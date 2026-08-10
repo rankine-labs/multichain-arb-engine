@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import { ChainManager } from './core/chainManager';
 import { PoolCache } from './core/poolCache';
 import { PoolDiscoveryEngine, DiscoveryConfig } from './core/poolDiscovery';
