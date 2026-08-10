@@ -28,8 +28,8 @@ private quicknodeLastBlock = 0;
 private lastEventAtMs = 0;
 
 async connect(): Promise<void> {
-  this.alchemyProvider = new ethers.WebSocketProvider(ALCHEMY_WSS);
-this.quicknodeProvider = new ethers.WebSocketProvider(QUICKNODE_WSS);
+    this.alchemyProvider = new ethers.WebSocketProvider(ALCHEMY_WSS, 43114); // explicit chainId — public AVAX endpoint doesn't support eth_chainId, breaking ethers' auto-detection
+    this.quicknodeProvider = new ethers.WebSocketProvider(QUICKNODE_WSS, 43114);
 
 this.alchemyProvider.on('pending', (txHash: string) => this.handlePending('alchemy', txHash));
 this.quicknodeProvider.on('pending', (txHash: string) => this.handlePending('quicknode', txHash));
