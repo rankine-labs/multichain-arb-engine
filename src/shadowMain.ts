@@ -1,4 +1,6 @@
 import 'dotenv/config';
+import { ethers } from 'ethers';
+import { resolveAndFetchV2Pool } from './core/poolResolver';
 import { ChainManager } from './core/chainManager';
 import { PoolCache } from './core/poolCache';
 import { PoolDiscoveryEngine, DiscoveryConfig } from './core/poolDiscovery';
@@ -25,6 +27,12 @@ seedKnownAddresses(routerRegistry);
 const decoder = new TransactionDecoder(routerRegistry);
 const filter = new FastFilter(cache);
 const priceOracle = new PriceOracle(cache);
+
+    // Read-only provider for JIT pool resolution (factory.getPair + reserve
+    // reads) — separate from the WebSocket providers used for event feeds,
+    // and explicit chainId since the public AVAX endpoint doesn't support
+    // eth_chainId auto-detection (see avalanche.ts for the same fix).
+    const avalancheReadProvider = new ethers.JsonRpcProvider('https://api.avax.network/ext/bc/C/rpc', 43114);
 
 const discoveryConfigs: Record<string, DiscoveryConfig> = {
 avalanche: {
@@ -64,10 +72,30 @@ if (!swap) return;
 const filterResult = filter.evaluate(swap);
 if (!filterResult.pass) return;
 
-const pool = cache.get(swap.chain, swap.poolAddress);
-const peers = cache.findPeerPools(swap.chain, swap.tokenIn, swap.tokenOut, swap.poolAddress);
-if (!pool || peers.length === 0) return;
-const sellPool = peers[0];
+let pool = cache.get(swap.chain, swap.poolAddress);
+
+    // Just-in-time pool discovery: swap.poolAddress is the ROUTER address
+    // (routers proxy to many pools, see decoder.ts). If we haven't cached
+    // this pool yet and know the router's factory, resolve the REAL pool
+    // address on-chain and pull its live reserves — no external API, just
+    // the same chain data we're already watching.
+    if (!pool) {
+        const entry = routerRegistry[swap.chain]?.[swap.poolAddress.toLowerCase()];
+        if (entry?.factory && swap.chain === 'avalanche') {
+            const resolved = await resolveAndFetchV2Pool(
+                avalancheReadProvider, swap.chain, entry.dex, entry.factory,
+                swap.tokenIn, swap.tokenOut, 30,
+                );
+            if (resolved) {
+                cache.upsert(resolved);
+                pool = resolved;
+            }
+        }
+    }
+
+    const peers = pool ? cache.findPeerPools(swap.chain, swap.tokenIn, swap.tokenOut, pool.poolAddress) : [];
+    if (!pool || peers.length === 0) return;
+    const sellPool = peers[0];
 
 const tokenInIsA = swap.tokenIn.toLowerCase() === pool.tokenA.toLowerCase();
 
