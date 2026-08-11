@@ -32,6 +32,7 @@ const ROUTER_INTERFACES: Record<string, ethers.Interface> = {
 // addresses on different chains.
 export interface RouterRegistryEntry {
   dex: string;
+    factory?: string; // v2 factory contract, used for JIT pool resolution (see poolResolver.ts)
   style: 'v2' | 'v3';
 }
 
