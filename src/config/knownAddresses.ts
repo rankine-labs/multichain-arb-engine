@@ -21,6 +21,8 @@ TRADERJOE_V1_ROUTER: '0x60aE616a2155Ee3d9A68541Ba4544862310933d4',
     TRADERJOE_V1_FACTORY: '0x9Ad6C38BE94206cA50bb0d90783181662f0Cfa10', // verified via LFJ official docs
     SUSHISWAP_ROUTER: '0x1b02dA8Cb0d097eB8D57A175b88c7D8b47997506', // verified via Snowtrace (real Create Pair history)
     SUSHISWAP_FACTORY: '0xc35DADB65012eC5796536bD9864eD8773aBc74C4', // same address SushiSwap uses on most chains, confirmed on Snowtrace directly
+    TRADERJOE_LB_ROUTER: '0x18556DA13313f3532c54711497A8FedAC273220E', // verified via official LFJ docs (V2.2)
+    TRADERJOE_LB_FACTORY: '0xb43120c4745967fa9b93E79C149E66B0f2D6Fe0c', // verified via official LFJ docs (V2.2)
 };
 
 // --- Monad — verified via official Uniswap deployment docs
@@ -80,6 +82,12 @@ registerStablecoin('avalanche', AVALANCHE_TOKENS.USDC_NATIVE);
         dex: 'sushiswap',
         style: 'v2',
         factory: AVALANCHE_ROUTERS.SUSHISWAP_FACTORY,
+    };
+
+    registry.avalanche[AVALANCHE_ROUTERS.TRADERJOE_LB_ROUTER.toLowerCase()] = {
+        dex: 'traderjoe-lb',
+        style: 'lb',
+        factory: AVALANCHE_ROUTERS.TRADERJOE_LB_FACTORY,
     };
 
 registry.monad[MONAD_ROUTERS.SWAP_ROUTER_02.toLowerCase()] = {
