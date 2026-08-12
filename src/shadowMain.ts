@@ -1,6 +1,6 @@
 import 'dotenv/config';
 import { ethers } from 'ethers';
-import { resolveAndFetchV2Pool } from './core/poolResolver';
+import { resolveAndFetchV2Pool, resolveAndFetchLBPool } from './core/poolResolver';
 import { ChainManager } from './core/chainManager';
 import { PoolCache } from './core/poolCache';
 import { PoolDiscoveryEngine, DiscoveryConfig } from './core/poolDiscovery';
@@ -81,7 +81,7 @@ let pool = cache.get(swap.chain, swap.poolAddress);
     // the same chain data we're already watching.
     if (!pool) {
         const entry = routerRegistry[swap.chain]?.[swap.poolAddress.toLowerCase()];
-        if (entry?.factory && swap.chain === 'avalanche') {
+        if (entry?.factory && swap.chain === 'avalanche' && entry.style === 'v2') {
             const resolved = await resolveAndFetchV2Pool(
                 avalancheReadProvider, swap.chain, entry.dex, entry.factory,
                 swap.tokenIn, swap.tokenOut, 30,
@@ -91,6 +91,17 @@ let pool = cache.get(swap.chain, swap.poolAddress);
                 pool = resolved;
             }
         }
+
+          if (entry?.factory && swap.chain === 'avalanche' && entry.style === 'lb') {
+                const resolved = await resolveAndFetchLBPool(
+                      avalancheReadProvider, swap.chain, entry.dex, entry.factory,
+                      swap.tokenIn, swap.tokenOut, 20,
+                      );
+                if (resolved) {
+                      cache.upsert(resolved);
+                      pool = resolved;
+                }
+          }
     }
 
     const peers = pool ? cache.findPeerPools(swap.chain, swap.tokenIn, swap.tokenOut, pool.poolAddress) : [];
