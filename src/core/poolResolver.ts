@@ -146,3 +146,82 @@ export async function resolveAndFetchLBPool(
     return null;
   }
 }
+
+
+// ============================================================================
+// V3 (Uniswap V3-style) POOL RESOLVER
+//
+// V3 pools are keyed by (tokenA, tokenB, fee tier), not just the pair, so a
+// pair can exist at multiple fee tiers simultaneously. This tries the
+// standard fee tiers in order and returns the first pool that actually
+// exists with real bytecode — good enough for JIT discovery; a production
+// version would compare liquidity across tiers the same way the LB
+// resolver picks the deepest bin step.
+// ============================================================================
+
+const V3_FACTORY_ABI = [
+  'function getPool(address tokenA, address tokenB, uint24 fee) view returns (address pool)',
+  ];
+const V3_POOL_ABI = [
+  'function slot0() view returns (uint160 sqrtPriceX96, int24 tick, uint16 observationIndex, uint16 observationCardinality, uint16 observationCardinalityNext, uint8 feeProtocol, bool unlocked)',
+  'function liquidity() view returns (uint128)',
+  'function token0() view returns (address)',
+  'function token1() view returns (address)',
+  ];
+
+const STANDARD_V3_FEE_TIERS = [500, 3000, 10000, 100]; // 0.05%, 0.3%, 1%, 0.01% — checked in rough order of typical liquidity
+
+export async function resolveAndFetchV3Pool(
+  provider: ethers.JsonRpcProvider,
+  chain: ChainName,
+  dex: string,
+  factoryAddress: string,
+  tokenA: string,
+  tokenB: string,
+  ): Promise<PoolState | null> {
+  try {
+    const factory = new ethers.Contract(factoryAddress, V3_FACTORY_ABI, provider);
+
+  for (const fee of STANDARD_V3_FEE_TIERS) {
+    let poolAddress: string;
+    try {
+      poolAddress = await factory.getPool(tokenA, tokenB, fee);
+    } catch {
+      continue;
+    }
+    if (!poolAddress || poolAddress === ethers.ZeroAddress) continue; // no pool at this fee tier — try the next one
+
+    const pool = new ethers.Contract(poolAddress, V3_POOL_ABI, provider);
+    try {
+      const [slot0, liquidity, token0, token1] = await Promise.all([
+        pool.slot0(),
+        pool.liquidity(),
+        pool.token0(),
+        pool.token1(),
+        ]);
+
+    if ((liquidity as bigint) === 0n) continue; // pool exists but is empty — not tradeable, try next tier
+
+    return {
+      chain,
+      dex,
+      poolAddress,
+      poolType: 'v3',
+      tokenA: token0,
+      tokenB: token1,
+      sqrtPriceX96: slot0[0] as bigint,
+      liquidity: liquidity as bigint,
+      feeBps: Math.round(fee / 100), // fee here is in hundredths of a bip (e.g. 3000 = 0.3%); convert to bps
+      lastUpdatedBlock: 0,
+      lastUpdatedMs: Date.now(),
+    };
+    } catch {
+      continue; // this fee tier's pool read failed — try the next one rather than giving up entirely
+    }
+  }
+
+  return null; // no live pool found at any standard fee tier
+  } catch {
+    return null;
+  }
+}
