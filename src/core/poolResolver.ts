@@ -262,27 +262,35 @@ export async function resolveKuruMarket(
   try {
     const marketParams = await ParamFetcher.getMarketParams(providerV5, marketAddress);
     const orderBookData = await OrderBook.getL2OrderBook(providerV5, marketAddress, marketParams);
-    const { vaultParams } = orderBookData;
-    if (!vaultParams) return null;
+    const { manualOrders } = orderBookData;
+    if (!manualOrders || manualOrders.bids.length === 0 || manualOrders.asks.length === 0) return null; // no real resting liquidity right now
 
-  const bestBid = vaultParams.vaultBestBid;
-    const bestAsk = vaultParams.vaultBestAsk;
-    if (!bestBid || !bestAsk || bestBid.isZero() || bestAsk.isZero()) return null; // no real vault liquidity resting right now
+  // manualOrders is the REAL limit order book (tight, realistic spread) —
+  // confirmed against live data to be the reliable liquidity signal here.
+  // The separate vaultParams (AMM-vault-only) can be legitimately empty
+  // even when real liquidity exists in the book, so this does NOT fall
+  // back to vaultParams. Both bids and asks are already human-readable
+  // [price, size] floats per the SDK's own OrderBookData type, not raw
+  // on-chain integers — no decimal scaling needed here.
+  const bestBid = manualOrders.bids[0];
+    const bestAsk = manualOrders.asks[0];
+    if (!bestBid || !bestAsk || bestBid[0] <= 0 || bestAsk[0] <= 0) return null;
 
-  const baseDepth = vaultParams.vaultBidOrderSize.add(vaultParams.vaultAskOrderSize);
-    if (baseDepth.isZero()) return null;
+  // Sum size across the top few levels on each side as a liquidity proxy —
+  // good enough for discovery/sizing, not a substitute for a real quote.
+  const bidDepth = manualOrders.bids.slice(0, 3).reduce((sum, level) => sum + level[1], 0);
+    const askDepth = manualOrders.asks.slice(0, 3).reduce((sum, level) => sum + level[1], 0);
+    const baseDepth = bidDepth + askDepth;
+    if (baseDepth <= 0) return null;
 
-  const baseDecimals = marketParams.baseAssetDecimals.toNumber();
-    const quoteDecimals = marketParams.quoteAssetDecimals.toNumber();
-    if (baseDecimals > 18 || quoteDecimals > 18) return null; // outside the range this approximation handles
+  const midPrice = (bestBid[0] + bestAsk[0]) / 2;
 
-  // Normalize to 18-decimal-equivalent bigints, matching the same
-  // simplifying assumption priceOracle.ts already documents elsewhere.
-  const reserveABase = BigInt(baseDepth.toString()) * 10n ** BigInt(18 - baseDecimals);
-
-  const midPrice = bestBid.add(bestAsk).div(2); // price precision units per MarketParams.pricePrecision
-  const quoteValueRaw = (BigInt(midPrice.toString()) * BigInt(baseDepth.toString())) / BigInt(marketParams.pricePrecision.toString());
-    const reserveBQuote = quoteValueRaw * 10n ** BigInt(18 - quoteDecimals);
+  // Scale the human-readable floats into 18-decimal-equivalent bigints,
+  // matching the same simplifying assumption priceOracle.ts documents
+  // elsewhere. Using a fixed-point round-trip through string formatting
+  // avoids floating-point bigint conversion errors.
+  const reserveABase = BigInt(ethersV5.utils.parseUnits(baseDepth.toFixed(8), 18).toString());
+      const reserveBQuote = BigInt(ethersV5.utils.parseUnits((baseDepth * midPrice).toFixed(8), 18).toString());
 
   return {
     chain,
