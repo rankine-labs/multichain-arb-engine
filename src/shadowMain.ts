@@ -1,6 +1,6 @@
 import 'dotenv/config';
 import { ethers } from 'ethers';
-import { resolveAndFetchV2Pool, resolveAndFetchLBPool, resolveAndFetchV3Pool } from './core/poolResolver';
+import { resolveAndFetchV2Pool, resolveAndFetchLBPool, resolveAndFetchV3Pool, resolveKuruMarket } from './core/poolResolver';
 import { ChainManager } from './core/chainManager';
 import { PoolCache } from './core/poolCache';
 import { PoolDiscoveryEngine, DiscoveryConfig } from './core/poolDiscovery';
@@ -11,6 +11,8 @@ import { PriceOracle } from './core/priceOracle';
 import { findOptimalTradeSize, calculateAllInProfit, buildOpportunity, calculateLiquidityCeiling } from './core/profitCalculator';
 import { scoreOpportunity, shouldPreArm } from './core/opportunityScorer';
 import { seedKnownAddresses } from './config/knownAddresses';
+import { ethers as ethersV5 } from 'ethers-v5';
+import { MONAD_KURU } from './config/knownAddresses';
 import { sendTelegramMessage } from './core/telegramSender';
 import { formatHourlySummary } from './core/telegramFormatter';
 import { RobinhoodChainAdapter } from './chains/robinhoodChain';
@@ -176,6 +178,18 @@ console.log(
 });
 
 await chainManager.startAll();
+
+      // Kuru is an order book, not something you find via factory.getPair(),
+      // so its market is seeded directly from the known address rather than
+      // discovered from swap traffic. This is what gives the Uniswap V3 pool
+      // a real second venue to compare against for cross-DEX opportunities.
+      const monadKuruProvider = new ethersV5.providers.JsonRpcProvider('https://rpc.monad.xyz');
+      const seedKuruMarket = async () => {
+            const resolved = await resolveKuruMarket(monadKuruProvider, 'monad', 'kuru', MONAD_KURU.MARKETS.MON_USDC);
+            if (resolved) cache.upsert(resolved);
+      };
+      await seedKuruMarket();
+      setInterval(seedKuruMarket, 30_000); // vault liquidity shifts as orders fill — keep it fresh
 setInterval(() => chainManager.runHealthChecks(), 15_000);
 
 setInterval(async () => {
