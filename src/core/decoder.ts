@@ -23,6 +23,15 @@ const ROUTER_INTERFACES: Record<string, ethers.Interface> = {
   v3: new ethers.Interface([
     'function exactInputSingle((address tokenIn, address tokenOut, uint24 fee, address recipient, uint256 deadline, uint256 amountIn, uint256 amountOutMinimum, uint160 sqrtPriceLimitX96))',
     'function exactInput((bytes path, address recipient, uint256 deadline, uint256 amountIn, uint256 amountOutMinimum))',
+      ]),
+    lb: new ethers.Interface([
+        // LFJ Liquidity Book router — path is a struct, not a flat address[], since
+        // each hop can cross a different bin step / LB version. tokenPath[0] and
+        // tokenPath[last] give us tokenIn/tokenOut the same way v2's path does.
+        'function swapExactTokensForTokens(uint256 amountIn, uint256 amountOutMin, (uint256[] pairBinSteps, uint8[] versions, address[] tokenPath) path, address to, uint256 deadline)',
+        'function swapExactTokensForNATIVE(uint256 amountIn, uint256 amountOutMinNATIVE, (uint256[] pairBinSteps, uint8[] versions, address[] tokenPath) path, address to, uint256 deadline)',
+        'function swapExactNATIVEForTokens(uint256 amountOutMin, (uint256[] pairBinSteps, uint8[] versions, address[] tokenPath) path, address to, uint256 deadline)',
+        ]),
     ]),
 };
 
@@ -33,7 +42,7 @@ const ROUTER_INTERFACES: Record<string, ethers.Interface> = {
 export interface RouterRegistryEntry {
   dex: string;
     factory?: string; // v2 factory contract, used for JIT pool resolution (see poolResolver.ts)
-  style: 'v2' | 'v3';
+    style: 'v2' | 'v3' | 'lb';
 }
 
 export type RouterRegistry = Record<ChainName, Record<string /* router address, lowercase */, RouterRegistryEntry>>;
@@ -146,6 +155,22 @@ export class TransactionDecoder {
         detectedAtMs: event.receivedAtMs,
       };
     }
+
+      if (entry.style === 'lb') {
+          const path = parsed.args.path as { tokenPath: string[] };
+          const tokenPath = path?.tokenPath;
+          if (!tokenPath || tokenPath.length < 2) return null;
+          return {
+              chain,
+              dex: entry.dex,
+              poolAddress: to,
+              tokenIn: tokenPath[0],
+              tokenOut: tokenPath[tokenPath.length - 1],
+              amountIn: BigInt(parsed.args.amountIn ?? 0),
+              stateType: event.stateType,
+              detectedAtMs: event.receivedAtMs,
+          };
+      }
 
     // v3 exactInputSingle
     const params = parsed.args[0];
