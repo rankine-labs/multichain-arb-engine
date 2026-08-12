@@ -32,8 +32,8 @@ const ROUTER_INTERFACES: Record<string, ethers.Interface> = {
         'function swapExactTokensForNATIVE(uint256 amountIn, uint256 amountOutMinNATIVE, (uint256[] pairBinSteps, uint8[] versions, address[] tokenPath) path, address to, uint256 deadline)',
         'function swapExactNATIVEForTokens(uint256 amountOutMin, (uint256[] pairBinSteps, uint8[] versions, address[] tokenPath) path, address to, uint256 deadline)',
         ]),
-    ]),
 };
+    
 
 // Router address -> (dex name, ABI style) mapping. Placeholder addresses —
 // fill in real router addresses per chain before this goes live. Kept
