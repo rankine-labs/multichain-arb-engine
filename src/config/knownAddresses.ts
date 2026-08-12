@@ -116,8 +116,21 @@ registerStablecoin('avalanche', AVALANCHE_TOKENS.USDC_NATIVE);
 
 registry.monad[MONAD_ROUTERS.SWAP_ROUTER_02.toLowerCase()] = {
 dex: 'uniswap-v3',
+    factory: MONAD_ROUTERS.UNISWAP_V3_FACTORY,
 style: 'v3',
 };
+
+    registry.robinhood[ROBINHOOD_V2.ROUTER.toLowerCase()] = {
+        dex: 'uniswap-v2',
+        style: 'v2',
+        factory: ROBINHOOD_V2.FACTORY,
+    };
+
+    registry.robinhood[ROBINHOOD_V3.SWAP_ROUTER_02.toLowerCase()] = {
+        dex: 'uniswap-v3',
+        style: 'v3',
+        factory: ROBINHOOD_V3.FACTORY,
+    };
 registerStablecoin('monad', MONAD_TOKENS.USDC);
 
 registerStablecoin('robinhood', ROBINHOOD_TOKENS.USDG);
