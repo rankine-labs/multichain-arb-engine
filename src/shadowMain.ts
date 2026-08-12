@@ -12,7 +12,7 @@ import { findOptimalTradeSize, calculateAllInProfit, buildOpportunity, calculate
 import { scoreOpportunity, shouldPreArm } from './core/opportunityScorer';
 import { seedKnownAddresses } from './config/knownAddresses';
 import { ethers as ethersV5 } from 'ethers-v5';
-import { MONAD_KURU } from './config/knownAddresses';
+import { MONAD_KURU, ROBINHOOD_V2, ROBINHOOD_V3 } from './config/knownAddresses';
 import { sendTelegramMessage } from './core/telegramSender';
 import { formatHourlySummary } from './core/telegramFormatter';
 import { RobinhoodChainAdapter } from './chains/robinhoodChain';
@@ -36,6 +36,7 @@ const priceOracle = new PriceOracle(cache);
     // eth_chainId auto-detection (see avalanche.ts for the same fix).
     const avalancheReadProvider = new ethers.JsonRpcProvider('https://api.avax.network/ext/bc/C/rpc', 43114);
       const monadReadProvider = new ethers.JsonRpcProvider('https://rpc.monad.xyz', 143);
+      const robinhoodReadProvider = new ethers.JsonRpcProvider('https://rpc.mainnet.chain.robinhood.com', 4663);
 
 const discoveryConfigs: Record<string, DiscoveryConfig> = {
 avalanche: {
@@ -109,6 +110,28 @@ let pool = cache.get(swap.chain, swap.poolAddress);
           if (entry?.factory && swap.chain === 'monad' && entry.style === 'v3') {
                 const resolved = await resolveAndFetchV3Pool(
                       monadReadProvider, swap.chain, entry.dex, entry.factory,
+                      swap.tokenIn, swap.tokenOut,
+                      );
+                if (resolved) {
+                      cache.upsert(resolved);
+                      pool = resolved;
+                }
+          }
+
+          if (entry?.factory && swap.chain === 'robinhood' && entry.style === 'v2') {
+                const resolved = await resolveAndFetchV2Pool(
+                      robinhoodReadProvider, swap.chain, entry.dex, entry.factory,
+                      swap.tokenIn, swap.tokenOut, 30,
+                      );
+                if (resolved) {
+                      cache.upsert(resolved);
+                      pool = resolved;
+                }
+          }
+
+          if (entry?.factory && swap.chain === 'robinhood' && entry.style === 'v3') {
+                const resolved = await resolveAndFetchV3Pool(
+                      robinhoodReadProvider, swap.chain, entry.dex, entry.factory,
                       swap.tokenIn, swap.tokenOut,
                       );
                 if (resolved) {
