@@ -1,5 +1,7 @@
 import { ethers } from 'ethers';
 import { PoolState, ChainName } from './types';
+import { ethers as ethersV5 } from 'ethers-v5'; // Kuru SDK is built on ethers v5, see kuruAdapter.ts
+import { ParamFetcher, OrderBook } from '@kuru-labs/kuru-sdk';
 
 // ============================================================================
 // POOL RESOLVER — just-in-time pool discovery for v2-style DEXs
@@ -223,5 +225,79 @@ export async function resolveAndFetchV3Pool(
   return null; // no live pool found at any standard fee tier
   } catch {
     return null;
+  }
+}
+
+
+// ============================================================================
+// KURU (order book) MARKET RESOLVER
+//
+// Kuru has no simple reserve pair the way v2 pools do — it's a real central
+// limit order book, and its markets are pre-deployed contracts rather than
+// something you derive from a factory.getPair() call. Unlike the other
+// resolvers in this file, this does NOT hand-write an ABI guess for Kuru's
+// read functions: their exact return encoding isn't independently
+// documented anywhere public, so guessing risks silently wrong numbers
+// feeding into real profit math (unlike a bad ABI guess elsewhere, which
+// just throws and returns null safely). Instead this uses Kuru's own
+// official SDK (ParamFetcher, OrderBook), which ships the correct ABI
+// internally — confirmed directly against the SDK's own .d.ts files
+// rather than assumed.
+//
+// APPROXIMATION, same honesty standard as the LB resolver: the AMM vault's
+// best bid/ask and resting order sizes (VaultParams) are used as a
+// liquidity proxy, converted into a v2-shaped PoolState so the existing
+// liquidity-ceiling and discovery math can use it. This is NOT the same as
+// walking the full order book for an exact execution price — real
+// execution should re-quote via the SDK's CostEstimator immediately before
+// firing.
+// ============================================================================
+
+export async function resolveKuruMarket(
+  providerV5: ethersV5.providers.JsonRpcProvider,
+  chain: ChainName,
+  dex: string,
+  marketAddress: string,
+  ): Promise<PoolState | null> {
+  try {
+    const marketParams = await ParamFetcher.getMarketParams(providerV5, marketAddress);
+    const orderBookData = await OrderBook.getL2OrderBook(providerV5, marketAddress, marketParams);
+    const { vaultParams } = orderBookData;
+    if (!vaultParams) return null;
+
+  const bestBid = vaultParams.vaultBestBid;
+    const bestAsk = vaultParams.vaultBestAsk;
+    if (!bestBid || !bestAsk || bestBid.isZero() || bestAsk.isZero()) return null; // no real vault liquidity resting right now
+
+  const baseDepth = vaultParams.vaultBidOrderSize.add(vaultParams.vaultAskOrderSize);
+    if (baseDepth.isZero()) return null;
+
+  const baseDecimals = marketParams.baseAssetDecimals.toNumber();
+    const quoteDecimals = marketParams.quoteAssetDecimals.toNumber();
+    if (baseDecimals > 18 || quoteDecimals > 18) return null; // outside the range this approximation handles
+
+  // Normalize to 18-decimal-equivalent bigints, matching the same
+  // simplifying assumption priceOracle.ts already documents elsewhere.
+  const reserveABase = BigInt(baseDepth.toString()) * 10n ** BigInt(18 - baseDecimals);
+
+  const midPrice = bestBid.add(bestAsk).div(2); // price precision units per MarketParams.pricePrecision
+  const quoteValueRaw = (BigInt(midPrice.toString()) * BigInt(baseDepth.toString())) / BigInt(marketParams.pricePrecision.toString());
+    const reserveBQuote = quoteValueRaw * 10n ** BigInt(18 - quoteDecimals);
+
+  return {
+    chain,
+    dex,
+    poolAddress: marketAddress,
+    poolType: 'v2', // treated as v2-shaped for downstream math — see approximation note above
+    tokenA: marketParams.baseAssetAddress,
+    tokenB: marketParams.quoteAssetAddress,
+    reserveA: reserveABase,
+    reserveB: reserveBQuote,
+    feeBps: marketParams.takerFeeBps.toNumber(),
+    lastUpdatedBlock: orderBookData.blockNumber,
+    lastUpdatedMs: Date.now(),
+  };
+  } catch {
+    return null; // SDK call failed, market has no liquidity yet, or a param was out of range — never crash the hot path over this
   }
 }
