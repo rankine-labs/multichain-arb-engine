@@ -1,6 +1,6 @@
 import 'dotenv/config';
 import { ethers } from 'ethers';
-import { resolveAndFetchV2Pool, resolveAndFetchLBPool } from './core/poolResolver';
+import { resolveAndFetchV2Pool, resolveAndFetchLBPool, resolveAndFetchV3Pool } from './core/poolResolver';
 import { ChainManager } from './core/chainManager';
 import { PoolCache } from './core/poolCache';
 import { PoolDiscoveryEngine, DiscoveryConfig } from './core/poolDiscovery';
@@ -33,6 +33,7 @@ const priceOracle = new PriceOracle(cache);
     // and explicit chainId since the public AVAX endpoint doesn't support
     // eth_chainId auto-detection (see avalanche.ts for the same fix).
     const avalancheReadProvider = new ethers.JsonRpcProvider('https://api.avax.network/ext/bc/C/rpc', 43114);
+      const monadReadProvider = new ethers.JsonRpcProvider('https://rpc.monad.xyz', 143);
 
 const discoveryConfigs: Record<string, DiscoveryConfig> = {
 avalanche: {
@@ -96,6 +97,17 @@ let pool = cache.get(swap.chain, swap.poolAddress);
                 const resolved = await resolveAndFetchLBPool(
                       avalancheReadProvider, swap.chain, entry.dex, entry.factory,
                       swap.tokenIn, swap.tokenOut, 20,
+                      );
+                if (resolved) {
+                      cache.upsert(resolved);
+                      pool = resolved;
+                }
+          }
+
+          if (entry?.factory && swap.chain === 'monad' && entry.style === 'v3') {
+                const resolved = await resolveAndFetchV3Pool(
+                      monadReadProvider, swap.chain, entry.dex, entry.factory,
+                      swap.tokenIn, swap.tokenOut,
                       );
                 if (resolved) {
                       cache.upsert(resolved);
