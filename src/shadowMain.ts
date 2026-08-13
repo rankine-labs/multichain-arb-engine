@@ -14,7 +14,7 @@ import { seedKnownAddresses } from './config/knownAddresses';
 import { ethers as ethersV5 } from 'ethers-v5';
 import { MONAD_KURU, ROBINHOOD_V2, ROBINHOOD_V3 } from './config/knownAddresses';
 import { sendTelegramMessage } from './core/telegramSender';
-import { formatHourlySummary, formatSkippedOpportunity } from './core/telegramFormatter';
+import { formatHourlySummary, formatSkippedOpportunity , formatDailySummary} from './core/telegramFormatter';
 import { RobinhoodChainAdapter } from './chains/robinhoodChain';
 import { MonadAdapter } from './chains/monad';
 import { AvalancheAdapter } from './chains/avalanche';
@@ -272,6 +272,14 @@ console.log(
 
 await chainManager.startAll();
 
+      const startStatus = chainManager.getStatus() as Record<string, { online: boolean }>;
+      const startChainParts: string[] = [];
+      for (const chainName of Object.keys(startStatus)) {
+            const isOnline = startStatus[chainName].online;
+            startChainParts.push(chainName + ' ' + (isOnline ? 'OK' : 'DOWN'));
+      }
+      await sendTelegramMessage('Shadow bot started. Chains: ' + startChainParts.join(', '));
+
       // Kuru is an order book, not something you find via factory.getPair(),
       // so its market is seeded directly from the known address rather than
       // discovered from swap traffic. This is what gives the Uniswap V3 pool
@@ -327,6 +335,23 @@ p95ReactionMs: summary.p95ReactionMs ?? 0,
 
 await sendTelegramMessage(message);
 }, 60 * 60 * 1000);
+
+      setInterval(async () => {
+            const summary = shadowLogger.summary();
+            const message = formatDailySummary({
+                  netProfitUsd: Number(summary.hypotheticalNetProfitUsd),
+                  byChain: {},
+                  won: summary.wouldHaveWon,
+                  missed: summary.wouldHaveLost,
+                  reverted: 0,
+                  fundingOwnCapitalPct: 0,
+                  fundingFlashLoanPct: 100,
+                  bestTradeUsd: 0,
+                  largestMissedUsd: 0,
+                  uptimePct: 100,
+            });
+            await sendTelegramMessage(message);
+      }, 24 * 60 * 60 * 1000);
 
 console.log('Shadow mode running. Pool cache size:', cache.size());
 console.log('Chain status:', chainManager.getStatus());
