@@ -43,25 +43,41 @@ avalanche: {
 chain: 'avalanche',
 minLiquidityUsd: 50_000,
 minRecent24hVolumeUsd: 20_000,
-approvedDexes: new Set(['traderjoe', 'pharaoh', 'uniswap', 'sushiswap']),
+    approvedDexes: new Set(['traderjoe-v1', 'traderjoe-lb', 'pharaoh', 'sushiswap']),
 },
 monad: {
 chain: 'monad',
 minLiquidityUsd: 25_000,
 minRecent24hVolumeUsd: 10_000,
-approvedDexes: new Set(['uniswap', 'ambient', 'kuru']),
+    approvedDexes: new Set(['uniswap-v3', 'ambient', 'kuru']),
 },
 robinhood: {
 chain: 'robinhood',
 minLiquidityUsd: 25_000,
 minRecent24hVolumeUsd: 10_000,
-approvedDexes: new Set(['arcus', 'uniswap', 'pleiades']),
+    approvedDexes: new Set(['arcus', 'uniswap-v2', 'uniswap-v3', 'pleiades']),
 },
 };
 
 const discoveryEngines = Object.fromEntries(
 Object.entries(discoveryConfigs).map(([chain, cfg]) => [chain, new PoolDiscoveryEngine(cfg, cache)]),
 );
+
+      // Gate every JIT-resolved pool through discovery approval before it's
+      // trusted: DEX must be on the approved list for that chain, and it must
+      // actually have liquidity on both sides. See poolDiscovery.ts's
+      // evaluateLiveDiscovery for what this does and does NOT check yet (no
+      // volume gate — that needs historical event-log scanning, not built).
+      function registerIfApproved(chain: 'avalanche' | 'monad' | 'robinhood', dex: string, resolved: any): boolean {
+            const hasNonZeroLiquidity = (resolved.reserveA ?? 0n) > 0n && (resolved.reserveB ?? 0n) > 0n;
+            const gate = discoveryEngines[chain].evaluateLiveDiscovery({ chain: resolved.chain, dex, hasNonZeroLiquidity });
+            if (!gate.approved) {
+                  console.log(`[discovery] rejected ${dex} pool on ${chain}: ${gate.rejections.join(', ')}`);
+                  return false;
+            }
+            cache.upsert(resolved);
+            return true;
+      }
 
 chainManager.register(new RobinhoodChainAdapter());
 chainManager.register(new MonadAdapter());
@@ -90,10 +106,7 @@ let pool = cache.get(swap.chain, swap.poolAddress);
                 avalancheReadProvider, swap.chain, entry.dex, entry.factory,
                 swap.tokenIn, swap.tokenOut, 30,
                 );
-            if (resolved) {
-                cache.upsert(resolved);
-                pool = resolved;
-            }
+if (registerIfApproved('avalanche', entry.dex, resolved)) pool = resolved;
         }
 
           if (entry?.factory && swap.chain === 'avalanche' && entry.style === 'lb') {
@@ -101,10 +114,7 @@ let pool = cache.get(swap.chain, swap.poolAddress);
                       avalancheReadProvider, swap.chain, entry.dex, entry.factory,
                       swap.tokenIn, swap.tokenOut, 20,
                       );
-                if (resolved) {
-                      cache.upsert(resolved);
-                      pool = resolved;
-                }
+                if (registerIfApproved('avalanche', entry.dex, resolved)) pool = resolved;
           }
 
           if (entry?.factory && swap.chain === 'monad' && entry.style === 'v3') {
@@ -112,10 +122,7 @@ let pool = cache.get(swap.chain, swap.poolAddress);
                       monadReadProvider, swap.chain, entry.dex, entry.factory,
                       swap.tokenIn, swap.tokenOut,
                       );
-                if (resolved) {
-                      cache.upsert(resolved);
-                      pool = resolved;
-                }
+                if (registerIfApproved('monad', entry.dex, resolved)) pool = resolved;
           }
 
           if (entry?.factory && swap.chain === 'robinhood' && entry.style === 'v2') {
@@ -123,10 +130,7 @@ let pool = cache.get(swap.chain, swap.poolAddress);
                       robinhoodReadProvider, swap.chain, entry.dex, entry.factory,
                       swap.tokenIn, swap.tokenOut, 30,
                       );
-                if (resolved) {
-                      cache.upsert(resolved);
-                      pool = resolved;
-                }
+                if (registerIfApproved('robinhood', entry.dex, resolved)) pool = resolved;
           }
 
           if (entry?.factory && swap.chain === 'robinhood' && entry.style === 'v3') {
@@ -134,10 +138,7 @@ let pool = cache.get(swap.chain, swap.poolAddress);
                       robinhoodReadProvider, swap.chain, entry.dex, entry.factory,
                       swap.tokenIn, swap.tokenOut,
                       );
-                if (resolved) {
-                      cache.upsert(resolved);
-                      pool = resolved;
-                }
+                if (registerIfApproved('robinhood', entry.dex, resolved)) pool = resolved;
           }
     }
 
