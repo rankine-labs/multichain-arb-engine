@@ -283,7 +283,20 @@ await chainManager.startAll();
       };
       await seedKuruMarket();
       setInterval(seedKuruMarket, 30_000); // vault liquidity shifts as orders fill — keep it fresh
-setInterval(() => chainManager.runHealthChecks(), 15_000);
+  const lastHealthStatus: Record<string, boolean> = { avalanche: true, monad: true, robinhood: true };
+      setInterval(async () => {
+            await chainManager.runHealthChecks();
+            const status = chainManager.getStatus() as Record<string, { online: boolean; reason?: string }>;
+            for (const [chain, info] of Object.entries(status)) {
+                  const wasHealthy = lastHealthStatus[chain] ?? true;
+                  if (wasHealthy && !info.online) {
+                        await sendTelegramMessage(`\u26a0\ufe0f ${chain} went UNHEALTHY: ${info.reason ?? 'unknown reason'}`);
+                  } else if (!wasHealthy && info.online) {
+                        await sendTelegramMessage(`\u2705 ${chain} recovered and is healthy again`);
+                  }
+                  lastHealthStatus[chain] = info.online;
+            }
+      }, 15_000);
 
 setInterval(async () => {
 const summary = shadowLogger.summary();
