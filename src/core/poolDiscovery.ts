@@ -131,4 +131,32 @@ lastUpdatedBlock: 0,
 lastUpdatedMs: Date.now(),
 });
 }
+
+    // Real-time gate for pools discovered from live swap traffic (JIT
+    // resolution in shadowMain.ts). This is DELIBERATELY NOT the full
+    // evaluateForMonitoring() above: that method also requires
+    // recent24hVolumeUsd, which needs historical event-log scanning that
+    // isn't built yet. Rather than fake a volume number (which would either
+    // reject everything or approve everything depending on the placeholder
+    // chosen), this checks only what we can honestly verify right now:
+    //   - is this DEX one we've actually approved for this chain?
+    //   - does the pool have real, non-zero liquidity on both sides?
+    // A pool passing this is safe to track and price, not yet proven to
+    // have real trading volume. Volume-based rejection remains future work.
+    evaluateLiveDiscovery(candidate: {
+        chain: ChainName;
+        dex: string;
+        hasNonZeroLiquidity: boolean;
+    }): { approved: boolean; rejections: RejectionReason[] } {
+        const rejections: RejectionReason[] = [];
+
+        if (!this.config.approvedDexes.has(candidate.dex)) {
+            rejections.push('DEX_NOT_APPROVED');
+        }
+        if (!candidate.hasNonZeroLiquidity) {
+            rejections.push('LIQUIDITY_TOO_LOW');
+        }
+
+        return { approved: rejections.length === 0, rejections };
+    }
 }
