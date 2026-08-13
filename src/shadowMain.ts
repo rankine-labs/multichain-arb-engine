@@ -14,7 +14,7 @@ import { seedKnownAddresses } from './config/knownAddresses';
 import { ethers as ethersV5 } from 'ethers-v5';
 import { MONAD_KURU, ROBINHOOD_V2, ROBINHOOD_V3 } from './config/knownAddresses';
 import { sendTelegramMessage } from './core/telegramSender';
-import { formatHourlySummary } from './core/telegramFormatter';
+import { formatHourlySummary, formatSkippedOpportunity } from './core/telegramFormatter';
 import { RobinhoodChainAdapter } from './chains/robinhoodChain';
 import { MonadAdapter } from './chains/monad';
 import { AvalancheAdapter } from './chains/avalanche';
@@ -185,6 +185,18 @@ const reactionMs = Date.now() - t0;
 
 if (!profit.qualifies) {
 shadowLogger.record({ opportunity, outcome: 'SKIPPED_BELOW_MIN_PROFIT', ourHypotheticalReactionMs: reactionMs });
+      // Only significant near-misses go to Telegram (per architecture doc:
+      // "no play-by-play noise") — gross opportunity had to clear a real bar
+      // even though it netted below the $20 minimum after costs.
+      if (sizing.grossProfitUsd >= 50) {
+            await sendTelegramMessage(formatSkippedOpportunity({
+                  chain: swap.chain,
+                  grossOpportunityUsd: sizing.grossProfitUsd,
+                  optimalTradeUsd: sizing.optimalTradeSizeUsd,
+                  expectedNetUsd: profit.conservativeNetProfitUsd,
+                  minRequiredUsd: 20,
+            }));
+      }
 return;
 }
 if (!shouldPreArm(score)) {
