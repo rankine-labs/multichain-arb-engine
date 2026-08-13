@@ -1,6 +1,6 @@
 import 'dotenv/config';
 import { ethers } from 'ethers';
-import { resolveAndFetchV2Pool, resolveAndFetchLBPool, resolveAndFetchV3Pool, resolveKuruMarket } from './core/poolResolver';
+import { resolveAndFetchV2Pool, resolveAndFetchLBPool, resolveAndFetchV3Pool, resolveKuruMarket, refetchV2PoolPrice, refetchV3PoolPrice } from './core/poolResolver';
 import { ChainManager } from './core/chainManager';
 import { PoolCache } from './core/poolCache';
 import { PoolDiscoveryEngine, DiscoveryConfig } from './core/poolDiscovery';
@@ -77,6 +77,62 @@ Object.entries(discoveryConfigs).map(([chain, cfg]) => [chain, new PoolDiscovery
             }
             cache.upsert(resolved);
             return true;
+      }
+
+      // Checks its own homework: after a delay, re-read both pools' CURRENT
+      // price directly from chain and see whether the spread that made this
+      // look profitable still exists. If it closed, something almost
+      // certainly traded through it \u2014 the honest read is WOULD_HAVE_LOST,
+      // since shadow mode never actually submitted anything to win the race.
+      // If it's still open, nothing visibly beat us to it \u2014 WOULD_HAVE_WON.
+      //
+      // NOTE ON SCOPE: this is a lighter-weight spread check, not a full
+      // re-run of the profit calculator (fees, sizing, slippage). It answers
+      // "did the underlying price gap close" \u2014 the dominant signal for
+      // whether someone else captured it \u2014 not "would our exact sized trade
+      // still clear $20 net." That fuller re-run is a reasonable next step.
+      function scheduleOutcomeCheck(opportunity: any, buyPool: any, sellPool: any) {
+            const providerByChain: Record<string, ethers.JsonRpcProvider> = {
+                  avalanche: avalancheReadProvider,
+                  monad: monadReadProvider,
+                  robinhood: robinhoodReadProvider,
+            };
+            const provider = providerByChain[opportunity.chain];
+            if (!provider) return;
+
+            setTimeout(async () => {
+                  try {
+                        const refetch = (pool: any) =>
+                              pool.poolType === 'v3' ? refetchV3PoolPrice(provider, pool) : refetchV2PoolPrice(provider, pool);
+                        const [freshBuy, freshSell] = await Promise.all([refetch(buyPool), refetch(sellPool)]);
+                        if (!freshBuy || !freshSell) return;
+
+                        const priceOf = (pool: any): number | null => {
+                              if (pool.poolType === 'v3' && pool.sqrtPriceX96) {
+                                    const p = Number(pool.sqrtPriceX96) / 2 ** 96;
+                                    return p * p;
+                              }
+                              if (pool.reserveA && pool.reserveB && pool.reserveA > 0n) {
+                                    return Number(pool.reserveB) / Number(pool.reserveA);
+                              }
+                              return null;
+                        };
+
+                        const buyPrice = priceOf(freshBuy);
+                        const sellPrice = priceOf(freshSell);
+                        if (buyPrice === null || sellPrice === null || buyPrice <= 0) return;
+
+                        const freshSpreadPct = (sellPrice - buyPrice) / buyPrice;
+
+                        if (freshSpreadPct > 0.001) {
+                              shadowLogger.resolve(opportunity.id, 'WOULD_HAVE_WON');
+                        } else {
+                              shadowLogger.resolve(opportunity.id, 'WOULD_HAVE_LOST');
+                        }
+                  } catch {
+                        // never crash the process over an outcome check
+                  }
+            }, 8000);
       }
 
 chainManager.register(new RobinhoodChainAdapter());
@@ -206,6 +262,7 @@ return;
 }
 
 shadowLogger.record({ opportunity, outcome: 'UNRESOLVED', ourHypotheticalReactionMs: reactionMs });
+      scheduleOutcomeCheck(opportunity, pool, sellPool);
 
 console.log(
 `[opportunity] ${swap.chain} score=${score} net=$${profit.conservativeNetProfitUsd.toFixed(2)} ` +
