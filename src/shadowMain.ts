@@ -340,7 +340,7 @@ await sendTelegramMessage(message);
             const summary = shadowLogger.summary();
             const message = formatDailySummary({
                   netProfitUsd: Number(summary.hypotheticalNetProfitUsd),
-                  byChain: {},
+                    byChain: { avalanche: 0, monad: 0, robinhood: 0 },
                   won: summary.wouldHaveWon,
                   missed: summary.wouldHaveLost,
                   reverted: 0,
