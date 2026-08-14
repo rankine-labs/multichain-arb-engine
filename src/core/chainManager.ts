@@ -46,6 +46,14 @@ const result = await adapter.healthCheck();
 this.status.set(chain, { online: result.healthy, reason: result.reason });
 if (!result.healthy) {
 console.warn(`[chainManager] ${chain} UNHEALTHY: ${result.reason}`);
+    try {
+        console.warn(`[chainManager] attempting to reconnect ${chain}...`);
+        await adapter.connect();
+        this.status.set(chain, { online: true });
+        console.warn(`[chainManager] ${chain} reconnected successfully`);
+    } catch (err) {
+        console.error(`[chainManager] ${chain} reconnect failed:`, err);
+    }
                               }
 }
 }
