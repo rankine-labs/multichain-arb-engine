@@ -116,4 +116,3 @@ export class AvalancheAdapter implements ChainCapability {
           return { submittedAtMs, txHash, method: 'public' };
   }
 }
-}
