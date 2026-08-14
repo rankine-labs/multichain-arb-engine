@@ -1,90 +1,133 @@
 import { ethers } from 'ethers';
 import { ChainCapability, RawChainEvent, PreparedTransaction, FireResult } from '../core/types';
 
-  // ============================================================================
-  // AVALANCHE ADAPTER
-  //
-  // The "normal" chain of the three — real public mempool. We race Alchemy
-  // and QuickNode against each other and use whichever delivers a VALID
-  // result first, not just whichever responds first. We cross-check block
-  // height agreement between the two so we're never trading off a provider
-  // that's silently behind.
-  // ============================================================================
+// ============================================================================
+// AVALANCHE ADAPTER
+//
+// The "normal" chain of the three -- real public mempool. We race Alchemy
+// and QuickNode against each other and use whichever delivers a VALID
+// result first, not just whichever responds first. We cross-check block
+// height agreement between the two so we're never trading off a provider
+// that's silently behind.
+//
+// RECONNECTION: public/free-tier WebSocket endpoints periodically close
+// idle connections. Without a reconnect trigger, a dropped socket just
+// goes silent forever -- confirmed live: block-height drift grew
+// unbounded (40,000+ blocks) over a long-running session before this was
+// added, because nothing was listening for the close event.
+// ============================================================================
 
-  const ALCHEMY_WSS = process.env.AVALANCHE_ALCHEMY_WSS ?? 'wss://REPLACE_WITH_ALCHEMY_AVAX_ENDPOINT';
+const ALCHEMY_WSS = process.env.AVALANCHE_ALCHEMY_WSS ?? 'wss://REPLACE_WITH_ALCHEMY_AVAX_ENDPOINT';
 const QUICKNODE_WSS = process.env.AVALANCHE_QUICKNODE_WSS ?? 'wss://REPLACE_WITH_QUICKNODE_AVAX_ENDPOINT';
 
 export class AvalancheAdapter implements ChainCapability {
-  readonly chain = 'avalanche' as const;
-readonly hasPendingMempool = true;
-readonly orderingModel = 'auction' as const;
+    readonly chain = 'avalanche' as const;
+    readonly hasPendingMempool = true;
+    readonly orderingModel = 'auction' as const;
 
-private alchemyProvider: ethers.WebSocketProvider | null = null;
-private quicknodeProvider: ethers.WebSocketProvider | null = null;
-private handlers: ((event: RawChainEvent) => void)[] = [];
+  private alchemyProvider: ethers.WebSocketProvider | null = null;
+    private quicknodeProvider: ethers.WebSocketProvider | null = null;
+    private handlers: ((event: RawChainEvent) => void)[] = [];
 
-private alchemyLastBlock = 0;
-private quicknodeLastBlock = 0;
-private lastEventAtMs = 0;
+  private alchemyLastBlock = 0;
+    private quicknodeLastBlock = 0;
+    private lastEventAtMs = 0;
 
-async connect(): Promise<void> {
-    // Clean up any previous connection before reconnecting -- otherwise a
-    // reconnect attempt after the socket died leaks the old (dead) provider
-    // and its listeners instead of replacing them.
-    try { this.alchemyProvider?.destroy(); } catch { /* already dead, fine */ }
-    try { this.quicknodeProvider?.destroy(); } catch { /* already dead, fine */ }
-  
-    this.alchemyProvider = new ethers.WebSocketProvider(ALCHEMY_WSS, 43114); // explicit chainId — public AVAX endpoint doesn't support eth_chainId, breaking ethers' auto-detection
-    this.quicknodeProvider = new ethers.WebSocketProvider(QUICKNODE_WSS, 43114);
+  private reconnecting = false;
+    private reconnectDelayMs = 2000;
 
-this.alchemyProvider.on('pending', (txHash: string) => this.handlePending('alchemy', txHash));
-this.quicknodeProvider.on('pending', (txHash: string) => this.handlePending('quicknode', txHash));
+  async connect(): Promise<void> {
+        // Clean up any previous connection before reconnecting -- otherwise a
+      // reconnect attempt after the socket died leaks the old (dead) provider
+      // and its listeners instead of replacing them.
+      try { this.alchemyProvider?.destroy(); } catch { /* already dead, fine */ }
+        try { this.quicknodeProvider?.destroy(); } catch { /* already dead, fine */ }
 
-this.alchemyProvider.on('block', (n: number) => { this.alchemyLastBlock = n; });
-this.quicknodeProvider.on('block', (n: number) => { this.quicknodeLastBlock = n; });
+      this.alchemyProvider = new ethers.WebSocketProvider(ALCHEMY_WSS, 43114); // explicit chainId -- public AVAX endpoint doesn't support eth_chainId, breaking ethers' auto-detection
+      this.quicknodeProvider = new ethers.WebSocketProvider(QUICKNODE_WSS, 43114);
 
-console.log('[avalanche] connected to both Alchemy and QuickNode pending-tx feeds');
-}
+      this.alchemyProvider.on('pending', (txHash: string) => this.handlePending('alchemy', txHash));
+        this.quicknodeProvider.on('pending', (txHash: string) => this.handlePending('quicknode', txHash));
 
-private async handlePending(source: 'alchemy' | 'quicknode', txHash: string) {
-  const receivedAtMs = Date.now();
-this.lastEventAtMs = receivedAtMs;
+      this.alchemyProvider.on('block', (n: number) => { this.alchemyLastBlock = n; });
+        this.quicknodeProvider.on('block', (n: number) => { this.quicknodeLastBlock = n; });
 
-const event: RawChainEvent = {
-chain: 'avalanche',
-  stateType: 'PENDING',
-  blockOrSeq: source === 'alchemy' ? this.alchemyLastBlock : this.quicknodeLastBlock,
-  receivedAtMs,
-  raw: { source, txHash },
-  };
+      // The underlying raw socket is what actually closes -- ethers' own
+      // WebSocketProvider does not auto-reconnect, so this is the only real
+      // signal that the connection died and needs re-establishing.
+      this.alchemyProvider.websocket.onclose = () => this.scheduleReconnect('alchemy');
+        this.quicknodeProvider.websocket.onclose = () => this.scheduleReconnect('quicknode');
 
-for (const h of this.handlers) h(event);
-}
+      this.reconnectDelayMs = 2000;
+        console.log('[avalanche] connected to both Alchemy and QuickNode pending-tx feeds');
+  }
 
-async disconnect(): Promise<void> {
-  await this.alchemyProvider?.destroy();
-await this.quicknodeProvider?.destroy();
-}
+  private scheduleReconnect(source: 'alchemy' | 'quicknode'): void {
+        if (this.reconnecting) return; // one dropped socket is enough to trigger a full reconnect of both
+      this.reconnecting = true;
+        console.warn(`[avalanche] ${source} websocket closed, reconnecting in ${this.reconnectDelayMs}ms`);
+        setTimeout(() => {
+                this.connect()
+                  .then(() => { this.reconnecting = false; })
+                  .catch((err) => {
+                              console.error('[avalanche] reconnect failed:', err.message);
+                              this.reconnecting = false;
+                              this.reconnectDelayMs = Math.min(this.reconnectDelayMs * 2, 30_000); // back off, cap at 30s
+                                   this.scheduleReconnect(source);
+                  });
+        }, this.reconnectDelayMs);
+  }
 
-onEvent(handler: (event: RawChainEvent) => void): void {
-this.handlers.push(handler);
-}
+  private async handlePending(source: 'alchemy' | 'quicknode', txHash: string) {
+        const receivedAtMs = Date.now();
+        this.lastEventAtMs = receivedAtMs;
 
-async healthCheck(): Promise<{ healthy: boolean; reason?: string }> {
-  const drift = Math.abs(this.alchemyLastBlock - this.quicknodeLastBlock);
-if (drift > 2) {
-return { healthy: false, reason: `providers disagree on block height by ${drift} blocks` };
-}
-const msSinceLastEvent = Date.now() - this.lastEventAtMs;
-if (this.lastEventAtMs > 0 && msSinceLastEvent > 30_000) {
-return { healthy: false, reason: `no pending tx events in ${msSinceLastEvent}ms` };
-}
-return { healthy: true };
-}
+      const provider = source === 'alchemy' ? this.alchemyProvider : this.quicknodeProvider;
+        if (!provider) return;
 
-async fireTransaction(preparedTx: PreparedTransaction): Promise<FireResult> {
-  const submittedAtMs = Date.now();
-const txHash = '0x' + 'PLACEHOLDER'.padEnd(64, '0');
-return { submittedAtMs, txHash, method: 'public' };
-}
+      let tx;
+        try {
+                tx = await provider.getTransaction(txHash);
+        } catch {
+                return;
+        }
+        if (!tx || !tx.to || !tx.data) return;
+
+      const event: RawChainEvent = {
+              chain: 'avalanche',
+              stateType: 'PENDING',
+              blockOrSeq: 'pending',
+              receivedAtMs,
+              raw: { to: tx.to, data: tx.data, from: tx.from, hash: tx.hash },
+      };
+
+      for (const h of this.handlers) h(event);
+  }
+
+  async disconnect(): Promise<void> {
+        await this.alchemyProvider?.destroy();
+        await this.quicknodeProvider?.destroy();
+  }
+
+  onEvent(handler: (event: RawChainEvent) => void): void {
+        this.handlers.push(handler);
+  }
+
+  async healthCheck(): Promise<{ healthy: boolean; reason?: string }> {
+        const drift = Math.abs(this.alchemyLastBlock - this.quicknodeLastBlock);
+        if (drift > 2) {
+                return { healthy: false, reason: `providers disagree on block height by ${drift} blocks` };
+        }
+        const msSinceLastEvent = Date.now() - this.lastEventAtMs;
+        if (this.lastEventAtMs > 0 && msSinceLastEvent > 30_000) {
+                return { healthy: false, reason: `no pending tx events in ${msSinceLastEvent}ms` };
+        }
+        return { healthy: true };
+  }
+
+  async fireTransaction(preparedTx: PreparedTransaction): Promise<FireResult> {
+        const submittedAtMs = Date.now();
+        const txHash = '0x' + 'PLACEHOLDER'.padEnd(64, '0');
+        return { submittedAtMs, txHash, method: 'public' };
+  }
 }
