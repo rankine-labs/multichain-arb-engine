@@ -327,3 +327,80 @@ export async function refetchV3PoolPrice(
           return null;
     }
 }
+
+// ============================================================================
+// V4 (Uniswap V4-style) POOL RESOLVER -- via StateView
+//
+// V4 has no per-pool contract address like V2/V3 -- every pool lives as
+// state inside a single PoolManager, addressed by a poolId (keccak256 hash
+// of the pool's key). StateView is the official read-only helper contract
+// for querying that state off-chain without needing the PoolManager's
+// onchain-only StateLibrary. poolId computation confirmed correct against
+// real, live Robinhood Chain data before this was written (found real
+// active liquidity on all 4 standard fee tiers for a known pair).
+//
+// Standard, no-hook pools use the same fee/tickSpacing convention as V3.
+// This tries those tiers directly via computed poolId -- no factory or
+// discovery registry needed for that common case.
+// ============================================================================
+
+const V4_STATE_VIEW_ABI = [
+      'function getSlot0(bytes32 poolId) view returns (uint160 sqrtPriceX96, int24 tick, uint24 protocolFee, uint24 lpFee)',
+      'function getLiquidity(bytes32 poolId) view returns (uint128 liquidity)',
+    ];
+
+const STANDARD_V4_FEE_TIERS: [number, number][] = [
+      [500, 10],
+      [3000, 60],
+      [10000, 200],
+      [100, 1],
+    ];
+
+export async function resolveAndFetchV4Pool(
+      provider: ethers.JsonRpcProvider,
+      chain: ChainName,
+      dex: string,
+      stateViewAddress: string,
+      tokenA: string,
+      tokenB: string,
+    ): Promise<PoolState | null> {
+      try {
+              const stateView = new ethers.Contract(stateViewAddress, V4_STATE_VIEW_ABI, provider);
+              const [currency0, currency1] = tokenA.toLowerCase() < tokenB.toLowerCase() ? [tokenA, tokenB] : [tokenB, tokenA];
+
+              for (const [fee, tickSpacing] of STANDARD_V4_FEE_TIERS) {
+                        try {
+                                    const encoded = ethers.AbiCoder.defaultAbiCoder().encode(
+                                                  ['address', 'address', 'uint24', 'int24', 'address'],
+                                                  [currency0, currency1, fee, tickSpacing, ethers.ZeroAddress],
+                                                );
+                                    const poolId = ethers.keccak256(encoded);
+
+                                    const liquidity: bigint = await stateView.getLiquidity(poolId);
+                                    if (liquidity === 0n) continue;
+
+                                    const slot0 = await stateView.getSlot0(poolId);
+
+                                    return {
+                                                  chain,
+                                                  dex,
+                                                  poolAddress: poolId,
+                                                  poolType: 'v3',
+                                                  tokenA: currency0,
+                                                  tokenB: currency1,
+                                                  sqrtPriceX96: slot0[0] as bigint,
+                                                  liquidity,
+                                                  feeBps: Math.round(fee / 100),
+                                                  lastUpdatedBlock: 0,
+                                                  lastUpdatedMs: Date.now(),
+                                    };
+                        } catch {
+                                    continue;
+                        }
+              }
+
+              return null;
+      } catch {
+              return null;
+      }
+}
