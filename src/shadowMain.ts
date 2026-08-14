@@ -1,6 +1,6 @@
 import 'dotenv/config';
 import { ethers } from 'ethers';
-import { resolveAndFetchV2Pool, resolveAndFetchLBPool, resolveAndFetchV3Pool, resolveKuruMarket, refetchV2PoolPrice, refetchV3PoolPrice } from './core/poolResolver';
+import { resolveAndFetchV2Pool, resolveAndFetchLBPool, resolveAndFetchV3Pool, resolveAndFetchV4Pool, resolveKuruMarket, refetchV2PoolPrice, refetchV3PoolPrice } from './core/poolResolver';
 import { ChainManager } from './core/chainManager';
 import { PoolCache } from './core/poolCache';
 import { PoolDiscoveryEngine, DiscoveryConfig } from './core/poolDiscovery';
@@ -12,7 +12,7 @@ import { findOptimalTradeSize, calculateAllInProfit, buildOpportunity, calculate
 import { scoreOpportunity, shouldPreArm } from './core/opportunityScorer';
 import { seedKnownAddresses } from './config/knownAddresses';
 import { ethers as ethersV5 } from 'ethers-v5';
-import { MONAD_KURU, ROBINHOOD_V2, ROBINHOOD_V3 } from './config/knownAddresses';
+import { MONAD_KURU, ROBINHOOD_V2, ROBINHOOD_V3, ROBINHOOD_V4, ROBINHOOD_TOKENS } from './config/knownAddresses';
 import { sendTelegramMessage } from './core/telegramSender';
 import { formatHourlySummary, formatSkippedOpportunity , formatDailySummary} from './core/telegramFormatter';
 import { RobinhoodChainAdapter } from './chains/robinhoodChain';
@@ -291,6 +291,20 @@ await chainManager.startAll();
       };
       await seedKuruMarket();
       setInterval(seedKuruMarket, 30_000); // vault liquidity shifts as orders fill — keep it fresh
+
+      // V4 has no per-swap router we can decode yet (its Universal Router uses
+      // encoded commands, a separate problem from reading pool state), so this
+      // uses the same safe pattern as Kuru: seed a known, verified pair
+      // directly from real chain state rather than wait for swap traffic.
+      const seedRobinhoodV4Market = async () => {
+            const resolved = await resolveAndFetchV4Pool(
+                  robinhoodReadProvider, 'robinhood', 'uniswap-v4', ROBINHOOD_V4.STATE_VIEW,
+                  ROBINHOOD_TOKENS.WETH, ROBINHOOD_TOKENS.USDG,
+                  );
+            if (resolved) cache.upsert(resolved);
+      };
+      await seedRobinhoodV4Market();
+      setInterval(seedRobinhoodV4Market, 30_000);
   const lastHealthStatus: Record<string, boolean> = { avalanche: true, monad: true, robinhood: true };
       setInterval(async () => {
             await chainManager.runHealthChecks();
