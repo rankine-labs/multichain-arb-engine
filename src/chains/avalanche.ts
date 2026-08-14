@@ -28,6 +28,12 @@ private quicknodeLastBlock = 0;
 private lastEventAtMs = 0;
 
 async connect(): Promise<void> {
+    // Clean up any previous connection before reconnecting -- otherwise a
+    // reconnect attempt after the socket died leaks the old (dead) provider
+    // and its listeners instead of replacing them.
+    try { this.alchemyProvider?.destroy(); } catch { /* already dead, fine */ }
+    try { this.quicknodeProvider?.destroy(); } catch { /* already dead, fine */ }
+  
     this.alchemyProvider = new ethers.WebSocketProvider(ALCHEMY_WSS, 43114); // explicit chainId — public AVAX endpoint doesn't support eth_chainId, breaking ethers' auto-detection
     this.quicknodeProvider = new ethers.WebSocketProvider(QUICKNODE_WSS, 43114);
 
