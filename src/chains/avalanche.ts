@@ -55,8 +55,8 @@ export class AvalancheAdapter implements ChainCapability {
       // The underlying raw socket is what actually closes -- ethers' own
       // WebSocketProvider does not auto-reconnect, so this is the only real
       // signal that the connection died and needs re-establishing.
-      this.alchemyProvider.websocket.onclose = () => this.scheduleReconnect('alchemy');
-        this.quicknodeProvider.websocket.onclose = () => this.scheduleReconnect('quicknode');
+(this.alchemyProvider.websocket as any).on('close', () => this.scheduleReconnect('alchemy'));
+          (this.quicknodeProvider.websocket as any).on('close', () => this.scheduleReconnect('quicknode'));
 
       this.reconnectDelayMs = 2000;
         console.log('[avalanche] connected to both Alchemy and QuickNode pending-tx feeds');
