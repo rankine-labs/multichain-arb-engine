@@ -139,7 +139,7 @@ return [
   '',
   'PERFORMANCE',
   `Average Reaction: ${input.avgReactionMs.toFixed(0)}ms`,
-  `Worst Typical Reaction: ${input.p95ReactionMs.toFixed(0)}ms`,
+  `Fast 95% of Time: ${input.p95ReactionMs.toFixed(0)}ms`,
   ].join('\n');
           }
 
