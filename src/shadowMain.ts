@@ -12,7 +12,7 @@ import { findOptimalTradeSize, calculateAllInProfit, buildOpportunity, calculate
 import { scoreOpportunity, shouldPreArm } from './core/opportunityScorer';
 import { seedKnownAddresses } from './config/knownAddresses';
 import { ethers as ethersV5 } from 'ethers-v5';
-import { MONAD_KURU, ROBINHOOD_V2, ROBINHOOD_V3, ROBINHOOD_V4, ROBINHOOD_TOKENS } from './config/knownAddresses';
+import { MONAD_KURU, MONAD_BEAN, ROBINHOOD_V2, ROBINHOOD_V3, ROBINHOOD_V4, ROBINHOOD_TOKENS } from './config/knownAddresses';
 import { sendTelegramMessage } from './core/telegramSender';
 import { formatHourlySummary, formatSkippedOpportunity , formatDailySummary} from './core/telegramFormatter';
 import { RobinhoodChainAdapter } from './chains/robinhoodChain';
@@ -49,7 +49,7 @@ monad: {
 chain: 'monad',
 minLiquidityUsd: 25_000,
 minRecent24hVolumeUsd: 10_000,
-    approvedDexes: new Set(['uniswap-v3', 'ambient', 'kuru']),
+    approvedDexes: new Set(['uniswap-v3', 'bean-exchange', 'kuru']),
 },
 robinhood: {
 chain: 'robinhood',
