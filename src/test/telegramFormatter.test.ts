@@ -27,8 +27,10 @@ assert(missedMsg.includes('LARGE ARB MISSED'), 'missed message has correct heade
 assert(missedMsg.includes('Winner: Another Searcher'), 'missed message shows winner');
 
 const skippedMsg = formatSkippedOpportunity({
-chain: 'avalanche', grossOpportunityUsd: 738, optimalTradeUsd: 191_000,
-expectedNetUsd: 24, minRequiredUsd: 30,
+    chain: 'avalanche', pair: 'WETH.../USDC...', buyDex: 'traderjoe-v1', sellDex: 'pharaoh',
+    buyPrice: 42.10, sellPrice: 42.35, spreadPct: 0.59,
+    grossOpportunityUsd: 738, optimalTradeUsd: 191_000,
+    expectedNetUsd: 24, minRequiredUsd: 30,
 });
 assert(skippedMsg.includes('SKIPPED'), 'skipped message declares SKIPPED');
 assert(skippedMsg.includes('Minimum: $30'), 'skipped message shows the minimum threshold');
