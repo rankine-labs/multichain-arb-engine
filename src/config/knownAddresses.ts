@@ -66,8 +66,8 @@ UNIVERSAL_ROUTER: '0x0D97dc33264BFC1c226207428A79b26757Fb9dc3',
   // confirmed to return real pool data using the same getAllLBPairs()
   // interface our existing LB resolver already calls ---
   export const MONAD_BEAN = {
-      DLMM_FACTORY: '0x8Bb9727Ca742C146563DCcBAfb9308A234E1d242',
-      DLMM_ROUTER: '0x721aC9E688E6B86F48b08DB2Ba2D4b7bBBd12665',
+          DLMM_FACTORY: '0x8Bb9727Ca742C146563DCcBAfb9308A234e1d242',
+          DLMM_ROUTER: '0x721aC9E688E6b86F48b08DB2ba2D4B7bBBd12665',
   };
 
 // Verified via live bytecode check against the real Robinhood Chain
