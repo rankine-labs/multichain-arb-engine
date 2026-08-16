@@ -337,6 +337,52 @@ await chainManager.startAll();
       };
       await seedRobinhoodV4Market();
       setInterval(seedRobinhoodV4Market, 30_000);
+
+      // Proof-of-life price check -- completely separate from the $30
+      // opportunity threshold above. Scans whatever pools are already
+      // cached (from either real swap traffic or the static seeds just
+      // above) for any pair with two or more venues, and reports their
+      // real prices side by side, however small the gap. This exists
+      // purely so it's possible to directly verify the bot is comparing
+      // genuine on-chain prices, without waiting for a rare, large,
+      // profitable opportunity to happen to occur.
+      const priceOfPool = (p: any): number | null => {
+            if (p.poolType === 'v3' && p.sqrtPriceX96) {
+                  const price = Number(p.sqrtPriceX96) / 2 ** 96;
+                  return price * price;
+            }
+            if (p.reserveA !== undefined && p.reserveB !== undefined && p.reserveA > 0n) {
+                  return Number(p.reserveB) / Number(p.reserveA);
+            }
+            return null;
+      };
+      const runProofOfLifeCheck = async () => {
+            for (const chain of ['avalanche', 'monad', 'robinhood'] as const) {
+                  const pools = cache.allForChain(chain);
+                  const seenPairs = new Set<string>();
+                  for (const pool of pools) {
+                        const pairKey = [pool.tokenA.toLowerCase(), pool.tokenB.toLowerCase()].sort().join('-');
+                        if (seenPairs.has(pairKey)) continue;
+                        seenPairs.add(pairKey);
+                        const peers = cache.findPeerPools(chain, pool.tokenA, pool.tokenB, pool.poolAddress);
+                        if (peers.length === 0) continue;
+                        const priceA = priceOfPool(pool);
+                        const priceB = priceOfPool(peers[0]);
+                        if (priceA === null || priceB === null || priceA === 0) continue;
+                        const spreadPct = ((priceB - priceA) / priceA) * 100;
+                        await sendTelegramMessage([
+                              'LIVE PRICE CHECK (proof of life, not an opportunity alert)',
+                              `Chain: ${chain}`,
+                              `Pair: ${pool.tokenA.slice(0, 8)}.../${pool.tokenB.slice(0, 8)}...`,
+                              `${pool.dex}: ${priceA}`,
+                              `${peers[0].dex}: ${priceB}`,
+                              `Spread: ${spreadPct.toFixed(4)}%`,
+                              ].join('\n'));
+                  }
+            }
+      };
+      setInterval(runProofOfLifeCheck, 120_000);
+      setTimeout(runProofOfLifeCheck, 10_000); // first check shortly after startup, not a full 2 minutes
   const lastHealthStatus: Record<string, boolean> = { avalanche: true, monad: true, robinhood: true };
       setInterval(async () => {
             await chainManager.runHealthChecks();
