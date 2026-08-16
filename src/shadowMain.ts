@@ -254,13 +254,37 @@ shadowLogger.record({ opportunity, outcome: 'SKIPPED_BELOW_MIN_PROFIT', ourHypot
       // "no play-by-play noise") — gross opportunity had to clear a real bar
       // even though it netted below the $20 minimum after costs.
       if (sizing.grossProfitUsd >= 50) {
-            await sendTelegramMessage(formatSkippedOpportunity({
-                  chain: swap.chain,
-                  grossOpportunityUsd: sizing.grossProfitUsd,
-                  optimalTradeUsd: sizing.optimalTradeSizeUsd,
-                  expectedNetUsd: profit.conservativeNetProfitUsd,
-                  minRequiredUsd: 20,
-            }));
+              // Real per-DEX prices, not just USD amounts, so the person watching
+              // Telegram can directly verify the bot is comparing genuine market
+              // prices rather than just trusting an opaque dollar figure.
+              const priceOf = (p: any): number | null => {
+                      if (p.poolType === 'v3' && p.sqrtPriceX96) {
+                              const price = Number(p.sqrtPriceX96) / 2 ** 96;
+                              return price * price;
+                      }
+                      if (p.reserveA !== undefined && p.reserveB !== undefined && p.reserveA > 0n) {
+                              return Number(p.reserveB) / Number(p.reserveA);
+                      }
+                      return null;
+              };
+              const buyPrice = priceOf(pool);
+              const sellPrice = priceOf(sellPool);
+              if (buyPrice !== null && sellPrice !== null && buyPrice > 0) {
+                      const spreadPct = ((sellPrice - buyPrice) / buyPrice) * 100;
+                      await sendTelegramMessage(formatSkippedOpportunity({
+                              chain: swap.chain,
+                              pair: `${swap.tokenIn.slice(0, 8)}.../${swap.tokenOut.slice(0, 8)}...`,
+                              buyDex: pool.dex,
+                              sellDex: sellPool.dex,
+                              buyPrice,
+                              sellPrice,
+                              spreadPct,
+                              grossOpportunityUsd: sizing.grossProfitUsd,
+                              optimalTradeUsd: sizing.optimalTradeSizeUsd,
+                              expectedNetUsd: profit.conservativeNetProfitUsd,
+                              minRequiredUsd: 20,
+                      }));
+              }
       }
 return;
 }
