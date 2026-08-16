@@ -129,6 +129,12 @@ dex: 'uniswap-v3',
 style: 'v3',
 };
 
+    registry.monad[MONAD_BEAN.DLMM_ROUTER.toLowerCase()] = {
+        dex: 'bean-exchange',
+        style: 'lb',
+        factory: MONAD_BEAN.DLMM_FACTORY,
+    };
+
     registry.robinhood[ROBINHOOD_V2.ROUTER.toLowerCase()] = {
         dex: 'uniswap-v2',
         style: 'v2',
