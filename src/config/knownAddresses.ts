@@ -61,6 +61,15 @@ STATE_VIEW: '0x77395F3B2E73aE90843717371294fa97CC419d64',
 UNIVERSAL_ROUTER: '0x0D97dc33264BFC1c226207428A79b26757Fb9dc3',
 };
 
+  // --- Monad: Bean Exchange (DLMM -- same bin-based liquidity model as
+  // TraderJoe LB) -- addresses verified via live bytecode check, factory
+  // confirmed to return real pool data using the same getAllLBPairs()
+  // interface our existing LB resolver already calls ---
+  export const MONAD_BEAN = {
+      DLMM_FACTORY: '0x8Bb9727Ca742C146563DCcBAfb9308A234E1d242',
+      DLMM_ROUTER: '0x721aC9E688E6B86F48b08DB2Ba2D4b7bBBd12665',
+  };
+
 // Verified via live bytecode check against the real Robinhood Chain
 // mainnet RPC (https://rpc.mainnet.chain.robinhood.com, chain ID 4663) —
 // every address below has confirmed on-chain bytecode, not just
