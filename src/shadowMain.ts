@@ -181,6 +181,14 @@ if (registerIfApproved('avalanche', entry.dex, resolved)) pool = resolved;
                 if (registerIfApproved('monad', entry.dex, resolved)) pool = resolved;
           }
 
+          if (entry?.factory && swap.chain === 'monad' && entry.style === 'lb') {
+                const resolved = await resolveAndFetchLBPool(
+                      monadReadProvider, swap.chain, entry.dex, entry.factory,
+                      swap.tokenIn, swap.tokenOut, 20,
+                      );
+                if (registerIfApproved('monad', entry.dex, resolved)) pool = resolved;
+          }
+
           if (entry?.factory && swap.chain === 'robinhood' && entry.style === 'v2') {
                 const resolved = await resolveAndFetchV2Pool(
                       robinhoodReadProvider, swap.chain, entry.dex, entry.factory,
