@@ -12,7 +12,7 @@ import { findOptimalTradeSize, calculateAllInProfit, buildOpportunity, calculate
 import { scoreOpportunity, shouldPreArm } from './core/opportunityScorer';
 import { seedKnownAddresses } from './config/knownAddresses';
 import { ethers as ethersV5 } from 'ethers-v5';
-import { MONAD_KURU, MONAD_BEAN, ROBINHOOD_V2, ROBINHOOD_V3, ROBINHOOD_V4, ROBINHOOD_TOKENS } from './config/knownAddresses';
+import { MONAD_KURU, MONAD_ROUTERS, MONAD_TOKENS, MONAD_BEAN, ROBINHOOD_V2, ROBINHOOD_V3, ROBINHOOD_V4, ROBINHOOD_TOKENS } from './config/knownAddresses';
 import { sendTelegramMessage } from './core/telegramSender';
 import { formatHourlySummary, formatSkippedOpportunity , formatDailySummary} from './core/telegramFormatter';
 import { RobinhoodChainAdapter } from './chains/robinhoodChain';
@@ -337,6 +337,34 @@ await chainManager.startAll();
       };
       await seedRobinhoodV4Market();
       setInterval(seedRobinhoodV4Market, 30_000);
+
+      // Both Kuru's MON/USDC and V4's WETH/USDG above are guaranteed to be
+      // in cache, but have no peer to compare against unless real swap
+      // traffic happens to also hit their JIT-discovered counterparts on
+      // the same specific pair. Confirmed live: after a fresh restart,
+      // neither had a match yet, so the proof-of-life check below found
+      // nothing to report. These two calls directly seed a real,
+      // same-chain, same-pair peer for each, so a genuine comparison is
+      // guaranteed to exist immediately rather than depend on timing.
+      const seedMonadV3Peer = async () => {
+            const resolved = await resolveAndFetchV3Pool(
+                  monadReadProvider, 'monad', 'uniswap-v3', MONAD_ROUTERS.UNISWAP_V3_FACTORY,
+                  MONAD_TOKENS.WMON, MONAD_TOKENS.USDC,
+                  );
+            if (resolved) cache.upsert(resolved);
+      };
+      await seedMonadV3Peer();
+      setInterval(seedMonadV3Peer, 30_000);
+
+      const seedRobinhoodV2Peer = async () => {
+            const resolved = await resolveAndFetchV2Pool(
+                  robinhoodReadProvider, 'robinhood', 'uniswap-v2', ROBINHOOD_V2.FACTORY,
+                  ROBINHOOD_TOKENS.WETH, ROBINHOOD_TOKENS.USDG, 30,
+                  );
+            if (resolved) cache.upsert(resolved);
+      };
+      await seedRobinhoodV2Peer();
+      setInterval(seedRobinhoodV2Peer, 30_000);
 
       // Proof-of-life price check -- completely separate from the $30
       // opportunity threshold above. Scans whatever pools are already
