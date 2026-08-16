@@ -253,7 +253,7 @@ shadowLogger.record({ opportunity, outcome: 'SKIPPED_BELOW_MIN_PROFIT', ourHypot
       // Only significant near-misses go to Telegram (per architecture doc:
       // "no play-by-play noise") — gross opportunity had to clear a real bar
       // even though it netted below the $20 minimum after costs.
-      if (sizing.grossProfitUsd >= 50) {
+      if (sizing.grossProfitUsd >= 30) {
               // Real per-DEX prices, not just USD amounts, so the person watching
               // Telegram can directly verify the bot is comparing genuine market
               // prices rather than just trusting an opaque dollar figure.
