@@ -65,23 +65,33 @@ winner: string;
 // Only significant skips get sent — routine below-threshold skips stay in
 // the analytics DB, not Telegram, per "no play-by-play noise."
 export function formatSkippedOpportunity(params: {
-chain: ChainName;
-grossOpportunityUsd: number;
-optimalTradeUsd: number;
-expectedNetUsd: number;
-minRequiredUsd: number;
-                   }): string {
-  return [
-  'LARGE OPPORTUNITY SKIPPED',
-  `Chain: ${params.chain}`,
-  `Gross Opportunity: $${params.grossOpportunityUsd.toFixed(0)}`,
-  `Optimal Trade: $${params.optimalTradeUsd.toFixed(0)}`,
-  `Expected Net: $${params.expectedNetUsd.toFixed(0)}`,
-  `Minimum: $${params.minRequiredUsd.toFixed(0)}`,
-  'Decision: SKIPPED',
-  'Reason: Profit below minimum after fees and safety margin.',
-  ].join('\n');
-              }
+    chain: ChainName;
+    pair: string;
+    buyDex: string;
+    sellDex: string;
+    buyPrice: number;
+    sellPrice: number;
+    spreadPct: number;
+    grossOpportunityUsd: number;
+    optimalTradeUsd: number;
+    expectedNetUsd: number;
+    minRequiredUsd: number;
+}): string {
+    return [
+        'LARGE OPPORTUNITY SKIPPED',
+        `Chain: ${params.chain}`,
+        `Pair: ${params.pair}`,
+        `Buy: ${params.buyDex} @ ${params.buyPrice}`,
+        `Sell: ${params.sellDex} @ ${params.sellPrice}`,
+        `Spread: ${params.spreadPct.toFixed(2)}%`,
+        `Gross Opportunity: $${params.grossOpportunityUsd.toFixed(0)}`,
+        `Optimal Trade: $${params.optimalTradeUsd.toFixed(0)}`,
+        `Expected Net: $${params.expectedNetUsd.toFixed(0)}`,
+        `Minimum: $${params.minRequiredUsd.toFixed(0)}`,
+        'Decision: SKIPPED',
+        'Reason: Profit below minimum after fees and safety margin.',
+        ].join('\n');
+}
 
 export interface HourlySummaryInput {
   activeChains: Record<ChainName, boolean>;
