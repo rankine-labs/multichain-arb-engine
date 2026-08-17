@@ -14,6 +14,27 @@ import { seedKnownAddresses } from './config/knownAddresses';
 import { ethers as ethersV5 } from 'ethers-v5';
 import { MONAD_KURU, MONAD_ROUTERS, MONAD_TOKENS, MONAD_BEAN, ROBINHOOD_V2, ROBINHOOD_V3, ROBINHOOD_V4, ROBINHOOD_TOKENS } from './config/knownAddresses';
 import { sendTelegramMessage } from './core/telegramSender';
+
+// Real token names for Telegram messages instead of raw contract
+// addresses -- covers the tokens we're already actively watching.
+// Unknown tokens fall back to a truncated address rather than
+// guessing a name.
+const TOKEN_SYMBOLS: Record<string, Record<string, string>> = {
+    monad: {
+        [MONAD_TOKENS.WMON.toLowerCase()]: 'WMON',
+        [MONAD_TOKENS.USDC.toLowerCase()]: 'USDC',
+    },
+    robinhood: {
+        [ROBINHOOD_TOKENS.WETH.toLowerCase()]: 'WETH',
+        [ROBINHOOD_TOKENS.USDG.toLowerCase()]: 'USDG',
+    },
+    avalanche: {},
+};
+function symbolOf(chain: string, address: string): string {
+    const known = TOKEN_SYMBOLS[chain]?.[address.toLowerCase()];
+    if (known) return known;
+    return `${address.slice(0, 6)}...${address.slice(-4)}`;
+}
 import { formatHourlySummary, formatSkippedOpportunity , formatDailySummary} from './core/telegramFormatter';
 import { RobinhoodChainAdapter } from './chains/robinhoodChain';
 import { MonadAdapter } from './chains/monad';
@@ -273,7 +294,7 @@ shadowLogger.record({ opportunity, outcome: 'SKIPPED_BELOW_MIN_PROFIT', ourHypot
                       const spreadPct = ((sellPrice - buyPrice) / buyPrice) * 100;
                       await sendTelegramMessage(formatSkippedOpportunity({
                               chain: swap.chain,
-                              pair: `${swap.tokenIn.slice(0, 8)}.../${swap.tokenOut.slice(0, 8)}...`,
+        pair: `${symbolOf(swap.chain, swap.tokenIn)}/${symbolOf(swap.chain, swap.tokenOut)}`,
                               buyDex: pool.dex,
                               sellDex: sellPool.dex,
                               buyPrice,
@@ -401,7 +422,7 @@ await chainManager.startAll();
                         await sendTelegramMessage([
                               'LIVE PRICE CHECK (proof of life, not an opportunity alert)',
                               `Chain: ${chain}`,
-                              `Pair: ${pool.tokenA.slice(0, 8)}.../${pool.tokenB.slice(0, 8)}...`,
+        `Pair: ${symbolOf(chain, pool.tokenA)}/${symbolOf(chain, pool.tokenB)}`,
                               `${pool.dex}: ${priceA}`,
                               `${peers[0].dex}: ${priceB}`,
                               `Spread: ${spreadPct.toFixed(4)}%`,
