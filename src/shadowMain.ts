@@ -430,8 +430,8 @@ await chainManager.startAll();
                   }
             }
       };
-      setInterval(runProofOfLifeCheck, 120_000);
-      setTimeout(runProofOfLifeCheck, 10_000); // first check shortly after startup, not a full 2 minutes
+              setInterval(runProofOfLifeCheck, 60 * 60 * 1000); // hourly, plus once on startup below
+          setTimeout(runProofOfLifeCheck, 10_000); // one check shortly after startup too
   const lastHealthStatus: Record<string, boolean> = { avalanche: true, monad: true, robinhood: true };
       setInterval(async () => {
             await chainManager.runHealthChecks();
