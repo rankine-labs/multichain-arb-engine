@@ -90,8 +90,8 @@ export const ROBINHOOD_V3 = {
 // v2-style factory/router — resolveAndFetchV2Pool (poolResolver.ts) works
 // with this directly, same pattern as TraderJoe/SushiSwap on Avalanche.
 export const ROBINHOOD_V2 = {
-FACTORY: '0x8bcEaA40B9AcdfAedF85AdF4FF01F5Ad6517937F',
-    ROUTER: '0x89e5DB8B5aA49aA85AC63f691524311AEB649eba',
+  FACTORY: '0x8bceaa40b9acdfaedf85adf4ff01f5ad6517937f', // lowercase, no checksum -- same fix as MONAD_BEAN
+      ROUTER: '0x89e5db8b5aa49aa85ac63f691524311aeb649eba',
 };
 
 // --- Robinhood Chain — token addresses verified across three independent
