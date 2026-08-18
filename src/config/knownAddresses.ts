@@ -70,6 +70,19 @@ UNIVERSAL_ROUTER: '0x0D97dc33264BFC1c226207428A79b26757Fb9dc3',
               DLMM_ROUTER: '0x721ac9e688e6b86f48b08db2ba2d4b7bbbd12665',
   };
 
+  // --- Monad: LFJ (the rebranded TraderJoe -- confirmed via LFJ's own
+  // official developer docs, addresses verified via live bytecode check
+  // on Monad mainnet). Has two product lines: the LB/DLMM pools (same
+  // bin-based model as Bean Exchange/TraderJoe LB, already supported)
+  // and the classic V1 constant-product pools (same model as our
+  // existing V2 resolver) ---
+  export const MONAD_LFJ = {
+      LB_FACTORY: '0xb43120c4745967fa9b93e79c149e66b0f2d6fe0c',
+      LB_ROUTER: '0x18556da13313f3532c54711497a8fedac273220e',
+      V1_FACTORY: '0xe32d45c2b1c17a0fe0de76f1ebfa7c44b7810034',
+      V1_ROUTER: '0x4face5b0ef2757ceb9151d14c036a1135931c70e',
+  };
+
 // Verified via live bytecode check against the real Robinhood Chain
 // mainnet RPC (https://rpc.mainnet.chain.robinhood.com, chain ID 4663) —
 // every address below has confirmed on-chain bytecode, not just
