@@ -148,6 +148,18 @@ style: 'v3',
         factory: MONAD_BEAN.DLMM_FACTORY,
     };
 
+    registry.monad[MONAD_LFJ.LB_ROUTER.toLowerCase()] = {
+        dex: 'lfj-lb',
+        style: 'lb',
+        factory: MONAD_LFJ.LB_FACTORY,
+    };
+
+    registry.monad[MONAD_LFJ.V1_ROUTER.toLowerCase()] = {
+        dex: 'lfj-v1',
+        style: 'v2',
+        factory: MONAD_LFJ.V1_FACTORY,
+    };
+
     registry.robinhood[ROBINHOOD_V2.ROUTER.toLowerCase()] = {
         dex: 'uniswap-v2',
         style: 'v2',
