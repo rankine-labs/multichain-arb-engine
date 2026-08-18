@@ -83,6 +83,18 @@ UNIVERSAL_ROUTER: '0x0D97dc33264BFC1c226207428A79b26757Fb9dc3',
       V1_ROUTER: '0x4face5b0ef2757ceb9151d14c036a1135931c70e',
   };
 
+  // --- Monad: PancakeSwap (V2 + V3 -- addresses provided by the user,
+  // verified via live bytecode check on Monad mainnet before use).
+  // V3SwapRouter and V3UniversalRouter both proxy to the same V3
+  // factory, so both are registered pointing to it ---
+  export const MONAD_PANCAKE = {
+      V3_FACTORY: '0x0bfbcf9fa4f9c56b0f40a671ad40e0805a091865',
+      V3_SWAP_ROUTER: '0x1b81d678ffb9c0263b24a97847620c99d213eb14',
+      V3_UNIVERSAL_ROUTER: '0x23682a588cf2601aca977df200938634c9f7d552',
+      V2_FACTORY: '0x02a84c1b3bbd7401a5f7fa98a384ebc70bb5749e',
+      V2_ROUTER: '0xb1bc24c34e88f7d43d5923034e3a14b24daacff9',
+  };
+
 // Verified via live bytecode check against the real Robinhood Chain
 // mainnet RPC (https://rpc.mainnet.chain.robinhood.com, chain ID 4663) —
 // every address below has confirmed on-chain bytecode, not just
@@ -106,6 +118,20 @@ export const ROBINHOOD_V2 = {
   FACTORY: '0x8bceaa40b9acdfaedf85adf4ff01f5ad6517937f', // lowercase, no checksum -- same fix as MONAD_BEAN
       ROUTER: '0x89e5db8b5aa49aa85ac63f691524311aeb649eba',
 };
+
+  // --- Robinhood Chain: PancakeSwap (V2 + V3 -- addresses provided by
+  // the user, verified via live bytecode check on Robinhood mainnet
+  // before use). Robinhood does NOT have a plain V3 SwapRouter deployed
+  // -- only SmartRouter and V3UniversalRouter -- both registered
+  // pointing to the shared V3 factory ---
+  export const ROBINHOOD_PANCAKE = {
+      V3_FACTORY: '0x0bfbcf9fa4f9c56b0f40a671ad40e0805a091865',
+      V3_QUOTER_V2: '0x8553aa1615549a86882151784b329b017aa7c832',
+      V3_UNIVERSAL_ROUTER: '0xe28c0e44f4016b073db20cf28971cac6ce3664d3',
+      SMART_ROUTER: '0x13f4ea83d0bd40e75c8222255bc855a974568dd4',
+      V2_FACTORY: '0x02a84c1b3bbd7401a5f7fa98a384ebc70bb5749e',
+      V2_ROUTER: '0x8cfe327cec66d1c090dd72bd0ff11d690c33a2eb',
+  };
 
 // --- Robinhood Chain — token addresses verified across three independent
 // sources: 1inch help docs, Blockscout explorer (direct on-chain lookup),
