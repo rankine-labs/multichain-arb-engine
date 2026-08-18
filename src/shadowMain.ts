@@ -51,6 +51,17 @@ const decoder = new TransactionDecoder(routerRegistry);
 const filter = new FastFilter(cache);
 const priceOracle = new PriceOracle(cache);
 
+      // Real proof that live trading is being compared, not just checked
+      // on a timer -- every genuine peer match found during real swap
+      // processing this hour goes here (regardless of dollar profit),
+      // keyed by chain+pair so repeated trades on the same pair just keep
+      // the largest spread seen, not a flood of duplicates. Sent and
+      // cleared every hour.
+      const hourlyMatches = new Map<string, {
+            chain: string; pair: string; buyDex: string; sellDex: string;
+            buyPrice: number; sellPrice: number; spreadPct: number;
+      }>();
+
     // Read-only provider for JIT pool resolution (factory.getPair + reserve
     // reads) — separate from the WebSocket providers used for event feeds,
     // and explicit chainId since the public AVAX endpoint doesn't support
@@ -241,6 +252,39 @@ if (registerIfApproved('avalanche', entry.dex, resolved)) pool = resolved;
     const peers = pool ? cache.findPeerPools(swap.chain, swap.tokenIn, swap.tokenOut, pool.poolAddress) : [];
     if (!pool || peers.length === 0) return;
     const sellPool = peers[0];
+
+      // Record this real, genuine match for the hourly proof-of-activity
+      // report -- happens for every real peer match found, independent
+      // of whether it's profitable enough to alert on.
+      const matchPriceOf = (p: any): number | null => {
+            if (p.poolType === 'v3' && p.sqrtPriceX96) {
+                  const price = Number(p.sqrtPriceX96) / 2 ** 96;
+                  return price * price;
+            }
+            if (p.reserveA !== undefined && p.reserveB !== undefined && p.reserveA > 0n) {
+                  return Number(p.reserveB) / Number(p.reserveA);
+            }
+            return null;
+      };
+      const matchBuyPrice = matchPriceOf(pool);
+      const matchSellPrice = matchPriceOf(sellPool);
+      if (matchBuyPrice !== null && matchSellPrice !== null && matchBuyPrice > 0) {
+            const matchSpreadPct = Math.abs((matchSellPrice - matchBuyPrice) / matchBuyPrice) * 100;
+            const matchPairLabel = `${symbolOf(swap.chain, pool.tokenA)}/${symbolOf(swap.chain, pool.tokenB)}`;
+            const matchKey = `${swap.chain}:${matchPairLabel}`;
+            const existingMatch = hourlyMatches.get(matchKey);
+            if (!existingMatch || matchSpreadPct > existingMatch.spreadPct) {
+                  hourlyMatches.set(matchKey, {
+                        chain: swap.chain,
+                        pair: matchPairLabel,
+                        buyDex: pool.dex,
+                        sellDex: sellPool.dex,
+                        buyPrice: matchBuyPrice,
+                        sellPrice: matchSellPrice,
+                        spreadPct: matchSpreadPct,
+                  });
+            }
+      }
 
 const tokenInIsA = swap.tokenIn.toLowerCase() === pool.tokenA.toLowerCase();
 
@@ -487,6 +531,27 @@ p95ReactionMs: summary.p95ReactionMs ?? 0,
 
 await sendTelegramMessage(message);
 }, 60 * 60 * 1000);
+
+      // Sends whatever real matches were actually found this hour, then
+      // clears for the next hour. If this comes back empty, that's a
+      // real, honest answer too -- it means no two watched exchanges
+      // traded the same pair close enough together to compare, not that
+      // anything is broken.
+      setInterval(async () => {
+            const found = [...hourlyMatches.values()].sort((a, b) => b.spreadPct - a.spreadPct);
+            const top = found.slice(0, 15);
+            const lines = [
+                  'REAL MATCHES FOUND THIS HOUR',
+                  found.length === 0
+                  ? 'None -- no two watched exchanges traded the same pair close enough together to compare.'
+                  : `${found.length} unique pair(s) matched, showing top ${top.length} by spread:`,
+                  ...top.map(m =>
+                        `${m.chain} ${m.pair}: ${m.buyDex} @ ${m.buyPrice} vs ${m.sellDex} @ ${m.sellPrice} (${m.spreadPct.toFixed(4)}% spread)`
+                        ),
+                  ];
+            await sendTelegramMessage(lines.join('\n'));
+            hourlyMatches.clear();
+      }, 60 * 60 * 1000);
 
       setInterval(async () => {
             const summary = shadowLogger.summary();
