@@ -23,6 +23,8 @@ const TOKEN_SYMBOLS: Record<string, Record<string, string>> = {
     monad: {
         [MONAD_TOKENS.WMON.toLowerCase()]: 'WMON',
         [MONAD_TOKENS.USDC.toLowerCase()]: 'USDC',
+            [MONAD_TOKENS.WETH.toLowerCase()]: 'WETH',
+            [MONAD_TOKENS.CBBTC.toLowerCase()]: 'cbBTC',
     },
     robinhood: {
         [ROBINHOOD_TOKENS.WETH.toLowerCase()]: 'WETH',
@@ -441,6 +443,80 @@ await chainManager.startAll();
       };
       await seedRobinhoodV2Peer();
       setInterval(seedRobinhoodV2Peer, 30_000);
+
+      // Proactively checks known, real multi-DEX pairs directly on a
+      // timer, instead of waiting for real swap traffic to happen to
+      // reveal both sides. Every venue below was confirmed to have real,
+      // live liquidity before being added -- see tonight's verification.
+      // Tier 1 only for now: MON/USDC, WETH/USDC, cbBTC/USDC, each
+      // checked across the 5 Monad DEXs we have real addresses for.
+      const monadWatchVenues: Array<{ dex: string; style: 'v2' | 'v3' | 'lb'; factory: string }> = [
+          { dex: 'uniswap-v3', style: 'v3', factory: MONAD_ROUTERS.UNISWAP_V3_FACTORY },
+          { dex: 'lfj-lb', style: 'lb', factory: MONAD_LFJ.LB_FACTORY },
+          { dex: 'lfj-v1', style: 'v2', factory: MONAD_LFJ.V1_FACTORY },
+          { dex: 'pancakeswap-v3', style: 'v3', factory: MONAD_PANCAKE.V3_FACTORY },
+          { dex: 'pancakeswap-v2', style: 'v2', factory: MONAD_PANCAKE.V2_FACTORY },
+            ];
+
+      const monadWatchedPairs: Array<{ tokenA: string; tokenB: string }> = [
+          { tokenA: MONAD_TOKENS.WMON, tokenB: MONAD_TOKENS.USDC },
+          { tokenA: MONAD_TOKENS.WETH, tokenB: MONAD_TOKENS.USDC },
+          { tokenA: MONAD_TOKENS.CBBTC, tokenB: MONAD_TOKENS.USDC },
+            ];
+
+      const watchListPriceOf = (p: any): number | null => {
+            if (p.poolType === 'v3' && p.sqrtPriceX96) {
+                  const price = Number(p.sqrtPriceX96) / 2 ** 96;
+                  return price * price;
+            }
+            if (p.reserveA !== undefined && p.reserveB !== undefined && p.reserveA > 0n) {
+                  return Number(p.reserveB) / Number(p.reserveA);
+            }
+            return null;
+      };
+
+      const checkMonadWatchList = async () => {
+            for (const { tokenA, tokenB } of monadWatchedPairs) {
+                  const resolved: any[] = [];
+                  for (const v of monadWatchVenues) {
+                        try {
+                              let pool: any = null;
+                              if (v.style === 'v3') {
+                                    pool = await resolveAndFetchV3Pool(monadReadProvider, 'monad', v.dex, v.factory, tokenA, tokenB);
+                              } else if (v.style === 'v2') {
+                                    pool = await resolveAndFetchV2Pool(monadReadProvider, 'monad', v.dex, v.factory, tokenA, tokenB, 30);
+                              } else if (v.style === 'lb') {
+                                    pool = await resolveAndFetchLBPool(monadReadProvider, 'monad', v.dex, v.factory, tokenA, tokenB, 20);
+                              }
+                              if (pool) { cache.upsert(pool); resolved.push(pool); }
+                        } catch { /* venue may genuinely have no pool for this pair yet */ }
+                  }
+                  for (let i = 0; i < resolved.length; i++) {
+                        for (let j = i + 1; j < resolved.length; j++) {
+                              const priceA = watchListPriceOf(resolved[i]);
+                              const priceB = watchListPriceOf(resolved[j]);
+                              if (priceA === null || priceB === null || priceA === 0) continue;
+                              const spreadPct = Math.abs((priceB - priceA) / priceA) * 100;
+                              const pairLabel = `${symbolOf('monad', tokenA)}/${symbolOf('monad', tokenB)}`;
+                              const watchKey = `monad:${pairLabel}`;
+                              const existingWatch = hourlyMatches.get(watchKey);
+                              if (!existingWatch || spreadPct > existingWatch.spreadPct) {
+                                    hourlyMatches.set(watchKey, {
+                                          chain: 'monad',
+                                          pair: pairLabel,
+                                          buyDex: resolved[i].dex,
+                                          sellDex: resolved[j].dex,
+                                          buyPrice: priceA,
+                                          sellPrice: priceB,
+                                          spreadPct,
+                                    });
+                              }
+                        }
+                  }
+            }
+      };
+      await checkMonadWatchList();
+      setInterval(checkMonadWatchList, 30_000);
 
       // Proof-of-life price check -- completely separate from the $30
       // opportunity threshold above. Scans whatever pools are already
