@@ -12,7 +12,7 @@ import { findOptimalTradeSize, calculateAllInProfit, buildOpportunity, calculate
 import { scoreOpportunity, shouldPreArm } from './core/opportunityScorer';
 import { seedKnownAddresses } from './config/knownAddresses';
 import { ethers as ethersV5 } from 'ethers-v5';
-import { MONAD_KURU, MONAD_ROUTERS, MONAD_TOKENS, MONAD_BEAN, ROBINHOOD_V2, ROBINHOOD_V3, ROBINHOOD_V4, ROBINHOOD_TOKENS } from './config/knownAddresses';
+import { MONAD_KURU, MONAD_ROUTERS, MONAD_TOKENS, MONAD_BEAN, MONAD_LFJ, ROBINHOOD_V2, ROBINHOOD_V3, ROBINHOOD_V4, ROBINHOOD_TOKENS } from './config/knownAddresses';
 import { sendTelegramMessage } from './core/telegramSender';
 
 // Real token names for Telegram messages instead of raw contract
@@ -70,7 +70,7 @@ monad: {
 chain: 'monad',
 minLiquidityUsd: 25_000,
 minRecent24hVolumeUsd: 10_000,
-    approvedDexes: new Set(['uniswap-v3', 'bean-exchange', 'kuru']),
+        approvedDexes: new Set(['uniswap-v3', 'bean-exchange', 'kuru', 'lfj-lb', 'lfj-v1']),
 },
 robinhood: {
 chain: 'robinhood',
@@ -206,6 +206,17 @@ if (registerIfApproved('avalanche', entry.dex, resolved)) pool = resolved;
                 const resolved = await resolveAndFetchLBPool(
                       monadReadProvider, swap.chain, entry.dex, entry.factory,
                       swap.tokenIn, swap.tokenOut, 20,
+                      );
+                if (registerIfApproved('monad', entry.dex, resolved)) pool = resolved;
+          }
+
+          // LFJ's V1 pools are classic constant-product (V2-style) -- no
+          // Monad 'v2' branch existed before this, since only Uniswap V3 and
+          // LB-style pools had been wired in on this chain so far.
+          if (entry?.factory && swap.chain === 'monad' && entry.style === 'v2') {
+                const resolved = await resolveAndFetchV2Pool(
+                      monadReadProvider, swap.chain, entry.dex, entry.factory,
+                      swap.tokenIn, swap.tokenOut, 30,
                       );
                 if (registerIfApproved('monad', entry.dex, resolved)) pool = resolved;
           }
