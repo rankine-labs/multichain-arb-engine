@@ -25,6 +25,12 @@ const TOKEN_SYMBOLS: Record<string, Record<string, string>> = {
         [MONAD_TOKENS.USDC.toLowerCase()]: 'USDC',
             [MONAD_TOKENS.WETH.toLowerCase()]: 'WETH',
             [MONAD_TOKENS.CBBTC.toLowerCase()]: 'cbBTC',
+            [MONAD_TOKENS.WBTC.toLowerCase()]: 'WBTC',
+            [MONAD_TOKENS.USDT0.toLowerCase()]: 'USDT0',
+            [MONAD_TOKENS.AUSD.toLowerCase()]: 'AUSD',
+            [MONAD_TOKENS.SHMON.toLowerCase()]: 'shMON',
+            [MONAD_TOKENS.SMON.toLowerCase()]: 'sMON',
+            [MONAD_TOKENS.GMON.toLowerCase()]: 'gMON',
     },
     robinhood: {
         [ROBINHOOD_TOKENS.WETH.toLowerCase()]: 'WETH',
@@ -462,6 +468,15 @@ await chainManager.startAll();
           { tokenA: MONAD_TOKENS.WMON, tokenB: MONAD_TOKENS.USDC },
           { tokenA: MONAD_TOKENS.WETH, tokenB: MONAD_TOKENS.USDC },
           { tokenA: MONAD_TOKENS.CBBTC, tokenB: MONAD_TOKENS.USDC },
+          { tokenA: MONAD_TOKENS.WBTC, tokenB: MONAD_TOKENS.WMON },
+          { tokenA: MONAD_TOKENS.WMON, tokenB: MONAD_TOKENS.WETH },
+          { tokenA: MONAD_TOKENS.CBBTC, tokenB: MONAD_TOKENS.WBTC },
+          { tokenA: MONAD_TOKENS.AUSD, tokenB: MONAD_TOKENS.USDC },
+          { tokenA: MONAD_TOKENS.USDT0, tokenB: MONAD_TOKENS.USDC },
+          { tokenA: MONAD_TOKENS.WMON, tokenB: MONAD_TOKENS.AUSD },
+          { tokenA: MONAD_TOKENS.SHMON, tokenB: MONAD_TOKENS.WMON },
+          { tokenA: MONAD_TOKENS.SMON, tokenB: MONAD_TOKENS.WMON },
+          { tokenA: MONAD_TOKENS.GMON, tokenB: MONAD_TOKENS.WMON },
             ];
 
       const watchListPriceOf = (p: any): number | null => {
