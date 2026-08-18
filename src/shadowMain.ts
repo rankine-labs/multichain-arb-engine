@@ -12,7 +12,7 @@ import { findOptimalTradeSize, calculateAllInProfit, buildOpportunity, calculate
 import { scoreOpportunity, shouldPreArm } from './core/opportunityScorer';
 import { seedKnownAddresses } from './config/knownAddresses';
 import { ethers as ethersV5 } from 'ethers-v5';
-import { MONAD_KURU, MONAD_ROUTERS, MONAD_TOKENS, MONAD_BEAN, MONAD_LFJ, ROBINHOOD_V2, ROBINHOOD_V3, ROBINHOOD_V4, ROBINHOOD_TOKENS } from './config/knownAddresses';
+import { MONAD_KURU, MONAD_ROUTERS, MONAD_TOKENS, MONAD_BEAN, MONAD_LFJ, MONAD_PANCAKE, ROBINHOOD_PANCAKE, ROBINHOOD_V2, ROBINHOOD_V3, ROBINHOOD_V4, ROBINHOOD_TOKENS } from './config/knownAddresses';
 import { sendTelegramMessage } from './core/telegramSender';
 
 // Real token names for Telegram messages instead of raw contract
@@ -70,13 +70,13 @@ monad: {
 chain: 'monad',
 minLiquidityUsd: 25_000,
 minRecent24hVolumeUsd: 10_000,
-        approvedDexes: new Set(['uniswap-v3', 'bean-exchange', 'kuru', 'lfj-lb', 'lfj-v1']),
+            approvedDexes: new Set(['uniswap-v3', 'bean-exchange', 'kuru', 'lfj-lb', 'lfj-v1', 'pancakeswap-v2', 'pancakeswap-v3']),
 },
 robinhood: {
 chain: 'robinhood',
 minLiquidityUsd: 25_000,
 minRecent24hVolumeUsd: 10_000,
-    approvedDexes: new Set(['arcus', 'uniswap-v2', 'uniswap-v3', 'pleiades']),
+        approvedDexes: new Set(['arcus', 'uniswap-v2', 'uniswap-v3', 'pleiades', 'pancakeswap-v2', 'pancakeswap-v3']),
 },
 };
 
