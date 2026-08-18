@@ -38,6 +38,7 @@ USDC: '0x754704Bc059F8C67012fEd69BC8A327a5aafb603',
     SHMON: '0x1b68626dca36c7fe922fd2d55e4f631d962de19c',
     SMON: '0xa3227c5969757783154c60bf0bc1944180ed81b9',
     GMON: '0x8498312a6b3cbd158bf0c93abdcf29e6e4f55081', // official Monad token-list, verified via live bytecode check
+    AUSD: '0x00000000efe302beaa2b3e6e1b18d08d69a9012a',
 };
 
 export const MONAD_ROUTERS = {
