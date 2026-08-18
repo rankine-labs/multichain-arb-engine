@@ -197,6 +197,42 @@ style: 'v3',
         style: 'v3',
         factory: ROBINHOOD_V3.FACTORY,
     };
+
+    registry.monad[MONAD_PANCAKE.V2_ROUTER.toLowerCase()] = {
+        dex: 'pancakeswap-v2',
+        style: 'v2',
+        factory: MONAD_PANCAKE.V2_FACTORY,
+    };
+
+    registry.monad[MONAD_PANCAKE.V3_SWAP_ROUTER.toLowerCase()] = {
+        dex: 'pancakeswap-v3',
+        style: 'v3',
+        factory: MONAD_PANCAKE.V3_FACTORY,
+    };
+
+    registry.monad[MONAD_PANCAKE.V3_UNIVERSAL_ROUTER.toLowerCase()] = {
+        dex: 'pancakeswap-v3',
+        style: 'v3',
+        factory: MONAD_PANCAKE.V3_FACTORY,
+    };
+
+    registry.robinhood[ROBINHOOD_PANCAKE.V2_ROUTER.toLowerCase()] = {
+        dex: 'pancakeswap-v2',
+        style: 'v2',
+        factory: ROBINHOOD_PANCAKE.V2_FACTORY,
+    };
+
+    registry.robinhood[ROBINHOOD_PANCAKE.SMART_ROUTER.toLowerCase()] = {
+        dex: 'pancakeswap-v3',
+        style: 'v3',
+        factory: ROBINHOOD_PANCAKE.V3_FACTORY,
+    };
+
+    registry.robinhood[ROBINHOOD_PANCAKE.V3_UNIVERSAL_ROUTER.toLowerCase()] = {
+        dex: 'pancakeswap-v3',
+        style: 'v3',
+        factory: ROBINHOOD_PANCAKE.V3_FACTORY,
+    };
 registerStablecoin('monad', MONAD_TOKENS.USDC);
 
 registerStablecoin('robinhood', ROBINHOOD_TOKENS.USDG);
