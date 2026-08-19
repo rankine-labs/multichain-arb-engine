@@ -558,7 +558,7 @@ for (let i = 0; i < resolved.length; i++) {
             });
             const watchEvent: RawChainEvent = {
                   chain: 'monad',
-                  stateType: 'confirmed',
+                  stateType: 'FINALIZED',
                   blockOrSeq: 0,
                   receivedAtMs: Date.now(),
                   raw: 'proactive-watch-list-check',
