@@ -403,7 +403,11 @@ await chainManager.startAll();
       const monadKuruProvider = new ethersV5.providers.JsonRpcProvider('https://rpc.monad.xyz');
       const seedKuruMarket = async () => {
             const resolved = await resolveKuruMarket(monadKuruProvider, 'monad', 'kuru', MONAD_KURU.MARKETS.MON_USDC);
-            if (resolved) cache.upsert(resolved);
+                    // Kuru's base asset is native MON, a different address from
+              // the wrapped MON every other exchange uses -- normalize to
+              // WMON before caching so this pool is recognized as the same
+              // pair everywhere else, not treated as unrelated.
+              if (resolved) cache.upsert({ ...resolved, tokenA: MONAD_TOKENS.WMON });
       };
       await seedKuruMarket();
       setInterval(seedKuruMarket, 30_000); // vault liquidity shifts as orders fill — keep it fresh
