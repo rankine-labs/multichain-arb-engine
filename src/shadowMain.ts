@@ -598,6 +598,7 @@ for (let i = 0; i < resolved.length; i++) {
             }
       }
 }
+            }
       };
       await checkMonadWatchList();
       setInterval(checkMonadWatchList, 30_000);
