@@ -141,6 +141,22 @@ export const ROBINHOOD_V2 = {
       V2_ROUTER: '0x8cfe327cec66d1c090dd72bd0ff11d690c33a2eb',
   };
 
+  // --- Robinhood Chain: Ramses (Solidly-style fork -- V2 factory uses
+  // getPair(tokenA, tokenB, stable), not the plain 2-arg Uniswap
+  // version). All 8 addresses verified via live bytecode check on
+  // Robinhood mainnet. V2 factory + WETH/USDG volatile pool confirmed
+  // live and working; V3 and DLMM not yet verified working. ---
+  export const ROBINHOOD_RAMSES = {
+        V2_FACTORY: '0x43b2bf9f33036a02fc7a00935571c2a6b0108e66',
+        V2_ROUTER: '0x33d3cdd45e4d64ea762574789a2db4842ec8262e',
+        V3_FACTORY: '0xe0c4ceb92d08ca985bb70fe0a22feb121a9854a8',
+        V3_QUOTER_V2: '0x4730e03eb4a58a5e20244062d5f9a99bcf5770a6',
+        V3_SWAP_ROUTER: '0xfcbbe2af83f94e7e2a9c35a535b3a04719afd2ae',
+        DLMM_FACTORY: '0xdcd5f77697914e27f56fd263ef82923c8524abac',
+        DLMM_ROUTER: '0xd0019e86edb35e1fedaab03aed5c3c60f115d28b',
+        DLMM_QUOTER: '0xb722efaabe807faea16068f595eaa9aa1a62cecd',
+  };
+
 // --- Robinhood Chain — token addresses verified across three independent
 // sources: 1inch help docs, Blockscout explorer (direct on-chain lookup),
 // and Kansoku Labs docs. ---
