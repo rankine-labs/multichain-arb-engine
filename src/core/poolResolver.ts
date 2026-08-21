@@ -63,6 +63,61 @@ export async function resolveAndFetchV2Pool(
 }
 
 // ============================================================================
+// SOLIDLY-STYLE V2 POOL RESOLVER (Ramses and similar forks)
+//
+// Ramses on Robinhood Chain looks like a standard Uniswap V2 fork but its
+// factory is Solidly-style: getPair(tokenA, tokenB, stable) takes a third
+// boolean argument distinguishing "stable" (correlated-asset) pools from
+// "volatile" ones. Calling the standard 2-argument getPair on this factory
+// reverts outright rather than returning an empty pool -- confirmed live
+// before writing this. Once the real pair address is found, the pair
+// contract itself is a normal getReserves()/token0()/token1() V2 pair, so
+// this reuses V2_PAIR_ABI unchanged.
+// ============================================================================
+
+const SOLIDLY_V2_FACTORY_ABI = ['function getPair(address tokenA, address tokenB, bool stable) view returns (address pair)'];
+
+export async function resolveAndFetchSolidlyV2Pool(
+      provider: ethers.JsonRpcProvider,
+      chain: ChainName,
+      dex: string,
+      factoryAddress: string,
+      tokenA: string,
+      tokenB: string,
+      stable: boolean,
+      feeBps: number,
+    ): Promise<PoolState | null> {
+      try {
+            const factory = new ethers.Contract(factoryAddress, SOLIDLY_V2_FACTORY_ABI, provider);
+            const pairAddress: string = await factory.getPair(tokenA, tokenB, stable);
+            if (!pairAddress || pairAddress === ethers.ZeroAddress) return null;
+
+            const pair = new ethers.Contract(pairAddress, V2_PAIR_ABI, provider);
+            const [reserves, token0, token1] = await Promise.all([
+                  pair.getReserves(),
+                  pair.token0(),
+                  pair.token1(),
+                  ]);
+
+            return {
+                  chain,
+                  dex,
+                  poolAddress: pairAddress,
+                  poolType: 'v2',
+                  tokenA: token0,
+                  tokenB: token1,
+                  reserveA: reserves[0],
+                  reserveB: reserves[1],
+                  feeBps,
+                  lastUpdatedBlock: 0,
+                  lastUpdatedMs: Date.now(),
+            };
+      } catch {
+            return null;
+      }
+}
+
+// ============================================================================
 // LB (Liquidity Book) POOL RESOLVER
 //
 // LFJ's Liquidity Book uses discrete price bins instead of a simple x*y=k
