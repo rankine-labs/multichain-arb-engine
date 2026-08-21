@@ -14,6 +14,8 @@ import { seedKnownAddresses } from './config/knownAddresses';
 import { ethers as ethersV5 } from 'ethers-v5';
 import { MONAD_KURU, MONAD_ROUTERS, MONAD_TOKENS, MONAD_BEAN, MONAD_LFJ, MONAD_PANCAKE, ROBINHOOD_PANCAKE, ROBINHOOD_V2, ROBINHOOD_V3, ROBINHOOD_V4, ROBINHOOD_TOKENS } from './config/knownAddresses';
 import { sendTelegramMessage } from './core/telegramSender';
+import { resolveAndFetchSolidlyV2Pool } from './core/poolResolver';
+import { ROBINHOOD_RAMSES } from './config/knownAddresses';
 
 // Real token names for Telegram messages instead of raw contract
 // addresses -- covers the tokens we're already actively watching.
@@ -453,6 +455,20 @@ await chainManager.startAll();
       };
       await seedRobinhoodV2Peer();
       setInterval(seedRobinhoodV2Peer, 30_000);
+
+      // Ramses is a Solidly-style fork -- confirmed live tonight that its
+      // factory needs the extra "stable" flag standard Uniswap-style
+      // factories don't have. WETH/USDG resolved and read real reserves
+      // successfully before this was wired in here.
+      const seedRobinhoodRamsesPeer = async () => {
+            const resolved = await resolveAndFetchSolidlyV2Pool(
+                  robinhoodReadProvider, 'robinhood', 'ramses-v2', ROBINHOOD_RAMSES.V2_FACTORY,
+                  ROBINHOOD_TOKENS.WETH, ROBINHOOD_TOKENS.USDG, false, 20,
+                  );
+            if (resolved) cache.upsert(resolved);
+      };
+      await seedRobinhoodRamsesPeer();
+      setInterval(seedRobinhoodRamsesPeer, 30_000);
 
       // Proactively checks known, real multi-DEX pairs directly on a
       // timer, instead of waiting for real swap traffic to happen to
