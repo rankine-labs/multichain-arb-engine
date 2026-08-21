@@ -645,16 +645,33 @@ await sendTelegramMessage(message);
       // traded the same pair close enough together to compare, not that
       // anything is broken.
       setInterval(async () => {
-            const found = [...hourlyMatches.values()].sort((a, b) => b.spreadPct - a.spreadPct);
-            const top = found.slice(0, 15);
+            const monadPairLines = monadWatchedPairs.map(({ tokenA, tokenB }) => {
+                  const label = `${symbolOf('monad', tokenA)}/${symbolOf('monad', tokenB)}`;
+                  const m = hourlyMatches.get(`monad:${label}`);
+                  return m
+                  ? `  ${label}: ${m.buyDex} @ ${m.buyPrice} vs ${m.sellDex} @ ${m.sellPrice} (${m.spreadPct.toFixed(4)}% spread)`
+                        : `  ${label}: no match this hour`;
+            });
+            const monadMatchedCount = monadPairLines.filter(l => !l.includes('no match this hour')).length;
+
+            const robinhoodLabel = `${symbolOf('robinhood', ROBINHOOD_TOKENS.WETH)}/${symbolOf('robinhood', ROBINHOOD_TOKENS.USDG)}`;
+            const robinhoodMatch = hourlyMatches.get(`robinhood:${robinhoodLabel}`);
+            const robinhoodLine = robinhoodMatch
+            ? `  ${robinhoodLabel}: ${robinhoodMatch.buyDex} @ ${robinhoodMatch.buyPrice} vs ${robinhoodMatch.sellDex} @ ${robinhoodMatch.sellPrice} (${robinhoodMatch.spreadPct.toFixed(4)}% spread)`
+                  : `  ${robinhoodLabel}: no match this hour`;
+
             const lines = [
                   'REAL MATCHES FOUND THIS HOUR',
-                  found.length === 0
-                  ? 'None -- no two watched exchanges traded the same pair close enough together to compare.'
-                  : `${found.length} unique pair(s) matched, showing top ${top.length} by spread:`,
-                  ...top.map(m =>
-                        `${m.chain} ${m.pair}: ${m.buyDex} @ ${m.buyPrice} vs ${m.sellDex} @ ${m.sellPrice} (${m.spreadPct.toFixed(4)}% spread)`
-                        ),
+                  '',
+                  `MONAD -- 5 exchanges (Uniswap V3, Kuru, Bean Exchange, LFJ, PancakeSwap)`,
+                  `Watching ${monadWatchedPairs.length} pairs, ${monadMatchedCount} matched this hour:`,
+                  ...monadPairLines,
+                  '',
+                  `ROBINHOOD -- 4 exchanges (Uniswap V2, Uniswap V3, Uniswap V4, PancakeSwap)`,
+                  `Watching 1 pair:`,
+                  robinhoodLine,
+                  '',
+                  `AVALANCHE -- 4 exchanges configured (TraderJoe V1, TraderJoe LB, SushiSwap, Pharaoh), but not receiving live trade data right now -- known gap, not a silent failure`,
                   ];
             await sendTelegramMessage(lines.join('\n'));
             hourlyMatches.clear();
