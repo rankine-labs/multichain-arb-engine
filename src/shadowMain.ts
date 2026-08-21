@@ -542,64 +542,6 @@ for (let i = 0; i < resolved.length; i++) {
                   });
             }
 
-            // Now the real economics -- same pipeline the reactive
-            // swap-triggered path uses, so a watch-list find is judged as a
-            // genuine opportunity, not just a raw price note.
-            const watchUsdPerToken = priceOracle.getUsdPrice('monad', tokenA);
-            if (watchUsdPerToken === null) continue;
-            const watchCeiling = calculateLiquidityCeiling(buyPool, sellPool, watchUsdPerToken);
-            if (watchCeiling <= 0) continue;
-            const watchSizing = findOptimalTradeSize(
-                  buyPool, sellPool, cache, false, watchCeiling, watchUsdPerToken,
-                  );
-            if (watchSizing.grossProfitUsd <= 0) continue;
-            const watchProfit = calculateAllInProfit(watchSizing, {
-                  gasPriceUsd: 2,
-                  dexFeeBps: { buy: buyPool.feeBps, sell: sellPool.feeBps },
-                  flashLoanFeeBps: 9,
-                  usingFlashLoan: true,
-                  safetyMarginPct: 0.15,
-            });
-            const watchEvent: RawChainEvent = {
-                  chain: 'monad',
-                  stateType: 'FINALIZED',
-                  blockOrSeq: 0,
-                  receivedAtMs: Date.now(),
-                  raw: 'proactive-watch-list-check',
-            };
-            const watchOpportunity = buildOpportunity(
-                  'monad', [tokenA, tokenB],
-                  buyPool.dex, buyPool.poolAddress, sellPool.dex, sellPool.poolAddress,
-                  watchSizing, watchProfit, watchEvent, 0,
-                  );
-            if (!watchProfit.qualifies) {
-                  shadowLogger.record({
-                        opportunity: watchOpportunity,
-                        outcome: 'SKIPPED_BELOW_MIN_PROFIT',
-                        notes: 'found via proactive watch list, not a live swap trigger',
-                  });
-                  continue;
-            }
-            shadowLogger.record({
-                  opportunity: watchOpportunity,
-                  outcome: 'UNRESOLVED',
-                  notes: 'found via proactive watch list -- real profit after costs, no live race to time it against',
-            });
-            if (watchSizing.grossProfitUsd >= 30) {
-                  await sendTelegramMessage(formatSkippedOpportunity({
-                        chain: 'monad',
-                        pair: pairLabel,
-                        buyDex: buyPool.dex,
-                        sellDex: sellPool.dex,
-                        buyPrice,
-                        sellPrice,
-                        spreadPct,
-                        grossOpportunityUsd: watchSizing.grossProfitUsd,
-                        optimalTradeUsd: watchSizing.optimalTradeSizeUsd,
-                        expectedNetUsd: watchProfit.conservativeNetProfitUsd,
-                        minRequiredUsd: 20,
-                  }));
-            }
       }
 }
             }
