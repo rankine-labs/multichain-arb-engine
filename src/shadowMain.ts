@@ -611,16 +611,18 @@ for (let i = 0; i < resolved.length; i++) {
               setInterval(runProofOfLifeCheck, 60 * 60 * 1000); // hourly, plus once on startup below
           setTimeout(runProofOfLifeCheck, 10_000); // one check shortly after startup too
   const lastHealthStatus: Record<string, boolean> = { avalanche: true, monad: true, robinhood: true };
+        // Chains flap in and out of health regularly (Monad's speculative
+        // feed reconnecting is normal, not an emergency). Counted silently
+        // here, reported once per hour instead of alerting live every time.
+        const chainHealthFlapCount: Record<string, number> = { avalanche: 0, monad: 0, robinhood: 0 };
       setInterval(async () => {
             await chainManager.runHealthChecks();
             const status = chainManager.getStatus() as Record<string, { online: boolean; reason?: string }>;
             for (const [chain, info] of Object.entries(status)) {
                   const wasHealthy = lastHealthStatus[chain] ?? true;
-                  if (wasHealthy && !info.online) {
-                        await sendTelegramMessage(`\u26a0\ufe0f ${chain} went UNHEALTHY: ${info.reason ?? 'unknown reason'}`);
-                  } else if (!wasHealthy && info.online) {
-                        await sendTelegramMessage(`\u2705 ${chain} recovered and is healthy again`);
-                  }
+if (wasHealthy && !info.online) {
+      chainHealthFlapCount[chain] = (chainHealthFlapCount[chain] ?? 0) + 1;
+}
                   lastHealthStatus[chain] = info.online;
             }
       }, 15_000);
@@ -653,6 +655,18 @@ p95ReactionMs: summary.p95ReactionMs ?? 0,
 });
 
 await sendTelegramMessage(message);
+
+      // Report any chain disconnects silently counted this hour, then
+      // reset for the next hour -- this replaces live UNHEALTHY/recovered
+      // alerts, which were firing on every brief reconnect.
+      const flapEntries = Object.entries(chainHealthFlapCount).filter(([, count]) => count > 0);
+      if (flapEntries.length > 0) {
+            const flapLines = flapEntries.map(
+                  ([chainName, count]) => `${chainName}: disconnected and auto-recovered ${count}x this hour`,
+                  );
+            await sendTelegramMessage(`CHAIN HEALTH THIS HOUR\n\n${flapLines.join('\n')}`);
+      }
+      for (const chainName of Object.keys(chainHealthFlapCount)) chainHealthFlapCount[chainName] = 0;
 }, 60 * 60 * 1000);
 
       // Sends whatever real matches were actually found this hour, then
