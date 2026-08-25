@@ -402,7 +402,7 @@ await chainManager.startAll();
       // so its market is seeded directly from the known address rather than
       // discovered from swap traffic. This is what gives the Uniswap V3 pool
       // a real second venue to compare against for cross-DEX opportunities.
-      const monadKuruProvider = new ethersV5.providers.JsonRpcProvider('https://rpc.monad.xyz');
+      const monadKuruProvider = new ethersV5.providers.JsonRpcProvider('https://rpc.monad.xyz', 143);
       const seedKuruMarket = async () => {
             const resolved = await resolveKuruMarket(monadKuruProvider, 'monad', 'kuru', MONAD_KURU.MARKETS.MON_USDC);
                     // Kuru's base asset is native MON, a different address from
