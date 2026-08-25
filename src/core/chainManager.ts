@@ -11,6 +11,13 @@ export class ChainManager {
 private adapters = new Map<ChainName, ChainCapability>();
 private status = new Map<ChainName, { online: boolean; reason?: string }>();
 private globalEventHandlers: ((event: RawChainEvent) => void)[] = [];
+    // Chains that keep failing health checks (a persistently rate-limited
+    // RPC, for example) used to get a reconnect attempt every single check
+    // -- 15 seconds, forever, hammering an already-overloaded endpoint.
+    // Tracks a per-chain failure count and the next allowed retry time so
+    // repeated failures back off (15s, 30s, 60s...) instead of retrying
+    // at a fixed 15s no matter how many times it has already failed.
+    private reconnectBackoff = new Map<ChainName, { failCount: number; nextRetryAt: number }>();
 
 register(adapter: ChainCapability) {
 this.adapters.set(adapter.chain, adapter);
@@ -45,17 +52,29 @@ for (const [chain, adapter] of this.adapters) {
 const result = await adapter.healthCheck();
 this.status.set(chain, { online: result.healthy, reason: result.reason });
 if (!result.healthy) {
-console.warn(`[chainManager] ${chain} UNHEALTHY: ${result.reason}`);
+    console.warn(`[chainManager] ${chain} UNHEALTHY: ${result.reason}`);
+    const backoff = this.reconnectBackoff.get(chain);
+    const now = Date.now();
+    if (backoff && now < backoff.nextRetryAt) {
+        continue;
+    }
     try {
         console.warn(`[chainManager] attempting to reconnect ${chain}...`);
         await adapter.connect();
         this.status.set(chain, { online: true });
+        this.reconnectBackoff.delete(chain);
         console.warn(`[chainManager] ${chain} reconnected successfully`);
     } catch (err) {
-        console.error(`[chainManager] ${chain} reconnect failed:`, err);
+        const failCount = (backoff?.failCount ?? 0) + 1;
+        const delayMs = Math.min(15_000 * 2 ** failCount, 5 * 60_000);
+        this.reconnectBackoff.set(chain, { failCount, nextRetryAt: now + delayMs });
+        console.error(`[chainManager] ${chain} reconnect failed, backing off ${Math.round(delayMs / 1000)}s:`, err);
     }
-                              }
+} else {
+    this.reconnectBackoff.delete(chain);
 }
+}
+                              
 }
 
 getStatus() {
