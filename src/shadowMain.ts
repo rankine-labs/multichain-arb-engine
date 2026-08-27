@@ -602,6 +602,21 @@ for (let i = 0; i < resolved.length; i++) {
       // purely so it's possible to directly verify the bot is comparing
       // genuine on-chain prices, without waiting for a rare, large,
       // profitable opportunity to happen to occur.
+
+      // Human-readable price formatting -- template-literal interpolation of a
+      // raw JS number prints ugly things like "2.44e-9" or 15 decimal places
+      // for tiny prices, which is unreadable in a Telegram message. This picks
+      // a sensible number of decimal places based on the price's own scale
+      // instead of dumping the raw float.
+      const formatPrice = (n: number): string => {
+            if (!isFinite(n)) return 'n/a';
+            if (n === 0) return '0';
+            const abs = Math.abs(n);
+            if (abs >= 1) return n.toLocaleString('en-US', { maximumFractionDigits: 4 });
+            const leadingZeros = Math.max(0, Math.ceil(-Math.log10(abs)));
+            const decimals = Math.min(leadingZeros + 4, 18);
+            return n.toFixed(decimals);
+      };
       const priceOfPool = (p: any): number | null => {
 const decA = decimalsOf(p.chain, p.tokenA);
             const decB = decimalsOf(p.chain, p.tokenB);
@@ -632,8 +647,8 @@ const decA = decimalsOf(p.chain, p.tokenA);
                               'LIVE PRICE CHECK (proof of life, not an opportunity alert)',
                               `Chain: ${chain}`,
         `Pair: ${symbolOf(chain, pool.tokenA)}/${symbolOf(chain, pool.tokenB)}`,
-                              `${pool.dex}: ${priceA}`,
-                              `${peers[0].dex}: ${priceB}`,
+                              `${pool.dex}: ${formatPrice(priceA)}`,
+                              `${peers[0].dex}: ${formatPrice(priceB)}`,
                               `Spread: ${spreadPct.toFixed(4)}%`,
                               ].join('\n'));
                   }
@@ -710,7 +725,7 @@ await sendTelegramMessage(message);
                   const label = `${symbolOf('monad', tokenA)}/${symbolOf('monad', tokenB)}`;
                   const m = hourlyMatches.get(`monad:${label}`);
                   return m
-                  ? `  ${label}: ${m.buyDex} @ ${m.buyPrice} vs ${m.sellDex} @ ${m.sellPrice} (${m.spreadPct.toFixed(4)}% spread)`
+? `  ${label}: ${m.buyDex} @ ${formatPrice(m.buyPrice)} vs ${m.sellDex} @ ${formatPrice(m.sellPrice)} (${m.spreadPct.toFixed(4)}% spread)`
                         : `  ${label}: no match this hour`;
             });
             const monadMatchedCount = monadPairLines.filter(l => !l.includes('no match this hour')).length;
@@ -718,7 +733,7 @@ await sendTelegramMessage(message);
             const robinhoodLabel = `${symbolOf('robinhood', ROBINHOOD_TOKENS.WETH)}/${symbolOf('robinhood', ROBINHOOD_TOKENS.USDG)}`;
             const robinhoodMatch = hourlyMatches.get(`robinhood:${robinhoodLabel}`);
             const robinhoodLine = robinhoodMatch
-            ? `  ${robinhoodLabel}: ${robinhoodMatch.buyDex} @ ${robinhoodMatch.buyPrice} vs ${robinhoodMatch.sellDex} @ ${robinhoodMatch.sellPrice} (${robinhoodMatch.spreadPct.toFixed(4)}% spread)`
+            ? `  ${robinhoodLabel}: ${robinhoodMatch.buyDex} @ ${formatPrice(robinhoodMatch.buyPrice)} vs ${robinhoodMatch.sellDex} @ ${formatPrice(robinhoodMatch.sellPrice)} (${robinhoodMatch.spreadPct.toFixed(4)}% spread)`
                   : `  ${robinhoodLabel}: no match this hour`;
 
             const lines = [
