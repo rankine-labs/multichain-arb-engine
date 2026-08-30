@@ -19,6 +19,15 @@ private globalEventHandlers: ((event: RawChainEvent) => void)[] = [];
     // at a fixed 15s no matter how many times it has already failed.
     private reconnectBackoff = new Map<ChainName, { failCount: number; nextRetryAt: number }>();
 
+      // A chain that keeps briefly reconnecting and dropping again (a flapping
+      // websocket, not a clean outage) would reset the backoff above to zero
+      // on every single brief success, so it could never actually escalate.
+      // Tracks when a chain most recently became healthy so the backoff only
+      // clears once it has genuinely stayed healthy for a sustained stretch,
+      // not just for one health-check tick.
+      private stableSince = new Map<ChainName, number>();
+      private static readonly STABLE_THRESHOLD_MS = 2 * 60_000;
+
 register(adapter: ChainCapability) {
 this.adapters.set(adapter.chain, adapter);
 adapter.onEvent((event) => {
@@ -53,6 +62,7 @@ const result = await adapter.healthCheck();
 this.status.set(chain, { online: result.healthy, reason: result.reason });
 if (!result.healthy) {
     console.warn(`[chainManager] ${chain} UNHEALTHY: ${result.reason}`);
+      this.stableSince.delete(chain);
     const backoff = this.reconnectBackoff.get(chain);
     const now = Date.now();
     if (backoff && now < backoff.nextRetryAt) {
@@ -62,7 +72,7 @@ if (!result.healthy) {
         console.warn(`[chainManager] attempting to reconnect ${chain}...`);
         await adapter.connect();
         this.status.set(chain, { online: true });
-        this.reconnectBackoff.delete(chain);
+        if (!this.stableSince.has(chain)) this.stableSince.set(chain, now);
         console.warn(`[chainManager] ${chain} reconnected successfully`);
     } catch (err) {
         const failCount = (backoff?.failCount ?? 0) + 1;
@@ -71,7 +81,12 @@ if (!result.healthy) {
         console.error(`[chainManager] ${chain} reconnect failed, backing off ${Math.round(delayMs / 1000)}s:`, err);
     }
 } else {
-    this.reconnectBackoff.delete(chain);
+const now = Date.now();
+      if (!this.stableSince.has(chain)) this.stableSince.set(chain, now);
+      const stableFor = now - (this.stableSince.get(chain) ?? now);
+      if (stableFor >= ChainManager.STABLE_THRESHOLD_MS) {
+            this.reconnectBackoff.delete(chain);
+      }
 }
 }
                               
