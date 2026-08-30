@@ -527,6 +527,10 @@ await chainManager.startAll();
             TOKEN_DECIMALS[chain]?.[addr.toLowerCase()] ?? 18;
 
       const watchListPriceOf = (p: any): number | null => {
+            // Excluded -- see the matching note on priceOfPool above. LFJ-LB's
+            // aggregate-reserve approximation produces nonsense spreads, not real
+            // ones, until real bin-based pricing is implemented.
+            if (p.dex === 'lfj-lb') return null;
 const decA = decimalsOf('monad', p.tokenA);
             const decB = decimalsOf('monad', p.tokenB);
             if (p.poolType === 'v3' && p.sqrtPriceX96) {
@@ -618,6 +622,13 @@ for (let i = 0; i < resolved.length; i++) {
             return n.toFixed(decimals);
       };
       const priceOfPool = (p: any): number | null => {
+            // LFJ's Liquidity Book pools spread liquidity across many discrete price
+            // bins. getReserves() only gives the TOTAL X/Y across every bin, which
+            // can be wildly different from the current market price if liquidity
+            // sits unevenly across bins -- this produced spreads in the millions of
+            // percent, not a real gap. Excluded from price comparison entirely
+            // until real bin-based pricing (getActiveId/getBinStep) is implemented.
+            if (p.dex === 'lfj-lb') return null;
 const decA = decimalsOf(p.chain, p.tokenA);
             const decB = decimalsOf(p.chain, p.tokenB);
             if (p.poolType === 'v3' && p.sqrtPriceX96) {
@@ -741,6 +752,7 @@ await sendTelegramMessage(message);
                   '',
                   `MONAD -- 5 exchanges (Uniswap V3, Kuru, Bean Exchange, LFJ, PancakeSwap)`,
                   `Watching ${monadWatchedPairs.length} pairs, ${monadMatchedCount} matched this hour:`,
+                  `LFJ-LB prices excluded from all comparisons above -- its aggregate reserves across price bins don't reflect the real market price, known gap, not a silent failure`,
                   ...monadPairLines,
                   '',
                   `ROBINHOOD -- 4 exchanges (Uniswap V2, Uniswap V3, Uniswap V4, PancakeSwap)`,
