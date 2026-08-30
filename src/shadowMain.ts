@@ -731,7 +731,7 @@ await sendTelegramMessage(message);
       // real, honest answer too -- it means no two watched exchanges
       // traded the same pair close enough together to compare, not that
       // anything is broken.
-      setInterval(async () => {
+      const sendHourlyMatchesReport = async () => {
             const monadPairLines = monadWatchedPairs.map(({ tokenA, tokenB }) => {
                   const label = `${symbolOf('monad', tokenA)}/${symbolOf('monad', tokenB)}`;
                   const m = hourlyMatches.get(`monad:${label}`);
@@ -763,7 +763,9 @@ await sendTelegramMessage(message);
                   ];
             await sendTelegramMessage(lines.join('\n'));
             hourlyMatches.clear();
-      }, 60 * 60 * 1000);
+      };
+      await sendHourlyMatchesReport();
+      setInterval(sendHourlyMatchesReport, 60 * 60 * 1000);
 
       setInterval(async () => {
             const summary = shadowLogger.summary();
