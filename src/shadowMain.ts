@@ -267,12 +267,25 @@ if (registerIfApproved('avalanche', entry.dex, resolved)) pool = resolved;
       // report -- happens for every real peer match found, independent
       // of whether it's profitable enough to alert on.
       const matchPriceOf = (p: any): number | null => {
+            // This is the price function that actually feeds the hourly report --
+            // confirmed live tonight it was still using the old, unadjusted-decimals
+            // formula even after that fix was applied elsewhere, which is why a real
+            // WETH/USDC spread showed 113% instead of a sane number. Same three
+            // protections as priceOfPool/watchListPriceOf: decimals, LFJ-LB
+            // exclusion, and a minimum-liquidity floor for near-empty pools.
+            if (p.dex === 'lfj-lb') return null;
+            const decA = decimalsOf(p.chain, p.tokenA);
+            const decB = decimalsOf(p.chain, p.tokenB);
             if (p.poolType === 'v3' && p.sqrtPriceX96) {
-                  const price = Number(p.sqrtPriceX96) / 2 ** 96;
-                  return price * price;
+                  const raw = Number(p.sqrtPriceX96) / 2 ** 96;
+                  return raw * raw * 10 ** (decA - decB);
             }
             if (p.reserveA !== undefined && p.reserveB !== undefined && p.reserveA > 0n) {
-                  return Number(p.reserveB) / Number(p.reserveA);
+                  const adjA = Number(p.reserveA) / 10 ** decA;
+                  const adjB = Number(p.reserveB) / 10 ** decB;
+                  const MIN_RESERVE_UNITS = 0.01;
+                  if (adjA < MIN_RESERVE_UNITS || adjB < MIN_RESERVE_UNITS) return null;
+                  return adjB / adjA;
             }
             return null;
       };
@@ -636,7 +649,19 @@ const decA = decimalsOf(p.chain, p.tokenA);
                   return raw * raw * 10 ** (decA - decB);
             }
             if (p.reserveA !== undefined && p.reserveB !== undefined && p.reserveA > 0n) {
-                  return (Number(p.reserveB) / 10 ** decB) / (Number(p.reserveA) / 10 ** decA);
+                  // A pool with real bytecode can still have near-zero reserves (a
+                  // pair that technically exists but was never meaningfully funded).
+                  // Confirmed live tonight: PancakeSwap V2's WETH/USDC pool on Monad
+                  // has reserve0 = 1 (0.000001 USDC) -- comparing that "price" against
+                  // a real, liquid pool produced a 113% spread that was pure noise,
+                  // not a real gap. Both decimal-adjusted reserves must clear a small
+                  // floor before this pool's price counts as a real market signal.
+                  const adjA = Number(p.reserveA) / 10 ** decA;
+                  const adjB = Number(p.reserveB) / 10 ** decB;
+                  const MIN_RESERVE_UNITS = 0.01;
+                  if (adjA < MIN_RESERVE_UNITS || adjB < MIN_RESERVE_UNITS) return null;
+                  return adjB / adjA;
+            }
             }
             return null;
       };
