@@ -22,7 +22,8 @@ jobs:
       - name: Probe live feeds
         shell: bash
         run: |
-          out=$(npx ts-node --transpile-only scripts/probe-feeds.ts 2>&1 | tail -40)
+          npx tsc -p tsconfig.scripts.json
+          out=$(node .scripts-build/scripts/probe-feeds.js 2>&1 | tail -40)
           echo "$out"
           out="${out//'%'/'%25'}"; out="${out//$'\n'/'%0A'}"
           echo "::notice title=Feed probe::${out}"

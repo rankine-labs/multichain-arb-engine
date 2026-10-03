@@ -1,0 +1,7 @@
+{
+  // Builds the diagnostic scripts in scripts/ together with the bot code
+  // they import. Used only by the live probe (see .github/workflows/probe.yml).
+  "extends": "./tsconfig.json",
+  "include": ["src", "scripts"],
+  "compilerOptions": { "rootDir": ".", "outDir": ".scripts-build" }
+}

@@ -5,8 +5,8 @@
 // bot's parsers actually understand what arrives. Run in CI (GitHub's
 // runners can reach the feeds) or on the server:
 //
-//   npx ts-node scripts/probe-feeds.ts            (default 30s per feed)
-//   PROBE_SECONDS=60 npx ts-node scripts/probe-feeds.ts
+//   npx tsc -p tsconfig.scripts.json && node .scripts-build/scripts/probe-feeds.js
+//   (PROBE_SECONDS=60 for a longer listen; default 30s per feed)
 //
 // Needs no keys. Monad uses MONAD_PROBE_WSS (default: public endpoint) --
 // the public endpoint may not support monadLogs; that's reported, not fatal.
