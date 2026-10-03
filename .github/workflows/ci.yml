@@ -57,8 +57,19 @@ jobs:
 
       # Real-pool tests on copies of live mainnet state. Public RPCs, no keys.
       # These hit live networks, so a flaky RPC can fail them; re-run if so.
+      # Also republishes the key result lines as one annotation, so the
+      # outcome is readable from the PR's checks without opening raw logs.
       - name: Fork tests (real pools)
-        run: forge test -vvv --match-path "test/Fork.t.sol"
+        shell: bash
+        run: |
+          set +e
+          forge test -vvv --match-path "test/Fork.t.sol" 2>&1 | tee fork-output.txt
+          status=${PIPESTATUS[0]}
+          summary=$(grep -E "\[(PASS|FAIL|SKIP)|->|pool |skipped|Revert|^\s+0x[0-9a-f]{8}|Suite result|Error" fork-output.txt | head -60)
+          summary="${summary//'%'/'%25'}"
+          summary="${summary//$'\n'/'%0A'}"
+          echo "::notice title=Fork test results::${summary}"
+          exit $status
         env:
           AVALANCHE_RPC_URL: https://api.avax.network/ext/bc/C/rpc
           MONAD_RPC_URL: https://rpc.monad.xyz
