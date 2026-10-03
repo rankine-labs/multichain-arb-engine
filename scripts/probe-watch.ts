@@ -10,6 +10,7 @@ import { parseFeedFrame } from '../src/chains/nitroFeed';
 import { TransactionDecoder, DEFAULT_ROUTER_REGISTRY } from '../src/core/decoder';
 import { seedKnownAddresses, ROBINHOOD_TOKENS, ROBINHOOD_V2, ROBINHOOD_V3, ROBINHOOD_PANCAKE, ROBINHOOD_RAMSES } from '../src/config/knownAddresses';
 import { discoverPairPools, Venue } from '../src/core/pairWatcher';
+import * as resolver from '../src/core/poolResolver';
 
 const provider = new ethers.JsonRpcProvider(process.env.ROBINHOOD_RPC_URL ?? 'https://rpc.mainnet.chain.robinhood.com', 4663, { staticNetwork: true });
 const VENUES: Venue[] = [
@@ -50,6 +51,7 @@ const VENUES: Venue[] = [
     out.push(`${await sym(p.a)}/${await sym(p.b)} (${p.n < 0 ? 'always' : p.n + ' swaps'}): ${pools.length} pools -> ${pools.map((x) => `${x.dex}${x.poolType === 'v3' ? ' ' + x.feeBps / 100 + '%' : ''}`).join(', ') || 'none'}`);
   }
   out.push(`pairs with 2+ pools (arbitrable): ${multi} of ${pairs.length}`);
+  out.push(`last RPC error seen during discovery: ${resolver.lastDiscoveryError || 'none'}`);
   console.log(out.join('\n'));
   process.exit(0);
 })();

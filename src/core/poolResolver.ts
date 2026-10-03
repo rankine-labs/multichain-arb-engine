@@ -310,7 +310,11 @@ export async function resolveAllV3Pools(
     const factory = new ethers.Contract(factoryAddress, mode === 'fee' ? V3_FACTORY_ABI : V3_FACTORY_BY_SPACING_ABI, provider);
     const keys = mode === 'fee' ? V3_FEE_TIERS_ALL : V3_TICK_SPACINGS;
 
-    const found = await Promise.all(keys.map(async (k) => {
+    // One tier at a time: firing every tier at once produced one huge
+    // batched RPC request that public endpoints reject, so pairs with many
+    // pools came back with none.
+    const found: Array<PoolState | null> = [];
+    for (const k of keys) found.push(await withRetry(async () => {
       try {
         const poolAddress: string = await factory.getPool(tokenA, tokenB, k);
         if (!poolAddress || poolAddress === ethers.ZeroAddress) return null;
@@ -331,11 +335,33 @@ export async function resolveAllV3Pools(
           lastUpdatedMs: Date.now(),
         };
         return state;
-      } catch {
+      } catch (err) {
+        if (isTransient(err)) throw err; // let withRetry try again
         return null; // no pool at this tier, or not a pool we can read
       }
     }));
     return found.filter((p): p is PoolState => p !== null);
+}
+
+// RPC hiccups (rate limits, rejected batches, timeouts) vs real "no pool".
+export function isTransient(err: unknown): boolean {
+  const m = String((err as any)?.shortMessage ?? (err as any)?.message ?? err).toLowerCase();
+  return /rate|429|too many|timeout|timed out|batch|network|socket|econn|503|502|missing response/.test(m);
+}
+
+// Runs fn; on a transient RPC error, waits briefly and tries once more.
+// Exported failures land in lastDiscoveryError for diagnostics.
+export let lastDiscoveryError = '';
+async function withRetry<T>(fn: () => Promise<T>): Promise<T | null> {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastDiscoveryError = String((err as any)?.shortMessage ?? (err as any)?.message ?? err).slice(0, 200);
+      if (attempt === 0) await new Promise((r) => setTimeout(r, 400));
+    }
+  }
+  return null;
 }
 
 // ============================================================================

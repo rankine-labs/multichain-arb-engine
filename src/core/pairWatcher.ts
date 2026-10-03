@@ -48,7 +48,9 @@ const ERC20_META = ['function symbol() view returns (string)', 'function decimal
 export async function discoverPairPools(
   provider: ethers.JsonRpcProvider, chain: ChainName, venues: Venue[], tokenA: string, tokenB: string,
 ): Promise<PoolState[]> {
-  const results = await Promise.all(venues.map(async (v): Promise<PoolState[]> => {
+  // Venues one after another (not all at once) to keep each RPC request small.
+  const results: PoolState[][] = [];
+  for (const v of venues) results.push(await (async (): Promise<PoolState[]> => {
     try {
       if (v.kind === 'v2') {
         const p = await resolveAndFetchV2Pool(provider, chain, v.dex, v.factory, tokenA, tokenB, v.feeBps ?? 30);
@@ -64,7 +66,7 @@ export async function discoverPairPools(
     } catch {
       return [];
     }
-  }));
+  })());
   return results.flat();
 }
 
