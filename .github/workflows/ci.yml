@@ -69,6 +69,13 @@ jobs:
         run: |
           set +e
           status=0
+          # Fork 10 blocks behind each chain's tip (newest block may not be
+          # accepted yet on public nodes).
+          for v in AVALANCHE MONAD ROBINHOOD; do
+            url_var="${v}_RPC_URL"
+            tip=$(curl -s -m 15 -X POST -H 'content-type: application/json' --data '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}' "${!url_var}" | sed -E 's/.*"result":"(0x[0-9a-fA-F]+)".*/\1/')
+            if [[ "$tip" == 0x* ]]; then export "${v}_RPC_URL_BLOCK=$(( tip - 10 ))"; fi
+          done
           # One run per chain, each pointed at its own RPC so Foundry picks
           # that chain's EVM flavour (required for Monad).
           for pair in "AvalancheForkTest:$AVALANCHE_RPC_URL" "MonadForkTest:$MONAD_RPC_URL" "RobinhoodForkTest:$ROBINHOOD_RPC_URL"; do

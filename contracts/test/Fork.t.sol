@@ -51,7 +51,12 @@ abstract contract ForkBase is Test {
             vm.skip(true);
             return false;
         }
-        vm.createSelectFork(url);
+        // Fork a few blocks behind the tip when CI provides one (<ENV>_BLOCK):
+        // the newest block may not be accepted yet on public nodes
+        // ("block not found: not accepted yet" on Avalanche).
+        uint256 forkBlock = vm.envOr(string.concat(envVar, "_BLOCK"), uint256(0));
+        if (forkBlock > 0) vm.createSelectFork(url, forkBlock);
+        else vm.createSelectFork(url);
         // This test contract is both owner and executor.
         exec = new ArbExecutor(address(this));
         return true;

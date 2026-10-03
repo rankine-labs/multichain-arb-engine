@@ -160,6 +160,7 @@ export interface DigestSection {
   chain: string;
   spreads: DigestSpread[];  // best spread per pair, any order (sorted here)
   noMatchCount?: number;    // watched pairs with nothing to compare this hour
+  note?: string;            // one short line under the chain, e.g. what it's watching
 }
 
 export interface WindowStats {
@@ -220,7 +221,7 @@ export function formatHourlyDigest(input: {
 }): string {
   const spreadLines: string[] = [];
   for (const sec of input.sections) {
-    spreadLines.push(chainLabel(sec.chain).toUpperCase());
+    spreadLines.push(chainLabel(sec.chain).toUpperCase() + (sec.note ? `  (${sec.note})` : ''));
     const sorted = [...sec.spreads].sort((a, b) => b.spreadPct - a.spreadPct);
     const shown = sorted.slice(0, MAX_PAIRS_PER_CHAIN);
     const pairWidth = Math.max(0, ...shown.map((s) => s.pair.length)) + 2;

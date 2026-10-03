@@ -80,7 +80,7 @@ const digest = formatHourlyDigest({
       { pair: 'AUSD/USDC', spreadPct: 0.08, buyDex: 'uniswap-v3', sellDex: 'lfj-v1' },
       { pair: 'WMON/USDC', spreadPct: 0.42, buyDex: 'uniswap-v3', sellDex: 'pancakeswap-v3' },
     ] },
-    { chain: 'robinhood', spreads: [{ pair: 'WETH/USDG', spreadPct: 0.15, buyDex: 'ramses-v2', sellDex: 'pancakeswap-v3' }] },
+    { chain: 'robinhood', note: 'watching 3 pairs, 18 pools', spreads: [{ pair: 'WETH/USDG', spreadPct: 0.15, buyDex: 'ramses-v2', sellDex: 'pancakeswap-v3' }] },
     { chain: 'avalanche', spreads: [] },
   ],
 });
@@ -94,6 +94,7 @@ assert(digest.includes('4 more pairs: no match'), 'digest: unmatched watch pairs
 assert(digest.includes('AVALANCHE\nno matches this hour'), 'digest: empty chain gets one line');
 assert(!/Filtered|All Costs|Best Chain|n\/a/.test(digest), 'digest: no always-zero fields');
 assert(validTelegramHtml(digest), 'digest: valid HTML');
+assert(digest.includes('ROBINHOOD  (watching 3 pairs, 18 pools)'), 'digest: chain note shown');
 assert(!digest.includes('Real-chain simulation'), 'digest: no simulation section when nothing was simulated');
 
 const withSim = formatHourlyDigest({

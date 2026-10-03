@@ -93,12 +93,14 @@ async function main() {
   const s1 = await rh.decode(rhEvent(SR02, wrapped));
   assert(s1?.tokenIn === RH_WETH && s1?.tokenOut === RH_USDG && s1?.amountIn === 7n * 10n ** 17n && s1?.poolAddress === SR02,
     'SwapRouter02 exactInputSingle inside multicall(deadline, ...) decoded');
+  assert(s1?.feeTier === 500, 'exactInputSingle carries its fee tier (500 = 0.05%)');
 
   // Multi-hop exactInput: WETH -(500)-> USDG -(3000)-> OTHER. First hop only.
   const path = ethers.solidityPacked(['address', 'uint24', 'address', 'uint24', 'address'], [RH_WETH, 500, RH_USDG, 3000, OTHER]);
   const multi = sr02.encodeFunctionData('exactInput', [{ path, recipient: OTHER, amountIn: 10n ** 18n, amountOutMinimum: 0n }]);
   const s2 = await rh.decode(rhEvent(SR02, multi));
   assert(s2?.tokenIn === RH_WETH && s2?.tokenOut === RH_USDG, 'exactInput multi-hop: first hop WETH -> USDG (used to return no tokens)');
+  assert(s2?.feeTier === 500, 'exactInput path: first hop fee tier read from packed path');
 
   // Universal Router: WRAP_ETH (0x0b, skipped) then V3_SWAP_EXACT_IN (0x00).
   const urIface = new ethers.Interface(['function execute(bytes commands, bytes[] inputs, uint256 deadline)']);
@@ -109,6 +111,7 @@ async function main() {
   const s3 = await rh.decode(rhEvent(UR, urCall));
   assert(s3?.tokenIn === RH_WETH && s3?.amountIn === 3n * 10n ** 18n && s3?.poolAddress === SR02 && s3?.dex === 'uniswap-v3',
     'Universal Router V3 swap decoded and routed to the V3 router for pool lookup');
+  assert(s3?.feeTier === 500, 'Universal Router V3 swap carries its fee tier');
 
   // Universal Router V2 swap (0x08), with the "allow revert" flag bit set (0x88).
   const v2In = coder.encode(['address', 'uint256', 'uint256', 'address[]', 'bool'], [OTHER, 5n * 10n ** 6n, 0n, [RH_USDG, RH_WETH], true]);
