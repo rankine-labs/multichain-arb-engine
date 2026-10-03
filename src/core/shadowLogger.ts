@@ -48,6 +48,35 @@ if (competitorTxHash) rec.competitorTxHash = competitorTxHash;
 
 // ---- Phase 1 success-criteria reporting ----
 
+// Stats for opportunities scored in a time window (e.g. the last hour).
+// summary() below is cumulative since the process started, so it can't
+// answer "what happened THIS hour"; this can.
+windowStats(sinceMs: number, untilMs: number = Date.now()) {
+const scoped = this.records.filter(r => {
+const t = r.opportunity.scoredAtMs;
+return t >= sinceMs && t < untilMs;
+});
+const won = scoped.filter(r => r.outcome === 'WOULD_HAVE_WON');
+const lost = scoped.filter(r => r.outcome === 'WOULD_HAVE_LOST');
+
+const reactionTimes = scoped
+.map(r => r.ourHypotheticalReactionMs)
+.filter((t): t is number => t !== undefined)
+.sort((a, b) => a - b);
+
+const nets = (rs: typeof scoped) => rs.map(r => r.opportunity.conservativeNetProfitUsd);
+return {
+seen: scoped.length,
+won: won.length,
+lost: lost.length,
+netUsd: nets(won).reduce((a, b) => a + b, 0),
+avgReactionMs: reactionTimes.length ? reactionTimes.reduce((a, b) => a + b, 0) / reactionTimes.length : null,
+p95ReactionMs: reactionTimes.length ? reactionTimes[Math.floor(reactionTimes.length * 0.95)] : null,
+bestWonUsd: won.length ? Math.max(...nets(won)) : null,
+largestLostUsd: lost.length ? Math.max(...nets(lost)) : null,
+};
+}
+
 summary(chain?: ChainName) {
 const scoped = chain ? this.records.filter(r => r.opportunity.chain === chain) : this.records;
 

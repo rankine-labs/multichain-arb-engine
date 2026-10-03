@@ -24,6 +24,11 @@
 #   BRANCH    branch to deploy               (default: main)
 # ============================================================================
 
+# The whole script is wrapped in { ... } so bash reads ALL of it before
+# running anything. This script lives in the repo it deploys, so a deploy
+# can replace this very file mid-run; without the wrapper bash could carry
+# on reading the NEW file from the middle.
+{
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -57,9 +62,17 @@ read_env_value() {
 TG_TOKEN="$(read_env_value TELEGRAM_BOT_TOKEN)"
 TG_CHATS="$(read_env_value TELEGRAM_CHAT_ID)"
 
+# Escapes text for Telegram's HTML mode (commit subjects can contain < > &).
+# (sed, not bash ${s//...}: newer bash treats '&' in the replacement as
+# "the matched text", which mangles &lt; into <lt;.)
+html() {
+  printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
+}
+
+# notify "<html message>"  -- sends to Telegram, logs a plain-text copy.
 notify() {
-  local text="[auto-deploy] $1"
-  log "$1"
+  local text="$1"
+  log "$(printf '%s' "$text" | sed -e 's/<[^>]*>//g' -e 's/&lt;/</g' -e 's/&gt;/>/g' -e 's/&amp;/\&/g' | tr '\n' ' ')"
   [ -n "$TG_TOKEN" ] && [ -n "$TG_CHATS" ] || return 0
   # Supports comma-separated chat IDs, same as the bot itself.
   IFS=',' read -ra CHATS <<< "$TG_CHATS"
@@ -68,8 +81,16 @@ notify() {
     [ -n "$chat" ] || continue
     curl -s -m 10 -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
       --data-urlencode "chat_id=${chat}" \
+      --data-urlencode "parse_mode=HTML" \
+      --data-urlencode "disable_web_page_preview=true" \
       --data-urlencode "text=${text}" > /dev/null || true
   done
+}
+
+# Standard alert shapes (same style as the bot's own messages).
+notify_not_deployed() {
+  notify "⚠️ <b>NOT DEPLOYED</b> <code>${SHORT}</code>
+$(html "$1")"
 }
 
 # Remember a commit that failed so we don't retry (and re-alert) every 2 min.
@@ -100,12 +121,12 @@ log "New commit found: $SHORT $SUBJECT"
 # --- 2. Refuse to overwrite hand edits on the server -------------------------
 CURRENT_BRANCH="$(git rev-parse --abbrev-ref HEAD)"
 if [ "$CURRENT_BRANCH" != "$BRANCH" ]; then
-  notify "NOT deployed $SHORT: server is on branch '$CURRENT_BRANCH', expected '$BRANCH'."
+  notify_not_deployed "Server is on branch '$CURRENT_BRANCH', expected '$BRANCH'."
   mark_failed "$REMOTE_SHA"; exit 1
 fi
 
 if ! git diff --quiet HEAD --; then
-  notify "NOT deployed $SHORT: the server has unsaved hand edits to tracked files. Commit or discard them (git status). It will deploy with the next change pushed to GitHub."
+  notify_not_deployed "The server has hand edits to tracked files. Commit or discard them (git status); it deploys with the next push."
   mark_failed "$REMOTE_SHA"; exit 1
 fi
 
@@ -113,7 +134,7 @@ PREV_SHA="$LOCAL_SHA"
 
 # --- 3. Pull the new code (fast-forward only, never force) --------------------
 if ! git merge --ff-only --quiet "origin/$BRANCH"; then
-  notify "NOT deployed $SHORT: server history has diverged from GitHub (fast-forward impossible). Needs a manual look."
+  notify_not_deployed "Server history has diverged from GitHub (fast-forward impossible). Needs a manual look."
   mark_failed "$REMOTE_SHA"; exit 1
 fi
 
@@ -128,7 +149,10 @@ rollback() {
   git reset --hard --quiet "$PREV_SHA"
   if [ "$PKG_CHANGED" = 1 ]; then npm install --no-audit --no-fund > /dev/null 2>&1; fi
   pm2 restart "$PM2_NAME" --update-env > /dev/null 2>&1
-  notify "FAILED to deploy $SHORT ($SUBJECT): $reason. Rolled back to ${PREV_SHA:0:7}, bot restarted on the old version."
+  notify "🔴 <b>DEPLOY FAILED</b> <code>${SHORT}</code>
+$(html "$SUBJECT")
+Reason: $(html "$reason")
+↩️ Rolled back to <code>${PREV_SHA:0:7}</code>, bot running old version"
   mark_failed "$REMOTE_SHA"
   exit 1
 }
@@ -168,5 +192,8 @@ if [ "$RESTARTS_B" != "$RESTARTS_A" ]; then
 fi
 
 rm -f "$FAILED_SHA_FILE"
-notify "Deployed $SHORT: $SUBJECT. Bot is up and stable."
+notify "🚀 <b>DEPLOYED</b> <code>${SHORT}</code>
+$(html "$SUBJECT")
+✅ Bot up and stable"
 exit 0
+}

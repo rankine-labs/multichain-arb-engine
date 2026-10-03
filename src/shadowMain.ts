@@ -46,7 +46,7 @@ function symbolOf(chain: string, address: string): string {
     if (known) return known;
     return `${address.slice(0, 6)}...${address.slice(-4)}`;
 }
-import { formatHourlySummary, formatSkippedOpportunity , formatDailySummary} from './core/telegramFormatter';
+import { formatSkippedOpportunity, formatHourlyDigest, formatDailyReport, formatStartup, formatExecutionWarning, DigestSection, DigestSpread } from './core/telegramFormatter';
 import { RobinhoodChainAdapter } from './chains/robinhoodChain';
 import { MonadAdapter } from './chains/monad';
 import { AvalancheAdapter } from './chains/avalanche';
@@ -444,18 +444,13 @@ console.log(
 // the bot actually trading.
 if (executionRequested()) {
       console.warn('[execution] EXECUTION_ENABLED=true but live firing is NOT implemented -- staying in shadow mode');
-      await sendTelegramMessage('Warning: EXECUTION_ENABLED is set, but live trading is not built yet. Bot is still shadow-only.');
+      await sendTelegramMessage(formatExecutionWarning());
 }
 
 await chainManager.startAll();
 
       const startStatus = chainManager.getStatus() as Record<string, { online: boolean }>;
-      const startChainParts: string[] = [];
-      for (const chainName of Object.keys(startStatus)) {
-            const isOnline = startStatus[chainName].online;
-            startChainParts.push(chainName + ' ' + (isOnline ? 'OK' : 'DOWN'));
-      }
-      await sendTelegramMessage('Shadow bot started. Chains: ' + startChainParts.join(', '));
+      await sendTelegramMessage(formatStartup(startStatus));
 
       // Kuru is an order book, not something you find via factory.getPair(),
       // so its market is seeded directly from the known address rather than
@@ -617,34 +612,29 @@ for (let i = 0; i < resolved.length; i++) {
       await checkMonadWatchList();
       setInterval(checkMonadWatchList, 30_000);
 
-      // Proof-of-life price check -- completely separate from the $30
-      // opportunity threshold above. Scans whatever pools are already
-      // cached (from either real swap traffic or the static seeds just
-      // above) for any pair with two or more venues, and reports their
-      // real prices side by side, however small the gap. This exists
-      // purely so it's possible to directly verify the bot is comparing
-      // genuine on-chain prices, without waiting for a rare, large,
-      // profitable opportunity to happen to occur.
+      // ======================================================================
+      // TELEGRAM REPORTING
+      // One hourly digest + one daily report. The digest replaced four
+      // separate senders (hourly summary, chain health, matches report and
+      // one "proof of life" message per pair), which produced 3-6 pings an
+      // hour. Formatting lives in core/telegramFormatter.ts.
+      // ======================================================================
 
-      // Human-readable price formatting -- template-literal interpolation of a
-      // raw JS number prints ugly things like "2.44e-9" or 15 decimal places
-      // for tiny prices, which is unreadable in a Telegram message. This picks
-      // a sensible number of decimal places based on the price's own scale
-      // instead of dumping the raw float.
-      const formatPrice = (n: number): string => {
-            if (!isFinite(n)) return 'n/a';
-            if (n === 0) return '0';
-            const abs = Math.abs(n);
-            if (abs >= 1) return n.toLocaleString('en-US', { maximumFractionDigits: 4 });
-            const leadingZeros = Math.max(0, Math.ceil(-Math.log10(abs)));
-            const decimals = Math.min(leadingZeros + 4, 18);
-            return n.toFixed(decimals);
-      };
-      const runProofOfLifeCheck = async () => {
+      // Times in reports are shown in this zone (server clock is UTC).
+      const REPORT_TZ = process.env.REPORT_TZ || 'America/Toronto';
+      const hhmm = (ms: number) =>
+            new Date(ms).toLocaleTimeString('en-GB', { timeZone: REPORT_TZ, hour: '2-digit', minute: '2-digit' });
+      const dayLabel = (ms: number) =>
+            new Date(ms).toLocaleDateString('en-US', { timeZone: REPORT_TZ, weekday: 'short', month: 'short', day: 'numeric' });
+
+      // Price sample across every cached pair with two or more venues, so the
+      // digest shows real prices even in an hour with no swap traffic. Feeds
+      // hourlyMatches (same store the live event path uses) instead of
+      // sending its own message per pair like it used to.
+      const samplePricesIntoMatches = () => {
             for (const chain of ['avalanche', 'monad', 'robinhood'] as const) {
-                  const pools = cache.allForChain(chain);
                   const seenPairs = new Set<string>();
-                  for (const pool of pools) {
+                  for (const pool of cache.allForChain(chain)) {
                         const pairKey = [pool.tokenA.toLowerCase(), pool.tokenB.toLowerCase()].sort().join('-');
                         if (seenPairs.has(pairKey)) continue;
                         seenPairs.add(pairKey);
@@ -653,136 +643,127 @@ for (let i = 0; i < resolved.length; i++) {
                         // Same base token for both pools so they compare like for like.
                         const priceA = priceOf(pool, pool.tokenA, decimalsOf);
                         const priceB = priceOf(peers[0], pool.tokenA, decimalsOf);
-                        if (priceA === null || priceB === null || priceA === 0) continue;
-                        const spreadPct = ((priceB - priceA) / priceA) * 100;
-                        await sendTelegramMessage([
-                              'LIVE PRICE CHECK (proof of life, not an opportunity alert)',
-                              `Chain: ${chain}`,
-        `Pair: ${symbolOf(chain, pool.tokenA)}/${symbolOf(chain, pool.tokenB)}`,
-                              `${pool.dex}: ${formatPrice(priceA)}`,
-                              `${peers[0].dex}: ${formatPrice(priceB)}`,
-                              `Spread: ${spreadPct.toFixed(4)}%`,
-                              ].join('\n'));
+                        if (priceA === null || priceB === null) continue;
+                        const pair = `${symbolOf(chain, pool.tokenA)}/${symbolOf(chain, pool.tokenB)}`;
+                        const key = `${chain}:${pair}`;
+                        const gap = spreadPct(priceA, priceB);
+                        const existing = hourlyMatches.get(key);
+                        if (!existing || gap > existing.spreadPct) {
+                              // "buy" = cheaper venue, "sell" = dearer one
+                              const [buy, sell] = priceA <= priceB ? [pool, peers[0]] : [peers[0], pool];
+                              hourlyMatches.set(key, {
+                                    chain, pair, buyDex: buy.dex, sellDex: sell.dex,
+                                    buyPrice: Math.min(priceA, priceB), sellPrice: Math.max(priceA, priceB), spreadPct: gap,
+                              });
+                        }
                   }
             }
       };
-              setInterval(runProofOfLifeCheck, 60 * 60 * 1000); // hourly, plus once on startup below
-          setTimeout(runProofOfLifeCheck, 10_000); // one check shortly after startup too
-  const lastHealthStatus: Record<string, boolean> = { avalanche: true, monad: true, robinhood: true };
-        // Chains flap in and out of health regularly (Monad's speculative
-        // feed reconnecting is normal, not an emergency). Counted silently
-        // here, reported once per hour instead of alerting live every time.
-        const chainHealthFlapCount: Record<string, number> = { avalanche: 0, monad: 0, robinhood: 0 };
+
+      // Health bookkeeping (runs every 15s alongside the health checks):
+      //  - flap count per chain, reported in the next digest then reset
+      //  - healthy/total ticks per chain, for the daily uptime figure
+      const lastHealthStatus: Record<string, boolean> = { avalanche: true, monad: true, robinhood: true };
+      // Chains flap in and out of health regularly (Monad's speculative
+      // feed reconnecting is normal, not an emergency). Counted silently
+      // here, reported once per hour instead of alerting live every time.
+      const chainHealthFlapCount: Record<string, number> = { avalanche: 0, monad: 0, robinhood: 0 };
+      const healthTicks: Record<string, { healthy: number; total: number }> = {
+            avalanche: { healthy: 0, total: 0 }, monad: { healthy: 0, total: 0 }, robinhood: { healthy: 0, total: 0 },
+      };
       setInterval(async () => {
             await chainManager.runHealthChecks();
             const status = chainManager.getStatus() as Record<string, { online: boolean; reason?: string }>;
             for (const [chain, info] of Object.entries(status)) {
                   const wasHealthy = lastHealthStatus[chain] ?? true;
-if (wasHealthy && !info.online) {
-      chainHealthFlapCount[chain] = (chainHealthFlapCount[chain] ?? 0) + 1;
-}
+                  if (wasHealthy && !info.online) {
+                        chainHealthFlapCount[chain] = (chainHealthFlapCount[chain] ?? 0) + 1;
+                  }
                   lastHealthStatus[chain] = info.online;
+                  const ticks = (healthTicks[chain] ??= { healthy: 0, total: 0 });
+                  ticks.total++;
+                  if (info.online) ticks.healthy++;
             }
       }, 15_000);
 
-setInterval(async () => {
-const summary = shadowLogger.summary();
-const status = chainManager.getStatus();
-
-const message = formatHourlySummary({
-activeChains: {
-avalanche: chainManager.isHealthy('avalanche'),
-monad: chainManager.isHealthy('monad'),
-robinhood: chainManager.isHealthy('robinhood'),
-},
-seen: summary.opportunitiesSeen,
-filtered: 0,
-simulated: summary.opportunitiesSeen,
-profitable: summary.wouldHaveWon + summary.wouldHaveLost,
-attempted: summary.wouldHaveWon + summary.wouldHaveLost,
-won: summary.wouldHaveWon,
-missed: summary.wouldHaveLost,
-reverted: 0,
-grossProfitUsd: 0,
-allCostsUsd: 0,
-netProfitUsd: Number(summary.hypotheticalNetProfitUsd),
-bestChain: { chain: 'avalanche', profitUsd: 0 },
-bestTrade: { pair: 'n/a', netProfitUsd: 0 },
-avgReactionMs: summary.avgReactionMs ?? 0,
-p95ReactionMs: summary.p95ReactionMs ?? 0,
-});
-
-await sendTelegramMessage(message);
-
-      // Report any chain disconnects silently counted this hour, then
-      // reset for the next hour -- this replaces live UNHEALTHY/recovered
-      // alerts, which were firing on every brief reconnect.
-      const flapEntries = Object.entries(chainHealthFlapCount).filter(([, count]) => count > 0);
-      if (flapEntries.length > 0) {
-            const flapLines = flapEntries.map(
-                  ([chainName, count]) => `${chainName}: disconnected and auto-recovered ${count}x this hour`,
-                  );
-            await sendTelegramMessage(`CHAIN HEALTH THIS HOUR\n\n${flapLines.join('\n')}`);
-      }
-      for (const chainName of Object.keys(chainHealthFlapCount)) chainHealthFlapCount[chainName] = 0;
-}, 60 * 60 * 1000);
-
-      // Sends whatever real matches were actually found this hour, then
-      // clears for the next hour. If this comes back empty, that's a
-      // real, honest answer too -- it means no two watched exchanges
-      // traded the same pair close enough together to compare, not that
-      // anything is broken.
-      const sendHourlyMatchesReport = async () => {
-            const monadPairLines = monadWatchedPairs.map(({ tokenA, tokenB }) => {
-                  const label = `${symbolOf('monad', tokenA)}/${symbolOf('monad', tokenB)}`;
-                  const m = hourlyMatches.get(`monad:${label}`);
-                  return m
-? `  ${label}: ${m.buyDex} @ ${formatPrice(m.buyPrice)} vs ${m.sellDex} @ ${formatPrice(m.sellPrice)} (${m.spreadPct.toFixed(4)}% spread)`
-                        : `  ${label}: no match this hour`;
+      // Builds the "best spread per pair" sections from hourlyMatches.
+      // The same pair can be stored under either token order (live event
+      // path vs price sample), so pairs are de-duplicated by their sorted
+      // symbols, keeping the widest spread.
+      const buildDigestSections = (): DigestSection[] => {
+            const byChain = new Map<string, Map<string, DigestSpread>>();
+            for (const m of hourlyMatches.values()) {
+                  const norm = m.pair.split('/').sort().join('/');
+                  const chainMap = byChain.get(m.chain) ?? new Map<string, DigestSpread>();
+                  byChain.set(m.chain, chainMap);
+                  const prev = chainMap.get(norm);
+                  if (!prev || m.spreadPct > prev.spreadPct) {
+                        chainMap.set(norm, { pair: m.pair, spreadPct: m.spreadPct, buyDex: m.buyDex, sellDex: m.sellDex });
+                  }
+            }
+            return (['monad', 'robinhood', 'avalanche'] as const).map((chain) => {
+                  const spreads = [...(byChain.get(chain)?.values() ?? [])];
+                  let noMatchCount = 0;
+                  if (chain === 'monad') {
+                        const matched = new Set(spreads.map((sp) => sp.pair.split('/').sort().join('/')));
+                        noMatchCount = monadWatchedPairs.filter(({ tokenA, tokenB }) =>
+                              !matched.has([symbolOf('monad', tokenA), symbolOf('monad', tokenB)].sort().join('/')),
+                        ).length;
+                  }
+                  return { chain, spreads, noMatchCount };
             });
-            const monadMatchedCount = monadPairLines.filter(l => !l.includes('no match this hour')).length;
-
-            const robinhoodLabel = `${symbolOf('robinhood', ROBINHOOD_TOKENS.WETH)}/${symbolOf('robinhood', ROBINHOOD_TOKENS.USDG)}`;
-            const robinhoodMatch = hourlyMatches.get(`robinhood:${robinhoodLabel}`);
-            const robinhoodLine = robinhoodMatch
-            ? `  ${robinhoodLabel}: ${robinhoodMatch.buyDex} @ ${formatPrice(robinhoodMatch.buyPrice)} vs ${robinhoodMatch.sellDex} @ ${formatPrice(robinhoodMatch.sellPrice)} (${robinhoodMatch.spreadPct.toFixed(4)}% spread)`
-                  : `  ${robinhoodLabel}: no match this hour`;
-
-            const lines = [
-                  'REAL MATCHES FOUND THIS HOUR',
-                  '',
-                  `MONAD -- 5 exchanges (Uniswap V3, Kuru, Bean Exchange, LFJ, PancakeSwap)`,
-                  `Watching ${monadWatchedPairs.length} pairs, ${monadMatchedCount} matched this hour:`,
-                  `LFJ-LB prices excluded from all comparisons above -- its aggregate reserves across price bins don't reflect the real market price, known gap, not a silent failure`,
-                  ...monadPairLines,
-                  '',
-                  `ROBINHOOD -- 4 exchanges (Uniswap V2, Uniswap V3, Uniswap V4, PancakeSwap)`,
-                  `Watching 1 pair:`,
-                  robinhoodLine,
-                  '',
-                  `AVALANCHE -- 4 exchanges configured (TraderJoe V1, TraderJoe LB, SushiSwap, Pharaoh), but not receiving live trade data right now -- known gap, not a silent failure`,
-                  ];
-            await sendTelegramMessage(lines.join('\n'));
-            hourlyMatches.clear();
       };
-      await sendHourlyMatchesReport();
-      setInterval(sendHourlyMatchesReport, 60 * 60 * 1000);
 
+      let lastDigestAt = Date.now();
+      const sendHourlyDigest = async () => {
+            const now = Date.now();
+            try {
+                  samplePricesIntoMatches();
+                  const stats = shadowLogger.windowStats(lastDigestAt, now);
+                  const status = chainManager.getStatus() as Record<string, { online: boolean }>;
+                  await sendTelegramMessage(formatHourlyDigest({
+                        windowLabel: `${hhmm(lastDigestAt)} to ${hhmm(now)}`,
+                        chains: (['avalanche', 'monad', 'robinhood'] as const).map((chain) => ({
+                              chain,
+                              healthy: status[chain]?.online ?? false,
+                              reconnects: chainHealthFlapCount[chain] ?? 0,
+                        })),
+                        stats,
+                        sections: buildDigestSections(),
+                  }));
+            } catch (err) {
+                  console.error('[telegram] hourly digest failed:', err);
+            } finally {
+                  // Reset for the next hour even if sending failed.
+                  hourlyMatches.clear();
+                  for (const chainName of Object.keys(chainHealthFlapCount)) chainHealthFlapCount[chainName] = 0;
+                  lastDigestAt = now;
+            }
+      };
+      setInterval(sendHourlyDigest, 60 * 60 * 1000);
+
+      let lastDailyAt = Date.now();
       setInterval(async () => {
-            const summary = shadowLogger.summary();
-            const message = formatDailySummary({
-                  netProfitUsd: Number(summary.hypotheticalNetProfitUsd),
-                    byChain: { avalanche: 0, monad: 0, robinhood: 0 },
-                  won: summary.wouldHaveWon,
-                  missed: summary.wouldHaveLost,
-                  reverted: 0,
-                  fundingOwnCapitalPct: 0,
-                  fundingFlashLoanPct: 100,
-                  bestTradeUsd: 0,
-                  largestMissedUsd: 0,
-                  uptimePct: 100,
-            });
-            await sendTelegramMessage(message);
+            const now = Date.now();
+            try {
+                  const stats = shadowLogger.windowStats(lastDailyAt, now);
+                  const uptimePct: Record<string, number | null> = {};
+                  for (const [chain, t] of Object.entries(healthTicks)) {
+                        uptimePct[chain] = t.total > 0 ? (t.healthy / t.total) * 100 : null;
+                  }
+                  await sendTelegramMessage(formatDailyReport({
+                        dateLabel: dayLabel(lastDailyAt),
+                        stats,
+                        bestTradeUsd: stats.bestWonUsd,
+                        largestMissUsd: stats.largestLostUsd,
+                        uptimePct,
+                  }));
+            } catch (err) {
+                  console.error('[telegram] daily report failed:', err);
+            } finally {
+                  for (const t of Object.values(healthTicks)) { t.healthy = 0; t.total = 0; }
+                  lastDailyAt = now;
+            }
       }, 24 * 60 * 60 * 1000);
 
 console.log('Shadow mode running. Pool cache size:', cache.size());
