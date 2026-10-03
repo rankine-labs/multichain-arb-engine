@@ -51,6 +51,7 @@ import { RobinhoodChainAdapter } from './chains/robinhoodChain';
 import { MonadAdapter } from './chains/monad';
 import { AvalancheAdapter } from './chains/avalanche';
 import { RawChainEvent } from './core/types';
+import { buildExecuteCall, executionRequested, executorConfig } from './execution/executorCalldata';
 
 async function main() {
 const cache = new PoolCache();
@@ -397,7 +398,47 @@ console.log(
 `[opportunity] ${swap.chain} predicted=${plan.usedPrediction} score=${score} net=$${profit.conservativeNetProfitUsd.toFixed(2)} ` +
 `reaction=${reactionMs}ms`,
 );
+
+      // EXECUTION DRY RUN -- builds the exact ArbExecutor.execute() calldata
+      // for this opportunity but NEVER signs or sends it. Answers "could the
+      // on-chain contract have executed this one, and if not, why?" so we can
+      // see real coverage before going live. See src/execution/executorCalldata.ts.
+      // Wrapped in try/catch: a dry-run problem must never affect the bot.
+      try {
+            const dry = buildExecuteCall({
+                  chain: swap.chain,
+                  tokenIn: swap.tokenIn,
+                  buyPool: buyPoolUsed,
+                  sellPool: sellPoolUsed,
+                  tradeSizeUsd: sizing.optimalTradeSizeUsd,
+                  netProfitUsd: profit.conservativeNetProfitUsd,
+                  usdPerTokenIn: usdPerToken,
+                  // Strict lookup: no default-to-18 for real trade amounts.
+                  tokenInDecimals: TOKEN_DECIMALS[swap.chain]?.[swap.tokenIn.toLowerCase()],
+                  maxBlock: 0n, // dry run only; live firing would use current block + 1
+                  ...executorConfig(swap.chain),
+            });
+            if ('reason' in dry) {
+                  console.log(`[exec-dryrun] ${swap.chain} NOT executable: ${dry.reason}`);
+            } else {
+                  const funding = /^0x0+$/.test(dry.flashPool) ? 'own-capital' : 'flash';
+                  console.log(
+                        `[exec-dryrun] ${swap.chain} executable: ${dry.hops.map((h) => `kind${h.kind}`).join('->')} ` +
+                        `amountIn=${dry.amountIn} minProfit=${dry.minProfit} ${funding}`,
+                  );
+            }
+      } catch (err) {
+            console.warn('[exec-dryrun] skipped:', (err as Error).message);
+      }
 });
+
+// Live trading is not implemented yet (adapters' fireTransaction() are
+// placeholders). Make sure flipping the switch early can't be mistaken for
+// the bot actually trading.
+if (executionRequested()) {
+      console.warn('[execution] EXECUTION_ENABLED=true but live firing is NOT implemented -- staying in shadow mode');
+      await sendTelegramMessage('Warning: EXECUTION_ENABLED is set, but live trading is not built yet. Bot is still shadow-only.');
+}
 
 await chainManager.startAll();
 
