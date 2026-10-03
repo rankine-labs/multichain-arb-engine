@@ -99,9 +99,42 @@ async function probeMonad(): Promise<string[]> {
   ];
 }
 
+// Avalanche public endpoint: does it stream pending transactions? If so,
+// it can back up the keyed Alchemy/QuickNode feeds.
+const AVAX_WSS = process.env.AVAX_PROBE_WSS ?? 'wss://api.avax.network/ext/bc/C/ws';
+async function probeAvalanche(): Promise<string[]> {
+  let subResult = 'no response', hashes = 0, fetched = 0, swaps = 0;
+  const http = 'https://api.avax.network/ext/bc/C/rpc';
+  const pending: string[] = [];
+  const status = await listen(AVAX_WSS, (ws) => {
+    ws.send(JSON.stringify({ id: 1, jsonrpc: '2.0', method: 'eth_subscribe', params: ['newPendingTransactions'] }));
+  }, (msg) => {
+    if (msg.id === 1) { subResult = msg.result ? 'accepted' : `rejected: ${JSON.stringify(msg.error)}`; return; }
+    const h = msg?.params?.result;
+    if (typeof h === 'string') { hashes++; if (pending.length < 40) pending.push(h); }
+  });
+  // Can we fetch those pending txs' calldata (what the adapter does next)?
+  for (const h of pending) {
+    try {
+      const r = await fetch(http, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_getTransactionByHash', params: [h] }) });
+      const tx = (await r.json())?.result;
+      if (tx?.to && tx?.input) {
+        fetched++;
+        const swap = await decoder.decode({ chain: 'avalanche', stateType: 'PENDING', blockOrSeq: 'pending', receivedAtMs: Date.now(), raw: { to: tx.to, data: tx.input, value: BigInt(tx.value ?? 0).toString() } });
+        if (swap) swaps++;
+      }
+    } catch { /* skip */ }
+  }
+  return [
+    `AVALANCHE public (${AVAX_WSS}): ${status}, subscribe ${subResult}`,
+    `pending tx hashes ${hashes}; of first ${pending.length}: fetched ${fetched}, decoded as swaps ${swaps}`,
+  ];
+}
+
 (async () => {
-  const [rh, monad] = await Promise.all([probeRobinhood(), probeMonad()]);
-  const out = [...rh, '', ...monad];
+  const [rh, monad, avax] = await Promise.all([probeRobinhood(), probeMonad(), probeAvalanche()]);
+  const out = [...rh, '', ...monad, '', ...avax];
   console.log(out.join('\n'));
   process.exit(0);
 })();

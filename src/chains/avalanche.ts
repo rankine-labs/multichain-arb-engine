@@ -43,6 +43,16 @@ export class AvalancheAdapter implements ChainCapability {
         private quicknodeLastBlock = 0;
         private lastEventAtMs = 0;
 
+        // Feed visibility. The old health check only flagged silence AFTER a
+        // first event, so a provider that connects but never streams pending
+        // txs (the live probe showed Avalanche's public endpoint does exactly
+        // that) looked healthy forever while the bot saw nothing.
+        private connectedAtMs = 0;
+        private pendingCount = { alchemy: 0, quicknode: 0 };
+        private lastCountLogAtMs = 0;
+        private static readonly FIRST_EVENT_GRACE_MS = 60_000;
+        private static readonly COUNT_LOG_EVERY_MS = 5 * 60_000;
+
   async connect(): Promise<void> {
             // Clean up any previous connection before reconnecting -- otherwise a
           // reconnect attempt after the socket died leaks the old (dead) provider
@@ -50,32 +60,48 @@ export class AvalancheAdapter implements ChainCapability {
           try { this.alchemyProvider?.destroy(); } catch { /* already dead, fine */ }
             try { this.quicknodeProvider?.destroy(); } catch { /* already dead, fine */ }
 
-          this.alchemyProvider = new ethers.WebSocketProvider(ALCHEMY_WSS, 43114); // explicit chainId -- public AVAX endpoint doesn't support eth_chainId, breaking ethers' auto-detection
-          this.quicknodeProvider = new ethers.WebSocketProvider(QUICKNODE_WSS, 43114);
+          this.alchemyProvider = null;
+          this.quicknodeProvider = null;
 
-          this.alchemyProvider.on('pending', (txHash: string) => this.handlePending('alchemy', txHash));
-            this.quicknodeProvider.on('pending', (txHash: string) => this.handlePending('quicknode', txHash));
+          // Skip any provider whose URL was never filled in (.env missing it).
+          const configured = (url: string) => !url.includes('REPLACE_WITH');
+          if (!configured(ALCHEMY_WSS) && !configured(QUICKNODE_WSS)) {
+                    throw new Error('Avalanche not configured: set AVALANCHE_QUICKNODE_WSS and/or AVALANCHE_ALCHEMY_WSS in .env');
+          }
+          if (configured(ALCHEMY_WSS)) {
+                    this.alchemyProvider = this.openProvider('alchemy', ALCHEMY_WSS);
+          } else console.warn('[avalanche] AVALANCHE_ALCHEMY_WSS not set -- using QuickNode only');
+          if (configured(QUICKNODE_WSS)) {
+                    this.quicknodeProvider = this.openProvider('quicknode', QUICKNODE_WSS);
+          } else console.warn('[avalanche] AVALANCHE_QUICKNODE_WSS not set -- using Alchemy only');
 
-          this.alchemyProvider.on('block', (n: number) => { this.alchemyLastBlock = n; });
-            this.quicknodeProvider.on('block', (n: number) => { this.quicknodeLastBlock = n; });
+          this.connectedAtMs = Date.now();
+          this.lastEventAtMs = 0;
+          const names = [this.alchemyProvider && 'Alchemy', this.quicknodeProvider && 'QuickNode'].filter(Boolean).join(' and ');
+          console.log(`[avalanche] connected to ${names} pending-tx feed(s)`);
+  }
 
+  // Opens one provider with all the listeners it needs.
+  private openProvider(source: 'alchemy' | 'quicknode', url: string): ethers.WebSocketProvider {
+          const provider = new ethers.WebSocketProvider(url, 43114); // explicit chainId -- public AVAX endpoint doesn't support eth_chainId, breaking ethers' auto-detection
+          provider.on('pending', (txHash: string) => this.handlePending(source, txHash));
+          provider.on('block', (n: number) => {
+                    if (source === 'alchemy') this.alchemyLastBlock = n; else this.quicknodeLastBlock = n;
+          });
           // Just a log, not a trigger -- chainManager's health check will call
           // connect() again on its own 15s cycle once healthCheck() reports this
           // provider unhealthy. Self-triggering here caused a real production
           // incident (see file header).
-          (this.alchemyProvider.websocket as any).on('close', () => console.warn('[avalanche] alchemy websocket closed -- chainManager will reconnect on its next health check'));
-            (this.quicknodeProvider.websocket as any).on('close', () => console.warn('[avalanche] quicknode websocket closed -- chainManager will reconnect on its next health check'));
-
+          (provider.websocket as any).on('close', () => console.warn(`[avalanche] ${source} websocket closed -- chainManager will reconnect on its next health check`));
           // Required or Node crashes the process -- see file header.
-          (this.alchemyProvider.websocket as any).on('error', (err: Error) => console.warn('[avalanche] alchemy websocket error:', err.message));
-            (this.quicknodeProvider.websocket as any).on('error', (err: Error) => console.warn('[avalanche] quicknode websocket error:', err.message));
-
-          console.log('[avalanche] connected to both Alchemy and QuickNode pending-tx feeds');
+          (provider.websocket as any).on('error', (err: Error) => console.warn(`[avalanche] ${source} websocket error:`, err.message));
+          return provider;
   }
 
   private async handlePending(source: 'alchemy' | 'quicknode', txHash: string) {
             const receivedAtMs = Date.now();
             this.lastEventAtMs = receivedAtMs;
+            this.pendingCount[source]++;
 
           const provider = source === 'alchemy' ? this.alchemyProvider : this.quicknodeProvider;
             if (!provider) return;
@@ -109,11 +135,29 @@ export class AvalancheAdapter implements ChainCapability {
   }
 
   async healthCheck(): Promise<{ healthy: boolean; reason?: string }> {
-            const drift = Math.abs(this.alchemyLastBlock - this.quicknodeLastBlock);
-            if (drift > 2) {
-                        return { healthy: false, reason: `providers disagree on block height by ${drift} blocks` };
+            const now = Date.now();
+
+            // Every 5 minutes, say how many pending txs each provider delivered.
+            if (now - this.lastCountLogAtMs >= AvalancheAdapter.COUNT_LOG_EVERY_MS) {
+                        console.log(`[avalanche] pending txs in last 5m: alchemy ${this.alchemyProvider ? this.pendingCount.alchemy : 'off'}, quicknode ${this.quicknodeProvider ? this.pendingCount.quicknode : 'off'}`);
+                        this.pendingCount = { alchemy: 0, quicknode: 0 };
+                        this.lastCountLogAtMs = now;
             }
-            const msSinceLastEvent = Date.now() - this.lastEventAtMs;
+
+            // Block-height agreement only means something with two providers.
+            if (this.alchemyProvider && this.quicknodeProvider) {
+                        const drift = Math.abs(this.alchemyLastBlock - this.quicknodeLastBlock);
+                        if (drift > 2) {
+                                    return { healthy: false, reason: `providers disagree on block height by ${drift} blocks` };
+                        }
+            }
+
+            // Connected but NOTHING ever arrived: not healthy, just quiet.
+            if (this.lastEventAtMs === 0 && this.connectedAtMs > 0 && now - this.connectedAtMs > AvalancheAdapter.FIRST_EVENT_GRACE_MS) {
+                        return { healthy: false, reason: 'connected, but no pending transactions received (provider may not stream the Avalanche mempool)' };
+            }
+
+            const msSinceLastEvent = now - this.lastEventAtMs;
             if (this.lastEventAtMs > 0 && msSinceLastEvent > 30_000) {
                         return { healthy: false, reason: `no pending tx events in ${msSinceLastEvent}ms` };
             }

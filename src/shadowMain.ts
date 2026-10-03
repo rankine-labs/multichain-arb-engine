@@ -53,7 +53,7 @@ import { AvalancheAdapter } from './chains/avalanche';
 import { RawChainEvent } from './core/types';
 import { priceOf, spreadPct } from './core/poolPrice';
 import { buildExecuteCall, executionRequested, executorConfig } from './execution/executorCalldata';
-import { makeRpc, simulateRoundTrip, Rpc } from './execution/simulator';
+import { makeRpc, simulateRoundTrip, simRpcUrl, Rpc } from './execution/simulator';
 
 async function main() {
 const cache = new PoolCache();
@@ -222,25 +222,29 @@ Object.entries(discoveryConfigs).map(([chain, cfg]) => [chain, new PoolDiscovery
 // real chain (eth_call + state overrides: nothing deployed, nothing spent)
 // and log the real profit next to what the maths model predicted.
 // ==========================================================================
-const SIM_RPC_URL: Record<string, string> = {
-      avalanche: process.env.SIM_RPC_AVALANCHE || 'https://api.avax.network/ext/bc/C/rpc',
-      monad: process.env.SIM_RPC_MONAD || 'https://rpc.monad.xyz',
-      robinhood: process.env.SIM_RPC_ROBINHOOD || 'https://rpc.mainnet.chain.robinhood.com',
-};
-const simRpc: Record<string, Rpc> = Object.fromEntries(Object.entries(SIM_RPC_URL).map(([c, u]) => [c, makeRpc(u)]));
+// Paid endpoint if configured, else public (see simRpcUrl in simulator.ts).
+const simRpc: Record<string, Rpc> = {};
+for (const chain of ['avalanche', 'monad', 'robinhood'] as const) {
+      const { url, source } = simRpcUrl(chain);
+      simRpc[chain] = makeRpc(url);
+      console.log(`[sim] ${chain}: simulating on ${source}`); // never log the URL itself (it holds your API key)
+}
+// When an endpoint says "slow down", pause that chain's simulations.
+const SIM_RATE_LIMIT_PAUSE_MS = 60_000;
+const simPausedUntil: Record<string, number> = {};
 // How long to wait for the trade we're backrunning to land before simulating
 // (roughly one to a few blocks on each chain).
 const SIM_DELAY_MS: Record<string, number> = { avalanche: 3_000, monad: 1_500, robinhood: 1_000 };
 const simBusy: Record<string, boolean> = {};          // one simulation in flight per chain
 const simDisabled: Record<string, string> = {};       // chain -> reason (e.g. RPC lacks overrides)
 // Reported in the hourly digest, then reset.
-const simStats = { checked: 0, profit: 0, loss: 0, fail: 0 };
+const simStats = { checked: 0, profit: 0, loss: 0, fail: 0, rateLimited: 0 };
 
 const queueSimulation = (
       chain: 'avalanche' | 'monad' | 'robinhood', tokenIn: string,
       buyPool: any, sellPool: any, tradeSizeUsd: number, modelGrossUsd: number, usdPerToken: number,
 ) => {
-      if (simBusy[chain] || simDisabled[chain]) return;
+      if (simBusy[chain] || simDisabled[chain] || Date.now() < (simPausedUntil[chain] ?? 0)) return;
       const decimals = TOKEN_DECIMALS[chain]?.[tokenIn.toLowerCase()];
       if (decimals === undefined) return;
       // Only need the route + amount here; minProfit is set by the simulator.
@@ -256,6 +260,13 @@ const queueSimulation = (
                   const r = await simulateRoundTrip(simRpc[chain], chain, { token: tokenIn, amountIn: built.amountIn, hops: built.hops });
                   const route = `${buyPool.dex}->${sellPool.dex}`;
                   const model = `model gross $${modelGrossUsd.toFixed(2)} on $${tradeSizeUsd.toFixed(0)}`;
+                  if (r.status === 'rate_limited') {
+                        // Not a trade result: pause, don't count it.
+                        simPausedUntil[chain] = Date.now() + SIM_RATE_LIMIT_PAUSE_MS;
+                        simStats.rateLimited++;
+                        console.warn(`[sim] ${chain} RPC rate limited, pausing simulations 60s`);
+                        return;
+                  }
                   if (r.status === 'unsupported') {
                         simDisabled[chain] = r.reason;
                         console.warn(`[sim] ${chain} simulation disabled: ${r.reason}`);
@@ -822,7 +833,7 @@ for (let i = 0; i < resolved.length; i++) {
                   // Reset for the next hour even if sending failed.
                   hourlyMatches.clear();
                   for (const chainName of Object.keys(chainHealthFlapCount)) chainHealthFlapCount[chainName] = 0;
-                  simStats.checked = simStats.profit = simStats.loss = simStats.fail = 0;
+                  simStats.checked = simStats.profit = simStats.loss = simStats.fail = simStats.rateLimited = 0;
                   lastDigestAt = now;
             }
       };
