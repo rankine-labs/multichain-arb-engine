@@ -63,9 +63,16 @@ jobs:
         shell: bash
         run: |
           set +e
-          forge test -vvv --match-path "test/Fork.t.sol" 2>&1 | tee fork-output.txt
-          status=${PIPESTATUS[0]}
-          summary=$(grep -E "\[(PASS|FAIL|SKIP)|->|pool |skipped|Revert|^\s+0x[0-9a-f]{8}|Suite result|Error" fork-output.txt | head -60)
+          status=0
+          # One run per chain, each pointed at its own RPC so Foundry picks
+          # that chain's EVM flavour (required for Monad).
+          for pair in "AvalancheForkTest:$AVALANCHE_RPC_URL" "MonadForkTest:$MONAD_RPC_URL" "RobinhoodForkTest:$ROBINHOOD_RPC_URL"; do
+            name="${pair%%:*}"; url="${pair#*:}"
+            echo "=== $name" | tee -a fork-output.txt
+            FOUNDRY_PROFILE=fork forge test -vvv --match-path "test/Fork.t.sol" --match-contract "$name" --fork-url "$url" 2>&1 | tee -a fork-output.txt
+            [ "${PIPESTATUS[0]}" -ne 0 ] && status=1
+          done
+          summary=$(grep -E "^===|\[(PASS|FAIL|SKIP)|->|pool |skipped|Revert|^\s+0x[0-9a-f]{8}|Suite result|Error" fork-output.txt | head -60)
           summary="${summary//'%'/'%25'}"
           summary="${summary//$'\n'/'%0A'}"
           echo "::notice title=Fork test results::${summary}"
