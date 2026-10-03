@@ -10,7 +10,8 @@ import {
     MockV3Pool,
     MockAavePool,
     DrainingV3Pool,
-    EvilFlashPool
+    EvilFlashPool,
+    EvilV3Lender
 } from "./mocks/Mocks.sol";
 
 // ============================================================================
@@ -291,5 +292,126 @@ contract ArbExecutorTest is Test {
         vm.prank(bot);
         vm.expectRevert(ArbExecutor.NotExecutor.selector);
         exec.execute(t, address(0));
+    }
+
+    // ---- V3 pool flash loans (no capital in the contract) ------------------
+
+    // A separate V3 pool that holds lots of USDC to lend (not used in the route).
+    function _lender() internal returns (MockV3Pool lender) {
+        lender = new MockV3Pool(address(weth), address(usdc), 3_000, 1, false);
+        usdc.mint(address(lender), 1_000_000 * E18);
+        weth.mint(address(lender), 1_000 * E18);
+        exec.setFlashPool(address(lender), true);
+    }
+
+    function test_v3Flash_makesProfit_withZeroCapital() public {
+        MockV3Pool lender = _lender();
+        uint256 lenderBefore = usdc.balanceOf(address(lender));
+        assertEq(usdc.balanceOf(address(exec)), 0, "contract starts empty");
+
+        vm.prank(bot);
+        exec.executeWithV3Flash(_trade(0, address(cheapV2), 0, address(dearV2), 1_000 * E18), address(lender));
+
+        uint256 profit = usdc.balanceOf(address(exec));
+        assertGt(profit, 1_000 * E18, "profit from borrowed money only");
+        // Lender got its 0.05% fee.
+        assertEq(usdc.balanceOf(address(lender)), lenderBefore + (TRADE * 5 + 9_999) / 10_000, "lender repaid + fee");
+        emit log_named_decimal_uint("V3-flash profit USDC (after 0.05% fee)", profit, 18);
+    }
+
+    function test_v3Flash_pancakeCallback_works() public {
+        MockV3Pool lender = new MockV3Pool(address(weth), address(usdc), 3_000, 1, true);
+        usdc.mint(address(lender), 1_000_000 * E18);
+        exec.setFlashPool(address(lender), true);
+        vm.prank(bot);
+        exec.executeWithV3Flash(_trade(0, address(cheapV2), 0, address(dearV2), 1_000 * E18), address(lender));
+        assertGt(usdc.balanceOf(address(exec)), 1_000 * E18, "pancake flash callback path");
+    }
+
+    function test_v3Flash_feeCountsAgainstProfit() public {
+        // Exact own-capital profit, then demand it on a flash trade: the fee must push it under.
+        uint256 snap = vm.snapshotState();
+        usdc.mint(address(exec), TRADE);
+        vm.prank(bot);
+        exec.execute(_trade(0, address(cheapV2), 0, address(dearV2), 1), address(0));
+        uint256 exactProfit = usdc.balanceOf(address(exec)) - TRADE;
+        vm.revertToState(snap);
+
+        MockV3Pool lender = _lender();
+        vm.prank(bot);
+        vm.expectRevert();
+        exec.executeWithV3Flash(_trade(0, address(cheapV2), 0, address(dearV2), exactProfit), address(lender));
+    }
+
+    function test_v3Flash_unprofitable_revertsAndLenderWhole() public {
+        MockV3Pool lender = _lender();
+        uint256 lenderBefore = usdc.balanceOf(address(lender));
+        vm.prank(bot);
+        vm.expectRevert();
+        exec.executeWithV3Flash(_trade(0, address(dearV2), 0, address(cheapV2), 1), address(lender));
+        assertEq(usdc.balanceOf(address(lender)), lenderBefore, "nothing moved");
+    }
+
+    function test_v3Flash_lenderMustBeAllowlisted() public {
+        MockV3Pool lender = new MockV3Pool(address(weth), address(usdc), 3_000, 1, false);
+        vm.prank(bot);
+        vm.expectRevert(abi.encodeWithSelector(ArbExecutor.FlashPoolNotAllowed.selector, address(lender)));
+        exec.executeWithV3Flash(_trade(0, address(cheapV2), 0, address(dearV2), 1), address(lender));
+    }
+
+    function test_v3Flash_lenderCannotBeATradePool() public {
+        exec.setFlashPool(address(dearV3), true);
+        vm.prank(bot);
+        vm.expectRevert(ArbExecutor.BadRoute.selector);
+        exec.executeWithV3Flash(_trade(0, address(cheapV2), 2, address(dearV3), 1), address(dearV3));
+    }
+
+    function test_v3Flash_lenderMustHoldTheToken() public {
+        MockERC20 other = new MockERC20("OTHER", 18);
+        MockV3Pool lender = new MockV3Pool(address(weth), address(other), 1, 1, false);
+        exec.setFlashPool(address(lender), true);
+        vm.prank(bot);
+        vm.expectRevert(ArbExecutor.BadRoute.selector);
+        exec.executeWithV3Flash(_trade(0, address(cheapV2), 0, address(dearV2), 1), address(lender));
+    }
+
+    function test_v3Flash_onlyExecutor() public {
+        MockV3Pool lender = _lender();
+        vm.prank(stranger);
+        vm.expectRevert(ArbExecutor.NotExecutor.selector);
+        exec.executeWithV3Flash(_trade(0, address(cheapV2), 0, address(dearV2), 1), address(lender));
+    }
+
+    function test_v3Flash_callbackRejectsDirectCalls() public {
+        vm.prank(stranger);
+        vm.expectRevert(ArbExecutor.UnauthorizedCallback.selector);
+        exec.uniswapV3FlashCallback(0, 0, "");
+        vm.prank(stranger);
+        vm.expectRevert(ArbExecutor.UnauthorizedCallback.selector);
+        exec.pancakeV3FlashCallback(0, 0, "");
+    }
+
+    function test_v3Flash_evilLender_cannotSubstituteRoute() public {
+        EvilV3Lender evil = new EvilV3Lender(address(weth), address(usdc));
+        usdc.mint(address(evil), TRADE);
+        exec.setFlashPool(address(evil), true);
+        ArbExecutor.Trade memory sneaky = _trade(0, address(cheapV2), 0, address(dearV2), 2);
+        evil.setSubstitute(abi.encode(sneaky));
+        vm.prank(bot);
+        vm.expectRevert(ArbExecutor.UnauthorizedCallback.selector);
+        exec.executeWithV3Flash(_trade(0, address(cheapV2), 0, address(dearV2), 1), address(evil));
+    }
+
+    function test_v3Flash_evilLender_giantFee_cannotTakeStoredFunds() public {
+        // Contract holds 5,000 USDC of past profit; evil lender claims a huge fee.
+        usdc.mint(address(exec), 5_000 * E18);
+        EvilV3Lender evil = new EvilV3Lender(address(weth), address(usdc));
+        usdc.mint(address(evil), TRADE);
+        evil.setFakeFee(4_000 * E18);
+        exec.setFlashPool(address(evil), true);
+        vm.prank(bot);
+        vm.expectRevert();
+        exec.executeWithV3Flash(_trade(0, address(cheapV2), 0, address(dearV2), 1), address(evil));
+        assertEq(usdc.balanceOf(address(exec)), 5_000 * E18, "stored profit untouched");
     }
 }

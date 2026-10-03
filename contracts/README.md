@@ -19,9 +19,12 @@ dry run and logs `[exec-dryrun]` lines, so you can see coverage before going liv
 
 Not supported yet (reverts `UnsupportedKind`): LFJ Liquidity Book, Kuru orderbook, Uniswap V4.
 
-Funding per trade:
-- `flashPool = <Aave V3 Pool>`: flash loan (Avalanche). Must be allowlisted with `setFlashPool`.
-- `flashPool = address(0)`: uses tokens already held by the contract (Robinhood, Monad).
+Funding per trade (the first two need **no money in the contract**):
+- `executeWithV3Flash(t, lendPool)`: flash loan from any Uniswap/PancakeSwap/Ramses V3 pool that holds the token and isn't part of the trade. Fee = that pool's fee tier (often 0.05%). Works on Robinhood, Monad and Avalanche.
+- `execute(t, aavePool)`: Aave V3 flash loan (Avalanche).
+- `execute(t, address(0))`: uses tokens already held by the contract.
+
+Every lender (V3 pool or Aave pool) must be allowlisted by the owner with `setFlashPool`.
 
 ## Roles
 
@@ -54,6 +57,8 @@ FOUNDRY_PROFILE=fork forge test --match-contract RobinhoodForkTest --fork-url $R
 | Monad | PancakeSwap V2 -> Uniswap V3 | V2 + V3 mixed |
 | Robinhood | Ramses V2 -> Ramses V3 | Solidly swaps, Ramses V3 callback |
 | Robinhood | Ramses V2 -> PancakeSwap V3 | Solidly + Pancake V3 |
+| Robinhood | **V3 flash loan** + Ramses V2 -> PancakeSwap V3 | borrow from a real V3 pool, trade, repay |
+| Monad | **V3 flash loan** + Uniswap V3 -> PancakeSwap V3 | same, on Monad |
 
 Each passes only if every swap executed and the trade was then stopped by the
 profit guard (pools were in balance) or was genuinely profitable.

@@ -108,6 +108,8 @@ contract MockSolidlyPair {
 interface IV3Callback {
     function uniswapV3SwapCallback(int256, int256, bytes calldata) external;
     function pancakeV3SwapCallback(int256, int256, bytes calldata) external;
+    function uniswapV3FlashCallback(uint256, uint256, bytes calldata) external;
+    function pancakeV3FlashCallback(uint256, uint256, bytes calldata) external;
 }
 
 // V3 style pool at a fixed price. Pays out first, then demands payment via
@@ -119,6 +121,8 @@ contract MockV3Pool {
     uint256 public immutable priceNum;
     uint256 public immutable priceDen;
     bool public immutable pancakeStyle;
+    bool private locked; // like real V3 pools: can't swap while lending
+    uint256 public constant FLASH_FEE_BPS = 5; // 0.05% fee tier
 
     constructor(address a, address b, uint256 num, uint256 den, bool pancakeStyle_) {
         (token0, token1) = a < b ? (a, b) : (b, a);
@@ -131,6 +135,7 @@ contract MockV3Pool {
         external
         returns (int256 amount0, int256 amount1)
     {
+        require(!locked, "LOK");
         require(amountSpecified > 0, "exact-in only");
         uint256 amountIn = uint256(amountSpecified);
         address tokenIn = zeroForOne ? token0 : token1;
@@ -148,6 +153,23 @@ contract MockV3Pool {
         else IV3Callback(msg.sender).uniswapV3SwapCallback(amount0, amount1, data);
 
         require(MockERC20(tokenIn).balanceOf(address(this)) >= before + amountIn, "IIA");
+    }
+
+    // Uniswap V3 flash: lend, call back with the fee owed, check repayment.
+    function flash(address recipient, uint256 amount0, uint256 amount1, bytes calldata data) external {
+        require(!locked, "LOK");
+        locked = true;
+        uint256 fee0 = (amount0 * FLASH_FEE_BPS + 9_999) / 10_000;
+        uint256 fee1 = (amount1 * FLASH_FEE_BPS + 9_999) / 10_000;
+        uint256 b0 = MockERC20(token0).balanceOf(address(this));
+        uint256 b1 = MockERC20(token1).balanceOf(address(this));
+        if (amount0 > 0) MockERC20(token0).transfer(recipient, amount0);
+        if (amount1 > 0) MockERC20(token1).transfer(recipient, amount1);
+        if (pancakeStyle) IV3Callback(msg.sender).pancakeV3FlashCallback(fee0, fee1, data);
+        else IV3Callback(msg.sender).uniswapV3FlashCallback(fee0, fee1, data);
+        require(MockERC20(token0).balanceOf(address(this)) >= b0 + fee0, "F0");
+        require(MockERC20(token1).balanceOf(address(this)) >= b1 + fee1, "F1");
+        locked = false;
     }
 }
 
@@ -219,5 +241,28 @@ contract EvilFlashPool {
         MockERC20(asset).transfer(receiver, amount);
         IFlashReceiver(receiver).executeOperation(asset, amount, type(uint128).max, receiver, p);
         MockERC20(asset).transferFrom(receiver, address(this), amount);
+    }
+}
+
+// A fake V3 "lender": calls back with a different trade, or a giant fee.
+contract EvilV3Lender {
+    address public immutable token0;
+    address public immutable token1;
+    bytes public substituteData;
+    uint256 public fakeFee;
+
+    constructor(address a, address b) {
+        (token0, token1) = a < b ? (a, b) : (b, a);
+    }
+
+    function setSubstitute(bytes calldata d) external { substituteData = d; }
+    function setFakeFee(uint256 f) external { fakeFee = f; }
+
+    function flash(address recipient, uint256 amount0, uint256 amount1, bytes calldata data) external {
+        if (amount0 > 0) MockERC20(token0).transfer(recipient, amount0);
+        if (amount1 > 0) MockERC20(token1).transfer(recipient, amount1);
+        bytes memory d = data;
+        if (substituteData.length > 0) d = substituteData;
+        IV3Callback(msg.sender).uniswapV3FlashCallback(fakeFee, fakeFee, d);
     }
 }

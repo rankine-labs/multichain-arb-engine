@@ -91,3 +91,38 @@ assert(!wrongPair.ok, 'tokenIn not in buy pool refused');
 assert(usdToTokenUnits(100, 1, 6) === 100_000_000n, '$100 of a $1 6-dec token = 100e6 units');
 assert(usdToTokenUnits(1, 3, 6) === 333_333n, 'rounds DOWN (1/3 token -> 333333 units)');
 assert(usdToTokenUnits(-5, 1, 18) === 0n && usdToTokenUnits(5, 0, 18) === 0n, 'bad inputs -> 0');
+
+// ---- V3 pool flash loans -----------------------------------------------------
+import { pickV3Lender, EXECUTE_V3_FLASH_SELECTOR, EXECUTE_ABI } from '../execution/executorCalldata';
+import { Interface } from 'ethers';
+
+const LENDER = '0x3333333333333333333333333333333333333333';
+const rf3 = buildExecuteCall({ ...base, v3Lender: LENDER });
+assert(rf3.ok && rf3.funding === 'v3-flash' && rf3.flashPool === LENDER, 'v3Lender -> v3-flash funding');
+assert(rf3.ok && rf3.data.startsWith(EXECUTE_V3_FLASH_SELECTOR), 'calldata uses executeWithV3Flash (selector matches compiled contract)');
+if (rf3.ok) {
+  const [t, lend] = new Interface(EXECUTE_ABI).decodeFunctionData('executeWithV3Flash', rf3.data);
+  assert(lend === LENDER && t.hops.length === 2 && t.amountIn === 2_000n * 10n ** 18n, 'flash calldata round-trips: lender, hops, amount');
+}
+const own = buildExecuteCall(base);
+assert(own.ok && own.funding === 'own', 'no lender, no Aave -> own capital');
+const lenderIsHop = buildExecuteCall({ ...base, v3Lender: V3.poolAddress });
+assert(!lenderIsHop.ok, 'lender that is also a trade pool is refused');
+
+// Lender picker: cheapest fee first, then deepest; must hold the token,
+// must not be a trade pool, must be a supported V3 DEX with liquidity.
+const lp = (addr: string, dex: string, fee: number, liq: bigint, tA = WMON, tB = USDC): PoolState => ({
+  chain: 'monad', dex, poolAddress: addr, poolType: 'v3', tokenA: tA, tokenB: tB,
+  feeBps: fee, liquidity: liq, sqrtPriceX96: 1n, lastUpdatedBlock: 1, lastUpdatedMs: 0,
+});
+const cands = [
+  lp('0xa1', 'uniswap-v3', 30, 10n ** 24n),
+  lp('0xa2', 'pancakeswap-v3', 5, 10n ** 20n),     // cheapest fee
+  lp('0xa3', 'uniswap-v3', 5, 10n ** 22n),         // same fee, deeper -> wins
+  lp('0xa4', 'uniswap-v3', 1, 0n),                 // no liquidity
+  lp('0xa5', 'kuru', 1, 10n ** 30n),               // unsupported dex
+  lp('0xa6', 'uniswap-v3', 1, 10n ** 30n, USDC, '0x9999999999999999999999999999999999999999'), // no WMON
+];
+assert(pickV3Lender(cands, WMON, [])?.poolAddress === '0xa3', 'picks lowest fee, then deepest liquidity');
+assert(pickV3Lender(cands, WMON, ['0xA3'])?.poolAddress === '0xa2', 'never picks a trade pool (case-insensitive)');
+assert(pickV3Lender([cands[3], cands[4], cands[5]], WMON, []) === null, 'none suitable -> null');

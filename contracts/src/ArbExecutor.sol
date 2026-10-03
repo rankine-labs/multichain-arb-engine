@@ -11,11 +11,15 @@ pragma solidity 0.8.26;
 //   don't have at least `minProfit` more, the WHOLE transaction reverts and
 //   nothing happens except a small gas cost. It can never "half-execute".
 //
-// Funding (pick per trade):
-//   - Flash loan from Aave V3 (flashPool != 0): borrow, trade, repay in the
+// Funding (pick per trade) -- the first two need NO money in the contract:
+//   - Aave V3 flash loan: execute(t, aavePool). Borrow, trade, repay in the
 //     same transaction. Use where Aave exists (Avalanche).
-//   - Own capital (flashPool == 0): trade with tokens already sitting in this
-//     contract. Use where there's no Aave (Robinhood Chain, likely Monad).
+//   - V3 pool flash loan: executeWithV3Flash(t, lendPool). Borrow from any
+//     Uniswap V3 / PancakeSwap V3 / Ramses V3 pool holding the token (fee =
+//     that pool's fee tier). Works on any chain with V3 pools (Robinhood,
+//     Monad, Avalanche). The lending pool must NOT be one of the trade's pools.
+//   - Own capital: execute(t, address(0)). Trades tokens already held here.
+//   Lenders (Aave pools and V3 lending pools) must be allowlisted by the owner.
 //
 // Pool types supported (Hop.kind):
 //   KIND_V2      Uniswap V2 style: TraderJoe v1, Sushi, PancakeSwap V2, LFJ v1
@@ -66,6 +70,13 @@ interface IUniswapV3Pool {
         uint160 sqrtPriceLimitX96,
         bytes calldata data
     ) external returns (int256 amount0, int256 amount1);
+}
+
+// Uniswap V3-style pool flash loan (PancakeSwap V3 / Ramses V3 are forks).
+interface IV3FlashPool {
+    function token0() external view returns (address);
+    function token1() external view returns (address);
+    function flash(address recipient, uint256 amount0, uint256 amount1, bytes calldata data) external;
 }
 
 interface IAaveV3Pool {
@@ -123,6 +134,7 @@ contract ArbExecutor {
     address private activeV3Pool;      // V3 pool we are mid-swap with
     address private activeV3TokenIn;   // token that V3 pool is owed
     bool private locked;               // re-entrancy guard
+    bool private activeFlashIs0;       // V3 flash: borrowed token is the lending pool's token0
 
     // ------------------------------------------------------------------------
     // Events / errors
@@ -223,6 +235,63 @@ contract ArbExecutor {
         // so it is automatically counted against the profit.
         uint256 profit = _checkBalances(t.token, t.minProfit, tokens, before);
         emit Executed(t.token, t.amountIn, profit, flashPool != address(0));
+    }
+
+    // V3 pool flash loan: borrow t.amountIn of t.token from `lendPool` (an
+    // allowlisted Uniswap/Pancake/Ramses V3 pool), run the route, repay the
+    // loan plus the pool's fee, keep the rest. No capital needed in here.
+    function executeWithV3Flash(Trade calldata t, address lendPool) external onlyExecutor nonReentrant {
+        if (block.number > t.maxBlock) revert Expired();
+        if (t.amountIn == 0 || t.minProfit == 0) revert ZeroAmount();
+        _validateRoute(t);
+        if (!flashPools[lendPool]) revert FlashPoolNotAllowed(lendPool);
+        // A pool is locked while it lends, so it can't also be a trade hop.
+        for (uint256 i = 0; i < t.hops.length; i++) {
+            if (t.hops[i].pool == lendPool) revert BadRoute();
+        }
+        bool is0 = IV3FlashPool(lendPool).token0() == t.token;
+        if (!is0 && IV3FlashPool(lendPool).token1() != t.token) revert BadRoute();
+
+        (address[] memory tokens, uint256[] memory before) = _snapshot(t);
+
+        bytes memory data = abi.encode(t);
+        activeFlashPool = lendPool;
+        activeTradeHash = keccak256(data);
+        activeFlashIs0 = is0;
+        IV3FlashPool(lendPool).flash(address(this), is0 ? t.amountIn : 0, is0 ? 0 : t.amountIn, data);
+        activeFlashPool = address(0);
+        activeTradeHash = bytes32(0);
+
+        // Fee was repaid inside the callback, so it's already counted here.
+        uint256 profit = _checkBalances(t.token, t.minProfit, tokens, before);
+        emit Executed(t.token, t.amountIn, profit, true);
+    }
+
+    // V3 flash callbacks (same logic, different names per DEX).
+    function uniswapV3FlashCallback(uint256 fee0, uint256 fee1, bytes calldata data) external {
+        _onV3Flash(fee0, fee1, data);
+    }
+
+    function pancakeV3FlashCallback(uint256 fee0, uint256 fee1, bytes calldata data) external {
+        _onV3Flash(fee0, fee1, data);
+    }
+
+    function ramsesV2FlashCallback(uint256 fee0, uint256 fee1, bytes calldata data) external {
+        _onV3Flash(fee0, fee1, data);
+    }
+
+    function _onV3Flash(uint256 fee0, uint256 fee1, bytes calldata data) private {
+        // Only the pool we're borrowing from, only for the exact trade we snapshotted.
+        if (msg.sender != activeFlashPool || msg.sender == address(0)) revert UnauthorizedCallback();
+        if (keccak256(data) != activeTradeHash) revert UnauthorizedCallback();
+
+        Trade memory t = abi.decode(data, (Trade));
+        _runHops(t.hops, t.amountIn);
+
+        // Repay principal + fee. If the route didn't make enough, this
+        // transfer fails or the pool's own balance check reverts everything.
+        uint256 fee = activeFlashIs0 ? fee0 : fee1;
+        _safeTransfer(t.token, msg.sender, t.amountIn + fee);
     }
 
     // ------------------------------------------------------------------------

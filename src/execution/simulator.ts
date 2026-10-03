@@ -1,6 +1,6 @@
 import { ethers } from 'ethers';
-import { ARB_EXECUTOR_RUNTIME_CODE, EXECUTOR_STORAGE_SLOT } from './arbExecutorBytecode';
-import { ExecutorHop, encodeExecuteRaw } from './executorCalldata';
+import { ARB_EXECUTOR_RUNTIME_CODE, EXECUTOR_STORAGE_SLOT, FLASH_POOLS_STORAGE_SLOT } from './arbExecutorBytecode';
+import { ExecutorHop, encodeExecuteRaw, encodeExecuteV3FlashRaw } from './executorCalldata';
 
 // ============================================================================
 // FREE PRE-TRADE SIMULATION
@@ -183,10 +183,14 @@ export function simRpcUrl(chain: 'avalanche' | 'monad' | 'robinhood', env: Recor
 // ----------------------------------------------------------------------------
 // The simulation
 // ----------------------------------------------------------------------------
+// opts.v3Lender: simulate the FLASH-LOAN version (executeWithV3Flash),
+// borrowing from that V3 pool, so the reported profit is AFTER the loan fee.
+// Without it, simulates own-capital mode.
 export async function simulateRoundTrip(
   rpc: Rpc,
   chain: string,
   trade: { token: string; amountIn: bigint; hops: ExecutorHop[] },
+  opts: { v3Lender?: string } = {},
 ): Promise<SimResult> {
   let slot: SlotInfo;
   try {
@@ -195,27 +199,41 @@ export async function simulateRoundTrip(
     if (err instanceof RateLimited) return { status: 'rate_limited', reason: err.message };
     throw err;
   }
-  if (slot === null) return { status: 'unsupported', reason: 'could not find token balance storage' };
-  if ('unsupported' in slot) return { status: 'unsupported', reason: slot.unsupported };
+  if ('unsupported' in (slot ?? {})) return { status: 'unsupported', reason: (slot as { unsupported: string }).unsupported };
+  // Own capital needs the balance override. Flash mode can run without it
+  // (it just can't tell "small loss" from "can't repay"; both are a loss).
+  if (slot === null && !opts.v3Lender) return { status: 'unsupported', reason: 'could not find token balance storage' };
+  const balanceKey = slot && 'key' in slot ? slot.key(SIM_EXECUTOR_ADDRESS) : null;
 
-  const data = encodeExecuteRaw({
+  const tradeArgs = {
     token: trade.token,
     amountIn: trade.amountIn,
     minProfit: MAX_UINT,          // force the "report profit and refuse" path
     maxBlock: MAX_UINT,
     hops: trade.hops,
-  });
+  };
+  const data = opts.v3Lender ? encodeExecuteV3FlashRaw(tradeArgs, opts.v3Lender) : encodeExecuteRaw(tradeArgs);
+
+  // Pretend-state for this one call:
+  //  - our contract code at SIM_EXECUTOR_ADDRESS, with SIM_CALLER as executor
+  //  - flash mode: the lender is on the allowlist
+  //  - a token balance of amountIn: the trade capital in own-capital mode;
+  //    in flash mode a float so a losing trade can still repay and reach the
+  //    profit check (profit is measured against it, so the result is exact)
+  const executorDiff: Record<string, string> = { [pad32(ethers.toBeHex(EXECUTOR_STORAGE_SLOT))]: pad32(SIM_CALLER) };
+  if (opts.v3Lender) {
+    const allowKey = ethers.keccak256(abi.encode(['address', 'uint256'], [opts.v3Lender, FLASH_POOLS_STORAGE_SLOT]));
+    executorDiff[allowKey] = pad32(1n);
+  }
+  const overrides: Record<string, unknown> = {
+    [SIM_EXECUTOR_ADDRESS]: { code: ARB_EXECUTOR_RUNTIME_CODE, stateDiff: executorDiff },
+  };
+  if (balanceKey) overrides[trade.token] = { stateDiff: { [balanceKey]: pad32(trade.amountIn) } };
 
   const r = await rpc('eth_call', [
     { from: SIM_CALLER, to: SIM_EXECUTOR_ADDRESS, data, gas: '0x' + (8_000_000).toString(16) },
     'latest',
-    {
-      [SIM_EXECUTOR_ADDRESS]: {
-        code: ARB_EXECUTOR_RUNTIME_CODE,
-        stateDiff: { [pad32(ethers.toBeHex(EXECUTOR_STORAGE_SLOT))]: pad32(SIM_CALLER) },
-      },
-      [trade.token]: { stateDiff: { [slot.key(SIM_EXECUTOR_ADDRESS)]: pad32(trade.amountIn) } },
-    },
+    overrides,
   ]);
 
   if (!r.error) return { status: 'fail', reason: 'call unexpectedly succeeded' };
@@ -232,6 +250,8 @@ export async function simulateRoundTrip(
       const got = parsed.args[0] as bigint;
       return got > 0n ? { status: 'profit', profit: got } : { status: 'loss' };
     }
+    // Flash mode with no float: couldn't repay the loan = the trade lost money.
+    if (parsed?.name === 'TransferFailed' && opts.v3Lender && !balanceKey) return { status: 'loss' };
     if (parsed?.name === 'Error') return { status: 'fail', reason: String(parsed.args[0]) };
     if (parsed) return { status: 'fail', reason: `${parsed.name}(${parsed.args.join(', ')})` };
   } catch { /* unknown error shape */ }
