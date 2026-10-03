@@ -25,8 +25,16 @@ import { ChainName, PoolState } from '../core/types';
 
 export const EXECUTE_ABI = [
   'function execute((address token,uint256 amountIn,uint256 minProfit,uint256 maxBlock,(uint8 kind,address pool,address tokenIn,address tokenOut,uint16 feeBps)[] hops) t, address flashPool)',
+  'function executeWithV3Flash((address token,uint256 amountIn,uint256 minProfit,uint256 maxBlock,(uint8 kind,address pool,address tokenIn,address tokenOut,uint16 feeBps)[] hops) t, address lendPool)',
 ];
 export const EXECUTE_SELECTOR = '0x4e773929'; // from `forge inspect ArbExecutor methodIdentifiers`
+export const EXECUTE_V3_FLASH_SELECTOR = '0x2448659a'; // cast sig executeWithV3Flash(...)
+
+// How a trade is funded:
+//   'v3-flash' -- borrow from a V3 pool (executeWithV3Flash), no capital needed
+//   'aave'     -- borrow from Aave (execute with the Aave pool)
+//   'own'      -- contract's own balance (execute with address(0))
+export type Funding = 'v3-flash' | 'aave' | 'own';
 
 // Must match the KIND_* constants in ArbExecutor.sol.
 export const KIND_V2 = 0;
@@ -69,7 +77,8 @@ export interface BuildInput {
   tokenInDecimals: number | undefined; // must be known; undefined = refuse
   maxBlock: bigint;          // revert on-chain if mined after this block
   executorAddress?: string;  // ArbExecutor deployed on this chain (optional for dry runs)
-  flashPool?: string;        // Aave V3 Pool if using a flash loan; omit for own capital
+  flashPool?: string;        // Aave V3 Pool, if borrowing from Aave
+  v3Lender?: string;         // V3 pool to borrow from (preferred when set; see pickV3Lender)
 }
 
 export type BuildResult =
@@ -79,7 +88,8 @@ export type BuildResult =
       data: string;
       amountIn: bigint;
       minProfit: bigint;
-      flashPool: string;
+      flashPool: string;   // lender address (Aave pool or V3 pool), or zero for own capital
+      funding: Funding;
       hops: ExecutorHop[];
     }
   | { ok: false; reason: string };
@@ -144,13 +154,19 @@ export function buildExecuteCall(input: BuildInput): BuildResult {
     { kind: sellKind, pool: sellPool.poolAddress, tokenIn: mid, tokenOut: input.tokenIn, feeBps: sellKind === KIND_V2 ? sellPool.feeBps : 0 },
   ];
 
+  const trade = { token: input.tokenIn, amountIn, minProfit, maxBlock: input.maxBlock, hops };
+  // Prefer a V3 pool flash loan, then Aave, then own capital.
+  if (input.v3Lender) {
+    if (hops.some((h) => h.pool.toLowerCase() === input.v3Lender!.toLowerCase())) {
+      return { ok: false, reason: 'lender pool is also a trade pool' };
+    }
+    const data = iface.encodeFunctionData('executeWithV3Flash', [trade, input.v3Lender]);
+    return { ok: true, to: input.executorAddress, data, amountIn, minProfit, flashPool: input.v3Lender, funding: 'v3-flash', hops };
+  }
   const flashPool = input.flashPool ?? ZERO_ADDRESS;
-  const data = iface.encodeFunctionData('execute', [
-    { token: input.tokenIn, amountIn, minProfit, maxBlock: input.maxBlock, hops },
-    flashPool,
-  ]);
-
-  return { ok: true, to: input.executorAddress, data, amountIn, minProfit, flashPool, hops };
+  const data = iface.encodeFunctionData('execute', [trade, flashPool]);
+  const funding: Funding = flashPool === ZERO_ADDRESS ? 'own' : 'aave';
+  return { ok: true, to: input.executorAddress, data, amountIn, minProfit, flashPool, funding, hops };
 }
 
 // Encodes execute() from explicit values (used by the simulator, which sets
@@ -160,6 +176,33 @@ export function encodeExecuteRaw(
   flashPool: string = ZERO_ADDRESS,
 ): string {
   return iface.encodeFunctionData('execute', [trade, flashPool]);
+}
+
+// Same, for the V3-pool flash loan entry point.
+export function encodeExecuteV3FlashRaw(
+  trade: { token: string; amountIn: bigint; minProfit: bigint; maxBlock: bigint; hops: ExecutorHop[] },
+  lendPool: string,
+): string {
+  return iface.encodeFunctionData('executeWithV3Flash', [trade, lendPool]);
+}
+
+// Chooses which V3 pool to borrow `token` from: must hold the token, must
+// not be one of the trade's pools (a pool is locked while it lends), and
+// must be a V3 pool type the contract's flash callbacks support. Picks the
+// lowest fee (the loan costs that pool's fee), then the most liquidity.
+const FLASH_LENDER_DEXES = new Set(['uniswap-v3', 'pancakeswap-v3', 'ramses-v3']);
+export function pickV3Lender(candidates: PoolState[], token: string, exclude: string[]): PoolState | null {
+  const t = token.toLowerCase();
+  const ex = new Set(exclude.map((a) => a.toLowerCase()));
+  const ok = candidates.filter((p) =>
+    p.poolType === 'v3' &&
+    FLASH_LENDER_DEXES.has(p.dex.toLowerCase()) &&
+    !ex.has(p.poolAddress.toLowerCase()) &&
+    (p.tokenA.toLowerCase() === t || p.tokenB.toLowerCase() === t) &&
+    (p.liquidity ?? 0n) > 0n,
+  );
+  ok.sort((a, b) => a.feeBps - b.feeBps || (b.liquidity! > a.liquidity! ? 1 : b.liquidity! < a.liquidity! ? -1 : 0));
+  return ok[0] ?? null;
 }
 
 // Decodes calldata back into its parts (used by tests and for logging).

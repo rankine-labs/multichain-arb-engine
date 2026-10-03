@@ -38,8 +38,8 @@ async function findV3(provider: ethers.Provider, factory: string, a: string, b: 
   return null;
 }
 
-async function run(chain: keyof typeof RPC, label: string, token: string, amountIn: bigint, hops: ExecutorHop[]) {
-  const r = await simulateRoundTrip(makeRpc(RPC[chain], 20_000), chain, { token, amountIn, hops });
+async function run(chain: keyof typeof RPC, label: string, token: string, amountIn: bigint, hops: ExecutorHop[], v3Lender?: string) {
+  const r = await simulateRoundTrip(makeRpc(RPC[chain], 20_000), chain, { token, amountIn, hops }, { v3Lender });
   return `${chain} ${label}: ${fmt(r)}`;
 }
 
@@ -78,6 +78,16 @@ async function run(chain: keyof typeof RPC, label: string, token: string, amount
     if (cake) {
       out.push(await run('robinhood', 'ramsesV2->cakeV3 WETH', WETH, 10n ** 16n, [h(KIND_SOLIDLY, ramses, WETH, USDG), h(KIND_V3, cake, USDG, WETH)]));
       out.push(await run('robinhood', 'ramsesV2->cakeV3 USDG', USDG, 20n * 10n ** 6n, [h(KIND_SOLIDLY, ramses, USDG, WETH), h(KIND_V3, cake, WETH, USDG)]));
+      // Flash-loan version: borrow WETH from a real Uniswap V3 pool (not a trade pool).
+      const uniF = '0x1f7d7550B1b028f7571E69A784071F0205FD2EfA';
+      let lender: string | null = null;
+      for (const fee of [500, 3000, 10000, 100]) {
+        const p2: string = await new ethers.Contract(uniF, v3Factory, p).getPool(WETH, USDG, fee).catch(() => ethers.ZeroAddress);
+        if (p2 !== ethers.ZeroAddress && p2.toLowerCase() !== cake.toLowerCase() && (await new ethers.Contract(p2, v3Pool, p).liquidity()) > 0n) { lender = p2; break; }
+      }
+      out.push(lender
+        ? await run('robinhood', `FLASH LOAN from ${lender.slice(0, 10)} + ramsesV2->cakeV3 WETH`, WETH, 10n ** 16n, [h(KIND_SOLIDLY, ramses, WETH, USDG), h(KIND_V3, cake, USDG, WETH)], lender)
+        : 'robinhood flash: no separate Uniswap V3 WETH/USDG lender found');
     } else out.push('robinhood: pancake V3 pool not found');
   } catch (e) { out.push(`robinhood: setup error ${(e as Error).message}`); }
 

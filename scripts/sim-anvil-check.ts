@@ -82,6 +82,20 @@ async function deploy(wallet: ethers.Signer, name: string, args: unknown[]) {
   const bad = await simulateRoundTrip(rpc, 'anvil', { token: U, amountIn, hops: [{ ...hop(C, U, W), kind: 7 }, hop(D, W, U)] });
   check(bad.status === 'fail' && 'reason' in bad && bad.reason.startsWith('UnsupportedKind'), `broken route -> fail with reason (got ${JSON.stringify(bad)})`);
 
+  // 5. Flash-loan version: borrow from a separate V3 pool. Profit must be
+  //    the own-capital profit minus exactly the 0.05% loan fee.
+  const lender = await deploy(wallet, 'MockV3Pool', [W, U, 3_000, 1, false]);
+  const L = await lender.getAddress();
+  await (await usdc.mint(L, 1_000_000n * E18)).wait();
+  await (await weth.mint(L, 1_000n * E18)).wait();
+  const flash = await simulateRoundTrip(rpc, 'anvil', { token: U, amountIn, hops: [hop(C, U, W), hop(D, W, U)] }, { v3Lender: L });
+  if (win.status === 'profit' && flash.status === 'profit') {
+    const fee = (amountIn * 5n + 9_999n) / 10_000n;
+    check(flash.profit === win.profit - fee, `flash-loan sim = own-capital profit - loan fee (${ethers.formatUnits(flash.profit, 18)} USDC, fee ${ethers.formatUnits(fee, 18)})`);
+  } else check(false, `flash-loan sim returned ${JSON.stringify(flash, (_, v) => typeof v === 'bigint' ? v.toString() : v)}`);
+  const flashLose = await simulateRoundTrip(rpc, 'anvil', { token: U, amountIn, hops: [hop(D, U, W), hop(C, W, U)] }, { v3Lender: L });
+  check(flashLose.status === 'loss', `flash-loan losing route -> loss (got ${flashLose.status})`);
+
   // 4. Nothing was actually changed on chain.
   check((await usdc.balanceOf(C)) === 3_000_000n * E18, 'simulation changed no real state');
 

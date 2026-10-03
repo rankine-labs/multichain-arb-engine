@@ -93,6 +93,42 @@ abstract contract ForkBase is Test {
         fail();
     }
 
+    // Same as _runExpectingOnlyProfitGuard, but borrowing from a V3 pool.
+    function _runV3FlashExpectingOnlyProfitGuard(string memory label, ArbExecutor.Trade memory t, address lender)
+        internal
+    {
+        (bool ok, bytes memory data) =
+            address(exec).call(abi.encodeWithSelector(ArbExecutor.executeWithV3Flash.selector, t, lender));
+        if (ok) {
+            console.log(label, "-> executed with real profit (live arb existed at this block)");
+            return;
+        }
+        if (data.length >= 4 && bytes4(data) == ArbExecutor.InsufficientProfit.selector) {
+            console.log(label, "-> borrowed, all swaps executed, repaid; stopped by profit guard (expected)");
+            return;
+        }
+        console.log(label, "-> FAILED before the profit check. Revert data:");
+        console.logBytes(data);
+        fail();
+    }
+
+    // V3 pool for the pair with liquidity, skipping any pool in `exclude`.
+    function _findV3Excluding(address factory, address a, address b, uint24[] memory fees, address exclude)
+        internal
+        view
+        returns (address)
+    {
+        for (uint256 i = 0; i < fees.length; i++) {
+            (bool ok, bytes memory ret) =
+                factory.staticcall(abi.encodeWithSignature("getPool(address,address,uint24)", a, b, fees[i]));
+            if (!ok || ret.length < 32) continue;
+            address pool = abi.decode(ret, (address));
+            if (pool == address(0) || pool == exclude || pool.code.length == 0) continue;
+            if (IV3Pool(pool).liquidity() > 0) return pool;
+        }
+        return address(0);
+    }
+
     // Finds a V3-style pool with liquidity for the pair, trying common fee tiers
     // via getPool(address,address,uint24). Returns address(0) if none.
     function _findV3(address factory, address a, address b, uint24[] memory fees) internal view returns (address) {
@@ -196,6 +232,30 @@ contract MonadForkTest is ForkBase {
         _runExpectingOnlyProfitGuard("monad uniV3->pancakeV3", t, address(0));
     }
 
+    // ZERO-CAPITAL on Monad: borrow WMON from a different Uniswap V3 pool
+    // than the one being traded.
+    function test_fork_monad_v3FlashLoan() public {
+        if (!_fork("MONAD_RPC_URL")) return;
+        address uni = _findV3(UNI_V3_FACTORY, WMON, USDC, _fees(3000, 500, 10000, 100));
+        address cake = _findV3(PANCAKE_V3_FACTORY, WMON, USDC, _fees(2500, 500, 10000, 100));
+        address lender = _findV3Excluding(UNI_V3_FACTORY, WMON, USDC, _fees(500, 10000, 3000, 100), uni);
+        if (lender == cake) lender = address(0);
+        console.log("monad lender (V3 pool):", lender);
+        if (uni == address(0) || cake == address(0) || lender == address(0)) {
+            console.log("skipped: no separate WMON lender pool found");
+            vm.skip(true);
+            return;
+        }
+        exec.setFlashPool(lender, true);
+        _fundWrapped(WMON, 1 ether); // tiny float so a losing trade can repay and reach the profit check
+        ArbExecutor.Hop[] memory hops = new ArbExecutor.Hop[](2);
+        hops[0] = _hop(2, uni, WMON, USDC, 0);
+        hops[1] = _hop(2, cake, USDC, WMON, 0);
+        ArbExecutor.Trade memory t =
+            ArbExecutor.Trade({token: WMON, amountIn: 10 ether, minProfit: 1, maxBlock: block.number, hops: hops});
+        _runV3FlashExpectingOnlyProfitGuard("monad V3 flash loan + uniV3->cakeV3", t, lender);
+    }
+
     function test_fork_monad_pancakeV2_to_uniV3() public {
         if (!_fork("MONAD_RPC_URL")) return;
         address v2 = IV2Factory(PANCAKE_V2_FACTORY).getPair(WMON, USDC);
@@ -227,6 +287,7 @@ contract RobinhoodForkTest is ForkBase {
     address constant RAMSES_V2_FACTORY = 0x43B2Bf9f33036a02fC7A00935571c2A6b0108e66;
     address constant RAMSES_V3_FACTORY = 0xE0c4ceb92d08CA985bB70fe0a22fEb121A9854A8;
     address constant PANCAKE_V3_FACTORY = 0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865;
+    address constant UNI_V3_FACTORY = 0x1f7d7550B1b028f7571E69A784071F0205FD2EfA;
 
     function _ramsesV2() internal view returns (address pair) {
         pair = ISolidlyFactory(RAMSES_V2_FACTORY).getPair(WETH, USDG, false);
@@ -259,6 +320,32 @@ contract RobinhoodForkTest is ForkBase {
             return;
         }
         _solidlyToV3("robinhood ramsesV2->ramsesV3", v3);
+    }
+
+    // ZERO-CAPITAL on Robinhood: borrow WETH from a real Uniswap V3 pool,
+    // trade Ramses V2 -> PancakeSwap V3, repay loan + fee.
+    function test_fork_robinhood_v3FlashLoan() public {
+        if (!_fork("ROBINHOOD_RPC_URL")) return;
+        address cake = _findV3(PANCAKE_V3_FACTORY, WETH, USDG, _fees(2500, 500, 10000, 100));
+        address lender = _findV3Excluding(UNI_V3_FACTORY, WETH, USDG, _fees(500, 3000, 10000, 100), cake);
+        if (lender == address(0)) lender = _findV3Excluding(RAMSES_V3_FACTORY, WETH, USDG, _fees(3000, 500, 10000, 100), cake);
+        console.log("robinhood lender (V3 pool):", lender);
+        console.log("robinhood pancake v3 trade pool:", cake);
+        if (cake == address(0) || lender == address(0)) {
+            console.log("skipped: no separate lender pool / trade pool found");
+            vm.skip(true);
+            return;
+        }
+        exec.setFlashPool(lender, true);
+        // Tiny float ONLY so a losing round trip can still repay the loan and
+        // reach our profit check (proves the full borrow/trade/repay loop).
+        _fundWrapped(WETH, 0.001 ether);
+        ArbExecutor.Hop[] memory hops = new ArbExecutor.Hop[](2);
+        hops[0] = _hop(1, _ramsesV2(), WETH, USDG, 0);
+        hops[1] = _hop(2, cake, USDG, WETH, 0);
+        ArbExecutor.Trade memory t =
+            ArbExecutor.Trade({token: WETH, amountIn: 0.01 ether, minProfit: 1, maxBlock: block.number, hops: hops});
+        _runV3FlashExpectingOnlyProfitGuard("robinhood V3 flash loan + ramsesV2->cakeV3", t, lender);
     }
 
     function test_fork_robinhood_ramsesV2_to_pancakeV3() public {

@@ -52,7 +52,7 @@ import { MonadAdapter } from './chains/monad';
 import { AvalancheAdapter } from './chains/avalanche';
 import { RawChainEvent } from './core/types';
 import { priceOf, spreadPct } from './core/poolPrice';
-import { buildExecuteCall, executionRequested, executorConfig } from './execution/executorCalldata';
+import { buildExecuteCall, executionRequested, executorConfig, pickV3Lender } from './execution/executorCalldata';
 import { makeRpc, simulateRoundTrip, simRpcUrl, Rpc } from './execution/simulator';
 
 async function main() {
@@ -247,19 +247,24 @@ const queueSimulation = (
       if (simBusy[chain] || simDisabled[chain] || Date.now() < (simPausedUntil[chain] ?? 0)) return;
       const decimals = TOKEN_DECIMALS[chain]?.[tokenIn.toLowerCase()];
       if (decimals === undefined) return;
+      // Flash loan: borrow from the cheapest V3 pool holding the token that
+      // isn't one of the trade's pools. None cached -> simulate own capital.
+      const lender = pickV3Lender(cache.allForChain(chain), tokenIn, [buyPool.poolAddress, sellPool.poolAddress]);
       // Only need the route + amount here; minProfit is set by the simulator.
       const built = buildExecuteCall({
             chain, tokenIn, buyPool, sellPool, tradeSizeUsd, netProfitUsd: 1,
             usdPerTokenIn: usdPerToken, tokenInDecimals: decimals, maxBlock: 0n,
+            v3Lender: lender?.poolAddress,
       });
       if ('reason' in built) return;
+      const funding = lender ? `flash loan from ${lender.dex} (${lender.feeBps / 100}% fee)` : 'own capital (no V3 lender cached)';
 
       simBusy[chain] = true;
       setTimeout(async () => {
             try {
-                  const r = await simulateRoundTrip(simRpc[chain], chain, { token: tokenIn, amountIn: built.amountIn, hops: built.hops });
+                  const r = await simulateRoundTrip(simRpc[chain], chain, { token: tokenIn, amountIn: built.amountIn, hops: built.hops }, { v3Lender: lender?.poolAddress });
                   const route = `${buyPool.dex}->${sellPool.dex}`;
-                  const model = `model gross $${modelGrossUsd.toFixed(2)} on $${tradeSizeUsd.toFixed(0)}`;
+                  const model = `model gross $${modelGrossUsd.toFixed(2)} on $${tradeSizeUsd.toFixed(0)} | ${funding}`;
                   if (r.status === 'rate_limited') {
                         // Not a trade result: pause, don't count it.
                         simPausedUntil[chain] = Date.now() + SIM_RATE_LIMIT_PAUSE_MS;
@@ -276,7 +281,7 @@ const queueSimulation = (
                   if (r.status === 'profit') {
                         simStats.profit++;
                         const usd = (Number(r.profit) / 10 ** decimals) * usdPerToken;
-                        console.log(`[sim] ${chain} ${route} REAL PROFIT $${usd.toFixed(2)} | ${model}`);
+                        console.log(`[sim] ${chain} ${route} REAL PROFIT $${usd.toFixed(2)} after loan fee | ${model}`);
                   } else if (r.status === 'loss') {
                         simStats.loss++;
                         console.log(`[sim] ${chain} ${route} real: LOSS | ${model}`);
@@ -519,11 +524,12 @@ console.log(
                   tokenInDecimals: TOKEN_DECIMALS[swap.chain]?.[swap.tokenIn.toLowerCase()],
                   maxBlock: 0n, // dry run only; live firing would use current block + 1
                   ...executorConfig(swap.chain),
+                  v3Lender: pickV3Lender(cache.allForChain(swap.chain), swap.tokenIn, [buyPoolUsed.poolAddress, sellPoolUsed.poolAddress])?.poolAddress,
             });
             if ('reason' in dry) {
                   console.log(`[exec-dryrun] ${swap.chain} NOT executable: ${dry.reason}`);
             } else {
-                  const funding = /^0x0+$/.test(dry.flashPool) ? 'own-capital' : 'flash';
+                  const funding = dry.funding;
                   console.log(
                         `[exec-dryrun] ${swap.chain} executable: ${dry.hops.map((h) => `kind${h.kind}`).join('->')} ` +
                         `amountIn=${dry.amountIn} minProfit=${dry.minProfit} ${funding}`,
