@@ -32,3 +32,10 @@ jobs:
           echo "$out"
           out="${out//'%'/'%25'}"; out="${out//$'\n'/'%0A'}"
           echo "::notice title=Simulation probe::${out}"
+      - name: Robinhood most-traded pairs
+        shell: bash
+        run: |
+          out=$(PROBE_SECONDS=120 node .scripts-build/scripts/probe-pairs.js 2>&1 | tail -25)
+          echo "$out"
+          out="${out//'%'/'%25'}"; out="${out//$'\n'/'%0A'}"
+          echo "::notice title=Pair probe::${out}"
