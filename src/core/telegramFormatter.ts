@@ -202,10 +202,19 @@ function statsBlock(s: WindowStats): string {
   return '<pre>' + lines.map(esc).join('\n') + '</pre>';
 }
 
+// Free pre-trade simulation results for the window (see execution/simulator.ts).
+export interface SimStats {
+  checked: number;
+  profit: number;  // real chain says: would have made money
+  loss: number;    // would have lost money
+  fail: number;    // trade itself would have reverted
+}
+
 export function formatHourlyDigest(input: {
   windowLabel: string;           // e.g. "09:00 to 10:00"
   chains: DigestChain[];
   stats: WindowStats;
+  sim?: SimStats;
   sections: DigestSection[];
 }): string {
   const spreadLines: string[] = [];
@@ -232,6 +241,15 @@ export function formatHourlyDigest(input: {
     '',
     '<b>Opportunities</b>',
     statsBlock(input.stats),
+    ...(input.sim && input.sim.checked > 0 ? [
+      '<b>Real-chain simulation</b>',
+      '<pre>' + [
+        row('Simulated', num(String(input.sim.checked)), 14),
+        row('Profitable', num(String(input.sim.profit)), 14),
+        row('Losing', num(String(input.sim.loss)), 14),
+        row('Would fail', num(String(input.sim.fail)), 14),
+      ].map(esc).join('\n') + '</pre>',
+    ] : []),
     '<b>Best spread per pair</b>',
     '<pre>' + spreadLines.map(esc).join('\n') + '</pre>',
     '<i>LB pools excluded from pricing</i>',
