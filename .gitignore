@@ -1,0 +1,13 @@
+# Dependencies (installed on each machine, never committed)
+node_modules/
+
+# Secrets - API keys, wallet keys, Telegram tokens. NEVER commit these.
+.env
+.env.*
+
+# Build / test output
+.test-build/
+
+# Auto-deploy logs and lock (server only)
+deploy/*.log
+deploy/*.lock

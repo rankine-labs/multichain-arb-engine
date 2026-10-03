@@ -1,0 +1,36 @@
+# ============================================================================
+# CI - checks every change before the server is allowed to pick it up.
+#
+# Runs on every push and pull request:
+#   1. Install packages
+#   2. Typecheck (does the code compile?)
+#   3. Run all tests
+#
+# A red X in GitHub's "Actions" tab means something is broken. The server's
+# auto-deploy script runs the same checks itself, so a broken change is
+# never deployed even if this is skipped.
+# ============================================================================
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install packages
+        run: npm install --no-audit --no-fund
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Tests
+        run: npm test
