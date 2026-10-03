@@ -1,5 +1,8 @@
 {
   // Visit https://aka.ms/tsconfig to read more about this file
+  // Only the bot itself (src/) is part of the build. Diagnostic scripts in
+  // scripts/ run separately via ts-node and must not break typecheck.
+  "include": ["src"],
   "compilerOptions": {
     // File Layout
     "rootDir": "src",

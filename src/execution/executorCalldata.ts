@@ -153,6 +153,15 @@ export function buildExecuteCall(input: BuildInput): BuildResult {
   return { ok: true, to: input.executorAddress, data, amountIn, minProfit, flashPool, hops };
 }
 
+// Encodes execute() from explicit values (used by the simulator, which sets
+// its own minProfit / maxBlock). buildExecuteCall() is the normal path.
+export function encodeExecuteRaw(
+  trade: { token: string; amountIn: bigint; minProfit: bigint; maxBlock: bigint; hops: ExecutorHop[] },
+  flashPool: string = ZERO_ADDRESS,
+): string {
+  return iface.encodeFunctionData('execute', [trade, flashPool]);
+}
+
 // Decodes calldata back into its parts (used by tests and for logging).
 export function decodeExecuteCall(data: string) {
   return iface.decodeFunctionData('execute', data);

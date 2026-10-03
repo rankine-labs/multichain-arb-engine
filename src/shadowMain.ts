@@ -53,6 +53,7 @@ import { AvalancheAdapter } from './chains/avalanche';
 import { RawChainEvent } from './core/types';
 import { priceOf, spreadPct } from './core/poolPrice';
 import { buildExecuteCall, executionRequested, executorConfig } from './execution/executorCalldata';
+import { makeRpc, simulateRoundTrip, Rpc } from './execution/simulator';
 
 async function main() {
 const cache = new PoolCache();
@@ -60,7 +61,6 @@ const shadowLogger = new ShadowLogger();
 const chainManager = new ChainManager();
 const routerRegistry = structuredClone(DEFAULT_ROUTER_REGISTRY);
 seedKnownAddresses(routerRegistry);
-const decoder = new TransactionDecoder(routerRegistry);
 const filter = new FastFilter(cache);
 const priceOracle = new PriceOracle(cache);
 
@@ -82,6 +82,10 @@ const priceOracle = new PriceOracle(cache);
     const avalancheReadProvider = new ethers.JsonRpcProvider('https://api.avax.network/ext/bc/C/rpc', 43114);
       const monadReadProvider = new ethers.JsonRpcProvider('https://rpc.monad.xyz', 143);
       const robinhoodReadProvider = new ethers.JsonRpcProvider('https://rpc.mainnet.chain.robinhood.com', 4663);
+
+      // Decoder gets the pool cache so it can decode Monad Swap logs (a log
+      // only names the pool; the cache knows its tokens).
+      const decoder = new TransactionDecoder(routerRegistry, avalancheReadProvider, (chain, addr) => cache.get(chain, addr));
 
 const discoveryConfigs: Record<string, DiscoveryConfig> = {
 avalanche: {
@@ -212,6 +216,71 @@ Object.entries(discoveryConfigs).map(([chain, cfg]) => [chain, new PoolDiscovery
       const decimalsOf = (chain: string, addr: string): number =>
             TOKEN_DECIMALS[chain]?.[addr.toLowerCase()] ?? 18;
 
+// ==========================================================================
+// FREE PRE-TRADE SIMULATION (shadow mode) -- see execution/simulator.ts
+// A moment after the big trade lands, run OUR exact round trip against the
+// real chain (eth_call + state overrides: nothing deployed, nothing spent)
+// and log the real profit next to what the maths model predicted.
+// ==========================================================================
+const SIM_RPC_URL: Record<string, string> = {
+      avalanche: process.env.SIM_RPC_AVALANCHE || 'https://api.avax.network/ext/bc/C/rpc',
+      monad: process.env.SIM_RPC_MONAD || 'https://rpc.monad.xyz',
+      robinhood: process.env.SIM_RPC_ROBINHOOD || 'https://rpc.mainnet.chain.robinhood.com',
+};
+const simRpc: Record<string, Rpc> = Object.fromEntries(Object.entries(SIM_RPC_URL).map(([c, u]) => [c, makeRpc(u)]));
+// How long to wait for the trade we're backrunning to land before simulating
+// (roughly one to a few blocks on each chain).
+const SIM_DELAY_MS: Record<string, number> = { avalanche: 3_000, monad: 1_500, robinhood: 1_000 };
+const simBusy: Record<string, boolean> = {};          // one simulation in flight per chain
+const simDisabled: Record<string, string> = {};       // chain -> reason (e.g. RPC lacks overrides)
+// Reported in the hourly digest, then reset.
+const simStats = { checked: 0, profit: 0, loss: 0, fail: 0 };
+
+const queueSimulation = (
+      chain: 'avalanche' | 'monad' | 'robinhood', tokenIn: string,
+      buyPool: any, sellPool: any, tradeSizeUsd: number, modelGrossUsd: number, usdPerToken: number,
+) => {
+      if (simBusy[chain] || simDisabled[chain]) return;
+      const decimals = TOKEN_DECIMALS[chain]?.[tokenIn.toLowerCase()];
+      if (decimals === undefined) return;
+      // Only need the route + amount here; minProfit is set by the simulator.
+      const built = buildExecuteCall({
+            chain, tokenIn, buyPool, sellPool, tradeSizeUsd, netProfitUsd: 1,
+            usdPerTokenIn: usdPerToken, tokenInDecimals: decimals, maxBlock: 0n,
+      });
+      if ('reason' in built) return;
+
+      simBusy[chain] = true;
+      setTimeout(async () => {
+            try {
+                  const r = await simulateRoundTrip(simRpc[chain], chain, { token: tokenIn, amountIn: built.amountIn, hops: built.hops });
+                  const route = `${buyPool.dex}->${sellPool.dex}`;
+                  const model = `model gross $${modelGrossUsd.toFixed(2)} on $${tradeSizeUsd.toFixed(0)}`;
+                  if (r.status === 'unsupported') {
+                        simDisabled[chain] = r.reason;
+                        console.warn(`[sim] ${chain} simulation disabled: ${r.reason}`);
+                        return;
+                  }
+                  simStats.checked++;
+                  if (r.status === 'profit') {
+                        simStats.profit++;
+                        const usd = (Number(r.profit) / 10 ** decimals) * usdPerToken;
+                        console.log(`[sim] ${chain} ${route} REAL PROFIT $${usd.toFixed(2)} | ${model}`);
+                  } else if (r.status === 'loss') {
+                        simStats.loss++;
+                        console.log(`[sim] ${chain} ${route} real: LOSS | ${model}`);
+                  } else {
+                        simStats.fail++;
+                        console.log(`[sim] ${chain} ${route} real: FAILS (${r.reason}) | ${model}`);
+                  }
+            } catch (err) {
+                  console.warn(`[sim] ${chain} error:`, (err as Error).message);
+            } finally {
+                  simBusy[chain] = false;
+            }
+      }, SIM_DELAY_MS[chain]);
+};
+
 chainManager.register(new RobinhoodChainAdapter());
 chainManager.register(new MonadAdapter());
 chainManager.register(new AvalancheAdapter());
@@ -222,9 +291,10 @@ const t0 = Date.now();
 const swap = await decoder.decode(event);
 if (!swap) return;
 
-const filterResult = filter.evaluate(swap);
-if (!filterResult.pass) return;
-
+// NOTE: the fast filter runs AFTER pool lookup (below), not here. For
+// router-based chains swap.poolAddress is the ROUTER, which is never in the
+// cache, so filtering first rejected every single swap as "pool not
+// tracked" before the real pool could be looked up.
 let pool = cache.get(swap.chain, swap.poolAddress);
 
     // Just-in-time pool discovery: swap.poolAddress is the ROUTER address
@@ -294,8 +364,15 @@ if (registerIfApproved('avalanche', entry.dex, resolved)) pool = resolved;
           }
     }
 
-    const peers = pool ? cache.findPeerPools(swap.chain, swap.tokenIn, swap.tokenOut, pool.poolAddress) : [];
-    if (!pool || peers.length === 0) return;
+    if (!pool) return;
+
+    // Cheap "is this trade big enough to matter" check, now against the
+    // REAL pool address.
+    const filterResult = filter.evaluate({ ...swap, poolAddress: pool.poolAddress });
+    if (!filterResult.pass) return;
+
+    const peers = cache.findPeerPools(swap.chain, swap.tokenIn, swap.tokenOut, pool.poolAddress);
+    if (peers.length === 0) return;
     const sellPool = peers[0];
 
       // Record this real, genuine match for the hourly proof-of-activity
@@ -335,7 +412,7 @@ dexFeeBps: { buy: pool.feeBps, sell: sellPool.feeBps }, // overwritten per direc
 flashLoanFeeBps: 9,
 usingFlashLoan: true,
 safetyMarginPct: 0.15,
-});
+}, decimalsOf(swap.chain, swap.tokenIn));
 if (!plan) return;
 const { sizing, profit } = plan;
 const buyPoolUsed = plan.buyPool;
@@ -354,6 +431,13 @@ sizing, profit, event, score,
 );
 
 const reactionMs = Date.now() - t0;
+
+// Simulate anything the model thinks is worth a look (gross > 0), whether
+// or not it clears the minimum -- that's how we learn where the model is
+// wrong in BOTH directions.
+if (sizing.grossProfitUsd > 0) {
+      queueSimulation(swap.chain, swap.tokenIn, buyPoolUsed, sellPoolUsed, sizing.optimalTradeSizeUsd, sizing.grossProfitUsd, usdPerToken);
+}
 
 if (!profit.qualifies) {
 shadowLogger.record({ opportunity, outcome: 'SKIPPED_BELOW_MIN_PROFIT', ourHypotheticalReactionMs: reactionMs });
@@ -729,6 +813,7 @@ for (let i = 0; i < resolved.length; i++) {
                               reconnects: chainHealthFlapCount[chain] ?? 0,
                         })),
                         stats,
+                        sim: { ...simStats },
                         sections: buildDigestSections(),
                   }));
             } catch (err) {
@@ -737,6 +822,7 @@ for (let i = 0; i < resolved.length; i++) {
                   // Reset for the next hour even if sending failed.
                   hourlyMatches.clear();
                   for (const chainName of Object.keys(chainHealthFlapCount)) chainHealthFlapCount[chainName] = 0;
+                  simStats.checked = simStats.profit = simStats.loss = simStats.fail = 0;
                   lastDigestAt = now;
             }
       };

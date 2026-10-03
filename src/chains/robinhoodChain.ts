@@ -2,6 +2,7 @@ import WebSocket from 'ws';
 import {
       ChainCapability, RawChainEvent, PreparedTransaction, FireResult,
 } from '../core/types';
+import { parseFeedFrame, maxSequenceNumber } from './nitroFeed';
 
 // ============================================================================
 // ROBINHOOD CHAIN ADAPTER
@@ -57,25 +58,30 @@ export class RobinhoodChainAdapter implements ChainCapability {
                                            const receivedAtMs = Date.now();
                                            this.lastMessageAtMs = receivedAtMs;
 
-                                                  let parsed: any;
+                                           let parsed: any;
                                            try {
                                                      parsed = JSON.parse(raw.toString());
                                            } catch {
                                                      return; // malformed frame, drop it
                                            }
 
-                                                  const seq = parsed.seq ?? parsed.sequenceNumber;
-                                           if (typeof seq === 'number') this.lastSeqSeen = seq;
+                                           const seq = maxSequenceNumber(parsed);
+                                           if (seq !== null) this.lastSeqSeen = seq;
 
-                                                  const event: RawChainEvent = {
-                                                            chain: 'robinhood',
-                                                            stateType: 'SEQUENCED',
-                                                            blockOrSeq: seq ?? 'unknown',
-                                                            receivedAtMs,
-                                                            raw: parsed,
-                                                  };
-
-                                                  for (const h of this.handlers) h(event);
+                                           // One frame can hold many transactions (see
+                                           // nitroFeed.ts). Emit one event per contract
+                                           // call with plain { to, data }, which is what
+                                           // the decoder understands.
+                                           for (const tx of parseFeedFrame(parsed)) {
+                                                     const event: RawChainEvent = {
+                                                               chain: 'robinhood',
+                                                               stateType: 'SEQUENCED',
+                                                               blockOrSeq: tx.sequenceNumber ?? seq ?? 'unknown',
+                                                               receivedAtMs,
+                                                               raw: { to: tx.to, data: tx.data, value: tx.value, hash: tx.hash, from: tx.from },
+                                                     };
+                                                     for (const h of this.handlers) h(event);
+                                           }
                                  });
 
                                  this.ws.on('error', (err) => {

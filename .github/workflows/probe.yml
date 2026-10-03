@@ -1,0 +1,34 @@
+# ============================================================================
+# LIVE PROBE (manual) -- checks the bot's parsers against the real feeds.
+# Run from GitHub: Actions -> "Live probe" -> Run workflow. Results appear
+# as an annotation on the run. Never touches the server or any funds.
+# ============================================================================
+name: Live probe
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install --no-audit --no-fund
+      - name: Probe live feeds
+        shell: bash
+        run: |
+          npx tsc -p tsconfig.scripts.json
+          out=$(node .scripts-build/scripts/probe-feeds.js 2>&1 | tail -40)
+          echo "$out"
+          out="${out//'%'/'%25'}"; out="${out//$'\n'/'%0A'}"
+          echo "::notice title=Feed probe::${out}"
+      - name: Probe free simulation on real chains
+        shell: bash
+        run: |
+          out=$(node .scripts-build/scripts/probe-sim.js 2>&1 | tail -20)
+          echo "$out"
+          out="${out//'%'/'%25'}"; out="${out//$'\n'/'%0A'}"
+          echo "::notice title=Simulation probe::${out}"

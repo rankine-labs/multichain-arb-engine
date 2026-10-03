@@ -94,6 +94,15 @@ assert(digest.includes('4 more pairs: no match'), 'digest: unmatched watch pairs
 assert(digest.includes('AVALANCHE\nno matches this hour'), 'digest: empty chain gets one line');
 assert(!/Filtered|All Costs|Best Chain|n\/a/.test(digest), 'digest: no always-zero fields');
 assert(validTelegramHtml(digest), 'digest: valid HTML');
+assert(!digest.includes('Real-chain simulation'), 'digest: no simulation section when nothing was simulated');
+
+const withSim = formatHourlyDigest({
+  windowLabel: 'x', chains: [], stats: { seen: 5, won: 0, lost: 0, netUsd: 0, avgReactionMs: null, p95ReactionMs: null },
+  sim: { checked: 12, profit: 3, loss: 7, fail: 2 }, sections: [],
+});
+assert(withSim.includes('<b>Real-chain simulation</b>') && withSim.includes('Simulated         12') && withSim.includes('Would fail         2'),
+  'digest: simulation section with aligned counts');
+assert(validTelegramHtml(withSim), 'digest with simulation: valid HTML');
 
 // Many pairs: capped per chain, still valid.
 const many = formatHourlyDigest({

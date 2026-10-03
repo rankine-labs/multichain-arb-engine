@@ -52,6 +52,11 @@ jobs:
       - name: Build
         run: forge build
 
+      # The bot simulates trades with a copy of this contract's compiled code
+      # (src/execution/arbExecutorBytecode.ts). Fail if that copy is stale.
+      - name: Bot's simulation copy matches the contract
+        run: node ../scripts/gen-executor-bytecode.js --check
+
       - name: Unit tests (mocks)
         run: forge test -vv --no-match-path "test/Fork.t.sol"
 
