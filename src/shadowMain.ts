@@ -335,7 +335,7 @@ dexFeeBps: { buy: pool.feeBps, sell: sellPool.feeBps }, // overwritten per direc
 flashLoanFeeBps: 9,
 usingFlashLoan: true,
 safetyMarginPct: 0.15,
-});
+}, decimalsOf(swap.chain, swap.tokenIn));
 if (!plan) return;
 const { sizing, profit } = plan;
 const buyPoolUsed = plan.buyPool;

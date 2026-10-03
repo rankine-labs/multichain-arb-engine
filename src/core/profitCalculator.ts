@@ -27,17 +27,35 @@ grossProfitUsd: number;
 // as the constraint (not the average, not the bigger one) protects us from
 // picking a size that blows out slippage on whichever side is shallower.
 // Matches the tiered approach from the original Arbitrum bot.
+//
+// `tokenIn` / `tokenInDecimals`: the token being traded and its decimals.
+// Depth is measured on THAT token's side of each pool and converted with
+// its real decimals. (Previously it always used the first-listed token and
+// assumed 18 decimals, so USDC-side depth was off by up to 10^12.)
+// When omitted, falls back to the first-listed token at 18 decimals.
+export interface TradeToken {
+tokenIn?: string;
+tokenInDecimals?: number;
+}
+
+// Which side of the pool `tokenIn` is on (defaults to the first-listed token).
+function tokenInIsA(pool: PoolState, tokenIn?: string): boolean {
+return !tokenIn || pool.tokenA.toLowerCase() === tokenIn.toLowerCase();
+}
+
 export function calculateLiquidityCeiling(
 buyPool: PoolState,
 sellPool: PoolState,
 usdPerToken: number,
+token: TradeToken = {},
 ): number {
+const scale = 10 ** (token.tokenInDecimals ?? 18);
 const poolUsdLiquidity = (pool: PoolState): number => {
-if (pool.poolType === 'v2' && pool.reserveA !== undefined) {
-// reserveA side, converted to USD — assumes tokenA is the priced side
-// (e.g. the stable or the token usdPerToken corresponds to). Real
-// implementation should price whichever side is more reliable.
-return Number(pool.reserveA) / 1e18 * usdPerToken;
+const inIsA = tokenInIsA(pool, token.tokenIn);
+if (pool.poolType === 'v2' && pool.reserveA !== undefined && pool.reserveB !== undefined) {
+// The traded token's own reserve, priced at its own USD price.
+const reserveIn = inIsA ? pool.reserveA : pool.reserveB;
+return Number(reserveIn) / scale * usdPerToken;
 }
 if (pool.poolType === 'v3' && pool.liquidity !== undefined && pool.sqrtPriceX96 !== undefined) {
 // Convert v3's active-tick liquidity into an equivalent "virtual
@@ -48,8 +66,11 @@ if (pool.poolType === 'v3' && pool.liquidity !== undefined && pool.sqrtPriceX96 
 // outside the active range isn't available at the current price
 // anyway.
 const Q96 = 1n << 96n;
-const virtualX = (pool.liquidity * Q96) / pool.sqrtPriceX96;
-return Number(virtualX) / 1e18 * usdPerToken;
+// virtualX is tokenA-side depth, virtualY is tokenB-side depth.
+const virtual = inIsA
+? (pool.liquidity * Q96) / pool.sqrtPriceX96
+: (pool.liquidity * pool.sqrtPriceX96) / Q96;
+return Number(virtual) / scale * usdPerToken;
 }
 return 0;
 };
@@ -84,16 +105,21 @@ cache: PoolCache,
 tokenInIsAOnBuyPool: boolean,
 maxCandidateUsd: number,
 usdPerToken: number,
-approxCostRateBps: number = (buyPool.feeBps + sellPool.feeBps + 9), // + flash loan fee default
+// DEX fees are NOT included here: computeAmountOut() already deducts each
+// pool's fee from the swap output, so adding them again double-counted them
+// and made every opportunity look ~0.5% worse than it really is.
+approxCostRateBps: number = 9, // flash loan fee
 approxFixedGasUsd: number = 2,
+tokenInDecimals: number = 18,  // real decimals of the token we start with
 ): SizingResult {
+const scale = 10 ** tokenInDecimals;
 const candidates = [0.01, 0.025, 0.05, 0.1, 0.2, 0.35, 0.5, 0.65, 0.8, 1.0].map(f => maxCandidateUsd * f);
 
 let best: SizingResult = { optimalTradeSizeUsd: 0, grossProfitUsd: -Infinity };
 let bestApproxNet = -Infinity;
 
 for (const usdSize of candidates) {
-const amountIn = BigInt(Math.floor((usdSize / usdPerToken) * 1e18));
+const amountIn = BigInt(Math.floor((usdSize / usdPerToken) * scale));
 
 // Universal getAmountOut — works identically whether buyPool/sellPool
 // are v2 or v3, the sizing logic never needs to know which.
@@ -108,7 +134,7 @@ const sellInIsA = sellPool.tokenA.toLowerCase() === buyOutToken;
 const usdOut = computeAmountOut(sellPool, sellInIsA, tokenOut);
 if (usdOut === null || usdOut <= 0n) continue;
 
-const usdOutValue = Number(usdOut) / 1e18 * usdPerToken;
+const usdOutValue = Number(usdOut) / scale * usdPerToken;
 const grossProfitUsd = usdOutValue - usdSize;
 
 // Approximate net used ONLY to pick the best size — the real, exact
@@ -135,7 +161,11 @@ const flashLoanFee = costs.usingFlashLoan
 : 0;
 const gas = costs.gasPriceUsd;
 
-const predictedNet = sizing.grossProfitUsd - dexFees - gas - flashLoanFee;
+// grossProfitUsd comes from computeAmountOut(), which already takes each
+// pool's fee out of the swap output. dexFees is still reported in the
+// breakdown (useful to see) but NOT subtracted again -- that was a double
+// count that hid real opportunities.
+const predictedNet = sizing.grossProfitUsd - gas - flashLoanFee;
 const safetyMargin = Math.max(0, predictedNet * costs.safetyMarginPct);
 const conservativeNetProfitUsd = predictedNet - safetyMargin;
 

@@ -39,6 +39,7 @@ export function planBackrun(
   swap: { tokenIn: string; amountIn: bigint; stateType: StateType },
   usdPerTokenIn: number,
   costs: CostEstimateInputs,
+  tokenInDecimals: number = 18,     // real decimals of swap.tokenIn
 ): BackrunPlan | null {
   const tokenIn = swap.tokenIn.toLowerCase();
 
@@ -59,10 +60,10 @@ export function planBackrun(
 
   // Step 2: size + cost both round-trip directions against the predicted state.
   const evaluate = (buyPool: PoolState, sellPool: PoolState): BackrunPlan | null => {
-    const ceiling = calculateLiquidityCeiling(buyPool, sellPool, usdPerTokenIn);
+    const ceiling = calculateLiquidityCeiling(buyPool, sellPool, usdPerTokenIn, { tokenIn, tokenInDecimals });
     if (ceiling <= 0) return null;
     const tokenInIsAOnBuy = buyPool.tokenA.toLowerCase() === tokenIn;
-    const sizing = findOptimalTradeSize(buyPool, sellPool, cache, tokenInIsAOnBuy, ceiling, usdPerTokenIn);
+    const sizing = findOptimalTradeSize(buyPool, sellPool, cache, tokenInIsAOnBuy, ceiling, usdPerTokenIn, undefined, undefined, tokenInDecimals);
     if (!(sizing.grossProfitUsd > 0)) return null;
     const profit = calculateAllInProfit(sizing, {
       ...costs,
