@@ -53,8 +53,11 @@ import {
 // ============================================================================
 
 const PRIMARY_WS_URL = process.env.MONAD_QUICKNODE_WSS ?? 'wss://REPLACE_WITH_QUICKNODE_MONAD_ENDPOINT';
-// Optional. Leave unset to stay on the primary only.
-const FALLBACK_WS_URL = process.env.MONAD_FALLBACK_WSS || null;
+// Used when the primary keeps dropping (e.g. QuickNode daily quota hit).
+// Defaults to Monad's public endpoint, confirmed by the live probe to
+// support monadLogs. Set MONAD_FALLBACK_WSS=off to disable.
+const FALLBACK_ENV = process.env.MONAD_FALLBACK_WSS;
+const FALLBACK_WS_URL = FALLBACK_ENV === 'off' ? null : (FALLBACK_ENV || 'wss://rpc.monad.xyz');
 
 // How long to wait for "socket open + subscription accepted" before giving up.
 const CONNECT_TIMEOUT_MS = 10_000;
@@ -110,7 +113,7 @@ export class MonadAdapter implements ChainCapability {
 
   constructor() {
     if (!FALLBACK_WS_URL) {
-      console.log('[monad] no MONAD_FALLBACK_WSS set -- primary endpoint only');
+      console.log('[monad] fallback endpoint disabled (MONAD_FALLBACK_WSS=off) -- primary only');
     }
   }
 

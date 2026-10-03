@@ -7,8 +7,6 @@ name: Live probe
 
 on:
   workflow_dispatch:
-  push:
-    branches: [feat/see-trades-and-simulate]
 
 jobs:
   probe:

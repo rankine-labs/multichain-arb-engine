@@ -66,6 +66,7 @@ Done:
 - [x] Ramses V3 callback name confirmed (works on live pool)
 - [x] Aave V3 Pool on Avalanche confirmed at `0x794a61358D6845594F94dc1DB02A252b5b4814aD`
 - [x] Bot builds `execute()` calldata (dry run in shadow mode)
+- [x] Free pre-trade simulation of the real contract on all 3 chains (`src/execution/simulator.ts`, `[sim]` log lines, hourly digest)
 
 Still to do (needs you):
 1. **Independent review** of `src/ArbExecutor.sol` by someone other than its author.
