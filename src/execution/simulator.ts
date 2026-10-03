@@ -54,6 +54,7 @@ export type SimResult =
   | { status: 'profit'; profit: bigint }               // would make `profit` (start-token units, before gas)
   | { status: 'loss' }                                  // would end with less than it started
   | { status: 'fail'; reason: string }                  // trade itself would revert
+  | { status: 'rate_limited'; reason: string }          // RPC said "slow down" -- not a trade result
   | { status: 'unsupported'; reason: string };          // couldn't simulate on this chain/token
 
 // ----------------------------------------------------------------------------
@@ -74,6 +75,7 @@ export function makeRpc(url: string, timeoutMs = 8_000): Rpc {
         body: JSON.stringify({ jsonrpc: '2.0', id: ++id, method, params }),
         signal: ctrl.signal,
       });
+      if (res.status === 429) return { error: { code: 429, message: 'rate limited (HTTP 429)' } };
       return await res.json();
     } catch (err) {
       return { error: { message: `network: ${(err as Error).message}` } };
@@ -94,6 +96,13 @@ function revertData(err: { data?: any } | undefined): string | null {
   return null;
 }
 
+// Does this RPC error mean "you're sending too many requests"?
+export function isRateLimited(err: { code?: number; message?: string } | undefined): boolean {
+  const m = (err?.message ?? '').toLowerCase();
+  return err?.code === 429 || err?.code === -32005 || m.includes('rate limit') || m.includes('too many requests')
+    || m.includes('exceeded') || m.includes('quota');
+}
+
 // Does this RPC error mean "state overrides aren't supported here"?
 function overridesUnsupported(err: { code?: number; message?: string } | undefined): boolean {
   const m = (err?.message ?? '').toLowerCase();
@@ -104,6 +113,8 @@ function overridesUnsupported(err: { code?: number; message?: string } | undefin
 // Finding where a token keeps balances (one-time per token, then cached)
 // ----------------------------------------------------------------------------
 type SlotInfo = { key: (holder: string) => string } | { unsupported: string } | null;
+// Thrown inside slot probing so a rate-limited probe isn't cached as "not found".
+class RateLimited extends Error {}
 const slotCache = new Map<string, SlotInfo>();
 const MAX_SLOT = 60;
 
@@ -121,7 +132,10 @@ export async function findBalanceSlot(rpc: Rpc, cacheKey: string, token: string)
       { to: token, data }, 'latest',
       { [token]: { stateDiff: { [keyFn(SIM_EXECUTOR_ADDRESS)]: pad32(magic) } } },
     ]);
-    if (r.error) return overridesUnsupported(r.error) ? 'unsupported' : false;
+    if (r.error) {
+      if (isRateLimited(r.error)) throw new RateLimited(r.error.message ?? 'rate limited');
+      return overridesUnsupported(r.error) ? 'unsupported' : false;
+    }
     try { return BigInt(r.result) === magic; } catch { return false; }
   };
 
@@ -139,6 +153,34 @@ export async function findBalanceSlot(rpc: Rpc, cacheKey: string, token: string)
 }
 
 // ----------------------------------------------------------------------------
+// Which RPC to simulate on, per chain (first match wins):
+//   1. SIM_RPC_<CHAIN> in .env (explicit)
+//   2. the chain's paid endpoint the bot already uses, as HTTPS
+//      (QuickNode/Alchemy serve HTTP on the same URL as their websocket)
+//   3. the chain's public endpoint
+// ----------------------------------------------------------------------------
+export function wssToHttps(wss: string | undefined): string | null {
+  if (!wss || !wss.startsWith('wss://') || wss.includes('REPLACE_WITH')) return null;
+  return wss.replace(/^wss:\/\//, 'https://').replace(/\/ext\/bc\/C\/ws(\/?)$/, '/ext/bc/C/rpc$1');
+}
+
+export function simRpcUrl(chain: 'avalanche' | 'monad' | 'robinhood', env: Record<string, string | undefined> = process.env): { url: string; source: string } {
+  const explicit = env[`SIM_RPC_${chain.toUpperCase()}`];
+  if (explicit) return { url: explicit, source: 'SIM_RPC setting' };
+  const paid =
+    chain === 'avalanche' ? wssToHttps(env.AVALANCHE_QUICKNODE_WSS) ?? wssToHttps(env.AVALANCHE_ALCHEMY_WSS)
+    : chain === 'monad' ? wssToHttps(env.MONAD_QUICKNODE_WSS)
+    : env.ROBINHOOD_RPC_HTTP ?? null;
+  if (paid) return { url: paid, source: 'your paid endpoint' };
+  const publicUrl = {
+    avalanche: 'https://api.avax.network/ext/bc/C/rpc',
+    monad: 'https://rpc.monad.xyz',
+    robinhood: 'https://rpc.mainnet.chain.robinhood.com',
+  }[chain];
+  return { url: publicUrl, source: 'public endpoint' };
+}
+
+// ----------------------------------------------------------------------------
 // The simulation
 // ----------------------------------------------------------------------------
 export async function simulateRoundTrip(
@@ -146,7 +188,13 @@ export async function simulateRoundTrip(
   chain: string,
   trade: { token: string; amountIn: bigint; hops: ExecutorHop[] },
 ): Promise<SimResult> {
-  const slot = await findBalanceSlot(rpc, `${chain}:${trade.token.toLowerCase()}`, trade.token);
+  let slot: SlotInfo;
+  try {
+    slot = await findBalanceSlot(rpc, `${chain}:${trade.token.toLowerCase()}`, trade.token);
+  } catch (err) {
+    if (err instanceof RateLimited) return { status: 'rate_limited', reason: err.message };
+    throw err;
+  }
   if (slot === null) return { status: 'unsupported', reason: 'could not find token balance storage' };
   if ('unsupported' in slot) return { status: 'unsupported', reason: slot.unsupported };
 
@@ -171,6 +219,8 @@ export async function simulateRoundTrip(
   ]);
 
   if (!r.error) return { status: 'fail', reason: 'call unexpectedly succeeded' };
+  if (isRateLimited(r.error)) return { status: 'rate_limited', reason: r.error.message ?? 'rate limited' };
+  if ((r.error.message ?? '').startsWith('network:')) return { status: 'rate_limited', reason: r.error.message! };
   if (overridesUnsupported(r.error)) return { status: 'unsupported', reason: r.error.message ?? 'overrides unsupported' };
 
   const rd = revertData(r.error);

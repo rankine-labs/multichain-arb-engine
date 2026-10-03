@@ -208,6 +208,7 @@ export interface SimStats {
   profit: number;  // real chain says: would have made money
   loss: number;    // would have lost money
   fail: number;    // trade itself would have reverted
+  rateLimited?: number; // times the RPC said "slow down" (simulations paused)
 }
 
 export function formatHourlyDigest(input: {
@@ -249,6 +250,7 @@ export function formatHourlyDigest(input: {
         row('Losing', num(String(input.sim.loss)), 14),
         row('Would fail', num(String(input.sim.fail)), 14),
       ].map(esc).join('\n') + '</pre>',
+      ...(input.sim.rateLimited ? [`<i>RPC rate-limited ${input.sim.rateLimited}x (simulations paused briefly)</i>`] : []),
     ] : []),
     '<b>Best spread per pair</b>',
     '<pre>' + spreadLines.map(esc).join('\n') + '</pre>',
