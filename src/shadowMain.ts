@@ -51,6 +51,7 @@ import { RobinhoodChainAdapter } from './chains/robinhoodChain';
 import { MonadAdapter } from './chains/monad';
 import { AvalancheAdapter } from './chains/avalanche';
 import { RawChainEvent } from './core/types';
+import { priceOf, spreadPct } from './core/poolPrice';
 import { buildExecuteCall, executionRequested, executorConfig } from './execution/executorCalldata';
 
 async function main() {
@@ -151,24 +152,21 @@ Object.entries(discoveryConfigs).map(([chain, cfg]) => [chain, new PoolDiscovery
                         const [freshBuy, freshSell] = await Promise.all([refetch(buyPool), refetch(sellPool)]);
                         if (!freshBuy || !freshSell) return;
 
-                        const priceOf = (pool: any): number | null => {
-                              if (pool.poolType === 'v3' && pool.sqrtPriceX96) {
-                                    const p = Number(pool.sqrtPriceX96) / 2 ** 96;
-                                    return p * p;
-                              }
-                              if (pool.reserveA && pool.reserveB && pool.reserveA > 0n) {
-                                    return Number(pool.reserveB) / Number(pool.reserveA);
-                              }
-                              return null;
-                        };
+                        // Both pools priced as "1 tokenIn = X tokenOut", decimal-
+                        // adjusted and oriented the same way (see core/poolPrice.ts).
+                        // The round trip SELLS tokenIn on the buy pool and buys it
+                        // back on the sell pool, so it wins when tokenIn is still
+                        // priced higher on the buy pool. The old version compared
+                        // raw, unoriented ratios, so WON/LOST depended on which
+                        // order each pool happened to list the pair.
+                        const tokenIn = opportunity.tokenPair[0];
+                        const buyPrice = priceOf(freshBuy, tokenIn, decimalsOf);
+                        const sellPrice = priceOf(freshSell, tokenIn, decimalsOf);
+                        if (buyPrice === null || sellPrice === null || sellPrice <= 0) return;
 
-                        const buyPrice = priceOf(freshBuy);
-                        const sellPrice = priceOf(freshSell);
-                        if (buyPrice === null || sellPrice === null || buyPrice <= 0) return;
+                        const freshEdge = (buyPrice - sellPrice) / sellPrice;
 
-                        const freshSpreadPct = (sellPrice - buyPrice) / buyPrice;
-
-                        if (freshSpreadPct > 0.001) {
+                        if (freshEdge > 0.001) {
                               shadowLogger.resolve(opportunity.id, 'WOULD_HAVE_WON');
                         } else {
                               shadowLogger.resolve(opportunity.id, 'WOULD_HAVE_LOST');
@@ -303,33 +301,13 @@ if (registerIfApproved('avalanche', entry.dex, resolved)) pool = resolved;
       // Record this real, genuine match for the hourly proof-of-activity
       // report -- happens for every real peer match found, independent
       // of whether it's profitable enough to alert on.
-      const matchPriceOf = (p: any): number | null => {
-            // This is the price function that actually feeds the hourly report --
-            // confirmed live tonight it was still using the old, unadjusted-decimals
-            // formula even after that fix was applied elsewhere, which is why a real
-            // WETH/USDC spread showed 113% instead of a sane number. Same three
-            // protections as priceOfPool/watchListPriceOf: decimals, LFJ-LB
-            // exclusion, and a minimum-liquidity floor for near-empty pools.
-            if (p.dex === 'lfj-lb') return null;
-            const decA = decimalsOf(p.chain, p.tokenA);
-            const decB = decimalsOf(p.chain, p.tokenB);
-            if (p.poolType === 'v3' && p.sqrtPriceX96) {
-                  const raw = Number(p.sqrtPriceX96) / 2 ** 96;
-                  return raw * raw * 10 ** (decA - decB);
-            }
-            if (p.reserveA !== undefined && p.reserveB !== undefined && p.reserveA > 0n) {
-                  const adjA = Number(p.reserveA) / 10 ** decA;
-                  const adjB = Number(p.reserveB) / 10 ** decB;
-                  const MIN_RESERVE_UNITS = 0.01;
-                  if (adjA < MIN_RESERVE_UNITS || adjB < MIN_RESERVE_UNITS) return null;
-                  return adjB / adjA;
-            }
-            return null;
-      };
-      const matchBuyPrice = matchPriceOf(pool);
-      const matchSellPrice = matchPriceOf(sellPool);
-      if (matchBuyPrice !== null && matchSellPrice !== null && matchBuyPrice > 0) {
-            const matchSpreadPct = Math.abs((matchSellPrice - matchBuyPrice) / matchBuyPrice) * 100;
+      // Both pools priced as "1 tokenIn = X tokenOut": decimal-adjusted, LB
+      // and dust pools excluded, and oriented the same way even if the two
+      // pools list the pair in opposite order (see core/poolPrice.ts).
+      const matchBuyPrice = priceOf(pool, swap.tokenIn, decimalsOf);
+      const matchSellPrice = priceOf(sellPool, swap.tokenIn, decimalsOf);
+      if (matchBuyPrice !== null && matchSellPrice !== null) {
+            const matchSpreadPct = spreadPct(matchBuyPrice, matchSellPrice);
             const matchPairLabel = `${symbolOf(swap.chain, pool.tokenA)}/${symbolOf(swap.chain, pool.tokenB)}`;
             const matchKey = `${swap.chain}:${matchPairLabel}`;
             const existingMatch = hourlyMatches.get(matchKey);
@@ -386,20 +364,14 @@ shadowLogger.record({ opportunity, outcome: 'SKIPPED_BELOW_MIN_PROFIT', ourHypot
               // Real per-DEX prices, not just USD amounts, so the person watching
               // Telegram can directly verify the bot is comparing genuine market
               // prices rather than just trusting an opaque dollar figure.
-              const priceOf = (p: any): number | null => {
-                      if (p.poolType === 'v3' && p.sqrtPriceX96) {
-                              const price = Number(p.sqrtPriceX96) / 2 ** 96;
-                              return price * price;
-                      }
-                      if (p.reserveA !== undefined && p.reserveB !== undefined && p.reserveA > 0n) {
-                              return Number(p.reserveB) / Number(p.reserveA);
-                      }
-                      return null;
-              };
-              const buyPrice = priceOf(buyPoolUsed); // predicted price if the guess was used
-              const sellPrice = priceOf(sellPoolUsed);
-              if (buyPrice !== null && sellPrice !== null && buyPrice > 0) {
-                      const spreadPct = ((sellPrice - buyPrice) / buyPrice) * 100;
+              // "1 tokenIn = X tokenOut" on each pool, decimal-adjusted and
+              // oriented the same way, so the prices shown are real market
+              // prices (previously raw ratios: off by 10^12 on WMON/USDC).
+              // Buy price is the PREDICTED post-trade price if the guess was used.
+              const buyPrice = priceOf(buyPoolUsed, swap.tokenIn, decimalsOf);
+              const sellPrice = priceOf(sellPoolUsed, swap.tokenIn, decimalsOf);
+              if (buyPrice !== null && sellPrice !== null) {
+                      const gapPct = spreadPct(buyPrice, sellPrice);
                       await sendTelegramMessage(formatSkippedOpportunity({
                               chain: swap.chain,
         pair: `${symbolOf(swap.chain, swap.tokenIn)}/${symbolOf(swap.chain, swap.tokenOut)}`,
@@ -407,7 +379,7 @@ shadowLogger.record({ opportunity, outcome: 'SKIPPED_BELOW_MIN_PROFIT', ourHypot
                               sellDex: sellPoolUsed.dex,
                               buyPrice,
                               sellPrice,
-                              spreadPct,
+                              spreadPct: gapPct,
                               grossOpportunityUsd: sizing.grossProfitUsd,
                               optimalTradeUsd: sizing.optimalTradeSizeUsd,
                               expectedNetUsd: profit.conservativeNetProfitUsd,
@@ -587,23 +559,6 @@ await chainManager.startAll();
             ];
 
 
-      const watchListPriceOf = (p: any): number | null => {
-            // Excluded -- see the matching note on priceOfPool above. LFJ-LB's
-            // aggregate-reserve approximation produces nonsense spreads, not real
-            // ones, until real bin-based pricing is implemented.
-            if (p.dex === 'lfj-lb') return null;
-const decA = decimalsOf('monad', p.tokenA);
-            const decB = decimalsOf('monad', p.tokenB);
-            if (p.poolType === 'v3' && p.sqrtPriceX96) {
-                  const raw = Number(p.sqrtPriceX96) / 2 ** 96;
-                  return raw * raw * 10 ** (decA - decB);
-            }
-            if (p.reserveA !== undefined && p.reserveB !== undefined && p.reserveA > 0n) {
-                  return (Number(p.reserveB) / 10 ** decB) / (Number(p.reserveA) / 10 ** decA);
-            }
-            return null;
-      };
-
       const checkMonadWatchList = async () => {
             for (const { tokenA, tokenB } of monadWatchedPairs) {
                   const resolved: any[] = [];
@@ -622,8 +577,11 @@ const decA = decimalsOf('monad', p.tokenA);
                   }
 for (let i = 0; i < resolved.length; i++) {
       for (let j = i + 1; j < resolved.length; j++) {
-            const priceA = watchListPriceOf(resolved[i]);
-            const priceB = watchListPriceOf(resolved[j]);
+            // Both priced as "1 tokenA = X tokenB" from the watch-list entry,
+            // whichever order each pool stores the pair in (core/poolPrice.ts
+            // also excludes LB and dust pools, as the old local helper did).
+            const priceA = priceOf(resolved[i], tokenA, decimalsOf);
+            const priceB = priceOf(resolved[j], tokenA, decimalsOf);
             if (priceA === null || priceB === null || priceA <= 0 || priceB <= 0) continue;
 
             // Orient buy = the cheaper venue, sell = the more expensive venue,
@@ -682,36 +640,6 @@ for (let i = 0; i < resolved.length; i++) {
             const decimals = Math.min(leadingZeros + 4, 18);
             return n.toFixed(decimals);
       };
-      const priceOfPool = (p: any): number | null => {
-            // LFJ's Liquidity Book pools spread liquidity across many discrete price
-            // bins. getReserves() only gives the TOTAL X/Y across every bin, which
-            // can be wildly different from the current market price if liquidity
-            // sits unevenly across bins -- this produced spreads in the millions of
-            // percent, not a real gap. Excluded from price comparison entirely
-            // until real bin-based pricing (getActiveId/getBinStep) is implemented.
-            if (p.dex === 'lfj-lb') return null;
-const decA = decimalsOf(p.chain, p.tokenA);
-            const decB = decimalsOf(p.chain, p.tokenB);
-            if (p.poolType === 'v3' && p.sqrtPriceX96) {
-                  const raw = Number(p.sqrtPriceX96) / 2 ** 96;
-                  return raw * raw * 10 ** (decA - decB);
-            }
-            if (p.reserveA !== undefined && p.reserveB !== undefined && p.reserveA > 0n) {
-                  // A pool with real bytecode can still have near-zero reserves (a
-                  // pair that technically exists but was never meaningfully funded).
-                  // Confirmed live tonight: PancakeSwap V2's WETH/USDC pool on Monad
-                  // has reserve0 = 1 (0.000001 USDC) -- comparing that "price" against
-                  // a real, liquid pool produced a 113% spread that was pure noise,
-                  // not a real gap. Both decimal-adjusted reserves must clear a small
-                  // floor before this pool's price counts as a real market signal.
-                  const adjA = Number(p.reserveA) / 10 ** decA;
-                  const adjB = Number(p.reserveB) / 10 ** decB;
-                  const MIN_RESERVE_UNITS = 0.01;
-                  if (adjA < MIN_RESERVE_UNITS || adjB < MIN_RESERVE_UNITS) return null;
-                  return adjB / adjA;
-            }
-            return null;
-      };
       const runProofOfLifeCheck = async () => {
             for (const chain of ['avalanche', 'monad', 'robinhood'] as const) {
                   const pools = cache.allForChain(chain);
@@ -722,8 +650,9 @@ const decA = decimalsOf(p.chain, p.tokenA);
                         seenPairs.add(pairKey);
                         const peers = cache.findPeerPools(chain, pool.tokenA, pool.tokenB, pool.poolAddress);
                         if (peers.length === 0) continue;
-                        const priceA = priceOfPool(pool);
-                        const priceB = priceOfPool(peers[0]);
+                        // Same base token for both pools so they compare like for like.
+                        const priceA = priceOf(pool, pool.tokenA, decimalsOf);
+                        const priceB = priceOf(peers[0], pool.tokenA, decimalsOf);
                         if (priceA === null || priceB === null || priceA === 0) continue;
                         const spreadPct = ((priceB - priceA) / priceA) * 100;
                         await sendTelegramMessage([
