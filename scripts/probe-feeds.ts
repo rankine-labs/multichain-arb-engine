@@ -42,6 +42,7 @@ async function probeRobinhood(): Promise<string[]> {
   let frames = 0, framesWithMessages = 0, txs = 0, swaps = 0, maxSeq: number | null = null;
   let firstShape = '';
   const routers = new Map<string, number>();
+  const swapsByDex = new Map<string, number>();
   const status = await listen(ROBINHOOD_FEED, () => {}, async (frame) => {
     frames++;
     if (!firstShape) firstShape = JSON.stringify(frame).slice(0, 300);
@@ -51,8 +52,8 @@ async function probeRobinhood(): Promise<string[]> {
     for (const tx of parseFeedFrame(frame)) {
       txs++;
       routers.set(tx.to.toLowerCase(), (routers.get(tx.to.toLowerCase()) ?? 0) + 1);
-      const swap = await decoder.decode({ chain: 'robinhood', stateType: 'SEQUENCED', blockOrSeq: 0, receivedAtMs: Date.now(), raw: { to: tx.to, data: tx.data } });
-      if (swap) swaps++;
+      const swap = await decoder.decode({ chain: 'robinhood', stateType: 'SEQUENCED', blockOrSeq: 0, receivedAtMs: Date.now(), raw: { to: tx.to, data: tx.data, value: tx.value } });
+      if (swap) { swaps++; swapsByDex.set(swap.dex, (swapsByDex.get(swap.dex) ?? 0) + 1); }
     }
   });
   const top = [...routers.entries()].sort((a, b) => b[1] - a[1]).slice(0, 5)
@@ -60,7 +61,7 @@ async function probeRobinhood(): Promise<string[]> {
   return [
     `ROBINHOOD feed: ${status}`,
     `frames ${frames}, with messages ${framesWithMessages}, latest seq ${maxSeq}`,
-    `txs parsed ${txs}, decoded as swaps ${swaps}`,
+    `txs parsed ${txs}, decoded as swaps ${swaps} ${JSON.stringify(Object.fromEntries(swapsByDex))}`,
     `top contracts called: ${top.join(' | ') || 'none'}`,
     `first frame: ${firstShape}`,
   ];
@@ -70,6 +71,9 @@ async function probeMonad(): Promise<string[]> {
   let logs = 0, swapLogs = 0, subResult = 'no response';
   const states = new Map<string, number>();
   let sample = '';
+  let swapKeys = '';
+  const seenIds = new Set<string>();
+  let uniqueSwapLogs = 0;
   const status = await listen(MONAD_WSS, (ws) => {
     ws.send(JSON.stringify({ id: 1, jsonrpc: '2.0', method: 'eth_subscribe', params: ['monadLogs', {}] }));
   }, (msg) => {
@@ -80,12 +84,18 @@ async function probeMonad(): Promise<string[]> {
     if (!sample) sample = JSON.stringify(r).slice(0, 300);
     states.set(String(r.commitState), (states.get(String(r.commitState)) ?? 0) + 1);
     const t0 = String(r.topics?.[0] ?? '').toLowerCase();
-    if (t0 === TOPIC_V2_SWAP || t0 === TOPIC_V3_SWAP || t0 === TOPIC_PANCAKE_V3_SWAP) swapLogs++;
+    if (t0 === TOPIC_V2_SWAP || t0 === TOPIC_V3_SWAP || t0 === TOPIC_PANCAKE_V3_SWAP) {
+      swapLogs++;
+      if (!swapKeys) swapKeys = Object.keys(r).join(',');
+      const id = `${r.transactionHash}:${r.logIndex}`;
+      if (!seenIds.has(id)) { seenIds.add(id); uniqueSwapLogs++; }
+    }
   });
   return [
     `MONAD (${MONAD_WSS}): ${status}, subscribe ${subResult}`,
     `logs ${logs}, Swap logs ${swapLogs}, commit states ${JSON.stringify(Object.fromEntries(states))}`,
-    `sample log: ${sample}`,
+    `unique Swap logs (tx+logIndex) ${uniqueSwapLogs}`,
+    `swap log fields: ${swapKeys}`,
   ];
 }
 

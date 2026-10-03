@@ -35,6 +35,7 @@ export interface FeedTx {
   hash: string;
   to: string;
   data: string;
+  value: string;   // wei, decimal string (native-coin swaps carry their amount here)
   from: string | null;
 }
 
@@ -91,7 +92,7 @@ export function parseFeedFrame(frame: unknown): FeedTx[] {
       if (!tx.to || !tx.data || tx.data === '0x') continue; // plain transfers aren't swaps
       let from: string | null = null;
       try { from = tx.from; } catch { /* unsigned or bad signature */ }
-      txs.push({ sequenceNumber: seq, hash: tx.hash ?? '', to: tx.to, data: tx.data, from });
+      txs.push({ sequenceNumber: seq, hash: tx.hash ?? '', to: tx.to, data: tx.data, value: tx.value.toString(), from });
     }
   }
   return txs;

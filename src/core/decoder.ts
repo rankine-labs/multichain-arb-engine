@@ -37,9 +37,27 @@ const ROUTER_INTERFACES: Record<string, ethers.Interface> = {
     'function swapExactTokensForETH(uint amountIn, uint amountOutMin, address[] path, address to, uint deadline)',
     ]),
   v3: new ethers.Interface([
+    // Original SwapRouter (has a deadline field)
     'function exactInputSingle((address tokenIn, address tokenOut, uint24 fee, address recipient, uint256 deadline, uint256 amountIn, uint256 amountOutMinimum, uint160 sqrtPriceLimitX96))',
     'function exactInput((bytes path, address recipient, uint256 deadline, uint256 amountIn, uint256 amountOutMinimum))',
+    // SwapRouter02 / PancakeSwap SmartRouter (no deadline field; deadline
+    // lives on the multicall wrapper instead). Confirmed by the live probe:
+    // Robinhood's busiest router is a SwapRouter02.
+    'function exactInputSingle((address tokenIn, address tokenOut, uint24 fee, address recipient, uint256 amountIn, uint256 amountOutMinimum, uint160 sqrtPriceLimitX96))',
+    'function exactInput((bytes path, address recipient, uint256 amountIn, uint256 amountOutMinimum))',
+    // SwapRouter02 can also route through V2 pairs (no deadline)
+    'function swapExactTokensForTokens(uint256 amountIn, uint256 amountOutMin, address[] path, address to)',
+    // Most SwapRouter02 calls arrive wrapped in multicall
+    'function multicall(bytes[] data)',
+    'function multicall(uint256 deadline, bytes[] data)',
+    'function multicall(bytes32 previousBlockhash, bytes[] data)',
       ]),
+    // Universal Router (Uniswap and PancakeSwap): a list of 1-byte commands,
+    // each with its own encoded inputs. We decode the V2 and V3 swap commands.
+    ur: new ethers.Interface([
+      'function execute(bytes commands, bytes[] inputs, uint256 deadline)',
+      'function execute(bytes commands, bytes[] inputs)',
+    ]),
     lb: new ethers.Interface([
         // LFJ Liquidity Book router — path is a struct, not a flat address[], since
         // each hop can cross a different bin step / LB version. tokenPath[0] and
@@ -58,7 +76,30 @@ const ROUTER_INTERFACES: Record<string, ethers.Interface> = {
 export interface RouterRegistryEntry {
   dex: string;
     factory?: string; // v2 factory contract, used for JIT pool resolution (see poolResolver.ts)
-    style: 'v2' | 'v3' | 'lb';
+    style: 'v2' | 'v3' | 'lb' | 'ur';
+    // Routers that can trade through BOTH V2 and V3 pools (SwapRouter02,
+    // Universal Router) point at the registry entry to use for each pool
+    // type: the decoded swap is attributed to that router, so pool lookup
+    // uses the right factory.
+    v2Via?: string;
+    v3Via?: string;
+}
+
+// Universal Router command IDs (low 6 bits of each command byte).
+const UR_V3_SWAP_EXACT_IN = 0x00;
+const UR_V2_SWAP_EXACT_IN = 0x08;
+// Universal Router "use the router's whole balance" placeholder amount;
+// the real amount isn't known from calldata, so those swaps are skipped.
+const UR_CONTRACT_BALANCE = 1n << 255n;
+
+// First pool hop of a V3 packed path: tokenIn (20 bytes) + fee (3) + next token (20).
+function firstV3Hop(path: string): { tokenIn: string; tokenOut: string } | null {
+  const hex = path.startsWith('0x') ? path.slice(2) : path;
+  if (hex.length < (20 + 3 + 20) * 2) return null;
+  return {
+    tokenIn: ethers.getAddress('0x' + hex.slice(0, 40)),
+    tokenOut: ethers.getAddress('0x' + hex.slice(46, 86)),
+  };
 }
 
 export type RouterRegistry = Record<ChainName, Record<string /* router address, lowercase */, RouterRegistryEntry>>;
@@ -191,7 +232,37 @@ export class TransactionDecoder {
   private decodeCalldata(chain: ChainName, to: string, data: string, event: RawChainEvent): DecodedSwap | null {
     const entry = this.registry[chain][to.toLowerCase()];
     if (!entry) return null; // not a router we're tracking — most traffic falls here
+    // Native-coin swaps (swapExactETHForTokens etc.) carry the amount as the
+    // tx value, not an argument.
+    const value = (() => { try { return BigInt((event.raw as any)?.value ?? 0); } catch { return 0n; } })();
+    return this.decodeRouterCall(chain, to, entry, data, event, value, 0);
+  }
 
+  // Builds the swap; `via` = the registry router whose factory should be used.
+  private swapOf(
+    chain: ChainName, via: string | undefined, tokenIn: string, tokenOut: string,
+    amountIn: bigint, event: RawChainEvent,
+  ): DecodedSwap | null {
+    if (!via || amountIn <= 0n || amountIn >= UR_CONTRACT_BALANCE) return null;
+    const viaEntry = this.registry[chain][via.toLowerCase()];
+    if (!viaEntry) return null;
+    return {
+      chain,
+      dex: viaEntry.dex,
+      poolAddress: via, // resolved to the actual pool by the caller via that router's factory
+      tokenIn,
+      tokenOut,
+      amountIn,
+      stateType: event.stateType,
+      detectedAtMs: event.receivedAtMs,
+    };
+  }
+
+  private decodeRouterCall(
+    chain: ChainName, to: string, entry: RouterRegistryEntry, data: string,
+    event: RawChainEvent, value: bigint, depth: number,
+  ): DecodedSwap | null {
+    if (depth > 2) return null;
     const iface = ROUTER_INTERFACES[entry.style];
     let parsed: ethers.TransactionDescription | null;
     try {
@@ -200,50 +271,77 @@ export class TransactionDecoder {
       return null; // not a swap method we recognize on this router
     }
     if (!parsed) return null;
+    const a = parsed.args;
 
-    if (entry.style === 'v2') {
-      const path = parsed.args.path as string[];
-      if (!path || path.length < 2) return null;
-      return {
-        chain,
-        dex: entry.dex,
-        poolAddress: to, // resolved to actual pool address by the caller via factory lookup
-        tokenIn: path[0],
-        tokenOut: path[path.length - 1],
-        amountIn: BigInt(parsed.args.amountIn ?? 0),
-        stateType: event.stateType,
-        detectedAtMs: event.receivedAtMs,
-      };
+    // --- multicall: decode the first inner call that is a swap -------------
+    if (parsed.name === 'multicall') {
+      const calls = a[a.length - 1] as string[];
+      for (const inner of calls ?? []) {
+        const swap = this.decodeRouterCall(chain, to, entry, inner, event, value, depth + 1);
+        if (swap) return swap;
+      }
+      return null;
     }
 
-      if (entry.style === 'lb') {
-          const path = parsed.args.path as { tokenPath: string[] };
-          const tokenPath = path?.tokenPath;
-          if (!tokenPath || tokenPath.length < 2) return null;
-          return {
-              chain,
-              dex: entry.dex,
-              poolAddress: to,
-              tokenIn: tokenPath[0],
-              tokenOut: tokenPath[tokenPath.length - 1],
-              amountIn: BigInt(parsed.args.amountIn ?? 0),
-              stateType: event.stateType,
-              detectedAtMs: event.receivedAtMs,
-          };
+    // --- Universal Router ---------------------------------------------------
+    if (entry.style === 'ur') {
+      const commands = ethers.getBytes(a[0] as string);
+      const inputs = a[1] as string[];
+      const coder = ethers.AbiCoder.defaultAbiCoder();
+      for (let i = 0; i < commands.length && i < inputs.length; i++) {
+        const cmd = commands[i] & 0x3f;
+        try {
+          if (cmd === UR_V3_SWAP_EXACT_IN) {
+            const [, amountIn, , path] = coder.decode(['address', 'uint256', 'uint256', 'bytes', 'bool'], inputs[i]);
+            const hop = firstV3Hop(path as string);
+            const swap = hop && this.swapOf(chain, entry.v3Via, hop.tokenIn, hop.tokenOut, amountIn as bigint, event);
+            if (swap) return swap;
+          } else if (cmd === UR_V2_SWAP_EXACT_IN) {
+            const [, amountIn, , path] = coder.decode(['address', 'uint256', 'uint256', 'address[]', 'bool'], inputs[i]);
+            const p = path as string[];
+            const swap = p.length >= 2 ? this.swapOf(chain, entry.v2Via, p[0], p[1], amountIn as bigint, event) : null;
+            if (swap) return swap;
+          }
+        } catch { /* malformed input for this command; try the next */ }
       }
+      return null;
+    }
 
-    // v3 exactInputSingle
-    const params = parsed.args[0];
+    // --- V2-style router ------------------------------------------------------
+    // First hop only: amountIn goes into the path[0]/path[1] pair. (Using
+    // the LAST token, as before, pointed multi-hop trades at the wrong pool.)
+    if (entry.style === 'v2') {
+      const path = a.path as string[];
+      if (!path || path.length < 2) return null;
+      const amountIn = a.amountIn !== undefined ? BigInt(a.amountIn) : value;
+      return this.swapOf(chain, to, path[0], path[1], amountIn, event);
+    }
+
+    // --- Liquidity Book router ---------------------------------------------
+    if (entry.style === 'lb') {
+      const tokenPath = (a.path as { tokenPath: string[] })?.tokenPath;
+      if (!tokenPath || tokenPath.length < 2) return null;
+      const amountIn = a.amountIn !== undefined ? BigInt(a.amountIn) : value;
+      return this.swapOf(chain, to, tokenPath[0], tokenPath[1], amountIn, event);
+    }
+
+    // --- V3-style router (SwapRouter / SwapRouter02 / SmartRouter) ---------
+    if (parsed.name === 'swapExactTokensForTokens') {
+      // V2 trade routed through a SwapRouter02-type router
+      const path = a.path as string[];
+      if (!path || path.length < 2) return null;
+      return this.swapOf(chain, entry.v2Via, path[0], path[1], BigInt(a.amountIn), event);
+    }
+    const params = a[0];
     if (!params) return null;
-    return {
-      chain,
-      dex: entry.dex,
-      poolAddress: to,
-      tokenIn: params.tokenIn,
-      tokenOut: params.tokenOut,
-      amountIn: BigInt(params.amountIn ?? 0),
-      stateType: event.stateType,
-      detectedAtMs: event.receivedAtMs,
-    };
+    if (parsed.name === 'exactInputSingle') {
+      return this.swapOf(chain, to, params.tokenIn, params.tokenOut, BigInt(params.amountIn ?? 0), event);
+    }
+    if (parsed.name === 'exactInput') {
+      // Multi-hop: decode the packed path. (Previously returned no tokens.)
+      const hop = firstV3Hop(params.path);
+      return hop ? this.swapOf(chain, to, hop.tokenIn, hop.tokenOut, BigInt(params.amountIn ?? 0), event) : null;
+    }
+    return null;
   }
 }

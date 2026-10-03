@@ -190,6 +190,7 @@ registry.monad[MONAD_ROUTERS.SWAP_ROUTER_02.toLowerCase()] = {
 dex: 'uniswap-v3',
     factory: MONAD_ROUTERS.UNISWAP_V3_FACTORY,
 style: 'v3',
+    v3Via: MONAD_ROUTERS.SWAP_ROUTER_02,
 };
 
     registry.monad[MONAD_BEAN.DLMM_ROUTER.toLowerCase()] = {
@@ -220,6 +221,7 @@ style: 'v3',
         dex: 'uniswap-v3',
         style: 'v3',
         factory: ROBINHOOD_V3.FACTORY,
+        v2Via: ROBINHOOD_V2.ROUTER,
     };
 
     registry.monad[MONAD_PANCAKE.V2_ROUTER.toLowerCase()] = {
@@ -234,10 +236,13 @@ style: 'v3',
         factory: MONAD_PANCAKE.V3_FACTORY,
     };
 
+    // Universal Router (was mislabelled 'v3', so its calls never parsed).
+    // V3 swaps resolve via the Pancake V3 router entry, V2 via Pancake V2.
     registry.monad[MONAD_PANCAKE.V3_UNIVERSAL_ROUTER.toLowerCase()] = {
-        dex: 'pancakeswap-v3',
-        style: 'v3',
-        factory: MONAD_PANCAKE.V3_FACTORY,
+        dex: 'pancakeswap-universal',
+        style: 'ur',
+        v3Via: MONAD_PANCAKE.V3_SWAP_ROUTER,
+        v2Via: MONAD_PANCAKE.V2_ROUTER,
     };
 
     registry.robinhood[ROBINHOOD_PANCAKE.V2_ROUTER.toLowerCase()] = {
@@ -250,13 +255,29 @@ style: 'v3',
         dex: 'pancakeswap-v3',
         style: 'v3',
         factory: ROBINHOOD_PANCAKE.V3_FACTORY,
+        v2Via: ROBINHOOD_PANCAKE.V2_ROUTER,
     };
 
     registry.robinhood[ROBINHOOD_PANCAKE.V3_UNIVERSAL_ROUTER.toLowerCase()] = {
-        dex: 'pancakeswap-v3',
-        style: 'v3',
-        factory: ROBINHOOD_PANCAKE.V3_FACTORY,
+        dex: 'pancakeswap-universal',
+        style: 'ur',
+        v3Via: ROBINHOOD_PANCAKE.SMART_ROUTER,
+        v2Via: ROBINHOOD_PANCAKE.V2_ROUTER,
     };
+    // Uniswap Universal Routers -- the second-busiest contract on Robinhood
+    // in the live probe. V2/V3 swap commands are decoded; V4 commands are not.
+    registry.robinhood[ROBINHOOD_V4.UNIVERSAL_ROUTER.toLowerCase()] = {
+        dex: 'uniswap-universal',
+        style: 'ur',
+        v3Via: ROBINHOOD_V3.SWAP_ROUTER_02,
+        v2Via: ROBINHOOD_V2.ROUTER,
+    };
+    registry.monad[MONAD_V4_PENDING.UNIVERSAL_ROUTER.toLowerCase()] = {
+        dex: 'uniswap-universal',
+        style: 'ur',
+        v3Via: MONAD_ROUTERS.SWAP_ROUTER_02,
+    };
+
 registerStablecoin('monad', MONAD_TOKENS.USDC);
 
 registerStablecoin('robinhood', ROBINHOOD_TOKENS.USDG);

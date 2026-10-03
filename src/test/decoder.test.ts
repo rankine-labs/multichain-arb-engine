@@ -66,6 +66,64 @@ async function main() {
   const data = iface.encodeFunctionData('swapExactTokensForTokens', [10n ** 20n, 0n, [WAVAX, AUSDC], ROUTER, 9_999_999_999n]);
   const swap = await avax.decode({ chain: 'avalanche', stateType: 'PENDING', blockOrSeq: 'pending', receivedAtMs: 1, raw: { to: ROUTER, data, hash: '0xabc' } });
   assert(swap?.tokenIn === WAVAX && swap?.amountIn === 10n ** 20n && swap?.dex === 'traderjoe-v1', 'Avalanche pending tx decoded without a provider (was always null)');
+
+  // 6. Router patterns seen in the live Robinhood probe.
+  const SR02 = '0xCaf681a66D020601342297493863E78C959E5cb2';   // SwapRouter02
+  const UR = '0x8876789976decbfcbbbe364623c63652db8c0904';     // Universal Router
+  const V2R = '0x89e5db8b5aa49aa85ac63f691524311aeb649eba';    // V2 router
+  const RH_WETH = '0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73';
+  const RH_USDG = '0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168';
+  const OTHER = '0x9999999999999999999999999999999999999999';
+  const rhRegistry: RouterRegistry = { avalanche: {}, monad: {}, robinhood: {
+    [SR02.toLowerCase()]: { dex: 'uniswap-v3', style: 'v3', v2Via: V2R },
+    [UR.toLowerCase()]: { dex: 'uniswap-universal', style: 'ur', v3Via: SR02, v2Via: V2R },
+    [V2R.toLowerCase()]: { dex: 'uniswap-v2', style: 'v2' },
+  } };
+  const rh = new TransactionDecoder(rhRegistry);
+  const rhEvent = (to: string, data: string, value = '0'): RawChainEvent =>
+    ({ chain: 'robinhood', stateType: 'SEQUENCED', blockOrSeq: 1, receivedAtMs: 1, raw: { to, data, value } });
+
+  const sr02 = new ethers.Interface([
+    'function exactInputSingle((address tokenIn, address tokenOut, uint24 fee, address recipient, uint256 amountIn, uint256 amountOutMinimum, uint160 sqrtPriceLimitX96))',
+    'function exactInput((bytes path, address recipient, uint256 amountIn, uint256 amountOutMinimum))',
+    'function multicall(uint256 deadline, bytes[] data)',
+  ]);
+  const single = sr02.encodeFunctionData('exactInputSingle', [{ tokenIn: RH_WETH, tokenOut: RH_USDG, fee: 500, recipient: OTHER, amountIn: 7n * 10n ** 17n, amountOutMinimum: 0n, sqrtPriceLimitX96: 0n }]);
+  const wrapped = sr02.encodeFunctionData('multicall', [9_999_999_999n, [single]]);
+  const s1 = await rh.decode(rhEvent(SR02, wrapped));
+  assert(s1?.tokenIn === RH_WETH && s1?.tokenOut === RH_USDG && s1?.amountIn === 7n * 10n ** 17n && s1?.poolAddress === SR02,
+    'SwapRouter02 exactInputSingle inside multicall(deadline, ...) decoded');
+
+  // Multi-hop exactInput: WETH -(500)-> USDG -(3000)-> OTHER. First hop only.
+  const path = ethers.solidityPacked(['address', 'uint24', 'address', 'uint24', 'address'], [RH_WETH, 500, RH_USDG, 3000, OTHER]);
+  const multi = sr02.encodeFunctionData('exactInput', [{ path, recipient: OTHER, amountIn: 10n ** 18n, amountOutMinimum: 0n }]);
+  const s2 = await rh.decode(rhEvent(SR02, multi));
+  assert(s2?.tokenIn === RH_WETH && s2?.tokenOut === RH_USDG, 'exactInput multi-hop: first hop WETH -> USDG (used to return no tokens)');
+
+  // Universal Router: WRAP_ETH (0x0b, skipped) then V3_SWAP_EXACT_IN (0x00).
+  const urIface = new ethers.Interface(['function execute(bytes commands, bytes[] inputs, uint256 deadline)']);
+  const coder = ethers.AbiCoder.defaultAbiCoder();
+  const wrapIn = coder.encode(['address', 'uint256'], [UR, 10n ** 18n]);
+  const v3In = coder.encode(['address', 'uint256', 'uint256', 'bytes', 'bool'], [OTHER, 3n * 10n ** 18n, 0n, ethers.solidityPacked(['address', 'uint24', 'address'], [RH_WETH, 500, RH_USDG]), false]);
+  const urCall = urIface.encodeFunctionData('execute', ['0x0b00', [wrapIn, v3In], 9_999_999_999n]);
+  const s3 = await rh.decode(rhEvent(UR, urCall));
+  assert(s3?.tokenIn === RH_WETH && s3?.amountIn === 3n * 10n ** 18n && s3?.poolAddress === SR02 && s3?.dex === 'uniswap-v3',
+    'Universal Router V3 swap decoded and routed to the V3 router for pool lookup');
+
+  // Universal Router V2 swap (0x08), with the "allow revert" flag bit set (0x88).
+  const v2In = coder.encode(['address', 'uint256', 'uint256', 'address[]', 'bool'], [OTHER, 5n * 10n ** 6n, 0n, [RH_USDG, RH_WETH], true]);
+  const s4 = await rh.decode(rhEvent(UR, urIface.encodeFunctionData('execute', ['0x88', [v2In], 9_999_999_999n])));
+  assert(s4?.tokenIn === RH_USDG && s4?.poolAddress === V2R && s4?.dex === 'uniswap-v2', 'Universal Router V2 swap decoded (flag bits ignored)');
+
+  // "Use whole balance" placeholder amount can't be sized -> skipped.
+  const balIn = coder.encode(['address', 'uint256', 'uint256', 'bytes', 'bool'], [OTHER, 1n << 255n, 0n, ethers.solidityPacked(['address', 'uint24', 'address'], [RH_WETH, 500, RH_USDG]), false]);
+  assert(await rh.decode(rhEvent(UR, urIface.encodeFunctionData('execute', ['0x00', [balIn], 1n]))) === null, 'contract-balance placeholder amount skipped');
+
+  // V2 router multi-hop + native-coin swap uses tx value.
+  const v2Iface = new ethers.Interface(['function swapExactETHForTokens(uint amountOutMin, address[] path, address to, uint deadline)']);
+  const eth = v2Iface.encodeFunctionData('swapExactETHForTokens', [0n, [RH_WETH, RH_USDG, OTHER], OTHER, 9_999_999_999n]);
+  const s5 = await rh.decode(rhEvent(V2R, eth, (2n * 10n ** 18n).toString()));
+  assert(s5?.amountIn === 2n * 10n ** 18n && s5?.tokenOut === RH_USDG, 'native-coin swap: amount from tx value, first hop only');
 }
 
 main().catch((err) => { console.error('FAIL: test crashed', err); process.exitCode = 1; });

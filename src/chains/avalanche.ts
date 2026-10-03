@@ -93,7 +93,7 @@ export class AvalancheAdapter implements ChainCapability {
                       stateType: 'PENDING',
                       blockOrSeq: 'pending',
                       receivedAtMs,
-                      raw: { to: tx.to, data: tx.data, from: tx.from, hash: tx.hash },
+                      raw: { to: tx.to, data: tx.data, value: tx.value.toString(), from: tx.from, hash: tx.hash },
           };
 
           for (const h of this.handlers) h(event);

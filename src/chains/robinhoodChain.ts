@@ -78,7 +78,7 @@ export class RobinhoodChainAdapter implements ChainCapability {
                                                                stateType: 'SEQUENCED',
                                                                blockOrSeq: tx.sequenceNumber ?? seq ?? 'unknown',
                                                                receivedAtMs,
-                                                               raw: { to: tx.to, data: tx.data, hash: tx.hash, from: tx.from },
+                                                               raw: { to: tx.to, data: tx.data, value: tx.value, hash: tx.hash, from: tx.from },
                                                      };
                                                      for (const h of this.handlers) h(event);
                                            }
