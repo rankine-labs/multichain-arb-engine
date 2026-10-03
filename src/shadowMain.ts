@@ -179,6 +179,41 @@ Object.entries(discoveryConfigs).map(([chain, cfg]) => [chain, new PoolDiscovery
             }, 8000);
       }
 
+// Declared BEFORE the event handler below on purpose: the handler uses
+// these, and chains start emitting events as soon as startAll() runs. When
+// this table sat further down, an early opportunity could reach it before it
+// existed (ReferenceError -> unhandled rejection -> process crash).
+// Real, on-chain-verified decimals -- checked directly against each
+      // token contract's decimals() tonight after spreads like 351514228%
+      // turned out to be a raw-unadjusted-ratio bug, not real price gaps.
+      // Keyed by lowercase token address (not symbol) so it works no matter
+      // which pool orders tokenA/tokenB which way. Missing tokens default to
+      // 18, the most common case, rather than throwing.
+      const TOKEN_DECIMALS: Record<string, Record<string, number>> = {
+            avalanche: {
+                  '0xb31f66aa3c1e785363f0875a1b74e27b85fd66c7': 18, // WAVAX
+                  '0xb97ef9ef8734c71904d8002f8b6bc66dd9c48a6e': 6,  // USDC (native, Circle)
+            },
+            monad: {
+                  '0x3bd359c1119da7da1d913d1c4d2b7c461115433a': 18, // WMON
+                  '0x754704bc059f8c67012fed69bc8a327a5aafb603': 6,  // USDC
+                  '0xee8c0e9f1bffb4eb878d8f15f368a02a35481242': 18, // WETH
+                  '0x0555e30da8f98308edb960aa94c0db47230d2b9c': 8,  // WBTC
+                  '0xd18b7ec58cdf4876f6afebd3ed1730e4ce10414b': 8,  // cbBTC
+                  '0xe7cd86e13ac4309349f30b3435a9d337750fc82d': 6,  // USDT0
+                  '0x1b68626dca36c7fe922fd2d55e4f631d962de19c': 18, // shMON
+                  '0xa3227c5969757783154c60bf0bc1944180ed81b9': 18, // sMON
+                  '0x8498312a6b3cbd158bf0c93abdcf29e6e4f55081': 18, // gMON
+                  '0x00000000efe302beaa2b3e6e1b18d08d69a9012a': 6,  // AUSD
+            },
+            robinhood: {
+                  '0x0bd7d308f8e1639fab988df18a8011f41eacad73': 18, // WETH
+                  '0x5fc5360d0400a0fd4f2af552add042d716f1d168': 6,  // USDG
+            },
+      };
+      const decimalsOf = (chain: string, addr: string): number =>
+            TOKEN_DECIMALS[chain]?.[addr.toLowerCase()] ?? 18;
+
 chainManager.register(new RobinhoodChainAdapter());
 chainManager.register(new MonadAdapter());
 chainManager.register(new AvalancheAdapter());
@@ -551,32 +586,6 @@ await chainManager.startAll();
           { tokenA: MONAD_TOKENS.GMON, tokenB: MONAD_TOKENS.WMON },
             ];
 
-             // Real, on-chain-verified decimals -- checked directly against each
-      // token contract's decimals() tonight after spreads like 351514228%
-      // turned out to be a raw-unadjusted-ratio bug, not real price gaps.
-      // Keyed by lowercase token address (not symbol) so it works no matter
-      // which pool orders tokenA/tokenB which way. Missing tokens default to
-      // 18, the most common case, rather than throwing.
-      const TOKEN_DECIMALS: Record<string, Record<string, number>> = {
-            monad: {
-                  '0x3bd359c1119da7da1d913d1c4d2b7c461115433a': 18, // WMON
-                  '0x754704bc059f8c67012fed69bc8a327a5aafb603': 6,  // USDC
-                  '0xee8c0e9f1bffb4eb878d8f15f368a02a35481242': 18, // WETH
-                  '0x0555e30da8f98308edb960aa94c0db47230d2b9c': 8,  // WBTC
-                  '0xd18b7ec58cdf4876f6afebd3ed1730e4ce10414b': 8,  // cbBTC
-                  '0xe7cd86e13ac4309349f30b3435a9d337750fc82d': 6,  // USDT0
-                  '0x1b68626dca36c7fe922fd2d55e4f631d962de19c': 18, // shMON
-                  '0xa3227c5969757783154c60bf0bc1944180ed81b9': 18, // sMON
-                  '0x8498312a6b3cbd158bf0c93abdcf29e6e4f55081': 18, // gMON
-                  '0x00000000efe302beaa2b3e6e1b18d08d69a9012a': 6,  // AUSD
-            },
-            robinhood: {
-                  '0x0bd7d308f8e1639fab988df18a8011f41eacad73': 18, // WETH
-                  '0x5fc5360d0400a0fd4f2af552add042d716f1d168': 6,  // USDG
-            },
-      };
-      const decimalsOf = (chain: string, addr: string): number =>
-            TOKEN_DECIMALS[chain]?.[addr.toLowerCase()] ?? 18;
 
       const watchListPriceOf = (p: any): number | null => {
             // Excluded -- see the matching note on priceOfPool above. LFJ-LB's
