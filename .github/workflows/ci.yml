@@ -52,5 +52,14 @@ jobs:
       - name: Build
         run: forge build
 
-      - name: Tests
-        run: forge test -vv
+      - name: Unit tests (mocks)
+        run: forge test -vv --no-match-path "test/Fork.t.sol"
+
+      # Real-pool tests on copies of live mainnet state. Public RPCs, no keys.
+      # These hit live networks, so a flaky RPC can fail them; re-run if so.
+      - name: Fork tests (real pools)
+        run: forge test -vvv --match-path "test/Fork.t.sol"
+        env:
+          AVALANCHE_RPC_URL: https://api.avax.network/ext/bc/C/rpc
+          MONAD_RPC_URL: https://rpc.monad.xyz
+          ROBINHOOD_RPC_URL: https://rpc.mainnet.chain.robinhood.com
