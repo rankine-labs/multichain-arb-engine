@@ -21,8 +21,12 @@ import {
 // list would be stale within hours; this follows the actual traffic.
 //
 // Limits (so it can't overload the RPC):
+//   - discovery runs ONE pair at a time from a queue; if the queue is full,
+//     new pairs are skipped (if they keep trading they'll be picked up later)
 //   - at most `maxPairs` pairs; the least recently traded pair is dropped
-//   - each pair is re-discovered at most every `rediscoverMs`
+//   - each pair is re-discovered at most every `rediscoverMs`; a pair found
+//     to have only ONE pool (most memecoins: nothing to arb against) is not
+//     re-checked for `singlePoolRecheckMs`
 //   - prices refreshed every `refreshMs` in the background (the bot ALSO
 //     re-reads the exact pools it's about to use at decision time)
 // ============================================================================
@@ -38,6 +42,8 @@ export interface PairWatcherOptions {
   maxPairs?: number;
   rediscoverMs?: number;
   refreshMs?: number;
+  maxQueue?: number;
+  singlePoolRecheckMs?: number;
 }
 
 type TokenMeta = { symbol: string; decimals: number };
@@ -79,7 +85,12 @@ export async function refreshPoolState(provider: ethers.JsonRpcProvider, pool: P
 
 export class PairWatcher {
   private pairs = new Map<string, { tokenA: string; tokenB: string; pools: string[]; discoveredAt: number; lastSeen: number }>();
-  private inFlight = new Set<string>();
+  private inFlight = new Set<string>();           // queued or running
+  private queue: Array<{ a: string; b: string }> = [];
+  private working = false;
+  private singlePool = new Map<string, number>();  // pair -> when it was found to have one pool
+  private readonly maxQueue: number;
+  private readonly singlePoolRecheckMs: number;
   private tokenMeta = new Map<string, TokenMeta | null>();
   private readonly maxPairs: number;
   private readonly rediscoverMs: number;
@@ -99,6 +110,8 @@ export class PairWatcher {
     this.maxPairs = opts.maxPairs ?? 40;
     this.rediscoverMs = opts.rediscoverMs ?? 10 * 60_000;
     this.refreshMs = opts.refreshMs ?? 30_000;
+    this.maxQueue = opts.maxQueue ?? 20;
+    this.singlePoolRecheckMs = opts.singlePoolRecheckMs ?? 60 * 60_000;
   }
 
   private key(a: string, b: string) {
@@ -114,9 +127,32 @@ export class PairWatcher {
     if (entry) entry.lastSeen = now;
     if (this.inFlight.has(k)) return;
     if (entry && now - entry.discoveredAt < this.rediscoverMs) return;
+    const single = this.singlePool.get(k);
+    if (single !== undefined && now - single < this.singlePoolRecheckMs) return;
+    if (this.queue.length >= this.maxQueue) return; // busy: skip, it'll come back if it keeps trading
     this.inFlight.add(k);
-    this.discover(a, b).catch((err) => console.warn(`[pairs] ${this.chain} discovery failed:`, (err as Error).message))
-      .finally(() => this.inFlight.delete(k));
+    this.queue.push({ a, b });
+    void this.drain();
+  }
+
+  // Works through the queue one pair at a time.
+  private async drain(): Promise<void> {
+    if (this.working) return;
+    this.working = true;
+    try {
+      while (this.queue.length) {
+        const { a, b } = this.queue.shift()!;
+        try {
+          await this.discover(a, b);
+        } catch (err) {
+          console.warn(`[pairs] ${this.chain} discovery failed:`, (err as Error).message);
+        } finally {
+          this.inFlight.delete(this.key(a, b));
+        }
+      }
+    } finally {
+      this.working = false;
+    }
   }
 
   // Awaitable version, used at startup for pairs we always want.
@@ -133,10 +169,16 @@ export class PairWatcher {
 
     const pools = await discoverPairPools(this.provider, this.chain, this.venues, a, b);
     for (const p of pools) this.cache.upsert(p);
+    // One pool = nothing to arb against: remember that, don't track the pair.
+    if (pools.length < 2) {
+      this.singlePool.set(k, Date.now());
+      if (this.singlePool.size > 5_000) this.singlePool.clear(); // bound memory
+      return;
+    }
     const now = Date.now();
     const prev = this.pairs.get(k);
     this.pairs.set(k, { tokenA: a, tokenB: b, pools: pools.map((p) => p.poolAddress), discoveredAt: now, lastSeen: prev?.lastSeen ?? now });
-    if (!prev && pools.length > 1) {
+    if (!prev) {
       console.log(`[pairs] ${this.chain} watching ${ma.symbol}/${mb.symbol}: ${pools.length} pools (${pools.map((p) => `${p.dex}${p.poolType === 'v3' ? ` ${p.feeBps / 100}%` : ''}`).join(', ')})`);
     }
     this.evictIfNeeded();
@@ -188,6 +230,6 @@ export class PairWatcher {
   stats() {
     let pools = 0;
     for (const p of this.pairs.values()) pools += p.pools.length;
-    return { pairs: this.pairs.size, pools };
+    return { pairs: this.pairs.size, pools, queued: this.queue.length, singlePoolPairs: this.singlePool.size };
   }
 }

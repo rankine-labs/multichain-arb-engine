@@ -863,7 +863,12 @@ for (let i = 0; i < resolved.length; i++) {
                               !matched.has([symbolOf('monad', tokenA), symbolOf('monad', tokenB)].sort().join('/')),
                         ).length;
                   }
-                  return { chain, spreads, noMatchCount };
+                  let note: string | undefined;
+                  if (chain === 'robinhood') {
+                        const st = robinhoodWatcher.stats();
+                        note = `watching ${st.pairs} pair${st.pairs === 1 ? '' : 's'}, ${st.pools} pools`;
+                  }
+                  return { chain, spreads, noMatchCount, note };
             });
       };
 
