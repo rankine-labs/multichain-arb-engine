@@ -92,6 +92,13 @@ export class MonadAdapter implements ChainCapability {
   private lastMessageAtMs = 0;
   private reorderedCount = 0; // tracked per Phase 1 requirement: measure how often speculative state flips
 
+  // Monad re-sends a log as its block moves through commit stages
+  // (proposed -> voted -> finalized). Only the FIRST sighting is passed on,
+  // otherwise one swap would be evaluated and counted 3-4 times. Bounded so
+  // it can't grow forever.
+  private seenLogs = new Set<string>();
+  private static readonly SEEN_LOGS_MAX = 20_000;
+
   // Keepalive state for the current socket.
   private pingTimer: NodeJS.Timeout | null = null;
   private awaitingPong = false;
@@ -250,6 +257,20 @@ export class MonadAdapter implements ChainCapability {
         if (!params) return;
 
         const stateType = params.commitState === 'Finalized' ? 'FINALIZED' : 'SPECULATIVE';
+
+        // De-duplicate across commit stages (see seenLogs above).
+        const logId = params.transactionHash !== undefined && params.logIndex !== undefined
+          ? `${params.transactionHash}:${params.logIndex}`
+          : null;
+        if (logId) {
+          if (this.seenLogs.has(logId)) return;
+          this.seenLogs.add(logId);
+          if (this.seenLogs.size > MonadAdapter.SEEN_LOGS_MAX) {
+            // Drop the oldest half (Sets iterate in insertion order).
+            let drop = this.seenLogs.size / 2;
+            for (const k of this.seenLogs) { if (drop-- <= 0) break; this.seenLogs.delete(k); }
+          }
+        }
 
         const event: RawChainEvent = {
           chain: 'monad',

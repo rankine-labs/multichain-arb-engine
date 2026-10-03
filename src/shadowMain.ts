@@ -60,7 +60,6 @@ const shadowLogger = new ShadowLogger();
 const chainManager = new ChainManager();
 const routerRegistry = structuredClone(DEFAULT_ROUTER_REGISTRY);
 seedKnownAddresses(routerRegistry);
-const decoder = new TransactionDecoder(routerRegistry);
 const filter = new FastFilter(cache);
 const priceOracle = new PriceOracle(cache);
 
@@ -82,6 +81,10 @@ const priceOracle = new PriceOracle(cache);
     const avalancheReadProvider = new ethers.JsonRpcProvider('https://api.avax.network/ext/bc/C/rpc', 43114);
       const monadReadProvider = new ethers.JsonRpcProvider('https://rpc.monad.xyz', 143);
       const robinhoodReadProvider = new ethers.JsonRpcProvider('https://rpc.mainnet.chain.robinhood.com', 4663);
+
+      // Decoder gets the pool cache so it can decode Monad Swap logs (a log
+      // only names the pool; the cache knows its tokens).
+      const decoder = new TransactionDecoder(routerRegistry, avalancheReadProvider, (chain, addr) => cache.get(chain, addr));
 
 const discoveryConfigs: Record<string, DiscoveryConfig> = {
 avalanche: {
@@ -222,9 +225,10 @@ const t0 = Date.now();
 const swap = await decoder.decode(event);
 if (!swap) return;
 
-const filterResult = filter.evaluate(swap);
-if (!filterResult.pass) return;
-
+// NOTE: the fast filter runs AFTER pool lookup (below), not here. For
+// router-based chains swap.poolAddress is the ROUTER, which is never in the
+// cache, so filtering first rejected every single swap as "pool not
+// tracked" before the real pool could be looked up.
 let pool = cache.get(swap.chain, swap.poolAddress);
 
     // Just-in-time pool discovery: swap.poolAddress is the ROUTER address
@@ -294,8 +298,15 @@ if (registerIfApproved('avalanche', entry.dex, resolved)) pool = resolved;
           }
     }
 
-    const peers = pool ? cache.findPeerPools(swap.chain, swap.tokenIn, swap.tokenOut, pool.poolAddress) : [];
-    if (!pool || peers.length === 0) return;
+    if (!pool) return;
+
+    // Cheap "is this trade big enough to matter" check, now against the
+    // REAL pool address.
+    const filterResult = filter.evaluate({ ...swap, poolAddress: pool.poolAddress });
+    if (!filterResult.pass) return;
+
+    const peers = cache.findPeerPools(swap.chain, swap.tokenIn, swap.tokenOut, pool.poolAddress);
+    if (peers.length === 0) return;
     const sellPool = peers[0];
 
       // Record this real, genuine match for the hourly proof-of-activity

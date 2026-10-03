@@ -1,5 +1,21 @@
 import { ethers } from 'ethers';
-import { DecodedSwap, RawChainEvent, ChainName } from './types';
+import { DecodedSwap, RawChainEvent, ChainName, PoolState } from './types';
+
+// ----------------------------------------------------------------------------
+// Swap EVENT signatures (topic0), for chains that give us logs (Monad).
+// Computed with `cast keccak "<signature>"`.
+// ----------------------------------------------------------------------------
+// Uniswap V2 / PancakeSwap V2 / LFJ v1:  Swap(sender, amount0In, amount1In, amount0Out, amount1Out, to)
+export const TOPIC_V2_SWAP = '0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822';
+// Uniswap V3:  Swap(sender, recipient, amount0, amount1, sqrtPriceX96, liquidity, tick)
+export const TOPIC_V3_SWAP = '0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67';
+// PancakeSwap V3 adds two protocol-fee fields at the end.
+export const TOPIC_PANCAKE_V3_SWAP = '0x19b47279256b2a23a1665c810c8d55a1758940ee09377d4f8d26497a3577dc83';
+
+const abi = ethers.AbiCoder.defaultAbiCoder();
+
+// Looks up a pool we already track (from the pool cache) by its address.
+export type PoolLookup = (chain: ChainName, poolAddress: string) => PoolState | undefined;
 
 // ============================================================================
 // TRANSACTION DECODER
@@ -62,7 +78,14 @@ export const DEFAULT_ROUTER_REGISTRY: RouterRegistry = {
 export class TransactionDecoder {
   constructor(
     private registry: RouterRegistry = DEFAULT_ROUTER_REGISTRY,
-    private provider?: ethers.JsonRpcProvider, // needed when raw event is only a txHash (Avalanche)
+    // Only used if an Avalanche event carries just a txHash (the adapter
+    // normally passes to/data already, so no extra round trip is needed).
+    private provider?: ethers.JsonRpcProvider,
+    // Needed to decode Monad Swap logs: a log only says "pool X swapped
+    // amount0/amount1", so we need the pool's two tokens to know which
+    // token went in. Only pools we already track can be decoded -- which is
+    // fine, since an untracked pool has no peer to arb against anyway.
+    private poolLookup?: PoolLookup,
     ) {}
 
   // Entry point. Returns null if this event isn't a swap we can decode
@@ -71,7 +94,7 @@ export class TransactionDecoder {
   async decode(event: RawChainEvent): Promise<DecodedSwap | null> {
     switch (event.chain) {
       case 'avalanche':
-      return this.decodeFromTxHash(event);
+      return this.decodeFromTx(event);
       case 'monad':
       return this.decodeFromLog(event);
       case 'robinhood':
@@ -81,36 +104,73 @@ export class TransactionDecoder {
     }
   }
 
-  // Avalanche's pending feed only gives us a txHash — we have to fetch the
-  // full transaction to get calldata. This is the one path with an RPC
-  // round-trip in it; everything else decodes from data already in hand.
-  private async decodeFromTxHash(event: RawChainEvent): Promise<DecodedSwap | null> {
-    if (!this.provider) return null;
-    const raw = event.raw as { txHash: string };
-    const tx = await this.provider.getTransaction(raw.txHash).catch(() => null);
-      if (!tx || !tx.to || !tx.data) return null;
-
-      return this.decodeCalldata('avalanche', tx.to, tx.data, event);
+  // Avalanche: the adapter already fetched the pending tx and passes
+  // { to, data }. (This used to ignore them and re-fetch by hash with a
+  // provider that was never supplied, so every Avalanche swap decoded to
+  // nothing.) Falls back to fetching only if just a hash was given.
+  private async decodeFromTx(event: RawChainEvent): Promise<DecodedSwap | null> {
+    const raw = event.raw as { to?: string; data?: string; txHash?: string; hash?: string };
+    if (raw?.to && raw?.data) return this.decodeCalldata('avalanche', raw.to, raw.data, event);
+    const hash = raw?.txHash ?? raw?.hash;
+    if (!this.provider || !hash) return null;
+    const tx = await this.provider.getTransaction(hash).catch(() => null);
+    if (!tx || !tx.to || !tx.data) return null;
+    return this.decodeCalldata('avalanche', tx.to, tx.data, event);
   }
 
-  // Monad's monadLogs feed gives structured log data directly — no extra
-  // RPC round trip needed, this is part of why the speculative feed is
-  // useful, we get everything we need in the push itself.
+  // Monad's monadLogs feed pushes each log ~1s before finalization, with
+  // the data we need already in it -- no extra RPC round trip.
+  //
+  // We decode Swap events from pools we track:
+  //   V2-style (Uniswap V2 / PancakeSwap V2 / LFJ v1): amountXIn / amountXOut
+  //   V3-style (Uniswap V3, PancakeSwap V3): signed amount0 / amount1,
+  //     positive = paid INTO the pool (that's the token going in)
+  // token0 is always the lower address on these DEXes, which tells us which
+  // amount belongs to which token. (This used to be a placeholder that
+  // returned an empty swap, so no Monad trade was ever evaluated.)
   private decodeFromLog(event: RawChainEvent): DecodedSwap | null {
     const raw = event.raw as any;
-    // Real Swap events (Uniswap V2/V3 style) carry token amounts directly
-    // in the log data rather than needing calldata decoding at all.
-    // Placeholder shape — align with actual monadLogs Swap event topic
-    // once we're pointed at real pools.
-    if (!raw?.address || !raw?.data) return null;
+    const log = raw?.log ?? raw; // tolerate either a bare log or { log: ... }
+    const topics: string[] | undefined = log?.topics;
+    const address: string | undefined = log?.address;
+    const data: string | undefined = log?.data;
+    if (!address || !data || !topics?.length) return null;
+
+    const topic0 = topics[0].toLowerCase();
+    if (topic0 !== TOPIC_V2_SWAP && topic0 !== TOPIC_V3_SWAP && topic0 !== TOPIC_PANCAKE_V3_SWAP) return null;
+
+    const pool = this.poolLookup?.('monad', address);
+    if (!pool) return null; // not a pool we track
+
+    const [token0, token1] = pool.tokenA.toLowerCase() < pool.tokenB.toLowerCase()
+      ? [pool.tokenA, pool.tokenB]
+      : [pool.tokenB, pool.tokenA];
+
+    let tokenIn: string, tokenOut: string, amountIn: bigint, amountOut: bigint;
+    try {
+      if (topic0 === TOPIC_V2_SWAP) {
+        const [a0In, a1In, a0Out, a1Out] = abi.decode(['uint256', 'uint256', 'uint256', 'uint256'], data) as unknown as bigint[];
+        if (a0In > 0n) { tokenIn = token0; tokenOut = token1; amountIn = a0In; amountOut = a1Out; }
+        else { tokenIn = token1; tokenOut = token0; amountIn = a1In; amountOut = a0Out; }
+      } else {
+        // V3 and Pancake V3 share the same first two data fields.
+        const [amount0, amount1] = abi.decode(['int256', 'int256'], data.slice(0, 2 + 64 * 2)) as unknown as bigint[];
+        if (amount0 > 0n) { tokenIn = token0; tokenOut = token1; amountIn = amount0; amountOut = -amount1; }
+        else { tokenIn = token1; tokenOut = token0; amountIn = amount1; amountOut = -amount0; }
+      }
+    } catch {
+      return null; // malformed log
+    }
+    if (amountIn <= 0n) return null;
 
     return {
       chain: 'monad',
-      dex: 'unknown', // resolved by looking up raw.address against known pool addresses
-      poolAddress: raw.address,
-      tokenIn: '0x0',
-      tokenOut: '0x0',
-      amountIn: 0n,
+      dex: pool.dex,
+      poolAddress: pool.poolAddress,
+      tokenIn,
+      tokenOut,
+      amountIn,
+      amountOutObserved: amountOut > 0n ? amountOut : undefined,
       stateType: event.stateType,
       detectedAtMs: event.receivedAtMs,
     };
