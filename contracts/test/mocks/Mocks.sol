@@ -1,0 +1,223 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.26;
+
+// ============================================================================
+// TEST MOCKS
+// Minimal stand-ins for real tokens, DEX pools and Aave, just faithful enough
+// to prove ArbExecutor's plumbing and safety checks. They are NOT exact
+// replicas of mainnet contracts -- fork tests against real pools are still
+// required before going live (see contracts/README.md).
+// ============================================================================
+
+contract MockERC20 {
+    string public name;
+    uint8 public immutable decimals;
+    mapping(address => uint256) public balanceOf;
+    mapping(address => mapping(address => uint256)) public allowance;
+
+    constructor(string memory name_, uint8 decimals_) {
+        name = name_;
+        decimals = decimals_;
+    }
+
+    function mint(address to, uint256 amount) external {
+        balanceOf[to] += amount;
+    }
+
+    function transfer(address to, uint256 amount) external returns (bool) {
+        balanceOf[msg.sender] -= amount;
+        balanceOf[to] += amount;
+        return true;
+    }
+
+    function approve(address spender, uint256 amount) external returns (bool) {
+        allowance[msg.sender][spender] = amount;
+        return true;
+    }
+
+    function transferFrom(address from, address to, uint256 amount) external returns (bool) {
+        allowance[from][msg.sender] -= amount;
+        balanceOf[from] -= amount;
+        balanceOf[to] += amount;
+        return true;
+    }
+}
+
+// Uniswap V2 style constant-product pair with K check, like the real thing.
+contract MockV2Pair {
+    address public immutable token0;
+    address public immutable token1;
+    uint112 private reserve0;
+    uint112 private reserve1;
+    uint16 public immutable feeBps;
+
+    constructor(address a, address b, uint16 feeBps_) {
+        (token0, token1) = a < b ? (a, b) : (b, a);
+        feeBps = feeBps_;
+    }
+
+    function getReserves() external view returns (uint112, uint112, uint32) {
+        return (reserve0, reserve1, 0);
+    }
+
+    function sync() public {
+        reserve0 = uint112(MockERC20(token0).balanceOf(address(this)));
+        reserve1 = uint112(MockERC20(token1).balanceOf(address(this)));
+    }
+
+    function swap(uint256 out0, uint256 out1, address to, bytes calldata) external {
+        if (out0 > 0) MockERC20(token0).transfer(to, out0);
+        if (out1 > 0) MockERC20(token1).transfer(to, out1);
+        uint256 b0 = MockERC20(token0).balanceOf(address(this));
+        uint256 b1 = MockERC20(token1).balanceOf(address(this));
+        uint256 in0 = b0 > reserve0 - out0 ? b0 - (reserve0 - out0) : 0;
+        uint256 in1 = b1 > reserve1 - out1 ? b1 - (reserve1 - out1) : 0;
+        // Fee-adjusted K must not decrease (same rule as Uniswap V2).
+        uint256 adj0 = b0 * 10_000 - in0 * feeBps;
+        uint256 adj1 = b1 * 10_000 - in1 * feeBps;
+        require(adj0 * adj1 >= uint256(reserve0) * reserve1 * 1e8, "K");
+        sync();
+    }
+}
+
+// Solidly style pair: quotes its own output via getAmountOut (volatile curve here).
+contract MockSolidlyPair {
+    address public immutable token0;
+    address public immutable token1;
+    uint256 public constant FEE_BPS = 5;
+
+    constructor(address a, address b) {
+        (token0, token1) = a < b ? (a, b) : (b, a);
+    }
+
+    function getAmountOut(uint256 amountIn, address tokenIn) public view returns (uint256) {
+        (uint256 rIn, uint256 rOut) = tokenIn == token0
+            ? (MockERC20(token0).balanceOf(address(this)), MockERC20(token1).balanceOf(address(this)))
+            : (MockERC20(token1).balanceOf(address(this)), MockERC20(token0).balanceOf(address(this)));
+        uint256 inAfterFee = amountIn * (10_000 - FEE_BPS) / 10_000;
+        return inAfterFee * rOut / (rIn + inAfterFee);
+    }
+
+    // Simplified: trusts the caller already sent tokens in (balance-based quote above).
+    function swap(uint256 out0, uint256 out1, address to, bytes calldata) external {
+        if (out0 > 0) MockERC20(token0).transfer(to, out0);
+        if (out1 > 0) MockERC20(token1).transfer(to, out1);
+    }
+}
+
+interface IV3Callback {
+    function uniswapV3SwapCallback(int256, int256, bytes calldata) external;
+    function pancakeV3SwapCallback(int256, int256, bytes calldata) external;
+}
+
+// V3 style pool at a fixed price. Pays out first, then demands payment via
+// the callback and checks it arrived -- the same flow real V3 pools use.
+contract MockV3Pool {
+    address public immutable token0;
+    address public immutable token1;
+    // price of token0 in token1, as num/den
+    uint256 public immutable priceNum;
+    uint256 public immutable priceDen;
+    bool public immutable pancakeStyle;
+
+    constructor(address a, address b, uint256 num, uint256 den, bool pancakeStyle_) {
+        (token0, token1) = a < b ? (a, b) : (b, a);
+        // caller passes price as "a in b"; flip if a ended up as token1
+        if (a < b) { priceNum = num; priceDen = den; } else { priceNum = den; priceDen = num; }
+        pancakeStyle = pancakeStyle_;
+    }
+
+    function swap(address recipient, bool zeroForOne, int256 amountSpecified, uint160, bytes calldata data)
+        external
+        returns (int256 amount0, int256 amount1)
+    {
+        require(amountSpecified > 0, "exact-in only");
+        uint256 amountIn = uint256(amountSpecified);
+        address tokenIn = zeroForOne ? token0 : token1;
+        address tokenOut = zeroForOne ? token1 : token0;
+        uint256 amountOut = zeroForOne ? amountIn * priceNum / priceDen : amountIn * priceDen / priceNum;
+        amountOut = amountOut * 9_970 / 10_000; // 0.30% fee
+
+        uint256 before = MockERC20(tokenIn).balanceOf(address(this));
+        MockERC20(tokenOut).transfer(recipient, amountOut);
+
+        (amount0, amount1) = zeroForOne
+            ? (int256(amountIn), -int256(amountOut))
+            : (-int256(amountOut), int256(amountIn));
+        if (pancakeStyle) IV3Callback(msg.sender).pancakeV3SwapCallback(amount0, amount1, data);
+        else IV3Callback(msg.sender).uniswapV3SwapCallback(amount0, amount1, data);
+
+        require(MockERC20(tokenIn).balanceOf(address(this)) >= before + amountIn, "IIA");
+    }
+}
+
+interface IFlashReceiver {
+    function executeOperation(address, uint256, uint256, address, bytes calldata) external returns (bool);
+}
+
+// Aave V3 flashLoanSimple: lend, call back, pull amount + premium.
+contract MockAavePool {
+    uint256 public constant PREMIUM_BPS = 5;
+
+    function flashLoanSimple(address receiver, address asset, uint256 amount, bytes calldata params, uint16)
+        external
+    {
+        uint256 premium = amount * PREMIUM_BPS / 10_000;
+        MockERC20(asset).transfer(receiver, amount);
+        require(IFlashReceiver(receiver).executeOperation(asset, amount, premium, receiver, params), "callback");
+        MockERC20(asset).transferFrom(receiver, address(this), amount + premium);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ATTACKERS -- used to prove a stolen executor key can't drain the contract.
+// ---------------------------------------------------------------------------
+
+// A fake "V3 pool" that demands far more tokenIn than it was asked to swap,
+// paying out `payout` of the other token -- e.g. take the contract's stored
+// WETH profits while handing back just enough of the trade token to look
+// "profitable".
+contract DrainingV3Pool {
+    address public immutable token0;
+    address public immutable token1;
+    uint256 public immutable demand;
+    uint256 public immutable payout;
+
+    constructor(address a, address b, uint256 demand_, uint256 payout_) {
+        (token0, token1) = a < b ? (a, b) : (b, a);
+        demand = demand_;
+        payout = payout_;
+    }
+
+    function swap(address, bool zeroForOne, int256, uint160, bytes calldata data)
+        external
+        returns (int256, int256)
+    {
+        int256 d = int256(demand);
+        if (zeroForOne) IV3Callback(msg.sender).uniswapV3SwapCallback(d, 0, data);
+        else IV3Callback(msg.sender).uniswapV3SwapCallback(0, d, data);
+        address tokenOut = zeroForOne ? token1 : token0;
+        MockERC20(tokenOut).transfer(msg.sender, payout);
+        return (0, 0);
+    }
+}
+
+// A fake "Aave pool" that swaps in a different route when calling back,
+// and tries to leave itself a big allowance.
+contract EvilFlashPool {
+    bytes public substituteParams;
+
+    function setSubstitute(bytes calldata p) external {
+        substituteParams = p;
+    }
+
+    function flashLoanSimple(address receiver, address asset, uint256 amount, bytes calldata params, uint16)
+        external
+    {
+        bytes memory p = params;
+        if (substituteParams.length > 0) p = substituteParams;
+        MockERC20(asset).transfer(receiver, amount);
+        IFlashReceiver(receiver).executeOperation(asset, amount, type(uint128).max, receiver, p);
+        MockERC20(asset).transferFrom(receiver, address(this), amount);
+    }
+}

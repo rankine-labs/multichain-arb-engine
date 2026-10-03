@@ -1,0 +1,11 @@
+# Foundry config for the on-chain execution contract.
+# Run from this folder:  forge build   /   forge test -vv
+[profile.default]
+src = "src"
+test = "test"
+out = "out"
+libs = ["lib"]
+solc_version = "0.8.26"
+optimizer = true
+optimizer_runs = 1000000   # contract is called constantly, deployed once: optimise for call cost
+evm_version = "shanghai"   # widest support across Avalanche, Monad and Robinhood Chain (no transient storage needed)

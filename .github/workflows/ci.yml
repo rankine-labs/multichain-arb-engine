@@ -34,3 +34,23 @@ jobs:
 
       - name: Tests
         run: npm test
+
+  # Solidity execution contract (contracts/). Separate job so a contract
+  # problem never blocks the bot's own checks, and vice versa.
+  contracts:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: contracts
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: foundry-rs/foundry-toolchain@v1
+
+      - name: Build
+        run: forge build
+
+      - name: Tests
+        run: forge test -vv
