@@ -100,7 +100,12 @@ const amountIn = BigInt(Math.floor((usdSize / usdPerToken) * 1e18));
 const tokenOut = computeAmountOut(buyPool, tokenInIsAOnBuyPool, amountIn);
 if (tokenOut === null || tokenOut <= 0n) continue;
 
-const usdOut = computeAmountOut(sellPool, !tokenInIsAOnBuyPool, tokenOut);
+// The sell pool may list the pair in the opposite order (tokenA/tokenB
+// swapped vs the buy pool), so work out its direction from the actual
+// token addresses instead of assuming both pools share the same order.
+const buyOutToken = (tokenInIsAOnBuyPool ? buyPool.tokenB : buyPool.tokenA).toLowerCase();
+const sellInIsA = sellPool.tokenA.toLowerCase() === buyOutToken;
+const usdOut = computeAmountOut(sellPool, sellInIsA, tokenOut);
 if (usdOut === null || usdOut <= 0n) continue;
 
 const usdOutValue = Number(usdOut) / 1e18 * usdPerToken;

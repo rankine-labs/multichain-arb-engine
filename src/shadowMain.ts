@@ -10,6 +10,7 @@ import { FastFilter } from './core/fastFilter';
 import { PriceOracle } from './core/priceOracle';
 import { findOptimalTradeSize, calculateAllInProfit, buildOpportunity, calculateLiquidityCeiling } from './core/profitCalculator';
 import { scoreOpportunity, shouldPreArm } from './core/opportunityScorer';
+import { planBackrun } from './core/backrunPlanner';
 import { seedKnownAddresses } from './config/knownAddresses';
 import { ethers as ethersV5 } from 'ethers-v5';
 import { MONAD_KURU, MONAD_ROUTERS, MONAD_TOKENS, MONAD_BEAN, MONAD_LFJ, MONAD_PANCAKE, ROBINHOOD_PANCAKE, ROBINHOOD_V2, ROBINHOOD_V3, ROBINHOOD_V4, ROBINHOOD_TOKENS } from './config/knownAddresses';
@@ -309,29 +310,22 @@ if (registerIfApproved('avalanche', entry.dex, resolved)) pool = resolved;
             }
       }
 
-const tokenInIsA = swap.tokenIn.toLowerCase() === pool.tokenA.toLowerCase();
-
 const usdPerToken = priceOracle.getUsdPrice(swap.chain, swap.tokenIn);
 if (usdPerToken === null) return;
 
-const liquidityCeiling = calculateLiquidityCeiling(pool, sellPool, usdPerToken);
-if (liquidityCeiling <= 0) return;
-
-const sizing = findOptimalTradeSize(
-pool, sellPool, cache, tokenInIsA,
-liquidityCeiling,
-usdPerToken,
-);
-
-if (sizing.grossProfitUsd <= 0) return;
-
-const profit = calculateAllInProfit(sizing, {
+// Predict the price AFTER this pending swap lands, then size the arb
+// against that future price (not today's). See core/backrunPlanner.ts.
+const plan = planBackrun(cache, pool, sellPool, swap, usdPerToken, {
 gasPriceUsd: 2,
-dexFeeBps: { buy: pool.feeBps, sell: sellPool.feeBps },
+dexFeeBps: { buy: pool.feeBps, sell: sellPool.feeBps }, // overwritten per direction inside planBackrun
 flashLoanFeeBps: 9,
 usingFlashLoan: true,
 safetyMarginPct: 0.15,
 });
+if (!plan) return;
+const { sizing, profit } = plan;
+const buyPoolUsed = plan.buyPool;
+const sellPoolUsed = plan.sellPool;
 
 const score = scoreOpportunity({
 conservativeNetProfitUsd: profit.conservativeNetProfitUsd,
@@ -341,7 +335,7 @@ chain: swap.chain,
 
 const opportunity = buildOpportunity(
 swap.chain, [swap.tokenIn, swap.tokenOut],
-pool.dex, pool.poolAddress, sellPool.dex, sellPool.poolAddress,
+buyPoolUsed.dex, buyPoolUsed.poolAddress, sellPoolUsed.dex, sellPoolUsed.poolAddress,
 sizing, profit, event, score,
 );
 
@@ -366,15 +360,15 @@ shadowLogger.record({ opportunity, outcome: 'SKIPPED_BELOW_MIN_PROFIT', ourHypot
                       }
                       return null;
               };
-              const buyPrice = priceOf(pool);
-              const sellPrice = priceOf(sellPool);
+              const buyPrice = priceOf(buyPoolUsed); // predicted price if the guess was used
+              const sellPrice = priceOf(sellPoolUsed);
               if (buyPrice !== null && sellPrice !== null && buyPrice > 0) {
                       const spreadPct = ((sellPrice - buyPrice) / buyPrice) * 100;
                       await sendTelegramMessage(formatSkippedOpportunity({
                               chain: swap.chain,
         pair: `${symbolOf(swap.chain, swap.tokenIn)}/${symbolOf(swap.chain, swap.tokenOut)}`,
-                              buyDex: pool.dex,
-                              sellDex: sellPool.dex,
+                              buyDex: buyPoolUsed.dex,
+                              sellDex: sellPoolUsed.dex,
                               buyPrice,
                               sellPrice,
                               spreadPct,
@@ -393,10 +387,14 @@ return;
 }
 
 shadowLogger.record({ opportunity, outcome: 'UNRESOLVED', ourHypotheticalReactionMs: reactionMs });
-      scheduleOutcomeCheck(opportunity, pool, sellPool);
+      scheduleOutcomeCheck(
+            opportunity,
+            buyPoolUsed.poolAddress === pool.poolAddress ? pool : sellPool,
+            sellPoolUsed.poolAddress === pool.poolAddress ? pool : sellPool,
+      );
 
 console.log(
-`[opportunity] ${swap.chain} score=${score} net=$${profit.conservativeNetProfitUsd.toFixed(2)} ` +
+`[opportunity] ${swap.chain} predicted=${plan.usedPrediction} score=${score} net=$${profit.conservativeNetProfitUsd.toFixed(2)} ` +
 `reaction=${reactionMs}ms`,
 );
 });
@@ -661,7 +659,6 @@ const decA = decimalsOf(p.chain, p.tokenA);
                   const MIN_RESERVE_UNITS = 0.01;
                   if (adjA < MIN_RESERVE_UNITS || adjB < MIN_RESERVE_UNITS) return null;
                   return adjB / adjA;
-            }
             }
             return null;
       };
