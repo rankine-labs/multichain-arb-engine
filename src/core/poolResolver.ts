@@ -211,14 +211,18 @@ export async function resolveAndFetchLBPool(
 const V3_FACTORY_ABI = [
     'function getPool(address tokenA, address tokenB, uint24 fee) view returns (address pool)',
   ];
+// slot0: only the first two fields are read. Forks differ after that
+// (PancakeSwap V3's feeProtocol is uint32, Ramses V3 adds fields), and
+// decoding Uniswap's exact layout made those pools fail silently.
 const V3_POOL_ABI = [
-    'function slot0() view returns (uint160 sqrtPriceX96, int24 tick, uint16 observationIndex, uint16 observationCardinality, uint16 observationCardinalityNext, uint8 feeProtocol, bool unlocked)',
+    'function slot0() view returns (uint160 sqrtPriceX96, int24 tick)',
     'function liquidity() view returns (uint128)',
     'function token0() view returns (address)',
     'function token1() view returns (address)',
   ];
 
-const STANDARD_V3_FEE_TIERS = [500, 3000, 10000, 100];
+// 2500 = PancakeSwap V3's main tier (was missing, so those pools were never found).
+const STANDARD_V3_FEE_TIERS = [500, 3000, 2500, 10000, 100];
 
 export async function resolveAndFetchV3Pool(
     provider: ethers.JsonRpcProvider,
@@ -273,6 +277,65 @@ export async function resolveAndFetchV3Pool(
     } catch {
           return null;
     }
+}
+
+// ============================================================================
+// ALL V3 POOLS FOR A PAIR ON ONE VENUE
+//
+// The same pair often trades in several fee tiers on one DEX (0.05%, 0.3%,
+// 1%), and those tiers are separate pools that can be arbed against each
+// other. resolveAndFetchV3Pool above returns only the first; this returns
+// every one with liquidity.
+//
+// mode 'fee':     factory.getPool(a, b, uint24 fee)          (Uniswap, PancakeSwap)
+// mode 'spacing': factory.getPool(a, b, int24 tickSpacing)    (Ramses V3 --
+//                 confirmed by the live probe: its fee lookups return nothing)
+//   In 'spacing' mode the fee is read from the pool itself.
+// ============================================================================
+
+const V3_FEE_TIERS_ALL = [100, 500, 2500, 3000, 10000];
+const V3_TICK_SPACINGS = [1, 5, 10, 50, 100, 200];
+const V3_FACTORY_BY_SPACING_ABI = ['function getPool(address tokenA, address tokenB, int24 tickSpacing) view returns (address pool)'];
+const V3_POOL_FEE_ABI = ['function fee() view returns (uint24)'];
+
+export async function resolveAllV3Pools(
+    provider: ethers.JsonRpcProvider,
+    chain: ChainName,
+    dex: string,
+    factoryAddress: string,
+    tokenA: string,
+    tokenB: string,
+    mode: 'fee' | 'spacing' = 'fee',
+  ): Promise<PoolState[]> {
+    const factory = new ethers.Contract(factoryAddress, mode === 'fee' ? V3_FACTORY_ABI : V3_FACTORY_BY_SPACING_ABI, provider);
+    const keys = mode === 'fee' ? V3_FEE_TIERS_ALL : V3_TICK_SPACINGS;
+
+    const found = await Promise.all(keys.map(async (k) => {
+      try {
+        const poolAddress: string = await factory.getPool(tokenA, tokenB, k);
+        if (!poolAddress || poolAddress === ethers.ZeroAddress) return null;
+        const pool = new ethers.Contract(poolAddress, [...V3_POOL_ABI, ...V3_POOL_FEE_ABI], provider);
+        const [slot0, liquidity, token0, token1, fee] = await Promise.all([
+          pool.slot0(), pool.liquidity(), pool.token0(), pool.token1(),
+          mode === 'fee' ? Promise.resolve(k) : pool.fee(),
+        ]);
+        if ((liquidity as bigint) === 0n) return null;
+        const state: PoolState = {
+          chain, dex, poolAddress,
+          poolType: 'v3',
+          tokenA: token0, tokenB: token1,
+          sqrtPriceX96: slot0[0] as bigint,
+          liquidity: liquidity as bigint,
+          feeBps: Math.round(Number(fee) / 100),
+          lastUpdatedBlock: 0,
+          lastUpdatedMs: Date.now(),
+        };
+        return state;
+      } catch {
+        return null; // no pool at this tier, or not a pool we can read
+      }
+    }));
+    return found.filter((p): p is PoolState => p !== null);
 }
 
 // ============================================================================

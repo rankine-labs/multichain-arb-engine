@@ -93,11 +93,12 @@ const UR_V2_SWAP_EXACT_IN = 0x08;
 const UR_CONTRACT_BALANCE = 1n << 255n;
 
 // First pool hop of a V3 packed path: tokenIn (20 bytes) + fee (3) + next token (20).
-function firstV3Hop(path: string): { tokenIn: string; tokenOut: string } | null {
+function firstV3Hop(path: string): { tokenIn: string; tokenOut: string; fee: number } | null {
   const hex = path.startsWith('0x') ? path.slice(2) : path;
   if (hex.length < (20 + 3 + 20) * 2) return null;
   return {
     tokenIn: ethers.getAddress('0x' + hex.slice(0, 40)),
+    fee: parseInt(hex.slice(40, 46), 16),
     tokenOut: ethers.getAddress('0x' + hex.slice(46, 86)),
   };
 }
@@ -241,7 +242,7 @@ export class TransactionDecoder {
   // Builds the swap; `via` = the registry router whose factory should be used.
   private swapOf(
     chain: ChainName, via: string | undefined, tokenIn: string, tokenOut: string,
-    amountIn: bigint, event: RawChainEvent,
+    amountIn: bigint, event: RawChainEvent, feeTier?: number,
   ): DecodedSwap | null {
     if (!via || amountIn <= 0n || amountIn >= UR_CONTRACT_BALANCE) return null;
     const viaEntry = this.registry[chain][via.toLowerCase()];
@@ -253,6 +254,7 @@ export class TransactionDecoder {
       tokenIn,
       tokenOut,
       amountIn,
+      feeTier,
       stateType: event.stateType,
       detectedAtMs: event.receivedAtMs,
     };
@@ -294,7 +296,7 @@ export class TransactionDecoder {
           if (cmd === UR_V3_SWAP_EXACT_IN) {
             const [, amountIn, , path] = coder.decode(['address', 'uint256', 'uint256', 'bytes', 'bool'], inputs[i]);
             const hop = firstV3Hop(path as string);
-            const swap = hop && this.swapOf(chain, entry.v3Via, hop.tokenIn, hop.tokenOut, amountIn as bigint, event);
+            const swap = hop && this.swapOf(chain, entry.v3Via, hop.tokenIn, hop.tokenOut, amountIn as bigint, event, hop.fee);
             if (swap) return swap;
           } else if (cmd === UR_V2_SWAP_EXACT_IN) {
             const [, amountIn, , path] = coder.decode(['address', 'uint256', 'uint256', 'address[]', 'bool'], inputs[i]);
@@ -335,12 +337,12 @@ export class TransactionDecoder {
     const params = a[0];
     if (!params) return null;
     if (parsed.name === 'exactInputSingle') {
-      return this.swapOf(chain, to, params.tokenIn, params.tokenOut, BigInt(params.amountIn ?? 0), event);
+      return this.swapOf(chain, to, params.tokenIn, params.tokenOut, BigInt(params.amountIn ?? 0), event, Number(params.fee));
     }
     if (parsed.name === 'exactInput') {
       // Multi-hop: decode the packed path. (Previously returned no tokens.)
       const hop = firstV3Hop(params.path);
-      return hop ? this.swapOf(chain, to, hop.tokenIn, hop.tokenOut, BigInt(params.amountIn ?? 0), event) : null;
+      return hop ? this.swapOf(chain, to, hop.tokenIn, hop.tokenOut, BigInt(params.amountIn ?? 0), event, hop.fee) : null;
     }
     return null;
   }

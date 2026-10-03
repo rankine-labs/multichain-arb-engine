@@ -52,6 +52,7 @@ import { MonadAdapter } from './chains/monad';
 import { AvalancheAdapter } from './chains/avalanche';
 import { RawChainEvent } from './core/types';
 import { priceOf, spreadPct } from './core/poolPrice';
+import { PairWatcher, Venue, refreshPoolState } from './core/pairWatcher';
 import { buildExecuteCall, executionRequested, executorConfig, pickV3Lender } from './execution/executorCalldata';
 import { makeRpc, simulateRoundTrip, simRpcUrl, Rpc } from './execution/simulator';
 
@@ -104,7 +105,7 @@ robinhood: {
 chain: 'robinhood',
 minLiquidityUsd: 25_000,
 minRecent24hVolumeUsd: 10_000,
-        approvedDexes: new Set(['arcus', 'uniswap-v2', 'uniswap-v3', 'pleiades', 'pancakeswap-v2', 'pancakeswap-v3']),
+        approvedDexes: new Set(['arcus', 'uniswap-v2', 'uniswap-v3', 'pleiades', 'pancakeswap-v2', 'pancakeswap-v3', 'ramses-v2', 'ramses-v3']),
 },
 };
 
@@ -297,6 +298,43 @@ const queueSimulation = (
       }, SIM_DELAY_MS[chain]);
 };
 
+// ==========================================================================
+// ROBINHOOD PAIR WATCHER -- follows live traffic (see core/pairWatcher.ts)
+// Every DEX + fee tier on Robinhood that the contract can trade.
+// ==========================================================================
+const ROBINHOOD_VENUES: Venue[] = [
+      { dex: 'uniswap-v2', kind: 'v2', factory: ROBINHOOD_V2.FACTORY, feeBps: 30 },
+      { dex: 'pancakeswap-v2', kind: 'v2', factory: ROBINHOOD_PANCAKE.V2_FACTORY, feeBps: 25 },
+      { dex: 'uniswap-v3', kind: 'v3-fee', factory: ROBINHOOD_V3.FACTORY },
+      { dex: 'pancakeswap-v3', kind: 'v3-fee', factory: ROBINHOOD_PANCAKE.V3_FACTORY },
+      { dex: 'ramses-v2', kind: 'solidly', factory: ROBINHOOD_RAMSES.V2_FACTORY, feeBps: 20 },
+      { dex: 'ramses-v3', kind: 'v3-spacing', factory: ROBINHOOD_RAMSES.V3_FACTORY },
+];
+const robinhoodWatcher = new PairWatcher('robinhood', robinhoodReadProvider, ROBINHOOD_VENUES, cache,
+      // Real decimals/symbols for every discovered token, read from the token itself.
+      (addr, meta) => {
+            (TOKEN_DECIMALS.robinhood ??= {})[addr] = meta.decimals;
+            (TOKEN_SYMBOLS.robinhood ??= {})[addr] = meta.symbol;
+      },
+      { maxPairs: 40, rediscoverMs: 10 * 60_000, refreshMs: 30_000 });
+
+// Re-read a pool's live price right before using it (skips pools we can't
+// refresh this way: Uniswap V4, order books, bin pools). Never waits more
+// than REFRESH_TIMEOUT_MS; falls back to the cached state.
+const READ_PROVIDER: Record<string, ethers.JsonRpcProvider> = {
+      avalanche: avalancheReadProvider, monad: monadReadProvider, robinhood: robinhoodReadProvider,
+};
+const REFRESH_TIMEOUT_MS = 1_500;
+const refreshNow = async (p: any): Promise<any> => {
+      if (p.dex === 'uniswap-v4' || p.poolType === 'orderbook' || p.dex.includes('lb') || p.dex === 'bean-exchange') return p;
+      const fresh = await Promise.race([
+            refreshPoolState(READ_PROVIDER[p.chain], p),
+            new Promise<null>((r) => setTimeout(() => r(null), REFRESH_TIMEOUT_MS)),
+      ]);
+      if (fresh) { cache.upsert(fresh); return fresh; }
+      return p;
+};
+
 chainManager.register(new RobinhoodChainAdapter());
 chainManager.register(new MonadAdapter());
 chainManager.register(new AvalancheAdapter());
@@ -307,11 +345,24 @@ const t0 = Date.now();
 const swap = await decoder.decode(event);
 if (!swap) return;
 
+// Follow the traffic: make sure every pool for this pair is being watched.
+if (swap.chain === 'robinhood') robinhoodWatcher.touch(swap.tokenIn, swap.tokenOut);
+
 // NOTE: the fast filter runs AFTER pool lookup (below), not here. For
 // router-based chains swap.poolAddress is the ROUTER, which is never in the
 // cache, so filtering first rejected every single swap as "pool not
 // tracked" before the real pool could be looked up.
 let pool = cache.get(swap.chain, swap.poolAddress);
+
+    // Router-based swaps: first look for the EXACT pool the trade used
+    // (same DEX, and same fee tier when the calldata tells us), among pools
+    // we already watch -- instead of any tier of the pair.
+    if (!pool) {
+          const viaEntry = routerRegistry[swap.chain]?.[swap.poolAddress.toLowerCase()];
+          const wantFeeBps = swap.feeTier !== undefined ? Math.round(swap.feeTier / 100) : undefined;
+          pool = cache.findPeerPools(swap.chain, swap.tokenIn, swap.tokenOut, '').find((p) =>
+                p.dex === (viaEntry?.dex ?? swap.dex) && (wantFeeBps === undefined || p.feeBps === wantFeeBps));
+    }
 
     // Just-in-time pool discovery: swap.poolAddress is the ROUTER address
     // (routers proxy to many pools, see decoder.ts). If we haven't cached
@@ -387,9 +438,12 @@ if (registerIfApproved('avalanche', entry.dex, resolved)) pool = resolved;
     const filterResult = filter.evaluate({ ...swap, poolAddress: pool.poolAddress });
     if (!filterResult.pass) return;
 
-    const peers = cache.findPeerPools(swap.chain, swap.tokenIn, swap.tokenOut, pool.poolAddress);
-    if (peers.length === 0) return;
-    const sellPool = peers[0];
+    // Fresh prices at decision time: re-read the traded pool and EVERY
+    // partner pool now, in parallel (cached prices can be up to 30s old).
+    const cachedPeers = cache.findPeerPools(swap.chain, swap.tokenIn, swap.tokenOut, pool.poolAddress);
+    if (cachedPeers.length === 0) return;
+    const [freshPool, ...peers] = await Promise.all([refreshNow(pool), ...cachedPeers.map(refreshNow)]);
+    pool = freshPool;
 
       // Record this real, genuine match for the hourly proof-of-activity
       // report -- happens for every real peer match found, independent
@@ -398,7 +452,17 @@ if (registerIfApproved('avalanche', entry.dex, resolved)) pool = resolved;
       // and dust pools excluded, and oriented the same way even if the two
       // pools list the pair in opposite order (see core/poolPrice.ts).
       const matchBuyPrice = priceOf(pool, swap.tokenIn, decimalsOf);
-      const matchSellPrice = priceOf(sellPool, swap.tokenIn, decimalsOf);
+      // Partner with the widest gap to the traded pool.
+      let sellPool = peers[0];
+      let matchSellPrice: number | null = null;
+      for (const peer of peers) {
+            const pp = priceOf(peer, swap.tokenIn, decimalsOf);
+            if (pp === null || matchBuyPrice === null) continue;
+            if (matchSellPrice === null || spreadPct(matchBuyPrice, pp) > spreadPct(matchBuyPrice, matchSellPrice)) {
+                  matchSellPrice = pp;
+                  sellPool = peer;
+            }
+      }
       if (matchBuyPrice !== null && matchSellPrice !== null) {
             const matchSpreadPct = spreadPct(matchBuyPrice, matchSellPrice);
             const matchPairLabel = `${symbolOf(swap.chain, pool.tokenA)}/${symbolOf(swap.chain, pool.tokenB)}`;
@@ -422,13 +486,18 @@ if (usdPerToken === null) return;
 
 // Predict the price AFTER this pending swap lands, then size the arb
 // against that future price (not today's). See core/backrunPlanner.ts.
-const plan = planBackrun(cache, pool, sellPool, swap, usdPerToken, {
-gasPriceUsd: 2,
-dexFeeBps: { buy: pool.feeBps, sell: sellPool.feeBps }, // overwritten per direction inside planBackrun
-flashLoanFeeBps: 9,
-usingFlashLoan: true,
-safetyMarginPct: 0.15,
-}, decimalsOf(swap.chain, swap.tokenIn));
+// Plan against EVERY partner pool and keep the best (used to try only the first).
+let plan: ReturnType<typeof planBackrun> = null;
+for (const peer of peers) {
+      const candidate = planBackrun(cache, pool, peer, swap, usdPerToken, {
+            gasPriceUsd: 2,
+            dexFeeBps: { buy: pool.feeBps, sell: peer.feeBps }, // overwritten per direction inside planBackrun
+            flashLoanFeeBps: 9,
+            usingFlashLoan: true,
+            safetyMarginPct: 0.15,
+      }, decimalsOf(swap.chain, swap.tokenIn));
+      if (candidate && (!plan || candidate.profit.conservativeNetProfitUsd > plan.profit.conservativeNetProfitUsd)) plan = candidate;
+}
 if (!plan) return;
 const { sizing, profit } = plan;
 const buyPoolUsed = plan.buyPool;
@@ -497,8 +566,8 @@ return;
 shadowLogger.record({ opportunity, outcome: 'UNRESOLVED', ourHypotheticalReactionMs: reactionMs });
       scheduleOutcomeCheck(
             opportunity,
-            buyPoolUsed.poolAddress === pool.poolAddress ? pool : sellPool,
-            sellPoolUsed.poolAddress === pool.poolAddress ? pool : sellPool,
+            cache.get(swap.chain, buyPoolUsed.poolAddress) ?? buyPoolUsed,
+            cache.get(swap.chain, sellPoolUsed.poolAddress) ?? sellPoolUsed,
       );
 
 console.log(
@@ -601,29 +670,12 @@ await chainManager.startAll();
       await seedMonadV3Peer();
       setInterval(seedMonadV3Peer, 30_000);
 
-      const seedRobinhoodV2Peer = async () => {
-            const resolved = await resolveAndFetchV2Pool(
-                  robinhoodReadProvider, 'robinhood', 'uniswap-v2', ROBINHOOD_V2.FACTORY,
-                  ROBINHOOD_TOKENS.WETH, ROBINHOOD_TOKENS.USDG, 30,
-                  );
-            if (resolved) cache.upsert(resolved);
-      };
-      await seedRobinhoodV2Peer();
-      setInterval(seedRobinhoodV2Peer, 30_000);
-
-      // Ramses is a Solidly-style fork -- confirmed live tonight that its
-      // factory needs the extra "stable" flag standard Uniswap-style
-      // factories don't have. WETH/USDG resolved and read real reserves
-      // successfully before this was wired in here.
-      const seedRobinhoodRamsesPeer = async () => {
-            const resolved = await resolveAndFetchSolidlyV2Pool(
-                  robinhoodReadProvider, 'robinhood', 'ramses-v2', ROBINHOOD_RAMSES.V2_FACTORY,
-                  ROBINHOOD_TOKENS.WETH, ROBINHOOD_TOKENS.USDG, false, 20,
-                  );
-            if (resolved) cache.upsert(resolved);
-      };
-      await seedRobinhoodRamsesPeer();
-      setInterval(seedRobinhoodRamsesPeer, 30_000);
+      // Robinhood partner pools: every DEX + fee tier for WETH/USDG from the
+      // start (replaces the old single Uniswap V2 + Ramses V2 seeds); other
+      // pairs are added automatically as they trade (core/pairWatcher.ts).
+      const wethUsdgPools = await robinhoodWatcher.watch(ROBINHOOD_TOKENS.WETH, ROBINHOOD_TOKENS.USDG);
+      console.log(`[pairs] robinhood WETH/USDG: ${wethUsdgPools} pools found at startup`);
+      robinhoodWatcher.start();
 
       // Proactively checks known, real multi-DEX pairs directly on a
       // timer, instead of waiting for real swap traffic to happen to

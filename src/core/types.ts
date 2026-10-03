@@ -27,6 +27,9 @@ export interface DecodedSwap {
   amountIn: bigint;
   // undefined until we predict it — Robinhood's feed never includes a result
   amountOutObserved?: bigint;
+  // V3 fee tier from the calldata (e.g. 500 = 0.05%), when known. Lets the
+  // bot find the exact pool the trade used, not just any tier of the pair.
+  feeTier?: number;
   stateType: StateType;
   detectedAtMs: number;
 }
