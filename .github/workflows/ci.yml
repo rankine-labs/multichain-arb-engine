@@ -34,3 +34,50 @@ jobs:
 
       - name: Tests
         run: npm test
+
+  # Solidity execution contract (contracts/). Separate job so a contract
+  # problem never blocks the bot's own checks, and vice versa.
+  contracts:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: contracts
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: foundry-rs/foundry-toolchain@v1
+
+      - name: Build
+        run: forge build
+
+      - name: Unit tests (mocks)
+        run: forge test -vv --no-match-path "test/Fork.t.sol"
+
+      # Real-pool tests on copies of live mainnet state. Public RPCs, no keys.
+      # These hit live networks, so a flaky RPC can fail them; re-run if so.
+      # Also republishes the key result lines as one annotation, so the
+      # outcome is readable from the PR's checks without opening raw logs.
+      - name: Fork tests (real pools)
+        shell: bash
+        run: |
+          set +e
+          status=0
+          # One run per chain, each pointed at its own RPC so Foundry picks
+          # that chain's EVM flavour (required for Monad).
+          for pair in "AvalancheForkTest:$AVALANCHE_RPC_URL" "MonadForkTest:$MONAD_RPC_URL" "RobinhoodForkTest:$ROBINHOOD_RPC_URL"; do
+            name="${pair%%:*}"; url="${pair#*:}"
+            echo "=== $name" | tee -a fork-output.txt
+            FOUNDRY_PROFILE=fork forge test -vvv --match-path "test/Fork.t.sol" --match-contract "$name" --fork-url "$url" 2>&1 | tee -a fork-output.txt
+            [ "${PIPESTATUS[0]}" -ne 0 ] && status=1
+          done
+          summary=$(grep -E "^===|\[(PASS|FAIL|SKIP)|->|pool |skipped|Revert|^\s+0x[0-9a-f]{8}|Suite result|Error" fork-output.txt | head -60)
+          summary="${summary//'%'/'%25'}"
+          summary="${summary//$'\n'/'%0A'}"
+          echo "::notice title=Fork test results::${summary}"
+          exit $status
+        env:
+          AVALANCHE_RPC_URL: https://api.avax.network/ext/bc/C/rpc
+          MONAD_RPC_URL: https://rpc.monad.xyz
+          ROBINHOOD_RPC_URL: https://rpc.mainnet.chain.robinhood.com

@@ -11,3 +11,6 @@ node_modules/
 # Auto-deploy logs and lock (server only)
 deploy/*.log
 deploy/*.lock
+# Foundry build output
+contracts/out/
+contracts/cache/
