@@ -67,7 +67,7 @@ jobs:
         if: inputs.only == 'backtest'
         shell: bash
         run: |
-          out=$(timeout 2700 node --max-old-space-size=12000 .scripts-build/scripts/backtest-robinhood.js 2>&1 | tail -60 || true)
+          out=$(timeout 5400 node --max-old-space-size=12000 .scripts-build/scripts/backtest-robinhood.js 2>&1 | tail -60 || true)
           echo "$out"
           out="${out//'%'/'%25'}"; out="${out//$'\n'/'%0A'}"
           echo "::notice title=Backtest::${out}"

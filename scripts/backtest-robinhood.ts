@@ -92,7 +92,12 @@ async function main() {
   const kindOf = new Map(pools.map((p) => [p.address, p.kind]));
   const events: BtEvent[] = [];
   let rawCount = 0, lastNote = Date.now();
-  await getLogsAdaptive(provider, pools.map((p) => p.address), fromBlock, latest, (ls) => {
+  // 4 block ranges downloaded in parallel (each splits itself further if the node refuses).
+  const STREAMS = 4;
+  const span = Math.ceil((latest - fromBlock + 1) / STREAMS);
+  await Promise.all(Array.from({ length: STREAMS }, (_, i) => {
+    const a = fromBlock + i * span, b = Math.min(latest, a + span - 1);
+    return getLogsAdaptive(provider, pools.map((p) => p.address), a, b, (ls) => {
     rawCount += ls.length;
     for (const l of ls) {
       const pool = lc(l.address ?? '');
@@ -103,7 +108,8 @@ async function main() {
         txHash: l.transactionHash ? lc(l.transactionHash) : undefined, txIndex: l.transactionIndex !== undefined ? Number(l.transactionIndex) : undefined });
     }
     if (Date.now() - lastNote > 60_000) { lastNote = Date.now(); say(`[bt] ...${rawCount} events so far`); }
-  });
+    });
+  }));
   say(`[bt] ${rawCount} pool events fetched, ${events.length} price updates (${Math.round((Date.now() - t0) / 1000)}s)`);
 
   // 6) Replay in order.
