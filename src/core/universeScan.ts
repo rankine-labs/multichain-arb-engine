@@ -111,7 +111,7 @@ export async function makeCaller(provider: ethers.JsonRpcProvider): Promise<{ ca
   };
 
   if (multicall) {
-    const CHUNK = 150;
+    const CHUNK = 400; // reads per request; a failed batch falls back to single calls
     const callMany: CallMany = async (calls) => {
       const out: (string | null)[] = new Array(calls.length).fill(null);
       for (let i = 0; i < calls.length; i += CHUNK) {
@@ -155,7 +155,7 @@ const decodeUint = (ret: string | null): bigint | null => {
 // ----------------------------------------------------------------------------
 // V2 / Solidly: walk allPairs(0..n-1), then read token0/token1 (and stable()).
 // ----------------------------------------------------------------------------
-export async function listV2Pools(provider: ethers.JsonRpcProvider, callMany: CallMany, f: ScanFactory, maxPairs = 20_000): Promise<ScannedPool[]> {
+export async function listV2Pools(provider: ethers.JsonRpcProvider, callMany: CallMany, f: ScanFactory, maxPairs = 250_000): Promise<ScannedPool[]> {
   const lenRaw = await provider.call({ to: f.factory, data: v2f.encodeFunctionData('allPairsLength') });
   const n = Math.min(Number(decodeUint(lenRaw) ?? 0n), maxPairs);
   if (n === 0) return [];
@@ -217,7 +217,8 @@ export async function getLogsAdaptive(
     const mid = Math.floor((from + to) / 2);
     const left = await getLogsAdaptive(provider, address, from, mid, depth + 1);
     const right = await getLogsAdaptive(provider, address, mid + 1, to, depth + 1);
-    return left.concat(right);
+    for (const l of right) left.push(l); // no spread: arrays can be very large
+    return left;
   }
 }
 
@@ -332,7 +333,7 @@ export async function scanUniverse(provider: ethers.JsonRpcProvider, factories: 
     try {
       const found = f.kind === 'v3' ? await listV3Pools(provider, f, latest) : await listV2Pools(provider, callMany, f);
       poolsPerDex[f.dex] = found.length;
-      all.push(...found);
+      for (const p of found) all.push(p); // (spread would overflow the stack on 100k+ pools)
       log(`[scan] ${f.dex}: ${found.length} pools`);
     } catch (err) {
       poolsPerDex[f.dex] = -1;
