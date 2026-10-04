@@ -275,13 +275,17 @@ export function addPoolsToState(state: ScanState, f: ScanFactory, pools: Scanned
 // Pricing (pure, unit-tested).
 //
 // Rough by design -- this only decides WHICH pairs are worth watching; the
-// bot re-reads exact prices before any decision.
-//   usdToken      = $1
-//   wrappedNative = price from its deepest pool against usdToken
-//   any other token = price from its deepest pool against usdToken or
-//                     wrappedNative (balance ratio; exact for V2, approximate
-//                     for V3)
-// Pool value = sum of priced sides; if only one side is priced, double it.
+// bot re-reads exact prices before any decision. But it must never be
+// fooled by junk pools, so:
+//   - prices come ONLY from V2-style pools, where the balance ratio IS the
+//     price. A V3 pool's balances say nothing about price (liquidity can sit
+//     entirely on one side), so a memecoin's V3 pool holding 10 WETH and
+//     1 token would otherwise price that token at 10 ETH.
+//       usdToken      = $1
+//       wrappedNative = deepest V2 pool vs usdToken (V3 only if no V2 exists)
+//       other tokens  = deepest V2 pool vs usdToken or wrappedNative
+//   - a pool is worth 2 x its SMALLER priced side (one side priced: 2 x it).
+//     Conservative: a pool stuffed with a worthless token isn't "deep".
 // ----------------------------------------------------------------------------
 const lc = (a: string) => a.toLowerCase();
 const units = (v: bigint | undefined, dec: number) => (v === undefined ? 0 : Number(ethers.formatUnits(v, dec)));
@@ -292,14 +296,15 @@ export function derivePrices(pools: ScannedPool[], decimals: Map<string, number>
   const dec = (t: string) => decimals.get(lc(t));
 
   // Best (deepest quote side) pool per token against a priced quote token.
-  const priceAgainst = (quote: string) => {
+  const priceAgainst = (quote: string, allowV3: boolean, only?: string) => {
     const best = new Map<string, { quoteAmt: number; px: number }>();
     for (const p of pools) {
       if (p.stable) continue;
+      if (p.kind === 'v3' && !allowV3) continue;
       const t0 = lc(p.token0), t1 = lc(p.token1);
       if (t0 !== quote && t1 !== quote) continue;
       const other = t0 === quote ? t1 : t0;
-      if (price.has(other)) continue;
+      if (price.has(other) || (only && other !== only)) continue;
       const dq = dec(quote), dt = dec(other);
       if (dq === undefined || dt === undefined) continue;
       const qAmt = units(t0 === quote ? p.bal0 : p.bal1, dq);
@@ -312,8 +317,9 @@ export function derivePrices(pools: ScannedPool[], decimals: Map<string, number>
     for (const [t, v] of best) if (!price.has(t)) price.set(t, v.px);
   };
 
-  priceAgainst(usd);                 // wrapped native (and others) vs the stablecoin
-  if (price.has(wn)) priceAgainst(wn); // everything else vs wrapped native
+  priceAgainst(usd, false);                              // V2 pools vs the stablecoin (incl. wrapped native)
+  if (!price.has(wn)) priceAgainst(usd, true, wn);       // wrapped native from V3 only if no V2 pool exists
+  if (price.has(wn)) priceAgainst(wn, false);            // everything else vs wrapped native (V2 only)
   return price;
 }
 
@@ -322,7 +328,7 @@ export function poolUsd(p: ScannedPool, decimals: Map<string, number>, price: Ma
   const p0 = price.get(lc(p.token0)), p1 = price.get(lc(p.token1));
   const v0 = p0 !== undefined && d0 !== undefined ? units(p.bal0, d0) * p0 : undefined;
   const v1 = p1 !== undefined && d1 !== undefined ? units(p.bal1, d1) * p1 : undefined;
-  if (v0 !== undefined && v1 !== undefined) return v0 + v1;
+  if (v0 !== undefined && v1 !== undefined) return 2 * Math.min(v0, v1);
   if (v0 !== undefined) return v0 * 2;
   if (v1 !== undefined) return v1 * 2;
   return 0;

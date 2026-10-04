@@ -45,7 +45,7 @@ assert(decodePoolCreatedLog({ topics: ['0x' + '33'.repeat(32), '0x' + 'ff'.repea
 
 // ---- pricing ----------------------------------------------------------------
 const USDG = A(10), WETH = A(11), TOK = A(12), OTHER = A(13), JUNK = A(14);
-const dec = new Map([[USDG, 6], [WETH, 18], [TOK, 18], [OTHER, 9]].map(([a, d]) => [String(a).toLowerCase(), d as number]));
+const dec = new Map([[USDG, 6], [WETH, 18], [TOK, 18], [OTHER, 9], [A(15), 18]].map(([a, d]) => [String(a).toLowerCase(), d as number]));
 const e18 = (n: number) => ethers.parseUnits(String(n), 18);
 const e6 = (n: number) => ethers.parseUnits(String(n), 6);
 const pools: ScannedPool[] = [
@@ -57,6 +57,9 @@ const pools: ScannedPool[] = [
   { dex: 'ramses-v2', kind: 'solidly', pool: A(103), token0: TOK, token1: WETH, bal0: e18(3_000), bal1: e18(1) },
   // stable-curve pool: excluded from pricing and from candidates
   { dex: 'ramses-v2', kind: 'solidly', pool: A(104), token0: TOK, token1: WETH, bal0: e18(9e6), bal1: e18(1), stable: true },
+  // V3 pool with skewed balances (1 TOK2 vs 10 WETH) must NOT price TOK2 at 10 ETH
+  { dex: 'uniswap-v3', kind: 'v3', pool: A(107), token0: A(15), token1: WETH, bal0: e18(1), bal1: e18(10) },
+  { dex: 'uniswap-v3', kind: 'v3', pool: A(108), token0: A(15), token1: WETH, bal0: e18(1e12), bal1: 0n },
   // pair with no priced side
   { dex: 'uniswap-v2', kind: 'v2', pool: A(105), token0: OTHER, token1: JUNK, bal0: 10n ** 12n, bal1: 10n ** 12n },
   { dex: 'pancakeswap-v2', kind: 'v2', pool: A(106), token0: OTHER, token1: JUNK, bal0: 10n ** 12n, bal1: 10n ** 12n },
@@ -66,12 +69,14 @@ assert(Math.abs((px.get(WETH.toLowerCase()) ?? 0) - 3000) < 1e-6, 'ETH priced fr
 assert(Math.abs((px.get(TOK.toLowerCase()) ?? 0) - 1) < 1e-9, 'other token priced via WETH');
 assert(!px.has(OTHER.toLowerCase()), 'token with no USDG/WETH pool stays unpriced');
 for (const p of pools) p.usd = poolUsd(p, dec, px);
-assert(Math.round(pools[0].usd!) === 600_000, 'pool value = both sides when both priced');
-assert(pools[5].usd === 0, 'unpriceable pool valued at 0');
+assert(Math.round(pools[0].usd!) === 600_000, 'pool value = 2 x smaller side when both priced');
+assert(pools[7].usd === 0, 'unpriceable pool valued at 0');
+assert(!px.has(A(15).toLowerCase()), 'V3 balances never used to price a token');
+assert(pools[5].usd === 60_000 && pools[6].usd === 0, 'V3 pool valued only by its priced (WETH) side');
 
 // ---- ranking ----------------------------------------------------------------
 const { multiPoolPairs, candidates } = rankCandidates(pools, 2_000);
-assert(multiPoolPairs === 3, `pairs on 2+ pools counted before liquidity filter (${multiPoolPairs})`);
+assert(multiPoolPairs === 4, `pairs on 2+ pools counted before liquidity filter (${multiPoolPairs})`);
 assert(candidates.length === 2, `only pairs with 2+ liquid, priceable pools kept (${candidates.length})`);
 assert(candidates[0].tokenA.toLowerCase() === TOK.toLowerCase() || candidates[0].tokenB.toLowerCase() === TOK.toLowerCase(),
   'ranked by 2nd-deepest pool (TOK/WETH 2nd pool $6k beats WETH/USDG 2nd pool $2k)');
