@@ -7,6 +7,17 @@ import 'dotenv/config';
 process.on('unhandledRejection', (reason) => {
       console.error('[error] unhandled rejection (bot keeps running):', reason);
 });
+
+// Report on demand: `pm2 sendSignal SIGUSR2 dex-arb-shadow` sends the hourly
+// report right now. Registered first thing: without a handler, SIGUSR2 kills
+// the process, and startup takes several minutes. Before the report is ready
+// the request is remembered and sent as soon as startup finishes.
+let reportNow: (() => Promise<void>) | null = null;
+let reportRequested = false;
+process.on('SIGUSR2', () => {
+      if (reportNow) { console.log('[telegram] report requested (SIGUSR2), sending now'); void reportNow(); }
+      else { console.log('[telegram] report requested during startup, will send when ready'); reportRequested = true; }
+});
 import { ethers } from 'ethers';
 import { resolveAndFetchV2Pool, resolveAndFetchLBPool, resolveAndFetchV3Pool, resolveAndFetchV4Pool, resolveKuruMarket, refetchV2PoolPrice, refetchV3PoolPrice } from './core/poolResolver';
 import { ChainManager } from './core/chainManager';
@@ -972,12 +983,9 @@ for (let i = 0; i < resolved.length; i++) {
       };
       setInterval(sendHourlyDigest, 60 * 60 * 1000);
 
-      // Report on demand: `pm2 sendSignal SIGUSR2 dex-arb-shadow` sends the
-      // hourly report right now (covering the time since the last one).
-      process.on('SIGUSR2', () => {
-            console.log('[telegram] report requested (SIGUSR2), sending now');
-            void sendHourlyDigest();
-      });
+      // Report on demand (see the SIGUSR2 handler at the top of this file).
+      reportNow = sendHourlyDigest;
+      if (reportRequested) { reportRequested = false; void sendHourlyDigest(); }
       // First report 10 minutes after start, so a fresh deploy shows up in
       // Telegram quickly instead of an hour later.
       setTimeout(() => { void sendHourlyDigest(); }, 10 * 60 * 1000);
