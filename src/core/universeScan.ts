@@ -284,11 +284,14 @@ export function addPoolsToState(state: ScanState, f: ScanFactory, pools: Scanned
 //       usdToken      = $1
 //       wrappedNative = deepest V2 pool vs usdToken (V3 only if no V2 exists)
 //       other tokens  = deepest V2 pool vs usdToken or wrappedNative
+//   - a pricing pool needs $2,000+ of USDG/WETH in it (tiny pools are easy to skew)
 //   - a pool is worth 2 x its SMALLER priced side (one side priced: 2 x it).
 //     Conservative: a pool stuffed with a worthless token isn't "deep".
 // ----------------------------------------------------------------------------
 const lc = (a: string) => a.toLowerCase();
 const units = (v: bigint | undefined, dec: number) => (v === undefined ? 0 : Number(ethers.formatUnits(v, dec)));
+
+const MIN_PRICING_QUOTE_USD = 2_000;
 
 export function derivePrices(pools: ScannedPool[], decimals: Map<string, number>, usdToken: string, wrappedNative: string): Map<string, number> {
   const usd = lc(usdToken), wn = lc(wrappedNative);
@@ -311,6 +314,9 @@ export function derivePrices(pools: ScannedPool[], decimals: Map<string, number>
       const tAmt = units(t0 === quote ? p.bal1 : p.bal0, dt);
       if (qAmt <= 0 || tAmt <= 0) continue;
       const qUsd = qAmt * (price.get(quote) ?? 0);
+      // A pool with almost no USDG/WETH in it is trivially mispriced (anyone
+      // can skew a $50 pool): never use it to price a token.
+      if (qUsd < MIN_PRICING_QUOTE_USD) continue;
       const prev = best.get(other);
       if (!prev || qUsd > prev.quoteAmt) best.set(other, { quoteAmt: qUsd, px: (qAmt / tAmt) * (price.get(quote) ?? 0) });
     }
