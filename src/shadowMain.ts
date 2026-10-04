@@ -972,6 +972,16 @@ for (let i = 0; i < resolved.length; i++) {
       };
       setInterval(sendHourlyDigest, 60 * 60 * 1000);
 
+      // Report on demand: `pm2 sendSignal SIGUSR2 dex-arb-shadow` sends the
+      // hourly report right now (covering the time since the last one).
+      process.on('SIGUSR2', () => {
+            console.log('[telegram] report requested (SIGUSR2), sending now');
+            void sendHourlyDigest();
+      });
+      // First report 10 minutes after start, so a fresh deploy shows up in
+      // Telegram quickly instead of an hour later.
+      setTimeout(() => { void sendHourlyDigest(); }, 10 * 60 * 1000);
+
       let lastDailyAt = Date.now();
       setInterval(async () => {
             const now = Date.now();
