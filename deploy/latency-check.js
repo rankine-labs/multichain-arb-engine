@@ -62,7 +62,14 @@ async function awsRegion(ip, ranges) {
   let ranges = null;
   try { ranges = await (await fetch('https://ip-ranges.amazonaws.com/ip-ranges.json')).json(); } catch { /* optional */ }
   let here = '?';
-  try { here = (await (await fetch('http://169.254.169.254/latest/meta-data/placement/region', { signal: AbortSignal.timeout(500) })).text()) || '?'; } catch { /* not on EC2 */ }
+  try {
+    // EC2 metadata (IMDSv2 token first; v1 fallback). Anything that isn't a
+    // region name (e.g. another cloud's metadata service) is ignored.
+    let token = '';
+    try { token = await (await fetch('http://169.254.169.254/latest/api/token', { method: 'PUT', headers: { 'X-aws-ec2-metadata-token-ttl-seconds': '60' }, signal: AbortSignal.timeout(500) })).text(); } catch { /* v1 */ }
+    const r = (await (await fetch('http://169.254.169.254/latest/meta-data/placement/region', { headers: token ? { 'X-aws-ec2-metadata-token': token } : {}, signal: AbortSignal.timeout(500) })).text()).trim();
+    if (/^[a-z]{2}(-[a-z]+)+-\d$/.test(r)) here = r;
+  } catch { /* not on EC2 */ }
   console.log(`Latency check from: ${here === '?' ? 'this machine' : 'AWS ' + here}`);
 
   for (const host of HOSTS) {
@@ -78,5 +85,6 @@ async function awsRegion(ip, ranges) {
   const rt = [];
   for (let i = 0; i < ROUNDS; i++) { const t = await rpcMs(); if (t !== null) rt.push(t); }
   console.log(`RPC round trip (eth_blockNumber): ${rt.length ? median(rt).toFixed(1) + ' ms median, best ' + Math.min(...rt).toFixed(1) + ' ms' : 'failed'}`);
-  console.log('Tip: run this in 2-3 AWS regions (us-east-1, us-east-2, us-west-2) and keep the bot where the numbers are lowest.');
+  console.log('Robinhood sits behind a CDN, so TCP connect only measures the nearest edge. The RPC round trip is the real distance.');
+  console.log('Tip: run this in 2-3 AWS regions (us-east-1, us-east-2, us-west-2) and keep the bot where the RPC round trip is lowest.');
 })();
