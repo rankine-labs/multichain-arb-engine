@@ -6,7 +6,7 @@
 #   Checks GitHub for new code on `main`. If there is some, it:
 #     1. Pulls it
 #     2. Makes sure it compiles and all tests pass
-#     3. Restarts the bot (pm2)
+#     3. Builds dist/ (pm2 runs dist/shadowMain.js) and restarts the bot (pm2)
 #     4. Watches the bot for 30 seconds to make sure it stays up
 #   If ANY step fails, it rolls back to the previous working version,
 #   restarts that, and sends you a Telegram alert. Success also alerts.
@@ -148,6 +148,8 @@ rollback() {
   log "Rolling back to ${PREV_SHA:0:7}: $reason"
   git reset --hard --quiet "$PREV_SHA"
   if [ "$PKG_CHANGED" = 1 ]; then npm install --no-audit --no-fund > /dev/null 2>&1; fi
+  # Rebuild the old version too: pm2 runs the compiled dist/, not src/.
+  npm run build > /dev/null 2>&1
   pm2 restart "$PM2_NAME" --update-env > /dev/null 2>&1
   notify "🔴 <b>DEPLOY FAILED</b> <code>${SHORT}</code>
 $(html "$SUBJECT")
@@ -165,6 +167,10 @@ fi
 # --- 4. Must compile and pass every test before restarting -------------------
 npm run typecheck || rollback "code does not compile"
 npm test          || rollback "tests failed"
+
+# --- 4b. Compile src/ into dist/ (what pm2 actually runs) --------------------
+# Without this step a restart just relaunches the previously built code.
+npm run build     || rollback "build failed"
 
 # --- 5. Restart and watch it stay up -----------------------------------------
 pm2_info() {

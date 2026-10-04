@@ -5,6 +5,7 @@
     "main": "index.js",
     "scripts": {
         "typecheck": "tsc --noEmit -p .",
+        "build": "rm -rf dist && tsc -p .",
         "test": "tsc -p . --outDir .test-build && node scripts/run-tests.js"
     },
     "keywords": [],
