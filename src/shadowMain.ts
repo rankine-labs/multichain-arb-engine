@@ -360,9 +360,18 @@ const refreshNow = async (p: any): Promise<any> => {
       return p;
 };
 
-chainManager.register(new RobinhoodChainAdapter());
-chainManager.register(new MonadAdapter());
-chainManager.register(new AvalancheAdapter());
+// Which chains run. Robinhood only for now: it's the test chain, and Monad
+// (public RPC rate limits) and Avalanche (providers stream no pending txs)
+// are paused until they're sorted. Turn them back on with, in .env:
+//   CHAINS=robinhood,monad,avalanche
+const ENABLED_CHAINS = new Set(
+      (process.env.CHAINS ?? 'robinhood').split(',').map((c) => c.trim().toLowerCase()).filter(Boolean),
+);
+const chainOn = (c: string) => ENABLED_CHAINS.has(c);
+console.log(`[chains] enabled: ${[...ENABLED_CHAINS].join(', ')}`);
+if (chainOn('robinhood')) chainManager.register(new RobinhoodChainAdapter());
+if (chainOn('monad')) chainManager.register(new MonadAdapter());
+if (chainOn('avalanche')) chainManager.register(new AvalancheAdapter());
 
 chainManager.onEvent(async (event: RawChainEvent) => {
 const t0 = Date.now();
@@ -660,8 +669,10 @@ await chainManager.startAll();
               // pair everywhere else, not treated as unrelated.
               if (resolved) cache.upsert({ ...resolved, tokenA: MONAD_TOKENS.WMON });
       };
-      await seedKuruMarket();
-      setInterval(seedKuruMarket, 30_000); // vault liquidity shifts as orders fill — keep it fresh
+      if (chainOn('monad')) {
+            await seedKuruMarket();
+            setInterval(seedKuruMarket, 30_000);
+      } // vault liquidity shifts as orders fill — keep it fresh
 
       // V4 has no per-swap router we can decode yet (its Universal Router uses
       // encoded commands, a separate problem from reading pool state), so this
@@ -692,8 +703,10 @@ await chainManager.startAll();
                   );
             if (resolved) cache.upsert(resolved);
       };
-      await seedMonadV3Peer();
-      setInterval(seedMonadV3Peer, 30_000);
+      if (chainOn('monad')) {
+            await seedMonadV3Peer();
+            setInterval(seedMonadV3Peer, 30_000);
+      }
 
       // Robinhood partner pools: every DEX + fee tier for WETH/USDG from the
       // start (replaces the old single Uniswap V2 + Ramses V2 seeds); other
@@ -843,8 +856,10 @@ for (let i = 0; i < resolved.length; i++) {
 }
             }
       };
-      await checkMonadWatchList();
-      setInterval(checkMonadWatchList, 30_000);
+      if (chainOn('monad')) {
+            await checkMonadWatchList();
+            setInterval(checkMonadWatchList, 30_000);
+      }
 
       // ======================================================================
       // TELEGRAM REPORTING
@@ -935,7 +950,7 @@ for (let i = 0; i < resolved.length; i++) {
                         chainMap.set(norm, { pair: m.pair, spreadPct: m.spreadPct, buyDex: m.buyDex, sellDex: m.sellDex });
                   }
             }
-            return (['monad', 'robinhood', 'avalanche'] as const).map((chain) => {
+            return (['monad', 'robinhood', 'avalanche'] as const).filter(chainOn).map((chain) => {
                   const spreads = [...(byChain.get(chain)?.values() ?? [])];
                   let noMatchCount = 0;
                   if (chain === 'monad') {
@@ -962,7 +977,7 @@ for (let i = 0; i < resolved.length; i++) {
                   const status = chainManager.getStatus() as Record<string, { online: boolean }>;
                   await sendTelegramMessage(formatHourlyDigest({
                         windowLabel: `${hhmm(lastDigestAt)} to ${hhmm(now)}`,
-                        chains: (['avalanche', 'monad', 'robinhood'] as const).map((chain) => ({
+                        chains: (['avalanche', 'monad', 'robinhood'] as const).filter(chainOn).map((chain) => ({
                               chain,
                               healthy: status[chain]?.online ?? false,
                               reconnects: chainHealthFlapCount[chain] ?? 0,
