@@ -1,4 +1,4 @@
-import { PairWatcher } from '../core/pairWatcher';
+import { PairWatcher, refreshPoolsBatch } from '../core/pairWatcher';
 import { PoolCache } from '../core/poolCache';
 
 // Checks the pair watcher can't overload the RPC: one discovery at a time,
@@ -44,5 +44,27 @@ async function main() {
   assert(done.length === before, 'no re-discovery of fresh pairs or known single-pool pairs');
   assert(w.stats().pairs === 1, 'only the multi-pool pair is tracked');
 }
+
+// Batch re-sync: one call list for all pools, results mapped back correctly.
+async function batch() {
+  const w = (n: bigint) => n.toString(16).padStart(64, '0');
+  const base = { chain: 'robinhood' as const, dex: 'x', tokenA: 'a', tokenB: 'b', feeBps: 5, lastUpdatedBlock: 0, lastUpdatedMs: 0 };
+  const pools = [
+    { ...base, poolAddress: 'v3pool', poolType: 'v3' as const, sqrtPriceX96: 1n, liquidity: 1n },
+    { ...base, poolAddress: 'v2pool', poolType: 'v2' as const, reserveA: 1n, reserveB: 1n },
+  ];
+  let seen: { target: string; data: string }[] = [];
+  const fresh = await refreshPoolsBatch(async (calls) => {
+    seen = calls;
+    return calls.map((c) => c.data === '0x3850c7bd' ? '0x' + w(777n) + w(5n) : c.data === '0x1a686502' ? '0x' + w(888n) : '0x' + w(11n) + w(22n) + w(3n));
+  }, pools);
+  assert(seen.length === 3, 'one batch: slot0 + liquidity for V3, getReserves for V2');
+  const v3 = fresh.find((p) => p.poolAddress === 'v3pool')!, v2 = fresh.find((p) => p.poolAddress === 'v2pool')!;
+  assert(v3.sqrtPriceX96 === 777n && v3.liquidity === 888n && v3.lastUpdatedMs > 0, 'V3 state + timestamp updated from batch');
+  assert(v2.reserveA === 11n && v2.reserveB === 22n, 'V2 reserves updated from batch');
+  const partial = await refreshPoolsBatch(async (calls) => calls.map(() => null), pools);
+  assert(partial.length === 0, 'failed reads leave pools untouched (no zeroed prices)');
+}
+batch().catch((e) => { console.error('FAIL: batch test crashed', e); process.exitCode = 1; });
 
 main().catch((err) => { console.error('FAIL: test crashed', err); process.exitCode = 1; });

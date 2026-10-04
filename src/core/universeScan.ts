@@ -177,10 +177,10 @@ export function decodePoolCreatedLog(log: { topics: readonly string[]; data: str
   return { token0: addr(t0), token1: addr(t1), pool: addr(pool) };
 }
 
-type RawLog = { topics: string[]; data: string };
+export type RawLog = { topics: string[]; data: string; address?: string; blockNumber?: string; logIndex?: string; transactionHash?: string; transactionIndex?: string };
 
 // eth_getLogs with a hard timeout (a public node can hang on a huge range).
-async function getLogsRaw(provider: ethers.JsonRpcProvider, address: string, from: number, to: number, timeoutMs: number): Promise<RawLog[]> {
+async function getLogsRaw(provider: ethers.JsonRpcProvider, address: string | string[], from: number, to: number, timeoutMs: number): Promise<RawLog[]> {
   let timer: NodeJS.Timeout | undefined;
   const timeout = new Promise<never>((_, rej) => { timer = setTimeout(() => rej(new Error('getLogs timeout')), timeoutMs); });
   try {
@@ -196,7 +196,7 @@ async function getLogsRaw(provider: ethers.JsonRpcProvider, address: string, fro
 // Fetches logs for [from, to]; if the node refuses or times out, splits the
 // range in half and tries each half (down to MIN_RANGE blocks).
 export async function getLogsAdaptive(
-  provider: ethers.JsonRpcProvider, address: string, from: number, to: number,
+  provider: ethers.JsonRpcProvider, address: string | string[], from: number, to: number,
   onLogs: (logs: RawLog[]) => void, timeoutMs = 30_000,
 ): Promise<void> {
   const MIN_RANGE = 1_000;

@@ -69,7 +69,7 @@ import { formatSkippedOpportunity, formatHourlyDigest, formatDailyReport, format
 import { RobinhoodChainAdapter } from './chains/robinhoodChain';
 import { MonadAdapter } from './chains/monad';
 import { AvalancheAdapter } from './chains/avalanche';
-import { RawChainEvent } from './core/types';
+import { RawChainEvent, PoolState } from './core/types';
 import { priceOf, spreadPct } from './core/poolPrice';
 import { PairWatcher, Venue, refreshPoolState } from './core/pairWatcher';
 import { scanUniverse, emptyScanState, ScanState } from './core/universeScan';
@@ -77,6 +77,8 @@ import { readFileSync, writeFileSync, mkdirSync, renameSync } from 'fs';
 import { ROBINHOOD_SCAN_FACTORIES } from './config/knownAddresses';
 import { buildExecuteCall, executionRequested, executorConfig, pickV3Lender } from './execution/executorCalldata';
 import { makeRpc, simulateRoundTrip, simRpcUrl, Rpc } from './execution/simulator';
+import { FastSender, SafetyGate, safetyConfigFromEnv } from './execution/fastSender';
+import { CompetitorTracker } from './core/competitorTracker';
 
 async function main() {
 const cache = new PoolCache();
@@ -341,7 +343,9 @@ const robinhoodWatcher = new PairWatcher('robinhood', robinhoodReadProvider, ROB
             (TOKEN_SYMBOLS.robinhood ??= {})[addr] = meta.symbol;
       },
       // 60 = up to ~20 pinned pairs from the chain-wide scan + traffic-driven ones.
-      { maxPairs: 60, rediscoverMs: 10 * 60_000, refreshMs: 30_000 });
+      // refreshMs: background re-sync of every watched pool (one Multicall3
+      // request), the safety net behind instant price tracking below.
+      { maxPairs: 60, rediscoverMs: 10 * 60_000, refreshMs: 5_000 });
 
 // Re-read a pool's live price right before using it (skips pools we can't
 // refresh this way: Uniswap V4, order books, bin pools). Never waits more
@@ -350,6 +354,28 @@ const READ_PROVIDER: Record<string, ethers.JsonRpcProvider> = {
       avalanche: avalancheReadProvider, monad: monadReadProvider, robinhood: robinhoodReadProvider,
 };
 const REFRESH_TIMEOUT_MS = 1_500;
+// Instant price tracking (Robinhood): decide from our own pool copies when
+// they're recent instead of re-reading every pool from the RPC first (that
+// re-read was the slowest step: tens of ms per decision). FAST_PRICES=off
+// in .env restores the old behaviour.
+const FAST_PRICES = process.env.FAST_PRICES !== 'off';
+const FRESH_MS = 20_000;
+const priceStats = { local: 0, rpc: 0 };
+
+// FAST SENDER (Robinhood). Dry run unless the live switches are all set
+// (see execution/fastSender.ts). ROBINHOOD_SEND_RPC = where to send trades
+// (ideally straight to the sequencer); defaults to the read RPC.
+const robinhoodSender = new FastSender(
+      robinhoodReadProvider, 4663,
+      process.env.ROBINHOOD_SEND_RPC ? new ethers.JsonRpcProvider(process.env.ROBINHOOD_SEND_RPC, 4663, { staticNetwork: true }) : robinhoodReadProvider,
+);
+const safetyGate = new SafetyGate(safetyConfigFromEnv());
+safetyGate.allowTokens([ROBINHOOD_TOKENS.WETH, ROBINHOOD_TOKENS.USDG]);
+// "fire-ready" = from the moment we saw the trigger trade to a signed trade
+// in hand. The number to compare against competitors.
+const fireStats = { readyMs: [] as number[], blocked: new Map<string, number>(), sent: 0 };
+// Live competitor timing (see core/competitorTracker.ts).
+const rivals = new CompetitorTracker(robinhoodReadProvider);
 const refreshNow = async (p: any): Promise<any> => {
       if (p.dex === 'uniswap-v4' || p.poolType === 'orderbook' || p.dex.includes('lb') || p.dex === 'bean-exchange') return p;
       const fresh = await Promise.race([
@@ -358,6 +384,11 @@ const refreshNow = async (p: any): Promise<any> => {
       ]);
       if (fresh) { cache.upsert(fresh); return fresh; }
       return p;
+};
+const priceAtDecision = async (p: PoolState): Promise<PoolState> => {
+      if (FAST_PRICES && p.chain === 'robinhood' && Date.now() - p.lastUpdatedMs <= FRESH_MS) { priceStats.local++; return p; }
+      priceStats.rpc++;
+      return refreshNow(p);
 };
 
 // Which chains run. Robinhood only for now: it's the test chain, and Monad
@@ -375,6 +406,8 @@ if (chainOn('avalanche')) chainManager.register(new AvalancheAdapter());
 
 chainManager.onEvent(async (event: RawChainEvent) => {
 const t0 = Date.now();
+// Timestamp every Robinhood feed tx: lets the competitor tracker time rivals.
+if (event.chain === 'robinhood') rivals.noteFeedTx((event.raw as any)?.hash, event.receivedAtMs);
 
 const swap = await decoder.decode(event);
 if (!swap) return;
@@ -467,6 +500,17 @@ if (registerIfApproved('avalanche', entry.dex, resolved)) pool = resolved;
 
     if (!pool) return;
 
+    // INSTANT PRICE TRACKING (Robinhood): the trade we just saw is already
+    // sequenced, so it WILL land. Apply its effect to our copy of the pool
+    // now, so the next trade on this pool is priced from up-to-date state
+    // without asking the RPC. `pool` keeps the pre-trade state for planning
+    // this backrun (the planner predicts this trade's effect itself).
+    if (FAST_PRICES && swap.chain === 'robinhood' && swap.amountIn > 0n) {
+          const inIsA = pool.tokenA.toLowerCase() === swap.tokenIn.toLowerCase();
+          const after = cache.predictPostTradeState(pool, inIsA, swap.amountIn);
+          if (after !== pool) cache.upsert({ ...after, lastUpdatedMs: Date.now() });
+    }
+
     // Cheap "is this trade big enough to matter" check, now against the
     // REAL pool address.
     const filterResult = filter.evaluate({ ...swap, poolAddress: pool.poolAddress });
@@ -476,7 +520,9 @@ if (registerIfApproved('avalanche', entry.dex, resolved)) pool = resolved;
     // partner pool now, in parallel (cached prices can be up to 30s old).
     const cachedPeers = cache.findPeerPools(swap.chain, swap.tokenIn, swap.tokenOut, pool.poolAddress);
     if (cachedPeers.length === 0) return;
-    const [freshPool, ...peers] = await Promise.all([refreshNow(pool), ...cachedPeers.map(refreshNow)]);
+    // Fast path: use our own up-to-date copy when it's recent (kept current by
+    // instant price tracking + the 5s re-sync); only ask the RPC when stale.
+    const [freshPool, ...peers] = await Promise.all([priceAtDecision(pool), ...cachedPeers.map(priceAtDecision)]);
     pool = freshPool;
 
       // Record this real, genuine match for the hourly proof-of-activity
@@ -534,6 +580,18 @@ for (const peer of peers) {
 }
 if (!plan) return;
 const { sizing, profit } = plan;
+
+// Any real gap on Robinhood: find out a few seconds from now which bot took
+// it and how fast, versus how fast we were ready (decision + ~2ms to sign).
+if (swap.chain === 'robinhood' && sizing.grossProfitUsd >= 5) {
+      rivals.watch({
+            triggerHash: (event.raw as any)?.hash,
+            triggerSeenMs: event.receivedAtMs,
+            pools: [pool.poolAddress, ...peers.map((p) => p.poolAddress)],
+            ourReadyMs: Date.now() - event.receivedAtMs + 2,
+            profitUsd: sizing.grossProfitUsd,
+      });
+}
 const buyPoolUsed = plan.buyPool;
 const sellPoolUsed = plan.sellPool;
 
@@ -631,6 +689,22 @@ console.log(
             });
             if ('reason' in dry) {
                   console.log(`[exec-dryrun] ${swap.chain} NOT executable: ${dry.reason}`);
+            } else if (swap.chain === 'robinhood') {
+                  // Safety gate, then build + sign (and send only if live).
+                  const gate = safetyGate.check({ tradeSizeUsd: sizing.optimalTradeSizeUsd, tokens: [swap.tokenIn, swap.tokenOut] });
+                  if (!gate.ok) {
+                        const r = 'reason' in gate ? gate.reason.replace(/\$\d+/g, '$N').replace(/0x[0-9a-f]+/gi, '0x…') : 'blocked';
+                        fireStats.blocked.set(r, (fireStats.blocked.get(r) ?? 0) + 1);
+                  } else if (robinhoodSender.live && !dry.to) {
+                        fireStats.blocked.set('no executor deployed', (fireStats.blocked.get('no executor deployed') ?? 0) + 1);
+                  } else {
+                        const fired = await robinhoodSender.fire(dry.to ?? '0x0000000000000000000000000000000000000000', dry.data);
+                        const readyMs = Date.now() - event.receivedAtMs;
+                        fireStats.readyMs.push(readyMs);
+                        if (fired.txHash) fireStats.sent++;
+                        console.log(`[fire] robinhood ${fired.live ? 'LIVE' : 'DRY RUN'} ready ${readyMs}ms after the trigger (sign ${fired.signMs.toFixed(1)}ms)` +
+                              `${fired.txHash ? ` tx ${fired.txHash}` : ''}${fired.error ? ` error: ${fired.error}` : ''}`);
+                  }
             } else {
                   const funding = dry.funding;
                   console.log(
@@ -646,9 +720,14 @@ console.log(
 // Live trading is not implemented yet (adapters' fireTransaction() are
 // placeholders). Make sure flipping the switch early can't be mistaken for
 // the bot actually trading.
-if (executionRequested()) {
-      console.warn('[execution] EXECUTION_ENABLED=true but live firing is NOT implemented -- staying in shadow mode');
+if (executionRequested() && !robinhoodSender.live) {
+      console.warn('[execution] EXECUTION_ENABLED=true but LIVE_SEND_CONFIRM / BOT_PRIVATE_KEY not set -- dry run only');
       await sendTelegramMessage(formatExecutionWarning());
+}
+if (chainOn('robinhood')) {
+      robinhoodSender.start()
+            .then(() => console.log(`[fire] robinhood sender ready (${robinhoodSender.live ? 'LIVE from ' + robinhoodSender.address : 'dry run'})`))
+            .catch((err) => console.warn('[fire] robinhood sender failed to start:', (err as Error).message));
 }
 
 await chainManager.startAll();
@@ -754,6 +833,8 @@ await chainManager.startAll();
                   }, scanState);
                   saveScanState(scanState);
                   const top = res.candidates.slice(0, SCAN_TOP);
+                  // Only vetted pairs' tokens may ever be traded (safety gate allowlist).
+                  safetyGate.allowTokens(top.flatMap((c) => [c.tokenA, c.tokenB]));
                   console.log(`[scan] robinhood: ${res.totalPools} pools, ${res.multiPoolPairs} pairs on 2+ pools, ${res.candidates.length} with $${SCAN_MIN_USD}+ in 2+ pools (${Math.round((Date.now() - t0) / 1000)}s)${res.errors.length ? ' errors: ' + res.errors.join('; ') : ''}`);
                   // One pair at a time: the watcher does its own exact pool discovery.
                   for (const c of top) {
@@ -965,7 +1046,13 @@ for (let i = 0; i < resolved.length; i++) {
                   let note: string | undefined;
                   if (chain === 'robinhood') {
                         const st = robinhoodWatcher.stats();
-                        note = `watching ${st.pairs} pair${st.pairs === 1 ? '' : 's'}, ${st.pools} pools`;
+                        const tot = priceStats.local + priceStats.rpc;
+                        const localPct = tot ? Math.round((100 * priceStats.local) / tot) : 0;
+                        const fr = [...fireStats.readyMs].sort((a, b) => a - b);
+                        const fireNote = fr.length ? `, fire-ready ${fr[Math.floor(fr.length / 2)]}ms median (${fr.length})` : '';
+                        const rv = rivals.summary();
+                        const rivalNote = rv.found ? `, rivals ${rv.theirMedianMs ?? '?'}ms vs ours ${rv.ourMedianMs ?? '?'}ms (we'd beat ${rv.beatCount}/${rv.comparable})` : '';
+                        note = `watching ${st.pairs} pair${st.pairs === 1 ? '' : 's'}, ${st.pools} pools${tot ? `, ${localPct}% instant prices` : ''}${fireNote}${rivalNote}`;
                   }
                   return { chain, spreads, noMatchCount, note };
             });
@@ -996,6 +1083,9 @@ for (let i = 0; i < resolved.length; i++) {
                   hourlyMatches.clear();
                   for (const chainName of Object.keys(chainHealthFlapCount)) chainHealthFlapCount[chainName] = 0;
                   simStats.checked = simStats.profit = simStats.loss = simStats.fail = simStats.rateLimited = 0;
+                  priceStats.local = priceStats.rpc = 0;
+                  fireStats.readyMs = []; fireStats.blocked.clear(); fireStats.sent = 0;
+                  rivals.reset();
                   lastDigestAt = now;
             }
       };
