@@ -87,22 +87,25 @@ async function main() {
   }
   say(`[bt] starting state for ${seeded}/${pools.length} pools`);
 
-  // 5) Every event from those pools in the window.
-  const logs: RawLog[] = [];
-  await getLogsAdaptive(provider, pools.map((p) => p.address), fromBlock, latest, (ls) => { for (const l of ls) logs.push(l); });
-  say(`[bt] ${logs.length} pool events fetched (${Math.round((Date.now() - t0) / 1000)}s)`);
-
-  // 6) Replay in order.
+  // 5) Every event from those pools in the window, decoded as it arrives
+  //    (raw logs are dropped right away: a week is a lot of data).
   const kindOf = new Map(pools.map((p) => [p.address, p.kind]));
   const events: BtEvent[] = [];
-  for (const l of logs) {
-    const pool = lc(l.address ?? '');
-    const kind = kindOf.get(pool);
-    if (!kind) continue;
-    const state = decodePoolEvent(kind, l);
-    if (!state) continue;
-    events.push({ block: Number(l.blockNumber), logIndex: Number(l.logIndex), pool, state });
-  }
+  let rawCount = 0, lastNote = Date.now();
+  await getLogsAdaptive(provider, pools.map((p) => p.address), fromBlock, latest, (ls) => {
+    rawCount += ls.length;
+    for (const l of ls) {
+      const pool = lc(l.address ?? '');
+      const kind = kindOf.get(pool);
+      if (!kind) continue;
+      const state = decodePoolEvent(kind, l);
+      if (state) events.push({ block: Number(l.blockNumber), logIndex: Number(l.logIndex), pool, state });
+    }
+    if (Date.now() - lastNote > 60_000) { lastNote = Date.now(); say(`[bt] ...${rawCount} events so far`); }
+  });
+  say(`[bt] ${rawCount} pool events fetched, ${events.length} price updates (${Math.round((Date.now() - t0) / 1000)}s)`);
+
+  // 6) Replay in order.
   events.sort((a, b) => a.block - b.block || a.logIndex - b.logIndex);
   for (const ev of events) for (const e of engines) e.apply(ev);
   for (const e of engines) e.finish(latest);
