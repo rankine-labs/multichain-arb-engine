@@ -1,6 +1,7 @@
 import { ethers } from 'ethers';
 import { ChainName, PoolState } from './types';
 import { PoolCache } from './poolCache';
+import { makeCaller } from './universeScan';
 import {
   resolveAndFetchV2Pool, resolveAndFetchSolidlyV2Pool, resolveAllV3Pools,
   refetchV2PoolPrice, refetchV3PoolPrice,
@@ -74,6 +75,39 @@ export async function discoverPairPools(
     }
   })());
   return results.flat();
+}
+
+// Re-reads MANY pools' live state in one go through Multicall3 (one RPC
+// request for ~100 pools instead of ~150 separate ones). V3: slot0() +
+// liquidity(); V2/Solidly: getReserves(). Only the first return words are
+// read, which are the same across Uniswap, PancakeSwap and Ramses.
+const SEL_SLOT0 = '0x3850c7bd', SEL_LIQ = '0x1a686502', SEL_RESERVES = '0x0902f1ac';
+export async function refreshPoolsBatch(
+  callMany: (calls: { target: string; data: string }[]) => Promise<(string | null)[]>,
+  pools: PoolState[],
+): Promise<PoolState[]> {
+  const calls: { target: string; data: string }[] = [];
+  const idx: number[] = []; // start index of each pool's calls
+  for (const p of pools) {
+    idx.push(calls.length);
+    if (p.poolType === 'v3') calls.push({ target: p.poolAddress, data: SEL_SLOT0 }, { target: p.poolAddress, data: SEL_LIQ });
+    else if (p.poolType === 'v2') calls.push({ target: p.poolAddress, data: SEL_RESERVES });
+  }
+  const res = await callMany(calls);
+  const word = (r: string | null, i: number) => (r && r.length >= 2 + 64 * (i + 1) ? BigInt('0x' + r.slice(2 + 64 * i, 2 + 64 * (i + 1))) : null);
+  const now = Date.now();
+  const out: PoolState[] = [];
+  pools.forEach((p, k) => {
+    const i = idx[k];
+    if (p.poolType === 'v3') {
+      const sqrt = word(res[i], 0), liq = word(res[i + 1], 0);
+      if (sqrt && liq) out.push({ ...p, sqrtPriceX96: sqrt, liquidity: liq, lastUpdatedMs: now });
+    } else if (p.poolType === 'v2') {
+      const r0 = word(res[i], 0), r1 = word(res[i], 1);
+      if (r0 !== null && r1 !== null) out.push({ ...p, reserveA: r0, reserveB: r1, lastUpdatedMs: now });
+    }
+  });
+  return out;
 }
 
 // Re-reads one pool's live price state. Returns null if it couldn't.
@@ -222,16 +256,25 @@ export class PairWatcher {
     this.refreshTimer = setInterval(() => { this.refreshAll().catch(() => { /* best effort */ }); }, this.refreshMs);
   }
 
+  // Background re-sync of every watched pool from the chain. With instant
+  // price tracking (prices updated from the trade feed), this is the safety
+  // net that corrects drift from trades the bot can't decode. One Multicall3
+  // request per round; falls back to single calls if Multicall3 is missing.
+  private callMany: ((calls: { target: string; data: string }[]) => Promise<(string | null)[]>) | null = null;
+  private refreshing = false;
+  lastRefreshMs = 0;
   async refreshAll(): Promise<void> {
-    const addrs = [...this.pairs.values()].flatMap((p) => p.pools);
-    // Small batches to stay gentle on the RPC.
-    for (let i = 0; i < addrs.length; i += 10) {
-      await Promise.all(addrs.slice(i, i + 10).map(async (addr) => {
-        const pool = this.cache.get(this.chain, addr);
-        if (!pool) return;
-        const fresh = await refreshPoolState(this.provider, pool);
-        if (fresh) this.cache.upsert(fresh);
-      }));
+    if (this.refreshing) return;
+    this.refreshing = true;
+    try {
+      const pools = [...this.pairs.values()].flatMap((p) => p.pools)
+        .map((a) => this.cache.get(this.chain, a)).filter((p): p is PoolState => !!p);
+      if (!pools.length) return;
+      this.callMany ??= (await makeCaller(this.provider)).callMany;
+      for (const fresh of await refreshPoolsBatch(this.callMany, pools)) this.cache.upsert(fresh);
+      this.lastRefreshMs = Date.now();
+    } finally {
+      this.refreshing = false;
     }
   }
 
