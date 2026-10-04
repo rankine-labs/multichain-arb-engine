@@ -67,7 +67,12 @@ export class ChainManager {
       const chain = chains[i];
       if (r.status === 'rejected') {
         this.status.set(chain, { online: false, reason: String(r.reason) });
-        console.error(`[chainManager] ${chain} failed to start:`, r.reason);
+        // Start a backoff right away: without it the first health check
+        // (15s later) retries immediately, which is how restart storms turn
+        // into provider blocks.
+        const delayMs = this.retryDelayMs(1, r.reason);
+        this.reconnectBackoff.set(chain, { failCount: 1, nextRetryAt: this.now() + delayMs });
+        console.error(`[chainManager] ${chain} failed to start (retry in ${Math.round(delayMs / 1000)}s):`, r.reason);
       }
     });
   }
@@ -75,6 +80,21 @@ export class ChainManager {
   // Backoff delay for a given number of consecutive failures.
   static backoffMs(failCount: number): number {
     return Math.min(15_000 * 2 ** failCount, 5 * 60_000);
+  }
+
+  // Extra wait when the provider itself told us to go away. Retrying during
+  // a provider block keeps the block alive: Robinhood's feed answers 403
+  // "Blocked for 1 hour after sustained feed connection rejections", and a
+  // retry every 5 min means it never lifts. 429 = rate limited.
+  static penaltyMs(err: unknown): number {
+    const m = String((err as any)?.message ?? err);
+    if (/\b403\b|blocked/i.test(m)) return 65 * 60_000; // sit the whole hour out
+    if (/\b429\b|too many/i.test(m)) return 10 * 60_000;
+    return 0;
+  }
+
+  private retryDelayMs(failCount: number, err: unknown): number {
+    return Math.max(ChainManager.backoffMs(failCount), ChainManager.penaltyMs(err));
   }
 
   async runHealthChecks() {
@@ -147,7 +167,7 @@ export class ChainManager {
       console.warn(`[chainManager] ${chain} reconnected successfully`);
     } catch (err) {
       const failCount = (backoff?.failCount ?? 0) + 1;
-      const delayMs = ChainManager.backoffMs(failCount);
+      const delayMs = this.retryDelayMs(failCount, err);
       this.reconnectBackoff.set(chain, { failCount, nextRetryAt: this.now() + delayMs });
       console.error(`[chainManager] ${chain} reconnect failed, backing off ${Math.round(delayMs / 1000)}s:`, err);
     }

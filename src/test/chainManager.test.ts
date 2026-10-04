@@ -18,11 +18,12 @@ class FakeAdapter implements ChainCapability {
   healthy = true;
   connectCalls = 0;
   connectShouldFail = false;
+  failMessage = 'nope';
   connectDelayMs = 0;
   async connect() {
     this.connectCalls++;
     if (this.connectDelayMs) await new Promise((r) => setTimeout(r, this.connectDelayMs));
-    if (this.connectShouldFail) throw new Error('nope');
+    if (this.connectShouldFail) throw new Error(this.failMessage);
     this.healthy = true;
   }
   async disconnect() {}
@@ -110,4 +111,28 @@ async function main() {
   assert(!threw && !cm4.isHealthy('monad'), 'throwing healthCheck marks chain unhealthy without crashing');
 }
 
-main().catch((err) => { console.error('FAIL: test crashed', err); process.exitCode = 1; });
+// ---------------------------------------------------------------------------
+// Provider blocks: a 403 "blocked for 1 hour" must not be retried every 5 min
+// (each retry keeps the block alive); startup failures back off too.
+// ---------------------------------------------------------------------------
+async function providerBlocks() {
+  assert(ChainManager.penaltyMs(new Error('Unexpected server response: 403')) >= 60 * 60_000, '403 from provider -> wait out the 1-hour block');
+  assert(ChainManager.penaltyMs(new Error('Unexpected server response: 429')) === 10 * 60_000, '429 rate limit -> 10 min wait');
+  assert(ChainManager.penaltyMs(new Error('socket closed')) === 0, 'ordinary errors keep the normal backoff');
+
+  let clock = 5_000_000;
+  const cm = new ChainManager(() => clock);
+  const a = new FakeAdapter();
+  a.connectShouldFail = true; a.failMessage = 'Unexpected server response: 403';
+  cm.register(a);
+  await quiet(() => cm.startAll());
+  const b = cm.getBackoff('monad');
+  assert(!!b && b.nextRetryAt - clock >= 60 * 60_000, 'failed start with 403 starts a 1-hour backoff immediately');
+  // Two hours of health checks every 15s: at most ~2 retries, not ~480.
+  a.healthy = false;
+  const before = a.connectCalls;
+  for (let i = 0; i < 480; i++) { clock += 15_000; await quiet(() => cm.runHealthChecks()); }
+  assert(a.connectCalls - before <= 2, `blocked feed retried at most once an hour (got ${a.connectCalls - before} in 2h)`);
+}
+
+main().then(providerBlocks).catch((err) => { console.error('FAIL: test crashed', err); process.exitCode = 1; });
