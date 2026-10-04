@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       only:
-        description: 'Run one step only: feeds, sim, pairs, watch, universe (blank = all)'
+        description: 'Run one step only: feeds, sim, pairs, watch, universe, backtest (blank = all except backtest)'
         required: false
         default: ''
 
@@ -63,3 +63,11 @@ jobs:
           echo "$out"
           out="${out//'%'/'%25'}"; out="${out//$'\n'/'%0A'}"
           echo "::notice title=Universe scan::${out}"
+      - name: Robinhood backtest (last 7 days of trades)
+        if: inputs.only == 'backtest'
+        shell: bash
+        run: |
+          out=$(timeout 2700 node .scripts-build/scripts/backtest-robinhood.js 2>&1 | tail -45)
+          echo "$out"
+          out="${out//'%'/'%25'}"; out="${out//$'\n'/'%0A'}"
+          echo "::notice title=Backtest::${out}"
