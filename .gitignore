@@ -15,3 +15,6 @@ deploy/*.lock
 contracts/out/
 contracts/cache/
 .scripts-build/
+
+# Bot state files (server only): chain-wide pool scan cache
+data/

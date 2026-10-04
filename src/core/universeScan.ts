@@ -6,11 +6,9 @@ import { ethers } from 'ethers';
 // Plain English:
 //   The pair watcher only learns about a pair after someone trades it. A pair
 //   that sits on two DEXes but trades rarely stays invisible. This scan asks
-//   every DEX factory for its FULL list of pools instead:
-//     - V2-style factories (Uniswap V2, PancakeSwap V2, Ramses V2/Solidly)
-//       keep a numbered list: allPairsLength() + allPairs(i)
-//     - V3-style factories (Uniswap V3, PancakeSwap V3, Ramses V3) have no
-//       list, so we read their PoolCreated event history
+//   every DEX factory for its FULL list of pools instead, by reading each
+//   factory's pool-creation events (PairCreated / PoolCreated). The result is
+//   saved (ScanState) so later scans only read pools created since then.
 //   Then it reads how much money sits in each pool (token balances), groups
 //   pools by token pair, and keeps pairs with 2+ pools that each hold at
 //   least `minPoolUsd`. Ranked by the SECOND-deepest pool, because an arb is
@@ -70,15 +68,7 @@ const MULTICALL3 = '0xcA11bde05977b3631167028862bE2a173976CA11';
 const mc3 = new ethers.Interface([
   'function aggregate3((address target, bool allowFailure, bytes callData)[] calls) payable returns ((bool success, bytes returnData)[] returnData)',
 ]);
-const v2f = new ethers.Interface([
-  'function allPairsLength() view returns (uint256)',
-  'function allPairs(uint256) view returns (address)',
-]);
-const pairI = new ethers.Interface([
-  'function token0() view returns (address)',
-  'function token1() view returns (address)',
-  'function stable() view returns (bool)',
-]);
+const pairI = new ethers.Interface(['function stable() view returns (bool)']);
 const erc20 = new ethers.Interface([
   'function balanceOf(address) view returns (uint256)',
   'function symbol() view returns (string)',
@@ -153,86 +143,132 @@ const decodeUint = (ret: string | null): bigint | null => {
 };
 
 // ----------------------------------------------------------------------------
-// V2 / Solidly: walk allPairs(0..n-1), then read token0/token1 (and stable()).
+// Pool discovery from factory creation events -- ONE method for every DEX.
+//
+// Every factory announces each new pool with an event:
+//   Uniswap/Pancake V2  PairCreated(token0 idx, token1 idx, address pair, uint n)
+//   Solidly (Ramses V2) PairCreated(token0 idx, token1 idx, bool stable, address pair, uint n)
+//   Uniswap/Pancake V3  PoolCreated(token0 idx, token1 idx, uint24 fee idx, int24 spacing, address pool)
+//   Ramses V3           PoolCreated(token0 idx, token1 idx, int24 spacing idx, address pool)
+// In all of them token0/token1 are the first two indexed topics and the pool
+// is the last data word that is a real address. Small numbers (counters,
+// fee, bool) look like addresses padded with zeros, so a "real address" must
+// have a non-zero byte in its first 8 bytes. Factory events that aren't pool
+// creations (OwnerChanged, FeeAmountEnabled...) carry no data -> skipped.
+//
+// Reading events costs one request per ~10k pools, versus 3 calls per pool
+// for allPairs(i) + token0() + token1().
 // ----------------------------------------------------------------------------
-export async function listV2Pools(provider: ethers.JsonRpcProvider, callMany: CallMany, f: ScanFactory, maxPairs = 250_000): Promise<ScannedPool[]> {
-  const lenRaw = await provider.call({ to: f.factory, data: v2f.encodeFunctionData('allPairsLength') });
-  const n = Math.min(Number(decodeUint(lenRaw) ?? 0n), maxPairs);
-  if (n === 0) return [];
+const isRealAddressWord = (w: string) => /^0{24}[0-9a-fA-F]{40}$/.test(w) && !/^0{40}/.test(w);
 
-  const addrs = (await callMany(Array.from({ length: n }, (_, i) => ({ target: f.factory, data: v2f.encodeFunctionData('allPairs', [i]) }))))
-    .map(decodeAddr).filter((a): a is string => !!a);
-
-  const tokenCalls: Call[] = [];
-  for (const a of addrs) {
-    tokenCalls.push({ target: a, data: pairI.encodeFunctionData('token0') }, { target: a, data: pairI.encodeFunctionData('token1') });
-    if (f.kind === 'solidly') tokenCalls.push({ target: a, data: pairI.encodeFunctionData('stable') });
+export function decodePoolCreatedLog(log: { topics: readonly string[]; data: string }): { token0: string; token1: string; pool: string } | null {
+  if (log.topics.length < 3) return null;
+  const hex = log.data.startsWith('0x') ? log.data.slice(2) : log.data;
+  if (hex.length < 64 || hex.length % 64 !== 0) return null;
+  const t0 = log.topics[1].slice(2), t1 = log.topics[2].slice(2);
+  if (!isRealAddressWord(t0) || !isRealAddressWord(t1) || t0.toLowerCase() === t1.toLowerCase()) return null;
+  let pool: string | null = null;
+  for (let i = hex.length - 64; i >= 0; i -= 64) {
+    const w = hex.slice(i, i + 64);
+    if (isRealAddressWord(w)) { pool = w; break; }
   }
-  const res = await callMany(tokenCalls);
-  const step = f.kind === 'solidly' ? 3 : 2;
+  if (!pool) return null;
+  const addr = (w: string) => ethers.getAddress('0x' + w.slice(24));
+  return { token0: addr(t0), token1: addr(t1), pool: addr(pool) };
+}
+
+type RawLog = { topics: string[]; data: string };
+
+// eth_getLogs with a hard timeout (a public node can hang on a huge range).
+async function getLogsRaw(provider: ethers.JsonRpcProvider, address: string, from: number, to: number, timeoutMs: number): Promise<RawLog[]> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<never>((_, rej) => { timer = setTimeout(() => rej(new Error('getLogs timeout')), timeoutMs); });
+  try {
+    return await Promise.race([
+      provider.send('eth_getLogs', [{ address, fromBlock: ethers.toQuantity(from), toBlock: ethers.toQuantity(to) }]) as Promise<RawLog[]>,
+      timeout,
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Fetches logs for [from, to]; if the node refuses or times out, splits the
+// range in half and tries each half (down to MIN_RANGE blocks).
+export async function getLogsAdaptive(
+  provider: ethers.JsonRpcProvider, address: string, from: number, to: number,
+  onLogs: (logs: RawLog[]) => void, timeoutMs = 30_000,
+): Promise<void> {
+  const MIN_RANGE = 1_000;
+  // Explicit stack instead of recursion: safe on any range size.
+  const stack: Array<[number, number]> = [[from, to]];
+  while (stack.length) {
+    const [f, t] = stack.pop()!;
+    try {
+      onLogs(await getLogsRaw(provider, address, f, t, timeoutMs));
+    } catch (err) {
+      if (t - f < MIN_RANGE) {
+        await sleep(500);
+        onLogs(await getLogsRaw(provider, address, f, t, timeoutMs)); // last try; throws if still failing
+        continue;
+      }
+      const mid = Math.floor((f + t) / 2);
+      stack.push([mid + 1, t], [f, mid]); // left half processed first
+    }
+  }
+}
+
+export async function listPoolsFromLogs(provider: ethers.JsonRpcProvider, f: ScanFactory, fromBlock: number, toBlock: number): Promise<ScannedPool[]> {
   const pools: ScannedPool[] = [];
-  addrs.forEach((pool, i) => {
-    const t0 = decodeAddr(res[i * step]), t1 = decodeAddr(res[i * step + 1]);
-    if (!t0 || !t1) return;
-    const p: ScannedPool = { dex: f.dex, kind: f.kind, pool, token0: t0, token1: t1 };
-    if (f.kind === 'solidly') p.stable = decodeUint(res[i * step + 2]) === 1n;
-    pools.push(p);
+  const seen = new Set<string>();
+  await getLogsAdaptive(provider, f.factory, fromBlock, toBlock, (logs) => {
+    for (const l of logs) {
+      const d = decodePoolCreatedLog(l);
+      if (!d || seen.has(d.pool)) continue;
+      seen.add(d.pool);
+      pools.push({ dex: f.dex, kind: f.kind, ...d });
+    }
   });
   return pools;
 }
 
 // ----------------------------------------------------------------------------
-// V3: read the factory's PoolCreated events.
-//
-// Works for Uniswap, PancakeSwap AND Ramses V3 without knowing the exact
-// event signature: every variant has token0/token1 as the first two indexed
-// topics and the pool address as the LAST word of the data. Factory events
-// that aren't pool creations (OwnerChanged, FeeAmountEnabled...) carry no
-// data and are skipped.
+// Saved scan state, so a restart only reads pools created since last time.
+// Compact on purpose (Robinhood has 100k+ memecoin pools): tokens are stored
+// once in a list and pools refer to them by index.
 // ----------------------------------------------------------------------------
-export function decodePoolCreatedLog(log: { topics: readonly string[]; data: string }): { token0: string; token1: string; pool: string } | null {
-  if (log.topics.length < 3) return null;
-  const hex = log.data.startsWith('0x') ? log.data.slice(2) : log.data;
-  if (hex.length < 64 || hex.length % 64 !== 0) return null;
-  const word = (w: string) => (/^0{24}[0-9a-fA-F]{40}$/.test(w) ? ethers.getAddress('0x' + w.slice(24)) : null);
-  const token0 = word(log.topics[1].slice(2)), token1 = word(log.topics[2].slice(2));
-  const pool = word(hex.slice(hex.length - 64));
-  if (!token0 || !token1 || !pool || token0 === token1) return null;
-  if (pool === ethers.ZeroAddress) return null;
-  return { token0, token1, pool };
+export interface ScanState {
+  version: 1;
+  lastBlock: Record<string, number>;          // factory (lowercase) -> last block scanned
+  tokens: string[];                           // lowercase token addresses
+  pools: Array<[number, string, number, number]>; // [factory index in `factories`, pool, token0 idx, token1 idx]
+  factories: string[];                        // "dex|kind|factory"
 }
 
-// Fetches logs for [from, to]; if the node refuses the range, splits it in half.
-export async function getLogsAdaptive(
-  provider: ethers.JsonRpcProvider, address: string, from: number, to: number, depth = 0,
-): Promise<ethers.Log[]> {
-  try {
-    return await provider.getLogs({ address, fromBlock: from, toBlock: to });
-  } catch (err) {
-    if (to - from < 2_000 || depth > 24) {
-      // Smallest range still failing: one retry, then give up on it.
-      await sleep(500);
-      return provider.getLogs({ address, fromBlock: from, toBlock: to });
-    }
-    const mid = Math.floor((from + to) / 2);
-    const left = await getLogsAdaptive(provider, address, from, mid, depth + 1);
-    const right = await getLogsAdaptive(provider, address, mid + 1, to, depth + 1);
-    for (const l of right) left.push(l); // no spread: arrays can be very large
-    return left;
-  }
+export function emptyScanState(): ScanState {
+  return { version: 1, lastBlock: {}, tokens: [], pools: [], factories: [] };
 }
 
-export async function listV3Pools(provider: ethers.JsonRpcProvider, f: ScanFactory, latestBlock: number): Promise<ScannedPool[]> {
-  const logs = await getLogsAdaptive(provider, f.factory, 0, latestBlock);
-  const seen = new Set<string>();
-  const pools: ScannedPool[] = [];
-  for (const l of logs) {
-    const d = decodePoolCreatedLog(l);
-    if (!d || seen.has(d.pool)) continue;
-    seen.add(d.pool);
-    pools.push({ dex: f.dex, kind: 'v3', ...d });
-  }
-  return pools;
+export function stateToPools(state: ScanState): ScannedPool[] {
+  return state.pools.map(([fi, pool, i0, i1]) => {
+    const [dex, kind] = state.factories[fi].split('|');
+    return { dex, kind: kind as ScannedPool['kind'], pool, token0: state.tokens[i0], token1: state.tokens[i1] };
+  });
+}
+
+export function addPoolsToState(state: ScanState, f: ScanFactory, pools: ScannedPool[]) {
+  const fkey = `${f.dex}|${f.kind}|${lc(f.factory)}`;
+  let fi = state.factories.indexOf(fkey);
+  if (fi < 0) fi = state.factories.push(fkey) - 1;
+  const tokenIdx = new Map(state.tokens.map((t, i) => [t, i]));
+  const idx = (t: string) => {
+    const k = lc(t);
+    let i = tokenIdx.get(k);
+    if (i === undefined) { i = state.tokens.push(k) - 1; tokenIdx.set(k, i); }
+    return i;
+  };
+  const known = new Set(state.pools.map((p) => lc(p[1])));
+  for (const p of pools) if (!known.has(lc(p.pool))) state.pools.push([fi, p.pool, idx(p.token0), idx(p.token1)]);
 }
 
 // ----------------------------------------------------------------------------
@@ -318,38 +354,52 @@ export function rankCandidates(pools: ScannedPool[], minPoolUsd: number): { mult
 
 // ----------------------------------------------------------------------------
 // The full scan.
+//   state: pass the saved state from last time (or emptyScanState()); it is
+//          updated in place with any new pools, ready to be saved again.
 // ----------------------------------------------------------------------------
-export async function scanUniverse(provider: ethers.JsonRpcProvider, factories: ScanFactory[], opts: ScanOptions): Promise<ScanResult> {
+const pairKey = (p: { token0: string; token1: string }) => [lc(p.token0), lc(p.token1)].sort().join('/');
+
+export async function scanUniverse(
+  provider: ethers.JsonRpcProvider, factories: ScanFactory[], opts: ScanOptions, state: ScanState = emptyScanState(),
+): Promise<ScanResult> {
   const log = opts.log ?? (() => {});
   const minPoolUsd = opts.minPoolUsd ?? 2_000;
   const errors: string[] = [];
   const { callMany, multicall } = await makeCaller(provider);
   const latest = await provider.getBlockNumber();
 
-  // 1) Every pool on every factory (one factory at a time; one failing doesn't stop the rest).
-  const all: ScannedPool[] = [];
-  const poolsPerDex: Record<string, number> = {};
+  // 1) New pools on every factory since the last scan (one factory at a time;
+  //    one failing doesn't stop the rest, and its progress isn't saved).
   for (const f of factories) {
+    const fk = lc(f.factory);
+    const from = (state.lastBlock[fk] ?? -1) + 1;
+    if (from > latest) continue;
     try {
-      const found = f.kind === 'v3' ? await listV3Pools(provider, f, latest) : await listV2Pools(provider, callMany, f);
-      poolsPerDex[f.dex] = found.length;
-      for (const p of found) all.push(p); // (spread would overflow the stack on 100k+ pools)
-      log(`[scan] ${f.dex}: ${found.length} pools`);
+      const found = await listPoolsFromLogs(provider, f, from, latest);
+      addPoolsToState(state, f, found);
+      state.lastBlock[fk] = latest;
+      log(`[scan] ${f.dex}: +${found.length} pools (blocks ${from}-${latest})`);
     } catch (err) {
-      poolsPerDex[f.dex] = -1;
       errors.push(`${f.dex}: ${String((err as any)?.shortMessage ?? (err as any)?.message ?? err).slice(0, 120)}`);
     }
   }
+  const all = stateToPools(state);
+  const poolsPerDex: Record<string, number> = {};
+  for (const f of factories) poolsPerDex[f.dex] = 0;
+  for (const p of all) poolsPerDex[p.dex] = (poolsPerDex[p.dex] ?? 0) + 1;
 
-  // 2) Only pairs on 2+ pools can be arbitraged -- read balances just for those.
+  // 2) Only pairs on 2+ pools can be arbitraged. Read balances for those,
+  //    plus each of their tokens' pools against USDG/WETH (to price them).
   const count = new Map<string, number>();
-  for (const p of all) { const k = [lc(p.token0), lc(p.token1)].sort().join('/'); count.set(k, (count.get(k) ?? 0) + 1); }
-  const pricingTokens = new Set([lc(opts.usdToken), lc(opts.wrappedNative)]);
-  // Pools that matter: multi-pool pairs, plus every pool against USDG/WETH (needed to price tokens).
-  const relevant = all.filter((p) => {
-    const k = [lc(p.token0), lc(p.token1)].sort().join('/');
-    return (count.get(k) ?? 0) >= 2 || pricingTokens.has(lc(p.token0)) || pricingTokens.has(lc(p.token1));
-  });
+  for (const p of all) { const k = pairKey(p); count.set(k, (count.get(k) ?? 0) + 1); }
+  const multi = all.filter((p) => (count.get(pairKey(p)) ?? 0) >= 2);
+  const quote = new Set([lc(opts.usdToken), lc(opts.wrappedNative)]);
+  const needPrice = new Set(multi.flatMap((p) => [lc(p.token0), lc(p.token1)]));
+  const multiSet = new Set(multi);
+  const pricing = all.filter((p) => !multiSet.has(p) && (
+    (quote.has(lc(p.token0)) && needPrice.has(lc(p.token1))) || (quote.has(lc(p.token1)) && needPrice.has(lc(p.token0)))));
+  const relevant = multi.concat(pricing);
+  log(`[scan] ${all.length} pools total; reading balances for ${relevant.length}`);
 
   const balCalls: Call[] = [];
   for (const p of relevant) {
@@ -358,6 +408,11 @@ export async function scanUniverse(provider: ethers.JsonRpcProvider, factories: 
   }
   const bals = await callMany(balCalls);
   relevant.forEach((p, i) => { p.bal0 = decodeUint(bals[i * 2]) ?? 0n; p.bal1 = decodeUint(bals[i * 2 + 1]) ?? 0n; });
+
+  // Solidly pools: stable-curve or volatile? (the bot can only price volatile)
+  const solid = relevant.filter((p) => p.kind === 'solidly');
+  const st = await callMany(solid.map((p) => ({ target: p.pool, data: pairI.encodeFunctionData('stable') })));
+  solid.forEach((p, i) => { p.stable = decodeUint(st[i]) === 1n; });
 
   // 3) Token decimals + symbols, read from the tokens themselves.
   const tokenList = [...new Set(relevant.flatMap((p) => [lc(p.token0), lc(p.token1)]))];
@@ -379,7 +434,6 @@ export async function scanUniverse(provider: ethers.JsonRpcProvider, factories: 
   // 4) Price, value and rank.
   const usdPrice = derivePrices(relevant, decimals, opts.usdToken, opts.wrappedNative);
   for (const p of relevant) p.usd = poolUsd(p, decimals, usdPrice);
-  const multi = relevant.filter((p) => (count.get([lc(p.token0), lc(p.token1)].sort().join('/')) ?? 0) >= 2);
   const { multiPoolPairs, candidates } = rankCandidates(multi, minPoolUsd);
 
   return { poolsPerDex, totalPools: all.length, multiPoolPairs, candidates, tokens, usdPrice, usedMulticall: multicall, errors };

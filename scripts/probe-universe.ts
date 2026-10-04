@@ -20,7 +20,7 @@ const usd = (v: number) => (v >= 1e6 ? `$${(v / 1e6).toFixed(1)}M` : v >= 1e4 ? 
   const t0 = Date.now();
   const res = await scanUniverse(provider, ROBINHOOD_SCAN_FACTORIES, {
     usdToken: ROBINHOOD_TOKENS.USDG, wrappedNative: ROBINHOOD_TOKENS.WETH, minPoolUsd: MIN_USD,
-    log: (m) => console.error(m),
+    log: (m) => console.log(m), // progress on stdout: shows where a slow scan got to
   });
   const sym = (t: string) => res.tokens.get(t.toLowerCase())?.symbol ?? t.slice(0, 8);
   const ethPx = res.usdPrice.get(ROBINHOOD_TOKENS.WETH.toLowerCase());

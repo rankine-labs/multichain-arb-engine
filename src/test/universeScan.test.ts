@@ -1,5 +1,5 @@
 import { ethers } from 'ethers';
-import { decodePoolCreatedLog, derivePrices, poolUsd, rankCandidates, ScannedPool } from '../core/universeScan';
+import { decodePoolCreatedLog, derivePrices, poolUsd, rankCandidates, ScannedPool, emptyScanState, addPoolsToState, stateToPools } from '../core/universeScan';
 import { PairWatcher } from '../core/pairWatcher';
 import { PoolCache } from '../core/poolCache';
 
@@ -11,7 +11,8 @@ function assert(cond: boolean, msg: string) {
   if (!cond) { console.error(`FAIL: ${msg}`); process.exitCode = 1; }
   else console.log(`PASS: ${msg}`);
 }
-const A = (n: number) => ethers.getAddress('0x' + n.toString(16).padStart(40, '0'));
+// Realistic addresses (non-zero leading bytes, like real contracts).
+const A = (n: number) => ethers.getAddress('0xabcdef0123' + n.toString(16).padStart(30, '0'));
 const pad = (a: string) => '0x' + a.slice(2).toLowerCase().padStart(64, '0');
 
 // ---- PoolCreated decoding ---------------------------------------------------
@@ -24,7 +25,18 @@ assert(uni?.token0 === A(1) && uni?.token1 === A(2) && uni?.pool === A(99), 'Uni
 
 // Ramses-style: tickSpacing indexed, data = pool only
 const ram = decodePoolCreatedLog({ topics: ['0x' + '11'.repeat(32), pad(A(3)), pad(A(4)), pad('0x01')], data: pad(A(77)) });
+assert(emptyScanState().pools.length === 0, 'empty scan state');
 assert(ram?.pool === A(77), 'Ramses-style PoolCreated (pool as only data word) decoded');
+
+// Uniswap V2: PairCreated(token0 idx, token1 idx, address pair, uint n) -- the counter must not be taken as the pool.
+const v2 = decodePoolCreatedLog({ topics: [ethers.id('PairCreated(address,address,address,uint256)'), pad(A(1)), pad(A(2))], data: pad(A(55)) + (12345).toString(16).padStart(64, '0') });
+assert(v2?.pool === A(55), 'Uniswap V2 PairCreated decoded (pair, not the counter)');
+// Solidly: PairCreated(token0 idx, token1 idx, bool stable, address pair, uint n)
+const sol = decodePoolCreatedLog({ topics: ['0x' + '44'.repeat(32), pad(A(1)), pad(A(2))], data: '0x' + '1'.padStart(64, '0') + pad(A(66)).slice(2) + '7'.padStart(64, '0') });
+assert(sol?.pool === A(66), 'Solidly PairCreated decoded (pair, not the bool or counter)');
+// Negative tickSpacing (int24 -> ff..ff) is not an address.
+const neg = decodePoolCreatedLog({ topics: ['0x' + '55'.repeat(32), pad(A(1)), pad(A(2))], data: '0x' + 'f'.repeat(64) });
+assert(neg === null, 'negative number never read as a pool');
 
 // Non-pool factory events (OwnerChanged, FeeAmountEnabled) carry no data -> skipped.
 assert(decodePoolCreatedLog({ topics: ['0x' + '22'.repeat(32), pad(A(5)), pad(A(6))], data: '0x' }) === null, 'event without data skipped');
@@ -65,6 +77,17 @@ assert(candidates[0].tokenA.toLowerCase() === TOK.toLowerCase() || candidates[0]
   'ranked by 2nd-deepest pool (TOK/WETH 2nd pool $6k beats WETH/USDG 2nd pool $2k)');
 assert(!candidates[0].pools.some((p) => p.stable), 'stable-curve pool never counted');
 assert(candidates[0].dexes.join(',') === 'uniswap-v2,ramses-v2', 'distinct DEXes listed deepest first');
+
+// ---- saved state ------------------------------------------------------------
+const stt = emptyScanState();
+const fUni = { dex: 'uniswap-v2', kind: 'v2' as const, factory: A(900) };
+addPoolsToState(stt, fUni, [pools[0], pools[2]]);
+addPoolsToState(stt, fUni, [pools[0]]);                       // duplicate ignored
+addPoolsToState(stt, { dex: 'ramses-v2', kind: 'solidly', factory: A(901) }, [pools[3]]);
+const back = JSON.parse(JSON.stringify(stt));                // survives save/load
+const restored = stateToPools(back);
+assert(restored.length === 3 && stt.tokens.length === 3, 'state stores each pool once, each token once');
+assert(restored[2].dex === 'ramses-v2' && restored[2].kind === 'solidly' && restored[2].pool === pools[3].pool, 'pool restored with its DEX and kind');
 
 // ---- pinned pairs survive eviction ------------------------------------------
 const w = new PairWatcher('robinhood', {} as any, [], new PoolCache(), () => {}, { maxPairs: 2 });

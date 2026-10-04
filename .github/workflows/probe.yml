@@ -59,7 +59,7 @@ jobs:
         if: inputs.only == '' || inputs.only == 'universe'
         shell: bash
         run: |
-          out=$(node .scripts-build/scripts/probe-universe.js 2>/dev/null | tail -40)
+          out=$(timeout 1200 node .scripts-build/scripts/probe-universe.js 2>&1 | tail -40)
           echo "$out"
           out="${out//'%'/'%25'}"; out="${out//$'\n'/'%0A'}"
           echo "::notice title=Universe scan::${out}"

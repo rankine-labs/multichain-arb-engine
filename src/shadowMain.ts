@@ -53,7 +53,8 @@ import { AvalancheAdapter } from './chains/avalanche';
 import { RawChainEvent } from './core/types';
 import { priceOf, spreadPct } from './core/poolPrice';
 import { PairWatcher, Venue, refreshPoolState } from './core/pairWatcher';
-import { scanUniverse } from './core/universeScan';
+import { scanUniverse, emptyScanState, ScanState } from './core/universeScan';
+import { readFileSync, writeFileSync, mkdirSync, renameSync } from 'fs';
 import { ROBINHOOD_SCAN_FACTORIES } from './config/knownAddresses';
 import { buildExecuteCall, executionRequested, executorConfig, pickV3Lender } from './execution/executorCalldata';
 import { makeRpc, simulateRoundTrip, simRpcUrl, Rpc } from './execution/simulator';
@@ -688,15 +689,36 @@ await chainManager.startAll();
       //   ROBINHOOD_SCAN_MIN_USD  minimum money per pool (default 2000)
       const SCAN_TOP = Number(process.env.ROBINHOOD_SCAN_TOP ?? 20);
       const SCAN_MIN_USD = Number(process.env.ROBINHOOD_SCAN_MIN_USD ?? 2_000);
+      // Pools found so far are saved here, so a restart (every auto-deploy)
+      // only reads pools created since the last scan. Safe to delete: the
+      // next scan just starts from scratch.
+      const SCAN_STATE_FILE = 'data/robinhood-universe.json';
+      const loadScanState = (): ScanState => {
+            try {
+                  const st = JSON.parse(readFileSync(SCAN_STATE_FILE, 'utf8'));
+                  if (st?.version === 1 && Array.isArray(st.pools)) return st;
+            } catch { /* missing or unreadable: start fresh */ }
+            return emptyScanState();
+      };
+      const saveScanState = (st: ScanState) => {
+            try {
+                  mkdirSync('data', { recursive: true });
+                  writeFileSync(SCAN_STATE_FILE + '.tmp', JSON.stringify(st));
+                  renameSync(SCAN_STATE_FILE + '.tmp', SCAN_STATE_FILE); // atomic: never a half-written file
+            } catch (err) { console.warn('[scan] could not save state:', (err as Error).message); }
+      };
+      let scanState: ScanState | null = null;
       let scanRunning = false;
       const runRobinhoodScan = async () => {
             if (scanRunning || SCAN_TOP <= 0) return;
             scanRunning = true;
             try {
                   const t0 = Date.now();
+                  scanState ??= loadScanState();
                   const res = await scanUniverse(robinhoodReadProvider, ROBINHOOD_SCAN_FACTORIES, {
                         usdToken: ROBINHOOD_TOKENS.USDG, wrappedNative: ROBINHOOD_TOKENS.WETH, minPoolUsd: SCAN_MIN_USD,
-                  });
+                  }, scanState);
+                  saveScanState(scanState);
                   const top = res.candidates.slice(0, SCAN_TOP);
                   console.log(`[scan] robinhood: ${res.totalPools} pools, ${res.multiPoolPairs} pairs on 2+ pools, ${res.candidates.length} with $${SCAN_MIN_USD}+ in 2+ pools (${Math.round((Date.now() - t0) / 1000)}s)${res.errors.length ? ' errors: ' + res.errors.join('; ') : ''}`);
                   // One pair at a time: the watcher does its own exact pool discovery.
