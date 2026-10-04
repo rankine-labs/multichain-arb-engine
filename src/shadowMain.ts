@@ -1,4 +1,12 @@
 import 'dotenv/config';
+
+// One bad trade event must never take the whole bot down. Event handlers are
+// async, so a bug in one shows up as an unhandled promise rejection, which
+// Node 22 treats as fatal (crash, pm2 restart, all feeds reconnect). Log it
+// and keep running instead; the next event is handled normally.
+process.on('unhandledRejection', (reason) => {
+      console.error('[error] unhandled rejection (bot keeps running):', reason);
+});
 import { ethers } from 'ethers';
 import { resolveAndFetchV2Pool, resolveAndFetchLBPool, resolveAndFetchV3Pool, resolveAndFetchV4Pool, resolveKuruMarket, refetchV2PoolPrice, refetchV3PoolPrice } from './core/poolResolver';
 import { ChainManager } from './core/chainManager';
@@ -122,6 +130,8 @@ Object.entries(discoveryConfigs).map(([chain, cfg]) => [chain, new PoolDiscovery
       // evaluateLiveDiscovery for what this does and does NOT check yet (no
       // volume gate — that needs historical event-log scanning, not built).
       function registerIfApproved(chain: 'avalanche' | 'monad' | 'robinhood', dex: string, resolved: any): boolean {
+            // Resolvers return null when there's no pool (or it couldn't be read).
+            if (!resolved) return false;
             const hasNonZeroLiquidity = (resolved.reserveA ?? 0n) > 0n && (resolved.reserveB ?? 0n) > 0n;
             const gate = discoveryEngines[chain].evaluateLiveDiscovery({ chain: resolved.chain, dex, hasNonZeroLiquidity });
             if (!gate.approved) {
