@@ -199,7 +199,7 @@ export async function getLogsAdaptive(
   provider: ethers.JsonRpcProvider, address: string | string[], from: number, to: number,
   onLogs: (logs: RawLog[]) => void, timeoutMs = 30_000,
 ): Promise<void> {
-  const MIN_RANGE = 1_000;
+  const MIN_RANGE = 8; // keep splitting: busy stretches can overflow even a few hundred blocks
   // Explicit stack instead of recursion: safe on any range size.
   const stack: Array<[number, number]> = [[from, to]];
   while (stack.length) {
