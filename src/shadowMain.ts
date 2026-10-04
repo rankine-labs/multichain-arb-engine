@@ -77,6 +77,7 @@ import { readFileSync, writeFileSync, mkdirSync, renameSync } from 'fs';
 import { ROBINHOOD_SCAN_FACTORIES } from './config/knownAddresses';
 import { buildExecuteCall, executionRequested, executorConfig, pickV3Lender } from './execution/executorCalldata';
 import { makeRpc, simulateRoundTrip, simRpcUrl, Rpc } from './execution/simulator';
+import { FastSender, SafetyGate, safetyConfigFromEnv } from './execution/fastSender';
 
 async function main() {
 const cache = new PoolCache();
@@ -359,6 +360,19 @@ const REFRESH_TIMEOUT_MS = 1_500;
 const FAST_PRICES = process.env.FAST_PRICES !== 'off';
 const FRESH_MS = 20_000;
 const priceStats = { local: 0, rpc: 0 };
+
+// FAST SENDER (Robinhood). Dry run unless the live switches are all set
+// (see execution/fastSender.ts). ROBINHOOD_SEND_RPC = where to send trades
+// (ideally straight to the sequencer); defaults to the read RPC.
+const robinhoodSender = new FastSender(
+      robinhoodReadProvider, 4663,
+      process.env.ROBINHOOD_SEND_RPC ? new ethers.JsonRpcProvider(process.env.ROBINHOOD_SEND_RPC, 4663, { staticNetwork: true }) : robinhoodReadProvider,
+);
+const safetyGate = new SafetyGate(safetyConfigFromEnv());
+safetyGate.allowTokens([ROBINHOOD_TOKENS.WETH, ROBINHOOD_TOKENS.USDG]);
+// "fire-ready" = from the moment we saw the trigger trade to a signed trade
+// in hand. The number to compare against competitors.
+const fireStats = { readyMs: [] as number[], blocked: new Map<string, number>(), sent: 0 };
 const refreshNow = async (p: any): Promise<any> => {
       if (p.dex === 'uniswap-v4' || p.poolType === 'orderbook' || p.dex.includes('lb') || p.dex === 'bean-exchange') return p;
       const fresh = await Promise.race([
@@ -658,6 +672,22 @@ console.log(
             });
             if ('reason' in dry) {
                   console.log(`[exec-dryrun] ${swap.chain} NOT executable: ${dry.reason}`);
+            } else if (swap.chain === 'robinhood') {
+                  // Safety gate, then build + sign (and send only if live).
+                  const gate = safetyGate.check({ tradeSizeUsd: sizing.optimalTradeSizeUsd, tokens: [swap.tokenIn, swap.tokenOut] });
+                  if (!gate.ok) {
+                        const r = 'reason' in gate ? gate.reason.replace(/\$\d+/g, '$N').replace(/0x[0-9a-f]+/gi, '0x…') : 'blocked';
+                        fireStats.blocked.set(r, (fireStats.blocked.get(r) ?? 0) + 1);
+                  } else if (robinhoodSender.live && !dry.to) {
+                        fireStats.blocked.set('no executor deployed', (fireStats.blocked.get('no executor deployed') ?? 0) + 1);
+                  } else {
+                        const fired = await robinhoodSender.fire(dry.to ?? '0x0000000000000000000000000000000000000000', dry.data);
+                        const readyMs = Date.now() - event.receivedAtMs;
+                        fireStats.readyMs.push(readyMs);
+                        if (fired.txHash) fireStats.sent++;
+                        console.log(`[fire] robinhood ${fired.live ? 'LIVE' : 'DRY RUN'} ready ${readyMs}ms after the trigger (sign ${fired.signMs.toFixed(1)}ms)` +
+                              `${fired.txHash ? ` tx ${fired.txHash}` : ''}${fired.error ? ` error: ${fired.error}` : ''}`);
+                  }
             } else {
                   const funding = dry.funding;
                   console.log(
@@ -673,9 +703,14 @@ console.log(
 // Live trading is not implemented yet (adapters' fireTransaction() are
 // placeholders). Make sure flipping the switch early can't be mistaken for
 // the bot actually trading.
-if (executionRequested()) {
-      console.warn('[execution] EXECUTION_ENABLED=true but live firing is NOT implemented -- staying in shadow mode');
+if (executionRequested() && !robinhoodSender.live) {
+      console.warn('[execution] EXECUTION_ENABLED=true but LIVE_SEND_CONFIRM / BOT_PRIVATE_KEY not set -- dry run only');
       await sendTelegramMessage(formatExecutionWarning());
+}
+if (chainOn('robinhood')) {
+      robinhoodSender.start()
+            .then(() => console.log(`[fire] robinhood sender ready (${robinhoodSender.live ? 'LIVE from ' + robinhoodSender.address : 'dry run'})`))
+            .catch((err) => console.warn('[fire] robinhood sender failed to start:', (err as Error).message));
 }
 
 await chainManager.startAll();
@@ -781,6 +816,8 @@ await chainManager.startAll();
                   }, scanState);
                   saveScanState(scanState);
                   const top = res.candidates.slice(0, SCAN_TOP);
+                  // Only vetted pairs' tokens may ever be traded (safety gate allowlist).
+                  safetyGate.allowTokens(top.flatMap((c) => [c.tokenA, c.tokenB]));
                   console.log(`[scan] robinhood: ${res.totalPools} pools, ${res.multiPoolPairs} pairs on 2+ pools, ${res.candidates.length} with $${SCAN_MIN_USD}+ in 2+ pools (${Math.round((Date.now() - t0) / 1000)}s)${res.errors.length ? ' errors: ' + res.errors.join('; ') : ''}`);
                   // One pair at a time: the watcher does its own exact pool discovery.
                   for (const c of top) {
@@ -994,7 +1031,9 @@ for (let i = 0; i < resolved.length; i++) {
                         const st = robinhoodWatcher.stats();
                         const tot = priceStats.local + priceStats.rpc;
                         const localPct = tot ? Math.round((100 * priceStats.local) / tot) : 0;
-                        note = `watching ${st.pairs} pair${st.pairs === 1 ? '' : 's'}, ${st.pools} pools${tot ? `, ${localPct}% instant prices` : ''}`;
+                        const fr = [...fireStats.readyMs].sort((a, b) => a - b);
+                        const fireNote = fr.length ? `, fire-ready ${fr[Math.floor(fr.length / 2)]}ms median (${fr.length})` : '';
+                        note = `watching ${st.pairs} pair${st.pairs === 1 ? '' : 's'}, ${st.pools} pools${tot ? `, ${localPct}% instant prices` : ''}${fireNote}`;
                   }
                   return { chain, spreads, noMatchCount, note };
             });
@@ -1026,6 +1065,7 @@ for (let i = 0; i < resolved.length; i++) {
                   for (const chainName of Object.keys(chainHealthFlapCount)) chainHealthFlapCount[chainName] = 0;
                   simStats.checked = simStats.profit = simStats.loss = simStats.fail = simStats.rateLimited = 0;
                   priceStats.local = priceStats.rpc = 0;
+                  fireStats.readyMs = []; fireStats.blocked.clear(); fireStats.sent = 0;
                   lastDigestAt = now;
             }
       };
