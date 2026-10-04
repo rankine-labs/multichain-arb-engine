@@ -763,7 +763,10 @@ await chainManager.startAll();
                   const st = robinhoodWatcher.stats();
                   console.log(`[scan] robinhood now watching ${st.pairs} pairs (${st.pinned} pinned), ${st.pools} pools`);
             } catch (err) {
-                  console.warn('[scan] robinhood scan failed:', (err as Error).message);
+                  // Usually the free public RPC rate-limiting us. Don't wait the
+                  // full 6 hours: try again in 15 minutes.
+                  console.warn('[scan] robinhood scan failed, retrying in 15 min:', String((err as Error).message).slice(0, 200));
+                  setTimeout(() => { void runRobinhoodScan(); }, 15 * 60_000);
             } finally {
                   scanRunning = false;
             }
