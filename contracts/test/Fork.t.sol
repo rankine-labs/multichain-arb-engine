@@ -342,9 +342,11 @@ contract RobinhoodForkTest is ForkBase {
             return;
         }
         exec.setFlashPool(lender, true);
-        // Tiny float ONLY so a losing round trip can still repay the loan and
-        // reach our profit check (proves the full borrow/trade/repay loop).
-        _fundWrapped(WETH, 0.001 ether);
+        // Float ONLY so a losing round trip can still repay the loan and reach
+        // our profit check (proves the full borrow/trade/repay loop). Sized to
+        // cover even a total loss of the 0.01 WETH borrowed: live pool prices
+        // drift, and a 0.001 float stopped covering the round-trip loss.
+        _fundWrapped(WETH, 0.011 ether);
         ArbExecutor.Hop[] memory hops = new ArbExecutor.Hop[](2);
         hops[0] = _hop(1, _ramsesV2(), WETH, USDG, 0);
         hops[1] = _hop(2, cake, USDG, WETH, 0);
