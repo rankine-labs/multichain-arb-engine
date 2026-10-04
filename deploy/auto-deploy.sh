@@ -51,6 +51,11 @@ fi
 
 cd "$APP_DIR" || { log "ERROR: APP_DIR $APP_DIR not found"; exit 1; }
 
+# --- Status page (GitHub issue), throttled to every 15 min inside the script.
+# Runs in the background with the lock released, so it can never delay or
+# block a deploy. Does nothing until GH_STATUS_TOKEN is in .env.
+( exec 9>&-; timeout 60 node "$SCRIPT_DIR/status-report.js" >> "$SCRIPT_DIR/status-report.log" 2>&1 ) &
+
 # --- Telegram alerts --------------------------------------------------------
 # Reads ONLY the two Telegram lines from the bot's .env (does not load the
 # rest of the file, so wallet keys etc. never enter this script).
