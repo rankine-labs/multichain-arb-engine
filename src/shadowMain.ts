@@ -53,6 +53,9 @@ import { AvalancheAdapter } from './chains/avalanche';
 import { RawChainEvent } from './core/types';
 import { priceOf, spreadPct } from './core/poolPrice';
 import { PairWatcher, Venue, refreshPoolState } from './core/pairWatcher';
+import { scanUniverse, emptyScanState, ScanState } from './core/universeScan';
+import { readFileSync, writeFileSync, mkdirSync, renameSync } from 'fs';
+import { ROBINHOOD_SCAN_FACTORIES } from './config/knownAddresses';
 import { buildExecuteCall, executionRequested, executorConfig, pickV3Lender } from './execution/executorCalldata';
 import { makeRpc, simulateRoundTrip, simRpcUrl, Rpc } from './execution/simulator';
 
@@ -316,7 +319,8 @@ const robinhoodWatcher = new PairWatcher('robinhood', robinhoodReadProvider, ROB
             (TOKEN_DECIMALS.robinhood ??= {})[addr] = meta.decimals;
             (TOKEN_SYMBOLS.robinhood ??= {})[addr] = meta.symbol;
       },
-      { maxPairs: 40, rediscoverMs: 10 * 60_000, refreshMs: 30_000 });
+      // 60 = up to ~20 pinned pairs from the chain-wide scan + traffic-driven ones.
+      { maxPairs: 60, rediscoverMs: 10 * 60_000, refreshMs: 30_000 });
 
 // Re-read a pool's live price right before using it (skips pools we can't
 // refresh this way: Uniswap V4, order books, bin pools). Never waits more
@@ -673,9 +677,65 @@ await chainManager.startAll();
       // Robinhood partner pools: every DEX + fee tier for WETH/USDG from the
       // start (replaces the old single Uniswap V2 + Ramses V2 seeds); other
       // pairs are added automatically as they trade (core/pairWatcher.ts).
-      const wethUsdgPools = await robinhoodWatcher.watch(ROBINHOOD_TOKENS.WETH, ROBINHOOD_TOKENS.USDG);
+      const wethUsdgPools = await robinhoodWatcher.watch(ROBINHOOD_TOKENS.WETH, ROBINHOOD_TOKENS.USDG, { pin: true });
       console.log(`[pairs] robinhood WETH/USDG: ${wethUsdgPools} pools found at startup`);
       robinhoodWatcher.start();
+
+      // Chain-wide scan: every pool on every Robinhood DEX factory, keeping
+      // pairs that sit on 2+ pools with real money in each (core/universeScan.ts).
+      // Catches pairs that trade too rarely for the traffic-driven watcher to
+      // notice. Runs in the background (never delays startup), then every 6h.
+      //   ROBINHOOD_SCAN_TOP      how many pairs to pin (default 20, 0 = off)
+      //   ROBINHOOD_SCAN_MIN_USD  minimum money per pool (default 2000)
+      const SCAN_TOP = Number(process.env.ROBINHOOD_SCAN_TOP ?? 20);
+      const SCAN_MIN_USD = Number(process.env.ROBINHOOD_SCAN_MIN_USD ?? 2_000);
+      // Pools found so far are saved here, so a restart (every auto-deploy)
+      // only reads pools created since the last scan. Safe to delete: the
+      // next scan just starts from scratch.
+      const SCAN_STATE_FILE = 'data/robinhood-universe.json';
+      const loadScanState = (): ScanState => {
+            try {
+                  const st = JSON.parse(readFileSync(SCAN_STATE_FILE, 'utf8'));
+                  if (st?.version === 1 && Array.isArray(st.pools)) return st;
+            } catch { /* missing or unreadable: start fresh */ }
+            return emptyScanState();
+      };
+      const saveScanState = (st: ScanState) => {
+            try {
+                  mkdirSync('data', { recursive: true });
+                  writeFileSync(SCAN_STATE_FILE + '.tmp', JSON.stringify(st));
+                  renameSync(SCAN_STATE_FILE + '.tmp', SCAN_STATE_FILE); // atomic: never a half-written file
+            } catch (err) { console.warn('[scan] could not save state:', (err as Error).message); }
+      };
+      let scanState: ScanState | null = null;
+      let scanRunning = false;
+      const runRobinhoodScan = async () => {
+            if (scanRunning || SCAN_TOP <= 0) return;
+            scanRunning = true;
+            try {
+                  const t0 = Date.now();
+                  scanState ??= loadScanState();
+                  const res = await scanUniverse(robinhoodReadProvider, ROBINHOOD_SCAN_FACTORIES, {
+                        usdToken: ROBINHOOD_TOKENS.USDG, wrappedNative: ROBINHOOD_TOKENS.WETH, minPoolUsd: SCAN_MIN_USD,
+                  }, scanState);
+                  saveScanState(scanState);
+                  const top = res.candidates.slice(0, SCAN_TOP);
+                  console.log(`[scan] robinhood: ${res.totalPools} pools, ${res.multiPoolPairs} pairs on 2+ pools, ${res.candidates.length} with $${SCAN_MIN_USD}+ in 2+ pools (${Math.round((Date.now() - t0) / 1000)}s)${res.errors.length ? ' errors: ' + res.errors.join('; ') : ''}`);
+                  // One pair at a time: the watcher does its own exact pool discovery.
+                  for (const c of top) {
+                        try { await robinhoodWatcher.watch(c.tokenA, c.tokenB, { pin: true }); }
+                        catch (err) { console.warn('[scan] watch failed:', (err as Error).message); }
+                  }
+                  const st = robinhoodWatcher.stats();
+                  console.log(`[scan] robinhood now watching ${st.pairs} pairs (${st.pinned} pinned), ${st.pools} pools`);
+            } catch (err) {
+                  console.warn('[scan] robinhood scan failed:', (err as Error).message);
+            } finally {
+                  scanRunning = false;
+            }
+      };
+      void runRobinhoodScan();
+      setInterval(() => { void runRobinhoodScan(); }, 6 * 60 * 60_000);
 
       // Proactively checks known, real multi-DEX pairs directly on a
       // timer, instead of waiting for real swap traffic to happen to
