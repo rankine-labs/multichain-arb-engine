@@ -85,6 +85,9 @@ export async function refreshPoolState(provider: ethers.JsonRpcProvider, pool: P
 
 export class PairWatcher {
   private pairs = new Map<string, { tokenA: string; tokenB: string; pools: string[]; discoveredAt: number; lastSeen: number }>();
+  // Pairs found by the chain-wide scan (or always-watched like WETH/USDG):
+  // never dropped to make room for traffic-driven pairs.
+  private pinned = new Set<string>();
   private inFlight = new Set<string>();           // queued or running
   private queue: Array<{ a: string; b: string }> = [];
   private working = false;
@@ -156,7 +159,9 @@ export class PairWatcher {
   }
 
   // Awaitable version, used at startup for pairs we always want.
-  async watch(a: string, b: string): Promise<number> {
+  // pin = keep this pair even when traffic-driven pairs fill the list.
+  async watch(a: string, b: string, opts: { pin?: boolean } = {}): Promise<number> {
+    if (opts.pin) this.pinned.add(this.key(a, b));
     await this.discover(a, b);
     return this.pairs.get(this.key(a, b))?.pools.length ?? 0;
   }
@@ -202,7 +207,10 @@ export class PairWatcher {
   private evictIfNeeded() {
     while (this.pairs.size > this.maxPairs) {
       let oldestKey: string | null = null, oldest = Infinity;
-      for (const [k, v] of this.pairs) if (v.lastSeen < oldest) { oldest = v.lastSeen; oldestKey = k; }
+      for (const [k, v] of this.pairs) {
+        if (this.pinned.has(k)) continue; // pinned pairs are never dropped
+        if (v.lastSeen < oldest) { oldest = v.lastSeen; oldestKey = k; }
+      }
       if (!oldestKey) break;
       this.pairs.delete(oldestKey); // stops refreshing; decision-time refresh still covers any use
     }
@@ -230,6 +238,6 @@ export class PairWatcher {
   stats() {
     let pools = 0;
     for (const p of this.pairs.values()) pools += p.pools.length;
-    return { pairs: this.pairs.size, pools, queued: this.queue.length, singlePoolPairs: this.singlePool.size };
+    return { pairs: this.pairs.size, pools, pinned: this.pinned.size, queued: this.queue.length, singlePoolPairs: this.singlePool.size };
   }
 }

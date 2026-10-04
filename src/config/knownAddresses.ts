@@ -282,3 +282,15 @@ registerStablecoin('monad', MONAD_TOKENS.USDC);
 
 registerStablecoin('robinhood', ROBINHOOD_TOKENS.USDG);
 }
+
+// Every Robinhood DEX factory, for the chain-wide pool scan
+// (core/universeScan.ts). V2-style factories are listed with allPairs();
+// V3-style ones through their PoolCreated event history.
+export const ROBINHOOD_SCAN_FACTORIES: { dex: string; kind: 'v2' | 'solidly' | 'v3'; factory: string }[] = [
+  { dex: 'uniswap-v2', kind: 'v2', factory: ROBINHOOD_V2.FACTORY },
+  { dex: 'pancakeswap-v2', kind: 'v2', factory: ROBINHOOD_PANCAKE.V2_FACTORY },
+  { dex: 'ramses-v2', kind: 'solidly', factory: ROBINHOOD_RAMSES.V2_FACTORY },
+  { dex: 'uniswap-v3', kind: 'v3', factory: ROBINHOOD_V3.FACTORY },
+  { dex: 'pancakeswap-v3', kind: 'v3', factory: ROBINHOOD_PANCAKE.V3_FACTORY },
+  { dex: 'ramses-v3', kind: 'v3', factory: ROBINHOOD_RAMSES.V3_FACTORY },
+];

@@ -7,6 +7,11 @@ name: Live probe
 
 on:
   workflow_dispatch:
+    inputs:
+      only:
+        description: 'Run one step only: feeds, sim, pairs, watch, universe (blank = all)'
+        required: false
+        default: ''
 
 jobs:
   probe:
@@ -17,15 +22,17 @@ jobs:
         with:
           node-version: 22
       - run: npm install --no-audit --no-fund
+      - run: npx tsc -p tsconfig.scripts.json
       - name: Probe live feeds
+        if: inputs.only == '' || inputs.only == 'feeds'
         shell: bash
         run: |
-          npx tsc -p tsconfig.scripts.json
           out=$(node .scripts-build/scripts/probe-feeds.js 2>&1 | tail -40)
           echo "$out"
           out="${out//'%'/'%25'}"; out="${out//$'\n'/'%0A'}"
           echo "::notice title=Feed probe::${out}"
       - name: Probe free simulation on real chains
+        if: inputs.only == '' || inputs.only == 'sim'
         shell: bash
         run: |
           out=$(node .scripts-build/scripts/probe-sim.js 2>&1 | tail -20)
@@ -33,6 +40,7 @@ jobs:
           out="${out//'%'/'%25'}"; out="${out//$'\n'/'%0A'}"
           echo "::notice title=Simulation probe::${out}"
       - name: Robinhood most-traded pairs
+        if: inputs.only == '' || inputs.only == 'pairs'
         shell: bash
         run: |
           out=$(PROBE_SECONDS=120 node .scripts-build/scripts/probe-pairs.js 2>&1 | tail -25)
@@ -40,9 +48,18 @@ jobs:
           out="${out//'%'/'%25'}"; out="${out//$'\n'/'%0A'}"
           echo "::notice title=Pair probe::${out}"
       - name: Robinhood pool discovery (pair watcher)
+        if: inputs.only == '' || inputs.only == 'watch'
         shell: bash
         run: |
           out=$(node .scripts-build/scripts/probe-watch.js 2>&1 | tail -20)
           echo "$out"
           out="${out//'%'/'%25'}"; out="${out//$'\n'/'%0A'}"
           echo "::notice title=Watch probe::${out}"
+      - name: Robinhood chain-wide pool scan (every pair on 2+ pools)
+        if: inputs.only == '' || inputs.only == 'universe'
+        shell: bash
+        run: |
+          out=$(node .scripts-build/scripts/probe-universe.js 2>/dev/null | tail -40)
+          echo "$out"
+          out="${out//'%'/'%25'}"; out="${out//$'\n'/'%0A'}"
+          echo "::notice title=Universe scan::${out}"
