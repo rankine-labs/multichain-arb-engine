@@ -99,7 +99,8 @@ async function main() {
       const kind = kindOf.get(pool);
       if (!kind) continue;
       const state = decodePoolEvent(kind, l);
-      if (state) events.push({ block: Number(l.blockNumber), logIndex: Number(l.logIndex), pool, state });
+      if (state) events.push({ block: Number(l.blockNumber), logIndex: Number(l.logIndex), pool, state,
+        txHash: l.transactionHash ? lc(l.transactionHash) : undefined, txIndex: l.transactionIndex !== undefined ? Number(l.transactionIndex) : undefined });
     }
     if (Date.now() - lastNote > 60_000) { lastNote = Date.now(); say(`[bt] ...${rawCount} events so far`); }
   });
@@ -152,6 +153,39 @@ async function main() {
   }).join(' · '));
   const busiest = [...swapsPerPool.entries()].sort((a, b) => b[1] - a[1]).slice(0, 3)
     .map(([a, n]) => { const p = pools.find((x) => x.address === a)!; return `${sym(p.token0)}/${sym(p.token1)} ${p.dex} ${(p.fee * 100).toFixed(2)}%: ${n}`; });
+  // ---- COMPETITORS: who closed the gaps, and how fast? -----------------------
+  // An arb touches two pools of the same pair in ONE transaction. The trade
+  // that closed a gap and did that = a competing bot. Its position right after
+  // the trade that opened the gap (same block, next transaction) = top speed.
+  const txPools = new Map<string, Set<string>>();
+  for (const ev of events) if (ev.txHash) (txPools.get(ev.txHash) ?? txPools.set(ev.txHash, new Set()).get(ev.txHash)!).add(ev.pool);
+  const sample = e5.opportunities.filter((o) => !o.stillOpen && o.closeTx);
+  const arbCloses = sample.filter((o) => o.closeTx !== o.openTx && [...(txPools.get(o.closeTx!) ?? [])].filter((p) => o.poolsInPair.includes(p)).length >= 2);
+  const selfCloses = sample.filter((o) => o.closeTx === o.openTx).length;
+  const bots = new Map<string, { wins: number; usd: number; from: Set<string> }>();
+  const gaps: number[] = [];
+  for (const o of arbCloses) {
+    let to = 'unknown', from = 'unknown';
+    try {
+      const tx = await provider.getTransaction(o.closeTx!);
+      to = lc(tx?.to ?? 'contract-creation'); from = lc(tx?.from ?? 'unknown');
+    } catch { /* keep unknown */ }
+    const b = bots.get(to) ?? { wins: 0, usd: 0, from: new Set<string>() };
+    b.wins++; b.usd += o.peakUsd; b.from.add(from); bots.set(to, b);
+    if (o.closedSameBlock && o.openTxIndex !== undefined && o.closeTxIndex !== undefined) gaps.push(o.closeTxIndex - o.openTxIndex);
+  }
+  const winsTotal = arbCloses.length || 1;
+  out.push('');
+  out.push(`COMPETITORS ($5+ opportunities, ${sample.length} closed)`);
+  out.push(`Closed by a bot arb (both pools in one tx): ${arbCloses.length} · by an ordinary trade: ${sample.length - arbCloses.length - selfCloses} · inside the triggering tx itself: ${selfCloses}`);
+  out.push(`Distinct bot contracts: ${bots.size}`);
+  [...bots.entries()].sort((a, b) => b[1].wins - a[1].wins).slice(0, 5).forEach(([to, b], i) => {
+    out.push(`#${i + 1} ${to.slice(0, 10)}…: ${b.wins} wins (${Math.round((100 * b.wins) / winsTotal)}%) · ${usd(b.usd)} · ${b.from.size} sending wallet(s)`);
+  });
+  if (gaps.length) {
+    const n = (f: (g: number) => boolean) => gaps.filter(f).length;
+    out.push(`Position after the trigger (same block): right behind it ${n((g) => g === 1)} · 2-3 later ${n((g) => g >= 2 && g <= 3)} · 4+ later ${n((g) => g >= 4)}`);
+  }
   out.push(`Busiest pools: ${busiest.join(' · ')}`);
   out.push(`Data: start state for ${seeded}/${pools.length} pools · ${Math.round((Date.now() - t0) / 1000)}s total`);
   console.log(out.join('\n'));

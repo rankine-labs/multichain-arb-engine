@@ -42,6 +42,8 @@ export interface BtEvent {
   logIndex: number;
   pool: string;         // lowercase
   state: PoolState;
+  txHash?: string;      // transaction that produced this event (for competitor tracking)
+  txIndex?: number;     // its position in the block (Robinhood orders first come, first served)
 }
 
 export interface Opportunity {
@@ -54,6 +56,11 @@ export interface Opportunity {
   sellDex: string;
   closedSameBlock: boolean;
   stillOpen: boolean;
+  poolsInPair: string[]; // every watched pool of this pair (to recognise an arb touching two of them)
+  openTx?: string;       // trade that created the gap
+  openTxIndex?: number;
+  closeTx?: string;      // trade that closed it (often the competitor's arb)
+  closeTxIndex?: number;
 }
 
 const Q96 = 2 ** 96;
@@ -180,13 +187,16 @@ export class BacktestEngine {
     if (best.usd >= this.opts.minProfitUsd) {
       if (!o) {
         pair.open = { pair: pair.label, startBlock: ev.block, endBlock: ev.block, peakUsd: best.usd, peakSizeUsd: best.sizeUsd,
-          buyDex: best.buy, sellDex: best.sell, closedSameBlock: false, stillOpen: true };
+          buyDex: best.buy, sellDex: best.sell, closedSameBlock: false, stillOpen: true,
+          poolsInPair: pair.pools.map((p) => p.address), openTx: ev.txHash, openTxIndex: ev.txIndex };
       } else if (best.usd > o.peakUsd) {
         o.peakUsd = best.usd; o.peakSizeUsd = best.sizeUsd; o.buyDex = best.buy; o.sellDex = best.sell;
       }
     } else if (o) {
       o.endBlock = ev.block;
       o.closedSameBlock = ev.block === o.startBlock;
+      o.closeTx = ev.txHash;
+      o.closeTxIndex = ev.txIndex;
       o.stillOpen = false;
       this.opportunities.push(o);
       pair.open = undefined;

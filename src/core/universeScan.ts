@@ -177,7 +177,7 @@ export function decodePoolCreatedLog(log: { topics: readonly string[]; data: str
   return { token0: addr(t0), token1: addr(t1), pool: addr(pool) };
 }
 
-export type RawLog = { topics: string[]; data: string; address?: string; blockNumber?: string; logIndex?: string };
+export type RawLog = { topics: string[]; data: string; address?: string; blockNumber?: string; logIndex?: string; transactionHash?: string; transactionIndex?: string };
 
 // eth_getLogs with a hard timeout (a public node can hang on a huge range).
 async function getLogsRaw(provider: ethers.JsonRpcProvider, address: string | string[], from: number, to: number, timeoutMs: number): Promise<RawLog[]> {
