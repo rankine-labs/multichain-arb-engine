@@ -105,6 +105,17 @@ async function main() {
   const simProfit = count(outL, /\[sim\].*REAL PROFIT/);
   const simLoss = count(outL, /\[sim\].*real: LOSS/);
   const simFail = count(outL, /\[sim\].*real: FAILS/);
+  const fireReady = outL.map((l) => /\[fire\] robinhood .* ready (\d+)ms/.exec(l)).filter(Boolean).map((m) => Number(m[1])).sort((a, b) => a - b);
+  const rivalLines = outL.filter((l) => /\[rival\] arb found/.test(l));
+  const rivalMs = rivalLines.map((l) => /theirs (\d+)ms/.exec(l)).filter(Boolean).map((m) => Number(m[1])).sort((a, b) => a - b);
+  const oursMs = rivalLines.map((l) => /ours (\d+)ms/.exec(l)).filter(Boolean).map((m) => Number(m[1])).sort((a, b) => a - b);
+  const med = (xs) => (xs.length ? xs[Math.floor(xs.length / 2)] : null);
+  let rpcRtt = null;
+  try {
+    const t = Date.now();
+    await fetch('https://rpc.mainnet.chain.robinhood.com', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}' });
+    rpcRtt = Date.now() - t;
+  } catch { /* skip */ }
   const newPairs = outL.filter((l) => /\[pairs\] .* watching /.test(l)).map((l) => l.replace(/^\[pairs\] \w+ watching /, '').split(':')[0]);
   const poolLookups = count(outL, /\[discovery\] rejected/);
 
@@ -137,6 +148,9 @@ async function main() {
     `- Pool scan: ${lastScan}`,
     `- New pairs picked up this window: ${newPairs.length ? newPairs.slice(0, 10).join(', ') : 'none'}`,
     `- Trades that needed a pool lookup: ${poolLookups}`,
+    `- Fire-ready (trigger seen -> signed trade): ${fireReady.length ? `${med(fireReady)} ms median over ${fireReady.length}` : 'no qualifying trades this window'}`,
+    `- Rivals: ${rivalLines.length ? `${rivalLines.length} rival arbs timed · theirs ${med(rivalMs) ?? '?'} ms median vs ours ${med(oursMs) ?? '?'} ms` : 'none timed this window'}`,
+    `- RPC round trip from the server: ${rpcRtt ?? '?'} ms`,
     `- Real-chain test runs: ${simProfit} profitable · ${simLoss} losing · ${simFail} would fail`,
     '',
     '### Errors this window',

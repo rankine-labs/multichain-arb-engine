@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       only:
-        description: 'Run one step only: feeds, sim, pairs, watch, universe, backtest (blank = all except backtest)'
+        description: 'Run one step only: feeds, sim, pairs, watch, universe, backtest, latency (blank = all except backtest)'
         required: false
         default: ''
 
@@ -71,3 +71,11 @@ jobs:
           echo "$out"
           out="${out//'%'/'%25'}"; out="${out//$'\n'/'%0A'}"
           echo "::notice title=Backtest::${out}"
+      - name: Latency to Robinhood servers
+        if: inputs.only == '' || inputs.only == 'latency'
+        shell: bash
+        run: |
+          out=$(node deploy/latency-check.js 2>&1 | tail -10 || true)
+          echo "$out"
+          out="${out//'%'/'%25'}"; out="${out//$'\n'/'%0A'}"
+          echo "::notice title=Latency::${out}"

@@ -78,6 +78,7 @@ import { ROBINHOOD_SCAN_FACTORIES } from './config/knownAddresses';
 import { buildExecuteCall, executionRequested, executorConfig, pickV3Lender } from './execution/executorCalldata';
 import { makeRpc, simulateRoundTrip, simRpcUrl, Rpc } from './execution/simulator';
 import { FastSender, SafetyGate, safetyConfigFromEnv } from './execution/fastSender';
+import { CompetitorTracker } from './core/competitorTracker';
 
 async function main() {
 const cache = new PoolCache();
@@ -373,6 +374,8 @@ safetyGate.allowTokens([ROBINHOOD_TOKENS.WETH, ROBINHOOD_TOKENS.USDG]);
 // "fire-ready" = from the moment we saw the trigger trade to a signed trade
 // in hand. The number to compare against competitors.
 const fireStats = { readyMs: [] as number[], blocked: new Map<string, number>(), sent: 0 };
+// Live competitor timing (see core/competitorTracker.ts).
+const rivals = new CompetitorTracker(robinhoodReadProvider);
 const refreshNow = async (p: any): Promise<any> => {
       if (p.dex === 'uniswap-v4' || p.poolType === 'orderbook' || p.dex.includes('lb') || p.dex === 'bean-exchange') return p;
       const fresh = await Promise.race([
@@ -403,6 +406,8 @@ if (chainOn('avalanche')) chainManager.register(new AvalancheAdapter());
 
 chainManager.onEvent(async (event: RawChainEvent) => {
 const t0 = Date.now();
+// Timestamp every Robinhood feed tx: lets the competitor tracker time rivals.
+if (event.chain === 'robinhood') rivals.noteFeedTx((event.raw as any)?.hash, event.receivedAtMs);
 
 const swap = await decoder.decode(event);
 if (!swap) return;
@@ -575,6 +580,18 @@ for (const peer of peers) {
 }
 if (!plan) return;
 const { sizing, profit } = plan;
+
+// Any real gap on Robinhood: find out a few seconds from now which bot took
+// it and how fast, versus how fast we were ready (decision + ~2ms to sign).
+if (swap.chain === 'robinhood' && sizing.grossProfitUsd >= 5) {
+      rivals.watch({
+            triggerHash: (event.raw as any)?.hash,
+            triggerSeenMs: event.receivedAtMs,
+            pools: [pool.poolAddress, ...peers.map((p) => p.poolAddress)],
+            ourReadyMs: Date.now() - event.receivedAtMs + 2,
+            profitUsd: sizing.grossProfitUsd,
+      });
+}
 const buyPoolUsed = plan.buyPool;
 const sellPoolUsed = plan.sellPool;
 
@@ -1033,7 +1050,9 @@ for (let i = 0; i < resolved.length; i++) {
                         const localPct = tot ? Math.round((100 * priceStats.local) / tot) : 0;
                         const fr = [...fireStats.readyMs].sort((a, b) => a - b);
                         const fireNote = fr.length ? `, fire-ready ${fr[Math.floor(fr.length / 2)]}ms median (${fr.length})` : '';
-                        note = `watching ${st.pairs} pair${st.pairs === 1 ? '' : 's'}, ${st.pools} pools${tot ? `, ${localPct}% instant prices` : ''}${fireNote}`;
+                        const rv = rivals.summary();
+                        const rivalNote = rv.found ? `, rivals ${rv.theirMedianMs ?? '?'}ms vs ours ${rv.ourMedianMs ?? '?'}ms (we'd beat ${rv.beatCount}/${rv.comparable})` : '';
+                        note = `watching ${st.pairs} pair${st.pairs === 1 ? '' : 's'}, ${st.pools} pools${tot ? `, ${localPct}% instant prices` : ''}${fireNote}${rivalNote}`;
                   }
                   return { chain, spreads, noMatchCount, note };
             });
@@ -1066,6 +1085,7 @@ for (let i = 0; i < resolved.length; i++) {
                   simStats.checked = simStats.profit = simStats.loss = simStats.fail = simStats.rateLimited = 0;
                   priceStats.local = priceStats.rpc = 0;
                   fireStats.readyMs = []; fireStats.blocked.clear(); fireStats.sent = 0;
+                  rivals.reset();
                   lastDigestAt = now;
             }
       };
