@@ -71,7 +71,7 @@ import { RobinhoodChainAdapter } from './chains/robinhoodChain';
 import { MonadAdapter } from './chains/monad';
 import { AvalancheAdapter } from './chains/avalanche';
 import { RawChainEvent, PoolState } from './core/types';
-import { priceOf, spreadPct } from './core/poolPrice';
+import { priceOf, spreadPct, deepEnough } from './core/poolPrice';
 import { PairWatcher, Venue, refreshPoolState } from './core/pairWatcher';
 import { scanUniverse, emptyScanState, ScanState } from './core/universeScan';
 import { readFileSync, writeFileSync, mkdirSync, renameSync } from 'fs';
@@ -711,7 +711,10 @@ if (registerIfApproved('avalanche', entry.dex, resolved)) pool = resolved;
 
     // Fresh prices at decision time: re-read the traded pool and EVERY
     // partner pool now, in parallel (cached prices can be up to 30s old).
-    const cachedPeers = cache.findPeerPools(swap.chain, swap.tokenIn, swap.tokenOut, pool.poolAddress);
+    // Partner pools must hold real money near their price ($1,000+); a
+    // near-empty pool can show any price and would only waste a simulation.
+    const cachedPeers = cache.findPeerPools(swap.chain, swap.tokenIn, swap.tokenOut, pool.poolAddress)
+          .filter((p) => deepEnough(p, decimalsOf, (t) => priceOracle.getUsdPrice(swap.chain, t)));
     if (cachedPeers.length === 0) return;
     // Fast path: use our own up-to-date copy when it's recent (kept current by
     // instant price tracking + the 5s re-sync); only ask the RPC when stale.
@@ -976,8 +979,11 @@ await chainManager.startAll();
             if (gapRunning) return;
             gapRunning = true;
             try {
+                  // Only pools with real money near their price ($1,000+ by default).
+                  const usdRh = (t: string) => priceOracle.getUsdPrice('robinhood', t);
                   const pairs = robinhoodWatcher.watchedPairPools()
-                        .map((addrs) => addrs.map((a) => cache.get('robinhood', a)).filter((p): p is PoolState => !!p));
+                        .map((addrs) => addrs.map((a) => cache.get('robinhood', a))
+                              .filter((p): p is PoolState => !!p && deepEnough(p, decimalsOf, usdRh)));
                   const gaps = findStandingGaps(pairs,
                         (t) => TOKEN_DECIMALS.robinhood?.[t.toLowerCase()],
                         (t) => priceOracle.getUsdPrice('robinhood', t),
@@ -1242,6 +1248,7 @@ for (let i = 0; i < resolved.length; i++) {
                         // always Uniswap V2/V3, so other exchanges never showed.)
                         let cheap: { p: PoolState; price: number } | null = null, dear: typeof cheap = null;
                         for (const p of [pool, ...peers]) {
+                              if (!deepEnough(p, decimalsOf, (t) => priceOracle.getUsdPrice(chain, t))) continue; // near-empty pool: its price means nothing
                               const price = priceOf(p, pool.tokenA, decimalsOf);
                               if (price === null) continue;
                               if (!cheap || price < cheap.price) cheap = { p, price };
