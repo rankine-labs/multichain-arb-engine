@@ -135,4 +135,52 @@ async function providerBlocks() {
   assert(a.connectCalls - before <= 2, `blocked feed retried at most once an hour (got ${a.connectCalls - before} in 2h)`);
 }
 
-main().then(providerBlocks).catch((err) => { console.error('FAIL: test crashed', err); process.exitCode = 1; });
+// ---------------------------------------------------------------------------
+// Provider block saved to a file survives a restart: the new process must
+// NOT connect until the block ends, then connects and clears the file.
+// ---------------------------------------------------------------------------
+async function blockSurvivesRestart() {
+  const { mkdtempSync, readFileSync } = await import('fs');
+  const { join } = await import('path');
+  const { tmpdir } = await import('os');
+  const file = join(mkdtempSync(join(tmpdir(), 'cm-')), 'blocks.json');
+  let clock = 9_000_000;
+
+  // Process 1: start fails with 403 -> block saved.
+  const cm1 = new ChainManager(() => clock, file);
+  const a1 = new FakeAdapter();
+  a1.connectShouldFail = true; a1.failMessage = 'Unexpected server response: 403';
+  cm1.register(a1);
+  await quiet(() => cm1.startAll());
+  const saved = JSON.parse(readFileSync(file, 'utf8'));
+  assert(saved.monad > clock + 60 * 60_000, '403 block end time saved to file');
+
+  // Process 2 (restart 10 min later): must not connect at all.
+  clock += 10 * 60_000;
+  const cm2 = new ChainManager(() => clock, file);
+  const a2 = new FakeAdapter();
+  cm2.register(a2);
+  await quiet(() => cm2.startAll());
+  assert(a2.connectCalls === 0 && !cm2.isHealthy('monad'), 'restart during a saved block does not connect');
+  a2.healthy = false;
+  for (let i = 0; i < 40; i++) { clock += 15_000; await quiet(() => cm2.runHealthChecks()); } // 10 more min
+  assert(a2.connectCalls === 0, 'still waiting while the saved block lasts');
+
+  // After the block ends, the health check reconnects and clears the file.
+  clock = saved.monad + 1;
+  await quiet(() => cm2.runHealthChecks());
+  assert(a2.connectCalls === 1, 'connects once the block has ended');
+  assert(JSON.parse(readFileSync(file, 'utf8')).monad === undefined, 'block cleared from file after connecting');
+
+  // Ordinary errors are never saved as blocks.
+  const file2 = join(mkdtempSync(join(tmpdir(), 'cm-')), 'blocks.json');
+  const cm3 = new ChainManager(() => clock, file2);
+  const a3 = new FakeAdapter();
+  a3.connectShouldFail = true; a3.failMessage = 'socket closed';
+  cm3.register(a3);
+  await quiet(() => cm3.startAll());
+  let wrote = true; try { readFileSync(file2, 'utf8'); } catch { wrote = false; }
+  assert(!wrote, 'ordinary connect errors are not saved as provider blocks');
+}
+
+main().then(providerBlocks).then(blockSurvivesRestart).catch((err) => { console.error('FAIL: test crashed', err); process.exitCode = 1; });

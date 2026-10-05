@@ -89,7 +89,9 @@ import { ROBINHOOD_SEED_PAIRS } from './config/robinhoodSeedPairs';
 async function main() {
 const cache = new PoolCache();
 const shadowLogger = new ShadowLogger();
-const chainManager = new ChainManager();
+// Provider blocks (403/429) are saved here so a restart doesn't hit a
+// blocked feed again and extend the block (core/chainManager.ts).
+const chainManager = new ChainManager(Date.now, 'data/provider-blocks.json');
 const routerRegistry = structuredClone(DEFAULT_ROUTER_REGISTRY);
 seedKnownAddresses(routerRegistry);
 const filter = new FastFilter(cache);
