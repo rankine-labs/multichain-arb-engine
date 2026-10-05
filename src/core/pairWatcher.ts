@@ -278,6 +278,9 @@ export class PairWatcher {
     }
   }
 
+  // Pool addresses per watched pair (for the standing-gap scanner).
+  watchedPairPools(): string[][] { return [...this.pairs.values()].map((p) => p.pools); }
+
   stats() {
     let pools = 0;
     for (const p of this.pairs.values()) pools += p.pools.length;

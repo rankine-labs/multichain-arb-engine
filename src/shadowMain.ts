@@ -79,6 +79,8 @@ import { ROBINHOOD_SCAN_FACTORIES } from './config/knownAddresses';
 import { buildExecuteCall, executionRequested, executorConfig, pickV3Lender } from './execution/executorCalldata';
 import { makeRpc, simulateRoundTrip, simRpcUrl, Rpc } from './execution/simulator';
 import { FastSender, SafetyGate, safetyConfigFromEnv } from './execution/fastSender';
+import { LiveTradeTracker } from './execution/liveTracker';
+import { findStandingGaps } from './core/gapScanner';
 import { CompetitorTracker } from './core/competitorTracker';
 import { pickRobinhoodReadRpc, robinhoodSendRpc, redact, ROBINHOOD_PUBLIC_RPC } from './config/robinhoodEndpoints';
 
@@ -368,6 +370,7 @@ const REFRESH_TIMEOUT_MS = 1_500;
 const FAST_PRICES = process.env.FAST_PRICES !== 'off';
 const FRESH_MS = 20_000;
 const priceStats = { local: 0, rpc: 0 };
+const gapStats = { found: 0, bestUsd: 0 }; // standing gaps (no trigger trade) this hour
 
 // FAST SENDER (Robinhood). Dry run unless the live switches are all set
 // (see execution/fastSender.ts). ROBINHOOD_SEND_RPC = where to send trades
@@ -382,8 +385,88 @@ safetyGate.allowTokens([ROBINHOOD_TOKENS.WETH, ROBINHOOD_TOKENS.USDG]);
 // "fire-ready" = from the moment we saw the trigger trade to a signed trade
 // in hand. The number to compare against competitors.
 const fireStats = { readyMs: [] as number[], blocked: new Map<string, number>(), sent: 0 };
+// Telegram near-miss throttle: at most one per pair per 10 min and 6 per hour,
+// so a busy pair can't flood your phone.
+const nearMissLast = new Map<string, number>();
+let nearMissTimes: number[] = [];
+const nearMissAllowed = (pairKey: string): boolean => {
+      const now = Date.now();
+      nearMissTimes = nearMissTimes.filter((t) => now - t < 3_600_000);
+      if (nearMissTimes.length >= 6) return false;
+      if (now - (nearMissLast.get(pairKey) ?? 0) < 600_000) return false;
+      nearMissLast.set(pairKey, now);
+      nearMissTimes.push(now);
+      return true;
+};
+
 // Live competitor timing (see core/competitorTracker.ts).
 const rivals = new CompetitorTracker(robinhoodReadProvider);
+
+// LIVE results (only used once live sending is switched on): receipt, profit
+// from the contract's Executed event, gas cost; losses feed the daily cap.
+const liveTracker = new LiveTradeTracker({
+      provider: robinhoodReadProvider,
+      ethUsd: () => priceOracle.getUsdPrice('robinhood', ROBINHOOD_TOKENS.WETH) ?? 0,
+      tokenUsd: (token, raw) => {
+            const px = priceOracle.getUsdPrice('robinhood', token);
+            const dec = TOKEN_DECIMALS.robinhood?.[token.toLowerCase()];
+            return px === null || dec === undefined ? null : (Number(raw) / 10 ** dec) * px;
+      },
+      recordLoss: (usd) => safetyGate.recordLoss(usd),
+      noteGasUsed: (gas) => robinhoodSender.noteGasUsed(gas),
+      notify: (html) => sendTelegramMessage(html),
+});
+
+// ONE path from "this is worth doing" to a signed trade, used by both the
+// trade-triggered engine and the standing-gap scanner:
+//   build the exact contract call -> safety gate -> sign (send only if live).
+// Never throws: a problem here must never affect the bot.
+const fireTrade = async (o: {
+      chain: 'avalanche' | 'monad' | 'robinhood'; tokenIn: string; tokenOut: string;
+      buyPool: any; sellPool: any; tradeSizeUsd: number; netProfitUsd: number; usdPerTokenIn: number;
+      seenAtMs: number; source: 'trade' | 'gap';
+}) => {
+      try {
+            const dry = buildExecuteCall({
+                  chain: o.chain, tokenIn: o.tokenIn, buyPool: o.buyPool, sellPool: o.sellPool,
+                  tradeSizeUsd: o.tradeSizeUsd, netProfitUsd: o.netProfitUsd, usdPerTokenIn: o.usdPerTokenIn,
+                  // Strict lookup: no default-to-18 for real trade amounts.
+                  tokenInDecimals: TOKEN_DECIMALS[o.chain]?.[o.tokenIn.toLowerCase()],
+                  // Deadline: the contract reverts if mined after this block. Live
+                  // trades get the latest block + 3 (~0.3 s on Robinhood); 0 is only
+                  // safe for dry runs (it would make every real trade revert).
+                  maxBlock: o.chain === 'robinhood' && robinhoodSender.live ? BigInt(robinhoodSender.latestBlock + 3) : 0n,
+                  ...executorConfig(o.chain),
+                  v3Lender: pickV3Lender(cache.allForChain(o.chain), o.tokenIn, [o.buyPool.poolAddress, o.sellPool.poolAddress])?.poolAddress,
+            });
+            if ('reason' in dry) { console.log(`[exec-dryrun] ${o.chain} NOT executable: ${dry.reason}`); return; }
+            if (o.chain !== 'robinhood') {
+                  console.log(`[exec-dryrun] ${o.chain} executable: ${dry.hops.map((h) => `kind${h.kind}`).join('->')} amountIn=${dry.amountIn} ${dry.funding}`);
+                  return;
+            }
+            const gate = safetyGate.check({ tradeSizeUsd: o.tradeSizeUsd, tokens: [o.tokenIn, o.tokenOut] });
+            if (!gate.ok) {
+                  const r = 'reason' in gate ? gate.reason.replace(/\$\d+/g, '$N').replace(/0x[0-9a-f]+/gi, '0x…') : 'blocked';
+                  fireStats.blocked.set(r, (fireStats.blocked.get(r) ?? 0) + 1);
+                  return;
+            }
+            if (robinhoodSender.live && !dry.to) {
+                  fireStats.blocked.set('no executor deployed', (fireStats.blocked.get('no executor deployed') ?? 0) + 1);
+                  return;
+            }
+            const fired = await robinhoodSender.fire(dry.to ?? '0x0000000000000000000000000000000000000000', dry.data);
+            const readyMs = Date.now() - o.seenAtMs;
+            if (o.source === 'trade') fireStats.readyMs.push(readyMs);
+            if (fired.txHash) {
+                  fireStats.sent++;
+                  liveTracker.track(fired.txHash, { expectedProfitUsd: o.netProfitUsd, label: `${symbolOf(o.chain, o.tokenIn)}/${symbolOf(o.chain, o.tokenOut)} ${o.buyPool.dex}>${o.sellPool.dex}` });
+            }
+            console.log(`[fire] robinhood ${fired.live ? 'LIVE' : 'DRY RUN'} (${o.source}) ready ${readyMs}ms after ${o.source === 'trade' ? 'the trigger' : 'the price update'} (sign ${fired.signMs.toFixed(1)}ms)` +
+                  `${fired.txHash ? ` tx ${fired.txHash}` : ''}${fired.error ? ` error: ${fired.error}` : ''}`);
+      } catch (err) {
+            console.warn('[exec-dryrun] skipped:', (err as Error).message);
+      }
+};
 const refreshNow = async (p: any): Promise<any> => {
       if (p.dex === 'uniswap-v4' || p.poolType === 'orderbook' || p.dex.includes('lb') || p.dex === 'bean-exchange') return p;
       const fresh = await Promise.race([
@@ -629,7 +712,7 @@ shadowLogger.record({ opportunity, outcome: 'SKIPPED_BELOW_MIN_PROFIT', ourHypot
       // Only significant near-misses go to Telegram (per architecture doc:
       // "no play-by-play noise") — gross opportunity had to clear a real bar
       // even though it netted below the $20 minimum after costs.
-      if (sizing.grossProfitUsd >= 30) {
+      if (sizing.grossProfitUsd >= 30 && nearMissAllowed(`${swap.chain}:${[swap.tokenIn, swap.tokenOut].map((t) => t.toLowerCase()).sort().join('/')}`)) {
               // Real per-DEX prices, not just USD amounts, so the person watching
               // Telegram can directly verify the bot is comparing genuine market
               // prices rather than just trusting an opaque dollar figure.
@@ -675,54 +758,14 @@ console.log(
 `reaction=${reactionMs}ms`,
 );
 
-      // EXECUTION DRY RUN -- builds the exact ArbExecutor.execute() calldata
-      // for this opportunity but NEVER signs or sends it. Answers "could the
-      // on-chain contract have executed this one, and if not, why?" so we can
-      // see real coverage before going live. See src/execution/executorCalldata.ts.
-      // Wrapped in try/catch: a dry-run problem must never affect the bot.
-      try {
-            const dry = buildExecuteCall({
-                  chain: swap.chain,
-                  tokenIn: swap.tokenIn,
-                  buyPool: buyPoolUsed,
-                  sellPool: sellPoolUsed,
-                  tradeSizeUsd: sizing.optimalTradeSizeUsd,
-                  netProfitUsd: profit.conservativeNetProfitUsd,
-                  usdPerTokenIn: usdPerToken,
-                  // Strict lookup: no default-to-18 for real trade amounts.
-                  tokenInDecimals: TOKEN_DECIMALS[swap.chain]?.[swap.tokenIn.toLowerCase()],
-                  maxBlock: 0n, // dry run only; live firing would use current block + 1
-                  ...executorConfig(swap.chain),
-                  v3Lender: pickV3Lender(cache.allForChain(swap.chain), swap.tokenIn, [buyPoolUsed.poolAddress, sellPoolUsed.poolAddress])?.poolAddress,
-            });
-            if ('reason' in dry) {
-                  console.log(`[exec-dryrun] ${swap.chain} NOT executable: ${dry.reason}`);
-            } else if (swap.chain === 'robinhood') {
-                  // Safety gate, then build + sign (and send only if live).
-                  const gate = safetyGate.check({ tradeSizeUsd: sizing.optimalTradeSizeUsd, tokens: [swap.tokenIn, swap.tokenOut] });
-                  if (!gate.ok) {
-                        const r = 'reason' in gate ? gate.reason.replace(/\$\d+/g, '$N').replace(/0x[0-9a-f]+/gi, '0x…') : 'blocked';
-                        fireStats.blocked.set(r, (fireStats.blocked.get(r) ?? 0) + 1);
-                  } else if (robinhoodSender.live && !dry.to) {
-                        fireStats.blocked.set('no executor deployed', (fireStats.blocked.get('no executor deployed') ?? 0) + 1);
-                  } else {
-                        const fired = await robinhoodSender.fire(dry.to ?? '0x0000000000000000000000000000000000000000', dry.data);
-                        const readyMs = Date.now() - event.receivedAtMs;
-                        fireStats.readyMs.push(readyMs);
-                        if (fired.txHash) fireStats.sent++;
-                        console.log(`[fire] robinhood ${fired.live ? 'LIVE' : 'DRY RUN'} ready ${readyMs}ms after the trigger (sign ${fired.signMs.toFixed(1)}ms)` +
-                              `${fired.txHash ? ` tx ${fired.txHash}` : ''}${fired.error ? ` error: ${fired.error}` : ''}`);
-                  }
-            } else {
-                  const funding = dry.funding;
-                  console.log(
-                        `[exec-dryrun] ${swap.chain} executable: ${dry.hops.map((h) => `kind${h.kind}`).join('->')} ` +
-                        `amountIn=${dry.amountIn} minProfit=${dry.minProfit} ${funding}`,
-                  );
-            }
-      } catch (err) {
-            console.warn('[exec-dryrun] skipped:', (err as Error).message);
-      }
+      // Build -> safety gate -> sign (send only if live). Shared with the
+      // standing-gap scanner; see fireTrade() above.
+      await fireTrade({
+            chain: swap.chain, tokenIn: swap.tokenIn, tokenOut: swap.tokenOut,
+            buyPool: buyPoolUsed, sellPool: sellPoolUsed,
+            tradeSizeUsd: sizing.optimalTradeSizeUsd, netProfitUsd: profit.conservativeNetProfitUsd,
+            usdPerTokenIn: usdPerToken, seenAtMs: event.receivedAtMs, source: 'trade',
+      });
 });
 
 // Live trading is not implemented yet (adapters' fireTransaction() are
@@ -734,7 +777,17 @@ if (executionRequested() && !robinhoodSender.live) {
 }
 if (chainOn('robinhood')) {
       robinhoodSender.start()
-            .then(() => console.log(`[fire] robinhood sender ready (${robinhoodSender.live ? 'LIVE from ' + robinhoodSender.address : 'dry run'})`))
+            .then(async () => {
+                  console.log(`[fire] robinhood sender ready (${robinhoodSender.live ? 'LIVE from ' + robinhoodSender.address : 'dry run'})`);
+                  if (robinhoodSender.live) {
+                        const b = await robinhoodSender.balanceCheck();
+                        if (!b.ok) {
+                              const msg = `bot wallet ${robinhoodSender.address} has ${ethers.formatEther(b.balance)} ETH, needs ${ethers.formatEther(b.needed)} per trade at the gas cap`;
+                              console.warn(`[fire] LOW GAS: ${msg}`);
+                              await sendTelegramMessage(`⚠️ <b>LOW GAS</b> · ${msg}`);
+                        }
+                  }
+            })
             .catch((err) => console.warn('[fire] robinhood sender failed to start:', (err as Error).message));
 }
 
@@ -804,6 +857,44 @@ await chainManager.startAll();
       // RPC (one DEX and fee tier at a time). The bot is live meanwhile;
       // pools join the watch list as they're found.
       robinhoodWatcher.start();
+
+      // STANDING-GAP SCANNER (core/gapScanner.ts): every 5 s, right after the
+      // price re-sync, look for gaps that exist without a trigger trade.
+      // Anti-spam: the same gap (pair + pools) fires at most once per 30 s,
+      // at most 2 fires per scan, and every fire still passes the safety gate.
+      const GAP_MIN_USD = Number(process.env.GAP_MIN_USD ?? 20);
+      const gapLastFired = new Map<string, number>();
+      setInterval(async () => {
+            try {
+                  const pairs = robinhoodWatcher.watchedPairPools()
+                        .map((addrs) => addrs.map((a) => cache.get('robinhood', a)).filter((p): p is PoolState => !!p));
+                  const gaps = findStandingGaps(pairs,
+                        (t) => TOKEN_DECIMALS.robinhood?.[t.toLowerCase()],
+                        (t) => priceOracle.getUsdPrice('robinhood', t),
+                        { minProfitUsd: GAP_MIN_USD, flashFee: 0.0005, gasUsd: 0.05, maxTradeUsd: Number(process.env.MAX_TRADE_USD ?? 5_000) });
+                  let fired = 0;
+                  for (const g of gaps) {
+                        if (fired >= 2) break;
+                        const key = `${g.buyPool.poolAddress}>${g.sellPool.poolAddress}`;
+                        if (Date.now() - (gapLastFired.get(key) ?? 0) < 30_000) continue;
+                        gapLastFired.set(key, Date.now());
+                        fired++;
+                        gapStats.found++;
+                        gapStats.bestUsd = Math.max(gapStats.bestUsd, g.profitUsd);
+                        const label = `${symbolOf('robinhood', g.base)}/${symbolOf('robinhood', g.quote)}`;
+                        console.log(`[gap] standing gap ${label}: buy ${g.buyPool.dex} ${g.buyPool.feeBps / 100}% -> sell ${g.sellPool.dex} ${g.sellPool.feeBps / 100}%, ~$${g.profitUsd.toFixed(2)} on $${Math.round(g.sizeUsd)}`);
+                        queueSimulation('robinhood', g.quote, g.buyPool, g.sellPool, g.sizeUsd, g.profitUsd, g.quoteUsd);
+                        await fireTrade({
+                              chain: 'robinhood', tokenIn: g.quote, tokenOut: g.base, buyPool: g.buyPool, sellPool: g.sellPool,
+                              tradeSizeUsd: g.sizeUsd, netProfitUsd: g.profitUsd, usdPerTokenIn: g.quoteUsd,
+                              seenAtMs: robinhoodWatcher.lastRefreshMs || Date.now(), source: 'gap',
+                        });
+                  }
+                  if (gapLastFired.size > 500) gapLastFired.clear();
+            } catch (err) {
+                  console.warn('[gap] scan failed:', (err as Error).message);
+            }
+      }, 5_000);
       void robinhoodWatcher.watch(ROBINHOOD_TOKENS.WETH, ROBINHOOD_TOKENS.USDG, { pin: true })
             .then((n) => console.log(`[pairs] robinhood WETH/USDG: ${n} pools found`))
             .catch((err) => console.warn('[pairs] WETH/USDG discovery failed:', (err as Error).message));
@@ -1066,7 +1157,10 @@ for (let i = 0; i < resolved.length; i++) {
                         const fireNote = fr.length ? `, fire-ready ${fr[Math.floor(fr.length / 2)]}ms median (${fr.length})` : '';
                         const rv = rivals.summary();
                         const rivalNote = rv.found ? `, rivals ${rv.theirMedianMs ?? '?'}ms vs ours ${rv.ourMedianMs ?? '?'}ms (we'd beat ${rv.beatCount}/${rv.comparable})` : '';
-                        note = `watching ${st.pairs} pair${st.pairs === 1 ? '' : 's'}, ${st.pools} pools${tot ? `, ${localPct}% instant prices` : ''}${fireNote}${rivalNote}`;
+                        const gapNote = gapStats.found ? `, standing gaps ${gapStats.found} (best $${gapStats.bestUsd.toFixed(0)})` : '';
+                        const lv = liveTracker.summary();
+                        const liveNote = lv.sent ? `, LIVE ${lv.won}/${lv.sent} won, profit $${lv.profitUsd.toFixed(2)}, gas $${lv.gasUsd.toFixed(2)}` : '';
+                        note = `watching ${st.pairs} pair${st.pairs === 1 ? '' : 's'}, ${st.pools} pools${tot ? `, ${localPct}% instant prices` : ''}${fireNote}${rivalNote}${gapNote}${liveNote}`;
                   }
                   return { chain, spreads, noMatchCount, note };
             });
@@ -1100,6 +1194,8 @@ for (let i = 0; i < resolved.length; i++) {
                   priceStats.local = priceStats.rpc = 0;
                   fireStats.readyMs = []; fireStats.blocked.clear(); fireStats.sent = 0;
                   rivals.reset();
+                  gapStats.found = 0; gapStats.bestUsd = 0;
+                  liveTracker.reset();
                   lastDigestAt = now;
             }
       };
