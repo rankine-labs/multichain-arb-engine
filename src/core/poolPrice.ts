@@ -111,11 +111,12 @@ export function poolDepthUsd(
   return null;
 }
 
-// Minimum depth for a pool to count in comparisons (POOL_MIN_DEPTH_USD, default $10,000).
-// Why $10k: profit ~ pool depth x gap squared, so to make the $20 minimum a
-// $10k pool already needs an ~18% gap (a $1k pool would need ~55%). Smaller
-// pools almost never pay and only waste simulations.
-export const POOL_MIN_DEPTH_USD = Number(process.env.POOL_MIN_DEPTH_USD ?? 10_000);
+// Minimum depth for a pool to count in comparisons (POOL_MIN_DEPTH_USD, default $25,000).
+// Why $25k: profit ~ pool depth x gap squared, so to make the $20 minimum a
+// $25k pool needs an ~12% gap ($10k would need ~18%, $1k ~55%). Smaller pools
+// rarely pay and mostly waste simulations. Review with the dry-run earnings
+// tracker: lower it if verified profit comes from smaller pools, raise it if not.
+export const POOL_MIN_DEPTH_USD = Number(process.env.POOL_MIN_DEPTH_USD ?? 25_000);
 
 export function deepEnough(p: PoolState, decimalsOf: DecimalsLookup, usdOf: (token: string) => number | null, minUsd = POOL_MIN_DEPTH_USD): boolean {
   const d = poolDepthUsd(p, decimalsOf, usdOf);
