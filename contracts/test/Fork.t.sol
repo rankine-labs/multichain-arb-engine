@@ -62,6 +62,16 @@ abstract contract ForkBase is Test {
         return true;
     }
 
+    // The chain's own block number, as the contract sees it for deadlines.
+    // On Arbitrum/Orbit chains (Robinhood) block.number is the PARENT chain's
+    // block, so ask the ArbSys precompile (address 100); elsewhere use
+    // block.number. Mirrors the bot, which takes maxBlock from eth_blockNumber.
+    function _l2Block() internal view returns (uint256) {
+        (bool ok, bytes memory ret) = address(100).staticcall{gas: 20_000}(abi.encodeWithSignature("arbBlockNumber()"));
+        if (ok && ret.length >= 32) return abi.decode(ret, (uint256));
+        return block.number;
+    }
+
     // Wraps native gas token into the wrapped token and hands it to the executor.
     function _fundWrapped(address wrapped, uint256 amount) internal {
         vm.deal(address(this), amount);
@@ -189,7 +199,7 @@ contract AvalancheForkTest is ForkBase {
         ArbExecutor.Hop[] memory hops = new ArbExecutor.Hop[](2);
         hops[0] = _hop(0, joe, WAVAX, USDC, 30);
         hops[1] = _hop(0, sushi, USDC, WAVAX, 30);
-        t = ArbExecutor.Trade({token: WAVAX, amountIn: amountIn, minProfit: 1, maxBlock: block.number, hops: hops});
+        t = ArbExecutor.Trade({token: WAVAX, amountIn: amountIn, minProfit: 1, maxBlock: _l2Block(), hops: hops});
     }
 
     function test_fork_avalanche_V2_ownCapital() public {
@@ -233,7 +243,7 @@ contract MonadForkTest is ForkBase {
         hops[0] = _hop(2, uni, WMON, USDC, 0);
         hops[1] = _hop(2, cake, USDC, WMON, 0);
         ArbExecutor.Trade memory t =
-            ArbExecutor.Trade({token: WMON, amountIn: 10 ether, minProfit: 1, maxBlock: block.number, hops: hops});
+            ArbExecutor.Trade({token: WMON, amountIn: 10 ether, minProfit: 1, maxBlock: _l2Block(), hops: hops});
         _runExpectingOnlyProfitGuard("monad uniV3->pancakeV3", t, address(0));
     }
 
@@ -257,7 +267,7 @@ contract MonadForkTest is ForkBase {
         hops[0] = _hop(2, uni, WMON, USDC, 0);
         hops[1] = _hop(2, cake, USDC, WMON, 0);
         ArbExecutor.Trade memory t =
-            ArbExecutor.Trade({token: WMON, amountIn: 10 ether, minProfit: 1, maxBlock: block.number, hops: hops});
+            ArbExecutor.Trade({token: WMON, amountIn: 10 ether, minProfit: 1, maxBlock: _l2Block(), hops: hops});
         _runV3FlashExpectingOnlyProfitGuard("monad V3 flash loan + uniV3->cakeV3", t, lender);
     }
 
@@ -278,7 +288,7 @@ contract MonadForkTest is ForkBase {
         hops[0] = _hop(0, v2, WMON, USDC, 25); // PancakeSwap V2 fee: 0.25%
         hops[1] = _hop(2, uni, USDC, WMON, 0);
         ArbExecutor.Trade memory t =
-            ArbExecutor.Trade({token: WMON, amountIn: 10 ether, minProfit: 1, maxBlock: block.number, hops: hops});
+            ArbExecutor.Trade({token: WMON, amountIn: 10 ether, minProfit: 1, maxBlock: _l2Block(), hops: hops});
         _runExpectingOnlyProfitGuard("monad pancakeV2->uniV3", t, address(0));
     }
 }
@@ -305,7 +315,7 @@ contract RobinhoodForkTest is ForkBase {
         hops[0] = _hop(1, _ramsesV2(), WETH, USDG, 0);
         hops[1] = _hop(2, v3, USDG, WETH, 0);
         ArbExecutor.Trade memory t =
-            ArbExecutor.Trade({token: WETH, amountIn: 0.01 ether, minProfit: 1, maxBlock: block.number, hops: hops});
+            ArbExecutor.Trade({token: WETH, amountIn: 0.01 ether, minProfit: 1, maxBlock: _l2Block(), hops: hops});
         _runExpectingOnlyProfitGuard(label, t, address(0));
     }
 
@@ -351,7 +361,7 @@ contract RobinhoodForkTest is ForkBase {
         hops[0] = _hop(1, _ramsesV2(), WETH, USDG, 0);
         hops[1] = _hop(2, cake, USDG, WETH, 0);
         ArbExecutor.Trade memory t =
-            ArbExecutor.Trade({token: WETH, amountIn: 0.01 ether, minProfit: 1, maxBlock: block.number, hops: hops});
+            ArbExecutor.Trade({token: WETH, amountIn: 0.01 ether, minProfit: 1, maxBlock: _l2Block(), hops: hops});
         _runV3FlashExpectingOnlyProfitGuard("robinhood V3 flash loan + ramsesV2->cakeV3", t, lender);
     }
 
@@ -386,7 +396,7 @@ contract RobinhoodForkTest is ForkBase {
         hops[0] = _hop(1, _ramsesV2(), WETH, USDG, 0);
         hops[1] = _hop(2, cake, USDG, WETH, 0);
         ArbExecutor.Trade memory t =
-            ArbExecutor.Trade({token: WETH, amountIn: 0.01 ether, minProfit: 1, maxBlock: block.number, hops: hops});
+            ArbExecutor.Trade({token: WETH, amountIn: 0.01 ether, minProfit: 1, maxBlock: _l2Block(), hops: hops});
         _runV3FlashExpectingOnlyProfitGuard("robinhood RAMSES V3 flash loan + ramsesV2->cakeV3", t, lender);
     }
 
@@ -419,7 +429,7 @@ contract RobinhoodForkTest is ForkBase {
         hops[0] = _hop(2, v3, WETH, USDG, 0);
         hops[1] = _v4Hop(USDG, WETH, 500, 10, true);
         ArbExecutor.Trade memory t =
-            ArbExecutor.Trade({token: WETH, amountIn: 0.01 ether, minProfit: 1, maxBlock: block.number, hops: hops});
+            ArbExecutor.Trade({token: WETH, amountIn: 0.01 ether, minProfit: 1, maxBlock: _l2Block(), hops: hops});
         _runExpectingOnlyProfitGuard("robinhood uniV3 -> V4 native ETH/USDG", t, address(0));
         assertEq(address(exec).balance, 0, "no ETH left in the contract");
     }
@@ -435,7 +445,7 @@ contract RobinhoodForkTest is ForkBase {
         hops[0] = _v4Hop(WETH, USDG, 500, 10, false);
         hops[1] = _hop(2, v3, USDG, WETH, 0);
         ArbExecutor.Trade memory t =
-            ArbExecutor.Trade({token: WETH, amountIn: 0.01 ether, minProfit: 1, maxBlock: block.number, hops: hops});
+            ArbExecutor.Trade({token: WETH, amountIn: 0.01 ether, minProfit: 1, maxBlock: _l2Block(), hops: hops});
         _runExpectingOnlyProfitGuard("robinhood V4 WETH/USDG -> uniV3", t, address(0));
     }
 
