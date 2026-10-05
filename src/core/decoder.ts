@@ -103,6 +103,8 @@ const UR_V4_SWAP = 0x10;
 // V4 router "actions" inside a V4_SWAP command (v4-periphery Actions.sol).
 const V4_SWAP_EXACT_IN_SINGLE = 0x06;
 const V4_SWAP_EXACT_IN = 0x07;
+const V4_SETTLE = 0x0b;     // (currency, amount, payerIsUser): pay `amount` of currency in
+const V4_SETTLE_ALL = 0x0c; // (currency, maxAmount): pay everything owed, up to maxAmount
 const ZERO = '0x0000000000000000000000000000000000000000';
 const POOL_KEY = 'tuple(address currency0,address currency1,uint24 fee,int24 tickSpacing,address hooks)';
 const V4_EXACT_IN_SINGLE = [`tuple(${POOL_KEY} poolKey,bool zeroForOne,uint128 amountIn,uint128 amountOutMinimum,bytes hookData)`];
@@ -271,7 +273,7 @@ export class TransactionDecoder {
   // and name the exact pool by its id, so the bot can find it directly in
   // its watch list. Hooked pools and "use whatever balance" amounts (0 or
   // the contract-balance placeholder) are skipped: we can't size those.
-  private decodeV4Swap(chain: ChainName, input: string, wrappedNative: string, event: RawChainEvent): DecodedSwap | null {
+  private decodeV4Swap(chain: ChainName, input: string, wrappedNative: string, event: RawChainEvent, txValue = 0n): DecodedSwap | null {
     const coder = ethers.AbiCoder.defaultAbiCoder();
     let actions: Uint8Array, params: string[];
     try {
@@ -282,16 +284,41 @@ export class TransactionDecoder {
       return null;
     }
     const asToken = (c: string) => (c.toLowerCase() === ZERO ? wrappedNative : c);
+
+    // "Open amount" swaps: amountIn = 0 means "swap whatever I paid in". The
+    // amount is then in a SETTLE action for that currency (pay X in), or,
+    // for native ETH, the ETH sent with the transaction. Wallets do this a
+    // lot (about two-thirds of the V4 swaps we used to skip).
+    const paidIn = (currency: string): bigint => {
+      const c = currency.toLowerCase();
+      for (let k = 0; k < actions.length && k < params.length; k++) {
+        try {
+          if (actions[k] === V4_SETTLE) {
+            const [cur, amt] = coder.decode(['address', 'uint256', 'bool'], params[k]);
+            if (String(cur).toLowerCase() !== c) continue;
+            const a = BigInt(amt);
+            if (a > 0n && a < UR_CONTRACT_BALANCE) return a;
+          } else if (actions[k] === V4_SETTLE_ALL) {
+            const [cur, max] = coder.decode(['address', 'uint256'], params[k]);
+            if (String(cur).toLowerCase() !== c) continue;
+            const a = BigInt(max);
+            if (a > 0n && a < UR_CONTRACT_BALANCE) return a;
+          }
+        } catch { /* not that shape: keep looking */ }
+      }
+      return c === ZERO && txValue > 0n ? txValue : 0n; // native ETH: what the tx sent
+    };
     for (let j = 0; j < actions.length && j < params.length; j++) {
       try {
         if (actions[j] === V4_SWAP_EXACT_IN_SINGLE) {
           const [x] = coder.decode(V4_EXACT_IN_SINGLE, params[j]);
           const key = x.poolKey;
           if (String(key.hooks).toLowerCase() !== ZERO) continue; // hooked pool: not ours
-          const amountIn = BigInt(x.amountIn);
-          if (amountIn === 0n || amountIn >= UR_CONTRACT_BALANCE) continue;
           const cIn = x.zeroForOne ? key.currency0 : key.currency1;
           const cOut = x.zeroForOne ? key.currency1 : key.currency0;
+          let amountIn = BigInt(x.amountIn);
+          if (amountIn === 0n) amountIn = paidIn(String(cIn)); // open amount: read what was paid in
+          if (amountIn === 0n || amountIn >= UR_CONTRACT_BALANCE) continue;
           return this.v4Swap(chain, v4Id(key.currency0, key.currency1, Number(key.fee), Number(key.tickSpacing)), asToken(cIn), asToken(cOut), amountIn, Number(key.fee), event);
         }
         if (actions[j] === V4_SWAP_EXACT_IN) {
@@ -299,9 +326,10 @@ export class TransactionDecoder {
           try { [x] = coder.decode(V4_EXACT_IN, params[j]); } catch { [x] = coder.decode(V4_EXACT_IN_V2, params[j]); }
           const hop = x.path?.[0];
           if (!hop || String(hop.hooks).toLowerCase() !== ZERO) continue;
-          const amountIn = BigInt(x.amountIn);
-          if (amountIn === 0n || amountIn >= UR_CONTRACT_BALANCE) continue;
           const a = String(x.currencyIn), b = String(hop.intermediateCurrency);
+          let amountIn = BigInt(x.amountIn);
+          if (amountIn === 0n) amountIn = paidIn(a); // open amount: read what was paid in
+          if (amountIn === 0n || amountIn >= UR_CONTRACT_BALANCE) continue;
           const [c0, c1] = a.toLowerCase() < b.toLowerCase() ? [a, b] : [b, a];
           return this.v4Swap(chain, v4Id(c0, c1, Number(hop.fee), Number(hop.tickSpacing)), asToken(a), asToken(b), amountIn, Number(hop.fee), event);
         }
@@ -384,7 +412,7 @@ export class TransactionDecoder {
             const swap = p.length >= 2 ? this.swapOf(chain, entry.v2Via, p[0], p[1], amountIn as bigint, event) : null;
             if (swap) return swap;
           } else if (cmd === UR_V4_SWAP && entry.v4WrappedNative) {
-            const swap = this.decodeV4Swap(chain, inputs[i], entry.v4WrappedNative, event);
+            const swap = this.decodeV4Swap(chain, inputs[i], entry.v4WrappedNative, event, value);
             if (swap) return swap;
           }
         } catch { /* malformed input for this command; try the next */ }
