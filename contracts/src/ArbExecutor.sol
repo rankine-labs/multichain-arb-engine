@@ -35,7 +35,9 @@ pragma solidity 0.8.26;
 //   orderbook. Add them as new kinds when needed.
 //
 // Who can do what:
-//   owner    - cold wallet. Sets the executor, withdraws profits. Fixed at deploy.
+//   owner    - cold wallet. Sets the executor, withdraws profits. Can hand
+//              ownership to a new wallet in two steps (propose, then the new
+//              wallet accepts), so a typo can never lock the contract.
 //   executor - the bot's hot wallet. Can ONLY call execute().
 //
 // Safety model (why a stolen executor key can't drain the contract):
@@ -114,6 +116,13 @@ interface IWETH {
     function withdraw(uint256 amount) external;
 }
 
+// Arbitrum system contract (built into every Arbitrum / Orbit chain, e.g.
+// Robinhood Chain, at address 100). On these chains `block.number` is the
+// PARENT chain's block number, so the chain's own block number comes from here.
+interface IArbSys {
+    function arbBlockNumber() external view returns (uint256);
+}
+
 interface IAaveV3Pool {
     function flashLoanSimple(
         address receiverAddress,
@@ -159,7 +168,6 @@ contract ArbExecutor {
     // State
     // ------------------------------------------------------------------------
 
-    address public immutable owner;
     address public executor;
 
     // Aave pools the owner has approved for flash loans. The executor can't
@@ -180,6 +188,12 @@ contract ArbExecutor {
     address public v4PoolManager;
     address public weth;               // wrapped native token, for native-ETH V4 pools
 
+    // Owner (cold wallet) and a proposed new owner, for the two-step handover.
+    // Declared last so the storage slots above stay where the bot's
+    // simulator expects them.
+    address public owner;
+    address public pendingOwner;
+
     // ------------------------------------------------------------------------
     // Events / errors
     // ------------------------------------------------------------------------
@@ -189,6 +203,9 @@ contract ArbExecutor {
     event Withdrawn(address indexed token, address indexed to, uint256 amount);
     event FlashPoolSet(address indexed pool, bool allowed);
     event V4Set(address indexed poolManager, address indexed weth);
+    event EthWithdrawn(address indexed to, uint256 amount);
+    event OwnershipTransferStarted(address indexed currentOwner, address indexed proposedOwner);
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
 
     error NotOwner();
     error NotExecutor();
@@ -204,6 +221,7 @@ contract ArbExecutor {
     error FlashPoolNotAllowed(address pool);
     error V4NotEnabled();
     error UnexpectedEth();
+    error NotPendingOwner();
 
     // ------------------------------------------------------------------------
     // Setup / admin
@@ -212,6 +230,7 @@ contract ArbExecutor {
     constructor(address executor_) {
         owner = msg.sender;
         executor = executor_;
+        emit OwnershipTransferred(address(0), msg.sender);
         emit ExecutorChanged(address(0), executor_);
     }
 
@@ -264,6 +283,28 @@ contract ArbExecutor {
         emit Withdrawn(token, to, amount);
     }
 
+    // Rescue native ETH (e.g. ETH force-sent to the contract). Normal trades
+    // never leave ETH here: it is always wrapped back to WETH mid-trade.
+    function withdrawEth(address payable to, uint256 amount) external onlyOwner nonReentrant {
+        (bool ok, ) = to.call{value: amount}("");
+        if (!ok) revert TransferFailed();
+        emit EthWithdrawn(to, amount);
+    }
+
+    // Two-step ownership handover: the owner proposes, the new wallet must
+    // accept from itself. Proposing address(0) cancels a pending handover.
+    function transferOwnership(address newOwner) external onlyOwner {
+        pendingOwner = newOwner;
+        emit OwnershipTransferStarted(owner, newOwner);
+    }
+
+    function acceptOwnership() external {
+        if (msg.sender != pendingOwner || msg.sender == address(0)) revert NotPendingOwner();
+        emit OwnershipTransferred(owner, msg.sender);
+        owner = msg.sender;
+        pendingOwner = address(0);
+    }
+
     // ------------------------------------------------------------------------
     // Main entry point
     // ------------------------------------------------------------------------
@@ -271,7 +312,7 @@ contract ArbExecutor {
     // flashPool: Aave V3 Pool address to borrow from, or address(0) to trade
     // with this contract's own balance.
     function execute(Trade calldata t, address flashPool) external onlyExecutor nonReentrant {
-        if (block.number > t.maxBlock) revert Expired();
+        if (_blockNumber() > t.maxBlock) revert Expired();
         if (t.amountIn == 0 || t.minProfit == 0) revert ZeroAmount();
         _validateRoute(t);
 
@@ -302,7 +343,7 @@ contract ArbExecutor {
     // allowlisted Uniswap/Pancake/Ramses V3 pool), run the route, repay the
     // loan plus the pool's fee, keep the rest. No capital needed in here.
     function executeWithV3Flash(Trade calldata t, address lendPool) external onlyExecutor nonReentrant {
-        if (block.number > t.maxBlock) revert Expired();
+        if (_blockNumber() > t.maxBlock) revert Expired();
         if (t.amountIn == 0 || t.minProfit == 0) revert ZeroAmount();
         _validateRoute(t);
         if (!flashPools[lendPool]) revert FlashPoolNotAllowed(lendPool);
@@ -576,6 +617,18 @@ contract ArbExecutor {
     // ------------------------------------------------------------------------
     // Checks
     // ------------------------------------------------------------------------
+
+    // The chain's OWN block number, for trade deadlines. On Arbitrum / Orbit
+    // chains (Robinhood Chain) `block.number` is the parent chain's block, so
+    // the bot's deadline (set from the chain's own blocks) would never match:
+    // every trade would either always expire or never expire. ArbSys at
+    // address 100 gives the right number there; on other chains nothing lives
+    // at that address, the call returns no data, and block.number is used.
+    function _blockNumber() private view returns (uint256) {
+        (bool ok, bytes memory ret) = address(100).staticcall(abi.encodeWithSelector(IArbSys.arbBlockNumber.selector));
+        if (ok && ret.length >= 32) return abi.decode(ret, (uint256));
+        return block.number;
+    }
 
     // Route must be 2+ hops, chain correctly, and start/end in t.token.
     function _validateRoute(Trade calldata t) private pure {
