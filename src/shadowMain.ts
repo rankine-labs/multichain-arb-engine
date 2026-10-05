@@ -84,6 +84,7 @@ import { findStandingGaps } from './core/gapScanner';
 import { CompetitorTracker } from './core/competitorTracker';
 import { pickRobinhoodReadRpc, robinhoodSendRpc, redact, ROBINHOOD_PUBLIC_RPC } from './config/robinhoodEndpoints';
 import { loadStartPairs, saveStartPairs } from './core/seedPairs';
+import { DryRunPnl } from './core/dryRunPnl';
 import { FailoverJsonRpcProvider } from './core/failoverRpc';
 import { endpointLabel } from './core/endpointLabel';
 import { ROBINHOOD_SEED_PAIRS } from './config/robinhoodSeedPairs';
@@ -364,6 +365,12 @@ const queueSimulation = (
                         simStats.profit++;
                         const usd = (Number(r.profit) / 10 ** decimals) * usdPerToken;
                         console.log(`[sim] ${chain} ${route} REAL PROFIT $${usd.toFixed(2)} after loan fee | ${model}`);
+                        // A trigger trade the real-chain test confirms clears the
+                        // firing bar after gas: counts as verified would-have-earned.
+                        const net = usd - 0.05;
+                        if (chain === 'robinhood' && net >= MIN_COUNTED_USD) {
+                              dryRunPnl.recordVerified(net, `${symbolOf(chain, tokenIn)} ${route}`);
+                        }
                   } else if (r.status === 'loss') {
                         simStats.loss++;
                         console.log(`[sim] ${chain} ${route} real: LOSS | ${model}`);
@@ -443,6 +450,12 @@ const robinhoodSender = new FastSender(
       new ethers.JsonRpcProvider(robinhoodSendRpc(), 4663, { staticNetwork: true }),
 );
 const safetyGate = new SafetyGate(safetyConfigFromEnv());
+// Dry-run "would have earned" totals (core/dryRunPnl.ts), saved so restarts
+// don't reset them. Verified = confirmed by a real-chain test; model-only =
+// the bot's own maths. Both assume we win the race.
+const dryRunPnl = new DryRunPnl('data/dryrun-pnl.json', process.env.REPORT_TZ || 'America/Toronto');
+setInterval(() => dryRunPnl.save(), 60_000);
+const MIN_COUNTED_USD = Number(process.env.GAP_MIN_USD ?? 20); // same bar as firing
 safetyGate.allowTokens([ROBINHOOD_TOKENS.WETH, ROBINHOOD_TOKENS.USDG]);
 // "fire-ready" = from the moment we saw the trigger trade to a signed trade
 // in hand. The number to compare against competitors.
@@ -537,6 +550,13 @@ const fireTrade = async (o: {
                   return;
             }
             const fired = await robinhoodSender.fire(dry.to ?? '0x0000000000000000000000000000000000000000', dry.data);
+            // Dry run: this trade passed every check and would have been sent.
+            // Standing gaps carry a simulation-confirmed profit; trigger trades
+            // carry the model's estimate (their simulation is counted separately).
+            if (!fired.live) {
+                  if (o.source === 'gap') dryRunPnl.recordVerified(o.netProfitUsd, `${symbolOf(o.chain, o.tokenIn)}/${symbolOf(o.chain, o.tokenOut)} gap`);
+                  else dryRunPnl.recordModelOnly(o.netProfitUsd);
+            }
             const readyMs = Date.now() - o.seenAtMs;
             if (o.source === 'trade') fireStats.readyMs.push(readyMs);
             if (fired.txHash) {
@@ -1308,7 +1328,9 @@ for (let i = 0; i < resolved.length; i++) {
                         // Which node prices come from right now, and how often the fast one had to rest.
                         const rpc = robinhoodReadProvider.router.getStats();
                         const rpcNote = `, prices on ${rpc.onFast ? 'fast node' : 'paid node (fast node resting)'}${rpc.switches ? ` (${rpc.switches} switch${rpc.switches === 1 ? '' : 'es'} to paid node since start)` : ''}`;
-                        note = `watching ${st.pairs} pair${st.pairs === 1 ? '' : 's'}, ${st.pools} pools${tot ? `, ${localPct}% instant prices` : ''}${fireNote}${rivalNote}${gapNote}${liveNote}${rpcNote}`;
+                        const pnlNote = `, ${dryRunPnl.line()}`;
+                        console.log(`[pnl] ${dryRunPnl.line()}`);
+                        note = `watching ${st.pairs} pair${st.pairs === 1 ? '' : 's'}, ${st.pools} pools${tot ? `, ${localPct}% instant prices` : ''}${fireNote}${rivalNote}${gapNote}${liveNote}${rpcNote}${pnlNote}`;
                   }
                   return { chain, spreads, noMatchCount, note };
             });

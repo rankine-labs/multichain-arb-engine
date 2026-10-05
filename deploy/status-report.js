@@ -101,6 +101,8 @@ async function main() {
   const chainsLine = lastMatch(sh(`tail -c 3000000 "${OUT_LOG}"`).split('\n').map(strip), /\[chains\] enabled:/) || '';
   const chains = (chainsLine.split('enabled:')[1] || 'robinhood').split(',').map((s) => s.trim()).filter(Boolean);
 
+  // Latest dry-run earnings line (the bot logs it hourly: "[pnl] would-have-earned ...").
+  const lastPnl = lastMatch(sh(`tail -c 8000000 "${OUT_LOG}"`).split('\n').map(strip), /^\[pnl\] /);
   const lastScan = lastMatch(sh(`tail -c 8000000 "${OUT_LOG}"`).split('\n').map(strip), /\[scan\] robinhood (now watching|:)|\[scan\] robinhood scan failed/) || 'no scan yet';
   const simProfit = count(outL, /\[sim\].*REAL PROFIT/);
   const simLoss = count(outL, /\[sim\].*real: LOSS/);
@@ -152,6 +154,7 @@ async function main() {
     `- Rivals: ${rivalLines.length ? `${rivalLines.length} rival arbs timed · theirs ${med(rivalMs) ?? '?'} ms median vs ours ${med(oursMs) ?? '?'} ms` : 'none timed this window'}`,
     `- RPC round trip from the server: ${rpcRtt ?? '?'} ms`,
     `- Real-chain test runs: ${simProfit} profitable · ${simLoss} losing · ${simFail} would fail`,
+    `- Dry run, would have earned (if we won every race): ${lastPnl ? lastPnl.replace(/^\[pnl\] would-have-earned /, '') : 'first figure after the next hourly report'}`,
     '',
     '### Errors this window',
     ...(topErrors.length ? topErrors.map(([m, n]) => `- ${n}x \`${m.replace(/`/g, "'")}\``) : ['- none']),
