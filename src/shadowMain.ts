@@ -1,4 +1,5 @@
 import 'dotenv/config';
+const BOOT_MS = Date.now(); // for the "[startup] fully running after Ns" log
 
 // One bad trade event must never take the whole bot down. Event handlers are
 // async, so a bug in one shows up as an unhandled promise rejection, which
@@ -733,7 +734,8 @@ if (chainOn('robinhood')) {
 await chainManager.startAll();
 
       const startStatus = chainManager.getStatus() as Record<string, { online: boolean }>;
-      await sendTelegramMessage(formatStartup(startStatus));
+      // Not awaited: a slow Telegram must never hold up startup.
+      void sendTelegramMessage(formatStartup(startStatus)).catch(() => { /* logged by sender */ });
 
       // Kuru is an order book, not something you find via factory.getPair(),
       // so its market is seeded directly from the known address rather than
@@ -764,8 +766,9 @@ await chainManager.startAll();
                   );
             if (resolved) cache.upsert(resolved);
       };
-      await seedRobinhoodV4Market();
-      setInterval(seedRobinhoodV4Market, 30_000);
+      // Background: startup doesn't wait for this pool lookup.
+      void seedRobinhoodV4Market().catch(() => { /* retried every 30s */ });
+      setInterval(() => { void seedRobinhoodV4Market().catch(() => { /* next tick */ }); }, 30_000);
 
       // Both Kuru's MON/USDC and V4's WETH/USDG above are guaranteed to be
       // in cache, but have no peer to compare against unless real swap
@@ -790,9 +793,13 @@ await chainManager.startAll();
       // Robinhood partner pools: every DEX + fee tier for WETH/USDG from the
       // start (replaces the old single Uniswap V2 + Ramses V2 seeds); other
       // pairs are added automatically as they trade (core/pairWatcher.ts).
-      const wethUsdgPools = await robinhoodWatcher.watch(ROBINHOOD_TOKENS.WETH, ROBINHOOD_TOKENS.USDG, { pin: true });
-      console.log(`[pairs] robinhood WETH/USDG: ${wethUsdgPools} pools found at startup`);
+      // Background: finding every WETH/USDG pool takes minutes on the free
+      // RPC (one DEX and fee tier at a time). The bot is live meanwhile;
+      // pools join the watch list as they're found.
       robinhoodWatcher.start();
+      void robinhoodWatcher.watch(ROBINHOOD_TOKENS.WETH, ROBINHOOD_TOKENS.USDG, { pin: true })
+            .then((n) => console.log(`[pairs] robinhood WETH/USDG: ${n} pools found`))
+            .catch((err) => console.warn('[pairs] WETH/USDG discovery failed:', (err as Error).message));
 
       // Chain-wide scan: every pool on every Robinhood DEX factory, keeping
       // pairs that sit on 2+ pools with real money in each (core/universeScan.ts).
@@ -1090,6 +1097,7 @@ for (let i = 0; i < resolved.length; i++) {
             }
       };
       setInterval(sendHourlyDigest, 60 * 60 * 1000);
+      console.log(`[startup] fully running ${Math.round((Date.now() - BOOT_MS) / 1000)}s after start`);
 
       // Report on demand (see the SIGUSR2 handler at the top of this file).
       reportNow = sendHourlyDigest;
