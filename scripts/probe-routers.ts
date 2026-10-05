@@ -49,6 +49,37 @@ async function swapLogs(from: number, to: number): Promise<Array<{ tx: string; t
   return out;
 }
 
+// Why a Universal Router swap wasn't decoded: the first swap-type command found.
+const URI = new ethers.Interface(['function execute(bytes commands, bytes[] inputs, uint256 deadline)', 'function execute(bytes commands, bytes[] inputs)']);
+const BAL = 1n << 255n;
+function urSkipReason(data: string): string {
+  try {
+    const p = URI.parseTransaction({ data });
+    if (!p) return 'not execute()';
+    const cmds = ethers.getBytes(p.args[0] as string), inputs = p.args[1] as string[];
+    const c = ethers.AbiCoder.defaultAbiCoder();
+    for (let i = 0; i < cmds.length; i++) {
+      const cmd = cmds[i] & 0x3f;
+      if (cmd === 0x01) return 'V3 exact-output';
+      if (cmd === 0x09) return 'V2 exact-output';
+      if (cmd === 0x00 || cmd === 0x08) {
+        const amt = c.decode(['address', 'uint256'], ethers.dataSlice(inputs[i], 0, 64))[1] as bigint;
+        return amt >= BAL ? `${cmd === 0 ? 'V3' : 'V2'} use-whole-balance` : `${cmd === 0 ? 'V3' : 'V2'} exact-in (other reason)`;
+      }
+      if (cmd === 0x10) {
+        const [acts] = c.decode(['bytes', 'bytes[]'], inputs[i]);
+        const a = ethers.getBytes(acts as string);
+        for (const x of a) {
+          if (x === 0x08 || x === 0x09) return 'V4 exact-output';
+          if (x === 0x06 || x === 0x07) return 'V4 exact-in (hooked pool or open amount)';
+        }
+        return 'V4 other actions';
+      }
+    }
+    return 'no swap command';
+  } catch { return 'unparseable'; }
+}
+
 (async () => {
   seedKnownAddresses(DEFAULT_ROUTER_REGISTRY);
   const decoder = new TransactionDecoder(DEFAULT_ROUTER_REGISTRY);
@@ -68,6 +99,8 @@ async function swapLogs(from: number, to: number): Promise<Array<{ tx: string; t
 
   type Row = { txs: number; decoded: number; v4: number; selectors: Map<string, number>; known: boolean };
   const rows = new Map<string, Row>();
+  // Universal Router swaps the decoder skipped, by reason (with ETH sent, a size hint).
+  const skipped = new Map<string, { n: number; eth: number[] }>();
   let fetched = 0;
   const txTo = new Map<string, string>();
   for (let i = 0; i < hashes.length && Date.now() < DEADLINE; i += 20) {
@@ -88,6 +121,12 @@ async function swapLogs(from: number, to: number): Promise<Array<{ tx: string; t
       const ev = { chain: 'robinhood' as const, stateType: 'SEQUENCED' as const, blockOrSeq: 0, receivedAtMs: Date.now(), raw: { to: tx.to, data: tx.data, value: tx.value.toString() } };
       const d = await decoder.decode(ev).catch(() => null);
       if (d) row.decoded++;
+      else if (DEFAULT_ROUTER_REGISTRY.robinhood[to]?.style === 'ur') {
+        const tag = urSkipReason(tx.data);
+        const e = skipped.get(tag) ?? { n: 0, eth: [] as number[] };
+        e.n++; e.eth.push(Number(ethers.formatEther(tx.value)));
+        skipped.set(tag, e);
+      }
     }
   }
 
@@ -127,6 +166,12 @@ async function swapLogs(from: number, to: number): Promise<Array<{ tx: string; t
     console.log(`UR copy ${to}: pools hit -> ${[...seen.entries()].map(([k, n]) => `${k} x${n}`).join(', ') || 'none found'}`);
   }
 
+  console.log('Universal Router swaps NOT decoded, by reason (count | median ETH sent | share sending ETH):');
+  for (const [tag, e] of [...skipped.entries()].sort((a, b) => b[1].n - a[1].n)) {
+    const sorted = [...e.eth].sort((a, b) => a - b);
+    const med = sorted[Math.floor(sorted.length / 2)] ?? 0;
+    console.log(`  ${tag} | ${e.n} | ${med.toFixed(4)} ETH | ${Math.round((100 * e.eth.filter((v) => v > 0).length) / e.n)}%`);
+  }
   console.log('Top senders (to address | swap txs | share | decoded | V4 | known router? | top selectors):');
   const sorted = [...rows.entries()].sort((a, b) => b[1].txs - a[1].txs).slice(0, 18);
   for (const [to, r] of sorted) {
