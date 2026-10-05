@@ -1,4 +1,6 @@
 import { ChainCapability, RawChainEvent, ChainName } from './types';
+import { readFileSync, writeFileSync, mkdirSync, renameSync } from 'fs';
+import { dirname } from 'path';
 
 // ============================================================================
 // CHAIN MANAGER
@@ -39,8 +41,54 @@ export class ChainManager {
   // Robinhood runaway loop. Only one cycle is allowed to run at a time.
   private checkInProgress = false;
 
+  // PROVIDER BLOCKS SURVIVE RESTARTS. A provider block (403 / 429) used to
+  // live only in memory, so every restart (each auto-deploy) knocked on the
+  // blocked feed again straight away -- and Robinhood treats that as more
+  // "sustained rejections", so a few deploys in a row kept the IP blocked.
+  // Now the block's end time is saved to `blockFile` and a restart waits it
+  // out. Cleared as soon as the chain connects.
+  private blockedUntil = new Map<ChainName, number>();
+
+  // "UNHEALTHY" used to print every health check (every 15 s) for the whole
+  // hour of a block: hundreds of identical lines. Now: on change, then at
+  // most every 10 min while it stays down.
+  private lastUnhealthyLog = new Map<ChainName, number>();
+  static readonly UNHEALTHY_LOG_EVERY_MS = 10 * 60_000;
+
   // `now` is injectable so tests can control time; production uses Date.now.
-  constructor(private readonly now: () => number = Date.now) {}
+  // `blockFile` is optional (tests and tools run without one).
+  constructor(private readonly now: () => number = Date.now, private readonly blockFile?: string) {
+    if (blockFile) {
+      try {
+        const saved = JSON.parse(readFileSync(blockFile, 'utf8')) as Record<string, number>;
+        for (const [chain, until] of Object.entries(saved)) {
+          if (typeof until === 'number' && until > this.now()) this.blockedUntil.set(chain as ChainName, until);
+        }
+      } catch { /* no file yet: nothing blocked */ }
+    }
+  }
+
+  private saveBlocks() {
+    if (!this.blockFile) return;
+    try {
+      mkdirSync(dirname(this.blockFile), { recursive: true });
+      writeFileSync(this.blockFile + '.tmp', JSON.stringify(Object.fromEntries(this.blockedUntil)));
+      renameSync(this.blockFile + '.tmp', this.blockFile);
+    } catch { /* best effort: memory still has it */ }
+  }
+
+  // Remember a provider block (only when the provider actually blocked us).
+  private noteBlock(chain: ChainName, err: unknown, until: number) {
+    if (ChainManager.penaltyMs(err) <= 0) return;
+    this.blockedUntil.set(chain, until);
+    this.saveBlocks();
+  }
+
+  private clearBlock(chain: ChainName) {
+    if (this.blockedUntil.delete(chain)) this.saveBlocks();
+  }
+
+  getBlockedUntil(chain: ChainName) { return this.blockedUntil.get(chain); }
 
   register(adapter: ChainCapability) {
     this.adapters.set(adapter.chain, adapter);
@@ -57,9 +105,20 @@ export class ChainManager {
     const chains = [...this.adapters.keys()];
     const results = await Promise.allSettled(
       [...this.adapters.values()].map(async (a) => {
+        // Still inside a provider block saved before the restart? Don't
+        // connect at all; the health checks retry once it has expired.
+        const until = this.blockedUntil.get(a.chain);
+        if (until && until > this.now()) {
+          const mins = Math.round((until - this.now()) / 60_000);
+          this.status.set(a.chain, { online: false, reason: `provider block, waiting ${mins} min` });
+          this.reconnectBackoff.set(a.chain, { failCount: 1, nextRetryAt: until });
+          console.warn(`[chainManager] ${a.chain} still blocked by the provider (saved before restart): not connecting for ${mins} min`);
+          return;
+        }
         await a.connect();
         this.status.set(a.chain, { online: true });
         this.stableSince.set(a.chain, this.now());
+        this.clearBlock(a.chain);
       }),
     );
 
@@ -72,6 +131,7 @@ export class ChainManager {
         // into provider blocks.
         const delayMs = this.retryDelayMs(1, r.reason);
         this.reconnectBackoff.set(chain, { failCount: 1, nextRetryAt: this.now() + delayMs });
+        this.noteBlock(chain, r.reason, this.now() + delayMs);
         console.error(`[chainManager] ${chain} failed to start (retry in ${Math.round(delayMs / 1000)}s):`, r.reason);
       }
     });
@@ -133,8 +193,14 @@ export class ChainManager {
     }
 
     // --- Unhealthy ----------------------------------------------------------
+    const wasOnline = this.status.get(chain)?.online ?? true;
     this.status.set(chain, { online: false, reason: result.reason });
-    console.warn(`[chainManager] ${chain} UNHEALTHY: ${result.reason}`);
+    if (wasOnline || now - (this.lastUnhealthyLog.get(chain) ?? 0) >= ChainManager.UNHEALTHY_LOG_EVERY_MS) {
+      this.lastUnhealthyLog.set(chain, now);
+      const wait = this.reconnectBackoff.get(chain);
+      const retryIn = wait && wait.nextRetryAt > now ? ` (next retry in ${Math.round((wait.nextRetryAt - now) / 60_000)} min)` : '';
+      console.warn(`[chainManager] ${chain} UNHEALTHY: ${result.reason}${retryIn}`);
+    }
 
     // Did it just flap (healthy, then died before the stable threshold)?
     // If so that counts as a failure, exactly like a failed reconnect.
@@ -164,12 +230,14 @@ export class ChainManager {
       // Start the stability clock from the reconnect. If it dies again
       // before STABLE_THRESHOLD_MS, the flap check above escalates backoff.
       this.stableSince.set(chain, this.now());
+      this.clearBlock(chain);
       console.warn(`[chainManager] ${chain} reconnected successfully`);
     } catch (err) {
       const failCount = (backoff?.failCount ?? 0) + 1;
       const delayMs = this.retryDelayMs(failCount, err);
       this.reconnectBackoff.set(chain, { failCount, nextRetryAt: this.now() + delayMs });
-      console.error(`[chainManager] ${chain} reconnect failed, backing off ${Math.round(delayMs / 1000)}s:`, err);
+      this.noteBlock(chain, err, this.now() + delayMs);
+      console.error(`[chainManager] ${chain} reconnect failed, backing off ${Math.round(delayMs / 1000)}s:`, String((err as Error)?.message ?? err).slice(0, 200));
     }
   }
 
