@@ -84,6 +84,8 @@ import { findStandingGaps } from './core/gapScanner';
 import { CompetitorTracker } from './core/competitorTracker';
 import { pickRobinhoodReadRpc, robinhoodSendRpc, redact, ROBINHOOD_PUBLIC_RPC } from './config/robinhoodEndpoints';
 import { loadStartPairs, saveStartPairs } from './core/seedPairs';
+import { FailoverJsonRpcProvider } from './core/failoverRpc';
+import { endpointLabel } from './core/endpointLabel';
 import { ROBINHOOD_SEED_PAIRS } from './config/robinhoodSeedPairs';
 
 async function main() {
@@ -114,12 +116,21 @@ const priceOracle = new PriceOracle(cache);
     // eth_chainId auto-detection (see avalanche.ts for the same fix).
     const avalancheReadProvider = new ethers.JsonRpcProvider('https://api.avax.network/ext/bc/C/rpc', 43114);
       const monadReadProvider = new ethers.JsonRpcProvider('https://rpc.monad.xyz', 143);
-      // Robinhood reads: paid RPC (your Alchemy key) when it answers, else the
-      // public RPC. See config/robinhoodEndpoints.ts.
+      // Robinhood reads are split by job (core/failoverRpc.ts):
+      //   FAST  (prices, blocks, pool lookups): Robinhood's own node, ~8 ms
+      //         from the server. Override with ROBINHOOD_FAST_RPC.
+      //   HEAVY (simulations, chain-wide scan): the paid node (Alchemy via
+      //         ROBINHOOD_RPC_HTTP) when it answers, ~24 ms but no throttling.
+      //   If FAST says "slow down" or fails, reads move to HEAVY for 5 min.
+      //   No paid node -> everything on the public node, like before.
       const rhRead = await pickRobinhoodReadRpc();
       if (!process.env.ROBINHOOD_RPC_HTTP && rhRead.url !== ROBINHOOD_PUBLIC_RPC) process.env.ROBINHOOD_RPC_HTTP = rhRead.url; // simulations use it too
-      console.log(`[robinhood] reading from ${rhRead.label} (${redact(rhRead.url)}), sending to ${redact(robinhoodSendRpc())}`);
-      const robinhoodReadProvider = new ethers.JsonRpcProvider(rhRead.url, 4663, { staticNetwork: true });
+      const rhFastUrl = process.env.ROBINHOOD_FAST_RPC || ROBINHOOD_PUBLIC_RPC;
+      const rhHeavyUrl = rhRead.url !== rhFastUrl ? rhRead.url : null;
+      console.log(`[robinhood] prices from ${endpointLabel(rhFastUrl)}, simulations + scan from ${rhHeavyUrl ? endpointLabel(rhHeavyUrl) + ' (' + redact(rhHeavyUrl) + ')' : 'the same node'}, sending to ${redact(robinhoodSendRpc())}`);
+      const robinhoodReadProvider = new FailoverJsonRpcProvider(rhFastUrl, rhHeavyUrl, 4663);
+      // Bursty work (the chain-wide scan) goes straight to HEAVY.
+      const robinhoodHeavyProvider = rhHeavyUrl ? new ethers.JsonRpcProvider(rhHeavyUrl, 4663, { staticNetwork: true }) : robinhoodReadProvider;
 
       // Decoder gets the pool cache so it can decode Monad Swap logs (a log
       // only names the pool; the cache knows its tokens).
@@ -1035,9 +1046,16 @@ await chainManager.startAll();
             try {
                   const t0 = Date.now();
                   scanState ??= loadScanState();
-                  const res = await scanUniverse(robinhoodReadProvider, ROBINHOOD_SCAN_FACTORIES, {
-                        usdToken: ROBINHOOD_TOKENS.USDG, wrappedNative: ROBINHOOD_TOKENS.WETH, minPoolUsd: SCAN_MIN_USD,
-                  }, scanState);
+                  // Scan on HEAVY (bursty: thousands of reads). If the paid
+                  // node refuses (e.g. its plan limits log queries), try once
+                  // on the fast node before waiting 15 min. Progress is saved
+                  // per factory, so a second attempt repeats nothing.
+                  const scanOpts = { usdToken: ROBINHOOD_TOKENS.USDG, wrappedNative: ROBINHOOD_TOKENS.WETH, minPoolUsd: SCAN_MIN_USD };
+                  let res = await scanUniverse(robinhoodHeavyProvider, ROBINHOOD_SCAN_FACTORIES, scanOpts, scanState);
+                  if (robinhoodHeavyProvider !== robinhoodReadProvider && res.errors.length && !res.candidates.length) {
+                        console.warn(`[scan] paid node scan failed (${res.errors.join('; ').slice(0, 150)}), retrying on the fast node`);
+                        res = await scanUniverse(robinhoodReadProvider, ROBINHOOD_SCAN_FACTORIES, scanOpts, scanState);
+                  }
                   saveScanState(scanState);
                   const top = res.candidates.slice(0, SCAN_TOP);
                   // Only replace the saved start list with a real result.
@@ -1264,7 +1282,10 @@ for (let i = 0; i < resolved.length; i++) {
                         const gapNote = (gapStats.found ? `, standing gaps ${gapStats.found} confirmed (best real $${gapStats.bestUsd.toFixed(0)})` : '') + (gapStats.fake ? `, ${gapStats.fake} fake gaps muted` : '');
                         const lv = liveTracker.summary();
                         const liveNote = lv.sent ? `, LIVE ${lv.won}/${lv.sent} won, profit $${lv.profitUsd.toFixed(2)}, gas $${lv.gasUsd.toFixed(2)}` : '';
-                        note = `watching ${st.pairs} pair${st.pairs === 1 ? '' : 's'}, ${st.pools} pools${tot ? `, ${localPct}% instant prices` : ''}${fireNote}${rivalNote}${gapNote}${liveNote}`;
+                        // Which node prices come from right now, and how often the fast one had to rest.
+                        const rpc = robinhoodReadProvider.router.getStats();
+                        const rpcNote = `, prices on ${rpc.onFast ? 'fast node' : 'paid node (fast node resting)'}${rpc.switches ? ` (${rpc.switches} switch${rpc.switches === 1 ? '' : 'es'} to paid node since start)` : ''}`;
+                        note = `watching ${st.pairs} pair${st.pairs === 1 ? '' : 's'}, ${st.pools} pools${tot ? `, ${localPct}% instant prices` : ''}${fireNote}${rivalNote}${gapNote}${liveNote}${rpcNote}`;
                   }
                   return { chain, spreads, noMatchCount, note };
             });
