@@ -35,6 +35,13 @@ const ROUTER_INTERFACES: Record<string, ethers.Interface> = {
     'function swapTokensForExactTokens(uint amountOut, uint amountInMax, address[] path, address to, uint deadline)',
     'function swapExactETHForTokens(uint amountOutMin, address[] path, address to, uint deadline)',
     'function swapExactTokensForETH(uint amountIn, uint amountOutMin, address[] path, address to, uint deadline)',
+    // "SupportingFeeOnTransferTokens" versions: same arguments, used by most
+    // wallets/front-ends by default. The router probe showed about half of
+    // Robinhood's V2 router swaps use these (0x791ac947, 0xb6f9de95), and the
+    // decoder skipped them all.
+    'function swapExactTokensForTokensSupportingFeeOnTransferTokens(uint amountIn, uint amountOutMin, address[] path, address to, uint deadline)',
+    'function swapExactETHForTokensSupportingFeeOnTransferTokens(uint amountOutMin, address[] path, address to, uint deadline)',
+    'function swapExactTokensForETHSupportingFeeOnTransferTokens(uint amountIn, uint amountOutMin, address[] path, address to, uint deadline)',
     ]),
   v3: new ethers.Interface([
     // Original SwapRouter (has a deadline field)
