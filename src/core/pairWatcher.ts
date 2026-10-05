@@ -45,6 +45,8 @@ export interface PairWatcherOptions {
   // Bursty pool lookups (discovery, token symbol/decimals) can use a
   // different node than the steady price refresh. Default: same node.
   discoveryProvider?: ethers.JsonRpcProvider;
+  // Called after each background price re-sync (e.g. to re-check gaps).
+  onRefreshed?: () => void;
   maxPairs?: number;
   rediscoverMs?: number;
   refreshMs?: number;
@@ -148,6 +150,7 @@ export class PairWatcher {
   private readonly refreshMs: number;
   private refreshTimer: NodeJS.Timeout | null = null;
   private readonly discoveryProvider: ethers.JsonRpcProvider;
+  private readonly onRefreshed?: () => void;
 
   constructor(
     private readonly chain: ChainName,
@@ -160,6 +163,7 @@ export class PairWatcher {
     opts: PairWatcherOptions = {},
   ) {
     this.discoveryProvider = opts.discoveryProvider ?? provider;
+    this.onRefreshed = opts.onRefreshed;
     this.maxPairs = opts.maxPairs ?? 40;
     this.rediscoverMs = opts.rediscoverMs ?? 10 * 60_000;
     this.refreshMs = opts.refreshMs ?? 30_000;
@@ -289,6 +293,7 @@ export class PairWatcher {
       this.callMany ??= (await makeCaller(this.provider)).callMany;
       for (const fresh of await refreshPoolsBatch(this.callMany, pools)) this.cache.upsert(fresh);
       this.lastRefreshMs = Date.now();
+      try { this.onRefreshed?.(); } catch { /* a listener error must not break refreshing */ }
     } finally {
       this.refreshing = false;
     }
