@@ -394,6 +394,9 @@ const ROBINHOOD_VENUES: Venue[] = [
       // (WETH stands in for ETH). Prices read through V4's StateView.
       { dex: 'uniswap-v4', kind: 'v4', factory: ROBINHOOD_V4.STATE_VIEW, poolManager: ROBINHOOD_V4.POOL_MANAGER, weth: ROBINHOOD_TOKENS.WETH },
 ];
+// Asks the standing-gap scanner to run soon (set up with the scanner below;
+// a no-op until then). Called whenever a pool price changes.
+let requestGapScan: () => void = () => {};
 const robinhoodWatcher = new PairWatcher('robinhood', robinhoodReadProvider, ROBINHOOD_VENUES, cache,
       // Real decimals/symbols for every discovered token, read from the token itself.
       (addr, meta) => {
@@ -405,7 +408,8 @@ const robinhoodWatcher = new PairWatcher('robinhood', robinhoodReadProvider, ROB
       // request), the safety net behind instant price tracking below.
       // discoveryProvider: pool lookups are bursty (many reads per pair), so
       // they go to the paid node; the steady 5 s price refresh stays fast.
-      { maxPairs: 60, rediscoverMs: 10 * 60_000, refreshMs: 5_000, discoveryProvider: robinhoodHeavyProvider });
+      { maxPairs: 60, rediscoverMs: 10 * 60_000, refreshMs: 5_000, discoveryProvider: robinhoodHeavyProvider,
+        onRefreshed: () => requestGapScan() });
 
 // Re-read a pool's live price right before using it (skips pools we can't
 // refresh this way: Uniswap V4, order books, bin pools). Never waits more
@@ -670,7 +674,7 @@ if (registerIfApproved('avalanche', entry.dex, resolved)) pool = resolved;
     if (FAST_PRICES && swap.chain === 'robinhood' && swap.amountIn > 0n) {
           const inIsA = pool.tokenA.toLowerCase() === swap.tokenIn.toLowerCase();
           const after = cache.predictPostTradeState(pool, inIsA, swap.amountIn);
-          if (after !== pool) cache.upsert({ ...after, lastUpdatedMs: Date.now() });
+          if (after !== pool) { cache.upsert({ ...after, lastUpdatedMs: Date.now() }); requestGapScan(); }
     }
 
     // Cheap "is this trade big enough to matter" check, now against the
@@ -932,7 +936,16 @@ await chainManager.startAll();
       const gapLastFired = new Map<string, number>();
       const gapMutedUntil = new Map<string, number>();
       let gapRunning = false; // a slow simulation must not let scans pile up
-      setInterval(async () => {
+      // WHEN it runs: the moment any price changes (a trade we read from the
+      // feed, or a price re-sync finishing), debounced 50 ms so a burst of
+      // trades is one scan; plus every 5 s as a safety net. The scan only
+      // reads prices already in memory, so running it often costs no RPC.
+      let gapScanQueued: NodeJS.Timeout | null = null;
+      requestGapScan = () => {
+            if (gapScanQueued) return;
+            gapScanQueued = setTimeout(() => { gapScanQueued = null; void runGapScan(); }, 50);
+      };
+      const runGapScan = async () => {
             if (gapRunning) return;
             gapRunning = true;
             try {
@@ -983,7 +996,8 @@ await chainManager.startAll();
             } finally {
                   gapRunning = false;
             }
-      }, 5_000);
+      };
+      setInterval(() => { void runGapScan(); }, 5_000);
       void robinhoodWatcher.watch(ROBINHOOD_TOKENS.WETH, ROBINHOOD_TOKENS.USDG, { pin: true })
             .then((n) => console.log(`[pairs] robinhood WETH/USDG: ${n} pools found`))
             .catch((err) => console.warn('[pairs] WETH/USDG discovery failed:', (err as Error).message));
