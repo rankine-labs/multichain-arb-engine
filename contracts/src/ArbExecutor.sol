@@ -625,7 +625,11 @@ contract ArbExecutor {
     // address 100 gives the right number there; on other chains nothing lives
     // at that address, the call returns no data, and block.number is used.
     function _blockNumber() private view returns (uint256) {
-        (bool ok, bytes memory ret) = address(100).staticcall(abi.encodeWithSelector(IArbSys.arbBlockNumber.selector));
+        // Gas-capped: the real precompile costs a few hundred gas, while a
+        // placeholder (0xfe in forks/simulations) would otherwise burn 63/64
+        // of the trade's gas before we fall back to block.number.
+        (bool ok, bytes memory ret) =
+            address(100).staticcall{gas: 20_000}(abi.encodeWithSelector(IArbSys.arbBlockNumber.selector));
         if (ok && ret.length >= 32) return abi.decode(ret, (uint256));
         return block.number;
     }

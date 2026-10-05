@@ -115,6 +115,17 @@ contract ReviewFixesTest is Test {
         assertGt(usdc.balanceOf(address(exec)), TRADE, "profit made");
     }
 
+    // In fork tests and local simulations of an Arbitrum chain, address(100)
+    // holds a 0xfe (INVALID) placeholder instead of the real precompile. The
+    // probe must not burn the trade's gas: it falls back to block.number.
+    function test_deadline_placeholderPrecompile_doesNotEatGas() public {
+        vm.etch(address(100), hex"fe");
+        vm.roll(50);
+        vm.prank(bot);
+        exec.execute{gas: 2_000_000}(_trade(50), address(0));
+        assertGt(usdc.balanceOf(address(exec)), TRADE, "profit made");
+    }
+
     // ---- 2. ETH rescue -------------------------------------------------------
 
     function test_withdrawEth_ownerOnly_andSends() public {
