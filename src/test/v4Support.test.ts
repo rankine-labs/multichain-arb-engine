@@ -135,6 +135,18 @@ async function decoderV4() {
   assert(await dec.decode(ev(ur.encodeFunctionData('execute', ['0x10', [coder.encode(['bytes', 'bytes[]'], ['0x06', [hooked]])], 1n]))) === null, 'hooked V4 pool skipped');
   const openDelta = coder.encode([`tuple(${KEY} poolKey,bool zeroForOne,uint128 amountIn,uint128 amountOutMinimum,bytes hookData)`],
     [{ poolKey: { currency0: ZERO, currency1: USDG, fee: 500, tickSpacing: 10, hooks: ZERO }, zeroForOne: true, amountIn: 0n, amountOutMinimum: 0n, hookData: '0x' }]);
-  assert(await dec.decode(ev(ur.encodeFunctionData('execute', ['0x10', [coder.encode(['bytes', 'bytes[]'], ['0x06', [openDelta]])], 1n]))) === null, 'amount 0 (use open balance) skipped');
+  assert(await dec.decode(ev(ur.encodeFunctionData('execute', ['0x10', [coder.encode(['bytes', 'bytes[]'], ['0x06', [openDelta]])], 1n]))) === null, 'amount 0 with nothing paid in -> skipped');
+
+  // Open amount, native ETH: the amount is the ETH sent with the transaction.
+  const evVal = (data: string, value: bigint) => ({ ...ev(data), raw: { to: ROBINHOOD_V4.UNIVERSAL_ROUTER, data, value: value.toString() } });
+  const s3 = await dec.decode(evVal(ur.encodeFunctionData('execute', ['0x10', [coder.encode(['bytes', 'bytes[]'], ['0x06', [openDelta]])], 1n]), 3n * 10n ** 17n));
+  assert(s3?.amountIn === 3n * 10n ** 17n && s3?.tokenIn.toLowerCase() === WETH.toLowerCase(), 'open amount + ETH sent -> amount = ETH sent');
+
+  // Open amount, token in: the amount is in a SETTLE action for that token.
+  const openUsdg = coder.encode([`tuple(${KEY} poolKey,bool zeroForOne,uint128 amountIn,uint128 amountOutMinimum,bytes hookData)`],
+    [{ poolKey: { currency0: ZERO, currency1: USDG, fee: 500, tickSpacing: 10, hooks: ZERO }, zeroForOne: false, amountIn: 0n, amountOutMinimum: 0n, hookData: '0x' }]);
+  const settleUsdg = coder.encode(['address', 'uint256', 'bool'], [USDG, 777n * 10n ** 6n, true]);
+  const s4 = await dec.decode(ev(ur.encodeFunctionData('execute', ['0x10', [coder.encode(['bytes', 'bytes[]'], ['0x0b06', [settleUsdg, openUsdg]])], 1n])));
+  assert(s4?.amountIn === 777n * 10n ** 6n && s4?.tokenIn.toLowerCase() === USDG.toLowerCase(), 'open amount + SETTLE of the token -> amount from SETTLE');
 }
 decoderV4().catch((err) => { console.error('FAIL: decoder V4 test crashed', err); process.exitCode = 1; });
