@@ -4,10 +4,10 @@ Executes one arbitrage round trip in a single transaction. If it doesn't end
 with at least `minProfit` more of the starting token, **the whole transaction
 reverts** and only gas is lost.
 
-**Status: tested on mocks AND on real mainnet pools (fork tests). Not deployed.
-Not wired to send transactions.** The bot still runs in shadow mode. It now
-builds the exact `execute()` calldata for each qualifying opportunity as a
-dry run and logs `[exec-dryrun]` lines, so you can see coverage before going live.
+**Status: tested on mocks AND on real mainnet pools (fork tests). Not deployed yet.**
+The bot builds and signs the exact trade for every qualifying opportunity as a
+DRY RUN (never sent). Deploying and going live: see [docs/GO_LIVE.md](../docs/GO_LIVE.md)
+(deploy script: `script/Deploy.s.sol`).
 
 ## What it supports
 
@@ -58,6 +58,7 @@ FOUNDRY_PROFILE=fork forge test --match-contract RobinhoodForkTest --fork-url $R
 | Robinhood | Ramses V2 -> Ramses V3 | Solidly swaps, Ramses V3 callback |
 | Robinhood | Ramses V2 -> PancakeSwap V3 | Solidly + Pancake V3 |
 | Robinhood | **V3 flash loan** + Ramses V2 -> PancakeSwap V3 | borrow from a real V3 pool, trade, repay |
+| Robinhood | **Ramses V3 as lender** + Ramses V2 -> PancakeSwap V3 | Ramses V3 flash callback name |
 | Monad | **V3 flash loan** + Uniswap V3 -> PancakeSwap V3 | same, on Monad |
 
 Each passes only if every swap executed and the trade was then stopped by the
