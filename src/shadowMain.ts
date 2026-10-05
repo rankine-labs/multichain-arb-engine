@@ -83,6 +83,8 @@ import { LiveTradeTracker } from './execution/liveTracker';
 import { findStandingGaps } from './core/gapScanner';
 import { CompetitorTracker } from './core/competitorTracker';
 import { pickRobinhoodReadRpc, robinhoodSendRpc, redact, ROBINHOOD_PUBLIC_RPC } from './config/robinhoodEndpoints';
+import { loadStartPairs, saveStartPairs } from './core/seedPairs';
+import { ROBINHOOD_SEED_PAIRS } from './config/robinhoodSeedPairs';
 
 async function main() {
 const cache = new PoolCache();
@@ -931,6 +933,24 @@ await chainManager.startAll();
       // only reads pools created since the last scan. Safe to delete: the
       // next scan just starts from scratch.
       const SCAN_STATE_FILE = 'data/robinhood-universe.json';
+      // Top pairs from the last good scan (core/seedPairs.ts). Watched at
+      // startup so the bot never runs on WETH/USDG alone while a scan is
+      // slow or blocked. Falls back to the backup list in the repo.
+      const TOP_PAIRS_FILE = 'data/robinhood-top-pairs.json';
+      if (SCAN_TOP > 0) {
+            const start = loadStartPairs(TOP_PAIRS_FILE, ROBINHOOD_SEED_PAIRS);
+            const pairs = start.pairs.slice(0, SCAN_TOP);
+            safetyGate.allowTokens(pairs.flatMap((p) => [p.a, p.b]));
+            void (async () => {
+                  // One at a time, in the background: startup is never delayed.
+                  for (const p of pairs) {
+                        try { await robinhoodWatcher.watch(p.a, p.b, { pin: true }); }
+                        catch (err) { console.warn('[pairs] start pair watch failed:', (err as Error).message); }
+                  }
+                  const st = robinhoodWatcher.stats();
+                  console.log(`[pairs] robinhood start list (${start.source}): ${pairs.length} pairs, now watching ${st.pairs} pairs, ${st.pools} pools`);
+            })();
+      }
       const loadScanState = (): ScanState => {
             try {
                   const st = JSON.parse(readFileSync(SCAN_STATE_FILE, 'utf8'));
@@ -958,6 +978,8 @@ await chainManager.startAll();
                   }, scanState);
                   saveScanState(scanState);
                   const top = res.candidates.slice(0, SCAN_TOP);
+                  // Only replace the saved start list with a real result.
+                  if (top.length) saveStartPairs(TOP_PAIRS_FILE, top.map((c) => ({ a: c.tokenA, b: c.tokenB })));
                   // Only vetted pairs' tokens may ever be traded (safety gate allowlist).
                   safetyGate.allowTokens(top.flatMap((c) => [c.tokenA, c.tokenB]));
                   console.log(`[scan] robinhood: ${res.totalPools} pools, ${res.multiPoolPairs} pairs on 2+ pools, ${res.candidates.length} with $${SCAN_MIN_USD}+ in 2+ pools (${Math.round((Date.now() - t0) / 1000)}s)${res.errors.length ? ' errors: ' + res.errors.join('; ') : ''}`);
