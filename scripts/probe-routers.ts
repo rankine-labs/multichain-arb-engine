@@ -17,26 +17,33 @@ import { seedKnownAddresses } from '../src/config/knownAddresses';
 
 const RPC = process.env.ROBINHOOD_RPC_URL ?? 'https://rpc.mainnet.chain.robinhood.com';
 const provider = new ethers.JsonRpcProvider(RPC, 4663, { staticNetwork: true, batchMaxCount: 20 });
-const HOURS = Number(process.env.ROUTER_HOURS ?? 6);
+const HOURS = Number(process.env.ROUTER_HOURS ?? 2);
 // Uniswap V4 swaps are logged by the single PoolManager, not by a pool.
 const TOPIC_V4_SWAP = ethers.id('Swap(bytes32,address,int128,int128,uint160,uint128,int24,uint24)');
 const TOPICS = [TOPIC_V2_SWAP, TOPIC_V3_SWAP, TOPIC_PANCAKE_V3_SWAP, TOPIC_V4_SWAP];
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+// Hard stop: whatever happens, print what we have after this long.
+const DEADLINE = Date.now() + Number(process.env.ROUTER_MAX_MIN ?? 25) * 60_000;
+let logErrors = 0, lastLogError = '';
+
 // eth_getLogs by topic only (any contract), splitting busy ranges in half.
+// A range that keeps failing even when tiny is retried 3 times, then
+// skipped and counted (never an endless loop).
 async function swapLogs(from: number, to: number): Promise<Array<{ tx: string; topic: string }>> {
   const out: Array<{ tx: string; topic: string }> = [];
-  const stack: Array<[number, number]> = [[from, to]];
-  while (stack.length) {
-    const [f, t] = stack.pop()!;
+  const stack: Array<[number, number, number]> = [[from, to, 0]];
+  while (stack.length && Date.now() < DEADLINE) {
+    const [f, t, tries] = stack.pop()!;
     try {
       const logs = await provider.send('eth_getLogs', [{ fromBlock: ethers.toQuantity(f), toBlock: ethers.toQuantity(t), topics: [TOPICS] }]) as Array<{ transactionHash: string; topics: string[] }>;
       for (const l of logs) out.push({ tx: l.transactionHash, topic: l.topics[0] });
-    } catch {
-      if (t - f < 4) { await sleep(500); stack.push([f, t]); continue; } // tiny range failing = rate limit: wait, retry
-      const m = Math.floor((f + t) / 2);
-      stack.push([m + 1, t], [f, m]);
+    } catch (err) {
+      lastLogError = String((err as Error).message).slice(0, 120);
+      if (t - f >= 4) { const m = Math.floor((f + t) / 2); stack.push([m + 1, t, 0], [f, m, 0]); continue; }
+      if (tries < 3) { await sleep(1_000 * (tries + 1)); stack.push([f, t, tries + 1]); continue; }
+      logErrors++; // give up on this little range
     }
   }
   return out;
@@ -52,6 +59,7 @@ async function swapLogs(from: number, to: number): Promise<Array<{ tx: string; t
   const blockSec = older ? (latest.timestamp - older.timestamp) / 10_000 : 0.25;
   const from = Math.max(0, latest.number - Math.round((HOURS * 3600) / Math.max(blockSec, 0.05)));
   const logs = await swapLogs(from, latest.number);
+  console.log(`[progress] ${logs.length} swap events collected, looking up transactions...`);
 
   // One entry per transaction (an aggregator trade can hit several pools).
   const byTx = new Map<string, Set<string>>();
@@ -61,7 +69,7 @@ async function swapLogs(from: number, to: number): Promise<Array<{ tx: string; t
   type Row = { txs: number; decoded: number; v4: number; selectors: Map<string, number>; known: boolean };
   const rows = new Map<string, Row>();
   let fetched = 0;
-  for (let i = 0; i < hashes.length; i += 20) {
+  for (let i = 0; i < hashes.length && Date.now() < DEADLINE; i += 20) {
     const chunk = hashes.slice(i, i + 20);
     const txs = await Promise.all(chunk.map((h) => provider.getTransaction(h).catch(() => null)));
     for (let k = 0; k < txs.length; k++) {
@@ -83,6 +91,8 @@ async function swapLogs(from: number, to: number): Promise<Array<{ tx: string; t
 
   const total = [...rows.values()].reduce((s, r) => s + r.txs, 0);
   const decoded = [...rows.values()].reduce((s, r) => s + r.decoded, 0);
+  if (logErrors) console.log(`(${logErrors} small block ranges skipped after retries; last error: ${lastLogError})`);
+  if (Date.now() >= DEADLINE) console.log('(stopped at the time limit: partial results)');
   console.log(`Last ${HOURS}h (blocks ${from}-${latest.number}, ~${blockSec.toFixed(2)}s/block): ${logs.length} swap events in ${hashes.length} txs, ${fetched} looked up`);
   console.log(`Bot decodes ${decoded}/${total} swap txs (${total ? Math.round((100 * decoded) / total) : 0}%) straight from the feed`);
   console.log('Top senders (to address | swap txs | share | decoded | V4 | known router? | top selectors):');
