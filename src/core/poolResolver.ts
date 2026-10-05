@@ -500,6 +500,66 @@ const STANDARD_V4_FEE_TIERS: [number, number][] = [
       [100, 1],
     ];
 
+// Pool id of a V4 pool: keccak256 of its key. hooks = 0 for every pool we trade.
+export function v4PoolId(currency0: string, currency1: string, fee: number, tickSpacing: number, hooks = ethers.ZeroAddress): string {
+  return ethers.keccak256(ethers.AbiCoder.defaultAbiCoder().encode(
+    ['address', 'address', 'uint24', 'int24', 'address'], [currency0, currency1, fee, tickSpacing, hooks]));
+}
+
+// Every HOOKLESS standard V4 pool for (tokenA, tokenB) with liquidity: the 4
+// usual fee / tick-spacing combos, plus the native-ETH versions when one side
+// is WETH (most V4 ETH pools hold native ETH, not WETH). Pools with hooks
+// (custom add-on code) are never returned: the contract won't trade them.
+//
+// The PoolState uses WETH in place of native ETH, so it pairs up with the
+// WETH pools on V2/V3. tokenA is always the pool's currency0 side, because
+// sqrtPriceX96 is the price of currency1 in currency0.
+export async function resolveAllV4Pools(
+  provider: ethers.JsonRpcProvider, chain: ChainName, dex: string,
+  stateViewAddress: string, poolManager: string, tokenA: string, tokenB: string, weth: string,
+): Promise<PoolState[]> {
+  const stateView = new ethers.Contract(stateViewAddress, V4_STATE_VIEW_ABI, provider);
+  const a = tokenA.toLowerCase(), b = tokenB.toLowerCase(), w = weth.toLowerCase();
+  const variants: Array<{ c0: string; c1: string; native: boolean }> = [];
+  variants.push(a < b ? { c0: tokenA, c1: tokenB, native: false } : { c0: tokenB, c1: tokenA, native: false });
+  if (a === w || b === w) variants.push({ c0: ethers.ZeroAddress, c1: a === w ? tokenB : tokenA, native: true });
+
+  const out: PoolState[] = [];
+  for (const v of variants) {
+    for (const [fee, tickSpacing] of STANDARD_V4_FEE_TIERS) {
+      try {
+        const id = v4PoolId(v.c0, v.c1, fee, tickSpacing);
+        const liquidity: bigint = await stateView.getLiquidity(id);
+        if (liquidity === 0n) continue;
+        const slot0 = await stateView.getSlot0(id);
+        out.push({
+          chain, dex, poolAddress: id, poolType: 'v3',
+          tokenA: v.native ? weth : v.c0, // currency0 side (WETH stands in for native ETH)
+          tokenB: v.c1,
+          sqrtPriceX96: slot0[0] as bigint, liquidity,
+          feeBps: Math.round(fee / 100),
+          lastUpdatedBlock: 0, lastUpdatedMs: Date.now(),
+          v4: { fee, tickSpacing, native: v.native, poolManager: ethers.getAddress(poolManager.toLowerCase()), stateView: ethers.getAddress(stateViewAddress.toLowerCase()) },
+        });
+      } catch { /* not readable: skip this one */ }
+    }
+  }
+  return out;
+}
+
+// Re-reads one V4 pool's price state through StateView.
+export async function refetchV4PoolPrice(provider: ethers.JsonRpcProvider, pool: PoolState): Promise<PoolState | null> {
+  if (!pool.v4) return null;
+  try {
+    const stateView = new ethers.Contract(pool.v4.stateView, V4_STATE_VIEW_ABI, provider);
+    const [slot0, liquidity] = await Promise.all([stateView.getSlot0(pool.poolAddress), stateView.getLiquidity(pool.poolAddress)]);
+    if ((liquidity as bigint) === 0n) return null;
+    return { ...pool, sqrtPriceX96: slot0[0] as bigint, liquidity: liquidity as bigint, lastUpdatedMs: Date.now() };
+  } catch {
+    return null;
+  }
+}
+
 export async function resolveAndFetchV4Pool(
       provider: ethers.JsonRpcProvider,
       chain: ChainName,

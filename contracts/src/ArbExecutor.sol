@@ -25,8 +25,14 @@ pragma solidity 0.8.26;
 //   KIND_V2      Uniswap V2 style: TraderJoe v1, Sushi, PancakeSwap V2, LFJ v1
 //   KIND_SOLIDLY Solidly style:   Ramses V2 (stable and volatile pairs)
 //   KIND_V3      Concentrated liquidity: Uniswap V3, PancakeSwap V3, Ramses V3
+//   KIND_V4      Uniswap V4 (one PoolManager holds every pool). Only pools
+//                WITHOUT hooks (custom add-on code): the contract always
+//                builds the pool key with hooks = address(0), so a hooked
+//                pool simply can't be reached. Native-ETH pools are traded
+//                through WETH (unwrapped going in, wrapped coming out).
+//                Off until the owner calls setV4(poolManager, weth).
 //   NOT supported (reverts UnsupportedKind): LFJ Liquidity Book, Kuru
-//   orderbook, Uniswap V4. Add them as new kinds when needed.
+//   orderbook. Add them as new kinds when needed.
 //
 // Who can do what:
 //   owner    - cold wallet. Sets the executor, withdraws profits. Fixed at deploy.
@@ -79,6 +85,35 @@ interface IV3FlashPool {
     function flash(address recipient, uint256 amount0, uint256 amount1, bytes calldata data) external;
 }
 
+// Uniswap V4 PoolManager (only what we use). Currency = token address,
+// address(0) = native ETH. BalanceDelta packs two int128s: amount0 in the
+// high 128 bits, amount1 in the low 128 bits. Negative = we owe the pool,
+// positive = the pool owes us.
+interface IV4PoolManager {
+    struct PoolKey {
+        address currency0;
+        address currency1;
+        uint24 fee;
+        int24 tickSpacing;
+        address hooks;
+    }
+    struct SwapParams {
+        bool zeroForOne;
+        int256 amountSpecified; // negative = exact input
+        uint160 sqrtPriceLimitX96;
+    }
+    function unlock(bytes calldata data) external returns (bytes memory);
+    function swap(PoolKey memory key, SwapParams memory params, bytes calldata hookData) external returns (int256 delta);
+    function sync(address currency) external;
+    function settle() external payable returns (uint256 paid);
+    function take(address currency, address to, uint256 amount) external;
+}
+
+interface IWETH {
+    function deposit() external payable;
+    function withdraw(uint256 amount) external;
+}
+
 interface IAaveV3Pool {
     function flashLoanSimple(
         address receiverAddress,
@@ -97,14 +132,18 @@ contract ArbExecutor {
     uint8 public constant KIND_V2 = 0;
     uint8 public constant KIND_SOLIDLY = 1;
     uint8 public constant KIND_V3 = 2;
+    uint8 public constant KIND_V4 = 3;
 
     // One swap in the route.
     struct Hop {
-        uint8 kind;        // KIND_V2 / KIND_SOLIDLY / KIND_V3
-        address pool;      // the pair / pool contract itself (NOT a router)
+        uint8 kind;        // KIND_V2 / KIND_SOLIDLY / KIND_V3 / KIND_V4
+        address pool;      // the pair / pool contract itself (NOT a router). KIND_V4: the PoolManager.
         address tokenIn;
         address tokenOut;
         uint16 feeBps;     // KIND_V2 only: pool fee in basis points (30 = 0.30%). Ignored otherwise.
+        uint24 v4Fee;      // KIND_V4 only: the pool's fee in pips (3000 = 0.30%)
+        int24 v4TickSpacing; // KIND_V4 only: the pool's tick spacing
+        bool v4Native;     // KIND_V4 only: the pool holds native ETH where the route has WETH
     }
 
     // A full round trip. Route must start and end in `token`.
@@ -135,6 +174,11 @@ contract ArbExecutor {
     address private activeV3TokenIn;   // token that V3 pool is owed
     bool private locked;               // re-entrancy guard
     bool private activeFlashIs0;       // V3 flash: borrowed token is the lending pool's token0
+    bool private activeV4;             // true only while we are inside our own PoolManager.unlock()
+
+    // Uniswap V4 (zero = V4 trading off). Set by the owner once per chain.
+    address public v4PoolManager;
+    address public weth;               // wrapped native token, for native-ETH V4 pools
 
     // ------------------------------------------------------------------------
     // Events / errors
@@ -144,6 +188,7 @@ contract ArbExecutor {
     event ExecutorChanged(address indexed oldExecutor, address indexed newExecutor);
     event Withdrawn(address indexed token, address indexed to, uint256 amount);
     event FlashPoolSet(address indexed pool, bool allowed);
+    event V4Set(address indexed poolManager, address indexed weth);
 
     error NotOwner();
     error NotExecutor();
@@ -157,6 +202,8 @@ contract ArbExecutor {
     error UnauthorizedCallback();
     error TransferFailed();
     error FlashPoolNotAllowed(address pool);
+    error V4NotEnabled();
+    error UnexpectedEth();
 
     // ------------------------------------------------------------------------
     // Setup / admin
@@ -195,6 +242,20 @@ contract ArbExecutor {
     function setFlashPool(address pool, bool allowed) external onlyOwner {
         flashPools[pool] = allowed;
         emit FlashPoolSet(pool, allowed);
+    }
+
+    // Turn on Uniswap V4 trading: the chain's PoolManager and WETH. Owner only.
+    // Pass zero addresses to turn it off again.
+    function setV4(address poolManager, address weth_) external onlyOwner {
+        v4PoolManager = poolManager;
+        weth = weth_;
+        emit V4Set(poolManager, weth_);
+    }
+
+    // Native ETH only ever arrives mid-trade: from WETH (unwrapping) or from
+    // the PoolManager (a native-ETH V4 pool paying out). Anything else is refused.
+    receive() external payable {
+        if (msg.sender != weth && msg.sender != v4PoolManager) revert UnexpectedEth();
     }
 
     // Move profits (or own-capital float) out. Owner only.
@@ -366,6 +427,8 @@ contract ArbExecutor {
                 _swapSolidly(h, amount);
             } else if (h.kind == KIND_V3) {
                 _swapV3(h, amount);
+            } else if (h.kind == KIND_V4) {
+                _swapV4(h, amount);
             } else {
                 revert UnsupportedKind(h.kind);
             }
@@ -427,6 +490,87 @@ contract ArbExecutor {
         );
         activeV3Pool = address(0);
         activeV3TokenIn = address(0);
+    }
+
+    // ------------------------------------------------------------------------
+    // Uniswap V4
+    // ------------------------------------------------------------------------
+    //
+    // V4 keeps every pool inside one PoolManager. To trade, you "unlock" it;
+    // it calls back unlockCallback(), where you swap, pay what you owe and
+    // take what you're owed. Everything must net to zero before unlock()
+    // returns, or the PoolManager reverts the whole transaction.
+    //
+    // One unlock per V4 hop keeps the rest of the route unchanged (V2/V3
+    // hops and the flash-loan logic don't need to know about V4).
+
+    function _swapV4(Hop memory h, uint256 amountIn) private {
+        address pm = v4PoolManager;
+        if (pm == address(0) || weth == address(0)) revert V4NotEnabled();
+        if (h.pool != pm) revert BadRoute(); // only the real PoolManager, never a look-alike
+        if (amountIn > uint256(type(int256).max)) revert BadRoute();
+
+        activeV4 = true;
+        IV4PoolManager(pm).unlock(abi.encode(h, amountIn));
+        activeV4 = false;
+    }
+
+    // Called by the PoolManager during our unlock(). Does the swap and settles.
+    function unlockCallback(bytes calldata data) external returns (bytes memory) {
+        if (msg.sender != v4PoolManager || msg.sender == address(0) || !activeV4) revert UnauthorizedCallback();
+        (Hop memory h, uint256 amountIn) = abi.decode(data, (Hop, uint256));
+        IV4PoolManager pm = IV4PoolManager(msg.sender);
+
+        // The pool's currencies: WETH becomes native ETH (address 0) when the
+        // pool is a native-ETH pool. The route's other token must not be WETH
+        // in that case (that would be a WETH/ETH "pool", not a real trade).
+        address cIn = h.tokenIn;
+        address cOut = h.tokenOut;
+        if (h.v4Native) {
+            if (cIn == weth) cIn = address(0);
+            else if (cOut == weth) cOut = address(0);
+            else revert BadRoute();
+        }
+        bool zeroForOne = cIn < cOut; // currency0 is always the lower address (native = 0 = lowest)
+        IV4PoolManager.PoolKey memory key = IV4PoolManager.PoolKey({
+            currency0: zeroForOne ? cIn : cOut,
+            currency1: zeroForOne ? cOut : cIn,
+            fee: h.v4Fee,
+            tickSpacing: h.v4TickSpacing,
+            hooks: address(0) // hookless pools only, always
+        });
+
+        // forge-lint: disable-next-line(unsafe-typecast)
+        int256 delta = pm.swap(key, IV4PoolManager.SwapParams({
+            zeroForOne: zeroForOne,
+            amountSpecified: -int256(amountIn), // exact input (range checked in _swapV4)
+            sqrtPriceLimitX96: zeroForOne ? MIN_SQRT_RATIO_PLUS_1 : MAX_SQRT_RATIO_MINUS_1
+        }), new bytes(0));
+
+        // Split the packed delta into the two currencies.
+        int128 d0 = int128(delta >> 128);
+        int128 d1 = int128(delta);
+        int128 owedSigned = zeroForOne ? d0 : d1; // negative: we owe
+        int128 gotSigned = zeroForOne ? d1 : d0;  // positive: we receive
+        if (owedSigned >= 0 || gotSigned <= 0) revert ZeroAmount();
+        uint256 owed = uint256(uint128(-owedSigned));
+        uint256 got = uint256(uint128(gotSigned));
+
+        // Pay what we owe.
+        if (cIn == address(0)) {
+            IWETH(weth).withdraw(owed);            // WETH -> ETH
+            pm.settle{value: owed}();
+        } else {
+            pm.sync(cIn);                          // tell the PoolManager to count what arrives
+            _safeTransfer(cIn, address(pm), owed);
+            pm.settle();
+        }
+
+        // Take what we're owed.
+        pm.take(cOut, address(this), got);
+        if (cOut == address(0)) IWETH(weth).deposit{value: got}(); // ETH -> WETH, so the route stays in tokens
+
+        return new bytes(0);
     }
 
     // ------------------------------------------------------------------------

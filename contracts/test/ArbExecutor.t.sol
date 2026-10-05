@@ -78,7 +78,7 @@ contract ArbExecutorTest is Test {
     }
 
     function _hop(uint8 kind, address pool, address tIn, address tOut) internal pure returns (ArbExecutor.Hop memory) {
-        return ArbExecutor.Hop({kind: kind, pool: pool, tokenIn: tIn, tokenOut: tOut, feeBps: 30});
+        return ArbExecutor.Hop({kind: kind, pool: pool, tokenIn: tIn, tokenOut: tOut, feeBps: 30, v4Fee: 0, v4TickSpacing: 0, v4Native: false});
     }
 
     // USDC -> WETH on `buy`, WETH -> USDC on `sell`.

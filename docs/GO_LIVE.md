@@ -48,6 +48,8 @@ forge script script/Deploy.s.sol \
 - Use `--trezor` instead of `--ledger` for a Trezor.
 - Run it once **without** `--broadcast` first: it only prints what it would do.
 - It prints `ArbExecutor deployed at: 0x...`. Keep that address.
+- It also switches on Uniswap V4 trading (Robinhood's PoolManager + WETH) and
+  prints the PoolManager it set. Only V4 pools without hooks can ever be traded.
 
 The cold wallet needs a little ETH on Robinhood Chain to pay for the deploy.
 

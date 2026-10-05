@@ -1,7 +1,7 @@
 import { endpointLabel, isPublicEndpoint } from '../core/endpointLabel';
 import { ethers } from 'ethers';
-import { ARB_EXECUTOR_RUNTIME_CODE, EXECUTOR_STORAGE_SLOT, FLASH_POOLS_STORAGE_SLOT } from './arbExecutorBytecode';
-import { ExecutorHop, encodeExecuteRaw, encodeExecuteV3FlashRaw } from './executorCalldata';
+import { ARB_EXECUTOR_RUNTIME_CODE, EXECUTOR_STORAGE_SLOT, FLASH_POOLS_STORAGE_SLOT, V4_POOL_MANAGER_STORAGE_SLOT, WETH_STORAGE_SLOT } from './arbExecutorBytecode';
+import { ExecutorHop, encodeExecuteRaw, encodeExecuteV3FlashRaw, KIND_V4 } from './executorCalldata';
 
 // ============================================================================
 // FREE PRE-TRADE SIMULATION
@@ -191,7 +191,7 @@ export async function simulateRoundTrip(
   rpc: Rpc,
   chain: string,
   trade: { token: string; amountIn: bigint; hops: ExecutorHop[] },
-  opts: { v3Lender?: string } = {},
+  opts: { v3Lender?: string; weth?: string } = {},
 ): Promise<SimResult> {
   let slot: SlotInfo;
   try {
@@ -222,6 +222,14 @@ export async function simulateRoundTrip(
   //    in flash mode a float so a losing trade can still repay and reach the
   //    profit check (profit is measured against it, so the result is exact)
   const executorDiff: Record<string, string> = { [pad32(ethers.toBeHex(EXECUTOR_STORAGE_SLOT))]: pad32(SIM_CALLER) };
+  // Uniswap V4 hops: switch V4 on in the simulated contract (the real one
+  // needs the owner's setV4 call), pointing at that PoolManager and WETH.
+  const v4Hop = trade.hops.find((h) => h.kind === KIND_V4);
+  if (v4Hop) {
+    if (!opts.weth) return { status: 'unsupported', reason: 'V4 trade needs the chain WETH address' };
+    executorDiff[pad32(ethers.toBeHex(V4_POOL_MANAGER_STORAGE_SLOT))] = pad32(v4Hop.pool);
+    executorDiff[pad32(ethers.toBeHex(WETH_STORAGE_SLOT))] = pad32(opts.weth);
+  }
   if (opts.v3Lender) {
     const allowKey = ethers.keccak256(abi.encode(['address', 'uint256'], [opts.v3Lender, FLASH_POOLS_STORAGE_SLOT]));
     executorDiff[allowKey] = pad32(1n);

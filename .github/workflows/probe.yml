@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       only:
-        description: 'Run one step only: feeds, sim, pairs, watch, universe, backtest, latency, lenders, smoke, seed, routers (blank = all except backtest)'
+        description: 'Run one step only: feeds, sim, pairs, watch, universe, backtest, latency, lenders, smoke, seed, routers, v4 (blank = all except backtest)'
         required: false
         default: ''
 
@@ -127,6 +127,14 @@ jobs:
           echo "$out"
           out="${out//'%'/'%25'}"; out="${out//$'\n'/'%0A'}"
           echo "::notice title=Routers::${out}"
+      - name: V4 pools for the watched pairs
+        if: inputs.only == 'v4'
+        shell: bash
+        run: |
+          out=$(timeout 1200 node .scripts-build/scripts/probe-v4.js 2>&1 | tail -45 || true)
+          echo "$out"
+          out="${out//'%'/'%25'}"; out="${out//$'\n'/'%0A'}"
+          echo "::notice title=V4 pools::${out}"
       - name: Export top pairs (backup list the bot starts from)
         if: inputs.only == 'seed'
         shell: bash

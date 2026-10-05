@@ -20,7 +20,7 @@ process.on('SIGUSR2', () => {
       else { console.log('[telegram] report requested during startup, will send when ready'); reportRequested = true; }
 });
 import { ethers } from 'ethers';
-import { resolveAndFetchV2Pool, resolveAndFetchLBPool, resolveAndFetchV3Pool, resolveAndFetchV4Pool, resolveKuruMarket, refetchV2PoolPrice, refetchV3PoolPrice } from './core/poolResolver';
+import { resolveAndFetchV2Pool, resolveAndFetchLBPool, resolveAndFetchV3Pool, resolveKuruMarket, refetchV2PoolPrice, refetchV3PoolPrice } from './core/poolResolver';
 import { ChainManager } from './core/chainManager';
 import { PoolCache } from './core/poolCache';
 import { PoolDiscoveryEngine, DiscoveryConfig } from './core/poolDiscovery';
@@ -314,7 +314,7 @@ const checkRoundTrip = async (
             v3Lender: lender?.poolAddress,
       });
       if ('reason' in built) return { status: 'skipped', reason: built.reason };
-      const r = await simulateRoundTrip(simRpc[chain], chain, { token: tokenIn, amountIn: built.amountIn, hops: built.hops }, { v3Lender: lender?.poolAddress });
+      const r = await simulateRoundTrip(simRpc[chain], chain, { token: tokenIn, amountIn: built.amountIn, hops: built.hops }, { v3Lender: lender?.poolAddress, weth: chain === 'robinhood' ? ROBINHOOD_TOKENS.WETH : undefined });
       if (r.status === 'rate_limited') { simPausedUntil[chain] = Date.now() + SIM_RATE_LIMIT_PAUSE_MS; return { status: 'rate_limited' }; }
       if (r.status === 'unsupported') return { status: 'skipped', reason: r.reason };
       if (r.status === 'profit') return { status: 'profit', usd: (Number(r.profit) / 10 ** decimals) * usdPerToken };
@@ -344,7 +344,7 @@ const queueSimulation = (
       simBusy[chain] = true;
       setTimeout(async () => {
             try {
-                  const r = await simulateRoundTrip(simRpc[chain], chain, { token: tokenIn, amountIn: built.amountIn, hops: built.hops }, { v3Lender: lender?.poolAddress });
+                  const r = await simulateRoundTrip(simRpc[chain], chain, { token: tokenIn, amountIn: built.amountIn, hops: built.hops }, { v3Lender: lender?.poolAddress, weth: chain === 'robinhood' ? ROBINHOOD_TOKENS.WETH : undefined });
                   const route = `${buyPool.dex}->${sellPool.dex}`;
                   const model = `model gross $${modelGrossUsd.toFixed(2)} on $${tradeSizeUsd.toFixed(0)} | ${funding}`;
                   if (r.status === 'rate_limited') {
@@ -390,6 +390,9 @@ const ROBINHOOD_VENUES: Venue[] = [
       { dex: 'pancakeswap-v3', kind: 'v3-fee', factory: ROBINHOOD_PANCAKE.V3_FACTORY },
       { dex: 'ramses-v2', kind: 'solidly', factory: ROBINHOOD_RAMSES.V2_FACTORY, feeBps: 20 },
       { dex: 'ramses-v3', kind: 'v3-spacing', factory: ROBINHOOD_RAMSES.V3_FACTORY },
+      // Uniswap V4: hookless standard pools only, including native-ETH pools
+      // (WETH stands in for ETH). Prices read through V4's StateView.
+      { dex: 'uniswap-v4', kind: 'v4', factory: ROBINHOOD_V4.STATE_VIEW, poolManager: ROBINHOOD_V4.POOL_MANAGER, weth: ROBINHOOD_TOKENS.WETH },
 ];
 const robinhoodWatcher = new PairWatcher('robinhood', robinhoodReadProvider, ROBINHOOD_VENUES, cache,
       // Real decimals/symbols for every discovered token, read from the token itself.
@@ -534,7 +537,7 @@ const fireTrade = async (o: {
       }
 };
 const refreshNow = async (p: any): Promise<any> => {
-      if (p.dex === 'uniswap-v4' || p.poolType === 'orderbook' || p.dex.includes('lb') || p.dex === 'bean-exchange') return p;
+      if ((p.dex === 'uniswap-v4' && !p.v4) || p.poolType === 'orderbook' || p.dex.includes('lb') || p.dex === 'bean-exchange') return p;
       const fresh = await Promise.race([
             refreshPoolState(READ_PROVIDER[p.chain], p),
             new Promise<null>((r) => setTimeout(() => r(null), REFRESH_TIMEOUT_MS)),
@@ -881,20 +884,9 @@ await chainManager.startAll();
             setInterval(seedKuruMarket, 30_000);
       } // vault liquidity shifts as orders fill — keep it fresh
 
-      // V4 has no per-swap router we can decode yet (its Universal Router uses
-      // encoded commands, a separate problem from reading pool state), so this
-      // uses the same safe pattern as Kuru: seed a known, verified pair
-      // directly from real chain state rather than wait for swap traffic.
-      const seedRobinhoodV4Market = async () => {
-            const resolved = await resolveAndFetchV4Pool(
-                  robinhoodReadProvider, 'robinhood', 'uniswap-v4', ROBINHOOD_V4.STATE_VIEW,
-                  ROBINHOOD_TOKENS.WETH, ROBINHOOD_TOKENS.USDG,
-                  );
-            if (resolved) cache.upsert(resolved);
-      };
-      // Background: startup doesn't wait for this pool lookup.
-      void seedRobinhoodV4Market().catch(() => { /* retried every 30s */ });
-      setInterval(() => { void seedRobinhoodV4Market().catch(() => { /* next tick */ }); }, 30_000);
+      // Uniswap V4 pools are found by the pair watcher (V4 venue in
+      // ROBINHOOD_VENUES) with their full V4 details, so the old one-pair
+      // V4 seed that used to sit here is gone.
 
       // Both Kuru's MON/USDC and V4's WETH/USDG above are guaranteed to be
       // in cache, but have no peer to compare against unless real swap

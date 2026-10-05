@@ -41,7 +41,7 @@ const base: BuildInput = {
 };
 
 // 1. Selector matches the compiled contract (forge inspect ArbExecutor methodIdentifiers).
-assert(EXECUTE_SELECTOR === '0x4e773929', 'execute() selector matches compiled ArbExecutor');
+assert(EXECUTE_SELECTOR === '0x8da2b32d', 'execute() selector matches compiled ArbExecutor');
 
 // 2. Happy path: correct amounts, route, kinds, and it round-trips through the ABI.
 const r = buildExecuteCall(base);
