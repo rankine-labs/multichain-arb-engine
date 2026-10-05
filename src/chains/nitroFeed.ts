@@ -1,4 +1,4 @@
-import { Transaction } from 'ethers';
+import { Transaction, keccak256 } from 'ethers';
 
 // ============================================================================
 // NITRO SEQUENCER FEED PARSER (Robinhood Chain = Arbitrum Orbit / Nitro)
@@ -40,27 +40,36 @@ export interface FeedTx {
 }
 
 // Pulls every signed transaction (that calls a contract) out of one l2Msg.
+// Transactions plus their raw signed bytes (the raw bytes give the tx hash
+// directly, see parseFeedFrame).
+type ParsedTx = { tx: Transaction; raw: string };
+
 export function parseL2Message(bytes: Uint8Array, depth = 0): Transaction[] {
+  return parseL2MessageRaw(bytes, depth).map((p) => p.tx);
+}
+
+function parseL2MessageRaw(bytes: Uint8Array, depth = 0): ParsedTx[] {
   if (bytes.length === 0 || depth > MAX_BATCH_DEPTH) return [];
   const kind = bytes[0];
   const body = bytes.subarray(1);
 
   if (kind === L2_KIND_SIGNED_TX) {
     try {
-      return [Transaction.from('0x' + Buffer.from(body).toString('hex'))];
+      const raw = '0x' + Buffer.from(body).toString('hex');
+      return [{ tx: Transaction.from(raw), raw }];
     } catch {
       return []; // not a tx we can parse; skip, don't crash
     }
   }
 
   if (kind === L2_KIND_BATCH) {
-    const out: Transaction[] = [];
+    const out: ParsedTx[] = [];
     let i = 0;
     while (i + 8 <= body.length) {
       const len = Number(Buffer.from(body.subarray(i, i + 8)).readBigUInt64BE());
       i += 8;
       if (len <= 0 || i + len > body.length) break; // truncated / malformed
-      out.push(...parseL2Message(body.subarray(i, i + len), depth + 1));
+      out.push(...parseL2MessageRaw(body.subarray(i, i + len), depth + 1));
       i += len;
     }
     return out;
@@ -88,11 +97,17 @@ export function parseFeedFrame(frame: unknown): FeedTx[] {
       continue;
     }
 
-    for (const tx of parseL2Message(bytes)) {
-      if (!tx.to || !tx.data || tx.data === '0x') continue; // plain transfers aren't swaps
-      let from: string | null = null;
-      try { from = tx.from; } catch { /* unsigned or bad signature */ }
-      txs.push({ sequenceNumber: seq, hash: tx.hash ?? '', to: tx.to, data: tx.data, value: tx.value.toString(), from });
+    for (const { tx, raw } of parseL2MessageRaw(bytes)) {
+      // Every field read is guarded: ethers re-validates some transactions
+      // lazily (e.g. a priority fee above the max fee, which Robinhood's
+      // sequencer accepts) and throws from inside getters like tx.hash.
+      try {
+        if (!tx.to || !tx.data || tx.data === '0x') continue; // plain transfers aren't swaps
+        let from: string | null = null;
+        try { from = tx.from; } catch { /* unsigned or bad signature */ }
+        // A tx hash is keccak256 of its raw signed bytes: no ethers validation involved.
+        txs.push({ sequenceNumber: seq, hash: keccak256(raw), to: tx.to, data: tx.data, value: tx.value.toString(), from });
+      } catch { /* malformed: skip this one, keep the rest of the frame */ }
     }
   }
   return txs;
