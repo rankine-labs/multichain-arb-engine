@@ -37,22 +37,39 @@ export function readCandidates(env: Record<string, string | undefined> = process
   return out;
 }
 
-// Picks the first read endpoint that really answers for chain 4663.
+// Picks the read endpoint for heavy work (simulations, scan, pool lookups).
+// A candidate is checked with eth_chainId, up to 3 tries:
+//   - answers chain 4663            -> use it
+//   - answers a DIFFERENT chain     -> wrong URL in .env: skip it
+//   - no answer / rate limited      -> your own ROBINHOOD_RPC_HTTP is still
+//     used (a one-off blip at startup must not drop the paid node for the
+//     whole run, which is what happened on 2026-10-05); auto-found keys are
+//     skipped instead, since nobody asked for them.
 export async function pickRobinhoodReadRpc(
   env: Record<string, string | undefined> = process.env,
   fetchFn: typeof fetch = fetch,
+  sleepMs = 1_000,
 ): Promise<{ url: string; label: string }> {
   for (const c of readCandidates(env)) {
     if (c.url === ROBINHOOD_PUBLIC_RPC) return c; // last resort: no need to test
-    try {
-      const r = await fetchFn(c.url, {
-        method: 'POST', headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_chainId', params: [] }),
-        signal: AbortSignal.timeout(4000),
-      });
-      const j = await r.json() as { result?: string };
-      if (j.result?.toLowerCase() === CHAIN_ID_HEX) return c;
-    } catch { /* try the next one */ }
+    let wrongChain = false;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const r = await fetchFn(c.url, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_chainId', params: [] }),
+          signal: AbortSignal.timeout(4000),
+        });
+        const j = await r.json() as { result?: string };
+        if (j.result?.toLowerCase() === CHAIN_ID_HEX) return c;
+        if (typeof j.result === 'string') { wrongChain = true; break; } // answered, but another chain
+      } catch { /* blip: try again */ }
+      if (attempt < 2 && sleepMs > 0) await new Promise((res) => setTimeout(res, sleepMs));
+    }
+    if (!wrongChain && c.url === env.ROBINHOOD_RPC_HTTP) {
+      console.warn(`[robinhood] ${redact(c.url)} did not answer the startup check; using it anyway (it's your ROBINHOOD_RPC_HTTP)`);
+      return c;
+    }
   }
   return { url: ROBINHOOD_PUBLIC_RPC, label: 'public RPC' };
 }

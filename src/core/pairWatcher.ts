@@ -42,6 +42,9 @@ export interface Venue {
 }
 
 export interface PairWatcherOptions {
+  // Bursty pool lookups (discovery, token symbol/decimals) can use a
+  // different node than the steady price refresh. Default: same node.
+  discoveryProvider?: ethers.JsonRpcProvider;
   maxPairs?: number;
   rediscoverMs?: number;
   refreshMs?: number;
@@ -144,6 +147,7 @@ export class PairWatcher {
   private readonly rediscoverMs: number;
   private readonly refreshMs: number;
   private refreshTimer: NodeJS.Timeout | null = null;
+  private readonly discoveryProvider: ethers.JsonRpcProvider;
 
   constructor(
     private readonly chain: ChainName,
@@ -155,6 +159,7 @@ export class PairWatcher {
     private readonly onToken: (address: string, meta: TokenMeta) => void,
     opts: PairWatcherOptions = {},
   ) {
+    this.discoveryProvider = opts.discoveryProvider ?? provider;
     this.maxPairs = opts.maxPairs ?? 40;
     this.rediscoverMs = opts.rediscoverMs ?? 10 * 60_000;
     this.refreshMs = opts.refreshMs ?? 30_000;
@@ -217,7 +222,7 @@ export class PairWatcher {
     const [ma, mb] = await Promise.all([this.meta(a), this.meta(b)]);
     if (!ma || !mb) return;
 
-    const pools = await discoverPairPools(this.provider, this.chain, this.venues, a, b);
+    const pools = await discoverPairPools(this.discoveryProvider, this.chain, this.venues, a, b);
     for (const p of pools) this.cache.upsert(p);
     // One pool = nothing to arb against: remember that, don't track the pair.
     if (pools.length < 2) {
@@ -240,7 +245,7 @@ export class PairWatcher {
     if (this.tokenMeta.has(t)) return this.tokenMeta.get(t)!;
     let m: TokenMeta | null = null;
     try {
-      const c = new ethers.Contract(token, ERC20_META, this.provider);
+      const c = new ethers.Contract(token, ERC20_META, this.discoveryProvider);
       const [symbol, decimals] = await Promise.all([c.symbol(), c.decimals()]);
       m = { symbol: String(symbol), decimals: Number(decimals) };
       this.onToken(t, m);

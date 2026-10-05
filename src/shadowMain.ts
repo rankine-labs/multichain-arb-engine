@@ -403,7 +403,9 @@ const robinhoodWatcher = new PairWatcher('robinhood', robinhoodReadProvider, ROB
       // 60 = up to ~20 pinned pairs from the chain-wide scan + traffic-driven ones.
       // refreshMs: background re-sync of every watched pool (one Multicall3
       // request), the safety net behind instant price tracking below.
-      { maxPairs: 60, rediscoverMs: 10 * 60_000, refreshMs: 5_000 });
+      // discoveryProvider: pool lookups are bursty (many reads per pair), so
+      // they go to the paid node; the steady 5 s price refresh stays fast.
+      { maxPairs: 60, rediscoverMs: 10 * 60_000, refreshMs: 5_000, discoveryProvider: robinhoodHeavyProvider });
 
 // Re-read a pool's live price right before using it (skips pools we can't
 // refresh this way: Uniswap V4, order books, bin pools). Never waits more
