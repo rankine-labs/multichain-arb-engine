@@ -394,6 +394,13 @@ const ROBINHOOD_VENUES: Venue[] = [
       // (WETH stands in for ETH). Prices read through V4's StateView.
       { dex: 'uniswap-v4', kind: 'v4', factory: ROBINHOOD_V4.STATE_VIEW, poolManager: ROBINHOOD_V4.POOL_MANAGER, weth: ROBINHOOD_TOKENS.WETH },
 ];
+// Short venue name for reports: exchange plus fee level for V3/V4 pools, so
+// two pools on the same exchange are told apart ("uniswap-v4 0.05% ETH").
+function venueLabel(p: PoolState): string {
+      const fee = p.poolType === 'v3' ? ` ${p.feeBps / 100}%` : '';
+      return `${p.dex}${fee}${p.v4?.native ? ' ETH' : ''}`;
+}
+
 // Asks the standing-gap scanner to run soon (set up with the scanner below;
 // a no-op until then). Called whenever a pool price changes.
 let requestGapScan: () => void = () => {};
@@ -718,8 +725,8 @@ if (registerIfApproved('avalanche', entry.dex, resolved)) pool = resolved;
                   hourlyMatches.set(matchKey, {
                         chain: swap.chain,
                         pair: matchPairLabel,
-                        buyDex: pool.dex,
-                        sellDex: sellPool.dex,
+                        buyDex: venueLabel(pool),
+                        sellDex: venueLabel(sellPool),
                         buyPrice: matchBuyPrice,
                         sellPrice: matchSellPrice,
                         spreadPct: matchSpreadPct,
@@ -1208,20 +1215,28 @@ for (let i = 0; i < resolved.length; i++) {
                         seenPairs.add(pairKey);
                         const peers = cache.findPeerPools(chain, pool.tokenA, pool.tokenB, pool.poolAddress);
                         if (peers.length === 0) continue;
-                        // Same base token for both pools so they compare like for like.
-                        const priceA = priceOf(pool, pool.tokenA, decimalsOf);
-                        const priceB = priceOf(peers[0], pool.tokenA, decimalsOf);
-                        if (priceA === null || priceB === null) continue;
+                        // Compare EVERY pool of the pair (all exchanges and fee
+                        // levels), not just the first two found, priced in the same
+                        // base token. Report the cheapest vs the dearest.
+                        // (Before: only the first two pools, which were nearly
+                        // always Uniswap V2/V3, so other exchanges never showed.)
+                        let cheap: { p: PoolState; price: number } | null = null, dear: typeof cheap = null;
+                        for (const p of [pool, ...peers]) {
+                              const price = priceOf(p, pool.tokenA, decimalsOf);
+                              if (price === null) continue;
+                              if (!cheap || price < cheap.price) cheap = { p, price };
+                              if (!dear || price > dear.price) dear = { p, price };
+                        }
+                        if (!cheap || !dear || cheap.p === dear.p) continue;
                         const pair = `${symbolOf(chain, pool.tokenA)}/${symbolOf(chain, pool.tokenB)}`;
                         const key = `${chain}:${pair}`;
-                        const gap = spreadPct(priceA, priceB);
+                        const gap = spreadPct(cheap.price, dear.price);
                         const existing = hourlyMatches.get(key);
                         if (!existing || gap > existing.spreadPct) {
                               // "buy" = cheaper venue, "sell" = dearer one
-                              const [buy, sell] = priceA <= priceB ? [pool, peers[0]] : [peers[0], pool];
                               hourlyMatches.set(key, {
-                                    chain, pair, buyDex: buy.dex, sellDex: sell.dex,
-                                    buyPrice: Math.min(priceA, priceB), sellPrice: Math.max(priceA, priceB), spreadPct: gap,
+                                    chain, pair, buyDex: venueLabel(cheap.p), sellDex: venueLabel(dear.p),
+                                    buyPrice: cheap.price, sellPrice: dear.price, spreadPct: gap,
                               });
                         }
                   }
