@@ -111,9 +111,16 @@ export class FastSender {
     await this.refreshGas();
     this.nonce = this.live ? await this.readProvider.getTransactionCount(this.wallet.address, 'pending') : 0;
     this.gasTimer = setInterval(() => { this.refreshGas().catch(() => { /* keep last value */ }); }, 2_000);
+    // Keep the connection to the send endpoint warm (TCP + TLS already open
+    // when a trade fires, instead of paying a fresh handshake: ~1 round trip
+    // saved). Any reply, even an error, keeps the connection alive.
+    this.warmTimer = setInterval(() => {
+      try { this.sendProvider.send('eth_chainId', []).catch(() => { /* fine */ }); } catch { /* fine */ }
+    }, 4_000);
   }
+  private warmTimer: NodeJS.Timeout | null = null;
 
-  stop() { if (this.gasTimer) clearInterval(this.gasTimer); }
+  stop() { if (this.gasTimer) clearInterval(this.gasTimer); if (this.warmTimer) clearInterval(this.warmTimer); }
 
   private async refreshGas() {
     const block = await this.readProvider.getBlock('latest');
