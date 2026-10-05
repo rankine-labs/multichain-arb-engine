@@ -127,6 +127,31 @@ async function main() {
   const eth = v2Iface.encodeFunctionData('swapExactETHForTokens', [0n, [RH_WETH, RH_USDG, OTHER], OTHER, 9_999_999_999n]);
   const s5 = await rh.decode(rhEvent(V2R, eth, (2n * 10n ** 18n).toString()));
   assert(s5?.amountIn === 2n * 10n ** 18n && s5?.tokenOut === RH_USDG, 'native-coin swap: amount from tx value, first hop only');
+
+  // Fee-on-transfer variants (what most wallets send): same decoding.
+  const fot = new ethers.Interface([
+    'function swapExactTokensForETHSupportingFeeOnTransferTokens(uint amountIn, uint amountOutMin, address[] path, address to, uint deadline)',
+    'function swapExactETHForTokensSupportingFeeOnTransferTokens(uint amountOutMin, address[] path, address to, uint deadline)',
+  ]);
+  const sell = fot.encodeFunctionData('swapExactTokensForETHSupportingFeeOnTransferTokens', [7_000_000n, 0n, [RH_USDG, RH_WETH], OTHER, 9_999_999_999n]);
+  assert(sell.startsWith('0x791ac947'), 'fee-on-transfer sell selector matches what the probe saw (0x791ac947)');
+  const s6 = await rh.decode(rhEvent(V2R, sell));
+  assert(s6?.amountIn === 7_000_000n && s6?.tokenIn === RH_USDG && s6?.tokenOut === RH_WETH, 'fee-on-transfer token->ETH swap decoded');
+  const buy = fot.encodeFunctionData('swapExactETHForTokensSupportingFeeOnTransferTokens', [0n, [RH_WETH, RH_USDG], OTHER, 9_999_999_999n]);
+  assert(buy.startsWith('0xb6f9de95'), 'fee-on-transfer buy selector matches what the probe saw (0xb6f9de95)');
+  const s7 = await rh.decode(rhEvent(V2R, buy, (10n ** 17n).toString()));
+  assert(s7?.amountIn === 10n ** 17n && s7?.tokenOut === RH_USDG, 'fee-on-transfer ETH->token swap: amount from tx value');
+
+  // Universal Router copies: V3 commands decode via the real registry.
+  const { seedKnownAddresses, ROBINHOOD_UR_COPIES } = await import('../config/knownAddresses');
+  const real: RouterRegistry = { avalanche: {}, monad: {}, robinhood: {} };
+  seedKnownAddresses(real);
+  const realDec = new TransactionDecoder(real);
+  const copyIn = coder.encode(['address', 'uint256', 'uint256', 'bytes', 'bool'], [OTHER, 5n * 10n ** 18n, 0n, ethers.solidityPacked(['address', 'uint24', 'address'], [RH_WETH, 500, RH_USDG]), false]);
+  const s8 = await realDec.decode(rhEvent(ROBINHOOD_UR_COPIES[0], urIface.encodeFunctionData('execute', ['0x00', [copyIn], 1n])));
+  assert(s8?.amountIn === 5n * 10n ** 18n && s8?.tokenIn === RH_WETH && s8?.dex === 'uniswap-v3', 'Universal Router copy: V3 swap decoded as Uniswap V3');
+  const copyV2In = coder.encode(['address', 'uint256', 'uint256', 'address[]', 'bool'], [OTHER, 10n ** 18n, 0n, [RH_WETH, RH_USDG], false]);
+  assert(await realDec.decode(rhEvent(ROBINHOOD_UR_COPIES[0], urIface.encodeFunctionData('execute', ['0x08', [copyV2In], 1n]))) === null, 'Universal Router copy: V2 command not guessed');
 }
 
 main().catch((err) => { console.error('FAIL: test crashed', err); process.exitCode = 1; });

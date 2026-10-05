@@ -114,6 +114,14 @@ export const ROBINHOOD_V4 = {
   UNIVERSAL_ROUTER: '0x8876789976deCBFcBBBE364623c63652DB8C0904',
 };
 
+// Universal Router copies seen on Robinhood (router probe, 2026-10-05).
+export const ROBINHOOD_UR_COPIES = [
+  '0x80114879f80d156c8003676557324c518babd194',
+  '0xd26c8cfce843f4122753425dd6613d7576777ec8',
+  '0xa28f468cb898cc407c981e26a521dfb2e2774174',
+  '0x204faca1764b154221e35c0d20abb3c525710498',
+];
+
 export const ROBINHOOD_V3 = {
   FACTORY: '0x1f7d7550B1b028f7571E69A784071F0205FD2EfA',
   SWAP_ROUTER_02: '0xCaf681a66D020601342297493863E78C959E5cb2',
@@ -272,6 +280,19 @@ style: 'v3',
         v3Via: ROBINHOOD_V3.SWAP_ROUTER_02,
         v2Via: ROBINHOOD_V2.ROUTER,
     };
+    // Copies of the Uniswap Universal Router deployed by front-ends/wallets
+    // (same execute() calldata). Found by the router probe (only=routers):
+    // together ~12% of Robinhood's V2/V3-only swaps, none decoded before.
+    // The probe checked the pools they hit: all Uniswap V3 (factory
+    // ROBINHOOD_V3.FACTORY), so V3 commands resolve via SwapRouter02. Their
+    // V2 commands are NOT decoded: no proof yet which V2 factory they use.
+    for (const copy of ROBINHOOD_UR_COPIES) {
+      registry.robinhood[copy.toLowerCase()] = {
+        dex: 'uniswap-universal',
+        style: 'ur',
+        v3Via: ROBINHOOD_V3.SWAP_ROUTER_02,
+      };
+    }
     registry.monad[MONAD_V4_PENDING.UNIVERSAL_ROUTER.toLowerCase()] = {
         dex: 'uniswap-universal',
         style: 'ur',
