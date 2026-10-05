@@ -12,7 +12,9 @@ async function main() {
   // 1. Endpoint selection.
   assert(simRpcUrl('monad', {}).source === 'public endpoint' && simRpcUrl('monad', {}).url === 'https://rpc.monad.xyz', 'no config -> public endpoint');
   const qn = simRpcUrl('monad', { MONAD_QUICKNODE_WSS: 'wss://abc.monad-mainnet.quiknode.pro/KEY/' });
-  assert(qn.source === 'your paid endpoint' && qn.url === 'https://abc.monad-mainnet.quiknode.pro/KEY/', 'QuickNode websocket -> same URL over HTTPS');
+  assert(qn.source === 'your paid endpoint (QuickNode)' && qn.url === 'https://abc.monad-mainnet.quiknode.pro/KEY/', 'QuickNode websocket -> same URL over HTTPS');
+  const fake = simRpcUrl('avalanche', { AVALANCHE_ALCHEMY_WSS: 'wss://api.avax.network/ext/bc/C/ws' });
+  assert(fake.source.startsWith('free public node'), 'a "paid" setting that holds the public URL is labelled as the public node');
   const avax = simRpcUrl('avalanche', { AVALANCHE_QUICKNODE_WSS: 'wss://x.avalanche-mainnet.quiknode.pro/KEY/ext/bc/C/ws' });
   assert(avax.url === 'https://x.avalanche-mainnet.quiknode.pro/KEY/ext/bc/C/rpc', 'Avalanche /ext/bc/C/ws -> /ext/bc/C/rpc');
   assert(simRpcUrl('avalanche', { AVALANCHE_QUICKNODE_WSS: 'wss://REPLACE_WITH_QUICKNODE_AVAX_ENDPOINT' }).source === 'public endpoint', 'placeholder URL ignored');
