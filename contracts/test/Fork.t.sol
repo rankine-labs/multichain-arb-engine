@@ -74,7 +74,7 @@ abstract contract ForkBase is Test {
         pure
         returns (ArbExecutor.Hop memory)
     {
-        return ArbExecutor.Hop({kind: kind, pool: pool, tokenIn: tIn, tokenOut: tOut, feeBps: feeBps});
+        return ArbExecutor.Hop({kind: kind, pool: pool, tokenIn: tIn, tokenOut: tOut, feeBps: feeBps, v4Fee: 0, v4TickSpacing: 0, v4Native: false});
     }
 
     // Runs the trade. Pass = it succeeded (real arb) OR reverted ONLY at the

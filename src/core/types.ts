@@ -48,6 +48,16 @@ export interface PoolState {
   feeBps: number;
   lastUpdatedBlock: number;
   lastUpdatedMs: number;
+  // Uniswap V4 pools only. poolAddress is then the 32-byte pool id (V4
+  // pools live inside one PoolManager, they have no address of their own).
+  // tokenA is the pool's currency0 side (WETH stands in for native ETH).
+  v4?: {
+    fee: number;          // in pips (3000 = 0.30%)
+    tickSpacing: number;
+    native: boolean;      // the pool holds native ETH where we use WETH
+    poolManager: string;  // where trades go
+    stateView: string;    // where prices are read
+  };
 }
 
 export interface ArbOpportunity {

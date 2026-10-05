@@ -131,7 +131,7 @@ jobs:
         if: inputs.only == 'v4'
         shell: bash
         run: |
-          out=$(timeout 1800 node .scripts-build/scripts/probe-v4.js 2>&1 | tail -45 || true)
+          out=$(timeout 1200 node .scripts-build/scripts/probe-v4.js 2>&1 | tail -45 || true)
           echo "$out"
           out="${out//'%'/'%25'}"; out="${out//$'\n'/'%0A'}"
           echo "::notice title=V4 pools::${out}"

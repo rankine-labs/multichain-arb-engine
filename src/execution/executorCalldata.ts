@@ -14,7 +14,8 @@ import { ChainName, PoolState } from '../core/types';
 //   opportunity COULD be executed by the contract, and if not, why.
 //
 // Refuses (returns ok:false with a reason) rather than guessing when:
-//   - a pool type the contract can't trade (Kuru orderbook, LFJ LB, stable/V4)
+//   - a pool type the contract can't trade (Kuru orderbook, LFJ LB, stable)
+//   - a Uniswap V4 pool without its V4 details (fee, tick spacing, PoolManager)
 //   - token decimals aren't explicitly known (a wrong guess = amounts off by
 //     orders of magnitude, so no default here, unlike the pricing code)
 //   - the trade rounds to zero tokens, or the profit floor rounds to zero
@@ -23,12 +24,13 @@ import { ChainName, PoolState } from '../core/types';
 // against the value compiled from ArbExecutor.sol.
 // ============================================================================
 
+const HOP_TUPLE = '(uint8 kind,address pool,address tokenIn,address tokenOut,uint16 feeBps,uint24 v4Fee,int24 v4TickSpacing,bool v4Native)';
 export const EXECUTE_ABI = [
-  'function execute((address token,uint256 amountIn,uint256 minProfit,uint256 maxBlock,(uint8 kind,address pool,address tokenIn,address tokenOut,uint16 feeBps)[] hops) t, address flashPool)',
-  'function executeWithV3Flash((address token,uint256 amountIn,uint256 minProfit,uint256 maxBlock,(uint8 kind,address pool,address tokenIn,address tokenOut,uint16 feeBps)[] hops) t, address lendPool)',
+  `function execute((address token,uint256 amountIn,uint256 minProfit,uint256 maxBlock,${HOP_TUPLE}[] hops) t, address flashPool)`,
+  `function executeWithV3Flash((address token,uint256 amountIn,uint256 minProfit,uint256 maxBlock,${HOP_TUPLE}[] hops) t, address lendPool)`,
 ];
-export const EXECUTE_SELECTOR = '0x4e773929'; // from `forge inspect ArbExecutor methodIdentifiers`
-export const EXECUTE_V3_FLASH_SELECTOR = '0x2448659a'; // cast sig executeWithV3Flash(...)
+export const EXECUTE_SELECTOR = '0x8da2b32d'; // from `forge inspect ArbExecutor methodIdentifiers`
+export const EXECUTE_V3_FLASH_SELECTOR = '0xb0fa7d85'; // same source
 
 // How a trade is funded:
 //   'v3-flash' -- borrow from a V3 pool (executeWithV3Flash), no capital needed
@@ -40,6 +42,7 @@ export type Funding = 'v3-flash' | 'aave' | 'own';
 export const KIND_V2 = 0;
 export const KIND_SOLIDLY = 1;
 export const KIND_V3 = 2;
+export const KIND_V4 = 3;
 
 // DEX names (PoolState.dex) whose V2-style pairs are Solidly-style, i.e.
 // price via the pair's own getAmountOut instead of x*y=k.
@@ -53,17 +56,25 @@ const UNSUPPORTED_DEXES = new Set([
   'bean-exchange',            // Bean DLMM (bins)
   'ramses-dlmm',
   'kuru',                     // orderbook
-  'uniswap-v4',
 ]);
 
 const iface = new Interface(EXECUTE_ABI);
 
 export interface ExecutorHop {
   kind: number;
-  pool: string;
+  pool: string;          // KIND_V4: the PoolManager
   tokenIn: string;
   tokenOut: string;
   feeBps: number;
+  // KIND_V4 only (left out = not a V4 hop; filled with 0/false when encoded):
+  v4Fee?: number;         // pool fee in pips (3000 = 0.30%)
+  v4TickSpacing?: number;
+  v4Native?: boolean;     // pool holds native ETH where we use WETH
+}
+
+// The contract expects every hop field; fill V4 fields with 0/false for V2/V3 hops.
+function fullHop(h: ExecutorHop) {
+  return { ...h, v4Fee: h.v4Fee ?? 0, v4TickSpacing: h.v4TickSpacing ?? 0, v4Native: h.v4Native ?? false };
 }
 
 export interface BuildInput {
@@ -100,6 +111,7 @@ const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000';
 export function kindForPool(pool: PoolState): number | null {
   const dex = pool.dex.toLowerCase();
   if (UNSUPPORTED_DEXES.has(dex)) return null;
+  if (dex === 'uniswap-v4') return pool.v4 ? KIND_V4 : null; // V4 needs its pool details
   if (pool.poolType === 'v3') return KIND_V3;
   if (pool.poolType === 'v2') return SOLIDLY_DEXES.has(dex) ? KIND_SOLIDLY : KIND_V2;
   return null; // 'orderbook', 'stable'
@@ -150,11 +162,11 @@ export function buildExecuteCall(input: BuildInput): BuildResult {
   if (minProfit === 0n) return { ok: false, reason: 'profit floor rounds to zero tokens' };
 
   const hops: ExecutorHop[] = [
-    { kind: buyKind, pool: buyPool.poolAddress, tokenIn: input.tokenIn, tokenOut: mid, feeBps: buyKind === KIND_V2 ? buyPool.feeBps : 0 },
-    { kind: sellKind, pool: sellPool.poolAddress, tokenIn: mid, tokenOut: input.tokenIn, feeBps: sellKind === KIND_V2 ? sellPool.feeBps : 0 },
+    hopFor(buyKind, buyPool, input.tokenIn, mid),
+    hopFor(sellKind, sellPool, mid, input.tokenIn),
   ];
 
-  const trade = { token: input.tokenIn, amountIn, minProfit, maxBlock: input.maxBlock, hops };
+  const trade = { token: input.tokenIn, amountIn, minProfit, maxBlock: input.maxBlock, hops: hops.map(fullHop) };
   // Prefer a V3 pool flash loan, then Aave, then own capital.
   if (input.v3Lender) {
     if (hops.some((h) => h.pool.toLowerCase() === input.v3Lender!.toLowerCase())) {
@@ -169,13 +181,29 @@ export function buildExecuteCall(input: BuildInput): BuildResult {
   return { ok: true, to: input.executorAddress, data, amountIn, minProfit, flashPool, funding, hops };
 }
 
+// One hop of the route in the contract's format.
+export function hopFor(kind: number, pool: PoolState, tokenIn: string, tokenOut: string): ExecutorHop {
+  if (kind === KIND_V4) {
+    // V4: the trade goes to the PoolManager; the pool is named by its fee,
+    // tick spacing and tokens (hookless pools only, enforced by the contract).
+    return {
+      kind, pool: pool.v4!.poolManager, tokenIn, tokenOut, feeBps: 0,
+      v4Fee: pool.v4!.fee, v4TickSpacing: pool.v4!.tickSpacing, v4Native: pool.v4!.native,
+    };
+  }
+  return {
+    kind, pool: pool.poolAddress, tokenIn, tokenOut, feeBps: kind === KIND_V2 ? pool.feeBps : 0,
+    v4Fee: 0, v4TickSpacing: 0, v4Native: false,
+  };
+}
+
 // Encodes execute() from explicit values (used by the simulator, which sets
 // its own minProfit / maxBlock). buildExecuteCall() is the normal path.
 export function encodeExecuteRaw(
   trade: { token: string; amountIn: bigint; minProfit: bigint; maxBlock: bigint; hops: ExecutorHop[] },
   flashPool: string = ZERO_ADDRESS,
 ): string {
-  return iface.encodeFunctionData('execute', [trade, flashPool]);
+  return iface.encodeFunctionData('execute', [{ ...trade, hops: trade.hops.map(fullHop) }, flashPool]);
 }
 
 // Same, for the V3-pool flash loan entry point.
@@ -183,7 +211,7 @@ export function encodeExecuteV3FlashRaw(
   trade: { token: string; amountIn: bigint; minProfit: bigint; maxBlock: bigint; hops: ExecutorHop[] },
   lendPool: string,
 ): string {
-  return iface.encodeFunctionData('executeWithV3Flash', [trade, lendPool]);
+  return iface.encodeFunctionData('executeWithV3Flash', [{ ...trade, hops: trade.hops.map(fullHop) }, lendPool]);
 }
 
 // Chooses which V3 pool to borrow `token` from: must hold the token, must
