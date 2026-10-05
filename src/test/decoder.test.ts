@@ -141,6 +141,17 @@ async function main() {
   assert(buy.startsWith('0xb6f9de95'), 'fee-on-transfer buy selector matches what the probe saw (0xb6f9de95)');
   const s7 = await rh.decode(rhEvent(V2R, buy, (10n ** 17n).toString()));
   assert(s7?.amountIn === 10n ** 17n && s7?.tokenOut === RH_USDG, 'fee-on-transfer ETH->token swap: amount from tx value');
+
+  // Universal Router copies: V3 commands decode via the real registry.
+  const { seedKnownAddresses, ROBINHOOD_UR_COPIES } = await import('../config/knownAddresses');
+  const real: RouterRegistry = { avalanche: {}, monad: {}, robinhood: {} };
+  seedKnownAddresses(real);
+  const realDec = new TransactionDecoder(real);
+  const copyIn = coder.encode(['address', 'uint256', 'uint256', 'bytes', 'bool'], [OTHER, 5n * 10n ** 18n, 0n, ethers.solidityPacked(['address', 'uint24', 'address'], [RH_WETH, 500, RH_USDG]), false]);
+  const s8 = await realDec.decode(rhEvent(ROBINHOOD_UR_COPIES[0], urIface.encodeFunctionData('execute', ['0x00', [copyIn], 1n])));
+  assert(s8?.amountIn === 5n * 10n ** 18n && s8?.tokenIn === RH_WETH && s8?.dex === 'uniswap-v3', 'Universal Router copy: V3 swap decoded as Uniswap V3');
+  const copyV2In = coder.encode(['address', 'uint256', 'uint256', 'address[]', 'bool'], [OTHER, 10n ** 18n, 0n, [RH_WETH, RH_USDG], false]);
+  assert(await realDec.decode(rhEvent(ROBINHOOD_UR_COPIES[0], urIface.encodeFunctionData('execute', ['0x08', [copyV2In], 1n]))) === null, 'Universal Router copy: V2 command not guessed');
 }
 
 main().catch((err) => { console.error('FAIL: test crashed', err); process.exitCode = 1; });
