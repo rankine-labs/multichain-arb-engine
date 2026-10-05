@@ -80,6 +80,7 @@ import { buildExecuteCall, executionRequested, executorConfig, pickV3Lender } fr
 import { makeRpc, simulateRoundTrip, simRpcUrl, Rpc } from './execution/simulator';
 import { FastSender, SafetyGate, safetyConfigFromEnv } from './execution/fastSender';
 import { CompetitorTracker } from './core/competitorTracker';
+import { pickRobinhoodReadRpc, robinhoodSendRpc, redact, ROBINHOOD_PUBLIC_RPC } from './config/robinhoodEndpoints';
 
 async function main() {
 const cache = new PoolCache();
@@ -107,7 +108,12 @@ const priceOracle = new PriceOracle(cache);
     // eth_chainId auto-detection (see avalanche.ts for the same fix).
     const avalancheReadProvider = new ethers.JsonRpcProvider('https://api.avax.network/ext/bc/C/rpc', 43114);
       const monadReadProvider = new ethers.JsonRpcProvider('https://rpc.monad.xyz', 143);
-      const robinhoodReadProvider = new ethers.JsonRpcProvider('https://rpc.mainnet.chain.robinhood.com', 4663);
+      // Robinhood reads: paid RPC (your Alchemy key) when it answers, else the
+      // public RPC. See config/robinhoodEndpoints.ts.
+      const rhRead = await pickRobinhoodReadRpc();
+      if (!process.env.ROBINHOOD_RPC_HTTP && rhRead.url !== ROBINHOOD_PUBLIC_RPC) process.env.ROBINHOOD_RPC_HTTP = rhRead.url; // simulations use it too
+      console.log(`[robinhood] reading from ${rhRead.label} (${redact(rhRead.url)}), sending to ${redact(robinhoodSendRpc())}`);
+      const robinhoodReadProvider = new ethers.JsonRpcProvider(rhRead.url, 4663, { staticNetwork: true });
 
       // Decoder gets the pool cache so it can decode Monad Swap logs (a log
       // only names the pool; the cache knows its tokens).
@@ -368,7 +374,8 @@ const priceStats = { local: 0, rpc: 0 };
 // (ideally straight to the sequencer); defaults to the read RPC.
 const robinhoodSender = new FastSender(
       robinhoodReadProvider, 4663,
-      process.env.ROBINHOOD_SEND_RPC ? new ethers.JsonRpcProvider(process.env.ROBINHOOD_SEND_RPC, 4663, { staticNetwork: true }) : robinhoodReadProvider,
+      // Trades go straight to the sequencer (first come, first served).
+      new ethers.JsonRpcProvider(robinhoodSendRpc(), 4663, { staticNetwork: true }),
 );
 const safetyGate = new SafetyGate(safetyConfigFromEnv());
 safetyGate.allowTokens([ROBINHOOD_TOKENS.WETH, ROBINHOOD_TOKENS.USDG]);

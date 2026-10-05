@@ -17,8 +17,21 @@
 const dns = require('dns').promises;
 const net = require('net');
 
-const HOSTS = ['feed.mainnet.chain.robinhood.com', 'rpc.mainnet.chain.robinhood.com'];
-const RPC = 'https://rpc.mainnet.chain.robinhood.com';
+const HOSTS = ['feed.mainnet.chain.robinhood.com', 'rpc.mainnet.chain.robinhood.com', 'sequencer.mainnet.chain.robinhood.com'];
+// Round trips compared: public RPC, the sequencer directly (where the bot
+// sends trades), and Alchemy if an Alchemy key is in the bot's .env.
+function alchemyUrl() {
+  try {
+    const env = require('fs').readFileSync(require('path').join(__dirname, '..', '.env'), 'utf8');
+    const m = /alchemy\.com\/v2\/([A-Za-z0-9_-]+)/.exec(env); // reads only the key, nothing else
+    return m ? `https://robinhood-mainnet.g.alchemy.com/v2/${m[1]}` : null;
+  } catch { return null; }
+}
+const ENDPOINTS = [
+  ['public RPC', 'https://rpc.mainnet.chain.robinhood.com'],
+  ['sequencer (direct)', 'https://sequencer.mainnet.chain.robinhood.com'],
+  ...(alchemyUrl() ? [['Alchemy', alchemyUrl()]] : []),
+];
 const ROUNDS = 7;
 
 const median = (xs) => { const s = [...xs].sort((a, b) => a - b); return s[Math.floor(s.length / 2)]; };
@@ -35,10 +48,10 @@ function tcpConnectMs(ip) {
   });
 }
 
-async function rpcMs() {
+async function rpcMs(url) {
   const t0 = process.hrtime.bigint();
   try {
-    const r = await fetch(RPC, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_blockNumber', params: [] }) });
+    const r = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_blockNumber', params: [] }) });
     await r.text();
     return Number(process.hrtime.bigint() - t0) / 1e6;
   } catch { return null; }
@@ -82,9 +95,11 @@ async function awsRegion(ip, ranges) {
     const region = await awsRegion(ip, ranges);
     console.log(`${host} -> ${ip} (${region ? 'AWS ' + region : 'not an AWS EC2 address, likely a CDN edge'}): TCP connect ${times.length ? median(times).toFixed(1) + ' ms median' : 'failed'}`);
   }
-  const rt = [];
-  for (let i = 0; i < ROUNDS; i++) { const t = await rpcMs(); if (t !== null) rt.push(t); }
-  console.log(`RPC round trip (eth_blockNumber): ${rt.length ? median(rt).toFixed(1) + ' ms median, best ' + Math.min(...rt).toFixed(1) + ' ms' : 'failed'}`);
+  for (const [label, url] of ENDPOINTS) {
+    const rt = [];
+    for (let i = 0; i < ROUNDS; i++) { const t = await rpcMs(url); if (t !== null) rt.push(t); }
+    console.log(`Round trip, ${label}: ${rt.length ? median(rt).toFixed(1) + ' ms median, best ' + Math.min(...rt).toFixed(1) + ' ms' : 'failed'}`);
+  }
   console.log('Robinhood sits behind a CDN, so TCP connect only measures the nearest edge. The RPC round trip is the real distance.');
   console.log('Tip: run this in 2-3 AWS regions (us-east-1, us-east-2, us-west-2) and keep the bot where the RPC round trip is lowest.');
 })();
