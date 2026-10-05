@@ -1,3 +1,4 @@
+import { endpointLabel } from '../core/endpointLabel';
 import { ethers } from 'ethers';
 import { ChainCapability, RawChainEvent, PreparedTransaction, FireResult } from '../core/types';
 
@@ -77,8 +78,12 @@ export class AvalancheAdapter implements ChainCapability {
 
           this.connectedAtMs = Date.now();
           this.lastEventAtMs = 0;
-          const names = [this.alchemyProvider && 'Alchemy', this.quicknodeProvider && 'QuickNode'].filter(Boolean).join(' and ');
-          console.log(`[avalanche] connected to ${names} pending-tx feed(s)`);
+          // Named by the URL's real host, not the setting name (see core/endpointLabel.ts).
+          const names = [this.alchemyProvider && endpointLabel(ALCHEMY_WSS), this.quicknodeProvider && endpointLabel(QUICKNODE_WSS)].filter(Boolean);
+          console.log(`[avalanche] connected to pending-tx feed(s): ${[...new Set(names)].join(' + ')}`);
+          if (names.every((n) => String(n).startsWith('free public node'))) {
+                console.warn('[avalanche] both feeds are the FREE PUBLIC node, which streams no pending transactions -- put real Alchemy/QuickNode URLs in .env');
+          }
   }
 
   // Opens one provider with all the listeners it needs.

@@ -1,3 +1,4 @@
+import { endpointLabel, isPublicEndpoint } from '../core/endpointLabel';
 import { ethers } from 'ethers';
 import { ARB_EXECUTOR_RUNTIME_CODE, EXECUTOR_STORAGE_SLOT, FLASH_POOLS_STORAGE_SLOT } from './arbExecutorBytecode';
 import { ExecutorHop, encodeExecuteRaw, encodeExecuteV3FlashRaw } from './executorCalldata';
@@ -171,7 +172,7 @@ export function simRpcUrl(chain: 'avalanche' | 'monad' | 'robinhood', env: Recor
     chain === 'avalanche' ? wssToHttps(env.AVALANCHE_QUICKNODE_WSS) ?? wssToHttps(env.AVALANCHE_ALCHEMY_WSS)
     : chain === 'monad' ? wssToHttps(env.MONAD_QUICKNODE_WSS)
     : env.ROBINHOOD_RPC_HTTP ?? null;
-  if (paid) return { url: paid, source: 'your paid endpoint' };
+  if (paid) return { url: paid, source: isPublicEndpoint(paid) ? endpointLabel(paid) : `your paid endpoint (${endpointLabel(paid)})` };
   const publicUrl = {
     avalanche: 'https://api.avax.network/ext/bc/C/rpc',
     monad: 'https://rpc.monad.xyz',

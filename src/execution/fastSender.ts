@@ -89,6 +89,9 @@ export class FastSender {
   private wallet: ethers.Wallet | ethers.HDNodeWallet;
   private nonce: number | null = null;
   private maxFeePerGas: bigint | null = null;
+  latestBlock = 0;              // for trade deadlines (maxBlock)
+  private gasLimitNow: bigint;  // starts at FIRE_GAS_LIMIT, tuned from real receipts
+  private maxGasSeen = 0n;
   private gasTimer: NodeJS.Timeout | null = null;
   readonly live: boolean;
 
@@ -98,6 +101,7 @@ export class FastSender {
     private readonly sendProvider: ethers.JsonRpcProvider = readProvider,
     private readonly gasLimit = BigInt(process.env.FIRE_GAS_LIMIT ?? 1_500_000),
   ) {
+    this.gasLimitNow = gasLimit;
     const key = process.env.BOT_PRIVATE_KEY;
     this.live = process.env.EXECUTION_ENABLED === 'true' && process.env.LIVE_SEND_CONFIRM === 'yes-real-money' && !!key;
     // Dry run signs with a throwaway key: same work, nothing at stake.
@@ -124,10 +128,29 @@ export class FastSender {
 
   private async refreshGas() {
     const block = await this.readProvider.getBlock('latest');
+    if (block?.number) this.latestBlock = block.number;
     const base = block?.baseFeePerGas ?? (await this.readProvider.getFeeData()).gasPrice ?? 0n;
     // 2x base fee headroom: Robinhood orders first come, first served, so a
     // priority tip buys nothing; the cap just has to cover base-fee moves.
     this.maxFeePerGas = base * 2n + 1n;
+  }
+
+  // Gas limit follows what real trades used: 1.5x the most seen, never below
+  // half the configured default. You only pay for gas USED; the limit just
+  // has to be high enough not to run out mid-trade.
+  noteGasUsed(gas: bigint) {
+    if (gas > this.maxGasSeen) this.maxGasSeen = gas;
+    const tuned = (this.maxGasSeen * 3n) / 2n;
+    const floor = this.gasLimit / 2n;
+    this.gasLimitNow = tuned > floor ? tuned : floor;
+  }
+  get currentGasLimit() { return this.gasLimitNow; }
+
+  // Live only: can the wallet pay for one trade at the gas cap? (ETH wei)
+  async balanceCheck(): Promise<{ ok: boolean; balance: bigint; needed: bigint }> {
+    const balance = await this.readProvider.getBalance(this.wallet.address);
+    const needed = (this.maxFeePerGas ?? 0n) * this.gasLimitNow;
+    return { ok: balance >= needed, balance, needed };
   }
 
   get ready() { return this.maxFeePerGas !== null && this.nonce !== null; }
@@ -137,7 +160,7 @@ export class FastSender {
     const t0 = performance.now();
     const tx: ethers.TransactionRequest = {
       type: 2, chainId: this.chainId, nonce: this.nonce!, to, data, value: 0n,
-      gasLimit: this.gasLimit, maxFeePerGas: this.maxFeePerGas!, maxPriorityFeePerGas: 0n,
+      gasLimit: this.gasLimitNow, maxFeePerGas: this.maxFeePerGas!, maxPriorityFeePerGas: 0n,
     };
     const raw = await this.wallet.signTransaction(tx);
     const signMs = performance.now() - t0;

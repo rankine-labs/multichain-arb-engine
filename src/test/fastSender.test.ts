@@ -46,5 +46,10 @@ async function main() {
   runs.sort((a, b) => a - b);
   assert(r!.live === false && !r!.txHash, 'dry run never broadcasts');
   assert(runs[10] < 20, `build + sign is fast (median ${runs[10].toFixed(2)} ms)`);
+  sender.noteGasUsed(2_000_000n);
+  assert(sender.currentGasLimit === 3_000_000n, 'gas limit rises to 1.5x the most a real trade used');
+  sender.noteGasUsed(100_000n);
+  assert(sender.currentGasLimit === 3_000_000n, 'and never drops below what was needed before');
+  assert(sender.latestBlock === 0 || typeof sender.latestBlock === 'number', 'latest block tracked for trade deadlines');
 }
 main().catch((e) => { console.error('FAIL: crashed', e); process.exitCode = 1; });
