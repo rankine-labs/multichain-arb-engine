@@ -278,6 +278,37 @@ const simDisabled: Record<string, string> = {};       // chain -> reason (e.g. R
 // Reported in the hourly digest, then reset.
 const simStats = { checked: 0, profit: 0, loss: 0, fail: 0, rateLimited: 0 };
 
+// One on-chain round-trip check, awaited by the caller (used by the
+// standing-gap scanner, where there's no race to lose by waiting ~1 s).
+// Same build + simulation as queueSimulation, but returns the result
+// instead of only logging it, and ignores the "one sim at a time" queue.
+type RoundTripCheck =
+      | { status: 'profit'; usd: number }
+      | { status: 'loss' | 'fail' | 'skipped'; reason: string }
+      | { status: 'rate_limited' };
+const checkRoundTrip = async (
+      chain: 'avalanche' | 'monad' | 'robinhood', tokenIn: string,
+      buyPool: any, sellPool: any, tradeSizeUsd: number, usdPerToken: number,
+): Promise<RoundTripCheck> => {
+      if (simDisabled[chain]) return { status: 'skipped', reason: `simulation off: ${simDisabled[chain]}` };
+      if (Date.now() < (simPausedUntil[chain] ?? 0)) return { status: 'rate_limited' };
+      const decimals = TOKEN_DECIMALS[chain]?.[tokenIn.toLowerCase()];
+      if (decimals === undefined) return { status: 'skipped', reason: 'unknown decimals' };
+      const lender = pickV3Lender(cache.allForChain(chain), tokenIn, [buyPool.poolAddress, sellPool.poolAddress]);
+      const built = buildExecuteCall({
+            chain, tokenIn, buyPool, sellPool, tradeSizeUsd, netProfitUsd: 1,
+            usdPerTokenIn: usdPerToken, tokenInDecimals: decimals, maxBlock: 0n,
+            v3Lender: lender?.poolAddress,
+      });
+      if ('reason' in built) return { status: 'skipped', reason: built.reason };
+      const r = await simulateRoundTrip(simRpc[chain], chain, { token: tokenIn, amountIn: built.amountIn, hops: built.hops }, { v3Lender: lender?.poolAddress });
+      if (r.status === 'rate_limited') { simPausedUntil[chain] = Date.now() + SIM_RATE_LIMIT_PAUSE_MS; return { status: 'rate_limited' }; }
+      if (r.status === 'unsupported') return { status: 'skipped', reason: r.reason };
+      if (r.status === 'profit') return { status: 'profit', usd: (Number(r.profit) / 10 ** decimals) * usdPerToken };
+      if (r.status === 'loss') return { status: 'loss', reason: 'ends with less than it started' };
+      return { status: 'fail', reason: r.reason };
+};
+
 const queueSimulation = (
       chain: 'avalanche' | 'monad' | 'robinhood', tokenIn: string,
       buyPool: any, sellPool: any, tradeSizeUsd: number, modelGrossUsd: number, usdPerToken: number,
@@ -372,7 +403,7 @@ const REFRESH_TIMEOUT_MS = 1_500;
 const FAST_PRICES = process.env.FAST_PRICES !== 'off';
 const FRESH_MS = 20_000;
 const priceStats = { local: 0, rpc: 0 };
-const gapStats = { found: 0, bestUsd: 0 }; // standing gaps (no trigger trade) this hour
+const gapStats = { found: 0, bestUsd: 0, fake: 0 }; // standing gaps (no trigger trade) this hour: confirmed, best real $, fakes muted
 
 // FAST SENDER (Robinhood). Dry run unless the live switches are all set
 // (see execution/fastSender.ts). ROBINHOOD_SEND_RPC = where to send trades
@@ -884,9 +915,19 @@ await chainManager.startAll();
       // price re-sync, look for gaps that exist without a trigger trade.
       // Anti-spam: the same gap (pair + pools) fires at most once per 30 s,
       // at most 2 fires per scan, and every fire still passes the safety gate.
+      // VERIFY FIRST: the scanner's maths assumes V3 pools are deep around the
+      // current price, which isn't true for thin, narrow positions. So every
+      // new gap is simulated on-chain (real pool code, ~1 s) before it counts:
+      //   confirmed -> fired (dry run: logged) with the SIMULATED profit
+      //   not real  -> muted for 30 min so it stops repeating
       const GAP_MIN_USD = Number(process.env.GAP_MIN_USD ?? 20);
+      const GAP_FAKE_MUTE_MS = 30 * 60_000;
       const gapLastFired = new Map<string, number>();
+      const gapMutedUntil = new Map<string, number>();
+      let gapRunning = false; // a slow simulation must not let scans pile up
       setInterval(async () => {
+            if (gapRunning) return;
+            gapRunning = true;
             try {
                   const pairs = robinhoodWatcher.watchedPairPools()
                         .map((addrs) => addrs.map((a) => cache.get('robinhood', a)).filter((p): p is PoolState => !!p));
@@ -898,23 +939,42 @@ await chainManager.startAll();
                   for (const g of gaps) {
                         if (fired >= 2) break;
                         const key = `${g.buyPool.poolAddress}>${g.sellPool.poolAddress}`;
+                        if (Date.now() < (gapMutedUntil.get(key) ?? 0)) continue;
                         if (Date.now() - (gapLastFired.get(key) ?? 0) < 30_000) continue;
                         gapLastFired.set(key, Date.now());
                         fired++;
-                        gapStats.found++;
-                        gapStats.bestUsd = Math.max(gapStats.bestUsd, g.profitUsd);
                         const label = `${symbolOf('robinhood', g.base)}/${symbolOf('robinhood', g.quote)}`;
-                        console.log(`[gap] standing gap ${label}: buy ${g.buyPool.dex} ${g.buyPool.feeBps / 100}% -> sell ${g.sellPool.dex} ${g.sellPool.feeBps / 100}%, ~$${g.profitUsd.toFixed(2)} on $${Math.round(g.sizeUsd)}`);
-                        queueSimulation('robinhood', g.quote, g.buyPool, g.sellPool, g.sizeUsd, g.profitUsd, g.quoteUsd);
+                        const route = `buy ${g.buyPool.dex} ${g.buyPool.feeBps / 100}% -> sell ${g.sellPool.dex} ${g.sellPool.feeBps / 100}%`;
+                        const check = await checkRoundTrip('robinhood', g.quote, g.buyPool, g.sellPool, g.sizeUsd, g.quoteUsd);
+                        if (check.status === 'rate_limited') {
+                              // Can't verify right now: skip, don't mute, try again next time.
+                              console.log(`[gap] ${label}: model ~$${g.profitUsd.toFixed(2)}, not verified (RPC busy), skipped`);
+                              continue;
+                        }
+                        const simNet = check.status === 'profit' ? check.usd - 0.05 /* gas */ : 0;
+                        if (check.status !== 'profit' || simNet < Math.max(5, GAP_MIN_USD / 2)) {
+                              gapMutedUntil.set(key, Date.now() + GAP_FAKE_MUTE_MS);
+                              gapStats.fake++;
+                              const why = check.status === 'profit' ? `real profit only $${check.usd.toFixed(2)}` : check.reason;
+                              console.log(`[gap] ${label}: model said ~$${g.profitUsd.toFixed(2)} but NOT REAL (${why}); muted 30 min | ${route}`);
+                              continue;
+                        }
+                        gapStats.found++;
+                        gapStats.bestUsd = Math.max(gapStats.bestUsd, simNet);
+                        console.log(`[gap] standing gap ${label} CONFIRMED: real ~$${simNet.toFixed(2)} (model $${g.profitUsd.toFixed(2)}) on $${Math.round(g.sizeUsd)} | ${route}`);
                         await fireTrade({
                               chain: 'robinhood', tokenIn: g.quote, tokenOut: g.base, buyPool: g.buyPool, sellPool: g.sellPool,
-                              tradeSizeUsd: g.sizeUsd, netProfitUsd: g.profitUsd, usdPerTokenIn: g.quoteUsd,
+                              // Never trust the model over the simulation.
+                              tradeSizeUsd: g.sizeUsd, netProfitUsd: Math.min(g.profitUsd, simNet), usdPerTokenIn: g.quoteUsd,
                               seenAtMs: robinhoodWatcher.lastRefreshMs || Date.now(), source: 'gap',
                         });
                   }
                   if (gapLastFired.size > 500) gapLastFired.clear();
+                  for (const [k, t] of gapMutedUntil) if (t < Date.now()) gapMutedUntil.delete(k);
             } catch (err) {
                   console.warn('[gap] scan failed:', (err as Error).message);
+            } finally {
+                  gapRunning = false;
             }
       }, 5_000);
       void robinhoodWatcher.watch(ROBINHOOD_TOKENS.WETH, ROBINHOOD_TOKENS.USDG, { pin: true })
@@ -1199,7 +1259,7 @@ for (let i = 0; i < resolved.length; i++) {
                         const fireNote = fr.length ? `, fire-ready ${fr[Math.floor(fr.length / 2)]}ms median (${fr.length})` : '';
                         const rv = rivals.summary();
                         const rivalNote = rv.found ? `, rivals ${rv.theirMedianMs ?? '?'}ms vs ours ${rv.ourMedianMs ?? '?'}ms (we'd beat ${rv.beatCount}/${rv.comparable})` : '';
-                        const gapNote = gapStats.found ? `, standing gaps ${gapStats.found} (best $${gapStats.bestUsd.toFixed(0)})` : '';
+                        const gapNote = (gapStats.found ? `, standing gaps ${gapStats.found} confirmed (best real $${gapStats.bestUsd.toFixed(0)})` : '') + (gapStats.fake ? `, ${gapStats.fake} fake gaps muted` : '');
                         const lv = liveTracker.summary();
                         const liveNote = lv.sent ? `, LIVE ${lv.won}/${lv.sent} won, profit $${lv.profitUsd.toFixed(2)}, gas $${lv.gasUsd.toFixed(2)}` : '';
                         note = `watching ${st.pairs} pair${st.pairs === 1 ? '' : 's'}, ${st.pools} pools${tot ? `, ${localPct}% instant prices` : ''}${fireNote}${rivalNote}${gapNote}${liveNote}`;
@@ -1236,7 +1296,7 @@ for (let i = 0; i < resolved.length; i++) {
                   priceStats.local = priceStats.rpc = 0;
                   fireStats.readyMs = []; fireStats.blocked.clear(); fireStats.sent = 0;
                   rivals.reset();
-                  gapStats.found = 0; gapStats.bestUsd = 0;
+                  gapStats.found = 0; gapStats.bestUsd = 0; gapStats.fake = 0;
                   liveTracker.reset();
                   lastDigestAt = now;
             }

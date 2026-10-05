@@ -6,7 +6,27 @@
 // cold path, so a slow Telegram API response can never delay a trade.
 // ============================================================================
 
+import { setDefaultResultOrder } from 'dns';
+
+// The server has no IPv6 route: trying Telegram's IPv6 address first made
+// some sends time out (ETIMEDOUT). Prefer IPv4 everywhere in this process.
+setDefaultResultOrder('ipv4first');
+
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN ?? '';
+
+// Network hiccups (timeouts, resets) get 2 more tries, 3 s then 10 s apart.
+// HTTP errors (bad chat ID etc.) are NOT retried: retrying won't fix them.
+const RETRY_DELAYS_MS = [3_000, 10_000];
+async function fetchWithRetry(url: string, init: RequestInit): Promise<Response> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await fetch(url, { ...init, signal: AbortSignal.timeout(15_000) });
+    } catch (err) {
+      if (attempt >= RETRY_DELAYS_MS.length) throw err;
+      await new Promise((r) => setTimeout(r, RETRY_DELAYS_MS[attempt]));
+    }
+  }
+}
 
 // TELEGRAM_CHAT_ID supports one or more comma-separated chat/channel IDs
 // (matches the format already used by the sonic-liq-bot project's .env) —
@@ -58,7 +78,7 @@ export async function sendTelegramMessage(text: string): Promise<void> {
   await Promise.all(
         TELEGRAM_CHAT_IDS.map(async (chatId) => {
                 try {
-                          const post = (body: Record<string, unknown>) => fetch(url, {
+                          const post = (body: Record<string, unknown>) => fetchWithRetry(url, {
                                       method: 'POST',
                                       headers: { 'Content-Type': 'application/json' },
                                       body: JSON.stringify({ chat_id: chatId, disable_web_page_preview: true, ...body }),
@@ -76,7 +96,8 @@ export async function sendTelegramMessage(text: string): Promise<void> {
                 } catch (err) {
                           // Never let a Telegram failure crash or block anything else — this is
                   // reporting, not trading logic.
-                  console.error(`[telegram] send to ${chatId} error:`, err);
+                  const e = err as Error & { cause?: { code?: string } };
+                  console.error(`[telegram] send to ${chatId} failed after retries: ${e.cause?.code ?? e.name}: ${e.message}`);
                 }
         }),
       );
