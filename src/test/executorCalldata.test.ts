@@ -126,3 +126,6 @@ const cands = [
 assert(pickV3Lender(cands, WMON, [])?.poolAddress === '0xa3', 'picks lowest fee, then deepest liquidity');
 assert(pickV3Lender(cands, WMON, ['0xA3'])?.poolAddress === '0xa2', 'never picks a trade pool (case-insensitive)');
 assert(pickV3Lender([cands[3], cands[4], cands[5]], WMON, []) === null, 'none suitable -> null');
+
+// Ramses V3 lends too (verified by the Ramses V3 lender fork test).
+assert(pickV3Lender([...cands, lp('0xa7', 'ramses-v3', 1, 10n ** 22n)], WMON, [])?.poolAddress === '0xa7', 'Ramses V3 pool can be the lender');
