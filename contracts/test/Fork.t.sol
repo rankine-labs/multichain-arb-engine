@@ -355,6 +355,41 @@ contract RobinhoodForkTest is ForkBase {
         _runV3FlashExpectingOnlyProfitGuard("robinhood V3 flash loan + ramsesV2->cakeV3", t, lender);
     }
 
+    // RAMSES V3 AS LENDER: borrow WETH from a real Ramses V3 pool. Proves the
+    // pool calls the flash callback name our contract implements
+    // (ramsesV2FlashCallback); if it used another name the loan would revert.
+    function test_fork_robinhood_ramsesV3_asLender() public {
+        if (!_fork("ROBINHOOD_RPC_URL")) return;
+        address cake = _findV3(PANCAKE_V3_FACTORY, WETH, USDG, _fees(2500, 500, 10000, 100));
+        // Ramses V3 pools are keyed by tick spacing; take one that holds WETH.
+        address lender = address(0);
+        int24[6] memory sp = [int24(1), int24(5), int24(10), int24(50), int24(100), int24(200)];
+        for (uint256 i = 0; i < sp.length && lender == address(0); i++) {
+            (bool ok, bytes memory ret) =
+                RAMSES_V3_FACTORY.staticcall(abi.encodeWithSignature("getPool(address,address,int24)", WETH, USDG, sp[i]));
+            if (!ok || ret.length < 32) continue;
+            address p = abi.decode(ret, (address));
+            if (p == address(0) || p == cake || p.code.length == 0) continue;
+            (bool okb, bytes memory bal) = WETH.staticcall(abi.encodeWithSignature("balanceOf(address)", p));
+            if (okb && bal.length >= 32 && abi.decode(bal, (uint256)) >= 0.05 ether) lender = p;
+        }
+        console.log("robinhood ramses v3 lender:", lender);
+        console.log("robinhood pancake v3 trade pool:", cake);
+        if (cake == address(0) || lender == address(0)) {
+            console.log("skipped: no Ramses V3 lender / PancakeSwap trade pool found");
+            vm.skip(true);
+            return;
+        }
+        exec.setFlashPool(lender, true);
+        _fundWrapped(WETH, 0.011 ether); // covers even a total-loss round trip, so we reach the profit check
+        ArbExecutor.Hop[] memory hops = new ArbExecutor.Hop[](2);
+        hops[0] = _hop(1, _ramsesV2(), WETH, USDG, 0);
+        hops[1] = _hop(2, cake, USDG, WETH, 0);
+        ArbExecutor.Trade memory t =
+            ArbExecutor.Trade({token: WETH, amountIn: 0.01 ether, minProfit: 1, maxBlock: block.number, hops: hops});
+        _runV3FlashExpectingOnlyProfitGuard("robinhood RAMSES V3 flash loan + ramsesV2->cakeV3", t, lender);
+    }
+
     function test_fork_robinhood_ramsesV2_to_pancakeV3() public {
         if (!_fork("ROBINHOOD_RPC_URL")) return;
         address v3 = _findV3(PANCAKE_V3_FACTORY, WETH, USDG, _fees(2500, 500, 10000, 100));

@@ -190,9 +190,9 @@ export function encodeExecuteV3FlashRaw(
 // not be one of the trade's pools (a pool is locked while it lends), and
 // must be a V3 pool type the contract's flash callbacks support. Picks the
 // lowest fee (the loan costs that pool's fee), then the most liquidity.
-// Ramses V3 is left out until its flash callback name is verified on a
-// live pool (its SWAP callback is verified; the flash one isn't yet).
-const FLASH_LENDER_DEXES = new Set(['uniswap-v3', 'pancakeswap-v3']);
+// Ramses V3 verified Oct 2026 by the fork test
+// test_fork_robinhood_ramsesV3_asLender (a live pool lent, trades ran, loan repaid).
+const FLASH_LENDER_DEXES = new Set(['uniswap-v3', 'pancakeswap-v3', 'ramses-v3']);
 export function pickV3Lender(candidates: PoolState[], token: string, exclude: string[]): PoolState | null {
   const t = token.toLowerCase();
   const ex = new Set(exclude.map((a) => a.toLowerCase()));

@@ -68,3 +68,18 @@ async function main() {
 }
 
 main().catch((err) => { console.error('FAIL: test crashed', err); process.exitCode = 1; });
+
+// A sequenced tx whose priority fee is ABOVE its max fee (Robinhood accepts
+// these; ethers throws from tx.hash). Must parse, with hash = keccak(raw bytes).
+{
+  const { encodeRlp, toBeHex, keccak256: k } = require('ethers');
+  const fields = [toBeHex(4663), '0x01', toBeHex(5_000_000_000n), toBeHex(1_000_000n), toBeHex(300_000), '0x' + '22'.repeat(20), '0x', '0x12345678', [], '0x01', '0x' + '33'.repeat(32), '0x' + '44'.repeat(32)];
+  const raw = '0x02' + encodeRlp(fields).slice(2);
+  const l2 = Buffer.concat([Buffer.from([4]), Buffer.from(raw.slice(2), 'hex')]).toString('base64');
+  const frame = { version: 1, messages: [{ sequenceNumber: 9, message: { message: { header: { kind: 3 }, l2Msg: l2 } } }] };
+  let txs: any[] = [];
+  let threw = false;
+  try { txs = parseFeedFrame(frame); } catch { threw = true; }
+  assert(!threw, 'odd-fee tx does not throw out of the frame parser');
+  assert(txs.length === 1 && txs[0].hash === k(raw), 'odd-fee tx kept, hash computed from raw bytes');
+}
