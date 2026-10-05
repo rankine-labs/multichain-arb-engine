@@ -1,4 +1,4 @@
-import { Interface } from 'ethers';
+import { Interface, getAddress } from 'ethers';
 import { ChainName, PoolState } from '../core/types';
 
 // ============================================================================
@@ -187,7 +187,9 @@ export function hopFor(kind: number, pool: PoolState, tokenIn: string, tokenOut:
     // V4: the trade goes to the PoolManager; the pool is named by its fee,
     // tick spacing and tokens (hookless pools only, enforced by the contract).
     return {
-      kind, pool: pool.v4!.poolManager, tokenIn, tokenOut, feeBps: 0,
+      // getAddress(lowercase): accept any capitalisation (a stored address with
+      // a wrong checksum would otherwise make the encoder throw).
+      kind, pool: getAddress(pool.v4!.poolManager.toLowerCase()), tokenIn, tokenOut, feeBps: 0,
       v4Fee: pool.v4!.fee, v4TickSpacing: pool.v4!.tickSpacing, v4Native: pool.v4!.native,
     };
   }

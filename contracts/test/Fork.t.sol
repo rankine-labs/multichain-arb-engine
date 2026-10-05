@@ -390,6 +390,55 @@ contract RobinhoodForkTest is ForkBase {
         _runV3FlashExpectingOnlyProfitGuard("robinhood RAMSES V3 flash loan + ramsesV2->cakeV3", t, lender);
     }
 
+    // ---- Uniswap V4 (real PoolManager, real hookless pools) -----------------
+    // Pools confirmed live by the V4 probe (only=v4): native ETH/USDG and
+    // WETH/USDG at 0.05% (tick spacing 10), both without hooks.
+    address constant V4_POOL_MANAGER = 0x8366a39CC670B4001A1121B8F6A443A643e40951;
+
+    function _v4Hop(address tIn, address tOut, uint24 fee, int24 spacing, bool native)
+        internal
+        pure
+        returns (ArbExecutor.Hop memory)
+    {
+        return ArbExecutor.Hop({kind: 3, pool: V4_POOL_MANAGER, tokenIn: tIn, tokenOut: tOut, feeBps: 0, v4Fee: fee, v4TickSpacing: spacing, v4Native: native});
+    }
+
+    function _uniV3() internal view returns (address v3) {
+        v3 = _findV3(UNI_V3_FACTORY, WETH, USDG, _fees(500, 3000, 10000, 100));
+    }
+
+    // WETH -> USDG on Uniswap V3, USDG -> WETH on the NATIVE-ETH V4 pool
+    // (contract unwraps/wraps around the V4 swap).
+    function test_fork_robinhood_v3_to_v4NativeEth() public {
+        if (!_fork("ROBINHOOD_RPC_URL")) return;
+        address v3 = _uniV3();
+        if (v3 == address(0)) { console.log("skipped: no Uniswap V3 WETH/USDG pool"); vm.skip(true); return; }
+        exec.setV4(V4_POOL_MANAGER, WETH);
+        _fundWrapped(WETH, 0.011 ether);
+        ArbExecutor.Hop[] memory hops = new ArbExecutor.Hop[](2);
+        hops[0] = _hop(2, v3, WETH, USDG, 0);
+        hops[1] = _v4Hop(USDG, WETH, 500, 10, true);
+        ArbExecutor.Trade memory t =
+            ArbExecutor.Trade({token: WETH, amountIn: 0.01 ether, minProfit: 1, maxBlock: block.number, hops: hops});
+        _runExpectingOnlyProfitGuard("robinhood uniV3 -> V4 native ETH/USDG", t, address(0));
+        assertEq(address(exec).balance, 0, "no ETH left in the contract");
+    }
+
+    // WETH -> USDG on the WETH (ERC20) V4 pool, USDG -> WETH on Uniswap V3.
+    function test_fork_robinhood_v4Weth_to_v3() public {
+        if (!_fork("ROBINHOOD_RPC_URL")) return;
+        address v3 = _uniV3();
+        if (v3 == address(0)) { console.log("skipped: no Uniswap V3 WETH/USDG pool"); vm.skip(true); return; }
+        exec.setV4(V4_POOL_MANAGER, WETH);
+        _fundWrapped(WETH, 0.011 ether);
+        ArbExecutor.Hop[] memory hops = new ArbExecutor.Hop[](2);
+        hops[0] = _v4Hop(WETH, USDG, 500, 10, false);
+        hops[1] = _hop(2, v3, USDG, WETH, 0);
+        ArbExecutor.Trade memory t =
+            ArbExecutor.Trade({token: WETH, amountIn: 0.01 ether, minProfit: 1, maxBlock: block.number, hops: hops});
+        _runExpectingOnlyProfitGuard("robinhood V4 WETH/USDG -> uniV3", t, address(0));
+    }
+
     function test_fork_robinhood_ramsesV2_to_pancakeV3() public {
         if (!_fork("ROBINHOOD_RPC_URL")) return;
         address v3 = _findV3(PANCAKE_V3_FACTORY, WETH, USDG, _fees(2500, 500, 10000, 100));

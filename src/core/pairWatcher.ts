@@ -3,8 +3,8 @@ import { ChainName, PoolState } from './types';
 import { PoolCache } from './poolCache';
 import { makeCaller } from './universeScan';
 import {
-  resolveAndFetchV2Pool, resolveAndFetchSolidlyV2Pool, resolveAllV3Pools,
-  refetchV2PoolPrice, refetchV3PoolPrice,
+  resolveAndFetchV2Pool, resolveAndFetchSolidlyV2Pool, resolveAllV3Pools, resolveAllV4Pools,
+  refetchV2PoolPrice, refetchV3PoolPrice, refetchV4PoolPrice,
 } from './poolResolver';
 
 // ============================================================================
@@ -34,9 +34,11 @@ import {
 
 export interface Venue {
   dex: string;
-  kind: 'v2' | 'solidly' | 'v3-fee' | 'v3-spacing';
-  factory: string;
-  feeBps?: number; // V2-style pools: swap fee in bps
+  kind: 'v2' | 'solidly' | 'v3-fee' | 'v3-spacing' | 'v4';
+  factory: string;   // kind 'v4': the StateView contract (where V4 prices are read)
+  feeBps?: number;   // V2-style pools: swap fee in bps
+  poolManager?: string; // kind 'v4' only: where V4 trades go
+  weth?: string;     // kind 'v4' only: WETH, which stands in for native ETH
 }
 
 export interface PairWatcherOptions {
@@ -69,6 +71,10 @@ export async function discoverPairPools(
         const vol = await resolveAndFetchSolidlyV2Pool(provider, chain, v.dex, v.factory, tokenA, tokenB, false, v.feeBps ?? 20);
         return vol ? [vol] : [];
       }
+      if (v.kind === 'v4') {
+        if (!v.poolManager || !v.weth) return [];
+        return await resolveAllV4Pools(provider, chain, v.dex, v.factory, v.poolManager, tokenA, tokenB, v.weth);
+      }
       return await resolveAllV3Pools(provider, chain, v.dex, v.factory, tokenA, tokenB, v.kind === 'v3-fee' ? 'fee' : 'spacing');
     } catch {
       return [];
@@ -82,6 +88,9 @@ export async function discoverPairPools(
 // liquidity(); V2/Solidly: getReserves(). Only the first return words are
 // read, which are the same across Uniswap, PancakeSwap and Ramses.
 const SEL_SLOT0 = '0x3850c7bd', SEL_LIQ = '0x1a686502', SEL_RESERVES = '0x0902f1ac';
+// V4: same two reads, but asked of the StateView contract with the pool id.
+const SEL_V4_SLOT0 = ethers.id('getSlot0(bytes32)').slice(0, 10);
+const SEL_V4_LIQ = ethers.id('getLiquidity(bytes32)').slice(0, 10);
 export async function refreshPoolsBatch(
   callMany: (calls: { target: string; data: string }[]) => Promise<(string | null)[]>,
   pools: PoolState[],
@@ -90,7 +99,8 @@ export async function refreshPoolsBatch(
   const idx: number[] = []; // start index of each pool's calls
   for (const p of pools) {
     idx.push(calls.length);
-    if (p.poolType === 'v3') calls.push({ target: p.poolAddress, data: SEL_SLOT0 }, { target: p.poolAddress, data: SEL_LIQ });
+    if (p.v4) calls.push({ target: p.v4.stateView, data: SEL_V4_SLOT0 + p.poolAddress.slice(2) }, { target: p.v4.stateView, data: SEL_V4_LIQ + p.poolAddress.slice(2) });
+    else if (p.poolType === 'v3') calls.push({ target: p.poolAddress, data: SEL_SLOT0 }, { target: p.poolAddress, data: SEL_LIQ });
     else if (p.poolType === 'v2') calls.push({ target: p.poolAddress, data: SEL_RESERVES });
   }
   const res = await callMany(calls);
@@ -112,6 +122,7 @@ export async function refreshPoolsBatch(
 
 // Re-reads one pool's live price state. Returns null if it couldn't.
 export async function refreshPoolState(provider: ethers.JsonRpcProvider, pool: PoolState): Promise<PoolState | null> {
+  if (pool.v4) return refetchV4PoolPrice(provider, pool);
   if (pool.poolType === 'v3') return refetchV3PoolPrice(provider, pool);
   if (pool.poolType === 'v2') return refetchV2PoolPrice(provider, pool);
   return null; // orderbook / bins: not refreshed here
@@ -218,7 +229,7 @@ export class PairWatcher {
     const prev = this.pairs.get(k);
     this.pairs.set(k, { tokenA: a, tokenB: b, pools: pools.map((p) => p.poolAddress), discoveredAt: now, lastSeen: prev?.lastSeen ?? now });
     if (!prev) {
-      console.log(`[pairs] ${this.chain} watching ${ma.symbol}/${mb.symbol}: ${pools.length} pools (${pools.map((p) => `${p.dex}${p.poolType === 'v3' ? ` ${p.feeBps / 100}%` : ''}`).join(', ')})`);
+      console.log(`[pairs] ${this.chain} watching ${ma.symbol}/${mb.symbol}: ${pools.length} pools (${pools.map((p) => `${p.dex}${p.poolType === 'v3' ? ` ${p.feeBps / 100}%` : ''}${p.v4?.native ? ' ETH' : ''}`).join(', ')})`);
     }
     this.evictIfNeeded();
   }
