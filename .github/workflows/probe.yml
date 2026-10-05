@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       only:
-        description: 'Run one step only: feeds, sim, pairs, watch, universe, backtest, latency, lenders (blank = all except backtest)'
+        description: 'Run one step only: feeds, sim, pairs, watch, universe, backtest, latency, lenders, smoke (blank = all except backtest)'
         required: false
         default: ''
 
@@ -79,6 +79,44 @@ jobs:
           echo "$out"
           out="${out//'%'/'%25'}"; out="${out//$'\n'/'%0A'}"
           echo "::notice title=Latency::${out}"
+      # SMOKE RUN: builds dist/ exactly like the server's auto-deploy and runs
+      # the real bot in DRY RUN for SMOKE_SECONDS. No .env, no keys, no
+      # Telegram (messages just print), so nothing leaves this runner except
+      # read-only chain requests. Lets us check a release when the server
+      # itself can't be reached.
+      - name: Smoke run (real bot, dry run, no keys, no Telegram)
+        if: inputs.only == 'smoke'
+        shell: bash
+        env:
+          CHAINS: robinhood
+          EXECUTION_ENABLED: 'false'
+          SMOKE_SECONDS: '1500'
+        run: |
+          npm run build
+          mkdir -p data
+          # Run the bot; keep the full log, it never fails the job on its own.
+          timeout "$SMOKE_SECONDS" node dist/shadowMain.js > smoke.log 2>&1 || true
+          # Summary: the lines that prove each part works, plus any errors.
+          {
+            echo "Ran $((SMOKE_SECONDS / 60)) min. Log lines: $(wc -l < smoke.log)"
+            echo "--- startup / scan / sender ---"
+            grep -E '^\[(startup|scan|fire)\]' smoke.log | head -12
+            echo "--- standing gaps found: $(grep -c '^\[gap\] standing gap' smoke.log) (first 8) ---"
+            grep '^\[gap\]' smoke.log | head -8
+            echo "--- rivals seen: $(grep -c '^\[rival\]' smoke.log) ---"
+            echo "--- errors / crashes ($(grep -ciE 'unhandled|error|fatal' smoke.log)) first 10 ---"
+            grep -iE 'unhandled|error|fatal' smoke.log | grep -v 'TELEGRAM_BOT_TOKEN' | head -10
+          } > summary.txt
+          cat summary.txt
+          out=$(cat summary.txt)
+          out="${out//'%'/'%25'}"; out="${out//$'\n'/'%0A'}"
+          echo "::notice title=Smoke run::${out}"
+      - name: Keep the full smoke log
+        if: inputs.only == 'smoke'
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-log
+          path: smoke.log
       - name: Suggest flash lenders (for deploying the contract)
         if: inputs.only == 'lenders'
         shell: bash
