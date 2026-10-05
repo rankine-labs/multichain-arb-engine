@@ -157,11 +157,21 @@ export class BacktestEngine {
   // Known starting state (e.g. read at the first block of the window).
   setState(pool: string, st: PoolState) { if (this.poolMeta.has(pool)) this.state.set(pool, st); }
 
-  apply(ev: BtEvent) {
+  // evaluate=false: just record the new state (used for all but the last
+  // event of a transaction, so a trade that touches two pools in one go is
+  // never mistaken for a gap someone else could have taken mid-trade).
+  apply(ev: BtEvent, evaluate = true) {
     const pair = this.pairOf.get(ev.pool);
     if (!pair) return;
     this.state.set(ev.pool, ev.state);
     this.eventsApplied++;
+    if (evaluate) this.evaluate(ev);
+  }
+
+  // Re-check the pair that `ev.pool` belongs to, as of the end of ev's transaction.
+  evaluate(ev: BtEvent) {
+    const pair = this.pairOf.get(ev.pool);
+    if (!pair) return;
 
     // Best arb across every ordered pair of pools for this token pair.
     let best = { usd: 0, sizeUsd: 0, buy: '', sell: '' };

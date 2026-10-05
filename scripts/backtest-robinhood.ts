@@ -114,7 +114,17 @@ async function main() {
 
   // 6) Replay in order.
   events.sort((a, b) => a.block - b.block || a.logIndex - b.logIndex);
-  for (const ev of events) for (const e of engines) e.apply(ev);
+  // Apply each transaction's events together, then check every pair it
+  // touched once, as of the end of that transaction.
+  for (let i = 0; i < events.length; ) {
+    let j = i;
+    while (j + 1 < events.length && events[j + 1].txHash && events[j + 1].txHash === events[i].txHash) j++;
+    for (let k = i; k <= j; k++) for (const e of engines) e.apply(events[k], false);
+    const lastPerPool = new Map<string, BtEvent>();
+    for (let k = i; k <= j; k++) lastPerPool.set(events[k].pool, events[k]);
+    for (const ev of lastPerPool.values()) for (const e of engines) e.evaluate({ ...ev, logIndex: events[j].logIndex });
+    i = j + 1;
+  }
   for (const e of engines) e.finish(latest);
   const swapsPerPool = new Map<string, number>();
   for (const ev of events) swapsPerPool.set(ev.pool, (swapsPerPool.get(ev.pool) ?? 0) + 1);

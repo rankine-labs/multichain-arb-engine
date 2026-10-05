@@ -71,3 +71,15 @@ assert(ops[0].closedSameBlock && ops[0].peakUsd > 20, 'first one closed in the s
 assert(!ops[1].closedSameBlock && ops[1].endBlock - ops[1].startBlock === 3, 'second lasted 3 blocks');
 assert(ops[1].buyDex === 'ramses-v2' || ops[1].buyDex === 'uniswap-v2', 'buy/sell venue recorded');
 assert(ops[2].stillOpen && ops[2].endBlock === 25, 'open opportunity closed at the end of the window');
+
+// A trade that moves two pools in ONE transaction never opens an opportunity
+// when only the end state of the transaction is checked.
+const eng2 = new BacktestEngine([A, B], (x, y) => (x === 'usdg' || y === 'usdg' ? { quote: 'usdg', usd: 1 } : null), (s) => s.toUpperCase(),
+  { minProfitUsd: 20, flashFee: 0.0005, gasUsd: 0.05, maxTradeUsd: 1e9 });
+eng2.apply({ block: 1, logIndex: 0, pool: 'a', state: v2(100_000, 100_000), txHash: '0x1' });
+eng2.apply({ block: 1, logIndex: 1, pool: 'b', state: v2(100_000, 100_000), txHash: '0x2' });
+eng2.apply({ block: 3, logIndex: 0, pool: 'a', state: v2(95_000, 105_263), txHash: '0xagg' }, false); // mid-transaction: gap
+eng2.apply({ block: 3, logIndex: 1, pool: 'b', state: v2(95_000, 105_263), txHash: '0xagg' }, false); // same tx moves the other pool too
+eng2.evaluate({ block: 3, logIndex: 1, pool: 'b', state: v2(95_000, 105_263), txHash: '0xagg' });
+eng2.finish(5);
+assert(eng2.opportunities.length === 0, 'gap that only exists inside one transaction is not counted');
