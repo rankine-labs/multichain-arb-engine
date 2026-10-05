@@ -90,11 +90,31 @@ export interface RouterRegistryEntry {
     // uses the right factory.
     v2Via?: string;
     v3Via?: string;
+    // Universal Routers only: V4 swaps inside them are decoded straight to
+    // the V4 pool id. Native ETH (address 0) in a V4 pool key is reported
+    // as this wrapped token, matching how the bot stores V4 pools.
+    v4WrappedNative?: string;
 }
 
 // Universal Router command IDs (low 6 bits of each command byte).
 const UR_V3_SWAP_EXACT_IN = 0x00;
 const UR_V2_SWAP_EXACT_IN = 0x08;
+const UR_V4_SWAP = 0x10;
+// V4 router "actions" inside a V4_SWAP command (v4-periphery Actions.sol).
+const V4_SWAP_EXACT_IN_SINGLE = 0x06;
+const V4_SWAP_EXACT_IN = 0x07;
+const ZERO = '0x0000000000000000000000000000000000000000';
+const POOL_KEY = 'tuple(address currency0,address currency1,uint24 fee,int24 tickSpacing,address hooks)';
+const V4_EXACT_IN_SINGLE = [`tuple(${POOL_KEY} poolKey,bool zeroForOne,uint128 amountIn,uint128 amountOutMinimum,bytes hookData)`];
+const V4_EXACT_IN = ['tuple(address currencyIn,tuple(address intermediateCurrency,uint24 fee,int24 tickSpacing,address hooks,bytes hookData)[] path,uint128 amountIn,uint128 amountOutMinimum)'];
+// Newer V4 router versions add a per-hop minimum price array; tried if the first layout fails.
+const V4_EXACT_IN_V2 = ['tuple(address currencyIn,tuple(address intermediateCurrency,uint24 fee,int24 tickSpacing,address hooks,bytes hookData)[] path,uint256[] minHopPriceX36,uint128 amountIn,uint128 amountOutMinimum)'];
+
+// Pool id of a hookless V4 pool (same formula as core/poolResolver.ts v4PoolId).
+function v4Id(c0: string, c1: string, fee: number, spacing: number): string {
+  return ethers.keccak256(ethers.AbiCoder.defaultAbiCoder().encode(
+    ['address', 'address', 'uint24', 'int24', 'address'], [c0, c1, fee, spacing, ZERO]));
+}
 // Universal Router "use the router's whole balance" placeholder amount;
 // the real amount isn't known from calldata, so those swaps are skipped.
 const UR_CONTRACT_BALANCE = 1n << 255n;
@@ -246,6 +266,59 @@ export class TransactionDecoder {
     return this.decodeRouterCall(chain, to, entry, data, event, value, 0);
   }
 
+  // A V4_SWAP command = a list of V4 "actions" with their params. We read the
+  // first exact-input swap (single pool, or the first hop of a multi-hop),
+  // and name the exact pool by its id, so the bot can find it directly in
+  // its watch list. Hooked pools and "use whatever balance" amounts (0 or
+  // the contract-balance placeholder) are skipped: we can't size those.
+  private decodeV4Swap(chain: ChainName, input: string, wrappedNative: string, event: RawChainEvent): DecodedSwap | null {
+    const coder = ethers.AbiCoder.defaultAbiCoder();
+    let actions: Uint8Array, params: string[];
+    try {
+      const [a, p] = coder.decode(['bytes', 'bytes[]'], input);
+      actions = ethers.getBytes(a as string);
+      params = p as string[];
+    } catch {
+      return null;
+    }
+    const asToken = (c: string) => (c.toLowerCase() === ZERO ? wrappedNative : c);
+    for (let j = 0; j < actions.length && j < params.length; j++) {
+      try {
+        if (actions[j] === V4_SWAP_EXACT_IN_SINGLE) {
+          const [x] = coder.decode(V4_EXACT_IN_SINGLE, params[j]);
+          const key = x.poolKey;
+          if (String(key.hooks).toLowerCase() !== ZERO) continue; // hooked pool: not ours
+          const amountIn = BigInt(x.amountIn);
+          if (amountIn === 0n || amountIn >= UR_CONTRACT_BALANCE) continue;
+          const cIn = x.zeroForOne ? key.currency0 : key.currency1;
+          const cOut = x.zeroForOne ? key.currency1 : key.currency0;
+          return this.v4Swap(chain, v4Id(key.currency0, key.currency1, Number(key.fee), Number(key.tickSpacing)), asToken(cIn), asToken(cOut), amountIn, Number(key.fee), event);
+        }
+        if (actions[j] === V4_SWAP_EXACT_IN) {
+          let x: any;
+          try { [x] = coder.decode(V4_EXACT_IN, params[j]); } catch { [x] = coder.decode(V4_EXACT_IN_V2, params[j]); }
+          const hop = x.path?.[0];
+          if (!hop || String(hop.hooks).toLowerCase() !== ZERO) continue;
+          const amountIn = BigInt(x.amountIn);
+          if (amountIn === 0n || amountIn >= UR_CONTRACT_BALANCE) continue;
+          const a = String(x.currencyIn), b = String(hop.intermediateCurrency);
+          const [c0, c1] = a.toLowerCase() < b.toLowerCase() ? [a, b] : [b, a];
+          return this.v4Swap(chain, v4Id(c0, c1, Number(hop.fee), Number(hop.tickSpacing)), asToken(a), asToken(b), amountIn, Number(hop.fee), event);
+        }
+      } catch { /* malformed action: try the next */ }
+    }
+    return null;
+  }
+
+  private v4Swap(chain: ChainName, poolId: string, tokenIn: string, tokenOut: string, amountIn: bigint, fee: number, event: RawChainEvent): DecodedSwap {
+    return {
+      chain, dex: 'uniswap-v4',
+      poolAddress: poolId, // the exact V4 pool (id), found directly in the cache
+      tokenIn, tokenOut, amountIn, feeTier: fee,
+      stateType: event.stateType, detectedAtMs: event.receivedAtMs,
+    };
+  }
+
   // Builds the swap; `via` = the registry router whose factory should be used.
   private swapOf(
     chain: ChainName, via: string | undefined, tokenIn: string, tokenOut: string,
@@ -309,6 +382,9 @@ export class TransactionDecoder {
             const [, amountIn, , path] = coder.decode(['address', 'uint256', 'uint256', 'address[]', 'bool'], inputs[i]);
             const p = path as string[];
             const swap = p.length >= 2 ? this.swapOf(chain, entry.v2Via, p[0], p[1], amountIn as bigint, event) : null;
+            if (swap) return swap;
+          } else if (cmd === UR_V4_SWAP && entry.v4WrappedNative) {
+            const swap = this.decodeV4Swap(chain, inputs[i], entry.v4WrappedNative, event);
             if (swap) return swap;
           }
         } catch { /* malformed input for this command; try the next */ }

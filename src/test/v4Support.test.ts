@@ -93,3 +93,48 @@ async function main() {
 }
 
 main().catch((err) => { console.error('FAIL: test crashed', err); process.exitCode = 1; });
+
+// ---------------------------------------------------------------------------
+// Reading V4 trades from the feed: a Universal Router V4_SWAP command is
+// decoded straight to the exact V4 pool (id), with native ETH reported as WETH.
+// ---------------------------------------------------------------------------
+import { TransactionDecoder, RouterRegistry } from '../core/decoder';
+import { seedKnownAddresses, ROBINHOOD_V4 } from '../config/knownAddresses';
+
+async function decoderV4() {
+  const reg: RouterRegistry = { avalanche: {}, monad: {}, robinhood: {} };
+  seedKnownAddresses(reg);
+  const dec = new TransactionDecoder(reg);
+  const coder = ethers.AbiCoder.defaultAbiCoder();
+  const ur = new ethers.Interface(['function execute(bytes commands, bytes[] inputs, uint256 deadline)']);
+  const ev = (data: string) => ({ chain: 'robinhood' as const, stateType: 'SEQUENCED' as const, blockOrSeq: 1, receivedAtMs: 1, raw: { to: ROBINHOOD_V4.UNIVERSAL_ROUTER, data, value: '0' } });
+  const KEY = 'tuple(address currency0,address currency1,uint24 fee,int24 tickSpacing,address hooks)';
+  const ZERO = ethers.ZeroAddress;
+
+  // Native ETH -> USDG, single pool 0.05% / spacing 10. Actions: SWAP_EXACT_IN_SINGLE, SETTLE_ALL, TAKE_ALL.
+  const single = coder.encode([`tuple(${KEY} poolKey,bool zeroForOne,uint128 amountIn,uint128 amountOutMinimum,bytes hookData)`],
+    [{ poolKey: { currency0: ZERO, currency1: USDG, fee: 500, tickSpacing: 10, hooks: ZERO }, zeroForOne: true, amountIn: 2n * 10n ** 18n, amountOutMinimum: 0n, hookData: '0x' }]);
+  const settle = coder.encode(['address', 'uint256'], [ZERO, 2n * 10n ** 18n]);
+  const take = coder.encode(['address', 'uint256'], [USDG, 0n]);
+  const v4Input = coder.encode(['bytes', 'bytes[]'], ['0x060c0f', [single, settle, take]]);
+  const s1 = await dec.decode(ev(ur.encodeFunctionData('execute', ['0x10', [v4Input], 1n])));
+  assert(s1?.dex === 'uniswap-v4' && s1.poolAddress === v4PoolId(ZERO, USDG, 500, 10), 'V4 single swap -> exact V4 pool id');
+  assert(s1?.tokenIn.toLowerCase() === WETH.toLowerCase() && s1?.tokenOut.toLowerCase() === USDG.toLowerCase() && s1?.amountIn === 2n * 10n ** 18n, 'native ETH reported as WETH, amount read');
+
+  // Multi-hop exact-in: USDG -> WETH (0.3%) -> ...: first hop is decoded.
+  const multi = coder.encode(['tuple(address currencyIn,tuple(address intermediateCurrency,uint24 fee,int24 tickSpacing,address hooks,bytes hookData)[] path,uint128 amountIn,uint128 amountOutMinimum)'],
+    [{ currencyIn: USDG, path: [{ intermediateCurrency: WETH, fee: 3000, tickSpacing: 60, hooks: ZERO, hookData: '0x' }], amountIn: 5_000n * 10n ** 6n, amountOutMinimum: 0n }]);
+  const v4Multi = coder.encode(['bytes', 'bytes[]'], ['0x07', [multi]]);
+  const s2 = await dec.decode(ev(ur.encodeFunctionData('execute', ['0x10', [v4Multi], 1n])));
+  const [c0, c1] = WETH.toLowerCase() < USDG.toLowerCase() ? [WETH, USDG] : [USDG, WETH];
+  assert(s2?.poolAddress === v4PoolId(c0, c1, 3000, 60) && s2?.tokenIn.toLowerCase() === USDG.toLowerCase(), 'V4 multi-hop: first hop decoded to its pool');
+
+  // Hooked pool and "use whole balance" (0) are skipped.
+  const hooked = coder.encode([`tuple(${KEY} poolKey,bool zeroForOne,uint128 amountIn,uint128 amountOutMinimum,bytes hookData)`],
+    [{ poolKey: { currency0: ZERO, currency1: USDG, fee: 500, tickSpacing: 10, hooks: '0x000000000000000000000000000000000000BEEF' }, zeroForOne: true, amountIn: 10n ** 18n, amountOutMinimum: 0n, hookData: '0x' }]);
+  assert(await dec.decode(ev(ur.encodeFunctionData('execute', ['0x10', [coder.encode(['bytes', 'bytes[]'], ['0x06', [hooked]])], 1n]))) === null, 'hooked V4 pool skipped');
+  const openDelta = coder.encode([`tuple(${KEY} poolKey,bool zeroForOne,uint128 amountIn,uint128 amountOutMinimum,bytes hookData)`],
+    [{ poolKey: { currency0: ZERO, currency1: USDG, fee: 500, tickSpacing: 10, hooks: ZERO }, zeroForOne: true, amountIn: 0n, amountOutMinimum: 0n, hookData: '0x' }]);
+  assert(await dec.decode(ev(ur.encodeFunctionData('execute', ['0x10', [coder.encode(['bytes', 'bytes[]'], ['0x06', [openDelta]])], 1n]))) === null, 'amount 0 (use open balance) skipped');
+}
+decoderV4().catch((err) => { console.error('FAIL: decoder V4 test crashed', err); process.exitCode = 1; });

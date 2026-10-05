@@ -279,6 +279,9 @@ style: 'v3',
         style: 'ur',
         v3Via: ROBINHOOD_V3.SWAP_ROUTER_02,
         v2Via: ROBINHOOD_V2.ROUTER,
+        // V4 swaps (about 90% of this router's traffic) decode straight to
+        // the V4 pool; native ETH is reported as WETH like the bot stores it.
+        v4WrappedNative: ROBINHOOD_TOKENS.WETH,
     };
     // Copies of the Uniswap Universal Router deployed by front-ends/wallets
     // (same execute() calldata). Found by the router probe (only=routers):
@@ -291,6 +294,9 @@ style: 'v3',
         dex: 'uniswap-universal',
         style: 'ur',
         v3Via: ROBINHOOD_V3.SWAP_ROUTER_02,
+        // V4 commands name their pool exactly (pool key in the calldata), so
+        // they're safe to decode for copies too.
+        v4WrappedNative: ROBINHOOD_TOKENS.WETH,
       };
     }
     registry.monad[MONAD_V4_PENDING.UNIVERSAL_ROUTER.toLowerCase()] = {
