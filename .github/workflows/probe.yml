@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       only:
-        description: 'Run one step only: feeds, sim, pairs, watch, universe, backtest, latency (blank = all except backtest)'
+        description: 'Run one step only: feeds, sim, pairs, watch, universe, backtest, latency, lenders (blank = all except backtest)'
         required: false
         default: ''
 
@@ -79,3 +79,11 @@ jobs:
           echo "$out"
           out="${out//'%'/'%25'}"; out="${out//$'\n'/'%0A'}"
           echo "::notice title=Latency::${out}"
+      - name: Suggest flash lenders (for deploying the contract)
+        if: inputs.only == 'lenders'
+        shell: bash
+        run: |
+          out=$(timeout 2400 node .scripts-build/scripts/suggest-lenders.js 2>&1 | tail -40 || true)
+          echo "$out"
+          out="${out//'%'/'%25'}"; out="${out//$'\n'/'%0A'}"
+          echo "::notice title=Flash lenders::${out}"

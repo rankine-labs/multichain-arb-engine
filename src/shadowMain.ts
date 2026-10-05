@@ -417,6 +417,20 @@ const liveTracker = new LiveTradeTracker({
       notify: (html) => sendTelegramMessage(html),
 });
 
+// Flash-loan lenders the bot may use. FLASH_LENDERS_<CHAIN> in .env = the
+// pools approved on the contract (same list given to the deploy script).
+// Set: only those. Not set: any pool (fine for dry runs; live trades are
+// refused above unless they use an approved lender).
+const approvedLenders = (chain: string) => new Set(
+      (process.env[`FLASH_LENDERS_${chain.toUpperCase()}`] ?? '').split(',').map((a) => a.trim().toLowerCase()).filter(Boolean),
+);
+const lenderCandidates = (chain: 'avalanche' | 'monad' | 'robinhood') => {
+      const ok = approvedLenders(chain);
+      const all = cache.allForChain(chain);
+      if (ok.size) return all.filter((p) => ok.has(p.poolAddress.toLowerCase()));
+      return robinhoodSender.live && chain === 'robinhood' ? [] : all;
+};
+
 // ONE path from "this is worth doing" to a signed trade, used by both the
 // trade-triggered engine and the standing-gap scanner:
 //   build the exact contract call -> safety gate -> sign (send only if live).
@@ -437,9 +451,15 @@ const fireTrade = async (o: {
                   // safe for dry runs (it would make every real trade revert).
                   maxBlock: o.chain === 'robinhood' && robinhoodSender.live ? BigInt(robinhoodSender.latestBlock + 3) : 0n,
                   ...executorConfig(o.chain),
-                  v3Lender: pickV3Lender(cache.allForChain(o.chain), o.tokenIn, [o.buyPool.poolAddress, o.sellPool.poolAddress])?.poolAddress,
+                  v3Lender: pickV3Lender(lenderCandidates(o.chain), o.tokenIn, [o.buyPool.poolAddress, o.sellPool.poolAddress])?.poolAddress,
             });
             if ('reason' in dry) { console.log(`[exec-dryrun] ${o.chain} NOT executable: ${dry.reason}`); return; }
+            // Live trades must borrow from a pool the contract owner approved
+            // (setFlashPool); anything else reverts on-chain.
+            if (o.chain === 'robinhood' && robinhoodSender.live && dry.funding !== 'v3-flash') {
+                  fireStats.blocked.set('no approved flash lender for this token', (fireStats.blocked.get('no approved flash lender for this token') ?? 0) + 1);
+                  return;
+            }
             if (o.chain !== 'robinhood') {
                   console.log(`[exec-dryrun] ${o.chain} executable: ${dry.hops.map((h) => `kind${h.kind}`).join('->')} amountIn=${dry.amountIn} ${dry.funding}`);
                   return;
