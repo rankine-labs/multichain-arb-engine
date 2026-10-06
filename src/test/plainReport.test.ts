@@ -36,3 +36,14 @@ assert(down.includes('live trade feed is down') && down.includes('backup'), 'pro
 assert(msg.length < 4000, 'fits in one Telegram message');
 const daily = formatPlainDaily({ dateLabel: 'Tue Oct 6', differencesFound: 1200, earnedChecked: 0, earnedCheckedCount: 0, weekChecked: 0, feedUptimePct: 99.8 });
 assert(daily.includes('DAILY SUMMARY') && daily.includes('99.8%'), 'daily summary in plain words');
+
+// Node usage lines + warnings at 80% and 100%.
+const usage = formatPlainHourly({ ...base, checksAvailable: true, checks: { done: 3, makeMoney: 1, loseMoney: 2, wouldFail: 0, nodeBusy: 0 },
+  nodeUsage: [
+    { name: 'public', used: 52000, daily: Infinity },
+    { name: 'quicknode', used: 11500, daily: 14000 },
+    { name: 'alchemy', used: 30000, daily: 30000 },
+  ] });
+assert(usage.includes('Robinhood (free): 52,000 (no daily cap)'), 'free node usage shown without a cap');
+assert(usage.includes('QuickNode (checks): 11,500 of 14,000 ⚠️') && usage.includes('at 82% of today'), '80%+ shows ⚠️ and a warning');
+assert(usage.includes('Alchemy (scan): 30,000 of 30,000 ❌') && usage.includes('paused until midnight UTC'), 'used up shows ❌ and says the job is paused');

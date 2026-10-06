@@ -74,12 +74,12 @@ import { MonadAdapter } from './chains/monad';
 import { AvalancheAdapter } from './chains/avalanche';
 import { RawChainEvent, PoolState } from './core/types';
 import { priceOf, spreadPct, deepEnough } from './core/poolPrice';
-import { PairWatcher, Venue, refreshPoolState } from './core/pairWatcher';
+import { PairWatcher, Venue, refreshPoolState, refreshPoolsBatch } from './core/pairWatcher';
 import { scanUniverse, emptyScanState, ScanState } from './core/universeScan';
 import { readFileSync, writeFileSync, mkdirSync, renameSync } from 'fs';
 import { ROBINHOOD_SCAN_FACTORIES } from './config/knownAddresses';
 import { buildExecuteCall, executionRequested, executorConfig, pickV3Lender } from './execution/executorCalldata';
-import { makeRpc, simulateRoundTrip, simRpcUrl, Rpc, makeFallbackRpc } from './execution/simulator';
+import { makeRpc, simulateRoundTrip, simRpcUrl, Rpc, makeFallbackRpc, loadBalanceSlots, wssToHttps } from './execution/simulator';
 import { FastSender, SafetyGate, safetyConfigFromEnv } from './execution/fastSender';
 import { checkLiveReady } from './execution/liveReadiness';
 import { LiveTradeTracker } from './execution/liveTracker';
@@ -89,6 +89,8 @@ import { pickRobinhoodReadRpc, robinhoodSendRpc, redact, ROBINHOOD_PUBLIC_RPC } 
 import { loadStartPairs, saveStartPairs } from './core/seedPairs';
 import { DryRunPnl } from './core/dryRunPnl';
 import { FailoverJsonRpcProvider } from './core/failoverRpc';
+import { makeCaller } from './core/universeScan';
+import { loadNodeUsage, saveNodeUsage, nodeUsageToday } from './core/nodeBudget';
 import { endpointLabel } from './core/endpointLabel';
 import { ROBINHOOD_SEED_PAIRS } from './config/robinhoodSeedPairs';
 
@@ -143,7 +145,11 @@ const priceOracle = new PriceOracle(cache, (chain, token) => {
       // Backup node(s) used only when the main free node is slow/failing,
       // before Alchemy (ROBINHOOD_BACKUP_RPC, e.g. Nodeflare).
       const rhBackup = (process.env.ROBINHOOD_BACKUP_RPC ?? '').split(',').map((u) => u.trim()).filter(Boolean);
-      const robinhoodReadProvider = new FailoverJsonRpcProvider(rhFastUrl, rhHeavyUrl, 4663, { extraFastUrls: rhExtraFast, backupUrls: rhBackup });
+      // Price reads: the free Robinhood node, then the backup (Nodeflare). The
+      // paid node (Alchemy) is deliberately NOT in this path any more: it's
+      // kept for the chain-wide scan, and when its plan ran out every price
+      // read was detouring through it and slowing the bot down.
+      const robinhoodReadProvider = new FailoverJsonRpcProvider(rhFastUrl, null, 4663, { extraFastUrls: rhExtraFast, backupUrls: rhBackup });
       // Bursty work (pool discovery, the chain-wide scan) goes to HEAVY
       // (Alchemy) first, with the public node as ITS fallback: when Alchemy
       // refuses (rate limit / plan limit), discovery used to stall completely
@@ -301,13 +307,33 @@ Object.entries(discoveryConfigs).map(([chain, cfg]) => [chain, new PoolDiscovery
 // ==========================================================================
 // Paid endpoint if configured, else public (see simRpcUrl in simulator.ts).
 const simRpc: Record<string, Rpc> = {};
+// Per-node usage today (speed limits + daily allowances, core/nodeBudget.ts):
+// restored so a restart doesn't reset the counts, saved every minute.
+loadNodeUsage('data/node-usage.json');
+setInterval(saveNodeUsage, 60_000);
+// Token balance locations found by earlier runs (saves the lookup after a restart).
+loadBalanceSlots('data/balance-slots.json');
+// Alchemy (ROBINHOOD_RPC_HTTP): fallback node for checks when QuickNode is set.
+const rhHeavyUrlForSims = process.env.ROBINHOOD_RPC_HTTP || null;
 for (const chain of ['avalanche', 'monad', 'robinhood'] as const) {
       const { url, source } = simRpcUrl(chain);
       // Robinhood: if the paid node refuses (rate/plan limit), simulate on the
       // public node instead of stopping real-chain tests altogether.
-      simRpc[chain] = chain === 'robinhood' && url !== ROBINHOOD_PUBLIC_RPC
-            ? makeFallbackRpc(makeRpc(url), makeRpc(ROBINHOOD_PUBLIC_RPC), (m) => console.warn(`[sim] robinhood ${m}`))
-            : makeRpc(url);
+      if (chain === 'robinhood') {
+            // Checks (simulations) run on QuickNode when its key is set, with
+            // the paid Alchemy node as ITS fallback. Never on the free public
+            // node (it refuses them and would then throttle our price reads).
+            // Each node is held to its own daily allowance (core/nodeBudget.ts).
+            const qn = wssToHttps(process.env.QUICKNODE_RPC_ROBINHOOD) ?? (process.env.QUICKNODE_RPC_ROBINHOOD || null);
+            const primary = qn ?? url;
+            const fallback = rhHeavyUrlForSims && rhHeavyUrlForSims !== primary ? rhHeavyUrlForSims : null;
+            simRpc[chain] = fallback
+                  ? makeFallbackRpc(makeRpc(primary), makeRpc(fallback), (m) => console.warn(`[sim] robinhood ${m.replace('public node', 'backup node')}`))
+                  : makeRpc(primary);
+            console.log(`[sim] robinhood: checks on ${qn ? 'QuickNode' : source}${fallback ? ' (fallback: Alchemy)' : ''}`);
+            continue;
+      }
+      simRpc[chain] = makeRpc(url);
       console.log(`[sim] ${chain}: simulating on ${source}`); // never log the URL itself (it holds your API key)
 }
 // When an endpoint says "slow down", pause that chain's simulations.
@@ -496,10 +522,21 @@ const robinhoodWatcher = new PairWatcher('robinhood', robinhoodReadProvider, ROB
       // 60 = up to ~20 pinned pairs from the chain-wide scan + traffic-driven ones.
       // refreshMs: background re-sync of every watched pool (one Multicall3
       // request), the safety net behind instant price tracking below.
-      // discoveryProvider: pool lookups are bursty (many reads per pair), so
-      // they go to the paid node; the steady 5 s price refresh stays fast.
-      { maxPairs: 60, rediscoverMs: 10 * 60_000, refreshMs: 5_000, discoveryProvider: robinhoodHeavyProvider,
+      // discoveryProvider: pool lookups now take 2 bundled requests per pair
+      // (multicall), so they run on the free node (with its backup) instead
+      // of draining the paid node's monthly allowance.
+      // rediscoverMs 60 min (was 10): a pair's pool list rarely changes, and
+      // re-asking every 10 min for 60 pairs was a steady drain.
+      { maxPairs: 60, rediscoverMs: 60 * 60_000, refreshMs: 5_000, discoveryProvider: robinhoodReadProvider,
         onRefreshed: () => requestGapScan() });
+// Restore the last watch list (saved every 10 min and at shutdown) so a
+// restart doesn't re-discover every pair in one burst.
+const WATCH_FILE = 'data/watched-pools.json';
+{
+      const restored = robinhoodWatcher.load(WATCH_FILE);
+      if (restored) console.log(`[pairs] robinhood: restored ${restored} watched pairs from the last run`);
+}
+setInterval(() => robinhoodWatcher.save(WATCH_FILE), 10 * 60_000);
 
 // Re-read a pool's live price right before using it (skips pools we can't
 // refresh this way: Uniswap V4, order books, bin pools). Never waits more
@@ -555,6 +592,8 @@ setInterval(() => dryRunPnl.save(), 60_000);
 for (const sig of ['SIGINT', 'SIGTERM'] as const) {
       process.once(sig, () => {
             try { dryRunPnl.save(); } catch { /* best effort */ }
+            try { robinhoodWatcher.save(WATCH_FILE); } catch { /* best effort */ }
+            try { saveNodeUsage(); } catch { /* best effort */ }
             console.log(`[shutdown] ${sig}: state saved, exiting`);
             process.exit(0);
       });
@@ -704,6 +743,42 @@ const refreshNow = async (p: any, preTrade = false): Promise<any> => {
       }
       return p;
 };
+// Robinhood: the traded pool and ALL its partner pools that need a fresh
+// price are re-read in ONE bundled request (multicall) instead of 2 requests
+// per pool. Same freshness rules as priceAtDecision; counts as one re-read
+// against the per-second cap. Falls back to the cached copies if the bundle
+// fails or is slower than REFRESH_TIMEOUT_MS.
+let rhDecisionCallMany: ((calls: { target: string; data: string }[]) => Promise<(string | null)[]>) | null = null;
+const pricesAtDecisionRobinhood = async (traded: PoolState, peers: PoolState[]): Promise<[PoolState, PoolState[]]> => {
+      const all = [traded, ...peers];
+      const stale = all.filter((p) => !(FAST_PRICES && Date.now() - p.lastUpdatedMs <= FRESH_MS)
+            && !(p.dex === 'uniswap-v4' && !p.v4) && (p.poolType === 'v2' || p.poolType === 'v3'));
+      priceStats.local += all.length - stale.length;
+      if (!stale.length) return [traded, peers];
+      const now = Date.now();
+      if (now - decisionRpcWindow.at >= 1_000) decisionRpcWindow = { at: now, n: 0 };
+      if (++decisionRpcWindow.n > MAX_DECISION_RPC_PER_SEC) { priceStats.local += stale.length; return [traded, peers]; }
+      priceStats.rpc += stale.length;
+      const readStartedMs = Date.now();
+      let fresh: PoolState[] = [];
+      try {
+            rhDecisionCallMany ??= (await makeCaller(robinhoodReadProvider)).callMany;
+            fresh = await Promise.race([
+                  refreshPoolsBatch(rhDecisionCallMany, stale),
+                  new Promise<PoolState[]>((r) => setTimeout(() => r([]), REFRESH_TIMEOUT_MS)),
+            ]);
+      } catch { fresh = []; }
+      const byAddr = new Map(fresh.map((f) => [f.poolAddress.toLowerCase(), f]));
+      const pick = (p: PoolState, preTrade: boolean): PoolState => {
+            const f = byAddr.get(p.poolAddress.toLowerCase());
+            if (!f) return p;
+            if (cache.upsertIfNotNewer(f, readStartedMs)) return f;
+            // Feed has a newer copy: peers use it; the traded pool keeps the pre-trade read.
+            return preTrade ? f : (cache.get(p.chain, p.poolAddress) ?? f);
+      };
+      return [pick(traded, true), peers.map((p) => pick(p, false))];
+};
+
 const priceAtDecision = async (p: PoolState, preTrade = false): Promise<PoolState> => {
       if (FAST_PRICES && p.chain === 'robinhood' && Date.now() - p.lastUpdatedMs <= FRESH_MS) { priceStats.local++; return p; }
       const now = Date.now();
@@ -855,7 +930,9 @@ if (registerIfApproved('avalanche', entry.dex, resolved)) pool = resolved;
     if (cachedPeers.length === 0) return;
     // Fast path: use our own up-to-date copy when it's recent (kept current by
     // instant price tracking + the 5s re-sync); only ask the RPC when stale.
-    const [freshPool, ...peers] = await Promise.all([priceAtDecision(pool, true), ...cachedPeers.map((p) => priceAtDecision(p))]);
+    const [freshPool, ...peers] = swap.chain === 'robinhood'
+          ? await pricesAtDecisionRobinhood(pool, cachedPeers).then(([t, ps]) => [t, ...ps])
+          : await Promise.all([priceAtDecision(pool, true), ...cachedPeers.map((p) => priceAtDecision(p))]);
     pool = freshPool;
 
       // Record this real, genuine match for the hourly proof-of-activity
@@ -1541,6 +1618,7 @@ for (let i = 0; i < resolved.length; i++) {
                               },
                               reactionMs: { typical: stats.medianReactionMs, slowest5pct: stats.p95ReactionMs },
                               otherBots: { timed: rv.found, theirMs: rv.theirMedianMs, oursMs: rv.ourMedianMs, weBeat: rv.beatCount },
+                              nodeUsage: nodeUsageToday(),
                               topDifferences: [...(rh?.spreads ?? [])].sort((a, b) => b.spreadPct - a.spreadPct)
                                     .map((d) => ({ pair: d.pair, pct: d.spreadPct, buyAt: d.buyDex, sellAt: d.sellDex })),
                         }));

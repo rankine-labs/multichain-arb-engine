@@ -1,4 +1,7 @@
+import { readFileSync, writeFileSync, mkdirSync, renameSync } from 'fs';
+import { dirname } from 'path';
 import { endpointLabel, isPublicEndpoint } from '../core/endpointLabel';
+import { budgetForUrl } from '../core/nodeBudget';
 import { ethers } from 'ethers';
 import { ARB_EXECUTOR_RUNTIME_CODE, EXECUTOR_STORAGE_SLOT, FLASH_POOLS_STORAGE_SLOT, V4_POOL_MANAGER_STORAGE_SLOT, WETH_STORAGE_SLOT } from './arbExecutorBytecode';
 import { ExecutorHop, encodeExecuteRaw, encodeExecuteV3FlashRaw, KIND_V4 } from './executorCalldata';
@@ -66,7 +69,12 @@ export type Rpc = (method: string, params: unknown[]) => Promise<{ result?: any;
 
 export function makeRpc(url: string, timeoutMs = 8_000): Rpc {
   let id = 0;
+  const budget = budgetForUrl(url); // speed limit + daily allowance (core/nodeBudget.ts)
   return async (method, params) => {
+    if (budget) {
+      try { await budget.take(1); }
+      catch (e) { return { error: { code: 429, message: (e as Error).message } }; } // treated as "slow down"
+    }
     const ctrl = new AbortController();
     const t = setTimeout(() => ctrl.abort(), timeoutMs);
     try {
@@ -133,46 +141,94 @@ function overridesUnsupported(err: { code?: number; message?: string } | undefin
 type SlotInfo = { key: (holder: string) => string } | { unsupported: string } | null;
 // Thrown inside slot probing so a rate-limited probe isn't cached as "not found".
 class RateLimited extends Error {}
-// Found slots are cached for good; "not found" only for an hour, so a
-// one-off bad probe can't switch a token off forever.
+// Found slots are cached for good AND saved to disk (data/balance-slots.json)
+// so a restart doesn't look them up again; "not found" only for an hour, so
+// a one-off bad probe can't switch a token off forever.
+type SlotSpec = { layout: 'solidity' | 'vyper'; slot: number };
 const slotCache = new Map<string, { info: SlotInfo; at: number }>();
-const NOT_FOUND_TTL_MS = 60 * 60_000;
+const NOT_FOUND_TTL_MS = 24 * 60 * 60_000; // misses retried daily (each costs up to ~60 requests)
 const MAX_SLOT = 60;
+let slotFile: string | null = null;
+const savedSpecs: Record<string, SlotSpec> = {};
 
 // Storage key for balances[holder] at mapping slot `slot`.
 function solidityKey(holder: string, slot: number) { return ethers.keccak256(abi.encode(['address', 'uint256'], [holder, slot])); }
 function vyperKey(holder: string, slot: number) { return ethers.keccak256(abi.encode(['uint256', 'address'], [slot, holder])); }
+const keyFnFor = (s: SlotSpec) => (h: string) => (s.layout === 'solidity' ? solidityKey(h, s.slot) : vyperKey(h, s.slot));
 
+// Load saved slots (call once at startup). Missing/bad file = start empty.
+export function loadBalanceSlots(file: string) {
+  slotFile = file;
+  try {
+    const j = JSON.parse(readFileSync(file, 'utf8')) as Record<string, SlotSpec>;
+    for (const [k, v] of Object.entries(j)) {
+      if ((v?.layout === 'solidity' || v?.layout === 'vyper') && Number.isInteger(v.slot)) {
+        savedSpecs[k] = v;
+        slotCache.set(k, { info: { key: keyFnFor(v) }, at: Date.now() });
+      }
+    }
+  } catch { /* none yet */ }
+}
+function saveSlot(cacheKey: string, spec: SlotSpec) {
+  savedSpecs[cacheKey] = spec;
+  if (!slotFile) return;
+  try {
+    mkdirSync(dirname(slotFile), { recursive: true });
+    writeFileSync(slotFile + '.tmp', JSON.stringify(savedSpecs));
+    renameSync(slotFile + '.tmp', slotFile);
+  } catch { /* best effort */ }
+}
+
+// ONE request finds the slot: every candidate location (slots 0-60, both
+// Solidity and Vyper layouts = 122 keys) is overridden at once with its own
+// marker value, then balanceOf is called. The value that comes back says
+// which location the token reads. A second request confirms it. Was up to
+// 122 separate requests per token (the biggest Alchemy drain).
 export async function findBalanceSlot(rpc: Rpc, cacheKey: string, token: string): Promise<SlotInfo> {
   const hit = slotCache.get(cacheKey);
   if (hit && (hit.info !== null || Date.now() - hit.at < NOT_FOUND_TTL_MS)) return hit.info;
-  const magic = 0x1234567890abcdefn;
   const data = BALANCE_OF.encodeFunctionData('balanceOf', [SIM_EXECUTOR_ADDRESS]);
+  const BASE = 0x1234567890abcdef0000n; // marker i = BASE + i (never a real balance)
 
-  const tryKey = async (keyFn: (h: string) => string): Promise<boolean | 'unsupported'> => {
-    const r = await rpc('eth_call', [
-      { to: token, data }, 'latest',
-      { [token]: { stateDiff: { [keyFn(SIM_EXECUTOR_ADDRESS)]: pad32(magic) } } },
-    ]);
+  const call = async (stateDiff: Record<string, string>) => {
+    const r = await rpc('eth_call', [{ to: token, data }, 'latest', { [token]: { stateDiff } }]);
     if (r.error) {
-      // Rate limits AND network trouble (timeouts, resets, bad gateway pages)
-      // are transient: abort the probe instead of counting it as "not this
-      // slot". Otherwise one blip cached "no slot found" and switched
-      // simulations off (audit fix, Oct 2026).
+      // Rate limits and network trouble are transient: don't cache "not found".
       if (isRateLimited(r.error) || (r.error.message ?? '').startsWith('network:')) throw new RateLimited(r.error.message ?? 'rate limited');
-      return overridesUnsupported(r.error) ? 'unsupported' : false;
+      return overridesUnsupported(r.error) ? 'unsupported' as const : null;
     }
-    try { return BigInt(r.result) === magic; } catch { return false; }
+    try { return BigInt(r.result); } catch { return null; }
   };
 
+  const specs: SlotSpec[] = [];
+  for (let slot = 0; slot <= MAX_SLOT; slot++) specs.push({ layout: 'solidity', slot }, { layout: 'vyper', slot });
+  const diff: Record<string, string> = {};
+  specs.forEach((sp, i) => { diff[keyFnFor(sp)(SIM_EXECUTOR_ADDRESS)] = pad32(BASE + BigInt(i)); });
+
+  // 1) Everything at once (works for most tokens: 2 requests total).
+  // 2) If that misses (the token also reads another per-account setting,
+  //    e.g. a "frozen" flag, which the all-at-once override switches on),
+  //    check locations one at a time, slots 0-30. That's a one-time cost
+  //    per token: found answers are saved to disk for good, misses are
+  //    remembered for 24 h.
   let found: SlotInfo = null;
-  outer:
-  for (let slot = 0; slot <= MAX_SLOT; slot++) {
-    for (const keyFn of [(h: string) => solidityKey(h, slot), (h: string) => vyperKey(h, slot)]) {
-      const ok = await tryKey(keyFn);
-      if (ok === 'unsupported') { found = { unsupported: 'RPC does not support eth_call state overrides' }; break outer; }
-      if (ok) { found = { key: keyFn }; break outer; }
+  let spec: SlotSpec | null = null;
+  const got = await call(diff);
+  if (got === 'unsupported') found = { unsupported: 'RPC does not support eth_call state overrides' };
+  else if (got !== null && got >= BASE && got < BASE + BigInt(specs.length)) spec = specs[Number(got - BASE)];
+  else {
+    const magic1 = 0x1234567890abcdefn;
+    for (const sp of specs.filter((x) => x.slot <= 30)) {
+      const r = await call({ [keyFnFor(sp)(SIM_EXECUTOR_ADDRESS)]: pad32(magic1) });
+      if (r === 'unsupported') { found = { unsupported: 'RPC does not support eth_call state overrides' }; break; }
+      if (r === magic1) { spec = sp; break; }
     }
+  }
+  if (spec) {
+    // Confirm with that one key alone (guards against odd tokens).
+    const magic = 0x1234567890abcdefn;
+    const check = await call({ [keyFnFor(spec)(SIM_EXECUTOR_ADDRESS)]: pad32(magic) });
+    if (check === magic) { found = { key: keyFnFor(spec) }; saveSlot(cacheKey, spec); }
   }
   slotCache.set(cacheKey, { info: found, at: Date.now() });
   return found;
