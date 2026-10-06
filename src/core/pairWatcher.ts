@@ -146,7 +146,12 @@ export class PairWatcher {
   private singlePool = new Map<string, number>();  // pair -> when it was found to have one pool
   private readonly maxQueue: number;
   private readonly singlePoolRecheckMs: number;
-  private tokenMeta = new Map<string, TokenMeta | null>();
+  // Token symbol/decimals. Successes are kept for good; a token that is
+  // definitely not a standard ERC-20 (call reverted / bad data) is skipped
+  // for an hour. Network errors and rate limits are NOT remembered, so one
+  // 429 at startup can't blacklist WETH/USDG for the life of the process.
+  private tokenMeta = new Map<string, TokenMeta>();
+  private badToken = new Map<string, number>(); // token -> when it failed
   private readonly maxPairs: number;
   private readonly rediscoverMs: number;
   private readonly refreshMs: number;
@@ -170,7 +175,9 @@ export class PairWatcher {
     this.rediscoverMs = opts.rediscoverMs ?? 10 * 60_000;
     this.refreshMs = opts.refreshMs ?? 30_000;
     this.maxQueue = opts.maxQueue ?? 20;
-    this.singlePoolRecheckMs = opts.singlePoolRecheckMs ?? 60 * 60_000;
+    // 15 min (was 1 h): a rate-limited read during discovery looks like a
+    // missing pool, so a real 2-pool pair could be ignored for an hour.
+    this.singlePoolRecheckMs = opts.singlePoolRecheckMs ?? 15 * 60_000;
   }
 
   private key(a: string, b: string) {
@@ -245,19 +252,30 @@ export class PairWatcher {
     this.evictIfNeeded();
   }
 
-  // Symbol + decimals straight from the token contract (cached; null = unreadable).
+  // Symbol + decimals straight from the token contract (null = unreadable now).
   private async meta(token: string): Promise<TokenMeta | null> {
     const t = token.toLowerCase();
-    if (this.tokenMeta.has(t)) return this.tokenMeta.get(t)!;
-    let m: TokenMeta | null = null;
+    const known = this.tokenMeta.get(t);
+    if (known) return known;
+    const failedAt = this.badToken.get(t);
+    if (failedAt !== undefined && Date.now() - failedAt < 60 * 60_000) return null;
     try {
       const c = new ethers.Contract(token, ERC20_META, this.discoveryProvider);
       const [symbol, decimals] = await Promise.all([c.symbol(), c.decimals()]);
-      m = { symbol: String(symbol), decimals: Number(decimals) };
+      const m = { symbol: String(symbol), decimals: Number(decimals) };
+      this.tokenMeta.set(t, m);
+      this.badToken.delete(t);
       this.onToken(t, m);
-    } catch { /* not a standard token; skip pairs that use it */ }
-    this.tokenMeta.set(t, m);
-    return m;
+      return m;
+    } catch (err) {
+      // Only a definite answer ("this contract can't do that") is remembered.
+      const code = (err as { code?: string }).code;
+      if (code === 'CALL_EXCEPTION' || code === 'BAD_DATA') {
+        this.badToken.set(t, Date.now());
+        if (this.badToken.size > 5_000) this.badToken.clear(); // bound memory
+      }
+      return null;
+    }
   }
 
   private evictIfNeeded() {

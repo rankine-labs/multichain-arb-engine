@@ -2,7 +2,8 @@
 pragma solidity 0.8.26;
 
 // ============================================================================
-// DEPLOY ArbExecutor (run from your COLD wallet; it becomes the owner forever)
+// DEPLOY ArbExecutor (run from your COLD wallet; it becomes the owner. Ownership
+// can later move only in two steps: transferOwnership + acceptOwnership)
 //
 //   cd contracts
 //   EXECUTOR=0xYourBotHotWallet \

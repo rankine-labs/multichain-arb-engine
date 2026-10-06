@@ -8,8 +8,11 @@ itself to live: live sending needs four settings that only you add to `.env`.
 - [ ] **Outside review of the contract** (`contracts/src/ArbExecutor.sol`). Someone
       independent should read it before real money touches it.
 - [ ] **Cold wallet** (Ledger or Trezor). It deploys the contract and becomes the
-      owner forever: it alone can withdraw profits, change the bot wallet, and
-      approve loan pools.
+      owner: it alone can withdraw profits (tokens and ETH), change the bot wallet,
+      and approve loan pools. Ownership can only move in two steps
+      (`transferOwnership`, then `acceptOwnership` from the new wallet).
+- [ ] **ArbSys check on the live chain**: run the GitHub "Live probe" workflow with
+      `only=arbsys`. It must say "ArbSys deadline check works" (it did on Oct 5, 2026).
 - [ ] **New hot wallet for the bot** (a fresh key, used for nothing else). It only
       pays gas. Trades use flash loans, so it never holds trading money.
 - [ ] Rival timing in the hourly reports looks competitive ("rivals X ms vs ours Y ms").
@@ -84,7 +87,17 @@ pm2 restart dex-arb-shadow --update-env
 
 ```
 [fire] robinhood sender ready (LIVE from 0xYourBotHotWallet)
+[fire] live checks passed: chain, executor role, lenders, ArbSys deadline
 ```
+
+If you see **LIVE CHECKS FAILED** instead (also sent to Telegram), every send is
+blocked until it's fixed. It names the problem: wrong chain, contract not found,
+the contract's executor isn't this bot wallet (`setExecutor`), or a pool in
+`FLASH_LENDERS_ROBINHOOD` isn't approved on the contract (`setFlashPool`). It
+re-checks every 5 minutes.
+
+If you see **BAD SETTING(S)** in the log, a limit in `.env` isn't a plain number
+(e.g. `5,000`). All sends are blocked until it's fixed.
 
 Every live trade then posts to Telegram: TRADE WON (profit, gas) or
 TRADE REVERTED (lost the race; gas only).
@@ -109,7 +122,10 @@ To turn live mode off completely, set `EXECUTION_ENABLED=false` in `.env`, then
 | Max sends per minute | 6 | `MAX_SENDS_PER_MIN` |
 | Only vetted tokens (the watched top pairs) | on | - |
 | Only approved loan pools | on | `FLASH_LENDERS_ROBINHOOD` |
-| Trade deadline | latest block + 3 (~0.3 s) | - |
+| Trade deadline | estimated current block + 3 s of blocks | `MAX_BLOCK_MARGIN_MS` (or `MAX_BLOCK_MARGIN` in blocks) |
+| Live readiness checks must pass (chain, executor role, lenders, ArbSys) | on | - |
+| Mistyped limit blocks all sends (fails closed) | on | - |
+| Kill switch | off | `KILL_SWITCH=on` (or `true`/`1`/`yes`), or the `data/KILL` file |
 | Contract reverts unless the trade ends in profit | always | - |
 
 ## Taking profits out (cold wallet)
@@ -118,6 +134,13 @@ Profits stay in the contract. The owner withdraws:
 
 ```bash
 cast send 0xContract "withdraw(address,address,uint256)" 0xToken 0xYourColdWallet AMOUNT \
+  --rpc-url https://rpc.mainnet.chain.robinhood.com --ledger --from 0xYourColdWallet
+```
+
+Native ETH stuck in the contract (it never holds ETH in normal trading):
+
+```bash
+cast send 0xContract "withdrawEth(address,uint256)" 0xYourColdWallet AMOUNT_WEI \
   --rpc-url https://rpc.mainnet.chain.robinhood.com --ledger --from 0xYourColdWallet
 ```
 
