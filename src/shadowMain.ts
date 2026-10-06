@@ -301,6 +301,13 @@ const simBusy: Record<string, boolean> = {};          // one simulation in fligh
 // Token-specific problems ("no balance slot found") never switch off the
 // whole chain; the simulator retries that token on its own after an hour.
 const simDisabled: Record<string, { reason: string; until: number }> = {};
+// Pool pairs whose last trigger test lost or failed: not re-tested for 5 min.
+const simLoserMuted = new Map<string, number>();
+const SIM_LOSER_MUTE_MS = 5 * 60_000;
+const muteLoser = (key: string) => {
+      simLoserMuted.set(key, Date.now() + SIM_LOSER_MUTE_MS);
+      if (simLoserMuted.size > 2_000) for (const [k, t] of simLoserMuted) if (t < Date.now()) simLoserMuted.delete(k);
+};
 const SIM_DISABLE_MS = 30 * 60_000;
 const simOff = (chain: string): string | undefined => {
       const d = simDisabled[chain];
@@ -310,6 +317,13 @@ const simOff = (chain: string): string | undefined => {
 };
 // Reported in the hourly digest, then reset.
 const simStats = { checked: 0, profit: 0, loss: 0, fail: 0, rateLimited: 0 };
+// A real arb between two pools nets a few % of the trade at most. A
+// simulated profit above this share of the amount put in (measured in
+// TOKENS, so a bad USD price can't hide it) means the token or pool data is
+// broken (fake balances, rebasing/honeypot token, dead pool): not real.
+const MAX_PLAUSIBLE_PROFIT_SHARE = Number(process.env.MAX_PLAUSIBLE_PROFIT_SHARE ?? 0.25);
+const plausibleProfit = (profit: bigint, amountIn: bigint): boolean =>
+      amountIn > 0n && Number(profit) / Number(amountIn) <= MAX_PLAUSIBLE_PROFIT_SHARE;
 
 // One on-chain round-trip check, awaited by the caller (used by the
 // standing-gap scanner, where there's no race to lose by waiting ~1 s).
@@ -340,7 +354,10 @@ const checkRoundTrip = async (
       const r = await simulateRoundTrip(simRpc[chain], chain, { token: tokenIn, amountIn: built.amountIn, hops: built.hops }, { v3Lender: lender?.poolAddress, weth: chain === 'robinhood' ? ROBINHOOD_TOKENS.WETH : undefined });
       if (r.status === 'rate_limited') { simPausedUntil[chain] = Date.now() + SIM_RATE_LIMIT_PAUSE_MS; return { status: 'rate_limited' }; }
       if (r.status === 'unsupported') return { status: 'skipped', reason: r.reason };
-      if (r.status === 'profit') return { status: 'profit', usd: (Number(r.profit) / 10 ** decimals) * usdPerToken };
+      if (r.status === 'profit') {
+            if (!plausibleProfit(r.profit, built.amountIn)) return { status: 'fail', reason: 'implausible profit (bad token or pool data)' };
+            return { status: 'profit', usd: (Number(r.profit) / 10 ** decimals) * usdPerToken };
+      }
       if (r.status === 'loss') return { status: 'loss', reason: 'ends with less than it started' };
       return { status: 'fail', reason: r.reason };
 };
@@ -350,6 +367,8 @@ const queueSimulation = (
       buyPool: any, sellPool: any, tradeSizeUsd: number, modelGrossUsd: number, usdPerToken: number,
 ) => {
       if (simBusy[chain] || simOff(chain) || Date.now() < (simPausedUntil[chain] ?? 0)) return;
+      const muteKey = `${buyPool.poolAddress}>${sellPool.poolAddress}`.toLowerCase();
+      if (Date.now() < (simLoserMuted.get(muteKey) ?? 0)) return;
       const decimals = TOKEN_DECIMALS[chain]?.[tokenIn.toLowerCase()];
       if (decimals === undefined) return;
       // Flash loan: borrow from the cheapest V3 pool holding the token that
@@ -389,14 +408,20 @@ const queueSimulation = (
                         return;
                   }
                   simStats.checked++;
-                  if (r.status === 'profit') {
+                  if (r.status !== 'profit' || !plausibleProfit(r.profit, built.amountIn)) muteLoser(muteKey);
+                  if (r.status === 'profit' && !plausibleProfit(r.profit, built.amountIn)) {
+                        simStats.fail++;
+                        console.log(`[sim] ${chain} ${route} real: IMPLAUSIBLE profit (bad token or pool data), ignored | ${model}`);
+                  } else if (r.status === 'profit') {
                         simStats.profit++;
                         const usd = (Number(r.profit) / 10 ** decimals) * usdPerToken;
                         console.log(`[sim] ${chain} ${route} REAL PROFIT $${usd.toFixed(2)} after loan fee | ${model}`);
                         // A trigger trade the real-chain test confirms clears the
-                        // firing bar after gas: counts as verified would-have-earned.
+                        // firing bar after gas: counts as verified would-have-earned,
+                        // but only on vetted tokens, same as a live trade would need.
                         const net = usd - (chain === 'robinhood' ? rhGasUsd(0.05) : 0.05);
-                        if (chain === 'robinhood' && net >= MIN_COUNTED_USD) {
+                        const vetted = [buyPool.tokenA, buyPool.tokenB].every((t: string) => safetyGate.isAllowed(t));
+                        if (chain === 'robinhood' && net >= MIN_COUNTED_USD && vetted) {
                               dryRunPnl.recordVerified(net, `${symbolOf(chain, tokenIn)} ${route}`);
                         }
                   } else if (r.status === 'loss') {
@@ -465,7 +490,15 @@ const REFRESH_TIMEOUT_MS = 1_500;
 // re-read was the slowest step: tens of ms per decision). FAST_PRICES=off
 // in .env restores the old behaviour.
 const FAST_PRICES = process.env.FAST_PRICES !== 'off';
-const FRESH_MS = 20_000;
+// 35 s: longer than the watcher's 30 s re-sync, so a watched pool is always
+// "fresh" between re-syncs (feed swaps keep it current in between). At 20 s,
+// a third of every cycle sent each trade's partner pools to the public RPC,
+// which slowed that node down for us once WETH pools passed the depth filter.
+const FRESH_MS = Number(process.env.FRESH_MS ?? 35_000);
+// Cap on decision-time RPC re-reads (per second). Past it, the cached copy
+// is used: a flood of trades must not hammer the public node.
+const MAX_DECISION_RPC_PER_SEC = Number(process.env.MAX_DECISION_RPC_PER_SEC ?? 10);
+let decisionRpcWindow = { at: 0, n: 0 };
 const priceStats = { local: 0, rpc: 0 };
 const gapStats = { found: 0, bestUsd: 0, fake: 0 }; // standing gaps (no trigger trade) this hour: confirmed, best real $, fakes muted
 
@@ -637,6 +670,9 @@ const refreshNow = async (p: any, preTrade = false): Promise<any> => {
 };
 const priceAtDecision = async (p: PoolState, preTrade = false): Promise<PoolState> => {
       if (FAST_PRICES && p.chain === 'robinhood' && Date.now() - p.lastUpdatedMs <= FRESH_MS) { priceStats.local++; return p; }
+      const now = Date.now();
+      if (now - decisionRpcWindow.at >= 1_000) decisionRpcWindow = { at: now, n: 0 };
+      if (p.chain === 'robinhood' && ++decisionRpcWindow.n > MAX_DECISION_RPC_PER_SEC) { priceStats.local++; return p; }
       priceStats.rpc++;
       return refreshNow(p, preTrade);
 };
@@ -862,10 +898,14 @@ sizing, profit, event, score,
 
 const reactionMs = Date.now() - t0;
 
-// Simulate anything the model thinks is worth a look (gross > 0), whether
-// or not it clears the minimum -- that's how we learn where the model is
-// wrong in BOTH directions.
-if (sizing.grossProfitUsd > 0) {
+// Simulate what the model thinks is worth a look (gross >= SIM_MIN_GROSS_USD,
+// default $2), even below the firing minimum, so we still learn where the
+// model is wrong in both directions. Skipped: tokens live trading could never
+// use (not vetted) and pool pairs that just tested as losers (5 min). Was
+// "gross > 0 on any token": ~100 losing tests per 15 min, wasting Alchemy quota.
+const SIM_MIN_GROSS_USD = Number(process.env.SIM_MIN_GROSS_USD ?? 2);
+const simVetted = swap.chain !== 'robinhood' || (safetyGate.isAllowed(swap.tokenIn) && safetyGate.isAllowed(swap.tokenOut));
+if (sizing.grossProfitUsd >= SIM_MIN_GROSS_USD && simVetted) {
       queueSimulation(swap.chain, swap.tokenIn, buyPoolUsed, sellPoolUsed, sizing.optimalTradeSizeUsd, sizing.grossProfitUsd, usdPerToken);
 }
 
@@ -1450,6 +1490,17 @@ for (let i = 0; i < resolved.length; i++) {
             }
       };
       setInterval(sendHourlyDigest, 60 * 60 * 1000);
+      // Hourly memory housekeeping: drop cached pools that aren't in a watched
+      // pair, aren't an approved flash lender and haven't been touched for
+      // 2 h. They're re-discovered on demand if trades show up again.
+      setInterval(() => {
+            try {
+                  const keep = new Set<string>(robinhoodWatcher.watchedPairPools().flat().map((a) => a.toLowerCase()));
+                  for (const c of ['robinhood', 'monad', 'avalanche']) for (const l of approvedLenders(c)) keep.add(l);
+                  const removed = cache.prune((p) => keep.has(p.poolAddress.toLowerCase()), 2 * 3600_000);
+                  console.log(`[mem] pruned ${removed} idle pools (cache ${cache.size()}, opportunity log ${shadowLogger.size}, heap ${Math.round(process.memoryUsage().heapUsed / 1e6)} MB)`);
+            } catch (err) { console.warn('[mem] prune failed:', (err as Error).message); }
+      }, 60 * 60 * 1000);
       console.log(`[startup] fully running ${Math.round((Date.now() - BOOT_MS) / 1000)}s after start`);
 
       // Report on demand (see the SIGUSR2 handler at the top of this file).

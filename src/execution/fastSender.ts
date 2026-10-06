@@ -71,6 +71,7 @@ export class SafetyGate {
   }
 
   allowTokens(tokens: string[]) { for (const t of tokens) this.allowed.add(t.toLowerCase()); }
+  isAllowed(token: string) { return this.allowed.has(token.toLowerCase()); }
 
   private today() { return new Date(this.now()).toISOString().slice(0, 10); }
 

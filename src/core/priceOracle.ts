@@ -46,7 +46,8 @@ export type StrictDecimals = (chain: string, token: string) => number | undefine
 
 // A pool must hold at least this much USD on its anchor side to be used for
 // pricing. Below it, the pool's ratio is noise.
-const MIN_ANCHOR_USD = Number(process.env.ORACLE_MIN_ANCHOR_USD ?? 500);
+// $2,500 (was $500): thin junk pools were a likely source of absurd prices.
+const MIN_ANCHOR_USD = Number(process.env.ORACLE_MIN_ANCHOR_USD ?? 2_500);
 
 export class PriceOracle {
   private memo = new Map<string, { px: number | null; at: number }>();

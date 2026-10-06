@@ -45,3 +45,11 @@ assert(p2.summary().allTime.verifiedUsd === 80.5 && p2.summary().allTime.modelUs
 // Days older than 7 drop out of the 7-day total but stay in all-time.
 clock = Date.UTC(2026, 9, 14, 17, 0, 0);
 assert(p2.summary().last7.verifiedUsd === 0 && p2.summary().allTime.verifiedUsd === 80.5, 'old days leave the 7-day total, stay in all-time');
+
+// Junk data guard: a single "profit" above the per-trade cap is never counted.
+{
+  const p3 = new DryRunPnl(null, 'America/Toronto', () => clock);
+  p3.recordVerified(49_842_419.92, 'COCO junk');
+  p3.recordModelOnly(1e9);
+  assert(p3.summary().today.verifiedUsd === 0 && p3.summary().today.modelUsd === 0, 'absurd single-trade profits are ignored');
+}

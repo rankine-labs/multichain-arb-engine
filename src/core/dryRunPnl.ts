@@ -24,12 +24,17 @@ export interface DayTotals {
   best?: { usd: number; label: string };
 }
 
-interface State { version: 1; days: Record<string, DayTotals> }
+// version 2 (Oct 6, 2026): fresh start after junk-token profits ($49M
+// "verified") polluted version 1. Old files are ignored.
+interface State { version: 2; days: Record<string, DayTotals> }
 
 const emptyDay = (): DayTotals => ({ verifiedUsd: 0, verifiedCount: 0, modelUsd: 0, modelCount: 0 });
 
 export class DryRunPnl {
-  private state: State = { version: 1, days: {} };
+  // Last line of defence: no single arb on these pools makes more than this.
+  // Anything bigger is bad data, never counted.
+  static MAX_ONE_TRADE_USD = Number(process.env.PNL_MAX_ONE_TRADE_USD ?? 2_000);
+  private state: State = { version: 2, days: {} };
   private dirty = false;
 
   constructor(
@@ -40,7 +45,7 @@ export class DryRunPnl {
     if (file) {
       try {
         const s = JSON.parse(readFileSync(file, 'utf8'));
-        if (s?.version === 1 && s.days && typeof s.days === 'object') this.state = s;
+        if (s?.version === 2 && s.days && typeof s.days === 'object') this.state = s;
       } catch { /* no file yet: start at zero */ }
     }
   }
@@ -57,7 +62,7 @@ export class DryRunPnl {
 
   // Profit confirmed by a real-chain test (already net of gas). Ignores junk values.
   recordVerified(usd: number, label: string) {
-    if (!(usd > 0) || !Number.isFinite(usd)) return;
+    if (!(usd > 0) || !Number.isFinite(usd) || usd > DryRunPnl.MAX_ONE_TRADE_USD) return;
     const d = this.today();
     d.verifiedUsd += usd;
     d.verifiedCount++;
@@ -67,7 +72,7 @@ export class DryRunPnl {
 
   // Would have fired from the model alone (not confirmed by a test).
   recordModelOnly(usd: number) {
-    if (!(usd > 0) || !Number.isFinite(usd)) return;
+    if (!(usd > 0) || !Number.isFinite(usd) || usd > DryRunPnl.MAX_ONE_TRADE_USD) return;
     const d = this.today();
     d.modelUsd += usd;
     d.modelCount++;

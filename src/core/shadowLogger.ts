@@ -32,10 +32,27 @@ notes?: string;
 
 export class ShadowLogger {
 private records: ShadowRecord[] = [];
+// Memory: records are kept ~26 h (enough for the hourly and daily reports)
+// and capped in number, and the raw trigger transaction is dropped (it was
+// the bulk of each record). Before this, every record lived forever and
+// memory crept up ~10 MB an hour.
+static KEEP_MS = 26 * 3600_000;
+static MAX_RECORDS = 50_000;
 
-record(entry: ShadowRecord) {
+record(entry: ShadowRecord, now = Date.now()) {
+const ev = entry.opportunity.triggeringEvent as any;
+if (ev && ev.raw !== undefined) entry.opportunity = { ...entry.opportunity, triggeringEvent: { ...ev, raw: undefined } };
 this.records.push(entry);
+// Prune occasionally (cheap): oldest first, by age then by count.
+if (this.records.length % 500 === 0 || this.records.length > ShadowLogger.MAX_RECORDS) {
+const cutoff = now - ShadowLogger.KEEP_MS;
+let drop = 0;
+while (drop < this.records.length && this.records[drop].opportunity.scoredAtMs < cutoff) drop++;
+drop = Math.max(drop, this.records.length - ShadowLogger.MAX_RECORDS);
+if (drop > 0) this.records.splice(0, drop);
 }
+}
+get size() { return this.records.length; }
 
 // Call this after checking the actual chain state post-opportunity
 resolve(opportunityId: string, outcome: ShadowOutcome, competitorLandedAtMs?: number, competitorTxHash?: string) {
