@@ -29,7 +29,10 @@ const ARB_BLOCK = new ethers.Interface(['function arbBlockNumber() view returns 
 export async function checkArbSys(provider: ethers.JsonRpcProvider): Promise<{ ok: boolean; arbBlock?: bigint; rpcBlock?: number; error?: string }> {
   try {
     const [ret, rpcBlock] = await Promise.all([
-      provider.call({ to: ARBSYS, data: ARB_BLOCK.encodeFunctionData('arbBlockNumber'), gasLimit: 20_000n }),
+      // Gas: 21,000 base cost of any transaction + calldata + the contract's
+      // 20,000 cap for this call. (A plain 20,000 limit is below the base cost
+      // and fails before ArbSys is even reached.)
+      provider.call({ to: ARBSYS, data: ARB_BLOCK.encodeFunctionData('arbBlockNumber'), gasLimit: 21_000n + 100n + 20_000n }),
       provider.getBlockNumber(),
     ]);
     const [arbBlock] = ARB_BLOCK.decodeFunctionResult('arbBlockNumber', ret);
