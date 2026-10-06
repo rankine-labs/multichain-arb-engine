@@ -260,6 +260,126 @@ export function formatHourlyDigest(input: {
 }
 
 // ----------------------------------------------------------------------------
+// PLAIN-ENGLISH HOURLY REPORT (Robinhood)
+//
+// Written for the owner to read on a phone, not for developers:
+//   - every number has a plain label (no "p95", "spread", "pools")
+//   - ✅ / ⚠️ / ❌ show good or bad at a glance
+//   - "Needs attention" lists only things worth acting on, in plain sentences
+// Names used: price differences (not gaps/spreads), trading spots (pools),
+// checked (real-chain test), reaction time (trade seen -> decision).
+// ----------------------------------------------------------------------------
+
+export interface PlainHourlyInput {
+  windowLabel: string;                 // "13:06 to 13:56"
+  live: boolean;                       // real trades on?
+  feedOk: boolean;                     // live trade feed connected now
+  feedReconnects: number;              // times it dropped this hour
+  pairs: number;                       // token pairs watched
+  spots: number;                       // trading spots (pools)
+  pricesFrom: 'free' | 'backup';       // where prices come from right now
+  freeNodeBusy: number;                // times the free node had to rest (since start)
+  differencesFound: number;            // price differences scored this hour
+  checks: { done: number; makeMoney: number; loseMoney: number; wouldFail: number; nodeBusy: number };
+  checksAvailable: boolean;            // false = no node can run checks right now
+  earned: { todayChecked: number; todayCheckedCount: number; todayUnchecked: number; todayUncheckedCount: number; weekChecked: number };
+  reactionMs: { typical: number | null; slowest5pct: number | null };
+  otherBots?: { timed: number; theirMs: number | null; oursMs: number | null; weBeat: number };
+  topDifferences: { pair: string; pct: number; buyAt: string; sellAt: string }[];
+}
+
+// "uniswap-v3 1%" -> "Uniswap V3 (1% fee)"; "uniswap-v4 0.3% ETH" -> "Uniswap V4 (0.3% fee, ETH)".
+const DEX_NAMES: Record<string, string> = {
+  'uniswap-v2': 'Uniswap V2', 'uniswap-v3': 'Uniswap V3', 'uniswap-v4': 'Uniswap V4',
+  'pancakeswap-v2': 'PancakeSwap V2', 'pancakeswap-v3': 'PancakeSwap V3',
+  'ramses-v2': 'Ramses V2', 'ramses-v3': 'Ramses V3',
+};
+export function plainSpot(label: string): string {
+  const [dex, ...rest] = label.trim().split(/\s+/);
+  const name = DEX_NAMES[dex] ?? dex;
+  const fee = rest.find((r) => r.endsWith('%'));
+  const extra = rest.filter((r) => !r.endsWith('%'));
+  const bits = [fee ? `${fee} fee` : '', ...extra].filter(Boolean);
+  return bits.length ? `${name} (${bits.join(', ')})` : name;
+}
+
+const secs = (ms: number): string => (ms < 1000 ? `${(ms / 1000).toFixed(2)} s` : `${(ms / 1000).toFixed(1)} s`);
+const money = (n: number): string => `$${n.toFixed(2)}`;
+const REACTION_TARGET_MS = 100;
+
+export function formatPlainHourly(r: PlainHourlyInput): string {
+  const attention: string[] = [];
+  const L: string[] = [];
+
+  L.push(`🤖 <b>ROBINHOOD</b> · last hour (${esc(r.windowLabel)})`);
+  L.push(`Mode: ${r.live ? '<b>LIVE (real money)</b>' : 'practice run (no real trades)'}`);
+  L.push(`Live trade feed: ${r.feedOk ? '✅ connected' : '❌ disconnected'}${r.feedReconnects ? ` (dropped ${r.feedReconnects}x, reconnected)` : ''}`);
+  if (!r.feedOk) attention.push('The live trade feed is down. The bot is retrying on its own; tell me if this repeats.');
+  L.push(`Watching: ${r.pairs} token pairs across ${r.spots} trading spots`);
+  L.push(`Getting prices from: ${r.pricesFrom === 'free' ? 'Robinhood (free) ✅' : 'backup node ⚠️ (Robinhood free node was busy)'}`);
+  if (r.pricesFrom !== 'free') attention.push('Prices are coming from the backup right now because the free Robinhood node asked us to slow down.');
+  L.push('');
+
+  L.push(`<b>Price differences found:</b> ${r.differencesFound}`);
+  if (!r.checksAvailable && r.checks.done === 0) {
+    L.push('Checked (real test): ❌ none, checking is off');
+    attention.push('Checks are off: no node can run them. Adding the QuickNode key turns them back on.');
+  } else {
+    L.push(`Checked (real test): ${r.checks.done}`);
+    L.push(`  ✅ would make money: ${r.checks.makeMoney}`);
+    L.push(`  ➖ would lose money: ${r.checks.loseMoney}`);
+    L.push(`  ✖️ wouldn't go through: ${r.checks.wouldFail}`);
+    if (r.checks.nodeBusy) L.push(`  (checking node said "slow down" ${r.checks.nodeBusy}x, checks paused briefly)`);
+  }
+  L.push('');
+
+  L.push('<b>Money we\'d have made</b> (if we won every race)');
+  L.push(`Today, checked: ${money(r.earned.todayChecked)} from ${r.earned.todayCheckedCount} trade${r.earned.todayCheckedCount === 1 ? '' : 's'}`);
+  if (r.earned.todayUncheckedCount) L.push(`Looks good but not checked yet: ${money(r.earned.todayUnchecked)} from ${r.earned.todayUncheckedCount} (not trustworthy)`);
+  L.push(`Last 7 days, checked: ${money(r.earned.weekChecked)}`);
+  L.push('');
+
+  const t = r.reactionMs;
+  if (t.typical !== null) {
+    const ok = t.typical <= REACTION_TARGET_MS;
+    L.push(`<b>Reaction time</b> (trade seen → decision): usually ${secs(t.typical)}${t.slowest5pct !== null ? `, slowest ones ${secs(t.slowest5pct)}+` : ''}. Target: under ${secs(REACTION_TARGET_MS)} ${ok ? '✅' : '❌'}`);
+    if (!ok && t.typical > 1_000) attention.push(`Reaction time is slow (usually ${secs(t.typical)}). Other bots would beat us to most trades.`);
+  }
+  if (r.otherBots && r.otherBots.timed > 0) {
+    const o = r.otherBots;
+    L.push(`Other bots timed: ${o.timed}${o.theirMs !== null && o.oursMs !== null ? `. Them ${secs(o.theirMs)}, us ${secs(o.oursMs)}` : ''}${o.weBeat ? `, we'd have been first ${o.weBeat}x` : ''}`);
+  }
+  L.push('');
+
+  if (r.topDifferences.length) {
+    L.push('<b>Biggest price differences</b> (before fees, not profit)');
+    for (const d of r.topDifferences.slice(0, 5)) {
+      L.push(`• ${esc(d.pair)} ${d.pct.toFixed(1)}%: buy on ${esc(plainSpot(d.buyAt))}, sell on ${esc(plainSpot(d.sellAt))}`);
+    }
+    L.push('');
+  }
+
+  L.push(attention.length ? `⚠️ <b>Needs attention</b>\n${attention.map((a) => '• ' + esc(a)).join('\n')}` : '✅ Nothing needs your attention.');
+  return L.join('\n');
+}
+
+export function formatPlainDaily(input: {
+  dateLabel: string;
+  differencesFound: number;
+  earnedChecked: number; earnedCheckedCount: number;
+  weekChecked: number;
+  feedUptimePct: number | null;
+}): string {
+  return [
+    `📅 <b>DAILY SUMMARY</b> · ${esc(input.dateLabel)}`,
+    `Price differences found: ${input.differencesFound}`,
+    `Money we'd have made today so far (checked): ${money(input.earnedChecked)} from ${input.earnedCheckedCount} trade${input.earnedCheckedCount === 1 ? '' : 's'}`,
+    `Last 7 days (checked): ${money(input.weekChecked)}`,
+    ...(input.feedUptimePct !== null ? [`Live trade feed up: ${input.feedUptimePct.toFixed(1)}% of the day ${input.feedUptimePct >= 99 ? '✅' : '⚠️'}`] : []),
+  ].join('\n');
+}
+
+// ----------------------------------------------------------------------------
 // Daily report
 // ----------------------------------------------------------------------------
 
