@@ -154,8 +154,13 @@ const priceOracle = new PriceOracle(cache, (chain, token) => {
       // (Alchemy) first, with the public node as ITS fallback: when Alchemy
       // refuses (rate limit / plan limit), discovery used to stall completely
       // (watch list stuck at 0). No slow retries on Alchemy: fail fast, switch.
+      // The chain-wide scan runs on Alchemy ONLY (no fallback): when Alchemy
+      // was out, the scan fell back to the free node and flooded it (thousands
+      // of reads), which got price reads moved off it. While Alchemy is out
+      // the scan just pauses; the saved pair list + live-trade discovery
+      // cover it meanwhile.
       const robinhoodHeavyProvider = rhHeavyUrl
-            ? new FailoverJsonRpcProvider(rhHeavyUrl, rhFastUrl, 4663, { logTag: 'rpc:heavy', fastTimeoutMs: 10_000, slowMs: 2_000 })
+            ? new FailoverJsonRpcProvider(rhHeavyUrl, null, 4663, { logTag: 'rpc:heavy', fastTimeoutMs: 10_000, slowMs: 2_000 })
             : robinhoodReadProvider;
 
       // Decoder gets the pool cache so it can decode Monad Swap logs (a log
@@ -1326,11 +1331,10 @@ await chainManager.startAll();
                   // on the fast node before waiting 15 min. Progress is saved
                   // per factory, so a second attempt repeats nothing.
                   const scanOpts = { usdToken: ROBINHOOD_TOKENS.USDG, wrappedNative: ROBINHOOD_TOKENS.WETH, minPoolUsd: SCAN_MIN_USD };
-                  let res = await scanUniverse(robinhoodHeavyProvider, ROBINHOOD_SCAN_FACTORIES, scanOpts, scanState);
-                  if (robinhoodHeavyProvider !== robinhoodReadProvider && res.errors.length && !res.candidates.length) {
-                        console.warn(`[scan] paid node scan failed (${res.errors.join('; ').slice(0, 150)}), retrying on the fast node`);
-                        res = await scanUniverse(robinhoodReadProvider, ROBINHOOD_SCAN_FACTORIES, scanOpts, scanState);
-                  }
+                  const res = await scanUniverse(robinhoodHeavyProvider, ROBINHOOD_SCAN_FACTORIES, scanOpts, scanState);
+                  // No fallback to the free node: the scan is thousands of reads and
+                  // would flood it (see robinhoodHeavyProvider).
+                  if (res.errors.length && !res.candidates.length) throw new Error(`paid node scan failed: ${res.errors.join('; ').slice(0, 150)}`);
                   saveScanState(scanState);
                   const top = res.candidates.slice(0, SCAN_TOP);
                   // Only replace the saved start list with a real result.
@@ -1348,8 +1352,13 @@ await chainManager.startAll();
             } catch (err) {
                   // Usually the free public RPC rate-limiting us. Don't wait the
                   // full 6 hours: try again in 15 minutes.
-                  console.warn('[scan] robinhood scan failed, retrying in 15 min:', String((err as Error).message).slice(0, 200));
-                  setTimeout(() => { void runRobinhoodScan(); }, 15 * 60_000);
+                  // Paid node out of allowance / rate limited: wait 6 h, not 15 min
+                  // (each retry would just fail again). Other errors: 15 min.
+                  const msg = String((err as Error).message);
+                  const outOfCredit = /429|allowance|rate limit|exceeded|too many/i.test(msg);
+                  const retryMin = outOfCredit ? 360 : 15;
+                  console.warn(`[scan] robinhood scan failed, retrying in ${retryMin} min:`, msg.slice(0, 200));
+                  setTimeout(() => { void runRobinhoodScan(); }, retryMin * 60_000);
             } finally {
                   scanRunning = false;
             }

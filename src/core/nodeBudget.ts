@@ -28,8 +28,11 @@ import { dirname } from 'path';
 // ============================================================================
 
 export class BudgetExceeded extends Error {
-  // "429" in the text makes every caller treat it like a rate limit.
-  constructor(node: string, why: string) { super(`${node} ${why} (429)`); }
+  // Daily allowance used up: "429" in the text makes callers treat it like a
+  // rate limit (rest that node, use its own backup). A full speed-limit
+  // queue is NOT a sick node: no "429", so nothing gets rested or moved; the
+  // request simply fails and its job retries later.
+  constructor(node: string, why: string, readonly queueFull = false) { super(queueFull ? `${node} ${why}, try again shortly` : `${node} ${why} (429)`); }
 }
 
 export class NodeBudget {
@@ -43,7 +46,7 @@ export class NodeBudget {
     readonly rps: number,
     readonly daily: number,                  // Infinity = no daily cap
     private readonly now: () => number = Date.now,
-    private readonly maxWaitMs = 5_000,      // past this, fail fast instead of queueing forever
+    private readonly maxWaitMs = 30_000,     // requests wait their turn up to this long
   ) {
     this.tokens = Math.max(1, rps);
     this.lastRefill = now();
@@ -66,7 +69,7 @@ export class NodeBudget {
     this.tokens -= n;
     if (this.tokens < 0) {
       const waitMs = (-this.tokens / this.rps) * 1000;
-      if (waitMs > this.maxWaitMs) { this.tokens += n; throw new BudgetExceeded(this.name, 'speed limit queue full'); }
+      if (waitMs > this.maxWaitMs) { this.tokens += n; throw new BudgetExceeded(this.name, 'speed limit queue full', true); }
       await new Promise((r) => setTimeout(r, waitMs));
     }
     this.usedToday += n;
