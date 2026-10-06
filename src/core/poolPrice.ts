@@ -32,6 +32,7 @@ export function priceAinB(p: PoolState, decimalsOf: DecimalsLookup): number | nu
   const decA = decimalsOf(p.chain, p.tokenA);
   const decB = decimalsOf(p.chain, p.tokenB);
 
+  if (p.poolType === 'v3' && p.liquidity === 0n) return null; // empty pool: no real price
   if (p.poolType === 'v3' && p.sqrtPriceX96) {
     const raw = Number(p.sqrtPriceX96) / 2 ** 96;
     const price = raw * raw * 10 ** (decA - decB);

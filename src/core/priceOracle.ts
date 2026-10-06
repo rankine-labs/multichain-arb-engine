@@ -1,100 +1,134 @@
 import { ChainName, PoolState } from './types';
 import { PoolCache } from './poolCache';
+import { priceOf, poolReserves } from './poolPrice';
 
 // ============================================================================
 // PRICE ORACLE
 //
-// Every profit calculation and the liquidity ceiling both need a real USD
-// price per token. Rather than depending on an external price API (one more
-// network call in or near the hot path), we derive price directly from the
-// pool cache we already maintain in memory — the same data we're using to
-// find arbitrage in the first place.
+// Every profit calculation, the gas-cost estimate, the trade-size limit and
+// the pool depth filter need a real USD price per token. Rather than calling
+// an external price API (one more network call near the hot path), we derive
+// price from the pool cache we already keep in memory.
 //
-// Method: find a pool pairing the target token directly against a known
-// stablecoin. If none exists, hop through one intermediate token (e.g.
-// TOKEN/WETH, then WETH/USDC) to get there. No external calls, no added
-// latency in the hot path.
+// Method:
+//   1. Stablecoins are $1.00 by definition.
+//   2. Direct: the DEEPEST pool pairing the token with a stablecoin.
+//   3. One hop: the deepest pool pairing the token with a token that has a
+//      direct stable price (e.g. TOKEN/WETH, then WETH/USDG).
+//
+// Fixes (Oct 2026 audit):
+//   - Uses each token's REAL decimals. The old version assumed 18 for all,
+//     so with USDG (6 decimals) WETH came out at $0.000000003, which made the
+//     $25k depth filter throw away every WETH pool, gas look free, and the
+//     max-trade-size check meaningless.
+//   - Reads V3/V4 pools too (not just V2), via the shared poolPrice helpers.
+//   - Picks the deepest pool instead of the first one found, and ignores
+//     pools too shallow to trust (a dust pool can show any price).
+//   - Unknown decimals: that pool is skipped rather than guessed.
+//   - Results are memoised briefly: the depth filter asks for prices many
+//     times per swap, and the one-hop search is O(pools^2).
 // ============================================================================
 
-// Known stablecoins per chain — treated as $1.00 by definition.
-// Populate via registerStablecoin() with real addresses per chain before
-// this goes live (kept out of source as a hardcoded list so addresses can
-// be supplied via config/env rather than requiring a code change).
+// Known stablecoins per chain, treated as $1.00 by definition.
+// Populated via registerStablecoin() (see config/knownAddresses.ts).
 const STABLECOINS: Record<ChainName, Set<string>> = {
-avalanche: new Set(),
-monad: new Set(),
-robinhood: new Set(),
+  avalanche: new Set(),
+  monad: new Set(),
+  robinhood: new Set(),
 };
 
 export function registerStablecoin(chain: ChainName, tokenAddress: string) {
-STABLECOINS[chain].add(tokenAddress.toLowerCase());
+  STABLECOINS[chain].add(tokenAddress.toLowerCase());
 }
+
+// Decimals for a token, or undefined if not known yet.
+export type StrictDecimals = (chain: string, token: string) => number | undefined;
+
+// A pool must hold at least this much USD on its anchor side to be used for
+// pricing. Below it, the pool's ratio is noise.
+const MIN_ANCHOR_USD = Number(process.env.ORACLE_MIN_ANCHOR_USD ?? 500);
 
 export class PriceOracle {
-constructor(private cache: PoolCache) {}
+  private memo = new Map<string, { px: number | null; at: number }>();
 
-isStable(chain: ChainName, tokenAddress: string): boolean {
-return STABLECOINS[chain].has(tokenAddress.toLowerCase());
-}
+  constructor(
+    private cache: PoolCache,
+    // Default 18 keeps old callers/tests working; the bot passes a strict lookup.
+    private decimals: StrictDecimals = () => 18,
+    private memoMs = 1_000,
+    private now: () => number = Date.now,
+  ) {}
 
-// Returns USD price per 1 whole token (18-decimals assumed for now —
-// real implementation needs per-token decimals, not a flat assumption).
-getUsdPrice(chain: ChainName, tokenAddress: string): number | null {
-if (this.isStable(chain, tokenAddress)) return 1.0;
+  isStable(chain: ChainName, tokenAddress: string): boolean {
+    return STABLECOINS[chain].has(tokenAddress.toLowerCase());
+  }
 
-// Direct pass: any cached pool pairing this token against a stablecoin
-const direct = this.findDirectStablePool(chain, tokenAddress);
-if (direct) return direct;
+  getUsdPrice(chain: ChainName, tokenAddress: string): number | null {
+    if (this.isStable(chain, tokenAddress)) return 1.0;
+    const key = `${chain}:${tokenAddress.toLowerCase()}`;
+    const hit = this.memo.get(key);
+    const t = this.now();
+    if (hit && t - hit.at < this.memoMs) return hit.px;
 
-// One-hop pass: token -> intermediate -> stablecoin
-const hopped = this.findOneHopStablePrice(chain, tokenAddress);
-if (hopped) return hopped;
+    const px = this.directStablePrice(chain, tokenAddress) ?? this.oneHopStablePrice(chain, tokenAddress);
+    this.memo.set(key, { px, at: t });
+    if (this.memo.size > 5_000) this.memo.clear(); // bound memory
+    return px;
+  }
 
-return null; // no path to a known price — caller must skip this token
-}
+  // Price of `token` in `anchor` units on pool p, plus how much USD sits on
+  // the anchor side (used to pick the deepest pool). null if unusable.
+  private quote(p: PoolState, token: string, anchorUsd: number): { px: number; depthUsd: number } | null {
+    const decT = this.decimals(p.chain, token);
+    const other = p.tokenA.toLowerCase() === token.toLowerCase() ? p.tokenB : p.tokenA;
+    const decO = this.decimals(p.chain, other);
+    if (decT === undefined || decO === undefined) return null; // never guess decimals
+    const dec = (_c: string, t: string) => (t.toLowerCase() === token.toLowerCase() ? decT : decO);
+    const px = priceOf(p, token, dec);
+    const r = poolReserves(p, dec);
+    if (px === null || !r || !(px > 0) || !Number.isFinite(px)) return null;
+    const anchorAmt = p.tokenA.toLowerCase() === other.toLowerCase() ? r.a : r.b;
+    const depthUsd = anchorAmt * anchorUsd;
+    if (!(depthUsd >= MIN_ANCHOR_USD)) return null;
+    return { px: px * anchorUsd, depthUsd };
+  }
 
-private findDirectStablePool(chain: ChainName, tokenAddress: string): number | null {
-for (const pool of this.cache.allForChain(chain)) {
-if (pool.poolType !== 'v2' || pool.reserveA === undefined || pool.reserveB === undefined) continue;
+  // Pools on this chain that contain `token`, with the other token.
+  private poolsWith(chain: ChainName, token: string): { p: PoolState; other: string }[] {
+    const t = token.toLowerCase();
+    const out: { p: PoolState; other: string }[] = [];
+    for (const p of this.cache.allForChain(chain)) {
+      const a = p.tokenA.toLowerCase(), b = p.tokenB.toLowerCase();
+      if (a === t) out.push({ p, other: b });
+      else if (b === t) out.push({ p, other: a });
+    }
+    return out;
+  }
 
-const isTokenA = pool.tokenA.toLowerCase() === tokenAddress.toLowerCase();
-const isTokenB = pool.tokenB.toLowerCase() === tokenAddress.toLowerCase();
-if (!isTokenA && !isTokenB) continue;
+  // Deepest pool pairing the token directly with a stablecoin.
+  private directStablePrice(chain: ChainName, token: string): number | null {
+    let best: { px: number; depthUsd: number } | null = null;
+    for (const { p, other } of this.poolsWith(chain, token)) {
+      if (!this.isStable(chain, other)) continue;
+      const q = this.quote(p, token, 1);
+      if (q && (!best || q.depthUsd > best.depthUsd)) best = q;
+    }
+    return best ? best.px : null;
+  }
 
-const otherToken = isTokenA ? pool.tokenB : pool.tokenA;
-if (!this.isStable(chain, otherToken)) continue;
-
-const tokenReserve = isTokenA ? pool.reserveA : pool.reserveB;
-const stableReserve = isTokenA ? pool.reserveB : pool.reserveA;
-if (tokenReserve === 0n) continue;
-
-// price = stable reserve / token reserve (both assumed 18 decimals)
-return Number(stableReserve) / Number(tokenReserve);
-}
-return null;
-}
-
-private findOneHopStablePrice(chain: ChainName, tokenAddress: string): number | null {
-for (const pool of this.cache.allForChain(chain)) {
-if (pool.poolType !== 'v2' || pool.reserveA === undefined || pool.reserveB === undefined) continue;
-
-const isTokenA = pool.tokenA.toLowerCase() === tokenAddress.toLowerCase();
-const isTokenB = pool.tokenB.toLowerCase() === tokenAddress.toLowerCase();
-if (!isTokenA && !isTokenB) continue;
-
-const intermediate = isTokenA ? pool.tokenB : pool.tokenA;
-if (this.isStable(chain, intermediate)) continue; // that's the direct case, already handled
-
-const intermediatePrice = this.findDirectStablePool(chain, intermediate);
-if (intermediatePrice === null) continue;
-
-const tokenReserve = isTokenA ? pool.reserveA : pool.reserveB;
-const intermediateReserve = isTokenA ? pool.reserveB : pool.reserveA;
-if (tokenReserve === 0n) continue;
-
-const tokenPerIntermediate = Number(intermediateReserve) / Number(tokenReserve);
-return tokenPerIntermediate * intermediatePrice;
-}
-return null;
-}
+  // Deepest pool pairing the token with an intermediate that has a direct
+  // stable price (TOKEN/WETH -> WETH/USDG).
+  private oneHopStablePrice(chain: ChainName, token: string): number | null {
+    let best: { px: number; depthUsd: number } | null = null;
+    const midPx = new Map<string, number | null>();
+    for (const { p, other } of this.poolsWith(chain, token)) {
+      if (this.isStable(chain, other)) continue; // direct case, already tried
+      if (!midPx.has(other)) midPx.set(other, this.directStablePrice(chain, other));
+      const mid = midPx.get(other);
+      if (!mid) continue;
+      const q = this.quote(p, token, mid);
+      if (q && (!best || q.depthUsd > best.depthUsd)) best = q;
+    }
+    return best ? best.px : null;
+  }
 }

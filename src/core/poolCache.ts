@@ -19,6 +19,40 @@ export class PoolCache {
                 this.pools.set(this.key(pool.chain, pool.poolAddress), pool);
                   }
 
+  // RPC refresh write: skip it if the cached copy changed AFTER the read
+  // started (the trade feed applied a newer swap while the RPC call was in
+  // flight; the RPC answer may predate that swap and would put the old price
+  // back, creating a fake gap). A pool skipped 3 times in a row is written
+  // anyway so drift on a very busy pool still gets corrected.
+  // Returns true if written.
+  // Also skipped within FEED_GRACE_MS of a swap applied from the trade feed:
+  // the feed sees a trade before the RPC node has it in a block, so an RPC
+  // read started just after still returns the pre-trade price.
+  private skips = new Map<string, number>();
+  private feedApplied = new Map<string, number>();
+  static FEED_GRACE_MS = Number(process.env.FEED_GRACE_MS ?? 2_000);
+
+  // Write a state predicted from a sequenced trade (instant price tracking).
+  upsertFromFeed(pool: PoolState, now = Date.now()) {
+    const k = this.key(pool.chain, pool.poolAddress);
+    this.pools.set(k, { ...pool, lastUpdatedMs: now });
+    this.feedApplied.set(k, now);
+  }
+
+  upsertIfNotNewer(fresh: PoolState, readStartedMs: number, now = Date.now()): boolean {
+    const k = this.key(fresh.chain, fresh.poolAddress);
+    const cur = this.pools.get(k);
+    const fedAt = this.feedApplied.get(k) ?? 0;
+    if (cur && (cur.lastUpdatedMs > readStartedMs || now - fedAt < PoolCache.FEED_GRACE_MS)) {
+      const n = (this.skips.get(k) ?? 0) + 1;
+      if (n < 3) { this.skips.set(k, n); return false; }
+    }
+    this.skips.delete(k);
+    this.feedApplied.delete(k);
+    this.pools.set(k, fresh);
+    return true;
+  }
+
                     get(chain: ChainName, poolAddress: string): PoolState | undefined {
                         return this.pools.get(this.key(chain, poolAddress));
                           }

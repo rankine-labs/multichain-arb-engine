@@ -62,7 +62,9 @@ function newText(file, offset) {
   } catch { return { text: '', size: offset }; }
 }
 
-const sh = (cmd) => { try { return execSync(cmd, { cwd: APP_DIR, encoding: 'utf8', timeout: 15000 }).trim(); } catch { return ''; } };
+// maxBuffer: Node's default is 1 MB; the log tails below read up to 8 MB.
+// Past 1 MB execSync threw ENOBUFS and the report went blank ("no scan yet").
+const sh = (cmd) => { try { return execSync(cmd, { cwd: APP_DIR, encoding: 'utf8', timeout: 15000, maxBuffer: 32 * 1024 * 1024 }).trim(); } catch { return ''; } };
 const strip = (l) => l.replace(/^\s*\d+\|[^|]*\|\s*/, '').trim(); // drop pm2 "0|name |" prefix
 const lastMatch = (lines, re) => [...lines].reverse().find((l) => re.test(l));
 const count = (lines, re) => lines.filter((l) => re.test(l)).length;
@@ -102,8 +104,9 @@ async function main() {
   const chains = (chainsLine.split('enabled:')[1] || 'robinhood').split(',').map((s) => s.trim()).filter(Boolean);
 
   // Latest dry-run earnings line (the bot logs it hourly: "[pnl] would-have-earned ...").
-  const lastPnl = lastMatch(sh(`tail -c 8000000 "${OUT_LOG}"`).split('\n').map(strip), /^\[pnl\] /);
-  const lastScan = lastMatch(sh(`tail -c 8000000 "${OUT_LOG}"`).split('\n').map(strip), /\[scan\] robinhood (now watching|:)|\[scan\] robinhood scan failed/) || 'no scan yet';
+  const bigTail = sh(`tail -c 8000000 "${OUT_LOG}"`).split('\n').map(strip); // read once, used twice
+  const lastPnl = lastMatch(bigTail, /^\[pnl\] /);
+  const lastScan = lastMatch(bigTail, /\[scan\] robinhood (now watching|:)|\[scan\] robinhood scan failed/) || 'no scan yet';
   const simProfit = count(outL, /\[sim\].*REAL PROFIT/);
   const simLoss = count(outL, /\[sim\].*real: LOSS/);
   const simFail = count(outL, /\[sim\].*real: FAILS/);

@@ -116,7 +116,9 @@ export async function refreshPoolsBatch(
     const i = idx[k];
     if (p.poolType === 'v3') {
       const sqrt = word(res[i], 0), liq = word(res[i + 1], 0);
-      if (sqrt && liq) out.push({ ...p, sqrtPriceX96: sqrt, liquidity: liq, lastUpdatedMs: now });
+      // liq may legitimately be 0 (liquidity pulled): store it so the old
+      // price is not kept. sqrt 0 / missing = unreadable, skip.
+      if (sqrt && liq !== null) out.push({ ...p, sqrtPriceX96: sqrt, liquidity: liq, lastUpdatedMs: now });
     } else if (p.poolType === 'v2') {
       const r0 = word(res[i], 0), r1 = word(res[i], 1);
       if (r0 !== null && r1 !== null) out.push({ ...p, reserveA: r0, reserveB: r1, lastUpdatedMs: now });
@@ -291,7 +293,10 @@ export class PairWatcher {
         .map((a) => this.cache.get(this.chain, a)).filter((p): p is PoolState => !!p);
       if (!pools.length) return;
       this.callMany ??= (await makeCaller(this.provider)).callMany;
-      for (const fresh of await refreshPoolsBatch(this.callMany, pools)) this.cache.upsert(fresh);
+      // Read started now: anything the trade feed wrote after this moment is
+      // newer than (or at best equal to) what the RPC returns, so keep it.
+      const readStartedMs = Date.now();
+      for (const fresh of await refreshPoolsBatch(this.callMany, pools)) this.cache.upsertIfNotNewer(fresh, readStartedMs);
       this.lastRefreshMs = Date.now();
       try { this.onRefreshed?.(); } catch { /* a listener error must not break refreshing */ }
     } finally {

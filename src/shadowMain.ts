@@ -1,4 +1,6 @@
 import 'dotenv/config';
+// Scrub API keys / tokens from every log line (must stay the 2nd import).
+import './core/logSanitizer.install';
 const BOOT_MS = Date.now(); // for the "[startup] fully running after Ns" log
 
 // One bad trade event must never take the whole bot down. Event handlers are
@@ -98,7 +100,12 @@ const chainManager = new ChainManager(Date.now, 'data/provider-blocks.json');
 const routerRegistry = structuredClone(DEFAULT_ROUTER_REGISTRY);
 seedKnownAddresses(routerRegistry);
 const filter = new FastFilter(cache);
-const priceOracle = new PriceOracle(cache);
+// USD prices use each token's REAL decimals (strict: unknown = skip that pool,
+// never guess 18). TOKEN_DECIMALS is declared further down; the try/catch
+// covers the (theoretical) case of a lookup before that line has run.
+const priceOracle = new PriceOracle(cache, (chain, token) => {
+      try { return TOKEN_DECIMALS[chain]?.[token.toLowerCase()]; } catch { return undefined; }
+});
 
       // Real proof that live trading is being compared, not just checked
       // on a timer -- every genuine peer match found during real swap
@@ -288,7 +295,18 @@ const simPausedUntil: Record<string, number> = {};
 // (roughly one to a few blocks on each chain).
 const SIM_DELAY_MS: Record<string, number> = { avalanche: 3_000, monad: 1_500, robinhood: 1_000 };
 const simBusy: Record<string, boolean> = {};          // one simulation in flight per chain
-const simDisabled: Record<string, string> = {};       // chain -> reason (e.g. RPC lacks overrides)
+// Simulation switched off for a chain (e.g. the RPC lacks state overrides),
+// with an expiry: retried after 30 min instead of staying off until restart.
+// Token-specific problems ("no balance slot found") never switch off the
+// whole chain; the simulator retries that token on its own after an hour.
+const simDisabled: Record<string, { reason: string; until: number }> = {};
+const SIM_DISABLE_MS = 30 * 60_000;
+const simOff = (chain: string): string | undefined => {
+      const d = simDisabled[chain];
+      if (!d) return undefined;
+      if (Date.now() >= d.until) { delete simDisabled[chain]; return undefined; }
+      return d.reason;
+};
 // Reported in the hourly digest, then reset.
 const simStats = { checked: 0, profit: 0, loss: 0, fail: 0, rateLimited: 0 };
 
@@ -304,7 +322,8 @@ const checkRoundTrip = async (
       chain: 'avalanche' | 'monad' | 'robinhood', tokenIn: string,
       buyPool: any, sellPool: any, tradeSizeUsd: number, usdPerToken: number,
 ): Promise<RoundTripCheck> => {
-      if (simDisabled[chain]) return { status: 'skipped', reason: `simulation off: ${simDisabled[chain]}` };
+      const off = simOff(chain);
+      if (off) return { status: 'skipped', reason: `simulation off: ${off}` };
       if (Date.now() < (simPausedUntil[chain] ?? 0)) return { status: 'rate_limited' };
       const decimals = TOKEN_DECIMALS[chain]?.[tokenIn.toLowerCase()];
       if (decimals === undefined) return { status: 'skipped', reason: 'unknown decimals' };
@@ -327,7 +346,7 @@ const queueSimulation = (
       chain: 'avalanche' | 'monad' | 'robinhood', tokenIn: string,
       buyPool: any, sellPool: any, tradeSizeUsd: number, modelGrossUsd: number, usdPerToken: number,
 ) => {
-      if (simBusy[chain] || simDisabled[chain] || Date.now() < (simPausedUntil[chain] ?? 0)) return;
+      if (simBusy[chain] || simOff(chain) || Date.now() < (simPausedUntil[chain] ?? 0)) return;
       const decimals = TOKEN_DECIMALS[chain]?.[tokenIn.toLowerCase()];
       if (decimals === undefined) return;
       // Flash loan: borrow from the cheapest V3 pool holding the token that
@@ -356,8 +375,12 @@ const queueSimulation = (
                         return;
                   }
                   if (r.status === 'unsupported') {
-                        simDisabled[chain] = r.reason;
-                        console.warn(`[sim] ${chain} simulation disabled: ${r.reason}`);
+                        // Only an RPC-wide problem pauses the chain; a token we
+                        // can't simulate just skips this one check.
+                        if (/override|does not support/i.test(r.reason)) {
+                              simDisabled[chain] = { reason: r.reason, until: Date.now() + SIM_DISABLE_MS };
+                              console.warn(`[sim] ${chain} simulation paused 30 min: ${r.reason}`);
+                        } else console.warn(`[sim] ${chain} skipped (${r.reason})`);
                         return;
                   }
                   simStats.checked++;
@@ -569,19 +592,28 @@ const fireTrade = async (o: {
             console.warn('[exec-dryrun] skipped:', (err as Error).message);
       }
 };
-const refreshNow = async (p: any): Promise<any> => {
+// preTrade: the caller wants the pool's state BEFORE the trade the feed just
+// applied (the backrun planner predicts that trade's effect itself), so an
+// RPC read refused by the cache is still returned for planning.
+const refreshNow = async (p: any, preTrade = false): Promise<any> => {
       if ((p.dex === 'uniswap-v4' && !p.v4) || p.poolType === 'orderbook' || p.dex.includes('lb') || p.dex === 'bean-exchange') return p;
+      const readStartedMs = Date.now();
       const fresh = await Promise.race([
             refreshPoolState(READ_PROVIDER[p.chain], p),
             new Promise<null>((r) => setTimeout(() => r(null), REFRESH_TIMEOUT_MS)),
       ]);
-      if (fresh) { cache.upsert(fresh); return fresh; }
+      if (fresh) {
+            if (cache.upsertIfNotNewer(fresh, readStartedMs)) return fresh;
+            // Not written: the trade feed has a newer copy in the cache. Peers
+            // use that newer copy; the traded pool keeps the pre-trade read.
+            return preTrade ? fresh : (cache.get(p.chain, p.poolAddress) ?? fresh);
+      }
       return p;
 };
-const priceAtDecision = async (p: PoolState): Promise<PoolState> => {
+const priceAtDecision = async (p: PoolState, preTrade = false): Promise<PoolState> => {
       if (FAST_PRICES && p.chain === 'robinhood' && Date.now() - p.lastUpdatedMs <= FRESH_MS) { priceStats.local++; return p; }
       priceStats.rpc++;
-      return refreshNow(p);
+      return refreshNow(p, preTrade);
 };
 
 // Which chains run. Robinhood only for now: it's the test chain, and Monad
@@ -650,7 +682,7 @@ if (registerIfApproved('avalanche', entry.dex, resolved)) pool = resolved;
           if (entry?.factory && swap.chain === 'monad' && entry.style === 'v3') {
                 const resolved = await resolveAndFetchV3Pool(
                       monadReadProvider, swap.chain, entry.dex, entry.factory,
-                      swap.tokenIn, swap.tokenOut,
+                      swap.tokenIn, swap.tokenOut, swap.feeTier, // exact tier the trade used
                       );
                 if (registerIfApproved('monad', entry.dex, resolved)) pool = resolved;
           }
@@ -685,7 +717,7 @@ if (registerIfApproved('avalanche', entry.dex, resolved)) pool = resolved;
           if (entry?.factory && swap.chain === 'robinhood' && entry.style === 'v3') {
                 const resolved = await resolveAndFetchV3Pool(
                       robinhoodReadProvider, swap.chain, entry.dex, entry.factory,
-                      swap.tokenIn, swap.tokenOut,
+                      swap.tokenIn, swap.tokenOut, swap.feeTier, // exact tier the trade used
                       );
                 if (registerIfApproved('robinhood', entry.dex, resolved)) pool = resolved;
           }
@@ -701,7 +733,7 @@ if (registerIfApproved('avalanche', entry.dex, resolved)) pool = resolved;
     if (FAST_PRICES && swap.chain === 'robinhood' && swap.amountIn > 0n) {
           const inIsA = pool.tokenA.toLowerCase() === swap.tokenIn.toLowerCase();
           const after = cache.predictPostTradeState(pool, inIsA, swap.amountIn);
-          if (after !== pool) { cache.upsert({ ...after, lastUpdatedMs: Date.now() }); requestGapScan(); }
+          if (after !== pool) { cache.upsertFromFeed(after); requestGapScan(); }
     }
 
     // Cheap "is this trade big enough to matter" check, now against the
@@ -718,7 +750,7 @@ if (registerIfApproved('avalanche', entry.dex, resolved)) pool = resolved;
     if (cachedPeers.length === 0) return;
     // Fast path: use our own up-to-date copy when it's recent (kept current by
     // instant price tracking + the 5s re-sync); only ask the RPC when stale.
-    const [freshPool, ...peers] = await Promise.all([priceAtDecision(pool), ...cachedPeers.map(priceAtDecision)]);
+    const [freshPool, ...peers] = await Promise.all([priceAtDecision(pool, true), ...cachedPeers.map((p) => priceAtDecision(p))]);
     pool = freshPool;
 
       // Record this real, genuine match for the hourly proof-of-activity

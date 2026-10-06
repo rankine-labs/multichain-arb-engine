@@ -1,3 +1,4 @@
+import { scrub, urlSecretParts } from '../core/logSanitizer';
 // ============================================================================
 // ROBINHOOD ENDPOINTS -- which servers the bot reads from and sends to
 //
@@ -79,4 +80,6 @@ export function robinhoodSendRpc(env: Record<string, string | undefined> = proce
 }
 
 // Redacts API keys for logs.
-export const redact = (url: string) => url.replace(/\/v2\/[A-Za-z0-9_-]+/, '/v2/***').replace(/\/[A-Za-z0-9_-]{24,}$/, '/***');
+// Hides long path segments (Alchemy /v2/KEY, QuickNode /KEY/), query-string
+// keys and user:pass, whatever the provider's URL layout.
+export const redact = (url: string) => scrub(url, urlSecretParts(url));

@@ -1,3 +1,4 @@
+import { scrub, collectSecrets } from './logSanitizer';
 // ============================================================================
 // TELEGRAM SENDER
 // Deliberately the ONLY module that makes a network call for reporting.
@@ -63,7 +64,8 @@ export function capLength(html: string): string {
 // Messages are HTML (see telegramFormatter.ts). Plain strings without tags
 // work too, as long as any '<', '>' or '&' in them is escaped.
 export async function sendTelegramMessage(text: string): Promise<void> {
-  text = capLength(text);
+  // Never send a key/token to a chat: same scrubber as the logs.
+  text = capLength(scrub(text, collectSecrets()));
     if (!TELEGRAM_BOT_TOKEN || TELEGRAM_CHAT_IDS.length === 0) {
           console.warn('[telegram] TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set — message not sent:');
           console.warn(text);
