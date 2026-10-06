@@ -140,7 +140,10 @@ const priceOracle = new PriceOracle(cache, (chain, token) => {
       // Extra free/keyed nodes to spread price reads across (comma-separated
       // URLs in ROBINHOOD_FAST_RPC_EXTRA, e.g. a QuickNode or Nodeflare key).
       const rhExtraFast = (process.env.ROBINHOOD_FAST_RPC_EXTRA ?? '').split(',').map((u) => u.trim()).filter(Boolean);
-      const robinhoodReadProvider = new FailoverJsonRpcProvider(rhFastUrl, rhHeavyUrl, 4663, { extraFastUrls: rhExtraFast });
+      // Backup node(s) used only when the main free node is slow/failing,
+      // before Alchemy (ROBINHOOD_BACKUP_RPC, e.g. Nodeflare).
+      const rhBackup = (process.env.ROBINHOOD_BACKUP_RPC ?? '').split(',').map((u) => u.trim()).filter(Boolean);
+      const robinhoodReadProvider = new FailoverJsonRpcProvider(rhFastUrl, rhHeavyUrl, 4663, { extraFastUrls: rhExtraFast, backupUrls: rhBackup });
       // Bursty work (the chain-wide scan) goes straight to HEAVY.
       const robinhoodHeavyProvider = rhHeavyUrl ? new ethers.JsonRpcProvider(rhHeavyUrl, 4663, { staticNetwork: true }) : robinhoodReadProvider;
 

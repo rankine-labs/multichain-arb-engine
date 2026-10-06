@@ -43,3 +43,33 @@ async function main() {
   assert(!logs.some((l) => /https?:\/\//.test(l)), 'no URLs in log lines');
 }
 main().catch((e) => { console.error('FAIL: crashed', e); process.exitCode = 1; });
+
+// Backup tier: used only when the main free node is resting, before the paid node.
+async function backupOrder() {
+  let clock = 0;
+  const calls: string[] = [];
+  const logs: string[] = [];
+  let publicSlow = true, backupDown = false;
+  const mk = (label: string, ms: () => number, fail?: () => boolean) => ({
+    label,
+    send: async (p: any) => {
+      calls.push(label); clock += ms();
+      if (fail?.()) { const e: any = new Error('timeout'); e.code = 'TIMEOUT'; throw e; }
+      return [{ id: p.id, jsonrpc: '2.0', result: label }] as any;
+    },
+  });
+  const payload = { id: 1, jsonrpc: '2.0', method: 'eth_blockNumber', params: [] } as any;
+  const r = new FailoverRouter(mk('public', () => (publicSlow ? 900 : 20)), mk('alchemy', () => 20),
+    { now: () => clock, log: (l) => logs.push(l), slowMs: 300, backups: [mk('nodeflare', () => 30, () => backupDown)] });
+  for (let i = 0; i < 3; i++) await r.send(payload);
+  assert(!calls.includes('nodeflare'), 'backup unused while the main node is fine');
+  for (let i = 0; i < 10; i++) await r.send(payload);
+  calls.length = 0;
+  await r.send(payload);
+  assert(calls[0] === 'nodeflare', 'main node slow -> backup (Nodeflare) answers, not Alchemy');
+  backupDown = true;
+  calls.length = 0;
+  const res = await r.send(payload);
+  assert(calls.join(',') === 'nodeflare,alchemy' && (res[0] as any).result === 'alchemy', 'backup failing too -> Alchemy');
+}
+backupOrder().catch((e) => { console.error('FAIL: crashed', e); process.exitCode = 1; });
