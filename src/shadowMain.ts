@@ -178,7 +178,13 @@ Object.entries(discoveryConfigs).map(([chain, cfg]) => [chain, new PoolDiscovery
       function registerIfApproved(chain: 'avalanche' | 'monad' | 'robinhood', dex: string, resolved: any): boolean {
             // Resolvers return null when there's no pool (or it couldn't be read).
             if (!resolved) return false;
-            const hasNonZeroLiquidity = (resolved.reserveA ?? 0n) > 0n && (resolved.reserveB ?? 0n) > 0n;
+            // V3/V4 pools have no reserves, only liquidity. Checking reserves for
+            // them rejected EVERY V3 pool found on the spot, so it was never
+            // cached and was looked up again on every trade (heavy load on
+            // the public RPC, which then throttled us).
+            const hasNonZeroLiquidity = resolved.poolType === 'v3'
+                  ? (resolved.liquidity ?? 0n) > 0n
+                  : (resolved.reserveA ?? 0n) > 0n && (resolved.reserveB ?? 0n) > 0n;
             const gate = discoveryEngines[chain].evaluateLiveDiscovery({ chain: resolved.chain, dex, hasNonZeroLiquidity });
             if (!gate.approved) {
                   console.log(`[discovery] rejected ${dex} pool on ${chain}: ${gate.rejections.join(', ')}`);
@@ -303,6 +309,8 @@ const simBusy: Record<string, boolean> = {};          // one simulation in fligh
 const simDisabled: Record<string, { reason: string; until: number }> = {};
 // Pool pairs whose last trigger test lost or failed: not re-tested for 5 min.
 const simLoserMuted = new Map<string, number>();
+// On-the-spot pool lookups that found nothing usable (see the trade handler).
+const jitFailedUntil = new Map<string, number>();
 const SIM_LOSER_MUTE_MS = 5 * 60_000;
 const muteLoser = (key: string) => {
       simLoserMuted.set(key, Date.now() + SIM_LOSER_MUTE_MS);
@@ -722,7 +730,11 @@ let pool = cache.get(swap.chain, swap.poolAddress);
     // this pool yet and know the router's factory, resolve the REAL pool
     // address on-chain and pull its live reserves — no external API, just
     // the same chain data we're already watching.
-    if (!pool) {
+    // Lookups that found nothing usable are remembered for 30 min, so a busy
+    // pair with no approved pool doesn't cost 10-25 RPC requests per trade.
+    const jitKey = `${swap.chain}:${swap.poolAddress}:${swap.tokenIn}:${swap.tokenOut}:${swap.feeTier ?? ''}`.toLowerCase();
+    const jitSkip = !pool && Date.now() < (jitFailedUntil.get(jitKey) ?? 0);
+    if (!pool && !jitSkip) {
         const entry = routerRegistry[swap.chain]?.[swap.poolAddress.toLowerCase()];
         if (entry?.factory && swap.chain === 'avalanche' && entry.style === 'v2') {
             const resolved = await resolveAndFetchV2Pool(
@@ -781,6 +793,10 @@ if (registerIfApproved('avalanche', entry.dex, resolved)) pool = resolved;
                       swap.tokenIn, swap.tokenOut, swap.feeTier, // exact tier the trade used
                       );
                 if (registerIfApproved('robinhood', entry.dex, resolved)) pool = resolved;
+          }
+          if (!pool && entry?.factory) {
+                jitFailedUntil.set(jitKey, Date.now() + 30 * 60_000);
+                if (jitFailedUntil.size > 5_000) for (const [k, t] of jitFailedUntil) if (t < Date.now()) jitFailedUntil.delete(k);
           }
     }
 
