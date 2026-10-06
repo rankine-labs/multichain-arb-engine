@@ -28,6 +28,10 @@ import { parseFeedFrame, maxSequenceNumber } from './nitroFeed';
 // ============================================================================
 
 const SEQUENCER_FEED_URL = 'wss://feed.mainnet.chain.robinhood.com';
+// Max wait for the websocket handshake (connect() never hangs past this).
+const CONNECT_TIMEOUT_MS = 10_000;
+// An open socket that has delivered nothing for this long is treated as dead.
+const SILENT_AFTER_OPEN_MS = 60_000;
 const RPC_HTTP_URL = process.env.ROBINHOOD_RPC_HTTP ?? 'https://rpc.mainnet.chain.robinhood.com';
 
 export class RobinhoodChainAdapter implements ChainCapability {
@@ -39,59 +43,92 @@ export class RobinhoodChainAdapter implements ChainCapability {
       private handlers: ((event: RawChainEvent) => void)[] = [];
       private lastSeqSeen = 0;
       private lastMessageAtMs = 0;
+      private openedAtMs = 0;
 
   async connect(): Promise<void> {
-          // Clean up any previous connection before reconnecting -- otherwise a
+        // Clean up any previous connection before reconnecting -- otherwise a
         // reconnect attempt after the socket died leaks the old (dead) socket
-        // and its listeners instead of replacing them.
-        try { this.ws?.removeAllListeners(); this.ws?.close(); } catch { /* already dead, fine */ }
+        // and its listeners instead of replacing them. A no-op 'error'
+        // listener stays attached: an old socket that errors while closing
+        // with no listener would crash the whole process.
+        const old = this.ws;
+        if (old) {
+              try { old.removeAllListeners(); old.on('error', () => { /* closing, ignore */ }); old.terminate(); } catch { /* already dead, fine */ }
+        }
+        // Fresh connection: the health check must not trust message times
+        // from the previous socket.
+        this.lastMessageAtMs = 0;
+        this.openedAtMs = 0;
 
         return new Promise((resolve, reject) => {
-                  this.ws = new WebSocket(SEQUENCER_FEED_URL);
+              // handshakeTimeout: Cloudflare can accept TCP and never answer the
+              // upgrade; without a limit connect() would hang forever and block
+              // every later health check (audit fix, Oct 2026).
+              const ws = new WebSocket(SEQUENCER_FEED_URL, { handshakeTimeout: CONNECT_TIMEOUT_MS });
+              this.ws = ws;
+              let settled = false;
+              const finish = (err?: Error) => {
+                    if (settled) return;
+                    settled = true;
+                    clearTimeout(timer);
+                    if (err) {
+                          try { ws.terminate(); } catch { /* fine */ }
+                          reject(err);
+                    } else resolve();
+              };
+              // Belt and braces on top of handshakeTimeout.
+              const timer = setTimeout(() => finish(new Error(`feed connect timed out after ${CONNECT_TIMEOUT_MS + 2_000}ms`)), CONNECT_TIMEOUT_MS + 2_000);
 
-                                 this.ws.on('open', () => {
-                                           console.log('[robinhood] sequencer feed connected');
-                                           resolve();
-                                 });
+              ws.on('open', () => {
+                    this.openedAtMs = Date.now();
+                    console.log('[robinhood] sequencer feed connected');
+                    finish();
+              });
 
-                                 this.ws.on('message', (raw: WebSocket.RawData) => {
-                                           const receivedAtMs = Date.now();
-                                           this.lastMessageAtMs = receivedAtMs;
+              ws.on('message', (raw: WebSocket.RawData) => {
+                    const receivedAtMs = Date.now();
+                    this.lastMessageAtMs = receivedAtMs;
 
-                                           let parsed: any;
-                                           try {
-                                                     parsed = JSON.parse(raw.toString());
-                                           } catch {
-                                                     return; // malformed frame, drop it
-                                           }
+                    let parsed: any;
+                    try {
+                          parsed = JSON.parse(raw.toString());
+                    } catch {
+                          return; // malformed frame, drop it
+                    }
 
-                                           const seq = maxSequenceNumber(parsed);
-                                           if (seq !== null) this.lastSeqSeen = seq;
+                    const seq = maxSequenceNumber(parsed);
+                    // After a reconnect the broadcaster can replay its backlog.
+                    // Frames we've already seen are dropped so the same swap is
+                    // never applied to cached prices twice.
+                    if (seq !== null) {
+                          if (seq <= this.lastSeqSeen) return;
+                          this.lastSeqSeen = seq;
+                    }
 
-                                           // One frame can hold many transactions (see
-                                           // nitroFeed.ts). Emit one event per contract
-                                           // call with plain { to, data }, which is what
-                                           // the decoder understands.
-                                           for (const tx of parseFeedFrame(parsed)) {
-                                                     const event: RawChainEvent = {
-                                                               chain: 'robinhood',
-                                                               stateType: 'SEQUENCED',
-                                                               blockOrSeq: tx.sequenceNumber ?? seq ?? 'unknown',
-                                                               receivedAtMs,
-                                                               raw: { to: tx.to, data: tx.data, value: tx.value, hash: tx.hash, from: tx.from },
-                                                     };
-                                                     for (const h of this.handlers) h(event);
-                                           }
-                                 });
+                    // One frame can hold many transactions (see nitroFeed.ts).
+                    // Emit one event per contract call with plain { to, data },
+                    // which is what the decoder understands.
+                    for (const tx of parseFeedFrame(parsed)) {
+                          const event: RawChainEvent = {
+                                chain: 'robinhood',
+                                stateType: 'SEQUENCED',
+                                blockOrSeq: tx.sequenceNumber ?? seq ?? 'unknown',
+                                receivedAtMs,
+                                raw: { to: tx.to, data: tx.data, value: tx.value, hash: tx.hash, from: tx.from },
+                          };
+                          for (const h of this.handlers) h(event);
+                    }
+              });
 
-                                 this.ws.on('error', (err) => {
-                                           console.error('[robinhood] feed error', err.message);
-                                           reject(err);
-                                 });
+              ws.on('error', (err) => {
+                    console.error('[robinhood] feed error', err.message);
+                    finish(err); // no-op once connected; health check handles the rest
+              });
 
-                                 this.ws.on('close', () => {
-                                           console.warn('[robinhood] feed closed -- chainManager will reconnect on its next health check');
-                                 });
+              ws.on('close', () => {
+                    console.warn('[robinhood] feed closed -- chainManager will reconnect on its next health check');
+                    finish(new Error('feed closed before it opened'));
+              });
         });
   }
 
@@ -113,6 +150,11 @@ export class RobinhoodChainAdapter implements ChainCapability {
         }
           if (this.lastMessageAtMs > 0 && msSinceLastMessage > 30_000) {
                   return { healthy: false, reason: `no sequencer messages in ${msSinceLastMessage}ms` };
+          }
+          // Opened but never sent a single message (blocks are ~0.1 s, so the
+          // feed is never quiet this long when it works).
+          if (this.lastMessageAtMs === 0 && this.openedAtMs > 0 && Date.now() - this.openedAtMs > SILENT_AFTER_OPEN_MS) {
+                  return { healthy: false, reason: `feed open ${Math.round((Date.now() - this.openedAtMs) / 1000)}s but no messages` };
           }
           return { healthy: true };
   }

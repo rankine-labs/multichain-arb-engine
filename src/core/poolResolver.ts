@@ -231,11 +231,15 @@ export async function resolveAndFetchV3Pool(
     factoryAddress: string,
     tokenA: string,
     tokenB: string,
+    // When the trade's calldata names its fee tier, look up THAT pool only.
+    // Falling back to "first tier with liquidity" applied a 0.3% pool's trade
+    // to the 0.05% pool and created fake gaps (audit fix, Oct 2026).
+    feeTier?: number,
   ): Promise<PoolState | null> {
     try {
           const factory = new ethers.Contract(factoryAddress, V3_FACTORY_ABI, provider);
 
-      for (const fee of STANDARD_V3_FEE_TIERS) {
+      for (const fee of feeTier !== undefined ? [feeTier] : STANDARD_V3_FEE_TIERS) {
               let poolAddress: string;
               try {
                         poolAddress = await factory.getPool(tokenA, tokenB, fee);
@@ -465,7 +469,8 @@ export async function refetchV3PoolPrice(
     try {
           const v3Pool = new ethers.Contract(pool.poolAddress, V3_POOL_ABI, provider);
           const [slot0, liquidity] = await Promise.all([v3Pool.slot0(), v3Pool.liquidity()]);
-          if ((liquidity as bigint) === 0n) return null;
+          // Liquidity 0 is a real state (LP pulled out): store it so the pool
+          // stops showing its old price, instead of returning null and keeping it.
           return { ...pool, sqrtPriceX96: slot0[0] as bigint, liquidity: liquidity as bigint, lastUpdatedMs: Date.now() };
     } catch {
           return null;
@@ -553,7 +558,7 @@ export async function refetchV4PoolPrice(provider: ethers.JsonRpcProvider, pool:
   try {
     const stateView = new ethers.Contract(pool.v4.stateView, V4_STATE_VIEW_ABI, provider);
     const [slot0, liquidity] = await Promise.all([stateView.getSlot0(pool.poolAddress), stateView.getLiquidity(pool.poolAddress)]);
-    if ((liquidity as bigint) === 0n) return null;
+    // Liquidity 0 stored as-is (see refetchV3PoolPrice).
     return { ...pool, sqrtPriceX96: slot0[0] as bigint, liquidity: liquidity as bigint, lastUpdatedMs: Date.now() };
   } catch {
     return null;

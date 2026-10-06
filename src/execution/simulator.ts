@@ -116,7 +116,10 @@ function overridesUnsupported(err: { code?: number; message?: string } | undefin
 type SlotInfo = { key: (holder: string) => string } | { unsupported: string } | null;
 // Thrown inside slot probing so a rate-limited probe isn't cached as "not found".
 class RateLimited extends Error {}
-const slotCache = new Map<string, SlotInfo>();
+// Found slots are cached for good; "not found" only for an hour, so a
+// one-off bad probe can't switch a token off forever.
+const slotCache = new Map<string, { info: SlotInfo; at: number }>();
+const NOT_FOUND_TTL_MS = 60 * 60_000;
 const MAX_SLOT = 60;
 
 // Storage key for balances[holder] at mapping slot `slot`.
@@ -124,7 +127,8 @@ function solidityKey(holder: string, slot: number) { return ethers.keccak256(abi
 function vyperKey(holder: string, slot: number) { return ethers.keccak256(abi.encode(['uint256', 'address'], [slot, holder])); }
 
 export async function findBalanceSlot(rpc: Rpc, cacheKey: string, token: string): Promise<SlotInfo> {
-  if (slotCache.has(cacheKey)) return slotCache.get(cacheKey)!;
+  const hit = slotCache.get(cacheKey);
+  if (hit && (hit.info !== null || Date.now() - hit.at < NOT_FOUND_TTL_MS)) return hit.info;
   const magic = 0x1234567890abcdefn;
   const data = BALANCE_OF.encodeFunctionData('balanceOf', [SIM_EXECUTOR_ADDRESS]);
 
@@ -134,7 +138,11 @@ export async function findBalanceSlot(rpc: Rpc, cacheKey: string, token: string)
       { [token]: { stateDiff: { [keyFn(SIM_EXECUTOR_ADDRESS)]: pad32(magic) } } },
     ]);
     if (r.error) {
-      if (isRateLimited(r.error)) throw new RateLimited(r.error.message ?? 'rate limited');
+      // Rate limits AND network trouble (timeouts, resets, bad gateway pages)
+      // are transient: abort the probe instead of counting it as "not this
+      // slot". Otherwise one blip cached "no slot found" and switched
+      // simulations off (audit fix, Oct 2026).
+      if (isRateLimited(r.error) || (r.error.message ?? '').startsWith('network:')) throw new RateLimited(r.error.message ?? 'rate limited');
       return overridesUnsupported(r.error) ? 'unsupported' : false;
     }
     try { return BigInt(r.result) === magic; } catch { return false; }
@@ -149,7 +157,7 @@ export async function findBalanceSlot(rpc: Rpc, cacheKey: string, token: string)
       if (ok) { found = { key: keyFn }; break outer; }
     }
   }
-  slotCache.set(cacheKey, found);
+  slotCache.set(cacheKey, { info: found, at: Date.now() });
   return found;
 }
 

@@ -51,6 +51,27 @@ fi
 
 cd "$APP_DIR" || { log "ERROR: APP_DIR $APP_DIR not found"; exit 1; }
 
+# --- Log housekeeping (cheap, every run) ------------------------------------
+# 1. pm2's own logs: set up pm2-logrotate ONCE (50 MB per file, keep 10,
+#    compressed). Marker file so it isn't re-run every 2 minutes. Runs in the
+#    background with the lock released so it can't delay a deploy.
+LOGROTATE_MARK="$SCRIPT_DIR/.pm2-logrotate-set"
+if [ ! -f "$LOGROTATE_MARK" ]; then
+  ( exec 9>&-
+    pm2 install pm2-logrotate > /dev/null 2>&1 \
+      && pm2 set pm2-logrotate:max_size 50M > /dev/null 2>&1 \
+      && pm2 set pm2-logrotate:retain 10 > /dev/null 2>&1 \
+      && pm2 set pm2-logrotate:compress true > /dev/null 2>&1 \
+      && touch "$LOGROTATE_MARK" ) &
+fi
+# 2. This script's own logs (deploy/*.log): past 5 MB, keep the last 2 MB.
+for f in "$SCRIPT_DIR"/*.log; do
+  [ -f "$f" ] || continue
+  if [ "$(stat -c %s "$f" 2>/dev/null || echo 0)" -gt 5242880 ]; then
+    tail -c 2097152 "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+  fi
+done
+
 # --- Status page (GitHub issue), throttled to every 15 min inside the script.
 # Runs in the background with the lock released, so it can never delay or
 # block a deploy. Does nothing until GH_STATUS_TOKEN is in .env.

@@ -50,3 +50,35 @@ const UNKNOWN_TOKEN = '0xghost';
 assert(oracle.getUsdPrice('avalanche', UNKNOWN_TOKEN) === null, 'unpriceable token returns null instead of guessing');
 
 assert(oracle.getUsdPrice('monad', WETH) === null, 'no cross-chain price leakage for an unregistered chain/token pair');
+
+// ---- Oct 2026 audit: real decimals, V3 pools, deepest pool wins ----------
+{
+  const { PoolCache: PC } = require('../core/poolCache');
+  const { PriceOracle: PO, registerStablecoin: reg } = require('../core/priceOracle');
+  const USDG = '0xusdg6', W = '0xweth18', STOCK = '0xstock18';
+  reg('robinhood', USDG);
+  const dec = (_c: string, t: string) => ({ [USDG]: 6, [W]: 18, [STOCK]: 18 } as Record<string, number>)[t.toLowerCase()];
+  const c2 = new PC();
+  const o2 = new PO(c2, dec, 0);
+  const base = { chain: 'robinhood', feeBps: 30, lastUpdatedBlock: 0, lastUpdatedMs: Date.now() };
+  // Small V2 pool at a WRONG price ($2,000) and a deep one at $3,000.
+  c2.upsert({ ...base, dex: 'ramses-v2', poolAddress: '0xa1', poolType: 'v2', tokenA: W, tokenB: USDG,
+    reserveA: 1n * 10n ** 18n, reserveB: 2_000n * 10n ** 6n });
+  c2.upsert({ ...base, dex: 'ramses-v2', poolAddress: '0xa2', poolType: 'v2', tokenA: W, tokenB: USDG,
+    reserveA: 100n * 10n ** 18n, reserveB: 300_000n * 10n ** 6n });
+  const px = o2.getUsdPrice('robinhood', W);
+  assert(px !== null && Math.abs(px - 3000) < 1, `WETH priced with USDG's 6 decimals and from the deepest pool (got ${px})`);
+
+  // V3 pool for STOCK/WETH at 0.1 WETH per STOCK => $300. sqrtPriceX96 for
+  // price tokenB/tokenA = 10 (WETH per STOCK when STOCK is tokenA? use A=STOCK, B=WETH, price 0.1).
+  const sqrt = BigInt(Math.floor(Math.sqrt(0.1) * 2 ** 96));
+  c2.upsert({ ...base, dex: 'uniswap-v3', poolAddress: '0xb1', poolType: 'v3', tokenA: STOCK, tokenB: W,
+    sqrtPriceX96: sqrt, liquidity: 10n ** 21n });
+  const sp = o2.getUsdPrice('robinhood', STOCK);
+  assert(sp !== null && Math.abs(sp - 300) < 1, `one-hop price through a V3 pool works (got ${sp})`);
+
+  // Unknown decimals: skipped, not guessed.
+  c2.upsert({ ...base, dex: 'x', poolAddress: '0xc1', poolType: 'v2', tokenA: '0xmystery', tokenB: USDG,
+    reserveA: 10n ** 24n, reserveB: 10n ** 12n });
+  assert(o2.getUsdPrice('robinhood', '0xmystery') === null, 'unknown decimals => no price instead of a guess');
+}
