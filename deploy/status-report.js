@@ -107,6 +107,9 @@ async function main() {
   const bigTail = sh(`tail -c 8000000 "${OUT_LOG}"`).split('\n').map(strip); // read once, used twice
   const lastPnl = lastMatch(bigTail, /^\[pnl\] /);
   const lastScan = lastMatch(bigTail, /\[scan\] robinhood (now watching|:)|\[scan\] robinhood scan failed/) || 'no scan yet';
+  // Live watch list (logged every 15 min), shown instead of the scan's line
+  // when present: the scan line only updates every 6 h.
+  const watchList = lastMatch(bigTail, /^\[pairs\] robinhood watch list:/);
   const simProfit = count(outL, /\[sim\].*REAL PROFIT/);
   const simLoss = count(outL, /\[sim\].*real: LOSS/);
   const simFail = count(outL, /\[sim\].*real: FAILS/);
@@ -156,6 +159,7 @@ async function main() {
     ...chains.map((c) => `- ${chainLine(c)}`),
     '',
     '### Robinhood',
+    ...(watchList ? [`- Watch list: ${watchList.replace(/^\[pairs\] robinhood watch list: /, '')}`] : []),
     `- Pool scan: ${lastScan}`,
     `- New pairs picked up this window: ${newPairs.length ? newPairs.slice(0, 10).join(', ') : 'none'}`,
     `- Trades that needed a pool lookup: ${poolLookups}`,

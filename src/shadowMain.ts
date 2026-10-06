@@ -137,7 +137,10 @@ const priceOracle = new PriceOracle(cache, (chain, token) => {
       const rhFastUrl = process.env.ROBINHOOD_FAST_RPC || ROBINHOOD_PUBLIC_RPC;
       const rhHeavyUrl = rhRead.url !== rhFastUrl ? rhRead.url : null;
       console.log(`[robinhood] prices from ${endpointLabel(rhFastUrl)}, simulations + scan from ${rhHeavyUrl ? endpointLabel(rhHeavyUrl) + ' (' + redact(rhHeavyUrl) + ')' : 'the same node'}, sending to ${redact(robinhoodSendRpc())}`);
-      const robinhoodReadProvider = new FailoverJsonRpcProvider(rhFastUrl, rhHeavyUrl, 4663);
+      // Extra free/keyed nodes to spread price reads across (comma-separated
+      // URLs in ROBINHOOD_FAST_RPC_EXTRA, e.g. a QuickNode or Nodeflare key).
+      const rhExtraFast = (process.env.ROBINHOOD_FAST_RPC_EXTRA ?? '').split(',').map((u) => u.trim()).filter(Boolean);
+      const robinhoodReadProvider = new FailoverJsonRpcProvider(rhFastUrl, rhHeavyUrl, 4663, { extraFastUrls: rhExtraFast });
       // Bursty work (the chain-wide scan) goes straight to HEAVY.
       const robinhoodHeavyProvider = rhHeavyUrl ? new ethers.JsonRpcProvider(rhHeavyUrl, 4663, { staticNetwork: true }) : robinhoodReadProvider;
 
@@ -535,6 +538,15 @@ const rhGasUsd = (fallback: number): number =>
 // the bot's own maths. Both assume we win the race.
 const dryRunPnl = new DryRunPnl('data/dryrun-pnl.json', process.env.REPORT_TZ || 'America/Toronto');
 setInterval(() => dryRunPnl.save(), 60_000);
+// Save on shutdown too: pm2 restart/stop (every deploy) sends SIGINT, and the
+// last minute of would-have-earned figures used to be lost each time.
+for (const sig of ['SIGINT', 'SIGTERM'] as const) {
+      process.once(sig, () => {
+            try { dryRunPnl.save(); } catch { /* best effort */ }
+            console.log(`[shutdown] ${sig}: state saved, exiting`);
+            process.exit(0);
+      });
+}
 const MIN_COUNTED_USD = Number(process.env.GAP_MIN_USD ?? 20); // same bar as firing
 safetyGate.allowTokens([ROBINHOOD_TOKENS.WETH, ROBINHOOD_TOKENS.USDG]);
 // "fire-ready" = from the moment we saw the trigger trade to a signed trade
@@ -555,7 +567,7 @@ const nearMissAllowed = (pairKey: string): boolean => {
 };
 
 // Live competitor timing (see core/competitorTracker.ts).
-const rivals = new CompetitorTracker(robinhoodReadProvider);
+const rivals = new CompetitorTracker(robinhoodReadProvider, Date.now, ROBINHOOD_V4.POOL_MANAGER);
 
 // LIVE results (only used once live sending is switched on): receipt, profit
 // from the contract's Executed event, gas cost; losses feed the daily cap.
@@ -570,6 +582,8 @@ const liveTracker = new LiveTradeTracker({
       recordLoss: (usd) => safetyGate.recordLoss(usd),
       noteGasUsed: (gas) => robinhoodSender.noteGasUsed(gas),
       notify: (html) => sendTelegramMessage(html),
+      onSettled: (hash) => safetyGate.releasePending(hash),
+      onDropped: () => { void robinhoodSender.resyncNonce(); },
 });
 
 // Flash-loan lenders the bot may use. FLASH_LENDERS_<CHAIN> in .env = the
@@ -650,6 +664,8 @@ const fireTrade = async (o: {
             if (o.source === 'trade') fireStats.readyMs.push(readyMs);
             if (fired.txHash) {
                   fireStats.sent++;
+                  // Worst-case gas (2x today's cost) held against the daily loss cap until the receipt.
+                  safetyGate.reservePending(fired.txHash, 2 * rhGasUsd(0.05));
                   liveTracker.track(fired.txHash, { expectedProfitUsd: o.netProfitUsd, label: `${symbolOf(o.chain, o.tokenIn)}/${symbolOf(o.chain, o.tokenOut)} ${o.buyPool.dex}>${o.sellPool.dex}` });
             }
             console.log(`[fire] robinhood ${fired.live ? 'LIVE' : 'DRY RUN'} (${o.source}) ready ${readyMs}ms after ${o.source === 'trade' ? 'the trigger' : 'the price update'} (sign ${fired.signMs.toFixed(1)}ms)` +
@@ -1506,6 +1522,11 @@ for (let i = 0; i < resolved.length; i++) {
             }
       };
       setInterval(sendHourlyDigest, 60 * 60 * 1000);
+      // Watch list size every 15 min (shown on the GitHub status page).
+      setInterval(() => {
+            const ws = robinhoodWatcher.stats();
+            console.log(`[pairs] robinhood watch list: ${ws.pairs} pairs, ${ws.pools} pools (${ws.pinnedWatched}/${ws.pinned} pinned found, ${ws.queued} queued)`);
+      }, 15 * 60_000);
       // Hourly memory housekeeping: drop cached pools that aren't in a watched
       // pair, aren't an approved flash lender and haven't been touched for
       // 2 h. They're re-discovered on demand if trades show up again.

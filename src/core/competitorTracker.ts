@@ -32,6 +32,13 @@ export interface RivalResult {
 
 interface Job { triggerHash: string; triggerSeenMs: number; pools: string[]; ourReadyMs?: number; profitUsd: number; dueAt: number }
 
+// Uniswap V4 pools aren't contracts: they're 32-byte ids inside the
+// PoolManager, and their trades show up as PoolManager Swap events with the
+// pool id as the first topic. eth_getLogs rejects a 32-byte id as an
+// "address", so every rival check involving a V4 pool used to fail silently.
+const V4_SWAP_TOPIC = ethers.id('Swap(bytes32,address,int128,int128,uint160,uint128,int24,uint24)');
+const isV4Id = (p: string) => p.length === 66;
+
 const MAX_QUEUE = 20;
 const CHECK_DELAY_MS = 4_000;   // let the blocks land before looking
 const SEEN_TTL_MS = 3 * 60_000;
@@ -43,7 +50,11 @@ export class CompetitorTracker {
   private busy = false;
   results: RivalResult[] = [];
 
-  constructor(private readonly provider: ethers.JsonRpcProvider, private readonly now: () => number = Date.now) {}
+  constructor(
+    private readonly provider: ethers.JsonRpcProvider,
+    private readonly now: () => number = Date.now,
+    private readonly v4PoolManager?: string, // needed to time rivals on V4 pools
+  ) {}
 
   noteFeedTx(hash: string | undefined, ms: number) {
     if (!hash) return;
@@ -115,10 +126,19 @@ export class CompetitorTracker {
   private async check(job: Job): Promise<RivalResult | null> {
     const receipt = await this.provider.getTransactionReceipt(job.triggerHash);
     if (!receipt) return null; // trigger never landed (reverted/dropped)
-    const raw = await this.provider.send('eth_getLogs', [{
-      address: job.pools, fromBlock: ethers.toQuantity(receipt.blockNumber), toBlock: ethers.toQuantity(receipt.blockNumber + 8),
-    }]) as { transactionHash: string; transactionIndex: string; blockNumber: string; address: string }[];
-    const logs = raw.map((l) => ({ transactionHash: l.transactionHash, transactionIndex: Number(l.transactionIndex), blockNumber: Number(l.blockNumber), address: l.address }));
+    type RawLog = { transactionHash: string; transactionIndex: string; blockNumber: string; address: string; topics: string[] };
+    const range = { fromBlock: ethers.toQuantity(receipt.blockNumber), toBlock: ethers.toQuantity(receipt.blockNumber + 8) };
+    const addrs = job.pools.filter((p) => !isV4Id(p));
+    const v4Ids = job.pools.filter(isV4Id);
+    const [plain, v4] = await Promise.all([
+      addrs.length ? this.provider.send('eth_getLogs', [{ address: addrs, ...range }]) as Promise<RawLog[]> : Promise.resolve([] as RawLog[]),
+      v4Ids.length && this.v4PoolManager
+        ? this.provider.send('eth_getLogs', [{ address: this.v4PoolManager, topics: [V4_SWAP_TOPIC, v4Ids], ...range }]) as Promise<RawLog[]>
+        : Promise.resolve([] as RawLog[]),
+    ]);
+    const toLog = (l: RawLog, address: string) => ({ transactionHash: l.transactionHash, transactionIndex: Number(l.transactionIndex), blockNumber: Number(l.blockNumber), address });
+    // A V4 swap counts as touching "the pool" whose id is in topic 1.
+    const logs = [...plain.map((l) => toLog(l, l.address)), ...v4.map((l) => toLog(l, (l.topics?.[1] ?? '').toLowerCase()))];
     const rival = CompetitorTracker.findRivalArb(logs, job.pools, { hash: job.triggerHash, block: receipt.blockNumber, index: receipt.index });
     if (!rival) return { found: false, ourReadyMs: job.ourReadyMs, profitUsd: job.profitUsd };
     const seenAt = this.seen.get(rival.hash);

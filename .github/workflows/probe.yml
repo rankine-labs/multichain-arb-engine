@@ -9,9 +9,13 @@ on:
   workflow_dispatch:
     inputs:
       only:
-        description: 'Run one step only: feeds, sim, pairs, watch, universe, backtest, latency, lenders, smoke, seed, routers, v4, arbsys (blank = all except backtest)'
+        description: 'Run one step only: feeds, sim, pairs, watch, universe, backtest, latency, lenders, smoke, seed, routers, v4, arbsys, nodes (blank = all except backtest)'
         required: false
         default: ''
+
+# Read-only token: these jobs only check out code and run tests/probes.
+permissions:
+  contents: read
 
 jobs:
   probe:
@@ -143,6 +147,14 @@ jobs:
           echo "$out"
           out="${out//'%'/'%25'}"; out="${out//$'\n'/'%0A'}"
           echo "::notice title=ArbSys::${out}"
+      - name: Free RPC nodes compared
+        if: inputs.only == 'nodes'
+        shell: bash
+        run: |
+          out=$(timeout 180 node .scripts-build/scripts/probe-nodes.js 2>&1 | tail -10 || true)
+          echo "$out"
+          out="${out//'%'/'%25'}"; out="${out//$'\n'/'%0A'}"
+          echo "::notice title=Nodes::${out}"
       - name: Export top pairs (backup list the bot starts from)
         if: inputs.only == 'seed'
         shell: bash

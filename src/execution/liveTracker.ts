@@ -34,6 +34,8 @@ export interface LiveTrackerDeps {
   notify: (html: string) => Promise<void> | void;     // Telegram
   pollMs?: number;
   timeoutMs?: number;
+  onSettled?: (hash: string) => void;   // receipt arrived or gave up (release the pending-loss hold)
+  onDropped?: () => void;               // never mined: resync the nonce
 }
 
 export class LiveTradeTracker {
@@ -49,10 +51,12 @@ export class LiveTradeTracker {
     while (Date.now() < deadline) {
       let receipt: ethers.TransactionReceipt | null = null;
       try { receipt = await this.d.provider.getTransactionReceipt(hash); } catch { /* retry */ }
-      if (receipt) { this.record(hash, meta, receipt); return; }
+      if (receipt) { this.d.onSettled?.(hash); this.record(hash, meta, receipt); return; }
       await new Promise((r) => setTimeout(r, poll));
     }
-    // Never mined: no gas paid, but worth knowing.
+    // Never mined: no gas paid, but worth knowing. Its nonce is free again.
+    this.d.onSettled?.(hash);
+    this.d.onDropped?.();
     const r: LiveResult = { hash, label: meta.label, status: 'dropped', gasUsd: 0, expectedProfitUsd: meta.expectedProfitUsd };
     this.results.push(r);
     await this.d.notify(`⚪ <b>TRADE DROPPED</b> · ${meta.label}\nNever mined within ${Math.round((this.d.timeoutMs ?? 90_000) / 1000)}s · no cost`);

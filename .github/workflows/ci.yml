@@ -16,6 +16,10 @@ on:
   push:
   pull_request:
 
+# Read-only token: these jobs only check out code and run tests/probes.
+permissions:
+  contents: read
+
 jobs:
   check:
     runs-on: ubuntu-latest
