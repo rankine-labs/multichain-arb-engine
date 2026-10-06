@@ -74,6 +74,23 @@ export class PoolCache {
                                                                                             return results;
                                                                                               }
 
+  // Memory: drop pools nobody needs any more (not kept by the caller, e.g.
+  // not in a watched pair, and not updated for maxAgeMs). Without this the
+  // cache only ever grew: every pool seen in any trade stayed forever and
+  // every peer lookup scanned all of them. Returns how many were removed.
+  prune(keep: (p: PoolState) => boolean, maxAgeMs: number, now = Date.now()): number {
+    let n = 0;
+    for (const [k, p] of this.pools) {
+      if (keep(p) || now - p.lastUpdatedMs < maxAgeMs) continue;
+      this.pools.delete(k);
+      this.skips.delete(k);
+      this.feedApplied.delete(k);
+      n++;
+    }
+    return n;
+  }
+
+
                                                                                                 allForChain(chain: ChainName): PoolState[] {
                                                                                                     return [...this.pools.values()].filter(p => p.chain === chain);
                                                                                                       }

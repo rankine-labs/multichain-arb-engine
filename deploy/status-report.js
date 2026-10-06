@@ -115,12 +115,18 @@ async function main() {
   const rivalMs = rivalLines.map((l) => /theirs (\d+)ms/.exec(l)).filter(Boolean).map((m) => Number(m[1])).sort((a, b) => a - b);
   const oursMs = rivalLines.map((l) => /ours (\d+)ms/.exec(l)).filter(Boolean).map((m) => Number(m[1])).sort((a, b) => a - b);
   const med = (xs) => (xs.length ? xs[Math.floor(xs.length / 2)] : null);
+  // 3 requests on one kept-alive connection; the BEST is reported. A single
+  // cold request mostly measured the connection setup (DNS + TLS), which
+  // made the number jump around.
   let rpcRtt = null;
-  try {
-    const t = Date.now();
-    await fetch('https://rpc.mainnet.chain.robinhood.com', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}' });
-    rpcRtt = Date.now() - t;
-  } catch { /* skip */ }
+  for (let i = 0; i < 3; i++) {
+    try {
+      const t = Date.now();
+      await fetch('https://rpc.mainnet.chain.robinhood.com', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}' });
+      const ms = Date.now() - t;
+      if (rpcRtt === null || ms < rpcRtt) rpcRtt = ms;
+    } catch { /* skip */ }
+  }
   const newPairs = outL.filter((l) => /\[pairs\] .* watching /.test(l)).map((l) => l.replace(/^\[pairs\] \w+ watching /, '').split(':')[0]);
   const poolLookups = count(outL, /\[discovery\] rejected/);
 
@@ -155,7 +161,7 @@ async function main() {
     `- Trades that needed a pool lookup: ${poolLookups}`,
     `- Fire-ready (trigger seen -> signed trade): ${fireReady.length ? `${med(fireReady)} ms median over ${fireReady.length}` : 'no qualifying trades this window'}`,
     `- Rivals: ${rivalLines.length ? `${rivalLines.length} rival arbs timed · theirs ${med(rivalMs) ?? '?'} ms median vs ours ${med(oursMs) ?? '?'} ms` : 'none timed this window'}`,
-    `- RPC round trip from the server: ${rpcRtt ?? '?'} ms`,
+    `- RPC round trip from the server (public node, best of 3): ${rpcRtt ?? '?'} ms`,
     `- Real-chain test runs: ${simProfit} profitable · ${simLoss} losing · ${simFail} would fail`,
     `- Dry run, would have earned (if we won every race): ${lastPnl ? lastPnl.replace(/^\[pnl\] would-have-earned /, '') : 'first figure after the next hourly report'}`,
     '',
