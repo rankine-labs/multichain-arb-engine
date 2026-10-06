@@ -1,6 +1,7 @@
 import { ethers } from 'ethers';
 import { isRateLimited } from '../execution/simulator';
 import { endpointLabel } from './endpointLabel';
+import { budgetForUrl, callsInBody } from './nodeBudget';
 
 // ============================================================================
 // FAST / HEAVY RPC SPLIT WITH FAILOVER
@@ -181,7 +182,13 @@ export class FailoverRouter {
       if (!Array.isArray(payload) && smallRequest(payload)) this.noteTime(f, this.now() - t0);
       return results;
     }
-    if (!this.heavy) throw new Error('no RPC node available');
+    if (!this.heavy) {
+      // No paid fallback (e.g. it's out for the month): every free node is
+      // resting, so ask the main one anyway; a slow answer beats none.
+      const main = this.fasts.find((f) => !f.backup) ?? this.fasts[0];
+      if (!main) throw new Error('no RPC node available');
+      return main.send(payload);
+    }
     try {
       return await this.heavy.send(payload);
     } catch (err) {
@@ -202,6 +209,16 @@ function fastRequest(url: string, timeoutMs: number): ethers.FetchRequest {
   const req = new ethers.FetchRequest(url);
   req.timeout = timeoutMs;
   req.setThrottleParams({ maxAttempts: 1 });
+  meter(req, url);
+  return req;
+}
+
+// Every request to a metered node waits under its speed limit and counts
+// against its daily allowance (core/nodeBudget.ts). Over the allowance it
+// fails with a "429"-style error, which the router treats like a rate limit.
+export function meter(req: ethers.FetchRequest, url: string): ethers.FetchRequest {
+  const b = budgetForUrl(url);
+  if (b) req.preflightFunc = async (r) => { await b.take(callsInBody(r.body)); return r; };
   return req;
 }
 
@@ -219,7 +236,8 @@ export class FailoverJsonRpcProvider extends ethers.JsonRpcProvider {
 
   constructor(fastUrl: string, heavyUrl: string | null, chainId: number, opts: { restMs?: number; fastTimeoutMs?: number; slowMs?: number; extraFastUrls?: string[]; backupUrls?: string[]; logTag?: string } = {}) {
     super(fastRequest(fastUrl, opts.fastTimeoutMs ?? 5_000), chainId, { staticNetwork: true });
-    this.heavyProvider = heavyUrl && heavyUrl !== fastUrl ? new ethers.JsonRpcProvider(heavyUrl, chainId, { staticNetwork: true }) : null;
+    // HEAVY: metered too, and no long built-in retries (fail fast, switch).
+    this.heavyProvider = heavyUrl && heavyUrl !== fastUrl ? new ethers.JsonRpcProvider(fastRequest(heavyUrl, 10_000), chainId, { staticNetwork: true }) : null;
     const heavyProvider = this.heavyProvider;
     const extras = (opts.extraFastUrls ?? []).filter((u) => u && u !== fastUrl && u !== heavyUrl);
     this.extraFast = extras.map((u) => new ethers.JsonRpcProvider(fastRequest(u, opts.fastTimeoutMs ?? 5_000), chainId, { staticNetwork: true }));

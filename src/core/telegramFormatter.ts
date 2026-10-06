@@ -286,7 +286,10 @@ export interface PlainHourlyInput {
   reactionMs: { typical: number | null; slowest5pct: number | null };
   otherBots?: { timed: number; theirMs: number | null; oursMs: number | null; weBeat: number };
   topDifferences: { pair: string; pct: number; buyAt: string; sellAt: string }[];
+  nodeUsage?: { name: string; used: number; daily: number }[]; // today's requests per node vs allowance
 }
+
+const NODE_NAMES: Record<string, string> = { public: 'Robinhood (free)', nodeflare: 'Nodeflare (backup)', quicknode: 'QuickNode (checks)', alchemy: 'Alchemy (scan)' };
 
 // "uniswap-v3 1%" -> "Uniswap V3 (1% fee)"; "uniswap-v4 0.3% ETH" -> "Uniswap V4 (0.3% fee, ETH)".
 const DEX_NAMES: Record<string, string> = {
@@ -350,6 +353,20 @@ export function formatPlainHourly(r: PlainHourlyInput): string {
     L.push(`Other bots timed: ${o.timed}${o.theirMs !== null && o.oursMs !== null ? `. Them ${secs(o.theirMs)}, us ${secs(o.oursMs)}` : ''}${o.weBeat ? `, we'd have been first ${o.weBeat}x` : ''}`);
   }
   L.push('');
+
+  if (r.nodeUsage?.length) {
+    L.push('<b>Node usage today</b> (requests vs daily allowance)');
+    for (const u of r.nodeUsage) {
+      const label = NODE_NAMES[u.name] ?? u.name;
+      if (u.daily === Infinity || !Number.isFinite(u.daily)) { L.push(`• ${esc(label)}: ${u.used.toLocaleString('en-US')} (no daily cap)`); continue; }
+      const share = u.used / u.daily;
+      const mark = share >= 1 ? '❌' : share >= 0.8 ? '⚠️' : '✅';
+      L.push(`• ${esc(label)}: ${u.used.toLocaleString('en-US')} of ${u.daily.toLocaleString('en-US')} ${mark}`);
+      if (share >= 1) attention.push(`${label} used its whole allowance for today; its job is paused until midnight UTC (8 pm Toronto).`);
+      else if (share >= 0.8) attention.push(`${label} is at ${Math.round(share * 100)}% of today's allowance.`);
+    }
+    L.push('');
+  }
 
   if (r.topDifferences.length) {
     L.push('<b>Biggest price differences</b> (before fees, not profit)');

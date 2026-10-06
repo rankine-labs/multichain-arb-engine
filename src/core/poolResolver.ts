@@ -297,8 +297,8 @@ export async function resolveAndFetchV3Pool(
 //   In 'spacing' mode the fee is read from the pool itself.
 // ============================================================================
 
-const V3_FEE_TIERS_ALL = [100, 500, 2500, 3000, 10000];
-const V3_TICK_SPACINGS = [1, 5, 10, 50, 100, 200];
+export const V3_FEE_TIERS_ALL = [100, 500, 2500, 3000, 10000];
+export const V3_TICK_SPACINGS = [1, 5, 10, 50, 100, 200];
 const V3_FACTORY_BY_SPACING_ABI = ['function getPool(address tokenA, address tokenB, int24 tickSpacing) view returns (address pool)'];
 const V3_POOL_FEE_ABI = ['function fee() view returns (uint24)'];
 
@@ -498,7 +498,7 @@ const V4_STATE_VIEW_ABI = [
       'function getLiquidity(bytes32 poolId) view returns (uint128 liquidity)',
     ];
 
-const STANDARD_V4_FEE_TIERS: [number, number][] = [
+export const STANDARD_V4_FEE_TIERS: [number, number][] = [
       [500, 10],
       [3000, 60],
       [10000, 200],

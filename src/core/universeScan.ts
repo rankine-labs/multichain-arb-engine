@@ -87,35 +87,42 @@ export async function makeCaller(provider: ethers.JsonRpcProvider): Promise<{ ca
   let multicall = false;
   try { multicall = (await provider.getCode(MULTICALL3)).length > 2; } catch { /* treat as absent */ }
 
-  // One eth_call with up to 2 attempts (transient RPC errors are common on public nodes).
+  // One eth_call with up to 2 attempts. A revert is a real answer (null).
+  // Anything else after 2 tries (rate limit, timeout, network) is THROWN:
+  // returning null there made callers read "no pool" and, worse, made a
+  // failed bundle fall back to hundreds of single calls (a burst that got us
+  // rate-limited). The caller retries later instead.
   const rawCall = async (c: Call): Promise<string | null> => {
+    let last: unknown;
     for (let i = 0; i < 2; i++) {
       try { return await provider.call({ to: c.target, data: c.data }); }
       catch (err) {
-        // A real revert won't fix itself on retry.
         if ((err as any)?.code === 'CALL_EXCEPTION') return null;
+        last = err;
         await sleep(300);
       }
     }
-    return null;
+    throw last;
   };
 
   if (multicall) {
-    const CHUNK = 400; // reads per request; a failed batch falls back to single calls
-    const callMany: CallMany = async (calls) => {
-      const out: (string | null)[] = new Array(calls.length).fill(null);
-      for (let i = 0; i < calls.length; i += CHUNK) {
-        const slice = calls.slice(i, i + CHUNK);
-        const data = mc3.encodeFunctionData('aggregate3', [slice.map((c) => ({ target: c.target, allowFailure: true, callData: c.data }))]);
-        const ret = await rawCall({ target: MULTICALL3, data });
-        if (!ret) {
-          // Whole batch failed (e.g. response too big): fall back to single calls for this chunk.
-          for (let j = 0; j < slice.length; j++) out[i + j] = await rawCall(slice[j]);
-          continue;
-        }
+    const CHUNK = 400; // reads per request
+    // One bundle. If the node rejects it as too big (revert / out of gas),
+    // split it in half and try each half: a few requests, never hundreds.
+    const bundle = async (slice: Call[]): Promise<(string | null)[]> => {
+      const data = mc3.encodeFunctionData('aggregate3', [slice.map((c) => ({ target: c.target, allowFailure: true, callData: c.data }))]);
+      const ret = await rawCall({ target: MULTICALL3, data }); // throws on rate limit / network
+      if (ret) {
         const [results] = mc3.decodeFunctionResult('aggregate3', ret);
-        results.forEach((r: any, j: number) => { out[i + j] = r.success && r.returnData !== '0x' ? r.returnData : null; });
+        return results.map((r: any) => (r.success && r.returnData !== '0x' ? r.returnData : null));
       }
+      if (slice.length === 1) return [await rawCall(slice[0])];
+      const mid = Math.ceil(slice.length / 2);
+      return [...(await bundle(slice.slice(0, mid))), ...(await bundle(slice.slice(mid)))];
+    };
+    const callMany: CallMany = async (calls) => {
+      const out: (string | null)[] = [];
+      for (let i = 0; i < calls.length; i += CHUNK) out.push(...(await bundle(calls.slice(i, i + CHUNK))));
       return out;
     };
     return { callMany, multicall };
