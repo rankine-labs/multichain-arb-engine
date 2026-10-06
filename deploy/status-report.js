@@ -110,6 +110,16 @@ async function main() {
   // Live watch list (logged every 15 min), shown instead of the scan's line
   // when present: the scan line only updates every 6 h.
   const watchList = lastMatch(bigTail, /^\[pairs\] robinhood watch list:/);
+  // Which node the bot reads prices from: the latest switch line ("[rpc] ...")
+  // tells us; none at all since start = always on the main free node.
+  const rpcLine = lastMatch(bigTail, /^\[rpc\] /);
+  const rpcSwitches = count(outL, /^\[rpc\] .*(rested|fast path ->)/);
+  let readsOn = 'main free node (no switches since start)';
+  if (rpcLine) {
+    if (/fast path back on/.test(rpcLine)) readsOn = 'main free node (back after a rest)';
+    else if (/fast path -> (.+?) for/.test(rpcLine)) readsOn = `${/fast path -> (.+?) for/.exec(rpcLine)[1]} (main free node resting: ${(/\(([^)]*)\)\s*$/.exec(rpcLine) || [])[1] || '?'})`;
+    else if (/reads on (.+)$/.test(rpcLine)) readsOn = `${/reads on (.+)$/.exec(rpcLine)[1]} (${(/\(([^)]*)\)/.exec(rpcLine) || [])[1] || 'a node is resting'})`;
+  }
   const simProfit = count(outL, /\[sim\].*REAL PROFIT/);
   const simLoss = count(outL, /\[sim\].*real: LOSS/);
   const simFail = count(outL, /\[sim\].*real: FAILS/);
@@ -165,6 +175,7 @@ async function main() {
     `- Trades that needed a pool lookup: ${poolLookups}`,
     `- Fire-ready (trigger seen -> signed trade): ${fireReady.length ? `${med(fireReady)} ms median over ${fireReady.length}` : 'no qualifying trades this window'}`,
     `- Rivals: ${rivalLines.length ? `${rivalLines.length} rival arbs timed · theirs ${med(rivalMs) ?? '?'} ms median vs ours ${med(oursMs) ?? '?'} ms` : 'none timed this window'}`,
+    `- Prices read from: ${readsOn} · ${rpcSwitches} node switch(es) this window`,
     `- RPC round trip from the server (public node, best of 3): ${rpcRtt ?? '?'} ms`,
     `- Real-chain test runs: ${simProfit} profitable · ${simLoss} losing · ${simFail} would fail`,
     `- Dry run, would have earned (if we won every race): ${lastPnl ? lastPnl.replace(/^\[pnl\] would-have-earned /, '') : 'first figure after the next hourly report'}`,

@@ -159,13 +159,22 @@ fi
 PREV_SHA="$LOCAL_SHA"
 
 # --- 3. Pull the new code (fast-forward only, never force) --------------------
+# npm writes its own package-lock.json on the server. If the repo starts
+# tracking one, that untracked copy would block the pull ("would be
+# overwritten") and look like diverged history. Remove it only when it's
+# untracked here AND the incoming commit has one.
+if [ -f package-lock.json ] && ! git ls-files --error-unmatch package-lock.json > /dev/null 2>&1 \
+   && git cat-file -e "origin/$BRANCH:package-lock.json" 2>/dev/null; then
+  log "Removing the server's untracked package-lock.json (the repo now has one)"
+  rm -f package-lock.json
+fi
 if ! git merge --ff-only --quiet "origin/$BRANCH"; then
   notify_not_deployed "Server history has diverged from GitHub (fast-forward impossible). Needs a manual look."
   mark_failed "$REMOTE_SHA"; exit 1
 fi
 
 PKG_CHANGED=0
-if ! git diff --quiet "$PREV_SHA" "$REMOTE_SHA" -- package.json; then
+if ! git diff --quiet "$PREV_SHA" "$REMOTE_SHA" -- package.json package-lock.json; then
   PKG_CHANGED=1
 fi
 
