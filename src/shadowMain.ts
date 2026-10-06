@@ -79,7 +79,7 @@ import { scanUniverse, emptyScanState, ScanState } from './core/universeScan';
 import { readFileSync, writeFileSync, mkdirSync, renameSync } from 'fs';
 import { ROBINHOOD_SCAN_FACTORIES } from './config/knownAddresses';
 import { buildExecuteCall, executionRequested, executorConfig, pickV3Lender } from './execution/executorCalldata';
-import { makeRpc, simulateRoundTrip, simRpcUrl, Rpc } from './execution/simulator';
+import { makeRpc, simulateRoundTrip, simRpcUrl, Rpc, makeFallbackRpc } from './execution/simulator';
 import { FastSender, SafetyGate, safetyConfigFromEnv } from './execution/fastSender';
 import { checkLiveReady } from './execution/liveReadiness';
 import { LiveTradeTracker } from './execution/liveTracker';
@@ -144,8 +144,13 @@ const priceOracle = new PriceOracle(cache, (chain, token) => {
       // before Alchemy (ROBINHOOD_BACKUP_RPC, e.g. Nodeflare).
       const rhBackup = (process.env.ROBINHOOD_BACKUP_RPC ?? '').split(',').map((u) => u.trim()).filter(Boolean);
       const robinhoodReadProvider = new FailoverJsonRpcProvider(rhFastUrl, rhHeavyUrl, 4663, { extraFastUrls: rhExtraFast, backupUrls: rhBackup });
-      // Bursty work (the chain-wide scan) goes straight to HEAVY.
-      const robinhoodHeavyProvider = rhHeavyUrl ? new ethers.JsonRpcProvider(rhHeavyUrl, 4663, { staticNetwork: true }) : robinhoodReadProvider;
+      // Bursty work (pool discovery, the chain-wide scan) goes to HEAVY
+      // (Alchemy) first, with the public node as ITS fallback: when Alchemy
+      // refuses (rate limit / plan limit), discovery used to stall completely
+      // (watch list stuck at 0). No slow retries on Alchemy: fail fast, switch.
+      const robinhoodHeavyProvider = rhHeavyUrl
+            ? new FailoverJsonRpcProvider(rhHeavyUrl, rhFastUrl, 4663, { logTag: 'rpc:heavy', fastTimeoutMs: 10_000, slowMs: 2_000 })
+            : robinhoodReadProvider;
 
       // Decoder gets the pool cache so it can decode Monad Swap logs (a log
       // only names the pool; the cache knows its tokens).
@@ -298,7 +303,11 @@ Object.entries(discoveryConfigs).map(([chain, cfg]) => [chain, new PoolDiscovery
 const simRpc: Record<string, Rpc> = {};
 for (const chain of ['avalanche', 'monad', 'robinhood'] as const) {
       const { url, source } = simRpcUrl(chain);
-      simRpc[chain] = makeRpc(url);
+      // Robinhood: if the paid node refuses (rate/plan limit), simulate on the
+      // public node instead of stopping real-chain tests altogether.
+      simRpc[chain] = chain === 'robinhood' && url !== ROBINHOOD_PUBLIC_RPC
+            ? makeFallbackRpc(makeRpc(url), makeRpc(ROBINHOOD_PUBLIC_RPC), (m) => console.warn(`[sim] robinhood ${m}`))
+            : makeRpc(url);
       console.log(`[sim] ${chain}: simulating on ${source}`); // never log the URL itself (it holds your API key)
 }
 // When an endpoint says "slow down", pause that chain's simulations.

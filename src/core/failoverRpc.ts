@@ -87,7 +87,7 @@ export class FailoverRouter {
   constructor(
     fast: Endpoint | Endpoint[],
     private readonly heavy: Endpoint | null, // null = no paid node: FAST only
-    private readonly opts: { restMs?: number; slowMs?: number; now?: () => number; log?: (line: string) => void; backups?: Endpoint[] } = {},
+    private readonly opts: { restMs?: number; slowMs?: number; now?: () => number; log?: (line: string) => void; backups?: Endpoint[]; logTag?: string } = {},
   ) {
     this.fasts = [
       ...(Array.isArray(fast) ? fast : [fast]).map((f) => ({ ...f, restUntil: 0, avgMs: null, samples: 0 })),
@@ -96,7 +96,9 @@ export class FailoverRouter {
   }
 
   private now() { return (this.opts.now ?? Date.now)(); }
-  private log(line: string) { (this.opts.log ?? console.log)(line); }
+  // logTag lets a second router (e.g. the heavy one) log as [rpc:heavy] so
+  // the status page's "prices read from" line only follows the price router.
+  private log(line: string) { (this.opts.log ?? console.log)(this.opts.logTag ? line.replace(/^\[rpc\]/, `[${this.opts.logTag}]`) : line); }
   private get restMs() { return this.opts.restMs ?? 5 * 60_000; }
   private get slowMs() { return this.opts.slowMs ?? Number(process.env.RPC_SLOW_MS ?? 300); }
 
@@ -195,7 +197,7 @@ export class FailoverJsonRpcProvider extends ethers.JsonRpcProvider {
   // QuickNode / Nodeflare endpoint), from ROBINHOOD_FAST_RPC_EXTRA.
   private readonly backupProviders: ethers.JsonRpcProvider[];
 
-  constructor(fastUrl: string, heavyUrl: string | null, chainId: number, opts: { restMs?: number; fastTimeoutMs?: number; slowMs?: number; extraFastUrls?: string[]; backupUrls?: string[] } = {}) {
+  constructor(fastUrl: string, heavyUrl: string | null, chainId: number, opts: { restMs?: number; fastTimeoutMs?: number; slowMs?: number; extraFastUrls?: string[]; backupUrls?: string[]; logTag?: string } = {}) {
     super(fastRequest(fastUrl, opts.fastTimeoutMs ?? 5_000), chainId, { staticNetwork: true });
     this.heavyProvider = heavyUrl && heavyUrl !== fastUrl ? new ethers.JsonRpcProvider(heavyUrl, chainId, { staticNetwork: true }) : null;
     const heavyProvider = this.heavyProvider;
@@ -210,7 +212,7 @@ export class FailoverJsonRpcProvider extends ethers.JsonRpcProvider {
       ],
       heavyProvider ? { label: endpointLabel(heavyUrl!), send: (p) => heavyProvider._send(p) } : null,
       {
-        restMs: opts.restMs, slowMs: opts.slowMs,
+        restMs: opts.restMs, slowMs: opts.slowMs, logTag: opts.logTag,
         backups: this.backupProviders.map((prov, i) => ({ label: endpointLabel(backups[i]) + ' (backup)', send: (p: ethers.JsonRpcPayload | ethers.JsonRpcPayload[]) => prov._send(p) })),
       },
     );

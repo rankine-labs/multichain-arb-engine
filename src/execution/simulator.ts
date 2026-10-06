@@ -86,6 +86,23 @@ export function makeRpc(url: string, timeoutMs = 8_000): Rpc {
   };
 }
 
+// Primary RPC with a fallback: when the primary says "slow down" or can't be
+// reached, it's rested for 5 min and the fallback answers meanwhile. Revert
+// data and other real answers pass straight through (they're results).
+export function makeFallbackRpc(primary: Rpc, fallback: Rpc, log: (msg: string) => void = () => {}, restMs = 5 * 60_000, now: () => number = Date.now): Rpc {
+  let restUntil = 0;
+  return async (method, params) => {
+    if (now() >= restUntil) {
+      const r = await primary(method, params);
+      const trouble = r.error && (isRateLimited(r.error) || (r.error.message ?? '').startsWith('network:'));
+      if (!trouble) return r;
+      restUntil = now() + restMs;
+      log(`paid node refused (${isRateLimited(r.error) ? 'rate/plan limit' : 'network'}), simulating on the public node for ${Math.round(restMs / 60_000)} min`);
+    }
+    return fallback(method, params);
+  };
+}
+
 const pad32 = (v: bigint | string): string =>
   ethers.zeroPadValue(typeof v === 'bigint' ? ethers.toBeHex(v) : v, 32);
 
