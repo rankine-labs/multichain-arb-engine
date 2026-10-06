@@ -205,11 +205,26 @@ export async function findBalanceSlot(rpc: Rpc, cacheKey: string, token: string)
   const diff: Record<string, string> = {};
   specs.forEach((sp, i) => { diff[keyFnFor(sp)(SIM_EXECUTOR_ADDRESS)] = pad32(BASE + BigInt(i)); });
 
+  // Try a group of candidates at once. If the token also reads another
+  // per-account setting (e.g. a "frozen" flag), overriding everything at
+  // once can switch that on and hide the answer, so a miss splits the group
+  // in half and tries each half: at most 3 levels (~15 requests), never 122.
+  let unsupported = false;
+  const search = async (idx: number[], depth: number): Promise<SlotSpec | null> => {
+    const d: Record<string, string> = {};
+    for (const i of idx) d[keyFnFor(specs[i])(SIM_EXECUTOR_ADDRESS)] = diff[keyFnFor(specs[i])(SIM_EXECUTOR_ADDRESS)];
+    const got = await call(d);
+    if (got === 'unsupported') { unsupported = true; return null; }
+    if (got !== null && got >= BASE && got < BASE + BigInt(specs.length) && idx.includes(Number(got - BASE))) return specs[Number(got - BASE)];
+    if (depth >= 3 || idx.length < 2) return null;
+    const mid = Math.ceil(idx.length / 2);
+    return (await search(idx.slice(0, mid), depth + 1)) ?? (unsupported ? null : await search(idx.slice(mid), depth + 1));
+  };
+
   let found: SlotInfo = null;
-  const got = await call(diff);
-  if (got === 'unsupported') found = { unsupported: 'RPC does not support eth_call state overrides' };
-  else if (got !== null && got >= BASE && got < BASE + BigInt(specs.length)) {
-    const spec = specs[Number(got - BASE)];
+  const spec = await search(specs.map((_, i) => i), 0);
+  if (unsupported) found = { unsupported: 'RPC does not support eth_call state overrides' };
+  else if (spec) {
     // Confirm with that one key alone (guards against odd tokens).
     const magic = 0x1234567890abcdefn;
     const check = await call({ [keyFnFor(spec)(SIM_EXECUTOR_ADDRESS)]: pad32(magic) });

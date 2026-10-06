@@ -50,5 +50,20 @@ async function main() {
   assert(calls === 2, `found in 2 requests (was up to 122): ${calls}`);
   const again = await findBalanceSlot(rpc, 'test:token', '0x' + '77'.repeat(20));
   assert(again === found && calls === 2, 'second lookup is free (cached)');
+
+  // Token that ALSO reads a per-account "frozen" flag at slot 3: if that key
+  // is overridden too, balanceOf returns 0 (hides the answer).
+  let calls2 = 0;
+  const rpc2: Rpc = async (_m, params: any[]) => {
+    calls2++;
+    const holder = '0x' + params[0].data.slice(-40);
+    const balKey = ethers.keccak256(abi.encode(['address', 'uint256'], [holder, 7]));
+    const frozenKey = ethers.keccak256(abi.encode(['address', 'uint256'], [holder, 3]));
+    const diff = params[2][params[0].to].stateDiff as Record<string, string>;
+    if (diff[frozenKey]) return { result: ethers.zeroPadValue('0x00', 32) };
+    return { result: ethers.zeroPadValue(diff[balKey] ?? '0x00', 32) };
+  };
+  const f2 = await findBalanceSlot(rpc2, 'test:frozen', '0x' + '88'.repeat(20));
+  assert(!!f2 && 'key' in f2 && calls2 <= 16, `token with a frozen flag: found by splitting (${calls2} requests)`);
 }
 main().catch((e) => { console.error('FAIL: crashed', e); process.exitCode = 1; });
