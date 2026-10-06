@@ -7,7 +7,7 @@
 #     1. Pulls it
 #     2. Makes sure it compiles and all tests pass
 #     3. Builds dist/ (pm2 runs dist/shadowMain.js) and restarts the bot (pm2)
-#     4. Watches the bot for 30 seconds to make sure it stays up
+#     4. Watches the whole startup (up to 7 min) for crashes, then 30 s more
 #   If ANY step fails, it rolls back to the previous working version,
 #   restarts that, and sends you a Telegram alert. Success also alerts.
 #
@@ -169,18 +169,47 @@ if ! git diff --quiet "$PREV_SHA" "$REMOTE_SHA" -- package.json; then
   PKG_CHANGED=1
 fi
 
+pm2_info() {
+  # Prints "<status> <restart count>" for the bot, or "missing 0"
+  pm2 jlist 2>/dev/null | node -e '
+    let s = ""; process.stdin.on("data", d => s += d).on("end", () => {
+      try {
+        const p = JSON.parse(s).find(x => x.name === process.argv[1]);
+        console.log(p ? `${p.pm2_env.status} ${p.pm2_env.restart_time}` : "missing 0");
+      } catch { console.log("missing 0"); }
+    });' "$PM2_NAME"
+}
+
 rollback() {
   local reason="$1"
   log "Rolling back to ${PREV_SHA:0:7}: $reason"
-  git reset --hard --quiet "$PREV_SHA"
-  if [ "$PKG_CHANGED" = 1 ]; then npm install --no-audit --no-fund > /dev/null 2>&1; fi
+  # Every rollback step is checked: a failed rollback must say so, not
+  # claim the old version is running.
+  local rb_err=""
+  git reset --hard --quiet "$PREV_SHA" || rb_err="git reset failed"
+  if [ -z "$rb_err" ] && [ "$PKG_CHANGED" = 1 ]; then
+    npm install --no-audit --no-fund > /dev/null 2>&1 || rb_err="npm install of the old version failed"
+  fi
   # Rebuild the old version too: pm2 runs the compiled dist/, not src/.
-  npm run build > /dev/null 2>&1
-  pm2 restart "$PM2_NAME" --update-env > /dev/null 2>&1
-  notify "🔴 <b>DEPLOY FAILED</b> <code>${SHORT}</code>
+  if [ -z "$rb_err" ]; then npm run build > /dev/null 2>&1 || rb_err="build of the old version failed (dist/ may be missing)"; fi
+  if [ -z "$rb_err" ]; then pm2 restart "$PM2_NAME" --update-env > /dev/null 2>&1 || rb_err="pm2 restart of the old version failed"; fi
+  if [ -z "$rb_err" ]; then
+    sleep 20
+    read -r RB_STATUS _ <<< "$(pm2_info)"
+    [ "$RB_STATUS" = "online" ] || rb_err="old version not running after rollback (status: $RB_STATUS)"
+  fi
+  if [ -n "$rb_err" ]; then
+    notify "🆘 <b>DEPLOY FAILED + ROLLBACK FAILED</b> <code>${SHORT}</code>
+$(html "$SUBJECT")
+Reason: $(html "$reason")
+Rollback: $(html "$rb_err")
+Bot may be DOWN. Needs a manual look (pm2 logs $PM2_NAME)."
+  else
+    notify "🔴 <b>DEPLOY FAILED</b> <code>${SHORT}</code>
 $(html "$SUBJECT")
 Reason: $(html "$reason")
 ↩️ Rolled back to <code>${PREV_SHA:0:7}</code>, bot running old version"
+  fi
   mark_failed "$REMOTE_SHA"
   exit 1
 }
@@ -199,33 +228,52 @@ npm test          || rollback "tests failed"
 npm run build     || rollback "build failed"
 
 # --- 5. Restart and watch it stay up -----------------------------------------
-pm2_info() {
-  # Prints "<status> <restart count>" for the bot, or "missing 0"
-  pm2 jlist 2>/dev/null | node -e '
-    let s = ""; process.stdin.on("data", d => s += d).on("end", () => {
-      try {
-        const p = JSON.parse(s).find(x => x.name === process.argv[1]);
-        console.log(p ? `${p.pm2_env.status} ${p.pm2_env.restart_time}` : "missing 0");
-      } catch { console.log("missing 0"); }
-    });' "$PM2_NAME"
-}
+# Where pm2 writes the bot's output, and how big it is before the restart,
+# so we only look for the startup line in NEW output.
+OUT_LOG="$(pm2 jlist 2>/dev/null | node -e '
+  let s = ""; process.stdin.on("data", d => s += d).on("end", () => {
+    try { const p = JSON.parse(s).find(x => x.name === process.argv[1]); console.log(p ? p.pm2_env.pm_out_log_path : ""); }
+    catch { console.log(""); }
+  });' "$PM2_NAME")"
+LOG_START=$(stat -c %s "$OUT_LOG" 2>/dev/null || echo 0)
 
 pm2 restart "$PM2_NAME" --update-env > /dev/null 2>&1 || rollback "pm2 restart failed"
 sleep 5
 read -r STATUS_A RESTARTS_A <<< "$(pm2_info)"
-sleep "$HEALTH_WAIT_SECONDS"
-read -r STATUS_B RESTARTS_B <<< "$(pm2_info)"
 
-if [ "$STATUS_B" != "online" ]; then
-  rollback "bot not running after restart (status: $STATUS_B)"
-fi
-if [ "$RESTARTS_B" != "$RESTARTS_A" ]; then
-  rollback "bot crashed and restarted $((RESTARTS_B - RESTARTS_A))x in the first ${HEALTH_WAIT_SECONDS}s"
-fi
+# Startup takes minutes (pair discovery, scans), so watch the WHOLE startup:
+# up to STARTUP_WAIT_SECONDS for "[startup] fully running", rolling back on
+# any crash in that window, then HEALTH_WAIT_SECONDS more to be sure it stays
+# up. (The old 35 s check passed builds that crashed later in startup.)
+STARTUP_WAIT_SECONDS=${STARTUP_WAIT_SECONDS:-420}
+STARTED=0
+waited=0
+while [ "$waited" -lt "$STARTUP_WAIT_SECONDS" ]; do
+  sleep 10; waited=$((waited + 10))
+  read -r STATUS_B RESTARTS_B <<< "$(pm2_info)"
+  [ "$STATUS_B" = "online" ] || rollback "bot not running after restart (status: $STATUS_B)"
+  [ "$RESTARTS_B" = "$RESTARTS_A" ] || rollback "bot crashed and restarted $((RESTARTS_B - RESTARTS_A))x during startup (${waited}s in)"
+  if [ -n "$OUT_LOG" ] && [ -f "$OUT_LOG" ]; then
+    size=$(stat -c %s "$OUT_LOG" 2>/dev/null || echo 0)
+    [ "$size" -lt "$LOG_START" ] && LOG_START=0   # log was rotated meanwhile
+    if tail -c +$((LOG_START + 1)) "$OUT_LOG" 2>/dev/null | grep -q '\[startup\] fully running'; then STARTED=1; break; fi
+  fi
+done
+
+sleep "$HEALTH_WAIT_SECONDS"
+read -r STATUS_C RESTARTS_C <<< "$(pm2_info)"
+[ "$STATUS_C" = "online" ] || rollback "bot stopped right after startup (status: $STATUS_C)"
+[ "$RESTARTS_C" = "$RESTARTS_A" ] || rollback "bot crashed and restarted $((RESTARTS_C - RESTARTS_A))x right after startup"
 
 rm -f "$FAILED_SHA_FILE"
-notify "🚀 <b>DEPLOYED</b> <code>${SHORT}</code>
+if [ "$STARTED" = 1 ]; then
+  notify "🚀 <b>DEPLOYED</b> <code>${SHORT}</code>
 $(html "$SUBJECT")
-✅ Bot up and stable"
+✅ Bot fully started and stable"
+else
+  notify "🚀 <b>DEPLOYED</b> <code>${SHORT}</code>
+$(html "$SUBJECT")
+⚠️ Bot is up with no crashes, but the startup-finished line wasn't seen within $((STARTUP_WAIT_SECONDS / 60)) min. Worth a look."
+fi
 exit 0
 }

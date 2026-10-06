@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       only:
-        description: 'Run one step only: feeds, sim, pairs, watch, universe, backtest, latency, lenders, smoke, seed, routers, v4 (blank = all except backtest)'
+        description: 'Run one step only: feeds, sim, pairs, watch, universe, backtest, latency, lenders, smoke, seed, routers, v4, arbsys (blank = all except backtest)'
         required: false
         default: ''
 
@@ -135,6 +135,14 @@ jobs:
           echo "$out"
           out="${out//'%'/'%25'}"; out="${out//$'\n'/'%0A'}"
           echo "::notice title=V4 pools::${out}"
+      - name: ArbSys block number (contract trade deadline)
+        if: inputs.only == 'arbsys'
+        shell: bash
+        run: |
+          out=$(timeout 120 node .scripts-build/scripts/probe-arbsys.js 2>&1 | tail -8 || true)
+          echo "$out"
+          out="${out//'%'/'%25'}"; out="${out//$'\n'/'%0A'}"
+          echo "::notice title=ArbSys::${out}"
       - name: Export top pairs (backup list the bot starts from)
         if: inputs.only == 'seed'
         shell: bash

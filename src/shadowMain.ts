@@ -81,6 +81,7 @@ import { ROBINHOOD_SCAN_FACTORIES } from './config/knownAddresses';
 import { buildExecuteCall, executionRequested, executorConfig, pickV3Lender } from './execution/executorCalldata';
 import { makeRpc, simulateRoundTrip, simRpcUrl, Rpc } from './execution/simulator';
 import { FastSender, SafetyGate, safetyConfigFromEnv } from './execution/fastSender';
+import { checkLiveReady } from './execution/liveReadiness';
 import { LiveTradeTracker } from './execution/liveTracker';
 import { findStandingGaps } from './core/gapScanner';
 import { CompetitorTracker } from './core/competitorTracker';
@@ -327,7 +328,9 @@ const checkRoundTrip = async (
       if (Date.now() < (simPausedUntil[chain] ?? 0)) return { status: 'rate_limited' };
       const decimals = TOKEN_DECIMALS[chain]?.[tokenIn.toLowerCase()];
       if (decimals === undefined) return { status: 'skipped', reason: 'unknown decimals' };
-      const lender = pickV3Lender(cache.allForChain(chain), tokenIn, [buyPool.poolAddress, sellPool.poolAddress]);
+      // Same lender choice as a live trade (approved FLASH_LENDERS only), so a
+      // "confirmed" profit is priced with the loan fee a real trade would pay.
+      const lender = pickV3Lender(lenderCandidates(chain), tokenIn, [buyPool.poolAddress, sellPool.poolAddress]);
       const built = buildExecuteCall({
             chain, tokenIn, buyPool, sellPool, tradeSizeUsd, netProfitUsd: 1,
             usdPerTokenIn: usdPerToken, tokenInDecimals: decimals, maxBlock: 0n,
@@ -351,7 +354,9 @@ const queueSimulation = (
       if (decimals === undefined) return;
       // Flash loan: borrow from the cheapest V3 pool holding the token that
       // isn't one of the trade's pools. None cached -> simulate own capital.
-      const lender = pickV3Lender(cache.allForChain(chain), tokenIn, [buyPool.poolAddress, sellPool.poolAddress]);
+      // Same lender choice as a live trade (approved FLASH_LENDERS only), so a
+      // "confirmed" profit is priced with the loan fee a real trade would pay.
+      const lender = pickV3Lender(lenderCandidates(chain), tokenIn, [buyPool.poolAddress, sellPool.poolAddress]);
       // Only need the route + amount here; minProfit is set by the simulator.
       const built = buildExecuteCall({
             chain, tokenIn, buyPool, sellPool, tradeSizeUsd, netProfitUsd: 1,
@@ -390,7 +395,7 @@ const queueSimulation = (
                         console.log(`[sim] ${chain} ${route} REAL PROFIT $${usd.toFixed(2)} after loan fee | ${model}`);
                         // A trigger trade the real-chain test confirms clears the
                         // firing bar after gas: counts as verified would-have-earned.
-                        const net = usd - 0.05;
+                        const net = usd - (chain === 'robinhood' ? rhGasUsd(0.05) : 0.05);
                         if (chain === 'robinhood' && net >= MIN_COUNTED_USD) {
                               dryRunPnl.recordVerified(net, `${symbolOf(chain, tokenIn)} ${route}`);
                         }
@@ -473,6 +478,17 @@ const robinhoodSender = new FastSender(
       new ethers.JsonRpcProvider(robinhoodSendRpc(), 4663, { staticNetwork: true }),
 );
 const safetyGate = new SafetyGate(safetyConfigFromEnv());
+if (safetyGate.problems.length) {
+      // Fail closed: every send is blocked until the setting is fixed.
+      console.warn(`[safety] BAD SETTING(S): ${safetyGate.problems.join(', ')} -- all sends blocked until fixed in .env`);
+}
+// Live-readiness result (see execution/liveReadiness.ts). Dry run: not needed.
+let liveChecks: { ok: boolean; problems: string[] } = { ok: !robinhoodSender.live, problems: [] };
+// Gas cost of one Robinhood trade in USD, from the real gas price and ETH
+// price (was a fixed $0.05 / $2). Falls back to the old fixed value if
+// either price is unknown yet.
+const rhGasUsd = (fallback: number): number =>
+      robinhoodSender.gasCostUsd(priceOracle.getUsdPrice('robinhood', ROBINHOOD_TOKENS.WETH)) ?? fallback;
 // Dry-run "would have earned" totals (core/dryRunPnl.ts), saved so restarts
 // don't reset them. Verified = confirmed by a real-chain test; model-only =
 // the bot's own maths. Both assume we win the race.
@@ -545,13 +561,22 @@ const fireTrade = async (o: {
                   // Strict lookup: no default-to-18 for real trade amounts.
                   tokenInDecimals: TOKEN_DECIMALS[o.chain]?.[o.tokenIn.toLowerCase()],
                   // Deadline: the contract reverts if mined after this block. Live
-                  // trades get the latest block + 3 (~0.3 s on Robinhood); 0 is only
-                  // safe for dry runs (it would make every real trade revert).
-                  maxBlock: o.chain === 'robinhood' && robinhoodSender.live ? BigInt(robinhoodSender.latestBlock + 3) : 0n,
+                  // trades get the ESTIMATED current block + a margin (default 20
+                  // blocks, ~2 s; MAX_BLOCK_MARGIN). The old "last read + 3" was
+                  // up to 2 s stale, so most real trades would revert Expired.
+                  // 0 is only used in dry runs.
+                  maxBlock: o.chain === 'robinhood' && robinhoodSender.live ? (robinhoodSender.deadlineBlock() ?? 0n) : 0n,
                   ...executorConfig(o.chain),
                   v3Lender: pickV3Lender(lenderCandidates(o.chain), o.tokenIn, [o.buyPool.poolAddress, o.sellPool.poolAddress])?.poolAddress,
             });
             if ('reason' in dry) { console.log(`[exec-dryrun] ${o.chain} NOT executable: ${dry.reason}`); return; }
+            const block = (r: string) => { fireStats.blocked.set(r, (fireStats.blocked.get(r) ?? 0) + 1); };
+            if (o.chain === 'robinhood' && robinhoodSender.live) {
+                  // No fresh block number = no safe deadline: don't send.
+                  if (robinhoodSender.deadlineBlock() === null) { block('block info stale'); return; }
+                  // Readiness checks (chain id, executor role, lenders, ArbSys) must pass first.
+                  if (!liveChecks.ok) { block('live checks not passed'); return; }
+            }
             // Live trades must borrow from a pool the contract owner approved
             // (setFlashPool); anything else reverts on-chain.
             if (o.chain === 'robinhood' && robinhoodSender.live && dry.funding !== 'v3-flash') {
@@ -798,7 +823,7 @@ if (usdPerToken === null) return;
 let plan: ReturnType<typeof planBackrun> = null;
 for (const peer of peers) {
       const candidate = planBackrun(cache, pool, peer, swap, usdPerToken, {
-            gasPriceUsd: 2,
+            gasPriceUsd: swap.chain === 'robinhood' ? rhGasUsd(2) : 2,
             dexFeeBps: { buy: pool.feeBps, sell: peer.feeBps }, // overwritten per direction inside planBackrun
             flashLoanFeeBps: 9,
             usingFlashLoan: true,
@@ -917,6 +942,22 @@ if (chainOn('robinhood')) {
             .then(async () => {
                   console.log(`[fire] robinhood sender ready (${robinhoodSender.live ? 'LIVE from ' + robinhoodSender.address : 'dry run'})`);
                   if (robinhoodSender.live) {
+                        // Readiness checks before the first real send; retried every
+                        // 5 min until they pass (e.g. lender approved later).
+                        const runChecks = async () => {
+                              liveChecks = await checkLiveReady(robinhoodReadProvider, {
+                                    chain: 'robinhood', executor: executorConfig('robinhood').executorAddress, sender: robinhoodSender.address,
+                                    tokens: [{ address: ROBINHOOD_TOKENS.WETH, label: 'WETH' }, { address: ROBINHOOD_TOKENS.USDG, label: 'USDG' }],
+                                    lenders: [...approvedLenders('robinhood')],
+                              }).catch((err) => ({ ok: false, problems: [`check error: ${(err as Error).message?.slice(0, 80)}`] }));
+                              if (liveChecks.ok) console.log('[fire] live checks passed: chain, executor role, lenders, ArbSys deadline');
+                              else {
+                                    console.warn(`[fire] LIVE CHECKS FAILED, sends blocked: ${liveChecks.problems.join('; ')}`);
+                                    await sendTelegramMessage(`🛑 <b>LIVE CHECKS FAILED</b> · sends blocked\n${liveChecks.problems.map((p) => '• ' + p.replace(/[<>&]/g, '')).join('\n')}`);
+                                    setTimeout(() => { void runChecks(); }, 5 * 60_000);
+                              }
+                        };
+                        await runChecks();
                         const b = await robinhoodSender.balanceCheck();
                         if (!b.ok) {
                               const msg = `bot wallet ${robinhoodSender.address} has ${ethers.formatEther(b.balance)} ETH, needs ${ethers.formatEther(b.needed)} per trade at the gas cap`;
@@ -1019,7 +1060,7 @@ await chainManager.startAll();
                   const gaps = findStandingGaps(pairs,
                         (t) => TOKEN_DECIMALS.robinhood?.[t.toLowerCase()],
                         (t) => priceOracle.getUsdPrice('robinhood', t),
-                        { minProfitUsd: GAP_MIN_USD, flashFee: 0.0005, gasUsd: 0.05, maxTradeUsd: Number(process.env.MAX_TRADE_USD ?? 5_000) });
+                        { minProfitUsd: GAP_MIN_USD, flashFee: 0.0005, gasUsd: rhGasUsd(0.05), maxTradeUsd: Number(process.env.MAX_TRADE_USD ?? 5_000) });
                   let fired = 0;
                   for (const g of gaps) {
                         if (fired >= 2) break;
@@ -1036,7 +1077,7 @@ await chainManager.startAll();
                               console.log(`[gap] ${label}: model ~$${g.profitUsd.toFixed(2)}, not verified (RPC busy), skipped`);
                               continue;
                         }
-                        const simNet = check.status === 'profit' ? check.usd - 0.05 /* gas */ : 0;
+                        const simNet = check.status === 'profit' ? check.usd - rhGasUsd(0.05) /* gas */ : 0;
                         if (check.status !== 'profit' || simNet < Math.max(5, GAP_MIN_USD / 2)) {
                               gapMutedUntil.set(key, Date.now() + GAP_FAKE_MUTE_MS);
                               gapStats.fake++;
