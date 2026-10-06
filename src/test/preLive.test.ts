@@ -38,7 +38,9 @@ async function main() {
   const d0 = dry.deadlineBlock(20, t);
   assert(d0 === 1_020n, `fresh read: deadline = block + margin (got ${d0})`);
   const d1 = dry.deadlineBlock(20, t + 1_500);
-  assert(d1 !== null && d1 >= 1_030n, `1.5 s later the estimate moves forward with ~0.1 s blocks (got ${d1})`);
+  const dDefault = dry.deadlineBlock(undefined, t);
+  assert(dDefault !== null && dDefault >= 1_050n, `default margin is time-based, ~3 s of blocks (got ${dDefault})`);
+  assert(d1 !== null && d1 >= 1_030n, `1.5 s later the estimate moves forward with the block time (got ${d1})`);
   assert(dry.deadlineBlock(20, t + 11_000) === null, 'block info older than 10 s -> no deadline');
 
   // --- nonce: concurrent fires, one rejected ------------------------------
