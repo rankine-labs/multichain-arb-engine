@@ -30,6 +30,9 @@ import { endpointLabel } from './endpointLabel';
 //     no single free node throttles us); a sick one is rested on its own and
 //     the others carry on. HEAVY is used only when every FAST node is resting.
 //     Extra nodes come from ROBINHOOD_FAST_RPC_EXTRA (comma-separated).
+//   - BACKUP nodes (ROBINHOOD_BACKUP_RPC, e.g. Nodeflare): used only when
+//     every FAST node is resting, before HEAVY. Keeps HEAVY's quota for
+//     simulations; a backup is rested on the same rules (errors / slow).
 // ============================================================================
 
 export type RpcSend = (payload: ethers.JsonRpcPayload | ethers.JsonRpcPayload[]) => Promise<Array<ethers.JsonRpcResult | ethers.JsonRpcError>>;
@@ -74,7 +77,7 @@ function resultsRateLimited(results: Array<ethers.JsonRpcResult | ethers.JsonRpc
 
 // The routing logic on its own (no network), so it can be tested with fakes.
 type Endpoint = { label: string; send: RpcSend };
-type FastState = Endpoint & { restUntil: number; avgMs: number | null; samples: number };
+type FastState = Endpoint & { restUntil: number; avgMs: number | null; samples: number; backup?: boolean };
 
 export class FailoverRouter {
   private readonly fasts: FastState[];
@@ -84,9 +87,12 @@ export class FailoverRouter {
   constructor(
     fast: Endpoint | Endpoint[],
     private readonly heavy: Endpoint | null, // null = no paid node: FAST only
-    private readonly opts: { restMs?: number; slowMs?: number; now?: () => number; log?: (line: string) => void } = {},
+    private readonly opts: { restMs?: number; slowMs?: number; now?: () => number; log?: (line: string) => void; backups?: Endpoint[] } = {},
   ) {
-    this.fasts = (Array.isArray(fast) ? fast : [fast]).map((f) => ({ ...f, restUntil: 0, avgMs: null, samples: 0 }));
+    this.fasts = [
+      ...(Array.isArray(fast) ? fast : [fast]).map((f) => ({ ...f, restUntil: 0, avgMs: null, samples: 0 })),
+      ...(opts.backups ?? []).map((f) => ({ ...f, restUntil: 0, avgMs: null, samples: 0, backup: true })),
+    ];
   }
 
   private now() { return (this.opts.now ?? Date.now)(); }
@@ -98,10 +104,14 @@ export class FailoverRouter {
 
   // FAST nodes not resting right now. Without a HEAVY node, all of them
   // (nothing to fall back to, so resting would only stop reads).
+  // Main FAST nodes first; BACKUP nodes only when every main one is resting.
   private available(): FastState[] {
-    if (!this.heavy) return this.fasts;
     const t = this.now();
-    return this.fasts.filter((f) => t >= f.restUntil);
+    const main = this.fasts.filter((f) => !f.backup);
+    if (!this.heavy && !this.fasts.some((f) => f.backup)) return main;
+    const up = main.filter((f) => t >= f.restUntil);
+    if (up.length) return up;
+    return this.fasts.filter((f) => f.backup && t >= f.restUntil);
   }
 
   // Are we reading from FAST right now? (Logs the switch back once.)
@@ -115,14 +125,14 @@ export class FailoverRouter {
   }
 
   private rest(f: FastState, reason: string) {
-    if (!this.heavy) return;
+    if (!this.heavy && !this.fasts.some((x) => x !== f && (x.backup || !f.backup))) return; // nothing to fall back to
     f.restUntil = this.now() + this.restMs;
     f.avgMs = null; f.samples = 0; // fresh measurement when it comes back
     const stillUp = this.available();
     this.stats.lastReason = reason.slice(0, 120);
     if (stillUp.length) {
       this.log(`[rpc] ${f.label} rested ${Math.round(this.restMs / 60_000)} min (${this.stats.lastReason}); reads on ${stillUp.map((x) => x.label).join(' + ')}`);
-    } else if (this.stats.onFast) {
+    } else if (this.stats.onFast && this.heavy) {
       this.stats.onFast = false;
       this.stats.switches++;
       this.log(`[rpc] fast path -> ${this.heavy.label} for ${Math.round(this.restMs / 60_000)} min (${this.stats.lastReason})`);
@@ -150,7 +160,7 @@ export class FailoverRouter {
         results = await f.send(payload);
       } catch (err) {
         // No paid node to fall back to, or a non-endpoint error: pass it on.
-        if (!this.heavy || !isEndpointTrouble(err)) throw err;
+        if ((!this.heavy && !this.available().some((x) => x !== f)) || !isEndpointTrouble(err)) throw err;
         this.rest(f, shortReason(err));
         continue;
       }
@@ -158,7 +168,8 @@ export class FailoverRouter {
       if (!Array.isArray(payload)) this.noteTime(f, this.now() - t0);
       return results;
     }
-    return this.heavy!.send(payload);
+    if (!this.heavy) throw new Error('no RPC node available');
+    return this.heavy.send(payload);
   }
 }
 
@@ -182,19 +193,26 @@ export class FailoverJsonRpcProvider extends ethers.JsonRpcProvider {
 
   // extraFastUrls: more FAST nodes to rotate reads across (e.g. a keyed
   // QuickNode / Nodeflare endpoint), from ROBINHOOD_FAST_RPC_EXTRA.
-  constructor(fastUrl: string, heavyUrl: string | null, chainId: number, opts: { restMs?: number; fastTimeoutMs?: number; slowMs?: number; extraFastUrls?: string[] } = {}) {
+  private readonly backupProviders: ethers.JsonRpcProvider[];
+
+  constructor(fastUrl: string, heavyUrl: string | null, chainId: number, opts: { restMs?: number; fastTimeoutMs?: number; slowMs?: number; extraFastUrls?: string[]; backupUrls?: string[] } = {}) {
     super(fastRequest(fastUrl, opts.fastTimeoutMs ?? 5_000), chainId, { staticNetwork: true });
     this.heavyProvider = heavyUrl && heavyUrl !== fastUrl ? new ethers.JsonRpcProvider(heavyUrl, chainId, { staticNetwork: true }) : null;
     const heavyProvider = this.heavyProvider;
     const extras = (opts.extraFastUrls ?? []).filter((u) => u && u !== fastUrl && u !== heavyUrl);
     this.extraFast = extras.map((u) => new ethers.JsonRpcProvider(fastRequest(u, opts.fastTimeoutMs ?? 5_000), chainId, { staticNetwork: true }));
+    const backups = (opts.backupUrls ?? []).filter((u) => u && u !== fastUrl && u !== heavyUrl && !extras.includes(u));
+    this.backupProviders = backups.map((u) => new ethers.JsonRpcProvider(fastRequest(u, opts.fastTimeoutMs ?? 5_000), chainId, { staticNetwork: true }));
     this.router = new FailoverRouter(
       [
         { label: endpointLabel(fastUrl), send: (p) => super._send(p) },
         ...this.extraFast.map((prov, i) => ({ label: endpointLabel(extras[i]), send: (p: ethers.JsonRpcPayload | ethers.JsonRpcPayload[]) => prov._send(p) })),
       ],
       heavyProvider ? { label: endpointLabel(heavyUrl!), send: (p) => heavyProvider._send(p) } : null,
-      { restMs: opts.restMs, slowMs: opts.slowMs },
+      {
+        restMs: opts.restMs, slowMs: opts.slowMs,
+        backups: this.backupProviders.map((prov, i) => ({ label: endpointLabel(backups[i]) + ' (backup)', send: (p: ethers.JsonRpcPayload | ethers.JsonRpcPayload[]) => prov._send(p) })),
+      },
     );
   }
 
@@ -202,5 +220,5 @@ export class FailoverJsonRpcProvider extends ethers.JsonRpcProvider {
     return this.router.send(payload) as Promise<Array<ethers.JsonRpcResult>>;
   }
 
-  override destroy() { this.heavyProvider?.destroy(); for (const p of this.extraFast) p.destroy(); super.destroy(); }
+  override destroy() { this.heavyProvider?.destroy(); for (const p of [...this.extraFast, ...this.backupProviders]) p.destroy(); super.destroy(); }
 }
