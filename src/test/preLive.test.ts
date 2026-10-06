@@ -22,6 +22,15 @@ async function main() {
   assert(good.problems.length === 0, 'defaults are valid');
   assert(killSwitchOn('ON') && killSwitchOn('true') && killSwitchOn('1') && killSwitchOn(' yes ') && !killSwitchOn('off') && !killSwitchOn(undefined), 'kill switch accepts on/true/1/yes in any case');
 
+  // --- gas of trades still in flight counts toward the daily loss cap -----
+  const g2 = new SafetyGate({ maxTradeUsd: 5000, dailyLossCapUsd: 10, maxSendsPerMinute: 100, killFile: '/nonexistent/KILL' });
+  g2.allowTokens(['0xa', '0xb']);
+  g2.reservePending('tx1', 6); g2.reservePending('tx2', 5);
+  const capped = g2.check({ tradeSizeUsd: 100, tokens: ['0xa', '0xb'] });
+  assert(!capped.ok && 'reason' in capped && /loss cap/.test(capped.reason), 'in-flight gas holds count against the daily loss cap');
+  g2.releasePending('tx1'); g2.releasePending('tx2');
+  assert(g2.check({ tradeSizeUsd: 100, tokens: ['0xa', '0xb'] }).ok, 'released once the receipts arrive');
+
   // --- deadline block ----------------------------------------------------
   let blockNo = 1_000;
   const fake = {

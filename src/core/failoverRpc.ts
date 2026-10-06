@@ -20,6 +20,16 @@ import { endpointLabel } from './endpointLabel';
 //
 //   Errors about the call itself (a reverted call, bad parameters) are real
 //   answers, not a sick endpoint: they never trigger a switch.
+//
+//   Oct 2026 additions:
+//   - SLOW counts as sick: if a FAST node's typical answer time (smoothed
+//     over recent single requests) goes above slowMs (default 300 ms), it's
+//     rested too. Before, a throttled node answering in ~1 s was never
+//     switched away from, because it never actually errored.
+//   - Several FAST nodes: requests rotate between them (spreads our load so
+//     no single free node throttles us); a sick one is rested on its own and
+//     the others carry on. HEAVY is used only when every FAST node is resting.
+//     Extra nodes come from ROBINHOOD_FAST_RPC_EXTRA (comma-separated).
 // ============================================================================
 
 export type RpcSend = (payload: ethers.JsonRpcPayload | ethers.JsonRpcPayload[]) => Promise<Array<ethers.JsonRpcResult | ethers.JsonRpcError>>;
@@ -63,60 +73,92 @@ function resultsRateLimited(results: Array<ethers.JsonRpcResult | ethers.JsonRpc
 }
 
 // The routing logic on its own (no network), so it can be tested with fakes.
+type Endpoint = { label: string; send: RpcSend };
+type FastState = Endpoint & { restUntil: number; avgMs: number | null; samples: number };
+
 export class FailoverRouter {
-  private restUntil = 0;
+  private readonly fasts: FastState[];
+  private next = 0;
   private stats: FailoverStats = { onFast: true, switches: 0 };
 
   constructor(
-    private readonly fast: { label: string; send: RpcSend },
-    private readonly heavy: { label: string; send: RpcSend } | null, // null = no paid node: FAST only
-    private readonly opts: { restMs?: number; now?: () => number; log?: (line: string) => void } = {},
-  ) {}
+    fast: Endpoint | Endpoint[],
+    private readonly heavy: Endpoint | null, // null = no paid node: FAST only
+    private readonly opts: { restMs?: number; slowMs?: number; now?: () => number; log?: (line: string) => void } = {},
+  ) {
+    this.fasts = (Array.isArray(fast) ? fast : [fast]).map((f) => ({ ...f, restUntil: 0, avgMs: null, samples: 0 }));
+  }
 
   private now() { return (this.opts.now ?? Date.now)(); }
   private log(line: string) { (this.opts.log ?? console.log)(line); }
   private get restMs() { return this.opts.restMs ?? 5 * 60_000; }
+  private get slowMs() { return this.opts.slowMs ?? Number(process.env.RPC_SLOW_MS ?? 300); }
 
   getStats(): FailoverStats { return { ...this.stats, onFast: this.onFast() }; }
 
-  // Are we reading from FAST right now? (Logs the switch back once.)
-  private onFast(): boolean {
-    if (!this.heavy) return true;
-    if (this.now() < this.restUntil) return false;
-    if (!this.stats.onFast) {
-      this.stats.onFast = true;
-      this.log(`[rpc] fast path back on ${this.fast.label}`);
-    }
-    return true;
+  // FAST nodes not resting right now. Without a HEAVY node, all of them
+  // (nothing to fall back to, so resting would only stop reads).
+  private available(): FastState[] {
+    if (!this.heavy) return this.fasts;
+    const t = this.now();
+    return this.fasts.filter((f) => t >= f.restUntil);
   }
 
-  private rest(reason: string) {
-    this.restUntil = this.now() + this.restMs;
-    if (this.stats.onFast) {
+  // Are we reading from FAST right now? (Logs the switch back once.)
+  private onFast(): boolean {
+    const ok = this.available().length > 0;
+    if (ok && !this.stats.onFast) {
+      this.stats.onFast = true;
+      this.log(`[rpc] fast path back on ${this.available().map((f) => f.label).join(' + ')}`);
+    }
+    return ok;
+  }
+
+  private rest(f: FastState, reason: string) {
+    if (!this.heavy) return;
+    f.restUntil = this.now() + this.restMs;
+    f.avgMs = null; f.samples = 0; // fresh measurement when it comes back
+    const stillUp = this.available();
+    this.stats.lastReason = reason.slice(0, 120);
+    if (stillUp.length) {
+      this.log(`[rpc] ${f.label} rested ${Math.round(this.restMs / 60_000)} min (${this.stats.lastReason}); reads on ${stillUp.map((x) => x.label).join(' + ')}`);
+    } else if (this.stats.onFast) {
       this.stats.onFast = false;
       this.stats.switches++;
-      this.stats.lastReason = reason.slice(0, 120);
-      this.log(`[rpc] fast path -> ${this.heavy!.label} for ${Math.round(this.restMs / 60_000)} min (${this.stats.lastReason})`);
+      this.log(`[rpc] fast path -> ${this.heavy.label} for ${Math.round(this.restMs / 60_000)} min (${this.stats.lastReason})`);
     }
+  }
+
+  // Smoothed answer time of single requests; too slow = rest the node.
+  private noteTime(f: FastState, ms: number) {
+    f.avgMs = f.avgMs === null ? ms : f.avgMs * 0.8 + ms * 0.2;
+    f.samples++;
+    if (f.samples >= 10 && f.avgMs > this.slowMs) this.rest(f, `slow, ~${Math.round(f.avgMs)} ms per answer`);
   }
 
   async send(payload: ethers.JsonRpcPayload | ethers.JsonRpcPayload[]): Promise<Array<ethers.JsonRpcResult | ethers.JsonRpcError>> {
-    if (!this.onFast()) return this.heavy!.send(payload);
-    let results: Array<ethers.JsonRpcResult | ethers.JsonRpcError>;
-    try {
-      results = await this.fast.send(payload);
-    } catch (err) {
-      // No paid node to fall back to, or a non-endpoint error: pass it on.
-      if (!this.heavy || !isEndpointTrouble(err)) throw err;
-      this.rest(shortReason(err));
-      return this.heavy.send(payload);
+    // Try each available FAST node at most once, starting with the next in turn.
+    const tried = new Set<FastState>();
+    while (this.onFast()) {
+      const avail = this.available().filter((f) => !tried.has(f));
+      if (!avail.length) break;
+      const f = avail[this.next++ % avail.length];
+      tried.add(f);
+      const t0 = this.now();
+      let results: Array<ethers.JsonRpcResult | ethers.JsonRpcError>;
+      try {
+        results = await f.send(payload);
+      } catch (err) {
+        // No paid node to fall back to, or a non-endpoint error: pass it on.
+        if (!this.heavy || !isEndpointTrouble(err)) throw err;
+        this.rest(f, shortReason(err));
+        continue;
+      }
+      if (this.heavy && resultsRateLimited(results)) { this.rest(f, 'rate limited'); continue; }
+      if (!Array.isArray(payload)) this.noteTime(f, this.now() - t0);
+      return results;
     }
-    const limited = this.heavy ? resultsRateLimited(results) : null;
-    if (limited) {
-      this.rest('rate limited');
-      return this.heavy!.send(payload); // resend the whole batch on HEAVY
-    }
-    return results;
+    return this.heavy!.send(payload);
   }
 }
 
@@ -136,14 +178,23 @@ export class FailoverJsonRpcProvider extends ethers.JsonRpcProvider {
   readonly router: FailoverRouter;
   private readonly heavyProvider: ethers.JsonRpcProvider | null;
 
-  constructor(fastUrl: string, heavyUrl: string | null, chainId: number, opts: { restMs?: number; fastTimeoutMs?: number } = {}) {
+  private readonly extraFast: ethers.JsonRpcProvider[];
+
+  // extraFastUrls: more FAST nodes to rotate reads across (e.g. a keyed
+  // QuickNode / Nodeflare endpoint), from ROBINHOOD_FAST_RPC_EXTRA.
+  constructor(fastUrl: string, heavyUrl: string | null, chainId: number, opts: { restMs?: number; fastTimeoutMs?: number; slowMs?: number; extraFastUrls?: string[] } = {}) {
     super(fastRequest(fastUrl, opts.fastTimeoutMs ?? 5_000), chainId, { staticNetwork: true });
     this.heavyProvider = heavyUrl && heavyUrl !== fastUrl ? new ethers.JsonRpcProvider(heavyUrl, chainId, { staticNetwork: true }) : null;
     const heavyProvider = this.heavyProvider;
+    const extras = (opts.extraFastUrls ?? []).filter((u) => u && u !== fastUrl && u !== heavyUrl);
+    this.extraFast = extras.map((u) => new ethers.JsonRpcProvider(fastRequest(u, opts.fastTimeoutMs ?? 5_000), chainId, { staticNetwork: true }));
     this.router = new FailoverRouter(
-      { label: endpointLabel(fastUrl), send: (p) => super._send(p) },
+      [
+        { label: endpointLabel(fastUrl), send: (p) => super._send(p) },
+        ...this.extraFast.map((prov, i) => ({ label: endpointLabel(extras[i]), send: (p: ethers.JsonRpcPayload | ethers.JsonRpcPayload[]) => prov._send(p) })),
+      ],
       heavyProvider ? { label: endpointLabel(heavyUrl!), send: (p) => heavyProvider._send(p) } : null,
-      { restMs: opts.restMs },
+      { restMs: opts.restMs, slowMs: opts.slowMs },
     );
   }
 
@@ -151,5 +202,5 @@ export class FailoverJsonRpcProvider extends ethers.JsonRpcProvider {
     return this.router.send(payload) as Promise<Array<ethers.JsonRpcResult>>;
   }
 
-  override destroy() { this.heavyProvider?.destroy(); super.destroy(); }
+  override destroy() { this.heavyProvider?.destroy(); for (const p of this.extraFast) p.destroy(); super.destroy(); }
 }

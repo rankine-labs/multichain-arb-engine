@@ -13,6 +13,10 @@ on:
         required: false
         default: ''
 
+# Read-only token: these jobs only check out code and run tests/probes.
+permissions:
+  contents: read
+
 jobs:
   probe:
     runs-on: ubuntu-latest

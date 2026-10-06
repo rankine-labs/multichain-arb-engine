@@ -140,6 +140,8 @@ export class PairWatcher {
   // Pairs found by the chain-wide scan (or always-watched like WETH/USDG):
   // never dropped to make room for traffic-driven pairs.
   private pinned = new Set<string>();
+  private pinnedTokens = new Map<string, { a: string; b: string }>(); // for retrying
+  private retryTimer: NodeJS.Timeout | null = null;
   private inFlight = new Set<string>();           // queued or running
   private queue: Array<{ a: string; b: string }> = [];
   private working = false;
@@ -224,7 +226,7 @@ export class PairWatcher {
   // Awaitable version, used at startup for pairs we always want.
   // pin = keep this pair even when traffic-driven pairs fill the list.
   async watch(a: string, b: string, opts: { pin?: boolean } = {}): Promise<number> {
-    if (opts.pin) this.pinned.add(this.key(a, b));
+    if (opts.pin) { this.pinned.add(this.key(a, b)); this.pinnedTokens.set(this.key(a, b), { a, b }); }
     await this.discover(a, b);
     return this.pairs.get(this.key(a, b))?.pools.length ?? 0;
   }
@@ -294,6 +296,26 @@ export class PairWatcher {
   start(): void {
     if (this.refreshTimer) return;
     this.refreshTimer = setInterval(() => { this.refreshAll().catch(() => { /* best effort */ }); }, this.refreshMs);
+    // Pinned pairs (from the scan / start list) are known to have 2+ pools.
+    // If discovery found fewer (usually a rate-limited lookup, which looks
+    // like "no pool"), try again every 15 min instead of never.
+    this.retryTimer = setInterval(() => { this.retryPinned(); }, this.pinnedRetryMs);
+  }
+
+  private readonly pinnedRetryMs = Number(process.env.PINNED_RETRY_MS ?? 15 * 60_000);
+
+  // Queue discovery for pinned pairs that aren't watched yet. Returns how many.
+  retryPinned(): number {
+    let n = 0;
+    for (const [k, t] of this.pinnedTokens) {
+      if (this.pairs.has(k) || this.inFlight.has(k)) continue;
+      this.singlePool.delete(k); // allow it through
+      this.inFlight.add(k);
+      this.queue.push(t);
+      n++;
+    }
+    if (n) void this.drain();
+    return n;
   }
 
   // Background re-sync of every watched pool from the chain. With instant
@@ -328,6 +350,8 @@ export class PairWatcher {
   stats() {
     let pools = 0;
     for (const p of this.pairs.values()) pools += p.pools.length;
-    return { pairs: this.pairs.size, pools, pinned: this.pinned.size, queued: this.queue.length, singlePoolPairs: this.singlePool.size };
+    let pinnedWatched = 0;
+    for (const k of this.pinned) if (this.pairs.has(k)) pinnedWatched++;
+    return { pairs: this.pairs.size, pools, pinned: this.pinned.size, pinnedWatched, queued: this.queue.length, singlePoolPairs: this.singlePool.size };
   }
 }

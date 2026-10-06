@@ -75,6 +75,14 @@ export class SafetyGate {
 
   private today() { return new Date(this.now()).toISOString().slice(0, 10); }
 
+  // Gas a sent trade COULD still cost, counted against the daily cap until
+  // its receipt arrives (receipts take up to 90 s; without this the cap could
+  // be overshot by every trade in flight).
+  private pending = new Map<string, number>();
+  reservePending(id: string, usd: number) { if (usd > 0 && Number.isFinite(usd)) this.pending.set(id, usd); }
+  releasePending(id: string) { this.pending.delete(id); }
+  private pendingUsd() { let s = 0; for (const v of this.pending.values()) s += v; return s; }
+
   // Gas burned or money lost on a send (dry runs record 0).
   recordLoss(usd: number) {
     if (this.lossDay !== this.today()) { this.lossDay = this.today(); this.lossUsd = 0; }
@@ -86,7 +94,8 @@ export class SafetyGate {
     if (this.problems.length) return { ok: false, reason: `bad safety setting: ${this.problems.join(', ')}` };
     if (!(trade.tradeSizeUsd > 0)) return { ok: false, reason: 'no trade size' };
     if (trade.tradeSizeUsd > this.cfg.maxTradeUsd) return { ok: false, reason: `size $${Math.round(trade.tradeSizeUsd)} over max $${this.cfg.maxTradeUsd}` };
-    if (this.lossDay === this.today() && this.lossUsd >= this.cfg.dailyLossCapUsd) return { ok: false, reason: `daily loss cap $${this.cfg.dailyLossCapUsd} reached` };
+    const lostToday = (this.lossDay === this.today() ? this.lossUsd : 0) + this.pendingUsd();
+    if (lostToday >= this.cfg.dailyLossCapUsd) return { ok: false, reason: `daily loss cap $${this.cfg.dailyLossCapUsd} reached` };
     const bad = trade.tokens.find((t) => !this.allowed.has(t.toLowerCase()));
     if (bad) return { ok: false, reason: `token ${bad.slice(0, 10)} not on the allowlist` };
     const t = this.now();
@@ -234,6 +243,19 @@ export class FastSender {
   }
 
   get ready() { return this.maxFeePerGas !== null && this.nonce !== null; }
+
+  // After a sent trade was DROPPED (never mined), its nonce was never used:
+  // re-read the count from the chain so later trades don't queue behind the
+  // gap. Runs in the fire queue so it can't race a send.
+  resyncNonce(): Promise<void> {
+    const run = this.fireChain.then(async () => {
+      if (!this.live) return;
+      const remote = await this.readProvider.getTransactionCount(this.wallet.address, 'pending').catch(() => null);
+      if (remote !== null) this.nonce = remote;
+    });
+    this.fireChain = run.catch(() => undefined);
+    return run.catch(() => undefined);
+  }
 
   // Fires run one at a time (sign ~1 ms + send ~5 ms), so two triggers can
   // never sign with the same nonce. Each fire waits for the previous one.
