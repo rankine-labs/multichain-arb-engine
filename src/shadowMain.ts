@@ -68,7 +68,7 @@ function symbolOf(chain: string, address: string): string {
     if (known) return known;
     return `${address.slice(0, 6)}...${address.slice(-4)}`;
 }
-import { formatSkippedOpportunity, formatHourlyDigest, formatDailyReport, formatStartup, formatExecutionWarning, DigestSection, DigestSpread } from './core/telegramFormatter';
+import { formatSkippedOpportunity, formatHourlyDigest, formatDailyReport, formatStartup, formatExecutionWarning, DigestSection, DigestSpread, formatPlainHourly, formatPlainDaily } from './core/telegramFormatter';
 import { RobinhoodChainAdapter } from './chains/robinhoodChain';
 import { MonadAdapter } from './chains/monad';
 import { AvalancheAdapter } from './chains/avalanche';
@@ -1507,7 +1507,44 @@ for (let i = 0; i < resolved.length; i++) {
                   samplePricesIntoMatches();
                   const stats = shadowLogger.windowStats(lastDigestAt, now);
                   const status = chainManager.getStatus() as Record<string, { online: boolean }>;
-                  await sendTelegramMessage(formatHourlyDigest({
+                  // Robinhood only (the normal setup): the plain-English report.
+                  // Other chains switched on: the older detailed digest.
+                  if (chainOn('robinhood') && !chainOn('monad') && !chainOn('avalanche')) {
+                        const sections = buildDigestSections();
+                        const rh = sections.find((s) => s.chain === 'robinhood');
+                        const st = robinhoodWatcher.stats();
+                        const rpc = robinhoodReadProvider.router.getStats();
+                        const pnl = dryRunPnl.summary();
+                        const rv = rivals.summary();
+                        await sendTelegramMessage(formatPlainHourly({
+                              windowLabel: `${hhmm(lastDigestAt)} to ${hhmm(now)}`,
+                              live: robinhoodSender.live,
+                              feedOk: status.robinhood?.online ?? false,
+                              feedReconnects: chainHealthFlapCount.robinhood ?? 0,
+                              pairs: st.pairs, spots: st.pools,
+                              pricesFrom: rpc.onFast ? 'free' : 'backup',
+                              freeNodeBusy: rpc.switches,
+                              differencesFound: stats.seen,
+                              // Trigger-trade checks + standing-difference checks together.
+                              checks: {
+                                    done: simStats.checked + gapStats.found + gapStats.fake,
+                                    makeMoney: simStats.profit + gapStats.found,
+                                    loseMoney: simStats.loss + gapStats.fake,
+                                    wouldFail: simStats.fail,
+                                    nodeBusy: simStats.rateLimited,
+                              },
+                              checksAvailable: !(simStats.checked === 0 && (simStats.rateLimited > 0 || !!simOff('robinhood'))),
+                              earned: {
+                                    todayChecked: pnl.today.verifiedUsd, todayCheckedCount: pnl.today.verifiedCount,
+                                    todayUnchecked: pnl.today.modelUsd, todayUncheckedCount: pnl.today.modelCount,
+                                    weekChecked: pnl.last7.verifiedUsd,
+                              },
+                              reactionMs: { typical: stats.medianReactionMs, slowest5pct: stats.p95ReactionMs },
+                              otherBots: { timed: rv.found, theirMs: rv.theirMedianMs, oursMs: rv.ourMedianMs, weBeat: rv.beatCount },
+                              topDifferences: [...(rh?.spreads ?? [])].sort((a, b) => b.spreadPct - a.spreadPct)
+                                    .map((d) => ({ pair: d.pair, pct: d.spreadPct, buyAt: d.buyDex, sellAt: d.sellDex })),
+                        }));
+                  } else await sendTelegramMessage(formatHourlyDigest({
                         windowLabel: `${hhmm(lastDigestAt)} to ${hhmm(now)}`,
                         chains: (['avalanche', 'monad', 'robinhood'] as const).filter(chainOn).map((chain) => ({
                               chain,
@@ -1568,7 +1605,16 @@ for (let i = 0; i < resolved.length; i++) {
                   for (const [chain, t] of Object.entries(healthTicks)) {
                         uptimePct[chain] = t.total > 0 ? (t.healthy / t.total) * 100 : null;
                   }
-                  await sendTelegramMessage(formatDailyReport({
+                  if (chainOn('robinhood') && !chainOn('monad') && !chainOn('avalanche')) {
+                        const pnl = dryRunPnl.summary();
+                        await sendTelegramMessage(formatPlainDaily({
+                              dateLabel: dayLabel(lastDailyAt),
+                              differencesFound: stats.seen,
+                              earnedChecked: pnl.today.verifiedUsd, earnedCheckedCount: pnl.today.verifiedCount,
+                              weekChecked: pnl.last7.verifiedUsd,
+                              feedUptimePct: uptimePct.robinhood ?? null,
+                        }));
+                  } else await sendTelegramMessage(formatDailyReport({
                         dateLabel: dayLabel(lastDailyAt),
                         stats,
                         bestTradeUsd: stats.bestWonUsd,

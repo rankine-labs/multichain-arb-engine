@@ -89,6 +89,9 @@ lost: lost.length,
 netUsd: nets(won).reduce((a, b) => a + b, 0),
 avgReactionMs: reactionTimes.length ? reactionTimes.reduce((a, b) => a + b, 0) / reactionTimes.length : null,
 p95ReactionMs: reactionTimes.length ? reactionTimes[Math.floor(reactionTimes.length * 0.95)] : null,
+// Typical (middle) reaction time: unlike the average, a few very slow
+// decisions can't drag it up. Used by the plain-English hourly report.
+medianReactionMs: reactionTimes.length ? reactionTimes[Math.floor(reactionTimes.length / 2)] : null,
 bestWonUsd: won.length ? Math.max(...nets(won)) : null,
 largestLostUsd: lost.length ? Math.max(...nets(lost)) : null,
 };
