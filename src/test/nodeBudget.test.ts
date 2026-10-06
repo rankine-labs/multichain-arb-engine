@@ -30,6 +30,11 @@ async function main() {
   let qThrew = false;
   try { await Promise.all(Array.from({ length: 10 }, () => q.take())); } catch { qThrew = true; }
   assert(qThrew, 'very long queue -> fails fast');
+  const { isEndpointTrouble } = require('../core/failoverRpc');
+  let qErr: unknown; try { await new NodeBudget('nodeflare', 1, Infinity, Date.now, 0).take(5); } catch (e) { qErr = e; }
+  assert(!!qErr && !isEndpointTrouble(qErr), 'a full queue is NOT treated as a sick node (no resting, no moving to another node)');
+  let dErr: unknown; try { await new NodeBudget('quicknode', 100, 0).take(); } catch (e) { dErr = e; }
+  assert(isEndpointTrouble(dErr), 'a used-up daily allowance IS treated like a rate limit (move to that job\'s backup)');
 
   assert(callsInBody(JSON.stringify([{ id: 1 }, { id: 2 }, { id: 3 }])) === 3 && callsInBody('{"id":1}') === 1, 'batched JSON-RPC counts each call');
 
