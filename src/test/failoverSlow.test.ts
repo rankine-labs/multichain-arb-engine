@@ -73,3 +73,31 @@ async function backupOrder() {
   assert(calls.join(',') === 'nodeflare,alchemy' && (res[0] as any).result === 'alchemy', 'backup failing too -> Alchemy');
 }
 backupOrder().catch((e) => { console.error('FAIL: crashed', e); process.exitCode = 1; });
+
+// Big calls don't count toward "slow"; paid node failing too -> back to the free node.
+async function bigCallsAndHeavyDown() {
+  let clock = 0;
+  const calls: string[] = [];
+  const mk = (label: string, ms: number, fail = false) => ({
+    label,
+    send: async (p: any) => {
+      calls.push(label); clock += ms;
+      if (fail) { const e: any = new Error('429 too many requests'); e.code = 'SERVER_ERROR'; throw e; }
+      return [{ id: p.id, jsonrpc: '2.0', result: label }] as any;
+    },
+  });
+  const logs: string[] = [];
+  const big = { id: 1, jsonrpc: '2.0', method: 'eth_call', params: [{ to: '0x1', data: '0x' + 'ab'.repeat(5000) }, 'latest'] } as any;
+  const r = new FailoverRouter(mk('public', 600), mk('alchemy', 20, true), { now: () => clock, log: (l) => logs.push(l), slowMs: 500 });
+  for (let i = 0; i < 15; i++) await r.send(big);
+  assert(!logs.some((l) => /slow/.test(l)), 'big multicall reads never mark the node slow');
+
+  // Force the free node to rest, then the paid node fails: free node still answers.
+  const small = { id: 2, jsonrpc: '2.0', method: 'eth_blockNumber', params: [] } as any;
+  const r2 = new FailoverRouter(mk('public', 900), mk('alchemy', 20, true), { now: () => clock, log: () => {}, slowMs: 500 });
+  for (let i = 0; i < 10; i++) await r2.send(small);
+  calls.length = 0;
+  const res = await r2.send(small);
+  assert(calls.join() === 'alchemy,public' && (res[0] as any).result === 'public', 'paid node failing too -> answered by the free node anyway');
+}
+bigCallsAndHeavyDown().catch((e) => { console.error('FAIL: crashed', e); process.exitCode = 1; });

@@ -75,6 +75,14 @@ function resultsRateLimited(results: Array<ethers.JsonRpcResult | ethers.JsonRpc
   return null;
 }
 
+// Small request = not a big eth_call (under ~2 KB of calldata).
+function smallRequest(p: ethers.JsonRpcPayload): boolean {
+  const params = (p as { params?: unknown[] }).params;
+  if (p.method !== 'eth_call' || !Array.isArray(params)) return true;
+  const data = (params[0] as { data?: string; input?: string } | undefined)?.data ?? (params[0] as { input?: string } | undefined)?.input ?? '';
+  return data.length < 4_000;
+}
+
 // The routing logic on its own (no network), so it can be tested with fakes.
 type Endpoint = { label: string; send: RpcSend };
 type FastState = Endpoint & { restUntil: number; avgMs: number | null; samples: number; backup?: boolean };
@@ -100,7 +108,7 @@ export class FailoverRouter {
   // the status page's "prices read from" line only follows the price router.
   private log(line: string) { (this.opts.log ?? console.log)(this.opts.logTag ? line.replace(/^\[rpc\]/, `[${this.opts.logTag}]`) : line); }
   private get restMs() { return this.opts.restMs ?? 5 * 60_000; }
-  private get slowMs() { return this.opts.slowMs ?? Number(process.env.RPC_SLOW_MS ?? 300); }
+  private get slowMs() { return this.opts.slowMs ?? Number(process.env.RPC_SLOW_MS ?? 500); }
 
   getStats(): FailoverStats { return { ...this.stats, onFast: this.onFast() }; }
 
@@ -167,11 +175,23 @@ export class FailoverRouter {
         continue;
       }
       if (this.heavy && resultsRateLimited(results)) { this.rest(f, 'rate limited'); continue; }
-      if (!Array.isArray(payload)) this.noteTime(f, this.now() - t0);
+      // Time only small single requests: a big eth_call (e.g. the Multicall
+      // that refreshes every pool at once) is legitimately slower and made a
+      // healthy node look "slow".
+      if (!Array.isArray(payload) && smallRequest(payload)) this.noteTime(f, this.now() - t0);
       return results;
     }
     if (!this.heavy) throw new Error('no RPC node available');
-    return this.heavy.send(payload);
+    try {
+      return await this.heavy.send(payload);
+    } catch (err) {
+      // HEAVY failing too (e.g. its plan limit is used up): a slow or resting
+      // FAST node is still better than no answer.
+      if (!isEndpointTrouble(err)) throw err;
+      const any = this.fasts.find((f) => !f.backup) ?? this.fasts[0];
+      if (!any) throw err;
+      return any.send(payload);
+    }
   }
 }
 
