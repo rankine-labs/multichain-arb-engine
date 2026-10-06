@@ -110,7 +110,7 @@ export class FastSender {
   private maxFeePerGas: bigint | null = null;
   latestBlock = 0;              // last block number seen (see deadlineBlock)
   private latestBlockAtMs = 0;  // when we saw it
-  private blockMs = 100;        // measured average block time (Robinhood ~0.1 s)
+  private blockMs = 50;         // measured average block time (starts at 50 ms, learned from reads)
   private l1Gas = 0n;           // extra gas for posting calldata to the parent chain
   private gasLimitNow: bigint;  // starts at FIRE_GAS_LIMIT, tuned from real receipts
   private maxGasSeen = 0n;
@@ -184,14 +184,22 @@ export class FastSender {
   }
 
   // Deadline for a trade: the current block (estimated from the last read
-  // plus elapsed time, since blocks are ~0.1 s and reads every 2 s) plus a
-  // margin. null = block info too old to trust: do not send.
-  deadlineBlock(marginBlocks = Number(process.env.MAX_BLOCK_MARGIN ?? 20), now = Date.now()): bigint | null {
+  // plus elapsed time, since blocks are fast and reads every 2 s) plus a
+  // margin. The margin is TIME-based by default (MAX_BLOCK_MARGIN_MS, 3 s
+  // worth of blocks at the measured block time), because Robinhood blocks
+  // turned out to be ~30 ms, not 100 ms: a fixed block count would be far
+  // shorter than intended. MAX_BLOCK_MARGIN (blocks) overrides it.
+  // null = block info too old to trust: do not send.
+  deadlineBlock(marginBlocks?: number, now = Date.now()): bigint | null {
     if (!this.latestBlock || !this.latestBlockAtMs) return null;
     const age = now - this.latestBlockAtMs;
     if (age > 10_000) return null;
     const est = this.latestBlock + Math.floor(age / this.blockMs);
-    return BigInt(est + Math.max(1, Math.floor(marginBlocks)));
+    const envBlocks = process.env.MAX_BLOCK_MARGIN ? Number(process.env.MAX_BLOCK_MARGIN) : undefined;
+    const marginMs = Number(process.env.MAX_BLOCK_MARGIN_MS ?? 3_000);
+    let margin = marginBlocks ?? envBlocks ?? Math.ceil(marginMs / this.blockMs);
+    if (!(Number.isFinite(margin) && margin >= 1)) margin = Math.ceil(3_000 / this.blockMs);
+    return BigInt(est + Math.floor(margin));
   }
 
   // Gas limit follows what real trades used: 1.5x the most seen, never below

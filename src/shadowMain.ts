@@ -561,9 +561,9 @@ const fireTrade = async (o: {
                   // Strict lookup: no default-to-18 for real trade amounts.
                   tokenInDecimals: TOKEN_DECIMALS[o.chain]?.[o.tokenIn.toLowerCase()],
                   // Deadline: the contract reverts if mined after this block. Live
-                  // trades get the ESTIMATED current block + a margin (default 20
-                  // blocks, ~2 s; MAX_BLOCK_MARGIN). The old "last read + 3" was
-                  // up to 2 s stale, so most real trades would revert Expired.
+                  // trades get the ESTIMATED current block + a margin (default 3 s
+                  // worth of blocks; MAX_BLOCK_MARGIN_MS). The old "last read + 3"
+                  // was up to 2 s stale, so most real trades would revert Expired.
                   // 0 is only used in dry runs.
                   maxBlock: o.chain === 'robinhood' && robinhoodSender.live ? (robinhoodSender.deadlineBlock() ?? 0n) : 0n,
                   ...executorConfig(o.chain),
