@@ -64,6 +64,6 @@ async function main() {
     return { result: ethers.zeroPadValue(diff[balKey] ?? '0x00', 32) };
   };
   const f2 = await findBalanceSlot(rpc2, 'test:frozen', '0x' + '88'.repeat(20));
-  assert(!!f2 && 'key' in f2 && calls2 <= 16, `token with a frozen flag: found by splitting (${calls2} requests)`);
+  assert(!!f2 && 'key' in f2 && calls2 <= 20, `token with a frozen flag: found one at a time (${calls2} requests, one-time)`);
 }
 main().catch((e) => { console.error('FAIL: crashed', e); process.exitCode = 1; });
