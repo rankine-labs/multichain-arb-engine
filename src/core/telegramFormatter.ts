@@ -287,6 +287,12 @@ export interface PlainHourlyInput {
   otherBots?: { timed: number; theirMs: number | null; oursMs: number | null; weBeat: number };
   topDifferences: { pair: string; pct: number; buyAt: string; sellAt: string }[];
   nodeUsage?: { name: string; used: number; daily: number }[]; // today's requests per node vs allowance
+  // Where trades dropped out this hour, step by step (see shadowMain funnel).
+  funnel?: {
+    tradesRead: number; noPool: number; tooSmall?: number; noPartner: number; noUsdPrice: number; smallerThanFees: number;
+    found: number; belowCheckBar: number; checkBarUsd: number; notVetted: number; sentToCheck: number;
+    skipped: [string, number][];
+  };
 }
 
 const NODE_NAMES: Record<string, string> = { public: 'Robinhood (free)', nodeflare: 'Nodeflare (backup)', quicknode: 'QuickNode (checks)', alchemy: 'Alchemy (scan)' };
@@ -323,6 +329,27 @@ export function formatPlainHourly(r: PlainHourlyInput): string {
   if (r.pricesFrom !== 'free') attention.push('Prices are coming from the backup right now because the free Robinhood node asked us to slow down.');
   L.push('');
 
+  if (r.funnel) {
+    const f = r.funnel;
+    const n = (x: number) => x.toLocaleString('en-US');
+    L.push('<b>What happened to trades this hour</b>');
+    L.push(`Trades read from the live feed: ${n(f.tradesRead)}`);
+    const out: string[] = [];
+    if (f.noPool) out.push(`${n(f.noPool)} trading spot not recognised`);
+    if (f.tooSmall) out.push(`${n(f.tooSmall)} trade too small to move the price`);
+    if (f.noPartner) out.push(`${n(f.noPartner)} no second trading spot with $25k+ to compare`);
+    if (f.noUsdPrice) out.push(`${n(f.noUsdPrice)} token has no USD price`);
+    if (f.smallerThanFees) out.push(`${n(f.smallerThanFees)} price difference smaller than the fees`);
+    for (const o of out) L.push(`  ➖ ${esc(o)}`);
+    L.push(`Worth a look after fees: ${n(f.found)}`);
+    const out2: string[] = [];
+    if (f.belowCheckBar) out2.push(`${n(f.belowCheckBar)} estimated gain under $${f.checkBarUsd.toFixed(2)} (too small to check)`);
+    if (f.notVetted) out2.push(`${n(f.notVetted)} token not on the vetted list`);
+    for (const o of out2) L.push(`  ➖ ${esc(o)}`);
+    L.push(`Sent to be checked: ${n(f.sentToCheck)}`);
+    for (const [why, c] of f.skipped.slice(0, 4)) L.push(`  ➖ ${n(c)} not checked: ${esc(why)}`);
+    L.push('');
+  }
   L.push(`<b>Price differences found:</b> ${r.differencesFound}`);
   if (!r.checksAvailable && r.checks.done === 0) {
     L.push('Checked (real test): ❌ none, checking is off');

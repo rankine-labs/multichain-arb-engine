@@ -371,6 +371,22 @@ const simOff = (chain: string): string | undefined => {
 };
 // Reported in the hourly digest, then reset.
 const simStats = { checked: 0, profit: 0, loss: 0, fail: 0, rateLimited: 0 };
+// Robinhood "funnel" for the hourly report: how many trades made it through
+// each step, and why price differences weren't checked. Reset every hour.
+const funnel = {
+      tradesRead: 0,        // trades decoded from the live feed
+      noPool: 0,            // couldn't identify the trading spot
+      tooSmall: 0,          // trade too small to move the price
+      noPartner: 0,         // no other trading spot for the pair deep enough ($25k+)
+      noUsdPrice: 0,        // couldn't price the token in USD
+      smallerThanFees: 0,   // price difference didn't beat the fees
+      found: 0,             // price differences worth a look
+      belowCheckBar: 0,     // estimated gain under the check minimum
+      notVetted: 0,         // token not on the vetted list (live trading won't touch it)
+      sentToCheck: 0,       // handed to the checker
+      skip: new Map<string, number>(), // checker skipped it: reason -> count
+};
+const funnelSkip = (why: string) => funnel.skip.set(why, (funnel.skip.get(why) ?? 0) + 1);
 // A real arb between two pools nets a few % of the trade at most. A
 // simulated profit above this share of the amount put in (measured in
 // TOKENS, so a bad USD price can't hide it) means the token or pool data is
@@ -420,11 +436,12 @@ const queueSimulation = (
       chain: 'avalanche' | 'monad' | 'robinhood', tokenIn: string,
       buyPool: any, sellPool: any, tradeSizeUsd: number, modelGrossUsd: number, usdPerToken: number,
 ) => {
-      if (simBusy[chain] || simOff(chain) || Date.now() < (simPausedUntil[chain] ?? 0)) return;
+      if (simBusy[chain]) { if (chain === 'robinhood') funnelSkip('another check was running'); return; }
+      if (simOff(chain) || Date.now() < (simPausedUntil[chain] ?? 0)) { if (chain === 'robinhood') funnelSkip('checking node paused (busy or out of allowance)'); return; }
       const muteKey = `${buyPool.poolAddress}>${sellPool.poolAddress}`.toLowerCase();
-      if (Date.now() < (simLoserMuted.get(muteKey) ?? 0)) return;
+      if (Date.now() < (simLoserMuted.get(muteKey) ?? 0)) { if (chain === 'robinhood') funnelSkip('same trading spots lost in the last 5 min'); return; }
       const decimals = TOKEN_DECIMALS[chain]?.[tokenIn.toLowerCase()];
-      if (decimals === undefined) return;
+      if (decimals === undefined) { if (chain === 'robinhood') funnelSkip('token decimals unknown'); return; }
       // Flash loan: borrow from the cheapest V3 pool holding the token that
       // isn't one of the trade's pools. None cached -> simulate own capital.
       // Same lender choice as a live trade (approved FLASH_LENDERS only), so a
@@ -436,7 +453,7 @@ const queueSimulation = (
             usdPerTokenIn: usdPerToken, tokenInDecimals: decimals, maxBlock: 0n,
             v3Lender: lender?.poolAddress,
       });
-      if ('reason' in built) return;
+      if ('reason' in built) { if (chain === 'robinhood') funnelSkip(`trade couldn't be built (${built.reason})`); return; }
       const funding = lender ? `flash loan from ${lender.dex} (${lender.feeBps / 100}% fee)` : 'own capital (no V3 lender cached)';
 
       simBusy[chain] = true;
@@ -813,6 +830,7 @@ if (event.chain === 'robinhood') rivals.noteFeedTx((event.raw as any)?.hash, eve
 
 const swap = await decoder.decode(event);
 if (!swap) return;
+if (swap.chain === 'robinhood') funnel.tradesRead++;
 
 // Follow the traffic: make sure every pool for this pair is being watched.
 if (swap.chain === 'robinhood') robinhoodWatcher.touch(swap.tokenIn, swap.tokenOut);
@@ -908,7 +926,7 @@ if (registerIfApproved('avalanche', entry.dex, resolved)) pool = resolved;
           }
     }
 
-    if (!pool) return;
+    if (!pool) { if (swap.chain === 'robinhood') funnel.noPool++; return; }
 
     // INSTANT PRICE TRACKING (Robinhood): the trade we just saw is already
     // sequenced, so it WILL land. Apply its effect to our copy of the pool
@@ -924,7 +942,7 @@ if (registerIfApproved('avalanche', entry.dex, resolved)) pool = resolved;
     // Cheap "is this trade big enough to matter" check, now against the
     // REAL pool address.
     const filterResult = filter.evaluate({ ...swap, poolAddress: pool.poolAddress });
-    if (!filterResult.pass) return;
+    if (!filterResult.pass) { if (swap.chain === 'robinhood') funnel.tooSmall++; return; }
 
     // Fresh prices at decision time: re-read the traded pool and EVERY
     // partner pool now, in parallel (cached prices can be up to 30s old).
@@ -932,7 +950,7 @@ if (registerIfApproved('avalanche', entry.dex, resolved)) pool = resolved;
     // near-empty pool can show any price and would only waste a simulation.
     const cachedPeers = cache.findPeerPools(swap.chain, swap.tokenIn, swap.tokenOut, pool.poolAddress)
           .filter((p) => deepEnough(p, decimalsOf, (t) => priceOracle.getUsdPrice(swap.chain, t)));
-    if (cachedPeers.length === 0) return;
+    if (cachedPeers.length === 0) { if (swap.chain === 'robinhood') funnel.noPartner++; return; }
     // Fast path: use our own up-to-date copy when it's recent (kept current by
     // instant price tracking + the 5s re-sync); only ask the RPC when stale.
     const [freshPool, ...peers] = swap.chain === 'robinhood'
@@ -977,7 +995,7 @@ if (registerIfApproved('avalanche', entry.dex, resolved)) pool = resolved;
       }
 
 const usdPerToken = priceOracle.getUsdPrice(swap.chain, swap.tokenIn);
-if (usdPerToken === null) return;
+if (usdPerToken === null) { if (swap.chain === 'robinhood') funnel.noUsdPrice++; return; }
 
 // Predict the price AFTER this pending swap lands, then size the arb
 // against that future price (not today's). See core/backrunPlanner.ts.
@@ -993,7 +1011,8 @@ for (const peer of peers) {
       }, decimalsOf(swap.chain, swap.tokenIn));
       if (candidate && (!plan || candidate.profit.conservativeNetProfitUsd > plan.profit.conservativeNetProfitUsd)) plan = candidate;
 }
-if (!plan) return;
+if (!plan) { if (swap.chain === 'robinhood') funnel.smallerThanFees++; return; }
+if (swap.chain === 'robinhood') funnel.found++;
 const { sizing, profit } = plan;
 
 // Any real gap on Robinhood: find out a few seconds from now which bot took
@@ -1025,12 +1044,19 @@ sizing, profit, event, score,
 const reactionMs = Date.now() - t0;
 
 // Simulate what the model thinks is worth a look (gross >= SIM_MIN_GROSS_USD,
-// default $2), even below the firing minimum, so we still learn where the
+// default $0.50), even below the firing minimum, so we still learn where the
 // model is wrong in both directions. Skipped: tokens live trading could never
 // use (not vetted) and pool pairs that just tested as losers (5 min). Was
 // "gross > 0 on any token": ~100 losing tests per 15 min, wasting Alchemy quota.
-const SIM_MIN_GROSS_USD = Number(process.env.SIM_MIN_GROSS_USD ?? 2);
+// $0.50 (was $2): on a quiet market almost nothing reached $2, so nothing
+// got checked and no real data came in. QuickNode's daily allowance caps the cost.
+const SIM_MIN_GROSS_USD = Number(process.env.SIM_MIN_GROSS_USD ?? 0.5);
 const simVetted = swap.chain !== 'robinhood' || (safetyGate.isAllowed(swap.tokenIn) && safetyGate.isAllowed(swap.tokenOut));
+if (swap.chain === 'robinhood') {
+      if (sizing.grossProfitUsd < SIM_MIN_GROSS_USD) funnel.belowCheckBar++;
+      else if (!simVetted) funnel.notVetted++;
+      else funnel.sentToCheck++;
+}
 if (sizing.grossProfitUsd >= SIM_MIN_GROSS_USD && simVetted) {
       queueSimulation(swap.chain, swap.tokenIn, buyPoolUsed, sellPoolUsed, sizing.optimalTradeSizeUsd, sizing.grossProfitUsd, usdPerToken);
 }
@@ -1628,6 +1654,13 @@ for (let i = 0; i < resolved.length; i++) {
                               reactionMs: { typical: stats.medianReactionMs, slowest5pct: stats.p95ReactionMs },
                               otherBots: { timed: rv.found, theirMs: rv.theirMedianMs, oursMs: rv.ourMedianMs, weBeat: rv.beatCount },
                               nodeUsage: nodeUsageToday(),
+                              funnel: {
+                                    tradesRead: funnel.tradesRead, noPool: funnel.noPool, tooSmall: funnel.tooSmall, noPartner: funnel.noPartner,
+                                    noUsdPrice: funnel.noUsdPrice, smallerThanFees: funnel.smallerThanFees, found: funnel.found,
+                                    belowCheckBar: funnel.belowCheckBar, checkBarUsd: Number(process.env.SIM_MIN_GROSS_USD ?? 0.5),
+                                    notVetted: funnel.notVetted, sentToCheck: funnel.sentToCheck,
+                                    skipped: [...funnel.skip.entries()].sort((a, b) => b[1] - a[1]),
+                              },
                               topDifferences: [...(rh?.spreads ?? [])].sort((a, b) => b.spreadPct - a.spreadPct)
                                     .map((d) => ({ pair: d.pair, pct: d.spreadPct, buyAt: d.buyDex, sellAt: d.sellDex })),
                         }));
@@ -1649,6 +1682,9 @@ for (let i = 0; i < resolved.length; i++) {
                   hourlyMatches.clear();
                   for (const chainName of Object.keys(chainHealthFlapCount)) chainHealthFlapCount[chainName] = 0;
                   simStats.checked = simStats.profit = simStats.loss = simStats.fail = simStats.rateLimited = 0;
+                  funnel.tradesRead = funnel.noPool = funnel.tooSmall = funnel.noPartner = funnel.noUsdPrice = funnel.smallerThanFees = 0;
+                  funnel.found = funnel.belowCheckBar = funnel.notVetted = funnel.sentToCheck = 0;
+                  funnel.skip.clear();
                   priceStats.local = priceStats.rpc = 0;
                   fireStats.readyMs = []; fireStats.blocked.clear(); fireStats.sent = 0;
                   rivals.reset();
