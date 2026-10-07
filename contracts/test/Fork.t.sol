@@ -555,6 +555,58 @@ contract RobinhoodForkTest is ForkBase {
         _flashRoute("robinhood flash(uni 0.01%) V4(native)->ramsesV3 start USDG 1000", USDG, WETH, 1000e6, V4_POOL_MANAGER, 3, _ramsesV3ByTick(), 2, true, false);
     }
 
+    // Every Ramses V3 WETH/USDG pool (one per tick spacing), so each can be
+    // tested at bot-sized amounts.
+    function _ramsesV3All() internal view returns (address[] memory pools, int24[] memory spacings) {
+        int24[6] memory sp = [int24(1), int24(5), int24(10), int24(50), int24(100), int24(200)];
+        pools = new address[](6);
+        spacings = new int24[](6);
+        uint256 n;
+        for (uint256 i = 0; i < sp.length; i++) {
+            (bool ok, bytes memory ret) =
+                RAMSES_V3_FACTORY.staticcall(abi.encodeWithSignature("getPool(address,address,int24)", WETH, USDG, sp[i]));
+            if (!ok || ret.length < 32) continue;
+            address p = abi.decode(ret, (address));
+            if (p == address(0) || p.code.length == 0) continue;
+            pools[n] = p; spacings[n] = sp[i]; n++;
+        }
+        assembly { mstore(pools, n) mstore(spacings, n) }
+    }
+
+    // Bot-sized trades through each Ramses V3 pool (own capital). Logs, per
+    // pool and size, whether the swaps ran or the revert data, instead of
+    // failing on the first problem, so one CI run shows the whole picture.
+    function test_fork_robinhood_ramsesV3_sizes() public {
+        if (!_fork("ROBINHOOD_RPC_URL")) return;
+        address uni = _uniV3();
+        (address[] memory pools, int24[] memory sp) = _ramsesV3All();
+        uint256[4] memory sizes = [uint256(0.05 ether), 1 ether, 5 ether, 20 ether];
+        for (uint256 i = 0; i < pools.length; i++) {
+            (, bytes memory bw) = WETH.staticcall(abi.encodeWithSignature("balanceOf(address)", pools[i]));
+            (, bytes memory bu) = USDG.staticcall(abi.encodeWithSignature("balanceOf(address)", pools[i]));
+            (, bytes memory lq) = pools[i].staticcall(abi.encodeWithSignature("liquidity()"));
+            console.log("ramses pool", pools[i]);
+            console.log("  tick spacing / WETH held / USDG held:", uint256(int256(sp[i])), abi.decode(bw, (uint256)), abi.decode(bu, (uint256)));
+            console.log("  pool active liquidity:", lq.length >= 32 ? abi.decode(lq, (uint256)) : 0);
+            for (uint256 k = 0; k < sizes.length; k++) {
+                for (uint256 dir = 0; dir < 2; dir++) {
+                    uint256 snap = vm.snapshotState();
+                    _fundWrapped(WETH, sizes[k]);
+                    ArbExecutor.Hop[] memory hops = new ArbExecutor.Hop[](2);
+                    if (dir == 0) { hops[0] = _hop(2, uni, WETH, USDG, 0); hops[1] = _hop(2, pools[i], USDG, WETH, 0); }
+                    else { hops[0] = _hop(2, pools[i], WETH, USDG, 0); hops[1] = _hop(2, uni, USDG, WETH, 0); }
+                    ArbExecutor.Trade memory t =
+                        ArbExecutor.Trade({token: WETH, amountIn: sizes[k], minProfit: 1, maxBlock: _l2Block(), hops: hops});
+                    (bool ok, bytes memory data) = address(exec).call(abi.encodeWithSelector(ArbExecutor.execute.selector, t, address(0)));
+                    bool guard = data.length >= 4 && bytes4(data) == ArbExecutor.InsufficientProfit.selector;
+                    console.log(dir == 0 ? "  -> uni->ramses size(wei)" : "  -> ramses->uni size(wei)", sizes[k], ok || guard ? "OK swaps ran" : "REVERTED");
+                    if (!ok && !guard) console.logBytes(data);
+                    vm.revertToState(snap);
+                }
+            }
+        }
+    }
+
     function test_fork_robinhood_ramsesV2_to_pancakeV3() public {
         if (!_fork("ROBINHOOD_RPC_URL")) return;
         address v3 = _findV3(PANCAKE_V3_FACTORY, WETH, USDG, _fees(2500, 500, 10000, 100));
