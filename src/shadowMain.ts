@@ -532,7 +532,8 @@ const queueSimulation = (
                   // Pair name in the log line, so the status page can show WHICH
                   // coins fail (e.g. "WETH/AAPL uniswap-v3->uniswap-v2").
                   const pair = `${symbolOf(chain, buyPool.tokenA)}/${symbolOf(chain, buyPool.tokenB)}`;
-                  const route = `${buyPool.dex}->${sellPool.dex}`;
+                  // Pool addresses (shortened) so a failing pool can be identified.
+                  const route = `${buyPool.dex}@${String(buyPool.poolAddress).slice(0, 10)}->${sellPool.dex}@${String(sellPool.poolAddress).slice(0, 10)}`;
                   const model = `model gross $${modelGrossUsd.toFixed(2)} on $${tradeSizeUsd.toFixed(0)}${timing ? ` | ${timing}` : ''} | ${funding}`;
                   if (r.status === 'rate_limited') {
                         // Not a trade result: pause, don't count it.
@@ -566,7 +567,7 @@ const queueSimulation = (
                         const net = usd - (chain === 'robinhood' ? rhGasUsd(0.05) : 0.05);
                         const vetted = [buyPool.tokenA, buyPool.tokenB].every((t: string) => safetyGate.isAllowed(t));
                         if (chain === 'robinhood' && net >= MIN_COUNTED_USD && vetted) {
-                              dryRunPnl.recordVerified(net, `${symbolOf(chain, tokenIn)} ${route}`);
+                              dryRunPnl.recordVerified(net, `${symbolOf(chain, tokenIn)} ${buyPool.dex}->${sellPool.dex}`);
                         }
                   } else if (r.status === 'loss') {
                         simStats.loss++;
