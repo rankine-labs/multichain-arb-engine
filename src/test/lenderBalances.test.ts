@@ -32,10 +32,10 @@ const hex = (n: bigint) => '0x' + n.toString(16).padStart(64, '0');
 async function main() {
   const lb = new LenderBalances();
   const callMany = async (calls: { target: string; data: string }[]) => calls.map((c) => {
-    if (c.data === '0x1a686502') return hex(answers[c.target][2]);
+    if (c.data === '0x1a686502') return hex(answers[c.target.toLowerCase()][2]);
     const holder = '0x' + c.data.slice(-40);
     const a = answers[holder];
-    return hex(c.target === WETH ? a[0] : a[1]);
+    return hex(c.target.toLowerCase() === WETH ? a[0] : a[1]);
   });
   const v4 = { ...big, dex: 'uniswap-v4', poolAddress: '0x' + 'ab'.repeat(32) } as PoolState; // 32-byte V4 id
   const n = await lb.refresh(callMany, [tiny, big, empty, v4]);

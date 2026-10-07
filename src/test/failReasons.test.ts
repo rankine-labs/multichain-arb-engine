@@ -55,4 +55,4 @@ assert(!none.includes('Why:'), 'no reasons section when nothing failed');
 
 // --- test timing line ------------------------------------------------------
 const timed = formatPlainHourly({ ...base, checks: { done: 5, makeMoney: 1, loseMoney: 4, wouldFail: 0, nodeBusy: 0, timing: { rightAfter: 3, othersInBlock: 1, late: 1 } } });
-assert(timed.includes('Test timing: 3 right after the trade we followed, 1 after another bot also traded, 1 tested late'), 'Telegram shows when checks were tested');
+assert(timed.includes('Test timing: 3 right after the trade we followed, 1 at the end of its block, 1 tested late'), 'Telegram shows when checks were tested');

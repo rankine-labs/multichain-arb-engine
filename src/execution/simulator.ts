@@ -122,6 +122,51 @@ function revertData(err: { data?: any } | undefined): string | null {
   return null;
 }
 
+// ----------------------------------------------------------------------------
+// REPLAY: test our trade at the exact moment it would land.
+//
+// Plain English:
+//   A plain eth_call only sees the state at the END of a block, after every
+//   trade in it, including rival bots that jumped in right behind the trade
+//   we follow. eth_simulateV1 runs several calls in order on the block BEFORE:
+//   we replay the trades in that block up to and including the trigger, then
+//   run our trade. That's the market a backrun would really hit if we were
+//   first in line.
+//
+// replayRpc wraps an Rpc: our simulation call (to SIM_EXECUTOR_ADDRESS) is
+// sent as eth_simulateV1 [prefix calls..., ours] on parentBlock with our
+// state overrides; everything else (balance slot lookups) passes through.
+// The answer is shaped like an eth_call answer, so simulateRoundTrip reads
+// it the same way.
+// ----------------------------------------------------------------------------
+const STATE_GONE_RE = /missing trie node|historical state|state.*(not available|unavailable)|header not found|unknown block|pruned/i;
+export type ReplayCall = { from: string; to: string; data: string; value?: string; gas?: string };
+
+export function replayRpc(base: Rpc, parentBlock: string, prefix: ReplayCall[]): Rpc {
+  return async (method, params) => {
+    const p = params as any[];
+    if (method !== 'eth_call' || p[0]?.to?.toLowerCase() !== SIM_EXECUTOR_ADDRESS) return base(method, params);
+    const r = await base('eth_simulateV1', [{
+      blockStateCalls: [{ stateOverrides: p[2] ?? {}, calls: [...prefix, p[0]] }],
+      validation: false,                       // replayed trades skip nonce/fee checks
+    }, parentBlock]);
+    if (r.error) {
+      // Rate limits / network trouble pass through (paused, not a trade result).
+      if (isRateLimited(r.error) || (r.error.message ?? '').startsWith('network:')) return r;
+      // Anything else (method missing, old state gone): a plain marker the
+      // caller recognises, so it falls back to a normal check. Deliberately
+      // no node wording, so it's never mistaken for "overrides unsupported"
+      // (which would pause all checks).
+      return { error: { message: `replay unavailable${STATE_GONE_RE.test(r.error.message ?? '') ? ' (state gone)' : ''}` } };
+    }
+    const calls = r.result?.[0]?.calls ?? [];
+    const ours = calls[calls.length - 1];
+    if (!ours) return { error: { message: 'replay returned no result' } };
+    if (ours.status === '0x1') return { result: ours.returnData };
+    return { error: { message: ours.error?.message ?? 'execution reverted', data: ours.returnData ?? ours.error?.data } };
+  };
+}
+
 // Does this RPC error mean "you're sending too many requests"?
 export function isRateLimited(err: { code?: number; message?: string } | undefined): boolean {
   const m = (err?.message ?? '').toLowerCase();

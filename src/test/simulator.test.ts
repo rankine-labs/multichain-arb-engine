@@ -1,4 +1,4 @@
-import { simRpcUrl, wssToHttps, isRateLimited, simulateRoundTrip, Rpc } from '../execution/simulator';
+import { simRpcUrl, wssToHttps, isRateLimited, simulateRoundTrip, Rpc, replayRpc, SIM_EXECUTOR_ADDRESS } from '../execution/simulator';
 
 // Checks which RPC simulations use, and that "slow down" responses are
 // reported as rate limits rather than as failed trades.
@@ -68,6 +68,26 @@ async function main() {
   assert(simBlock === '0x1a2b', `simulation runs on the requested block (got ${String(simBlock)})`);
   await simulateRoundTrip(blockSpy, 'test3', trade);
   assert(simBlock === 'latest', 'no block given -> latest');
+
+  // 6. Replay: our sim call becomes eth_simulateV1 [trigger, ours] on the
+  //    parent block; the profit-guard revert comes back like an eth_call's.
+  let sent: any = null;
+  const insufficient = '0x' + 'f1f24d3a'.padEnd(8, '0'); // any 4 bytes: parsed below only as revert data
+  const node: Rpc = async (method, params) => {
+    const p = params as any[];
+    if (method === 'eth_call') { const diff = Object.values(p[2])[0] as any; return { result: Object.values(diff.stateDiff)[0] }; }
+    sent = { method, params };
+    return { result: [{ calls: [{ status: '0x1', returnData: '0x' }, { status: '0x0', returnData: insufficient, error: { message: 'execution reverted' } }] }] };
+  };
+  const trigger = { from: '0x00000000000000000000000000000000000000aa', to: '0x00000000000000000000000000000000000000bb', data: '0x1234' };
+  const rr = replayRpc(node, '0x10', [trigger]);
+  const out = await rr('eth_call', [{ to: SIM_EXECUTOR_ADDRESS, data: '0x' }, 'latest', { x: 1 }]);
+  assert(sent?.method === 'eth_simulateV1' && sent.params[1] === '0x10', 'replay runs on the parent block');
+  assert(sent.params[0].blockStateCalls[0].calls[0].data === '0x1234' && sent.params[0].blockStateCalls[0].calls.length === 2, 'trigger replayed first, then our trade');
+  assert(sent.params[0].blockStateCalls[0].stateOverrides.x === 1 && sent.params[0].validation === false, 'our pretend-state goes along, validation off');
+  assert(out.error?.data === insufficient, 'our revert data comes back like an eth_call error');
+  const other = await rr('eth_call', [{ to: '0x00000000000000000000000000000000000000cc', data: '0x70a08231' }, 'latest', { ['0x00000000000000000000000000000000000000cc']: { stateDiff: { k: '0x05' } } }]);
+  assert(other.result === '0x05', 'other calls (balance slot lookups) pass straight through');
 }
 
 main().catch((err) => { console.error('FAIL: test crashed', err); process.exitCode = 1; });

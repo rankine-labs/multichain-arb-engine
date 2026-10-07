@@ -81,7 +81,7 @@ import { ROBINHOOD_SCAN_FACTORIES } from './config/knownAddresses';
 import { buildExecuteCall, executionRequested, executorConfig, pickV3Lender } from './execution/executorCalldata';
 import { FailTally } from './core/failReasons';
 import { LenderBalances } from './core/lenderBalances';
-import { makeRpc, simulateRoundTrip, simRpcUrl, Rpc, makeFallbackRpc, loadBalanceSlots, wssToHttps } from './execution/simulator';
+import { makeRpc, simulateRoundTrip, simRpcUrl, Rpc, makeFallbackRpc, loadBalanceSlots, wssToHttps, replayRpc, ReplayCall } from './execution/simulator';
 import { FastSender, SafetyGate, safetyConfigFromEnv } from './execution/fastSender';
 import { checkLiveReady } from './execution/liveReadiness';
 import { LiveTradeTracker } from './execution/liveTracker';
@@ -446,18 +446,27 @@ const checkRoundTrip = async (
       return { status: 'fail', reason: r.reason };
 };
 
-// Finds the block the trigger trade landed in. Returns the block (hex) and
-// whether the trigger was the LAST trade in it (then that block's state is
-// exactly "right after the trigger"; otherwise someone else traded after it
-// in the same block, often a rival's backrun). null = not found in time.
-const findTriggerBlock = async (rpc: (m: string, p: unknown[]) => Promise<{ result?: any; error?: any }>, hash: string): Promise<{ block: string; last: boolean } | null> => {
+// Finds where the trigger trade landed and the trades before it in that
+// block (including the trigger itself), so the check can REPLAY them on the
+// block before and then run our trade: the exact moment a backrun lands,
+// before any rival. null = not found in time.
+type TriggerSpot = { block: string; parent: string; prefix: ReplayCall[] };
+const USER_TX_TYPES = new Set(['0x0', '0x1', '0x2', '0x3', '0x4']); // skip Arbitrum system txs (0x64-0x6a)
+const findTriggerSpot = async (rpc: (m: string, p: unknown[]) => Promise<{ result?: any; error?: any }>, hash: string): Promise<TriggerSpot | null> => {
       for (let i = 0; i < RH_TRIGGER_MAX_POLLS; i++) {
             const r = await rpc('eth_getTransactionReceipt', [hash]);
             if (r.error) return null;
             if (r.result?.blockNumber) {
-                  const c = await rpc('eth_getBlockTransactionCountByNumber', [r.result.blockNumber]);
-                  const count = c.result ? Number(c.result) : NaN;
-                  return { block: r.result.blockNumber, last: Number.isFinite(count) && Number(r.result.transactionIndex) === count - 1 };
+                  const n = BigInt(r.result.blockNumber);
+                  const idx = Number(r.result.transactionIndex);
+                  const b = await rpc('eth_getBlockByNumber', [r.result.blockNumber, true]);
+                  const txs: any[] = b.result?.transactions ?? [];
+                  const prefix: ReplayCall[] = txs.slice(0, idx + 1)
+                        .filter((t) => t.to && USER_TX_TYPES.has(String(t.type ?? '0x0').toLowerCase()))
+                        .map((t) => ({ from: t.from, to: t.to, data: t.input ?? t.data ?? '0x', value: t.value, gas: t.gas }));
+                  // The trigger must be in there, or the replay would be meaningless.
+                  if (!prefix.length || !txs[idx] || txs[idx].hash?.toLowerCase() !== hash.toLowerCase()) return null;
+                  return { block: r.result.blockNumber, parent: '0x' + (n - 1n).toString(16), prefix };
             }
             await new Promise((res) => setTimeout(res, RH_TRIGGER_POLL_MS));
       }
@@ -496,24 +505,30 @@ const queueSimulation = (
       setTimeout(async () => {
             try {
                   // Robinhood: test on the trigger's own block (right after it).
-                  let blockTag = 'latest';
-                  let timing = '';
-                  if (followTrigger) {
-                        const tb = await findTriggerBlock(simRpc[chain], triggerHash!);
-                        if (tb) {
-                              blockTag = tb.block;
-                              if (tb.last) { checkTiming.rightAfter++; timing = 'right after trigger'; }
-                              else { checkTiming.othersInBlock++; timing = 'others traded after trigger in same block'; }
-                        } else { checkTiming.late++; timing = 'trigger not found in time, tested on latest'; }
-                  }
+                  // Robinhood: replay the trigger's block up to the trigger, then
+                  // our trade (right after the trigger, before any rival).
+                  // Fallbacks: end of the trigger's block, then latest.
                   const simOpts = { v3Lender: lender?.poolAddress, weth: chain === 'robinhood' ? ROBINHOOD_TOKENS.WETH : undefined };
-                  let r = await simulateRoundTrip(simRpc[chain], chain, { token: tokenIn, amountIn: built.amountIn, hops: built.hops }, { ...simOpts, blockTag });
-                  // Node no longer has that block's state: test on latest instead.
-                  if (blockTag !== 'latest' && 'reason' in r && STATE_GONE.test(r.reason)) {
-                        checkTiming.late++; if (timing.startsWith('right')) checkTiming.rightAfter--; else checkTiming.othersInBlock--;
-                        timing = 'old block state gone, tested on latest';
-                        r = await simulateRoundTrip(simRpc[chain], chain, { token: tokenIn, amountIn: built.amountIn, hops: built.hops }, simOpts);
+                  const trade = { token: tokenIn, amountIn: built.amountIn, hops: built.hops };
+                  let timing = '';
+                  let r: Awaited<ReturnType<typeof simulateRoundTrip>>;
+                  const spot = followTrigger ? await findTriggerSpot(simRpc[chain], triggerHash!) : null;
+                  if (spot) {
+                        r = await simulateRoundTrip(replayRpc(simRpc[chain], spot.parent, spot.prefix), chain, trade, simOpts);
+                        timing = 'right after trigger';
+                        if ('reason' in r && (r.reason.startsWith('replay unavailable') || STATE_GONE.test(r.reason))) {
+                              // Replay not possible: end of the trigger's block instead.
+                              r = await simulateRoundTrip(simRpc[chain], chain, trade, { ...simOpts, blockTag: spot.block });
+                              timing = 'end of trigger block';
+                              if ('reason' in r && STATE_GONE.test(r.reason)) { r = await simulateRoundTrip(simRpc[chain], chain, trade, simOpts); timing = 'tested late'; }
+                        }
+                  } else {
+                        r = await simulateRoundTrip(simRpc[chain], chain, trade, simOpts);
+                        if (followTrigger) timing = 'tested late';
                   }
+                  if (timing === 'right after trigger') checkTiming.rightAfter++;
+                  else if (timing === 'end of trigger block') checkTiming.othersInBlock++;
+                  else if (timing === 'tested late') checkTiming.late++;
                   // Pair name in the log line, so the status page can show WHICH
                   // coins fail (e.g. "WETH/AAPL uniswap-v3->uniswap-v2").
                   const pair = `${symbolOf(chain, buyPool.tokenA)}/${symbolOf(chain, buyPool.tokenB)}`;
@@ -544,7 +559,7 @@ const queueSimulation = (
                   } else if (r.status === 'profit') {
                         simStats.profit++;
                         const usd = (Number(r.profit) / 10 ** decimals) * usdPerToken;
-                        console.log(`[sim] ${chain} ${route} REAL PROFIT $${usd.toFixed(2)} after loan fee | ${model}`);
+                        console.log(`[sim] ${chain} ${pair} ${route} REAL PROFIT $${usd.toFixed(4)} after loan fee | ${model}`);
                         // A trigger trade the real-chain test confirms clears the
                         // firing bar after gas: counts as verified would-have-earned,
                         // but only on vetted tokens, same as a live trade would need.

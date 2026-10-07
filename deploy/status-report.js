@@ -134,8 +134,8 @@ async function main() {
   const simFail = count(outL, /\[sim\].*real: FAILS/);
   // When trigger checks were tested (bot tags each [sim] line).
   const tRight = count(outL, /\[sim\] robinhood .*\| right after trigger \|/);
-  const tOthers = count(outL, /\[sim\] robinhood .*\| others traded after trigger/);
-  const tLate = count(outL, /\[sim\] robinhood .*\| (trigger not found|old block state gone)/);
+  const tOthers = count(outL, /\[sim\] robinhood .*\| end of trigger block \|/);
+  const tLate = count(outL, /\[sim\] robinhood .*\| tested late \|/);
   // Exact reasons the chain gave for failed checks (trigger trades and
   // standing gaps), counted, so the cause is visible without logging in.
   const failCounts = new Map();
@@ -213,7 +213,7 @@ async function main() {
     `- Real-chain test runs: ${simProfit} profitable · ${simLoss} losing · ${simFail} would fail`,
     ...(profitUsd.length ? [`- Profitable checks: total $${profitUsd.reduce((x, y) => x + y, 0).toFixed(2)} · middle $${profitUsd[Math.floor(profitUsd.length / 2)].toFixed(2)} · biggest $${profitUsd[profitUsd.length - 1].toFixed(2)} (before gas)`,
       `- Profit by pair: ${topProfitPairs.map(([p, v]) => `${p} $${v.toFixed(2)}`).join(' · ')}`] : []),
-    ...(tRight + tOthers + tLate ? [`- Test timing: ${tRight} right after trigger · ${tOthers} after others traded in same block · ${tLate} late`] : []),
+    ...(tRight + tOthers + tLate ? [`- Test timing: ${tRight} right after trigger (replayed) · ${tOthers} end of trigger block · ${tLate} late`] : []),
     ...(topFails.length ? ['- Why tests would fail (exact chain reason):', ...topFails.map(([m, n]) => `  - ${n}x \`${m.replace(/`/g, "'")}\``)] : []),
     `- Dry run, would have earned (if we won every race): ${lastPnl ? lastPnl.replace(/^\[pnl\] would-have-earned /, '') : 'first figure after the next hourly report'}`,
     '',

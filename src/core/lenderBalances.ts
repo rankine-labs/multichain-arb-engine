@@ -42,9 +42,11 @@ export class LenderBalances {
     const v3 = pools.filter((p) => p.poolType === 'v3' && p.dex !== 'uniswap-v4' && isAddr(p.poolAddress) && isAddr(p.tokenA) && isAddr(p.tokenB));
     const calls: Call[] = [];
     for (const p of v3) {
-      calls.push({ target: p.tokenA, data: BALANCE_OF + pad(p.poolAddress) });
-      calls.push({ target: p.tokenB, data: BALANCE_OF + pad(p.poolAddress) });
-      calls.push({ target: p.poolAddress, data: LIQUIDITY });
+      // Lowercase: a mixed-case address with a bad checksum makes ethers throw
+      // "invalid address" and the whole bundle fails.
+      calls.push({ target: p.tokenA.toLowerCase(), data: BALANCE_OF + pad(p.poolAddress) });
+      calls.push({ target: p.tokenB.toLowerCase(), data: BALANCE_OF + pad(p.poolAddress) });
+      calls.push({ target: p.poolAddress.toLowerCase(), data: LIQUIDITY });
     }
     if (!calls.length) return 0;
     const res = await callMany(calls);

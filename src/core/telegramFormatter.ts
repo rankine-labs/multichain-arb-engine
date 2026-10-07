@@ -377,7 +377,7 @@ export function formatPlainHourly(r: PlainHourlyInput): string {
     const tm = r.checks.timing;
     if (tm && tm.rightAfter + tm.othersInBlock + tm.late > 0) {
       const bits = [`${tm.rightAfter} right after the trade we followed`];
-      if (tm.othersInBlock) bits.push(`${tm.othersInBlock} after another bot also traded`);
+      if (tm.othersInBlock) bits.push(`${tm.othersInBlock} at the end of its block`);
       if (tm.late) bits.push(`${tm.late} tested late`);
       L.push(`  Test timing: ${bits.join(', ')}`);
     }
