@@ -54,6 +54,29 @@ async function getPool(factory: string, fee: number): Promise<string | null> {
     console.log(`${label}: ${r.status}${'reason' in r ? ` (${r.reason})` : ''}`);
     await sleep(1500);
   }
+  // Isolate the replay problem: our trade ALONE inside eth_simulateV1 on
+  // latest, with the same pretend-state, printing the node's full answer.
+  {
+    const ethersMod = (await import('ethers')).ethers;
+    const data0 = encodeExecuteRaw({ token: WETH, amountIn, minProfit: (1n << 256n) - 1n, maxBlock: (1n << 256n) - 1n, hops: routes[0][1] });
+    // Find WETH's balance slot the way the bot does (via its own check, cached).
+    for (const slot of [3, 0, 51, 101]) {
+      const balKey = ethersMod.keccak256(ethersMod.AbiCoder.defaultAbiCoder().encode(['address', 'uint256'], [SIM_EXECUTOR_ADDRESS, slot]));
+      const ov = {
+        [SIM_EXECUTOR_ADDRESS]: { code: ARB_EXECUTOR_RUNTIME_CODE, stateDiff: { ['0x' + pad('0x0')]: '0x' + pad(SIM_CALLER) } },
+        [WETH]: { stateDiff: { [balKey]: '0x' + amountIn.toString(16).padStart(64, '0') } },
+      };
+      const call = { from: SIM_CALLER, to: SIM_EXECUTOR_ADDRESS, data: data0, gas: '0x7a1200' };
+      const plain = await rpc('eth_call', [call, 'latest', ov]);
+      const sim = await rpc('eth_simulateV1', [{ blockStateCalls: [{ stateOverrides: ov, calls: [call] }], validation: false }, 'latest']);
+      const simState = await rpc('eth_simulateV1', [{ blockStateCalls: [{ stateOverrides: { [SIM_EXECUTOR_ADDRESS]: { code: ARB_EXECUTOR_RUNTIME_CODE, state: { ['0x' + pad('0x0')]: '0x' + pad(SIM_CALLER) } }, [WETH]: { stateDiff: { [balKey]: '0x' + amountIn.toString(16).padStart(64, '0') } } }, calls: [call] }], validation: false }, 'latest']);
+      const show = (x: any) => JSON.stringify(x.error ?? x.result?.[0]?.calls?.[0] ?? x.result).slice(0, 260);
+      console.log(`slot ${slot}: plain eth_call -> ${JSON.stringify(plain.error ?? plain.result).slice(0, 140)}`);
+      console.log(`slot ${slot}: simulateV1 stateDiff -> ${show(sim)}`);
+      console.log(`slot ${slot}: simulateV1 state -> ${show(simState)}`);
+      await sleep(1000);
+    }
+  }
   // Replay mode (what the bot's checks use): recent block's trades, then ours.
   // Old way (no block overrides) vs new (real block time + big gas room).
   const latest = Number((await rpc('eth_blockNumber', [])).result);
