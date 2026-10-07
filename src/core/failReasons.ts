@@ -8,8 +8,8 @@
 //   "BadRoute()"). This file sorts those into a few groups a person can act on:
 //     - tax:      the coin takes a cut when it's moved, so the pool gets less
 //                 than our trade expected and cancels it
-//     - transfer: coins couldn't be moved: usually the lender pool was too
-//                 small (or empty), sometimes a coin that blocks transfers
+//     - transfer: a coin transfer failed during the test (cause being
+//                 traced; can also be a coin that blocks transfers)
 //     - blocked:  the coin says outright it refuses (blacklist / trading off)
 //     - ours:     our bot built the trade wrong (a bug for us to fix)
 //     - stale:    our price info for the pool was old or wrong
