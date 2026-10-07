@@ -349,6 +349,15 @@ const simPausedUntil: Record<string, number> = {};
 // How long to wait for the trade we're backrunning to land before simulating
 // (roughly one to a few blocks on each chain).
 const SIM_DELAY_MS: Record<string, number> = { avalanche: 3_000, monad: 1_500, robinhood: 1_000 };
+// Robinhood trigger checks don't use the fixed delay: they wait for the
+// trigger trade's own block (see findTriggerBlock) and test right after it.
+// Blocks are ~30 ms, so the old 1 s wait tested ~30 blocks late, after rival
+// bots (who land right behind the trigger) had already closed the gap: every
+// check looked like "no money" whether the opportunity was real or not.
+const RH_TRIGGER_POLL_MS = 150;     // how often to ask "has the trigger landed?"
+const RH_TRIGGER_MAX_POLLS = 12;    // give up after ~1.8 s and test on the latest block
+// Hourly: how Robinhood trigger checks were timed (reset with the digest).
+const checkTiming = { rightAfter: 0, othersInBlock: 0, late: 0 };
 const simBusy: Record<string, boolean> = {};          // one simulation in flight per chain
 // Simulation switched off for a chain (e.g. the RPC lacks state overrides),
 // with an expiry: retried after 30 min instead of staying off until restart.
@@ -437,9 +446,30 @@ const checkRoundTrip = async (
       return { status: 'fail', reason: r.reason };
 };
 
+// Finds the block the trigger trade landed in. Returns the block (hex) and
+// whether the trigger was the LAST trade in it (then that block's state is
+// exactly "right after the trigger"; otherwise someone else traded after it
+// in the same block, often a rival's backrun). null = not found in time.
+const findTriggerBlock = async (rpc: (m: string, p: unknown[]) => Promise<{ result?: any; error?: any }>, hash: string): Promise<{ block: string; last: boolean } | null> => {
+      for (let i = 0; i < RH_TRIGGER_MAX_POLLS; i++) {
+            const r = await rpc('eth_getTransactionReceipt', [hash]);
+            if (r.error) return null;
+            if (r.result?.blockNumber) {
+                  const c = await rpc('eth_getBlockTransactionCountByNumber', [r.result.blockNumber]);
+                  const count = c.result ? Number(c.result) : NaN;
+                  return { block: r.result.blockNumber, last: Number.isFinite(count) && Number(r.result.transactionIndex) === count - 1 };
+            }
+            await new Promise((res) => setTimeout(res, RH_TRIGGER_POLL_MS));
+      }
+      return null;
+};
+// Node can't serve an older block's state ("missing trie node" etc.).
+const STATE_GONE = /missing trie node|historical state|state.*(not available|unavailable)|header not found|unknown block|pruned/i;
+
 const queueSimulation = (
       chain: 'avalanche' | 'monad' | 'robinhood', tokenIn: string,
       buyPool: any, sellPool: any, tradeSizeUsd: number, modelGrossUsd: number, usdPerToken: number,
+      triggerHash?: string,   // Robinhood: the trade we're following, to test right after it
 ) => {
       if (simBusy[chain]) { if (chain === 'robinhood') funnelSkip('another check was running'); return; }
       if (simOff(chain) || Date.now() < (simPausedUntil[chain] ?? 0)) { if (chain === 'robinhood') funnelSkip('checking node paused (busy or out of allowance)'); return; }
@@ -462,14 +492,33 @@ const queueSimulation = (
       const funding = lender ? `flash loan from ${lender.dex} (${lender.feeBps / 100}% fee)` : 'own capital (no V3 lender cached)';
 
       simBusy[chain] = true;
+      const followTrigger = chain === 'robinhood' && !!triggerHash && !triggerHash.includes('PLACEHOLDER');
       setTimeout(async () => {
             try {
-                  const r = await simulateRoundTrip(simRpc[chain], chain, { token: tokenIn, amountIn: built.amountIn, hops: built.hops }, { v3Lender: lender?.poolAddress, weth: chain === 'robinhood' ? ROBINHOOD_TOKENS.WETH : undefined });
+                  // Robinhood: test on the trigger's own block (right after it).
+                  let blockTag = 'latest';
+                  let timing = '';
+                  if (followTrigger) {
+                        const tb = await findTriggerBlock(simRpc[chain], triggerHash!);
+                        if (tb) {
+                              blockTag = tb.block;
+                              if (tb.last) { checkTiming.rightAfter++; timing = 'right after trigger'; }
+                              else { checkTiming.othersInBlock++; timing = 'others traded after trigger in same block'; }
+                        } else { checkTiming.late++; timing = 'trigger not found in time, tested on latest'; }
+                  }
+                  const simOpts = { v3Lender: lender?.poolAddress, weth: chain === 'robinhood' ? ROBINHOOD_TOKENS.WETH : undefined };
+                  let r = await simulateRoundTrip(simRpc[chain], chain, { token: tokenIn, amountIn: built.amountIn, hops: built.hops }, { ...simOpts, blockTag });
+                  // Node no longer has that block's state: test on latest instead.
+                  if (blockTag !== 'latest' && 'reason' in r && STATE_GONE.test(r.reason)) {
+                        checkTiming.late++; if (timing.startsWith('right')) checkTiming.rightAfter--; else checkTiming.othersInBlock--;
+                        timing = 'old block state gone, tested on latest';
+                        r = await simulateRoundTrip(simRpc[chain], chain, { token: tokenIn, amountIn: built.amountIn, hops: built.hops }, simOpts);
+                  }
                   // Pair name in the log line, so the status page can show WHICH
                   // coins fail (e.g. "WETH/AAPL uniswap-v3->uniswap-v2").
                   const pair = `${symbolOf(chain, buyPool.tokenA)}/${symbolOf(chain, buyPool.tokenB)}`;
                   const route = `${buyPool.dex}->${sellPool.dex}`;
-                  const model = `model gross $${modelGrossUsd.toFixed(2)} on $${tradeSizeUsd.toFixed(0)} | ${funding}`;
+                  const model = `model gross $${modelGrossUsd.toFixed(2)} on $${tradeSizeUsd.toFixed(0)}${timing ? ` | ${timing}` : ''} | ${funding}`;
                   if (r.status === 'rate_limited') {
                         // Not a trade result: pause, don't count it.
                         simPausedUntil[chain] = Date.now() + SIM_RATE_LIMIT_PAUSE_MS;
@@ -517,7 +566,7 @@ const queueSimulation = (
             } finally {
                   simBusy[chain] = false;
             }
-      }, SIM_DELAY_MS[chain]);
+      }, followTrigger ? RH_TRIGGER_POLL_MS : SIM_DELAY_MS[chain]);
 };
 
 // ==========================================================================
@@ -1098,7 +1147,7 @@ if (swap.chain === 'robinhood') {
       else funnel.sentToCheck++;
 }
 if (sizing.grossProfitUsd >= SIM_MIN_GROSS_USD && simVetted) {
-      queueSimulation(swap.chain, swap.tokenIn, buyPoolUsed, sellPoolUsed, sizing.optimalTradeSizeUsd, sizing.grossProfitUsd, usdPerToken);
+      queueSimulation(swap.chain, swap.tokenIn, buyPoolUsed, sellPoolUsed, sizing.optimalTradeSizeUsd, sizing.grossProfitUsd, usdPerToken, (event.raw as any)?.hash);
 }
 
 if (!profit.qualifies) {
@@ -1701,6 +1750,7 @@ for (let i = 0; i < resolved.length; i++) {
                                     loseMoney: simStats.loss + gapStats.fake,
                                     wouldFail: simStats.fail + gapStats.fail,
                                     failReasons: failTally.plain(),
+                                    timing: { ...checkTiming },
                                     nodeBusy: simStats.rateLimited,
                               },
                               checksAvailable: !(simStats.checked === 0 && (simStats.rateLimited > 0 || !!simOff('robinhood'))),
@@ -1744,6 +1794,7 @@ for (let i = 0; i < resolved.length; i++) {
                   funnel.found = funnel.belowCheckBar = funnel.notVetted = funnel.sentToCheck = 0;
                   funnel.skip.clear();
                   failTally.clear();
+                  checkTiming.rightAfter = checkTiming.othersInBlock = checkTiming.late = 0;
                   priceStats.local = priceStats.rpc = 0;
                   fireStats.readyMs = []; fireStats.blocked.clear(); fireStats.sent = 0;
                   rivals.reset();

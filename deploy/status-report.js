@@ -123,6 +123,10 @@ async function main() {
   const simProfit = count(outL, /\[sim\].*REAL PROFIT/);
   const simLoss = count(outL, /\[sim\].*real: LOSS/);
   const simFail = count(outL, /\[sim\].*real: FAILS/);
+  // When trigger checks were tested (bot tags each [sim] line).
+  const tRight = count(outL, /\[sim\] robinhood .*\| right after trigger \|/);
+  const tOthers = count(outL, /\[sim\] robinhood .*\| others traded after trigger/);
+  const tLate = count(outL, /\[sim\] robinhood .*\| (trigger not found|old block state gone)/);
   // Exact reasons the chain gave for failed checks (trigger trades and
   // standing gaps), counted, so the cause is visible without logging in.
   const failCounts = new Map();
@@ -198,6 +202,7 @@ async function main() {
     `- Prices read from: ${readsOn} · ${rpcSwitches} node switch(es) this window`,
     `- RPC round trip from the server (public node, best of 3): ${rpcRtt ?? '?'} ms`,
     `- Real-chain test runs: ${simProfit} profitable · ${simLoss} losing · ${simFail} would fail`,
+    ...(tRight + tOthers + tLate ? [`- Test timing: ${tRight} right after trigger · ${tOthers} after others traded in same block · ${tLate} late`] : []),
     ...(topFails.length ? ['- Why tests would fail (exact chain reason):', ...topFails.map(([m, n]) => `  - ${n}x \`${m.replace(/`/g, "'")}\``)] : []),
     `- Dry run, would have earned (if we won every race): ${lastPnl ? lastPnl.replace(/^\[pnl\] would-have-earned /, '') : 'first figure after the next hourly report'}`,
     '',
