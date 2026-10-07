@@ -13,9 +13,12 @@ function assert(cond: boolean, msg: string) {
 assert(classifyFailReason('UniswapV2: K') === 'tax', 'V2 K check = coin takes a cut');
 assert(classifyFailReason('IIA') === 'tax', 'V3 IIA = coin takes a cut');
 assert(classifyFailReason('TokenBalanceDropped(0xabc)') === 'tax', 'middle coin shrank = coin takes a cut');
-assert(classifyFailReason('TransferHelper: TRANSFER_FAILED') === 'blocked', 'transfer failed = coin blocks trading');
-assert(classifyFailReason('STF') === 'blocked', 'STF = coin blocks trading');
-assert(classifyFailReason('TransferFailed()') === 'blocked', 'our TransferFailed = coin blocks trading');
+assert(classifyFailReason('TransferHelper: TRANSFER_FAILED') === 'transfer', 'transfer failed = money could not be moved');
+assert(classifyFailReason('STF') === 'transfer', 'STF = money could not be moved');
+assert(classifyFailReason('TF') === 'transfer', 'TF = money could not be moved (lender short)');
+assert(classifyFailReason('TransferFailed()') === 'transfer', 'our TransferFailed = money could not be moved');
+assert(classifyFailReason('L') === 'transfer', 'L = lender had no active liquidity');
+assert(classifyFailReason('ERC20: sender is blacklisted') === 'blocked', 'explicit blacklist = coin blocks trading');
 assert(classifyFailReason('BadRoute()') === 'ours', 'BadRoute = our bug');
 assert(classifyFailReason('SPL') === 'ours', 'bad price limit = our bug');
 assert(classifyFailReason('UniswapV2: INSUFFICIENT_OUTPUT_AMOUNT') === 'stale', 'output short = old price info');

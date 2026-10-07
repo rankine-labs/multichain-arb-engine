@@ -223,7 +223,15 @@ export function encodeExecuteV3FlashRaw(
 // Ramses V3 verified Oct 2026 by the fork test
 // test_fork_robinhood_ramsesV3_asLender (a live pool lent, trades ran, loan repaid).
 const FLASH_LENDER_DEXES = new Set(['uniswap-v3', 'pancakeswap-v3', 'ramses-v3']);
-export function pickV3Lender(candidates: PoolState[], token: string, exclude: string[]): PoolState | null {
+//
+// canLend (optional): "does this pool really hold enough of the token?" (see
+// core/lenderBalances.ts). When given, pools that can't cover the loan with
+// room to spare are skipped. Without it, the cheapest pool won even if it
+// held almost nothing, and the loan failed ("TF" / "TransferFailed" / "L").
+export function pickV3Lender(
+  candidates: PoolState[], token: string, exclude: string[],
+  canLend?: (pool: string, token: string) => boolean,
+): PoolState | null {
   const t = token.toLowerCase();
   const ex = new Set(exclude.map((a) => a.toLowerCase()));
   const ok = candidates.filter((p) =>
@@ -231,7 +239,8 @@ export function pickV3Lender(candidates: PoolState[], token: string, exclude: st
     FLASH_LENDER_DEXES.has(p.dex.toLowerCase()) &&
     !ex.has(p.poolAddress.toLowerCase()) &&
     (p.tokenA.toLowerCase() === t || p.tokenB.toLowerCase() === t) &&
-    (p.liquidity ?? 0n) > 0n,
+    (p.liquidity ?? 0n) > 0n &&
+    (!canLend || canLend(p.poolAddress, t)),
   );
   ok.sort((a, b) => a.feeBps - b.feeBps || (b.liquidity! > a.liquidity! ? 1 : b.liquidity! < a.liquidity! ? -1 : 0));
   return ok[0] ?? null;
