@@ -145,7 +145,10 @@ async function main() {
     // Pair + route (which exchanges) + funding (flash loan / own money), so a
     // failure can be traced to one pool type without reading the raw log.
     const sm = /\[sim\] robinhood (\S+\/\S+) (\S+) real: FAILS \((.*)\) \| .*\| (.*)$/.exec(l);
-    const m = sm ? [sm[0], `${sm[1]} ${sm[2]}, ${sm[4].replace(/ \(no V3 lender cached\)/, '')}`, sm[3]]
+    // Trade size bucket from "model gross $x on $SIZE" (helps spot size-related failures).
+    const size = /on \$(\d+)/.exec(l);
+    const bucket = size ? (Number(size[1]) < 1000 ? 'under $1k' : Number(size[1]) < 10000 ? '$1k-10k' : Number(size[1]) < 100000 ? '$10k-100k' : 'over $100k') : '?';
+    const m = sm ? [sm[0], `${sm[1]} ${sm[2]}, ${sm[4].replace(/ \(no V3 lender cached\)/, '')}, size ${bucket}`, sm[3]]
       : /\[gap\] (\S+\/\S+): .*NOT REAL \((.*)\); muted 30 min \| (.*)$/.exec(l)?.map((x, i, a) => (i === 1 ? `${x} ${a[3]}` : x))
       || /\[sim\] robinhood ()\S+ real: FAILS \((.*)\) \| /.exec(l); // older lines without the pair
     if (!m || /^real profit only/.test(m[2]) || /^ends with less/.test(m[2])) continue;
