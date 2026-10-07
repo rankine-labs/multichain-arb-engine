@@ -136,7 +136,7 @@ async function main() {
   const tRight = count(outL, /\[sim\] robinhood .*\| right after trigger[ ,|]/);
   const tOthers = count(outL, /\[sim\] robinhood .*\| end of trigger block[ ,|]/);
   const tLate = count(outL, /\[sim\] robinhood .*\| tested late[ ,|]/);
-  const rechecked = count(outL, /\[sim\] robinhood .*rechecked on free node/);
+  const rechecked = count(outL, /\[sim\] robinhood .*\(replay failed\)/);
   // Exact reasons the chain gave for failed checks (trigger trades and
   // standing gaps), counted, so the cause is visible without logging in.
   const failCounts = new Map();
@@ -217,7 +217,7 @@ async function main() {
     `- Real-chain test runs: ${simProfit} profitable · ${simLoss} losing · ${simFail} would fail`,
     ...(profitUsd.length ? [`- Profitable checks: total $${profitUsd.reduce((x, y) => x + y, 0).toFixed(2)} · middle $${profitUsd[Math.floor(profitUsd.length / 2)].toFixed(2)} · biggest $${profitUsd[profitUsd.length - 1].toFixed(2)} (before gas)`,
       `- Profit by pair: ${topProfitPairs.map(([p, v]) => `${p} $${v.toFixed(2)}`).join(' · ')}`] : []),
-    ...(tRight + tOthers + tLate ? [`- Test timing: ${tRight} right after trigger (replayed) · ${tOthers} end of trigger block · ${tLate} late · ${rechecked} re-checked on free node`] : []),
+    ...(tRight + tOthers + tLate ? [`- Test timing: ${tRight} right after trigger (replayed) · ${tOthers} end of trigger block · ${tLate} late · ${rechecked} re-checked without replay`] : []),
     ...(topFails.length ? ['- Why tests would fail (exact chain reason):', ...topFails.map(([m, n]) => `  - ${n}x \`${m.replace(/`/g, "'")}\``)] : []),
     `- Dry run, would have earned (if we won every race): ${lastPnl ? lastPnl.replace(/^\[pnl\] would-have-earned /, '') : 'first figure after the next hourly report'}`,
     '',
