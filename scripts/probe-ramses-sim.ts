@@ -58,7 +58,11 @@ async function getPool(factory: string, fee: number): Promise<string | null> {
   // the Uniswap 0.01% pool, start with WETH or USDG.
   {
     const lender = await getPool(UNI_FACTORY, 100);
-    console.log(`flash lender (uni 0.01%): ${lender}`);
+    // Trade on a DIFFERENT Uniswap pool than the lender (a pool can't lend and trade at once).
+    let uniT = await getPool(UNI_FACTORY, 500);
+    if (!uniT || uniT === lender) uniT = await getPool(UNI_FACTORY, 3000);
+    console.log(`flash lender (uni 0.01%): ${lender}, trade pool: ${uniT}`);
+    const uni = uniT;
     const usdgIn = 300n * 10n ** 6n; // $300 of USDG (6 decimals)
     const cases: [string, string, bigint, any[]][] = [
       ['flash WETH uni->ramses', WETH, amountIn, [hop(uni!, WETH, USDG), hop(RAMSES, USDG, WETH)]],
