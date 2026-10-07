@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       only:
-        description: 'Run one step only: feeds, sim, pairs, watch, universe, backtest, latency, lenders, smoke, seed, routers, v4, arbsys, nodes, multicall, simv1 (blank = all except backtest)'
+        description: 'Run one step only: feeds, sim, pairs, watch, universe, backtest, latency, lenders, smoke, seed, routers, v4, arbsys, nodes, multicall, simv1, ramsessim (blank = all except backtest)'
         required: false
         default: ''
 
@@ -43,6 +43,14 @@ jobs:
           echo "$out"
           out="${out//'%'/'%25'}"; out="${out//$'\n'/'%0A'}"
           echo "::notice title=simulateV1 probe::${out}"
+      - name: Ramses route check on the live node (bot's own simulation + trace)
+        if: inputs.only == 'ramsessim'
+        shell: bash
+        run: |
+          out=$(node .scripts-build/scripts/probe-ramses-sim.js 2>&1 | tail -50)
+          echo "$out"
+          out="${out//'%'/'%25'}"; out="${out//$'\n'/'%0A'}"
+          echo "::notice title=Ramses sim probe::${out}"
       - name: Probe free simulation on real chains
         if: inputs.only == '' || inputs.only == 'sim'
         shell: bash
