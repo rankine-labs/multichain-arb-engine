@@ -142,12 +142,23 @@ function revertData(err: { data?: any } | undefined): string | null {
 const STATE_GONE_RE = /missing trie node|historical state|state.*(not available|unavailable)|header not found|unknown block|pruned/i;
 export type ReplayCall = { from: string; to: string; data: string; value?: string; gas?: string };
 
-export function replayRpc(base: Rpc, parentBlock: string, prefix: ReplayCall[]): Rpc {
+// blockTime: the real block's timestamp (hex), so pools that depend on time
+// (e.g. Ramses fee periods) see the same moment as the real block.
+// The simulated block also gets a huge gas limit: replayed trades carry their
+// own (sometimes very large) gas limits, which used up the block's gas before
+// our trade ran, so it failed with no reason.
+const REPLAY_BLOCK_GAS = '0x' + (2_000_000_000).toString(16);
+
+export function replayRpc(base: Rpc, parentBlock: string, prefix: ReplayCall[], blockTime?: string): Rpc {
   return async (method, params) => {
     const p = params as any[];
     if (method !== 'eth_call' || p[0]?.to?.toLowerCase() !== SIM_EXECUTOR_ADDRESS) return base(method, params);
     const r = await base('eth_simulateV1', [{
-      blockStateCalls: [{ stateOverrides: p[2] ?? {}, calls: [...prefix, p[0]] }],
+      blockStateCalls: [{
+        blockOverrides: { gasLimit: REPLAY_BLOCK_GAS, ...(blockTime ? { time: blockTime } : {}) },
+        stateOverrides: p[2] ?? {},
+        calls: [...prefix, p[0]],
+      }],
       validation: false,                       // replayed trades skip nonce/fee checks
     }, parentBlock]);
     if (r.error) {
@@ -163,7 +174,12 @@ export function replayRpc(base: Rpc, parentBlock: string, prefix: ReplayCall[]):
     const ours = calls[calls.length - 1];
     if (!ours) return { error: { message: 'replay returned no result' } };
     if (ours.status === '0x1') return { result: ours.returnData };
-    return { error: { message: ours.error?.message ?? 'execution reverted', data: ours.returnData ?? ours.error?.data } };
+    // eth_simulateV1 puts revert data in error.data and leaves returnData as
+    // "0x". Reading returnData first lost the data, so every replayed check
+    // (profit, loss, real failure alike) read as "reverted with no reason".
+    const revert = ours.error?.data && ours.error.data !== '0x' ? ours.error.data
+      : ours.returnData && ours.returnData !== '0x' ? ours.returnData : undefined;
+    return { error: { message: ours.error?.message ?? 'execution reverted', data: revert } };
   };
 }
 

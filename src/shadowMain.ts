@@ -457,7 +457,7 @@ const checkRoundTrip = async (
 // block (including the trigger itself), so the check can REPLAY them on the
 // block before and then run our trade: the exact moment a backrun lands,
 // before any rival. null = not found in time.
-type TriggerSpot = { block: string; parent: string; prefix: ReplayCall[] };
+type TriggerSpot = { block: string; parent: string; prefix: ReplayCall[]; time?: string };
 const USER_TX_TYPES = new Set(['0x0', '0x1', '0x2', '0x3', '0x4']); // skip Arbitrum system txs (0x64-0x6a)
 const findTriggerSpot = async (rpc: (m: string, p: unknown[]) => Promise<{ result?: any; error?: any }>, hash: string): Promise<TriggerSpot | null> => {
       for (let i = 0; i < RH_TRIGGER_MAX_POLLS; i++) {
@@ -473,7 +473,7 @@ const findTriggerSpot = async (rpc: (m: string, p: unknown[]) => Promise<{ resul
                         .map((t) => ({ from: t.from, to: t.to, data: t.input ?? t.data ?? '0x', value: t.value, gas: t.gas }));
                   // The trigger must be in there, or the replay would be meaningless.
                   if (!prefix.length || !txs[idx] || txs[idx].hash?.toLowerCase() !== hash.toLowerCase()) return null;
-                  return { block: r.result.blockNumber, parent: '0x' + (n - 1n).toString(16), prefix };
+                  return { block: r.result.blockNumber, parent: '0x' + (n - 1n).toString(16), prefix, time: b.result?.timestamp };
             }
             await new Promise((res) => setTimeout(res, RH_TRIGGER_POLL_MS));
       }
@@ -521,7 +521,7 @@ const queueSimulation = (
                   let r: Awaited<ReturnType<typeof simulateRoundTrip>>;
                   const spot = followTrigger ? await findTriggerSpot(simRpc[chain], triggerHash!) : null;
                   if (spot) {
-                        r = await simulateRoundTrip(replayRpc(simRpc[chain], spot.parent, spot.prefix), chain, trade, simOpts);
+                        r = await simulateRoundTrip(replayRpc(simRpc[chain], spot.parent, spot.prefix, spot.time), chain, trade, simOpts);
                         timing = 'right after trigger';
                         if ('reason' in r && (r.reason.startsWith('replay unavailable') || STATE_GONE.test(r.reason))) {
                               // Replay not possible: end of the trigger's block instead.
