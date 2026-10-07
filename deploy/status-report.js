@@ -123,6 +123,16 @@ async function main() {
   const simProfit = count(outL, /\[sim\].*REAL PROFIT/);
   const simLoss = count(outL, /\[sim\].*real: LOSS/);
   const simFail = count(outL, /\[sim\].*real: FAILS/);
+  // Exact reasons the chain gave for failed checks (trigger trades and
+  // standing gaps), counted, so the cause is visible without logging in.
+  const failCounts = new Map();
+  for (const l of outL) {
+    const m = /\[sim\] robinhood .*real: FAILS \((.*)\) \| /.exec(l) || /\[gap\] .*NOT REAL \((.*)\); muted/.exec(l);
+    if (!m || /^real profit only/.test(m[1]) || /^ends with less/.test(m[1])) continue;
+    const k = m[1].replace(/0x[0-9a-fA-F]{8,}/g, '0x…').replace(/\d{5,}/g, 'N').slice(0, 100);
+    failCounts.set(k, (failCounts.get(k) || 0) + 1);
+  }
+  const topFails = [...failCounts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 6);
   const fireReady = outL.map((l) => /\[fire\] robinhood .* ready (\d+)ms/.exec(l)).filter(Boolean).map((m) => Number(m[1])).sort((a, b) => a - b);
   const rivalLines = outL.filter((l) => /\[rival\] arb found/.test(l));
   const rivalMs = rivalLines.map((l) => /theirs (\d+)ms/.exec(l)).filter(Boolean).map((m) => Number(m[1])).sort((a, b) => a - b);
@@ -178,6 +188,7 @@ async function main() {
     `- Prices read from: ${readsOn} · ${rpcSwitches} node switch(es) this window`,
     `- RPC round trip from the server (public node, best of 3): ${rpcRtt ?? '?'} ms`,
     `- Real-chain test runs: ${simProfit} profitable · ${simLoss} losing · ${simFail} would fail`,
+    ...(topFails.length ? ['- Why tests would fail (exact chain reason):', ...topFails.map(([m, n]) => `  - ${n}x \`${m.replace(/`/g, "'")}\``)] : []),
     `- Dry run, would have earned (if we won every race): ${lastPnl ? lastPnl.replace(/^\[pnl\] would-have-earned /, '') : 'first figure after the next hourly report'}`,
     '',
     '### Errors this window',
