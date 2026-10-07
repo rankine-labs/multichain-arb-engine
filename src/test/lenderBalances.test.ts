@@ -37,8 +37,9 @@ async function main() {
     const a = answers[holder];
     return hex(c.target === WETH ? a[0] : a[1]);
   });
-  const n = await lb.refresh(callMany, [tiny, big, empty]);
-  assert(n === 3, 'reads all three candidate pools in one bundle');
+  const v4 = { ...big, dex: 'uniswap-v4', poolAddress: '0x' + 'ab'.repeat(32) } as PoolState; // 32-byte V4 id
+  const n = await lb.refresh(callMany, [tiny, big, empty, v4]);
+  assert(n === 3, 'reads the three real lender pools in one bundle, skips the V4 pool id');
   assert(lb.balanceOf(big.poolAddress, WETH) === 50n * 10n ** 18n, 'stores real WETH balance');
 
   const loan = 10n ** 17n; // 0.1 WETH

@@ -36,7 +36,10 @@ export class LenderBalances {
   // Read balances + liquidity for every candidate V3 pool in one bundled
   // read. Pools that fail to answer are dropped (treated as unknown = unusable).
   async refresh(callMany: CallMany, pools: PoolState[], now = Date.now()): Promise<number> {
-    const v3 = pools.filter((p) => p.poolType === 'v3');
+    // Only real 20-byte pool and token addresses (Uniswap V4 pools are keyed
+    // by a 32-byte id and can't lend this way; native ETH is address 0).
+    const isAddr = (a: string) => /^0x[0-9a-fA-F]{40}$/.test(a) && !/^0x0{40}$/.test(a);
+    const v3 = pools.filter((p) => p.poolType === 'v3' && p.dex !== 'uniswap-v4' && isAddr(p.poolAddress) && isAddr(p.tokenA) && isAddr(p.tokenB));
     const calls: Call[] = [];
     for (const p of v3) {
       calls.push({ target: p.tokenA, data: BALANCE_OF + pad(p.poolAddress) });
