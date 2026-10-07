@@ -90,6 +90,10 @@ async function main() {
   await rt('eth_call', [{ to: SIM_EXECUTOR_ADDRESS, data: '0x' }, 'latest', {}]);
   assert(sent.params[0].blockStateCalls[0].blockOverrides.time === '0x6543', 'simulated block uses the real block time');
   assert(out.error?.data === insufficient, 'our revert data comes back like an eth_call error');
+  // Real node shape: returnData "0x", revert data in error.data.
+  const realShape: Rpc = async () => ({ result: [{ calls: [{ status: '0x1', returnData: '0x' }, { status: '0x0', returnData: '0x', error: { message: 'execution reverted', code: 3, data: insufficient } }] }] });
+  const out2 = await replayRpc(realShape, '0x10', [trigger])('eth_call', [{ to: SIM_EXECUTOR_ADDRESS, data: '0x' }, 'latest', {}]);
+  assert(out2.error?.data === insufficient, 'revert data read from error.data when returnData is empty (real node answer)');
   const other = await rr('eth_call', [{ to: '0x00000000000000000000000000000000000000cc', data: '0x70a08231' }, 'latest', { ['0x00000000000000000000000000000000000000cc']: { stateDiff: { k: '0x05' } } }]);
   assert(other.result === '0x05', 'other calls (balance slot lookups) pass straight through');
 }

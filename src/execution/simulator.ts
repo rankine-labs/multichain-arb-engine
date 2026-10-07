@@ -174,7 +174,12 @@ export function replayRpc(base: Rpc, parentBlock: string, prefix: ReplayCall[], 
     const ours = calls[calls.length - 1];
     if (!ours) return { error: { message: 'replay returned no result' } };
     if (ours.status === '0x1') return { result: ours.returnData };
-    return { error: { message: ours.error?.message ?? 'execution reverted', data: ours.returnData ?? ours.error?.data } };
+    // eth_simulateV1 puts revert data in error.data and leaves returnData as
+    // "0x". Reading returnData first lost the data, so every replayed check
+    // (profit, loss, real failure alike) read as "reverted with no reason".
+    const revert = ours.error?.data && ours.error.data !== '0x' ? ours.error.data
+      : ours.returnData && ours.returnData !== '0x' ? ours.returnData : undefined;
+    return { error: { message: ours.error?.message ?? 'execution reverted', data: revert } };
   };
 }
 
