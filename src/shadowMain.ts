@@ -314,6 +314,11 @@ Object.entries(discoveryConfigs).map(([chain, cfg]) => [chain, new PoolDiscovery
 // ==========================================================================
 // Paid endpoint if configured, else public (see simRpcUrl in simulator.ts).
 const simRpc: Record<string, Rpc> = {};
+// Robinhood's free public node, used to DOUBLE-CHECK a trade the checking node
+// (QuickNode) says breaks with no reason. Oct 7: QuickNode reverted every
+// Ramses V3 check while the free node and fork tests ran the same trade fine.
+// Metered by its node budget (8/s), and only used for those few re-checks.
+const rhFreeSimRpc: Rpc = makeRpc('https://rpc.mainnet.chain.robinhood.com');
 // Per-node usage today (speed limits + daily allowances, core/nodeBudget.ts):
 // restored so a restart doesn't reset the counts, saved every minute.
 loadNodeUsage('data/node-usage.json');
@@ -358,6 +363,8 @@ const RH_TRIGGER_POLL_MS = 150;     // how often to ask "has the trigger landed?
 const RH_TRIGGER_MAX_POLLS = 12;    // give up after ~1.8 s and test on the latest block
 // Hourly: how Robinhood trigger checks were timed (reset with the digest).
 const checkTiming = { rightAfter: 0, othersInBlock: 0, late: 0 };
+// Hourly: re-checks on the free node, and how many changed the answer.
+const recheckStats = { done: 0, changed: 0 };
 const simBusy: Record<string, boolean> = {};          // one simulation in flight per chain
 // Simulation switched off for a chain (e.g. the RPC lacks state overrides),
 // with an expiry: retried after 30 min instead of staying off until restart.
@@ -526,9 +533,22 @@ const queueSimulation = (
                         r = await simulateRoundTrip(simRpc[chain], chain, trade, simOpts);
                         if (followTrigger) timing = 'tested late';
                   }
-                  if (timing === 'right after trigger') checkTiming.rightAfter++;
-                  else if (timing === 'end of trigger block') checkTiming.othersInBlock++;
-                  else if (timing === 'tested late') checkTiming.late++;
+                  // Checking node said "breaks" with no real reason (no revert data,
+                  // or a transfer failing): ask the free node the same question.
+                  // If it answers (profit / loss / a real revert), trust it.
+                  if (chain === 'robinhood' && r.status === 'fail' && /execution reverted\s*$|reverted without data|TransferFailed/.test(r.reason)) {
+                        const free = timing === 'right after trigger' && spot ? replayRpc(rhFreeSimRpc, spot.parent, spot.prefix) : rhFreeSimRpc;
+                        const r2 = await simulateRoundTrip(free, chain, trade, simOpts);
+                        if (r2.status !== 'rate_limited' && !('reason' in r2 && r2.reason.startsWith('replay unavailable'))) {
+                              recheckStats.done++;
+                              if (r2.status !== 'fail') recheckStats.changed++;
+                              r = r2;
+                              timing = `${timing || 'latest'}, rechecked on free node`;
+                        }
+                  }
+                  if (timing.startsWith('right after trigger')) checkTiming.rightAfter++;
+                  else if (timing.startsWith('end of trigger block')) checkTiming.othersInBlock++;
+                  else if (timing.startsWith('tested late')) checkTiming.late++;
                   // Pair name in the log line, so the status page can show WHICH
                   // coins fail (e.g. "WETH/AAPL uniswap-v3->uniswap-v2").
                   const pair = `${symbolOf(chain, buyPool.tokenA)}/${symbolOf(chain, buyPool.tokenB)}`;
@@ -1811,6 +1831,8 @@ for (let i = 0; i < resolved.length; i++) {
                   funnel.skip.clear();
                   failTally.clear();
                   checkTiming.rightAfter = checkTiming.othersInBlock = checkTiming.late = 0;
+                  if (recheckStats.done) console.log(`[sim] robinhood free-node re-checks this hour: ${recheckStats.done}, answer changed ${recheckStats.changed}`);
+                  recheckStats.done = recheckStats.changed = 0;
                   priceStats.local = priceStats.rpc = 0;
                   fireStats.readyMs = []; fireStats.blocked.clear(); fireStats.sent = 0;
                   rivals.reset();
