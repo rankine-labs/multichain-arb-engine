@@ -14,7 +14,7 @@ import { ethers } from 'ethers';
 const URL_ = process.env.ROBINHOOD_RPC_URL ?? 'https://rpc.mainnet.chain.robinhood.com';
 const WETH = '0x0bd7d308f8e1639fab988df18a8011f41eacad73';
 const USDG = '0x5fc5360d0400a0fd4f2af552add042d716f1d168';
-const BLOCKS = Number(process.env.PROBE_BLOCKS ?? 400);
+const BLOCKS = Number(process.env.PROBE_BLOCKS ?? 250);
 
 let id = 0;
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -48,6 +48,7 @@ const topicAddr = (t: string) => '0x' + t.slice(26).toLowerCase();
   let blocksRead = 0, receiptsRead = 0;
   for (let n = latest - 2; n > latest - 2 - BLOCKS; n--) {
     const r = await rpc('eth_getBlockReceipts', ['0x' + n.toString(16)]);
+    if (r.error && /403/.test(JSON.stringify(r.error))) { await sleep(20_000); n++; continue; }
     if (r.error) { console.log(`block receipts not available: ${JSON.stringify(r.error).slice(0, 120)}`); break; }
     blocksRead++;
     for (const rc of r.result ?? []) {
@@ -71,7 +72,7 @@ const topicAddr = (t: string) => '0x' + t.slice(26).toLowerCase();
       b.trades++; if (flash) b.flash++; b.pools.push(pools.size); b.froms.add(rc.from.toLowerCase());
       bots.set(to, b);
     }
-    if (n % 25 === 0) await sleep(300);
+    await sleep(900); // slow: the free node blocks fast readers
   }
   console.log(`read ${blocksRead} blocks, ${receiptsRead} trades; arbitrage contracts found: ${bots.size}`);
   const top = [...bots.entries()].sort((a, b) => b[1].trades - a[1].trades).slice(0, 8);
