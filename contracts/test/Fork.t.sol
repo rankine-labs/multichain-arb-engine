@@ -555,6 +555,62 @@ contract RobinhoodForkTest is ForkBase {
         _flashRoute("robinhood flash(uni 0.01%) V4(native)->ramsesV3 start USDG 1000", USDG, WETH, 1000e6, V4_POOL_MANAGER, 3, _ramsesV3ByTick(), 2, true, false);
     }
 
+    // Every Ramses V3 WETH/USDG pool (one per tick spacing), so each can be
+    // tested at bot-sized amounts.
+    function _ramsesV3All() internal view returns (address[] memory pools, int24[] memory spacings) {
+        int24[6] memory sp = [int24(1), int24(5), int24(10), int24(50), int24(100), int24(200)];
+        pools = new address[](6);
+        spacings = new int24[](6);
+        uint256 n;
+        for (uint256 i = 0; i < sp.length; i++) {
+            (bool ok, bytes memory ret) =
+                RAMSES_V3_FACTORY.staticcall(abi.encodeWithSignature("getPool(address,address,int24)", WETH, USDG, sp[i]));
+            if (!ok || ret.length < 32) continue;
+            address p = abi.decode(ret, (address));
+            if (p == address(0) || p.code.length == 0) continue;
+            pools[n] = p; spacings[n] = sp[i]; n++;
+        }
+        assembly { mstore(pools, n) mstore(spacings, n) }
+    }
+
+    // (Bot-sized Ramses trades, 0.05-20 WETH, all pools both directions:
+    // verified OK Oct 7 2026; removed to keep CI output short.)
+
+    // Mimics the BOT'S simulation exactly: contract code copied onto the
+    // simulator's made-up address (0x...a7b51e00), executor slot set to the
+    // simulator's made-up caller (0x...0b0751), start balance written
+    // straight into storage. If Ramses fails here but works with a normally
+    // deployed contract, the problem is the simulation setup, not the trade.
+    function test_fork_robinhood_simSetup_ramses() public {
+        if (!_fork("ROBINHOOD_RPC_URL")) return;
+        address SIM = address(uint160(0xa7b51e00));
+        address CALLER = address(uint160(0x0b0751));
+        vm.etch(SIM, address(exec).code);
+        vm.store(SIM, bytes32(uint256(0)), bytes32(uint256(uint160(CALLER))));
+        address uni = _uniV3();
+        (address[] memory pools,) = _ramsesV3All();
+        for (uint256 i = 0; i < pools.length; i++) {
+            for (uint256 dir = 0; dir < 3; dir++) {
+                uint256 snap = vm.snapshotState();
+                deal(WETH, SIM, 1 ether);
+                ArbExecutor.Hop[] memory hops = new ArbExecutor.Hop[](2);
+                address other = dir == 2 ? _findV3(PANCAKE_V3_FACTORY, WETH, USDG, _fees(2500, 500, 10000, 100)) : uni;
+                if (dir == 0) { hops[0] = _hop(2, uni, WETH, USDG, 0); hops[1] = _hop(2, pools[i], USDG, WETH, 0); }
+                else if (dir == 1) { hops[0] = _hop(2, pools[i], WETH, USDG, 0); hops[1] = _hop(2, uni, USDG, WETH, 0); }
+                else { hops[0] = _hop(2, other, WETH, USDG, 0); hops[1] = _hop(2, uni, USDG, WETH, 0); } // control: no Ramses
+                ArbExecutor.Trade memory t =
+                    ArbExecutor.Trade({token: WETH, amountIn: 1 ether, minProfit: type(uint256).max, maxBlock: type(uint256).max, hops: hops});
+                vm.prank(CALLER);
+                (bool ok, bytes memory data) = SIM.call(abi.encodeWithSelector(ArbExecutor.execute.selector, t, address(0)));
+                bool guard = data.length >= 4 && bytes4(data) == ArbExecutor.InsufficientProfit.selector;
+                string memory label = dir == 0 ? "  -> SIM setup uni->ramses" : dir == 1 ? "  -> SIM setup ramses->uni" : "  -> SIM setup control cake->uni (no ramses)";
+                console.log(label, pools[i], ok || guard ? "OK swaps ran" : "REVERTED");
+                if (!ok && !guard) console.logBytes(data);
+                vm.revertToState(snap);
+            }
+        }
+    }
+
     function test_fork_robinhood_ramsesV2_to_pancakeV3() public {
         if (!_fork("ROBINHOOD_RPC_URL")) return;
         address v3 = _findV3(PANCAKE_V3_FACTORY, WETH, USDG, _fees(2500, 500, 10000, 100));
