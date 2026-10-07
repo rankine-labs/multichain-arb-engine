@@ -282,7 +282,10 @@ export interface PlainHourlyInput {
   differencesFound: number;            // price differences scored this hour
   // failReasons: why the "wouldn't go through" ones failed, in plain groups,
   // biggest first (see core/failReasons.ts). Optional for older callers.
-  checks: { done: number; makeMoney: number; loseMoney: number; wouldFail: number; nodeBusy: number; failReasons?: [string, number][] };
+  checks: { done: number; makeMoney: number; loseMoney: number; wouldFail: number; nodeBusy: number; failReasons?: [string, number][];
+    // When trigger checks were tested: right after the trade we followed,
+    // after someone else also traded in that block, or late (latest block).
+    timing?: { rightAfter: number; othersInBlock: number; late: number } };
   checksAvailable: boolean;            // false = no node can run checks right now
   earned: { todayChecked: number; todayCheckedCount: number; todayUnchecked: number; todayUncheckedCount: number; weekChecked: number };
   reactionMs: { typical: number | null; slowest5pct: number | null };
@@ -371,6 +374,13 @@ export function formatPlainHourly(r: PlainHourlyInput): string {
       if (ours) attention.push(`${ours[1]} check(s) failed because our bot built the trade wrong. Tell me and I'll fix it.`);
     }
     if (r.checks.nodeBusy) L.push(`  (checking node said "slow down" ${r.checks.nodeBusy}x, checks paused briefly)`);
+    const tm = r.checks.timing;
+    if (tm && tm.rightAfter + tm.othersInBlock + tm.late > 0) {
+      const bits = [`${tm.rightAfter} right after the trade we followed`];
+      if (tm.othersInBlock) bits.push(`${tm.othersInBlock} after another bot also traded`);
+      if (tm.late) bits.push(`${tm.late} tested late`);
+      L.push(`  Test timing: ${bits.join(', ')}`);
+    }
   }
   L.push('');
 

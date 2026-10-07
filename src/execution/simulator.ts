@@ -272,7 +272,11 @@ export async function simulateRoundTrip(
   rpc: Rpc,
   chain: string,
   trade: { token: string; amountIn: bigint; hops: ExecutorHop[] },
-  opts: { v3Lender?: string; weth?: string } = {},
+  // blockTag: which block's state to test against ('latest' by default). The
+  // Robinhood trigger check passes the block the trigger trade landed in, so
+  // the test sees the market RIGHT AFTER that trade (where a backrun would
+  // land), not ~30 blocks later after rival bots already closed the gap.
+  opts: { v3Lender?: string; weth?: string; blockTag?: string } = {},
 ): Promise<SimResult> {
   let slot: SlotInfo;
   try {
@@ -322,7 +326,7 @@ export async function simulateRoundTrip(
 
   const r = await rpc('eth_call', [
     { from: SIM_CALLER, to: SIM_EXECUTOR_ADDRESS, data, gas: '0x' + (8_000_000).toString(16) },
-    'latest',
+    opts.blockTag ?? 'latest',
     overrides,
   ]);
 

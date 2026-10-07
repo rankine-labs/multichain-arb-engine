@@ -51,6 +51,23 @@ async function main() {
   };
   const r3 = await simulateRoundTrip(slotOk, 'test2', trade);
   assert(r3.status === 'rate_limited', `network error during simulation -> paused, not a failed trade (got ${r3.status})`);
+
+  // 5. The trigger check can test against a chosen block (right after the
+  //    trade we follow) instead of 'latest'.
+  let simBlock: unknown = null;
+  const blockSpy: Rpc = async (method, params) => {
+    const p = params as any[];
+    if (p[0]?.data?.startsWith('0x70a08231')) {
+      const diff = Object.values(p[2])[0] as any;
+      return { result: Object.values(diff.stateDiff)[0] };
+    }
+    simBlock = p[1];
+    return { error: { message: 'execution reverted' } };
+  };
+  await simulateRoundTrip(blockSpy, 'test3', trade, { blockTag: '0x1a2b' });
+  assert(simBlock === '0x1a2b', `simulation runs on the requested block (got ${String(simBlock)})`);
+  await simulateRoundTrip(blockSpy, 'test3', trade);
+  assert(simBlock === 'latest', 'no block given -> latest');
 }
 
 main().catch((err) => { console.error('FAIL: test crashed', err); process.exitCode = 1; });
