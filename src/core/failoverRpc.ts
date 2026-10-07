@@ -85,13 +85,19 @@ function smallRequest(p: ethers.JsonRpcPayload): boolean {
 }
 
 // The routing logic on its own (no network), so it can be tested with fakes.
-type Endpoint = { label: string; send: RpcSend };
+// wait: the node's own speed-limit queue (core/nodeBudget.ts). Called BEFORE
+// the answer-time clock starts, so time spent waiting in OUR queue is never
+// mistaken for the node being slow. Oct 7: it was, and the free node kept
+// getting "rested" for slowness it didn't have (it answered in ~20 ms),
+// pushing all reads onto the Nodeflare backup until its allowance ran out.
+type Endpoint = { label: string; send: RpcSend; wait?: (payload: ethers.JsonRpcPayload | ethers.JsonRpcPayload[]) => Promise<void> };
 type FastState = Endpoint & { restUntil: number; avgMs: number | null; samples: number; backup?: boolean };
 
 export class FailoverRouter {
   private readonly fasts: FastState[];
   private next = 0;
   private stats: FailoverStats = { onFast: true, switches: 0 };
+  private onBackup = false; // reads currently going to a backup node
 
   constructor(
     fast: Endpoint | Endpoint[],
@@ -121,8 +127,16 @@ export class FailoverRouter {
     const main = this.fasts.filter((f) => !f.backup);
     if (!this.heavy && !this.fasts.some((f) => f.backup)) return main;
     const up = main.filter((f) => t >= f.restUntil);
-    if (up.length) return up;
-    return this.fasts.filter((f) => f.backup && t >= f.restUntil);
+    if (up.length) {
+      // Main node(s) back after a rest while we were on a backup: say so once
+      // (the status page follows these lines; without it, it kept showing
+      // "backup" long after the main node was back).
+      if (this.onBackup) { this.onBackup = false; this.log(`[rpc] fast path back on ${up.map((f) => f.label).join(' + ')}`); }
+      return up;
+    }
+    const backups = this.fasts.filter((f) => f.backup && t >= f.restUntil);
+    if (backups.length) this.onBackup = true;
+    return backups;
   }
 
   // Are we reading from FAST right now? (Logs the switch back once.)
@@ -165,13 +179,22 @@ export class FailoverRouter {
       if (!avail.length) break;
       const f = avail[this.next++ % avail.length];
       tried.add(f);
-      const t0 = this.now();
       let results: Array<ethers.JsonRpcResult | ethers.JsonRpcError>;
+      let t0 = this.now();
       try {
+        if (f.wait) { await f.wait(payload); t0 = this.now(); } // queue time not counted as node time
         results = await f.send(payload);
       } catch (err) {
-        // No paid node to fall back to, or a non-endpoint error: pass it on.
-        if ((!this.heavy && !this.available().some((x) => x !== f)) || !isEndpointTrouble(err)) throw err;
+        if (!isEndpointTrouble(err)) throw err;
+        // No paid node and nothing else up. A BACKUP that fails (e.g. its daily
+        // allowance is used up) must not fail the read: the main node is
+        // resting, not dead, so ask it anyway. Before, these failed outright
+        // (~900 "nodeflare daily allowance used up" errors per 15 min).
+        if (!this.heavy && !this.available().some((x) => x !== f)) {
+          const main = this.fasts.find((x) => !x.backup);
+          if (f.backup && main) { await main.wait?.(payload); return main.send(payload); }
+          throw err;
+        }
         this.rest(f, shortReason(err));
         continue;
       }
@@ -205,12 +228,20 @@ export class FailoverRouter {
 // FAST requests: short timeout and NO built-in retries. ethers normally
 // retries a 429 with growing waits (seconds); we'd rather switch to HEAVY
 // immediately than sit and wait.
-function fastRequest(url: string, timeoutMs: number): ethers.FetchRequest {
+// metered=false: the router meters it through Endpoint.wait instead, so the
+// queue wait stays outside the answer-time measurement.
+function fastRequest(url: string, timeoutMs: number, metered = true): ethers.FetchRequest {
   const req = new ethers.FetchRequest(url);
   req.timeout = timeoutMs;
   req.setThrottleParams({ maxAttempts: 1 });
-  meter(req, url);
+  if (metered) meter(req, url);
   return req;
+}
+
+// Endpoint.wait for a node URL: its speed limit + daily allowance, if metered.
+function budgetWait(url: string): Endpoint['wait'] {
+  const b = budgetForUrl(url);
+  return b ? async (p) => { await b.take(Array.isArray(p) ? Math.max(1, p.length) : 1); } : undefined;
 }
 
 // Every request to a metered node waits under its speed limit and counts
@@ -235,23 +266,23 @@ export class FailoverJsonRpcProvider extends ethers.JsonRpcProvider {
   private readonly backupProviders: ethers.JsonRpcProvider[];
 
   constructor(fastUrl: string, heavyUrl: string | null, chainId: number, opts: { restMs?: number; fastTimeoutMs?: number; slowMs?: number; extraFastUrls?: string[]; backupUrls?: string[]; logTag?: string } = {}) {
-    super(fastRequest(fastUrl, opts.fastTimeoutMs ?? 5_000), chainId, { staticNetwork: true });
+    super(fastRequest(fastUrl, opts.fastTimeoutMs ?? 5_000, false), chainId, { staticNetwork: true });
     // HEAVY: metered too, and no long built-in retries (fail fast, switch).
     this.heavyProvider = heavyUrl && heavyUrl !== fastUrl ? new ethers.JsonRpcProvider(fastRequest(heavyUrl, 10_000), chainId, { staticNetwork: true }) : null;
     const heavyProvider = this.heavyProvider;
     const extras = (opts.extraFastUrls ?? []).filter((u) => u && u !== fastUrl && u !== heavyUrl);
-    this.extraFast = extras.map((u) => new ethers.JsonRpcProvider(fastRequest(u, opts.fastTimeoutMs ?? 5_000), chainId, { staticNetwork: true }));
+    this.extraFast = extras.map((u) => new ethers.JsonRpcProvider(fastRequest(u, opts.fastTimeoutMs ?? 5_000, false), chainId, { staticNetwork: true }));
     const backups = (opts.backupUrls ?? []).filter((u) => u && u !== fastUrl && u !== heavyUrl && !extras.includes(u));
-    this.backupProviders = backups.map((u) => new ethers.JsonRpcProvider(fastRequest(u, opts.fastTimeoutMs ?? 5_000), chainId, { staticNetwork: true }));
+    this.backupProviders = backups.map((u) => new ethers.JsonRpcProvider(fastRequest(u, opts.fastTimeoutMs ?? 5_000, false), chainId, { staticNetwork: true }));
     this.router = new FailoverRouter(
       [
-        { label: endpointLabel(fastUrl), send: (p) => super._send(p) },
-        ...this.extraFast.map((prov, i) => ({ label: endpointLabel(extras[i]), send: (p: ethers.JsonRpcPayload | ethers.JsonRpcPayload[]) => prov._send(p) })),
+        { label: endpointLabel(fastUrl), send: (p) => super._send(p), wait: budgetWait(fastUrl) },
+        ...this.extraFast.map((prov, i) => ({ label: endpointLabel(extras[i]), send: (p: ethers.JsonRpcPayload | ethers.JsonRpcPayload[]) => prov._send(p), wait: budgetWait(extras[i]) })),
       ],
       heavyProvider ? { label: endpointLabel(heavyUrl!), send: (p) => heavyProvider._send(p) } : null,
       {
         restMs: opts.restMs, slowMs: opts.slowMs, logTag: opts.logTag,
-        backups: this.backupProviders.map((prov, i) => ({ label: endpointLabel(backups[i]) + ' (backup)', send: (p: ethers.JsonRpcPayload | ethers.JsonRpcPayload[]) => prov._send(p) })),
+        backups: this.backupProviders.map((prov, i) => ({ label: endpointLabel(backups[i]) + ' (backup)', send: (p: ethers.JsonRpcPayload | ethers.JsonRpcPayload[]) => prov._send(p), wait: budgetWait(backups[i]) })),
       },
     );
   }
