@@ -280,7 +280,9 @@ export interface PlainHourlyInput {
   pricesFrom: 'free' | 'backup';       // where prices come from right now
   freeNodeBusy: number;                // times the free node had to rest (since start)
   differencesFound: number;            // price differences scored this hour
-  checks: { done: number; makeMoney: number; loseMoney: number; wouldFail: number; nodeBusy: number };
+  // failReasons: why the "wouldn't go through" ones failed, in plain groups,
+  // biggest first (see core/failReasons.ts). Optional for older callers.
+  checks: { done: number; makeMoney: number; loseMoney: number; wouldFail: number; nodeBusy: number; failReasons?: [string, number][] };
   checksAvailable: boolean;            // false = no node can run checks right now
   earned: { todayChecked: number; todayCheckedCount: number; todayUnchecked: number; todayUncheckedCount: number; weekChecked: number };
   reactionMs: { typical: number | null; slowest5pct: number | null };
@@ -359,6 +361,15 @@ export function formatPlainHourly(r: PlainHourlyInput): string {
     L.push(`  ✅ would make money: ${r.checks.makeMoney}`);
     L.push(`  ➖ would lose money: ${r.checks.loseMoney}`);
     L.push(`  ✖️ wouldn't go through: ${r.checks.wouldFail}`);
+    // Why they wouldn't go through, so you can tell bad coins (skip them)
+    // from a bug on our side (needs fixing) at a glance.
+    if (r.checks.wouldFail > 0 && r.checks.failReasons?.length) {
+      L.push('     Why:');
+      for (const [why, c] of r.checks.failReasons.slice(0, 5)) L.push(`     • ${esc(why)}: ${c}`);
+      // A bug on our side is the one worth acting on: flag it.
+      const ours = r.checks.failReasons.find(([why]) => why.startsWith('our bot'));
+      if (ours) attention.push(`${ours[1]} check(s) failed because our bot built the trade wrong. Tell me and I'll fix it.`);
+    }
     if (r.checks.nodeBusy) L.push(`  (checking node said "slow down" ${r.checks.nodeBusy}x, checks paused briefly)`);
   }
   L.push('');

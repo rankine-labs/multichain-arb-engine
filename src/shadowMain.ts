@@ -79,6 +79,7 @@ import { scanUniverse, emptyScanState, ScanState } from './core/universeScan';
 import { readFileSync, writeFileSync, mkdirSync, renameSync } from 'fs';
 import { ROBINHOOD_SCAN_FACTORIES } from './config/knownAddresses';
 import { buildExecuteCall, executionRequested, executorConfig, pickV3Lender } from './execution/executorCalldata';
+import { FailTally } from './core/failReasons';
 import { makeRpc, simulateRoundTrip, simRpcUrl, Rpc, makeFallbackRpc, loadBalanceSlots, wssToHttps } from './execution/simulator';
 import { FastSender, SafetyGate, safetyConfigFromEnv } from './execution/fastSender';
 import { checkLiveReady } from './execution/liveReadiness';
@@ -387,6 +388,9 @@ const funnel = {
       skip: new Map<string, number>(), // checker skipped it: reason -> count
 };
 const funnelSkip = (why: string) => funnel.skip.set(why, (funnel.skip.get(why) ?? 0) + 1);
+// Why Robinhood checks "wouldn't go through" this hour, sorted into plain
+// groups (coin takes a cut, our bug, old price info...). Reset every hour.
+const failTally = new FailTally();
 // A real arb between two pools nets a few % of the trade at most. A
 // simulated profit above this share of the amount put in (measured in
 // TOKENS, so a bad USD price can't hide it) means the token or pool data is
@@ -482,6 +486,7 @@ const queueSimulation = (
                   if (r.status !== 'profit' || !plausibleProfit(r.profit, built.amountIn)) muteLoser(muteKey);
                   if (r.status === 'profit' && !plausibleProfit(r.profit, built.amountIn)) {
                         simStats.fail++;
+                        if (chain === 'robinhood') failTally.add('implausible profit');
                         console.log(`[sim] ${chain} ${route} real: IMPLAUSIBLE profit (bad token or pool data), ignored | ${model}`);
                   } else if (r.status === 'profit') {
                         simStats.profit++;
@@ -500,6 +505,7 @@ const queueSimulation = (
                         console.log(`[sim] ${chain} ${route} real: LOSS | ${model}`);
                   } else {
                         simStats.fail++;
+                        if (chain === 'robinhood') failTally.add(r.reason);
                         console.log(`[sim] ${chain} ${route} real: FAILS (${r.reason}) | ${model}`);
                   }
             } catch (err) {
@@ -582,7 +588,7 @@ const FRESH_MS = Number(process.env.FRESH_MS ?? 35_000);
 const MAX_DECISION_RPC_PER_SEC = Number(process.env.MAX_DECISION_RPC_PER_SEC ?? 10);
 let decisionRpcWindow = { at: 0, n: 0 };
 const priceStats = { local: 0, rpc: 0 };
-const gapStats = { found: 0, bestUsd: 0, fake: 0 }; // standing gaps (no trigger trade) this hour: confirmed, best real $, fakes muted
+const gapStats = { found: 0, bestUsd: 0, fake: 0, fail: 0 }; // standing gaps (no trigger trade) this hour: confirmed, best real $, fakes muted
 
 // FAST SENDER (Robinhood). Dry run unless the live switches are all set
 // (see execution/fastSender.ts). ROBINHOOD_SEND_RPC = where to send trades
@@ -1272,7 +1278,10 @@ await chainManager.startAll();
                         const simNet = check.status === 'profit' ? check.usd - rhGasUsd(0.05) /* gas */ : 0;
                         if (check.status !== 'profit' || simNet < Math.max(5, GAP_MIN_USD / 2)) {
                               gapMutedUntil.set(key, Date.now() + GAP_FAKE_MUTE_MS);
-                              gapStats.fake++;
+                              // A revert is "wouldn't go through" (with its reason);
+                              // a loss or too-small profit is "would lose money".
+                              if (check.status === 'fail') { gapStats.fail++; failTally.add(check.reason); }
+                              else gapStats.fake++;
                               const why = check.status === 'profit' ? `real profit only $${check.usd.toFixed(2)}` : check.reason;
                               console.log(`[gap] ${label}: model said ~$${g.profitUsd.toFixed(2)} but NOT REAL (${why}); muted 30 min | ${route}`);
                               continue;
@@ -1639,10 +1648,11 @@ for (let i = 0; i < resolved.length; i++) {
                               differencesFound: stats.seen,
                               // Trigger-trade checks + standing-difference checks together.
                               checks: {
-                                    done: simStats.checked + gapStats.found + gapStats.fake,
+                                    done: simStats.checked + gapStats.found + gapStats.fake + gapStats.fail,
                                     makeMoney: simStats.profit + gapStats.found,
                                     loseMoney: simStats.loss + gapStats.fake,
-                                    wouldFail: simStats.fail,
+                                    wouldFail: simStats.fail + gapStats.fail,
+                                    failReasons: failTally.plain(),
                                     nodeBusy: simStats.rateLimited,
                               },
                               checksAvailable: !(simStats.checked === 0 && (simStats.rateLimited > 0 || !!simOff('robinhood'))),
@@ -1685,10 +1695,11 @@ for (let i = 0; i < resolved.length; i++) {
                   funnel.tradesRead = funnel.noPool = funnel.tooSmall = funnel.noPartner = funnel.noUsdPrice = funnel.smallerThanFees = 0;
                   funnel.found = funnel.belowCheckBar = funnel.notVetted = funnel.sentToCheck = 0;
                   funnel.skip.clear();
+                  failTally.clear();
                   priceStats.local = priceStats.rpc = 0;
                   fireStats.readyMs = []; fireStats.blocked.clear(); fireStats.sent = 0;
                   rivals.reset();
-                  gapStats.found = 0; gapStats.bestUsd = 0; gapStats.fake = 0;
+                  gapStats.found = 0; gapStats.bestUsd = 0; gapStats.fake = 0; gapStats.fail = 0;
                   liveTracker.reset();
                   lastDigestAt = now;
             }
