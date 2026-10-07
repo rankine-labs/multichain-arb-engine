@@ -533,17 +533,24 @@ const queueSimulation = (
                         r = await simulateRoundTrip(simRpc[chain], chain, trade, simOpts);
                         if (followTrigger) timing = 'tested late';
                   }
-                  // Checking node said "breaks" with no real reason (no revert data,
-                  // or a transfer failing): ask the free node the same question.
-                  // If it answers (profit / loss / a real revert), trust it.
-                  if (chain === 'robinhood' && r.status === 'fail' && /execution reverted\s*$|reverted without data|TransferFailed/.test(r.reason)) {
-                        const free = timing === 'right after trigger' && spot ? replayRpc(rhFreeSimRpc, spot.parent, spot.prefix) : rhFreeSimRpc;
-                        const r2 = await simulateRoundTrip(free, chain, trade, simOpts);
-                        if (r2.status !== 'rate_limited' && !('reason' in r2 && r2.reason.startsWith('replay unavailable'))) {
-                              recheckStats.done++;
-                              if (r2.status !== 'fail') recheckStats.changed++;
+                  // "Breaks" with no real reason (no revert data, or a transfer
+                  // failing). Oct 7: Ramses V3 pools always fail inside the replay
+                  // (eth_simulateV1) on this chain, but run fine in a plain check.
+                  // So: plain check at the end of the trigger's block, then, if
+                  // that still says "breaks" with no reason, the free node.
+                  const noReason = (x: typeof r) => x.status === 'fail' && /execution reverted\s*$|reverted without data|TransferFailed/.test(x.reason);
+                  if (chain === 'robinhood' && noReason(r)) {
+                        recheckStats.done++;
+                        let r2 = spot ? await simulateRoundTrip(simRpc[chain], chain, trade, { ...simOpts, blockTag: spot.block }) : r;
+                        let where = spot ? 'end of trigger block (replay failed)' : timing || 'latest';
+                        if (r2.status === 'rate_limited' || noReason(r2) || ('reason' in r2 && STATE_GONE.test(r2.reason))) {
+                              const r3 = await simulateRoundTrip(rhFreeSimRpc, chain, trade, simOpts);
+                              if (r3.status !== 'rate_limited') { r2 = r3; where = 'tested late on free node (replay failed)'; }
+                        }
+                        if (r2.status !== 'rate_limited') {
+                              if (!noReason(r2)) recheckStats.changed++;
                               r = r2;
-                              timing = `${timing || 'latest'}, rechecked on free node`;
+                              timing = where;
                         }
                   }
                   if (timing.startsWith('right after trigger')) checkTiming.rightAfter++;
