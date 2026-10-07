@@ -68,7 +68,7 @@ function symbolOf(chain: string, address: string): string {
     if (known) return known;
     return `${address.slice(0, 6)}...${address.slice(-4)}`;
 }
-import { formatSkippedOpportunity, formatHourlyDigest, formatDailyReport, formatStartup, formatExecutionWarning, DigestSection, DigestSpread, formatPlainHourly, formatPlainDaily } from './core/telegramFormatter';
+import { formatSkippedOpportunity, formatHourlyDigest, formatDailyReport, formatStartup, formatExecutionWarning, DigestSection, DigestSpread, formatPlainHourly, formatPlainDaily, formatRivalDaily } from './core/telegramFormatter';
 import { RobinhoodChainAdapter } from './chains/robinhoodChain';
 import { MonadAdapter } from './chains/monad';
 import { AvalancheAdapter } from './chains/avalanche';
@@ -750,6 +750,7 @@ for (const sig of ['SIGINT', 'SIGTERM'] as const) {
             try { dryRunPnl.save(); } catch { /* best effort */ }
             try { robinhoodWatcher.save(WATCH_FILE); } catch { /* best effort */ }
             try { routeScores.save(ROUTE_FILE); } catch { /* best effort */ }
+            try { rivalWatch.save(RIVAL_BOTS_FILE, RIVAL_TRADES_FILE); } catch { /* best effort */ }
             try { saveNodeUsage(); } catch { /* best effort */ }
             console.log(`[shutdown] ${sig}: state saved, exiting`);
             process.exit(0);
@@ -779,6 +780,7 @@ const rivals = new CompetitorTracker(robinhoodReadProvider, Date.now, ROBINHOOD_
 // Rival watch (core/rivalWatch.ts): follows every trade of the rival bots the
 // tracker has caught, to see what they win and where. Bots saved to disk.
 const RIVAL_BOTS_FILE = 'data/rival-bots.json';
+const RIVAL_TRADES_FILE = 'data/rival-trades.json';
 const rivalWatch = new RivalWatch(
       (m, p) => robinhoodReadProvider.send(m, p as any[]),
       (token, raw) => {
@@ -788,8 +790,23 @@ const rivalWatch = new RivalWatch(
       },
       (token) => symbolOf('robinhood', token),
       (pool) => !!cache.get('robinhood', pool),
+      ROBINHOOD_TOKENS.WETH,
 );
-{ const n = rivalWatch.load(RIVAL_BOTS_FILE); if (n) console.log(`[rivalwatch] following ${n} known rival bots`); }
+{
+      const n = rivalWatch.load(RIVAL_BOTS_FILE, RIVAL_TRADES_FILE);
+      // Seed: arbitrage contracts found on chain by the funding probe (Oct 7).
+      for (const b of ['0x8876789976decbfcbbbe364623c63652db8c0904', '0x1e7f0968bf0ad273d4edc75debc8bae037b0ad2c', '0x6e2a35a7ad683cf634d91492d73bb7ff774c6919',
+            '0x5399d94d2cab7c252a6034042e1917a0e5e17a18', '0x203bffa697bee74d39d255c1c028e3efa689b5f7', '0x6c49cc864b3f8f6bef6559ef4f1662c408b84154',
+            '0x6aa80dbbed9ae5ab45fbf61f9644fada3b29326e', '0x7ddbd3952d9fd58cc7d344ad0931d08db072114a']) rivalWatch.addBot(b);
+      console.log(`[rivalwatch] following ${rivalWatch.botCount()} rival bots, ${n.recs} trades restored`);
+}
+// Sampler: one recent block every 15 s, to find rival bots we don't know yet.
+setInterval(async () => {
+      try {
+            const latest = await robinhoodReadProvider.getBlockNumber();
+            await rivalWatch.sampleBlock('0x' + (latest - 3).toString(16));
+      } catch { /* node busy: next time */ }
+}, Number(process.env.RIVAL_SAMPLE_MS ?? 15_000));
 // New rival bots caught by the tracker join the watch list (checked every minute).
 let rivalResultsSeen = 0;
 setInterval(() => {
@@ -797,8 +814,8 @@ setInterval(() => {
             const r = rivals.results[rivalResultsSeen];
             if (r.found && r.bot) rivalWatch.addBot(r.bot);
       }
-      rivalWatch.save(RIVAL_BOTS_FILE);
 }, 60_000);
+setInterval(() => rivalWatch.save(RIVAL_BOTS_FILE, RIVAL_TRADES_FILE), 10 * 60_000);
 
 // LIVE results (only used once live sending is switched on): receipt, profit
 // from the contract's Executed event, gas cost; losses feed the daily cap.
@@ -1938,6 +1955,37 @@ for (let i = 0; i < resolved.length; i++) {
       // First report 10 minutes after start, so a fresh deploy shows up in
       // Telegram quickly instead of an hour later.
       setTimeout(() => { void sendHourlyDigest(); }, 10 * 60 * 1000);
+
+      // Daily RIVAL BOT REPORT at 9:00 Toronto time (Stage 0: learn from the
+      // other bots). Sent once per day; the date is saved so a restart
+      // doesn't send it twice. Covers the last 24 h of saved rival trades.
+      const RIVAL_DAILY_FILE = 'data/rival-daily.json';
+      const RIVAL_DAILY_HOUR = Number(process.env.RIVAL_DAILY_HOUR ?? 9);
+      const torontoNow = () => {
+            const parts = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Toronto', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', hour12: false }).formatToParts(new Date());
+            const get = (t: string) => parts.find((p) => p.type === t)?.value ?? '';
+            return { date: `${get('year')}-${get('month')}-${get('day')}`, hour: Number(get('hour')) % 24 };
+      };
+      const sendRivalDaily = async () => {
+            const now = Date.now();
+            const sum = rivalWatch.summary(now - 24 * 3600_000, now);
+            const hours = Math.min(24, Math.max(0.1, (now - rivalWatch.firstRecordMs(now - 24 * 3600_000)) / 3600_000));
+            await sendTelegramMessage(formatRivalDaily({ dateLabel: torontoNow().date, hours, summary: sum, botsKnown: rivalWatch.botCount() }));
+      };
+      setInterval(async () => {
+            const t = torontoNow();
+            if (t.hour !== RIVAL_DAILY_HOUR) return;
+            let last = '';
+            try { last = JSON.parse(readFileSync(RIVAL_DAILY_FILE, 'utf8')).date ?? ''; } catch { /* first time */ }
+            if (last === t.date) return;
+            try {
+                  writeFileSync(RIVAL_DAILY_FILE, JSON.stringify({ date: t.date }));
+                  await sendRivalDaily();
+            } catch (err) { console.error('[telegram] rival daily report failed:', err); }
+      }, 60_000);
+      // First taste: a rival report 2 hours after start, so you don't wait
+      // until tomorrow morning to see the format.
+      setTimeout(() => { void sendRivalDaily().catch(() => {}); }, Number(process.env.RIVAL_FIRST_REPORT_MS ?? 2 * 3600_000));
 
       let lastDailyAt = Date.now();
       setInterval(async () => {

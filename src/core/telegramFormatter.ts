@@ -1,4 +1,5 @@
 import { ChainName } from './types';
+import type { RivalSummary } from './rivalWatch';
 
 // ============================================================================
 // TELEGRAM MESSAGE FORMATTING -- COLD PATH
@@ -294,8 +295,8 @@ export interface PlainHourlyInput {
   earned: { todayChecked: number; todayCheckedCount: number; todayUnchecked: number; todayUncheckedCount: number; weekChecked: number };
   reactionMs: { typical: number | null; slowest5pct: number | null };
   otherBots?: { timed: number; theirMs: number | null; oursMs: number | null; weBeat: number };
-  // What the rival bots won this hour (core/rivalWatch.ts).
-  rivalWins?: { trades: number; wins: number; usd: number; byPair: [string, number, number][]; onOurPools: number; bots: number; botsKnown: number };
+  // What the rival bots did this hour (core/rivalWatch.ts).
+  rivalWins?: RivalSummary & { botsKnown: number };
   topDifferences: { pair: string; pct: number; buyAt: string; sellAt: string }[];
   nodeUsage?: { name: string; used: number; daily: number }[]; // today's requests per node vs allowance
   // Where trades dropped out this hour, step by step (see shadowMain funnel).
@@ -415,16 +416,12 @@ export function formatPlainHourly(r: PlainHourlyInput): string {
   }
   L.push('');
 
-  // What the other bots won: where the real money is on this chain.
+  // What the other bots did: where the real money is, and how they make it.
   const rw = r.rivalWins;
   if (rw && (rw.trades > 0 || rw.botsKnown > 0)) {
-    L.push(`<b>What other bots won this hour</b> (following ${rw.botsKnown} known bot${rw.botsKnown === 1 ? '' : 's'})`);
+    L.push(`<b>What other bots did this hour</b> (following ${rw.botsKnown} bot${rw.botsKnown === 1 ? '' : 's'})`);
     if (!rw.trades) L.push('No trades by them this hour.');
-    else {
-      L.push(`${rw.trades} trade${rw.trades === 1 ? '' : 's'} by ${rw.bots} bot${rw.bots === 1 ? '' : 's'}, ${rw.wins} made money, about ${money(rw.usd)} total (before their gas)`);
-      for (const [pair, n, usd] of rw.byPair.slice(0, 5)) L.push(`  • ${esc(pair)}: ${n}x, about ${money(usd)}`);
-      L.push(`On trading spots we watch: ${rw.onOurPools} of ${rw.trades}`);
-    }
+    else L.push(...rivalLines(rw));
     L.push('');
   }
 
@@ -518,4 +515,72 @@ export function formatExecutionWarning(): string {
     '⚠️ <b>EXECUTION_ENABLED is set</b>',
     'Live trading is not built yet. Bot is still shadow-only.',
   ].join('\n');
+}
+
+
+// ----------------------------------------------------------------------------
+// Rival bots, in plain English (hourly section + daily report).
+// ----------------------------------------------------------------------------
+const cents = (n: number | null): string => (n === null ? '?' : n < 1 ? `${(n * 100).toFixed(n < 0.1 ? 2 : 1)}¢` : money(n));
+const share = (a: number, b: number): string => (b ? `${Math.round((100 * a) / b)}%` : '0%');
+
+function rivalLines(s: RivalSummary): string[] {
+  const L: string[] = [];
+  const ok = s.trades - s.failed;
+  L.push(`Trades: ${s.trades} by ${s.bots} bot${s.bots === 1 ? '' : 's'}`);
+  L.push(`  ✅ made money after gas: ${s.wins}`);
+  L.push(`  ➖ broke even or lost: ${Math.max(0, ok - s.wins - s.unpriced)}`);
+  if (s.unpriced) L.push(`  ❔ coins we can't price: ${s.unpriced}`);
+  if (s.failed) L.push(`  ✖️ failed but still paid gas: ${s.failed}`);
+  L.push(`Money: made ${money(s.grossUsd)}, paid ${money(s.gasUsd)} gas, kept ${money(s.netUsd)}`);
+  L.push(`Typical trade: puts in ${s.medianSizeUsd === null ? '?' : money(s.medianSizeUsd)}, a win makes ${cents(s.medianWinUsd)}, gas ${cents(s.medianGasUsd)}`);
+  L.push(`Routes: 2 pools ${share(s.routes.two, s.trades)}, 3 pools ${share(s.routes.three, s.trades)}, 4+ pools ${share(s.routes.fourPlus, s.trades)}`);
+  L.push(`Money source: own money ${share(s.trades - s.flash, s.trades)}, flash loans ${share(s.flash, s.trades)}`);
+  for (const [pair, n, usd] of s.byPair.slice(0, 5)) L.push(`  • ${esc(pair)}: ${n} wins, ${money(usd)}`);
+  L.push(`On trading spots we watch: ${s.onOurPools} of ${s.trades}`);
+  return L;
+}
+
+// Lessons the numbers teach, one line each.
+export function rivalLessons(s: RivalSummary): string[] {
+  const out: string[] = [];
+  if (s.medianWinUsd !== null && s.medianSizeUsd) out.push(`A typical win makes ${cents(s.medianWinUsd)} on ${money(s.medianSizeUsd)} put in (${((100 * s.medianWinUsd) / s.medianSizeUsd).toFixed(2)}%). Tiny margins, lots of trades.`);
+  if (s.medianWinUsd !== null && s.medianGasUsd) out.push(`Gas is about ${cents(s.medianGasUsd)} a trade, so one typical win pays for about ${Math.floor(s.medianWinUsd / s.medianGasUsd)} misses.`);
+  const loops = s.routes.three + s.routes.fourPlus;
+  if (s.trades) out.push(`${share(loops, s.trades)} of their trades are 3+ pool loops. Our bot can't do those yet.`);
+  if (s.trades) out.push(`${share(s.flash, s.trades)} used flash loans; the rest used their own money.`);
+  if (s.trades) out.push(`${share(s.onOurPools, s.trades)} were on pools we watch. The rest is money we can't even see yet.`);
+  if (s.failed) out.push(`${s.failed} trades failed outright and still paid gas. Sending lots and accepting misses is part of the game.`);
+  return out;
+}
+
+// Stage 0 verdict: is there enough money here, and is gas cheap enough?
+export function rivalVerdict(s: RivalSummary, hours: number): string {
+  const perDay = hours > 0 ? (s.netUsd * 24) / hours : 0;
+  const gasOk = s.medianGasUsd !== null && s.medianWinUsd !== null && s.medianGasUsd * 4 <= s.medianWinUsd;
+  if (s.trades < 20) return '⏳ Not enough rival trades yet to judge. Give it more time.';
+  if (perDay < 100) return `⚠️ Small pie: the bots we follow keep about ${money(perDay)} a day after gas. Probably not worth building more here unless it grows.`;
+  if (!gasOk) return `⚠️ Gas is too high compared with a typical win (${cents(s.medianGasUsd)} gas vs ${cents(s.medianWinUsd)} win). Tiny trades would struggle.`;
+  return `✅ Worth building Stage 1: the bots we follow keep about ${money(perDay)} a day after gas, and gas is cheap compared with a win.`;
+}
+
+export function formatRivalDaily(input: { dateLabel: string; hours: number; summary: RivalSummary; botsKnown: number }): string {
+  const s = input.summary;
+  const L: string[] = [];
+  L.push(`📚 <b>RIVAL BOT REPORT</b> · ${esc(input.dateLabel)} (last ${Math.round(input.hours)} h)`);
+  L.push(`Following ${input.botsKnown} rival bot${input.botsKnown === 1 ? '' : 's'}. Numbers are for those bots only, so the real total is at least this.`);
+  L.push('');
+  if (!s.trades) { L.push('No rival trades recorded yet.'); return L.join('\n'); }
+  L.push(...rivalLines(s));
+  L.push('');
+  L.push('<b>Top bots</b> (kept after gas)');
+  for (const b of s.byBot.slice(0, 5)) {
+    L.push(`  • ${b.bot.slice(0, 8)}…: ${b.trades} trades, kept ${money(b.netUsd)}, puts in ${b.medianSizeUsd === null ? '?' : money(b.medianSizeUsd)}, ${b.avgPools.toFixed(1)} pools avg${b.flash ? `, flash loans ${b.flash}x` : ''}`);
+  }
+  L.push('');
+  L.push('<b>What we learn</b>');
+  for (const l of rivalLessons(s)) L.push(`  • ${l}`);
+  L.push('');
+  L.push(`<b>Verdict</b>: ${rivalVerdict(s, input.hours)}`);
+  return L.join('\n');
 }
