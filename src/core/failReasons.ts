@@ -68,7 +68,7 @@ export function classifyFailReason(raw: string): FailGroup {
 // numbers are collapsed so the same failure on different coins counts once.
 export function normaliseRawReason(raw: string): string {
   return (raw ?? '')
-    .replace(/0x[0-9a-fA-F]{8,}/g, '0x…')
+    .replace(/0x[0-9a-fA-F]{9,}/g, '0x…') // keeps 4-byte error codes
     .replace(/\d{5,}/g, 'N')
     .trim()
     .slice(0, 80) || '(empty)';
