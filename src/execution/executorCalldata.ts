@@ -181,6 +181,52 @@ export function buildExecuteCall(input: BuildInput): BuildResult {
   return { ok: true, to: input.executorAddress, data, amountIn, minProfit, flashPool, funding, hops };
 }
 
+// ----------------------------------------------------------------------------
+// LOOP ROUTES (3+ pools): tokenIn -> A -> B -> ... -> tokenIn.
+//
+// Plain English: the same contract call as a 2-pool trade, just with more
+// steps. Each leg names its pool and which coin goes in and out; the legs
+// must chain (one leg's coin out is the next leg's coin in) and end back on
+// tokenIn. The contract checks profit on tokenIn at the end, exactly as for
+// 2-pool trades, and cancels everything if it isn't there.
+// ----------------------------------------------------------------------------
+export interface RouteLeg { pool: PoolState; tokenIn: string; tokenOut: string }
+
+export function buildRouteCall(input: Omit<BuildInput, 'buyPool' | 'sellPool'> & { legs: RouteLeg[] }): BuildResult {
+  const legs = input.legs;
+  if (legs.length < 2) return { ok: false, reason: 'a route needs at least 2 pools' };
+  const lc = (x: string) => x.toLowerCase();
+  if (lc(legs[0].tokenIn) !== lc(input.tokenIn) || lc(legs[legs.length - 1].tokenOut) !== lc(input.tokenIn)) {
+    return { ok: false, reason: 'route must start and end on tokenIn' };
+  }
+  const hops: ExecutorHop[] = [];
+  const seenPools = new Set<string>();
+  for (let i = 0; i < legs.length; i++) {
+    const l = legs[i];
+    if (i > 0 && lc(legs[i - 1].tokenOut) !== lc(l.tokenIn)) return { ok: false, reason: 'route legs do not chain' };
+    if (otherToken(l.pool, l.tokenIn)?.toLowerCase() !== lc(l.tokenOut)) return { ok: false, reason: `pool ${l.pool.poolAddress} does not trade ${l.tokenIn} -> ${l.tokenOut}` };
+    if (seenPools.has(lc(l.pool.poolAddress))) return { ok: false, reason: 'route uses the same pool twice' };
+    seenPools.add(lc(l.pool.poolAddress));
+    const kind = kindForPool(l.pool);
+    if (kind === null) return { ok: false, reason: `pool not supported by contract (${l.pool.dex}/${l.pool.poolType})` };
+    hops.push(hopFor(kind, l.pool, l.tokenIn, l.tokenOut));
+  }
+  if (input.tokenInDecimals === undefined) return { ok: false, reason: `unknown decimals for ${input.tokenIn}` };
+  const amountIn = usdToTokenUnits(input.tradeSizeUsd, input.usdPerTokenIn, input.tokenInDecimals);
+  if (amountIn === 0n) return { ok: false, reason: 'trade size rounds to zero tokens' };
+  const minProfit = usdToTokenUnits(input.netProfitUsd, input.usdPerTokenIn, input.tokenInDecimals);
+  if (minProfit === 0n) return { ok: false, reason: 'profit floor rounds to zero tokens' };
+  const trade = { token: input.tokenIn, amountIn, minProfit, maxBlock: input.maxBlock, hops: hops.map(fullHop) };
+  if (input.v3Lender) {
+    if (hops.some((h) => lc(h.pool) === lc(input.v3Lender!))) return { ok: false, reason: 'lender pool is also a trade pool' };
+    const data = iface.encodeFunctionData('executeWithV3Flash', [trade, input.v3Lender]);
+    return { ok: true, to: input.executorAddress, data, amountIn, minProfit, flashPool: input.v3Lender, funding: 'v3-flash', hops };
+  }
+  const flashPool = input.flashPool ?? ZERO_ADDRESS;
+  const data = iface.encodeFunctionData('execute', [trade, flashPool]);
+  return { ok: true, to: input.executorAddress, data, amountIn, minProfit, flashPool, funding: flashPool === ZERO_ADDRESS ? 'own' : 'aave', hops };
+}
+
 // One hop of the route in the contract's format.
 export function hopFor(kind: number, pool: PoolState, tokenIn: string, tokenOut: string): ExecutorHop {
   if (kind === KIND_V4) {
