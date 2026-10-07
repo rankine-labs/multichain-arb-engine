@@ -584,19 +584,28 @@ contract RobinhoodForkTest is ForkBase {
         (bool ok2, bytes memory d2) = address(exec).call(abi.encodeWithSelector(ArbExecutor.execute.selector, t2, address(0)));
         bool g2 = d2.length >= 4 && bytes4(d2) == ArbExecutor.InsufficientProfit.selector;
         console.log("  -> ownUSDG uni0.05->ramses0287:", ok2 || g2 ? "OK reached profit check" : "REVERTED");
-        // Step by step with this test as the trader, to see amounts.
+        _stepByStep(uni, ram);
+    }
+
+    // Step by step with this test as the trader, to see amounts.
+    function _stepByStep(address uni, address ram) internal {
         uint256 snap = vm.snapshotState();
         deal(USDG, address(this), 300e6);
         stepPool = uni; stepToken = USDG;
-        bool z1 = USDG < WETH;
-        (int256 a0, int256 a1) = IV3PoolStep(uni).swap(address(this), z1, int256(300e6), z1 ? uint160(4295128740) : uint160(1461446703485210103287273052203988822378723970341), "");
-        uint256 wethGot = uint256(-(z1 ? a1 : a0));
-        console.log("  -> step1 USDG->WETH on uni: WETH got", wethGot);
+        (uint256 paid1, uint256 wethGot) = _stepSwap(uni, USDG, WETH, 300e6);
+        console.log("  -> step1 USDG->WETH on uni: USDG paid / WETH got", paid1, wethGot);
         stepPool = ram; stepToken = WETH;
-        bool z2 = WETH < USDG;
-        (int256 b0, int256 b1) = IV3PoolStep(ram).swap(address(this), z2, int256(wethGot), z2 ? uint160(4295128740) : uint160(1461446703485210103287273052203988822378723970341), "");
-        console.log("  -> step2 WETH->USDG on ramses: WETH owed / USDG got", uint256(z2 ? b0 : b1), uint256(-(z2 ? b1 : b0)));
+        (uint256 paid2, uint256 usdgGot) = _stepSwap(ram, WETH, USDG, wethGot);
+        console.log("  -> step2 WETH->USDG on ramses: WETH paid / USDG got", paid2, usdgGot);
         vm.revertToState(snap);
+    }
+
+    function _stepSwap(address pool, address tIn, address tOut, uint256 amt) internal returns (uint256 paid, uint256 got) {
+        bool z = tIn < tOut;
+        uint160 lim = z ? uint160(4295128740) : uint160(1461446703485210103287273052203988822378723970341);
+        (int256 d0, int256 d1) = IV3PoolStep(pool).swap(address(this), z, int256(amt), lim, "");
+        paid = uint256(z ? d0 : d1);
+        got = uint256(-(z ? d1 : d0));
     }
 
     address internal stepPool;
