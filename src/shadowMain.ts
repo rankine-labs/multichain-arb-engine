@@ -80,6 +80,7 @@ import { readFileSync, writeFileSync, mkdirSync, renameSync } from 'fs';
 import { ROBINHOOD_SCAN_FACTORIES } from './config/knownAddresses';
 import { buildExecuteCall, executionRequested, executorConfig, pickV3Lender } from './execution/executorCalldata';
 import { FailTally } from './core/failReasons';
+import { LenderBalances } from './core/lenderBalances';
 import { makeRpc, simulateRoundTrip, simRpcUrl, Rpc, makeFallbackRpc, loadBalanceSlots, wssToHttps } from './execution/simulator';
 import { FastSender, SafetyGate, safetyConfigFromEnv } from './execution/fastSender';
 import { checkLiveReady } from './execution/liveReadiness';
@@ -418,7 +419,7 @@ const checkRoundTrip = async (
       if (decimals === undefined) return { status: 'skipped', reason: 'unknown decimals' };
       // Same lender choice as a live trade (approved FLASH_LENDERS only), so a
       // "confirmed" profit is priced with the loan fee a real trade would pay.
-      const lender = pickV3Lender(lenderCandidates(chain), tokenIn, [buyPool.poolAddress, sellPool.poolAddress]);
+      const lender = pickLender(chain, tokenIn, buyPool, sellPool, tradeSizeUsd, usdPerToken);
       const built = buildExecuteCall({
             chain, tokenIn, buyPool, sellPool, tradeSizeUsd, netProfitUsd: 1,
             usdPerTokenIn: usdPerToken, tokenInDecimals: decimals, maxBlock: 0n,
@@ -450,7 +451,7 @@ const queueSimulation = (
       // isn't one of the trade's pools. None cached -> simulate own capital.
       // Same lender choice as a live trade (approved FLASH_LENDERS only), so a
       // "confirmed" profit is priced with the loan fee a real trade would pay.
-      const lender = pickV3Lender(lenderCandidates(chain), tokenIn, [buyPool.poolAddress, sellPool.poolAddress]);
+      const lender = pickLender(chain, tokenIn, buyPool, sellPool, tradeSizeUsd, usdPerToken);
       // Only need the route + amount here; minProfit is set by the simulator.
       const built = buildExecuteCall({
             chain, tokenIn, buyPool, sellPool, tradeSizeUsd, netProfitUsd: 1,
@@ -682,6 +683,36 @@ const lenderCandidates = (chain: 'avalanche' | 'monad' | 'robinhood') => {
       return robinhoodSender.live && chain === 'robinhood' ? [] : all;
 };
 
+// Robinhood: real coin balances of every possible lender pool, refreshed
+// every LENDER_REFRESH_MS in one bundled read (see core/lenderBalances.ts).
+const lenderBalances = new LenderBalances();
+const LENDER_REFRESH_MS = Number(process.env.LENDER_REFRESH_MS ?? 5 * 60_000);
+// Lender must hold this many times the loan (room for price moves / fees).
+const LENDER_HEADROOM = BigInt(Math.max(1, Math.floor(Number(process.env.LENDER_HEADROOM ?? 3))));
+
+// Coins of tokenIn the trade will borrow: tradeSizeUsd / price, in raw units.
+const loanUnits = (tradeSizeUsd: number, usdPerToken: number, decimals: number): bigint | null => {
+      if (!(tradeSizeUsd > 0) || !(usdPerToken > 0)) return null;
+      const micro = BigInt(Math.floor((tradeSizeUsd / usdPerToken) * 1e6)); // 6-decimal precision, no float overflow
+      return (micro * 10n ** BigInt(decimals)) / 1_000_000n;
+};
+
+// The ONE lender choice used by checks and (later) live trades: cheapest pool
+// that really holds enough. Robinhood only checks balances; other chains
+// (paused) keep the old rule.
+const pickLender = (
+      chain: 'avalanche' | 'monad' | 'robinhood', tokenIn: string, buyPool: any, sellPool: any,
+      tradeSizeUsd: number, usdPerToken: number,
+) => {
+      const exclude = [buyPool.poolAddress, sellPool.poolAddress];
+      if (chain !== 'robinhood') return pickV3Lender(lenderCandidates(chain), tokenIn, exclude);
+      const dec = TOKEN_DECIMALS[chain]?.[tokenIn.toLowerCase()];
+      const amount = dec === undefined ? null : loanUnits(tradeSizeUsd, usdPerToken, dec);
+      // Unknown amount or no balances read yet: no lender (own-capital check instead).
+      if (amount === null || !lenderBalances.lastRefreshMs) return null;
+      return pickV3Lender(lenderCandidates(chain), tokenIn, exclude, (pool, token) => lenderBalances.canLend(pool, token, amount, LENDER_HEADROOM));
+};
+
 // ONE path from "this is worth doing" to a signed trade, used by both the
 // trade-triggered engine and the standing-gap scanner:
 //   build the exact contract call -> safety gate -> sign (send only if live).
@@ -704,7 +735,7 @@ const fireTrade = async (o: {
                   // 0 is only used in dry runs.
                   maxBlock: o.chain === 'robinhood' && robinhoodSender.live ? (robinhoodSender.deadlineBlock() ?? 0n) : 0n,
                   ...executorConfig(o.chain),
-                  v3Lender: pickV3Lender(lenderCandidates(o.chain), o.tokenIn, [o.buyPool.poolAddress, o.sellPool.poolAddress])?.poolAddress,
+                  v3Lender: pickLender(o.chain, o.tokenIn, o.buyPool, o.sellPool, o.tradeSizeUsd, o.usdPerTokenIn)?.poolAddress,
             });
             if ('reason' in dry) { console.log(`[exec-dryrun] ${o.chain} NOT executable: ${dry.reason}`); return; }
             const block = (r: string) => { fireStats.blocked.set(r, (fireStats.blocked.get(r) ?? 0) + 1); };
@@ -1308,6 +1339,20 @@ await chainManager.startAll();
             }
       };
       setInterval(() => { void runGapScan(); }, 5_000);
+      // Lender balances: one bundled read of every candidate lender pool's
+      // coins + liquidity, first ~20 s after start (watch list loaded), then
+      // every LENDER_REFRESH_MS. A failed read keeps the last good list.
+      const refreshLenders = async () => {
+            try {
+                  rhDecisionCallMany ??= (await makeCaller(robinhoodReadProvider)).callMany;
+                  const n = await lenderBalances.refresh(rhDecisionCallMany, lenderCandidates('robinhood'));
+                  console.log(`[lenders] robinhood: balances read for ${n} possible lender pools`);
+            } catch (err) {
+                  console.warn('[lenders] robinhood balance read failed (keeping last list):', (err as Error).message);
+            }
+      };
+      setTimeout(() => { void refreshLenders(); }, 20_000);
+      setInterval(() => { void refreshLenders(); }, LENDER_REFRESH_MS);
       void robinhoodWatcher.watch(ROBINHOOD_TOKENS.WETH, ROBINHOOD_TOKENS.USDG, { pin: true })
             .then((n) => console.log(`[pairs] robinhood WETH/USDG: ${n} pools found`))
             .catch((err) => console.warn('[pairs] WETH/USDG discovery failed:', (err as Error).message));

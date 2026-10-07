@@ -8,7 +8,9 @@
 //   "BadRoute()"). This file sorts those into a few groups a person can act on:
 //     - tax:      the coin takes a cut when it's moved, so the pool gets less
 //                 than our trade expected and cancels it
-//     - blocked:  the coin refuses the transfer (scam / trading locked)
+//     - transfer: coins couldn't be moved: usually the lender pool was too
+//                 small (or empty), sometimes a coin that blocks transfers
+//     - blocked:  the coin says outright it refuses (blacklist / trading off)
 //     - ours:     our bot built the trade wrong (a bug for us to fix)
 //     - stale:    our price info for the pool was old or wrong
 //     - silent:   failed without giving any reason
@@ -17,11 +19,12 @@
 //   show exactly what the chain said, for diagnosis.
 // ============================================================================
 
-export type FailGroup = 'tax' | 'blocked' | 'ours' | 'stale' | 'silent' | 'other';
+export type FailGroup = 'tax' | 'transfer' | 'blocked' | 'ours' | 'stale' | 'silent' | 'other';
 
 // Plain-English label for each group, as shown in Telegram.
 export const FAIL_GROUP_LABEL: Record<FailGroup, string> = {
   tax: 'coin takes a cut when moved (skip these coins)',
+  transfer: "money couldn't be moved (lender too small, or coin blocks transfers)",
   blocked: 'coin blocks trading (likely scam coin)',
   ours: 'our bot built the trade wrong (bug for me to fix)',
   stale: 'price info was old or wrong',
@@ -47,8 +50,13 @@ const RULES: [FailGroup, RegExp][] = [
   ['tax', /: K\b|^K$|\bIIA\b/],
   // The coin itself refused to move: transfer helpers failing, blacklists,
   // trading switched off, max-transaction limits.
-  ['blocked', /TRANSFER_FAILED|TransferFailed|blacklist|not allowed|trading (is )?not (enabled|open|active)|tradingEnabled|max ?tx|exceeds (the )?max|transfer amount exceeds/i],
-  ['blocked', /\bSTF\b|\bTF\b/],
+  // Explicit refusals from the coin itself.
+  ['blocked', /blacklist|not allowed|trading (is )?not (enabled|open|active)|tradingEnabled|max ?tx|exceeds (the )?max/i],
+  // A transfer failed without saying why: on WETH/USDG this was the lender
+  // pool not holding enough (TF / TransferFailed) or having no active
+  // liquidity (L). Could also be a coin that blocks transfers.
+  ['transfer', /TRANSFER_FAILED|TransferFailed|transfer amount exceeds/i],
+  ['transfer', /\bSTF\b|\bTF\b|^L$/],
   // Pool math didn't match what we expected: price moved or our cached state
   // was off, or the simulated profit was too good to be true.
   ['stale', /INSUFFICIENT_OUTPUT_AMOUNT|INSUFFICIENT_LIQUIDITY|implausible profit|Too little received/i],

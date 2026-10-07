@@ -449,6 +449,71 @@ contract RobinhoodForkTest is ForkBase {
         _runExpectingOnlyProfitGuard("robinhood V4 WETH/USDG -> uniV3", t, address(0));
     }
 
+    // Ramses V3 WETH/USDG pool keyed by tick spacing, with real coins in it.
+    function _ramsesV3ByTick() internal view returns (address v3) {
+        int24[6] memory sp = [int24(1), int24(5), int24(10), int24(50), int24(100), int24(200)];
+        uint256 best;
+        for (uint256 i = 0; i < sp.length; i++) {
+            (bool ok, bytes memory ret) =
+                RAMSES_V3_FACTORY.staticcall(abi.encodeWithSignature("getPool(address,address,int24)", WETH, USDG, sp[i]));
+            if (!ok || ret.length < 32) continue;
+            address p = abi.decode(ret, (address));
+            if (p == address(0) || p.code.length == 0) continue;
+            (bool okb, bytes memory bal) = WETH.staticcall(abi.encodeWithSignature("balanceOf(address)", p));
+            if (!okb || bal.length < 32) continue;
+            uint256 b = abi.decode(bal, (uint256));
+            if (b > best) { best = b; v3 = p; } // deepest WETH balance
+        }
+    }
+
+    // The exact route the bot's checks failed on (Oct 7): WETH -> USDG on
+    // Uniswap V3, then USDG -> WETH on Ramses V3. Own capital, so only the
+    // Ramses hop itself is being tested (no lender involved).
+    function test_fork_robinhood_uniV3_to_ramsesV3() public {
+        if (!_fork("ROBINHOOD_RPC_URL")) return;
+        address uni = _uniV3();
+        address ram = _ramsesV3ByTick();
+        console.log("robinhood uni v3 WETH/USDG:", uni);
+        console.log("robinhood ramses v3 WETH/USDG (by tick spacing):", ram);
+        if (uni == address(0) || ram == address(0)) { console.log("skipped: pools not found"); vm.skip(true); return; }
+        _fundWrapped(WETH, 0.05 ether);
+        ArbExecutor.Hop[] memory hops = new ArbExecutor.Hop[](2);
+        hops[0] = _hop(2, uni, WETH, USDG, 0);
+        hops[1] = _hop(2, ram, USDG, WETH, 0);
+        ArbExecutor.Trade memory t =
+            ArbExecutor.Trade({token: WETH, amountIn: 0.05 ether, minProfit: 1, maxBlock: _l2Block(), hops: hops});
+        _runExpectingOnlyProfitGuard("robinhood uniV3 -> ramsesV3", t, address(0));
+    }
+
+    // Reverse direction: Ramses V3 first, then Uniswap V3.
+    function test_fork_robinhood_ramsesV3_to_uniV3() public {
+        if (!_fork("ROBINHOOD_RPC_URL")) return;
+        address uni = _uniV3();
+        address ram = _ramsesV3ByTick();
+        if (uni == address(0) || ram == address(0)) { console.log("skipped: pools not found"); vm.skip(true); return; }
+        _fundWrapped(WETH, 0.05 ether);
+        ArbExecutor.Hop[] memory hops = new ArbExecutor.Hop[](2);
+        hops[0] = _hop(2, ram, WETH, USDG, 0);
+        hops[1] = _hop(2, uni, USDG, WETH, 0);
+        ArbExecutor.Trade memory t =
+            ArbExecutor.Trade({token: WETH, amountIn: 0.05 ether, minProfit: 1, maxBlock: _l2Block(), hops: hops});
+        _runExpectingOnlyProfitGuard("robinhood ramsesV3 -> uniV3", t, address(0));
+    }
+
+    // Same failing route, now with a flash loan from the TINY 0.01% Uniswap
+    // V3 pool the bot used to pick. Logs how much WETH that pool holds, so we
+    // can see whether it could ever cover the loan.
+    function test_fork_robinhood_tinyLenderBalance() public {
+        if (!_fork("ROBINHOOD_RPC_URL")) return;
+        address tiny = _findV3(UNI_V3_FACTORY, WETH, USDG, _fees(100, 100, 100, 100));
+        console.log("robinhood uni v3 0.01% WETH/USDG pool:", tiny);
+        if (tiny == address(0)) { console.log("skipped: no 0.01% pool"); vm.skip(true); return; }
+        (, bytes memory bal) = WETH.staticcall(abi.encodeWithSignature("balanceOf(address)", tiny));
+        (, bytes memory bal2) = USDG.staticcall(abi.encodeWithSignature("balanceOf(address)", tiny));
+        console.log("  tiny pool WETH held (wei):", abi.decode(bal, (uint256)));
+        console.log("  tiny pool USDG held (raw):", abi.decode(bal2, (uint256)));
+    }
+
     function test_fork_robinhood_ramsesV2_to_pancakeV3() public {
         if (!_fork("ROBINHOOD_RPC_URL")) return;
         address v3 = _findV3(PANCAKE_V3_FACTORY, WETH, USDG, _fees(2500, 500, 10000, 100));
