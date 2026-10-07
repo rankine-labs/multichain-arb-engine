@@ -121,6 +121,15 @@ async function main() {
     else if (/reads on (.+)$/.test(rpcLine)) readsOn = `${/reads on (.+)$/.exec(rpcLine)[1]} (${(/\(([^)]*)\)/.exec(rpcLine) || [])[1] || 'a node is resting'})`;
   }
   const simProfit = count(outL, /\[sim\].*REAL PROFIT/);
+  // Dollar size of the profitable checks (before gas), so we can see if
+  // they're worth chasing: count, total, middle value, biggest.
+  const profitUsd = outL.map((l) => /\[sim\] robinhood .*REAL PROFIT \$([0-9.]+)/.exec(l)).filter(Boolean).map((m) => Number(m[1])).sort((a, b) => a - b);
+  const profitPairs = new Map();
+  for (const l of outL) {
+    const m = /\[sim\] robinhood (\S+\/\S+) .*REAL PROFIT \$([0-9.]+)/.exec(l);
+    if (m) profitPairs.set(m[1], (profitPairs.get(m[1]) || 0) + Number(m[2]));
+  }
+  const topProfitPairs = [...profitPairs.entries()].sort((a, b) => b[1] - a[1]).slice(0, 5);
   const simLoss = count(outL, /\[sim\].*real: LOSS/);
   const simFail = count(outL, /\[sim\].*real: FAILS/);
   // When trigger checks were tested (bot tags each [sim] line).
@@ -202,6 +211,8 @@ async function main() {
     `- Prices read from: ${readsOn} · ${rpcSwitches} node switch(es) this window`,
     `- RPC round trip from the server (public node, best of 3): ${rpcRtt ?? '?'} ms`,
     `- Real-chain test runs: ${simProfit} profitable · ${simLoss} losing · ${simFail} would fail`,
+    ...(profitUsd.length ? [`- Profitable checks: total $${profitUsd.reduce((x, y) => x + y, 0).toFixed(2)} · middle $${profitUsd[Math.floor(profitUsd.length / 2)].toFixed(2)} · biggest $${profitUsd[profitUsd.length - 1].toFixed(2)} (before gas)`,
+      `- Profit by pair: ${topProfitPairs.map(([p, v]) => `${p} $${v.toFixed(2)}`).join(' · ')}`] : []),
     ...(tRight + tOthers + tLate ? [`- Test timing: ${tRight} right after trigger · ${tOthers} after others traded in same block · ${tLate} late`] : []),
     ...(topFails.length ? ['- Why tests would fail (exact chain reason):', ...topFails.map(([m, n]) => `  - ${n}x \`${m.replace(/`/g, "'")}\``)] : []),
     `- Dry run, would have earned (if we won every race): ${lastPnl ? lastPnl.replace(/^\[pnl\] would-have-earned /, '') : 'first figure after the next hourly report'}`,
