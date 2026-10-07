@@ -614,8 +614,8 @@ contract RobinhoodForkTest is ForkBase {
     // deployed contract, the problem is the simulation setup, not the trade.
     function test_fork_robinhood_simSetup_ramses() public {
         if (!_fork("ROBINHOOD_RPC_URL")) return;
-        address SIM = 0x00000000000000000000000000000000A7B51e00;
-        address CALLER = 0x00000000000000000000000000000000000b0751;
+        address SIM = address(uint160(0xa7b51e00));
+        address CALLER = address(uint160(0x0b0751));
         vm.etch(SIM, address(exec).code);
         vm.store(SIM, bytes32(uint256(0)), bytes32(uint256(uint160(CALLER))));
         address uni = _uniV3();
