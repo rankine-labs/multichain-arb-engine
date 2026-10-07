@@ -514,6 +514,47 @@ contract RobinhoodForkTest is ForkBase {
         console.log("  tiny pool USDG held (raw):", abi.decode(bal2, (uint256)));
     }
 
+    // Flash loan from the Uniswap V3 0.01% pool (the lender the bot picked),
+    // then the failing route, starting with WETH or USDG, at a bot-like size.
+    // A float covers a losing round trip so a clean run stops at the profit
+    // check. Any other revert prints its raw data.
+    function _flashRoute(string memory label, address start, address mid, uint256 amount, address h1, uint8 k1, address h2, uint8 k2, bool native1, bool native2) internal {
+        address lender = _findV3(UNI_V3_FACTORY, WETH, USDG, _fees(100, 100, 100, 100));
+        if (lender == address(0) || h1 == address(0) || h2 == address(0)) { console.log(label, "skipped: pool missing"); vm.skip(true); return; }
+        exec.setFlashPool(lender, true);
+        exec.setV4(V4_POOL_MANAGER, WETH);
+        if (start == WETH) _fundWrapped(WETH, amount);
+        else deal(start, address(exec), amount);
+        ArbExecutor.Hop[] memory hops = new ArbExecutor.Hop[](2);
+        hops[0] = k1 == 3 ? _v4Hop(start, mid, 500, 10, native1) : _hop(k1, h1, start, mid, 0);
+        hops[1] = k2 == 3 ? _v4Hop(mid, start, 500, 10, native2) : _hop(k2, h2, mid, start, 0);
+        ArbExecutor.Trade memory t =
+            ArbExecutor.Trade({token: start, amountIn: amount, minProfit: 1, maxBlock: _l2Block(), hops: hops});
+        _runV3FlashExpectingOnlyProfitGuard(label, t, lender);
+    }
+
+    function test_fork_robinhood_flash_uniV3_to_ramsesV3_WETH() public {
+        if (!_fork("ROBINHOOD_RPC_URL")) return;
+        address uni = _findV3Excluding(UNI_V3_FACTORY, WETH, USDG, _fees(500, 3000, 10000, 500), address(0));
+        _flashRoute("robinhood flash(uni 0.01%) uniV3->ramsesV3 start WETH 0.3", WETH, USDG, 0.3 ether, uni, 2, _ramsesV3ByTick(), 2, false, false);
+    }
+
+    function test_fork_robinhood_flash_uniV3_to_ramsesV3_USDG() public {
+        if (!_fork("ROBINHOOD_RPC_URL")) return;
+        address uni = _findV3Excluding(UNI_V3_FACTORY, WETH, USDG, _fees(500, 3000, 10000, 500), address(0));
+        _flashRoute("robinhood flash(uni 0.01%) uniV3->ramsesV3 start USDG 1000", USDG, WETH, 1000e6, uni, 2, _ramsesV3ByTick(), 2, false, false);
+    }
+
+    function test_fork_robinhood_flash_v4_to_ramsesV3_WETH() public {
+        if (!_fork("ROBINHOOD_RPC_URL")) return;
+        _flashRoute("robinhood flash(uni 0.01%) V4(native)->ramsesV3 start WETH 0.3", WETH, USDG, 0.3 ether, V4_POOL_MANAGER, 3, _ramsesV3ByTick(), 2, true, false);
+    }
+
+    function test_fork_robinhood_flash_v4_to_ramsesV3_USDG() public {
+        if (!_fork("ROBINHOOD_RPC_URL")) return;
+        _flashRoute("robinhood flash(uni 0.01%) V4(native)->ramsesV3 start USDG 1000", USDG, WETH, 1000e6, V4_POOL_MANAGER, 3, _ramsesV3ByTick(), 2, true, false);
+    }
+
     function test_fork_robinhood_ramsesV2_to_pancakeV3() public {
         if (!_fork("ROBINHOOD_RPC_URL")) return;
         address v3 = _findV3(PANCAKE_V3_FACTORY, WETH, USDG, _fees(2500, 500, 10000, 100));
