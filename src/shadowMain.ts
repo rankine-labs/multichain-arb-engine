@@ -82,6 +82,7 @@ import { buildExecuteCall, executionRequested, executorConfig, pickV3Lender } fr
 import { FailTally } from './core/failReasons';
 import { LenderBalances } from './core/lenderBalances';
 import { RouteScores, WinSizes, WIN_BARS } from './core/routeScore';
+import { RivalWatch } from './core/rivalWatch';
 import { makeRpc, simulateRoundTrip, simRpcUrl, Rpc, makeFallbackRpc, loadBalanceSlots, wssToHttps, replayRpc, ReplayCall } from './execution/simulator';
 import { FastSender, SafetyGate, safetyConfigFromEnv } from './execution/fastSender';
 import { checkLiveReady } from './execution/liveReadiness';
@@ -93,7 +94,7 @@ import { loadStartPairs, saveStartPairs } from './core/seedPairs';
 import { DryRunPnl } from './core/dryRunPnl';
 import { FailoverJsonRpcProvider } from './core/failoverRpc';
 import { makeCaller } from './core/universeScan';
-import { loadNodeUsage, saveNodeUsage, nodeUsageToday } from './core/nodeBudget';
+import { loadNodeUsage, saveNodeUsage, nodeUsageToday, NodeBudget, budgetForUrl, callsInBody } from './core/nodeBudget';
 import { endpointLabel } from './core/endpointLabel';
 import { ROBINHOOD_SEED_PAIRS } from './config/robinhoodSeedPairs';
 
@@ -165,6 +166,22 @@ const priceOracle = new PriceOracle(cache, (chain, token) => {
       const robinhoodHeavyProvider = rhHeavyUrl
             ? new FailoverJsonRpcProvider(rhHeavyUrl, null, 4663, { logTag: 'rpc:heavy', fastTimeoutMs: 10_000, slowMs: 2_000 })
             : robinhoodReadProvider;
+      // The chain-wide scan on the FREE node, done gently (Oct 7: Alchemy is
+      // out of credit until Nov 1, so the scan had stopped). Its own slow lane:
+      // at most ROBINHOOD_SCAN_RPS requests a second (default 2), on top of the
+      // free node's shared allowance, so price reads always come first.
+      // ROBINHOOD_SCAN_NODE=alchemy puts it back on the paid node.
+      const SCAN_RPS = Number(process.env.ROBINHOOD_SCAN_RPS ?? 2);
+      const scanLane = new NodeBudget('scan', SCAN_RPS, Infinity, Date.now, 10 * 60_000);
+      const robinhoodScanProvider = (process.env.ROBINHOOD_SCAN_NODE ?? 'free') === 'alchemy' && rhHeavyUrl
+            ? robinhoodHeavyProvider
+            : (() => {
+                  const req = new ethers.FetchRequest(rhFastUrl);
+                  req.timeout = 30_000;
+                  const shared = budgetForUrl(rhFastUrl);
+                  req.preflightFunc = async (r) => { const n = callsInBody(r.body); await scanLane.take(n); await shared?.take(n); return r; };
+                  return new ethers.JsonRpcProvider(req, 4663, { staticNetwork: true, batchMaxCount: 1 });
+            })();
 
       // Decoder gets the pool cache so it can decode Monad Swap logs (a log
       // only names the pool; the cache knows its tokens).
@@ -664,7 +681,9 @@ const robinhoodWatcher = new PairWatcher('robinhood', robinhoodReadProvider, ROB
       // of draining the paid node's monthly allowance.
       // rediscoverMs 60 min (was 10): a pair's pool list rarely changes, and
       // re-asking every 10 min for 60 pairs was a steady drain.
-      { maxPairs: 60, rediscoverMs: 60 * 60_000, refreshMs: 5_000, discoveryProvider: robinhoodReadProvider,
+      // 150 pairs (was 60): price reads are bundled (400 per request), so
+      // ~700 pools cost ~4 requests per refresh. ROBINHOOD_MAX_PAIRS overrides.
+      { maxPairs: Number(process.env.ROBINHOOD_MAX_PAIRS ?? 150), rediscoverMs: 60 * 60_000, refreshMs: 5_000, discoveryProvider: robinhoodReadProvider,
         onRefreshed: () => requestGapScan() });
 // Restore the last watch list (saved every 10 min and at shutdown) so a
 // restart doesn't re-discover every pair in one burst.
@@ -757,6 +776,29 @@ const nearMissAllowed = (pairKey: string): boolean => {
 
 // Live competitor timing (see core/competitorTracker.ts).
 const rivals = new CompetitorTracker(robinhoodReadProvider, Date.now, ROBINHOOD_V4.POOL_MANAGER);
+// Rival watch (core/rivalWatch.ts): follows every trade of the rival bots the
+// tracker has caught, to see what they win and where. Bots saved to disk.
+const RIVAL_BOTS_FILE = 'data/rival-bots.json';
+const rivalWatch = new RivalWatch(
+      (m, p) => robinhoodReadProvider.send(m, p as any[]),
+      (token, raw) => {
+            const px = priceOracle.getUsdPrice('robinhood', token);
+            const dec = TOKEN_DECIMALS.robinhood?.[token.toLowerCase()];
+            return px === null || dec === undefined ? null : (Number(raw) / 10 ** dec) * px;
+      },
+      (token) => symbolOf('robinhood', token),
+      (pool) => !!cache.get('robinhood', pool),
+);
+{ const n = rivalWatch.load(RIVAL_BOTS_FILE); if (n) console.log(`[rivalwatch] following ${n} known rival bots`); }
+// New rival bots caught by the tracker join the watch list (checked every minute).
+let rivalResultsSeen = 0;
+setInterval(() => {
+      for (; rivalResultsSeen < rivals.results.length; rivalResultsSeen++) {
+            const r = rivals.results[rivalResultsSeen];
+            if (r.found && r.bot) rivalWatch.addBot(r.bot);
+      }
+      rivalWatch.save(RIVAL_BOTS_FILE);
+}, 60_000);
 
 // LIVE results (only used once live sending is switched on): receipt, profit
 // from the contract's Executed event, gas cost; losses feed the daily cap.
@@ -972,7 +1014,7 @@ if (chainOn('avalanche')) chainManager.register(new AvalancheAdapter());
 chainManager.onEvent(async (event: RawChainEvent) => {
 const t0 = Date.now();
 // Timestamp every Robinhood feed tx: lets the competitor tracker time rivals.
-if (event.chain === 'robinhood') rivals.noteFeedTx((event.raw as any)?.hash, event.receivedAtMs);
+if (event.chain === 'robinhood') { rivals.noteFeedTx((event.raw as any)?.hash, event.receivedAtMs); rivalWatch.noteTx((event.raw as any)?.to, (event.raw as any)?.hash); }
 
 const swap = await decoder.decode(event);
 if (!swap) return;
@@ -1469,7 +1511,9 @@ await chainManager.startAll();
       // notice. Runs in the background (never delays startup), then every 6h.
       //   ROBINHOOD_SCAN_TOP      how many pairs to pin (default 20, 0 = off)
       //   ROBINHOOD_SCAN_MIN_USD  minimum money per pool (default 2000)
-      const SCAN_TOP = Number(process.env.ROBINHOOD_SCAN_TOP ?? 20);
+      // 80 pinned (was 20): every pair on 2+ pools with real money, up to 80,
+      // is always watched; the rest of the 150 follow live traffic.
+      const SCAN_TOP = Number(process.env.ROBINHOOD_SCAN_TOP ?? 80);
       const SCAN_MIN_USD = Number(process.env.ROBINHOOD_SCAN_MIN_USD ?? 2_000);
       // Pools found so far are saved here, so a restart (every auto-deploy)
       // only reads pools created since the last scan. Safe to delete: the
@@ -1519,11 +1563,13 @@ await chainManager.startAll();
                   // node refuses (e.g. its plan limits log queries), try once
                   // on the fast node before waiting 15 min. Progress is saved
                   // per factory, so a second attempt repeats nothing.
-                  const scanOpts = { usdToken: ROBINHOOD_TOKENS.USDG, wrappedNative: ROBINHOOD_TOKENS.WETH, minPoolUsd: SCAN_MIN_USD };
-                  const res = await scanUniverse(robinhoodHeavyProvider, ROBINHOOD_SCAN_FACTORIES, scanOpts, scanState);
-                  // No fallback to the free node: the scan is thousands of reads and
-                  // would flood it (see robinhoodHeavyProvider).
-                  if (res.errors.length && !res.candidates.length) throw new Error(`paid node scan failed: ${res.errors.join('; ').slice(0, 150)}`);
+                  const scanOpts = { usdToken: ROBINHOOD_TOKENS.USDG, wrappedNative: ROBINHOOD_TOKENS.WETH, minPoolUsd: SCAN_MIN_USD,
+                        maxLogRange: Number(process.env.ROBINHOOD_SCAN_LOG_RANGE ?? 500_000), log: (m: string) => console.log(m) };
+                  // Gentle lane on the free node (see robinhoodScanProvider).
+                  const res = await scanUniverse(robinhoodScanProvider, ROBINHOOD_SCAN_FACTORIES, scanOpts, scanState);
+                  // Progress per factory is saved even if some failed.
+                  if (res.errors.length) saveScanState(scanState);
+                  if (res.errors.length && !res.candidates.length) throw new Error(`scan failed: ${res.errors.join('; ').slice(0, 150)}`);
                   saveScanState(scanState);
                   const top = res.candidates.slice(0, SCAN_TOP);
                   // Only replace the saved start list with a real result.
@@ -1545,7 +1591,8 @@ await chainManager.startAll();
                   // (each retry would just fail again). Other errors: 15 min.
                   const msg = String((err as Error).message);
                   const outOfCredit = /429|allowance|rate limit|exceeded|too many/i.test(msg);
-                  const retryMin = outOfCredit ? 360 : 15;
+                  // Free node "slow down": try again in 30 min (progress is saved).
+                  const retryMin = outOfCredit ? 30 : 15;
                   console.warn(`[scan] robinhood scan failed, retrying in ${retryMin} min:`, msg.slice(0, 200));
                   setTimeout(() => { void runRobinhoodScan(); }, retryMin * 60_000);
             } finally {
@@ -1820,6 +1867,7 @@ for (let i = 0; i < resolved.length; i++) {
                               },
                               reactionMs: { typical: stats.medianReactionMs, slowest5pct: stats.p95ReactionMs },
                               otherBots: { timed: rv.found, theirMs: rv.theirMedianMs, oursMs: rv.ourMedianMs, weBeat: rv.beatCount },
+                              rivalWins: { ...rivalWatch.takeHour(), botsKnown: rivalWatch.botCount() },
                               nodeUsage: nodeUsageToday(),
                               funnel: {
                                     tradesRead: funnel.tradesRead, noPool: funnel.noPool, tooSmall: funnel.tooSmall, noPartner: funnel.noPartner,

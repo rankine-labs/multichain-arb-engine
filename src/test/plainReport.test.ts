@@ -46,7 +46,7 @@ const usage = formatPlainHourly({ ...base, checksAvailable: true, checks: { done
   ] });
 assert(usage.includes('Robinhood (free): 52,000 (no daily cap)'), 'free node usage shown without a cap');
 assert(usage.includes('QuickNode (checks): 11,500 of 14,000 ⚠️') && usage.includes('at 82% of today'), '80%+ shows ⚠️ and a warning');
-assert(usage.includes('Alchemy (scan): 30,000 of 30,000 ❌') && usage.includes('paused until midnight UTC'), 'used up shows ❌ and says the job is paused');
+assert(usage.includes('Alchemy (spare, out until Nov 1): 30,000 of 30,000 ❌') && usage.includes('paused until midnight UTC'), 'used up shows ❌ and says the job is paused');
 
 // Funnel: where trades dropped out, in plain words.
 const fun = formatPlainHourly({ ...base, funnel: {

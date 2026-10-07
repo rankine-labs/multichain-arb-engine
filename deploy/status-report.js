@@ -162,6 +162,14 @@ async function main() {
   const topFails = [...failCounts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 10);
   const fireReady = outL.map((l) => /\[fire\] robinhood .* ready (\d+)ms/.exec(l)).filter(Boolean).map((m) => Number(m[1])).sort((a, b) => a - b);
   const rivalLines = outL.filter((l) => /\[rival\] arb found/.test(l));
+  // Rival watch: what the other bots won (bot, pair, ~$, pools watched by us?).
+  const rw = outL.map((l) => /\[rivalwatch\] bot \S+ (\S+) ~\$(-?[0-9.]+) \| \d+ pools, (all watched|NOT)/.exec(l)).filter(Boolean);
+  const rwWins = rw.filter((m) => Number(m[2]) > 0);
+  const rwPairs = new Map();
+  for (const m of rwWins) rwPairs.set(m[1], (rwPairs.get(m[1]) || 0) + Number(m[2]));
+  const rwTop = [...rwPairs.entries()].sort((a, b) => b[1] - a[1]).slice(0, 6);
+  const rwOurs = rw.filter((m) => m[3] === 'all watched').length;
+  const scanLine = lastMatch(outL, /^\[scan\] /);
   const rivalMs = rivalLines.map((l) => /theirs (\d+)ms/.exec(l)).filter(Boolean).map((m) => Number(m[1])).sort((a, b) => a - b);
   const oursMs = rivalLines.map((l) => /ours (\d+)ms/.exec(l)).filter(Boolean).map((m) => Number(m[1])).sort((a, b) => a - b);
   const med = (xs) => (xs.length ? xs[Math.floor(xs.length / 2)] : null);
@@ -213,6 +221,9 @@ async function main() {
     `- Fire-ready (trigger seen -> signed trade): ${fireReady.length ? `${med(fireReady)} ms median over ${fireReady.length}` : 'no qualifying trades this window'}`,
     `- Rivals: ${rivalLines.length ? `${rivalLines.length} rival arbs timed · theirs ${med(rivalMs) ?? '?'} ms median vs ours ${med(oursMs) ?? '?'} ms` : 'none timed this window'}`,
     `- Prices read from: ${readsOn} · ${rpcSwitches} node switch(es) this window`,
+    `- Rival bots' trades read: ${rw.length} · made money: ${rwWins.length} · about $${rwWins.reduce((x, m) => x + Number(m[2]), 0).toFixed(2)} · on pools we watch: ${rwOurs}`,
+    ...(rwTop.length ? [`- Rival profit by pair: ${rwTop.map(([p, v]) => `${p} $${v.toFixed(2)}`).join(' · ')}`] : []),
+    ...(scanLine ? [`- Latest scan line: ${scanLine.slice(0, 200)}`] : []),
     `- RPC round trip from the server (public node, best of 3): ${rpcRtt ?? '?'} ms`,
     `- Real-chain test runs: ${simProfit} profitable · ${simLoss} losing · ${simFail} would fail`,
     ...(profitUsd.length ? [`- Profitable checks: total $${profitUsd.reduce((x, y) => x + y, 0).toFixed(2)} · middle $${profitUsd[Math.floor(profitUsd.length / 2)].toFixed(2)} · biggest $${profitUsd[profitUsd.length - 1].toFixed(2)} (before gas)`,

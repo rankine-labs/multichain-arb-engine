@@ -62,6 +62,10 @@ export interface ScanOptions {
   wrappedNative: string;     // WETH; priced from its deepest pool vs usdToken
   minPoolUsd?: number;       // default 2,000
   log?: (msg: string) => void;
+  // Largest block range asked for in one log query (default: whole range).
+  // On the free node, a ~30 ms-block chain makes a day ~2.9M blocks, so we
+  // start with sensible slices instead of one huge ask that gets split anyway.
+  maxLogRange?: number;
 }
 
 const MULTICALL3 = '0xcA11bde05977b3631167028862bE2a173976CA11';
@@ -202,18 +206,35 @@ async function getLogsRaw(provider: ethers.JsonRpcProvider, address: string | st
 
 // Fetches logs for [from, to]; if the node refuses or times out, splits the
 // range in half and tries each half (down to MIN_RANGE blocks).
+// A "slow down" answer is NOT a sign the range is too big: wait and ask the
+// same range again (splitting on rate limits multiplied requests into a burst).
+const isSlowDown = (err: unknown) => /429|too many|rate limit|exceeded|allowance/i.test(String((err as any)?.shortMessage ?? '') + ' ' + String((err as any)?.message ?? err));
+
 export async function getLogsAdaptive(
   provider: ethers.JsonRpcProvider, address: string | string[], from: number, to: number,
-  onLogs: (logs: RawLog[]) => void, timeoutMs = 30_000,
+  onLogs: (logs: RawLog[]) => void, timeoutMs = 30_000, maxRange = Infinity,
 ): Promise<void> {
   const MIN_RANGE = 8; // keep splitting: busy stretches can overflow even a few hundred blocks
-  // Explicit stack instead of recursion: safe on any range size.
-  const stack: Array<[number, number]> = [[from, to]];
+  // Explicit stack instead of recursion: safe on any range size. Big ranges
+  // start as maxRange-sized slices (pushed in reverse so the oldest runs first).
+  const stack: Array<[number, number]> = [];
+  const step = Number.isFinite(maxRange) && maxRange > 0 ? Math.floor(maxRange) : to - from + 1;
+  const slices: Array<[number, number]> = [];
+  for (let f = from; f <= to; f += step) slices.push([f, Math.min(to, f + step - 1)]);
+  for (let i = slices.length - 1; i >= 0; i--) stack.push(slices[i]);
+  let slowDowns = 0;
   while (stack.length) {
     const [f, t] = stack.pop()!;
     try {
       onLogs(await getLogsRaw(provider, address, f, t, timeoutMs));
+      slowDowns = 0;
     } catch (err) {
+      if (isSlowDown(err)) {
+        if (++slowDowns > 6) throw err;                 // node keeps refusing: give up, scan retries later
+        await sleep(2_000 * slowDowns);
+        stack.push([f, t]);                              // same range again
+        continue;
+      }
       if (t - f < MIN_RANGE) {
         await sleep(500);
         onLogs(await getLogsRaw(provider, address, f, t, timeoutMs)); // last try; throws if still failing
@@ -225,7 +246,7 @@ export async function getLogsAdaptive(
   }
 }
 
-export async function listPoolsFromLogs(provider: ethers.JsonRpcProvider, f: ScanFactory, fromBlock: number, toBlock: number): Promise<ScannedPool[]> {
+export async function listPoolsFromLogs(provider: ethers.JsonRpcProvider, f: ScanFactory, fromBlock: number, toBlock: number, maxRange = Infinity): Promise<ScannedPool[]> {
   const pools: ScannedPool[] = [];
   const seen = new Set<string>();
   await getLogsAdaptive(provider, f.factory, fromBlock, toBlock, (logs) => {
@@ -235,7 +256,7 @@ export async function listPoolsFromLogs(provider: ethers.JsonRpcProvider, f: Sca
       seen.add(d.pool);
       pools.push({ dex: f.dex, kind: f.kind, ...d });
     }
-  });
+  }, 30_000, maxRange);
   return pools;
 }
 
@@ -394,7 +415,7 @@ export async function scanUniverse(
     const from = (state.lastBlock[fk] ?? -1) + 1;
     if (from > latest) continue;
     try {
-      const found = await listPoolsFromLogs(provider, f, from, latest);
+      const found = await listPoolsFromLogs(provider, f, from, latest, opts.maxLogRange);
       addPoolsToState(state, f, found);
       state.lastBlock[fk] = latest;
       log(`[scan] ${f.dex}: +${found.length} pools (blocks ${from}-${latest})`);

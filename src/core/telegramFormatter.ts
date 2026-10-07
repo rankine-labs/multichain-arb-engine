@@ -294,6 +294,8 @@ export interface PlainHourlyInput {
   earned: { todayChecked: number; todayCheckedCount: number; todayUnchecked: number; todayUncheckedCount: number; weekChecked: number };
   reactionMs: { typical: number | null; slowest5pct: number | null };
   otherBots?: { timed: number; theirMs: number | null; oursMs: number | null; weBeat: number };
+  // What the rival bots won this hour (core/rivalWatch.ts).
+  rivalWins?: { trades: number; wins: number; usd: number; byPair: [string, number, number][]; onOurPools: number; bots: number; botsKnown: number };
   topDifferences: { pair: string; pct: number; buyAt: string; sellAt: string }[];
   nodeUsage?: { name: string; used: number; daily: number }[]; // today's requests per node vs allowance
   // Where trades dropped out this hour, step by step (see shadowMain funnel).
@@ -304,7 +306,7 @@ export interface PlainHourlyInput {
   };
 }
 
-const NODE_NAMES: Record<string, string> = { public: 'Robinhood (free)', nodeflare: 'Nodeflare (backup)', quicknode: 'QuickNode (checks)', alchemy: 'Alchemy (scan)' };
+const NODE_NAMES: Record<string, string> = { public: 'Robinhood (free)', nodeflare: 'Nodeflare (backup)', quicknode: 'QuickNode (checks)', alchemy: 'Alchemy (spare, out until Nov 1)' };
 
 // "uniswap-v3 1%" -> "Uniswap V3 (1% fee)"; "uniswap-v4 0.3% ETH" -> "Uniswap V4 (0.3% fee, ETH)".
 const DEX_NAMES: Record<string, string> = {
@@ -412,6 +414,19 @@ export function formatPlainHourly(r: PlainHourlyInput): string {
     L.push(`Other bots timed: ${o.timed}${o.theirMs !== null && o.oursMs !== null ? `. Them ${secs(o.theirMs)}, us ${secs(o.oursMs)}` : ''}${o.weBeat ? `, we'd have been first ${o.weBeat}x` : ''}`);
   }
   L.push('');
+
+  // What the other bots won: where the real money is on this chain.
+  const rw = r.rivalWins;
+  if (rw && (rw.trades > 0 || rw.botsKnown > 0)) {
+    L.push(`<b>What other bots won this hour</b> (following ${rw.botsKnown} known bot${rw.botsKnown === 1 ? '' : 's'})`);
+    if (!rw.trades) L.push('No trades by them this hour.');
+    else {
+      L.push(`${rw.trades} trade${rw.trades === 1 ? '' : 's'} by ${rw.bots} bot${rw.bots === 1 ? '' : 's'}, ${rw.wins} made money, about ${money(rw.usd)} total (before their gas)`);
+      for (const [pair, n, usd] of rw.byPair.slice(0, 5)) L.push(`  • ${esc(pair)}: ${n}x, about ${money(usd)}`);
+      L.push(`On trading spots we watch: ${rw.onOurPools} of ${rw.trades}`);
+    }
+    L.push('');
+  }
 
   if (r.nodeUsage?.length) {
     L.push('<b>Node usage today</b> (requests vs daily allowance)');
