@@ -35,3 +35,26 @@ a crowded chain. Effort: about 2 to 3 hours.
 - **Pro-grade parts, one at a time, only where data says they pay:** own node
   next to the chain, local in-memory simulation, all-pool route finder,
   gas-optimised contract, priority bidding, faster language for the hot path.
+
+## Other strategies to consider (notes only, Oct 7)
+
+Ranked by how much they might be worth to us. None built.
+
+1. **Multi-pool loops**: already planned as Stage 1.
+2. **Exchange vs chain (CEX-DEX)**: compare on-chain prices with a big
+   exchange (Coinbase, Kraken...). Buy where cheap, sell where dear. Usually
+   the biggest MEV money on chains like this. Needs an exchange account and
+   money on both sides; the two legs aren't one atomic trade, so there's price
+   risk between them.
+3. **Stock tokens at the US market open (9:30 Toronto)**: real stock prices
+   jump at the open, on-chain pools lag. Predictable timing, unique to
+   Robinhood Chain. Measure the lag first with a live stock price feed.
+4. **Liquidations**: only if lending apps exist on the chain (unchecked).
+5. **Holding stock (non-atomic arb)**: trade one leg now, rebalance later.
+   More capital and price risk.
+6. **Uniswap V4 special pools (hooks, dynamic fees)**: unusual gaps, more
+   code per pool type.
+
+Not for us: sandwich / front-run (hurts traders, impossible here anyway),
+sniping new launches (mostly scams), just-in-time liquidity (needs to see
+trades before they happen).
