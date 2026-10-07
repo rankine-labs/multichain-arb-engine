@@ -296,6 +296,10 @@ contract MonadForkTest is ForkBase {
 // ---------------------------------------------------------------------------
 // ROBINHOOD CHAIN: Ramses V2 (Solidly) <-> Ramses V3 / PancakeSwap V3
 // ---------------------------------------------------------------------------
+interface IV3PoolStep {
+    function swap(address recipient, bool zeroForOne, int256 amountSpecified, uint160 sqrtPriceLimitX96, bytes calldata data) external returns (int256, int256);
+}
+
 contract RobinhoodForkTest is ForkBase {
     address constant WETH = 0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73;
     address constant USDG = 0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168;
@@ -554,6 +558,65 @@ contract RobinhoodForkTest is ForkBase {
         if (!_fork("ROBINHOOD_RPC_URL")) return;
         _flashRoute("robinhood flash(uni 0.01%) V4(native)->ramsesV3 start USDG 1000", USDG, WETH, 1000e6, V4_POOL_MANAGER, 3, _ramsesV3ByTick(), 2, true, false);
     }
+
+    // The exact live failure (Oct 7): flash-borrow USDG from the Uniswap 0.01%
+    // pool, USDG -> WETH on Uniswap 0.05%, WETH -> USDG on Ramses 0x0287.
+    // Logs the contract's result and, if it fails, the raw revert.
+    function test_fork_robinhood_flashUSDG_ramses0287() public {
+        if (!_fork("ROBINHOOD_RPC_URL")) return;
+        address lender = 0x52e65B17fB6E5BA00Ed806f37Afcd2DaA50271Ca;
+        address uni = 0x69BfaF19C9f377BB306a89aEd9F6B07e2c1a8d9a;
+        address ram = 0x028779cA5D91C7F016ACB98E0AfA5102F4e436e4;
+        exec.setFlashPool(lender, true);
+        deal(USDG, address(exec), 300e6); // float, like the bot's check
+        ArbExecutor.Hop[] memory hops = new ArbExecutor.Hop[](2);
+        hops[0] = _hop(2, uni, USDG, WETH, 0);
+        hops[1] = _hop(2, ram, WETH, USDG, 0);
+        ArbExecutor.Trade memory t =
+            ArbExecutor.Trade({token: USDG, amountIn: 300e6, minProfit: 1, maxBlock: _l2Block(), hops: hops});
+        (bool ok, bytes memory data) = address(exec).call(abi.encodeWithSelector(ArbExecutor.executeWithV3Flash.selector, t, lender));
+        bool guard = data.length >= 4 && bytes4(data) == ArbExecutor.InsufficientProfit.selector;
+        console.log("  -> flashUSDG uni0.05->ramses0287:", ok || guard ? "OK reached profit check" : "REVERTED");
+        if (!ok && !guard) console.logBytes(data);
+        // Same trade, own money only (no flash): does Ramses itself work here?
+        ArbExecutor.Trade memory t2 =
+            ArbExecutor.Trade({token: USDG, amountIn: 300e6, minProfit: 1, maxBlock: _l2Block(), hops: hops});
+        (bool ok2, bytes memory d2) = address(exec).call(abi.encodeWithSelector(ArbExecutor.execute.selector, t2, address(0)));
+        bool g2 = d2.length >= 4 && bytes4(d2) == ArbExecutor.InsufficientProfit.selector;
+        console.log("  -> ownUSDG uni0.05->ramses0287:", ok2 || g2 ? "OK reached profit check" : "REVERTED");
+        _stepByStep(uni, ram);
+    }
+
+    // Step by step with this test as the trader, to see amounts.
+    function _stepByStep(address uni, address ram) internal {
+        uint256 snap = vm.snapshotState();
+        deal(USDG, address(this), 300e6);
+        stepPool = uni; stepToken = USDG;
+        (uint256 paid1, uint256 wethGot) = _stepSwap(uni, USDG, WETH, 300e6);
+        console.log("  -> step1 USDG->WETH on uni: USDG paid / WETH got", paid1, wethGot);
+        stepPool = ram; stepToken = WETH;
+        (uint256 paid2, uint256 usdgGot) = _stepSwap(ram, WETH, USDG, wethGot);
+        console.log("  -> step2 WETH->USDG on ramses: WETH paid / USDG got", paid2, usdgGot);
+        vm.revertToState(snap);
+    }
+
+    function _stepSwap(address pool, address tIn, address tOut, uint256 amt) internal returns (uint256 paid, uint256 got) {
+        bool z = tIn < tOut;
+        uint160 lim = z ? uint160(4295128740) : uint160(1461446703485210103287273052203988822378723970341);
+        (int256 d0, int256 d1) = IV3PoolStep(pool).swap(address(this), z, int256(amt), lim, "");
+        paid = uint256(z ? d0 : d1);
+        got = uint256(-(z ? d1 : d0));
+    }
+
+    address internal stepPool;
+    address internal stepToken;
+    function _payStep(int256 a0, int256 a1) internal {
+        require(msg.sender == stepPool, "step: wrong pool");
+        uint256 owed = uint256(a0 > 0 ? a0 : a1);
+        IWETH(stepToken).transfer(msg.sender, owed);
+    }
+    function uniswapV3SwapCallback(int256 a0, int256 a1, bytes calldata) external { _payStep(a0, a1); }
+    function ramsesV2SwapCallback(int256 a0, int256 a1, bytes calldata) external { _payStep(a0, a1); }
 
     function test_fork_robinhood_ramsesV2_to_pancakeV3() public {
         if (!_fork("ROBINHOOD_RPC_URL")) return;

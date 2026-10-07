@@ -56,3 +56,9 @@ assert(!none.includes('Why:'), 'no reasons section when nothing failed');
 // --- test timing line ------------------------------------------------------
 const timed = formatPlainHourly({ ...base, checks: { done: 5, makeMoney: 1, loseMoney: 4, wouldFail: 0, nodeBusy: 0, timing: { rightAfter: 3, othersInBlock: 1, late: 1 } } });
 assert(timed.includes('Test timing: 3 right after the trade we followed, 1 at the end of its block, 1 tested late'), 'Telegram shows when checks were tested');
+
+// --- wins by size + benched pairs ------------------------------------------
+const sized = formatPlainHourly({ ...base, checks: { done: 4, makeMoney: 2, loseMoney: 2, wouldFail: 0, nodeBusy: 0,
+  winSizes: { bars: [1, 2, 5, 10, 20], hour: [1, 1, 0, 0, 0], today: [3, 2, 1, 1, 1], todayUsd: [36, 35, 28, 28, 28] }, benchedRoutes: 4 } });
+assert(sized.includes('$1+: 3 ($36) · $2+: 2 ($35) · $5+: 1 ($28)'), 'Telegram shows real wins by size');
+assert(sized.includes('Skipping 4 pair(s) of trading spots that never pay out'), 'Telegram shows benched pairs');
