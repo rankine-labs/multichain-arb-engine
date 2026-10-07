@@ -54,6 +54,26 @@ async function getPool(factory: string, fee: number): Promise<string | null> {
     console.log(`${label}: ${r.status}${'reason' in r ? ` (${r.reason})` : ''}`);
     await sleep(1500);
   }
+  // Flash-loan versions (the ones that still fail in the bot): borrow from
+  // the Uniswap 0.01% pool, start with WETH or USDG.
+  {
+    const lender = await getPool(UNI_FACTORY, 100);
+    console.log(`flash lender (uni 0.01%): ${lender}`);
+    const usdgIn = 300n * 10n ** 6n; // $300 of USDG (6 decimals)
+    const cases: [string, string, bigint, any[]][] = [
+      ['flash WETH uni->ramses', WETH, amountIn, [hop(uni!, WETH, USDG), hop(RAMSES, USDG, WETH)]],
+      ['flash WETH ramses->uni', WETH, amountIn, [hop(RAMSES, WETH, USDG), hop(uni!, USDG, WETH)]],
+      ['flash USDG uni->ramses', USDG, usdgIn, [hop(uni!, USDG, WETH), hop(RAMSES, WETH, USDG)]],
+      ['flash USDG ramses->uni', USDG, usdgIn, [hop(RAMSES, USDG, WETH), hop(uni!, WETH, USDG)]],
+      ['flash USDG uni->cake (control)', USDG, usdgIn, [hop(uni!, USDG, WETH), hop(cake!, WETH, USDG)]],
+      ['own USDG uni->ramses', USDG, usdgIn, [hop(uni!, USDG, WETH), hop(RAMSES, WETH, USDG)]],
+    ];
+    for (const [label, token, amt, hops] of cases) {
+      const r = await simulateRoundTrip(rpc, 'robinhood', { token, amountIn: amt, hops }, label.startsWith('flash') ? { v3Lender: lender! } : {});
+      console.log(`${label}: ${r.status}${'reason' in r ? ` (${r.reason})` : ''}${r.status === 'profit' ? ` ${String((r as any).profit)}` : ''}`);
+      await sleep(1200);
+    }
+  }
   // Isolate the replay problem: our trade ALONE inside eth_simulateV1 on
   // latest, with the same pretend-state, printing the node's full answer.
   {
