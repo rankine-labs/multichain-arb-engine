@@ -4,7 +4,7 @@
 // WETH/USDG), next to a control route without Ramses, and asks the node to
 // trace where the failing one reverts. Read-only, no keys.
 // ============================================================================
-import { makeRpc, simulateRoundTrip, SIM_EXECUTOR_ADDRESS, SIM_CALLER } from '../src/execution/simulator';
+import { makeRpc, simulateRoundTrip, SIM_EXECUTOR_ADDRESS, SIM_CALLER, replayRpc, ReplayCall } from '../src/execution/simulator';
 import { KIND_V3, encodeExecuteRaw } from '../src/execution/executorCalldata';
 import { ARB_EXECUTOR_RUNTIME_CODE, EXECUTOR_STORAGE_SLOT } from '../src/execution/arbExecutorBytecode';
 
@@ -19,6 +19,15 @@ const base = makeRpc(URL_, 15_000);
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 // Retry on public-node rate limits.
 const rpc = async (m: string, p: unknown[]) => { for (let i = 0; i < 5; i++) { const r = await base(m, p); if (!r.error || !/429|too many|rate/i.test(JSON.stringify(r.error))) return r; await sleep(2000 * (i + 1)); } return base(m, p); };
+// The replay as it was before the fix (no block overrides), for comparison.
+const replayRpcNoOverrides = (b: typeof base, parent: string, prefix: ReplayCall[]) => async (m: string, p: unknown[]) => {
+  const q = p as any[];
+  if (m !== 'eth_call' || q[0]?.to?.toLowerCase() !== SIM_EXECUTOR_ADDRESS) return rpc(m, p);
+  const r = await rpc('eth_simulateV1', [{ blockStateCalls: [{ stateOverrides: q[2] ?? {}, calls: [...prefix, q[0]] }], validation: false }, parent]);
+  if (r.error) return { error: { message: 'replay unavailable' } };
+  const c = r.result?.[0]?.calls ?? []; const o = c[c.length - 1];
+  return o?.status === '0x1' ? { result: o.returnData } : { error: { message: o?.error?.message ?? 'execution reverted', data: o?.returnData } };
+};
 const pad = (a: string) => a.replace(/^0x/, '').padStart(64, '0');
 
 async function getPool(factory: string, fee: number): Promise<string | null> {
@@ -44,6 +53,23 @@ async function getPool(factory: string, fee: number): Promise<string | null> {
     const r = await simulateRoundTrip(rpc, 'robinhood', { token: WETH, amountIn, hops });
     console.log(`${label}: ${r.status}${'reason' in r ? ` (${r.reason})` : ''}`);
     await sleep(1500);
+  }
+  // Replay mode (what the bot's checks use): recent block's trades, then ours.
+  // Old way (no block overrides) vs new (real block time + big gas room).
+  const latest = Number((await rpc('eth_blockNumber', [])).result);
+  for (let n = latest - 3; n > latest - 120; n--) {
+    const b = (await rpc('eth_getBlockByNumber', ['0x' + n.toString(16), true])).result;
+    const txs: any[] = (b?.transactions ?? []).filter((t: any) => t.to && ['0x0', '0x1', '0x2'].includes(t.type));
+    if (!txs.length) continue;
+    const prefix: ReplayCall[] = txs.map((t) => ({ from: t.from, to: t.to, data: t.input, value: t.value, gas: t.gas }));
+    console.log(`replay block ${n}: ${prefix.length} trade(s), gas limits ${prefix.map((x) => parseInt(x.gas!, 16)).join(', ')}`);
+    for (const [label, hops] of routes) {
+      const oldWay = await simulateRoundTrip(replayRpcNoOverrides(base, '0x' + (n - 1).toString(16), prefix), 'robinhood', { token: WETH, amountIn, hops });
+      const newWay = await simulateRoundTrip(replayRpc(rpc, '0x' + (n - 1).toString(16), prefix, b.timestamp), 'robinhood', { token: WETH, amountIn, hops });
+      console.log(`  ${label}: old replay ${oldWay.status}${'reason' in oldWay ? ` (${oldWay.reason})` : ''} | new replay ${newWay.status}${'reason' in newWay ? ` (${newWay.reason})` : ''}`);
+      await sleep(1000);
+    }
+    break;
   }
   // Trace the Ramses route: where does it revert?
   const data = encodeExecuteRaw({ token: WETH, amountIn, minProfit: (1n << 256n) - 1n, maxBlock: (1n << 256n) - 1n, hops: routes[1][1] });

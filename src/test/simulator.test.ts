@@ -85,6 +85,10 @@ async function main() {
   assert(sent?.method === 'eth_simulateV1' && sent.params[1] === '0x10', 'replay runs on the parent block');
   assert(sent.params[0].blockStateCalls[0].calls[0].data === '0x1234' && sent.params[0].blockStateCalls[0].calls.length === 2, 'trigger replayed first, then our trade');
   assert(sent.params[0].blockStateCalls[0].stateOverrides.x === 1 && sent.params[0].validation === false, 'our pretend-state goes along, validation off');
+  assert(BigInt(sent.params[0].blockStateCalls[0].blockOverrides.gasLimit) >= 1_000_000_000n, 'simulated block has room for replayed trades plus ours');
+  const rt = replayRpc(node, '0x10', [trigger], '0x6543');
+  await rt('eth_call', [{ to: SIM_EXECUTOR_ADDRESS, data: '0x' }, 'latest', {}]);
+  assert(sent.params[0].blockStateCalls[0].blockOverrides.time === '0x6543', 'simulated block uses the real block time');
   assert(out.error?.data === insufficient, 'our revert data comes back like an eth_call error');
   const other = await rr('eth_call', [{ to: '0x00000000000000000000000000000000000000cc', data: '0x70a08231' }, 'latest', { ['0x00000000000000000000000000000000000000cc']: { stateDiff: { k: '0x05' } } }]);
   assert(other.result === '0x05', 'other calls (balance slot lookups) pass straight through');
