@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       only:
-        description: 'Run one step only: feeds, sim, pairs, watch, universe, backtest, latency, lenders, smoke, seed, routers, v4, arbsys, nodes, multicall (blank = all except backtest)'
+        description: 'Run one step only: feeds, sim, pairs, watch, universe, backtest, latency, lenders, smoke, seed, routers, v4, arbsys, nodes, multicall, simv1 (blank = all except backtest)'
         required: false
         default: ''
 
@@ -35,6 +35,14 @@ jobs:
           echo "$out"
           out="${out//'%'/'%25'}"; out="${out//$'\n'/'%0A'}"
           echo "::notice title=Feed probe::${out}"
+      - name: Can the node replay trigger-then-ours (eth_simulateV1)
+        if: inputs.only == 'simv1'
+        shell: bash
+        run: |
+          out=$(node .scripts-build/scripts/probe-simv1.js 2>&1 | tail -10)
+          echo "$out"
+          out="${out//'%'/'%25'}"; out="${out//$'\n'/'%0A'}"
+          echo "::notice title=simulateV1 probe::${out}"
       - name: Probe free simulation on real chains
         if: inputs.only == '' || inputs.only == 'sim'
         shell: bash
