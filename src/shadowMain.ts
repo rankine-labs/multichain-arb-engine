@@ -81,6 +81,7 @@ import { ROBINHOOD_SCAN_FACTORIES } from './config/knownAddresses';
 import { buildExecuteCall, executionRequested, executorConfig, pickV3Lender } from './execution/executorCalldata';
 import { FailTally } from './core/failReasons';
 import { LenderBalances } from './core/lenderBalances';
+import { RouteScores, WinSizes, WIN_BARS } from './core/routeScore';
 import { makeRpc, simulateRoundTrip, simRpcUrl, Rpc, makeFallbackRpc, loadBalanceSlots, wssToHttps, replayRpc, ReplayCall } from './execution/simulator';
 import { FastSender, SafetyGate, safetyConfigFromEnv } from './execution/fastSender';
 import { checkLiveReady } from './execution/liveReadiness';
@@ -371,6 +372,14 @@ const simBusy: Record<string, boolean> = {};          // one simulation in fligh
 // Token-specific problems ("no balance slot found") never switch off the
 // whole chain; the simulator retries that token on its own after an hour.
 const simDisabled: Record<string, { reason: string; until: number }> = {};
+// Robinhood: which pool pairs actually pay out in real tests (core/routeScore.ts).
+// Pairs tested 3+ times without a real win are benched for 6 h. Saved to disk.
+const ROUTE_FILE = 'data/route-scores.json';
+const routeScores = new RouteScores();
+{ const n = routeScores.load(ROUTE_FILE); if (n) console.log(`[sim] robinhood: restored scores for ${n} pool pairs`); }
+setInterval(() => routeScores.save(ROUTE_FILE), 10 * 60_000);
+// Real wins by size ($1/$2/$5/$10/$20 bars), to set the firing bar from data.
+const winSizes = new WinSizes();
 // Pool pairs whose last trigger test lost or failed: not re-tested for 5 min.
 const simLoserMuted = new Map<string, number>();
 // On-the-spot pool lookups that found nothing usable (see the trade handler).
@@ -491,6 +500,8 @@ const queueSimulation = (
       if (simOff(chain) || Date.now() < (simPausedUntil[chain] ?? 0)) { if (chain === 'robinhood') funnelSkip('checking node paused (busy or out of allowance)'); return; }
       const muteKey = `${buyPool.poolAddress}>${sellPool.poolAddress}`.toLowerCase();
       if (Date.now() < (simLoserMuted.get(muteKey) ?? 0)) { if (chain === 'robinhood') funnelSkip('same trading spots lost in the last 5 min'); return; }
+      const routeKey = RouteScores.key(buyPool.poolAddress, sellPool.poolAddress);
+      if (chain === 'robinhood' && routeScores.isBenched(routeKey)) { funnelSkip("these two trading spots never pay out (benched 6 h)"); return; }
       const decimals = TOKEN_DECIMALS[chain]?.[tokenIn.toLowerCase()];
       if (decimals === undefined) { if (chain === 'robinhood') funnelSkip('token decimals unknown'); return; }
       // Flash loan: borrow from the cheapest V3 pool holding the token that
@@ -596,12 +607,14 @@ const queueSimulation = (
                         if (chain === 'robinhood' && net >= MIN_COUNTED_USD && vetted) {
                               dryRunPnl.recordVerified(net, `${symbolOf(chain, tokenIn)} ${buyPool.dex}->${sellPool.dex}`);
                         }
+                        if (chain === 'robinhood') { routeScores.record(routeKey, net); if (vetted) winSizes.add(net); }
                   } else if (r.status === 'loss') {
                         simStats.loss++;
+                        if (chain === 'robinhood') routeScores.record(routeKey, 0);
                         console.log(`[sim] ${chain} ${pair} ${route} real: LOSS | ${model}`);
                   } else {
                         simStats.fail++;
-                        if (chain === 'robinhood') failTally.add(r.reason);
+                        if (chain === 'robinhood') { failTally.add(r.reason); routeScores.record(routeKey, 0); }
                         console.log(`[sim] ${chain} ${pair} ${route} real: FAILS (${r.reason}) | ${model}`);
                   }
             } catch (err) {
@@ -717,6 +730,7 @@ for (const sig of ['SIGINT', 'SIGTERM'] as const) {
       process.once(sig, () => {
             try { dryRunPnl.save(); } catch { /* best effort */ }
             try { robinhoodWatcher.save(WATCH_FILE); } catch { /* best effort */ }
+            try { routeScores.save(ROUTE_FILE); } catch { /* best effort */ }
             try { saveNodeUsage(); } catch { /* best effort */ }
             console.log(`[shutdown] ${sig}: state saved, exiting`);
             process.exit(0);
@@ -1794,6 +1808,8 @@ for (let i = 0; i < resolved.length; i++) {
                                     wouldFail: simStats.fail + gapStats.fail,
                                     failReasons: failTally.plain(),
                                     timing: { ...checkTiming },
+                                    winSizes: { bars: WIN_BARS, hour: [...winSizes.hour], today: [...winSizes.today], todayUsd: [...winSizes.todayUsd] },
+                                    benchedRoutes: routeScores.benchedCount(),
                                     nodeBusy: simStats.rateLimited,
                               },
                               checksAvailable: !(simStats.checked === 0 && (simStats.rateLimited > 0 || !!simOff('robinhood'))),
@@ -1840,6 +1856,7 @@ for (let i = 0; i < resolved.length; i++) {
                   checkTiming.rightAfter = checkTiming.othersInBlock = checkTiming.late = 0;
                   if (recheckStats.done) console.log(`[sim] robinhood free-node re-checks this hour: ${recheckStats.done}, answer changed ${recheckStats.changed}`);
                   recheckStats.done = recheckStats.changed = 0;
+                  winSizes.resetHour();
                   priceStats.local = priceStats.rpc = 0;
                   fireStats.readyMs = []; fireStats.blocked.clear(); fireStats.sent = 0;
                   rivals.reset();

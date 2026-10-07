@@ -285,7 +285,11 @@ export interface PlainHourlyInput {
   checks: { done: number; makeMoney: number; loseMoney: number; wouldFail: number; nodeBusy: number; failReasons?: [string, number][];
     // When trigger checks were tested: right after the trade we followed,
     // after someone else also traded in that block, or late (latest block).
-    timing?: { rightAfter: number; othersInBlock: number; late: number } };
+    timing?: { rightAfter: number; othersInBlock: number; late: number };
+    // Real wins (after gas, vetted coins) that cleared each bar, this hour and today.
+    winSizes?: { bars: number[]; hour: number[]; today: number[]; todayUsd: number[] };
+    benchedRoutes?: number; // pool pairs benched for never paying out
+  };
   checksAvailable: boolean;            // false = no node can run checks right now
   earned: { todayChecked: number; todayCheckedCount: number; todayUnchecked: number; todayUncheckedCount: number; weekChecked: number };
   reactionMs: { typical: number | null; slowest5pct: number | null };
@@ -381,6 +385,13 @@ export function formatPlainHourly(r: PlainHourlyInput): string {
       if (tm.late) bits.push(`${tm.late} tested late`);
       L.push(`  Test timing: ${bits.join(', ')}`);
     }
+    // Wins by size: decides where the firing bar should be ($20 today).
+    const ws = r.checks.winSizes;
+    if (ws && ws.today.some((x) => x > 0)) {
+      L.push('  Real wins by size (after gas), today:');
+      L.push('  ' + ws.bars.map((b, i) => `$${b}+: ${ws.today[i]} ($${ws.todayUsd[i].toFixed(0)})`).join(' · '));
+    }
+    if (r.checks.benchedRoutes) L.push(`  Skipping ${r.checks.benchedRoutes} pair(s) of trading spots that never pay out`);
   }
   L.push('');
 

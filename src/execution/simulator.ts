@@ -406,7 +406,10 @@ export async function simulateRoundTrip(
       return got > 0n ? { status: 'profit', profit: got } : { status: 'loss' };
     }
     // Flash mode with no float: couldn't repay the loan = the trade lost money.
-    if (parsed?.name === 'TransferFailed' && opts.v3Lender && !balanceKey) return { status: 'loss' };
+    // Flash mode: TransferFailed = the loan couldn't be repaid. That's a losing
+    // trade, e.g. the sell pool was nearly empty at this price and filled
+    // almost nothing (Oct 7: Ramses 0x0287 paid $0.000003 for 0.117 ETH).
+    if (parsed?.name === 'TransferFailed' && opts.v3Lender) return { status: 'loss' };
     if (parsed?.name === 'Error') return { status: 'fail', reason: String(parsed.args[0]) };
     if (parsed) return { status: 'fail', reason: `${parsed.name}(${parsed.args.join(', ')})` };
   } catch { /* unknown error shape */ }
