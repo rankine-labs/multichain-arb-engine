@@ -1,5 +1,6 @@
 import { ChainName } from './types';
 import type { RivalSummary } from './rivalWatch';
+import type { GapRow } from './crossQuoteMonitor';
 
 // ============================================================================
 // TELEGRAM MESSAGE FORMATTING -- COLD PATH
@@ -582,5 +583,42 @@ export function formatRivalDaily(input: { dateLabel: string; hours: number; summ
   for (const l of rivalLessons(s)) L.push(`  • ${l}`);
   L.push('');
   L.push(`<b>Verdict</b>: ${rivalVerdict(s, input.hours)}`);
+  return L.join('\n');
+}
+
+
+// ----------------------------------------------------------------------------
+// MARKET OPEN REPORT: do USDG and ETH pools of the same token disagree more
+// around the 9:30 stock market open than the rest of the day?
+// ----------------------------------------------------------------------------
+export function formatMarketOpenReport(input: { dateLabel: string; tokens: number; rows: GapRow[] }): string {
+  const L: string[] = [];
+  const pc = (x: number) => `${x.toFixed(2)}%`;
+  const mins = (s: number) => (s < 60 ? `${Math.round(s)} s` : `${(s / 60).toFixed(1)} min`);
+  L.push(`📈 <b>MARKET OPEN REPORT</b> · ${esc(input.dateLabel)} (9:00 to 10:30)`);
+  L.push(`Watching ${input.tokens} tokens that trade in both a USDG pool and an ETH pool. A "gap" is how far the two prices disagree. "After fees" is what's left once both pools' fees and the ETH/USDG swap are paid. Measurement only, no trades.`);
+  L.push('');
+  const rows = input.rows.filter((r) => r.open.samples > 0);
+  if (!rows.length) { L.push('No measurements during the open (bot restarted, or a holiday).'); return L.join('\n'); }
+  const paying = rows.filter((r) => r.open.maxNetPct > 0);
+  L.push(`<b>Biggest gaps at the open</b>`);
+  for (const r of rows.slice(0, 8)) {
+    const net = r.open.maxNetPct > 0 ? `after fees ${pc(r.open.maxNetPct)}, worth trading for ${mins(r.open.secondsProfitable)}` : 'not enough after fees';
+    const rest = r.rest.samples ? ` · rest of day max ${pc(r.rest.maxGapPct)}` : '';
+    L.push(`  • ${esc(r.symbol)}: gap up to ${pc(r.open.maxGapPct)} (${net})${rest}`);
+  }
+  L.push('');
+  const openAvg = rows.reduce((s, r) => s + r.open.maxGapPct, 0) / rows.length;
+  const restRows = rows.filter((r) => r.rest.samples > 0);
+  const restAvg = restRows.length ? restRows.reduce((s, r) => s + r.rest.maxGapPct, 0) / restRows.length : null;
+  L.push(`Typical biggest gap per token: open ${pc(openAvg)}${restAvg !== null ? `, rest of day ${pc(restAvg)}` : ''}`);
+  L.push(`Tokens with a gap worth trading after fees at the open: ${paying.length} of ${rows.length}`);
+  L.push('');
+  const verdict = paying.length >= 3 && paying.some((r) => r.open.secondsProfitable >= 30)
+    ? '✅ Real gaps at the open that last long enough to trade. Worth building "market open mode" on top of Stage 1.'
+    : paying.length
+      ? '⚠️ A few gaps after fees, but small or brief. Watch a few more mornings before building anything.'
+      : '❌ No gaps worth trading after fees this morning. Pools stay in line; watch a few more mornings to be sure.';
+  L.push(`<b>Verdict</b>: ${verdict}`);
   return L.join('\n');
 }

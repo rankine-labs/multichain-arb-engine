@@ -68,14 +68,15 @@ function symbolOf(chain: string, address: string): string {
     if (known) return known;
     return `${address.slice(0, 6)}...${address.slice(-4)}`;
 }
-import { formatSkippedOpportunity, formatHourlyDigest, formatDailyReport, formatStartup, formatExecutionWarning, DigestSection, DigestSpread, formatPlainHourly, formatPlainDaily, formatRivalDaily } from './core/telegramFormatter';
+import { formatSkippedOpportunity, formatHourlyDigest, formatDailyReport, formatStartup, formatExecutionWarning, DigestSection, DigestSpread, formatPlainHourly, formatPlainDaily, formatRivalDaily, formatMarketOpenReport } from './core/telegramFormatter';
 import { RobinhoodChainAdapter } from './chains/robinhoodChain';
 import { MonadAdapter } from './chains/monad';
 import { AvalancheAdapter } from './chains/avalanche';
 import { RawChainEvent, PoolState } from './core/types';
 import { priceOf, spreadPct, deepEnough } from './core/poolPrice';
 import { PairWatcher, Venue, refreshPoolState, refreshPoolsBatch } from './core/pairWatcher';
-import { scanUniverse, emptyScanState, ScanState } from './core/universeScan';
+import { scanUniverse, emptyScanState, ScanState, stateToPools } from './core/universeScan';
+import { CrossQuoteMonitor } from './core/crossQuoteMonitor';
 import { readFileSync, writeFileSync, mkdirSync, renameSync } from 'fs';
 import { ROBINHOOD_SCAN_FACTORIES } from './config/knownAddresses';
 import { buildExecuteCall, executionRequested, executorConfig, pickV3Lender } from './execution/executorCalldata';
@@ -1617,6 +1618,59 @@ await chainManager.startAll();
             }
       };
       void runRobinhoodScan();
+
+      // ---- Market-open measurement (stock tokens etc.) -------------------
+      // Tokens with both a USDG pool and an ETH pool: how far apart are the
+      // two prices, after fees, and is it worse around the 9:30 stock market
+      // open? Measurement only (core/crossQuoteMonitor.ts). Report to
+      // Telegram at 10:35 Toronto time on weekdays.
+      const crossQuote = new CrossQuoteMonitor(
+            async (calls) => { rhDecisionCallMany ??= (await makeCaller(robinhoodReadProvider)).callMany; return rhDecisionCallMany(calls); },
+            ROBINHOOD_TOKENS.USDG, ROBINHOOD_TOKENS.WETH,
+            () => priceOracle.getUsdPrice('robinhood', ROBINHOOD_TOKENS.WETH),
+      );
+      const OPEN_FROM = 9 * 60, OPEN_TO = 10 * 60 + 30, OPEN_REPORT = 10 * 60 + 35; // minutes after midnight, Toronto
+      const toronto = () => {
+            const parts = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Toronto', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', weekday: 'short', hour12: false }).formatToParts(new Date());
+            const get = (t: string) => parts.find((p) => p.type === t)?.value ?? '';
+            const mins = (Number(get('hour')) % 24) * 60 + Number(get('minute'));
+            return { date: `${get('year')}-${get('month')}-${get('day')}`, mins, weekday: !['Sat', 'Sun'].includes(get('weekday')) };
+      };
+      const setupCrossQuote = async () => {
+            try {
+                  const st = scanState ?? loadScanState();
+                  const n = await crossQuote.setup(stateToPools(st), Number(process.env.CROSS_QUOTE_TOKENS ?? 60));
+                  console.log(`[openwatch] watching ${n} tokens that trade against both USDG and ETH`);
+            } catch (err) { console.warn('[openwatch] setup failed:', (err as Error).message); }
+      };
+      setTimeout(() => { void setupCrossQuote(); }, 90_000);
+      setInterval(() => { void setupCrossQuote(); }, 6 * 60 * 60_000);
+      let lastCrossTick = 0;
+      let crossBusy = false;
+      setInterval(async () => {
+            const t = toronto();
+            const inOpen = t.weekday && t.mins >= OPEN_FROM && t.mins < OPEN_TO;
+            if (crossBusy || Date.now() - lastCrossTick < (inOpen ? 5_000 : 15_000)) return;
+            crossBusy = true; lastCrossTick = Date.now();
+            try { await crossQuote.tick(inOpen, t.date); } catch { /* node busy: next tick */ } finally { crossBusy = false; }
+      }, 1_000);
+      // One line an hour for the status page: biggest after-fee gap today.
+      setInterval(() => {
+            const top = crossQuote.rows()[0];
+            if (top) console.log(`[openwatch] ${crossQuote.tokenCount()} tokens; biggest gap today ${top.symbol}: open ${top.open.maxGapPct.toFixed(2)}% (after fees ${top.open.samples ? top.open.maxNetPct.toFixed(2) : 'n/a'}%), rest of day ${top.rest.maxGapPct.toFixed(2)}%`);
+      }, 60 * 60_000);
+      const OPEN_REPORT_FILE = 'data/open-report.json';
+      setInterval(async () => {
+            const t = toronto();
+            if (!t.weekday || t.mins < OPEN_REPORT || t.mins > OPEN_REPORT + 30) return;
+            let last = '';
+            try { last = JSON.parse(readFileSync(OPEN_REPORT_FILE, 'utf8')).date ?? ''; } catch { /* first time */ }
+            if (last === t.date) return;
+            try {
+                  writeFileSync(OPEN_REPORT_FILE, JSON.stringify({ date: t.date }));
+                  await sendTelegramMessage(formatMarketOpenReport({ dateLabel: t.date, tokens: crossQuote.tokenCount(), rows: crossQuote.rows() }));
+            } catch (err) { console.error('[telegram] market open report failed:', err); }
+      }, 60_000);
       setInterval(() => { void runRobinhoodScan(); }, 6 * 60 * 60_000);
 
       // Proactively checks known, real multi-DEX pairs directly on a
