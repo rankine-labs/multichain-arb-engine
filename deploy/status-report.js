@@ -129,7 +129,11 @@ async function main() {
   for (const l of outL) {
     // [sim] robinhood WETH/AAPL uniswap-v3->uniswap-v2 real: FAILS (TF) | ...
     // [gap] WETH/QQQ: model said ~$N but NOT REAL (TF); muted 30 min | ...
-    const m = /\[sim\] robinhood (\S+\/\S+) .*real: FAILS \((.*)\) \| /.exec(l) || /\[gap\] (\S+\/\S+): .*NOT REAL \((.*)\); muted/.exec(l)
+    // Pair + route (which exchanges) + funding (flash loan / own money), so a
+    // failure can be traced to one pool type without reading the raw log.
+    const sm = /\[sim\] robinhood (\S+\/\S+) (\S+) real: FAILS \((.*)\) \| .*\| (.*)$/.exec(l);
+    const m = sm ? [sm[0], `${sm[1]} ${sm[2]}, ${sm[4].replace(/ \(no V3 lender cached\)/, '')}`, sm[3]]
+      : /\[gap\] (\S+\/\S+): .*NOT REAL \((.*)\); muted 30 min \| (.*)$/.exec(l)?.map((x, i, a) => (i === 1 ? `${x} ${a[3]}` : x))
       || /\[sim\] robinhood ()\S+ real: FAILS \((.*)\) \| /.exec(l); // older lines without the pair
     if (!m || /^real profit only/.test(m[2]) || /^ends with less/.test(m[2])) continue;
     // Keep 4-byte error codes (0x + 8 hex) so unknown errors can be looked
