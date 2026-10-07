@@ -47,3 +47,17 @@ const usage = formatPlainHourly({ ...base, checksAvailable: true, checks: { done
 assert(usage.includes('Robinhood (free): 52,000 (no daily cap)'), 'free node usage shown without a cap');
 assert(usage.includes('QuickNode (checks): 11,500 of 14,000 ⚠️') && usage.includes('at 82% of today'), '80%+ shows ⚠️ and a warning');
 assert(usage.includes('Alchemy (scan): 30,000 of 30,000 ❌') && usage.includes('paused until midnight UTC'), 'used up shows ❌ and says the job is paused');
+
+// Funnel: where trades dropped out, in plain words.
+const fun = formatPlainHourly({ ...base, funnel: {
+  tradesRead: 1240, noPool: 30, noPartner: 900, noUsdPrice: 10, smallerThanFees: 277, found: 23,
+  belowCheckBar: 18, checkBarUsd: 0.5, notVetted: 3, sentToCheck: 2,
+  skipped: [['another check was running', 1]],
+} });
+console.log('----- funnel -----\n' + fun.split('What happened')[1]?.split('Price differences found')[0] + '------------------');
+assert(fun.includes('Trades read from the live feed: 1,240'), 'funnel: trades read');
+assert(fun.includes('900 no second trading spot with $25k+ to compare'), 'funnel: depth filter drop in plain words');
+assert(fun.includes('277 price difference smaller than the fees'), 'funnel: fees drop');
+assert(fun.includes('18 estimated gain under $0.50'), 'funnel: check bar drop');
+assert(fun.includes('Sent to be checked: 2') && fun.includes('1 not checked: another check was running'), 'funnel: checker skips listed');
+assert(fun.length < 4000, 'still fits one Telegram message');
