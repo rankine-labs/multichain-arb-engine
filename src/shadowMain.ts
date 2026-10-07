@@ -464,6 +464,9 @@ const queueSimulation = (
       setTimeout(async () => {
             try {
                   const r = await simulateRoundTrip(simRpc[chain], chain, { token: tokenIn, amountIn: built.amountIn, hops: built.hops }, { v3Lender: lender?.poolAddress, weth: chain === 'robinhood' ? ROBINHOOD_TOKENS.WETH : undefined });
+                  // Pair name in the log line, so the status page can show WHICH
+                  // coins fail (e.g. "WETH/AAPL uniswap-v3->uniswap-v2").
+                  const pair = `${symbolOf(chain, buyPool.tokenA)}/${symbolOf(chain, buyPool.tokenB)}`;
                   const route = `${buyPool.dex}->${sellPool.dex}`;
                   const model = `model gross $${modelGrossUsd.toFixed(2)} on $${tradeSizeUsd.toFixed(0)} | ${funding}`;
                   if (r.status === 'rate_limited') {
@@ -487,7 +490,7 @@ const queueSimulation = (
                   if (r.status === 'profit' && !plausibleProfit(r.profit, built.amountIn)) {
                         simStats.fail++;
                         if (chain === 'robinhood') failTally.add('implausible profit');
-                        console.log(`[sim] ${chain} ${route} real: IMPLAUSIBLE profit (bad token or pool data), ignored | ${model}`);
+                        console.log(`[sim] ${chain} ${pair} ${route} real: IMPLAUSIBLE profit (bad token or pool data), ignored | ${model}`);
                   } else if (r.status === 'profit') {
                         simStats.profit++;
                         const usd = (Number(r.profit) / 10 ** decimals) * usdPerToken;
@@ -502,11 +505,11 @@ const queueSimulation = (
                         }
                   } else if (r.status === 'loss') {
                         simStats.loss++;
-                        console.log(`[sim] ${chain} ${route} real: LOSS | ${model}`);
+                        console.log(`[sim] ${chain} ${pair} ${route} real: LOSS | ${model}`);
                   } else {
                         simStats.fail++;
                         if (chain === 'robinhood') failTally.add(r.reason);
-                        console.log(`[sim] ${chain} ${route} real: FAILS (${r.reason}) | ${model}`);
+                        console.log(`[sim] ${chain} ${pair} ${route} real: FAILS (${r.reason}) | ${model}`);
                   }
             } catch (err) {
                   console.warn(`[sim] ${chain} error:`, (err as Error).message);

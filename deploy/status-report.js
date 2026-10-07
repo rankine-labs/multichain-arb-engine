@@ -127,12 +127,18 @@ async function main() {
   // standing gaps), counted, so the cause is visible without logging in.
   const failCounts = new Map();
   for (const l of outL) {
-    const m = /\[sim\] robinhood .*real: FAILS \((.*)\) \| /.exec(l) || /\[gap\] .*NOT REAL \((.*)\); muted/.exec(l);
-    if (!m || /^real profit only/.test(m[1]) || /^ends with less/.test(m[1])) continue;
-    const k = m[1].replace(/0x[0-9a-fA-F]{8,}/g, '0x…').replace(/\d{5,}/g, 'N').slice(0, 100);
+    // [sim] robinhood WETH/AAPL uniswap-v3->uniswap-v2 real: FAILS (TF) | ...
+    // [gap] WETH/QQQ: model said ~$N but NOT REAL (TF); muted 30 min | ...
+    const m = /\[sim\] robinhood (\S+\/\S+) .*real: FAILS \((.*)\) \| /.exec(l) || /\[gap\] (\S+\/\S+): .*NOT REAL \((.*)\); muted/.exec(l)
+      || /\[sim\] robinhood ()\S+ real: FAILS \((.*)\) \| /.exec(l); // older lines without the pair
+    if (!m || /^real profit only/.test(m[2]) || /^ends with less/.test(m[2])) continue;
+    // Keep 4-byte error codes (0x + 8 hex) so unknown errors can be looked
+    // up; only longer hex (addresses, data) is shortened.
+    const reason = m[2].replace(/0x[0-9a-fA-F]{9,}/g, '0x…').replace(/\d{5,}/g, 'N').slice(0, 100);
+    const k = m[1] ? `${reason} on ${m[1]}` : reason;
     failCounts.set(k, (failCounts.get(k) || 0) + 1);
   }
-  const topFails = [...failCounts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 6);
+  const topFails = [...failCounts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 10);
   const fireReady = outL.map((l) => /\[fire\] robinhood .* ready (\d+)ms/.exec(l)).filter(Boolean).map((m) => Number(m[1])).sort((a, b) => a - b);
   const rivalLines = outL.filter((l) => /\[rival\] arb found/.test(l));
   const rivalMs = rivalLines.map((l) => /theirs (\d+)ms/.exec(l)).filter(Boolean).map((m) => Number(m[1])).sort((a, b) => a - b);
