@@ -55,6 +55,23 @@ Ranked by how much they might be worth to us. None built.
 6. **Uniswap V4 special pools (hooks, dynamic fees)**: unusual gaps, more
    code per pool type.
 
+More backrun ideas (Oct 7, evening):
+
+7. **New pool first trade**: when someone creates a new pool for an existing
+   coin, its starting price is set by hand and often a bit off. The first bot
+   to trade it into line keeps the gap. Often bigger than 10 cents. Fits us
+   best: young chain, all-in-one safe trade. Measure first: how often new
+   pools appear with an off price.
+8. **Repeat traders (split orders)**: big traders splitting one order into
+   chunks every few minutes push prices the same way on a schedule. Learn the
+   pattern, be ready before each chunk. Timing beats speed.
+9. **Dollar-coin pools**: USDG vs other dollar coins, if they have pools
+   here. Should sit at $1.00; big trades knock them off briefly. Very safe.
+10. **ETH vs wrapped ETH pools**: some Uniswap V4 pools use plain ETH, others
+    WETH. Same coin, separate prices. Contract already handles both.
+11. **Pool-manager rebalances**: apps that manage liquidity move it around
+    periodically, often on a schedule, wobbling prices.
+
 Not for us: sandwich / front-run (hurts traders, impossible here anyway),
 sniping new launches (mostly scams), just-in-time liquidity (needs to see
 trades before they happen).
