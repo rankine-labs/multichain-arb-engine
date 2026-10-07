@@ -24,7 +24,7 @@ export type FailGroup = 'tax' | 'transfer' | 'blocked' | 'ours' | 'stale' | 'sil
 // Plain-English label for each group, as shown in Telegram.
 export const FAIL_GROUP_LABEL: Record<FailGroup, string> = {
   tax: 'coin takes a cut when moved (skip these coins)',
-  transfer: "money couldn't be moved (lender too small, or coin blocks transfers)",
+  transfer: "a coin transfer failed during the test",
   blocked: 'coin blocks trading (likely scam coin)',
   ours: 'our bot built the trade wrong (bug for me to fix)',
   stale: 'price info was old or wrong',
@@ -52,9 +52,10 @@ const RULES: [FailGroup, RegExp][] = [
   // trading switched off, max-transaction limits.
   // Explicit refusals from the coin itself.
   ['blocked', /blacklist|not allowed|trading (is )?not (enabled|open|active)|tradingEnabled|max ?tx|exceeds (the )?max/i],
-  // A transfer failed without saying why: on WETH/USDG this was the lender
-  // pool not holding enough (TF / TransferFailed) or having no active
-  // liquidity (L). Could also be a coin that blocks transfers.
+  // A transfer failed without saying why (TF / TransferFailed), or the lender
+  // pool had no active liquidity (L). Oct 7: seen on WETH/USDG, where fork
+  // tests show the coins, lender and routes all work, so the cause is being
+  // traced in our own test setup. Could also be a coin that blocks transfers.
   ['transfer', /TRANSFER_FAILED|TransferFailed|transfer amount exceeds/i],
   ['transfer', /\bSTF\b|\bTF\b|^L$/],
   // Pool math didn't match what we expected: price moved or our cached state
