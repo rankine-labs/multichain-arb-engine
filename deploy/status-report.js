@@ -163,7 +163,9 @@ async function main() {
   const fireReady = outL.map((l) => /\[fire\] robinhood .* ready (\d+)ms/.exec(l)).filter(Boolean).map((m) => Number(m[1])).sort((a, b) => a - b);
   const rivalLines = outL.filter((l) => /\[rival\] arb found/.test(l));
   // Rival watch: what the other bots won (bot, pair, ~$, pools watched by us?).
-  const rw = outL.map((l) => /\[rivalwatch\] bot \S+ (\S+) ~\$(-?[0-9.]+) \| \d+ pools, (all watched|NOT)/.exec(l)).filter(Boolean);
+  const rw = outL.map((l) => /\[rivalwatch\] bot \S+ (\S+) ~\$(-?[0-9.]+) \| \d+ pools.*(all watched|NOT)/.exec(l)).filter(Boolean);
+  const rwFailed = count(outL, /\[rivalwatch\] bot \S+ FAILED/);
+  const rwNewBots = count(outL, /\[rivalwatch\] new rival bot found/);
   const rwWins = rw.filter((m) => Number(m[2]) > 0);
   const rwPairs = new Map();
   for (const m of rwWins) rwPairs.set(m[1], (rwPairs.get(m[1]) || 0) + Number(m[2]));
@@ -221,7 +223,7 @@ async function main() {
     `- Fire-ready (trigger seen -> signed trade): ${fireReady.length ? `${med(fireReady)} ms median over ${fireReady.length}` : 'no qualifying trades this window'}`,
     `- Rivals: ${rivalLines.length ? `${rivalLines.length} rival arbs timed · theirs ${med(rivalMs) ?? '?'} ms median vs ours ${med(oursMs) ?? '?'} ms` : 'none timed this window'}`,
     `- Prices read from: ${readsOn} · ${rpcSwitches} node switch(es) this window`,
-    `- Rival bots' trades read: ${rw.length} · made money: ${rwWins.length} · about $${rwWins.reduce((x, m) => x + Number(m[2]), 0).toFixed(2)} · on pools we watch: ${rwOurs}`,
+    `- Rival bots' trades read: ${rw.length} · made money: ${rwWins.length} · about $${rwWins.reduce((x, m) => x + Number(m[2]), 0).toFixed(2)} · on pools we watch: ${rwOurs} · failed: ${rwFailed} · new bots found: ${rwNewBots}`,
     ...(rwTop.length ? [`- Rival profit by pair: ${rwTop.map(([p, v]) => `${p} $${v.toFixed(2)}`).join(' · ')}`] : []),
     ...(scanLine ? [`- Latest scan line: ${scanLine.slice(0, 200)}`] : []),
     `- RPC round trip from the server (public node, best of 3): ${rpcRtt ?? '?'} ms`,
