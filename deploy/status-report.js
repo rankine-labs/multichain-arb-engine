@@ -179,6 +179,8 @@ async function main() {
   const newPoolsWaiting = count(outL, /^\[newpools\] new pool .* waiting/);
   const newPoolsFails = count(outL, /^\[newpools\] poll failed/);
   const groupsLine = lastMatch(bigTail, /^\[groups\] verified coins:/);
+  // While the list is still being built: its latest progress line (or a failure).
+  const groupsProgress = lastMatch(bigTail, /^\[groups\] (building:|symbols:|no pool scan|build\/setup failed)/);
   const loopsLine = lastMatch(bigTail, /^\[loops\] \d+ tokens across/);
   const loopsWatch = lastMatch(bigTail, /^\[loops\] watching /);
   const rivalMs = rivalLines.map((l) => /theirs (\d+)ms/.exec(l)).filter(Boolean).map((m) => Number(m[1])).sort((a, b) => a - b);
@@ -239,7 +241,7 @@ async function main() {
     `- New pool counter: ${newPoolsLine ? newPoolsLine.replace(/^\[newpools\] /, '') : 'no hourly line yet'} · this window: ${newPoolsWaiting} new pool(s) for deep coins, ${newPoolsFirstMoney.length} measured, ${newPoolsFails} failed poll(s)`,
     ...newPoolsFirstMoney.slice(-3).map((l) => `  - ${l.replace(/^\[newpools\] /, '').slice(0, 200)}`),
     `- Loop watch: ${loopsLine ? loopsLine.replace(/^\[loops\] /, '') : 'no line yet'}${loopsWatch ? ` (${loopsWatch.replace(/^\[loops\] /, '')})` : ''}`,
-    `- Coin groups (please review): ${groupsLine ? groupsLine.replace(/^\[groups\] verified coins: /, '').slice(0, 1500) : 'not built yet'}`,
+    `- Coin groups (please review): ${groupsLine ? groupsLine.replace(/^\[groups\] verified coins: /, '').slice(0, 1500) : `not built yet${groupsProgress ? ` (${groupsProgress.replace(/^\[groups\] /, '')})` : ''}`}`,
     `- RPC round trip from the server (public node, best of 3): ${rpcRtt ?? '?'} ms`,
     `- Real-chain test runs: ${simProfit} profitable · ${simLoss} losing · ${simFail} would fail`,
     ...(profitUsd.length ? [`- Profitable checks: total $${profitUsd.reduce((x, y) => x + y, 0).toFixed(2)} · middle $${profitUsd[Math.floor(profitUsd.length / 2)].toFixed(2)} · biggest $${profitUsd[profitUsd.length - 1].toFixed(2)} (before gas)`,
