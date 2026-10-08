@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       only:
-        description: 'Run one step only: feeds, sim, pairs, watch, universe, backtest, latency, lenders, smoke, seed, routers, v4, arbsys, nodes, multicall, simv1, ramsessim (blank = all except backtest)'
+        description: 'Run one step only: feeds, sim, pairs, watch, universe, backtest, latency, lenders, smoke, seed, routers, v4, arbsys, nodes, multicall, simv1, ramsessim, rivalreplay, rivalcaps, rivalverify (blank = all except backtest)'
         required: false
         default: ''
 
@@ -51,6 +51,18 @@ jobs:
           echo "$out"
           out="${out//'%'/'%25'}"; out="${out//$'\n'/'%0A'}"
           echo "::notice title=Ramses sim probe::${out}"
+      - name: Rival replay (research, read-only)
+        if: inputs.only == 'rivalreplay'
+        shell: bash
+        timeout-minutes: 75
+        run: node .scripts-build/scripts/probe-rival-replay.js 2>&1 | tail -80
+      # Which RPC methods the public node answers (traces, old balances,
+      # ordered replays, long log searches). Read-only, ~20 requests.
+      - name: Rival replay node capabilities (research, read-only)
+        if: inputs.only == 'rivalcaps'
+        shell: bash
+        timeout-minutes: 10
+        run: node .scripts-build/scripts/probe-rival-caps.js 2>&1 | tail -60
       - name: Probe free simulation on real chains
         if: inputs.only == '' || inputs.only == 'sim'
         shell: bash
