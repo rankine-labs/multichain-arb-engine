@@ -41,3 +41,14 @@ The verifier does not claim a protocol identity based solely on matching functio
 - Historical replay logs and full factory addresses were not provided to this branch.
 
 Do not report tests as passing or unknown DEXs as identified until there is evidence.
+
+## External research (2026-10-08)
+- Robinhood official network documentation identifies mainnet as chain ID 4663 and Blockscout as its explorer: https://docs.robinhood.com/chain/connecting/
+- 0x's July 31, 2026 changelog lists many supported Robinhood DEX families, including Ekubo, Giga, RobinSwap, SwapHood, Swaap, SushiSwap and Uniswap variants: https://docs.0x.org/changelog/2026/7/31 . **This is a discovery list, not proof any family matches an unknown prefix.**
+- Public verified-contract directory: https://www.hoodexplorer.org/contractsearch . Use independently of factory() checks.
+- Added `scripts/recover-rival-factories.js` to recover complete factory addresses from full rival pool contract addresses. Usage:
+  ```bash
+  ROBINHOOD_RPC_URL=https://YOUR_RPC node scripts/recover-rival-factories.js 0xFULL_POOL_ADDRESS ...
+  ```
+- The rival replay source `scripts/probe-rival-replay.ts` on branch `research-rival-replay` already calls `factory()` for each non-V4 pool, but truncates unknown factory addresses in human-readable output. The most reliable fix is to emit **full** addresses (plus pool and transaction hashes) directly from that replay or pass its pool addresses to the new recovery script.
+- Without complete observed pool addresses, there is no defensible mapping of the five abbreviated factory prefixes to named DEXs. None has been added to execution routing.
