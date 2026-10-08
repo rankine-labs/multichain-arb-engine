@@ -231,6 +231,7 @@ export async function buildTokenGroups(deps: {
   symbolCacheFile: string;
   outFile: string;
   pauseMs?: number;                   // between symbol bundles (default 2 s)
+  progressEvery?: number;             // progress line + save every N bundles (default 10)
   log?: (m: string) => void;
 }): Promise<TokenGroupsResult> {
   const log = deps.log ?? (() => {});
@@ -240,22 +241,39 @@ export async function buildTokenGroups(deps: {
   // 1) Symbols of coins paired with USDG/WETH that we haven't read yet.
   const cache = loadSymbolCache(deps.symbolCacheFile);
   const todo = deps.state.tokens.slice(cache.upTo).filter((t) => qp.has(t.toLowerCase()) && !(t.toLowerCase() in cache.symbols));
+  // On a big chain this is thousands of names on the gentle scan lane, so it
+  // can take a while. Two things keep it visible and restart-safe:
+  //  - a progress line every `progressEvery` bundles (the status page shows
+  //    the latest one until the list is built), and
+  //  - the names read so far are saved at each progress line, so a restart
+  //    (e.g. a deploy) resumes where it stopped instead of starting over
+  //    (`upTo` only moves when the whole step is done; already-read names
+  //    are skipped by the `in cache.symbols` check above).
   const BUNDLE = 400;
-  for (let i = 0; i < todo.length; i += BUNDLE) {
+  const every = Math.max(1, deps.progressEvery ?? 10);
+  const t0 = Date.now();
+  log(`[groups] building: reading ${todo.length} coin name(s) (${Object.keys(cache.symbols).length} already known)`);
+  for (let i = 0, n = 0; i < todo.length; i += BUNDLE, n++) {
     const slice = todo.slice(i, i + BUNDLE);
     const res = await deps.callMany(slice.map((t) => ({ target: t, data: SEL_SYMBOL })));
     slice.forEach((t, j) => { cache.symbols[t.toLowerCase()] = decodeSymbol(res[j]) ?? ''; });
-    if (i + BUNDLE < todo.length) await sleep(deps.pauseMs ?? 2_000);
+    const done = Math.min(todo.length, i + BUNDLE);
+    if ((n + 1) % every === 0 && done < todo.length) {
+      saveJson(deps.symbolCacheFile, cache);
+      log(`[groups] building: coin names ${done} of ${todo.length} read (${Math.round((Date.now() - t0) / 1000)}s)`);
+    }
+    if (done < todo.length) await sleep(deps.pauseMs ?? 2_000);
   }
   cache.upTo = deps.state.tokens.length;
   saveJson(deps.symbolCacheFile, cache);
-  log(`[groups] symbols: ${todo.length} new read, ${Object.keys(cache.symbols).length} known`);
+  log(`[groups] symbols: ${todo.length} new read, ${Object.keys(cache.symbols).length} known (${Math.round((Date.now() - t0) / 1000)}s)`);
 
   // 2) Candidates by name (never trusted on its own).
   const cands = pickCandidates(Object.entries(cache.symbols).filter(([, s]) => s).map(([token, symbol]) => ({ token, symbol })));
   for (const t of [usdg, weth]) if (!cands.some((c) => c.token === t)) cands.push({ token: t, symbol: t === usdg ? 'USDG' : 'WETH', ...(t === usdg ? { kind: 'dollar' as const, group: 'Dollars' } : { kind: 'eth' as const, group: 'ETH' }) });
 
   // 3) Price each candidate on its USDG/WETH pools (plus WETH itself).
+  log(`[groups] building: pricing ${cands.length} candidate coin(s)`);
   const need = [...new Set(cands.map((c) => c.token))];
   const pools = [...new Map(need.flatMap((t) => qp.get(t) ?? []).filter((p) => !p.stable).map((p) => [p.pool.toLowerCase(), p])).values()];
   const toks = [...new Set([...need, usdg, weth, ...pools.flatMap((p) => [p.token0.toLowerCase(), p.token1.toLowerCase()])])];
