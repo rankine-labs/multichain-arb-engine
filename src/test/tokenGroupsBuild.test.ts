@@ -75,7 +75,7 @@ const pools: ScannedPool[] = coins.map((c, i) => ({ dex: 'uniswap-v2', kind: 'v2
   assert(asked2.length === 200, `resume reads only the 200 missing names (read ${asked2.length})`);
   assert(!asked2.some((t) => symbolsAsked.includes(t)), 'no name is read twice');
   assert(logs2.some((l) => /^\[groups\] symbols: 200 new read, 1000 known/.test(l)), 'finish line counts the full list');
-  assert(logs2.some((l) => /^\[groups\] building: \d+ candidate coin\(s\) by name/.test(l)), 'pricing step is logged');
+  assert(logs2.some((l) => /^\[groups\] building: \d+ named coin\(s\) with USDG\/WETH pools/.test(l)), 'pricing step is logged');
   const saved2 = JSON.parse(readFileSync(symbolCacheFile, 'utf8'));
   assert(saved2.upTo === state.tokens.length, 'step marked finished once all names are read');
   assert(Array.isArray(res.members) && existsSync(outFile), 'list built and saved');
@@ -153,7 +153,7 @@ async function realisticChain() {
   assert(!r.rejected.some((x) => junk.includes(x.token)), 'junk coins leave no notes in the rejected list');
   assert(junk.every((_, i) => !reservesAsked.has(A(0xa0000 + i))), 'junk pools never get the full price read (cheap check dropped them)');
   assert(reservesAsked.size <= 5, `full price read only for the few real pools (${reservesAsked.size})`);
-  assert(logs.some((l) => /pool\(s\) have enough USDG\/WETH in them/.test(l)), 'depth check result is logged');
+  assert(logs.some((l) => /pool\(s\) checked, \d+ deep enough; \d+ candidate coin\(s\), pricing \d+ pool\(s\)/.test(l)), 'depth check result is logged');
 
   // The cheap check is an upper bound: a pool right at the minimum still
   // passes it and is judged in full (here: $900 minimum, the $900 pool).
