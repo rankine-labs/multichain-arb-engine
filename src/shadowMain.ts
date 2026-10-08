@@ -101,6 +101,8 @@ import { makeCaller } from './core/universeScan';
 import { loadNodeUsage, saveNodeUsage, nodeUsageToday, NodeBudget, budgetForUrl, callsInBody } from './core/nodeBudget';
 import { endpointLabel } from './core/endpointLabel';
 import { ROBINHOOD_SEED_PAIRS } from './config/robinhoodSeedPairs';
+import { ResearchLane, researchConfigFromEnv, planShallowCandidate, findResearchGaps, gapCandidate, ResearchCandidate } from './core/researchLane';
+import { poolDepthUsd } from './core/poolPrice';
 
 async function main() {
 const cache = new PoolCache();
@@ -756,6 +758,7 @@ for (const sig of ['SIGINT', 'SIGTERM'] as const) {
             try { routeScores.save(ROUTE_FILE); } catch { /* best effort */ }
             try { rivalWatch.save(RIVAL_BOTS_FILE, RIVAL_TRADES_FILE); } catch { /* best effort */ }
             try { saveNodeUsage(); } catch { /* best effort */ }
+            try { if (research.enabled) research.save(RESEARCH_FILE); } catch { /* best effort */ }
             console.log(`[shutdown] ${sig}: state saved, exiting`);
             process.exit(0);
       });
@@ -895,6 +898,63 @@ const pickLender = (
       if (amount === null || !lenderBalances.lastRefreshMs) return null;
       return pickV3Lender(lenderCandidates(chain), tokenIn, exclude, (pool, token) => lenderBalances.canLend(pool, token, amount, LENDER_HEADROOM));
 };
+
+// RESEARCH LANE (core/researchLane.ts). Off unless RESEARCH_LANE=1.
+// Tests a small random sample of what the scanner below THROWS AWAY (under
+// the $0.50 check bar, partner pool under $25k, coin not vetted, standing gap
+// under $20) on the same checking node, within its own small allowance
+// (RESEARCH_RPC_PER_MIN, default 6 a minute). Test only: never trades, never
+// vets a coin, never changes any bar. It waits while the main checker is
+// busy or paused, and stops when the checking node's daily allowance is
+// mostly used. Results: [research] log lines, an hourly Telegram note and
+// data/research-lane.json.
+const RESEARCH_FILE = 'data/research-lane.json';
+const researchNode = budgetForUrl(wssToHttps(process.env.QUICKNODE_RPC_ROBINHOOD) || process.env.QUICKNODE_RPC_ROBINHOOD || simRpcUrl('robinhood').url);
+const research = new ResearchLane(researchConfigFromEnv(), {
+      rpc: simRpc.robinhood,
+      decimalsOf: (t) => TOKEN_DECIMALS.robinhood?.[t.toLowerCase()],
+      symbolOf: (t) => symbolOf('robinhood', t),
+      pickLender: (t, buy, sell, size, usd) => pickLender('robinhood', t, buy, sell, size, usd),
+      gasUsd: () => rhGasUsd(0.05),
+      weth: ROBINHOOD_TOKENS.WETH,
+      canRun: () => !simBusy.robinhood && !simOff('robinhood') && Date.now() >= (simPausedUntil.robinhood ?? 0)
+            && (!researchNode || researchNode.share() < research.config.maxNodeShare),
+});
+const usdRhResearch = (t: string) => priceOracle.getUsdPrice('robinhood', t);
+const isDeepRh = (p: PoolState) => deepEnough(p, decimalsOf, usdRhResearch);
+// Trigger trade with no $25k+ partner: plan it against the thinner partners (later, off the hot path).
+const researchShallow = (victim: PoolState, swap: { tokenIn: string; tokenOut: string; amountIn: bigint; stateType: any }, hash?: string) =>
+      planShallowCandidate({
+            cache, victim, swap, usdPerToken: usdRhResearch(swap.tokenIn), tokenInDecimals: TOKEN_DECIMALS.robinhood?.[swap.tokenIn.toLowerCase()],
+            isDeep: isDeepRh, depthUsd: (p) => poolDepthUsd(p, decimalsOf, usdRhResearch), minDepthUsd: research.config.minDepthUsd,
+            gasUsd: rhGasUsd(2), vetted: safetyGate.isAllowed(swap.tokenIn) && safetyGate.isAllowed(swap.tokenOut), triggerHash: hash,
+      });
+if (research.enabled) {
+      const restored = research.load(RESEARCH_FILE);
+      const c = research.config;
+      console.log(`[research] lane ON (test only, never trades): sampling ${c.samplePct}% of rejects, ${c.rpcPerMin} node requests/min${restored ? `, ${restored} past samples restored` : ''}`);
+      setInterval(() => { void research.tick(); }, 2_000);
+      setInterval(() => research.save(RESEARCH_FILE), 10 * 60_000);
+      // Standing gaps the main scanner ignores: prices already in memory only, no node requests.
+      setInterval(() => {
+            try {
+                  const pairs = robinhoodWatcher.watchedPairPools().map((addrs) => addrs.map((a) => cache.get('robinhood', a)).filter((p): p is PoolState => !!p));
+                  const gaps = findResearchGaps(pairs, isDeepRh, (p) => poolDepthUsd(p, decimalsOf, usdRhResearch), (t) => TOKEN_DECIMALS.robinhood?.[t.toLowerCase()], usdRhResearch,
+                        { mainMinUsd: Number(process.env.GAP_MIN_USD ?? 20), researchMinUsd: c.gapMinUsd, minDepthUsd: c.minDepthUsd, gasUsd: rhGasUsd(0.05), maxTradeUsd: Number(process.env.MAX_TRADE_USD ?? 5_000) });
+                  for (const { reason, gap } of gaps) {
+                        const vetted = safetyGate.isAllowed(gap.base) && safetyGate.isAllowed(gap.quote);
+                        // A standing gap sits there for minutes: one test per 30 min is enough.
+                        research.offer(reason, `${gap.buyPool.poolAddress}>${gap.sellPool.poolAddress}`, () => gapCandidate(reason, gap, vetted), 30 * 60_000);
+                  }
+            } catch (err) { console.warn('[research] gap look failed (ignored):', (err as Error).message); }
+      }, 60_000);
+      // Hourly: one line in the log, one short Telegram note (RESEARCH_TELEGRAM=0 turns the note off).
+      setInterval(() => {
+            const text = research.takeHour();
+            console.log(`[research] hour: ${text.replace(/<[^>]+>/g, '').replace(/\n/g, ' | ')}`);
+            if (process.env.RESEARCH_TELEGRAM !== '0') void sendTelegramMessage(text).catch(() => { /* logged by sender */ });
+      }, 60 * 60_000);
+}
 
 // ONE path from "this is worth doing" to a signed trade, used by both the
 // trade-triggered engine and the standing-gap scanner:
@@ -1173,7 +1233,15 @@ if (registerIfApproved('avalanche', entry.dex, resolved)) pool = resolved;
     // near-empty pool can show any price and would only waste a simulation.
     const cachedPeers = cache.findPeerPools(swap.chain, swap.tokenIn, swap.tokenOut, pool.poolAddress)
           .filter((p) => deepEnough(p, decimalsOf, (t) => priceOracle.getUsdPrice(swap.chain, t)));
-    if (cachedPeers.length === 0) { if (swap.chain === 'robinhood') funnel.noPartner++; return; }
+    if (cachedPeers.length === 0) {
+          if (swap.chain === 'robinhood') {
+                funnel.noPartner++;
+                // Research lane (off unless RESEARCH_LANE=1): maybe sample it; planned later, off this path.
+                const victim = pool, hash = (event.raw as any)?.hash;
+                if (research.enabled) research.offer('shallow_pool', victim.poolAddress, () => researchShallow(victim, swap, hash));
+          }
+          return;
+    }
     // Fast path: use our own up-to-date copy when it's recent (kept current by
     // instant price tracking + the 5s re-sync); only ask the RPC when stale.
     const [freshPool, ...peers] = swap.chain === 'robinhood'
@@ -1279,6 +1347,15 @@ if (swap.chain === 'robinhood') {
       if (sizing.grossProfitUsd < SIM_MIN_GROSS_USD) funnel.belowCheckBar++;
       else if (!simVetted) funnel.notVetted++;
       else funnel.sentToCheck++;
+      // Research lane (off unless RESEARCH_LANE=1): maybe sample what the check bar or the vetted list threw away.
+      if (research.enabled && (sizing.grossProfitUsd < SIM_MIN_GROSS_USD || !simVetted)) {
+            const rc: ResearchCandidate = {
+                  reason: sizing.grossProfitUsd < SIM_MIN_GROSS_USD ? 'below_sim_bar' : 'unvetted_token', source: 'trigger',
+                  tokenIn: swap.tokenIn, buyPool: buyPoolUsed, sellPool: sellPoolUsed, sizeUsd: sizing.optimalTradeSizeUsd,
+                  modelGrossUsd: sizing.grossProfitUsd, usdPerToken, vetted: simVetted, triggerHash: (event.raw as any)?.hash,
+            };
+            research.offer(rc.reason, `${buyPoolUsed.poolAddress}>${sellPoolUsed.poolAddress}`, () => rc);
+      }
 }
 if (sizing.grossProfitUsd >= SIM_MIN_GROSS_USD && simVetted) {
       queueSimulation(swap.chain, swap.tokenIn, buyPoolUsed, sellPoolUsed, sizing.optimalTradeSizeUsd, sizing.grossProfitUsd, usdPerToken, (event.raw as any)?.hash);
