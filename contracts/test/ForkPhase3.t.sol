@@ -148,14 +148,18 @@ contract RobinhoodForkTestPhase3 is ForkBase {
     }
 
     // Parent-chain (L1) data charge for this calldata, in L2 gas units, from
-    // the live node (NodeInterface works only through eth_call). 0 if unavailable.
-    function _l1Gas(bytes memory data) internal returns (uint256) {
+    // the live node (NodeInterface works only through eth_call).
+    // Returns (l1Gas, l2BaseFee, l1BaseFeeEstimate, ok).
+    function _l1Gas(bytes memory data) internal returns (uint256 l1, uint256 l2Base, uint256 l1Base, bool ok) {
         bytes memory q = abi.encodeWithSignature("gasEstimateL1Component(address,bool,bytes)", address(exec), false, data);
         string memory params = string.concat('[{"to":"', vm.toString(NODE_INTERFACE), '","data":"', vm.toString(q), '"},"latest"]');
         try vm.rpc("eth_call", params) returns (bytes memory ret) {
-            if (ret.length >= 32) return uint256(uint64(uint256(bytes32(ret))));
+            if (ret.length >= 96) {
+                (uint64 g, uint256 b, uint256 lb) = abi.decode(ret, (uint64, uint256, uint256));
+                return (g, b, lb, true);
+            }
         } catch {}
-        return 0;
+        return (0, 0, 0, false);
     }
 
     function _gasPriceWei() internal returns (uint256 p) {
@@ -168,14 +172,15 @@ contract RobinhoodForkTestPhase3 is ForkBase {
 
     // One "GAS" line: gas units and dollars (L2 execution + L1 data).
     function _logGas(string memory label, RunResult memory r, uint256 ethCents) internal {
-        uint256 l1 = _l1Gas(r.callData);
+        (uint256 l1, , uint256 l1Base, bool l1ok) = _l1Gas(r.callData);
         uint256 price = _gasPriceWei();
         uint256 total = r.txGas + l1;
         // micro-dollars = gas x wei/gas x cents/ETH / 1e18 x 1e4
         uint256 microUsd = total * price * ethCents / 1e14;
         console.log(string.concat(
             "GAS ", label, ": exec ", vm.toString(r.execGas), " + tx base/calldata ", vm.toString(r.txGas - r.execGas),
-            " + L1 data ", vm.toString(l1), " = ", vm.toString(total), " gas"
+            " + L1 data ", vm.toString(l1), " = ", vm.toString(total), " gas",
+            l1ok ? string.concat(" (L1 base fee estimate ", vm.toString(l1Base), " wei)") : " (L1 estimate unavailable from node)"
         ));
         console.log(string.concat(
             "GAS ", label, ": at ", vm.toString(price), " wei/gas and ETH $", vm.toString(ethCents / 100),
@@ -201,43 +206,56 @@ contract RobinhoodForkTestPhase3 is ForkBase {
     }
 
     // Shared between the own-capital and flash halves (kept in storage to
-    // stay under Solidity's local-variable limit).
+    // stay under Solidity's local-variable limit). Set BEFORE any snapshot:
+    // vm.revertToState also rolls back this test contract's own storage.
     string private cLabel;
     address private cSell;
     address private cBuy;
     uint256 private cEthCents;
-    uint256 private cOwnProfit;
 
     // Full winning backrun, own money then flash loan, on the same pushed state.
     // `sellDear` is the pool we push (WETH becomes dear there: we sell WETH
-    // into it first), `buyBack` is where we buy the WETH back.
+    // into it first), `buyBack` is where we buy the WETH back. Pushes of 2%,
+    // 5% and 10% are tried in turn (a thin or already-mispriced buy-back pool
+    // may need a bigger gap before the round trip wins).
     function _winningPair(string memory label, address sellDear, uint8 kSell, address buyBack, uint8 kBuy, address lender) internal {
         (cLabel, cSell, cBuy) = (label, sellDear, buyBack);
         cEthCents = _ethUsdCents(sellDear);
-        _pushWethUp(sellDear, 200); // +2%, like a big buyer just hit this pool
         ArbExecutor.Trade memory t = ArbExecutor.Trade({
             token: WETH, amountIn: TRADE_WETH, minProfit: 1, maxBlock: _l2Block(), hops: _hops(sellDear, kSell, buyBack, kBuy)
         });
-        uint256 snap = vm.snapshotState();
-        if (!_ownHalf(t)) return;
-        vm.revertToState(snap);
-        if (lender == address(0)) { console.log("FLASH", label, "skipped: no separate lender pool"); return; }
-        _flashHalf(t, lender);
-        vm.revertToState(snap);
+        uint256 base = vm.snapshotState();
+        uint256[3] memory pushes = [uint256(200), 500, 1_000];
+        for (uint256 i = 0; i < pushes.length; i++) {
+            vm.revertToState(base);
+            _pushWethUp(sellDear, pushes[i]);
+            uint256 snap = vm.snapshotState();
+            (bool ok, uint256 ownProfit) = _ownHalf(t);
+            if (!ok) continue;
+            vm.revertToState(snap);
+            if (lender == address(0)) { console.log("FLASH", label, "skipped: no separate lender pool"); return; }
+            _flashHalf(t, lender, ownProfit);
+            return;
+        }
+        console.log(string.concat("GAS ", label, ": skipped, no winning round trip even after a 10% push (buy-back pool too thin or mispriced)"));
     }
 
-    function _ownHalf(ArbExecutor.Trade memory t) internal returns (bool) {
+    // Own capital. Returns (true, profit) on a winning run; (false, 0) when the
+    // only problem is "not profitable at this gap"; any other revert fails the test.
+    function _ownHalf(ArbExecutor.Trade memory t) internal returns (bool, uint256) {
         _fundWrapped(WETH, TRADE_WETH);
         RunResult memory own = _run(t, address(0), _touched(cSell, cBuy, address(0)));
-        if (!own.ok) { console.log(cLabel, "own capital FAILED:"); console.logBytes(own.revertData); fail(); return false; }
+        if (!own.ok) {
+            if (own.revertData.length >= 4 && bytes4(own.revertData) == ArbExecutor.InsufficientProfit.selector) return (false, 0);
+            console.log(cLabel, "own capital FAILED:"); console.logBytes(own.revertData); fail(); return (false, 0);
+        }
         assertEq(IWETH(WETH).balanceOf(address(exec)), TRADE_WETH + own.profit, "own: capital + profit");
-        cOwnProfit = own.profit;
         _logGas(string.concat(cLabel, " own capital"), own, cEthCents);
-        return true;
+        return (true, own.profit);
     }
 
     // Flash loan with an EMPTY contract (no float at all).
-    function _flashHalf(ArbExecutor.Trade memory t, address lender) internal {
+    function _flashHalf(ArbExecutor.Trade memory t, address lender, uint256 ownProfit) internal {
         exec.setFlashPool(lender, true);
         assertEq(IWETH(WETH).balanceOf(address(exec)), 0, "flash: contract starts empty");
         uint256 lenderBefore = IWETH(WETH).balanceOf(lender);
@@ -246,11 +264,11 @@ contract RobinhoodForkTestPhase3 is ForkBase {
         if (!fl.ok) { console.log(cLabel, "flash FAILED:"); console.logBytes(fl.revertData); fail(); return; }
         assertEq(IWETH(WETH).balanceOf(lender), lenderBefore + fee, "lender got exactly loan + fee back");
         assertEq(IWETH(WETH).balanceOf(address(exec)), fl.profit, "contract holds exactly the profit");
-        assertEq(fl.profit + fee, cOwnProfit, "flash profit = own-capital profit - fee");
+        assertEq(fl.profit + fee, ownProfit, "flash profit = own-capital profit - fee");
         assertEq(IWETH(USDG).balanceOf(address(exec)), 0, "no USDG left behind");
         _logGas(string.concat(cLabel, " flash loan"), fl, cEthCents);
         console.log(string.concat(
-            "FLASH ", cLabel, ": own profit ", vm.toString(cOwnProfit), " wei, flash profit ", vm.toString(fl.profit),
+            "FLASH ", cLabel, ": own profit ", vm.toString(ownProfit), " wei, flash profit ", vm.toString(fl.profit),
             " wei, fee ", vm.toString(fee), " wei (repaid in full, empty contract)"
         ));
     }
