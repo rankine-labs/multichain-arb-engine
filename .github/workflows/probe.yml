@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       only:
-        description: 'Run one step only: feeds, sim, pairs, watch, universe, backtest, latency, lenders, smoke, seed, routers, v4, arbsys, nodes, multicall, simv1, ramsessim, routes (blank = all except backtest)'
+        description: 'Run one step only: feeds, sim, pairs, watch, universe, backtest, latency, lenders, smoke, seed, routers, v4, arbsys, nodes, multicall, simv1, ramsessim, routes, venues (blank = all except backtest)'
         required: false
         default: ''
 
@@ -51,6 +51,13 @@ jobs:
         shell: bash
         run: |
           timeout 3300 node .scripts-build/scripts/probe-routes-funding.js || true
+      # Extra venues (Oct 8): identify factories, map pools to exchanges and
+      # check our pricing maths against real swaps. Writes its own annotations.
+      - name: Venue identification and swap-maths validation (read-only)
+        if: inputs.only == 'venues'
+        shell: bash
+        run: |
+          timeout 2700 node .scripts-build/scripts/probe-venues.js || true
       - name: Ramses route check on the live node (bot's own simulation + trace)
         if: inputs.only == 'ramsessim'
         shell: bash
