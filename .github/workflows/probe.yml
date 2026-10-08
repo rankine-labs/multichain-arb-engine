@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       only:
-        description: 'Run one step only: feeds, sim, pairs, watch, universe, backtest, latency, lenders, smoke, seed, routers, v4, arbsys, nodes, multicall, simv1, ramsessim (blank = all except backtest)'
+        description: 'Run one step only: feeds, sim, pairs, watch, universe, backtest, latency, lenders, smoke, seed, routers, v4, arbsys, nodes, multicall, simv1, ramsessim, routes (blank = all except backtest)'
         required: false
         default: ''
 
@@ -43,6 +43,14 @@ jobs:
           echo "$out"
           out="${out//'%'/'%25'}"; out="${out//$'\n'/'%0A'}"
           echo "::notice title=simulateV1 probe::${out}"
+      # Phase 6 research: rival wins by route length (2, 3, 4+ pools) and how
+      # they would fare under each way of paying (flash loan fee vs own
+      # money). The script writes its own annotations. Read-only.
+      - name: Routes and funding study (rival wins, read-only)
+        if: inputs.only == 'routes'
+        shell: bash
+        run: |
+          timeout 3300 node .scripts-build/scripts/probe-routes-funding.js || true
       - name: Ramses route check on the live node (bot's own simulation + trace)
         if: inputs.only == 'ramsessim'
         shell: bash
