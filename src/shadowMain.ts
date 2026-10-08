@@ -86,6 +86,7 @@ import { FailTally } from './core/failReasons';
 import { LenderBalances } from './core/lenderBalances';
 import { RouteScores, WinSizes, WIN_BARS } from './core/routeScore';
 import { RivalWatch } from './core/rivalWatch';
+import { V3BalanceBook } from './core/v3BalanceBook';
 import { makeRpc, simulateRoundTrip, simRpcUrl, Rpc, makeFallbackRpc, loadBalanceSlots, wssToHttps, replayRpc, ReplayCall } from './execution/simulator';
 import { FastSender, SafetyGate, safetyConfigFromEnv } from './execution/fastSender';
 import { checkLiveReady } from './execution/liveReadiness';
@@ -795,16 +796,24 @@ const rivalWatch = new RivalWatch(
       (pool) => !!cache.get('robinhood', pool),
       ROBINHOOD_TOKENS.WETH,
       Date.now, 3_000,
-      // Money in the pool each coin's price comes from: trades in coins
-      // priced from a pool under $5k are left out of the rival money totals.
-      (token) => priceOracle.getUsdPriceInfo('robinhood', token)?.depthUsd ?? null,
+      {
+            // Money in the pool each coin's price comes from: trades in coins
+            // priced from a pool under $5k are left out of the rival money totals.
+            priceDepthUsd: (token) => priceOracle.getUsdPriceInfo('robinhood', token)?.depthUsd ?? null,
+            // V4 pools we know: does the pool hold plain ETH? (its ETH leg has
+            // no log, so such trades are marked "uncertain"). Unknown -> null.
+            v4IsNative: (id) => { const p = cache.get('robinhood', id); return p?.v4 ? p.v4.native : null; },
+            v4PoolManager: ROBINHOOD_V4.POOL_MANAGER,
+      },
 );
 {
       const n = rivalWatch.load(RIVAL_BOTS_FILE, RIVAL_TRADES_FILE);
       // Seed: arbitrage contracts found on chain by the funding probe (Oct 7).
       for (const b of ['0x8876789976decbfcbbbe364623c63652db8c0904', '0x1e7f0968bf0ad273d4edc75debc8bae037b0ad2c', '0x6e2a35a7ad683cf634d91492d73bb7ff774c6919',
             '0x5399d94d2cab7c252a6034042e1917a0e5e17a18', '0x203bffa697bee74d39d255c1c028e3efa689b5f7', '0x6c49cc864b3f8f6bef6559ef4f1662c408b84154',
-            '0x6aa80dbbed9ae5ab45fbf61f9644fada3b29326e', '0x7ddbd3952d9fd58cc7d344ad0931d08db072114a']) rivalWatch.addBot(b);
+            '0x6aa80dbbed9ae5ab45fbf61f9644fada3b29326e', '0x7ddbd3952d9fd58cc7d344ad0931d08db072114a']) rivalWatch.addBot(b, 'seed');
+      // Seeds are UNPROVEN until each earns 3 confirmed closed-loop wins in
+      // front of us; reports show verified vs unproven (rivalWatch.botStatus()).
       console.log(`[rivalwatch] following ${rivalWatch.botCount()} rival bots, ${n.recs} trades restored`);
 }
 // Sampler: one recent block every 15 s, to find rival bots we don't know yet.
@@ -819,7 +828,7 @@ let rivalResultsSeen = 0;
 setInterval(() => {
       for (; rivalResultsSeen < rivals.results.length; rivalResultsSeen++) {
             const r = rivals.results[rivalResultsSeen];
-            if (r.found && r.bot) rivalWatch.addBot(r.bot);
+            if (r.found && r.bot) rivalWatch.addBot(r.bot, 'tracker');
       }
 }, 60_000);
 setInterval(() => rivalWatch.save(RIVAL_BOTS_FILE, RIVAL_TRADES_FILE), 10 * 60_000);
@@ -1040,7 +1049,7 @@ if (chainOn('avalanche')) chainManager.register(new AvalancheAdapter());
 chainManager.onEvent(async (event: RawChainEvent) => {
 const t0 = Date.now();
 // Timestamp every Robinhood feed tx: lets the competitor tracker time rivals.
-if (event.chain === 'robinhood') { rivals.noteFeedTx((event.raw as any)?.hash, event.receivedAtMs); rivalWatch.noteTx((event.raw as any)?.to, (event.raw as any)?.hash); }
+if (event.chain === 'robinhood') { rivals.noteFeedTx((event.raw as any)?.hash, event.receivedAtMs); rivalWatch.noteTx((event.raw as any)?.to, (event.raw as any)?.hash, (event.raw as any)?.from, (event.raw as any)?.value); }
 
 const swap = await decoder.decode(event);
 if (!swap) return;
@@ -1690,6 +1699,21 @@ await chainManager.startAll();
             return rhScanCallMany(calls);
       };
 
+      // REAL V3 BALANCES (core/v3BalanceBook.ts, Phase 1 fix): every 10 min,
+      // one bundled read of the coins each cached V3 pool really holds, so the
+      // price oracle stops treating narrow-band pools as deep. Scan lane only,
+      // never the trading path. First read 2 min after start.
+      const v3Balances = new V3BalanceBook();
+      priceOracle.useBalances(v3Balances);
+      const refreshV3Balances = async () => {
+            try {
+                  const n = await v3Balances.refresh(scanCallMany, cache.allForChain('robinhood'));
+                  console.log(`[oracle] real V3 balances read: ${n}`);
+            } catch (err) { console.warn('[oracle] V3 balance read failed (kept old values):', (err as Error).message); }
+      };
+      setTimeout(() => { void refreshV3Balances(); }, 2 * 60_000);
+      setInterval(() => { void refreshV3Balances(); }, 10 * 60_000);
+
       // NEW POOL COUNTER (core/newPoolWatch.ts): new pools for coins that
       // already trade deep, and how far off their starting price was.
       // One log request a minute (two when a new pool for deep coins appears).
@@ -2086,7 +2110,7 @@ for (let i = 0; i < resolved.length; i++) {
                               },
                               reactionMs: { typical: stats.medianReactionMs, slowest5pct: stats.p95ReactionMs },
                               otherBots: { timed: rv.found, theirMs: rv.theirMedianMs, oursMs: rv.ourMedianMs, weBeat: rv.beatCount },
-                              rivalWins: { ...rivalWatch.takeHour(), botsKnown: rivalWatch.botCount() },
+                              rivalWins: { ...rivalWatch.takeHour(), botsKnown: rivalWatch.botCount(), botsVerified: rivalWatch.botStatus().verified },
                               newPools: hourNewPools ?? undefined,
                               nodeUsage: nodeUsageToday(),
                               funnel: {
@@ -2173,7 +2197,7 @@ for (let i = 0; i < resolved.length; i++) {
             const now = Date.now();
             const sum = rivalWatch.summary(now - 24 * 3600_000, now);
             const hours = Math.min(24, Math.max(0.1, (now - rivalWatch.firstRecordMs(now - 24 * 3600_000)) / 3600_000));
-            await sendTelegramMessage(formatRivalDaily({ dateLabel: torontoNow().date, hours, summary: sum, botsKnown: rivalWatch.botCount(),
+            await sendTelegramMessage(formatRivalDaily({ dateLabel: torontoNow().date, hours, summary: sum, botsKnown: rivalWatch.botCount(), botsVerified: rivalWatch.botStatus().verified,
                   newPools: newPoolWatchRef?.summary(now - 24 * 3600_000, now) }));
       };
       setInterval(async () => {

@@ -128,7 +128,7 @@ async function main() {
   const thin = summarize([{ ...base, grossUsd: 0.3, sizeUsd: 999_999, thinPrice: true }]);
   assert(thin.medianSizeUsd === null && thin.junk === 1, 'size priced from a shallow pool is not used');
   const rep = formatRivalDaily({ dateLabel: '2026-10-08', hours: 24, summary: clean, botsKnown: 9 });
-  assert(rep.includes('profit not trusted (junk coin prices, left out of the money below): 96') && !rep.includes('10,065') && !rep.includes('$10065'), 'report says 96 not trusted, no fake money');
+  assert(rep.includes('dollar result uncertain (left out of the money below): 96 (junk coin price 96)') && !rep.includes('10,065') && !rep.includes('$10065'), 'report says 96 not trusted, no fake money');
   assert(rep.includes('Verdict') && rivalVerdict(clean, 24).startsWith('⚠️ Small pie'), 'verdict judged on cleaned numbers');
   // Mostly junk: verdict waits rather than judging on a handful of real trades.
   const mostlyJunk = summarize([...Array.from({ length: 96 }, () => ({ ...base })), ...Array.from({ length: 5 }, () => ({ ...base, grossUsd: 5, sizeUsd: 1_000 }))]);

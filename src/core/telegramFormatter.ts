@@ -299,7 +299,7 @@ export interface PlainHourlyInput {
   reactionMs: { typical: number | null; slowest5pct: number | null };
   otherBots?: { timed: number; theirMs: number | null; oursMs: number | null; weBeat: number };
   // What the rival bots did this hour (core/rivalWatch.ts).
-  rivalWins?: RivalSummary & { botsKnown: number };
+  rivalWins?: RivalSummary & { botsKnown: number; botsVerified?: number };
   // New pools for coins that already trade deep (core/newPoolWatch.ts).
   newPools?: NewPoolSummary;
   topDifferences: { pair: string; pct: number; buyAt: string; sellAt: string }[];
@@ -424,8 +424,8 @@ export function formatPlainHourly(r: PlainHourlyInput): string {
   // What the other bots did: where the real money is, and how they make it.
   const rw = r.rivalWins;
   if (rw && (rw.trades > 0 || rw.botsKnown > 0)) {
-    L.push(`<b>What other bots did this hour</b> (following ${rw.botsKnown} bot${rw.botsKnown === 1 ? '' : 's'})`);
-    if (!rw.trades) L.push('No trades by them this hour.');
+    L.push(`<b>What other bots did this hour</b> (following ${rw.botsKnown} bot${rw.botsKnown === 1 ? '' : 's'}${rw.botsVerified !== undefined ? `, ${rw.botsVerified} verified` : ''})`);
+    if (!rw.trades) { L.push('No trades by them this hour.'); const c = sampleLine(rw); if (c) L.push(c); }
     else L.push(...rivalLines(rw));
     L.push('');
   }
@@ -531,29 +531,57 @@ export function formatExecutionWarning(): string {
 const cents = (n: number | null): string => (n === null ? '?' : n < 1 ? `${(n * 100).toFixed(n < 0.1 ? 2 : 1)}¢` : money(n));
 const share = (a: number, b: number): string => (b ? `${Math.round((100 * a) / b)}%` : '0%');
 
+// Plain-English labels for why a trade's dollar result isn't confirmed.
+const WHY_LABEL: Record<string, string> = {
+  'v4-native-leg': 'plain-ETH pool leg we can\'t see',
+  'v4-pool-unknown': 'V4 pool we can\'t check',
+  'native-eth-sent': 'sent plain ETH',
+  'open-position': 'not a closed loop',
+  'profit-sent-elsewhere': 'coins sent to another wallet',
+  'junk-price': 'junk coin price',
+  'gas-unpriced': 'gas not priced',
+};
+
+// Trades whose dollar result we trust (went through, priced, not junk, not uncertain).
+const trustedTrades = (s: RivalSummary): number => s.trades - s.failed - s.unpriced - (s.junk ?? 0) - (s.uncertain ?? 0);
+
 function rivalLines(s: RivalSummary): string[] {
   const L: string[] = [];
   const ok = s.trades - s.failed;     // trades that went through
-  const junk = s.junk ?? 0;
-  L.push(`Trades: ${s.trades} by ${s.bots} bot${s.bots === 1 ? '' : 's'}`);
-  L.push(`  ✅ made money after gas: ${s.wins}`);
-  L.push(`  ➖ broke even or lost: ${Math.max(0, ok - s.wins - s.unpriced - junk)}`);
+  const unsure = (s.junk ?? 0) + (s.uncertain ?? 0);
+  const confirmed = trustedTrades(s);
+  L.push(`Trades: ${s.trades} by ${s.bots} bot${s.bots === 1 ? '' : 's'}${s.verifiedBots !== undefined ? ` (${s.verifiedBots} verified)` : ''}`);
+  L.push(`  ✅ made money after gas (confirmed): ${s.wins}`);
+  L.push(`  ➖ broke even or lost (confirmed): ${Math.max(0, confirmed - s.wins)}`);
+  // Seen but dollar result not trusted: never shown as profit or loss.
+  if (unsure) {
+    const why = (s.whyUncertain ?? []).slice(0, 3).map(([w, n]) => `${WHY_LABEL[w] ?? w} ${n}`).join(', ');
+    L.push(`  ❔ dollar result uncertain (left out of the money below): ${unsure}${why ? ` (${why})` : ''}`);
+  }
   if (s.unpriced) L.push(`  ❔ coins we can't price: ${s.unpriced}`);
-  // Junk coins: their pool prices are distorted, so the "profit" is nonsense.
-  if (junk) L.push(`  ❔ profit not trusted (junk coin prices, left out of the money below): ${junk}`);
   if (s.failed) L.push(`  ✖️ failed but still paid gas: ${s.failed}`);
-  L.push(`Money: made ${money(s.grossUsd)}, paid ${money(s.gasUsd)} gas, kept ${money(s.netUsd)}`);
+  // The money lines add up exactly: kept = made - gas on confirmed - gas on failed.
+  const gc = s.gasConfirmedUsd ?? s.gasUsd, gf = s.gasFailedUsd ?? 0, gu = s.gasUnknownUsd ?? 0;
+  L.push(`Money (confirmed trades): made ${money(s.grossUsd)} - gas ${money(gc)} - failed-trade gas ${money(gf)} = kept ${money(s.netUsd)}`);
+  if (gu > 0) L.push(`Gas on uncertain/unpriced trades: ${money(gu)} (if those made nothing, kept ${money(s.netWorstUsd ?? s.netUsd - gu)})`);
   L.push(`Typical trade: puts in ${s.medianSizeUsd === null ? '?' : money(s.medianSizeUsd)}, a win makes ${cents(s.medianWinUsd)}, gas ${cents(s.medianGasUsd)}`);
   // Route shapes only count trades that went through (failed ones show 0 pools).
   L.push(`Routes (trades that went through): 2 pools ${share(s.routes.two, ok)}, 3 pools ${share(s.routes.three, ok)}, 4+ pools ${share(s.routes.fourPlus, ok)}`);
-  L.push(`Money source: own money ${share(s.trades - s.flash, s.trades)}, flash loans ${share(s.flash, s.trades)}`);
+  // Flash = a real flash-loan event. A normal V3 swap paying first is NOT a loan.
+  L.push(`Money source: own money ${share(ok - s.flash, ok)}, flash loans ${share(s.flash, ok)}`);
   for (const [pair, n, usd] of s.byPair.slice(0, 5)) L.push(`  • ${esc(pair)}: ${n} wins, ${money(usd)}`);
   L.push(`On trading spots we watch: ${s.onOurPools} of ${s.trades}`);
+  const c = sampleLine(s);
+  if (c) L.push(c);
   return L;
 }
 
-// Trades whose dollar result we trust (went through, priced, not junk).
-const trustedTrades = (s: RivalSummary): number => s.trades - s.failed - s.unpriced - (s.junk ?? 0);
+// Chain-wide sample: what share of the market these numbers cover.
+function sampleLine(s: RivalSummary): string | null {
+  const sm = s.sample;
+  return sm && sm.blocks ? `Chain sample: ${sm.blocks} blocks read, ${sm.arbs} rival-style trades, ${share(sm.followed, sm.arbs)} by bots we follow` : null;
+}
+
 
 // Lessons the numbers teach, one line each.
 export function rivalLessons(s: RivalSummary): string[] {
@@ -563,10 +591,12 @@ export function rivalLessons(s: RivalSummary): string[] {
   if (s.medianWinUsd !== null && s.medianGasUsd) out.push(`Gas is about ${cents(s.medianGasUsd)} a trade, so one typical win pays for about ${Math.floor(s.medianWinUsd / s.medianGasUsd)} misses.`);
   const loops = s.routes.three + s.routes.fourPlus;
   if (ok) out.push(`${share(loops, ok)} of their trades that went through are 3+ pool loops. Our bot can't do those yet.`);
-  if (s.trades) out.push(`${share(s.flash, s.trades)} used flash loans; the rest used their own money.`);
+  if (ok) out.push(`${share(s.flash, ok)} used flash loans; the rest used their own money.`);
   if (s.trades) out.push(`${share(s.onOurPools, s.trades)} were on pools we watch. The rest is money we can't even see yet.`);
   if (s.failed) out.push(`${s.failed} trades failed outright and still paid gas. Sending lots and accepting misses is part of the game.`);
   if (s.junk) out.push(`${s.junk} trades were in junk coins whose prices can't be trusted, so their "profit" is left out.`);
+  if (s.uncertain) out.push(`${s.uncertain} more trades had a dollar result we can't confirm (e.g. a plain-ETH leg), so they're left out too. Their gas still counts.`);
+  if (s.sample && s.sample.arbs >= 10) out.push(`In sampled blocks we follow the bots behind ${share(s.sample.followed, s.sample.arbs)} of rival-style trades. The rest of the market is bigger than these numbers.`);
   return out;
 }
 
@@ -581,20 +611,20 @@ export function rivalVerdict(s: RivalSummary, hours: number): string {
   return `✅ Worth building Stage 1: the bots we follow keep about ${money(perDay)} a day after gas, and gas is cheap compared with a win.`;
 }
 
-export function formatRivalDaily(input: { dateLabel: string; hours: number; summary: RivalSummary; botsKnown: number; newPools?: NewPoolSummary }): string {
+export function formatRivalDaily(input: { dateLabel: string; hours: number; summary: RivalSummary; botsKnown: number; botsVerified?: number; newPools?: NewPoolSummary }): string {
   const s = input.summary;
   const L: string[] = [];
   // "New pools" section goes at the end (also when there are no rival trades yet).
   const withNewPools = (out: string[]) => (input.newPools ? [...out, '', ...newPoolsSection(input.newPools)] : out);
   L.push(`📚 <b>RIVAL BOT REPORT</b> · ${esc(input.dateLabel)} (last ${Math.round(input.hours)} h)`);
-  L.push(`Following ${input.botsKnown} rival bot${input.botsKnown === 1 ? '' : 's'}. Numbers are for those bots only, so the real total is at least this.`);
+  L.push(`Following ${input.botsKnown} rival bot${input.botsKnown === 1 ? '' : 's'}${input.botsVerified !== undefined ? ` (${input.botsVerified} verified with 3+ confirmed wins, the rest unproven)` : ''}. Numbers are for those bots only, so the real total is at least this.`);
   L.push('');
   if (!s.trades) { L.push('No rival trades recorded yet.'); return withNewPools(L).join('\n'); }
   L.push(...rivalLines(s));
   L.push('');
   L.push('<b>Top bots</b> (kept after gas)');
   for (const b of s.byBot.slice(0, 5)) {
-    L.push(`  • ${b.bot.slice(0, 8)}…: ${b.trades} trades, kept ${money(b.netUsd)}, puts in ${b.medianSizeUsd === null ? '?' : money(b.medianSizeUsd)}, ${b.avgPools.toFixed(1)} pools avg (trades that went through)${b.flash ? `, flash loans ${b.flash}x` : ''}`);
+    L.push(`  • ${b.bot.slice(0, 8)}…${b.verified ? '' : ' (unproven)'}: ${b.trades} trades, kept ${money(b.netUsd)}, puts in ${b.medianSizeUsd === null ? '?' : money(b.medianSizeUsd)}, ${b.avgPools.toFixed(1)} pools avg (trades that went through)${b.flash ? `, flash loans ${b.flash}x` : ''}`);
   }
   L.push('');
   L.push('<b>What we learn</b>');
