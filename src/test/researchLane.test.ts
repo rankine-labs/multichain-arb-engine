@@ -107,6 +107,14 @@ function makeLane(over: Partial<ResearchConfig> = {}, deps: Partial<ResearchDeps
             assert(lane.statsFor('below_sim_bar').sampled === 4, 'after the window the same route can be sampled again');
       }
       {
+            // Standing gaps pass a longer window (30 min): re-offers inside it are ignored.
+            const { lane, advance } = makeLane({ dedupeMs: 60_000 });
+            lane.offer('gap_below_min', 'g', () => cand(), 30 * 60_000);
+            advance(5 * 60_000);
+            lane.offer('gap_below_min', 'g', () => cand(), 30 * 60_000);
+            assert(lane.statsFor('gap_below_min').sampled === 1, 'a per-offer window (30 min for gaps) overrides the default');
+      }
+      {
             const { lane } = makeLane();
             lane.offer('below_sim_bar', 'x', () => { throw new Error('boom'); });
             let threw = false;

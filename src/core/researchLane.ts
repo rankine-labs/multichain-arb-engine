@@ -245,7 +245,7 @@ const noReason = (r: SimResult) => r.status === 'fail' && /execution reverted\s*
 
 export class ResearchLane {
       private queues = new Map<ResearchReason, Queued[]>();
-      private recent = new Map<string, number>();      // dedupe: key -> when last sampled
+      private recent = new Map<string, number>();      // dedupe: key -> not sampled again until
       private rr = 0;                                    // round-robin pointer over reasons
       private busy = false;
       private pausedUntil = 0;
@@ -274,18 +274,20 @@ export class ResearchLane {
 
       // ---- Called from the main scanner (must stay cheap and never throw) ----
       // reason: why the main scanner rejected it. key: identifies the route,
-      // for the "once per route per 2 min" rule. make: builds the candidate
-      // later, on the lane's own time (so planning never slows the scanner).
-      offer(reason: ResearchReason, key: string, make: () => ResearchCandidate | null): void {
+      // for the "once per route per 2 min" rule (dedupeMs overrides the 2 min,
+      // e.g. standing gaps sit there for minutes and only need one test).
+      // make: builds the candidate later, on the lane's own time (so planning
+      // never slows the scanner).
+      offer(reason: ResearchReason, key: string, make: () => ResearchCandidate | null, dedupeMs = this.config.dedupeMs): void {
             if (!this.config.enabled) return;
             try {
                   this.stats(reason, (s) => { s.offered++; });
                   if (!(this.random() * 100 < this.config.samplePct)) return;
                   const now = this.now();
                   const k = `${reason}|${key.toLowerCase()}`;
-                  if (now - (this.recent.get(k) ?? -Infinity) < this.config.dedupeMs) return;
-                  this.recent.set(k, now);
-                  if (this.recent.size > 5_000) for (const [rk, t] of this.recent) if (now - t >= this.config.dedupeMs) this.recent.delete(rk);
+                  if (now < (this.recent.get(k) ?? -Infinity)) return;
+                  this.recent.set(k, now + dedupeMs);
+                  if (this.recent.size > 5_000) for (const [rk, until] of this.recent) if (now >= until) this.recent.delete(rk);
                   const q = this.queues.get(reason)!;
                   q.push({ key: k, make, at: now });
                   this.stats(reason, (s) => { s.sampled++; });
