@@ -71,6 +71,36 @@ const INIT_TOPIC = '0xdd466e674ea557f56295e2d0218a125ea4b4f0f6f3307b95f85e611083
     const b = '0x' + Math.max(1, latest - age).toString(16);
     show(`eth_getBalance ${age} blocks back`, await rpc('eth_getBalance', [tx.from, b]));
   }
+  // State window: how many blocks back does the node still answer
+  // eth_getBalance? (Only recent state is kept; replays must happen inside it.)
+  const now = Number((await rpc('eth_blockNumber', [])).result);
+  for (const age of [16, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536]) {
+    const r = await rpc('eth_getBalance', [tx.from, '0x' + (now - age).toString(16)]);
+    out.push(`${r.result !== undefined ? 'OK  ' : 'FAIL'} state ${age} blocks back${r.error ? ': ' + String(r.error.message).slice(0, 60) : ''}`);
+  }
+  // JSON-RPC batch: several questions in one HTTP request.
+  try {
+    const res = await fetch(URL_, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify([
+      { jsonrpc: '2.0', id: 1, method: 'eth_blockNumber', params: [] },
+      { jsonrpc: '2.0', id: 2, method: 'eth_chainId', params: [] },
+    ]) });
+    const j = await res.json();
+    out.push(`${Array.isArray(j) && j.length === 2 ? 'OK  ' : 'FAIL'} JSON-RPC batch: HTTP ${res.status} ${JSON.stringify(j).slice(0, 120)}`);
+  } catch (e) { out.push(`FAIL JSON-RPC batch: ${(e as Error).message}`); }
+  await sleep(PACE_MS);
+  // Multicall3 deployed? (the bot's pool discovery already relies on it)
+  show('Multicall3 code size', await rpc('eth_getCode', ['0xcA11bde05977b3631167028862bE2a173976CA11', 'latest']).then((r) => (r.result ? { result: (r.result.length - 2) / 2 } : r)));
+  // eth_simulateV1 on a RECENT parent with traceTransfers (native ETH moves
+  // reported as synthetic Transfer logs): exact native accounting without a tracer.
+  const recent = now - 5;
+  const blkFull = (await rpc('eth_getBlockByNumber', ['0x' + recent.toString(16), true])).result;
+  const userTxs = (blkFull?.transactions ?? []).filter((t: any) => t.to && ['0x0', '0x1', '0x2'].includes(t.type));
+  if (userTxs.length) {
+    const t0 = userTxs[0];
+    const sim = await rpc('eth_simulateV1', [{ blockStateCalls: [{ blockOverrides: { time: blkFull.timestamp, gasLimit: '0x77359400' }, calls: [{ from: t0.from, to: t0.to, data: t0.input, value: t0.value, gas: t0.gas }] }], validation: false, traceTransfers: true }, '0x' + (recent - 1).toString(16)]);
+    const c = sim.result?.[0]?.calls?.[0];
+    out.push(`${c ? 'OK  ' : 'FAIL'} eth_simulateV1 recent parent + traceTransfers: ${c ? `status ${c.status}, ${c.logs?.length} logs, synthetic ETH logs ${(c.logs ?? []).filter((l: any) => String(l.address).toLowerCase() === '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee').length}, tx value ${t0.value}` : JSON.stringify(sim.error).slice(0, 160)}`);
+  }
   const text = out.join('\n');
   console.log(text);
   const esc = (s: string) => s.replace(/%/g, '%25').replace(/\r/g, '').replace(/\n/g, '%0A');
