@@ -174,8 +174,8 @@ async function main() {
   // The public node only keeps recent state (a few hundred blocks, i.e.
   // seconds on this chain), so each swap is checked right after its block
   // appears: read the newest block, then the pool state one block before.
-  const stats = new Map<string, { tested: number; inBand: number[]; price: number[]; crossed: number; earlier: number; feeMismatch: number; lines: string[] }>();
-  const st = (v: string) => stats.get(v) ?? stats.set(v, { tested: 0, inBand: [], price: [], crossed: 0, earlier: 0, feeMismatch: 0, lines: [] }).get(v)!;
+  const stats = new Map<string, { tested: number; inBand: number[]; price: number[]; crossed: number; earlier: number; feeMismatch: number; lines: string[]; feeExamples: string[] }>();
+  const st = (v: string) => stats.get(v) ?? stats.set(v, { tested: 0, inBand: [], price: [], crossed: 0, earlier: 0, feeMismatch: 0, lines: [], feeExamples: [] }).get(v)!;
   const wanted = (v: string) => !v.startsWith('factory ') && v !== 'no factory()' && v !== 'uniswap-v4 (other)';
   const deadline = Date.now() + Number(process.env.PROBE_VALIDATE_MIN ?? 14) * 60_000;
   let lastSeen = 0;
@@ -249,7 +249,7 @@ async function main() {
         if (v4) {
           sqrtP = word(res[i], 0); liq = word(res[i + 1], 0);
           const lpFee = word(res[i], 3), evFee = Number(word(x.data, 5));
-          if (lpFee !== null && Number(lpFee) !== evFee) v.feeMismatch++;
+          if (lpFee !== null && Number(lpFee) !== evFee) { v.feeMismatch++; if (v.feeExamples.length < 12) v.feeExamples.push(`${evFee}/${lpFee}`); }
           feePips = evFee; // the fee this swap really paid (hooks may change it per swap)
         } else {
           sqrtP = word(res[i], 0) ?? word(res[i + 1], 0); liq = word(res[i + 2], 0);
@@ -276,9 +276,11 @@ async function main() {
   const q = (xs: number[], f: number) => { const a = [...xs].sort((m, n) => m - n); return a.length ? a[Math.min(a.length - 1, Math.floor(a.length * f))] : NaN; };
   const summary: string[] = [firstErr ? `first state-read error: ${firstErr}` : 'state reads ok'];
   for (const [venue, v] of [...stats.entries()].sort((a, b) => b[1].tested - a[1].tested)) {
-    summary.push(`${venue}: tested ${v.tested}, in-band ${v.inBand.length} (out err median ${q(v.inBand, 0.5).toFixed(3)} bps, p90 ${q(v.inBand, 0.9).toFixed(3)}, worst ${q(v.inBand, 1).toFixed(3)}; price err median ${q(v.price, 0.5).toFixed(3)}), crossed ${v.crossed}${v.feeMismatch ? `, hook fee differed from pool fee ${v.feeMismatch}x` : ''}, later-in-block skips ${v.earlier}`);
+    summary.push(`${venue}: tested ${v.tested}, in-band ${v.inBand.length} (out err median ${q(v.inBand, 0.5).toFixed(3)} bps, p90 ${q(v.inBand, 0.9).toFixed(3)}, worst ${q(v.inBand, 1).toFixed(3)}; price err median ${q(v.price, 0.5).toFixed(3)}), crossed ${v.crossed}${v.feeMismatch ? `, hook fee differed from pool fee ${v.feeMismatch}x (charged/pool: ${v.feeExamples.join(' ')})` : ''}, later-in-block skips ${v.earlier}`);
   }
   note('Validation summary (our maths vs real swaps)', summary.join('\n'));
-  for (const [venue, v] of stats) if (v.lines.length) note(`Validate ${venue}`, v.lines.slice(0, 15).join('\n'));
+  // GitHub shows only ~10 notices per step: details for the NEW venues only.
+  const isNew = (v: string) => ROBINHOOD_VENUES.some((x) => x.id === v);
+  for (const [venue, v] of [...stats.entries()].filter(([k]) => isNew(k)).slice(0, 7)) if (v.lines.length) note(`Validate ${venue}`, v.lines.slice(0, 15).join('\n'));
 }
 main().catch((e) => { note('Venue probe failed', String(e?.message ?? e)); process.exitCode = 0; });
