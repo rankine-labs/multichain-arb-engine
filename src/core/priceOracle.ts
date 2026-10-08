@@ -49,8 +49,14 @@ export type StrictDecimals = (chain: string, token: string) => number | undefine
 // $2,500 (was $500): thin junk pools were a likely source of absurd prices.
 const MIN_ANCHOR_USD = Number(process.env.ORACLE_MIN_ANCHOR_USD ?? 2_500);
 
+// A USD price plus where it came from. depthUsd is the rough total money in
+// the pool the price was read from (2 x its anchor side, the usual
+// "both sides are worth the same" estimate); Infinity for a stablecoin.
+// Used by reports to ignore prices that come from shallow pools.
+export interface PriceInfo { px: number; depthUsd: number; pool: string | null }
+
 export class PriceOracle {
-  private memo = new Map<string, { px: number | null; at: number }>();
+  private memo = new Map<string, { info: PriceInfo | null; at: number }>();
 
   constructor(
     private cache: PoolCache,
@@ -65,21 +71,28 @@ export class PriceOracle {
   }
 
   getUsdPrice(chain: ChainName, tokenAddress: string): number | null {
-    if (this.isStable(chain, tokenAddress)) return 1.0;
+    return this.getUsdPriceInfo(chain, tokenAddress)?.px ?? null;
+  }
+
+  // Same price as getUsdPrice, plus how deep the pool behind it is.
+  getUsdPriceInfo(chain: ChainName, tokenAddress: string): PriceInfo | null {
+    if (this.isStable(chain, tokenAddress)) return { px: 1.0, depthUsd: Infinity, pool: null };
     const key = `${chain}:${tokenAddress.toLowerCase()}`;
     const hit = this.memo.get(key);
     const t = this.now();
-    if (hit && t - hit.at < this.memoMs) return hit.px;
+    if (hit && t - hit.at < this.memoMs) return hit.info;
 
-    const px = this.directStablePrice(chain, tokenAddress) ?? this.oneHopStablePrice(chain, tokenAddress);
-    this.memo.set(key, { px, at: t });
+    const best = this.directStablePrice(chain, tokenAddress) ?? this.oneHopStablePrice(chain, tokenAddress);
+    // Total pool money ~ 2 x the anchor side (the side we can value).
+    const info = best ? { px: best.px, depthUsd: 2 * best.depthUsd, pool: best.pool } : null;
+    this.memo.set(key, { info, at: t });
     if (this.memo.size > 5_000) this.memo.clear(); // bound memory
-    return px;
+    return info;
   }
 
   // Price of `token` in `anchor` units on pool p, plus how much USD sits on
   // the anchor side (used to pick the deepest pool). null if unusable.
-  private quote(p: PoolState, token: string, anchorUsd: number): { px: number; depthUsd: number } | null {
+  private quote(p: PoolState, token: string, anchorUsd: number): { px: number; depthUsd: number; pool: string } | null {
     const decT = this.decimals(p.chain, token);
     const other = p.tokenA.toLowerCase() === token.toLowerCase() ? p.tokenB : p.tokenA;
     const decO = this.decimals(p.chain, other);
@@ -91,7 +104,7 @@ export class PriceOracle {
     const anchorAmt = p.tokenA.toLowerCase() === other.toLowerCase() ? r.a : r.b;
     const depthUsd = anchorAmt * anchorUsd;
     if (!(depthUsd >= MIN_ANCHOR_USD)) return null;
-    return { px: px * anchorUsd, depthUsd };
+    return { px: px * anchorUsd, depthUsd, pool: p.poolAddress.toLowerCase() };
   }
 
   // Pools on this chain that contain `token`, with the other token.
@@ -107,29 +120,29 @@ export class PriceOracle {
   }
 
   // Deepest pool pairing the token directly with a stablecoin.
-  private directStablePrice(chain: ChainName, token: string): number | null {
-    let best: { px: number; depthUsd: number } | null = null;
+  private directStablePrice(chain: ChainName, token: string): { px: number; depthUsd: number; pool: string } | null {
+    let best: { px: number; depthUsd: number; pool: string } | null = null;
     for (const { p, other } of this.poolsWith(chain, token)) {
       if (!this.isStable(chain, other)) continue;
       const q = this.quote(p, token, 1);
       if (q && (!best || q.depthUsd > best.depthUsd)) best = q;
     }
-    return best ? best.px : null;
+    return best;
   }
 
   // Deepest pool pairing the token with an intermediate that has a direct
   // stable price (TOKEN/WETH -> WETH/USDG).
-  private oneHopStablePrice(chain: ChainName, token: string): number | null {
-    let best: { px: number; depthUsd: number } | null = null;
+  private oneHopStablePrice(chain: ChainName, token: string): { px: number; depthUsd: number; pool: string } | null {
+    let best: { px: number; depthUsd: number; pool: string } | null = null;
     const midPx = new Map<string, number | null>();
     for (const { p, other } of this.poolsWith(chain, token)) {
       if (this.isStable(chain, other)) continue; // direct case, already tried
-      if (!midPx.has(other)) midPx.set(other, this.directStablePrice(chain, other));
+      if (!midPx.has(other)) midPx.set(other, this.directStablePrice(chain, other)?.px ?? null);
       const mid = midPx.get(other);
       if (!mid) continue;
       const q = this.quote(p, token, mid);
       if (q && (!best || q.depthUsd > best.depthUsd)) best = q;
     }
-    return best ? best.px : null;
+    return best;
   }
 }

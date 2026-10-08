@@ -1,5 +1,5 @@
 import { ethers } from 'ethers';
-import { RivalWatch, summarize, RivalRec } from '../core/rivalWatch';
+import { RivalWatch, summarize, RivalRec, isJunkProfit } from '../core/rivalWatch';
 import { formatPlainHourly, formatRivalDaily, rivalVerdict, rivalLessons } from '../core/telegramFormatter';
 
 function assert(cond: boolean, msg: string) {
@@ -57,7 +57,7 @@ async function main() {
   const s = summarize(recs);
   assert(s.trades === 5 && s.wins === 2 && s.failed === 1 && s.unpriced === 1, 'counts: 2 wins, 1 failed, 1 unpriced');
   assert(Math.abs(s.netUsd - (34.965 + 0.09 - 0.01 - 0.01)) < 1e-6, 'kept after gas adds up (failed trades count their gas)');
-  assert(s.routes.two === 3 && s.routes.three === 1 && s.routes.fourPlus === 1 && s.flash === 1 && s.onOurPools === 1, 'routes, flash and watched counted');
+  assert(s.routes.two === 2 && s.routes.three === 1 && s.routes.fourPlus === 1 && s.flash === 1 && s.onOurPools === 1, 'routes (failed trades left out), flash and watched counted');
   assert(s.bots === 2 && s.byBot[0].bot === BOT, 'bots ranked by money kept');
 
   // --- sampler finds new bots, ignores trading apps -----------------------------
@@ -85,7 +85,7 @@ async function main() {
     earned: { todayChecked: 0, todayCheckedCount: 0, todayUnchecked: 0, todayUncheckedCount: 0, weekChecked: 0 },
     reactionMs: { typical: 5, slowest5pct: 9 }, topDifferences: [], rivalWins: { ...s, botsKnown: 8 },
   });
-  assert(hourly.includes('What other bots did this hour') && hourly.includes('failed but still paid gas: 1') && hourly.includes('Routes: 2 pools 60%, 3 pools 20%, 4+ pools 20%'), 'hourly section shows trades, failures, routes');
+  assert(hourly.includes('What other bots did this hour') && hourly.includes('failed but still paid gas: 1') && hourly.includes('Routes (trades that went through): 2 pools 50%, 3 pools 25%, 4+ pools 25%'), 'hourly section shows trades, failures, routes');
   const daily = formatRivalDaily({ dateLabel: '2026-10-08', hours: 24, summary: s, botsKnown: 8 });
   assert(daily.includes('RIVAL BOT REPORT') && daily.includes('Top bots') && daily.includes('What we learn') && daily.includes('Verdict'), 'daily report has all parts');
   assert(rivalLessons(s).some((l) => l.includes('3+ pool loops')), 'lessons mention loops');
@@ -94,5 +94,52 @@ async function main() {
   assert(rivalVerdict(many, 1).startsWith('✅'), 'big pie and cheap gas -> worth building');
   const small = summarize(Array.from({ length: 50 }, () => ({ ...rec, grossUsd: 0.02, gasUsd: 0.01 })));
   assert(rivalVerdict(small, 24).startsWith('⚠️ Small pie'), 'small pie -> warning');
+
+  // --- junk coin prices (ORBIO-like cases, Oct 8 report) -------------------------
+  const ORBIO_BOT = '0x00000000000000000000000000000000000000b9';
+  const base: RivalRec = { t: clock, bot: ORBIO_BOT, pair: 'ORBIO/WETH', pools: 2, sizeUsd: 120, grossUsd: 104.8, gasUsd: 0.01, failed: false, flash: false, ours: false };
+  // 1) $104.80 "profit" on $120 put in: 87%, impossible for arbitrage.
+  assert(isJunkProfit(base), 'profit 87% of trade size -> not trusted');
+  // 2) Size unknown and "profit" over $5: not trusted. Under $5: fine.
+  assert(isJunkProfit({ ...base, sizeUsd: null, grossUsd: 40 }) && !isJunkProfit({ ...base, sizeUsd: null, grossUsd: 0.4 }), 'no size: over $5 not trusted, small profit kept');
+  // 3) Hugely negative from a distorted price (the -$24,742 day) is junk too.
+  assert(isJunkProfit({ ...base, grossUsd: -24_000, sizeUsd: 300 }), 'impossible LOSS is junk too');
+  // 4) Priced from a shallow pool: junk even if the ratio looks fine.
+  assert(isJunkProfit({ ...base, grossUsd: 0.5, sizeUsd: 300, thinPrice: true }), 'shallow price pool -> not trusted');
+  // 5) A normal small win stays.
+  assert(!isJunkProfit({ ...base, grossUsd: 0.6, sizeUsd: 300 }), 'normal 0.2% win is trusted');
+  assert(!isJunkProfit({ ...base, failed: true, grossUsd: null }), 'failed trades are never "junk"');
+
+  // 96 ORBIO "wins" of ~$104.84 (the fake $10,065) + 30 real small wins + 10 failures.
+  const orbio: RivalRec[] = [
+    ...Array.from({ length: 96 }, () => ({ ...base })),
+    ...Array.from({ length: 30 }, () => ({ ...base, bot: BOT, pair: 'USDG/WETH', grossUsd: 0.5, sizeUsd: 2_000 })),
+    ...Array.from({ length: 10 }, () => ({ ...base, failed: true, pools: 0, grossUsd: null, sizeUsd: null, pair: '(failed)' })),
+  ];
+  const clean = summarize(orbio);
+  assert(clean.junk === 96 && clean.wins === 30 && clean.failed === 10 && clean.trades === 136, 'junk counted separately; real wins and failures kept');
+  assert(Math.abs(clean.grossUsd - 15) < 1e-6, 'money totals ignore the fake $10,065');
+  assert(Math.abs(clean.netUsd - (30 * 0.49 - 10 * 0.01)) < 1e-6, 'kept = real wins after gas minus failed gas');
+  assert(!clean.byPair.some(([p]) => p === 'ORBIO/WETH'), 'ORBIO not listed as a winning pair');
+  const ob = clean.byBot.find((b) => b.bot === ORBIO_BOT)!;
+  assert(Math.abs(ob.netUsd + 0.1) < 1e-6 && ob.trades === 106, 'ORBIO bot keeps only its real gas losses');
+  assert(ob.avgPools === 2, 'avg pools ignores failed trades (would be 1.8 with them)');
+  assert(clean.medianSizeUsd === 2_000 && ob.medianSizeUsd === null, 'junk trades\' sizes are left out of "typical trade"');
+  const thin = summarize([{ ...base, grossUsd: 0.3, sizeUsd: 999_999, thinPrice: true }]);
+  assert(thin.medianSizeUsd === null && thin.junk === 1, 'size priced from a shallow pool is not used');
+  const rep = formatRivalDaily({ dateLabel: '2026-10-08', hours: 24, summary: clean, botsKnown: 9 });
+  assert(rep.includes('profit not trusted (junk coin prices, left out of the money below): 96') && !rep.includes('10,065') && !rep.includes('$10065'), 'report says 96 not trusted, no fake money');
+  assert(rep.includes('Verdict') && rivalVerdict(clean, 24).startsWith('⚠️ Small pie'), 'verdict judged on cleaned numbers');
+  // Mostly junk: verdict waits rather than judging on a handful of real trades.
+  const mostlyJunk = summarize([...Array.from({ length: 96 }, () => ({ ...base })), ...Array.from({ length: 5 }, () => ({ ...base, grossUsd: 5, sizeUsd: 1_000 }))]);
+  assert(rivalVerdict(mostlyJunk, 24).startsWith('⏳'), 'too few trustworthy trades -> wait');
+
+  // toRec flags coins priced from shallow pools (depth callback).
+  const thinRw = new RivalWatch(async () => ({}), px, (x) => (x === WETH ? 'WETH' : 'USDG'), () => false, WETH, () => clock, 0,
+    (tok) => (tok === USDG ? Infinity : 3_000));
+  const thinRec = thinRw.toRec({ status: '0x1', blockNumber: '0x1', gasUsed: '0x30d40', effectiveGasPrice: '0x2faf080', logs: arbLogs(BOT) }, BOT)!;
+  assert(thinRec.thinPrice === true && isJunkProfit(thinRec), 'WETH priced from a $3k pool -> flagged');
+  const deepRw = new RivalWatch(async () => ({}), px, (x) => (x === WETH ? 'WETH' : 'USDG'), () => false, WETH, () => clock, 0, () => 1e6);
+  assert(!deepRw.toRec({ status: '0x1', blockNumber: '0x1', gasUsed: '0x30d40', effectiveGasPrice: '0x2faf080', logs: arbLogs(BOT) }, BOT)!.thinPrice, 'deep price pools -> not flagged');
 }
 main();
