@@ -1,5 +1,6 @@
 import { ChainName } from './types';
 import type { RivalSummary } from './rivalWatch';
+import { ProfitBands } from './profitBands';
 import type { NewPoolSummary } from './newPoolWatch';
 import type { LoopRow, PegRow, LoopQuote } from './crossQuoteMonitor';
 import type { GapRow } from './crossQuoteMonitor';
@@ -304,6 +305,11 @@ export interface PlainHourlyInput {
   newPools?: NewPoolSummary;
   topDifferences: { pair: string; pct: number; buyAt: string; sellAt: string }[];
   nodeUsage?: { name: string; used: number; daily: number }[]; // today's requests per node vs allowance
+  // Phase 8 (Oct 8): our own costs and results, in plain numbers.
+  ourGas?: { ownUsd: number | null; flashUsd: number | null }; // our contract's gas per trade, right now
+  profitBands?: { hour: number[]; day: number[]; hourUsd: number; dayUsd: number }; // profitable checks by $ size
+  simOutcomes?: [string, number][];   // check results by category (core/failReasons SimBucket), this hour
+  research?: string;                  // research lane hour summary (core/researchLane.ts), if on
   // Where trades dropped out this hour, step by step (see shadowMain funnel).
   funnel?: {
     tradesRead: number; noPool: number; tooSmall?: number; noPartner: number; noUsdPrice: number; smallerThanFees: number;
@@ -400,6 +406,19 @@ export function formatPlainHourly(r: PlainHourlyInput): string {
       L.push('  ' + ws.bars.map((b, i) => `$${b}+: ${ws.today[i]} ($${ws.todayUsd[i].toFixed(0)})`).join(' · '));
     }
     if (r.checks.benchedRoutes) L.push(`  Skipping ${r.checks.benchedRoutes} pair(s) of trading spots that never pay out`);
+    // Every check result by category: tells "the trade is bad" apart from "our tools failed".
+    if (r.simOutcomes?.length) L.push(`  Check results by kind: ${r.simOutcomes.slice(0, 6).map(([k, c]) => `${esc(k)} ${c}`).join(' · ')}`);
+    // Profitable checks by dollar size (after our gas), this hour and today.
+    const pb = r.profitBands;
+    if (pb) {
+      const h = ProfitBands.line(pb.hour), d = ProfitBands.line(pb.day);
+      L.push(`  Profitable checks by size this hour: ${h ?? 'none'}`);
+      if (d) L.push(`  Today: ${d} (total ${money(pb.dayUsd)})`);
+    }
+  }
+  // Our own contract's gas right now (measured: ~335k gas own money, ~477k with a loan).
+  if (r.ourGas && (r.ourGas.ownUsd !== null || r.ourGas.flashUsd !== null)) {
+    L.push(`Our trade gas right now: ${r.ourGas.ownUsd === null ? '?' : cents(r.ourGas.ownUsd)} with our own money, ${r.ourGas.flashUsd === null ? '?' : cents(r.ourGas.flashUsd)} with a loan`);
   }
   L.push('');
 
@@ -431,6 +450,19 @@ export function formatPlainHourly(r: PlainHourlyInput): string {
   }
 
   if (r.newPools) { L.push(newPoolsHourlyLine(r.newPools)); L.push(''); }
+
+  // Research lane (shadow only): tests of trades the main filters threw away.
+  if (r.research) { L.push(r.research); L.push(''); }
+
+  // Honest bottom line: what is PROVEN vs what is only seen.
+  {
+    const ours = r.earned.todayChecked;
+    const theirs = r.rivalWins && r.rivalWins.trades ? r.rivalWins.netUsd : null;
+    const bits = [`our checked would-have-made today ${money(ours)}`];
+    if (theirs !== null) bits.push(`bots we follow kept ${money(theirs)} this hour (confirmed only)`);
+    L.push(`<b>Bottom line</b>: ${bits.join('; ')}. Practice run: nothing is real money until a live trade lands.`);
+    L.push('');
+  }
 
   if (r.nodeUsage?.length) {
     L.push('<b>Node usage today</b> (requests vs daily allowance)');
@@ -571,6 +603,9 @@ function rivalLines(s: RivalSummary): string[] {
   L.push(`Money source: own money ${share(ok - s.flash, ok)}, flash loans ${share(s.flash, ok)}`);
   for (const [pair, n, usd] of s.byPair.slice(0, 5)) L.push(`  • ${esc(pair)}: ${n} wins, ${money(usd)}`);
   L.push(`On trading spots we watch: ${s.onOurPools} of ${s.trades}`);
+  // Their confirmed wins we couldn't have taken, and why (can overlap).
+  const m = s.missed;
+  if (m && (m.notWatched || m.loops)) L.push(`Their wins we couldn't take: ${m.notWatched} on pools we don't read (${money(m.notWatchedUsd)}), ${m.loops} on 3+ pool loops (${money(m.loopsUsd)})`);
   const c = sampleLine(s);
   if (c) L.push(c);
   return L;

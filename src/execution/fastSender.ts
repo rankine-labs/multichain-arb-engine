@@ -232,6 +232,13 @@ export class FastSender {
     return (Number(used * baseFee) / 1e18) * ethUsd;
   }
 
+  // Same, for a given amount of gas (e.g. our measured own-money vs loan
+  // trade). Used by the hourly report to show our real cost per trade.
+  gasCostUsdFor(gasUnits: bigint, ethUsd: number | null | undefined): number | null {
+    if (!this.maxFeePerGas || !ethUsd || !(ethUsd > 0)) return null;
+    return (Number((gasUnits + this.l1Gas) * (this.maxFeePerGas / 2n)) / 1e18) * ethUsd;
+  }
+
   // Limit actually used: tuned L2 limit + 1.5x the current L1 posting gas.
   get currentGasLimit() { return this.gasLimitNow + (this.l1Gas * 3n) / 2n; }
 

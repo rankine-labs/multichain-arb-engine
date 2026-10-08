@@ -186,6 +186,10 @@ export interface RivalSummary {
   verifiedBots: number;         // bots in this window that are verified (see VERIFIED_BOT_WINS)
   whyUncertain: [UncertainReason, number][]; // reason -> trades (uncertain + junk)
   sample?: SampleStats;         // chain-wide sample for the same period (hourly only)
+  // Confirmed rival wins we could NOT have taken today, and why:
+  //   notWatched = a pool in the route is one we don't read (unknown DEX or pool)
+  //   loops      = 3+ pool route (our bot only does 2-pool trades)
+  missed: { notWatched: number; notWatchedUsd: number; loops: number; loopsUsd: number };
 }
 
 const median = (xs: number[]): number | null => {
@@ -209,6 +213,7 @@ export function summarize(recs: RivalRec[], verified?: Set<string>): RivalSummar
     medianSizeUsd: null, medianWinUsd: null, medianGasUsd: null,
     routes: { two: 0, three: 0, fourPlus: 0 }, flash: 0, onOurPools: 0, byPair: [], byBot: [], bots: 0,
     verifiedBots: 0, whyUncertain: [],
+    missed: { notWatched: 0, notWatchedUsd: 0, loops: 0, loopsUsd: 0 },
   };
   const why = new Map<UncertainReason, number>();
   const sizes: number[] = [], wins: number[] = [], gases: number[] = [];
@@ -244,6 +249,8 @@ export function summarize(recs: RivalRec[], verified?: Set<string>): RivalSummar
     if (net > 0) {
       out.wins++; wins.push(net);
       if (r.closedLoop !== false) b.loopWins++;
+      if (!r.ours) { out.missed.notWatched++; out.missed.notWatchedUsd += net; }
+      if (r.pools >= 3) { out.missed.loops++; out.missed.loopsUsd += net; }
       const p = byPair.get(r.pair) ?? { n: 0, usd: 0 };
       p.n++; p.usd += net; byPair.set(r.pair, p);
     }

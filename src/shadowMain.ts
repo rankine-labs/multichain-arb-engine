@@ -87,6 +87,8 @@ import { LenderBalances } from './core/lenderBalances';
 import { RouteScores, WinSizes, WIN_BARS } from './core/routeScore';
 import { RivalWatch } from './core/rivalWatch';
 import { V3BalanceBook } from './core/v3BalanceBook';
+import { ProfitBands } from './core/profitBands';
+import { SimBucketTally, classifySimOutcome } from './core/failReasons';
 import { makeRpc, simulateRoundTrip, simRpcUrl, Rpc, makeFallbackRpc, loadBalanceSlots, wssToHttps, replayRpc, ReplayCall } from './execution/simulator';
 import { FastSender, SafetyGate, safetyConfigFromEnv } from './execution/fastSender';
 import { checkLiveReady } from './execution/liveReadiness';
@@ -421,6 +423,14 @@ const simOff = (chain: string): string | undefined => {
 };
 // Reported in the hourly digest, then reset.
 const simStats = { checked: 0, profit: 0, loss: 0, fail: 0, rateLimited: 0 };
+// Phase 8 (Oct 8): profitable checks by $ band (after our gas) and every
+// check result by category, for the hourly report. Robinhood only.
+const profitBands = new ProfitBands();
+const simBuckets = new SimBucketTally();
+const torontoDay = () => new Date().toLocaleDateString('en-CA', { timeZone: 'America/Toronto' });
+// Our executor's gas per trade, measured on a Robinhood fork (Phase 3):
+// ~311k-359k own money, ~453k-501k with a flash loan. Midpoints used.
+const OUR_GAS_OWN = 335_000n, OUR_GAS_FLASH = 477_000n;
 // Robinhood "funnel" for the hourly report: how many trades made it through
 // each step, and why price differences weren't checked. Reset every hour.
 const funnel = {
@@ -596,6 +606,7 @@ const queueSimulation = (
                   // Pool addresses (shortened) so a failing pool can be identified.
                   const route = `${buyPool.dex}@${String(buyPool.poolAddress).slice(0, 10)}->${sellPool.dex}@${String(sellPool.poolAddress).slice(0, 10)}`;
                   const model = `model gross $${modelGrossUsd.toFixed(2)} on $${tradeSizeUsd.toFixed(0)}${timing ? ` | ${timing}` : ''} | ${funding}`;
+                  if (chain === 'robinhood') simBuckets.add((r as any).bucket ?? classifySimOutcome(r.status, 'reason' in r ? (r as any).reason : ''));
                   if (r.status === 'rate_limited') {
                         // Not a trade result: pause, don't count it.
                         simPausedUntil[chain] = Date.now() + SIM_RATE_LIMIT_PAUSE_MS;
@@ -630,7 +641,7 @@ const queueSimulation = (
                         if (chain === 'robinhood' && net >= MIN_COUNTED_USD && vetted) {
                               dryRunPnl.recordVerified(net, `${symbolOf(chain, tokenIn)} ${buyPool.dex}->${sellPool.dex}`);
                         }
-                        if (chain === 'robinhood') { routeScores.record(routeKey, net); if (vetted) winSizes.add(net); }
+                        if (chain === 'robinhood') { routeScores.record(routeKey, net); if (vetted) winSizes.add(net); profitBands.add(net, torontoDay()); }
                   } else if (r.status === 'loss') {
                         simStats.loss++;
                         if (chain === 'robinhood') routeScores.record(routeKey, 0);
@@ -948,12 +959,17 @@ if (research.enabled) {
                   }
             } catch (err) { console.warn('[research] gap look failed (ignored):', (err as Error).message); }
       }, 60_000);
-      // Hourly: one line in the log, one short Telegram note (RESEARCH_TELEGRAM=0 turns the note off).
-      setInterval(() => {
-            const text = research.takeHour();
-            console.log(`[research] hour: ${text.replace(/<[^>]+>/g, '').replace(/\n/g, ' | ')}`);
-            if (process.env.RESEARCH_TELEGRAM !== '0') void sendTelegramMessage(text).catch(() => { /* logged by sender */ });
-      }, 60 * 60_000);
+      // Hourly: the lane's summary goes into the main hourly report (Phase 8);
+      // see researchHourText() used by the hourly digest.
+}
+
+// Research lane hour summary for the hourly report (also one log line).
+// undefined when the lane is off or RESEARCH_TELEGRAM=0.
+function researchHourText(): string | undefined {
+      if (!research.enabled) return undefined;
+      const text = research.takeHour();
+      console.log(`[research] hour: ${text.replace(/<[^>]+>/g, '').replace(/\n/g, ' | ')}`);
+      return process.env.RESEARCH_TELEGRAM === '0' ? undefined : text;
 }
 
 // ONE path from "this is worth doing" to a signed trade, used by both the
@@ -2203,6 +2219,13 @@ for (let i = 0; i < resolved.length; i++) {
                               rivalWins: { ...rivalWatch.takeHour(), botsKnown: rivalWatch.botCount(), botsVerified: rivalWatch.botStatus().verified },
                               newPools: hourNewPools ?? undefined,
                               nodeUsage: nodeUsageToday(),
+                              ourGas: (() => {
+                                    const eth = priceOracle.getUsdPrice('robinhood', ROBINHOOD_TOKENS.WETH);
+                                    return { ownUsd: robinhoodSender.gasCostUsdFor(OUR_GAS_OWN, eth), flashUsd: robinhoodSender.gasCostUsdFor(OUR_GAS_FLASH, eth) };
+                              })(),
+                              profitBands: { hour: [...profitBands.hour], day: [...profitBands.day], hourUsd: profitBands.hourUsd, dayUsd: profitBands.dayUsd },
+                              simOutcomes: simBuckets.plain(),
+                              research: researchHourText(),
                               funnel: {
                                     tradesRead: funnel.tradesRead, noPool: funnel.noPool, tooSmall: funnel.tooSmall, noPartner: funnel.noPartner,
                                     noUsdPrice: funnel.noUsdPrice, smallerThanFees: funnel.smallerThanFees, found: funnel.found,
@@ -2231,6 +2254,7 @@ for (let i = 0; i < resolved.length; i++) {
                   hourlyMatches.clear();
                   for (const chainName of Object.keys(chainHealthFlapCount)) chainHealthFlapCount[chainName] = 0;
                   simStats.checked = simStats.profit = simStats.loss = simStats.fail = simStats.rateLimited = 0;
+                  profitBands.resetHour(); simBuckets.clear();
                   funnel.tradesRead = funnel.noPool = funnel.tooSmall = funnel.noPartner = funnel.noUsdPrice = funnel.smallerThanFees = 0;
                   funnel.found = funnel.belowCheckBar = funnel.notVetted = funnel.sentToCheck = 0;
                   funnel.skip.clear();
