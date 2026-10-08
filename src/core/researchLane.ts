@@ -1,3 +1,4 @@
+import { isExecutableVenue } from '../config/robinhoodVenues';
 import { readFileSync, writeFileSync, mkdirSync, renameSync } from 'fs';
 import { dirname } from 'path';
 import { PoolState } from './types';
@@ -594,7 +595,8 @@ export function planShallowCandidate(input: {
       const { cache, victim, swap, usdPerToken } = input;
       if (usdPerToken === null || !(usdPerToken > 0) || input.tokenInDecimals === undefined) return null;
       const thin = cache.findPeerPools(victim.chain, swap.tokenIn, swap.tokenOut, victim.poolAddress)
-            .filter((p) => !input.isDeep(p) && (input.depthUsd(p) ?? 0) >= input.minDepthUsd);
+            // Only exchanges our contract can trade (extra venues are counted elsewhere).
+            .filter((p) => isExecutableVenue(p.dex) && !input.isDeep(p) && (input.depthUsd(p) ?? 0) >= input.minDepthUsd);
       let best: ReturnType<typeof planBackrun> = null;
       let bestPeer: PoolState | null = null;
       for (const peer of thin) {

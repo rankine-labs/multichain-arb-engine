@@ -37,11 +37,16 @@ import {
 
 export interface Venue {
   dex: string;
-  kind: 'v2' | 'solidly' | 'v3-fee' | 'v3-spacing' | 'v4';
+  // 'algebra':     Algebra Integral factory, factory.poolByPair(a, b)
+  // 'v4-registry': hooked V4 pools listed by a registry (Fables): `factory`
+  //                is the StateView, `registry` lists the pools.
+  kind: 'v2' | 'solidly' | 'v3-fee' | 'v3-spacing' | 'v4' | 'algebra' | 'v4-registry';
   factory: string;   // kind 'v4': the StateView contract (where V4 prices are read)
   feeBps?: number;   // V2-style pools: swap fee in bps
   poolManager?: string; // kind 'v4' only: where V4 trades go
   weth?: string;     // kind 'v4' only: WETH, which stands in for native ETH
+  registry?: string; // kind 'v4-registry': contract with activePools()
+  pairFee?: boolean; // kind 'solidly': read each pair's own fee() (in millionths)
 }
 
 export interface PairWatcherOptions {
@@ -123,6 +128,13 @@ const iSV = new ethers.Interface([
   'function getSlot0(bytes32) view returns (uint160,int24,uint24,uint24)',
   'function getLiquidity(bytes32) view returns (uint128)',
 ]);
+// Algebra Integral (Alandale): pool lookup and price state.
+const iAlgF = new ethers.Interface(['function poolByPair(address,address) view returns (address)']);
+const iAlgP = new ethers.Interface(['function globalState() view returns (uint160,int24,uint16,uint8,uint16,bool)']);
+// Solidly pairs with their own fee (GIGA Classic): fee() in millionths.
+const iPairFee = new ethers.Interface(['function fee() view returns (uint256)']);
+// Hooked V4 pool registry (Fables): every live pool's key and id.
+const iReg = new ethers.Interface(['function activePools() view returns (tuple(tuple(address currency0, address currency1, uint24 fee, int24 tickSpacing, address hooks) key, bytes32 id, bool active)[])']);
 const iMeta = new ethers.Interface(['function symbol() view returns (string)', 'function decimals() view returns (uint8)']);
 const iMeta32 = new ethers.Interface(['function symbol() view returns (bytes32)']);
 
@@ -146,7 +158,8 @@ export async function discoverPairPoolsMulticall(
   callMany: CallManyFn, chain: ChainName, venues: Venue[], tokenA: string, tokenB: string,
   metaFor: string[] = [],
 ): Promise<{ pools: PoolState[]; meta: Record<string, MetaResult> }> {
-  type Pending = { venue: Venue; kind: 'v2' | 'solidly' | 'v3'; feeKey?: number; spacing?: boolean; idx: number }
+  type Pending = { venue: Venue; kind: 'v2' | 'solidly' | 'v3' | 'algebra'; feeKey?: number; spacing?: boolean; idx: number }
+    | { venue: Venue; kind: 'v4-registry'; idx: number }
     | { venue: Venue; kind: 'v4'; id: string; fee: number; tickSpacing: number; native: boolean; c0: string; c1: string; liqIdx: number; slotIdx: number };
   const calls: { target: string; data: string }[] = [];
   const pend: Pending[] = [];
@@ -157,6 +170,8 @@ export async function discoverPairPoolsMulticall(
     else if (v.kind === 'solidly') pend.push({ venue: v, kind: 'solidly', idx: push(v.factory, iSolF.encodeFunctionData('getPair', [tokenA, tokenB, false])) });
     else if (v.kind === 'v3-fee') for (const f of V3_FEE_TIERS_ALL) pend.push({ venue: v, kind: 'v3', feeKey: f, idx: push(v.factory, iV3F.encodeFunctionData('getPool', [tokenA, tokenB, f])) });
     else if (v.kind === 'v3-spacing') for (const sp of V3_TICK_SPACINGS) pend.push({ venue: v, kind: 'v3', feeKey: sp, spacing: true, idx: push(v.factory, iV3S.encodeFunctionData('getPool', [tokenA, tokenB, sp])) });
+    else if (v.kind === 'algebra') pend.push({ venue: v, kind: 'algebra', idx: push(v.factory, iAlgF.encodeFunctionData('poolByPair', [tokenA, tokenB])) });
+    else if (v.kind === 'v4-registry' && v.registry && v.poolManager && v.weth) pend.push({ venue: v, kind: 'v4-registry', idx: push(v.registry, iReg.encodeFunctionData('activePools')) });
     else if (v.kind === 'v4' && v.poolManager && v.weth) {
       const a = tokenA.toLowerCase(), b = tokenB.toLowerCase(), w = v.weth.toLowerCase();
       const variants: { c0: string; c1: string; native: boolean }[] = [a < b ? { c0: tokenA, c1: tokenB, native: false } : { c0: tokenB, c1: tokenA, native: false }];
@@ -183,9 +198,28 @@ export async function discoverPairPoolsMulticall(
   const now = Date.now();
   const pools: PoolState[] = [];
   // Round 2: state of the V2 / Solidly / V3 pools that exist.
-  const found: { p: Pending & { kind: 'v2' | 'solidly' | 'v3' }; addr: string; base: number }[] = [];
+  const found: { p: Pending & { kind: 'v2' | 'solidly' | 'v3' | 'algebra' }; addr: string; base: number }[] = [];
   const calls2: { target: string; data: string }[] = [];
+  // Hooked V4 pools (registry) matching this pair: their state is read in round 2.
+  const hooked: { venue: Venue; id: string; fee: number; tickSpacing: number; native: boolean; c1: string; c0: string; hooks: string; base: number }[] = [];
   for (const p of pend) {
+    if (p.kind === 'v4-registry') {
+      const v = p.venue;
+      let list: any[] = [];
+      try { list = r1[p.idx] ? (iReg.decodeFunctionResult('activePools', r1[p.idx]!)[0] as any[]) : []; } catch { list = []; }
+      const a = tokenA.toLowerCase(), b = tokenB.toLowerCase(), w = v.weth!.toLowerCase();
+      for (const e of list) {
+        if (!e.active) continue;
+        const c0 = String(e.key.currency0).toLowerCase(), c1 = String(e.key.currency1).toLowerCase();
+        const native = c0 === ethers.ZeroAddress;
+        const x0 = native ? w : c0;
+        if (!((x0 === a && c1 === b) || (x0 === b && c1 === a))) continue;
+        const base = calls2.length;
+        calls2.push({ target: v.factory, data: iSV.encodeFunctionData('getSlot0', [e.id]) }, { target: v.factory, data: iSV.encodeFunctionData('getLiquidity', [e.id]) });
+        hooked.push({ venue: v, id: String(e.id), fee: Number(e.key.fee), tickSpacing: Number(e.key.tickSpacing), native, c0, c1, hooks: String(e.key.hooks), base });
+      }
+      continue;
+    }
     if (p.kind === 'v4') {
       const liq = word(r1[p.liqIdx]);
       const sqrt = word(r1[p.slotIdx]);
@@ -206,14 +240,37 @@ export async function discoverPairPoolsMulticall(
       calls2.push({ target: addr, data: iV3P.encodeFunctionData('slot0') }, { target: addr, data: iV3P.encodeFunctionData('liquidity') },
         { target: addr, data: iV3P.encodeFunctionData('token0') }, { target: addr, data: iV3P.encodeFunctionData('token1') });
       if (p.spacing) calls2.push({ target: addr, data: iV3P.encodeFunctionData('fee') });
+    } else if (p.kind === 'algebra') {
+      // globalState word 0 = sqrt price, word 2 = the fee right now (pips).
+      calls2.push({ target: addr, data: iAlgP.encodeFunctionData('globalState') }, { target: addr, data: iV3P.encodeFunctionData('liquidity') },
+        { target: addr, data: iV3P.encodeFunctionData('token0') }, { target: addr, data: iV3P.encodeFunctionData('token1') });
     } else {
       calls2.push({ target: addr, data: iPair.encodeFunctionData('getReserves') }, { target: addr, data: iPair.encodeFunctionData('token0') },
         { target: addr, data: iPair.encodeFunctionData('token1') });
+      if (p.kind === 'solidly' && p.venue.pairFee) calls2.push({ target: addr, data: iPairFee.encodeFunctionData('fee') });
     }
-    found.push({ p: p as Pending & { kind: 'v2' | 'solidly' | 'v3' }, addr, base });
+    found.push({ p: p as Pending & { kind: 'v2' | 'solidly' | 'v3' | 'algebra' }, addr, base });
   }
   const r2 = calls2.length ? await callMany(calls2) : [];
+  for (const h of hooked) {
+    const sqrt = word(r2[h.base], 0), lpFee = word(r2[h.base], 3), liq = word(r2[h.base + 1]);
+    if (!sqrt || !liq || lpFee === null) continue;
+    pools.push({
+      chain, dex: h.venue.dex, poolAddress: h.id, poolType: 'v3',
+      tokenA: h.native ? ethers.getAddress(h.venue.weth!.toLowerCase()) : ethers.getAddress(h.c0), tokenB: ethers.getAddress(h.c1),
+      sqrtPriceX96: sqrt, liquidity: liq, feeBps: Math.round(Number(lpFee) / 100), feePips: Number(lpFee),
+      lastUpdatedBlock: 0, lastUpdatedMs: now,
+      v4: { fee: h.fee, tickSpacing: h.tickSpacing, native: h.native, poolManager: ethers.getAddress(h.venue.poolManager!.toLowerCase()), stateView: ethers.getAddress(h.venue.factory.toLowerCase()), hooks: h.hooks },
+    });
+  }
   for (const { p, addr, base } of found) {
+    if (p.kind === 'algebra') {
+      const sqrt = word(r2[base], 0), fee = word(r2[base], 2), liq = word(r2[base + 1]), t0 = addrOf(r2[base + 2]), t1 = addrOf(r2[base + 3]);
+      if (!sqrt || !liq || !t0 || !t1 || fee === null) continue;
+      pools.push({ chain, dex: p.venue.dex, poolAddress: addr, poolType: 'v3', variant: 'algebra', tokenA: t0, tokenB: t1,
+        sqrtPriceX96: sqrt, liquidity: liq, feeBps: Math.round(Number(fee) / 100), feePips: Number(fee), lastUpdatedBlock: 0, lastUpdatedMs: now });
+      continue;
+    }
     if (p.kind === 'v3') {
       const sqrt = word(r2[base]), liq = word(r2[base + 1]), t0 = addrOf(r2[base + 2]), t1 = addrOf(r2[base + 3]);
       const fee = p.spacing ? word(r2[base + 4]) : BigInt(p.feeKey!);
@@ -223,8 +280,12 @@ export async function discoverPairPoolsMulticall(
     } else {
       const r0 = word(r2[base], 0), rr1 = word(r2[base], 1), t0 = addrOf(r2[base + 1]), t1 = addrOf(r2[base + 2]);
       if (r0 === null || rr1 === null || !t0 || !t1) continue;
+      // Per-pair fee (GIGA Classic): fee() in millionths = pips.
+      const pf = p.kind === 'solidly' && p.venue.pairFee ? word(r2[base + 3]) : null;
+      const feeFields = pf !== null && pf < 100_000n ? { feeBps: Math.round(Number(pf) / 100), feePips: Number(pf) } : { feeBps: p.venue.feeBps ?? (p.kind === 'solidly' ? 20 : 30) };
+      if (p.kind === 'solidly' && p.venue.pairFee && pf === null) continue; // fee unknown: don't guess
       pools.push({ chain, dex: p.venue.dex, poolAddress: addr, poolType: 'v2', tokenA: t0, tokenB: t1,
-        reserveA: r0, reserveB: rr1, feeBps: p.venue.feeBps ?? (p.kind === 'solidly' ? 20 : 30), lastUpdatedBlock: 0, lastUpdatedMs: now });
+        reserveA: r0, reserveB: rr1, ...feeFields, lastUpdatedBlock: 0, lastUpdatedMs: now });
     }
   }
   return { pools, meta };
@@ -235,6 +296,8 @@ export async function discoverPairPoolsMulticall(
 // liquidity(); V2/Solidly: getReserves(). Only the first return words are
 // read, which are the same across Uniswap, PancakeSwap and Ramses.
 const SEL_SLOT0 = '0x3850c7bd', SEL_LIQ = '0x1a686502', SEL_RESERVES = '0x0902f1ac';
+// Algebra Integral: price + current dynamic fee live in globalState().
+const SEL_ALG_STATE = ethers.id('globalState()').slice(0, 10);
 // V4: same two reads, but asked of the StateView contract with the pool id.
 const SEL_V4_SLOT0 = ethers.id('getSlot0(bytes32)').slice(0, 10);
 const SEL_V4_LIQ = ethers.id('getLiquidity(bytes32)').slice(0, 10);
@@ -247,6 +310,7 @@ export async function refreshPoolsBatch(
   for (const p of pools) {
     idx.push(calls.length);
     if (p.v4) calls.push({ target: p.v4.stateView, data: SEL_V4_SLOT0 + p.poolAddress.slice(2) }, { target: p.v4.stateView, data: SEL_V4_LIQ + p.poolAddress.slice(2) });
+    else if (p.poolType === 'v3' && p.variant === 'algebra') calls.push({ target: p.poolAddress, data: SEL_ALG_STATE }, { target: p.poolAddress, data: SEL_LIQ });
     else if (p.poolType === 'v3') calls.push({ target: p.poolAddress, data: SEL_SLOT0 }, { target: p.poolAddress, data: SEL_LIQ });
     else if (p.poolType === 'v2') calls.push({ target: p.poolAddress, data: SEL_RESERVES });
   }
@@ -260,7 +324,11 @@ export async function refreshPoolsBatch(
       const sqrt = word(res[i], 0), liq = word(res[i + 1], 0);
       // liq may legitimately be 0 (liquidity pulled): store it so the old
       // price is not kept. sqrt 0 / missing = unreadable, skip.
-      if (sqrt && liq !== null) out.push({ ...p, sqrtPriceX96: sqrt, liquidity: liq, lastUpdatedMs: now });
+      // Dynamic-fee pools: keep the fee current too (Algebra: globalState
+      // word 2; hooked V4: getSlot0 word 3 = the pool's LP fee now).
+      const dyn = p.variant === 'algebra' ? word(res[i], 2) : p.v4?.hooks ? word(res[i], 3) : null;
+      const fee = dyn !== null && dyn < 1_000_000n ? { feePips: Number(dyn), feeBps: Math.round(Number(dyn) / 100) } : {};
+      if (sqrt && liq !== null) out.push({ ...p, ...fee, sqrtPriceX96: sqrt, liquidity: liq, lastUpdatedMs: now });
     } else if (p.poolType === 'v2') {
       const r0 = word(res[i], 0), r1 = word(res[i], 1);
       if (r0 !== null && r1 !== null) out.push({ ...p, reserveA: r0, reserveB: r1, lastUpdatedMs: now });
@@ -272,6 +340,12 @@ export async function refreshPoolsBatch(
 // Re-reads one pool's live price state. Returns null if it couldn't.
 export async function refreshPoolState(provider: ethers.JsonRpcProvider, pool: PoolState): Promise<PoolState | null> {
   if (pool.v4) return refetchV4PoolPrice(provider, pool);
+  if (pool.poolType === 'v3' && pool.variant === 'algebra') {
+    // Algebra: one batched read through the same code as the 5 s re-sync.
+    const callOne = async (calls: { target: string; data: string }[]) =>
+      Promise.all(calls.map((c) => provider.call({ to: c.target, data: c.data }).catch(() => null)));
+    return (await refreshPoolsBatch(callOne, [pool]))[0] ?? null;
+  }
   if (pool.poolType === 'v3') return refetchV3PoolPrice(provider, pool);
   if (pool.poolType === 'v2') return refetchV2PoolPrice(provider, pool);
   return null; // orderbook / bins: not refreshed here

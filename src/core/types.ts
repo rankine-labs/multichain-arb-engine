@@ -61,7 +61,12 @@ export interface PoolState {
     native: boolean;      // the pool holds native ETH where we use WETH
     poolManager: string;  // where trades go
     stateView: string;    // where prices are read
+    hooks?: string;       // hooked pools (e.g. Fables): the hook contract; fee then changes per swap
   };
+  // How to read this pool's price (default: the Uniswap V3 slot0()).
+  // 'algebra': Algebra Integral copies (Alandale) keep it in globalState(),
+  // with a dynamic fee in globalState word 2.
+  variant?: 'algebra';
 }
 
 export interface ArbOpportunity {

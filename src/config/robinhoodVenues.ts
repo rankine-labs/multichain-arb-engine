@@ -179,3 +179,44 @@ export function venueByFactory(factory: string): RobinhoodVenue | undefined {
   const f = factory.toLowerCase();
   return ROBINHOOD_VENUES.find((v) => v.contracts.some((c) => c.address.toLowerCase() === f));
 }
+
+// How the pair watcher should look pools up on each priceable venue
+// (core/pairWatcher.ts Venue kinds). Venues not listed here are not read.
+export function watcherKindOf(v: RobinhoodVenue): 'algebra' | 'v3-fee' | 'v3-spacing' | 'solidly' | 'v4-registry' | null {
+  switch (v.model) {
+    case 'algebra': return 'algebra';
+    case 'pancake-v3': case 'uniswap-v3': return 'v3-fee';
+    case 'slipstream': return 'v3-spacing';
+    case 'solidly': return 'solidly';
+    case 'v4-hooked': return 'v4-registry';
+    default: return null;
+  }
+}
+
+// Extra pair-watcher venues (price reading only). The caller adds them only
+// when RH_EXTRA_VENUES=1; the trade path refuses them via isExecutableVenue().
+export function extraWatcherVenues(v4: { stateView: string; poolManager: string; weth: string }) {
+  const out: { dex: string; kind: 'algebra' | 'v3-fee' | 'v3-spacing' | 'solidly' | 'v4-registry'; factory: string; registry?: string; poolManager?: string; weth?: string; pairFee?: boolean }[] = [];
+  for (const v of priceableVenues()) {
+    const kind = watcherKindOf(v);
+    if (!kind) continue;
+    if (kind === 'v4-registry') {
+      const reg = v.contracts.find((c) => c.role === 'registry');
+      if (reg) out.push({ dex: v.id, kind, factory: v4.stateView, registry: reg.address, poolManager: v4.poolManager, weth: v4.weth });
+      continue;
+    }
+    const f = v.contracts.find((c) => c.role === 'factory');
+    if (f) out.push({ dex: v.id, kind, factory: f.address, ...(kind === 'solidly' ? { pairFee: true } : {}) });
+  }
+  return out;
+}
+
+// Extra factories for the chain-wide universe scan (pool creation events).
+export function extraScanFactories(): { dex: string; kind: 'v2' | 'solidly' | 'v3'; factory: string }[] {
+  return priceableVenues().flatMap((v) => {
+    const kind = watcherKindOf(v);
+    const f = v.contracts.find((c) => c.role === 'factory');
+    if (!kind || kind === 'v4-registry' || !f) return [];
+    return [{ dex: v.id, kind: kind === 'solidly' ? 'solidly' as const : 'v3' as const, factory: f.address }];
+  });
+}
