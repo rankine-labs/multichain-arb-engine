@@ -54,4 +54,4 @@ assert(bucketOf(2) === '2' && bucketOf(3) === '3' && bucketOf(5) === '4+', 'rout
 const txt = formatStudy([...trades, win({ pools: 3, shape: 'x > y > z' })], { blocks: 100, txs: 500, chainMinutes: 10, windows: 2 });
 assert(/\[2 pools\] arbs 6/.test(txt) && /\[3 pools\] arbs 1/.test(txt) && /Own money USDG/.test(txt) && /1x \$0\.0300 x > y > z/.test(txt), 'report lists routes, own money and loop shapes');
 assert(/Junk win \(left out\)/.test(txt), 'junk wins listed separately');
-assert(!/—/.test(txt), 'no long dashes in the report');
+assert(!/\u2014/.test(txt), 'no long dashes in the report');
