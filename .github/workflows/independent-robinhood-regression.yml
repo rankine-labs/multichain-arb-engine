@@ -20,8 +20,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-          cache: npm
-      - name: Install locked dependencies
-        run: npm ci
+      # Main branch currently has no package-lock.json; npm ci would fail.
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
       - name: Run existing test suite
         run: npm test
