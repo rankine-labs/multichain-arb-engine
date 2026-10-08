@@ -146,8 +146,9 @@ export function formatStudy(trades: StudyTrade[], meta: { blocks: number; txs: n
     lines.push(`   still > $0 for us: ${s.funding.map((x) => `${x.label}: ${x.positive} ($${f2(x.keptUsd)})`).join('; ')}`);
   }
   for (const c of capitalNeeds(trades)) lines.push(`Own money ${c.token}: ${c.wins} sized wins, size p50 ${usd0(c.p50)} p90 ${usd0(c.p90)} p99 ${usd0(c.p99)} max ${usd0(c.max)}`);
-  // Loop shapes (3+ pools), most common first.
-  const loops = trades.filter((t) => t.pools >= 3 && t.verified && t.grossUsd - t.gasUsd > 0);
+  // Loop shapes (3+ pools), most common first. Junk wins are left out here
+  // too (they are listed on their own below).
+  const loops = trades.filter((t) => t.pools >= 3 && t.verified && t.grossUsd - t.gasUsd > 0 && !isJunkWin(t));
   const shapes = new Map<string, { n: number; net: number }>();
   for (const t of loops) { const k = t.shape; const v = shapes.get(k) ?? { n: 0, net: 0 }; v.n++; v.net += t.grossUsd - t.gasUsd; shapes.set(k, v); }
   const top = [...shapes.entries()].sort((a, b) => b[1].n - a[1].n || b[1].net - a[1].net).slice(0, 10);
