@@ -342,12 +342,31 @@ export class LoopMonitor {
     const Q = this.quotes;
     // Pools touching a quote coin, grouped by the token on the other side.
     // A pool between two quotes counts for both sides.
+    //
+    // Two passes to keep memory low: on Robinhood Chain ~400,000 coins have
+    // a WETH pool, and a pool list per coin cost ~200 MB at peak. Pass 1
+    // only notes WHICH quotes each coin touches (one small number per coin,
+    // a bit per quote); pass 2 builds pool lists only for coins that can
+    // loop (2+ different quotes) and the quote coins themselves.
+    const qIdx = new Map([...Q.keys()].map((q, i) => [q, i]));
+    const seen = new Map<string, number>(); // token -> bitmask of quotes it trades against
+    const mark = (t: string, q: string) => { const i = qIdx.get(q)!; seen.set(t, (seen.get(t) ?? 0) | (i < 31 ? 1 << i : 1 << 30)); };
+    for (const p of scanned) {
+      if (p.stable) continue;
+      const t0 = p.token0.toLowerCase(), t1 = p.token1.toLowerCase();
+      if (Q.has(t1)) mark(t0, t1);
+      if (Q.has(t0)) mark(t1, t0);
+    }
+    const bits = (x: number) => { let n = 0; while (x) { n += x & 1; x >>>= 1; } return n; };
+    const keep = new Set<string>();
+    for (const [t, m] of seen) if (Q.has(t) || bits(m) >= 2) keep.add(t);
+    seen.clear();
     const byToken = new Map<string, { p: ScannedPool; quote: string }[]>();
     for (const p of scanned) {
       if (p.stable) continue;
       const t0 = p.token0.toLowerCase(), t1 = p.token1.toLowerCase();
-      if (Q.has(t1)) (byToken.get(t0) ?? byToken.set(t0, []).get(t0)!).push({ p, quote: t1 });
-      if (Q.has(t0)) (byToken.get(t1) ?? byToken.set(t1, []).get(t1)!).push({ p, quote: t0 });
+      if (Q.has(t1) && keep.has(t0)) (byToken.get(t0) ?? byToken.set(t0, []).get(t0)!).push({ p, quote: t1 });
+      if (Q.has(t0) && keep.has(t1)) (byToken.get(t1) ?? byToken.set(t1, []).get(t1)!).push({ p, quote: t0 });
     }
     // Only tokens with 2+ different quotes can loop (cheap filter before any
     // read). Quote coins themselves are always kept: their pools with each

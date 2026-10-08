@@ -124,6 +124,11 @@ async function main() {
   ];
   const n = await mon.setup(pools.map((x) => x.p), quotes);
   assert(n >= 2 && mon.quoteCount() === 3, 'setup: HOOD and JUNK (and the dollar coins themselves) can loop');
+  // Thousands of WETH-only junk coins (live: ~400,000) must not change the
+  // pick (setup notes quotes per coin first, then lists pools for the few).
+  const junkMany = Array.from({ length: 5000 }, (_, i) => ({ dex: 'uniswap-v2', kind: 'v2', pool: A(0x50000 + i), token0: A(0x60000 + i), token1: WETH } as unknown as ScannedPool));
+  const mon2 = new LoopMonitor(fakeCallMany, () => clock, undefined, (t) => dec[t.toLowerCase()]);
+  assert(await mon2.setup([...pools.map((x) => x.p as ScannedPool), ...junkMany], quotes) === n, 'setup: 5,000 one-quote junk coins change nothing');
   assert(!mon.rows().length, 'no stats before the first reading');
   reads = 0;
   for (let i = 0; i < 25; i++) { await mon.tick(); clock += 30_000; }
