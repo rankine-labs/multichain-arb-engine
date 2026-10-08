@@ -1,7 +1,7 @@
 // Tests for loop measurement Phase A: verified coin groups (core/tokenGroups.ts),
 // the loop monitor (LoopMonitor in core/crossQuoteMonitor.ts) and the LOOP REPORT.
 import { classifySymbol, copyKey, pickCandidates, verifyGroups, quotePools, decodeSymbol, groupsStatusLine, QuotePrice } from '../core/tokenGroups';
-import { LoopMonitor, bestLoop, isBrokenLoop, PricedLeg, LoopLegInfo } from '../core/crossQuoteMonitor';
+import { LoopMonitor, bestLoop, isBrokenLoop, shouldScheduleFirstLoopReport, PricedLeg, LoopLegInfo } from '../core/crossQuoteMonitor';
 import { formatLoopReport, loopVerdict } from '../core/telegramFormatter';
 import type { PoolState } from '../core/types';
 import type { ScannedPool } from '../core/universeScan';
@@ -172,4 +172,9 @@ async function main() {
   mon.resetPeriod();
   assert(!mon.rows().length && !mon.pegRows().length, 'new period starts empty after a report');
 }
+// First LOOP REPORT: its 2 h clock starts only once tokens are watched.
+assert(!shouldScheduleFirstLoopReport(false, false, 0), 'first report not scheduled while the loop watch has 0 tokens');
+assert(shouldScheduleFirstLoopReport(false, false, 12), 'first report scheduled once tokens are watched');
+assert(!shouldScheduleFirstLoopReport(false, true, 12), 'first report scheduled only once (6-hourly rebuilds do not add more)');
+assert(!shouldScheduleFirstLoopReport(true, false, 12), 'first report never repeats after it was sent');
 main();

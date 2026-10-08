@@ -123,6 +123,10 @@ export function verifyGroups(
       const t = c.token.toLowerCase();
       if (t === usdg || t === weth) continue; // added below as anchors
       const q = prices.get(t);
+      // Same-name junk (hundreds of thousands of "copies" on this chain) with
+      // no real pool: dropped without a note. Those notes were always cut
+      // from the list anyway, and building them all cost a lot of memory.
+      if (c.kind === 'copy' && (!q || !(q.depthUsd >= minDepthUsd))) continue;
       if (!q) { rejected.push({ token: t, symbol: c.symbol, group, why: 'no pool against USDG or WETH' }); continue; }
       if (!(q.depthUsd >= minDepthUsd)) { rejected.push({ token: t, symbol: c.symbol, group, why: `only $${Math.round(q.depthUsd)} in its best pool` }); continue; }
       deep.push({ c, q });
@@ -231,6 +235,9 @@ export async function buildTokenGroups(deps: {
   symbolCacheFile: string;
   outFile: string;
   pauseMs?: number;                   // between symbol bundles (default 2 s)
+  progressEvery?: number;             // progress line + save every N bundles (default 10)
+  minDepthUsd?: number;               // pool money needed to count (default MIN_GROUP_DEPTH_USD)
+  depthSlice?: number;                // pools per cheap depth-check slice (default 4,000)
   log?: (m: string) => void;
 }): Promise<TokenGroupsResult> {
   const log = deps.log ?? (() => {});
@@ -240,62 +247,127 @@ export async function buildTokenGroups(deps: {
   // 1) Symbols of coins paired with USDG/WETH that we haven't read yet.
   const cache = loadSymbolCache(deps.symbolCacheFile);
   const todo = deps.state.tokens.slice(cache.upTo).filter((t) => qp.has(t.toLowerCase()) && !(t.toLowerCase() in cache.symbols));
+  // On a big chain this is thousands of names on the gentle scan lane, so it
+  // can take a while. Two things keep it visible and restart-safe:
+  //  - a progress line every `progressEvery` bundles (the status page shows
+  //    the latest one until the list is built), and
+  //  - the names read so far are saved at each progress line, so a restart
+  //    (e.g. a deploy) resumes where it stopped instead of starting over
+  //    (`upTo` only moves when the whole step is done; already-read names
+  //    are skipped by the `in cache.symbols` check above).
   const BUNDLE = 400;
-  for (let i = 0; i < todo.length; i += BUNDLE) {
+  const every = Math.max(1, deps.progressEvery ?? 10);
+  const t0 = Date.now();
+  log(`[groups] building: reading ${todo.length} coin name(s) (${Object.keys(cache.symbols).length} already known)`);
+  for (let i = 0, n = 0; i < todo.length; i += BUNDLE, n++) {
     const slice = todo.slice(i, i + BUNDLE);
     const res = await deps.callMany(slice.map((t) => ({ target: t, data: SEL_SYMBOL })));
     slice.forEach((t, j) => { cache.symbols[t.toLowerCase()] = decodeSymbol(res[j]) ?? ''; });
-    if (i + BUNDLE < todo.length) await sleep(deps.pauseMs ?? 2_000);
+    const done = Math.min(todo.length, i + BUNDLE);
+    if ((n + 1) % every === 0 && done < todo.length) {
+      saveJson(deps.symbolCacheFile, cache);
+      log(`[groups] building: coin names ${done} of ${todo.length} read (${Math.round((Date.now() - t0) / 1000)}s)`);
+    }
+    if (done < todo.length) await sleep(deps.pauseMs ?? 2_000);
   }
   cache.upTo = deps.state.tokens.length;
   saveJson(deps.symbolCacheFile, cache);
-  log(`[groups] symbols: ${todo.length} new read, ${Object.keys(cache.symbols).length} known`);
+  log(`[groups] symbols: ${todo.length} new read, ${Object.keys(cache.symbols).length} known (${Math.round((Date.now() - t0) / 1000)}s)`);
 
   // 2) Candidates by name (never trusted on its own).
   const cands = pickCandidates(Object.entries(cache.symbols).filter(([, s]) => s).map(([token, symbol]) => ({ token, symbol })));
   for (const t of [usdg, weth]) if (!cands.some((c) => c.token === t)) cands.push({ token: t, symbol: t === usdg ? 'USDG' : 'WETH', ...(t === usdg ? { kind: 'dollar' as const, group: 'Dollars' } : { kind: 'eth' as const, group: 'ETH' }) });
 
-  // 3) Price each candidate on its USDG/WETH pools (plus WETH itself).
-  const need = [...new Set(cands.map((c) => c.token))];
-  const pools = [...new Map(need.flatMap((t) => qp.get(t) ?? []).filter((p) => !p.stable).map((p) => [p.pool.toLowerCase(), p])).values()];
-  const toks = [...new Set([...need, usdg, weth, ...pools.flatMap((p) => [p.token0.toLowerCase(), p.token1.toLowerCase()])])];
-  const metaRes = await deps.callMany(toks.map((t) => ({ target: t, data: SEL_DECIMALS })));
-  const dec = new Map<string, number>();
-  toks.forEach((t, i) => { const d = big(metaRes[i]); if (d !== null && d <= 36n) dec.set(t, Number(d)); });
-  const calls: { target: string; data: string }[] = [];
-  for (const p of pools) {
-    calls.push({ target: p.token0, data: SEL_BALANCE + pad(p.pool) }, { target: p.token1, data: SEL_BALANCE + pad(p.pool) });
-    calls.push(p.kind === 'v3' ? { target: p.pool, data: SEL_SLOT0 } : { target: p.pool, data: SEL_RESERVES });
-    calls.push(p.kind === 'solidly' ? { target: p.pool, data: SEL_STABLE } : { target: p.pool, data: SEL_RESERVES });
-  }
-  const res = await deps.callMany(calls);
-  const read = pools.map((p, i) => {
-    const b0 = big(res[i * 4]), b1 = big(res[i * 4 + 1]);
-    const d0 = dec.get(p.token0.toLowerCase()), d1 = dec.get(p.token1.toLowerCase());
-    if (b0 === null || b1 === null || d0 === undefined || d1 === undefined) return null;
-    if (p.kind === 'solidly' && big(res[i * 4 + 3]) === 1n) return null; // stable-curve pool: not a plain price
-    let px: number | null = null; // token1 per token0
-    if (p.kind === 'v3') {
-      const s = big(res[i * 4 + 2]);
-      if (s && s > 0n) { const x = Number(s) / 2 ** 96; px = x * x * 10 ** (d0 - d1); }
-    } else {
-      const r0 = big(res[i * 4 + 2], 0), r1 = big(res[i * 4 + 2], 1);
-      if (r0 && r1) px = (Number(r1) / 10 ** d1) / (Number(r0) / 10 ** d0);
-    }
-    if (!px || !Number.isFinite(px)) return null;
-    return { p, px, a0: Number(b0) / 10 ** d0, a1: Number(b1) / 10 ** d1 };
-  }).filter((x): x is NonNullable<typeof x> => !!x);
+  // 3) Price candidates on their USDG/WETH pools.
+  //
+  // On Robinhood Chain names repeat by the thousands (launchpad meme coins),
+  // so "2+ coins with the same name" made ~400,000 candidates. Reading all of
+  // them in full (decimals + 4 reads per pool) took hours on the gentle lane
+  // and the list never got built. So, in three steps:
+  //   a) WETH's price from the WETH/USDG pools (needed for the depth check).
+  //   b) Cheap depth check: ONE read per pool, the USDG/WETH balance in it.
+  //      A pool's "money in it" is 2 x its smaller side, so a pool holding
+  //      less than half the minimum in USDG/WETH can never qualify. Exact,
+  //      not a guess: no real coin is lost here.
+  //   c) Full price read only for pools that passed (a few hundred).
+  const minDepthUsd = deps.minDepthUsd ?? MIN_GROUP_DEPTH_USD;
+  const need = new Set(cands.map((c) => c.token.toLowerCase()));
+  const allPools = [...new Map([...need].flatMap((t) => qp.get(t) ?? []).filter((p) => !p.stable).map((p) => [p.pool.toLowerCase(), p])).values()];
+  log(`[groups] building: ${need.size} candidate coin(s) by name, ${allPools.length} pool(s) to check`);
+  const isAnchor = (p: ScannedPool) => { const a = p.token0.toLowerCase(), b = p.token1.toLowerCase(); return (a === weth && b === usdg) || (a === usdg && b === weth); };
 
-  // WETH's price: its deepest pool against USDG.
+  // Full read of some pools: decimals of their coins, balances, price.
+  const decCache = new Map<string, number>();
+  const readPools = async (ps: ScannedPool[]) => {
+    const toks = [...new Set(ps.flatMap((p) => [p.token0.toLowerCase(), p.token1.toLowerCase()]))].filter((t) => !decCache.has(t));
+    if (toks.length) {
+      const metaRes = await deps.callMany(toks.map((t) => ({ target: t, data: SEL_DECIMALS })));
+      toks.forEach((t, i) => { const d = big(metaRes[i]); if (d !== null && d <= 36n) decCache.set(t, Number(d)); });
+    }
+    const calls: { target: string; data: string }[] = [];
+    for (const p of ps) {
+      calls.push({ target: p.token0, data: SEL_BALANCE + pad(p.pool) }, { target: p.token1, data: SEL_BALANCE + pad(p.pool) });
+      calls.push(p.kind === 'v3' ? { target: p.pool, data: SEL_SLOT0 } : { target: p.pool, data: SEL_RESERVES });
+      calls.push(p.kind === 'solidly' ? { target: p.pool, data: SEL_STABLE } : { target: p.pool, data: SEL_RESERVES });
+    }
+    const res = ps.length ? await deps.callMany(calls) : [];
+    return ps.map((p, i) => {
+      const b0 = big(res[i * 4]), b1 = big(res[i * 4 + 1]);
+      const d0 = decCache.get(p.token0.toLowerCase()), d1 = decCache.get(p.token1.toLowerCase());
+      if (b0 === null || b1 === null || d0 === undefined || d1 === undefined) return null;
+      if (p.kind === 'solidly' && big(res[i * 4 + 3]) === 1n) return null; // stable-curve pool: not a plain price
+      let px: number | null = null; // token1 per token0
+      if (p.kind === 'v3') {
+        const sq = big(res[i * 4 + 2]);
+        if (sq && sq > 0n) { const x = Number(sq) / 2 ** 96; px = x * x * 10 ** (d0 - d1); }
+      } else {
+        const r0 = big(res[i * 4 + 2], 0), r1 = big(res[i * 4 + 2], 1);
+        if (r0 && r1) px = (Number(r1) / 10 ** d1) / (Number(r0) / 10 ** d0);
+      }
+      if (!px || !Number.isFinite(px)) return null;
+      return { p, px, a0: Number(b0) / 10 ** d0, a1: Number(b1) / 10 ** d1 };
+    }).filter((x): x is NonNullable<typeof x> => !!x);
+  };
+
+  // a) WETH's price: its deepest pool against USDG.
+  const anchorRead = await readPools(allPools.filter(isAnchor));
   let wethUsd = 0, bestW = 0;
-  for (const r of read) {
-    const t0 = r.p.token0.toLowerCase(), t1 = r.p.token1.toLowerCase();
-    if (!((t0 === weth && t1 === usdg) || (t0 === usdg && t1 === weth))) continue;
-    const usdAmt = t0 === usdg ? r.a0 : r.a1;
-    const px = t0 === weth ? r.px : 1 / r.px;
+  for (const r of anchorRead) {
+    const usdAmt = r.p.token0.toLowerCase() === usdg ? r.a0 : r.a1;
+    const px = r.p.token0.toLowerCase() === weth ? r.px : 1 / r.px;
     if (usdAmt > bestW) { bestW = usdAmt; wethUsd = px; }
   }
   const quoteUsd = (q: string) => (q === usdg ? 1 : q === weth ? wethUsd : 0);
+
+  // b) Cheap depth check, in slices (progress + a short pause between).
+  const dU = decCache.get(usdg), dW = decCache.get(weth);
+  const passed: ScannedPool[] = [];
+  const shallow = new Map<string, number>(); // token -> best "money in it" upper bound, for the rejected list
+  const rest = allPools.filter((p) => !isAnchor(p));
+  const SLICE = deps.depthSlice ?? 4_000;
+  const tc = Date.now();
+  for (let i = 0; i < rest.length; i += SLICE) {
+    const slice = rest.slice(i, i + SLICE);
+    const qOf = (p: ScannedPool) => { const a = p.token0.toLowerCase(); return a === usdg || a === weth ? a : p.token1.toLowerCase(); };
+    const res = await deps.callMany(slice.map((p) => ({ target: qOf(p), data: SEL_BALANCE + pad(p.pool) })));
+    slice.forEach((p, j) => {
+      const q = qOf(p), d = q === usdg ? dU : dW, b = big(res[j]);
+      if (b === null || d === undefined) return;
+      const upTo = 2 * (Number(b) / 10 ** d) * quoteUsd(q); // most this pool could count as
+      if (upTo >= minDepthUsd) { passed.push(p); return; }
+      const tok = q === p.token0.toLowerCase() ? p.token1.toLowerCase() : p.token0.toLowerCase();
+      if (upTo > (shallow.get(tok) ?? -1)) shallow.set(tok, upTo);
+    });
+    const done = Math.min(rest.length, i + SLICE);
+    if (done < rest.length) {
+      if ((i / SLICE + 1) % 10 === 0) log(`[groups] building: depth check ${done} of ${rest.length} pools, ${passed.length} deep enough (${Math.round((Date.now() - tc) / 1000)}s)`);
+      await sleep(deps.pauseMs ?? 2_000);
+    }
+  }
+  log(`[groups] building: ${passed.length} of ${rest.length} pool(s) have enough USDG/WETH in them; pricing those`);
+
+  // c) Full read of the pools that passed.
+  const read = [...anchorRead, ...await readPools(passed)];
   const prices = new Map<string, QuotePrice>();
   for (const r of read) {
     const t0 = r.p.token0.toLowerCase(), t1 = r.p.token1.toLowerCase();
@@ -309,9 +381,13 @@ export async function buildTokenGroups(deps: {
       if (!prev || depthUsd > prev.depthUsd) prices.set(tok, { priceUsd, depthUsd, pool: r.p.pool.toLowerCase() });
     }
   }
+  // Coins that only have shallow pools: their best depth (upper bound) so the
+  // rejected list says "only $X in its best pool" (price unknown: never used,
+  // verifyGroups rejects on depth before it looks at the price).
+  for (const [tok, upTo] of shallow) if (!prices.has(tok)) prices.set(tok, { priceUsd: NaN, depthUsd: upTo, pool: '' });
 
   // 4) Verify and save.
-  const { members, rejected } = verifyGroups(cands, prices, { usdg, weth, wethUsd });
+  const { members, rejected } = verifyGroups(cands, prices, { usdg, weth, wethUsd }, minDepthUsd);
   const out: TokenGroupsResult = { version: 1, updatedAt: Date.now(), members, rejected };
   saveJson(deps.outFile, out);
   log(`[groups] ${groupsStatusLine(out)}`);
