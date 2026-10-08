@@ -154,6 +154,20 @@ export const ROBINHOOD_VENUES: readonly RobinhoodVenue[] = [
     executionBlocker: 'Uniswap V3 callback, tick-spacing pools; not yet replay-tested.',
     source: ['DefiLlama dimension-adapters dexs/raphael-slipstream/index.ts'],
   },
+  {
+    id: 'sushiswap-v3', name: 'SushiSwap V3', priority: 'P1', model: 'uniswap-v3',
+    contracts: [{ role: 'factory', address: '0xE51960f1B45f1C9FB6D166E6a884F866fC70433B' }],
+    priceable: true, executionEnabled: false,
+    executionBlocker: 'Uniswap V3 copy (same callback); not yet replay-tested.',
+    source: ['DefiLlama dimension-adapters dexs/sushiswap-v3.ts', 'venue probe run 37845231412 (factory of 7 traded pools)'],
+  },
+  {
+    id: 'kittenswap-algebra', name: 'KittenSwap (Algebra)', priority: 'P1', model: 'algebra',
+    contracts: [{ role: 'factory', address: '0xf03875b5Ec5eAc83cab83A6c2ab17844304AA7a0' }],
+    priceable: true, executionEnabled: false,
+    executionBlocker: 'Algebra callback; plugins can override the fee per swap (SwapFee event).',
+    source: ['DefiLlama dimension-adapters dexs/kittenswap-algebra/index.ts', 'venue probe run 37845231412'],
+  },
   // ---- P2: documented by the project, not seen in rival trades ---------------
   {
     id: 'goo-exchange', name: 'Goo Exchange', priority: 'P2', model: 'uniswap-v3',

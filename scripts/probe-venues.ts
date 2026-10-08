@@ -27,11 +27,11 @@ import { ROBINHOOD_VENUES } from '../src/config/robinhoodVenues';
 import { clAmountOut, v2AmountOut, errorBps } from '../src/core/venueMath';
 
 const URL_ = process.env.ROBINHOOD_RPC_URL ?? 'https://rpc.mainnet.chain.robinhood.com';
-const WINDOWS = Number(process.env.PROBE_WINDOWS ?? 6);
-const WINDOW = Number(process.env.PROBE_WINDOW ?? 150);
+const WINDOWS = Number(process.env.PROBE_WINDOWS ?? 4);
+const WINDOW = Number(process.env.PROBE_WINDOW ?? 100);
 const HOURS = Number(process.env.PROBE_HOURS ?? 3);
 const PACE = Number(process.env.PROBE_PACE_MS ?? 700);
-const PER_VENUE = Number(process.env.PROBE_SWAPS_PER_VENUE ?? 10);
+const PER_VENUE = Number(process.env.PROBE_SWAPS_PER_VENUE ?? 15);
 const BLOCKSCOUT = 'https://robinhoodchain.blockscout.com/api/v2';
 const MC3 = '0xcA11bde05977b3631167028862bE2a173976CA11';
 
@@ -170,87 +170,115 @@ async function main() {
     ...[...byVenue.entries()].sort((a, b) => b[1].length - a[1].length).map(([v, l]) => `${v}: ${l.length} swaps, ${new Set(l.map((x) => x.topics[0] === T_V4 ? x.topics[1] : x.address)).size} pools, topic ${l[0].topics[0].slice(0, 10)}`),
   ].join('\n'));
 
-  // ---- 3. validate our maths on real swaps ----------------------------------
-  for (const [venue, list] of byVenue) {
-    if (venue === 'no factory()') continue;
-    const lines: string[] = [];
-    const errs: number[] = [], priceErrs: number[] = [];
-    let crossed = 0, tested = 0, skippedEarlier = 0, feeMismatch = 0;
-    for (const s of list) {
-      if (tested >= PER_VENUE) break;
-      // Pre-swap state is only "the block before" if no earlier swap hit this pool in the same block.
-      const key = s.topics[0] === T_V4 ? s.topics[1] : s.address;
-      const earlier = (blockLogs.get(s.block) ?? []).some((o) => o.logIndex < s.logIndex && (o.topics[0] === T_V4 ? o.topics[1] : o.address) === key);
-      if (earlier) { skippedEarlier++; continue; }
-      const pre = s.block - 1;
+  // ---- 3. validate our maths on real swaps (at the chain head) -------------
+  // The public node only keeps recent state (a few hundred blocks, i.e.
+  // seconds on this chain), so each swap is checked right after its block
+  // appears: read the newest block, then the pool state one block before.
+  const stats = new Map<string, { tested: number; inBand: number[]; price: number[]; crossed: number; earlier: number; feeMismatch: number; lines: string[] }>();
+  const st = (v: string) => stats.get(v) ?? stats.set(v, { tested: 0, inBand: [], price: [], crossed: 0, earlier: 0, feeMismatch: 0, lines: [] }).get(v)!;
+  const wanted = (v: string) => !v.startsWith('factory ') && v !== 'no factory()' && v !== 'uniswap-v4 (other)';
+  const deadline = Date.now() + Number(process.env.PROBE_VALIDATE_MIN ?? 14) * 60_000;
+  let lastSeen = 0;
+  let firstErr = '';
+  while (Date.now() < deadline) {
+    const head = Number(await rpc('eth_blockNumber', []));
+    if (head === lastSeen) { await sleep(300); continue; }
+    lastSeen = head;
+    let rcpts: any[] = [];
+    try { rcpts = await rpc('eth_getBlockReceipts', [ethers.toQuantity(head)]); } catch { continue; }
+    const list: SwapLog[] = [];
+    for (const rc of rcpts ?? []) for (const l of rc.logs ?? []) {
+      const t0 = l.topics?.[0];
+      if (t0 !== T_V2 && t0 !== T_V3 && t0 !== T_PCS && t0 !== T_V4) continue;
+      list.push({ block: head, logIndex: Number(l.logIndex), address: String(l.address).toLowerCase(), topics: l.topics, data: l.data, tx: rc.transactionHash });
+    }
+    // New pools: who made them (one bundled read).
+    const unknownPools = [...new Set(list.filter((x) => x.topics[0] !== T_V4 && !factoryOf.has(x.address)).map((x) => x.address))];
+    if (unknownPools.length) {
+      const r = await callMany(unknownPools.map((p) => ({ target: p, data: SEL('factory()') })));
+      unknownPools.forEach((p, i) => { const f = addr(r[i]); if (f) factoryOf.set(p, f); });
+    }
+    // One swap per venue per block, first touch of its pool in the block only.
+    const seenPool = new Set<string>();
+    const picks: { s: SwapLog; venue: string }[] = [];
+    for (const x of list) {
+      const key = x.topics[0] === T_V4 ? x.topics[1] : x.address;
+      const v = venueOf(x);
+      if (seenPool.has(key)) { if (wanted(v)) st(v).earlier++; continue; }
+      seenPool.add(key);
+      if (!wanted(v) || st(v).tested >= PER_VENUE || picks.some((p) => p.venue === v)) continue;
+      picks.push({ s: x, venue: v });
+    }
+    if (!picks.length) continue;
+    // All pre-swap state for this block in ONE request.
+    const calls: { target: string; data: string }[] = [];
+    const at: number[] = [];
+    for (const { s: x } of picks) {
+      at.push(calls.length);
+      if (x.topics[0] === T_V4) calls.push(
+        { target: ROBINHOOD_V4.STATE_VIEW, data: SEL('getSlot0(bytes32)') + x.topics[1].slice(2) },
+        { target: ROBINHOOD_V4.STATE_VIEW, data: SEL('getLiquidity(bytes32)') + x.topics[1].slice(2) });
+      else if (x.topics[0] === T_V2) calls.push({ target: x.address, data: SEL('getReserves()') }, { target: x.address, data: SEL('fee()') });
+      else calls.push({ target: x.address, data: SEL('slot0()') }, { target: x.address, data: SEL('globalState()') }, { target: x.address, data: SEL('liquidity()') }, { target: x.address, data: SEL('fee()') });
+    }
+    let res: (string | null)[];
+    try {
+      const data = mc3.encodeFunctionData('aggregate3', [calls.map((c) => ({ target: c.target, allowFailure: true, callData: c.data }))]);
+      const ret = await rpc('eth_call', [{ to: MC3, data }, ethers.toQuantity(head - 1)]);
+      res = mc3.decodeFunctionResult('aggregate3', ret)[0].map((r: any) => (r.success && r.returnData !== '0x' ? r.returnData : null));
+    } catch (e) { if (!firstErr) firstErr = String((e as any)?.shortMessage ?? (e as Error).message).slice(0, 160); continue; }
+    picks.forEach(({ s: x, venue }, k) => {
+      const i = at[k], v = st(venue);
       try {
-        if (s.topics[0] === T_V2) {
-          // Classic pair: reserves before, fee from fee() if it has one (GIGA Classic: per pair, 1e6 denom).
-          const [res, fee] = await callMany([{ target: s.address, data: SEL('getReserves()') }, { target: s.address, data: SEL('fee()') }], pre);
-          const r0 = word(res, 0), r1 = word(res, 1);
-          const a0In = word(s.data, 0)!, a1In = word(s.data, 1)!, a0Out = word(s.data, 2)!, a1Out = word(s.data, 3)!;
-          if (r0 === null || r1 === null) { lines.push(`${s.tx}: no reserves`); continue; }
+        if (x.topics[0] === T_V2) {
+          const r0 = word(res[i], 0), r1 = word(res[i], 1), feeRaw = word(res[i + 1], 0);
+          if (r0 === null || r1 === null) { v.lines.push(`${x.tx.slice(0, 12)}: no reserves`); return; }
           // Known fixed fees; GIGA Classic reads fee() per pair (millionths = pips).
-          const feeRaw = word(fee, 0);
           const feePips = venue === 'uniswap-v2' ? 3000 : venue === 'pancakeswap-v2' ? 2500
-            : venue === 'giga-classic' && feeRaw !== null ? Number(feeRaw) : feeRaw !== null && feeRaw < 100_000n ? Number(feeRaw) : 3000;
+            : feeRaw !== null && feeRaw < 100_000n ? Number(feeRaw) : 3000;
+          const a0In = word(x.data, 0)!, a1In = word(x.data, 1)!, a0Out = word(x.data, 2)!, a1Out = word(x.data, 3)!;
           const zf = a0In > 0n;
           const pred = zf ? v2AmountOut(a0In, r0, r1, feePips) : v2AmountOut(a1In, r1, r0, feePips);
-          const act = zf ? a1Out : a0Out;
-          const e = errorBps(pred, act); errs.push(e); tested++;
-          lines.push(`${s.tx.slice(0, 12)} v2 fee ${feePips}pips err ${e.toFixed(2)} bps`);
-        } else {
-          const v4 = s.topics[0] === T_V4;
-          let sqrtP: bigint | null, liq: bigint | null, feePips: number | null = null;
-          if (v4) {
-            const [s0, l] = await callMany([
-              { target: ROBINHOOD_V4.STATE_VIEW, data: SEL('getSlot0(bytes32)') + s.topics[1].slice(2) },
-              { target: ROBINHOOD_V4.STATE_VIEW, data: SEL('getLiquidity(bytes32)') + s.topics[1].slice(2) },
-            ], pre);
-            sqrtP = word(s0, 0); liq = word(l, 0);
-            const lpFee = word(s0, 3);
-            const evFee = Number(word(s.data, 5));
-            if (lpFee !== null && Number(lpFee) !== evFee) feeMismatch++;
-            feePips = evFee; // the fee the swap really paid (dynamic-fee hooks may differ from lpFee)
-          } else {
-            const [s0, gs, l, f] = await callMany([
-              { target: s.address, data: SEL('slot0()') },
-              { target: s.address, data: SEL('globalState()') },
-              { target: s.address, data: SEL('liquidity()') },
-              { target: s.address, data: SEL('fee()') },
-            ], pre);
-            sqrtP = word(s0, 0) ?? word(gs, 0); liq = word(l, 0);
-            const fr = word(f, 0);
-            feePips = fr !== null ? Number(fr) : gs ? Number(word(gs, 2)) : null;
-          }
-          if (!sqrtP || !liq || feePips === null) { lines.push(`${s.tx.slice(0, 12)}: state unreadable at ${pre}`); continue; }
-          // Event amounts. V3-style: from the pool's side (+ = pool received).
-          // V4: from the swapper's side (- = swapper paid), so flip.
-          let a0 = signed(word(s.data, 0)!), a1 = signed(word(s.data, 1)!);
-          if (v4) { a0 = signed(word(s.data, 0)!, 256); a1 = signed(word(s.data, 1)!, 256); a0 = -a0; a1 = -a1; }
-          const postSqrt = word(s.data, 2)!, postLiq = word(s.data, 3)!;
-          const zf = a0 > 0n;
-          const amtIn = zf ? a0 : a1;
-          const act = zf ? -a1 : -a0;
-          const { amountOut, sqrtPriceNextX96 } = clAmountOut(sqrtP, liq, amtIn, zf, feePips);
-          const e = errorBps(amountOut, act);
-          const pe = errorBps(sqrtPriceNextX96, postSqrt);
-          const cross = postLiq !== liq;
-          if (cross) crossed++; else { errs.push(e); priceErrs.push(pe); }
-          tested++;
-          lines.push(`${s.tx.slice(0, 12)} fee ${feePips}pips${cross ? ' CROSSED band' : ''} out err ${e.toFixed(3)} bps, price err ${pe.toFixed(3)} bps`);
+          const e = errorBps(pred, zf ? a1Out : a0Out);
+          v.tested++; v.inBand.push(e);
+          v.lines.push(`${x.tx.slice(0, 12)} v2 fee ${feePips}pips err ${e.toFixed(3)} bps`);
+          return;
         }
-      } catch (err) { lines.push(`${s.tx.slice(0, 12)}: ${(err as Error).message.slice(0, 80)}`); }
-    }
-    const sorted = [...errs].sort((a, b) => a - b);
-    const med = sorted.length ? sorted[Math.floor(sorted.length / 2)] : NaN;
-    const max = sorted.length ? sorted[sorted.length - 1] : NaN;
-    note(`Validate ${venue}`, [
-      `tested ${tested} (in-band ${errs.length}, crossed a band ${crossed}, skipped ${skippedEarlier} with an earlier swap in the block${feeMismatch ? `, V4 fee differed from pool lpFee ${feeMismatch}x` : ''})`,
-      `amount-out error: median ${med.toFixed(3)} bps, worst ${max.toFixed(3)} bps`,
-      ...lines.slice(0, 12),
-      `example tx: ${list[0].tx}`,
-    ].join('\n'));
+        const v4 = x.topics[0] === T_V4;
+        let sqrtP: bigint | null, liq: bigint | null, feePips: number | null;
+        if (v4) {
+          sqrtP = word(res[i], 0); liq = word(res[i + 1], 0);
+          const lpFee = word(res[i], 3), evFee = Number(word(x.data, 5));
+          if (lpFee !== null && Number(lpFee) !== evFee) v.feeMismatch++;
+          feePips = evFee; // the fee this swap really paid (hooks may change it per swap)
+        } else {
+          sqrtP = word(res[i], 0) ?? word(res[i + 1], 0); liq = word(res[i + 2], 0);
+          const fr = word(res[i + 3], 0);
+          feePips = fr !== null ? Number(fr) : res[i + 1] ? Number(word(res[i + 1], 2)) : null;
+        }
+        if (!sqrtP || !liq || feePips === null) { v.lines.push(`${x.tx.slice(0, 12)}: state unreadable`); return; }
+        // V3-style events: amounts from the pool's side (+ = pool received).
+        // V4: from the swapper's side, so flip the sign.
+        let a0 = signed(word(x.data, 0)!), a1 = signed(word(x.data, 1)!);
+        if (v4) { a0 = -a0; a1 = -a1; }
+        const postSqrt = word(x.data, 2)!, postLiq = word(x.data, 3)!;
+        const zf = a0 > 0n;
+        const { amountOut, sqrtPriceNextX96 } = clAmountOut(sqrtP, liq, zf ? a0 : a1, zf, feePips);
+        const e = errorBps(amountOut, zf ? -a1 : -a0), pe = errorBps(sqrtPriceNextX96, postSqrt);
+        const cross = postLiq !== liq;
+        v.tested++;
+        if (cross) v.crossed++; else { v.inBand.push(e); v.price.push(pe); }
+        v.lines.push(`${x.tx.slice(0, 12)} fee ${feePips}pips${cross ? ' CROSSED band' : ''} out err ${e.toFixed(3)} bps, price err ${pe.toFixed(3)} bps`);
+      } catch (err) { v.lines.push(`${x.tx.slice(0, 12)}: ${(err as Error).message.slice(0, 80)}`); }
+    });
+    if ([...stats.values()].length >= 8 && [...stats.values()].every((x) => x.tested >= PER_VENUE)) break;
   }
+  const q = (xs: number[], f: number) => { const a = [...xs].sort((m, n) => m - n); return a.length ? a[Math.min(a.length - 1, Math.floor(a.length * f))] : NaN; };
+  const summary: string[] = [firstErr ? `first state-read error: ${firstErr}` : 'state reads ok'];
+  for (const [venue, v] of [...stats.entries()].sort((a, b) => b[1].tested - a[1].tested)) {
+    summary.push(`${venue}: tested ${v.tested}, in-band ${v.inBand.length} (out err median ${q(v.inBand, 0.5).toFixed(3)} bps, p90 ${q(v.inBand, 0.9).toFixed(3)}, worst ${q(v.inBand, 1).toFixed(3)}; price err median ${q(v.price, 0.5).toFixed(3)}), crossed ${v.crossed}${v.feeMismatch ? `, hook fee differed from pool fee ${v.feeMismatch}x` : ''}, later-in-block skips ${v.earlier}`);
+  }
+  note('Validation summary (our maths vs real swaps)', summary.join('\n'));
+  for (const [venue, v] of stats) if (v.lines.length) note(`Validate ${venue}`, v.lines.slice(0, 15).join('\n'));
 }
 main().catch((e) => { note('Venue probe failed', String(e?.message ?? e)); process.exitCode = 0; });
