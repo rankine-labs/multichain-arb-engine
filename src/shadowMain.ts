@@ -1774,7 +1774,10 @@ await chainManager.startAll();
       };
       // After start: the saved list is used right away (if any) and rebuilt
       // in the background; then refreshed every 6 h like the pool scan.
-      setTimeout(() => { void setupLoops(false).then(() => setupLoops(true)); }, 3 * 60_000);
+      // (Only rebuild straight away when we started from a saved list; a
+      // fresh build just ran, so a second one would only repeat it.)
+      const groupsFromDisk = !!tokenGroups;
+      setTimeout(() => { void setupLoops(false).then(() => (groupsFromDisk ? setupLoops(true) : undefined)); }, 3 * 60_000);
       setInterval(() => { void setupLoops(true); }, 6 * 60 * 60_000);
       let loopBusy = false;
       let loopErrors = 0;
