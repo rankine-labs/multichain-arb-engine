@@ -244,6 +244,14 @@ const UNREADABLE_GAP_PCT = 50;      // above this: wrong decimals / broken pool,
 const emptyLoop = (): LoopStats => ({ samples: 0, hugeSamples: 0, maxGapPct: 0, maxNetPct: -Infinity, secondsProfitable: 0, longestRunS: 0, curRunS: 0, best: null });
 const emptyPeg = (): PegStats => ({ samples: 0, maxDevPct: 0, maxNetPct: -Infinity, secondsProfitable: 0, longestRunS: 0, curRunS: 0 });
 
+// Should the one-time first LOOP REPORT be scheduled now? Only once, only if
+// it was never sent, and only once the loop watch actually watches tokens.
+// (Starting the 2 h clock at bot start sent an empty "0 tokens" report when
+// the coin list took long to build on the free node.)
+export function shouldScheduleFirstLoopReport(firstSent: boolean, alreadyScheduled: boolean, tokensWatched: number): boolean {
+  return !firstSent && !alreadyScheduled && tokensWatched > 0;
+}
+
 // Is this token broken (gap above 10% nearly every time we looked)?
 export function isBrokenLoop(s: LoopStats): boolean {
   return s.samples >= JUNK_MIN_SAMPLES && s.hugeSamples / s.samples >= JUNK_SHARE;

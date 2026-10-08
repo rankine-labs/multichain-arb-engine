@@ -76,7 +76,7 @@ import { RawChainEvent, PoolState } from './core/types';
 import { priceOf, spreadPct, deepEnough } from './core/poolPrice';
 import { PairWatcher, Venue, refreshPoolState, refreshPoolsBatch } from './core/pairWatcher';
 import { scanUniverse, emptyScanState, ScanState, stateToPools, getLogsAdaptive, RawLog } from './core/universeScan';
-import { CrossQuoteMonitor, LoopMonitor } from './core/crossQuoteMonitor';
+import { CrossQuoteMonitor, LoopMonitor, shouldScheduleFirstLoopReport } from './core/crossQuoteMonitor';
 import { NewPoolWatch } from './core/newPoolWatch';
 import { buildTokenGroups, loadTokenGroups, groupsStatusLine, TokenGroupsResult } from './core/tokenGroups';
 import { readFileSync, writeFileSync, mkdirSync, renameSync } from 'fs';
@@ -1745,6 +1745,8 @@ await chainManager.startAll();
             (token) => TOKEN_DECIMALS.robinhood?.[token.toLowerCase()],
       );
       loopMonitor.load(LOOP_STATS_FILE);
+      // Set up further down, next to the LOOP REPORT (no-op until then).
+      let scheduleFirstLoopReport: (tokensWatched: number) => void = () => {};
       let groupsBusy = false;
       const setupLoops = async (rebuildGroups: boolean) => {
             if (groupsBusy) return;
@@ -1763,6 +1765,7 @@ await chainManager.startAll();
                   const quotes = tokenGroups.members.map((m) => ({ token: m.token, symbol: m.symbol, group: m.group, priceUsd: m.priceUsd }));
                   const n = await loopMonitor.setup(pools, quotes, Number(process.env.LOOP_TOKENS ?? 80));
                   console.log(`[loops] watching ${n} tokens that trade against 2+ of ${quotes.length} verified coins`);
+                  scheduleFirstLoopReport(n);
             } catch (err) {
                   console.warn('[groups] build/setup failed, retrying later:', (err as Error).message);
             } finally {
@@ -1807,10 +1810,17 @@ await chainManager.startAll();
             loopMonitor.resetPeriod();
             loopMonitor.save(LOOP_STATS_FILE);
       };
-      if (!loopReportState().firstSent) {
-            setTimeout(() => { void sendLoopReport(toronto().date).catch((err) => console.error('[telegram] loop report failed:', err)); },
-                  Number(process.env.LOOP_FIRST_REPORT_MS ?? 2 * 3600_000));
-      }
+      // The first report's 2 h clock starts once the loop watch has tokens
+      // (see setupLoops), not at bot start: the coin list can take a while.
+      let firstLoopReportScheduled = false;
+      scheduleFirstLoopReport = (tokensWatched: number) => {
+            if (!shouldScheduleFirstLoopReport(!!loopReportState().firstSent, firstLoopReportScheduled, tokensWatched)) return;
+            firstLoopReportScheduled = true;
+            const ms = Number(process.env.LOOP_FIRST_REPORT_MS ?? 2 * 3600_000);
+            console.log(`[loops] first LOOP REPORT in ${Math.round(ms / 60_000)} min`);
+            setTimeout(() => { void sendLoopReport(toronto().date).catch((err) => console.error('[telegram] loop report failed:', err)); }, ms);
+      };
+      scheduleFirstLoopReport(loopMonitor.tokenCount()); // e.g. saved list loaded already
       setInterval(async () => {
             const t = toronto();
             if (t.mins < LOOP_REPORT_AT || t.mins > LOOP_REPORT_AT + 30) return;
