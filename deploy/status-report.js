@@ -173,6 +173,14 @@ async function main() {
   const rwOurs = rw.filter((m) => m[3] === 'all watched').length;
   const scanLine = lastMatch(outL, /^\[scan\] /);
   const openLine = lastMatch(bigTail, /^\[openwatch\] /);
+  // Measurement-only features (Oct 8): new pool counter, coin groups, loops.
+  const newPoolsLine = lastMatch(bigTail, /^\[newpools\] last hour:/);
+  const newPoolsFirstMoney = outL.filter((l) => /^\[newpools\] first money in /.test(l));
+  const newPoolsWaiting = count(outL, /^\[newpools\] new pool .* waiting/);
+  const newPoolsFails = count(outL, /^\[newpools\] poll failed/);
+  const groupsLine = lastMatch(bigTail, /^\[groups\] verified coins:/);
+  const loopsLine = lastMatch(bigTail, /^\[loops\] \d+ tokens across/);
+  const loopsWatch = lastMatch(bigTail, /^\[loops\] watching /);
   const rivalMs = rivalLines.map((l) => /theirs (\d+)ms/.exec(l)).filter(Boolean).map((m) => Number(m[1])).sort((a, b) => a - b);
   const oursMs = rivalLines.map((l) => /ours (\d+)ms/.exec(l)).filter(Boolean).map((m) => Number(m[1])).sort((a, b) => a - b);
   const med = (xs) => (xs.length ? xs[Math.floor(xs.length / 2)] : null);
@@ -228,6 +236,10 @@ async function main() {
     ...(rwTop.length ? [`- Rival profit by pair: ${rwTop.map(([p, v]) => `${p} $${v.toFixed(2)}`).join(' · ')}`] : []),
     ...(scanLine ? [`- Latest scan line: ${scanLine.slice(0, 200)}`] : []),
     ...(openLine ? [`- Market-open watch: ${openLine.replace(/^\[openwatch\] /, '').slice(0, 220)}`] : []),
+    `- New pool counter: ${newPoolsLine ? newPoolsLine.replace(/^\[newpools\] /, '') : 'no hourly line yet'} · this window: ${newPoolsWaiting} new pool(s) for deep coins, ${newPoolsFirstMoney.length} measured, ${newPoolsFails} failed poll(s)`,
+    ...newPoolsFirstMoney.slice(-3).map((l) => `  - ${l.replace(/^\[newpools\] /, '').slice(0, 200)}`),
+    `- Loop watch: ${loopsLine ? loopsLine.replace(/^\[loops\] /, '') : 'no line yet'}${loopsWatch ? ` (${loopsWatch.replace(/^\[loops\] /, '')})` : ''}`,
+    `- Coin groups (please review): ${groupsLine ? groupsLine.replace(/^\[groups\] verified coins: /, '').slice(0, 1500) : 'not built yet'}`,
     `- RPC round trip from the server (public node, best of 3): ${rpcRtt ?? '?'} ms`,
     `- Real-chain test runs: ${simProfit} profitable · ${simLoss} losing · ${simFail} would fail`,
     ...(profitUsd.length ? [`- Profitable checks: total $${profitUsd.reduce((x, y) => x + y, 0).toFixed(2)} · middle $${profitUsd[Math.floor(profitUsd.length / 2)].toFixed(2)} · biggest $${profitUsd[profitUsd.length - 1].toFixed(2)} (before gas)`,

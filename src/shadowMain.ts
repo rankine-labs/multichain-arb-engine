@@ -68,15 +68,17 @@ function symbolOf(chain: string, address: string): string {
     if (known) return known;
     return `${address.slice(0, 6)}...${address.slice(-4)}`;
 }
-import { formatSkippedOpportunity, formatHourlyDigest, formatDailyReport, formatStartup, formatExecutionWarning, DigestSection, DigestSpread, formatPlainHourly, formatPlainDaily, formatRivalDaily, formatMarketOpenReport } from './core/telegramFormatter';
+import { formatSkippedOpportunity, formatHourlyDigest, formatDailyReport, formatStartup, formatExecutionWarning, DigestSection, DigestSpread, formatPlainHourly, formatPlainDaily, formatRivalDaily, formatMarketOpenReport, formatLoopReport } from './core/telegramFormatter';
 import { RobinhoodChainAdapter } from './chains/robinhoodChain';
 import { MonadAdapter } from './chains/monad';
 import { AvalancheAdapter } from './chains/avalanche';
 import { RawChainEvent, PoolState } from './core/types';
 import { priceOf, spreadPct, deepEnough } from './core/poolPrice';
 import { PairWatcher, Venue, refreshPoolState, refreshPoolsBatch } from './core/pairWatcher';
-import { scanUniverse, emptyScanState, ScanState, stateToPools } from './core/universeScan';
-import { CrossQuoteMonitor } from './core/crossQuoteMonitor';
+import { scanUniverse, emptyScanState, ScanState, stateToPools, getLogsAdaptive, RawLog } from './core/universeScan';
+import { CrossQuoteMonitor, LoopMonitor } from './core/crossQuoteMonitor';
+import { NewPoolWatch } from './core/newPoolWatch';
+import { buildTokenGroups, loadTokenGroups, groupsStatusLine, TokenGroupsResult } from './core/tokenGroups';
 import { readFileSync, writeFileSync, mkdirSync, renameSync } from 'fs';
 import { ROBINHOOD_SCAN_FACTORIES } from './config/knownAddresses';
 import { buildExecuteCall, executionRequested, executorConfig, pickV3Lender } from './execution/executorCalldata';
@@ -792,6 +794,10 @@ const rivalWatch = new RivalWatch(
       (token) => symbolOf('robinhood', token),
       (pool) => !!cache.get('robinhood', pool),
       ROBINHOOD_TOKENS.WETH,
+      Date.now, 3_000,
+      // Money in the pool each coin's price comes from: trades in coins
+      // priced from a pool under $5k are left out of the rival money totals.
+      (token) => priceOracle.getUsdPriceInfo('robinhood', token)?.depthUsd ?? null,
 );
 {
       const n = rivalWatch.load(RIVAL_BOTS_FILE, RIVAL_TRADES_FILE);
@@ -817,6 +823,8 @@ setInterval(() => {
       }
 }, 60_000);
 setInterval(() => rivalWatch.save(RIVAL_BOTS_FILE, RIVAL_TRADES_FILE), 10 * 60_000);
+// New pool counter (set up with the chain-wide scan further down; read by the reports).
+let newPoolWatchRef: NewPoolWatch | null = null;
 
 // LIVE results (only used once live sending is switched on): receipt, profit
 // from the contract's Executed event, gas cost; losses feed the daily cap.
@@ -1673,6 +1681,143 @@ await chainManager.startAll();
       }, 60_000);
       setInterval(() => { void runRobinhoodScan(); }, 6 * 60 * 60_000);
 
+      // ---- Measurement only (Oct 8): new pools, coin groups, loops --------
+      // All three read through the gentle scan lane on the free node (see
+      // robinhoodScanProvider), never the price-read path, and never trade.
+      let rhScanCallMany: ((calls: { target: string; data: string }[]) => Promise<(string | null)[]>) | null = null;
+      const scanCallMany = async (calls: { target: string; data: string }[]) => {
+            rhScanCallMany ??= (await makeCaller(robinhoodScanProvider)).callMany;
+            return rhScanCallMany(calls);
+      };
+
+      // NEW POOL COUNTER (core/newPoolWatch.ts): new pools for coins that
+      // already trade deep, and how far off their starting price was.
+      // One log request a minute (two when a new pool for deep coins appears).
+      const NEW_POOLS_FILE = 'data/new-pools.json';
+      const newPoolWatch = new NewPoolWatch({
+            factories: ROBINHOOD_SCAN_FACTORIES,
+            getLogs: async (addrs, from, to) => {
+                  const out: RawLog[] = [];
+                  await getLogsAdaptive(robinhoodScanProvider as ethers.JsonRpcProvider, addrs, from, to, (logs) => { out.push(...logs); }, 30_000, 200_000);
+                  return out;
+            },
+            latestBlock: () => robinhoodScanProvider.getBlockNumber(),
+            refPrice: (token) => priceOracle.getUsdPriceInfo('robinhood', token),
+            decimals: (token) => TOKEN_DECIMALS.robinhood?.[token.toLowerCase()],
+            symbol: (token) => symbolOf('robinhood', token),
+      });
+      newPoolWatch.load(NEW_POOLS_FILE);
+      setInterval(() => { void newPoolWatch.poll(); }, Number(process.env.NEW_POOL_POLL_MS ?? 60_000));
+      setInterval(() => newPoolWatch.save(NEW_POOLS_FILE), 10 * 60_000);
+      newPoolWatchRef = newPoolWatch;
+
+      // COIN GROUPS (core/tokenGroups.ts): dollar coins, ETH, Bitcoin
+      // versions, verified copies. Names only make a candidate; verified =
+      // $10k+ pool against USDG/WETH and price within 2% of the group.
+      // Saved to data/token-groups.json, printed on the status page.
+      const GROUPS_FILE = 'data/token-groups.json';
+      const SYMBOLS_FILE = 'data/token-symbols.json';
+      let tokenGroups: TokenGroupsResult | null = loadTokenGroups(GROUPS_FILE);
+      if (tokenGroups) console.log(`[groups] ${groupsStatusLine(tokenGroups)} (saved list)`);
+
+      // LOOP MONITOR (LoopMonitor in core/crossQuoteMonitor.ts): best 3-pool
+      // loop per token across all verified coins, after all three real fees.
+      const LOOP_STATS_FILE = 'data/loop-stats.json';
+      const loopMonitor = new LoopMonitor(
+            scanCallMany, Date.now,
+            // Native-ETH pools vs WETH pools for the same token, from the pool
+            // cache (Uniswap V4 pools aren't in the factory scan).
+            () => {
+                  const weth = ROBINHOOD_TOKENS.WETH.toLowerCase();
+                  const byTok = new Map<string, { native?: PoolState; wrapped?: PoolState }>();
+                  for (const p of cache.allForChain('robinhood')) {
+                        const a = p.tokenA.toLowerCase(), b = p.tokenB.toLowerCase();
+                        if (a !== weth && b !== weth) continue;
+                        const tok = a === weth ? b : a;
+                        const e = byTok.get(tok) ?? {};
+                        if (p.v4?.native) { if (!e.native || p.feeBps < e.native.feeBps) e.native = p; }
+                        else if (!e.wrapped || p.feeBps < e.wrapped.feeBps) e.wrapped = p;
+                        byTok.set(tok, e);
+                  }
+                  return [...byTok.entries()].filter(([, e]) => e.native && e.wrapped)
+                        .map(([tok, e]) => ({ label: `${symbolOf('robinhood', tok)}: ETH pool vs WETH pool`, token: tok, native: e.native!, wrapped: e.wrapped! }));
+            },
+            (token) => TOKEN_DECIMALS.robinhood?.[token.toLowerCase()],
+      );
+      loopMonitor.load(LOOP_STATS_FILE);
+      let groupsBusy = false;
+      const setupLoops = async (rebuildGroups: boolean) => {
+            if (groupsBusy) return;
+            groupsBusy = true;
+            try {
+                  const st = scanState ?? loadScanState();
+                  const pools = stateToPools(st);
+                  if (!pools.length) { console.log('[groups] no pool scan yet; will try again later'); return; }
+                  if (rebuildGroups || !tokenGroups) {
+                        tokenGroups = await buildTokenGroups({
+                              callMany: scanCallMany, state: st, pools,
+                              usdg: ROBINHOOD_TOKENS.USDG, weth: ROBINHOOD_TOKENS.WETH,
+                              symbolCacheFile: SYMBOLS_FILE, outFile: GROUPS_FILE, log: (m) => console.log(m),
+                        });
+                  }
+                  const quotes = tokenGroups.members.map((m) => ({ token: m.token, symbol: m.symbol, group: m.group, priceUsd: m.priceUsd }));
+                  const n = await loopMonitor.setup(pools, quotes, Number(process.env.LOOP_TOKENS ?? 80));
+                  console.log(`[loops] watching ${n} tokens that trade against 2+ of ${quotes.length} verified coins`);
+            } catch (err) {
+                  console.warn('[groups] build/setup failed, retrying later:', (err as Error).message);
+            } finally {
+                  groupsBusy = false;
+            }
+      };
+      // After start: the saved list is used right away (if any) and rebuilt
+      // in the background; then refreshed every 6 h like the pool scan.
+      setTimeout(() => { void setupLoops(false).then(() => setupLoops(true)); }, 3 * 60_000);
+      setInterval(() => { void setupLoops(true); }, 6 * 60 * 60_000);
+      let loopBusy = false;
+      let loopErrors = 0;
+      setInterval(async () => {
+            if (loopBusy) return;
+            loopBusy = true;
+            try { await loopMonitor.tick(); } catch (err) {
+                  if (++loopErrors % 20 === 1) console.warn('[loops] reading pools failed (will retry):', (err as Error).message);
+            } finally { loopBusy = false; }
+      }, Number(process.env.LOOP_TICK_MS ?? 30_000));
+      setInterval(() => {
+            loopMonitor.save(LOOP_STATS_FILE);
+            console.log(loopMonitor.statusLine());
+            console.log(newPoolWatch.statusLine(newPoolWatch.summary(Date.now() - 3600_000)));
+            if (tokenGroups) console.log(`[groups] ${groupsStatusLine(tokenGroups)}`);
+      }, 15 * 60_000);
+
+      // LOOP REPORT to Telegram: the first one about 2 h after this update
+      // goes live (only once ever), then daily at 9:10 Toronto time. Each
+      // report covers the time since the previous one.
+      const LOOP_REPORT_FILE = 'data/loop-report.json';
+      const LOOP_REPORT_AT = 9 * 60 + 10; // minutes after midnight, Toronto
+      const loopReportState = (): { date?: string; firstSent?: boolean } => {
+            try { return JSON.parse(readFileSync(LOOP_REPORT_FILE, 'utf8')); } catch { return {}; }
+      };
+      const sendLoopReport = async (date: string) => {
+            const hours = Math.max(0.1, (Date.now() - loopMonitor.periodStart) / 3600_000);
+            writeFileSync(LOOP_REPORT_FILE, JSON.stringify({ ...loopReportState(), date, firstSent: true }));
+            await sendTelegramMessage(formatLoopReport({
+                  dateLabel: date, hours, tokens: loopMonitor.tokenCount(), quotes: loopMonitor.quoteList(),
+                  rows: loopMonitor.rows(), pegs: loopMonitor.pegRows(),
+            }));
+            loopMonitor.resetPeriod();
+            loopMonitor.save(LOOP_STATS_FILE);
+      };
+      if (!loopReportState().firstSent) {
+            setTimeout(() => { void sendLoopReport(toronto().date).catch((err) => console.error('[telegram] loop report failed:', err)); },
+                  Number(process.env.LOOP_FIRST_REPORT_MS ?? 2 * 3600_000));
+      }
+      setInterval(async () => {
+            const t = toronto();
+            if (t.mins < LOOP_REPORT_AT || t.mins > LOOP_REPORT_AT + 30) return;
+            if (loopReportState().date === t.date) return;
+            try { await sendLoopReport(t.date); } catch (err) { console.error('[telegram] loop report failed:', err); }
+      }, 60_000);
+
       // Proactively checks known, real multi-DEX pairs directly on a
       // timer, instead of waiting for real swap traffic to happen to
       // reveal both sides. Every venue below was confirmed to have real,
@@ -1909,6 +2054,9 @@ for (let i = 0; i < resolved.length; i++) {
                         const rpc = robinhoodReadProvider.router.getStats();
                         const pnl = dryRunPnl.summary();
                         const rv = rivals.summary();
+                        // New pools this hour (core/newPoolWatch.ts), also one line for the status page.
+                        const hourNewPools = newPoolWatchRef?.takeHour() ?? null;
+                        if (hourNewPools && newPoolWatchRef) console.log(newPoolWatchRef.statusLine(hourNewPools));
                         await sendTelegramMessage(formatPlainHourly({
                               windowLabel: `${hhmm(lastDigestAt)} to ${hhmm(now)}`,
                               live: robinhoodSender.live,
@@ -1939,6 +2087,7 @@ for (let i = 0; i < resolved.length; i++) {
                               reactionMs: { typical: stats.medianReactionMs, slowest5pct: stats.p95ReactionMs },
                               otherBots: { timed: rv.found, theirMs: rv.theirMedianMs, oursMs: rv.ourMedianMs, weBeat: rv.beatCount },
                               rivalWins: { ...rivalWatch.takeHour(), botsKnown: rivalWatch.botCount() },
+                              newPools: hourNewPools ?? undefined,
                               nodeUsage: nodeUsageToday(),
                               funnel: {
                                     tradesRead: funnel.tradesRead, noPool: funnel.noPool, tooSmall: funnel.tooSmall, noPartner: funnel.noPartner,
@@ -2024,7 +2173,8 @@ for (let i = 0; i < resolved.length; i++) {
             const now = Date.now();
             const sum = rivalWatch.summary(now - 24 * 3600_000, now);
             const hours = Math.min(24, Math.max(0.1, (now - rivalWatch.firstRecordMs(now - 24 * 3600_000)) / 3600_000));
-            await sendTelegramMessage(formatRivalDaily({ dateLabel: torontoNow().date, hours, summary: sum, botsKnown: rivalWatch.botCount() }));
+            await sendTelegramMessage(formatRivalDaily({ dateLabel: torontoNow().date, hours, summary: sum, botsKnown: rivalWatch.botCount(),
+                  newPools: newPoolWatchRef?.summary(now - 24 * 3600_000, now) }));
       };
       setInterval(async () => {
             const t = torontoNow();

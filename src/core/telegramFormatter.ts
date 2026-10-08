@@ -1,5 +1,7 @@
 import { ChainName } from './types';
 import type { RivalSummary } from './rivalWatch';
+import type { NewPoolSummary } from './newPoolWatch';
+import type { LoopRow, PegRow, LoopQuote } from './crossQuoteMonitor';
 import type { GapRow } from './crossQuoteMonitor';
 
 // ============================================================================
@@ -298,6 +300,8 @@ export interface PlainHourlyInput {
   otherBots?: { timed: number; theirMs: number | null; oursMs: number | null; weBeat: number };
   // What the rival bots did this hour (core/rivalWatch.ts).
   rivalWins?: RivalSummary & { botsKnown: number };
+  // New pools for coins that already trade deep (core/newPoolWatch.ts).
+  newPools?: NewPoolSummary;
   topDifferences: { pair: string; pct: number; buyAt: string; sellAt: string }[];
   nodeUsage?: { name: string; used: number; daily: number }[]; // today's requests per node vs allowance
   // Where trades dropped out this hour, step by step (see shadowMain funnel).
@@ -426,6 +430,8 @@ export function formatPlainHourly(r: PlainHourlyInput): string {
     L.push('');
   }
 
+  if (r.newPools) { L.push(newPoolsHourlyLine(r.newPools)); L.push(''); }
+
   if (r.nodeUsage?.length) {
     L.push('<b>Node usage today</b> (requests vs daily allowance)');
     for (const u of r.nodeUsage) {
@@ -527,63 +533,100 @@ const share = (a: number, b: number): string => (b ? `${Math.round((100 * a) / b
 
 function rivalLines(s: RivalSummary): string[] {
   const L: string[] = [];
-  const ok = s.trades - s.failed;
+  const ok = s.trades - s.failed;     // trades that went through
+  const junk = s.junk ?? 0;
   L.push(`Trades: ${s.trades} by ${s.bots} bot${s.bots === 1 ? '' : 's'}`);
   L.push(`  ✅ made money after gas: ${s.wins}`);
-  L.push(`  ➖ broke even or lost: ${Math.max(0, ok - s.wins - s.unpriced)}`);
+  L.push(`  ➖ broke even or lost: ${Math.max(0, ok - s.wins - s.unpriced - junk)}`);
   if (s.unpriced) L.push(`  ❔ coins we can't price: ${s.unpriced}`);
+  // Junk coins: their pool prices are distorted, so the "profit" is nonsense.
+  if (junk) L.push(`  ❔ profit not trusted (junk coin prices, left out of the money below): ${junk}`);
   if (s.failed) L.push(`  ✖️ failed but still paid gas: ${s.failed}`);
   L.push(`Money: made ${money(s.grossUsd)}, paid ${money(s.gasUsd)} gas, kept ${money(s.netUsd)}`);
   L.push(`Typical trade: puts in ${s.medianSizeUsd === null ? '?' : money(s.medianSizeUsd)}, a win makes ${cents(s.medianWinUsd)}, gas ${cents(s.medianGasUsd)}`);
-  L.push(`Routes: 2 pools ${share(s.routes.two, s.trades)}, 3 pools ${share(s.routes.three, s.trades)}, 4+ pools ${share(s.routes.fourPlus, s.trades)}`);
+  // Route shapes only count trades that went through (failed ones show 0 pools).
+  L.push(`Routes (trades that went through): 2 pools ${share(s.routes.two, ok)}, 3 pools ${share(s.routes.three, ok)}, 4+ pools ${share(s.routes.fourPlus, ok)}`);
   L.push(`Money source: own money ${share(s.trades - s.flash, s.trades)}, flash loans ${share(s.flash, s.trades)}`);
   for (const [pair, n, usd] of s.byPair.slice(0, 5)) L.push(`  • ${esc(pair)}: ${n} wins, ${money(usd)}`);
   L.push(`On trading spots we watch: ${s.onOurPools} of ${s.trades}`);
   return L;
 }
 
+// Trades whose dollar result we trust (went through, priced, not junk).
+const trustedTrades = (s: RivalSummary): number => s.trades - s.failed - s.unpriced - (s.junk ?? 0);
+
 // Lessons the numbers teach, one line each.
 export function rivalLessons(s: RivalSummary): string[] {
   const out: string[] = [];
+  const ok = s.trades - s.failed;
   if (s.medianWinUsd !== null && s.medianSizeUsd) out.push(`A typical win makes ${cents(s.medianWinUsd)} on ${money(s.medianSizeUsd)} put in (${((100 * s.medianWinUsd) / s.medianSizeUsd).toFixed(2)}%). Tiny margins, lots of trades.`);
   if (s.medianWinUsd !== null && s.medianGasUsd) out.push(`Gas is about ${cents(s.medianGasUsd)} a trade, so one typical win pays for about ${Math.floor(s.medianWinUsd / s.medianGasUsd)} misses.`);
   const loops = s.routes.three + s.routes.fourPlus;
-  if (s.trades) out.push(`${share(loops, s.trades)} of their trades are 3+ pool loops. Our bot can't do those yet.`);
+  if (ok) out.push(`${share(loops, ok)} of their trades that went through are 3+ pool loops. Our bot can't do those yet.`);
   if (s.trades) out.push(`${share(s.flash, s.trades)} used flash loans; the rest used their own money.`);
   if (s.trades) out.push(`${share(s.onOurPools, s.trades)} were on pools we watch. The rest is money we can't even see yet.`);
   if (s.failed) out.push(`${s.failed} trades failed outright and still paid gas. Sending lots and accepting misses is part of the game.`);
+  if (s.junk) out.push(`${s.junk} trades were in junk coins whose prices can't be trusted, so their "profit" is left out.`);
   return out;
 }
 
 // Stage 0 verdict: is there enough money here, and is gas cheap enough?
+// Judged only on trades with a trustworthy dollar result.
 export function rivalVerdict(s: RivalSummary, hours: number): string {
   const perDay = hours > 0 ? (s.netUsd * 24) / hours : 0;
   const gasOk = s.medianGasUsd !== null && s.medianWinUsd !== null && s.medianGasUsd * 4 <= s.medianWinUsd;
-  if (s.trades < 20) return '⏳ Not enough rival trades yet to judge. Give it more time.';
+  if (trustedTrades(s) < 20) return `⏳ Not enough rival trades with a trustworthy dollar result yet (${Math.max(0, trustedTrades(s))}) to judge. Give it more time.`;
   if (perDay < 100) return `⚠️ Small pie: the bots we follow keep about ${money(perDay)} a day after gas. Probably not worth building more here unless it grows.`;
   if (!gasOk) return `⚠️ Gas is too high compared with a typical win (${cents(s.medianGasUsd)} gas vs ${cents(s.medianWinUsd)} win). Tiny trades would struggle.`;
   return `✅ Worth building Stage 1: the bots we follow keep about ${money(perDay)} a day after gas, and gas is cheap compared with a win.`;
 }
 
-export function formatRivalDaily(input: { dateLabel: string; hours: number; summary: RivalSummary; botsKnown: number }): string {
+export function formatRivalDaily(input: { dateLabel: string; hours: number; summary: RivalSummary; botsKnown: number; newPools?: NewPoolSummary }): string {
   const s = input.summary;
   const L: string[] = [];
+  // "New pools" section goes at the end (also when there are no rival trades yet).
+  const withNewPools = (out: string[]) => (input.newPools ? [...out, '', ...newPoolsSection(input.newPools)] : out);
   L.push(`📚 <b>RIVAL BOT REPORT</b> · ${esc(input.dateLabel)} (last ${Math.round(input.hours)} h)`);
   L.push(`Following ${input.botsKnown} rival bot${input.botsKnown === 1 ? '' : 's'}. Numbers are for those bots only, so the real total is at least this.`);
   L.push('');
-  if (!s.trades) { L.push('No rival trades recorded yet.'); return L.join('\n'); }
+  if (!s.trades) { L.push('No rival trades recorded yet.'); return withNewPools(L).join('\n'); }
   L.push(...rivalLines(s));
   L.push('');
   L.push('<b>Top bots</b> (kept after gas)');
   for (const b of s.byBot.slice(0, 5)) {
-    L.push(`  • ${b.bot.slice(0, 8)}…: ${b.trades} trades, kept ${money(b.netUsd)}, puts in ${b.medianSizeUsd === null ? '?' : money(b.medianSizeUsd)}, ${b.avgPools.toFixed(1)} pools avg${b.flash ? `, flash loans ${b.flash}x` : ''}`);
+    L.push(`  • ${b.bot.slice(0, 8)}…: ${b.trades} trades, kept ${money(b.netUsd)}, puts in ${b.medianSizeUsd === null ? '?' : money(b.medianSizeUsd)}, ${b.avgPools.toFixed(1)} pools avg (trades that went through)${b.flash ? `, flash loans ${b.flash}x` : ''}`);
   }
   L.push('');
   L.push('<b>What we learn</b>');
   for (const l of rivalLessons(s)) L.push(`  • ${l}`);
   L.push('');
   L.push(`<b>Verdict</b>: ${rivalVerdict(s, input.hours)}`);
-  return L.join('\n');
+  return withNewPools(L).join('\n');
+}
+
+// ----------------------------------------------------------------------------
+// New pools (core/newPoolWatch.ts): how often a new pool for a coin that
+// already trades deep starts at an off price. Measurement only.
+// ----------------------------------------------------------------------------
+const usd0 = (n: number): string => `$${Math.round(n).toLocaleString('en-US')}`;
+
+export function newPoolsHourlyLine(s: NewPoolSummary): string {
+  if (!s.measured) return `<b>New pools</b>: ${s.created} made, ${s.eligible} for coins that already trade deep, none got money yet.`;
+  return `<b>New pools</b>: ${s.created} made, ${s.eligible} for coins that already trade deep, ${s.measured} got money. Started off price: ${s.off05} by 0.5%+, ${s.off1} by 1%+, ${s.off3} by 3%+ (about ${usd0(s.usd)} in them).`;
+}
+
+export function newPoolsSection(s: NewPoolSummary): string[] {
+  const L: string[] = ['<b>New pools</b> (last 24 h, measurement only)'];
+  L.push(`New pools made: ${s.created}. For coins that already trade in a deep pool ($10k+): ${s.eligible}. Got their first money: ${s.measured}.`);
+  if (!s.measured) { L.push('None to measure yet.'); return L; }
+  L.push(`Started more than 0.5% off: ${s.off05} · more than 1%: ${s.off1} · more than 3%: ${s.off3}`);
+  L.push(`Money in them: about ${usd0(s.usd)} (in the ones 1%+ off: ${usd0(s.usdOff1)})`);
+  for (const r of s.top.slice(0, 3)) L.push(`  • ${esc(r.pair)} on ${esc(plainSpot(r.dex))}: started ${r.gapPct.toFixed(2)}% off, about ${usd0(r.usd)} in it`);
+  const verdict = s.off1 >= 5 ? '✅ Off-price new pools are common. Worth a closer look at catching them.'
+    : s.off1 ? '⚠️ It happens, but rarely so far. Keep counting.'
+      : '➖ No new pool started more than 1% off. Nothing to catch yet.';
+  L.push(verdict);
+  return L;
 }
 
 
@@ -620,5 +663,79 @@ export function formatMarketOpenReport(input: { dateLabel: string; tokens: numbe
       ? '⚠️ A few gaps after fees, but small or brief. Watch a few more mornings before building anything.'
       : '❌ No gaps worth trading after fees this morning. Pools stay in line; watch a few more mornings to be sure.';
   L.push(`<b>Verdict</b>: ${verdict}`);
+  return L.join('\n');
+}
+
+
+// ----------------------------------------------------------------------------
+// LOOP REPORT (loop measurement, Phase A): do 3-way loops through coins that
+// should be worth the same have real gaps after fees? Measurement only.
+// ----------------------------------------------------------------------------
+const pc2 = (x: number) => `${x.toFixed(2)}%`;
+const dur = (s: number) => (s < 60 ? `${Math.round(s)} s` : s < 3600 ? `${(s / 60).toFixed(1)} min` : `${(s / 3600).toFixed(1)} h`);
+
+// Plain verdict: is it worth building the loop trader?
+// A loop paying over 10% after fees isn't believable on a working market
+// (usually a junk coin that only sometimes looks normal), so it doesn't count.
+const credible = (r: LoopRow) => !r.broken && r.stats.maxNetPct > 0 && r.stats.maxNetPct <= 10;
+
+export function loopVerdict(rows: LoopRow[], pegs: PegRow[]): string {
+  const good = rows.filter(credible);
+  // Bar for "worth building": several tokens paying for 2+ minutes in total,
+  // or 2+ tokens with 0.3%+ after fees lasting a full minute in one go.
+  // One lucky token isn't enough to build a trader on.
+  const lasting = good.filter((r) => r.stats.secondsProfitable >= 120);
+  const strong = good.filter((r) => r.stats.maxNetPct >= 0.3 && r.stats.longestRunS >= 60);
+  const pegGood = pegs.filter((p) => p.stats.maxNetPct > 0 && p.stats.secondsProfitable >= 60);
+  if (!rows.some((r) => r.stats.samples > 0) && !pegs.length) return '⏳ No measurements yet (just started, or nothing to watch). Wait for the next report.';
+  if (lasting.length >= 3 || strong.length >= 2) return `✅ Worth building the loop trader: ${lasting.length} token(s) had loops paying after fees for 2+ minutes${strong.length ? `, ${strong.length} with 0.3%+ lasting a minute or more in one go` : ''}.`;
+  if (good.length || pegGood.length) return '⚠️ Some loops pay after fees, but they are small or brief. Keep measuring a few more days before building.';
+  return '❌ No loop paid after fees in this period. Not worth building the loop trader yet.';
+}
+
+export function formatLoopReport(input: {
+  dateLabel: string; hours: number; tokens: number; quotes: LoopQuote[]; rows: LoopRow[]; pegs: PegRow[];
+}): string {
+  const L: string[] = [];
+  L.push(`🔁 <b>LOOP REPORT</b> · ${esc(input.dateLabel)} (last ${input.hours < 1 ? input.hours.toFixed(1) : Math.round(input.hours)} h)`);
+  L.push('Measurement only, no trades. A loop goes coin A → token → coin B → back to coin A, through 3 pools. "After fees" is what is left once all 3 pools\' fees are paid, on a small trade (a big trade moves the price and gets less).');
+  const byGroup = new Map<string, string[]>();
+  for (const q of input.quotes) (byGroup.get(q.group) ?? byGroup.set(q.group, []).get(q.group)!).push(q.symbol);
+  L.push(`Watching ${input.tokens} token(s) across ${input.quotes.length} verified coins: ${[...byGroup.entries()].map(([g, xs]) => `${g} (${xs.join(', ')})`).join('; ') || 'none yet'}.`);
+  L.push('');
+
+  const rows = input.rows.filter((r) => r.stats.samples > 0);
+  const ok = rows.filter((r) => !r.broken);
+  const paying = ok.filter((r) => r.stats.maxNetPct > 0);
+  L.push('<b>Loops with a gap after fees</b>');
+  if (!paying.length) L.push('  None.');
+  for (const r of paying.slice(0, 6)) {
+    const b = r.stats.best;
+    L.push(`  • ${esc(r.symbol)}: up to ${pc2(r.stats.maxNetPct)} after fees, worth trading for ${dur(r.stats.secondsProfitable)} in total (longest stretch ${dur(r.stats.longestRunS)})${credible(r) ? '' : ' ⚠️ over 10%: probably a junk coin, not counted in the verdict'}`);
+    if (b) L.push(`     Route: ${esc(b.route)}. Shallowest pool about $${Math.round(b.shallowUsd).toLocaleString('en-US')}.`);
+  }
+  const close = ok.filter((r) => r.stats.maxNetPct <= 0).sort((a, b) => b.stats.maxGapPct - a.stats.maxGapPct).slice(0, 3);
+  if (close.length) {
+    L.push('<b>Biggest gaps that did not cover the fees</b>');
+    for (const r of close) L.push(`  • ${esc(r.symbol)}: gap up to ${pc2(r.stats.maxGapPct)} before fees (best after fees ${Number.isFinite(r.stats.maxNetPct) ? pc2(r.stats.maxNetPct) : 'n/a'})`);
+  }
+  L.push('');
+
+  L.push('<b>Inside the groups</b> (coins that should be worth the same)');
+  if (!input.pegs.length) L.push('  No direct pools between same-value coins found yet.');
+  for (const p of input.pegs.slice(0, 8)) {
+    const s = p.stats;
+    const two = Number.isFinite(s.maxNetPct) ? `; two pools apart after fees: ${s.maxNetPct > 0 ? `${pc2(s.maxNetPct)}, for ${dur(s.secondsProfitable)}` : 'never enough'}` : '';
+    const what = p.group === 'ETH vs WETH' ? `up to ${pc2(s.maxDevPct)} apart` : `up to ${pc2(s.maxDevPct)} off ${/^Copies/.test(p.group) ? 'its usual ratio' : '1 to 1'}`;
+    L.push(`  • ${esc(p.label)} (${esc(p.group)}): ${what}${two}`);
+  }
+  L.push('');
+
+  const broken = rows.filter((r) => r.broken);
+  if (broken.length) {
+    L.push(`<b>Ignored as broken</b> (gap above 10% nearly all the time): ${broken.slice(0, 8).map((r) => `${esc(r.symbol)} (${r.stats.maxGapPct > 0 ? r.stats.maxGapPct.toFixed(0) + '%' : 'over 50%'})`).join(', ')}`);
+    L.push('');
+  }
+  L.push(`<b>Verdict</b>: ${loopVerdict(input.rows, input.pegs)}`);
   return L.join('\n');
 }

@@ -22,7 +22,23 @@ import { dirname } from 'path';
 //   Records are kept 26 h and saved to disk, so the daily report survives
 //   restarts. Light on the node: receipts at most ~1/s, sampler 1 block / 15 s.
 //   Never affects trading.
+//
+// Junk prices (fix, Oct 8): a junk coin's price comes from its own tiny,
+// lopsided pool, so a trade in it could be "worth" thousands of dollars
+// either way (the report once said rivals made -$24,742, and one bot made
+// $10,065 from 96 trades). A trade's profit is now treated as UNTRUSTED and
+// left out of every money total (but still counted) when:
+//   - the profit is impossible for what went in: more than 5% of the trade
+//     size, or more than $5 when the size is unknown, or
+//   - any coin it moved is priced from a pool under $5,000.
 // ============================================================================
+
+// Profit bigger than this share of the trade size can't be real arbitrage.
+export const MAX_PLAUSIBLE_PROFIT_SHARE = 0.05;
+// With no trade size, a "profit" bigger than this is not trusted.
+export const MAX_PROFIT_NO_SIZE_USD = 5;
+// A coin priced from a pool holding less than this is not trusted.
+export const MIN_PRICE_POOL_USD = 5_000;
 
 const TRANSFER = ethers.id('Transfer(address,address,uint256)');
 const V4_SWAP = ethers.id('Swap(bytes32,address,int128,int128,uint160,uint128,int24,uint24)');
@@ -62,14 +78,26 @@ export interface RivalRec {
   failed: boolean;      // trade reverted (paid gas, did nothing)
   flash: boolean;       // borrowed via flash loan
   ours: boolean;        // every pool in the route is one we watch
+  thinPrice?: boolean;  // a coin it moved is priced from a pool under $5k
+}
+
+// True when a trade's dollar profit can't be trusted (see the note at the
+// top). Failed and unpriced trades have no profit to judge, so false.
+export function isJunkProfit(r: RivalRec): boolean {
+  if (r.failed || r.grossUsd === null) return false;
+  if (r.thinPrice) return true;
+  const g = Math.abs(r.grossUsd);
+  if (r.sizeUsd !== null && r.sizeUsd > 0) return g > MAX_PLAUSIBLE_PROFIT_SHARE * r.sizeUsd;
+  return g > MAX_PROFIT_NO_SIZE_USD;
 }
 
 export interface RivalSummary {
   trades: number; failed: number; unpriced: number;
+  junk: number;                 // profit not trusted (junk coin prices), left out of money totals
   wins: number;                 // made money after gas
   grossUsd: number; gasUsd: number; netUsd: number;
   medianSizeUsd: number | null; medianWinUsd: number | null; medianGasUsd: number | null;
-  routes: { two: number; three: number; fourPlus: number };
+  routes: { two: number; three: number; fourPlus: number }; // trades that went through (failed ones show 0 pools)
   flash: number; onOurPools: number;
   byPair: [string, number, number][];                          // [pair, trades, net $]
   byBot: { bot: string; trades: number; netUsd: number; medianSizeUsd: number | null; avgPools: number; flash: number }[];
@@ -84,9 +112,11 @@ const median = (xs: number[]): number | null => {
 
 export function summarize(recs: RivalRec[]): RivalSummary {
   const byPair = new Map<string, { n: number; usd: number }>();
-  const byBot = new Map<string, { n: number; usd: number; sizes: number[]; pools: number; flash: number }>();
+  // okN/okPools: trades that went through, and their pool count. Failed
+  // trades record 0 pools, so counting them dragged "avg pools" down.
+  const byBot = new Map<string, { n: number; usd: number; sizes: number[]; okN: number; okPools: number; flash: number }>();
   const out: RivalSummary = {
-    trades: recs.length, failed: 0, unpriced: 0, wins: 0, grossUsd: 0, gasUsd: 0, netUsd: 0,
+    trades: recs.length, failed: 0, unpriced: 0, junk: 0, wins: 0, grossUsd: 0, gasUsd: 0, netUsd: 0,
     medianSizeUsd: null, medianWinUsd: null, medianGasUsd: null,
     routes: { two: 0, three: 0, fourPlus: 0 }, flash: 0, onOurPools: 0, byPair: [], byBot: [], bots: 0,
   };
@@ -96,12 +126,19 @@ export function summarize(recs: RivalRec[]): RivalSummary {
     if (r.gasUsd !== null) { gases.push(r.gasUsd); out.gasUsd += r.gasUsd; }
     if (r.flash) out.flash++;
     if (r.ours) out.onOurPools++;
+    const b = byBot.get(r.bot) ?? { n: 0, usd: 0, sizes: [], okN: 0, okPools: 0, flash: 0 };
+    b.n++; if (r.flash) b.flash++;
+    byBot.set(r.bot, b);
+    if (r.failed) { out.failed++; b.usd -= gas; out.netUsd -= gas; continue; }
+    // Route shape only for trades that went through.
+    b.okN++; b.okPools += r.pools;
     if (r.pools <= 2) out.routes.two++; else if (r.pools === 3) out.routes.three++; else out.routes.fourPlus++;
-    const b = byBot.get(r.bot) ?? { n: 0, usd: 0, sizes: [], pools: 0, flash: 0 };
-    b.n++; b.pools += r.pools; if (r.flash) b.flash++;
-    if (r.failed) { out.failed++; b.usd -= gas; out.netUsd -= gas; byBot.set(r.bot, b); continue; }
-    if (r.sizeUsd !== null) { sizes.push(r.sizeUsd); b.sizes.push(r.sizeUsd); }
-    if (r.grossUsd === null) { out.unpriced++; byBot.set(r.bot, b); continue; }
+    // Junk trades (see isJunkProfit) skew "typical trade size" too, so their
+    // size is left out along with their profit.
+    const junk = isJunkProfit(r);
+    if (r.sizeUsd !== null && !r.thinPrice && !junk) { sizes.push(r.sizeUsd); b.sizes.push(r.sizeUsd); }
+    if (r.grossUsd === null) { out.unpriced++; continue; }
+    if (junk) { out.junk++; continue; } // counted, but no money
     out.grossUsd += r.grossUsd;
     const net = r.grossUsd - gas;
     out.netUsd += net; b.usd += net;
@@ -110,11 +147,10 @@ export function summarize(recs: RivalRec[]): RivalSummary {
       const p = byPair.get(r.pair) ?? { n: 0, usd: 0 };
       p.n++; p.usd += net; byPair.set(r.pair, p);
     }
-    byBot.set(r.bot, b);
   }
   out.medianSizeUsd = median(sizes); out.medianWinUsd = median(wins); out.medianGasUsd = median(gases);
   out.byPair = [...byPair.entries()].sort((a, b) => b[1].usd - a[1].usd).map(([p, e]) => [p, e.n, e.usd]);
-  out.byBot = [...byBot.entries()].map(([bot, e]) => ({ bot, trades: e.n, netUsd: e.usd, medianSizeUsd: median(e.sizes), avgPools: e.n ? e.pools / e.n : 0, flash: e.flash }))
+  out.byBot = [...byBot.entries()].map(([bot, e]) => ({ bot, trades: e.n, netUsd: e.usd, medianSizeUsd: median(e.sizes), avgPools: e.okN ? e.okPools / e.okN : 0, flash: e.flash }))
     .sort((a, b) => b.netUsd - a.netUsd);
   out.bots = byBot.size;
   return out;
@@ -136,6 +172,9 @@ export class RivalWatch {
     private readonly weth: string,
     private readonly now: () => number = Date.now,
     private readonly delayMs = 3_000,
+    // How much money is in the pool a coin's price comes from (null = no
+    // price). Optional: without it, only the profit-vs-size rule applies.
+    private readonly priceDepthUsd?: (token: string) => number | null,
   ) { this.hourFrom = now(); }
 
   addBot(addr: string | undefined) { if (addr && /^0x[0-9a-fA-F]{40}$/.test(addr)) this.bots.add(addr.toLowerCase()); }
@@ -194,10 +233,21 @@ export class RivalWatch {
     let size: number | null = null;
     for (const [tok, v] of tr.outflow) { const u = this.tokenUsd(tok, v); if (u !== null) size = Math.max(size ?? 0, u); }
     const pair = [...new Set([...tr.net.keys()].map((x) => this.symbol(x)))].sort().join('/') || '?';
+    // Any coin it moved priced from a shallow pool? Then its dollar numbers
+    // can't be trusted (a $500 pool can show any price).
+    let thinPrice = false;
+    if (this.priceDepthUsd) {
+      for (const tok of new Set([...tr.net.keys(), ...tr.outflow.keys()])) {
+        if ((tr.net.get(tok) ?? 0n) === 0n && !tr.outflow.get(tok)) continue;
+        const d = this.priceDepthUsd(tok);
+        if (d !== null && d < MIN_PRICE_POOL_USD) { thinPrice = true; break; }
+      }
+    }
     return {
       t, bot, pair, pools: tr.pools.length, sizeUsd: size,
       grossUsd: priced && !unpricedMove ? gross : null, gasUsd, failed: false, flash: tr.flash,
       ours: tr.pools.every((p) => this.isWatchedPool(p)),
+      ...(thinPrice ? { thinPrice: true } : {}),
     };
   }
 
@@ -230,7 +280,10 @@ export class RivalWatch {
     const cutoff = this.now() - 26 * 3600_000;
     if (this.recs.length > 50_000 || (this.recs.length % 500 === 0 && this.recs[0]?.t < cutoff)) this.recs = this.recs.filter((r) => r.t >= cutoff).slice(-50_000);
     const net = rec.grossUsd !== null ? rec.grossUsd - (rec.gasUsd ?? 0) : null;
-    console.log(`[rivalwatch] bot ${rec.bot.slice(0, 10)} ${rec.failed ? 'FAILED' : rec.pair} ${net === null ? (rec.failed ? `gas $${(rec.gasUsd ?? 0).toFixed(4)}` : 'unpriced') : `~$${net.toFixed(4)}`} | ${rec.pools} pools, size ${rec.sizeUsd === null ? '?' : '$' + rec.sizeUsd.toFixed(0)}, gas ${rec.gasUsd === null ? '?' : '$' + rec.gasUsd.toFixed(4)}${rec.flash ? ', flash loan' : ''}, ${rec.ours ? 'all watched by us' : 'NOT all watched by us'}`);
+    // Junk-priced trades are logged without "~$" so the status page doesn't add them up.
+    const money = net === null ? (rec.failed ? `gas $${(rec.gasUsd ?? 0).toFixed(4)}` : 'unpriced')
+      : isJunkProfit(rec) ? `junk price (said $${net.toFixed(2)}, ignored)` : `~$${net.toFixed(4)}`;
+    console.log(`[rivalwatch] bot ${rec.bot.slice(0, 10)} ${rec.failed ? 'FAILED' : rec.pair} ${money} | ${rec.pools} pools, size ${rec.sizeUsd === null ? '?' : '$' + rec.sizeUsd.toFixed(0)}, gas ${rec.gasUsd === null ? '?' : '$' + rec.gasUsd.toFixed(4)}${rec.flash ? ', flash loan' : ''}, ${rec.ours ? 'all watched by us' : 'NOT all watched by us'}`);
   }
 
   // Sampler: read one recent block's receipts and spot new rival bots.
