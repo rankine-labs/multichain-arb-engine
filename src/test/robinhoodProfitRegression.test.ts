@@ -90,4 +90,25 @@ near(cheapGas.grossProfitUsd, expensiveGas.grossProfitUsd,
 
 // A research result under $20 may still be worth simulating. The live threshold
 // is NOT a substitute for the independent research-lane selection policy.
+// V3 liquidity at the current tick is NOT total available pool liquidity.
+// A local virtual-reserve quote can be used for candidate discovery, but
+// it must not be treated as an exact tick-crossing quote or execution proof.
+const v3a: PoolState = {
+  ...a, poolType: 'v3', poolAddress: '0x0000000000000000000000000000000000000003',
+  reserveA: undefined, reserveB: undefined,
+  sqrtPriceX96: 1n << 96n, liquidity: 1000000n * 10n ** 18n,
+  feeBps: 5,
+};
+const v3b: PoolState = {
+  ...v3a, poolAddress: '0x0000000000000000000000000000000000000004',
+  feeBps: 30,
+};
+const v3Cache = new PoolCache();
+v3Cache.upsert(v3a);
+v3Cache.upsert(v3b);
+const v3Sizing = findOptimalTradeSize(v3a, v3b, v3Cache, true, 1000, 1, 9, 0.02, 18);
+check(Number.isFinite(v3Sizing.grossProfitUsd), 'V3 same-tick approximation returns finite result');
+check(v3Sizing.grossProfitUsd <= 0,
+  'identical-price V3 pools with swap fees cannot create free profit');
+
 console.log('Independent regression checks complete. No transactions submitted.');
