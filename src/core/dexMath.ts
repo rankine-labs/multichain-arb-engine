@@ -1,7 +1,7 @@
 import { PoolState } from './types';
 
 // ============================================================================
-// DEX MATH — universal getAmountOut()
+// DEX MATH: universal getAmountOut()
 //
 // The core arbitrage engine should not care which DEX/pool type it's
 // working with. It asks one question: "if I trade X amount through this
@@ -64,7 +64,7 @@ export function computeAmountOut(pool: PoolState, tokenInIsA: boolean, amountIn:
     if (pool.sqrtPriceX96 === undefined || pool.liquidity === undefined) return null;
 
     // Virtual reserves at the current price within the active tick's
-    // liquidity — see predictPostTradeState in poolCache.ts for the same
+    // liquidity: see predictPostTradeState in poolCache.ts for the same
     // approximation and its known limitation (doesn't model tick-crossing).
     const virtualX = (pool.liquidity * Q96) / pool.sqrtPriceX96;
     const virtualY = (pool.liquidity * pool.sqrtPriceX96) / Q96;
@@ -86,7 +86,7 @@ export function computeAmountOut(pool: PoolState, tokenInIsA: boolean, amountIn:
     }
   }
 
-  // orderbook / stable pool math — not implemented yet (Kuru on Monad needs
+  // orderbook / stable pool math: not implemented yet (Kuru on Monad needs
   // its own adapter since order-book pricing has no reserves at all).
   return null;
 }

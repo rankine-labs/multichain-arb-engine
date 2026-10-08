@@ -61,10 +61,14 @@ if (pool.poolType === 'v3' && pool.liquidity !== undefined && pool.sqrtPriceX96 
 // Convert v3's active-tick liquidity into an equivalent "virtual
 // reserve" in the same units as v2, using the same identity dexMath
 // uses: virtualX = L * Q96 / sqrtP. This only reflects liquidity in
-// the CURRENT tick range, not the pool's total TVL across all ticks —
-// appropriately conservative for a safety ceiling, since liquidity
-// outside the active range isn't available at the current price
-// anyway.
+// the CURRENT tick range, not the pool's total TVL across all ticks.
+// CAUTION (measured Oct 2026, src/test/sizingOptimizer.test.ts): this is
+// NOT always conservative. A "virtual reserve" pretends the current band's
+// liquidity goes on forever, so for liquidity packed into a narrow band it
+// can be many times the money really in the pool (up to ~13x in the test's
+// scenarios), and big trades then walk out of the band where the bot's
+// V3 maths overstates the output. The on-chain check catches those (they
+// show up as losses), but the size it was asked to check was too big.
 const Q96 = 1n << 96n;
 // virtualX is tokenA-side depth, virtualY is tokenB-side depth.
 const virtual = inIsA
@@ -94,7 +98,7 @@ return thinnerPoolUsd * capPct;
 }
 
 // Trade size optimizer: bigger isn't always better, because our own trade
-// moves the price against us — AND because flat-rate costs (DEX fees,
+// moves the price against us, AND because flat-rate costs (DEX fees,
 // flash loan fee) scale with size while gas is roughly fixed. We optimize
 // for approximate NET profit, not gross, or the optimizer will happily
 // pick a size where fees eat the entire spread (caught by profitMath.test.ts).
@@ -213,7 +217,7 @@ const sellInIsA = sellPool.tokenA.toLowerCase() === buyOutToken;
 const quote: RoundTripQuote = (usdSize) => {
 const amountIn = BigInt(Math.floor((usdSize / usdPerToken) * scale));
 
-// Universal getAmountOut — works identically whether buyPool/sellPool
+// Universal getAmountOut: works identically whether buyPool/sellPool
 // are v2 or v3, the sizing logic never needs to know which.
 const tokenOut = computeAmountOut(buyPool, tokenInIsAOnBuyPool, amountIn);
 if (tokenOut === null || tokenOut <= 0n) return null;

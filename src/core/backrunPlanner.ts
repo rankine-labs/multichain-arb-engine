@@ -3,7 +3,7 @@ import { PoolCache } from './poolCache';
 import { findOptimalTradeSize, calculateAllInProfit, calculateLiquidityCeiling, CostEstimateInputs, SizingResult, SizingOptions } from './profitCalculator';
 
 // ============================================================================
-// BACKRUN PLANNER — "guess the price before it happens"
+// BACKRUN PLANNER: "guess the price before it happens"
 //
 // Plain English:
 //   We just saw a big swap that hasn't landed yet. Instead of comparing the
