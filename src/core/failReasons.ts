@@ -114,3 +114,89 @@ export class FailTally {
 
   clear() { this.groups.clear(); this.raw.clear(); }
 }
+
+// ============================================================================
+// SIMULATION OUTCOME BUCKETS
+//
+// Plain English:
+//   Every real-chain check ends in exactly one of these buckets, so a report
+//   can tell "the trade would lose money" apart from "the check itself
+//   couldn't run". The first four say something about the TRADE; the rest
+//   are about our tools or the node:
+//     profit               the trade would make money (exact amount known)
+//     real_loss            the trade would end with less than it started
+//                          (our profit check said 0, or a flash loan could
+//                          not be repaid from the trade's proceeds)
+//     token_transfer       a token refused to move (transfer failed, not
+//                          enough balance, transfer tax, blocked coin)
+//     contract_revert      any other revert: a pool or our contract said no
+//                          (bad route, stale price, pool locked, ...)
+//     missing_revert_data  it reverted but the node gave no reason to read
+//     override_unsupported the node can't do "pretend state" (state overrides)
+//     rpc_failure          rate limit, quota, timeout or network trouble
+//     replay_unavailable   the exact-moment replay (eth_simulateV1) couldn't
+//                          run on this node / block; a plain check is used
+//     not_simulable        this token or route can't be simulated here
+//                          (e.g. its balance storage wasn't found)
+// The raw-reason groups above (tax/transfer/...) are reused, not duplicated.
+// ============================================================================
+
+export type SimBucket =
+  | 'profit'
+  | 'real_loss'
+  | 'token_transfer'
+  | 'contract_revert'
+  | 'missing_revert_data'
+  | 'override_unsupported'
+  | 'rpc_failure'
+  | 'replay_unavailable'
+  | 'not_simulable';
+
+export const SIM_BUCKET_LABEL: Record<SimBucket, string> = {
+  profit: 'would make money',
+  real_loss: 'would lose money',
+  token_transfer: 'a token refused to move',
+  contract_revert: 'a pool or our contract refused the trade',
+  missing_revert_data: 'refused without giving a reason',
+  override_unsupported: "node can't do pretend-state checks",
+  rpc_failure: 'node busy, out of allowance or unreachable',
+  replay_unavailable: 'exact-moment replay not possible on this node/block',
+  not_simulable: "this token/route can't be checked here",
+};
+
+// True when the bucket says something about the TRADE (not about our tools).
+export function isTradeVerdict(b: SimBucket): boolean {
+  return b === 'profit' || b === 'real_loss' || b === 'token_transfer' || b === 'contract_revert';
+}
+
+// Bucket for a check result from its status and reason text. The simulator
+// tags its results with this; it also works as a fallback for any result
+// that wasn't tagged.
+export function classifySimOutcome(status: string, reason = ''): SimBucket {
+  if (status === 'profit') return 'profit';
+  if (status === 'loss') return 'real_loss';
+  if (status === 'rate_limited') return 'rpc_failure';
+  const r = (reason ?? '').trim();
+  if (/^replay (unavailable|returned no result)/i.test(r)) return 'replay_unavailable';
+  if (status === 'unsupported') {
+    return /override|does not support|too many arguments|invalid params/i.test(r) ? 'override_unsupported' : 'not_simulable';
+  }
+  // status 'fail' (or anything else): look at what the chain said.
+  if (!r || /reverted without data|^execution reverted\s*:?\s*$|^revert$|^revert 0x$/i.test(r)) return 'missing_revert_data';
+  const g = classifyFailReason(r);
+  if (g === 'transfer' || g === 'tax' || g === 'blocked' || /exceeds balance|insufficient balance/i.test(r)) return 'token_transfer';
+  if (g === 'silent') return 'missing_revert_data';
+  return 'contract_revert';
+}
+
+// Counts check outcomes by bucket (e.g. per hour, for a report line).
+export class SimBucketTally {
+  private counts = new Map<SimBucket, number>();
+  add(b: SimBucket): void { this.counts.set(b, (this.counts.get(b) ?? 0) + 1); }
+  get(b: SimBucket): number { return this.counts.get(b) ?? 0; }
+  // [label, count], biggest first.
+  plain(): [string, number][] {
+    return [...this.counts.entries()].sort((a, b) => b[1] - a[1]).map(([k, c]) => [SIM_BUCKET_LABEL[k], c]);
+  }
+  clear(): void { this.counts.clear(); }
+}

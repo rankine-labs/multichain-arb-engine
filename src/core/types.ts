@@ -46,6 +46,10 @@ export interface PoolState {
   sqrtPriceX96?: bigint;  // v3-style
   liquidity?: bigint;     // v3-style
   feeBps: number;
+  // Exact pool fee in pips (1,000,000 = 100%, 3000 = 0.30%), when known.
+  // Optional: V3 fees like 250 pips (0.025%) don't fit whole-number feeBps.
+  // The swap maths (core/dexMath.ts feePipsOf) prefers this over feeBps.
+  feePips?: number;
   lastUpdatedBlock: number;
   lastUpdatedMs: number;
   // Uniswap V4 pools only. poolAddress is then the 32-byte pool id (V4
