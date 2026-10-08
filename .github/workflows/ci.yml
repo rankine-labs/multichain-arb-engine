@@ -62,7 +62,7 @@ jobs:
         run: node ../scripts/gen-executor-bytecode.js --check
 
       - name: Unit tests (mocks)
-        run: forge test -vv --no-match-path "test/Fork.t.sol"
+        run: forge test -vv --no-match-path "test/Fork*.t.sol"
 
       # Real-pool tests on copies of live mainnet state. Public RPCs, no keys.
       # These hit live networks, so a flaky RPC can fail them; re-run if so.
@@ -85,10 +85,11 @@ jobs:
           for pair in "AvalancheForkTest:$AVALANCHE_RPC_URL" "MonadForkTest:$MONAD_RPC_URL" "RobinhoodForkTest:$ROBINHOOD_RPC_URL"; do
             name="${pair%%:*}"; url="${pair#*:}"
             echo "=== $name" | tee -a fork-output.txt
-            FOUNDRY_PROFILE=fork forge test -vvv --match-path "test/Fork.t.sol" --match-contract "$name" --fork-url "$url" 2>&1 | tee -a fork-output.txt
+            FOUNDRY_PROFILE=fork forge test -vvv --match-path "test/Fork*.t.sol" --match-contract "$name" --fork-url "$url" 2>&1 | tee -a fork-output.txt
             [ "${PIPESTATUS[0]}" -ne 0 ] && status=1
           done
-          summary=$(grep -E "^===|\[(PASS|FAIL|SKIP)|->|pool |skipped|Revert|^\s+0x[0-9a-f]{8}|Suite result|Error" fork-output.txt | head -60)
+          # GAS / FLASH lines: measured gas and flash-loan accounting (ForkPhase3.t.sol).
+          summary=$(grep -E "^===|\[(PASS|FAIL|SKIP)|->|pool |skipped|Revert|^\s+0x[0-9a-f]{8}|Suite result|Error|GAS |FLASH " fork-output.txt | head -120)
           summary="${summary//'%'/'%25'}"
           summary="${summary//$'\n'/'%0A'}"
           echo "::notice title=Fork test results::${summary}"
