@@ -15,8 +15,8 @@
 //   (9 bps in today's planner) or own money the better way to pay?
 //
 // Settings (environment):
-//   PROBE_WINDOWS   number of windows (default 6)
-//   PROBE_WINDOW    blocks per window (default 1000)
+//   PROBE_WINDOWS   number of windows (default 8)
+//   PROBE_WINDOW    blocks per window (default 750)
 //   PROBE_HOURS     spread the windows over this many hours back (default 24)
 //   PROBE_BATCH     blocks per batched request (default 4)
 //   PROBE_PACE_MS   pause between requests (default 800, the public node
@@ -27,15 +27,15 @@
 // ============================================================================
 import { ethers } from 'ethers';
 import { ROBINHOOD_SCAN_FACTORIES, ROBINHOOD_TOKENS } from '../src/config/knownAddresses';
-import { StudyTrade, formatStudy } from '../src/core/routeFundingStudy';
+import { StudyTrade, formatStudy, isJunkWin } from '../src/core/routeFundingStudy';
 
 const URL_ = process.env.ROBINHOOD_RPC_URL ?? 'https://rpc.mainnet.chain.robinhood.com';
 const WETH = ROBINHOOD_TOKENS.WETH.toLowerCase();
 const USDG = ROBINHOOD_TOKENS.USDG.toLowerCase();
 // Deepest WETH/USDG pool (Uniswap V3 0.01%): used only to price ETH in USD.
 const PRICE_POOL = '0x52e65b17fb6e5ba00ed806f37afcd2daa50271ca';
-const WINDOWS = Number(process.env.PROBE_WINDOWS ?? 6);
-const WINDOW = Number(process.env.PROBE_WINDOW ?? 1000);
+const WINDOWS = Number(process.env.PROBE_WINDOWS ?? 8);
+const WINDOW = Number(process.env.PROBE_WINDOW ?? 750);
 // Stop reading new windows after this long, so the report always prints
 // before the workflow's time limit.
 const MAX_MS = Number(process.env.PROBE_MAX_MINUTES ?? 42) * 60_000;
@@ -132,7 +132,7 @@ function deltasFor(logs: any[], E: Set<string>): Map<string, bigint> {
   return d;
 }
 
-interface Raw { block: number; from: string; to: string; pools: string[]; deltas: Map<string, bigint>; flash: boolean; paidFirst: boolean; gasWei: bigint; outs: { tok: string; v: bigint }[] }
+interface Raw { window: number; hash: string; block: number; from: string; to: string; pools: string[]; deltas: Map<string, bigint>; flash: boolean; paidFirst: boolean; gasWei: bigint; outs: { tok: string; v: bigint }[] }
 
 (async () => {
   // ETH price in USD from the deep WETH/USDG pool.
@@ -158,6 +158,7 @@ interface Raw { block: number; from: string; to: string; pools: string[]; deltas
 
   const trades: Raw[] = [];
   let blocksRead = 0, txs = 0, chainSeconds = 0, windowsRead = 0;
+  const windowTimes: string[] = [];           // start time of each window (UTC)
   const startedAt = Date.now();
   for (let w = 0; w < WINDOWS; w++) {
     if (Date.now() - startedAt > MAX_MS) { console.log(`time limit: stopping after ${w} windows`); break; }
@@ -195,7 +196,7 @@ interface Raw { block: number; from: string; to: string; pools: string[]; deltas
             if (tok === WETH || tok === USDG) { try { outs.push({ tok, v: BigInt(String(l.data).slice(0, 66)) }); } catch { /* skip */ } }
           }
           trades.push({
-            block: nums[i]!, from: String(rc.from).toLowerCase(), to: String(rc.to).toLowerCase(), pools, deltas: d,
+            window: w, hash: String(rc.transactionHash), block: nums[i]!, from: String(rc.from).toLowerCase(), to: String(rc.to).toLowerCase(), pools, deltas: d,
             flash: logs.some((l: any) => FLASH.has(l.topics?.[0])),
             paidFirst: firstIn >= 0 && (firstOut < 0 || firstIn < firstOut),
             gasWei: BigInt(rc.gasUsed ?? '0x0') * BigInt(rc.effectiveGasPrice ?? '0x0'), outs,
@@ -210,17 +211,18 @@ interface Raw { block: number; from: string; to: string; pools: string[]; deltas
     ]);
     firstTs = Number(bs?.result?.timestamp ?? 0); lastTs = Number(be?.result?.timestamp ?? 0);
     if (lastTs > firstTs) chainSeconds += lastTs - firstTs;
+    windowTimes[w] = new Date(firstTs * 1000).toISOString().slice(5, 16).replace('T', ' ');
     console.log(`window ${w + 1}/${WINDOWS}: blocks ${start}-${end} (${new Date(firstTs * 1000).toISOString().slice(0, 16)} UTC), arbs so far ${trades.length}, node blocks ${blocked}`);
   }
 
   // Pool details (factory, coins) for every non-V4 pool seen, read once.
   const pools = [...new Set(trades.flatMap((t) => t.pools).filter((p) => p.length === 42))];
   const meta = await callMany(pools.flatMap((p) => [{ to: p, data: '0xc45a0155' }, { to: p, data: '0x0dfe1681' }, { to: p, data: '0xd21220a7' }]));
-  const info = new Map<string, { dex: string; known: boolean; t0: string | null; t1: string | null }>();
+  const info = new Map<string, { dex: string; known: boolean; t0: string | null; t1: string | null; factory: string | null }>();
   pools.forEach((p, i) => {
     const fac = addrOf(meta[i * 3]);
     const dex = fac && KNOWN[fac] ? KNOWN[fac]! : `other(${(fac ?? '?').slice(0, 8)})`;
-    info.set(p, { dex, known: !!(fac && KNOWN[fac]), t0: addrOf(meta[i * 3 + 1]), t1: addrOf(meta[i * 3 + 2]) });
+    info.set(p, { dex, known: !!(fac && KNOWN[fac]), t0: addrOf(meta[i * 3 + 1]), t1: addrOf(meta[i * 3 + 2]), factory: fac });
   });
   const toks = [...new Set([...info.values()].flatMap((x) => [x.t0, x.t1]).filter((x): x is string => !!x))];
   const symRes = await callMany(toks.map((t) => ({ to: t, data: '0x95d89b41' })));
@@ -239,6 +241,9 @@ interface Raw { block: number; from: string; to: string; pools: string[]; deltas
     const gasUsd = (Number(t.gasWei) / 1e18) * ethUsd;
     let sizeUsd = 0, sizeToken: 'USDG' | 'WETH' | null = null;
     for (const o of t.outs) { const u = usd(o.tok, o.v) ?? 0; if (u > sizeUsd) { sizeUsd = u; sizeToken = o.tok === WETH ? 'WETH' : 'USDG'; } }
+    // Under $1 paid out in USDG/WETH: the real input was another coin (only
+    // dust was paid in USDG/WETH), so the size is unknown, not tiny.
+    if (sizeUsd < 1) { sizeUsd = 0; sizeToken = null; }
     const gainSet = new Set(moves.map(([k]) => k));
     const gainToken = !verified ? 'other' : gainSet.size > 1 ? 'both' : gainSet.has(WETH) ? 'WETH' : 'USDG';
     const unknownFactory = t.pools.some((p) => p.length === 42 && !info.get(p)?.known);
@@ -249,7 +254,27 @@ interface Raw { block: number; from: string; to: string; pools: string[]; deltas
     } as StudyTrade;
   });
 
-  const report = formatStudy(rows, { blocks: blocksRead, txs, chainMinutes: chainSeconds / 60, windows: windowsRead });
+  const base = formatStudy(rows, { blocks: blocksRead, txs, chainMinutes: chainSeconds / 60, windows: windowsRead });
+  const extra: string[] = [];
+  // Per window: is the money spread over the day or bunched in one window?
+  for (let w = 0; w < windowsRead; w++) {
+    const ws = rows.filter((_, i) => trades[i]!.window === w && rows[i]!.verified && !isJunkWin(rows[i]!) && rows[i]!.grossUsd > rows[i]!.gasUsd);
+    const byLen = (f: (n: number) => boolean) => ws.filter((r) => f(r.pools));
+    const net = (xs: StudyTrade[]) => xs.reduce((a, r) => a + r.grossUsd - r.gasUsd, 0).toFixed(2);
+    extra.push(`Window ${w + 1} from ${windowTimes[w]} UTC: wins 2p ${byLen((n) => n === 2).length} ($${net(byLen((n) => n === 2))}), 3p ${byLen((n) => n === 3).length} ($${net(byLen((n) => n === 3))}), 4+p ${byLen((n) => n >= 4).length} ($${net(byLen((n) => n >= 4))})`);
+  }
+  // The biggest clean wins: who makes the money, how big, through what.
+  const idx = rows.map((r, i) => i).filter((i) => rows[i]!.verified && !isJunkWin(rows[i]!) && rows[i]!.grossUsd > rows[i]!.gasUsd)
+    .sort((a, b) => (rows[b]!.grossUsd - rows[b]!.gasUsd) - (rows[a]!.grossUsd - rows[a]!.gasUsd)).slice(0, 12);
+  for (const i of idx) {
+    const r = rows[i]!, t = trades[i]!;
+    extra.push(`Top win: net $${(r.grossUsd - r.gasUsd).toFixed(2)} | ${r.pools} pools | size $${Math.round(r.sizeUsd)} ${r.sizeToken ?? '?'} | ${r.flashLoan ? 'flash loan' : r.poolPaidFirst ? 'pool paid first' : 'own money first'} | bot ${r.bot.slice(0, 10)} | ${windowTimes[t.window]} | ${t.hash.slice(0, 18)} | ${r.shape}`);
+  }
+  // Unknown factories in full (for the DEX discovery work), most used first.
+  const facCount = new Map<string, number>();
+  for (const t of trades) for (const p of t.pools) { const x = info.get(p); if (x && !x.known && x.factory) facCount.set(x.factory, (facCount.get(x.factory) ?? 0) + 1); }
+  for (const [f, n] of [...facCount.entries()].sort((a, b) => b[1] - a[1]).slice(0, 8)) extra.push(`Unknown factory ${f}: ${n} pool uses`);
+  const report = base + '\n' + extra.join('\n');
   console.log(`node 403/429 back-offs: ${blocked}`);
   console.log(report);
   // One GitHub annotation per ~30 lines (the workflow step also wraps the tail).
