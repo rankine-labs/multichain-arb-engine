@@ -258,7 +258,11 @@ export async function discoverPairPoolsMulticall(
     pools.push({
       chain, dex: h.venue.dex, poolAddress: h.id, poolType: 'v3',
       tokenA: h.native ? ethers.getAddress(h.venue.weth!.toLowerCase()) : ethers.getAddress(h.c0), tokenB: ethers.getAddress(h.c1),
-      sqrtPriceX96: sqrt, liquidity: liq, feeBps: Math.round(Number(lpFee) / 100), feePips: Number(lpFee),
+      // The hook charges its own fee per swap (Fables: 0.035% to 0.45% seen,
+      // while the pool's listed lpFee reads 0). Listed fee 0 = unknown: use a
+      // conservative estimate so gaps are never overstated.
+      ...hookedFee(lpFee),
+      sqrtPriceX96: sqrt, liquidity: liq,
       lastUpdatedBlock: 0, lastUpdatedMs: now,
       v4: { fee: h.fee, tickSpacing: h.tickSpacing, native: h.native, poolManager: ethers.getAddress(h.venue.poolManager!.toLowerCase()), stateView: ethers.getAddress(h.venue.factory.toLowerCase()), hooks: h.hooks },
     });
@@ -296,6 +300,14 @@ export async function discoverPairPoolsMulticall(
 // liquidity(); V2/Solidly: getReserves(). Only the first return words are
 // read, which are the same across Uniswap, PancakeSwap and Ramses.
 const SEL_SLOT0 = '0x3850c7bd', SEL_LIQ = '0x1a686502', SEL_RESERVES = '0x0902f1ac';
+// Hooked V4 pools (Fables): the listed lpFee is 0 and the hook sets the real
+// fee per swap (venue probe run 37853652882: 350 to 4,500 pips, mostly
+// 2,600). Use the listed fee when it is set, else this conservative estimate.
+export const HOOKED_V4_FEE_ESTIMATE_PIPS = Number(process.env.HOOKED_V4_FEE_PIPS ?? 3000);
+export function hookedFee(lpFee: bigint | null): { feePips: number; feeBps: number } {
+  const f = lpFee !== null && lpFee > 0n && lpFee < 1_000_000n ? Number(lpFee) : HOOKED_V4_FEE_ESTIMATE_PIPS;
+  return { feePips: f, feeBps: Math.round(f / 100) };
+}
 // Algebra Integral: price + current dynamic fee live in globalState().
 const SEL_ALG_STATE = ethers.id('globalState()').slice(0, 10);
 // V4: same two reads, but asked of the StateView contract with the pool id.
@@ -326,8 +338,9 @@ export async function refreshPoolsBatch(
       // price is not kept. sqrt 0 / missing = unreadable, skip.
       // Dynamic-fee pools: keep the fee current too (Algebra: globalState
       // word 2; hooked V4: getSlot0 word 3 = the pool's LP fee now).
-      const dyn = p.variant === 'algebra' ? word(res[i], 2) : p.v4?.hooks ? word(res[i], 3) : null;
-      const fee = dyn !== null && dyn < 1_000_000n ? { feePips: Number(dyn), feeBps: Math.round(Number(dyn) / 100) } : {};
+      const dyn = p.variant === 'algebra' ? word(res[i], 2) : null;
+      const fee = p.v4?.hooks ? hookedFee(word(res[i], 3))
+        : dyn !== null && dyn < 1_000_000n ? { feePips: Number(dyn), feeBps: Math.round(Number(dyn) / 100) } : {};
       if (sqrt && liq !== null) out.push({ ...p, ...fee, sqrtPriceX96: sqrt, liquidity: liq, lastUpdatedMs: now });
     } else if (p.poolType === 'v2') {
       const r0 = word(res[i], 0), r1 = word(res[i], 1);

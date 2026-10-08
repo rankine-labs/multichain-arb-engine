@@ -70,7 +70,7 @@ async function main() {
     if (t === PAIR && s4 === sel('token1()')) return enc(['address'], [B]);
     if (t === PAIR && s4 === sel('fee()')) return enc(['uint256'], [1800]);
     if (t === REG) return enc(['tuple(tuple(address,address,uint24,int24,address),bytes32,bool)[]'], [[[[ethers.ZeroAddress, B, 0x800000, 60, '0x' + '99'.repeat(20)], id, true]]]);
-    if (t === SV && s4 === sel('getSlot0(bytes32)')) return enc(['uint160', 'int24', 'uint24', 'uint24'], [SQRT, 0, 0, 4200]);
+    if (t === SV && s4 === sel('getSlot0(bytes32)')) return enc(['uint160', 'int24', 'uint24', 'uint24'], [SQRT, 0, 0, 0]);
     if (t === SV && s4 === sel('getLiquidity(bytes32)')) return enc(['uint128'], [10n ** 19n]);
     return null;
   });
@@ -86,7 +86,7 @@ async function main() {
   assert(!!sol && sol.feePips === 1800 && sol.feeBps === 18 && sol.reserveB === 2n * 10n ** 20n, 'GIGA Classic pair uses its own fee (0.18%)');
   const { pools: wPools } = await discoverPairPoolsMulticall(fake, 'robinhood', venues, W, B);
   const fab = wPools.find((p) => p.dex === 'fables');
-  assert(!!fab && fab.v4?.hooks === '0x' + '99'.repeat(20) && fab.v4.native && fab.feePips === 4200 && fab.poolAddress === id, 'Fables pool found in the registry (native ETH as WETH), fee = current LP fee');
+  assert(!!fab && fab.v4?.hooks === '0x' + '99'.repeat(20) && fab.v4.native && fab.feePips === 3000 && fab.poolAddress === id, 'Fables pool found in the registry (native ETH as WETH); listed fee 0 -> conservative 0.30% estimate');
   assert(!pools.some((p) => p.dex === 'fables'), 'Fables pool not matched to the wrong pair');
   // Refresh keeps dynamic fees current.
   const fake2 = async (calls: { target: string; data: string }[]) => calls.map((c) => {
@@ -97,6 +97,6 @@ async function main() {
   });
   const fresh = await refreshPoolsBatch(fake2, [alg!, fab!]);
   assert(fresh[0].feePips === 2500 && fresh[0].sqrtPriceX96 === SQRT + 1n, 'Algebra refresh reads globalState (price + new fee)');
-  assert(fresh[1].feePips === 900 && fresh[1].sqrtPriceX96 === SQRT + 2n, 'hooked V4 refresh updates the LP fee');
+  assert(fresh[1].feePips === 900 && fresh[1].sqrtPriceX96 === SQRT + 2n, 'hooked V4 refresh uses a listed fee when the pool has one');
 }
 main();
