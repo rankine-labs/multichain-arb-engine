@@ -193,7 +193,7 @@ export async function discoverPairPoolsMulticall(
       pools.push({
         chain, dex: p.venue.dex, poolAddress: p.id, poolType: 'v3',
         tokenA: p.native ? p.venue.weth! : p.c0, tokenB: p.c1,
-        sqrtPriceX96: sqrt, liquidity: liq, feeBps: Math.round(p.fee / 100),
+        sqrtPriceX96: sqrt, liquidity: liq, feeBps: Math.round(p.fee / 100), feePips: Number(p.fee),
         lastUpdatedBlock: 0, lastUpdatedMs: now,
         v4: { fee: p.fee, tickSpacing: p.tickSpacing, native: p.native, poolManager: ethers.getAddress(p.venue.poolManager!.toLowerCase()), stateView: ethers.getAddress(p.venue.factory.toLowerCase()) },
       });
@@ -219,7 +219,7 @@ export async function discoverPairPoolsMulticall(
       const fee = p.spacing ? word(r2[base + 4]) : BigInt(p.feeKey!);
       if (!sqrt || !liq || !t0 || !t1 || fee === null) continue; // unreadable or no liquidity (same as before)
       pools.push({ chain, dex: p.venue.dex, poolAddress: addr, poolType: 'v3', tokenA: t0, tokenB: t1,
-        sqrtPriceX96: sqrt, liquidity: liq, feeBps: Math.round(Number(fee) / 100), lastUpdatedBlock: 0, lastUpdatedMs: now });
+        sqrtPriceX96: sqrt, liquidity: liq, feeBps: Math.round(Number(fee) / 100), feePips: Number(fee), lastUpdatedBlock: 0, lastUpdatedMs: now });
     } else {
       const r0 = word(r2[base], 0), rr1 = word(r2[base], 1), t0 = addrOf(r2[base + 1]), t1 = addrOf(r2[base + 2]);
       if (r0 === null || rr1 === null || !t0 || !t1) continue;
