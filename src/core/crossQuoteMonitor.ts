@@ -42,9 +42,33 @@ const decodeSymbol = (r: string | null): string => {
   } catch { return '?'; }
 };
 
-export interface TokenLeg { pool: PoolState; quote: 'usdg' | 'weth'; feePct: number; quoteUsd: number }
+// One pool of a watched token.
+//   feePct:    the pool's real fee in % (V3: read from the pool; V2-style:
+//              that exchange's fixed fee, see V2_FEE_PCT)
+//   feeKnown:  false = we had to assume 0.3% (fee unreadable / unknown
+//              exchange); such legs are counted in unknownFeeLegs()
+//   quoteUsd:  quote-coin money in the pool (USDG or WETH side), used to
+//              pick the deepest pool. Re-read every depthRefreshMs.
+export interface TokenLeg { pool: PoolState; quote: 'usdg' | 'weth'; feePct: number; feeKnown: boolean; quoteUsd: number }
 export interface GapStats { maxGapPct: number; maxNetPct: number; secondsProfitable: number; samples: number; lastPriceUsd: number | null }
 export interface GapRow { symbol: string; token: string; open: GapStats; rest: GapStats }
+
+// Fixed fees (in %) of the V2-style exchanges on Robinhood Chain (same values
+// the bot's pair watcher uses for these venues). Anything else is assumed
+// 0.3% and flagged as an unknown fee.
+const V2_FEE_PCT: Record<string, number> = { 'uniswap-v2': 0.3, 'pancakeswap-v2': 0.25, 'ramses-v2': 0.2 };
+const DEFAULT_FEE_PCT = 0.3;
+
+// A pool's fee in % and whether it is the real fee (true) or a guess (false).
+// v3FeePct: the fee read from the pool itself (V3), if that read worked.
+export function legFee(dex: string, kind: string, v3FeePct?: number): { feePct: number; feeKnown: boolean } {
+  if (kind === 'v3') return v3FeePct !== undefined ? { feePct: v3FeePct, feeKnown: true } : { feePct: DEFAULT_FEE_PCT, feeKnown: false };
+  const f = V2_FEE_PCT[dex];
+  return f !== undefined ? { feePct: f, feeKnown: true } : { feePct: DEFAULT_FEE_PCT, feeKnown: false };
+}
+
+// Quote-coin money in a pool, in USD (USDG has 6 decimals, WETH 18).
+const quoteUsdOf = (raw: bigint, isUsdg: boolean, ethUsd: number) => (isUsdg ? Number(raw) / 1e6 : (Number(raw) / 1e18) * ethUsd);
 
 const emptyStats = (): GapStats => ({ maxGapPct: 0, maxNetPct: -Infinity, secondsProfitable: 0, samples: 0, lastPriceUsd: null });
 
@@ -62,9 +86,19 @@ export class CrossQuoteMonitor {
     private readonly weth: string,
     private readonly wethUsd: () => number | null,
     private readonly now: () => number = Date.now,
+    // How often to re-read each pool's depth (one bundled read). Depth used
+    // to be read once at setup and never again, so "deepest pool" could go
+    // stale for days as liquidity moved. 0 = never (old behaviour).
+    private readonly depthRefreshMs: number = 10 * 60_000,
   ) {}
 
+  private lastDepthMs = 0;
+
   tokenCount() { return this.legs.size; }
+  // Legs whose fee is a 0.3% guess (unknown exchange or unreadable V3 fee).
+  unknownFeeLegs(): number { let n = 0; for (const ls of this.legs.values()) for (const l of ls) if (!l.feeKnown) n++; return n; }
+  // How old the depth numbers used for ranking are (ms), or null before setup.
+  depthAgeMs(): number | null { return this.lastDepthMs ? this.now() - this.lastDepthMs : null; }
 
   // Pick tokens with at least one USDG pool AND one WETH pool, each holding at
   // least minQuoteUsd of the quote coin; keep the maxTokens deepest.
@@ -92,8 +126,7 @@ export class CrossQuoteMonitor {
     const ethUsd = this.wethUsd() ?? 0;
     const deep = pools.map((x, i) => {
       const raw = big(bal[i]) ?? 0n;
-      const usd = x.quote === usdg ? Number(raw) / 1e6 : (Number(raw) / 1e18) * ethUsd;
-      return { ...x, usd };
+      return { ...x, usd: quoteUsdOf(raw, x.quote === usdg, ethUsd) };
     }).filter((x) => x.usd >= minQuoteUsd);
 
     // Tokens still having both quotes after the depth filter, deepest first.
@@ -120,16 +153,24 @@ export class CrossQuoteMonitor {
     this.legs.clear();
     for (const [token, xs] of chosen) {
       if (!this.decimals.has(token)) continue;
-      this.legs.set(token, xs.map((x) => ({
-        quote: x.quote === usdg ? 'usdg' as const : 'weth' as const,
-        quoteUsd: x.usd,
-        feePct: x.p.kind === 'v3' ? (feeOf.get(x.p.pool.toLowerCase()) ?? 0.3) : 0.3,
-        pool: {
-          chain: 'robinhood', dex: x.p.dex, poolAddress: x.p.pool, poolType: x.p.kind === 'v3' ? 'v3' : 'v2',
-          tokenA: x.p.token0, tokenB: x.p.token1, feeBps: 30, lastUpdatedMs: 0,
-        } as PoolState,
-      })));
+      this.legs.set(token, xs.map((x) => {
+        // Real fee: V3 read from the pool; V2-style from the exchange's
+        // fixed fee (was a flat 0.3% for every V2 pool, and feeBps 30 in
+        // the pool record regardless of the real fee).
+        const { feePct, feeKnown } = legFee(x.p.dex, x.p.kind, feeOf.get(x.p.pool.toLowerCase()));
+        return {
+          quote: x.quote === usdg ? 'usdg' as const : 'weth' as const,
+          quoteUsd: x.usd,
+          feePct, feeKnown,
+          pool: {
+            chain: 'robinhood', dex: x.p.dex, poolAddress: x.p.pool, poolType: x.p.kind === 'v3' ? 'v3' : 'v2',
+            tokenA: x.p.token0, tokenB: x.p.token1,
+            feeBps: Math.round(feePct * 100), feePips: Math.round(feePct * 10_000), lastUpdatedMs: 0,
+          } as PoolState,
+        };
+      }));
     }
+    this.lastDepthMs = this.now();
     return this.legs.size;
   }
 
@@ -142,9 +183,30 @@ export class CrossQuoteMonitor {
 
   // One measurement: read all pools, compute each token's gap, add to stats.
   // inOpen: is it the market-open window right now. dayKey: Toronto date.
+  // Re-reads every leg's quote-side balance (one bundled read) so the
+  // "deepest pool" choice follows where the money is NOW. A failed read
+  // keeps the old number for that pool.
+  async refreshDepth(): Promise<void> {
+    const all = [...this.legs.values()].flat();
+    if (!all.length) return;
+    const usdg = this.usdg.toLowerCase();
+    const bal = await this.callMany(all.map((l) => ({ target: l.quote === 'usdg' ? usdg : this.weth.toLowerCase(), data: SEL_BALANCE + pad(l.pool.poolAddress) })));
+    const ethUsd = this.wethUsd();
+    all.forEach((l, i) => {
+      const raw = big(bal[i]);
+      if (raw === null) return;
+      if (l.quote === 'weth' && !ethUsd) return; // can't value it right now
+      l.quoteUsd = quoteUsdOf(raw, l.quote === 'usdg', ethUsd ?? 0);
+    });
+    this.lastDepthMs = this.now();
+  }
+
   async tick(inOpen: boolean, dayKey: string): Promise<number> {
     if (!this.legs.size) return 0;
     if (dayKey !== this.day) { this.day = dayKey; this.stats.clear(); }
+    if (this.depthRefreshMs > 0 && this.now() - this.lastDepthMs >= this.depthRefreshMs) {
+      try { await this.refreshDepth(); } catch { /* keep the old depths; retried next interval */ this.lastDepthMs = this.now(); }
+    }
     const all = [...this.legs.values()].flat();
     const fresh = await refreshPoolsBatch(this.callMany, all.map((l) => l.pool));
     const byAddr = new Map(fresh.map((p) => [p.poolAddress.toLowerCase(), p]));
@@ -279,7 +341,6 @@ export function bestLoop(
   return best;
 }
 
-const V2_FEE_PCT: Record<string, number> = { 'uniswap-v2': 0.3, 'pancakeswap-v2': 0.25, 'ramses-v2': 0.2 };
 
 // Add one reading to running stats. dt = seconds since the last reading.
 function addLoopSample(s: LoopStats, r: { gapPct: number; netPct: number; route: string; shallowUsd: number } | null, dt: number) {
