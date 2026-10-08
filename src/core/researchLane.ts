@@ -253,6 +253,12 @@ export class ResearchLane {
       private total = new Map<ResearchReason, ReasonStats>();
       private records: ResearchRecord[] = [];
       private skipWhy = new Map<string, number>();       // this hour: why tests couldn't run
+      // Coins whose test ran out of the lane's allowance part way (usually the
+      // one-time "where does this coin keep balances" lookup, which can take
+      // up to ~30 requests for odd coins). Left alone for a while so one odd
+      // coin can't eat the whole allowance over and over.
+      private starved = new Map<string, number>();
+      private static readonly STARVED_MS = 10 * 60_000;
       readonly budget: CallBudget;
       private readonly rpc: Rpc;
       private readonly now: () => number;
@@ -353,8 +359,11 @@ export class ResearchLane {
                   vetted: c.vetted, sizeUsd: round(c.sizeUsd, 2), modelGrossUsd: round(c.modelGrossUsd, 4), timing: 'latest block',
                   note: c.note,
             };
+            const tokenKey = c.tokenIn.toLowerCase();
             if (decimals === undefined) {
                   rec.own = { kind: 'skipped', why: 'coin decimals unknown' };
+            } else if (this.now() < (this.starved.get(tokenKey) ?? 0)) {
+                  rec.own = { kind: 'skipped', why: 'coin lookup too big for the lane allowance (resting)' };
             } else {
                   // Where in the chain to test. Trigger candidates: replay the
                   // trigger's block up to the trigger, then our trade (the exact
@@ -364,6 +373,10 @@ export class ResearchLane {
                   const own = await this.runOne(c, decimals, null, spot);
                   rec.own = own.outcome;
                   rec.timing = own.timing;
+                  if (own.outcome.kind === 'skipped' && own.outcome.why === 'lane allowance used up') {
+                        this.starved.set(tokenKey, this.now() + ResearchLane.STARVED_MS);
+                        if (this.starved.size > 500) for (const [k, t] of this.starved) if (this.now() >= t) this.starved.delete(k);
+                  }
                   // Then the flash-loan version, only if it's cheap: a lender is
                   // known and the allowance has a request to spare. Not after a
                   // "no room / node busy" answer (it would just be refused too),

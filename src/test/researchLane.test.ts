@@ -208,6 +208,22 @@ function makeLane(over: Partial<ResearchConfig> = {}, deps: Partial<ResearchDeps
             assert((await lane.tick()) === true, 'rest over: testing resumes');
       }
 
+      {
+            // A coin whose test runs out of the lane's allowance part way is left alone for a while.
+            let simCalls = 0;
+            const sim = async (): Promise<SimResult> => { simCalls++; return { status: 'rate_limited', reason: 'research lane allowance used up (429)' }; };
+            const { lane, advance } = makeLane({ flash: false, rpcPerMin: 600 }, { simulate: sim as any });
+            lane.offer('below_sim_bar', 'r1', () => cand());
+            await lane.tick();
+            lane.offer('below_sim_bar', 'r2', () => cand());
+            await lane.tick();
+            assert(simCalls === 1 && lane.statsFor('below_sim_bar').skipped === 2, 'coin that ran out the allowance is rested (no second attempt)');
+            advance(11 * 60_000);
+            lane.offer('below_sim_bar', 'r3', () => cand());
+            await lane.tick();
+            assert(simCalls === 2, 'after 10 min the coin is tried again');
+      }
+
       // ---- Replay right after the trigger trade ----
       {
             const hash = '0x' + 'ab'.repeat(32);
@@ -254,7 +270,7 @@ function makeLane(over: Partial<ResearchConfig> = {}, deps: Partial<ResearchDeps
             await lane.tick();
             const text = lane.takeHour();
             assert(text.includes('Research lane') && text.includes('1 made money') && text.includes('$1.99'), 'hourly summary says what made money');
-            assert(!/[–—]/.test(text), 'summary has no long dashes');
+            assert(!/[\u2013\u2014]/.test(text), 'summary has no long dashes');
             assert(lane.statsFor('below_sim_bar', 'hour').tested === 0 && lane.statsFor('below_sim_bar', 'total').tested === 1, 'takeHour resets the hour, keeps the total');
             const dir = mkdtempSync(join(tmpdir(), 'research-'));
             const file = join(dir, 'research-lane.json');
