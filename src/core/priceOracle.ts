@@ -1,6 +1,7 @@
 import { ChainName, PoolState } from './types';
 import { PoolCache } from './poolCache';
 import { priceOf, poolReserves } from './poolPrice';
+import type { V3BalanceBook } from './v3BalanceBook';
 
 // ============================================================================
 // PRICE ORACLE
@@ -53,7 +54,24 @@ const MIN_ANCHOR_USD = Number(process.env.ORACLE_MIN_ANCHOR_USD ?? 2_500);
 // the pool the price was read from (2 x its anchor side, the usual
 // "both sides are worth the same" estimate); Infinity for a stablecoin.
 // Used by reports to ignore prices that come from shallow pools.
-export interface PriceInfo { px: number; depthUsd: number; pool: string | null }
+//
+// depthSource (Phase 1 fix, Oct 8) says how the depth was measured:
+//   'reserves'      V2-style pool: real reserves, honest
+//   'real-balance'  V3 pool: capped at the coins the pool really holds
+//                   (see core/v3BalanceBook.ts), honest
+//   'virtual'       V3/V4 pool with no real balance known: "virtual reserves"
+//                   can be many times the real money in a narrow-band pool,
+//                   so treat as LOW confidence
+//   'stable'        a stablecoin, $1 by definition
+export type DepthSource = 'reserves' | 'real-balance' | 'virtual' | 'stable';
+export interface PriceInfo { px: number; depthUsd: number; pool: string | null; depthSource?: DepthSource }
+
+// Pick the pricing pool by its capped (real) depth instead of virtual depth.
+// OFF by default so live detection is unchanged until approved; the depth
+// REPORTED in PriceInfo is always the capped one.
+const SELECT_BY_REAL_DEPTH = process.env.ORACLE_REAL_DEPTH_SELECT === '1';
+
+type Quote = { px: number; depthUsd: number; pool: string; realUsd: number; source: DepthSource };
 
 export class PriceOracle {
   private memo = new Map<string, { info: PriceInfo | null; at: number }>();
@@ -64,7 +82,12 @@ export class PriceOracle {
     private decimals: StrictDecimals = () => 18,
     private memoMs = 1_000,
     private now: () => number = Date.now,
+    // Real V3 pool balances (optional). Without it, V3 depth stays virtual.
+    private balances?: V3BalanceBook,
   ) {}
+
+  // Attach the balance book after construction (the bot builds it later).
+  useBalances(book: V3BalanceBook) { this.balances = book; this.memo.clear(); }
 
   isStable(chain: ChainName, tokenAddress: string): boolean {
     return STABLECOINS[chain].has(tokenAddress.toLowerCase());
@@ -76,15 +99,16 @@ export class PriceOracle {
 
   // Same price as getUsdPrice, plus how deep the pool behind it is.
   getUsdPriceInfo(chain: ChainName, tokenAddress: string): PriceInfo | null {
-    if (this.isStable(chain, tokenAddress)) return { px: 1.0, depthUsd: Infinity, pool: null };
+    if (this.isStable(chain, tokenAddress)) return { px: 1.0, depthUsd: Infinity, pool: null, depthSource: 'stable' };
     const key = `${chain}:${tokenAddress.toLowerCase()}`;
     const hit = this.memo.get(key);
     const t = this.now();
     if (hit && t - hit.at < this.memoMs) return hit.info;
 
     const best = this.directStablePrice(chain, tokenAddress) ?? this.oneHopStablePrice(chain, tokenAddress);
-    // Total pool money ~ 2 x the anchor side (the side we can value).
-    const info = best ? { px: best.px, depthUsd: 2 * best.depthUsd, pool: best.pool } : null;
+    // Total pool money ~ 2 x the anchor side (the side we can value), using
+    // the capped (real) depth so thin narrow-band V3 pools don't look deep.
+    const info: PriceInfo | null = best ? { px: best.px, depthUsd: 2 * best.realUsd, pool: best.pool, depthSource: best.source } : null;
     this.memo.set(key, { info, at: t });
     if (this.memo.size > 5_000) this.memo.clear(); // bound memory
     return info;
@@ -92,7 +116,10 @@ export class PriceOracle {
 
   // Price of `token` in `anchor` units on pool p, plus how much USD sits on
   // the anchor side (used to pick the deepest pool). null if unusable.
-  private quote(p: PoolState, token: string, anchorUsd: number): { px: number; depthUsd: number; pool: string } | null {
+  // realUsd = depthUsd capped at the anchor coins the pool really holds (V3
+  // with a known balance); depthUsd stays the old virtual figure, used for
+  // choosing the pool unless ORACLE_REAL_DEPTH_SELECT=1.
+  private quote(p: PoolState, token: string, anchorUsd: number): Quote | null {
     const decT = this.decimals(p.chain, token);
     const other = p.tokenA.toLowerCase() === token.toLowerCase() ? p.tokenB : p.tokenA;
     const decO = this.decimals(p.chain, other);
@@ -102,9 +129,19 @@ export class PriceOracle {
     const r = poolReserves(p, dec);
     if (px === null || !r || !(px > 0) || !Number.isFinite(px)) return null;
     const anchorAmt = p.tokenA.toLowerCase() === other.toLowerCase() ? r.a : r.b;
-    const depthUsd = anchorAmt * anchorUsd;
+    const virtualUsd = anchorAmt * anchorUsd;
+    let realUsd = virtualUsd;
+    let source: DepthSource = p.poolType === 'v3' ? 'virtual' : 'reserves';
+    if (p.poolType === 'v3' && !p.v4 && this.balances) {
+      const raw = this.balances.get(p.poolAddress, other);
+      if (raw !== undefined) {
+        realUsd = Math.min(virtualUsd, (Number(raw) / 10 ** decO) * anchorUsd);
+        source = 'real-balance';
+      }
+    }
+    const depthUsd = SELECT_BY_REAL_DEPTH ? realUsd : virtualUsd;
     if (!(depthUsd >= MIN_ANCHOR_USD)) return null;
-    return { px: px * anchorUsd, depthUsd, pool: p.poolAddress.toLowerCase() };
+    return { px: px * anchorUsd, depthUsd, pool: p.poolAddress.toLowerCase(), realUsd, source };
   }
 
   // Pools on this chain that contain `token`, with the other token.
@@ -120,8 +157,8 @@ export class PriceOracle {
   }
 
   // Deepest pool pairing the token directly with a stablecoin.
-  private directStablePrice(chain: ChainName, token: string): { px: number; depthUsd: number; pool: string } | null {
-    let best: { px: number; depthUsd: number; pool: string } | null = null;
+  private directStablePrice(chain: ChainName, token: string): Quote | null {
+    let best: Quote | null = null;
     for (const { p, other } of this.poolsWith(chain, token)) {
       if (!this.isStable(chain, other)) continue;
       const q = this.quote(p, token, 1);
@@ -132,8 +169,8 @@ export class PriceOracle {
 
   // Deepest pool pairing the token with an intermediate that has a direct
   // stable price (TOKEN/WETH -> WETH/USDG).
-  private oneHopStablePrice(chain: ChainName, token: string): { px: number; depthUsd: number; pool: string } | null {
-    let best: { px: number; depthUsd: number; pool: string } | null = null;
+  private oneHopStablePrice(chain: ChainName, token: string): Quote | null {
+    let best: Quote | null = null;
     const midPx = new Map<string, number | null>();
     for (const { p, other } of this.poolsWith(chain, token)) {
       if (this.isStable(chain, other)) continue; // direct case, already tried
