@@ -104,6 +104,7 @@ const noteNoSlot = (token: string, reason: string) => { if (/balance storage/i.t
 // ON by default since Oct 8 (owner approved tracking); RH_EXTRA_VENUES=0 turns it off.
 const RH_EXTRA_VENUES = process.env.RH_EXTRA_VENUES !== '0';
 import { ProfitBands } from './core/profitBands';
+import { RaceChecker } from './core/raceCheck';
 import { SimBucketTally, classifySimOutcome } from './core/failReasons';
 import { makeRpc, simulateRoundTrip, simRpcUrl, Rpc, makeFallbackRpc, loadBalanceSlots, wssToHttps, replayRpc, ReplayCall } from './execution/simulator';
 import { FastSender, SafetyGate, safetyConfigFromEnv } from './execution/fastSender';
@@ -663,6 +664,9 @@ const queueSimulation = (
                               dryRunPnl.recordVerified(net, `${symbolOf(chain, tokenIn)} ${buyPool.dex}->${sellPool.dex}`);
                         }
                         if (chain === 'robinhood') { routeScores.record(routeKey, net); if (vetted) winSizes.add(net); profitBands.add(net, torontoDay()); }
+                        // Race check for trigger wins: we'd send ~0.1 s after seeing the trigger,
+                        // so "ready" is the block after the trigger's block.
+                        if (chain === 'robinhood' && spot && net > 0) void raceChecker.record({ label: `${pair} after trigger`, pools: [buyPool.poolAddress, sellPool.poolAddress], netUsd: net, source: 'trigger', spottedBlock: Number(spot.block), readyDelayMs: 100, ignoreTx: triggerHash });
                   } else if (r.status === 'loss') {
                         simStats.loss++;
                         if (chain === 'robinhood') routeScores.record(routeKey, 0);
@@ -877,6 +881,11 @@ setInterval(() => {
       }
 }, 60_000);
 setInterval(() => rivalWatch.save(RIVAL_BOTS_FILE, RIVAL_TRADES_FILE), 10 * 60_000);
+// RACE CHECK (core/raceCheck.ts): for every confirmed practice win, watch the
+// two pools for ~30 s and see whether another bot took it before we'd have
+// been ready. Answers "would we really have won?". Watch only.
+const raceChecker = new RaceChecker((m, p) => robinhoodReadProvider.send(m, p as any[]), ROBINHOOD_V4.POOL_MANAGER);
+setInterval(() => { void raceChecker.tick(); }, 5_000);
 // New pool counter (set up with the chain-wide scan further down; read by the reports).
 let newPoolWatchRef: NewPoolWatch | null = null;
 
@@ -1677,6 +1686,7 @@ await chainManager.startAll();
                         fired++;
                         const label = `${symbolOf('robinhood', g.base)}/${symbolOf('robinhood', g.quote)}`;
                         const route = `buy ${g.buyPool.dex} ${g.buyPool.feeBps / 100}% -> sell ${g.sellPool.dex} ${g.sellPool.feeBps / 100}%`;
+                        const spottedAt = Date.now(); // for the race check: spotted -> ready time
                         const check = await checkRoundTrip('robinhood', g.quote, g.buyPool, g.sellPool, g.sizeUsd, g.quoteUsd);
                         if (check.status === 'rate_limited') {
                               // Can't verify right now: skip, don't mute, try again next time.
@@ -1702,6 +1712,8 @@ await chainManager.startAll();
                         const gapVetted = safetyGate.isAllowed(g.base) && safetyGate.isAllowed(g.quote);
                         if (gapVetted && simNet >= MIN_COUNTED_USD) dryRunPnl.recordVerified(simNet, `${label} gap`);
                         profitBands.add(simNet, torontoDay());
+                        // Would we really have won it? (ready = after our check + ~2 ms to sign)
+                        void raceChecker.record({ label: `${label} gap`, pools: [g.buyPool.poolAddress, g.sellPool.poolAddress], netUsd: simNet, source: 'gap', readyDelayMs: Date.now() - spottedAt + 2 });
                         console.log(`[gap] standing gap ${label} CONFIRMED: real ~$${simNet.toFixed(2)} (model $${g.profitUsd.toFixed(2)}) on $${Math.round(g.sizeUsd)} | ${route}`);
                         await fireTrade({
                               chain: 'robinhood', tokenIn: g.quote, tokenOut: g.base, buyPool: g.buyPool, sellPool: g.sellPool,
@@ -2330,6 +2342,7 @@ for (let i = 0; i < resolved.length; i++) {
                               profitBands: { hour: [...profitBands.hour], day: [...profitBands.day], hourUsd: profitBands.hourUsd, dayUsd: profitBands.dayUsd },
                               simOutcomes: simBuckets.plain(),
                               research: researchHourText(),
+                              race: raceChecker.takeHour(),
                               funnel: {
                                     tradesRead: funnel.tradesRead, noPool: funnel.noPool, tooSmall: funnel.tooSmall, noPartner: funnel.noPartner,
                                     noUsdPrice: funnel.noUsdPrice, smallerThanFees: funnel.smallerThanFees, found: funnel.found,
