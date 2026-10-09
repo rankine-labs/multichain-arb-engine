@@ -1,5 +1,11 @@
 import { PoolState } from './types';
 import { bestArb } from './backtest';
+import { feePipsOf } from './dexMath';
+
+// A pool's swap fee as a fraction (0.003 = 0.30%), from the exact fee in pips
+// when known (hooked V4 / Fables fee source, Algebra dynamic fee, 250-pip V3
+// tiers), else whole bps. Same value as feeBps / 10,000 for every other pool.
+export const feeFraction = (p: PoolState): number => feePipsOf(p) / 1_000_000;
 
 // ============================================================================
 // STANDING-GAP SCANNER -- finds arbs that exist WITHOUT a trigger trade
@@ -83,7 +89,7 @@ export function findStandingGaps(
         const dS0 = sell.tokenA.toLowerCase() === t0 ? d0 : d1, dS1 = sell.tokenA.toLowerCase() === t0 ? d1 : d0;
         const rs = poolReserves(sell, base, dS0, dS1);
         if (!rs) continue;
-        const r = bestArb(rb, buy.feeBps / 10_000, rs, sell.feeBps / 10_000, opts.flashFee, opts.maxTradeUsd / quoteUsd);
+        const r = bestArb(rb, feeFraction(buy), rs, feeFraction(sell), opts.flashFee, opts.maxTradeUsd / quoteUsd);
         const profitUsd = r.profit * quoteUsd - opts.gasUsd;
         if (profitUsd > (best?.profitUsd ?? 0)) {
           best = { pairKey: [t0, t1].sort().join('/'), base, quote, buyPool: buy, sellPool: sell,
