@@ -36,7 +36,9 @@ async function main() {
   say(`[bt] scan done: ${cands.length} pairs, ETH ~${usd(ethUsd)} (${Math.round((Date.now() - t0) / 1000)}s)`);
 
   // 2) Their pools, with fees (V3: read fee(); V2: known per DEX).
-  const raw = cands.flatMap((c) => c.pools);
+  // The backtest has no V4 maths yet, so V4 pools (added to the scan on
+  // Oct 9) are left out here; the type guard keeps the compiler happy.
+  const raw = cands.flatMap((c) => c.pools).filter((p): p is typeof p & { kind: 'v2' | 'v3' | 'solidly' } => p.kind !== 'v4');
   const { callMany } = await makeCaller(provider);
   const feeIface = new ethers.Interface(['function fee() view returns (uint24)']);
   const v3 = raw.filter((p) => p.kind === 'v3');
