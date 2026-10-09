@@ -12,8 +12,17 @@ const { readdirSync } = require('fs');
 const { join } = require('path');
 const { spawnSync } = require('child_process');
 
+const { existsSync } = require('fs');
 const testDir = join(__dirname, '..', '.test-build', 'test');
-const files = readdirSync(testDir).filter(f => f.endsWith('.test.js')).sort();
+const srcDir = join(__dirname, '..', 'src', 'test');
+// Only tests that still have a source file. The build folder is never wiped,
+// so a deleted test's old compiled copy would otherwise keep running (Oct 9:
+// a reverted feature's stale test failed the server's deploy check and
+// blocked the revert itself).
+const all = readdirSync(testDir).filter(f => f.endsWith('.test.js')).sort();
+const files = all.filter(f => existsSync(join(srcDir, f.replace(/\.js$/, '.ts'))));
+const stale = all.filter(f => !files.includes(f));
+if (stale.length) console.log(`Skipping ${stale.length} stale compiled test(s) with no source: ${stale.join(', ')}`);
 
 if (files.length === 0) {
   console.error('No test files found in', testDir);
