@@ -321,14 +321,3 @@ export const ROBINHOOD_SCAN_FACTORIES: { dex: string; kind: 'v2' | 'solidly' | '
   { dex: 'pancakeswap-v3', kind: 'v3', factory: ROBINHOOD_PANCAKE.V3_FACTORY },
   { dex: 'ramses-v3', kind: 'v3', factory: ROBINHOOD_RAMSES.V3_FACTORY },
 ];
-
-// Uniswap V4 for the chain-wide pool scan (core/universeScan.ts + core/v4Scan.ts).
-// Kept separate from ROBINHOOD_SCAN_FACTORIES on purpose: V4 has no factory,
-// its pools are found from the PoolManager's Initialize events and read via
-// StateView, and several scripts expect that list to hold address-based pools.
-// The bot adds this entry unless RH_V4_SCAN=0. Dex name matches the pair
-// watcher's own V4 pools ('uniswap-v4').
-export const ROBINHOOD_V4_SCAN_FACTORY = {
-  dex: 'uniswap-v4', kind: 'v4' as const, factory: ROBINHOOD_V4.POOL_MANAGER,
-  stateView: ROBINHOOD_V4.STATE_VIEW, weth: ROBINHOOD_TOKENS.WETH,
-};
