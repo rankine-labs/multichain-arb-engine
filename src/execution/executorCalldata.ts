@@ -107,11 +107,40 @@ export type BuildResult =
 
 const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000';
 
+// Robinhood "copy" exchanges (src/config/robinhoodVenues.ts) that are exact
+// copies of a V3 exchange we already trade, and which payment callback their
+// pools call on our contract. The contract answers all three callback names
+// the same way and only checks that the caller is the pool it is swapping
+// with right now (no factory or init-code-hash check), so a copy pool works
+// as long as its swap() and callback match the original. They all trade as
+// KIND_V3 with the pool's own address; nothing else in the calldata differs
+// (tick spacing / fee tier is only used to FIND the pool, not to trade it).
+// Proved per venue by contracts/test/ForkCopyVenues.t.sol. Whether a venue
+// may actually be used is decided elsewhere (isPracticeTestableVenue).
+export const COPY_V3_CALLBACK: Readonly<Record<string, 'uniswapV3SwapCallback' | 'pancakeV3SwapCallback'>> = {
+  'giga-cl': 'pancakeV3SwapCallback',      // PancakeSwap V3 copy
+  'swaphood-v3': 'pancakeV3SwapCallback',  // PancakeSwap V3 copy
+  'sushiswap-v3': 'uniswapV3SwapCallback', // Uniswap V3 copy
+  'up-cl': 'uniswapV3SwapCallback',        // Slipstream (Velodrome/Aerodrome CL) copy
+  'topaz-cl': 'uniswapV3SwapCallback',     // Slipstream copy
+  'raphael-cl': 'uniswapV3SwapCallback',   // Slipstream copy
+};
+
 // Which contract "kind" a pool maps to, or null if the contract can't trade it.
 export function kindForPool(pool: PoolState): number | null {
   const dex = pool.dex.toLowerCase();
   if (UNSUPPORTED_DEXES.has(dex)) return null;
-  if (dex === 'uniswap-v4') return pool.v4 ? KIND_V4 : null; // V4 needs its pool details
+  // V4 needs its pool details, and hookless pools only (the contract always
+  // builds the pool key with hooks = 0, so a hooked pool can't be reached).
+  const hooked = !!pool.v4?.hooks && pool.v4.hooks.toLowerCase() !== ZERO_ADDRESS;
+  if (dex === 'uniswap-v4') return pool.v4 && !hooked ? KIND_V4 : null;
+  // Algebra copies (Alandale, KittenSwap) call algebraSwapCallback, which the
+  // contract does not have. They are labelled 'v3' for pricing, so refuse
+  // them here rather than build a trade that would revert on chain.
+  if (pool.variant === 'algebra') return null;
+  // Any other pool carrying V4 details (hooked V4 pools such as Fables) has a
+  // 32-byte pool id, not a pool address: the V3 path can't trade it.
+  if (pool.v4) return null;
   if (pool.poolType === 'v3') return KIND_V3;
   if (pool.poolType === 'v2') return SOLIDLY_DEXES.has(dex) ? KIND_SOLIDLY : KIND_V2;
   return null; // 'orderbook', 'stable'

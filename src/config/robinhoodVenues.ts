@@ -61,7 +61,17 @@ export interface RobinhoodVenue {
   source: string[];
   // Filled from the venue probe; see docs/VENUES.md for the run.
   onChain?: { verified: boolean; note: string };
+  // Set ONLY when our real executor contract traded this venue's pools on a
+  // fork of the live chain (contracts/test/ForkCopyVenues.t.sol): both
+  // directions, every swap executed, stopped only by our own profit check.
+  // `run` is the CI run that showed it, `date` when. This allows PRACTICE
+  // testing only (isPracticeTestableVenue); it never turns on real trading.
+  practiceTested?: { run: string; date: string };
 }
+
+// Where the copy-exchange fork test passed (CI 'contracts' job, annotation
+// "Copy venue fork results"). Same run for all six.
+const COPY_FORK_RUN = { run: 'https://github.com/rankine-labs/multichain-arb-engine/actions/runs/37880135355', date: '2026-10-08' };
 
 export const ROBINHOOD_VENUES: readonly RobinhoodVenue[] = [
   // ---- P0: the user's priority list + the deepest unknown factory -----------
@@ -76,8 +86,9 @@ export const ROBINHOOD_VENUES: readonly RobinhoodVenue[] = [
     id: 'giga-cl', name: 'GIGA DEX CL', priority: 'P0', model: 'pancake-v3',
     contracts: [{ role: 'factory', address: '0xEce6eCd61177336ea6Fb9b17937AC439D85EE20B' }],
     priceable: true, executionEnabled: false,
-    executionBlocker: 'Uses the PancakeSwap V3 callback our contract already supports, but not yet replay-tested on these pools.',
+    executionBlocker: 'PancakeSwap V3 callback; our executor traded its WETH/USDG pool both ways on a fork (practiceTested). Not yet approved for real trades.',
     source: ['https://docs.gigadex.fi/security/contracts', 'DefiLlama dimension-adapters dexs/giga-dex/index.ts'],
+    practiceTested: COPY_FORK_RUN,
   },
   {
     id: 'giga-classic', name: 'GIGA DEX Classic (Solidly pairs)', priority: 'P0', model: 'solidly',
@@ -130,36 +141,41 @@ export const ROBINHOOD_VENUES: readonly RobinhoodVenue[] = [
     id: 'up-cl', name: 'UP CL (Slipstream copy)', priority: 'P1', model: 'slipstream',
     contracts: [{ role: 'factory', address: '0x1ac9dB4a2608ba45D6127B1737949b51Bb54B7F3' }],
     priceable: true, executionEnabled: false,
-    executionBlocker: 'Uses the Uniswap V3 callback, but pools are keyed by tick spacing and not yet replay-tested.',
+    executionBlocker: 'Slipstream copy (Uniswap V3 callback, tick-spacing pools); our executor traded its WETH/USDG pool both ways on a fork (practiceTested). Not yet approved for real trades.',
     source: ['DefiLlama dimension-adapters dexs/up-v3/index.ts', 'rival-trade probe (WETH/USDG pool)'],
+    practiceTested: COPY_FORK_RUN,
   },
   {
     id: 'swaphood-v3', name: 'SwapHood V3', priority: 'P1', model: 'pancake-v3',
     contracts: [{ role: 'factory', address: '0x0Ec554F0BfF0Be6C99d1e95C8015bb0950f6A2C7' }],
     priceable: true, executionEnabled: false,
-    executionBlocker: 'PancakeSwap V3 style; not yet replay-tested.',
+    executionBlocker: 'PancakeSwap V3 copy; our executor traded its WETH/USDG pool both ways on a fork (practiceTested). Not yet approved for real trades.',
     source: ['DefiLlama dimension-adapters dexs/swaphood-v3/index.ts'],
+    practiceTested: COPY_FORK_RUN,
   },
   {
     id: 'topaz-cl', name: 'Topaz CL (Slipstream copy)', priority: 'P1', model: 'slipstream',
     contracts: [{ role: 'factory', address: '0xaa5865dC3A60b25D305226d66fd573021f0D8fFB' }],
     priceable: true, executionEnabled: false,
-    executionBlocker: 'Uniswap V3 callback, tick-spacing pools; not yet replay-tested.',
+    executionBlocker: 'Slipstream copy (Uniswap V3 callback, tick-spacing pools); our executor traded its WETH/USDG pool both ways on a fork (practiceTested). Not yet approved for real trades.',
     source: ['DefiLlama dimension-adapters dexs/topaz-cl/index.ts'],
+    practiceTested: COPY_FORK_RUN,
   },
   {
     id: 'raphael-cl', name: 'Raphael Slipstream', priority: 'P1', model: 'slipstream',
     contracts: [{ role: 'factory', address: '0x5481864ddd46a2D798Df0925C23B7846e776E5E3' }],
     priceable: true, executionEnabled: false,
-    executionBlocker: 'Uniswap V3 callback, tick-spacing pools; not yet replay-tested.',
+    executionBlocker: 'Slipstream copy (Uniswap V3 callback, tick-spacing pools); our executor traded its WETH/USDG pool both ways on a fork (practiceTested). Not yet approved for real trades.',
     source: ['DefiLlama dimension-adapters dexs/raphael-slipstream/index.ts'],
+    practiceTested: COPY_FORK_RUN,
   },
   {
     id: 'sushiswap-v3', name: 'SushiSwap V3', priority: 'P1', model: 'uniswap-v3',
     contracts: [{ role: 'factory', address: '0xE51960f1B45f1C9FB6D166E6a884F866fC70433B' }],
     priceable: true, executionEnabled: false,
-    executionBlocker: 'Uniswap V3 copy (same callback); not yet replay-tested.',
+    executionBlocker: 'Uniswap V3 copy; our executor traded its WETH/USDG pool both ways on a fork (practiceTested). Not yet approved for real trades.',
     source: ['DefiLlama dimension-adapters dexs/sushiswap-v3.ts', 'venue probe run 37845231412 (factory of 7 traded pools)'],
+    practiceTested: COPY_FORK_RUN,
   },
   {
     id: 'kittenswap-algebra', name: 'KittenSwap (Algebra)', priority: 'P1', model: 'algebra',
@@ -186,6 +202,14 @@ export function priceableVenues(): RobinhoodVenue[] {
 // The one gate for trading: nothing in this file may be traded.
 export function isExecutableVenue(dex: string): boolean {
   return !ROBINHOOD_VENUES.some((v) => v.id === dex);
+}
+
+// PRACTICE testing only (never real money): true only for venues whose
+// pools our existing executor contract traded on a live-chain fork
+// (practiceTested is set). executionEnabled stays false for every venue and
+// isExecutableVenue() still refuses them; the caller decides where to use this.
+export function isPracticeTestableVenue(dex: string): boolean {
+  return ROBINHOOD_VENUES.some((v) => v.id === dex && !!v.practiceTested);
 }
 
 // Venue for a factory address (lowercase match), if any.
