@@ -59,6 +59,9 @@ jobs:
       - name: Fables dynamic fee research (read-only)
         if: inputs.only == 'fablesfee'
         shell: bash
+        env:
+          FABLES_PART: both
+          FABLES_MINUTES: '30'
         run: |
           timeout 3000 node .scripts-build/scripts/probe-fables-fee.js || true
       - name: Venue identification and swap-maths validation (read-only)

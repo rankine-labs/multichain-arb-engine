@@ -253,9 +253,170 @@ async function discover() {
   noteLong('Fee timeline (block:fee, z=0->1 o=1->0)', tl);
 }
 
+// ---------------------------------------------------------------------------
+// Bundled reads through Multicall3 (one RPC request for many view calls).
+const MC3 = '0xcA11bde05977b3631167028862bE2a173976CA11';
+const mc3 = new ethers.Interface(['function aggregate3((address target, bool allowFailure, bytes callData)[] calls) payable returns ((bool success, bytes returnData)[] returnData)']);
+async function callMany(calls: { target: string; data: string }[], tag: string | number = 'latest'): Promise<(string | null)[]> {
+  const out: (string | null)[] = [];
+  const t = typeof tag === 'number' ? ethers.toQuantity(tag) : tag;
+  for (let i = 0; i < calls.length; i += 400) {
+    const slice = calls.slice(i, i + 400);
+    const data = mc3.encodeFunctionData('aggregate3', [slice.map((c) => ({ target: c.target, allowFailure: true, callData: c.data }))]);
+    try {
+      const ret = await rpc('eth_call', [{ to: MC3, data }, t]);
+      const [res] = mc3.decodeFunctionResult('aggregate3', ret);
+      out.push(...res.map((r: any) => (r.success && r.returnData !== '0x' ? r.returnData : null)));
+    } catch { out.push(...slice.map(() => null)); }
+  }
+  return out;
+}
+const SEL = (sig: string) => ethers.id(sig).slice(0, 10);
+const enc = (sig: string, types: string[], vals: unknown[]) => SEL(sig) + coder.encode(types, vals).slice(2);
+// All 32-byte words of a return value as short decimal numbers.
+const words = (r: string | null) => (r ? (r.slice(2).match(/.{64}/g) ?? []).map((w) => BigInt('0x' + w).toString()).join(',') : '-');
+const firstWord = (r: string | null) => (r && r.length >= 66 ? Number(BigInt(r.slice(0, 66))) : null);
+const curFeeCall = (p: Pool, zeroForOne: boolean) => ({ target: p.hooks, data: enc('currentFee(bytes32,bool)', ['bytes32', 'bool'], [p.id, zeroForOne]) });
+
+// Part "views": every fee-related view of every pool, raw, at the chain head.
+async function views() {
+  const pools = await readPools();
+  const blk = await rpc('eth_getBlockByNumber', ['latest', false]);
+  const now = Number(blk.timestamp);
+  const probes: [string, (p: Pool) => string][] = [
+    ['cur z', (p) => enc('currentFee(bytes32,bool)', ['bytes32', 'bool'], [p.id, true])],
+    ['cur o', (p) => enc('currentFee(bytes32,bool)', ['bytes32', 'bool'], [p.id, false])],
+    ['auto z', (p) => enc('autonomousFee(bytes32,bool)', ['bytes32', 'bool'], [p.id, true])],
+    ['auto o', (p) => enc('autonomousFee(bytes32,bool)', ['bytes32', 'bool'], [p.id, false])],
+    ['flat', (p) => enc('flatFee(bytes32)', ['bytes32'], [p.id])],
+    ['max', (p) => enc('maxFee(bytes32)', ['bytes32'], [p.id])],
+    ['asym', (p) => enc('poolAsymmetry(bytes32)', ['bytes32'], [p.id])],
+    ['poke', (p) => enc('pokeOf(bytes32)', ['bytes32'], [p.id])],
+    ['pokeFloor', (p) => enc('pokeFloor(bytes32)', ['bytes32'], [p.id])],
+    ['floorCfg', (p) => enc('floorConfig(bytes32)', ['bytes32'], [p.id])],
+    ['open', (p) => enc('openSec(bytes32)', ['bytes32'], [p.id])],
+    ['close', (p) => enc('closeSec(bytes32)', ['bytes32'], [p.id])],
+    ['open1', () => SEL('openSec()')],
+    ['close1', () => SEL('closeSec()')],
+    ['dst', (p) => enc('dstMode(bytes32)', ['bytes32'], [p.id])],
+    ['dst1', () => SEL('dstMode()')],
+    ['session', (p) => enc('sessionAt(bytes32,uint256)', ['bytes32', 'uint256'], [p.id, now])],
+    ['session1', () => enc('sessionAt(uint256)', ['uint256'], [now])],
+    ['minFee', () => SEL('MIN_POOL_FEE()')],
+    ['absMax', () => SEL('ABSOLUTE_MAX_FEE()')],
+    ['spikeMult', () => SEL('MAX_SPIKE_MULT()')],
+    ['descentWin', () => SEL('MAX_DESCENT_WINDOW()')],
+    ['pokeTtl', () => SEL('MAX_POKE_TTL()')],
+    ['pokeDisc', () => SEL('MAX_POKE_DISCOUNT_BPS()')],
+    ['paused', (p) => enc('pausedFor(bytes32)', ['bytes32'], [p.id])],
+  ];
+  const calls = pools.flatMap((p) => probes.map(([, f]) => ({ target: p.hooks, data: f(p) })));
+  const res = await callMany(calls);
+  const lines: string[] = [`head ts ${now} (${new Date(now * 1000).toISOString()}) block ${Number(blk.number)}`];
+  pools.forEach((p, i) => {
+    const parts = probes.map(([name], j) => [name, res[i * probes.length + j]] as const).filter(([, r]) => r !== null).map(([n, r]) => `${n}=${words(r)}`);
+    lines.push(`${p.id.slice(0, 10)} ${tokenSymbols.get(p.c0) ?? p.c0.slice(0, 6)}/${tokenSymbols.get(p.c1) ?? p.c1.slice(0, 6)} h${p.hooks.slice(2, 6)} ${parts.join(' ')}`);
+  });
+  noteLong('Fables hook views at head', lines);
+
+  // For calendar pools: the floor fee over the next 7 days (hourly), via
+  // feeFloorAt(id, floorConfig, t), to see the schedule shape.
+  const sched: string[] = [];
+  const cfgType = '(uint24,uint24,uint24,uint8,uint24,uint32,uint24,uint32,uint32)';
+  for (const [i, p] of pools.entries()) {
+    const cfgRaw = res[i * probes.length + probes.findIndex(([n]) => n === 'floorCfg')];
+    if (!cfgRaw || sched.length > 14) continue;
+    let cfg: any;
+    try { cfg = coder.decode([cfgType], cfgRaw)[0]; } catch { continue; }
+    const ts = Array.from({ length: 7 * 24 }, (_, h) => now - (now % 3600) + h * 3600);
+    const r = await callMany(ts.flatMap((t) => [
+      { target: p.hooks, data: enc(`feeFloorAt(bytes32,${cfgType},uint256)`, ['bytes32', cfgType, 'uint256'], [p.id, cfg, t]) },
+      { target: p.hooks, data: enc(`feeFloorAt(${cfgType},uint256)`, [cfgType, 'uint256'], [cfg, t]) },
+    ]));
+    const vals = ts.map((t, k) => firstWord(r[2 * k]) ?? firstWord(r[2 * k + 1]));
+    // Compress runs: only print where the value changes ("Th14=500").
+    const runs: string[] = [];
+    let prev: number | null | undefined;
+    vals.forEach((v, k) => { if (v !== prev) { const d = new Date(ts[k] * 1000); runs.push(`${'SuMoTuWeThFrSa'.slice(d.getUTCDay() * 2, d.getUTCDay() * 2 + 2)}${String(d.getUTCHours()).padStart(2, '0')}=${v}`); prev = v; } });
+    sched.push(`${p.id.slice(0, 10)} ${tokenSymbols.get(p.c0) ?? ''}/${tokenSymbols.get(p.c1) ?? ''} cfg ${cfg.map((x: any) => x.toString()).join(',')}: ${runs.join(' ')}`);
+  }
+  if (sched.length) noteLong('Calendar floor, next 7 days UTC hourly', sched);
+}
+
+// Part "track": follow the chain head for FABLES_MINUTES. For each block with
+// Fables swaps, read currentFee(id, direction) at the block BEFORE (and ~5 s
+// before) and compare with the fee each swap actually paid.
+type Rec = { id: string; fee: number; zf: boolean; pos: number; b1: number | null; b45: number | null; amt: bigint; dtLast: number };
+async function track() {
+  const pools = await readPools();
+  for (const p of pools) { await symbol(p.c0); await symbol(p.c1); }
+  const byId = new Map(pools.map((p) => [p.id, p]));
+  const ids = pools.map((p) => p.id);
+  const minutes = Number(process.env.FABLES_MINUTES ?? 30);
+  const stop = Date.now() + minutes * 60_000;
+  let from = Number(await rpc('eth_blockNumber', []));
+  const recs: Rec[] = [];
+  const lastSwapBlock = new Map<string, number>();
+  let skipped = 0;
+  while (Date.now() < stop) {
+    await sleep(1500);
+    const head = Number(await rpc('eth_blockNumber', []));
+    if (head <= from) continue;
+    const swaps = (await readSwaps(ids, from + 1, head)).sort((a, b) => a.block - b.block || a.logIndex - b.logIndex);
+    from = head;
+    const blocks = [...new Set(swaps.map((s) => s.block))];
+    for (const b of blocks) {
+      // The public node keeps old state for only a few hundred blocks: skip
+      // blocks we fell too far behind on rather than read failures.
+      const nowHead = Number(await rpc('eth_blockNumber', []));
+      if (nowHead - b > 220) { skipped++; continue; }
+      const inBlock = swaps.filter((s) => s.block === b);
+      const keys = [...new Set(inBlock.map((s) => `${s.id}:${s.a0 < 0n}`))];
+      const calls = keys.map((k) => { const [id, z] = k.split(':'); return curFeeCall(byId.get(id)!, z === 'true'); });
+      const r1 = await callMany(calls, b - 1);
+      const r45 = await callMany(calls, b - 45);
+      const seen = new Map<string, number>();
+      for (const s of inBlock) {
+        const k = `${s.id}:${s.a0 < 0n}`;
+        const ki = keys.indexOf(k);
+        const pos = seen.get(s.id) ?? 0; seen.set(s.id, pos + 1);
+        recs.push({ id: s.id, fee: s.fee, zf: s.a0 < 0n, pos, b1: firstWord(r1[ki]), b45: firstWord(r45[ki]), amt: s.a0 < 0n ? -s.a0 : -s.a1, dtLast: b - (lastSwapBlock.get(s.id) ?? 0) });
+        lastSwapBlock.set(s.id, b);
+      }
+    }
+  }
+  // Summary.
+  const hookOf = (id: string) => byId.get(id)!.hooks.slice(0, 8);
+  const pct = (a: number, b: number) => (b ? `${((100 * a) / b).toFixed(1)}%` : '-');
+  const first = recs.filter((r) => r.pos === 0), later = recs.filter((r) => r.pos > 0);
+  const ok = (r: Rec, f: number | null) => f !== null && f === r.fee;
+  const near = (r: Rec, f: number | null) => f !== null && Math.abs(f - r.fee) <= Math.max(5, r.fee * 0.02);
+  const lines = [
+    `${recs.length} swaps tracked over ${minutes} min, ${skipped} blocks skipped (fell behind) (${first.length} first-in-block for their pool, ${later.length} later in the same block)`,
+    `currentFee at block-1, first swaps: exact ${pct(first.filter((r) => ok(r, r.b1)).length, first.length)}, within 2% ${pct(first.filter((r) => near(r, r.b1)).length, first.length)}, read failed ${first.filter((r) => r.b1 === null).length}`,
+    `currentFee at block-1, later swaps: exact ${pct(later.filter((r) => ok(r, r.b1)).length, later.length)}`,
+    `currentFee ~5 s before (block-45): exact ${pct(recs.filter((r) => ok(r, r.b45)).length, recs.length)}, within 2% ${pct(recs.filter((r) => near(r, r.b45)).length, recs.length)}, read failed ${recs.filter((r) => r.b45 === null).length}`,
+    `conservative check (prediction >= actual): block-1 ${pct(first.filter((r) => r.b1 !== null && r.b1 >= r.fee).length, first.length)}, 5 s ${pct(recs.filter((r) => r.b45 !== null && r.b45 >= r.fee).length, recs.length)}`,
+  ];
+  const fam = new Map<string, Rec[]>();
+  for (const r of first) { const h = hookOf(r.id); if (!fam.has(h)) fam.set(h, []); fam.get(h)!.push(r); }
+  for (const [h, list] of fam) lines.push(`hook ${h}: n=${list.length} exact@b-1 ${pct(list.filter((r) => ok(r, r.b1)).length, list.length)} exact@5s ${pct(list.filter((r) => ok(r, r.b45)).length, list.length)}`);
+  note('Fables fee prediction accuracy', lines.join('\n'));
+  const miss = recs.filter((r) => !ok(r, r.b1)).slice(0, 60).map((r) => {
+    const p = byId.get(r.id)!;
+    return `${r.id.slice(0, 10)} ${tokenSymbols.get(p.c0)}/${tokenSymbols.get(p.c1)} ${r.zf ? 'z' : 'o'} pos${r.pos} paid ${r.fee} pred@b-1 ${r.b1} pred@5s ${r.b45} amtIn ${r.amt} gap ${r.dtLast}blk`;
+  });
+  if (miss.length) noteLong('Fables fee mispredictions (block-1)', miss);
+  const stale = recs.filter((r) => ok(r, r.b1) && !ok(r, r.b45)).slice(0, 40).map((r) => `${r.id.slice(0, 10)} ${tokenSymbols.get(byId.get(r.id)!.c1)} ${r.zf ? 'z' : 'o'} paid ${r.fee} pred@5s ${r.b45}`);
+  if (stale.length) noteLong('Fables fee changed within 5 s', stale);
+}
+
 (async () => {
   try {
     if (PART === 'discover') await discover();
+    else if (PART === 'views') { for (const p of await readPools()) { await symbol(p.c0); await symbol(p.c1); } await views(); }
+    else if (PART === 'track') await track();
+    else if (PART === 'both') { for (const p of await readPools()) { await symbol(p.c0); await symbol(p.c1); } await views(); await track(); }
     else note('Fables fee probe', `unknown FABLES_PART ${PART}`);
   } catch (e) { note('Fables fee probe failed', String((e as Error).stack ?? e).slice(0, 2000)); }
   process.exit(0);
