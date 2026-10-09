@@ -179,7 +179,7 @@ async function readSwaps(ids: string[], fromBlock: number, toBlock: number): Pro
 
 const tokenSymbols = new Map<string, string>();
 async function symbol(t: string): Promise<string> {
-  if (t === ethers.ZeroAddress) return 'ETH';
+  if (t === ethers.ZeroAddress) { tokenSymbols.set(t, 'ETH'); return 'ETH'; } // native ETH
   if (tokenSymbols.has(t)) return tokenSymbols.get(t)!;
   let s = t.slice(0, 8);
   try {
