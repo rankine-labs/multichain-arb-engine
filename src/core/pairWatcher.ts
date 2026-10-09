@@ -60,6 +60,12 @@ export interface PairWatcherOptions {
   refreshMs?: number;
   maxQueue?: number;
   singlePoolRecheckMs?: number;
+  // Fee source for hooked V4 pools (Fables). Given a pool id (lowercase
+  // 32-byte hex), returns the fee the hook is expected to charge on the next
+  // swap, in pips, or null when it has no opinion. Left out = the process-wide
+  // source from setHookedFeeSource(), and if that is not set either, the
+  // conservative HOOKED_V4_FEE_ESTIMATE_PIPS. See hookedFee() for the order.
+  hookedFeeOf?: HookedFeeSource;
 }
 
 type TokenMeta = { symbol: string; decimals: number };
@@ -157,6 +163,8 @@ export type MetaResult = { symbol: string; decimals: number } | 'not-a-token';
 export async function discoverPairPoolsMulticall(
   callMany: CallManyFn, chain: ChainName, venues: Venue[], tokenA: string, tokenB: string,
   metaFor: string[] = [],
+  // hookedFeeOf: fee source for hooked V4 pools (else the process-wide one).
+  opts: { hookedFeeOf?: HookedFeeSource } = {},
 ): Promise<{ pools: PoolState[]; meta: Record<string, MetaResult> }> {
   type Pending = { venue: Venue; kind: 'v2' | 'solidly' | 'v3' | 'algebra'; feeKey?: number; spacing?: boolean; idx: number }
     | { venue: Venue; kind: 'v4-registry'; idx: number }
@@ -208,12 +216,19 @@ export async function discoverPairPoolsMulticall(
       let list: any[] = [];
       try { list = r1[p.idx] ? (iReg.decodeFunctionResult('activePools', r1[p.idx]!)[0] as any[]) : []; } catch { list = []; }
       const a = tokenA.toLowerCase(), b = tokenB.toLowerCase(), w = v.weth!.toLowerCase();
-      for (const e of list) {
+      // Memory/request guard: Fables lists ~65 pools today. Only the first
+      // MAX_REGISTRY_POOLS entries are looked at and at most
+      // MAX_HOOKED_POOLS_PER_PAIR are kept for one pair, so a registry that
+      // grows (or misbehaves) can never blow up one lookup or the cache.
+      let matched = 0;
+      for (const e of list.slice(0, MAX_REGISTRY_POOLS)) {
+        if (matched >= MAX_HOOKED_POOLS_PER_PAIR) break;
         if (!e.active) continue;
         const c0 = String(e.key.currency0).toLowerCase(), c1 = String(e.key.currency1).toLowerCase();
         const native = c0 === ethers.ZeroAddress;
         const x0 = native ? w : c0;
         if (!((x0 === a && c1 === b) || (x0 === b && c1 === a))) continue;
+        matched++;
         const base = calls2.length;
         calls2.push({ target: v.factory, data: iSV.encodeFunctionData('getSlot0', [e.id]) }, { target: v.factory, data: iSV.encodeFunctionData('getLiquidity', [e.id]) });
         hooked.push({ venue: v, id: String(e.id), fee: Number(e.key.fee), tickSpacing: Number(e.key.tickSpacing), native, c0, c1, hooks: String(e.key.hooks), base });
@@ -260,8 +275,9 @@ export async function discoverPairPoolsMulticall(
       tokenA: h.native ? ethers.getAddress(h.venue.weth!.toLowerCase()) : ethers.getAddress(h.c0), tokenB: ethers.getAddress(h.c1),
       // The hook charges its own fee per swap (Fables: 0.035% to 0.45% seen,
       // while the pool's listed lpFee reads 0). Listed fee 0 = unknown: use a
-      // conservative estimate so gaps are never overstated.
-      ...hookedFee(lpFee),
+      // conservative estimate so gaps are never overstated, unless a fee
+      // source (the Fables fee predictor) gives a number for this pool.
+      ...hookedFee(lpFee, h.id, opts.hookedFeeOf),
       sqrtPriceX96: sqrt, liquidity: liq,
       lastUpdatedBlock: 0, lastUpdatedMs: now,
       v4: { fee: h.fee, tickSpacing: h.tickSpacing, native: h.native, poolManager: ethers.getAddress(h.venue.poolManager!.toLowerCase()), stateView: ethers.getAddress(h.venue.factory.toLowerCase()), hooks: h.hooks },
@@ -302,10 +318,40 @@ export async function discoverPairPoolsMulticall(
 const SEL_SLOT0 = '0x3850c7bd', SEL_LIQ = '0x1a686502', SEL_RESERVES = '0x0902f1ac';
 // Hooked V4 pools (Fables): the listed lpFee is 0 and the hook sets the real
 // fee per swap (venue probe run 37853652882: 350 to 4,500 pips, mostly
-// 2,600). Use the listed fee when it is set, else this conservative estimate.
+// 2,600). Without a better source, this conservative estimate is used.
 export const HOOKED_V4_FEE_ESTIMATE_PIPS = Number(process.env.HOOKED_V4_FEE_PIPS ?? 3000);
-export function hookedFee(lpFee: bigint | null): { feePips: number; feeBps: number } {
-  const f = lpFee !== null && lpFee > 0n && lpFee < 1_000_000n ? Number(lpFee) : HOOKED_V4_FEE_ESTIMATE_PIPS;
+
+// Registry guards (memory and request size), see discoverPairPoolsMulticall.
+export const MAX_REGISTRY_POOLS = 1_000;
+export const MAX_HOOKED_POOLS_PER_PAIR = 8;
+
+// A fee source for hooked V4 pools: pool id (lowercase 32-byte hex) in, the
+// fee the next swap is expected to pay (pips) out, or null = "don't know".
+export type HookedFeeSource = (poolId: string) => number | null;
+
+// Process-wide fee source, used by every refresh/discovery call that is not
+// handed one explicitly (the pair watcher, the decision-time re-read, the
+// cross-quote monitor). null = none, which is the default.
+let processHookedFeeOf: HookedFeeSource | null = null;
+export function setHookedFeeSource(fn: HookedFeeSource | null): void { processHookedFeeOf = fn; }
+export function getHookedFeeSource(): HookedFeeSource | null { return processHookedFeeOf; }
+
+// A usable fee in pips: a whole number above 0 and below 100%.
+const validPips = (f: unknown): f is number => typeof f === 'number' && Number.isInteger(f) && f > 0 && f < 1_000_000;
+
+// The fee our maths charges for a hooked V4 pool, in this order:
+//   1. the fee source (the explicit `source`, else the process-wide one),
+//      when it answers with a valid number for this pool id;
+//   2. the pool's listed LP fee (getSlot0 word 3), when it is set (above 0);
+//   3. HOOKED_V4_FEE_ESTIMATE_PIPS (conservative, so gaps are not overstated).
+// A source that throws or returns junk is ignored (falls through to 2 or 3).
+export function hookedFee(lpFee: bigint | null, poolId?: string, source?: HookedFeeSource | null): { feePips: number; feeBps: number } {
+  const src = source ?? processHookedFeeOf;
+  let f: number | null = null;
+  if (src && poolId) {
+    try { const got = src(poolId.toLowerCase()); if (validPips(got)) f = got; } catch { /* bad source: ignore it */ }
+  }
+  if (f === null) f = lpFee !== null && lpFee > 0n && lpFee < 1_000_000n ? Number(lpFee) : HOOKED_V4_FEE_ESTIMATE_PIPS;
   return { feePips: f, feeBps: Math.round(f / 100) };
 }
 // Algebra Integral: price + current dynamic fee live in globalState().
@@ -316,6 +362,8 @@ const SEL_V4_LIQ = ethers.id('getLiquidity(bytes32)').slice(0, 10);
 export async function refreshPoolsBatch(
   callMany: (calls: { target: string; data: string }[]) => Promise<(string | null)[]>,
   pools: PoolState[],
+  // hookedFeeOf: fee source for hooked V4 pools (else the process-wide one).
+  opts: { hookedFeeOf?: HookedFeeSource } = {},
 ): Promise<PoolState[]> {
   const calls: { target: string; data: string }[] = [];
   const idx: number[] = []; // start index of each pool's calls
@@ -339,7 +387,7 @@ export async function refreshPoolsBatch(
       // Dynamic-fee pools: keep the fee current too (Algebra: globalState
       // word 2; hooked V4: getSlot0 word 3 = the pool's LP fee now).
       const dyn = p.variant === 'algebra' ? word(res[i], 2) : null;
-      const fee = p.v4?.hooks ? hookedFee(word(res[i], 3))
+      const fee = p.v4?.hooks ? hookedFee(word(res[i], 3), p.poolAddress, opts.hookedFeeOf)
         : dyn !== null && dyn < 1_000_000n ? { feePips: Number(dyn), feeBps: Math.round(Number(dyn) / 100) } : {};
       if (sqrt && liq !== null) out.push({ ...p, ...fee, sqrtPriceX96: sqrt, liquidity: liq, lastUpdatedMs: now });
     } else if (p.poolType === 'v2') {
@@ -352,9 +400,12 @@ export async function refreshPoolsBatch(
 
 // Re-reads one pool's live price state. Returns null if it couldn't.
 export async function refreshPoolState(provider: ethers.JsonRpcProvider, pool: PoolState): Promise<PoolState | null> {
-  if (pool.v4) return refetchV4PoolPrice(provider, pool);
-  if (pool.poolType === 'v3' && pool.variant === 'algebra') {
-    // Algebra: one batched read through the same code as the 5 s re-sync.
+  // Hooked V4 (Fables) and Algebra: one batched read through the same code
+  // as the background re-sync, so the dynamic fee is refreshed together with
+  // the price (hooked V4: through the fee source, see hookedFee()).
+  const hookedV4 = !!pool.v4?.hooks && pool.v4.hooks.toLowerCase() !== ethers.ZeroAddress;
+  if (pool.v4 && !hookedV4) return refetchV4PoolPrice(provider, pool);
+  if (hookedV4 || (pool.poolType === 'v3' && pool.variant === 'algebra')) {
     const callOne = async (calls: { target: string; data: string }[]) =>
       Promise.all(calls.map((c) => provider.call({ to: c.target, data: c.data }).catch(() => null)));
     return (await refreshPoolsBatch(callOne, [pool]))[0] ?? null;
@@ -390,6 +441,7 @@ export class PairWatcher {
   private refreshTimer: NodeJS.Timeout | null = null;
   private readonly discoveryProvider: ethers.JsonRpcProvider;
   private readonly onRefreshed?: () => void;
+  private readonly hookedFeeOf?: HookedFeeSource;
 
   constructor(
     private readonly chain: ChainName,
@@ -403,6 +455,7 @@ export class PairWatcher {
   ) {
     this.discoveryProvider = opts.discoveryProvider ?? provider;
     this.onRefreshed = opts.onRefreshed;
+    this.hookedFeeOf = opts.hookedFeeOf;
     this.maxPairs = opts.maxPairs ?? 40;
     this.rediscoverMs = opts.rediscoverMs ?? 10 * 60_000;
     this.refreshMs = opts.refreshMs ?? 30_000;
@@ -475,7 +528,7 @@ export class PairWatcher {
     }
     const metaFor = [a, b].filter((t) => !this.tokenMeta.has(t.toLowerCase()));
     this.discoveryCallMany ??= (await makeCaller(this.discoveryProvider)).callMany;
-    const { pools, meta: gotMeta } = await discoverPairPoolsMulticall(this.discoveryCallMany, this.chain, this.venues, a, b, metaFor);
+    const { pools, meta: gotMeta } = await discoverPairPoolsMulticall(this.discoveryCallMany, this.chain, this.venues, a, b, metaFor, { hookedFeeOf: this.hookedFeeOf });
     for (const [t, m] of Object.entries(gotMeta)) {
       if (m === 'not-a-token') { this.badToken.set(t, Date.now()); if (this.badToken.size > 5_000) this.badToken.clear(); continue; }
       this.tokenMeta.set(t, m);
@@ -581,7 +634,7 @@ export class PairWatcher {
       // Read started now: anything the trade feed wrote after this moment is
       // newer than (or at best equal to) what the RPC returns, so keep it.
       const readStartedMs = Date.now();
-      for (const fresh of await refreshPoolsBatch(this.callMany, pools)) this.cache.upsertIfNotNewer(fresh, readStartedMs);
+      for (const fresh of await refreshPoolsBatch(this.callMany, pools, { hookedFeeOf: this.hookedFeeOf })) this.cache.upsertIfNotNewer(fresh, readStartedMs);
       this.lastRefreshMs = Date.now();
       try { this.onRefreshed?.(); } catch { /* a listener error must not break refreshing */ }
     } finally {

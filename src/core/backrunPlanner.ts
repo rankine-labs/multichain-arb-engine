@@ -1,6 +1,7 @@
 import { PoolState, StateType } from './types';
 import { PoolCache } from './poolCache';
 import { findOptimalTradeSize, calculateAllInProfit, calculateLiquidityCeiling, CostEstimateInputs, SizingResult, SizingOptions } from './profitCalculator';
+import { feePipsOf } from './dexMath';
 
 // ============================================================================
 // BACKRUN PLANNER: "guess the price before it happens"
@@ -88,7 +89,10 @@ export function planBackrun(
     if (!(sizing.grossProfitUsd > 0)) return null;
     const profit = calculateAllInProfit(sizing, {
       ...planCosts,
-      dexFeeBps: { buy: buyPool.feeBps, sell: sellPool.feeBps },
+      // Exact fee (pips / 100, may be fractional bps), e.g. a hooked V4
+      // pool's predicted fee. Reported in the breakdown only (the sizing
+      // maths already charged each pool's fee through feePipsOf).
+      dexFeeBps: { buy: feePipsOf(buyPool) / 100, sell: feePipsOf(sellPool) / 100 },
     });
     return { usedPrediction, buyPool, sellPool, sizing, profit };
   };

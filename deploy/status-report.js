@@ -185,6 +185,8 @@ async function main() {
   const groupsLine = lastMatch(bigTail, /^\[groups\] verified coins:/);
   // Uniswap V4 asked per pair in the chain-wide scan (Oct 9).
   const v4Line = lastMatch(bigTail, /^\[scan\] v4: /);
+  // Practice tests and wins per new exchange (hourly, core/venueTally.ts).
+  const venuesLine = lastMatch(bigTail, /^\[venues\] practice tests by exchange/);
   // While the list is still being built: its latest progress line (or a failure).
   const groupsProgress = lastMatch(bigTail, /^\[groups\] (building:|symbols:|no pool scan|build\/setup failed)/);
   const loopsLine = lastMatch(bigTail, /^\[loops\] \d+ tokens across/);
@@ -247,7 +249,8 @@ async function main() {
     `- New pool counter: ${newPoolsLine ? newPoolsLine.replace(/^\[newpools\] /, '') : 'no hourly line yet'} · this window: ${newPoolsWaiting} new pool(s) for deep coins, ${newPoolsFirstMoney.length} measured, ${newPoolsFails} failed poll(s)`,
     ...newPoolsFirstMoney.slice(-3).map((l) => `  - ${l.replace(/^\[newpools\] /, '').slice(0, 200)}`),
     `- Loop watch: ${loopsLine ? loopsLine.replace(/^\[loops\] /, '') : 'no line yet'}${loopsWatch ? ` (${loopsWatch.replace(/^\[loops\] /, '')})` : ''}`,
-    `- Uniswap V4 (asked per pair): ${v4Line ? v4Line.replace(/^\[scan\] v4: /, '') : 'no full scan finished yet'}`,
+    `- New exchanges, practice tests and wins: ${venuesLine ? venuesLine.replace(/^\[venues\] practice tests by exchange, /, '').slice(0, 600) : 'first figure after the next hourly report'}`,
+    `- Uniswap V4 (asked per pair):${v4Line ? v4Line.replace(/^\[scan\] v4: /, '') : 'no full scan finished yet'}`,
     `- Coin groups (please review): ${groupsLine ? groupsLine.replace(/^\[groups\] verified coins: /, '').slice(0, 1500) : `not built yet${groupsProgress ? ` (${groupsProgress.replace(/^\[groups\] /, '')})` : ''}`}`,
     `- RPC round trip from the server (public node, best of 3): ${rpcRtt ?? '?'} ms`,
     `- Real-chain test runs: ${simProfit} profitable · ${simLoss} losing · ${simFail} would fail`,

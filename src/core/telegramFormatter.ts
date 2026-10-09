@@ -310,6 +310,7 @@ export interface PlainHourlyInput {
   profitBands?: { hour: number[]; day: number[]; hourUsd: number; dayUsd: number }; // profitable checks by $ size
   simOutcomes?: [string, number][];   // check results by category (core/failReasons SimBucket), this hour
   research?: string;                  // research lane hour summary (core/researchLane.ts), if on
+  venueTests?: string;                // practice tests + wins per new exchange (core/venueTally.ts hourText), if any
   // Race check (core/raceCheck.ts): would we really have won this hour's practice wins?
   race?: { won: number; lost: number; unclear: number; wonUsd: number; lostUsd: number; avgLeadS: number | null; pending: number };
   // Where trades dropped out this hour, step by step (see shadowMain funnel).
@@ -462,6 +463,9 @@ export function formatPlainHourly(r: PlainHourlyInput): string {
 
   // Research lane (shadow only): tests of trades the main filters threw away.
   if (r.research) { L.push(r.research); L.push(''); }
+
+  // Which new exchanges earn in practice (Fables, Alandale, GIGA CL, ...).
+  if (r.venueTests) { L.push(r.venueTests); L.push(''); }
 
   // Honest bottom line: what is PROVEN vs what is only seen.
   {

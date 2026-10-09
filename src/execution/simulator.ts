@@ -383,6 +383,15 @@ export function simRpcUrl(chain: 'avalanche' | 'monad' | 'robinhood', env: Recor
   return { url: publicUrl, source: 'public endpoint' };
 }
 
+// A hop that goes through the Uniswap V4 PoolManager: the plain V4 kind, or
+// any hop carrying a V4 tick spacing (hopFor in executorCalldata.ts fills it
+// only for V4 hops, 0 otherwise). That covers hooked V4 pools (Fables)
+// whichever kind number the contract gives them, so the simulated contract
+// gets V4 switched on (PoolManager + WETH) for them too.
+export function isV4Hop(h: ExecutorHop): boolean {
+  return h.kind === KIND_V4 || (h.v4TickSpacing ?? 0) !== 0;
+}
+
 // ----------------------------------------------------------------------------
 // The simulation
 // ----------------------------------------------------------------------------
