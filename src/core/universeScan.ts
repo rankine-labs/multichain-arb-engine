@@ -1,4 +1,5 @@
 import { ethers } from 'ethers';
+import { v4Asks, findV4Pools } from './v4Lookup';
 
 // ============================================================================
 // UNIVERSE SCAN -- find EVERY pair that exists on 2+ pools, chain-wide
@@ -26,8 +27,9 @@ export interface ScanFactory {
 
 export interface ScannedPool {
   dex: string;
-  kind: 'v2' | 'solidly' | 'v3';
-  pool: string;
+  kind: 'v2' | 'solidly' | 'v3' | 'v4';   // 'v4': only in scan RESULTS (asked per pair), never in the saved map
+  pool: string;       // V4: the 32-byte pool id
+  v4?: { fee: number; tickSpacing: number; native: boolean; poolManager: string; stateView: string };
   token0: string;
   token1: string;
   stable?: boolean;   // Solidly stable-curve pool (the bot can't price these)
@@ -55,6 +57,8 @@ export interface ScanResult {
   usdPrice: Map<string, number>;
   usedMulticall: boolean;
   errors: string[];
+  // Uniswap V4 asked per pair (opts.v4): what was checked and found.
+  v4?: { singles: number; withMoney: number; pairsAsked: number; found: number; candidatesWithV4: number };
 }
 
 export interface ScanOptions {
@@ -66,6 +70,8 @@ export interface ScanOptions {
   // On the free node, a ~30 ms-block chain makes a day ~2.9M blocks, so we
   // start with sensible slices instead of one huge ask that gets split anyway.
   maxLogRange?: number;
+  // Uniswap V4, asked per pair (core/v4Lookup.ts). Leave out to skip V4.
+  v4?: { stateView: string; poolManager: string; maxPairs?: number; pauseMs?: number };
 }
 
 const MULTICALL3 = '0xcA11bde05977b3631167028862bE2a173976CA11';
@@ -480,7 +486,69 @@ export async function scanUniverse(
   // 4) Price, value and rank.
   const usdPrice = derivePrices(relevant, decimals, opts.usdToken, opts.wrappedNative);
   for (const p of relevant) p.usd = poolUsd(p, decimals, usdPrice);
-  const { multiPoolPairs, candidates } = rankCandidates(multi, minPoolUsd);
+  let { multiPoolPairs, candidates } = rankCandidates(multi, minPoolUsd);
 
-  return { poolsPerDex, totalPools: all.length, multiPoolPairs, candidates, tokens, usdPrice, usedMulticall: multicall, errors };
+  // 5) Uniswap V4, asked per pair (see core/v4Lookup.ts for why not from
+  //    its history). Only pairs with a USDG/WETH side:
+  //    a) pairs on ONE exchange so far: one cheap read each (the USDG/WETH
+  //       balance in that pool); keep those with real money. They become
+  //       candidates if V4 has a pool for them too.
+  //    b) pairs already picked: V4 may add a deeper second pool.
+  //    Nothing here is saved in the map; a V4 failure never fails the scan.
+  let v4: ScanResult['v4'];
+  if (opts.v4) {
+    try {
+      const qs = [lc(opts.usdToken), lc(opts.wrappedNative)];
+      const wethUsd = usdPrice.get(qs[1]) ?? 0;
+      const qUsd = (q: string) => (q === qs[0] ? 1 : q === qs[1] ? wethUsd : 0);
+      const qDec = (q: string) => decimals.get(q);
+      if (!(wethUsd > 0) || qDec(qs[0]) === undefined || qDec(qs[1]) === undefined) throw new Error('no WETH price yet');
+      const quoteOf = (p: ScannedPool): string | null => {
+        const a = lc(p.token0), b = lc(p.token1);
+        if (qs.includes(a) && qs.includes(b)) return null; // USDG/WETH itself: plenty of pools already
+        return qs.includes(a) ? a : qs.includes(b) ? b : null;
+      };
+      // a) single-exchange pairs with a USDG/WETH side, one balance read each.
+      const singles = all.filter((p) => !multiSet.has(p) && p.kind !== 'solidly' && quoteOf(p) !== null);
+      const withMoney: ScannedPool[] = [];
+      const SLICE = 4_000;
+      for (let i = 0; i < singles.length; i += SLICE) {
+        const slice = singles.slice(i, i + SLICE);
+        const res = await callMany(slice.map((p) => ({ target: quoteOf(p)!, data: erc20.encodeFunctionData('balanceOf', [p.pool]) })));
+        slice.forEach((p, j) => {
+          const q = quoteOf(p)!, raw = decodeUint(res[j]);
+          if (raw === null) return;
+          // 2 x the USDG/WETH side: an upper bound for V3-style pools; the
+          // bot re-reads exact prices before any decision.
+          const usd = 2 * units(raw, qDec(q)!) * qUsd(q);
+          if (usd >= minPoolUsd) { p.usd = usd; withMoney.push(p); }
+        });
+        if (i + SLICE < singles.length) await sleep(opts.v4.pauseMs ?? 500);
+      }
+      // Deepest first, capped (memory/time safety).
+      withMoney.sort((a, b) => (b.usd ?? 0) - (a.usd ?? 0));
+      const kept = withMoney.slice(0, opts.v4.maxPairs ?? 5_000);
+      // b) + pairs already picked that have a USDG/WETH side.
+      const pairs = new Map<string, { quote: string; other: string }>();
+      const addPair = (p: { token0: string; token1: string }) => {
+        const q = quoteOf(p as ScannedPool); if (!q) return;
+        const other = lc(p.token0) === q ? lc(p.token1) : lc(p.token0);
+        pairs.set(pairKey(p), { quote: q, other });
+      };
+      for (const p of kept) addPair(p);
+      for (const c of candidates) addPair({ token0: c.tokenA, token1: c.tokenB });
+      const found = await findV4Pools(callMany, v4Asks([...pairs.values()], opts.wrappedNative), {
+        stateView: opts.v4.stateView, poolManager: opts.v4.poolManager, weth: opts.wrappedNative,
+        quoteUsd: qUsd, quoteDecimals: qDec, minUsd: minPoolUsd,
+      });
+      if (found.length) ({ candidates } = rankCandidates([...multi, ...kept, ...found], minPoolUsd));
+      v4 = { singles: singles.length, withMoney: withMoney.length, pairsAsked: pairs.size, found: found.length,
+        candidatesWithV4: candidates.filter((c) => c.pools.some((p) => p.kind === 'v4')).length };
+      log(`[scan] v4 lookup: ${singles.length} single-exchange pairs checked, ${withMoney.length} with $${minPoolUsd}+; asked V4 about ${pairs.size} pairs, found ${found.length} V4 pools with $${minPoolUsd}+`);
+    } catch (err) {
+      errors.push(`uniswap-v4 lookup: ${String((err as any)?.shortMessage ?? (err as any)?.message ?? err).slice(0, 120)}`);
+    }
+  }
+
+  return { poolsPerDex, totalPools: all.length, multiPoolPairs, candidates, tokens, usdPrice, usedMulticall: multicall, errors, v4 };
 }
