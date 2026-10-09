@@ -383,6 +383,15 @@ export function simRpcUrl(chain: 'avalanche' | 'monad' | 'robinhood', env: Recor
   return { url: publicUrl, source: 'public endpoint' };
 }
 
+// A hop that goes through the Uniswap V4 PoolManager: the plain V4 kind, or
+// any hop carrying a V4 tick spacing (hopFor in executorCalldata.ts fills it
+// only for V4 hops, 0 otherwise). That covers hooked V4 pools (Fables)
+// whichever kind number the contract gives them, so the simulated contract
+// gets V4 switched on (PoolManager + WETH) for them too.
+export function isV4Hop(h: ExecutorHop): boolean {
+  return h.kind === KIND_V4 || (h.v4TickSpacing ?? 0) !== 0;
+}
+
 // ----------------------------------------------------------------------------
 // The simulation
 // ----------------------------------------------------------------------------
@@ -445,7 +454,7 @@ async function simulateInner(
   const executorDiff: Record<string, string> = { [pad32(ethers.toBeHex(EXECUTOR_STORAGE_SLOT))]: pad32(SIM_CALLER) };
   // Uniswap V4 hops: switch V4 on in the simulated contract (the real one
   // needs the owner's setV4 call), pointing at that PoolManager and WETH.
-  const v4Hop = trade.hops.find((h) => h.kind === KIND_V4);
+  const v4Hop = trade.hops.find(isV4Hop);
   if (v4Hop) {
     if (!opts.weth) return { status: 'unsupported', reason: 'V4 trade needs the chain WETH address' };
     executorDiff[pad32(ethers.toBeHex(V4_POOL_MANAGER_STORAGE_SLOT))] = pad32(v4Hop.pool);
