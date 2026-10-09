@@ -367,9 +367,10 @@ export function formatPlainHourly(r: PlainHourlyInput): string {
     L.push(`Worth a look after fees: ${n(f.found)}`);
     const out2: string[] = [];
     if (f.belowCheckBar) out2.push(`${n(f.belowCheckBar)} estimated gain under $${f.checkBarUsd.toFixed(2)} (too small to check)`);
-    if (f.notVetted) out2.push(`${n(f.notVetted)} token not on the vetted list`);
     for (const o of out2) L.push(`  ➖ ${esc(o)}`);
     L.push(`Sent to be checked: ${n(f.sentToCheck)}`);
+    // Since Oct 8 unvetted coins are tested too, but can never be traded.
+    if (f.notVetted) L.push(`  (of those, ${n(f.notVetted)} on coins not on the vetted list: tested only, can't be traded)`);
     for (const [why, c] of f.skipped.slice(0, 4)) L.push(`  ➖ ${n(c)} not checked: ${esc(why)}`);
     L.push('');
   }
