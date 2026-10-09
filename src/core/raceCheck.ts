@@ -40,6 +40,7 @@ export interface RaceEntry {
   netUsd: number;         // confirmed practice profit
   source: 'gap' | 'trigger';
   ignoreTx?: string;      // the trade we reacted to (its own swap isn't a rival)
+  afterTxIndex?: number;  // trigger's position in its block: trades before it already happened when we saw it
 }
 
 export interface RaceResult extends RaceEntry {
@@ -52,7 +53,7 @@ export interface RaceResult extends RaceEntry {
 
 export interface RaceSummary { won: number; lost: number; unclear: number; wonUsd: number; lostUsd: number; avgLeadS: number | null }
 
-type Log = { address: string; topics: string[]; blockNumber: string; transactionHash: string; logIndex?: string };
+type Log = { address: string; topics: string[]; blockNumber: string; transactionHash: string; logIndex?: string; transactionIndex?: string };
 type Rpc = (method: string, params: unknown[]) => Promise<any>;
 
 // Pure: decide the verdict for one entry from the swap logs on its pools.
@@ -73,6 +74,8 @@ export function judge(e: RaceEntry, logs: Log[], poolManager?: string): Omit<Rac
     if (e.ignoreTx && l.transactionHash.toLowerCase() === e.ignoreTx.toLowerCase()) continue;
     const b = Number(BigInt(l.blockNumber));
     if (b < e.spottedBlock) continue;
+    // Same block as the trigger but before it: already part of the state we tested.
+    if (b === e.spottedBlock && e.afterTxIndex !== undefined && l.transactionIndex !== undefined && Number(l.transactionIndex) <= e.afterTxIndex) continue;
     const t = byTx.get(l.transactionHash) ?? { block: b, pools: new Set<string>() };
     t.pools.add(p); byTx.set(l.transactionHash, t);
   }
@@ -104,7 +107,7 @@ export class RaceChecker {
       const back = Math.ceil(e.readyDelayMs / (BLOCK_S * 1000));
       const spottedBlock = e.spottedBlock ?? head - back;
       const readyBlock = e.spottedBlock !== undefined ? e.spottedBlock + Math.max(1, back) : head;
-      this.pending.push({ label: e.label, pools: e.pools, netUsd: e.netUsd, source: e.source, spottedBlock, readyBlock, ...(e.ignoreTx ? { ignoreTx: e.ignoreTx } : {}) });
+      this.pending.push({ label: e.label, pools: e.pools, netUsd: e.netUsd, source: e.source, spottedBlock, readyBlock, ...(e.ignoreTx ? { ignoreTx: e.ignoreTx } : {}), ...(e.afterTxIndex !== undefined ? { afterTxIndex: e.afterTxIndex } : {}) });
     } catch { /* node busy: skip this one */ }
   }
 

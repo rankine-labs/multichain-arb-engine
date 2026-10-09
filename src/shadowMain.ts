@@ -518,7 +518,7 @@ const checkRoundTrip = async (
 // block (including the trigger itself), so the check can REPLAY them on the
 // block before and then run our trade: the exact moment a backrun lands,
 // before any rival. null = not found in time.
-type TriggerSpot = { block: string; parent: string; prefix: ReplayCall[]; time?: string };
+type TriggerSpot = { block: string; parent: string; prefix: ReplayCall[]; time?: string; index?: number };
 const USER_TX_TYPES = new Set(['0x0', '0x1', '0x2', '0x3', '0x4']); // skip Arbitrum system txs (0x64-0x6a)
 const findTriggerSpot = async (rpc: (m: string, p: unknown[]) => Promise<{ result?: any; error?: any }>, hash: string): Promise<TriggerSpot | null> => {
       for (let i = 0; i < RH_TRIGGER_MAX_POLLS; i++) {
@@ -534,7 +534,7 @@ const findTriggerSpot = async (rpc: (m: string, p: unknown[]) => Promise<{ resul
                         .map((t) => ({ from: t.from, to: t.to, data: t.input ?? t.data ?? '0x', value: t.value, gas: t.gas }));
                   // The trigger must be in there, or the replay would be meaningless.
                   if (!prefix.length || !txs[idx] || txs[idx].hash?.toLowerCase() !== hash.toLowerCase()) return null;
-                  return { block: r.result.blockNumber, parent: '0x' + (n - 1n).toString(16), prefix, time: b.result?.timestamp };
+                  return { block: r.result.blockNumber, parent: '0x' + (n - 1n).toString(16), prefix, time: b.result?.timestamp, index: idx };
             }
             await new Promise((res) => setTimeout(res, RH_TRIGGER_POLL_MS));
       }
@@ -666,7 +666,7 @@ const queueSimulation = (
                         if (chain === 'robinhood') { routeScores.record(routeKey, net); if (vetted) winSizes.add(net); profitBands.add(net, torontoDay()); }
                         // Race check for trigger wins: we'd send ~0.1 s after seeing the trigger,
                         // so "ready" is the block after the trigger's block.
-                        if (chain === 'robinhood' && spot && net > 0) void raceChecker.record({ label: `${pair} after trigger`, pools: [buyPool.poolAddress, sellPool.poolAddress], netUsd: net, source: 'trigger', spottedBlock: Number(spot.block), readyDelayMs: 100, ignoreTx: triggerHash });
+                        if (chain === 'robinhood' && spot && net > 0) void raceChecker.record({ label: `${pair} after trigger`, pools: [buyPool.poolAddress, sellPool.poolAddress], netUsd: net, source: 'trigger', spottedBlock: Number(spot.block), readyDelayMs: 100, ignoreTx: triggerHash, ...(spot.index !== undefined ? { afterTxIndex: spot.index } : {}) });
                   } else if (r.status === 'loss') {
                         simStats.loss++;
                         if (chain === 'robinhood') routeScores.record(routeKey, 0);

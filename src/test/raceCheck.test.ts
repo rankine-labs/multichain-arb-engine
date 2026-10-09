@@ -39,6 +39,11 @@ async function main() {
   const trig: RaceEntry = { ...e, source: 'trigger', ignoreTx: '0xtrigger' };
   assert(judge(trig, [swap(A, 1000, '0xtrigger')]).verdict === 'won', 'the trigger trade itself is ignored');
 
+  // Trades earlier in the trigger's own block were already in the state we tested.
+  const early = { address: A, topics: [V3], blockNumber: q(1000), transactionHash: '0xbefore', transactionIndex: '0x2' };
+  assert(judge({ ...trig, afterTxIndex: 5 }, [early]).verdict === 'won', 'trades before the trigger in its block are ignored');
+  assert(judge({ ...trig, afterTxIndex: 1 }, [early]).verdict === 'unclear', 'a one-pool trade after the trigger, before we were ready -> unclear');
+
   // Summary.
   const rs: RaceResult[] = [
     { ...e, verdict: 'won' }, { ...e, netUsd: 2, verdict: 'won' },
