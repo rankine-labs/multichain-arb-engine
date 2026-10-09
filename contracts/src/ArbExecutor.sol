@@ -26,12 +26,20 @@ pragma solidity 0.8.26;
 //   KIND_SOLIDLY Solidly style:   Ramses V2 (stable and volatile pairs)
 //   KIND_V3      Concentrated liquidity: Uniswap V3, PancakeSwap V3, Ramses V3,
 //                and Algebra Integral copies (same swap(), algebraSwapCallback)
-//   KIND_V4      Uniswap V4 (one PoolManager holds every pool). Only pools
-//                WITHOUT hooks (custom add-on code): the contract always
-//                builds the pool key with hooks = address(0), so a hooked
-//                pool simply can't be reached. Native-ETH pools are traded
-//                through WETH (unwrapped going in, wrapped coming out).
+//   KIND_V4      Uniswap V4 (one PoolManager holds every pool), pools WITHOUT
+//                hooks (custom add-on code): the pool key is built with
+//                hooks = address(0). Native-ETH pools are traded through
+//                WETH (unwrapped going in, wrapped coming out).
 //                Off until the owner calls setV4(poolManager, weth).
+//   KIND_V4_HOOKED  Uniswap V4 pools WITH a hook (e.g. Fables on Robinhood).
+//                Same PoolManager, same swap and settlement as KIND_V4; the
+//                only difference is the pool key's hooks field. Because the
+//                Hop layout has no spare address field, `pool` carries the
+//                HOOK address for this kind, and the PoolManager always comes
+//                from the owner's setV4 setting (never from the calldata).
+//                v4Fee is the pool key's fee field exactly as registered,
+//                including the dynamic-fee flag (0x800000) where the hook
+//                sets the fee per swap.
 //   NOT supported (reverts UnsupportedKind): LFJ Liquidity Book, Kuru
 //   orderbook. Add them as new kinds when needed.
 //
@@ -143,17 +151,19 @@ contract ArbExecutor {
     uint8 public constant KIND_SOLIDLY = 1;
     uint8 public constant KIND_V3 = 2;
     uint8 public constant KIND_V4 = 3;
+    uint8 public constant KIND_V4_HOOKED = 4;
 
     // One swap in the route.
     struct Hop {
-        uint8 kind;        // KIND_V2 / KIND_SOLIDLY / KIND_V3 / KIND_V4
+        uint8 kind;        // KIND_V2 / KIND_SOLIDLY / KIND_V3 / KIND_V4 / KIND_V4_HOOKED
         address pool;      // the pair / pool contract itself (NOT a router). KIND_V4: the PoolManager.
+                           // KIND_V4_HOOKED: the pool's HOOK contract (PoolManager comes from setV4).
         address tokenIn;
         address tokenOut;
         uint16 feeBps;     // KIND_V2 only: pool fee in basis points (30 = 0.30%). Ignored otherwise.
-        uint24 v4Fee;      // KIND_V4 only: the pool's fee in pips (3000 = 0.30%)
-        int24 v4TickSpacing; // KIND_V4 only: the pool's tick spacing
-        bool v4Native;     // KIND_V4 only: the pool holds native ETH where the route has WETH
+        uint24 v4Fee;      // V4 kinds: the pool key's fee field (3000 = 0.30%; 0x800000 = dynamic fee set by the hook)
+        int24 v4TickSpacing; // V4 kinds: the pool's tick spacing
+        bool v4Native;     // V4 kinds: the pool holds native ETH where the route has WETH
     }
 
     // A full round trip. Route must start and end in `token`.
@@ -476,7 +486,7 @@ contract ArbExecutor {
                 _swapSolidly(h, amount);
             } else if (h.kind == KIND_V3) {
                 _swapV3(h, amount);
-            } else if (h.kind == KIND_V4) {
+            } else if (h.kind == KIND_V4 || h.kind == KIND_V4_HOOKED) {
                 _swapV4(h, amount);
             } else {
                 revert UnsupportedKind(h.kind);
@@ -555,11 +565,24 @@ contract ArbExecutor {
     //
     // One unlock per V4 hop keeps the rest of the route unchanged (V2/V3
     // hops and the flash-loan logic don't need to know about V4).
+    //
+    // Hooked pools (KIND_V4_HOOKED): the PoolManager calls the hook during
+    // the swap. A hook that changes amounts ("returns delta") has its share
+    // already included in the delta swap() hands back to us, so paying what
+    // that delta says we owe and taking what it says we are owed settles
+    // everything correctly. Extra guard: we never pay more than this hop's
+    // input, and the final balance checks still apply as for every hop.
 
     function _swapV4(Hop memory h, uint256 amountIn) private {
         address pm = v4PoolManager;
         if (pm == address(0) || weth == address(0)) revert V4NotEnabled();
-        if (h.pool != pm) revert BadRoute(); // only the real PoolManager, never a look-alike
+        if (h.kind == KIND_V4) {
+            if (h.pool != pm) revert BadRoute(); // only the real PoolManager, never a look-alike
+        } else {
+            // Hooked pool: `pool` is the hook. The call still goes to the
+            // owner-set PoolManager; the hook can't be the PoolManager or us.
+            if (h.pool == pm || h.pool == address(this)) revert BadRoute();
+        }
         if (amountIn > uint256(type(int256).max)) revert BadRoute();
 
         activeV4 = true;
@@ -589,7 +612,7 @@ contract ArbExecutor {
             currency1: zeroForOne ? cOut : cIn,
             fee: h.v4Fee,
             tickSpacing: h.v4TickSpacing,
-            hooks: address(0) // hookless pools only, always
+            hooks: h.kind == KIND_V4_HOOKED ? h.pool : address(0) // KIND_V4: hookless, always
         });
 
         // forge-lint: disable-next-line(unsafe-typecast)
@@ -607,6 +630,9 @@ contract ArbExecutor {
         if (owedSigned >= 0 || gotSigned <= 0) revert ZeroAmount();
         uint256 owed = uint256(uint128(-owedSigned));
         uint256 got = uint256(uint128(gotSigned));
+        // Exact input: never pay more than this hop's input (a hook adding to
+        // our bill would otherwise be paid from the contract's other funds).
+        if (owed > amountIn) revert BadRoute();
 
         // Pay what we owe.
         if (cIn == address(0)) {

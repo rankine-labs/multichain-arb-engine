@@ -135,7 +135,7 @@ assert(pickV3Lender([...cands, lp('0xa7', 'ramses-v3', 1, 10n ** 22n)], WMON, []
 // own address, both as the buy and the sell side, and the calldata decodes
 // back to the same route (contracts/test/ForkCopyVenues.t.sol proves the
 // contract side on a fork of the live chain).
-import { COPY_V3_CALLBACK, KIND_V4 } from '../execution/executorCalldata';
+import { COPY_V3_CALLBACK, KIND_V4, KIND_V4_HOOKED, v4KeyMatchesId, encodeExecuteRaw } from '../execution/executorCalldata';
 
 const RH_WETH = '0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73';
 const RH_USDG = '0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168';
@@ -189,9 +189,63 @@ for (const dex of ['alandale', 'kittenswap-algebra']) {
 // An Algebra-labelled entry carrying V4 details is not a pool address: refused.
 assert(kindForPool(rhPool('alandale', '0x' + 'ab'.repeat(32), { variant: 'algebra', v4: { fee: 0, tickSpacing: 60, native: false, poolManager: '0x8366a39CC670B4001A1121B8F6A443A643e40951', stateView: '0xF3334192D15450CdD385c8B70e03f9A6bD9E673b' } })) === null, 'Algebra-labelled pool with V4 details refused');
 
-// Pools labelled 'v3' for pricing that the contract can NOT trade are refused.
+// Hooked V4 pools (Fables) now trade as KIND_V4_HOOKED, never as V3.
 const hookedV4 = { fee: 0, tickSpacing: 60, native: true, poolManager: '0x8366a39CC670B4001A1121B8F6A443A643e40951', stateView: '0xF3334192D15450CdD385c8B70e03f9A6bD9E673b', hooks: '0x' + '99'.repeat(20) };
-assert(kindForPool(rhPool('fables', '0x' + 'ab'.repeat(32), { v4: hookedV4 })) === null, 'hooked V4 pool (Fables) refused, not traded as V3');
-assert(kindForPool(rhPool('uniswap-v4', '0x' + 'ab'.repeat(32), { v4: hookedV4 })) === null, 'hooked Uniswap V4 pool refused');
+assert(kindForPool(rhPool('fables', '0x' + 'ab'.repeat(32), { v4: hookedV4 })) === KIND_V4_HOOKED, 'hooked V4 pool (Fables) -> KIND_V4_HOOKED, not traded as V3');
+assert(kindForPool(rhPool('uniswap-v4', '0x' + 'ab'.repeat(32), { v4: hookedV4 })) === KIND_V4_HOOKED, 'hooked Uniswap V4 pool -> KIND_V4_HOOKED');
+assert(kindForPool(rhPool('fables', '0x' + 'ab'.repeat(32), { v4: { ...hookedV4, hooks: undefined } })) === null, 'hookless V4 details under another exchange name still refused');
 assert(kindForPool(rhPool('uniswap-v4', '0x' + 'ab'.repeat(32), { v4: { ...hookedV4, hooks: undefined } })) === KIND_V4, 'hookless Uniswap V4 pool still KIND_V4');
 assert(kindForPool(rhPool('uniswap-v4', '0x' + 'ab'.repeat(32), { v4: { ...hookedV4, hooks: '0x0000000000000000000000000000000000000000' } })) === KIND_V4, 'V4 pool with hooks = zero address still KIND_V4');
+
+// ---- Fables: real pool key -> calldata ---------------------------------------
+// The most liquid Fables ETH/USDG pool as read from the registry on a fork
+// (contracts/test/ForkFablesVenues.t.sol): native ETH / USDG, fee field
+// 0x800000 (dynamic fee, set by the hook per swap), tick spacing 10.
+const FABLES_ID = '0xbac3aa3b91584a53a579b3c999a56756e954e59247e497bad1d25a4334bde551';
+const FABLES_HOOK = '0x06a889870C8f83640D6816319f72e2aA579b6080';
+const RH_PM = '0x8366a39CC670B4001A1121B8F6A443A643e40951';
+const fables = rhPool('fables', FABLES_ID, {
+  feeBps: 30, feePips: 3000,
+  v4: { fee: 0x800000, tickSpacing: 10, native: true, poolManager: RH_PM, stateView: '0xF3334192D15450CdD385c8B70e03f9A6bD9E673b', hooks: FABLES_HOOK.toLowerCase() },
+});
+assert(kindForPool(fables) === KIND_V4_HOOKED, 'Fables ETH/USDG -> KIND_V4_HOOKED');
+assert(v4KeyMatchesId(fables), 'Fables key (ETH, USDG, 0x800000, 10, hook) hashes to the real pool id');
+assert(!v4KeyMatchesId({ ...fables, v4: { ...fables.v4!, fee: 700 } }), 'a measured fee in place of the fee field does NOT match the id');
+
+for (const [buy, sell, label] of [[RH_UNI, fables, 'uni then fables'], [fables, RH_UNI, 'fables then uni']] as const) {
+  const b = buildExecuteCall({ ...rhBase, buyPool: buy, sellPool: sell });
+  assert(b.ok, `fables ${label}: calldata builds`);
+  if (!b.ok) continue;
+  assert(b.data.startsWith(EXECUTE_SELECTOR), `fables ${label}: same execute() selector as before (calldata layout unchanged)`);
+  const [t] = decodeExecuteCall(b.data);
+  const fh = buy === fables ? t.hops[0] : t.hops[1];
+  const other = buy === fables ? t.hops[1] : t.hops[0];
+  assert(Number(fh.kind) === KIND_V4_HOOKED, `fables ${label}: Fables hop is kind 4`);
+  assert(fh.pool === FABLES_HOOK, `fables ${label}: Fables hop's pool field is the hook (checksummed)`);
+  assert(Number(fh.v4Fee) === 0x800000 && Number(fh.v4TickSpacing) === 10 && fh.v4Native === true, `fables ${label}: fee field 0x800000, tick spacing 10, native ETH`);
+  assert(Number(fh.feeBps) === 0, `fables ${label}: no fixed V2 fee on the Fables hop`);
+  assert(Number(other.kind) === KIND_V3, `fables ${label}: other hop still KIND_V3`);
+  const bh = buy === fables ? b.hops[0] : b.hops[1];
+  assert(bh.v4PoolManager === RH_PM, `fables ${label}: PoolManager kept for the simulator (not encoded)`);
+}
+
+// Wrong key refused with a reason instead of sending a swap to a pool that doesn't exist.
+{
+  const wrongFee = { ...fables, v4: { ...fables.v4!, fee: 700 } };
+  const b = buildExecuteCall({ ...rhBase, buyPool: RH_UNI, sellPool: wrongFee });
+  assert(!b.ok && reasonOf(b).includes('does not match its pool id'), 'Fables pool with a wrong fee field refused (key/id mismatch)');
+  const wrongHook = { ...fables, v4: { ...fables.v4!, hooks: '0x' + '99'.repeat(20) } };
+  const c = buildExecuteCall({ ...rhBase, buyPool: wrongHook, sellPool: RH_UNI });
+  assert(!c.ok && reasonOf(c).includes('buy pool'), 'Fables pool with a wrong hook refused');
+}
+
+// The encoder never sends the bot-only v4PoolManager field, and plain hops encode exactly as before.
+{
+  const hops = [
+    { kind: KIND_V3, pool: RH_UNI.poolAddress, tokenIn: RH_WETH, tokenOut: RH_USDG, feeBps: 0 },
+    { kind: KIND_V4_HOOKED, pool: FABLES_HOOK, tokenIn: RH_USDG, tokenOut: RH_WETH, feeBps: 0, v4Fee: 0x800000, v4TickSpacing: 10, v4Native: true, v4PoolManager: RH_PM },
+  ];
+  const withExtra = encodeExecuteRaw({ token: RH_WETH, amountIn: 1n, minProfit: 1n, maxBlock: 1n, hops });
+  const withoutExtra = encodeExecuteRaw({ token: RH_WETH, amountIn: 1n, minProfit: 1n, maxBlock: 1n, hops: hops.map(({ v4PoolManager: _pm, ...h }) => h) });
+  assert(withExtra === withoutExtra, 'v4PoolManager is not part of the calldata');
+}

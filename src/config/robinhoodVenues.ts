@@ -118,8 +118,10 @@ export const ROBINHOOD_VENUES: readonly RobinhoodVenue[] = [
     id: 'fables', name: 'Fables (Uniswap V4 hooks, dynamic fee)', priority: 'P0', model: 'v4-hooked',
     contracts: [{ role: 'registry', address: '0x159a113e012593d9b3cc63ad45e30f0467e13ef3' }],
     priceable: true, executionEnabled: false,
-    executionBlocker: 'Pools sit on the shared V4 PoolManager but carry a hook that sets the fee per swap; our V4 path assumes a fixed fee and no hook.',
-    source: ['DefiLlama dimension-adapters dexs/fables.ts (FablesPoolRegistry.activePools())'],
+    executionBlocker: 'Passed the executor fork test with the new hooked-V4 hop kind (practice only); the DEPLOYED contract lacks that kind, so real trades need a redeploy and owner approval.',
+    source: ['DefiLlama dimension-adapters dexs/fables.ts (FablesPoolRegistry.activePools())', 'Fees: hook currentFee(poolId, zeroForOne), see core/fablesFee.ts'],
+    // ForkFablesVenues: ETH/USDG round trips both ways, ~334-340k gas.
+    practiceTested: { run: 'https://github.com/rankine-labs/multichain-arb-engine/actions/runs/37980235088', date: '2026-10-09' },
   },
   {
     id: 'metric', name: 'Metric OMM (oracle market maker)', priority: 'P0', model: 'oracle-amm',
@@ -212,7 +214,14 @@ export function priceableVenues(): RobinhoodVenue[] {
 
 // The one gate for trading: nothing in this file may be traded.
 export function isExecutableVenue(dex: string): boolean {
-  return !ROBINHOOD_VENUES.some((v) => v.id === dex);
+  return isExecutableIn(ROBINHOOD_VENUES, dex);
+}
+
+// Same gate against a given venue list (tests use a copy of the registry
+// with one venue changed). Kept separate from isExecutableVenue so that
+// `list.every(isExecutableVenue)` can never pass an index as the list.
+export function isExecutableIn(venues: readonly RobinhoodVenue[], dex: string): boolean {
+  return !venues.some((v) => v.id === dex);
 }
 
 // PRACTICE testing only (never real money): true only for venues whose
@@ -222,7 +231,36 @@ export function isExecutableVenue(dex: string): boolean {
 // deployed contract would need a redeploy before a real Algebra trade. executionEnabled stays false for every venue and
 // isExecutableVenue() still refuses them; the caller decides where to use this.
 export function isPracticeTestableVenue(dex: string): boolean {
-  return ROBINHOOD_VENUES.some((v) => v.id === dex && !!v.practiceTested);
+  return isPracticeTestableIn(ROBINHOOD_VENUES, dex);
+}
+export function isPracticeTestableIn(venues: readonly RobinhoodVenue[], dex: string): boolean {
+  return venues.some((v) => v.id === dex && !!v.practiceTested);
+}
+
+// The bot's planning gate (shadowMain canPracticeTest): may the practice
+// path plan and simulate trades on this exchange? Yes for the exchanges we
+// already trade (not in this file) and for venues with practiceTested set.
+// Fables (and every other venue without a fork run) stays watch-only: prices
+// are read and shown, but no practice trade is planned through it. This is
+// never permission to trade for real (isExecutableVenue decides that).
+export function canPracticeTestVenue(dex: string): boolean {
+  return canPracticeTestIn(ROBINHOOD_VENUES, dex);
+}
+export function canPracticeTestIn(venues: readonly RobinhoodVenue[], dex: string): boolean {
+  return isExecutableIn(venues, dex) || isPracticeTestableIn(venues, dex);
+}
+
+// Venues the hourly report counts practice tests and wins for: every extra
+// venue we read prices from (Fables, Alandale, GIGA CL, UP, SushiSwap, ...).
+// A fixed list, so the per-exchange counters can never grow without limit.
+export function reportedVenueIds(): string[] {
+  return priceableVenues().map((v) => v.id);
+}
+
+// Short display name for reports ("Alandale (Algebra Integral CL)" -> "Alandale").
+export function venueShortName(dex: string): string {
+  const v = ROBINHOOD_VENUES.find((x) => x.id === dex);
+  return v ? v.name.replace(/\s*\(.*\)\s*$/, '') : dex;
 }
 
 // Venue for a factory address (lowercase match), if any.
