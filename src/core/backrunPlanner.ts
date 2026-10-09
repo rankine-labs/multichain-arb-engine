@@ -58,8 +58,9 @@ export function planBackrun(
   const ownCapital = opts.funding === 'own-capital';
   // Own capital: no loan, so no loan fee in sizing OR in the final costs.
   const planCosts: CostEstimateInputs = ownCapital ? { ...costs, usingFlashLoan: false, flashLoanFeeBps: 0 } : costs;
-  // undefined = the optimizer's default 9 bps (exactly today's behaviour).
-  const sizingRateBps = ownCapital ? 0 : undefined;
+  // Size with the SAME loan fee the costs use (was a fixed 9 bps in sizing
+  // even when the real lender charges 1 bp). Own capital: no fee.
+  const sizingRateBps = ownCapital ? 0 : (costs.usingFlashLoan ? costs.flashLoanFeeBps : 0);
   const sizingOpts: SizingOptions = { refine: opts.refineSize === true };
   const tokenIn = swap.tokenIn.toLowerCase();
 

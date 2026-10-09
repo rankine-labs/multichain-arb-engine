@@ -51,3 +51,17 @@ assert(withGuess?.buyPool.dex === 'dexB' && withGuess?.sellPool.dex === 'dexA',
 
 // 3. The real cached pool must not be modified by the guess.
 assert(cache.get('avalanche', '0xA')?.reserveA === 1_000n * E18, 'prediction never alters the real cached pool');
+
+// 4. Accurate costs (Oct 8): a 1 bp lender and 2-cent gas keep more profit
+//    than the old flat 9 bps and $2, and sizing uses the same loan fee.
+{
+  const old = planBackrun(cache, victim, peer, { ...bigSell, stateType: 'PENDING' }, 3400, costs);
+  const real = planBackrun(cache, victim, peer, { ...bigSell, stateType: 'PENDING' }, 3400, { ...costs, gasPriceUsd: 0.02, flashLoanFeeBps: 1 }, 18, { refineSize: true });
+  assert(!!old && !!real && real.profit.conservativeNetProfitUsd > old.profit.conservativeNetProfitUsd,
+    `real costs keep more (old $${old?.profit.conservativeNetProfitUsd.toFixed(2)} vs real $${real?.profit.conservativeNetProfitUsd.toFixed(2)})`);
+  // The finer search may pick a SMALLER size if the 10-size grid overshot the peak.
+  assert(!!old && !!real && real.sizing.grossProfitUsd >= old.sizing.grossProfitUsd,
+    'finer size search never earns less before costs than the 10-size grid');
+  const own = planBackrun(cache, victim, peer, { ...bigSell, stateType: 'PENDING' }, 3400, { ...costs, gasPriceUsd: 0.02, flashLoanFeeBps: 0, usingFlashLoan: false }, 18, { refineSize: true, funding: 'own-capital' });
+  assert(!!own && own.profit.conservativeNetProfitUsd >= real!.profit.conservativeNetProfitUsd - 1e-9, 'no lender -> own money, no loan fee at all');
+}

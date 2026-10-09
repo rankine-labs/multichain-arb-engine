@@ -426,6 +426,8 @@ const simOff = (chain: string): string | undefined => {
       return d.reason;
 };
 // Reported in the hourly digest, then reset.
+// Smallest model gain worth a real-chain test (see the trade handler).
+const SIM_CHECK_BAR_USD = Number(process.env.SIM_MIN_GROSS_USD ?? 0.05);
 const simStats = { checked: 0, profit: 0, loss: 0, fail: 0, rateLimited: 0 };
 // Phase 8 (Oct 8): profitable checks by $ band (after our gas) and every
 // check result by category, for the hourly report. Robinhood only.
@@ -920,6 +922,16 @@ const pickLender = (
       return pickV3Lender(lenderCandidates(chain), tokenIn, exclude, (pool, token) => lenderBalances.canLend(pool, token, amount, LENDER_HEADROOM));
 };
 
+// Loan fee (bps) the Robinhood check would pay for tokenIn: the cheapest
+// approved V3 lender holding it, other than the two trade pools. Uses the
+// exact fee (pips) so a 0.01% pool counts as 1 bp. null = no lender, the
+// check uses own money, so plan with no loan fee.
+const rhLoanFeeBps = (tokenIn: string, buyPool: PoolState, sellPool: PoolState): number | null => {
+      const l = pickV3Lender(lenderCandidates('robinhood'), tokenIn, [buyPool.poolAddress, sellPool.poolAddress]);
+      if (!l) return null;
+      return (l.feePips ?? l.feeBps * 100) / 100;
+};
+
 // RESEARCH LANE (core/researchLane.ts). Off unless RESEARCH_LANE=1.
 // Tests a small random sample of what the scanner below THROWS AWAY (under
 // the $0.50 check bar, partner pool under $25k, coin not vetted, standing gap
@@ -1329,13 +1341,22 @@ if (usdPerToken === null) { if (swap.chain === 'robinhood') funnel.noUsdPrice++;
 // Plan against EVERY partner pool and keep the best (used to try only the first).
 let plan: ReturnType<typeof planBackrun> = null;
 for (const peer of peers) {
+      // ACCURATE COSTS (Oct 8, owner approved), Robinhood:
+      //  - gas: live gas price x our contract's measured gas (fork-measured
+      //    ~2 cents); the fallback before the first gas reading is 5 cents, not $2
+      //  - loan fee: the fee of the lender the real-chain check will use (the
+      //    0.01% Uniswap pool = 1 bp), not a flat 9 bps; no lender = own money, 0
+      //  - finer size search (pure maths, no node requests)
+      // Other chains keep the old figures.
+      const rh = swap.chain === 'robinhood';
+      const loanBps = rh ? rhLoanFeeBps(swap.tokenIn, pool, peer) : 9;
       const candidate = planBackrun(cache, pool, peer, swap, usdPerToken, {
-            gasPriceUsd: swap.chain === 'robinhood' ? rhGasUsd(2) : 2,
+            gasPriceUsd: rh ? rhGasUsd(0.05) : 2,
             dexFeeBps: { buy: pool.feeBps, sell: peer.feeBps }, // overwritten per direction inside planBackrun
-            flashLoanFeeBps: 9,
-            usingFlashLoan: true,
+            flashLoanFeeBps: loanBps ?? 0,
+            usingFlashLoan: !rh || loanBps !== null,
             safetyMarginPct: 0.15,
-      }, decimalsOf(swap.chain, swap.tokenIn));
+      }, decimalsOf(swap.chain, swap.tokenIn), rh ? { refineSize: true, ...(loanBps === null ? { funding: 'own-capital' as const } : {}) } : {});
       if (candidate && (!plan || candidate.profit.conservativeNetProfitUsd > plan.profit.conservativeNetProfitUsd)) plan = candidate;
 }
 if (!plan) { if (swap.chain === 'robinhood') funnel.smallerThanFees++; return; }
@@ -1377,12 +1398,16 @@ const reactionMs = Date.now() - t0;
 // "gross > 0 on any token": ~100 losing tests per 15 min, wasting Alchemy quota.
 // $0.50 (was $2): on a quiet market almost nothing reached $2, so nothing
 // got checked and no real data came in. QuickNode's daily allowance caps the cost.
-const SIM_MIN_GROSS_USD = Number(process.env.SIM_MIN_GROSS_USD ?? 0.5);
+// Oct 8 (owner approved): bar lowered to $0.05 (about twice our real gas):
+// every verified rival win was under $0.50, so the old bar hid all of them.
+// Coins not on the vetted list are now TESTED too (a test spends nothing);
+// they still can never be traded or counted as verified money.
+const SIM_MIN_GROSS_USD = SIM_CHECK_BAR_USD;
 const simVetted = swap.chain !== 'robinhood' || (safetyGate.isAllowed(swap.tokenIn) && safetyGate.isAllowed(swap.tokenOut));
+const simAllowed = swap.chain !== 'robinhood' ? simVetted : true;
 if (swap.chain === 'robinhood') {
       if (sizing.grossProfitUsd < SIM_MIN_GROSS_USD) funnel.belowCheckBar++;
-      else if (!simVetted) funnel.notVetted++;
-      else funnel.sentToCheck++;
+      else { funnel.sentToCheck++; if (!simVetted) funnel.notVetted++; }
       // Research lane (off unless RESEARCH_LANE=1): maybe sample what the check bar or the vetted list threw away.
       if (research.enabled && (sizing.grossProfitUsd < SIM_MIN_GROSS_USD || !simVetted)) {
             const rc: ResearchCandidate = {
@@ -1393,7 +1418,7 @@ if (swap.chain === 'robinhood') {
             research.offer(rc.reason, `${buyPoolUsed.poolAddress}>${sellPoolUsed.poolAddress}`, () => rc);
       }
 }
-if (sizing.grossProfitUsd >= SIM_MIN_GROSS_USD && simVetted) {
+if (sizing.grossProfitUsd >= SIM_MIN_GROSS_USD && simAllowed) {
       queueSimulation(swap.chain, swap.tokenIn, buyPoolUsed, sellPoolUsed, sizing.optimalTradeSizeUsd, sizing.grossProfitUsd, usdPerToken, (event.raw as any)?.hash);
 }
 
@@ -2263,7 +2288,7 @@ for (let i = 0; i < resolved.length; i++) {
                               funnel: {
                                     tradesRead: funnel.tradesRead, noPool: funnel.noPool, tooSmall: funnel.tooSmall, noPartner: funnel.noPartner,
                                     noUsdPrice: funnel.noUsdPrice, smallerThanFees: funnel.smallerThanFees, found: funnel.found,
-                                    belowCheckBar: funnel.belowCheckBar, checkBarUsd: Number(process.env.SIM_MIN_GROSS_USD ?? 0.5),
+                                    belowCheckBar: funnel.belowCheckBar, checkBarUsd: SIM_CHECK_BAR_USD,
                                     notVetted: funnel.notVetted, sentToCheck: funnel.sentToCheck,
                                     skipped: [...funnel.skip.entries()].sort((a, b) => b[1] - a[1]),
                               },
