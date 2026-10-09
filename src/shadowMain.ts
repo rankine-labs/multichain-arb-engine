@@ -96,6 +96,10 @@ const canPracticeTest = (dex: string) => isExecutableVenue(dex) || isPracticeTes
 // own balance, no flash loan (RH_FUNDING=flash brings loans back).
 const RH_OWN_MONEY = process.env.RH_FUNDING !== 'flash';
 const OWN_MONEY_MAX_USD = Number(process.env.OWN_MONEY_MAX_USD ?? 2_000);
+// Coins the own-money check couldn't fund (no findable balance storage):
+// their next tests borrow instead, so they're tested rather than skipped.
+const noBalanceSlot = new Set<string>();
+const noteNoSlot = (token: string, reason: string) => { if (/balance storage/i.test(reason)) { noBalanceSlot.add(token.toLowerCase()); if (noBalanceSlot.size > 2_000) noBalanceSlot.clear(); } };
 // Read prices on the extra Robinhood venues (watch only; never traded).
 // ON by default since Oct 8 (owner approved tracking); RH_EXTRA_VENUES=0 turns it off.
 const RH_EXTRA_VENUES = process.env.RH_EXTRA_VENUES !== '0';
@@ -500,7 +504,7 @@ const checkRoundTrip = async (
       if ('reason' in built) return { status: 'skipped', reason: built.reason };
       const r = await simulateRoundTrip(simRpc[chain], chain, { token: tokenIn, amountIn: built.amountIn, hops: built.hops }, { v3Lender: lender?.poolAddress, weth: chain === 'robinhood' ? ROBINHOOD_TOKENS.WETH : undefined });
       if (r.status === 'rate_limited') { simPausedUntil[chain] = Date.now() + SIM_RATE_LIMIT_PAUSE_MS; return { status: 'rate_limited' }; }
-      if (r.status === 'unsupported') return { status: 'skipped', reason: r.reason };
+      if (r.status === 'unsupported') { if (chain === 'robinhood') noteNoSlot(tokenIn, r.reason); return { status: 'skipped', reason: r.reason }; }
       if (r.status === 'profit') {
             if (!plausibleProfit(r.profit, built.amountIn)) return { status: 'fail', reason: 'implausible profit (bad token or pool data)' };
             return { status: 'profit', usd: (Number(r.profit) / 10 ** decimals) * usdPerToken };
@@ -634,7 +638,10 @@ const queueSimulation = (
                         if (/override|does not support/i.test(r.reason)) {
                               simDisabled[chain] = { reason: r.reason, until: Date.now() + SIM_DISABLE_MS };
                               console.warn(`[sim] ${chain} simulation paused 30 min: ${r.reason}`);
-                        } else console.warn(`[sim] ${chain} skipped (${r.reason})`);
+                        } else {
+                              console.warn(`[sim] ${chain} skipped (${r.reason})`);
+                              if (chain === 'robinhood') noteNoSlot(tokenIn, r.reason); // next test of this coin uses a loan
+                        }
                         return;
                   }
                   simStats.checked++;
@@ -930,7 +937,9 @@ const pickLender = (
       // Own money for trades up to OWN_MONEY_MAX_USD ($2,000); bigger trades
       // borrow from the cheapest lender (0.01% pool) so the big wins aren't
       // limited by our own pot (~$1,000 USDG + $300 WETH planned).
-      if (RH_OWN_MONEY && tradeSizeUsd <= OWN_MONEY_MAX_USD) return null;
+      // Exception: coins whose balance storage the checker can't find can't be
+      // given a pretend own-money balance, so they're tested with a loan instead.
+      if (RH_OWN_MONEY && tradeSizeUsd <= OWN_MONEY_MAX_USD && !noBalanceSlot.has(tokenIn.toLowerCase())) return null;
       const dec = TOKEN_DECIMALS[chain]?.[tokenIn.toLowerCase()];
       const amount = dec === undefined ? null : loanUnits(tradeSizeUsd, usdPerToken, dec);
       // Unknown amount or no balances read yet: no lender (own-capital check instead).
