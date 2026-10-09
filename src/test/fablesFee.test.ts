@@ -1,7 +1,7 @@
 import { ethers } from 'ethers';
 import {
   SEL_FABLES_CURRENT_FEE, fablesFeeCalls, parseFablesFees, readFablesFees, decodeFeeWord,
-  predictFablesFeePips, FablesFeeBook, FABLES_DEFAULT_FALLBACK_PIPS,
+  predictFablesFeePips, rampedFee, FablesFeeBook, FABLES_DEFAULT_FALLBACK_PIPS,
 } from '../core/fablesFee';
 
 // ============================================================================
@@ -57,6 +57,17 @@ async function main() {
   const oldObs = predictFablesFeePips({ nowMs: now + 3_600_000, observed: [{ feePips: 9000, atMs: now }] });
   assert(oldObs.source === 'fallback', 'observed fees older than the window are ignored');
 
+  // --- ramps (stock close climb) ----------------------------------------------------
+  // Real numbers: INTC climbed 10702 -> 10705 in ~5 s before the close.
+  assert(rampedFee({ feePips: 10705, readAtMs: now }, { feePips: 10702, readAtMs: now - 5000 }, now + 5000) === 10708, 'steady climb continued for one more interval');
+  assert(rampedFee({ feePips: 10705, readAtMs: now }, { feePips: 10702, readAtMs: now - 5000 }, now + 60_000) === 10708, 'never extrapolated past one interval');
+  assert(rampedFee({ feePips: 3000, readAtMs: now }, { feePips: 3250, readAtMs: now - 5000 }, now + 5000) === 3000, 'falling fee (open spike decaying) not extrapolated: last read is already on the safe side');
+  assert(rampedFee({ feePips: 30000, readAtMs: now }, { feePips: 9000, readAtMs: now - 5000 }, now + 5000) === 30000, 'a jump (override set) is not treated as a ramp');
+  assert(rampedFee({ feePips: 1000, readAtMs: now }, { feePips: 990, readAtMs: now - 60_000 }, now + 5000) === 1000, 'reads too far apart: no ramp');
+  assert(rampedFee({ feePips: 1000, readAtMs: now }, null, now + 5000) === 1000, 'no previous read: no ramp');
+  const rp = predictFablesFeePips({ nowMs: now + 2000, leadMs: 1000, live: { feePips: 4276, readAtMs: now }, prev: { feePips: 4226, readAtMs: now - 5000 } });
+  assert(rp.feePips === 4306 && rp.source === 'hook', 'predict continues the ramp to when the trade lands (3 s of a 50-per-5 s climb)');
+
   // --- the book ------------------------------------------------------------------
   const book = new FablesFeeBook();
   book.applyRead(parsed, now);
@@ -66,6 +77,14 @@ async function main() {
   assert(book.predict(idA, true, now + 2500).feePips === 1500, 'book: swap after the read raises the fee');
   assert(book.predict(idA, true, now + 60_000).feePips === 1500 && book.predict(idA, true, now + 60_000).source === 'observed', 'book: read gone stale -> highest observed');
   assert(book.predict(idA.toUpperCase().replace('0X', '0x'), false, now + 1000).feePips === 845, 'pool id matched case-insensitively');
+  // Second read 5 s later with a small climb: the book continues it.
+  const book2 = new FablesFeeBook();
+  book2.applyRead(parseFablesFees(pools, [word(2000), word(2000), word(500), word(500)]), now);
+  book2.applyRead(parseFablesFees(pools, [word(2010), word(2000), word(500), word(500)]), now + 5000);
+  assert(book2.liveFee(idA, true)!.feePips === 2010, 'liveFee returns the newest read');
+  assert(book2.predict(idA, true, now + 5000, { leadMs: 5000 }).feePips === 2020, 'book: climbing direction continued');
+  assert(book2.predict(idA, false, now + 5000, { leadMs: 5000 }).feePips === 2000, 'book: flat direction unchanged');
+  assert(book2.liveFee(idB, false)!.feePips === 500 && book2.liveFee('0x' + '00'.repeat(32), true) === null, 'unknown pool -> null');
 }
 
 main().catch((e) => { console.error(e); process.exitCode = 1; });

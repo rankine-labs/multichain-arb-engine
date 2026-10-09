@@ -8,18 +8,29 @@ import { ethers } from 'ethers';
 //   fee is a "dynamic fee" flag and StateView's lpFee reads 0. The real fee
 //   is picked by each pool's hook contract at the moment of the swap.
 //
-//   Probe runs (scripts/probe-fables-fee.ts, Oct 9) decoded the hooks'
-//   function list. Every Fables hook has a public read-only function
+//   Probe runs (scripts/probe-fables-fee.ts, Oct 9; runs 37978510077,
+//   37979020544) decoded the 13 hooks' function lists. Every Fables hook has
+//   a public read-only function
 //       currentFee(bytes32 poolId, bool zeroForOne) returns (uint24 pips)
 //   which returns the fee the NEXT swap in that direction will pay. It takes
-//   no swap size, so size does not change the fee. Behind it:
-//     - crypto / meme pools: a per-pool flat fee, optionally raised for one
-//       direction ("asymmetry"), plus a short, expiring override ("poke")
-//       that Fables' off-chain software sets when markets move;
-//     - tokenized-stock pools: a trading-calendar floor (market open, closed,
-//       holiday "day overrides") plus the same poke override, which decays
-//       back down over a few minutes after it is set.
-//   So the fee for a swap = currentFee(id, direction) read just before it.
+//   no swap size, so trade size does not change the fee. What it returns:
+//     - if an override ("poke", set by Fables' off-chain software when
+//       markets move, up to 3 days long) has not expired: the poke's fee for
+//       that direction (it can be higher OR lower than normal);
+//     - otherwise the pool's own fee ("autonomous"):
+//         crypto / meme pools: a flat fee per pool (0.01% to 4%), plus an
+//         optional extra for one direction ("asymmetry");
+//         tokenized-stock pools: a trading-calendar fee in US Eastern time:
+//         regular-hours fee, a spike at the 09:30 open that falls in a
+//         straight line over 30 min to 2 h, a straight-line climb over the
+//         last 30 min to a higher fee at the 16:00 close, falling again over
+//         30 min to the overnight fee, and a weekend fee.
+//   Checked against 622 real swaps: currentFee read one block before the
+//   swap matched the fee paid exactly 99.1% of the time; the rest were 1 pip
+//   low (fee climbing during the close ramp). Read ~5 s earlier: 91.6% exact,
+//   100% within 2%, every miss a few pips low in a calendar ramp. So the fee
+//   for a swap = currentFee(id, direction) read just before it, nudged up
+//   while a ramp is climbing.
 //
 //   This module gives the bot:
 //     1. fablesFeeCalls / parseFablesFees / readFablesFees: one Multicall3
@@ -28,8 +39,9 @@ import { ethers } from 'ethers';
 //     2. FablesFeeBook: remembers the latest read per pool and direction and
 //        the fees real swaps paid recently (from the Swap event's last word).
 //     3. predictFablesFeePips: a pure function that picks the fee to assume
-//        for a trade: the fresh hook read when we have one, never lower than
-//        anything paid in the last few seconds; otherwise the highest fee
+//        for a trade: the fresh hook read when we have one (continued
+//        upward if the last two reads show a steady climb), never lower
+//        than anything paid since that read; otherwise the highest fee
 //        recently seen; otherwise a conservative default.
 // ============================================================================
 
