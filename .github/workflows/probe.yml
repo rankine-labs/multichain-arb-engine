@@ -54,13 +54,13 @@ jobs:
       # Extra venues (Oct 8): identify factories, map pools to exchanges and
       # check our pricing maths against real swaps. Writes its own annotations.
       # Fables (Oct 9): how the Fables hook picks each swap's fee. Optional
-      # part via FABLES_PART (discover, views, track). Writes its own
+      # part via FABLES_PART (discover, views, track, both, policy). Writes its own
       # annotations. Read-only.
       - name: Fables dynamic fee research (read-only)
         if: inputs.only == 'fablesfee'
         shell: bash
         env:
-          FABLES_PART: both
+          FABLES_PART: policy
           FABLES_MINUTES: '30'
         run: |
           timeout 3000 node .scripts-build/scripts/probe-fables-fee.js || true

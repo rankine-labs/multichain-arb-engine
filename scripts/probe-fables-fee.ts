@@ -15,16 +15,24 @@
 //     3. Reads recent Swap events for the Fables pools and summarises the fee
 //        actually charged, per pool, per direction and per hour of day.
 //   Part "views": calls the hook's fee-looking view functions for every pool
-//     at the chain head and lines them up against the most recent swap fee.
+//     at the chain head, plus the stock-calendar floor for the next 7 days.
+//   Part "track": follows the chain and checks currentFee(id, direction),
+//     read one block before each swap and ~5 s before, against the fee paid.
+//   Part "both": views then track.
+//   Part "policy": replays exactly what the bot will do (one bundled read
+//     every ~5 s into a FablesFeeBook, then predictFablesFeePips) and scores
+//     it against the fee each real swap paid.
 //
 //   Results are printed as GitHub annotations (several, each under ~4 KB).
 //
 // Settings (environment):
-//   FABLES_PART (discover | views | track), FABLES_HOURS of swaps to read
+//   FABLES_PART (discover | views | track | both | policy), FABLES_MINUTES
+//   to follow the chain (track/policy, default 30), FABLES_HOURS of swaps to read
 //   (default 6), PROBE_PACE_MS (default 700)
 // Run: npx tsc -p tsconfig.scripts.json && node .scripts-build/scripts/probe-fables-fee.js
 // ============================================================================
 import { ethers } from 'ethers';
+import { FablesFeeBook, readFablesFees } from '../src/core/fablesFee';
 
 const URL_ = process.env.ROBINHOOD_RPC_URL ?? 'https://rpc.mainnet.chain.robinhood.com';
 const PART = process.env.FABLES_PART ?? 'discover';
@@ -411,9 +419,83 @@ async function track() {
   if (stale.length) noteLong('Fables fee changed within 5 s', stale);
 }
 
+// Part "policy": replays what the BOT will do. Every 45 blocks (~5 s, the
+// bot's price re-sync) it reads currentFee for every Fables pool in one
+// multicall (src/core/fablesFee.ts readFablesFees) into a FablesFeeBook, feeds
+// it the swaps it has seen, and predicts each new swap's fee half a second
+// before the swap's block. Compares with the fee the swap actually paid.
+async function policy() {
+  const pools = await readPools();
+  for (const p of pools) { await symbol(p.c0); await symbol(p.c1); }
+  const byId = new Map(pools.map((p) => [p.id, p]));
+  const refs = pools.map((p) => ({ id: p.id, hooks: p.hooks }));
+  const ids = pools.map((p) => p.id);
+  const minutes = Number(process.env.FABLES_MINUTES ?? 30);
+  const stop = Date.now() + minutes * 60_000;
+  // Block -> milliseconds, measured over the last 20,000 blocks.
+  const h0 = Number(await rpc('eth_blockNumber', []));
+  const bA = await rpc('eth_getBlockByNumber', [ethers.toQuantity(h0), false]);
+  const bB = await rpc('eth_getBlockByNumber', [ethers.toQuantity(h0 - 20_000), false]);
+  const msPerBlock = ((Number(bA.timestamp) - Number(bB.timestamp)) * 1000) / 20_000;
+  const ms = (b: number) => (b - h0) * msPerBlock;
+  const STEP = Math.max(1, Math.round(5000 / msPerBlock));
+  const book = new FablesFeeBook();
+  const applied = new Set<number>();
+  const applyAt = async (R: number) => {
+    if (applied.has(R)) return;
+    applied.add(R);
+    book.applyRead(await readFablesFees((c) => callMany(c, R), refs), ms(R));
+  };
+  type P = { id: string; zf: boolean; paid: number; pred: number; plain: number | null; src: string };
+  const out: P[] = [];
+  let from = h0, skipped = 0, jumps = 0;
+  while (Date.now() < stop) {
+    await sleep(1500);
+    const head = Number(await rpc('eth_blockNumber', []));
+    if (head <= from) continue;
+    const swaps = (await readSwaps(ids, from + 1, head)).sort((a, b) => a.block - b.block || a.logIndex - b.logIndex);
+    from = head;
+    for (const b of [...new Set(swaps.map((s) => s.block))]) {
+      const nowHead = Number(await rpc('eth_blockNumber', []));
+      if (nowHead - (b - 2 * STEP) > 230) { skipped++; continue; }
+      const R = b - 1 - ((b - 1) % STEP);
+      const before = new Map(pools.map((p) => [p.id, book.liveFee(p.id, true)?.feePips]));
+      await applyAt(R - STEP);
+      await applyAt(R);
+      for (const p of pools) { const o = before.get(p.id), n = book.liveFee(p.id, true)?.feePips; if (o && n && Math.abs(n - o) > o * 0.1) jumps++; }
+      const inBlock = swaps.filter((s) => s.block === b);
+      for (const s of inBlock) {
+        const zf = s.a0 < 0n;
+        const pr = book.predict(s.id, zf, ms(b) - 500, { leadMs: 500 });
+        out.push({ id: s.id, zf, paid: s.fee, pred: pr.feePips, plain: book.liveFee(s.id, zf)?.feePips ?? null, src: pr.source });
+      }
+      for (const s of inBlock) book.observeSwap(s.id, s.a0 < 0n, s.fee, ms(b));
+    }
+  }
+  const n = out.length;
+  const pct = (k: number) => (n ? `${((100 * k) / n).toFixed(1)}%` : '-');
+  const exact = out.filter((o) => o.pred === o.paid).length;
+  const w1 = out.filter((o) => Math.abs(o.pred - o.paid) <= o.paid * 0.01).length;
+  const under = out.filter((o) => o.pred < o.paid);
+  const plainExact = out.filter((o) => o.plain === o.paid).length;
+  const fixedErr = out.reduce((a, o) => a + Math.abs(3000 - o.paid), 0) / Math.max(1, n);
+  const predErr = out.reduce((a, o) => a + Math.abs(o.pred - o.paid), 0) / Math.max(1, n);
+  const worstUnder = under.reduce((w, o) => Math.max(w, o.paid - o.pred), 0);
+  note('Fables fee: bot policy replay (5 s refresh)', [
+    `${n} swaps over ${minutes} min, ${skipped} blocks skipped (fell behind), ${msPerBlock.toFixed(1)} ms/block, refresh every ${STEP} blocks, ${jumps} fee jumps >10% between refreshes`,
+    `predictFablesFeePips (book, ramp, observed floor): exact ${pct(exact)}, within 1% ${pct(w1)}, under-predicted ${pct(under.length)} (worst ${worstUnder} pips), mean abs error ${predErr.toFixed(1)} pips`,
+    `plain last read, no ramp: exact ${pct(plainExact)}`,
+    `old fixed 3000 pips estimate: mean abs error ${fixedErr.toFixed(0)} pips, exact ${pct(out.filter((o) => o.paid === 3000).length)}`,
+    `sources: ${['hook', 'observed', 'fallback'].map((s) => `${s} ${out.filter((o) => o.src === s).length}`).join(', ')}`,
+  ].join('\n'));
+  const bad = out.filter((o) => o.pred !== o.paid).slice(0, 50).map((o) => `${o.id.slice(0, 10)} ${tokenSymbols.get(byId.get(o.id)!.c0)}/${tokenSymbols.get(byId.get(o.id)!.c1)} ${o.zf ? 'z' : 'o'} paid ${o.paid} pred ${o.pred} plain ${o.plain} ${o.src}`);
+  if (bad.length) noteLong('Fables fee: policy misses', bad);
+}
+
 (async () => {
   try {
-    if (PART === 'discover') await discover();
+    if (PART === 'policy') await policy();
+    else if (PART === 'discover') await discover();
     else if (PART === 'views') { for (const p of await readPools()) { await symbol(p.c0); await symbol(p.c1); } await views(); }
     else if (PART === 'track') await track();
     else if (PART === 'both') { for (const p of await readPools()) { await symbol(p.c0); await symbol(p.c1); } await views(); await track(); }
