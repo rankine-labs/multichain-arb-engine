@@ -87,7 +87,14 @@ import { LenderBalances } from './core/lenderBalances';
 import { RouteScores, WinSizes, WIN_BARS } from './core/routeScore';
 import { RivalWatch } from './core/rivalWatch';
 import { V3BalanceBook } from './core/v3BalanceBook';
-import { extraWatcherVenues, extraScanFactories, isExecutableVenue } from './config/robinhoodVenues';
+import { extraWatcherVenues, extraScanFactories, isExecutableVenue, isPracticeTestableVenue } from './config/robinhoodVenues';
+// Practice-test a pool: exchanges we trade, plus extra venues that passed the
+// executor fork test (config/robinhoodVenues.ts). Real trades still need
+// isExecutableVenue (fireTrade refuses everything else).
+const canPracticeTest = (dex: string) => isExecutableVenue(dex) || isPracticeTestableVenue(dex);
+// OWN MONEY (Oct 8, owner): plan and test Robinhood trades as paid from our
+// own balance, no flash loan (RH_FUNDING=flash brings loans back).
+const RH_OWN_MONEY = process.env.RH_FUNDING !== 'flash';
 // Read prices on the extra Robinhood venues (watch only; never traded).
 // ON by default since Oct 8 (owner approved tracking); RH_EXTRA_VENUES=0 turns it off.
 const RH_EXTRA_VENUES = process.env.RH_EXTRA_VENUES !== '0';
@@ -555,7 +562,7 @@ const queueSimulation = (
             v3Lender: lender?.poolAddress,
       });
       if ('reason' in built) { if (chain === 'robinhood') funnelSkip(`trade couldn't be built (${built.reason})`); return; }
-      const funding = lender ? `flash loan from ${lender.dex} (${lender.feeBps / 100}% fee)` : 'own capital (no V3 lender cached)';
+      const funding = lender ? `flash loan from ${lender.dex} (${lender.feeBps / 100}% fee)` : RH_OWN_MONEY && chain === 'robinhood' ? 'own money' : 'own capital (no V3 lender cached)';
 
       simBusy[chain] = true;
       const followTrigger = chain === 'robinhood' && !!triggerHash && !triggerHash.includes('PLACEHOLDER');
@@ -915,6 +922,7 @@ const pickLender = (
 ) => {
       const exclude = [buyPool.poolAddress, sellPool.poolAddress];
       if (chain !== 'robinhood') return pickV3Lender(lenderCandidates(chain), tokenIn, exclude);
+      if (RH_OWN_MONEY) return null; // own money: no loan, checks fund the contract's own balance
       const dec = TOKEN_DECIMALS[chain]?.[tokenIn.toLowerCase()];
       const amount = dec === undefined ? null : loanUnits(tradeSizeUsd, usdPerToken, dec);
       // Unknown amount or no balances read yet: no lender (own-capital check instead).
@@ -927,6 +935,7 @@ const pickLender = (
 // exact fee (pips) so a 0.01% pool counts as 1 bp. null = no lender, the
 // check uses own money, so plan with no loan fee.
 const rhLoanFeeBps = (tokenIn: string, buyPool: PoolState, sellPool: PoolState): number | null => {
+      if (RH_OWN_MONEY) return null; // own money: no loan fee
       const l = pickV3Lender(lenderCandidates('robinhood'), tokenIn, [buyPool.poolAddress, sellPool.poolAddress]);
       if (!l) return null;
       return (l.feePips ?? l.feeBps * 100) / 100;
@@ -971,7 +980,7 @@ if (research.enabled) {
       // Standing gaps the main scanner ignores: prices already in memory only, no node requests.
       setInterval(() => {
             try {
-                  const pairs = robinhoodWatcher.watchedPairPools().map((addrs) => addrs.map((a) => cache.get('robinhood', a)).filter((p): p is PoolState => !!p && isExecutableVenue(p.dex)));
+                  const pairs = robinhoodWatcher.watchedPairPools().map((addrs) => addrs.map((a) => cache.get('robinhood', a)).filter((p): p is PoolState => !!p && canPracticeTest(p.dex)));
                   const gaps = findResearchGaps(pairs, isDeepRh, (p) => poolDepthUsd(p, decimalsOf, usdRhResearch), (t) => TOKEN_DECIMALS.robinhood?.[t.toLowerCase()], usdRhResearch,
                         { mainMinUsd: Number(process.env.GAP_MIN_USD ?? 20), researchMinUsd: c.gapMinUsd, minDepthUsd: c.minDepthUsd, gasUsd: rhGasUsd(0.05), maxTradeUsd: Number(process.env.MAX_TRADE_USD ?? 5_000) });
                   for (const { reason, gap } of gaps) {
@@ -1279,8 +1288,8 @@ if (registerIfApproved('avalanche', entry.dex, resolved)) pool = resolved;
           .filter((p) => deepEnough(p, decimalsOf, (t) => priceOracle.getUsdPrice(swap.chain, t)));
     // Partners on exchanges our contract can't trade yet (extra venues) are
     // only counted, never planned or tested: "missed: unsupported exchange".
-    const cachedPeers = deepPeers.filter((p) => isExecutableVenue(p.dex));
-    if (swap.chain === 'robinhood' && deepPeers.length > cachedPeers.length) funnelSkip(`partner on an exchange we can't trade yet (${[...new Set(deepPeers.filter((p) => !isExecutableVenue(p.dex)).map((p) => p.dex))].join(', ')})`);
+    const cachedPeers = deepPeers.filter((p) => canPracticeTest(p.dex));
+    if (swap.chain === 'robinhood' && deepPeers.length > cachedPeers.length) funnelSkip(`partner on an exchange we can't trade yet (${[...new Set(deepPeers.filter((p) => !canPracticeTest(p.dex)).map((p) => p.dex))].join(', ')})`);
     if (cachedPeers.length === 0) {
           if (swap.chain === 'robinhood') {
                 funnel.noPartner++;
@@ -1617,13 +1626,13 @@ await chainManager.startAll();
                               (t) => TOKEN_DECIMALS.robinhood?.[t.toLowerCase()],
                               (t) => priceOracle.getUsdPrice('robinhood', t),
                               { minProfitUsd: 0.25, flashFee: 0, gasUsd: rhGasUsd(0.05), maxTradeUsd: Number(process.env.MAX_TRADE_USD ?? 5_000) })
-                              .filter((g) => !isExecutableVenue(g.buyPool.dex) || !isExecutableVenue(g.sellPool.dex));
+                              .filter((g) => !canPracticeTest(g.buyPool.dex) || !canPracticeTest(g.sellPool.dex));
                         for (const g of unsupported.slice(0, 20)) {
-                              const ex = [g.buyPool.dex, g.sellPool.dex].filter((d) => !isExecutableVenue(d)).join('+');
+                              const ex = [g.buyPool.dex, g.sellPool.dex].filter((d) => !canPracticeTest(d)).join('+');
                               funnelSkip(`standing gap needs ${ex} (can't trade yet), model $0.25+`);
                         }
                   }
-                  for (let i = 0; i < pairs.length; i++) pairs[i] = pairs[i].filter((p) => isExecutableVenue(p.dex));
+                  for (let i = 0; i < pairs.length; i++) pairs[i] = pairs[i].filter((p) => canPracticeTest(p.dex));
                   const gaps = findStandingGaps(pairs,
                         (t) => TOKEN_DECIMALS.robinhood?.[t.toLowerCase()],
                         (t) => priceOracle.getUsdPrice('robinhood', t),
