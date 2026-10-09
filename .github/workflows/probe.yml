@@ -141,6 +141,12 @@ jobs:
             echo "--- standing gaps found: $(grep -c '^\[gap\] standing gap' smoke.log) (first 8) ---"
             grep '^\[gap\]' smoke.log | head -8
             echo "--- rivals seen: $(grep -c '^\[rival\]' smoke.log) ---"
+            echo "--- extra venues: pools by exchange in the watch list ---"
+            grep -oE 'dex[=:" ]+(alandale|giga-cl|giga-classic|fables|up-cl|topaz-cl|raphael-cl|swaphood-v3|sushiswap-v3|kittenswap-algebra|goo-exchange)' smoke.log | sort | uniq -c | head -12
+            grep -E "exchange we can't trade yet|standing gap needs" smoke.log | head -4
+            echo "--- rival watch: $(grep -c '^\[rivalwatch\]' smoke.log) lines; oracle balances: $(grep -c 'real V3 balances read' smoke.log) ---"
+            grep -E '^\[oracle\]' smoke.log | head -2
+            grep -E '^\[scan\].*(alandale|giga|fables|up-cl)' smoke.log | head -4
             echo "--- errors / crashes ($(grep -ciE 'unhandled|error|fatal' smoke.log)) first 10 ---"
             grep -iE 'unhandled|error|fatal' smoke.log | grep -v 'TELEGRAM_BOT_TOKEN' | head -10
           } > summary.txt

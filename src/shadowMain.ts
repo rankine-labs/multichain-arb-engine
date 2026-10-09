@@ -88,8 +88,9 @@ import { RouteScores, WinSizes, WIN_BARS } from './core/routeScore';
 import { RivalWatch } from './core/rivalWatch';
 import { V3BalanceBook } from './core/v3BalanceBook';
 import { extraWatcherVenues, extraScanFactories, isExecutableVenue } from './config/robinhoodVenues';
-// Read prices on the extra Robinhood venues (research; never traded).
-const RH_EXTRA_VENUES = process.env.RH_EXTRA_VENUES === '1';
+// Read prices on the extra Robinhood venues (watch only; never traded).
+// ON by default since Oct 8 (owner approved tracking); RH_EXTRA_VENUES=0 turns it off.
+const RH_EXTRA_VENUES = process.env.RH_EXTRA_VENUES !== '0';
 import { ProfitBands } from './core/profitBands';
 import { SimBucketTally, classifySimOutcome } from './core/failReasons';
 import { makeRpc, simulateRoundTrip, simRpcUrl, Rpc, makeFallbackRpc, loadBalanceSlots, wssToHttps, replayRpc, ReplayCall } from './execution/simulator';
@@ -677,8 +678,8 @@ const ROBINHOOD_VENUES: Venue[] = [
       // (WETH stands in for ETH). Prices read through V4's StateView.
       { dex: 'uniswap-v4', kind: 'v4', factory: ROBINHOOD_V4.STATE_VIEW, poolManager: ROBINHOOD_V4.POOL_MANAGER, weth: ROBINHOOD_TOKENS.WETH },
       // EXTRA VENUES (config/robinhoodVenues.ts): Alandale, GIGA, SwapHood,
-      // UP, Topaz, Raphael, Fables. PRICE READING ONLY, and only with
-      // RH_EXTRA_VENUES=1 (default off: the live bot is unchanged). The trade
+      // UP, Topaz, Raphael, Fables. PRICE READING ONLY (on by default;
+      // RH_EXTRA_VENUES=0 turns it off). The trade
       // path refuses every one of them (isExecutableVenue), so they show up
       // as "partner on an exchange we can't trade yet" in the hourly report.
       ...(RH_EXTRA_VENUES ? extraWatcherVenues({ stateView: ROBINHOOD_V4.STATE_VIEW, poolManager: ROBINHOOD_V4.POOL_MANAGER, weth: ROBINHOOD_TOKENS.WETH }) : []),
