@@ -1,6 +1,7 @@
 import { readFileSync, writeFileSync, mkdirSync, renameSync } from 'fs';
 import { dirname } from 'path';
 import type { ScannedPool, ScanState } from './universeScan';
+import { readSideAmounts, v4StateCalls, decodeV4State, v4VirtualAmounts } from './v4Scan';
 
 // ============================================================================
 // TOKEN GROUPS -- coins that should be worth the same (loop measurement, step 1)
@@ -319,24 +320,39 @@ export async function buildTokenGroups(deps: {
       const metaRes = await deps.callMany(toks.map((t) => ({ target: t, data: SEL_DECIMALS })));
       toks.forEach((t, i) => { const d = big(metaRes[i]); if (d !== null && d <= 36n) decCache.set(t, Number(d)); });
     }
+    // Ordinary pools: 4 reads (both balances, price, Solidly stable flag).
+    // V4 pools: 2 StateView reads (price + liquidity); their "balances" are
+    // the virtual amounts at today's price (core/v4Scan.ts).
     const calls: { target: string; data: string }[] = [];
+    const at: number[] = [];
     for (const p of ps) {
+      at.push(calls.length);
+      if (p.v4) { calls.push(...v4StateCalls(p.v4.stateView, p.pool)); continue; }
       calls.push({ target: p.token0, data: SEL_BALANCE + pad(p.pool) }, { target: p.token1, data: SEL_BALANCE + pad(p.pool) });
       calls.push(p.kind === 'v3' ? { target: p.pool, data: SEL_SLOT0 } : { target: p.pool, data: SEL_RESERVES });
       calls.push(p.kind === 'solidly' ? { target: p.pool, data: SEL_STABLE } : { target: p.pool, data: SEL_RESERVES });
     }
     const res = ps.length ? await deps.callMany(calls) : [];
+    const sqrtPx = (sq: bigint | null, d0: number, d1: number) => { if (!sq || sq <= 0n) return null; const x = Number(sq) / 2 ** 96; return x * x * 10 ** (d0 - d1); };
     return ps.map((p, i) => {
-      const b0 = big(res[i * 4]), b1 = big(res[i * 4 + 1]);
+      const k = at[i];
       const d0 = decCache.get(p.token0.toLowerCase()), d1 = decCache.get(p.token1.toLowerCase());
-      if (b0 === null || b1 === null || d0 === undefined || d1 === undefined) return null;
-      if (p.kind === 'solidly' && big(res[i * 4 + 3]) === 1n) return null; // stable-curve pool: not a plain price
+      if (d0 === undefined || d1 === undefined) return null;
+      if (p.v4) {
+        const st = decodeV4State(res[k], res[k + 1]);
+        if (!st) return null;
+        const { a0, a1 } = v4VirtualAmounts(st.sqrtPriceX96, st.liquidity);
+        const px = sqrtPx(st.sqrtPriceX96, d0, d1);
+        if (!px || !Number.isFinite(px)) return null;
+        return { p, px, a0: Number(a0) / 10 ** d0, a1: Number(a1) / 10 ** d1 };
+      }
+      const b0 = big(res[k]), b1 = big(res[k + 1]);
+      if (b0 === null || b1 === null) return null;
+      if (p.kind === 'solidly' && big(res[k + 3]) === 1n) return null; // stable-curve pool: not a plain price
       let px: number | null = null; // token1 per token0
-      if (p.kind === 'v3') {
-        const sq = big(res[i * 4 + 2]);
-        if (sq && sq > 0n) { const x = Number(sq) / 2 ** 96; px = x * x * 10 ** (d0 - d1); }
-      } else {
-        const r0 = big(res[i * 4 + 2], 0), r1 = big(res[i * 4 + 2], 1);
+      if (p.kind === 'v3') px = sqrtPx(big(res[k + 2]), d0, d1);
+      else {
+        const r0 = big(res[k + 2], 0), r1 = big(res[k + 2], 1);
         if (r0 && r1) px = (Number(r1) / 10 ** d1) / (Number(r0) / 10 ** d0);
       }
       if (!px || !Number.isFinite(px)) return null;
@@ -367,9 +383,10 @@ export async function buildTokenGroups(deps: {
   const flush = async () => {
     if (!buf.length) return;
     const slice = buf; buf = [];
-    const res = await deps.callMany(slice.map((p) => ({ target: qOf(p), data: SEL_BALANCE + pad(p.pool) })));
+    // One read per pool (V4: two, from StateView; core/v4Scan.ts).
+    const res = await readSideAmounts(deps.callMany, slice.map((p) => ({ pool: p.pool, token0: p.token0, token: qOf(p), v4StateView: p.v4?.stateView })));
     slice.forEach((p, j) => {
-      const q = qOf(p), d = q === usdg ? dU : dW, bal = big(res[j]);
+      const q = qOf(p), d = q === usdg ? dU : dW, bal = res[j];
       if (bal === null || d === undefined) return;
       const upTo = 2 * (Number(bal) / 10 ** d) * quoteUsd(q); // most this pool could count as
       if (upTo >= minDepthUsd) { passed.push(p); return; }
