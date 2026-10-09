@@ -85,6 +85,6 @@ Recommend closing #75 once this is approved, or keeping its Reisa entry, which t
 
 1. **GIGA CL, SwapHood V3, SushiSwap V3** (callbacks we already have): run the executor on a fork against their pools (the Phase 3 fork test pattern) and confirm the simulation matches.
 2. **Slipstream copies (UP, Topaz, Raphael):** same, plus pool lookup by tick spacing in the executor's calldata.
-3. **Algebra (Alandale, KittenSwap):** add `algebraSwapCallback` to the contract. That's a contract change and a redeploy, so it needs owner approval.
+3. **Algebra (Alandale, KittenSwap):** `algebraSwapCallback` is now in the contract source (branch `algebra-support`, Oct 9) and both venues passed the fork test `contracts/test/ForkAlgebraVenues.t.sol` (WETH/USDG, both directions, CI run 37944712215), so they are PRACTICE-testable: the practice simulator runs the new contract code. The contract deployed on chain does NOT have this callback yet, so a real Algebra trade would need a redeploy (owner approval) on top of turning on real trading for these venues.
 4. **Fables:** predict the hook fee; V4 hook pools also need the hook address in the pool key the executor builds.
 5. **Metric, Tessera, BrownFi, Ekubo:** quote-call or custom adapters. Not worth it until the counters show money there.

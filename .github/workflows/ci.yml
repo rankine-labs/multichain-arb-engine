@@ -102,7 +102,7 @@ jobs:
           echo "::notice title=Copy venue fork results::${copy}"
           # Algebra exchanges (ForkAlgebraVenues.t.sol: Alandale, KittenSwap):
           # result, pools, pool code/fee check, gas, failures. Own note, short.
-          alg=$(grep -E "algebra_|ALGEBRA VENUE|(alandale|kittenswap-algebra)(: skipped| pool )|GAS (alandale|kittenswap-algebra)|algebra FAILED" fork-output.txt | head -60)
+          alg=$(grep -E "algebra_|ALGEBRA VENUE|(alandale|kittenswap-algebra)(: skipped| pool | (uniV3|algebra) then .*->)|GAS (alandale|kittenswap-algebra)|algebra FAILED" fork-output.txt | head -60)
           alg="${alg//'%'/'%25'}"
           alg="${alg//$'\n'/'%0A'}"
           echo "::notice title=Algebra venue fork results::${alg}"
