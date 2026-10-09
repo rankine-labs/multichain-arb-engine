@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       only:
-        description: 'Run one step only: feeds, sim, pairs, watch, universe, backtest, latency, lenders, smoke, seed, routers, v4, arbsys, nodes, multicall, simv1, ramsessim (blank = all except backtest)'
+        description: 'Run one step only: feeds, sim, pairs, watch, universe, backtest, latency, lenders, smoke, seed, routers, v4, arbsys, nodes, multicall, simv1, ramsessim, routes, venues (blank = all except backtest)'
         required: false
         default: ''
 
@@ -43,6 +43,21 @@ jobs:
           echo "$out"
           out="${out//'%'/'%25'}"; out="${out//$'\n'/'%0A'}"
           echo "::notice title=simulateV1 probe::${out}"
+      # Phase 6 research: rival wins by route length (2, 3, 4+ pools) and how
+      # they would fare under each way of paying (flash loan fee vs own
+      # money). The script writes its own annotations. Read-only.
+      - name: Routes and funding study (rival wins, read-only)
+        if: inputs.only == 'routes'
+        shell: bash
+        run: |
+          timeout 3300 node .scripts-build/scripts/probe-routes-funding.js || true
+      # Extra venues (Oct 8): identify factories, map pools to exchanges and
+      # check our pricing maths against real swaps. Writes its own annotations.
+      - name: Venue identification and swap-maths validation (read-only)
+        if: inputs.only == 'venues'
+        shell: bash
+        run: |
+          timeout 2700 node .scripts-build/scripts/probe-venues.js || true
       - name: Ramses route check on the live node (bot's own simulation + trace)
         if: inputs.only == 'ramsessim'
         shell: bash
@@ -126,6 +141,12 @@ jobs:
             echo "--- standing gaps found: $(grep -c '^\[gap\] standing gap' smoke.log) (first 8) ---"
             grep '^\[gap\]' smoke.log | head -8
             echo "--- rivals seen: $(grep -c '^\[rival\]' smoke.log) ---"
+            echo "--- extra venues: pools by exchange in the watch list ---"
+            grep -oE 'dex[=:" ]+(alandale|giga-cl|giga-classic|fables|up-cl|topaz-cl|raphael-cl|swaphood-v3|sushiswap-v3|kittenswap-algebra|goo-exchange)' smoke.log | sort | uniq -c | head -12
+            grep -E "exchange we can't trade yet|standing gap needs" smoke.log | head -4
+            echo "--- rival watch: $(grep -c '^\[rivalwatch\]' smoke.log) lines; oracle balances: $(grep -c 'real V3 balances read' smoke.log) ---"
+            grep -E '^\[oracle\]' smoke.log | head -2
+            grep -E '^\[scan\].*(alandale|giga|fables|up-cl)' smoke.log | head -4
             echo "--- errors / crashes ($(grep -ciE 'unhandled|error|fatal' smoke.log)) first 10 ---"
             grep -iE 'unhandled|error|fatal' smoke.log | grep -v 'TELEGRAM_BOT_TOKEN' | head -10
           } > summary.txt

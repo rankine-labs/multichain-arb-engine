@@ -95,6 +95,9 @@ async function deploy(wallet: ethers.Signer, name: string, args: unknown[]) {
   } else check(false, `flash-loan sim returned ${JSON.stringify(flash, (_, v) => typeof v === 'bigint' ? v.toString() : v)}`);
   const flashLose = await simulateRoundTrip(rpc, 'anvil', { token: U, amountIn, hops: [hop(D, U, W), hop(C, W, U)] }, { v3Lender: L });
   check(flashLose.status === 'loss', `flash-loan losing route -> loss (got ${flashLose.status})`);
+  // The flash check gives the contract NO pretend balance (like the live,
+  // empty contract): the losing trade fails repaying the loan.
+  check(flashLose.bucket === 'real_loss', `flash-loan losing route is bucketed as a real loss (got ${flashLose.bucket})`);
 
   // 4. Nothing was actually changed on chain.
   check((await usdc.balanceOf(C)) === 3_000_000n * E18, 'simulation changed no real state');

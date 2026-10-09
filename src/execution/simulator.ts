@@ -5,6 +5,7 @@ import { budgetForUrl } from '../core/nodeBudget';
 import { ethers } from 'ethers';
 import { ARB_EXECUTOR_RUNTIME_CODE, EXECUTOR_STORAGE_SLOT, FLASH_POOLS_STORAGE_SLOT, V4_POOL_MANAGER_STORAGE_SLOT, WETH_STORAGE_SLOT } from './arbExecutorBytecode';
 import { ExecutorHop, encodeExecuteRaw, encodeExecuteV3FlashRaw, KIND_V4 } from './executorCalldata';
+import { SimBucket, classifySimOutcome } from '../core/failReasons';
 
 // ============================================================================
 // FREE PRE-TRADE SIMULATION
@@ -26,11 +27,17 @@ import { ExecutorHop, encodeExecuteRaw, encodeExecuteV3FlashRaw, KIND_V4 } from 
 //   itself would have failed (and we report which error).
 //
 // Notes:
-//   - Simulates own-capital mode (no flash loan); the flash fee is a known,
-//     fixed cost the caller can subtract.
+//   - Own-capital mode by default. With opts.v3Lender it simulates the
+//     flash-loan version instead, and then the contract is given NO pretend
+//     balance at all (exactly like the live contract, which holds nothing):
+//     a winning trade must repay the loan + fee from its own proceeds, and a
+//     losing one fails at repayment. So a pretend balance can never hide a
+//     repayment problem (proved in contracts/test/FlashRepay.t.sol).
 //   - Runs against the chain's latest state, so call it shortly AFTER the
 //     big trade you're backrunning has landed.
-//   - Never throws: returns a status instead.
+//   - Never throws: returns a status instead. Every result also carries a
+//     `bucket` (see core/failReasons.ts SimBucket) saying whether it is a
+//     verdict on the trade or a problem with the check itself.
 // ============================================================================
 
 // Arbitrary empty addresses, only ever used inside eth_call overrides.
@@ -49,17 +56,29 @@ const errIface = new ethers.Interface([
   'error UnauthorizedCallback()',
   'error TransferFailed()',
   'error NotExecutor()',
+  'error FlashPoolNotAllowed(address pool)',
+  'error V4NotEnabled()',
+  'error UnexpectedEth()',
+  'error Reentrancy()',
   'error Error(string)',
   'error Panic(uint256)',
 ]);
 const BALANCE_OF = new ethers.Interface(['function balanceOf(address) view returns (uint256)']);
 
+// `bucket`: which of the outcome groups this is (core/failReasons.ts).
+// `detail` (loss only): what kind of loss, when known.
 export type SimResult =
-  | { status: 'profit'; profit: bigint }               // would make `profit` (start-token units, before gas)
-  | { status: 'loss' }                                  // would end with less than it started
-  | { status: 'fail'; reason: string }                  // trade itself would revert
-  | { status: 'rate_limited'; reason: string }          // RPC said "slow down" -- not a trade result
-  | { status: 'unsupported'; reason: string };          // couldn't simulate on this chain/token
+  | { status: 'profit'; profit: bigint; bucket?: SimBucket }   // would make `profit` (start-token units, before gas)
+  | { status: 'loss'; bucket?: SimBucket; detail?: string }    // would end with less than it started
+  | { status: 'fail'; reason: string; bucket?: SimBucket }     // trade itself would revert
+  | { status: 'rate_limited'; reason: string; bucket?: SimBucket } // RPC said "slow down" -- not a trade result
+  | { status: 'unsupported'; reason: string; bucket?: SimBucket }; // couldn't simulate on this chain/token
+
+// Adds the bucket to a result (one rulebook: classifySimOutcome).
+function tag<R extends SimResult>(r: R): R {
+  if (r.bucket) return r;
+  return { ...r, bucket: classifySimOutcome(r.status, 'reason' in r ? r.reason : '') };
+}
 
 // ----------------------------------------------------------------------------
 // Minimal JSON-RPC client: returns the RPC error instead of throwing on it,
@@ -114,13 +133,53 @@ export function makeFallbackRpc(primary: Rpc, fallback: Rpc, log: (msg: string) 
 const pad32 = (v: bigint | string): string =>
   ethers.zeroPadValue(typeof v === 'bigint' ? ethers.toBeHex(v) : v, 32);
 
-// Revert data can sit in error.data as a string or nested (provider-specific).
-function revertData(err: { data?: any } | undefined): string | null {
-  const d = err?.data;
-  if (typeof d === 'string' && d.startsWith('0x')) return d;
-  if (typeof d?.data === 'string' && d.data.startsWith('0x')) return d.data;
-  return null;
+// ----------------------------------------------------------------------------
+// Where nodes put revert data (the contract's "why it said no", as hex).
+// Every node software / provider has its own habit:
+//   error.data = "0x..."                         Geth / Nitro / QuickNode / Alchemy
+//   error.data = { data: "0x..." }               some proxies, Hardhat-style
+//   error.data = { originalError: { data } }     wrapped by middleware
+//   error.data = "Reverted 0x..."                Nethermind
+//   error.error.data = "0x..."                   doubly wrapped errors
+//   error.message = "execution reverted: 0x..."  data only in the message text
+// We look through all of them. Hex found only in the message text is used
+// only if it has the exact shape of revert data (4-byte code + whole 32-byte
+// words), so an address or hash mentioned in a message is never mistaken for it.
+// ----------------------------------------------------------------------------
+const HEX_RE = /0x[0-9a-fA-F]*/;
+const isRevertShape = (h: string) => /^0x[0-9a-fA-F]{8}([0-9a-fA-F]{64})*$/.test(h);
+
+export function extractRevertData(err: unknown): string | null {
+  const seen = new Set<unknown>();
+  const fromValue = (v: unknown, depth: number): string | null => {
+    if (v === null || v === undefined || depth > 4 || seen.has(v)) return null;
+    if (typeof v === 'string') {
+      const s = v.trim();
+      if (/^0x[0-9a-fA-F]*$/.test(s)) return s;                        // plain hex (may be "0x")
+      const m = /^Reverted\s+(0x[0-9a-fA-F]*)$/i.exec(s);              // Nethermind
+      return m ? m[1] : null;
+    }
+    if (typeof v !== 'object') return null;
+    seen.add(v);
+    const o = v as Record<string, unknown>;
+    for (const k of ['data', 'originalError', 'error', 'result', 'return', 'revert']) {
+      const found = fromValue(o[k], depth + 1);
+      if (found !== null) return found;
+    }
+    return null;
+  };
+  const direct = fromValue((err as any)?.data, 0) ?? fromValue((err as any)?.error, 0);
+  if (direct !== null && direct !== '0x') return direct;
+  // Last resort: revert-shaped hex inside the message text.
+  const msg = String((err as any)?.message ?? '');
+  for (const piece of msg.split(/[\s,:;()"'\[\]{}]+/)) {
+    const h = HEX_RE.exec(piece)?.[0];
+    if (h && h === piece && isRevertShape(h)) return h;
+  }
+  return direct; // "0x" (explicitly empty) or null (nothing at all)
 }
+
+const revertData = (err: { data?: any } | undefined): string | null => extractRevertData(err);
 
 // ----------------------------------------------------------------------------
 // REPLAY: test our trade at the exact moment it would land.
@@ -186,8 +245,9 @@ export function replayRpc(base: Rpc, parentBlock: string, prefix: ReplayCall[], 
 // Does this RPC error mean "you're sending too many requests"?
 export function isRateLimited(err: { code?: number; message?: string } | undefined): boolean {
   const m = (err?.message ?? '').toLowerCase();
-  return err?.code === 429 || err?.code === -32005 || m.includes('rate limit') || m.includes('too many requests')
-    || m.includes('exceeded') || m.includes('quota');
+  // -32007 / "request limit reached": QuickNode's per-second limit wording.
+  return err?.code === 429 || err?.code === -32005 || err?.code === -32007 || m.includes('rate limit') || m.includes('too many requests')
+    || m.includes('exceeded') || m.includes('quota') || m.includes('limit reached');
 }
 
 // Does this RPC error mean "state overrides aren't supported here"?
@@ -339,18 +399,35 @@ export async function simulateRoundTrip(
   // land), not ~30 blocks later after rival bots already closed the gap.
   opts: { v3Lender?: string; weth?: string; blockTag?: string } = {},
 ): Promise<SimResult> {
-  let slot: SlotInfo;
-  try {
-    slot = await findBalanceSlot(rpc, `${chain}:${trade.token.toLowerCase()}`, trade.token);
-  } catch (err) {
-    if (err instanceof RateLimited) return { status: 'rate_limited', reason: err.message };
-    throw err;
+  return tag(await simulateInner(rpc, chain, trade, opts));
+}
+
+async function simulateInner(
+  rpc: Rpc,
+  chain: string,
+  trade: { token: string; amountIn: bigint; hops: ExecutorHop[] },
+  opts: { v3Lender?: string; weth?: string; blockTag?: string },
+): Promise<SimResult> {
+  const flash = !!opts.v3Lender;
+
+  // Own capital: the contract must hold amountIn of the start token, so we
+  // need the token's balance storage location (looked up once per token).
+  // Flash loan: the contract holds NOTHING, exactly like the live one, so no
+  // lookup and no pretend balance (saves requests, and can't hide a failed
+  // repayment: see the header).
+  let balanceKey: string | null = null;
+  if (!flash) {
+    let slot: SlotInfo;
+    try {
+      slot = await findBalanceSlot(rpc, `${chain}:${trade.token.toLowerCase()}`, trade.token);
+    } catch (err) {
+      if (err instanceof RateLimited) return { status: 'rate_limited', reason: err.message };
+      throw err;
+    }
+    if ('unsupported' in (slot ?? {})) return { status: 'unsupported', reason: (slot as { unsupported: string }).unsupported };
+    if (slot === null) return { status: 'unsupported', reason: 'could not find token balance storage' };
+    balanceKey = 'key' in slot! ? slot.key(SIM_EXECUTOR_ADDRESS) : null;
   }
-  if ('unsupported' in (slot ?? {})) return { status: 'unsupported', reason: (slot as { unsupported: string }).unsupported };
-  // Own capital needs the balance override. Flash mode can run without it
-  // (it just can't tell "small loss" from "can't repay"; both are a loss).
-  if (slot === null && !opts.v3Lender) return { status: 'unsupported', reason: 'could not find token balance storage' };
-  const balanceKey = slot && 'key' in slot ? slot.key(SIM_EXECUTOR_ADDRESS) : null;
 
   const tradeArgs = {
     token: trade.token,
@@ -359,14 +436,12 @@ export async function simulateRoundTrip(
     maxBlock: MAX_UINT,
     hops: trade.hops,
   };
-  const data = opts.v3Lender ? encodeExecuteV3FlashRaw(tradeArgs, opts.v3Lender) : encodeExecuteRaw(tradeArgs);
+  const data = flash ? encodeExecuteV3FlashRaw(tradeArgs, opts.v3Lender!) : encodeExecuteRaw(tradeArgs);
 
   // Pretend-state for this one call:
   //  - our contract code at SIM_EXECUTOR_ADDRESS, with SIM_CALLER as executor
-  //  - flash mode: the lender is on the allowlist
-  //  - a token balance of amountIn: the trade capital in own-capital mode;
-  //    in flash mode a float so a losing trade can still repay and reach the
-  //    profit check (profit is measured against it, so the result is exact)
+  //  - flash mode: the lender is on the allowlist (and NO token balance)
+  //  - own-capital mode: a token balance of amountIn (the trade capital)
   const executorDiff: Record<string, string> = { [pad32(ethers.toBeHex(EXECUTOR_STORAGE_SLOT))]: pad32(SIM_CALLER) };
   // Uniswap V4 hops: switch V4 on in the simulated contract (the real one
   // needs the owner's setV4 call), pointing at that PoolManager and WETH.
@@ -376,7 +451,7 @@ export async function simulateRoundTrip(
     executorDiff[pad32(ethers.toBeHex(V4_POOL_MANAGER_STORAGE_SLOT))] = pad32(v4Hop.pool);
     executorDiff[pad32(ethers.toBeHex(WETH_STORAGE_SLOT))] = pad32(opts.weth);
   }
-  if (opts.v3Lender) {
+  if (flash) {
     const allowKey = ethers.keccak256(abi.encode(['address', 'uint256'], [opts.v3Lender, FLASH_POOLS_STORAGE_SLOT]));
     executorDiff[allowKey] = pad32(1n);
   }
@@ -391,27 +466,52 @@ export async function simulateRoundTrip(
     overrides,
   ]);
 
-  if (!r.error) return { status: 'fail', reason: 'call unexpectedly succeeded' };
+  if (!r.error) return { status: 'fail', reason: 'call unexpectedly succeeded', bucket: 'contract_revert' };
+
+  // Readable revert data from our contract wins over any guess based on the
+  // error MESSAGE (a message can contain words like "exceeded" that look like
+  // a rate limit, but real revert data is the contract's own answer).
+  const rd = revertData(r.error);
+  const parsed = parseRevert(rd);
+  if (parsed) return verdictFrom(parsed, flash);
+
   if (isRateLimited(r.error)) return { status: 'rate_limited', reason: r.error.message ?? 'rate limited' };
   if ((r.error.message ?? '').startsWith('network:')) return { status: 'rate_limited', reason: r.error.message! };
-  if (overridesUnsupported(r.error)) return { status: 'unsupported', reason: r.error.message ?? 'overrides unsupported' };
+  if (overridesUnsupported(r.error)) return { status: 'unsupported', reason: r.error.message ?? 'overrides unsupported', bucket: 'override_unsupported' };
 
-  const rd = revertData(r.error);
-  if (!rd || rd === '0x') return { status: 'fail', reason: r.error.message ?? 'reverted without data' };
+  if (!rd || rd === '0x') {
+    // Replay marker / no data at all. Reason text kept as before (callers
+    // match on it); the bucket says which it is.
+    // Some nodes give the reason only as text ("execution reverted: STF"),
+    // so the text is still sorted (classifySimOutcome); a bare "execution
+    // reverted" is missing_revert_data.
+    const reason = r.error.message ?? 'reverted without data';
+    return { status: 'fail', reason };
+  }
+  return { status: 'fail', reason: `revert ${rd.slice(0, 10)}`, bucket: 'contract_revert' };
+}
 
-  try {
-    const parsed = errIface.parseError(rd);
-    if (parsed?.name === 'InsufficientProfit') {
-      const got = parsed.args[0] as bigint;
-      return got > 0n ? { status: 'profit', profit: got } : { status: 'loss' };
-    }
-    // Flash mode with no float: couldn't repay the loan = the trade lost money.
-    // Flash mode: TransferFailed = the loan couldn't be repaid. That's a losing
-    // trade, e.g. the sell pool was nearly empty at this price and filled
-    // almost nothing (Oct 7: Ramses 0x0287 paid $0.000003 for 0.117 ETH).
-    if (parsed?.name === 'TransferFailed' && opts.v3Lender) return { status: 'loss' };
-    if (parsed?.name === 'Error') return { status: 'fail', reason: String(parsed.args[0]) };
-    if (parsed) return { status: 'fail', reason: `${parsed.name}(${parsed.args.join(', ')})` };
-  } catch { /* unknown error shape */ }
-  return { status: 'fail', reason: `revert ${rd.slice(0, 10)}` };
+// Revert data -> decoded error, or null if there is none / it isn't one we know.
+function parseRevert(rd: string | null): ethers.ErrorDescription | null {
+  if (!rd || rd === '0x') return null;
+  try { return errIface.parseError(rd); } catch { return null; }
+}
+
+// What a decoded revert means for the trade.
+function verdictFrom(parsed: ethers.ErrorDescription, flash: boolean): SimResult {
+  if (parsed.name === 'InsufficientProfit') {
+    const got = parsed.args[0] as bigint;
+    return got > 0n
+      ? { status: 'profit', profit: got, bucket: 'profit' }
+      : { status: 'loss', bucket: 'real_loss', detail: 'ends with no more than it started' };
+  }
+  // Flash mode: TransferFailed = the loan couldn't be repaid from the trade's
+  // proceeds, i.e. the trade lost money (e.g. Oct 7: the sell pool was nearly
+  // empty at that price and paid $0.000003 for 0.117 ETH). Very rarely it is
+  // a token refusing to move mid-route instead; both mean "don't trade this".
+  if (parsed.name === 'TransferFailed' && flash) {
+    return { status: 'loss', bucket: 'real_loss', detail: 'flash loan could not be repaid (trade lost money, or a token refused to move)' };
+  }
+  const reason = parsed.name === 'Error' ? String(parsed.args[0]) : `${parsed.name}(${parsed.args.join(', ')})`;
+  return { status: 'fail', reason };
 }

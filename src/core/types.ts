@@ -46,6 +46,10 @@ export interface PoolState {
   sqrtPriceX96?: bigint;  // v3-style
   liquidity?: bigint;     // v3-style
   feeBps: number;
+  // Exact pool fee in pips (1,000,000 = 100%, 3000 = 0.30%), when known.
+  // Optional: V3 fees like 250 pips (0.025%) don't fit whole-number feeBps.
+  // The swap maths (core/dexMath.ts feePipsOf) prefers this over feeBps.
+  feePips?: number;
   lastUpdatedBlock: number;
   lastUpdatedMs: number;
   // Uniswap V4 pools only. poolAddress is then the 32-byte pool id (V4
@@ -57,7 +61,12 @@ export interface PoolState {
     native: boolean;      // the pool holds native ETH where we use WETH
     poolManager: string;  // where trades go
     stateView: string;    // where prices are read
+    hooks?: string;       // hooked pools (e.g. Fables): the hook contract; fee then changes per swap
   };
+  // How to read this pool's price (default: the Uniswap V3 slot0()).
+  // 'algebra': Algebra Integral copies (Alandale) keep it in globalState(),
+  // with a dynamic fee in globalState word 2.
+  variant?: 'algebra';
 }
 
 export interface ArbOpportunity {

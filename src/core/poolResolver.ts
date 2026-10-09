@@ -268,7 +268,7 @@ export async function resolveAndFetchV3Pool(
                             tokenB: token1,
                             sqrtPriceX96: slot0[0] as bigint,
                             liquidity: liquidity as bigint,
-                            feeBps: Math.round(fee / 100),
+                            feeBps: Math.round(fee / 100), feePips: Number(fee),
                             lastUpdatedBlock: 0,
                             lastUpdatedMs: Date.now(),
                 };
@@ -334,7 +334,7 @@ export async function resolveAllV3Pools(
           tokenA: token0, tokenB: token1,
           sqrtPriceX96: slot0[0] as bigint,
           liquidity: liquidity as bigint,
-          feeBps: Math.round(Number(fee) / 100),
+          feeBps: Math.round(Number(fee) / 100), feePips: Number(fee),
           lastUpdatedBlock: 0,
           lastUpdatedMs: Date.now(),
         };
@@ -542,7 +542,7 @@ export async function resolveAllV4Pools(
           tokenA: v.native ? weth : v.c0, // currency0 side (WETH stands in for native ETH)
           tokenB: v.c1,
           sqrtPriceX96: slot0[0] as bigint, liquidity,
-          feeBps: Math.round(fee / 100),
+          feeBps: Math.round(fee / 100), feePips: Number(fee),
           lastUpdatedBlock: 0, lastUpdatedMs: Date.now(),
           v4: { fee, tickSpacing, native: v.native, poolManager: ethers.getAddress(poolManager.toLowerCase()), stateView: ethers.getAddress(stateViewAddress.toLowerCase()) },
         });
@@ -599,7 +599,7 @@ export async function resolveAndFetchV4Pool(
                                                   tokenB: currency1,
                                                   sqrtPriceX96: slot0[0] as bigint,
                                                   liquidity,
-                                                  feeBps: Math.round(fee / 100),
+                                                  feeBps: Math.round(fee / 100), feePips: Number(fee),
                                                   lastUpdatedBlock: 0,
                                                   lastUpdatedMs: Date.now(),
                                     };

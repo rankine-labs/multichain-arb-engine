@@ -86,6 +86,13 @@ import { FailTally } from './core/failReasons';
 import { LenderBalances } from './core/lenderBalances';
 import { RouteScores, WinSizes, WIN_BARS } from './core/routeScore';
 import { RivalWatch } from './core/rivalWatch';
+import { V3BalanceBook } from './core/v3BalanceBook';
+import { extraWatcherVenues, extraScanFactories, isExecutableVenue } from './config/robinhoodVenues';
+// Read prices on the extra Robinhood venues (watch only; never traded).
+// ON by default since Oct 8 (owner approved tracking); RH_EXTRA_VENUES=0 turns it off.
+const RH_EXTRA_VENUES = process.env.RH_EXTRA_VENUES !== '0';
+import { ProfitBands } from './core/profitBands';
+import { SimBucketTally, classifySimOutcome } from './core/failReasons';
 import { makeRpc, simulateRoundTrip, simRpcUrl, Rpc, makeFallbackRpc, loadBalanceSlots, wssToHttps, replayRpc, ReplayCall } from './execution/simulator';
 import { FastSender, SafetyGate, safetyConfigFromEnv } from './execution/fastSender';
 import { checkLiveReady } from './execution/liveReadiness';
@@ -100,6 +107,8 @@ import { makeCaller } from './core/universeScan';
 import { loadNodeUsage, saveNodeUsage, nodeUsageToday, NodeBudget, budgetForUrl, callsInBody } from './core/nodeBudget';
 import { endpointLabel } from './core/endpointLabel';
 import { ROBINHOOD_SEED_PAIRS } from './config/robinhoodSeedPairs';
+import { ResearchLane, researchConfigFromEnv, planShallowCandidate, findResearchGaps, gapCandidate, ResearchCandidate } from './core/researchLane';
+import { poolDepthUsd } from './core/poolPrice';
 
 async function main() {
 const cache = new PoolCache();
@@ -418,6 +427,14 @@ const simOff = (chain: string): string | undefined => {
 };
 // Reported in the hourly digest, then reset.
 const simStats = { checked: 0, profit: 0, loss: 0, fail: 0, rateLimited: 0 };
+// Phase 8 (Oct 8): profitable checks by $ band (after our gas) and every
+// check result by category, for the hourly report. Robinhood only.
+const profitBands = new ProfitBands();
+const simBuckets = new SimBucketTally();
+const torontoDay = () => new Date().toLocaleDateString('en-CA', { timeZone: 'America/Toronto' });
+// Our executor's gas per trade, measured on a Robinhood fork (Phase 3):
+// ~311k-359k own money, ~453k-501k with a flash loan. Midpoints used.
+const OUR_GAS_OWN = 335_000n, OUR_GAS_FLASH = 477_000n;
 // Robinhood "funnel" for the hourly report: how many trades made it through
 // each step, and why price differences weren't checked. Reset every hour.
 const funnel = {
@@ -593,6 +610,7 @@ const queueSimulation = (
                   // Pool addresses (shortened) so a failing pool can be identified.
                   const route = `${buyPool.dex}@${String(buyPool.poolAddress).slice(0, 10)}->${sellPool.dex}@${String(sellPool.poolAddress).slice(0, 10)}`;
                   const model = `model gross $${modelGrossUsd.toFixed(2)} on $${tradeSizeUsd.toFixed(0)}${timing ? ` | ${timing}` : ''} | ${funding}`;
+                  if (chain === 'robinhood') simBuckets.add((r as any).bucket ?? classifySimOutcome(r.status, 'reason' in r ? (r as any).reason : ''));
                   if (r.status === 'rate_limited') {
                         // Not a trade result: pause, don't count it.
                         simPausedUntil[chain] = Date.now() + SIM_RATE_LIMIT_PAUSE_MS;
@@ -627,7 +645,7 @@ const queueSimulation = (
                         if (chain === 'robinhood' && net >= MIN_COUNTED_USD && vetted) {
                               dryRunPnl.recordVerified(net, `${symbolOf(chain, tokenIn)} ${buyPool.dex}->${sellPool.dex}`);
                         }
-                        if (chain === 'robinhood') { routeScores.record(routeKey, net); if (vetted) winSizes.add(net); }
+                        if (chain === 'robinhood') { routeScores.record(routeKey, net); if (vetted) winSizes.add(net); profitBands.add(net, torontoDay()); }
                   } else if (r.status === 'loss') {
                         simStats.loss++;
                         if (chain === 'robinhood') routeScores.record(routeKey, 0);
@@ -659,6 +677,12 @@ const ROBINHOOD_VENUES: Venue[] = [
       // Uniswap V4: hookless standard pools only, including native-ETH pools
       // (WETH stands in for ETH). Prices read through V4's StateView.
       { dex: 'uniswap-v4', kind: 'v4', factory: ROBINHOOD_V4.STATE_VIEW, poolManager: ROBINHOOD_V4.POOL_MANAGER, weth: ROBINHOOD_TOKENS.WETH },
+      // EXTRA VENUES (config/robinhoodVenues.ts): Alandale, GIGA, SwapHood,
+      // UP, Topaz, Raphael, Fables. PRICE READING ONLY (on by default;
+      // RH_EXTRA_VENUES=0 turns it off). The trade
+      // path refuses every one of them (isExecutableVenue), so they show up
+      // as "partner on an exchange we can't trade yet" in the hourly report.
+      ...(RH_EXTRA_VENUES ? extraWatcherVenues({ stateView: ROBINHOOD_V4.STATE_VIEW, poolManager: ROBINHOOD_V4.POOL_MANAGER, weth: ROBINHOOD_TOKENS.WETH }) : []),
 ];
 // Short venue name for reports: exchange plus fee level for V3/V4 pools, so
 // two pools on the same exchange are told apart ("uniswap-v4 0.05% ETH").
@@ -755,6 +779,7 @@ for (const sig of ['SIGINT', 'SIGTERM'] as const) {
             try { routeScores.save(ROUTE_FILE); } catch { /* best effort */ }
             try { rivalWatch.save(RIVAL_BOTS_FILE, RIVAL_TRADES_FILE); } catch { /* best effort */ }
             try { saveNodeUsage(); } catch { /* best effort */ }
+            try { if (research.enabled) research.save(RESEARCH_FILE); } catch { /* best effort */ }
             console.log(`[shutdown] ${sig}: state saved, exiting`);
             process.exit(0);
       });
@@ -795,16 +820,24 @@ const rivalWatch = new RivalWatch(
       (pool) => !!cache.get('robinhood', pool),
       ROBINHOOD_TOKENS.WETH,
       Date.now, 3_000,
-      // Money in the pool each coin's price comes from: trades in coins
-      // priced from a pool under $5k are left out of the rival money totals.
-      (token) => priceOracle.getUsdPriceInfo('robinhood', token)?.depthUsd ?? null,
+      {
+            // Money in the pool each coin's price comes from: trades in coins
+            // priced from a pool under $5k are left out of the rival money totals.
+            priceDepthUsd: (token) => priceOracle.getUsdPriceInfo('robinhood', token)?.depthUsd ?? null,
+            // V4 pools we know: does the pool hold plain ETH? (its ETH leg has
+            // no log, so such trades are marked "uncertain"). Unknown -> null.
+            v4IsNative: (id) => { const p = cache.get('robinhood', id); return p?.v4 ? p.v4.native : null; },
+            v4PoolManager: ROBINHOOD_V4.POOL_MANAGER,
+      },
 );
 {
       const n = rivalWatch.load(RIVAL_BOTS_FILE, RIVAL_TRADES_FILE);
       // Seed: arbitrage contracts found on chain by the funding probe (Oct 7).
       for (const b of ['0x8876789976decbfcbbbe364623c63652db8c0904', '0x1e7f0968bf0ad273d4edc75debc8bae037b0ad2c', '0x6e2a35a7ad683cf634d91492d73bb7ff774c6919',
             '0x5399d94d2cab7c252a6034042e1917a0e5e17a18', '0x203bffa697bee74d39d255c1c028e3efa689b5f7', '0x6c49cc864b3f8f6bef6559ef4f1662c408b84154',
-            '0x6aa80dbbed9ae5ab45fbf61f9644fada3b29326e', '0x7ddbd3952d9fd58cc7d344ad0931d08db072114a']) rivalWatch.addBot(b);
+            '0x6aa80dbbed9ae5ab45fbf61f9644fada3b29326e', '0x7ddbd3952d9fd58cc7d344ad0931d08db072114a']) rivalWatch.addBot(b, 'seed');
+      // Seeds are UNPROVEN until each earns 3 confirmed closed-loop wins in
+      // front of us; reports show verified vs unproven (rivalWatch.botStatus()).
       console.log(`[rivalwatch] following ${rivalWatch.botCount()} rival bots, ${n.recs} trades restored`);
 }
 // Sampler: one recent block every 15 s, to find rival bots we don't know yet.
@@ -819,7 +852,7 @@ let rivalResultsSeen = 0;
 setInterval(() => {
       for (; rivalResultsSeen < rivals.results.length; rivalResultsSeen++) {
             const r = rivals.results[rivalResultsSeen];
-            if (r.found && r.bot) rivalWatch.addBot(r.bot);
+            if (r.found && r.bot) rivalWatch.addBot(r.bot, 'tracker');
       }
 }, 60_000);
 setInterval(() => rivalWatch.save(RIVAL_BOTS_FILE, RIVAL_TRADES_FILE), 10 * 60_000);
@@ -887,6 +920,68 @@ const pickLender = (
       return pickV3Lender(lenderCandidates(chain), tokenIn, exclude, (pool, token) => lenderBalances.canLend(pool, token, amount, LENDER_HEADROOM));
 };
 
+// RESEARCH LANE (core/researchLane.ts). Off unless RESEARCH_LANE=1.
+// Tests a small random sample of what the scanner below THROWS AWAY (under
+// the $0.50 check bar, partner pool under $25k, coin not vetted, standing gap
+// under $20) on the same checking node, within its own small allowance
+// (RESEARCH_RPC_PER_MIN, default 6 a minute). Test only: never trades, never
+// vets a coin, never changes any bar. It waits while the main checker is
+// busy or paused, and stops when the checking node's daily allowance is
+// mostly used. Results: [research] log lines, an hourly Telegram note and
+// data/research-lane.json.
+const RESEARCH_FILE = 'data/research-lane.json';
+const researchNode = budgetForUrl(wssToHttps(process.env.QUICKNODE_RPC_ROBINHOOD) || process.env.QUICKNODE_RPC_ROBINHOOD || simRpcUrl('robinhood').url);
+const research = new ResearchLane(researchConfigFromEnv(), {
+      rpc: simRpc.robinhood,
+      decimalsOf: (t) => TOKEN_DECIMALS.robinhood?.[t.toLowerCase()],
+      symbolOf: (t) => symbolOf('robinhood', t),
+      pickLender: (t, buy, sell, size, usd) => pickLender('robinhood', t, buy, sell, size, usd),
+      gasUsd: () => rhGasUsd(0.05),
+      weth: ROBINHOOD_TOKENS.WETH,
+      canRun: () => !simBusy.robinhood && !simOff('robinhood') && Date.now() >= (simPausedUntil.robinhood ?? 0)
+            && (!researchNode || researchNode.share() < research.config.maxNodeShare),
+});
+const usdRhResearch = (t: string) => priceOracle.getUsdPrice('robinhood', t);
+const isDeepRh = (p: PoolState) => deepEnough(p, decimalsOf, usdRhResearch);
+// Trigger trade with no $25k+ partner: plan it against the thinner partners (later, off the hot path).
+const researchShallow = (victim: PoolState, swap: { tokenIn: string; tokenOut: string; amountIn: bigint; stateType: any }, hash?: string) =>
+      planShallowCandidate({
+            cache, victim, swap, usdPerToken: usdRhResearch(swap.tokenIn), tokenInDecimals: TOKEN_DECIMALS.robinhood?.[swap.tokenIn.toLowerCase()],
+            isDeep: isDeepRh, depthUsd: (p) => poolDepthUsd(p, decimalsOf, usdRhResearch), minDepthUsd: research.config.minDepthUsd,
+            gasUsd: rhGasUsd(2), vetted: safetyGate.isAllowed(swap.tokenIn) && safetyGate.isAllowed(swap.tokenOut), triggerHash: hash,
+      });
+if (research.enabled) {
+      const restored = research.load(RESEARCH_FILE);
+      const c = research.config;
+      console.log(`[research] lane ON (test only, never trades): sampling ${c.samplePct}% of rejects, ${c.rpcPerMin} node requests/min${restored ? `, ${restored} past samples restored` : ''}`);
+      setInterval(() => { void research.tick(); }, 2_000);
+      setInterval(() => research.save(RESEARCH_FILE), 10 * 60_000);
+      // Standing gaps the main scanner ignores: prices already in memory only, no node requests.
+      setInterval(() => {
+            try {
+                  const pairs = robinhoodWatcher.watchedPairPools().map((addrs) => addrs.map((a) => cache.get('robinhood', a)).filter((p): p is PoolState => !!p && isExecutableVenue(p.dex)));
+                  const gaps = findResearchGaps(pairs, isDeepRh, (p) => poolDepthUsd(p, decimalsOf, usdRhResearch), (t) => TOKEN_DECIMALS.robinhood?.[t.toLowerCase()], usdRhResearch,
+                        { mainMinUsd: Number(process.env.GAP_MIN_USD ?? 20), researchMinUsd: c.gapMinUsd, minDepthUsd: c.minDepthUsd, gasUsd: rhGasUsd(0.05), maxTradeUsd: Number(process.env.MAX_TRADE_USD ?? 5_000) });
+                  for (const { reason, gap } of gaps) {
+                        const vetted = safetyGate.isAllowed(gap.base) && safetyGate.isAllowed(gap.quote);
+                        // A standing gap sits there for minutes: one test per 30 min is enough.
+                        research.offer(reason, `${gap.buyPool.poolAddress}>${gap.sellPool.poolAddress}`, () => gapCandidate(reason, gap, vetted), 30 * 60_000);
+                  }
+            } catch (err) { console.warn('[research] gap look failed (ignored):', (err as Error).message); }
+      }, 60_000);
+      // Hourly: the lane's summary goes into the main hourly report (Phase 8);
+      // see researchHourText() used by the hourly digest.
+}
+
+// Research lane hour summary for the hourly report (also one log line).
+// undefined when the lane is off or RESEARCH_TELEGRAM=0.
+function researchHourText(): string | undefined {
+      if (!research.enabled) return undefined;
+      const text = research.takeHour();
+      console.log(`[research] hour: ${text.replace(/<[^>]+>/g, '').replace(/\n/g, ' | ')}`);
+      return process.env.RESEARCH_TELEGRAM === '0' ? undefined : text;
+}
+
 // ONE path from "this is worth doing" to a signed trade, used by both the
 // trade-triggered engine and the standing-gap scanner:
 //   build the exact contract call -> safety gate -> sign (send only if live).
@@ -897,6 +992,12 @@ const fireTrade = async (o: {
       seenAtMs: number; source: 'trade' | 'gap';
 }) => {
       try {
+            // Hard stop: never build a trade on an exchange that isn't cleared
+            // for trading (config/robinhoodVenues.ts executionEnabled: false).
+            if (!isExecutableVenue(o.buyPool?.dex ?? '') || !isExecutableVenue(o.sellPool?.dex ?? '')) {
+                  console.log(`[exec-dryrun] ${o.chain} NOT executable: exchange not cleared for trading (${o.buyPool?.dex} / ${o.sellPool?.dex})`);
+                  return;
+            }
             const dry = buildExecuteCall({
                   chain: o.chain, tokenIn: o.tokenIn, buyPool: o.buyPool, sellPool: o.sellPool,
                   tradeSizeUsd: o.tradeSizeUsd, netProfitUsd: o.netProfitUsd, usdPerTokenIn: o.usdPerTokenIn,
@@ -1040,7 +1141,7 @@ if (chainOn('avalanche')) chainManager.register(new AvalancheAdapter());
 chainManager.onEvent(async (event: RawChainEvent) => {
 const t0 = Date.now();
 // Timestamp every Robinhood feed tx: lets the competitor tracker time rivals.
-if (event.chain === 'robinhood') { rivals.noteFeedTx((event.raw as any)?.hash, event.receivedAtMs); rivalWatch.noteTx((event.raw as any)?.to, (event.raw as any)?.hash); }
+if (event.chain === 'robinhood') { rivals.noteFeedTx((event.raw as any)?.hash, event.receivedAtMs); rivalWatch.noteTx((event.raw as any)?.to, (event.raw as any)?.hash, (event.raw as any)?.from, (event.raw as any)?.value); }
 
 const swap = await decoder.decode(event);
 if (!swap) return;
@@ -1162,9 +1263,21 @@ if (registerIfApproved('avalanche', entry.dex, resolved)) pool = resolved;
     // partner pool now, in parallel (cached prices can be up to 30s old).
     // Partner pools must hold real money near their price ($1,000+); a
     // near-empty pool can show any price and would only waste a simulation.
-    const cachedPeers = cache.findPeerPools(swap.chain, swap.tokenIn, swap.tokenOut, pool.poolAddress)
+    const deepPeers = cache.findPeerPools(swap.chain, swap.tokenIn, swap.tokenOut, pool.poolAddress)
           .filter((p) => deepEnough(p, decimalsOf, (t) => priceOracle.getUsdPrice(swap.chain, t)));
-    if (cachedPeers.length === 0) { if (swap.chain === 'robinhood') funnel.noPartner++; return; }
+    // Partners on exchanges our contract can't trade yet (extra venues) are
+    // only counted, never planned or tested: "missed: unsupported exchange".
+    const cachedPeers = deepPeers.filter((p) => isExecutableVenue(p.dex));
+    if (swap.chain === 'robinhood' && deepPeers.length > cachedPeers.length) funnelSkip(`partner on an exchange we can't trade yet (${[...new Set(deepPeers.filter((p) => !isExecutableVenue(p.dex)).map((p) => p.dex))].join(', ')})`);
+    if (cachedPeers.length === 0) {
+          if (swap.chain === 'robinhood') {
+                funnel.noPartner++;
+                // Research lane (off unless RESEARCH_LANE=1): maybe sample it; planned later, off this path.
+                const victim = pool, hash = (event.raw as any)?.hash;
+                if (research.enabled) research.offer('shallow_pool', victim.poolAddress, () => researchShallow(victim, swap, hash));
+          }
+          return;
+    }
     // Fast path: use our own up-to-date copy when it's recent (kept current by
     // instant price tracking + the 5s re-sync); only ask the RPC when stale.
     const [freshPool, ...peers] = swap.chain === 'robinhood'
@@ -1270,6 +1383,15 @@ if (swap.chain === 'robinhood') {
       if (sizing.grossProfitUsd < SIM_MIN_GROSS_USD) funnel.belowCheckBar++;
       else if (!simVetted) funnel.notVetted++;
       else funnel.sentToCheck++;
+      // Research lane (off unless RESEARCH_LANE=1): maybe sample what the check bar or the vetted list threw away.
+      if (research.enabled && (sizing.grossProfitUsd < SIM_MIN_GROSS_USD || !simVetted)) {
+            const rc: ResearchCandidate = {
+                  reason: sizing.grossProfitUsd < SIM_MIN_GROSS_USD ? 'below_sim_bar' : 'unvetted_token', source: 'trigger',
+                  tokenIn: swap.tokenIn, buyPool: buyPoolUsed, sellPool: sellPoolUsed, sizeUsd: sizing.optimalTradeSizeUsd,
+                  modelGrossUsd: sizing.grossProfitUsd, usdPerToken, vetted: simVetted, triggerHash: (event.raw as any)?.hash,
+            };
+            research.offer(rc.reason, `${buyPoolUsed.poolAddress}>${sellPoolUsed.poolAddress}`, () => rc);
+      }
 }
 if (sizing.grossProfitUsd >= SIM_MIN_GROSS_USD && simVetted) {
       queueSimulation(swap.chain, swap.tokenIn, buyPoolUsed, sellPoolUsed, sizing.optimalTradeSizeUsd, sizing.grossProfitUsd, usdPerToken, (event.raw as any)?.hash);
@@ -1463,6 +1585,20 @@ await chainManager.startAll();
                   const pairs = robinhoodWatcher.watchedPairPools()
                         .map((addrs) => addrs.map((a) => cache.get('robinhood', a))
                               .filter((p): p is PoolState => !!p && deepEnough(p, decimalsOf, usdRh)));
+                  // Gaps that need an extra venue (can't trade yet): counted for
+                  // the report only, then those pools are left out.
+                  if (RH_EXTRA_VENUES) {
+                        const unsupported = findStandingGaps(pairs,
+                              (t) => TOKEN_DECIMALS.robinhood?.[t.toLowerCase()],
+                              (t) => priceOracle.getUsdPrice('robinhood', t),
+                              { minProfitUsd: 0.25, flashFee: 0, gasUsd: rhGasUsd(0.05), maxTradeUsd: Number(process.env.MAX_TRADE_USD ?? 5_000) })
+                              .filter((g) => !isExecutableVenue(g.buyPool.dex) || !isExecutableVenue(g.sellPool.dex));
+                        for (const g of unsupported.slice(0, 20)) {
+                              const ex = [g.buyPool.dex, g.sellPool.dex].filter((d) => !isExecutableVenue(d)).join('+');
+                              funnelSkip(`standing gap needs ${ex} (can't trade yet), model $0.25+`);
+                        }
+                  }
+                  for (let i = 0; i < pairs.length; i++) pairs[i] = pairs[i].filter((p) => isExecutableVenue(p.dex));
                   const gaps = findStandingGaps(pairs,
                         (t) => TOKEN_DECIMALS.robinhood?.[t.toLowerCase()],
                         (t) => priceOracle.getUsdPrice('robinhood', t),
@@ -1592,7 +1728,7 @@ await chainManager.startAll();
                   const scanOpts = { usdToken: ROBINHOOD_TOKENS.USDG, wrappedNative: ROBINHOOD_TOKENS.WETH, minPoolUsd: SCAN_MIN_USD,
                         maxLogRange: Number(process.env.ROBINHOOD_SCAN_LOG_RANGE ?? 500_000), log: (m: string) => console.log(m) };
                   // Gentle lane on the free node (see robinhoodScanProvider).
-                  const res = await scanUniverse(robinhoodScanProvider, ROBINHOOD_SCAN_FACTORIES, scanOpts, scanState);
+                  const res = await scanUniverse(robinhoodScanProvider, RH_EXTRA_VENUES ? [...ROBINHOOD_SCAN_FACTORIES, ...extraScanFactories()] : ROBINHOOD_SCAN_FACTORIES, scanOpts, scanState);
                   // Progress per factory is saved even if some failed.
                   if (res.errors.length) saveScanState(scanState);
                   if (res.errors.length && !res.candidates.length) throw new Error(`scan failed: ${res.errors.join('; ').slice(0, 150)}`);
@@ -1689,6 +1825,21 @@ await chainManager.startAll();
             rhScanCallMany ??= (await makeCaller(robinhoodScanProvider)).callMany;
             return rhScanCallMany(calls);
       };
+
+      // REAL V3 BALANCES (core/v3BalanceBook.ts, Phase 1 fix): every 10 min,
+      // one bundled read of the coins each cached V3 pool really holds, so the
+      // price oracle stops treating narrow-band pools as deep. Scan lane only,
+      // never the trading path. First read 2 min after start.
+      const v3Balances = new V3BalanceBook();
+      priceOracle.useBalances(v3Balances);
+      const refreshV3Balances = async () => {
+            try {
+                  const n = await v3Balances.refresh(scanCallMany, cache.allForChain('robinhood'));
+                  console.log(`[oracle] real V3 balances read: ${n}`);
+            } catch (err) { console.warn('[oracle] V3 balance read failed (kept old values):', (err as Error).message); }
+      };
+      setTimeout(() => { void refreshV3Balances(); }, 2 * 60_000);
+      setInterval(() => { void refreshV3Balances(); }, 10 * 60_000);
 
       // NEW POOL COUNTER (core/newPoolWatch.ts): new pools for coins that
       // already trade deep, and how far off their starting price was.
@@ -2099,9 +2250,16 @@ for (let i = 0; i < resolved.length; i++) {
                               },
                               reactionMs: { typical: stats.medianReactionMs, slowest5pct: stats.p95ReactionMs },
                               otherBots: { timed: rv.found, theirMs: rv.theirMedianMs, oursMs: rv.ourMedianMs, weBeat: rv.beatCount },
-                              rivalWins: { ...rivalWatch.takeHour(), botsKnown: rivalWatch.botCount() },
+                              rivalWins: { ...rivalWatch.takeHour(), botsKnown: rivalWatch.botCount(), botsVerified: rivalWatch.botStatus().verified },
                               newPools: hourNewPools ?? undefined,
                               nodeUsage: nodeUsageToday(),
+                              ourGas: (() => {
+                                    const eth = priceOracle.getUsdPrice('robinhood', ROBINHOOD_TOKENS.WETH);
+                                    return { ownUsd: robinhoodSender.gasCostUsdFor(OUR_GAS_OWN, eth), flashUsd: robinhoodSender.gasCostUsdFor(OUR_GAS_FLASH, eth) };
+                              })(),
+                              profitBands: { hour: [...profitBands.hour], day: [...profitBands.day], hourUsd: profitBands.hourUsd, dayUsd: profitBands.dayUsd },
+                              simOutcomes: simBuckets.plain(),
+                              research: researchHourText(),
                               funnel: {
                                     tradesRead: funnel.tradesRead, noPool: funnel.noPool, tooSmall: funnel.tooSmall, noPartner: funnel.noPartner,
                                     noUsdPrice: funnel.noUsdPrice, smallerThanFees: funnel.smallerThanFees, found: funnel.found,
@@ -2130,6 +2288,7 @@ for (let i = 0; i < resolved.length; i++) {
                   hourlyMatches.clear();
                   for (const chainName of Object.keys(chainHealthFlapCount)) chainHealthFlapCount[chainName] = 0;
                   simStats.checked = simStats.profit = simStats.loss = simStats.fail = simStats.rateLimited = 0;
+                  profitBands.resetHour(); simBuckets.clear();
                   funnel.tradesRead = funnel.noPool = funnel.tooSmall = funnel.noPartner = funnel.noUsdPrice = funnel.smallerThanFees = 0;
                   funnel.found = funnel.belowCheckBar = funnel.notVetted = funnel.sentToCheck = 0;
                   funnel.skip.clear();
@@ -2186,7 +2345,7 @@ for (let i = 0; i < resolved.length; i++) {
             const now = Date.now();
             const sum = rivalWatch.summary(now - 24 * 3600_000, now);
             const hours = Math.min(24, Math.max(0.1, (now - rivalWatch.firstRecordMs(now - 24 * 3600_000)) / 3600_000));
-            await sendTelegramMessage(formatRivalDaily({ dateLabel: torontoNow().date, hours, summary: sum, botsKnown: rivalWatch.botCount(),
+            await sendTelegramMessage(formatRivalDaily({ dateLabel: torontoNow().date, hours, summary: sum, botsKnown: rivalWatch.botCount(), botsVerified: rivalWatch.botStatus().verified,
                   newPools: newPoolWatchRef?.summary(now - 24 * 3600_000, now) }));
       };
       setInterval(async () => {
