@@ -81,6 +81,9 @@ import { NewPoolWatch } from './core/newPoolWatch';
 import { buildTokenGroups, loadTokenGroups, groupsStatusLine, TokenGroupsResult } from './core/tokenGroups';
 import { readFileSync, writeFileSync, mkdirSync, renameSync } from 'fs';
 import { ROBINHOOD_SCAN_FACTORIES } from './config/knownAddresses';
+// Uniswap V4 in the chain-wide scan, asked PER PAIR (core/v4Lookup.ts), not
+// from V4's history (that ran out of memory twice on Oct 9). RH_V4_SCAN=0 off.
+const RH_V4_SCAN = process.env.RH_V4_SCAN !== '0';
 import { buildExecuteCall, executionRequested, executorConfig, pickV3Lender } from './execution/executorCalldata';
 import { FailTally } from './core/failReasons';
 import { LenderBalances } from './core/lenderBalances';
@@ -1818,7 +1821,8 @@ await chainManager.startAll();
                   // on the fast node before waiting 15 min. Progress is saved
                   // per factory, so a second attempt repeats nothing.
                   const scanOpts = { usdToken: ROBINHOOD_TOKENS.USDG, wrappedNative: ROBINHOOD_TOKENS.WETH, minPoolUsd: SCAN_MIN_USD,
-                        maxLogRange: Number(process.env.ROBINHOOD_SCAN_LOG_RANGE ?? 500_000), log: (m: string) => console.log(m) };
+                        maxLogRange: Number(process.env.ROBINHOOD_SCAN_LOG_RANGE ?? 500_000), log: (m: string) => console.log(m),
+                        v4: RH_V4_SCAN ? { stateView: ROBINHOOD_V4.STATE_VIEW, poolManager: ROBINHOOD_V4.POOL_MANAGER } : undefined };
                   // Gentle lane on the free node (see robinhoodScanProvider).
                   const res = await scanUniverse(robinhoodScanProvider, RH_EXTRA_VENUES ? [...ROBINHOOD_SCAN_FACTORIES, ...extraScanFactories()] : ROBINHOOD_SCAN_FACTORIES, scanOpts, scanState);
                   // Progress per factory is saved even if some failed.
@@ -1826,6 +1830,8 @@ await chainManager.startAll();
                   if (res.errors.length && !res.candidates.length) throw new Error(`scan failed: ${res.errors.join('; ').slice(0, 150)}`);
                   saveScanState(scanState);
                   const top = res.candidates.slice(0, SCAN_TOP);
+                  // Status page: how many picked pairs V4 helped (a V4 pool among their deep pools).
+                  if (res.v4) console.log(`[scan] v4: ${top.filter((c) => c.pools.some((p) => p.kind === 'v4')).length} of ${top.length} picked pairs have a deep V4 pool (asked V4 about ${res.v4.pairsAsked} pairs, found ${res.v4.found} pools)`);
                   // Only replace the saved start list with a real result.
                   if (top.length) saveStartPairs(TOP_PAIRS_FILE, top.map((c) => ({ a: c.tokenA, b: c.tokenB })));
                   // Only vetted pairs' tokens may ever be traded (safety gate allowlist).
