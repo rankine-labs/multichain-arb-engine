@@ -106,6 +106,12 @@ jobs:
           alg="${alg//'%'/'%25'}"
           alg="${alg//$'\n'/'%0A'}"
           echo "::notice title=Algebra venue fork results::${alg}"
+          # Fables (Uniswap V4 pools with a hook, ForkFablesVenues.t.sol):
+          # result, pool, gas and the fee each swap really paid. Own note, short.
+          fab=$(grep -E "FABLES|fables_|GAS fables" fork-output.txt | head -60)
+          fab="${fab//'%'/'%25'}"
+          fab="${fab//$'\n'/'%0A'}"
+          echo "::notice title=Fables venue fork results::${fab}"
           exit $status
         env:
           AVALANCHE_RPC_URL: https://api.avax.network/ext/bc/C/rpc
