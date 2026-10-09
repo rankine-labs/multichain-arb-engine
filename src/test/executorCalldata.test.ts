@@ -169,8 +169,27 @@ for (const dex of Object.keys(COPY_V3_CALLBACK)) {
   }
 }
 
+// ---- Algebra Integral pools (Alandale, KittenSwap) ---------------------------
+// Same swap() as Uniswap V3; the contract answers their algebraSwapCallback
+// like the V3 callbacks, so they trade as KIND_V3 with the pool's own address
+// (contracts/test/Algebra.t.sol + ForkAlgebraVenues.t.sol prove the contract side).
+for (const dex of ['alandale', 'kittenswap-algebra']) {
+  const alg = rhPool(dex, '0x5555555555555555555555555555555555555555', { variant: 'algebra', feeBps: 1, feePips: 123 });
+  assert(kindForPool(alg) === KIND_V3, `${dex}: Algebra pool trades as KIND_V3`);
+  for (const [buy, sell, label] of [[RH_UNI, alg, 'uni then algebra'], [alg, RH_UNI, 'algebra then uni']] as const) {
+    const b = buildExecuteCall({ ...rhBase, buyPool: buy, sellPool: sell });
+    assert(b.ok, `${dex} ${label}: calldata builds`);
+    if (!b.ok) continue;
+    const [t] = decodeExecuteCall(b.data);
+    assert(t.hops.every((h: { kind: bigint }) => Number(h.kind) === KIND_V3), `${dex} ${label}: both hops KIND_V3`);
+    assert(t.hops[0].pool.toLowerCase() === buy.poolAddress && t.hops[1].pool.toLowerCase() === sell.poolAddress, `${dex} ${label}: hops point at the pools themselves`);
+    assert(Number(t.hops[0].feeBps) === 0 && Number(t.hops[1].feeBps) === 0, `${dex} ${label}: no fixed fee sent (the pool charges its own dynamic fee)`);
+  }
+}
+// An Algebra-labelled entry carrying V4 details is not a pool address: refused.
+assert(kindForPool(rhPool('alandale', '0x' + 'ab'.repeat(32), { variant: 'algebra', v4: { fee: 0, tickSpacing: 60, native: false, poolManager: '0x8366a39CC670B4001A1121B8F6A443A643e40951', stateView: '0xF3334192D15450CdD385c8B70e03f9A6bD9E673b' } })) === null, 'Algebra-labelled pool with V4 details refused');
+
 // Pools labelled 'v3' for pricing that the contract can NOT trade are refused.
-assert(kindForPool(rhPool('alandale', '0x5555555555555555555555555555555555555555', { variant: 'algebra' })) === null, 'Algebra pool refused (needs algebraSwapCallback)');
 const hookedV4 = { fee: 0, tickSpacing: 60, native: true, poolManager: '0x8366a39CC670B4001A1121B8F6A443A643e40951', stateView: '0xF3334192D15450CdD385c8B70e03f9A6bD9E673b', hooks: '0x' + '99'.repeat(20) };
 assert(kindForPool(rhPool('fables', '0x' + 'ab'.repeat(32), { v4: hookedV4 })) === null, 'hooked V4 pool (Fables) refused, not traded as V3');
 assert(kindForPool(rhPool('uniswap-v4', '0x' + 'ab'.repeat(32), { v4: hookedV4 })) === null, 'hooked Uniswap V4 pool refused');

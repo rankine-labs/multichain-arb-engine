@@ -134,10 +134,16 @@ export function kindForPool(pool: PoolState): number | null {
   // builds the pool key with hooks = 0, so a hooked pool can't be reached).
   const hooked = !!pool.v4?.hooks && pool.v4.hooks.toLowerCase() !== ZERO_ADDRESS;
   if (dex === 'uniswap-v4') return pool.v4 && !hooked ? KIND_V4 : null;
-  // Algebra copies (Alandale, KittenSwap) call algebraSwapCallback, which the
-  // contract does not have. They are labelled 'v3' for pricing, so refuse
-  // them here rather than build a trade that would revert on chain.
-  if (pool.variant === 'algebra') return null;
+  // Algebra Integral copies (Alandale, KittenSwap): swap() takes the same
+  // inputs as Uniswap V3 and pays through algebraSwapCallback, which the
+  // contract answers exactly like the V3 callbacks (same caller check). So
+  // they trade as an ordinary KIND_V3 hop with the pool's own address.
+  // Proved by contracts/test/ForkAlgebraVenues.t.sol. NOTE: only this
+  // branch's contract code has that callback; the bot's PRACTICE simulator
+  // runs that code, but the contract deployed on chain does not have it yet
+  // (a redeploy is needed before a real Algebra trade could work). Real
+  // trades are refused anyway: these venues are not isExecutableVenue().
+  if (pool.variant === 'algebra') return pool.v4 ? null : KIND_V3;
   // Any other pool carrying V4 details (hooked V4 pools such as Fables) has a
   // 32-byte pool id, not a pool address: the V3 path can't trade it.
   if (pool.v4) return null;
