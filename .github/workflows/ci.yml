@@ -93,6 +93,12 @@ jobs:
           summary="${summary//'%'/'%25'}"
           summary="${summary//$'\n'/'%0A'}"
           echo "::notice title=Fork test results::${summary}"
+          # Copy-exchange results (ForkCopyVenues.t.sol) get their own note:
+          # the main one is cut off before the Robinhood suite's last tests.
+          copy=$(grep -E "copy_|COPY VENUE|giga-cl|swaphood-v3|sushiswap-v3|up-cl|topaz-cl|raphael-cl" fork-output.txt | head -80)
+          copy="${copy//'%'/'%25'}"
+          copy="${copy//$'\n'/'%0A'}"
+          echo "::notice title=Copy venue fork results::${copy}"
           exit $status
         env:
           AVALANCHE_RPC_URL: https://api.avax.network/ext/bc/C/rpc

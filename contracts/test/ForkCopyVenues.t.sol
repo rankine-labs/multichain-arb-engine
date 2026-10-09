@@ -205,8 +205,8 @@ contract RobinhoodForkTestCopyVenues is ForkBase {
             console.log(string.concat(label, " -> all swaps executed; stopped by profit guard (expected)"));
             pass = true;
         } else {
-            console.log(string.concat(label, " -> FAILED before the profit check. Revert data:"));
-            console.logBytes(data);
+            // Revert data on the same line, so CI's summary (one line per match) keeps it.
+            console.log(string.concat(label, " -> FAILED before the profit check. Revert data: ", vm.toString(data)));
         }
         if (pass) {
             console.log(string.concat(
