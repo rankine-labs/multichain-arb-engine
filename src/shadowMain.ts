@@ -90,11 +90,16 @@ import { LenderBalances } from './core/lenderBalances';
 import { RouteScores, WinSizes, WIN_BARS } from './core/routeScore';
 import { RivalWatch } from './core/rivalWatch';
 import { V3BalanceBook } from './core/v3BalanceBook';
-import { extraWatcherVenues, extraScanFactories, isExecutableVenue, isPracticeTestableVenue } from './config/robinhoodVenues';
+import { extraWatcherVenues, extraScanFactories, isExecutableVenue, canPracticeTestVenue, reportedVenueIds, venueShortName } from './config/robinhoodVenues';
+import { VenueTally } from './core/venueTally';
 // Practice-test a pool: exchanges we trade, plus extra venues that passed the
-// executor fork test (config/robinhoodVenues.ts). Real trades still need
-// isExecutableVenue (fireTrade refuses everything else).
-const canPracticeTest = (dex: string) => isExecutableVenue(dex) || isPracticeTestableVenue(dex);
+// executor fork test (config/robinhoodVenues.ts canPracticeTestVenue). Fables
+// stays watch-only until its practiceTested run is recorded there. Real
+// trades still need isExecutableVenue (fireTrade refuses everything else).
+const canPracticeTest = (dex: string) => canPracticeTestVenue(dex);
+// Practice tests and wins per new exchange, for the hourly report and the
+// status page (core/venueTally.ts). Fixed list of venue ids = bounded memory.
+const venueTally = new VenueTally(reportedVenueIds(), venueShortName);
 // OWN MONEY (Oct 8, owner): plan and test Robinhood trades as paid from our
 // own balance, no flash loan (RH_FUNDING=flash brings loans back).
 const RH_OWN_MONEY = process.env.RH_FUNDING !== 'flash';
@@ -649,6 +654,13 @@ const queueSimulation = (
                         return;
                   }
                   simStats.checked++;
+                  // Per-exchange practice count (new exchanges only): a win is a
+                  // plausible profit that is still above 0 after our gas.
+                  if (chain === 'robinhood') {
+                        const winNet = r.status === 'profit' && plausibleProfit(r.profit, built.amountIn)
+                              ? (Number(r.profit) / 10 ** decimals) * usdPerToken - rhGasUsd(0.05) : undefined;
+                        venueTally.add(buyPool.dex, sellPool.dex, torontoDay(), winNet);
+                  }
                   if (r.status !== 'profit' || !plausibleProfit(r.profit, built.amountIn)) muteLoser(muteKey);
                   if (r.status === 'profit' && !plausibleProfit(r.profit, built.amountIn)) {
                         simStats.fail++;
@@ -1705,6 +1717,8 @@ await chainManager.startAll();
                               continue;
                         }
                         const simNet = check.status === 'profit' ? check.usd - rhGasUsd(0.05) /* gas */ : 0;
+                        // Per-exchange practice count (skipped checks were not tests).
+                        if (check.status !== 'skipped') venueTally.add(g.buyPool.dex, g.sellPool.dex, torontoDay(), check.status === 'profit' ? simNet : undefined);
                         if (check.status !== 'profit' || simNet < GAP_CONFIRM_MIN_USD) {
                               gapMutedUntil.set(key, Date.now() + GAP_FAKE_MUTE_MS);
                               // A revert is "wouldn't go through" (with its reason);
@@ -2358,6 +2372,7 @@ for (let i = 0; i < resolved.length; i++) {
                               profitBands: { hour: [...profitBands.hour], day: [...profitBands.day], hourUsd: profitBands.hourUsd, dayUsd: profitBands.dayUsd },
                               simOutcomes: simBuckets.plain(),
                               research: researchHourText(),
+                              venueTests: venueTally.hourText() ?? undefined,
                               race: raceChecker.takeHour(),
                               funnel: {
                                     tradesRead: funnel.tradesRead, noPool: funnel.noPool, tooSmall: funnel.tooSmall, noPartner: funnel.noPartner,
@@ -2388,6 +2403,9 @@ for (let i = 0; i < resolved.length; i++) {
                   for (const chainName of Object.keys(chainHealthFlapCount)) chainHealthFlapCount[chainName] = 0;
                   simStats.checked = simStats.profit = simStats.loss = simStats.fail = simStats.rateLimited = 0;
                   profitBands.resetHour(); simBuckets.clear();
+                  // Status page line (deploy/status-report.js), then a fresh hour.
+                  console.log(venueTally.statusLine());
+                  venueTally.resetHour();
                   funnel.tradesRead = funnel.noPool = funnel.tooSmall = funnel.noPartner = funnel.noUsdPrice = funnel.smallerThanFees = 0;
                   funnel.found = funnel.belowCheckBar = funnel.notVetted = funnel.sentToCheck = 0;
                   funnel.skip.clear();
