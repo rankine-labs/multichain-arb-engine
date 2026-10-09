@@ -166,6 +166,10 @@ async function main() {
   const rw = outL.map((l) => /\[rivalwatch\] bot \S+ (\S+) ~\$(-?[0-9.]+) \| \d+ pools.*(all watched|NOT)/.exec(l)).filter(Boolean);
   const rwFailed = count(outL, /\[rivalwatch\] bot \S+ FAILED/);
   const rwNewBots = count(outL, /\[rivalwatch\] new rival bot found/);
+  // Race check (would we really have won each practice win?).
+  const raceLines = outL.filter((l) => /^\[race\] /.test(l));
+  const raceWon = raceLines.filter((l) => /WE WOULD HAVE WON/.test(l)).length;
+  const raceLost = raceLines.filter((l) => /: LOST to /.test(l)).length;
   const rwWins = rw.filter((m) => Number(m[2]) > 0);
   const rwPairs = new Map();
   for (const m of rwWins) rwPairs.set(m[1], (rwPairs.get(m[1]) || 0) + Number(m[2]));
@@ -244,6 +248,7 @@ async function main() {
     `- Coin groups (please review): ${groupsLine ? groupsLine.replace(/^\[groups\] verified coins: /, '').slice(0, 1500) : `not built yet${groupsProgress ? ` (${groupsProgress.replace(/^\[groups\] /, '')})` : ''}`}`,
     `- RPC round trip from the server (public node, best of 3): ${rpcRtt ?? '?'} ms`,
     `- Real-chain test runs: ${simProfit} profitable · ${simLoss} losing · ${simFail} would fail`,
+    ...(raceLines.length ? [`- Race check: ${raceWon} would have won · ${raceLost} lost to a faster bot · ${raceLines.length - raceWon - raceLost} unclear`, ...raceLines.slice(-3).map((l) => `  - ${l.replace(/^\[race\] /, '').slice(0, 200)}`)] : []),
     ...(profitUsd.length ? [`- Profitable checks: total $${profitUsd.reduce((x, y) => x + y, 0).toFixed(2)} · middle $${profitUsd[Math.floor(profitUsd.length / 2)].toFixed(2)} · biggest $${profitUsd[profitUsd.length - 1].toFixed(2)} (before gas)`,
       `- Profit by pair: ${topProfitPairs.map(([p, v]) => `${p} $${v.toFixed(2)}`).join(' · ')}`] : []),
     ...(tRight + tOthers + tLate ? [`- Test timing: ${tRight} right after trigger (replayed) · ${tOthers} end of trigger block · ${tLate} late · ${rechecked} re-checked without replay`] : []),

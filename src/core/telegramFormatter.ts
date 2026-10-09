@@ -310,6 +310,8 @@ export interface PlainHourlyInput {
   profitBands?: { hour: number[]; day: number[]; hourUsd: number; dayUsd: number }; // profitable checks by $ size
   simOutcomes?: [string, number][];   // check results by category (core/failReasons SimBucket), this hour
   research?: string;                  // research lane hour summary (core/researchLane.ts), if on
+  // Race check (core/raceCheck.ts): would we really have won this hour's practice wins?
+  race?: { won: number; lost: number; unclear: number; wonUsd: number; lostUsd: number; avgLeadS: number | null; pending: number };
   // Where trades dropped out this hour, step by step (see shadowMain funnel).
   funnel?: {
     tradesRead: number; noPool: number; tooSmall?: number; noPartner: number; noUsdPrice: number; smallerThanFees: number;
@@ -416,6 +418,12 @@ export function formatPlainHourly(r: PlainHourlyInput): string {
       L.push(`  Profitable checks by size this hour: ${h ?? 'none'}`);
       if (d) L.push(`  Today: ${d} (total ${money(pb.dayUsd)})`);
     }
+  }
+  // Race check: practice wins vs other bots that went for the same gap.
+  const rc = r.race;
+  if (rc && (rc.won + rc.lost + rc.unclear + rc.pending) > 0) {
+    const n = rc.won + rc.lost + rc.unclear;
+    L.push(`<b>Race check</b>: ${n} win${n === 1 ? '' : 's'} checked → we'd have won ${rc.won} (${money(rc.wonUsd)}), lost ${rc.lost} (${money(rc.lostUsd)})${rc.avgLeadS !== null ? `, rival ${rc.avgLeadS}s faster on average` : ''}${rc.unclear ? `, unclear ${rc.unclear}` : ''}${rc.pending ? ` · ${rc.pending} still being watched` : ''}`);
   }
   // Our own contract's gas right now (measured: ~335k gas own money, ~477k with a loan).
   if (r.ourGas && (r.ourGas.ownUsd !== null || r.ourGas.flashUsd !== null)) {
