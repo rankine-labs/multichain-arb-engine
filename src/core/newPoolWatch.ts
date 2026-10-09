@@ -2,6 +2,7 @@ import { ethers } from 'ethers';
 import { readFileSync, writeFileSync, mkdirSync, renameSync } from 'fs';
 import { dirname } from 'path';
 import { decodePoolCreatedLog, type RawLog, type ScanFactory } from './universeScan';
+import { V4_INITIALIZE_TOPIC, V4_MODIFY_LIQUIDITY_TOPIC, decodeV4Initialize, decodeV4ModifyLiquidity, v4MintAmounts } from './v4Scan';
 
 // ============================================================================
 // NEW POOL COUNTER -- measurement only, never trades.
@@ -28,8 +29,12 @@ import { decodePoolCreatedLog, type RawLog, type ScanFactory } from './universeS
 //   4. Compare that starting price with the deep pools' price, and record:
 //      how far off (%), and roughly how much money went in.
 //
-// Uniswap V4 pools are created differently (no factory), so they aren't
-// counted here yet.
+// Uniswap V4 (no factory; all pools live in one PoolManager): one extra
+// log request a minute on the PoolManager, filtered to just two events:
+//   - Initialize: a new pool and the price its creator set (hooked pools,
+//     which the bot can't trade, are skipped);
+//   - ModifyLiquidity: the first money added; the amounts are worked out
+//     from the liquidity and price range (core/v4Scan.ts v4MintAmounts).
 // ============================================================================
 
 const SYNC = ethers.id('Sync(uint112,uint112)');          // Uniswap V2 / PancakeSwap V2
@@ -72,8 +77,9 @@ export interface NewPoolSummary {
 
 export interface NewPoolWatchOptions {
   factories: ScanFactory[];
-  // eth_getLogs for these addresses over [from, to] (any topics).
-  getLogs: (addresses: string[], from: number, to: number) => Promise<RawLog[]>;
+  // eth_getLogs for these addresses over [from, to] (any topics, unless
+  // `topics` is given: used for the V4 PoolManager so its swaps never come back).
+  getLogs: (addresses: string[], from: number, to: number, topics?: (string | string[] | null)[]) => Promise<RawLog[]>;
   latestBlock: () => Promise<number>;
   refPrice: (token: string) => RefPrice | null;
   decimals: (token: string) => number | undefined;
@@ -150,7 +156,8 @@ export class NewPoolWatch {
   private recs: NewPoolRec[] = [];
   private hourFrom: number;
   private busy = false;
-  private readonly factoryByAddr: Map<string, ScanFactory>;
+  private readonly factoryByAddr: Map<string, ScanFactory>;   // address-based factories (not V4)
+  private readonly v4Factories: ScanFactory[];
   private readonly now: () => number;
   private readonly minDeepUsd: number;
   private readonly maxPending: number;
@@ -160,7 +167,8 @@ export class NewPoolWatch {
   errors = 0;              // failed polls since start (shown on the status page)
 
   constructor(private readonly o: NewPoolWatchOptions) {
-    this.factoryByAddr = new Map(o.factories.map((f) => [f.factory.toLowerCase(), f]));
+    this.factoryByAddr = new Map(o.factories.filter((f) => f.kind !== 'v4').map((f) => [f.factory.toLowerCase(), f]));
+    this.v4Factories = o.factories.filter((f) => f.kind === 'v4' && !!f.weth);
     this.now = o.now ?? Date.now;
     this.minDeepUsd = o.minDeepUsd ?? 10_000;
     this.maxPending = o.maxPending ?? 200;
@@ -193,7 +201,8 @@ export class NewPoolWatch {
       if (from > latest) return;
       if (latest - from > this.maxCatchUp) from = latest - this.maxCatchUp; // long stop: skip the oldest part
       this.expire();
-      const addrs = [...this.factoryByAddr.keys(), ...this.pending.keys()];
+      // V4 pending pools are ids, not addresses: they never go in this list.
+      const addrs = [...this.factoryByAddr.keys(), ...[...this.pending.values()].filter((p) => p.kind !== 'v4').map((p) => p.pool)];
       const logs = await this.o.getLogs(addrs, from, latest);
       const fresh: PendingPool[] = [];
       const poolLogs: RawLog[] = [];
@@ -210,6 +219,9 @@ export class NewPoolWatch {
       // in the address list yet). Rare: only pools for deep coins.
       if (fresh.length) poolLogs.push(...await this.o.getLogs(fresh.map((p) => p.pool), Math.min(...fresh.map((p) => p.createdBlock)), latest));
       this.onPoolLogs(poolLogs);
+      for (const f of this.v4Factories) {
+        this.onV4Logs(f, await this.o.getLogs([f.factory], from, latest, [[V4_INITIALIZE_TOPIC, V4_MODIFY_LIQUIDITY_TOPIC]]));
+      }
       this.lastBlock = latest;
     } catch (err) {
       this.errors++;
@@ -255,6 +267,30 @@ export class NewPoolWatch {
         const a0 = word(l.data, 2), a1 = word(l.data, 3);
         const px = v3Price1Per0(BigInt(p.sqrtPriceX96), d0, d1);
         if (px !== null && a0 !== null && a1 !== null) this.measure(p, px, Number(a0) / 10 ** d0, Number(a1) / 10 ** d1);
+      }
+    }
+  }
+
+  // V4 events from the PoolManager, oldest first: new pools (Initialize, with
+  // the creator's price) and first money in (ModifyLiquidity adding liquidity).
+  onV4Logs(f: ScanFactory, logs: RawLog[]) {
+    for (const l of [...logs].sort(logOrder)) {
+      const t0 = l.topics?.[0]?.toLowerCase();
+      if (t0 === V4_INITIALIZE_TOPIC) {
+        const d = decodeV4Initialize(l, f.weth!);
+        if (!d || d.hooked) continue; // misread, or a hooked pool the bot can't trade
+        const p = this.onCreated(f, { token0: d.token0, token1: d.token1, pool: d.id }, blockOf(l));
+        if (p) p.sqrtPriceX96 = d.sqrtPriceX96.toString();
+      } else if (t0 === V4_MODIFY_LIQUIDITY_TOPIC) {
+        const m = decodeV4ModifyLiquidity(l);
+        if (!m || m.liquidityDelta <= 0n) continue;
+        const p = this.pending.get(m.id);
+        if (!p || p.kind !== 'v4' || !p.sqrtPriceX96) continue;
+        const d0 = this.o.decimals(p.token0)!, d1 = this.o.decimals(p.token1)!;
+        const sq = BigInt(p.sqrtPriceX96);
+        const px = v3Price1Per0(sq, d0, d1);
+        const { a0, a1 } = v4MintAmounts(sq, m.tickLower, m.tickUpper, m.liquidityDelta);
+        if (px !== null) this.measure(p, px, a0 / 10 ** d0, a1 / 10 ** d1);
       }
     }
   }
