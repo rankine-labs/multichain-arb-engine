@@ -24,11 +24,15 @@ async function main() {
   // PRACTICE testing gate: exactly the 6 copy exchanges whose fork test passed
   // (contracts/test/ForkCopyVenues.t.sol), each with the CI run noted.
   const COPIES = ['giga-cl', 'swaphood-v3', 'sushiswap-v3', 'up-cl', 'topaz-cl', 'raphael-cl'];
+  // Plus the 2 Algebra exchanges whose fork test passed (ForkAlgebraVenues.t.sol).
+  const ALGEBRA = ['alandale', 'kittenswap-algebra'];
+  const PRACTICE = [...COPIES, ...ALGEBRA];
   assert(COPIES.every(isPracticeTestableVenue), 'all 6 fork-tested copy exchanges are practice-testable');
-  assert(ROBINHOOD_VENUES.filter((v) => isPracticeTestableVenue(v.id)).map((v) => v.id).sort().join(',') === [...COPIES].sort().join(','), 'no other venue is practice-testable (Algebra, Fables, oracle venues etc. stay out)');
+  assert(ALGEBRA.every(isPracticeTestableVenue), 'both fork-tested Algebra exchanges (Alandale, KittenSwap) are practice-testable');
+  assert(ROBINHOOD_VENUES.filter((v) => isPracticeTestableVenue(v.id)).map((v) => v.id).sort().join(',') === [...PRACTICE].sort().join(','), 'no other venue is practice-testable (Fables, oracle venues etc. stay out)');
   assert(ROBINHOOD_VENUES.filter((v) => v.practiceTested).every((v) => /actions\/runs\/\d+$/.test(v.practiceTested!.run) && /^\d{4}-\d{2}-\d{2}$/.test(v.practiceTested!.date)), 'every practice-tested venue names its CI run and date');
-  assert(!isPracticeTestableVenue('uniswap-v3') && !isPracticeTestableVenue('alandale') && !isPracticeTestableVenue(''), 'practice gate is only for listed, fork-tested venues');
-  assert(COPIES.every((d) => !isExecutableVenue(d)), 'practice-testable venues are still refused by the real trade gate');
+  assert(!isPracticeTestableVenue('uniswap-v3') && !isPracticeTestableVenue('fables') && !isPracticeTestableVenue(''), 'practice gate is only for listed, fork-tested venues');
+  assert(PRACTICE.every((d) => !isExecutableVenue(d)), 'practice-testable venues (Algebra too) are still refused by the real trade gate');
   const all = ROBINHOOD_VENUES.flatMap((v) => v.contracts.map((c) => c.address));
   assert(all.every((a) => { try { ethers.getAddress(a.toLowerCase()); return /^0x[0-9a-fA-F]{40}$/.test(a); } catch { return false; } }), 'every address is a full 20-byte address (no shortened guesses)');
   assert(new Set(all.map((a) => a.toLowerCase())).size === all.length, 'no address listed twice');

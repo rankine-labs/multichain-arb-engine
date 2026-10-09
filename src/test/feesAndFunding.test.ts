@@ -51,6 +51,17 @@ const outExact = computeAmountOut(v3, true, E18)!;
 const outRounded = computeAmountOut({ ...v3, feePips: undefined }, true, E18)!;
 assert(outExact > outRounded, 'exact 0.025% fee gives slightly more out than the rounded 0.03%');
 
+// Algebra pools (Alandale, KittenSwap): the fee is dynamic and read from
+// globalState() word 2 into feePips. Sizing must use that exact value, not
+// the rounded feeBps (a 0.0123% pool would round to 0.01%).
+{
+  const alg: PoolState = { ...v3, dex: 'alandale', variant: 'algebra', feeBps: 1, feePips: 123 };
+  assert(feePipsOf(alg) === 123, 'Algebra pool: sizing uses the live fee from globalState (123 pips), not rounded bps');
+  const outLive = computeAmountOut(alg, true, E18)!;
+  const outBps = computeAmountOut({ ...alg, feePips: undefined }, true, E18)!;
+  assert(outLive < outBps, 'Algebra pool: the live 0.0123% fee is charged (less out than the rounded 0.01%)');
+}
+
 // The price guess (poolCache) charges the same fee as the sizing maths.
 {
   const cache = new PoolCache();

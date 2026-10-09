@@ -266,3 +266,74 @@ contract EvilV3Lender {
         IV3Callback(msg.sender).uniswapV3FlashCallback(fakeFee, fakeFee, d);
     }
 }
+
+interface IAlgebraCallback {
+    function algebraSwapCallback(int256, int256, bytes calldata) external;
+}
+
+// Algebra Integral style pool at a fixed price (Alandale, KittenSwap).
+// Same swap() inputs as Uniswap V3, but it pays out, then calls
+// algebraSwapCallback and checks the payment arrived. Like the real pool it
+// refuses a price limit that is ON or outside Algebra's MIN/MAX sqrt ratio
+// (same numbers as Uniswap's TickMath), or on the wrong side of the price.
+// Optional `relay`: instead of calling back itself, the pool asks another
+// contract to make the callback (used to prove a different caller is refused).
+contract MockAlgebraPool {
+    address public immutable token0;
+    address public immutable token1;
+    uint256 public immutable priceNum; // price of token0 in token1, as num/den
+    uint256 public immutable priceDen;
+    uint16 public immutable feePips;   // e.g. 500 = 0.05%
+    address public relay;
+
+    // Algebra Integral TickMath bounds (identical to Uniswap V3 TickMath).
+    uint160 public constant MIN_SQRT_RATIO = 4295128739;
+    uint160 public constant MAX_SQRT_RATIO = 1461446703485210103287273052203988822378723970342;
+    // A fixed "current" sqrt price (1:1 in raw units) for the side check.
+    uint160 public constant CURRENT_SQRT_PRICE = 79228162514264337593543950336;
+
+    constructor(address a, address b, uint256 num, uint256 den, uint16 feePips_) {
+        (token0, token1) = a < b ? (a, b) : (b, a);
+        if (a < b) { priceNum = num; priceDen = den; } else { priceNum = den; priceDen = num; }
+        feePips = feePips_;
+    }
+
+    function setRelay(address r) external { relay = r; }
+
+    function swap(address recipient, bool zeroToOne, int256 amountRequired, uint160 limitSqrtPrice, bytes calldata data)
+        external
+        returns (int256 amount0, int256 amount1)
+    {
+        // Algebra's limit check (AlgebraPool: invalidLimitSqrtPrice).
+        if (zeroToOne) {
+            require(limitSqrtPrice < CURRENT_SQRT_PRICE && limitSqrtPrice > MIN_SQRT_RATIO, "invalidLimitSqrtPrice");
+        } else {
+            require(limitSqrtPrice > CURRENT_SQRT_PRICE && limitSqrtPrice < MAX_SQRT_RATIO, "invalidLimitSqrtPrice");
+        }
+        require(amountRequired > 0, "exact-in only");
+        uint256 amountIn = uint256(amountRequired);
+        address tokenIn = zeroToOne ? token0 : token1;
+        address tokenOut = zeroToOne ? token1 : token0;
+        uint256 amountOut = zeroToOne ? amountIn * priceNum / priceDen : amountIn * priceDen / priceNum;
+        amountOut = amountOut * (1_000_000 - feePips) / 1_000_000;
+
+        uint256 before = MockERC20(tokenIn).balanceOf(address(this));
+        MockERC20(tokenOut).transfer(recipient, amountOut);
+
+        (amount0, amount1) = zeroToOne
+            ? (int256(amountIn), -int256(amountOut))
+            : (-int256(amountOut), int256(amountIn));
+        if (relay != address(0)) AlgebraCallbackRelay(relay).poke(msg.sender, amount0, amount1, data);
+        else IAlgebraCallback(msg.sender).algebraSwapCallback(amount0, amount1, data);
+
+        require(MockERC20(tokenIn).balanceOf(address(this)) >= before + amountIn, "insufficientInputAmount");
+    }
+}
+
+// Calls algebraSwapCallback on a target from ITS OWN address: a contract
+// that is not the pool being swapped with. The executor must refuse it.
+contract AlgebraCallbackRelay {
+    function poke(address target, int256 a0, int256 a1, bytes calldata data) external {
+        IAlgebraCallback(target).algebraSwapCallback(a0, a1, data);
+    }
+}

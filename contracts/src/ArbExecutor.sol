@@ -24,7 +24,8 @@ pragma solidity 0.8.26;
 // Pool types supported (Hop.kind):
 //   KIND_V2      Uniswap V2 style: TraderJoe v1, Sushi, PancakeSwap V2, LFJ v1
 //   KIND_SOLIDLY Solidly style:   Ramses V2 (stable and volatile pairs)
-//   KIND_V3      Concentrated liquidity: Uniswap V3, PancakeSwap V3, Ramses V3
+//   KIND_V3      Concentrated liquidity: Uniswap V3, PancakeSwap V3, Ramses V3,
+//                and Algebra Integral copies (same swap(), algebraSwapCallback)
 //   KIND_V4      Uniswap V4 (one PoolManager holds every pool). Only pools
 //                WITHOUT hooks (custom add-on code): the contract always
 //                builds the pool key with hooks = address(0), so a hooked
@@ -439,6 +440,13 @@ contract ArbExecutor {
         _payV3(amount0Delta, amount1Delta);
     }
 
+    // Algebra Integral pools (Alandale, KittenSwap on Robinhood). Their swap()
+    // has the same inputs as Uniswap V3's, so they trade as KIND_V3; only the
+    // payment callback has a different name. Same caller check as above.
+    function algebraSwapCallback(int256 amount0Delta, int256 amount1Delta, bytes calldata) external {
+        _payV3(amount0Delta, amount1Delta);
+    }
+
     // Pays the V3 pool what it's owed -- but only the pool we're mid-swap
     // with, and only in the token we're selling into it.
     function _payV3(int256 amount0Delta, int256 amount1Delta) private {
@@ -511,6 +519,9 @@ contract ArbExecutor {
 
     // Uniswap V3 price limits: just inside the allowed range = no limit.
     // Overall slippage is enforced by the final profit check instead.
+    // Algebra Integral uses the same MIN/MAX sqrt ratio (its TickMath is a
+    // copy of Uniswap's) and refuses a limit AT the bound, so these "one
+    // inside the bound" values are valid there too.
     uint160 private constant MIN_SQRT_RATIO_PLUS_1 = 4295128740;
     uint160 private constant MAX_SQRT_RATIO_MINUS_1 = 1461446703485210103287273052203988822378723970341;
 

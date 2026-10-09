@@ -62,7 +62,8 @@ export interface RobinhoodVenue {
   // Filled from the venue probe; see docs/VENUES.md for the run.
   onChain?: { verified: boolean; note: string };
   // Set ONLY when our real executor contract traded this venue's pools on a
-  // fork of the live chain (contracts/test/ForkCopyVenues.t.sol): both
+  // fork of the live chain (contracts/test/ForkCopyVenues.t.sol, or
+  // ForkAlgebraVenues.t.sol for the Algebra venues): both
   // directions, every swap executed, stopped only by our own profit check.
   // `run` is the CI run that showed it, `date` when. This allows PRACTICE
   // testing only (isPracticeTestableVenue); it never turns on real trading.
@@ -73,14 +74,23 @@ export interface RobinhoodVenue {
 // "Copy venue fork results"). Same run for all six.
 const COPY_FORK_RUN = { run: 'https://github.com/rankine-labs/multichain-arb-engine/actions/runs/37880135355', date: '2026-10-08' };
 
+// Where the Algebra fork test passed (contracts/test/ForkAlgebraVenues.t.sol,
+// CI annotation "Algebra venue fork results"): Alandale and KittenSwap
+// WETH/USDG pools, both directions, with the executor that has
+// algebraSwapCallback. That callback is only in the contract SOURCE (and so
+// in the practice simulator's copy); the contract deployed on chain does not
+// have it, so a real Algebra trade would also need a redeploy.
+const ALGEBRA_FORK_RUN = { run: 'https://github.com/rankine-labs/multichain-arb-engine/actions/runs/37944712215', date: '2026-10-09' };
+
 export const ROBINHOOD_VENUES: readonly RobinhoodVenue[] = [
   // ---- P0: the user's priority list + the deepest unknown factory -----------
   {
     id: 'alandale', name: 'Alandale (Algebra Integral CL)', priority: 'P0', model: 'algebra',
     contracts: [{ role: 'factory', address: '0x16494A80E08Bcb9285D87b67149d7b01774D82F8' }],
     priceable: true, executionEnabled: false,
-    executionBlocker: 'Algebra pools call algebraSwapCallback; our contract only answers the Uniswap/PancakeSwap callbacks.',
+    executionBlocker: 'Algebra callback: in the contract source and fork-tested (practiceTested, WETH/USDG both ways), but the deployed contract lacks it; real trades need a redeploy and approval.',
     source: ['DefiLlama dimension-adapters dexs/alandale/index.ts', 'rival-trade probe: factory of the deep SPY/USDG and WETH/USDG pools'],
+    practiceTested: ALGEBRA_FORK_RUN,
   },
   {
     id: 'giga-cl', name: 'GIGA DEX CL', priority: 'P0', model: 'pancake-v3',
@@ -181,8 +191,9 @@ export const ROBINHOOD_VENUES: readonly RobinhoodVenue[] = [
     id: 'kittenswap-algebra', name: 'KittenSwap (Algebra)', priority: 'P1', model: 'algebra',
     contracts: [{ role: 'factory', address: '0xf03875b5Ec5eAc83cab83A6c2ab17844304AA7a0' }],
     priceable: true, executionEnabled: false,
-    executionBlocker: 'Algebra callback; plugins can override the fee per swap (SwapFee event).',
+    executionBlocker: 'Algebra callback: in the contract source and fork-tested (practiceTested, WETH/USDG both ways), but the deployed contract lacks it; real trades need a redeploy and approval. Plugins can override the fee per swap (SwapFee event).',
     source: ['DefiLlama dimension-adapters dexs/kittenswap-algebra/index.ts', 'venue probe run 37845231412'],
+    practiceTested: ALGEBRA_FORK_RUN,
   },
   // ---- P2: documented by the project, not seen in rival trades ---------------
   {
@@ -205,8 +216,10 @@ export function isExecutableVenue(dex: string): boolean {
 }
 
 // PRACTICE testing only (never real money): true only for venues whose
-// pools our existing executor contract traded on a live-chain fork
-// (practiceTested is set). executionEnabled stays false for every venue and
+// pools our executor contract code traded on a live-chain fork
+// (practiceTested is set). For the Algebra venues that is the contract
+// SOURCE (with algebraSwapCallback), which the practice simulator runs; the
+// deployed contract would need a redeploy before a real Algebra trade. executionEnabled stays false for every venue and
 // isExecutableVenue() still refuses them; the caller decides where to use this.
 export function isPracticeTestableVenue(dex: string): boolean {
   return ROBINHOOD_VENUES.some((v) => v.id === dex && !!v.practiceTested);
