@@ -179,9 +179,6 @@ async function main() {
   const newPoolsWaiting = count(outL, /^\[newpools\] new pool .* waiting/);
   const newPoolsFails = count(outL, /^\[newpools\] poll failed/);
   const groupsLine = lastMatch(bigTail, /^\[groups\] verified coins:/);
-  // Uniswap V4 in the chain-wide scan (Oct 9): pools found, and the map summary.
-  const v4FoundLine = lastMatch(bigTail, /^\[scan\] uniswap-v4: /);
-  const v4MapLine = lastMatch(bigTail, /^\[scan\] v4: /);
   // While the list is still being built: its latest progress line (or a failure).
   const groupsProgress = lastMatch(bigTail, /^\[groups\] (building:|symbols:|no pool scan|build\/setup failed)/);
   const loopsLine = lastMatch(bigTail, /^\[loops\] \d+ tokens across/);
@@ -244,7 +241,6 @@ async function main() {
     `- New pool counter: ${newPoolsLine ? newPoolsLine.replace(/^\[newpools\] /, '') : 'no hourly line yet'} · this window: ${newPoolsWaiting} new pool(s) for deep coins, ${newPoolsFirstMoney.length} measured, ${newPoolsFails} failed poll(s)`,
     ...newPoolsFirstMoney.slice(-3).map((l) => `  - ${l.replace(/^\[newpools\] /, '').slice(0, 200)}`),
     `- Loop watch: ${loopsLine ? loopsLine.replace(/^\[loops\] /, '') : 'no line yet'}${loopsWatch ? ` (${loopsWatch.replace(/^\[loops\] /, '')})` : ''}`,
-    `- Uniswap V4 in the scan: ${v4MapLine ? v4MapLine.replace(/^\[scan\] v4: /, '') : 'no full scan finished yet'}${v4FoundLine ? ` · latest read: ${v4FoundLine.replace(/^\[scan\] uniswap-v4: /, '')}` : ''}`,
     `- Coin groups (please review): ${groupsLine ? groupsLine.replace(/^\[groups\] verified coins: /, '').slice(0, 1500) : `not built yet${groupsProgress ? ` (${groupsProgress.replace(/^\[groups\] /, '')})` : ''}`}`,
     `- RPC round trip from the server (public node, best of 3): ${rpcRtt ?? '?'} ms`,
     `- Real-chain test runs: ${simProfit} profitable · ${simLoss} losing · ${simFail} would fail`,

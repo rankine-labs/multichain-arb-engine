@@ -2,7 +2,6 @@ import type { PoolState } from './types';
 import type { ScannedPool } from './universeScan';
 import { refreshPoolsBatch } from './pairWatcher';
 import { priceOf } from './poolPrice';
-import { readSideAmounts, v4PoolState } from './v4Scan';
 import { readFileSync, writeFileSync, mkdirSync, renameSync } from 'fs';
 import { dirname } from 'path';
 
@@ -63,8 +62,7 @@ const DEFAULT_FEE_PCT = 0.3;
 // A pool's fee in % and whether it is the real fee (true) or a guess (false).
 // v3FeePct: the fee read from the pool itself (V3), if that read worked.
 export function legFee(dex: string, kind: string, v3FeePct?: number): { feePct: number; feeKnown: boolean } {
-  // V4: the fee comes from the pool's key (scan), passed in like a V3 fee.
-  if (kind === 'v3' || kind === 'v4') return v3FeePct !== undefined ? { feePct: v3FeePct, feeKnown: true } : { feePct: DEFAULT_FEE_PCT, feeKnown: false };
+  if (kind === 'v3') return v3FeePct !== undefined ? { feePct: v3FeePct, feeKnown: true } : { feePct: DEFAULT_FEE_PCT, feeKnown: false };
   const f = V2_FEE_PCT[dex];
   return f !== undefined ? { feePct: f, feeKnown: true } : { feePct: DEFAULT_FEE_PCT, feeKnown: false };
 }
@@ -124,11 +122,10 @@ export class CrossQuoteMonitor {
 
     // Quote-side balance of every candidate pool (one bundled read).
     const pools = cands.flatMap(([token, ps]) => ps.map((p) => ({ token, p, quote: [p.token0, p.token1].map((x) => x.toLowerCase()).includes(usdg) ? usdg : weth })));
-    // (V4 pools have no balance of their own: virtual amount, core/v4Scan.ts.)
-    const bal = await readSideAmounts(this.callMany, pools.map((x) => ({ pool: x.p.pool, token0: x.p.token0, token: x.quote, v4StateView: x.p.v4?.stateView })));
+    const bal = await this.callMany(pools.map((x) => ({ target: x.quote, data: SEL_BALANCE + pad(x.p.pool) })));
     const ethUsd = this.wethUsd() ?? 0;
     const deep = pools.map((x, i) => {
-      const raw = bal[i] ?? 0n;
+      const raw = big(bal[i]) ?? 0n;
       return { ...x, usd: quoteUsdOf(raw, x.quote === usdg, ethUsd) };
     }).filter((x) => x.usd >= minQuoteUsd);
 
@@ -152,7 +149,6 @@ export class CrossQuoteMonitor {
     const fees = await this.callMany(v3.map((x) => ({ target: x.p.pool, data: SEL_FEE })));
     const feeOf = new Map<string, number>();
     v3.forEach((x, i) => { const f = big(fees[i]); if (f !== null) feeOf.set(x.p.pool.toLowerCase(), Number(f) / 10_000); }); // pips -> %
-    for (const [, xs] of chosen) for (const x of xs) if (x.p.v4) feeOf.set(x.p.pool.toLowerCase(), x.p.v4.fee / 10_000); // V4: fee from its key
 
     this.legs.clear();
     for (const [token, xs] of chosen) {
@@ -166,7 +162,7 @@ export class CrossQuoteMonitor {
           quote: x.quote === usdg ? 'usdg' as const : 'weth' as const,
           quoteUsd: x.usd,
           feePct, feeKnown,
-          pool: x.p.v4 ? v4PoolState({ ...x.p, v4: x.p.v4 }) : {
+          pool: {
             chain: 'robinhood', dex: x.p.dex, poolAddress: x.p.pool, poolType: x.p.kind === 'v3' ? 'v3' : 'v2',
             tokenA: x.p.token0, tokenB: x.p.token1,
             feeBps: Math.round(feePct * 100), feePips: Math.round(feePct * 10_000), lastUpdatedMs: 0,
@@ -194,10 +190,10 @@ export class CrossQuoteMonitor {
     const all = [...this.legs.values()].flat();
     if (!all.length) return;
     const usdg = this.usdg.toLowerCase();
-    const bal = await readSideAmounts(this.callMany, all.map((l) => ({ pool: l.pool.poolAddress, token0: l.pool.tokenA, token: l.quote === 'usdg' ? usdg : this.weth.toLowerCase(), v4StateView: l.pool.v4?.stateView })));
+    const bal = await this.callMany(all.map((l) => ({ target: l.quote === 'usdg' ? usdg : this.weth.toLowerCase(), data: SEL_BALANCE + pad(l.pool.poolAddress) })));
     const ethUsd = this.wethUsd();
     all.forEach((l, i) => {
-      const raw = bal[i];
+      const raw = big(bal[i]);
       if (raw === null) return;
       if (l.quote === 'weth' && !ethUsd) return; // can't value it right now
       l.quoteUsd = quoteUsdOf(raw, l.quote === 'usdg', ethUsd ?? 0);
@@ -398,7 +394,7 @@ export class LoopMonitor {
   quoteCount() { return this.quotes.size; }
   quoteList(): LoopQuote[] { return [...this.quotes.values()]; }
 
-  private label(p: ScannedPool, feePct: number) { return `${p.dex}${p.kind === 'v3' || p.kind === 'v4' ? ` ${feePct}%` : ''}`; }
+  private label(p: ScannedPool, feePct: number) { return `${p.dex}${p.kind === 'v3' ? ` ${feePct}%` : ''}`; }
 
   // Pick tokens that trade against 2+ verified quote coins (with a pool
   // between those two quotes to close the loop), keep the deepest maxTokens.
@@ -442,17 +438,15 @@ export class LoopMonitor {
     // Quote-side balance of each candidate pool, V3 fees: one bundled read.
     const flat = cands.flatMap(([token, xs]) => xs.map((x) => ({ token, ...x })));
     const uniqPools = [...new Map(flat.map((x) => [x.p.pool.toLowerCase(), x.p])).values()];
-    // V4 pools: no fee() and no balance of their own -> fee from the pool's
-    // key, quote side from StateView (core/v4Scan.ts). Never sent to fee().
-    const sides = await readSideAmounts(this.callMany, flat.map((x) => ({ pool: x.p.pool, token0: x.p.token0, token: x.quote, v4StateView: x.p.v4?.stateView })));
-    const addrPools = uniqPools.filter((p) => !p.v4);
-    const feeRes = await this.callMany(addrPools.map((p) => ({ target: p.pool, data: SEL_FEE })));
+    const res = await this.callMany([
+      ...flat.map((x) => ({ target: x.quote, data: SEL_BALANCE + pad(x.p.pool) })),
+      ...uniqPools.map((p) => ({ target: p.pool, data: SEL_FEE })),
+    ]);
     const feeOf = new Map<string, number>();
-    addrPools.forEach((p, i) => {
-      const f = big(feeRes[i]);
+    uniqPools.forEach((p, i) => {
+      const f = big(res[flat.length + i]);
       feeOf.set(p.pool.toLowerCase(), p.kind === 'v3' && f !== null ? Number(f) / 10_000 : V2_FEE_PCT[p.dex] ?? 0.3);
     });
-    for (const p of uniqPools) if (p.v4) feeOf.set(p.pool.toLowerCase(), p.v4.fee / 10_000);
     // Decimals of quotes (needed to value balances) and of tokens.
     const toks = [...new Set([...Q.keys(), ...cands.map(([t]) => t)])];
     const meta = await this.callMany(toks.flatMap((t) => [{ target: t, data: SEL_DECIMALS }, { target: t, data: SEL_SYMBOL }]));
@@ -467,12 +461,12 @@ export class LoopMonitor {
       const dq = this.decimals.get(x.quote);
       const q = Q.get(x.quote)!;
       if (dq === undefined || !this.decimals.has(x.token)) return;
-      const usd = (Number(sides[i] ?? 0n) / 10 ** dq) * q.priceUsd;
+      const usd = (Number(big(res[i]) ?? 0n) / 10 ** dq) * q.priceUsd;
       if (!(usd >= minQuoteUsd)) return;
       const feePct = feeOf.get(x.p.pool.toLowerCase()) ?? 0.3;
       const leg: LoopLegInfo = {
         quote: x.quote, feePct, depthUsd: 2 * usd, label: this.label(x.p, feePct),
-        pool: x.p.v4 ? v4PoolState({ ...x.p, v4: x.p.v4 }) : {
+        pool: {
           chain: 'robinhood', dex: x.p.dex, poolAddress: x.p.pool, poolType: x.p.kind === 'v3' ? 'v3' : 'v2',
           tokenA: x.p.token0, tokenB: x.p.token1, feeBps: Math.round(feePct * 100), lastUpdatedMs: 0,
         } as PoolState,

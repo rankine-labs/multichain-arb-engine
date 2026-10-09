@@ -1,5 +1,4 @@
 import { ethers } from 'ethers';
-import { V4_INITIALIZE_TOPIC, decodeV4Initialize, v4StateCalls, decodeV4State, v4VirtualAmounts, type V4Meta } from './v4Scan';
 
 // ============================================================================
 // UNIVERSE SCAN -- find EVERY pair that exists on 2+ pools, chain-wide
@@ -21,17 +20,14 @@ import { V4_INITIALIZE_TOPIC, decodeV4Initialize, v4StateCalls, decodeV4State, v
 
 export interface ScanFactory {
   dex: string;
-  kind: 'v2' | 'solidly' | 'v3' | 'v4';
-  factory: string;        // V4: the PoolManager (pools are found from its Initialize events)
-  stateView?: string;     // V4 only: where pool prices are read (see core/v4Scan.ts)
-  weth?: string;          // V4 only: stands in for native ETH
+  kind: 'v2' | 'solidly' | 'v3';
+  factory: string;
 }
 
 export interface ScannedPool {
   dex: string;
-  kind: 'v2' | 'solidly' | 'v3' | 'v4';
-  pool: string;       // V4: the 32-byte pool id (V4 pools have no address)
-  v4?: V4Meta;        // V4 only: fee, tick spacing, native ETH, where to read it
+  kind: 'v2' | 'solidly' | 'v3';
+  pool: string;
   token0: string;
   token1: string;
   stable?: boolean;   // Solidly stable-curve pool (the bot can't price these)
@@ -195,12 +191,12 @@ export function decodePoolCreatedLog(log: { topics: readonly string[]; data: str
 export type RawLog = { topics: string[]; data: string; address?: string; blockNumber?: string; logIndex?: string; transactionHash?: string; transactionIndex?: string };
 
 // eth_getLogs with a hard timeout (a public node can hang on a huge range).
-async function getLogsRaw(provider: ethers.JsonRpcProvider, address: string | string[], from: number, to: number, timeoutMs: number, topics?: (string | string[] | null)[]): Promise<RawLog[]> {
+async function getLogsRaw(provider: ethers.JsonRpcProvider, address: string | string[], from: number, to: number, timeoutMs: number): Promise<RawLog[]> {
   let timer: NodeJS.Timeout | undefined;
   const timeout = new Promise<never>((_, rej) => { timer = setTimeout(() => rej(new Error('getLogs timeout')), timeoutMs); });
   try {
     return await Promise.race([
-      provider.send('eth_getLogs', [{ address, fromBlock: ethers.toQuantity(from), toBlock: ethers.toQuantity(to), ...(topics ? { topics } : {}) }]) as Promise<RawLog[]>,
+      provider.send('eth_getLogs', [{ address, fromBlock: ethers.toQuantity(from), toBlock: ethers.toQuantity(to) }]) as Promise<RawLog[]>,
       timeout,
     ]);
   } finally {
@@ -217,7 +213,6 @@ const isSlowDown = (err: unknown) => /429|too many|rate limit|exceeded|allowance
 export async function getLogsAdaptive(
   provider: ethers.JsonRpcProvider, address: string | string[], from: number, to: number,
   onLogs: (logs: RawLog[]) => void, timeoutMs = 30_000, maxRange = Infinity,
-  topics?: (string | string[] | null)[],   // optional topic filter (V4: only Initialize / ModifyLiquidity)
 ): Promise<void> {
   const MIN_RANGE = 8; // keep splitting: busy stretches can overflow even a few hundred blocks
   // Explicit stack instead of recursion: safe on any range size. Big ranges
@@ -231,7 +226,7 @@ export async function getLogsAdaptive(
   while (stack.length) {
     const [f, t] = stack.pop()!;
     try {
-      onLogs(await getLogsRaw(provider, address, f, t, timeoutMs, topics));
+      onLogs(await getLogsRaw(provider, address, f, t, timeoutMs));
       slowDowns = 0;
     } catch (err) {
       if (isSlowDown(err)) {
@@ -242,7 +237,7 @@ export async function getLogsAdaptive(
       }
       if (t - f < MIN_RANGE) {
         await sleep(500);
-        onLogs(await getLogsRaw(provider, address, f, t, timeoutMs, topics)); // last try; throws if still failing
+        onLogs(await getLogsRaw(provider, address, f, t, timeoutMs)); // last try; throws if still failing
         continue;
       }
       const mid = Math.floor((f + t) / 2);
@@ -265,24 +260,6 @@ export async function listPoolsFromLogs(provider: ethers.JsonRpcProvider, f: Sca
   return pools;
 }
 
-// V4: every hookless pool from the PoolManager's Initialize events (topic
-// filter, so its Swap events are never downloaded). Hooked pools are skipped.
-export async function listV4PoolsFromLogs(provider: ethers.JsonRpcProvider, f: ScanFactory, fromBlock: number, toBlock: number, maxRange = Infinity): Promise<{ pools: ScannedPool[]; hooked: number }> {
-  if (!f.stateView || !f.weth) throw new Error(`${f.dex}: V4 needs stateView and weth`);
-  const pools: ScannedPool[] = [];
-  let hooked = 0;
-  await getLogsAdaptive(provider, f.factory, fromBlock, toBlock, (logs) => {
-    for (const l of logs) {
-      const d = decodeV4Initialize(l, f.weth!);
-      if (!d) continue;
-      if (d.hooked) { hooked++; continue; }
-      pools.push({ dex: f.dex, kind: 'v4', pool: d.id, token0: d.token0, token1: d.token1,
-        v4: { fee: d.fee, tickSpacing: d.tickSpacing, native: d.native, poolManager: lc(f.factory), stateView: lc(f.stateView!) } });
-    }
-  }, 30_000, maxRange, [V4_INITIALIZE_TOPIC]);
-  return { pools, hooked };
-}
-
 // ----------------------------------------------------------------------------
 // Saved scan state, so a restart only reads pools created since last time.
 // Compact on purpose (Robinhood has 100k+ memecoin pools): tokens are stored
@@ -293,10 +270,7 @@ export interface ScanState {
   lastBlock: Record<string, number>;          // factory (lowercase) -> last block scanned
   tokens: string[];                           // lowercase token addresses
   pools: Array<[number, string, number, number]>; // [factory index in `factories`, pool, token0 idx, token1 idx]
-  factories: string[];                        // "dex|kind|factory" (V4: "dex|v4|poolManager|stateView")
-  // V4 pools only: pool id -> [fee pips, tick spacing, 1 = native ETH]. Optional
-  // so state saved before V4 was added still loads.
-  v4?: Record<string, [number, number, number]>;
+  factories: string[];                        // "dex|kind|factory"
 }
 
 export function emptyScanState(): ScanState {
@@ -304,18 +278,20 @@ export function emptyScanState(): ScanState {
 }
 
 export function stateToPools(state: ScanState): ScannedPool[] {
-  return state.pools.flatMap(([fi, pool, i0, i1]): ScannedPool[] => {
-    const [dex, kind, factory, stateView] = state.factories[fi].split('|');
-    const base = { dex, kind: kind as ScannedPool['kind'], pool, token0: state.tokens[i0], token1: state.tokens[i1] };
-    if (kind !== 'v4') return [base];
-    const m = state.v4?.[pool];
-    if (!m || !stateView) return []; // can't read a V4 pool without its details
-    return [{ ...base, v4: { fee: m[0], tickSpacing: m[1], native: m[2] === 1, poolManager: factory, stateView } }];
-  });
+  // Guard (Oct 9): a V4 scan was briefly live and may have saved V4 pools
+  // (32-byte ids, not addresses) in the state. This code can't read them,
+  // so they are skipped instead of being sent normal pool calls.
+  const out: ScannedPool[] = [];
+  for (const [fi, pool, i0, i1] of state.pools) {
+    const [dex, kind] = state.factories[fi].split('|');
+    if (kind === 'v4' || pool.length !== 42) continue;
+    out.push({ dex, kind: kind as ScannedPool['kind'], pool, token0: state.tokens[i0], token1: state.tokens[i1] });
+  }
+  return out;
 }
 
 export function addPoolsToState(state: ScanState, f: ScanFactory, pools: ScannedPool[]) {
-  const fkey = `${f.dex}|${f.kind}|${lc(f.factory)}${f.kind === 'v4' && f.stateView ? '|' + lc(f.stateView) : ''}`;
+  const fkey = `${f.dex}|${f.kind}|${lc(f.factory)}`;
   let fi = state.factories.indexOf(fkey);
   if (fi < 0) fi = state.factories.push(fkey) - 1;
   const tokenIdx = new Map(state.tokens.map((t, i) => [t, i]));
@@ -326,11 +302,7 @@ export function addPoolsToState(state: ScanState, f: ScanFactory, pools: Scanned
     return i;
   };
   const known = new Set(state.pools.map((p) => lc(p[1])));
-  for (const p of pools) {
-    if (known.has(lc(p.pool))) continue;
-    state.pools.push([fi, p.pool, idx(p.token0), idx(p.token1)]);
-    if (p.v4) (state.v4 ??= {})[lc(p.pool)] = [p.v4.fee, p.v4.tickSpacing, p.v4.native ? 1 : 0];
-  }
+  for (const p of pools) if (!known.has(lc(p.pool))) state.pools.push([fi, p.pool, idx(p.token0), idx(p.token1)]);
 }
 
 // ----------------------------------------------------------------------------
@@ -365,7 +337,7 @@ export function derivePrices(pools: ScannedPool[], decimals: Map<string, number>
     const best = new Map<string, { quoteAmt: number; px: number }>();
     for (const p of pools) {
       if (p.stable) continue;
-      if ((p.kind === 'v3' || p.kind === 'v4') && !allowV3) continue; // V4 is concentrated liquidity too
+      if (p.kind === 'v3' && !allowV3) continue;
       const t0 = lc(p.token0), t1 = lc(p.token1);
       if (t0 !== quote && t1 !== quote) continue;
       const other = t0 === quote ? t1 : t0;
@@ -449,13 +421,6 @@ export async function scanUniverse(
     const from = (state.lastBlock[fk] ?? -1) + 1;
     if (from > latest) continue;
     try {
-      if (f.kind === 'v4') {
-        const { pools: found, hooked } = await listV4PoolsFromLogs(provider, f, from, latest, opts.maxLogRange);
-        addPoolsToState(state, f, found);
-        state.lastBlock[fk] = latest;
-        log(`[scan] ${f.dex}: +${found.length} pools, ${hooked} with hooks skipped (blocks ${from}-${latest})`);
-        continue;
-      }
       const found = await listPoolsFromLogs(provider, f, from, latest, opts.maxLogRange);
       addPoolsToState(state, f, found);
       state.lastBlock[fk] = latest;
@@ -482,24 +447,13 @@ export async function scanUniverse(
   const relevant = multi.concat(pricing);
   log(`[scan] ${all.length} pools total; reading balances for ${relevant.length}`);
 
-  // Ordinary pools: each coin's balanceOf(pool). V4 pools (no address of
-  // their own): StateView price + liquidity -> virtual amounts (core/v4Scan.ts).
   const balCalls: Call[] = [];
   for (const p of relevant) {
-    if (p.v4) { balCalls.push(...v4StateCalls(p.v4.stateView, p.pool)); continue; }
     balCalls.push({ target: p.token0, data: erc20.encodeFunctionData('balanceOf', [p.pool]) });
     balCalls.push({ target: p.token1, data: erc20.encodeFunctionData('balanceOf', [p.pool]) });
   }
   const bals = await callMany(balCalls);
-  relevant.forEach((p, i) => {
-    if (p.v4) {
-      const st = decodeV4State(bals[i * 2], bals[i * 2 + 1]);
-      const { a0, a1 } = st ? v4VirtualAmounts(st.sqrtPriceX96, st.liquidity) : { a0: 0n, a1: 0n };
-      p.bal0 = a0; p.bal1 = a1;
-      return;
-    }
-    p.bal0 = decodeUint(bals[i * 2]) ?? 0n; p.bal1 = decodeUint(bals[i * 2 + 1]) ?? 0n;
-  });
+  relevant.forEach((p, i) => { p.bal0 = decodeUint(bals[i * 2]) ?? 0n; p.bal1 = decodeUint(bals[i * 2 + 1]) ?? 0n; });
 
   // Solidly pools: stable-curve or volatile? (the bot can only price volatile)
   const solid = relevant.filter((p) => p.kind === 'solidly');
