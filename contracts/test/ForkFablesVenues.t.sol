@@ -95,38 +95,38 @@ contract RobinhoodForkTestFablesProbe is Test {
         uint256 nh;
         uint256 bestLiq;
         uint256 bestIdx = type(uint256).max;
+        bytes32[] memory hashes = new bytes32[](es.length);
+        uint256 nHash;
+        uint256 hookFlagsOr;
+        uint256 hookFlagsAnd = type(uint256).max;
         for (uint256 i = 0; i < es.length; i++) {
             IFablesRegistry.PoolKey memory k = es[i].key;
             uint128 liq = IStateView(STATE_VIEW).getLiquidity(es[i].id);
-            (uint160 sp, , , uint24 lpFee) = IStateView(STATE_VIEW).getSlot0(es[i].id);
-            if (i < 12) console.log(string.concat("FABLES pool ", vm.toString(i), " c0 ", vm.toString(k.currency0), " c1 ", vm.toString(k.currency1),
-                " fee ", vm.toString(uint256(k.fee)), " ts ", vm.toString(int256(k.tickSpacing)), " hooks ", vm.toString(k.hooks)));
-            if (i < 12) console.log(string.concat("FABLES   active ", es[i].active ? "y" : "n", " liq ", vm.toString(uint256(liq)), " lpFee ", vm.toString(uint256(lpFee)), " sqrtP ", vm.toString(uint256(sp))));
+            hookFlagsOr |= uint160(k.hooks) & 0x3fff;
+            hookFlagsAnd &= uint160(k.hooks) & 0x3fff;
+            bytes32 ch = k.hooks.codehash;
             bool seen;
-            for (uint256 j = 0; j < nh; j++) if (hooks[j] == k.hooks) seen = true;
+            for (uint256 j = 0; j < nHash; j++) if (hashes[j] == ch) seen = true;
+            if (!seen) hashes[nHash++] = ch;
             if (!seen) hooks[nh++] = k.hooks;
             if ((k.currency1 == USDG || k.currency0 == USDG) && (k.currency0 == address(0) || k.currency0 == WETH || k.currency1 == WETH) && liq > bestLiq) {
                 bestLiq = liq; bestIdx = i;
             }
         }
-        for (uint256 j = 0; j < nh; j++) {
-            console.log(string.concat("FABLES hook ", vm.toString(hooks[j]), " code size ", vm.toString(hooks[j].code.length), " flags: ", _flags(hooks[j])));
-            _scan("FABLES hook", hooks[j].code);
-            bytes32 impl = vm.load(hooks[j], 0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc);
-            address ia = address(uint160(uint256(impl)));
-            if (ia.code.length > 0) {
-                console.log(string.concat("FABLES hook is a proxy, impl ", vm.toString(ia), " size ", vm.toString(ia.code.length)));
-                _scan("FABLES impl", ia.code);
-            }
-        }
+        console.log(string.concat("FABLES distinct hook codehashes ", vm.toString(nHash), " flags OR ", vm.toString(hookFlagsOr), " AND ", vm.toString(hookFlagsAnd)));
         if (bestIdx == type(uint256).max) { console.log("FABLES no ETH/USDG pool"); return; }
         IFablesRegistry.PoolKey memory key = es[bestIdx].key;
-        console.log("FABLES trying direct swap on pool", bestIdx);
+        console.log(string.concat("FABLES best pool ", vm.toString(bestIdx), " c0 ", vm.toString(key.currency0), " c1 ", vm.toString(key.currency1),
+            " fee ", vm.toString(uint256(key.fee)), " ts ", vm.toString(int256(key.tickSpacing)), " hooks ", vm.toString(key.hooks), " liq ", vm.toString(bestLiq)));
+        console.log(string.concat("FABLES best pool id ", vm.toString(es[bestIdx].id)));
 
-        // Sell 20 USDG for ETH/WETH, then sell the ETH back.
+        // Sell 20 USDG for ETH/WETH, then sell the ETH back. tx.origin is a
+        // random wallet that has never touched Fables.
+        address origin = makeAddr("random-origin");
         deal(USDG, address(this), 20e6);
         bool usdgIs0 = key.currency0 == USDG;
         vm.recordLogs();
+        vm.prank(address(this), origin);
         (bool ok, bytes memory ret) = PM.call(abi.encodeWithSelector(IPM.unlock.selector, abi.encode(key, usdgIs0, uint256(20e6))));
         console.log("FABLES swap1 USDG->ETH ok:", ok);
         if (!ok) console.log(string.concat("FABLES revert ", vm.toString(ret)));
@@ -135,32 +135,53 @@ contract RobinhoodForkTestFablesProbe is Test {
         console.log("FABLES got eth", ethGot);
         if (ok && ethGot > 0) {
             vm.recordLogs();
+            vm.prank(address(this), origin);
             (ok, ret) = PM.call(abi.encodeWithSelector(IPM.unlock.selector, abi.encode(key, !usdgIs0, ethGot)));
             console.log("FABLES swap2 ETH->USDG ok:", ok);
             if (!ok) console.log(string.concat("FABLES revert ", vm.toString(ret)));
             _logSwapFees();
             console.log("FABLES usdg back", IERC20Min(USDG).balanceOf(address(this)));
         }
+
+        _hookInfo(key.hooks);
+        _scan("FABLES hook0", key.hooks.code);
+    }
+
+    function _hookInfo(address h) internal view {
+        console.log(string.concat("FABLES hook0 ", vm.toString(h), " code size ", vm.toString(h.code.length), " flags: ", _flags(h)));
+        bytes32 impl = vm.load(h, 0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc);
+        if (impl != bytes32(0)) console.log(string.concat("FABLES hook impl slot ", vm.toString(impl)));
     }
 
     // Walks the code opcode by opcode (skipping PUSH data) and prints every
     // 4-byte constant pushed (function selectors it dispatches on or calls)
     // plus whether it reads tx.origin (ORIGIN, 0x32) or delegates (0xf4).
-    function _scan(string memory label, bytes memory code) internal pure {
+    function _scan(string memory label, bytes memory code) internal view {
         string memory sels;
         bool origin;
         bool delegate;
         uint256 n;
+        uint256 nOrigin;
         for (uint256 i = 0; i < code.length; i++) {
             uint8 op = uint8(code[i]);
-            if (op == 0x32) origin = true;
+            if (op == 0x32) {
+                origin = true;
+                if (nOrigin < 4) {
+                    uint256 lo = i >= 12 ? i - 12 : 0;
+                    uint256 hi = i + 28 < code.length ? i + 28 : code.length;
+                    bytes memory ctx = new bytes(hi - lo);
+                    for (uint256 q = lo; q < hi; q++) ctx[q - lo] = code[q];
+                    console.log(string.concat(label, " ORIGIN at ", vm.toString(i), " ctx(from ", vm.toString(lo), ") ", vm.toString(ctx)));
+                    nOrigin++;
+                }
+            }
             if (op == 0xf4) delegate = true;
             if (op >= 0x60 && op <= 0x7f) {
                 uint256 len = op - 0x5f;
-                if (op == 0x63 && i + 4 < code.length && n < 90) {
+                if (op == 0x63 && i + 4 < code.length && n < 120) {
                     bytes4 v = bytes4(uint32(uint8(code[i + 1])) << 24 | uint32(uint8(code[i + 2])) << 16 | uint32(uint8(code[i + 3])) << 8 | uint32(uint8(code[i + 4])));
-                    sels = string.concat(sels, _hex4(v), " ");
-                    n++;
+                    string memory hx = _hex4(v);
+                    if (!vm.contains(sels, hx)) { sels = string.concat(sels, hx, " "); n++; }
                 }
                 i += len;
             }
