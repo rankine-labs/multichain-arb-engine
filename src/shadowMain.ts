@@ -95,6 +95,7 @@ const canPracticeTest = (dex: string) => isExecutableVenue(dex) || isPracticeTes
 // OWN MONEY (Oct 8, owner): plan and test Robinhood trades as paid from our
 // own balance, no flash loan (RH_FUNDING=flash brings loans back).
 const RH_OWN_MONEY = process.env.RH_FUNDING !== 'flash';
+const OWN_MONEY_MAX_USD = Number(process.env.OWN_MONEY_MAX_USD ?? 2_000);
 // Read prices on the extra Robinhood venues (watch only; never traded).
 // ON by default since Oct 8 (owner approved tracking); RH_EXTRA_VENUES=0 turns it off.
 const RH_EXTRA_VENUES = process.env.RH_EXTRA_VENUES !== '0';
@@ -793,7 +794,11 @@ for (const sig of ['SIGINT', 'SIGTERM'] as const) {
             process.exit(0);
       });
 }
-const MIN_COUNTED_USD = Number(process.env.GAP_MIN_USD ?? 20); // same bar as firing
+// Smallest CONFIRMED profit (after gas, vetted coins) counted as "would have
+// earned". Was the $20 firing bar, which hid every real small win; since
+// Oct 9 (owner approved) any confirmed win of 5 cents or more counts.
+// The live firing bar / safety gate is unchanged.
+const MIN_COUNTED_USD = Number(process.env.COUNT_MIN_USD ?? 0.05);
 safetyGate.allowTokens([ROBINHOOD_TOKENS.WETH, ROBINHOOD_TOKENS.USDG]);
 // "fire-ready" = from the moment we saw the trigger trade to a signed trade
 // in hand. The number to compare against competitors.
@@ -922,7 +927,10 @@ const pickLender = (
 ) => {
       const exclude = [buyPool.poolAddress, sellPool.poolAddress];
       if (chain !== 'robinhood') return pickV3Lender(lenderCandidates(chain), tokenIn, exclude);
-      if (RH_OWN_MONEY) return null; // own money: no loan, checks fund the contract's own balance
+      // Own money for trades up to OWN_MONEY_MAX_USD ($2,000); bigger trades
+      // borrow from the cheapest lender (0.01% pool) so the big wins aren't
+      // limited by our own pot (~$1,000 USDG + $300 WETH planned).
+      if (RH_OWN_MONEY && tradeSizeUsd <= OWN_MONEY_MAX_USD) return null;
       const dec = TOKEN_DECIMALS[chain]?.[tokenIn.toLowerCase()];
       const amount = dec === undefined ? null : loanUnits(tradeSizeUsd, usdPerToken, dec);
       // Unknown amount or no balances read yet: no lender (own-capital check instead).
@@ -982,7 +990,7 @@ if (research.enabled) {
             try {
                   const pairs = robinhoodWatcher.watchedPairPools().map((addrs) => addrs.map((a) => cache.get('robinhood', a)).filter((p): p is PoolState => !!p && canPracticeTest(p.dex)));
                   const gaps = findResearchGaps(pairs, isDeepRh, (p) => poolDepthUsd(p, decimalsOf, usdRhResearch), (t) => TOKEN_DECIMALS.robinhood?.[t.toLowerCase()], usdRhResearch,
-                        { mainMinUsd: Number(process.env.GAP_MIN_USD ?? 20), researchMinUsd: c.gapMinUsd, minDepthUsd: c.minDepthUsd, gasUsd: rhGasUsd(0.05), maxTradeUsd: Number(process.env.MAX_TRADE_USD ?? 5_000) });
+                        { mainMinUsd: Number(process.env.GAP_MIN_USD ?? 0.05), researchMinUsd: c.gapMinUsd, minDepthUsd: c.minDepthUsd, gasUsd: rhGasUsd(0.05), maxTradeUsd: Number(process.env.MAX_TRADE_USD ?? 5_000) });
                   for (const { reason, gap } of gaps) {
                         const vetted = safetyGate.isAllowed(gap.base) && safetyGate.isAllowed(gap.quote);
                         // A standing gap sits there for minutes: one test per 30 min is enough.
@@ -1066,8 +1074,8 @@ const fireTrade = async (o: {
             // Standing gaps carry a simulation-confirmed profit; trigger trades
             // carry the model's estimate (their simulation is counted separately).
             if (!fired.live) {
-                  if (o.source === 'gap') dryRunPnl.recordVerified(o.netProfitUsd, `${symbolOf(o.chain, o.tokenIn)}/${symbolOf(o.chain, o.tokenOut)} gap`);
-                  else dryRunPnl.recordModelOnly(o.netProfitUsd);
+                  // Gap wins are counted where they're confirmed (gap scanner), not here.
+                  if (o.source !== 'gap') dryRunPnl.recordModelOnly(o.netProfitUsd);
             }
             const readyMs = Date.now() - o.seenAtMs;
             if (o.source === 'trade') fireStats.readyMs.push(readyMs);
@@ -1596,7 +1604,15 @@ await chainManager.startAll();
       // new gap is simulated on-chain (real pool code, ~1 s) before it counts:
       //   confirmed -> fired (dry run: logged) with the SIMULATED profit
       //   not real  -> muted for 30 min so it stops repeating
-      const GAP_MIN_USD = Number(process.env.GAP_MIN_USD ?? 20);
+      // Oct 9 (owner approved): sitting gaps are TESTED from a 5-cent model
+      // profit (was $20) and count when the real-chain test confirms 2 cents+
+      // after gas. Most rival wins are sitting gaps under $1.
+      // At most GAP_TESTS_PER_MIN tests a minute (default 6) so the checking
+      // node's allowance isn't burned; failing pairs are muted 30 min.
+      const GAP_MIN_USD = Number(process.env.GAP_MIN_USD ?? 0.05);
+      const GAP_CONFIRM_MIN_USD = Number(process.env.GAP_CONFIRM_MIN_USD ?? 0.02);
+      const GAP_TESTS_PER_MIN = Number(process.env.GAP_TESTS_PER_MIN ?? 6);
+      const gapTestTimes: number[] = [];
       const GAP_FAKE_MUTE_MS = 30 * 60_000;
       const gapLastFired = new Map<string, number>();
       const gapMutedUntil = new Map<string, number>();
@@ -1636,13 +1652,18 @@ await chainManager.startAll();
                   const gaps = findStandingGaps(pairs,
                         (t) => TOKEN_DECIMALS.robinhood?.[t.toLowerCase()],
                         (t) => priceOracle.getUsdPrice('robinhood', t),
-                        { minProfitUsd: GAP_MIN_USD, flashFee: 0.0005, gasUsd: rhGasUsd(0.05), maxTradeUsd: Number(process.env.MAX_TRADE_USD ?? 5_000) });
+                        // Own money (no loan fee) for planning; the check itself borrows at 0.01% above $2,000.
+                        { minProfitUsd: GAP_MIN_USD, flashFee: RH_OWN_MONEY ? 0 : 0.0005, gasUsd: rhGasUsd(0.05), maxTradeUsd: Number(process.env.MAX_TRADE_USD ?? 5_000) });
                   let fired = 0;
                   for (const g of gaps) {
                         if (fired >= 2) break;
                         const key = `${g.buyPool.poolAddress}>${g.sellPool.poolAddress}`;
                         if (Date.now() < (gapMutedUntil.get(key) ?? 0)) continue;
                         if (Date.now() - (gapLastFired.get(key) ?? 0) < 30_000) continue;
+                        // Rate limit: drop timestamps older than a minute, stop when full.
+                        while (gapTestTimes.length && Date.now() - gapTestTimes[0] > 60_000) gapTestTimes.shift();
+                        if (gapTestTimes.length >= GAP_TESTS_PER_MIN) break;
+                        gapTestTimes.push(Date.now());
                         gapLastFired.set(key, Date.now());
                         fired++;
                         const label = `${symbolOf('robinhood', g.base)}/${symbolOf('robinhood', g.quote)}`;
@@ -1654,7 +1675,7 @@ await chainManager.startAll();
                               continue;
                         }
                         const simNet = check.status === 'profit' ? check.usd - rhGasUsd(0.05) /* gas */ : 0;
-                        if (check.status !== 'profit' || simNet < Math.max(5, GAP_MIN_USD / 2)) {
+                        if (check.status !== 'profit' || simNet < GAP_CONFIRM_MIN_USD) {
                               gapMutedUntil.set(key, Date.now() + GAP_FAKE_MUTE_MS);
                               // A revert is "wouldn't go through" (with its reason);
                               // a loss or too-small profit is "would lose money".
@@ -1666,6 +1687,12 @@ await chainManager.startAll();
                         }
                         gapStats.found++;
                         gapStats.bestUsd = Math.max(gapStats.bestUsd, simNet);
+                        // Practice results: confirmed sitting-gap wins on vetted coins count as
+                        // "would have earned" here (the firing safety gate below may still
+                        // refuse small trades; that's about sending, not about the result).
+                        const gapVetted = safetyGate.isAllowed(g.base) && safetyGate.isAllowed(g.quote);
+                        if (gapVetted && simNet >= MIN_COUNTED_USD) dryRunPnl.recordVerified(simNet, `${label} gap`);
+                        profitBands.add(simNet, torontoDay());
                         console.log(`[gap] standing gap ${label} CONFIRMED: real ~$${simNet.toFixed(2)} (model $${g.profitUsd.toFixed(2)}) on $${Math.round(g.sizeUsd)} | ${route}`);
                         await fireTrade({
                               chain: 'robinhood', tokenIn: g.quote, tokenOut: g.base, buyPool: g.buyPool, sellPool: g.sellPool,
