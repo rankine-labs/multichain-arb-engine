@@ -1631,6 +1631,12 @@ await chainManager.startAll();
       const GAP_CONFIRM_MIN_USD = Number(process.env.GAP_CONFIRM_MIN_USD ?? 0.02);
       const GAP_TESTS_PER_MIN = Number(process.env.GAP_TESTS_PER_MIN ?? 6);
       const gapTestTimes: number[] = [];
+      // ONE GAP = ONE WIN: a gap nobody takes can sit there for minutes, and
+      // re-confirming it every 30 s counted the same chance again and again.
+      // We remember both pools' price state at each confirmed win and skip the
+      // pair until either pool's price actually changes (a new chance).
+      const gapConfirmedState = new Map<string, string>();
+      const poolSig = (p: PoolState) => `${p.sqrtPriceX96 ?? ''}:${p.liquidity ?? ''}:${p.reserveA ?? ''}:${p.reserveB ?? ''}`;
       const GAP_FAKE_MUTE_MS = 30 * 60_000;
       const gapLastFired = new Map<string, number>();
       const gapMutedUntil = new Map<string, number>();
@@ -1678,6 +1684,8 @@ await chainManager.startAll();
                         const key = `${g.buyPool.poolAddress}>${g.sellPool.poolAddress}`;
                         if (Date.now() < (gapMutedUntil.get(key) ?? 0)) continue;
                         if (Date.now() - (gapLastFired.get(key) ?? 0) < 30_000) continue;
+                        const sig = `${poolSig(g.buyPool)}|${poolSig(g.sellPool)}`;
+                        if (gapConfirmedState.get(key) === sig) continue; // same gap we already counted
                         // Rate limit: drop timestamps older than a minute, stop when full.
                         while (gapTestTimes.length && Date.now() - gapTestTimes[0] > 60_000) gapTestTimes.shift();
                         if (gapTestTimes.length >= GAP_TESTS_PER_MIN) break;
@@ -1706,6 +1714,8 @@ await chainManager.startAll();
                         }
                         gapStats.found++;
                         gapStats.bestUsd = Math.max(gapStats.bestUsd, simNet);
+                        gapConfirmedState.set(key, sig);
+                        if (gapConfirmedState.size > 2_000) gapConfirmedState.clear();
                         // Practice results: confirmed sitting-gap wins on vetted coins count as
                         // "would have earned" here (the firing safety gate below may still
                         // refuse small trades; that's about sending, not about the result).
