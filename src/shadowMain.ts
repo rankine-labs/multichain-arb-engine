@@ -75,15 +75,12 @@ import { AvalancheAdapter } from './chains/avalanche';
 import { RawChainEvent, PoolState } from './core/types';
 import { priceOf, spreadPct, deepEnough } from './core/poolPrice';
 import { PairWatcher, Venue, refreshPoolState, refreshPoolsBatch } from './core/pairWatcher';
-import { scanUniverse, emptyScanState, ScanState, stateToPools, getLogsAdaptive, RawLog, pruneV4 } from './core/universeScan';
+import { scanUniverse, emptyScanState, ScanState, stateToPools, getLogsAdaptive, RawLog } from './core/universeScan';
 import { CrossQuoteMonitor, LoopMonitor, shouldScheduleFirstLoopReport } from './core/crossQuoteMonitor';
 import { NewPoolWatch } from './core/newPoolWatch';
 import { buildTokenGroups, loadTokenGroups, groupsStatusLine, TokenGroupsResult } from './core/tokenGroups';
 import { readFileSync, writeFileSync, mkdirSync, renameSync } from 'fs';
-import { ROBINHOOD_SCAN_FACTORIES, ROBINHOOD_V4_SCAN_FACTORY } from './config/knownAddresses';
-// Uniswap V4 in the chain-wide scan, the coin groups, the loop watch and the
-// new pool counter (core/v4Scan.ts). RH_V4_SCAN=0 switches it off.
-const RH_V4_SCAN = process.env.RH_V4_SCAN !== '0';
+import { ROBINHOOD_SCAN_FACTORIES } from './config/knownAddresses';
 import { buildExecuteCall, executionRequested, executorConfig, pickV3Lender } from './execution/executorCalldata';
 import { FailTally } from './core/failReasons';
 import { LenderBalances } from './core/lenderBalances';
@@ -1797,13 +1794,7 @@ await chainManager.startAll();
       const loadScanState = (): ScanState => {
             try {
                   const st = JSON.parse(readFileSync(SCAN_STATE_FILE, 'utf8'));
-                  if (st?.version === 1 && Array.isArray(st.pools)) {
-                        // Never let unfiltered V4 pools back in (Oct 9: all ~650k
-                        // of them ran the bot out of memory). See pruneV4.
-                        const pruned = pruneV4(st);
-                        if (pruned) console.log(`[scan] removed ${pruned} saved V4 pools whose coins only trade on V4`);
-                        return st;
-                  }
+                  if (st?.version === 1 && Array.isArray(st.pools)) return st;
             } catch { /* missing or unreadable: start fresh */ }
             return emptyScanState();
       };
@@ -1815,11 +1806,6 @@ await chainManager.startAll();
             } catch (err) { console.warn('[scan] could not save state:', (err as Error).message); }
       };
       let scanState: ScanState | null = null;
-      // Rebuild hooks run once after the FIRST full scan since start, so the
-      // measurement features pick up newly scanned pools (e.g. Uniswap V4)
-      // right away instead of at their next 6-hourly rebuild. Filled in below.
-      const afterFirstScan: Array<() => void> = [];
-      let firstScanDone = false;
       let scanRunning = false;
       const runRobinhoodScan = async () => {
             if (scanRunning || SCAN_TOP <= 0) return;
@@ -1832,16 +1818,9 @@ await chainManager.startAll();
                   // on the fast node before waiting 15 min. Progress is saved
                   // per factory, so a second attempt repeats nothing.
                   const scanOpts = { usdToken: ROBINHOOD_TOKENS.USDG, wrappedNative: ROBINHOOD_TOKENS.WETH, minPoolUsd: SCAN_MIN_USD,
-                        maxLogRange: Number(process.env.ROBINHOOD_SCAN_LOG_RANGE ?? 500_000), log: (m: string) => console.log(m),
-                        // Ceiling on V4 pools in the map (memory safety). RH_V4_MAX_POOLS raises it.
-                        maxV4Pools: Number(process.env.RH_V4_MAX_POOLS ?? 25_000) };
+                        maxLogRange: Number(process.env.ROBINHOOD_SCAN_LOG_RANGE ?? 500_000), log: (m: string) => console.log(m) };
                   // Gentle lane on the free node (see robinhoodScanProvider).
-                  const scanFactories = [
-                        ...ROBINHOOD_SCAN_FACTORIES,
-                        ...(RH_EXTRA_VENUES ? extraScanFactories() : []),
-                        ...(RH_V4_SCAN ? [ROBINHOOD_V4_SCAN_FACTORY] : []),
-                  ];
-                  const res = await scanUniverse(robinhoodScanProvider, scanFactories, scanOpts, scanState);
+                  const res = await scanUniverse(robinhoodScanProvider, RH_EXTRA_VENUES ? [...ROBINHOOD_SCAN_FACTORIES, ...extraScanFactories()] : ROBINHOOD_SCAN_FACTORIES, scanOpts, scanState);
                   // Progress per factory is saved even if some failed.
                   if (res.errors.length) saveScanState(scanState);
                   if (res.errors.length && !res.candidates.length) throw new Error(`scan failed: ${res.errors.join('; ').slice(0, 150)}`);
@@ -1852,9 +1831,6 @@ await chainManager.startAll();
                   // Only vetted pairs' tokens may ever be traded (safety gate allowlist).
                   safetyGate.allowTokens(top.flatMap((c) => [c.tokenA, c.tokenB]));
                   console.log(`[scan] robinhood: ${res.totalPools} pools, ${res.multiPoolPairs} pairs on 2+ pools, ${res.candidates.length} with $${SCAN_MIN_USD}+ in 2+ pools (${Math.round((Date.now() - t0) / 1000)}s)${res.errors.length ? ' errors: ' + res.errors.join('; ') : ''}`);
-                  // V4's share, for the status page: pools in the map, and
-                  // picked pairs that have a V4 pool among their deep ones.
-                  if (RH_V4_SCAN) console.log(`[scan] v4: ${res.poolsPerDex['uniswap-v4'] ?? 0} V4 pools in the map; ${top.filter((c) => c.pools.some((p) => p.kind === 'v4')).length} of ${top.length} picked pairs have a deep V4 pool`);
                   // One pair at a time: the watcher does its own exact pool discovery.
                   for (const c of top) {
                         try { await robinhoodWatcher.watch(c.tokenA, c.tokenB, { pin: true }); }
@@ -1862,7 +1838,6 @@ await chainManager.startAll();
                   }
                   const st = robinhoodWatcher.stats();
                   console.log(`[scan] robinhood now watching ${st.pairs} pairs (${st.pinned} pinned), ${st.pools} pools`);
-                  if (!firstScanDone) { firstScanDone = true; for (const f of afterFirstScan) f(); }
             } catch (err) {
                   // Usually the free public RPC rate-limiting us. Don't wait the
                   // full 6 hours: try again in 15 minutes.
@@ -1906,7 +1881,6 @@ await chainManager.startAll();
       };
       setTimeout(() => { void setupCrossQuote(); }, 90_000);
       setInterval(() => { void setupCrossQuote(); }, 6 * 60 * 60_000);
-      afterFirstScan.push(() => { void setupCrossQuote(); });
       let lastCrossTick = 0;
       let crossBusy = false;
       setInterval(async () => {
@@ -1964,10 +1938,10 @@ await chainManager.startAll();
       // One log request a minute (two when a new pool for deep coins appears).
       const NEW_POOLS_FILE = 'data/new-pools.json';
       const newPoolWatch = new NewPoolWatch({
-            factories: RH_V4_SCAN ? [...ROBINHOOD_SCAN_FACTORIES, ROBINHOOD_V4_SCAN_FACTORY] : ROBINHOOD_SCAN_FACTORIES,
-            getLogs: async (addrs, from, to, topics) => {
+            factories: ROBINHOOD_SCAN_FACTORIES,
+            getLogs: async (addrs, from, to) => {
                   const out: RawLog[] = [];
-                  await getLogsAdaptive(robinhoodScanProvider as ethers.JsonRpcProvider, addrs, from, to, (logs) => { out.push(...logs); }, 30_000, 200_000, topics);
+                  await getLogsAdaptive(robinhoodScanProvider as ethers.JsonRpcProvider, addrs, from, to, (logs) => { out.push(...logs); }, 30_000, 200_000);
                   return out;
             },
             latestBlock: () => robinhoodScanProvider.getBlockNumber(),
@@ -2048,10 +2022,6 @@ await chainManager.startAll();
       const groupsFromDisk = !!tokenGroups;
       setTimeout(() => { void setupLoops(false).then(() => (groupsFromDisk ? setupLoops(true) : undefined)); }, 3 * 60_000);
       setInterval(() => { void setupLoops(true); }, 6 * 60 * 60_000);
-      // If a coin-group build is already running (it may be using the map from
-      // before this scan), wait for it, then rebuild once with the new map.
-      const loopsAfterScan = () => { if (groupsBusy) setTimeout(loopsAfterScan, 60_000); else void setupLoops(true); };
-      afterFirstScan.push(loopsAfterScan);
       let loopBusy = false;
       let loopErrors = 0;
       setInterval(async () => {
