@@ -14,7 +14,8 @@
 import { ethers } from 'ethers';
 import { simulateRoundTrip, extractRevertData, replayRpc, isRateLimited, Rpc, SIM_EXECUTOR_ADDRESS } from '../execution/simulator';
 import { classifySimOutcome, isTradeVerdict, SimBucketTally, SimBucket } from '../core/failReasons';
-import { KIND_V2 } from '../execution/executorCalldata';
+import { KIND_V2, KIND_V4_HOOKED } from '../execution/executorCalldata';
+import { V4_POOL_MANAGER_STORAGE_SLOT, WETH_STORAGE_SLOT } from '../execution/arbExecutorBytecode';
 
 function assert(cond: boolean, msg: string) {
   if (!cond) { console.error(`FAIL: ${msg}`); process.exitCode = 1; }
@@ -181,6 +182,24 @@ async function main() {
   const own = lastCall?.[2] ?? {};
   const tokenDiff = Object.entries(own).find(([k]) => k.toLowerCase() === TOKEN.toLowerCase())?.[1] as any;
   assert(probes > 0 && tokenDiff && Object.values(tokenDiff.stateDiff)[0] === ethers.zeroPadValue(ethers.toBeHex(trade.amountIn), 32), 'own-capital check funds the contract with exactly amountIn');
+
+  // ---- 5. Hooked V4 hop (Fables): V4 switched on with the hop's PoolManager --
+  // The hop's `pool` is the hook, so the PoolManager comes from v4PoolManager.
+  const PM = '0x8366a39CC670B4001A1121B8F6A443A643e40951';
+  const HOOK = '0x06a889870C8f83640D6816319f72e2aA579b6080';
+  const WETH = '0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73';
+  const hookedHop = { kind: KIND_V4_HOOKED, pool: HOOK, tokenIn: MID, tokenOut: TOKEN, feeBps: 0, v4Fee: 0x800000, v4TickSpacing: 10, v4Native: true, v4PoolManager: PM };
+  const hookedTrade = { ...trade, hops: [trade.hops[0], hookedHop] };
+  const slotKey = (n: number) => ethers.zeroPadValue(ethers.toBeHex(n), 32).toLowerCase();
+  const h1 = await simulateRoundTrip(nodeAnswering({ error: { code: 3, message: 'execution reverted', data: insufficient(PROFIT) } }), 'hooked-chain', hookedTrade, { weth: WETH });
+  const hookedDiff = ((lastCall?.[2] ?? {})[SIM_EXECUTOR_ADDRESS]?.stateDiff ?? {}) as Record<string, string>;
+  const diffLower = Object.fromEntries(Object.entries(hookedDiff).map(([k, v]) => [k.toLowerCase(), String(v).toLowerCase()]));
+  assert(h1.status === 'profit', 'hooked V4 trade simulates');
+  assert(diffLower[slotKey(V4_POOL_MANAGER_STORAGE_SLOT)] === ethers.zeroPadValue(PM, 32).toLowerCase(), 'hooked hop: simulated contract points at the PoolManager, not the hook');
+  assert(diffLower[slotKey(WETH_STORAGE_SLOT)] === ethers.zeroPadValue(WETH, 32).toLowerCase(), 'hooked hop: simulated contract gets WETH');
+  const { v4PoolManager: _drop, ...noPm } = hookedHop;
+  const h2 = await simulateRoundTrip(nodeAnswering({ result: '0x' }), 'hooked-chain-2', { ...trade, hops: [trade.hops[0], noPm] }, { weth: WETH });
+  assert(h2.status === 'unsupported', 'hooked hop without its PoolManager -> unsupported, not guessed');
 }
 
 main().catch((err) => { console.error('FAIL: test crashed', err); process.exitCode = 1; });

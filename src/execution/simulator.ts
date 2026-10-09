@@ -4,7 +4,7 @@ import { endpointLabel, isPublicEndpoint } from '../core/endpointLabel';
 import { budgetForUrl } from '../core/nodeBudget';
 import { ethers } from 'ethers';
 import { ARB_EXECUTOR_RUNTIME_CODE, EXECUTOR_STORAGE_SLOT, FLASH_POOLS_STORAGE_SLOT, V4_POOL_MANAGER_STORAGE_SLOT, WETH_STORAGE_SLOT } from './arbExecutorBytecode';
-import { ExecutorHop, encodeExecuteRaw, encodeExecuteV3FlashRaw, KIND_V4 } from './executorCalldata';
+import { ExecutorHop, encodeExecuteRaw, encodeExecuteV3FlashRaw, KIND_V4, KIND_V4_HOOKED } from './executorCalldata';
 import { SimBucket, classifySimOutcome } from '../core/failReasons';
 
 // ============================================================================
@@ -445,10 +445,14 @@ async function simulateInner(
   const executorDiff: Record<string, string> = { [pad32(ethers.toBeHex(EXECUTOR_STORAGE_SLOT))]: pad32(SIM_CALLER) };
   // Uniswap V4 hops: switch V4 on in the simulated contract (the real one
   // needs the owner's setV4 call), pointing at that PoolManager and WETH.
-  const v4Hop = trade.hops.find((h) => h.kind === KIND_V4);
+  // Plain V4 hops name the PoolManager in `pool`; hooked ones (Fables) carry
+  // the hook there and the PoolManager in v4PoolManager.
+  const v4Hop = trade.hops.find((h) => h.kind === KIND_V4 || h.kind === KIND_V4_HOOKED);
   if (v4Hop) {
     if (!opts.weth) return { status: 'unsupported', reason: 'V4 trade needs the chain WETH address' };
-    executorDiff[pad32(ethers.toBeHex(V4_POOL_MANAGER_STORAGE_SLOT))] = pad32(v4Hop.pool);
+    const pm = v4Hop.kind === KIND_V4 ? v4Hop.pool : v4Hop.v4PoolManager;
+    if (!pm) return { status: 'unsupported', reason: 'hooked V4 hop without its PoolManager' };
+    executorDiff[pad32(ethers.toBeHex(V4_POOL_MANAGER_STORAGE_SLOT))] = pad32(pm);
     executorDiff[pad32(ethers.toBeHex(WETH_STORAGE_SLOT))] = pad32(opts.weth);
   }
   if (flash) {
