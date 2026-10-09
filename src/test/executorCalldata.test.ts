@@ -129,3 +129,50 @@ assert(pickV3Lender([cands[3], cands[4], cands[5]], WMON, []) === null, 'none su
 
 // Ramses V3 lends too (verified by the Ramses V3 lender fork test).
 assert(pickV3Lender([...cands, lp('0xa7', 'ramses-v3', 1, 10n ** 22n)], WMON, [])?.poolAddress === '0xa7', 'Ramses V3 pool can be the lender');
+
+// ---- Robinhood copy exchanges ------------------------------------------------
+// The 6 V3 copies trade exactly like the originals: KIND_V3 with the pool's
+// own address, both as the buy and the sell side, and the calldata decodes
+// back to the same route (contracts/test/ForkCopyVenues.t.sol proves the
+// contract side on a fork of the live chain).
+import { COPY_V3_CALLBACK, KIND_V4 } from '../execution/executorCalldata';
+
+const RH_WETH = '0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73';
+const RH_USDG = '0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168';
+const rhPool = (dex: string, addr: string, extra: Partial<PoolState> = {}): PoolState => ({
+  chain: 'robinhood', dex, poolAddress: addr, poolType: 'v3', tokenA: RH_WETH, tokenB: RH_USDG,
+  feeBps: 5, sqrtPriceX96: 1n, liquidity: 10n ** 18n, lastUpdatedBlock: 1, lastUpdatedMs: 0, ...extra,
+});
+const RH_UNI = rhPool('uniswap-v3', '0x3333333333333333333333333333333333333333');
+const rhBase: BuildInput = {
+  chain: 'robinhood', tokenIn: RH_WETH, buyPool: RH_UNI, sellPool: RH_UNI,
+  tradeSizeUsd: 100, netProfitUsd: 1, usdPerTokenIn: 2_500, tokenInDecimals: 18, maxBlock: 1n,
+};
+
+assert(Object.keys(COPY_V3_CALLBACK).sort().join(',') === 'giga-cl,raphael-cl,sushiswap-v3,swaphood-v3,topaz-cl,up-cl', 'all 6 copy exchanges are mapped');
+assert(['giga-cl', 'swaphood-v3'].every((d) => COPY_V3_CALLBACK[d] === 'pancakeV3SwapCallback'), 'PancakeSwap copies use the PancakeSwap callback');
+assert(['sushiswap-v3', 'up-cl', 'topaz-cl', 'raphael-cl'].every((d) => COPY_V3_CALLBACK[d] === 'uniswapV3SwapCallback'), 'Uniswap and Slipstream copies use the Uniswap callback');
+
+for (const dex of Object.keys(COPY_V3_CALLBACK)) {
+  const copy = rhPool(dex, '0x4444444444444444444444444444444444444444');
+  assert(kindForPool(copy) === KIND_V3, `${dex}: trades as KIND_V3`);
+  // Copy on the sell side (Uniswap first, copy back) and on the buy side.
+  for (const [buy, sell, label] of [[RH_UNI, copy, 'uni then copy'], [copy, RH_UNI, 'copy then uni']] as const) {
+    const b = buildExecuteCall({ ...rhBase, buyPool: buy, sellPool: sell });
+    assert(b.ok, `${dex} ${label}: calldata builds`);
+    if (!b.ok) continue;
+    const [t] = decodeExecuteCall(b.data);
+    assert(t.hops.length === 2 && t.hops.every((h: { kind: bigint }) => Number(h.kind) === KIND_V3), `${dex} ${label}: both hops KIND_V3`);
+    assert(t.hops[0].pool.toLowerCase() === buy.poolAddress && t.hops[1].pool.toLowerCase() === sell.poolAddress, `${dex} ${label}: hops point at the pools themselves`);
+    assert(t.hops[0].tokenIn === RH_WETH && t.hops[0].tokenOut === RH_USDG && t.hops[1].tokenOut === RH_WETH, `${dex} ${label}: WETH -> USDG -> WETH`);
+    assert(Number(t.hops[0].feeBps) === 0 && Number(t.hops[1].v4TickSpacing) === 0, `${dex} ${label}: no V2 fee or V4 fields on V3 hops`);
+  }
+}
+
+// Pools labelled 'v3' for pricing that the contract can NOT trade are refused.
+assert(kindForPool(rhPool('alandale', '0x5555555555555555555555555555555555555555', { variant: 'algebra' })) === null, 'Algebra pool refused (needs algebraSwapCallback)');
+const hookedV4 = { fee: 0, tickSpacing: 60, native: true, poolManager: '0x8366a39CC670B4001A1121B8F6A443A643e40951', stateView: '0xF3334192D15450CdD385c8B70e03f9A6bD9E673b', hooks: '0x' + '99'.repeat(20) };
+assert(kindForPool(rhPool('fables', '0x' + 'ab'.repeat(32), { v4: hookedV4 })) === null, 'hooked V4 pool (Fables) refused, not traded as V3');
+assert(kindForPool(rhPool('uniswap-v4', '0x' + 'ab'.repeat(32), { v4: hookedV4 })) === null, 'hooked Uniswap V4 pool refused');
+assert(kindForPool(rhPool('uniswap-v4', '0x' + 'ab'.repeat(32), { v4: { ...hookedV4, hooks: undefined } })) === KIND_V4, 'hookless Uniswap V4 pool still KIND_V4');
+assert(kindForPool(rhPool('uniswap-v4', '0x' + 'ab'.repeat(32), { v4: { ...hookedV4, hooks: '0x0000000000000000000000000000000000000000' } })) === KIND_V4, 'V4 pool with hooks = zero address still KIND_V4');

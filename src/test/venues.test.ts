@@ -1,7 +1,7 @@
 import { ethers } from 'ethers';
 import { clAmountOut, v2AmountOut, errorBps } from '../core/venueMath';
 import { poolFromPositions, exactSwap } from './helpers/v3Exact';
-import { ROBINHOOD_VENUES, isExecutableVenue, venueByFactory, extraWatcherVenues, extraScanFactories, priceableVenues } from '../config/robinhoodVenues';
+import { ROBINHOOD_VENUES, isExecutableVenue, isPracticeTestableVenue, venueByFactory, extraWatcherVenues, extraScanFactories, priceableVenues } from '../config/robinhoodVenues';
 import { ROBINHOOD_SCAN_FACTORIES } from '../config/knownAddresses';
 import { discoverPairPoolsMulticall, refreshPoolsBatch, Venue } from '../core/pairWatcher';
 
@@ -21,6 +21,14 @@ async function main() {
   assert(ROBINHOOD_VENUES.every((v) => v.executionEnabled === false), 'no extra venue is enabled for trading');
   assert(ROBINHOOD_VENUES.every((v) => !isExecutableVenue(v.id)), 'the trade gate refuses every extra venue');
   assert(['uniswap-v2', 'uniswap-v3', 'uniswap-v4', 'pancakeswap-v3', 'ramses-v2', 'ramses-v3'].every(isExecutableVenue), 'existing exchanges still pass the trade gate');
+  // PRACTICE testing gate: exactly the 6 copy exchanges whose fork test passed
+  // (contracts/test/ForkCopyVenues.t.sol), each with the CI run noted.
+  const COPIES = ['giga-cl', 'swaphood-v3', 'sushiswap-v3', 'up-cl', 'topaz-cl', 'raphael-cl'];
+  assert(COPIES.every(isPracticeTestableVenue), 'all 6 fork-tested copy exchanges are practice-testable');
+  assert(ROBINHOOD_VENUES.filter((v) => isPracticeTestableVenue(v.id)).map((v) => v.id).sort().join(',') === [...COPIES].sort().join(','), 'no other venue is practice-testable (Algebra, Fables, oracle venues etc. stay out)');
+  assert(ROBINHOOD_VENUES.filter((v) => v.practiceTested).every((v) => /actions\/runs\/\d+$/.test(v.practiceTested!.run) && /^\d{4}-\d{2}-\d{2}$/.test(v.practiceTested!.date)), 'every practice-tested venue names its CI run and date');
+  assert(!isPracticeTestableVenue('uniswap-v3') && !isPracticeTestableVenue('alandale') && !isPracticeTestableVenue(''), 'practice gate is only for listed, fork-tested venues');
+  assert(COPIES.every((d) => !isExecutableVenue(d)), 'practice-testable venues are still refused by the real trade gate');
   const all = ROBINHOOD_VENUES.flatMap((v) => v.contracts.map((c) => c.address));
   assert(all.every((a) => { try { ethers.getAddress(a.toLowerCase()); return /^0x[0-9a-fA-F]{40}$/.test(a); } catch { return false; } }), 'every address is a full 20-byte address (no shortened guesses)');
   assert(new Set(all.map((a) => a.toLowerCase())).size === all.length, 'no address listed twice');
