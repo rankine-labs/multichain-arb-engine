@@ -64,6 +64,12 @@ jobs:
           FABLES_MINUTES: '30'
         run: |
           timeout 3000 node .scripts-build/scripts/probe-fables-fee.js || true
+      # Oct 11: find the $535 practice win (UP CL -> Uniswap V2). Read-only.
+      - name: Big win check (read-only)
+        if: inputs.only == 'bigwin'
+        shell: bash
+        run: |
+          timeout 1500 node .scripts-build/scripts/probe-bigwin.js || true
       - name: Venue identification and swap-maths validation (read-only)
         if: inputs.only == 'venues'
         shell: bash
