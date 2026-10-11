@@ -105,6 +105,17 @@ const venueTally = new VenueTally(reportedVenueIds(), venueShortName);
 // own balance, no flash loan (RH_FUNDING=flash brings loans back).
 const RH_OWN_MONEY = process.env.RH_FUNDING !== 'flash';
 const OWN_MONEY_MAX_USD = Number(process.env.OWN_MONEY_MAX_USD ?? 2_000);
+// BIG GAPS ALWAYS GET LOOKED AT (Oct 11, owner approved). Pool pairs that keep
+// losing small checks are benched (6 h) or muted (5 to 30 min) to save
+// checks. But a big trade can open a real gap on exactly such a pair (Sunday's
+// $535 NET gap was on a busy pair). Any gap the bot's maths puts at
+// BENCH_BYPASS_USD ($1 default) or more ignores the bench and mutes.
+const BENCH_BYPASS_USD = Number(process.env.BENCH_BYPASS_USD ?? 1);
+// Biggest trade, in dollars (MAX_TRADE_USD). Was $5,000: on a huge gap the
+// best size can be far bigger, so big wins were cut short. Trades above the
+// own-money limit borrow, and only from a lender that really holds enough;
+// the contract still cancels anything that wouldn't make money.
+const MAX_TRADE_USD = Number(process.env.MAX_TRADE_USD ?? 20_000);
 // Coins the own-money check couldn't fund (no findable balance storage):
 // their next tests borrow instead, so they're tested rather than skipped.
 const noBalanceSlot = new Set<string>();
@@ -562,9 +573,10 @@ const queueSimulation = (
       if (simBusy[chain]) { if (chain === 'robinhood') funnelSkip('another check was running'); return; }
       if (simOff(chain) || Date.now() < (simPausedUntil[chain] ?? 0)) { if (chain === 'robinhood') funnelSkip('checking node paused (busy or out of allowance)'); return; }
       const muteKey = `${buyPool.poolAddress}>${sellPool.poolAddress}`.toLowerCase();
-      if (Date.now() < (simLoserMuted.get(muteKey) ?? 0)) { if (chain === 'robinhood') funnelSkip('same trading spots lost in the last 5 min'); return; }
+      const bigGap = modelGrossUsd >= BENCH_BYPASS_USD; // big gaps skip the mute and the bench
+      if (!bigGap && Date.now() < (simLoserMuted.get(muteKey) ?? 0)) { if (chain === 'robinhood') funnelSkip('same trading spots lost in the last 5 min'); return; }
       const routeKey = RouteScores.key(buyPool.poolAddress, sellPool.poolAddress);
-      if (chain === 'robinhood' && routeScores.isBenched(routeKey)) { funnelSkip("these two trading spots never pay out (benched 6 h)"); return; }
+      if (chain === 'robinhood' && !bigGap && routeScores.isBenched(routeKey)) { funnelSkip("these two trading spots never pay out (benched 6 h)"); return; }
       const decimals = TOKEN_DECIMALS[chain]?.[tokenIn.toLowerCase()];
       if (decimals === undefined) { if (chain === 'robinhood') funnelSkip('token decimals unknown'); return; }
       // Flash loan: borrow from the cheapest V3 pool holding the token that
@@ -1053,7 +1065,7 @@ if (research.enabled) {
             try {
                   const pairs = robinhoodWatcher.watchedPairPools().map((addrs) => addrs.map((a) => cache.get('robinhood', a)).filter((p): p is PoolState => !!p && canPracticeTest(p.dex)));
                   const gaps = findResearchGaps(pairs, isDeepRh, (p) => poolDepthUsd(p, decimalsOf, usdRhResearch), (t) => TOKEN_DECIMALS.robinhood?.[t.toLowerCase()], usdRhResearch,
-                        { mainMinUsd: Number(process.env.GAP_MIN_USD ?? 0.05), researchMinUsd: c.gapMinUsd, minDepthUsd: c.minDepthUsd, gasUsd: rhGasUsd(0.05), maxTradeUsd: Number(process.env.MAX_TRADE_USD ?? 5_000) });
+                        { mainMinUsd: Number(process.env.GAP_MIN_USD ?? 0.05), researchMinUsd: c.gapMinUsd, minDepthUsd: c.minDepthUsd, gasUsd: rhGasUsd(0.05), maxTradeUsd: MAX_TRADE_USD });
                   for (const { reason, gap } of gaps) {
                         const vetted = safetyGate.isAllowed(gap.base) && safetyGate.isAllowed(gap.quote);
                         // A standing gap sits there for minutes: one test per 30 min is enough.
@@ -1099,7 +1111,8 @@ const fireTrade = async (o: {
             const block = (r: string) => { fireStats.blocked.set(r, (fireStats.blocked.get(r) ?? 0) + 1); };
             // Pool pairs whose practice checks keep losing (benched 6 h) aren't
             // sent either: a trade the checks say never pays would only burn gas.
-            if (o.chain === 'robinhood' && o.source === 'trade' && routeScores.isBenched(RouteScores.key(o.buyPool.poolAddress, o.sellPool.poolAddress))) {
+            // Big gaps ($1+ expected, BENCH_BYPASS_USD) are sent even on a benched pair.
+            if (o.chain === 'robinhood' && o.source === 'trade' && o.netProfitUsd < BENCH_BYPASS_USD && routeScores.isBenched(RouteScores.key(o.buyPool.poolAddress, o.sellPool.poolAddress))) {
                   block('pool pair benched (practice checks keep losing)');
                   return;
             }
@@ -1741,6 +1754,10 @@ await chainManager.startAll();
       const GAP_FAKE_MUTE_MS = 30 * 60_000;
       const gapLastFired = new Map<string, number>();
       const gapMutedUntil = new Map<string, number>();
+      // Pool state when a pair was muted: a big gap on a muted pair is
+      // re-checked only if the pools actually changed since (a broken pool
+      // showing the same fake gap forever doesn't eat the check budget).
+      const gapMutedSig = new Map<string, string>();
       let gapRunning = false; // a slow simulation must not let scans pile up
       // WHEN it runs: the moment any price changes (a trade we read from the
       // feed, or a price re-sync finishing), debounced 50 ms so a burst of
@@ -1766,7 +1783,7 @@ await chainManager.startAll();
                         const unsupported = findStandingGaps(pairs,
                               (t) => TOKEN_DECIMALS.robinhood?.[t.toLowerCase()],
                               (t) => priceOracle.getUsdPrice('robinhood', t),
-                              { minProfitUsd: 0.25, flashFee: 0, gasUsd: rhGasUsd(0.05), maxTradeUsd: Number(process.env.MAX_TRADE_USD ?? 5_000) })
+                              { minProfitUsd: 0.25, flashFee: 0, gasUsd: rhGasUsd(0.05), maxTradeUsd: MAX_TRADE_USD })
                               .filter((g) => !canPracticeTest(g.buyPool.dex) || !canPracticeTest(g.sellPool.dex));
                         for (const g of unsupported.slice(0, 20)) {
                               const ex = [g.buyPool.dex, g.sellPool.dex].filter((d) => !canPracticeTest(d)).join('+');
@@ -1778,14 +1795,15 @@ await chainManager.startAll();
                         (t) => TOKEN_DECIMALS.robinhood?.[t.toLowerCase()],
                         (t) => priceOracle.getUsdPrice('robinhood', t),
                         // Own money (no loan fee) for planning; the check itself borrows at 0.01% above $2,000.
-                        { minProfitUsd: GAP_MIN_USD, flashFee: RH_OWN_MONEY ? 0 : 0.0005, gasUsd: rhGasUsd(0.05), maxTradeUsd: Number(process.env.MAX_TRADE_USD ?? 5_000) });
+                        { minProfitUsd: GAP_MIN_USD, flashFee: RH_OWN_MONEY ? 0 : 0.0005, gasUsd: rhGasUsd(0.05), maxTradeUsd: MAX_TRADE_USD });
                   let fired = 0;
                   for (const g of gaps) {
                         if (fired >= 2) break;
                         const key = `${g.buyPool.poolAddress}>${g.sellPool.poolAddress}`;
-                        if (Date.now() < (gapMutedUntil.get(key) ?? 0)) continue;
-                        if (Date.now() - (gapLastFired.get(key) ?? 0) < 30_000) continue;
                         const sig = `${poolSig(g.buyPool)}|${poolSig(g.sellPool)}`;
+                        const bigChanged = g.profitUsd >= BENCH_BYPASS_USD && gapMutedSig.get(key) !== sig;
+                        if (!bigChanged && Date.now() < (gapMutedUntil.get(key) ?? 0)) continue;
+                        if (Date.now() - (gapLastFired.get(key) ?? 0) < 30_000) continue;
                         if (gapConfirmedState.get(key) === sig) continue; // same gap we already counted
                         // Rate limit: drop timestamps older than a minute, stop when full.
                         while (gapTestTimes.length && Date.now() - gapTestTimes[0] > 60_000) gapTestTimes.shift();
@@ -1807,6 +1825,8 @@ await chainManager.startAll();
                         if (check.status !== 'skipped') venueTally.add(g.buyPool.dex, g.sellPool.dex, torontoDay(), check.status === 'profit' ? simNet : undefined);
                         if (check.status !== 'profit' || simNet < GAP_CONFIRM_MIN_USD) {
                               gapMutedUntil.set(key, Date.now() + GAP_FAKE_MUTE_MS);
+                              gapMutedSig.set(key, sig);
+                              if (gapMutedSig.size > 2_000) gapMutedSig.clear();
                               // A revert is "wouldn't go through" (with its reason);
                               // a loss or too-small profit is "would lose money".
                               if (check.status === 'fail') { gapStats.fail++; failTally.add(check.reason); }

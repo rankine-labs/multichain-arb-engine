@@ -21,8 +21,12 @@ export interface FastFilterConfig {
 minTradeToPoolLiquidityRatio: number; // e.g. 0.01 = trade must be >=1% of pool depth
 }
 
+// 0.2% (was 1%, Oct 11, owner approved). A V2 trade of 0.2% of the pool moves
+// its price about 0.4%, already more than the fees between a 0.3% pool and a
+// 0.05% pool, so with the $0.10 send minimum these trades can pay. The 1% bar
+// was sized for the old $20 minimum. Only V2-style pools are filtered here.
 export const DEFAULT_FILTER_CONFIG: FastFilterConfig = {
-minTradeToPoolLiquidityRatio: 0.01,
+minTradeToPoolLiquidityRatio: Number(process.env.FILTER_MIN_TRADE_RATIO ?? 0.002),
 };
 
 export type FilterOutcome =
