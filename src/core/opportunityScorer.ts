@@ -58,10 +58,13 @@ const competitionScore = winProb * 25;
 return Math.round(profitScore + confidenceScore + competitionScore);
 }
 
-// Below this, we don't bother pre-arming — the expected value doesn't
-// justify tying up the hot path.
-export const SIMULATE_THRESHOLD = 40;
+// Score kept for logs and ranking only. It used to also be a send gate (40
+// points), but on Robinhood the fixed parts add up to 37.5, so 40 quietly
+// demanded about $5 of profit on top of the send minimum. Oct 11 (owner):
+// the only profit bar for sending is MIN_NET_PROFIT_USD ($0.10 default), so
+// any opportunity that cleared it (score above 0) passes here.
+export const SIMULATE_THRESHOLD = 40; // informational: a "strong" opportunity
 
 export function shouldPreArm(score: number): boolean {
-return score >= SIMULATE_THRESHOLD;
+return score > 0;
 }

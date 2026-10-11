@@ -92,7 +92,32 @@ export interface ArbOpportunity {
   score: number; // 0-100, see OpportunityScorer
 }
 
-export const MIN_NET_PROFIT_USD = 20;
+// ----------------------------------------------------------------------------
+// MINIMUM PROFIT TO SEND A TRADE (all chains)
+//
+// Plain English: the bot only sends a real trade when it expects at least
+// this much profit AFTER gas, exchange fees, any loan fee and a 15% safety
+// haircut. Was a fixed $20, which meant almost none of our real wins (nearly
+// all under $20) would ever be sent once live. Owner decision Oct 11: $0.10.
+//
+// Why $0.10 is safe: a trade that loses the race costs only its gas (~2
+// cents) because the contract cancels any trade that wouldn't make money,
+// and the daily loss cap (DAILY_LOSS_CAP_USD) stops the bot if failed
+// trades burn too much gas in a day.
+//
+// Setting: MIN_EXEC_NET_USD (dollars, above 0). Unset, empty, zero or
+// invalid -> $0.10 (zero would let through trades whose profit floor rounds
+// to nothing).
+// Other bars are separate and unchanged: SIM_MIN_GROSS_USD decides what gets
+// a practice check, COUNT_MIN_USD what counts in practice reports, and the
+// contract's own minProfit check is set per trade from this expected profit.
+// ----------------------------------------------------------------------------
+export const DEFAULT_MIN_EXEC_NET_USD = 0.10;
+export function readMinExecNetUsd(raw: string | undefined = process.env.MIN_EXEC_NET_USD): number {
+  const v = raw === undefined || raw.trim() === '' ? NaN : Number(raw);
+  return Number.isFinite(v) && v > 0 ? v : DEFAULT_MIN_EXEC_NET_USD;
+}
+export const MIN_NET_PROFIT_USD = readMinExecNetUsd();
 
 // ----------------------------------------------------------------------------
 // ChainCapability — every chain adapter implements this. The core engine
