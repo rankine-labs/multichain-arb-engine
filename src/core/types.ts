@@ -114,8 +114,12 @@ export interface ArbOpportunity {
 // ----------------------------------------------------------------------------
 export const DEFAULT_MIN_EXEC_NET_USD = 0.10;
 export function readMinExecNetUsd(raw: string | undefined = process.env.MIN_EXEC_NET_USD): number {
-  const v = raw === undefined || raw.trim() === '' ? NaN : Number(raw);
-  return Number.isFinite(v) && v > 0 ? v : DEFAULT_MIN_EXEC_NET_USD;
+  if (raw === undefined || raw.trim() === '') return DEFAULT_MIN_EXEC_NET_USD;
+  const v = Number(raw);
+  if (Number.isFinite(v) && v > 0) return v;
+  // Say so loudly: a typo (e.g. "0,5") must not silently fall back to $0.10.
+  console.warn(`[config] MIN_EXEC_NET_USD="${raw}" is not a dollar amount above 0; using $${DEFAULT_MIN_EXEC_NET_USD}`);
+  return DEFAULT_MIN_EXEC_NET_USD;
 }
 export const MIN_NET_PROFIT_USD = readMinExecNetUsd();
 

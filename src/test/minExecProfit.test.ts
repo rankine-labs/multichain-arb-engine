@@ -1,7 +1,7 @@
 import { readMinExecNetUsd, DEFAULT_MIN_EXEC_NET_USD, MIN_NET_PROFIT_USD } from '../core/types';
 import { calculateAllInProfit } from '../core/profitCalculator';
 import { scoreOpportunity, shouldPreArm } from '../core/opportunityScorer';
-import { OwnMoneyBook, useOwnMoney, OWN_MONEY_CUSHION } from '../core/ownMoney';
+import { OwnMoneyBook, useOwnMoney, OWN_MONEY_CUSHION, OWN_MONEY_MAX_AGE_MS } from '../core/ownMoney';
 
 // ============================================================================
 // Send minimum ($0.10, was $20) and own-money funding (Oct 11).
@@ -61,7 +61,8 @@ async function main() {
   // 4b. Real balances (live).
   const USDG = '0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168';
   let live = false;
-  const book = new OwnMoneyBook(() => live);
+  let clock = 1_000_000;
+  const book = new OwnMoneyBook(() => live, () => clock);
   assert(book.availableUsd(USDG, 1, 6) === Infinity && book.covers(USDG, 10n ** 30n), 'practice: no balance limit, nothing to check');
   live = true;
   assert(book.availableUsd(USDG, 1, 6) === 0 && !book.covers(USDG, 1n), 'live before the first read: no own money (every trade borrows)');
@@ -71,6 +72,8 @@ async function main() {
   assert(calls[0].startsWith('0x70a08231') && calls[0].endsWith('e1'), 'reads balanceOf(the trade contract)');
   assert(Math.abs(book.availableUsd(USDG, 1, 6) - 1_000 * OWN_MONEY_CUSHION) < 1e-9, 'live: $1,000 held -> $980 usable (2% cushion)');
   assert(book.covers(USDG, 1_000n * 10n ** 6n) && !book.covers(USDG, 1_000n * 10n ** 6n + 1n), 'final check before sending: exact amount held or refused');
+  clock += OWN_MONEY_MAX_AGE_MS + 1;
+  assert(book.availableUsd(USDG, 1, 6) === 0 && !book.covers(USDG, 1n), 'balance older than 60 s: not trusted (borrow instead)');
   await book.refresh(async (cs) => cs.map(() => null), '0x00000000000000000000000000000000000000e1', [USDG]);
   assert(book.availableUsd(USDG, 1, 6) === 0, 'unreadable balance counts as zero (borrow rather than fail)');
 }

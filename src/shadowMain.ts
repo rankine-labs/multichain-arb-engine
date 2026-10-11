@@ -493,7 +493,7 @@ const plausibleProfit = (profit: bigint, amountIn: bigint): boolean =>
 // Same build + simulation as queueSimulation, but returns the result
 // instead of only logging it, and ignores the "one sim at a time" queue.
 type RoundTripCheck =
-      | { status: 'profit'; usd: number }
+      | { status: 'profit'; usd: number; loanPips: number } // loanPips: fee of the lender the check used (0 = own money)
       | { status: 'loss' | 'fail' | 'skipped'; reason: string }
       | { status: 'rate_limited' };
 const checkRoundTrip = async (
@@ -519,7 +519,7 @@ const checkRoundTrip = async (
       if (r.status === 'unsupported') { if (chain === 'robinhood') noteNoSlot(tokenIn, r.reason); return { status: 'skipped', reason: r.reason }; }
       if (r.status === 'profit') {
             if (!plausibleProfit(r.profit, built.amountIn)) return { status: 'fail', reason: 'implausible profit (bad token or pool data)' };
-            return { status: 'profit', usd: (Number(r.profit) / 10 ** decimals) * usdPerToken };
+            return { status: 'profit', usd: (Number(r.profit) / 10 ** decimals) * usdPerToken, loanPips: lender ? (lender.feePips ?? lender.feeBps * 100) : 0 };
       }
       if (r.status === 'loss') return { status: 'loss', reason: 'ends with less than it started' };
       return { status: 'fail', reason: r.reason };
@@ -1082,11 +1082,12 @@ const fireTrade = async (o: {
       chain: 'avalanche' | 'monad' | 'robinhood'; tokenIn: string; tokenOut: string;
       buyPool: any; sellPool: any; tradeSizeUsd: number; netProfitUsd: number; usdPerTokenIn: number;
       seenAtMs: number; source: 'trade' | 'gap';
-      // true when netProfitUsd already has the loan fee taken off (the
-      // practice check priced the same lender). False for trigger trades
-      // planned as own money: if this trade ends up borrowing, the fee is
-      // taken off here before it becomes the contract's profit floor.
-      netIncludesLoanFee: boolean;
+      // Loan fee (pips, 100 = 0.01%) already taken off netProfitUsd when it
+      // was worked out: 0 if it was planned as own money. If the lender
+      // chosen now charges more (balances moved, or planning priced a lender
+      // that turned out too small), the difference comes off here before it
+      // becomes the contract's profit floor.
+      plannedLoanPips: number;
 }) => {
       try {
             // Hard stop: never build a trade on an exchange that isn't cleared
@@ -1105,11 +1106,13 @@ const fireTrade = async (o: {
             // Own money or loan (same choice as the practice check, see pickLender).
             const lender = pickLender(o.chain, o.tokenIn, o.buyPool, o.sellPool, o.tradeSizeUsd, o.usdPerTokenIn);
             let netProfitUsd = o.netProfitUsd;
-            if (o.chain === 'robinhood' && lender && !o.netIncludesLoanFee) {
-                  const feePips = lender.feePips ?? lender.feeBps * 100;
-                  netProfitUsd -= o.tradeSizeUsd * feePips / 1_000_000;
-                  if (netProfitUsd < MIN_NET_PROFIT_USD) { block('loan fee leaves less than the send minimum'); return; }
+            if (o.chain === 'robinhood') {
+                  const actualPips = lender ? (lender.feePips ?? lender.feeBps * 100) : 0;
+                  netProfitUsd -= o.tradeSizeUsd * Math.max(0, actualPips - o.plannedLoanPips) / 1_000_000;
             }
+            // The one send minimum, for every kind of trade (trigger and
+            // sitting gap): MIN_NET_PROFIT_USD ($0.10 default) after all costs.
+            if (!(netProfitUsd >= MIN_NET_PROFIT_USD)) { block('expected profit under the send minimum'); return; }
             const dry = buildExecuteCall({
                   chain: o.chain, tokenIn: o.tokenIn, buyPool: o.buyPool, sellPool: o.sellPool,
                   tradeSizeUsd: o.tradeSizeUsd, netProfitUsd, usdPerTokenIn: o.usdPerTokenIn,
@@ -1165,7 +1168,7 @@ const fireTrade = async (o: {
             // carry the model's estimate (their simulation is counted separately).
             if (!fired.live) {
                   // Gap wins are counted where they're confirmed (gap scanner), not here.
-                  if (o.source !== 'gap') dryRunPnl.recordModelOnly(o.netProfitUsd);
+                  if (o.source !== 'gap') dryRunPnl.recordModelOnly(netProfitUsd);
             }
             const readyMs = Date.now() - o.seenAtMs;
             if (o.source === 'trade') fireStats.readyMs.push(readyMs);
@@ -1175,7 +1178,7 @@ const fireTrade = async (o: {
                   setTimeout(() => { void refreshOwnMoney(); }, 3_000);
                   // Worst-case gas (2x today's cost) held against the daily loss cap until the receipt.
                   safetyGate.reservePending(fired.txHash, 2 * rhGasUsd(0.05));
-                  liveTracker.track(fired.txHash, { expectedProfitUsd: o.netProfitUsd, label: `${symbolOf(o.chain, o.tokenIn)}/${symbolOf(o.chain, o.tokenOut)} ${o.buyPool.dex}>${o.sellPool.dex}` });
+                  liveTracker.track(fired.txHash, { expectedProfitUsd: netProfitUsd, label: `${symbolOf(o.chain, o.tokenIn)}/${symbolOf(o.chain, o.tokenOut)} ${o.buyPool.dex}>${o.sellPool.dex}` });
             }
             console.log(`[fire] robinhood ${fired.live ? 'LIVE' : 'DRY RUN'} (${o.source}) ready ${readyMs}ms after ${o.source === 'trade' ? 'the trigger' : 'the price update'} (sign ${fired.signMs.toFixed(1)}ms)` +
                   `${fired.txHash ? ` tx ${fired.txHash}` : ''}${fired.error ? ` error: ${fired.error}` : ''}`);
@@ -1612,7 +1615,7 @@ console.log(
             tradeSizeUsd: sizing.optimalTradeSizeUsd, netProfitUsd: profit.conservativeNetProfitUsd,
             usdPerTokenIn: usdPerToken, seenAtMs: event.receivedAtMs, source: 'trade',
             // Planned with a loan fee only when own money is switched off.
-            netIncludesLoanFee: !RH_OWN_MONEY,
+            plannedLoanPips: swap.chain === 'robinhood' && !RH_OWN_MONEY ? (rhLoanFeeBps(swap.tokenIn, buyPoolUsed, sellPoolUsed) ?? 0) * 100 : 0,
       });
 });
 
@@ -1830,8 +1833,8 @@ await chainManager.startAll();
                               // Never trust the model over the simulation.
                               tradeSizeUsd: g.sizeUsd, netProfitUsd: Math.min(g.profitUsd, simNet), usdPerTokenIn: g.quoteUsd,
                               seenAtMs: robinhoodWatcher.lastRefreshMs || Date.now(), source: 'gap',
-                              // The practice check priced the same lender, fee included.
-                              netIncludesLoanFee: true,
+                              // Fee of the lender the practice check used (already in simNet).
+                              plannedLoanPips: check.loanPips,
                         });
                   }
                   if (gapLastFired.size > 500) gapLastFired.clear();

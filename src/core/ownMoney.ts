@@ -11,7 +11,8 @@
 //   This keeps the contract's real balances (read every 15 s while live, and
 //   right after each real trade) and decides per trade:
 //     - own money, if the trade fits under BOTH the $2,000 limit and what the
-//       contract really holds of that coin (with a 2% cushion for price moves)
+//       contract really holds of that coin (with a 2% cushion for price moves,
+//       and only if the balance was read in the last 60 s)
 //     - otherwise a loan from the cheapest approved lender (0.01%)
 //   The trade SIZE is never changed here: the pools decide the size (the
 //   profit calculator picks the most profitable amount), this only decides
@@ -30,6 +31,9 @@ const pad = (a: string) => a.toLowerCase().replace(/^0x/, '').padStart(64, '0');
 // Keep 2% of the balance unused, so a price move between planning and
 // sending doesn't make an own-money trade ask for more than we hold.
 export const OWN_MONEY_CUSHION = 0.98;
+// Balances older than this aren't trusted (reads keep failing, or the owner
+// withdrew): trades borrow instead until a fresh read comes in.
+export const OWN_MONEY_MAX_AGE_MS = 60_000;
 
 export class OwnMoneyBook {
   private readonly balances = new Map<string, bigint>();
@@ -60,14 +64,16 @@ export class OwnMoneyBook {
   //   live:     the real balance, less the 2% cushion; 0 before the first read
   availableUsd(token: string, usdPerToken: number, decimals: number): number {
     if (!this.isLive()) return Infinity;
-    if (!this.lastReadMs || !(usdPerToken > 0)) return 0;
+    if (!this.lastReadMs || this.now() - this.lastReadMs > OWN_MONEY_MAX_AGE_MS || !(usdPerToken > 0)) return 0;
     return (Number(this.raw(token)) / 10 ** decimals) * usdPerToken * OWN_MONEY_CUSHION;
   }
 
   // Final check right before a live own-money send: does the contract hold
   // at least the exact amount the trade will spend?
   covers(token: string, amountIn: bigint): boolean {
-    return !this.isLive() || this.raw(token) >= amountIn;
+    if (!this.isLive()) return true;
+    const fresh = this.lastReadMs > 0 && this.now() - this.lastReadMs <= OWN_MONEY_MAX_AGE_MS;
+    return fresh && this.raw(token) >= amountIn;
   }
 }
 
