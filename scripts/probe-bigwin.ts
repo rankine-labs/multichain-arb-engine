@@ -120,7 +120,26 @@ async function tsOf(block: number): Promise<number> {
 
 interface Pair { coin: string; sym: string; coinDec: number; usdgDec: number; up: string; upUsdgIs0: boolean; v2: string; v2UsdgIs0: boolean }
 
+// Timing mode: for a trigger tx and the rival tx that closed the gap, print
+// block, position in block and the gap between them in blocks and seconds.
+async function timing(txs: string[]) {
+  const lines: string[] = [];
+  let first: { block: number; idx: number } | null = null;
+  for (const h of txs) {
+    const rc = await rpc('eth_getTransactionReceipt', [h]);
+    const block = Number(rc.blockNumber), idx = Number(rc.transactionIndex);
+    const b = await rpc('eth_getBlockByNumber', [rc.blockNumber, false]);
+    const swaps = rc.logs.filter((l: any) => T_ANY_SWAPS.includes(l.topics[0])).map((l: any) => l.address.toLowerCase().slice(0, 10));
+    const gas = Number(BigInt(rc.gasUsed) * BigInt(rc.effectiveGasPrice ?? 0)) / 1e18;
+    const rel = first ? `  -> ${block - first.block} block(s) after the first (${((block - first.block) * 0.11).toFixed(2)} s), ${block === first.block ? `same block, ${idx - first.idx} position(s) later` : ''}` : '';
+    lines.push(`${h.slice(0, 12)} block ${block} pos ${idx} of ${b.transactions.length} time ${toronto(Number(b.timestamp))} from ${rc.from} to ${rc.to} status ${rc.status} gas ${gas.toFixed(8)} ETH swaps on ${swaps.join(',')}${rel}`);
+    if (!first) first = { block, idx };
+  }
+  annotate('Big win timing', lines);
+}
+
 async function main() {
+  if (process.env.BIGWIN_TXS) return timing(process.env.BIGWIN_TXS.split(',').map((s) => s.trim()));
   const head = Number(await rpc('eth_blockNumber', []));
   const headTs = await tsOf(head);
   const fromIso = process.env.BIGWIN_FROM_UTC || (() => {

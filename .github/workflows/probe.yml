@@ -68,6 +68,9 @@ jobs:
       - name: Big win check (read-only)
         if: inputs.only == 'bigwin'
         shell: bash
+        env:
+          # Trigger tx, then the rival tx(s) that closed the gap (NET/USDG, 11:54 and 13:47).
+          BIGWIN_TXS: '0x68cee491d9802a388f2d138f4ddce3dd07a433a3f3057aa7079d6703140f4f7c,0x2dc40c5749268ae49b994ba3d44bf3696f81078160f3db33d0d06b7cbb686280,0x5eb7243a4eaede871a01c9827c82f0b09b4635b1fecc0f2e83bebe83fa58775c,0x0b8274f6442a06c06c8d076b9ecad36bcf7d695df32331040d93f0533d5635d6'
         run: |
           timeout 1500 node .scripts-build/scripts/probe-bigwin.js || true
       - name: Venue identification and swap-maths validation (read-only)
