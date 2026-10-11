@@ -72,7 +72,7 @@ import { formatSkippedOpportunity, formatHourlyDigest, formatDailyReport, format
 import { RobinhoodChainAdapter } from './chains/robinhoodChain';
 import { MonadAdapter } from './chains/monad';
 import { AvalancheAdapter } from './chains/avalanche';
-import { RawChainEvent, PoolState } from './core/types';
+import { RawChainEvent, PoolState, MIN_NET_PROFIT_USD } from './core/types';
 import { priceOf, spreadPct, deepEnough } from './core/poolPrice';
 import { PairWatcher, Venue, refreshPoolState, refreshPoolsBatch } from './core/pairWatcher';
 import { scanUniverse, emptyScanState, ScanState, stateToPools, getLogsAdaptive, RawLog } from './core/universeScan';
@@ -85,6 +85,7 @@ import { ROBINHOOD_SCAN_FACTORIES } from './config/knownAddresses';
 // from V4's history (that ran out of memory twice on Oct 9). RH_V4_SCAN=0 off.
 const RH_V4_SCAN = process.env.RH_V4_SCAN !== '0';
 import { buildExecuteCall, executionRequested, executorConfig, pickV3Lender } from './execution/executorCalldata';
+import { OwnMoneyBook, useOwnMoney } from './core/ownMoney';
 import { FailTally } from './core/failReasons';
 import { LenderBalances } from './core/lenderBalances';
 import { RouteScores, WinSizes, WIN_BARS } from './core/routeScore';
@@ -492,7 +493,7 @@ const plausibleProfit = (profit: bigint, amountIn: bigint): boolean =>
 // Same build + simulation as queueSimulation, but returns the result
 // instead of only logging it, and ignores the "one sim at a time" queue.
 type RoundTripCheck =
-      | { status: 'profit'; usd: number }
+      | { status: 'profit'; usd: number; loanPips: number } // loanPips: fee of the lender the check used (0 = own money)
       | { status: 'loss' | 'fail' | 'skipped'; reason: string }
       | { status: 'rate_limited' };
 const checkRoundTrip = async (
@@ -518,7 +519,7 @@ const checkRoundTrip = async (
       if (r.status === 'unsupported') { if (chain === 'robinhood') noteNoSlot(tokenIn, r.reason); return { status: 'skipped', reason: r.reason }; }
       if (r.status === 'profit') {
             if (!plausibleProfit(r.profit, built.amountIn)) return { status: 'fail', reason: 'implausible profit (bad token or pool data)' };
-            return { status: 'profit', usd: (Number(r.profit) / 10 ** decimals) * usdPerToken };
+            return { status: 'profit', usd: (Number(r.profit) / 10 ** decimals) * usdPerToken, loanPips: lender ? (lender.feePips ?? lender.feeBps * 100) : 0 };
       }
       if (r.status === 'loss') return { status: 'loss', reason: 'ends with less than it started' };
       return { status: 'fail', reason: r.reason };
@@ -940,6 +941,25 @@ const lenderCandidates = (chain: 'avalanche' | 'monad' | 'robinhood') => {
 // Robinhood: real coin balances of every possible lender pool, refreshed
 // every LENDER_REFRESH_MS in one bundled read (see core/lenderBalances.ts).
 const lenderBalances = new LenderBalances();
+// Own money the trade contract really holds (core/ownMoney.ts). Live only:
+// read every 15 s and after each real trade. Practice keeps the old
+// "up to OWN_MONEY_MAX_USD" assumption, so practice numbers don't change.
+const ownMoney = new OwnMoneyBook(() => robinhoodSender.live);
+// Coins the contract may hold for own-money trades (OWN_MONEY_TOKENS adds more, comma-separated).
+const OWN_MONEY_TOKENS = [ROBINHOOD_TOKENS.USDG, ROBINHOOD_TOKENS.WETH,
+      ...(process.env.OWN_MONEY_TOKENS ?? '').split(',').map((t) => t.trim()).filter((t) => /^0x[0-9a-fA-F]{40}$/.test(t))];
+// Read the contract's balances (live only; practice has nothing to read).
+// A failed read keeps the last numbers; before the first read every trade borrows.
+const refreshOwnMoney = async () => {
+      const holder = executorConfig('robinhood').executorAddress;
+      if (!robinhoodSender.live || !holder) return;
+      try {
+            rhDecisionCallMany ??= (await makeCaller(robinhoodReadProvider)).callMany;
+            await ownMoney.refresh(rhDecisionCallMany, holder, OWN_MONEY_TOKENS);
+      } catch (err) {
+            console.warn('[own-money] balance read failed (keeping last numbers):', (err as Error).message);
+      }
+};
 const LENDER_REFRESH_MS = Number(process.env.LENDER_REFRESH_MS ?? 5 * 60_000);
 // Lender must hold this many times the loan (room for price moves / fees).
 const LENDER_HEADROOM = BigInt(Math.max(1, Math.floor(Number(process.env.LENDER_HEADROOM ?? 3))));
@@ -965,8 +985,16 @@ const pickLender = (
       // limited by our own pot (~$1,000 USDG + $300 WETH planned).
       // Exception: coins whose balance storage the checker can't find can't be
       // given a pretend own-money balance, so they're tested with a loan instead.
-      if (RH_OWN_MONEY && tradeSizeUsd <= OWN_MONEY_MAX_USD && !noBalanceSlot.has(tokenIn.toLowerCase())) return null;
+      // Oct 11: live, "own money" also means the contract really holds enough
+      // of this coin (ownMoney.availableUsd); otherwise the trade borrows. The
+      // size itself is never changed here, only how it's paid for.
       const dec = TOKEN_DECIMALS[chain]?.[tokenIn.toLowerCase()];
+      if (useOwnMoney({
+            ownMoneyOn: RH_OWN_MONEY, tradeSizeUsd, ownMaxUsd: OWN_MONEY_MAX_USD,
+            ownAvailableUsd: dec === undefined ? 0 : ownMoney.availableUsd(tokenIn, usdPerToken, dec),
+            // The practice checker's balance trick, irrelevant to a real balance.
+            noBalanceSlot: !robinhoodSender.live && noBalanceSlot.has(tokenIn.toLowerCase()),
+      })) return null;
       const amount = dec === undefined ? null : loanUnits(tradeSizeUsd, usdPerToken, dec);
       // Unknown amount or no balances read yet: no lender (own-capital check instead).
       if (amount === null || !lenderBalances.lastRefreshMs) return null;
@@ -1054,6 +1082,12 @@ const fireTrade = async (o: {
       chain: 'avalanche' | 'monad' | 'robinhood'; tokenIn: string; tokenOut: string;
       buyPool: any; sellPool: any; tradeSizeUsd: number; netProfitUsd: number; usdPerTokenIn: number;
       seenAtMs: number; source: 'trade' | 'gap';
+      // Loan fee (pips, 100 = 0.01%) already taken off netProfitUsd when it
+      // was worked out: 0 if it was planned as own money. If the lender
+      // chosen now charges more (balances moved, or planning priced a lender
+      // that turned out too small), the difference comes off here before it
+      // becomes the contract's profit floor.
+      plannedLoanPips: number;
 }) => {
       try {
             // Hard stop: never build a trade on an exchange that isn't cleared
@@ -1062,9 +1096,26 @@ const fireTrade = async (o: {
                   console.log(`[exec-dryrun] ${o.chain} NOT executable: exchange not cleared for trading (${o.buyPool?.dex} / ${o.sellPool?.dex})`);
                   return;
             }
+            const block = (r: string) => { fireStats.blocked.set(r, (fireStats.blocked.get(r) ?? 0) + 1); };
+            // Pool pairs whose practice checks keep losing (benched 6 h) aren't
+            // sent either: a trade the checks say never pays would only burn gas.
+            if (o.chain === 'robinhood' && o.source === 'trade' && routeScores.isBenched(RouteScores.key(o.buyPool.poolAddress, o.sellPool.poolAddress))) {
+                  block('pool pair benched (practice checks keep losing)');
+                  return;
+            }
+            // Own money or loan (same choice as the practice check, see pickLender).
+            const lender = pickLender(o.chain, o.tokenIn, o.buyPool, o.sellPool, o.tradeSizeUsd, o.usdPerTokenIn);
+            let netProfitUsd = o.netProfitUsd;
+            if (o.chain === 'robinhood') {
+                  const actualPips = lender ? (lender.feePips ?? lender.feeBps * 100) : 0;
+                  netProfitUsd -= o.tradeSizeUsd * Math.max(0, actualPips - o.plannedLoanPips) / 1_000_000;
+            }
+            // The one send minimum, for every kind of trade (trigger and
+            // sitting gap): MIN_NET_PROFIT_USD ($0.10 default) after all costs.
+            if (!(netProfitUsd >= MIN_NET_PROFIT_USD)) { block('expected profit under the send minimum'); return; }
             const dry = buildExecuteCall({
                   chain: o.chain, tokenIn: o.tokenIn, buyPool: o.buyPool, sellPool: o.sellPool,
-                  tradeSizeUsd: o.tradeSizeUsd, netProfitUsd: o.netProfitUsd, usdPerTokenIn: o.usdPerTokenIn,
+                  tradeSizeUsd: o.tradeSizeUsd, netProfitUsd, usdPerTokenIn: o.usdPerTokenIn,
                   // Strict lookup: no default-to-18 for real trade amounts.
                   tokenInDecimals: TOKEN_DECIMALS[o.chain]?.[o.tokenIn.toLowerCase()],
                   // Deadline: the contract reverts if mined after this block. Live
@@ -1074,21 +1125,28 @@ const fireTrade = async (o: {
                   // 0 is only used in dry runs.
                   maxBlock: o.chain === 'robinhood' && robinhoodSender.live ? (robinhoodSender.deadlineBlock() ?? 0n) : 0n,
                   ...executorConfig(o.chain),
-                  v3Lender: pickLender(o.chain, o.tokenIn, o.buyPool, o.sellPool, o.tradeSizeUsd, o.usdPerTokenIn)?.poolAddress,
+                  v3Lender: lender?.poolAddress,
             });
             if ('reason' in dry) { console.log(`[exec-dryrun] ${o.chain} NOT executable: ${dry.reason}`); return; }
-            const block = (r: string) => { fireStats.blocked.set(r, (fireStats.blocked.get(r) ?? 0) + 1); };
             if (o.chain === 'robinhood' && robinhoodSender.live) {
                   // No fresh block number = no safe deadline: don't send.
                   if (robinhoodSender.deadlineBlock() === null) { block('block info stale'); return; }
                   // Readiness checks (chain id, executor role, lenders, ArbSys) must pass first.
                   if (!liveChecks.ok) { block('live checks not passed'); return; }
             }
-            // Live trades must borrow from a pool the contract owner approved
-            // (setFlashPool); anything else reverts on-chain.
-            if (o.chain === 'robinhood' && robinhoodSender.live && dry.funding !== 'v3-flash') {
-                  fireStats.blocked.set('no approved flash lender for this token', (fireStats.blocked.get('no approved flash lender for this token') ?? 0) + 1);
-                  return;
+            // Live funding. Oct 11: own-money trades are now allowed (they were
+            // all refused before, even though the plan is own money first):
+            //   - own money: only if the contract really holds the exact amount
+            //     this trade spends (re-read every 15 s and after each trade)
+            //   - loan: only from a pool the owner approved (setFlashPool);
+            //     anything else reverts on-chain
+            if (o.chain === 'robinhood' && robinhoodSender.live) {
+                  if (dry.funding === 'own') {
+                        if (!ownMoney.covers(o.tokenIn, dry.amountIn)) { block('own money too low and no approved lender'); return; }
+                  } else if (dry.funding !== 'v3-flash') {
+                        block('no approved flash lender for this token');
+                        return;
+                  }
             }
             if (o.chain !== 'robinhood') {
                   console.log(`[exec-dryrun] ${o.chain} executable: ${dry.hops.map((h) => `kind${h.kind}`).join('->')} amountIn=${dry.amountIn} ${dry.funding}`);
@@ -1110,15 +1168,17 @@ const fireTrade = async (o: {
             // carry the model's estimate (their simulation is counted separately).
             if (!fired.live) {
                   // Gap wins are counted where they're confirmed (gap scanner), not here.
-                  if (o.source !== 'gap') dryRunPnl.recordModelOnly(o.netProfitUsd);
+                  if (o.source !== 'gap') dryRunPnl.recordModelOnly(netProfitUsd);
             }
             const readyMs = Date.now() - o.seenAtMs;
             if (o.source === 'trade') fireStats.readyMs.push(readyMs);
             if (fired.txHash) {
                   fireStats.sent++;
+                  // Our balances change when it lands: re-read them a few seconds later.
+                  setTimeout(() => { void refreshOwnMoney(); }, 3_000);
                   // Worst-case gas (2x today's cost) held against the daily loss cap until the receipt.
                   safetyGate.reservePending(fired.txHash, 2 * rhGasUsd(0.05));
-                  liveTracker.track(fired.txHash, { expectedProfitUsd: o.netProfitUsd, label: `${symbolOf(o.chain, o.tokenIn)}/${symbolOf(o.chain, o.tokenOut)} ${o.buyPool.dex}>${o.sellPool.dex}` });
+                  liveTracker.track(fired.txHash, { expectedProfitUsd: netProfitUsd, label: `${symbolOf(o.chain, o.tokenIn)}/${symbolOf(o.chain, o.tokenOut)} ${o.buyPool.dex}>${o.sellPool.dex}` });
             }
             console.log(`[fire] robinhood ${fired.live ? 'LIVE' : 'DRY RUN'} (${o.source}) ready ${readyMs}ms after ${o.source === 'trade' ? 'the trigger' : 'the price update'} (sign ${fired.signMs.toFixed(1)}ms)` +
                   `${fired.txHash ? ` tx ${fired.txHash}` : ''}${fired.error ? ` error: ${fired.error}` : ''}`);
@@ -1500,7 +1560,7 @@ if (!profit.qualifies) {
 shadowLogger.record({ opportunity, outcome: 'SKIPPED_BELOW_MIN_PROFIT', ourHypotheticalReactionMs: reactionMs });
       // Only significant near-misses go to Telegram (per architecture doc:
       // "no play-by-play noise") — gross opportunity had to clear a real bar
-      // even though it netted below the $20 minimum after costs.
+      // even though it netted below the send minimum (MIN_NET_PROFIT_USD) after costs.
       if (sizing.grossProfitUsd >= 30 && nearMissAllowed(`${swap.chain}:${[swap.tokenIn, swap.tokenOut].map((t) => t.toLowerCase()).sort().join('/')}`)) {
               // Real per-DEX prices, not just USD amounts, so the person watching
               // Telegram can directly verify the bot is comparing genuine market
@@ -1524,7 +1584,7 @@ shadowLogger.record({ opportunity, outcome: 'SKIPPED_BELOW_MIN_PROFIT', ourHypot
                               grossOpportunityUsd: sizing.grossProfitUsd,
                               optimalTradeUsd: sizing.optimalTradeSizeUsd,
                               expectedNetUsd: profit.conservativeNetProfitUsd,
-                              minRequiredUsd: 20,
+                              minRequiredUsd: MIN_NET_PROFIT_USD,
                       }));
               }
       }
@@ -1554,6 +1614,8 @@ console.log(
             buyPool: buyPoolUsed, sellPool: sellPoolUsed,
             tradeSizeUsd: sizing.optimalTradeSizeUsd, netProfitUsd: profit.conservativeNetProfitUsd,
             usdPerTokenIn: usdPerToken, seenAtMs: event.receivedAtMs, source: 'trade',
+            // Planned with a loan fee only when own money is switched off.
+            plannedLoanPips: swap.chain === 'robinhood' && !RH_OWN_MONEY ? (rhLoanFeeBps(swap.tokenIn, buyPoolUsed, sellPoolUsed) ?? 0) * 100 : 0,
       });
 });
 
@@ -1771,6 +1833,8 @@ await chainManager.startAll();
                               // Never trust the model over the simulation.
                               tradeSizeUsd: g.sizeUsd, netProfitUsd: Math.min(g.profitUsd, simNet), usdPerTokenIn: g.quoteUsd,
                               seenAtMs: robinhoodWatcher.lastRefreshMs || Date.now(), source: 'gap',
+                              // Fee of the lender the practice check used (already in simNet).
+                              plannedLoanPips: check.loanPips,
                         });
                   }
                   if (gapLastFired.size > 500) gapLastFired.clear();
@@ -1796,6 +1860,9 @@ await chainManager.startAll();
       };
       setTimeout(() => { void refreshLenders(); }, 20_000);
       setInterval(() => { void refreshLenders(); }, LENDER_REFRESH_MS);
+      // Own money in the trade contract: every 15 s while live (does nothing in practice).
+      setTimeout(() => { void refreshOwnMoney(); }, 5_000);
+      setInterval(() => { void refreshOwnMoney(); }, 15_000);
       void robinhoodWatcher.watch(ROBINHOOD_TOKENS.WETH, ROBINHOOD_TOKENS.USDG, { pin: true })
             .then((n) => console.log(`[pairs] robinhood WETH/USDG: ${n} pools found`))
             .catch((err) => console.warn('[pairs] WETH/USDG discovery failed:', (err as Error).message));

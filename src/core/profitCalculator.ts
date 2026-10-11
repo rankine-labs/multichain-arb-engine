@@ -5,8 +5,9 @@ import { computeAmountOut } from './dexMath';
 // ============================================================================
 // PROFIT CALCULATOR
 // Subtracts every real cost before anything counts as an opportunity.
-// Core rule: conservative expected net profit must be >= $20 (MIN_NET_PROFIT_USD)
-// AFTER a safety-margin haircut, not before.
+// Core rule: conservative expected net profit must be >= MIN_NET_PROFIT_USD
+// (the send minimum, $0.10 by default, see types.ts) AFTER a safety-margin
+// haircut, not before.
 // ============================================================================
 
 export interface CostEstimateInputs {
