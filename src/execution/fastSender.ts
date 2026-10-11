@@ -21,7 +21,7 @@ import { existsSync } from 'fs';
 //
 // SAFETY GATE (checked before every send, live or dry):
 //   - kill switch: file data/KILL exists, or KILL_SWITCH=on
-//   - max trade size (MAX_TRADE_USD, default 5,000)
+//   - max trade size (MAX_TRADE_USD, default 20,000; was 5,000 until Oct 11)
 //   - daily loss cap (DAILY_LOSS_CAP_USD, default 25): gas burned on failed
 //     sends + any losses; once hit, no more sends until midnight UTC
 //   - max sends per minute (MAX_SENDS_PER_MIN, default 6)
@@ -37,7 +37,7 @@ export interface SafetyConfig {
 
 export function safetyConfigFromEnv(env: Record<string, string | undefined> = process.env): SafetyConfig {
   return {
-    maxTradeUsd: Number(env.MAX_TRADE_USD ?? 5_000),
+    maxTradeUsd: Number(env.MAX_TRADE_USD ?? 20_000),
     dailyLossCapUsd: Number(env.DAILY_LOSS_CAP_USD ?? 25),
     maxSendsPerMinute: Number(env.MAX_SENDS_PER_MIN ?? 6),
     killFile: env.KILL_FILE ?? 'data/KILL',

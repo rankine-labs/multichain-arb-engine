@@ -78,3 +78,9 @@ async function main() {
   assert(book.availableUsd(USDG, 1, 6) === 0, 'unreadable balance counts as zero (borrow rather than fail)');
 }
 main();
+
+// Oct 11 audit: limits that were sized for the old $20 minimum.
+import { DEFAULT_FILTER_CONFIG } from '../core/fastFilter';
+import { safetyConfigFromEnv } from '../execution/fastSender';
+assert(DEFAULT_FILTER_CONFIG.minTradeToPoolLiquidityRatio === 0.002, 'size filter: trades of 0.2%+ of a V2 pool get a look (was 1%)');
+assert(safetyConfigFromEnv({} as any).maxTradeUsd === 20_000, 'biggest trade $20,000 by default (was $5,000)');
