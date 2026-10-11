@@ -56,7 +56,7 @@ const fun = formatPlainHourly({ ...base, funnel: {
 } });
 console.log('----- funnel -----\n' + fun.split('What happened')[1]?.split('Price differences found')[0] + '------------------');
 assert(fun.includes('Trades read from the live feed: 1,240'), 'funnel: trades read');
-assert(fun.includes('900 no second trading spot with $25k+ to compare'), 'funnel: depth filter drop in plain words');
+assert(fun.includes('900 no second trading spot with $10k+ to compare'), 'funnel: depth filter drop in plain words');
 assert(fun.includes('277 price difference smaller than the fees'), 'funnel: fees drop');
 assert(fun.includes('18 estimated gain under $0.50'), 'funnel: check bar drop');
 assert(fun.includes('Sent to be checked: 2') && fun.includes('1 not checked: another check was running'), 'funnel: checker skips listed');
