@@ -467,7 +467,7 @@ const funnel = {
       tradesRead: 0,        // trades decoded from the live feed
       noPool: 0,            // couldn't identify the trading spot
       tooSmall: 0,          // trade too small to move the price
-      noPartner: 0,         // no other trading spot for the pair deep enough ($25k+)
+      noPartner: 0,         // no other trading spot for the pair deep enough (POOL_MIN_DEPTH_USD, $10k+)
       noUsdPrice: 0,        // couldn't price the token in USD
       smallerThanFees: 0,   // price difference didn't beat the fees
       found: 0,             // price differences worth a look

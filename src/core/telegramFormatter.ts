@@ -1,6 +1,7 @@
 import { ChainName } from './types';
 import type { RivalSummary } from './rivalWatch';
 import { ProfitBands } from './profitBands';
+import { POOL_MIN_DEPTH_USD } from './poolPrice';
 import type { NewPoolSummary } from './newPoolWatch';
 import type { LoopRow, PegRow, LoopQuote } from './crossQuoteMonitor';
 import type { GapRow } from './crossQuoteMonitor';
@@ -363,7 +364,7 @@ export function formatPlainHourly(r: PlainHourlyInput): string {
     const out: string[] = [];
     if (f.noPool) out.push(`${n(f.noPool)} trading spot not recognised`);
     if (f.tooSmall) out.push(`${n(f.tooSmall)} trade too small to move the price`);
-    if (f.noPartner) out.push(`${n(f.noPartner)} no second trading spot with $25k+ to compare`);
+    if (f.noPartner) out.push(`${n(f.noPartner)} no second trading spot with $${Math.round(POOL_MIN_DEPTH_USD / 1000)}k+ to compare`);
     if (f.noUsdPrice) out.push(`${n(f.noUsdPrice)} token has no USD price`);
     if (f.smallerThanFees) out.push(`${n(f.smallerThanFees)} price difference smaller than the fees`);
     for (const o of out) L.push(`  ➖ ${esc(o)}`);
