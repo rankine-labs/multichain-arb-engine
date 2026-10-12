@@ -64,6 +64,17 @@ jobs:
           FABLES_MINUTES: '30'
         run: |
           timeout 3000 node .scripts-build/scripts/probe-fables-fee.js || true
+      # Oct 11: is the every-block reader worth building? Both read-only.
+      - name: Missed-trigger money test (read-only)
+        if: inputs.only == 'missed'
+        shell: bash
+        run: |
+          timeout 2700 node .scripts-build/scripts/probe-missed.js || true
+      - name: Every-block reader load test (read-only)
+        if: inputs.only == 'blockpoll'
+        shell: bash
+        run: |
+          timeout 900 node .scripts-build/scripts/probe-blockpoll.js || true
       - name: Venue identification and swap-maths validation (read-only)
         if: inputs.only == 'venues'
         shell: bash
