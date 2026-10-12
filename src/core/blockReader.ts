@@ -184,14 +184,26 @@ export interface BlockReaderOptions {
   //   because the bot's own price reads were refused), so it never adds load
   //   to a node that is already pushing back.
   paused?: () => boolean;
+  callTimeoutMs?: number;           // hard limit per node call (default 4000)
 }
 
 // Pauses after errors (milliseconds).
 const RATE_LIMIT_PAUSE_MS = 1000;   // first 429; doubles for each one in a row, up to LONG_PAUSE_MS
 const ERROR_PAUSE_MS = 500;
 const LONG_PAUSE_MS = 30_000;
+const WATCHDOG_MS = 15_000;          // no finished poll for this long = restart the loop
 const LONG_PAUSE_AFTER = 20;        // errors in a row before the long pause
-const TIMING_SAMPLES = 200;         // how many recent request timings to keep for the median
+const TIMING_SAMPLES = 200;
+// Hard limit on one node call. Oct 12: on the server the reader stopped after
+// 4 polls, most likely a request that never finished. Whatever the cause, a
+// call that takes longer than this is abandoned and counted as an error.
+const CALL_TIMEOUT_MS = 4_000;
+function withTimeout<T>(p: Promise<T>, ms: number = CALL_TIMEOUT_MS): Promise<T> {
+  ms = ms || CALL_TIMEOUT_MS;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const t = new Promise<never>((_, rej) => { timer = setTimeout(() => rej(new Error(`node call timed out after ${ms} ms`)), ms); });
+  return Promise.race([p, t]).finally(() => { if (timer) clearTimeout(timer); }) as Promise<T>;
+}         // how many recent request timings to keep for the median
 
 // Does this error mean "you are asking too often"?
 function isRateLimit(err: any): boolean {
@@ -222,9 +234,12 @@ export class BlockReader {
   private timer: ReturnType<typeof setTimeout> | null = null;
   private delayMs: number;           // wait before the next poll
   private errorsInRow = 0;
+  private generation = 0;              // loop id (a restarted loop retires the old one)
+  private lastPollDoneAt = 0;
+  private watchdog: ReturnType<typeof setInterval> | null = null;
   private limitsInRow = 0;            // 429s in a row (exponential pause)
   private timings: number[] = [];    // recent eth_getLogs durations (ms)
-  private counts = { polls: 0, ok: 0, errors: 0, rateLimited: 0, updates: 0, skippedRanges: 0, pausedPolls: 0 };
+  private counts = { polls: 0, ok: 0, errors: 0, rateLimited: 0, updates: 0, skippedRanges: 0, pausedPolls: 0, restarts: 0 };
 
   constructor(o: BlockReaderOptions) {
     this.o = o;
@@ -240,18 +255,36 @@ export class BlockReader {
   start(): void {
     if (this.running) return;
     this.running = true;
+    const gen = ++this.generation;
     const tick = async () => {
-      if (!this.running) return;
+      if (!this.running || gen !== this.generation) return;
       try { await this.pollOnce(); } catch (e) { /* pollOnce never throws, this is a last safety net */ }
-      if (!this.running) return;
+      this.lastPollDoneAt = this.now();
+      if (!this.running || gen !== this.generation) return;
       this.timer = setTimeout(tick, this.delayMs);
     };
+    this.lastPollDoneAt = this.now();
     this.timer = setTimeout(tick, 0);
+    // Watchdog: if no poll has finished for 15 s (longer than the longest
+    // pause plus a timed-out call), start a fresh loop and count a restart.
+    if (!this.watchdog) {
+      this.watchdog = setInterval(() => {
+        if (!this.running) return;
+        if (this.now() - this.lastPollDoneAt > WATCHDOG_MS + this.delayMs) {
+          this.counts.restarts++;
+          if (this.timer) clearTimeout(this.timer);
+          this.running = false;
+          this.start();
+        }
+      }, 5_000);
+      (this.watchdog as any).unref?.();
+    }
   }
 
   // Stop the loop. A poll already in flight finishes but schedules nothing.
   stop(): void {
     this.running = false;
+    if (this.watchdog) { clearInterval(this.watchdog); this.watchdog = null; }
     if (this.timer) clearTimeout(this.timer);
     this.timer = null;
   }
@@ -270,7 +303,7 @@ export class BlockReader {
       // 1. Refresh the newest block number every headEveryMs (and on the first poll).
       const t = this.now();
       if (this.head < 0 || (!this.o.rpcBatch && t - this.headAt >= this.headEveryMs)) {
-        const h = toNum(await this.o.rpc('eth_blockNumber', []));
+        const h = toNum(await withTimeout(this.o.rpc('eth_blockNumber', []), this.o.callTimeoutMs));
         if (h === null) throw new Error('eth_blockNumber returned an unreadable value');
         this.head = Math.max(this.head, h);
         this.headAt = t;
@@ -308,7 +341,7 @@ export class BlockReader {
       try {
         if (this.o.rpcBatch) {
           // One request, same server: its newest block, then its events.
-          const [h, r] = await this.o.rpcBatch([{ method: 'eth_blockNumber', params: [] }, { method: 'eth_getLogs', params: [filter] }]);
+          const [h, r] = await withTimeout(this.o.rpcBatch([{ method: 'eth_blockNumber', params: [] }, { method: 'eth_getLogs', params: [filter] }]), this.o.callTimeoutMs);
           const hn = toNum(h);
           if (hn === null) throw new Error('eth_blockNumber returned an unreadable value');
           headBefore = hn;
@@ -317,7 +350,7 @@ export class BlockReader {
           if (r instanceof Error) throw r;
           logs = Array.isArray(r) ? r : [];
         } else {
-          const r = await this.o.rpc('eth_getLogs', [filter]);
+          const r = await withTimeout(this.o.rpc('eth_getLogs', [filter]), this.o.callTimeoutMs);
           logs = Array.isArray(r) ? r : [];
         }
       } catch (e) {
@@ -405,7 +438,7 @@ export class BlockReader {
     return [...this.errorKinds.entries()].sort((a, b) => b[1] - a[1]).slice(0, max).map(([k, n]) => `${k} x${n}`).join('; ');
   }
 
-  stats(): { polls: number; ok: number; errors: number; rateLimited: number; updates: number; skippedRanges: number; pausedPolls: number; lastBlock: number; lagBlocks: number; medianMs: number } {
+  stats(): { polls: number; ok: number; errors: number; rateLimited: number; updates: number; skippedRanges: number; pausedPolls: number; restarts: number; lastBlock: number; lagBlocks: number; medianMs: number } {
     const s = [...this.timings].sort((a, b) => a - b);
     let medianMs = 0;
     if (s.length) {

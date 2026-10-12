@@ -262,6 +262,12 @@ async function main() {
     for (let i = 0; i < 3; i++) { await r.pollOnce(); waits.push(r.nextDelayMs()); }
     assert(waits.join(',') === '1000,2000,4000', `rate limited in a row: pause doubles (got ${waits.join(',')})`);
   }
+  {
+    // A node call that never answers is abandoned and counted as an error.
+    const r = new BlockReader({ rpc: () => new Promise(() => {}), poolManager: PM, addresses: () => [A], v4Ids: () => new Set(), onUpdates: () => {}, callTimeoutMs: 50 });
+    await r.pollOnce();
+    assert(r.stats().errors === 1 && /timed out/.test(r.errorSummary()), 'hung node call: abandoned after the time limit, counted as an error');
+  }
 }
 
 main().catch((e) => { console.error('FAIL: unexpected error', e); process.exitCode = 1; });
