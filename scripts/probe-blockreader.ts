@@ -316,6 +316,7 @@ async function checkUpdate(u: PoolUpdate): Promise<CheckResult> {
   annotate('Block reader live check', [
     `Node ${RPC_URL.replace(/\/v2\/.*/, '/v2/***')}, ${MINUTES} min, poll every ${POLL_MS} ms. ${sel.selectionLine}`,
     `Polls ${s.polls}: ok ${s.ok}, errors ${s.errors}, rate-limited ${s.rateLimited}; median poll ${s.medianMs} ms. Probe count: ${readerRequests} reader requests, ${readerRefusals} refused as rate-limited.`,
+    `Error messages: ${reader.errorSummary(6) || 'none'}`,
     `Blocks covered ${covered} vs head advance ${headAdvance} (${headAdvance > 0 ? ((100 * covered) / headAdvance).toFixed(1) : '0'}%); skipped ranges ${s.skippedRanges}.`,
     `Lag behind newest block: median ${median(lagSamples)}, max ${lagSamples.length ? Math.max(...lagSamples) : 0} blocks (${lagSamples.length} samples; reader's own figure at end ${s.lagBlocks}).`,
     `Updates received ${updatesSeen} (reader says ${s.updates}): v2 ${kinds.v2}, v3 ${kinds.v3}, v4 ${kinds.v4}.`,

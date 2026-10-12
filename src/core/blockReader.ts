@@ -345,8 +345,13 @@ export class BlockReader {
   }
 
   // Bookkeeping for a failed poll: count it and choose the pause.
+  // Most recent error messages by kind (for the status line and probes).
+  private readonly errorKinds = new Map<string, number>();
   private fail(e: unknown): void {
     this.counts.errors++;
+    const kind = String((e as any)?.message ?? e ?? 'unknown').replace(/0x[0-9a-f]+/gi, '0x..').replace(/\d+/g, 'N').slice(0, 80);
+    this.errorKinds.set(kind, (this.errorKinds.get(kind) ?? 0) + 1);
+    if (this.errorKinds.size > 20) this.errorKinds.clear();
     this.errorsInRow++;
     const limited = isRateLimit(e);
     if (limited) this.counts.rateLimited++;
@@ -361,6 +366,11 @@ export class BlockReader {
   }
 
   // Health numbers for the status line.
+  // Error messages seen so far, most common first ("message xN").
+  errorSummary(max = 4): string {
+    return [...this.errorKinds.entries()].sort((a, b) => b[1] - a[1]).slice(0, max).map(([k, n]) => `${k} x${n}`).join('; ');
+  }
+
   stats(): { polls: number; ok: number; errors: number; rateLimited: number; updates: number; skippedRanges: number; lastBlock: number; lagBlocks: number; medianMs: number } {
     const s = [...this.timings].sort((a, b) => a - b);
     let medianMs = 0;
