@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       only:
-        description: 'Run one step only: feeds, sim, pairs, watch, universe, backtest, latency, lenders, smoke, seed, routers, v4, arbsys, nodes, multicall, simv1, ramsessim, routes, venues, fablesfee (blank = all except backtest)'
+        description: 'Run one step only: feeds, sim, pairs, watch, universe, backtest, latency, lenders, smoke, seed, routers, v4, arbsys, nodes, multicall, simv1, ramsessim, routes, venues, fablesfee, blockreader (blank = all except backtest)'
         required: false
         default: ''
 
@@ -64,6 +64,14 @@ jobs:
           FABLES_MINUTES: '30'
         run: |
           timeout 3000 node .scripts-build/scripts/probe-fables-fee.js || true
+      # Block reader (Oct 11): runs the real every-block reader against the
+      # live node for BR_MINUTES and checks a sample of the pool states it
+      # reports against the chain. Writes its own annotation. Read-only.
+      - name: Block reader live check (read-only)
+        if: inputs.only == 'blockreader'
+        shell: bash
+        run: |
+          timeout 900 node .scripts-build/scripts/probe-blockreader.js || true
       - name: Venue identification and swap-maths validation (read-only)
         if: inputs.only == 'venues'
         shell: bash

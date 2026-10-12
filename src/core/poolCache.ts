@@ -40,10 +40,33 @@ export class PoolCache {
     this.feedApplied.set(k, now);
   }
 
+  // Write an EXACT state read from a mined block (core/blockReader.ts). Not
+  // marked as a feed prediction, so the reader's next block for the same pool
+  // is never held back; an RPC refresh that started earlier still can't
+  // overwrite it (lastUpdatedMs is newer than that read's start).
+  upsertFromBlock(pool: PoolState, now = Date.now()) {
+    const k = this.key(pool.chain, pool.poolAddress);
+    this.pools.set(k, { ...pool, lastUpdatedMs: now });
+    this.blockApplied.set(k, now);
+  }
+  // When the block reader last wrote each pool. An RPC refresh that started
+  // before that is never force-written over it (see upsertIfNotNewer).
+  private blockApplied = new Map<string, number>();
+
+  // True if the trade feed wrote a predicted state for this pool in the last
+  // `ms` milliseconds (the block reader then leaves that pool alone, so an
+  // older block can't overwrite a newer prediction).
+  fedWithin(chain: ChainName, poolAddress: string, ms: number, now = Date.now()): boolean {
+    return now - (this.feedApplied.get(this.key(chain, poolAddress)) ?? 0) < ms;
+  }
+
   upsertIfNotNewer(fresh: PoolState, readStartedMs: number, now = Date.now()): boolean {
     const k = this.key(fresh.chain, fresh.poolAddress);
     const cur = this.pools.get(k);
     const fedAt = this.feedApplied.get(k) ?? 0;
+    // Exact block-reader data newer than this read: never overwrite it, not
+    // even after repeated skips (the read can only be older).
+    if (cur && (this.blockApplied.get(k) ?? 0) > readStartedMs) return false;
     if (cur && (cur.lastUpdatedMs > readStartedMs || now - fedAt < PoolCache.FEED_GRACE_MS)) {
       const n = (this.skips.get(k) ?? 0) + 1;
       if (n < 3) { this.skips.set(k, n); return false; }

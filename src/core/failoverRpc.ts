@@ -118,6 +118,9 @@ export class FailoverRouter {
   private get slowMs() { return this.opts.slowMs ?? Number(process.env.RPC_SLOW_MS ?? 500); }
 
   getStats(): FailoverStats { return { ...this.stats, onFast: this.onFast() }; }
+  // True while the main FAST node is resting after it refused or failed
+  // (the every-block reader then stays quiet so it doesn't add load).
+  mainResting(): boolean { return this.now() < (this.fasts[0]?.restUntil ?? 0); }
 
   // FAST nodes not resting right now. Without a HEAVY node, all of them
   // (nothing to fall back to, so resting would only stop reads).
@@ -290,6 +293,9 @@ export class FailoverJsonRpcProvider extends ethers.JsonRpcProvider {
   override async _send(payload: ethers.JsonRpcPayload | ethers.JsonRpcPayload[]): Promise<Array<ethers.JsonRpcResult>> {
     return this.router.send(payload) as Promise<Array<ethers.JsonRpcResult>>;
   }
+
+  // See FailoverRouter.mainResting().
+  mainResting(): boolean { return this.router.mainResting(); }
 
   override destroy() { this.heavyProvider?.destroy(); for (const p of [...this.extraFast, ...this.backupProviders]) p.destroy(); super.destroy(); }
 }

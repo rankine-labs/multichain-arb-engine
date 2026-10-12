@@ -86,6 +86,7 @@ import { ROBINHOOD_SCAN_FACTORIES } from './config/knownAddresses';
 const RH_V4_SCAN = process.env.RH_V4_SCAN !== '0';
 import { buildExecuteCall, executionRequested, executorConfig, pickV3Lender } from './execution/executorCalldata';
 import { OwnMoneyBook, useOwnMoney } from './core/ownMoney';
+import { BlockReader, PoolUpdate } from './core/blockReader';
 import { FailTally } from './core/failReasons';
 import { LenderBalances } from './core/lenderBalances';
 import { RouteScores, WinSizes, WIN_BARS } from './core/routeScore';
@@ -1773,6 +1774,11 @@ await chainManager.startAll();
       // We remember both pools' price state at each confirmed win and skip the
       // pair until either pool's price actually changes (a new chance).
       const gapConfirmedState = new Map<string, string>();
+      // Oct 11 review: with prices now updated every block, a tiny unrelated
+      // trade changes a pool's state and used to make the same open gap count
+      // again. Now a confirmed gap counts again only after it CLOSED (left the
+      // scan's list) or at least doubled in size. Value = model profit when confirmed.
+      const gapConfirmedOpen = new Map<string, number>();
       const poolSig = (p: PoolState) => `${p.sqrtPriceX96 ?? ''}:${p.liquidity ?? ''}:${p.reserveA ?? ''}:${p.reserveB ?? ''}`;
       const GAP_FAKE_MUTE_MS = 30 * 60_000;
       const gapLastFired = new Map<string, number>();
@@ -1822,6 +1828,9 @@ await chainManager.startAll();
                           // Top 3 pool combinations per coin pair (was only the best): a muted
                           // combination no longer hides the other pools of the same pair.
                           perPair: 3 });
+                  // Gaps that closed since they were confirmed may count again.
+                  const openNow = new Set(gaps.map((g) => `${g.buyPool.poolAddress}>${g.sellPool.poolAddress}`));
+                  for (const k of gapConfirmedOpen.keys()) if (!openNow.has(k)) gapConfirmedOpen.delete(k);
                   let fired = 0;
                   for (const g of gaps) {
                         if (fired >= 2) break;
@@ -1835,6 +1844,8 @@ await chainManager.startAll();
                         const bigFresh = g.profitUsd >= BENCH_BYPASS_USD && gapLastSig.get(key) !== sig;
                         if (!bigFresh && Date.now() - (gapLastFired.get(key) ?? 0) < 30_000) continue;
                         if (gapConfirmedState.get(key) === sig) continue; // same gap we already counted
+                        const wasConfirmed = gapConfirmedOpen.get(key);
+                        if (wasConfirmed !== undefined && g.profitUsd < 2 * wasConfirmed) continue; // still the same open gap
                         // Rate limits: drop timestamps older than a minute; skip when full.
                         while (gapTestTimes.length && Date.now() - gapTestTimes[0] > 60_000) gapTestTimes.shift();
                         while (gapBigTimes.length && Date.now() - gapBigTimes[0] > 60_000) gapBigTimes.shift();
@@ -1871,6 +1882,8 @@ await chainManager.startAll();
                         gapStats.found++;
                         gapStats.bestUsd = Math.max(gapStats.bestUsd, simNet);
                         gapConfirmedState.set(key, sig);
+                        gapConfirmedOpen.set(key, g.profitUsd);
+                        if (gapConfirmedOpen.size > 2_000) gapConfirmedOpen.clear();
                         if (gapConfirmedState.size > 2_000) gapConfirmedState.clear();
                         // Practice results: confirmed sitting-gap wins on vetted coins count as
                         // "would have earned" here (the firing safety gate below may still
@@ -1899,6 +1912,83 @@ await chainManager.startAll();
             }
       };
       setInterval(() => { void runGapScan(); }, 5_000);
+
+      // EVERY-BLOCK READER (core/blockReader.ts, Oct 11, owner approved).
+      // About half of all trades come through apps the feed decoder can't read,
+      // so their price effect used to show up only at the 5 s refresh. The
+      // reader asks the free node for each new block's pool events (~every
+      // 0.15 s) and writes the exact new prices into the cache, then runs the
+      // gap scan. BLOCK_READER=0 turns it off; BLOCK_READER_POLL_MS sets the pace.
+      if (process.env.BLOCK_READER !== '0') {
+            const READER_URL = process.env.BLOCK_READER_RPC || 'https://rpc.mainnet.chain.robinhood.com';
+            // Plain request, outside the price-read failover: a refused poll is
+            // simply retried by the reader (it never moves to the paid/backup node).
+            const readerRpc = async (method: string, params: unknown[]) => {
+                  const res = await fetch(READER_URL, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }), signal: AbortSignal.timeout(3_000) });
+                  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                  const j: any = await res.json();
+                  if (j.error) throw new Error(`${j.error.code ?? ''} ${j.error.message ?? 'rpc error'}`);
+                  return j.result;
+            };
+            // Same, but several calls in one request (answered by one server).
+            // A call that failed comes back as an Error in its slot.
+            const readerBatch = async (calls: Array<{ method: string; params: unknown[] }>) => {
+                  const res = await fetch(READER_URL, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(calls.map((c, i) => ({ jsonrpc: '2.0', id: i, method: c.method, params: c.params }))), signal: AbortSignal.timeout(3_000) });
+                  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                  const arr: any[] = await res.json();
+                  if (!Array.isArray(arr)) throw new Error('batch answer was not a list');
+                  return calls.map((_, i) => {
+                        const r = arr.find((x) => x && x.id === i);
+                        if (!r) return new Error('missing batch answer');
+                        return r.error ? new Error(`${r.error.code ?? ''} ${r.error.message ?? 'rpc error'}`) : r.result;
+                  });
+            };
+            const watched = () => robinhoodWatcher.watchedPairPools().flat().map((a) => a.toLowerCase());
+            // Leave a pool alone if the feed just applied a predicted trade to it.
+            const FEED_FRESH_MS = Number(process.env.BLOCK_READER_FEED_GRACE_MS ?? 400);
+            let readerApplied = 0;
+            const applyUpdate = (u: PoolUpdate): boolean => {
+                  const cur = cache.get('robinhood', u.pool);
+                  if (!cur || cur.lastUpdatedBlock > u.block) return false;
+                  if (cache.fedWithin('robinhood', cur.poolAddress, FEED_FRESH_MS)) return false;
+                  if (u.kind === 'v2') {
+                        if (u.reserve0 === undefined || u.reserve1 === undefined || cur.reserveA === undefined) return false;
+                        if (cur.reserveA === u.reserve0 && cur.reserveB === u.reserve1) return false;
+                        cache.upsertFromBlock({ ...cur, reserveA: u.reserve0, reserveB: u.reserve1, lastUpdatedBlock: u.block });
+                  } else {
+                        if (u.sqrtPriceX96 === undefined || cur.poolType !== 'v3') return false;
+                        if (cur.sqrtPriceX96 === u.sqrtPriceX96 && cur.liquidity === u.liquidity) return false;
+                        cache.upsertFromBlock({ ...cur, sqrtPriceX96: u.sqrtPriceX96, ...(u.liquidity !== undefined ? { liquidity: u.liquidity } : {}), lastUpdatedBlock: u.block });
+                  }
+                  return true;
+            };
+            const blockReader = new BlockReader({
+                  rpc: readerRpc,
+                  rpcBatch: readerBatch,
+                  // Ask for events by type only (tiny request) and keep ours here.
+                  localFilter: true,
+                  // Stay quiet while the price-read node is resting after a refusal.
+                  paused: () => robinhoodReadProvider.mainResting(),
+                  poolManager: ROBINHOOD_V4.POOL_MANAGER,
+                  addresses: () => watched().filter((a) => a.length === 42),
+                  v4Ids: () => new Set(watched().filter((a) => a.length === 66)),
+                  // ~4 polls a second (each is one request carrying 2 calls).
+                  pollMs: Number(process.env.BLOCK_READER_POLL_MS ?? 250),
+                  onUpdates: (latest) => {
+                        let n = 0;
+                        for (const u of latest.values()) if (applyUpdate(u)) n++;
+                        if (n) { readerApplied += n; requestGapScan(); }
+                  },
+            });
+            blockReader.start();
+            const logReader = () => {
+                  const st = blockReader.stats();
+                  const errs = blockReader.errorSummary(3);
+                  console.log(`[blockreader] polls ${st.polls} (ok ${st.ok}, errors ${st.errors}, rate-limited ${st.rateLimited}, paused ${st.pausedPolls}) · prices updated ${readerApplied} · median ${st.medianMs} ms · skipped ranges ${st.skippedRanges}${errs ? ' · errors: ' + errs : ''}`);
+            };
+            setTimeout(logReader, 60_000);
+            setInterval(logReader, 10 * 60_000);
+      }
       // Lender balances: one bundled read of every candidate lender pool's
       // coins + liquidity, first ~20 s after start (watch list loaded), then
       // every LENDER_REFRESH_MS. A failed read keeps the last good list.
