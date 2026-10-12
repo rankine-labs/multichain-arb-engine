@@ -575,21 +575,22 @@ const findTriggerSpot = async (rpc: (m: string, p: unknown[]) => Promise<{ resul
 // Node can't serve an older block's state ("missing trie node" etc.).
 const STATE_GONE = /missing trie node|historical state|state.*(not available|unavailable)|header not found|unknown block|pruned/i;
 
-const queueSimulation = (
+// Runs one practice check now. Returns false if it decided not to (muted,
+// benched, unbuildable...), so the check line can move on to the next gap.
+// Called only through queueSimulation (the check line) below.
+const runSimulation = (
       chain: 'avalanche' | 'monad' | 'robinhood', tokenIn: string,
       buyPool: any, sellPool: any, tradeSizeUsd: number, modelGrossUsd: number, usdPerToken: number,
       triggerHash?: string,   // Robinhood: the trade we're following, to test right after it
-) => {
-      const inFlight = simInFlight[chain] ?? 0;
-      if (inFlight > 0 && !(modelGrossUsd >= BENCH_BYPASS_USD && inFlight < SIM_MAX_PARALLEL)) { if (chain === 'robinhood') funnelSkip('another check was running'); return; }
-      if (simOff(chain) || Date.now() < (simPausedUntil[chain] ?? 0)) { if (chain === 'robinhood') funnelSkip('checking node paused (busy or out of allowance)'); return; }
+): boolean => {
+      if (simOff(chain) || Date.now() < (simPausedUntil[chain] ?? 0)) { if (chain === 'robinhood') funnelSkip('checking node paused (busy or out of allowance)'); return false; }
       const muteKey = `${buyPool.poolAddress}>${sellPool.poolAddress}`.toLowerCase();
       const bigGap = modelGrossUsd >= BENCH_BYPASS_USD; // big gaps skip the mute and the bench
-      if (!bigGap && Date.now() < (simLoserMuted.get(muteKey) ?? 0)) { if (chain === 'robinhood') funnelSkip('same trading spots lost in the last 5 min'); return; }
+      if (!bigGap && Date.now() < (simLoserMuted.get(muteKey) ?? 0)) { if (chain === 'robinhood') funnelSkip('same trading spots lost in the last 5 min'); return false; }
       const routeKey = RouteScores.key(buyPool.poolAddress, sellPool.poolAddress);
-      if (chain === 'robinhood' && !bigGap && routeScores.isBenched(routeKey)) { funnelSkip("these two trading spots never pay out (benched 6 h)"); return; }
+      if (chain === 'robinhood' && !bigGap && routeScores.isBenched(routeKey)) { funnelSkip("these two trading spots never pay out (benched 6 h)"); return false; }
       const decimals = TOKEN_DECIMALS[chain]?.[tokenIn.toLowerCase()];
-      if (decimals === undefined) { if (chain === 'robinhood') funnelSkip('token decimals unknown'); return; }
+      if (decimals === undefined) { if (chain === 'robinhood') funnelSkip('token decimals unknown'); return false; }
       // Flash loan: borrow from the cheapest V3 pool holding the token that
       // isn't one of the trade's pools. None cached -> simulate own capital.
       // Same lender choice as a live trade (approved FLASH_LENDERS only), so a
@@ -601,7 +602,7 @@ const queueSimulation = (
             usdPerTokenIn: usdPerToken, tokenInDecimals: decimals, maxBlock: 0n,
             v3Lender: lender?.poolAddress,
       });
-      if ('reason' in built) { if (chain === 'robinhood') funnelSkip(`trade couldn't be built (${built.reason})`); return; }
+      if ('reason' in built) { if (chain === 'robinhood') funnelSkip(`trade couldn't be built (${built.reason})`); return false; }
       const funding = lender ? `flash loan from ${lender.dex} (${lender.feeBps / 100}% fee)` : RH_OWN_MONEY && chain === 'robinhood' ? 'own money' : 'own capital (no V3 lender cached)';
 
       simInFlight[chain] = (simInFlight[chain] ?? 0) + 1;
@@ -721,8 +722,73 @@ const queueSimulation = (
                   console.warn(`[sim] ${chain} error:`, (err as Error).message);
             } finally {
                   simInFlight[chain] = Math.max(0, (simInFlight[chain] ?? 1) - 1);
+                  // A slot just freed up: start the best gap waiting in line.
+                  setImmediate(() => drainSimQueue(chain));
             }
       }, followTrigger ? RH_TRIGGER_POLL_MS : SIM_DELAY_MS[chain]);
+      return true;
+};
+
+// ==========================================================================
+// THE CHECK LINE (Oct 12, owner approved).
+//
+// Plain English: practice checks used to be first come, first served, and a
+// gap that arrived while a check was running was simply dropped, however big.
+// Now gaps wait in a short line, best first:
+//   - up to SIM_BASE_PARALLEL (2) checks run at once; a big gap ($1+,
+//     BENCH_BYPASS_USD) may use one more slot (SIM_MAX_PARALLEL, 3)
+//   - when a slot frees up, the MOST PROFITABLE gap waiting goes next
+//   - coins we can't trade (not on the vetted list) go to the back: they run
+//     only when nothing tradable is waiting, and never take the last free slot
+//   - a gap that has waited more than SIM_QUEUE_MAX_AGE_MS (2 s) is dropped:
+//     by then the chance is usually gone
+// Live trades never wait for this line: they are sent the moment a gap is seen.
+// ==========================================================================
+const SIM_BASE_PARALLEL = Number(process.env.SIM_BASE_PARALLEL ?? 2);
+const SIM_QUEUE_MAX_AGE_MS = Number(process.env.SIM_QUEUE_MAX_AGE_MS ?? 2_000);
+const SIM_QUEUE_MAX = 30;
+type SimArgs = Parameters<typeof runSimulation>;
+type SimWaiting = { args: SimArgs; value: number; vetted: boolean; at: number };
+const simWaiting: Record<string, SimWaiting[]> = {};
+// Better first: tradable before untradable, then bigger expected profit.
+const simBetter = (a: SimWaiting, b: SimWaiting) => (a.vetted === b.vetted ? b.value - a.value : a.vetted ? -1 : 1);
+// Can this gap start now? Big gaps get one extra slot; untradable coins never take the last one.
+const simHasRoom = (chain: string, w: SimWaiting): boolean => {
+      const n = simInFlight[chain] ?? 0;
+      const limit = w.value >= BENCH_BYPASS_USD ? SIM_MAX_PARALLEL : SIM_BASE_PARALLEL;
+      return n < (w.vetted ? limit : Math.min(limit, SIM_BASE_PARALLEL) - 1);
+};
+const drainSimQueue = (chain: 'avalanche' | 'monad' | 'robinhood') => {
+      const line = simWaiting[chain];
+      if (!line?.length) return;
+      const now = Date.now();
+      // Too old: drop.
+      for (let i = line.length - 1; i >= 0; i--) {
+            if (now - line[i].at > SIM_QUEUE_MAX_AGE_MS) { line.splice(i, 1); if (chain === 'robinhood') funnelSkip('waited too long in the check line (2 s)'); }
+      }
+      line.sort(simBetter);
+      // Start the best ones that fit; skip ones that decide not to run.
+      for (let i = 0; i < line.length;) {
+            if (!simHasRoom(chain, line[i])) { i++; continue; }
+            const [w] = line.splice(i, 1);
+            runSimulation(...w.args);
+      }
+};
+const queueSimulation = (
+      chain: 'avalanche' | 'monad' | 'robinhood', tokenIn: string,
+      buyPool: any, sellPool: any, tradeSizeUsd: number, modelGrossUsd: number, usdPerToken: number,
+      triggerHash?: string,
+      vetted = true,          // false = coin not on the vetted list (checked last)
+) => {
+      const w: SimWaiting = { args: [chain, tokenIn, buyPool, sellPool, tradeSizeUsd, modelGrossUsd, usdPerToken, triggerHash], value: modelGrossUsd, vetted, at: Date.now() };
+      const line = (simWaiting[chain] ??= []);
+      // Room now and nothing better waiting: start straight away.
+      if (simHasRoom(chain, w) && !line.some((x) => simBetter(x, w) < 0)) { runSimulation(...w.args); return; }
+      line.push(w);
+      line.sort(simBetter);
+      // Line full: the worst one leaves.
+      if (line.length > SIM_QUEUE_MAX) { line.pop(); if (chain === 'robinhood') funnelSkip('check line full (lowest value dropped)'); }
+      drainSimQueue(chain);
 };
 
 // ==========================================================================
@@ -1589,7 +1655,7 @@ if (swap.chain === 'robinhood') {
       }
 }
 if (sizing.grossProfitUsd >= SIM_MIN_GROSS_USD && simAllowed) {
-      queueSimulation(swap.chain, swap.tokenIn, buyPoolUsed, sellPoolUsed, sizing.optimalTradeSizeUsd, sizing.grossProfitUsd, usdPerToken, (event.raw as any)?.hash);
+      queueSimulation(swap.chain, swap.tokenIn, buyPoolUsed, sellPoolUsed, sizing.optimalTradeSizeUsd, sizing.grossProfitUsd, usdPerToken, (event.raw as any)?.hash, simVetted);
 }
 
 if (!profit.qualifies) {
