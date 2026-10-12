@@ -431,7 +431,12 @@ const RH_TRIGGER_MAX_POLLS = 12;    // give up after ~1.8 s and test on the late
 const checkTiming = { rightAfter: 0, othersInBlock: 0, late: 0 };
 // Hourly: re-checks on the free node, and how many changed the answer.
 const recheckStats = { done: 0, changed: 0 };
-const simBusy: Record<string, boolean> = {};          // one simulation in flight per chain
+// Practice checks in flight per chain. Normally one at a time (keeps the
+// checking node's allowance safe). Oct 11: a big gap ($1+, BENCH_BYPASS_USD)
+// may run alongside, up to SIM_MAX_PARALLEL at once, instead of being dropped
+// because a small check happened to be running.
+const simInFlight: Record<string, number> = {};
+const SIM_MAX_PARALLEL = Number(process.env.SIM_MAX_PARALLEL ?? 3);
 // Simulation switched off for a chain (e.g. the RPC lacks state overrides),
 // with an expiry: retried after 30 min instead of staying off until restart.
 // Token-specific problems ("no balance slot found") never switch off the
@@ -571,7 +576,8 @@ const queueSimulation = (
       buyPool: any, sellPool: any, tradeSizeUsd: number, modelGrossUsd: number, usdPerToken: number,
       triggerHash?: string,   // Robinhood: the trade we're following, to test right after it
 ) => {
-      if (simBusy[chain]) { if (chain === 'robinhood') funnelSkip('another check was running'); return; }
+      const inFlight = simInFlight[chain] ?? 0;
+      if (inFlight > 0 && !(modelGrossUsd >= BENCH_BYPASS_USD && inFlight < SIM_MAX_PARALLEL)) { if (chain === 'robinhood') funnelSkip('another check was running'); return; }
       if (simOff(chain) || Date.now() < (simPausedUntil[chain] ?? 0)) { if (chain === 'robinhood') funnelSkip('checking node paused (busy or out of allowance)'); return; }
       const muteKey = `${buyPool.poolAddress}>${sellPool.poolAddress}`.toLowerCase();
       const bigGap = modelGrossUsd >= BENCH_BYPASS_USD; // big gaps skip the mute and the bench
@@ -594,7 +600,7 @@ const queueSimulation = (
       if ('reason' in built) { if (chain === 'robinhood') funnelSkip(`trade couldn't be built (${built.reason})`); return; }
       const funding = lender ? `flash loan from ${lender.dex} (${lender.feeBps / 100}% fee)` : RH_OWN_MONEY && chain === 'robinhood' ? 'own money' : 'own capital (no V3 lender cached)';
 
-      simBusy[chain] = true;
+      simInFlight[chain] = (simInFlight[chain] ?? 0) + 1;
       const followTrigger = chain === 'robinhood' && !!triggerHash && !triggerHash.includes('PLACEHOLDER');
       setTimeout(async () => {
             try {
@@ -710,7 +716,7 @@ const queueSimulation = (
             } catch (err) {
                   console.warn(`[sim] ${chain} error:`, (err as Error).message);
             } finally {
-                  simBusy[chain] = false;
+                  simInFlight[chain] = Math.max(0, (simInFlight[chain] ?? 1) - 1);
             }
       }, followTrigger ? RH_TRIGGER_POLL_MS : SIM_DELAY_MS[chain]);
 };
@@ -1055,7 +1061,7 @@ const research = new ResearchLane(researchConfigFromEnv(), {
       pickLender: (t, buy, sell, size, usd) => pickLender('robinhood', t, buy, sell, size, usd),
       gasUsd: () => rhGasUsd(0.05),
       weth: ROBINHOOD_TOKENS.WETH,
-      canRun: () => !simBusy.robinhood && !simOff('robinhood') && Date.now() >= (simPausedUntil.robinhood ?? 0)
+      canRun: () => !(simInFlight.robinhood ?? 0) && !simOff('robinhood') && Date.now() >= (simPausedUntil.robinhood ?? 0)
             && (!researchNode || researchNode.share() < research.config.maxNodeShare),
 });
 const usdRhResearch = (t: string) => priceOracle.getUsdPrice('robinhood', t);
@@ -1758,6 +1764,10 @@ await chainManager.startAll();
       const GAP_CONFIRM_MIN_USD = Number(process.env.GAP_CONFIRM_MIN_USD ?? 0.02);
       const GAP_TESTS_PER_MIN = Number(process.env.GAP_TESTS_PER_MIN ?? 6);
       const gapTestTimes: number[] = [];
+      // Separate, bigger budget for big gaps ($1+) so they never wait behind small ones.
+      const GAP_BIG_TESTS_PER_MIN = Number(process.env.GAP_BIG_TESTS_PER_MIN ?? 20);
+      const gapBigTimes: number[] = [];
+      const gapLastSig = new Map<string, string>(); // pool prices when each pair was last checked
       // ONE GAP = ONE WIN: a gap nobody takes can sit there for minutes, and
       // re-confirming it every 30 s counted the same chance again and again.
       // We remember both pools' price state at each confirmed win and skip the
@@ -1808,7 +1818,10 @@ await chainManager.startAll();
                         (t) => TOKEN_DECIMALS.robinhood?.[t.toLowerCase()],
                         (t) => priceOracle.getUsdPrice('robinhood', t),
                         // Own money (no loan fee) for planning; the check itself borrows at 0.01% above $2,000.
-                        { minProfitUsd: GAP_MIN_USD, flashFee: RH_OWN_MONEY ? 0 : 0.0005, gasUsd: rhGasUsd(0.05), maxTradeUsd: MAX_TRADE_USD });
+                        { minProfitUsd: GAP_MIN_USD, flashFee: RH_OWN_MONEY ? 0 : 0.0005, gasUsd: rhGasUsd(0.05), maxTradeUsd: MAX_TRADE_USD,
+                          // Top 3 pool combinations per coin pair (was only the best): a muted
+                          // combination no longer hides the other pools of the same pair.
+                          perPair: 3 });
                   let fired = 0;
                   for (const g of gaps) {
                         if (fired >= 2) break;
@@ -1816,13 +1829,20 @@ await chainManager.startAll();
                         const sig = `${poolSig(g.buyPool)}|${poolSig(g.sellPool)}`;
                         const bigChanged = g.profitUsd >= BENCH_BYPASS_USD && gapMutedSig.get(key) !== sig;
                         if (!bigChanged && Date.now() < (gapMutedUntil.get(key) ?? 0)) continue;
-                        if (Date.now() - (gapLastFired.get(key) ?? 0) < 30_000) continue;
+                        // Big gap ($1+) whose prices moved since this pair was last checked:
+                        // skips the 30 s cooldown and the 6-a-minute budget (own cap below),
+                        // so small gaps can't use up the checks a big one needs.
+                        const bigFresh = g.profitUsd >= BENCH_BYPASS_USD && gapLastSig.get(key) !== sig;
+                        if (!bigFresh && Date.now() - (gapLastFired.get(key) ?? 0) < 30_000) continue;
                         if (gapConfirmedState.get(key) === sig) continue; // same gap we already counted
-                        // Rate limit: drop timestamps older than a minute, stop when full.
+                        // Rate limits: drop timestamps older than a minute; skip when full.
                         while (gapTestTimes.length && Date.now() - gapTestTimes[0] > 60_000) gapTestTimes.shift();
-                        if (gapTestTimes.length >= GAP_TESTS_PER_MIN) break;
-                        gapTestTimes.push(Date.now());
+                        while (gapBigTimes.length && Date.now() - gapBigTimes[0] > 60_000) gapBigTimes.shift();
+                        if (bigFresh) { if (gapBigTimes.length >= GAP_BIG_TESTS_PER_MIN) continue; gapBigTimes.push(Date.now()); }
+                        else { if (gapTestTimes.length >= GAP_TESTS_PER_MIN) continue; gapTestTimes.push(Date.now()); }
                         gapLastFired.set(key, Date.now());
+                        gapLastSig.set(key, sig);
+                        if (gapLastSig.size > 2_000) gapLastSig.clear();
                         fired++;
                         const label = `${symbolOf('robinhood', g.base)}/${symbolOf('robinhood', g.quote)}`;
                         const route = `buy ${g.buyPool.dex} ${g.buyPool.feeBps / 100}% -> sell ${g.sellPool.dex} ${g.sellPool.feeBps / 100}%`;

@@ -37,6 +37,9 @@ export interface GapOptions {
   flashFee: number;        // fraction
   gasUsd: number;
   maxTradeUsd: number;
+  // How many pool combinations to return per coin pair, best first (default 1).
+  // The scanner asks for 3 so a muted best combination doesn't hide the others.
+  perPair?: number;
 }
 
 const Q96 = 2 ** 96;
@@ -79,7 +82,7 @@ export function findStandingGaps(
     const [quote, base, quoteUsd] = u1 ? [t1, t0, u1] : u0 ? [t0, t1, u0] : [null, null, 0];
     if (!quote || !base || !(quoteUsd > 0)) continue;
 
-    let best: StandingGap | null = null;
+    const found: StandingGap[] = [];
     for (const buy of usable) {
       const dB0 = buy.tokenA.toLowerCase() === t0 ? d0 : d1, dB1 = buy.tokenA.toLowerCase() === t0 ? d1 : d0;
       const rb = poolReserves(buy, base, dB0, dB1);
@@ -91,13 +94,13 @@ export function findStandingGaps(
         if (!rs) continue;
         const r = bestArb(rb, feeFraction(buy), rs, feeFraction(sell), opts.flashFee, opts.maxTradeUsd / quoteUsd);
         const profitUsd = r.profit * quoteUsd - opts.gasUsd;
-        if (profitUsd > (best?.profitUsd ?? 0)) {
-          best = { pairKey: [t0, t1].sort().join('/'), base, quote, buyPool: buy, sellPool: sell,
-            sizeQuote: r.dx, sizeUsd: r.dx * quoteUsd, profitUsd, quoteUsd };
+        if (profitUsd > 0 && profitUsd >= opts.minProfitUsd) {
+          found.push({ pairKey: [t0, t1].sort().join('/'), base, quote, buyPool: buy, sellPool: sell,
+            sizeQuote: r.dx, sizeUsd: r.dx * quoteUsd, profitUsd, quoteUsd });
         }
       }
     }
-    if (best && best.profitUsd >= opts.minProfitUsd) out.push(best);
+    out.push(...found.sort((a, b) => b.profitUsd - a.profitUsd).slice(0, Math.max(1, opts.perPair ?? 1)));
   }
   return out.sort((a, b) => b.profitUsd - a.profitUsd);
 }
