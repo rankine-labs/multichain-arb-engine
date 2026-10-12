@@ -41,6 +41,8 @@ interface IV3Pool {
 }
 
 abstract contract ForkBase is Test {
+    // Owner of the test contract (cold wallet stand-in): never the executor.
+    address internal constant FORK_OWNER = address(0xC01D);
     ArbExecutor exec;
 
     // Starts a fork if the RPC env var is set; otherwise marks the test skipped.
@@ -57,7 +59,9 @@ abstract contract ForkBase is Test {
         uint256 forkBlock = vm.envOr(string.concat(envVar, "_BLOCK"), uint256(0));
         if (forkBlock > 0) vm.createSelectFork(url, forkBlock);
         else vm.createSelectFork(url);
-        // This test contract is both owner and executor.
+        // This test contract is the executor (bot); a separate address is the
+        // owner, since the contract refuses owner == executor (audit, Oct 12).
+        vm.prank(FORK_OWNER);
         exec = new ArbExecutor(address(this));
         return true;
     }
@@ -211,6 +215,7 @@ contract AvalancheForkTest is ForkBase {
     function test_fork_avalanche_V2_aaveFlashLoan() public {
         if (!_fork("AVALANCHE_RPC_URL")) return;
         require(AAVE_POOL.code.length > 0, "no Aave pool code at expected address");
+        vm.prank(FORK_OWNER);
         exec.setFlashPool(AAVE_POOL, true);
         // Small float so a losing round trip can still repay Aave, letting the
         // revert happen at OUR profit check (proves the full flash loop works).
@@ -261,6 +266,7 @@ contract MonadForkTest is ForkBase {
             vm.skip(true);
             return;
         }
+        vm.prank(FORK_OWNER);
         exec.setFlashPool(lender, true);
         _fundWrapped(WMON, 1 ether); // tiny float so a losing trade can repay and reach the profit check
         ArbExecutor.Hop[] memory hops = new ArbExecutor.Hop[](2);
@@ -355,6 +361,7 @@ contract RobinhoodForkTest is ForkBase {
             vm.skip(true);
             return;
         }
+        vm.prank(FORK_OWNER);
         exec.setFlashPool(lender, true);
         // Float ONLY so a losing round trip can still repay the loan and reach
         // our profit check (proves the full borrow/trade/repay loop). Sized to
@@ -394,6 +401,7 @@ contract RobinhoodForkTest is ForkBase {
             vm.skip(true);
             return;
         }
+        vm.prank(FORK_OWNER);
         exec.setFlashPool(lender, true);
         _fundWrapped(WETH, 0.011 ether); // covers even a total-loss round trip, so we reach the profit check
         ArbExecutor.Hop[] memory hops = new ArbExecutor.Hop[](2);
@@ -427,6 +435,7 @@ contract RobinhoodForkTest is ForkBase {
         if (!_fork("ROBINHOOD_RPC_URL")) return;
         address v3 = _uniV3();
         if (v3 == address(0)) { console.log("skipped: no Uniswap V3 WETH/USDG pool"); vm.skip(true); return; }
+        vm.prank(FORK_OWNER);
         exec.setV4(V4_POOL_MANAGER, WETH);
         _fundWrapped(WETH, 0.011 ether);
         ArbExecutor.Hop[] memory hops = new ArbExecutor.Hop[](2);
@@ -443,6 +452,7 @@ contract RobinhoodForkTest is ForkBase {
         if (!_fork("ROBINHOOD_RPC_URL")) return;
         address v3 = _uniV3();
         if (v3 == address(0)) { console.log("skipped: no Uniswap V3 WETH/USDG pool"); vm.skip(true); return; }
+        vm.prank(FORK_OWNER);
         exec.setV4(V4_POOL_MANAGER, WETH);
         _fundWrapped(WETH, 0.011 ether);
         ArbExecutor.Hop[] memory hops = new ArbExecutor.Hop[](2);
@@ -525,7 +535,9 @@ contract RobinhoodForkTest is ForkBase {
     function _flashRoute(string memory label, address start, address mid, uint256 amount, address h1, uint8 k1, address h2, uint8 k2, bool native1, bool native2) internal {
         address lender = _findV3(UNI_V3_FACTORY, WETH, USDG, _fees(100, 100, 100, 100));
         if (lender == address(0) || h1 == address(0) || h2 == address(0)) { console.log(label, "skipped: pool missing"); vm.skip(true); return; }
+        vm.prank(FORK_OWNER);
         exec.setFlashPool(lender, true);
+        vm.prank(FORK_OWNER);
         exec.setV4(V4_POOL_MANAGER, WETH);
         if (start == WETH) _fundWrapped(WETH, amount);
         else deal(start, address(exec), amount);
@@ -567,6 +579,7 @@ contract RobinhoodForkTest is ForkBase {
         address lender = 0x52e65B17fB6E5BA00Ed806f37Afcd2DaA50271Ca;
         address uni = 0x69BfaF19C9f377BB306a89aEd9F6B07e2c1a8d9a;
         address ram = 0x028779cA5D91C7F016ACB98E0AfA5102F4e436e4;
+        vm.prank(FORK_OWNER);
         exec.setFlashPool(lender, true);
         deal(USDG, address(exec), 300e6); // float, like the bot's check
         ArbExecutor.Hop[] memory hops = new ArbExecutor.Hop[](2);
