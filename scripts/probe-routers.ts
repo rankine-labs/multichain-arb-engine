@@ -97,7 +97,7 @@ function urSkipReason(data: string): string {
   for (const l of logs) (byTx.get(l.tx) ?? byTx.set(l.tx, new Set()).get(l.tx)!).add(l.topic);
   const hashes = [...byTx.keys()];
 
-  type Row = { txs: number; decoded: number; v4: number; selectors: Map<string, number>; known: boolean };
+  type Row = { txs: number; decoded: number; v4: number; selectors: Map<string, number>; known: boolean; senders: Set<string> };
   const rows = new Map<string, Row>();
   // Universal Router swaps the decoder skipped, by reason (with ETH sent, a size hint).
   const skipped = new Map<string, { n: number; eth: number[] }>();
@@ -112,9 +112,12 @@ function urSkipReason(data: string): string {
       fetched++;
       const to = tx.to.toLowerCase();
       txTo.set(chunk[k], to);
-      const row = rows.get(to) ?? { txs: 0, decoded: 0, v4: 0, selectors: new Map(), known: !!DEFAULT_ROUTER_REGISTRY.robinhood[to] };
+      const row = rows.get(to) ?? { txs: 0, decoded: 0, v4: 0, selectors: new Map(), known: !!DEFAULT_ROUTER_REGISTRY.robinhood[to], senders: new Set<string>() };
       rows.set(to, row);
       row.txs++;
+      // Who sends through it: many different wallets = an app/router people use;
+      // one or two wallets = a bot (its trades close gaps, they don't open them).
+      if (row.senders.size < 500) row.senders.add(tx.from.toLowerCase());
       if (byTx.get(chunk[k])!.has(TOPIC_V4_SWAP)) row.v4++;
       const sel = tx.data.slice(0, 10);
       row.selectors.set(sel, (row.selectors.get(sel) ?? 0) + 1);
@@ -172,12 +175,12 @@ function urSkipReason(data: string): string {
     const med = sorted[Math.floor(sorted.length / 2)] ?? 0;
     console.log(`  ${tag} | ${e.n} | ${med.toFixed(4)} ETH | ${Math.round((100 * e.eth.filter((v) => v > 0).length) / e.n)}%`);
   }
-  console.log('Top senders (to address | swap txs | share | decoded | V4 | known router? | top selectors):');
+  console.log('Top senders (to address | swap txs | share | decoded | V4 | known router? | different wallets | top selectors):');
   const sorted = [...rows.entries()].sort((a, b) => b[1].txs - a[1].txs).slice(0, 18);
   for (const [to, r] of sorted) {
     const sels = [...r.selectors.entries()].sort((a, b) => b[1] - a[1]).slice(0, 3).map(([s, n]) => `${s}x${n}`).join(' ');
     const name = DEFAULT_ROUTER_REGISTRY.robinhood[to]?.dex;
-    console.log(`${to} | ${r.txs} | ${Math.round((100 * r.txs) / total)}% | ${r.decoded} | ${r.v4} | ${r.known ? 'yes ' + name : 'no'} | ${sels}`);
+    console.log(`${to} | ${r.txs} | ${Math.round((100 * r.txs) / total)}% | ${r.decoded} | ${r.v4} | ${r.known ? 'yes ' + name : 'no'} | ${r.senders.size} | ${sels}`);
   }
   process.exit(0);
 })().catch((e) => { console.log(`failed: ${(e as Error).message}`); process.exit(0); });
