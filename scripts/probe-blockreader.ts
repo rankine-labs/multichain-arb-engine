@@ -165,7 +165,7 @@ async function pickPools(head: number) {
     selectionLine: `Picked from blocks ${from}..${head}: ${byPool.size} pools + ${byV4.size} V4 pools active, watching ${pools.length} + ${v4.length}. ` +
       `Parser on those ${allLogs.length} logs: v2 ${parsedKinds.v2}, v3 ${parsedKinds.v3}, v4 ${parsedKinds.v4} updates, ${latestCount} distinct pools.`,
     solidlyLine: solidly.size
-      ? `Solidly-style Sync(uint256,uint256): ${[...solidly.values()].reduce((a, b) => a + b, 0)} events from ${solidly.size} pools in the window. The spec does not handle this event, so those pools get no updates.`
+      ? `Solidly-style Sync(uint256,uint256): ${[...solidly.values()].reduce((a, b) => a + b, 0)} events from ${solidly.size} pools in the window. Handled by the reader (Solidly Sync).`
       : 'Solidly-style Sync(uint256,uint256): none seen in the window.',
   };
 }

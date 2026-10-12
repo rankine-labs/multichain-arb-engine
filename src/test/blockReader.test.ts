@@ -1,6 +1,6 @@
 import {
   parsePoolLogs, latestPerPool, BlockReader, RpcLog, PoolUpdate,
-  SYNC_TOPIC, V3_SWAP_TOPIC, PANCAKE_V3_SWAP_TOPIC, ALGEBRA_INTEGRAL_SWAP_TOPIC, V4_SWAP_TOPIC, HANDLED_TOPICS,
+  SYNC_TOPIC, SOLIDLY_SYNC_TOPIC, V3_SWAP_TOPIC, PANCAKE_V3_SWAP_TOPIC, ALGEBRA_INTEGRAL_SWAP_TOPIC, V4_SWAP_TOPIC, HANDLED_TOPICS,
 } from '../core/blockReader';
 import { ethers } from 'ethers';
 
@@ -31,7 +31,12 @@ const LIQ = 123456789012345678n;
 async function main() {
   // ---- topics ----
   assert(SYNC_TOPIC === ethers.id('Sync(uint112,uint112)'), 'Sync topic is the V2 Sync fingerprint');
-  assert(HANDLED_TOPICS.length === 5 && new Set(HANDLED_TOPICS).size === 5, 'five distinct handled topics');
+  {
+    const sol = parsePoolLogs([log(A, [SOLIDLY_SYNC_TOPIC], data(5n, 6n), 10, 1)], PM);
+    assert(sol.length === 1 && sol[0].kind === 'v2' && sol[0].reserve0 === 5n && sol[0].reserve1 === 6n, 'Solidly Sync(uint256,uint256) (Ramses V2) parsed as reserves');
+    assert(HANDLED_TOPICS.includes(SOLIDLY_SYNC_TOPIC), 'Solidly Sync is requested from the node');
+  }
+  assert(HANDLED_TOPICS.length === 6 && new Set(HANDLED_TOPICS).size === 6, 'six distinct handled topics (incl. Solidly Sync)');
 
   // ---- parsing each event type ----
   const sync = parsePoolLogs([log(A.toUpperCase().replace('0X', '0x'), [SYNC_TOPIC], data(1000n, 2000n), 10, 3)], PM);

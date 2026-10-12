@@ -54,6 +54,9 @@ export interface PoolUpdate {
 
 // V2 / Solidly reserve update: Sync(reserve0, reserve1).
 export const SYNC_TOPIC = ethers.id('Sync(uint112,uint112)');
+// Solidly-style pools (Ramses V2, GIGA Classic and other Velodrome copies)
+// declare the same event with uint256 fields, which is a different fingerprint.
+export const SOLIDLY_SYNC_TOPIC = ethers.id('Sync(uint256,uint256)');
 // Uniswap V3 / Slipstream / Algebra-compatible Swap.
 export const V3_SWAP_TOPIC = ethers.id('Swap(address,address,int256,int256,uint160,uint128,int24)');
 // PancakeSwap V3 Swap (adds two protocol fee fields at the end).
@@ -64,7 +67,7 @@ export const ALGEBRA_INTEGRAL_SWAP_TOPIC = ethers.id('Swap(address,address,int25
 export const V4_SWAP_TOPIC = ethers.id('Swap(bytes32,address,int128,int128,uint160,uint128,int24,uint24)');
 
 // Every topic we ask the node for, in one list (the node ORs them).
-export const HANDLED_TOPICS: string[] = [SYNC_TOPIC, V3_SWAP_TOPIC, PANCAKE_V3_SWAP_TOPIC, ALGEBRA_INTEGRAL_SWAP_TOPIC, V4_SWAP_TOPIC];
+export const HANDLED_TOPICS: string[] = [SYNC_TOPIC, SOLIDLY_SYNC_TOPIC, V3_SWAP_TOPIC, PANCAKE_V3_SWAP_TOPIC, ALGEBRA_INTEGRAL_SWAP_TOPIC, V4_SWAP_TOPIC];
 
 // The three V3 flavours share the same first five data fields, so they are
 // decoded the same way.
@@ -122,7 +125,7 @@ export function parsePoolLogs(logs: RpcLog[], poolManager: string): PoolUpdate[]
     if (!w) continue;
     const address = (l.address || '').toLowerCase();
 
-    if (t0 === SYNC_TOPIC) {
+    if (t0 === SYNC_TOPIC || t0 === SOLIDLY_SYNC_TOPIC) {
       // V2 / Solidly: data = reserve0, reserve1.
       if (w.length < 2) continue;
       out.push({ pool: address, kind: 'v2', block, logIndex, reserve0: asUint(w[0]!), reserve1: asUint(w[1]!) });
