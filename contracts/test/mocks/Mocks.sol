@@ -90,18 +90,31 @@ contract MockSolidlyPair {
         (token0, token1) = a < b ? (a, b) : (b, a);
     }
 
+    // Stored reserves like a real Solidly pair: set by sync() after funding
+    // the pair, and after every swap.
+    uint256 private r0;
+    uint256 private r1;
+
+    function sync() public {
+        r0 = MockERC20(token0).balanceOf(address(this));
+        r1 = MockERC20(token1).balanceOf(address(this));
+    }
+
+    function getReserves() external view returns (uint256, uint256, uint256) {
+        return (r0, r1, 0);
+    }
+
     function getAmountOut(uint256 amountIn, address tokenIn) public view returns (uint256) {
-        (uint256 rIn, uint256 rOut) = tokenIn == token0
-            ? (MockERC20(token0).balanceOf(address(this)), MockERC20(token1).balanceOf(address(this)))
-            : (MockERC20(token1).balanceOf(address(this)), MockERC20(token0).balanceOf(address(this)));
+        (uint256 rIn, uint256 rOut) = tokenIn == token0 ? (r0, r1) : (r1, r0);
         uint256 inAfterFee = amountIn * (10_000 - FEE_BPS) / 10_000;
         return inAfterFee * rOut / (rIn + inAfterFee);
     }
 
-    // Simplified: trusts the caller already sent tokens in (balance-based quote above).
+    // Simplified: trusts the caller already sent tokens in; reserves re-read after.
     function swap(uint256 out0, uint256 out1, address to, bytes calldata) external {
         if (out0 > 0) MockERC20(token0).transfer(to, out0);
         if (out1 > 0) MockERC20(token1).transfer(to, out1);
+        sync();
     }
 }
 

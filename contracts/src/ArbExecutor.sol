@@ -74,6 +74,8 @@ interface IUniswapV2Pair {
 
 interface ISolidlyPair {
     function token0() external view returns (address);
+    // Solidly pairs return uint256s (some forks uint112s: same ABI words).
+    function getReserves() external view returns (uint256, uint256, uint256);
     function getAmountOut(uint256 amountIn, address tokenIn) external view returns (uint256);
     function swap(uint256 amount0Out, uint256 amount1Out, address to, bytes calldata data) external;
 }
@@ -204,6 +206,9 @@ contract ArbExecutor {
     // simulator expects them.
     address public owner;
     address public pendingOwner;
+    // Added Oct 12 (audit). Kept after everything else so no storage slot
+    // above moves (the bot's simulator overrides some of them by number).
+    uint256 private activeV3MaxIn;     // the most the active V3 pool may ask for (this hop's input)
 
     // ------------------------------------------------------------------------
     // Events / errors
@@ -233,12 +238,16 @@ contract ArbExecutor {
     error V4NotEnabled();
     error UnexpectedEth();
     error NotPendingOwner();
+    error OwnerIsExecutor();
 
     // ------------------------------------------------------------------------
     // Setup / admin
     // ------------------------------------------------------------------------
 
     constructor(address executor_) {
+        // Owner (cold wallet) and bot (hot wallet) must be different: otherwise
+        // the hot wallet could also withdraw everything (audit, Oct 12).
+        if (executor_ == msg.sender) revert OwnerIsExecutor();
         owner = msg.sender;
         executor = executor_;
         emit OwnershipTransferred(address(0), msg.sender);
@@ -263,7 +272,9 @@ contract ArbExecutor {
     }
 
     // Swap out the bot's hot wallet (e.g. if the key may be compromised).
+    // Kill switch: setExecutor(address(0)) stops all trading at once.
     function setExecutor(address newExecutor) external onlyOwner {
+        if (newExecutor != address(0) && newExecutor == owner) revert OwnerIsExecutor();
         emit ExecutorChanged(executor, newExecutor);
         executor = newExecutor;
     }
@@ -305,12 +316,14 @@ contract ArbExecutor {
     // Two-step ownership handover: the owner proposes, the new wallet must
     // accept from itself. Proposing address(0) cancels a pending handover.
     function transferOwnership(address newOwner) external onlyOwner {
+        if (newOwner != address(0) && newOwner == executor) revert OwnerIsExecutor();
         pendingOwner = newOwner;
         emit OwnershipTransferStarted(owner, newOwner);
     }
 
     function acceptOwnership() external {
         if (msg.sender != pendingOwner || msg.sender == address(0)) revert NotPendingOwner();
+        if (msg.sender == executor) revert OwnerIsExecutor();
         emit OwnershipTransferred(owner, msg.sender);
         owner = msg.sender;
         pendingOwner = address(0);
@@ -464,6 +477,10 @@ contract ArbExecutor {
         // Exactly one side is positive on a real swap: the amount we owe.
         int256 owedSigned = amount0Delta > 0 ? amount0Delta : amount1Delta;
         if (owedSigned <= 0) revert UnauthorizedCallback();
+        // Exact input: never pay more than this hop's input. Before, only the
+        // final balance check stopped a pool asking for too much (audit, Oct 12).
+        // forge-lint: disable-next-line(unsafe-typecast)
+        if (uint256(owedSigned) > activeV3MaxIn) revert BadRoute(); // safe: checked > 0 above
         // forge-lint: disable-next-line(unsafe-typecast)
         _safeTransfer(activeV3TokenIn, msg.sender, uint256(owedSigned)); // safe: checked > 0 above
     }
@@ -520,9 +537,14 @@ contract ArbExecutor {
     function _swapSolidly(Hop memory h, uint256 amountIn) private {
         ISolidlyPair pair = ISolidlyPair(h.pool);
         bool inIs0 = pair.token0() == h.tokenIn;
-        // The pair knows its own curve (stable or volatile) and fee.
-        uint256 amountOut = pair.getAmountOut(amountIn, h.tokenIn);
+        (uint256 r0, uint256 r1, ) = pair.getReserves();
+        uint256 reserveIn = inIs0 ? r0 : r1;
         _safeTransfer(h.tokenIn, h.pool, amountIn);
+        // Quote on what the pair actually received (a coin that skims a fee on
+        // every transfer arrives short), like the V2 path (audit, Oct 12).
+        // The pair knows its own curve (stable or volatile) and fee.
+        uint256 received = IERC20(h.tokenIn).balanceOf(h.pool) - reserveIn;
+        uint256 amountOut = pair.getAmountOut(received, h.tokenIn);
         (uint256 out0, uint256 out1) = inIs0 ? (uint256(0), amountOut) : (amountOut, uint256(0));
         pair.swap(out0, out1, address(this), new bytes(0));
     }
@@ -542,6 +564,7 @@ contract ArbExecutor {
 
         activeV3Pool = h.pool;
         activeV3TokenIn = h.tokenIn;
+        activeV3MaxIn = amountIn;
         pool.swap(
             address(this),
             zeroForOne,
@@ -552,6 +575,7 @@ contract ArbExecutor {
         );
         activeV3Pool = address(0);
         activeV3TokenIn = address(0);
+        activeV3MaxIn = 0;
     }
 
     // ------------------------------------------------------------------------
@@ -637,6 +661,9 @@ contract ArbExecutor {
         // Pay what we owe.
         if (cIn == address(0)) {
             IWETH(weth).withdraw(owed);            // WETH -> ETH
+            // Clear any coin a hook left "synced", or the ETH settle would
+            // revert (audit, Oct 12). sync(native) just resets it.
+            pm.sync(address(0));
             pm.settle{value: owed}();
         } else {
             pm.sync(cIn);                          // tell the PoolManager to count what arrives

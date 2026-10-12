@@ -160,3 +160,21 @@ Then put the new key in `BOT_PRIVATE_KEY` and restart.
 Only after a few days of live results in Telegram:
 1. More wins than reverts, and profit above gas: raise `MAX_TRADE_USD` step by step ($1k, then $2.5k, then $5k).
 2. Many reverts: we're losing races. Check the rival timing before spending more on gas.
+
+## Emergency stop (kill switch)
+
+From the cold wallet, call `setExecutor(0x0000000000000000000000000000000000000000)` on the
+contract. From that moment no bot wallet can trade; your money stays in the contract and you
+can withdraw it. To resume, call `setExecutor(<bot wallet>)` again. (The contract refuses to make
+the owner and the bot the same wallet: a hot wallet that could also withdraw would defeat the
+cold wallet.)
+
+## Security review (Oct 12)
+
+Independent automated review of `ArbExecutor.sol`: no critical, high or medium issues. Four low
+items were fixed: a V3 pool can no longer ask for more than the hop's input; owner and bot must
+be different wallets; Solidly hops quote on what the pair actually received (fee-on-transfer
+coins); native-ETH V4 settles clear any coin a hook left synced. Before deploying, check the
+`FLASH_LENDERS` list has no Algebra pools (Alandale, KittenSwap): they can't lend to this
+contract and would only make loan trades fail. A paid human audit is still worth it before
+larger amounts.

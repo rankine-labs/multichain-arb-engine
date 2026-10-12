@@ -55,6 +55,7 @@ contract ArbExecutorTest is Test {
         cheapSolidly = new MockSolidlyPair(address(usdc), address(weth));
         weth.mint(address(cheapSolidly), 1_000 * E18);
         usdc.mint(address(cheapSolidly), 3_000_000 * E18);
+        cheapSolidly.sync();
 
         // price of WETH in USDC = 3300 / 1
         dearV3 = new MockV3Pool(address(weth), address(usdc), 3_300, 1, false);
@@ -280,7 +281,9 @@ contract ArbExecutorTest is Test {
 
         ArbExecutor.Trade memory t = _trade(0, address(cheapV2), 2, address(thief), 1);
         vm.prank(bot);
-        vm.expectRevert(abi.encodeWithSelector(ArbExecutor.TokenBalanceDropped.selector, address(weth)));
+        // Audit fix (Oct 12): refused right at the payment (asks for more than
+        // the hop's input), before the final balance check is even needed.
+        vm.expectRevert(ArbExecutor.BadRoute.selector);
         exec.execute(t, address(0));
         assertEq(weth.balanceOf(address(exec)), 10 * E18, "stored WETH untouched");
     }
