@@ -120,6 +120,9 @@ export const ROBINHOOD_UR_COPIES = [
   '0xd26c8cfce843f4122753425dd6613d7576777ec8',
   '0xa28f468cb898cc407c981e26a521dfb2e2774174',
   '0x204faca1764b154221e35c0d20abb3c525710498',
+  // Oct 11 router probe: two more copies, ~5% of swap transactions, none decoded before.
+  '0xaf9d6fa019328d8cf8598d0d5be22cc6622b09f1',
+  '0x7feb3ecbacbd0cc23ec46659d541636d58749a97',
 ];
 
 export const ROBINHOOD_V3 = {
