@@ -40,6 +40,21 @@ export class PoolCache {
     this.feedApplied.set(k, now);
   }
 
+  // Write an EXACT state read from a mined block (core/blockReader.ts). Not
+  // marked as a feed prediction, so the reader's next block for the same pool
+  // is never held back; an RPC refresh that started earlier still can't
+  // overwrite it (lastUpdatedMs is newer than that read's start).
+  upsertFromBlock(pool: PoolState, now = Date.now()) {
+    this.pools.set(this.key(pool.chain, pool.poolAddress), { ...pool, lastUpdatedMs: now });
+  }
+
+  // True if the trade feed wrote a predicted state for this pool in the last
+  // `ms` milliseconds (the block reader then leaves that pool alone, so an
+  // older block can't overwrite a newer prediction).
+  fedWithin(chain: ChainName, poolAddress: string, ms: number, now = Date.now()): boolean {
+    return now - (this.feedApplied.get(this.key(chain, poolAddress)) ?? 0) < ms;
+  }
+
   upsertIfNotNewer(fresh: PoolState, readStartedMs: number, now = Date.now()): boolean {
     const k = this.key(fresh.chain, fresh.poolAddress);
     const cur = this.pools.get(k);
