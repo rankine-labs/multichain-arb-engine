@@ -469,7 +469,10 @@ const simOff = (chain: string): string | undefined => {
 };
 // Reported in the hourly digest, then reset.
 // Smallest model gain worth a real-chain test (see the trade handler).
-const SIM_CHECK_BAR_USD = Number(process.env.SIM_MIN_GROSS_USD ?? 0.05);
+// Oct 12 (owner approved): $0.10 (was $0.05), same as the send minimum. Checks
+// went up 8x with Oct 11's changes and QuickNode's 14,000-a-day allowance would
+// run out by midday; gaps under $0.10 can't be sent live anyway.
+const SIM_CHECK_BAR_USD = Number(process.env.SIM_MIN_GROSS_USD ?? 0.10);
 const simStats = { checked: 0, profit: 0, loss: 0, fail: 0, rateLimited: 0 };
 // Phase 8 (Oct 8): profitable checks by $ band (after our gas) and every
 // check result by category, for the hourly report. Robinhood only.
@@ -821,7 +824,7 @@ const logLimits = () => {
       console.log(`[limits] send minimum $${MIN_NET_PROFIT_USD} · biggest trade $${MAX_TRADE_USD.toLocaleString('en-US')}` +
             (sendCap !== MAX_TRADE_USD ? ` (send check $${sendCap.toLocaleString('en-US')})` : '') +
             ` · own money up to $${OWN_MONEY_MAX_USD.toLocaleString('en-US')} · partner pools $${Math.round(POOL_MIN_DEPTH_USD / 1000)}k+` +
-            ` · big gaps ($${BENCH_BYPASS_USD}+) skip the bench · size filter ${(DEFAULT_FILTER_CONFIG.minTradeToPoolLiquidityRatio * 100).toFixed(1)}% of pool`);
+            ` · check bar $${SIM_CHECK_BAR_USD} · big gaps ($${BENCH_BYPASS_USD}+) skip the bench · size filter ${(DEFAULT_FILTER_CONFIG.minTradeToPoolLiquidityRatio * 100).toFixed(1)}% of pool`);
 };
 logLimits();
 setInterval(logLimits, 10 * 60_000);
@@ -1085,7 +1088,7 @@ if (research.enabled) {
             try {
                   const pairs = robinhoodWatcher.watchedPairPools().map((addrs) => addrs.map((a) => cache.get('robinhood', a)).filter((p): p is PoolState => !!p && canPracticeTest(p.dex)));
                   const gaps = findResearchGaps(pairs, isDeepRh, (p) => poolDepthUsd(p, decimalsOf, usdRhResearch), (t) => TOKEN_DECIMALS.robinhood?.[t.toLowerCase()], usdRhResearch,
-                        { mainMinUsd: Number(process.env.GAP_MIN_USD ?? 0.05), researchMinUsd: c.gapMinUsd, minDepthUsd: c.minDepthUsd, gasUsd: rhGasUsd(0.05), maxTradeUsd: MAX_TRADE_USD });
+                        { mainMinUsd: Number(process.env.GAP_MIN_USD ?? 0.10), researchMinUsd: c.gapMinUsd, minDepthUsd: c.minDepthUsd, gasUsd: rhGasUsd(0.05), maxTradeUsd: MAX_TRADE_USD });
                   for (const { reason, gap } of gaps) {
                         const vetted = safetyGate.isAllowed(gap.base) && safetyGate.isAllowed(gap.quote);
                         // A standing gap sits there for minutes: one test per 30 min is enough.
@@ -1761,9 +1764,11 @@ await chainManager.startAll();
       // after gas. Most rival wins are sitting gaps under $1.
       // At most GAP_TESTS_PER_MIN tests a minute (default 6) so the checking
       // node's allowance isn't burned; failing pairs are muted 30 min.
-      const GAP_MIN_USD = Number(process.env.GAP_MIN_USD ?? 0.05);
+      // Oct 12: $0.10 (was $0.05) and 3 small-gap checks a minute (was 6) to keep
+      // QuickNode's daily allowance through market hours. Big gaps ($1+) keep their own 20.
+      const GAP_MIN_USD = Number(process.env.GAP_MIN_USD ?? 0.10);
       const GAP_CONFIRM_MIN_USD = Number(process.env.GAP_CONFIRM_MIN_USD ?? 0.02);
-      const GAP_TESTS_PER_MIN = Number(process.env.GAP_TESTS_PER_MIN ?? 6);
+      const GAP_TESTS_PER_MIN = Number(process.env.GAP_TESTS_PER_MIN ?? 3);
       const gapTestTimes: number[] = [];
       // Separate, bigger budget for big gaps ($1+) so they never wait behind small ones.
       const GAP_BIG_TESTS_PER_MIN = Number(process.env.GAP_BIG_TESTS_PER_MIN ?? 20);
