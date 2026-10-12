@@ -256,6 +256,7 @@ contract RobinhoodForkTestPhase3 is ForkBase {
 
     // Flash loan with an EMPTY contract (no float at all).
     function _flashHalf(ArbExecutor.Trade memory t, address lender, uint256 ownProfit) internal {
+        vm.prank(FORK_OWNER);
         exec.setFlashPool(lender, true);
         assertEq(IWETH(WETH).balanceOf(address(exec)), 0, "flash: contract starts empty");
         uint256 lenderBefore = IWETH(WETH).balanceOf(lender);
@@ -317,6 +318,7 @@ contract RobinhoodForkTestPhase3 is ForkBase {
             console.log("FLASH losing-trade check skipped: pools missing"); vm.skip(true); return;
         }
         _pushWethUp(uni, 200);
+        vm.prank(FORK_OWNER);
         exec.setFlashPool(lender, true);
         // Wrong way round: buy WETH where it is now dear. Loses ~2%.
         ArbExecutor.Hop[] memory hops = new ArbExecutor.Hop[](2);

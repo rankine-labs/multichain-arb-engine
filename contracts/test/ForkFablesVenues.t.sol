@@ -311,6 +311,7 @@ contract RobinhoodForkTestFablesVenues is ForkBase {
             return;
         }
         _logPool();
+        vm.prank(FORK_OWNER);
         exec.setV4(POOL_MANAGER, WETH);
 
         uint256 snap = vm.snapshotState();
