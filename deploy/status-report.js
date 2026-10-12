@@ -177,6 +177,7 @@ async function main() {
   const rwOurs = rw.filter((m) => m[3] === 'all watched').length;
   const scanLine = lastMatch(outL, /^\[scan\] /);
   const openLine = lastMatch(bigTail, /^\[openwatch\] /);
+  const limitsLine = lastMatch(bigTail, /^\[limits\] /);
   // Measurement-only features (Oct 8): new pool counter, coin groups, loops.
   const newPoolsLine = lastMatch(bigTail, /^\[newpools\] last hour:/);
   const newPoolsFirstMoney = outL.filter((l) => /^\[newpools\] first money in /.test(l));
@@ -245,6 +246,7 @@ async function main() {
     `- Rival bots' trades read: ${rw.length} · made money: ${rwWins.length} · about $${rwWins.reduce((x, m) => x + Number(m[2]), 0).toFixed(2)} · on pools we watch: ${rwOurs} · failed: ${rwFailed} · new bots found: ${rwNewBots}`,
     ...(rwTop.length ? [`- Rival profit by pair: ${rwTop.map(([p, v]) => `${p} $${v.toFixed(2)}`).join(' · ')}`] : []),
     ...(scanLine ? [`- Latest scan line: ${scanLine.slice(0, 200)}`] : []),
+    ...(limitsLine ? [`- Limits in use: ${limitsLine.replace(/^\[limits\] /, '').slice(0, 260)}`] : []),
     ...(openLine ? [`- Market-open watch: ${openLine.replace(/^\[openwatch\] /, '').slice(0, 220)}`] : []),
     `- New pool counter: ${newPoolsLine ? newPoolsLine.replace(/^\[newpools\] /, '') : 'no hourly line yet'} · this window: ${newPoolsWaiting} new pool(s) for deep coins, ${newPoolsFirstMoney.length} measured, ${newPoolsFails} failed poll(s)`,
     ...newPoolsFirstMoney.slice(-3).map((l) => `  - ${l.replace(/^\[newpools\] /, '').slice(0, 200)}`),
