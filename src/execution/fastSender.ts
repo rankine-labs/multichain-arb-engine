@@ -71,6 +71,8 @@ export class SafetyGate {
   }
 
   allowTokens(tokens: string[]) { for (const t of tokens) this.allowed.add(t.toLowerCase()); }
+  // Take coins off the allowlist (an auto-vetted coin that later failed like a trap coin).
+  disallowTokens(tokens: string[]) { for (const t of tokens) this.allowed.delete(t.toLowerCase()); }
   isAllowed(token: string) { return this.allowed.has(token.toLowerCase()); }
 
   private today() { return new Date(this.now()).toISOString().slice(0, 10); }

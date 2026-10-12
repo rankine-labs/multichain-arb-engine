@@ -87,6 +87,7 @@ const RH_V4_SCAN = process.env.RH_V4_SCAN !== '0';
 import { buildExecuteCall, executionRequested, executorConfig, pickV3Lender } from './execution/executorCalldata';
 import { OwnMoneyBook, useOwnMoney } from './core/ownMoney';
 import { BlockReader, PoolUpdate } from './core/blockReader';
+import { AutoVet, CheckOutcome } from './core/autoVet';
 import { FailTally } from './core/failReasons';
 import { LenderBalances } from './core/lenderBalances';
 import { RouteScores, WinSizes, WIN_BARS } from './core/routeScore';
@@ -689,6 +690,12 @@ const runSimulation = (
                         venueTally.add(buyPool.dex, sellPool.dex, torontoDay(), winNet);
                   }
                   if (r.status !== 'profit' || !plausibleProfit(r.profit, built.amountIn)) muteLoser(muteKey);
+                  const pairTokens = [buyPool.tokenA, buyPool.tokenB];
+                  if (chain === 'robinhood') {
+                        if (r.status === 'profit') noteCheck(pairTokens, plausibleProfit(r.profit, built.amountIn) ? 'profit' : 'fail', plausibleProfit(r.profit, built.amountIn) ? '' : 'implausible profit');
+                        else if (r.status === 'loss') noteCheck(pairTokens, 'loss');
+                        else if (r.status === 'fail') noteCheck(pairTokens, 'fail', r.reason);
+                  }
                   if (r.status === 'profit' && !plausibleProfit(r.profit, built.amountIn)) {
                         simStats.fail++;
                         if (chain === 'robinhood') failTally.add('implausible profit');
@@ -701,7 +708,9 @@ const runSimulation = (
                         // firing bar after gas: counts as verified would-have-earned,
                         // but only on vetted tokens, same as a live trade would need.
                         const net = usd - (chain === 'robinhood' ? rhGasUsd(0.05) : 0.05);
-                        const vetted = [buyPool.tokenA, buyPool.tokenB].every((t: string) => safetyGate.isAllowed(t));
+                        // Auto-vetted coins count only within their smaller trade limit.
+                        const vetted = [buyPool.tokenA, buyPool.tokenB].every((t: string) => safetyGate.isAllowed(t))
+                              && !(involvesAutoVetted([buyPool.tokenA, buyPool.tokenB]) && tradeSizeUsd > AUTO_VET_MAX_TRADE_USD);
                         if (chain === 'robinhood' && net >= MIN_COUNTED_USD && vetted) {
                               dryRunPnl.recordVerified(net, `${symbolOf(chain, tokenIn)} ${buyPool.dex}->${sellPool.dex}`);
                         }
@@ -882,6 +891,24 @@ const robinhoodSender = new FastSender(
       new ethers.JsonRpcProvider(robinhoodSendRpc(), 4663, { staticNetwork: true }),
 );
 const safetyGate = new SafetyGate(safetyConfigFromEnv());
+// AUTO-VET (core/autoVet.ts, Oct 12, owner approved): coins earn a place on the
+// vetted list by passing practice checks (3 completed, 1+ profitable, never a
+// trap-coin failure). Saved to disk; reloaded into the safety gate at start.
+const autoVet = new AutoVet((t) => safetyGate.isAllowed(t));
+const AUTO_VET_FILE = 'data/auto-vetted.json';
+safetyGate.allowTokens(autoVet.load(AUTO_VET_FILE));
+setInterval(() => autoVet.save(AUTO_VET_FILE), 10 * 60_000);
+// Auto-vetted coins get a smaller live trade limit: their owner could still
+// change the coin's rules later. Trigger trades are planned within it; bigger
+// trades on these coins are neither sent nor counted.
+const AUTO_VET_MAX_TRADE_USD = Number(process.env.AUTO_VET_MAX_TRADE_USD ?? 300);
+const involvesAutoVetted = (tokens: string[]) => tokens.some((t) => autoVet.isAutoVetted(t));
+// Feed one finished practice check into auto-vet and update the safety gate.
+const noteCheck = (tokens: string[], outcome: CheckOutcome, reason = '') => {
+      const { added, removed } = autoVet.record(tokens, outcome, reason);
+      if (added.length) { safetyGate.allowTokens(added); console.log(`[autovet] vetted after clean practice checks: ${added.map((t) => symbolOf('robinhood', t)).join(', ')}`); }
+      if (removed.length) { safetyGate.disallowTokens(removed); console.log(`[autovet] REMOVED (failed like a trap coin: ${reason.slice(0, 60)}): ${removed.map((t) => symbolOf('robinhood', t)).join(', ')}`); }
+};
 // LIMITS LINE (status page): the limits the bot is REALLY using, after any
 // override in the server's settings file. Logged at start and every 10 min
 // so the status page always has a recent copy.
@@ -890,7 +917,8 @@ const logLimits = () => {
       console.log(`[limits] send minimum $${MIN_NET_PROFIT_USD} · biggest trade $${MAX_TRADE_USD.toLocaleString('en-US')}` +
             (sendCap !== MAX_TRADE_USD ? ` (send check $${sendCap.toLocaleString('en-US')})` : '') +
             ` · own money up to $${OWN_MONEY_MAX_USD.toLocaleString('en-US')} · partner pools $${Math.round(POOL_MIN_DEPTH_USD / 1000)}k+` +
-            ` · check bar $${SIM_CHECK_BAR_USD} · big gaps ($${BENCH_BYPASS_USD}+) skip the bench · size filter ${(DEFAULT_FILTER_CONFIG.minTradeToPoolLiquidityRatio * 100).toFixed(1)}% of pool`);
+            ` · check bar $${SIM_CHECK_BAR_USD} · big gaps ($${BENCH_BYPASS_USD}+) skip the bench · size filter ${(DEFAULT_FILTER_CONFIG.minTradeToPoolLiquidityRatio * 100).toFixed(1)}% of pool` +
+            ` · auto-vetted coins ${autoVet.stats().vetted} (blocked ${autoVet.stats().blocked}, watching ${autoVet.stats().watching}, limit $${AUTO_VET_MAX_TRADE_USD})`);
 };
 logLimits();
 setInterval(logLimits, 10 * 60_000);
@@ -917,6 +945,7 @@ for (const sig of ['SIGINT', 'SIGTERM'] as const) {
             try { dryRunPnl.save(); } catch { /* best effort */ }
             try { robinhoodWatcher.save(WATCH_FILE); } catch { /* best effort */ }
             try { routeScores.save(ROUTE_FILE); } catch { /* best effort */ }
+            try { autoVet.save(AUTO_VET_FILE); } catch { /* best effort */ }
             try { rivalWatch.save(RIVAL_BOTS_FILE, RIVAL_TRADES_FILE); } catch { /* best effort */ }
             try { saveNodeUsage(); } catch { /* best effort */ }
             try { if (research.enabled) research.save(RESEARCH_FILE); } catch { /* best effort */ }
@@ -1203,6 +1232,11 @@ const fireTrade = async (o: {
             // Big gaps ($1+ expected, BENCH_BYPASS_USD) are sent even on a benched pair.
             if (o.chain === 'robinhood' && o.source === 'trade' && o.netProfitUsd < BENCH_BYPASS_USD && routeScores.isBenched(RouteScores.key(o.buyPool.poolAddress, o.sellPool.poolAddress))) {
                   block('pool pair benched (practice checks keep losing)');
+                  return;
+            }
+            // Auto-vetted coins: smaller trade limit (their rules could still change).
+            if (o.chain === 'robinhood' && involvesAutoVetted([o.tokenIn, o.tokenOut]) && o.tradeSizeUsd > AUTO_VET_MAX_TRADE_USD) {
+                  block(`auto-vetted coin: over the $${AUTO_VET_MAX_TRADE_USD} limit`);
                   return;
             }
             // Own money or loan (same choice as the practice check, see pickLender).
@@ -1592,7 +1626,7 @@ for (const peer of peers) {
             flashLoanFeeBps: loanBps ?? 0,
             usingFlashLoan: !rh || loanBps !== null,
             safetyMarginPct: 0.15,
-      }, decimalsOf(swap.chain, swap.tokenIn), rh ? { refineSize: true, maxTradeUsd: MAX_TRADE_USD, ...(loanBps === null ? { funding: 'own-capital' as const } : {}) } : {});
+      }, decimalsOf(swap.chain, swap.tokenIn), rh ? { refineSize: true, maxTradeUsd: involvesAutoVetted([swap.tokenIn, swap.tokenOut]) ? Math.min(MAX_TRADE_USD, AUTO_VET_MAX_TRADE_USD) : MAX_TRADE_USD, ...(loanBps === null ? { funding: 'own-capital' as const } : {}) } : {});
       if (candidate && (!plan || candidate.profit.conservativeNetProfitUsd > plan.profit.conservativeNetProfitUsd)) plan = candidate;
 }
 if (!plan) { if (swap.chain === 'robinhood') funnel.smallerThanFees++; return; }
@@ -1936,6 +1970,9 @@ await chainManager.startAll();
                               continue;
                         }
                         const simNet = check.status === 'profit' ? check.usd - rhGasUsd(0.05) /* gas */ : 0;
+                        if (check.status === 'profit') noteCheck([g.base, g.quote], simNet > 0 ? 'profit' : 'loss');
+                        else if (check.status === 'loss') noteCheck([g.base, g.quote], 'loss');
+                        else if (check.status === 'fail') noteCheck([g.base, g.quote], 'fail', check.reason);
                         // Per-exchange practice count (skipped checks were not tests).
                         if (check.status !== 'skipped') venueTally.add(g.buyPool.dex, g.sellPool.dex, torontoDay(), check.status === 'profit' ? simNet : undefined);
                         if (check.status !== 'profit' || simNet < GAP_CONFIRM_MIN_USD) {
@@ -1959,7 +1996,8 @@ await chainManager.startAll();
                         // Practice results: confirmed sitting-gap wins on vetted coins count as
                         // "would have earned" here (the firing safety gate below may still
                         // refuse small trades; that's about sending, not about the result).
-                        const gapVetted = safetyGate.isAllowed(g.base) && safetyGate.isAllowed(g.quote);
+                        const gapVetted = safetyGate.isAllowed(g.base) && safetyGate.isAllowed(g.quote)
+                              && !(involvesAutoVetted([g.base, g.quote]) && g.sizeUsd > AUTO_VET_MAX_TRADE_USD);
                         if (gapVetted && simNet >= MIN_COUNTED_USD) dryRunPnl.recordVerified(simNet, `${label} gap`);
                         profitBands.add(simNet, torontoDay());
                         // Would we really have won it? (ready = after our check + ~2 ms to sign)
