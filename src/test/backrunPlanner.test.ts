@@ -65,3 +65,14 @@ assert(cache.get('avalanche', '0xA')?.reserveA === 1_000n * E18, 'prediction nev
   const own = planBackrun(cache, victim, peer, { ...bigSell, stateType: 'PENDING' }, 3400, { ...costs, gasPriceUsd: 0.02, flashLoanFeeBps: 0, usingFlashLoan: false }, 18, { refineSize: true, funding: 'own-capital' });
   assert(!!own && own.profit.conservativeNetProfitUsd >= real!.profit.conservativeNetProfitUsd - 1e-9, 'no lender -> own money, no loan fee at all');
 }
+
+// Oct 11: a gap whose best size is above the trade cap is SHRUNK to the cap
+// (still planned, still profitable), not planned too big and refused later.
+{
+  const uncapped = planBackrun(cache, victim, peer, { ...bigSell, stateType: 'PENDING' }, 3400, costs);
+  const cap = 20_000;
+  const capped = planBackrun(cache, victim, peer, { ...bigSell, stateType: 'PENDING' }, 3400, costs, 18, { maxTradeUsd: cap });
+  assert((uncapped?.sizing.optimalTradeSizeUsd ?? 0) > cap, `test gap wants more than $20k (best size $${Math.round(uncapped?.sizing.optimalTradeSizeUsd ?? 0)})`);
+  assert(capped !== null && capped.sizing.optimalTradeSizeUsd <= cap + 1e-6, 'with a $20k cap the trade is shrunk to $20k or less');
+  assert((capped?.profit.conservativeNetProfitUsd ?? 0) > 0 && (capped?.profit.conservativeNetProfitUsd ?? 0) <= (uncapped?.profit.conservativeNetProfitUsd ?? 0), 'shrunk trade still makes money (less than uncapped)');
+}

@@ -44,6 +44,10 @@ export interface PlanOptions {
   funding?: 'flash' | 'own-capital';
   // Finer size search (see SizingOptions.refine in profitCalculator.ts).
   refineSize?: boolean;
+  // Biggest trade in dollars (MAX_TRADE_USD). Oct 11: when the best size is
+  // bigger, the trade is SHRUNK to this size (and priced at that size)
+  // instead of being planned too big and then refused by the send check.
+  maxTradeUsd?: number;
 }
 
 export function planBackrun(
@@ -82,7 +86,8 @@ export function planBackrun(
 
   // Step 2: size + cost both round-trip directions against the predicted state.
   const evaluate = (buyPool: PoolState, sellPool: PoolState): BackrunPlan | null => {
-    const ceiling = calculateLiquidityCeiling(buyPool, sellPool, usdPerTokenIn, { tokenIn, tokenInDecimals });
+    const poolCeiling = calculateLiquidityCeiling(buyPool, sellPool, usdPerTokenIn, { tokenIn, tokenInDecimals });
+    const ceiling = opts.maxTradeUsd !== undefined && opts.maxTradeUsd > 0 ? Math.min(poolCeiling, opts.maxTradeUsd) : poolCeiling;
     if (ceiling <= 0) return null;
     const tokenInIsAOnBuy = buyPool.tokenA.toLowerCase() === tokenIn;
     const sizing = findOptimalTradeSize(buyPool, sellPool, cache, tokenInIsAOnBuy, ceiling, usdPerTokenIn, sizingRateBps, undefined, tokenInDecimals, sizingOpts);

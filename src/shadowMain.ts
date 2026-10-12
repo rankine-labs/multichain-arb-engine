@@ -73,7 +73,7 @@ import { RobinhoodChainAdapter } from './chains/robinhoodChain';
 import { MonadAdapter } from './chains/monad';
 import { AvalancheAdapter } from './chains/avalanche';
 import { RawChainEvent, PoolState, MIN_NET_PROFIT_USD } from './core/types';
-import { priceOf, spreadPct, deepEnough } from './core/poolPrice';
+import { priceOf, spreadPct, deepEnough, POOL_MIN_DEPTH_USD } from './core/poolPrice';
 import { PairWatcher, Venue, refreshPoolState, refreshPoolsBatch } from './core/pairWatcher';
 import { scanUniverse, emptyScanState, ScanState, stateToPools, getLogsAdaptive, RawLog } from './core/universeScan';
 import { CrossQuoteMonitor, LoopMonitor, shouldScheduleFirstLoopReport } from './core/crossQuoteMonitor';
@@ -130,6 +130,7 @@ import { setHookedFeeSource } from './core/pairWatcher';
 import { SimBucketTally, classifySimOutcome } from './core/failReasons';
 import { makeRpc, simulateRoundTrip, simRpcUrl, Rpc, makeFallbackRpc, loadBalanceSlots, wssToHttps, replayRpc, ReplayCall } from './execution/simulator';
 import { FastSender, SafetyGate, safetyConfigFromEnv } from './execution/fastSender';
+import { DEFAULT_FILTER_CONFIG } from './core/fastFilter';
 import { checkLiveReady } from './execution/liveReadiness';
 import { LiveTradeTracker } from './execution/liveTracker';
 import { findStandingGaps } from './core/gapScanner';
@@ -805,6 +806,18 @@ const robinhoodSender = new FastSender(
       new ethers.JsonRpcProvider(robinhoodSendRpc(), 4663, { staticNetwork: true }),
 );
 const safetyGate = new SafetyGate(safetyConfigFromEnv());
+// LIMITS LINE (status page): the limits the bot is REALLY using, after any
+// override in the server's settings file. Logged at start and every 10 min
+// so the status page always has a recent copy.
+const logLimits = () => {
+      const sendCap = safetyConfigFromEnv().maxTradeUsd;
+      console.log(`[limits] send minimum $${MIN_NET_PROFIT_USD} · biggest trade $${MAX_TRADE_USD.toLocaleString('en-US')}` +
+            (sendCap !== MAX_TRADE_USD ? ` (send check $${sendCap.toLocaleString('en-US')})` : '') +
+            ` · own money up to $${OWN_MONEY_MAX_USD.toLocaleString('en-US')} · partner pools $${Math.round(POOL_MIN_DEPTH_USD / 1000)}k+` +
+            ` · big gaps ($${BENCH_BYPASS_USD}+) skip the bench · size filter ${(DEFAULT_FILTER_CONFIG.minTradeToPoolLiquidityRatio * 100).toFixed(1)}% of pool`);
+};
+logLimits();
+setInterval(logLimits, 10 * 60_000);
 if (safetyGate.problems.length) {
       // Fail closed: every send is blocked until the setting is fixed.
       console.warn(`[safety] BAD SETTING(S): ${safetyGate.problems.join(', ')} -- all sends blocked until fixed in .env`);
@@ -1503,7 +1516,7 @@ for (const peer of peers) {
             flashLoanFeeBps: loanBps ?? 0,
             usingFlashLoan: !rh || loanBps !== null,
             safetyMarginPct: 0.15,
-      }, decimalsOf(swap.chain, swap.tokenIn), rh ? { refineSize: true, ...(loanBps === null ? { funding: 'own-capital' as const } : {}) } : {});
+      }, decimalsOf(swap.chain, swap.tokenIn), rh ? { refineSize: true, maxTradeUsd: MAX_TRADE_USD, ...(loanBps === null ? { funding: 'own-capital' as const } : {}) } : {});
       if (candidate && (!plan || candidate.profit.conservativeNetProfitUsd > plan.profit.conservativeNetProfitUsd)) plan = candidate;
 }
 if (!plan) { if (swap.chain === 'robinhood') funnel.smallerThanFees++; return; }
