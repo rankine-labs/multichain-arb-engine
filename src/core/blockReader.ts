@@ -172,10 +172,22 @@ export interface BlockReaderOptions {
   headEveryMs?: number;             // eth_blockNumber refresh, default 2000
   maxRange?: number;                // max blocks per eth_getLogs (default 200); if behind more, jump to head - maxRange and count a skip
   now?: () => number;
+  // Optional (review fixes, Oct 11):
+  // rpcBatch: send "newest block" and "events since" in ONE request, so both
+  //   answers come from the same server and the bookmark never jumps past
+  //   blocks that server didn't have yet.
+  rpcBatch?: (calls: Array<{ method: string; params: unknown[] }>) => Promise<any[]>;
+  // localFilter: don't send our ~700 pool addresses every poll (about 30 KB);
+  //   ask for the events by type only and keep ours here.
+  localFilter?: boolean;
+  // paused: when true the reader skips polls (e.g. the free node is resting
+  //   because the bot's own price reads were refused), so it never adds load
+  //   to a node that is already pushing back.
+  paused?: () => boolean;
 }
 
 // Pauses after errors (milliseconds).
-const RATE_LIMIT_PAUSE_MS = 1000;
+const RATE_LIMIT_PAUSE_MS = 1000;   // first 429; doubles for each one in a row, up to LONG_PAUSE_MS
 const ERROR_PAUSE_MS = 500;
 const LONG_PAUSE_MS = 30_000;
 const LONG_PAUSE_AFTER = 20;        // errors in a row before the long pause
@@ -210,8 +222,9 @@ export class BlockReader {
   private timer: ReturnType<typeof setTimeout> | null = null;
   private delayMs: number;           // wait before the next poll
   private errorsInRow = 0;
+  private limitsInRow = 0;            // 429s in a row (exponential pause)
   private timings: number[] = [];    // recent eth_getLogs durations (ms)
-  private counts = { polls: 0, ok: 0, errors: 0, rateLimited: 0, updates: 0, skippedRanges: 0 };
+  private counts = { polls: 0, ok: 0, errors: 0, rateLimited: 0, updates: 0, skippedRanges: 0, pausedPolls: 0 };
 
   constructor(o: BlockReaderOptions) {
     this.o = o;
@@ -252,9 +265,11 @@ export class BlockReader {
   async pollOnce(): Promise<void> {
     this.counts.polls++;
     try {
+      // 0. Node pushing back on the bot's own reads: stay quiet for a second.
+      if (this.o.paused?.()) { this.counts.pausedPolls++; this.delayMs = 1_000; return; }
       // 1. Refresh the newest block number every headEveryMs (and on the first poll).
       const t = this.now();
-      if (this.head < 0 || t - this.headAt >= this.headEveryMs) {
+      if (this.head < 0 || (!this.o.rpcBatch && t - this.headAt >= this.headEveryMs)) {
         const h = toNum(await this.o.rpc('eth_blockNumber', []));
         if (h === null) throw new Error('eth_blockNumber returned an unreadable value');
         this.head = Math.max(this.head, h);
@@ -275,6 +290,7 @@ export class BlockReader {
       const addrSet = new Set<string>();
       for (const a of this.o.addresses() ?? []) if (a) addrSet.add(a.toLowerCase());
       if (pm) addrSet.add(pm);
+      const local = !!this.o.localFilter;
       if (addrSet.size === 0) {
         // Nothing to watch. Never send an address-less request (it would
         // return every event on the chain).
@@ -283,22 +299,35 @@ export class BlockReader {
       }
 
       // 5. Ask for all handled events since the last block we read.
-      const headBefore = this.head;
+      let headBefore = this.head;
       const started = this.now();
+      const filter: Record<string, unknown> = { fromBlock: '0x' + (this.last + 1).toString(16), toBlock: 'latest', topics: [HANDLED_TOPICS] };
+      if (!local) filter.address = [...addrSet];
       let logs: RpcLog[];
+      let ahead = false;
       try {
-        const r = await this.o.rpc('eth_getLogs', [{
-          fromBlock: '0x' + (this.last + 1).toString(16),
-          toBlock: 'latest',
-          address: [...addrSet],
-          topics: [HANDLED_TOPICS],
-        }]);
-        logs = Array.isArray(r) ? r : [];
+        if (this.o.rpcBatch) {
+          // One request, same server: its newest block, then its events.
+          const [h, r] = await this.o.rpcBatch([{ method: 'eth_blockNumber', params: [] }, { method: 'eth_getLogs', params: [filter] }]);
+          const hn = toNum(h);
+          if (hn === null) throw new Error('eth_blockNumber returned an unreadable value');
+          headBefore = hn;
+          this.head = Math.max(this.head, hn);
+          this.headAt = t;
+          if (r instanceof Error) throw r;
+          logs = Array.isArray(r) ? r : [];
+        } else {
+          const r = await this.o.rpc('eth_getLogs', [filter]);
+          logs = Array.isArray(r) ? r : [];
+        }
       } catch (e) {
         if (!isAheadOfHead(e)) throw e;
         logs = [];   // no new block yet, nothing to read
+        ahead = true;
       }
       this.recordTiming(this.now() - started);
+      // Events by type only: keep the ones from our pools (V4: the PoolManager).
+      if (local) logs = logs.filter((l) => addrSet.has((l?.address || '').toLowerCase()));
 
       // 6. V4 swaps arrive for every pool in the PoolManager; keep only ours.
       const ids = this.o.v4Ids() ?? new Set<string>();
@@ -317,7 +346,9 @@ export class BlockReader {
         const b = toNum(l?.blockNumber);
         if (b !== null && b > maxSeen) maxSeen = b;
       }
-      this.last = Math.max(this.last, maxSeen, headBefore);
+      // Asked from a block the server doesn't have yet: don't move the
+      // bookmark (otherwise blocks could be skipped unread).
+      this.last = ahead ? Math.max(this.last, maxSeen) : Math.max(this.last, maxSeen, headBefore);
       if (this.last > this.head) this.head = this.last;
 
       // 8. Decode, keep the newest state per pool, hand it to the bot.
@@ -341,6 +372,7 @@ export class BlockReader {
   private succeed(): void {
     this.counts.ok++;
     this.errorsInRow = 0;
+    this.limitsInRow = 0;
     this.delayMs = this.pollMs;
   }
 
@@ -355,8 +387,10 @@ export class BlockReader {
     this.errorsInRow++;
     const limited = isRateLimit(e);
     if (limited) this.counts.rateLimited++;
+    if (limited) this.limitsInRow++;
     if (this.errorsInRow >= LONG_PAUSE_AFTER) this.delayMs = LONG_PAUSE_MS;
-    else this.delayMs = limited ? RATE_LIMIT_PAUSE_MS : ERROR_PAUSE_MS;
+    // 429s in a row: 1 s, 2 s, 4 s ... up to 30 s, so a pushing-back node gets real room.
+    else this.delayMs = limited ? Math.min(LONG_PAUSE_MS, RATE_LIMIT_PAUSE_MS * 2 ** Math.max(0, this.limitsInRow - 1)) : ERROR_PAUSE_MS;
   }
 
   // Remember how long a request took (keeps only the most recent ones).
@@ -371,7 +405,7 @@ export class BlockReader {
     return [...this.errorKinds.entries()].sort((a, b) => b[1] - a[1]).slice(0, max).map(([k, n]) => `${k} x${n}`).join('; ');
   }
 
-  stats(): { polls: number; ok: number; errors: number; rateLimited: number; updates: number; skippedRanges: number; lastBlock: number; lagBlocks: number; medianMs: number } {
+  stats(): { polls: number; ok: number; errors: number; rateLimited: number; updates: number; skippedRanges: number; pausedPolls: number; lastBlock: number; lagBlocks: number; medianMs: number } {
     const s = [...this.timings].sort((a, b) => a - b);
     let medianMs = 0;
     if (s.length) {

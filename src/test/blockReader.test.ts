@@ -215,6 +215,53 @@ async function main() {
     await new Promise((res) => setTimeout(res, 30));
     assert(polls >= 2 && maxInFlight === 1 && r.stats().polls <= polls + 1, 'loop polls repeatedly, never overlapping, and stops');
   }
+  // ---- review fixes (Oct 11) ----
+  {
+    // Batch: head and events from the same answer; local filtering; no address list sent.
+    let sentFilter: any = null, singles = 0;
+    let head = 200;
+    const rpcBatch = async (calls: Array<{ method: string; params: unknown[] }>) => {
+      sentFilter = calls[1].params[0];
+      return [q(head), [log(A, [SYNC_TOPIC], data(7n, 8n), head, 0), log(B, [SYNC_TOPIC], data(1n, 1n), head, 1)]];
+    };
+    const rpc = async (m: string) => { singles++; return m === 'eth_blockNumber' ? q(head - 1) : []; };
+    const got: Map<string, PoolUpdate>[] = [];
+    const r = new BlockReader({ rpc, rpcBatch, localFilter: true, poolManager: PM, addresses: () => [A], v4Ids: () => new Set(), onUpdates: (m) => got.push(m) });
+    await r.pollOnce();   // first poll learns the head
+    head = 205;
+    await r.pollOnce();
+    assert(sentFilter && sentFilter.address === undefined, 'local filter: our address list is not sent');
+    assert(got.length >= 1 && got[got.length - 1].has(A) && !got[got.length - 1].has(B), 'local filter: only our pools kept');
+    assert(r.stats().lastBlock === 205, 'batch: bookmark moves to the same server’s newest block');
+  }
+  {
+    // Ahead of the server's head: bookmark stays put.
+    let calls = 0;
+    const rpc = async (m: string) => {
+      if (m === 'eth_blockNumber') return q(300);
+      calls++;
+      throw new Error('invalid block range');
+    };
+    const r = new BlockReader({ rpc, poolManager: PM, addresses: () => [A], v4Ids: () => new Set(), onUpdates: () => {}, headEveryMs: 0 });
+    await r.pollOnce();
+    const b = r.stats().lastBlock;
+    await r.pollOnce();
+    assert(calls >= 2 && r.stats().lastBlock === b, 'server behind: bookmark not moved past unread blocks');
+  }
+  {
+    // Paused while the node rests: no requests.
+    let n = 0;
+    const r = new BlockReader({ rpc: async () => { n++; return q(1); }, poolManager: PM, addresses: () => [A], v4Ids: () => new Set(), onUpdates: () => {}, paused: () => true });
+    await r.pollOnce();
+    assert(n === 0 && r.stats().pausedPolls === 1 && r.nextDelayMs() === 1000, 'paused: no requests, waits 1 s');
+  }
+  {
+    // 429s in a row: 1 s, 2 s, 4 s.
+    const r = new BlockReader({ rpc: async () => { throw new Error('HTTP 429'); }, poolManager: PM, addresses: () => [A], v4Ids: () => new Set(), onUpdates: () => {} });
+    const waits: number[] = [];
+    for (let i = 0; i < 3; i++) { await r.pollOnce(); waits.push(r.nextDelayMs()); }
+    assert(waits.join(',') === '1000,2000,4000', `rate limited in a row: pause doubles (got ${waits.join(',')})`);
+  }
 }
 
 main().catch((e) => { console.error('FAIL: unexpected error', e); process.exitCode = 1; });

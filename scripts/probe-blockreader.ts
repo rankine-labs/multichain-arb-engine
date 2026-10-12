@@ -41,7 +41,7 @@ import type { PoolUpdate, RpcLog } from '../src/core/blockReader';
 // ---- settings ----------------------------------------------------------------
 const RPC_URL = process.env.ROBINHOOD_RPC_URL ?? 'https://rpc.mainnet.chain.robinhood.com';
 const MINUTES = Number(process.env.BR_MINUTES ?? 8);
-const POLL_MS = Number(process.env.BR_POLL_MS ?? 110);
+const POLL_MS = Number(process.env.BR_POLL_MS ?? 250);
 const SELECT_BLOCKS = Number(process.env.BR_SELECT_BLOCKS ?? 300);
 const TOP_POOLS = Number(process.env.BR_POOLS ?? 60);
 const TOP_V4 = Number(process.env.BR_V4_POOLS ?? 20);
@@ -258,6 +258,16 @@ async function checkUpdate(u: PoolUpdate): Promise<CheckResult> {
     catch (e) { if ((e as RpcError).rateLimited) readerRefusals++; throw e; }
   };
 
+  // Same setup as the bot: head + events in one request, events by type only.
+  const readerBatch = async (calls: Array<{ method: string; params: unknown[] }>) => {
+    readerRequests++;
+    const res = await fetch(RPC_URL, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(calls.map((c, i) => ({ jsonrpc: '2.0', id: i, method: c.method, params: c.params }))), signal: AbortSignal.timeout(3_000) });
+    if (res.status === 429) { readerRefusals++; throw new RpcError('HTTP 429 rate limited', true); }
+    if (!res.ok) throw new RpcError(`HTTP ${res.status}`, false);
+    const arr: any[] = await res.json();
+    return calls.map((_, i) => { const r = arr.find((x) => x && x.id === i); return !r ? new Error('missing batch answer') : r.error ? new Error(String(r.error.message ?? r.error.code)) : r.result; });
+  };
+
   const runCheck = (u: PoolUpdate) => {
     checksStarted++; inFlight++;
     checkUpdate(u)
@@ -274,6 +284,8 @@ async function checkUpdate(u: PoolUpdate): Promise<CheckResult> {
   const headStart = Number(await rpcPatient('eth_blockNumber', []));
   const reader = new BlockReader({
     rpc: readerRpc,
+    rpcBatch: readerBatch,
+    localFilter: true,
     poolManager: POOL_MANAGER,
     addresses: () => addresses,
     v4Ids: () => v4Ids,
