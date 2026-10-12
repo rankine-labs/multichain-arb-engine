@@ -1984,10 +1984,10 @@ await chainManager.startAll();
             const logReader = () => {
                   const st = blockReader.stats();
                   const errs = blockReader.errorSummary(3);
-                  console.log(`[blockreader] polls ${st.polls} (ok ${st.ok}, errors ${st.errors}, rate-limited ${st.rateLimited}, paused ${st.pausedPolls}) · prices updated ${readerApplied} · median ${st.medianMs} ms · skipped ranges ${st.skippedRanges}${errs ? ' · errors: ' + errs : ''}`);
+                  console.log(`[blockreader] polls ${st.polls} (ok ${st.ok}, errors ${st.errors}, rate-limited ${st.rateLimited}, paused ${st.pausedPolls}, restarts ${st.restarts}) · prices updated ${readerApplied} · median ${st.medianMs} ms · skipped ranges ${st.skippedRanges}${errs ? ' · errors: ' + errs : ''}`);
             };
             setTimeout(logReader, 60_000);
-            setInterval(logReader, 10 * 60_000);
+            setInterval(logReader, 5 * 60_000);
       }
       // Lender balances: one bundled read of every candidate lender pool's
       // coins + liquidity, first ~20 s after start (watch list loaded), then
