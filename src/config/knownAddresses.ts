@@ -123,6 +123,8 @@ export const ROBINHOOD_UR_COPIES = [
   // Oct 11 router probe: two more copies, ~5% of swap transactions, none decoded before.
   '0xaf9d6fa019328d8cf8598d0d5be22cc6622b09f1',
   '0x7feb3ecbacbd0cc23ec46659d541636d58749a97',
+  // Oct 11 router probe (wallet count): ~3% of swap txs, 113 different wallets, Uniswap V4 pools.
+  '0x8c7b36c84d7ddf623ddc126f2a7019b1581a8de5',
 ];
 
 export const ROBINHOOD_V3 = {
