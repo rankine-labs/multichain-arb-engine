@@ -306,6 +306,7 @@ export interface PlainHourlyInput {
   newPools?: NewPoolSummary;
   topDifferences: { pair: string; pct: number; buyAt: string; sellAt: string }[];
   nodeUsage?: { name: string; used: number; daily: number }[]; // today's requests per node vs allowance
+  memory?: string; // one memory line (core/memReport.ts); absent when MEM_LOG=0
   // Phase 8 (Oct 8): our own costs and results, in plain numbers.
   ourGas?: { ownUsd: number | null; flashUsd: number | null }; // our contract's gas per trade, right now
   profitBands?: { hour: number[]; day: number[]; hourUsd: number; dayUsd: number }; // profitable checks by $ size
@@ -501,6 +502,9 @@ export function formatPlainHourly(r: PlainHourlyInput): string {
     }
     L.push('');
   }
+
+  // Memory use (measurement only, see core/memReport.ts).
+  if (r.memory) { L.push(esc(r.memory)); L.push(''); }
 
   if (r.topDifferences.length) {
     L.push('<b>Biggest price differences</b> (before fees, not profit)');

@@ -155,10 +155,15 @@ import { poolDepthUsd } from './core/poolPrice';
 // Loop trader v1 (3-5 pool loops, practice only, off unless LOOP_TRADER=1).
 import { LoopTrader, loopConfigFromEnv } from './core/loopTrader';
 import { formatLoopHour } from './core/loopReport';
+import { startMemReport, registerSize } from './core/memReport';
 
 async function main() {
 const cache = new PoolCache();
 const shadowLogger = new ShadowLogger();
+// Memory line every 5 min (core/memReport.ts; MEM_LOG=0 turns it off). Measurement only.
+const memReport = startMemReport();
+registerSize('opportunities', () => shadowLogger.size);
+registerSize('pools', () => cache.size());
 // Provider blocks (403/429) are saved here so a restart doesn't hit a
 // blocked feed again and extend the block (core/chainManager.ts).
 const chainManager = new ChainManager(Date.now, 'data/provider-blocks.json');
@@ -1026,6 +1031,8 @@ const rivalWatch = new RivalWatch(
             v4PoolManager: ROBINHOOD_V4.POOL_MANAGER,
       },
 );
+registerSize('rival trades', () => rivalWatch.recordCount());
+registerSize('competitor results', () => rivals.results.length);
 {
       const n = rivalWatch.load(RIVAL_BOTS_FILE, RIVAL_TRADES_FILE);
       // Seed: arbitrage contracts found on chain by the funding probe (Oct 7).
@@ -1274,6 +1281,7 @@ if (loopCfg.enabled) {
       setInterval(runLoopScan, 5_000);
       // Race comparison: every rival trade the rival watch saves.
       rivalWatch.onRecord = (rec) => loopTrader.noteRival(rec);
+      registerSize('loop cycles', () => loopTrader.finder.cycleCount());
       loopHourText = () => formatLoopHour(loopTrader.takeHour(), loopCfg.maxPools);
       console.log(`[loop] loop trader ON (practice only, never sends): 3-${loopCfg.maxPools} pools, up to ${loopCfg.maxCycles} loops, max $${loopCfg.maxTradeUsd}, bar $${loopCfg.minNetUsd}, ${loopCfg.checksPerMin} checks/min`);
 }
@@ -2829,6 +2837,7 @@ for (let i = 0; i < resolved.length; i++) {
                               research: researchHourText(),
                               venueTests: venueTally.hourText() ?? undefined,
                               loops: loopHourText(),
+                              memory: memReport?.hourLine(),
                               race: raceChecker.takeHour(),
                               funnel: {
                                     tradesRead: funnel.tradesRead, noPool: funnel.noPool, tooSmall: funnel.tooSmall, noPartner: funnel.noPartner,
