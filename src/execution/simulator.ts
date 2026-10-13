@@ -5,7 +5,7 @@ import { budgetForUrl } from '../core/nodeBudget';
 import { ethers } from 'ethers';
 import { ARB_EXECUTOR_RUNTIME_CODE, EXECUTOR_STORAGE_SLOT, FLASH_POOLS_STORAGE_SLOT, V4_POOL_MANAGER_STORAGE_SLOT, WETH_STORAGE_SLOT } from './arbExecutorBytecode';
 import { ExecutorHop, encodeExecuteRaw, encodeExecuteV3FlashRaw, KIND_V4, KIND_V4_HOOKED } from './executorCalldata';
-import { SimBucket, classifySimOutcome } from '../core/failReasons';
+import { SimBucket, classifySimOutcome, SampleLimiter } from '../core/failReasons';
 
 // ============================================================================
 // FREE PRE-TRADE SIMULATION
@@ -46,7 +46,15 @@ export const SIM_CALLER = '0x00000000000000000000000000000000000b0751';
 
 const MAX_UINT = (1n << 256n) - 1n;
 const abi = ethers.AbiCoder.defaultAbiCoder();
+// Every error our contract can give (contracts/src/ArbExecutor.sol; the test
+// src/test/failedChecks.test.ts fails if one is missing here), the two
+// standard Solidity ones, and the common errors of the exchanges a check
+// goes through, so a refusal reads as words instead of a hex code:
+//   Uniswap V4 PoolManager (Fables / V4 hops) and its WrappedError, which
+//   carries the real error of a hook or coin inside it
+//   Algebra Integral pools (Alandale, KittenSwap)
 const errIface = new ethers.Interface([
+  // ArbExecutor
   'error InsufficientProfit(uint256 got, uint256 wanted)',
   'error TokenBalanceDropped(address token)',
   'error UnsupportedKind(uint8 kind)',
@@ -56,13 +64,57 @@ const errIface = new ethers.Interface([
   'error UnauthorizedCallback()',
   'error TransferFailed()',
   'error NotExecutor()',
+  'error NotOwner()',
+  'error NotPendingOwner()',
+  'error OwnerIsExecutor()',
   'error FlashPoolNotAllowed(address pool)',
   'error V4NotEnabled()',
   'error UnexpectedEth()',
   'error Reentrancy()',
+  // Solidity built-ins
   'error Error(string)',
   'error Panic(uint256)',
+  // Uniswap V4
+  'error WrappedError(address target, bytes4 selector, bytes reason, bytes details)',
+  'error CurrencyNotSettled()',
+  'error PoolNotInitialized()',
+  'error PriceLimitAlreadyExceeded(uint160 sqrtPriceCurrentX96, uint160 sqrtPriceLimitX96)',
+  'error PriceLimitOutOfBounds(uint160 sqrtPriceLimitX96)',
+  'error SwapAmountCannotBeZero()',
+  'error ManagerLocked()',
+  'error ERC20TransferFailed()',
+  'error NativeTransferFailed()',
+  'error HookDeltaExceedsSwapAmount()',
+  'error InvalidHookResponse()',
+  // Algebra Integral
+  'error locked()',
+  'error notInitialized()',
+  'error zeroAmountRequired()',
+  'error invalidAmountRequired()',
+  'error insufficientInputAmount()',
+  'error invalidLimitSqrtPrice()',
 ]);
+// Solidity Panic codes in words (what went wrong inside a contract).
+const PANIC_WORDS: Record<number, string> = {
+  0x01: 'assert failed', 0x11: 'arithmetic over/underflow', 0x12: 'division by zero',
+  0x21: 'bad enum value', 0x22: 'bad storage data', 0x31: 'pop on empty array',
+  0x32: 'array index out of range', 0x41: 'out of memory', 0x51: 'call to zero function',
+};
+
+// Log at most a few raw examples an hour of checks we couldn't read, so
+// "failed with no reason" can be diagnosed from the server log next time.
+let diagLog: (msg: string) => void = (m) => console.log(m);
+const diagSamples = new SampleLimiter(5);
+// Tests swap the log line writer (and get a fresh hourly allowance).
+export function setSimDiagnosticLog(fn: (msg: string) => void): void { diagLog = fn; diagSamples.reset(); }
+
+// The first 10 bytes of revert data as hex ("0x" + 20 hex digits): the error
+// code plus the start of its details. Enough to look it up, short to log.
+export const first10Bytes = (hex: string): string => hex.slice(0, 22);
+
+const KIND_NAMES: Record<number, string> = { 0: 'V2', 1: 'Solidly', 2: 'V3', 3: 'V4', 4: 'V4-hooked' };
+const routeText = (hops: ExecutorHop[]): string =>
+  hops.map((h) => `${KIND_NAMES[h.kind] ?? `kind${h.kind}`}@${h.pool.slice(0, 10)}`).join(' -> ');
 const BALANCE_OF = new ethers.Interface(['function balanceOf(address) view returns (uint256)']);
 
 // `bucket`: which of the outcome groups this is (core/failReasons.ts).
@@ -229,17 +281,45 @@ export function replayRpc(base: Rpc, parentBlock: string, prefix: ReplayCall[], 
       // (which would pause all checks).
       return { error: { message: `replay unavailable${STATE_GONE_RE.test(r.error.message ?? '') ? ' (state gone)' : ''}` } };
     }
-    const calls = r.result?.[0]?.calls ?? [];
-    const ours = calls[calls.length - 1];
-    if (!ours) return { error: { message: 'replay returned no result' } };
-    if (ours.status === '0x1') return { result: ours.returnData };
-    // eth_simulateV1 puts revert data in error.data and leaves returnData as
-    // "0x". Reading returnData first lost the data, so every replayed check
-    // (profit, loss, real failure alike) read as "reverted with no reason".
-    const revert = ours.error?.data && ours.error.data !== '0x' ? ours.error.data
-      : ours.returnData && ours.returnData !== '0x' ? ours.returnData : undefined;
-    return { error: { message: ours.error?.message ?? 'execution reverted', data: revert } };
+    return readReplayAnswer(r.result, prefix.length + 1);
   };
+}
+
+// Reads OUR call's answer out of an eth_simulateV1 result, shaped like an
+// eth_call answer. Node softwares differ in the details, so all of these
+// are understood:
+//   result = [ { calls: [...] } ]          the standard shape (one block)
+//   result = { calls: [...] }              a single block, not in a list
+//   status "0x1" / "0x0", 1 / 0, true / false, or missing (then: failed if
+//                                          there is an error, else succeeded)
+//   error = { message, code, data }        revert data in error.data
+//   error = { data: { data: "0x..." } }    revert data one level deeper
+//   error = "execution reverted"           error given as plain text
+//   returnData = "0x..."                   revert data only in returnData
+// Our call is the last of `expectedCalls`. If the node sent back a different
+// number of calls we can't tell which answer is ours, so the replay counts
+// as unavailable (before, the last answer was taken anyway, and a replayed
+// trade's success could be misread as OUR call succeeding: "built the trade
+// wrong").
+export function readReplayAnswer(result: any, expectedCalls: number): { result?: any; error?: { message?: string; data?: any; code?: number; via?: string } } {
+  const block = Array.isArray(result) ? result[0] : result;
+  const calls: any[] = Array.isArray(block?.calls) ? block.calls : [];
+  // Both start with "replay unavailable", so callers fall back to a plain
+  // check (an empty answer used to be counted as a failed trade).
+  if (!calls.length) return { error: { message: 'replay unavailable (no answer)' } };
+  if (calls.length !== expectedCalls) return { error: { message: `replay unavailable (${calls.length} answers for ${expectedCalls} calls)` } };
+  const ours = calls[calls.length - 1];
+  const err = typeof ours?.error === 'string' ? { message: ours.error } : ours?.error;
+  const st = ours?.status;
+  const failed = st === '0x0' || st === 0 || st === false || st === '0' || (st === undefined && !!err);
+  if (!failed) return { result: ours?.returnData ?? '0x' };
+  // eth_simulateV1 puts revert data in error.data and leaves returnData as
+  // "0x". Reading returnData first lost the data, so every replayed check
+  // (profit, loss, real failure alike) read as "reverted with no reason".
+  const fromErr = err ? extractRevertData(err) : null;
+  const revert = fromErr && fromErr !== '0x' ? fromErr
+    : typeof ours?.returnData === 'string' && ours.returnData !== '0x' ? ours.returnData : undefined;
+  return { error: { message: err?.message ?? 'execution reverted', code: err?.code, data: revert, via: 'eth_simulateV1' } };
 }
 
 // Does this RPC error mean "you're sending too many requests"?
@@ -411,6 +491,40 @@ export async function simulateRoundTrip(
   return tag(await simulateInner(rpc, chain, trade, opts));
 }
 
+// ----------------------------------------------------------------------------
+// SECOND OPINION for "failed with no reason"
+//
+// Plain English:
+//   Oct 7 we found the checking node (QuickNode) refusing some trades with no
+//   reason at all (every Ramses V3 check) while the free public node and fork
+//   tests ran the very same trade fine. The after-trigger checks already ask
+//   the free node again in that case; the standing-gap checks (most of the
+//   hourly checks) did not, so their "no reason" failures were never
+//   double-checked. simulateWithRecheck does the same for any caller: if the
+//   first node says "breaks, no reason" (or TransferFailed with own money,
+//   which the same node problem also produced), ask `backup` once, and keep
+//   its answer unless the backup is busy, unreachable or can't run the check.
+// ----------------------------------------------------------------------------
+export function isNoReasonFail(r: SimResult): boolean {
+  return r.status === 'fail' && /execution reverted\s*$|reverted without data|TransferFailed/.test(r.reason);
+}
+
+export async function simulateWithRecheck(
+  primary: Rpc, backup: Rpc | null, chain: string,
+  trade: { token: string; amountIn: bigint; hops: ExecutorHop[] },
+  opts: { v3Lender?: string; weth?: string; blockTag?: string } = {},
+  // Told after each second opinion: did it give a different (readable) answer?
+  onRecheck: (changed: boolean) => void = () => {},
+): Promise<SimResult> {
+  const r = await simulateRoundTrip(primary, chain, trade, opts);
+  if (!backup || !isNoReasonFail(r)) return r;
+  const r2 = await simulateRoundTrip(backup, chain, trade, opts);
+  // Backup busy, or it can't run this check at all: keep the first answer.
+  if (r2.status === 'rate_limited' || r2.status === 'unsupported') return r;
+  onRecheck(!isNoReasonFail(r2));
+  return r2;
+}
+
 async function simulateInner(
   rpc: Rpc,
   chain: string,
@@ -499,15 +613,53 @@ async function simulateInner(
     // so the text is still sorted (classifySimOutcome); a bare "execution
     // reverted" is missing_revert_data.
     const reason = r.error.message ?? 'reverted without data';
+    if (!/^replay /.test(reason) && classifySimOutcome('fail', reason) === 'missing_revert_data') {
+      diagnose('no-data', `no revert data | node said ${describeError(r.error)}`, trade.hops, flash, opts.blockTag);
+    }
     return { status: 'fail', reason };
   }
-  return { status: 'fail', reason: `revert ${rd.slice(0, 10)}`, bucket: 'contract_revert' };
+  // Revert data we can't read: keep its first 10 bytes so it can be looked
+  // up later (the 4-byte error code alone is often not enough).
+  diagnose('unknown', `unknown revert data ${first10Bytes(rd)} (${(rd.length - 2) / 2} bytes) | node said ${describeError(r.error)}`, trade.hops, flash, opts.blockTag);
+  return { status: 'fail', reason: `revert ${first10Bytes(rd)}`, bucket: 'contract_revert' };
+}
+
+// One log line (at most a few an hour per kind) describing a check whose
+// answer we couldn't read: what the node sent back and which route it was.
+// Never contains the node address (the error object doesn't hold it).
+function diagnose(kind: string, what: string, hops: ExecutorHop[], flash: boolean, blockTag?: string): void {
+  if (!diagSamples.take(kind)) return;
+  diagLog(`[sim-diag] ${what} | route ${routeText(hops)} | ${flash ? 'flash loan' : 'own money'}${blockTag ? ` | block ${blockTag}` : ''}`);
+}
+
+// The node's error, briefly: code, message (shortened), which fields it had,
+// and whether it came from a replay (eth_simulateV1) or a plain eth_call.
+function describeError(e: { code?: number; message?: string; data?: any; via?: string } & Record<string, any>): string {
+  const fields = Object.keys(e ?? {}).filter((k) => k !== 'via').join(',');
+  const data = typeof e?.data === 'string' ? ` data=${first10Bytes(e.data)}` : e?.data !== undefined ? ` data=<${typeof e.data}>` : '';
+  return `code=${e?.code ?? '-'} msg="${String(e?.message ?? '').slice(0, 100)}"${data} fields=[${fields}] via ${e?.via ?? 'eth_call'}`;
 }
 
 // Revert data -> decoded error, or null if there is none / it isn't one we know.
 function parseRevert(rd: string | null): ethers.ErrorDescription | null {
   if (!rd || rd === '0x') return null;
   try { return errIface.parseError(rd); } catch { return null; }
+}
+
+// A decoded error as readable text. Panic gets its meaning in words; a V4
+// WrappedError shows the error it carries (a hook's or a coin's own refusal).
+function errorText(parsed: ethers.ErrorDescription): string {
+  if (parsed.name === 'Error') return String(parsed.args[0]);
+  if (parsed.name === 'Panic') {
+    const code = Number(parsed.args[0]);
+    return `Panic(0x${code.toString(16)}: ${PANIC_WORDS[code] ?? 'unknown'})`;
+  }
+  if (parsed.name === 'WrappedError') {
+    const inner = parseRevert(String(parsed.args[2]));
+    const innerText = inner ? errorText(inner) : `revert ${first10Bytes(String(parsed.args[2]))}`;
+    return `${innerText} (inside V4 call to ${String(parsed.args[0]).slice(0, 10)}, WrappedError)`;
+  }
+  return `${parsed.name}(${parsed.args.join(', ')})`;
 }
 
 // What a decoded revert means for the trade.
@@ -525,6 +677,13 @@ function verdictFrom(parsed: ethers.ErrorDescription, flash: boolean): SimResult
   if (parsed.name === 'TransferFailed' && flash) {
     return { status: 'loss', bucket: 'real_loss', detail: 'flash loan could not be repaid (trade lost money, or a token refused to move)' };
   }
-  const reason = parsed.name === 'Error' ? String(parsed.args[0]) : `${parsed.name}(${parsed.args.join(', ')})`;
-  return { status: 'fail', reason };
+  // A pool that paid out nothing (ZeroAmount: the check always sends coins in,
+  // so only a hop can give 0) or asked to be paid nothing (UnauthorizedCallback:
+  // a V3 pool with no liquidity in that direction calls back owing 0; the
+  // contract's other callback guards can't trip in a check). The pool had no
+  // coins to trade at its price, so our saved pool info was old or wrong:
+  // not a mistake in how we built the trade (core/failReasons.ts 'stale').
+  if (parsed.name === 'ZeroAmount') return { status: 'fail', reason: 'ZeroAmount(): pool gave back nothing' };
+  if (parsed.name === 'UnauthorizedCallback') return { status: 'fail', reason: 'UnauthorizedCallback(): pool took nothing (no liquidity at its price)' };
+  return { status: 'fail', reason: errorText(parsed) };
 }
