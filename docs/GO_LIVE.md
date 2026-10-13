@@ -1,5 +1,7 @@
 # Going live on Robinhood: checklist
 
+> Friday step-by-step: follow [GO_LIVE_CHECKLIST.md](GO_LIVE_CHECKLIST.md). This page has the background.
+
 The bot runs in **shadow mode** until every step below is done. It can't switch
 itself to live: live sending needs four settings that only you add to `.env`.
 
