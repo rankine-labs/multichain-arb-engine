@@ -111,7 +111,7 @@ async function filterAndCapTests() {
     advance(60_000); sockets[0]!.emit('pong'); r.tick();
     assert(sockets.length === 2, 'after resubscribeMs: new socket with the new list');
     sockets[1]!.open();
-    assert(JSON.stringify(sockets[1]!.sent[0].params[1].address) === JSON.stringify([A, OTHER, PM].sort()), 'renewed subscription includes the new pool');
+    assert(JSON.stringify(sockets[1]!.sent[0].params[1].address) === JSON.stringify([A, OTHER].sort()), 'renewed subscription includes the new pool');
     assert(r.stats().resubscribes === 1 && logs.some((l) => l.includes('renewing the subscription')), 'renewal counted and logged');
     sockets[1]!.reply(1, '0xs2');
     advance(61_000); sockets[1]!.emit('pong'); r.tick();
@@ -166,9 +166,12 @@ async function main() {
     s.open();
     const sub = s.sent[0];
     assert(sub?.method === 'eth_subscribe' && sub.params[0] === 'logs', 'on open: subscribes to logs');
-    assert(JSON.stringify(sub.params[1].topics) === JSON.stringify([HANDLED_TOPICS]), 'subscription uses the same topic set as the poll reader');
-    assert(JSON.stringify(sub.params[1].address) === JSON.stringify([A, PM].sort()), 'address filter on by default: only our pools + the V4 PoolManager');
-    assert(s.sent.length === 1, 'newHeads NOT subscribed by default (saves billed messages)');
+    assert(JSON.stringify(sub.params[1].topics) === JSON.stringify([HANDLED_TOPICS.filter((t) => t !== V4_SWAP_TOPIC)]), 'pool subscription: the poll reader topics minus V4 swaps');
+    assert(JSON.stringify(sub.params[1].address) === JSON.stringify([A]), 'address filter on by default: only our pool contracts');
+    const v4sub = s.sent[1];
+    assert(v4sub?.id === 3 && v4sub.params[1].address === PM && JSON.stringify(v4sub.params[1].topics) === JSON.stringify([[V4_SWAP_TOPIC], [ID]]), 'second subscription: V4 swaps from the PoolManager for our V4 pool ids only');
+    s.reply(3, '0xsubv4');
+    assert(!s.sent.some((x) => x.params?.[0] === 'newHeads'), 'newHeads NOT subscribed by default (saves billed messages)');
     s.reply(1, '0xsub1');
     assert(r.healthy() && !r.fallbackActive(), 'subscription confirmed: healthy, poll reader pauses');
     assert(health.length === 1 && health[0]!.healthy, 'health change reported (up)');
@@ -176,7 +179,7 @@ async function main() {
     s.push('0xsub1', syncLog(A, 500, 1, 10n, 20n));
     s.push('0xsub1', syncLog(A, 500, 3, 11n, 21n));         // newer in same block wins
     s.push('0xsub1', syncLog(OTHER, 501, 0, 1n, 1n));      // not our pool: ignored but advances the block
-    s.push('0xsub1', v4Log(ID, 500, 2));                   // our V4 pool
+    s.push('0xsubv4', v4Log(ID, 500, 2));                  // our V4 pool (arrives on the V4 subscription)
     s.push('0xsub1', v4Log(ID_OTHER, 500, 4));             // V4 pool we don't watch
     s.push('0xwrongsub', syncLog(A, 600, 0, 9n, 9n));      // unknown subscription id: ignored
     assert(applied.length === 0, 'events are gathered briefly, not applied one by one');
@@ -187,7 +190,7 @@ async function main() {
     assert(!!a && a.reserve0 === 11n && a.reserve1 === 21n && a.block === 500, 'newest Sync for our pool applied (same update shape as the poll reader)');
     assert(b.latest.has(ID) && !b.latest.has(ID_OTHER) && !b.latest.has(OTHER), 'only our pools / V4 ids kept (same filter as poll reader)');
     assert(b.toBlock === 501 && r.stats().lastBlock === 501, 'last block tracks the newest event seen on chain');
-    assert(r.stats().messages === 7 && usage.summary().find((x) => x.label === r.label)!.wsMessages === 7, 'every pushed message counted (stats + usage counter)');
+    assert(r.stats().messages === 8 && usage.summary().find((x) => x.label === r.label)!.wsMessages === 8, 'every pushed message counted (stats + usage counter)');
     assert(r.label === 'Chainstack WebSocket', 'node labelled by provider name from the host');
     assert(!logs.join('\n').includes('SECRETKEY'), 'logs never contain the URL / key');
 
