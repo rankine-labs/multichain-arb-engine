@@ -91,6 +91,39 @@ const DEFAULTS: Record<string, { rps: number; daily: number; match: RegExp }> = 
 const budgets = new Map<string, NodeBudget>();
 let usageFile: string | null = null;
 
+// ---- Budgets for one exact node URL (any provider) --------------------------
+// Plain English: the table above only knows a few providers by name. When the
+// owner points a job at ANY other node from .env (e.g. CHECK_RPC_MAIN =
+// a Chainstack URL, see core/checkNodes.ts), that node gets its own speed
+// limit and daily allowance here, matched by its exact URL. An exact-URL
+// budget wins over the provider table, so the same QuickNode key used as
+// CHECK_RPC_MAIN with CHECK_RPC_MAIN_DAILY is held to THAT allowance.
+const urlBudgets = new Map<string, NodeBudget>();
+// Usage read from disk for budgets that are registered later in startup
+// (the file is loaded before the check nodes are set up).
+const pendingUsage = new Map<string, { day: string; used: number }>();
+
+// Same URL written slightly differently (trailing slash, upper-case host)
+// should still find its budget.
+const urlKey = (url: string) => url.trim().replace(/\/+$/, '').toLowerCase();
+
+export function registerUrlBudget(url: string, name: string, rps: number, daily: number): NodeBudget {
+  const key = urlKey(url);
+  const existing = urlBudgets.get(key);
+  if (existing) return existing;
+  // Two URLs with the same display name share one budget (same node).
+  let b = budgets.get(name);
+  if (!b) {
+    b = new NodeBudget(name, rps, daily);
+    // Today's usage from before a restart, if the file had it.
+    const saved = pendingUsage.get(name);
+    if (saved && saved.day === b.day) b.usedToday = Number(saved.used) || 0;
+    budgets.set(name, b);
+  }
+  urlBudgets.set(key, b);
+  return b;
+}
+
 function envNum(name: string, fallback: number): number {
   const v = Number(process.env[name]);
   return Number.isFinite(v) && v > 0 ? v : fallback;
@@ -109,6 +142,8 @@ function get(name: string): NodeBudget {
 // The budget for a node URL, or null for nodes we don't meter (e.g. the
 // sequencer we send trades to).
 export function budgetForUrl(url: string): NodeBudget | null {
+  const exact = url ? urlBudgets.get(urlKey(url)) : undefined;
+  if (exact) return exact;
   for (const [name, d] of Object.entries(DEFAULTS)) if (d.match.test(url)) return get(name);
   return null;
 }
@@ -129,7 +164,10 @@ export function loadNodeUsage(file: string) {
     const j = JSON.parse(readFileSync(file, 'utf8')) as Record<string, { day: string; used: number }>;
     const today = dayKey(Date.now());
     for (const [name, u] of Object.entries(j)) {
-      if (!DEFAULTS[name] || u.day !== today) continue;
+      if (u.day !== today) continue;
+      // Not a built-in provider: keep it until its exact-URL budget is
+      // registered (registerUrlBudget picks it up).
+      if (!DEFAULTS[name]) { pendingUsage.set(name, u); continue; }
       const b = get(name);
       b.usedToday = Number(u.used) || 0;
     }
