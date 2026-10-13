@@ -88,7 +88,9 @@ import { ROBINHOOD_SCAN_FACTORIES } from './config/knownAddresses';
 // Uniswap V4 in the chain-wide scan, asked PER PAIR (core/v4Lookup.ts), not
 // from V4's history (that ran out of memory twice on Oct 9). RH_V4_SCAN=0 off.
 const RH_V4_SCAN = process.env.RH_V4_SCAN !== '0';
-import { buildExecuteCall, executionRequested, executorConfig, pickV3Lender } from './execution/executorCalldata';
+import { buildExecuteCall, executionRequested, executorConfig, pickV3Lender, kindForPool } from './execution/executorCalldata';
+import { GasModel, GasCalibration, gasSettingsFromEnv, routeKeyFor, twoPoolKey, defaultUnitsFor, costsLine } from './core/gasModel';
+import { recordEventFee, eventFeeCounts, feeFromEventsOn, setHeadBlockSource } from './core/eventFees';
 import { OwnMoneyBook, useOwnMoney } from './core/ownMoney';
 import { BlockReader, PoolUpdate } from './core/blockReader';
 import { AutoVet, CheckOutcome } from './core/autoVet';
@@ -158,7 +160,7 @@ import { ROBINHOOD_SEED_PAIRS } from './config/robinhoodSeedPairs';
 import { ResearchLane, researchConfigFromEnv, planShallowCandidate, findResearchGaps, gapCandidate, ResearchCandidate } from './core/researchLane';
 import { poolDepthUsd, setRealBalanceSource, thinPools } from './core/poolPrice';
 // Loop trader v1 (3-5 pool loops, practice only, off unless LOOP_TRADER=1).
-import { LoopTrader, loopConfigFromEnv, loopGasUsd } from './core/loopTrader';
+import { LoopTrader, loopConfigFromEnv } from './core/loopTrader';
 import { formatLoopHour } from './core/loopReport';
 import { startMemReport, registerSize } from './core/memReport';
 // Loop trader extra pools: keeps single-pool pairs fresh for the loop finder only (off unless LOOP_TRADER=1).
@@ -657,6 +659,8 @@ const runSimulation = (
                   if (spot) {
                         r = await simulateRoundTrip(replayRpc(simRpc[chain], spot.parent, spot.prefix, spot.time), chain, trade, simOpts);
                         timing = 'right after trigger';
+                        // Replays report the gas our trade used: calibrate the gas model.
+                        if (chain === 'robinhood' && (r.status === 'profit' || r.status === 'loss') && r.gasUsed) gasModel.notePractice(twoPoolKey(built.hops.map((h) => h.kind), !!lender), r.gasUsed);
                         if ('reason' in r && (r.reason.startsWith('replay unavailable') || STATE_GONE.test(r.reason))) {
                               // Replay not possible: end of the trigger's block instead.
                               r = await simulateRoundTrip(simRpc[chain], chain, trade, { ...simOpts, blockTag: spot.block });
@@ -969,8 +973,42 @@ let liveChecks: { ok: boolean; problems: string[] } = { ok: !robinhoodSender.liv
 // Gas cost of one Robinhood trade in USD, from the real gas price and ETH
 // price (was a fixed $0.05 / $2). Falls back to the old fixed value if
 // either price is unknown yet.
-const rhGasUsd = (fallback: number): number =>
+// Oct 13 (GAS_FROM_LIVE, core/gasModel.ts): per kind of trade (own money vs
+// loan, exchange mix), measured gas units x live gas price, x GAS_MARGIN;
+// $0.05 (the fallback) when the gas reading is missing or over 30 s old.
+// GAS_FROM_LIVE=0 = the line below `oldGasUsd` only (the previous behaviour).
+const oldGasUsd = (fallback: number): number =>
       robinhoodSender.gasCostUsd(priceOracle.getUsdPrice('robinhood', ROBINHOOD_TOKENS.WETH)) ?? fallback;
+const gasModel = new GasModel(gasSettingsFromEnv(), new GasCalibration('data/gas-calibration.json'),
+      () => robinhoodSender, () => priceOracle.getUsdPrice('robinhood', ROBINHOOD_TOKENS.WETH), oldGasUsd);
+// loan: funded by a flash loan (default: the bot's funding setting).
+// kinds: the two pools' executor kinds when known (finer calibration).
+const rhGasUsd = (fallback: number, loan: boolean = !RH_OWN_MONEY, kinds?: (number | null)[]): number =>
+      gasModel.twoPoolUsd(loan, kinds && kinds.every((k) => k !== null) ? kinds as number[] : undefined, fallback);
+// Event fees are "newer" than a fee read by BLOCK (core/eventFees.ts): the
+// current block, estimated from the sender's 2 s block reads.
+setHeadBlockSource(() => { const d = robinhoodSender.deadlineBlock(1); return d === null ? null : Number(d) - 1; });
+// One receipt of our own live trade -> gas calibration. Asks the node for
+// the raw receipt once to read Arbitrum's gasUsedForL1 (the parent-chain
+// part). Calibration learns the trade's OWN gas (gasUsed - gasUsedForL1),
+// the same thing practice replays measure; the estimate then adds the
+// parent-chain part at today's price (fastSender's realistic-calldata read).
+// The first 20 live receipts log estimated vs actual parent-chain gas.
+let l1Compared = 0;
+const noteReceiptGas = async (key: string, hash: string, gas: bigint, success: boolean) => {
+      let l1: bigint | null = null;
+      try {
+            const raw = await robinhoodReadProvider.send('eth_getTransactionReceipt', [hash]);
+            if (raw?.gasUsedForL1 !== undefined && raw?.gasUsedForL1 !== null) l1 = BigInt(raw.gasUsedForL1);
+      } catch { /* no L1 split: the whole gasUsed counts (errs on the high side) */ }
+      if (l1Compared < 20) {
+            l1Compared++;
+            const est = robinhoodSender.l1GasNow;
+            console.log(`[gas] live receipt ${hash.slice(0, 10)}: parent-chain gas estimated ${est} vs actual ${l1 ?? '?'}` +
+                  (l1 !== null && l1 > est ? ' (UNDER-estimated: raise FIRE_L1_CALLDATA_BYTES)' : '') + ` | total gas ${gas}`);
+      }
+      gasModel.noteReceipt(key, gas, l1, success, defaultUnitsFor(key));
+};
 // Dry-run "would have earned" totals (core/dryRunPnl.ts), saved so restarts
 // don't reset them. Verified = confirmed by a real-chain test; model-only =
 // the bot's own maths. Both assume we win the race.
@@ -981,6 +1019,7 @@ setInterval(() => dryRunPnl.save(), 60_000);
 for (const sig of ['SIGINT', 'SIGTERM'] as const) {
       process.once(sig, () => {
             try { dryRunPnl.save(); } catch { /* best effort */ }
+            try { gasModel.calibration.maybeSave(true); } catch { /* best effort */ }
             try { robinhoodWatcher.save(WATCH_FILE); } catch { /* best effort */ }
             try { routeScores.save(ROUTE_FILE); } catch { /* best effort */ }
             try { autoVet.save(AUTO_VET_FILE); } catch { /* best effort */ }
@@ -1096,7 +1135,7 @@ const liveTracker = new LiveTradeTracker({
       },
       recordLoss: (usd) => { safetyGate.recordLoss(usd); safetyAlerts.onLoss(safetyGate.lossTodayUsd()); },
       onResult: (r) => liveTradeLog.result(r),
-      noteGasUsed: (gas) => robinhoodSender.noteGasUsed(gas),
+      noteGasUsed: (gas, info) => { robinhoodSender.noteGasUsed(gas); if (info?.routeKey) void noteReceiptGas(info.routeKey, info.hash, gas, info.success); },
       notify: (html) => sendTelegramMessage(html),
       onSettled: (hash) => { safetyGate.releasePending(hash); robinhoodSender.settled(hash); },
       onDropped: () => { void robinhoodSender.resyncNonce(); },
@@ -1269,8 +1308,8 @@ if (loopCfg.enabled) {
                   decimalsOf: (t) => TOKEN_DECIMALS.robinhood?.[t.toLowerCase()],
                   usdOf: usdRhLoop,
                   depthUsd: (p) => poolDepthUsd(p, decimalsOf, usdRhLoop),
-                  // Our gas for a 2-pool trade, scaled per pool (fit to fork-test gas, see loopGasUsd).
-                  gasUsd: (hops) => loopGasUsd(rhGasUsd(0.05), hops),
+                  // Our gas for a loop of N pools (core/gasModel.ts loopUsd: calibrated per pool count, else the 2-pool estimate scaled per pool).
+                  gasUsd: (hops) => gasModel.loopUsd(hops, 0.05),
                   // Pools rival loops used (last 24 h): their loops are listed first.
                   rivalPools: () => rivalWatch.loopRoutePools(Date.now() - 24 * 3600_000),
                   isTradable: (t) => safetyGate.isAllowed(t),
@@ -1443,7 +1482,7 @@ const fireTrade = async (o: {
                   setTimeout(() => { void refreshOwnMoney(); }, 3_000);
                   // Worst-case gas (2x today's cost) held against the daily loss cap until the receipt.
                   safetyGate.reservePending(fired.txHash, 2 * rhGasUsd(0.05));
-                  liveTracker.track(fired.txHash, { expectedProfitUsd: netProfitUsd, label: tradeLabel });
+                  liveTracker.track(fired.txHash, { expectedProfitUsd: netProfitUsd, label: tradeLabel, routeKey: routeKeyFor(dry.hops.map((h) => h.kind), dry.funding === 'v3-flash') });
             }
             console.log(`[fire] robinhood ${fired.live ? 'LIVE' : 'DRY RUN'} (${o.source}) ready ${readyMs}ms after ${o.source === 'trade' ? 'the trigger' : 'the price update'} (sign ${fired.signMs.toFixed(1)}ms)` +
                   `${fired.txHash ? ` tx ${fired.txHash}` : ''}${fired.error ? ` error: ${fired.error}` : ''}`);
@@ -1750,7 +1789,7 @@ for (const peer of peers) {
       const rh = swap.chain === 'robinhood';
       const loanBps = rh ? rhLoanFeeBps(swap.tokenIn, pool, peer) : 9;
       const candidate = planBackrun(cache, pool, peer, swap, usdPerToken, {
-            gasPriceUsd: rh ? rhGasUsd(0.05) : 2,
+            gasPriceUsd: rh ? rhGasUsd(0.05, loanBps !== null, [kindForPool(pool), kindForPool(peer)]) : 2,
             dexFeeBps: { buy: pool.feeBps, sell: peer.feeBps }, // overwritten per direction inside planBackrun
             flashLoanFeeBps: loanBps ?? 0,
             usingFlashLoan: !rh || loanBps !== null,
@@ -2196,7 +2235,14 @@ await chainManager.startAll();
             let readerApplied = 0;
             const applyUpdate = (u: PoolUpdate): boolean => {
                   const cur = cache.get('robinhood', u.pool);
-                  if (!cur || cur.lastUpdatedBlock > u.block) return false;
+                  if (!cur) return false;
+                  // Fee the swap paid (V4 / Algebra Integral events), kept on the
+                  // pool even if its price write is skipped below (core/eventFees.ts).
+                  // Fables pools: also fed to the Fables fee predictor.
+                  if (feeFromEventsOn() && recordEventFee(cur, u) && cur.v4?.hooks && u.v4Fee !== undefined && u.zeroForOne !== undefined) {
+                        fablesFees.observeSwap(cur.poolAddress, u.zeroForOne, u.v4Fee, Date.now());
+                  }
+                  if (cur.lastUpdatedBlock > u.block) return false;
                   if (cache.fedWithin('robinhood', cur.poolAddress, FEED_FRESH_MS)) return false;
                   if (u.kind === 'v2') {
                         if (u.reserve0 === undefined || u.reserve1 === undefined || cur.reserveA === undefined) return false;
@@ -2933,6 +2979,10 @@ for (let i = 0; i < resolved.length; i++) {
                               ourGas: (() => {
                                     const eth = priceOracle.getUsdPrice('robinhood', ROBINHOOD_TOKENS.WETH);
                                     return { ownUsd: robinhoodSender.gasCostUsdFor(OUR_GAS_OWN, eth), flashUsd: robinhoodSender.gasCostUsdFor(OUR_GAS_FLASH, eth) };
+                              })(),
+                              costsUsed: (() => {
+                                    const f = eventFeeCounts(cache.allForChain('robinhood'));
+                                    return costsLine(gasModel.twoPool(!RH_OWN_MONEY), gasModel.settings, f.fromEvents, f.waiting, gasModel.staleReason);
                               })(),
                               profitBands: { hour: [...profitBands.hour], day: [...profitBands.day], hourUsd: profitBands.hourUsd, dayUsd: profitBands.dayUsd },
                               simOutcomes: simBuckets.plain(),
