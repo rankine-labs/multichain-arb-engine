@@ -29,6 +29,7 @@ The loop trader v1:
    checks come last: only when the normal check line is idle, and at most 6 a
    minute.
 5. **Reports** a "Loop trades" block in the hourly report.
+6. **Keeps single pools fresh** for loops (see "Extra single pools" below).
 
 **It never sends a trade.** The loop trader is never handed the sender or a
 wallet; even with `EXECUTION_ENABLED=true`, loops are only practice-checked.
@@ -43,6 +44,7 @@ Loop trades: found 12, best $0.84, checked 9, would make money 4 ($1.92), contra
   1) WETH/DJT/PONS/USDG/WETH: 5x, best $0.84
   ...
 Race vs rival loops: they won 40 (busiest: 0xd7572f 38); 31 longer than 5 pools or not fully seen; of the other 9, we found 3, usually 1.2 s before we read their trade
+  extra single pools watched: 240 (231 with a fresh price now)
 Finder speed: 9,800 updates, typical 3.1 ms, slowest 14 ms; 5000 loops watched
 ```
 
@@ -50,10 +52,54 @@ Finder speed: 9,800 updates, typical 3.1 ms, slowest 14 ms; 5000 loops watched
 - **checked / would make money**: practice-check results (after gas).
 - **contract can't run**: loops through an exchange the contract can't trade
   yet or that isn't approved for practice checks.
+- **extra single pools watched**: single-pool pairs kept fresh for loops (see
+  below), and how many had a fresh price when the report was made.
 - **Race vs rival loops**: for each rival loop win of 3-5 pools, did our finder
   have the same pools paying shortly before? "before we read their trade" is
   measured against when our rival watch read their trade (a few seconds after
   it landed), so it is a rough lead, not an exact race result.
+
+## Extra single pools (loops through pairs that sit on one pool)
+
+**The problem.** The bot only keeps prices fresh for coin pairs that sit on
+2+ pools, because a 2-pool trade needs two pools. A pair on just one pool
+(often the middle step of a rival loop, e.g. DJT/PONS) was remembered but
+never updated, and the loop finder only uses fresh prices. So loops such as
+WETH -> DJT -> PONS -> USDG -> WETH, the kind the rival bot 0xd7572f makes
+about $464 a day on, were invisible.
+
+**What the bot does now** (only when `LOOP_TRADER=1`):
+
+1. **Picks up to 300 single pools.** A single pool is picked when it has at
+   least $10,000 in it (`POOL_MIN_DEPTH_USD`, same bar as everywhere else)
+   and both of its coins can be reached from WETH/USDG so the pool can sit on
+   a loop of 3-5 pools. Pools that rival loop trades went through (last 24 h)
+   come first, then pools on the coins those rivals used, then the deepest.
+2. **Finds new ones from the chain-wide scan.** The scan knows every pool on
+   the chain but not how much money is in it. Promising single pools (both
+   coins already on our coin map, or a coin like PONS that joins two coins on
+   the map) get one cheap balance read each, bundled hundreds to a request.
+   The ones with money are then looked up properly (exact price, fee, coin
+   decimals), about 40 per round. A pool with no money isn't looked at again
+   for 6 hours.
+3. **Keeps them fresh.** Picked pools are added to the block reader's list,
+   so every trade on them updates the price straight from the block. This
+   costs **no extra node requests**: the block reader already fetches every
+   block's trade events and keeps the ones for our pools. On top of that, one
+   bundled re-read of all picked pools every 20 s (1-2 requests, on the gentle
+   scan lane) keeps quiet pools counted as fresh and corrects any drift. A
+   re-read never overwrites a newer price from the block reader.
+4. **Rebuilds the pick** every 10 minutes and right after each chain-wide scan.
+
+**What it does NOT change.** Extra pools are never added to the pair
+watcher's watch list. The 2-pool gap scanner and the back-run planner never
+see them; only the loop finder does. A trade on an extra pool triggers a loop
+scan only (not a gap scan). With `LOOP_TRADER` unset, none of this exists.
+
+**Where to see it.** The 5-minute `[blockreader]` log line ends with
+`loop extra pools: N fresh / M selected`; each rebuild logs a
+`[loop] extra single pools ...` line; the hourly "Loop trades" block shows
+`extra single pools watched: N`.
 
 ## Settings (.env)
 
@@ -67,6 +113,10 @@ Finder speed: 9,800 updates, typical 3.1 ms, slowest 14 ms; 5000 loops watched
 | `LOOP_MIN_NET_USD` | check bar ($0.10) | Smallest model profit after gas that counts and gets checked. Defaults to `SIM_MIN_GROSS_USD`, else `MIN_EXEC_NET_USD`, else $0.10. |
 | `LOOP_CHECKS_PER_MIN` | 6 | Most loop practice checks a minute. `0` = find and report only. |
 | `LOOP_MAX_POOL_AGE_MS` | 30000 | Pools whose price is older than this are left out. |
+| `LOOP_EXTRA_POOLS` | on with `LOOP_TRADER=1` | Keep single-pool pairs fresh for loops. `0` = off. Never on without `LOOP_TRADER=1`. |
+| `LOOP_EXTRA_POOLS_MAX` | 300 | Most single pools kept fresh (up to 2,000). |
+| `LOOP_EXTRA_REFRESH_MS` | 20000 | Bundled re-read of the picked pools (2/3 of `LOOP_MAX_POOL_AGE_MS`, at most 20 s). `0` = only trades update them, so quiet pools drop out of the finder. |
+| `LOOP_EXTRA_LOOKUPS` | 40 | New single pools from the scan looked up properly per 10-minute round. `0` = only use single pools the bot already knows. |
 
 Pools also need `POOL_MIN_DEPTH_USD` ($10,000) of money, like the gap scanner.
 
@@ -95,11 +145,9 @@ across mixed exchanges needs **no contract change** for practice checks.
    and a separate switch. Not in v1 on purpose.
 5. **Own money in WETH/USDG** (rivals use their own money). Flash loans are
    possible too, but the lending pool must not be on the loop.
-6. **Keep more pools fresh**: the finder only uses pools of "watched" pairs
-   (pairs with 2+ pools), because only those get new prices every block.
-   Pairs with a single pool (often the middle steps of rival loops, e.g.
-   DJT/PONS) are not refreshed, so loops through them are not seen yet. The
-   pair watcher / block reader would need to follow those pools too.
+6. **Keep more pools fresh**: done (see "Extra single pools" above). Check
+   the hourly "Race vs rival loops" line: "we found" should rise for rival
+   loops through single-pool pairs.
 7. **Longer loops**: the rival averages 7.5 pools per trade. v1 stops at 5.
 
 ## Known limits
@@ -109,5 +157,11 @@ across mixed exchanges needs **no contract change** for practice checks.
   the practice check (real pool code) catches it.
 - Ramses V2 pairs are priced as x*y=k; the pair watcher only follows their
   "volatile" pairs (which use x*y=k), never "stable" ones.
+- Extra single pools add up to 300 pools to the loop finder. The loop list
+  is still capped at `LOOP_MAX_CYCLES` (5,000); recently moved and deeper
+  pools are kept first, so the cap can push some quieter loops out.
+- An extra pool's price is exact after every trade (from the block). Between
+  trades it is confirmed by the 20 s re-read; if the node is busy and a
+  re-read fails, those pools briefly drop out of the finder (safe side).
 - Rebuilding the loop list (when pools come or go, at most every 5 s, and once
   a minute) takes tens of milliseconds; normal updates take a few.
