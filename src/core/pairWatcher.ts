@@ -552,6 +552,45 @@ export class PairWatcher {
     this.evictIfNeeded();
   }
 
+  // LOOP TRADER EXTRA POOLS (core/loopExtraPools.ts): look up every pool for
+  // one pair on every exchange, the same way discover() does, but WITHOUT
+  // adding the pair to the watch list. So the pair never reaches the 2-pool
+  // gap scanner or the back-run planner through this path.
+  //
+  // Plain English: "does this coin pair really sit on exactly one pool, and
+  // what is that pool's price right now?"
+  //   - exactly one pool found: it is written to the pool cache (never over a
+  //     newer copy, e.g. one the block reader just wrote) and returned;
+  //   - two or more pools found: nothing is written and nothing is returned
+  //     (a real 2-pool pair belongs to the normal pair watcher, which will
+  //     pick it up when someone trades it);
+  //   - token symbol/decimals are learned as usual (exact decimals are needed
+  //     before a pool can ever be priced).
+  // `callMany` lets the caller use a gentler node lane (the loop trader uses
+  // the chain-wide scan's slow lane). Network errors are thrown.
+  async lookupPair(a: string, b: string, callMany?: CallManyFn): Promise<PoolState[]> {
+    const now0 = Date.now();
+    for (const t of [a, b]) {
+      const failedAt = this.badToken.get(t.toLowerCase());
+      if (failedAt !== undefined && now0 - failedAt < 60 * 60_000) return []; // known non-token
+    }
+    const metaFor = [a, b].filter((t) => !this.tokenMeta.has(t.toLowerCase()));
+    let cm = callMany;
+    if (!cm) { this.discoveryCallMany ??= (await makeCaller(this.discoveryProvider)).callMany; cm = this.discoveryCallMany; }
+    const startedMs = Date.now();
+    const { pools, meta: gotMeta } = await discoverPairPoolsMulticall(cm, this.chain, this.venues, a, b, metaFor, { hookedFeeOf: this.hookedFeeOf });
+    for (const [t, m] of Object.entries(gotMeta)) {
+      if (m === 'not-a-token') { this.badToken.set(t, Date.now()); if (this.badToken.size > 5_000) this.badToken.clear(); continue; }
+      this.tokenMeta.set(t, m);
+      this.onToken(t, m);
+    }
+    if (!this.tokenMeta.get(a.toLowerCase()) || !this.tokenMeta.get(b.toLowerCase())) return [];
+    if (pools.length !== 1) return [];
+    // Never put an older read over a newer cached copy (block reader / feed).
+    this.cache.upsertIfNotNewer(pools[0], startedMs);
+    return pools;
+  }
+
   // Symbol + decimals straight from the token contract (null = unreadable now).
   private async meta(token: string): Promise<TokenMeta | null> {
     const t = token.toLowerCase();

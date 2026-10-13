@@ -15,7 +15,8 @@ const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replac
 const money = (n: number) => `$${n.toFixed(2)}`;
 const secs = (ms: number) => (ms < 1_000 ? `${Math.round(ms)} ms` : `${(ms / 1_000).toFixed(1)} s`);
 
-export function formatLoopHour(h: LoopHour, maxPools: number): string {
+// extra: the loop trader's extra single pools (core/loopExtraPools.ts), when on.
+export function formatLoopHour(h: LoopHour, maxPools: number, extra?: { fresh: number; selected: number } | null): string {
   const L: string[] = [];
   L.push(`<b>Loop trades</b> (3-${maxPools} pool loops, practice only, never sent)`);
   L.push(`Loop trades: found ${h.found}, best ${money(h.bestUsd)}, checked ${h.checked}, would make money ${h.wouldMake} (${money(h.wouldMakeUsd)}), contract can't run ${h.cantRun}`);
@@ -29,6 +30,7 @@ export function formatLoopHour(h: LoopHour, maxPools: number): string {
     const lead = rv.leadMsMedian !== null ? `, usually ${secs(rv.leadMsMedian)} before we read their trade` : '';
     L.push(`Race vs rival loops: they won ${rv.loops}${bot}; ${rv.tooLong} longer than ${maxPools} pools or not fully seen; of the other ${rv.comparable}, we found ${rv.weFound}${lead}`);
   }
+  if (extra) L.push(`  extra single pools watched: ${extra.selected} (${extra.fresh} with a fresh price now)`);
   if (h.updates) L.push(`Finder speed: ${h.updates} updates, typical ${h.medianMs!.toFixed(1)} ms, slowest ${h.slowestMs!.toFixed(1)} ms; ${h.cycles} loops watched${h.capped ? ' (list hit its cap)' : ''}`);
   return L.join('\n');
 }
