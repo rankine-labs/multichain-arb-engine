@@ -1619,7 +1619,15 @@ const t0 = Date.now();
 // Stage timers (measurement only): lap times from "feed received" onwards.
 const trace = event.chain === 'robinhood' ? stageTimers.begin(event.receivedAtMs) : null;
 // Timestamp every Robinhood feed tx: lets the competitor tracker time rivals.
-if (event.chain === 'robinhood') { rivals.noteFeedTx((event.raw as any)?.hash, event.receivedAtMs); rivalWatch.noteTx((event.raw as any)?.to, (event.raw as any)?.hash, (event.raw as any)?.from, (event.raw as any)?.value); }
+if (event.chain === 'robinhood') {
+      rivals.noteFeedTx((event.raw as any)?.hash, event.receivedAtMs);
+      // The rival tracker needs the SENDER, which costs a signature check
+      // (~1-2 ms). Done on the next turn, after this frame's trades have been
+      // decided, so it never delays our own decision (FEED_LAZY_SENDER=0: old order).
+      const raw = event.raw as any;
+      if (process.env.FEED_LAZY_SENDER !== '0') setImmediate(() => { try { rivalWatch.noteTx(raw?.to, raw?.hash, raw?.from, raw?.value); } catch { /* never affects trading */ } });
+      else rivalWatch.noteTx(raw?.to, raw?.hash, raw?.from, raw?.value);
+}
 
 const swap = await decoder.decode(event);
 if (!swap) return;
