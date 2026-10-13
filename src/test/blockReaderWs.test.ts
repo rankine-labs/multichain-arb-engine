@@ -61,7 +61,7 @@ const v4Log = (id: string, block: number, idx: number): RpcLog =>
   ({ address: PM, topics: [V4_SWAP_TOPIC, id, '0x' + '00'.repeat(32)], data: data(1n, 2n, 3n, 4n, 5n, 6n), blockNumber: q(block), logIndex: q(idx) });
 
 // Build a reader wired to a fake socket factory.
-function setup(httpAnswers: { head?: number; logs?: RpcLog[]; fail?: boolean } = {}) {
+function setup(httpAnswers: { head?: number; logs?: RpcLog[]; fail?: boolean } = {}, extra: { addressFilter?: boolean; dailyMessageCap?: number; resubscribeMs?: number; addresses?: () => string[] } = {}) {
   const sockets: FakeSocket[] = [];
   const applied: Array<{ latest: Map<string, PoolUpdate>; toBlock: number }> = [];
   const health: Array<{ healthy: boolean; last: number }> = [];
@@ -78,8 +78,11 @@ function setup(httpAnswers: { head?: number; logs?: RpcLog[]; fail?: boolean } =
     },
     httpLabel: 'test HTTP',
     poolManager: PM,
-    addresses: () => [A],
+    addresses: extra.addresses ?? (() => [A]),
     v4Ids: () => new Set([ID]),
+    addressFilter: extra.addressFilter,
+    dailyMessageCap: extra.dailyMessageCap,
+    resubscribeMs: extra.resubscribeMs,
     onUpdates: (latest, toBlock) => applied.push({ latest, toBlock }),
     onHealthChange: (healthy, last) => health.push({ healthy, last }),
     connect: () => { const s = new FakeSocket(); sockets.push(s); return s; },
@@ -89,7 +92,52 @@ function setup(httpAnswers: { head?: number; logs?: RpcLog[]; fail?: boolean } =
   return { r, sockets, applied, health, httpCalls, usage, logs };
 }
 
+async function filterAndCapTests() {
+  // ---- address filter off: every pool on the chain (old behaviour) ----
+  {
+    const { r, sockets } = setup({}, { addressFilter: false });
+    r.start(); sockets[0]!.open();
+    assert(!sockets[0]!.sent[0].params[1].address, 'BLOCK_READER_WSS_FILTER=0: no address filter');
+    r.stop();
+  }
+  // ---- watch list changes: subscription renewed, but not more often than resubscribeMs ----
+  {
+    let list = [A];
+    const { r, sockets, logs } = setup({ head: 0 }, { resubscribeMs: 60_000, addresses: () => list });
+    r.start(); sockets[0]!.open(); sockets[0]!.reply(1, '0xs1');
+    list = [A, OTHER];
+    advance(1_000); r.tick();
+    assert(sockets.length === 1, 'list changed but renewal waits for resubscribeMs');
+    advance(60_000); sockets[0]!.emit('pong'); r.tick();
+    assert(sockets.length === 2, 'after resubscribeMs: new socket with the new list');
+    sockets[1]!.open();
+    assert(JSON.stringify(sockets[1]!.sent[0].params[1].address) === JSON.stringify([A, OTHER, PM].sort()), 'renewed subscription includes the new pool');
+    assert(r.stats().resubscribes === 1 && logs.some((l) => l.includes('renewing the subscription')), 'renewal counted and logged');
+    sockets[1]!.reply(1, '0xs2');
+    advance(61_000); sockets[1]!.emit('pong'); r.tick();
+    assert(sockets.length === 2, 'same list: no renewal');
+    r.stop();
+  }
+  // ---- daily cap: feed stops, polling takes over, back on the next UTC day ----
+  {
+    clock = Date.UTC(2026, 9, 13, 23, 0, 0);
+    const { r, sockets, logs } = setup({}, { dailyMessageCap: 3 });
+    r.start(); sockets[0]!.open(); sockets[0]!.reply(1, '0xc1');       // message 1 (subscribe reply)
+    sockets[0]!.push('0xc1', syncLog(A, 10, 0, 1n, 1n));                 // message 2
+    assert(r.healthy(), 'under the cap: healthy');
+    sockets[0]!.push('0xc1', syncLog(A, 11, 0, 1n, 1n));                 // message 3: cap
+    assert(!r.healthy() && r.stats().capped && sockets[0]!.closed, 'cap reached: socket closed, poll reader takes over');
+    assert(logs.some((l) => l.includes('daily cap')), 'cap logged');
+    advance(40_000); r.tick();
+    assert(sockets.length === 1, 'no reconnect while capped');
+    clock = Date.UTC(2026, 9, 14, 0, 0, 5); r.tick();
+    assert(sockets.length === 2 && !r.stats().capped, 'next UTC day: push feed back on');
+    r.stop();
+  }
+}
+
 async function main() {
+  await filterAndCapTests();
   // ---- backfill range maths ----
   {
     const r = backfillRange(100, 150, 200);
@@ -118,7 +166,8 @@ async function main() {
     s.open();
     const sub = s.sent[0];
     assert(sub?.method === 'eth_subscribe' && sub.params[0] === 'logs', 'on open: subscribes to logs');
-    assert(!sub.params[1].address && JSON.stringify(sub.params[1].topics) === JSON.stringify([HANDLED_TOPICS]), 'subscription uses the same topic set as the poll reader, no address filter');
+    assert(JSON.stringify(sub.params[1].topics) === JSON.stringify([HANDLED_TOPICS]), 'subscription uses the same topic set as the poll reader');
+    assert(JSON.stringify(sub.params[1].address) === JSON.stringify([A, PM].sort()), 'address filter on by default: only our pools + the V4 PoolManager');
     assert(s.sent.length === 1, 'newHeads NOT subscribed by default (saves billed messages)');
     s.reply(1, '0xsub1');
     assert(r.healthy() && !r.fallbackActive(), 'subscription confirmed: healthy, poll reader pauses');
