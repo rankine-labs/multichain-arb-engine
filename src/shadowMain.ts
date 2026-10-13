@@ -152,6 +152,9 @@ import { nodeUsage as nodeUsageCounter } from './core/nodeUsage';
 import { ROBINHOOD_SEED_PAIRS } from './config/robinhoodSeedPairs';
 import { ResearchLane, researchConfigFromEnv, planShallowCandidate, findResearchGaps, gapCandidate, ResearchCandidate } from './core/researchLane';
 import { poolDepthUsd } from './core/poolPrice';
+// Loop trader v1 (3-5 pool loops, practice only, off unless LOOP_TRADER=1).
+import { LoopTrader, loopConfigFromEnv } from './core/loopTrader';
+import { formatLoopHour } from './core/loopReport';
 
 async function main() {
 const cache = new PoolCache();
@@ -1215,6 +1218,66 @@ if (research.enabled) {
       // see researchHourText() used by the hourly digest.
 }
 
+// ==========================================================================
+// LOOP TRADER v1 (core/loopTrader.ts, docs/LOOP_TRADER.md). Off unless
+// LOOP_TRADER=1; off = nothing below runs. Finds 3-5 pool loops (WETH/USDG
+// in and out) after every price update, the same moments as the gap scan,
+// and PRACTICE-checks the paying ones when the normal check line is idle
+// (LOOP_CHECKS_PER_MIN, default 6). It is never given the sender: loops
+// cannot be sent live in v1, even with EXECUTION_ENABLED.
+// ==========================================================================
+const loopCfg = loopConfigFromEnv();
+let requestLoopScan: () => void = () => {};
+let loopHourText: () => string | undefined = () => undefined;
+if (loopCfg.enabled) {
+      const usdRhLoop = (t: string) => priceOracle.getUsdPrice('robinhood', t);
+      let loopLogTimes: number[] = [];
+      const loopTrader = new LoopTrader(loopCfg, {
+            bases: [ROBINHOOD_TOKENS.WETH, ROBINHOOD_TOKENS.USDG],
+            env: {
+                  decimalsOf: (t) => TOKEN_DECIMALS.robinhood?.[t.toLowerCase()],
+                  usdOf: usdRhLoop,
+                  depthUsd: (p) => poolDepthUsd(p, decimalsOf, usdRhLoop),
+                  // Our gas for a 2-pool trade, scaled by the number of pools.
+                  gasUsd: (hops) => rhGasUsd(0.05) * (hops / 2),
+                  isTradable: (t) => safetyGate.isAllowed(t),
+                  now: Date.now,
+            },
+            symbolOf: (t) => symbolOf('robinhood', t),
+            decimalsOf: (t) => TOKEN_DECIMALS.robinhood?.[t.toLowerCase()],
+            canPracticeTest: (p) => canPracticeTest(p.dex),
+            // Lowest priority: only when no normal check is running or waiting.
+            canCheckNow: () => !(simInFlight.robinhood ?? 0) && !(simWaiting.robinhood?.length) && !simOff('robinhood')
+                  && Date.now() >= (simPausedUntil.robinhood ?? 0) && (!researchNode || researchNode.share() < 0.8),
+            // Own-money practice check (rivals use their own money), same checker as 2-pool trades.
+            runCheck: (trade) => simulateRoundTrip(simRpc.robinhood, 'robinhood', trade, { weth: ROBINHOOD_TOKENS.WETH }),
+            log: (m) => {
+                  const now = Date.now();
+                  loopLogTimes = loopLogTimes.filter((t) => now - t < 60_000);
+                  if (loopLogTimes.length < 60) { loopLogTimes.push(now); console.log(m); }
+            },
+      });
+      let loopQueued: NodeJS.Timeout | null = null;
+      const runLoopScan = () => {
+            try {
+                  // Only pools the bot keeps fresh (watched pairs) with real money near their price.
+                  const pools = robinhoodWatcher.watchedPairPools().flat()
+                        .map((a) => cache.get('robinhood', a))
+                        .filter((p): p is PoolState => !!p && deepEnough(p, decimalsOf, usdRhLoop));
+                  loopTrader.onUpdate(pools);
+            } catch (err) { console.warn('[loop] scan failed (ignored):', (err as Error).message); }
+      };
+      requestLoopScan = () => {
+            if (loopQueued) return;
+            loopQueued = setTimeout(() => { loopQueued = null; runLoopScan(); }, 50);
+      };
+      setInterval(runLoopScan, 5_000);
+      // Race comparison: every rival trade the rival watch saves.
+      rivalWatch.onRecord = (rec) => loopTrader.noteRival(rec);
+      loopHourText = () => formatLoopHour(loopTrader.takeHour(), loopCfg.maxPools);
+      console.log(`[loop] loop trader ON (practice only, never sends): 3-${loopCfg.maxPools} pools, up to ${loopCfg.maxCycles} loops, max $${loopCfg.maxTradeUsd}, bar $${loopCfg.minNetUsd}, ${loopCfg.checksPerMin} checks/min`);
+}
+
 // Research lane hour summary for the hourly report (also one log line).
 // undefined when the lane is off or RESEARCH_TELEGRAM=0.
 function researchHourText(): string | undefined {
@@ -1919,6 +1982,7 @@ await chainManager.startAll();
       // reads prices already in memory, so running it often costs no RPC.
       let gapScanQueued: NodeJS.Timeout | null = null;
       requestGapScan = () => {
+            requestLoopScan(); // loop trader (off unless LOOP_TRADER=1): same triggers
             if (gapScanQueued) return;
             gapScanQueued = setTimeout(() => { gapScanQueued = null; void runGapScan(); }, 50);
       };
@@ -2764,6 +2828,7 @@ for (let i = 0; i < resolved.length; i++) {
                               simOutcomes: simBuckets.plain(),
                               research: researchHourText(),
                               venueTests: venueTally.hourText() ?? undefined,
+                              loops: loopHourText(),
                               race: raceChecker.takeHour(),
                               funnel: {
                                     tradesRead: funnel.tradesRead, noPool: funnel.noPool, tooSmall: funnel.tooSmall, noPartner: funnel.noPartner,
