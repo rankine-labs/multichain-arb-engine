@@ -31,6 +31,8 @@ class FakeChain {
   failNext: string[] = [];           // scripted refusals for the next arrivals ('' = no failure)
   acceptButError = false;            // next accepted tx replies with an error (e.g. timed out after it got in)
   holdMs = 60;
+  mempool = false;                   // true = a node that KEEPS future-nonce txs (accepted, run once the gap fills)
+  private pooled = new Set<number>();
   countGate: Promise<void> | null = null; // when set, nonce reads wait on it (to catch a re-sync in the act)
   private held = new Map<number, () => void>();
   readProvider(): ethers.JsonRpcProvider {
@@ -45,6 +47,7 @@ class FakeChain {
   private accept(n: number) {
     this.nonce++;
     this.accepted.push(n);
+    while (this.pooled.has(this.nonce)) { this.pooled.delete(this.nonce); this.accepted.push(this.nonce); this.nonce++; }
     const next = this.held.get(this.nonce);
     if (next) { this.held.delete(this.nonce); next(); }
   }
@@ -54,6 +57,7 @@ class FakeChain {
     if (scripted) return Promise.resolve(scripted);
     if (n < this.nonce) return Promise.resolve('nonce too low');
     if (n === this.nonce) { this.accept(n); return Promise.resolve(null); }
+    if (this.mempool) { this.pooled.add(n); return Promise.resolve(null); }
     return new Promise((res) => {
       const t = setTimeout(() => { this.held.delete(n); res('nonce too high'); }, this.holdMs);
       this.held.set(n, () => { clearTimeout(t); this.accept(n); res(null); });
@@ -174,6 +178,26 @@ async function main() {
     const r3 = await s.fire(TO, '0x03');
     assert(r3.nonce === 9 && !!r3.txHash, `next nonce is 9: never re-uses 7 or 8 (got ${r3.nonce})`);
     assert(new Set(chain.accepted).size === chain.accepted.length, `no nonce accepted twice (${chain.accepted})`);
+  }
+
+  // 4b. Non-nonce failure of n while n+1 was accepted (a node that keeps
+  //     future-nonce txs): the failed nonce is re-signed, no hole, and the
+  //     already-accepted n+1 is skipped afterwards (never used twice).
+  {
+    const chain = new FakeChain();
+    const logs: string[] = [];
+    chain.mempool = true;
+    chain.failNext = ['flaky upstream'];   // nonce 7 refused (not used)
+    chain.delays = [20, 5];                // nonce 8 accepted (kept, waiting for 7)
+    const s = await liveSender(chain, true, logs);
+    const [ra, rb] = await Promise.all([s.fire(TO, '0x01'), s.fire(TO, '0x02')]);
+    assert(!ra.txHash && ra.nonce === 7 && !!rb.txHash && rb.nonce === 8, 'nonce 7 failed, nonce 8 accepted');
+    assert(logs.length === 1 && /next nonce 7/.test(logs[0]), `re-sync goes back to the failed nonce 7, not past 8 (${logs.join(' | ')})`);
+    const rc = await s.fire(TO, '0x03');
+    const rd = await s.fire(TO, '0x04');
+    assert(rc.nonce === 7 && !!rc.txHash, `hole filled: 7 re-signed and accepted (got ${rc.nonce})`);
+    assert(rd.nonce === 9 && !!rd.txHash, `then 8 (already accepted) is skipped: next is 9 (got ${rd.nonce})`);
+    assert(JSON.stringify(chain.accepted) === '[7,8,9]', `chain ran 7,8,9 with no hole and no repeat (got ${chain.accepted})`);
   }
 
   // 5. "nonce too low" (already used elsewhere) moves past it; a dropped trade resyncs to the chain.

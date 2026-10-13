@@ -83,4 +83,46 @@ async function main() {
   // today's behaviour (RPC resolve on first sight) is unchanged.
   assert(!handlerFinds(cache, B, C, 'uniswap-v3', 5), 'truly unknown pools are left to the normal resolve path');
 }
-main().catch((e) => { console.error('FAIL: crashed', e); process.exitCode = 1; });
+// The re-lookup (real discover(), V2 venue, fake node) never puts its older
+// read over a newer copy the block reader wrote while it was in flight.
+async function discoverRespectsBlockWrites() {
+  const cache = new PoolCache();
+  const F = '0x' + 'f0'.repeat(20), POOL = '0x' + 'e1'.repeat(20);
+  const venue = { dex: 'uniswap-v2', kind: 'v2' as const, factory: F, feeBps: 30 };
+  const watcher = new PairWatcher('robinhood', {} as any, [venue as any], cache, () => {}, {});
+  (watcher as any).tokenMeta.set(A.toLowerCase(), { symbol: 'A', decimals: 18 });
+  (watcher as any).tokenMeta.set(B.toLowerCase(), { symbol: 'B', decimals: 18 });
+  const addrWord = (x: string) => '0x' + x.slice(2).padStart(64, '0');
+  const [lo, hi] = A.toLowerCase() < B.toLowerCase() ? [A, B] : [B, A];
+  // Existing copy of the pool in the cache (reserves 5/5).
+  cache.upsert(pool(POOL, lo, hi, { dex: 'uniswap-v2', poolType: 'v2', reserveA: 5n, reserveB: 5n, feeBps: 30, lastUpdatedMs: Date.now() - 10_000 } as any));
+  let round = 0;
+  (watcher as any).discoveryCallMany = async (calls: { target: string; data: string }[]) => {
+    round++;
+    await sleep(5);
+    // While the lookup is in flight, the block reader writes the newest state (reserves 9/9).
+    if (round === 2) cache.upsertFromBlock({ ...cache.get('robinhood', POOL)!, reserveA: 9n, reserveB: 9n, lastUpdatedBlock: 100 });
+    return calls.map((c) => {
+      if (c.data.startsWith('0xe6a43905')) return addrWord(POOL);                 // getPair
+      if (c.data.startsWith('0x0902f1ac')) return '0x' + w(1n) + w(1n) + w(0n);    // getReserves (older: 1/1)
+      if (c.data.startsWith('0x0dfe1681')) return addrWord(lo);                   // token0
+      if (c.data.startsWith('0xd21220a7')) return addrWord(hi);                   // token1
+      return null;
+    });
+  };
+  await (watcher as any).discover(A, B);
+  const st = cache.get('robinhood', POOL)!;
+  assert(round === 2, 'real discovery ran its 2 bundled rounds');
+  assert(st.reserveA === 9n && st.reserveB === 9n, `re-lookup did NOT overwrite the newer block-reader state (reserves ${st.reserveA}/${st.reserveB})`);
+
+  // A pool not in the cache yet is still written normally.
+  const cache2 = new PoolCache();
+  const w2 = new PairWatcher('robinhood', {} as any, [venue as any], cache2, () => {}, {});
+  (w2 as any).tokenMeta = (watcher as any).tokenMeta;
+  round = 5;
+  (w2 as any).discoveryCallMany = (watcher as any).discoveryCallMany;
+  await (w2 as any).discover(A, B);
+  assert(cache2.get('robinhood', POOL)?.reserveA === 1n, 'new pool from a lookup is written as before');
+}
+
+main().then(discoverRespectsBlockWrites).catch((e) => { console.error('FAIL: crashed', e); process.exitCode = 1; });

@@ -528,6 +528,7 @@ export class PairWatcher {
     }
     const metaFor = [a, b].filter((t) => !this.tokenMeta.has(t.toLowerCase()));
     this.discoveryCallMany ??= (await makeCaller(this.discoveryProvider)).callMany;
+    const readStartedMs = Date.now(); // anything written to the cache after this is newer than this read
     const { pools, meta: gotMeta } = await discoverPairPoolsMulticall(this.discoveryCallMany, this.chain, this.venues, a, b, metaFor, { hookedFeeOf: this.hookedFeeOf });
     for (const [t, m] of Object.entries(gotMeta)) {
       if (m === 'not-a-token') { this.badToken.set(t, Date.now()); if (this.badToken.size > 5_000) this.badToken.clear(); continue; }
@@ -536,7 +537,9 @@ export class PairWatcher {
     }
     const ma = this.tokenMeta.get(a.toLowerCase()), mb = this.tokenMeta.get(b.toLowerCase());
     if (!ma || !mb) return;
-    for (const p of pools) this.cache.upsert(p);
+    // Never put this read over a newer copy (block reader / trade feed wrote
+    // the pool while the lookup was in flight): same rule as the re-sync.
+    for (const p of pools) this.cache.upsertIfNotNewer(p, readStartedMs);
     // One pool = nothing to arb against: remember that, don't track the pair.
     if (pools.length < 2) {
       this.singlePool.set(k, Date.now());

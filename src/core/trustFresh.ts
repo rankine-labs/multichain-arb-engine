@@ -18,7 +18,9 @@
 //     2. WebSocket healthy right now, AND healthy without a break since
 //        (pool's last update - LAG margin). Any drop / reconnect / renewal in
 //        between = not trusted (we may have missed an event in that window).
-//     3. the pool is in the live subscription (new pools join at the next renewal)
+//     3. the pool is in the CURRENT watch list (the readers throw away events
+//        of pools that left it) and in the live subscription (new pools join
+//        at the next renewal), without a gap since its last update
 //     4. real event data arrived on that subscription in the last
 //        SPEED_TRUST_WS_DATA_MS (3 s): proves the subscription is really
 //        delivering, not just answering keep-alive pings
@@ -71,7 +73,7 @@ export function trustFreshConfigFromEnv(env: Record<string, string | undefined> 
 export interface WsFacts {
   healthy(): boolean;
   healthySinceMs(): number | null;
-  coversPool(addr: string): boolean;
+  coveredSinceMs(addr: string): number | null; // in the current list + subscription since (null = not covered)
   lastDataAtMs(kind: 'pools' | 'v4'): number;
 }
 // What it needs from the pool cache (PoolCache has these).
@@ -97,7 +99,9 @@ export function wsTrustProblem(p: PoolState, ws: WsFacts | null, cache: CacheFac
   if (!(stateMs > 0)) return 'pool never refreshed';
   if (since > stateMs - cfg.lagMarginMs) return 'WebSocket had a break since this pool was last updated';
   if (now - stateMs > cfg.maxAgeMs) return 'older than the WebSocket trust limit';
-  if (!ws.coversPool(p.poolAddress)) return 'pool not in the live subscription';
+  const covered = ws.coveredSinceMs(p.poolAddress);
+  if (covered === null) return 'pool not in the current watch list / live subscription';
+  if (covered > stateMs - cfg.lagMarginMs) return 'pool joined the watch list after its last update';
   const kind = p.poolAddress.length === 66 ? 'v4' : 'pools';
   if (now - ws.lastDataAtMs(kind) > cfg.dataMs) return 'no recent WebSocket data';
   const fedAt = cache.feedAppliedAt(p.chain, p.poolAddress);

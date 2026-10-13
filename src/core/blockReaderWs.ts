@@ -255,17 +255,42 @@ export class WsBlockReader {
   // count): 'pools' = our pool contracts, 'v4' = V4 swaps for our pool ids.
   private dataAt = { pools: 0, v4: 0 };
   lastDataAtMs(kind: 'pools' | 'v4'): number { return this.dataAt[kind]; }
-  // Is this pool part of the LIVE subscription? (A pool added to the watch
-  // list is only included after the next renewal.) Address filter off =
-  // every pool on the chain is covered.
+  // Is this pool covered RIGHT NOW, and since when? A pool counts only if
+  //   - it is in the CURRENT watch list (addresses() / v4Ids()): events of
+  //     a pool that left the list (e.g. its pair was dropped over
+  //     ROBINHOOD_MAX_PAIRS) are thrown away by apply(), even while it is
+  //     still in the subscription and in the cache;
+  //   - and, with the address filter on, in the live subscription too (a
+  //     newly watched pool joins at the next renewal).
+  // Returns the time it has been in the current list without a gap (so a
+  // pool that left and came back is only covered from its return), or null.
+  // Address filter off: same current-list check (no subscription check).
   private subPools = new Set<string>();
   private subIds = new Set<string>();
-  coversPool(addr: string): boolean {
-    if (!this.healthy()) return false;
-    if (this.o.addressFilter === false) return true;
-    const a = addr.toLowerCase();
-    return a.length === 66 ? this.subIds.has(a) : this.subPools.has(a);
+  private curSince = new Map<string, number>(); // current-list pool -> in the list since
+  private curAt = -Infinity;                    // when curSince was last rebuilt
+  // Rebuild the "current list" view. Called by apply() (which reads the list
+  // anyway) and by coveredSinceMs() at most once a second.
+  private noteCurrent(addrs: Iterable<string>, ids: Iterable<string>): void {
+    const t = this.now();
+    const next = new Map<string, number>();
+    for (const x of addrs) if (x) { const k = x.toLowerCase(); next.set(k, this.curSince.get(k) ?? t); }
+    for (const x of ids) if (x) { const k = x.toLowerCase(); next.set(k, this.curSince.get(k) ?? t); }
+    this.curSince = next;
+    this.curAt = t;
   }
+  coveredSinceMs(addr: string): number | null {
+    if (!this.healthy()) return null;
+    if (this.now() - this.curAt > 1_000) {
+      try { this.noteCurrent(this.o.addresses() ?? [], this.o.v4Ids() ?? new Set<string>()); } catch { return null; }
+    }
+    const a = addr.toLowerCase();
+    const since = this.curSince.get(a);
+    if (since === undefined) return null;
+    if (this.o.addressFilter !== false && !(a.length === 66 ? this.subIds.has(a) : this.subPools.has(a))) return null;
+    return since;
+  }
+  coversPool(addr: string): boolean { return this.coveredSinceMs(addr) !== null; }
 
   // Health check, every second: stale connection -> reconnect; quiet
   // connection -> keep-alive ping; health changes -> tell the bot.
@@ -543,6 +568,7 @@ export class WsBlockReader {
     for (const a of this.o.addresses() ?? []) if (a) addrSet.add(a.toLowerCase());
     if (pm) addrSet.add(pm);
     const ids = this.o.v4Ids() ?? new Set<string>();
+    this.noteCurrent(addrSet, ids); // keep coveredSinceMs() in step with what is really applied
     let maxSeen = this.lastBlock;
     const kept: RpcLog[] = [];
     for (const l of logs) {

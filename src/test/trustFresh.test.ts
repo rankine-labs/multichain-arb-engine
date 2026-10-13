@@ -24,10 +24,10 @@ const v2 = (extra: Partial<PoolState> = {}): PoolState => ({
 } as PoolState);
 
 // Fake WebSocket facts: healthy since 5 min ago, data 0.5 s ago, pool subscribed.
-const ws = (o: Partial<{ healthy: boolean; since: number | null; covers: boolean; dataAt: number }> = {}): WsFacts => ({
+const ws = (o: Partial<{ healthy: boolean; since: number | null; covers: number | null; dataAt: number }> = {}): WsFacts => ({
   healthy: () => o.healthy ?? true,
   healthySinceMs: () => (o.since === undefined ? NOW - 300_000 : o.since),
-  coversPool: () => o.covers ?? true,
+  coveredSinceMs: () => (o.covers === undefined ? NOW - 300_000 : o.covers),
   lastDataAtMs: () => o.dataAt ?? NOW - 500,
 });
 const noWrites = { blockAppliedAt: () => 0, feedAppliedAt: () => 0 };
@@ -47,7 +47,8 @@ const reasons: [string, string | null][] = [
   ['WebSocket down now', wsTrustProblem(v2(), ws({ healthy: false }), noWrites, cfg, NOW)],
   ['WebSocket had a break after the pool update', wsTrustProblem(v2(), ws({ since: NOW - 30_000 }), noWrites, cfg, NOW)],
   ['break just inside the lag margin', wsTrustProblem(v2(), ws({ since: NOW - 60_000 - 1_000 }), noWrites, cfg, NOW)],
-  ['pool not in the live subscription', wsTrustProblem(v2(), ws({ covers: false }), noWrites, cfg, NOW)],
+  ['pool not in the current watch list / subscription', wsTrustProblem(v2(), ws({ covers: null }), noWrites, cfg, NOW)],
+  ['pool (re)joined the watch list after its last update', wsTrustProblem(v2(), ws({ covers: NOW - 30_000 }), noWrites, cfg, NOW)],
   ['no WebSocket data for 4 s', wsTrustProblem(v2(), ws({ dataAt: NOW - 4_000 }), noWrites, cfg, NOW)],
   ['older than 120 s', wsTrustProblem(v2({ lastUpdatedMs: NOW - 130_000 }), ws({ since: NOW - 600_000 }), noWrites, cfg, NOW)],
   ['never refreshed (restored from disk)', wsTrustProblem(v2({ lastUpdatedMs: 0 }), ws(), noWrites, cfg, NOW)],
@@ -117,4 +118,52 @@ class FakeSocket extends EventEmitter implements SocketLike {
   sockets[1].emit('pong');
   assert(reader.healthy() && wsTrustProblem(cache.get('robinhood', ADDR)!, reader, cache, cfg, clock) !== null, 'pings alone (no event data for 4 s) -> not trusted');
   reader.stop();
+}
+
+// 5. A pair dropped from the watch list AFTER the subscription: still in the
+//    subscription and in the cache, but its events are now thrown away, so it
+//    must not be trusted. Coming back only counts from its return.
+{
+  let clock = 2_000_000;
+  let list = [ADDR];
+  const sockets: FakeSocket[] = [];
+  const cache = new PoolCache();
+  const mk = (addressFilter: boolean) => new WsBlockReader({
+    url: 'wss://example.invalid/x', httpRpc: async () => '0x0', poolManager: '0x00000000000000000000000000000000000000dd',
+    addresses: () => list, v4Ids: () => new Set<string>(), onUpdates: () => {}, addressFilter,
+    connect: () => { const s = new FakeSocket(); sockets.push(s); return s; },
+    schedule: () => () => {}, now: () => clock, autoTick: false, usage: new NodeUsageCounter(() => clock), log: () => {},
+  });
+  const reader = mk(true);
+  reader.start();
+  sockets[0].emit('open'); sockets[0].reply(1, '0xsubA');
+  const push = () => sockets[sockets.length - 1].push(sockets.length === 1 ? '0xsubA' : '0xsubB', { address: ADDR, topics: [SYNC_TOPIC], data: '0x' + '0'.repeat(127) + '1' + '0'.repeat(63) + '2', blockNumber: '0x10', logIndex: '0x0' });
+  assert(reader.coveredSinceMs(ADDR) === clock, 'subscribed + on the current list -> covered from now');
+  clock += 5_000;
+  cache.upsert(v2({ lastUpdatedMs: clock }));
+  clock += 50_000; push();
+  assert(wsTrustProblem(cache.get('robinhood', ADDR)!, reader, cache, cfg, clock) === null, 'on the list the whole time -> trusted');
+  list = [];                                  // pair dropped (over ROBINHOOD_MAX_PAIRS); subscription not renewed yet
+  clock += 2_000; push();
+  assert(reader.coveredSinceMs(ADDR) === null, 'dropped from the current list -> not covered, even though still subscribed');
+  assert(wsTrustProblem(cache.get('robinhood', ADDR)!, reader, cache, cfg, clock) !== null, 'dropped pair -> NOT trusted (falls back to the RPC re-read)');
+  list = [ADDR];                              // back on the list
+  clock += 2_000; push();
+  const back = reader.coveredSinceMs(ADDR);
+  assert(back === clock, 'back on the list -> covered only from its return');
+  assert(wsTrustProblem(cache.get('robinhood', ADDR)!, reader, cache, cfg, clock) !== null, 'state from before the gap -> still NOT trusted');
+  reader.stop();
+
+  // Address filter OFF (BLOCK_READER_WSS_FILTER=0): same current-list check.
+  sockets.length = 0;
+  list = [];
+  const open = mk(false);
+  open.start();
+  sockets[0].emit('open'); sockets[0].reply(1, '0xsubA');
+  assert(open.coveredSinceMs(ADDR) === null, 'filter off: a pool not on the current list is NOT covered');
+  list = [ADDR];
+  clock += 2_000;
+  assert(open.coveredSinceMs(ADDR) === clock, 'filter off: pool on the current list is covered (from when it joined)');
+  assert(!open.coversPool('0x00000000000000000000000000000000000000ff'), 'filter off: other pools on the chain are not covered');
+  open.stop();
 }

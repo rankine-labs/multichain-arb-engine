@@ -393,20 +393,24 @@ export class FastSender {
   //       sends without making the next fire wait for the reply;
   //     - if ANY send fails, new signing PAUSES. The bot waits for every
   //       send still on its way, then re-reads the wallet's nonce from the
-  //       chain and picks the next nonce as the highest of:
-  //         * what the chain says (pending count),
-  //         * one past the highest nonce the sequencer ACCEPTED,
-  //         * one past any nonce the sequencer said was already used
-  //           ("nonce too low" / "already known").
-  //       So an accepted nonce is never used twice, and a failed nonce is
-  //       re-used next (as before) unless a later one was accepted. Every
-  //       re-sync is logged, so nothing changes silently.
+  //       chain and picks the next nonce:
+  //         * the LOWEST nonce that failed (re-signed at it, so no hole is
+  //           left behind), unless the chain or a "nonce too low" reply says
+  //           it is already used;
+  //         * otherwise the highest of: what the chain says (pending count),
+  //           one past the highest nonce the sequencer ACCEPTED, one past any
+  //           nonce reported as already used.
+  //       Nonces the sequencer already ACCEPTED are skipped when handing out
+  //       the following ones, so an accepted nonce is never used twice.
+  //       Every re-sync is logged, so nothing changes silently.
   //   Practice mode never sends, so it behaves exactly as before (same
   //   nonce, signature only).
   //   Safety gates (kill switch, loss cap, rate limit, allowlist) run in
   //   shadowMain BEFORE fire() and are untouched.
   private maxAccepted = -1;                    // highest nonce the sequencer accepted
   private usedFloor = 0;                       // one past a nonce reported as already used
+  private failedNonces = new Set<number>();     // nonces that failed (not "already used") since the last re-sync
+  private acceptedNonces = new Set<number>();   // accepted nonces at or above the counter (skipped when handing out)
   private sending = new Set<Promise<void>>();  // sends on their way (bookkeeping included)
   private pause: Promise<void> | null = null;  // set while re-syncing: new fires wait
 
@@ -418,8 +422,13 @@ export class FastSender {
     const queueMs = t0 - calledAt;
     // Take the nonce NOW, synchronously, before any await: two fires can
     // never get the same one, and they get them in call order.
-    const n = this.nonce!;
-    if (this.live) this.nonce = n + 1;
+    let n = this.nonce!;
+    if (this.live) {
+      // Skip nonces already accepted (possible right after re-signing a hole).
+      while (this.acceptedNonces.has(n)) { this.acceptedNonces.delete(n); n++; }
+      for (const a of this.acceptedNonces) if (a < n) this.acceptedNonces.delete(a);
+      this.nonce = n + 1;
+    }
     // Live: register this nonce as "on its way" from the moment it is taken
     // (not just once it is sent), so a re-sync always waits for it.
     let finish: () => void = () => {};
@@ -436,6 +445,7 @@ export class FastSender {
       raw = await this.wallet.signTransaction(tx);
     } catch (err) {
       // Signing failed: nonce n was never sent. Re-sync so it isn't skipped.
+      if (this.live) this.failedNonces.add(n);
       release();
       if (this.live) await this.pauseAndResync(`signing failed for nonce ${n}`, n);
       return { live: this.live, signMs: performance.now() - t0, queueMs, error: `sign failed: ${String((err as Error).message).slice(0, 150)}` };
@@ -451,11 +461,13 @@ export class FastSender {
       hash = await this.sendProvider.send('eth_sendRawTransaction', [raw]) as string;
       // Outcome recorded BEFORE this nonce stops counting as "on its way".
       if (n > this.maxAccepted) this.maxAccepted = n;
+      this.acceptedNonces.add(n);
       this.inflight?.add(hash);   // marked right AFTER the send so the send itself isn't slowed
     } catch (err) {
       msg = String((err as Error)?.message ?? err);
       // "nonce too low" / "already known": n is used up, never use it again.
       if (/nonce too low|already known/i.test(msg)) this.usedFloor = Math.max(this.usedFloor, n + 1);
+      else this.failedNonces.add(n);
     } finally {
       release();
     }
@@ -483,9 +495,16 @@ export class FastSender {
         next = remote ?? before;
         this.maxAccepted = Math.min(this.maxAccepted, next - 1);
         this.usedFloor = Math.min(this.usedFloor, next);
+        this.acceptedNonces.clear();
       } else {
-        next = Math.max(remote ?? -1, this.maxAccepted + 1, this.usedFloor);
+        // Lowest failed nonce that nothing says is used: re-sign at it (no hole).
+        const lowestFailed = this.failedNonces.size ? Math.min(...this.failedNonces) : null;
+        const usedBelow = Math.max(remote ?? -1, this.usedFloor);
+        if (lowestFailed !== null && lowestFailed >= usedBelow && !this.acceptedNonces.has(lowestFailed)) next = lowestFailed;
+        else next = Math.max(remote ?? -1, this.maxAccepted + 1, this.usedFloor);
       }
+      this.failedNonces.clear();
+      for (const a of this.acceptedNonces) if (a < next) this.acceptedNonces.delete(a);
       this.nonce = next;
       this.log(`[fire] nonce re-sync (${why}): next nonce ${next} (was ${before}; chain says ${remote ?? 'unreadable'}, highest accepted ${this.maxAccepted})`);
     })().finally(() => { this.pause = null; });
