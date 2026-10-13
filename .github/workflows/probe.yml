@@ -92,10 +92,16 @@ jobs:
         if: inputs.only == 'nvda'
         shell: bash
         run: |
-          out=$(timeout 900 node .scripts-build/scripts/probe-nvda.js 2>&1 | tail -120)
-          echo "$out"
-          out="${out//'%'/'%25'}"; out="${out//$'\n'/'%0A'}"
-          echo "::notice title=NVDA probe::${out}"
+          timeout 900 node .scripts-build/scripts/probe-nvda.js > nvda.txt 2>&1 || true
+          cat nvda.txt
+          # One annotation holds only ~4 KB: post the output in parts of 20 lines.
+          split -l 20 nvda.txt nvda-part-
+          n=0
+          for f in nvda-part-*; do
+            n=$((n+1)); out=$(cut -c1-300 "$f")
+            out="${out//'%'/'%25'}"; out="${out//$'\n'/'%0A'}"
+            echo "::notice title=NVDA probe part ${n}::${out}"
+          done
       - name: Probe free simulation on real chains
         if: inputs.only == '' || inputs.only == 'sim'
         shell: bash
