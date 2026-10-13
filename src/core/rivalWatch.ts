@@ -574,6 +574,17 @@ export class RivalWatch {
 
   // Summaries for the reports.
   summary(fromMs: number, toMs = this.now()): RivalSummary { return summarize(this.recs.filter((r) => r.t >= fromMs && r.t < toMs), this.verifiedBots()); }
+  // Pools (lower-case addresses / V4 pool ids) used by rival LOOP trades
+  // (3+ pools, went through) since fromMs. The loop trader's extra pools
+  // (core/loopExtraPools.ts) keep these first. Reads memory only.
+  loopRoutePools(fromMs: number): Set<string> {
+    const out = new Set<string>();
+    for (const r of this.recs) {
+      if (r.t < fromMs || r.failed || r.pools < 3 || !r.route) continue;
+      for (const p of r.route) out.add(p.toLowerCase());
+    }
+    return out;
+  }
   // When the earliest saved record at/after fromMs is (for "last N hours" labels).
   firstRecordMs(fromMs: number): number { const r = this.recs.find((x) => x.t >= fromMs); return r ? r.t : this.now(); }
   // Hourly: the hour's trades plus the chain-wide sample for the same hour.

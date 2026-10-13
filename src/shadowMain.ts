@@ -156,6 +156,8 @@ import { poolDepthUsd } from './core/poolPrice';
 import { LoopTrader, loopConfigFromEnv } from './core/loopTrader';
 import { formatLoopHour } from './core/loopReport';
 import { startMemReport, registerSize } from './core/memReport';
+// Loop trader extra pools: keeps single-pool pairs fresh for the loop finder only (off unless LOOP_TRADER=1).
+import { LoopExtraPools, loopExtraConfigFromEnv, readerAddresses, afterReaderWrite } from './core/loopExtraPools';
 
 async function main() {
 const cache = new PoolCache();
@@ -1236,6 +1238,12 @@ if (research.enabled) {
 const loopCfg = loopConfigFromEnv();
 let requestLoopScan: () => void = () => {};
 let loopHourText: () => string | undefined = () => undefined;
+// EXTRA SINGLE POOLS for the loop finder (core/loopExtraPools.ts). Created
+// further down, next to the chain-wide scan, only when LOOP_TRADER=1 (and
+// LOOP_EXTRA_POOLS is not 0). null = off: the block reader, gap scanner and
+// everything else behave exactly as before.
+const loopExtraCfg = loopExtraConfigFromEnv(process.env, loopCfg, POOL_MIN_DEPTH_USD);
+let loopExtra: LoopExtraPools | null = null;
 if (loopCfg.enabled) {
       const usdRhLoop = (t: string) => priceOracle.getUsdPrice('robinhood', t);
       let loopLogTimes: number[] = [];
@@ -1271,6 +1279,14 @@ if (loopCfg.enabled) {
                   const pools = robinhoodWatcher.watchedPairPools().flat()
                         .map((a) => cache.get('robinhood', a))
                         .filter((p): p is PoolState => !!p && deepEnough(p, decimalsOf, usdRhLoop));
+                  // Plus the extra single pools (when on) whose price is fresh.
+                  // They go to the loop finder only, never to the gap scanner.
+                  if (loopExtra) {
+                        const have = new Set(pools.map((p) => p.poolAddress.toLowerCase()));
+                        for (const p of loopExtra.freshPools(loopCfg.maxPoolAgeMs)) {
+                              if (!have.has(p.poolAddress.toLowerCase()) && deepEnough(p, decimalsOf, usdRhLoop)) pools.push(p);
+                        }
+                  }
                   loopTrader.onUpdate(pools);
             } catch (err) { console.warn('[loop] scan failed (ignored):', (err as Error).message); }
       };
@@ -1282,7 +1298,7 @@ if (loopCfg.enabled) {
       // Race comparison: every rival trade the rival watch saves.
       rivalWatch.onRecord = (rec) => loopTrader.noteRival(rec);
       registerSize('loop cycles', () => loopTrader.finder.cycleCount());
-      loopHourText = () => formatLoopHour(loopTrader.takeHour(), loopCfg.maxPools);
+      loopHourText = () => formatLoopHour(loopTrader.takeHour(), loopCfg.maxPools, loopExtra?.status(loopCfg.maxPoolAgeMs) ?? null);
       console.log(`[loop] loop trader ON (practice only, never sends): 3-${loopCfg.maxPools} pools, up to ${loopCfg.maxCycles} loops, max $${loopCfg.maxTradeUsd}, bar $${loopCfg.minNetUsd}, ${loopCfg.checksPerMin} checks/min`);
 }
 
@@ -2146,7 +2162,12 @@ await chainManager.startAll();
                         return r.error ? new Error(`${r.error.code ?? ''} ${r.error.message ?? 'rpc error'}`) : r.result;
                   });
             };
-            const watched = () => robinhoodWatcher.watchedPairPools().flat().map((a) => a.toLowerCase());
+            const watchedOnly = () => robinhoodWatcher.watchedPairPools().flat().map((a) => a.toLowerCase());
+            // Pools whose events the readers apply: watched pools, plus the loop
+            // trader's extra single pools when that is on (exactly watchedOnly() when off).
+            // Costs no extra node requests: the readers already fetch every
+            // block's events by type and keep ours here.
+            const watched = () => readerAddresses(watchedOnly(), loopExtra);
             // Leave a pool alone if the feed just applied a predicted trade to it.
             const FEED_FRESH_MS = Number(process.env.BLOCK_READER_FEED_GRACE_MS ?? 400);
             let readerApplied = 0;
@@ -2165,6 +2186,18 @@ await chainManager.startAll();
                   }
                   return true;
             };
+            // Both readers hand their batch here. Writes the new prices, then:
+            // a watched pool moved -> gap scan (which also runs the loop scan),
+            // only extra loop pools moved -> loop scan alone (the gap scan has
+            // nothing new to look at). With extra pools off: gap scan, as before.
+            const onReaderUpdates = (latest: Map<string, PoolUpdate>) => {
+                  const applied: string[] = [];
+                  for (const u of latest.values()) if (applyUpdate(u)) applied.push(u.pool);
+                  readerApplied += applied.length;
+                  const next = afterReaderWrite(applied, loopExtra, () => new Set(watchedOnly()));
+                  if (next === 'gap') requestGapScan();
+                  else if (next === 'loop') requestLoopScan();
+            };
             // PUSH READER (core/blockReaderWs.ts). Only when BLOCK_READER_WSS is set:
             // the node pushes each block's events over a WebSocket into the same
             // applyUpdate path. The poll reader below stays quiet while the push
@@ -2179,11 +2212,7 @@ await chainManager.startAll();
                         poolManager: ROBINHOOD_V4.POOL_MANAGER,
                         addresses: () => watched().filter((a) => a.length === 42),
                         v4Ids: () => new Set(watched().filter((a) => a.length === 66)),
-                        onUpdates: (latest) => {
-                              let n = 0;
-                              for (const u of latest.values()) if (applyUpdate(u)) n++;
-                              if (n) { readerApplied += n; requestGapScan(); }
-                        },
+                        onUpdates: (latest) => onReaderUpdates(latest),
                         // Push feed down: polling resumes from the last block it delivered.
                         onHealthChange: (healthy, last) => { if (!healthy && last > 0) blockReader.setBookmark(last - 1); },
                   });
@@ -2201,18 +2230,14 @@ await chainManager.startAll();
                   v4Ids: () => new Set(watched().filter((a) => a.length === 66)),
                   // ~4 polls a second (each is one request carrying 2 calls).
                   pollMs: Number(process.env.BLOCK_READER_POLL_MS ?? 250),
-                  onUpdates: (latest) => {
-                        let n = 0;
-                        for (const u of latest.values()) if (applyUpdate(u)) n++;
-                        if (n) { readerApplied += n; requestGapScan(); }
-                  },
+                  onUpdates: (latest) => onReaderUpdates(latest),
             });
             blockReader.start();
             wsReader?.start();
             const logReader = () => {
                   const st = blockReader.stats();
                   const errs = blockReader.errorSummary(3);
-                  console.log(`[blockreader] polls ${st.polls} (ok ${st.ok}, errors ${st.errors}, rate-limited ${st.rateLimited}, paused ${st.pausedPolls}, restarts ${st.restarts}) · prices updated ${readerApplied} · median ${st.medianMs} ms · skipped ranges ${st.skippedRanges}${errs ? ' · errors: ' + errs : ''}${wsReader ? ' · ' + wsReader.statusText() : ''}`);
+                  console.log(`[blockreader] polls ${st.polls} (ok ${st.ok}, errors ${st.errors}, rate-limited ${st.rateLimited}, paused ${st.pausedPolls}, restarts ${st.restarts}) · prices updated ${readerApplied} · median ${st.medianMs} ms · skipped ranges ${st.skippedRanges}${errs ? ' · errors: ' + errs : ''}${wsReader ? ' · ' + wsReader.statusText() : ''}${loopExtra ? ' · ' + loopExtra.statusText(loopCfg.maxPoolAgeMs) : ''}`);
             };
             setTimeout(logReader, 60_000);
             setInterval(logReader, 5 * 60_000);
@@ -2286,6 +2311,9 @@ await chainManager.startAll();
       };
       let scanState: ScanState | null = null;
       let scanRunning = false;
+      // Called after each good chain-wide scan (the loop trader's extra pools
+      // rebuild their pick then; a no-op unless that is on).
+      let onScanDone: () => void = () => {};
       const runRobinhoodScan = async () => {
             if (scanRunning || SCAN_TOP <= 0) return;
             scanRunning = true;
@@ -2320,6 +2348,7 @@ await chainManager.startAll();
                   }
                   const st = robinhoodWatcher.stats();
                   console.log(`[scan] robinhood now watching ${st.pairs} pairs (${st.pinned} pinned), ${st.pools} pools`);
+                  try { onScanDone(); } catch { /* a listener problem must not fail the scan */ }
             } catch (err) {
                   // Usually the free public RPC rate-limiting us. Don't wait the
                   // full 6 hours: try again in 15 minutes.
@@ -2399,6 +2428,49 @@ await chainManager.startAll();
             rhScanCallMany ??= (await makeCaller(robinhoodScanProvider)).callMany;
             return rhScanCallMany(calls);
       };
+
+      // LOOP TRADER EXTRA SINGLE POOLS (core/loopExtraPools.ts, docs/LOOP_TRADER.md).
+      // Only when LOOP_TRADER=1 (LOOP_EXTRA_POOLS=0 forces it off). Picks up to
+      // LOOP_EXTRA_POOLS_MAX (300) single-pool pairs with $10k+ that can sit on
+      // a 3-5 pool loop through WETH/USDG, and keeps their prices fresh for the
+      // LOOP FINDER ONLY: the block reader applies their events (no extra
+      // requests) and one bundled re-read every 20 s on this gentle scan lane.
+      // They never join the pair watcher's list, so the 2-pool gap scanner
+      // and back-run planner never see them.
+      if (loopExtraCfg.enabled) {
+            const usdRhExtra = (t: string) => priceOracle.getUsdPrice('robinhood', t);
+            let extraScanRefs: { n: number; refs: { pool: string; token0: string; token1: string }[] } | null = null;
+            loopExtra = new LoopExtraPools(loopExtraCfg, {
+                  bases: [ROBINHOOD_TOKENS.WETH, ROBINHOOD_TOKENS.USDG],
+                  getPool: (k) => cache.get('robinhood', k),
+                  cachePools: () => cache.allForChain('robinhood'),
+                  watchedPools: () => robinhoodWatcher.watchedPairPools(),
+                  // The scan's saved pool list (tokens + pool address only, no prices).
+                  // Rebuilt only when the scan found new pools (the list is 100k+
+                  // pools: no point re-making it every 10 minutes).
+                  scanPools: () => {
+                        const st = scanState ?? loadScanState();
+                        if (!extraScanRefs || extraScanRefs.n !== st.pools.length) {
+                              extraScanRefs = { n: st.pools.length, refs: stateToPools(st).map((p) => ({ pool: p.pool, token0: p.token0, token1: p.token1 })) };
+                        }
+                        return extraScanRefs.refs;
+                  },
+                  depthUsd: (p) => poolDepthUsd(p, decimalsOf, usdRhExtra),
+                  usdOf: usdRhExtra,
+                  decimalsOf: (t) => TOKEN_DECIMALS.robinhood?.[t.toLowerCase()],
+                  // Pools used by rival loop wins in the last 24 h (memory only).
+                  rivalPools: () => rivalWatch.loopRoutePools(Date.now() - 24 * 3600_000),
+                  callMany: scanCallMany,
+                  lookupPair: (a, b, cm) => robinhoodWatcher.lookupPair(a, b, cm),
+                  readStates: (pools, cm) => refreshPoolsBatch(cm, pools),
+                  writeState: (fresh, startedMs) => cache.upsertIfNotNewer(fresh, startedMs),
+                  now: Date.now,
+                  log: (m) => console.log(m),
+            });
+            loopExtra.start();
+            onScanDone = () => loopExtra?.noteScanUpdated();
+            console.log(`[loop] extra single pools ON (loop finder only): up to ${loopExtraCfg.maxSelected}, re-read every ${Math.round(loopExtraCfg.refreshMs / 1000)} s, first pick in 3 min`);
+      }
 
       // REAL V3 BALANCES (core/v3BalanceBook.ts, Phase 1 fix): every 10 min,
       // one bundled read of the coins each cached V3 pool really holds, so the
@@ -2902,6 +2974,8 @@ for (let i = 0; i < resolved.length; i++) {
             try {
                   const keep = new Set<string>(robinhoodWatcher.watchedPairPools().flat().map((a) => a.toLowerCase()));
                   for (const c of ['robinhood', 'monad', 'avalanche']) for (const l of approvedLenders(c)) keep.add(l);
+                  // The loop trader's extra single pools (when on) stay in the cache too.
+                  if (loopExtra) for (const k of loopExtra.keys()) keep.add(k);
                   const removed = cache.prune((p) => keep.has(p.poolAddress.toLowerCase()), 2 * 3600_000);
                   console.log(`[mem] pruned ${removed} idle pools (cache ${cache.size()}, opportunity log ${shadowLogger.size}, heap ${Math.round(process.memoryUsage().heapUsed / 1e6)} MB)`);
             } catch (err) { console.warn('[mem] prune failed:', (err as Error).message); }
