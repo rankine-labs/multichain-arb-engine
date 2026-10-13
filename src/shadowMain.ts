@@ -130,7 +130,7 @@ import { RaceChecker } from './core/raceCheck';
 import { FablesFeeBook, readFablesFees } from './core/fablesFee';
 import { setHookedFeeSource } from './core/pairWatcher';
 import { SimBucketTally, classifySimOutcome } from './core/failReasons';
-import { makeRpc, simulateRoundTrip, simRpcUrl, Rpc, makeFallbackRpc, loadBalanceSlots, wssToHttps, replayRpc, ReplayCall } from './execution/simulator';
+import { makeRpc, simulateRoundTrip, simulateWithRecheck, simRpcUrl, Rpc, makeFallbackRpc, loadBalanceSlots, wssToHttps, replayRpc, ReplayCall } from './execution/simulator';
 import { FastSender, SafetyGate, safetyConfigFromEnv } from './execution/fastSender';
 import { DEFAULT_FILTER_CONFIG } from './core/fastFilter';
 import { checkLiveReady } from './execution/liveReadiness';
@@ -536,7 +536,12 @@ const checkRoundTrip = async (
             v3Lender: lender?.poolAddress,
       });
       if ('reason' in built) return { status: 'skipped', reason: built.reason };
-      const r = await simulateRoundTrip(simRpc[chain], chain, { token: tokenIn, amountIn: built.amountIn, hops: built.hops }, { v3Lender: lender?.poolAddress, weth: chain === 'robinhood' ? ROBINHOOD_TOKENS.WETH : undefined });
+      // Robinhood: a "breaks, no reason" answer is asked again on the free node
+      // (as the after-trigger checks already do), and every result is counted
+      // in the "Check results by kind" line, which before saw trigger checks only.
+      const r = await simulateWithRecheck(simRpc[chain], chain === 'robinhood' ? rhFreeSimRpc : null, chain, { token: tokenIn, amountIn: built.amountIn, hops: built.hops }, { v3Lender: lender?.poolAddress, weth: chain === 'robinhood' ? ROBINHOOD_TOKENS.WETH : undefined },
+            (changed) => { recheckStats.done++; if (changed) recheckStats.changed++; });
+      if (chain === 'robinhood') simBuckets.add(r.bucket ?? classifySimOutcome(r.status, 'reason' in r ? r.reason : ''));
       if (r.status === 'rate_limited') { simPausedUntil[chain] = Date.now() + SIM_RATE_LIMIT_PAUSE_MS; return { status: 'rate_limited' }; }
       if (r.status === 'unsupported') { if (chain === 'robinhood') noteNoSlot(tokenIn, r.reason); return { status: 'skipped', reason: r.reason }; }
       if (r.status === 'profit') {
@@ -1982,7 +1987,9 @@ await chainManager.startAll();
                               // A revert is "wouldn't go through" (with its reason);
                               // a loss or too-small profit is "would lose money".
                               if (check.status === 'fail') { gapStats.fail++; failTally.add(check.reason); }
-                              else gapStats.fake++;
+                              // A skipped check (coin can't be tested, checking off...) was
+                              // never run: not "would lose money" (it was counted as that).
+                              else if (check.status !== 'skipped') gapStats.fake++;
                               const why = check.status === 'profit' ? `real profit only $${check.usd.toFixed(2)}` : check.reason;
                               console.log(`[gap] ${label}: model said ~$${g.profitUsd.toFixed(2)} but NOT REAL (${why}); muted 30 min | ${route}`);
                               continue;

@@ -20,7 +20,9 @@ assert(classifyFailReason('TransferFailed()') === 'transfer', 'our TransferFaile
 assert(classifyFailReason('L') === 'transfer', 'L = lender had no active liquidity');
 assert(classifyFailReason('ERC20: sender is blacklisted') === 'blocked', 'explicit blacklist = coin blocks trading');
 assert(classifyFailReason('BadRoute()') === 'ours', 'BadRoute = our bug');
-assert(classifyFailReason('SPL') === 'ours', 'bad price limit = our bug');
+// Oct 12: we always pass the standard "no limit" value; SPL only happens when
+// the pool's price already sits at the end of its range (old pool info).
+assert(classifyFailReason('SPL') === 'stale', 'price limit refused = pool at the end of its range (old pool info)');
 assert(classifyFailReason('UniswapV2: INSUFFICIENT_OUTPUT_AMOUNT') === 'stale', 'output short = old price info');
 assert(classifyFailReason('implausible profit') === 'stale', 'too-good profit = bad price info');
 assert(classifyFailReason('reverted without data') === 'silent', 'no data = no reason given');

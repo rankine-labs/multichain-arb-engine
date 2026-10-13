@@ -37,16 +37,37 @@ export const FAIL_GROUP_LABEL: Record<FailGroup, string> = {
 // words so ordinary words like "as" don't trigger them; longer phrases are
 // case-insensitive.
 const RULES: [FailGroup, RegExp][] = [
+  // A pool that gave back nothing / took nothing for our coins. Oct 12: these
+  // were counted as "our bot built the trade wrong", but in a practice check
+  // they can only mean the pool had no coins to trade at its price (our saved
+  // pool info was old or wrong), not a mistake in the trade we built:
+  //   ZeroAmount           a hop paid out 0 coins (the check always sends a
+  //                        non-zero amount, so the contract's other ZeroAmount
+  //                        reason can't happen here)
+  //   UnauthorizedCallback a V3 pool asked to be paid 0 (it had no liquidity
+  //                        in that direction); the contract's other callback
+  //                        guards can't trip in a check (we set them up)
+  //   SPL / invalidLimitSqrtPrice / PriceLimitAlreadyExceeded
+  //                        the pool's price already sits at the very end of
+  //                        its range (drained pool); we pass the standard
+  //                        "no limit" value every exchange accepts
+  // Checked BEFORE the "ours" rules on purpose.
+  ['stale', /ZeroAmount|UnauthorizedCallback|invalidLimitSqrtPrice|PriceLimitAlreadyExceeded|PriceLimitOutOfBounds|pool (gave back|took) nothing/],
+  ['stale', /\bSPL\b/],
   // Our own contract's errors that mean the route/setup we built was wrong.
-  // LOK = V3 pool locked (we re-entered it), SPL = we passed a bad price limit.
-  ['ours', /BadRoute|UnsupportedKind|ZeroAmount|UnauthorizedCallback|FlashPoolNotAllowed|V4NotEnabled|NotExecutor|Expired|Reentrancy|UnexpectedEth|call unexpectedly succeeded/i],
-  ['ours', /\bLOK\b|\bSPL\b/],
+  // LOK = V3 pool locked (we re-entered it), locked() = same on Algebra.
+  // CurrencyNotSettled / PoolNotInitialized = Uniswap V4 says we paid wrong
+  // or named a pool that doesn't exist (our pool key).
+  ['ours', /BadRoute|UnsupportedKind|FlashPoolNotAllowed|V4NotEnabled|NotExecutor|NotOwner|NotPendingOwner|OwnerIsExecutor|Reentrancy|UnexpectedEth|CurrencyNotSettled|PoolNotInitialized|call unexpectedly succeeded/i],
+  // "Expired()" only as our contract's own error (case-sensitive, with the
+  // brackets), so a node message that merely contains "expired" can't land here.
+  ['ours', /\bExpired\(\)|\bLOK\b|^locked\(\)/],
   // Uniswap V2 "K" check / insufficient input: the pair received fewer coins
   // than we sent (our contract sends the full amount and asks for the matching
   // output), which is exactly what a transfer tax causes. V3 "IIA" is the same
   // thing on a V3 pool. TokenBalanceDropped = a coin in the middle of the route
   // shrank between hops, also a transfer cut.
-  ['tax', /INSUFFICIENT_INPUT_AMOUNT|TokenBalanceDropped/i],
+  ['tax', /INSUFFICIENT_INPUT_AMOUNT|TokenBalanceDropped|insufficientInputAmount/i],
   ['tax', /: K\b|^K$|\bIIA\b/],
   // The coin itself refused to move: transfer helpers failing, blacklists,
   // trading switched off, max-transaction limits.
@@ -65,6 +86,10 @@ const RULES: [FailGroup, RegExp][] = [
   // The chain reverted with no data at all.
   ['silent', /reverted without data|execution reverted\s*$|^revert$/i],
 ];
+// Note: our contract's TransferFailed() / Uniswap V4's ERC20TransferFailed()
+// and NativeTransferFailed() all match the 'transfer' rule (TransferFailed).
+// Unknown error codes reach 'other' as "revert 0x<first 10 bytes>", so they
+// can be looked up from the log.
 
 export function classifyFailReason(raw: string): FailGroup {
   const text = (raw ?? '').trim();
@@ -75,12 +100,44 @@ export function classifyFailReason(raw: string): FailGroup {
 
 // Shortens a raw reason for counting: long hex (addresses, data) and big
 // numbers are collapsed so the same failure on different coins counts once.
+// Exception: unknown revert data ("revert 0x...") keeps its first 10 bytes
+// (the error code and the start of its details), so it can be looked up.
 export function normaliseRawReason(raw: string): string {
   return (raw ?? '')
-    .replace(/0x[0-9a-fA-F]{9,}/g, '0x…') // keeps 4-byte error codes
-    .replace(/\d{5,}/g, 'N')
+    .replace(/0x[0-9a-fA-F]{9,}/g, (hex, at: number, all: string) =>
+      /revert $/.test(all.slice(Math.max(0, at - 7), at)) ? hex.slice(0, 22) : '0x…') // keeps 4-byte error codes
+    .replace(/\b\d{5,}\b/g, 'N') // whole numbers only (not digits inside kept hex)
     .trim()
     .slice(0, 80) || '(empty)';
+}
+
+// ============================================================================
+// DIAGNOSTIC SAMPLES -- a few raw examples per hour of checks that failed
+// without a reason we can read, written to the server log.
+//
+// Plain English:
+//   "Failed with no reason given" can't be fixed from a count alone: we need
+//   to see what the node actually sent back. This lets through at most
+//   `perHour` examples an hour (per kind), so the log shows the raw answer
+//   without filling up.
+// ============================================================================
+export class SampleLimiter {
+  private windowStart = 0;
+  private used = new Map<string, number>();
+  constructor(private readonly perHour = 5, private readonly now: () => number = Date.now) {}
+
+  // True if one more example of `kind` may be logged this hour.
+  take(kind: string): boolean {
+    const t = this.now();
+    if (t - this.windowStart >= 3_600_000) { this.windowStart = t; this.used.clear(); }
+    const n = this.used.get(kind) ?? 0;
+    if (n >= this.perHour) return false;
+    this.used.set(kind, n + 1);
+    return true;
+  }
+
+  // Forget this hour's count (used by tests).
+  reset(): void { this.windowStart = 0; this.used.clear(); }
 }
 
 // Counts failures for one hour: by plain group and by raw reason.
