@@ -112,6 +112,12 @@ jobs:
           fab="${fab//'%'/'%25'}"
           fab="${fab//$'\n'/'%0A'}"
           echo "::notice title=Fables venue fork results::${fab}"
+          # Loops of 3-5 pools (Fork.t.sol test_fork_robinhood_loop*): result,
+          # pools, gas, failures. Own note, short.
+          loops=$(grep -E "robinhood_loop|loop3|loop4|loop5|GAS loop" fork-output.txt | head -40)
+          loops="${loops//'%'/'%25'}"
+          loops="${loops//$'\n'/'%0A'}"
+          echo "::notice title=Loop fork results::${loops}"
           exit $status
         env:
           AVALANCHE_RPC_URL: https://api.avax.network/ext/bc/C/rpc
