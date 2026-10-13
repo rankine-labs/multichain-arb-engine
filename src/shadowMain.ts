@@ -1253,7 +1253,7 @@ if (loopCfg.enabled) {
                   decimalsOf: (t) => TOKEN_DECIMALS.robinhood?.[t.toLowerCase()],
                   usdOf: usdRhLoop,
                   depthUsd: (p) => poolDepthUsd(p, decimalsOf, usdRhLoop),
-                  // Our gas for a 2-pool trade, scaled by the number of pools (3-8).
+                  // Our gas for a 2-pool trade, scaled per pool (fit to fork-test gas, see loopGasUsd).
                   gasUsd: (hops) => loopGasUsd(rhGasUsd(0.05), hops),
                   // Pools rival loops used (last 24 h): their loops are listed first.
                   rivalPools: () => rivalWatch.loopRoutePools(Date.now() - 24 * 3600_000),

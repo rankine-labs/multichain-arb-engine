@@ -19,10 +19,12 @@ The loop trader v1:
 2. **Prices them exactly.** Each loop is priced with the same pool maths the
    bot already uses (V2 copies, V3 copies, Algebra, Uniswap V4 including
    Fables). It finds the best trade size (up to $2,000, and never more than
-   30% of the shallowest pool's money) and subtracts our gas (2-pool gas
-   scaled by the number of pools: a 3-pool loop pays 1.5x, an 8-pool loop
-   4x. There is no measured per-pool gas figure for our contract yet, so
-   this simple scaling is used for every length).
+   30% of the shallowest pool's money) and subtracts our gas. Loop gas is a
+   fixed part plus a part per pool, fitted to the PR #116 fork tests
+   (contract call only: 3 hops 502k, 4 hops 646k, 5 hops 758k; a 4-hop V3
+   flash loan 760k): about 123k + 128k per pool. It is scaled from the
+   bot's normal 2-pool gas estimate, so a 3-pool loop pays 1.34x the 2-pool
+   gas, 5 pools 2.01x and 8 pools 3.03x.
 3. **Counts each loop once.** A paying loop is counted once until it closes
    (same rule as the gap scanner: it counts again only after it disappeared,
    or if it at least doubled).
@@ -110,6 +112,12 @@ prices at the time of the rebuild. If a pool's price moves by more than half
 of `LOOP_LONG_SLACK` (1%) since then, the list is rebuilt early (at most every
 5 s), so a long loop that a big trade just opened gets listed quickly.
 
+**Timing tests.** The test prints all the timings below but, because the
+server runs the tests before every deploy and a busy machine can stretch a
+single timing, it only fails on generous limits by default (longest slice
+under 60 ms, typical update under 20 ms). Run `PERF_STRICT=1 npm test` to
+check the real 15 ms slice target.
+
 **Measured speed** (test benchmark, ~1,000 synthetic pools: 700 watched + 300
 extra, 10 pools moving per update):
 
@@ -123,9 +131,10 @@ At 8 pools with the default 5,000 loops, each length only gets about 830
 loops. If the hourly block shows the list hitting its cap, raising
 `LOOP_MAX_CYCLES` (e.g. 20,000) lists more long loops at a small cost.
 
-**Before trying 8 pools live** (not just practice): gas for an 8-pool loop is
-assumed to be 4x a 2-pool trade. That should be checked against a real
-8-hop practice check's gas before trusting the "after gas" numbers.
+**Before trying 8 pools live** (not just practice): gas for 6-8 pool loops
+comes from a straight line through the measured 3-5 hop fork tests (8 pools
+about 1.15M gas, 3.03x a 2-pool trade). That should be checked against a
+real 8-hop practice check's gas before trusting the "after gas" numbers.
 
 ## Extra single pools (loops through pairs that sit on one pool)
 

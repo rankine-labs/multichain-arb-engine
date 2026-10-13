@@ -61,12 +61,22 @@ export function loopMaxPoolsFromEnv(raw: string | undefined, warn: (msg: string)
   return c;
 }
 
-// Our gas for a loop: the 2-pool trade's gas scaled by the number of pools
-// (a 3-pool loop = 1.5x, an 8-pool loop = 4x). The repo has no measured
-// per-hop gas figure for the contract yet, so this simple scaling is used
-// for every length 3-8.
+// Our gas for a loop: a fixed part plus a part per pool, scaled from the
+// bot's existing 2-pool gas estimate (so a 2-pool result stays the same).
+//
+// Measured (PR #116 fork tests, contract call only): live 3-hop 502k gas,
+// 4-hop own money 646k, 4-hop V3 flash loan 760k, 5-hop 758k. On mocks a V2
+// hop costs ~64k and a 2-hop trade ~160k, but real pools cost more per hop.
+// Straight-line fit to the own-money real-pool runs (3/4/5 hops):
+//   gas ~= 123k + 128k per pool  (3 -> 507k, 4 -> 635k, 5 -> 763k, 8 -> 1.15M)
+// So a loop of N pools costs (123k + 128k*N) / (123k + 128k*2) times the
+// 2-pool estimate: 3 pools = 1.34x, 5 pools = 2.01x, 8 pools = 3.03x.
+// (Flash-loan loops cost ~100k more; loops are own money in practice checks.)
+export const LOOP_GAS_BASE = 123_000;
+export const LOOP_GAS_PER_POOL = 128_000;
+export function loopGasUnits(pools: number): number { return LOOP_GAS_BASE + LOOP_GAS_PER_POOL * pools; }
 export function loopGasUsd(twoPoolGasUsd: number, pools: number): number {
-  return twoPoolGasUsd * (pools / 2);
+  return twoPoolGasUsd * (loopGasUnits(pools) / loopGasUnits(2));
 }
 
 export function loopConfigFromEnv(env: Record<string, string | undefined> = process.env, warn: (msg: string) => void = console.warn): LoopTraderConfig {
