@@ -124,6 +124,17 @@ async function main() {
   const s5 = await dec.decode(ev(exec('0x10', v4Input('0x07', [mNew]))));
   assert(s5?.poolAddress === ID_WETH_3000 && s5.amountIn === 777n * 10n ** 6n, 'newer multi-hop format (extra list) read with the right amount');
 
+  // ---- 5b. Newer single-swap format seen live on Robinhood (urv4 probe, Oct 12):
+  // one extra price-limit number before hookData. Also with real hookData bytes.
+  const singleNew = (amount: bigint, limit: bigint, hookData = '0x') => coder.encode([`tuple(${KEY} poolKey,bool zeroForOne,uint128 amount,uint128 limit,uint256 hopLimit,bytes hookData)`],
+    [{ poolKey: keyEth500, zeroForOne: true, amount, limit, hopLimit: 0n, hookData }]);
+  const s5b = await dec.decode(ev(exec('0x10', v4Input('0x08', [singleNew(1_000n * 10n ** 6n, 10n ** 18n)]))));
+  assert(s5b?.exactOut === true && s5b.poolAddress === ID_ETH_500 && s5b.amountOutWanted === 1_000n * 10n ** 6n, 'newer single format (extra price limit): buy-exact read');
+  const s5c = await dec.decode(ev(exec('0x10', v4Input('0x06', [singleNew(3n * 10n ** 18n, 0n, '0x' + 'ab'.repeat(40))]))));
+  assert(s5c?.amountIn === 3n * 10n ** 18n && s5c.poolAddress === ID_ETH_500, 'newer single format with hook data bytes: sell-exact read');
+  const s5d = await dec.decode(ev(exec('0x10', v4Input('0x08', [single(keyEth500, true, 1_000n * 10n ** 6n, 10n ** 18n).slice(0, -64) + '00'.repeat(64)]))));
+  assert(s5d === null, 'single swap with extra trailing data (length does not fit) -> skipped, no crash');
+
   // ---- 6. Allow-revert flag (0x90 = 0x80 | 0x10) and execute() without deadline.
   const s6 = await dec.decode(ev(ur.encodeFunctionData('execute(bytes,bytes[],uint256)', ['0x90', [v4Input('0x080c0f', [single(keyEth500, true, 1_000n * 10n ** 6n, 10n ** 18n), settleAll(ZERO, 10n ** 18n), takeAll(USDG)])], 1n])));
   assert(s6?.exactOut === true && s6.poolAddress === ID_ETH_500, 'allow-revert flag (0x90): still read as V4_SWAP');
@@ -157,8 +168,8 @@ async function main() {
   // ---- 9. Broken or unknown data -> skipped, no crash.
   assert(await dec.decode(ev(exec('0x10', '0x1234'))) === null, 'malformed V4 input -> skipped, no crash');
   assert(await dec.decode(ev(exec('0x10', v4Input('0x08', ['0xdeadbeef'])))) === null, 'malformed swap params -> skipped, no crash');
-  const oddSingle = coder.encode([`tuple(${KEY} poolKey,bool zeroForOne,uint128 amount,uint128 limit,uint256 extra,bytes hookData)`],
-    [{ poolKey: keyEth500, zeroForOne: true, amount: 10n ** 6n, limit: 10n ** 18n, extra: 5n, hookData: '0x' }]);
+  const oddSingle = coder.encode([`tuple(${KEY} poolKey,bool zeroForOne,uint128 amount,uint128 limit,uint256 x1,uint256 x2,bytes hookData)`],
+    [{ poolKey: keyEth500, zeroForOne: true, amount: 10n ** 6n, limit: 10n ** 18n, x1: 5n, x2: 6n, hookData: '0x' }]);
   assert(await dec.decode(ev(exec('0x10', v4Input('0x08', [oddSingle])))) === null, 'unknown single-swap layout -> skipped, not guessed');
   assert(await dec.decode(ev(exec('0x10', v4Input('0x08', [single(keyEth500, true, 0n, 10n ** 18n)])))) === null, 'buy-exact with open amount (0) -> skipped');
   h = takeUrV4Hour();

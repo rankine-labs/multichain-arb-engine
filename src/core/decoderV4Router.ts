@@ -21,7 +21,9 @@ import { computeAmountOut } from './dexMath';
 //     - hooked pools the bot already watches (e.g. Fables), including
 //       changing-fee ("dynamic fee") pools, but ONLY where the bot has a fee
 //       source for them (Fables: core/fablesFee.ts, via pairWatcher.hookedFee);
-//     - newer V4 router versions whose multi-hop format has an extra list.
+//     - newer V4 router versions that add price-limit fields (one number in
+//       single-pool swaps, a list in multi-hop swaps). Robinhood's main
+//       Universal Router uses the newer single-pool format.
 //   Every swap is matched to the EXACT pool in the bot's pool list by its V4
 //   pool id. Anything we can't read safely (unknown pool, unknown layout,
 //   changing fee with no fee source, broken data) is skipped and counted as
@@ -147,6 +149,10 @@ const PATH_KEY = 'tuple(address intermediateCurrency,uint24 fee,int24 tickSpacin
 // ExactInputSingleParams / ExactOutputSingleParams (same shape; the two
 // amounts are amountIn+amountOutMinimum or amountOut+amountInMaximum).
 const SINGLE = [`tuple(${POOL_KEY} poolKey,bool zeroForOne,uint128 amount,uint128 limit,bytes hookData)`];
+// Newer V4 router versions add one per-swap price-limit number right before
+// hookData. Seen on Robinhood's main Universal Router (urv4 probe, Oct 12:
+// most single swaps). The number itself is not needed.
+const SINGLE_WITH_HOP_LIMIT = [`tuple(${POOL_KEY} poolKey,bool zeroForOne,uint128 amount,uint128 limit,uint256 hopLimit,bytes hookData)`];
 // ExactInputParams / ExactOutputParams (currency = currencyIn / currencyOut).
 const MULTI = [`tuple(address currency,${PATH_KEY}[] path,uint128 amount,uint128 limit)`];
 // Newer V4 router versions add a per-hop price-limit list right after the
@@ -164,13 +170,28 @@ function wordAt(hex: string, i: number): bigint | null {
 // never "decode" into nonsense amounts. Each params blob is abi.encode(struct):
 // word 0 points at the struct; inside it, the pointer to the first list or
 // bytes field tells how many fixed fields come before it.
-//   single:  hookData pointer = 9 words (0x120) -> the standard layout
+//   single:  hookData pointer = 9 words (0x120) -> the standard layout;
+//            10 words (0x140) -> with the extra price-limit number.
+//            The blob's total length must also match exactly, so the two
+//            can never be mixed up.
 //   multi:   path pointer = 4 words (0x80) -> standard; 5 words (0xa0) -> with hop limits
 function layoutOf(param: string, kind: 'single' | 'multi'): string[] | null {
   const ptr = wordAt(param, 0);
   if (ptr === null || ptr % 32n !== 0n || ptr > 32n * 16n) return null;
   const base = Number(ptr / 32n);
-  if (kind === 'single') return wordAt(param, base + 8) === 0x120n ? SINGLE : null;
+  if (kind === 'single') {
+    const totalWords = (param.length - (param.startsWith('0x') ? 2 : 0)) / 64;
+    // head words before hookData -> does this layout explain the blob exactly?
+    const fits = (headWords: number): boolean => {
+      if (wordAt(param, base + headWords - 1) !== BigInt(headWords * 32)) return false;
+      const hookLen = wordAt(param, base + headWords);
+      if (hookLen === null || hookLen > 100_000n) return false;
+      return totalWords === base + headWords + 1 + Math.ceil(Number(hookLen) / 32);
+    };
+    if (fits(9)) return SINGLE;
+    if (fits(10)) return SINGLE_WITH_HOP_LIMIT;
+    return null;
+  }
   const pathPtr = wordAt(param, base + 1);
   if (pathPtr === 0x80n) return MULTI;
   if (pathPtr === 0xa0n) return MULTI_WITH_HOP_LIMITS;
