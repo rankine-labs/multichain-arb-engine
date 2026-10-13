@@ -312,6 +312,7 @@ export interface PlainHourlyInput {
   simOutcomes?: [string, number][];   // check results by category (core/failReasons SimBucket), this hour
   research?: string;                  // research lane hour summary (core/researchLane.ts), if on
   venueTests?: string;                // practice tests + wins per new exchange (core/venueTally.ts hourText), if any
+  loops?: string;                     // loop trader block (core/loopReport.ts), only when LOOP_TRADER is on
   // Race check (core/raceCheck.ts): would we really have won this hour's practice wins?
   race?: { won: number; lost: number; unclear: number; wonUsd: number; lostUsd: number; avgLeadS: number | null; pending: number };
   // Where trades dropped out this hour, step by step (see shadowMain funnel).
@@ -467,6 +468,9 @@ export function formatPlainHourly(r: PlainHourlyInput): string {
 
   // Which new exchanges earn in practice (Fables, Alandale, GIGA CL, ...).
   if (r.venueTests) { L.push(r.venueTests); L.push(''); }
+
+  // Loop trader (3-5 pool loops), practice only. Only present when LOOP_TRADER is on.
+  if (r.loops) { L.push(r.loops); L.push(''); }
 
   // Honest bottom line: what is PROVEN vs what is only seen.
   {

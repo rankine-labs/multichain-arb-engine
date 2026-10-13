@@ -499,8 +499,13 @@ export class RivalWatch {
     }
   }
 
+  // Optional listener told about every saved trade (the loop trader's race
+  // comparison uses it). A listener error never affects the rival watch.
+  onRecord?: (rec: RivalRec) => void;
+
   add(rec: RivalRec) {
     this.recs.push(rec);
+    if (this.onRecord) { try { this.onRecord(rec); } catch { /* listener problems are ignored */ } }
     const cutoff = this.now() - 26 * 3600_000;
     if (this.recs.length > MAX_RECS || (this.recs.length % 500 === 0 && this.recs[0]?.t < cutoff)) this.recs = this.recs.filter((r) => r.t >= cutoff).slice(-MAX_RECS);
     // Bot track record (for "verified") and its owner wallet.
