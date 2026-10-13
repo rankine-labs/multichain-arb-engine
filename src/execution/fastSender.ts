@@ -91,6 +91,13 @@ export class SafetyGate {
     this.lossUsd += Math.max(0, usd);
   }
 
+  // Money lost today so far (UTC day, resets at midnight UTC like the cap).
+  // includePending: also count trades still waiting for a receipt, which is
+  // what check() compares against the cap. Used by the Telegram safety alerts.
+  lossTodayUsd(includePending = false): number {
+    return (this.lossDay === this.today() ? this.lossUsd : 0) + (includePending ? this.pendingUsd() : 0);
+  }
+
   check(trade: { tradeSizeUsd: number; tokens: string[] }): { ok: true } | { ok: false; reason: string } {
     if (killSwitchOn(process.env.KILL_SWITCH) || existsSync(this.cfg.killFile)) return { ok: false, reason: 'kill switch on' };
     if (this.problems.length) return { ok: false, reason: `bad safety setting: ${this.problems.join(', ')}` };

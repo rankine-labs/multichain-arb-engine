@@ -577,6 +577,39 @@ export function formatStartup(chains: Record<string, { online: boolean }>): stri
   return [`▶️ <b>BOT STARTED</b> · shadow mode`, line].join('\n');
 }
 
+// ----------------------------------------------------------------------------
+// Live safety alerts (sent by execution/safetyAlerts.ts, at most once per
+// reason per UTC day). Same style as TRADE WON / TRADE REVERTED.
+// ----------------------------------------------------------------------------
+
+// Early warning: 75% of today's loss cap is used up.
+export function formatLossCapWarning(chain: string, lostUsd: number, capUsd: number): string {
+  return [
+    `⚠️ <b>LOSS CAP 75% USED</b> · ${esc(chainLabel(chain))}`,
+    `Lost $${lostUsd.toFixed(2)} of the $${capUsd.toFixed(2)} daily loss cap today (gas on lost races plus any losing trades).`,
+    `Live sending stops for the day at $${capUsd.toFixed(2)}.`,
+  ].join('\n');
+}
+
+// The cap was hit: live sending is paused until midnight UTC.
+export function formatLossCapHit(chain: string, lostUsd: number, capUsd: number): string {
+  return [
+    `🛑 <b>DAILY LOSS CAP HIT</b> · ${esc(chainLabel(chain))}`,
+    `Lost $${lostUsd.toFixed(2)} today (cap $${capUsd.toFixed(2)}, counting trades still waiting for a receipt).`,
+    'Live sending is paused until midnight UTC, then it resumes on its own.',
+    '<i>To resume sooner: raise DAILY_LOSS_CAP_USD in .env and restart the bot.</i>',
+  ].join('\n');
+}
+
+// Live sending paused for another safety reason (kill switch, bad setting).
+export function formatLivePaused(chain: string, reason: string, fix: string): string {
+  return [
+    `🛑 <b>LIVE SENDING PAUSED</b> · ${esc(chainLabel(chain))}`,
+    `Reason: ${esc(reason)}`,
+    `<i>${esc(fix)}</i>`,
+  ].join('\n');
+}
+
 export function formatExecutionWarning(): string {
   return [
     '⚠️ <b>EXECUTION_ENABLED is set</b>',

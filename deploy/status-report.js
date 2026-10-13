@@ -40,9 +40,123 @@ function envValue(key) {
   } catch { return ''; }
 }
 
+// True if .env has a non-empty value for this key. Returns yes/no only: the
+// value itself (e.g. the wallet key) is never kept or printed.
+function envHas(key) {
+  try {
+    return fs.readFileSync(path.join(APP_DIR, '.env'), 'utf8').split('\n').some((l) => new RegExp(`^${key}=\\s*["']?[^"'\\s]`).test(l));
+  } catch { return false; }
+}
+
 const TOKEN = envValue('GH_STATUS_TOKEN');
 const ISSUE = envValue('GH_STATUS_ISSUE') || '15';
 const EVERY_MIN = Number(envValue('STATUS_EVERY_MIN') || 15);
+
+// ----------------------------------------------------------------------------
+// LIVE MODE (real money)
+//
+// Is the bot sending real trades? Best signal: the line the bot logs when its
+// sender starts: "[fire] robinhood sender ready (LIVE from 0x...)" or
+// "(dry run)". If that line is no longer in the log tail, fall back to the
+// same .env settings the bot checks (src/execution/fastSender.ts): live needs
+// EXECUTION_ENABLED=true AND LIVE_SEND_CONFIRM=yes-real-money AND a wallet key.
+// ----------------------------------------------------------------------------
+function detectLive(logLines, env) {
+  const ready = [...logLines].reverse().find((l) => /\[fire\] robinhood sender ready \(/.test(l));
+  if (ready) return /\(LIVE from/.test(ready);
+  return env.EXECUTION_ENABLED === 'true' && env.LIVE_SEND_CONFIRM === 'yes-real-money' && !!env.hasKey;
+}
+
+// Footer wording: the only change to the page in practice mode.
+const footerText = (live) => `<sub>Posted by deploy/status-report.js on the server. ${live ? 'LIVE: real money' : 'Practice mode: no real trades'}.</sub>`;
+
+// Every line the bot wrote to data/live-trades.jsonl (plus the older,
+// rotated .1 file). One JSON object per line; broken lines are skipped.
+const LIVE_FILE = path.join(APP_DIR, 'data', 'live-trades.jsonl');
+function readLiveRecords(file = LIVE_FILE) {
+  const out = [];
+  for (const f of [file + '.1', file]) {
+    let text = '';
+    try { text = fs.readFileSync(f, 'utf8'); } catch { continue; }
+    for (const line of text.split('\n')) {
+      if (!line.trim()) continue;
+      try { const r = JSON.parse(line); if (r && typeof r.t === 'number') out.push(r); } catch { /* skip */ }
+    }
+  }
+  return out.sort((a, b) => a.t - b.t);
+}
+
+const money = (n) => `${n < 0 ? '-' : ''}$${Math.abs(n).toFixed(2)}`;
+const signed = (n) => `${n > 0 ? '+' : n < 0 ? '-' : ''}$${Math.abs(n).toFixed(2)}`;
+const shortHash = (h) => (h && h.length > 14 ? `${h.slice(0, 8)}…${h.slice(-4)}` : h || '');
+
+// Builds the "Live trades" section from the live-trades.jsonl records.
+//   windowStart: start of this report's window (ms); now: report time (ms)
+//   capUsd: DAILY_LOSS_CAP_USD. "Today" is the UTC day, the same day the
+//   bot's daily loss cap resets on (midnight UTC = 7 or 8 pm Toronto).
+function liveSection(records, { windowStart, now, capUsd }) {
+  const d = new Date(now);
+  const dayStart = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate());
+  const tally = (from) => {
+    const rs = records.filter((r) => r.t >= from && r.t <= now);
+    const results = rs.filter((r) => r.kind === 'result');
+    const won = results.filter((r) => r.status === 'won');
+    const rev = results.filter((r) => r.status === 'reverted');
+    const blocked = new Map();
+    for (const r of rs) if (r.kind === 'blocked' && r.counts) for (const [k, v] of Object.entries(r.counts)) blocked.set(k, (blocked.get(k) || 0) + Number(v || 0));
+    return {
+      sent: rs.filter((r) => r.kind === 'sent').length,
+      sendFailed: rs.filter((r) => r.kind === 'send_failed').length,
+      won: won.length, wonNet: won.reduce((x, r) => x + Number(r.netUsd || 0), 0),
+      rev: rev.length, revGas: rev.reduce((x, r) => x + Number(r.gasUsd || 0), 0),
+      dropped: results.filter((r) => r.status === 'dropped').length,
+      net: results.reduce((x, r) => x + Number(r.netUsd || 0), 0),
+      // Same as the bot's loss cap count: gas on reverts + any trade that lost after gas.
+      loss: results.reduce((x, r) => x + Math.max(0, -Number(r.netUsd || 0)), 0),
+      blocked, blockedTotal: [...blocked.values()].reduce((x, y) => x + y, 0),
+    };
+  };
+  const w = tally(windowStart), t = tally(dayStart);
+  const usedPct = capUsd > 0 ? Math.round((100 * t.loss) / capUsd) : 0;
+  const reasons = (m) => [...m.entries()].sort((a, b) => b[1] - a[1]).map(([k, v]) => `${v}x ${k}`).join(' · ') || 'none';
+
+  // Last 5 trades: each send (or refused send) with its result, newest first.
+  const resultByHash = new Map(records.filter((r) => r.kind === 'result' && r.hash).map((r) => [r.hash, r]));
+  const recent = records.filter((r) => r.kind === 'sent' || r.kind === 'send_failed').slice(-5).reverse();
+  const time = (ms) => new Date(ms).toLocaleString('en-CA', { timeZone: 'America/Toronto', hour12: false, month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+  const outcome = (r) => {
+    if (r.kind === 'send_failed') return `send refused by node (no cost): ${String(r.error || '').replace(/[|`]/g, ' ').slice(0, 60)}`;
+    const res = resultByHash.get(r.hash);
+    if (!res) return 'waiting for receipt';
+    if (res.status === 'won') return `won ${signed(Number(res.netUsd || 0))} after gas${res.profitUsd === null ? ' (profit price unknown)' : ''}`;
+    if (res.status === 'reverted') return `reverted, gas lost ${money(Number(res.gasUsd || 0))}`;
+    return 'dropped (never mined, no cost)';
+  };
+
+  return [
+    '### Live trades (real money)',
+    '| | This window | Today (UTC) |',
+    '|---|---|---|',
+    `| Sent | ${w.sent} | ${t.sent} |`,
+    `| Landed and won (profit after gas) | ${w.won} (${signed(w.wonNet)}) | ${t.won} (${signed(t.wonNet)}) |`,
+    `| Landed but reverted (gas lost) | ${w.rev} (${money(w.revGas)}) | ${t.rev} (${money(t.revGas)}) |`,
+    ...(w.dropped || t.dropped ? [`| Dropped (never mined, no cost) | ${w.dropped} | ${t.dropped} |`] : []),
+    ...(w.sendFailed || t.sendFailed ? [`| Send refused by node (no cost) | ${w.sendFailed} | ${t.sendFailed} |`] : []),
+    `| Not sent: stopped by safety gate | ${w.blockedTotal} | ${t.blockedTotal} |`,
+    '',
+    `- **Net today: ${signed(t.net)}** (all landed trades, after gas)`,
+    `- Daily loss used: ${money(t.loss)} of ${money(capUsd)} cap (${usedPct}%)${t.loss >= capUsd && capUsd > 0 ? ' · **CAP HIT: live sending paused until midnight UTC**' : ''}`,
+    `- Stopped by safety gate this window, by reason: ${reasons(w.blocked)}`,
+    ...(t.blockedTotal !== w.blockedTotal ? [`- Stopped by safety gate today, by reason: ${reasons(t.blocked)}`] : []),
+    '',
+    '**Last 5 trades**',
+    ...(recent.length
+      ? ['| Time (Toronto) | Pair / route | Size | Result | Tx |', '|---|---|---|---|---|',
+        ...recent.map((r) => `| ${time(r.t)} | ${String(r.label || '?').replace(/\|/g, '/')} | ${money(Number(r.sizeUsd || 0)).replace(/\.\d\d$/, '')} | ${outcome(r)} | ${r.hash ? `\`${shortHash(r.hash)}\`` : '-'} |`)]
+      : ['- no live sends yet']),
+    '',
+  ];
+}
 
 function loadState() {
   try { return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')); } catch { return { lastRun: 0, out: 0, err: 0 }; }
@@ -227,10 +341,15 @@ async function main() {
   const deploy = sh('tail -n 1 deploy/auto-deploy.log').replace(/<[^>]+>/g, '').slice(0, 160);
   const stamp = new Date(now).toLocaleString('en-CA', { timeZone: 'America/Toronto', hour12: false });
 
+  // Live mode? Then add the "Live trades" section (practice mode: nothing added).
+  const live = detectLive(bigTail, { EXECUTION_ENABLED: envValue('EXECUTION_ENABLED'), LIVE_SEND_CONFIRM: envValue('LIVE_SEND_CONFIRM'), hasKey: envHas('BOT_PRIVATE_KEY') });
+  const liveLines = live ? liveSection(readLiveRecords(), { windowStart: state.lastRun || now - EVERY_MIN * 60_000, now, capUsd: Number(envValue('DAILY_LOSS_CAP_USD') || 25) }) : [];
+
   const body = [
     `## ${running ? '🟢 Bot running' : '🔴 Bot NOT running'}`,
     `_Updated ${stamp} (Toronto). Covers the last ${Math.round((now - (state.lastRun || now)) / 60000) || EVERY_MIN} min. Refreshes every ${EVERY_MIN} min._`,
     '',
+    ...liveLines,
     '### Bot',
     `- Up ${upMin} min · ${memMb} MB memory · ${restartsSince} restart(s) since last report`,
     `- Code: \`${sha}\``,
@@ -272,7 +391,7 @@ async function main() {
     '### Errors this window',
     ...(topErrors.length ? topErrors.map(([m, n]) => `- ${n}x \`${m.replace(/`/g, "'")}\``) : ['- none']),
     '',
-    '<sub>Posted by deploy/status-report.js on the server. Shadow mode: no real trades.</sub>',
+    footerText(live),
   ].join('\n');
 
   const res = await fetch(`https://api.github.com/repos/${REPO}/issues/${ISSUE}`, {
@@ -286,4 +405,8 @@ async function main() {
   console.log(`[status] updated issue #${ISSUE}`);
 }
 
-main().catch((e) => console.error('[status] failed:', e.message));
+// Run only when started directly (node deploy/status-report.js). When a test
+// loads this file it just gets the helpers below, nothing is posted.
+if (require.main === module) main().catch((e) => console.error('[status] failed:', e.message));
+
+module.exports = { detectLive, footerText, readLiveRecords, liveSection };

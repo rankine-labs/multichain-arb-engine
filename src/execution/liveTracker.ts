@@ -36,6 +36,7 @@ export interface LiveTrackerDeps {
   timeoutMs?: number;
   onSettled?: (hash: string) => void;   // receipt arrived or gave up (release the pending-loss hold)
   onDropped?: () => void;               // never mined: resync the nonce
+  onResult?: (r: LiveResult) => void;   // every final result (written to data/live-trades.jsonl for the status page)
 }
 
 export class LiveTradeTracker {
@@ -58,7 +59,7 @@ export class LiveTradeTracker {
     this.d.onSettled?.(hash);
     this.d.onDropped?.();
     const r: LiveResult = { hash, label: meta.label, status: 'dropped', gasUsd: 0, expectedProfitUsd: meta.expectedProfitUsd };
-    this.results.push(r);
+    this.push(r);
     await this.d.notify(`⚪ <b>TRADE DROPPED</b> · ${meta.label}\nNever mined within ${Math.round((this.d.timeoutMs ?? 90_000) / 1000)}s · no cost`);
   }
 
@@ -78,14 +79,20 @@ export class LiveTradeTracker {
       }
       const net = (profitUsd ?? 0) - gasUsd;
       if (net < 0) this.d.recordLoss(-net);
-      this.results.push({ hash, label: meta.label, status: 'profit', gasUsd, profitTokenUnits, profitUsd, expectedProfitUsd: meta.expectedProfitUsd });
+      this.push({ hash, label: meta.label, status: 'profit', gasUsd, profitTokenUnits, profitUsd, expectedProfitUsd: meta.expectedProfitUsd });
       void this.d.notify(`✅ <b>TRADE WON</b> · ${meta.label}\nProfit ${profitUsd !== undefined ? '$' + profitUsd.toFixed(2) : '?'} · gas $${gasUsd.toFixed(2)} · expected $${meta.expectedProfitUsd.toFixed(2)}\n<code>${hash}</code>`);
     } else {
       // Reverted: someone was faster or the price moved. Only gas is lost.
       this.d.recordLoss(gasUsd);
-      this.results.push({ hash, label: meta.label, status: 'reverted', gasUsd, expectedProfitUsd: meta.expectedProfitUsd });
+      this.push({ hash, label: meta.label, status: 'reverted', gasUsd, expectedProfitUsd: meta.expectedProfitUsd });
       void this.d.notify(`❌ <b>TRADE REVERTED</b> · ${meta.label}\nLost the race or price moved · gas $${gasUsd.toFixed(2)}\n<code>${hash}</code>`);
     }
+  }
+
+  // Keep the result and tell the listener (never lets a listener error escape).
+  private push(r: LiveResult) {
+    this.results.push(r);
+    try { this.d.onResult?.(r); } catch { /* logging must never affect trading */ }
   }
 
   summary() {
