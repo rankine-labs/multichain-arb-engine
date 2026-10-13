@@ -387,8 +387,10 @@ export async function refreshPoolsBatch(
       // Dynamic-fee pools: keep the fee current too (Algebra: globalState
       // word 2; hooked V4: getSlot0 word 3 = the pool's LP fee now).
       const dyn = p.variant === 'algebra' ? word(res[i], 2) : null;
-      const fee = p.v4?.hooks ? hookedFee(word(res[i], 3), p.poolAddress, opts.hookedFeeOf)
-        : dyn !== null && dyn < 1_000_000n ? { feePips: Number(dyn), feeBps: Math.round(Number(dyn) / 100) } : {};
+      // feeReadMs: when this changing fee was read, so a fee seen in a newer
+      // swap event can take over (core/eventFees.ts) and an older one can't.
+      const fee = p.v4?.hooks ? { ...hookedFee(word(res[i], 3), p.poolAddress, opts.hookedFeeOf), feeReadMs: now }
+        : dyn !== null && dyn < 1_000_000n ? { feePips: Number(dyn), feeBps: Math.round(Number(dyn) / 100), feeReadMs: now } : {};
       if (sqrt && liq !== null) out.push({ ...p, ...fee, sqrtPriceX96: sqrt, liquidity: liq, lastUpdatedMs: now });
     } else if (p.poolType === 'v2') {
       const r0 = word(res[i], 0), r1 = word(res[i], 1);

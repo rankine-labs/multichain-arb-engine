@@ -1,4 +1,5 @@
 import { PoolState } from './types';
+import { eventFeePips } from './eventFees';
 
 // ============================================================================
 // DEX MATH: universal getAmountOut()
@@ -29,6 +30,11 @@ const Q96 = 1n << 96n;
 const PIPS = 1_000_000n; // 100% in pips
 
 export function feePipsOf(pool: PoolState): number {
+  // Dynamic-fee pools: the fee real swaps just paid (Swap events), while it
+  // is newer than the last fee read. null when off / nothing fresh (Oct 13,
+  // FEE_FROM_EVENTS, core/eventFees.ts).
+  const ev = eventFeePips(pool);
+  if (ev !== null) return ev;
   if (pool.feePips !== undefined && Number.isInteger(pool.feePips) && pool.feePips >= 0 && pool.feePips < 1_000_000) return pool.feePips;
   // V4 pools carry their real fee in pips (dynamic-fee flag values are >= 1e6: ignored).
   if (pool.v4 && Number.isInteger(pool.v4.fee) && pool.v4.fee >= 0 && pool.v4.fee < 1_000_000) return pool.v4.fee;

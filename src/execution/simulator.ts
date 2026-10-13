@@ -119,9 +119,13 @@ const BALANCE_OF = new ethers.Interface(['function balanceOf(address) view retur
 
 // `bucket`: which of the outcome groups this is (core/failReasons.ts).
 // `detail` (loss only): what kind of loss, when known.
+// `gasUsed` (profit/loss only, when the node reports it, i.e. replays via
+// eth_simulateV1): gas our call used. Only set when the whole route ran and
+// the contract refused at the final profit check, so it is a fair sample of
+// what the real trade would use (core/gasModel.ts calibration).
 export type SimResult =
-  | { status: 'profit'; profit: bigint; bucket?: SimBucket }   // would make `profit` (start-token units, before gas)
-  | { status: 'loss'; bucket?: SimBucket; detail?: string }    // would end with less than it started
+  | { status: 'profit'; profit: bigint; bucket?: SimBucket; gasUsed?: bigint }   // would make `profit` (start-token units, before gas)
+  | { status: 'loss'; bucket?: SimBucket; detail?: string; gasUsed?: bigint }    // would end with less than it started
   | { status: 'fail'; reason: string; bucket?: SimBucket }     // trade itself would revert
   | { status: 'rate_limited'; reason: string; bucket?: SimBucket } // RPC said "slow down" -- not a trade result
   | { status: 'unsupported'; reason: string; bucket?: SimBucket }; // couldn't simulate on this chain/token
@@ -301,7 +305,7 @@ export function replayRpc(base: Rpc, parentBlock: string, prefix: ReplayCall[], 
 // as unavailable (before, the last answer was taken anyway, and a replayed
 // trade's success could be misread as OUR call succeeding: "built the trade
 // wrong").
-export function readReplayAnswer(result: any, expectedCalls: number): { result?: any; error?: { message?: string; data?: any; code?: number; via?: string } } {
+export function readReplayAnswer(result: any, expectedCalls: number): { result?: any; error?: { message?: string; data?: any; code?: number; via?: string; gasUsed?: string } } {
   const block = Array.isArray(result) ? result[0] : result;
   const calls: any[] = Array.isArray(block?.calls) ? block.calls : [];
   // Both start with "replay unavailable", so callers fall back to a plain
@@ -319,7 +323,9 @@ export function readReplayAnswer(result: any, expectedCalls: number): { result?:
   const fromErr = err ? extractRevertData(err) : null;
   const revert = fromErr && fromErr !== '0x' ? fromErr
     : typeof ours?.returnData === 'string' && ours.returnData !== '0x' ? ours.returnData : undefined;
-  return { error: { message: err?.message ?? 'execution reverted', code: err?.code, data: revert, via: 'eth_simulateV1' } };
+  // gasUsed: eth_simulateV1 reports the gas our call used (a plain eth_call
+  // can't). Kept so the gas model can learn real gas per kind of trade.
+  return { error: { message: err?.message ?? 'execution reverted', code: err?.code, data: revert, via: 'eth_simulateV1', ...(ours?.gasUsed !== undefined ? { gasUsed: String(ours.gasUsed) } : {}) } };
 }
 
 // Does this RPC error mean "you're sending too many requests"?
@@ -600,7 +606,13 @@ async function simulateInner(
   // a rate limit, but real revert data is the contract's own answer).
   const rd = revertData(r.error);
   const parsed = parseRevert(rd);
-  if (parsed) return verdictFrom(parsed, flash);
+  if (parsed) {
+    const v = verdictFrom(parsed, flash);
+    // Whole route ran (refused only at the final profit check): keep its gas.
+    const gu = gasUsedOf((r.error as { gasUsed?: unknown }).gasUsed);
+    if (gu !== null && parsed.name === 'InsufficientProfit' && (v.status === 'profit' || v.status === 'loss')) return { ...v, gasUsed: gu };
+    return v;
+  }
 
   if (isRateLimited(r.error)) return { status: 'rate_limited', reason: r.error.message ?? 'rate limited' };
   if ((r.error.message ?? '').startsWith('network:')) return { status: 'rate_limited', reason: r.error.message! };
@@ -622,6 +634,12 @@ async function simulateInner(
   // up later (the 4-byte error code alone is often not enough).
   diagnose('unknown', `unknown revert data ${first10Bytes(rd)} (${(rd.length - 2) / 2} bytes) | node said ${describeError(r.error)}`, trade.hops, flash, opts.blockTag);
   return { status: 'fail', reason: `revert ${first10Bytes(rd)}`, bucket: 'contract_revert' };
+}
+
+// The node's gasUsed (hex or decimal text, or a number) as a whole number, or null.
+export function gasUsedOf(v: unknown): bigint | null {
+  if (v === undefined || v === null || v === '') return null;
+  try { const g = BigInt(v as string | number); return g > 0n ? g : null; } catch { return null; }
 }
 
 // One log line (at most a few an hour per kind) describing a check whose

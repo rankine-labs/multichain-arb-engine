@@ -72,7 +72,19 @@ export interface PoolState {
   // 'algebra': Algebra Integral copies (Alandale) keep it in globalState(),
   // with a dynamic fee in globalState word 2.
   variant?: 'algebra';
+  // FEES SEEN IN SWAP EVENTS (Oct 13, FEE_FROM_EVENTS; core/eventFees.ts).
+  // The fee the pool's latest swap really paid, per direction (z = token0
+  // sold into the pool, o = token1 sold), read from V4 / Algebra Integral
+  // Swap events by the block reader. Used by the swap maths instead of the
+  // read fee when it is newer than feeReadMs.
+  observedFee?: { z?: ObservedFee; o?: ObservedFee };
+  // When this pool's changing fee was last read from the chain (Algebra
+  // globalState, hooked V4 fee source). Unset = never re-read since discovery.
+  feeReadMs?: number;
 }
+
+// One fee seen in a real swap: pips (1,000,000 = 100%), its block, and when we saw it.
+export interface ObservedFee { pips: number; block: number; atMs: number }
 
 export interface ArbOpportunity {
     id: string;

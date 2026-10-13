@@ -45,6 +45,17 @@ export interface PoolUpdate {
   sqrtPriceX96?: bigint; // v3/v4 (from Swap)
   liquidity?: bigint;
   tick?: number;
+  // Fees the swap actually paid (Oct 13, FEE_FROM_EVENTS), when the event says:
+  //   v4Fee:      Uniswap V4 Swap's last field = the fee charged, in pips
+  //               (1,000,000 = 100%), including any dynamic/hook-set LP fee
+  //               and protocol fee.
+  //   algebraFee: Algebra Integral Swap's overrideFee and pluginFee (pips).
+  //               overrideFee > 0 replaced the pool's own fee for that swap;
+  //               pluginFee is charged on top. 0/0 = the pool's own fee.
+  // zeroForOne: which way the swap went (true = token0 sold into the pool).
+  zeroForOne?: boolean;
+  v4Fee?: number;
+  algebraFee?: { override: number; plugin: number };
 }
 
 // ---------------------------------------------------------------------------
@@ -132,14 +143,29 @@ export function parsePoolLogs(logs: RpcLog[], poolManager: string): PoolUpdate[]
     } else if (V3_LIKE.has(t0)) {
       // V3 family: data = amount0, amount1, sqrtPriceX96, liquidity, tick, ...
       if (w.length < 5) continue;
-      out.push({ pool: address, kind: 'v3', block, logIndex, sqrtPriceX96: asUint(w[2]!), liquidity: asUint(w[3]!), tick: Number(asInt(w[4]!)) });
+      const u: PoolUpdate = { pool: address, kind: 'v3', block, logIndex, sqrtPriceX96: asUint(w[2]!), liquidity: asUint(w[3]!), tick: Number(asInt(w[4]!)) };
+      // amount0 is from the pool's side: positive = the pool received token0.
+      const a0 = asInt(w[0]!);
+      if (a0 !== 0n) u.zeroForOne = a0 > 0n;
+      // Algebra Integral: words 5 and 6 = overrideFee, pluginFee (uint24 each).
+      if (t0 === ALGEBRA_INTEGRAL_SWAP_TOPIC && w.length >= 7) {
+        const o = asUint(w[5]!), pf = asUint(w[6]!);
+        if (o < 1_000_000n && pf < 1_000_000n) u.algebraFee = { override: Number(o), plugin: Number(pf) };
+      }
+      out.push(u);
     } else if (t0 === V4_SWAP_TOPIC) {
       // V4: only trust it if it came from the real PoolManager. The pool id
       // is topic 1; data = amount0, amount1, sqrtPriceX96, liquidity, tick, fee.
       if (!pm || address !== pm) continue;
       const id = l.topics[1]?.toLowerCase();
       if (!id || w.length < 5) continue;
-      out.push({ pool: id, kind: 'v4', block, logIndex, sqrtPriceX96: asUint(w[2]!), liquidity: asUint(w[3]!), tick: Number(asInt(w[4]!)) });
+      const u: PoolUpdate = { pool: id, kind: 'v4', block, logIndex, sqrtPriceX96: asUint(w[2]!), liquidity: asUint(w[3]!), tick: Number(asInt(w[4]!)) };
+      // amount0 is from the SWAPPER's side: negative = the swapper paid token0.
+      const a0 = asInt(w[0]!);
+      if (a0 !== 0n) u.zeroForOne = a0 < 0n;
+      // Word 5 = the fee this swap paid, in pips (uint24; >= 100% is nonsense).
+      if (w.length >= 6) { const f = asUint(w[5]!); if (f < 1_000_000n) u.v4Fee = Number(f); }
+      out.push(u);
     }
     // Anything else (including V2 Swap events, which carry no reserves) is ignored.
   }

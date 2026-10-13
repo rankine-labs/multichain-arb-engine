@@ -30,7 +30,9 @@ export interface LiveTrackerDeps {
   ethUsd: () => number;                               // price of the gas coin
   tokenUsd: (token: string, raw: bigint) => number | null; // USD value of a raw token amount
   recordLoss: (usd: number) => void;                  // safety gate daily loss cap
-  noteGasUsed: (gas: bigint) => void;                 // adaptive gas limit
+  // Adaptive gas limit + gas calibration. `info` (added Oct 13): which trade
+  // it was, its kind of route (core/gasModel.ts key) and whether it succeeded.
+  noteGasUsed: (gas: bigint, info?: { hash: string; routeKey?: string; success: boolean }) => void;
   notify: (html: string) => Promise<void> | void;     // Telegram
   pollMs?: number;
   timeoutMs?: number;
@@ -43,11 +45,13 @@ export class LiveTradeTracker {
   results: LiveResult[] = [];
   constructor(private readonly d: LiveTrackerDeps) {}
 
-  track(hash: string, meta: { expectedProfitUsd: number; label: string }) {
+  // routeKey (optional): the gas model's name for this kind of trade, so its
+  // real gas can calibrate future estimates.
+  track(hash: string, meta: { expectedProfitUsd: number; label: string; routeKey?: string }) {
     void this.watch(hash, meta);
   }
 
-  private async watch(hash: string, meta: { expectedProfitUsd: number; label: string }) {
+  private async watch(hash: string, meta: { expectedProfitUsd: number; label: string; routeKey?: string }) {
     const poll = this.d.pollMs ?? 1_000, deadline = Date.now() + (this.d.timeoutMs ?? 90_000);
     while (Date.now() < deadline) {
       let receipt: ethers.TransactionReceipt | null = null;
@@ -64,10 +68,10 @@ export class LiveTradeTracker {
   }
 
   // Pure-ish: turns a receipt into a result (exported for tests via record()).
-  record(hash: string, meta: { expectedProfitUsd: number; label: string }, receipt: Pick<ethers.TransactionReceipt, 'status' | 'gasUsed' | 'gasPrice' | 'logs'>) {
+  record(hash: string, meta: { expectedProfitUsd: number; label: string; routeKey?: string }, receipt: Pick<ethers.TransactionReceipt, 'status' | 'gasUsed' | 'gasPrice' | 'logs'>) {
     const gasWei = receipt.gasUsed * (receipt.gasPrice ?? 0n);
     const gasUsd = Number(ethers.formatEther(gasWei)) * this.d.ethUsd();
-    this.d.noteGasUsed(receipt.gasUsed);
+    this.d.noteGasUsed(receipt.gasUsed, { hash, routeKey: meta.routeKey, success: receipt.status === 1 });
     if (receipt.status === 1) {
       const ev = receipt.logs.find((l) => l.topics[0] === EXECUTED_TOPIC);
       let profitTokenUnits: bigint | undefined, profitUsd: number | undefined;

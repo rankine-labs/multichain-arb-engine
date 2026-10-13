@@ -309,6 +309,8 @@ export interface PlainHourlyInput {
   memory?: string; // one memory line (core/memReport.ts); absent when MEM_LOG=0
   // Phase 8 (Oct 8): our own costs and results, in plain numbers.
   ourGas?: { ownUsd: number | null; flashUsd: number | null }; // our contract's gas per trade, right now
+  // "Costs used: gas X¢ (live, margin 1.3x; ...) · dynamic fees from events: N pools" (core/gasModel.ts costsLine)
+  costsUsed?: string;
   profitBands?: { hour: number[]; day: number[]; hourUsd: number; dayUsd: number }; // profitable checks by $ size
   simOutcomes?: [string, number][];   // check results by category (core/failReasons SimBucket), this hour
   research?: string;                  // research lane hour summary (core/researchLane.ts), if on
@@ -439,6 +441,8 @@ export function formatPlainHourly(r: PlainHourlyInput): string {
   if (r.ourGas && (r.ourGas.ownUsd !== null || r.ourGas.flashUsd !== null)) {
     L.push(`Our trade gas right now: ${r.ourGas.ownUsd === null ? '?' : cents(r.ourGas.ownUsd)} with our own money, ${r.ourGas.flashUsd === null ? '?' : cents(r.ourGas.flashUsd)} with a loan`);
   }
+  // What the profit maths is subtracting right now (gas model + event fees).
+  if (r.costsUsed) L.push(esc(r.costsUsed));
   L.push('');
 
   L.push('<b>Money we\'d have made</b> (if we won every race)');

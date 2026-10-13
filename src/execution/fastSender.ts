@@ -296,6 +296,10 @@ export class FastSender {
     return (Number((gasUnits + this.l1Gas) * (this.maxFeePerGas / 2n)) / 1e18) * ethUsd;
   }
 
+  // When the gas price was last read successfully (0 = never). The gas model
+  // (core/gasModel.ts) stops trusting the live price when this gets old.
+  get gasReadAtMs(): number { return this.maxFeePerGas ? this.latestBlockAtMs : 0; }
+
   // Limit actually used: tuned L2 limit + 1.5x the current L1 posting gas.
   get currentGasLimit() { return this.gasLimitNow + (this.l1Gas * 3n) / 2n; }
 
