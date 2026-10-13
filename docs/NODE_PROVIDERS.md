@@ -103,3 +103,9 @@ BLOCK_READER_WSS=wss://robinhood-mainnet.core.chainstack.com/ws/YOUR_KEY
 3. Restart: `pm2 restart <name> --update-env`.
 4. Check the startup `[sim] robinhood: checks on ...` line, plus the next `[blockreader]` line, which should say `live`.
 5. To go back: delete the lines and restart. The bot returns to QuickNode/Alchemy and the polling reader.
+
+## WebSocket limits (Oct 13)
+
+- `BLOCK_READER_WSS_FILTER` (default on): the WebSocket only pushes events from our own pools plus the V4 PoolManager, not every pool on the chain. Paid providers bill each pushed message, so this keeps the bill small. When the watch list changes, the subscription is renewed at most every 10 minutes. Set `BLOCK_READER_WSS_FILTER=0` to get every pool.
+- `BLOCK_READER_WSS_DAILY` (default 400000): after this many pushed messages in a UTC day, the WebSocket switches off and the normal poll reader takes over until midnight UTC (8 pm Toronto). `0` means no cap.
+- Saved Chainstack links are used automatically (src/config/envDefaults.ts): `CHAINSTACK_RPC_ROBINHOOD` becomes the practice-check node (120000/day, QuickNode as backup) and `CHAINSTACK_WSS_ROBINHOOD` becomes `BLOCK_READER_WSS`. Anything set in .env wins. `BLOCK_READER_WSS=off` keeps the WebSocket off.

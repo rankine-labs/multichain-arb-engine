@@ -12,16 +12,19 @@
 //
 //   What it fills in (only if missing):
 //     CHECK_RPC_MAIN           <- CHAINSTACK_RPC_ROBINHOOD   (practice checks on Chainstack)
-//     CHECK_RPC_MAIN_DAILY     <- 60000                      (free plan: ~100k/day, leave room)
+//     CHECK_RPC_MAIN_DAILY     <- 120000                     (Growth plan: 20M/month = ~650k/day)
 //     CHECK_RPC_FALLBACK       <- QUICKNODE_RPC_ROBINHOOD    (QuickNode as the backup)
 //     CHECK_RPC_FALLBACK_DAILY <- 14000                      (QuickNode's daily allowance)
 //     LOOP_TRADER              <- 1                          (owner approved Oct 13; practice
 //                                                             only, the loop code can't send)
 //   Set LOOP_TRADER=0 in .env to turn loops off again.
 //
-//   NOT filled in: BLOCK_READER_WSS. The WebSocket reader pushes a message for
-//   every pool trade on the chain, which could use up the free plan in a day.
-//   It waits until the owner upgrades the plan and sets it on purpose.
+//     BLOCK_READER_WSS         <- CHAINSTACK_WSS_ROBINHOOD   (owner upgraded to Growth Oct 13
+//                                                             and asked for the WebSocket on).
+//                                                             Only our pools' events are pushed,
+//                                                             capped at 400,000 messages a UTC day
+//                                                             (BLOCK_READER_WSS_DAILY), then polling.
+//   Set BLOCK_READER_WSS=off in .env to keep the WebSocket off.
 //
 //   Must be imported right after 'dotenv/config' and before anything else
 //   reads these settings. Never prints the links (they contain the API key).
@@ -38,12 +41,20 @@ export function applyEnvDefaults(env: Env): string[] {
   if (!has('CHECK_RPC_MAIN') && has('CHAINSTACK_RPC_ROBINHOOD')) {
     env.CHECK_RPC_MAIN = env.CHAINSTACK_RPC_ROBINHOOD!.trim();
     notes.push('practice checks: Chainstack (from CHAINSTACK_RPC_ROBINHOOD)');
-    if (!has('CHECK_RPC_MAIN_DAILY')) { env.CHECK_RPC_MAIN_DAILY = '60000'; notes.push('Chainstack daily allowance 60000'); }
+    if (!has('CHECK_RPC_MAIN_DAILY')) { env.CHECK_RPC_MAIN_DAILY = '120000'; notes.push('Chainstack daily allowance 120000'); }
     if (!has('CHECK_RPC_FALLBACK') && has('QUICKNODE_RPC_ROBINHOOD')) {
       env.CHECK_RPC_FALLBACK = env.QUICKNODE_RPC_ROBINHOOD!.trim();
       notes.push('backup for checks: QuickNode');
       if (!has('CHECK_RPC_FALLBACK_DAILY')) { env.CHECK_RPC_FALLBACK_DAILY = '14000'; notes.push('QuickNode daily allowance 14000'); }
     }
+  }
+
+  if (!has('BLOCK_READER_WSS') && has('CHAINSTACK_WSS_ROBINHOOD')) {
+    env.BLOCK_READER_WSS = env.CHAINSTACK_WSS_ROBINHOOD!.trim();
+    notes.push('block reader: Chainstack WebSocket push (our pools only, daily cap)');
+  } else if ((env.BLOCK_READER_WSS ?? '').trim().toLowerCase() === 'off') {
+    delete env.BLOCK_READER_WSS;
+    notes.push('block reader WebSocket off (BLOCK_READER_WSS=off)');
   }
 
   if (!has('LOOP_TRADER')) {

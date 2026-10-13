@@ -2232,6 +2232,10 @@ await chainManager.startAll();
                         httpRpc: readerRpc,
                         httpLabel: `${endpointLabel(READER_URL)} (block reader gap fills)`,
                         heads: process.env.BLOCK_READER_WSS_HEADS === '1',
+                        // Only our pools' events (BLOCK_READER_WSS_FILTER=0 = every pool on the chain),
+                        // and at most BLOCK_READER_WSS_DAILY pushed messages a UTC day (0 = no cap).
+                        addressFilter: process.env.BLOCK_READER_WSS_FILTER !== '0',
+                        dailyMessageCap: Number(process.env.BLOCK_READER_WSS_DAILY ?? 400_000),
                         poolManager: ROBINHOOD_V4.POOL_MANAGER,
                         addresses: () => watched().filter((a) => a.length === 42),
                         v4Ids: () => new Set(watched().filter((a) => a.length === 66)),

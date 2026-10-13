@@ -18,9 +18,12 @@ import { nodeUsage, NodeUsageCounter } from './nodeUsage';
 //
 //   What it does:
 //     - Subscribes to the same six event types the poll reader asks for
-//       (Sync / Swap, see HANDLED_TOPICS) with no address filter, then keeps
-//       only events from our pools here (same as the poll reader's
-//       "localFilter" mode, and the same V4 pool-id check).
+//       (Sync / Swap, see HANDLED_TOPICS), by default only from our own pools
+//       plus the V4 PoolManager (address filter: far fewer billed messages),
+//       then double-checks here (same V4 pool-id check as the poll reader).
+//     - DAILY CAP: after BLOCK_READER_WSS_DAILY pushed messages in a UTC day
+//       the push feed switches off and polling takes over until midnight UTC,
+//       so a busy day can't run through the provider plan.
 //     - Hands the results to the SAME function the poll reader uses
 //       (onUpdates -> applyUpdate -> cache.upsertFromBlock), so the rest of
 //       the bot can't tell which reader found the trade.
@@ -79,6 +82,16 @@ export interface WsBlockReaderOptions {
   autoTick?: boolean;                              // run the 1 s health check timer (default true; tests drive tick())
   usage?: NodeUsageCounter;
   log?: (line: string) => void;
+  // ADDRESS FILTER (default on): ask the node only for events from our own
+  // pools (plus the V4 PoolManager) instead of every pool on the chain. Paid
+  // providers bill each pushed message, and our pools are a small share of
+  // all chain traffic, so this cuts the bill a lot. When the watch list
+  // changes, the subscription is renewed (at most every resubscribeMs).
+  addressFilter?: boolean;
+  resubscribeMs?: number;                          // default 10 min
+  // DAILY CAP: stop the push feed for the rest of the UTC day after this many
+  // pushed messages (the poll reader takes over). 0 = no cap. Default 400,000.
+  dailyMessageCap?: number;
 }
 
 // Read a hex block number. null when missing / unreadable.
@@ -164,7 +177,12 @@ export class WsBlockReader {
   private cancelFlush: (() => void) | null = null;
   private rereadFrom: number | null = null; // reorg: re-read from this block
   private rereading = false;
-  private counts = { messages: 0, logs: 0, updates: 0, reconnects: 0, staleReconnects: 0, subscribeErrors: 0, socketErrors: 0, backfills: 0, backfillSkipped: 0, reorgs: 0 };
+  private counts = { messages: 0, logs: 0, updates: 0, reconnects: 0, staleReconnects: 0, subscribeErrors: 0, socketErrors: 0, backfills: 0, backfillSkipped: 0, reorgs: 0, resubscribes: 0 };
+  private subSig = '';                     // which addresses the live subscription asked for
+  private lastSubAt = 0;                   // when we last (re)subscribed
+  private dayKey = '';                     // UTC day the message count belongs to
+  private dayMessages = 0;                 // pushed messages today (UTC)
+  private capped = false;                  // daily cap hit: push feed off until the next UTC day
 
   constructor(o: WsBlockReaderOptions) {
     this.o = o;
@@ -223,6 +241,27 @@ export class WsBlockReader {
     try {
       if (!this.running) return;
       const t = this.now();
+      // New UTC day after a cap: turn the push feed back on.
+      if (this.capped && this.utcDay(t) !== this.dayKey) {
+        this.capped = false;
+        this.dayKey = this.utcDay(t); this.dayMessages = 0;
+        this.log(`${this.label}: new day, push feed back on`);
+        this.backoffMs = this.minBackoff;
+        this.connect();
+        this.noteHealth();
+        return;
+      }
+      // Watch list changed: renew the subscription so new pools are included
+      // (at most every resubscribeMs, so a busy list doesn't cause churn).
+      if (this.socket && this.subscribed && this.o.addressFilter !== false &&
+          t - this.lastSubAt >= (this.o.resubscribeMs ?? 600_000) &&
+          this.subscribeAddresses().join(',') !== this.subSig) {
+        this.counts.resubscribes++;
+        this.log(`${this.label}: watch list changed, renewing the subscription`);
+        this.dropSocket();
+        this.connect();                     // gap fill runs once the new subscription is live
+        return;
+      }
       if (this.socket && t - this.lastMsgAt > this.staleMs) {
         this.counts.staleReconnects++;
         this.log(`${this.label}: nothing received for ${Math.round(this.staleMs / 1000)} s, reconnecting (block reader polls meanwhile)`);
@@ -243,6 +282,7 @@ export class WsBlockReader {
   private connect(): void {
     this.cancelReconnect = null;
     if (!this.running) return;
+    if (this.capped) return;               // daily cap hit: stay off until the next UTC day (tick() restarts it)
     const gen = ++this.gen;
     this.subscribed = false;
     this.hadData = false;
@@ -271,8 +311,18 @@ export class WsBlockReader {
       if (gen !== this.gen) return;
       try {
         this.lastMsgAt = this.now();
-        // Same six event types the poll reader asks for, no address filter.
-        sock.send(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_subscribe', params: ['logs', { topics: [HANDLED_TOPICS] }] }));
+        // Same six event types the poll reader asks for. With the address
+        // filter on (default), only from our pools + the V4 PoolManager.
+        const filter: { topics: string[][]; address?: string[] } = { topics: [HANDLED_TOPICS] };
+        if (this.o.addressFilter !== false) {
+          const list = this.subscribeAddresses();
+          filter.address = list;
+          this.subSig = list.join(',');
+        } else {
+          this.subSig = '';
+        }
+        this.lastSubAt = this.now();
+        sock.send(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_subscribe', params: ['logs', filter] }));
         if (this.o.heads) sock.send(JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'eth_subscribe', params: ['newHeads'] }));
       } catch (e) {
         this.counts.socketErrors++;
@@ -323,6 +373,7 @@ export class WsBlockReader {
       this.lastMsgAt = this.now();
       this.counts.messages++;
       this.usage.countWsMessage(this.label);
+      if (this.countToday()) return;        // daily cap just hit: feed stopped
       const text = typeof data === 'string' ? data : Buffer.isBuffer(data) ? data.toString('utf8') : String(data);
       let m: any;
       try { m = JSON.parse(text); } catch { return; }   // not JSON: ignore
@@ -383,6 +434,35 @@ export class WsBlockReader {
     } catch (e) {
       this.log(`message error (${wsReason(e)})`);
     }
+  }
+
+  // Addresses for the subscription: our pools + the V4 PoolManager, sorted
+  // (so the same list always gives the same signature).
+  private subscribeAddresses(): string[] {
+    const set = new Set<string>();
+    for (const a of this.o.addresses() ?? []) if (a && a.length === 42) set.add(a.toLowerCase());
+    const pm = (this.o.poolManager || '').toLowerCase();
+    if (pm) set.add(pm);
+    return [...set].sort();
+  }
+
+  private utcDay(t: number): string { return new Date(t).toISOString().slice(0, 10); }
+
+  // Count one pushed message against today's cap. True = cap just hit and
+  // the feed was stopped (the poll reader takes over until the next UTC day).
+  private countToday(): boolean {
+    const t = this.now();
+    const d = this.utcDay(t);
+    if (d !== this.dayKey) { this.dayKey = d; this.dayMessages = 0; }
+    this.dayMessages++;
+    const cap = this.o.dailyMessageCap ?? 400_000;
+    if (cap > 0 && this.dayMessages >= cap && !this.capped) {
+      this.capped = true;
+      this.log(`${this.label}: daily cap of ${cap} pushed messages reached, push feed off until midnight UTC (block reader polls meanwhile)`);
+      this.dropSocket();
+      return true;
+    }
+    return false;
   }
 
   // A real event arrived: the connection works, so reset the reconnect wait.
@@ -481,15 +561,16 @@ export class WsBlockReader {
   }
 
   // Health numbers for the 5-minute [blockreader] line.
-  stats(): { healthy: boolean; messages: number; logs: number; updates: number; reconnects: number; staleReconnects: number; subscribeErrors: number; socketErrors: number; backfills: number; backfillSkipped: number; reorgs: number; fallbackSeconds: number; lastBlock: number; head: number } {
+  stats(): { healthy: boolean; messages: number; logs: number; updates: number; reconnects: number; staleReconnects: number; subscribeErrors: number; socketErrors: number; backfills: number; backfillSkipped: number; reorgs: number; resubscribes: number; fallbackSeconds: number; lastBlock: number; head: number; todayMessages: number; capped: boolean } {
     const fallbackMs = this.downMsTotal + (this.wasHealthy ? 0 : Math.max(0, this.now() - this.downSince));
-    return { healthy: this.healthy(), ...this.counts, fallbackSeconds: Math.round(fallbackMs / 1000), lastBlock: this.lastBlock, head: this.head };
+    return { healthy: this.healthy(), ...this.counts, fallbackSeconds: Math.round(fallbackMs / 1000), lastBlock: this.lastBlock, head: this.head, todayMessages: this.dayMessages, capped: this.capped };
   }
 
   // One short piece of text for the [blockreader] log line.
   statusText(): string {
     const s = this.stats();
-    return `push ${this.label}: ${s.healthy ? 'live' : 'DOWN (polling)'}, msgs ${s.messages}, reconnects ${s.reconnects}, fallback ${s.fallbackSeconds} s, last block ${s.lastBlock}` +
+    return `push ${this.label}: ${s.capped ? 'OFF (daily cap, polling)' : s.healthy ? 'live' : 'DOWN (polling)'}, msgs ${s.messages} (today ${s.todayMessages}), reconnects ${s.reconnects}, fallback ${s.fallbackSeconds} s, last block ${s.lastBlock}` +
+      (s.resubscribes ? `, list renewals ${s.resubscribes}` : '') +
       (s.backfills ? `, gap fills ${s.backfills}` : '') + (s.reorgs ? `, reorg events ${s.reorgs}` : '') + (s.subscribeErrors ? `, refused ${s.subscribeErrors}` : '');
   }
 }
