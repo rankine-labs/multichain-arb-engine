@@ -143,6 +143,7 @@ async function main() {
   const isV4Swap = (s: { poolAddress: string } | null) => !!s && s.poolAddress.length === 66;
   const reasons = new Map<string, number>();
   let readOff = 0, readOn = 0, exactOutOn = 0, hookedOn = 0;
+  const dumps: string[] = [];
   for (const { tx, inputs } of picked) {
     const ev: RawChainEvent = { chain: 'robinhood', stateType: 'FINALIZED', blockOrSeq: tx.blockNumber ?? 0, receivedAtMs: Date.now(), raw: { to: tx.to, data: tx.data, value: tx.value.toString() } };
     delete process.env.FEED_DECODE_UR_V4;
@@ -153,6 +154,18 @@ async function main() {
     for (const inp of inputs) {
       const o = decodeUrV4Input(inp, { chain: 'robinhood', wrappedNative: ROBINHOOD_TOKENS.WETH, poolLookup: lookup as any, event: ev, txValue: tx.value });
       if ('reason' in o) bump(reasons, o.reason);
+      // A few raw samples of formats the reader doesn't know, so the layout
+      // can be checked by hand: action byte + the first 14 words of its params.
+      if ('reason' in o && o.reason === 'unknown V4 router format' && dumps.length < 3) {
+        try {
+          const [a, p] = coder.decode(['bytes', 'bytes[]'], inp);
+          const acts = ethers.getBytes(a as string), ps = p as string[];
+          const j = [...acts].findIndex((x) => x >= 0x06 && x <= 0x09);
+          const h = ps[j].slice(2);
+          const words = Array.from({ length: Math.min(14, h.length / 64) }, (_, w) => BigInt('0x' + h.slice(w * 64, w * 64 + 64)).toString(16));
+          dumps.push(`tx ${tx.hash.slice(0, 12)} action 0x0${acts[j].toString(16)} len ${h.length / 64}w: ${words.join(' ')}`);
+        } catch { /* skip sample */ }
+      }
     }
   }
   delete process.env.FEED_DECODE_UR_V4;
@@ -166,6 +179,7 @@ async function main() {
   console.log(`Read as a V4 swap, switch OFF (today): ${readOff}/${picked.length} (${pct(readOff, picked.length)})`);
   console.log(`Read as a V4 swap, switch ON: ${readOn}/${picked.length} (${pct(readOn, picked.length)}); of those buy-exact ${exactOutOn}, hooked (Fables) ${hookedOn}`);
   console.log(`New reader: why not readable (per command): ${top(reasons, 8)}`);
+  for (const d of dumps) console.log(`Unknown format sample: ${d}`);
 }
 
 main().catch((err) => { console.error('Router V4 probe failed:', (err as Error).message); process.exitCode = 1; });
