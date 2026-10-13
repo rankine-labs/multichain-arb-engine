@@ -1,6 +1,7 @@
 import { PoolState } from './types';
 import { feePipsOf } from './dexMath';
 import { clAmountOut, v2AmountOut } from './venueMath';
+import { realBalanceOf } from './poolPrice';
 
 // ============================================================================
 // LOOP FINDER -- finds 3 to 8 pool loops that end with more than they start
@@ -52,9 +53,19 @@ import { clAmountOut, v2AmountOut } from './venueMath';
 // hooked Fables pools at their known fee). Order books, stable curves and
 // Liquidity Book bins have no exact maths here and are left out.
 //
-// Known limit (same as the 2-pool scanner): V3-style pools are priced inside
-// their current price band. A big trade that crosses into the next band is
-// only an estimate. The practice check (a real eth_call) catches that.
+// SIZING REALISM (Oct 13, "found 363, would make money 0"): V3-style pools
+// are priced inside their current price band only. Before this fix the
+// best-size search could pick a size that pushes a concentrated pool far
+// past its band, or asks a pool to pay out more coins than it really holds,
+// so the "profit" was imaginary and every practice check lost. Now the
+// exact check (and the quick check's size limit) only allows sizes where:
+//   - no V3-style hop leaves its current price band (see inBandMaxIn), and
+//   - no V3 hop pays out more than the pool's real coin balance (read every
+//     ~10 min by core/v3BalanceBook.ts, see realBalanceOf).
+// This makes loop estimates conservative: exact while inside the band, and
+// never bigger than what a pool can really pay. It can miss a loop that
+// would only pay by crossing into the next band; it will no longer report
+// loops that only "pay" because of that.
 // ============================================================================
 
 const Q96 = 2 ** 96;
@@ -233,14 +244,127 @@ export function exactHopOut(p: PoolState, inIsA: boolean, amountIn: bigint): big
   return 0n;
 }
 
-// Exact output of a whole loop.
-export function exactLoopOut(pools: PoolState[], hops: LoopHop[], amountIn: bigint): bigint {
+// ----------------------------------------------------------------------------
+// Sizing realism: price band limit and real balance cap (Oct 13)
+// ----------------------------------------------------------------------------
+
+// Uniswap V3 style pools hold their liquidity in price bands. The band edges
+// sit every `tickSpacing` ticks (1 tick = a 0.01% price step). Inside one
+// band the liquidity number we read is exact; past the edge it may change
+// (often it drops sharply in concentrated pools).
+//
+// Where the spacing comes from:
+//   - V4 pools: their own tickSpacing (part of the pool key).
+//   - V3 copies: the standard Uniswap spacing for the fee tier
+//     (0.01% -> 1, 0.05% -> 10, 0.25% -> 50, 0.30% -> 60, 1% -> 200).
+//   - Any other fee (Algebra dynamic fees, odd tiers): fee / 50 ticks, at
+//     least 1. That is never wider than the usual spacing for that fee, and
+//     a narrower band only makes the limit stricter (safer), never looser.
+const STANDARD_TICK_SPACING: Record<number, number> = { 100: 1, 500: 10, 2500: 50, 3000: 60, 10000: 200 };
+export function tickSpacingOf(p: PoolState): number {
+  if (p.v4 && Number.isInteger(p.v4.tickSpacing) && p.v4.tickSpacing > 0) return p.v4.tickSpacing;
+  const fee = feePipsOf(p);
+  return STANDARD_TICK_SPACING[fee] ?? Math.max(1, Math.floor(fee / 50));
+}
+
+const MIN_TICK = -887272, MAX_TICK = 887272;
+const LOG_TICK = Math.log(1.0001);
+// sqrt(price) at a tick (real number, not X96).
+const sqrtAtTick = (t: number) => Math.pow(1.0001, t / 2);
+
+// The most of `tokenIn` (raw units, INCLUDING the pool fee) that can go into
+// a V3-style pool before its price reaches the edge of its current band.
+// null = no band limit (V2 pools). 0 = the price already sits on the edge.
+//
+// How: the current tick comes from the price (tick = log base 1.0001 of the
+// price, rounded down). The band is [lower, lower + spacing), lower being the
+// tick rounded down to a multiple of the spacing. Selling token0 pushes the
+// price DOWN toward `lower`; selling token1 pushes it UP toward `upper`.
+// With s = sqrt(price) and L = liquidity, the standard V3 formulas give the
+// input needed to move the price from s to the edge sEdge:
+//   token0 in: L * (1/sEdge - 1/s)       token1 in: L * (sEdge - s)
+// Then the fee is added back on (the pool only prices the part after fee).
+export function inBandMaxIn(p: PoolState, inIsA: boolean): number | null {
+  if (p.poolType !== 'v3') return null;
+  if (!p.sqrtPriceX96 || !p.liquidity) return 0;
+  const s = Number(p.sqrtPriceX96) / Q96, L = Number(p.liquidity);
+  if (!(s > 0) || !(L > 0) || !Number.isFinite(s) || !Number.isFinite(L)) return 0;
+  const ts = tickSpacingOf(p);
+  const tick = Math.floor((2 * Math.log(s)) / LOG_TICK);
+  let lower = Math.floor(tick / ts) * ts;
+  // Float rounding right next to an edge: make sure lower <= price < upper.
+  if (sqrtAtTick(lower) > s) lower -= ts;
+  if (sqrtAtTick(lower + ts) <= s) lower += ts;
+  const upper = lower + ts;
+  let net: number;
+  if (inIsA) net = L * (1 / sqrtAtTick(Math.max(MIN_TICK, lower)) - 1 / s); // price falls to `lower`
+  else net = L * (sqrtAtTick(Math.min(MAX_TICK, upper)) - s);              // price rises to `upper`
+  if (!(net > 0) || !Number.isFinite(net)) return 0;
+  const g = 1 - feePipsOf(p) / 1_000_000;
+  return g > 0 ? net / g : 0;
+}
+
+// The pool's real balance of the coin it pays out on this hop (raw units),
+// or undefined when not known (V2 pools, V4 pools, balance not read yet).
+export function realOutCap(p: PoolState, inIsA: boolean): bigint | undefined {
+  return realBalanceOf(p, inIsA ? p.tokenB : p.tokenA);
+}
+
+// Exact output of one swap, made realistic:
+//   - input past the band edge is treated as wasted (only the part that fits
+//     inside the band is priced), so a bigger trade never looks better;
+//   - the output is capped at the pool's real balance of that coin.
+// For a size inside both limits this is exactly exactHopOut.
+export function realisticHopOut(p: PoolState, inIsA: boolean, amountIn: bigint): bigint {
+  let a = amountIn;
+  const maxIn = inBandMaxIn(p, inIsA);
+  if (maxIn !== null) {
+    const m = BigInt(Math.max(0, Math.floor(maxIn)));
+    if (a > m) a = m;
+  }
+  let out = exactHopOut(p, inIsA, a);
+  const real = realOutCap(p, inIsA);
+  if (real !== undefined && out > real) out = real;
+  return out;
+}
+
+// Exact output of a whole loop. opts.realistic: use realisticHopOut for each
+// hop (band limit + real balance cap). The finder always uses realistic.
+export function exactLoopOut(pools: PoolState[], hops: LoopHop[], amountIn: bigint, opts: { realistic?: boolean } = {}): bigint {
   let amt = amountIn;
   for (let i = 0; i < hops.length; i++) {
-    amt = exactHopOut(pools[i], hops[i].inIsA, amt);
+    amt = opts.realistic ? realisticHopOut(pools[i], hops[i].inIsA, amt) : exactHopOut(pools[i], hops[i].inIsA, amt);
     if (amt <= 0n) return 0n;
   }
   return amt;
+}
+
+// Biggest starting amount (raw base-coin units) for which EVERY hop stays
+// inside its price band and pays out no more than its real balance.
+// Infinity = no limit (all V2, balances unknown). Float maths, a size limit
+// only: works backwards from the last hop, turning each hop's limit on its
+// output into a limit on its input with the inverse of the x*y=k curve
+// (exact for V3 inside its band), then applying that hop's own band limit.
+export function maxLoopInput(pools: PoolState[], hops: LoopHop[]): number {
+  let lim = Infinity; // most the NEXT hop may receive (= most this hop may pay out)
+  for (let i = hops.length - 1; i >= 0; i--) {
+    const p = pools[i], inIsA = hops[i].inIsA;
+    const real = realOutCap(p, inIsA);
+    let outLim = lim;
+    if (real !== undefined) outLim = Math.min(outLim, Number(real));
+    let inLim = Infinity;
+    if (outLim !== Infinity) {
+      const h = hopCurve(p, inIsA);
+      if (!h || !(outLim > 0)) return 0;
+      // Inverse of out = g*rout*x / (rin + g*x): x = rin*out / (g*(rout - out)).
+      inLim = outLim >= h.rout ? Infinity : (h.rin * outLim) / (h.g * (h.rout - outLim));
+    }
+    const band = inBandMaxIn(p, inIsA);
+    if (band !== null) inLim = Math.min(inLim, band);
+    if (!(inLim > 0)) return 0;
+    lim = inLim;
+  }
+  return lim;
 }
 
 // ----------------------------------------------------------------------------
@@ -805,23 +929,31 @@ export class LoopFinder {
     if (!pools) return null;
     const cap = this.capRaw(c, pools, now);
     if (!cap) return null;
-    const { profit } = bestInputClosedForm(A, C, cap.cap);
+    // Never size past a price band edge or a pool's real balance (Oct 13).
+    const { profit } = bestInputClosedForm(A, C, Math.min(cap.cap, maxLoopInput(pools, c.hops)));
     const scale = cap.usd / 10 ** cap.dec;
     return profit * scale - this.env.gasUsd(c.hops.length);
   }
 
   // Exact check: integer pool maths, best size by golden-section search.
+  // Sizes are limited so no hop leaves its price band or pays out more than
+  // it really holds (maxLoopInput), and each hop is priced with
+  // realisticHopOut as a second safety net. So the number reported is exact
+  // within the band and never relies on coins a pool doesn't have.
   exact(c: LoopCycle): LoopResult | null {
     const pools = this.poolsOf(c);
     if (!pools) return null;
     const cap = this.capRaw(c, pools);
-    if (!cap || cap.cap < 1) return null;
+    if (!cap) return null;
+    const hi = Math.min(cap.cap, maxLoopInput(pools, c.hops));
+    if (!(hi >= 1)) return null;
     const toBig = (x: number) => BigInt(Math.max(0, Math.floor(x)));
-    const f = (x: number) => { const a = toBig(x); return Number(exactLoopOut(pools, c.hops, a) - a); };
-    const best = goldenMax(f, 0, cap.cap);
+    const out = (a: bigint) => exactLoopOut(pools, c.hops, a, { realistic: true });
+    const f = (x: number) => { const a = toBig(x); return Number(out(a) - a); };
+    const best = goldenMax(f, 0, hi);
     const amountIn = toBig(best.x);
     if (amountIn <= 0n) return null;
-    const amountOut = exactLoopOut(pools, c.hops, amountIn);
+    const amountOut = out(amountIn);
     const scale = cap.usd / 10 ** cap.dec;
     const grossUsd = Number(amountOut - amountIn) * scale;
     const gasUsd = this.env.gasUsd(c.hops.length);

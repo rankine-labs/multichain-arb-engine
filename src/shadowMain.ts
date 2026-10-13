@@ -98,7 +98,7 @@ import { FailTally } from './core/failReasons';
 import { LenderBalances } from './core/lenderBalances';
 import { RouteScores, WinSizes, WIN_BARS } from './core/routeScore';
 import { RivalWatch } from './core/rivalWatch';
-import { V3BalanceBook } from './core/v3BalanceBook';
+import { V3BalanceBook, V3_BALANCES_FILE } from './core/v3BalanceBook';
 import { extraWatcherVenues, extraScanFactories, isExecutableVenue, canPracticeTestVenue, reportedVenueIds, venueShortName } from './config/robinhoodVenues';
 import { VenueTally } from './core/venueTally';
 // Practice-test a pool: exchanges we trade, plus extra venues that passed the
@@ -2599,6 +2599,9 @@ await chainManager.startAll();
       // price oracle stops treating narrow-band pools as deep. Scan lane only,
       // never the trading path. First read 2 min after start.
       const v3Balances = new V3BalanceBook();
+      // Oct 13: start with the balances saved before the restart (up to 1 h
+      // old), so the thin-pool filter works right away, not after 2 min.
+      console.log(`[oracle] real V3 balances loaded from disk: ${v3Balances.load(V3_BALANCES_FILE)}`);
       priceOracle.useBalances(v3Balances);
       // Oct 13 (USDG/NVDA): the depth filter and the standing-gap scanner use
       // the same real balances, so a pool counts only as deep as the coins
@@ -2608,6 +2611,7 @@ await chainManager.startAll();
             try {
                   const n = await v3Balances.refresh(scanCallMany, cache.allForChain('robinhood'));
                   console.log(`[oracle] real V3 balances read: ${n}`);
+                  void v3Balances.save(V3_BALANCES_FILE); // for a fast restart (atomic write)
                   // Status page: pools whose price maths says "deep" but whose
                   // real coins don't (left out of gaps and checks). Top 3 shown.
                   const thin = thinPools(cache.allForChain('robinhood'), decimalsOf, (t) => priceOracle.getUsdPrice('robinhood', t));
