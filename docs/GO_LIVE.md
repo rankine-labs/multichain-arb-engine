@@ -1,5 +1,7 @@
 # Going live on Robinhood: checklist
 
+> Friday step-by-step: follow [GO_LIVE_CHECKLIST.md](GO_LIVE_CHECKLIST.md). This page has the background.
+
 The bot runs in **shadow mode** until every step below is done. It can't switch
 itself to live: live sending needs four settings that only you add to `.env`.
 
@@ -117,7 +119,7 @@ To turn live mode off completely, set `EXECUTION_ENABLED=false` in `.env`, then
 
 | Limit | Default | Setting |
 |---|---|---|
-| Max trade size | $5,000 | `MAX_TRADE_USD` |
+| Max trade size | $20,000 (always set it; start small) | `MAX_TRADE_USD` |
 | Daily loss cap (gas on lost races + any losses) | $25 | `DAILY_LOSS_CAP_USD` |
 | Max sends per minute | 6 | `MAX_SENDS_PER_MIN` |
 | Only vetted tokens (the watched top pairs) | on | - |

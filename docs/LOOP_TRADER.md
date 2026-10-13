@@ -136,9 +136,9 @@ across mixed exchanges needs **no contract change** for practice checks.
 2. **A contract test with 3+ hops**: every contract test today uses 2 hops.
    Add a test (mixed V2 + V3 + V4) and a Robinhood fork test of a real loop
    (e.g. WETH/DJT/PONS/USDG) before any real money.
-3. **Redeploy if needed**: the deployed contract lacks some fixes in this
-   repo's version (Algebra callback, Oct 12 audit fixes). Loops through
-   Algebra pools need the redeployed contract.
+3. **Contract deploy**: no contract is deployed yet (see
+   `contracts/README.md`). Friday's deploy uses current main, which already
+   has the Algebra callback and the Oct 12 audit fixes.
 4. **A loop send path**: today's sender only builds 2-pool trades. A live loop
    needs its own builder (with the minimum-profit floor from the practice
    result), the same safety gate (vetted coins, size limits, daily loss cap)
