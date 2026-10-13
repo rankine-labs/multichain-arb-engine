@@ -22,3 +22,5 @@ data/
 # Compiled bot (built on the server by auto-deploy)
 dist/
 deploy/.status-state.json
+# Deploy lock: owner's one-time "deploy while live" permission (server only)
+DEPLOY_ALLOW_LIVE

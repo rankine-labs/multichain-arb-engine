@@ -68,6 +68,8 @@ const sh = (cmd) => { try { return execSync(cmd, { cwd: APP_DIR, encoding: 'utf8
 const strip = (l) => l.replace(/^\s*\d+\|[^|]*\|\s*/, '').trim(); // drop pm2 "0|name |" prefix
 const lastMatch = (lines, re) => [...lines].reverse().find((l) => re.test(l));
 const count = (lines, re) => lines.filter((l) => re.test(l)).length;
+// Deploy lock: auto-deploy.sh writes "<sha> <title>" here while live instead of deploying.
+const pendingDeploy = () => { try { return fs.readFileSync(path.join(APP_DIR, 'data', 'deploy-pending.txt'), 'utf8').trim().slice(0, 160); } catch { return ''; } };
 
 async function main() {
   const state = loadState();
@@ -235,6 +237,7 @@ async function main() {
     `- Up ${upMin} min · ${memMb} MB memory · ${restartsSince} restart(s) since last report`,
     `- Code: \`${sha}\``,
     `- Last deploy: ${deploy || 'n/a'}`,
+    ...(pendingDeploy() ? [`- Update waiting (deploy locked while live): ${pendingDeploy()}`] : []),
     '',
     '### Chains',
     ...chains.map((c) => `- ${chainLine(c)}`),

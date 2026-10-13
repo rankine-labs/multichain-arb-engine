@@ -1,5 +1,6 @@
 import { ethers } from 'ethers';
-import { existsSync } from 'fs';
+import { existsSync, mkdirSync, renameSync, writeFileSync } from 'fs';
+import { dirname } from 'path';
 
 // ============================================================================
 // FAST SENDER + SAFETY GATE
@@ -108,6 +109,46 @@ export class SafetyGate {
   }
 }
 
+// IN-FLIGHT MARKER (deploy lock, Oct 13)
+//
+// Plain English:
+//   While live, auto-deploy must not restart the bot in the middle of a real
+//   trade. So the bot keeps a tiny file, data/inflight.json, saying how many
+//   live trades are sent but not finished yet (no receipt / not given up):
+//     {"count":1,"since":"2026-10-16T14:00:00.000Z","sinceMs":1760623200000}
+//   auto-deploy.sh waits for count 0 before restarting. Only switched on for
+//   the real bot (shadowMain calls trackInflight), and only when live, so
+//   tests and practice mode never write it.
+//   Starts at count 0 on every bot start: a crash mid-trade can't leave a
+//   stuck count behind (auto-deploy also ignores a file untouched for 5 min).
+export class InflightMarker {
+  private hashes = new Set<string>();
+  private sinceMs = 0;
+  constructor(readonly file: string, private readonly now: () => number = Date.now) { this.write(); }
+
+  get count() { return this.hashes.size; }
+  add(hash: string) {
+    if (this.hashes.size === 0) this.sinceMs = this.now();
+    this.hashes.add(hash);
+    this.write();
+  }
+  remove(hash: string) {
+    if (!this.hashes.delete(hash)) return;
+    if (this.hashes.size === 0) this.sinceMs = 0;
+    this.write();
+  }
+  // Write to a temp file then rename, so auto-deploy never reads half a file.
+  // Never throws: a disk problem must not stop a trade.
+  private write() {
+    try {
+      mkdirSync(dirname(this.file), { recursive: true });
+      const body = JSON.stringify({ count: this.hashes.size, since: this.sinceMs ? new Date(this.sinceMs).toISOString() : null, sinceMs: this.sinceMs });
+      writeFileSync(this.file + '.tmp', body + '\n');
+      renameSync(this.file + '.tmp', this.file);
+    } catch { /* best effort */ }
+  }
+}
+
 export interface FireResult {
   live: boolean;
   signMs: number;      // time to build + sign
@@ -143,6 +184,13 @@ export class FastSender {
   }
 
   get address() { return this.wallet.address; }
+
+  // Deploy lock: count live trades in flight in this file (see InflightMarker).
+  // Live only; practice mode writes nothing. settled() = receipt arrived or
+  // the trade was given up as dropped.
+  private inflight: InflightMarker | null = null;
+  trackInflight(file: string) { if (this.live) this.inflight = new InflightMarker(file); }
+  settled(hash: string) { this.inflight?.remove(hash); }
 
   // Pre-load nonce and gas, then keep gas fresh in the background.
   async start() {
@@ -292,6 +340,7 @@ export class FastSender {
     try {
       const hash = await this.sendProvider.send('eth_sendRawTransaction', [raw]) as string;
       this.nonce = n + 1;
+      this.inflight?.add(hash);   // marked right AFTER the send so the send itself isn't slowed
       return { live: true, signMs, sendMs: performance.now() - t1, txHash: hash };
     } catch (err) {
       const msg = String((err as Error).message);

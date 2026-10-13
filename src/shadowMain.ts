@@ -920,6 +920,9 @@ const robinhoodSender = new FastSender(
       // Trades go straight to the sequencer (first come, first served).
       new ethers.JsonRpcProvider(robinhoodSendRpc(), 4663, { staticNetwork: true }),
 );
+// Deploy lock: live trades in flight are counted in data/inflight.json so
+// auto-deploy never restarts the bot mid-trade (live only; deploy/auto-deploy.sh).
+robinhoodSender.trackInflight(process.env.INFLIGHT_FILE || 'data/inflight.json');
 const safetyGate = new SafetyGate(safetyConfigFromEnv());
 // AUTO-VET (core/autoVet.ts, Oct 12, owner approved): coins earn a place on the
 // vetted list by passing practice checks (3 completed, 1+ profitable, never a
@@ -1083,7 +1086,7 @@ const liveTracker = new LiveTradeTracker({
       recordLoss: (usd) => safetyGate.recordLoss(usd),
       noteGasUsed: (gas) => robinhoodSender.noteGasUsed(gas),
       notify: (html) => sendTelegramMessage(html),
-      onSettled: (hash) => safetyGate.releasePending(hash),
+      onSettled: (hash) => { safetyGate.releasePending(hash); robinhoodSender.settled(hash); },
       onDropped: () => { void robinhoodSender.resyncNonce(); },
 });
 
