@@ -54,9 +54,9 @@ const env: LoopEnv = {
   // Loop through both base coins: listed once per direction, from WETH (preferred).
   const both = enumerateCycles([v2(1, W, A(60), 1, 1), v2(2, A(60), USDG, 1, 1), v2(3, USDG, W, 1, 1)], [W, USDG], 3, 5);
   assert(both.cycles.length === 2 && both.cycles.every((c) => c.base === W), 'loop through WETH and USDG listed once per direction, starting in WETH');
-  // Cap respected.
+  // Cap respected (shared out between lengths: 3 loops over 3 lengths = 1 each).
   const capped = enumerateCycles(ring(3, 900, 9000).concat(ring(4, 950, 9500)), [W], 3, 5, { maxCycles: 3 });
-  assert(capped.cycles.length === 3 && capped.capped, 'LOOP_MAX_CYCLES cap respected');
+  assert(capped.cycles.length <= 3 && capped.capped && capped.byLen[3] === 1 && capped.byLen[4] === 1, 'LOOP_MAX_CYCLES cap respected, shared between lengths');
   // Same pool set, different start / order -> same poolSet key (used for the rival match).
   assert(both.cycles[0].poolSet === both.cycles[1].poolSet && both.cycles[0].sig !== both.cycles[1].sig, 'two directions: same pool set, different signature');
 }
@@ -206,8 +206,8 @@ function trader(over: Record<string, string>, checks: LoopTrade[], canCheck = ()
     assert(r === undefined && t.finder.cycleCount() === 0 && checks.length === 0 && t.takeHour().updates === 0, 'LOOP_TRADER off: nothing runs');
     assert(!loopConfigFromEnv({}).enabled, 'LOOP_TRADER unset = off');
     assert(LOOP_LIVE_SEND_POSSIBLE === false, 'v1 cannot send loops live');
-    const c = loopConfigFromEnv({ LOOP_MAX_POOLS: '9', MIN_EXEC_NET_USD: '0.25' });
-    assert(c.maxPools === 5 && c.minNetUsd === 0.25 && c.checksPerMin === 6 && c.maxTradeUsd === 2_000 && c.maxCycles === 5_000, 'settings: defaults and limits');
+    const c = loopConfigFromEnv({ LOOP_MAX_POOLS: '9', MIN_EXEC_NET_USD: '0.25' }, () => {});
+    assert(c.maxPools === 8 && c.minNetUsd === 0.25 && c.checksPerMin === 6 && c.maxTradeUsd === 2_000 && c.maxCycles === 5_000, 'settings: defaults and limits');
   }
   {
     // Rival race: their win on the same pools as a loop we found -> "we found it".
@@ -220,7 +220,7 @@ function trader(over: Record<string, string>, checks: LoopTrade[], canCheck = ()
     t.noteRival({ bot: '0xd7572f00', pools: 7, route: [A(1), A(2), A(3), A(4), A(5), A(6)], grossUsd: 1, gasUsd: 0.016, failed: false, t: clock });
     t.noteRival({ bot: '0xother', pools: 3, route: [A(91), A(92), A(93)], grossUsd: 1, gasUsd: 0.016, failed: false, t: clock });
     const h = t.takeHour();
-    assert(h.rival.loops === 3 && h.rival.tooLong === 1 && h.rival.comparable === 2 && h.rival.weFound === 1 && h.rival.leadMsMedian === 1_500, 'rival race: matched our loop 1.5 s before we read their trade');
+    assert(h.rival.loops === 3 && h.rival.longer === 1 && h.rival.unseen === 0 && h.rival.comparable === 2 && h.rival.weFound === 1 && h.rival.leadMsMedian === 1_500, 'rival race: matched our loop 1.5 s before we read their trade');
     const txt = formatLoopHour(h, 5);
     assert(txt.includes('Loop trades: found 1, best $') && txt.includes("contract can't run 0") && txt.includes('we found 1'), 'hourly block text');
   }
@@ -234,7 +234,10 @@ function trader(over: Record<string, string>, checks: LoopTrade[], canCheck = ()
     pools.push(v2(9999, W, USDG, 1_000, 1_000));
     clock += 120_000;
     const f = new LoopFinder({ bases: [W, USDG] }, env);
-    const first = f.update(pools);
+    f.update(pools);
+    await f.idle();               // the list is built in slices in the background
+    const first = f.update(pools); // puts the new list in place
+    while (f.update(pools).waiting) { /* price every loop once */ }
     const times: number[] = [];
     let evald = 0;
     for (let k = 0; k < 30; k++) {
@@ -245,7 +248,7 @@ function trader(over: Record<string, string>, checks: LoopTrade[], canCheck = ()
     }
     times.sort((a, b) => a - b);
     const med = times[15], worst = times[29];
-    console.log(`  benchmark: ${pools.length} pools, ${first.cycles} loops listed in ${first.ms.toFixed(1)} ms; 10 pools moved per update: median ${med.toFixed(2)} ms, slowest ${worst.toFixed(2)} ms, ~${Math.round(evald / 30)} loops re-priced per update`);
+    console.log(`  benchmark: ${pools.length} pools, ${first.cycles} loops listed in ${f.rebuildStats()!.totalMs.toFixed(1)} ms (longest slice ${f.rebuildStats()!.maxSliceMs.toFixed(1)} ms); 10 pools moved per update: median ${med.toFixed(2)} ms, slowest ${worst.toFixed(2)} ms, ~${Math.round(evald / 30)} loops re-priced per update`);
     assert(first.cycles === 5_000, 'benchmark: loop list filled to the 5,000 cap');
     assert(med < 20, `benchmark: typical update under 20 ms (${med.toFixed(2)} ms)`);
   }

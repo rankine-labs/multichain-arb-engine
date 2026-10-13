@@ -1,5 +1,5 @@
 import { PoolState } from './types';
-import { LoopFinder, LoopEnv, LoopResult, LoopCycle } from './loopFinder';
+import { LoopFinder, LoopEnv, LoopResult, LoopCycle, LOOP_MIN_POOLS_LIMIT, LOOP_MAX_POOLS_LIMIT } from './loopFinder';
 import { ExecutorHop, hopFor, kindForPool, v4KeyMatchesId, KIND_V4_HOOKED } from '../execution/executorCalldata';
 import type { SimResult } from '../execution/simulator';
 
@@ -31,13 +31,14 @@ export const LOOP_LIVE_SEND_POSSIBLE = false as const;
 
 export interface LoopTraderConfig {
   enabled: boolean;        // LOOP_TRADER=1
-  maxPools: number;        // LOOP_MAX_POOLS (3-5, default 5)
+  maxPools: number;        // LOOP_MAX_POOLS (3-8, default 5)
   maxCycles: number;       // LOOP_MAX_CYCLES (default 5000)
   maxTradeUsd: number;     // LOOP_MAX_TRADE_USD (default $2,000)
   depthShare: number;      // LOOP_DEPTH_SHARE (default 0.3 of the shallowest pool)
   minNetUsd: number;       // LOOP_MIN_NET_USD, default = the check bar (SIM_MIN_GROSS_USD, else MIN_EXEC_NET_USD, else $0.10)
   checksPerMin: number;    // LOOP_CHECKS_PER_MIN (default 6, 0 = never check)
   maxPoolAgeMs: number;    // LOOP_MAX_POOL_AGE_MS: pools with older prices are left out (default 30 s)
+  longSlack: number;       // LOOP_LONG_SLACK: 6-8 pool loops are listed only if within this share of paying (default 0.02)
 }
 
 const num = (raw: string | undefined, dflt: number, min: number, max: number): number => {
@@ -46,17 +47,40 @@ const num = (raw: string | undefined, dflt: number, min: number, max: number): n
   return Number.isFinite(v) ? Math.min(max, Math.max(min, v)) : dflt;
 };
 
-export function loopConfigFromEnv(env: Record<string, string | undefined> = process.env): LoopTraderConfig {
+// LOOP_MAX_POOLS: longest loop searched. 3 to 8, default 5. A value outside
+// 3-8 is moved to the nearest end (9 -> 8, 2 -> 3); text that isn't a
+// number means the default. Both print a warning so a typo is noticed.
+export function loopMaxPoolsFromEnv(raw: string | undefined, warn: (msg: string) => void = console.warn): number {
+  const dflt = 5;
+  if (raw === undefined || raw.trim() === '') return dflt;
+  const v = Number(raw);
+  if (!Number.isFinite(v)) { warn(`[loop] LOOP_MAX_POOLS=${raw} is not a number, using ${dflt}`); return dflt; }
+  const r = Math.round(v);
+  const c = Math.min(LOOP_MAX_POOLS_LIMIT, Math.max(LOOP_MIN_POOLS_LIMIT, r));
+  if (c !== v) warn(`[loop] LOOP_MAX_POOLS=${raw} is outside ${LOOP_MIN_POOLS_LIMIT}-${LOOP_MAX_POOLS_LIMIT} (whole numbers), using ${c}`);
+  return c;
+}
+
+// Our gas for a loop: the 2-pool trade's gas scaled by the number of pools
+// (a 3-pool loop = 1.5x, an 8-pool loop = 4x). The repo has no measured
+// per-hop gas figure for the contract yet, so this simple scaling is used
+// for every length 3-8.
+export function loopGasUsd(twoPoolGasUsd: number, pools: number): number {
+  return twoPoolGasUsd * (pools / 2);
+}
+
+export function loopConfigFromEnv(env: Record<string, string | undefined> = process.env, warn: (msg: string) => void = console.warn): LoopTraderConfig {
   const bar = num(env.SIM_MIN_GROSS_USD, num(env.MIN_EXEC_NET_USD, 0.10, 0.0001, 1e6), 0.0001, 1e6);
   return {
     enabled: env.LOOP_TRADER === '1' || env.LOOP_TRADER === 'true',
-    maxPools: Math.round(num(env.LOOP_MAX_POOLS, 5, 3, 5)),
+    maxPools: loopMaxPoolsFromEnv(env.LOOP_MAX_POOLS, warn),
     maxCycles: Math.round(num(env.LOOP_MAX_CYCLES, 5_000, 1, 50_000)),
     maxTradeUsd: num(env.LOOP_MAX_TRADE_USD, 2_000, 1, 1e6),
     depthShare: num(env.LOOP_DEPTH_SHARE, 0.3, 0.001, 1),
     minNetUsd: num(env.LOOP_MIN_NET_USD, bar, 0.0001, 1e6),
     checksPerMin: Math.round(num(env.LOOP_CHECKS_PER_MIN, 6, 0, 60)),
     maxPoolAgeMs: num(env.LOOP_MAX_POOL_AGE_MS, 30_000, 1_000, 3_600_000),
+    longSlack: num(env.LOOP_LONG_SLACK, 0.02, 0, 0.2),
   };
 }
 
@@ -110,9 +134,14 @@ export interface LoopHour {
   found: number; bestUsd: number; checked: number; wouldMake: number; wouldMakeUsd: number;
   lost: number; failed: number; cantRun: number; cantRunWhy: [string, number][];
   skippedCap: number;           // couldn't be checked: cap reached / line busy / too old
+  foundByLen: number[];         // paying loops found, by number of pools (index = pools)
   topRoutes: RouteStat[];
   updates: number; medianMs: number | null; slowestMs: number | null; cycles: number; capped: boolean;
-  rival: { loops: number; comparable: number; weFound: number; leadMsMedian: number | null; tooLong: number; topBot: [string, number] | null };
+  cyclesByLen: number[];        // loops in the list, by number of pools
+  rebuild: { totalMs: number; maxSliceMs: number } | null; // last loop list rebuild
+  // longer: rival loop wins with more pools than our LOOP_MAX_POOLS;
+  // unseen: within our max, but we didn't see every pool of their route.
+  rival: { loops: number; comparable: number; weFound: number; leadMsMedian: number | null; longer: number; unseen: number; topBot: [string, number] | null };
 }
 
 export class LoopTrader {
@@ -128,14 +157,15 @@ export class LoopTrader {
   private hour = this.emptyHour();
 
   constructor(readonly cfg: LoopTraderConfig, private deps: LoopTraderDeps) {
-    this.finder = new LoopFinder({ bases: deps.bases, maxPools: cfg.maxPools, maxCycles: cfg.maxCycles, maxTradeUsd: cfg.maxTradeUsd, depthShare: cfg.depthShare }, deps.env);
+    this.finder = new LoopFinder({ bases: deps.bases, maxPools: cfg.maxPools, maxCycles: cfg.maxCycles, maxTradeUsd: cfg.maxTradeUsd, depthShare: cfg.depthShare, longSlack: cfg.longSlack ?? 0.02 }, deps.env);
   }
 
   private emptyHour() {
     return {
       found: 0, bestUsd: 0, checked: 0, wouldMake: 0, wouldMakeUsd: 0, lost: 0, failed: 0, cantRun: 0,
       cantRunWhy: new Map<string, number>(), skippedCap: 0, routes: new Map<string, RouteStat>(), ms: [] as number[],
-      rival: { loops: 0, comparable: 0, weFound: 0, leads: [] as number[], tooLong: 0, bots: new Map<string, number>() },
+      foundByLen: [] as number[],
+      rival: { loops: 0, comparable: 0, weFound: 0, leads: [] as number[], longer: 0, unseen: 0, bots: new Map<string, number>() },
     };
   }
 
@@ -183,6 +213,8 @@ export class LoopTrader {
   private count(r: LoopResult, now: number) {
     const h = this.hour;
     h.found++;
+    const len = r.cycle.hops.length;
+    h.foundByLen[len] = (h.foundByLen[len] ?? 0) + 1;
     h.bestUsd = Math.max(h.bestUsd, r.netUsd);
     const label = this.label(r.cycle);
     const rs = h.routes.get(label) ?? { label, n: 0, bestUsd: 0 };
@@ -255,7 +287,8 @@ export class LoopTrader {
     rv.bots.set(rec.bot, (rv.bots.get(rec.bot) ?? 0) + 1);
     if (rv.bots.size > 200) rv.bots.clear();
     const route = rec.route ?? [];
-    if (rec.pools > this.cfg.maxPools || route.length !== rec.pools) { rv.tooLong++; return; }
+    if (rec.pools > this.cfg.maxPools) { rv.longer++; return; }      // longer than we search
+    if (route.length !== rec.pools) { rv.unseen++; return; }         // we didn't see their whole route
     rv.comparable++;
     const s = this.seen.get(route.map((p) => p.toLowerCase()).sort().join(','));
     // Found within the 2 minutes before we read their trade.
@@ -273,11 +306,14 @@ export class LoopTrader {
       found: h.found, bestUsd: h.bestUsd, checked: h.checked, wouldMake: h.wouldMake, wouldMakeUsd: h.wouldMakeUsd,
       lost: h.lost, failed: h.failed, cantRun: h.cantRun, cantRunWhy: [...h.cantRunWhy.entries()].sort((a, b) => b[1] - a[1]),
       skippedCap: h.skippedCap,
+      foundByLen: Array.from({ length: LOOP_MAX_POOLS_LIMIT + 1 }, (_, i) => h.foundByLen[i] ?? 0),
       topRoutes: [...h.routes.values()].sort((a, b) => b.bestUsd - a.bestUsd || b.n - a.n).slice(0, 3),
       updates: ms.length, medianMs: ms.length ? ms[Math.floor(ms.length / 2)] : null, slowestMs: ms.length ? ms[ms.length - 1] : null,
       cycles: this.finder.cycleCount(), capped: this.finder.lastCapped,
+      cyclesByLen: Array.from({ length: LOOP_MAX_POOLS_LIMIT + 1 }, (_, i) => this.finder.cyclesByLen()[i] ?? 0),
+      rebuild: (() => { const s = this.finder.rebuildStats(); return s ? { totalMs: s.totalMs, maxSliceMs: s.maxSliceMs } : null; })(),
       rival: { loops: h.rival.loops, comparable: h.rival.comparable, weFound: h.rival.weFound,
-        leadMsMedian: leads.length ? leads[Math.floor(leads.length / 2)] : null, tooLong: h.rival.tooLong, topBot: top },
+        leadMsMedian: leads.length ? leads[Math.floor(leads.length / 2)] : null, longer: h.rival.longer, unseen: h.rival.unseen, topBot: top },
     };
   }
 }
