@@ -114,7 +114,7 @@ export class RobinhoodChainAdapter implements ChainCapability {
                                 stateType: 'SEQUENCED',
                                 blockOrSeq: tx.sequenceNumber ?? seq ?? 'unknown',
                                 receivedAtMs,
-                                raw: { to: tx.to, data: tx.data, value: tx.value, hash: tx.hash, from: tx.from },
+                                raw: withSender({ to: tx.to, data: tx.data, value: tx.value, hash: tx.hash }, tx),
                           };
                           for (const h of this.handlers) h(event);
                     }
@@ -170,4 +170,13 @@ export class RobinhoodChainAdapter implements ChainCapability {
                 method: 'sequencer-direct',
         };
   }
+}
+
+// Copies the feed tx's sender onto the event WITHOUT reading it: `from` stays
+// lazy (see nitroFeed.ts defineLazyFrom), so the signature is only checked if
+// something actually needs the sender (the rival tracker), not for every
+// transaction before the bot can act on any of them.
+function withSender<T extends object>(raw: T, tx: { from: string | null }): T & { from: string | null } {
+  Object.defineProperty(raw, 'from', { enumerable: true, configurable: true, get: () => tx.from });
+  return raw as T & { from: string | null };
 }

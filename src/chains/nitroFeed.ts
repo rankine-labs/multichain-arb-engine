@@ -78,6 +78,27 @@ function parseL2MessageRaw(bytes: Uint8Array, depth = 0): ParsedTx[] {
   return [];
 }
 
+// Sender of a transaction, or null if it can't be recovered (unsigned or a
+// bad signature). Never throws.
+function safeFrom(tx: Transaction): string | null {
+  try { return tx.from; } catch { return null; }
+}
+
+// On by default; FEED_LAZY_SENDER=0 turns it off (read per call so tests can switch it).
+function lazySender(): boolean { return process.env.FEED_LAZY_SENDER !== '0'; }
+
+// Adds a `from` property that recovers the sender the first time it is read
+// and caches the answer. Enumerable, so it still shows up like a normal field.
+export function defineLazyFrom(target: { from?: string | null }, tx: Transaction): void {
+  let done = false;
+  let value: string | null = null;
+  Object.defineProperty(target, 'from', {
+    enumerable: true,
+    configurable: true,
+    get() { if (!done) { value = safeFrom(tx); done = true; } return value; },
+  });
+}
+
 // Parses one websocket frame into the transactions it contains.
 // Returns [] for anything unexpected; never throws.
 export function parseFeedFrame(frame: unknown): FeedTx[] {
@@ -103,10 +124,18 @@ export function parseFeedFrame(frame: unknown): FeedTx[] {
       // sequencer accepts) and throws from inside getters like tx.hash.
       try {
         if (!tx.to || !tx.data || tx.data === '0x') continue; // plain transfers aren't swaps
-        let from: string | null = null;
-        try { from = tx.from; } catch { /* unsigned or bad signature */ }
         // A tx hash is keccak256 of its raw signed bytes: no ethers validation involved.
-        txs.push({ sequenceNumber: seq, hash: keccak256(raw), to: tx.to, data: tx.data, value: tx.value.toString(), from });
+        const out = { sequenceNumber: seq, hash: keccak256(raw), to: tx.to, data: tx.data, value: tx.value.toString() } as FeedTx;
+        // SENDER ("from") IS WORKED OUT ONLY WHEN SOMEONE ASKS FOR IT (Oct 13).
+        // Finding the sender means checking the signature, which takes about
+        // 1-2 ms per transaction in JavaScript. A feed frame often holds 20-40
+        // transactions, and the old code checked every signature BEFORE the bot
+        // could look at any trade: ~39 ms typical wait on the hot path. Only the
+        // rival tracker needs the sender, so it is now computed on first read
+        // (and remembered). FEED_LAZY_SENDER=0 restores the old eager behaviour.
+        if (lazySender()) defineLazyFrom(out, tx);
+        else out.from = safeFrom(tx);
+        txs.push(out);
       } catch { /* malformed: skip this one, keep the rest of the frame */ }
     }
   }
