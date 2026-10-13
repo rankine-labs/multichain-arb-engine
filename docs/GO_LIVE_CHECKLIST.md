@@ -52,8 +52,41 @@ Telegram report from the last few days, Rudy signs off)
 
 - [ ] ArbSys check passed recently: GitHub, Actions, **Live probe**, `only=arbsys`
       says "ArbSys deadline check works". (Claude runs it.)
-- [ ] **No merges to main on Friday** while live is being switched on. Every
-      merge auto-deploys and restarts the live bot.
+- [ ] **Deploy lock is on the server** (the `deploy-lock` change merged and
+      deployed BEFORE live is switched on). Once `EXECUTION_ENABLED=true` is
+      in `.env`, merges to main no longer restart the bot. See
+      [Deploying while live](#deploying-while-live) below.
+
+### Deploying while live
+
+How the lock works (`deploy/auto-deploy.sh`, every 2 minutes):
+- **Practice** (`EXECUTION_ENABLED` not `true`): merges deploy exactly as before.
+- **Live** (`EXECUTION_ENABLED=true`): a merge is NOT deployed and the bot is
+  NOT restarted. The server only notes it: Telegram says `🔒 UPDATE WAITING`
+  once, the status page shows `Update waiting (deploy locked while live):
+  <sha> <title>`, and `deploy/auto-deploy.log` says `update waiting`.
+  Several merges in a row just update the note to the newest one.
+
+To deploy deliberately while live (Rudy, on the server, in the bot folder):
+1. Check the status page or Telegram for the waiting update and decide it's wanted.
+2. Pick ONE:
+   - `touch DEPLOY_ALLOW_LIVE` : the next 2-minute run deploys it, then the
+     file deletes itself (one deploy only).
+   - `bash deploy/auto-deploy.sh --force 2>&1 | tee -a deploy/auto-deploy.log` :
+     deploy right now and watch it (same Linux user that runs pm2).
+3. Before restarting, it waits up to 60 s for any live trade to finish (the bot
+   counts them in `data/inflight.json`). Still busy: no restart, the old code
+   stays, and the next run tries again by itself.
+4. Same checks as always: compile, tests, build, watch startup, Telegram
+   `🚀 DEPLOYED` or `🔴 DEPLOY FAILED` (rolled back). If it fails BEFORE the
+   restart, the live bot is left running untouched.
+
+Notes:
+- A failed deploy uses up the `DEPLOY_ALLOW_LIVE` file. Touch it again after the fix is merged.
+- Turning live off (`EXECUTION_ENABLED=false` + restart) unlocks deploys; the
+  waiting update then deploys on the next run.
+- Restarting by hand (`pm2 restart dex-arb-shadow --update-env`) does NOT load
+  new code. Only auto-deploy pulls and builds it.
 
 ## 3. Go-live steps (in this exact order)
 
@@ -222,7 +255,7 @@ Information only: gas per loop trade measured in the PR #116 fork tests:
 - [ ] Paid node in `.env`, `[sim]` and `[blockreader]` lines look right
 - [ ] Practice numbers signed off
 - [ ] ArbSys probe passed
-- [ ] No merges planned for Friday
+- [ ] Deploy lock merged and deployed (merges wait while live; see "Deploying while live")
 
 **Friday**
 - [ ] 1. Lender list from Live probe (Claude)

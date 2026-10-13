@@ -18,10 +18,26 @@
 #   - Only one copy of this script can run at a time (lock file)
 #   - The server PULLS from GitHub; nothing needs to SSH into the server
 #
+# DEPLOY LOCK (Oct 13): while the bot is LIVE (EXECUTION_ENABLED=true in
+# .env, the bot's own live switch) a new commit is NOT deployed. It is only
+# noted as "update waiting: <sha> <title>" in data/deploy-pending.txt (shown
+# on the status page), logged, and sent to Telegram once. Nothing is pulled,
+# so the server keeps running exactly the code it had.
+#   To deploy while live anyway (the owner, deliberately), ONE of:
+#     touch DEPLOY_ALLOW_LIVE              (in the bot folder; next run deploys,
+#                                           then the file is deleted: one use)
+#     bash deploy/auto-deploy.sh --force   (deploy right now, from the bot folder)
+#     DEPLOY_WHILE_LIVE=1 bash deploy/auto-deploy.sh
+#   Even then, the restart waits until no live trade is in flight (the bot
+#   counts them in data/inflight.json). Still busy after 60 s: the new code
+#   is put back to the old version (no restart) and the next run tries again.
+#   Practice mode (not live): works exactly as before, no lock.
+#
 # Settings (optional, override with environment variables):
 #   APP_DIR   folder of the repo on the server (default: this script's repo)
 #   PM2_NAME  pm2 process to restart        (default: dex-arb-shadow)
 #   BRANCH    branch to deploy               (default: main)
+#   INFLIGHT_WAIT_SECONDS   how long to wait for trades to finish (default 60)
 # ============================================================================
 
 # The whole script is wrapped in { ... } so bash reads ALL of it before
@@ -42,10 +58,79 @@ HEALTH_WAIT_SECONDS=${HEALTH_WAIT_SECONDS:-30}
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
 
+# --force on the command line = owner deploying deliberately while live.
+FORCE=0
+if [ "${1:-}" = "--force" ]; then FORCE=1; fi
+
+# --- Deploy lock helpers ------------------------------------------------------
+# Small functions with no side effects, so the test (src/test/deployLock.test.ts)
+# can run them against fake .env / state files.
+
+# env_file_value FILE KEY  -> prints KEY's value from FILE (last line wins),
+# with quotes, spaces and a trailing "# comment" removed. Empty if missing.
+# Reads only that one line, so wallet keys never enter this script.
+env_file_value() {
+  local file="$1" key="$2"
+  [ -f "$file" ] || return 0
+  grep -E "^[[:space:]]*(export[[:space:]]+)?${key}[[:space:]]*=" "$file" 2>/dev/null | tail -n 1 \
+    | sed -E -e 's/^[^=]*=//' -e 's/[[:space:]]+#.*$//' -e 's/^[[:space:]]+//' -e 's/[[:space:]]+$//' \
+             -e 's/^["'\'']//' -e 's/["'\'']$//'
+}
+
+# deploy_decision APP_DIR FORCE  -> prints one word:
+#   practice  bot is not live: deploy exactly as always
+#   override  bot is live, but the owner allowed this deploy
+#   locked    bot is live: don't deploy, just note the waiting update
+# "Live" = EXECUTION_ENABLED=true in .env (the bot's own live switch; any
+# capitals count, to err on the side of locking).
+deploy_decision() {
+  local dir="$1" force="${2:-0}" live
+  live="$(env_file_value "$dir/.env" EXECUTION_ENABLED)"
+  if [ "${live,,}" != "true" ]; then echo practice; return 0; fi
+  if [ "$force" = 1 ] || [ "${DEPLOY_WHILE_LIVE:-0}" = 1 ] || [ -f "$dir/DEPLOY_ALLOW_LIVE" ]; then
+    echo override; return 0
+  fi
+  echo locked
+}
+
+# inflight_count FILE NOW_SECONDS  -> how many live trades the bot says are
+# in flight (data/inflight.json). 0 when the file is missing, or untouched
+# for INFLIGHT_STALE_SECONDS (a crashed bot can't block deploys forever; a
+# trade gives up after 90 s). A file that can't be read counts as busy.
+inflight_count() {
+  local file="$1" now="$2" mtime n
+  [ -f "$file" ] || { echo 0; return 0; }
+  mtime="$(stat -c %Y "$file" 2>/dev/null || echo 0)"
+  if [ $((now - mtime)) -gt "${INFLIGHT_STALE_SECONDS:-300}" ]; then echo 0; return 0; fi
+  n="$(grep -o '"count"[[:space:]]*:[[:space:]]*[0-9]\+' "$file" 2>/dev/null | grep -o '[0-9]\+$' | head -n 1)"
+  echo "${n:-1}"
+}
+
+# wait_for_no_inflight FILE  -> succeeds as soon as no trade is in flight,
+# fails if trades are still in flight after INFLIGHT_WAIT_SECONDS.
+wait_for_no_inflight() {
+  local file="$1" waited=0 limit="${INFLIGHT_WAIT_SECONDS:-60}"
+  while [ "$(inflight_count "$file" "$(date +%s)")" != 0 ]; do
+    [ "$waited" -ge "$limit" ] && return 1
+    sleep 2; waited=$((waited + 2))
+  done
+  return 0
+}
+
+# The test loads only the helpers above, then stops here.
+if [ "${AUTO_DEPLOY_FUNCTIONS_ONLY:-0}" = 1 ]; then return 0 2>/dev/null || exit 0; fi
+
+PENDING_FILE="$APP_DIR/data/deploy-pending.txt"
+INFLIGHT_FILE="$APP_DIR/data/inflight.json"
+ALLOW_FILE="$APP_DIR/DEPLOY_ALLOW_LIVE"
+LIVE=0        # 1 = deploying while live (owner override)
+RESTARTED=0   # 1 = the new version has been started
+
 # --- Only one deploy at a time ----------------------------------------------
 # If a previous run is still going (slow npm install, etc.), skip this run.
 exec 9>"$LOCK_FILE"
 if ! flock -n 9; then
+  [ "$FORCE" = 1 ] && echo "Another deploy run is in progress. Try again in a few minutes."
   exit 0
 fi
 
@@ -121,7 +206,13 @@ $(html "$1")"
 
 # Remember a commit that failed so we don't retry (and re-alert) every 2 min.
 # A NEW commit on GitHub clears this automatically.
-mark_failed() { echo "$1" > "$FAILED_SHA_FILE"; }
+# Also uses up a live-deploy permission (DEPLOY_ALLOW_LIVE) and clears the
+# "update waiting" note: a failed deploy must not leave the door open for
+# the NEXT commit to restart the live bot without the owner asking again.
+mark_failed() {
+  echo "$1" > "$FAILED_SHA_FILE"
+  rm -f "$ALLOW_FILE" "$PENDING_FILE"
+}
 
 # --- 1. Anything new on GitHub? ---------------------------------------------
 if ! git fetch --quiet origin "$BRANCH" 2>/dev/null; then
@@ -133,15 +224,44 @@ LOCAL_SHA="$(git rev-parse HEAD)"
 REMOTE_SHA="$(git rev-parse "origin/$BRANCH")"
 
 if [ "$LOCAL_SHA" = "$REMOTE_SHA" ]; then
+  rm -f "$PENDING_FILE"   # nothing waiting any more (e.g. deployed by hand)
+  [ "$FORCE" = 1 ] && log "Already up to date ($(git log -1 --format='%h %s')). Nothing to deploy."
   exit 0   # up to date, nothing to do
 fi
 
 if [ -f "$FAILED_SHA_FILE" ] && [ "$(cat "$FAILED_SHA_FILE")" = "$REMOTE_SHA" ]; then
+  [ "$FORCE" = 1 ] && log "Commit ${REMOTE_SHA:0:7} already failed to deploy (see deploy/auto-deploy.log). Push a fix."
   exit 0   # this exact commit already failed; waiting for a fix to be pushed
 fi
 
 SHORT="${REMOTE_SHA:0:7}"
 SUBJECT="$(git log -1 --format=%s "$REMOTE_SHA")"
+
+# --- 1b. Deploy lock: is the bot live? -----------------------------------------
+case "$(deploy_decision "$APP_DIR" "$FORCE")" in
+  locked)
+    # Note the waiting update; log + Telegram only when it's a NEW commit,
+    # not every 2 minutes. Nothing is pulled; the bot is not touched.
+    WAITING="$SHORT $SUBJECT"
+    if [ "$(cat "$PENDING_FILE" 2>/dev/null || true)" != "$WAITING" ]; then
+      mkdir -p "$(dirname "$PENDING_FILE")" && printf '%s\n' "$WAITING" > "$PENDING_FILE"
+      notify "🔒 <b>UPDATE WAITING</b> <code>${SHORT}</code>
+$(html "$SUBJECT")
+Bot is LIVE, so it was not deployed or restarted (update waiting: ${SHORT}).
+To deploy it: <code>touch DEPLOY_ALLOW_LIVE</code> in the bot folder, or <code>bash deploy/auto-deploy.sh --force</code>"
+    fi
+    exit 0
+    ;;
+  override)
+    LIVE=1
+    WHY="DEPLOY_ALLOW_LIVE file"
+    [ "${DEPLOY_WHILE_LIVE:-0}" = 1 ] && WHY="DEPLOY_WHILE_LIVE=1"
+    [ "$FORCE" = 1 ] && WHY="--force"
+    log "Bot is LIVE but the owner allowed this deploy ($WHY)"
+    ;;
+  *) ;;   # practice: deploy exactly as always
+esac
+
 log "New commit found: $SHORT $SUBJECT"
 
 # --- 2. Refuse to overwrite hand edits on the server -------------------------
@@ -201,11 +321,17 @@ rollback() {
   fi
   # Rebuild the old version too: pm2 runs the compiled dist/, not src/.
   if [ -z "$rb_err" ]; then npm run build > /dev/null 2>&1 || rb_err="build of the old version failed (dist/ may be missing)"; fi
-  if [ -z "$rb_err" ]; then pm2 restart "$PM2_NAME" --update-env > /dev/null 2>&1 || rb_err="pm2 restart of the old version failed"; fi
-  if [ -z "$rb_err" ]; then
-    sleep 20
-    read -r RB_STATUS _ <<< "$(pm2_info)"
-    [ "$RB_STATUS" = "online" ] || rb_err="old version not running after rollback (status: $RB_STATUS)"
+  # Live and the new version was never started: the bot is still running the
+  # old version untouched, so DON'T restart it (no needless mid-trade restart).
+  if [ "$LIVE" = 1 ] && [ "$RESTARTED" = 0 ]; then
+    [ -z "$rb_err" ] && log "Live: the bot was never restarted and still runs the old version; leaving it alone"
+  else
+    if [ -z "$rb_err" ]; then pm2 restart "$PM2_NAME" --update-env > /dev/null 2>&1 || rb_err="pm2 restart of the old version failed"; fi
+    if [ -z "$rb_err" ]; then
+      sleep 20
+      read -r RB_STATUS _ <<< "$(pm2_info)"
+      [ "$RB_STATUS" = "online" ] || rb_err="old version not running after rollback (status: $RB_STATUS)"
+    fi
   fi
   if [ -n "$rb_err" ]; then
     notify "🆘 <b>DEPLOY FAILED + ROLLBACK FAILED</b> <code>${SHORT}</code>
@@ -246,7 +372,32 @@ OUT_LOG="$(pm2 jlist 2>/dev/null | node -e '
   });' "$PM2_NAME")"
 LOG_START=$(stat -c %s "$OUT_LOG" 2>/dev/null || echo 0)
 
+# --- 4c. Live: never restart in the middle of a real trade -------------------
+# Wait (up to INFLIGHT_WAIT_SECONDS) until the bot says no live trade is in
+# flight. Still busy: put the old code back WITHOUT restarting (the bot keeps
+# running the old version) and try again on the next run. The commit is not
+# marked failed and DEPLOY_ALLOW_LIVE is kept, so the retry happens by itself.
+if [ "$LIVE" = 1 ] && ! wait_for_no_inflight "$INFLIGHT_FILE"; then
+  log "Live trade still in flight after ${INFLIGHT_WAIT_SECONDS:-60}s; not restarting. Putting the old code back; will retry next run."
+  undo_err=""
+  git reset --hard --quiet "$PREV_SHA" || undo_err="git reset failed"
+  if [ -z "$undo_err" ] && [ "$PKG_CHANGED" = 1 ]; then
+    npm install --no-audit --no-fund > /dev/null 2>&1 || undo_err="npm install of the old version failed"
+  fi
+  if [ -z "$undo_err" ]; then npm run build > /dev/null 2>&1 || undo_err="build of the old version failed (dist/ may be missing)"; fi
+  if [ -n "$undo_err" ]; then
+    notify "🆘 <b>DEPLOY SKIPPED, CLEANUP FAILED</b> <code>${SHORT}</code>
+$(html "$SUBJECT")
+A live trade was in flight so the bot was NOT restarted (still running the old version), but putting the old code back failed: $(html "$undo_err").
+Needs a manual look before the bot restarts for any reason."
+  fi
+  exit 0
+fi
+
 pm2 restart "$PM2_NAME" --update-env > /dev/null 2>&1 || rollback "pm2 restart failed"
+RESTARTED=1
+# The live-deploy permission is used up the moment the restart happens.
+[ "$LIVE" = 1 ] && rm -f "$ALLOW_FILE"
 sleep 5
 read -r STATUS_A RESTARTS_A <<< "$(pm2_info)"
 
@@ -274,7 +425,7 @@ read -r STATUS_C RESTARTS_C <<< "$(pm2_info)"
 [ "$STATUS_C" = "online" ] || rollback "bot stopped right after startup (status: $STATUS_C)"
 [ "$RESTARTS_C" = "$RESTARTS_A" ] || rollback "bot crashed and restarted $((RESTARTS_C - RESTARTS_A))x right after startup"
 
-rm -f "$FAILED_SHA_FILE"
+rm -f "$FAILED_SHA_FILE" "$PENDING_FILE"
 if [ "$STARTED" = 1 ]; then
   notify "🚀 <b>DEPLOYED</b> <code>${SHORT}</code>
 $(html "$SUBJECT")
