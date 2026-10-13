@@ -1053,13 +1053,13 @@ setInterval(async () => {
       } catch { /* node busy: next time */ }
 }, Number(process.env.RIVAL_SAMPLE_MS ?? 15_000));
 // New rival bots caught by the tracker join the watch list (checked every minute).
+// Uses the tracker's ticket counter, so the hourly reset and the 2,000 cap
+// can't make it skip new bots (before Oct 13 the hourly reset did).
 let rivalResultsSeen = 0;
 setInterval(() => {
-      // Positions count results dropped by the tracker's 2,000 cap too.
-      for (rivalResultsSeen = Math.max(rivalResultsSeen, rivals.dropped); rivalResultsSeen < rivals.dropped + rivals.results.length; rivalResultsSeen++) {
-            const r = rivals.results[rivalResultsSeen - rivals.dropped];
-            if (r.found && r.bot) rivalWatch.addBot(r.bot, 'tracker');
-      }
+      const { items, next } = rivals.resultsSince(rivalResultsSeen);
+      rivalResultsSeen = next;
+      for (const r of items) if (r.found && r.bot) rivalWatch.addBot(r.bot, 'tracker');
 }, 60_000);
 setInterval(() => rivalWatch.save(RIVAL_BOTS_FILE, RIVAL_TRADES_FILE), 10 * 60_000);
 // RACE CHECK (core/raceCheck.ts): for every confirmed practice win, watch the

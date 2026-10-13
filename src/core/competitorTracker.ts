@@ -57,6 +57,12 @@ export class CompetitorTracker {
   // since the last reset. Lets a reader that walks `results` by position
   // (shadowMain's "new rival bots" check) keep its place.
   dropped = 0;
+  // Ticket counter: how many results have EVER been added. Never goes back
+  // to zero, not on reset() and not when the cap trims old results. Each
+  // result's ticket number is its place in this count (first = 1). Readers
+  // remember the last ticket they saw and ask for "everything after it"
+  // with resultsSince(), so a reset or a trim can't make them skip or repeat.
+  private total = 0;
 
   constructor(
     private readonly provider: ethers.JsonRpcProvider,
@@ -94,6 +100,7 @@ export class CompetitorTracker {
           const r = await this.check(job);
           if (r) {
             this.results.push(r);
+            this.total++;
             if (this.results.length > MAX_RESULTS) {
               const extra = this.results.length - MAX_RESULTS;
               this.results.splice(0, extra);
@@ -187,5 +194,15 @@ export class CompetitorTracker {
     };
   }
 
+  // Results added after ticket `seen`, plus the ticket to remember for next
+  // time. Start with seen = 0. Results already gone (reset, or trimmed by
+  // the cap before you asked) can't be returned, but nothing still kept is
+  // skipped and nothing is handed out twice.
+  resultsSince(seen: number): { items: RivalResult[]; next: number } {
+    const newCount = Math.max(0, this.total - seen);
+    return { items: this.results.slice(Math.max(0, this.results.length - newCount)), next: this.total };
+  }
+
+  // Clears the hour's results. The ticket counter (total) is kept on purpose.
   reset() { this.results = []; this.dropped = 0; }
 }
