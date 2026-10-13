@@ -307,6 +307,8 @@ export interface PlainHourlyInput {
   topDifferences: { pair: string; pct: number; buyAt: string; sellAt: string }[];
   nodeUsage?: { name: string; used: number; daily: number }[]; // today's requests per node vs allowance
   memory?: string; // one memory line (core/memReport.ts); absent when MEM_LOG=0
+  // Stage timers (core/stageTimer.ts): where fire-ready time goes, median and p95 lines.
+  speed?: { median: string; p95: string };
   // Phase 8 (Oct 8): our own costs and results, in plain numbers.
   ourGas?: { ownUsd: number | null; flashUsd: number | null }; // our contract's gas per trade, right now
   profitBands?: { hour: number[]; day: number[]; hourUsd: number; dayUsd: number }; // profitable checks by $ size
@@ -457,6 +459,7 @@ export function formatPlainHourly(r: PlainHourlyInput): string {
     const o = r.otherBots;
     L.push(`Other bots timed: ${o.timed}${o.theirMs !== null && o.oursMs !== null ? `. Them ${secs(o.theirMs)}, us ${secs(o.oursMs)}` : ''}${o.weBeat ? `, we'd have been first ${o.weBeat}x` : ''}`);
   }
+  if (r.speed) { L.push(esc(r.speed.median)); L.push(esc(r.speed.p95.replace('Where the time goes (p95)', 'Slowest 5%'))); }
   L.push('');
 
   // What the other bots did: where the real money is, and how they make it.

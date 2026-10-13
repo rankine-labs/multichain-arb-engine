@@ -160,9 +160,15 @@ export interface FireResult {
   live: boolean;
   signMs: number;      // time to build + sign
   sendMs?: number;     // time for the send call (live only)
+  queueMs?: number;    // time spent waiting for our turn (previous fire / nonce re-sync)
+  signedAtMs?: number; // wall-clock time the trade was signed (fire-ready = this - trade seen)
+  nonce?: number;      // nonce used (live only)
   txHash?: string;
   error?: string;
 }
+
+// PARALLEL SEND (SPEED_PARALLEL_SEND). Default OFF: see FastSender.fire().
+export const parallelSendFromEnv = (env: Record<string, string | undefined> = process.env) => env.SPEED_PARALLEL_SEND === '1' || env.SPEED_PARALLEL_SEND === 'on';
 
 export class FastSender {
   private wallet: ethers.Wallet | ethers.HDNodeWallet;
@@ -176,13 +182,19 @@ export class FastSender {
   private maxGasSeen = 0n;
   private gasTimer: NodeJS.Timeout | null = null;
   readonly live: boolean;
+  readonly parallel: boolean;
+  private readonly log: (line: string) => void;
 
   constructor(
     private readonly readProvider: ethers.JsonRpcProvider,
     private readonly chainId: number,
     private readonly sendProvider: ethers.JsonRpcProvider = readProvider,
     private readonly gasLimit = BigInt(process.env.FIRE_GAS_LIMIT ?? 1_500_000),
+    // parallel: see fire(). Defaults to SPEED_PARALLEL_SEND (off).
+    opts: { parallel?: boolean; log?: (line: string) => void } = {},
   ) {
+    this.parallel = opts.parallel ?? parallelSendFromEnv();
+    this.log = opts.log ?? ((l) => console.log(l));
     this.gasLimitNow = gasLimit;
     const key = process.env.BOT_PRIVATE_KEY;
     this.live = process.env.EXECUTION_ENABLED === 'true' && process.env.LIVE_SEND_CONFIRM === 'yes-real-money' && !!key;
@@ -203,6 +215,7 @@ export class FastSender {
   async start() {
     await this.refreshGas();
     this.nonce = this.live ? await this.readProvider.getTransactionCount(this.wallet.address, 'pending') : 0;
+    this.maxAccepted = this.nonce - 1; // everything below the chain's count is already used
     this.gasTimer = setInterval(() => { this.refreshGas().catch(() => { /* keep last value */ }); }, 2_000);
     // Keep the connection to the send endpoint warm (TCP + TLS already open
     // when a trade fires, instead of paying a fresh handshake: ~1 round trip
@@ -312,6 +325,7 @@ export class FastSender {
   // re-read the count from the chain so later trades don't queue behind the
   // gap. Runs in the fire queue so it can't race a send.
   resyncNonce(): Promise<void> {
+    if (this.parallel) return this.pauseAndResync('dropped trade', null);
     const run = this.fireChain.then(async () => {
       if (!this.live) return;
       const remote = await this.readProvider.getTransactionCount(this.wallet.address, 'pending').catch(() => null);
@@ -323,16 +337,23 @@ export class FastSender {
 
   // Fires run one at a time (sign ~1 ms + send ~5 ms), so two triggers can
   // never sign with the same nonce. Each fire waits for the previous one.
+  //
+  // SPEED_PARALLEL_SEND=1 (default OFF) changes only this: the next fire no
+  // longer waits for the previous one's eth_sendRawTransaction reply (see
+  // fireParallel below). Off = exactly the old one-at-a-time behaviour.
   private fireChain: Promise<unknown> = Promise.resolve();
   fire(to: string, data: string): Promise<FireResult> {
-    const run = this.fireChain.then(() => this.fireOne(to, data), () => this.fireOne(to, data));
+    const calledAt = performance.now();
+    if (this.parallel) return this.fireParallel(to, data, calledAt);
+    const run = this.fireChain.then(() => this.fireOne(to, data, calledAt), () => this.fireOne(to, data, calledAt));
     this.fireChain = run.catch(() => undefined);
     return run;
   }
 
-  private async fireOne(to: string, data: string): Promise<FireResult> {
+  private async fireOne(to: string, data: string, calledAt = performance.now()): Promise<FireResult> {
     if (!this.ready) return { live: this.live, signMs: 0, error: 'sender not ready' };
     const t0 = performance.now();
+    const queueMs = t0 - calledAt;
     const n = this.nonce!;
     const tx: ethers.TransactionRequest = {
       type: 2, chainId: this.chainId, nonce: n, to, data, value: 0n,
@@ -340,15 +361,17 @@ export class FastSender {
     };
     const raw = await this.wallet.signTransaction(tx);
     const signMs = performance.now() - t0;
-    if (!this.live) return { live: false, signMs };
+    const signedAtMs = Date.now();
+    if (!this.live) return { live: false, signMs, queueMs, signedAtMs };
 
     // LIVE: one raw send; nonce advanced locally on success.
     const t1 = performance.now();
     try {
       const hash = await this.sendProvider.send('eth_sendRawTransaction', [raw]) as string;
       this.nonce = n + 1;
+      if (n > this.maxAccepted) this.maxAccepted = n;
       this.inflight?.add(hash);   // marked right AFTER the send so the send itself isn't slowed
-      return { live: true, signMs, sendMs: performance.now() - t1, txHash: hash };
+      return { live: true, signMs, sendMs: performance.now() - t1, queueMs, signedAtMs, nonce: n, txHash: hash };
     } catch (err) {
       const msg = String((err as Error).message);
       // Resync, but never go BELOW the nonce we just tried: the read node can
@@ -356,7 +379,119 @@ export class FastSender {
       const remote = await this.readProvider.getTransactionCount(this.wallet.address, 'pending').catch(() => n);
       const floor = /nonce too low|already known/i.test(msg) ? n + 1 : n;
       this.nonce = Math.max(remote, floor);
-      return { live: true, signMs, sendMs: performance.now() - t1, error: msg.slice(0, 200) };
+      return { live: true, signMs, sendMs: performance.now() - t1, queueMs, signedAtMs, nonce: n, error: msg.slice(0, 200) };
     }
   }
+
+  // ---- PARALLEL SEND (SPEED_PARALLEL_SEND=1, default OFF) ------------------
+  //
+  // Plain English:
+  //   One-at-a-time mode makes trade #2 wait until trade #1's send call has
+  //   come back from the sequencer (~5-20 ms). In parallel mode:
+  //     - each fire takes the next nonce INSTANTLY and in strict order (a
+  //       plain counter, taken before anything can interrupt), signs, and
+  //       sends without making the next fire wait for the reply;
+  //     - if ANY send fails, new signing PAUSES. The bot waits for every
+  //       send still on its way, then re-reads the wallet's nonce from the
+  //       chain and picks the next nonce as the highest of:
+  //         * what the chain says (pending count),
+  //         * one past the highest nonce the sequencer ACCEPTED,
+  //         * one past any nonce the sequencer said was already used
+  //           ("nonce too low" / "already known").
+  //       So an accepted nonce is never used twice, and a failed nonce is
+  //       re-used next (as before) unless a later one was accepted. Every
+  //       re-sync is logged, so nothing changes silently.
+  //   Practice mode never sends, so it behaves exactly as before (same
+  //   nonce, signature only).
+  //   Safety gates (kill switch, loss cap, rate limit, allowlist) run in
+  //   shadowMain BEFORE fire() and are untouched.
+  private maxAccepted = -1;                    // highest nonce the sequencer accepted
+  private usedFloor = 0;                       // one past a nonce reported as already used
+  private sending = new Set<Promise<void>>();  // sends on their way (bookkeeping included)
+  private pause: Promise<void> | null = null;  // set while re-syncing: new fires wait
+
+  private async fireParallel(to: string, data: string, calledAt: number): Promise<FireResult> {
+    // Wait out any re-sync in progress (loop: a new one may start meanwhile).
+    while (this.pause) await this.pause;
+    if (!this.ready) return { live: this.live, signMs: 0, error: 'sender not ready' };
+    const t0 = performance.now();
+    const queueMs = t0 - calledAt;
+    // Take the nonce NOW, synchronously, before any await: two fires can
+    // never get the same one, and they get them in call order.
+    const n = this.nonce!;
+    if (this.live) this.nonce = n + 1;
+    // Live: register this nonce as "on its way" from the moment it is taken
+    // (not just once it is sent), so a re-sync always waits for it.
+    let finish: () => void = () => {};
+    const slot = this.live ? new Promise<void>((r) => { finish = r; }) : null;
+    if (slot) this.sending.add(slot);
+    const release = () => { if (slot) { this.sending.delete(slot); finish(); } };
+
+    const tx: ethers.TransactionRequest = {
+      type: 2, chainId: this.chainId, nonce: n, to, data, value: 0n,
+      gasLimit: this.currentGasLimit, maxFeePerGas: this.maxFeePerGas!, maxPriorityFeePerGas: 0n,
+    };
+    let raw: string;
+    try {
+      raw = await this.wallet.signTransaction(tx);
+    } catch (err) {
+      // Signing failed: nonce n was never sent. Re-sync so it isn't skipped.
+      release();
+      if (this.live) await this.pauseAndResync(`signing failed for nonce ${n}`, n);
+      return { live: this.live, signMs: performance.now() - t0, queueMs, error: `sign failed: ${String((err as Error).message).slice(0, 150)}` };
+    }
+    const signMs = performance.now() - t0;
+    const signedAtMs = Date.now();
+    if (!this.live) return { live: false, signMs, queueMs, signedAtMs };
+
+    const t1 = performance.now();
+    let hash: string | null = null;
+    let msg = '';
+    try {
+      hash = await this.sendProvider.send('eth_sendRawTransaction', [raw]) as string;
+      // Outcome recorded BEFORE this nonce stops counting as "on its way".
+      if (n > this.maxAccepted) this.maxAccepted = n;
+      this.inflight?.add(hash);   // marked right AFTER the send so the send itself isn't slowed
+    } catch (err) {
+      msg = String((err as Error)?.message ?? err);
+      // "nonce too low" / "already known": n is used up, never use it again.
+      if (/nonce too low|already known/i.test(msg)) this.usedFloor = Math.max(this.usedFloor, n + 1);
+    } finally {
+      release();
+    }
+    const sendMs = performance.now() - t1;
+    if (hash) return { live: true, signMs, sendMs, queueMs, signedAtMs, nonce: n, txHash: hash };
+    await this.pauseAndResync(`send failed for nonce ${n}`, n);
+    return { live: true, signMs, sendMs, queueMs, signedAtMs, nonce: n, error: (msg || 'send failed').slice(0, 200) };
+  }
+
+  // Pause new signing, wait for every send on its way, then set the next
+  // nonce (see the rules above). Several failures at once share ONE re-sync.
+  // failedNonce null = a dropped trade (never mined): like the one-at-a-time
+  // mode, trust the chain's count.
+  private pauseAndResync(why: string, failedNonce: number | null): Promise<void> {
+    if (!this.live) return Promise.resolve();
+    if (this.pause) return this.pause;
+    this.pause = (async () => {
+      // Wait for every send still on its way (their outcomes are recorded as they land).
+      while (this.sending.size) await Promise.allSettled([...this.sending]);
+      const remote = await this.readProvider.getTransactionCount(this.wallet.address, 'pending').catch(() => null);
+      const before = this.nonce!;
+      let next: number;
+      if (failedNonce === null) {
+        // A sent trade was never mined: its nonce is free again.
+        next = remote ?? before;
+        this.maxAccepted = Math.min(this.maxAccepted, next - 1);
+        this.usedFloor = Math.min(this.usedFloor, next);
+      } else {
+        next = Math.max(remote ?? -1, this.maxAccepted + 1, this.usedFloor);
+      }
+      this.nonce = next;
+      this.log(`[fire] nonce re-sync (${why}): next nonce ${next} (was ${before}; chain says ${remote ?? 'unreadable'}, highest accepted ${this.maxAccepted})`);
+    })().finally(() => { this.pause = null; });
+    return this.pause;
+  }
+
+  // For tests / status: is a nonce re-sync running right now?
+  get resyncing(): boolean { return this.pause !== null; }
 }

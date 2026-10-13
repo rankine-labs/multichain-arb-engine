@@ -720,6 +720,50 @@ export class PairWatcher {
   // Pool addresses per watched pair (for the standing-gap scanner).
   watchedPairPools(): string[][] { return [...this.pairs.values()].map((p) => p.pools); }
 
+  // Is this token pair on the watch list? (Used to tell "RPC lookup for a
+  // pool we should already have known" apart from a truly new pair.)
+  isWatched(a: string, b: string): boolean { return this.pairs.has(this.key(a, b)); }
+
+  // PRELOAD (SPEED_PRELOAD, see shadowMain): make sure every pool on the
+  // watch list has a usable state in the cache, so a feed trade on a known
+  // pool never has to look the pool up over RPC while the trade waits.
+  //   - pools missing from the cache: their pair is queued for the normal
+  //     bundled lookup (same as a pinned-pair retry), off the hot path
+  //   - pools restored from the last run but never re-read (lastUpdatedMs 0)
+  //     or older than staleMs: re-read now in ONE bundled request (the same
+  //     multicall the 5 s re-sync uses) instead of waiting for the next tick
+  // Never throws. Returns what it did (for the log line and tests).
+  async preload(staleMs = 30_000): Promise<{ pools: number; missingPairs: number; refreshed: number }> {
+    let pools = 0, missingPairs = 0, refreshed = 0;
+    try {
+      const now = Date.now();
+      const stale: PoolState[] = [];
+      for (const [k, p] of this.pairs) {
+        let missing = false;
+        for (const a of p.pools) {
+          pools++;
+          const st = this.cache.get(this.chain, a);
+          if (!st) missing = true;
+          else if (!(st.lastUpdatedMs > 0) || now - st.lastUpdatedMs > staleMs) stale.push(st);
+        }
+        if (missing && !this.inFlight.has(k) && this.queue.length < this.maxQueue) {
+          missingPairs++;
+          this.inFlight.add(k);
+          this.queue.push({ a: p.tokenA, b: p.tokenB });
+        }
+      }
+      if (missingPairs) void this.drain();
+      if (stale.length) {
+        this.callMany ??= (await makeCaller(this.provider)).callMany;
+        const readStartedMs = Date.now();
+        for (const fresh of await refreshPoolsBatch(this.callMany, stale, { hookedFeeOf: this.hookedFeeOf })) {
+          if (this.cache.upsertIfNotNewer(fresh, readStartedMs)) refreshed++;
+        }
+      }
+    } catch { /* node busy: the normal 5 s re-sync still runs */ }
+    return { pools, missingPairs, refreshed };
+  }
+
   stats() {
     let pools = 0;
     for (const p of this.pairs.values()) pools += p.pools.length;
