@@ -210,7 +210,7 @@ export interface ScanPoolRef { pool: string; token0: string; token1: string }
 export interface ScanPickInput {
   bases: string[];
   loopMaxPools: number;
-  scanPools: ScanPoolRef[];
+  scanPools: Iterable<ScanPoolRef>;  // looped over twice (a list, or the scan state's live view)
   graphPools: PoolState[];          // deep pools we already price (watched + deep cached)
   knownPairs: Set<string>;          // pairs that already have a pool in the cache / watch list
   skip: (pool: string) => boolean;  // looked at recently (no money, or already looked up)
@@ -326,7 +326,7 @@ export interface LoopExtraDeps {
   getPool: (pool: string) => PoolState | undefined;    // cache lookup
   cachePools: () => PoolState[];                       // every cached pool on this chain
   watchedPools: () => string[][];                      // pair watcher's pools per watched pair
-  scanPools: () => ScanPoolRef[];                      // chain-wide scan's pool list ([] = none yet)
+  scanPools: () => Iterable<ScanPoolRef>;              // chain-wide scan's pool list ([] = none yet)
   depthUsd: (p: PoolState) => number | null;
   usdOf: (token: string) => number | null;
   decimalsOf: (token: string) => number | undefined;
@@ -409,7 +409,8 @@ export class LoopExtraPools {
       // A) New single pools from the chain-wide scan (cheap balance read, then exact lookup).
       let balanceChecks = 0, lookups = 0, lookupErrors = 0;
       const scan = this.cfg.lookupsPerRound > 0 ? this.deps.scanPools() : [];
-      if (scan.length) {
+      // Any pools at all? (works for a list or a live view of the scan state)
+      if (!scan[Symbol.iterator]().next().done) {
         const cached = this.deps.cachePools();
         const knownPairs = new Set<string>();
         for (const p of watched) knownPairs.add(pairKey(p.tokenA, p.tokenB));

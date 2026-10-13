@@ -30,33 +30,68 @@ competitorTxHash?: string;
 notes?: string;
 }
 
+// What the log actually keeps per opportunity (Oct 13 memory trim).
+// The reports only ever read these few fields, so the full opportunity
+// (pools, token pair, cost breakdown, trigger event...) is no longer kept.
+// About 0.1 kB per record instead of ~0.7 kB.
+export interface ShadowEntry {
+id: string;                    // opportunity id (for resolve())
+chain: ChainName;
+scoredAtMs: number;            // when it was scored (window stats use this)
+netUsd: number;                // conservativeNetProfitUsd
+outcome: ShadowOutcome;
+ourHypotheticalReactionMs?: number;
+competitorLandedAtMs?: number;
+competitorTxHash?: string;
+notes?: string;
+}
+
 export class ShadowLogger {
-private records: ShadowRecord[] = [];
-// Memory: records are kept ~26 h (enough for the hourly and daily reports)
-// and capped in number, and the raw trigger transaction is dropped (it was
-// the bulk of each record). Before this, every record lived forever and
-// memory crept up ~10 MB an hour.
+// Oldest first. Each entry is small (see ShadowEntry).
+private records: ShadowEntry[] = [];
+// id -> entry, so resolve() is instant instead of searching every record.
+private byId = new Map<string, ShadowEntry>();
+// Memory: records are kept ~26 h (enough for the hourly and daily reports;
+// the daily report needs the full last 24 h, so 26 h leaves a margin) and
+// capped in number. Since Oct 13 each record keeps only the handful of
+// numbers the reports read, so even a full log is only a few MB.
 static KEEP_MS = 26 * 3600_000;
 static MAX_RECORDS = 50_000;
 
 record(entry: ShadowRecord, now = Date.now()) {
-const ev = entry.opportunity.triggeringEvent as any;
-if (ev && ev.raw !== undefined) entry.opportunity = { ...entry.opportunity, triggeringEvent: { ...ev, raw: undefined } };
-this.records.push(entry);
+const o = entry.opportunity;
+const e: ShadowEntry = {
+id: o.id, chain: o.chain, scoredAtMs: o.scoredAtMs, netUsd: o.conservativeNetProfitUsd, outcome: entry.outcome,
+ourHypotheticalReactionMs: entry.ourHypotheticalReactionMs,
+competitorLandedAtMs: entry.competitorLandedAtMs,
+competitorTxHash: entry.competitorTxHash,
+notes: entry.notes,
+};
+this.records.push(e);
+// Same rule as the old linear search: the FIRST record with an id wins.
+if (!this.byId.has(e.id)) this.byId.set(e.id, e);
 // Prune occasionally (cheap): oldest first, by age then by count.
 if (this.records.length % 500 === 0 || this.records.length > ShadowLogger.MAX_RECORDS) {
 const cutoff = now - ShadowLogger.KEEP_MS;
 let drop = 0;
-while (drop < this.records.length && this.records[drop].opportunity.scoredAtMs < cutoff) drop++;
+while (drop < this.records.length && this.records[drop].scoredAtMs < cutoff) drop++;
 drop = Math.max(drop, this.records.length - ShadowLogger.MAX_RECORDS);
-if (drop > 0) this.records.splice(0, drop);
+if (drop > 0) {
+// Forget the dropped ones in the id index too (only if the index
+// points at that exact record).
+for (let i = 0; i < drop; i++) {
+const r = this.records[i];
+if (this.byId.get(r.id) === r) this.byId.delete(r.id);
+}
+this.records.splice(0, drop);
+}
 }
 }
 get size() { return this.records.length; }
 
 // Call this after checking the actual chain state post-opportunity
 resolve(opportunityId: string, outcome: ShadowOutcome, competitorLandedAtMs?: number, competitorTxHash?: string) {
-const rec = this.records.find(r => r.opportunity.id === opportunityId);
+const rec = this.byId.get(opportunityId);
 if (!rec) return;
 rec.outcome = outcome;
 if (competitorLandedAtMs !== undefined) rec.competitorLandedAtMs = competitorLandedAtMs;
@@ -70,7 +105,7 @@ if (competitorTxHash) rec.competitorTxHash = competitorTxHash;
 // answer "what happened THIS hour"; this can.
 windowStats(sinceMs: number, untilMs: number = Date.now()) {
 const scoped = this.records.filter(r => {
-const t = r.opportunity.scoredAtMs;
+const t = r.scoredAtMs;
 return t >= sinceMs && t < untilMs;
 });
 const won = scoped.filter(r => r.outcome === 'WOULD_HAVE_WON');
@@ -81,7 +116,7 @@ const reactionTimes = scoped
 .filter((t): t is number => t !== undefined)
 .sort((a, b) => a - b);
 
-const nets = (rs: typeof scoped) => rs.map(r => r.opportunity.conservativeNetProfitUsd);
+const nets = (rs: typeof scoped) => rs.map(r => r.netUsd);
 return {
 seen: scoped.length,
 won: won.length,
@@ -98,7 +133,7 @@ largestLostUsd: lost.length ? Math.max(...nets(lost)) : null,
 }
 
 summary(chain?: ChainName) {
-const scoped = chain ? this.records.filter(r => r.opportunity.chain === chain) : this.records;
+const scoped = chain ? this.records.filter(r => r.chain === chain) : this.records;
 
 const seen = scoped.length;
 const wouldHaveWon = scoped.filter(r => r.outcome === 'WOULD_HAVE_WON').length;
@@ -122,7 +157,7 @@ const p95Reaction = reactionTimes.length
 
 const totalConservativeNetIfWon = scoped
 .filter(r => r.outcome === 'WOULD_HAVE_WON')
-.reduce((sum, r) => sum + r.opportunity.conservativeNetProfitUsd, 0);
+.reduce((sum, r) => sum + r.netUsd, 0);
 
 return {
 chain: chain ?? 'ALL',
@@ -144,12 +179,12 @@ hypotheticalNetProfitUsd: totalConservativeNetIfWon.toFixed(2),
 // Every WOULD_HAVE_LOST record is a diagnosis question:
 // were we slow, or did the competitor have better infra?
 diagnoseLosses(chain?: ChainName) {
-const scoped = (chain ? this.records.filter(r => r.opportunity.chain === chain) : this.records)
+const scoped = (chain ? this.records.filter(r => r.chain === chain) : this.records)
 .filter(r => r.outcome === 'WOULD_HAVE_LOST');
 
 return scoped.map(r => ({
-id: r.opportunity.id,
-chain: r.opportunity.chain,
+id: r.id,
+chain: r.chain,
 ourReactionMs: r.ourHypotheticalReactionMs,
 competitorReactionMs: r.competitorLandedAtMs,
 marginMs: (r.competitorLandedAtMs ?? 0) - (r.ourHypotheticalReactionMs ?? 0),

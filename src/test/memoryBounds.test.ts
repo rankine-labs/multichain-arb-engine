@@ -20,7 +20,7 @@ const opp = (t: number, id: string) => ({
 for (let i = 0; i < 499; i++) log.record({ opportunity: opp(now - 30 * 3600_000, `old${i}`), outcome: 'UNRESOLVED' }, now);
 log.record({ opportunity: opp(now, 'new'), outcome: 'UNRESOLVED' }, now); // 500th record triggers a prune
 assert(log.size === 1, `records older than 26 h are dropped (left ${log.size})`);
-assert((log as any).records[0].opportunity.triggeringEvent.raw === undefined, 'raw transaction is not kept');
+assert((log as any).records[0].opportunity === undefined && (log as any).records[0].netUsd === 1, 'raw transaction (and the rest of the full opportunity) is not kept');
 assert(log.windowStats(now - 1000, now + 1).seen === 1, 'window stats still work');
 
 const c = new PoolCache();

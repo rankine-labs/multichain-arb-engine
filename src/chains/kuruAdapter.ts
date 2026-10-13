@@ -1,10 +1,16 @@
-import { ethers as ethersV5 } from 'ethers-v5'; // explicit aliased dependency
+// Type-only imports: they vanish when compiled, so merely loading this file
+// does NOT load the Kuru SDK or ethers v5 (together ~22 MB of memory).
+// The SDK itself is loaded on first use, below (only when Monad is on).
+import type { ethers as ethersV5 } from 'ethers-v5'; // explicit aliased dependency
 // (package.json: "ethers-v5": "npm:ethers@5.7.1") — @kuru-labs/kuru-sdk is
 // built on ethers v5 while the rest of this project uses v6, so this alias
 // keeps the two fully isolated rather than relying on npm's nested
 // node_modules resolution, which would break silently if the SDK's
 // dependency tree ever changes shape.
-import { CostEstimator, MarketParams } from '@kuru-labs/kuru-sdk';
+import type { MarketParams } from '@kuru-labs/kuru-sdk';
+
+// Loads Kuru's cost estimator the first time it is needed (cached by Node after that).
+const loadCostEstimator = async () => (await import('@kuru-labs/kuru-sdk')).CostEstimator;
 
 // ============================================================================
 // KURU ADAPTER (Monad order-book DEX)
@@ -65,6 +71,7 @@ export class KuruAdapter {
     snapshot: KuruOrderBookSnapshot,
     quoteAmount: number,
     ): Promise<any> {
+    const CostEstimator = await loadCostEstimator();
     return CostEstimator.estimateMarketBuy(
       providerV5,
       snapshot.orderbookAddress,
@@ -78,6 +85,7 @@ async estimateRequiredQuoteForBuy(
   snapshot: KuruOrderBookSnapshot,
   baseTokenAmount: number,
   ): Promise<any> {
+  const CostEstimator = await loadCostEstimator();
   return CostEstimator.estimateRequiredQuoteForBuy(
     providerV5,
     snapshot.orderbookAddress,
@@ -93,6 +101,7 @@ async estimateSell(
   snapshot: KuruOrderBookSnapshot,
   size: number,
   ): Promise<any> {
+  const CostEstimator = await loadCostEstimator();
   return CostEstimator.estimateMarketSell(
     providerV5,
     snapshot.orderbookAddress,

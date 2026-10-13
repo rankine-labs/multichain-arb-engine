@@ -42,6 +42,10 @@ const isV4Id = (p: string) => p.length === 66;
 const MAX_QUEUE = 20;
 const CHECK_DELAY_MS = 4_000;   // let the blocks land before looking
 const SEEN_TTL_MS = 3 * 60_000;
+// Results kept between resets (the hourly report resets them). An hour has
+// far fewer checks than this (one check at a time, a few seconds each, only
+// for real chances); the cap only stops runaway growth if resets ever stop.
+export const MAX_RESULTS = 2_000;
 
 export class CompetitorTracker {
   private seen = new Map<string, number>();
@@ -49,6 +53,10 @@ export class CompetitorTracker {
   private queue: Job[] = [];
   private busy = false;
   results: RivalResult[] = [];
+  // How many results were dropped from the front of `results` by the cap
+  // since the last reset. Lets a reader that walks `results` by position
+  // (shadowMain's "new rival bots" check) keep its place.
+  dropped = 0;
 
   constructor(
     private readonly provider: ethers.JsonRpcProvider,
@@ -86,6 +94,11 @@ export class CompetitorTracker {
           const r = await this.check(job);
           if (r) {
             this.results.push(r);
+            if (this.results.length > MAX_RESULTS) {
+              const extra = this.results.length - MAX_RESULTS;
+              this.results.splice(0, extra);
+              this.dropped += extra;
+            }
             console.log(r.found
               ? `[rival] arb found: theirs ${r.theirMs ?? '?'}ms, ours ${r.ourReadyMs ?? '?'}ms, ${r.txGap !== undefined ? `${r.txGap} tx behind trigger` : `${r.blocksLater} block(s) later`}, bot ${r.bot?.slice(0, 10) ?? '?'} ($${Math.round(r.profitUsd)} gap)`
               : `[rival] no rival arb within 8 blocks ($${Math.round(r.profitUsd)} gap)`);
@@ -174,5 +187,5 @@ export class CompetitorTracker {
     };
   }
 
-  reset() { this.results = []; }
+  reset() { this.results = []; this.dropped = 0; }
 }
