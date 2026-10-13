@@ -1,7 +1,9 @@
 import { ethers } from 'ethers';
 import { PoolState, ChainName } from './types';
-import { ethers as ethersV5 } from 'ethers-v5'; // Kuru SDK is built on ethers v5, see kuruAdapter.ts
-import { ParamFetcher, OrderBook } from '@kuru-labs/kuru-sdk';
+// Type-only (removed when compiled): the Kuru SDK and ethers v5 are only
+// loaded inside resolveKuruMarket(), which runs only when Monad is on.
+// Loading them at startup cost ~22 MB of memory for nothing.
+import type { ethers as ethersV5 } from 'ethers-v5'; // Kuru SDK is built on ethers v5, see kuruAdapter.ts
 
 // ============================================================================
 // POOL RESOLVER \u2014 just-in-time pool discovery for v2-style DEXs
@@ -401,6 +403,9 @@ export async function resolveKuruMarket(
     marketAddress: string,
   ): Promise<PoolState | null> {
     try {
+          // Loaded on first use only (Node caches them after that).
+          const { ParamFetcher, OrderBook } = await import('@kuru-labs/kuru-sdk');
+          const { ethers: ethersV5 } = await import('ethers-v5');
           const marketParams = await ParamFetcher.getMarketParams(providerV5, marketAddress);
           const orderBookData = await OrderBook.getL2OrderBook(providerV5, marketAddress, marketParams);
           const { manualOrders } = orderBookData;

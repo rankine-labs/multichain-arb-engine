@@ -109,6 +109,7 @@ export class PoolCache {
       this.pools.delete(k);
       this.skips.delete(k);
       this.feedApplied.delete(k);
+      this.blockApplied.delete(k); // (Oct 13) was missed: one entry per pruned pool stayed forever
       n++;
     }
     return n;
@@ -119,7 +120,10 @@ export class PoolCache {
                                                                                                     return [...this.pools.values()].filter(p => p.chain === chain);
                                                                                                       }
                                                                                                       
-                                                                                                        size(): number {
+                                                                                                        // For tests / memory checks: how many pools have a "block reader wrote here" note.
+  blockAppliedCount(): number { return this.blockApplied.size; }
+
+  size(): number {
                                                                                                             return this.pools.size;
                                                                                                               }
                                                                                                               

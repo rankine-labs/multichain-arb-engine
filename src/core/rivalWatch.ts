@@ -1,5 +1,5 @@
 import { ethers } from 'ethers';
-import { readFileSync, writeFileSync, mkdirSync, renameSync } from 'fs';
+import { readFileSync, mkdirSync, renameSync, openSync, writeSync, closeSync } from 'fs';
 import { dirname } from 'path';
 
 // ============================================================================
@@ -20,7 +20,7 @@ import { dirname } from 'path';
 //   the wallets that run known bots (a new contract sent from the same wallet
 //   is probably the same operator's next bot).
 //
-//   Records are kept 26 h and saved to disk, so the daily report survives
+//   Records are kept 24 h and saved to disk, so the daily report survives
 //   restarts. Light on the node: receipts at most ~1/s, sampler 1 block / 15 s.
 //   Never affects trading.
 //
@@ -55,8 +55,15 @@ export const MIN_PRICE_POOL_USD = 5_000;
 // A bot counts as VERIFIED once we've seen it make this many confirmed,
 // closed-loop wins (ended with more of a coin and less of none).
 export const VERIFIED_BOT_WINS = 3;
-// Records kept in memory (26 h window). Each is ~0.5 kB with route + amounts.
-const MAX_RECS = 30_000;
+// Records kept in memory. Every report looks back at most 24 h (daily
+// report, loop extra pools' rival pools; the hourly report one hour), so
+// 24 h is enough (was 26 h). Each record is ~0.3 kB in memory since the
+// Oct 13 trim (shared address strings, no per-coin amounts).
+export const RIVAL_KEEP_MS = 24 * 3600_000;
+export const MAX_RECS = 30_000;
+// Saving writes this many records per chunk, so the 10-minute save never
+// builds one giant string of the whole file in memory.
+const SAVE_CHUNK = 500;
 
 const TRANSFER = ethers.id('Transfer(address,address,uint256)');
 // WETH wrap/unwrap events. They emit NO Transfer, and the matching native
@@ -499,15 +506,76 @@ export class RivalWatch {
     }
   }
 
+  // ---- Compact storage (Oct 13 memory trim) ----------------------------
+  // The same bot, wallet, pair name and pool addresses appear in thousands
+  // of records. Reading them from receipts (or from the saved file) makes a
+  // fresh copy of the text every time, so one shared copy is kept here and
+  // every record points at it. Routes and "why" lists that repeat are shared
+  // the same way. The per-coin raw amounts (`deltas`) are not kept: no report
+  // reads them (the tx hash is kept, so they can always be looked up again).
+  private shared = new Map<string, string>();
+  private sharedLists = new Map<string, readonly string[]>();
+  private str(x: string): string {
+    const have = this.shared.get(x);
+    if (have !== undefined) return have;
+    this.shared.set(x, x);
+    return x;
+  }
+  private list<T extends string>(xs: T[]): T[] {
+    const k = xs.join(',');
+    const have = this.sharedLists.get(k);
+    if (have) return have as T[];
+    const l = Object.freeze(xs.map((x) => this.str(x))) as unknown as T[];
+    this.sharedLists.set(k, l);
+    return l;
+  }
+  // One record in the compact form kept in memory and on disk. Every record
+  // gets the same fields in the same order (missing ones are left undefined,
+  // which the reports treat exactly like "not there" and the file leaves out).
+  private compact(r: RivalRec): RivalRec {
+    return {
+      t: r.t, bot: this.str(r.bot), pair: this.str(r.pair), pools: r.pools,
+      sizeUsd: r.sizeUsd, grossUsd: r.grossUsd, gasUsd: r.gasUsd,
+      failed: r.failed, flash: r.flash, ours: r.ours,
+      thinPrice: r.thinPrice || undefined,
+      hash: r.hash, block: r.block,
+      from: r.from !== undefined ? this.str(r.from) : undefined,
+      route: r.route ? this.list(r.route) : undefined,
+      conf: r.conf,
+      why: r.why ? this.list(r.why) : undefined,
+      closedLoop: r.closedLoop,
+    };
+  }
+  // After old records are dropped, forget shared text no record uses any
+  // more (otherwise the shared tables would only ever grow).
+  private rebuildShared() {
+    const keep = new Map<string, string>();
+    const keepLists = new Map<string, readonly string[]>();
+    const k = (x: string | undefined) => { if (x !== undefined) keep.set(x, x); };
+    for (const r of this.recs) {
+      k(r.bot); k(r.pair); k(r.from);
+      if (r.route) { keepLists.set(r.route.join(','), r.route); for (const p of r.route) k(p); }
+      if (r.why) keepLists.set(r.why.join(','), r.why);
+    }
+    this.shared = keep;
+    this.sharedLists = keepLists;
+  }
+  // For the [mem] line / tests: how many shared texts are held.
+  sharedCount(): number { return this.shared.size; }
+
   // Optional listener told about every saved trade (the loop trader's race
   // comparison uses it). A listener error never affects the rival watch.
   onRecord?: (rec: RivalRec) => void;
 
   add(rec: RivalRec) {
-    this.recs.push(rec);
+    // The listener gets the full record; memory keeps the compact copy.
+    this.recs.push(this.compact(rec));
     if (this.onRecord) { try { this.onRecord(rec); } catch { /* listener problems are ignored */ } }
-    const cutoff = this.now() - 26 * 3600_000;
-    if (this.recs.length > MAX_RECS || (this.recs.length % 500 === 0 && this.recs[0]?.t < cutoff)) this.recs = this.recs.filter((r) => r.t >= cutoff).slice(-MAX_RECS);
+    const cutoff = this.now() - RIVAL_KEEP_MS;
+    if (this.recs.length > MAX_RECS || (this.recs.length % 500 === 0 && this.recs[0]?.t < cutoff)) {
+      this.recs = this.recs.filter((r) => r.t >= cutoff).slice(-MAX_RECS);
+      this.rebuildShared();
+    }
     // Bot track record (for "verified") and its owner wallet.
     const info = this.bots.get(rec.bot);
     const bucket = bucketOf(rec);
@@ -607,19 +675,39 @@ export class RivalWatch {
       }
     } catch { /* first run */ }
     try {
-      const cutoff = this.now() - 26 * 3600_000;
+      // Reads both the current file and older ones (which also have
+      // `deltas` and were kept 26 h): old extras are simply left out.
+      const cutoff = this.now() - RIVAL_KEEP_MS;
       const rows = JSON.parse(readFileSync(recsFile, 'utf8')) as RivalRec[];
-      this.recs = rows.filter((r) => r.t >= cutoff).slice(-MAX_RECS);
+      if (Array.isArray(rows)) {
+        this.recs = rows.filter((r) => r && r.t >= cutoff).slice(-MAX_RECS).map((r) => this.compact(r));
+        this.rebuildShared();
+      }
     } catch { /* first run */ }
     return { bots: this.bots.size, recs: this.recs.length };
   }
+  // Saves as a plain JSON list (same file format as before, so older
+  // versions of the bot can still read it). Written a chunk of records at a
+  // time to a temporary file, then swapped in, so a crash mid-save never
+  // leaves a half-written file and memory never holds the whole file as text.
   save(botsFile: string, recsFile: string) {
-    const write = (file: string, data: unknown) => {
+    const write = (file: string, rows: unknown[]) => {
+      let fd: number | null = null;
       try {
         mkdirSync(dirname(file), { recursive: true });
-        writeFileSync(file + '.tmp', JSON.stringify(data));
+        fd = openSync(file + '.tmp', 'w');
+        writeSync(fd, '[');
+        for (let i = 0; i < rows.length; i += SAVE_CHUNK) {
+          const part = rows.slice(i, i + SAVE_CHUNK).map((r) => JSON.stringify(r)).join(',');
+          writeSync(fd, (i > 0 ? ',' : '') + part);
+        }
+        writeSync(fd, ']');
+        closeSync(fd); fd = null;
         renameSync(file + '.tmp', file);
-      } catch { /* best effort */ }
+      } catch {
+        /* best effort */
+        if (fd !== null) { try { closeSync(fd); } catch { /* ignore */ } }
+      }
     };
     write(botsFile, [...this.bots.entries()].map(([a, i]) => ({ a, ...i })));
     write(recsFile, this.recs);

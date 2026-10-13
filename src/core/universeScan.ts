@@ -296,6 +296,24 @@ export function stateToPools(state: ScanState): ScannedPool[] {
   return out;
 }
 
+// The same pools as stateToPools(), but only pool + coins, and WITHOUT
+// building a list: each pool is handed out one at a time while the caller
+// loops over it, straight from the saved scan state. Used by the loop
+// trader's extra pools, which used to keep its own copy of the whole list
+// (one small object per pool, 100k+ pools) in memory all the time.
+// Can be looped over any number of times; always reflects the current state.
+export function scanPoolRefs(state: ScanState): Iterable<{ pool: string; token0: string; token1: string }> {
+  return {
+    *[Symbol.iterator]() {
+      const skip = state.factories.map((f) => f.split('|')[1] === 'v4');
+      for (const [fi, pool, i0, i1] of state.pools) {
+        if (skip[fi] || pool.length !== 42) continue;
+        yield { pool, token0: state.tokens[i0], token1: state.tokens[i1] };
+      }
+    },
+  };
+}
+
 export function addPoolsToState(state: ScanState, f: ScanFactory, pools: ScannedPool[]) {
   const fkey = `${f.dex}|${f.kind}|${lc(f.factory)}`;
   let fi = state.factories.indexOf(fkey);

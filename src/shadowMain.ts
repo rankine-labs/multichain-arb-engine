@@ -35,7 +35,7 @@ import { findOptimalTradeSize, calculateAllInProfit, buildOpportunity, calculate
 import { scoreOpportunity, shouldPreArm } from './core/opportunityScorer';
 import { planBackrun } from './core/backrunPlanner';
 import { seedKnownAddresses } from './config/knownAddresses';
-import { ethers as ethersV5 } from 'ethers-v5';
+// ethers v5 (needed only by the Kuru SDK on Monad) is loaded further down, only when Monad is on.
 import { MONAD_KURU, MONAD_ROUTERS, MONAD_TOKENS, MONAD_BEAN, MONAD_LFJ, MONAD_PANCAKE, ROBINHOOD_PANCAKE, ROBINHOOD_V2, ROBINHOOD_V3, ROBINHOOD_V4, ROBINHOOD_TOKENS } from './config/knownAddresses';
 import { sendTelegramMessage } from './core/telegramSender';
 import { resolveAndFetchSolidlyV2Pool } from './core/poolResolver';
@@ -76,7 +76,7 @@ import { AvalancheAdapter } from './chains/avalanche';
 import { RawChainEvent, PoolState, MIN_NET_PROFIT_USD } from './core/types';
 import { priceOf, spreadPct, deepEnough, POOL_MIN_DEPTH_USD } from './core/poolPrice';
 import { PairWatcher, Venue, refreshPoolState, refreshPoolsBatch } from './core/pairWatcher';
-import { scanUniverse, emptyScanState, ScanState, stateToPools, getLogsAdaptive, RawLog } from './core/universeScan';
+import { scanUniverse, emptyScanState, ScanState, stateToPools, scanPoolRefs, getLogsAdaptive, RawLog } from './core/universeScan';
 import { CrossQuoteMonitor, LoopMonitor, shouldScheduleFirstLoopReport } from './core/crossQuoteMonitor';
 import { NewPoolWatch } from './core/newPoolWatch';
 import { buildTokenGroups, loadTokenGroups, groupsStatusLine, TokenGroupsResult } from './core/tokenGroups';
@@ -1055,8 +1055,9 @@ setInterval(async () => {
 // New rival bots caught by the tracker join the watch list (checked every minute).
 let rivalResultsSeen = 0;
 setInterval(() => {
-      for (; rivalResultsSeen < rivals.results.length; rivalResultsSeen++) {
-            const r = rivals.results[rivalResultsSeen];
+      // Positions count results dropped by the tracker's 2,000 cap too.
+      for (rivalResultsSeen = Math.max(rivalResultsSeen, rivals.dropped); rivalResultsSeen < rivals.dropped + rivals.results.length; rivalResultsSeen++) {
+            const r = rivals.results[rivalResultsSeen - rivals.dropped];
             if (r.found && r.bot) rivalWatch.addBot(r.bot, 'tracker');
       }
 }, 60_000);
@@ -1911,6 +1912,9 @@ await chainManager.startAll();
       // so its market is seeded directly from the known address rather than
       // discovered from swap traffic. This is what gives the Uniswap V3 pool
       // a real second venue to compare against for cross-DEX opportunities.
+      if (chainOn('monad')) {
+      // Loaded only when Monad is on (saves ~22 MB otherwise).
+      const { ethers: ethersV5 } = await import('ethers-v5');
       const monadKuruProvider = new ethersV5.providers.JsonRpcProvider('https://rpc.monad.xyz', 143);
       const seedKuruMarket = async () => {
             const resolved = await resolveKuruMarket(monadKuruProvider, 'monad', 'kuru', MONAD_KURU.MARKETS.MON_USDC);
@@ -1920,10 +1924,9 @@ await chainManager.startAll();
               // pair everywhere else, not treated as unrelated.
               if (resolved) cache.upsert({ ...resolved, tokenA: MONAD_TOKENS.WMON });
       };
-      if (chainOn('monad')) {
             await seedKuruMarket();
-            setInterval(seedKuruMarket, 30_000);
-      } // vault liquidity shifts as orders fill — keep it fresh
+            setInterval(seedKuruMarket, 30_000); // vault liquidity shifts as orders fill — keep it fresh
+      }
 
       // Uniswap V4 pools are found by the pair watcher (V4 venue in
       // ROBINHOOD_VENUES) with their full V4 details, so the old one-pair
@@ -2439,22 +2442,15 @@ await chainManager.startAll();
       // and back-run planner never see them.
       if (loopExtraCfg.enabled) {
             const usdRhExtra = (t: string) => priceOracle.getUsdPrice('robinhood', t);
-            let extraScanRefs: { n: number; refs: { pool: string; token0: string; token1: string }[] } | null = null;
             loopExtra = new LoopExtraPools(loopExtraCfg, {
                   bases: [ROBINHOOD_TOKENS.WETH, ROBINHOOD_TOKENS.USDG],
                   getPool: (k) => cache.get('robinhood', k),
                   cachePools: () => cache.allForChain('robinhood'),
                   watchedPools: () => robinhoodWatcher.watchedPairPools(),
-                  // The scan's saved pool list (tokens + pool address only, no prices).
-                  // Rebuilt only when the scan found new pools (the list is 100k+
-                  // pools: no point re-making it every 10 minutes).
-                  scanPools: () => {
-                        const st = scanState ?? loadScanState();
-                        if (!extraScanRefs || extraScanRefs.n !== st.pools.length) {
-                              extraScanRefs = { n: st.pools.length, refs: stateToPools(st).map((p) => ({ pool: p.pool, token0: p.token0, token1: p.token1 })) };
-                        }
-                        return extraScanRefs.refs;
-                  },
+                  // The scan's saved pool list (tokens + pool address only, no prices),
+                  // read straight from the scan state while the picker loops over it.
+                  // Memory: no second copy of the 100k+ pool list is kept any more.
+                  scanPools: () => scanPoolRefs(scanState ?? loadScanState()),
                   depthUsd: (p) => poolDepthUsd(p, decimalsOf, usdRhExtra),
                   usdOf: usdRhExtra,
                   decimalsOf: (t) => TOKEN_DECIMALS.robinhood?.[t.toLowerCase()],
