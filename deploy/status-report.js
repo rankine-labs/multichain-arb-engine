@@ -179,6 +179,9 @@ async function main() {
   const openLine = lastMatch(bigTail, /^\[openwatch\] /);
   const limitsLine = lastMatch(bigTail, /^\[limits\] /);
   const readerLine = lastMatch(bigTail, /^\[blockreader\] /);
+  // Oct 13: pools left out because their real coins are far below what their
+  // price maths assumes (the USDG/NVDA Uniswap 0.01% pool). Every 10 min.
+  const thinLine = lastMatch(bigTail, /^\[thinpools\] /);
   // Measurement-only features (Oct 8): new pool counter, coin groups, loops.
   const newPoolsLine = lastMatch(bigTail, /^\[newpools\] last hour:/);
   const newPoolsFirstMoney = outL.filter((l) => /^\[newpools\] first money in /.test(l));
@@ -248,7 +251,8 @@ async function main() {
     ...(rwTop.length ? [`- Rival profit by pair: ${rwTop.map(([p, v]) => `${p} $${v.toFixed(2)}`).join(' · ')}`] : []),
     ...(scanLine ? [`- Latest scan line: ${scanLine.slice(0, 200)}`] : []),
     ...(readerLine ? [`- Every-block reader: ${readerLine.replace(/^\[blockreader\] /, '').slice(0, 220)}`] : []),
-    ...(limitsLine ? [`- Limits in use: ${limitsLine.replace(/^\[limits\] /, '').slice(0, 260)}`] : []),
+    ...(thinLine ? [`- Thin pools skipped: ${thinLine.replace(/^\[thinpools\] /, '').slice(0, 320)}`] : []),
+    ...(limitsLine ? [`- Limits in use:${limitsLine.replace(/^\[limits\] /, '').slice(0, 260)}`] : []),
     ...(openLine ? [`- Market-open watch: ${openLine.replace(/^\[openwatch\] /, '').slice(0, 220)}`] : []),
     `- New pool counter: ${newPoolsLine ? newPoolsLine.replace(/^\[newpools\] /, '') : 'no hourly line yet'} · this window: ${newPoolsWaiting} new pool(s) for deep coins, ${newPoolsFirstMoney.length} measured, ${newPoolsFails} failed poll(s)`,
     ...newPoolsFirstMoney.slice(-3).map((l) => `  - ${l.replace(/^\[newpools\] /, '').slice(0, 200)}`),

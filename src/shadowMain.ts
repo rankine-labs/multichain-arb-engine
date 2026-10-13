@@ -151,7 +151,7 @@ import { WsBlockReader } from './core/blockReaderWs';
 import { nodeUsage as nodeUsageCounter } from './core/nodeUsage';
 import { ROBINHOOD_SEED_PAIRS } from './config/robinhoodSeedPairs';
 import { ResearchLane, researchConfigFromEnv, planShallowCandidate, findResearchGaps, gapCandidate, ResearchCandidate } from './core/researchLane';
-import { poolDepthUsd } from './core/poolPrice';
+import { poolDepthUsd, setRealBalanceSource, thinPools } from './core/poolPrice';
 // Loop trader v1 (3-5 pool loops, practice only, off unless LOOP_TRADER=1).
 import { LoopTrader, loopConfigFromEnv } from './core/loopTrader';
 import { formatLoopHour } from './core/loopReport';
@@ -2478,10 +2478,20 @@ await chainManager.startAll();
       // never the trading path. First read 2 min after start.
       const v3Balances = new V3BalanceBook();
       priceOracle.useBalances(v3Balances);
+      // Oct 13 (USDG/NVDA): the depth filter and the standing-gap scanner use
+      // the same real balances, so a pool counts only as deep as the coins
+      // really in it (core/poolPrice.ts "REAL BALANCE CAP").
+      setRealBalanceSource((pool, token) => v3Balances.get(pool, token));
       const refreshV3Balances = async () => {
             try {
                   const n = await v3Balances.refresh(scanCallMany, cache.allForChain('robinhood'));
                   console.log(`[oracle] real V3 balances read: ${n}`);
+                  // Status page: pools whose price maths says "deep" but whose
+                  // real coins don't (left out of gaps and checks). Top 3 shown.
+                  const thin = thinPools(cache.allForChain('robinhood'), decimalsOf, (t) => priceOracle.getUsdPrice('robinhood', t));
+                  const k = (x: number) => (x >= 1000 ? `$${Math.round(x / 1000)}k` : `$${Math.round(x)}`);
+                  console.log(`[thinpools] ${thin.length} pool(s) left out (looked deep, real coins under $${Math.round(POOL_MIN_DEPTH_USD / 1000)}k)` +
+                        (thin.length ? `: ${thin.slice(0, 3).map((t) => `${symbolOf('robinhood', t.pool.tokenA)}/${symbolOf('robinhood', t.pool.tokenB)} ${t.pool.dex} ${(t.pool.feePips ?? t.pool.feeBps * 100) / 10_000}% ${k(t.realUsd)} real vs ${k(t.virtualUsd)} assumed`).join(' · ')}` : ''));
             } catch (err) { console.warn('[oracle] V3 balance read failed (kept old values):', (err as Error).message); }
       };
       setTimeout(() => { void refreshV3Balances(); }, 2 * 60_000);

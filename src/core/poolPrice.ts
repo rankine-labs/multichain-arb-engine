@@ -97,13 +97,56 @@ export function poolReserves(p: PoolState, decimalsOf: DecimalsLookup): { a: num
   return null;
 }
 
+// ----------------------------------------------------------------------------
+// REAL BALANCE CAP (Oct 13, the USDG/NVDA problem)
+//
+// Plain English:
+//   A V3 pool's "virtual" depth assumes its liquidity stretches on forever.
+//   When all of it sits in one tiny price band, the pool can look like a
+//   $400,000 pool while holding $83. Overnight on Oct 13 the Uniswap V3 0.01%
+//   USDG/NVDA pool did exactly that: liquidity squeezed into ONE tick, price
+//   stuck at $207 while every other NVDA pool said $225, and only $83 of
+//   USDG plus 0.003 NVDA really inside. The bot saw a "$300 gap" against it,
+//   checked it ~140 times an hour, and every check broke (the pool simply
+//   can't pay out). The coin itself was fine (NVDA moves normally, not paused).
+//
+//   The bot already reads every V3 pool's real coin balances every ~10 min
+//   (core/v3BalanceBook.ts) but only the price oracle used them. Now the
+//   depth filter (poolDepthUsd / deepEnough) and the standing-gap scanner use
+//   them too: a pool counts only as deep as the coins really in it.
+//   V4 pools are not capped (their coins all sit together in one contract).
+//   Before the first balance read (2 min after start), or for a pool found
+//   since the last read, nothing changes (virtual depth, as before).
+// ----------------------------------------------------------------------------
+export type RealBalanceSource = (pool: string, token: string) => bigint | undefined;
+let realBalanceSource: RealBalanceSource | null = null;
+// Called once at startup with the balance book (null switches it off, e.g. in tests).
+export function setRealBalanceSource(fn: RealBalanceSource | null): void { realBalanceSource = fn; }
+
+// Raw balance of `token` held by V3 pool `p`, or undefined when not known
+// (not a V3 pool, a V4 pool, no balance source, or not read yet).
+export function realBalanceOf(p: PoolState, token: string): bigint | undefined {
+  if (p.poolType !== 'v3' || p.v4 || !realBalanceSource) return undefined;
+  if (!/^0x[0-9a-fA-F]{40}$/.test(p.poolAddress)) return undefined;
+  return realBalanceSource(p.poolAddress, token);
+}
+
 // USD depth: 2 x the smaller side when both tokens have a USD price, else
 // 2 x the side we can price. null = can't tell (treated as too shallow).
+// V3 pools: each side is capped at the coins really in the pool, when known.
+// opts.virtualOnly: skip the cap (used to spot the pools the cap removed).
 export function poolDepthUsd(
   p: PoolState, decimalsOf: DecimalsLookup, usdOf: (token: string) => number | null,
+  opts: { virtualOnly?: boolean } = {},
 ): number | null {
-  const r = poolReserves(p, decimalsOf);
-  if (!r) return null;
+  const r0 = poolReserves(p, decimalsOf);
+  if (!r0) return null;
+  const r = { ...r0 };
+  if (!opts.virtualOnly) {
+    const ra = realBalanceOf(p, p.tokenA), rb = realBalanceOf(p, p.tokenB);
+    if (ra !== undefined) r.a = Math.min(r.a, Number(ra) / 10 ** decimalsOf(p.chain, p.tokenA));
+    if (rb !== undefined) r.b = Math.min(r.b, Number(rb) / 10 ** decimalsOf(p.chain, p.tokenB));
+  }
   const ua = usdOf(p.tokenA), ub = usdOf(p.tokenB);
   const aUsd = ua ? r.a * ua : null, bUsd = ub ? r.b * ub : null;
   if (aUsd !== null && bUsd !== null) return 2 * Math.min(aUsd, bUsd);
@@ -124,4 +167,22 @@ export const POOL_MIN_DEPTH_USD = Number(process.env.POOL_MIN_DEPTH_USD ?? 10_00
 export function deepEnough(p: PoolState, decimalsOf: DecimalsLookup, usdOf: (token: string) => number | null, minUsd = POOL_MIN_DEPTH_USD): boolean {
   const d = poolDepthUsd(p, decimalsOf, usdOf);
   return d !== null && d >= minUsd;
+}
+
+// Pools that LOOK deep from their price maths (virtual depth at or above the
+// minimum) but whose real coins are below it: left out by deepEnough since
+// Oct 13. Listed on the status page so a stuck pool is visible. Biggest
+// difference first.
+export function thinPools(
+  pools: PoolState[], decimalsOf: DecimalsLookup, usdOf: (token: string) => number | null, minUsd = POOL_MIN_DEPTH_USD,
+): { pool: PoolState; virtualUsd: number; realUsd: number }[] {
+  const out: { pool: PoolState; virtualUsd: number; realUsd: number }[] = [];
+  for (const p of pools) {
+    if (p.poolType !== 'v3' || p.v4) continue;
+    const virtualUsd = poolDepthUsd(p, decimalsOf, usdOf, { virtualOnly: true });
+    if (virtualUsd === null || virtualUsd < minUsd) continue;
+    const realUsd = poolDepthUsd(p, decimalsOf, usdOf);
+    if (realUsd !== null && realUsd < minUsd) out.push({ pool: p, virtualUsd, realUsd });
+  }
+  return out.sort((x, y) => (y.virtualUsd - y.realUsd) - (x.virtualUsd - x.realUsd));
 }
