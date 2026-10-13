@@ -140,6 +140,72 @@ const MAX_PLAUSIBLE_PROFIT_SHARE = 0.25;
 interface Waiting { r: LoopResult; trade: LoopTrade; at: number }
 interface RouteStat { label: string; n: number; bestUsd: number }
 
+// ----------------------------------------------------------------------------
+// CHECK VS ESTIMATE (Oct 13 diagnosis)
+//
+// Plain English: every loop the finder said would pay lost in its practice
+// check. To see WHY, each practice check is written down with:
+//   - the finder's estimate (profit after gas, USD),
+//   - what the check said (profit after gas in USD, or "lost", or why it
+//     wouldn't go through),
+//   - how many seconds passed between "found" and the check starting,
+//   - the route.
+// A loss that happens within 1 s of being found means the estimate itself
+// was wrong (prices were still the same). A loss after several seconds can
+// also mean someone else took the gap first. The hourly report shows the
+// medians and that quick / slow split.
+//
+// A losing check does not say HOW MUCH it lost (the contract only reports
+// "not more than it started"), so a loss counts as minus our gas in the
+// median result: the best a losing check could have been.
+// ----------------------------------------------------------------------------
+export interface LoopCheckRecord {
+  route: string;
+  estUsd: number;               // finder's estimate after gas
+  outcome: 'profit' | 'loss' | 'fail';
+  resultUsd: number | null;     // after gas; loss = minus gas (best case); fail = null
+  reason?: string;              // why it wouldn't go through
+  delayMs: number;              // found -> check started
+}
+
+export interface LoopCheckSummary {
+  n: number;
+  medianEstUsd: number | null;
+  medianResultUsd: number | null;
+  medianDelayMs: number | null;
+  lossesQuick: number;          // losses checked under 1 s after being found
+  lossesSlow: number;           // losses checked 1 s or more after being found
+  topFail: [string, number] | null; // most common reason a check wouldn't go through
+}
+
+const median = (xs: number[]): number | null => {
+  if (!xs.length) return null;
+  const s = [...xs].sort((a, b) => a - b), m = Math.floor(s.length / 2);
+  return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
+};
+
+// Adds up the hour's check records for the report line.
+export function summarizeLoopChecks(recs: LoopCheckRecord[]): LoopCheckSummary {
+  const fails = new Map<string, number>();
+  let lossesQuick = 0, lossesSlow = 0;
+  for (const r of recs) {
+    if (r.outcome === 'loss') { if (r.delayMs < 1_000) lossesQuick++; else lossesSlow++; }
+    if (r.outcome === 'fail') { const k = (r.reason ?? 'unknown').slice(0, 60); fails.set(k, (fails.get(k) ?? 0) + 1); }
+  }
+  const results = recs.map((r) => r.resultUsd).filter((x): x is number => x !== null);
+  return {
+    n: recs.length,
+    medianEstUsd: median(recs.map((r) => r.estUsd)),
+    medianResultUsd: median(results),
+    medianDelayMs: median(recs.map((r) => r.delayMs)),
+    lossesQuick, lossesSlow,
+    topFail: [...fails.entries()].sort((a, b) => b[1] - a[1])[0] ?? null,
+  };
+}
+
+// Most check records kept per hour (checks are capped at 6 a minute = 360 an hour).
+const MAX_CHECK_RECORDS = 1_000;
+
 export interface LoopHour {
   found: number; bestUsd: number; checked: number; wouldMake: number; wouldMakeUsd: number;
   lost: number; failed: number; cantRun: number; cantRunWhy: [string, number][];
@@ -152,6 +218,7 @@ export interface LoopHour {
   // longer: rival loop wins with more pools than our LOOP_MAX_POOLS;
   // unseen: within our max, but we didn't see every pool of their route.
   rival: { loops: number; comparable: number; weFound: number; leadMsMedian: number | null; longer: number; unseen: number; topBot: [string, number] | null };
+  checkVsEstimate: LoopCheckSummary; // practice check results against the finder's estimates
 }
 
 export class LoopTrader {
@@ -175,6 +242,7 @@ export class LoopTrader {
       found: 0, bestUsd: 0, checked: 0, wouldMake: 0, wouldMakeUsd: 0, lost: 0, failed: 0, cantRun: 0,
       cantRunWhy: new Map<string, number>(), skippedCap: 0, routes: new Map<string, RouteStat>(), ms: [] as number[],
       foundByLen: [] as number[],
+      checks: [] as LoopCheckRecord[],
       rival: { loops: 0, comparable: 0, weFound: 0, leads: [] as number[], longer: 0, unseen: 0, bots: new Map<string, number>() },
     };
   }
@@ -267,6 +335,9 @@ export class LoopTrader {
 
   private async check(w: Waiting) {
     const label = this.label(w.r.cycle);
+    // Seconds between "found" (queued) and the check starting.
+    const delayMs = Math.max(0, this.deps.env.now() - w.at);
+    const after = `found ${(delayMs / 1_000).toFixed(1)} s before the check`;
     let r: SimResult;
     try { r = await this.deps.runCheck(w.trade); }
     catch (e) { this.deps.log?.(`[loop] ${label} practice check error: ${(e as Error).message}`); return; }
@@ -274,15 +345,29 @@ export class LoopTrader {
     if (r.status === 'rate_limited') { this.pausedUntil = this.deps.env.now() + 60_000; return; }
     if (r.status === 'unsupported') { this.deps.log?.(`[loop] ${label} practice check skipped (${r.reason})`); return; }
     h.checked++;
+    const est = w.r.netUsd;
+    const note = (rec: Omit<LoopCheckRecord, 'route' | 'estUsd' | 'delayMs'>) => {
+      if (h.checks.length < MAX_CHECK_RECORDS) h.checks.push({ route: label, estUsd: est, delayMs, ...rec });
+    };
     if (r.status === 'profit') {
       const dec = this.deps.decimalsOf(w.r.cycle.base), usd = this.deps.env.usdOf(w.r.cycle.base);
       const plausible = w.trade.amountIn > 0n && Number(r.profit) / Number(w.trade.amountIn) <= MAX_PLAUSIBLE_PROFIT_SHARE;
-      if (dec === undefined || !usd || !plausible) { h.failed++; this.deps.log?.(`[loop] ${label} practice: implausible or unpriced profit, ignored`); return; }
+      if (dec === undefined || !usd || !plausible) {
+        h.failed++; note({ outcome: 'fail', resultUsd: null, reason: 'implausible or unpriced profit' });
+        this.deps.log?.(`[loop] ${label} practice: implausible or unpriced profit, ignored (estimate $${est.toFixed(2)}, ${after})`);
+        return;
+      }
       const net = (Number(r.profit) / 10 ** dec) * usd - w.r.gasUsd;
-      if (net > 0) { h.wouldMake++; h.wouldMakeUsd += net; } else h.lost++;
-      this.deps.log?.(`[loop] ${label} practice: REAL PROFIT $${net.toFixed(4)} after gas (model $${w.r.netUsd.toFixed(2)}) | practice only, never sent`);
-    } else if (r.status === 'loss') { h.lost++; this.deps.log?.(`[loop] ${label} practice: LOSS (model $${w.r.netUsd.toFixed(2)})`); }
-    else { h.failed++; this.deps.log?.(`[loop] ${label} practice: FAILS (${r.reason})`); }
+      if (net > 0) { h.wouldMake++; h.wouldMakeUsd += net; note({ outcome: 'profit', resultUsd: net }); }
+      else { h.lost++; note({ outcome: 'loss', resultUsd: net }); }
+      this.deps.log?.(`[loop] ${label} practice: REAL PROFIT $${net.toFixed(4)} after gas (estimate $${est.toFixed(2)}, ${after}) | practice only, never sent`);
+    } else if (r.status === 'loss') {
+      h.lost++; note({ outcome: 'loss', resultUsd: -w.r.gasUsd });
+      this.deps.log?.(`[loop] ${label} practice: LOSS (estimate $${est.toFixed(2)}, ${after})`);
+    } else {
+      h.failed++; note({ outcome: 'fail', resultUsd: null, reason: r.reason });
+      this.deps.log?.(`[loop] ${label} practice: FAILS (${r.reason}; estimate $${est.toFixed(2)}, ${after})`);
+    }
     this.drain();
   }
 
@@ -324,6 +409,7 @@ export class LoopTrader {
       rebuild: (() => { const s = this.finder.rebuildStats(); return s ? { totalMs: s.totalMs, maxSliceMs: s.maxSliceMs } : null; })(),
       rival: { loops: h.rival.loops, comparable: h.rival.comparable, weFound: h.rival.weFound,
         leadMsMedian: leads.length ? leads[Math.floor(leads.length / 2)] : null, longer: h.rival.longer, unseen: h.rival.unseen, topBot: top },
+      checkVsEstimate: summarizeLoopChecks(h.checks),
     };
   }
 }
