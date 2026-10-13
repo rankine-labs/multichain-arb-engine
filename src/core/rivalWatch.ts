@@ -569,6 +569,9 @@ export class RivalWatch {
     return added;
   }
 
+  // How many trade records are kept in memory (for the [mem] line, core/memReport.ts).
+  recordCount(): number { return this.recs.length; }
+
   // Summaries for the reports.
   summary(fromMs: number, toMs = this.now()): RivalSummary { return summarize(this.recs.filter((r) => r.t >= fromMs && r.t < toMs), this.verifiedBots()); }
   // When the earliest saved record at/after fromMs is (for "last N hours" labels).
