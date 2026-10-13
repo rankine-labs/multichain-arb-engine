@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       only:
-        description: 'Run one step only: feeds, sim, pairs, watch, universe, backtest, latency, lenders, smoke, seed, routers, v4, arbsys, nodes, multicall, simv1, ramsessim, routes, venues, fablesfee, blockreader, urv4 (blank = all except backtest)'
+        description: 'Run one step only: feeds, sim, pairs, watch, universe, backtest, latency, lenders, smoke, seed, routers, v4, arbsys, nodes, multicall, simv1, ramsessim, routes, venues, fablesfee, blockreader, urv4, nvda (blank = all except backtest)'
         required: false
         default: ''
 
@@ -85,6 +85,23 @@ jobs:
           echo "$out"
           out="${out//'%'/'%25'}"; out="${out//$'\n'/'%0A'}"
           echo "::notice title=Ramses sim probe::${out}"
+      # NVDA (Oct 13): why every USDG/NVDA practice check breaks. Looks at the
+      # token (pause / allowlist functions), whether NVDA can move, the pools
+      # and the bot's own check with a call trace. Read-only.
+      - name: NVDA token and check probe (read-only)
+        if: inputs.only == 'nvda'
+        shell: bash
+        run: |
+          timeout 900 node .scripts-build/scripts/probe-nvda.js > nvda.txt 2>&1 || true
+          cat nvda.txt
+          # One annotation holds only ~4 KB: post the output in parts of 20 lines.
+          split -l 20 nvda.txt nvda-part-
+          n=0
+          for f in nvda-part-*; do
+            n=$((n+1)); out=$(cut -c1-300 "$f")
+            out="${out//'%'/'%25'}"; out="${out//$'\n'/'%0A'}"
+            echo "::notice title=NVDA probe part ${n}::${out}"
+          done
       - name: Probe free simulation on real chains
         if: inputs.only == '' || inputs.only == 'sim'
         shell: bash

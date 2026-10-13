@@ -1,6 +1,7 @@
 import { PoolState } from './types';
 import { bestArb } from './backtest';
 import { feePipsOf } from './dexMath';
+import { realBalanceOf } from './poolPrice';
 
 // A pool's swap fee as a fraction (0.003 = 0.30%), from the exact fee in pips
 // when known (hooked V4 / Fables fee source, Algebra dynamic fee, 250-pip V3
@@ -64,6 +65,25 @@ export function poolReserves(p: PoolState, base: string, dec0: number, dec1: num
   return base.toLowerCase() === p.tokenA.toLowerCase() ? { base: x, quote: y } : { base: y, quote: x };
 }
 
+// REAL BALANCE CAP (Oct 13, see core/poolPrice.ts). A V3 pool's reserves
+// above are "virtual" and can be thousands of times what the pool really
+// holds (the USDG/NVDA Uniswap 0.01% pool: ~$400k virtual, $83 real). The
+// coin a pool PAYS OUT can never exceed its real balance, so both sides are
+// shrunk by the same factor (the price stays the same, only the depth
+// drops) until the paid-out side fits what is really there. Unknown
+// balance (V2, V4, not read yet) = unchanged. Nothing at all = no pool.
+export function capToRealBalance(
+  r: { base: number; quote: number } | null, p: PoolState, outToken: string, outSide: 'base' | 'quote', outDecimals: number,
+): { base: number; quote: number } | null {
+  if (!r) return null;
+  const raw = realBalanceOf(p, outToken);
+  if (raw === undefined) return r;
+  const real = Number(raw) / 10 ** outDecimals;
+  if (!(real > 0)) return null;
+  const k = Math.min(1, real / r[outSide]);
+  return k < 1 ? { base: r.base * k, quote: r.quote * k } : r;
+}
+
 export function findStandingGaps(
   pairs: PoolState[][],
   decimalsOf: (token: string) => number | undefined,
@@ -85,12 +105,14 @@ export function findStandingGaps(
     const found: StandingGap[] = [];
     for (const buy of usable) {
       const dB0 = buy.tokenA.toLowerCase() === t0 ? d0 : d1, dB1 = buy.tokenA.toLowerCase() === t0 ? d1 : d0;
-      const rb = poolReserves(buy, base, dB0, dB1);
+      // Buy pool pays out the base coin: only as much as it really holds.
+      const rb = capToRealBalance(poolReserves(buy, base, dB0, dB1), buy, base, 'base', base.toLowerCase() === buy.tokenA.toLowerCase() ? dB0 : dB1);
       if (!rb) continue;
       for (const sell of usable) {
         if (sell === buy) continue;
         const dS0 = sell.tokenA.toLowerCase() === t0 ? d0 : d1, dS1 = sell.tokenA.toLowerCase() === t0 ? d1 : d0;
-        const rs = poolReserves(sell, base, dS0, dS1);
+        // Sell pool pays out the quote coin: only as much as it really holds.
+        const rs = capToRealBalance(poolReserves(sell, base, dS0, dS1), sell, quote, 'quote', quote === sell.tokenA.toLowerCase() ? dS0 : dS1);
         if (!rs) continue;
         const r = bestArb(rb, feeFraction(buy), rs, feeFraction(sell), opts.flashFee, opts.maxTradeUsd / quoteUsd);
         const profitUsd = r.profit * quoteUsd - opts.gasUsd;
