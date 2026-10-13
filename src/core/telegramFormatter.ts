@@ -319,6 +319,8 @@ export interface PlainHourlyInput {
     tradesRead: number; noPool: number; tooSmall?: number; noPartner: number; noUsdPrice: number; smallerThanFees: number;
     found: number; belowCheckBar: number; checkBarUsd: number; notVetted: number; sentToCheck: number;
     skipped: [string, number][];
+    // Router V4 formats (core/decoderV4Router.ts), only when FEED_DECODE_UR_V4 is on.
+    routerV4?: { read: number; notReadable: number; topReason?: string };
   };
 }
 
@@ -361,6 +363,10 @@ export function formatPlainHourly(r: PlainHourlyInput): string {
     const n = (x: number) => x.toLocaleString('en-US');
     L.push('<b>What happened to trades this hour</b>');
     L.push(`Trades read from the live feed: ${n(f.tradesRead)}`);
+    if (f.routerV4) {
+      L.push(`  Router V4 swaps read: ${n(f.routerV4.read)}`);
+      if (f.routerV4.notReadable) L.push(`  ➖ ${n(f.routerV4.notReadable)} Router V4 swaps not readable${f.routerV4.topReason ? ` (mostly: ${esc(f.routerV4.topReason)})` : ''}`);
+    }
     const out: string[] = [];
     if (f.noPool) out.push(`${n(f.noPool)} trading spot not recognised`);
     if (f.tooSmall) out.push(`${n(f.tooSmall)} trade too small to move the price`);

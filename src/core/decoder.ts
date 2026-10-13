@@ -1,5 +1,6 @@
 import { ethers } from 'ethers';
 import { DecodedSwap, RawChainEvent, ChainName, PoolState } from './types';
+import { urV4DecodeOn, readUrV4Command } from './decoderV4Router';
 
 // ----------------------------------------------------------------------------
 // Swap EVENT signatures (topic0), for chains that give us logs (Monad).
@@ -412,7 +413,13 @@ export class TransactionDecoder {
             const swap = p.length >= 2 ? this.swapOf(chain, entry.v2Via, p[0], p[1], amountIn as bigint, event) : null;
             if (swap) return swap;
           } else if (cmd === UR_V4_SWAP && entry.v4WrappedNative) {
-            const swap = this.decodeV4Swap(chain, inputs[i], entry.v4WrappedNative, event, value);
+            const wrapped = entry.v4WrappedNative;
+            const older = () => this.decodeV4Swap(chain, inputs[i], wrapped, event, value);
+            // Router V4 formats (off unless FEED_DECODE_UR_V4=1): the fuller
+            // reader in decoderV4Router.ts, falling back to the older one.
+            const swap = urV4DecodeOn() && this.poolLookup
+              ? readUrV4Command(inputs[i], { chain, wrappedNative: wrapped, poolLookup: this.poolLookup, event, txValue: value }, older)
+              : older();
             if (swap) return swap;
           }
         } catch { /* malformed input for this command; try the next */ }

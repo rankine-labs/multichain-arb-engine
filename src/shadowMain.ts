@@ -28,6 +28,7 @@ import { PoolCache } from './core/poolCache';
 import { PoolDiscoveryEngine, DiscoveryConfig } from './core/poolDiscovery';
 import { ShadowLogger } from './core/shadowLogger';
 import { TransactionDecoder, DEFAULT_ROUTER_REGISTRY } from './core/decoder';
+import { urV4DecodeOn, takeUrV4Hour } from './core/decoderV4Router';
 import { FastFilter } from './core/fastFilter';
 import { PriceOracle } from './core/priceOracle';
 import { findOptimalTradeSize, calculateAllInProfit, buildOpportunity, calculateLiquidityCeiling } from './core/profitCalculator';
@@ -2770,6 +2771,8 @@ for (let i = 0; i < resolved.length; i++) {
                                     belowCheckBar: funnel.belowCheckBar, checkBarUsd: SIM_CHECK_BAR_USD,
                                     notVetted: funnel.notVetted, sentToCheck: funnel.sentToCheck,
                                     skipped: [...funnel.skip.entries()].sort((a, b) => b[1] - a[1]),
+                                    // Router V4 formats: shown only when FEED_DECODE_UR_V4 is on (takes + resets the hour).
+                                    routerV4: urV4DecodeOn() ? (({ read, notReadable, reasons }) => ({ read, notReadable, topReason: reasons[0]?.[0] }))(takeUrV4Hour()) : undefined,
                               },
                               topDifferences: [...(rh?.spreads ?? [])].sort((a, b) => b.spreadPct - a.spreadPct)
                                     .map((d) => ({ pair: d.pair, pct: d.spreadPct, buyAt: d.buyDex, sellAt: d.sellDex })),

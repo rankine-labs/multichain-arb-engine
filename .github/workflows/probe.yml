@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       only:
-        description: 'Run one step only: feeds, sim, pairs, watch, universe, backtest, latency, lenders, smoke, seed, routers, v4, arbsys, nodes, multicall, simv1, ramsessim, routes, venues, fablesfee, blockreader (blank = all except backtest)'
+        description: 'Run one step only: feeds, sim, pairs, watch, universe, backtest, latency, lenders, smoke, seed, routers, v4, arbsys, nodes, multicall, simv1, ramsessim, routes, venues, fablesfee, blockreader, urv4 (blank = all except backtest)'
         required: false
         default: ''
 
@@ -195,6 +195,16 @@ jobs:
           echo "$out"
           out="${out//'%'/'%25'}"; out="${out//$'\n'/'%0A'}"
           echo "::notice title=V4 pools::${out}"
+      # Router V4 formats: how many real Universal Router V4 swaps (command
+      # 0x10) the new reader can read vs today. Read-only (public node).
+      - name: Router V4 swaps readable (read-only)
+        if: inputs.only == 'urv4'
+        shell: bash
+        run: |
+          out=$(timeout 1200 node .scripts-build/scripts/probe-urv4.js 2>&1 | tail -20 || true)
+          echo "$out"
+          out="${out//'%'/'%25'}"; out="${out//$'\n'/'%0A'}"
+          echo "::notice title=Router V4::${out}"
       - name: ArbSys block number (contract trade deadline)
         if: inputs.only == 'arbsys'
         shell: bash
