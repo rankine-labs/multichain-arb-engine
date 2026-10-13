@@ -642,4 +642,200 @@ contract RobinhoodForkTest is ForkBase {
         }
         _solidlyToV3("robinhood ramsesV2->pancakeV3", v3);
     }
+
+    // ---- LOOPS: 3, 4 and 5 hops on real pools ---------------------------------
+    // The loop trader (src/core/loopTrader.ts) sends routes of 3-5 pools. These
+    // run such routes end to end on live Robinhood pools. A live loop is almost
+    // never profitable at a random block, so the expected result is "every
+    // swap ran, every pool was paid, then the profit check said no"
+    // (InsufficientProfit). Any other revert fails with the raw revert data.
+    // Each run logs "GAS loop ...": gas for the whole loop on real pools
+    // (measured up to the profit check, which is the last step anyway).
+
+    // Coins that pair with both WETH and USDG on Robinhood (seed pairs list,
+    // src/config/robinhoodSeedPairs.ts). PONS first: the bot's loop docs
+    // (docs/LOOP_TRADER.md) show rival loops through it.
+    function _loopCoins() internal pure returns (address[6] memory) {
+        return [
+            0x39dBED3a2bd333467115dE45665cC57F813C4571, // PONS
+            0x020bfC650A365f8BB26819deAAbF3E21291018b4, // CASHCAT
+            0xc6911796042b15d7Fa4F6CDe69e245DdCd3d9c31, // VIRTUAL
+            0x117cc2133c37B721F49dE2A7a74833232B3B4C0C, // SPY
+            0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC, // NVDA
+            0xec262a75e413fAfD0dF80480274532C79D42da09  // MSTR
+        ];
+    }
+
+    // How much of `token` an address holds (0 if the call fails).
+    function _balOf(address token, address who) internal view returns (uint256) {
+        (bool ok, bytes memory ret) = token.staticcall(abi.encodeWithSignature("balanceOf(address)", who));
+        return ok && ret.length >= 32 ? abi.decode(ret, (uint256)) : 0;
+    }
+
+    // A V3 pool from a factory getPool(...) call, if it exists and has liquidity.
+    function _v3At(address factory, bytes memory call) internal view returns (address pool) {
+        (bool ok, bytes memory ret) = factory.staticcall(call);
+        if (!ok || ret.length < 32) return address(0);
+        pool = abi.decode(ret, (address));
+        if (pool == address(0) || pool.code.length == 0) return address(0);
+        (bool okL, bytes memory l) = pool.staticcall(abi.encodeWithSignature("liquidity()"));
+        if (!okL || l.length < 32 || abi.decode(l, (uint128)) == 0) return address(0);
+    }
+
+    // Deepest pool for a/b (most `ref` coin held, at least minRef), over
+    // Uniswap V3, PancakeSwap V3, Ramses V3 and Ramses V2 (volatile).
+    // Returns the pool and its contract kind (2 = V3 style, 1 = Solidly).
+    function _deepestPool(address a, address b, address ref, uint256 minRef, address exclude)
+        internal
+        view
+        returns (address best, uint8 kind)
+    {
+        uint256 bestBal = minRef;
+        uint24[4] memory uniFees = [uint24(100), 500, 3000, 10000];
+        uint24[4] memory cakeFees = [uint24(100), 500, 2500, 10000];
+        int24[6] memory ramSp = [int24(1), 5, 10, 50, 100, 200];
+        for (uint256 i = 0; i < 4; i++) {
+            address p = _v3At(UNI_V3_FACTORY, abi.encodeWithSignature("getPool(address,address,uint24)", a, b, uniFees[i]));
+            uint256 bal = (p == address(0) || p == exclude) ? 0 : _balOf(ref, p);
+            if (bal >= bestBal && bal > 0) { best = p; kind = 2; bestBal = bal; }
+            p = _v3At(PANCAKE_V3_FACTORY, abi.encodeWithSignature("getPool(address,address,uint24)", a, b, cakeFees[i]));
+            bal = (p == address(0) || p == exclude) ? 0 : _balOf(ref, p);
+            if (bal >= bestBal && bal > 0) { best = p; kind = 2; bestBal = bal; }
+        }
+        for (uint256 i = 0; i < 6; i++) {
+            address p = _v3At(RAMSES_V3_FACTORY, abi.encodeWithSignature("getPool(address,address,int24)", a, b, ramSp[i]));
+            uint256 bal = (p == address(0) || p == exclude) ? 0 : _balOf(ref, p);
+            if (bal >= bestBal && bal > 0) { best = p; kind = 2; bestBal = bal; }
+        }
+        (bool ok, bytes memory ret) =
+            RAMSES_V2_FACTORY.staticcall(abi.encodeWithSignature("getPair(address,address,bool)", a, b, false));
+        if (ok && ret.length >= 32) {
+            address p = abi.decode(ret, (address));
+            uint256 bal = (p == address(0) || p == exclude || p.code.length == 0) ? 0 : _balOf(ref, p);
+            if (bal >= bestBal && bal > 0) { best = p; kind = 1; }
+        }
+    }
+
+    // Runs a loop (own money if lender == 0, else a V3 flash loan from it).
+    // Returns 0 = executed with profit, 1 = stopped at the profit check,
+    // 2 = failed before the profit check (revert data logged).
+    function _runLoop(string memory label, ArbExecutor.Trade memory t, address lender) internal returns (uint8) {
+        bytes memory call = lender == address(0)
+            ? abi.encodeWithSelector(ArbExecutor.execute.selector, t, address(0))
+            : abi.encodeWithSelector(ArbExecutor.executeWithV3Flash.selector, t, lender);
+        uint256 g = gasleft();
+        (bool ok, bytes memory data) = address(exec).call(call);
+        uint256 used = g - gasleft();
+        console.log(string.concat("GAS loop ", label, " hops / gas:"), t.hops.length, used);
+        if (ok) {
+            console.log(label, "-> executed with real profit (live arb existed at this block)");
+            return 0;
+        }
+        if (data.length >= 4 && bytes4(data) == ArbExecutor.InsufficientProfit.selector) {
+            console.log(label, "-> all swaps executed, every pool paid; stopped by profit guard (expected)");
+            return 1;
+        }
+        console.log(label, "-> FAILED before the profit check. Revert data:");
+        console.logBytes(data);
+        return 2;
+    }
+
+    // 4 hops on four different exchanges, all WETH/USDG:
+    // WETH -UniV3-> USDG -RamsesV2-> WETH -PancakeV3-> USDG -V4 (native ETH)-> WETH
+    function _loop4Hops(address uni, address cake) internal view returns (ArbExecutor.Hop[] memory hops) {
+        hops = new ArbExecutor.Hop[](4);
+        hops[0] = _hop(2, uni, WETH, USDG, 0);
+        hops[1] = _hop(1, _ramsesV2(), USDG, WETH, 0);
+        hops[2] = _hop(2, cake, WETH, USDG, 0);
+        hops[3] = _v4Hop(USDG, WETH, 500, 10, true);
+    }
+
+    function test_fork_robinhood_loop4_fourVenues_ownMoney() public {
+        if (!_fork("ROBINHOOD_RPC_URL")) return;
+        address uni = _uniV3();
+        address cake = _findV3(PANCAKE_V3_FACTORY, WETH, USDG, _fees(2500, 500, 10000, 100));
+        console.log("loop4 pools: uniV3 / pancakeV3:", uni, cake);
+        if (uni == address(0) || cake == address(0)) { console.log("loop4: skipped: pools not found"); vm.skip(true); return; }
+        vm.prank(FORK_OWNER);
+        exec.setV4(V4_POOL_MANAGER, WETH);
+        _fundWrapped(WETH, 0.01 ether);
+        ArbExecutor.Trade memory t =
+            ArbExecutor.Trade({token: WETH, amountIn: 0.01 ether, minProfit: 1, maxBlock: _l2Block(), hops: _loop4Hops(uni, cake)});
+        assertLt(_runLoop("robinhood loop4 uniV3->ramsesV2->cakeV3->V4", t, address(0)), 2, "4-hop loop must reach the profit check");
+        assertEq(address(exec).balance, 0, "no ETH left in the contract");
+    }
+
+    // Same 4-hop loop, borrowing the WETH from the Uniswap V3 0.01% pool
+    // (not part of the route). A float covers a losing round trip so a clean
+    // run reaches the profit check.
+    function test_fork_robinhood_loop4_fourVenues_v3Flash() public {
+        if (!_fork("ROBINHOOD_RPC_URL")) return;
+        address lender = _findV3(UNI_V3_FACTORY, WETH, USDG, _fees(100, 100, 100, 100));
+        address uni = _findV3Excluding(UNI_V3_FACTORY, WETH, USDG, _fees(500, 3000, 10000, 500), lender);
+        address cake = _findV3(PANCAKE_V3_FACTORY, WETH, USDG, _fees(2500, 500, 10000, 100));
+        console.log("loop4 flash: lender / uniV3 / pancakeV3:", lender, uni, cake);
+        if (lender == address(0) || uni == address(0) || cake == address(0)) {
+            console.log("loop4 flash: skipped: pools not found");
+            vm.skip(true);
+            return;
+        }
+        vm.startPrank(FORK_OWNER);
+        exec.setV4(V4_POOL_MANAGER, WETH);
+        exec.setFlashPool(lender, true);
+        vm.stopPrank();
+        _fundWrapped(WETH, 0.011 ether);
+        ArbExecutor.Trade memory t =
+            ArbExecutor.Trade({token: WETH, amountIn: 0.01 ether, minProfit: 1, maxBlock: _l2Block(), hops: _loop4Hops(uni, cake)});
+        assertLt(_runLoop("robinhood loop4 flash(uni 0.01%) uniV3->ramsesV2->cakeV3->V4", t, lender), 2, "4-hop flash loop must reach the profit check");
+    }
+
+    // 3 coins: WETH -> USDG -> X -> WETH on the deepest live pools, for the
+    // first coin X (list above) that has both pools and runs. Then the same
+    // with two more WETH/USDG hops added (5 hops):
+    // WETH -> USDG -> X -> WETH -PancakeV3-> USDG -V4 native-> WETH.
+    function test_fork_robinhood_loop3_and_loop5_threeCoins() public {
+        if (!_fork("ROBINHOOD_RPC_URL")) return;
+        address uni = _uniV3();
+        if (uni == address(0)) { console.log("loop3: skipped: no Uniswap V3 WETH/USDG pool"); vm.skip(true); return; }
+        vm.prank(FORK_OWNER);
+        exec.setV4(V4_POOL_MANAGER, WETH);
+        _fundWrapped(WETH, 0.01 ether);
+        address[6] memory xs = _loopCoins();
+        uint256 tried;
+        for (uint256 i = 0; i < xs.length; i++) {
+            // Pools must hold at least 500 USDG / 0.2 WETH, so a 0.01 WETH trade is small for them.
+            (address p2, uint8 k2) = _deepestPool(USDG, xs[i], USDG, 500e6, uni);
+            (address p3, uint8 k3) = _deepestPool(xs[i], WETH, WETH, 0.2 ether, uni);
+            if (p2 == address(0) || p3 == address(0)) { console.log("loop3: no deep USDG/X + X/WETH pools for", xs[i]); continue; }
+            tried++;
+            console.log("loop3 coin X:", xs[i]);
+            console.log("loop3 pools USDG/X, X/WETH:", p2, p3);
+            ArbExecutor.Hop[] memory hops = new ArbExecutor.Hop[](3);
+            hops[0] = _hop(2, uni, WETH, USDG, 0);
+            hops[1] = _hop(k2, p2, USDG, xs[i], 0);
+            hops[2] = _hop(k3, p3, xs[i], WETH, 0);
+            ArbExecutor.Trade memory t =
+                ArbExecutor.Trade({token: WETH, amountIn: 0.01 ether, minProfit: 1, maxBlock: _l2Block(), hops: hops});
+            if (_runLoop("robinhood loop3 WETH->USDG->X->WETH", t, address(0)) == 2) continue; // try the next coin
+            _loop5(hops, xs[i]);
+            return;
+        }
+        if (tried == 0) { console.log("loop3: skipped: no coin with deep pools on both sides"); vm.skip(true); return; }
+        console.log("loop3: FAILED: every coin tried failed before the profit check");
+        fail();
+    }
+
+    function _loop5(ArbExecutor.Hop[] memory three, address x) internal {
+        address cake = _findV3(PANCAKE_V3_FACTORY, WETH, USDG, _fees(2500, 500, 10000, 100));
+        if (cake == address(0)) { console.log("loop5: skipped: no PancakeSwap V3 WETH/USDG pool"); return; }
+        ArbExecutor.Hop[] memory hops = new ArbExecutor.Hop[](5);
+        (hops[0], hops[1], hops[2]) = (three[0], three[1], three[2]);
+        hops[3] = _hop(2, cake, WETH, USDG, 0);
+        hops[4] = _v4Hop(USDG, WETH, 500, 10, true);
+        ArbExecutor.Trade memory t =
+            ArbExecutor.Trade({token: WETH, amountIn: 0.01 ether, minProfit: 1, maxBlock: _l2Block(), hops: hops});
+        console.log("loop5 through coin X:", x);
+        assertLt(_runLoop("robinhood loop5 WETH->USDG->X->WETH->USDG->WETH", t, address(0)), 2, "5-hop loop must reach the profit check");
+        assertEq(address(exec).balance, 0, "no ETH left in the contract");
+    }
 }
