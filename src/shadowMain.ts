@@ -1,6 +1,9 @@
 import 'dotenv/config';
 // Scrub API keys / tokens from every log line (must stay the 2nd import).
 import './core/logSanitizer.install';
+// Fill in CHECK_RPC_* from the saved Chainstack/QuickNode links and turn the
+// practice loop trader on, unless .env already sets them (config/envDefaults.ts).
+import './config/envDefaults';
 const BOOT_MS = Date.now(); // for the "[startup] fully running after Ns" log
 
 // One bad trade event must never take the whole bot down. Event handlers are
