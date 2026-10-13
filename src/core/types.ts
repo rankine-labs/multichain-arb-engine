@@ -30,6 +30,11 @@ export interface DecodedSwap {
   // V3 fee tier from the calldata (e.g. 500 = 0.05%), when known. Lets the
   // bot find the exact pool the trade used, not just any tier of the pair.
   feeTier?: number;
+  // "Buy exactly Y" trades (Router V4 formats, core/decoderV4Router.ts): the
+  // trader named the amount OUT; amountIn above is what our price maths says
+  // they pay for it. Unset for normal "sell exactly X" trades.
+  exactOut?: boolean;
+  amountOutWanted?: bigint;
   stateType: StateType;
   detectedAtMs: number;
 }
