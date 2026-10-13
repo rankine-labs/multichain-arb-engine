@@ -3,7 +3,7 @@ import { feePipsOf } from './dexMath';
 import { clAmountOut, v2AmountOut } from './venueMath';
 
 // ============================================================================
-// LOOP FINDER -- finds 3 to 5 pool loops that end with more than they start
+// LOOP FINDER -- finds 3 to 8 pool loops that end with more than they start
 //
 // Plain English:
 //   Today the bot only trades "the same coin pair on two pools" (buy where
@@ -15,18 +15,33 @@ import { clAmountOut, v2AmountOut } from './venueMath';
 //   This file does the maths only. It never trades and never asks the node
 //   anything: it reads the prices the bot already keeps in memory.
 //
-// How it stays fast (target: well under 20 ms per price update):
+// How it stays fast (target: well under 20 ms per price update, even at 8 pools):
 //   1. MAP: all pools become a map of coins (dots) joined by pools (lines).
-//   2. LOOPS LIST: every path of 3-5 pools that starts and ends in a base
-//      coin (WETH or USDG) is listed ONCE, up to LOOP_MAX_CYCLES loops.
-//      Loops through pools that moved recently are kept first. The list is
-//      rebuilt only when the set of pools changes (or once a minute).
-//   3. ON EACH UPDATE only the loops that go through a pool whose price just
-//      changed are re-priced.
-//   4. QUICK CHECK: a chain of x*y=k swaps is itself one simple curve,
+//   2. LOOPS LIST: paths of 3 to LOOP_MAX_POOLS pools that start and end in
+//      a base coin (WETH or USDG) are listed ONCE, up to LOOP_MAX_CYCLES
+//      loops. That total is shared out between the loop lengths, so lots of
+//      long loops can never push the short ones out. Pools rival bots used
+//      in their loops go first, then pools that moved recently, then deep
+//      pools. The list is rebuilt when the set of pools changes, when a pool
+//      price moves a lot, and at least once a minute.
+//   3. LONG LOOPS (6+ pools) would be millions of paths, so they are only
+//      listed when they could come close to paying: before listing, the
+//      finder works out "the best any route of N more pools back to the base
+//      coin could possibly do" (prices with fees, no trade size). A path is
+//      dropped as soon as even that best case can't get within
+//      LOOP_LONG_SLACK (2%) of paying for its gas. This check can only ever
+//      be too hopeful, never too strict, so a loop that pays is never
+//      dropped by it.
+//   4. NO FREEZE: building the list is done in small slices of a few ms,
+//      handing control back to the rest of the bot in between, so a rebuild
+//      never holds the bot up for more than about 10 ms at a time.
+//   5. ON EACH UPDATE only the loops that go through a pool whose price just
+//      changed are re-priced, inside a time budget (anything left over is
+//      priced on the next update).
+//   6. QUICK CHECK: a chain of x*y=k swaps is itself one simple curve,
 //      out = A*x / (1 + C*x). That gives the best size in one line of maths
 //      (no searching), so thousands of loops cost about a millisecond.
-//   5. EXACT CHECK: the few loops that pass the quick check are re-priced
+//   7. EXACT CHECK: the few loops that pass the quick check are re-priced
 //      with the exact integer pool maths already used elsewhere in the bot
 //      (V2 copies: v2AmountOut; V3 / V4 / Algebra in the current price band:
 //      clAmountOut), and the best size is found by a golden-section search.
@@ -44,6 +59,10 @@ import { clAmountOut, v2AmountOut } from './venueMath';
 
 const Q96 = 2 ** 96;
 const lc = (s: string) => s.toLowerCase();
+
+// Longest and shortest loop the finder will ever look for.
+export const LOOP_MIN_POOLS_LIMIT = 3;
+export const LOOP_MAX_POOLS_LIMIT = 8;
 
 // Exchanges whose pools are bins / order books: no exact maths here.
 const NO_EXACT_MATH_DEXES = new Set(['lfj-lb', 'traderjoe-lb', 'bean-exchange', 'ramses-dlmm', 'kuru']);
@@ -82,24 +101,32 @@ export interface LoopEnv {
   gasUsd: (hops: number) => number;                    // our gas for a loop of this many pools
   isTradable: (token: string) => boolean;              // coin on the vetted list
   now: () => number;
+  // Pools (lower-case) that rival bots used in their loop trades lately.
+  // Loops through them are listed first. Optional: none = no preference.
+  rivalPools?: () => Set<string>;
 }
 
 export interface LoopFinderConfig {
   bases: string[];       // coins a loop may start/end in, most preferred first (WETH, USDG)
   minPools: number;      // 3 (2-pool trades are the gap scanner's job)
-  maxPools: number;      // LOOP_MAX_POOLS, default 5
-  maxCycles: number;     // LOOP_MAX_CYCLES, default 5000
+  maxPools: number;      // LOOP_MAX_POOLS, default 5, at most 8
+  maxCycles: number;     // LOOP_MAX_CYCLES, default 5000, shared out between loop lengths
   maxTradeUsd: number;   // LOOP_MAX_TRADE_USD, default $2,000
   depthShare: number;    // LOOP_DEPTH_SHARE: trade at most this share of the shallowest pool's depth (0.3)
   exactTopK: number;     // how many quick-check winners get the exact check per update (20)
-  maxDfsSteps: number;   // safety cap on the loop listing work (300,000 steps)
+  maxStepsPerLength: number; // safety cap on the loop listing work, per loop length (100,000 steps)
   rebuildMs: number;     // rebuild the loop list at least this often (60 s)
   rebuildMinMs: number;  // ...but never more often than this (5 s), even if pools come and go
+  longFromPools: number; // loops this long or longer are only listed if they could come close to paying (6)
+  longSlack: number;     // LOOP_LONG_SLACK: "close" = within this share of paying (0.02 = 2%)
+  sliceMs: number;       // a rebuild works about this long before letting the bot run (5 ms)
+  updateBudgetMs: number; // time budget for re-pricing loops in one update (12 ms)
 }
 
 export const DEFAULT_FINDER_CONFIG: Omit<LoopFinderConfig, 'bases'> = {
   minPools: 3, maxPools: 5, maxCycles: 5_000, maxTradeUsd: 2_000, depthShare: 0.3,
-  exactTopK: 20, maxDfsSteps: 300_000, rebuildMs: 60_000, rebuildMinMs: 5_000,
+  exactTopK: 20, maxStepsPerLength: 100_000, rebuildMs: 60_000, rebuildMinMs: 5_000,
+  longFromPools: 6, longSlack: 0.02, sliceMs: 5, updateBudgetMs: 12,
 };
 
 // A priced loop.
@@ -119,10 +146,12 @@ export interface UpdateOutcome {
   results: LoopResult[];      // loops making money after gas (exact maths), best first
   evaluated: number[];        // ids of loops with a verdict this update (paying or not)
   changedPools: number;
-  rebuilt: boolean;
+  rebuilt: boolean;           // a new loop list was put in place this update (loop ids changed)
   cycles: number;             // loops in the list
   ms: number;                 // time this update took
+  waiting: number;            // loops still waiting to be priced (time budget ran out)
 }
+
 
 // ----------------------------------------------------------------------------
 // Pure maths
@@ -218,69 +247,299 @@ export function exactLoopOut(pools: PoolState[], hops: LoopHop[], amountIn: bigi
 // The loop list
 // ----------------------------------------------------------------------------
 
-interface Edge { poolKey: string; other: string; inIsA: boolean }
+// How the price of one pool, one way, looks to the "best case" check:
+// log of (price after fee). Adding these up along a loop gives the log of
+// "what comes back per coin put in" for a tiny trade, which is the most a
+// loop can ever return (bigger trades only get worse prices).
+export function hopLogRate(p: PoolState, inIsA: boolean): number | null {
+  const h = hopCurve(p, inIsA);
+  if (!h) return null;
+  const r = Math.log((h.g * h.rout) / h.rin);
+  return Number.isFinite(r) ? r : null;
+}
 
-// Lists loops of minPools..maxPools pools that start and end in a base coin.
-// Each loop is listed once per direction: a loop that passes through two
-// base coins is listed only from the more preferred one (WETH before USDG).
-// No pool and no in-between coin is used twice in one loop.
-// `order(poolKey)`: higher = explored first (recently moved, deep pools), so
-// when a cap is hit the most useful loops are already in the list.
-export function enumerateCycles(
-  pools: PoolState[], bases: string[], minPools: number, maxPools: number,
-  opts: { maxCycles?: number; maxSteps?: number; order?: (poolKey: string) => number } = {},
-): { cycles: LoopCycle[]; steps: number; capped: boolean } {
-  const maxCycles = opts.maxCycles ?? Infinity, maxSteps = opts.maxSteps ?? Infinity;
-  const baseRank = new Map(bases.map((b, i) => [lc(b), i] as [string, number]));
-  const adj = new Map<string, Edge[]>();
-  for (const p of pools) {
-    const k = lc(p.poolAddress), a = lc(p.tokenA), b = lc(p.tokenB);
-    if (a === b) continue;
-    (adj.get(a) ?? adj.set(a, []).get(a)!).push({ poolKey: k, other: b, inIsA: true });
-    (adj.get(b) ?? adj.set(b, []).get(b)!).push({ poolKey: k, other: a, inIsA: false });
+export interface CycleSearchOptions {
+  maxCycles?: number;        // most loops in total; shared out between lengths
+  maxSteps?: number;         // most search steps in total; shared out between lengths
+  order?: (poolKey: string) => number;   // higher = tried first (short loops)
+  preferPools?: Set<string>; // pools tried before all others (rival loop pools)
+  longFrom?: number;         // loops this long or longer use the best-case check (default: never)
+  // Smallest log return a loop of this length must be able to reach to be
+  // listed (only for long loops). E.g. log(1 + gas/size) + log(1 - slack).
+  minLog?: (len: number) => number;
+}
+
+// One way through one pool, with coins as numbers (faster than text).
+interface SEdge { pool: number; to: number; inIsA: boolean; w: number; score: number; pref: boolean }
+// A coin's ordered list of ways out, for one (base, loop length, hops left)
+// combination. `tier2` = where the non-preferred pools start.
+interface ChildList { ids: Int32Array; tier2: number }
+
+// Lists loops, one length at a time (3 pools, then 4, ...), and can stop
+// part way and carry on later (run() with a deadline), so a big rebuild can
+// be done in small slices without freezing the bot.
+//
+// Rules (same as before): a loop is listed once per direction; a loop that
+// passes through two base coins is listed only from the more preferred one
+// (WETH before USDG); no pool and no in-between coin is used twice.
+//
+// Sharing out: each length gets an equal share of what is left of
+// LOOP_MAX_CYCLES (and of the step budget) when its turn comes. A length
+// that doesn't use its share passes the rest on to the longer lengths.
+export class CycleSearch {
+  readonly cycles: LoopCycle[] = [];
+  readonly byLen: number[] = [];              // loops listed per length (index = pools)
+  readonly cappedLens = new Set<number>();    // lengths that hit their share
+  readonly rates = new Map<string, number>(); // pool -> log price A->B when the list was built
+  steps = 0;
+  done = false;
+
+  // The coin map, coins and pools as numbers.
+  private tokNames: string[] = [];
+  private poolKeys: string[] = [];
+  private edges: SEdge[] = [];
+  private out: number[][] = [];          // coin -> edge ids leaving it
+  private rankOf!: Int32Array;           // coin -> base rank (-1 = not a base)
+  private baseToks: number[] = [];       // base coins in preference order (present on the map only)
+  // best[b][k][t]: the best log return of any route of exactly k pools from
+  // coin t back to base number b (routes may repeat coins here, which can
+  // only make the number bigger: so it is always a safe "best case").
+  private best: Float64Array[][] = [];
+  private childCache = new Map<number, ChildList>();
+  private setupDone = false;
+  private sortWork = 0;
+  private setupIdx = 0;                  // pools read into the map so far
+  private tokId = new Map<string, number>();                  // edges sorted since the last clock check
+
+  // Where the search is.
+  private len: number;
+  private bi = 0;
+  private depth = 0;
+  private lists: ChildList[] = [];
+  private pos: number[] = [];
+  private tokAt: number[] = [];
+  private edgeAt: number[] = [];
+  private prefix: number[] = [];
+  private usedPool!: Uint8Array;
+  private usedTok!: Uint8Array;
+  private passCount = 0;
+  private passSteps = 0;
+  private quota = Infinity;
+  private stepBudget = Infinity;
+  private passStarted = false;
+  private cyclesLeft: number;
+  private stepsLeft: number;
+
+  constructor(
+    private pools: PoolState[], private bases: string[],
+    private minPools: number, private maxPools: number,
+    private opts: CycleSearchOptions = {},
+  ) {
+    this.len = minPools;
+    this.cyclesLeft = opts.maxCycles ?? Infinity;
+    this.stepsLeft = opts.maxSteps ?? Infinity;
   }
-  if (opts.order) for (const list of adj.values()) list.sort((x, y) => opts.order!(y.poolKey) - opts.order!(x.poolKey));
 
-  const cycles: LoopCycle[] = [];
-  let steps = 0, capped = false;
-  const pathHops: LoopHop[] = [], pathTokens: string[] = [];
-  const usedPools = new Set<string>(), usedTokens = new Set<string>();
+  get capped(): boolean { return this.cappedLens.size > 0; }
 
-  const dfs = (start: string, rank: number, cur: string): void => {
-    for (const e of adj.get(cur) ?? []) {
-      if (capped) return;
-      if (++steps > maxSteps) { capped = true; return; }
-      if (usedPools.has(e.poolKey)) continue;
-      const depth = pathHops.length + 1;
-      if (e.other === start) {
-        if (depth >= minPools) {
-          const hops = [...pathHops, { poolKey: e.poolKey, tokenIn: cur, tokenOut: start, inIsA: e.inIsA }];
-          const keys = hops.map((h) => h.poolKey);
-          cycles.push({ id: cycles.length, sig: `${start}:${keys.join('>')}`, poolSet: [...keys].sort().join(','), base: start, hops, tokens: [...pathTokens] });
-          if (cycles.length >= maxCycles) { capped = true; return; }
+  // Build the coin map and the best-case table. A few ms for ~1,000 pools.
+  // Can stop part way (deadline) and carry on in the next slice: true = done.
+  private setup(deadline: number): boolean {
+    const tokId = this.tokId;
+    const tid = (t: string) => { let i = tokId.get(t); if (i === undefined) { i = this.tokNames.length; tokId.set(t, i); this.tokNames.push(t); this.out.push([]); } return i; };
+    const order = this.opts.order, pref = this.opts.preferPools;
+    while (this.setupIdx < this.pools.length) {
+      if ((this.setupIdx & 31) === 31 && performance.now() > deadline) return false;
+      const p = this.pools[this.setupIdx++];
+      const k = lc(p.poolAddress), a = lc(p.tokenA), b = lc(p.tokenB);
+      if (a === b) continue;
+      // Pools we can't price are left out (the quick check would skip them anyway).
+      const wAB = hopLogRate(p, true), wBA = hopLogRate(p, false);
+      if (wAB === null || wBA === null) continue;
+      const pi = this.poolKeys.length; this.poolKeys.push(k);
+      this.rates.set(k, wAB);
+      const ia = tid(a), ib = tid(b);
+      const score = order ? order(k) : 0, isPref = !!pref && pref.has(k);
+      this.out[ia].push(this.edges.length); this.edges.push({ pool: pi, to: ib, inIsA: true, w: wAB, score, pref: isPref });
+      this.out[ib].push(this.edges.length); this.edges.push({ pool: pi, to: ia, inIsA: false, w: wBA, score, pref: isPref });
+    }
+    const n = this.tokNames.length;
+    this.rankOf = new Int32Array(n).fill(-1);
+    const seen = new Set<string>();
+    for (const b of this.bases.map(lc)) {
+      if (seen.has(b)) continue; seen.add(b);
+      const i = tokId.get(b);
+      if (i === undefined) continue;
+      this.rankOf[i] = this.baseToks.length;
+      this.baseToks.push(i);
+    }
+    // Best-case table: k = 0 means "already at the base".
+    for (const bt of this.baseToks) {
+      const rows: Float64Array[] = [];
+      const r0 = new Float64Array(n).fill(-Infinity); r0[bt] = 0; rows.push(r0);
+      for (let k = 1; k < this.maxPools; k++) {
+        const prev = rows[k - 1], row = new Float64Array(n).fill(-Infinity);
+        for (let t = 0; t < n; t++) {
+          let m = -Infinity;
+          for (const eid of this.out[t]) { const e = this.edges[eid]; const v = e.w + prev[e.to]; if (v > m) m = v; }
+          row[t] = m;
         }
+        rows.push(row);
+      }
+      this.best.push(rows);
+    }
+    this.usedPool = new Uint8Array(this.poolKeys.length);
+    this.usedTok = new Uint8Array(n);
+    this.setupDone = true;
+    return true;
+  }
+
+  private isLong(len: number): boolean { return len >= (this.opts.longFrom ?? Infinity) && !!this.opts.minLog; }
+
+  // Ways out of coin t that can still get back to the base in exactly
+  // `left` more pools, best first. Built the first time it's needed.
+  //   short loops: rival pools first, then by `order` (recently moved, deep);
+  //   long loops: rival pools first, then by best case (most hopeful first).
+  private children(long: boolean, bi: number, left: number, t: number): ChildList {
+    const key = (((long ? 1 : 0) * this.baseToks.length + bi) * this.maxPools + left) * this.tokNames.length + t;
+    let c = this.childCache.get(key);
+    if (c) return c;
+    this.sortWork += this.out[t].length; // sorting takes time: run() checks the clock sooner
+    const row = this.best[bi][left];
+    const tier1: number[] = [], tier2: number[] = [];
+    for (const eid of this.out[t]) {
+      const e = this.edges[eid];
+      if (row[e.to] === -Infinity) continue; // can't get back in time
+      (e.pref ? tier1 : tier2).push(eid);
+    }
+    const key2 = long ? (eid: number) => this.edges[eid].w + row[this.edges[eid].to] : (eid: number) => this.edges[eid].score;
+    tier1.sort((x, y) => key2(y) - key2(x));
+    tier2.sort((x, y) => key2(y) - key2(x));
+    c = { ids: Int32Array.from([...tier1, ...tier2]), tier2: tier1.length };
+    this.childCache.set(key, c);
+    return c;
+  }
+
+  // Clear the path in progress (used pools / coins).
+  private resetPath() {
+    for (let d = 0; d < this.depth; d++) { this.usedPool[this.edges[this.edgeAt[d]].pool] = 0; }
+    for (let d = 1; d <= this.depth; d++) this.usedTok[this.tokAt[d]] = 0;
+    if (this.tokAt.length) this.usedTok[this.tokAt[0]] = 0;
+    this.depth = 0;
+  }
+
+  // Start the search from base number bi for the current length.
+  private startBase() {
+    const bt = this.baseToks[this.bi];
+    this.depth = 0;
+    this.tokAt[0] = bt; this.prefix[0] = 0; this.pos[0] = 0;
+    this.lists[0] = this.children(this.isLong(this.len), this.bi, this.len - 1, bt);
+    this.usedTok[bt] = 1;
+  }
+
+  // Finish the current length and move to the next one.
+  private endPass() {
+    this.resetPath();
+    this.cyclesLeft -= this.passCount;
+    this.stepsLeft -= this.passSteps;
+    this.len++;
+    this.bi = 0;
+    this.passStarted = false;
+  }
+
+  // Work until `deadline` (performance.now() time). Returns true when finished.
+  run(deadline: number): boolean {
+    if (this.done) return true;
+    if (!this.setupDone && (!this.setup(deadline) || performance.now() > deadline)) return false;
+    let tick = 0;
+    for (;;) {
+      if (!this.passStarted) {
+        if (this.len > this.maxPools || !this.baseToks.length) { this.done = true; return true; }
+        // This length's share of what's left.
+        const lensLeft = this.maxPools - this.len + 1;
+        this.quota = Math.ceil(this.cyclesLeft / lensLeft);
+        this.stepBudget = Math.ceil(this.stepsLeft / lensLeft);
+        this.passCount = 0; this.passSteps = 0; this.bi = 0; this.passStarted = true;
+        if (this.quota <= 0) { this.cappedLens.add(this.len); this.endPass(); continue; }
+        this.startBase();
+      }
+      // Check the clock every 64 steps, or sooner after sorting big lists.
+      if (((++tick & 63) === 0 || this.sortWork > 2_000) && (this.sortWork = 0, performance.now() > deadline)) return false;
+
+      const d = this.depth, list = this.lists[d];
+      if (this.pos[d] >= list.ids.length) {
+        if (d === 0) {
+          // This base is finished: next base, or next length.
+          this.usedTok[this.tokAt[0]] = 0;
+          this.bi++;
+          if (this.bi >= this.baseToks.length) this.endPass(); else this.startBase();
+          continue;
+        }
+        // Step back one pool.
+        this.depth--;
+        this.usedPool[this.edges[this.edgeAt[this.depth]].pool] = 0;
+        this.usedTok[this.tokAt[d]] = 0;
         continue;
       }
-      if (depth >= maxPools || usedTokens.has(e.other)) continue;
-      // A loop through a more preferred base coin is listed from that coin.
-      const r = baseRank.get(e.other);
-      if (r !== undefined && r < rank) continue;
-      usedPools.add(e.poolKey); usedTokens.add(e.other);
-      pathHops.push({ poolKey: e.poolKey, tokenIn: cur, tokenOut: e.other, inIsA: e.inIsA });
-      pathTokens.push(e.other);
-      dfs(start, rank, e.other);
-      pathHops.pop(); pathTokens.pop();
-      usedPools.delete(e.poolKey); usedTokens.delete(e.other);
+      const i = this.pos[d]++;
+      const eid = list.ids[i], e = this.edges[eid];
+      this.steps++;
+      if (++this.passSteps > this.stepBudget) { this.cappedLens.add(this.len); this.endPass(); continue; }
+      if (this.usedPool[e.pool]) continue;
+      const left = this.len - d - 1; // pools still to go after this one
+      if (this.isLong(this.len)) {
+        // Best case for any loop that starts with this path: still not
+        // enough? Then nothing further down this list is either (it is
+        // sorted best first), so skip the rest of this group.
+        const ub = this.prefix[d] + e.w + this.best[this.bi][left][e.to];
+        if (ub < this.opts.minLog!(this.len)) { this.pos[d] = i < list.tier2 ? list.tier2 : list.ids.length; continue; }
+      }
+      const start = this.tokAt[0];
+      if (left === 0) {
+        // The list only holds ways back to the base here: a full loop.
+        this.emit(d, eid);
+        if (this.passCount >= this.quota) { this.cappedLens.add(this.len); this.endPass(); }
+        continue;
+      }
+      if (e.to === start || this.usedTok[e.to]) continue;
+      const r = this.rankOf[e.to];
+      if (r >= 0 && r < this.bi) continue; // listed from the more preferred base instead
+      // Go one pool deeper.
+      this.usedPool[e.pool] = 1; this.usedTok[e.to] = 1;
+      this.edgeAt[d] = eid;
+      this.depth = d + 1;
+      this.tokAt[d + 1] = e.to;
+      this.prefix[d + 1] = this.prefix[d] + e.w;
+      this.pos[d + 1] = 0;
+      this.lists[d + 1] = this.children(this.isLong(this.len), this.bi, left - 1, e.to);
     }
-  };
-
-  for (const [b, rank] of baseRank) {
-    if (capped) break;
-    if (!adj.has(b)) continue;
-    pathTokens.length = 0; pathTokens.push(b); usedTokens.clear(); usedTokens.add(b);
-    dfs(b, rank, b);
   }
-  return { cycles, steps, capped };
+
+  // Save the loop made of the current path plus edge `lastEid`.
+  private emit(d: number, lastEid: number) {
+    const hops: LoopHop[] = [];
+    const tokens: string[] = [];
+    for (let j = 0; j <= d; j++) {
+      const e = this.edges[j < d ? this.edgeAt[j] : lastEid];
+      tokens.push(this.tokNames[this.tokAt[j]]);
+      hops.push({ poolKey: this.poolKeys[e.pool], tokenIn: this.tokNames[this.tokAt[j]], tokenOut: this.tokNames[e.to], inIsA: e.inIsA });
+    }
+    const base = tokens[0];
+    const keys = hops.map((h) => h.poolKey);
+    this.cycles.push({ id: this.cycles.length, sig: `${base}:${keys.join('>')}`, poolSet: [...keys].sort().join(','), base, hops, tokens });
+    this.byLen[hops.length] = (this.byLen[hops.length] ?? 0) + 1;
+    this.passCount++;
+  }
+}
+
+// Lists all loops in one go (no slicing). Used by tests and small maps.
+export function enumerateCycles(
+  pools: PoolState[], bases: string[], minPools: number, maxPools: number,
+  opts: CycleSearchOptions = {},
+): { cycles: LoopCycle[]; steps: number; capped: boolean; byLen: number[] } {
+  const s = new CycleSearch(pools, bases, minPools, maxPools, opts);
+  s.run(Infinity);
+  return { cycles: s.cycles, steps: s.steps, capped: s.capped, byLen: s.byLen };
 }
 
 // ----------------------------------------------------------------------------
@@ -289,6 +548,28 @@ export function enumerateCycles(
 
 const poolSig = (p: PoolState) => `${p.sqrtPriceX96 ?? ''}:${p.liquidity ?? ''}:${p.reserveA ?? ''}:${p.reserveB ?? ''}:${p.feePips ?? p.feeBps}`;
 
+// How the last loop list rebuild went (for the hourly report and tests).
+export interface RebuildStats {
+  cycles: number;
+  byLen: number[];        // loops listed per length
+  steps: number;
+  capped: boolean;
+  totalMs: number;        // start to finish, including the time the bot ran in between slices
+  workMs: number;         // time actually spent listing
+  maxSliceMs: number;     // longest single slice (how long the bot was held up at most)
+  slices: number;
+}
+
+interface RebuildJob {
+  search: CycleSearch;
+  byPool: Map<string, number[]>; // pool -> loops through it, filled in slices after the search
+  indexed: number;               // loops added to byPool so far
+  started: number;        // performance.now()
+  workMs: number;
+  maxSliceMs: number;
+  slices: number;
+}
+
 export class LoopFinder {
   readonly cfg: LoopFinderConfig;
   private cycles: LoopCycle[] = [];
@@ -296,9 +577,19 @@ export class LoopFinder {
   private pools = new Map<string, PoolState>();      // latest state of every usable pool
   private sigs = new Map<string, string>();          // pool -> price state last seen
   private moved = new Map<string, number>();         // pool -> when its price last changed
+  private curves = new Map<string, { ab: HopCurve | null; ba: HopCurve | null }>(); // pool -> quick-check curves
+  private depths = new Map<string, { v: number | null; at: number }>();            // pool -> depth (cached 5 s)
   private poolSetKey = '';                           // which pools the loop list was built from
   private lastRebuild = -Infinity;
-  lastCapped = false;                                // loop list hit LOOP_MAX_CYCLES or the step cap
+  private job: RebuildJob | null = null;             // rebuild in progress (in slices)
+  private ready: { search: CycleSearch; byPool: Map<string, number[]>; stats: RebuildStats } | null = null; // finished rebuild, put in place on the next update
+  private idleWaiters: (() => void)[] = [];
+  private pending = new Set<number>();               // loops still to be priced (time budget ran out)
+  private builtRates = new Map<string, number>();    // pool -> price when the list was built
+  private bigMove = false;                           // a pool moved enough that the long-loop list may be stale
+  lastCapped = false;                                // loop list hit LOOP_MAX_CYCLES (some length) or the step cap
+  lastStats: RebuildStats | null = null;          // how the last rebuild went
+  rebuilds = 0;
 
   constructor(cfg: Partial<LoopFinderConfig> & { bases: string[] }, private env: LoopEnv) {
     this.cfg = { ...DEFAULT_FINDER_CONFIG, ...cfg, bases: cfg.bases.map(lc) };
@@ -306,82 +597,184 @@ export class LoopFinder {
 
   cycleCount(): number { return this.cycles.length; }
   cycleById(id: number): LoopCycle | undefined { return this.cycles[id]; }
+  // Loops in the list per length (index = pools).
+  cyclesByLen(): number[] { return this.lastStats ? [...this.lastStats.byLen] : []; }
+  rebuildStats(): RebuildStats | null { return this.lastStats; }
+  rebuilding(): boolean { return this.job !== null; }
+  // Resolves when no rebuild is running (the result goes in on the next update).
+  idle(): Promise<void> { return this.job ? new Promise((r) => this.idleWaiters.push(r)) : Promise.resolve(); }
+
+  // Smallest log return a long loop must be able to reach to be listed:
+  // pay its gas on the biggest allowed trade, minus the slack.
+  private minLog = (len: number): number =>
+    Math.log1p(Math.max(0, this.env.gasUsd(len)) / this.cfg.maxTradeUsd) + Math.log(1 - Math.min(0.5, Math.max(0, this.cfg.longSlack)));
 
   // Call after every price update with the pools that may be used.
   update(poolsIn: PoolState[]): UpdateOutcome {
     const t0 = performance.now();
     const now = this.env.now();
+    let rebuilt = false;
+    // A rebuild that finished in the background goes in now (loop ids change here only).
+    if (this.ready) { this.install(); rebuilt = true; }
+
     const fresh = new Map<string, PoolState>();
     for (const p of poolsIn) if (hasExactMath(p)) fresh.set(lc(p.poolAddress), p);
 
     // Which pools changed price since last time?
     const changed: string[] = [];
+    const longOn = this.cfg.maxPools >= this.cfg.longFromPools;
+    const bigMoveAt = Math.min(0.5, Math.max(0, this.cfg.longSlack)) / 2;
     for (const [k, p] of fresh) {
       const s = poolSig(p);
-      if (this.sigs.get(k) !== s) { changed.push(k); this.sigs.set(k, s); this.moved.set(k, now); }
+      if (this.sigs.get(k) === s) continue;
+      changed.push(k); this.sigs.set(k, s); this.moved.set(k, now);
+      const ab = hopCurve(p, true), ba = hopCurve(p, false);
+      this.curves.set(k, { ab, ba });
+      this.depths.delete(k);
+      // A price move bigger than half the slack since the list was built:
+      // long loops through this pool may now be close to paying but not listed.
+      if (longOn && ab) {
+        const was = this.builtRates.get(k);
+        if (was !== undefined && Math.abs(Math.log((ab.g * ab.rout) / ab.rin) - was) > bigMoveAt) this.bigMove = true;
+      }
     }
-    for (const k of this.sigs.keys()) if (!fresh.has(k)) { this.sigs.delete(k); this.moved.delete(k); }
+    for (const k of this.sigs.keys()) if (!fresh.has(k)) { this.sigs.delete(k); this.moved.delete(k); this.curves.delete(k); this.depths.delete(k); }
     this.pools = fresh;
 
-    // Rebuild the loop list when the pool set changed (rate-limited) or it's old.
-    const setKey = [...fresh.keys()].sort().join(',');
-    const due = now - this.lastRebuild >= this.cfg.rebuildMs;
-    const setChanged = setKey !== this.poolSetKey && now - this.lastRebuild >= this.cfg.rebuildMinMs;
-    let rebuilt = false;
-    if (due || setChanged) { this.rebuild(now); this.poolSetKey = setKey; this.lastRebuild = now; rebuilt = true; }
-
-    // Loops to re-price: all after a rebuild, else only those through a changed pool.
-    let ids: number[];
-    if (rebuilt) ids = this.cycles.map((c) => c.id);
-    else {
-      const set = new Set<number>();
-      for (const k of changed) for (const id of this.byPool.get(k) ?? []) set.add(id);
-      ids = [...set];
+    // Rebuild the loop list when the pool set changed or a price moved a lot
+    // (rate-limited), or when it's old. Only one rebuild at a time.
+    if (!this.job) {
+      const setKey = [...fresh.keys()].sort().join(',');
+      const due = now - this.lastRebuild >= this.cfg.rebuildMs;
+      const early = (setKey !== this.poolSetKey || this.bigMove) && now - this.lastRebuild >= this.cfg.rebuildMinMs;
+      if (due || early) {
+        this.poolSetKey = setKey; this.lastRebuild = now; this.bigMove = false;
+        this.startRebuild(now);
+        // Small maps finish in the first slice: put the new list in right away.
+        if (this.ready) { this.install(); rebuilt = true; }
+      }
     }
 
+    // Loops to re-price: those through a changed pool, then any left over
+    // from earlier updates (after a rebuild that's every loop).
+    const todo = new Set<number>();
+    for (const k of changed) for (const id of this.byPool.get(k) ?? []) todo.add(id);
+    for (const id of this.pending) todo.add(id);
+    this.pending.clear();
+
     // Quick check (closed form) for each loop, keep the best few for the exact check.
-    const quick: { id: number; net: number; xUsd: number }[] = [];
-    for (const id of ids) {
-      const q = this.quickNet(this.cycles[id]);
-      if (q && q.net > 0) quick.push({ id, net: q.net, xUsd: q.xUsd });
+    // Time budget: the quick checks may use up to 60% of it, the exact checks the rest.
+    const budget = this.cfg.updateBudgetMs;
+    const quick: { id: number; net: number }[] = [];
+    const done: number[] = [];
+    let n = 0;
+    for (const id of todo) {
+      if ((++n & 63) === 0 && performance.now() - t0 > budget * 0.6) { this.pending.add(id); continue; }
+      if (this.pending.size) { this.pending.add(id); continue; }
+      done.push(id);
+      const q = this.quickNet(this.cycles[id], now);
+      if (q !== null && q > 0) quick.push({ id, net: q });
     }
     quick.sort((a, b) => b.net - a.net);
     const results: LoopResult[] = [];
-    for (const q of quick.slice(0, this.cfg.exactTopK)) {
+    const noVerdict = new Set<number>();
+    for (let j = 0; j < quick.length; j++) {
+      const q = quick[j];
+      if (j >= this.cfg.exactTopK) { noVerdict.add(q.id); continue; }
+      if (j > 0 && performance.now() - t0 > budget) { noVerdict.add(q.id); this.pending.add(q.id); continue; }
       const r = this.exact(this.cycles[q.id]);
       if (r && r.netUsd > 0) results.push(r);
     }
     results.sort((a, b) => b.netUsd - a.netUsd);
     // Loops that passed the quick check but missed the exact check this time
-    // (not in the top few) have no verdict: left out of `evaluated`.
-    const noVerdict = new Set(quick.slice(this.cfg.exactTopK).map((q) => q.id));
-    const evaluated = noVerdict.size ? ids.filter((id) => !noVerdict.has(id)) : ids;
-    return { results, evaluated, changedPools: changed.length, rebuilt, cycles: this.cycles.length, ms: performance.now() - t0 };
+    // have no verdict: left out of `evaluated`. Loops not reached in time
+    // are priced on the next update.
+    const evaluated = noVerdict.size ? done.filter((id) => !noVerdict.has(id)) : done;
+    return { results, evaluated, changedPools: changed.length, rebuilt, cycles: this.cycles.length, ms: performance.now() - t0, waiting: this.pending.size };
   }
 
-  // Rebuild the loop list. Pools that moved in the last 10 minutes go first,
-  // then deeper pools, so the cap keeps the loops most likely to pay.
-  private rebuild(now: number) {
+  // Start a rebuild. Order: pools rival loops used first, then pools that
+  // moved in the last 10 minutes, then deeper pools, so when a length's
+  // share is full the most useful loops are already in the list.
+  private startRebuild(now: number) {
     const score = new Map<string, number>();
     for (const [k, p] of this.pools) {
       const recent = now - (this.moved.get(k) ?? -Infinity) < 10 * 60_000 ? 1e12 : 0;
-      score.set(k, recent + (this.env.depthUsd(p) ?? 0));
+      score.set(k, recent + (this.depthOf(k, p, now) ?? 0));
     }
-    const { cycles, capped } = enumerateCycles([...this.pools.values()], this.cfg.bases, this.cfg.minPools, this.cfg.maxPools,
-      { maxCycles: this.cfg.maxCycles, maxSteps: this.cfg.maxDfsSteps, order: (k) => score.get(k) ?? 0 });
-    this.cycles = cycles;
-    this.lastCapped = capped;
-    this.byPool.clear();
-    for (const c of cycles) for (const h of c.hops) (this.byPool.get(h.poolKey) ?? this.byPool.set(h.poolKey, []).get(h.poolKey)!).push(c.id);
+    let prefer: Set<string> | undefined;
+    try { prefer = this.env.rivalPools?.(); } catch { prefer = undefined; }
+    const lens = Math.max(1, this.cfg.maxPools - this.cfg.minPools + 1);
+    const search = new CycleSearch([...this.pools.values()], this.cfg.bases, this.cfg.minPools, this.cfg.maxPools, {
+      maxCycles: this.cfg.maxCycles, maxSteps: this.cfg.maxStepsPerLength * lens,
+      order: (k) => score.get(k) ?? 0, preferPools: prefer,
+      longFrom: this.cfg.longFromPools, minLog: this.minLog,
+    });
+    this.job = { search, byPool: new Map(), indexed: 0, started: performance.now(), workMs: 0, maxSliceMs: 0, slices: 0 };
+    this.slice();
+  }
+
+  // One slice of rebuild work; schedules the next slice if not finished.
+  // setImmediate lets price updates, timers and node replies run in between.
+  private slice = () => {
+    const job = this.job;
+    if (!job) return;
+    const s0 = performance.now(), deadline = s0 + this.cfg.sliceMs;
+    let finished = job.search.run(deadline);
+    // Then the "which loops go through which pool" index, also in slices.
+    if (finished) {
+      const cs = job.search.cycles;
+      while (job.indexed < cs.length) {
+        if ((job.indexed & 255) === 255 && performance.now() > deadline) { finished = false; break; }
+        const c = cs[job.indexed++];
+        for (const h of c.hops) (job.byPool.get(h.poolKey) ?? job.byPool.set(h.poolKey, []).get(h.poolKey)!).push(c.id);
+      }
+    }
+    const took = performance.now() - s0;
+    job.workMs += took; job.slices++; job.maxSliceMs = Math.max(job.maxSliceMs, took);
+    if (!finished) { setImmediate(this.slice); return; }
+    const s = job.search;
+    this.ready = { search: s, byPool: job.byPool, stats: {
+      cycles: s.cycles.length, byLen: [...s.byLen].map((x) => x ?? 0), steps: s.steps, capped: s.capped,
+      totalMs: performance.now() - job.started, workMs: job.workMs, maxSliceMs: job.maxSliceMs, slices: job.slices,
+    } };
+    this.job = null;
+    const w = this.idleWaiters; this.idleWaiters = [];
+    for (const f of w) f();
+  };
+
+  // Put a finished loop list in place. Every loop gets priced (within the
+  // time budget, the rest on the next updates).
+  private install() {
+    const { search, byPool, stats } = this.ready!;
+    this.ready = null;
+    const t = performance.now();
+    this.cycles = search.cycles;
+    this.lastCapped = search.capped;
+    this.builtRates = search.rates;
+    this.byPool = byPool;
+    this.pending = new Set(this.cycles.map((c) => c.id));
+    const took = performance.now() - t;
+    this.lastStats = { ...stats, workMs: stats.workMs + took, maxSliceMs: Math.max(stats.maxSliceMs, took) };
+    this.rebuilds++;
+  }
+
+  // Money in a pool near its price (cached for 5 s, or until the pool changes).
+  private depthOf(k: string, p: PoolState, now: number): number | null {
+    const c = this.depths.get(k);
+    if (c && now - c.at < 5_000) return c.v;
+    const v = this.env.depthUsd(p);
+    this.depths.set(k, { v, at: now });
+    return v;
   }
 
   // Biggest input for a loop, in base-coin raw units: LOOP_MAX_TRADE_USD and
   // a share of the shallowest pool's depth, whichever is smaller.
-  private capRaw(c: LoopCycle, pools: PoolState[]): { cap: number; usd: number; dec: number } | null {
+  private capRaw(c: LoopCycle, pools: PoolState[], now = this.env.now()): { cap: number; usd: number; dec: number } | null {
     const dec = this.env.decimalsOf(c.base), usd = this.env.usdOf(c.base);
     if (dec === undefined || !usd || !(usd > 0)) return null;
     let minDepth = Infinity;
-    for (const p of pools) { const d = this.env.depthUsd(p); minDepth = Math.min(minDepth, d === null ? 0 : d); }
+    for (let i = 0; i < pools.length; i++) { const d = this.depthOf(c.hops[i].poolKey, pools[i], now); minDepth = Math.min(minDepth, d === null ? 0 : d); }
     const capUsd = Math.min(this.cfg.maxTradeUsd, minDepth * this.cfg.depthShare);
     if (!(capUsd > 0)) return null;
     return { cap: (capUsd / usd) * 10 ** dec, usd, dec };
@@ -394,18 +787,27 @@ export class LoopFinder {
   }
 
   // Quick check: closed-form best size on the combined curve. Float maths.
-  private quickNet(c: LoopCycle): { net: number; xUsd: number } | null {
+  // Returns the model profit after gas in USD, or null if it can't pay.
+  private quickNet(c: LoopCycle | undefined, now: number): number | null {
+    if (!c) return null;
+    // Combine the pools' curves (same maths as composeCurves, without making arrays).
+    let A = 1, C = 0;
+    for (const h of c.hops) {
+      const cv = this.curves.get(h.poolKey);
+      const k = cv ? (h.inIsA ? cv.ab : cv.ba) : null;
+      if (!k) return null;
+      const a = k.g * k.rout, b = k.rin;
+      C = (b * C + k.g * A) / b;
+      A = (a * A) / b;
+    }
+    if (!(A > 1)) return null; // the loop loses money even on a tiny trade
     const pools = this.poolsOf(c);
     if (!pools) return null;
-    const curves: HopCurve[] = [];
-    for (let i = 0; i < pools.length; i++) { const h = hopCurve(pools[i], c.hops[i].inIsA); if (!h) return null; curves.push(h); }
-    const { A, C } = composeCurves(curves);
-    if (!(A > 1)) return null; // the loop loses money even on a tiny trade
-    const cap = this.capRaw(c, pools);
+    const cap = this.capRaw(c, pools, now);
     if (!cap) return null;
-    const { x, profit } = bestInputClosedForm(A, C, cap.cap);
+    const { profit } = bestInputClosedForm(A, C, cap.cap);
     const scale = cap.usd / 10 ** cap.dec;
-    return { net: profit * scale - this.env.gasUsd(c.hops.length), xUsd: x * scale };
+    return profit * scale - this.env.gasUsd(c.hops.length);
   }
 
   // Exact check: integer pool maths, best size by golden-section search.

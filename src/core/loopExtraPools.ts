@@ -16,7 +16,7 @@ import { hasExactMath } from './loopFinder';
 //   keeps them fresh, for the LOOP FINDER ONLY:
 //     1. PICK: a single pool is picked when it has real money in it
 //        (POOL_MIN_DEPTH_USD, $10k) and both of its coins can be reached from
-//        WETH/USDG so that the pool can sit on a 3-5 pool loop. Pools used by
+//        WETH/USDG so that the pool can sit on a loop of 3 to LOOP_MAX_POOLS pools. Pools used by
 //        rival loop trades come first, then the deepest. At most
 //        LOOP_EXTRA_POOLS_MAX (300).
 //     2. FIND NEW ONES: the chain-wide scan knows every pool on the chain but
@@ -50,7 +50,7 @@ export interface LoopExtraConfig {
   enabled: boolean;          // LOOP_TRADER=1 and LOOP_EXTRA_POOLS not 0
   maxSelected: number;       // LOOP_EXTRA_POOLS_MAX (default 300)
   minDepthUsd: number;       // POOL_MIN_DEPTH_USD (default $10,000), same bar as everywhere else
-  loopMaxPools: number;      // LOOP_MAX_POOLS (3-5): longest loop a pool must fit on
+  loopMaxPools: number;      // LOOP_MAX_POOLS (3-8): longest loop a pool must fit on
   rebuildMs: number;         // rebuild the selection this often (10 min)
   minRebuildGapMs: number;   // ...and never twice within this (1 min), even after a scan
   refreshMs: number;         // LOOP_EXTRA_REFRESH_MS: bundled re-read of picked pools (default 20 s, 0 = off)
@@ -139,7 +139,7 @@ export interface SelectInput {
 export interface SelectOutput {
   selected: PoolState[];
   deepSingles: number;   // single pools with enough money (before the reach test)
-  reachable: number;     // ...of which can sit on a 3-5 pool loop
+  reachable: number;     // ...of which can sit on a loop of 3 to LOOP_MAX_POOLS pools
   rivalPicked: number;   // picked pools that a rival loop used
 }
 

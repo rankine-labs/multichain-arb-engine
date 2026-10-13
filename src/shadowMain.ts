@@ -153,7 +153,7 @@ import { ROBINHOOD_SEED_PAIRS } from './config/robinhoodSeedPairs';
 import { ResearchLane, researchConfigFromEnv, planShallowCandidate, findResearchGaps, gapCandidate, ResearchCandidate } from './core/researchLane';
 import { poolDepthUsd, setRealBalanceSource, thinPools } from './core/poolPrice';
 // Loop trader v1 (3-5 pool loops, practice only, off unless LOOP_TRADER=1).
-import { LoopTrader, loopConfigFromEnv } from './core/loopTrader';
+import { LoopTrader, loopConfigFromEnv, loopGasUsd } from './core/loopTrader';
 import { formatLoopHour } from './core/loopReport';
 import { startMemReport, registerSize } from './core/memReport';
 // Loop trader extra pools: keeps single-pool pairs fresh for the loop finder only (off unless LOOP_TRADER=1).
@@ -1230,7 +1230,7 @@ if (research.enabled) {
 
 // ==========================================================================
 // LOOP TRADER v1 (core/loopTrader.ts, docs/LOOP_TRADER.md). Off unless
-// LOOP_TRADER=1; off = nothing below runs. Finds 3-5 pool loops (WETH/USDG
+// LOOP_TRADER=1; off = nothing below runs. Finds 3-8 pool loops (LOOP_MAX_POOLS, default 5) (WETH/USDG
 // in and out) after every price update, the same moments as the gap scan,
 // and PRACTICE-checks the paying ones when the normal check line is idle
 // (LOOP_CHECKS_PER_MIN, default 6). It is never given the sender: loops
@@ -1254,8 +1254,10 @@ if (loopCfg.enabled) {
                   decimalsOf: (t) => TOKEN_DECIMALS.robinhood?.[t.toLowerCase()],
                   usdOf: usdRhLoop,
                   depthUsd: (p) => poolDepthUsd(p, decimalsOf, usdRhLoop),
-                  // Our gas for a 2-pool trade, scaled by the number of pools.
-                  gasUsd: (hops) => rhGasUsd(0.05) * (hops / 2),
+                  // Our gas for a 2-pool trade, scaled per pool (fit to fork-test gas, see loopGasUsd).
+                  gasUsd: (hops) => loopGasUsd(rhGasUsd(0.05), hops),
+                  // Pools rival loops used (last 24 h): their loops are listed first.
+                  rivalPools: () => rivalWatch.loopRoutePools(Date.now() - 24 * 3600_000),
                   isTradable: (t) => safetyGate.isAllowed(t),
                   now: Date.now,
             },
