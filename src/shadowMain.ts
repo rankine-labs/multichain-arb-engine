@@ -144,6 +144,10 @@ import { FailoverJsonRpcProvider } from './core/failoverRpc';
 import { makeCaller } from './core/universeScan';
 import { loadNodeUsage, saveNodeUsage, nodeUsageToday, NodeBudget, budgetForUrl, callsInBody } from './core/nodeBudget';
 import { endpointLabel } from './core/endpointLabel';
+// Any-provider node settings (off unless set in .env, see docs/NODE_PROVIDERS.md).
+import { checkNodesFromEnv, buildCheckRpc } from './core/checkNodes';
+import { WsBlockReader } from './core/blockReaderWs';
+import { nodeUsage as nodeUsageCounter } from './core/nodeUsage';
 import { ROBINHOOD_SEED_PAIRS } from './config/robinhoodSeedPairs';
 import { ResearchLane, researchConfigFromEnv, planShallowCandidate, findResearchGaps, gapCandidate, ResearchCandidate } from './core/researchLane';
 import { poolDepthUsd } from './core/poolPrice';
@@ -395,8 +399,18 @@ setInterval(saveNodeUsage, 60_000);
 loadBalanceSlots('data/balance-slots.json');
 // Alchemy (ROBINHOOD_RPC_HTTP): fallback node for checks when QuickNode is set.
 const rhHeavyUrlForSims = process.env.ROBINHOOD_RPC_HTTP || null;
+// ANY-PROVIDER CHECK NODES (core/checkNodes.ts). Only when CHECK_RPC_MAIN is
+// set in .env; otherwise null and the QuickNode/Alchemy code below runs as before.
+const checkPlan = checkNodesFromEnv(process.env, (m) => console.warn(`[sim] ${m}`));
 for (const chain of ['avalanche', 'monad', 'robinhood'] as const) {
       const { url, source } = simRpcUrl(chain);
+      if (chain === 'robinhood' && checkPlan) {
+            for (const w of checkPlan.warnings) console.warn(`[sim] ${w}`);
+            const built = buildCheckRpc(checkPlan);
+            simRpc[chain] = built.rpc;
+            console.log(`[sim] robinhood: ${built.description}`); // provider names only, never URLs
+            continue;
+      }
       // Robinhood: if the paid node refuses (rate/plan limit), simulate on the
       // public node instead of stopping real-chain tests altogether.
       if (chain === 'robinhood') {
@@ -1152,7 +1166,7 @@ const rhLoanFeeBps = (tokenIn: string, buyPool: PoolState, sellPool: PoolState):
 // mostly used. Results: [research] log lines, an hourly Telegram note and
 // data/research-lane.json.
 const RESEARCH_FILE = 'data/research-lane.json';
-const researchNode = budgetForUrl(wssToHttps(process.env.QUICKNODE_RPC_ROBINHOOD) || process.env.QUICKNODE_RPC_ROBINHOOD || simRpcUrl('robinhood').url);
+const researchNode = checkPlan ? budgetForUrl(checkPlan.main.url) : budgetForUrl(wssToHttps(process.env.QUICKNODE_RPC_ROBINHOOD) || process.env.QUICKNODE_RPC_ROBINHOOD || simRpcUrl('robinhood').url);
 const research = new ResearchLane(researchConfigFromEnv(), {
       rpc: simRpc.robinhood,
       decimalsOf: (t) => TOKEN_DECIMALS.robinhood?.[t.toLowerCase()],
@@ -2071,13 +2085,37 @@ await chainManager.startAll();
                   }
                   return true;
             };
+            // PUSH READER (core/blockReaderWs.ts). Only when BLOCK_READER_WSS is set:
+            // the node pushes each block's events over a WebSocket into the same
+            // applyUpdate path. The poll reader below stays quiet while the push
+            // feed is healthy and takes over whenever it isn't.
+            let wsReader: WsBlockReader | null = null;
+            if (process.env.BLOCK_READER_WSS) {
+                  wsReader = new WsBlockReader({
+                        url: process.env.BLOCK_READER_WSS,
+                        httpRpc: readerRpc,
+                        httpLabel: `${endpointLabel(READER_URL)} (block reader gap fills)`,
+                        heads: process.env.BLOCK_READER_WSS_HEADS === '1',
+                        poolManager: ROBINHOOD_V4.POOL_MANAGER,
+                        addresses: () => watched().filter((a) => a.length === 42),
+                        v4Ids: () => new Set(watched().filter((a) => a.length === 66)),
+                        onUpdates: (latest) => {
+                              let n = 0;
+                              for (const u of latest.values()) if (applyUpdate(u)) n++;
+                              if (n) { readerApplied += n; requestGapScan(); }
+                        },
+                        // Push feed down: polling resumes from the last block it delivered.
+                        onHealthChange: (healthy, last) => { if (!healthy && last > 0) blockReader.setBookmark(last - 1); },
+                  });
+            }
             const blockReader = new BlockReader({
                   rpc: readerRpc,
                   rpcBatch: readerBatch,
                   // Ask for events by type only (tiny request) and keep ours here.
                   localFilter: true,
-                  // Stay quiet while the price-read node is resting after a refusal.
-                  paused: () => robinhoodReadProvider.mainResting(),
+                  // Stay quiet while the price-read node is resting after a refusal,
+                  // or while the push reader (if set) is delivering events.
+                  paused: () => (wsReader?.healthy() ?? false) || robinhoodReadProvider.mainResting(),
                   poolManager: ROBINHOOD_V4.POOL_MANAGER,
                   addresses: () => watched().filter((a) => a.length === 42),
                   v4Ids: () => new Set(watched().filter((a) => a.length === 66)),
@@ -2090,10 +2128,11 @@ await chainManager.startAll();
                   },
             });
             blockReader.start();
+            wsReader?.start();
             const logReader = () => {
                   const st = blockReader.stats();
                   const errs = blockReader.errorSummary(3);
-                  console.log(`[blockreader] polls ${st.polls} (ok ${st.ok}, errors ${st.errors}, rate-limited ${st.rateLimited}, paused ${st.pausedPolls}, restarts ${st.restarts}) · prices updated ${readerApplied} · median ${st.medianMs} ms · skipped ranges ${st.skippedRanges}${errs ? ' · errors: ' + errs : ''}`);
+                  console.log(`[blockreader] polls ${st.polls} (ok ${st.ok}, errors ${st.errors}, rate-limited ${st.rateLimited}, paused ${st.pausedPolls}, restarts ${st.restarts}) · prices updated ${readerApplied} · median ${st.medianMs} ms · skipped ranges ${st.skippedRanges}${errs ? ' · errors: ' + errs : ''}${wsReader ? ' · ' + wsReader.statusText() : ''}`);
             };
             setTimeout(logReader, 60_000);
             setInterval(logReader, 5 * 60_000);
@@ -2707,7 +2746,8 @@ for (let i = 0; i < resolved.length; i++) {
                               otherBots: { timed: rv.found, theirMs: rv.theirMedianMs, oursMs: rv.ourMedianMs, weBeat: rv.beatCount },
                               rivalWins: { ...rivalWatch.takeHour(), botsKnown: rivalWatch.botCount(), botsVerified: rivalWatch.botStatus().verified },
                               newPools: hourNewPools ?? undefined,
-                              nodeUsage: nodeUsageToday(),
+                              // + any-provider nodes (push reader messages etc.), only when configured.
+                              nodeUsage: [...nodeUsageToday(), ...nodeUsageCounter.reportLines()],
                               ourGas: (() => {
                                     const eth = priceOracle.getUsdPrice('robinhood', ROBINHOOD_TOKENS.WETH);
                                     return { ownUsd: robinhoodSender.gasCostUsdFor(OUR_GAS_OWN, eth), flashUsd: robinhoodSender.gasCostUsdFor(OUR_GAS_FLASH, eth) };

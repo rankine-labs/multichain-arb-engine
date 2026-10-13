@@ -11,6 +11,15 @@ export function endpointLabel(url: string | undefined): string {
   if (host.includes('alchemy.com')) return 'Alchemy';
   if (host.includes('quiknode') || host.includes('quicknode')) return 'QuickNode';
   if (host.includes('blockrazor')) return 'BlockRazor';
+  // Other paid providers, so "any provider" setups (docs/NODE_PROVIDERS.md)
+  // show a friendly name instead of a raw host. Chainstack hosts look like
+  // nd-123-456-789.p2pify.com or *.core.chainstack.com.
+  if (host.includes('chainstack') || host.endsWith('p2pify.com')) return 'Chainstack';
+  if (host.includes('infura.io')) return 'Infura';
+  if (host.includes('ankr.com')) return 'Ankr';
+  if (host.includes('drpc.org')) return 'dRPC';
+  if (host.includes('getblock.io')) return 'GetBlock';
+  if (host.includes('blastapi.io')) return 'Blast';
   if (PUBLIC_HOSTS.some((h) => host.endsWith(h))) return `free public node (${host})`;
   return host;
 }
