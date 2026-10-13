@@ -18,8 +18,9 @@ import { nodeUsage, NodeUsageCounter } from './nodeUsage';
 //
 //   What it does:
 //     - Subscribes to the same six event types the poll reader asks for
-//       (Sync / Swap, see HANDLED_TOPICS), by default only from our own pools
-//       plus the V4 PoolManager (address filter: far fewer billed messages),
+//       (Sync / Swap, see HANDLED_TOPICS), by default only from our own pool
+//       contracts, plus V4 swaps for our own V4 pool ids (address filter: far
+//       fewer billed messages),
 //       then double-checks here (same V4 pool-id check as the poll reader).
 //     - DAILY CAP: after BLOCK_READER_WSS_DAILY pushed messages in a UTC day
 //       the push feed switches off and polling takes over until midnight UTC,
@@ -160,6 +161,7 @@ export class WsBlockReader {
   private gen = 0;                         // connection id: events from an old socket are ignored
   private logsSub: string | null = null;   // subscription id the node gave us for events
   private headsSub: string | null = null;
+  private v4Sub: string | null = null;     // second subscription: V4 swaps for OUR pool ids only (address filter mode)
   private subscribed = false;
   private hadData = false;                 // a real event arrived on this connection (resets the backoff)
   private lastMsgAt = 0;                   // last time ANYTHING arrived (message or pong)
@@ -255,7 +257,7 @@ export class WsBlockReader {
       // (at most every resubscribeMs, so a busy list doesn't cause churn).
       if (this.socket && this.subscribed && this.o.addressFilter !== false &&
           t - this.lastSubAt >= (this.o.resubscribeMs ?? 600_000) &&
-          this.subscribeAddresses().join(',') !== this.subSig) {
+          this.listSig() !== this.subSig) {
         this.counts.resubscribes++;
         this.log(`${this.label}: watch list changed, renewing the subscription`);
         this.dropSocket();
@@ -288,6 +290,7 @@ export class WsBlockReader {
     this.hadData = false;
     this.logsSub = null;
     this.headsSub = null;
+    this.v4Sub = null;
     this.lastMsgAt = this.now();           // the stale check also covers a connect that never finishes
     let sock: SocketLike;
     try {
@@ -313,16 +316,23 @@ export class WsBlockReader {
         this.lastMsgAt = this.now();
         // Same six event types the poll reader asks for. With the address
         // filter on (default), only from our pools + the V4 PoolManager.
-        const filter: { topics: string[][]; address?: string[] } = { topics: [HANDLED_TOPICS] };
+        //   Filter on: TWO subscriptions, so the node only pushes what we use:
+        //     1) Sync/Swap events from our own pool contracts (V2/V3/Solidly/Algebra)
+        //     2) V4 Swap events from the PoolManager, only for OUR V4 pool ids
+        //        (the PoolManager emits every V4 swap on the chain, so filtering
+        //        by pool id there is what keeps the message count down).
+        this.lastSubAt = this.now();
         if (this.o.addressFilter !== false) {
-          const list = this.subscribeAddresses();
-          filter.address = list;
-          this.subSig = list.join(',');
+          const { pools, ids } = this.subscribeLists();
+          this.subSig = pools.join(',') + '|' + ids.join(',');
+          const nonV4 = HANDLED_TOPICS.filter((t) => t !== V4_SWAP_TOPIC);
+          sock.send(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_subscribe', params: ['logs', { address: pools, topics: [nonV4] }] }));
+          const pm = (this.o.poolManager || '').toLowerCase();
+          if (pm && ids.length) sock.send(JSON.stringify({ jsonrpc: '2.0', id: 3, method: 'eth_subscribe', params: ['logs', { address: pm, topics: [[V4_SWAP_TOPIC], ids] }] }));
         } else {
           this.subSig = '';
+          sock.send(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_subscribe', params: ['logs', { topics: [HANDLED_TOPICS] }] }));
         }
-        this.lastSubAt = this.now();
-        sock.send(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_subscribe', params: ['logs', filter] }));
         if (this.o.heads) sock.send(JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'eth_subscribe', params: ['newHeads'] }));
       } catch (e) {
         this.counts.socketErrors++;
@@ -348,6 +358,7 @@ export class WsBlockReader {
     this.subscribed = false;
     this.logsSub = null;
     this.headsSub = null;
+    this.v4Sub = null;
     if (s) {
       try { s.terminate ? s.terminate() : s.close(); } catch { /* already closed */ }
     }
@@ -380,7 +391,7 @@ export class WsBlockReader {
       if (!m || typeof m !== 'object') return;
 
       // Replies to our subscribe requests.
-      if (m.id === 1 || m.id === 2) {
+      if (m.id === 1 || m.id === 2 || m.id === 3) {
         if (m.error || typeof m.result !== 'string') {
           // e.g. the provider refuses an address-less log subscription.
           this.counts.subscribeErrors++;
@@ -398,6 +409,8 @@ export class WsBlockReader {
           this.noteHealth();
           // Gap fill: blocks we may have missed while disconnected.
           if (reconnect && this.lastBlock >= 0) void this.backfill(this.lastBlock, 'gap');
+        } else if (m.id === 3) {
+          this.v4Sub = m.result;
         } else {
           this.headsSub = m.result;
         }
@@ -414,7 +427,7 @@ export class WsBlockReader {
           this.markData();
           return;
         }
-        if (sub && sub === this.logsSub && r) {
+        if (sub && (sub === this.logsSub || sub === this.v4Sub) && r) {
           this.markData();
           const logs: RpcLog[] = Array.isArray(r) ? r : [r];
           for (const l of logs) {
@@ -436,15 +449,16 @@ export class WsBlockReader {
     }
   }
 
-  // Addresses for the subscription: our pools + the V4 PoolManager, sorted
-  // (so the same list always gives the same signature).
-  private subscribeAddresses(): string[] {
-    const set = new Set<string>();
-    for (const a of this.o.addresses() ?? []) if (a && a.length === 42) set.add(a.toLowerCase());
-    const pm = (this.o.poolManager || '').toLowerCase();
-    if (pm) set.add(pm);
-    return [...set].sort();
+  // What the filtered subscriptions ask for: our pool contracts and our V4
+  // pool ids, sorted (so the same lists always give the same signature).
+  private subscribeLists(): { pools: string[]; ids: string[] } {
+    const pools = new Set<string>();
+    for (const a of this.o.addresses() ?? []) if (a && a.length === 42) pools.add(a.toLowerCase());
+    const ids = new Set<string>();
+    for (const id of this.o.v4Ids() ?? []) if (id && id.length === 66) ids.add(id.toLowerCase());
+    return { pools: [...pools].sort(), ids: [...ids].sort() };
   }
+  private listSig(): string { const { pools, ids } = this.subscribeLists(); return pools.join(',') + '|' + ids.join(','); }
 
   private utcDay(t: number): string { return new Date(t).toISOString().slice(0, 10); }
 
