@@ -580,7 +580,7 @@ export function formatStartup(chains: Record<string, { online: boolean }>): stri
 export function formatExecutionWarning(): string {
   return [
     '⚠️ <b>EXECUTION_ENABLED is set</b>',
-    'Live trading is not built yet. Bot is still shadow-only.',
+    'Live trading is half set up (LIVE_SEND_CONFIRM / BOT_PRIVATE_KEY missing): still dry run. Check docs/GO_LIVE_CHECKLIST.md.',
   ].join('\n');
 }
 

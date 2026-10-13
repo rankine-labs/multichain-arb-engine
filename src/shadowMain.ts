@@ -1862,9 +1862,8 @@ console.log(
       });
 });
 
-// Live trading is not implemented yet (adapters' fireTransaction() are
-// placeholders). Make sure flipping the switch early can't be mistaken for
-// the bot actually trading.
+// Live trading half set up (EXECUTION_ENABLED without the other live
+// settings): say so, so it can't be mistaken for the bot actually trading.
 if (executionRequested() && !robinhoodSender.live) {
       console.warn('[execution] EXECUTION_ENABLED=true but LIVE_SEND_CONFIRM / BOT_PRIVATE_KEY not set -- dry run only');
       await sendTelegramMessage(formatExecutionWarning());

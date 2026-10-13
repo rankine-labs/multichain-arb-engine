@@ -210,6 +210,9 @@ Needed before loops can go live (from [LOOP_TRADER.md](LOOP_TRADER.md)):
 - Owner approval of a few days of loop practice numbers.
 - Own money in WETH/USDG (a flash lender must not sit on the loop).
 
+Information only: gas per loop trade measured in the PR #116 fork tests:
+3 pools 502k, 4 pools 646k, 5 pools 758k.
+
 ## 7. One-page tick box
 
 **Before Friday**
