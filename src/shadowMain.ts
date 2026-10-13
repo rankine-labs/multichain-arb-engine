@@ -136,6 +136,8 @@ import { FastSender, SafetyGate, safetyConfigFromEnv } from './execution/fastSen
 import { DEFAULT_FILTER_CONFIG } from './core/fastFilter';
 import { checkLiveReady } from './execution/liveReadiness';
 import { LiveTradeTracker } from './execution/liveTracker';
+import { LiveTradeLog } from './execution/liveTradeLog';
+import { SafetyAlerts } from './execution/safetyAlerts';
 import { findStandingGaps } from './core/gapScanner';
 import { CompetitorTracker } from './core/competitorTracker';
 import { pickRobinhoodReadRpc, robinhoodSendRpc, redact, ROBINHOOD_PUBLIC_RPC } from './config/robinhoodEndpoints';
@@ -1070,6 +1072,12 @@ setInterval(() => { void raceChecker.tick(); }, 5_000);
 // New pool counter (set up with the chain-wide scan further down; read by the reports).
 let newPoolWatchRef: NewPoolWatch | null = null;
 
+// Live only: every real send and result goes to data/live-trades.jsonl (read
+// by the status page), and Telegram alerts fire when live sending pauses
+// (daily loss cap, kill switch, bad setting) or 75% of the cap is used.
+const liveTradeLog = new LiveTradeLog();
+const safetyAlerts = new SafetyAlerts((html) => sendTelegramMessage(html), safetyConfigFromEnv().dailyLossCapUsd);
+
 // LIVE results (only used once live sending is switched on): receipt, profit
 // from the contract's Executed event, gas cost; losses feed the daily cap.
 const liveTracker = new LiveTradeTracker({
@@ -1080,7 +1088,8 @@ const liveTracker = new LiveTradeTracker({
             const dec = TOKEN_DECIMALS.robinhood?.[token.toLowerCase()];
             return px === null || dec === undefined ? null : (Number(raw) / 10 ** dec) * px;
       },
-      recordLoss: (usd) => safetyGate.recordLoss(usd),
+      recordLoss: (usd) => { safetyGate.recordLoss(usd); safetyAlerts.onLoss(safetyGate.lossTodayUsd()); },
+      onResult: (r) => liveTradeLog.result(r),
       noteGasUsed: (gas) => robinhoodSender.noteGasUsed(gas),
       notify: (html) => sendTelegramMessage(html),
       onSettled: (hash) => safetyGate.releasePending(hash),
@@ -1402,6 +1411,7 @@ const fireTrade = async (o: {
             if (!gate.ok) {
                   const r = 'reason' in gate ? gate.reason.replace(/\$\d+/g, '$N').replace(/0x[0-9a-f]+/gi, '0x…') : 'blocked';
                   fireStats.blocked.set(r, (fireStats.blocked.get(r) ?? 0) + 1);
+                  if (robinhoodSender.live) { liveTradeLog.noteBlocked(r); safetyAlerts.onBlocked('reason' in gate ? gate.reason : '', safetyGate.lossTodayUsd(true)); }
                   return;
             }
             if (robinhoodSender.live && !dry.to) {
@@ -1418,13 +1428,16 @@ const fireTrade = async (o: {
             }
             const readyMs = Date.now() - o.seenAtMs;
             if (o.source === 'trade') fireStats.readyMs.push(readyMs);
+            const tradeLabel = `${symbolOf(o.chain, o.tokenIn)}/${symbolOf(o.chain, o.tokenOut)} ${o.buyPool.dex}>${o.sellPool.dex}`;
+            if (fired.live && !fired.txHash && fired.error) liveTradeLog.sendFailed(tradeLabel, o.tradeSizeUsd, fired.error);
             if (fired.txHash) {
                   fireStats.sent++;
+                  liveTradeLog.sent(fired.txHash, tradeLabel, o.tradeSizeUsd, netProfitUsd);
                   // Our balances change when it lands: re-read them a few seconds later.
                   setTimeout(() => { void refreshOwnMoney(); }, 3_000);
                   // Worst-case gas (2x today's cost) held against the daily loss cap until the receipt.
                   safetyGate.reservePending(fired.txHash, 2 * rhGasUsd(0.05));
-                  liveTracker.track(fired.txHash, { expectedProfitUsd: netProfitUsd, label: `${symbolOf(o.chain, o.tokenIn)}/${symbolOf(o.chain, o.tokenOut)} ${o.buyPool.dex}>${o.sellPool.dex}` });
+                  liveTracker.track(fired.txHash, { expectedProfitUsd: netProfitUsd, label: tradeLabel });
             }
             console.log(`[fire] robinhood ${fired.live ? 'LIVE' : 'DRY RUN'} (${o.source}) ready ${readyMs}ms after ${o.source === 'trade' ? 'the trigger' : 'the price update'} (sign ${fired.signMs.toFixed(1)}ms)` +
                   `${fired.txHash ? ` tx ${fired.txHash}` : ''}${fired.error ? ` error: ${fired.error}` : ''}`);
