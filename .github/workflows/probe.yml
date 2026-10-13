@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       only:
-        description: 'Run one step only: feeds, sim, pairs, watch, universe, backtest, latency, lenders, smoke, seed, routers, v4, arbsys, nodes, multicall, simv1, ramsessim, routes, venues, fablesfee, blockreader, urv4 (blank = all except backtest)'
+        description: 'Run one step only: feeds, sim, pairs, watch, universe, backtest, latency, lenders, smoke, seed, routers, v4, arbsys, nodes, multicall, simv1, ramsessim, routes, venues, fablesfee, blockreader, urv4, nvda (blank = all except backtest)'
         required: false
         default: ''
 
@@ -85,6 +85,17 @@ jobs:
           echo "$out"
           out="${out//'%'/'%25'}"; out="${out//$'\n'/'%0A'}"
           echo "::notice title=Ramses sim probe::${out}"
+      # NVDA (Oct 13): why every USDG/NVDA practice check breaks. Looks at the
+      # token (pause / allowlist functions), whether NVDA can move, the pools
+      # and the bot's own check with a call trace. Read-only.
+      - name: NVDA token and check probe (read-only)
+        if: inputs.only == 'nvda'
+        shell: bash
+        run: |
+          out=$(timeout 900 node .scripts-build/scripts/probe-nvda.js 2>&1 | tail -120)
+          echo "$out"
+          out="${out//'%'/'%25'}"; out="${out//$'\n'/'%0A'}"
+          echo "::notice title=NVDA probe::${out}"
       - name: Probe free simulation on real chains
         if: inputs.only == '' || inputs.only == 'sim'
         shell: bash
