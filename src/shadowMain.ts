@@ -90,7 +90,7 @@ import { ROBINHOOD_SCAN_FACTORIES } from './config/knownAddresses';
 const RH_V4_SCAN = process.env.RH_V4_SCAN !== '0';
 import { buildExecuteCall, executionRequested, executorConfig, pickV3Lender, kindForPool } from './execution/executorCalldata';
 import { GasModel, GasCalibration, gasSettingsFromEnv, routeKeyFor, twoPoolKey, defaultUnitsFor, costsLine } from './core/gasModel';
-import { recordEventFee, eventFeeCounts, feeFromEventsOn } from './core/eventFees';
+import { recordEventFee, eventFeeCounts, feeFromEventsOn, setHeadBlockSource } from './core/eventFees';
 import { OwnMoneyBook, useOwnMoney } from './core/ownMoney';
 import { BlockReader, PoolUpdate } from './core/blockReader';
 import { AutoVet, CheckOutcome } from './core/autoVet';
@@ -985,15 +985,28 @@ const gasModel = new GasModel(gasSettingsFromEnv(), new GasCalibration('data/gas
 // kinds: the two pools' executor kinds when known (finer calibration).
 const rhGasUsd = (fallback: number, loan: boolean = !RH_OWN_MONEY, kinds?: (number | null)[]): number =>
       gasModel.twoPoolUsd(loan, kinds && kinds.every((k) => k !== null) ? kinds as number[] : undefined, fallback);
+// Event fees are "newer" than a fee read by BLOCK (core/eventFees.ts): the
+// current block, estimated from the sender's 2 s block reads.
+setHeadBlockSource(() => { const d = robinhoodSender.deadlineBlock(1); return d === null ? null : Number(d) - 1; });
 // One receipt of our own live trade -> gas calibration. Asks the node for
 // the raw receipt once to read Arbitrum's gasUsedForL1 (the parent-chain
-// part, which the live estimate adds separately at today's price).
+// part). Calibration learns the trade's OWN gas (gasUsed - gasUsedForL1),
+// the same thing practice replays measure; the estimate then adds the
+// parent-chain part at today's price (fastSender's realistic-calldata read).
+// The first 20 live receipts log estimated vs actual parent-chain gas.
+let l1Compared = 0;
 const noteReceiptGas = async (key: string, hash: string, gas: bigint, success: boolean) => {
       let l1: bigint | null = null;
       try {
             const raw = await robinhoodReadProvider.send('eth_getTransactionReceipt', [hash]);
             if (raw?.gasUsedForL1 !== undefined && raw?.gasUsedForL1 !== null) l1 = BigInt(raw.gasUsedForL1);
       } catch { /* no L1 split: the whole gasUsed counts (errs on the high side) */ }
+      if (l1Compared < 20) {
+            l1Compared++;
+            const est = robinhoodSender.l1GasNow;
+            console.log(`[gas] live receipt ${hash.slice(0, 10)}: parent-chain gas estimated ${est} vs actual ${l1 ?? '?'}` +
+                  (l1 !== null && l1 > est ? ' (UNDER-estimated: raise FIRE_L1_CALLDATA_BYTES)' : '') + ` | total gas ${gas}`);
+      }
       gasModel.noteReceipt(key, gas, l1, success, defaultUnitsFor(key));
 };
 // Dry-run "would have earned" totals (core/dryRunPnl.ts), saved so restarts

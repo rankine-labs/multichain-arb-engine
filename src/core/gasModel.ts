@@ -102,6 +102,9 @@ export function routeKeyFor(kinds: number[], loan: boolean): string {
   return kinds.length === 2 ? twoPoolKey(kinds, loan) : loopKey(kinds.length);
 }
 
+// Calibrated units never go below this share of the route's default.
+export const CALIBRATION_FLOOR = 0.75;
+
 // Sane range for one sample of gas units (anything outside is a bad reading).
 export const MIN_SAMPLE_UNITS = 50_000;
 export const MAX_SAMPLE_UNITS = 5_000_000;
@@ -153,10 +156,13 @@ export class GasCalibration {
   median(key: string): number | null { return median(this.samples.get(key) ?? []); }
 
   // Units to use: the median once there are enough samples, else the default.
+  // Review fix (Oct 13): never below CALIBRATION_FLOOR (75%) of the
+  // fork-measured default for that kind of trade, so a run of unusually
+  // cheap samples can't make costs look much lower than measured.
   units(key: string, defaultUnits: number, minSamples: number): { units: number; calibrated: boolean; samples: number } {
     const n = this.count(key);
     const med = n >= minSamples ? this.median(key) : null;
-    return med !== null ? { units: med, calibrated: true, samples: n } : { units: defaultUnits, calibrated: false, samples: n };
+    return med !== null ? { units: Math.max(med, defaultUnits * CALIBRATION_FLOOR), calibrated: true, samples: n } : { units: defaultUnits, calibrated: false, samples: n };
   }
 
   // Everything, for the save file and tests.
@@ -282,8 +288,11 @@ export class GasModel {
   }
 
   // One live receipt of our own trade. gasUsed = receipt.gasUsed;
-  // gasUsedForL1 = Arbitrum's parent-chain part of it (taken out, because
-  // the live estimate adds the CURRENT posting cost separately). Reverted
+  // gasUsedForL1 = Arbitrum's parent-chain part of it. Calibration learns the
+  // trade's own (L2) gas only, the same thing practice replays measure; the
+  // live estimate adds the parent-chain part at today's price from a
+  // realistic-size calldata read (fastSender.refreshL1Gas). Without the split
+  // the whole gasUsed is kept (errs high). Reverted
   // trades count only if they ran most of the route (>= 60% of the expected
   // gas): an early revert (e.g. "too late") used far less gas than a real
   // trade and would make every estimate too low.

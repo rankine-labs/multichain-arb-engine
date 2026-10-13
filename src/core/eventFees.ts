@@ -20,11 +20,20 @@ import { PoolState, ObservedFee } from './types';
 //   direction and the swap maths uses it while it is NEWER than the last fee
 //   read from the chain (a fresh read wins again until the next swap).
 //
+//   "Newer" is decided by BLOCK NUMBER (review fix, Oct 13): each fee read
+//   remembers the chain's block at that moment (feeReadBlock) and an event
+//   counts only if its block is after that. So a gap-fill replay of old
+//   blocks can never beat a fresher read just because it was processed later.
+//
 //   Safety rules:
-//     - only fees seen in the last FEE_EVENT_MAX_AGE_MS (default 10 min);
-//     - both directions seen: the higher of the two (trades go both ways);
-//     - only one direction seen on a hooked V4 pool (Fables can charge more
-//       one way): never BELOW the fee the bot would otherwise use;
+//     - only fees from the last FEE_EVENT_MAX_AGE_MS (default 10 min; also
+//       counted in blocks when the current block is known);
+//     - DIRECTION-AWARE (review fix, Oct 13): Fables hooks and Algebra
+//       Integral plugins can charge a different fee each way. A trade uses
+//       the fee seen for ITS direction. If only the other direction was
+//       seen, it uses the higher of that and the read fee: never lower.
+//       Callers that don't say the direction get the higher of the two
+//       directions (or of the one seen and the read fee);
 //     - hooked V4 pools with the dynamic flag that never had a swap seen:
 //       unchanged (the Fables fee predictor / 0.30% estimate), and counted.
 //   FEE_FROM_EVENTS=0 = old behaviour exactly (events ignored).
@@ -37,6 +46,15 @@ let maxAgeMs = (() => {
   return Number.isFinite(n) && n >= 1_000 ? n : 600_000;
 })();
 let clock: () => number = Date.now;
+// The chain's current block, when the bot knows it (shadowMain sets it).
+// Fee reads stamp it as feeReadBlock; events must be after it to count.
+let headBlock: () => number | null = () => null;
+export function setHeadBlockSource(fn: () => number | null): void { headBlock = fn; }
+export function currentHeadBlock(): number | null {
+  try { const b = headBlock(); return b !== null && Number.isFinite(b) && b > 0 ? Math.floor(b) : null; } catch { return null; }
+}
+// Blocks per millisecond guess for the block-based age limit (Robinhood ~30 ms blocks).
+const BLOCK_MS_GUESS = 30;
 
 export function feeFromEventsOn(): boolean { return enabled; }
 // Tests only: switch on/off, change the age limit and the clock.
@@ -103,17 +121,32 @@ export function recordEventFee(pool: PoolState, ev: SwapFeeEvent, nowMs: number 
   return true;
 }
 
+// Is this event fee still usable? Newer than the last fee read (by block when
+// the read's block is known, else by time) and not too old.
+function usable(x: ObservedFee | undefined, pool: PoolState, nowMs: number, head: number | null): x is ObservedFee {
+  if (!x || !validPips(x.pips)) return false;
+  if (nowMs - x.atMs > maxAgeMs) return false;
+  if (head !== null && head - x.block > maxAgeMs / BLOCK_MS_GUESS) return false;   // old block replayed late
+  if (pool.feeReadBlock !== undefined) return x.block > pool.feeReadBlock;
+  return x.atMs >= (pool.feeReadMs ?? 0);
+}
+
 // The event fee to use for this pool right now, or null = use the normal fee.
-export function eventFeePips(pool: PoolState, nowMs: number = clock()): number | null {
+// zeroForOne: the trade's direction (true = selling token0 / tokenA) when the
+// caller knows it; undefined = could be either way (most conservative).
+export function eventFeePips(pool: PoolState, nowMs: number = clock(), zeroForOne?: boolean): number | null {
   if (!enabled || !pool.observedFee) return null;
-  const since = pool.feeReadMs ?? 0;
-  const fresh = [pool.observedFee.z, pool.observedFee.o]
-    .filter((x): x is ObservedFee => !!x && validPips(x.pips) && x.atMs >= since && nowMs - x.atMs <= maxAgeMs);
-  if (!fresh.length) return null;
-  const top = Math.max(...fresh.map((x) => x.pips));
-  if (fresh.length === 2) return top;
-  // One direction only. Hooked V4 can charge more the other way: never lower.
-  return pool.v4?.hooks ? Math.max(top, readFeePips(pool)) : top;
+  const head = currentHeadBlock();
+  const z = usable(pool.observedFee.z, pool, nowMs, head) ? pool.observedFee.z!.pips : null;
+  const o = usable(pool.observedFee.o, pool, nowMs, head) ? pool.observedFee.o!.pips : null;
+  if (z === null && o === null) return null;
+  if (zeroForOne !== undefined) {
+    const mine = zeroForOne ? z : o, other = zeroForOne ? o : z;
+    if (mine !== null) return mine;                      // seen for this very direction
+    return Math.max(other!, readFeePips(pool));          // only the other way seen: never lower
+  }
+  if (z !== null && o !== null) return Math.max(z, o);   // both seen: the higher
+  return Math.max((z ?? o)!, readFeePips(pool));         // one seen, direction unknown: never lower
 }
 
 // For the hourly report: pools whose fee currently comes from events, and

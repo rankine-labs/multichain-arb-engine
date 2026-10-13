@@ -83,18 +83,23 @@ assert(k === '2p:V2+V3:own' && twoPoolKey([0, 2], false) === k, 'key: exchange m
 assert(twoPoolKey([4, 2], true) === '2p:V3+V4hook:loan' && loopKey(3) === 'loop:3', 'keys for loan / hooked V4 / loops');
 assert(routeKeyFor([0, 2], true) === '2p:V2+V3:loan' && routeKeyFor([0, 2, 2], false) === 'loop:3', 'routeKeyFor: 2 hops = 2-pool, more = loop');
 assert(defaultUnitsFor('2p:V2+V3:loan') === DEFAULT_GAS_LOAN && defaultUnitsFor('2p:any:own') === DEFAULT_GAS_OWN && defaultUnitsFor('loop:4') === loopGasUnits(4), 'default units per key');
-for (let i = 0; i < 9; i++) model.notePractice(k, 200_000n + BigInt(i) * 1000n);
+for (let i = 0; i < 9; i++) model.notePractice(k, 300_000n + BigInt(i) * 1000n);
 const nine = model.twoPool(false, [2, 0]);
 assert(!nine.calibrated && nine.units === DEFAULT_GAS_OWN && nine.samples === 9, '9 samples: still the default (needs 10)');
-model.notePractice(k, 209_000n);
+model.notePractice(k, 309_000n);
 const ten = model.twoPool(false, [2, 0]);
-assert(ten.calibrated && ten.units === 204_500 && ten.samples === 10, `10 samples: median ${ten.units} used`);
+assert(ten.calibrated && ten.units === 304_500 && ten.samples === 10, `10 samples: median ${ten.units} used`);
 assert(ten.usd < own.usd, 'calibrated lower gas -> lower cost than the default');
 assert(calib.count(twoPoolAnyKey(false)) === 10 && model.twoPool(false).calibrated, 'samples also feed the funding-wide key (used when the exchanges are unknown)');
 assert(!model.twoPool(true).calibrated, 'own-money samples do not calibrate loans');
 assert(!calib.add(k, 10_000n) && !calib.add(k, 9_000_000n) && calib.count(k) === 10, 'implausible samples (10k, 9M) rejected');
 const unknownMix = model.twoPool(false, [1, 3]);
-assert(unknownMix.calibrated && unknownMix.units === 204_500, 'exchange mix without its own samples: funding-wide median');
+assert(unknownMix.calibrated && unknownMix.units === 304_500, 'exchange mix without its own samples: funding-wide median');
+// floor: calibrated units never below 75% of the default
+const cheapKey = twoPoolKey([0, 0], true);
+for (let i = 0; i < 10; i++) model.notePractice(cheapKey, 150_000n);
+const cheap = model.twoPool(true, [0, 0]);
+assert(cheap.calibrated && cheap.units === DEFAULT_GAS_LOAN * 0.75, `calibrated median 150k clamped up to 75% of the 477k default (${cheap.units})`);
 // rolling window
 const small = new GasCalibration(null, 5);
 for (let i = 1; i <= 8; i++) small.add('loop:3', i * 100_000);

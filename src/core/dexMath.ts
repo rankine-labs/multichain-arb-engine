@@ -29,11 +29,14 @@ const Q96 = 1n << 96n;
 // ----------------------------------------------------------------------------
 const PIPS = 1_000_000n; // 100% in pips
 
-export function feePipsOf(pool: PoolState): number {
+// zeroForOne (optional): the trade's direction (true = tokenA/token0 in).
+// Only matters for fees seen in swap events, which are kept per direction;
+// left out = the safe choice for either direction.
+export function feePipsOf(pool: PoolState, zeroForOne?: boolean): number {
   // Dynamic-fee pools: the fee real swaps just paid (Swap events), while it
   // is newer than the last fee read. null when off / nothing fresh (Oct 13,
   // FEE_FROM_EVENTS, core/eventFees.ts).
-  const ev = eventFeePips(pool);
+  const ev = eventFeePips(pool, undefined, zeroForOne);
   if (ev !== null) return ev;
   if (pool.feePips !== undefined && Number.isInteger(pool.feePips) && pool.feePips >= 0 && pool.feePips < 1_000_000) return pool.feePips;
   // V4 pools carry their real fee in pips (dynamic-fee flag values are >= 1e6: ignored).
@@ -44,8 +47,8 @@ export function feePipsOf(pool: PoolState): number {
 
 // The part of amountIn the pool actually prices after taking its fee.
 // Same rounding as before: rounded down.
-export function amountInAfterFee(pool: PoolState, amountIn: bigint): bigint {
-  return (amountIn * (PIPS - BigInt(feePipsOf(pool)))) / PIPS;
+export function amountInAfterFee(pool: PoolState, amountIn: bigint, zeroForOne?: boolean): bigint {
+  return (amountIn * (PIPS - BigInt(feePipsOf(pool, zeroForOne)))) / PIPS;
 }
 
 export function computeAmountOut(pool: PoolState, tokenInIsA: boolean, amountIn: bigint): bigint | null {
@@ -53,7 +56,7 @@ export function computeAmountOut(pool: PoolState, tokenInIsA: boolean, amountIn:
 
   if (pool.poolType === 'v2') {
     if (pool.reserveA === undefined || pool.reserveB === undefined) return null;
-    const amountInWithFee = amountInAfterFee(pool, amountIn);
+    const amountInWithFee = amountInAfterFee(pool, amountIn, tokenInIsA);
 
     if (tokenInIsA) {
       if (pool.reserveA + amountInWithFee === 0n) return null;
@@ -77,7 +80,7 @@ export function computeAmountOut(pool: PoolState, tokenInIsA: boolean, amountIn:
 
     // Direction: tokenA is the pool's token0, so tokenInIsA = "zeroForOne"
     // (token0 in, token1 out). virtualX is token0's side, virtualY token1's.
-    const amountInWithFee = amountInAfterFee(pool, amountIn);
+    const amountInWithFee = amountInAfterFee(pool, amountIn, tokenInIsA);
 
     if (tokenInIsA) {
       const newVirtualX = virtualX + amountInWithFee;

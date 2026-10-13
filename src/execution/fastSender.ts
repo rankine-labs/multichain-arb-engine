@@ -237,14 +237,26 @@ export class FastSender {
     this.maxFeePerGas = base * 2n + 1n;
   }
 
-  // Parent-chain (L1) part of the gas for ~1 KB of calldata, from
+  // Parent-chain (L1) part of the gas for one trade's calldata, from
   // NodeInterface.gasEstimateL1Component. Only meaningful on Arbitrum/Orbit
   // chains; elsewhere the call fails and the extra stays 0.
+  //
+  // Review fix (Oct 13): this used to ask about 1,000 copies of the byte 0xab.
+  // The parent chain charges for data AFTER compression, and a repeated byte
+  // compresses to almost nothing, so the estimate was far too low. Now it
+  // asks about RANDOM bytes (which don't compress) of our real trade size:
+  // a 2-pool executor call is 772 bytes (measured from encodeExecuteRaw), so
+  // FIRE_L1_CALLDATA_BYTES defaults to 800. Real calldata (many zero bytes)
+  // compresses somewhat, so this errs on the high side.
   private l1Tick = 0;
+  private readonly l1Bytes = (() => {
+    const n = Number(process.env.FIRE_L1_CALLDATA_BYTES ?? 800);
+    return Number.isInteger(n) && n >= 100 && n <= 20_000 ? n : 800;
+  })();
   private async refreshL1Gas() {
     if (this.l1Tick++ % 5 !== 0) return; // every ~10 s is plenty
     const iface = new ethers.Interface(['function gasEstimateL1Component(address,bool,bytes) returns (uint64,uint256,uint256)']);
-    const data = iface.encodeFunctionData('gasEstimateL1Component', [ethers.ZeroAddress, false, '0x' + 'ab'.repeat(1_000)]);
+    const data = iface.encodeFunctionData('gasEstimateL1Component', [ethers.ZeroAddress, false, ethers.hexlify(ethers.randomBytes(this.l1Bytes))]);
     const ret = await this.readProvider.call({ to: '0x00000000000000000000000000000000000000C8', data });
     const [l1] = iface.decodeFunctionResult('gasEstimateL1Component', ret);
     this.l1Gas = BigInt(l1);
@@ -295,6 +307,10 @@ export class FastSender {
     if (!this.maxFeePerGas || !ethUsd || !(ethUsd > 0)) return null;
     return (Number((gasUnits + this.l1Gas) * (this.maxFeePerGas / 2n)) / 1e18) * ethUsd;
   }
+
+  // Current parent-chain posting gas estimate for one trade (gas units), for
+  // comparing with real receipts' gasUsedForL1.
+  get l1GasNow(): bigint { return this.l1Gas; }
 
   // When the gas price was last read successfully (0 = never). The gas model
   // (core/gasModel.ts) stops trusting the live price when this gets old.

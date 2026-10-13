@@ -1,5 +1,5 @@
 import { parsePoolLogs, V4_SWAP_TOPIC, ALGEBRA_INTEGRAL_SWAP_TOPIC, V3_SWAP_TOPIC, RpcLog } from '../core/blockReader';
-import { recordEventFee, eventFeePips, eventFeeCounts, setFeeFromEvents, isDynamicFeePool } from '../core/eventFees';
+import { recordEventFee, eventFeePips, eventFeeCounts, setFeeFromEvents, isDynamicFeePool, setHeadBlockSource } from '../core/eventFees';
 import { feePipsOf, computeAmountOut } from '../core/dexMath';
 import { PoolState } from '../core/types';
 
@@ -62,8 +62,8 @@ assert(isDynamicFeePool(v4Pool()) && isDynamicFeePool(algPool()), 'Fables (hooke
 const a = algPool();
 a.feeReadMs = now - 1_000;
 assert(recordEventFee(a, au, now) && a.observedFee?.z?.pips === 1500, 'Algebra: stored fee = override 1200 + plugin 300');
-// One direction only on a non-hooked pool: the observed fee is used directly.
-assert(feePipsOf(a) === 1500, 'observed fee newer than the globalState read: used by the swap maths (1500 instead of 500)');
+assert(feePipsOf(a) === 1500 && feePipsOf(a, true) === 1500, 'observed fee newer than the globalState read: used by the swap maths (1500 instead of 500)');
+assert(feePipsOf(a, false) === 1500, 'other direction (not seen): max(seen 1500, read 500) = 1500');
 // Fee read again later: the read wins.
 a.feeReadMs = now + 1;
 assert(feePipsOf(a) === 500, 'a fee read newer than the event: the read wins again');
@@ -72,6 +72,17 @@ a.feeReadMs = now - 1_000;
 const a2 = algPool();
 recordEventFee(a2, { block: 102, zeroForOne: false, algebraFee: { override: 0, plugin: 250 } }, now);
 assert(a2.observedFee?.o?.pips === 750, 'Algebra pluginFee only: own fee 500 + 250');
+// Direction-aware, Algebra too (review fix): a LOW fee seen one way never
+// lowers the other direction below the read fee.
+const a3 = algPool();
+a3.feeReadMs = now - 1_000;
+recordEventFee(a3, { block: 110, zeroForOne: true, algebraFee: { override: 100, plugin: 0 } }, now);
+assert(feePipsOf(a3, true) === 100, 'Algebra: trade in the seen direction uses the seen fee (100)');
+assert(feePipsOf(a3, false) === 500, 'Algebra: trade in the OTHER direction never below the read fee (500, not 100)');
+assert(feePipsOf(a3) === 500, 'Algebra: direction unknown: never below the read fee');
+const amtSeen = computeAmountOut(a3, true, 10n ** 15n)!, amtOther = computeAmountOut(a3, false, 10n ** 15n)!;
+const amtRead = computeAmountOut(algPool(), false, 10n ** 15n)!;
+assert(amtSeen > amtRead && amtOther === amtRead, 'swap maths passes the direction: cheaper only in the seen direction');
 // 0/0: the swap paid the pool's own fee -> older override for that direction forgotten
 recordEventFee(a2, { block: 103, zeroForOne: false, algebraFee: { override: 0, plugin: 0 } }, now);
 assert(!a2.observedFee?.o && feePipsOf(a2) === 500, 'Algebra 0/0 fees: forget the old override, back to the read fee');
@@ -79,7 +90,8 @@ assert(!a2.observedFee?.o && feePipsOf(a2) === 500, 'Algebra 0/0 fees: forget th
 // V4 hooked (Fables): both directions -> the higher; one direction -> never below the source fee
 const p = v4Pool();
 recordEventFee(p, { ...v4u, v4Fee: 2000 }, now);
-assert(eventFeePips(p, now) === 3000 && feePipsOf(p) === 3000, 'hooked V4, one direction seen lower (2000) than the source (3000): stays 3000 (other direction unknown)');
+assert(eventFeePips(p, now) === 3000 && feePipsOf(p) === 3000 && feePipsOf(p, false) === 3000, 'hooked V4, one direction seen lower (2000) than the source (3000): stays 3000 unless trading that direction');
+assert(feePipsOf(p, true) === 2000, 'hooked V4: trading the seen direction uses the seen fee (2000)');
 recordEventFee(p, { ...v4u, v4Fee: 4500 }, now);
 assert(feePipsOf(p) === 4500, 'hooked V4, one direction seen higher (4500): 4500');
 recordEventFee(p, { ...v4back, block: 101 }, now);
@@ -103,6 +115,22 @@ recordEventFee(p4, au, now);
 now += 600_001;
 assert(feePipsOf(p4) === 500, 'event fee older than 10 min: ignored');
 now -= 600_001;
+
+// Block-based freshness (review fix): with a known chain block, an event
+// counts only if its block is AFTER the fee read's block, however late it
+// was processed (gap-fill replays of old blocks).
+setHeadBlockSource(() => 1_000);
+const b = algPool();
+b.feeReadBlock = 900; b.feeReadMs = now + 5_000;     // read later in wall time than the event is processed
+recordEventFee(b, { block: 950, zeroForOne: true, algebraFee: { override: 1200, plugin: 0 } }, now);
+assert(feePipsOf(b, true) === 1200, 'event block 950 after read block 900: used (even though processed before the read time)');
+const b2 = algPool();
+b2.feeReadBlock = 960; b2.feeReadMs = now - 60_000;  // read EARLIER in wall time
+recordEventFee(b2, { block: 950, zeroForOne: true, algebraFee: { override: 1200, plugin: 0 } }, now);
+assert(feePipsOf(b2, true) === 500, 'replayed old event (block 950) vs newer read (block 960): the read wins');
+setHeadBlockSource(() => 1_000_000);
+assert(feePipsOf(b, true) === 500, 'event far behind the current block (block-based age limit): ignored');
+setHeadBlockSource(() => null);
 
 // Counts for the report
 const fresh = v4Pool();

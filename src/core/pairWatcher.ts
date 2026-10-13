@@ -3,6 +3,7 @@ import { dirname } from 'path';
 import { ethers } from 'ethers';
 import { ChainName, PoolState } from './types';
 import { PoolCache } from './poolCache';
+import { currentHeadBlock } from './eventFees';
 import { makeCaller } from './universeScan';
 import {
   resolveAndFetchV2Pool, resolveAndFetchSolidlyV2Pool, resolveAllV3Pools, resolveAllV4Pools,
@@ -278,6 +279,7 @@ export async function discoverPairPoolsMulticall(
       // conservative estimate so gaps are never overstated, unless a fee
       // source (the Fables fee predictor) gives a number for this pool.
       ...hookedFee(lpFee, h.id, opts.hookedFeeOf),
+      ...discoveryStamp(now),
       sqrtPriceX96: sqrt, liquidity: liq,
       lastUpdatedBlock: 0, lastUpdatedMs: now,
       v4: { fee: h.fee, tickSpacing: h.tickSpacing, native: h.native, poolManager: ethers.getAddress(h.venue.poolManager!.toLowerCase()), stateView: ethers.getAddress(h.venue.factory.toLowerCase()), hooks: h.hooks },
@@ -288,7 +290,7 @@ export async function discoverPairPoolsMulticall(
       const sqrt = word(r2[base], 0), fee = word(r2[base], 2), liq = word(r2[base + 1]), t0 = addrOf(r2[base + 2]), t1 = addrOf(r2[base + 3]);
       if (!sqrt || !liq || !t0 || !t1 || fee === null) continue;
       pools.push({ chain, dex: p.venue.dex, poolAddress: addr, poolType: 'v3', variant: 'algebra', tokenA: t0, tokenB: t1,
-        sqrtPriceX96: sqrt, liquidity: liq, feeBps: Math.round(Number(fee) / 100), feePips: Number(fee), lastUpdatedBlock: 0, lastUpdatedMs: now });
+        sqrtPriceX96: sqrt, liquidity: liq, feeBps: Math.round(Number(fee) / 100), feePips: Number(fee), lastUpdatedBlock: 0, lastUpdatedMs: now, ...discoveryStamp(now) });
       continue;
     }
     if (p.kind === 'v3') {
@@ -336,6 +338,13 @@ let processHookedFeeOf: HookedFeeSource | null = null;
 export function setHookedFeeSource(fn: HookedFeeSource | null): void { processHookedFeeOf = fn; }
 export function getHookedFeeSource(): HookedFeeSource | null { return processHookedFeeOf; }
 
+// When/at which block a changing fee was read during discovery (event fees
+// from earlier blocks then never override it; core/eventFees.ts).
+function discoveryStamp(now: number): { feeReadMs: number; feeReadBlock?: number } {
+  const b = currentHeadBlock();
+  return b !== null ? { feeReadMs: now, feeReadBlock: b } : { feeReadMs: now };
+}
+
 // A usable fee in pips: a whole number above 0 and below 100%.
 const validPips = (f: unknown): f is number => typeof f === 'number' && Number.isInteger(f) && f > 0 && f < 1_000_000;
 
@@ -377,6 +386,8 @@ export async function refreshPoolsBatch(
   const res = await callMany(calls);
   const word = (r: string | null, i: number) => (r && r.length >= 2 + 64 * (i + 1) ? BigInt('0x' + r.slice(2 + 64 * i, 2 + 64 * (i + 1))) : null);
   const now = Date.now();
+  // Chain block at (just after) the read, for event-fee freshness (core/eventFees.ts).
+  const readBlock = currentHeadBlock();
   const out: PoolState[] = [];
   pools.forEach((p, k) => {
     const i = idx[k];
@@ -389,8 +400,10 @@ export async function refreshPoolsBatch(
       const dyn = p.variant === 'algebra' ? word(res[i], 2) : null;
       // feeReadMs: when this changing fee was read, so a fee seen in a newer
       // swap event can take over (core/eventFees.ts) and an older one can't.
-      const fee = p.v4?.hooks ? { ...hookedFee(word(res[i], 3), p.poolAddress, opts.hookedFeeOf), feeReadMs: now }
-        : dyn !== null && dyn < 1_000_000n ? { feePips: Number(dyn), feeBps: Math.round(Number(dyn) / 100), feeReadMs: now } : {};
+      // feeReadBlock: the chain's block at this read (event fees must be newer).
+      const stamp = { feeReadMs: now, ...(readBlock !== null ? { feeReadBlock: readBlock } : {}) };
+      const fee = p.v4?.hooks ? { ...hookedFee(word(res[i], 3), p.poolAddress, opts.hookedFeeOf), ...stamp }
+        : dyn !== null && dyn < 1_000_000n ? { feePips: Number(dyn), feeBps: Math.round(Number(dyn) / 100), ...stamp } : {};
       if (sqrt && liq !== null) out.push({ ...p, ...fee, sqrtPriceX96: sqrt, liquidity: liq, lastUpdatedMs: now });
     } else if (p.poolType === 'v2') {
       const r0 = word(res[i], 0), r1 = word(res[i], 1);
