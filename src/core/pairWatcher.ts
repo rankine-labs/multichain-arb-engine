@@ -543,6 +543,7 @@ export class PairWatcher {
     }
     const metaFor = [a, b].filter((t) => !this.tokenMeta.has(t.toLowerCase()));
     this.discoveryCallMany ??= (await makeCaller(this.discoveryProvider)).callMany;
+    const readStartedMs = Date.now(); // anything written to the cache after this is newer than this read
     const { pools, meta: gotMeta } = await discoverPairPoolsMulticall(this.discoveryCallMany, this.chain, this.venues, a, b, metaFor, { hookedFeeOf: this.hookedFeeOf });
     for (const [t, m] of Object.entries(gotMeta)) {
       if (m === 'not-a-token') { this.badToken.set(t, Date.now()); if (this.badToken.size > 5_000) this.badToken.clear(); continue; }
@@ -551,7 +552,9 @@ export class PairWatcher {
     }
     const ma = this.tokenMeta.get(a.toLowerCase()), mb = this.tokenMeta.get(b.toLowerCase());
     if (!ma || !mb) return;
-    for (const p of pools) this.cache.upsert(p);
+    // Never put this read over a newer copy (block reader / trade feed wrote
+    // the pool while the lookup was in flight): same rule as the re-sync.
+    for (const p of pools) this.cache.upsertIfNotNewer(p, readStartedMs);
     // One pool = nothing to arb against: remember that, don't track the pair.
     if (pools.length < 2) {
       this.singlePool.set(k, Date.now());
@@ -734,6 +737,50 @@ export class PairWatcher {
 
   // Pool addresses per watched pair (for the standing-gap scanner).
   watchedPairPools(): string[][] { return [...this.pairs.values()].map((p) => p.pools); }
+
+  // Is this token pair on the watch list? (Used to tell "RPC lookup for a
+  // pool we should already have known" apart from a truly new pair.)
+  isWatched(a: string, b: string): boolean { return this.pairs.has(this.key(a, b)); }
+
+  // PRELOAD (SPEED_PRELOAD, see shadowMain): make sure every pool on the
+  // watch list has a usable state in the cache, so a feed trade on a known
+  // pool never has to look the pool up over RPC while the trade waits.
+  //   - pools missing from the cache: their pair is queued for the normal
+  //     bundled lookup (same as a pinned-pair retry), off the hot path
+  //   - pools restored from the last run but never re-read (lastUpdatedMs 0)
+  //     or older than staleMs: re-read now in ONE bundled request (the same
+  //     multicall the 5 s re-sync uses) instead of waiting for the next tick
+  // Never throws. Returns what it did (for the log line and tests).
+  async preload(staleMs = 30_000): Promise<{ pools: number; missingPairs: number; refreshed: number }> {
+    let pools = 0, missingPairs = 0, refreshed = 0;
+    try {
+      const now = Date.now();
+      const stale: PoolState[] = [];
+      for (const [k, p] of this.pairs) {
+        let missing = false;
+        for (const a of p.pools) {
+          pools++;
+          const st = this.cache.get(this.chain, a);
+          if (!st) missing = true;
+          else if (!(st.lastUpdatedMs > 0) || now - st.lastUpdatedMs > staleMs) stale.push(st);
+        }
+        if (missing && !this.inFlight.has(k) && this.queue.length < this.maxQueue) {
+          missingPairs++;
+          this.inFlight.add(k);
+          this.queue.push({ a: p.tokenA, b: p.tokenB });
+        }
+      }
+      if (missingPairs) void this.drain();
+      if (stale.length) {
+        this.callMany ??= (await makeCaller(this.provider)).callMany;
+        const readStartedMs = Date.now();
+        for (const fresh of await refreshPoolsBatch(this.callMany, stale, { hookedFeeOf: this.hookedFeeOf })) {
+          if (this.cache.upsertIfNotNewer(fresh, readStartedMs)) refreshed++;
+        }
+      }
+    } catch { /* node busy: the normal 5 s re-sync still runs */ }
+    return { pools, missingPairs, refreshed };
+  }
 
   stats() {
     let pools = 0;

@@ -165,6 +165,9 @@ import { formatLoopHour } from './core/loopReport';
 import { startMemReport, registerSize } from './core/memReport';
 // Loop trader extra pools: keeps single-pool pairs fresh for the loop finder only (off unless LOOP_TRADER=1).
 import { LoopExtraPools, loopExtraConfigFromEnv, readerAddresses, afterReaderWrite } from './core/loopExtraPools';
+// Speed fixes (Oct 13): stage timers, preload, trust the WebSocket for prices.
+import { StageTimers, StageTrace } from './core/stageTimer';
+import { trustFreshConfigFromEnv, wsTrustProblem, WsFacts } from './core/trustFresh';
 
 async function main() {
 const cache = new PoolCache();
@@ -919,6 +922,19 @@ const FRESH_MS = Number(process.env.FRESH_MS ?? 35_000);
 const MAX_DECISION_RPC_PER_SEC = Number(process.env.MAX_DECISION_RPC_PER_SEC ?? 10);
 let decisionRpcWindow = { at: 0, n: 0 };
 const priceStats = { local: 0, rpc: 0 };
+// SPEED FIXES (Oct 13, owner approved). Each has an off switch in .env:
+//   stage timers (always on, measurement only): where fire-ready time goes,
+//     every 5 min as a [speed] log line and in the hourly report
+//   SPEED_PRELOAD=0   turns off loading every watched pool's price at start
+//                     (and the 1-minute "any watched pool missing?" check)
+//   SPEED_TRUST_WS=0  turns off using cached prices the WebSocket vouches for
+//                     (core/trustFresh.ts has the exact rules)
+//   SPEED_PARALLEL_SEND=1 turns ON parallel sends (off by default; see
+//                     execution/fastSender.ts)
+const stageTimers = new StageTimers();
+const SPEED_PRELOAD = process.env.SPEED_PRELOAD !== '0' && process.env.SPEED_PRELOAD !== 'off';
+const trustCfg = trustFreshConfigFromEnv();
+let wsFacts: WsFacts | null = null; // set once the WebSocket block reader exists (BLOCK_READER_WSS)
 const gapStats = { found: 0, bestUsd: 0, fake: 0, fail: 0 }; // standing gaps (no trigger trade) this hour: confirmed, best real $, fakes muted
 
 // FAST SENDER (Robinhood). Dry run unless the live switches are all set
@@ -1376,6 +1392,7 @@ const fireTrade = async (o: {
       chain: 'avalanche' | 'monad' | 'robinhood'; tokenIn: string; tokenOut: string;
       buyPool: any; sellPool: any; tradeSizeUsd: number; netProfitUsd: number; usdPerTokenIn: number;
       seenAtMs: number; source: 'trade' | 'gap';
+      trace?: StageTrace | null; // stage timers (trigger trades only)
       // Loan fee (pips, 100 = 0.01%) already taken off netProfitUsd when it
       // was worked out: 0 if it was planned as own money. If the lender
       // chosen now charges more (balances moved, or planning priced a lender
@@ -1463,7 +1480,9 @@ const fireTrade = async (o: {
                   fireStats.blocked.set('no executor deployed', (fireStats.blocked.get('no executor deployed') ?? 0) + 1);
                   return;
             }
+            o.trace?.mark('checks');
             const fired = await robinhoodSender.fire(dry.to ?? '0x0000000000000000000000000000000000000000', dry.data);
+            o.trace?.addFire(fired);
             // Dry run: this trade passed every check and would have been sent.
             // Standing gaps carry a simulation-confirmed profit; trigger trades
             // carry the model's estimate (their simulation is counted separately).
@@ -1471,7 +1490,8 @@ const fireTrade = async (o: {
                   // Gap wins are counted where they're confirmed (gap scanner), not here.
                   if (o.source !== 'gap') dryRunPnl.recordModelOnly(netProfitUsd);
             }
-            const readyMs = Date.now() - o.seenAtMs;
+            // Trade seen -> trade SIGNED (the send itself isn't part of "ready").
+            const readyMs = (fired.signedAtMs ?? Date.now()) - o.seenAtMs;
             if (o.source === 'trade') fireStats.readyMs.push(readyMs);
             const tradeLabel = `${symbolOf(o.chain, o.tokenIn)}/${symbolOf(o.chain, o.tokenOut)} ${o.buyPool.dex}>${o.sellPool.dex}`;
             if (fired.live && !fired.txHash && fired.error) liveTradeLog.sendFailed(tradeLabel, o.tradeSizeUsd, fired.error);
@@ -1538,8 +1558,12 @@ setInterval(async () => {
 }, 5_000);
 const pricesAtDecisionRobinhood = async (traded: PoolState, peers: PoolState[]): Promise<[PoolState, PoolState[]]> => {
       const all = [traded, ...peers];
+      let wsTrusted = 0;
       const stale = all.filter((p) => !(FAST_PRICES && Date.now() - p.lastUpdatedMs <= FRESH_MS)
-            && !(p.dex === 'uniswap-v4' && !p.v4) && (p.poolType === 'v2' || p.poolType === 'v3'));
+            && !(p.dex === 'uniswap-v4' && !p.v4) && (p.poolType === 'v2' || p.poolType === 'v3')
+            // SPEED_TRUST_WS: older than FRESH_MS, but the WebSocket proves it's still current.
+            && !(FAST_PRICES && wsTrustProblem(p, wsFacts, cache, trustCfg) === null && ++wsTrusted > 0));
+      if (wsTrusted) stageTimers.noteTrustedWs(wsTrusted);
       priceStats.local += all.length - stale.length;
       if (!stale.length) return [traded, peers];
       const now = Date.now();
@@ -1548,6 +1572,7 @@ const pricesAtDecisionRobinhood = async (traded: PoolState, peers: PoolState[]):
       priceStats.rpc += stale.length;
       const readStartedMs = Date.now();
       let fresh: PoolState[] = [];
+      const refreshT0 = performance.now();
       try {
             rhDecisionCallMany ??= (await makeCaller(robinhoodReadProvider)).callMany;
             fresh = await Promise.race([
@@ -1555,6 +1580,7 @@ const pricesAtDecisionRobinhood = async (traded: PoolState, peers: PoolState[]):
                   new Promise<PoolState[]>((r) => setTimeout(() => r([]), REFRESH_TIMEOUT_MS)),
             ]);
       } catch { fresh = []; }
+      stageTimers.notePriceRefresh(performance.now() - refreshT0); // RPC on the hot path: how long it held the trade
       const byAddr = new Map(fresh.map((f) => [f.poolAddress.toLowerCase(), f]));
       const pick = (p: PoolState, preTrade: boolean): PoolState => {
             const f = byAddr.get(p.poolAddress.toLowerCase());
@@ -1590,11 +1616,14 @@ if (chainOn('avalanche')) chainManager.register(new AvalancheAdapter());
 
 chainManager.onEvent(async (event: RawChainEvent) => {
 const t0 = Date.now();
+// Stage timers (measurement only): lap times from "feed received" onwards.
+const trace = event.chain === 'robinhood' ? stageTimers.begin(event.receivedAtMs) : null;
 // Timestamp every Robinhood feed tx: lets the competitor tracker time rivals.
 if (event.chain === 'robinhood') { rivals.noteFeedTx((event.raw as any)?.hash, event.receivedAtMs); rivalWatch.noteTx((event.raw as any)?.to, (event.raw as any)?.hash, (event.raw as any)?.from, (event.raw as any)?.value); }
 
 const swap = await decoder.decode(event);
 if (!swap) return;
+trace?.mark('decode');
 if (swap.chain === 'robinhood') funnel.tradesRead++;
 
 // Follow the traffic: make sure every pool for this pair is being watched.
@@ -1670,6 +1699,8 @@ if (registerIfApproved('avalanche', entry.dex, resolved)) pool = resolved;
                 if (registerIfApproved('monad', entry.dex, resolved)) pool = resolved;
           }
 
+          // Stage timers: an RPC pool lookup on the hot path (and was the pair already watched?).
+          if (entry?.factory && swap.chain === 'robinhood' && (entry.style === 'v2' || entry.style === 'v3')) stageTimers.noteLookupRpc(robinhoodWatcher.isWatched(swap.tokenIn, swap.tokenOut));
           if (entry?.factory && swap.chain === 'robinhood' && entry.style === 'v2') {
                 const resolved = await resolveAndFetchV2Pool(
                       robinhoodReadProvider, swap.chain, entry.dex, entry.factory,
@@ -1728,12 +1759,14 @@ if (registerIfApproved('avalanche', entry.dex, resolved)) pool = resolved;
           }
           return;
     }
+    trace?.mark('lookup');
     // Fast path: use our own up-to-date copy when it's recent (kept current by
     // instant price tracking + the 5s re-sync); only ask the RPC when stale.
     const [freshPool, ...peers] = swap.chain === 'robinhood'
           ? await pricesAtDecisionRobinhood(pool, cachedPeers).then(([t, ps]) => [t, ...ps])
           : await Promise.all([priceAtDecision(pool, true), ...cachedPeers.map((p) => priceAtDecision(p))]);
     pool = freshPool;
+    trace?.mark('prices');
 
       // Record this real, genuine match for the hourly proof-of-activity
       // report -- happens for every real peer match found, independent
@@ -1797,6 +1830,7 @@ for (const peer of peers) {
       }, decimalsOf(swap.chain, swap.tokenIn), rh ? { refineSize: true, maxTradeUsd: involvesAutoVetted([swap.tokenIn, swap.tokenOut]) ? Math.min(MAX_TRADE_USD, AUTO_VET_MAX_TRADE_USD) : MAX_TRADE_USD, ...(loanBps === null ? { funding: 'own-capital' as const } : {}) } : {});
       if (candidate && (!plan || candidate.profit.conservativeNetProfitUsd > plan.profit.conservativeNetProfitUsd)) plan = candidate;
 }
+trace?.mark('math');
 if (!plan) { if (swap.chain === 'robinhood') funnel.smallerThanFees++; return; }
 if (swap.chain === 'robinhood') funnel.found++;
 const { sizing, profit } = plan;
@@ -1917,7 +1951,7 @@ console.log(
             chain: swap.chain, tokenIn: swap.tokenIn, tokenOut: swap.tokenOut,
             buyPool: buyPoolUsed, sellPool: sellPoolUsed,
             tradeSizeUsd: sizing.optimalTradeSizeUsd, netProfitUsd: profit.conservativeNetProfitUsd,
-            usdPerTokenIn: usdPerToken, seenAtMs: event.receivedAtMs, source: 'trade',
+            usdPerTokenIn: usdPerToken, seenAtMs: event.receivedAtMs, source: 'trade', trace,
             // Planned with a loan fee only when own money is switched off.
             plannedLoanPips: swap.chain === 'robinhood' && !RH_OWN_MONEY ? (rhLoanFeeBps(swap.tokenIn, buyPoolUsed, sellPoolUsed) ?? 0) * 100 : 0,
       });
@@ -2018,6 +2052,19 @@ await chainManager.startAll();
       // RPC (one DEX and fee tier at a time). The bot is live meanwhile;
       // pools join the watch list as they're found.
       robinhoodWatcher.start();
+      // PRELOAD (SPEED_PRELOAD, default on): every watched pool's price in the
+      // cache right away (pools restored from the last run are re-read now in
+      // one bundled request instead of on the first trade), then once a minute
+      // re-look-up any watched pair whose pool went missing from the cache.
+      // Off the hot path; a feed trade on a watched pool never waits for it.
+      if (SPEED_PRELOAD) {
+            const runPreload = async (why: string) => {
+                  const r = await robinhoodWatcher.preload();
+                  if (why === 'start' || r.refreshed || r.missingPairs) console.log(`[speed] preload (${why}): ${r.pools} watched pools, ${r.refreshed} re-read now, ${r.missingPairs} pair${r.missingPairs === 1 ? '' : 's'} looked up again`);
+            };
+            void runPreload('start');
+            setInterval(() => { void runPreload('check'); }, 60_000);
+      }
 
       // STANDING-GAP SCANNER (core/gapScanner.ts): every 5 s, right after the
       // price re-sync, look for gaps that exist without a trigger trade.
@@ -2289,6 +2336,7 @@ await chainManager.startAll();
                         // Push feed down: polling resumes from the last block it delivered.
                         onHealthChange: (healthy, last) => { if (!healthy && last > 0) blockReader.setBookmark(last - 1); },
                   });
+                  wsFacts = wsReader; // SPEED_TRUST_WS reads its health facts (core/trustFresh.ts)
             }
             const blockReader = new BlockReader({
                   rpc: readerRpc,
@@ -2990,6 +3038,7 @@ for (let i = 0; i < resolved.length; i++) {
                               venueTests: venueTally.hourText() ?? undefined,
                               loops: loopHourText(),
                               memory: memReport?.hourLine(),
+                              speed: (({ median, p95 }) => ({ median, p95 }))(stageTimers.take('hour')),
                               race: raceChecker.takeHour(),
                               funnel: {
                                     tradesRead: funnel.tradesRead, noPool: funnel.noPool, tooSmall: funnel.tooSmall, noPartner: funnel.noPartner,
@@ -3042,6 +3091,12 @@ for (let i = 0; i < resolved.length; i++) {
             }
       };
       setInterval(sendHourlyDigest, 60 * 60 * 1000);
+      // Stage timers: where the fire-ready time goes, every 5 min (median, then slowest 5%).
+      setInterval(() => {
+            const sp = stageTimers.take('fiveMin');
+            console.log(`[speed] ${sp.median}`);
+            console.log(`[speed] ${sp.p95}`);
+      }, 5 * 60_000);
       // Watch list size every 15 min (shown on the GitHub status page).
       setInterval(() => {
             const ws = robinhoodWatcher.stats();

@@ -60,6 +60,12 @@ export class PoolCache {
     return now - (this.feedApplied.get(this.key(chain, poolAddress)) ?? 0) < ms;
   }
 
+  // When the block reader / trade feed last wrote this pool (0 = never).
+  // Read-only; used by the "trust the WebSocket" price check
+  // (core/trustFresh.ts) to know WHERE the cached state came from.
+  blockAppliedAt(chain: ChainName, poolAddress: string): number { return this.blockApplied.get(this.key(chain, poolAddress)) ?? 0; }
+  feedAppliedAt(chain: ChainName, poolAddress: string): number { return this.feedApplied.get(this.key(chain, poolAddress)) ?? 0; }
+
   upsertIfNotNewer(fresh: PoolState, readStartedMs: number, now = Date.now()): boolean {
     const k = this.key(fresh.chain, fresh.poolAddress);
     const cur = this.pools.get(k);

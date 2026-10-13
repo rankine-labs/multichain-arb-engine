@@ -237,6 +237,61 @@ export class WsBlockReader {
   // The poll reader should be running right now (push feed not healthy).
   fallbackActive(): boolean { return !this.healthy(); }
 
+  // ---- read-only facts for the "trust the WebSocket" price check ----------
+  // (core/trustFresh.ts). None of these change how the reader works.
+  //
+  // Since when the push feed has been healthy WITHOUT a break (null = not
+  // healthy now). Any drop, reconnect or subscription renewal starts a new
+  // stretch, so a pool last updated before that can never be trusted on the
+  // WebSocket's word alone.
+  private healthyFrom: number | null = null;
+  healthySinceMs(): number | null {
+    if (!this.healthy()) { this.healthyFrom = null; return null; }
+    // healthy() can flip true before the 1 s tick notices; take "now" then.
+    if (this.healthyFrom === null) this.healthyFrom = this.now();
+    return this.healthyFrom;
+  }
+  // Last time real event DATA arrived on each subscription (pongs don't
+  // count): 'pools' = our pool contracts, 'v4' = V4 swaps for our pool ids.
+  private dataAt = { pools: 0, v4: 0 };
+  lastDataAtMs(kind: 'pools' | 'v4'): number { return this.dataAt[kind]; }
+  // Is this pool covered RIGHT NOW, and since when? A pool counts only if
+  //   - it is in the CURRENT watch list (addresses() / v4Ids()): events of
+  //     a pool that left the list (e.g. its pair was dropped over
+  //     ROBINHOOD_MAX_PAIRS) are thrown away by apply(), even while it is
+  //     still in the subscription and in the cache;
+  //   - and, with the address filter on, in the live subscription too (a
+  //     newly watched pool joins at the next renewal).
+  // Returns the time it has been in the current list without a gap (so a
+  // pool that left and came back is only covered from its return), or null.
+  // Address filter off: same current-list check (no subscription check).
+  private subPools = new Set<string>();
+  private subIds = new Set<string>();
+  private curSince = new Map<string, number>(); // current-list pool -> in the list since
+  private curAt = -Infinity;                    // when curSince was last rebuilt
+  // Rebuild the "current list" view. Called by apply() (which reads the list
+  // anyway) and by coveredSinceMs() at most once a second.
+  private noteCurrent(addrs: Iterable<string>, ids: Iterable<string>): void {
+    const t = this.now();
+    const next = new Map<string, number>();
+    for (const x of addrs) if (x) { const k = x.toLowerCase(); next.set(k, this.curSince.get(k) ?? t); }
+    for (const x of ids) if (x) { const k = x.toLowerCase(); next.set(k, this.curSince.get(k) ?? t); }
+    this.curSince = next;
+    this.curAt = t;
+  }
+  coveredSinceMs(addr: string): number | null {
+    if (!this.healthy()) return null;
+    if (this.now() - this.curAt > 1_000) {
+      try { this.noteCurrent(this.o.addresses() ?? [], this.o.v4Ids() ?? new Set<string>()); } catch { return null; }
+    }
+    const a = addr.toLowerCase();
+    const since = this.curSince.get(a);
+    if (since === undefined) return null;
+    if (this.o.addressFilter !== false && !(a.length === 66 ? this.subIds.has(a) : this.subPools.has(a))) return null;
+    return since;
+  }
+  coversPool(addr: string): boolean { return this.coveredSinceMs(addr) !== null; }
+
   // Health check, every second: stale connection -> reconnect; quiet
   // connection -> keep-alive ping; health changes -> tell the bot.
   tick(): void {
@@ -325,6 +380,7 @@ export class WsBlockReader {
         if (this.o.addressFilter !== false) {
           const { pools, ids } = this.subscribeLists();
           this.subSig = pools.join(',') + '|' + ids.join(',');
+          this.subPools = new Set(pools); this.subIds = new Set(ids); // what this subscription covers (read-only facts above)
           const nonV4 = HANDLED_TOPICS.filter((t) => t !== V4_SWAP_TOPIC);
           sock.send(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_subscribe', params: ['logs', { address: pools, topics: [nonV4] }] }));
           const pm = (this.o.poolManager || '').toLowerCase();
@@ -429,6 +485,7 @@ export class WsBlockReader {
         }
         if (sub && (sub === this.logsSub || sub === this.v4Sub) && r) {
           this.markData();
+          if (sub === this.logsSub) this.dataAt.pools = this.now(); else this.dataAt.v4 = this.now();
           const logs: RpcLog[] = Array.isArray(r) ? r : [r];
           for (const l of logs) {
             this.counts.logs++;
@@ -511,6 +568,7 @@ export class WsBlockReader {
     for (const a of this.o.addresses() ?? []) if (a) addrSet.add(a.toLowerCase());
     if (pm) addrSet.add(pm);
     const ids = this.o.v4Ids() ?? new Set<string>();
+    this.noteCurrent(addrSet, ids); // keep coveredSinceMs() in step with what is really applied
     let maxSeen = this.lastBlock;
     const kept: RpcLog[] = [];
     for (const l of logs) {
@@ -569,6 +627,7 @@ export class WsBlockReader {
     if (h === this.wasHealthy) return;
     this.wasHealthy = h;
     const t = this.now();
+    this.healthyFrom = h ? (this.healthyFrom ?? t) : null; // start / end of an unbroken healthy stretch
     if (h) { this.downMsTotal += Math.max(0, t - this.downSince); }
     else { this.downSince = t; }
     try { this.o.onHealthChange?.(h, this.lastBlock); } catch { /* receiver bug must not stop the reader */ }
