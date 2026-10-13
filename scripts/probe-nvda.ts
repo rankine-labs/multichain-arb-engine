@@ -29,7 +29,7 @@ const provider = new ethers.JsonRpcProvider(URL_, 4663, { staticNetwork: true })
 const base = makeRpc(URL_, 15_000);
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 // Retry on public-node rate limits.
-const rpc = async (m: string, p: unknown[]) => { for (let i = 0; i < 5; i++) { const r = await base(m, p); if (!r.error || !/429|too many|rate/i.test(JSON.stringify(r.error))) return r; await sleep(2000 * (i + 1)); } return base(m, p); };
+const rpc = async (m: string, p: unknown[]) => { for (let i = 0; i < 5; i++) { const r = await base(m, p); if (!r.error || !/429|too many|rate|network:/i.test(JSON.stringify(r.error))) return r; await sleep(2000 * (i + 1)); } return base(m, p); };
 const pad = (a: string) => a.replace(/^0x/, '').padStart(64, '0');
 const out: string[] = [];
 const say = (s: string) => { out.push(s); console.log(s); };
@@ -158,8 +158,10 @@ async function tryTransfer(label: string, from: string, to: string, amt: bigint)
   const pools = await discoverPairPools(provider, 'robinhood', venues, USDG, NVDA);
   const decOf = (t: string) => (t.toLowerCase() === NVDA ? decNvda : t.toLowerCase() === USDG ? decUsdg : undefined);
   say(`== pools (${pools.length})`);
-  const nvdaBal = async (holder: string) => BigInt(await view(NVDA, 'balanceOf(address)', pad(holder)));
-  const usdgBal = async (holder: string) => BigInt(await view(USDG, 'balanceOf(address)', pad(holder)));
+  // Unreadable answer -> -1 (printed as such) instead of crashing the probe.
+  const big = (x: string) => { try { return BigInt(x.slice(0, 66)); } catch { return -1n; } };
+  const nvdaBal = async (holder: string) => big(await view(NVDA, 'balanceOf(address)', pad(holder)));
+  const usdgBal = async (holder: string) => big(await view(USDG, 'balanceOf(address)', pad(holder)));
   for (const p of pools) {
     const a0 = p.tokenA.toLowerCase();
     const raw = Number(p.sqrtPriceX96 ?? 0n) / 2 ** 96;
@@ -167,6 +169,11 @@ async function tryTransfer(label: string, from: string, to: string, amt: bigint)
     const bPerA = raw * raw * 10 ** ((decOf(p.tokenA) ?? 0) - (decOf(p.tokenB) ?? 0));
     const usdgPerNvda = a0 === USDG ? 1 / bPerA : bPerA;
     const holder = p.v4 ? p.v4.poolManager : p.poolAddress;
+    if (!p.v4) {
+      const s0 = await view(p.poolAddress, 'slot0()');
+      const ts = await view(p.poolAddress, 'tickSpacing()');
+      say(`  (${p.poolAddress} tick ${s0.startsWith('0x') ? ethers.AbiCoder.defaultAbiCoder().decode(['int24'], '0x' + s0.slice(66, 130))[0] : s0} spacing ${ts.startsWith('0x') ? BigInt(ts) : ts})`);
+    } else say(`  (v4 id ${p.poolAddress} fee ${p.v4.fee} spacing ${p.v4.tickSpacing})`);
     say(`${p.dex} ${(p.feePips ?? p.feeBps * 100) / 10_000}% ${p.poolAddress.slice(0, 18)} tokenA=${p.tokenA.slice(0, 8)} USDG/NVDA=${usdgPerNvda.toFixed(4)} L=${p.liquidity} holds NVDA ${Number(await nvdaBal(holder)) / 10 ** decNvda} USDG ${Number(await usdgBal(holder)) / 10 ** decUsdg}${p.v4 ? ' (PoolManager total)' : ''}`);
   }
   // Model gap, same scanner as the bot (NVDA $ price taken from the pools).
