@@ -289,6 +289,18 @@ export class BlockReader {
     this.timer = null;
   }
 
+  // Move the bookmark to `block` (the last block already read elsewhere).
+  // Used when the push reader (core/blockReaderWs.ts) hands back to polling:
+  // polling carries on from where the push feed stopped, instead of from
+  // where polling itself paused (which could be hours old and would count
+  // as a "skipped range"). Ignored if it would move the bookmark backwards.
+  setBookmark(block: number): void {
+    if (Number.isFinite(block) && block > this.last) {
+      this.last = block;
+      if (this.last > this.head) this.head = this.last;
+    }
+  }
+
   // How long the loop will wait before the next poll (reflects any error pause).
   nextDelayMs(): number {
     return this.delayMs;
