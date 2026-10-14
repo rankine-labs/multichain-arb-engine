@@ -143,7 +143,7 @@ import { checkLiveReady } from './execution/liveReadiness';
 import { LiveTradeTracker } from './execution/liveTracker';
 import { LiveTradeLog } from './execution/liveTradeLog';
 import { SafetyAlerts } from './execution/safetyAlerts';
-import { findStandingGaps } from './core/gapScanner';
+import { findStandingGaps, findStandingGapsSteps, GapScanMemo } from './core/gapScanner';
 import { CompetitorTracker } from './core/competitorTracker';
 import { pickRobinhoodReadRpc, robinhoodSendRpc, redact, ROBINHOOD_PUBLIC_RPC } from './config/robinhoodEndpoints';
 import { loadStartPairs, saveStartPairs } from './core/seedPairs';
@@ -158,7 +158,7 @@ import { WsBlockReader } from './core/blockReaderWs';
 import { nodeUsage as nodeUsageCounter } from './core/nodeUsage';
 import { ROBINHOOD_SEED_PAIRS } from './config/robinhoodSeedPairs';
 import { ResearchLane, researchConfigFromEnv, planShallowCandidate, findResearchGaps, gapCandidate, ResearchCandidate } from './core/researchLane';
-import { poolDepthUsd, setRealBalanceSource, thinPools } from './core/poolPrice';
+import { poolDepthUsd, setRealBalanceSource, thinPools, thinPoolsSteps } from './core/poolPrice';
 // Loop trader v1 (3-5 pool loops, practice only, off unless LOOP_TRADER=1).
 import { LoopTrader, loopConfigFromEnv } from './core/loopTrader';
 import { formatLoopHour } from './core/loopReport';
@@ -169,8 +169,12 @@ import { LoopExtraPools, loopExtraConfigFromEnv, readerAddresses, afterReaderWri
 import { StageTimers, StageTrace } from './core/stageTimer';
 import { trustFreshConfigFromEnv, wsTrustProblem, WsFacts } from './core/trustFresh';
 // Stall finder (Oct 14): which job froze the bot, plus chunked versions of the big jobs.
-import { stallFinder, timed, timedAsync, formatStallLine, formatStallDetail } from './core/stallFinder';
-import { runSteps, writeJsonChunkedQueued } from './core/chunked';
+import { stallFinder, timed, timedAsync, formatStallLine, formatStallDetail, markStretch, labelled } from './core/stallFinder';
+import { runSteps, drainSteps, writeJsonChunkedQueued } from './core/chunked';
+// REPORT_CHUNKED (Oct 14, freeze phase 1): the thin pool check and the
+// hourly report's price sample run in small bites (same results) instead
+// of one long freeze. REPORT_CHUNKED=0 = one go (old behaviour).
+const REPORT_CHUNKED = process.env.REPORT_CHUNKED !== '0';
 
 // STALL FIXES (Oct 14). Big jobs done in ~5 ms bites so trades never wait
 // behind them. Each has an off switch in .env (all on by default):
@@ -593,6 +597,7 @@ const checkRoundTrip = async (
       // in the "Check results by kind" line, which before saw trigger checks only.
       const r = await simulateWithRecheck(simRpc[chain], chain === 'robinhood' ? rhFreeSimRpc : null, chain, { token: tokenIn, amountIn: built.amountIn, hops: built.hops }, { v3Lender: lender?.poolAddress, weth: chain === 'robinhood' ? ROBINHOOD_TOKENS.WETH : undefined },
             (changed) => { recheckStats.done++; if (changed) recheckStats.changed++; });
+      markStretch('practice check result'); // stall finder: handling the check's answer
       if (chain === 'robinhood') simBuckets.add(r.bucket ?? classifySimOutcome(r.status, 'reason' in r ? r.reason : ''));
       if (r.status === 'rate_limited') { simPausedUntil[chain] = Date.now() + SIM_RATE_LIMIT_PAUSE_MS; return { status: 'rate_limited' }; }
       if (r.status === 'unsupported') { if (chain === 'robinhood') noteNoSlot(tokenIn, r.reason); return { status: 'skipped', reason: r.reason }; }
@@ -691,6 +696,7 @@ const runSimulation = (
                         r = await simulateRoundTrip(simRpc[chain], chain, trade, simOpts);
                         if (followTrigger) timing = 'tested late';
                   }
+                  markStretch('practice check result'); // stall finder: handling the check's answer
                   // "Breaks" with no real reason (no revert data, or a transfer
                   // failing). Oct 7: Ramses V3 pools always fail inside the replay
                   // (eth_simulateV1) on this chain, but run fine in a plain check.
@@ -890,6 +896,9 @@ function venueLabel(p: PoolState): string {
 // Asks the standing-gap scanner to run soon (set up with the scanner below;
 // a no-op until then). Called whenever a pool price changes.
 let requestGapScan: () => void = () => {};
+// Gaps skipped because a pool's price changed while the scan ran in bites
+// (fast gap scan). Shown on the 5-min [stalls] line, then reset.
+let gapStaleSkips = 0;
 const robinhoodWatcher = new PairWatcher('robinhood', robinhoodReadProvider, ROBINHOOD_VENUES, cache,
       // Real decimals/symbols for every discovered token, read from the token itself.
       (addr, meta) => {
@@ -996,7 +1005,7 @@ const logLimits = () => {
             ` · auto-vetted coins ${autoVet.stats().vetted} (blocked ${autoVet.stats().blocked}, watching ${autoVet.stats().watching}, limit $${AUTO_VET_MAX_TRADE_USD})`);
 };
 logLimits();
-setInterval(logLimits, 10 * 60_000);
+setInterval(labelled('limits log', logLimits), 10 * 60_000);
 if (safetyGate.problems.length) {
       // Fail closed: every send is blocked until the setting is fixed.
       console.warn(`[safety] BAD SETTING(S): ${safetyGate.problems.join(', ')} -- all sends blocked until fixed in .env`);
@@ -1126,27 +1135,27 @@ registerSize('competitor results', () => rivals.results.length);
       console.log(`[rivalwatch] following ${rivalWatch.botCount()} rival bots, ${n.recs} trades restored`);
 }
 // Sampler: one recent block every 15 s, to find rival bots we don't know yet.
-setInterval(async () => {
+setInterval(labelled('rival watch sample', async () => {
       try {
             const latest = await robinhoodReadProvider.getBlockNumber();
             await timedAsync('rival watch sample', () => rivalWatch.sampleBlock('0x' + (latest - 3).toString(16)));
       } catch { /* node busy: next time */ }
-}, Number(process.env.RIVAL_SAMPLE_MS ?? 15_000));
+}), Number(process.env.RIVAL_SAMPLE_MS ?? 15_000));
 // New rival bots caught by the tracker join the watch list (checked every minute).
 // Uses the tracker's ticket counter, so the hourly reset and the 2,000 cap
 // can't make it skip new bots (before Oct 13 the hourly reset did).
 let rivalResultsSeen = 0;
-setInterval(() => {
+setInterval(labelled('rival bots update', () => {
       const { items, next } = rivals.resultsSince(rivalResultsSeen);
       rivalResultsSeen = next;
       for (const r of items) if (r.found && r.bot) rivalWatch.addBot(r.bot, 'tracker');
-}, 60_000);
+}), 60_000);
 setInterval(() => timed('rival watch save', () => rivalWatch.save(RIVAL_BOTS_FILE, RIVAL_TRADES_FILE)), 10 * 60_000);
 // RACE CHECK (core/raceCheck.ts): for every confirmed practice win, watch the
 // two pools for ~30 s and see whether another bot took it before we'd have
 // been ready. Answers "would we really have won?". Watch only.
 const raceChecker = new RaceChecker((m, p) => robinhoodReadProvider.send(m, p as any[]), ROBINHOOD_V4.POOL_MANAGER);
-setInterval(() => { void raceChecker.tick(); }, 5_000);
+setInterval(labelled('race check', () => { void raceChecker.tick(); }), 5_000);
 // New pool counter (set up with the chain-wide scan further down; read by the reports).
 let newPoolWatchRef: NewPoolWatch | null = null;
 
@@ -1502,6 +1511,7 @@ const fireTrade = async (o: {
             }
             o.trace?.mark('checks');
             const fired = await robinhoodSender.fire(dry.to ?? '0x0000000000000000000000000000000000000000', dry.data);
+            markStretch('fire result'); // stall finder: handling the sender's answer
             o.trace?.addFire(fired);
             // Dry run: this trade passed every check and would have been sent.
             // Standing gaps carry a simulation-confirmed profit; trigger trades
@@ -1566,16 +1576,18 @@ setHookedFeeSource((id) => {
       if (a.source === 'fallback' && b.source === 'fallback') return null; // not read yet: keep the default
       return Math.max(a.feePips, b.feePips);
 });
-setInterval(async () => {
+setInterval(labelled('fables fee read', async () => {
       try {
-            const pools = cache.allForChain('robinhood')
-                  .filter((p) => p.dex === 'fables' && p.v4?.hooks)
-                  .map((p) => ({ id: p.poolAddress, hooks: p.v4!.hooks! }));
+            // (Oct 14: walks the pools without copying the whole list first; same pools.)
+            const pools: { id: string; hooks: string }[] = [];
+            for (const p of cache.forChain('robinhood')) if (p.dex === 'fables' && p.v4?.hooks) pools.push({ id: p.poolAddress, hooks: p.v4.hooks });
             if (!pools.length) return;
             rhDecisionCallMany ??= (await makeCaller(robinhoodReadProvider)).callMany;
-            fablesFees.applyRead(await readFablesFees(rhDecisionCallMany, pools), Date.now());
+            const read = await readFablesFees(rhDecisionCallMany, pools);
+            markStretch('fables fee read');
+            fablesFees.applyRead(read, Date.now());
       } catch { /* node busy: keep the last fees, try again in 5 s */ }
-}, 5_000);
+}), 5_000);
 const pricesAtDecisionRobinhood = async (traded: PoolState, peers: PoolState[]): Promise<[PoolState, PoolState[]]> => {
       const all = [traded, ...peers];
       let wsTrusted = 0;
@@ -1645,11 +1657,14 @@ if (event.chain === 'robinhood') {
       // (~1-2 ms). Done on the next turn, after this frame's trades have been
       // decided, so it never delays our own decision (FEED_LAZY_SENDER=0: old order).
       const raw = event.raw as any;
-      if (process.env.FEED_LAZY_SENDER !== '0') setImmediate(() => { try { rivalWatch.noteTx(raw?.to, raw?.hash, raw?.from, raw?.value); } catch { /* never affects trading */ } });
+      if (process.env.FEED_LAZY_SENDER !== '0') setImmediate(() => { try { timed('rival watch', () => rivalWatch.noteTx(raw?.to, raw?.hash, raw?.from, raw?.value)); } catch { /* never affects trading */ } });
       else rivalWatch.noteTx(raw?.to, raw?.hash, raw?.from, raw?.value);
 }
 
 const swap = await decoder.decode(event);
+// Stall finder: everything after the decode (pool lookup, peers, filters)
+// used to run unnamed ("other"); named now (measurement only).
+markStretch('feed trade');
 if (!swap) return;
 trace?.mark('decode');
 if (swap.chain === 'robinhood') funnel.tradesRead++;
@@ -1793,6 +1808,8 @@ if (registerIfApproved('avalanche', entry.dex, resolved)) pool = resolved;
     const [freshPool, ...peers] = swap.chain === 'robinhood'
           ? await pricesAtDecisionRobinhood(pool, cachedPeers).then(([t, ps]) => [t, ...ps])
           : await Promise.all([priceAtDecision(pool, true), ...cachedPeers.map((p) => priceAtDecision(p))]);
+    // Stall finder: sizing / profit maths after the prices came back.
+    markStretch('feed trade decide');
     pool = freshPool;
     trace?.mark('prices');
 
@@ -1985,7 +2002,8 @@ console.log(
       });
 };
 // Stall finder: each feed trade is timed as "feed trade" up to its first wait
-// (measurement only; not counted as a slow background job).
+// (measurement only; not counted as a slow background job). The parts after
+// its waits are named inside onFeedEvent (markStretch).
 chainManager.onEvent((event: RawChainEvent) => { void timedAsync('feed trade', () => onFeedEvent(event), false); });
 
 // Live trading half set up (EXECUTION_ENABLED without the other live
@@ -2049,7 +2067,7 @@ await chainManager.startAll();
               if (resolved) cache.upsert({ ...resolved, tokenA: MONAD_TOKENS.WMON });
       };
             await seedKuruMarket();
-            setInterval(seedKuruMarket, 30_000); // vault liquidity shifts as orders fill — keep it fresh
+            setInterval(labelled('kuru seed', seedKuruMarket), 30_000); // vault liquidity shifts as orders fill — keep it fresh
       }
 
       // Uniswap V4 pools are found by the pair watcher (V4 venue in
@@ -2073,7 +2091,7 @@ await chainManager.startAll();
       };
       if (chainOn('monad')) {
             await seedMonadV3Peer();
-            setInterval(seedMonadV3Peer, 30_000);
+            setInterval(labelled('monad peer seed', seedMonadV3Peer), 30_000);
       }
 
       // Robinhood partner pools: every DEX + fee tier for WETH/USDG from the
@@ -2094,7 +2112,7 @@ await chainManager.startAll();
                   if (why === 'start' || r.refreshed || r.missingPairs) console.log(`[speed] preload (${why}): ${r.pools} watched pools, ${r.refreshed} re-read now, ${r.missingPairs} pair${r.missingPairs === 1 ? '' : 's'} looked up again`);
             };
             void runPreload('start');
-            setInterval(() => { void runPreload('check'); }, 60_000);
+            setInterval(labelled('pool preload', () => { void runPreload('check'); }), 60_000);
       }
 
       // STANDING-GAP SCANNER (core/gapScanner.ts): every 5 s, right after the
@@ -2145,27 +2163,58 @@ await chainManager.startAll();
       // trades is one scan; plus every 5 s as a safety net. The scan only
       // reads prices already in memory, so running it often costs no RPC.
       let gapScanQueued: NodeJS.Timeout | null = null;
-      requestGapScan = () => {
-            requestLoopScan(); // loop trader (off unless LOOP_TRADER=1): same triggers
+      // FAST GAP SCAN (Oct 14, freeze phase 1; core/gapScanner.ts
+      // findStandingGapsSteps). Same gaps as before, but:
+      //   - pairs whose pools didn't change reuse their last answer
+      //   - the scan runs in small bites (GAP_SCAN_SLICE_MS, default 8 ms)
+      //     with breaks for feed messages, instead of one long freeze
+      //   - a price change that arrives while a scan (or its practice check)
+      //     is running is no longer dropped: one more scan runs right after
+      // GAP_SCAN_FAST=0 = the old one-go scan.
+      const GAP_SCAN_FAST = process.env.GAP_SCAN_FAST !== '0';
+      const GAP_SCAN_SLICE_MS = Number(process.env.GAP_SCAN_SLICE_MS ?? 8);
+      const gapMemoMain = new GapScanMemo(), gapMemoExtra = new GapScanMemo();
+      let gapAgain = false; // a scan was asked for while one was running
+      const queueGapScan = () => {
             if (gapScanQueued) return;
             gapScanQueued = setTimeout(() => { gapScanQueued = null; void timedAsync('gap scan', runGapScan); }, 50);
       };
+      requestGapScan = () => {
+            requestLoopScan(); // loop trader (off unless LOOP_TRADER=1): same triggers
+            queueGapScan();
+      };
+      // Watched pairs' pools with real money near their price, built in steps
+      // (pauses every 32 pairs). Same list as the old one-go build below.
+      const usdRhGap = (t: string) => priceOracle.getUsdPrice('robinhood', t);
+      function* gapPairsSteps(): Generator<void, PoolState[][], void> {
+            const list = robinhoodWatcher.watchedPairPools();
+            const out: PoolState[][] = [];
+            for (let i = 0; i < list.length; i++) {
+                  const ps: PoolState[] = [];
+                  for (const a of list[i]) { const p = cache.get('robinhood', a); if (p && deepEnough(p, decimalsOf, usdRhGap)) ps.push(p); }
+                  out.push(ps);
+                  if ((i & 31) === 31) yield;
+            }
+            return out;
+      }
       const runGapScan = async () => {
-            if (gapRunning) return;
+            if (gapRunning) { if (GAP_SCAN_FAST) gapAgain = true; return; }
             gapRunning = true;
             try {
                   // Only pools with real money near their price ($1,000+ by default).
                   const usdRh = (t: string) => priceOracle.getUsdPrice('robinhood', t);
-                  const pairs = robinhoodWatcher.watchedPairPools()
-                        .map((addrs) => addrs.map((a) => cache.get('robinhood', a))
-                              .filter((p): p is PoolState => !!p && deepEnough(p, decimalsOf, usdRh)));
+                  const pairs = GAP_SCAN_FAST ? await runSteps(gapPairsSteps(), 'gap scan', GAP_SCAN_SLICE_MS)
+                        : robinhoodWatcher.watchedPairPools()
+                              .map((addrs) => addrs.map((a) => cache.get('robinhood', a))
+                                    .filter((p): p is PoolState => !!p && deepEnough(p, decimalsOf, usdRh)));
+                  const gapDecimals = (t: string) => TOKEN_DECIMALS.robinhood?.[t.toLowerCase()];
                   // Gaps that need an extra venue (can't trade yet): counted for
                   // the report only, then those pools are left out.
                   if (RH_EXTRA_VENUES) {
-                        const unsupported = findStandingGaps(pairs,
-                              (t) => TOKEN_DECIMALS.robinhood?.[t.toLowerCase()],
-                              (t) => priceOracle.getUsdPrice('robinhood', t),
-                              { minProfitUsd: 0.25, flashFee: 0, gasUsd: rhGasUsd(0.05), maxTradeUsd: MAX_TRADE_USD })
+                        const extraOpts = { minProfitUsd: 0.25, flashFee: 0, gasUsd: rhGasUsd(0.05), maxTradeUsd: MAX_TRADE_USD };
+                        const unsupported = (GAP_SCAN_FAST
+                              ? await runSteps(findStandingGapsSteps(pairs, gapDecimals, usdRh, extraOpts, gapMemoExtra), 'gap scan', GAP_SCAN_SLICE_MS)
+                              : findStandingGaps(pairs, gapDecimals, usdRh, extraOpts))
                               .filter((g) => !canPracticeTest(g.buyPool.dex) || !canPracticeTest(g.sellPool.dex));
                         for (const g of unsupported.slice(0, 20)) {
                               const ex = [g.buyPool.dex, g.sellPool.dex].filter((d) => !canPracticeTest(d)).join('+');
@@ -2173,20 +2222,30 @@ await chainManager.startAll();
                         }
                   }
                   for (let i = 0; i < pairs.length; i++) pairs[i] = pairs[i].filter((p) => canPracticeTest(p.dex));
-                  const gaps = findStandingGaps(pairs,
-                        (t) => TOKEN_DECIMALS.robinhood?.[t.toLowerCase()],
-                        (t) => priceOracle.getUsdPrice('robinhood', t),
-                        // Own money (no loan fee) for planning; the check itself borrows at 0.01% above $2,000.
-                        { minProfitUsd: GAP_MIN_USD, flashFee: RH_OWN_MONEY ? 0 : 0.0005, gasUsd: rhGasUsd(0.05), maxTradeUsd: MAX_TRADE_USD,
-                          // Top 3 pool combinations per coin pair (was only the best): a muted
-                          // combination no longer hides the other pools of the same pair.
-                          perPair: 3 });
+                  // Own money (no loan fee) for planning; the check itself borrows at 0.01% above $2,000.
+                  const mainOpts = { minProfitUsd: GAP_MIN_USD, flashFee: RH_OWN_MONEY ? 0 : 0.0005, gasUsd: rhGasUsd(0.05), maxTradeUsd: MAX_TRADE_USD,
+                        // Top 3 pool combinations per coin pair (was only the best): a muted
+                        // combination no longer hides the other pools of the same pair.
+                        perPair: 3 };
+                  const gaps = GAP_SCAN_FAST
+                        ? await runSteps(findStandingGapsSteps(pairs, gapDecimals, usdRh, mainOpts, gapMemoMain), 'gap scan', GAP_SCAN_SLICE_MS)
+                        : findStandingGaps(pairs, gapDecimals, usdRh, mainOpts);
+                  // The rest of this run (cooldown checks, logging) is named too.
+                  markStretch('gap scan');
                   // Gaps that closed since they were confirmed may count again.
                   const openNow = new Set(gaps.map((g) => `${g.buyPool.poolAddress}>${g.sellPool.poolAddress}`));
                   for (const k of gapConfirmedOpen.keys()) if (!openNow.has(k)) gapConfirmedOpen.delete(k);
                   let fired = 0;
                   for (const g of gaps) {
                         if (fired >= 2) break;
+                        // Fast scan runs in bites: a pool may have got a new price
+                        // during a break. Such a gap is skipped (no check budget used,
+                        // pair not muted) and one more scan runs with fresh prices.
+                        if (GAP_SCAN_FAST && (cache.get('robinhood', g.buyPool.poolAddress) !== g.buyPool || cache.get('robinhood', g.sellPool.poolAddress) !== g.sellPool)) {
+                              gapStaleSkips++;
+                              gapAgain = true;
+                              continue;
+                        }
                         const key = `${g.buyPool.poolAddress}>${g.sellPool.poolAddress}`;
                         const sig = `${poolSig(g.buyPool)}|${poolSig(g.sellPool)}`;
                         const bigChanged = g.profitUsd >= BENCH_BYPASS_USD && gapMutedSig.get(key) !== sig;
@@ -2212,6 +2271,8 @@ await chainManager.startAll();
                         const route = `buy ${g.buyPool.dex} ${g.buyPool.feeBps / 100}% -> sell ${g.sellPool.dex} ${g.sellPool.feeBps / 100}%`;
                         const spottedAt = Date.now(); // for the race check: spotted -> ready time
                         const check = await checkRoundTrip('robinhood', g.quote, g.buyPool, g.sellPool, g.sizeUsd, g.quoteUsd);
+                        // Stall finder: handling the practice check's answer.
+                        markStretch('gap check result');
                         if (check.status === 'rate_limited') {
                               // Can't verify right now: skip, don't mute, try again next time.
                               console.log(`[gap] ${label}: model ~$${g.profitUsd.toFixed(2)}, not verified (RPC busy), skipped`);
@@ -2261,6 +2322,7 @@ await chainManager.startAll();
                               // Fee of the lender the practice check used (already in simNet).
                               plannedLoanPips: check.loanPips,
                         });
+                        markStretch('gap check result');
                   }
                   if (gapLastFired.size > 500) gapLastFired.clear();
                   for (const [k, t] of gapMutedUntil) if (t < Date.now()) gapMutedUntil.delete(k);
@@ -2268,6 +2330,8 @@ await chainManager.startAll();
                   console.warn('[gap] scan failed:', (err as Error).message);
             } finally {
                   gapRunning = false;
+                  // Prices changed while this run was busy: scan once more (coalesced).
+                  if (gapAgain) { gapAgain = false; queueGapScan(); }
             }
       };
       setInterval(() => { void timedAsync('gap scan', runGapScan); }, 5_000);
@@ -2285,7 +2349,9 @@ await chainManager.startAll();
             const readerRpc = async (method: string, params: unknown[]) => {
                   const res = await fetch(READER_URL, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }), signal: AbortSignal.timeout(3_000) });
                   if (!res.ok) throw new Error(`HTTP ${res.status}`);
-                  const j: any = await res.json();
+                  // Read as text, then parse under a stall-finder name (same result as res.json()).
+                  const txt = await res.text();
+                  const j: any = timed('block reader json', () => JSON.parse(txt));
                   if (j.error) throw new Error(`${j.error.code ?? ''} ${j.error.message ?? 'rpc error'}`);
                   return j.result;
             };
@@ -2294,7 +2360,8 @@ await chainManager.startAll();
             const readerBatch = async (calls: Array<{ method: string; params: unknown[] }>) => {
                   const res = await fetch(READER_URL, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(calls.map((c, i) => ({ jsonrpc: '2.0', id: i, method: c.method, params: c.params }))), signal: AbortSignal.timeout(3_000) });
                   if (!res.ok) throw new Error(`HTTP ${res.status}`);
-                  const arr: any[] = await res.json();
+                  const txt = await res.text();
+                  const arr: any[] = timed('block reader json', () => JSON.parse(txt));
                   if (!Array.isArray(arr)) throw new Error('batch answer was not a list');
                   return calls.map((_, i) => {
                         const r = arr.find((x) => x && x.id === i);
@@ -2308,6 +2375,25 @@ await chainManager.startAll();
             // Costs no extra node requests: the readers already fetch every
             // block's events by type and keep ours here.
             const watched = () => readerAddresses(watchedOnly(), loopExtra);
+            // READER TARGETS KEPT READY (Oct 14, freeze phase 1). Both readers
+            // asked for the pool list twice per poll / pushed message (4+ times
+            // a second), and each ask rebuilt it from the whole watch list
+            // (thousands of new strings each time). Now the list is rebuilt at
+            // most once every READER_TARGETS_MS (default 1,000 ms) and handed
+            // over frozen, so the readers can reuse their address sets too
+            // (core/blockReader.ts AddressSetCache). A pool added to the watch
+            // list is picked up within that time. READER_TARGETS_MS=0 = rebuild
+            // on every ask (old behaviour).
+            const READER_TARGETS_MS = Number(process.env.READER_TARGETS_MS ?? 1_000);
+            let readerTargets: { at: number; addrs: readonly string[]; ids: Set<string> } | null = null;
+            const targets = () => {
+                  const t = Date.now();
+                  if (!readerTargets || READER_TARGETS_MS <= 0 || t - readerTargets.at >= READER_TARGETS_MS) {
+                        const w = timed('reader targets', watched);
+                        readerTargets = { at: t, addrs: Object.freeze(w.filter((a) => a.length === 42)), ids: new Set(w.filter((a) => a.length === 66)) };
+                  }
+                  return readerTargets;
+            };
             // Leave a pool alone if the feed just applied a predicted trade to it.
             const FEED_FRESH_MS = Number(process.env.BLOCK_READER_FEED_GRACE_MS ?? 400);
             let readerApplied = 0;
@@ -2361,8 +2447,9 @@ await chainManager.startAll();
                         addressFilter: process.env.BLOCK_READER_WSS_FILTER !== '0',
                         dailyMessageCap: Number(process.env.BLOCK_READER_WSS_DAILY ?? 400_000),
                         poolManager: ROBINHOOD_V4.POOL_MANAGER,
-                        addresses: () => watched().filter((a) => a.length === 42),
-                        v4Ids: () => new Set(watched().filter((a) => a.length === 66)),
+                        // (Oct 14: same lists, kept ready; see targets() above.)
+                        addresses: () => targets().addrs as string[],
+                        v4Ids: () => targets().ids,
                         onUpdates: (latest) => onReaderUpdates(latest),
                         // Push feed down: polling resumes from the last block it delivered.
                         onHealthChange: (healthy, last) => { if (!healthy && last > 0) blockReader.setBookmark(last - 1); },
@@ -2378,8 +2465,8 @@ await chainManager.startAll();
                   // or while the push reader (if set) is delivering events.
                   paused: () => (wsReader?.healthy() ?? false) || robinhoodReadProvider.mainResting(),
                   poolManager: ROBINHOOD_V4.POOL_MANAGER,
-                  addresses: () => watched().filter((a) => a.length === 42),
-                  v4Ids: () => new Set(watched().filter((a) => a.length === 66)),
+                  addresses: () => targets().addrs as string[],
+                  v4Ids: () => targets().ids,
                   // ~4 polls a second (each is one request carrying 2 calls).
                   pollMs: Number(process.env.BLOCK_READER_POLL_MS ?? 250),
                   onUpdates: (latest) => onReaderUpdates(latest),
@@ -2392,7 +2479,7 @@ await chainManager.startAll();
                   console.log(`[blockreader] polls ${st.polls} (ok ${st.ok}, errors ${st.errors}, rate-limited ${st.rateLimited}, paused ${st.pausedPolls}, restarts ${st.restarts}) · prices updated ${readerApplied} · median ${st.medianMs} ms · skipped ranges ${st.skippedRanges}${errs ? ' · errors: ' + errs : ''}${wsReader ? ' · ' + wsReader.statusText() : ''}${loopExtra ? ' · ' + loopExtra.statusText(loopCfg.maxPoolAgeMs) : ''}`);
             };
             setTimeout(logReader, 60_000);
-            setInterval(logReader, 5 * 60_000);
+            setInterval(labelled('block reader log', logReader), 5 * 60_000);
       }
       // Lender balances: one bundled read of every candidate lender pool's
       // coins + liquidity, first ~20 s after start (watch list loaded), then
@@ -2407,10 +2494,10 @@ await chainManager.startAll();
             }
       };
       setTimeout(() => { void refreshLenders(); }, 20_000);
-      setInterval(() => { void refreshLenders(); }, LENDER_REFRESH_MS);
+      setInterval(labelled('lender balances', () => { void refreshLenders(); }), LENDER_REFRESH_MS);
       // Own money in the trade contract: every 15 s while live (does nothing in practice).
       setTimeout(() => { void refreshOwnMoney(); }, 5_000);
-      setInterval(() => { void refreshOwnMoney(); }, 15_000);
+      setInterval(labelled('own money read', () => { void refreshOwnMoney(); }), 15_000);
       void robinhoodWatcher.watch(ROBINHOOD_TOKENS.WETH, ROBINHOOD_TOKENS.USDG, { pin: true })
             .then((n) => console.log(`[pairs] robinhood WETH/USDG: ${n} pools found`))
             .catch((err) => console.warn('[pairs] WETH/USDG discovery failed:', (err as Error).message));
@@ -2550,23 +2637,29 @@ await chainManager.startAll();
             } catch (err) { console.warn('[openwatch] setup failed:', (err as Error).message); }
       };
       setTimeout(() => { void setupCrossQuote(); }, 90_000);
-      setInterval(() => { void setupCrossQuote(); }, 6 * 60 * 60_000);
+      setInterval(labelled('cross-quote setup', () => { void setupCrossQuote(); }), 6 * 60 * 60_000);
       let lastCrossTick = 0;
       let crossBusy = false;
-      setInterval(async () => {
+      // Oct 14 (freeze phase 1): this watch only MEASURES (it never trades).
+      // Outside the market-open window it now samples every CROSS_QUOTE_REST_MS
+      // (default 60 s, was 15 s); the open window keeps every 5 s. Its maths
+      // runs in small bites (CROSS_QUOTE_CHUNKED=0: one go, old behaviour).
+      const CROSS_QUOTE_REST_MS = Number(process.env.CROSS_QUOTE_REST_MS ?? 60_000);
+      const CROSS_QUOTE_CHUNKED = process.env.CROSS_QUOTE_CHUNKED !== '0';
+      setInterval(labelled('cross-quote monitor', async () => {
             const t = toronto();
             const inOpen = t.weekday && t.mins >= OPEN_FROM && t.mins < OPEN_TO;
-            if (crossBusy || Date.now() - lastCrossTick < (inOpen ? 5_000 : 15_000)) return;
+            if (crossBusy || Date.now() - lastCrossTick < (inOpen ? 5_000 : CROSS_QUOTE_REST_MS)) return;
             crossBusy = true; lastCrossTick = Date.now();
-            try { await timedAsync('cross-quote monitor', () => crossQuote.tick(inOpen, t.date)); } catch { /* node busy: next tick */ } finally { crossBusy = false; }
-      }, 1_000);
+            try { await timedAsync('cross-quote monitor', () => (CROSS_QUOTE_CHUNKED ? crossQuote.tickChunked(inOpen, t.date) : crossQuote.tick(inOpen, t.date))); } catch { /* node busy: next tick */ } finally { crossBusy = false; }
+      }), 1_000);
       // One line an hour for the status page: biggest after-fee gap today.
-      setInterval(() => {
+      setInterval(labelled('market-open watch log', () => {
             const top = crossQuote.rows()[0];
             if (top) console.log(`[openwatch] ${crossQuote.tokenCount()} tokens; biggest gap today ${top.symbol}: open ${top.open.maxGapPct.toFixed(2)}% (after fees ${top.open.samples ? top.open.maxNetPct.toFixed(2) : 'n/a'}%), rest of day ${top.rest.maxGapPct.toFixed(2)}%`);
-      }, 60 * 60_000);
+      }), 60 * 60_000);
       const OPEN_REPORT_FILE = 'data/open-report.json';
-      setInterval(async () => {
+      setInterval(labelled('market-open report', async () => {
             const t = toronto();
             if (!t.weekday || t.mins < OPEN_REPORT || t.mins > OPEN_REPORT + 30) return;
             let last = '';
@@ -2576,8 +2669,8 @@ await chainManager.startAll();
                   writeFileSync(OPEN_REPORT_FILE, JSON.stringify({ date: t.date }));
                   await sendTelegramMessage(formatMarketOpenReport({ dateLabel: t.date, tokens: crossQuote.tokenCount(), rows: crossQuote.rows() }));
             } catch (err) { console.error('[telegram] market open report failed:', err); }
-      }, 60_000);
-      setInterval(() => { void runRobinhoodScan(); }, 6 * 60 * 60_000);
+      }), 60_000);
+      setInterval(labelled('pool scan', () => { void runRobinhoodScan(); }), 6 * 60 * 60_000);
 
       // ---- Measurement only (Oct 8): new pools, coin groups, loops --------
       // All three read through the gentle scan lane on the free node (see
@@ -2647,14 +2740,18 @@ await chainManager.startAll();
                   void timedAsync('v3 balance save', () => v3Balances.save(V3_BALANCES_FILE)); // for a fast restart (atomic write)
                   // Status page: pools whose price maths says "deep" but whose
                   // real coins don't (left out of gaps and checks). Top 3 shown.
-                  const thin = timed('thin pool check', () => thinPools(cache.allForChain('robinhood'), decimalsOf, (t) => priceOracle.getUsdPrice('robinhood', t)));
+                  const usdThin = (t: string) => priceOracle.getUsdPrice('robinhood', t);
+                  const thin = REPORT_CHUNKED
+                        ? await runSteps(thinPoolsSteps(cache.allForChain('robinhood'), decimalsOf, usdThin), 'thin pool check')
+                        : timed('thin pool check', () => thinPools(cache.allForChain('robinhood'), decimalsOf, usdThin));
+                  markStretch('thin pool check');
                   const k = (x: number) => (x >= 1000 ? `$${Math.round(x / 1000)}k` : `$${Math.round(x)}`);
                   console.log(`[thinpools] ${thin.length} pool(s) left out (looked deep, real coins under $${Math.round(POOL_MIN_DEPTH_USD / 1000)}k)` +
                         (thin.length ? `: ${thin.slice(0, 3).map((t) => `${symbolOf('robinhood', t.pool.tokenA)}/${symbolOf('robinhood', t.pool.tokenB)} ${t.pool.dex} ${(t.pool.feePips ?? t.pool.feeBps * 100) / 10_000}% ${k(t.realUsd)} real vs ${k(t.virtualUsd)} assumed`).join(' · ')}` : ''));
             } catch (err) { console.warn('[oracle] V3 balance read failed (kept old values):', (err as Error).message); }
       };
       setTimeout(() => { void refreshV3Balances(); }, 2 * 60_000);
-      setInterval(() => { void refreshV3Balances(); }, 10 * 60_000);
+      setInterval(labelled('v3 balance refresh', () => { void refreshV3Balances(); }), 10 * 60_000);
 
       // NEW POOL COUNTER (core/newPoolWatch.ts): new pools for coins that
       // already trade deep, and how far off their starting price was.
@@ -2744,7 +2841,7 @@ await chainManager.startAll();
       // fresh build just ran, so a second one would only repeat it.)
       const groupsFromDisk = !!tokenGroups;
       setTimeout(() => { void setupLoops(false).then(() => (groupsFromDisk ? setupLoops(true) : undefined)); }, 3 * 60_000);
-      setInterval(() => { void setupLoops(true); }, 6 * 60 * 60_000);
+      setInterval(labelled('loop monitor setup', () => { void setupLoops(true); }), 6 * 60 * 60_000);
       let loopBusy = false;
       let loopErrors = 0;
       setInterval(async () => {
@@ -2884,7 +2981,7 @@ for (let i = 0; i < resolved.length; i++) {
       };
       if (chainOn('monad')) {
             await checkMonadWatchList();
-            setInterval(checkMonadWatchList, 30_000);
+            setInterval(labelled('monad watch list', checkMonadWatchList), 30_000);
       }
 
       // ======================================================================
@@ -2906,10 +3003,14 @@ for (let i = 0; i < resolved.length; i++) {
       // digest shows real prices even in an hour with no swap traffic. Feeds
       // hourlyMatches (same store the live event path uses) instead of
       // sending its own message per pair like it used to.
-      const samplePricesIntoMatches = () => {
+      // (Oct 14: written as steps, pausing every 100 pools, so it can run in
+      // small bites; samplePricesIntoMatches() runs it in one go as before.)
+      function* samplePricesSteps(): Generator<void, void, void> {
             for (const chain of ['avalanche', 'monad', 'robinhood'] as const) {
                   const seenPairs = new Set<string>();
+                  let n = 0;
                   for (const pool of cache.allForChain(chain)) {
+                        if ((++n % 100) === 0) yield;
                         const pairKey = [pool.tokenA.toLowerCase(), pool.tokenB.toLowerCase()].sort().join('-');
                         if (seenPairs.has(pairKey)) continue;
                         seenPairs.add(pairKey);
@@ -2942,7 +3043,8 @@ for (let i = 0; i < resolved.length; i++) {
                         }
                   }
             }
-      };
+      }
+      const samplePricesIntoMatches = () => drainSteps(samplePricesSteps());
 
       // Health bookkeeping (runs every 15s alongside the health checks):
       //  - flap count per chain, reported in the next digest then reset
@@ -2955,8 +3057,9 @@ for (let i = 0; i < resolved.length; i++) {
       const healthTicks: Record<string, { healthy: number; total: number }> = {
             avalanche: { healthy: 0, total: 0 }, monad: { healthy: 0, total: 0 }, robinhood: { healthy: 0, total: 0 },
       };
-      setInterval(async () => {
+      setInterval(labelled('health check', async () => {
             await chainManager.runHealthChecks();
+            markStretch('health check');
             const status = chainManager.getStatus() as Record<string, { online: boolean; reason?: string }>;
             for (const [chain, info] of Object.entries(status)) {
                   const wasHealthy = lastHealthStatus[chain] ?? true;
@@ -2968,7 +3071,7 @@ for (let i = 0; i < resolved.length; i++) {
                   ticks.total++;
                   if (info.online) ticks.healthy++;
             }
-      }, 15_000);
+      }), 15_000);
 
       // Builds the "best spread per pair" sections from hourlyMatches.
       // The same pair can be stored under either token order (live event
@@ -3021,7 +3124,10 @@ for (let i = 0; i < resolved.length; i++) {
       const sendHourlyDigestInner = async () => {
             const now = Date.now();
             try {
-                  samplePricesIntoMatches();
+                  if (REPORT_CHUNKED) {
+                        await runSteps(samplePricesSteps(), 'hourly report');
+                        markStretch('hourly report'); // the rest of the build is named too
+                  } else samplePricesIntoMatches();
                   const stats = shadowLogger.windowStats(lastDigestAt, now);
                   const status = chainManager.getStatus() as Record<string, { online: boolean }>;
                   // Robinhood only (the normal setup): the plain-English report.
@@ -3141,25 +3247,27 @@ for (let i = 0; i < resolved.length; i++) {
       const sendHourlyDigest = () => timedAsync('hourly report', sendHourlyDigestInner);
       setInterval(sendHourlyDigest, 60 * 60 * 1000);
       // Stage timers: where the fire-ready time goes, every 5 min (median, then slowest 5%).
-      setInterval(() => {
+      setInterval(labelled('stall report', () => {
             const sp = stageTimers.take('fiveMin');
             console.log(`[speed] ${sp.median}`);
             console.log(`[speed] ${sp.p95}`);
             // Stall finder: freezes in the last 5 min and what caused them.
             const sf = stallFinder.take('fiveMin');
-            console.log(`[stalls] ${formatStallLine(sf)}`);
+            // Plus how many gaps the fast scan skipped because prices moved during it.
+            console.log(`[stalls] ${formatStallLine(sf)}${gapStaleSkips ? ` · gaps skipped (prices moved during the scan, rescanned): ${gapStaleSkips}` : ''}`);
+            gapStaleSkips = 0;
             const sd = formatStallDetail(sf);
             if (sd) console.log(`[stalls] ${sd}`);
-      }, 5 * 60_000);
+      }), 5 * 60_000);
       // Watch list size every 15 min (shown on the GitHub status page).
-      setInterval(() => {
+      setInterval(labelled('watch list log', () => {
             const ws = robinhoodWatcher.stats();
             console.log(`[pairs] robinhood watch list: ${ws.pairs} pairs, ${ws.pools} pools (${ws.pinnedWatched}/${ws.pinned} pinned found, ${ws.queued} queued)`);
-      }, 15 * 60_000);
+      }), 15 * 60_000);
       // Hourly memory housekeeping: drop cached pools that aren't in a watched
       // pair, aren't an approved flash lender and haven't been touched for
       // 2 h. They're re-discovered on demand if trades show up again.
-      setInterval(() => {
+      setInterval(labelled('pool prune', () => {
             try {
                   const keep = new Set<string>(robinhoodWatcher.watchedPairPools().flat().map((a) => a.toLowerCase()));
                   for (const c of ['robinhood', 'monad', 'avalanche']) for (const l of approvedLenders(c)) keep.add(l);
@@ -3168,7 +3276,7 @@ for (let i = 0; i < resolved.length; i++) {
                   const removed = cache.prune((p) => keep.has(p.poolAddress.toLowerCase()), 2 * 3600_000);
                   console.log(`[mem] pruned ${removed} idle pools (cache ${cache.size()}, opportunity log ${shadowLogger.size}, heap ${Math.round(process.memoryUsage().heapUsed / 1e6)} MB)`);
             } catch (err) { console.warn('[mem] prune failed:', (err as Error).message); }
-      }, 60 * 60 * 1000);
+      }), 60 * 60 * 1000);
       console.log(`[startup] fully running ${Math.round((Date.now() - BOOT_MS) / 1000)}s after start`);
 
       // Report on demand (see the SIGUSR2 handler at the top of this file).
@@ -3195,7 +3303,7 @@ for (let i = 0; i < resolved.length; i++) {
             await sendTelegramMessage(formatRivalDaily({ dateLabel: torontoNow().date, hours, summary: sum, botsKnown: rivalWatch.botCount(), botsVerified: rivalWatch.botStatus().verified,
                   newPools: newPoolWatchRef?.summary(now - 24 * 3600_000, now) }));
       };
-      setInterval(async () => {
+      setInterval(labelled('rival daily report', async () => {
             const t = torontoNow();
             if (t.hour !== RIVAL_DAILY_HOUR) return;
             let last = '';
@@ -3205,13 +3313,13 @@ for (let i = 0; i < resolved.length; i++) {
                   writeFileSync(RIVAL_DAILY_FILE, JSON.stringify({ date: t.date }));
                   await sendRivalDaily();
             } catch (err) { console.error('[telegram] rival daily report failed:', err); }
-      }, 60_000);
+      }), 60_000);
       // First taste: a rival report 2 hours after start, so you don't wait
       // until tomorrow morning to see the format.
       setTimeout(() => { void sendRivalDaily().catch(() => {}); }, Number(process.env.RIVAL_FIRST_REPORT_MS ?? 2 * 3600_000));
 
       let lastDailyAt = Date.now();
-      setInterval(async () => {
+      setInterval(labelled('daily report', async () => {
             const now = Date.now();
             try {
                   const stats = shadowLogger.windowStats(lastDailyAt, now);
@@ -3241,7 +3349,7 @@ for (let i = 0; i < resolved.length; i++) {
                   for (const t of Object.values(healthTicks)) { t.healthy = 0; t.total = 0; }
                   lastDailyAt = now;
             }
-      }, 24 * 60 * 60 * 1000);
+      }), 24 * 60 * 60 * 1000);
 
 console.log('Shadow mode running. Pool cache size:', cache.size());
 console.log('Chain status:', chainManager.getStatus());

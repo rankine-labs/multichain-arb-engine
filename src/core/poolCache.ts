@@ -9,15 +9,78 @@ import { amountInAfterFee } from './dexMath';
 // We keep every approved pool's state in RAM and update it as events arrive.
 // ============================================================================
 
+// ----------------------------------------------------------------------------
+// LOOKUP INDEXES (Oct 14, freeze phase 1)
+//
+// Plain English:
+//   "Which pools hold token X?" and "which other pools trade X/Y?" used to
+//   walk EVERY cached pool, lower-casing two or three addresses per pool
+//   each time. The price oracle asked "which pools hold X" several times
+//   per coin price, about once a second for every coin, and copied the
+//   whole pool list each time; every feed trade asked "which other pools
+//   trade this pair". With thousands of pools that was the biggest source
+//   of throwaway memory (memory clean-up was ~10% of all time) and part of
+//   the 300-700 ms gap-scan freezes.
+//
+//   Now the cache keeps two small indexes, updated on every write:
+//     chain -> pool keys       (allForChain, forChain)
+//     chain:token -> pool keys (withToken, findPeerPools)
+//   Answers are EXACTLY the same, in the same order (the indexes keep the
+//   order pools were first added, like the main list does).
+//
+// Switch: POOL_INDEX=0 goes back to walking every pool (old behaviour).
+// ----------------------------------------------------------------------------
+const POOL_INDEX_ON = process.env.POOL_INDEX !== '0';
+
 export class PoolCache {
   private pools = new Map<string, PoolState>(); // key: `${chain}:${poolAddress}`
+  // Index: chain -> keys of its pools (insertion order = main list order).
+  private byChain = new Map<string, Set<string>>();
+  // Index: `${chain}:${token lowercase}` -> keys of pools holding that token.
+  private byToken = new Map<string, Set<string>>();
+  // Lower-cased tokens a pool was indexed under (to unindex it exactly).
+  private indexedAs = new Map<string, { chain: string; a: string; b: string }>();
+  readonly indexed: boolean;
+
+  constructor(opts: { index?: boolean } = {}) {
+    this.indexed = opts.index ?? POOL_INDEX_ON;
+  }
 
     private key(chain: ChainName, poolAddress: string) {
         return `${chain}:${poolAddress.toLowerCase()}`;
           }
 
+  // Every write goes through here so the indexes always match the main list.
+  private put(k: string, pool: PoolState): void {
+    if (this.indexed) {
+      const prev = this.indexedAs.get(k);
+      // Same chain + tokens as before (the usual case: a price update): nothing to do.
+      if (!prev || prev.chain !== pool.chain || prev.a !== pool.tokenA.toLowerCase() || prev.b !== pool.tokenB.toLowerCase()) {
+        if (prev) this.unindex(k, prev);
+        const ent = { chain: pool.chain as string, a: pool.tokenA.toLowerCase(), b: pool.tokenB.toLowerCase() };
+        this.indexedAs.set(k, ent);
+        addTo(this.byChain, ent.chain, k);
+        addTo(this.byToken, `${ent.chain}:${ent.a}`, k);
+        addTo(this.byToken, `${ent.chain}:${ent.b}`, k);
+      }
+    }
+    this.pools.set(k, pool);
+  }
+
+  private unindex(k: string, ent: { chain: string; a: string; b: string }): void {
+    removeFrom(this.byChain, ent.chain, k);
+    removeFrom(this.byToken, `${ent.chain}:${ent.a}`, k);
+    removeFrom(this.byToken, `${ent.chain}:${ent.b}`, k);
+    this.indexedAs.delete(k);
+  }
+
+  private drop(k: string): void {
+    this.pools.delete(k);
+    if (this.indexed) { const ent = this.indexedAs.get(k); if (ent) this.unindex(k, ent); }
+  }
+
             upsert(pool: PoolState) {
-                this.pools.set(this.key(pool.chain, pool.poolAddress), pool);
+                this.put(this.key(pool.chain, pool.poolAddress), pool);
                   }
 
   // RPC refresh write: skip it if the cached copy changed AFTER the read
@@ -36,7 +99,7 @@ export class PoolCache {
   // Write a state predicted from a sequenced trade (instant price tracking).
   upsertFromFeed(pool: PoolState, now = Date.now()) {
     const k = this.key(pool.chain, pool.poolAddress);
-    this.pools.set(k, { ...pool, lastUpdatedMs: now });
+    this.put(k, { ...pool, lastUpdatedMs: now });
     this.feedApplied.set(k, now);
   }
 
@@ -46,7 +109,7 @@ export class PoolCache {
   // overwrite it (lastUpdatedMs is newer than that read's start).
   upsertFromBlock(pool: PoolState, now = Date.now()) {
     const k = this.key(pool.chain, pool.poolAddress);
-    this.pools.set(k, { ...pool, lastUpdatedMs: now });
+    this.put(k, { ...pool, lastUpdatedMs: now });
     this.blockApplied.set(k, now);
   }
   // When the block reader last wrote each pool. An RPC refresh that started
@@ -79,7 +142,7 @@ export class PoolCache {
     }
     this.skips.delete(k);
     this.feedApplied.delete(k);
-    this.pools.set(k, fresh);
+    this.put(k, fresh);
     return true;
   }
 
@@ -93,6 +156,20 @@ export class PoolCache {
                                     const a = tokenA.toLowerCase();
                                         const b = tokenB.toLowerCase();
                                             const results: PoolState[] = [];
+    if (this.indexed) {
+      // Index: walk the pools of the token with fewer pools, keep those whose
+      // other token matches. Same pools, same order as the full walk below.
+      const sa = this.byToken.get(`${chain}:${a}`), sb = this.byToken.get(`${chain}:${b}`);
+      if (!sa || !sb) return results;
+      const small = sa.size <= sb.size ? sa : sb;
+      const ex = `${chain}:${excludePool.toLowerCase()}`;
+      for (const k of small) {
+        if (k === ex) continue;
+        const ent = this.indexedAs.get(k)!;
+        if ((ent.a === a && ent.b === b) || (ent.a === b && ent.b === a)) results.push(this.pools.get(k)!);
+      }
+      return results;
+    }
                                                 for (const pool of this.pools.values()) {
                                                       if (pool.chain !== chain) continue;
                                                             if (pool.poolAddress.toLowerCase() === excludePool.toLowerCase()) continue;
@@ -112,7 +189,7 @@ export class PoolCache {
     let n = 0;
     for (const [k, p] of this.pools) {
       if (keep(p) || now - p.lastUpdatedMs < maxAgeMs) continue;
-      this.pools.delete(k);
+      this.drop(k);
       this.skips.delete(k);
       this.feedApplied.delete(k);
       this.blockApplied.delete(k); // (Oct 13) was missed: one entry per pruned pool stayed forever
@@ -123,8 +200,42 @@ export class PoolCache {
 
 
                                                                                                 allForChain(chain: ChainName): PoolState[] {
+    if (this.indexed) {
+      // Index: only this chain's pools, no full walk (same order as below).
+      const ks = this.byChain.get(chain);
+      const out: PoolState[] = [];
+      if (ks) for (const k of ks) out.push(this.pools.get(k)!);
+      return out;
+    }
                                                                                                     return [...this.pools.values()].filter(p => p.chain === chain);
                                                                                                       }
+
+  // Walk one chain's pools WITHOUT making a copy of the list (for loops
+  // that only read). Don't add or remove pools while walking.
+  *forChain(chain: ChainName): IterableIterator<PoolState> {
+    if (this.indexed) {
+      const ks = this.byChain.get(chain);
+      if (ks) for (const k of ks) yield this.pools.get(k)!;
+      return;
+    }
+    for (const p of this.pools.values()) if (p.chain === chain) yield p;
+  }
+
+  // Pools on `chain` holding `token`, in the same order as allForChain.
+  withToken(chain: ChainName, token: string): PoolState[] {
+    const t = token.toLowerCase();
+    const out: PoolState[] = [];
+    if (this.indexed) {
+      const ks = this.byToken.get(`${chain}:${t}`);
+      if (ks) for (const k of ks) out.push(this.pools.get(k)!);
+      return out;
+    }
+    for (const p of this.pools.values()) {
+      if (p.chain !== chain) continue;
+      if (p.tokenA.toLowerCase() === t || p.tokenB.toLowerCase() === t) out.push(p);
+    }
+    return out;
+  }
                                                                                                       
                                                                                                         // For tests / memory checks: how many pools have a "block reader wrote here" note.
   blockAppliedCount(): number { return this.blockApplied.size; }
@@ -202,3 +313,17 @@ export class PoolCache {
                                                                                                                                                                                                                                                                                                                                                                                                             return pool;
                                                                                                                                                                                                                                                                                                                                                                                                               }
                                                                                                                                                                                                                                                                                                                                                                                                               }
+
+// Index helpers: add / remove a pool key under an index entry (empty
+// entries are deleted so the index never keeps dead tokens around).
+function addTo(m: Map<string, Set<string>>, k: string, v: string): void {
+  let s = m.get(k);
+  if (!s) { s = new Set(); m.set(k, s); }
+  s.add(v);
+}
+function removeFrom(m: Map<string, Set<string>>, k: string, v: string): void {
+  const s = m.get(k);
+  if (!s) return;
+  s.delete(v);
+  if (s.size === 0) m.delete(k);
+}

@@ -1,4 +1,5 @@
 import { ethers } from 'ethers';
+import { markStretch } from './stallFinder';
 
 // ============================================================================
 // COMPETITOR TRACKER (live) -- how fast are the bots we race against?
@@ -98,6 +99,7 @@ export class CompetitorTracker {
         this.queue.shift();
         try {
           const r = await this.check(job);
+          markStretch('competitor tracker'); // stall finder name (measurement only)
           if (r) {
             this.results.push(r);
             this.total++;
@@ -156,6 +158,7 @@ export class CompetitorTracker {
         ? this.provider.send('eth_getLogs', [{ address: this.v4PoolManager, topics: [V4_SWAP_TOPIC, v4Ids], ...range }]) as Promise<RawLog[]>
         : Promise.resolve([] as RawLog[]),
     ]);
+    markStretch('competitor tracker'); // stall finder name (measurement only)
     const toLog = (l: RawLog, address: string) => ({ transactionHash: l.transactionHash, transactionIndex: Number(l.transactionIndex), blockNumber: Number(l.blockNumber), address });
     // A V4 swap counts as touching "the pool" whose id is in topic 1.
     const logs = [...plain.map((l) => toLog(l, l.address)), ...v4.map((l) => toLog(l, (l.topics?.[1] ?? '').toLowerCase()))];

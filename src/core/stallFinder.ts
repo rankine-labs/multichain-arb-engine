@@ -1,4 +1,5 @@
 import { PerformanceObserver, constants as perfConstants } from 'perf_hooks';
+import { getHeapStatistics } from 'v8';
 
 // ============================================================================
 // STALL FINDER ("what froze the bot?")
@@ -33,9 +34,26 @@ import { PerformanceObserver, constants as perfConstants } from 'perf_hooks';
 //
 // Switch: STALL_FINDER=0 turns the detector and GC watcher off (the job
 // wrappers then just run the job). On by default.
+//
+// Oct 14 fixes (freeze phase 1, measurement only):
+//   - GC was blamed only for freezes in the last ~20 s of each window: the
+//     list of recent clean-ups (1,000 long) filled in ~20 s at 44 clean-ups
+//     a second, and freezes were matched to clean-ups only when the report
+//     was built (every 5 min). Older GC freezes fell into "other". Now each
+//     freeze and each clean-up are matched the moment the second of the two
+//     is seen, so the match is never lost.
+//   - The freeze count stopped at 2,000 (the size of the list). The count
+//     and the worst freeze are now kept per window, so they are exact; the
+//     causes come from the newest MAX_STALLS freezes (the line says so when
+//     there were more).
+//   - mark(name): names the rest of the current stretch of work (used after
+//     an "await", where the old wrappers stopped timing).
+//   - Memory made per second (a lower bound): how fast the bot creates new
+//     data, from the heap size read at every tick. A high number means a lot
+//     of memory clean-up (GC) work.
 // ============================================================================
 
-const MAX_STALLS = 2_000;   // freezes remembered (enough for an hour of a bad case)
+export const MAX_STALLS = 6_000;   // freezes remembered (an hour of the Oct 14 bad case is ~2,500)
 const MAX_SLICES = 512;     // recent job slices kept to explain the next freeze
 const MAX_GC = 1_000;       // recent memory clean-ups kept to explain freezes
 const MIN_SLICE_MS = 1;     // job slices shorter than this can't explain a 50 ms freeze
@@ -51,6 +69,7 @@ interface Stall {
   ms: number;                 // how late the tick was (the freeze length)
   jobs: Map<string, number>;  // job name -> ms of the freeze it explains
   during: string[];           // slow background jobs in progress at the time
+  gcMs: number;               // ms of the freeze explained by memory clean-up (GC)
 }
 
 // Per-window totals for every named job (for the "longest steps" list).
@@ -66,6 +85,8 @@ export interface StallSummary {
   gc: GcTotals;               // every memory clean-up in this window
   longest: { name: string; maxMs: number; n: number }[]; // named jobs with the longest single stretch
   enabled: boolean;
+  causesFrom?: number;        // set when causes come from fewer freezes than counted (list full)
+  allocMbPerSec?: number;     // memory made per second (lower bound), when measured
 }
 
 // Name Node gives each kind of memory clean-up, in plain words.
@@ -85,13 +106,21 @@ class Window {
   started = performance.now();
   jobs = new Map<string, JobTotals>();
   gc = emptyGc();
-  reset(now: number) { this.started = now; this.jobs.clear(); this.gc = emptyGc(); }
+  freezes = 0;       // exact freeze count in this window (not limited by the list size)
+  worstMs = 0;
+  allocBytes = 0;    // heap growth seen between ticks (memory made, lower bound)
+  allocMs = 0;       // time those readings cover
+  reset(now: number) {
+    this.started = now; this.jobs.clear(); this.gc = emptyGc();
+    this.freezes = 0; this.worstMs = 0; this.allocBytes = 0; this.allocMs = 0;
+  }
 }
 
 export interface StallFinderOptions {
   thresholdMs?: number;   // freezes longer than this are counted (default 50)
   tickMs?: number;        // detector tick (default 20)
   enabled?: boolean;      // default: STALL_FINDER is not 0
+  heapUsed?: () => number; // heap size reader (tests pass a fake one)
 }
 
 export class StallFinder {
@@ -109,11 +138,15 @@ export class StallFinder {
   // Slow background jobs started but not finished (name -> how many).
   private inFlight = new Map<string, number>();
   private win = { fiveMin: new Window(), hour: new Window() };
+  // Last heap size reading (for the memory-made-per-second estimate).
+  private lastHeap = -1;
+  private readonly heapUsed: () => number;
 
   constructor(opts: StallFinderOptions = {}) {
     this.thresholdMs = opts.thresholdMs ?? 50;
     this.tickMs = opts.tickMs ?? 20;
     this.enabled = opts.enabled ?? (process.env.STALL_FINDER !== '0' && process.env.STALL_FINDER !== 'off');
+    this.heapUsed = opts.heapUsed ?? (() => getHeapStatistics().used_heap_size);
   }
 
   // ---- Start / stop the detector ------------------------------------------
@@ -147,7 +180,23 @@ export class StallFinder {
     this.lastTick = now;
     const late = gap - this.tickMs;
     if (late > this.thresholdMs) this.recordStall(now - gap, now, late);
+    this.noteHeap(gap);
   }
+
+  // Memory made per second (lower bound): the heap only grows between two
+  // readings when new data is made; a clean-up makes it drop. Adding up the
+  // growth between ticks misses what a clean-up removed in between, so the
+  // real rate is higher. Exposed for tests.
+  noteHeap(gapMs: number, heap = this.safeHeap()): void {
+    if (heap < 0) return;
+    const grew = this.lastHeap >= 0 ? heap - this.lastHeap : 0;
+    this.lastHeap = heap;
+    for (const w of [this.win.fiveMin, this.win.hour]) {
+      if (grew > 0) w.allocBytes += grew;
+      w.allocMs += gapMs;
+    }
+  }
+  private safeHeap(): number { try { return this.heapUsed(); } catch { return -1; } }
 
   // Exposed for tests: record a freeze between two times.
   recordStall(start: number, end: number, ms: number): void {
@@ -166,9 +215,24 @@ export class StallFinder {
       const own = overlap * Math.min(1, Math.max(0, s.selfMs / dur));
       if (own > 0) jobs.set(s.name, (jobs.get(s.name) ?? 0) + own);
     }
-    const during = [...this.inFlight.keys()].sort();
-    this.stalls.push({ start, end, ms, jobs, during });
-    if (this.stalls.length > MAX_STALLS) this.stalls.splice(0, this.stalls.length - MAX_STALLS);
+    const during = this.inFlight.size ? [...this.inFlight.keys()].sort() : [];
+    // Memory clean-ups already reported that overlapped this freeze. (One
+    // reported AFTER this freeze is matched in noteGc instead, so each
+    // clean-up / freeze pair is counted exactly once.)
+    let gcMs = 0;
+    for (let i = this.gcs.length - 1; i >= 0; i--) {
+      const g = this.gcs[i];
+      if (g.end + 10_000 < start) break;   // far older than the freeze: stop looking
+      const o = Math.min(g.end, end) - Math.max(g.start, start);
+      if (o > 0) gcMs += o;
+    }
+    this.stalls.push({ start, end, ms, jobs, during, gcMs });
+    for (const w of [this.win.fiveMin, this.win.hour]) {
+      w.freezes++;
+      if (ms > w.worstMs) w.worstMs = ms;
+    }
+    // Trimmed in batches (not one at a time) so a long list isn't shifted on every freeze.
+    if (this.stalls.length > MAX_STALLS + 500) this.stalls.splice(0, this.stalls.length - MAX_STALLS);
   }
 
   // A memory clean-up finished (Node tells us shortly after it happened).
@@ -180,8 +244,17 @@ export class StallFinder {
       if (durationMs > g.maxMs) { g.maxMs = durationMs; g.maxKind = kind; }
     }
     if (durationMs >= MIN_SLICE_MS) {
-      this.gcs.push({ start, end: start + durationMs, kind });
-      if (this.gcs.length > MAX_GC) this.gcs.splice(0, this.gcs.length - MAX_GC);
+      const end = start + durationMs;
+      this.gcs.push({ start, end, kind });
+      if (this.gcs.length > MAX_GC + 200) this.gcs.splice(0, this.gcs.length - MAX_GC);
+      // Freezes already recorded that this clean-up overlapped (Node reports
+      // a clean-up a moment after it happened, often after the late tick).
+      for (let i = this.stalls.length - 1; i >= 0; i--) {
+        const s = this.stalls[i];
+        if (s.end <= start) break;          // freezes are stored in time order
+        const o = Math.min(end, s.end) - Math.max(start, s.start);
+        if (o > 0) s.gcMs += o;
+      }
     }
   }
 
@@ -228,6 +301,14 @@ export class StallFinder {
     try { return fn(); } finally { end(); }
   }
 
+  // Name the rest of the current stretch of work, e.g. right after an
+  // "await" (where run/runAsync stopped timing). The stretch ends when the
+  // current piece of code gives the thread back (next microtask turn).
+  mark(name: string): void {
+    const end = this.begin(name);
+    queueMicrotask(end);
+  }
+
   // Time an async job. The part before its first "await" is timed as one
   // stretch (that is where async jobs usually do their heavy work); the job
   // also counts as "in progress" until it finishes, so a freeze that no
@@ -259,20 +340,14 @@ export class StallFinder {
       c.n++; if (ms > c.maxMs) c.maxMs = ms;
       causes.set(name, c);
     };
-    let freezes = 0, worstMs = 0;
+    let seen = 0;
     for (const s of this.stalls) {
       if (s.end < from || s.end > now) continue;
-      freezes++;
-      if (s.ms > worstMs) worstMs = s.ms;
+      seen++;
       let explained = 0;
       for (const [name, ms] of s.jobs) { add(name, ms); explained += ms; }
-      // Memory clean-ups that overlapped the freeze (GC entries can arrive
-      // a moment after the freeze was noticed, so they're matched here).
-      let gcMs = 0;
-      for (const g of this.gcs) {
-        const o = Math.min(g.end, s.end) - Math.max(g.start, s.start);
-        if (o > 0) gcMs += o;
-      }
+      // Memory clean-ups that overlapped the freeze (matched as they arrive).
+      const gcMs = Math.min(s.gcMs, s.ms);
       if (gcMs > 0) { add('GC', gcMs); explained += gcMs; }
       // Whatever isn't explained by a named job or GC: "other".
       const rest = s.ms - explained;
@@ -282,7 +357,9 @@ export class StallFinder {
       .sort((a, b) => b.n * b.maxMs - a.n * a.maxMs || b.maxMs - a.maxMs);
     const longest = [...w.jobs.entries()].map(([name, j]) => ({ name, maxMs: j.maxMs, n: j.n }))
       .sort((a, b) => b.maxMs - a.maxMs);
-    const out: StallSummary = { freezes, worstMs, thresholdMs: this.thresholdMs, causes: list, gc: { ...w.gc }, longest, enabled: this.enabled };
+    const out: StallSummary = { freezes: w.freezes, worstMs: w.worstMs, thresholdMs: this.thresholdMs, causes: list, gc: { ...w.gc }, longest, enabled: this.enabled };
+    if (seen < w.freezes) out.causesFrom = seen;
+    if (w.allocMs >= 1_000) out.allocMbPerSec = w.allocBytes / 1_048_576 / (w.allocMs / 1_000);
     w.reset(now);
     return out;
   }
@@ -296,7 +373,8 @@ export function formatStallLine(s: StallSummary, maxCauses = 4): string {
   if (!s.enabled) return 'Freezes: stall finder off (STALL_FINDER=0)';
   if (!s.freezes) return `Freezes over ${s.thresholdMs} ms: none`;
   const causes = s.causes.slice(0, maxCauses).map((c) => `${c.name} ${c.n}x (max ${fmt(c.maxMs)} ms)`).join(', ');
-  return `Freezes over ${s.thresholdMs} ms: ${s.freezes} (worst ${fmt(s.worstMs)} ms)${causes ? ` · top causes: ${causes}` : ''}`;
+  const from = s.causesFrom !== undefined ? ` (newest ${s.causesFrom})` : '';
+  return `Freezes over ${s.thresholdMs} ms: ${s.freezes} (worst ${fmt(s.worstMs)} ms)${causes ? ` · top causes${from}: ${causes}` : ''}`;
 }
 
 // "Memory clean-up (GC): 812x, 1.9 s in total, worst 85 ms (major), 6 major · longest single steps: loop scan 14 ms, ..."
@@ -306,7 +384,8 @@ export function formatStallDetail(s: StallSummary, maxJobs = 4): string {
   const total = g.totalMs >= 1000 ? `${(g.totalMs / 1000).toFixed(1)} s` : `${fmt(g.totalMs)} ms`;
   const gcText = g.n ? `Memory clean-up (GC): ${g.n}x, ${total} in total, worst ${fmt(g.maxMs)} ms (${g.maxKind || '?'}), ${g.major} major` : 'Memory clean-up (GC): none seen';
   const jobs = s.longest.filter((j) => j.maxMs >= 5).slice(0, maxJobs).map((j) => `${j.name} ${fmt(j.maxMs)} ms`).join(', ');
-  return `${gcText}${jobs ? ` · longest single steps: ${jobs}` : ''}`;
+  const alloc = s.allocMbPerSec !== undefined ? ` · memory made: at least ${fmt(s.allocMbPerSec)} MB/s` : '';
+  return `${gcText}${alloc}${jobs ? ` · longest single steps: ${jobs}` : ''}`;
 }
 
 // The bot's one stall finder (started in shadowMain). Other files use the
@@ -314,3 +393,15 @@ export function formatStallDetail(s: StallSummary, maxJobs = 4): string {
 export const stallFinder = new StallFinder();
 export const timed = <T>(name: string, fn: () => T): T => stallFinder.run(name, fn);
 export const timedAsync = <T>(name: string, fn: () => Promise<T>, track = true): Promise<T> => stallFinder.runAsync(name, fn, track);
+// Name the rest of the current stretch of work (after an await). See mark().
+export const markStretch = (name: string): void => stallFinder.mark(name);
+// Wrap a callback (timer, event handler) so each call is timed under `name`.
+// Works for plain and async callbacks (an async one is timed up to its
+// first await, like timedAsync without the "in progress" note). The
+// callback's return value is passed through unchanged.
+export function labelled<A extends unknown[], R>(name: string, fn: (...args: A) => R): (...args: A) => R {
+  return (...args: A): R => {
+    const end = stallFinder.begin(name);
+    try { return fn(...args); } finally { end(); }
+  };
+}

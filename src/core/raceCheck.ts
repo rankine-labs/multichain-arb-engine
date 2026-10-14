@@ -1,4 +1,5 @@
 import { ethers } from 'ethers';
+import { markStretch } from './stallFinder';
 
 // ============================================================================
 // RACE CHECK -- would we really have won each practice win?
@@ -128,6 +129,7 @@ export class RaceChecker {
       const logs: Log[] = [];
       if (addrs.length) logs.push(...(await q({ address: addrs, topics: [SWAP_TOPICS] })));
       if (ids.length) logs.push(...(await q({ address: this.poolManager, topics: [V4_SWAP, ids] })));
+      markStretch('race check'); // stall finder name (measurement only)
       for (const e of ripe) {
         const j = judge(e, logs, this.poolManager);
         const r: RaceResult = { ...e, ...j };

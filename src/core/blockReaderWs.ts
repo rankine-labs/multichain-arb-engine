@@ -1,5 +1,6 @@
 import WebSocket from 'ws';
-import { HANDLED_TOPICS, V4_SWAP_TOPIC, RpcFn, RpcLog, PoolUpdate, parsePoolLogs, latestPerPool } from './blockReader';
+import { HANDLED_TOPICS, V4_SWAP_TOPIC, RpcFn, RpcLog, PoolUpdate, parsePoolLogs, latestPerPool, AddressSetCache } from './blockReader';
+import { stallFinder } from './stallFinder';
 import { endpointLabel } from './endpointLabel';
 import { nodeUsage, NodeUsageCounter } from './nodeUsage';
 
@@ -215,7 +216,7 @@ export class WsBlockReader {
     this.downSince = this.now();
     this.connect();
     if (this.o.autoTick !== false && !this.tickTimer) {
-      this.tickTimer = setInterval(() => this.tick(), 1_000);
+      this.tickTimer = setInterval(() => stallFinder.run('block reader ws tick', () => this.tick()), 1_000);
       (this.tickTimer as any).unref?.();
     }
   }
@@ -269,10 +270,18 @@ export class WsBlockReader {
   private subIds = new Set<string>();
   private curSince = new Map<string, number>(); // current-list pool -> in the list since
   private curAt = -Infinity;                    // when curSince was last rebuilt
+  // Oct 14: the lists curSince was last built from. Same frozen address list
+  // and same id set again = nothing to rebuild (see AddressSetCache).
+  private curSrc: { addrs: unknown; ids: unknown } = { addrs: null, ids: null };
+  private addrCache = new AddressSetCache();
   // Rebuild the "current list" view. Called by apply() (which reads the list
   // anyway) and by coveredSinceMs() at most once a second.
-  private noteCurrent(addrs: Iterable<string>, ids: Iterable<string>): void {
+  private noteCurrent(addrs: Iterable<string>, ids: Iterable<string>, src?: readonly string[]): void {
     const t = this.now();
+    // Built from these very lists last time (frozen list): the rebuild would
+    // give the same map, so only the time is updated.
+    if (src && Object.isFrozen(src) && this.curSrc.addrs === addrs && this.curSrc.ids === ids) { this.curAt = t; return; }
+    this.curSrc = { addrs: src && Object.isFrozen(src) ? addrs : null, ids };
     const next = new Map<string, number>();
     for (const x of addrs) if (x) { const k = x.toLowerCase(); next.set(k, this.curSince.get(k) ?? t); }
     for (const x of ids) if (x) { const k = x.toLowerCase(); next.set(k, this.curSince.get(k) ?? t); }
@@ -282,7 +291,7 @@ export class WsBlockReader {
   coveredSinceMs(addr: string): number | null {
     if (!this.healthy()) return null;
     if (this.now() - this.curAt > 1_000) {
-      try { this.noteCurrent(this.o.addresses() ?? [], this.o.v4Ids() ?? new Set<string>()); } catch { return null; }
+      try { const src = this.o.addresses() ?? []; this.noteCurrent(src, this.o.v4Ids() ?? new Set<string>(), src); } catch { return null; }
     }
     const a = addr.toLowerCase();
     const since = this.curSince.get(a);
@@ -396,7 +405,9 @@ export class WsBlockReader {
         this.scheduleReconnect();
       }
     });
-    sock.on('message', (data: unknown) => { if (gen === this.gen) this.onMessage(data); });
+    // Stall finder: each pushed message (parse + keep our pools' events) is
+    // timed as "block reader message" (measurement only).
+    sock.on('message', (data: unknown) => { if (gen === this.gen) stallFinder.run('block reader message', () => this.onMessage(data)); });
     sock.on('pong', () => { if (gen === this.gen) this.lastMsgAt = this.now(); });
     sock.on('close', () => {
       if (gen !== this.gen) return;
@@ -545,7 +556,8 @@ export class WsBlockReader {
   // milliseconds so the bot gets them as one batch (one gap scan, not 20).
   private scheduleFlush(): void {
     if (this.cancelFlush) return;
-    this.cancelFlush = this.schedule(() => { this.cancelFlush = null; this.flush(); }, this.o.flushMs ?? 5);
+    // Stall finder: applying the gathered events is named (measurement only).
+    this.cancelFlush = this.schedule(() => { this.cancelFlush = null; stallFinder.run('block reader apply', () => this.flush()); }, this.o.flushMs ?? 5);
   }
 
   // Apply everything gathered so far (and start a reorg re-read if needed).
@@ -564,11 +576,10 @@ export class WsBlockReader {
   // decode, keep the newest per pool, hand to the bot.
   private apply(logs: RpcLog[], toBlockHint = -1): void {
     const pm = (this.o.poolManager || '').toLowerCase();
-    const addrSet = new Set<string>();
-    for (const a of this.o.addresses() ?? []) if (a) addrSet.add(a.toLowerCase());
-    if (pm) addrSet.add(pm);
+    const src = this.o.addresses() ?? [];
+    const addrSet = this.addrCache.get(src, pm);
     const ids = this.o.v4Ids() ?? new Set<string>();
-    this.noteCurrent(addrSet, ids); // keep coveredSinceMs() in step with what is really applied
+    this.noteCurrent(addrSet, ids, src); // keep coveredSinceMs() in step with what is really applied
     let maxSeen = this.lastBlock;
     const kept: RpcLog[] = [];
     for (const l of logs) {
@@ -585,7 +596,9 @@ export class WsBlockReader {
     }
     this.lastBlock = Math.max(maxSeen, toBlockHint);
     if (this.lastBlock > this.head) this.head = this.lastBlock;
-    const latest = latestPerPool(parsePoolLogs(kept, pm));
+    const endDecode = stallFinder.begin('block reader decode');
+    let latest: Map<string, PoolUpdate>;
+    try { latest = latestPerPool(parsePoolLogs(kept, pm)); } finally { endDecode(); }
     if (latest.size === 0) return;
     this.counts.updates += latest.size;
     try {

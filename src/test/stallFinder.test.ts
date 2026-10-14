@@ -6,7 +6,7 @@
 //   - memory clean-ups (GC) that overlap a freeze are listed as "GC"
 //   - the 5-minute log line / hourly Telegram lines read as expected
 // Timing checks use generous bounds (the server runs these during deploys).
-import { StallFinder, formatStallLine, formatStallDetail } from '../core/stallFinder';
+import { StallFinder, formatStallLine, formatStallDetail, MAX_STALLS } from '../core/stallFinder';
 import { formatPlainHourly } from '../core/telegramFormatter';
 
 function assert(cond: boolean, msg: string) {
@@ -104,8 +104,9 @@ async function main() {
     assert(formatStallLine(empty) === 'Freezes over 50 ms: none' && empty.gc.n === 0, 'fresh window after take(): "none"');
     assert(formatStallLine({ ...empty, enabled: false }) === 'Freezes: stall finder off (STALL_FINDER=0)' && formatStallDetail({ ...empty, enabled: false }) === '', 'off switch is reported plainly');
     // Bounded memory: thousands of freezes never grow the list without limit.
-    for (let i = 0; i < 5_000; i++) f.recordStall(t + 30_000 + i, t + 30_000 + i + 0.5, 60);
-    assert((f as any).stalls.length <= 2_000, 'freeze list is bounded');
+    // (Oct 14: the list holds MAX_STALLS, trimmed in batches of 500.)
+    for (let i = 0; i < 20_000; i++) f.recordStall(t + 30_000 + i, t + 30_000 + i + 0.5, 60);
+    assert((f as any).stalls.length <= MAX_STALLS + 500, 'freeze list is bounded');
   }
 
   // ---------------------------------------------------------------------------
