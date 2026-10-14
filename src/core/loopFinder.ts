@@ -2,6 +2,7 @@ import { PoolState } from './types';
 import { feePipsOf } from './dexMath';
 import { clAmountOut, v2AmountOut } from './venueMath';
 import { realBalanceOf } from './poolPrice';
+import { stallFinder } from './stallFinder';
 
 // ============================================================================
 // LOOP FINDER -- finds 3 to 8 pool loops that end with more than they start
@@ -843,6 +844,8 @@ export class LoopFinder {
   private slice = () => {
     const job = this.job;
     if (!job) return;
+    // Stall finder: times this slice as "loop rebuild" (measurement only).
+    const endTimer = stallFinder.begin('loop rebuild');
     const s0 = performance.now(), deadline = s0 + this.cfg.sliceMs;
     let finished = job.search.run(deadline);
     // Then the "which loops go through which pool" index, also in slices.
@@ -855,6 +858,7 @@ export class LoopFinder {
       }
     }
     const took = performance.now() - s0;
+    endTimer();
     job.workMs += took; job.slices++; job.maxSliceMs = Math.max(job.maxSliceMs, took);
     if (!finished) { setImmediate(this.slice); return; }
     const s = job.search;

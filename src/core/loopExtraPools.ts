@@ -1,6 +1,8 @@
 import { ethers } from 'ethers';
 import { PoolState } from './types';
 import { hasExactMath } from './loopFinder';
+import { Steps, drainSteps, runSteps } from './chunked';
+import { timed } from './stallFinder';
 
 // ============================================================================
 // LOOP EXTRA POOLS -- keep single-pool coin pairs fresh, for the loop trader
@@ -56,6 +58,10 @@ export interface LoopExtraConfig {
   refreshMs: number;         // LOOP_EXTRA_REFRESH_MS: bundled re-read of picked pools (default 20 s, 0 = off)
   lookupsPerRound: number;   // LOOP_EXTRA_LOOKUPS: new single pools looked up per rebuild (default 40)
   balanceChecksPerRound: number; // scan pools given a cheap balance read per rebuild (5,000 = ~13 bundled requests)
+  // STALL_FIX_EXTRA_PICK (default on): do the pick in ~5 ms bites from a
+  // compact scan index, so it never freezes the bot. Same pools picked.
+  // Left out (old tests) = off.
+  chunked?: boolean;
 }
 
 const num = (raw: string | undefined, dflt: number, min: number, max: number): number => {
@@ -84,6 +90,7 @@ export function loopExtraConfigFromEnv(
     refreshMs: Math.round(num(env.LOOP_EXTRA_REFRESH_MS, dfltRefresh, 0, 600_000)),
     lookupsPerRound: Math.round(num(env.LOOP_EXTRA_LOOKUPS, 40, 0, 500)),
     balanceChecksPerRound: 5_000,
+    chunked: env.STALL_FIX_EXTRA_PICK !== '0' && env.STALL_FIX_EXTRA_PICK !== 'off',
   };
 }
 
@@ -144,6 +151,13 @@ export interface SelectOutput {
 }
 
 export function selectLoopPools(inp: SelectInput): SelectOutput {
+  return drainSteps(selectLoopPoolsSteps(inp));
+}
+
+// The same pick as selectLoopPools(), written as steps (core/chunked.ts):
+// `yield` marks safe places for a break, so the rebuild can run it in ~5 ms
+// bites with runSteps(). Same code, so the same pools are picked.
+export function* selectLoopPoolsSteps(inp: SelectInput): Steps<SelectOutput> {
   const L = inp.loopMaxPools;
   const rival = inp.rivalPools ?? new Set<string>();
   const watchedKeys = new Set(inp.watched.map((p) => lc(p.poolAddress)));
@@ -154,11 +168,18 @@ export function selectLoopPools(inp: SelectInput): SelectOutput {
   // How many pools we know per pair outside the watch list (a "single" pair has exactly one).
   const perPair = new Map<string, number>();
   const others = inp.others.filter((p) => !watchedKeys.has(lc(p.poolAddress)));
-  for (const p of others) { const k = pairKey(p.tokenA, p.tokenB); perPair.set(k, (perPair.get(k) ?? 0) + 1); }
+  yield;
+  for (let i = 0; i < others.length; i++) {
+    if ((i & 1023) === 1023) yield;
+    const p = others[i];
+    const k = pairKey(p.tokenA, p.tokenB); perPair.set(k, (perPair.get(k) ?? 0) + 1);
+  }
 
   const singles: PoolState[] = [];
   const seen = new Set<string>();
+  let step = 0;
   for (const p of others) {
+    if ((++step & 255) === 255) yield;
     const k = lc(p.poolAddress), pk = pairKey(p.tokenA, p.tokenB);
     if (seen.has(k) || lc(p.tokenA) === lc(p.tokenB)) continue;
     if (watchedPairs.has(pk)) continue;                         // pair already watched: not ours
@@ -188,12 +209,20 @@ export function selectLoopPools(inp: SelectInput): SelectOutput {
     }
     return false;
   };
-  const reach = singles.filter(fits);
+  // (Each "fits" test can walk the coin map, so take a break every 16.)
+  yield;
+  const reach: PoolState[] = [];
+  for (let i = 0; i < singles.length; i++) {
+    if ((i & 15) === 15) yield;
+    if (fits(singles[i])) reach.push(singles[i]);
+  }
+  yield;
 
   // Rival coins: coins of pools the rival loops went through (not WETH/USDG,
   // which are on every loop).
   const rivalTokens = new Set<string>();
   for (const p of [...inp.watched, ...inp.others]) if (rival.has(lc(p.poolAddress))) { rivalTokens.add(lc(p.tokenA)); rivalTokens.add(lc(p.tokenB)); }
+  yield;
   for (const b of bases) rivalTokens.delete(b);
   const score = (p: PoolState) => (rival.has(lc(p.poolAddress)) ? 4 : 0) + (rivalTokens.has(lc(p.tokenA)) ? 1 : 0) + (rivalTokens.has(lc(p.tokenB)) ? 1 : 0);
   const depth = new Map(reach.map((p) => [p, inp.depthUsd(p) ?? 0] as [PoolState, number]));
@@ -264,6 +293,261 @@ export function pickScanCandidates(inp: ScanPickInput): (ScanPoolRef & { tier: n
 }
 
 // ----------------------------------------------------------------------------
+// 2b) The same pick, from a compact index of the scan (STALL FIX, Oct 14)
+//
+// Plain English:
+//   pickScanCandidates() above goes over the chain-wide scan's ~400,000
+//   pools twice per pick (every 10 min), building about a million throw-away
+//   objects and a 400,000-entry list of text keys each time. That froze the
+//   bot for hundreds of ms and gave Node's memory clean-up (GC) lots of work.
+//
+//   Now, once per scan update, we build a compact index of the scan (plain
+//   number lists, no text keys): which pools are the only pool of their coin
+//   pair ("singles"), and the coin pairs that have 2+ pools. Each pick then
+//   only looks at the singles, using numbers, in ~5 ms bites. The answer is
+//   exactly the same as pickScanCandidates() (the tests compare the two).
+// ----------------------------------------------------------------------------
+type ScanStateLike = { tokens: string[]; pools: Array<[number, string, number, number]>; factories: string[] };
+
+export interface ScanIndex {
+  state: ScanStateLike;
+  poolCount: number;       // scan pools this index covers (state.pools.length when built)
+  tokenCount: number;      // coins this index covers
+  factoryCount: number;
+  anyPool: boolean;        // at least one usable pool (not V4, a normal address)
+  canon: Int32Array;       // coin position -> first position of the same coin (normally itself)
+  low: string[];           // coin addresses in lower case (the state's own list when it already is)
+  singles: Int32Array;     // positions (in state.pools) of usable pools that are the only pool of their pair
+  multi: Map<string, number>; // pair key -> number of pools, only for pairs on 2+ pools
+}
+
+// Is this index still right for the scan state? (The scan only ever adds
+// pools, coins and factories, so the lengths tell us.)
+export function scanIndexFresh(idx: ScanIndex | null, state: ScanStateLike): boolean {
+  return !!idx && idx.state === state && idx.poolCount === state.pools.length
+    && idx.tokenCount === state.tokens.length && idx.factoryCount === state.factories.length;
+}
+
+// Build the index (as steps, see core/chunked.ts). Once per scan update.
+// Plain number tables sized up front are used instead of Maps: a Map that
+// grows to 400k entries re-sorts itself mid-way (one ~100 ms freeze), and
+// every throw-away object or growing list adds to Node's memory clean-up.
+export function* buildScanIndexSteps(state: ScanStateLike): Steps<ScanIndex> {
+  const P = state.pools.length, T = state.tokens.length, F = state.factories.length;
+  const isV4 = state.factories.map((f) => f.split('|')[1] === 'v4');
+  // Lower-case coin list (the scan already stores lower case; checked
+  // letter by letter, so nothing new is made when it already is).
+  let low = state.tokens;
+  for (let i = 0; i < T; i++) {
+    if ((i & 4095) === 4095) yield;
+    if (hasUpper(state.tokens[i])) { low = state.tokens.map(lc); break; }
+  }
+  yield;
+  // Same coin listed twice? Point both at the first one (normally never
+  // happens). Number table keyed by a hash of the address text.
+  const canon = new Int32Array(T);
+  {
+    const tmask = tableSize(T) - 1;
+    const at = new Int32Array(tmask + 1).fill(-1);
+    for (let i = 0; i < T; i++) {
+      if ((i & 4095) === 4095) yield;
+      const s = low[i];
+      let h = textHash(s, false) & tmask;
+      while (at[h] !== -1 && low[at[h]] !== s) h = (h + 1) & tmask;
+      if (at[h] === -1) { at[h] = i; canon[i] = i; } else canon[i] = at[h];
+    }
+  }
+  // Pools per coin pair. Slot = hash of (smaller coin, larger coin).
+  const usable = (row: [number, string, number, number]) => !isV4[row[0]] && row[1].length === 42;
+  const cap = tableSize(P), mask = cap - 1;
+  const slotA = new Int32Array(cap).fill(-1), slotB = new Int32Array(cap), slotN = new Int32Array(cap);
+  // The slot of pair (a, b), a < b: the matching one, or the first free one.
+  const slotOf = (a: number, b: number): number => {
+    let h = ((Math.imul(a, 0x9e3779b1) ^ Math.imul(b + 0x7f4a7c15, 0x85ebca77)) >>> 0) & mask;
+    while (slotA[h] !== -1 && (slotA[h] !== a || slotB[h] !== b)) h = (h + 1) & mask;
+    return h;
+  };
+  let anyPool = false;
+  for (let i = 0; i < P; i++) {
+    if ((i & 2047) === 2047) yield;
+    const row = state.pools[i];
+    if (!usable(row)) continue;
+    anyPool = true;
+    let a = canon[row[2]], b = canon[row[3]];
+    if (a > b) { const x = a; a = b; b = x; }
+    const h = slotOf(a, b);
+    if (slotA[h] === -1) { slotA[h] = a; slotB[h] = b; }
+    slotN[h]++;
+  }
+  // Singles: usable pools that are the only pool of their pair (in scan order).
+  const singlesAll = new Int32Array(P);
+  let ns = 0;
+  for (let i = 0; i < P; i++) {
+    if ((i & 2047) === 2047) yield;
+    const row = state.pools[i];
+    if (!usable(row)) continue;
+    let a = canon[row[2]], b = canon[row[3]];
+    if (a === b) continue;
+    if (a > b) { const x = a; a = b; b = x; }
+    if (slotN[slotOf(a, b)] === 1) singlesAll[ns++] = i;
+  }
+  // Pairs on 2+ pools, by their usual text key (only these few need text).
+  const multi = new Map<string, number>();
+  for (let h = 0; h < cap; h++) {
+    if ((h & 8191) === 8191) yield;
+    if (slotN[h] >= 2) multi.set(pairKey(low[slotA[h]], low[slotB[h]]), slotN[h]);
+  }
+  return { state, poolCount: P, tokenCount: T, factoryCount: F, anyPool, canon, low, singles: singlesAll.slice(0, ns), multi };
+}
+
+// Table size: a power of two, at least twice the number of entries.
+function tableSize(n: number): number { let c = 1024; while (c < n * 2) c *= 2; return c; }
+// Any capital letter (A-Z) in the text?
+function hasUpper(s: string): boolean {
+  for (let c = 0; c < s.length; c++) { const x = s.charCodeAt(c); if (x >= 65 && x <= 90) return true; }
+  return false;
+}
+// Number hash of a text (FNV-1a). anyCase = treat capital letters as small
+// ones (works for addresses: only 0-9, a-f, x), so "0xAb" and "0xab" match.
+function textHash(s: string, anyCase: boolean): number {
+  let h = 0x811c9dc5;
+  for (let c = 0; c < s.length; c++) { let x = s.charCodeAt(c); if (anyCase && x >= 65 && x <= 90) x += 32; h = Math.imul(h ^ x, 0x01000193); }
+  return h >>> 0;
+}
+
+// Pools the scan knows for a pair, from the index: the count for pairs on
+// 2+ pools, otherwise 0. (selectLoopPools only asks "more than one?", so
+// this gives the same pick as counting every scan pool.)
+export function scanPairCountFromIndex(idx: ScanIndex | null, pk: string): number {
+  return idx?.multi.get(pk) ?? 0;
+}
+
+export interface IndexedPickInput extends Omit<ScanPickInput, 'scanPools'> { index: ScanIndex }
+
+// Same answer as pickScanCandidates(), from the index (as steps).
+// Same rules in the same order; the only differences are how it is done:
+// numbers instead of text keys, and a pool address is only turned into
+// lower case (a new piece of text) when its answer depends on it.
+export function* pickScanCandidatesIndexedSteps(inp: IndexedPickInput): Steps<(ScanPoolRef & { tier: number })[]> {
+  const L = inp.loopMaxPools;
+  const rival = inp.rivalPools ?? new Set<string>();
+  const idx = inp.index, st = idx.state, T = idx.tokenCount, canon = idx.canon;
+  const adj = buildAdj(inp.graphPools.map(edgeOf));
+  const bases = inp.bases.map(lc);
+  const dist = bases.map((b) => hops(adj, b, L));
+  const nb = bases.length;
+  yield;
+  // Per coin, as small numbers: pools from each base coin (FAR = can't reach
+  // within L pools; any sum with FAR is above every loop length), and
+  // whether the coin is on our coin map.
+  const FAR = 127;
+  const D = bases.map(() => new Int8Array(T).fill(FAR));
+  const onMap = new Uint8Array(T);
+  // Coins named in knownPairs, to turn those pairs into number keys.
+  const knownTokens = new Set<string>();
+  for (const pk of inp.knownPairs) { const s = pk.indexOf('/'); if (s > 0) { knownTokens.add(pk.slice(0, s)); knownTokens.add(pk.slice(s + 1)); } }
+  const knownTokenAt = new Map<string, number>();
+  for (let i = 0; i < T; i++) {
+    if ((i & 2047) === 2047) yield;
+    if (canon[i] !== i) continue;
+    const s = idx.low[i];
+    for (let k = 0; k < nb; k++) { const d = dist[k].get(s); if (d !== undefined) D[k][i] = d; }
+    if (adj.has(s) || bases.includes(s)) onMap[i] = 1;
+    if (knownTokens.has(s)) knownTokenAt.set(s, i);
+  }
+  const known = new Set<number>();
+  for (const pk of inp.knownPairs) {
+    const s = pk.indexOf('/');
+    if (s <= 0) continue;
+    const a = knownTokenAt.get(pk.slice(0, s)), b = knownTokenAt.get(pk.slice(s + 1));
+    if (a !== undefined && b !== undefined) known.add(a < b ? a * T + b : b * T + a);
+  }
+  // Rival pools by a case-blind hash: only a hash match needs the real check.
+  const rivalHash = new Set<number>();
+  for (const k of rival) rivalHash.add(textHash(k, true));
+  const isRival = (raw: string): boolean => rival.size > 0 && rivalHash.has(textHash(raw, true)) && rival.has(lc(raw));
+  yield;
+
+  // Results go into buckets by (tier, rank) in the order found. Reading the
+  // buckets in order gives exactly what a stable sort by tier then rank
+  // gives (what pickScanCandidates does), without sorting a big list, and
+  // only the first `max` results are ever turned into objects.
+  const buckets: number[][] = [];
+  const put = (pi: number, tier: number, rank: number) => { const b = tier * 32 + Math.min(31, rank); (buckets[b] ??= []).push(pi); };
+  const ref = (pi: number): ScanPoolRef => { const r = st.pools[pi]; return { pool: r[1], token0: st.tokens[r[2]], token1: st.tokens[r[3]] }; };
+  // Tier 2 bookkeeping, as fixed-size number lists: which off-map coin,
+  // which pool, and the other coin's distance from each base. "Recently
+  // looked at" (skip) is checked later, and only for coins that could make
+  // a pair of pools at all (most coins have just one pool).
+  const singles = idx.singles;
+  const bTok = new Int32Array(singles.length), bPool = new Int32Array(singles.length), bNd = new Int8Array(singles.length * nb);
+  let nbr = 0;
+  for (let j = 0; j < singles.length; j++) {
+    if ((j & 1023) === 1023) yield;
+    const pi = singles[j], row = st.pools[pi];
+    const a = canon[row[2]], b = canon[row[3]];
+    if (known.has(a < b ? a * T + b : b * T + a)) continue;
+    if (isRival(row[1])) { if (!inp.skip(lc(row[1]))) put(pi, 0, 0); continue; }
+    let fit = Infinity, onA = false, onB = false;
+    for (let k = 0; k < nb; k++) {
+      const da = D[k][a], db = D[k][b];
+      if (da + db + 1 < fit) fit = da + db + 1;
+      if (da <= L - 2) onA = true;
+      if (db <= L - 2) onB = true;
+    }
+    if (fit <= L) { if (!inp.skip(lc(row[1]))) put(pi, 1, fit); continue; }
+    if (!onMap[a] && onB) { bTok[nbr] = a; bPool[nbr] = pi; for (let k = 0; k < nb; k++) bNd[nbr * nb + k] = D[k][b]; nbr++; }
+    else if (!onMap[b] && onA) { bTok[nbr] = b; bPool[nbr] = pi; for (let k = 0; k < nb; k++) bNd[nbr * nb + k] = D[k][a]; nbr++; }
+  }
+  yield;
+  // A coin needs 2+ pools to be a bridge; skip only ever removes pools, so
+  // coins with fewer than 2 before the skip check can be left out right away.
+  const raw = new Uint8Array(T);
+  for (let e = 0; e < nbr; e++) { if ((e & 4095) === 4095) yield; if (raw[bTok[e]] < 2) raw[bTok[e]]++; }
+  // Keep at most 20 pools per off-map coin (first ones seen, not looked at
+  // recently), then group the coins with 2+ pools, in the order each coin
+  // was first seen.
+  const kept = new Uint8Array(T);
+  const accepted = new Uint8Array(nbr);
+  for (let e = 0; e < nbr; e++) {
+    if ((e & 1023) === 1023) yield;
+    const t = bTok[e];
+    if (raw[t] < 2 || kept[t] >= 20) continue;
+    if (inp.skip(lc(st.pools[bPool[e]][1]))) continue;
+    kept[t]++; accepted[e] = 1;
+  }
+  const groups = new Map<number, number[]>();
+  for (let e = 0; e < nbr; e++) {
+    if ((e & 4095) === 4095) yield;
+    if (!accepted[e] || kept[bTok[e]] < 2) continue;
+    (groups.get(bTok[e]) ?? groups.set(bTok[e], []).get(bTok[e])!).push(e);
+  }
+  let g = 0;
+  for (const list of groups.values()) {
+    if ((++g & 255) === 255) yield;
+    // Two of its neighbours that fit a loop together: d1 + d2 + 2 pools.
+    let fit = Infinity;
+    for (let i = 0; i < list.length; i++) for (let j = i + 1; j < list.length; j++)
+      for (let k = 0; k < nb; k++) fit = Math.min(fit, bNd[list[i] * nb + k] + bNd[list[j] * nb + k] + 2);
+    if (fit > L) continue;
+    for (const e of list) put(bPool[e], 2, fit);
+  }
+  // Best first (tier, then rank), at most `max`.
+  const max = Math.max(0, inp.max);
+  const result: (ScanPoolRef & { tier: number })[] = [];
+  for (let b = 0; b < buckets.length && result.length < max; b++) {
+    const list = buckets[b];
+    if (!list) continue;
+    const tier = Math.floor(b / 32);
+    for (let i = 0; i < list.length && result.length < max; i++) {
+      if ((result.length & 1023) === 1023) yield;
+      result.push({ ...ref(list[i]), tier });
+    }
+  }
+  return result;
+}
+
+// ----------------------------------------------------------------------------
 // Bundling: lookups that run at the same time share one node request.
 // ----------------------------------------------------------------------------
 export type CallMany = (calls: { target: string; data: string }[]) => Promise<(string | null)[]>;
@@ -327,6 +611,9 @@ export interface LoopExtraDeps {
   cachePools: () => PoolState[];                       // every cached pool on this chain
   watchedPools: () => string[][];                      // pair watcher's pools per watched pair
   scanPools: () => Iterable<ScanPoolRef>;              // chain-wide scan's pool list ([] = none yet)
+  // The chain-wide scan's saved state itself (null = none yet). Given: the
+  // pick uses the compact index (cfg.chunked). Not given: scanPools() as before.
+  scanState?: () => ScanStateLike | null;
   depthUsd: (p: PoolState) => number | null;
   usdOf: (token: string) => number | null;
   decimalsOf: (token: string) => number | undefined;
@@ -360,6 +647,20 @@ export class LoopExtraPools {
 
   constructor(readonly cfg: LoopExtraConfig, private deps: LoopExtraDeps) {
     this.bundled = coalesceCallMany(deps.callMany);
+  }
+
+  // The compact scan index (see buildScanIndexSteps), built in ~5 ms bites
+  // the first time and again only after the scan state changed. null when
+  // there's no scan state yet.
+  private index: ScanIndex | null = null;
+  private async scanIndex(): Promise<ScanIndex | null> {
+    const st = this.deps.scanState?.() ?? null;
+    if (!st) return null;
+    if (!scanIndexFresh(this.index, st)) {
+      this.index = null;   // drop the old one first (memory)
+      this.index = await runSteps(buildScanIndexSteps(st), 'extra-pool scan index');
+    }
+    return this.index;
   }
 
   // ---- What the rest of the bot asks --------------------------------------
@@ -408,20 +709,27 @@ export class LoopExtraPools {
 
       // A) New single pools from the chain-wide scan (cheap balance read, then exact lookup).
       let balanceChecks = 0, lookups = 0, lookupErrors = 0;
-      const scan = this.cfg.lookupsPerRound > 0 ? this.deps.scanPools() : [];
+      // STALL FIX (cfg.chunked): use the compact scan index, in ~5 ms bites.
+      // Off (or no scan state given): the old one-go pick over the full list.
+      const indexed = !!this.cfg.chunked && !!this.deps.scanState && this.cfg.lookupsPerRound > 0;
+      const index = indexed ? await this.scanIndex() : null;
+      const scan = this.cfg.lookupsPerRound > 0 && !indexed ? this.deps.scanPools() : [];
       // Any pools at all? (works for a list or a live view of the scan state)
-      if (!scan[Symbol.iterator]().next().done) {
+      if (indexed ? !!index?.anyPool : !scan[Symbol.iterator]().next().done) {
         const cached = this.deps.cachePools();
         const knownPairs = new Set<string>();
         for (const p of watched) knownPairs.add(pairKey(p.tokenA, p.tokenB));
         for (const p of cached) knownPairs.add(pairKey(p.tokenA, p.tokenB));
         const graphPools = [...watched, ...cached.filter((p) => !watchedKeys.has(lc(p.poolAddress)))].filter((p) => hasExactMath(p) && deepOk(p));
         const t = this.deps.now();
-        const cands = pickScanCandidates({
-          bases: this.deps.bases, loopMaxPools: this.cfg.loopMaxPools, scanPools: scan, graphPools, knownPairs,
-          skip: (k) => (this.dustUntil.get(k) ?? 0) > t || (this.lookedUntil.get(k) ?? 0) > t,
+        const pickInput = {
+          bases: this.deps.bases, loopMaxPools: this.cfg.loopMaxPools, graphPools, knownPairs,
+          skip: (k: string) => (this.dustUntil.get(k) ?? 0) > t || (this.lookedUntil.get(k) ?? 0) > t,
           rivalPools: this.deps.rivalPools(), max: this.cfg.balanceChecksPerRound,
-        });
+        };
+        const cands = index
+          ? await runSteps(pickScanCandidatesIndexedSteps({ ...pickInput, index }), 'extra-pool pick')
+          : timed('extra-pool pick', () => pickScanCandidates({ ...pickInput, scanPools: scan }));
         // Cheap money check: one balanceOf for a coin we can price (rival pools skip it).
         const toCheck: { ref: ScanPoolRef & { tier: number }; token: string; usd: number; dec: number }[] = [];
         const passed: { ref: ScanPoolRef & { tier: number }; est: number }[] = [];
@@ -463,13 +771,24 @@ export class LoopExtraPools {
       }
 
       // B) Pick from everything we now have a price for.
-      const scanCount = new Map<string, number>();
-      for (const p of scan) { const k = pairKey(p.token0, p.token1); scanCount.set(k, (scanCount.get(k) ?? 0) + 1); }
-      const sel = selectLoopPools({
+      let scanPairCount: (k: string) => number;
+      if (indexed) {
+        // The scan may have grown during the lookups: refresh the index if so.
+        const idx2 = await this.scanIndex();
+        scanPairCount = (k) => scanPairCountFromIndex(idx2, k);
+      } else {
+        const scanCount = new Map<string, number>();
+        timed('extra-pool scan count', () => { for (const p of scan) { const k = pairKey(p.token0, p.token1); scanCount.set(k, (scanCount.get(k) ?? 0) + 1); } });
+        scanPairCount = (k) => scanCount.get(k) ?? 0;
+      }
+      const selInput: SelectInput = {
         bases: this.deps.bases, loopMaxPools: this.cfg.loopMaxPools, cap: this.cfg.maxSelected, minDepthUsd: this.cfg.minDepthUsd,
         watched, others: this.deps.cachePools().filter((p) => !watchedKeys.has(lc(p.poolAddress))),
-        depthUsd: this.deps.depthUsd, rivalPools: this.deps.rivalPools(), scanPairCount: (k) => scanCount.get(k) ?? 0,
-      });
+        depthUsd: this.deps.depthUsd, rivalPools: this.deps.rivalPools(), scanPairCount,
+      };
+      const sel = this.cfg.chunked
+        ? await runSteps(selectLoopPoolsSteps(selInput), 'extra-pool select')
+        : timed('extra-pool select', () => selectLoopPools(selInput));
       const next = new Set(sel.selected.map((p) => lc(p.poolAddress)));
       const added = sel.selected.filter((p) => !this.selected.has(lc(p.poolAddress)));
       // Follow them in the block reader FIRST, then read their state: a trade

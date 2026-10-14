@@ -79,7 +79,7 @@ import { AvalancheAdapter } from './chains/avalanche';
 import { RawChainEvent, PoolState, MIN_NET_PROFIT_USD } from './core/types';
 import { priceOf, spreadPct, deepEnough, POOL_MIN_DEPTH_USD } from './core/poolPrice';
 import { PairWatcher, Venue, refreshPoolState, refreshPoolsBatch } from './core/pairWatcher';
-import { scanUniverse, emptyScanState, ScanState, stateToPools, scanPoolRefs, getLogsAdaptive, RawLog } from './core/universeScan';
+import { scanUniverse, emptyScanState, ScanState, stateToPools, stateToPoolsSteps, scanPoolRefs, getLogsAdaptive, RawLog } from './core/universeScan';
 import { CrossQuoteMonitor, LoopMonitor, shouldScheduleFirstLoopReport } from './core/crossQuoteMonitor';
 import { NewPoolWatch } from './core/newPoolWatch';
 import { buildTokenGroups, loadTokenGroups, groupsStatusLine, TokenGroupsResult } from './core/tokenGroups';
@@ -168,8 +168,25 @@ import { LoopExtraPools, loopExtraConfigFromEnv, readerAddresses, afterReaderWri
 // Speed fixes (Oct 13): stage timers, preload, trust the WebSocket for prices.
 import { StageTimers, StageTrace } from './core/stageTimer';
 import { trustFreshConfigFromEnv, wsTrustProblem, WsFacts } from './core/trustFresh';
+// Stall finder (Oct 14): which job froze the bot, plus chunked versions of the big jobs.
+import { stallFinder, timed, timedAsync, formatStallLine, formatStallDetail } from './core/stallFinder';
+import { runSteps, writeJsonChunkedQueued } from './core/chunked';
+
+// STALL FIXES (Oct 14). Big jobs done in ~5 ms bites so trades never wait
+// behind them. Each has an off switch in .env (all on by default):
+//   STALL_FINDER=0           turns off the freeze detector (measurement only)
+//   STALL_FIX_EXTRA_PICK=0   loop extra-pool pick in one go again (core/loopExtraPools.ts)
+//   STALL_FIX_SCAN_EXPAND=0  chain-wide pool list (~400k pools) expanded in one go again
+//   STALL_FIX_SAVES=0        chain-wide scan file saved in one go again (writeFileSync)
+//   STALL_FIX_LOOP_DEBOUNCE=0 the 5 s loop scan safety net runs directly again
+//                            (instead of through the same 50 ms queue as every other loop scan)
+const stallFixOn = (name: string) => process.env[name] !== '0' && process.env[name] !== 'off';
+const STALL_FIX_SCAN_EXPAND = stallFixOn('STALL_FIX_SCAN_EXPAND');
+const STALL_FIX_SAVES = stallFixOn('STALL_FIX_SAVES');
+const STALL_FIX_LOOP_DEBOUNCE = stallFixOn('STALL_FIX_LOOP_DEBOUNCE');
 
 async function main() {
+stallFinder.start();
 const cache = new PoolCache();
 const shadowLogger = new ShadowLogger();
 // Memory line every 5 min (core/memReport.ts; MEM_LOG=0 turns it off). Measurement only.
@@ -415,7 +432,7 @@ const rhFreeSimRpc: Rpc = makeRpc('https://rpc.mainnet.chain.robinhood.com');
 // Per-node usage today (speed limits + daily allowances, core/nodeBudget.ts):
 // restored so a restart doesn't reset the counts, saved every minute.
 loadNodeUsage('data/node-usage.json');
-setInterval(saveNodeUsage, 60_000);
+setInterval(() => timed('node usage save', saveNodeUsage), 60_000);
 // Token balance locations found by earlier runs (saves the lookup after a restart).
 loadBalanceSlots('data/balance-slots.json');
 // Alchemy (ROBINHOOD_RPC_HTTP): fallback node for checks when QuickNode is set.
@@ -484,7 +501,7 @@ const simDisabled: Record<string, { reason: string; until: number }> = {};
 const ROUTE_FILE = 'data/route-scores.json';
 const routeScores = new RouteScores();
 { const n = routeScores.load(ROUTE_FILE); if (n) console.log(`[sim] robinhood: restored scores for ${n} pool pairs`); }
-setInterval(() => routeScores.save(ROUTE_FILE), 10 * 60_000);
+setInterval(() => timed('route scores save', () => routeScores.save(ROUTE_FILE)), 10 * 60_000);
 // Real wins by size ($1/$2/$5/$10/$20 bars), to set the firing bar from data.
 const winSizes = new WinSizes();
 // Pool pairs whose last trigger test lost or failed: not re-tested for 5 min.
@@ -898,7 +915,7 @@ const WATCH_FILE = 'data/watched-pools.json';
       const restored = robinhoodWatcher.load(WATCH_FILE);
       if (restored) console.log(`[pairs] robinhood: restored ${restored} watched pairs from the last run`);
 }
-setInterval(() => robinhoodWatcher.save(WATCH_FILE), 10 * 60_000);
+setInterval(() => timed('watch list save', () => robinhoodWatcher.save(WATCH_FILE)), 10 * 60_000);
 
 // Re-read a pool's live price right before using it (skips pools we can't
 // refresh this way: Uniswap V4, order books, bin pools). Never waits more
@@ -955,7 +972,7 @@ const safetyGate = new SafetyGate(safetyConfigFromEnv());
 const autoVet = new AutoVet((t) => safetyGate.isAllowed(t));
 const AUTO_VET_FILE = 'data/auto-vetted.json';
 safetyGate.allowTokens(autoVet.load(AUTO_VET_FILE));
-setInterval(() => autoVet.save(AUTO_VET_FILE), 10 * 60_000);
+setInterval(() => timed('auto-vet save', () => autoVet.save(AUTO_VET_FILE)), 10 * 60_000);
 // Auto-vetted coins get a smaller live trade limit: their owner could still
 // change the coin's rules later. Trigger trades are planned within it; bigger
 // trades on these coins are neither sent nor counted.
@@ -1029,7 +1046,7 @@ const noteReceiptGas = async (key: string, hash: string, gas: bigint, success: b
 // don't reset them. Verified = confirmed by a real-chain test; model-only =
 // the bot's own maths. Both assume we win the race.
 const dryRunPnl = new DryRunPnl('data/dryrun-pnl.json', process.env.REPORT_TZ || 'America/Toronto');
-setInterval(() => dryRunPnl.save(), 60_000);
+setInterval(() => timed('dry-run P&L save', () => dryRunPnl.save()), 60_000);
 // Save on shutdown too: pm2 restart/stop (every deploy) sends SIGINT, and the
 // last minute of would-have-earned figures used to be lost each time.
 for (const sig of ['SIGINT', 'SIGTERM'] as const) {
@@ -1112,7 +1129,7 @@ registerSize('competitor results', () => rivals.results.length);
 setInterval(async () => {
       try {
             const latest = await robinhoodReadProvider.getBlockNumber();
-            await rivalWatch.sampleBlock('0x' + (latest - 3).toString(16));
+            await timedAsync('rival watch sample', () => rivalWatch.sampleBlock('0x' + (latest - 3).toString(16)));
       } catch { /* node busy: next time */ }
 }, Number(process.env.RIVAL_SAMPLE_MS ?? 15_000));
 // New rival bots caught by the tracker join the watch list (checked every minute).
@@ -1124,7 +1141,7 @@ setInterval(() => {
       rivalResultsSeen = next;
       for (const r of items) if (r.found && r.bot) rivalWatch.addBot(r.bot, 'tracker');
 }, 60_000);
-setInterval(() => rivalWatch.save(RIVAL_BOTS_FILE, RIVAL_TRADES_FILE), 10 * 60_000);
+setInterval(() => timed('rival watch save', () => rivalWatch.save(RIVAL_BOTS_FILE, RIVAL_TRADES_FILE)), 10 * 60_000);
 // RACE CHECK (core/raceCheck.ts): for every confirmed practice win, watch the
 // two pools for ~30 s and see whether another bot took it before we'd have
 // been ready. Answers "would we really have won?". Watch only.
@@ -1279,10 +1296,10 @@ if (research.enabled) {
       const restored = research.load(RESEARCH_FILE);
       const c = research.config;
       console.log(`[research] lane ON (test only, never trades): sampling ${c.samplePct}% of rejects, ${c.rpcPerMin} node requests/min${restored ? `, ${restored} past samples restored` : ''}`);
-      setInterval(() => { void research.tick(); }, 2_000);
-      setInterval(() => research.save(RESEARCH_FILE), 10 * 60_000);
+      setInterval(() => { void timedAsync('research lane', () => research.tick()); }, 2_000);
+      setInterval(() => timed('research save', () => research.save(RESEARCH_FILE)), 10 * 60_000);
       // Standing gaps the main scanner ignores: prices already in memory only, no node requests.
-      setInterval(() => {
+      setInterval(() => timed('research gap look', () => {
             try {
                   const pairs = robinhoodWatcher.watchedPairPools().map((addrs) => addrs.map((a) => cache.get('robinhood', a)).filter((p): p is PoolState => !!p && canPracticeTest(p.dex)));
                   const gaps = findResearchGaps(pairs, isDeepRh, (p) => poolDepthUsd(p, decimalsOf, usdRhResearch), (t) => TOKEN_DECIMALS.robinhood?.[t.toLowerCase()], usdRhResearch,
@@ -1293,7 +1310,7 @@ if (research.enabled) {
                         research.offer(reason, `${gap.buyPool.poolAddress}>${gap.sellPool.poolAddress}`, () => gapCandidate(reason, gap, vetted), 30 * 60_000);
                   }
             } catch (err) { console.warn('[research] gap look failed (ignored):', (err as Error).message); }
-      }, 60_000);
+      }), 60_000);
       // Hourly: the lane's summary goes into the main hourly report (Phase 8);
       // see researchHourText() used by the hourly digest.
 }
@@ -1346,7 +1363,7 @@ if (loopCfg.enabled) {
             },
       });
       let loopQueued: NodeJS.Timeout | null = null;
-      const runLoopScan = () => {
+      const runLoopScan = () => timed('loop scan', () => {
             try {
                   // Only pools the bot keeps fresh (watched pairs) with real money near their price.
                   const pools = robinhoodWatcher.watchedPairPools().flat()
@@ -1362,12 +1379,15 @@ if (loopCfg.enabled) {
                   }
                   loopTrader.onUpdate(pools);
             } catch (err) { console.warn('[loop] scan failed (ignored):', (err as Error).message); }
-      };
+      });
       requestLoopScan = () => {
             if (loopQueued) return;
             loopQueued = setTimeout(() => { loopQueued = null; runLoopScan(); }, 50);
       };
-      setInterval(runLoopScan, 5_000);
+      // 5 s safety net. Goes through the same 50 ms queue as every other loop
+      // scan, so it can never run right after (in the same moment as) a
+      // queued scan: at most one loop scan per 50 ms (STALL_FIX_LOOP_DEBOUNCE).
+      setInterval(STALL_FIX_LOOP_DEBOUNCE ? () => requestLoopScan() : runLoopScan, 5_000);
       // Race comparison: every rival trade the rival watch saves.
       rivalWatch.onRecord = (rec) => loopTrader.noteRival(rec);
       registerSize('loop cycles', () => loopTrader.finder.cycleCount());
@@ -1614,7 +1634,7 @@ if (chainOn('robinhood')) chainManager.register(new RobinhoodChainAdapter());
 if (chainOn('monad')) chainManager.register(new MonadAdapter());
 if (chainOn('avalanche')) chainManager.register(new AvalancheAdapter());
 
-chainManager.onEvent(async (event: RawChainEvent) => {
+const onFeedEvent = async (event: RawChainEvent) => {
 const t0 = Date.now();
 // Stage timers (measurement only): lap times from "feed received" onwards.
 const trace = event.chain === 'robinhood' ? stageTimers.begin(event.receivedAtMs) : null;
@@ -1963,7 +1983,10 @@ console.log(
             // Planned with a loan fee only when own money is switched off.
             plannedLoanPips: swap.chain === 'robinhood' && !RH_OWN_MONEY ? (rhLoanFeeBps(swap.tokenIn, buyPoolUsed, sellPoolUsed) ?? 0) * 100 : 0,
       });
-});
+};
+// Stall finder: each feed trade is timed as "feed trade" up to its first wait
+// (measurement only; not counted as a slow background job).
+chainManager.onEvent((event: RawChainEvent) => { void timedAsync('feed trade', () => onFeedEvent(event), false); });
 
 // Live trading half set up (EXECUTION_ENABLED without the other live
 // settings): say so, so it can't be mistaken for the bot actually trading.
@@ -2125,7 +2148,7 @@ await chainManager.startAll();
       requestGapScan = () => {
             requestLoopScan(); // loop trader (off unless LOOP_TRADER=1): same triggers
             if (gapScanQueued) return;
-            gapScanQueued = setTimeout(() => { gapScanQueued = null; void runGapScan(); }, 50);
+            gapScanQueued = setTimeout(() => { gapScanQueued = null; void timedAsync('gap scan', runGapScan); }, 50);
       };
       const runGapScan = async () => {
             if (gapRunning) return;
@@ -2247,7 +2270,7 @@ await chainManager.startAll();
                   gapRunning = false;
             }
       };
-      setInterval(() => { void runGapScan(); }, 5_000);
+      setInterval(() => { void timedAsync('gap scan', runGapScan); }, 5_000);
 
       // EVERY-BLOCK READER (core/blockReader.ts, Oct 11, owner approved).
       // About half of all trades come through apps the feed decoder can't read,
@@ -2314,14 +2337,14 @@ await chainManager.startAll();
             // a watched pool moved -> gap scan (which also runs the loop scan),
             // only extra loop pools moved -> loop scan alone (the gap scan has
             // nothing new to look at). With extra pools off: gap scan, as before.
-            const onReaderUpdates = (latest: Map<string, PoolUpdate>) => {
+            const onReaderUpdates = (latest: Map<string, PoolUpdate>) => timed('block reader apply', () => {
                   const applied: string[] = [];
                   for (const u of latest.values()) if (applyUpdate(u)) applied.push(u.pool);
                   readerApplied += applied.length;
                   const next = afterReaderWrite(applied, loopExtra, () => new Set(watchedOnly()));
                   if (next === 'gap') requestGapScan();
                   else if (next === 'loop') requestLoopScan();
-            };
+            });
             // PUSH READER (core/blockReaderWs.ts). Only when BLOCK_READER_WSS is set:
             // the node pushes each block's events over a WebSocket into the same
             // applyUpdate path. The poll reader below stays quiet while the push
@@ -2424,18 +2447,24 @@ await chainManager.startAll();
                   console.log(`[pairs] robinhood start list (${start.source}): ${pairs.length} pairs, now watching ${st.pairs} pairs, ${st.pools} pools`);
             })();
       }
-      const loadScanState = (): ScanState => {
+      const loadScanState = (): ScanState => timed('scan file load', () => {
             try {
                   const st = JSON.parse(readFileSync(SCAN_STATE_FILE, 'utf8'));
                   if (st?.version === 1 && Array.isArray(st.pools)) return st;
             } catch { /* missing or unreadable: start fresh */ }
             return emptyScanState();
-      };
-      const saveScanState = (st: ScanState) => {
+      });
+      // The file holds every pool on the chain (~400k, tens of MB of text).
+      // STALL_FIX_SAVES: written in ~5 ms bites with async writes (same bytes,
+      // still temp file + rename). Off: the old one-go write.
+      const saveScanState = async (st: ScanState) => {
             try {
-                  mkdirSync('data', { recursive: true });
-                  writeFileSync(SCAN_STATE_FILE + '.tmp', JSON.stringify(st));
-                  renameSync(SCAN_STATE_FILE + '.tmp', SCAN_STATE_FILE); // atomic: never a half-written file
+                  if (STALL_FIX_SAVES) { await writeJsonChunkedQueued(SCAN_STATE_FILE, st, 'scan file save'); return; }
+                  timed('scan file save', () => {
+                        mkdirSync('data', { recursive: true });
+                        writeFileSync(SCAN_STATE_FILE + '.tmp', JSON.stringify(st));
+                        renameSync(SCAN_STATE_FILE + '.tmp', SCAN_STATE_FILE); // atomic: never a half-written file
+                  });
             } catch (err) { console.warn('[scan] could not save state:', (err as Error).message); }
       };
       let scanState: ScanState | null = null;
@@ -2455,13 +2484,13 @@ await chainManager.startAll();
                   // per factory, so a second attempt repeats nothing.
                   const scanOpts = { usdToken: ROBINHOOD_TOKENS.USDG, wrappedNative: ROBINHOOD_TOKENS.WETH, minPoolUsd: SCAN_MIN_USD,
                         maxLogRange: Number(process.env.ROBINHOOD_SCAN_LOG_RANGE ?? 500_000), log: (m: string) => console.log(m),
-                        v4: RH_V4_SCAN ? { stateView: ROBINHOOD_V4.STATE_VIEW, poolManager: ROBINHOOD_V4.POOL_MANAGER } : undefined };
+                        v4: RH_V4_SCAN ? { stateView: ROBINHOOD_V4.STATE_VIEW, poolManager: ROBINHOOD_V4.POOL_MANAGER } : undefined,
+                        chunked: STALL_FIX_SCAN_EXPAND };
                   // Gentle lane on the free node (see robinhoodScanProvider).
                   const res = await scanUniverse(robinhoodScanProvider, RH_EXTRA_VENUES ? [...ROBINHOOD_SCAN_FACTORIES, ...extraScanFactories()] : ROBINHOOD_SCAN_FACTORIES, scanOpts, scanState);
                   // Progress per factory is saved even if some failed.
-                  if (res.errors.length) saveScanState(scanState);
-                  if (res.errors.length && !res.candidates.length) throw new Error(`scan failed: ${res.errors.join('; ').slice(0, 150)}`);
-                  saveScanState(scanState);
+                  if (res.errors.length && !res.candidates.length) { await saveScanState(scanState); throw new Error(`scan failed: ${res.errors.join('; ').slice(0, 150)}`); }
+                  await saveScanState(scanState);
                   const top = res.candidates.slice(0, SCAN_TOP);
                   // Status page: how many picked pairs V4 helped (a V4 pool among their deep pools).
                   if (res.v4) console.log(`[scan] v4: ${top.filter((c) => c.pools.some((p) => p.kind === 'v4')).length} of ${top.length} picked pairs have a deep V4 pool (asked V4 about ${res.v4.pairsAsked} pairs, found ${res.v4.found} pools)`);
@@ -2515,7 +2544,8 @@ await chainManager.startAll();
       const setupCrossQuote = async () => {
             try {
                   const st = scanState ?? loadScanState();
-                  const n = await crossQuote.setup(stateToPools(st), Number(process.env.CROSS_QUOTE_TOKENS ?? 60));
+                  const pools = STALL_FIX_SCAN_EXPAND ? await runSteps(stateToPoolsSteps(st), 'scan pool list') : timed('scan pool list', () => stateToPools(st));
+                  const n = await timedAsync('cross-quote setup', () => crossQuote.setup(pools, Number(process.env.CROSS_QUOTE_TOKENS ?? 60)));
                   console.log(`[openwatch] watching ${n} tokens that trade against both USDG and ETH`);
             } catch (err) { console.warn('[openwatch] setup failed:', (err as Error).message); }
       };
@@ -2528,7 +2558,7 @@ await chainManager.startAll();
             const inOpen = t.weekday && t.mins >= OPEN_FROM && t.mins < OPEN_TO;
             if (crossBusy || Date.now() - lastCrossTick < (inOpen ? 5_000 : 15_000)) return;
             crossBusy = true; lastCrossTick = Date.now();
-            try { await crossQuote.tick(inOpen, t.date); } catch { /* node busy: next tick */ } finally { crossBusy = false; }
+            try { await timedAsync('cross-quote monitor', () => crossQuote.tick(inOpen, t.date)); } catch { /* node busy: next tick */ } finally { crossBusy = false; }
       }, 1_000);
       // One line an hour for the status page: biggest after-fee gap today.
       setInterval(() => {
@@ -2577,6 +2607,9 @@ await chainManager.startAll();
                   // read straight from the scan state while the picker loops over it.
                   // Memory: no second copy of the 100k+ pool list is kept any more.
                   scanPools: () => scanPoolRefs(scanState ?? loadScanState()),
+                  // The scan state itself, for the compact index (STALL_FIX_EXTRA_PICK).
+                  // Loaded once and kept (the chain-wide scan keeps it too).
+                  scanState: () => (scanState ??= loadScanState()),
                   depthUsd: (p) => poolDepthUsd(p, decimalsOf, usdRhExtra),
                   usdOf: usdRhExtra,
                   decimalsOf: (t) => TOKEN_DECIMALS.robinhood?.[t.toLowerCase()],
@@ -2609,12 +2642,12 @@ await chainManager.startAll();
       setRealBalanceSource((pool, token) => v3Balances.get(pool, token));
       const refreshV3Balances = async () => {
             try {
-                  const n = await v3Balances.refresh(scanCallMany, cache.allForChain('robinhood'));
+                  const n = await timedAsync('v3 balance refresh', () => v3Balances.refresh(scanCallMany, cache.allForChain('robinhood')));
                   console.log(`[oracle] real V3 balances read: ${n}`);
-                  void v3Balances.save(V3_BALANCES_FILE); // for a fast restart (atomic write)
+                  void timedAsync('v3 balance save', () => v3Balances.save(V3_BALANCES_FILE)); // for a fast restart (atomic write)
                   // Status page: pools whose price maths says "deep" but whose
                   // real coins don't (left out of gaps and checks). Top 3 shown.
-                  const thin = thinPools(cache.allForChain('robinhood'), decimalsOf, (t) => priceOracle.getUsdPrice('robinhood', t));
+                  const thin = timed('thin pool check', () => thinPools(cache.allForChain('robinhood'), decimalsOf, (t) => priceOracle.getUsdPrice('robinhood', t)));
                   const k = (x: number) => (x >= 1000 ? `$${Math.round(x / 1000)}k` : `$${Math.round(x)}`);
                   console.log(`[thinpools] ${thin.length} pool(s) left out (looked deep, real coins under $${Math.round(POOL_MIN_DEPTH_USD / 1000)}k)` +
                         (thin.length ? `: ${thin.slice(0, 3).map((t) => `${symbolOf('robinhood', t.pool.tokenA)}/${symbolOf('robinhood', t.pool.tokenB)} ${t.pool.dex} ${(t.pool.feePips ?? t.pool.feeBps * 100) / 10_000}% ${k(t.realUsd)} real vs ${k(t.virtualUsd)} assumed`).join(' · ')}` : ''));
@@ -2640,8 +2673,8 @@ await chainManager.startAll();
             symbol: (token) => symbolOf('robinhood', token),
       });
       newPoolWatch.load(NEW_POOLS_FILE);
-      setInterval(() => { void newPoolWatch.poll(); }, Number(process.env.NEW_POOL_POLL_MS ?? 60_000));
-      setInterval(() => newPoolWatch.save(NEW_POOLS_FILE), 10 * 60_000);
+      setInterval(() => { void timedAsync('new pool watch', () => newPoolWatch.poll()); }, Number(process.env.NEW_POOL_POLL_MS ?? 60_000));
+      setInterval(() => timed('new pool watch save', () => newPoolWatch.save(NEW_POOLS_FILE)), 10 * 60_000);
       newPoolWatchRef = newPoolWatch;
 
       // COIN GROUPS (core/tokenGroups.ts): dollar coins, ETH, Bitcoin
@@ -2686,17 +2719,17 @@ await chainManager.startAll();
             groupsBusy = true;
             try {
                   const st = scanState ?? loadScanState();
-                  const pools = stateToPools(st);
+                  const pools = STALL_FIX_SCAN_EXPAND ? await runSteps(stateToPoolsSteps(st), 'scan pool list') : timed('scan pool list', () => stateToPools(st));
                   if (!pools.length) { console.log('[groups] no pool scan yet; will try again later'); return; }
                   if (rebuildGroups || !tokenGroups) {
-                        tokenGroups = await buildTokenGroups({
+                        tokenGroups = await timedAsync('coin groups build', () => buildTokenGroups({
                               callMany: scanCallMany, state: st, pools,
                               usdg: ROBINHOOD_TOKENS.USDG, weth: ROBINHOOD_TOKENS.WETH,
                               symbolCacheFile: SYMBOLS_FILE, outFile: GROUPS_FILE, log: (m) => console.log(m),
-                        });
+                        }));
                   }
-                  const quotes = tokenGroups.members.map((m) => ({ token: m.token, symbol: m.symbol, group: m.group, priceUsd: m.priceUsd }));
-                  const n = await loopMonitor.setup(pools, quotes, Number(process.env.LOOP_TOKENS ?? 80));
+                  const quotes = tokenGroups!.members.map((m) => ({ token: m.token, symbol: m.symbol, group: m.group, priceUsd: m.priceUsd }));
+                  const n = await timedAsync('loop monitor setup', () => loopMonitor.setup(pools, quotes, Number(process.env.LOOP_TOKENS ?? 80)));
                   console.log(`[loops] watching ${n} tokens that trade against 2+ of ${quotes.length} verified coins`);
                   scheduleFirstLoopReport(n);
             } catch (err) {
@@ -2717,12 +2750,12 @@ await chainManager.startAll();
       setInterval(async () => {
             if (loopBusy) return;
             loopBusy = true;
-            try { await loopMonitor.tick(); } catch (err) {
+            try { await timedAsync('loop monitor', () => loopMonitor.tick()); } catch (err) {
                   if (++loopErrors % 20 === 1) console.warn('[loops] reading pools failed (will retry):', (err as Error).message);
             } finally { loopBusy = false; }
       }, Number(process.env.LOOP_TICK_MS ?? 30_000));
       setInterval(() => {
-            loopMonitor.save(LOOP_STATS_FILE);
+            timed('loop monitor save', () => loopMonitor.save(LOOP_STATS_FILE));
             console.log(loopMonitor.statusLine());
             console.log(newPoolWatch.statusLine(newPoolWatch.summary(Date.now() - 3600_000)));
             if (tokenGroups) console.log(`[groups] ${groupsStatusLine(tokenGroups)}`);
@@ -2985,7 +3018,7 @@ for (let i = 0; i < resolved.length; i++) {
       };
 
       let lastDigestAt = Date.now();
-      const sendHourlyDigest = async () => {
+      const sendHourlyDigestInner = async () => {
             const now = Date.now();
             try {
                   samplePricesIntoMatches();
@@ -3051,6 +3084,8 @@ for (let i = 0; i < resolved.length; i++) {
                               loops: loopHourText(),
                               memory: memReport?.hourLine(),
                               speed: (({ median, p95 }) => ({ median, p95 }))(stageTimers.take('hour')),
+                              // Stall finder: freezes this hour and what caused them (core/stallFinder.ts).
+                              stalls: (() => { const s = stallFinder.take('hour'); return [formatStallLine(s), formatStallDetail(s)].filter(Boolean); })(),
                               race: raceChecker.takeHour(),
                               funnel: {
                                     tradesRead: funnel.tradesRead, noPool: funnel.noPool, tooSmall: funnel.tooSmall, noPartner: funnel.noPartner,
@@ -3102,12 +3137,19 @@ for (let i = 0; i < resolved.length; i++) {
                   lastDigestAt = now;
             }
       };
+      // Building the report is timed by the stall finder too.
+      const sendHourlyDigest = () => timedAsync('hourly report', sendHourlyDigestInner);
       setInterval(sendHourlyDigest, 60 * 60 * 1000);
       // Stage timers: where the fire-ready time goes, every 5 min (median, then slowest 5%).
       setInterval(() => {
             const sp = stageTimers.take('fiveMin');
             console.log(`[speed] ${sp.median}`);
             console.log(`[speed] ${sp.p95}`);
+            // Stall finder: freezes in the last 5 min and what caused them.
+            const sf = stallFinder.take('fiveMin');
+            console.log(`[stalls] ${formatStallLine(sf)}`);
+            const sd = formatStallDetail(sf);
+            if (sd) console.log(`[stalls] ${sd}`);
       }, 5 * 60_000);
       // Watch list size every 15 min (shown on the GitHub status page).
       setInterval(() => {

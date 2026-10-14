@@ -1,6 +1,7 @@
 import * as v8 from 'v8';
 import { mkdirSync } from 'fs';
 import { join } from 'path';
+import { timed } from './stallFinder';
 
 // ============================================================================
 // MEMORY REPORT (measurement only - changes nothing about trading)
@@ -129,8 +130,9 @@ export function startMemReport(env: NodeJS.ProcessEnv = process.env, log: (s: st
   const minutes = memLogMinutes(env);
   if (minutes === 0) return null;
   const rep = new MemReporter();
-  const safeLog = () => { try { log(rep.line()); } catch (err) { console.warn('[mem] report failed (ignored):', (err as Error).message); } };
-  setInterval(() => { try { rep.sample(); } catch { /* ignore */ } }, 60_000).unref();
+  // Both timed by the stall finder ("mem report"), measurement only.
+  const safeLog = () => timed('mem report', () => { try { log(rep.line()); } catch (err) { console.warn('[mem] report failed (ignored):', (err as Error).message); } });
+  setInterval(() => timed('mem report', () => { try { rep.sample(); } catch { /* ignore */ } }), 60_000).unref();
   setInterval(safeLog, minutes * 60_000).unref();
   // Heap snapshot on demand (only if MEM_SNAPSHOT=1). This is an EXTRA
   // listener: the existing SIGUSR2 "send report now" handler keeps working.

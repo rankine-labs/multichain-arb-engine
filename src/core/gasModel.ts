@@ -1,4 +1,5 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'fs';
+import { timed } from './stallFinder';
 import { dirname } from 'path';
 import { loopGasUsd, loopGasUnits } from './loopTrader';
 
@@ -192,9 +193,12 @@ export class GasCalibration {
     const t = this.now();
     if (!force && t - this.lastSaveMs < 60_000) return;
     try {
-      mkdirSync(dirname(this.file), { recursive: true });
-      writeFileSync(this.file + '.tmp', JSON.stringify({ savedAt: new Date(t).toISOString(), samples: this.snapshot() }) + '\n');
-      renameSync(this.file + '.tmp', this.file);
+      // Timed by the stall finder ("gas calibration save"), measurement only.
+      timed('gas calibration save', () => {
+        mkdirSync(dirname(this.file!), { recursive: true });
+        writeFileSync(this.file + '.tmp', JSON.stringify({ savedAt: new Date(t).toISOString(), samples: this.snapshot() }) + '\n');
+        renameSync(this.file + '.tmp', this.file!);
+      });
       this.dirty = false;
       this.lastSaveMs = t;
     } catch { /* best effort */ }
