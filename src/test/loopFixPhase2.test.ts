@@ -6,7 +6,7 @@
 //   E) cheap scan: unchanged scans skipped, sliced scan == one-go scan
 //   and: every switch off == old behaviour.
 import { PoolCache, confirmedViewFromEnv } from '../core/poolCache';
-import { loopFixFromEnv, LoopTriggerBook, loopPoolState, triggerHashes } from '../core/loopPrices';
+import { loopFixFromEnv, PendingTrades, loopPoolState } from '../core/loopPrices';
 import { LoopFinder, LoopEnv, LoopResult } from '../core/loopFinder';
 import { LoopTrader, loopConfigFromEnv, LoopTrade, LoopCheckContext, LoopCheckResult, summarizeLoopChecks, LoopCheckRecord } from '../core/loopTrader';
 import { formatLoopHour, modelVsCheckText } from '../core/loopReport';
@@ -115,32 +115,69 @@ const tick = () => new Promise<void>((r) => setImmediate(r));
   }
 
   // -------------------------------------------------------------------------
-  // A) Loop pricing: trigger pool = one prediction on the confirmed state,
-  //    every other pool = confirmed state; switch off = main cache.
+  // A) Loop pricing: confirmed state + every trade no block has confirmed
+  //    yet (feed order); a trade already in the confirmed state is never
+  //    added again; switch off = main cache.
   // -------------------------------------------------------------------------
   {
     const c = new PoolCache({ confirmed: true });
-    const p1 = v2(40, W, A(80), 100, 100, 3), p2 = v2(41, A(80), A(81), 100, 100, 3);
-    c.upsertFromBlock(p1); c.upsertFromBlock(p2);
-    // Two earlier feed predictions stacked on pool 40 in the main cache, and one on pool 41.
-    for (let i = 0; i < 2; i++) c.upsertFromFeed(c.predictPostTradeState(c.get('robinhood', A(40))!, true, E18));
-    c.upsertFromFeed(c.predictPostTradeState(c.get('robinhood', A(41))!, true, E18));
-    const book = new LoopTriggerBook();
-    book.note(A(40), { hash: '0xtrig', inIsA: true, amountIn: E18, at: clock });
-    const trig = book.take();
-    assert(book.size() === 0 && trig.size === 1, 'trigger book hands over and empties');
     const predict = (p: PoolState, i: boolean, a: bigint) => c.predictPostTradeState(p, i, a);
-    const s40 = loopPoolState(c.get('robinhood', A(40)), c.getConfirmed('robinhood', A(40)), trig.get(A(40)), true, predict, clock);
-    const s41 = loopPoolState(c.get('robinhood', A(41)), c.getConfirmed('robinhood', A(41)), trig.get(A(41)), true, predict, clock);
-    const want40 = c.predictPostTradeState(c.getConfirmed('robinhood', A(40))!, true, E18);
-    assert(!!s40 && s40.reserveA === want40.reserveA && s40.reserveB === want40.reserveB && s40.reserveA !== c.get('robinhood', A(40))!.reserveA, 'trigger pool: ONE prediction on top of the confirmed state (not the stacked main copy)');
-    assert(s41 === c.getConfirmed('robinhood', A(41)), 'other pools: the confirmed state as is');
-    const off40 = loopPoolState(c.get('robinhood', A(40)), c.getConfirmed('robinhood', A(40)), trig.get(A(40)), false, predict, clock);
-    assert(off40 === c.get('robinhood', A(40)), 'LOOP_REAL_PRICES off: main cache state (old behaviour)');
-    assert(loopPoolState(undefined, undefined, undefined, true, predict, clock) === undefined, 'no confirmed state, no trigger: pool left out');
-    const h = triggerHashes(trig);
-    assert(h.get(A(40))?.hash === '0xtrig', 'trigger hashes by pool');
+    const P = A(40), Q = A(41);
+    c.upsertFromBlock(v2(40, W, A(80), 100, 100, 3), clock, '0xold');
+    c.upsertFromBlock(v2(41, A(80), A(81), 100, 100, 3), clock, '0xold2');
+    const pend = new PendingTrades(4_000);
+    const st = (k: string, now = clock) => pend.stateFor(k, c.get('robinhood', k), c.getConfirmed('robinhood', k), c.confirmedInfo('robinhood', k), predict, now);
+    // Feed order: some other tx, then T1 on P, then T2 on P.
+    pend.noteFeedTx('0xother');
+    pend.note(P, { hash: '0xT1', inIsA: true, amountIn: E18, at: clock });
+    c.upsertFromFeed(predict(c.get('robinhood', P)!, true, E18), clock);
+    const fresh1 = pend.takeFresh();
+    assert(fresh1.get(P)?.hash === '0xt1' && pend.takeFresh().size === 0, 'trigger hashes since the last scan, then empty');
+    const conf0 = c.getConfirmed('robinhood', P)!;
+    const one = predict(conf0, true, E18);
+    const s1 = st(P);
+    assert(!!s1 && s1.reserveA === one.reserveA && s1.reserveB === one.reserveB, 'pending trade T1 applied on top of the confirmed state');
+    assert(st(Q) === c.getConfirmed('robinhood', Q), 'pool with no pending trade: the confirmed state as is');
+    assert(st(P) === s1, 'unchanged: the same state object is reused (cheap scan can skip)');
+    // MISSED-TRADE case: a later scan, triggered by something else, before T1's block is read.
+    pend.takeFresh();
+    const s1b = st(P, clock + 300);
+    assert(!!s1b && s1b.reserveA === one.reserveA, 'later scan before T1 is in a block: T1 still counted (not missed)');
+    // T2 arrives.
+    pend.note(P, { hash: '0xT2', inIsA: true, amountIn: E18, at: clock + 400 });
+    const two = predict(one, true, E18);
+    const s2 = st(P, clock + 400);
+    assert(!!s2 && s2.reserveA === two.reserveA && pend.pendingCount(P) === 2, 'two pending trades: both applied, in feed order');
+    // DOUBLE-COUNT case: the block with T1 (not T2) is read: confirmed now includes T1.
+    const afterT1 = { ...v2(40, W, A(80), 1, 1, 4), reserveA: one.reserveA, reserveB: one.reserveB };
+    c.keepBlockState(afterT1, 4, clock + 500, '0xt1');
+    const s3 = st(P, clock + 500);
+    assert(pend.pendingCount(P) === 1 && !!s3 && s3.reserveA === two.reserveA && s3.reserveB === two.reserveB, 'block with T1 read: T1 dropped (not counted twice), T2 still added');
+    // Block with T2 read: nothing pending, the confirmed state is used as is.
+    const afterT2 = { ...v2(40, W, A(80), 1, 1, 5), reserveA: two.reserveA, reserveB: two.reserveB };
+    c.keepBlockState(afterT2, 5, clock + 600, '0xt2');
+    assert(st(P, clock + 600) === c.getConfirmed('robinhood', P) && pend.size() === 0, 'block with T2 read: no prediction added, pool forgotten');
+    // Block whose last tx is a LATER unrelated trade also confirms earlier pending ones (feed order).
+    pend.note(Q, { hash: '0xT3', inIsA: true, amountIn: E18, at: clock + 700 });
+    pend.noteFeedTx('0xT4');
+    c.keepBlockState({ ...c.getConfirmed('robinhood', Q)!, reserveA: 7n * E18 }, 6, clock + 800, '0xt4');
+    assert(st(Q, clock + 800) === c.getConfirmed('robinhood', Q) && pend.pendingCount(Q) === 0, 'block ending with a later tx: earlier pending trade dropped');
+    // RPC read (block unknown) saved well after the trade: trade taken as included.
+    pend.note(Q, { hash: '0xT5', inIsA: true, amountIn: E18, at: clock + 1_000 });
+    for (let i = 0; i < 3; i++) c.upsertIfNotNewer({ ...v2(41, A(80), A(81), 100, 100, 0), lastUpdatedMs: clock + 4_000 }, clock + 4_000, clock + 4_000);
+    assert(st(Q, clock + 4_000) === c.getConfirmed('robinhood', Q) && pend.pendingCount(Q) === 0, 'RPC read saved > 1 s after the trade: trade dropped');
+    // Safety net: never confirmed -> dropped after LOOP_PENDING_MAX_MS.
+    pend.note(P, { hash: '0xT6', inIsA: true, amountIn: E18, at: clock + 5_000 });
+    assert(st(P, clock + 5_100) !== c.getConfirmed('robinhood', P), 'unconfirmed trade counted while young');
+    assert(st(P, clock + 9_500) === c.getConfirmed('robinhood', P) && pend.pendingCount(P) === 0, 'unconfirmed trade dropped after 4 s');
+    pend.note(A(99), { hash: '0xT7', inIsA: true, amountIn: E18, at: clock });
+    pend.sweep(clock + 10_000);
+    assert(pend.size() === 0, 'sweep frees pools no scan asked about');
+    // Switch off / no data.
+    assert(loopPoolState(c.get('robinhood', P), c.getConfirmed('robinhood', P), [{ inIsA: true, amountIn: E18, at: clock }], false, predict, clock) === c.get('robinhood', P), 'LOOP_REAL_PRICES off: main cache state (old behaviour)');
+    assert(loopPoolState(undefined, undefined, undefined, true, predict, clock) === undefined, 'no confirmed state, no pending trade: pool left out');
   }
+
 
   // -------------------------------------------------------------------------
   // C) The trigger hash reaches the loop check. D) model vs check record.
@@ -208,6 +245,30 @@ const tick = () => new Promise<void>((r) => setImmediate(r));
     ];
     const txt = modelVsCheckText(summarizeLoopChecks(recs));
     assert(txt === 'model vs check (profit before gas, by timing): right after trigger 2: model said $2.00, check said $0.30, gap 85% (1 lost, loss size unknown so counted as $0)', `model vs check text (${txt})`);
+  }
+
+  // -------------------------------------------------------------------------
+  // Review fixes: block-0 RPC write vs fresh block state; needsWork.
+  // -------------------------------------------------------------------------
+  {
+    const c = new PoolCache({ confirmed: true });
+    const now0 = Date.now();
+    c.upsertFromBlock(v2(45, W, A(85), 100, 100, 9), now0);
+    c.upsert({ ...v2(45, W, A(85), 1, 1, 0) }); // block unknown, right after the block state
+    assert(c.confirmedBlock('robinhood', A(45)) === 9 && c.getConfirmed('robinhood', A(45))!.reserveA === 100n * E18, 'block-0 RPC write does not replace a fresh block state');
+    const c2 = new PoolCache({ confirmed: true });
+    c2.upsertFromBlock(v2(46, W, A(86), 100, 100, 9), now0 - 5_000);
+    c2.upsert({ ...v2(46, W, A(86), 1, 1, 0) });
+    assert(c2.getConfirmed('robinhood', A(46))!.reserveA === E18, 'block-0 RPC write replaces an older block state');
+
+    const f = new LoopFinder({ bases: [W], rebuildMinMs: 5_000, rebuildMs: 60_000 }, env);
+    clock += 200_000;
+    f.update(loopPools(800)); await f.idle(); f.update(loopPools(800));
+    while (f.update(loopPools(800)).waiting) { /* price all */ }
+    assert(!f.needsWork(clock), 'needsWork: nothing waiting right after a rebuild');
+    f.update([...loopPools(800), ...loopPools(810)]); // a pool joined, but the 5 s gap has not passed
+    assert(!f.needsWork(clock), 'needsWork: early rebuild not yet allowed');
+    assert(f.needsWork(clock + 6_000), 'needsWork: pending early rebuild (pool joined) counts once allowed');
   }
 
   // -------------------------------------------------------------------------
@@ -281,5 +342,19 @@ const tick = () => new Promise<void>((r) => setImmediate(r));
     t.onUpdate(changed.slice(0, 2)); // a pool left: runs
     const h = t.takeHour();
     assert(h.skippedScans === 1 && h.updates === 3, `cheap scan: skipped only the unchanged scan (skipped ${h.skippedScans}, ran ${h.updates})`);
+    // A scan that throws part way must not make the next identical scan skip.
+    const t2 = trader({ cheapScan: true }, [], { status: 'loss' });
+    clock += 120_000;
+    const ps2 = loopPools(750);
+    t2.onUpdate(ps2);
+    const real = t2.finder.updateSteps.bind(t2.finder);
+    let boom = true;
+    (t2.finder as { updateSteps: typeof real }).updateSteps = function* (p: PoolState[]) { if (boom) { boom = false; throw new Error('boom'); } return yield* real(p); };
+    const changed2 = [ps2[0], { ...ps2[1], reserveA: ps2[1].reserveA! + 1n }, ps2[2]];
+    let threw = false;
+    try { t2.onUpdate(changed2); } catch { threw = true; }
+    t2.onUpdate(changed2);
+    const h2 = t2.takeHour();
+    assert(threw && h2.updates === 2 && h2.skippedScans === undefined, 'after a failed scan the same pools are scanned again (not skipped)');
   }
 })();

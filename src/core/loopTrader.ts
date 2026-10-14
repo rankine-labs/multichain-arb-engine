@@ -329,9 +329,12 @@ export class LoopTrader {
       let same = usable.length === this.lastInput.length && !this.finder.needsWork(now);
       for (let i = 0; same && i < usable.length; i++) if (usable[i] !== this.lastInput[i]) same = false;
       if (same) { this.hour.skipped++; this.drain(); return []; }
-      this.lastInput = usable;
+      // Forget the last input until this scan finishes: if it throws part
+      // way, the next scan with the same pools must run, not be skipped.
+      this.lastInput = [];
     }
     const out: UpdateOutcome = yield* this.finder.updateSteps(usable);
+    if (this.deps.fix?.cheapScan) this.lastInput = usable;
     this.hour.ms.push(out.ms);
     if (this.hour.ms.length > 20_000) this.hour.ms.splice(0, 10_000);
 

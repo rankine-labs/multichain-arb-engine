@@ -742,7 +742,11 @@ export class LoopFinder {
   // scan (LOOP_CHEAP_SCAN) to skip updates where nothing changed.
   needsWork(now = this.env.now()): boolean {
     if (this.ready || this.pending.size) return true;
-    return !this.job && now - this.lastRebuild >= this.cfg.rebuildMs;
+    if (this.job) return false; // a rebuild is running: its result is put in on a later update
+    const since = now - this.lastRebuild;
+    // Regular rebuild due, or an early one waiting (a pool joined/left or a
+    // price moved a lot) whose minimum gap has now passed.
+    return since >= this.cfg.rebuildMs || ((this.setDirty || this.bigMove) && since >= this.cfg.rebuildMinMs);
   }
 
   // Call after every price update with the pools that may be used.

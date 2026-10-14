@@ -202,10 +202,18 @@ nothing here runs or uses memory):
 - **A. Real prices** (`LOOP_REAL_PRICES`). The pool cache keeps a second,
   small "confirmed" view: the last state that came from real chain data (a
   block the block reader read, or an RPC re-read), never a feed prediction.
-  Loops are priced from it. The one exception: a pool the trigger trade just
-  traded on gets THAT trade's predicted effect on top of its confirmed state
-  (one prediction, not a stack of older ones). The view stores references to
-  states the cache already has (no copies) and is cleaned up with the pool.
+  Loops are priced from it, plus the predicted effect of every feed trade on
+  that pool that no block has confirmed yet, in feed order ("pending"
+  trades). A trade leaves the pending list as soon as a confirmed state is
+  known to include it: the block reader says which transaction made the
+  pool's last event, and the feed shows trades in the chain's order, so
+  everything up to that transaction is in. An RPC read (block unknown)
+  counts for trades seen more than 1 s before it was saved, and anything not
+  confirmed within `LOOP_PENDING_MAX_MS` (4 s) is dropped. So a trade is
+  never missed by a later scan and never counted twice. The view stores
+  references to states the cache already has (no copies), is cleaned up with
+  the pool, and an RPC read with no block number can't replace a block state
+  less than 0.5 s old.
 - **B. Keep block updates** (`LOOP_KEEP_BLOCK_UPDATES`). When the block reader
   skips the main write because the feed wrote the pool moments ago, the block
   state still goes into the confirmed view (an older block never overwrites a
@@ -217,7 +225,8 @@ nothing here runs or uses memory):
   latest ("tested late"). A loop check may wait for the normal check line to
   be idle; if the trigger's block is too old for the node it falls back
   cleanly. Loops found with no trigger (5 s safety net, block updates) are
-  checked on latest as before.
+  checked on latest as before. A loop check counts as a running check on the checking
+  node, so the 2-pool check line sees the node as busy while it runs.
 - **D. Model vs check** (`LOOP_MODEL_VS_CHECK`). Each check records the
   model's profit before gas and the check's, and which timing the check used.
   The hourly block gets a line like
@@ -247,6 +256,7 @@ nothing here runs or uses memory):
 | `LOOP_MODEL_VS_CHECK` | on with `LOOP_TRADER=1` | Model vs check line and log, loop gas learned from checks (part D). |
 | `LOOP_CHEAP_SCAN` | on with `LOOP_TRADER=1` | Skip unchanged loop scans and run scans in slices (part E). `0` = one go. |
 | `LOOP_SCAN_SLICE_MS` | 8 | Longest single slice of a sliced loop scan. |
+| `LOOP_PENDING_MAX_MS` | 4000 | A feed trade no block has confirmed by then stops being added to loop prices. |
 | `LOOP_TRADER` | off | `1` turns the loop trader on. Unset or `0` = off, exactly today's behaviour. |
 | `LOOP_MAX_POOLS` | 5 | Longest loop searched (3 to 8). A value outside 3-8 is moved to the nearest end (9 becomes 8) and text that isn't a number means 5; both print a warning at start-up. |
 | `LOOP_MAX_CYCLES` | 5000 | Most loops kept in the list, shared out evenly between the loop lengths searched. Loops through rival pools, then pools that moved in the last 10 min, are kept first. |

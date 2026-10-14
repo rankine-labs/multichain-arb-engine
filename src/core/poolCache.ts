@@ -58,6 +58,7 @@ interface Confirmed {
   block: number;       // its block number (0 = not known, e.g. some RPC reads)
   at: number;          // when it was written (ms)
   fromBlock: boolean;  // written by the block reader (guards older RPC reads, see upsertIfNotNewer)
+  tx?: string;         // block reader: the transaction of the pool's last event in that read (lower-case)
   // Event fees seen after this state was written are on the main copy only:
   // a merged copy is made once and reused while nothing changes.
   merged?: { fee: PoolState['observedFee']; pool: PoolState };
@@ -68,6 +69,15 @@ export function confirmedViewFromEnv(env: Record<string, string | undefined> = p
   const loopsOn = env.LOOP_TRADER === '1' || env.LOOP_TRADER === 'true';
   return loopsOn && env.LOOP_REAL_PRICES !== '0';
 }
+
+// What the loop trader needs to know about a confirmed state to tell which
+// feed trades it already includes (core/loopPrices.ts PendingTrades).
+export interface ConfirmedInfo { block: number; at: number; fromBlock: boolean; tx?: string }
+
+// An RPC read with no block number must not replace a block-reader state
+// written this recently: the RPC node may be a block or so behind, so its
+// answer could be OLDER than the exact block state (about 2 blocks here).
+export const CONFIRMED_RPC_GRACE_MS = 500;
 
 export class PoolCache {
   private pools = new Map<string, PoolState>(); // key: `${chain}:${poolAddress}`
@@ -89,11 +99,13 @@ export class PoolCache {
 
   // Remember a real-data state in the confirmed view. Never called for feed
   // predictions. An older block never replaces a newer one.
-  private confirm(k: string, pool: PoolState, block: number, now: number, fromBlock: boolean): void {
+  private confirm(k: string, pool: PoolState, block: number, now: number, fromBlock: boolean, tx?: string): void {
     if (!this.confirmedOn) return;
     const cur = this.confirmed.get(k);
     if (cur && block > 0 && cur.block > block) return;
-    this.confirmed.set(k, { pool, block, at: now, fromBlock });
+    // Block unknown (some RPC reads): don't replace a fresh block state.
+    if (cur && block <= 0 && cur.fromBlock && cur.block > 0 && now - cur.at < CONFIRMED_RPC_GRACE_MS) return;
+    this.confirmed.set(k, { pool, block, at: now, fromBlock, ...(tx ? { tx } : {}) });
   }
 
     private key(chain: ChainName, poolAddress: string) {
@@ -162,13 +174,15 @@ export class PoolCache {
   // marked as a feed prediction, so the reader's next block for the same pool
   // is never held back; an RPC refresh that started earlier still can't
   // overwrite it (lastUpdatedMs is newer than that read's start).
-  upsertFromBlock(pool: PoolState, now = Date.now()) {
+  // tx (optional, loop trader only): the transaction of the event that
+  // produced this state, so loops know which feed trades it already includes.
+  upsertFromBlock(pool: PoolState, now = Date.now(), tx?: string) {
     const k = this.key(pool.chain, pool.poolAddress);
     const st = { ...pool, lastUpdatedMs: now };
     this.put(k, st);
     this.blockApplied.set(k, now);
     // Same object in the confirmed view (a reference, not a copy).
-    this.confirm(k, st, st.lastUpdatedBlock, now, true);
+    this.confirm(k, st, st.lastUpdatedBlock, now, true, tx);
   }
 
   // LOOP_KEEP_BLOCK_UPDATES: the block reader read an EXACT state but left
@@ -177,14 +191,20 @@ export class PoolCache {
   // Now it goes into the confirmed view only: the main list (and so every
   // 2-pool trade) is not touched at all. An older block never overwrites a
   // newer one. Returns true if kept.
-  keepBlockState(pool: PoolState, block: number, now = Date.now()): boolean {
+  keepBlockState(pool: PoolState, block: number, now = Date.now(), tx?: string): boolean {
     if (!this.confirmedOn) return false;
     const k = this.key(pool.chain, pool.poolAddress);
     if (!this.pools.has(k)) return false; // only pools the cache knows (keeps memory bounded)
     const cur = this.confirmed.get(k);
     if (cur && cur.block > block) return false;
-    this.confirmed.set(k, { pool: { ...pool, lastUpdatedBlock: block, lastUpdatedMs: now }, block, at: now, fromBlock: true });
+    this.confirmed.set(k, { pool: { ...pool, lastUpdatedBlock: block, lastUpdatedMs: now }, block, at: now, fromBlock: true, ...(tx ? { tx } : {}) });
     return true;
+  }
+
+  // Where the confirmed state came from (block, when, which transaction). undefined = none.
+  confirmedInfo(chain: ChainName, poolAddress: string): ConfirmedInfo | undefined {
+    const c = this.confirmed.get(this.key(chain, poolAddress));
+    return c ? { block: c.block, at: c.at, fromBlock: c.fromBlock, ...(c.tx ? { tx: c.tx } : {}) } : undefined;
   }
 
   // The last REAL-data state of a pool (block reader or RPC read), never a
