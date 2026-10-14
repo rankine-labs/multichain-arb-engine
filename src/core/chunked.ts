@@ -52,6 +52,28 @@ export async function runSteps<T>(job: Steps<T>, name: string, sliceMs = 5): Pro
   }
 }
 
+// For async jobs with long plain loops (not written as steps): call
+// `if (pacer.due()) await pacer.rest();` inside the loop. due() is true once
+// about `sliceMs` of work has run since the last break (it only looks at the
+// clock every 256 calls, so it costs almost nothing). rest() lets the rest of
+// the bot run, then names the next stretch `name` for the stall finder.
+// enabled = false: never takes a break (the old behaviour). Same result
+// either way; only the timing changes.
+export class Pacer {
+  private t0 = performance.now();
+  private calls = 0;
+  constructor(private readonly name: string, private readonly sliceMs = 5, private readonly enabled = true) {}
+  due(): boolean {
+    if (!this.enabled || (++this.calls & 255) !== 0) return false;
+    return performance.now() - this.t0 >= this.sliceMs;
+  }
+  async rest(): Promise<void> {
+    await yieldToLoop();
+    this.t0 = performance.now();
+    stallFinder.mark(this.name);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // JSON in pieces
 // ---------------------------------------------------------------------------

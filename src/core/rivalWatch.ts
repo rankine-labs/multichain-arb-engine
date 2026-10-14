@@ -294,7 +294,32 @@ export interface RivalWatchOptions {
   v4IsNative?: (poolId: string) => boolean | null;
   // The V4 PoolManager: coins sent there are part of the trade, not "elsewhere".
   v4PoolManager?: string;
+  // Addresses that can never be a NEW rival bot (DEX routers, the V4
+  // PoolManager, pools we watch, coins we know). Given a lowercase address.
+  // A transaction to one of these is never checked for "sent by a known
+  // bot's wallet", so we skip working out its sender (see noteTx).
+  neverNewBot?: (addr: string) => boolean;
+  // Most sender look-ups per second (each one is a signature check, ~1-2 ms).
+  // Above this, the transaction's owner-wallet check is skipped and counted.
+  // Default 40 (RIVAL_SENDER_MAX_PER_SEC in shadowMain).
+  senderMaxPerSec?: number;
 }
+
+// Counters for the sender look-ups noteTx did or skipped (status log, 5 min).
+export interface SenderStats {
+  looked: number;          // senders actually worked out (signature checks)
+  knownBot: number;        // skipped: sent straight to a bot we follow (no need)
+  noOwners: number;        // skipped: we know no bot wallets yet, nothing to match
+  neverBot: number;        // skipped: sent to a router / pool / coin, never a new bot
+  dupOrFull: number;       // skipped: already queued, or the queue is full
+  overCap: number;         // skipped: over the per-second limit
+}
+const emptySenderStats = (): SenderStats => ({ looked: 0, knownBot: 0, noOwners: 0, neverBot: 0, dupOrFull: 0, overCap: 0 });
+
+// The sender of a transaction: either already known (text), or a function
+// that works it out only when called (the feed's sender costs a signature
+// check, so we only want to pay for it when it is really needed).
+export type LazySender = string | null | undefined | (() => string | null | undefined);
 
 export class RivalWatch {
   private bots = new Map<string, BotInfo>();
@@ -307,6 +332,8 @@ export class RivalWatch {
   private hourFrom: number;
   private sample = emptySample();
   private readonly opts: RivalWatchOptions;
+  private senders = emptySenderStats();
+  private senderWindow = { at: 0, n: 0 };            // sender look-ups in the current second
 
   constructor(
     private readonly rpc: (method: string, params: unknown[]) => Promise<any>,
@@ -346,11 +373,43 @@ export class RivalWatch {
 
   // Every feed transaction: queue it if it went to a rival bot, or came from
   // a wallet that runs one (catches an operator's new or second contract).
-  noteTx(to: string | undefined, hash: string | undefined, from?: string, value?: string | bigint) {
+  //
+  // `from` (the sender) can be given as text, or as a function that works it
+  // out only when called (RIVAL LAZY SENDER, Oct 14). Working out a feed
+  // transaction's sender is a signature check of about 1-2 ms, and the old
+  // code paid it for EVERY feed transaction: the biggest single cause of
+  // freezes ("rival watch", ~1,000 a 5 min). The sender is only needed for
+  // the owner-wallet check, so with a function it is skipped when:
+  //   - the transaction went to a bot we already follow (queued anyway),
+  //   - it is already queued, or the queue is full (nothing would happen),
+  //   - we know no bot wallets yet (nothing to match it against),
+  //   - it went to a router / pool / coin (can never be a new bot), or
+  //   - we already did `senderMaxPerSec` look-ups this second (counted).
+  // Text senders behave exactly as before (older callers and tests).
+  noteTx(to: string | undefined, hash: string | undefined, from?: LazySender, value?: string | bigint) {
     if (!to || !hash) return;
     const bot = to.toLowerCase();
     const known = this.bots.has(bot);
-    const viaOwner = !known && !!from && this.owners.has(from.toLowerCase());
+    let viaOwner = false;
+    if (typeof from === 'function') {
+      // Cheap checks first; the signature check only when it can matter.
+      if (known) this.senders.knownBot++;
+      else if (this.queue.length >= 100 || this.queued.has(hash)) { this.senders.dupOrFull++; return; }
+      else if (!this.owners.size) { this.senders.noOwners++; return; }
+      else if (this.opts.neverNewBot?.(bot)) { this.senders.neverBot++; return; }
+      else {
+        const t = this.now();
+        if (t - this.senderWindow.at >= 1_000) this.senderWindow = { at: t, n: 0 };
+        if (this.senderWindow.n >= (this.opts.senderMaxPerSec ?? 40)) { this.senders.overCap++; return; }
+        this.senderWindow.n++;
+        this.senders.looked++;
+        let sender: string | null | undefined;
+        try { sender = from(); } catch { sender = null; }
+        viaOwner = !!sender && this.owners.has(sender.toLowerCase());
+      }
+    } else {
+      viaOwner = !known && !!from && this.owners.has(from.toLowerCase());
+    }
     if ((!known && !viaOwner) || this.queue.length >= 100 || this.queued.has(hash)) return;
     let v: bigint | undefined;
     try { v = value !== undefined && value !== null ? BigInt(value) : undefined; } catch { v = undefined; }
@@ -358,6 +417,13 @@ export class RivalWatch {
     if (this.queued.size > 5_000) this.queued.clear(); // bounded memory
     this.queue.push({ hash, bot, dueAt: this.now() + this.delayMs, value: v, probe: viaOwner });
     void this.drain();
+  }
+
+  // Sender look-up counters since the last call, then reset (5-min status log).
+  takeSenderStats(): SenderStats {
+    const s = this.senders;
+    this.senders = emptySenderStats();
+    return s;
   }
 
   // Reads one trade from its receipt logs. `traders` = the bot contract plus

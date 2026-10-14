@@ -1101,6 +1101,10 @@ const rivals = new CompetitorTracker(robinhoodReadProvider, Date.now, ROBINHOOD_
 // tracker has caught, to see what they win and where. Bots saved to disk.
 const RIVAL_BOTS_FILE = 'data/rival-bots.json';
 const RIVAL_TRADES_FILE = 'data/rival-trades.json';
+const RIVAL_PM_LOWER = ROBINHOOD_V4.POOL_MANAGER.toLowerCase();
+// RIVAL_LAZY_SENDER=0: hand rival watch the sender up front for every feed
+// transaction (the old behaviour: a signature check per transaction).
+const RIVAL_LAZY_SENDER = process.env.RIVAL_LAZY_SENDER !== '0';
 const rivalWatch = new RivalWatch(
       (m, p) => robinhoodReadProvider.send(m, p as any[]),
       (token, raw) => {
@@ -1120,6 +1124,14 @@ const rivalWatch = new RivalWatch(
             // no log, so such trades are marked "uncertain"). Unknown -> null.
             v4IsNative: (id) => { const p = cache.get('robinhood', id); return p?.v4 ? p.v4.native : null; },
             v4PoolManager: ROBINHOOD_V4.POOL_MANAGER,
+            // Addresses that can never be a NEW rival bot: DEX routers, the V4
+            // PoolManager, pools we watch, coins we know. Feed transactions to
+            // these skip the sender look-up (a ~1-2 ms signature check), see
+            // RivalWatch.noteTx. All quick lookups. Given lowercase addresses.
+            neverNewBot: (a) => a === RIVAL_PM_LOWER || !!routerRegistry.robinhood?.[a]
+                  || !!cache.get('robinhood', a) || TOKEN_DECIMALS.robinhood?.[a] !== undefined,
+            // At most this many sender look-ups per second (the rest are skipped and counted).
+            senderMaxPerSec: Number(process.env.RIVAL_SENDER_MAX_PER_SEC ?? 40),
       },
 );
 registerSize('rival trades', () => rivalWatch.recordCount());
@@ -1656,9 +1668,13 @@ if (event.chain === 'robinhood') {
       // The rival tracker needs the SENDER, which costs a signature check
       // (~1-2 ms). Done on the next turn, after this frame's trades have been
       // decided, so it never delays our own decision (FEED_LAZY_SENDER=0: old order).
+      // Since Oct 14 the sender is passed as a function (RIVAL_LAZY_SENDER):
+      // rival watch only works it out for the few transactions where it can
+      // matter, instead of for every feed transaction (RIVAL_LAZY_SENDER=0: old).
       const raw = event.raw as any;
-      if (process.env.FEED_LAZY_SENDER !== '0') setImmediate(() => { try { timed('rival watch', () => rivalWatch.noteTx(raw?.to, raw?.hash, raw?.from, raw?.value)); } catch { /* never affects trading */ } });
-      else rivalWatch.noteTx(raw?.to, raw?.hash, raw?.from, raw?.value);
+      const sender = RIVAL_LAZY_SENDER ? () => raw?.from : undefined;
+      if (process.env.FEED_LAZY_SENDER !== '0') setImmediate(() => { try { timed('rival watch', () => rivalWatch.noteTx(raw?.to, raw?.hash, sender ?? raw?.from, raw?.value)); } catch { /* never affects trading */ } });
+      else rivalWatch.noteTx(raw?.to, raw?.hash, sender ?? raw?.from, raw?.value);
 }
 
 const swap = await decoder.decode(event);
@@ -2823,6 +2839,8 @@ await chainManager.startAll();
                               callMany: scanCallMany, state: st, pools,
                               usdg: ROBINHOOD_TOKENS.USDG, weth: ROBINHOOD_TOKENS.WETH,
                               symbolCacheFile: SYMBOLS_FILE, outFile: GROUPS_FILE, log: (m) => console.log(m),
+                              // Short breaks in the long walks over every pool/coin (same switch as the scan's pool list).
+                              paced: STALL_FIX_SCAN_EXPAND,
                         }));
                   }
                   const quotes = tokenGroups!.members.map((m) => ({ token: m.token, symbol: m.symbol, group: m.group, priceUsd: m.priceUsd }));
@@ -3258,6 +3276,9 @@ for (let i = 0; i < resolved.length; i++) {
             gapStaleSkips = 0;
             const sd = formatStallDetail(sf);
             if (sd) console.log(`[stalls] ${sd}`);
+            // Rival watch sender look-ups (signature checks) done vs skipped, last 5 min.
+            const rs = rivalWatch.takeSenderStats();
+            console.log(`[rivalwatch] sender checks (5 min): ${rs.looked} done · skipped: ${rs.knownBot} known bot, ${rs.noOwners} no bot wallets known, ${rs.neverBot} router/pool/coin, ${rs.dupOrFull} already queued, ${rs.overCap} over the ${process.env.RIVAL_SENDER_MAX_PER_SEC ?? 40}/s limit`);
       }), 5 * 60_000);
       // Watch list size every 15 min (shown on the GitHub status page).
       setInterval(labelled('watch list log', () => {
