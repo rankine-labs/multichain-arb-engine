@@ -18,7 +18,7 @@ const QN = 'https://x.robinhood.quiknode.pro/def/';
   const notes = applyEnvDefaults(env);
   assert(env.CHECK_RPC_MAIN === CS && env.CHECK_RPC_MAIN_DAILY === '120000', 'checks move to Chainstack with a 120000/day allowance');
   assert(env.CHECK_RPC_FALLBACK === QN && env.CHECK_RPC_FALLBACK_DAILY === '14000', 'QuickNode becomes the backup with 14000/day');
-  assert(env.LOOP_TRADER === '1', 'loop trader turned on');
+  assert(env.LOOP_TRADER === '0', 'loop trader off by default (Oct 14)');
   assert(notes.every((n) => !n.includes('http') && !n.includes('abc') && !n.includes('def')), 'notes never include the links or keys');
   assert(env.BLOCK_READER_WSS === undefined, 'no WSS link saved: WebSocket reader not switched on');
 }
@@ -53,7 +53,7 @@ const QN = 'https://x.robinhood.quiknode.pro/def/';
 {
   const env: Record<string, string | undefined> = { CHAINSTACK_RPC_ROBINHOOD: '  ', LOOP_TRADER: '' };
   applyEnvDefaults(env);
-  assert(env.CHECK_RPC_MAIN === undefined && env.LOOP_TRADER === '1', 'blank Chainstack ignored; blank LOOP_TRADER treated as unset');
+  assert(env.CHECK_RPC_MAIN === undefined && env.LOOP_TRADER === '0', 'blank Chainstack ignored; blank LOOP_TRADER treated as unset (off)');
 }
 
 // 6. WSS link saved: WebSocket reader on; 'off' keeps it off; an explicit one wins.
@@ -68,4 +68,11 @@ const QN = 'https://x.robinhood.quiknode.pro/def/';
   const own: Record<string, string | undefined> = { CHAINSTACK_WSS_ROBINHOOD: 'wss://cs.example/k', BLOCK_READER_WSS: 'wss://other.example/z' };
   applyEnvDefaults(own);
   assert(own.BLOCK_READER_WSS === 'wss://other.example/z', 'an explicit BLOCK_READER_WSS wins');
+}
+
+// 7. Owner can still turn loops on.
+{
+  const env: Record<string, string | undefined> = { LOOP_TRADER: '1' };
+  applyEnvDefaults(env);
+  assert(env.LOOP_TRADER === '1', 'LOOP_TRADER=1 in .env keeps loops on');
 }
