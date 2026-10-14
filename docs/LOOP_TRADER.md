@@ -178,10 +178,75 @@ scan only (not a gap scan). With `LOOP_TRADER` unset, none of this exists.
 `[loop] extra single pools ...` line; the hourly "Loop trades" block shows
 `extra single pools watched: N`.
 
+## Loop fix phase 2 (Oct 14): real prices, trigger replay, cheap scans
+
+**Why.** An audit found loops looked profitable in the model but almost never
+passed the practice check. The loop maths and the contract encoding were
+right. The causes were:
+
+1. Loops were priced on **predicted** pool states (the trade feed guesses a
+   pool's new price before the trade is in a block). Small guess errors add up
+   over 3 to 5 pools, worst in thin meme and stock-coin pools.
+2. **Real block updates were thrown away**: when the feed had written a pool
+   in the last 400 ms (`BLOCK_READER_FEED_GRACE_MS`), the block reader skipped
+   the exact block state and never came back to it.
+3. Loop practice checks ran on plain "latest", not right after the trade that
+   opened the loop (2-pool checks replay the trigger's block first).
+4. The loss shown for a losing loop check was only a gas guess.
+5. Loop scans were the biggest freeze cause when loops were on.
+
+**What changed** (each part has its own switch, all ON when `LOOP_TRADER=1`;
+`=0` brings back the old behaviour for that part; with `LOOP_TRADER` off
+nothing here runs or uses memory):
+
+- **A. Real prices** (`LOOP_REAL_PRICES`). The pool cache keeps a second,
+  small "confirmed" view: the last state that came from real chain data (a
+  block the block reader read, or an RPC re-read), never a feed prediction.
+  Loops are priced from it. The one exception: a pool the trigger trade just
+  traded on gets THAT trade's predicted effect on top of its confirmed state
+  (one prediction, not a stack of older ones). The view stores references to
+  states the cache already has (no copies) and is cleaned up with the pool.
+- **B. Keep block updates** (`LOOP_KEEP_BLOCK_UPDATES`). When the block reader
+  skips the main write because the feed wrote the pool moments ago, the block
+  state still goes into the confirmed view (an older block never overwrites a
+  newer one). The main cache, and so every 2-pool trade, is not touched.
+- **C. Trigger replay** (`LOOP_TRIGGER_REPLAY`). A loop found right after a
+  feed trade remembers that trade's hash. Its practice check then works like
+  the 2-pool one: find the trigger's block, replay it up to and including the
+  trigger, then run our loop. Fallbacks: the end of the trigger's block, then
+  latest ("tested late"). A loop check may wait for the normal check line to
+  be idle; if the trigger's block is too old for the node it falls back
+  cleanly. Loops found with no trigger (5 s safety net, block updates) are
+  checked on latest as before.
+- **D. Model vs check** (`LOOP_MODEL_VS_CHECK`). Each check records the
+  model's profit before gas and the check's, and which timing the check used.
+  The hourly block gets a line like
+  `model vs check (profit before gas, by timing): right after trigger 4: model said $1.20, check said $0.30, gap 75% (3 lost, ...)`.
+  The contract only reports the final result, and for a loss not even how
+  much, so a loss counts as $0 (the real gap on losses is at least what is
+  shown). Each check also logs the model's amount out of EVERY pool next to
+  the check's end result (`[loop] ... model vs check: model per pool ...`).
+  Replays report the gas the loop really used; that now teaches the gas
+  model's loop estimate (loop kinds only), and the check result uses the gas
+  estimate as of the check.
+- **E. Cheap scan** (`LOOP_CHEAP_SCAN`, `LOOP_SCAN_SLICE_MS`). A scan where no
+  pool state changed (and the finder has nothing waiting) is skipped. The
+  finder already only re-prices loops through changed pools; its per-update
+  work (the pool list, change check, quick and exact checks) now runs in
+  slices of at most 8 ms with breaks for feed messages, timed as `loop scan`
+  by the stall finder. The sorted pool-set key is only built when a pool
+  joined or left. Results are exactly the same as a one-go scan (tested).
+
 ## Settings (.env)
 
 | Setting | Default | What it does |
 |---|---|---|
+| `LOOP_REAL_PRICES` | on with `LOOP_TRADER=1` | Price loops from block/RPC confirmed pool states (part A). `0` = main cache (feed predictions included). |
+| `LOOP_KEEP_BLOCK_UPDATES` | on with `LOOP_TRADER=1` | Keep block states the main cache skipped, for loops only (part B). Needs `LOOP_REAL_PRICES`. |
+| `LOOP_TRIGGER_REPLAY` | on with `LOOP_TRADER=1` | Practice-check loops right after their trigger trade (part C). `0` = latest. |
+| `LOOP_MODEL_VS_CHECK` | on with `LOOP_TRADER=1` | Model vs check line and log, loop gas learned from checks (part D). |
+| `LOOP_CHEAP_SCAN` | on with `LOOP_TRADER=1` | Skip unchanged loop scans and run scans in slices (part E). `0` = one go. |
+| `LOOP_SCAN_SLICE_MS` | 8 | Longest single slice of a sliced loop scan. |
 | `LOOP_TRADER` | off | `1` turns the loop trader on. Unset or `0` = off, exactly today's behaviour. |
 | `LOOP_MAX_POOLS` | 5 | Longest loop searched (3 to 8). A value outside 3-8 is moved to the nearest end (9 becomes 8) and text that isn't a number means 5; both print a warning at start-up. |
 | `LOOP_MAX_CYCLES` | 5000 | Most loops kept in the list, shared out evenly between the loop lengths searched. Loops through rival pools, then pools that moved in the last 10 min, are kept first. |

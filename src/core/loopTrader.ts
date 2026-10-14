@@ -1,5 +1,7 @@
 import { PoolState } from './types';
-import { LoopFinder, LoopEnv, LoopResult, LoopCycle, LOOP_MIN_POOLS_LIMIT, LOOP_MAX_POOLS_LIMIT } from './loopFinder';
+import { LoopFinder, LoopEnv, LoopResult, LoopCycle, LOOP_MIN_POOLS_LIMIT, LOOP_MAX_POOLS_LIMIT, UpdateOutcome, realisticHopOut } from './loopFinder';
+import { drainSteps, Steps } from './chunked';
+import type { LoopFixSwitches } from './loopPrices';
 import { ExecutorHop, hopFor, kindForPool, v4KeyMatchesId, KIND_V4_HOOKED } from '../execution/executorCalldata';
 import type { SimResult } from '../execution/simulator';
 
@@ -107,8 +109,27 @@ export interface LoopTraderDeps {
   // True when the normal check line is idle and the node has room.
   canCheckNow: () => boolean;
   // One practice check (eth_call with state override). Never sends anything.
-  runCheck: (trade: LoopTrade) => Promise<SimResult>;
+  // ctx.triggerHash (LOOP_TRIGGER_REPLAY): the feed trade that opened the
+  // loop, so the check can replay its block up to it and test right after
+  // it. The answer may say which timing was used ("right after trigger",
+  // "end of trigger block", "tested late", "latest").
+  runCheck: (trade: LoopTrade, ctx?: LoopCheckContext) => Promise<LoopCheckResult>;
   log?: (msg: string) => void;
+  // Loop fix phase 2 switches (core/loopPrices.ts). Missing = all off = old behaviour.
+  fix?: Partial<LoopFixSwitches>;
+  // LOOP_MODEL_VS_CHECK: a check reported the gas our loop really used
+  // (replays do): teach the gas model (shadowMain: gasModel.notePractice).
+  noteGas?: (pools: number, gasUsed: bigint) => void;
+}
+
+// What a loop practice check is told, and what it answers.
+export interface LoopCheckContext { triggerHash?: string }
+export type LoopCheckResult = SimResult & { timing?: string };
+
+// Optional extra input for one scan: the feed trades that triggered it.
+export interface LoopScanContext {
+  // Pool (lower-case address / V4 id) -> latest trigger trade hash on it.
+  triggers?: Map<string, { hash: string; at: number }>;
 }
 
 // Turns a loop into the contract's hop list, or says why the contract can't run it.
@@ -137,7 +158,7 @@ export function buildLoopTrade(r: Pick<LoopResult, 'cycle' | 'pools' | 'amountIn
 // A real loop nets a few % at most; more means broken token/pool data.
 const MAX_PLAUSIBLE_PROFIT_SHARE = 0.25;
 
-interface Waiting { r: LoopResult; trade: LoopTrade; at: number }
+interface Waiting { r: LoopResult; trade: LoopTrade; at: number; triggerHash?: string }
 interface RouteStat { label: string; n: number; bestUsd: number }
 
 // ----------------------------------------------------------------------------
@@ -166,6 +187,22 @@ export interface LoopCheckRecord {
   resultUsd: number | null;     // after gas; loss = minus gas (best case); fail = null
   reason?: string;              // why it wouldn't go through
   delayMs: number;              // found -> check started
+  // LOOP_MODEL_VS_CHECK (loop fix phase 2): profit BEFORE gas, model vs check.
+  // checkGrossUsd: exact for a profit; 0 for a loss (the contract only says
+  // "not more than it started", so 0 is the best a loss could have been);
+  // null when the check didn't go through.
+  timing?: string;              // which state the check ran on (see runCheck)
+  modelGrossUsd?: number;
+  checkGrossUsd?: number | null;
+}
+
+// Model vs check, per check timing (for the hourly line).
+export interface ModelVsCheckRow {
+  timing: string;
+  n: number;                    // checks that ran the whole route (profit or loss)
+  modelUsd: number;             // sum of the model's profit before gas
+  checkUsd: number;             // sum of the check's profit before gas (loss = 0, best case)
+  losses: number;               // of n, how many lost (real loss size unknown)
 }
 
 export interface LoopCheckSummary {
@@ -176,6 +213,7 @@ export interface LoopCheckSummary {
   lossesQuick: number;          // losses checked under 1 s after being found
   lossesSlow: number;           // losses checked 1 s or more after being found
   topFail: [string, number] | null; // most common reason a check wouldn't go through
+  modelVsCheck?: ModelVsCheckRow[];  // LOOP_MODEL_VS_CHECK: by timing, most checks first
 }
 
 const median = (xs: number[]): number | null => {
@@ -193,6 +231,16 @@ export function summarizeLoopChecks(recs: LoopCheckRecord[]): LoopCheckSummary {
     if (r.outcome === 'fail') { const k = (r.reason ?? 'unknown').slice(0, 60); fails.set(k, (fails.get(k) ?? 0) + 1); }
   }
   const results = recs.map((r) => r.resultUsd).filter((x): x is number => x !== null);
+  // Model vs check by timing (only records that carry both numbers).
+  const rows = new Map<string, ModelVsCheckRow>();
+  for (const r of recs) {
+    if (r.modelGrossUsd === undefined || r.checkGrossUsd === undefined || r.checkGrossUsd === null) continue;
+    const t = r.timing || 'latest';
+    const row = rows.get(t) ?? { timing: t, n: 0, modelUsd: 0, checkUsd: 0, losses: 0 };
+    row.n++; row.modelUsd += r.modelGrossUsd; row.checkUsd += r.checkGrossUsd;
+    if (r.outcome === 'loss') row.losses++;
+    rows.set(t, row);
+  }
   return {
     n: recs.length,
     medianEstUsd: median(recs.map((r) => r.estUsd)),
@@ -200,6 +248,7 @@ export function summarizeLoopChecks(recs: LoopCheckRecord[]): LoopCheckSummary {
     medianDelayMs: median(recs.map((r) => r.delayMs)),
     lossesQuick, lossesSlow,
     topFail: [...fails.entries()].sort((a, b) => b[1] - a[1])[0] ?? null,
+    ...(rows.size ? { modelVsCheck: [...rows.values()].sort((a, b) => b.n - a.n) } : {}),
   };
 }
 
@@ -213,6 +262,7 @@ export interface LoopHour {
   foundByLen: number[];         // paying loops found, by number of pools (index = pools)
   topRoutes: RouteStat[];
   updates: number; medianMs: number | null; slowestMs: number | null; cycles: number; capped: boolean;
+  skippedScans?: number;        // LOOP_CHEAP_SCAN: scans skipped because no pool changed
   cyclesByLen: number[];        // loops in the list, by number of pools
   rebuild: { totalMs: number; maxSliceMs: number } | null; // last loop list rebuild
   // longer: rival loop wins with more pools than our LOOP_MAX_POOLS;
@@ -232,6 +282,10 @@ export class LoopTrader {
   // and the last time it was seen paying. For the rival race comparison.
   private seen = new Map<string, { first: number; last: number }>();
   private hour = this.emptyHour();
+  // LOOP_CHEAP_SCAN: the pool states the last scan used (references only,
+  // no copies). A scan with exactly the same states, and nothing waiting in
+  // the finder, would change nothing, so it is skipped.
+  private lastInput: PoolState[] = [];
 
   constructor(readonly cfg: LoopTraderConfig, private deps: LoopTraderDeps) {
     this.finder = new LoopFinder({ bases: deps.bases, maxPools: cfg.maxPools, maxCycles: cfg.maxCycles, maxTradeUsd: cfg.maxTradeUsd, depthShare: cfg.depthShare, longSlack: cfg.longSlack ?? 0.02 }, deps.env);
@@ -243,6 +297,7 @@ export class LoopTrader {
       cantRunWhy: new Map<string, number>(), skippedCap: 0, routes: new Map<string, RouteStat>(), ms: [] as number[],
       foundByLen: [] as number[],
       checks: [] as LoopCheckRecord[],
+      skipped: 0,
       rival: { loops: 0, comparable: 0, weFound: 0, leads: [] as number[], longer: 0, unseen: 0, bots: new Map<string, number>() },
     };
   }
@@ -251,11 +306,32 @@ export class LoopTrader {
 
   // Call after each price update with the pools the bot keeps fresh.
   // Returns undefined when switched off (nothing runs).
-  onUpdate(pools: PoolState[]): LoopResult[] | undefined {
+  onUpdate(pools: PoolState[], ctx: LoopScanContext = {}): LoopResult[] | undefined {
+    if (!this.cfg.enabled) return undefined;
+    return drainSteps(this.onUpdateSteps(pools, ctx));
+  }
+
+  // The same scan written as steps (LOOP_CHEAP_SCAN), so shadowMain can run
+  // it in small slices (core/chunked.ts runSteps). Same answer as onUpdate.
+  *onUpdateSteps(pools: PoolState[], ctx: LoopScanContext = {}): Steps<LoopResult[] | undefined> {
     if (!this.cfg.enabled) return undefined;
     const now = this.deps.env.now();
-    const usable = pools.filter((p) => now - p.lastUpdatedMs <= this.cfg.maxPoolAgeMs);
-    const out = this.finder.update(usable);
+    const usable: PoolState[] = [];
+    for (let i = 0; i < pools.length; i++) {
+      const p = pools[i];
+      if (now - p.lastUpdatedMs <= this.cfg.maxPoolAgeMs) usable.push(p);
+      if ((i & 511) === 511) yield;
+    }
+    // CHEAP SCAN: nothing changed since the last scan (same pool states, same
+    // order, none aged out) and the finder has nothing waiting: skip it. The
+    // result would be "no loop changed", exactly what skipping gives.
+    if (this.deps.fix?.cheapScan) {
+      let same = usable.length === this.lastInput.length && !this.finder.needsWork(now);
+      for (let i = 0; same && i < usable.length; i++) if (usable[i] !== this.lastInput[i]) same = false;
+      if (same) { this.hour.skipped++; this.drain(); return []; }
+      this.lastInput = usable;
+    }
+    const out: UpdateOutcome = yield* this.finder.updateSteps(usable);
     this.hour.ms.push(out.ms);
     if (this.hour.ms.length > 20_000) this.hour.ms.splice(0, 10_000);
 
@@ -280,7 +356,7 @@ export class LoopTrader {
       const was = this.open.get(r.cycle.sig);
       if (was !== undefined && r.netUsd < 2 * was) continue; // same open loop, already counted
       this.open.set(r.cycle.sig, r.netUsd);
-      this.count(r, now);
+      this.count(r, now, this.triggerOf(r, ctx));
     }
     if (this.seen.size > 5_000) for (const [k, v] of this.seen) if (now - v.last > 10 * 60_000) this.seen.delete(k);
     if (this.open.size > 5_000) this.open.clear();
@@ -288,7 +364,21 @@ export class LoopTrader {
     return out.results;
   }
 
-  private count(r: LoopResult, now: number) {
+  // LOOP_TRIGGER_REPLAY: the trigger trade this loop follows, if one of its
+  // pools was traded on by a feed trade that started this scan (the latest
+  // one if several). None = a loop found by the 5 s safety net or a block
+  // update: checked on "latest" as before.
+  private triggerOf(r: LoopResult, ctx: LoopScanContext): string | undefined {
+    if (!this.deps.fix?.triggerReplay || !ctx.triggers?.size) return undefined;
+    let best: { hash: string; at: number } | undefined;
+    for (const h of r.cycle.hops) {
+      const t = ctx.triggers.get(h.poolKey);
+      if (t && (!best || t.at > best.at)) best = t;
+    }
+    return best?.hash;
+  }
+
+  private count(r: LoopResult, now: number, triggerHash?: string) {
     const h = this.hour;
     h.found++;
     const len = r.cycle.hops.length;
@@ -308,7 +398,7 @@ export class LoopTrader {
     }
     if (this.cfg.checksPerMin <= 0) return;
     this.deps.log?.(`${base}: queued for a practice check`);
-    this.waiting.push({ r, trade: built.trade, at: now });
+    this.waiting.push({ r, trade: built.trade, at: now, ...(triggerHash ? { triggerHash } : {}) });
     // Vetted coins first, then bigger profit. Short line: 10 max.
     this.waiting.sort((a, b) => (a.r.tradable === b.r.tradable ? b.r.netUsd - a.r.netUsd : a.r.tradable ? -1 : 1));
     if (this.waiting.length > 10) { this.waiting.length = 10; h.skippedCap++; }
@@ -338,17 +428,29 @@ export class LoopTrader {
     // Seconds between "found" (queued) and the check starting.
     const delayMs = Math.max(0, this.deps.env.now() - w.at);
     const after = `found ${(delayMs / 1_000).toFixed(1)} s before the check`;
-    let r: SimResult;
-    try { r = await this.deps.runCheck(w.trade); }
+    let r: LoopCheckResult;
+    try { r = await (w.triggerHash ? this.deps.runCheck(w.trade, { triggerHash: w.triggerHash }) : this.deps.runCheck(w.trade)); }
     catch (e) { this.deps.log?.(`[loop] ${label} practice check error: ${(e as Error).message}`); return; }
     const h = this.hour;
     if (r.status === 'rate_limited') { this.pausedUntil = this.deps.env.now() + 60_000; return; }
     if (r.status === 'unsupported') { this.deps.log?.(`[loop] ${label} practice check skipped (${r.reason})`); return; }
     h.checked++;
     const est = w.r.netUsd;
+    const mvc = !!this.deps.fix?.modelVsCheck;
+    const hops = w.r.cycle.hops.length;
+    // Gas: the check ran the whole route and said how much gas it used
+    // (replays report it): teach the gas model, then use its estimate as of
+    // NOW (calibrated loop gas once there are enough samples) instead of the
+    // number from when the loop was found.
+    if (mvc && (r.status === 'profit' || r.status === 'loss') && r.gasUsed) this.deps.noteGas?.(hops, r.gasUsed);
+    const gasUsd = mvc ? this.deps.env.gasUsd(hops) : w.r.gasUsd;
+    const timing = r.timing ?? (mvc ? 'latest' : undefined);
     const note = (rec: Omit<LoopCheckRecord, 'route' | 'estUsd' | 'delayMs'>) => {
-      if (h.checks.length < MAX_CHECK_RECORDS) h.checks.push({ route: label, estUsd: est, delayMs, ...rec });
+      if (h.checks.length >= MAX_CHECK_RECORDS) return;
+      const extra = mvc ? { timing, modelGrossUsd: w.r.grossUsd } : {};
+      h.checks.push({ route: label, estUsd: est, delayMs, ...extra, ...rec });
     };
+    if (mvc) this.logModelVsCheck(w, r, label, timing);
     if (r.status === 'profit') {
       const dec = this.deps.decimalsOf(w.r.cycle.base), usd = this.deps.env.usdOf(w.r.cycle.base);
       const plausible = w.trade.amountIn > 0n && Number(r.profit) / Number(w.trade.amountIn) <= MAX_PLAUSIBLE_PROFIT_SHARE;
@@ -357,18 +459,45 @@ export class LoopTrader {
         this.deps.log?.(`[loop] ${label} practice: implausible or unpriced profit, ignored (estimate $${est.toFixed(2)}, ${after})`);
         return;
       }
-      const net = (Number(r.profit) / 10 ** dec) * usd - w.r.gasUsd;
-      if (net > 0) { h.wouldMake++; h.wouldMakeUsd += net; note({ outcome: 'profit', resultUsd: net }); }
-      else { h.lost++; note({ outcome: 'loss', resultUsd: net }); }
-      this.deps.log?.(`[loop] ${label} practice: REAL PROFIT $${net.toFixed(4)} after gas (estimate $${est.toFixed(2)}, ${after}) | practice only, never sent`);
+      const gross = (Number(r.profit) / 10 ** dec) * usd;
+      const net = gross - gasUsd;
+      const g = mvc ? { checkGrossUsd: gross } : {};
+      if (net > 0) { h.wouldMake++; h.wouldMakeUsd += net; note({ outcome: 'profit', resultUsd: net, ...g }); }
+      else { h.lost++; note({ outcome: 'loss', resultUsd: net, ...g }); }
+      this.deps.log?.(`[loop] ${label} practice: REAL PROFIT $${net.toFixed(4)} after gas (estimate $${est.toFixed(2)}, ${after}${timing ? `, ${timing}` : ''}) | practice only, never sent`);
     } else if (r.status === 'loss') {
-      h.lost++; note({ outcome: 'loss', resultUsd: -w.r.gasUsd });
-      this.deps.log?.(`[loop] ${label} practice: LOSS (estimate $${est.toFixed(2)}, ${after})`);
+      h.lost++; note({ outcome: 'loss', resultUsd: -gasUsd, ...(mvc ? { checkGrossUsd: 0 } : {}) });
+      this.deps.log?.(`[loop] ${label} practice: LOSS (estimate $${est.toFixed(2)}, ${after}${timing ? `, ${timing}` : ''})`);
     } else {
-      h.failed++; note({ outcome: 'fail', resultUsd: null, reason: r.reason });
-      this.deps.log?.(`[loop] ${label} practice: FAILS (${r.reason}; estimate $${est.toFixed(2)}, ${after})`);
+      h.failed++; note({ outcome: 'fail', resultUsd: null, reason: r.reason, ...(mvc ? { checkGrossUsd: null } : {}) });
+      this.deps.log?.(`[loop] ${label} practice: FAILS (${r.reason}; estimate $${est.toFixed(2)}, ${after}${timing ? `, ${timing}` : ''})`);
     }
     this.drain();
+  }
+
+  // LOOP_MODEL_VS_CHECK: one log line per check with what the model expected
+  // out of EACH pool and what the check gave back at the end. The contract
+  // only reports the final result (and for a loss not even how much), so the
+  // per-pool numbers are the model's; comparing them with the end result
+  // shows how far off the model was overall.
+  private logModelVsCheck(w: Waiting, r: LoopCheckResult, label: string, timing: string | undefined): void {
+    if (!this.deps.log) return;
+    const c = w.r.cycle;
+    const fmt = (raw: bigint, tok: string) => {
+      const d = this.deps.decimalsOf(tok);
+      const v = d === undefined ? Number(raw) : Number(raw) / 10 ** d;
+      return `${v.toPrecision(5)} ${this.deps.symbolOf(tok)}`;
+    };
+    const parts = [fmt(w.r.amountIn, c.base)];
+    let amt = w.r.amountIn;
+    for (let i = 0; i < c.hops.length; i++) {
+      amt = realisticHopOut(w.r.pools[i], c.hops[i].inIsA, amt);
+      parts.push(fmt(amt, c.hops[i].tokenOut));
+    }
+    const end = r.status === 'profit' ? fmt(w.trade.amountIn + r.profit, c.base)
+      : r.status === 'loss' ? `no more than ${fmt(w.trade.amountIn, c.base)} (loss size unknown)`
+        : `did not run (${'reason' in r ? r.reason : 'unknown'})`;
+    this.deps.log(`[loop] ${label} model vs check${timing ? ` (${timing})` : ''}: model per pool ${parts.join(' -> ')}; check end ${end}`);
   }
 
   // Rival race: a rival's confirmed loop win. Did our finder have the same loop
@@ -405,6 +534,7 @@ export class LoopTrader {
       topRoutes: [...h.routes.values()].sort((a, b) => b.bestUsd - a.bestUsd || b.n - a.n).slice(0, 3),
       updates: ms.length, medianMs: ms.length ? ms[Math.floor(ms.length / 2)] : null, slowestMs: ms.length ? ms[ms.length - 1] : null,
       cycles: this.finder.cycleCount(), capped: this.finder.lastCapped,
+      ...(h.skipped ? { skippedScans: h.skipped } : {}),
       cyclesByLen: Array.from({ length: LOOP_MAX_POOLS_LIMIT + 1 }, (_, i) => this.finder.cyclesByLen()[i] ?? 0),
       rebuild: (() => { const s = this.finder.rebuildStats(); return s ? { totalMs: s.totalMs, maxSliceMs: s.maxSliceMs } : null; })(),
       rival: { loops: h.rival.loops, comparable: h.rival.comparable, weFound: h.rival.weFound,

@@ -3,6 +3,7 @@ import { feePipsOf } from './dexMath';
 import { clAmountOut, v2AmountOut } from './venueMath';
 import { realBalanceOf } from './poolPrice';
 import { stallFinder } from './stallFinder';
+import { drainSteps } from './chunked';
 
 // ============================================================================
 // LOOP FINDER -- finds 3 to 8 pool loops that end with more than they start
@@ -712,6 +713,7 @@ export class LoopFinder {
   private pending = new Set<number>();               // loops still to be priced (time budget ran out)
   private builtRates = new Map<string, number>();    // pool -> price when the list was built
   private bigMove = false;                           // a pool moved enough that the long-loop list may be stale
+  private setDirty = false;                          // a pool joined or left since the last rebuild
   lastCapped = false;                                // loop list hit LOOP_MAX_CYCLES (some length) or the step cap
   lastStats: RebuildStats | null = null;          // how the last rebuild went
   rebuilds = 0;
@@ -734,24 +736,54 @@ export class LoopFinder {
   private minLog = (len: number): number =>
     Math.log1p(Math.max(0, this.env.gasUsd(len)) / this.cfg.maxTradeUsd) + Math.log(1 - Math.min(0.5, Math.max(0, this.cfg.longSlack)));
 
+  // True when an update would do something even if no pool changed: a
+  // finished rebuild to put in place, loops still waiting to be priced, or
+  // the loop list is due for its regular rebuild. Used by the cheap loop
+  // scan (LOOP_CHEAP_SCAN) to skip updates where nothing changed.
+  needsWork(now = this.env.now()): boolean {
+    if (this.ready || this.pending.size) return true;
+    return !this.job && now - this.lastRebuild >= this.cfg.rebuildMs;
+  }
+
   // Call after every price update with the pools that may be used.
+  // Runs all at once (same code as updateSteps, no breaks).
   update(poolsIn: PoolState[]): UpdateOutcome {
+    return drainSteps(this.updateSteps(poolsIn));
+  }
+
+  // The same update written as steps (LOOP_CHEAP_SCAN): it says `yield` at
+  // safe points, so the caller can run it in small slices (core/chunked.ts
+  // runSteps) and let feed messages through in between. Same answer as
+  // update(): the time budget below counts WORK time only (breaks between
+  // slices are not counted), and the pools list is the one handed in.
+  *updateSteps(poolsIn: PoolState[]): Generator<void, UpdateOutcome, void> {
     const t0 = performance.now();
+    let paused = 0; // time spent in breaks between slices (not work)
+    const work = () => performance.now() - t0 - paused;
+    // Take a break: remember how long it lasted so the budget ignores it.
+    const brk = function* (): Generator<void, void, void> { const b = performance.now(); yield; paused += performance.now() - b; };
     const now = this.env.now();
     let rebuilt = false;
     // A rebuild that finished in the background goes in now (loop ids change here only).
     if (this.ready) { this.install(); rebuilt = true; }
 
     const fresh = new Map<string, PoolState>();
-    for (const p of poolsIn) if (hasExactMath(p)) fresh.set(lc(p.poolAddress), p);
+    let i = 0;
+    for (const p of poolsIn) {
+      if (hasExactMath(p)) fresh.set(lc(p.poolAddress), p);
+      if ((++i & 255) === 0) yield* brk();
+    }
 
     // Which pools changed price since last time?
     const changed: string[] = [];
     const longOn = this.cfg.maxPools >= this.cfg.longFromPools;
     const bigMoveAt = Math.min(0.5, Math.max(0, this.cfg.longSlack)) / 2;
+    i = 0;
     for (const [k, p] of fresh) {
+      if ((++i & 127) === 0) yield* brk();
       const s = poolSig(p);
       if (this.sigs.get(k) === s) continue;
+      if (!this.sigs.has(k)) this.setDirty = true; // a pool joined the set
       changed.push(k); this.sigs.set(k, s); this.moved.set(k, now);
       const ab = hopCurve(p, true), ba = hopCurve(p, false);
       this.curves.set(k, { ab, ba });
@@ -763,22 +795,41 @@ export class LoopFinder {
         if (was !== undefined && Math.abs(Math.log((ab.g * ab.rout) / ab.rin) - was) > bigMoveAt) this.bigMove = true;
       }
     }
-    for (const k of this.sigs.keys()) if (!fresh.has(k)) { this.sigs.delete(k); this.moved.delete(k); this.curves.delete(k); this.depths.delete(k); }
+    // Pools that left the set (collected first, then removed: a Map must not
+    // be changed while it is being walked across a break).
+    const gone: string[] = [];
+    i = 0;
+    for (const k of this.sigs.keys()) {
+      if (!fresh.has(k)) gone.push(k);
+      if ((++i & 255) === 0) yield* brk();
+    }
+    for (const k of gone) { this.sigs.delete(k); this.moved.delete(k); this.curves.delete(k); this.depths.delete(k); }
+    if (gone.length) this.setDirty = true;
     this.pools = fresh;
 
     // Rebuild the loop list when the pool set changed or a price moved a lot
     // (rate-limited), or when it's old. Only one rebuild at a time.
     if (!this.job) {
-      const setKey = [...fresh.keys()].sort().join(',');
       const due = now - this.lastRebuild >= this.cfg.rebuildMs;
-      const early = (setKey !== this.poolSetKey || this.bigMove) && now - this.lastRebuild >= this.cfg.rebuildMinMs;
+      // The sorted list of pool keys is only built when a pool joined or
+      // left since the last rebuild (before: on every update, a big sort
+      // and join each time). If none did, the set is the same as at the
+      // last rebuild, so the answer is the same.
+      let setChanged = false;
+      let setKey = this.poolSetKey;
+      if (this.setDirty && (due || now - this.lastRebuild >= this.cfg.rebuildMinMs || this.bigMove)) {
+        setKey = [...fresh.keys()].sort().join(',');
+        setChanged = setKey !== this.poolSetKey;
+      }
+      const early = (setChanged || this.bigMove) && now - this.lastRebuild >= this.cfg.rebuildMinMs;
       if (due || early) {
-        this.poolSetKey = setKey; this.lastRebuild = now; this.bigMove = false;
+        this.poolSetKey = setKey; this.lastRebuild = now; this.bigMove = false; this.setDirty = false;
         this.startRebuild(now);
         // Small maps finish in the first slice: put the new list in right away.
         if (this.ready) { this.install(); rebuilt = true; }
       }
     }
+    yield* brk();
 
     // Loops to re-price: those through a changed pool, then any left over
     // from earlier updates (after a rebuild that's every loop).
@@ -794,7 +845,8 @@ export class LoopFinder {
     const done: number[] = [];
     let n = 0;
     for (const id of todo) {
-      if ((++n & 63) === 0 && performance.now() - t0 > budget * 0.6) { this.pending.add(id); continue; }
+      if ((n & 63) === 63) yield* brk();
+      if ((++n & 63) === 0 && work() > budget * 0.6) { this.pending.add(id); continue; }
       if (this.pending.size) { this.pending.add(id); continue; }
       done.push(id);
       const q = this.quickNet(this.cycles[id], now);
@@ -806,7 +858,8 @@ export class LoopFinder {
     for (let j = 0; j < quick.length; j++) {
       const q = quick[j];
       if (j >= this.cfg.exactTopK) { noVerdict.add(q.id); continue; }
-      if (j > 0 && performance.now() - t0 > budget) { noVerdict.add(q.id); this.pending.add(q.id); continue; }
+      if (j > 0 && work() > budget) { noVerdict.add(q.id); this.pending.add(q.id); continue; }
+      if (j > 0) yield* brk(); // one exact check per step (each is a few hundred maths steps)
       const r = this.exact(this.cycles[q.id]);
       if (r && r.netUsd > 0) results.push(r);
     }
@@ -815,7 +868,7 @@ export class LoopFinder {
     // have no verdict: left out of `evaluated`. Loops not reached in time
     // are priced on the next update.
     const evaluated = noVerdict.size ? done.filter((id) => !noVerdict.has(id)) : done;
-    return { results, evaluated, changedPools: changed.length, rebuilt, cycles: this.cycles.length, ms: performance.now() - t0, waiting: this.pending.size };
+    return { results, evaluated, changedPools: changed.length, rebuilt, cycles: this.cycles.length, ms: work(), waiting: this.pending.size };
   }
 
   // Start a rebuild. Order: pools rival loops used first, then pools that

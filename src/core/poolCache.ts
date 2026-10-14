@@ -32,6 +32,43 @@ import { amountInAfterFee } from './dexMath';
 // ----------------------------------------------------------------------------
 const POOL_INDEX_ON = process.env.POOL_INDEX !== '0';
 
+// ----------------------------------------------------------------------------
+// CONFIRMED VIEW (loop fix phase 2, LOOP_REAL_PRICES)
+//
+// Plain English:
+//   The main list holds the bot's BEST GUESS of each pool: when the trade feed
+//   sees a trade it writes a PREDICTED state straight away (upsertFromFeed),
+//   long before the trade is in a block. That is right for 2-pool trades (we
+//   want to act on the trade we just saw), but loops chain 3 to 5 pools, and
+//   small prediction errors add up hop after hop, worst in thin meme pools.
+//
+//   So, only when the loop trader is on (LOOP_TRADER=1) and LOOP_REAL_PRICES
+//   is not 0, the cache also remembers the last state that came from REAL
+//   chain data: a block the block reader read (upsertFromBlock, or
+//   keepBlockState when the main write was skipped) or an RPC re-read
+//   (upsert / upsertIfNotNewer). The trade feed never writes here.
+//
+//   Memory: one small entry per pool, holding a REFERENCE to a state the
+//   main list already made (no copy), except when the main write was skipped
+//   (keepBlockState makes one state object). Entries are removed together
+//   with the pool (prune). Off = nothing is stored at all.
+// ----------------------------------------------------------------------------
+interface Confirmed {
+  pool: PoolState;     // the real-data state (shared with the main list when it was written there too)
+  block: number;       // its block number (0 = not known, e.g. some RPC reads)
+  at: number;          // when it was written (ms)
+  fromBlock: boolean;  // written by the block reader (guards older RPC reads, see upsertIfNotNewer)
+  // Event fees seen after this state was written are on the main copy only:
+  // a merged copy is made once and reused while nothing changes.
+  merged?: { fee: PoolState['observedFee']; pool: PoolState };
+}
+
+// The loop trader switches (read once). Exported for shadowMain and tests.
+export function confirmedViewFromEnv(env: Record<string, string | undefined> = process.env): boolean {
+  const loopsOn = env.LOOP_TRADER === '1' || env.LOOP_TRADER === 'true';
+  return loopsOn && env.LOOP_REAL_PRICES !== '0';
+}
+
 export class PoolCache {
   private pools = new Map<string, PoolState>(); // key: `${chain}:${poolAddress}`
   // Index: chain -> keys of its pools (insertion order = main list order).
@@ -41,9 +78,22 @@ export class PoolCache {
   // Lower-cased tokens a pool was indexed under (to unindex it exactly).
   private indexedAs = new Map<string, { chain: string; a: string; b: string }>();
   readonly indexed: boolean;
+  // Confirmed view (see above). Empty and unused when switched off.
+  private confirmed = new Map<string, Confirmed>();
+  readonly confirmedOn: boolean;
 
-  constructor(opts: { index?: boolean } = {}) {
+  constructor(opts: { index?: boolean; confirmed?: boolean } = {}) {
     this.indexed = opts.index ?? POOL_INDEX_ON;
+    this.confirmedOn = opts.confirmed ?? confirmedViewFromEnv();
+  }
+
+  // Remember a real-data state in the confirmed view. Never called for feed
+  // predictions. An older block never replaces a newer one.
+  private confirm(k: string, pool: PoolState, block: number, now: number, fromBlock: boolean): void {
+    if (!this.confirmedOn) return;
+    const cur = this.confirmed.get(k);
+    if (cur && block > 0 && cur.block > block) return;
+    this.confirmed.set(k, { pool, block, at: now, fromBlock });
   }
 
     private key(chain: ChainName, poolAddress: string) {
@@ -76,12 +126,17 @@ export class PoolCache {
 
   private drop(k: string): void {
     this.pools.delete(k);
+    this.confirmed.delete(k);
     if (this.indexed) { const ent = this.indexedAs.get(k); if (ent) this.unindex(k, ent); }
   }
 
-            upsert(pool: PoolState) {
-                this.put(this.key(pool.chain, pool.poolAddress), pool);
-                  }
+  // Plain write: pool discovery and RPC reads (never the trade feed), so it
+  // also counts as real data for the confirmed view.
+  upsert(pool: PoolState) {
+    const k = this.key(pool.chain, pool.poolAddress);
+    this.put(k, pool);
+    this.confirm(k, pool, pool.lastUpdatedBlock ?? 0, Date.now(), false);
+  }
 
   // RPC refresh write: skip it if the cached copy changed AFTER the read
   // started (the trade feed applied a newer swap while the RPC call was in
@@ -109,9 +164,47 @@ export class PoolCache {
   // overwrite it (lastUpdatedMs is newer than that read's start).
   upsertFromBlock(pool: PoolState, now = Date.now()) {
     const k = this.key(pool.chain, pool.poolAddress);
-    this.put(k, { ...pool, lastUpdatedMs: now });
+    const st = { ...pool, lastUpdatedMs: now };
+    this.put(k, st);
     this.blockApplied.set(k, now);
+    // Same object in the confirmed view (a reference, not a copy).
+    this.confirm(k, st, st.lastUpdatedBlock, now, true);
   }
+
+  // LOOP_KEEP_BLOCK_UPDATES: the block reader read an EXACT state but left
+  // the main list alone (the feed wrote a prediction moments ago, see
+  // shadowMain applyUpdate). Before, that real state was simply thrown away.
+  // Now it goes into the confirmed view only: the main list (and so every
+  // 2-pool trade) is not touched at all. An older block never overwrites a
+  // newer one. Returns true if kept.
+  keepBlockState(pool: PoolState, block: number, now = Date.now()): boolean {
+    if (!this.confirmedOn) return false;
+    const k = this.key(pool.chain, pool.poolAddress);
+    if (!this.pools.has(k)) return false; // only pools the cache knows (keeps memory bounded)
+    const cur = this.confirmed.get(k);
+    if (cur && cur.block > block) return false;
+    this.confirmed.set(k, { pool: { ...pool, lastUpdatedBlock: block, lastUpdatedMs: now }, block, at: now, fromBlock: true });
+    return true;
+  }
+
+  // The last REAL-data state of a pool (block reader or RPC read), never a
+  // feed prediction. undefined = none (or the view is off). Event fees seen
+  // since (kept on the main copy, core/eventFees.ts) are carried over, so
+  // dynamic-fee pools use their latest real fee.
+  getConfirmed(chain: ChainName, poolAddress: string): PoolState | undefined {
+    const k = this.key(chain, poolAddress);
+    const c = this.confirmed.get(k);
+    if (!c) return undefined;
+    const main = this.pools.get(k);
+    if (!main || main === c.pool || main.observedFee === c.pool.observedFee) return c.pool;
+    if (!c.merged || c.merged.fee !== main.observedFee) c.merged = { fee: main.observedFee, pool: { ...c.pool, observedFee: main.observedFee } };
+    return c.merged.pool;
+  }
+
+  // Block number of the confirmed state (for tests / reports). 0 = none or unknown.
+  confirmedBlock(chain: ChainName, poolAddress: string): number { return this.confirmed.get(this.key(chain, poolAddress))?.block ?? 0; }
+  // For tests / memory checks: how many pools have a confirmed state.
+  confirmedCount(): number { return this.confirmed.size; }
   // When the block reader last wrote each pool. An RPC refresh that started
   // before that is never force-written over it (see upsertIfNotNewer).
   private blockApplied = new Map<string, number>();
@@ -143,6 +236,11 @@ export class PoolCache {
     this.skips.delete(k);
     this.feedApplied.delete(k);
     this.put(k, fresh);
+    // Confirmed view: an RPC read is real data, unless the block reader put a
+    // newer exact state there after this read started (keepBlockState can do
+    // that without touching blockApplied above).
+    const c = this.confirmed.get(k);
+    if (!(c && c.fromBlock && c.at > readStartedMs)) this.confirm(k, fresh, fresh.lastUpdatedBlock ?? 0, now, false);
     return true;
   }
 
