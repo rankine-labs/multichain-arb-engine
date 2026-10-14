@@ -76,8 +76,10 @@ type Quote = { px: number; depthUsd: number; pool: string; realUsd: number; sour
 // Oct 14 (freeze phase 1): the one-hop price (TOKEN/WETH then WETH/USDG)
 // worked out WETH's direct price again for EVERY coin priced through WETH,
 // walking all of WETH's pools each time. Now that middle price is kept for
-// the same short time as every other price (memoMs, 1 s), like getUsdPrice
-// already does. Prices can be up to memoMs old either way, as before.
+// HALF of memoMs (0.5 s), and a coin price built from a kept middle price
+// is remembered only until memoMs after that middle price was worked out
+// (not memoMs after the coin price). So no price the oracle hands out is
+// ever more than memoMs (1 s) old, the same limit as before.
 // Switch: ORACLE_MID_MEMO=0 works the middle price out every time (old).
 const MID_MEMO_ON = process.env.ORACLE_MID_MEMO !== '0';
 
@@ -85,6 +87,8 @@ export class PriceOracle {
   private memo = new Map<string, { info: PriceInfo | null; at: number }>();
   // Direct (stablecoin) price of middle coins used by the one-hop search.
   private midMemo = new Map<string, { px: number | null; at: number }>();
+  // Oldest input (kept middle price) used by the price being worked out now.
+  private oldestInput = 0;
 
   constructor(
     private cache: PoolCache,
@@ -115,11 +119,13 @@ export class PriceOracle {
     const t = this.now();
     if (hit && t - hit.at < this.memoMs) return hit.info;
 
+    this.oldestInput = t;
     const best = this.directStablePrice(chain, tokenAddress) ?? this.oneHopStablePrice(chain, tokenAddress);
     // Total pool money ~ 2 x the anchor side (the side we can value), using
     // the capped (real) depth so thin narrow-band V3 pools don't look deep.
     const info: PriceInfo | null = best ? { px: best.px, depthUsd: 2 * best.realUsd, pool: best.pool, depthSource: best.source } : null;
-    this.memo.set(key, { info, at: t });
+    // Kept from the time of its oldest input, so it is never older than memoMs in total.
+    this.memo.set(key, { info, at: Math.min(t, this.oldestInput) });
     if (this.memo.size > 5_000) this.memo.clear(); // bound memory
     return info;
   }
@@ -194,13 +200,13 @@ export class PriceOracle {
     return best;
   }
 
-  // Direct stablecoin price of a middle coin, kept for memoMs (see MID_MEMO_ON).
+  // Direct stablecoin price of a middle coin, kept for memoMs / 2 (see MID_MEMO_ON).
   private midPrice(chain: ChainName, token: string): number | null {
     if (!MID_MEMO_ON || this.memoMs <= 0) return this.directStablePrice(chain, token)?.px ?? null;
     const key = `${chain}:${token.toLowerCase()}`;
     const t = this.now();
     const hit = this.midMemo.get(key);
-    if (hit && t - hit.at < this.memoMs) return hit.px;
+    if (hit && t - hit.at < this.memoMs / 2) { if (hit.at < this.oldestInput) this.oldestInput = hit.at; return hit.px; }
     const px = this.directStablePrice(chain, token)?.px ?? null;
     this.midMemo.set(key, { px, at: t });
     if (this.midMemo.size > 5_000) this.midMemo.clear(); // bound memory

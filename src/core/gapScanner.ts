@@ -144,6 +144,11 @@ export function findStandingGaps(
 //        real coin balances, the coin's USD price, decimals, settings).
 //        A pair where none of that changed reuses its answer; only pairs
 //        touched by the update are worked out again.
+//        What is remembered is every pool combination with its profit
+//        BEFORE gas. Gas (which changes nearly every scan) and the minimum
+//        profit are applied fresh each scan, exactly as the old scan does
+//        (profit - gas > 0 and >= minimum, best first, top perPair), so a
+//        gas change doesn't throw the memory away.
 //     2. It is written as steps (core/chunked.ts): it can pause after any
 //        pair, so the bot never freezes for long; the caller runs it in
 //        small bites with breaks in between for feed messages.
@@ -163,7 +168,8 @@ interface PoolPrint {
 interface PairMemo {
   t0: string; t1: string; quote: string; base: string; quoteUsd: number; d0: number; d1: number;
   prints: PoolPrint[];
-  found: { bi: number; si: number; sizeQuote: number; profitUsd: number }[];
+  // Every combination worked out, in the old scan's order, with profit before gas.
+  cands: { bi: number; si: number; sizeQuote: number; grossUsd: number }[];
   scan: number;   // last scan that saw this pair (pairs not seen are forgotten)
 }
 
@@ -177,9 +183,11 @@ export class GapScanMemo {
   worked = 0;      // pairs worked out again
   size(): number { return this.pairs.size; }
 
-  // Start a new scan; settings changed = forget everything.
+  // Start a new scan; settings that change the remembered maths (loan fee,
+  // trade size cap) changed = forget everything. Gas, the minimum profit and
+  // perPair are applied fresh every scan, so they are not part of this.
   begin(opts: GapOptions): number {
-    const k = `${opts.minProfitUsd}|${opts.flashFee}|${opts.gasUsd}|${opts.maxTradeUsd}|${opts.perPair ?? 1}`;
+    const k = `${opts.flashFee}|${opts.maxTradeUsd}`;
     if (k !== this.optsKey) { this.pairs.clear(); this.optsKey = k; }
     return ++this.scan;
   }
@@ -202,11 +210,12 @@ const samePrint = (a: PoolPrint, b: PoolPrint): boolean =>
   && a.fee === b.fee && a.balBase === b.balBase && a.balQuote === b.balQuote;
 
 // One pair, worked out in full: the same maths, in the same order, as the
-// inner loop of findStandingGaps above. Returns positions in `usable`.
+// inner loop of findStandingGaps above, but keeping EVERY combination with
+// its profit before gas. Returns positions in `usable`.
 function workOutPair(
   usable: PoolState[], t0: string, d0: number, d1: number, base: string, quote: string, quoteUsd: number, opts: GapOptions,
-): PairMemo['found'] {
-  const found: PairMemo['found'] = [];
+): PairMemo['cands'] {
+  const cands: PairMemo['cands'] = [];
   for (let bi = 0; bi < usable.length; bi++) {
     const buy = usable[bi];
     const dB0 = buy.tokenA.toLowerCase() === t0 ? d0 : d1, dB1 = buy.tokenA.toLowerCase() === t0 ? d1 : d0;
@@ -219,11 +228,21 @@ function workOutPair(
       const rs = capToRealBalance(poolReserves(sell, base, dS0, dS1), sell, quote, 'quote', quote === sell.tokenA.toLowerCase() ? dS0 : dS1);
       if (!rs) continue;
       const r = bestArb(rb, feeFraction(buy), rs, feeFraction(sell), opts.flashFee, opts.maxTradeUsd / quoteUsd);
-      const profitUsd = r.profit * quoteUsd - opts.gasUsd;
-      if (profitUsd > 0 && profitUsd >= opts.minProfitUsd) found.push({ bi, si, sizeQuote: r.dx, profitUsd });
+      cands.push({ bi, si, sizeQuote: r.dx, grossUsd: r.profit * quoteUsd });
     }
   }
-  // Best first, keep the top perPair (same stable sort as the old scan).
+  return cands;
+}
+
+// This scan's answer for one pair from its combinations: exactly the old
+// scan's rule (profit after gas > 0 and >= minimum, stable sort best first,
+// top perPair). Same arithmetic: (profit x quoteUsd) - gas.
+function pickGaps(cands: PairMemo['cands'], opts: GapOptions): { bi: number; si: number; sizeQuote: number; profitUsd: number }[] {
+  const found: { bi: number; si: number; sizeQuote: number; profitUsd: number }[] = [];
+  for (const c of cands) {
+    const profitUsd = c.grossUsd - opts.gasUsd;
+    if (profitUsd > 0 && profitUsd >= opts.minProfitUsd) found.push({ bi: c.bi, si: c.si, sizeQuote: c.sizeQuote, profitUsd });
+  }
   return found.sort((a, b) => b.profitUsd - a.profitUsd).slice(0, Math.max(1, opts.perPair ?? 1));
 }
 
@@ -257,19 +276,19 @@ export function* findStandingGapsSteps(
     const dup = seenThisScan.has(key);
     seenThisScan.add(key);
     const m = dup ? undefined : memo.get(key);
-    let found: PairMemo['found'];
+    let cands: PairMemo['cands'];
     if (m && m.t0 === t0 && m.t1 === t1 && m.quote === quote && m.base === base && m.quoteUsd === quoteUsd && m.d0 === d0 && m.d1 === d1
       && m.prints.length === prints.length && m.prints.every((x, i) => samePrint(x, prints[i]))) {
-      found = m.found;
+      cands = m.cands;
       m.scan = scan;
       memo.reused++;
     } else {
-      found = workOutPair(usable, t0, d0, d1, base, quote, quoteUsd, opts);
-      if (!dup) memo.set(key, { t0, t1, quote, base, quoteUsd, d0, d1, prints, found, scan });
+      cands = workOutPair(usable, t0, d0, d1, base, quote, quoteUsd, opts);
+      if (!dup) memo.set(key, { t0, t1, quote, base, quoteUsd, d0, d1, prints, cands, scan });
       memo.worked++;
     }
     const pairKey = [t0, t1].sort().join('/');
-    for (const f of found) {
+    for (const f of pickGaps(cands, opts)) {
       out.push({ pairKey, base, quote, buyPool: usable[f.bi], sellPool: usable[f.si],
         sizeQuote: f.sizeQuote, sizeUsd: f.sizeQuote * quoteUsd, profitUsd: f.profitUsd, quoteUsd });
     }

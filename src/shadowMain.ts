@@ -896,6 +896,9 @@ function venueLabel(p: PoolState): string {
 // Asks the standing-gap scanner to run soon (set up with the scanner below;
 // a no-op until then). Called whenever a pool price changes.
 let requestGapScan: () => void = () => {};
+// Gaps skipped because a pool's price changed while the scan ran in bites
+// (fast gap scan). Shown on the 5-min [stalls] line, then reset.
+let gapStaleSkips = 0;
 const robinhoodWatcher = new PairWatcher('robinhood', robinhoodReadProvider, ROBINHOOD_VENUES, cache,
       // Real decimals/symbols for every discovered token, read from the token itself.
       (addr, meta) => {
@@ -2235,6 +2238,14 @@ await chainManager.startAll();
                   let fired = 0;
                   for (const g of gaps) {
                         if (fired >= 2) break;
+                        // Fast scan runs in bites: a pool may have got a new price
+                        // during a break. Such a gap is skipped (no check budget used,
+                        // pair not muted) and one more scan runs with fresh prices.
+                        if (GAP_SCAN_FAST && (cache.get('robinhood', g.buyPool.poolAddress) !== g.buyPool || cache.get('robinhood', g.sellPool.poolAddress) !== g.sellPool)) {
+                              gapStaleSkips++;
+                              gapAgain = true;
+                              continue;
+                        }
                         const key = `${g.buyPool.poolAddress}>${g.sellPool.poolAddress}`;
                         const sig = `${poolSig(g.buyPool)}|${poolSig(g.sellPool)}`;
                         const bigChanged = g.profitUsd >= BENCH_BYPASS_USD && gapMutedSig.get(key) !== sig;
@@ -3242,7 +3253,9 @@ for (let i = 0; i < resolved.length; i++) {
             console.log(`[speed] ${sp.p95}`);
             // Stall finder: freezes in the last 5 min and what caused them.
             const sf = stallFinder.take('fiveMin');
-            console.log(`[stalls] ${formatStallLine(sf)}`);
+            // Plus how many gaps the fast scan skipped because prices moved during it.
+            console.log(`[stalls] ${formatStallLine(sf)}${gapStaleSkips ? ` · gaps skipped (prices moved during the scan, rescanned): ${gapStaleSkips}` : ''}`);
+            gapStaleSkips = 0;
             const sd = formatStallDetail(sf);
             if (sd) console.log(`[stalls] ${sd}`);
       }), 5 * 60_000);

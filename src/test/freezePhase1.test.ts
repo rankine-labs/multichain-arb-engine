@@ -163,6 +163,21 @@ async function main() {
       if (JSON.stringify(x) !== JSON.stringify(y)) diff++;
     }
     assert(diff === 0, `oracle prices identical: index + middle-price memory vs full walk without memory (${coins.length + 2} coins)`);
+
+    // Staleness stays at memoMs (1 s) in total: WETH's middle price worked out
+    // at t=0 and reused at t=400 must not keep the coin's price past t=1000.
+    let clock = 0;
+    const c2 = new PoolCache({ index: true });
+    const ethUsd = v2(ETH, USD, 1_000, 4_000_000), coinEth = v2(coins[0], ETH, 1_000, 1);
+    c2.upsert(ethUsd); c2.upsert(coinEth); c2.upsert(v2(coins[1], ETH, 1_000, 1));
+    const o2 = new PriceOracle(c2, () => 18, 1_000, () => clock);
+    o2.getUsdPrice('robinhood', coins[1]);           // t=0: works out (and keeps) WETH's middle price
+    clock = 400;
+    const p400 = o2.getUsdPrice('robinhood', coins[0]); // t=400: coin priced from the kept middle price
+    c2.upsert({ ...ethUsd, reserveB: ethUsd.reserveB! * 2n }); // ETH doubles
+    clock = 1_100;
+    const p1100 = o2.getUsdPrice('robinhood', coins[0]);
+    assert(p400 !== null && p1100 !== null && Math.abs(p1100 / p400 - 2) < 1e-9, `coin price built from a kept middle price expires memoMs after the middle price (${p400} -> ${p1100})`);
   }
 
   // ===========================================================================
@@ -236,13 +251,21 @@ async function main() {
         else (p as any).feePips = pick([100, 3000]);                          // changed in place (same object)
       }
       if (round % 60 === 59) opts = { ...opts, minProfitUsd: pick([0.1, 0.5, 2]), perPair: pick([1, 3]) };
+      if (round % 100 === 99) opts = { ...opts, flashFee: pick([0, 0.0005]) };
+      // Gas changes every scan (live gas price x ETH price), like on the server.
+      opts = { ...opts, gasUsd: 0.02 + rnd() * 0.08 };
       const old = findStandingGaps(pairs, decOf, usdOf, opts);
       const fast = drainSteps(findStandingGapsSteps(pairs, decOf, usdOf, opts, memo));
       scans++; totalGaps += old.length;
       if (!sameGaps(old, fast)) diff++;
     }
     assert(diff === 0 && totalGaps > 50, `fast gap scan == old scan on ${scans} random scans with changes (${totalGaps} gaps, ${diff} different)`);
-    assert(memo.reused > memo.worked, `fast scan reuses unchanged pairs (reused ${memo.reused}, worked out ${memo.worked})`);
+    assert(memo.reused > 5 * memo.worked, `fast scan reuses unchanged pairs even with gas changing every scan (reused ${memo.reused}, worked out ${memo.worked})`);
+    // Only gas and the minimum change: every pair comes from memory, answer still identical.
+    const before = memo.worked;
+    const gasOpts = { ...opts, gasUsd: opts.gasUsd + 0.37, minProfitUsd: 0.01 };
+    const gasFast = drainSteps(findStandingGapsSteps(pairs, decOf, usdOf, gasOpts, memo));
+    assert(memo.worked === before && sameGaps(gasFast, findStandingGaps(pairs, decOf, usdOf, gasOpts)), 'gas / minimum change only: memo still hits and gaps == old scan');
 
     // It really pauses: with 0 ms bites, a timer set before the scan runs before it ends.
     let ranBetween = false;
