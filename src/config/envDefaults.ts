@@ -15,9 +15,9 @@
 //     CHECK_RPC_MAIN_DAILY     <- 120000                     (Growth plan: 20M/month = ~650k/day)
 //     CHECK_RPC_FALLBACK       <- QUICKNODE_RPC_ROBINHOOD    (QuickNode as the backup)
 //     CHECK_RPC_FALLBACK_DAILY <- 14000                      (QuickNode's daily allowance)
-//     LOOP_TRADER              <- 1                          (owner approved Oct 13; practice
-//                                                             only, the loop code can't send)
-//   Set LOOP_TRADER=0 in .env to turn loops off again.
+//     LOOP_TRADER              <- 0                          (Oct 14: off by default, loop
+//                                                             scans were the main freeze cause)
+//   Set LOOP_TRADER=1 in .env to turn loops back on (practice only).
 //
 //     BLOCK_READER_WSS         <- CHAINSTACK_WSS_ROBINHOOD   (owner upgraded to Growth Oct 13
 //                                                             and asked for the WebSocket on).
@@ -57,9 +57,14 @@ export function applyEnvDefaults(env: Env): string[] {
     notes.push('block reader WebSocket off (BLOCK_READER_WSS=off)');
   }
 
+  // Oct 14 (owner approved): loops are now OFF by default. The stall finder
+  // showed the loop scan was the biggest cause of bot freezes (754 freezes
+  // over 50 ms in one hour, up to 651 ms each) and of constant memory
+  // clean-up, while 0 loops have been profitable. They come back once the
+  // loop investigation fixes their pricing. LOOP_TRADER=1 in .env turns them on.
   if (!has('LOOP_TRADER')) {
-    env.LOOP_TRADER = '1';
-    notes.push('loop trader ON (practice only; set LOOP_TRADER=0 to turn off)');
+    env.LOOP_TRADER = '0';
+    notes.push('loop trader OFF (set LOOP_TRADER=1 in .env to turn on)');
   }
   return notes;
 }
