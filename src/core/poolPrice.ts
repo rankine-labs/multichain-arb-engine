@@ -186,3 +186,22 @@ export function thinPools(
   }
   return out.sort((x, y) => (y.virtualUsd - y.realUsd) - (x.virtualUsd - x.realUsd));
 }
+
+// Same as thinPools, written as steps (core/chunked.ts): pauses every 200
+// pools so the check can run in small bites (Oct 14: the one-go check froze
+// the bot for up to 339 ms). Same list, same order.
+export function* thinPoolsSteps(
+  pools: PoolState[], decimalsOf: DecimalsLookup, usdOf: (token: string) => number | null, minUsd = POOL_MIN_DEPTH_USD,
+): Generator<void, { pool: PoolState; virtualUsd: number; realUsd: number }[], void> {
+  const out: { pool: PoolState; virtualUsd: number; realUsd: number }[] = [];
+  for (let i = 0; i < pools.length; i++) {
+    const p = pools[i];
+    if ((i % 200) === 199) yield;
+    if (p.poolType !== 'v3' || p.v4) continue;
+    const virtualUsd = poolDepthUsd(p, decimalsOf, usdOf, { virtualOnly: true });
+    if (virtualUsd === null || virtualUsd < minUsd) continue;
+    const realUsd = poolDepthUsd(p, decimalsOf, usdOf);
+    if (realUsd !== null && realUsd < minUsd) out.push({ pool: p, virtualUsd, realUsd });
+  }
+  return out.sort((x, y) => (y.virtualUsd - y.realUsd) - (x.virtualUsd - x.realUsd));
+}

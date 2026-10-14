@@ -1,6 +1,7 @@
 import { isExecutableVenue, isPracticeTestableVenue } from '../config/robinhoodVenues';
 import { readFileSync, writeFileSync, mkdirSync, renameSync } from 'fs';
 import { dirname } from 'path';
+import { markStretch } from './stallFinder';
 import { PoolState } from './types';
 import { PoolCache } from './poolCache';
 import { planBackrun } from './backrunPlanner';
@@ -322,6 +323,7 @@ export class ResearchLane {
             this.busy = true;
             try {
                   await this.process(item.reason, item.q);
+                  markStretch('research lane'); // stall finder name (measurement only)
             } catch (err) {
                   this.log(`[research] test error (ignored): ${(err as Error).message}`);
             } finally {
@@ -372,6 +374,7 @@ export class ResearchLane {
                   const spot = c.source === 'trigger' && c.triggerHash && this.config.replay ? await this.findSpot(c.triggerHash) : null;
                   // Own money first (rivals trade with their own money, 45 of 46).
                   const own = await this.runOne(c, decimals, null, spot);
+                  markStretch('research lane'); // stall finder name (measurement only)
                   rec.own = own.outcome;
                   rec.timing = own.timing;
                   if (own.outcome.kind === 'skipped' && own.outcome.why === 'lane allowance used up') {
@@ -429,6 +432,7 @@ export class ResearchLane {
             } else {
                   r = await this.simulate(this.rpc, 'robinhood', trade, opts);
             }
+            markStretch('research lane'); // stall finder name (measurement only)
             return { outcome: this.toOutcome(r, built.amountIn, decimals, c.usdPerToken), timing };
       }
 

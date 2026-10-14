@@ -1,6 +1,7 @@
 import { ethers } from 'ethers';
 import { readFileSync, writeFileSync, mkdirSync, renameSync } from 'fs';
 import { dirname } from 'path';
+import { markStretch } from './stallFinder';
 import { decodePoolCreatedLog, type RawLog, type ScanFactory } from './universeScan';
 
 // ============================================================================
@@ -195,6 +196,7 @@ export class NewPoolWatch {
       this.expire();
       const addrs = [...this.factoryByAddr.keys(), ...this.pending.keys()];
       const logs = await this.o.getLogs(addrs, from, latest);
+      markStretch('new pool watch'); // stall finder name (measurement only)
       const fresh: PendingPool[] = [];
       const poolLogs: RawLog[] = [];
       for (const l of logs) {

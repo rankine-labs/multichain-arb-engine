@@ -182,6 +182,26 @@ const sh = (cmd) => { try { return execSync(cmd, { cwd: APP_DIR, encoding: 'utf8
 const strip = (l) => l.replace(/^\s*\d+\|[^|]*\|\s*/, '').trim(); // drop pm2 "0|name |" prefix
 const lastMatch = (lines, re) => [...lines].reverse().find((l) => re.test(l));
 const count = (lines, re) => lines.filter((l) => re.test(l)).length;
+// Memory (Oct 14): the bot's latest "[mem] rss ..." line (src/core/memReport.ts,
+// every 5 min), shortened for the page. null = no line yet.
+function memSummary(lines) {
+  const l = lastMatch(lines, /^\[mem\] rss /);
+  if (!l) return null;
+  const m = /^\[mem\] rss (\d+) MB · heap used (\d+) \/ total (\d+) \/ limit (\d+) MB/.exec(l);
+  const peak = /peak rss (\d+) MB, peak heap used (\d+) MB/.exec(l);
+  const sizes = /· sizes: (.*)$/.exec(l);
+  if (!m) return l.replace(/^\[mem\] /, '').slice(0, 300);
+  return `rss ${m[1]} MB (peak ${peak ? peak[1] : '?'}) · real data (heap used) ${m[2]} of ${m[3]} MB, limit ${m[4]} MB`
+    + (sizes ? ` · sizes: ${sizes[1].slice(0, 200)}` : '');
+}
+// Freezes (Oct 14): the bot's latest two "[stalls]" lines (every 5 min):
+// "Freezes over 50 ms: ..." and "Memory clean-up (GC): ...". null = none yet.
+function stallSummary(lines) {
+  const f = lastMatch(lines, /^\[stalls\] Freezes/);
+  if (!f) return null;
+  const g = lastMatch(lines, /^\[stalls\] Memory clean-up/);
+  return f.replace(/^\[stalls\] /, '').slice(0, 300) + (g ? ` · ${g.replace(/^\[stalls\] /, '').slice(0, 300)}` : '');
+}
 // Deploy lock: auto-deploy.sh writes "<sha> <title>" here while live instead of deploying.
 const pendingDeploy = () => { try { return fs.readFileSync(path.join(APP_DIR, 'data', 'deploy-pending.txt'), 'utf8').trim().slice(0, 160); } catch { return ''; } };
 
@@ -354,6 +374,8 @@ async function main() {
     ...liveLines,
     '### Bot',
     `- Up ${upMin} min · ${memMb} MB memory · ${restartsSince} restart(s) since last report`,
+    ...(memSummary(bigTail) ? [`- Memory (last 5 min): ${memSummary(bigTail)}`] : []),
+    ...(stallSummary(bigTail) ? [`- Freezes (last 5 min): ${stallSummary(bigTail)}`] : []),
     `- Code: \`${sha}\``,
     `- Last deploy: ${deploy || 'n/a'}`,
     ...(pendingDeploy() ? [`- Update waiting (deploy locked while live): ${pendingDeploy()}`] : []),
@@ -412,4 +434,4 @@ async function main() {
 // loads this file it just gets the helpers below, nothing is posted.
 if (require.main === module) main().catch((e) => console.error('[status] failed:', e.message));
 
-module.exports = { detectLive, footerText, readLiveRecords, liveSection };
+module.exports = { detectLive, footerText, readLiveRecords, liveSection, memSummary, stallSummary };

@@ -1,4 +1,5 @@
 import { ethers } from 'ethers';
+import { stallFinder } from './stallFinder';
 
 // ============================================================================
 // BLOCK READER -- read every new block's pool events straight from the node.
@@ -246,7 +247,33 @@ function isAheadOfHead(err: any): boolean {
   return /invalid block range|fromblock.*(greater|after|beyond)|block range.*(invalid|beyond)|beyond current head/i.test(msg);
 }
 
+// ----------------------------------------------------------------------------
+// Address set reuse (Oct 14, freeze phase 1)
+// Each poll (4 a second) and each pushed message used to rebuild a set of
+// every watched pool address (thousands of lower-cased strings). When the
+// bot hands over a FROZEN list (it keeps one ready, refreshed about once a
+// second), the set built from it last time is reused: a frozen list can't
+// change, so the set is exactly what a rebuild would give. Any other list
+// is rebuilt every time, as before.
+// ----------------------------------------------------------------------------
+export class AddressSetCache {
+  private src: readonly string[] | null = null;
+  private pm = '';
+  private set = new Set<string>();
+  get(src: readonly string[], pm: string): Set<string> {
+    if (src === this.src && pm === this.pm && Object.isFrozen(src)) return this.set;
+    const s = new Set<string>();
+    for (const a of src) if (a) s.add(a.toLowerCase());
+    if (pm) s.add(pm);
+    this.src = src; this.pm = pm; this.set = s;
+    return s;
+  }
+  // True if the last get() returned a reused set for this very list.
+  reusable(src: readonly string[]): boolean { return src === this.src && Object.isFrozen(src); }
+}
+
 export class BlockReader {
+  private addrCache = new AddressSetCache();
   private readonly o: BlockReaderOptions;
   private readonly pollMs: number;
   private readonly headEveryMs: number;
@@ -358,9 +385,7 @@ export class BlockReader {
 
       // 4. Which contracts to ask about: our pools plus the V4 PoolManager.
       const pm = (this.o.poolManager || '').toLowerCase();
-      const addrSet = new Set<string>();
-      for (const a of this.o.addresses() ?? []) if (a) addrSet.add(a.toLowerCase());
-      if (pm) addrSet.add(pm);
+      const addrSet = this.addrCache.get(this.o.addresses() ?? [], pm);
       const local = !!this.o.localFilter;
       if (addrSet.size === 0) {
         // Nothing to watch. Never send an address-less request (it would
@@ -397,6 +422,9 @@ export class BlockReader {
         ahead = true;
       }
       this.recordTiming(this.now() - started);
+      // Stall finder: the work after the node answered (filter, decode, apply)
+      // is named, up to the end of this poll's stretch (measurement only).
+      stallFinder.mark('block reader decode');
       // Events by type only: keep the ones from our pools (V4: the PoolManager).
       if (local) logs = logs.filter((l) => addrSet.has((l?.address || '').toLowerCase()));
 

@@ -128,8 +128,11 @@ export async function makeCaller(provider: ethers.JsonRpcProvider): Promise<{ ca
       const data = mc3.encodeFunctionData('aggregate3', [slice.map((c) => ({ target: c.target, allowFailure: true, callData: c.data }))]);
       const ret = await rawCall({ target: MULTICALL3, data }); // throws on rate limit / network
       if (ret) {
-        const [results] = mc3.decodeFunctionResult('aggregate3', ret);
-        return results.map((r: any) => (r.success && r.returnData !== '0x' ? r.returnData : null));
+        // Stall finder: decoding a big bundled answer is timed (measurement only).
+        return timed('multicall decode', () => {
+          const [results] = mc3.decodeFunctionResult('aggregate3', ret);
+          return results.map((r: any) => (r.success && r.returnData !== '0x' ? r.returnData : null));
+        });
       }
       if (slice.length === 1) return [await rawCall(slice[0])];
       const mid = Math.ceil(slice.length / 2);

@@ -1,6 +1,7 @@
 import { ethers } from 'ethers';
 import { existsSync, mkdirSync, renameSync, writeFileSync } from 'fs';
 import { dirname } from 'path';
+import { labelled, markStretch } from '../core/stallFinder';
 
 // ============================================================================
 // FAST SENDER + SAFETY GATE
@@ -216,7 +217,8 @@ export class FastSender {
     await this.refreshGas();
     this.nonce = this.live ? await this.readProvider.getTransactionCount(this.wallet.address, 'pending') : 0;
     this.maxAccepted = this.nonce - 1; // everything below the chain's count is already used
-    this.gasTimer = setInterval(() => { this.refreshGas().catch(() => { /* keep last value */ }); }, 2_000);
+    // (Stall finder names only: measurement, nothing about sending changes.)
+    this.gasTimer = setInterval(labelled('gas price read', () => { this.refreshGas().catch(() => { /* keep last value */ }); }), 2_000);
     // Keep the connection to the send endpoint warm (TCP + TLS already open
     // when a trade fires, instead of paying a fresh handshake: ~1 round trip
     // saved). Any reply, even an error, keeps the connection alive.
@@ -230,6 +232,7 @@ export class FastSender {
 
   private async refreshGas() {
     const block = await this.readProvider.getBlock('latest');
+    markStretch('gas price read');
     if (block?.number) {
       const now = Date.now();
       // Learn the real block time from consecutive reads (smoothed).

@@ -4,6 +4,12 @@ import { refreshPoolsBatch } from './pairWatcher';
 import { priceOf } from './poolPrice';
 import { readFileSync, writeFileSync, mkdirSync, renameSync } from 'fs';
 import { dirname } from 'path';
+import { Steps, drainSteps, runSteps } from './chunked';
+import { markStretch } from './stallFinder';
+
+// A finished job with nothing left to do (for the early returns in tickSteps).
+// eslint-disable-next-line require-yield
+function* noSteps<T>(v: T): Steps<T> { return v; }
 
 // ============================================================================
 // CROSS-QUOTE MONITOR -- do tokens priced in USDG and in ETH disagree, and
@@ -74,6 +80,12 @@ const emptyStats = (): GapStats => ({ maxGapPct: 0, maxNetPct: -Infinity, second
 
 export class CrossQuoteMonitor {
   private legs = new Map<string, TokenLeg[]>();     // token -> its USDG and WETH pools
+  // Oct 14 (freeze phase 1): every leg in one list, built once per setup
+  // (the tick used to rebuild it twice per run). Same legs, same order.
+  private allLegs: TokenLeg[] = [];
+  // Run the per-token maths in small bites (yield every few tokens) when
+  // ticked through tickChunked(). Same numbers either way.
+  static readonly TOKENS_PER_BITE = 10;
   private symbols = new Map<string, string>();
   private decimals = new Map<string, number>();
   private day = '';
@@ -151,6 +163,7 @@ export class CrossQuoteMonitor {
     v3.forEach((x, i) => { const f = big(fees[i]); if (f !== null) feeOf.set(x.p.pool.toLowerCase(), Number(f) / 10_000); }); // pips -> %
 
     this.legs.clear();
+    this.allLegs = [];
     for (const [token, xs] of chosen) {
       if (!this.decimals.has(token)) continue;
       this.legs.set(token, xs.map((x) => {
@@ -170,6 +183,7 @@ export class CrossQuoteMonitor {
         };
       }));
     }
+    for (const ls of this.legs.values()) for (const l of ls) this.allLegs.push(l);
     this.lastDepthMs = this.now();
     return this.legs.size;
   }
@@ -187,7 +201,7 @@ export class CrossQuoteMonitor {
   // "deepest pool" choice follows where the money is NOW. A failed read
   // keeps the old number for that pool.
   async refreshDepth(): Promise<void> {
-    const all = [...this.legs.values()].flat();
+    const all = this.allLegs;
     if (!all.length) return;
     const usdg = this.usdg.toLowerCase();
     const bal = await this.callMany(all.map((l) => ({ target: l.quote === 'usdg' ? usdg : this.weth.toLowerCase(), data: SEL_BALANCE + pad(l.pool.poolAddress) })));
@@ -202,21 +216,40 @@ export class CrossQuoteMonitor {
   }
 
   async tick(inOpen: boolean, dayKey: string): Promise<number> {
-    if (!this.legs.size) return 0;
+    return drainSteps(await this.tickSteps(inOpen, dayKey));
+  }
+
+  // Same as tick(), with the per-token maths run in small bites (breaks for
+  // the rest of the bot in between). Same numbers as tick().
+  async tickChunked(inOpen: boolean, dayKey: string): Promise<number> {
+    return runSteps(await this.tickSteps(inOpen, dayKey), 'cross-quote monitor');
+  }
+
+  // Reads (with waits), then returns the maths as steps.
+  private async tickSteps(inOpen: boolean, dayKey: string): Promise<Steps<number>> {
+    if (!this.legs.size) return noSteps(0);
     if (dayKey !== this.day) { this.day = dayKey; this.stats.clear(); }
     if (this.depthRefreshMs > 0 && this.now() - this.lastDepthMs >= this.depthRefreshMs) {
       try { await this.refreshDepth(); } catch { /* keep the old depths; retried next interval */ this.lastDepthMs = this.now(); }
     }
-    const all = [...this.legs.values()].flat();
+    const all = this.allLegs;
     const fresh = await refreshPoolsBatch(this.callMany, all.map((l) => l.pool));
+    markStretch('cross-quote monitor'); // stall finder name (measurement only)
     const byAddr = new Map(fresh.map((p) => [p.poolAddress.toLowerCase(), p]));
     const ethUsd = this.wethUsd();
-    if (!ethUsd) return 0;
+    if (!ethUsd) return noSteps(0);
     const t = this.now();
     const dt = this.lastTickMs ? Math.min(60, (t - this.lastTickMs) / 1000) : 0;
     this.lastTickMs = t;
+    return this.measureSteps(byAddr, ethUsd, dt, inOpen);
+  }
+
+  // The per-token maths (unchanged), pausing every TOKENS_PER_BITE tokens.
+  private *measureSteps(byAddr: Map<string, PoolState>, ethUsd: number, dt: number, inOpen: boolean): Steps<number> {
     let measured = 0;
+    let n = 0;
     for (const [token, legs] of this.legs) {
+      if (++n % CrossQuoteMonitor.TOKENS_PER_BITE === 0) yield;
       // Deepest live pool per quote.
       const best = (q: 'usdg' | 'weth') => legs.filter((l) => l.quote === q && byAddr.has(l.pool.poolAddress.toLowerCase()))
         .sort((a, b) => b.quoteUsd - a.quoteUsd)[0];

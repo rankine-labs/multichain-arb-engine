@@ -5,7 +5,7 @@ import { ChainName, PoolState } from './types';
 import { PoolCache } from './poolCache';
 import { currentHeadBlock } from './eventFees';
 import { makeCaller } from './universeScan';
-import { timed } from './stallFinder';
+import { timed, markStretch } from './stallFinder';
 import {
   resolveAndFetchV2Pool, resolveAndFetchSolidlyV2Pool, resolveAllV3Pools, resolveAllV4Pools,
   refetchV2PoolPrice, refetchV3PoolPrice, refetchV4PoolPrice,
@@ -385,6 +385,8 @@ export async function refreshPoolsBatch(
     else if (p.poolType === 'v2') calls.push({ target: p.poolAddress, data: SEL_RESERVES });
   }
   const res = await callMany(calls);
+  // Stall finder: turning the node's answer into pool records (measurement only).
+  markStretch('pool read decode');
   const word = (r: string | null, i: number) => (r && r.length >= 2 + 64 * (i + 1) ? BigInt('0x' + r.slice(2 + 64 * i, 2 + 64 * (i + 1))) : null);
   const now = Date.now();
   // Chain block at (just after) the read, for event-fee freshness (core/eventFees.ts).
@@ -651,11 +653,12 @@ export class PairWatcher {
   // Background price refresh for every watched pool.
   start(): void {
     if (this.refreshTimer) return;
-    this.refreshTimer = setInterval(() => { this.refreshAll().catch(() => { /* best effort */ }); }, this.refreshMs);
+    // Stall finder names (measurement only): the 5 s price re-sync and the pinned-pair retry.
+    this.refreshTimer = setInterval(() => { timed('watch list refresh', () => this.refreshAll()).catch(() => { /* best effort */ }); }, this.refreshMs);
     // Pinned pairs (from the scan / start list) are known to have 2+ pools.
     // If discovery found fewer (usually a rate-limited lookup, which looks
     // like "no pool"), try again every 15 min instead of never.
-    this.retryTimer = setInterval(() => { this.retryPinned(); }, this.pinnedRetryMs);
+    this.retryTimer = setInterval(() => { timed('watch list retry', () => this.retryPinned()); }, this.pinnedRetryMs);
   }
 
   private readonly pinnedRetryMs = Number(process.env.PINNED_RETRY_MS ?? 15 * 60_000);

@@ -126,3 +126,155 @@ export function findStandingGaps(
   }
   return out.sort((a, b) => b.profitUsd - a.profitUsd);
 }
+
+// ============================================================================
+// FAST GAP SCAN (Oct 14, freeze phase 1)
+//
+// Plain English:
+//   The scan above runs after every price change (every block, several times
+//   a second) and redoes the maths for EVERY watched coin pair, even though
+//   a block usually moves only a few pools. The hourly report showed it
+//   freezing the bot for up to 600-700 ms (most of that was the price
+//   oracle, fixed separately; see poolCache.ts and priceOracle.ts).
+//
+//   This version gives EXACTLY the same list of gaps for the same input
+//   (a test checks this on thousands of random cases), but:
+//     1. It remembers each pair's answer together with everything the
+//        answer depends on (each pool's reserves / price / liquidity, fee,
+//        real coin balances, the coin's USD price, decimals, settings).
+//        A pair where none of that changed reuses its answer; only pairs
+//        touched by the update are worked out again.
+//     2. It is written as steps (core/chunked.ts): it can pause after any
+//        pair, so the bot never freezes for long; the caller runs it in
+//        small bites with breaks in between for feed messages.
+//
+//   Switch: GAP_SCAN_FAST=0 in shadowMain uses the old one-go scan.
+// ============================================================================
+
+// Everything one pool contributes to a pair's answer.
+interface PoolPrint {
+  addr: string; type: string; tokenA: string;
+  ra: unknown; rb: unknown; sq: unknown; liq: unknown;  // reserves / price / liquidity as stored
+  fee: number;                                          // fee fraction used
+  balBase: bigint | undefined; balQuote: bigint | undefined; // real balances (V3 cap)
+}
+// One remembered pair: its inputs and its answer (pool positions, not objects,
+// so a new object with the same numbers still gives the current objects back).
+interface PairMemo {
+  t0: string; t1: string; quote: string; base: string; quoteUsd: number; d0: number; d1: number;
+  prints: PoolPrint[];
+  found: { bi: number; si: number; sizeQuote: number; profitUsd: number }[];
+  scan: number;   // last scan that saw this pair (pairs not seen are forgotten)
+}
+
+// Memory for one caller of the fast scan (use one per call site: the
+// settings are part of what is remembered).
+export class GapScanMemo {
+  private pairs = new Map<string, PairMemo>();
+  private optsKey = '';
+  private scan = 0;
+  reused = 0;      // pairs answered from memory (lifetime, for the log / tests)
+  worked = 0;      // pairs worked out again
+  size(): number { return this.pairs.size; }
+
+  // Start a new scan; settings changed = forget everything.
+  begin(opts: GapOptions): number {
+    const k = `${opts.minProfitUsd}|${opts.flashFee}|${opts.gasUsd}|${opts.maxTradeUsd}|${opts.perPair ?? 1}`;
+    if (k !== this.optsKey) { this.pairs.clear(); this.optsKey = k; }
+    return ++this.scan;
+  }
+  get(key: string): PairMemo | undefined { return this.pairs.get(key); }
+  set(key: string, m: PairMemo): void { this.pairs.set(key, m); }
+  // Forget pairs the last scan didn't see (pair dropped from the watch list).
+  endScan(scan: number): void { for (const [k, m] of this.pairs) if (m.scan !== scan) this.pairs.delete(k); }
+}
+
+function printOf(p: PoolState, base: string, quote: string): PoolPrint {
+  return {
+    addr: p.poolAddress, type: p.poolType, tokenA: p.tokenA,
+    ra: p.reserveA, rb: p.reserveB, sq: p.sqrtPriceX96, liq: p.liquidity,
+    fee: feeFraction(p),
+    balBase: realBalanceOf(p, base), balQuote: realBalanceOf(p, quote),
+  };
+}
+const samePrint = (a: PoolPrint, b: PoolPrint): boolean =>
+  a.addr === b.addr && a.type === b.type && a.tokenA === b.tokenA && a.ra === b.ra && a.rb === b.rb && a.sq === b.sq && a.liq === b.liq
+  && a.fee === b.fee && a.balBase === b.balBase && a.balQuote === b.balQuote;
+
+// One pair, worked out in full: the same maths, in the same order, as the
+// inner loop of findStandingGaps above. Returns positions in `usable`.
+function workOutPair(
+  usable: PoolState[], t0: string, d0: number, d1: number, base: string, quote: string, quoteUsd: number, opts: GapOptions,
+): PairMemo['found'] {
+  const found: PairMemo['found'] = [];
+  for (let bi = 0; bi < usable.length; bi++) {
+    const buy = usable[bi];
+    const dB0 = buy.tokenA.toLowerCase() === t0 ? d0 : d1, dB1 = buy.tokenA.toLowerCase() === t0 ? d1 : d0;
+    const rb = capToRealBalance(poolReserves(buy, base, dB0, dB1), buy, base, 'base', base.toLowerCase() === buy.tokenA.toLowerCase() ? dB0 : dB1);
+    if (!rb) continue;
+    for (let si = 0; si < usable.length; si++) {
+      const sell = usable[si];
+      if (sell === buy) continue;
+      const dS0 = sell.tokenA.toLowerCase() === t0 ? d0 : d1, dS1 = sell.tokenA.toLowerCase() === t0 ? d1 : d0;
+      const rs = capToRealBalance(poolReserves(sell, base, dS0, dS1), sell, quote, 'quote', quote === sell.tokenA.toLowerCase() ? dS0 : dS1);
+      if (!rs) continue;
+      const r = bestArb(rb, feeFraction(buy), rs, feeFraction(sell), opts.flashFee, opts.maxTradeUsd / quoteUsd);
+      const profitUsd = r.profit * quoteUsd - opts.gasUsd;
+      if (profitUsd > 0 && profitUsd >= opts.minProfitUsd) found.push({ bi, si, sizeQuote: r.dx, profitUsd });
+    }
+  }
+  // Best first, keep the top perPair (same stable sort as the old scan).
+  return found.sort((a, b) => b.profitUsd - a.profitUsd).slice(0, Math.max(1, opts.perPair ?? 1));
+}
+
+// The fast scan as steps: `yield` after each pair (a safe place to pause).
+// Run with drainSteps() (all at once) or runSteps() (in small bites).
+// Same result as findStandingGaps(pairs, decimalsOf, usdOf, opts).
+export function* findStandingGapsSteps(
+  pairs: PoolState[][],
+  decimalsOf: (token: string) => number | undefined,
+  usdOf: (token: string) => number | null,
+  opts: GapOptions,
+  memo: GapScanMemo = new GapScanMemo(),
+): Generator<void, StandingGap[], void> {
+  const scan = memo.begin(opts);
+  const seenThisScan = new Set<string>();
+  const out: StandingGap[] = [];
+  for (const pools of pairs) {
+    const usable = pools.filter((p) => p.poolType === 'v2' || p.poolType === 'v3');
+    if (usable.length < 2) continue;
+    const t0 = usable[0].tokenA.toLowerCase(), t1 = usable[0].tokenB.toLowerCase();
+    const d0 = decimalsOf(t0), d1 = decimalsOf(t1);
+    if (d0 === undefined || d1 === undefined) continue; // never guess decimals
+    const u1 = usdOf(t1), u0 = usdOf(t0);
+    const [quote, base, quoteUsd] = u1 ? [t1, t0, u1] : u0 ? [t0, t1, u0] : [null, null, 0];
+    if (!quote || !base || !(quoteUsd > 0)) continue;
+
+    // What this pair's answer depends on, right now.
+    const prints = usable.map((p) => printOf(p, base, quote));
+    const key = `${t0}/${t1}`;
+    // The same coin pair twice in one scan (not normal): work it out without memory.
+    const dup = seenThisScan.has(key);
+    seenThisScan.add(key);
+    const m = dup ? undefined : memo.get(key);
+    let found: PairMemo['found'];
+    if (m && m.t0 === t0 && m.t1 === t1 && m.quote === quote && m.base === base && m.quoteUsd === quoteUsd && m.d0 === d0 && m.d1 === d1
+      && m.prints.length === prints.length && m.prints.every((x, i) => samePrint(x, prints[i]))) {
+      found = m.found;
+      m.scan = scan;
+      memo.reused++;
+    } else {
+      found = workOutPair(usable, t0, d0, d1, base, quote, quoteUsd, opts);
+      if (!dup) memo.set(key, { t0, t1, quote, base, quoteUsd, d0, d1, prints, found, scan });
+      memo.worked++;
+    }
+    const pairKey = [t0, t1].sort().join('/');
+    for (const f of found) {
+      out.push({ pairKey, base, quote, buyPool: usable[f.bi], sellPool: usable[f.si],
+        sizeQuote: f.sizeQuote, sizeUsd: f.sizeQuote * quoteUsd, profitUsd: f.profitUsd, quoteUsd });
+    }
+    yield;
+  }
+  memo.endScan(scan);
+  return out.sort((a, b) => b.profitUsd - a.profitUsd);
+}

@@ -3,6 +3,7 @@ import {
       ChainCapability, RawChainEvent, PreparedTransaction, FireResult,
 } from '../core/types';
 import { parseFeedFrame, maxSequenceNumber } from './nitroFeed';
+import { labelled } from '../core/stallFinder';
 
 // ============================================================================
 // ROBINHOOD CHAIN ADAPTER
@@ -85,7 +86,9 @@ export class RobinhoodChainAdapter implements ChainCapability {
                     finish();
               });
 
-              ws.on('message', (raw: WebSocket.RawData) => {
+              // Stall finder: each feed frame (parse + split into trades) is
+              // timed as "feed frame"; the trades' own work as "feed trade".
+              ws.on('message', labelled('feed frame', (raw: WebSocket.RawData) => {
                     const receivedAtMs = Date.now();
                     this.lastMessageAtMs = receivedAtMs;
 
@@ -118,7 +121,7 @@ export class RobinhoodChainAdapter implements ChainCapability {
                           };
                           for (const h of this.handlers) h(event);
                     }
-              });
+              }));
 
               ws.on('error', (err) => {
                     console.error('[robinhood] feed error', err.message);

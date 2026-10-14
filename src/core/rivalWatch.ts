@@ -1,6 +1,7 @@
 import { ethers } from 'ethers';
 import { readFileSync, mkdirSync, renameSync, openSync, writeSync, closeSync } from 'fs';
 import { dirname } from 'path';
+import { markStretch } from './stallFinder';
 
 // ============================================================================
 // RIVAL WATCH -- learn from the other arbitrage bots (Stage 0).
@@ -479,6 +480,7 @@ export class RivalWatch {
         this.queue.shift();
         try {
           const r = await this.rpc('eth_getTransactionReceipt', [job.hash]);
+          markStretch('rival watch'); // stall finder name (measurement only)
           const rcpt = r?.result ?? r;
           if (rcpt?.blockNumber) {
             const rec = this.toRec(rcpt, job.bot, this.now(), { value: job.value });
@@ -607,6 +609,7 @@ export class RivalWatch {
   //     many come from bots we already follow.
   async sampleBlock(blockTag: string): Promise<number> {
     const r = await this.rpc('eth_getBlockReceipts', [blockTag]);
+    markStretch('rival watch sample'); // stall finder name (measurement only)
     const rcpts: any[] = r?.result ?? r ?? [];
     if (!Array.isArray(rcpts)) return 0;
     const bn = Number(BigInt(blockTag));
