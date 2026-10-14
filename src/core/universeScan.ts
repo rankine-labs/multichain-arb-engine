@@ -1,5 +1,7 @@
 import { ethers } from 'ethers';
 import { v4Asks, findV4Pools } from './v4Lookup';
+import { Steps, drainSteps, runSteps } from './chunked';
+import { timed } from './stallFinder';
 
 // ============================================================================
 // UNIVERSE SCAN -- find EVERY pair that exists on 2+ pools, chain-wide
@@ -72,6 +74,9 @@ export interface ScanOptions {
   maxLogRange?: number;
   // Uniswap V4, asked per pair (core/v4Lookup.ts). Leave out to skip V4.
   v4?: { stateView: string; poolManager: string; maxPairs?: number; pauseMs?: number };
+  // Go over the full pool list in ~5 ms bites (core/chunked.ts) instead of
+  // one long freeze. Same result either way. STALL_FIX_SCAN_EXPAND=0 = off.
+  chunked?: boolean;
 }
 
 const MULTICALL3 = '0xcA11bde05977b3631167028862bE2a173976CA11';
@@ -284,11 +289,21 @@ export function emptyScanState(): ScanState {
 }
 
 export function stateToPools(state: ScanState): ScannedPool[] {
+  return drainSteps(stateToPoolsSteps(state));
+}
+
+// The same list as stateToPools(), written as steps (core/chunked.ts) so it
+// can be built in ~5 ms bites with runSteps() instead of freezing the bot
+// while ~400,000 pools are expanded. Same code, so the same result.
+export function* stateToPoolsSteps(state: ScanState): Steps<ScannedPool[]> {
   // Guard (Oct 9): a V4 scan was briefly live and may have saved V4 pools
   // (32-byte ids, not addresses) in the state. This code can't read them,
   // so they are skipped instead of being sent normal pool calls.
   const out: ScannedPool[] = [];
-  for (const [fi, pool, i0, i1] of state.pools) {
+  const n = state.pools.length;
+  for (let i = 0; i < n; i++) {
+    if ((i & 2047) === 2047) yield;   // a safe place for a break
+    const [fi, pool, i0, i1] = state.pools[i];
     const [dex, kind] = state.factories[fi].split('|');
     if (kind === 'v4' || pool.length !== 42) continue;
     out.push({ dex, kind: kind as ScannedPool['kind'], pool, token0: state.tokens[i0], token1: state.tokens[i1] });
@@ -453,22 +468,36 @@ export async function scanUniverse(
       errors.push(`${f.dex}: ${String((err as any)?.shortMessage ?? (err as any)?.message ?? err).slice(0, 120)}`);
     }
   }
-  const all = stateToPools(state);
-  const poolsPerDex: Record<string, number> = {};
-  for (const f of factories) poolsPerDex[f.dex] = 0;
-  for (const p of all) poolsPerDex[p.dex] = (poolsPerDex[p.dex] ?? 0) + 1;
+  // Steps 1b-2 go over every pool on the chain (~400,000 on Robinhood).
+  // Written as steps (core/chunked.ts): with opts.chunked they run in ~5 ms
+  // bites so the bot keeps reading trades meanwhile; the result is the same.
+  function* prepare(): Steps<{ all: ScannedPool[]; poolsPerDex: Record<string, number>; multi: ScannedPool[]; multiSet: Set<ScannedPool>; relevant: ScannedPool[] }> {
+    const all: ScannedPool[] = yield* stateToPoolsSteps(state);
+    const poolsPerDex: Record<string, number> = {};
+    for (const f of factories) poolsPerDex[f.dex] = 0;
+    for (let i = 0; i < all.length; i++) { if ((i & 4095) === 4095) yield; const p = all[i]; poolsPerDex[p.dex] = (poolsPerDex[p.dex] ?? 0) + 1; }
 
-  // 2) Only pairs on 2+ pools can be arbitraged. Read balances for those,
-  //    plus each of their tokens' pools against USDG/WETH (to price them).
-  const count = new Map<string, number>();
-  for (const p of all) { const k = pairKey(p); count.set(k, (count.get(k) ?? 0) + 1); }
-  const multi = all.filter((p) => (count.get(pairKey(p)) ?? 0) >= 2);
-  const quote = new Set([lc(opts.usdToken), lc(opts.wrappedNative)]);
-  const needPrice = new Set(multi.flatMap((p) => [lc(p.token0), lc(p.token1)]));
-  const multiSet = new Set(multi);
-  const pricing = all.filter((p) => !multiSet.has(p) && (
-    (quote.has(lc(p.token0)) && needPrice.has(lc(p.token1))) || (quote.has(lc(p.token1)) && needPrice.has(lc(p.token0)))));
-  const relevant = multi.concat(pricing);
+    // 2) Only pairs on 2+ pools can be arbitraged. Read balances for those,
+    //    plus each of their tokens' pools against USDG/WETH (to price them).
+    const count = new Map<string, number>();
+    for (let i = 0; i < all.length; i++) { if ((i & 2047) === 2047) yield; const k = pairKey(all[i]); count.set(k, (count.get(k) ?? 0) + 1); }
+    const multi: ScannedPool[] = [];
+    for (let i = 0; i < all.length; i++) { if ((i & 2047) === 2047) yield; if ((count.get(pairKey(all[i])) ?? 0) >= 2) multi.push(all[i]); }
+    count.clear();
+    const quote = new Set([lc(opts.usdToken), lc(opts.wrappedNative)]);
+    const needPrice = new Set<string>();
+    for (const p of multi) { needPrice.add(lc(p.token0)); needPrice.add(lc(p.token1)); }
+    const multiSet = new Set(multi);
+    const pricing: ScannedPool[] = [];
+    for (let i = 0; i < all.length; i++) {
+      if ((i & 2047) === 2047) yield;
+      const p = all[i];
+      if (!multiSet.has(p) && (
+        (quote.has(lc(p.token0)) && needPrice.has(lc(p.token1))) || (quote.has(lc(p.token1)) && needPrice.has(lc(p.token0))))) pricing.push(p);
+    }
+    return { all, poolsPerDex, multi, multiSet, relevant: multi.concat(pricing) };
+  }
+  const { all, poolsPerDex, multi, multiSet, relevant } = opts.chunked ? await runSteps(prepare(), 'chain-wide scan processing') : timed('chain-wide scan processing', () => drainSteps(prepare()));
   log(`[scan] ${all.length} pools total; reading balances for ${relevant.length}`);
 
   const balCalls: Call[] = [];

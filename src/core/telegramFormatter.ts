@@ -309,6 +309,9 @@ export interface PlainHourlyInput {
   memory?: string; // one memory line (core/memReport.ts); absent when MEM_LOG=0
   // Stage timers (core/stageTimer.ts): where fire-ready time goes, median and p95 lines.
   speed?: { median: string; p95: string };
+  // Stall finder (core/stallFinder.ts): "Freezes over 50 ms: ..." plus a GC /
+  // longest-steps line. Shown right under the speed lines.
+  stalls?: string[];
   // Phase 8 (Oct 8): our own costs and results, in plain numbers.
   ourGas?: { ownUsd: number | null; flashUsd: number | null }; // our contract's gas per trade, right now
   // "Costs used: gas X¢ (live, margin 1.3x; ...) · dynamic fees from events: N pools" (core/gasModel.ts costsLine)
@@ -464,6 +467,7 @@ export function formatPlainHourly(r: PlainHourlyInput): string {
     L.push(`Other bots timed: ${o.timed}${o.theirMs !== null && o.oursMs !== null ? `. Them ${secs(o.theirMs)}, us ${secs(o.oursMs)}` : ''}${o.weBeat ? `, we'd have been first ${o.weBeat}x` : ''}`);
   }
   if (r.speed) { L.push(esc(r.speed.median)); L.push(esc(r.speed.p95.replace('Where the time goes (p95)', 'Slowest 5%'))); }
+  for (const s of r.stalls ?? []) if (s) L.push(esc(s));
   L.push('');
 
   // What the other bots did: where the real money is, and how they make it.

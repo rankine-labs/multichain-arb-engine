@@ -5,6 +5,7 @@ import { ChainName, PoolState } from './types';
 import { PoolCache } from './poolCache';
 import { currentHeadBlock } from './eventFees';
 import { makeCaller } from './universeScan';
+import { timed } from './stallFinder';
 import {
   resolveAndFetchV2Pool, resolveAndFetchSolidlyV2Pool, resolveAllV3Pools, resolveAllV4Pools,
   refetchV2PoolPrice, refetchV3PoolPrice, refetchV4PoolPrice,
@@ -691,9 +692,13 @@ export class PairWatcher {
       // Read started now: anything the trade feed wrote after this moment is
       // newer than (or at best equal to) what the RPC returns, so keep it.
       const readStartedMs = Date.now();
-      for (const fresh of await refreshPoolsBatch(this.callMany, pools, { hookedFeeOf: this.hookedFeeOf })) this.cache.upsertIfNotNewer(fresh, readStartedMs);
-      this.lastRefreshMs = Date.now();
-      try { this.onRefreshed?.(); } catch { /* a listener error must not break refreshing */ }
+      const freshList = await refreshPoolsBatch(this.callMany, pools, { hookedFeeOf: this.hookedFeeOf });
+      // Stall finder: times writing the re-read prices (measurement only).
+      timed('watch list refresh', () => {
+        for (const fresh of freshList) this.cache.upsertIfNotNewer(fresh, readStartedMs);
+        this.lastRefreshMs = Date.now();
+        try { this.onRefreshed?.(); } catch { /* a listener error must not break refreshing */ }
+      });
     } finally {
       this.refreshing = false;
     }
