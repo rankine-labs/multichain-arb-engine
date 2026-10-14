@@ -1,6 +1,7 @@
 import { readFileSync, writeFileSync, mkdirSync, renameSync } from 'fs';
 import { dirname } from 'path';
 import type { ScannedPool, ScanState } from './universeScan';
+import { Pacer } from './chunked';
 
 // ============================================================================
 // TOKEN GROUPS -- coins that should be worth the same (loop measurement, step 1)
@@ -239,8 +240,17 @@ export async function buildTokenGroups(deps: {
   minDepthUsd?: number;               // pool money needed to count (default MIN_GROUP_DEPTH_USD)
   depthSlice?: number;                // pools per cheap depth-check slice (default 4,000)
   log?: (m: string) => void;
+  // Take short breaks inside the long walks over every pool / coin (default
+  // on), so trades can get through. Same result; false = no breaks (old way).
+  paced?: boolean;
+  paceMs?: number;                    // work between breaks (default 5 ms; tests use 0)
 }): Promise<TokenGroupsResult> {
   const log = deps.log ?? (() => {});
+  // FREEZE FIX PHASE 2 (Oct 14): the walks below go over every pool and coin
+  // on the chain (hundreds of thousands), each in one go, which froze the bot
+  // for a long time every 6 hours. Now each walk takes a short break about
+  // every 5 ms (see Pacer in core/chunked.ts). Same answers, same order.
+  const pacer = new Pacer('coin groups build', deps.paceMs ?? 5, deps.paced !== false);
   const usdg = deps.usdg.toLowerCase(), weth = deps.weth.toLowerCase();
   // Coins with a pool against USDG or WETH. A plain set, not a pool list
   // per coin: with ~400,000 such coins the lists cost ~70 MB for nothing.
@@ -250,11 +260,21 @@ export async function buildTokenGroups(deps: {
     return a === usdg || a === weth ? b : b === usdg || b === weth ? a : null;
   };
   const quoted = new Set<string>();
-  for (const p of deps.pools) { const o = otherSide(p); if (o) quoted.add(o); }
+  for (const p of deps.pools) {
+    const o = otherSide(p); if (o) quoted.add(o);
+    if (pacer.due()) await pacer.rest();
+  }
 
   // 1) Symbols of coins paired with USDG/WETH that we haven't read yet.
   const cache = loadSymbolCache(deps.symbolCacheFile);
-  const todo = deps.state.tokens.slice(cache.upTo).filter((t) => quoted.has(t.toLowerCase()) && !(t.toLowerCase() in cache.symbols));
+  // (Same as tokens.slice(upTo).filter(...), written as a loop so it can
+  // take breaks. The list length is noted first, like slice() did.)
+  const todo: string[] = [];
+  for (let i = cache.upTo, end = deps.state.tokens.length; i < end; i++) {
+    const t = deps.state.tokens[i];
+    if (quoted.has(t.toLowerCase()) && !(t.toLowerCase() in cache.symbols)) todo.push(t);
+    if (pacer.due()) await pacer.rest();
+  }
   // On a big chain this is thousands of names on the gentle scan lane, so it
   // can take a while. Two things keep it visible and restart-safe:
   //  - a progress line every `progressEvery` bundles (the status page shows
@@ -304,6 +324,7 @@ export async function buildTokenGroups(deps: {
   const fixedTok = new Set<string>();
   let named = 0;
   for (const t in cache.symbols) {
+    if (pacer.due()) await pacer.rest();
     const sym = cache.symbols[t];
     if (!sym || !quoted.has(t)) continue;
     named++;
@@ -345,7 +366,12 @@ export async function buildTokenGroups(deps: {
   };
 
   // a) WETH's price: its deepest pool against USDG.
-  const anchorRead = await readPools(deps.pools.filter((p) => !p.stable && isAnchor(p)));
+  const anchorPools: ScannedPool[] = [];
+  for (const p of deps.pools) {
+    if (!p.stable && isAnchor(p)) anchorPools.push(p);
+    if (pacer.due()) await pacer.rest();
+  }
+  const anchorRead = await readPools(anchorPools);
   let wethUsd = 0, bestW = 0;
   for (const r of anchorRead) {
     const usdAmt = r.p.token0.toLowerCase() === usdg ? r.a0 : r.a1;
@@ -381,6 +407,7 @@ export async function buildTokenGroups(deps: {
     await sleep(deps.pauseMs ?? 2_000);
   };
   for (const p of deps.pools) {
+    if (pacer.due()) await pacer.rest();
     if (p.stable || isAnchor(p)) continue;
     const t = otherSide(p);
     if (!t || t === usdg || t === weth || !cache.symbols[t]) continue; // not a USDG/WETH pool, or an unnamed coin

@@ -39,6 +39,22 @@ export function checkVsEstimateText(cv: LoopCheckSummary): string {
   return `check vs estimate: median estimate ${est}, median result ${res}, median delay ${dly}; losses quick (<1s) ${cv.lossesQuick}, slow ${cv.lossesSlow}${fail}`;
 }
 
+// "model vs check (profit before gas): right after trigger 4: model said
+// $1.20, check said $0.30, gap 75% (3 lost); latest 2: ...". One part per
+// check timing (LOOP_MODEL_VS_CHECK). A losing check counts as $0 (the
+// contract doesn't say how much it lost), so the real gap on losses is
+// at least what is shown. null = nothing to show.
+export function modelVsCheckText(cv: LoopCheckSummary): string | null {
+  const rows = cv.modelVsCheck;
+  if (!rows || !rows.length) return null;
+  const parts = rows.map((r) => {
+    const gap = r.modelUsd > 0 ? `${Math.round((1 - r.checkUsd / r.modelUsd) * 100)}%` : 'n/a';
+    const lost = r.losses ? ` (${r.losses} lost, loss size unknown so counted as $0)` : '';
+    return `${esc(r.timing)} ${r.n}: model said ${signedMoney(r.modelUsd)}, check said ${signedMoney(r.checkUsd)}, gap ${gap}${lost}`;
+  });
+  return `model vs check (profit before gas, by timing): ${parts.join('; ')}`;
+}
+
 // extra: the loop trader's extra single pools (core/loopExtraPools.ts), when on.
 export function formatLoopHour(h: LoopHour, maxPools: number, extra?: { fresh: number; selected: number } | null): string {
   const L: string[] = [];
@@ -48,6 +64,8 @@ export function formatLoopHour(h: LoopHour, maxPools: number, extra?: { fresh: n
   if (h.checked) L.push(`  checks that lost: ${h.lost}, wouldn't go through: ${h.failed}`);
   const cv = h.checkVsEstimate;
   if (cv && cv.n) L.push(`  ${checkVsEstimateText(cv)}`);
+  const mvc = cv ? modelVsCheckText(cv) : null;
+  if (mvc) L.push(`  ${mvc}`);
   if (h.skippedCap) L.push(`  not checked (loop check limit or line busy): ${h.skippedCap}`);
   if (h.cantRunWhy.length) L.push(`  can't run because: ${h.cantRunWhy.slice(0, 3).map(([w, n]) => `${esc(w)} ${n}`).join('; ')}`);
   h.topRoutes.forEach((r, i) => L.push(`  ${i + 1}) ${esc(r.label)}: ${r.n}x, best ${money(r.bestUsd)}`));
@@ -61,7 +79,7 @@ export function formatLoopHour(h: LoopHour, maxPools: number, extra?: { fresh: n
   if (extra) L.push(`  extra single pools watched: ${extra.selected} (${extra.fresh} with a fresh price now)`);
   if (h.updates) {
     const rb = h.rebuild ? `; last list rebuild ${secs(h.rebuild.totalMs)} in slices of at most ${h.rebuild.maxSliceMs.toFixed(1)} ms` : '';
-    L.push(`Finder speed: ${h.updates} updates, typical ${h.medianMs!.toFixed(1)} ms, slowest ${h.slowestMs!.toFixed(1)} ms; ${h.cycles} loops watched${h.capped ? ' (list hit its cap)' : ''} (${byLengthText(h.cyclesByLen, maxPools)})${rb}`);
+    L.push(`Finder speed: ${h.updates} updates, typical ${h.medianMs!.toFixed(1)} ms, slowest ${h.slowestMs!.toFixed(1)} ms; ${h.cycles} loops watched${h.capped ? ' (list hit its cap)' : ''} (${byLengthText(h.cyclesByLen, maxPools)})${rb}${h.skippedScans ? `; ${h.skippedScans} scans skipped (nothing changed)` : ''}`);
   }
   return L.join('\n');
 }

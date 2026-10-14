@@ -89,7 +89,7 @@ import { ROBINHOOD_SCAN_FACTORIES } from './config/knownAddresses';
 // from V4's history (that ran out of memory twice on Oct 9). RH_V4_SCAN=0 off.
 const RH_V4_SCAN = process.env.RH_V4_SCAN !== '0';
 import { buildExecuteCall, executionRequested, executorConfig, pickV3Lender, kindForPool } from './execution/executorCalldata';
-import { GasModel, GasCalibration, gasSettingsFromEnv, routeKeyFor, twoPoolKey, defaultUnitsFor, costsLine } from './core/gasModel';
+import { GasModel, GasCalibration, gasSettingsFromEnv, routeKeyFor, twoPoolKey, defaultUnitsFor, costsLine, loopKey } from './core/gasModel';
 import { recordEventFee, eventFeeCounts, feeFromEventsOn, setHeadBlockSource } from './core/eventFees';
 import { OwnMoneyBook, useOwnMoney } from './core/ownMoney';
 import { BlockReader, PoolUpdate } from './core/blockReader';
@@ -160,7 +160,9 @@ import { ROBINHOOD_SEED_PAIRS } from './config/robinhoodSeedPairs';
 import { ResearchLane, researchConfigFromEnv, planShallowCandidate, findResearchGaps, gapCandidate, ResearchCandidate } from './core/researchLane';
 import { poolDepthUsd, setRealBalanceSource, thinPools, thinPoolsSteps } from './core/poolPrice';
 // Loop trader v1 (3-5 pool loops, practice only, off unless LOOP_TRADER=1).
-import { LoopTrader, loopConfigFromEnv } from './core/loopTrader';
+import { LoopTrader, loopConfigFromEnv, LoopCheckResult, LoopTrade } from './core/loopTrader';
+// Loop fix phase 2: real (block-confirmed) prices, trigger replay, cheap scans (core/loopPrices.ts).
+import { loopFixFromEnv, PendingTrades, loopPoolState } from './core/loopPrices';
 import { formatLoopHour } from './core/loopReport';
 import { startMemReport, registerSize } from './core/memReport';
 // Loop trader extra pools: keeps single-pool pairs fresh for the loop finder only (off unless LOOP_TRADER=1).
@@ -1101,6 +1103,10 @@ const rivals = new CompetitorTracker(robinhoodReadProvider, Date.now, ROBINHOOD_
 // tracker has caught, to see what they win and where. Bots saved to disk.
 const RIVAL_BOTS_FILE = 'data/rival-bots.json';
 const RIVAL_TRADES_FILE = 'data/rival-trades.json';
+const RIVAL_PM_LOWER = ROBINHOOD_V4.POOL_MANAGER.toLowerCase();
+// RIVAL_LAZY_SENDER=0: hand rival watch the sender up front for every feed
+// transaction (the old behaviour: a signature check per transaction).
+const RIVAL_LAZY_SENDER = process.env.RIVAL_LAZY_SENDER !== '0';
 const rivalWatch = new RivalWatch(
       (m, p) => robinhoodReadProvider.send(m, p as any[]),
       (token, raw) => {
@@ -1120,6 +1126,14 @@ const rivalWatch = new RivalWatch(
             // no log, so such trades are marked "uncertain"). Unknown -> null.
             v4IsNative: (id) => { const p = cache.get('robinhood', id); return p?.v4 ? p.v4.native : null; },
             v4PoolManager: ROBINHOOD_V4.POOL_MANAGER,
+            // Addresses that can never be a NEW rival bot: DEX routers, the V4
+            // PoolManager, pools we watch, coins we know. Feed transactions to
+            // these skip the sender look-up (a ~1-2 ms signature check), see
+            // RivalWatch.noteTx. All quick lookups. Given lowercase addresses.
+            neverNewBot: (a) => a === RIVAL_PM_LOWER || !!routerRegistry.robinhood?.[a]
+                  || !!cache.get('robinhood', a) || TOKEN_DECIMALS.robinhood?.[a] !== undefined,
+            // At most this many sender look-ups per second (the rest are skipped and counted).
+            senderMaxPerSec: Number(process.env.RIVAL_SENDER_MAX_PER_SEC ?? 40),
       },
 );
 registerSize('rival trades', () => rivalWatch.recordCount());
@@ -1333,6 +1347,22 @@ if (research.enabled) {
 // cannot be sent live in v1, even with EXECUTION_ENABLED.
 // ==========================================================================
 const loopCfg = loopConfigFromEnv();
+// LOOP FIX PHASE 2 switches (core/loopPrices.ts, docs/LOOP_TRADER.md). Each is
+// ON when LOOP_TRADER=1 and can be turned off on its own with =0:
+//   LOOP_REAL_PRICES=0         loops priced on the main cache again (feed predictions included)
+//   LOOP_KEEP_BLOCK_UPDATES=0  block states skipped by the main cache are thrown away again
+//   LOOP_TRIGGER_REPLAY=0      loop checks on "latest" again (no replay right after the trigger)
+//   LOOP_MODEL_VS_CHECK=0      no model-vs-check line, loop gas not learned from checks
+//   LOOP_CHEAP_SCAN=0          every loop scan runs in one go again
+//   LOOP_SCAN_SLICE_MS         longest single slice of a loop scan (default 8 ms)
+// LOOP_TRADER off (the default) = all off, nothing below runs.
+const loopFix = loopFixFromEnv();
+// Feed trades no block has confirmed yet (pool, direction, size, hash, feed
+// order), plus the order of every feed transaction. Only filled when real
+// prices or trigger replay are on (see onFeedEvent). Loops price a pool as
+// its confirmed state plus its still-pending trades (core/loopPrices.ts).
+const loopTriggers = new PendingTrades(loopFix.pendingMaxMs);
+const loopTriggersOn = loopCfg.enabled && (loopFix.realPrices || loopFix.triggerReplay);
 let requestLoopScan: () => void = () => {};
 let loopHourText: () => string | undefined = () => undefined;
 // EXTRA SINGLE POOLS for the loop finder (core/loopExtraPools.ts). Created
@@ -1344,6 +1374,66 @@ let loopExtra: LoopExtraPools | null = null;
 if (loopCfg.enabled) {
       const usdRhLoop = (t: string) => priceOracle.getUsdPrice('robinhood', t);
       let loopLogTimes: number[] = [];
+      // LOOP_TRIGGER_REPLAY: one loop practice check, tested RIGHT AFTER the
+      // trade that opened the loop, the same way the 2-pool checks do it
+      // (runSimulation): find the trigger's block, replay that block up to
+      // and including the trigger, then run our loop (eth_simulateV1).
+      // Fallbacks, same as 2-pool: the end of the trigger's block, then
+      // latest ("tested late"). A loop check can wait a while for the normal
+      // check line to be idle; if the trigger's block is too old for the node
+      // (state gone) it falls back cleanly. No trigger (5 s safety net, block
+      // updates) = latest, as before. Never sends anything.
+      // The loop check is counted as a running check on the checking node
+      // (simInFlight.robinhood), so the 2-pool check line knows the node is
+      // busy. It only starts when that line is idle, at most one at a time,
+      // and frees its slot (and starts any waiting 2-pool check) when done.
+      const loopCheck = async (trade: LoopTrade, triggerHash?: string): Promise<LoopCheckResult> => {
+            simInFlight.robinhood = (simInFlight.robinhood ?? 0) + 1;
+            try { return await loopCheckInner(trade, triggerHash); }
+            finally {
+                  simInFlight.robinhood = Math.max(0, (simInFlight.robinhood ?? 1) - 1);
+                  setImmediate(() => drainSimQueue('robinhood'));
+            }
+      };
+      const loopCheckInner = async (trade: LoopTrade, triggerHash?: string): Promise<LoopCheckResult> => {
+            const rpc = simRpc.robinhood;
+            const simOpts = { weth: ROBINHOOD_TOKENS.WETH };
+            const follow = loopFix.triggerReplay && !!triggerHash && !triggerHash.includes('PLACEHOLDER');
+            if (!follow) {
+                  const r = await simulateRoundTrip(rpc, 'robinhood', trade, simOpts);
+                  // Switches off: exactly the old answer. On: say it ran on latest.
+                  return loopFix.triggerReplay || loopFix.modelVsCheck ? { ...r, timing: 'latest' } : r;
+            }
+            let r: Awaited<ReturnType<typeof simulateRoundTrip>>;
+            let timing: string;
+            const spot = await findTriggerSpot(rpc, triggerHash!);
+            if (spot) {
+                  r = await simulateRoundTrip(replayRpc(rpc, spot.parent, spot.prefix, spot.time), 'robinhood', trade, simOpts);
+                  timing = 'right after trigger';
+                  if ('reason' in r && (r.reason.startsWith('replay unavailable') || STATE_GONE.test(r.reason))) {
+                        r = await simulateRoundTrip(rpc, 'robinhood', trade, { ...simOpts, blockTag: spot.block });
+                        timing = 'end of trigger block';
+                        if ('reason' in r && STATE_GONE.test(r.reason)) { r = await simulateRoundTrip(rpc, 'robinhood', trade, simOpts); timing = 'tested late'; }
+                  }
+            } else {
+                  r = await simulateRoundTrip(rpc, 'robinhood', trade, simOpts);
+                  timing = 'tested late';
+            }
+            // "Breaks" with no real reason: same second opinion as runSimulation
+            // (plain check at the end of the trigger's block, then the free node).
+            // The 2-pool recheck counters are left alone (loops are reported separately).
+            const noReason = (x: typeof r) => x.status === 'fail' && /execution reverted\s*$|reverted without data|TransferFailed/.test(x.reason);
+            if (noReason(r)) {
+                  let r2 = spot ? await simulateRoundTrip(rpc, 'robinhood', trade, { ...simOpts, blockTag: spot.block }) : r;
+                  let where = spot ? 'end of trigger block (replay failed)' : timing;
+                  if (r2.status === 'rate_limited' || noReason(r2) || ('reason' in r2 && STATE_GONE.test(r2.reason))) {
+                        const r3 = await simulateRoundTrip(rhFreeSimRpc, 'robinhood', trade, simOpts);
+                        if (r3.status !== 'rate_limited') { r2 = r3; where = 'tested late on free node (replay failed)'; }
+                  }
+                  if (r2.status !== 'rate_limited') { r = r2; timing = where; }
+            }
+            return { ...r, timing };
+      };
       const loopTrader = new LoopTrader(loopCfg, {
             bases: [ROBINHOOD_TOKENS.WETH, ROBINHOOD_TOKENS.USDG],
             env: {
@@ -1364,31 +1454,82 @@ if (loopCfg.enabled) {
             canCheckNow: () => !(simInFlight.robinhood ?? 0) && !(simWaiting.robinhood?.length) && !simOff('robinhood')
                   && Date.now() >= (simPausedUntil.robinhood ?? 0) && (!researchNode || researchNode.share() < 0.8),
             // Own-money practice check (rivals use their own money), same checker as 2-pool trades.
-            runCheck: (trade) => simulateRoundTrip(simRpc.robinhood, 'robinhood', trade, { weth: ROBINHOOD_TOKENS.WETH }),
+            // With LOOP_TRIGGER_REPLAY: right after the loop's trigger trade (loopCheck above).
+            runCheck: (trade, ctx) => loopCheck(trade, ctx?.triggerHash),
+            fix: loopFix,
+            // LOOP_MODEL_VS_CHECK: real loop gas from replays teaches the gas
+            // model's loop estimate (loop kinds only; 2-pool estimates untouched).
+            noteGas: (pools, gasUsed) => { gasModel.notePractice(loopKey(pools), gasUsed); },
             log: (m) => {
                   const now = Date.now();
                   loopLogTimes = loopLogTimes.filter((t) => now - t < 60_000);
                   if (loopLogTimes.length < 60) { loopLogTimes.push(now); console.log(m); }
             },
       });
-      let loopQueued: NodeJS.Timeout | null = null;
-      const runLoopScan = () => timed('loop scan', () => {
-            try {
-                  // Only pools the bot keeps fresh (watched pairs) with real money near their price.
-                  const pools = robinhoodWatcher.watchedPairPools().flat()
-                        .map((a) => cache.get('robinhood', a))
-                        .filter((p): p is PoolState => !!p && deepEnough(p, decimalsOf, usdRhLoop));
-                  // Plus the extra single pools (when on) whose price is fresh.
-                  // They go to the loop finder only, never to the gap scanner.
-                  if (loopExtra) {
-                        const have = new Set(pools.map((p) => p.poolAddress.toLowerCase()));
-                        for (const p of loopExtra.freshPools(loopCfg.maxPoolAgeMs)) {
-                              if (!have.has(p.poolAddress.toLowerCase()) && deepEnough(p, decimalsOf, usdRhLoop)) pools.push(p);
-                        }
+      // One loop scan, written as steps (core/chunked.ts) so it can run in
+      // small slices. The pools: the watched pairs' pools (and the extra
+      // single pools when on) with real money near their price.
+      // LOOP_REAL_PRICES: each pool's state is its block-confirmed one, plus
+      // the predicted effect of every feed trade on it that no block has
+      // confirmed yet, in feed order (PendingTrades.stateFor). A trade already
+      // in the confirmed state is never added again.
+      const predict = (p: PoolState, inIsA: boolean, amt: bigint) => cache.predictPostTradeState(p, inIsA, amt);
+      // Only if the cache is really keeping the confirmed view (it reads the
+      // same switches at start); otherwise loops would see no pools at all.
+      const realPricesOn = loopFix.realPrices && cache.confirmedOn;
+      function* loopScanSteps(): Generator<void, void, void> {
+            const now = Date.now();
+            // Trigger trades since the last scan (hashes for the replay check).
+            const fresh = loopTriggersOn ? loopTriggers.takeFresh() : new Map<string, { hash: string; at: number }>();
+            if (loopTriggersOn) loopTriggers.sweep(now);
+            const stateOf = (a: string): PoolState | undefined => realPricesOn
+                  ? loopTriggers.stateFor(a, cache.get('robinhood', a), cache.getConfirmed('robinhood', a), cache.confirmedInfo('robinhood', a), predict, now)
+                  : loopPoolState(cache.get('robinhood', a), undefined, undefined, false, predict, now);
+            const pools: PoolState[] = [];
+            let n = 0;
+            for (const pair of robinhoodWatcher.watchedPairPools()) {
+                  for (const a of pair) {
+                        const p = stateOf(a);
+                        if (p && deepEnough(p, decimalsOf, usdRhLoop)) pools.push(p);
+                        if ((++n & 63) === 0) yield;
                   }
-                  loopTrader.onUpdate(pools);
-            } catch (err) { console.warn('[loop] scan failed (ignored):', (err as Error).message); }
-      });
+            }
+            // Plus the extra single pools (when on) whose price is fresh.
+            // They go to the loop finder only, never to the gap scanner.
+            if (loopExtra) {
+                  const have = new Set(pools.map((p) => p.poolAddress.toLowerCase()));
+                  const extra = realPricesOn
+                        ? loopExtra.keys().map(stateOf).filter((p): p is PoolState => !!p && now - p.lastUpdatedMs <= loopCfg.maxPoolAgeMs)
+                        : loopExtra.freshPools(loopCfg.maxPoolAgeMs);
+                  for (const p of extra) {
+                        if (!have.has(p.poolAddress.toLowerCase()) && deepEnough(p, decimalsOf, usdRhLoop)) pools.push(p);
+                        if ((++n & 63) === 0) yield;
+                  }
+            }
+            // LOOP_TRIGGER_REPLAY: which trigger trade each traded pool follows.
+            const ctx = loopFix.triggerReplay && fresh.size ? { triggers: fresh } : {};
+            yield* loopTrader.onUpdateSteps(pools, ctx);
+      }
+      let loopQueued: NodeJS.Timeout | null = null;
+      let loopScanning = false; // a sliced scan is running
+      let loopAgain = false;    // a scan was asked for while one was running
+      const runLoopScan = () => {
+            if (!loopFix.cheapScan) {
+                  // One go (old behaviour).
+                  timed('loop scan', () => {
+                        try { drainSteps(loopScanSteps()); } catch (err) { console.warn('[loop] scan failed (ignored):', (err as Error).message); }
+                  });
+                  return;
+            }
+            // LOOP_CHEAP_SCAN: in slices of at most LOOP_SCAN_SLICE_MS (8 ms)
+            // with breaks for feed messages, each slice timed as 'loop scan'.
+            // One scan at a time; one asked for meanwhile runs right after.
+            if (loopScanning) { loopAgain = true; return; }
+            loopScanning = true;
+            runSteps(loopScanSteps(), 'loop scan', loopFix.sliceMs)
+                  .catch((err) => console.warn('[loop] scan failed (ignored):', (err as Error).message))
+                  .finally(() => { loopScanning = false; if (loopAgain) { loopAgain = false; requestLoopScan(); } });
+      };
       requestLoopScan = () => {
             if (loopQueued) return;
             loopQueued = setTimeout(() => { loopQueued = null; runLoopScan(); }, 50);
@@ -1400,7 +1541,9 @@ if (loopCfg.enabled) {
       // Race comparison: every rival trade the rival watch saves.
       rivalWatch.onRecord = (rec) => loopTrader.noteRival(rec);
       registerSize('loop cycles', () => loopTrader.finder.cycleCount());
+      registerSize('loop confirmed states', () => cache.confirmedCount());
       loopHourText = () => formatLoopHour(loopTrader.takeHour(), loopCfg.maxPools, loopExtra?.status(loopCfg.maxPoolAgeMs) ?? null);
+      console.log(`[loop] fix phase 2: real prices ${realPricesOn ? 'on' : 'off'}, keep block updates ${loopFix.keepBlockUpdates ? 'on' : 'off'}, trigger replay ${loopFix.triggerReplay ? 'on' : 'off'}, model vs check ${loopFix.modelVsCheck ? 'on' : 'off'}, cheap scan ${loopFix.cheapScan ? `on (${loopFix.sliceMs} ms slices)` : 'off'}`);
       console.log(`[loop] loop trader ON (practice only, never sends): 3-${loopCfg.maxPools} pools, up to ${loopCfg.maxCycles} loops, max $${loopCfg.maxTradeUsd}, bar $${loopCfg.minNetUsd}, ${loopCfg.checksPerMin} checks/min`);
 }
 
@@ -1653,12 +1796,22 @@ const trace = event.chain === 'robinhood' ? stageTimers.begin(event.receivedAtMs
 // Timestamp every Robinhood feed tx: lets the competitor tracker time rivals.
 if (event.chain === 'robinhood') {
       rivals.noteFeedTx((event.raw as any)?.hash, event.receivedAtMs);
+      // Loop trader (only when on): the feed's order of transactions, to know
+      // which pending trades a block read already includes.
+      if (loopTriggersOn) loopTriggers.noteFeedTx((event.raw as any)?.hash);
       // The rival tracker needs the SENDER, which costs a signature check
       // (~1-2 ms). Done on the next turn, after this frame's trades have been
       // decided, so it never delays our own decision (FEED_LAZY_SENDER=0: old order).
+      // Since Oct 14 the sender is passed as a function (RIVAL_LAZY_SENDER):
+      // rival watch only works it out for the few transactions where it can
+      // matter, instead of for every feed transaction (RIVAL_LAZY_SENDER=0: old).
       const raw = event.raw as any;
-      if (process.env.FEED_LAZY_SENDER !== '0') setImmediate(() => { try { timed('rival watch', () => rivalWatch.noteTx(raw?.to, raw?.hash, raw?.from, raw?.value)); } catch { /* never affects trading */ } });
-      else rivalWatch.noteTx(raw?.to, raw?.hash, raw?.from, raw?.value);
+      const sender = RIVAL_LAZY_SENDER ? () => raw?.from : undefined;
+      // First 4 bytes of the call (cheap slice): coin transfers / approvals and
+      // ETH sends with no call skip the sender check (only used in lazy mode).
+      const sel = RIVAL_LAZY_SENDER && typeof raw?.data === 'string' ? raw.data.slice(0, 10) : undefined;
+      if (process.env.FEED_LAZY_SENDER !== '0') setImmediate(() => { try { timed('rival watch', () => rivalWatch.noteTx(raw?.to, raw?.hash, sender ?? raw?.from, raw?.value, sel)); } catch { /* never affects trading */ } });
+      else rivalWatch.noteTx(raw?.to, raw?.hash, sender ?? raw?.from, raw?.value, sel);
 }
 
 const swap = await decoder.decode(event);
@@ -1775,7 +1928,13 @@ if (registerIfApproved('avalanche', entry.dex, resolved)) pool = resolved;
     if (FAST_PRICES && swap.chain === 'robinhood' && swap.amountIn > 0n) {
           const inIsA = pool.tokenA.toLowerCase() === swap.tokenIn.toLowerCase();
           const after = cache.predictPostTradeState(pool, inIsA, swap.amountIn);
-          if (after !== pool) { cache.upsertFromFeed(after); requestGapScan(); }
+          if (after !== pool) {
+                cache.upsertFromFeed(after);
+                // Loop trader (only when on): remember this trade for the next
+                // loop scan (its predicted effect + its hash for the replay check).
+                if (loopTriggersOn) loopTriggers.note(after.poolAddress, { hash: (event.raw as any)?.hash, inIsA, amountIn: swap.amountIn, at: Date.now() });
+                requestGapScan();
+          }
     }
 
     // Cheap "is this trade big enough to matter" check, now against the
@@ -2397,6 +2556,25 @@ await chainManager.startAll();
             // Leave a pool alone if the feed just applied a predicted trade to it.
             const FEED_FRESH_MS = Number(process.env.BLOCK_READER_FEED_GRACE_MS ?? 400);
             let readerApplied = 0;
+            // LOOP_KEEP_BLOCK_UPDATES: put a block state the main write skipped
+            // into the confirmed view (PoolCache.keepBlockState, which never
+            // touches the main cache and ignores an older block). Built from
+            // the confirmed copy when there is one (else the main copy), with
+            // the block's prices: the same fields the main write would set.
+            const keepBlockOn = loopCfg.enabled && loopFix.realPrices && loopFix.keepBlockUpdates && cache.confirmedOn;
+            const keepBlockState = (cur: PoolState, u: PoolUpdate): void => {
+                  if (cache.confirmedBlock('robinhood', cur.poolAddress) > u.block) return;
+                  const base = cache.getConfirmed('robinhood', cur.poolAddress) ?? cur;
+                  if (u.kind === 'v2') {
+                        if (u.reserve0 === undefined || u.reserve1 === undefined || base.reserveA === undefined) return;
+                        if (base.reserveA === u.reserve0 && base.reserveB === u.reserve1 && base.lastUpdatedBlock >= u.block) return;
+                        cache.keepBlockState({ ...base, reserveA: u.reserve0, reserveB: u.reserve1 }, u.block, Date.now(), u.txHash);
+                  } else {
+                        if (u.sqrtPriceX96 === undefined || base.poolType !== 'v3') return;
+                        if (base.sqrtPriceX96 === u.sqrtPriceX96 && (u.liquidity === undefined || base.liquidity === u.liquidity) && base.lastUpdatedBlock >= u.block) return;
+                        cache.keepBlockState({ ...base, sqrtPriceX96: u.sqrtPriceX96, ...(u.liquidity !== undefined ? { liquidity: u.liquidity } : {}) }, u.block, Date.now(), u.txHash);
+                  }
+            };
             const applyUpdate = (u: PoolUpdate): boolean => {
                   const cur = cache.get('robinhood', u.pool);
                   if (!cur) return false;
@@ -2407,15 +2585,22 @@ await chainManager.startAll();
                         fablesFees.observeSwap(cur.poolAddress, u.zeroForOne, u.v4Fee, Date.now());
                   }
                   if (cur.lastUpdatedBlock > u.block) return false;
-                  if (cache.fedWithin('robinhood', cur.poolAddress, FEED_FRESH_MS)) return false;
+                  if (cache.fedWithin('robinhood', cur.poolAddress, FEED_FRESH_MS)) {
+                        // LOOP_KEEP_BLOCK_UPDATES (loop trader only): the main
+                        // cache still leaves this pool alone (2-pool trades
+                        // unchanged), but the exact block state is kept for
+                        // the loop finder's confirmed view instead of lost.
+                        if (keepBlockOn) keepBlockState(cur, u);
+                        return false;
+                  }
                   if (u.kind === 'v2') {
                         if (u.reserve0 === undefined || u.reserve1 === undefined || cur.reserveA === undefined) return false;
-                        if (cur.reserveA === u.reserve0 && cur.reserveB === u.reserve1) return false;
-                        cache.upsertFromBlock({ ...cur, reserveA: u.reserve0, reserveB: u.reserve1, lastUpdatedBlock: u.block });
+                        if (cur.reserveA === u.reserve0 && cur.reserveB === u.reserve1) { if (keepBlockOn) keepBlockState(cur, u); return false; }
+                        cache.upsertFromBlock({ ...cur, reserveA: u.reserve0, reserveB: u.reserve1, lastUpdatedBlock: u.block }, Date.now(), u.txHash);
                   } else {
                         if (u.sqrtPriceX96 === undefined || cur.poolType !== 'v3') return false;
-                        if (cur.sqrtPriceX96 === u.sqrtPriceX96 && cur.liquidity === u.liquidity) return false;
-                        cache.upsertFromBlock({ ...cur, sqrtPriceX96: u.sqrtPriceX96, ...(u.liquidity !== undefined ? { liquidity: u.liquidity } : {}), lastUpdatedBlock: u.block });
+                        if (cur.sqrtPriceX96 === u.sqrtPriceX96 && cur.liquidity === u.liquidity) { if (keepBlockOn) keepBlockState(cur, u); return false; }
+                        cache.upsertFromBlock({ ...cur, sqrtPriceX96: u.sqrtPriceX96, ...(u.liquidity !== undefined ? { liquidity: u.liquidity } : {}), lastUpdatedBlock: u.block }, Date.now(), u.txHash);
                   }
                   return true;
             };
@@ -2823,6 +3008,8 @@ await chainManager.startAll();
                               callMany: scanCallMany, state: st, pools,
                               usdg: ROBINHOOD_TOKENS.USDG, weth: ROBINHOOD_TOKENS.WETH,
                               symbolCacheFile: SYMBOLS_FILE, outFile: GROUPS_FILE, log: (m) => console.log(m),
+                              // Short breaks in the long walks over every pool/coin (same switch as the scan's pool list).
+                              paced: STALL_FIX_SCAN_EXPAND,
                         }));
                   }
                   const quotes = tokenGroups!.members.map((m) => ({ token: m.token, symbol: m.symbol, group: m.group, priceUsd: m.priceUsd }));
@@ -3258,6 +3445,9 @@ for (let i = 0; i < resolved.length; i++) {
             gapStaleSkips = 0;
             const sd = formatStallDetail(sf);
             if (sd) console.log(`[stalls] ${sd}`);
+            // Rival watch sender look-ups (signature checks) done vs skipped, last 5 min.
+            const rs = rivalWatch.takeSenderStats();
+            console.log(`[rivalwatch] sender checks (5 min): ${rs.looked} done · skipped: ${rs.knownBot} known bot, ${rs.noOwners} no bot wallets known, ${rs.neverBot} router/pool/coin, ${rs.coinMove} coin transfer/approval, ${rs.dupOrFull} already queued, ${rs.overCap} over the ${process.env.RIVAL_SENDER_MAX_PER_SEC ?? 40}/s limit`);
       }), 5 * 60_000);
       // Watch list size every 15 min (shown on the GitHub status page).
       setInterval(labelled('watch list log', () => {

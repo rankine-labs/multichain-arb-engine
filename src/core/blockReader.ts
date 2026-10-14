@@ -57,6 +57,10 @@ export interface PoolUpdate {
   zeroForOne?: boolean;
   v4Fee?: number;
   algebraFee?: { override: number; plugin: number };
+  // The transaction that made this event (lower-case), when the node says.
+  // Used only by the loop trader (loop fix phase 2) to know which feed
+  // trades a block has confirmed; the price writes ignore it.
+  txHash?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -136,11 +140,12 @@ export function parsePoolLogs(logs: RpcLog[], poolManager: string): PoolUpdate[]
     const w = words(l.data);
     if (!w) continue;
     const address = (l.address || '').toLowerCase();
+    const tx = typeof l.transactionHash === 'string' ? l.transactionHash.toLowerCase() : undefined;
 
     if (t0 === SYNC_TOPIC || t0 === SOLIDLY_SYNC_TOPIC) {
       // V2 / Solidly: data = reserve0, reserve1.
       if (w.length < 2) continue;
-      out.push({ pool: address, kind: 'v2', block, logIndex, reserve0: asUint(w[0]!), reserve1: asUint(w[1]!) });
+      out.push({ pool: address, kind: 'v2', block, logIndex, reserve0: asUint(w[0]!), reserve1: asUint(w[1]!), ...(tx ? { txHash: tx } : {}) });
     } else if (V3_LIKE.has(t0)) {
       // V3 family: data = amount0, amount1, sqrtPriceX96, liquidity, tick, ...
       if (w.length < 5) continue;
@@ -148,6 +153,7 @@ export function parsePoolLogs(logs: RpcLog[], poolManager: string): PoolUpdate[]
       // amount0 is from the pool's side: positive = the pool received token0.
       const a0 = asInt(w[0]!);
       if (a0 !== 0n) u.zeroForOne = a0 > 0n;
+      if (tx) u.txHash = tx;
       // Algebra Integral: words 5 and 6 = overrideFee, pluginFee (uint24 each).
       if (t0 === ALGEBRA_INTEGRAL_SWAP_TOPIC && w.length >= 7) {
         const o = asUint(w[5]!), pf = asUint(w[6]!);
@@ -164,6 +170,7 @@ export function parsePoolLogs(logs: RpcLog[], poolManager: string): PoolUpdate[]
       // amount0 is from the SWAPPER's side: negative = the swapper paid token0.
       const a0 = asInt(w[0]!);
       if (a0 !== 0n) u.zeroForOne = a0 < 0n;
+      if (tx) u.txHash = tx;
       // Word 5 = the fee this swap paid, in pips (uint24; >= 100% is nonsense).
       if (w.length >= 6) { const f = asUint(w[5]!); if (f < 1_000_000n) u.v4Fee = Number(f); }
       out.push(u);

@@ -1,6 +1,6 @@
 import { ethers } from 'ethers';
 import { v4Asks, findV4Pools } from './v4Lookup';
-import { Steps, drainSteps, runSteps } from './chunked';
+import { Steps, drainSteps, runSteps, yieldToLoop } from './chunked';
 import { timed } from './stallFinder';
 
 // ============================================================================
@@ -90,6 +90,149 @@ const erc20 = new ethers.Interface([
   'function decimals() view returns (uint8)',
 ]);
 
+// ----------------------------------------------------------------------------
+// FAST MULTICALL ANSWER READER (freeze fix phase 2, Oct 14)
+//
+// Plain English:
+//   A Multicall3 bundle of 400 reads comes back as one long piece of hex
+//   text holding 400 (worked?, answer) pairs. The general-purpose ethers
+//   reader builds lots of temporary objects for every pair, which was the top
+//   cause of freezes during the 6-hourly scan ("multicall decode", up to 1.9 s).
+//   The layout is simple and fixed, so this reader just walks the hex text
+//   by position and cuts out each answer. Same answers as ethers, much less
+//   work and memory.
+//
+//   Safety: every position and length is checked. If ANYTHING looks unusual
+//   (a position out of range, a "worked?" flag that isn't 0 or 1, a missing
+//   piece), it gives up and returns null, and the caller uses the ethers
+//   reader instead, so the answer is always the same as before.
+//   SCAN_FAST_DECODE=0 turns it off (always ethers).
+//
+// The layout (each "word" is 32 bytes = 64 hex characters):
+//   word 0            where the list starts (always 32)
+//   list start        how many pairs (N)
+//   next N words      where each pair starts (counted from just after N)
+//   each pair         word 1: worked? (0/1), word 2: where its answer starts
+//                     (counted from the pair start), then the answer's length
+//                     in bytes, then the answer itself padded to whole words
+// ----------------------------------------------------------------------------
+const ZERO52 = '0'.repeat(52);
+// Reads the word at hex position `pos` as a small number, or -1 if it is too
+// big to be a sensible position/length (top 26 bytes must be zero).
+const smallWord = (hex: string, pos: number): number => {
+  if (pos + 64 > hex.length || !hex.startsWith(ZERO52, pos)) return -1;
+  const n = parseInt(hex.slice(pos + 52, pos + 64), 16);
+  return Number.isFinite(n) ? n : -1;
+};
+
+// Multicall3 aggregate3 answer -> per-read answer (null = read failed or
+// returned nothing). Returns null (not an array) if the text looks unusual:
+// the caller then uses the ethers reader.
+export function fastDecodeAggregate3(ret: string): (string | null)[] | null {
+  if (typeof ret !== 'string' || !ret.startsWith('0x')) return null;
+  // ethers always hands back lowercase text; match it exactly.
+  const hex = /[A-F]/.test(ret) ? ret.toLowerCase() : ret;
+  const H = 2; // hex position of byte 0 (after "0x")
+  const totalBytes = (hex.length - H) / 2;
+  if (!Number.isInteger(totalBytes) || totalBytes < 64) return null;
+  const at = (byte: number) => H + byte * 2; // byte offset -> hex position
+  const listOff = smallWord(hex, at(0));
+  if (listOff < 0 || listOff % 32 !== 0 || listOff + 32 > totalBytes) return null;
+  const n = smallWord(hex, at(listOff));
+  const base = listOff + 32; // pair positions are counted from here
+  if (n < 0 || base + n * 32 > totalBytes) return null;
+  const out: (string | null)[] = new Array(n);
+  // Multicall3 always writes the pairs back to back in order (the standard
+  // tight layout). We insist on exactly that: anything else goes to ethers.
+  let expectRel = n * 32;
+  for (let i = 0; i < n; i++) {
+    const rel = smallWord(hex, at(base + i * 32));
+    if (rel !== expectRel) return null;
+    const pair = base + rel;
+    if (pair + 64 > totalBytes) return null;
+    // worked? flag: exactly 0 or 1 (anything else: let ethers decide).
+    const flagPos = at(pair);
+    if (!hex.startsWith(ZERO52, flagPos)) return null;
+    const flagTail = hex.slice(flagPos + 52, flagPos + 64);
+    const ok = flagTail === '000000000001';
+    if (!ok && flagTail !== '000000000000') return null;
+    const dataRel = smallWord(hex, at(pair + 32));
+    if (dataRel !== 64) return null; // answer right after the two pair words
+    const lenAt = pair + dataRel;
+    const len = smallWord(hex, at(lenAt));
+    if (len < 0) return null;
+    const start = lenAt + 32;
+    // The answer plus its padding must fit inside the text.
+    const end = start + Math.ceil(len / 32) * 32;
+    if (end > totalBytes) return null;
+    out[i] = ok && len > 0 ? '0x' + hex.slice(at(start), at(start + len)) : null;
+    expectRel = end - base;
+  }
+  // Nothing left over after the last answer (again: the standard layout).
+  if (base + expectRel !== totalBytes) return null;
+  return out;
+}
+
+// The same answer with the ethers reader (the old way, and the fallback).
+export function ethersDecodeAggregate3(ret: string): (string | null)[] {
+  const [results] = mc3.decodeFunctionResult('aggregate3', ret);
+  return results.map((r: any) => (r.success && r.returnData !== '0x' ? r.returnData : null));
+}
+
+// How many bundles were read the fast way vs fell back to ethers (tests / logs).
+export const decodeStats = { fast: 0, fallback: 0 };
+
+// Fast reader first (unless SCAN_FAST_DECODE=0); ethers if it gives up.
+export function decodeAggregate3(ret: string): (string | null)[] {
+  if (process.env.SCAN_FAST_DECODE !== '0') {
+    let fast: (string | null)[] | null = null;
+    try { fast = fastDecodeAggregate3(ret); } catch { fast = null; }
+    if (fast) { decodeStats.fast++; return fast; }
+    decodeStats.fallback++;
+  }
+  return ethersDecodeAggregate3(ret);
+}
+
+// The same trick for the QUESTION we send: ethers took ~50 ms to write out
+// one 400-read bundle (measured Oct 14), on top of the reading. This writes
+// the exact same text by hand. Anything unusual (a target that isn't a plain
+// 0x + 40 hex address, call data that isn't whole bytes of hex) goes to
+// ethers instead, so the text sent is always byte-for-byte what ethers writes.
+const AGG3_SELECTOR = mc3.getFunction('aggregate3')!.selector.slice(2);
+const ADDR_RE = /^0x[0-9a-fA-F]{40}$/;
+const HEX_RE = /^0x(?:[0-9a-fA-F]{2})*$/;
+const hexWord = (n: number) => n.toString(16).padStart(64, '0');
+const ZERO64 = '0'.repeat(64);
+export function fastEncodeAggregate3(calls: { target: string; data: string }[]): string | null {
+  const n = calls.length;
+  const parts: string[] = ['0x', AGG3_SELECTOR, hexWord(32), hexWord(n)];
+  // First the N "where does call i start" words, then the calls themselves.
+  // Each call: address, allowFailure = true, where its data starts (always
+  // 96 bytes in), the data length, the data padded with zeros to whole words.
+  const bodies: string[] = new Array(n);
+  let rel = n * 32;
+  for (let i = 0; i < n; i++) {
+    const c = calls[i];
+    if (typeof c?.target !== 'string' || typeof c?.data !== 'string' || !ADDR_RE.test(c.target) || !HEX_RE.test(c.data)) return null;
+    const dataHex = c.data.slice(2).toLowerCase();
+    const len = dataHex.length / 2;
+    const padChars = (64 - (dataHex.length % 64)) % 64;
+    parts.push(hexWord(rel));
+    bodies[i] = '000000000000000000000000' + c.target.slice(2).toLowerCase() + hexWord(1) + hexWord(96) + hexWord(len)
+      + dataHex + ZERO64.slice(0, padChars);
+    rel += 128 + (dataHex.length + padChars) / 2;
+  }
+  for (const b of bodies) parts.push(b);
+  return parts.join('');
+}
+export function encodeAggregate3(calls: { target: string; data: string }[]): string {
+  if (process.env.SCAN_FAST_DECODE !== '0') {
+    const fast = fastEncodeAggregate3(calls);
+    if (fast) return fast;
+  }
+  return mc3.encodeFunctionData('aggregate3', [calls.map((c) => ({ target: c.target, allowFailure: true, callData: c.data }))]);
+}
+
 type Call = { target: string; data: string };
 type CallMany = (calls: Call[]) => Promise<(string | null)[]>;
 
@@ -125,14 +268,13 @@ export async function makeCaller(provider: ethers.JsonRpcProvider): Promise<{ ca
     // One bundle. If the node rejects it as too big (revert / out of gas),
     // split it in half and try each half: a few requests, never hundreds.
     const bundle = async (slice: Call[]): Promise<(string | null)[]> => {
-      const data = mc3.encodeFunctionData('aggregate3', [slice.map((c) => ({ target: c.target, allowFailure: true, callData: c.data }))]);
+      // Written by hand (same text as ethers, see encodeAggregate3), timed by name.
+      const data = timed('multicall encode', () => encodeAggregate3(slice));
       const ret = await rawCall({ target: MULTICALL3, data }); // throws on rate limit / network
       if (ret) {
         // Stall finder: decoding a big bundled answer is timed (measurement only).
-        return timed('multicall decode', () => {
-          const [results] = mc3.decodeFunctionResult('aggregate3', ret);
-          return results.map((r: any) => (r.success && r.returnData !== '0x' ? r.returnData : null));
-        });
+        // Fast hand reader, same answers as ethers (see decodeAggregate3 above).
+        return timed('multicall decode', () => decodeAggregate3(ret));
       }
       if (slice.length === 1) return [await rawCall(slice[0])];
       const mid = Math.ceil(slice.length / 2);
@@ -140,7 +282,14 @@ export async function makeCaller(provider: ethers.JsonRpcProvider): Promise<{ ca
     };
     const callMany: CallMany = async (calls) => {
       const out: (string | null)[] = [];
-      for (let i = 0; i < calls.length; i += CHUNK) out.push(...(await bundle(calls.slice(i, i + CHUNK))));
+      for (let i = 0; i < calls.length; i += CHUNK) {
+        // Between bundles, let the rest of the bot run (trades, feed messages)
+        // so a scan of thousands of reads never holds the thread for long.
+        // Not before the first bundle: a small read (one bundle) is unchanged.
+        if (i > 0) await yieldToLoop();
+        const res = await bundle(calls.slice(i, i + CHUNK));
+        for (const r of res) out.push(r);
+      }
       return out;
     };
     return { callMany, multicall };
