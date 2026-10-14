@@ -311,10 +311,16 @@ export interface SenderStats {
   knownBot: number;        // skipped: sent straight to a bot we follow (no need)
   noOwners: number;        // skipped: we know no bot wallets yet, nothing to match
   neverBot: number;        // skipped: sent to a router / pool / coin, never a new bot
+  coinMove: number;        // skipped: a plain coin transfer / approval, or an ETH send with no call
   dupOrFull: number;       // skipped: already queued, or the queue is full
   overCap: number;         // skipped: over the per-second limit
 }
-const emptySenderStats = (): SenderStats => ({ looked: 0, knownBot: 0, noOwners: 0, neverBot: 0, dupOrFull: 0, overCap: 0 });
+const emptySenderStats = (): SenderStats => ({ looked: 0, knownBot: 0, noOwners: 0, neverBot: 0, coinMove: 0, dupOrFull: 0, overCap: 0 });
+
+// Coin housekeeping calls (first 4 bytes of the call data): transfer,
+// approve, transferFrom. Whatever contract receives one of these is acting
+// as a coin, never as an arbitrage bot, so its sender is not worth checking.
+const COIN_MOVE_SELECTORS = new Set(['0xa9059cbb', '0x095ea7b3', '0x23b872dd']);
 
 // The sender of a transaction: either already known (text), or a function
 // that works it out only when called (the feed's sender costs a signature
@@ -383,10 +389,13 @@ export class RivalWatch {
   //   - the transaction went to a bot we already follow (queued anyway),
   //   - it is already queued, or the queue is full (nothing would happen),
   //   - we know no bot wallets yet (nothing to match it against),
-  //   - it went to a router / pool / coin (can never be a new bot), or
+  //   - it went to a router / pool / coin (can never be a new bot),
+  //   - it is a plain coin transfer / approval, or an ETH send with no call
+  //     (`data` = the call data or just its first 4 bytes; checked only when
+  //     given; catches coins we don't have on our list), or
   //   - we already did `senderMaxPerSec` look-ups this second (counted).
   // Text senders behave exactly as before (older callers and tests).
-  noteTx(to: string | undefined, hash: string | undefined, from?: LazySender, value?: string | bigint) {
+  noteTx(to: string | undefined, hash: string | undefined, from?: LazySender, value?: string | bigint, data?: string) {
     if (!to || !hash) return;
     const bot = to.toLowerCase();
     const known = this.bots.has(bot);
@@ -397,6 +406,7 @@ export class RivalWatch {
       else if (this.queue.length >= 100 || this.queued.has(hash)) { this.senders.dupOrFull++; return; }
       else if (!this.owners.size) { this.senders.noOwners++; return; }
       else if (this.opts.neverNewBot?.(bot)) { this.senders.neverBot++; return; }
+      else if (typeof data === 'string' && (data.length <= 2 || COIN_MOVE_SELECTORS.has(data.slice(0, 10).toLowerCase()))) { this.senders.coinMove++; return; }
       else {
         const t = this.now();
         if (t - this.senderWindow.at >= 1_000) this.senderWindow = { at: t, n: 0 };

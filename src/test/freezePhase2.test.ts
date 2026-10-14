@@ -92,6 +92,28 @@ async function main() {
     rw.noteTx(NEWBOT, 'd1', lazy(STRANGER));
     assert(looks === 6, 'limit resets the next second');
 
+    // g2) Coin transfers / approvals to a coin NOT on our list, and ETH sends
+    // with no call: skipped, so they can't use up the per-second limit.
+    looks = 0; rw.takeSenderStats();
+    clock += 1_000;
+    const COIN = A(0xc0);
+    rw.noteTx(COIN, 'm1', lazy(OWNER), undefined, '0xa9059cbb');                    // transfer (selector only)
+    rw.noteTx(COIN, 'm2', lazy(OWNER), undefined, '0x095EA7B3' + '00'.repeat(64));  // approve (full data, upper case)
+    rw.noteTx(COIN, 'm3', lazy(OWNER), undefined, '0x23b872dd' + '00'.repeat(96));  // transferFrom
+    rw.noteTx(NEWBOT, 'm4', lazy(OWNER), undefined, '0x');                          // ETH send, no call
+    rw.noteTx(NEWBOT, 'm5', lazy(OWNER), undefined, '');                            // ETH send, no call
+    st = rw.takeSenderStats();
+    assert(looks === 0 && st.coinMove === 5 && !['m1', 'm2', 'm3', 'm4', 'm5'].some((h) => (rw as any).queued.has(h)), 'coin transfer/approve/transferFrom and empty-data sends: no sender check, not queued');
+    for (let i = 0; i < 100; i++) rw.noteTx(COIN, 'flood' + i, lazy(STRANGER), undefined, '0x095ea7b3');
+    rw.noteTx(NEWBOT, 'real1', lazy(OWNER), undefined, '0x12345678');               // a real owner-wallet call
+    assert(looks === 1 && (rw as any).queued.has('real1'), 'a flood of approvals does not use up the limit: the real owner-wallet tx is still caught');
+    // Bot we follow: queued whatever the call is (selector skip is only for the sender check).
+    rw.noteTx(BOT, 'm6', lazy(OWNER), undefined, '0xa9059cbb');
+    assert((rw as any).queued.has('m6'), 'tx to a known bot is queued even if it looks like a coin transfer');
+    // No data given (older callers): no selector skip.
+    rw.noteTx(NEWBOT, 'm7', lazy(OWNER));
+    assert(looks === 2 && (rw as any).queued.has('m7'), 'no call data given: checked as before');
+
     // h) Queue full: no sender check.
     looks = 0;
     const q = mk({ senderMaxPerSec: 100 });
@@ -114,8 +136,9 @@ async function main() {
     old.noteTx(ROUTER, 't1', OWNER);   // text form: no router skip (old behaviour)
     old.noteTx(NEWBOT, 't2', STRANGER);
     old.noteTx(NEWBOT, 't3', undefined);
+    old.noteTx(A(0xc1), 't4', OWNER, undefined, '0xa9059cbb'); // text form: no coin-move skip (old behaviour)
     const ost = old.takeSenderStats();
-    assert((old as any).queued.has('t1') && !(old as any).queued.has('t2') && !(old as any).queued.has('t3'), 'text sender: same answers as before');
+    assert((old as any).queued.has('t1') && (old as any).queued.has('t4') && !(old as any).queued.has('t2') && !(old as any).queued.has('t3'), 'text sender: same answers as before');
     assert(ost.looked === 0 && ost.noOwners === 0, 'text sender: no lazy-sender counters touched');
     // Let the few queued jobs finish so the test can exit (1 s pause per job).
   }

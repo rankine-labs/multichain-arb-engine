@@ -1673,8 +1673,11 @@ if (event.chain === 'robinhood') {
       // matter, instead of for every feed transaction (RIVAL_LAZY_SENDER=0: old).
       const raw = event.raw as any;
       const sender = RIVAL_LAZY_SENDER ? () => raw?.from : undefined;
-      if (process.env.FEED_LAZY_SENDER !== '0') setImmediate(() => { try { timed('rival watch', () => rivalWatch.noteTx(raw?.to, raw?.hash, sender ?? raw?.from, raw?.value)); } catch { /* never affects trading */ } });
-      else rivalWatch.noteTx(raw?.to, raw?.hash, sender ?? raw?.from, raw?.value);
+      // First 4 bytes of the call (cheap slice): coin transfers / approvals and
+      // ETH sends with no call skip the sender check (only used in lazy mode).
+      const sel = RIVAL_LAZY_SENDER && typeof raw?.data === 'string' ? raw.data.slice(0, 10) : undefined;
+      if (process.env.FEED_LAZY_SENDER !== '0') setImmediate(() => { try { timed('rival watch', () => rivalWatch.noteTx(raw?.to, raw?.hash, sender ?? raw?.from, raw?.value, sel)); } catch { /* never affects trading */ } });
+      else rivalWatch.noteTx(raw?.to, raw?.hash, sender ?? raw?.from, raw?.value, sel);
 }
 
 const swap = await decoder.decode(event);
@@ -3278,7 +3281,7 @@ for (let i = 0; i < resolved.length; i++) {
             if (sd) console.log(`[stalls] ${sd}`);
             // Rival watch sender look-ups (signature checks) done vs skipped, last 5 min.
             const rs = rivalWatch.takeSenderStats();
-            console.log(`[rivalwatch] sender checks (5 min): ${rs.looked} done · skipped: ${rs.knownBot} known bot, ${rs.noOwners} no bot wallets known, ${rs.neverBot} router/pool/coin, ${rs.dupOrFull} already queued, ${rs.overCap} over the ${process.env.RIVAL_SENDER_MAX_PER_SEC ?? 40}/s limit`);
+            console.log(`[rivalwatch] sender checks (5 min): ${rs.looked} done · skipped: ${rs.knownBot} known bot, ${rs.noOwners} no bot wallets known, ${rs.neverBot} router/pool/coin, ${rs.coinMove} coin transfer/approval, ${rs.dupOrFull} already queued, ${rs.overCap} over the ${process.env.RIVAL_SENDER_MAX_PER_SEC ?? 40}/s limit`);
       }), 5 * 60_000);
       // Watch list size every 15 min (shown on the GitHub status page).
       setInterval(labelled('watch list log', () => {
