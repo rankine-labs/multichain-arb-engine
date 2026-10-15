@@ -118,6 +118,16 @@ export async function confirmOutlier(o: {
   return { ok: true, detail: `confirmed on a second node (${pct(full.profit, o.firstProfit)} of first), half size ${Math.round(share * 100)}%` };
 }
 
+// The second check must answer within `ms`, or it counts as "not confirmed"
+// (fail closed). A slow answer is worse than none for a live trade: its
+// deadline was set before the check started.
+export function withDeadline(check: Promise<OutlierVerdict>, ms: number): Promise<OutlierVerdict> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<OutlierVerdict>((res) => { timer = setTimeout(() => res({ ok: false, reason: `second check took over ${ms} ms` }), ms); });
+  const safe = check.catch((err) => ({ ok: false as const, reason: `second check error: ${(err as Error)?.message ?? err}` }));
+  return Promise.race([safe, timeout]).finally(() => clearTimeout(timer));
+}
+
 // Short words for a check result that wasn't a profit.
 function describe(r: SimResult): string {
   if (r.status === 'loss') return 'loss';

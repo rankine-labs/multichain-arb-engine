@@ -1,4 +1,4 @@
-import { readOutlierConfig, isOutlier, confirmOutlier } from '../core/outlierGuard';
+import { readOutlierConfig, isOutlier, confirmOutlier, withDeadline } from '../core/outlierGuard';
 import type { SimResult } from '../execution/simulator';
 
 // ============================================================================
@@ -79,6 +79,15 @@ async function main() {
   // Case of the anchor address does not matter.
   const vCase = await confirmOutlier({ tokenIn: USDG.toLowerCase(), anchors, amountIn: amt, firstProfit: first, simulate: real.simulate });
   assert(vCase.ok, 'anchor match ignores upper/lower case');
+
+  // Deadline: a second check that never answers counts as not confirmed (fail closed).
+  const t0 = Date.now();
+  const vSlow = await withDeadline(new Promise<never>(() => {}), 50);
+  assert(!vSlow.ok && 'reason' in vSlow && /took over 50 ms/.test(vSlow.reason) && Date.now() - t0 < 1000, 'second check that never answers: refused after the deadline');
+  const vErr = await withDeadline(Promise.reject(new Error('boom')), 50);
+  assert(!vErr.ok && 'reason' in vErr && /boom/.test(vErr.reason), 'second check that throws: refused');
+  const vFast = await withDeadline(Promise.resolve({ ok: true as const, detail: 'fine' }), 50);
+  assert(vFast.ok, 'second check that answers in time: its answer is kept');
 }
 
 main().catch((e) => { console.error('FAIL: test crashed', e); process.exitCode = 1; });
