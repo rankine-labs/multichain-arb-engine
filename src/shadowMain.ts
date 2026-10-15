@@ -83,7 +83,7 @@ import { scanUniverse, emptyScanState, ScanState, stateToPools, stateToPoolsStep
 import { CrossQuoteMonitor, LoopMonitor, shouldScheduleFirstLoopReport } from './core/crossQuoteMonitor';
 import { NewPoolWatch } from './core/newPoolWatch';
 import { buildTokenGroups, loadTokenGroups, groupsStatusLine, TokenGroupsResult } from './core/tokenGroups';
-import { readFileSync, writeFileSync, mkdirSync, renameSync } from 'fs';
+import { readFileSync, writeFileSync, mkdirSync, renameSync, existsSync } from 'fs';
 import { ROBINHOOD_SCAN_FACTORIES } from './config/knownAddresses';
 // Uniswap V4 in the chain-wide scan, asked PER PAIR (core/v4Lookup.ts), not
 // from V4's history (that ran out of memory twice on Oct 9). RH_V4_SCAN=0 off.
@@ -157,9 +157,8 @@ import { RealisticPnl, readStartCoins, WinFacts } from './core/realisticPnl';
 import { StableTally, parseStableEnv } from './core/stableTally';
 // Hourly report version 2 (Oct 15, reporting only): money ledgers, the new
 // plain hourly message and the 4-hour accumulator (src/report/).
-import { MoneyLedgers, RealMoneyLedger } from './report/ledgers';
-import { PeriodStats, WinsTested } from './report/periodStats';
-import { hourlyMessage, reportV2On, hourNumbersFrom, HourlyReportInput, FULL_HOUR_MIN_MS } from './report/hourlyReport';
+import { MoneyLedgers, RealMoneyLedger, hourMoneyOf } from './report/ledgers';
+import { hourlyMessage, reportV2On, HourlyReportInput, FULL_HOUR_MIN_MS } from './report/hourlyReport';
 import { FailoverJsonRpcProvider } from './core/failoverRpc';
 import { makeCaller } from './core/universeScan';
 import { loadNodeUsage, saveNodeUsage, nodeUsageToday, NodeBudget, budgetForUrl, callsInBody } from './core/nodeBudget';
@@ -190,6 +189,14 @@ import { trustFreshConfigFromEnv, wsTrustProblem, WsFacts } from './core/trustFr
 // Stall finder (Oct 14): which job froze the bot, plus chunked versions of the big jobs.
 import { stallFinder, timed, timedAsync, formatStallLine, formatStallDetail, markStretch, labelled } from './core/stallFinder';
 import { runSteps, drainSteps, writeJsonChunkedQueued } from './core/chunked';
+// 4-HOUR REPORT (reporting only): 4-hour totals of the hourly numbers, and the 3-message formatter.
+import { FourHourStats, HourSample, LoopSample, loopSampleFrom, fourHourMark, zonedParts } from './report/fourHourStats';
+import { formatFourHourReport, FourHourSnapshot } from './report/fourHourReport';
+import { FAIL_GROUP_LABEL } from './core/failReasons';
+import { readMemNotes } from './core/memReport';
+import type { StageSummary } from './core/stageTimer';
+import type { StallSummary } from './core/stallFinder';
+import { killSwitchOn } from './execution/fastSender';
 // REPORT_CHUNKED (Oct 14, freeze phase 1): the thin pool check and the
 // hourly report's price sample run in small bites (same results) instead
 // of one long freeze. REPORT_CHUNKED=0 = one go (old behaviour).
@@ -455,6 +462,8 @@ Object.entries(discoveryConfigs).map(([chain, cfg]) => [chain, new PoolDiscovery
 // ==========================================================================
 // Paid endpoint if configured, else public (see simRpcUrl in simulator.ts).
 const simRpc: Record<string, Rpc> = {};
+// Practice-test node names (never URLs), for the 4-hour report's connections section.
+let checkNodeLabel: string | null = null;
 // Robinhood's free public node, used to DOUBLE-CHECK a trade the checking node
 // (QuickNode) says breaks with no reason. Oct 7: QuickNode reverted every
 // Ramses V3 check while the free node and fork tests ran the same trade fine.
@@ -478,6 +487,7 @@ for (const chain of ['avalanche', 'monad', 'robinhood'] as const) {
             const built = buildCheckRpc(checkPlan);
             simRpc[chain] = built.rpc;
             console.log(`[sim] robinhood: ${built.description}`); // provider names only, never URLs
+            checkNodeLabel = built.description;
             continue;
       }
       // Robinhood: if the paid node refuses (rate/plan limit), simulate on the
@@ -494,6 +504,7 @@ for (const chain of ['avalanche', 'monad', 'robinhood'] as const) {
                   ? makeFallbackRpc(makeRpc(primary), makeRpc(fallback), (m) => console.warn(`[sim] robinhood ${m.replace('public node', 'backup node')}`))
                   : makeRpc(primary);
             console.log(`[sim] robinhood: checks on ${qn ? 'QuickNode' : source}${fallback ? ' (fallback: Alchemy)' : ''}`);
+            checkNodeLabel = `${qn ? 'QuickNode' : source}${fallback ? ' (backup: Alchemy)' : ' (no backup)'}`;
             continue;
       }
       simRpc[chain] = makeRpc(url);
@@ -582,6 +593,21 @@ const funnel = {
       skip: new Map<string, number>(), // checker skipped it: reason -> count
 };
 const funnelSkip = (why: string) => funnel.skip.set(why, (funnel.skip.get(why) ?? 0) + 1);
+// 4-HOUR REPORT (reporting only, REPORT_V2=1 by default; 0 = no 4-hour report).
+// Keeps 4-hour totals of the hourly numbers plus each win as it is counted,
+// saved to data/report-4h.json so a restart keeps them. Never touches trading.
+const REPORT_4H_ON = reportV2On(process.env);
+const fourHour: FourHourStats | null = REPORT_4H_ON ? new FourHourStats('data/report-4h.json') : null;
+if (fourHour) setInterval(() => timed('4h report save', () => fourHour.save()), 60_000);
+// Read-only facts the 4-hour report shows, filled in further down where they exist.
+let lastLoopSample: LoopSample | null = null;        // the loop trader's last hour (set when the hourly code takes it)
+let lastThinPoolCount: number | null = null;         // pools left out as thin at the last check
+let wsReaderRef: WsBlockReader | null = null;        // the push block reader, when set up
+let blockReaderStats: (() => { errors: number; rateLimited: number }) | null = null;
+// Pool kind for the parts check: 'v4', 'v3', 'v2', or the pool type.
+const poolKind = (p: PoolState): string => (p.v4 ? 'v4' : p.poolType);
+// Reporting must never break the money path: any error in it is ignored.
+const report4h = (fn: () => void) => { try { fn(); } catch { /* reporting only */ } };
 // Why Robinhood checks "wouldn't go through" this hour, sorted into plain
 // groups (coin takes a cut, our bug, old price info...). Reset every hour.
 const failTally = new FailTally();
@@ -620,11 +646,13 @@ const outlierCountOk = async (label: string, netUsd: number, sizeUsd: number,
       // outliers are simply not counted in the practice numbers.
       if (robinhoodSender.live) {
             console.log(`[outlier] ${label} $${netUsd.toFixed(2)} on $${Math.round(sizeUsd)}: outlier, not counted (live: the send path decides)`);
+            report4h(() => fourHour?.noteOutlierBlocked(netUsd));
             return false;
       }
       const v = await confirmRhOutlier(trade.tokenIn, trade.hops, trade.amountIn, trade.profit, trade.v3Lender, trade.blockTag);
       if (v.ok) { console.log(`[outlier] ${label} $${netUsd.toFixed(2)} on $${Math.round(sizeUsd)}: ${v.detail}, counted`); return true; }
       funnelSkip('outlier profit, not counted (too good to be true, see [outlier] log)');
+      report4h(() => fourHour?.noteOutlierBlocked(netUsd));
       console.log(`[outlier] ${label} $${netUsd.toFixed(2)} on $${Math.round(sizeUsd)}: OUTLIER, NOT COUNTED (${'reason' in v ? v.reason : 'refused'})`);
       return false;
 };
@@ -821,6 +849,7 @@ const runSimulation = (
                         const winNet = r.status === 'profit' && plausibleProfit(r.profit, built.amountIn)
                               ? (Number(r.profit) / 10 ** decimals) * usdPerToken - rhGasUsd(0.05) : undefined;
                         venueTally.add(buyPool.dex, sellPool.dex, torontoDay(), winNet);
+                        report4h(() => fourHour?.noteTest([poolKind(buyPool), poolKind(sellPool)], winNet));
                   }
                   if (r.status !== 'profit' || !plausibleProfit(r.profit, built.amountIn)) muteLoser(muteKey);
                   const pairTokens = [buyPool.tokenA, buyPool.tokenB];
@@ -1151,18 +1180,16 @@ const moneyLedgers = new MoneyLedgers({
       checked: () => { const s = dryRunPnl.summary(); return { today: s.today.verifiedUsd, week: s.last7.verifiedUsd }; },
       couldEarn: () => { const s = realisticPnl.summary(); return { today: s.today.usd, week: s.weekUsd }; },
 }, realMoney);
-// 4-HOUR TOTALS (src/report/periodStats.ts): each hourly report adds its
-// numbers here; the separate 4-hour report reads (take()) them. Saved to disk.
-const periodStats = new PeriodStats('data/period-stats.json');
 // Every verified practice win goes through here: the normal total, then the
 // live-realistic total and the other-stablecoin counter (both reporting only).
 // `usd` is what the normal total adds (net of gas, only the new part of a
 // re-checked gap), so nothing is counted twice.
 const countVerifiedWin = (usd: number, label: string, win: WinFacts, pairTokens: [string, string]) => {
       dryRunPnl.recordVerified(usd, label);
-      const realistic = realisticPnl.record(usd, win);
-      // Same win into the hourly report's "last hour" counters (reporting only).
-      moneyLedgers.notePracticeWin(usd, label, realistic === 'ok');
+      const verdict = realisticPnl.record(usd, win);
+      // Same win into the hourly money ledgers. The hourly report AND the
+      // 4-hour report read them, so their money numbers always agree.
+      moneyLedgers.notePracticeWin(usd, label, verdict);
       stableTally.noteWin(pairTokens, win.startToken, usd);
 };
 // Save on shutdown too: pm2 restart/stop (every deploy) sends SIGINT, and the
@@ -1171,7 +1198,8 @@ for (const sig of ['SIGINT', 'SIGTERM'] as const) {
       process.once(sig, () => {
             try { dryRunPnl.save(); } catch { /* best effort */ }
             try { realisticPnl.save(); stableTally.save(); } catch { /* best effort */ }
-            try { realMoney.save(); periodStats.save(); } catch { /* best effort */ }
+            try { realMoney.save(); } catch { /* best effort */ }
+            try { fourHour?.save(); } catch { /* best effort */ }
             try { gasModel.calibration.maybeSave(true); } catch { /* best effort */ }
             try { robinhoodWatcher.save(WATCH_FILE); } catch { /* best effort */ }
             try { routeScores.save(ROUTE_FILE); } catch { /* best effort */ }
@@ -1510,10 +1538,6 @@ const loopWorkerTriggersOn = loopWorkerOn && (loopFix.realPrices || loopFix.trig
 let requestLoopScan: () => void = () => {};
 // The hourly report waits for this (the loop worker answers by message).
 let loopHourText: () => Promise<string | undefined> | string | undefined = () => undefined;
-// The same hour's loop numbers as plain counts (checked / would make money),
-// set by loopHourText when it takes the hour, for the hourly report v2.
-// null = no loop numbers this hour (loop trader off or worker not answering).
-let loopHourNums: WinsTested | null = null;
 // EXTRA SINGLE POOLS for the loop finder (core/loopExtraPools.ts). Created
 // further down, next to the chain-wide scan, only when LOOP_TRADER=1 (and
 // LOOP_EXTRA_POOLS is not 0). null = off: the block reader, gap scanner and
@@ -1727,10 +1751,10 @@ if (loopCfg.enabled && !loopWorkerOn) {
       let loopHourStart = Date.now();
       loopHourText = () => {
             const h = loopTrader.takeHour();
-            loopHourNums = { won: h.wouldMake, tested: h.checked };
             loopHourStart = Date.now();
             const node = loopNodeText({ ...loopGuard.takeHour(), busySkips: loopThrottle.takeBusy() });
             console.log(loopLogLine(h, loopCfg.maxPools, 'hour', node));
+            report4h(() => { lastLoopSample = loopSampleFrom(h, node); });
             return formatLoopHour(h, loopCfg.maxPools, loopExtra?.status(loopCfg.maxPoolAgeMs) ?? null) + `\n  ${node}`;
       };
       // Every 15 min: the hour's numbers so far (read only, nothing reset), so
@@ -1848,8 +1872,8 @@ if (loopWorkerOn) {
                   console.log('[loop] hour: no numbers (loop worker not answering or restarting)');
                   return 'Loop trades: no numbers this hour (loop worker restarting)';
             }
-            loopHourNums = { won: r.h.wouldMake, tested: r.h.checked };
             console.log(loopLogLine(r.h, loopCfg.maxPools, 'hour', r.node));
+            report4h(() => { lastLoopSample = loopSampleFrom(r.h, r.node); });
             return formatLoopHour(r.h, loopCfg.maxPools, loopExtra?.status(loopCfg.maxPoolAgeMs) ?? null) + `\n  ${r.node}`;
       };
       console.log(`[loop] fix phase 2: real prices ${realPricesOn ? 'on' : 'off'}, keep block updates ${loopFix.keepBlockUpdates ? 'on' : 'off'}, trigger replay ${loopFix.triggerReplay ? 'on' : 'off'}, model vs check ${loopFix.modelVsCheck ? 'on' : 'off'}, cheap scan ${loopFix.cheapScan ? 'on' : 'off'}`);
@@ -2806,6 +2830,7 @@ await chainManager.startAll();
                         else if (check.status === 'fail') noteCheck([g.base, g.quote], 'fail', check.reason);
                         // Per-exchange practice count (skipped checks were not tests).
                         if (check.status !== 'skipped') venueTally.add(g.buyPool.dex, g.sellPool.dex, torontoDay(), check.status === 'profit' ? simNet : undefined);
+                        if (check.status !== 'skipped') report4h(() => fourHour?.noteTest([poolKind(g.buyPool), poolKind(g.sellPool)], check.status === 'profit' ? simNet : undefined));
                         if (check.status !== 'profit' || simNet < GAP_CONFIRM_MIN_USD) {
                               gapMutedUntil.set(key, Date.now() + GAP_FAKE_MUTE_MS);
                               gapMutedSig.set(key, sig);
@@ -3014,6 +3039,7 @@ await chainManager.startAll();
                         // Push feed down: polling resumes from the last block it delivered.
                         onHealthChange: (healthy, last) => { if (!healthy && last > 0) blockReader.setBookmark(last - 1); },
                   });
+                  wsReaderRef = wsReader; // read by the 4-hour report (connections)
                   wsFacts = wsReader; // SPEED_TRUST_WS reads its health facts (core/trustFresh.ts)
             }
             const blockReader = new BlockReader({
@@ -3033,6 +3059,7 @@ await chainManager.startAll();
             });
             blockReader.start();
             wsReader?.start();
+            blockReaderStats = () => blockReader.stats(); // read by the 4-hour report (node errors)
             const logReader = () => {
                   const st = blockReader.stats();
                   const errs = blockReader.errorSummary(3);
@@ -3308,6 +3335,7 @@ await chainManager.startAll();
                         ? await runSteps(thinPoolsSteps(cache.allForChain('robinhood'), decimalsOf, usdThin), 'thin pool check')
                         : timed('thin pool check', () => thinPools(cache.allForChain('robinhood'), decimalsOf, usdThin));
                   markStretch('thin pool check');
+                  lastThinPoolCount = thin.length; // shown in the 4-hour report
                   const k = (x: number) => (x >= 1000 ? `$${Math.round(x / 1000)}k` : `$${Math.round(x)}`);
                   console.log(`[thinpools] ${thin.length} pool(s) left out (looked deep, real coins under $${Math.round(POOL_MIN_DEPTH_USD / 1000)}k)` +
                         (thin.length ? `: ${thin.slice(0, 3).map((t) => `${symbolOf('robinhood', t.pool.tokenA)}/${symbolOf('robinhood', t.pool.tokenB)} ${t.pool.dex} ${(t.pool.feePips ?? t.pool.feeBps * 100) / 10_000}% ${k(t.realUsd)} real vs ${k(t.virtualUsd)} assumed`).join(' · ')}` : ''));
@@ -3693,19 +3721,61 @@ for (let i = 0; i < resolved.length; i++) {
             });
       };
 
+      // One hour of the hourly report's numbers as a plain HourSample for the
+      // 4-hour totals (report/fourHourStats.ts). Reads only; called while the
+      // hour's counters are still set (before the reset below).
+      const hourSampleFrom = (r: PlainHourlyInput, fromMs: number, toMs: number, reactionN: number, stage: StageSummary, stall: StallSummary): HourSample => {
+            const f = r.funnel;
+            const lv = liveTracker.summary();
+            const stages: HourSample['stages'] = {};
+            for (const [k, v] of Object.entries(stage.stages)) stages[k] = { n: v.n, median: v.median, p95: v.p95 };
+            return {
+                  fromMs, toMs,
+                  funnel: {
+                        tradesRead: f?.tradesRead ?? 0, noPool: f?.noPool ?? 0, tooSmall: f?.tooSmall ?? 0, noPartner: f?.noPartner ?? 0,
+                        noUsdPrice: f?.noUsdPrice ?? 0, smallerThanFees: f?.smallerThanFees ?? 0, found: f?.found ?? 0,
+                        belowCheckBar: f?.belowCheckBar ?? 0, notVetted: f?.notVetted ?? 0, sentToCheck: f?.sentToCheck ?? 0,
+                  },
+                  checkBarUsd: f?.checkBarUsd ?? SIM_CHECK_BAR_USD,
+                  checks: {
+                        done: r.checks.done, makeMoney: r.checks.makeMoney, loseMoney: r.checks.loseMoney, wouldFail: r.checks.wouldFail,
+                        // "Too late to test": failed because the price info was old (the price had moved).
+                        tooLate: (r.checks.failReasons ?? []).find(([label]) => label === FAIL_GROUP_LABEL.stale)?.[1] ?? 0,
+                        nodeBusy: r.checks.nodeBusy,
+                  },
+                  timing: r.checks.timing ? { ...r.checks.timing } : { rightAfter: 0, othersInBlock: 0, late: 0 },
+                  benchedRoutes: r.checks.benchedRoutes ?? 0,
+                  checksAvailable: r.checksAvailable,
+                  race: r.race ? { won: r.race.won, lost: r.race.lost, unclear: r.race.unclear, wonUsd: r.race.wonUsd, lostUsd: r.race.lostUsd } : null,
+                  reaction: { n: reactionN, medianMs: r.reactionMs.typical, p95Ms: r.reactionMs.slowest5pct },
+                  stages,
+                  stalls: { enabled: stall.enabled, thresholdMs: stall.thresholdMs, freezes: stall.freezes, worstMs: stall.worstMs,
+                        causes: stall.causes.slice(0, 8).map((c) => [c.name, c.n, c.maxMs] as [string, number, number]), gcN: stall.gc.n, gcMs: stall.gc.totalMs },
+                  rivalsSpeed: r.otherBots ? { ...r.otherBots } : null,
+                  loops: lastLoopSample,
+                  venues: venueTally.hourCounts(),
+                  live: { sent: lv.sent, won: lv.won, profitUsd: lv.profitUsd, gasUsd: lv.gasUsd },
+                  feedDrops: r.feedReconnects,
+            };
+      };
+
       let lastDigestAt = Date.now();
       // REPORT_V2 (Oct 15, owner approved, default on): the short plain hourly
       // message (src/report/hourlyReport.ts), sent at the top of each clock
-      // hour. REPORT_V2=0: the old long hourly message, on the old timer,
-      // exactly as before. Either way every hourly counter below is taken
-      // (read and reset) once per report, exactly as before, and the log
-      // lines and status page are unchanged.
+      // hour, plus the 4-hour report. REPORT_V2=0: the old long hourly
+      // message on the old timer, exactly as before, and no 4-hour report.
+      // ONE COLLECTION: every hourly counter (loop hour, funnel, stage timers,
+      // stall finder, race check, venue tally, rival hour, new pools, money
+      // ledgers...) is taken exactly once per run of sendHourlyDigestInner.
+      // That one set of numbers feeds the hourly message (new or old), the
+      // 4-hour totals, and (sendHourly=false) the part-hour collection at a
+      // 4-hour mark. Runs never overlap (see sendHourlyDigest below).
       const REPORT_V2 = reportV2On(process.env);
       // First report since the bot started: its window is partial.
       let firstHourlyReport = true;
-      // Free node rests since start, at the last report (to count this hour's).
+      // Free node rests since start, at the last collection (to count this hour's).
       let lastFreeNodeSwitches = robinhoodReadProvider.router.getStats().switches;
-      const sendHourlyDigestInner = async () => {
+      const sendHourlyDigestInner = async (sendHourly = true) => {
             const now = Date.now();
             try {
                   if (REPORT_CHUNKED) {
@@ -3727,12 +3797,14 @@ for (let i = 0; i < resolved.length; i++) {
                         const hourNewPools = newPoolWatchRef?.takeHour() ?? null;
                         if (hourNewPools && newPoolWatchRef) console.log(newPoolWatchRef.statusLine(hourNewPools));
                         // Loop numbers: from the loop worker by message when it runs (waits up to 3 s).
-                        loopHourNums = null; // set again by loopHourText if this hour has loop numbers
+                        lastLoopSample = null; // filled by loopHourText when loop numbers arrive
                         const loopsHour = await loopHourText();
-                        // Taken once here (they reset), used by both report versions.
+                        // Taken ONCE here (each take starts a fresh hour), shared by the
+                        // hourly message (both versions) and the 4-hour totals.
+                        const stageHour = stageTimers.take('hour');
                         const stallHour = stallFinder.take('hour');
                         const raceHour = raceChecker.takeHour();
-                        const oldInput: PlainHourlyInput = {
+                        const hourInput: PlainHourlyInput = {
                               windowLabel: `${hhmm(lastDigestAt)} to ${hhmm(now)}`,
                               live: robinhoodSender.live,
                               feedOk: status.robinhood?.online ?? false,
@@ -3783,7 +3855,7 @@ for (let i = 0; i < resolved.length; i++) {
                               venueTests: venueTally.hourText() ?? undefined,
                               loops: loopsHour,
                               memory: memReport?.hourLine(),
-                              speed: (({ median, p95 }) => ({ median, p95 }))(stageTimers.take('hour')),
+                              speed: { median: stageHour.median, p95: stageHour.p95 },
                               // Stall finder: freezes this hour and what caused them (core/stallFinder.ts).
                               stalls: [formatStallLine(stallHour), formatStallDetail(stallHour)].filter(Boolean),
                               race: raceHour,
@@ -3801,10 +3873,10 @@ for (let i = 0; i < resolved.length; i++) {
                         };
                         // ---- Hourly report v2 numbers (all already measured above) ----
                         const moneySnap = moneyLedgers.takePeriod();
-                        // Window: since the last report; the first report after a
+                        // Window: since the last collection; the first one after a
                         // restart starts when the money counters started (bot start).
                         const fromMs = firstHourlyReport ? Math.min(moneySnap.periodStartMs, lastDigestAt) : lastDigestAt;
-                        const ck = oldInput.checks;
+                        const ck = hourInput.checks;
                         // "waited too long in the check line" (queue time-outs) this hour.
                         let tooLate = 0;
                         for (const [why, c] of funnel.skip) if (why.startsWith('waited too long in the check line')) tooLate += c;
@@ -3815,8 +3887,8 @@ for (let i = 0; i < resolved.length; i++) {
                               restarted: firstHourlyReport && now - fromMs < FULL_HOUR_MIN_MS,
                               money: { ...moneySnap, periodStartMs: fromMs, periodEndMs: now },
                               startLabel: realisticPnl.cfg.startLabel,
-                              normal: oldInput.checksAvailable || ck.done > 0 ? { won: ck.makeMoney, tested: ck.done } : null,
-                              loop: loopHourNums,
+                              normal: hourInput.checksAvailable || ck.done > 0 ? { won: ck.makeMoney, tested: ck.done } : null,
+                              loop: lastLoopSample ? { won: lastLoopSample.wouldMake, tested: lastLoopSample.checked } : null,
                               races: { won: raceHour.won, lost: raceHour.lost, unclear: raceHour.unclear, pending: raceHour.pending },
                               feedOk: status.robinhood ? status.robinhood.online : null,
                               reactionMs: stats.medianReactionMs,
@@ -3826,11 +3898,12 @@ for (let i = 0; i < resolved.length; i++) {
                               nodeErrors: simStats.rateLimited + Math.max(0, rpc.switches - lastFreeNodeSwitches),
                         };
                         lastFreeNodeSwitches = rpc.switches;
-                        // The 4-hour report's running totals (both versions, never blocks the send).
-                        try { periodStats.add(hourNumbersFrom(v2Input)); } catch (err) { console.warn('[report] 4-hour totals add failed (ignored):', (err as Error).message); }
-                        console.log(`[report] hourly ${REPORT_V2 ? 'v2' : 'v1'}: checked ${moneySnap.checked.lastHour.toFixed(2)}, could earn live ${moneySnap.couldEarn.lastHour.toFixed(2)}, real ${moneySnap.real.lastHour.toFixed(2)}`);
-                        await sendTelegramMessage(hourlyMessage(REPORT_V2, v2Input, oldInput));
-                  } else await sendTelegramMessage(formatHourlyDigest({
+                        // 4-hour totals: this collection's numbers, copied once, with the
+                        // same money the hourly shows (reporting only, never throws).
+                        if (fourHour) report4h(() => fourHour.addHour({ ...hourSampleFrom(hourInput, fromMs, now, stats.seen, stageHour.summary, stallHour), money: hourMoneyOf(moneySnap) }));
+                        if (REPORT_V2) console.log(`[report] hourly v2${sendHourly ? '' : ' (collected for the 4-hour report, not sent)'}: checked ${moneySnap.checked.lastHour.toFixed(2)}, could earn live ${moneySnap.couldEarn.lastHour.toFixed(2)}, real ${moneySnap.real.lastHour.toFixed(2)}`);
+                        if (sendHourly) await sendTelegramMessage(hourlyMessage(REPORT_V2, v2Input, hourInput));
+                  } else if (sendHourly) await sendTelegramMessage(formatHourlyDigest({
                         windowLabel: `${hhmm(lastDigestAt)} to ${hhmm(now)}`,
                         chains: (['avalanche', 'monad', 'robinhood'] as const).filter(chainOn).map((chain) => ({
                               chain,
@@ -3870,14 +3943,33 @@ for (let i = 0; i < resolved.length; i++) {
             }
       };
       // Building the report is timed by the stall finder too.
-      const sendHourlyDigest = () => timedAsync('hourly report', sendHourlyDigestInner);
+      // sendHourly=false: take the hour's numbers into the 4-hour totals
+      // without sending the hourly message (a part-hour at a 4-hour mark).
+      // Runs are strictly one after another (a queue), so two runs can never
+      // read the same counters (no double take, no lost hour).
+      let digestQueue: Promise<void> = Promise.resolve();
+      const sendHourlyDigest = (sendHourly = true): Promise<void> => {
+            const run = digestQueue.then(() => timedAsync('hourly report', () => sendHourlyDigestInner(sendHourly)).then(() => undefined, () => undefined));
+            digestQueue = run;
+            return run;
+      };
+      // Set further down (4-hour report): called right after the top-of-hour
+      // hourly when that hour is a 4-hour mark, so the hourly goes first and
+      // the 4-hour report uses the same collection (no second take).
+      let afterTopOfHour: (() => Promise<void>) | null = null;
       if (REPORT_V2) {
             // Top of each clock hour (+1 s so the time reads 15:00, not 14:59).
             // Recomputed every time, so it never drifts.
             const scheduleNextHourly = () => {
                   const t = Date.now();
                   const next = Math.floor(t / 3_600_000) * 3_600_000 + 3_600_000 + 1_000;
-                  setTimeout(() => { scheduleNextHourly(); void sendHourlyDigest(); }, next - t);
+                  setTimeout(() => {
+                        scheduleNextHourly();
+                        void (async () => {
+                              await sendHourlyDigest();
+                              try { if (afterTopOfHour) await afterTopOfHour(); } catch (err) { console.error('[report4h] after hourly failed:', err); }
+                        })();
+                  }, next - t);
             };
             scheduleNextHourly();
       } else setInterval(sendHourlyDigest, 60 * 60 * 1000);
@@ -3921,8 +4013,96 @@ for (let i = 0; i < resolved.length; i++) {
       reportNow = sendHourlyDigest;
       if (reportRequested) { reportRequested = false; void sendHourlyDigest(); }
       // First report 10 minutes after start, so a fresh deploy shows up in
-      // Telegram quickly instead of an hour later.
-      setTimeout(() => { void sendHourlyDigest(); }, 10 * 60 * 1000);
+      // Telegram quickly instead of an hour later. REPORT_V2=0 only: with
+      // REPORT_V2 the first hourly comes at the next top of the hour, marked
+      // "partial (bot restarted)", and the startup alert confirms the deploy.
+      if (!REPORT_V2) setTimeout(() => { void sendHourlyDigest(); }, 10 * 60 * 1000);
+
+      // ======================================================================
+      // 4-HOUR REPORT (REPORT_V2, default on; REPORT_V2=0 = off). Reporting only.
+      // At 00:00, 04:00, 08:00, 12:00, 16:00 and 20:00 (REPORT_4H_TZ, default
+      // Toronto): take the last part-hour into the totals, then send the 3
+      // messages (report/fourHourReport.ts). The sent mark is saved, so a
+      // restart never sends the same report twice. Robinhood-only setup only.
+      // ======================================================================
+      const REPORT_4H_TZ = process.env.REPORT_4H_TZ || 'America/Toronto';
+      let sending4h = false;
+      // collect=false: the top-of-hour hourly has just taken this hour's
+      // numbers (one collection feeds both). collect=true (fallback, e.g. the
+      // bot restarted at 16:10): take the part-hour first, without an hourly message.
+      const sendFourHourReport = async (markKey: string, collect = true) => {
+            if (!fourHour || sending4h) return;
+            sending4h = true;
+            try {
+                  if (collect) await sendHourlyDigest(false); // the numbers since the last hourly take
+                  const now = Date.now();
+                  // The 4-hour mark this report ends at, and the one it starts at.
+                  // (now minus the minutes and seconds past the mark's hour)
+                  const markMs = now - zonedParts(now, REPORT_4H_TZ).minute * 60_000 - (now % 60_000);
+                  const scheduledFromMs = markMs - 4 * 3600_000;
+                  const fromMs = Math.max(scheduledFromMs, fourHour.peek(now).fromMs);
+                  const status = chainManager.getStatus() as Record<string, { online: boolean }>;
+                  const st = robinhoodWatcher.stats();
+                  const rpc = robinhoodReadProvider.router.getStats();
+                  const est = gasModel.twoPool(!RH_OWN_MONEY);
+                  const mem = memReport ? memReport.sample() : process.memoryUsage();
+                  const ws = wsReaderRef?.stats() ?? null;
+                  const br = blockReaderStats ? blockReaderStats() : null;
+                  const snap: FourHourSnapshot = {
+                        live: robinhoodSender.live,
+                        loansOn: !RH_OWN_MONEY,
+                        pairs: st.pairs, pools: st.pools,
+                        gasPerTradeUsd: Number.isFinite(est.usd) ? est.usd : null,
+                        gasSamples: est.source === 'old' ? null : est.samples,
+                        gasCalibrated: est.source === 'old' ? null : est.calibrated,
+                        gasSource: est.source,
+                        feePoolsFromSwaps: eventFeeCounts(cache.allForChain('robinhood')).fromEvents,
+                        otherStables: stableTally.line(),
+                        rivals: rivalWatch.summary(fromMs, now),
+                        rivalBotsKnown: rivalWatch.botCount(),
+                        newPools: newPoolWatchRef?.summary(fromMs, now) ?? null,
+                        thinPools: lastThinPoolCount,
+                        memory: { rssMb: Math.round(mem.rss / 1_048_576), peakRssMb: memReport ? Math.round(memReport.peakRss / 1_048_576) : null, heapMb: Math.round(mem.heapUsed / 1_048_576), notes: readMemNotes() },
+                        feedOkNow: status.robinhood?.online ?? null,
+                        ws: ws ? { healthy: ws.healthy, reconnects: fourHour.delta('ws reconnects', ws.reconnects), todayMessages: ws.todayMessages, cap: Number(process.env.BLOCK_READER_WSS_DAILY ?? 400_000), capped: ws.capped } : null,
+                        checkNode: checkNodeLabel,
+                        nodeErrors: {
+                              blockReaderErrors: br ? fourHour.delta('block reader errors', br.errors) : null,
+                              blockReaderRateLimited: br ? fourHour.delta('block reader rate limited', br.rateLimited) : null,
+                              freeNodeRests: fourHour.delta('free node switches', rpc.switches),
+                        },
+                        nodeUsage: [...nodeUsageToday(), ...nodeUsageCounter.reportLines()],
+                        loopsOn: loopCfg.enabled,
+                        maxLoopPools: loopCfg.maxPools,
+                        emergencyStop: killSwitchOn(process.env.KILL_SWITCH) || existsSync(process.env.KILL_FILE ?? 'data/KILL') ? 'on' : 'off',
+                  };
+                  // Close the period first: a failed send never makes a second copy later.
+                  const { totals, prev } = fourHour.close(markKey, now);
+                  const msgs = formatFourHourReport({ tz: REPORT_4H_TZ, scheduledFromMs, toMs: now, totals, prevWins: prev, snap });
+                  console.log(`[report4h] sending 4-hour report ${markKey} (${msgs.map((m) => m.length).join('/')} chars)`);
+                  for (const m of msgs) await sendTelegramMessage(m);
+            } catch (err) {
+                  console.error('[telegram] 4-hour report failed:', err);
+            } finally { sending4h = false; }
+      };
+      if (fourHour && chainOn('robinhood') && !chainOn('monad') && !chainOn('avalanche')) {
+            // Normal path: right after the top-of-hour hourly (hourly first, then
+            // the 3 messages of the 4-hour report, same collection).
+            afterTopOfHour = async () => {
+                  const mark = fourHourMark(Date.now(), REPORT_4H_TZ);
+                  if (mark && mark !== fourHour.lastSentKey) await sendFourHourReport(mark, false);
+            };
+            // Fallback (a restart just after a mark, or the normal path failed):
+            // checked every minute, but never in the first 3 minutes of an hour,
+            // which belong to the normal path.
+            setInterval(labelled('4h report check', () => {
+                  const t = Date.now();
+                  if (zonedParts(t, REPORT_4H_TZ).minute < 3) return;
+                  const mark = fourHourMark(t, REPORT_4H_TZ);
+                  if (mark && mark !== fourHour.lastSentKey) void sendFourHourReport(mark, true);
+            }), 60_000);
+            console.log(`[report4h] 4-hour report on (REPORT_V2), at 00/04/08/12/16/20 ${REPORT_4H_TZ}`);
+      }
 
       // Daily RIVAL BOT REPORT at 9:00 Toronto time (Stage 0: learn from the
       // other bots). Sent once per day; the date is saved so a restart

@@ -1,5 +1,6 @@
 import { readFileSync, writeFileSync, mkdirSync, renameSync } from 'fs';
 import { dirname } from 'path';
+import type { HourMoney } from './fourHourStats';
 
 // ============================================================================
 // MONEY LEDGERS FOR THE HOURLY REPORT (Oct 15, owner approved, reporting only)
@@ -15,9 +16,16 @@ import { dirname } from 'path';
 //     Could earn live  the part of those wins our own money could really
 //                      take (starts in USDG/WETH, fits our own money, no
 //                      loan). Today / 7 days come from core/realisticPnl.ts.
-//     Real money made  confirmed REAL trades only (live mode), after the gas
-//                      each one really paid. Gas burnt on failed (reverted)
-//                      trades is kept apart and shown on its own line.
+//     Real money made  confirmed REAL trades only (live mode): the true
+//                      change in our account. Won trades minus the gas each
+//                      one paid, MINUS the gas burnt on failed (reverted)
+//                      trades (owner decision, Oct 15). The gas and failed
+//                      trades are also shown on their own line.
+//
+//   The 4-hour report (src/report/fourHourReport.ts) reads the very same
+//   numbers: each hourly collection copies takePeriod() into its 4-hour
+//   totals (hourMoneyOf below), so 4 hourly reports always add up to the
+//   4-hour report.
 //
 //   "Last hour" for all three is counted here: every win is added to a
 //   running "this report period" counter, and the hourly report takes it
@@ -44,7 +52,7 @@ export interface LedgerRow { lastHour: number; today: number; week: number }
 
 // One period's real-trade numbers (what the live-only line shows).
 export interface RealPeriod {
-  madeUsd: number;          // won trades: profit minus their own gas
+  madeUsd: number;          // true account change: won trades' profit minus ALL gas (won and failed)
   won: number;              // trades that landed and paid
   gasUsd: number;           // gas paid on every real trade (won and failed)
   failed: number;           // trades that reverted on chain (we paid gas, got nothing)
@@ -55,10 +63,16 @@ export interface RealPeriod {
 export interface BestWin { usd: number; label: string }
 
 // The running counter for the current report period (memory only).
+// Why a checked win was left out of "Could earn live" (same words as core/realisticPnl.ts).
+export type LeftOutReason = 'otherCoin' | 'overSize' | 'loan';
+export type LeftOut = Record<LeftOutReason, { n: number; usd: number }>;
+const emptyLeftOut = (): LeftOut => ({ otherCoin: { n: 0, usd: 0 }, overSize: { n: 0, usd: 0 }, loan: { n: 0, usd: 0 } });
+
 interface PeriodCounter {
   startMs: number;
   checkedUsd: number; checkedCount: number;
   couldEarnUsd: number; couldEarnCount: number;
+  leftOut: LeftOut;
   best: BestWin | null;
   real: RealPeriod;
 }
@@ -120,7 +134,8 @@ export class RealMoneyLedger {
       // No price for the profit coin: we only know what we paid in gas.
       d.madeUsd = num(r.profitUsd) - gas;
     } else if (r.status === 'reverted') {
-      d.failed = 1; d.gasUsd = gas; d.failedCostUsd = gas;
+      // Failed trade: we paid gas and got nothing, so the account went down.
+      d.failed = 1; d.gasUsd = gas; d.failedCostUsd = gas; d.madeUsd = -gas;
     } else return d; // dropped: never mined, no gas, nothing to add
     const k = RealMoneyLedger.hourKey(this.now());
     const h = (this.state.hours[k] ??= fixHour(null));
@@ -136,7 +151,7 @@ export class RealMoneyLedger {
     for (const k of Object.keys(this.state.hours)) if (Number(k) < oldest) delete this.state.hours[k];
   }
 
-  // Sums of real money made (won trades, after their gas) for today
+  // Sums of real money made (true account change, all gas taken off) for today
   // (Toronto) and the last 7 Toronto days including today.
   totals(): { today: number; week: number; todayPeriod: RealPeriod; weekPeriod: RealPeriod } {
     const todayKey = this.dayKey();
@@ -186,6 +201,7 @@ export interface LedgerSnapshot {
   realPeriod: RealPeriod;   // this period's real-trade details (gas, failed trades)
   checkedCount: number;     // checked wins this period
   couldEarnCount: number;
+  leftOut: LeftOut;         // checked wins left out of "Could earn live", by reason
   best: BestWin | null;     // biggest checked win this period
 }
 
@@ -203,17 +219,19 @@ export class MoneyLedgers {
   }
 
   private static freshPeriod(startMs: number): PeriodCounter {
-    return { startMs, checkedUsd: 0, checkedCount: 0, couldEarnUsd: 0, couldEarnCount: 0, best: null, real: emptyReal() };
+    return { startMs, checkedUsd: 0, checkedCount: 0, couldEarnUsd: 0, couldEarnCount: 0, leftOut: emptyLeftOut(), best: null, real: emptyReal() };
   }
 
   // A checked practice win, called right where the practice total counts it.
-  // couldEarnLive: true when the live-realistic total counted it too.
+  // verdict: what the live-realistic total did with it ('ok' = counted as
+  // "Could earn live", otherwise why it was left out; null = it refused it).
   // Same guard as core/dryRunPnl.ts, so the two never disagree.
-  notePracticeWin(usd: number, label: string, couldEarnLive: boolean) {
+  notePracticeWin(usd: number, label: string, verdict: 'ok' | LeftOutReason | null) {
     if (!(usd > 0) || !Number.isFinite(usd) || usd > MoneyLedgers.MAX_ONE_TRADE_USD) return;
     const p = this.period;
     p.checkedUsd += usd; p.checkedCount++;
-    if (couldEarnLive) { p.couldEarnUsd += usd; p.couldEarnCount++; }
+    if (verdict === 'ok') { p.couldEarnUsd += usd; p.couldEarnCount++; }
+    else if (verdict && p.leftOut[verdict]) { p.leftOut[verdict].n++; p.leftOut[verdict].usd += usd; }
     if (!p.best || usd > p.best.usd) p.best = { usd, label: String(label).slice(0, 60) };
   }
 
@@ -250,7 +268,21 @@ export class MoneyLedgers {
       real: { lastHour: p.real.madeUsd, today: real.today, week: real.week },
       realPeriod: { ...p.real },
       checkedCount: p.checkedCount, couldEarnCount: p.couldEarnCount,
+      leftOut: JSON.parse(JSON.stringify(p.leftOut)),
       best: p.best ? { ...p.best } : null,
     };
   }
+}
+
+// One collection's money in the shape the 4-hour totals keep
+// (src/report/fourHourStats.ts HourSample.money).
+export function hourMoneyOf(s: LedgerSnapshot): HourMoney {
+  return {
+    checkedUsd: s.checked.lastHour, checkedCount: s.checkedCount,
+    couldEarnUsd: s.couldEarn.lastHour, couldEarnCount: s.couldEarnCount,
+    leftOut: JSON.parse(JSON.stringify(s.leftOut)),
+    best: s.best ? { ...s.best } : null,
+    realUsd: s.real.lastHour, realWon: s.realPeriod.won,
+    gasUsd: s.realPeriod.gasUsd, failed: s.realPeriod.failed, failedCostUsd: s.realPeriod.failedCostUsd,
+  };
 }

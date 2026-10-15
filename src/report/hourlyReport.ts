@@ -25,10 +25,13 @@
 //     - Every piece of text is HTML escaped before it goes in.
 //     - No em dashes anywhere (the time range uses an en dash, as approved).
 //   Pure function: no clock, no disk, no network. Easy to test.
+//   The 4-hour report (src/report/fourHourReport.ts) is built from the same
+//   collection of numbers (money ledgers, trades, races), so they agree.
 // ============================================================================
 
 import type { LedgerSnapshot } from './ledgers';
-import type { HourNumbers, WinsTested } from './periodStats';
+// A "wins out of tested" pair for one hour.
+export interface WinsTested { won: number; tested: number }
 import { formatPlainHourly, PlainHourlyInput } from '../core/telegramFormatter';
 
 // Telegram's hard limit for one message.
@@ -216,24 +219,6 @@ export function formatHourlyV2(r: HourlyReportInput): string {
     text += '\n(trimmed)';
   }
   return text;
-}
-
-// The same hour's numbers in the shape the 4-hour accumulator wants
-// (src/report/periodStats.ts), so the 4-hour report sums exactly what the
-// hourly reports showed.
-export function hourNumbersFrom(r: HourlyReportInput): HourNumbers {
-  const m = r.money;
-  return {
-    fromMs: m.periodStartMs, toMs: m.periodEndMs,
-    money: {
-      checkedUsd: m.checked.lastHour, couldEarnUsd: m.couldEarn.lastHour, realUsd: m.real.lastHour,
-      gasUsd: m.realPeriod.gasUsd, failedTrades: m.realPeriod.failed, failedCostUsd: m.realPeriod.failedCostUsd,
-    },
-    normal: r.normal ? { ...r.normal } : null,
-    loop: r.loop ? { ...r.loop } : null,
-    races: r.races ? { won: r.races.won, lost: r.races.lost } : null,
-    best: m.best ? { ...m.best } : null,
-  };
 }
 
 // REPORT_V2 switch: on unless set to exactly "0".

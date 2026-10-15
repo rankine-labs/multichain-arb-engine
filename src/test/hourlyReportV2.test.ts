@@ -3,14 +3,17 @@
 //     midnight, restart, practice and live kept apart
 //   - report/hourlyReport.ts: the approved layout in practice and live,
 //     partial period, n/a, HTML escaping, length, overall verdict
-//   - report/periodStats.ts: the 4-hour running totals
+//   - one collection feeds both: 4 hourly money snapshots added to the
+//     4-hour totals (report/fourHourStats.ts) give the same money in the
+//     4-hour report (report/fourHourReport.ts), practice and live
 //   - REPORT_V2=0 sends the old hourly message unchanged
 import { mkdtempSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { RealMoneyLedger, MoneyLedgers, LedgerSnapshot } from '../report/ledgers';
-import { PeriodStats } from '../report/periodStats';
-import { formatHourlyV2, hourNumbersFrom, overallVerdict, plainRoute, usd, reportV2On, hourlyMessage, HourlyReportInput, TELEGRAM_MAX_CHARS } from '../report/hourlyReport';
+import { RealMoneyLedger, MoneyLedgers, LedgerSnapshot, hourMoneyOf } from '../report/ledgers';
+import { FourHourStats, HourSample } from '../report/fourHourStats';
+import { formatFourHourReport, FourHourSnapshot } from '../report/fourHourReport';
+import { formatHourlyV2, overallVerdict, plainRoute, usd, reportV2On, hourlyMessage, HourlyReportInput, TELEGRAM_MAX_CHARS } from '../report/hourlyReport';
 import { formatPlainHourly } from '../core/telegramFormatter';
 
 function assert(cond: boolean, msg: string) {
@@ -30,22 +33,22 @@ const H = 3_600_000, D = 86_400_000;
   led.add({ status: 'profit', gasUsd: 0.10, profitUsd: 2.10 });          // +2.00, Oct 15 Toronto
   clock = Date.UTC(2026, 9, 16, 4, 30);                                   // 00:30 Oct 16 Toronto
   led.add({ status: 'profit', gasUsd: 0.20, profitUsd: 1.20 });          // +1.00, Oct 16
-  led.add({ status: 'reverted', gasUsd: 0.30 });                         // failed: gas only
+  led.add({ status: 'reverted', gasUsd: 0.30 });                         // failed: -0.30 (gas only)
   led.add({ status: 'dropped', gasUsd: 0 });                             // never mined: nothing
   let t = led.totals();
-  assert(near(t.today, 1.0), `Toronto midnight: today only counts after 00:00 Toronto (${t.today})`);
-  assert(near(t.week, 3.0), `7 days includes yesterday evening (${t.week})`);
-  assert(t.todayPeriod.failed === 1 && near(t.todayPeriod.failedCostUsd, 0.3), 'failed trade gas kept apart, not in money made');
+  assert(near(t.today, 0.7), `Toronto midnight: today only counts after 00:00 Toronto, failed gas taken off (${t.today})`);
+  assert(near(t.week, 2.7), `7 days includes yesterday evening (${t.week})`);
+  assert(t.todayPeriod.failed === 1 && near(t.todayPeriod.failedCostUsd, 0.3), 'failed trades and their gas also counted for their own line');
   assert(near(t.todayPeriod.gasUsd, 0.5) && t.todayPeriod.won === 1, 'gas paid counts won and failed trades');
   // Restart: a new ledger reads the same file.
   const led2 = new RealMoneyLedger(file, 'America/Toronto', () => clock);
   t = led2.totals();
-  assert(near(t.today, 1.0) && near(t.week, 3.0) && t.todayPeriod.failed === 1, 'restart: real money totals survive');
+  assert(near(t.today, 0.7) && near(t.week, 2.7) && t.todayPeriod.failed === 1, 'restart: real money totals survive');
   // 6 days later the Oct 15 trade is still in the 7 days; 7 days later it is not.
   clock = Date.UTC(2026, 9, 21, 12, 0);   // Oct 21 Toronto
-  assert(near(led2.totals().week, 3.0), 'Oct 21: Oct 15 still inside the last 7 days');
+  assert(near(led2.totals().week, 2.7), 'Oct 21: Oct 15 still inside the last 7 days');
   clock = Date.UTC(2026, 9, 22, 12, 0);   // Oct 22 Toronto
-  assert(near(led2.totals().week, 1.0), 'Oct 22: Oct 15 dropped out of the last 7 days');
+  assert(near(led2.totals().week, 0.7), 'Oct 22: Oct 15 dropped out of the last 7 days');
   // Old buckets are trimmed (bounded file).
   clock = Date.UTC(2026, 9, 30, 12, 0);
   led2.add({ status: 'profit', gasUsd: 0, profitUsd: 0.5 });
@@ -58,17 +61,18 @@ const H = 3_600_000, D = 86_400_000;
   const practice = { checked: () => ({ today: 41.10, week: 312.40 }), couldEarn: () => ({ today: 22.60, week: 140.20 }) };
   const real = new RealMoneyLedger(join(dir(), 'live.json'), 'America/Toronto', () => clock);
   const ml = new MoneyLedgers(practice, real, () => clock);
-  ml.notePracticeWin(2.31, 'WETH ramses-v3->uniswap-v2', true);
-  ml.notePracticeWin(1.79, 'WETH/USDG gap', true);
-  ml.notePracticeWin(2.18, 'ORBIO uniswap-v2->uniswap-v3', false);
-  ml.notePracticeWin(5_000, 'junk', true);                    // over the junk limit
-  ml.notePracticeWin(-1, 'loss', true);                       // not a win
+  ml.notePracticeWin(2.31, 'WETH ramses-v3->uniswap-v2', 'ok');
+  ml.notePracticeWin(1.79, 'WETH/USDG gap', 'ok');
+  ml.notePracticeWin(2.18, 'ORBIO uniswap-v2->uniswap-v3', 'otherCoin');
+  ml.notePracticeWin(5_000, 'junk', 'ok');                    // over the junk limit
+  ml.notePracticeWin(-1, 'loss', 'ok');                       // not a win
   // A real result while NOT live never counts (practice can't add real money).
   ml.noteRealResult({ status: 'profit', gasUsd: 0.1, profitUsd: 9 }, false);
   clock += H;
   const s = ml.takePeriod();
   assert(near(s.checked.lastHour, 6.28) && s.checkedCount === 3, `checked wins last hour $6.28 from 3 (${s.checked.lastHour})`);
   assert(near(s.couldEarn.lastHour, 4.10) && s.couldEarnCount === 2, `could earn live last hour $4.10 (${s.couldEarn.lastHour})`);
+  assert(s.leftOut.otherCoin.n === 1 && near(s.leftOut.otherCoin.usd, 2.18) && s.leftOut.loan.n === 0, 'left out of could earn live, by reason');
   assert(s.checked.today === 41.10 && s.checked.week === 312.40 && s.couldEarn.week === 140.20, 'today / 7 days come from the practice totals');
   assert(s.real.lastHour === 0 && s.real.today === 0 && s.real.week === 0, 'practice: real money stays $0.00 (practice never mixed in)');
   assert(s.best?.usd === 2.31 && s.best.label === 'WETH ramses-v3->uniswap-v2', 'best win this hour kept with its label');
@@ -79,7 +83,7 @@ const H = 3_600_000, D = 86_400_000;
   ml.noteRealResult({ status: 'profit', gasUsd: 0.25, profitUsd: 3.25 }, true);
   ml.noteRealResult({ status: 'reverted', gasUsd: 0.4 }, true);
   const s3 = ml.peekPeriod();
-  assert(near(s3.real.lastHour, 3.0) && near(s3.real.today, 3.0), 'live: real money made = profit minus its gas');
+  assert(near(s3.real.lastHour, 2.6) && near(s3.real.today, 2.6), 'live: real money made = profit minus its gas minus failed-trade gas ($3.00 - $0.40)');
   assert(s3.realPeriod.failed === 1 && near(s3.realPeriod.failedCostUsd, 0.4) && near(s3.realPeriod.gasUsd, 0.65), 'live: gas and failed trades for the line');
   assert(s3.checked.lastHour === 0 && s3.couldEarn.lastHour === 0, 'live results never touch the practice ledgers');
 }
@@ -92,6 +96,7 @@ const snap = (over: Partial<LedgerSnapshot> = {}): LedgerSnapshot => ({
   real: { lastHour: 0, today: 0, week: 0 },
   realPeriod: { madeUsd: 0, won: 0, gasUsd: 0, failed: 0, failedCostUsd: 0 },
   checkedCount: 4, couldEarnCount: 3,
+  leftOut: { otherCoin: { n: 1, usd: 2.18 }, overSize: { n: 0, usd: 0 }, loan: { n: 0, usd: 0 } },
   best: { usd: 2.31, label: 'WETH ramses-v3->uniswap-v2' },
   ...over,
 });
@@ -125,11 +130,11 @@ const input = (over: Partial<HourlyReportInput> = {}): HourlyReportInput => ({
   // Live mode: header, real money and the gas / failed line.
   const live = formatHourlyV2(input({
     live: true,
-    money: snap({ real: { lastHour: 3.0, today: 12.5, week: 1234.5 }, realPeriod: { madeUsd: 3, won: 1, gasUsd: 0.65, failed: 1, failedCostUsd: 0.4 } }),
+    money: snap({ real: { lastHour: 2.6, today: 12.5, week: 1234.5 }, realPeriod: { madeUsd: 2.6, won: 1, gasUsd: 0.65, failed: 1, failedCostUsd: 0.4 } }),
   }));
   console.log('----- live sample -----\n' + live + '\n-----------------------');
   assert(live.includes('<b>LIVE (real money)</b>') && !live.includes('Practice mode'), 'live header');
-  assert(/Real money made\s+\$3\.00\s+\$12\.50\s+\$1,234\.50/.test(live), 'live: real money row filled (with thousands comma)');
+  assert(/Real money made\s+\$2\.60\s+\$12\.50\s+\$1,234\.50/.test(live), 'live: real money row filled (with thousands comma)');
   assert(live.includes('Gas paid $0.65 · Failed trades 1 (cost $0.40)'), 'live: gas paid and failed trades line');
 
   // Partial period after a restart.
@@ -166,23 +171,69 @@ const input = (over: Partial<HourlyReportInput> = {}): HourlyReportInput => ({
   assert(plainRoute('WETH/USDG gap') === 'WETH/USDG gap', 'gap labels kept as they are');
 }
 
-// --- 4-hour running totals --------------------------------------------------------
-{
-  const file = join(dir(), 'period-stats.json');
-  const ps = new PeriodStats(file);
-  const h1 = hourNumbersFrom(input());
-  const h2 = hourNumbersFrom(input({ loop: null, normal: { won: 1, tested: 10 }, races: { won: 1, lost: 2 }, money: snap({ periodStartMs: Date.UTC(2026, 9, 15, 19, 0), periodEndMs: Date.UTC(2026, 9, 15, 20, 0), best: { usd: 3.5, label: 'big' } }) }));
-  ps.add(h1); ps.add(h2);
-  const restarted = new PeriodStats(file);   // restart in between
-  const p = restarted.peek();
-  assert(p.hours === 2 && near(p.money.checkedUsd, 12.56) && near(p.money.couldEarnUsd, 8.2), '4-hour money sums the hours (and survives a restart)');
-  assert(p.normal?.won === 5 && p.normal.tested === 70 && p.normal.measuredHours === 2, 'normal trades summed');
-  assert(p.loop?.won === 0 && p.loop.tested === 36 && p.loop.measuredHours === 1, 'loop trades: only measured hours summed');
-  assert(p.races?.won === 5 && p.races.lost === 2, 'races summed');
-  assert(p.best?.usd === 3.5 && p.fromMs === Date.UTC(2026, 9, 15, 18, 0) && p.toMs === Date.UTC(2026, 9, 15, 20, 0), 'best win and window over the 4 hours');
-  const taken = restarted.take();
-  assert(taken.hours === 2 && restarted.peek().hours === 0 && restarted.peek().loop === null, 'take hands over the totals and starts fresh');
-  assert(new PeriodStats(file).peek().hours === 0, 'the fresh start is saved too');
+// --- One collection feeds the hourly AND the 4-hour report ----------------------
+// Four hourly collections: each takes the money ledgers once (like
+// shadowMain), and the same snapshot goes into the 4-hour totals.
+function hourSample(fromMs: number, k: number): HourSample {
+  return {
+    fromMs, toMs: fromMs + H,
+    funnel: { tradesRead: 1000, noPool: 0, tooSmall: 0, noPartner: 0, noUsdPrice: 0, smallerThanFees: 0, found: 100, belowCheckBar: 0, notVetted: 0, sentToCheck: 60 },
+    checkBarUsd: 0.10,
+    checks: { done: 60, makeMoney: 4 * k, loseMoney: 50, wouldFail: 6, tooLate: 0, nodeBusy: 0 },
+    timing: { rightAfter: 60, othersInBlock: 0, late: 0 },
+    benchedRoutes: 0, checksAvailable: true,
+    race: { won: 4, lost: 0, unclear: 0, wonUsd: 6, lostUsd: 0 },
+    reaction: { n: 100, medianMs: 26, p95Ms: 80 },
+    stages: {}, stalls: { enabled: true, thresholdMs: 50, freezes: 1, worstMs: 500, causes: [], gcN: 0, gcMs: 0 },
+    rivalsSpeed: null,
+    loops: { found: 50, bestUsd: 1, checked: 36, wouldMake: 0, wouldMakeUsd: 0, lost: 36, failed: 0, cantRun: 0, skippedCap: 0, foundByLen: [0, 0, 0, 50], mvcN: 0, modelUsd: 0, checkUsd: 0, rivalLoops: 0, rivalLonger: 0, nodeRateLimited: 0, nodePaused: 0, nodeBusySkips: 0, nodeText: 'loop node free node', topRoutes: [] },
+    venues: [], live: { sent: k === 1 ? 2 : 0, won: 0, profitUsd: 0, gasUsd: 0 }, feedDrops: 0,
+  };
+}
+const fourSnap = (live: boolean): FourHourSnapshot => ({
+  live, loansOn: false, pairs: 214, pools: 538, gasPerTradeUsd: 0.021, gasSamples: 14, gasCalibrated: true, gasSource: 'live', feePoolsFromSwaps: 6,
+  otherStables: null, rivals: null, rivalBotsKnown: 41, newPools: null, thinPools: 4,
+  memory: { rssMb: 612, peakRssMb: 740, heapMb: 310, notes: null }, feedOkNow: true, ws: null, checkNode: 'QuickNode (backup: Alchemy)',
+  nodeErrors: { blockReaderErrors: 0, blockReaderRateLimited: 0, freeNodeRests: 0 }, nodeUsage: [], loopsOn: true, maxLoopPools: 5, emergencyStop: 'off',
+});
+for (const live of [false, true]) {
+  const start = Date.UTC(2026, 9, 15, 16, 0);  // 12:00 Toronto
+  let clock = start;
+  const practice = { checked: () => ({ today: 0, week: 0 }), couldEarn: () => ({ today: 0, week: 0 }) };
+  const ml = new MoneyLedgers(practice, new RealMoneyLedger(null, 'America/Toronto', () => clock), () => clock);
+  const four = new FourHourStats(join(dir(), 'report-4h.json'), () => start);
+  const hourly: LedgerSnapshot[] = [];
+  for (let k = 1; k <= 4; k++) {
+    ml.notePracticeWin(1.5 * k, `WETH uniswap-v3->ramses-v3 #${k}`, 'ok');
+    ml.notePracticeWin(0.5, 'AAPL/WETH gap', 'otherCoin');
+    if (k === 1) { ml.noteRealResult({ status: 'profit', gasUsd: 0.25, profitUsd: 3.25 }, live); ml.noteRealResult({ status: 'reverted', gasUsd: 0.4 }, live); }
+    clock += H;
+    const snapK = ml.takePeriod();                       // taken ONCE per collection
+    hourly.push(snapK);
+    four.addHour({ ...hourSample(clock - H, k), money: hourMoneyOf(snapK) });   // same numbers into the 4-hour totals
+  }
+  const totals = four.peek(clock);
+  const sumChecked = hourly.reduce((a, x) => a + x.checked.lastHour, 0);
+  const sumCould = hourly.reduce((a, x) => a + x.couldEarn.lastHour, 0);
+  const sumReal = hourly.reduce((a, x) => a + x.real.lastHour, 0);
+  const tag = live ? 'live' : 'practice';
+  assert(near(totals.wins.usd, sumChecked) && near(sumChecked, 17), `${tag}: 4-hour checked wins = sum of the 4 hourly ($17.00)`);
+  assert(near(totals.wins.liveOk.usd, sumCould) && near(sumCould, 15), `${tag}: 4-hour could earn live = sum of the 4 hourly ($15.00)`);
+  assert(totals.wins.leftOut.otherCoin.n === 4, `${tag}: left-out wins carried into the 4-hour totals`);
+  assert(totals.wins.best?.usd === 6 && totals.wins.best.label === 'WETH uniswap-v3->ramses-v3 #4', `${tag}: best win over 4 hours = best hourly best win`);
+  assert(near(totals.money.realUsd, sumReal) && near(sumReal, live ? 2.6 : 0), `${tag}: 4-hour real money = sum of the hourly (${sumReal})`);
+  assert(totals.checks.makeMoney === 40 && totals.checks.done === 240 && totals.race.won === 16 && totals.loops?.checked === 144, `${tag}: trades tested / won and races summed from the same hour samples`);
+  const msgs = formatFourHourReport({ tz: 'America/Toronto', scheduledFromMs: start, toMs: clock, totals, prevWins: null, snap: fourSnap(live) });
+  assert(msgs.length === 3 && msgs.every((m) => m.length < 4096), `${tag}: 4-hour report is 3 messages under the limit`);
+  assert(/Checked wins\s+\$17\.00/.test(msgs[0]!) && /Could earn live\s+\$15\.00 \(4 wins\)/.test(msgs[0]!), `${tag}: 4-hour money lines match the hourly sums`);
+  if (live) {
+    assert(/Real money made\s+\$2\.60 \(1 of 2 sent won\)/.test(msgs[0]!), 'live: 4-hour real money = true account change (failed gas taken off)');
+    assert(msgs[0]!.includes('Gas paid $0.65 · Failed trades 1 (cost $0.40)'), 'live: 4-hour gas paid / failed trades line');
+    const firstHour = formatHourlyV2(input({ live: true, money: hourly[0]! }));
+    assert(/Real money made\s+\$2\.60/.test(firstHour) && firstHour.includes('Gas paid $0.65 · Failed trades 1 (cost $0.40)'), 'live: the hourly shows the same real money and gas line');
+    console.log('----- 4-hour report sample (live, 3 parts) -----');
+    for (const m of msgs) console.log(m + `\n[${m.length} chars]\n`);
+  } else assert(/Real money made\s+\$0 \(practice\)/.test(msgs[0]!), 'practice: 4-hour real money $0 (practice)');
 }
 
 // --- REPORT_V2 switch ----------------------------------------------------------------
