@@ -198,7 +198,7 @@ function tradesSection(i: FourHourInput): string[] {
     row('Tested on the real chain', int(c.done).padStart(7), 25),
     row(' ✅ would make money', ofTests(c.makeMoney), 25),
     row(' ➖ would lose', ofTests(c.loseMoney), 25),
-    row(' ⏳ too late to test', ofTests(c.tooLate), 25),
+    row(' ⏳ price moved first', ofTests(c.tooLate), 25),
     row(' ✖️ test failed', ofTests(failedOther), 25),
   ];
   const tm = t.timing;
@@ -211,7 +211,7 @@ function tradesSection(i: FourHourInput): string[] {
       ? `Test timing: ${int(tm.rightAfter)} right after the trade · ${int(tm.othersInBlock)} end of block · ${int(tm.late)} late`
       : 'Test timing: n/a (no timed tests)',
     ...(c.nodeBusy ? [`Test node said "slow down" ${int(c.nodeBusy)}x (tests paused briefly)`] : []),
-    '<i>Funnel % are of trades seen; test % are of tests. Tests also include price gaps found without a trade, so the steps overlap and don\'t add up exactly. "Too late" = the price had already moved.</i>',
+    '<i>Funnel % are of trades seen; test % are of tests. Tests also include price gaps found without a trade, so the steps overlap and don\'t add up exactly. "Price moved first" = the price changed before the test ran.</i>',
   ];
   return L;
 }
