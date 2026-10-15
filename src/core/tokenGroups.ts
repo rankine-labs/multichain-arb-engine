@@ -1,7 +1,9 @@
 import { readFileSync, writeFileSync, mkdirSync, renameSync } from 'fs';
+import { readFile } from 'fs/promises';
 import { dirname } from 'path';
 import type { ScannedPool, ScanState } from './universeScan';
-import { Pacer } from './chunked';
+import { Pacer, runSteps, writeTextChunked } from './chunked';
+import { timed, markStretch } from './stallFinder';
 
 // ============================================================================
 // TOKEN GROUPS -- coins that should be worth the same (loop measurement, step 1)
@@ -215,6 +217,132 @@ export function loadSymbolCache(file: string): SymbolCache {
   try { const d = JSON.parse(readFileSync(file, 'utf8')); if (typeof d.upTo === 'number' && d.symbols) return d; } catch { /* first run */ }
   return { upTo: 0, symbols: {} };
 }
+
+// ---------------------------------------------------------------------------
+// SYMBOL CACHE IN SMALL BITES (Oct 15, REBUILD_PACED)
+//
+// Plain English:
+//   The saved coin names file holds one name per coin paired with USDG or
+//   WETH (~400,000 on Robinhood Chain, ~20 MB). Reading it in one go, writing
+//   it in one go, and counting its entries (Object.keys) each held the bot
+//   for 0.1-0.5 s on a fast machine (about 3x that on the server), all while
+//   "coin groups build" was running, and none of it was named, so it showed
+//   up as "other (during coin groups build)" in the freeze report.
+//   Now the file is read and written a bite at a time, and the names are
+//   kept in a Map in memory (counting a Map is instant and walking it needs
+//   no big list up front). The file on disk is byte for byte the same as
+//   before (tested), so old and new versions can read each other's file.
+// ---------------------------------------------------------------------------
+export interface SymbolCacheMap { upTo: number; symbols: Map<string, string> }
+
+// A key that a plain object would put in a different order (number-like),
+// or treat specially (__proto__). Never an address; if one shows up we use
+// the old one-go reader so the result is exactly the same as before.
+const oddKey = (k: string) => k === '__proto__' || /^(0|[1-9][0-9]*)$/.test(k);
+
+// The saved file, read as steps (`yield` = a safe place for a break).
+// Only the exact layout saveJson writes (JSON with 1-space indent: one name
+// per line) is read this way; anything else returns null and the caller
+// uses JSON.parse in one go (old behaviour). Names are parsed with
+// JSON.parse a few thousand lines at a time, so text rules (escapes etc.)
+// are exactly JSON's.
+export function* parseSymbolCacheSteps(text: string): Generator<void, SymbolCacheMap | null, void> {
+  // Layout:  {\n "upTo": N,\n "symbols": {\n  "0x..": "NAME",\n ...\n }\n}
+  //   or     {\n "upTo": N,\n "symbols": {}\n}
+  let pos = 0;
+  const nextLine = (): string | null => {
+    if (pos > text.length) return null;
+    let e = text.indexOf('\n', pos);
+    if (e < 0) e = text.length;
+    const line = text.slice(pos, e);
+    pos = e + 1;
+    return line;
+  };
+  if (nextLine() !== '{') return null;
+  const head = nextLine();
+  const m = head ? /^ "upTo": (.+),$/.exec(head) : null;
+  if (!m) return null;
+  let upTo: unknown;
+  try { upTo = JSON.parse(m[1]); } catch { return null; }
+  if (typeof upTo !== 'number') return null;
+  const symbols = new Map<string, string>();
+  const open = nextLine();
+  if (open === ' "symbols": {}') {
+    if (nextLine() !== '}' || pos <= text.length) return null; // must be the very end
+    return { upTo, symbols };
+  }
+  if (open !== ' "symbols": {') return null;
+  const BATCH = 2_000;
+  let batch: string[] = [];
+  // Parse a batch of name lines as one small JSON object; false = not as expected.
+  const flush = (last: boolean): boolean => {
+    if (!batch.length) return true;
+    // Every line but the very last name line ends with a comma.
+    const lastLine = batch[batch.length - 1];
+    if (last ? lastLine.endsWith(',') : !lastLine.endsWith(',')) return false;
+    batch[batch.length - 1] = last ? lastLine : lastLine.slice(0, -1);
+    let obj: Record<string, unknown>;
+    try { obj = JSON.parse('{' + batch.join('\n') + '}'); } catch { return false; }
+    // One line, one name: a line holding two names (or none) means the
+    // layout is not what we expect.
+    const keys = Object.keys(obj);
+    if (keys.length !== batch.length) return false;
+    for (const k of keys) {
+      const v = obj[k];
+      if (typeof v !== 'string' || oddKey(k) || symbols.has(k)) return false;
+      symbols.set(k, v);
+    }
+    batch = [];
+    return true;
+  };
+  for (let n = 1; ; n++) {
+    const line = nextLine();
+    if (line === null) return null;
+    if (line === ' }') break;
+    if (!line.startsWith('  "')) return null;
+    batch.push(line);
+    if (batch.length >= BATCH) {
+      // Keep the batch's last line for the next batch if it might be the
+      // last name (we only know when we see " }").
+      const keep = batch.pop()!;
+      if (!flush(false)) return null;
+      batch = [keep];
+    }
+    if ((n & 1023) === 0) yield;
+  }
+  if (!flush(true)) return null;
+  if (nextLine() !== '}' || pos <= text.length) return null; // nothing after the closing brace
+  return { upTo, symbols };
+}
+
+// The file text for a cache held as a Map, piece by piece. Joined together
+// it is exactly JSON.stringify({ upTo, symbols: {...} }, null, 1), the text
+// saveJson writes for the object version (tested).
+export function* symbolCachePieces(c: SymbolCacheMap): Generator<string, void, void> {
+  yield '{\n "upTo": ' + JSON.stringify(c.upTo) + ',\n "symbols": ';
+  if (!c.symbols.size) { yield '{}\n}'; return; }
+  let first = true;
+  let buf: string[] = [];
+  for (const [k, v] of c.symbols) {
+    buf.push((first ? '{\n  ' : ',\n  ') + JSON.stringify(k) + ': ' + JSON.stringify(v));
+    first = false;
+    if (buf.length >= 1_000) { yield buf.join(''); buf = []; }
+  }
+  buf.push('\n }\n}');
+  yield buf.join('');
+}
+
+// Read the saved file without freezing the bot: the file is read with an
+// async read, then parsed in ~5 ms bites (runSteps). Same names as
+// loadSymbolCache, as a Map. No file yet: an empty cache (like
+// loadSymbolCache). Returns null if the file is not in the expected layout;
+// the caller then uses the old one-go reader and old code path, so an
+// unusual file is handled exactly as before.
+export async function loadSymbolCacheMap(file: string, sliceMs = 5): Promise<SymbolCacheMap | null> {
+  let text: string;
+  try { text = await readFile(file, 'utf8'); } catch { return { upTo: 0, symbols: new Map() }; }
+  return runSteps(parseSymbolCacheSteps(text), 'coin names file load', sliceMs);
+}
 const saveJson = (file: string, data: unknown) => {
   try {
     mkdirSync(dirname(file), { recursive: true });
@@ -244,6 +372,11 @@ export async function buildTokenGroups(deps: {
   // on), so trades can get through. Same result; false = no breaks (old way).
   paced?: boolean;
   paceMs?: number;                    // work between breaks (default 5 ms; tests use 0)
+  // REBUILD_PACED (Oct 15, default on): the saved coin names file is read
+  // and written in small bites and kept as a Map (see "SYMBOL CACHE IN
+  // SMALL BITES" above). Same names, same file bytes, same result.
+  // false = the old one-go read / write / count.
+  rebuildPaced?: boolean;
 }): Promise<TokenGroupsResult> {
   const log = deps.log ?? (() => {});
   // FREEZE FIX PHASE 2 (Oct 14): the walks below go over every pool and coin
@@ -266,13 +399,40 @@ export async function buildTokenGroups(deps: {
   }
 
   // 1) Symbols of coins paired with USDG/WETH that we haven't read yet.
-  const cache = loadSymbolCache(deps.symbolCacheFile);
+  // The names are held either as a Map (REBUILD_PACED: read/written in
+  // bites) or as the old plain object; `names` below hides the difference.
+  const mapCache = deps.rebuildPaced !== false ? await loadSymbolCacheMap(deps.symbolCacheFile, deps.paceMs ?? 5) : null;
+  const cache: SymbolCache | SymbolCacheMap = mapCache ?? timed('coin names file load', () => loadSymbolCache(deps.symbolCacheFile));
+  const names = mapCache ? {
+    has: (t: string) => mapCache.symbols.has(t),
+    get: (t: string) => mapCache.symbols.get(t),
+    set: (t: string, s: string) => { mapCache.symbols.set(t, s); },
+    count: () => mapCache.symbols.size,
+    keys: () => mapCache.symbols.keys(),
+    save: async () => {
+      try { await writeTextChunked(deps.symbolCacheFile, symbolCachePieces(mapCache), 'coin names file save', deps.paceMs ?? 5); } catch { /* best effort, like saveJson */ }
+    },
+  } : (() => {
+    const obj = (cache as SymbolCache).symbols;
+    return {
+      has: (t: string) => t in obj,
+      get: (t: string): string | undefined => obj[t],
+      set: (t: string, s: string) => { obj[t] = s; },
+      count: () => Object.keys(obj).length,
+      keys: function* () { for (const t in obj) yield t; },
+      save: async () => { timed('coin names file save', () => saveJson(deps.symbolCacheFile, cache)); },
+    };
+  })();
   // (Same as tokens.slice(upTo).filter(...), written as a loop so it can
   // take breaks. The list length is noted first, like slice() did.)
   const todo: string[] = [];
-  for (let i = cache.upTo, end = deps.state.tokens.length; i < end; i++) {
+  // Remember how far we looked NOW: a pool scan running at the same time may
+  // add coins while we read names, and those must be picked up next time,
+  // not skipped forever.
+  const seenUpTo = deps.state.tokens.length;
+  for (let i = cache.upTo, end = seenUpTo; i < end; i++) {
     const t = deps.state.tokens[i];
-    if (quoted.has(t.toLowerCase()) && !(t.toLowerCase() in cache.symbols)) todo.push(t);
+    if (quoted.has(t.toLowerCase()) && !names.has(t.toLowerCase())) todo.push(t);
     if (pacer.due()) await pacer.rest();
   }
   // On a big chain this is thousands of names on the gentle scan lane, so it
@@ -282,25 +442,25 @@ export async function buildTokenGroups(deps: {
   //  - the names read so far are saved at each progress line, so a restart
   //    (e.g. a deploy) resumes where it stopped instead of starting over
   //    (`upTo` only moves when the whole step is done; already-read names
-  //    are skipped by the `in cache.symbols` check above).
+  //    are skipped by the `names.has` check above).
   const BUNDLE = 400;
   const every = Math.max(1, deps.progressEvery ?? 10);
   const t0 = Date.now();
-  log(`[groups] building: reading ${todo.length} coin name(s) (${Object.keys(cache.symbols).length} already known)`);
+  log(`[groups] building: reading ${todo.length} coin name(s) (${names.count()} already known)`);
   for (let i = 0, n = 0; i < todo.length; i += BUNDLE, n++) {
     const slice = todo.slice(i, i + BUNDLE);
     const res = await deps.callMany(slice.map((t) => ({ target: t, data: SEL_SYMBOL })));
-    slice.forEach((t, j) => { cache.symbols[t.toLowerCase()] = decodeSymbol(res[j]) ?? ''; });
+    slice.forEach((t, j) => { names.set(t.toLowerCase(), decodeSymbol(res[j]) ?? ''); });
     const done = Math.min(todo.length, i + BUNDLE);
     if ((n + 1) % every === 0 && done < todo.length) {
-      saveJson(deps.symbolCacheFile, cache);
+      await names.save();
       log(`[groups] building: coin names ${done} of ${todo.length} read (${Math.round((Date.now() - t0) / 1000)}s)`);
     }
     if (done < todo.length) await sleep(deps.pauseMs ?? 2_000);
   }
-  cache.upTo = deps.state.tokens.length;
-  saveJson(deps.symbolCacheFile, cache);
-  log(`[groups] symbols: ${todo.length} new read, ${Object.keys(cache.symbols).length} known (${Math.round((Date.now() - t0) / 1000)}s)`);
+  cache.upTo = seenUpTo;
+  await names.save();
+  log(`[groups] symbols: ${todo.length} new read, ${names.count()} known (${Math.round((Date.now() - t0) / 1000)}s)`);
 
   // 2) + 3) Candidates and their prices.
   //
@@ -323,9 +483,9 @@ export async function buildTokenGroups(deps: {
   // Fixed-group coins by name (a few hundred at most, lookalikes included).
   const fixedTok = new Set<string>();
   let named = 0;
-  for (const t in cache.symbols) {
+  for (const t of names.keys()) {
     if (pacer.due()) await pacer.rest();
-    const sym = cache.symbols[t];
+    const sym = names.get(t);
     if (!sym || !quoted.has(t)) continue;
     named++;
     if (classifySymbol(sym)) fixedTok.add(t);
@@ -347,6 +507,7 @@ export async function buildTokenGroups(deps: {
       calls.push(p.kind === 'solidly' ? { target: p.pool, data: SEL_STABLE } : { target: p.pool, data: SEL_RESERVES });
     }
     const res = ps.length ? await deps.callMany(calls) : [];
+    markStretch('coin groups build'); // freeze report: name the work on the answers
     return ps.map((p, i) => {
       const b0 = big(res[i * 4]), b1 = big(res[i * 4 + 1]);
       const d0 = decCache.get(p.token0.toLowerCase()), d1 = decCache.get(p.token1.toLowerCase());
@@ -372,6 +533,7 @@ export async function buildTokenGroups(deps: {
     if (pacer.due()) await pacer.rest();
   }
   const anchorRead = await readPools(anchorPools);
+  markStretch('coin groups build');
   let wethUsd = 0, bestW = 0;
   for (const r of anchorRead) {
     const usdAmt = r.p.token0.toLowerCase() === usdg ? r.a0 : r.a1;
@@ -394,6 +556,7 @@ export async function buildTokenGroups(deps: {
     if (!buf.length) return;
     const slice = buf; buf = [];
     const res = await deps.callMany(slice.map((p) => ({ target: qOf(p), data: SEL_BALANCE + pad(p.pool) })));
+    markStretch('coin groups build');
     slice.forEach((p, j) => {
       const q = qOf(p), d = q === usdg ? dU : dW, bal = big(res[j]);
       if (bal === null || d === undefined) return;
@@ -410,7 +573,7 @@ export async function buildTokenGroups(deps: {
     if (pacer.due()) await pacer.rest();
     if (p.stable || isAnchor(p)) continue;
     const t = otherSide(p);
-    if (!t || t === usdg || t === weth || !cache.symbols[t]) continue; // not a USDG/WETH pool, or an unnamed coin
+    if (!t || t === usdg || t === weth || !names.get(t)) continue; // not a USDG/WETH pool, or an unnamed coin
     buf.push(p);
     if (buf.length >= SLICE) await flush();
   }
@@ -420,7 +583,7 @@ export async function buildTokenGroups(deps: {
   const deepTok = new Set<string>();
   for (const p of passed) { const q = qOf(p); deepTok.add(q === p.token0.toLowerCase() ? p.token1.toLowerCase() : p.token0.toLowerCase()); }
   const pick: GroupCandidate[] = [];
-  for (const t of new Set([...fixedTok, ...deepTok])) if (cache.symbols[t]) pick.push({ token: t, symbol: cache.symbols[t] });
+  for (const t of new Set([...fixedTok, ...deepTok])) { const s = names.get(t); if (s) pick.push({ token: t, symbol: s }); }
   const cands = pickCandidates(pick);
   for (const t of [usdg, weth]) if (!cands.some((c) => c.token === t)) cands.push({ token: t, symbol: t === usdg ? 'USDG' : 'WETH', ...(t === usdg ? { kind: 'dollar' as const, group: 'Dollars' } : { kind: 'eth' as const, group: 'ETH' }) });
   const candSet = new Set(cands.map((c) => c.token.toLowerCase()));
@@ -428,7 +591,9 @@ export async function buildTokenGroups(deps: {
   log(`[groups] building: ${checked} pool(s) checked, ${passed.length} deep enough; ${cands.length} candidate coin(s), pricing ${toRead.length} pool(s)`);
 
   // d) Full read of the candidates' pools that passed.
-  const read = [...anchorRead, ...await readPools(toRead)];
+  const toReadDone = await readPools(toRead);
+  markStretch('coin groups build'); // freeze report: name the pricing / verify / save below
+  const read = [...anchorRead, ...toReadDone];
   const prices = new Map<string, QuotePrice>();
   for (const r of read) {
     const t0 = r.p.token0.toLowerCase(), t1 = r.p.token1.toLowerCase();

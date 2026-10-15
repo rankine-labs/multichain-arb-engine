@@ -1,6 +1,6 @@
 import { ethers } from 'ethers';
 import { v4Asks, findV4Pools } from './v4Lookup';
-import { Steps, drainSteps, runSteps, yieldToLoop } from './chunked';
+import { Steps, drainSteps, runSteps, yieldToLoop, Pacer } from './chunked';
 import { timed } from './stallFinder';
 
 // ============================================================================
@@ -77,6 +77,13 @@ export interface ScanOptions {
   // Go over the full pool list in ~5 ms bites (core/chunked.ts) instead of
   // one long freeze. Same result either way. STALL_FIX_SCAN_EXPAND=0 = off.
   chunked?: boolean;
+  // REBUILD_PACED (Oct 15): the rest of the scan's long steps (writing the
+  // balance / name reads, reading the names back, pricing, the per-factory
+  // "new pools" bookkeeping, the V4 single-pool list) also run in ~5 ms
+  // bites, and the read requests are written by hand instead of through
+  // ethers (same bytes, ~50x less work). Same result. false = old way.
+  paced?: boolean;
+  paceMs?: number;           // work between breaks (default 5 ms; tests use 0)
 }
 
 const MULTICALL3 = '0xcA11bde05977b3631167028862bE2a173976CA11';
@@ -124,6 +131,55 @@ const smallWord = (hex: string, pos: number): number => {
   const n = parseInt(hex.slice(pos + 52, pos + 64), 16);
   return Number.isFinite(n) ? n : -1;
 };
+
+// ----------------------------------------------------------------------------
+// HAND-WRITTEN READ REQUESTS (Oct 15, REBUILD_PACED)
+//
+// Plain English:
+//   Measured: asking ethers to write one "balanceOf(pool)" request costs
+//   ~50 microseconds. The scan writes two per pool it reads (tens of
+//   thousands of pools) all in one go, which froze the bot for seconds
+//   (7.3 s for 50,000 pools on a fast test machine). The request is just a
+//   fixed 4-byte code plus the address padded to 32 bytes, so it is written
+//   by hand here: exactly the same text ethers writes (tested), ~50x faster.
+//   Anything that does not look like a normal address goes to ethers as
+//   before (which also reports a bad address as before).
+//   Note: ethers also rejects a mixed-case address whose capital letters are
+//   a wrong checksum; this writer does not check that. The scan only ever
+//   has addresses written by ethers itself (correct checksum) or lower case,
+//   so the result is the same for everything the bot actually scans.
+// ----------------------------------------------------------------------------
+const SEL_BALANCE_OF = '0x70a08231';
+// (ADDR_RE / HEX_RE: defined with the fast bundle writer below.)
+const PAD24 = '0'.repeat(24);
+export function encodeBalanceOf(addr: string): string {
+  if (typeof addr !== 'string' || !ADDR_RE.test(addr)) return erc20.encodeFunctionData('balanceOf', [addr]);
+  return SEL_BALANCE_OF + PAD24 + addr.slice(2).toLowerCase();
+}
+// Calls with no inputs are always the same text.
+export const CALL_DECIMALS = erc20.encodeFunctionData('decimals');
+export const CALL_SYMBOL = erc20.encodeFunctionData('symbol');
+export const CALL_STABLE = pairI.encodeFunctionData('stable');
+
+// Reads a symbol() answer (a text) by hand when it is in the standard
+// layout (offset 32, length, the letters padded to 32 bytes) and plain
+// ASCII. Returns null for anything else, and the caller asks ethers, so
+// the answer is always what ethers would give (tested on many samples).
+export function fastDecodeString(ret: string | null | undefined): string | null {
+  if (typeof ret !== 'string' || ret.length < 2 + 128 || !HEX_RE.test(ret)) return null;
+  const hex = ret.slice(2);
+  // ethers refuses an answer that is not whole 32-byte words.
+  if (hex.length % 64 !== 0 || smallWord(hex, 0) !== 32) return null;
+  const len = smallWord(hex, 64);
+  if (len < 0 || 128 + Math.ceil(len / 32) * 64 > hex.length) return null;
+  let out = '';
+  for (let i = 0; i < len; i++) {
+    const b = parseInt(hex.slice(128 + i * 2, 130 + i * 2), 16);
+    if (!(b < 0x80)) return null; // not plain ASCII: let ethers do it
+    out += String.fromCharCode(b);
+  }
+  return out;
+}
 
 // Multicall3 aggregate3 answer -> per-read answer (null = read failed or
 // returned nothing). Returns null (not an array) if the text looks unusual:
@@ -496,6 +552,52 @@ export function addPoolsToState(state: ScanState, f: ScanFactory, pools: Scanned
   for (const p of pools) if (!known.has(lc(p.pool))) state.pools.push([fi, p.pool, idx(p.token0), idx(p.token1)]);
 }
 
+// REBUILD_PACED (Oct 15): addPoolsToState() above builds two lookups over
+// EVERY coin and pool on the chain (~400,000 each) each time it is called,
+// once per factory per scan: 0.3-0.5 s each on a fast test machine, so
+// 2-4 s of freezes per scan. The version below builds the two lookups once
+// per scan, in ~5 ms bites, and keeps them up to date. Same pools added in
+// the same order (tested).
+export interface ScanStateIndex { tokenIdx: Map<string, number>; known: Set<string> }
+
+export function* buildScanStateIndexSteps(state: ScanState): Steps<ScanStateIndex> {
+  const tokenIdx = new Map<string, number>();
+  for (let i = 0; i < state.tokens.length; i++) {
+    if ((i & 2047) === 2047) yield;
+    tokenIdx.set(state.tokens[i], i);
+  }
+  const known = new Set<string>();
+  for (let i = 0; i < state.pools.length; i++) {
+    if ((i & 2047) === 2047) yield;
+    known.add(lc(state.pools[i][1]));
+  }
+  return { tokenIdx, known };
+}
+
+// Same as addPoolsToState(state, f, pools), using (and updating) the index.
+// Like the old one, a pool is checked against the pools that were in the
+// state before this call (so the answer is the same even if the list
+// handed in held the same pool twice).
+export function* addPoolsToStateSteps(state: ScanState, f: ScanFactory, pools: ScannedPool[], index: ScanStateIndex): Steps<void> {
+  const fkey = `${f.dex}|${f.kind}|${lc(f.factory)}`;
+  let fi = state.factories.indexOf(fkey);
+  if (fi < 0) fi = state.factories.push(fkey) - 1;
+  const idx = (t: string) => {
+    const k = lc(t);
+    let i = index.tokenIdx.get(k);
+    if (i === undefined) { i = state.tokens.push(k) - 1; index.tokenIdx.set(k, i); }
+    return i;
+  };
+  const added: string[] = [];
+  for (let n = 0; n < pools.length; n++) {
+    if ((n & 1023) === 1023) yield;
+    const p = pools[n];
+    const k = lc(p.pool);
+    if (!index.known.has(k)) { state.pools.push([fi, p.pool, idx(p.token0), idx(p.token1)]); added.push(k); }
+  }
+  for (const k of added) index.known.add(k);
+}
+
 // ----------------------------------------------------------------------------
 // Pricing (pure, unit-tested).
 //
@@ -519,14 +621,22 @@ const units = (v: bigint | undefined, dec: number) => (v === undefined ? 0 : Num
 const MIN_PRICING_QUOTE_USD = 2_000;
 
 export function derivePrices(pools: ScannedPool[], decimals: Map<string, number>, usdToken: string, wrappedNative: string): Map<string, number> {
+  return drainSteps(derivePricesSteps(pools, decimals, usdToken, wrappedNative));
+}
+
+// The same pricing written as steps (`yield` = a safe place for a break),
+// so the scan can run it in ~5 ms bites (REBUILD_PACED). Same code, same prices.
+export function* derivePricesSteps(pools: ScannedPool[], decimals: Map<string, number>, usdToken: string, wrappedNative: string): Steps<Map<string, number>> {
   const usd = lc(usdToken), wn = lc(wrappedNative);
   const price = new Map<string, number>([[usd, 1]]);
   const dec = (t: string) => decimals.get(lc(t));
 
   // Best (deepest quote side) pool per token against a priced quote token.
-  const priceAgainst = (quote: string, allowV3: boolean, only?: string) => {
+  const priceAgainst = function* (quote: string, allowV3: boolean, only?: string): Steps<void> {
     const best = new Map<string, { quoteAmt: number; px: number }>();
+    let n = 0;
     for (const p of pools) {
+      if ((++n & 2047) === 0) yield;
       if (p.stable) continue;
       if (p.kind === 'v3' && !allowV3) continue;
       const t0 = lc(p.token0), t1 = lc(p.token1);
@@ -548,9 +658,9 @@ export function derivePrices(pools: ScannedPool[], decimals: Map<string, number>
     for (const [t, v] of best) if (!price.has(t)) price.set(t, v.px);
   };
 
-  priceAgainst(usd, false);                              // V2 pools vs the stablecoin (incl. wrapped native)
-  if (!price.has(wn)) priceAgainst(usd, true, wn);       // wrapped native from V3 only if no V2 pool exists
-  if (price.has(wn)) priceAgainst(wn, false);            // everything else vs wrapped native (V2 only)
+  yield* priceAgainst(usd, false);                              // V2 pools vs the stablecoin (incl. wrapped native)
+  if (!price.has(wn)) yield* priceAgainst(usd, true, wn);       // wrapped native from V3 only if no V2 pool exists
+  if (price.has(wn)) yield* priceAgainst(wn, false);            // everything else vs wrapped native (V2 only)
   return price;
 }
 
@@ -567,14 +677,22 @@ export function poolUsd(p: ScannedPool, decimals: Map<string, number>, price: Ma
 
 // Groups pools by pair, keeps liquid priceable ones, ranks by 2nd-deepest pool.
 export function rankCandidates(pools: ScannedPool[], minPoolUsd: number): { multiPoolPairs: number; candidates: PairCandidate[] } {
+  return drainSteps(rankCandidatesSteps(pools, minPoolUsd));
+}
+
+// The same ranking written as steps (REBUILD_PACED). Same code, same list.
+export function* rankCandidatesSteps(pools: ScannedPool[], minPoolUsd: number): Steps<{ multiPoolPairs: number; candidates: PairCandidate[] }> {
+  let n = 0;
   const byPair = new Map<string, ScannedPool[]>();
   for (const p of pools) {
+    if ((++n & 1023) === 0) yield;
     const k = [lc(p.token0), lc(p.token1)].sort().join('/');
     (byPair.get(k) ?? byPair.set(k, []).get(k)!).push(p);
   }
   let multiPoolPairs = 0;
   const candidates: PairCandidate[] = [];
   for (const group of byPair.values()) {
+    if ((++n & 1023) === 0) yield;
     if (group.length >= 2) multiPoolPairs++;
     // Solidly stable pools use a curve the bot can't price -> not usable.
     const usable = group.filter((p) => !p.stable && (p.usd ?? 0) >= minPoolUsd).sort((a, b) => (b.usd ?? 0) - (a.usd ?? 0));
@@ -604,6 +722,16 @@ export async function scanUniverse(
   const errors: string[] = [];
   const { callMany, multicall } = await makeCaller(provider);
   const latest = await provider.getBlockNumber();
+  // REBUILD_PACED: take a short break about every 5 ms in the long loops
+  // below (each stretch between breaks is named "pool scan" for the freeze
+  // report). Off: no breaks and ethers writes the requests (old way).
+  const paced = !!opts.paced;
+  const pacer = new Pacer('pool scan', opts.paceMs ?? 5, paced);
+  const sliceMs = opts.paceMs ?? 5;
+  const encBal = paced ? encodeBalanceOf : (a: string) => erc20.encodeFunctionData('balanceOf', [a]);
+  // The coin / pool lookups used to add new pools (built once, only when a
+  // factory has new pools; see addPoolsToStateSteps).
+  let stateIndex: ScanStateIndex | null = null;
 
   // 1) New pools on every factory since the last scan (one factory at a time;
   //    one failing doesn't stop the rest, and its progress isn't saved).
@@ -613,13 +741,21 @@ export async function scanUniverse(
     if (from > latest) continue;
     try {
       const found = await listPoolsFromLogs(provider, f, from, latest, opts.maxLogRange);
-      addPoolsToState(state, f, found);
+      if (!paced) addPoolsToState(state, f, found);
+      else if (found.length) {
+        // (With no new pools there is nothing to add: the old call changed nothing either.)
+        stateIndex ??= await runSteps(buildScanStateIndexSteps(state), 'pool scan new pools', sliceMs);
+        await runSteps(addPoolsToStateSteps(state, f, found, stateIndex), 'pool scan new pools', sliceMs);
+      }
       state.lastBlock[fk] = latest;
       log(`[scan] ${f.dex}: +${found.length} pools (blocks ${from}-${latest})`);
     } catch (err) {
       errors.push(`${f.dex}: ${String((err as any)?.shortMessage ?? (err as any)?.message ?? err).slice(0, 120)}`);
     }
   }
+  // Done adding new pools: let the big coin/pool lookups go now, so they
+  // don't sit in memory (tens of MB) for the rest of the scan.
+  stateIndex = null;
   // Steps 1b-2 go over every pool on the chain (~400,000 on Robinhood).
   // Written as steps (core/chunked.ts): with opts.chunked they run in ~5 ms
   // bites so the bot keeps reading trades meanwhile; the result is the same.
@@ -652,40 +788,70 @@ export async function scanUniverse(
   const { all, poolsPerDex, multi, multiSet, relevant } = opts.chunked ? await runSteps(prepare(), 'chain-wide scan processing') : timed('chain-wide scan processing', () => drainSteps(prepare()));
   log(`[scan] ${all.length} pools total; reading balances for ${relevant.length}`);
 
+  // Oct 15 (REBUILD_PACED): this step used to write two requests per pool
+  // through ethers in one go (~50 microseconds each): 7.3 s for 50,000
+  // pools on a fast test machine, the biggest freeze found. Now written by
+  // hand (same text) with short breaks.
   const balCalls: Call[] = [];
   for (const p of relevant) {
-    balCalls.push({ target: p.token0, data: erc20.encodeFunctionData('balanceOf', [p.pool]) });
-    balCalls.push({ target: p.token1, data: erc20.encodeFunctionData('balanceOf', [p.pool]) });
+    if (pacer.due()) await pacer.rest();
+    balCalls.push({ target: p.token0, data: encBal(p.pool) });
+    balCalls.push({ target: p.token1, data: encBal(p.pool) });
   }
   const bals = await callMany(balCalls);
-  relevant.forEach((p, i) => { p.bal0 = decodeUint(bals[i * 2]) ?? 0n; p.bal1 = decodeUint(bals[i * 2 + 1]) ?? 0n; });
+  for (let i = 0; i < relevant.length; i++) {
+    if (pacer.due()) await pacer.rest();
+    const p = relevant[i];
+    p.bal0 = decodeUint(bals[i * 2]) ?? 0n; p.bal1 = decodeUint(bals[i * 2 + 1]) ?? 0n;
+  }
 
   // Solidly pools: stable-curve or volatile? (the bot can only price volatile)
   const solid = relevant.filter((p) => p.kind === 'solidly');
-  const st = await callMany(solid.map((p) => ({ target: p.pool, data: pairI.encodeFunctionData('stable') })));
+  const st = await callMany(solid.map((p) => ({ target: p.pool, data: paced ? CALL_STABLE : pairI.encodeFunctionData('stable') })));
   solid.forEach((p, i) => { p.stable = decodeUint(st[i]) === 1n; });
 
   // 3) Token decimals + symbols, read from the tokens themselves.
-  const tokenList = [...new Set(relevant.flatMap((p) => [lc(p.token0), lc(p.token1)]))];
-  const metaRes = await callMany(tokenList.flatMap((t) => [
-    { target: t, data: erc20.encodeFunctionData('decimals') },
-    { target: t, data: erc20.encodeFunctionData('symbol') },
-  ]));
+  // (Same list as [...new Set(relevant.flatMap(...))], built with breaks.)
+  const tokenSet = new Set<string>();
+  for (const p of relevant) {
+    if (pacer.due()) await pacer.rest();
+    tokenSet.add(lc(p.token0)); tokenSet.add(lc(p.token1));
+  }
+  const tokenList = [...tokenSet];
+  const metaCalls: Call[] = [];
+  for (const t of tokenList) {
+    if (pacer.due()) await pacer.rest();
+    metaCalls.push(
+      { target: t, data: paced ? CALL_DECIMALS : erc20.encodeFunctionData('decimals') },
+      { target: t, data: paced ? CALL_SYMBOL : erc20.encodeFunctionData('symbol') },
+    );
+  }
+  const metaRes = await callMany(metaCalls);
   const tokens = new Map<string, TokenInfo>();
   const decimals = new Map<string, number>();
-  tokenList.forEach((t, i) => {
+  for (let i = 0; i < tokenList.length; i++) {
+    if (pacer.due()) await pacer.rest();
+    const t = tokenList[i];
     const d = decodeUint(metaRes[i * 2]);
-    if (d === null || d > 36n) return; // not a standard token: its pools are skipped
+    if (d === null || d > 36n) continue; // not a standard token: its pools are skipped
     let symbol = t.slice(0, 8);
-    try { symbol = String(erc20.decodeFunctionResult('symbol', metaRes[i * 2 + 1]!)[0]); } catch { /* keep short address */ }
+    // Paced: plain names are read by hand (same answer, ~25 microseconds
+    // saved per coin); anything unusual still goes to ethers.
+    const fast = paced ? fastDecodeString(metaRes[i * 2 + 1]) : null;
+    if (fast !== null) symbol = fast;
+    else try { symbol = String(erc20.decodeFunctionResult('symbol', metaRes[i * 2 + 1]!)[0]); } catch { /* keep short address */ }
     tokens.set(t, { symbol, decimals: Number(d) });
     decimals.set(t, Number(d));
-  });
+  }
 
   // 4) Price, value and rank.
-  const usdPrice = derivePrices(relevant, decimals, opts.usdToken, opts.wrappedNative);
-  for (const p of relevant) p.usd = poolUsd(p, decimals, usdPrice);
-  let { multiPoolPairs, candidates } = rankCandidates(multi, minPoolUsd);
+  const usdPrice = paced ? await runSteps(derivePricesSteps(relevant, decimals, opts.usdToken, opts.wrappedNative), 'pool scan pricing', sliceMs)
+    : derivePrices(relevant, decimals, opts.usdToken, opts.wrappedNative);
+  for (const p of relevant) {
+    if (pacer.due()) await pacer.rest();
+    p.usd = poolUsd(p, decimals, usdPrice);
+  }
+  let { multiPoolPairs, candidates } = paced ? await runSteps(rankCandidatesSteps(multi, minPoolUsd), 'pool scan pricing', sliceMs) : rankCandidates(multi, minPoolUsd);
 
   // 5) Uniswap V4, asked per pair (see core/v4Lookup.ts for why not from
   //    its history). Only pairs with a USDG/WETH side:
@@ -708,12 +874,17 @@ export async function scanUniverse(
         return qs.includes(a) ? a : qs.includes(b) ? b : null;
       };
       // a) single-exchange pairs with a USDG/WETH side, one balance read each.
-      const singles = all.filter((p) => !multiSet.has(p) && p.kind !== 'solidly' && quoteOf(p) !== null);
+      // (Same list as all.filter(...), built with breaks: ~400,000 pools.)
+      const singles: ScannedPool[] = [];
+      for (const p of all) {
+        if (pacer.due()) await pacer.rest();
+        if (!multiSet.has(p) && p.kind !== 'solidly' && quoteOf(p) !== null) singles.push(p);
+      }
       const withMoney: ScannedPool[] = [];
       const SLICE = 4_000;
       for (let i = 0; i < singles.length; i += SLICE) {
         const slice = singles.slice(i, i + SLICE);
-        const res = await callMany(slice.map((p) => ({ target: quoteOf(p)!, data: erc20.encodeFunctionData('balanceOf', [p.pool]) })));
+        const res = await callMany(slice.map((p) => ({ target: quoteOf(p)!, data: encBal(p.pool) })));
         slice.forEach((p, j) => {
           const q = quoteOf(p)!, raw = decodeUint(res[j]);
           if (raw === null) return;
@@ -740,7 +911,7 @@ export async function scanUniverse(
         stateView: opts.v4.stateView, poolManager: opts.v4.poolManager, weth: opts.wrappedNative,
         quoteUsd: qUsd, quoteDecimals: qDec, minUsd: minPoolUsd,
       });
-      if (found.length) ({ candidates } = rankCandidates([...multi, ...kept, ...found], minPoolUsd));
+      if (found.length) ({ candidates } = paced ? await runSteps(rankCandidatesSteps([...multi, ...kept, ...found], minPoolUsd), 'pool scan pricing', sliceMs) : rankCandidates([...multi, ...kept, ...found], minPoolUsd));
       v4 = { singles: singles.length, withMoney: withMoney.length, pairsAsked: pairs.size, found: found.length,
         candidatesWithV4: candidates.filter((c) => c.pools.some((p) => p.kind === 'v4')).length };
       log(`[scan] v4 lookup: ${singles.length} single-exchange pairs checked, ${withMoney.length} with $${minPoolUsd}+; asked V4 about ${pairs.size} pairs, found ${found.length} V4 pools with $${minPoolUsd}+`);

@@ -297,7 +297,11 @@ export interface PlainHourlyInput {
     benchedRoutes?: number; // pool pairs benched for never paying out
   };
   checksAvailable: boolean;            // false = no node can run checks right now
-  earned: { todayChecked: number; todayCheckedCount: number; todayUnchecked: number; todayUncheckedCount: number; weekChecked: number };
+  earned: {
+    todayChecked: number; todayCheckedCount: number; todayUnchecked: number; todayUncheckedCount: number; weekChecked: number;
+    // Oct 15 (optional): part of todayChecked from single wins of $20+, and the biggest win.
+    todayBigUsd?: number; todayBigCount?: number; best?: { usd: number; label: string };
+  };
   reactionMs: { typical: number | null; slowest5pct: number | null };
   otherBots?: { timed: number; theirMs: number | null; oursMs: number | null; weBeat: number };
   // What the rival bots did this hour (core/rivalWatch.ts).
@@ -422,7 +426,9 @@ export function formatPlainHourly(r: PlainHourlyInput): string {
     // Wins by size: decides where the firing bar should be ($20 today).
     const ws = r.checks.winSizes;
     if (ws && ws.today.some((x) => x > 0)) {
-      L.push('  Real wins by size (after gas), today:');
+      // Fed only by checks right after a trade we followed, on vetted coins.
+      // Standing-gap wins are NOT in here, so this is smaller than "Today" below.
+      L.push('  Wins right after a trade we followed, by size (after gas, vetted coins, standing gaps not included), today:');
       L.push('  ' + ws.bars.map((b, i) => `$${b}+: ${ws.today[i]} ($${ws.todayUsd[i].toFixed(0)})`).join(' · '));
     }
     if (r.checks.benchedRoutes) L.push(`  Skipping ${r.checks.benchedRoutes} pair(s) of trading spots that never pay out`);
@@ -433,7 +439,8 @@ export function formatPlainHourly(r: PlainHourlyInput): string {
     if (pb) {
       const h = ProfitBands.line(pb.hour), d = ProfitBands.line(pb.day);
       L.push(`  Profitable checks by size this hour: ${h ?? 'none'}`);
-      if (d) L.push(`  Today: ${d} (total ${money(pb.dayUsd)})`);
+      // Every profitable check, including coins not on the vetted list (can't be traded).
+      if (d) L.push(`  Today, all coins incl. ones we can't trade: ${d} (total ${money(pb.dayUsd)})`);
     }
   }
   // Race check: practice wins vs other bots that went for the same gap.
@@ -452,6 +459,15 @@ export function formatPlainHourly(r: PlainHourlyInput): string {
 
   L.push('<b>Money we\'d have made</b> (if we won every race)');
   L.push(`Today, checked: ${money(r.earned.todayChecked)} from ${r.earned.todayCheckedCount} trade${r.earned.todayCheckedCount === 1 ? '' : 's'}`);
+  // A few big one-off wins can be most of the day: show the total without them,
+  // and the biggest one, so it can be looked up in the logs.
+  const big = r.earned.todayBigCount ?? 0;
+  if (big > 0) {
+    const restUsd = r.earned.todayChecked - (r.earned.todayBigUsd ?? 0);
+    const restN = r.earned.todayCheckedCount - big;
+    L.push(`  of that, ${money(r.earned.todayBigUsd ?? 0)} from ${big} win${big === 1 ? '' : 's'} of $20+ (rare, check before trusting). Without them: ${money(restUsd)} from ${restN}`);
+  }
+  if (r.earned.best && r.earned.best.usd >= 20) L.push(`  Biggest today: ${money(r.earned.best.usd)} ${esc(r.earned.best.label)}`);
   if (r.earned.todayUncheckedCount) L.push(`Looks good but not checked yet: ${money(r.earned.todayUnchecked)} from ${r.earned.todayUncheckedCount} (not trustworthy)`);
   L.push(`Last 7 days, checked: ${money(r.earned.weekChecked)}`);
   L.push('');
@@ -470,6 +486,12 @@ export function formatPlainHourly(r: PlainHourlyInput): string {
   for (const s of r.stalls ?? []) if (s) L.push(esc(s));
   L.push('');
 
+  // Loop trader (3-5 pool loops), practice only. Only present when LOOP_TRADER is on.
+  // Placed before the rival bots / research / new exchange blocks (Oct 15):
+  // further down it was the part cut off when the message ran over
+  // Telegram's length limit ("(trimmed)").
+  if (r.loops) { L.push(r.loops); L.push(''); }
+
   // What the other bots did: where the real money is, and how they make it.
   const rw = r.rivalWins;
   if (rw && (rw.trades > 0 || rw.botsKnown > 0)) {
@@ -486,9 +508,6 @@ export function formatPlainHourly(r: PlainHourlyInput): string {
 
   // Which new exchanges earn in practice (Fables, Alandale, GIGA CL, ...).
   if (r.venueTests) { L.push(r.venueTests); L.push(''); }
-
-  // Loop trader (3-5 pool loops), practice only. Only present when LOOP_TRADER is on.
-  if (r.loops) { L.push(r.loops); L.push(''); }
 
   // Honest bottom line: what is PROVEN vs what is only seen.
   {

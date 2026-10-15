@@ -202,6 +202,32 @@ function stallSummary(lines) {
   const g = lastMatch(lines, /^\[stalls\] Memory clean-up/);
   return f.replace(/^\[stalls\] /, '').slice(0, 300) + (g ? ` · ${g.replace(/^\[stalls\] /, '').slice(0, 300)}` : '');
 }
+// Loop trades (Oct 15): the loop trader's results, from its own log lines
+// (src/core/loopReport.ts loopLogLine):
+//   "[loop] hour: found 505, best $8.87, ..."            once an hour (full hour)
+//   "[loop] hour so far (15 min): found 120, best $2.10, ..."  every 15 min
+// Returns the page lines. The "so far" line is shown only when it is newer
+// than the last full-hour line (an older one belongs to the hour before).
+function loopTradeLines(lines) {
+  let hourAt = -1, sofarAt = -1;
+  for (let i = lines.length - 1; i >= 0 && (hourAt < 0 || sofarAt < 0); i--) {
+    if (hourAt < 0 && /^\[loop\] hour: /.test(lines[i])) hourAt = i;
+    else if (sofarAt < 0 && /^\[loop\] hour so far \(\d+ min\): /.test(lines[i])) sofarAt = i;
+  }
+  const body = (l) => l.replace(/^\[loop\] /, '').slice(0, 700);
+  if (hourAt < 0 && sofarAt < 0) {
+    const on = lastMatch(lines, /^\[loop\] loop trader ON/);
+    return [`- Loop trades: no loop results yet (${on ? 'loop trader on, first numbers within 15 min' : 'loops off, or no summary in the log yet'})`];
+  }
+  const out = [];
+  if (sofarAt > hourAt) {
+    const m = /^hour so far \((\d+) min\): (.*)$/.exec(body(lines[sofarAt]));
+    if (m) out.push(`- Loop trades (this hour so far, ${m[1]} min): ${m[2]}`);
+  }
+  if (hourAt >= 0) out.push(`- Loop trades (last full hour): ${body(lines[hourAt]).replace(/^hour: /, '')}`);
+  return out;
+}
+
 // Deploy lock: auto-deploy.sh writes "<sha> <title>" here while live instead of deploying.
 const pendingDeploy = () => { try { return fs.readFileSync(path.join(APP_DIR, 'data', 'deploy-pending.txt'), 'utf8').trim().slice(0, 160); } catch { return ''; } };
 
@@ -401,6 +427,7 @@ async function main() {
     `- New pool counter: ${newPoolsLine ? newPoolsLine.replace(/^\[newpools\] /, '') : 'no hourly line yet'} · this window: ${newPoolsWaiting} new pool(s) for deep coins, ${newPoolsFirstMoney.length} measured, ${newPoolsFails} failed poll(s)`,
     ...newPoolsFirstMoney.slice(-3).map((l) => `  - ${l.replace(/^\[newpools\] /, '').slice(0, 200)}`),
     `- Loop watch: ${loopsLine ? loopsLine.replace(/^\[loops\] /, '') : 'no line yet'}${loopsWatch ? ` (${loopsWatch.replace(/^\[loops\] /, '')})` : ''}`,
+    ...loopTradeLines(bigTail),
     `- New exchanges, practice tests and wins: ${venuesLine ? venuesLine.replace(/^\[venues\] practice tests by exchange, /, '').slice(0, 600) : 'first figure after the next hourly report'}`,
     `- Uniswap V4 (asked per pair):${v4Line ? v4Line.replace(/^\[scan\] v4: /, '') : 'no full scan finished yet'}`,
     `- Coin groups (please review): ${groupsLine ? groupsLine.replace(/^\[groups\] verified coins: /, '').slice(0, 1500) : `not built yet${groupsProgress ? ` (${groupsProgress.replace(/^\[groups\] /, '')})` : ''}`}`,
@@ -434,4 +461,4 @@ async function main() {
 // loads this file it just gets the helpers below, nothing is posted.
 if (require.main === module) main().catch((e) => console.error('[status] failed:', e.message));
 
-module.exports = { detectLive, footerText, readLiveRecords, liveSection, memSummary, stallSummary };
+module.exports = { detectLive, footerText, readLiveRecords, liveSection, memSummary, stallSummary, loopTradeLines };

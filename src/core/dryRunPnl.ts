@@ -22,6 +22,11 @@ export interface DayTotals {
   modelUsd: number;
   modelCount: number;
   best?: { usd: number; label: string };
+  // Oct 15: the part of verifiedUsd that came from single wins of $20+.
+  // A few big one-off wins can be most of a day's total, so the report shows
+  // the total without them too. Missing in older files = 0.
+  bigUsd?: number;
+  bigCount?: number;
 }
 
 // version 2 (Oct 6, 2026): fresh start after junk-token profits ($49M
@@ -34,6 +39,8 @@ export class DryRunPnl {
   // Last line of defence: no single arb on these pools makes more than this.
   // Anything bigger is bad data, never counted.
   static MAX_ONE_TRADE_USD = Number(process.env.PNL_MAX_ONE_TRADE_USD ?? 2_000);
+  // A single win this big or bigger is a "big win" (shown apart in the report).
+  static BIG_WIN_USD = 20;
   private state: State = { version: 2, days: {} };
   private dirty = false;
 
@@ -67,6 +74,7 @@ export class DryRunPnl {
     d.verifiedUsd += usd;
     d.verifiedCount++;
     if (!d.best || usd > d.best.usd) d.best = { usd, label: label.slice(0, 60) };
+    if (usd >= DryRunPnl.BIG_WIN_USD) { d.bigUsd = (d.bigUsd ?? 0) + usd; d.bigCount = (d.bigCount ?? 0) + 1; }
     this.dirty = true;
   }
 

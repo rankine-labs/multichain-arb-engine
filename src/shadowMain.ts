@@ -133,6 +133,7 @@ const noteNoSlot = (token: string, reason: string) => { if (/balance storage/i.t
 const RH_EXTRA_VENUES = process.env.RH_EXTRA_VENUES !== '0';
 import { ProfitBands } from './core/profitBands';
 import { RaceChecker } from './core/raceCheck';
+import { GapCredit } from './core/gapCredit';
 import { FablesFeeBook, readFablesFees } from './core/fablesFee';
 import { setHookedFeeSource } from './core/pairWatcher';
 import { SimBucketTally, classifySimOutcome } from './core/failReasons';
@@ -163,7 +164,7 @@ import { poolDepthUsd, setRealBalanceSource, thinPools, thinPoolsSteps } from '.
 import { LoopTrader, loopConfigFromEnv, LoopCheckResult, LoopTrade } from './core/loopTrader';
 // Loop fix phase 2: real (block-confirmed) prices, trigger replay, cheap scans (core/loopPrices.ts).
 import { loopFixFromEnv, PendingTrades, loopPoolState } from './core/loopPrices';
-import { formatLoopHour } from './core/loopReport';
+import { formatLoopHour, loopLogLine } from './core/loopReport';
 import { startMemReport, registerSize } from './core/memReport';
 // Loop trader extra pools: keeps single-pool pairs fresh for the loop finder only (off unless LOOP_TRADER=1).
 import { LoopExtraPools, loopExtraConfigFromEnv, readerAddresses, afterReaderWrite } from './core/loopExtraPools';
@@ -190,6 +191,14 @@ const stallFixOn = (name: string) => process.env[name] !== '0' && process.env[na
 const STALL_FIX_SCAN_EXPAND = stallFixOn('STALL_FIX_SCAN_EXPAND');
 const STALL_FIX_SAVES = stallFixOn('STALL_FIX_SAVES');
 const STALL_FIX_LOOP_DEBOUNCE = stallFixOn('STALL_FIX_LOOP_DEBOUNCE');
+// REBUILD_PACED (Oct 15, freeze fix): the 6-hourly / startup rebuilds take
+// short breaks in their remaining long steps, so no single step holds the
+// bot for seconds. Same results. Covers: the chain-wide pool scan (hand-
+// written read requests, pricing, new-pool bookkeeping, V4 single-pool
+// list), the coin names file (read/written in bites), and the cross-quote
+// and loop monitor setups. The pool scan is also listed as "in progress"
+// for the freeze report. REBUILD_PACED=0 = the old one-go way.
+const REBUILD_PACED = stallFixOn('REBUILD_PACED');
 
 async function main() {
 stallFinder.start();
@@ -509,7 +518,7 @@ const routeScores = new RouteScores();
 { const n = routeScores.load(ROUTE_FILE); if (n) console.log(`[sim] robinhood: restored scores for ${n} pool pairs`); }
 setInterval(() => timed('route scores save', () => routeScores.save(ROUTE_FILE)), 10 * 60_000);
 // Real wins by size ($1/$2/$5/$10/$20 bars), to set the firing bar from data.
-const winSizes = new WinSizes();
+const winSizes = new WinSizes(Date.now, 'America/Toronto'); // same 'today' as the rest of the report
 // Pool pairs whose last trigger test lost or failed: not re-tested for 5 min.
 const simLoserMuted = new Map<string, number>();
 // On-the-spot pool lookups that found nothing usable (see the trade handler).
@@ -1542,7 +1551,22 @@ if (loopCfg.enabled) {
       rivalWatch.onRecord = (rec) => loopTrader.noteRival(rec);
       registerSize('loop cycles', () => loopTrader.finder.cycleCount());
       registerSize('loop confirmed states', () => cache.confirmedCount());
-      loopHourText = () => formatLoopHour(loopTrader.takeHour(), loopCfg.maxPools, loopExtra?.status(loopCfg.maxPoolAgeMs) ?? null);
+      // Hourly: take the hour's numbers ONCE (takeHour resets them), log one
+      // plain "[loop] hour:" line for the status page, then build the same
+      // Telegram block as before from the same numbers.
+      let loopHourStart = Date.now();
+      loopHourText = () => {
+            const h = loopTrader.takeHour();
+            loopHourStart = Date.now();
+            console.log(loopLogLine(h, loopCfg.maxPools, 'hour'));
+            return formatLoopHour(h, loopCfg.maxPools, loopExtra?.status(loopCfg.maxPoolAgeMs) ?? null);
+      };
+      // Every 15 min: the hour's numbers so far (read only, nothing reset), so
+      // the status page (also every 15 min) always has fresh loop numbers.
+      setInterval(() => {
+            try { console.log(loopLogLine(loopTrader.peekHour(), loopCfg.maxPools, `hour so far (${Math.round((Date.now() - loopHourStart) / 60_000)} min)`)); }
+            catch (err) { console.warn('[loop] summary line failed (ignored):', (err as Error).message); }
+      }, 15 * 60_000);
       console.log(`[loop] fix phase 2: real prices ${realPricesOn ? 'on' : 'off'}, keep block updates ${loopFix.keepBlockUpdates ? 'on' : 'off'}, trigger replay ${loopFix.triggerReplay ? 'on' : 'off'}, model vs check ${loopFix.modelVsCheck ? 'on' : 'off'}, cheap scan ${loopFix.cheapScan ? `on (${loopFix.sliceMs} ms slices)` : 'off'}`);
       console.log(`[loop] loop trader ON (practice only, never sends): 3-${loopCfg.maxPools} pools, up to ${loopCfg.maxCycles} loops, max $${loopCfg.maxTradeUsd}, bar $${loopCfg.minNetUsd}, ${loopCfg.checksPerMin} checks/min`);
 }
@@ -2308,6 +2332,9 @@ await chainManager.startAll();
       // again. Now a confirmed gap counts again only after it CLOSED (left the
       // scan's list) or at least doubled in size. Value = model profit when confirmed.
       const gapConfirmedOpen = new Map<string, number>();
+      // Oct 15: when an open gap is re-checked because it doubled, only the
+      // growth counts toward "would have made" (one gap, one trade). Reporting only.
+      const gapCredit = new GapCredit();
       const poolSig = (p: PoolState) => `${p.sqrtPriceX96 ?? ''}:${p.liquidity ?? ''}:${p.reserveA ?? ''}:${p.reserveB ?? ''}`;
       const GAP_FAKE_MUTE_MS = 30 * 60_000;
       const gapLastFired = new Map<string, number>();
@@ -2394,6 +2421,7 @@ await chainManager.startAll();
                   // Gaps that closed since they were confirmed may count again.
                   const openNow = new Set(gaps.map((g) => `${g.buyPool.poolAddress}>${g.sellPool.poolAddress}`));
                   for (const k of gapConfirmedOpen.keys()) if (!openNow.has(k)) gapConfirmedOpen.delete(k);
+                  for (const k of [...gapCredit.keys()]) if (!openNow.has(k)) gapCredit.closed(k);
                   let fired = 0;
                   for (const g of gaps) {
                         if (fired >= 2) break;
@@ -2455,21 +2483,28 @@ await chainManager.startAll();
                               else if (check.status !== 'skipped') gapStats.fake++;
                               const why = check.status === 'profit' ? `real profit only $${check.usd.toFixed(2)}` : check.reason;
                               console.log(`[gap] ${label}: model said ~$${g.profitUsd.toFixed(2)} but NOT REAL (${why}); muted 30 min | ${route}`);
+                              gapCredit.closed(key); // not real: forget what it was credited (practice numbers only)
                               continue;
                         }
                         gapStats.found++;
                         gapStats.bestUsd = Math.max(gapStats.bestUsd, simNet);
                         gapConfirmedState.set(key, sig);
                         gapConfirmedOpen.set(key, g.profitUsd);
-                        if (gapConfirmedOpen.size > 2_000) gapConfirmedOpen.clear();
+                        // Emptied together with gapCredit, so a gap that is "new" to the
+                        // re-check rule is also credited in full (practice numbers only).
+                        if (gapConfirmedOpen.size > 2_000) { gapConfirmedOpen.clear(); for (const k of [...gapCredit.keys()]) gapCredit.closed(k); }
                         if (gapConfirmedState.size > 2_000) gapConfirmedState.clear();
                         // Practice results: confirmed sitting-gap wins on vetted coins count as
                         // "would have earned" here (the firing safety gate below may still
                         // refuse small trades; that's about sending, not about the result).
                         const gapVetted = safetyGate.isAllowed(g.base) && safetyGate.isAllowed(g.quote)
                               && !(involvesAutoVetted([g.base, g.quote]) && g.sizeUsd > AUTO_VET_MAX_TRADE_USD);
-                        if (gapVetted && simNet >= MIN_COUNTED_USD) dryRunPnl.recordVerified(simNet, `${label} gap`);
-                        profitBands.add(simNet, torontoDay());
+                        // Same open gap re-checked after it doubled: only the growth is new
+                        // money (one trade takes the gap once). First time: all of it.
+                        const gapNew = gapCredit.credit(key, simNet);
+                        if (gapVetted && gapNew >= MIN_COUNTED_USD) dryRunPnl.recordVerified(gapNew, `${label} gap`);
+                        if (gapNew > 0) profitBands.add(gapNew, torontoDay());
+                        if (gapNew < simNet) console.log(`[gap] ${label}: same open gap grew, counted only the extra $${gapNew.toFixed(2)} of $${simNet.toFixed(2)}`);
                         // Would we really have won it? (ready = after our check + ~2 ms to sign)
                         void raceChecker.record({ label: `${label} gap`, pools: [g.buyPool.poolAddress, g.sellPool.poolAddress], netUsd: simNet, source: 'gap', readyDelayMs: Date.now() - spottedAt + 2 });
                         console.log(`[gap] standing gap ${label} CONFIRMED: real ~$${simNet.toFixed(2)} (model $${g.profitUsd.toFixed(2)}) on $${Math.round(g.sizeUsd)} | ${route}`);
@@ -2744,7 +2779,10 @@ await chainManager.startAll();
       // Called after each good chain-wide scan (the loop trader's extra pools
       // rebuild their pick then; a no-op unless that is on).
       let onScanDone: () => void = () => {};
-      const runRobinhoodScan = async () => {
+      // Freeze report: the whole scan counts as "pool scan" in progress, so a
+      // freeze during it says "(during ..., pool scan)" (REBUILD_PACED).
+      const runRobinhoodScan = (): Promise<void> => (REBUILD_PACED && !scanRunning && SCAN_TOP > 0 ? timedAsync('pool scan', runRobinhoodScanInner) : runRobinhoodScanInner());
+      const runRobinhoodScanInner = async () => {
             if (scanRunning || SCAN_TOP <= 0) return;
             scanRunning = true;
             try {
@@ -2757,7 +2795,7 @@ await chainManager.startAll();
                   const scanOpts = { usdToken: ROBINHOOD_TOKENS.USDG, wrappedNative: ROBINHOOD_TOKENS.WETH, minPoolUsd: SCAN_MIN_USD,
                         maxLogRange: Number(process.env.ROBINHOOD_SCAN_LOG_RANGE ?? 500_000), log: (m: string) => console.log(m),
                         v4: RH_V4_SCAN ? { stateView: ROBINHOOD_V4.STATE_VIEW, poolManager: ROBINHOOD_V4.POOL_MANAGER } : undefined,
-                        chunked: STALL_FIX_SCAN_EXPAND };
+                        chunked: STALL_FIX_SCAN_EXPAND, paced: REBUILD_PACED };
                   // Gentle lane on the free node (see robinhoodScanProvider).
                   const res = await scanUniverse(robinhoodScanProvider, RH_EXTRA_VENUES ? [...ROBINHOOD_SCAN_FACTORIES, ...extraScanFactories()] : ROBINHOOD_SCAN_FACTORIES, scanOpts, scanState);
                   // Progress per factory is saved even if some failed.
@@ -2817,7 +2855,7 @@ await chainManager.startAll();
             try {
                   const st = scanState ?? loadScanState();
                   const pools = STALL_FIX_SCAN_EXPAND ? await runSteps(stateToPoolsSteps(st), 'scan pool list') : timed('scan pool list', () => stateToPools(st));
-                  const n = await timedAsync('cross-quote setup', () => crossQuote.setup(pools, Number(process.env.CROSS_QUOTE_TOKENS ?? 60)));
+                  const n = await timedAsync('cross-quote setup', () => crossQuote.setup(pools, Number(process.env.CROSS_QUOTE_TOKENS ?? 60), undefined, { paced: REBUILD_PACED }));
                   console.log(`[openwatch] watching ${n} tokens that trade against both USDG and ETH`);
             } catch (err) { console.warn('[openwatch] setup failed:', (err as Error).message); }
       };
@@ -3010,10 +3048,12 @@ await chainManager.startAll();
                               symbolCacheFile: SYMBOLS_FILE, outFile: GROUPS_FILE, log: (m) => console.log(m),
                               // Short breaks in the long walks over every pool/coin (same switch as the scan's pool list).
                               paced: STALL_FIX_SCAN_EXPAND,
+                              // Coin names file read / written in bites (REBUILD_PACED=0: one go).
+                              rebuildPaced: REBUILD_PACED,
                         }));
                   }
                   const quotes = tokenGroups!.members.map((m) => ({ token: m.token, symbol: m.symbol, group: m.group, priceUsd: m.priceUsd }));
-                  const n = await timedAsync('loop monitor setup', () => loopMonitor.setup(pools, quotes, Number(process.env.LOOP_TOKENS ?? 80)));
+                  const n = await timedAsync('loop monitor setup', () => loopMonitor.setup(pools, quotes, Number(process.env.LOOP_TOKENS ?? 80), undefined, { paced: REBUILD_PACED }));
                   console.log(`[loops] watching ${n} tokens that trade against 2+ of ${quotes.length} verified coins`);
                   scheduleFirstLoopReport(n);
             } catch (err) {
@@ -3355,6 +3395,7 @@ for (let i = 0; i < resolved.length; i++) {
                                     todayChecked: pnl.today.verifiedUsd, todayCheckedCount: pnl.today.verifiedCount,
                                     todayUnchecked: pnl.today.modelUsd, todayUncheckedCount: pnl.today.modelCount,
                                     weekChecked: pnl.last7.verifiedUsd,
+                                    todayBigUsd: pnl.today.bigUsd ?? 0, todayBigCount: pnl.today.bigCount ?? 0, best: pnl.today.best,
                               },
                               reactionMs: { typical: stats.medianReactionMs, slowest5pct: stats.p95ReactionMs },
                               otherBots: { timed: rv.found, theirMs: rv.theirMedianMs, oursMs: rv.ourMedianMs, weBeat: rv.beatCount },
