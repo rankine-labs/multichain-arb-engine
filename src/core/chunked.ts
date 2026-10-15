@@ -59,18 +59,35 @@ export async function runSteps<T>(job: Steps<T>, name: string, sliceMs = 5): Pro
 // the bot run, then names the next stretch `name` for the stall finder.
 // enabled = false: never takes a break (the old behaviour). Same result
 // either way; only the timing changes.
+//
+// Oct 15 fix (naming only): rest() used to name the next stretch with
+// stallFinder.mark(), but that name ended BEFORE the caller's code after
+// `await rest()` even started (a quirk of how async code takes turns), so
+// the work between breaks, and any long step after the last break, was
+// never named and showed up as "other (during ...)". Now the name covers
+// the caller's code until its next break, or until it next waits on
+// something (e.g. a node read) or finishes.
 export class Pacer {
   private t0 = performance.now();
   private calls = 0;
+  private endStretch: (() => void) | null = null;
   constructor(private readonly name: string, private readonly sliceMs = 5, private readonly enabled = true) {}
   due(): boolean {
     if (!this.enabled || (++this.calls & 255) !== 0) return false;
     return performance.now() - this.t0 >= this.sliceMs;
   }
   async rest(): Promise<void> {
+    // The named stretch before this break ends here.
+    if (this.endStretch) { this.endStretch(); this.endStretch = null; }
     await yieldToLoop();
     this.t0 = performance.now();
-    stallFinder.mark(this.name);
+    const end = stallFinder.begin(this.name);
+    this.endStretch = end;
+    // End the name after the caller's next piece of code has run: the
+    // caller's code after `await rest()` is queued right after this
+    // function returns, so ending two turns later lets it run first.
+    // (Ending twice is harmless: the next rest() may end it sooner.)
+    queueMicrotask(() => queueMicrotask(end));
   }
 }
 
@@ -124,11 +141,17 @@ export function* jsonPieces(value: unknown, depth = 0): Generator<string, void, 
 // Atomic: written to file.tmp, then renamed over the real file.
 // Throws on a disk problem (the caller decides what to do).
 export async function writeJsonChunked(file: string, value: unknown, name = 'json save', sliceMs = 5): Promise<void> {
+  return writeTextChunked(file, jsonPieces(value), name, sliceMs);
+}
+
+// Write text handed out piece by piece (any generator of strings) to `file`
+// the same careful way: built in ~5 ms bites, async writes, temp file then
+// rename. The file holds exactly the pieces joined together.
+export async function writeTextChunked(file: string, pieces: Iterator<string, unknown, void>, name = 'file save', sliceMs = 5): Promise<void> {
   await mkdir(dirname(file), { recursive: true });
   const tmp = file + '.tmp';
   const fh = await open(tmp, 'w');
   try {
-    const pieces = jsonPieces(value);
     let done = false;
     while (!done) {
       // One bite: build up to ~1 MB of text or ~sliceMs of work.

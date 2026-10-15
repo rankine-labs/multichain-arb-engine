@@ -190,6 +190,14 @@ const stallFixOn = (name: string) => process.env[name] !== '0' && process.env[na
 const STALL_FIX_SCAN_EXPAND = stallFixOn('STALL_FIX_SCAN_EXPAND');
 const STALL_FIX_SAVES = stallFixOn('STALL_FIX_SAVES');
 const STALL_FIX_LOOP_DEBOUNCE = stallFixOn('STALL_FIX_LOOP_DEBOUNCE');
+// REBUILD_PACED (Oct 15, freeze fix): the 6-hourly / startup rebuilds take
+// short breaks in their remaining long steps, so no single step holds the
+// bot for seconds. Same results. Covers: the chain-wide pool scan (hand-
+// written read requests, pricing, new-pool bookkeeping, V4 single-pool
+// list), the coin names file (read/written in bites), and the cross-quote
+// and loop monitor setups. The pool scan is also listed as "in progress"
+// for the freeze report. REBUILD_PACED=0 = the old one-go way.
+const REBUILD_PACED = stallFixOn('REBUILD_PACED');
 
 async function main() {
 stallFinder.start();
@@ -2744,7 +2752,10 @@ await chainManager.startAll();
       // Called after each good chain-wide scan (the loop trader's extra pools
       // rebuild their pick then; a no-op unless that is on).
       let onScanDone: () => void = () => {};
-      const runRobinhoodScan = async () => {
+      // Freeze report: the whole scan counts as "pool scan" in progress, so a
+      // freeze during it says "(during ..., pool scan)" (REBUILD_PACED).
+      const runRobinhoodScan = (): Promise<void> => (REBUILD_PACED && !scanRunning && SCAN_TOP > 0 ? timedAsync('pool scan', runRobinhoodScanInner) : runRobinhoodScanInner());
+      const runRobinhoodScanInner = async () => {
             if (scanRunning || SCAN_TOP <= 0) return;
             scanRunning = true;
             try {
@@ -2757,7 +2768,7 @@ await chainManager.startAll();
                   const scanOpts = { usdToken: ROBINHOOD_TOKENS.USDG, wrappedNative: ROBINHOOD_TOKENS.WETH, minPoolUsd: SCAN_MIN_USD,
                         maxLogRange: Number(process.env.ROBINHOOD_SCAN_LOG_RANGE ?? 500_000), log: (m: string) => console.log(m),
                         v4: RH_V4_SCAN ? { stateView: ROBINHOOD_V4.STATE_VIEW, poolManager: ROBINHOOD_V4.POOL_MANAGER } : undefined,
-                        chunked: STALL_FIX_SCAN_EXPAND };
+                        chunked: STALL_FIX_SCAN_EXPAND, paced: REBUILD_PACED };
                   // Gentle lane on the free node (see robinhoodScanProvider).
                   const res = await scanUniverse(robinhoodScanProvider, RH_EXTRA_VENUES ? [...ROBINHOOD_SCAN_FACTORIES, ...extraScanFactories()] : ROBINHOOD_SCAN_FACTORIES, scanOpts, scanState);
                   // Progress per factory is saved even if some failed.
@@ -2817,7 +2828,7 @@ await chainManager.startAll();
             try {
                   const st = scanState ?? loadScanState();
                   const pools = STALL_FIX_SCAN_EXPAND ? await runSteps(stateToPoolsSteps(st), 'scan pool list') : timed('scan pool list', () => stateToPools(st));
-                  const n = await timedAsync('cross-quote setup', () => crossQuote.setup(pools, Number(process.env.CROSS_QUOTE_TOKENS ?? 60)));
+                  const n = await timedAsync('cross-quote setup', () => crossQuote.setup(pools, Number(process.env.CROSS_QUOTE_TOKENS ?? 60), undefined, { paced: REBUILD_PACED }));
                   console.log(`[openwatch] watching ${n} tokens that trade against both USDG and ETH`);
             } catch (err) { console.warn('[openwatch] setup failed:', (err as Error).message); }
       };
@@ -3010,10 +3021,12 @@ await chainManager.startAll();
                               symbolCacheFile: SYMBOLS_FILE, outFile: GROUPS_FILE, log: (m) => console.log(m),
                               // Short breaks in the long walks over every pool/coin (same switch as the scan's pool list).
                               paced: STALL_FIX_SCAN_EXPAND,
+                              // Coin names file read / written in bites (REBUILD_PACED=0: one go).
+                              rebuildPaced: REBUILD_PACED,
                         }));
                   }
                   const quotes = tokenGroups!.members.map((m) => ({ token: m.token, symbol: m.symbol, group: m.group, priceUsd: m.priceUsd }));
-                  const n = await timedAsync('loop monitor setup', () => loopMonitor.setup(pools, quotes, Number(process.env.LOOP_TOKENS ?? 80)));
+                  const n = await timedAsync('loop monitor setup', () => loopMonitor.setup(pools, quotes, Number(process.env.LOOP_TOKENS ?? 80), undefined, { paced: REBUILD_PACED }));
                   console.log(`[loops] watching ${n} tokens that trade against 2+ of ${quotes.length} verified coins`);
                   scheduleFirstLoopReport(n);
             } catch (err) {

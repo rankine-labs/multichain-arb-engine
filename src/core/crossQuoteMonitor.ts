@@ -4,7 +4,7 @@ import { refreshPoolsBatch } from './pairWatcher';
 import { priceOf } from './poolPrice';
 import { readFileSync, writeFileSync, mkdirSync, renameSync } from 'fs';
 import { dirname } from 'path';
-import { Steps, drainSteps, runSteps } from './chunked';
+import { Steps, drainSteps, runSteps, Pacer } from './chunked';
 import { markStretch } from './stallFinder';
 
 // A finished job with nothing left to do (for the early returns in tickSteps).
@@ -114,10 +114,15 @@ export class CrossQuoteMonitor {
 
   // Pick tokens with at least one USDG pool AND one WETH pool, each holding at
   // least minQuoteUsd of the quote coin; keep the maxTokens deepest.
-  async setup(scanned: ScannedPool[], maxTokens = 60, minQuoteUsd = 1_000): Promise<number> {
+  // pace.paced (REBUILD_PACED, Oct 15): the walks over every scanned pool
+  // (~400,000) take a short break about every 5 ms (measured: 1.5 s in one
+  // go on the server). Same tokens picked. Off: no breaks (old way).
+  async setup(scanned: ScannedPool[], maxTokens = 60, minQuoteUsd = 1_000, pace: { paced?: boolean; paceMs?: number } = {}): Promise<number> {
+    const pacer = new Pacer('cross-quote setup', pace.paceMs ?? 5, !!pace.paced);
     const usdg = this.usdg.toLowerCase(), weth = this.weth.toLowerCase();
     const byToken = new Map<string, ScannedPool[]>();
     for (const p of scanned) {
+      if (pacer.due()) await pacer.rest();
       if (p.stable) continue;
       const t0 = p.token0.toLowerCase(), t1 = p.token1.toLowerCase();
       const quote = [usdg, weth].includes(t0) ? t0 : [usdg, weth].includes(t1) ? t1 : null;
@@ -126,10 +131,13 @@ export class CrossQuoteMonitor {
       if (token === usdg || token === weth) continue;
       (byToken.get(token) ?? byToken.set(token, []).get(token)!).push(p);
     }
-    const cands = [...byToken.entries()].filter(([, ps]) => {
-      const qs = new Set(ps.map((p) => ([p.token0, p.token1].map((x) => x.toLowerCase()).includes(usdg) ? 'usdg' : 'weth')));
-      return qs.size === 2;
-    });
+    // (Same as [...byToken.entries()].filter(...), as a loop with breaks.)
+    const cands: [string, ScannedPool[]][] = [];
+    for (const e of byToken) {
+      if (pacer.due()) await pacer.rest();
+      const qs = new Set(e[1].map((p) => ([p.token0, p.token1].map((x) => x.toLowerCase()).includes(usdg) ? 'usdg' : 'weth')));
+      if (qs.size === 2) cands.push(e);
+    }
     if (!cands.length) return 0;
 
     // Quote-side balance of every candidate pool (one bundled read).
@@ -431,7 +439,11 @@ export class LoopMonitor {
 
   // Pick tokens that trade against 2+ verified quote coins (with a pool
   // between those two quotes to close the loop), keep the deepest maxTokens.
-  async setup(scanned: ScannedPool[], quotes: LoopQuote[], maxTokens = 80, minQuoteUsd = 2_000): Promise<number> {
+  // pace.paced (REBUILD_PACED, Oct 15): the walks over every scanned pool and
+  // coin take a short break about every 5 ms (measured: ~0.6 s in one go on
+  // the server). Same tokens picked. Off: no breaks (old way).
+  async setup(scanned: ScannedPool[], quotes: LoopQuote[], maxTokens = 80, minQuoteUsd = 2_000, pace: { paced?: boolean; paceMs?: number } = {}): Promise<number> {
+    const pacer = new Pacer('loop monitor setup', pace.paceMs ?? 5, !!pace.paced);
     this.quotes = new Map(quotes.map((q) => [q.token.toLowerCase(), { ...q, token: q.token.toLowerCase() }]));
     const Q = this.quotes;
     // Pools touching a quote coin, grouped by the token on the other side.
@@ -446,6 +458,7 @@ export class LoopMonitor {
     const seen = new Map<string, number>(); // token -> bitmask of quotes it trades against
     const mark = (t: string, q: string) => { const i = qIdx.get(q)!; seen.set(t, (seen.get(t) ?? 0) | (i < 31 ? 1 << i : 1 << 30)); };
     for (const p of scanned) {
+      if (pacer.due()) await pacer.rest();
       if (p.stable) continue;
       const t0 = p.token0.toLowerCase(), t1 = p.token1.toLowerCase();
       if (Q.has(t1)) mark(t0, t1);
@@ -453,10 +466,14 @@ export class LoopMonitor {
     }
     const bits = (x: number) => { let n = 0; while (x) { n += x & 1; x >>>= 1; } return n; };
     const keep = new Set<string>();
-    for (const [t, m] of seen) if (Q.has(t) || bits(m) >= 2) keep.add(t);
+    for (const [t, m] of seen) {
+      if (pacer.due()) await pacer.rest();
+      if (Q.has(t) || bits(m) >= 2) keep.add(t);
+    }
     seen.clear();
     const byToken = new Map<string, { p: ScannedPool; quote: string }[]>();
     for (const p of scanned) {
+      if (pacer.due()) await pacer.rest();
       if (p.stable) continue;
       const t0 = p.token0.toLowerCase(), t1 = p.token1.toLowerCase();
       if (Q.has(t1) && keep.has(t0)) (byToken.get(t0) ?? byToken.set(t0, []).get(t0)!).push({ p, quote: t1 });
