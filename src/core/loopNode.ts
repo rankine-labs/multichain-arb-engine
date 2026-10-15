@@ -264,6 +264,12 @@ export class LoopNodeThrottle {
   private checkStart = 0;        // when the current loop check started
   sentThisCheck = 0;             // requests the current loop check got past the gate
   busySkips = 0;                 // checks given up this hour (read by the hour line)
+  // LOOP WORKER (Oct 15): when loops run in their own thread, the shared
+  // allowance lives in the main thread. Then this is set and asked instead of
+  // `shared` before every request: the main thread answers yes only when the
+  // shared allowance is quiet (same rule as sharedHasRoom) and counts the
+  // request in it. null = ask `shared` directly (loops in the main thread).
+  permit: (() => Promise<boolean>) | null = null;
 
   constructor(
     readonly maxRps: number,
@@ -297,7 +303,10 @@ export class LoopNodeThrottle {
       const t = this.now();
       if (t - this.checkStart > this.maxCheckMs) throw new LoopNodeBusy('check too long');
       const own = this.ownHasRoom(t);
-      if (own && this.sharedHasRoom()) { this.sent.push(t); this.sentThisCheck++; return; }
+      // Only ask about the shared node when loops' own limit has room (so a
+      // "yes" from the main thread, which counts the request, is always used).
+      const room = own && (this.permit ? await this.permit() : this.sharedHasRoom());
+      if (own && room) { this.sent.push(t); this.sentThisCheck++; return; }
       // Only time lost to a busy SHARED node counts toward the 2 s.
       if (own) {
         if (this.waitedMs + this.stepMs > this.maxWaitMs) throw new LoopNodeBusy();

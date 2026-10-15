@@ -190,8 +190,11 @@ function memSummary(lines) {
   const m = /^\[mem\] rss (\d+) MB · heap used (\d+) \/ total (\d+) \/ limit (\d+) MB/.exec(l);
   const peak = /peak rss (\d+) MB, peak heap used (\d+) MB/.exec(l);
   const sizes = /· sizes: (.*)$/.exec(l);
+  // Loop worker thread's own memory (Oct 15, LOOP_WORKER), when it runs.
+  const worker = /· (loop worker heap \d+ MB(?: \(restarting\))?)/.exec(l);
   if (!m) return l.replace(/^\[mem\] /, '').slice(0, 300);
   return `rss ${m[1]} MB (peak ${peak ? peak[1] : '?'}) · real data (heap used) ${m[2]} of ${m[3]} MB, limit ${m[4]} MB`
+    + (worker ? ` · ${worker[1]}` : '')
     + (sizes ? ` · sizes: ${sizes[1].slice(0, 200)}` : '');
 }
 // Freezes (Oct 14): the bot's latest two "[stalls]" lines (every 5 min):

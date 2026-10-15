@@ -215,10 +215,33 @@ export class PoolCache {
     const k = this.key(chain, poolAddress);
     const c = this.confirmed.get(k);
     if (!c) return undefined;
-    const main = this.pools.get(k);
+    return this.withFee(c, this.pools.get(k));
+  }
+
+  // The confirmed state with the main copy's latest event fees (see getConfirmed).
+  private withFee(c: Confirmed, main: PoolState | undefined): PoolState {
     if (!main || main === c.pool || main.observedFee === c.pool.observedFee) return c.pool;
     if (!c.merged || c.merged.fee !== main.observedFee) c.merged = { fee: main.observedFee, pool: { ...c.pool, observedFee: main.observedFee } };
     return c.merged.pool;
+  }
+
+  // LOOP WORKER (main thread side, core/loopWorkerFeed.ts): in ONE lookup,
+  // the main state (m), the confirmed state exactly as getConfirmed gives it
+  // (c), and the confirmed entry itself (e). `e` is a new object on every
+  // confirmed write, so "e changed" tells whether confirmedInfo changed
+  // without building it. Read only; fills `out` (no new objects).
+  readLoopView(chain: ChainName, poolAddress: string, out: { m?: PoolState; c?: PoolState; e?: object }): void {
+    this.readLoopViewKey(this.key(chain, poolAddress), out);
+  }
+  // Same, with the cache's own key (from cacheKey) worked out once and
+  // remembered by the caller: saves making a lower-case copy every time.
+  cacheKey(chain: ChainName, poolAddress: string): string { return this.key(chain, poolAddress); }
+  readLoopViewKey(k: string, out: { m?: PoolState; c?: PoolState; e?: object }): void {
+    const main = this.pools.get(k);
+    const c = this.confirmed.get(k);
+    out.m = main;
+    out.e = c;
+    out.c = c ? this.withFee(c, main) : undefined;
   }
 
   // Block number of the confirmed state (for tests / reports). 0 = none or unknown.
