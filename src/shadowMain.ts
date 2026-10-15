@@ -97,6 +97,8 @@ import { AutoVet, CheckOutcome } from './core/autoVet';
 import { FailTally } from './core/failReasons';
 import { LenderBalances } from './core/lenderBalances';
 import { RouteScores, WinSizes, WIN_BARS } from './core/routeScore';
+import { readOutlierConfig, isOutlier, confirmOutlier, withDeadline, OutlierVerdict } from './core/outlierGuard';
+import type { ExecutorHop } from './execution/executorCalldata';
 import { RivalWatch } from './core/rivalWatch';
 import { V3BalanceBook, V3_BALANCES_FILE } from './core/v3BalanceBook';
 import { extraWatcherVenues, extraScanFactories, isExecutableVenue, canPracticeTestVenue, reportedVenueIds, venueShortName } from './config/robinhoodVenues';
@@ -582,12 +584,50 @@ const MAX_PLAUSIBLE_PROFIT_SHARE = Number(process.env.MAX_PLAUSIBLE_PROFIT_SHARE
 const plausibleProfit = (profit: bigint, amountIn: bigint): boolean =>
       amountIn > 0n && Number(profit) / Number(amountIn) <= MAX_PLAUSIBLE_PROFIT_SHARE;
 
+// OUTLIER GUARD (core/outlierGuard.ts, Oct 15). A profit over $50, or over 2%
+// of the trade (and over $20), is "too good to be true" (the $785 USDG/ORBIO
+// gap). It is only trusted if paid in USDG/WETH AND a second check on the
+// free node (a different node from the checking node) agrees at full and
+// half size. Live: not sent otherwise. Practice: not counted otherwise.
+const OUTLIER_CFG = readOutlierConfig();
+const OUTLIER_ANCHORS = [ROBINHOOD_TOKENS.USDG, ROBINHOOD_TOKENS.WETH];
+// The whole second check (2 simulations) must finish within OUTLIER_CHECK_MS
+// (default 1.5 s). Too slow = "not confirmed": a live trade would otherwise
+// go out after its deadline and revert. blockTag: practice trigger checks
+// test at the trigger's block (where the gap was), not 'latest'.
+const OUTLIER_CHECK_MS = Number(process.env.OUTLIER_CHECK_MS ?? 1500);
+const confirmRhOutlier = (tokenIn: string, hops: ExecutorHop[], amountIn: bigint, firstProfit: bigint, v3Lender?: string, blockTag?: string): Promise<OutlierVerdict> =>
+      withDeadline(confirmOutlier({
+            tokenIn, anchors: OUTLIER_ANCHORS, amountIn, firstProfit,
+            simulate: (amt) => simulateRoundTrip(rhFreeSimRpc, 'robinhood', { token: tokenIn, amountIn: amt, hops }, { v3Lender, weth: ROBINHOOD_TOKENS.WETH, ...(blockTag ? { blockTag } : {}) }),
+      }), OUTLIER_CHECK_MS);
+// Practice only: should this verified win count in "money we'd have made"?
+// Normal wins: yes, no extra checks. Outliers: only if the second check agrees.
+const outlierCountOk = async (label: string, netUsd: number, sizeUsd: number,
+      trade: { tokenIn: string; hops: ExecutorHop[]; amountIn: bigint; profit: bigint; v3Lender?: string; blockTag?: string }): Promise<boolean> => {
+      if (!isOutlier(netUsd, sizeUsd, OUTLIER_CFG)) return true;
+      // Live: the send path runs its own second check for outliers (fireTrade);
+      // running it here too would double the wait before sending. Live
+      // outliers are simply not counted in the practice numbers.
+      if (robinhoodSender.live) {
+            console.log(`[outlier] ${label} $${netUsd.toFixed(2)} on $${Math.round(sizeUsd)}: outlier, not counted (live: the send path decides)`);
+            return false;
+      }
+      const v = await confirmRhOutlier(trade.tokenIn, trade.hops, trade.amountIn, trade.profit, trade.v3Lender, trade.blockTag);
+      if (v.ok) { console.log(`[outlier] ${label} $${netUsd.toFixed(2)} on $${Math.round(sizeUsd)}: ${v.detail}, counted`); return true; }
+      funnelSkip('outlier profit, not counted (too good to be true, see [outlier] log)');
+      console.log(`[outlier] ${label} $${netUsd.toFixed(2)} on $${Math.round(sizeUsd)}: OUTLIER, NOT COUNTED (${'reason' in v ? v.reason : 'refused'})`);
+      return false;
+};
+
 // One on-chain round-trip check, awaited by the caller (used by the
 // standing-gap scanner, where there's no race to lose by waiting ~1 s).
 // Same build + simulation as queueSimulation, but returns the result
 // instead of only logging it, and ignores the "one sim at a time" queue.
 type RoundTripCheck =
-      | { status: 'profit'; usd: number; loanPips: number } // loanPips: fee of the lender the check used (0 = own money)
+      // loanPips: fee of the lender the check used (0 = own money).
+      // trade: what was checked (for the outlier guard's second check).
+      | { status: 'profit'; usd: number; loanPips: number; trade: { tokenIn: string; hops: ExecutorHop[]; amountIn: bigint; profit: bigint; v3Lender?: string } }
       | { status: 'loss' | 'fail' | 'skipped'; reason: string }
       | { status: 'rate_limited' };
 const checkRoundTrip = async (
@@ -619,7 +659,8 @@ const checkRoundTrip = async (
       if (r.status === 'unsupported') { if (chain === 'robinhood') noteNoSlot(tokenIn, r.reason); return { status: 'skipped', reason: r.reason }; }
       if (r.status === 'profit') {
             if (!plausibleProfit(r.profit, built.amountIn)) return { status: 'fail', reason: 'implausible profit (bad token or pool data)' };
-            return { status: 'profit', usd: (Number(r.profit) / 10 ** decimals) * usdPerToken, loanPips: lender ? (lender.feePips ?? lender.feeBps * 100) : 0 };
+            return { status: 'profit', usd: (Number(r.profit) / 10 ** decimals) * usdPerToken, loanPips: lender ? (lender.feePips ?? lender.feeBps * 100) : 0,
+                  trade: { tokenIn, hops: built.hops, amountIn: built.amountIn, profit: r.profit, v3Lender: lender?.poolAddress } };
       }
       if (r.status === 'loss') return { status: 'loss', reason: 'ends with less than it started' };
       return { status: 'fail', reason: r.reason };
@@ -794,7 +835,9 @@ const runSimulation = (
                         // Auto-vetted coins count only within their smaller trade limit.
                         const vetted = [buyPool.tokenA, buyPool.tokenB].every((t: string) => safetyGate.isAllowed(t))
                               && !(involvesAutoVetted([buyPool.tokenA, buyPool.tokenB]) && tradeSizeUsd > AUTO_VET_MAX_TRADE_USD);
-                        if (chain === 'robinhood' && net >= MIN_COUNTED_USD && vetted) {
+                        // Outliers (too good to be true) count only after a second check agrees.
+                        if (chain === 'robinhood' && net >= MIN_COUNTED_USD && vetted
+                              && await outlierCountOk(`${pair} after trigger`, net, tradeSizeUsd, { tokenIn, hops: built.hops, amountIn: built.amountIn, profit: r.profit, v3Lender: lender?.poolAddress, ...(spot ? { blockTag: spot.block } : {}) })) {
                               dryRunPnl.recordVerified(net, `${symbolOf(chain, tokenIn)} ${buyPool.dex}->${sellPool.dex}`);
                         }
                         if (chain === 'robinhood') { routeScores.record(routeKey, net); if (vetted) winSizes.add(net); profitBands.add(net, torontoDay()); }
@@ -1777,6 +1820,10 @@ const fireTrade = async (o: {
       // that turned out too small), the difference comes off here before it
       // becomes the contract's profit floor.
       plannedLoanPips: number;
+      // What the practice check said (sitting gaps). The outlier guard looks at
+      // the bigger of this and netProfitUsd, so a $785 check result can't slip
+      // past it just because the model said $15.
+      checkedProfitUsd?: number;
 }) => {
       try {
             // Hard stop: never build a trade on an exchange that isn't cleared
@@ -1841,6 +1888,36 @@ const fireTrade = async (o: {
                   } else if (dry.funding !== 'v3-flash') {
                         block('no approved flash lender for this token');
                         return;
+                  }
+                  // OUTLIER GUARD (core/outlierGuard.ts, Oct 15). A profit that is too
+                  // good to be true (over $50, or over 2% of the trade and over $20) is
+                  // sent only if it is paid in USDG/WETH and a second check on another
+                  // node agrees at full and half size. Normal wins skip this entirely.
+                  // LIVE trigger trades: the second check runs on the latest block, where
+                  // the trade we follow hasn't landed yet, so it will almost never
+                  // confirm. That makes this a deliberate cap by policy: trigger
+                  // trades above the outlier line are not sent live.
+                  const guardUsd = Math.max(netProfitUsd, o.checkedProfitUsd ?? 0);
+                  if (isOutlier(guardUsd, o.tradeSizeUsd, OUTLIER_CFG)) {
+                        const builtAt = Date.now();
+                        const v = await confirmRhOutlier(o.tokenIn, dry.hops, dry.amountIn, dry.minProfit, lender?.poolAddress);
+                        markStretch('outlier second check');
+                        // The deadline (maxBlock) was set when the trade was built. If the
+                        // second check took over 1 s, the deadline may be too close: don't send.
+                        const tookMs = Date.now() - builtAt;
+                        if (v.ok && tookMs > Number(process.env.OUTLIER_MAX_DELAY_MS ?? 1000)) {
+                              console.log(`[outlier] LIVE NOT SENT: ${symbolOf(o.chain, o.tokenIn)}/${symbolOf(o.chain, o.tokenOut)} confirmed but the check took ${tookMs} ms (deadline too close)`);
+                              block('outlier profit, second check too slow (deadline)');
+                              liveTradeLog.noteBlocked('outlier profit, second check too slow (deadline)');
+                              return;
+                        }
+                        if (!v.ok) {
+                              console.log(`[outlier] LIVE NOT SENT${o.source === 'trade' ? ' (trigger outlier: capped by policy)' : ''}: ${symbolOf(o.chain, o.tokenIn)}/${symbolOf(o.chain, o.tokenOut)} $${guardUsd.toFixed(2)} on $${Math.round(o.tradeSizeUsd)} (${'reason' in v ? v.reason : 'refused'})`);
+                              block('outlier profit (too good to be true), second check failed');
+                              liveTradeLog.noteBlocked('outlier profit (too good to be true), second check failed');
+                              return;
+                        }
+                        console.log(`[outlier] live send allowed: $${netProfitUsd.toFixed(2)} on $${Math.round(o.tradeSizeUsd)}, ${v.detail}`);
                   }
             }
             if (o.chain !== 'robinhood') {
@@ -2686,7 +2763,9 @@ await chainManager.startAll();
                         // Same open gap re-checked after it doubled: only the growth is new
                         // money (one trade takes the gap once). First time: all of it.
                         const gapNew = gapCredit.credit(key, simNet);
-                        if (gapVetted && gapNew >= MIN_COUNTED_USD) dryRunPnl.recordVerified(gapNew, `${label} gap`);
+                        // Outliers (too good to be true, e.g. the $785 USDG/ORBIO gap) count
+                        // only after a second check agrees (core/outlierGuard.ts).
+                        if (gapVetted && gapNew >= MIN_COUNTED_USD && await outlierCountOk(`${label} gap`, simNet, g.sizeUsd, check.trade)) dryRunPnl.recordVerified(gapNew, `${label} gap`);
                         if (gapNew > 0) profitBands.add(gapNew, torontoDay());
                         if (gapNew < simNet) console.log(`[gap] ${label}: same open gap grew, counted only the extra $${gapNew.toFixed(2)} of $${simNet.toFixed(2)}`);
                         // Would we really have won it? (ready = after our check + ~2 ms to sign)
@@ -2699,6 +2778,7 @@ await chainManager.startAll();
                               seenAtMs: robinhoodWatcher.lastRefreshMs || Date.now(), source: 'gap',
                               // Fee of the lender the practice check used (already in simNet).
                               plannedLoanPips: check.loanPips,
+                              checkedProfitUsd: simNet,
                         });
                         markStretch('gap check result');
                   }
