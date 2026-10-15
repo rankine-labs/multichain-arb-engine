@@ -18,9 +18,12 @@ import type { SimResult } from '../execution/simulator';
 //       check: the same free eth_call "pretend" test used for 2-pool trades;
 //     - otherwise notes "loop found (contract can't run it yet)".
 //
-//   Practice checks for loops come LAST: they only run when the normal check
-//   line is idle, and at most LOOP_CHECKS_PER_MIN (6) a minute, so loops can
-//   never crowd out normal trades or use up the node's daily allowance.
+//   Practice checks for loops: one at a time, at most LOOP_CHECKS_PER_MIN (6)
+//   a minute, and only when canCheckNow says yes. Since Oct 15 they run on
+//   their own node (LOOP_CHECK_NODE, core/loopNode.ts, default the free
+//   public node), so they never crowd out 2-pool checks on the main node.
+//   With LOOP_CHECK_NODE=main they come LAST, only when the normal check line
+//   is idle (old behaviour).
 //
 //   THIS FILE CANNOT SEND A TRADE. It is never given a sender or a wallet,
 //   only a "practice check" function. LOOP_LIVE_SEND_POSSIBLE is false and a

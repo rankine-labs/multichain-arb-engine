@@ -265,6 +265,9 @@ nothing here runs or uses memory):
 | `LOOP_DEPTH_SHARE` | 0.3 | Trade at most this share of the shallowest pool's money. |
 | `LOOP_MIN_NET_USD` | check bar ($0.10) | Smallest model profit after gas that counts and gets checked. Defaults to `SIM_MIN_GROSS_USD`, else `MIN_EXEC_NET_USD`, else $0.10. |
 | `LOOP_CHECKS_PER_MIN` | 6 | Most loop practice checks a minute. `0` = find and report only. |
+| `LOOP_CHECK_NODE` | free | Which node loop practice checks use. `free` = the free public Robinhood node: loop checks no longer take a slot in the 2-pool check line and never touch the main checking node (Chainstack). The "no reason" second opinion is skipped for loops (the only other node would be Chainstack). `main` = old behaviour (main checking node, shares the 2-pool line). |
+| `LOOP_CHECK_RPC` | none | With `free`: use this node URL for loop checks instead of the free public node. Never logged. Refused (free node used) if it is the main checking node. |
+| `LOOP_CHECK_DAILY` | 3000 | Most loop checks a day on the loop node (Toronto day). `0` = no limit. When the loop node says "slow down" or can't be reached, loop checks pause 60 s, doubling up to 10 min; a clean check resets it. If the node has no replay method (`eth_simulateV1`), loops test at the end of the trigger's block and the hourly line says "replay not supported on loop node". |
 | `LOOP_MAX_POOL_AGE_MS` | 30000 | Pools whose price is older than this are left out. |
 | `LOOP_EXTRA_POOLS` | on with `LOOP_TRADER=1` | Keep single-pool pairs fresh for loops. `0` = off. Never on without `LOOP_TRADER=1`. |
 | `LOOP_EXTRA_POOLS_MAX` | 300 | Most single pools kept fresh (up to 2,000). |
