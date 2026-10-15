@@ -163,7 +163,7 @@ import { poolDepthUsd, setRealBalanceSource, thinPools, thinPoolsSteps } from '.
 // Loop trader v1 (3-5 pool loops, practice only, off unless LOOP_TRADER=1).
 import { LoopTrader, loopConfigFromEnv, LoopCheckResult, LoopTrade } from './core/loopTrader';
 // Which node loop practice checks run on (LOOP_CHECK_NODE, default the free public node).
-import { loopNodeFromEnv, LoopNodeGuard, runLoopCheck, LoopCheckDeps, loopNodeText } from './core/loopNode';
+import { loopNodeFromEnv, LoopNodeGuard, runLoopCheck, LoopCheckDeps, loopNodeText, LoopNodeThrottle, LoopNodeBusy, loopMaxRpsFromEnv } from './core/loopNode';
 // Loop fix phase 2: real (block-confirmed) prices, trigger replay, cheap scans (core/loopPrices.ts).
 import { loopFixFromEnv, PendingTrades, loopPoolState } from './core/loopPrices';
 import { formatLoopHour, loopLogLine } from './core/loopReport';
@@ -628,8 +628,10 @@ const checkRoundTrip = async (
 // before any rival. null = not found in time.
 type TriggerSpot = { block: string; parent: string; prefix: ReplayCall[]; time?: string; index?: number };
 const USER_TX_TYPES = new Set(['0x0', '0x1', '0x2', '0x3', '0x4']); // skip Arbitrum system txs (0x64-0x6a)
-const findTriggerSpot = async (rpc: (m: string, p: unknown[]) => Promise<{ result?: any; error?: any }>, hash: string): Promise<TriggerSpot | null> => {
-      for (let i = 0; i < RH_TRIGGER_MAX_POLLS; i++) {
+// pollMs / maxPolls: loop checks poll less often (300 ms, 6 times) to save
+// requests on the free node; 2-pool checks keep 150 ms x 12.
+const findTriggerSpot = async (rpc: (m: string, p: unknown[]) => Promise<{ result?: any; error?: any }>, hash: string, pollMs = RH_TRIGGER_POLL_MS, maxPolls = RH_TRIGGER_MAX_POLLS): Promise<TriggerSpot | null> => {
+      for (let i = 0; i < maxPolls; i++) {
             const r = await rpc('eth_getTransactionReceipt', [hash]);
             if (r.error) return null;
             if (r.result?.blockNumber) {
@@ -644,7 +646,7 @@ const findTriggerSpot = async (rpc: (m: string, p: unknown[]) => Promise<{ resul
                   if (!prefix.length || !txs[idx] || txs[idx].hash?.toLowerCase() !== hash.toLowerCase()) return null;
                   return { block: r.result.blockNumber, parent: '0x' + (n - 1n).toString(16), prefix, time: b.result?.timestamp, index: idx };
             }
-            await new Promise((res) => setTimeout(res, RH_TRIGGER_POLL_MS));
+            await new Promise((res) => setTimeout(res, pollMs));
       }
       return null;
 };
@@ -1418,14 +1420,21 @@ if (loopCfg.enabled) {
             loopNodeCfg.label = 'free public node';
       }
       const loopGuard = new LoopNodeGuard(loopNodeCfg);
-      const loopNodeRpc: Rpc = loopOnMain ? simRpc.robinhood : loopGuard.watch(loopNodeCfg.customUrl ? makeRpc(loopNodeCfg.customUrl) : rhFreeSimRpc);
       const loopNodeBudget = loopOnMain ? null : budgetForUrl(loopNodeCfg.customUrl ?? 'https://rpc.mainnet.chain.robinhood.com');
+      // Free mode: every loop request passes the throttle first (loops' own
+      // LOOP_NODE_MAX_RPS, and only when the shared allowance used by price
+      // reads has room), so loops never delay price reads (core/loopNode.ts).
+      const loopThrottle = new LoopNodeThrottle(loopMaxRpsFromEnv(), () => loopNodeBudget?.headroom() ?? null);
+      const loopNodeRpc: Rpc = loopOnMain ? simRpc.robinhood
+            : loopGuard.watch(loopThrottle.wrap(loopNodeCfg.customUrl ? makeRpc(loopNodeCfg.customUrl) : rhFreeSimRpc));
+      // Loop checks poll for the trigger less often in free mode (300 ms, up to 6 times).
+      const LOOP_TRIGGER_POLL_MS = 300, LOOP_TRIGGER_MAX_POLLS = 6;
       const loopCheckDeps: LoopCheckDeps = {
             rpc: loopNodeRpc,
             // Main mode: the free node double-checks "no reason" fails, as before.
             secondOpinion: loopOnMain ? rhFreeSimRpc : null,
             simulate: (rpc, trade, opts) => simulateRoundTrip(rpc, 'robinhood', trade, opts),
-            findSpot: (rpc, hash) => findTriggerSpot(rpc, hash),
+            findSpot: (rpc, hash) => loopOnMain ? findTriggerSpot(rpc, hash) : findTriggerSpot(rpc, hash, LOOP_TRIGGER_POLL_MS, LOOP_TRIGGER_MAX_POLLS),
             replay: replayRpc,
             stateGone: STATE_GONE,
             weth: ROBINHOOD_TOKENS.WETH,
@@ -1445,11 +1454,20 @@ if (loopCfg.enabled) {
             }
             // Free node: no 2-pool slot taken, nothing to hand back.
             loopGuard.noteStart();
-            // First replay ever: ask the node once whether it can replay.
-            if (loopFix.triggerReplay && triggerHash) await loopGuard.probeReplay(loopNodeRpc);
-            const r = await runLoopCheck(loopCheckDeps, trade, triggerHash);
-            loopGuard.noteResult(r);
-            return r;
+            loopThrottle.beginCheck();
+            try {
+                  // First replay ever: ask the node once whether it can replay.
+                  if (loopFix.triggerReplay && triggerHash) await loopGuard.probeReplay(loopNodeRpc);
+                  const r = await runLoopCheck(loopCheckDeps, trade, triggerHash);
+                  loopGuard.noteResult(r);
+                  return r;
+            } catch (e) {
+                  if (!(e instanceof LoopNodeBusy)) throw e;
+                  // Shared node too busy for 2 s: give up quietly. Not a
+                  // "slow down" pause, not counted as a check.
+                  loopThrottle.busySkips++;
+                  return { status: 'unsupported', reason: 'skipped: node busy' };
+            }
       };
       const loopTrader = new LoopTrader(loopCfg, {
             bases: [ROBINHOOD_TOKENS.WETH, ROBINHOOD_TOKENS.USDG],
@@ -1574,14 +1592,14 @@ if (loopCfg.enabled) {
       loopHourText = () => {
             const h = loopTrader.takeHour();
             loopHourStart = Date.now();
-            const node = loopNodeText(loopGuard.takeHour());
+            const node = loopNodeText({ ...loopGuard.takeHour(), busySkips: loopThrottle.takeBusy() });
             console.log(loopLogLine(h, loopCfg.maxPools, 'hour', node));
             return formatLoopHour(h, loopCfg.maxPools, loopExtra?.status(loopCfg.maxPoolAgeMs) ?? null) + `\n  ${node}`;
       };
       // Every 15 min: the hour's numbers so far (read only, nothing reset), so
       // the status page (also every 15 min) always has fresh loop numbers.
       setInterval(() => {
-            try { console.log(loopLogLine(loopTrader.peekHour(), loopCfg.maxPools, `hour so far (${Math.round((Date.now() - loopHourStart) / 60_000)} min)`, loopNodeText(loopGuard.peekHour()))); }
+            try { console.log(loopLogLine(loopTrader.peekHour(), loopCfg.maxPools, `hour so far (${Math.round((Date.now() - loopHourStart) / 60_000)} min)`, loopNodeText({ ...loopGuard.peekHour(), busySkips: loopThrottle.busySkips }))); }
             catch (err) { console.warn('[loop] summary line failed (ignored):', (err as Error).message); }
       }, 15 * 60_000);
       console.log(`[loop] fix phase 2: real prices ${realPricesOn ? 'on' : 'off'}, keep block updates ${loopFix.keepBlockUpdates ? 'on' : 'off'}, trigger replay ${loopFix.triggerReplay ? 'on' : 'off'}, model vs check ${loopFix.modelVsCheck ? 'on' : 'off'}, cheap scan ${loopFix.cheapScan ? `on (${loopFix.sliceMs} ms slices)` : 'off'}`);

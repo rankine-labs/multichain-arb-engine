@@ -40,6 +40,10 @@ export class NodeBudget {
   private lastRefill: number;
   usedToday = 0;
   day: string;
+  // For headroom() only (read by the loop checks, core/loopNode.ts):
+  // requests waiting their turn right now, and when recent calls were counted.
+  private waiters = 0;
+  private recent: number[] = [];
 
   constructor(
     readonly name: string,
@@ -70,9 +74,27 @@ export class NodeBudget {
     if (this.tokens < 0) {
       const waitMs = (-this.tokens / this.rps) * 1000;
       if (waitMs > this.maxWaitMs) { this.tokens += n; throw new BudgetExceeded(this.name, 'speed limit queue full', true); }
-      await new Promise((r) => setTimeout(r, waitMs));
+      this.waiters++;
+      try { await new Promise((r) => setTimeout(r, waitMs)); }
+      finally { this.waiters--; }
     }
     this.usedToday += n;
+    // Remember when these calls went out (last second only, kept short).
+    const at = this.now();
+    for (let i = 0; i < n && this.recent.length < 2_000; i++) this.recent.push(at);
+  }
+
+  // READ ONLY: how busy this node's shared allowance is right now. Never
+  // takes or gives back any allowance (it only forgets call times older than 1 s). Used by loop checks to stay out of the way of price reads:
+  //   pending:     requests queued waiting for their turn
+  //   usedLastSec: calls counted in the last second
+  //   tokens:      calls that could go out right now without waiting
+  //   rps:         the speed limit (calls a second)
+  headroom(): { pending: number; usedLastSec: number; tokens: number; rps: number } {
+    const t = this.now();
+    while (this.recent.length && t - this.recent[0] >= 1_000) this.recent.shift();
+    const tokens = Math.min(Math.max(1, this.rps), this.tokens + ((t - this.lastRefill) / 1000) * this.rps);
+    return { pending: this.waiters, usedLastSec: this.recent.length, tokens, rps: this.rps };
   }
 
   share() { return this.daily === Infinity ? 0 : this.usedToday / this.daily; }

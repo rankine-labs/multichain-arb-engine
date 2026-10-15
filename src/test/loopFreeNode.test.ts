@@ -6,7 +6,9 @@
 //   D) replay not supported on the loop node: checked once, then end-of-block checks
 //   E) LOOP_CHECK_NODE=main: exactly the old steps (main node, free node second opinion)
 //   F) the hourly line shows the loop node
-import { loopNodeFromEnv, LoopNodeGuard, runLoopCheck, LoopCheckDeps, LoopSpot, loopNodeText, isMethodMissing } from '../core/loopNode';
+//   G) throttle: shared node busy = 0 loop requests; never over LOOP_NODE_MAX_RPS
+import { loopNodeFromEnv, LoopNodeGuard, runLoopCheck, LoopCheckDeps, LoopSpot, loopNodeText, isMethodMissing, LoopNodeThrottle, LoopNodeBusy, loopMaxRpsFromEnv } from '../core/loopNode';
+import { NodeBudget } from '../core/nodeBudget';
 import type { Rpc, SimResult } from '../execution/simulator';
 import type { LoopTrade } from '../core/loopTrader';
 import { loopLogLine } from '../core/loopReport';
@@ -214,6 +216,67 @@ async function main() {
     const r3 = await runLoopCheck(d3, trade, '0xhash');
     assert(r3.status === 'loss' && (r3 as any).timing === undefined, 'switches off: exactly the old answer');
     assert(loopNodeText({ label: 'main checking node', mode: 'main', replay: 'unknown', rateLimited: 0, pauses: 0, pausedForMs: 0, today: 0, dailyCap: 3000 }) === 'loop node main checking node', 'main mode hour text');
+  }
+
+  // ---------------- G) throttle: loops never delay price reads ----------------
+  {
+    // Fake clock + sleep (no real waiting).
+    let t = 10_000_000;
+    const sleep = async (ms: number) => { t += ms; };
+    // Shared allowance busy (someone queued): a loop check sends 0 requests.
+    const node = fakeNode('free');
+    const busyShared = () => ({ pending: 1, usedLastSec: 1, tokens: 5, rps: 8 });
+    const th = new LoopNodeThrottle(2, busyShared, () => t, sleep);
+    const { d } = deps(th.wrap(node.rpc), null, () => ({ status: 'loss' }));
+    th.beginCheck();
+    const start = t;
+    let busy = false;
+    try { await runLoopCheck(d, trade, '0xhash'); } catch (e) { busy = e instanceof LoopNodeBusy; }
+    assert(busy && node.calls.length === 0, `shared queue busy: loop check gives up, 0 requests sent (${node.calls.length})`);
+    assert(t - start <= 2_000, `waited at most 2 s (${t - start} ms)`);
+    // Over half the shared speed limit used, or no free slot: also shut.
+    const th2 = new LoopNodeThrottle(2, () => ({ pending: 0, usedLastSec: 4, tokens: 4, rps: 8 }), () => t, sleep);
+    const th3 = new LoopNodeThrottle(2, () => ({ pending: 0, usedLastSec: 0, tokens: 0.5, rps: 8 }), () => t, sleep);
+    const th4 = new LoopNodeThrottle(2, () => ({ pending: 0, usedLastSec: 3, tokens: 5, rps: 8 }), () => t, sleep);
+    assert(!th2.sharedHasRoom() && !th3.sharedHasRoom() && th4.sharedHasRoom(), 'room only with an empty queue, under half the limit and a free slot');
+    // Quiet shared node: loop requests never exceed LOOP_NODE_MAX_RPS in any second.
+    const sentAt: number[] = [];
+    const quietNode: Rpc = async () => { sentAt.push(t); return { result: '0x' }; };
+    const th5 = new LoopNodeThrottle(2, () => ({ pending: 0, usedLastSec: 0, tokens: 8, rps: 8 }), () => t, sleep, 60_000);
+    const w5 = th5.wrap(quietNode);
+    th5.beginCheck();
+    for (let i = 0; i < 20; i++) { await w5('eth_call', []); t += 10; }
+    let worst = 0;
+    for (const a of sentAt) worst = Math.max(worst, sentAt.filter((b) => b >= a && b - a < 1_000).length);
+    assert(sentAt.length === 20 && worst <= 2, `20 loop requests, never more than 2 in any second (worst ${worst})`);
+    assert(loopMaxRpsFromEnv({}) === 2 && loopMaxRpsFromEnv({ LOOP_NODE_MAX_RPS: '5' }) === 5 && loopMaxRpsFromEnv({ LOOP_NODE_MAX_RPS: 'x' }) === 2, 'LOOP_NODE_MAX_RPS: default 2, number used, junk = 2');
+    // Busy skip is not a "slow down" pause.
+    const g = new LoopNodeGuard(loopNodeFromEnv({}), () => t, quiet);
+    const th6 = new LoopNodeThrottle(2, busyShared, () => t, sleep);
+    const watched = g.watch(th6.wrap(node.rpc));
+    th6.beginCheck();
+    try { await watched('eth_call', []); } catch { /* busy */ }
+    assert(g.canCheck() && g.peekHour().pauses === 0 && g.peekHour().rateLimited === 0, 'node busy skip: no pause, not counted as a rate limit');
+    th6.busySkips = 3;
+    assert(loopNodeText({ ...g.peekHour(), busySkips: th6.takeBusy() }).includes('skipped node busy 3') && th6.busySkips === 0, 'hour text shows "skipped node busy", then resets');
+    // Shared NodeBudget headroom: read only, sees the queue and recent use.
+    let bt = 0;
+    const b = new NodeBudget('test', 8, Infinity, () => bt);
+    const h0 = b.headroom();
+    assert(h0.pending === 0 && h0.usedLastSec === 0 && h0.tokens === 8 && h0.rps === 8, 'headroom: quiet at start');
+    for (let i = 0; i < 5; i++) await b.take(1);
+    const h1 = b.headroom();
+    assert(h1.usedLastSec === 5 && h1.tokens === 3 && b.headroom().tokens === 3, 'headroom: counts recent calls, never takes allowance');
+    bt += 1_000;
+    assert(b.headroom().usedLastSec === 0, 'headroom: forgets calls older than 1 s');
+    // Fill the bucket so the next take waits: pending shows while it waits.
+    for (let i = 0; i < 8; i++) await b.take(1);
+    const waiting = b.take(1);
+    await new Promise((r) => setImmediate(r));
+    const hp = b.headroom().pending;
+    bt += 1_000;
+    await waiting;
+    assert(hp === 1 && b.headroom().pending === 0, `headroom: queued request seen as pending (${hp})`);
   }
 
   // ---------------- F) hourly line ----------------

@@ -85,6 +85,7 @@ export interface LoopNodeHour {
   pausedForMs: number;        // pause time left right now (0 = not paused)
   today: number;              // loop checks started today on the loop node
   dailyCap: number;
+  busySkips?: number;         // checks skipped because the shared node was busy (LoopNodeThrottle)
 }
 
 // Plain one-liner for the hourly / 15 minute loop line and Telegram.
@@ -93,6 +94,7 @@ export function loopNodeText(h: LoopNodeHour): string {
   const replay = h.replay === 'yes' ? 'replay ok' : h.replay === 'no' ? 'replay not supported on loop node' : 'replay not tested yet';
   const parts = [`loop node ${h.label} (${replay})`, `rate limited ${h.rateLimited}`, `paused ${h.pauses}`];
   if (h.pausedForMs > 0) parts.push(`paused now ${Math.ceil(h.pausedForMs / 1_000)} s`);
+  if (h.busySkips) parts.push(`skipped node busy ${h.busySkips}`);
   parts.push(`today ${h.today}${Number.isFinite(h.dailyCap) ? `/${h.dailyCap}` : ''}`);
   return parts.join(', ');
 }
@@ -212,6 +214,79 @@ export class LoopNodeGuard {
   peekHour(): LoopNodeHour { return this.snapshot(); }
   // The hour's numbers, and start a new hour (today's count is kept).
   takeHour(): LoopNodeHour { const s = this.snapshot(); this.hour = { rateLimited: 0, pauses: 0 }; return s; }
+}
+
+// ----------------------------------------------------------------------------
+// LOOP NODE THROTTLE (Oct 15, owner approved). Price reads for 2-pool trades
+// (the money path) share the free node's speed limit (8 a second). Loops must
+// never slow them down, so EVERY loop request first passes this gate:
+//   1. loops' own limit: at most LOOP_NODE_MAX_RPS (default 2) requests in
+//      any one second;
+//   2. the shared allowance must have room: nobody waiting in its queue,
+//      under half its speed limit used in the last second, and a free slot
+//      right now. So a loop request never waits in the shared queue, and is
+//      never placed ahead of a price read.
+// If the gate stays shut, the request waits in small steps, up to 2 s in
+// total per loop check. After that the check gives up quietly: "skipped:
+// node busy" (counted in the hour line, NOT a "slow down" pause).
+// ----------------------------------------------------------------------------
+export interface SharedHeadroom { pending: number; usedLastSec: number; tokens: number; rps: number }
+
+// Thrown when a loop check gave up waiting (caught in shadowMain loopCheck).
+export class LoopNodeBusy extends Error { constructor() { super('skipped: node busy'); } }
+
+export function loopMaxRpsFromEnv(env: Record<string, string | undefined> = process.env): number {
+  const v = Number(env.LOOP_NODE_MAX_RPS ?? 2);
+  return Number.isFinite(v) && v > 0 ? Math.min(v, 50) : 2;
+}
+
+export class LoopNodeThrottle {
+  private sent: number[] = [];   // when loop requests went out (last second)
+  private waitedMs = 0;          // waited so far in the current loop check
+  busySkips = 0;                 // checks given up this hour (read by the hour line)
+
+  constructor(
+    readonly maxRps: number,
+    private readonly shared: () => SharedHeadroom | null,   // null = node with no shared allowance
+    private readonly now: () => number = Date.now,
+    private readonly sleep: (ms: number) => Promise<void> = (ms) => new Promise((r) => setTimeout(r, ms)),
+    readonly maxWaitMs = 2_000,
+    private readonly stepMs = 50,
+  ) {}
+
+  // A new loop check: its 2 s waiting allowance starts again.
+  beginCheck(): void { this.waitedMs = 0; }
+
+  // Is the shared allowance quiet enough for a loop request?
+  sharedHasRoom(): boolean {
+    const h = this.shared();
+    if (!h) return true;
+    return h.pending === 0 && h.usedLastSec < 0.5 * h.rps && h.tokens >= 1;
+  }
+
+  private ownHasRoom(t: number): boolean {
+    while (this.sent.length && t - this.sent[0] >= 1_000) this.sent.shift();
+    return this.sent.length < this.maxRps;
+  }
+
+  // Waits for the gate, or throws LoopNodeBusy after 2 s of waiting in this check.
+  async gate(): Promise<void> {
+    for (;;) {
+      const t = this.now();
+      if (this.ownHasRoom(t) && this.sharedHasRoom()) { this.sent.push(t); return; }
+      if (this.waitedMs + this.stepMs > this.maxWaitMs) throw new LoopNodeBusy();
+      this.waitedMs += this.stepMs;
+      await this.sleep(this.stepMs);
+    }
+  }
+
+  // The loop node with the gate in front of every request.
+  wrap(rpc: Rpc): Rpc {
+    return async (method, params) => { await this.gate(); return rpc(method, params); };
+  }
+
+  // The hour's "skipped: node busy" count, and start a new hour.
+  takeBusy(): number { const n = this.busySkips; this.busySkips = 0; return n; }
 }
 
 // ----------------------------------------------------------------------------
