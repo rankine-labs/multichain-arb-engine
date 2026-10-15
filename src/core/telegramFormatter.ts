@@ -470,6 +470,12 @@ export function formatPlainHourly(r: PlainHourlyInput): string {
   for (const s of r.stalls ?? []) if (s) L.push(esc(s));
   L.push('');
 
+  // Loop trader (3-5 pool loops), practice only. Only present when LOOP_TRADER is on.
+  // Placed before the rival bots / research / new exchange blocks (Oct 15):
+  // further down it was the part cut off when the message ran over
+  // Telegram's length limit ("(trimmed)").
+  if (r.loops) { L.push(r.loops); L.push(''); }
+
   // What the other bots did: where the real money is, and how they make it.
   const rw = r.rivalWins;
   if (rw && (rw.trades > 0 || rw.botsKnown > 0)) {
@@ -486,9 +492,6 @@ export function formatPlainHourly(r: PlainHourlyInput): string {
 
   // Which new exchanges earn in practice (Fables, Alandale, GIGA CL, ...).
   if (r.venueTests) { L.push(r.venueTests); L.push(''); }
-
-  // Loop trader (3-5 pool loops), practice only. Only present when LOOP_TRADER is on.
-  if (r.loops) { L.push(r.loops); L.push(''); }
 
   // Honest bottom line: what is PROVEN vs what is only seen.
   {

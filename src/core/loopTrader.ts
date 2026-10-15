@@ -526,6 +526,18 @@ export class LoopTrader {
   takeHour(): LoopHour {
     const h = this.hour;
     this.hour = this.emptyHour();
+    return this.summarize(h);
+  }
+
+  // The hour's numbers SO FAR, without starting a new hour (nothing is
+  // reset). Used for the 15 minute "[loop] hour so far" log line that the
+  // status page reads. Only reads and sorts the hour's bounded lists.
+  peekHour(): LoopHour {
+    return this.summarize(this.hour);
+  }
+
+  // Turns the raw hour counters into the report numbers. Never changes them.
+  private summarize(h: ReturnType<LoopTrader['emptyHour']>): LoopHour {
     const ms = [...h.ms].sort((a, b) => a - b);
     const leads = [...h.rival.leads].sort((a, b) => a - b);
     const top = [...h.rival.bots.entries()].sort((a, b) => b[1] - a[1])[0] ?? null;

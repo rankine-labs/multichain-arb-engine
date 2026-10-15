@@ -55,6 +55,31 @@ export function modelVsCheckText(cv: LoopCheckSummary): string | null {
   return `model vs check (profit before gas, by timing): ${parts.join('; ')}`;
 }
 
+// ONE plain log line with the loop numbers, for the status page
+// (deploy/status-report.js reads the bot's log, it can't see Telegram).
+//   label: "hour" for the full hour (logged when the hourly report takes the
+//   numbers), or "hour so far (N min)" for the 15 minute line.
+// Example:
+//   [loop] hour: found 505, best $8.87, checked 39, would make 1 ($0.14),
+//   lost 37, wouldn't go through 1, can't run 0, by length 3p 115 4p 63 5p 327
+//   | model vs check (profit before gas, by timing): latest 30: ...
+// Only lengths we search are listed. No HTML, kept on one line.
+export function loopLogLine(h: LoopHour, maxPools: number, label: string): string {
+  const lens: string[] = [];
+  for (let n = 3; n <= Math.min(8, maxPools); n++) lens.push(`${n}p ${h.foundByLen[n] ?? 0}`);
+  const parts = [
+    `found ${h.found}`, `best ${money(h.bestUsd)}`, `checked ${h.checked}`,
+    `would make ${h.wouldMake} (${money(h.wouldMakeUsd)})`, `lost ${h.lost}`,
+    `wouldn't go through ${h.failed}`, `can't run ${h.cantRun}`,
+  ];
+  if (h.skippedCap) parts.push(`not checked ${h.skippedCap}`);
+  parts.push(`by length ${lens.join(' ')}`);
+  // The model vs check text is written for Telegram (HTML escaped): undo that.
+  const mvc = h.checkVsEstimate ? modelVsCheckText(h.checkVsEstimate) : null;
+  const plain = (s: string) => s.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&').replace(/\s*\n\s*/g, ' ');
+  return `[loop] ${label}: ${parts.join(', ')}${mvc ? ` | ${plain(mvc)}` : ''}`;
+}
+
 // extra: the loop trader's extra single pools (core/loopExtraPools.ts), when on.
 export function formatLoopHour(h: LoopHour, maxPools: number, extra?: { fresh: number; selected: number } | null): string {
   const L: string[] = [];
