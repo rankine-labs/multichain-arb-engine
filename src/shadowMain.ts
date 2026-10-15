@@ -162,6 +162,8 @@ import { ResearchLane, researchConfigFromEnv, planShallowCandidate, findResearch
 import { poolDepthUsd, setRealBalanceSource, thinPools, thinPoolsSteps } from './core/poolPrice';
 // Loop trader v1 (3-5 pool loops, practice only, off unless LOOP_TRADER=1).
 import { LoopTrader, loopConfigFromEnv, LoopCheckResult, LoopTrade } from './core/loopTrader';
+// Which node loop practice checks run on (LOOP_CHECK_NODE, default the free public node).
+import { loopNodeFromEnv, LoopNodeGuard, runLoopCheck, LoopCheckDeps, loopNodeText, LoopNodeThrottle, LoopNodeBusy, loopMaxRpsFromEnv } from './core/loopNode';
 // Loop fix phase 2: real (block-confirmed) prices, trigger replay, cheap scans (core/loopPrices.ts).
 import { loopFixFromEnv, PendingTrades, loopPoolState } from './core/loopPrices';
 import { formatLoopHour, loopLogLine } from './core/loopReport';
@@ -626,8 +628,10 @@ const checkRoundTrip = async (
 // before any rival. null = not found in time.
 type TriggerSpot = { block: string; parent: string; prefix: ReplayCall[]; time?: string; index?: number };
 const USER_TX_TYPES = new Set(['0x0', '0x1', '0x2', '0x3', '0x4']); // skip Arbitrum system txs (0x64-0x6a)
-const findTriggerSpot = async (rpc: (m: string, p: unknown[]) => Promise<{ result?: any; error?: any }>, hash: string): Promise<TriggerSpot | null> => {
-      for (let i = 0; i < RH_TRIGGER_MAX_POLLS; i++) {
+// pollMs / maxPolls: loop checks poll less often (300 ms, 6 times) to save
+// requests on the free node; 2-pool checks keep 150 ms x 12.
+const findTriggerSpot = async (rpc: (m: string, p: unknown[]) => Promise<{ result?: any; error?: any }>, hash: string, pollMs = RH_TRIGGER_POLL_MS, maxPolls = RH_TRIGGER_MAX_POLLS): Promise<TriggerSpot | null> => {
+      for (let i = 0; i < maxPolls; i++) {
             const r = await rpc('eth_getTransactionReceipt', [hash]);
             if (r.error) return null;
             if (r.result?.blockNumber) {
@@ -642,7 +646,7 @@ const findTriggerSpot = async (rpc: (m: string, p: unknown[]) => Promise<{ resul
                   if (!prefix.length || !txs[idx] || txs[idx].hash?.toLowerCase() !== hash.toLowerCase()) return null;
                   return { block: r.result.blockNumber, parent: '0x' + (n - 1n).toString(16), prefix, time: b.result?.timestamp, index: idx };
             }
-            await new Promise((res) => setTimeout(res, RH_TRIGGER_POLL_MS));
+            await new Promise((res) => setTimeout(res, pollMs));
       }
       return null;
 };
@@ -1388,60 +1392,93 @@ if (loopCfg.enabled) {
       // (runSimulation): find the trigger's block, replay that block up to
       // and including the trigger, then run our loop (eth_simulateV1).
       // Fallbacks, same as 2-pool: the end of the trigger's block, then
-      // latest ("tested late"). A loop check can wait a while for the normal
-      // check line to be idle; if the trigger's block is too old for the node
-      // (state gone) it falls back cleanly. No trigger (5 s safety net, block
-      // updates) = latest, as before. Never sends anything.
-      // The loop check is counted as a running check on the checking node
-      // (simInFlight.robinhood), so the 2-pool check line knows the node is
-      // busy. It only starts when that line is idle, at most one at a time,
-      // and frees its slot (and starts any waiting 2-pool check) when done.
-      const loopCheck = async (trade: LoopTrade, triggerHash?: string): Promise<LoopCheckResult> => {
-            simInFlight.robinhood = (simInFlight.robinhood ?? 0) + 1;
-            try { return await loopCheckInner(trade, triggerHash); }
-            finally {
-                  simInFlight.robinhood = Math.max(0, (simInFlight.robinhood ?? 1) - 1);
-                  setImmediate(() => drainSimQueue('robinhood'));
-            }
+      // latest ("tested late"). No trigger (5 s safety net, block updates)
+      // = latest, as before. Never sends anything. The steps themselves are
+      // in core/loopNode.ts runLoopCheck.
+      //
+      // WHICH NODE (LOOP_CHECK_NODE, core/loopNode.ts, Oct 15 owner approved):
+      //   free (default): loop checks run on the free public node (or
+      //     LOOP_CHECK_RPC). They do NOT take a slot in the 2-pool check line
+      //     (simInFlight) and never touch the main checking node (Chainstack),
+      //     so 2-pool checks no longer wait behind them. Their own guard
+      //     pauses them when the free node says "slow down" and holds them to
+      //     LOOP_CHECK_DAILY a day. The "no reason" second opinion is skipped
+      //     (the only other node would be Chainstack).
+      //   main: old behaviour. The loop check counts as a running check on
+      //     the checking node (simInFlight.robinhood), only starts when the
+      //     2-pool line is idle, and frees its slot (and starts any waiting
+      //     2-pool check) when done.
+      const loopNodeCfg = loopNodeFromEnv(process.env);
+      const loopOnMain = loopNodeCfg.mode === 'main';
+      // LOOP_CHECK_RPC pointing at a configured checking node (main or its
+      // backup, QuickNode, Alchemy, SIM_RPC_ROBINHOOD) would undo the whole
+      // point (keep the paid nodes for 2-pool checks): refuse it, use the free node.
+      const mainCheckUrls = [checkPlan?.main.url, checkPlan?.fallback?.url,
+            wssToHttps(process.env.QUICKNODE_RPC_ROBINHOOD) || process.env.QUICKNODE_RPC_ROBINHOOD,
+            process.env.ROBINHOOD_RPC_HTTP, process.env.SIM_RPC_ROBINHOOD]
+            .filter((u): u is string => !!u).map((u) => u.trim().replace(/\/+$/, '').toLowerCase());
+      if (loopNodeCfg.customUrl && mainCheckUrls.includes(loopNodeCfg.customUrl.trim().replace(/\/+$/, '').toLowerCase())) {
+            console.warn('[loop] LOOP_CHECK_RPC is one of the checking nodes: using the free public node for loops instead');
+            loopNodeCfg.customUrl = null;
+            loopNodeCfg.label = 'free public node';
+      }
+      const loopGuard = new LoopNodeGuard(loopNodeCfg);
+      const loopNodeBudget = loopOnMain ? null : budgetForUrl(loopNodeCfg.customUrl ?? 'https://rpc.mainnet.chain.robinhood.com');
+      // Free mode: every loop request passes the throttle first (loops' own
+      // LOOP_NODE_MAX_RPS, and only when the shared allowance used by price
+      // reads has room), so loops never delay price reads (core/loopNode.ts).
+      const loopThrottle = new LoopNodeThrottle(loopMaxRpsFromEnv(), () => loopNodeBudget?.headroom() ?? null);
+      const loopNodeRpc: Rpc = loopOnMain ? simRpc.robinhood
+            : loopGuard.watch(loopThrottle.wrap(loopNodeCfg.customUrl ? makeRpc(loopNodeCfg.customUrl) : rhFreeSimRpc));
+      // Loop checks poll for the trigger less often in free mode (300 ms, up to 6 times).
+      const LOOP_TRIGGER_POLL_MS = 300, LOOP_TRIGGER_MAX_POLLS = 6;
+      const loopCheckDeps: LoopCheckDeps = {
+            rpc: loopNodeRpc,
+            // Main mode: the free node double-checks "no reason" fails, as before.
+            secondOpinion: loopOnMain ? rhFreeSimRpc : null,
+            // Free mode: token balance locations are read from the shared
+            // cache but never added to it (an odd free-node answer must not
+            // change what 2-pool checks use). Main mode: as before.
+            simulate: (rpc, trade, opts) => simulateRoundTrip(rpc, 'robinhood', trade, loopOnMain ? opts : { ...opts, slotReadOnly: true }),
+            findSpot: (rpc, hash) => loopOnMain ? findTriggerSpot(rpc, hash) : findTriggerSpot(rpc, hash, LOOP_TRIGGER_POLL_MS, LOOP_TRIGGER_MAX_POLLS),
+            replay: replayRpc,
+            stateGone: STATE_GONE,
+            weth: ROBINHOOD_TOKENS.WETH,
+            triggerReplay: loopFix.triggerReplay,
+            tagLatest: loopFix.triggerReplay || loopFix.modelVsCheck,
+            replayAllowed: () => loopOnMain || loopGuard.replay !== 'no',
+            lean: !loopOnMain,
       };
-      const loopCheckInner = async (trade: LoopTrade, triggerHash?: string): Promise<LoopCheckResult> => {
-            const rpc = simRpc.robinhood;
-            const simOpts = { weth: ROBINHOOD_TOKENS.WETH };
-            const follow = loopFix.triggerReplay && !!triggerHash && !triggerHash.includes('PLACEHOLDER');
-            if (!follow) {
-                  const r = await simulateRoundTrip(rpc, 'robinhood', trade, simOpts);
-                  // Switches off: exactly the old answer. On: say it ran on latest.
-                  return loopFix.triggerReplay || loopFix.modelVsCheck ? { ...r, timing: 'latest' } : r;
-            }
-            let r: Awaited<ReturnType<typeof simulateRoundTrip>>;
-            let timing: string;
-            const spot = await findTriggerSpot(rpc, triggerHash!);
-            if (spot) {
-                  r = await simulateRoundTrip(replayRpc(rpc, spot.parent, spot.prefix, spot.time), 'robinhood', trade, simOpts);
-                  timing = 'right after trigger';
-                  if ('reason' in r && (r.reason.startsWith('replay unavailable') || STATE_GONE.test(r.reason))) {
-                        r = await simulateRoundTrip(rpc, 'robinhood', trade, { ...simOpts, blockTag: spot.block });
-                        timing = 'end of trigger block';
-                        if ('reason' in r && STATE_GONE.test(r.reason)) { r = await simulateRoundTrip(rpc, 'robinhood', trade, simOpts); timing = 'tested late'; }
+      const loopCheck = async (trade: LoopTrade, triggerHash?: string): Promise<LoopCheckResult> => {
+            if (loopOnMain) {
+                  simInFlight.robinhood = (simInFlight.robinhood ?? 0) + 1;
+                  try { return await runLoopCheck(loopCheckDeps, trade, triggerHash); }
+                  finally {
+                        simInFlight.robinhood = Math.max(0, (simInFlight.robinhood ?? 1) - 1);
+                        setImmediate(() => drainSimQueue('robinhood'));
                   }
-            } else {
-                  r = await simulateRoundTrip(rpc, 'robinhood', trade, simOpts);
-                  timing = 'tested late';
             }
-            // "Breaks" with no real reason: same second opinion as runSimulation
-            // (plain check at the end of the trigger's block, then the free node).
-            // The 2-pool recheck counters are left alone (loops are reported separately).
-            const noReason = (x: typeof r) => x.status === 'fail' && /execution reverted\s*$|reverted without data|TransferFailed/.test(x.reason);
-            if (noReason(r)) {
-                  let r2 = spot ? await simulateRoundTrip(rpc, 'robinhood', trade, { ...simOpts, blockTag: spot.block }) : r;
-                  let where = spot ? 'end of trigger block (replay failed)' : timing;
-                  if (r2.status === 'rate_limited' || noReason(r2) || ('reason' in r2 && STATE_GONE.test(r2.reason))) {
-                        const r3 = await simulateRoundTrip(rhFreeSimRpc, 'robinhood', trade, simOpts);
-                        if (r3.status !== 'rate_limited') { r2 = r3; where = 'tested late on free node (replay failed)'; }
-                  }
-                  if (r2.status !== 'rate_limited') { r = r2; timing = where; }
+            // Free node: no 2-pool slot taken, nothing to hand back.
+            loopGuard.noteStart();
+            loopThrottle.beginCheck();
+            try {
+                  // First replay ever: ask the node once whether it can replay.
+                  if (loopFix.triggerReplay && triggerHash) await loopGuard.probeReplay(loopNodeRpc);
+                  const r = await runLoopCheck(loopCheckDeps, trade, triggerHash);
+                  loopGuard.noteResult(r);
+                  return r;
+            } catch (e) {
+                  if (!(e instanceof LoopNodeBusy)) throw e;
+                  // Shared node too busy for 2 s (or the check ran 15 s): give
+                  // up quietly. Not a "slow down" pause, not counted as a
+                  // check, not logged one by one (core/loopTrader.ts), only
+                  // counted in the hour line.
+                  loopThrottle.busySkips++;
+                  return { status: 'unsupported', reason: e.message };
+            } finally {
+                  // Today's LOOP_CHECK_DAILY counts only checks that sent something.
+                  if (loopThrottle.sentThisCheck > 0) loopGuard.countCheck();
             }
-            return { ...r, timing };
       };
       const loopTrader = new LoopTrader(loopCfg, {
             bases: [ROBINHOOD_TOKENS.WETH, ROBINHOOD_TOKENS.USDG],
@@ -1459,9 +1496,17 @@ if (loopCfg.enabled) {
             symbolOf: (t) => symbolOf('robinhood', t),
             decimalsOf: (t) => TOKEN_DECIMALS.robinhood?.[t.toLowerCase()],
             canPracticeTest: (p) => canPracticeTest(p.dex),
-            // Lowest priority: only when no normal check is running or waiting.
-            canCheckNow: () => !(simInFlight.robinhood ?? 0) && !(simWaiting.robinhood?.length) && !simOff('robinhood')
-                  && Date.now() >= (simPausedUntil.robinhood ?? 0) && (!researchNode || researchNode.share() < 0.8),
+            // Main mode (old): lowest priority, only when no normal check is
+            // running or waiting on the checking node.
+            // Free mode: the 2-pool line is on another node, so it is not
+            // waited for. Only the loop node's own guard (not paused after a
+            // "slow down", daily limit not reached) and its daily allowance
+            // (if it has one) decide. One loop check at a time and
+            // LOOP_CHECKS_PER_MIN still apply (core/loopTrader.ts drain).
+            canCheckNow: loopOnMain
+                  ? () => !(simInFlight.robinhood ?? 0) && !(simWaiting.robinhood?.length) && !simOff('robinhood')
+                        && Date.now() >= (simPausedUntil.robinhood ?? 0) && (!researchNode || researchNode.share() < 0.8)
+                  : () => loopGuard.canCheck() && (!loopNodeBudget || loopNodeBudget.share() < 0.8),
             // Own-money practice check (rivals use their own money), same checker as 2-pool trades.
             // With LOOP_TRIGGER_REPLAY: right after the loop's trigger trade (loopCheck above).
             runCheck: (trade, ctx) => loopCheck(trade, ctx?.triggerHash),
@@ -1558,16 +1603,20 @@ if (loopCfg.enabled) {
       loopHourText = () => {
             const h = loopTrader.takeHour();
             loopHourStart = Date.now();
-            console.log(loopLogLine(h, loopCfg.maxPools, 'hour'));
-            return formatLoopHour(h, loopCfg.maxPools, loopExtra?.status(loopCfg.maxPoolAgeMs) ?? null);
+            const node = loopNodeText({ ...loopGuard.takeHour(), busySkips: loopThrottle.takeBusy() });
+            console.log(loopLogLine(h, loopCfg.maxPools, 'hour', node));
+            return formatLoopHour(h, loopCfg.maxPools, loopExtra?.status(loopCfg.maxPoolAgeMs) ?? null) + `\n  ${node}`;
       };
       // Every 15 min: the hour's numbers so far (read only, nothing reset), so
       // the status page (also every 15 min) always has fresh loop numbers.
       setInterval(() => {
-            try { console.log(loopLogLine(loopTrader.peekHour(), loopCfg.maxPools, `hour so far (${Math.round((Date.now() - loopHourStart) / 60_000)} min)`)); }
+            try { console.log(loopLogLine(loopTrader.peekHour(), loopCfg.maxPools, `hour so far (${Math.round((Date.now() - loopHourStart) / 60_000)} min)`, loopNodeText({ ...loopGuard.peekHour(), busySkips: loopThrottle.busySkips }))); }
             catch (err) { console.warn('[loop] summary line failed (ignored):', (err as Error).message); }
       }, 15 * 60_000);
       console.log(`[loop] fix phase 2: real prices ${realPricesOn ? 'on' : 'off'}, keep block updates ${loopFix.keepBlockUpdates ? 'on' : 'off'}, trigger replay ${loopFix.triggerReplay ? 'on' : 'off'}, model vs check ${loopFix.modelVsCheck ? 'on' : 'off'}, cheap scan ${loopFix.cheapScan ? `on (${loopFix.sliceMs} ms slices)` : 'off'}`);
+      console.log(loopOnMain
+            ? '[loop] loop checks on the main checking node (LOOP_CHECK_NODE=main, shares the 2-pool check line)'
+            : `[loop] loop checks on the ${loopNodeCfg.label} (main checking node kept for 2-pool checks only), up to ${Number.isFinite(loopNodeCfg.dailyCap) ? loopNodeCfg.dailyCap : 'unlimited'} a day`);
       console.log(`[loop] loop trader ON (practice only, never sends): 3-${loopCfg.maxPools} pools, up to ${loopCfg.maxCycles} loops, max $${loopCfg.maxTradeUsd}, bar $${loopCfg.minNetUsd}, ${loopCfg.checksPerMin} checks/min`);
 }
 
