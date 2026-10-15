@@ -70,7 +70,9 @@ export function loopNodeFromEnv(env: Record<string, string | undefined> = proces
 export function isMethodMissing(err: { code?: number; message?: string } | undefined): boolean {
   if (!err) return false;
   if (err.code === -32601) return true;
-  return /method .*(not found|does not exist|not supported|not available|is not)|unsupported method|unknown method|no such method|not whitelisted/i.test(err.message ?? '');
+  // Also "disabled" / "forbidden" / "not allowed" style answers (method switched off for us).
+  if (err.code === 403 || err.code === -32004) return true;
+  return /method .*(not found|does not exist|not supported|not available|is not|disabled|forbidden|not allowed)|unsupported method|unknown method|no such method|not whitelisted|forbidden|not allowed|unauthori[sz]ed/i.test(err.message ?? '');
 }
 
 export type ReplaySupport = 'unknown' | 'yes' | 'no';
@@ -133,7 +135,12 @@ export class LoopNodeGuard {
   }
 
   // A loop check is starting on the loop node.
-  noteStart(): void { this.rollDay(); this.today++; this.limitedThisCheck = false; }
+  noteStart(): void { this.limitedThisCheck = false; }
+
+  // The check really sent something to the node (its first request got past
+  // the throttle): counts toward today's LOOP_CHECK_DAILY. A check skipped
+  // as "node busy" before sending anything is not counted.
+  countCheck(): void { this.rollDay(); this.today++; }
 
   // The node said "slow down" (or could not be reached). Starts a pause unless
   // one is already running (several answers in one check = one pause).
@@ -152,7 +159,8 @@ export class LoopNodeGuard {
   // pause length back to 60 s. A node that can't do state overrides at all
   // pauses loop checks for 30 min (same rule as the 2-pool checker).
   noteResult(r: SimResult): void {
-    if (r.status === 'rate_limited') { this.noteRateLimit(); return; }
+    // Already counted when the node said it (watch); don't count it twice.
+    if (r.status === 'rate_limited') { if (!this.limitedThisCheck) this.noteRateLimit(); return; }
     if (r.status === 'unsupported' && /override|does not support/i.test(r.reason)) {
       this.pausedUntil = Math.max(this.pausedUntil, this.now() + 30 * 60_000);
       this.hour.pauses++;
@@ -171,8 +179,11 @@ export class LoopNodeGuard {
   // Wraps the loop node so every answer is watched: "slow down" answers start
   // a pause, and a "no such method" answer to eth_simulateV1 marks replay as
   // not supported. Answers themselves pass through unchanged.
+  // Once the node said "slow down" during a check, the rest of that check
+  // sends nothing more: every later request answers "rate limited" at once.
   watch(rpc: Rpc): Rpc {
     return async (method, params) => {
+      if (this.limitedThisCheck) return { error: { code: 429, message: 'loop node said slow down earlier in this check (not sent)' } };
       const r = await rpc(method, params);
       if (r.error) {
         if (isRateLimited(r.error) || (r.error.message ?? '').startsWith('network:')) this.noteRateLimit();
@@ -192,10 +203,13 @@ export class LoopNodeGuard {
       this.probing = (async () => {
         try {
           const r = await rpc('eth_simulateV1', [{ blockStateCalls: [{ calls: [] }] }, 'latest']);
+          // Only a clear answer decides: a normal result or a revert-shaped
+          // error = supported; "no such method" / disabled / forbidden = not
+          // supported. Anything else (busy, odd error) = still unknown:
+          // asked again in 10 min, and real replays are tried meanwhile.
           if (!r.error) this.replay = 'yes';
           else if (isMethodMissing(r.error)) this.markNoReplay();
-          else if (isRateLimited(r.error) || (r.error.message ?? '').startsWith('network:')) { /* unclear: ask later */ }
-          else this.replay = 'yes'; // the method exists (it just didn't like the empty test)
+          else if (/revert/i.test(r.error.message ?? '') || (typeof r.error.data === 'string' && r.error.data.startsWith('0x'))) this.replay = 'yes';
           if (this.replay === 'yes') this.log(`[loop] ${this.cfg.label} supports replay (eth_simulateV1)`);
         } catch { /* unclear: ask later */ }
         finally { this.probing = null; }
@@ -222,18 +236,22 @@ export class LoopNodeGuard {
 // never slow them down, so EVERY loop request first passes this gate:
 //   1. loops' own limit: at most LOOP_NODE_MAX_RPS (default 2) requests in
 //      any one second;
-//   2. the shared allowance must have room: nobody waiting in its queue,
-//      under half its speed limit used in the last second, and a free slot
-//      right now. So a loop request never waits in the shared queue, and is
-//      never placed ahead of a price read.
-// If the gate stays shut, the request waits in small steps, up to 2 s in
-// total per loop check. After that the check gives up quietly: "skipped:
-// node busy" (counted in the hour line, NOT a "slow down" pause).
+//   2. the shared allowance must be nearly untouched: nobody waiting in its
+//      queue, under half its speed limit used in the last second, and almost
+//      all its slots free right now (at most 2 short of full, so with 8 a
+//      second at least 5 stay free for price reads after our request). So a
+//      loop request never waits in the shared queue, is never placed ahead
+//      of a price read, and leaves price reads room to go out at once.
+// Waiting because the SHARED node is busy counts toward 2 s per loop check;
+// after that the check gives up quietly: "skipped: node busy" (counted in
+// the hour line, NOT a "slow down" pause). Waiting only on loops' own limit
+// is fine and not counted, but a whole check may take at most 15 s
+// ("skipped: check too long", counted with the busy ones).
 // ----------------------------------------------------------------------------
 export interface SharedHeadroom { pending: number; usedLastSec: number; tokens: number; rps: number }
 
 // Thrown when a loop check gave up waiting (caught in shadowMain loopCheck).
-export class LoopNodeBusy extends Error { constructor() { super('skipped: node busy'); } }
+export class LoopNodeBusy extends Error { constructor(why = 'node busy') { super(`skipped: ${why}`); } }
 
 export function loopMaxRpsFromEnv(env: Record<string, string | undefined> = process.env): number {
   const v = Number(env.LOOP_NODE_MAX_RPS ?? 2);
@@ -242,7 +260,9 @@ export function loopMaxRpsFromEnv(env: Record<string, string | undefined> = proc
 
 export class LoopNodeThrottle {
   private sent: number[] = [];   // when loop requests went out (last second)
-  private waitedMs = 0;          // waited so far in the current loop check
+  private waitedMs = 0;          // waited on the SHARED node so far in the current loop check
+  private checkStart = 0;        // when the current loop check started
+  sentThisCheck = 0;             // requests the current loop check got past the gate
   busySkips = 0;                 // checks given up this hour (read by the hour line)
 
   constructor(
@@ -252,16 +272,17 @@ export class LoopNodeThrottle {
     private readonly sleep: (ms: number) => Promise<void> = (ms) => new Promise((r) => setTimeout(r, ms)),
     readonly maxWaitMs = 2_000,
     private readonly stepMs = 50,
+    readonly maxCheckMs = 15_000,
   ) {}
 
-  // A new loop check: its 2 s waiting allowance starts again.
-  beginCheck(): void { this.waitedMs = 0; }
+  // A new loop check: its waiting allowances start again.
+  beginCheck(): void { this.waitedMs = 0; this.sentThisCheck = 0; this.checkStart = this.now(); }
 
   // Is the shared allowance quiet enough for a loop request?
   sharedHasRoom(): boolean {
     const h = this.shared();
     if (!h) return true;
-    return h.pending === 0 && h.usedLastSec < 0.5 * h.rps && h.tokens >= 1;
+    return h.pending === 0 && h.usedLastSec < 0.5 * h.rps && h.tokens >= Math.max(1, h.rps - 2);
   }
 
   private ownHasRoom(t: number): boolean {
@@ -269,13 +290,19 @@ export class LoopNodeThrottle {
     return this.sent.length < this.maxRps;
   }
 
-  // Waits for the gate, or throws LoopNodeBusy after 2 s of waiting in this check.
+  // Waits for the gate, or throws LoopNodeBusy after 2 s of waiting on the
+  // shared node in this check (or when the check has run 15 s).
   async gate(): Promise<void> {
     for (;;) {
       const t = this.now();
-      if (this.ownHasRoom(t) && this.sharedHasRoom()) { this.sent.push(t); return; }
-      if (this.waitedMs + this.stepMs > this.maxWaitMs) throw new LoopNodeBusy();
-      this.waitedMs += this.stepMs;
+      if (t - this.checkStart > this.maxCheckMs) throw new LoopNodeBusy('check too long');
+      const own = this.ownHasRoom(t);
+      if (own && this.sharedHasRoom()) { this.sent.push(t); this.sentThisCheck++; return; }
+      // Only time lost to a busy SHARED node counts toward the 2 s.
+      if (own) {
+        if (this.waitedMs + this.stepMs > this.maxWaitMs) throw new LoopNodeBusy();
+        this.waitedMs += this.stepMs;
+      }
       await this.sleep(this.stepMs);
     }
   }

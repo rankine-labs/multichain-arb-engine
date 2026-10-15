@@ -353,6 +353,11 @@ class RateLimited extends Error {}
 // a one-off bad probe can't switch a token off forever.
 type SlotSpec = { layout: 'solidity' | 'vyper'; slot: number };
 const slotCache = new Map<string, { info: SlotInfo; at: number }>();
+// Side cache for "read only" lookups (loop checks on the free node, Oct 15):
+// they may READ the main cache, but what they find goes only here (memory
+// only, never saved, never read by 2-pool checks), so an odd answer from
+// another node can never change what the 2-pool checks use.
+const sideSlotCache = new Map<string, { info: SlotInfo; at: number }>();
 const NOT_FOUND_TTL_MS = 24 * 60 * 60_000; // misses retried daily (each costs up to ~60 requests)
 const MAX_SLOT = 60;
 let slotFile: string | null = null;
@@ -391,9 +396,12 @@ function saveSlot(cacheKey: string, spec: SlotSpec) {
 // marker value, then balanceOf is called. The value that comes back says
 // which location the token reads. A second request confirms it. Was up to
 // 122 separate requests per token (the biggest Alchemy drain).
-export async function findBalanceSlot(rpc: Rpc, cacheKey: string, token: string): Promise<SlotInfo> {
+// readOnly: read the main cache, but write any new answer to the side cache only.
+export async function findBalanceSlot(rpc: Rpc, cacheKey: string, token: string, readOnly = false): Promise<SlotInfo> {
+  const fresh = (h: { info: SlotInfo; at: number } | undefined) => !!h && (h.info !== null || Date.now() - h.at < NOT_FOUND_TTL_MS);
   const hit = slotCache.get(cacheKey);
-  if (hit && (hit.info !== null || Date.now() - hit.at < NOT_FOUND_TTL_MS)) return hit.info;
+  if (fresh(hit)) return hit!.info;
+  if (readOnly) { const side = sideSlotCache.get(cacheKey); if (fresh(side)) return side!.info; }
   const data = BALANCE_OF.encodeFunctionData('balanceOf', [SIM_EXECUTOR_ADDRESS]);
   const BASE = 0x1234567890abcdef0000n; // marker i = BASE + i (never a real balance)
 
@@ -435,9 +443,12 @@ export async function findBalanceSlot(rpc: Rpc, cacheKey: string, token: string)
     // Confirm with that one key alone (guards against odd tokens).
     const magic = 0x1234567890abcdefn;
     const check = await call({ [keyFnFor(spec)(SIM_EXECUTOR_ADDRESS)]: pad32(magic) });
-    if (check === magic) { found = { key: keyFnFor(spec) }; saveSlot(cacheKey, spec); }
+    if (check === magic) { found = { key: keyFnFor(spec) }; if (!readOnly) saveSlot(cacheKey, spec); }
   }
-  slotCache.set(cacheKey, { info: found, at: Date.now() });
+  if (readOnly) {
+    if (sideSlotCache.size > 2_000) sideSlotCache.clear(); // memory bound
+    sideSlotCache.set(cacheKey, { info: found, at: Date.now() });
+  } else slotCache.set(cacheKey, { info: found, at: Date.now() });
   return found;
 }
 
@@ -492,7 +503,9 @@ export async function simulateRoundTrip(
   // Robinhood trigger check passes the block the trigger trade landed in, so
   // the test sees the market RIGHT AFTER that trade (where a backrun would
   // land), not ~30 blocks later after rival bots already closed the gap.
-  opts: { v3Lender?: string; weth?: string; blockTag?: string } = {},
+  // slotReadOnly: loop checks on the free node: may read the token balance
+  // location cache, never add to it (see sideSlotCache).
+  opts: { v3Lender?: string; weth?: string; blockTag?: string; slotReadOnly?: boolean } = {},
 ): Promise<SimResult> {
   return tag(await simulateInner(rpc, chain, trade, opts));
 }
@@ -535,7 +548,7 @@ async function simulateInner(
   rpc: Rpc,
   chain: string,
   trade: { token: string; amountIn: bigint; hops: ExecutorHop[] },
-  opts: { v3Lender?: string; weth?: string; blockTag?: string },
+  opts: { v3Lender?: string; weth?: string; blockTag?: string; slotReadOnly?: boolean },
 ): Promise<SimResult> {
   const flash = !!opts.v3Lender;
 
@@ -548,7 +561,7 @@ async function simulateInner(
   if (!flash) {
     let slot: SlotInfo;
     try {
-      slot = await findBalanceSlot(rpc, `${chain}:${trade.token.toLowerCase()}`, trade.token);
+      slot = await findBalanceSlot(rpc, `${chain}:${trade.token.toLowerCase()}`, trade.token, !!opts.slotReadOnly);
     } catch (err) {
       if (err instanceof RateLimited) return { status: 'rate_limited', reason: err.message };
       throw err;

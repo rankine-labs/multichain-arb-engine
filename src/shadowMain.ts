@@ -1410,12 +1410,15 @@ if (loopCfg.enabled) {
       //     2-pool check) when done.
       const loopNodeCfg = loopNodeFromEnv(process.env);
       const loopOnMain = loopNodeCfg.mode === 'main';
-      // LOOP_CHECK_RPC pointing at the main checking node would undo the whole
-      // point (keep Chainstack for 2-pool checks): refuse it, use the free node.
-      const mainCheckUrls = [checkPlan?.main.url, wssToHttps(process.env.QUICKNODE_RPC_ROBINHOOD) || process.env.QUICKNODE_RPC_ROBINHOOD]
+      // LOOP_CHECK_RPC pointing at a configured checking node (main or its
+      // backup, QuickNode, Alchemy, SIM_RPC_ROBINHOOD) would undo the whole
+      // point (keep the paid nodes for 2-pool checks): refuse it, use the free node.
+      const mainCheckUrls = [checkPlan?.main.url, checkPlan?.fallback?.url,
+            wssToHttps(process.env.QUICKNODE_RPC_ROBINHOOD) || process.env.QUICKNODE_RPC_ROBINHOOD,
+            process.env.ROBINHOOD_RPC_HTTP, process.env.SIM_RPC_ROBINHOOD]
             .filter((u): u is string => !!u).map((u) => u.trim().replace(/\/+$/, '').toLowerCase());
       if (loopNodeCfg.customUrl && mainCheckUrls.includes(loopNodeCfg.customUrl.trim().replace(/\/+$/, '').toLowerCase())) {
-            console.warn('[loop] LOOP_CHECK_RPC is the main checking node: using the free public node for loops instead');
+            console.warn('[loop] LOOP_CHECK_RPC is one of the checking nodes: using the free public node for loops instead');
             loopNodeCfg.customUrl = null;
             loopNodeCfg.label = 'free public node';
       }
@@ -1433,7 +1436,10 @@ if (loopCfg.enabled) {
             rpc: loopNodeRpc,
             // Main mode: the free node double-checks "no reason" fails, as before.
             secondOpinion: loopOnMain ? rhFreeSimRpc : null,
-            simulate: (rpc, trade, opts) => simulateRoundTrip(rpc, 'robinhood', trade, opts),
+            // Free mode: token balance locations are read from the shared
+            // cache but never added to it (an odd free-node answer must not
+            // change what 2-pool checks use). Main mode: as before.
+            simulate: (rpc, trade, opts) => simulateRoundTrip(rpc, 'robinhood', trade, loopOnMain ? opts : { ...opts, slotReadOnly: true }),
             findSpot: (rpc, hash) => loopOnMain ? findTriggerSpot(rpc, hash) : findTriggerSpot(rpc, hash, LOOP_TRIGGER_POLL_MS, LOOP_TRIGGER_MAX_POLLS),
             replay: replayRpc,
             stateGone: STATE_GONE,
@@ -1463,10 +1469,15 @@ if (loopCfg.enabled) {
                   return r;
             } catch (e) {
                   if (!(e instanceof LoopNodeBusy)) throw e;
-                  // Shared node too busy for 2 s: give up quietly. Not a
-                  // "slow down" pause, not counted as a check.
+                  // Shared node too busy for 2 s (or the check ran 15 s): give
+                  // up quietly. Not a "slow down" pause, not counted as a
+                  // check, not logged one by one (core/loopTrader.ts), only
+                  // counted in the hour line.
                   loopThrottle.busySkips++;
-                  return { status: 'unsupported', reason: 'skipped: node busy' };
+                  return { status: 'unsupported', reason: e.message };
+            } finally {
+                  // Today's LOOP_CHECK_DAILY counts only checks that sent something.
+                  if (loopThrottle.sentThisCheck > 0) loopGuard.countCheck();
             }
       };
       const loopTrader = new LoopTrader(loopCfg, {

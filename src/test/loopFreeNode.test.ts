@@ -10,6 +10,7 @@
 import { loopNodeFromEnv, LoopNodeGuard, runLoopCheck, LoopCheckDeps, LoopSpot, loopNodeText, isMethodMissing, LoopNodeThrottle, LoopNodeBusy, loopMaxRpsFromEnv } from '../core/loopNode';
 import { NodeBudget } from '../core/nodeBudget';
 import type { Rpc, SimResult } from '../execution/simulator';
+import { findBalanceSlot } from '../execution/simulator';
 import type { LoopTrade } from '../core/loopTrader';
 import { loopLogLine } from '../core/loopReport';
 
@@ -113,9 +114,9 @@ async function main() {
     const node = g.watch(busy.rpc);
     g.noteStart();
     await node('eth_getTransactionReceipt', []);
-    await node('eth_call', []); // second answer in the same check: same pause
+    await node('eth_call', []); // second request in the same check: not sent at all
     assert(!g.canCheck(), 'paused after "slow down"');
-    assert(g.peekHour().pauses === 1 && g.peekHour().rateLimited === 2, 'two answers, one pause');
+    assert(g.peekHour().pauses === 1 && g.peekHour().rateLimited === 1 && busy.calls.length === 1, 'one "slow down", one pause, second request never sent');
     t += 59_000; assert(!g.canCheck(), 'still paused at 59 s');
     t += 2_000; assert(g.canCheck(), 'resumes after 60 s');
     g.noteStart(); g.noteRateLimit(); t += 119_000; assert(!g.canCheck(), 'second pause: 2 min');
@@ -141,12 +142,14 @@ async function main() {
     // daily cap
     let day = 'd1';
     const g4 = new LoopNodeGuard(loopNodeFromEnv({ LOOP_CHECK_DAILY: '2' }), () => t, quiet, () => day);
-    g4.noteStart(); g4.noteStart();
+    g4.noteStart();
+    assert(g4.peekHour().today === 0, 'a check that sent nothing is not counted toward the daily cap');
+    g4.countCheck(); g4.countCheck();
     assert(!g4.canCheck(), 'daily cap reached: no more loop checks');
     day = 'd2'; assert(g4.canCheck() && g4.peekHour().today === 0, 'new day: count starts again');
     // takeHour resets the hour counts, keeps today's
     const g5 = new LoopNodeGuard(loopNodeFromEnv({}), () => t, quiet);
-    g5.noteStart(); g5.noteRateLimit();
+    g5.noteStart(); g5.countCheck(); g5.noteRateLimit();
     const h = g5.takeHour();
     assert(h.pauses === 1 && h.rateLimited === 1 && g5.peekHour().pauses === 0 && g5.peekHour().today === 1, 'takeHour resets the hour, keeps today');
   }
@@ -189,7 +192,13 @@ async function main() {
     const gy = new LoopNodeGuard(loopNodeFromEnv({}), () => 0, quiet);
     assert(await gy.probeReplay(fakeNode('y', () => ({ result: [{ calls: [] }] })).rpc) === 'yes', 'probe: method present -> supported');
     const gi = new LoopNodeGuard(loopNodeFromEnv({}), () => 0, quiet);
-    assert(await gi.probeReplay(fakeNode('i', () => ({ error: { code: -32602, message: 'invalid params' } })).rpc) === 'yes', 'probe: method present but empty test refused -> supported');
+    assert(await gi.probeReplay(fakeNode('i', () => ({ error: { code: -32602, message: 'invalid params' } })).rpc) === 'unknown', 'probe: unclear error (invalid params) -> still unknown, not "supported"');
+    const gr = new LoopNodeGuard(loopNodeFromEnv({}), () => 0, quiet);
+    assert(await gr.probeReplay(fakeNode('r', () => ({ error: { code: 3, message: 'execution reverted', data: '0x' } })).rpc) === 'yes', 'probe: revert-shaped answer -> supported');
+    for (const err of [{ code: 403, message: 'Forbidden' }, { message: 'method eth_simulateV1 is disabled' }, { message: 'this method is not allowed' }]) {
+      const gf = new LoopNodeGuard(loopNodeFromEnv({}), () => 0, quiet);
+      assert(await gf.probeReplay(fakeNode('f', () => ({ error: err })).rpc) === 'no', `probe: "${err.message}" -> not supported`);
+    }
     // Learned from a real replay answer too (no probe).
     const gl = new LoopNodeGuard(loopNodeFromEnv({}), () => 0, quiet);
     await gl.watch(node.rpc)('eth_simulateV1', []);
@@ -237,8 +246,36 @@ async function main() {
     // Over half the shared speed limit used, or no free slot: also shut.
     const th2 = new LoopNodeThrottle(2, () => ({ pending: 0, usedLastSec: 4, tokens: 4, rps: 8 }), () => t, sleep);
     const th3 = new LoopNodeThrottle(2, () => ({ pending: 0, usedLastSec: 0, tokens: 0.5, rps: 8 }), () => t, sleep);
-    const th4 = new LoopNodeThrottle(2, () => ({ pending: 0, usedLastSec: 3, tokens: 5, rps: 8 }), () => t, sleep);
-    assert(!th2.sharedHasRoom() && !th3.sharedHasRoom() && th4.sharedHasRoom(), 'room only with an empty queue, under half the limit and a free slot');
+    const th4 = new LoopNodeThrottle(2, () => ({ pending: 0, usedLastSec: 3, tokens: 6, rps: 8 }), () => t, sleep);
+    const th4b = new LoopNodeThrottle(2, () => ({ pending: 0, usedLastSec: 1, tokens: 5.9, rps: 8 }), () => t, sleep);
+    assert(!th2.sharedHasRoom() && !th3.sharedHasRoom() && th4.sharedHasRoom(), 'room only with an empty queue, under half the limit and slots free');
+    assert(!th4b.sharedHasRoom(), 'shared allowance must be nearly full (8/s: at least 6 free) before a loop request goes');
+    // Waiting only on loops' own limit never counts as "node busy".
+    const th7 = new LoopNodeThrottle(2, () => ({ pending: 0, usedLastSec: 0, tokens: 8, rps: 8 }), () => t, sleep);
+    const w7 = th7.wrap(async () => ({ result: '0x' }));
+    th7.beginCheck();
+    let skipped7 = false;
+    try { for (let i = 0; i < 12; i++) await w7('eth_call', []); } catch { skipped7 = true; }
+    assert(!skipped7 && th7.sentThisCheck === 12, '12 requests on an idle node (about 6 s at 2/s): not skipped as busy');
+    // But a whole check may take at most 15 s.
+    const th8 = new LoopNodeThrottle(2, () => ({ pending: 0, usedLastSec: 0, tokens: 8, rps: 8 }), () => t, sleep);
+    const w8 = th8.wrap(async () => ({ result: '0x' }));
+    th8.beginCheck();
+    let why8 = '';
+    try { for (let i = 0; i < 100; i++) await w8('eth_call', []); } catch (e) { why8 = (e as Error).message; }
+    assert(why8 === 'skipped: check too long' && th8.sentThisCheck <= 32, `check capped at 15 s (${why8}, ${th8.sentThisCheck} sent)`);
+    // Once rate limited in a check, nothing more is sent in that check.
+    const gw = new LoopNodeGuard(loopNodeFromEnv({}), () => t, quiet);
+    let sentW = 0;
+    const ww = gw.watch(async () => { sentW++; return { error: { code: 429, message: 'too many requests' } }; });
+    gw.noteStart();
+    await ww('eth_call', []); const later = await ww('eth_call', []); await ww('eth_call', []);
+    assert(sentW === 1 && later.error?.code === 429 && gw.peekHour().rateLimited === 1, 'after "slow down" mid-check: no more requests sent, counted once');
+    gw.noteResult({ status: 'rate_limited', reason: 'x' });
+    assert(gw.peekHour().rateLimited === 1, 'rate_limited result of that check not counted twice');
+    gw.noteStart(); t += 60_001;
+    await ww('eth_call', []);
+    assert(sentW === 2, 'next check sends again');
     // Quiet shared node: loop requests never exceed LOOP_NODE_MAX_RPS in any second.
     const sentAt: number[] = [];
     const quietNode: Rpc = async () => { sentAt.push(t); return { result: '0x' }; };
@@ -277,6 +314,18 @@ async function main() {
     bt += 1_000;
     await waiting;
     assert(hp === 1 && b.headroom().pending === 0, `headroom: queued request seen as pending (${hp})`);
+  }
+
+  // ---------------- H) slot cache: loops read it, never add to it ----------------
+  {
+    let n1 = 0, n2 = 0, n3 = 0;
+    const refuses = (count: () => void): Rpc => async () => { count(); return { error: { code: -32602, message: 'invalid params' } }; };
+    const key = 'robinhood:0xloopslottest';
+    await findBalanceSlot(refuses(() => n1++), key, '0x00000000000000000000000000000000000000aa', true);
+    await findBalanceSlot(refuses(() => n2++), key, '0x00000000000000000000000000000000000000aa', true);
+    assert(n1 === 1 && n2 === 0, 'read-only lookup remembered for loops (side cache)');
+    await findBalanceSlot(refuses(() => n3++), key, '0x00000000000000000000000000000000000000aa');
+    assert(n3 === 1, 'the 2-pool lookup does not see the loop answer (main cache untouched)');
   }
 
   // ---------------- F) hourly line ----------------

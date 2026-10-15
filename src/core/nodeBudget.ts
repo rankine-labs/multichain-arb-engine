@@ -81,6 +81,7 @@ export class NodeBudget {
     this.usedToday += n;
     // Remember when these calls went out (last second only, kept short).
     const at = this.now();
+    while (this.recent.length && at - this.recent[0] >= 1_000) this.recent.shift(); // drop old ones first
     for (let i = 0; i < n && this.recent.length < 2_000; i++) this.recent.push(at);
   }
 

@@ -439,6 +439,9 @@ export class LoopTrader {
     catch (e) { this.deps.log?.(`[loop] ${label} practice check error: ${(e as Error).message}`); return; }
     const h = this.hour;
     if (r.status === 'rate_limited') { this.pausedUntil = this.deps.env.now() + 60_000; return; }
+    // "skipped: node busy" / "skipped: check too long" (loop node throttle,
+    // core/loopNode.ts): counted in the hour line there, not logged one by one.
+    if (r.status === 'unsupported' && r.reason.startsWith('skipped: ')) return;
     if (r.status === 'unsupported') { this.deps.log?.(`[loop] ${label} practice check skipped (${r.reason})`); return; }
     h.checked++;
     const est = w.r.netUsd;
