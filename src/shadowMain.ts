@@ -133,6 +133,7 @@ const noteNoSlot = (token: string, reason: string) => { if (/balance storage/i.t
 const RH_EXTRA_VENUES = process.env.RH_EXTRA_VENUES !== '0';
 import { ProfitBands } from './core/profitBands';
 import { RaceChecker } from './core/raceCheck';
+import { GapCredit } from './core/gapCredit';
 import { FablesFeeBook, readFablesFees } from './core/fablesFee';
 import { setHookedFeeSource } from './core/pairWatcher';
 import { SimBucketTally, classifySimOutcome } from './core/failReasons';
@@ -509,7 +510,7 @@ const routeScores = new RouteScores();
 { const n = routeScores.load(ROUTE_FILE); if (n) console.log(`[sim] robinhood: restored scores for ${n} pool pairs`); }
 setInterval(() => timed('route scores save', () => routeScores.save(ROUTE_FILE)), 10 * 60_000);
 // Real wins by size ($1/$2/$5/$10/$20 bars), to set the firing bar from data.
-const winSizes = new WinSizes();
+const winSizes = new WinSizes(Date.now, 'America/Toronto'); // same 'today' as the rest of the report
 // Pool pairs whose last trigger test lost or failed: not re-tested for 5 min.
 const simLoserMuted = new Map<string, number>();
 // On-the-spot pool lookups that found nothing usable (see the trade handler).
@@ -2308,6 +2309,9 @@ await chainManager.startAll();
       // again. Now a confirmed gap counts again only after it CLOSED (left the
       // scan's list) or at least doubled in size. Value = model profit when confirmed.
       const gapConfirmedOpen = new Map<string, number>();
+      // Oct 15: when an open gap is re-checked because it doubled, only the
+      // growth counts toward "would have made" (one gap, one trade). Reporting only.
+      const gapCredit = new GapCredit();
       const poolSig = (p: PoolState) => `${p.sqrtPriceX96 ?? ''}:${p.liquidity ?? ''}:${p.reserveA ?? ''}:${p.reserveB ?? ''}`;
       const GAP_FAKE_MUTE_MS = 30 * 60_000;
       const gapLastFired = new Map<string, number>();
@@ -2394,6 +2398,7 @@ await chainManager.startAll();
                   // Gaps that closed since they were confirmed may count again.
                   const openNow = new Set(gaps.map((g) => `${g.buyPool.poolAddress}>${g.sellPool.poolAddress}`));
                   for (const k of gapConfirmedOpen.keys()) if (!openNow.has(k)) gapConfirmedOpen.delete(k);
+                  for (const k of [...gapCredit.keys()]) if (!openNow.has(k)) gapCredit.closed(k);
                   let fired = 0;
                   for (const g of gaps) {
                         if (fired >= 2) break;
@@ -2468,8 +2473,12 @@ await chainManager.startAll();
                         // refuse small trades; that's about sending, not about the result).
                         const gapVetted = safetyGate.isAllowed(g.base) && safetyGate.isAllowed(g.quote)
                               && !(involvesAutoVetted([g.base, g.quote]) && g.sizeUsd > AUTO_VET_MAX_TRADE_USD);
-                        if (gapVetted && simNet >= MIN_COUNTED_USD) dryRunPnl.recordVerified(simNet, `${label} gap`);
-                        profitBands.add(simNet, torontoDay());
+                        // Same open gap re-checked after it doubled: only the growth is new
+                        // money (one trade takes the gap once). First time: all of it.
+                        const gapNew = gapCredit.credit(key, simNet);
+                        if (gapVetted && gapNew >= MIN_COUNTED_USD) dryRunPnl.recordVerified(gapNew, `${label} gap`);
+                        if (gapNew > 0) profitBands.add(gapNew, torontoDay());
+                        if (gapNew < simNet) console.log(`[gap] ${label}: same open gap grew, counted only the extra $${gapNew.toFixed(2)} of $${simNet.toFixed(2)}`);
                         // Would we really have won it? (ready = after our check + ~2 ms to sign)
                         void raceChecker.record({ label: `${label} gap`, pools: [g.buyPool.poolAddress, g.sellPool.poolAddress], netUsd: simNet, source: 'gap', readyDelayMs: Date.now() - spottedAt + 2 });
                         console.log(`[gap] standing gap ${label} CONFIRMED: real ~$${simNet.toFixed(2)} (model $${g.profitUsd.toFixed(2)}) on $${Math.round(g.sizeUsd)} | ${route}`);
@@ -3355,6 +3364,7 @@ for (let i = 0; i < resolved.length; i++) {
                                     todayChecked: pnl.today.verifiedUsd, todayCheckedCount: pnl.today.verifiedCount,
                                     todayUnchecked: pnl.today.modelUsd, todayUncheckedCount: pnl.today.modelCount,
                                     weekChecked: pnl.last7.verifiedUsd,
+                                    todayBigUsd: pnl.today.bigUsd ?? 0, todayBigCount: pnl.today.bigCount ?? 0, best: pnl.today.best,
                               },
                               reactionMs: { typical: stats.medianReactionMs, slowest5pct: stats.p95ReactionMs },
                               otherBots: { timed: rv.found, theirMs: rv.theirMedianMs, oursMs: rv.ourMedianMs, weBeat: rv.beatCount },

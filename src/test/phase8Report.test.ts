@@ -40,7 +40,7 @@ const hourly = formatPlainHourly({
   simOutcomes: [['would make money', 2], ['would lose money', 1], ['node busy, out of allowance or unreachable', 1]],
   research: '🔬 <b>Research lane</b>: 3 tested',
 });
-assert(hourly.includes('Profitable checks by size this hour: $0.01-$0.10: 1 · $0.10-$0.50: 2') && hourly.includes('Today: ') && hourly.includes('$20+: 1'), 'hourly shows profit bands (hour and today)');
+assert(hourly.includes('Profitable checks by size this hour: $0.01-$0.10: 1 · $0.10-$0.50: 2') && hourly.includes("Today, all coins incl. ones we can't trade: ") && hourly.includes('$20+: 1'), 'hourly shows profit bands (hour and today)');
 assert(hourly.includes('Check results by kind: would make money 2 · would lose money 1'), 'hourly shows check results by kind');
 assert(hourly.includes('Our trade gas right now: 1.80¢ with our own money, 2.70¢ with a loan'), 'hourly shows our real gas cost');
 assert(hourly.includes('Research lane'), 'research lane folded into the hourly report');
