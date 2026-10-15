@@ -151,6 +151,8 @@ import { CompetitorTracker } from './core/competitorTracker';
 import { pickRobinhoodReadRpc, robinhoodSendRpc, redact, ROBINHOOD_PUBLIC_RPC } from './config/robinhoodEndpoints';
 import { loadStartPairs, saveStartPairs } from './core/seedPairs';
 import { DryRunPnl } from './core/dryRunPnl';
+import { RealisticPnl, readStartCoins, WinFacts } from './core/realisticPnl';
+import { StableTally, parseStableEnv } from './core/stableTally';
 import { FailoverJsonRpcProvider } from './core/failoverRpc';
 import { makeCaller } from './core/universeScan';
 import { loadNodeUsage, saveNodeUsage, nodeUsageToday, NodeBudget, budgetForUrl, callsInBody } from './core/nodeBudget';
@@ -838,7 +840,8 @@ const runSimulation = (
                         // Outliers (too good to be true) count only after a second check agrees.
                         if (chain === 'robinhood' && net >= MIN_COUNTED_USD && vetted
                               && await outlierCountOk(`${pair} after trigger`, net, tradeSizeUsd, { tokenIn, hops: built.hops, amountIn: built.amountIn, profit: r.profit, v3Lender: lender?.poolAddress, ...(spot ? { blockTag: spot.block } : {}) })) {
-                              dryRunPnl.recordVerified(net, `${symbolOf(chain, tokenIn)} ${buyPool.dex}->${sellPool.dex}`);
+                              countVerifiedWin(net, `${symbolOf(chain, tokenIn)} ${buyPool.dex}->${sellPool.dex}`,
+                                    { startToken: tokenIn, sizeUsd: tradeSizeUsd, lender: lender?.poolAddress }, [buyPool.tokenA, buyPool.tokenB]);
                         }
                         if (chain === 'robinhood') { routeScores.record(routeKey, net); if (vetted) winSizes.add(net); profitBands.add(net, torontoDay()); }
                         // Race check for trigger wins: we'd send ~0.1 s after seeing the trigger,
@@ -1117,11 +1120,36 @@ const noteReceiptGas = async (key: string, hash: string, gas: bigint, success: b
 // the bot's own maths. Both assume we win the race.
 const dryRunPnl = new DryRunPnl('data/dryrun-pnl.json', process.env.REPORT_TZ || 'America/Toronto');
 setInterval(() => timed('dry-run P&L save', () => dryRunPnl.save()), 60_000);
+// LIVE-REALISTIC TOTAL (core/realisticPnl.ts, Oct 15, measurement only).
+// A second "would have made" total that only counts wins our real money could
+// really take: starts in USDG or WETH (REALISTIC_START_COINS), size at or under
+// the own-money cap (OWN_MONEY_MAX_USD), and no loan in the check.
+const realisticPnl = new RealisticPnl('data/realistic-pnl.json', {
+      startCoins: readStartCoins(process.env.REALISTIC_START_COINS, [ROBINHOOD_TOKENS.USDG, ROBINHOOD_TOKENS.WETH]),
+      ownMaxUsd: OWN_MONEY_MAX_USD,
+      startLabel: process.env.REALISTIC_START_COINS ? 'chosen coins' : 'USDG/WETH',
+}, process.env.REPORT_TZ || 'America/Toronto');
+// OTHER STABLECOINS (core/stableTally.ts, Oct 15, measurement only): gaps and
+// wins on pairs with aUSD, UUSD or USDe. Addresses come from the verified coin
+// groups (set further down) or OTHER_STABLES in .env.
+const stableTally = new StableTally('data/other-stables.json', process.env.REPORT_TZ || 'America/Toronto');
+stableTally.setFromEnv(parseStableEnv(process.env.OTHER_STABLES));
+setInterval(() => timed('realistic totals save', () => { realisticPnl.save(); stableTally.save(); }), 60_000);
+// Every verified practice win goes through here: the normal total, then the
+// live-realistic total and the other-stablecoin counter (both reporting only).
+// `usd` is what the normal total adds (net of gas, only the new part of a
+// re-checked gap), so nothing is counted twice.
+const countVerifiedWin = (usd: number, label: string, win: WinFacts, pairTokens: [string, string]) => {
+      dryRunPnl.recordVerified(usd, label);
+      realisticPnl.record(usd, win);
+      stableTally.noteWin(pairTokens, win.startToken, usd);
+};
 // Save on shutdown too: pm2 restart/stop (every deploy) sends SIGINT, and the
 // last minute of would-have-earned figures used to be lost each time.
 for (const sig of ['SIGINT', 'SIGTERM'] as const) {
       process.once(sig, () => {
             try { dryRunPnl.save(); } catch { /* best effort */ }
+            try { realisticPnl.save(); stableTally.save(); } catch { /* best effort */ }
             try { gasModel.calibration.maybeSave(true); } catch { /* best effort */ }
             try { robinhoodWatcher.save(WATCH_FILE); } catch { /* best effort */ }
             try { routeScores.save(ROUTE_FILE); } catch { /* best effort */ }
@@ -2683,6 +2711,9 @@ await chainManager.startAll();
                   const openNow = new Set(gaps.map((g) => `${g.buyPool.poolAddress}>${g.sellPool.poolAddress}`));
                   for (const k of gapConfirmedOpen.keys()) if (!openNow.has(k)) gapConfirmedOpen.delete(k);
                   for (const k of [...gapCredit.keys()]) if (!openNow.has(k)) gapCredit.closed(k);
+                  // Other-stablecoin counter (reporting only): gaps on aUSD/UUSD/USDe pairs,
+                  // from this scan's results already in memory (no node requests).
+                  stableTally.noteGaps(gaps.map((g) => ({ key: `${g.buyPool.poolAddress}>${g.sellPool.poolAddress}`, tokens: [g.base, g.quote] as [string, string], modelUsd: g.profitUsd })));
                   let fired = 0;
                   for (const g of gaps) {
                         if (fired >= 2) break;
@@ -2765,7 +2796,9 @@ await chainManager.startAll();
                         const gapNew = gapCredit.credit(key, simNet);
                         // Outliers (too good to be true, e.g. the $785 USDG/ORBIO gap) count
                         // only after a second check agrees (core/outlierGuard.ts).
-                        if (gapVetted && gapNew >= MIN_COUNTED_USD && await outlierCountOk(`${label} gap`, simNet, g.sizeUsd, check.trade)) dryRunPnl.recordVerified(gapNew, `${label} gap`);
+                        if (gapVetted && gapNew >= MIN_COUNTED_USD && await outlierCountOk(`${label} gap`, simNet, g.sizeUsd, check.trade)) {
+                              countVerifiedWin(gapNew, `${label} gap`, { startToken: g.quote, sizeUsd: g.sizeUsd, lender: check.trade.v3Lender }, [g.base, g.quote]);
+                        }
                         if (gapNew > 0) profitBands.add(gapNew, torontoDay());
                         if (gapNew < simNet) console.log(`[gap] ${label}: same open gap grew, counted only the extra $${gapNew.toFixed(2)} of $${simNet.toFixed(2)}`);
                         // Would we really have won it? (ready = after our check + ~2 ms to sign)
@@ -3269,6 +3302,8 @@ await chainManager.startAll();
       const SYMBOLS_FILE = 'data/token-symbols.json';
       let tokenGroups: TokenGroupsResult | null = loadTokenGroups(GROUPS_FILE);
       if (tokenGroups) console.log(`[groups] ${groupsStatusLine(tokenGroups)} (saved list)`);
+      // Other-stablecoin counter: learn aUSD/UUSD/USDe addresses from the verified "Dollars" group.
+      stableTally.addFromGroups(tokenGroups?.members);
 
       // LOOP MONITOR (LoopMonitor in core/crossQuoteMonitor.ts): best 3-pool
       // loop per token across all verified coins, after all three real fees.
@@ -3315,6 +3350,7 @@ await chainManager.startAll();
                               // Coin names file read / written in bites (REBUILD_PACED=0: one go).
                               rebuildPaced: REBUILD_PACED,
                         }));
+                        stableTally.addFromGroups(tokenGroups?.members); // new list: refresh the coin addresses
                   }
                   const quotes = tokenGroups!.members.map((m) => ({ token: m.token, symbol: m.symbol, group: m.group, priceUsd: m.priceUsd }));
                   const n = await timedAsync('loop monitor setup', () => loopMonitor.setup(pools, quotes, Number(process.env.LOOP_TOKENS ?? 80), undefined, { paced: REBUILD_PACED }));
@@ -3605,6 +3641,9 @@ for (let i = 0; i < resolved.length; i++) {
                         const rpcNote = `, prices on ${rpc.onFast ? 'fast node' : 'paid node (fast node resting)'}${rpc.switches ? ` (${rpc.switches} switch${rpc.switches === 1 ? '' : 'es'} to paid node since start)` : ''}`;
                         const pnlNote = `, ${dryRunPnl.line()}`;
                         console.log(`[pnl] ${dryRunPnl.line()}`);
+                        // Status page reads these two (deploy/status-report.js realisticLines).
+                        for (const l of realisticPnl.lines()) console.log(`[pnl-real] ${l}`);
+                        console.log(`[stables] ${stableTally.line()}`);
                         note = `watching ${st.pairs} pair${st.pairs === 1 ? '' : 's'}, ${st.pools} pools${tot ? `, ${localPct}% instant prices` : ''}${fireNote}${rivalNote}${gapNote}${liveNote}${rpcNote}${pnlNote}`;
                   }
                   return { chain, spreads, noMatchCount, note };
@@ -3663,6 +3702,9 @@ for (let i = 0; i < resolved.length; i++) {
                                     weekChecked: pnl.last7.verifiedUsd,
                                     todayBigUsd: pnl.today.bigUsd ?? 0, todayBigCount: pnl.today.bigCount ?? 0, best: pnl.today.best,
                               },
+                              // Live-realistic total + what it left out, and the other-stablecoin line (reporting only).
+                              realistic: realisticPnl.lines(),
+                              otherStables: stableTally.line(),
                               reactionMs: { typical: stats.medianReactionMs, slowest5pct: stats.p95ReactionMs },
                               otherBots: { timed: rv.found, theirMs: rv.theirMedianMs, oursMs: rv.ourMedianMs, weBeat: rv.beatCount },
                               rivalWins: { ...rivalWatch.takeHour(), botsKnown: rivalWatch.botCount(), botsVerified: rivalWatch.botStatus().verified },

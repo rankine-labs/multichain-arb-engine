@@ -442,6 +442,7 @@ async function main() {
     ...(tRight + tOthers + tLate ? [`- Test timing: ${tRight} right after trigger (replayed) · ${tOthers} end of trigger block · ${tLate} late · ${rechecked} re-checked without replay`] : []),
     ...(topFails.length ? ['- Why tests would fail (exact chain reason):', ...topFails.map(([m, n]) => `  - ${n}x \`${m.replace(/`/g, "'")}\``)] : []),
     `- Dry run, would have earned (if we won every race): ${lastPnl ? lastPnl.replace(/^\[pnl\] would-have-earned /, '') : 'first figure after the next hourly report'}`,
+    ...realisticLines(bigTail),
     '',
     '### Errors this window',
     ...(topErrors.length ? topErrors.map(([m, n]) => `- ${n}x \`${m.replace(/`/g, "'")}\``) : ['- none']),
@@ -460,8 +461,28 @@ async function main() {
   console.log(`[status] updated issue #${ISSUE}`);
 }
 
+// Live-realistic total and other-stablecoin lines (Oct 15, reporting only).
+// Reads the latest "[pnl-real] live-realistic ...", "[pnl-real] left out today ..."
+// and "[stables] Other stables ..." log lines (printed with the hourly report).
+// Never throws: anything odd gives a "first figure after the next hourly report" line.
+function realisticLines(lines) {
+  try {
+    const list = Array.isArray(lines) ? lines.filter((l) => typeof l === 'string') : [];
+    const last = (re) => { for (let i = list.length - 1; i >= 0; i--) if (re.test(list[i])) return list[i]; return null; };
+    const real = last(/^\[pnl-real\] live-realistic /);
+    const left = last(/^\[pnl-real\] left out today/);
+    const stables = last(/^\[stables\] Other stables/);
+    const out = [`  - ${real ? real.replace(/^\[pnl-real\] /, '').slice(0, 300) : 'live-realistic: first figure after the next hourly report'}`];
+    if (left) out.push(`  - ${left.replace(/^\[pnl-real\] /, '').slice(0, 300)}`);
+    out.push(`- ${stables ? stables.replace(/^\[stables\] /, '').slice(0, 500) : 'Other stables (today): first figure after the next hourly report'}`);
+    return out;
+  } catch {
+    return ['- Live-realistic and other stables: could not read the log lines'];
+  }
+}
+
 // Run only when started directly (node deploy/status-report.js). When a test
 // loads this file it just gets the helpers below, nothing is posted.
 if (require.main === module) main().catch((e) => console.error('[status] failed:', e.message));
 
-module.exports = { detectLive, footerText, readLiveRecords, liveSection, memSummary, stallSummary, loopTradeLines };
+module.exports = { detectLive, footerText, readLiveRecords, liveSection, memSummary, stallSummary, loopTradeLines, realisticLines };

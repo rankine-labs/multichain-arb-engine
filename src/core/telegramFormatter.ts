@@ -302,6 +302,10 @@ export interface PlainHourlyInput {
     // Oct 15 (optional): part of todayChecked from single wins of $20+, and the biggest win.
     todayBigUsd?: number; todayBigCount?: number; best?: { usd: number; label: string };
   };
+  // Oct 15 (optional, reporting only): the live-realistic total (core/realisticPnl.ts
+  // lines(): total, then what it left out) and the other-stablecoin line (core/stableTally.ts).
+  realistic?: string[];
+  otherStables?: string;
   reactionMs: { typical: number | null; slowest5pct: number | null };
   otherBots?: { timed: number; theirMs: number | null; oursMs: number | null; weBeat: number };
   // What the rival bots did this hour (core/rivalWatch.ts).
@@ -470,6 +474,12 @@ export function formatPlainHourly(r: PlainHourlyInput): string {
   if (r.earned.best && r.earned.best.usd >= 20) L.push(`  Biggest today: ${money(r.earned.best.usd)} ${esc(r.earned.best.label)}`);
   if (r.earned.todayUncheckedCount) L.push(`Looks good but not checked yet: ${money(r.earned.todayUnchecked)} from ${r.earned.todayUncheckedCount} (not trustworthy)`);
   L.push(`Last 7 days, checked: ${money(r.earned.weekChecked)}`);
+  // What our own money could really have taken (USDG/WETH start, own-money size, no loan).
+  if (r.realistic?.length) {
+    L.push(`Of that, ${esc(r.realistic[0])}`);
+    for (const extra of r.realistic.slice(1)) L.push(`  ${esc(extra)}`);
+  }
+  if (r.otherStables) L.push(esc(r.otherStables));
   L.push('');
 
   const t = r.reactionMs;
