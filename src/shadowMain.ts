@@ -77,7 +77,7 @@ import { RobinhoodChainAdapter } from './chains/robinhoodChain';
 import { MonadAdapter } from './chains/monad';
 import { AvalancheAdapter } from './chains/avalanche';
 import { RawChainEvent, PoolState, MIN_NET_PROFIT_USD } from './core/types';
-import { priceOf, spreadPct, deepEnough, POOL_MIN_DEPTH_USD } from './core/poolPrice';
+import { priceOf, spreadPct, deepEnough, POOL_MIN_DEPTH_USD, realBalanceOf } from './core/poolPrice';
 import { PairWatcher, Venue, refreshPoolState, refreshPoolsBatch } from './core/pairWatcher';
 import { scanUniverse, emptyScanState, ScanState, stateToPools, stateToPoolsSteps, scanPoolRefs, getLogsAdaptive, RawLog } from './core/universeScan';
 import { CrossQuoteMonitor, LoopMonitor, shouldScheduleFirstLoopReport } from './core/crossQuoteMonitor';
@@ -90,13 +90,15 @@ import { ROBINHOOD_SCAN_FACTORIES } from './config/knownAddresses';
 const RH_V4_SCAN = process.env.RH_V4_SCAN !== '0';
 import { buildExecuteCall, executionRequested, executorConfig, pickV3Lender, kindForPool } from './execution/executorCalldata';
 import { GasModel, GasCalibration, gasSettingsFromEnv, routeKeyFor, twoPoolKey, defaultUnitsFor, costsLine, loopKey } from './core/gasModel';
-import { recordEventFee, eventFeeCounts, feeFromEventsOn, setHeadBlockSource } from './core/eventFees';
+import { recordEventFee, eventFeeCounts, feeFromEventsOn, setHeadBlockSource, currentHeadBlock } from './core/eventFees';
 import { OwnMoneyBook, useOwnMoney } from './core/ownMoney';
 import { BlockReader, PoolUpdate } from './core/blockReader';
 import { AutoVet, CheckOutcome } from './core/autoVet';
 import { FailTally } from './core/failReasons';
 import { LenderBalances } from './core/lenderBalances';
 import { RouteScores, WinSizes, WIN_BARS } from './core/routeScore';
+import { readOutlierConfig, isOutlier, confirmOutlier, withDeadline, OutlierVerdict } from './core/outlierGuard';
+import type { ExecutorHop } from './execution/executorCalldata';
 import { RivalWatch } from './core/rivalWatch';
 import { V3BalanceBook, V3_BALANCES_FILE } from './core/v3BalanceBook';
 import { extraWatcherVenues, extraScanFactories, isExecutableVenue, canPracticeTestVenue, reportedVenueIds, venueShortName } from './config/robinhoodVenues';
@@ -149,6 +151,8 @@ import { CompetitorTracker } from './core/competitorTracker';
 import { pickRobinhoodReadRpc, robinhoodSendRpc, redact, ROBINHOOD_PUBLIC_RPC } from './config/robinhoodEndpoints';
 import { loadStartPairs, saveStartPairs } from './core/seedPairs';
 import { DryRunPnl } from './core/dryRunPnl';
+import { RealisticPnl, readStartCoins, WinFacts } from './core/realisticPnl';
+import { StableTally, parseStableEnv } from './core/stableTally';
 import { FailoverJsonRpcProvider } from './core/failoverRpc';
 import { makeCaller } from './core/universeScan';
 import { loadNodeUsage, saveNodeUsage, nodeUsageToday, NodeBudget, budgetForUrl, callsInBody } from './core/nodeBudget';
@@ -167,9 +171,12 @@ import { loopNodeFromEnv, LoopNodeGuard, runLoopCheck, LoopCheckDeps, loopNodeTe
 // Loop fix phase 2: real (block-confirmed) prices, trigger replay, cheap scans (core/loopPrices.ts).
 import { loopFixFromEnv, PendingTrades, loopPoolState } from './core/loopPrices';
 import { formatLoopHour, loopLogLine } from './core/loopReport';
-import { startMemReport, registerSize } from './core/memReport';
+import { startMemReport, registerSize, registerMemNote } from './core/memReport';
 // Loop trader extra pools: keeps single-pool pairs fresh for the loop finder only (off unless LOOP_TRADER=1).
 import { LoopExtraPools, loopExtraConfigFromEnv, readerAddresses, afterReaderWrite } from './core/loopExtraPools';
+// Loop worker: the loop trader in its own thread (LOOP_WORKER, default on with LOOP_TRADER=1).
+import { MainLoopFeeder, loopWorkerFromEnv } from './core/loopWorkerFeed';
+import { LoopWorkerHost, loopWorkerHeapMbFromEnv } from './core/loopWorkerHost';
 // Speed fixes (Oct 13): stage timers, preload, trust the WebSocket for prices.
 import { StageTimers, StageTrace } from './core/stageTimer';
 import { trustFreshConfigFromEnv, wsTrustProblem, WsFacts } from './core/trustFresh';
@@ -579,12 +586,50 @@ const MAX_PLAUSIBLE_PROFIT_SHARE = Number(process.env.MAX_PLAUSIBLE_PROFIT_SHARE
 const plausibleProfit = (profit: bigint, amountIn: bigint): boolean =>
       amountIn > 0n && Number(profit) / Number(amountIn) <= MAX_PLAUSIBLE_PROFIT_SHARE;
 
+// OUTLIER GUARD (core/outlierGuard.ts, Oct 15). A profit over $50, or over 2%
+// of the trade (and over $20), is "too good to be true" (the $785 USDG/ORBIO
+// gap). It is only trusted if paid in USDG/WETH AND a second check on the
+// free node (a different node from the checking node) agrees at full and
+// half size. Live: not sent otherwise. Practice: not counted otherwise.
+const OUTLIER_CFG = readOutlierConfig();
+const OUTLIER_ANCHORS = [ROBINHOOD_TOKENS.USDG, ROBINHOOD_TOKENS.WETH];
+// The whole second check (2 simulations) must finish within OUTLIER_CHECK_MS
+// (default 1.5 s). Too slow = "not confirmed": a live trade would otherwise
+// go out after its deadline and revert. blockTag: practice trigger checks
+// test at the trigger's block (where the gap was), not 'latest'.
+const OUTLIER_CHECK_MS = Number(process.env.OUTLIER_CHECK_MS ?? 1500);
+const confirmRhOutlier = (tokenIn: string, hops: ExecutorHop[], amountIn: bigint, firstProfit: bigint, v3Lender?: string, blockTag?: string): Promise<OutlierVerdict> =>
+      withDeadline(confirmOutlier({
+            tokenIn, anchors: OUTLIER_ANCHORS, amountIn, firstProfit,
+            simulate: (amt) => simulateRoundTrip(rhFreeSimRpc, 'robinhood', { token: tokenIn, amountIn: amt, hops }, { v3Lender, weth: ROBINHOOD_TOKENS.WETH, ...(blockTag ? { blockTag } : {}) }),
+      }), OUTLIER_CHECK_MS);
+// Practice only: should this verified win count in "money we'd have made"?
+// Normal wins: yes, no extra checks. Outliers: only if the second check agrees.
+const outlierCountOk = async (label: string, netUsd: number, sizeUsd: number,
+      trade: { tokenIn: string; hops: ExecutorHop[]; amountIn: bigint; profit: bigint; v3Lender?: string; blockTag?: string }): Promise<boolean> => {
+      if (!isOutlier(netUsd, sizeUsd, OUTLIER_CFG)) return true;
+      // Live: the send path runs its own second check for outliers (fireTrade);
+      // running it here too would double the wait before sending. Live
+      // outliers are simply not counted in the practice numbers.
+      if (robinhoodSender.live) {
+            console.log(`[outlier] ${label} $${netUsd.toFixed(2)} on $${Math.round(sizeUsd)}: outlier, not counted (live: the send path decides)`);
+            return false;
+      }
+      const v = await confirmRhOutlier(trade.tokenIn, trade.hops, trade.amountIn, trade.profit, trade.v3Lender, trade.blockTag);
+      if (v.ok) { console.log(`[outlier] ${label} $${netUsd.toFixed(2)} on $${Math.round(sizeUsd)}: ${v.detail}, counted`); return true; }
+      funnelSkip('outlier profit, not counted (too good to be true, see [outlier] log)');
+      console.log(`[outlier] ${label} $${netUsd.toFixed(2)} on $${Math.round(sizeUsd)}: OUTLIER, NOT COUNTED (${'reason' in v ? v.reason : 'refused'})`);
+      return false;
+};
+
 // One on-chain round-trip check, awaited by the caller (used by the
 // standing-gap scanner, where there's no race to lose by waiting ~1 s).
 // Same build + simulation as queueSimulation, but returns the result
 // instead of only logging it, and ignores the "one sim at a time" queue.
 type RoundTripCheck =
-      | { status: 'profit'; usd: number; loanPips: number } // loanPips: fee of the lender the check used (0 = own money)
+      // loanPips: fee of the lender the check used (0 = own money).
+      // trade: what was checked (for the outlier guard's second check).
+      | { status: 'profit'; usd: number; loanPips: number; trade: { tokenIn: string; hops: ExecutorHop[]; amountIn: bigint; profit: bigint; v3Lender?: string } }
       | { status: 'loss' | 'fail' | 'skipped'; reason: string }
       | { status: 'rate_limited' };
 const checkRoundTrip = async (
@@ -616,7 +661,8 @@ const checkRoundTrip = async (
       if (r.status === 'unsupported') { if (chain === 'robinhood') noteNoSlot(tokenIn, r.reason); return { status: 'skipped', reason: r.reason }; }
       if (r.status === 'profit') {
             if (!plausibleProfit(r.profit, built.amountIn)) return { status: 'fail', reason: 'implausible profit (bad token or pool data)' };
-            return { status: 'profit', usd: (Number(r.profit) / 10 ** decimals) * usdPerToken, loanPips: lender ? (lender.feePips ?? lender.feeBps * 100) : 0 };
+            return { status: 'profit', usd: (Number(r.profit) / 10 ** decimals) * usdPerToken, loanPips: lender ? (lender.feePips ?? lender.feeBps * 100) : 0,
+                  trade: { tokenIn, hops: built.hops, amountIn: built.amountIn, profit: r.profit, v3Lender: lender?.poolAddress } };
       }
       if (r.status === 'loss') return { status: 'loss', reason: 'ends with less than it started' };
       return { status: 'fail', reason: r.reason };
@@ -791,8 +837,11 @@ const runSimulation = (
                         // Auto-vetted coins count only within their smaller trade limit.
                         const vetted = [buyPool.tokenA, buyPool.tokenB].every((t: string) => safetyGate.isAllowed(t))
                               && !(involvesAutoVetted([buyPool.tokenA, buyPool.tokenB]) && tradeSizeUsd > AUTO_VET_MAX_TRADE_USD);
-                        if (chain === 'robinhood' && net >= MIN_COUNTED_USD && vetted) {
-                              dryRunPnl.recordVerified(net, `${symbolOf(chain, tokenIn)} ${buyPool.dex}->${sellPool.dex}`);
+                        // Outliers (too good to be true) count only after a second check agrees.
+                        if (chain === 'robinhood' && net >= MIN_COUNTED_USD && vetted
+                              && await outlierCountOk(`${pair} after trigger`, net, tradeSizeUsd, { tokenIn, hops: built.hops, amountIn: built.amountIn, profit: r.profit, v3Lender: lender?.poolAddress, ...(spot ? { blockTag: spot.block } : {}) })) {
+                              countVerifiedWin(net, `${symbolOf(chain, tokenIn)} ${buyPool.dex}->${sellPool.dex}`,
+                                    { startToken: tokenIn, sizeUsd: tradeSizeUsd, lender: lender?.poolAddress }, [buyPool.tokenA, buyPool.tokenB]);
                         }
                         if (chain === 'robinhood') { routeScores.record(routeKey, net); if (vetted) winSizes.add(net); profitBands.add(net, torontoDay()); }
                         // Race check for trigger wins: we'd send ~0.1 s after seeing the trigger,
@@ -1071,11 +1120,36 @@ const noteReceiptGas = async (key: string, hash: string, gas: bigint, success: b
 // the bot's own maths. Both assume we win the race.
 const dryRunPnl = new DryRunPnl('data/dryrun-pnl.json', process.env.REPORT_TZ || 'America/Toronto');
 setInterval(() => timed('dry-run P&L save', () => dryRunPnl.save()), 60_000);
+// LIVE-REALISTIC TOTAL (core/realisticPnl.ts, Oct 15, measurement only).
+// A second "would have made" total that only counts wins our real money could
+// really take: starts in USDG or WETH (REALISTIC_START_COINS), size at or under
+// the own-money cap (OWN_MONEY_MAX_USD), and no loan in the check.
+const realisticPnl = new RealisticPnl('data/realistic-pnl.json', {
+      startCoins: readStartCoins(process.env.REALISTIC_START_COINS, [ROBINHOOD_TOKENS.USDG, ROBINHOOD_TOKENS.WETH]),
+      ownMaxUsd: OWN_MONEY_MAX_USD,
+      startLabel: process.env.REALISTIC_START_COINS ? 'chosen coins' : 'USDG/WETH',
+}, process.env.REPORT_TZ || 'America/Toronto');
+// OTHER STABLECOINS (core/stableTally.ts, Oct 15, measurement only): gaps and
+// wins on pairs with aUSD, UUSD or USDe. Addresses come from the verified coin
+// groups (set further down) or OTHER_STABLES in .env.
+const stableTally = new StableTally('data/other-stables.json', process.env.REPORT_TZ || 'America/Toronto');
+stableTally.setFromEnv(parseStableEnv(process.env.OTHER_STABLES));
+setInterval(() => timed('realistic totals save', () => { realisticPnl.save(); stableTally.save(); }), 60_000);
+// Every verified practice win goes through here: the normal total, then the
+// live-realistic total and the other-stablecoin counter (both reporting only).
+// `usd` is what the normal total adds (net of gas, only the new part of a
+// re-checked gap), so nothing is counted twice.
+const countVerifiedWin = (usd: number, label: string, win: WinFacts, pairTokens: [string, string]) => {
+      dryRunPnl.recordVerified(usd, label);
+      realisticPnl.record(usd, win);
+      stableTally.noteWin(pairTokens, win.startToken, usd);
+};
 // Save on shutdown too: pm2 restart/stop (every deploy) sends SIGINT, and the
 // last minute of would-have-earned figures used to be lost each time.
 for (const sig of ['SIGINT', 'SIGTERM'] as const) {
       process.once(sig, () => {
             try { dryRunPnl.save(); } catch { /* best effort */ }
+            try { realisticPnl.save(); stableTally.save(); } catch { /* best effort */ }
             try { gasModel.calibration.maybeSave(true); } catch { /* best effort */ }
             try { robinhoodWatcher.save(WATCH_FILE); } catch { /* best effort */ }
             try { routeScores.save(ROUTE_FILE); } catch { /* best effort */ }
@@ -1370,21 +1444,52 @@ const loopCfg = loopConfigFromEnv();
 //   LOOP_SCAN_SLICE_MS         longest single slice of a loop scan (default 8 ms)
 // LOOP_TRADER off (the default) = all off, nothing below runs.
 const loopFix = loopFixFromEnv();
+// Which node loop practice checks run on (LOOP_CHECK_NODE, core/loopNode.ts).
+// LOOP_CHECK_RPC pointing at a configured checking node (main or its
+// backup, QuickNode, Alchemy, SIM_RPC_ROBINHOOD) would undo the whole
+// point (keep the paid nodes for 2-pool checks): refuse it, use the free node.
+// (Read here, before both loop set-ups below; same rules as before.)
+const loopNodeCfgShared = (() => {
+      if (!loopCfg.enabled) return null;
+      const cfg = loopNodeFromEnv(process.env);
+      const mainCheckUrls = [checkPlan?.main.url, checkPlan?.fallback?.url,
+            wssToHttps(process.env.QUICKNODE_RPC_ROBINHOOD) || process.env.QUICKNODE_RPC_ROBINHOOD,
+            process.env.ROBINHOOD_RPC_HTTP, process.env.SIM_RPC_ROBINHOOD]
+            .filter((u): u is string => !!u).map((u) => u.trim().replace(/\/+$/, '').toLowerCase());
+      if (cfg.customUrl && mainCheckUrls.includes(cfg.customUrl.trim().replace(/\/+$/, '').toLowerCase())) {
+            console.warn('[loop] LOOP_CHECK_RPC is one of the checking nodes: using the free public node for loops instead');
+            cfg.customUrl = null;
+            cfg.label = 'free public node';
+      }
+      return cfg;
+})();
+// LOOP WORKER (core/loopWorkerHost.ts, Oct 15, owner approved): the loop
+// trader runs in its own thread so loop scans never freeze the main thread
+// (trade feed, 2-pool trades). On by default with LOOP_TRADER=1;
+// LOOP_WORKER=0 = loops in the main thread exactly as before. The worker
+// only supports loop checks on their own node (LOOP_CHECK_NODE=free, the
+// default); with LOOP_CHECK_NODE=main loops stay in the main thread.
+const loopWorkerOn = loopCfg.enabled && loopWorkerFromEnv(process.env) && loopNodeCfgShared?.mode !== 'main';
+if (loopCfg.enabled && loopWorkerFromEnv(process.env) && !loopWorkerOn) console.log('[loop] LOOP_CHECK_NODE=main: loop worker not used, loops run in the main thread (old behaviour)');
+let loopWorker: LoopWorkerHost | null = null;
 // Feed trades no block has confirmed yet (pool, direction, size, hash, feed
 // order), plus the order of every feed transaction. Only filled when real
 // prices or trigger replay are on (see onFeedEvent). Loops price a pool as
 // its confirmed state plus its still-pending trades (core/loopPrices.ts).
 const loopTriggers = new PendingTrades(loopFix.pendingMaxMs);
-const loopTriggersOn = loopCfg.enabled && (loopFix.realPrices || loopFix.triggerReplay);
+// Main-thread book (LOOP_WORKER=0) or notes forwarded to the loop worker.
+const loopTriggersOn = loopCfg.enabled && !loopWorkerOn && (loopFix.realPrices || loopFix.triggerReplay);
+const loopWorkerTriggersOn = loopWorkerOn && (loopFix.realPrices || loopFix.triggerReplay);
 let requestLoopScan: () => void = () => {};
-let loopHourText: () => string | undefined = () => undefined;
+// The hourly report waits for this (the loop worker answers by message).
+let loopHourText: () => Promise<string | undefined> | string | undefined = () => undefined;
 // EXTRA SINGLE POOLS for the loop finder (core/loopExtraPools.ts). Created
 // further down, next to the chain-wide scan, only when LOOP_TRADER=1 (and
 // LOOP_EXTRA_POOLS is not 0). null = off: the block reader, gap scanner and
 // everything else behave exactly as before.
 const loopExtraCfg = loopExtraConfigFromEnv(process.env, loopCfg, POOL_MIN_DEPTH_USD);
 let loopExtra: LoopExtraPools | null = null;
-if (loopCfg.enabled) {
+if (loopCfg.enabled && !loopWorkerOn) {
       const usdRhLoop = (t: string) => priceOracle.getUsdPrice('robinhood', t);
       let loopLogTimes: number[] = [];
       // LOOP_TRIGGER_REPLAY: one loop practice check, tested RIGHT AFTER the
@@ -1408,20 +1513,9 @@ if (loopCfg.enabled) {
       //     the checking node (simInFlight.robinhood), only starts when the
       //     2-pool line is idle, and frees its slot (and starts any waiting
       //     2-pool check) when done.
-      const loopNodeCfg = loopNodeFromEnv(process.env);
+      // Read above (loopNodeCfgShared), same rules as before.
+      const loopNodeCfg = loopNodeCfgShared!;
       const loopOnMain = loopNodeCfg.mode === 'main';
-      // LOOP_CHECK_RPC pointing at a configured checking node (main or its
-      // backup, QuickNode, Alchemy, SIM_RPC_ROBINHOOD) would undo the whole
-      // point (keep the paid nodes for 2-pool checks): refuse it, use the free node.
-      const mainCheckUrls = [checkPlan?.main.url, checkPlan?.fallback?.url,
-            wssToHttps(process.env.QUICKNODE_RPC_ROBINHOOD) || process.env.QUICKNODE_RPC_ROBINHOOD,
-            process.env.ROBINHOOD_RPC_HTTP, process.env.SIM_RPC_ROBINHOOD]
-            .filter((u): u is string => !!u).map((u) => u.trim().replace(/\/+$/, '').toLowerCase());
-      if (loopNodeCfg.customUrl && mainCheckUrls.includes(loopNodeCfg.customUrl.trim().replace(/\/+$/, '').toLowerCase())) {
-            console.warn('[loop] LOOP_CHECK_RPC is one of the checking nodes: using the free public node for loops instead');
-            loopNodeCfg.customUrl = null;
-            loopNodeCfg.label = 'free public node';
-      }
       const loopGuard = new LoopNodeGuard(loopNodeCfg);
       const loopNodeBudget = loopOnMain ? null : budgetForUrl(loopNodeCfg.customUrl ?? 'https://rpc.mainnet.chain.robinhood.com');
       // Free mode: every loop request passes the throttle first (loops' own
@@ -1620,6 +1714,116 @@ if (loopCfg.enabled) {
       console.log(`[loop] loop trader ON (practice only, never sends): 3-${loopCfg.maxPools} pools, up to ${loopCfg.maxCycles} loops, max $${loopCfg.maxTradeUsd}, bar $${loopCfg.minNetUsd}, ${loopCfg.checksPerMin} checks/min`);
 }
 
+// ==========================================================================
+// LOOP TRADER IN ITS OWN THREAD (LOOP_WORKER, default on with LOOP_TRADER=1;
+// core/loopWorkerHost.ts, core/loopWorkerEntry.ts). Same loop trader, same
+// switches, same practice checks on the loop node, same report lines. The
+// main thread only sends the loop pools that changed (at most one message
+// every 50 ms) and answers the worker's "may I use the free node?" questions.
+// PRACTICE ONLY: the worker has no wallet and no sender.
+// ==========================================================================
+if (loopWorkerOn) {
+      const usdRhLoop = (t: string) => priceOracle.getUsdPrice('robinhood', t);
+      const loopNodeCfg = loopNodeCfgShared!;
+      // The free node's shared allowance (price reads for 2-pool trades use it too).
+      const loopNodeBudget = budgetForUrl(loopNodeCfg.customUrl ?? 'https://rpc.mainnet.chain.robinhood.com');
+      // Only if the cache is really keeping the confirmed view (same rule as before).
+      const realPricesOn = loopFix.realPrices && cache.confirmedOn;
+      // Pool address -> the cache's own key, worked out once (bounded).
+      const loopCacheKeys = new Map<string, string>();
+      const feeder = new MainLoopFeeder({
+            watchedPairs: () => robinhoodWatcher.watchedPairPools(),
+            extraKeys: () => loopExtra ? loopExtra.keys() : null,
+            main: (k) => cache.get('robinhood', k),
+            confirmed: (k) => cache.getConfirmed('robinhood', k),
+            info: (k) => cache.confirmedInfo('robinhood', k),
+            // The same three in one lookup (what the feeder really uses).
+            view: (k, out) => {
+                  let ck = loopCacheKeys.get(k);
+                  if (ck === undefined) { ck = cache.cacheKey('robinhood', k); if (loopCacheKeys.size > 50_000) loopCacheKeys.clear(); loopCacheKeys.set(k, ck); }
+                  cache.readLoopViewKey(ck, out);
+            },
+            realPrices: realPricesOn,
+            usdOf: usdRhLoop,
+            decimalsOf: (t) => TOKEN_DECIMALS.robinhood?.[t.toLowerCase()],
+            symbolOf: (t) => symbolOf('robinhood', t),
+            tradable: (t) => safetyGate.isAllowed(t),
+            practiceDex: (dex) => canPracticeTest(dex),
+            gasUsd: (hops) => gasModel.loopUsd(hops, 0.05),
+            rivalPools: () => rivalWatch.loopRoutePools(Date.now() - 24 * 3600_000),
+            balance: (p, token) => realBalanceOf(p, token),
+            // Daily allowance of the loop node under 80% (same rule as before).
+            budgetOk: () => !loopNodeBudget || loopNodeBudget.share() < 0.8,
+            head: () => currentHeadBlock(),
+            bases: [ROBINHOOD_TOKENS.WETH, ROBINHOOD_TOKENS.USDG],
+            now: Date.now,
+      });
+      const host = new LoopWorkerHost({
+            init: {
+                  t: 'init', loopCfg, fix: loopFix, realPricesOn,
+                  triggersOn: loopFix.realPrices || loopFix.triggerReplay,
+                  extraOn: loopExtraCfg.enabled,
+                  bases: [ROBINHOOD_TOKENS.WETH, ROBINHOOD_TOKENS.USDG],
+                  minDepthUsd: POOL_MIN_DEPTH_USD,
+                  node: {
+                        cfg: loopNodeCfg, maxRps: loopMaxRpsFromEnv(), freeUrl: 'https://rpc.mainnet.chain.robinhood.com',
+                        weth: ROBINHOOD_TOKENS.WETH, slotsFile: 'data/balance-slots.json',
+                        // Loop checks poll for the trigger less often (300 ms, up to 6 times), as before.
+                        triggerPollMs: 300, triggerMaxPolls: 6,
+                        sharedBudget: !!loopNodeBudget,
+                  },
+                  statsMs: 30_000, peekMs: 15 * 60_000, logPerMin: 60,
+            },
+            feeder,
+            // Same rule as LoopNodeThrottle.sharedHasRoom (core/loopNode.ts):
+            // nobody waiting, under half the speed limit used in the last
+            // second, almost all slots free. A yes is counted in the shared
+            // allowance (as the loop request used to be), so price reads keep
+            // their room. Never waits (a slot is free when it says yes).
+            permit: () => {
+                  if (!loopNodeBudget) return true;
+                  const h = loopNodeBudget.headroom();
+                  const ok = h.pending === 0 && h.usedLastSec < 0.5 * h.rps && h.tokens >= Math.max(1, h.rps - 2);
+                  if (ok) void loopNodeBudget.take(1).catch(() => undefined);
+                  return ok;
+            },
+            // LOOP_MODEL_VS_CHECK: real loop gas from replays teaches the gas model (loop kinds only).
+            noteGas: (pools, gasUsed) => { gasModel.notePractice(loopKey(pools), gasUsed); },
+            log: (m) => console.log(m),
+            warn: (m) => console.warn(m),
+            heapMb: loopWorkerHeapMbFromEnv(),
+            // The worker answered after the hourly report gave up (3 s): the
+            // report said "no numbers", the plain line for the status page is still written.
+            onLateHour: (r) => console.log(loopLogLine(r.h, loopCfg.maxPools, 'hour', r.node) + ' (arrived late)'),
+      });
+      loopWorker = host;
+      host.start();
+      process.once('exit', () => host.stop());
+      requestLoopScan = () => host.requestScan();
+      // 5 s safety net, through the same 50 ms queue as every other loop scan.
+      setInterval(() => requestLoopScan(), 5_000);
+      // Race comparison: every rival trade the rival watch saves.
+      rivalWatch.onRecord = (rec) => host.noteRival({ bot: rec.bot, pools: rec.pools, route: rec.route, grossUsd: rec.grossUsd, gasUsd: rec.gasUsd, failed: rec.failed, t: rec.t });
+      registerSize('loop cycles', () => host.stats?.cycles ?? 0);
+      registerSize('loop confirmed states', () => cache.confirmedCount());
+      registerSize('loop worker pools', () => host.stats?.pools ?? 0);
+      registerMemNote('loop worker', () => host.stats ? `loop worker heap ${Math.round(host.stats.heapUsed / 1_048_576)} MB${host.alive ? '' : ' (restarting)'}` : null);
+      // Hourly: the worker takes the hour's numbers ONCE (and starts a new
+      // hour); the same "[loop] hour:" line and Telegram block as before.
+      loopHourText = async () => {
+            const r = await host.takeHour();
+            if (!r) {
+                  console.log('[loop] hour: no numbers (loop worker not answering or restarting)');
+                  return 'Loop trades: no numbers this hour (loop worker restarting)';
+            }
+            console.log(loopLogLine(r.h, loopCfg.maxPools, 'hour', r.node));
+            return formatLoopHour(r.h, loopCfg.maxPools, loopExtra?.status(loopCfg.maxPoolAgeMs) ?? null) + `\n  ${r.node}`;
+      };
+      console.log(`[loop] fix phase 2: real prices ${realPricesOn ? 'on' : 'off'}, keep block updates ${loopFix.keepBlockUpdates ? 'on' : 'off'}, trigger replay ${loopFix.triggerReplay ? 'on' : 'off'}, model vs check ${loopFix.modelVsCheck ? 'on' : 'off'}, cheap scan ${loopFix.cheapScan ? 'on' : 'off'}`);
+      console.log(`[loop] loop checks on the ${loopNodeCfg.label} (main checking node kept for 2-pool checks only), up to ${Number.isFinite(loopNodeCfg.dailyCap) ? loopNodeCfg.dailyCap : 'unlimited'} a day`);
+      console.log(`[loop] loop trader ON in its own thread (LOOP_WORKER, practice only, never sends): 3-${loopCfg.maxPools} pools, up to ${loopCfg.maxCycles} loops, max $${loopCfg.maxTradeUsd}, bar $${loopCfg.minNetUsd}, ${loopCfg.checksPerMin} checks/min, worker memory limit ${loopWorkerHeapMbFromEnv()} MB`);
+}
+
 // Research lane hour summary for the hourly report (also one log line).
 // undefined when the lane is off or RESEARCH_TELEGRAM=0.
 function researchHourText(): string | undefined {
@@ -1644,6 +1848,10 @@ const fireTrade = async (o: {
       // that turned out too small), the difference comes off here before it
       // becomes the contract's profit floor.
       plannedLoanPips: number;
+      // What the practice check said (sitting gaps). The outlier guard looks at
+      // the bigger of this and netProfitUsd, so a $785 check result can't slip
+      // past it just because the model said $15.
+      checkedProfitUsd?: number;
 }) => {
       try {
             // Hard stop: never build a trade on an exchange that isn't cleared
@@ -1708,6 +1916,36 @@ const fireTrade = async (o: {
                   } else if (dry.funding !== 'v3-flash') {
                         block('no approved flash lender for this token');
                         return;
+                  }
+                  // OUTLIER GUARD (core/outlierGuard.ts, Oct 15). A profit that is too
+                  // good to be true (over $50, or over 2% of the trade and over $20) is
+                  // sent only if it is paid in USDG/WETH and a second check on another
+                  // node agrees at full and half size. Normal wins skip this entirely.
+                  // LIVE trigger trades: the second check runs on the latest block, where
+                  // the trade we follow hasn't landed yet, so it will almost never
+                  // confirm. That makes this a deliberate cap by policy: trigger
+                  // trades above the outlier line are not sent live.
+                  const guardUsd = Math.max(netProfitUsd, o.checkedProfitUsd ?? 0);
+                  if (isOutlier(guardUsd, o.tradeSizeUsd, OUTLIER_CFG)) {
+                        const builtAt = Date.now();
+                        const v = await confirmRhOutlier(o.tokenIn, dry.hops, dry.amountIn, dry.minProfit, lender?.poolAddress);
+                        markStretch('outlier second check');
+                        // The deadline (maxBlock) was set when the trade was built. If the
+                        // second check took over 1 s, the deadline may be too close: don't send.
+                        const tookMs = Date.now() - builtAt;
+                        if (v.ok && tookMs > Number(process.env.OUTLIER_MAX_DELAY_MS ?? 1000)) {
+                              console.log(`[outlier] LIVE NOT SENT: ${symbolOf(o.chain, o.tokenIn)}/${symbolOf(o.chain, o.tokenOut)} confirmed but the check took ${tookMs} ms (deadline too close)`);
+                              block('outlier profit, second check too slow (deadline)');
+                              liveTradeLog.noteBlocked('outlier profit, second check too slow (deadline)');
+                              return;
+                        }
+                        if (!v.ok) {
+                              console.log(`[outlier] LIVE NOT SENT${o.source === 'trade' ? ' (trigger outlier: capped by policy)' : ''}: ${symbolOf(o.chain, o.tokenIn)}/${symbolOf(o.chain, o.tokenOut)} $${guardUsd.toFixed(2)} on $${Math.round(o.tradeSizeUsd)} (${'reason' in v ? v.reason : 'refused'})`);
+                              block('outlier profit (too good to be true), second check failed');
+                              liveTradeLog.noteBlocked('outlier profit (too good to be true), second check failed');
+                              return;
+                        }
+                        console.log(`[outlier] live send allowed: $${netProfitUsd.toFixed(2)} on $${Math.round(o.tradeSizeUsd)}, ${v.detail}`);
                   }
             }
             if (o.chain !== 'robinhood') {
@@ -1872,6 +2110,7 @@ if (event.chain === 'robinhood') {
       // Loop trader (only when on): the feed's order of transactions, to know
       // which pending trades a block read already includes.
       if (loopTriggersOn) loopTriggers.noteFeedTx((event.raw as any)?.hash);
+      else if (loopWorkerTriggersOn) loopWorker?.noteFeedTx((event.raw as any)?.hash); // loop worker: one array push
       // The rival tracker needs the SENDER, which costs a signature check
       // (~1-2 ms). Done on the next turn, after this frame's trades have been
       // decided, so it never delays our own decision (FEED_LAZY_SENDER=0: old order).
@@ -2006,6 +2245,7 @@ if (registerIfApproved('avalanche', entry.dex, resolved)) pool = resolved;
                 // Loop trader (only when on): remember this trade for the next
                 // loop scan (its predicted effect + its hash for the replay check).
                 if (loopTriggersOn) loopTriggers.note(after.poolAddress, { hash: (event.raw as any)?.hash, inIsA, amountIn: swap.amountIn, at: Date.now() });
+                else if (loopWorkerTriggersOn) loopWorker?.noteTrade(after.poolAddress, { hash: (event.raw as any)?.hash, inIsA, amountIn: swap.amountIn, at: Date.now() });
                 requestGapScan();
           }
     }
@@ -2471,6 +2711,9 @@ await chainManager.startAll();
                   const openNow = new Set(gaps.map((g) => `${g.buyPool.poolAddress}>${g.sellPool.poolAddress}`));
                   for (const k of gapConfirmedOpen.keys()) if (!openNow.has(k)) gapConfirmedOpen.delete(k);
                   for (const k of [...gapCredit.keys()]) if (!openNow.has(k)) gapCredit.closed(k);
+                  // Other-stablecoin counter (reporting only): gaps on aUSD/UUSD/USDe pairs,
+                  // from this scan's results already in memory (no node requests).
+                  stableTally.noteGaps(gaps.map((g) => ({ key: `${g.buyPool.poolAddress}>${g.sellPool.poolAddress}`, tokens: [g.base, g.quote] as [string, string], modelUsd: g.profitUsd })));
                   let fired = 0;
                   for (const g of gaps) {
                         if (fired >= 2) break;
@@ -2551,7 +2794,11 @@ await chainManager.startAll();
                         // Same open gap re-checked after it doubled: only the growth is new
                         // money (one trade takes the gap once). First time: all of it.
                         const gapNew = gapCredit.credit(key, simNet);
-                        if (gapVetted && gapNew >= MIN_COUNTED_USD) dryRunPnl.recordVerified(gapNew, `${label} gap`);
+                        // Outliers (too good to be true, e.g. the $785 USDG/ORBIO gap) count
+                        // only after a second check agrees (core/outlierGuard.ts).
+                        if (gapVetted && gapNew >= MIN_COUNTED_USD && await outlierCountOk(`${label} gap`, simNet, g.sizeUsd, check.trade)) {
+                              countVerifiedWin(gapNew, `${label} gap`, { startToken: g.quote, sizeUsd: g.sizeUsd, lender: check.trade.v3Lender }, [g.base, g.quote]);
+                        }
                         if (gapNew > 0) profitBands.add(gapNew, torontoDay());
                         if (gapNew < simNet) console.log(`[gap] ${label}: same open gap grew, counted only the extra $${gapNew.toFixed(2)} of $${simNet.toFixed(2)}`);
                         // Would we really have won it? (ready = after our check + ~2 ms to sign)
@@ -2564,6 +2811,7 @@ await chainManager.startAll();
                               seenAtMs: robinhoodWatcher.lastRefreshMs || Date.now(), source: 'gap',
                               // Fee of the lender the practice check used (already in simNet).
                               plannedLoanPips: check.loanPips,
+                              checkedProfitUsd: simNet,
                         });
                         markStretch('gap check result');
                   }
@@ -3054,6 +3302,8 @@ await chainManager.startAll();
       const SYMBOLS_FILE = 'data/token-symbols.json';
       let tokenGroups: TokenGroupsResult | null = loadTokenGroups(GROUPS_FILE);
       if (tokenGroups) console.log(`[groups] ${groupsStatusLine(tokenGroups)} (saved list)`);
+      // Other-stablecoin counter: learn aUSD/UUSD/USDe addresses from the verified "Dollars" group.
+      stableTally.addFromGroups(tokenGroups?.members);
 
       // LOOP MONITOR (LoopMonitor in core/crossQuoteMonitor.ts): best 3-pool
       // loop per token across all verified coins, after all three real fees.
@@ -3100,6 +3350,7 @@ await chainManager.startAll();
                               // Coin names file read / written in bites (REBUILD_PACED=0: one go).
                               rebuildPaced: REBUILD_PACED,
                         }));
+                        stableTally.addFromGroups(tokenGroups?.members); // new list: refresh the coin addresses
                   }
                   const quotes = tokenGroups!.members.map((m) => ({ token: m.token, symbol: m.symbol, group: m.group, priceUsd: m.priceUsd }));
                   const n = await timedAsync('loop monitor setup', () => loopMonitor.setup(pools, quotes, Number(process.env.LOOP_TOKENS ?? 80), undefined, { paced: REBUILD_PACED }));
@@ -3390,6 +3641,9 @@ for (let i = 0; i < resolved.length; i++) {
                         const rpcNote = `, prices on ${rpc.onFast ? 'fast node' : 'paid node (fast node resting)'}${rpc.switches ? ` (${rpc.switches} switch${rpc.switches === 1 ? '' : 'es'} to paid node since start)` : ''}`;
                         const pnlNote = `, ${dryRunPnl.line()}`;
                         console.log(`[pnl] ${dryRunPnl.line()}`);
+                        // Status page reads these two (deploy/status-report.js realisticLines).
+                        for (const l of realisticPnl.lines()) console.log(`[pnl-real] ${l}`);
+                        console.log(`[stables] ${stableTally.line()}`);
                         note = `watching ${st.pairs} pair${st.pairs === 1 ? '' : 's'}, ${st.pools} pools${tot ? `, ${localPct}% instant prices` : ''}${fireNote}${rivalNote}${gapNote}${liveNote}${rpcNote}${pnlNote}`;
                   }
                   return { chain, spreads, noMatchCount, note };
@@ -3418,6 +3672,8 @@ for (let i = 0; i < resolved.length; i++) {
                         // New pools this hour (core/newPoolWatch.ts), also one line for the status page.
                         const hourNewPools = newPoolWatchRef?.takeHour() ?? null;
                         if (hourNewPools && newPoolWatchRef) console.log(newPoolWatchRef.statusLine(hourNewPools));
+                        // Loop numbers: from the loop worker by message when it runs (waits up to 3 s).
+                        const loopsHour = await loopHourText();
                         await sendTelegramMessage(formatPlainHourly({
                               windowLabel: `${hhmm(lastDigestAt)} to ${hhmm(now)}`,
                               live: robinhoodSender.live,
@@ -3446,6 +3702,9 @@ for (let i = 0; i < resolved.length; i++) {
                                     weekChecked: pnl.last7.verifiedUsd,
                                     todayBigUsd: pnl.today.bigUsd ?? 0, todayBigCount: pnl.today.bigCount ?? 0, best: pnl.today.best,
                               },
+                              // Live-realistic total + what it left out, and the other-stablecoin line (reporting only).
+                              realistic: realisticPnl.lines(),
+                              otherStables: stableTally.line(),
                               reactionMs: { typical: stats.medianReactionMs, slowest5pct: stats.p95ReactionMs },
                               otherBots: { timed: rv.found, theirMs: rv.theirMedianMs, oursMs: rv.ourMedianMs, weBeat: rv.beatCount },
                               rivalWins: { ...rivalWatch.takeHour(), botsKnown: rivalWatch.botCount(), botsVerified: rivalWatch.botStatus().verified },
@@ -3464,7 +3723,7 @@ for (let i = 0; i < resolved.length; i++) {
                               simOutcomes: simBuckets.plain(),
                               research: researchHourText(),
                               venueTests: venueTally.hourText() ?? undefined,
-                              loops: loopHourText(),
+                              loops: loopsHour,
                               memory: memReport?.hourLine(),
                               speed: (({ median, p95 }) => ({ median, p95 }))(stageTimers.take('hour')),
                               // Stall finder: freezes this hour and what caused them (core/stallFinder.ts).

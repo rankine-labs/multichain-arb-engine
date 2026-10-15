@@ -47,6 +47,24 @@ export function registerSize(name: string, getter: () => number): void {
 // Forget all registered lists (used by the tests).
 export function clearSizes(): void {
   sizeGetters.clear();
+  extraNotes.clear();
+}
+
+// Extra short notes added to the end of the memory lines, e.g. the loop
+// worker's own memory: "loop worker heap 45 MB" (the loop worker is a
+// separate thread with its own memory, not part of "heap used" above).
+// The getter returns null when there is nothing to say (e.g. worker off).
+const extraNotes = new Map<string, () => string | null>();
+export function registerMemNote(name: string, getter: () => string | null): void {
+  extraNotes.set(name, getter);
+}
+// All notes joined with " · " ('' when none). A note that throws is left out.
+export function readMemNotes(): string {
+  const parts: string[] = [];
+  for (const g of extraNotes.values()) {
+    try { const t = g(); if (t) parts.push(t); } catch { /* left out */ }
+  }
+  return parts.join(' · ');
 }
 
 // Read every registered size. A getter that throws (or returns junk) shows
@@ -95,16 +113,20 @@ export class MemReporter {
   line(): string {
     const m = this.sample();
     const sizes = readSizes();
+    const notes = readMemNotes();
     return `[mem] rss ${mb(m.rss)} MB · heap used ${mb(m.heapUsed)} / total ${mb(m.heapTotal)} / limit ${mb(this.heapLimit())} MB`
       + ` · external ${mb(m.external)} MB · buffers ${mb(m.arrayBuffers)} MB`
       + ` · peak rss ${mb(this.peakRss)} MB, peak heap used ${mb(this.peakHeapUsed)} MB`
+      + (notes ? ` · ${notes}` : '')
       + (sizes ? ` · sizes: ${sizes}` : '');
   }
 
   // One short line for the hourly Telegram report.
   hourLine(): string {
     const m = this.sample();
-    return `Memory: rss ${mb(m.rss)} MB (peak ${mb(this.peakRss)}), real data (heap used) ${mb(m.heapUsed)} MB, heap limit ${mb(this.heapLimit())} MB`;
+    const notes = readMemNotes();
+    return `Memory: rss ${mb(m.rss)} MB (peak ${mb(this.peakRss)}), real data (heap used) ${mb(m.heapUsed)} MB, heap limit ${mb(this.heapLimit())} MB`
+      + (notes ? `, ${notes}` : '');
   }
 }
 
