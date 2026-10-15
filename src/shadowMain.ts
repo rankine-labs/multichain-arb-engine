@@ -72,7 +72,7 @@ function symbolOf(chain: string, address: string): string {
     if (known) return known;
     return `${address.slice(0, 6)}...${address.slice(-4)}`;
 }
-import { formatSkippedOpportunity, formatHourlyDigest, formatDailyReport, formatStartup, formatExecutionWarning, DigestSection, DigestSpread, formatPlainHourly, formatPlainDaily, formatRivalDaily, formatMarketOpenReport, formatLoopReport } from './core/telegramFormatter';
+import { formatSkippedOpportunity, formatHourlyDigest, formatDailyReport, formatStartup, formatExecutionWarning, DigestSection, DigestSpread, PlainHourlyInput, formatPlainDaily, formatRivalDaily, formatMarketOpenReport, formatLoopReport } from './core/telegramFormatter';
 import { RobinhoodChainAdapter } from './chains/robinhoodChain';
 import { MonadAdapter } from './chains/monad';
 import { AvalancheAdapter } from './chains/avalanche';
@@ -153,6 +153,11 @@ import { loadStartPairs, saveStartPairs } from './core/seedPairs';
 import { DryRunPnl } from './core/dryRunPnl';
 import { RealisticPnl, readStartCoins, WinFacts } from './core/realisticPnl';
 import { StableTally, parseStableEnv } from './core/stableTally';
+// Hourly report version 2 (Oct 15, reporting only): money ledgers, the new
+// plain hourly message and the 4-hour accumulator (src/report/).
+import { MoneyLedgers, RealMoneyLedger } from './report/ledgers';
+import { PeriodStats, WinsTested } from './report/periodStats';
+import { hourlyMessage, reportV2On, hourNumbersFrom, HourlyReportInput, FULL_HOUR_MIN_MS } from './report/hourlyReport';
 import { FailoverJsonRpcProvider } from './core/failoverRpc';
 import { makeCaller } from './core/universeScan';
 import { loadNodeUsage, saveNodeUsage, nodeUsageToday, NodeBudget, budgetForUrl, callsInBody } from './core/nodeBudget';
@@ -1135,13 +1140,27 @@ const realisticPnl = new RealisticPnl('data/realistic-pnl.json', {
 const stableTally = new StableTally('data/other-stables.json', process.env.REPORT_TZ || 'America/Toronto');
 stableTally.setFromEnv(parseStableEnv(process.env.OTHER_STABLES));
 setInterval(() => timed('realistic totals save', () => { realisticPnl.save(); stableTally.save(); }), 60_000);
+// MONEY LEDGERS for the hourly report (src/report/ledgers.ts, reporting only).
+// Checked wins and Could earn live: today / 7 days read from the two practice
+// totals above; the last hour is counted as wins come in. Real money made:
+// confirmed live trades only, saved in data/live-money.json (survives restarts).
+const realMoney = new RealMoneyLedger('data/live-money.json', process.env.REPORT_TZ || 'America/Toronto');
+const moneyLedgers = new MoneyLedgers({
+      checked: () => { const s = dryRunPnl.summary(); return { today: s.today.verifiedUsd, week: s.last7.verifiedUsd }; },
+      couldEarn: () => { const s = realisticPnl.summary(); return { today: s.today.usd, week: s.weekUsd }; },
+}, realMoney);
+// 4-HOUR TOTALS (src/report/periodStats.ts): each hourly report adds its
+// numbers here; the separate 4-hour report reads (take()) them. Saved to disk.
+const periodStats = new PeriodStats('data/period-stats.json');
 // Every verified practice win goes through here: the normal total, then the
 // live-realistic total and the other-stablecoin counter (both reporting only).
 // `usd` is what the normal total adds (net of gas, only the new part of a
 // re-checked gap), so nothing is counted twice.
 const countVerifiedWin = (usd: number, label: string, win: WinFacts, pairTokens: [string, string]) => {
       dryRunPnl.recordVerified(usd, label);
-      realisticPnl.record(usd, win);
+      const realistic = realisticPnl.record(usd, win);
+      // Same win into the hourly report's "last hour" counters (reporting only).
+      moneyLedgers.notePracticeWin(usd, label, realistic === 'ok');
       stableTally.noteWin(pairTokens, win.startToken, usd);
 };
 // Save on shutdown too: pm2 restart/stop (every deploy) sends SIGINT, and the
@@ -1150,6 +1169,7 @@ for (const sig of ['SIGINT', 'SIGTERM'] as const) {
       process.once(sig, () => {
             try { dryRunPnl.save(); } catch { /* best effort */ }
             try { realisticPnl.save(); stableTally.save(); } catch { /* best effort */ }
+            try { realMoney.save(); periodStats.save(); } catch { /* best effort */ }
             try { gasModel.calibration.maybeSave(true); } catch { /* best effort */ }
             try { robinhoodWatcher.save(WATCH_FILE); } catch { /* best effort */ }
             try { routeScores.save(ROUTE_FILE); } catch { /* best effort */ }
@@ -1277,7 +1297,9 @@ const liveTracker = new LiveTradeTracker({
             return px === null || dec === undefined ? null : (Number(raw) / 10 ** dec) * px;
       },
       recordLoss: (usd) => { safetyGate.recordLoss(usd); safetyAlerts.onLoss(safetyGate.lossTodayUsd()); },
-      onResult: (r) => liveTradeLog.result(r),
+      // Every final result: the status page's file, and the hourly report's
+      // "Real money made" ledger (only counted when sending is really live).
+      onResult: (r) => { liveTradeLog.result(r); moneyLedgers.noteRealResult(r, robinhoodSender.live); },
       noteGasUsed: (gas, info) => { robinhoodSender.noteGasUsed(gas); if (info?.routeKey) void noteReceiptGas(info.routeKey, info.hash, gas, info.success); },
       notify: (html) => sendTelegramMessage(html),
       onSettled: (hash) => { safetyGate.releasePending(hash); robinhoodSender.settled(hash); },
@@ -1483,6 +1505,10 @@ const loopWorkerTriggersOn = loopWorkerOn && (loopFix.realPrices || loopFix.trig
 let requestLoopScan: () => void = () => {};
 // The hourly report waits for this (the loop worker answers by message).
 let loopHourText: () => Promise<string | undefined> | string | undefined = () => undefined;
+// The same hour's loop numbers as plain counts (checked / would make money),
+// set by loopHourText when it takes the hour, for the hourly report v2.
+// null = no loop numbers this hour (loop trader off or worker not answering).
+let loopHourNums: WinsTested | null = null;
 // EXTRA SINGLE POOLS for the loop finder (core/loopExtraPools.ts). Created
 // further down, next to the chain-wide scan, only when LOOP_TRADER=1 (and
 // LOOP_EXTRA_POOLS is not 0). null = off: the block reader, gap scanner and
@@ -1696,6 +1722,7 @@ if (loopCfg.enabled && !loopWorkerOn) {
       let loopHourStart = Date.now();
       loopHourText = () => {
             const h = loopTrader.takeHour();
+            loopHourNums = { won: h.wouldMake, tested: h.checked };
             loopHourStart = Date.now();
             const node = loopNodeText({ ...loopGuard.takeHour(), busySkips: loopThrottle.takeBusy() });
             console.log(loopLogLine(h, loopCfg.maxPools, 'hour', node));
@@ -1816,6 +1843,7 @@ if (loopWorkerOn) {
                   console.log('[loop] hour: no numbers (loop worker not answering or restarting)');
                   return 'Loop trades: no numbers this hour (loop worker restarting)';
             }
+            loopHourNums = { won: r.h.wouldMake, tested: r.h.checked };
             console.log(loopLogLine(r.h, loopCfg.maxPools, 'hour', r.node));
             return formatLoopHour(r.h, loopCfg.maxPools, loopExtra?.status(loopCfg.maxPoolAgeMs) ?? null) + `\n  ${r.node}`;
       };
@@ -3651,6 +3679,17 @@ for (let i = 0; i < resolved.length; i++) {
       };
 
       let lastDigestAt = Date.now();
+      // REPORT_V2 (Oct 15, owner approved, default on): the short plain hourly
+      // message (src/report/hourlyReport.ts), sent at the top of each clock
+      // hour. REPORT_V2=0: the old long hourly message, on the old timer,
+      // exactly as before. Either way every hourly counter below is taken
+      // (read and reset) once per report, exactly as before, and the log
+      // lines and status page are unchanged.
+      const REPORT_V2 = reportV2On(process.env);
+      // First report since the bot started: its window is partial.
+      let firstHourlyReport = true;
+      // Free node rests since start, at the last report (to count this hour's).
+      let lastFreeNodeSwitches = robinhoodReadProvider.router.getStats().switches;
       const sendHourlyDigestInner = async () => {
             const now = Date.now();
             try {
@@ -3673,8 +3712,12 @@ for (let i = 0; i < resolved.length; i++) {
                         const hourNewPools = newPoolWatchRef?.takeHour() ?? null;
                         if (hourNewPools && newPoolWatchRef) console.log(newPoolWatchRef.statusLine(hourNewPools));
                         // Loop numbers: from the loop worker by message when it runs (waits up to 3 s).
+                        loopHourNums = null; // set again by loopHourText if this hour has loop numbers
                         const loopsHour = await loopHourText();
-                        await sendTelegramMessage(formatPlainHourly({
+                        // Taken once here (they reset), used by both report versions.
+                        const stallHour = stallFinder.take('hour');
+                        const raceHour = raceChecker.takeHour();
+                        const oldInput: PlainHourlyInput = {
                               windowLabel: `${hhmm(lastDigestAt)} to ${hhmm(now)}`,
                               live: robinhoodSender.live,
                               feedOk: status.robinhood?.online ?? false,
@@ -3727,8 +3770,8 @@ for (let i = 0; i < resolved.length; i++) {
                               memory: memReport?.hourLine(),
                               speed: (({ median, p95 }) => ({ median, p95 }))(stageTimers.take('hour')),
                               // Stall finder: freezes this hour and what caused them (core/stallFinder.ts).
-                              stalls: (() => { const s = stallFinder.take('hour'); return [formatStallLine(s), formatStallDetail(s)].filter(Boolean); })(),
-                              race: raceChecker.takeHour(),
+                              stalls: [formatStallLine(stallHour), formatStallDetail(stallHour)].filter(Boolean),
+                              race: raceHour,
                               funnel: {
                                     tradesRead: funnel.tradesRead, noPool: funnel.noPool, tooSmall: funnel.tooSmall, noPartner: funnel.noPartner,
                                     noUsdPrice: funnel.noUsdPrice, smallerThanFees: funnel.smallerThanFees, found: funnel.found,
@@ -3740,7 +3783,38 @@ for (let i = 0; i < resolved.length; i++) {
                               },
                               topDifferences: [...(rh?.spreads ?? [])].sort((a, b) => b.spreadPct - a.spreadPct)
                                     .map((d) => ({ pair: d.pair, pct: d.spreadPct, buyAt: d.buyDex, sellAt: d.sellDex })),
-                        }));
+                        };
+                        // ---- Hourly report v2 numbers (all already measured above) ----
+                        const moneySnap = moneyLedgers.takePeriod();
+                        // Window: since the last report; the first report after a
+                        // restart starts when the money counters started (bot start).
+                        const fromMs = firstHourlyReport ? Math.min(moneySnap.periodStartMs, lastDigestAt) : lastDigestAt;
+                        const ck = oldInput.checks;
+                        // "waited too long in the check line" (queue time-outs) this hour.
+                        let tooLate = 0;
+                        for (const [why, c] of funnel.skip) if (why.startsWith('waited too long in the check line')) tooLate += c;
+                        const v2Input: HourlyReportInput = {
+                              live: robinhoodSender.live,
+                              tz: REPORT_TZ,
+                              tzLabel: REPORT_TZ === 'America/Toronto' ? 'Toronto' : REPORT_TZ,
+                              restarted: firstHourlyReport && now - fromMs < FULL_HOUR_MIN_MS,
+                              money: { ...moneySnap, periodStartMs: fromMs, periodEndMs: now },
+                              startLabel: realisticPnl.cfg.startLabel,
+                              normal: oldInput.checksAvailable || ck.done > 0 ? { won: ck.makeMoney, tested: ck.done } : null,
+                              loop: loopHourNums,
+                              races: { won: raceHour.won, lost: raceHour.lost, unclear: raceHour.unclear, pending: raceHour.pending },
+                              feedOk: status.robinhood ? status.robinhood.online : null,
+                              reactionMs: stats.medianReactionMs,
+                              tooLate,
+                              longestFreezeMs: stallHour.enabled ? stallHour.worstMs : null,
+                              // Checking node "slow down" answers + free node rests, this hour.
+                              nodeErrors: simStats.rateLimited + Math.max(0, rpc.switches - lastFreeNodeSwitches),
+                        };
+                        lastFreeNodeSwitches = rpc.switches;
+                        // The 4-hour report's running totals (both versions, never blocks the send).
+                        try { periodStats.add(hourNumbersFrom(v2Input)); } catch (err) { console.warn('[report] 4-hour totals add failed (ignored):', (err as Error).message); }
+                        console.log(`[report] hourly ${REPORT_V2 ? 'v2' : 'v1'}: checked ${moneySnap.checked.lastHour.toFixed(2)}, could earn live ${moneySnap.couldEarn.lastHour.toFixed(2)}, real ${moneySnap.real.lastHour.toFixed(2)}`);
+                        await sendTelegramMessage(hourlyMessage(REPORT_V2, v2Input, oldInput));
                   } else await sendTelegramMessage(formatHourlyDigest({
                         windowLabel: `${hhmm(lastDigestAt)} to ${hhmm(now)}`,
                         chains: (['avalanche', 'monad', 'robinhood'] as const).filter(chainOn).map((chain) => ({
@@ -3777,11 +3851,21 @@ for (let i = 0; i < resolved.length; i++) {
                   gapStats.found = 0; gapStats.bestUsd = 0; gapStats.fake = 0; gapStats.fail = 0;
                   liveTracker.reset();
                   lastDigestAt = now;
+                  firstHourlyReport = false;
             }
       };
       // Building the report is timed by the stall finder too.
       const sendHourlyDigest = () => timedAsync('hourly report', sendHourlyDigestInner);
-      setInterval(sendHourlyDigest, 60 * 60 * 1000);
+      if (REPORT_V2) {
+            // Top of each clock hour (+1 s so the time reads 15:00, not 14:59).
+            // Recomputed every time, so it never drifts.
+            const scheduleNextHourly = () => {
+                  const t = Date.now();
+                  const next = Math.floor(t / 3_600_000) * 3_600_000 + 3_600_000 + 1_000;
+                  setTimeout(() => { scheduleNextHourly(); void sendHourlyDigest(); }, next - t);
+            };
+            scheduleNextHourly();
+      } else setInterval(sendHourlyDigest, 60 * 60 * 1000);
       // Stage timers: where the fire-ready time goes, every 5 min (median, then slowest 5%).
       setInterval(labelled('stall report', () => {
             const sp = stageTimers.take('fiveMin');
