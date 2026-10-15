@@ -83,8 +83,10 @@ export class WinSizes {
   today = WIN_BARS.map(() => 0);
   todayUsd = WIN_BARS.map(() => 0); // money at each bar (sum of wins >= bar)
   private day: string;
-  constructor(private readonly now: () => number = Date.now) { this.day = this.dayKey(); }
-  private dayKey() { return new Date(this.now()).toISOString().slice(0, 10); }
+  // tz: whose calendar "today" follows. Default UTC (as before); the bot passes
+  // Toronto so this "today" matches the rest of the hourly report.
+  constructor(private readonly now: () => number = Date.now, private readonly tz = 'UTC') { this.day = this.dayKey(); }
+  private dayKey() { return new Date(this.now()).toLocaleDateString('en-CA', { timeZone: this.tz }); }
 
   add(netUsd: number) {
     if (this.dayKey() !== this.day) { this.day = this.dayKey(); this.today = WIN_BARS.map(() => 0); this.todayUsd = WIN_BARS.map(() => 0); }
