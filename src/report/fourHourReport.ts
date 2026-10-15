@@ -1,6 +1,7 @@
 import type { PeriodTotals } from './fourHourStats';
 import type { RivalSummary } from '../core/rivalWatch';
 import type { NewPoolSummary } from '../core/newPoolWatch';
+import { plainRoute } from './hourlyReport';
 
 // ============================================================================
 // FOUR-HOUR REPORT (formatter only, reporting only)
@@ -155,7 +156,8 @@ function moneySection(i: FourHourInput): string[] {
     row('Wins: normal', `${w.n} (${money(w.usd)})`),
     row('Wins: loops', loops ? `${loops.wouldMake} (${money(loops.wouldMakeUsd)}, tests only, not in total)` : s.loopsOn ? NA : 'off'),
     row('Average win', w.n ? money(w.usd / w.n) : NA),
-    row('Biggest win', w.best ? `${money(w.best.usd)} ${w.best.label}` : NA),
+    // Same plain route names as the hourly ("WETH Uniswap V3 → Ramses V3").
+    row('Biggest win', w.best ? `${money(w.best.usd)} ${plainRoute(w.best.label)}` : NA),
     row('Gas per trade', s.gasPerTradeUsd === null ? NA : `${cents(s.gasPerTradeUsd)} (estimated, already taken off)`),
     row('Loans', s.loansOn ? 'on (loan fees: n/a, not measured)' : 'off (own money)'),
   ];
