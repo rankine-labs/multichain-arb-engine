@@ -87,7 +87,7 @@ const askPermit = (): Promise<boolean> => new Promise((resolve) => {
   const id = ++permitId;
   const timer = setTimeout(() => { if (permitWaiters.delete(id)) resolve(false); }, 1_000);
   permitWaiters.set(id, (ok) => { clearTimeout(timer); resolve(ok); });
-  post({ t: 'permit', id });
+  post({ t: 'permit', id, at: Date.now() });
 });
 
 // ---- State ------------------------------------------------------------------

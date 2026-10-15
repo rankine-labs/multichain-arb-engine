@@ -1721,6 +1721,9 @@ if (loopWorkerOn) {
             log: (m) => console.log(m),
             warn: (m) => console.warn(m),
             heapMb: loopWorkerHeapMbFromEnv(),
+            // The worker answered after the hourly report gave up (3 s): the
+            // report said "no numbers", the plain line for the status page is still written.
+            onLateHour: (r) => console.log(loopLogLine(r.h, loopCfg.maxPools, 'hour', r.node) + ' (arrived late)'),
       });
       loopWorker = host;
       host.start();

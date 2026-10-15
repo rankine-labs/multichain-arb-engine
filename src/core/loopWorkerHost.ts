@@ -50,6 +50,11 @@ export interface LoopWorkerHostOptions {
   now?: () => number;
   createWorker?: (file: string, heapMb: number) => WorkerLike;
   onAck?: (seq: number, digest: string | undefined) => void; // tests
+  // The hour's numbers arrived after takeHour gave up waiting (the worker had
+  // already started a new hour): handed here so they are still logged.
+  onLateHour?: (r: { h: LoopHour; node: string }) => void;
+  readyTimeoutMs?: number;        // a started worker must say "ready" within this (10 s)
+  permitMaxAgeMs?: number;        // older "may I?" questions are answered no (900 ms; the worker gives up at 1 s)
   autoFlush?: boolean;            // tests: false = send only on flushNow (default true)
 }
 
@@ -75,6 +80,8 @@ export class LoopWorkerHost {
   private restartTimes: number[] = [];
   private hourId = 0;
   private hourWaiters = new Map<number, (r: { h: LoopHour; node: string } | null) => void>();
+  private readyTimer: NodeJS.Timeout | null = null;
+  permitsStale = 0;
   private readonly now: () => number;
   private readonly flushMs: number;
   stats: WorkerStats | null = null;
@@ -104,6 +111,20 @@ export class LoopWorkerHost {
     w.on('error', (err: Error) => { if (this.worker === w) this.o.warn(`[loop] worker crashed: ${err?.message ?? err} (main thread keeps running)`); });
     w.on('exit', (code: number) => this.onExit(w, code));
     this.post(w, this.o.init);
+    // A worker that never says "ready" (e.g. its start-up failed) would leave
+    // loops dead without a sound: after readyTimeoutMs stop it and restart it
+    // (counts toward the restarts-per-hour limit).
+    if (this.readyTimer) clearTimeout(this.readyTimer);
+    this.readyTimer = setTimeout(() => {
+      this.readyTimer = null;
+      if (this.worker !== w || this.ready || this.stopping) return;
+      this.o.warn(`[loop] worker did not start within ${Math.round((this.o.readyTimeoutMs ?? 10_000) / 1_000)} s: stopping it (main thread keeps running)`);
+      this.worker = null;
+      try { void Promise.resolve(w.terminate()).catch(() => undefined); } catch { /* already gone */ }
+      this.crashes++;
+      this.scheduleRestart();
+    }, this.o.readyTimeoutMs ?? 10_000);
+    this.readyTimer.unref?.();
   }
 
   // Stop for good (shutdown). Never throws.
@@ -111,6 +132,7 @@ export class LoopWorkerHost {
     this.stopping = true;
     if (this.timer) { clearTimeout(this.timer); this.timer = null; }
     if (this.restartTimer) { clearTimeout(this.restartTimer); this.restartTimer = null; }
+    if (this.readyTimer) { clearTimeout(this.readyTimer); this.readyTimer = null; }
     const w = this.worker;
     this.worker = null; this.ready = false;
     for (const f of this.hourWaiters.values()) f(null);
@@ -186,6 +208,7 @@ export class LoopWorkerHost {
       switch (m.t) {
         case 'ready':
           this.ready = true;
+          if (this.readyTimer) { clearTimeout(this.readyTimer); this.readyTimer = null; }
           this.wantScan = true;
           this.schedule();
           break;
@@ -198,6 +221,9 @@ export class LoopWorkerHost {
         case 'permit': {
           this.permitsAsked++;
           let ok = false;
+          // Asked too long ago (main thread was busy): the worker has given up
+          // on it (1 s), so a yes would only waste a slot of the shared allowance.
+          if (typeof m.at === 'number' && this.now() - m.at > (this.o.permitMaxAgeMs ?? 900)) { this.permitsStale++; this.post(w, { t: 'permit', id: m.id, ok: false }); break; }
           try { ok = this.o.permit(); } catch { ok = false; }
           if (ok) this.permitsGiven++;
           this.post(w, { t: 'permit', id: m.id, ok });
@@ -205,7 +231,12 @@ export class LoopWorkerHost {
         }
         case 'log': (m.level === 'warn' ? this.o.warn : this.o.log)(m.line); break;
         case 'noteGas': this.o.noteGas(m.pools, m.gasUsed); break;
-        case 'hour': { const f = this.hourWaiters.get(m.id); if (f) { this.hourWaiters.delete(m.id); f({ h: m.h, node: m.node }); } break; }
+        case 'hour': {
+          const f = this.hourWaiters.get(m.id);
+          if (f) { this.hourWaiters.delete(m.id); f({ h: m.h, node: m.node }); }
+          else this.o.onLateHour?.({ h: m.h, node: m.node }); // too late for the report: still logged
+          break;
+        }
         case 'stats': this.stats = m.s; break;
         case 'error': this.o.warn(`[loop] worker problem (ignored): ${m.message}`); break;
       }

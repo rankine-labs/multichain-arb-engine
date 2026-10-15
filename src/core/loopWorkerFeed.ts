@@ -118,7 +118,7 @@ export type FromWorker =
   | { t: 'ready' }
   | { t: 'ack'; seq: number; digest?: string }
   | { t: 'log'; line: string; level?: 'warn' }
-  | { t: 'permit'; id: number }
+  | { t: 'permit'; id: number; at: number } // at = when asked (Date.now, same clock in both threads)
   | { t: 'noteGas'; pools: number; gasUsed: bigint }
   | { t: 'hour'; id: number; h: LoopHour; node: string }
   | { t: 'stats'; s: WorkerStats }

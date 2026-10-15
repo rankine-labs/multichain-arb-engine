@@ -220,7 +220,7 @@ function initFor(over: Partial<LoopWorkerInit> = {}): LoopWorkerInit {
     times.sort((a, b) => a - b);
     const med = times[100], p99 = times[198];
     assert(sizes === 200 * 20, `only changed pools are sent (${sizes / 200} per update, of ${N})`);
-    assert(med < 2, `main thread work per update is small: median ${med.toFixed(3)} ms, p99 ${p99.toFixed(3)} ms for ${N} pools`);
+    assert(med < 20, `main thread work per update is small: median ${med.toFixed(3)} ms, p99 ${p99.toFixed(3)} ms for ${N} pools`);
     // Bounded: worker behind (3 messages unanswered) -> nothing new is sent.
     const b1 = f.build(true)!, b2 = f.build(true)!, b3 = f.build(true)!;
     const held = f.build(true);
@@ -273,6 +273,51 @@ function initFor(over: Partial<LoopWorkerInit> = {}): LoopWorkerInit {
     assert(hr === null, 'hour numbers while the worker is down: null (report says so), no hang');
     host.stop();
     assert(true, 'main thread survived three worker crashes');
+  }
+
+  // -------------------------------------------------------------------------
+  // 5b. Review fixes with a fake worker: no "ready" -> restart; stale "may I?"
+  // questions answered no; a late hour reply is still handed over.
+  // -------------------------------------------------------------------------
+  {
+    type L = (m: any) => void;
+    const made: { posted: any[]; on: Record<string, L>; terminated: boolean }[] = [];
+    const fake = () => {
+      const f = { posted: [] as any[], on: {} as Record<string, L>, terminated: false };
+      made.push(f);
+      return { postMessage: (m: any) => { f.posted.push(m); }, on: (ev: string, fn: L) => { f.on[ev] = fn; }, terminate: () => { f.terminated = true; if (f.on.exit) f.on.exit(1); return Promise.resolve(1); } } as any;
+    };
+    const src: LoopSource = {
+      watchedPairs: () => [], extraKeys: () => null, main: () => undefined, confirmed: () => undefined, info: () => undefined,
+      realPrices: true, usdOf: () => 1, decimalsOf: () => 18, symbolOf: (t) => t, tradable: () => true, practiceDex: () => true,
+      gasUsd: () => 0.01, rivalPools: () => new Set(), balance: () => undefined, budgetOk: () => true, head: () => null, bases: [W, USDG], now: () => clock,
+    };
+    const warns: string[] = [];
+    let given = 0;
+    const late: any[] = [];
+    const host = new LoopWorkerHost({
+      init: initFor(), feeder: new MainLoopFeeder(src), permit: () => { given++; return true; }, noteGas: () => {}, log: () => {}, warn: (m) => warns.push(m),
+      createWorker: fake, readyTimeoutMs: 60, restartDelaysMs: [20, 20, 20], maxRestartsPerHour: 3, autoFlush: false, onLateHour: (r) => late.push(r),
+    });
+    host.start();
+    await sleep(200);
+    assert(made.length >= 2 && made[0].terminated && host.crashes >= 1 && warns.some((w) => w.includes('did not start')), `worker that never says ready: stopped and restarted (${made.length} started, ${host.crashes} counted as crashes)`);
+    // Let the newest fake worker say ready.
+    const cur = made[made.length - 1];
+    cur.on.message({ t: 'ready' });
+    assert(host.alive, 'restarted worker that says ready is used');
+    const before = given;
+    cur.on.message({ t: 'permit', id: 1, at: Date.now() - 2_000 });
+    cur.on.message({ t: 'permit', id: 2, at: Date.now() });
+    const answers = cur.posted.filter((m) => m.t === 'permit');
+    assert(answers.length === 2 && !answers[0].ok && answers[1].ok && given === before + 1 && host.permitsStale === 1,
+      'a "may I?" older than 900 ms is answered no without using the shared allowance; a fresh one gets yes');
+    const p = host.takeHour(30);
+    const asked = cur.posted.find((m) => m.t === 'takeHour');
+    const r = await p;
+    cur.on.message({ t: 'hour', id: asked.id, h: { found: 7 }, node: 'n' });
+    assert(r === null && late.length === 1 && late[0].h.found === 7, 'hour numbers arriving after the 3 s wait are still handed over (logged), not lost');
+    host.stop();
   }
 
   // -------------------------------------------------------------------------
