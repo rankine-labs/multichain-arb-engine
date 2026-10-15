@@ -426,7 +426,11 @@ export async function buildTokenGroups(deps: {
   // (Same as tokens.slice(upTo).filter(...), written as a loop so it can
   // take breaks. The list length is noted first, like slice() did.)
   const todo: string[] = [];
-  for (let i = cache.upTo, end = deps.state.tokens.length; i < end; i++) {
+  // Remember how far we looked NOW: a pool scan running at the same time may
+  // add coins while we read names, and those must be picked up next time,
+  // not skipped forever.
+  const seenUpTo = deps.state.tokens.length;
+  for (let i = cache.upTo, end = seenUpTo; i < end; i++) {
     const t = deps.state.tokens[i];
     if (quoted.has(t.toLowerCase()) && !names.has(t.toLowerCase())) todo.push(t);
     if (pacer.due()) await pacer.rest();
@@ -454,7 +458,7 @@ export async function buildTokenGroups(deps: {
     }
     if (done < todo.length) await sleep(deps.pauseMs ?? 2_000);
   }
-  cache.upTo = deps.state.tokens.length;
+  cache.upTo = seenUpTo;
   await names.save();
   log(`[groups] symbols: ${todo.length} new read, ${names.count()} known (${Math.round((Date.now() - t0) / 1000)}s)`);
 

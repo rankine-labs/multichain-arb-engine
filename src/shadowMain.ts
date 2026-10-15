@@ -2483,13 +2483,16 @@ await chainManager.startAll();
                               else if (check.status !== 'skipped') gapStats.fake++;
                               const why = check.status === 'profit' ? `real profit only $${check.usd.toFixed(2)}` : check.reason;
                               console.log(`[gap] ${label}: model said ~$${g.profitUsd.toFixed(2)} but NOT REAL (${why}); muted 30 min | ${route}`);
+                              gapCredit.closed(key); // not real: forget what it was credited (practice numbers only)
                               continue;
                         }
                         gapStats.found++;
                         gapStats.bestUsd = Math.max(gapStats.bestUsd, simNet);
                         gapConfirmedState.set(key, sig);
                         gapConfirmedOpen.set(key, g.profitUsd);
-                        if (gapConfirmedOpen.size > 2_000) gapConfirmedOpen.clear();
+                        // Emptied together with gapCredit, so a gap that is "new" to the
+                        // re-check rule is also credited in full (practice numbers only).
+                        if (gapConfirmedOpen.size > 2_000) { gapConfirmedOpen.clear(); for (const k of [...gapCredit.keys()]) gapCredit.closed(k); }
                         if (gapConfirmedState.size > 2_000) gapConfirmedState.clear();
                         // Practice results: confirmed sitting-gap wins on vetted coins count as
                         // "would have earned" here (the firing safety gate below may still

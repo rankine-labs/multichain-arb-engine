@@ -74,7 +74,7 @@ export class RouteScores {
 // ----------------------------------------------------------------------------
 // WIN SIZES -- how many real wins (after gas, vetted coins) cleared each bar,
 // so the firing bar ($20 today) can be set from data. Per hour and per day
-// (UTC day, like the rest of the bot's daily counts).
+// (Toronto day, like the rest of the hourly report).
 // ----------------------------------------------------------------------------
 export const WIN_BARS = [1, 2, 5, 10, 20];
 

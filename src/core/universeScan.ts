@@ -753,6 +753,9 @@ export async function scanUniverse(
       errors.push(`${f.dex}: ${String((err as any)?.shortMessage ?? (err as any)?.message ?? err).slice(0, 120)}`);
     }
   }
+  // Done adding new pools: let the big coin/pool lookups go now, so they
+  // don't sit in memory (tens of MB) for the rest of the scan.
+  stateIndex = null;
   // Steps 1b-2 go over every pool on the chain (~400,000 on Robinhood).
   // Written as steps (core/chunked.ts): with opts.chunked they run in ~5 ms
   // bites so the bot keeps reading trades meanwhile; the result is the same.
