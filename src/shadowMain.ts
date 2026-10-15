@@ -163,7 +163,7 @@ import { poolDepthUsd, setRealBalanceSource, thinPools, thinPoolsSteps } from '.
 import { LoopTrader, loopConfigFromEnv, LoopCheckResult, LoopTrade } from './core/loopTrader';
 // Loop fix phase 2: real (block-confirmed) prices, trigger replay, cheap scans (core/loopPrices.ts).
 import { loopFixFromEnv, PendingTrades, loopPoolState } from './core/loopPrices';
-import { formatLoopHour } from './core/loopReport';
+import { formatLoopHour, loopLogLine } from './core/loopReport';
 import { startMemReport, registerSize } from './core/memReport';
 // Loop trader extra pools: keeps single-pool pairs fresh for the loop finder only (off unless LOOP_TRADER=1).
 import { LoopExtraPools, loopExtraConfigFromEnv, readerAddresses, afterReaderWrite } from './core/loopExtraPools';
@@ -1550,7 +1550,22 @@ if (loopCfg.enabled) {
       rivalWatch.onRecord = (rec) => loopTrader.noteRival(rec);
       registerSize('loop cycles', () => loopTrader.finder.cycleCount());
       registerSize('loop confirmed states', () => cache.confirmedCount());
-      loopHourText = () => formatLoopHour(loopTrader.takeHour(), loopCfg.maxPools, loopExtra?.status(loopCfg.maxPoolAgeMs) ?? null);
+      // Hourly: take the hour's numbers ONCE (takeHour resets them), log one
+      // plain "[loop] hour:" line for the status page, then build the same
+      // Telegram block as before from the same numbers.
+      let loopHourStart = Date.now();
+      loopHourText = () => {
+            const h = loopTrader.takeHour();
+            loopHourStart = Date.now();
+            console.log(loopLogLine(h, loopCfg.maxPools, 'hour'));
+            return formatLoopHour(h, loopCfg.maxPools, loopExtra?.status(loopCfg.maxPoolAgeMs) ?? null);
+      };
+      // Every 15 min: the hour's numbers so far (read only, nothing reset), so
+      // the status page (also every 15 min) always has fresh loop numbers.
+      setInterval(() => {
+            try { console.log(loopLogLine(loopTrader.peekHour(), loopCfg.maxPools, `hour so far (${Math.round((Date.now() - loopHourStart) / 60_000)} min)`)); }
+            catch (err) { console.warn('[loop] summary line failed (ignored):', (err as Error).message); }
+      }, 15 * 60_000);
       console.log(`[loop] fix phase 2: real prices ${realPricesOn ? 'on' : 'off'}, keep block updates ${loopFix.keepBlockUpdates ? 'on' : 'off'}, trigger replay ${loopFix.triggerReplay ? 'on' : 'off'}, model vs check ${loopFix.modelVsCheck ? 'on' : 'off'}, cheap scan ${loopFix.cheapScan ? `on (${loopFix.sliceMs} ms slices)` : 'off'}`);
       console.log(`[loop] loop trader ON (practice only, never sends): 3-${loopCfg.maxPools} pools, up to ${loopCfg.maxCycles} loops, max $${loopCfg.maxTradeUsd}, bar $${loopCfg.minNetUsd}, ${loopCfg.checksPerMin} checks/min`);
 }
