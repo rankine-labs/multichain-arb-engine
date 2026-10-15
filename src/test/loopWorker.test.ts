@@ -171,6 +171,10 @@ function initFor(over: Partial<LoopWorkerInit> = {}): LoopWorkerInit {
     }
     assert(differ === 0 && same === 30, `worker finds exactly the same loops as the main thread (${same}/30 scans equal${firstDiff ? '; ' + firstDiff : ''})`);
     assert(paying > 0, `the test sequence really has paying loops (${paying} loop results over 30 scans)`);
+    // The worker's loop list may still be rebuilding in the background right
+    // after the last scan (its size report lags by a moment): give it time to
+    // settle, nudging it with a scan, instead of reading it the same instant.
+    await waitFor(() => { if (host.stats?.cycles !== ref.finder.cycleCount()) host.flushNow(true, true); return host.stats !== null && host.stats.cycles === ref.finder.cycleCount(); }, 5_000);
     assert(host.stats !== null && host.stats.cycles === ref.finder.cycleCount(), `worker reports its loop list size (${host.stats?.cycles} loops, main-thread version ${ref.finder.cycleCount()})`);
     // Hour numbers come back by message, same shape as before.
     const hr = await host.takeHour();
