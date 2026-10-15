@@ -146,6 +146,8 @@ import { checkLiveReady } from './execution/liveReadiness';
 import { LiveTradeTracker } from './execution/liveTracker';
 import { LiveTradeLog } from './execution/liveTradeLog';
 import { SafetyAlerts } from './execution/safetyAlerts';
+import { AlertHooks } from './report/alertHooks';
+import { getHeapStatistics } from 'v8';
 import { findStandingGaps, findStandingGapsSteps, GapScanMemo } from './core/gapScanner';
 import { CompetitorTracker } from './core/competitorTracker';
 import { pickRobinhoodReadRpc, robinhoodSendRpc, redact, ROBINHOOD_PUBLIC_RPC } from './config/robinhoodEndpoints';
@@ -1284,7 +1286,10 @@ let newPoolWatchRef: NewPoolWatch | null = null;
 // by the status page), and Telegram alerts fire when live sending pauses
 // (daily loss cap, kill switch, bad setting) or 75% of the cap is used.
 const liveTradeLog = new LiveTradeLog();
-const safetyAlerts = new SafetyAlerts((html) => sendTelegramMessage(html), safetyConfigFromEnv().dailyLossCapUsd);
+// Instant plain-English alerts (report/alertHooks.ts). REPORT_V2=0 = old messages.
+const alertHooks = new AlertHooks({ send: (html) => sendTelegramMessage(html) });
+alertHooks.installExitRecorder();
+const safetyAlerts = new SafetyAlerts((html, critical) => alertHooks.safetyNotify(html, critical), safetyConfigFromEnv().dailyLossCapUsd, 'robinhood', Date.now, alertHooks.v2);
 
 // LIVE results (only used once live sending is switched on): receipt, profit
 // from the contract's Executed event, gas cost; losses feed the daily cap.
@@ -1297,11 +1302,11 @@ const liveTracker = new LiveTradeTracker({
             return px === null || dec === undefined ? null : (Number(raw) / 10 ** dec) * px;
       },
       recordLoss: (usd) => { safetyGate.recordLoss(usd); safetyAlerts.onLoss(safetyGate.lossTodayUsd()); },
-      // Every final result: the status page's file, and the hourly report's
-      // "Real money made" ledger (only counted when sending is really live).
-      onResult: (r) => { liveTradeLog.result(r); moneyLedgers.noteRealResult(r, robinhoodSender.live); },
+      // Every final result: the status page's file, the instant alerts, and the
+      // hourly report's "Real money made" ledger (only counted when really live).
+      onResult: (r) => { liveTradeLog.result(r); alertHooks.onLiveResult(r); moneyLedgers.noteRealResult(r, robinhoodSender.live); },
       noteGasUsed: (gas, info) => { robinhoodSender.noteGasUsed(gas); if (info?.routeKey) void noteReceiptGas(info.routeKey, info.hash, gas, info.success); },
-      notify: (html) => sendTelegramMessage(html),
+      notify: (html) => alertHooks.liveTrackerNotify(html),
       onSettled: (hash) => { safetyGate.releasePending(hash); robinhoodSender.settled(hash); },
       onDropped: () => { void robinhoodSender.resyncNonce(); },
 });
@@ -1817,7 +1822,7 @@ if (loopWorkerOn) {
             // LOOP_MODEL_VS_CHECK: real loop gas from replays teaches the gas model (loop kinds only).
             noteGas: (pools, gasUsed) => { gasModel.notePractice(loopKey(pools), gasUsed); },
             log: (m) => console.log(m),
-            warn: (m) => console.warn(m),
+            warn: (m) => { console.warn(m); alertHooks.onLoopWarn(m); },
             heapMb: loopWorkerHeapMbFromEnv(),
             // The worker answered after the hourly report gave up (3 s): the
             // report said "no numbers", the plain line for the status page is still written.
@@ -2006,7 +2011,7 @@ const fireTrade = async (o: {
             const readyMs = (fired.signedAtMs ?? Date.now()) - o.seenAtMs;
             if (o.source === 'trade') fireStats.readyMs.push(readyMs);
             const tradeLabel = `${symbolOf(o.chain, o.tokenIn)}/${symbolOf(o.chain, o.tokenOut)} ${o.buyPool.dex}>${o.sellPool.dex}`;
-            if (fired.live && !fired.txHash && fired.error) liveTradeLog.sendFailed(tradeLabel, o.tradeSizeUsd, fired.error);
+            if (fired.live && !fired.txHash && fired.error) { liveTradeLog.sendFailed(tradeLabel, o.tradeSizeUsd, fired.error); alertHooks.liveSendFailed(tradeLabel, fired.error); }
             if (fired.txHash) {
                   fireStats.sent++;
                   liveTradeLog.sent(fired.txHash, tradeLabel, o.tradeSizeUsd, netProfitUsd);
@@ -2525,10 +2530,10 @@ if (chainOn('robinhood')) {
                                     tokens: [{ address: ROBINHOOD_TOKENS.WETH, label: 'WETH' }, { address: ROBINHOOD_TOKENS.USDG, label: 'USDG' }],
                                     lenders: [...approvedLenders('robinhood')],
                               }).catch((err) => ({ ok: false, problems: [`check error: ${(err as Error).message?.slice(0, 80)}`] }));
-                              if (liveChecks.ok) console.log('[fire] live checks passed: chain, executor role, lenders, ArbSys deadline');
+                              if (liveChecks.ok) { console.log('[fire] live checks passed: chain, executor role, lenders, ArbSys deadline'); alertHooks.liveChecksPassed(); }
                               else {
                                     console.warn(`[fire] LIVE CHECKS FAILED, sends blocked: ${liveChecks.problems.join('; ')}`);
-                                    await sendTelegramMessage(`🛑 <b>LIVE CHECKS FAILED</b> · sends blocked\n${liveChecks.problems.map((p) => '• ' + p.replace(/[<>&]/g, '')).join('\n')}`);
+                                    alertHooks.liveChecksFailed(liveChecks.problems);
                                     setTimeout(() => { void runChecks(); }, 5 * 60_000);
                               }
                         };
@@ -2537,7 +2542,7 @@ if (chainOn('robinhood')) {
                         if (!b.ok) {
                               const msg = `bot wallet ${robinhoodSender.address} has ${ethers.formatEther(b.balance)} ETH, needs ${ethers.formatEther(b.needed)} per trade at the gas cap`;
                               console.warn(`[fire] LOW GAS: ${msg}`);
-                              await sendTelegramMessage(`⚠️ <b>LOW GAS</b> · ${msg}`);
+                              alertHooks.lowGas(msg);
                         }
                   }
             })
@@ -2548,7 +2553,17 @@ await chainManager.startAll();
 
       const startStatus = chainManager.getStatus() as Record<string, { online: boolean }>;
       // Not awaited: a slow Telegram must never hold up startup.
-      void sendTelegramMessage(formatStartup(startStatus)).catch(() => { /* logged by sender */ });
+      alertHooks.startup(() => formatStartup(startStatus), startStatus, robinhoodSender.live);
+      // Problem alerts (report/alertWatch.ts): read-only checks every 5 s. REPORT_V2 only.
+      alertHooks.startWatch({
+            feedHealthy: () => (chainOn('robinhood') ? chainManager.isHealthy('robinhood') : null),
+            wsStatus: () => { const w = wsFacts as unknown as { stats?: () => { healthy: boolean; capped: boolean } } | null; return w?.stats ? w.stats() : null; },
+            checkNodePaused: () => (!chainOn('robinhood') ? null : simOff('robinhood') ? 'off' : Date.now() < (simPausedUntil.robinhood ?? 0) ? 'busy' : null),
+            queueTimeoutsTotal: () => funnel.skip.get('waited too long in the check line (2 s)') ?? 0,
+            memory: () => { const m = process.memoryUsage(); return { heapUsed: m.heapUsed, heapLimit: getHeapStatistics().heap_size_limit, rss: m.rss }; },
+            loopWorker: () => (loopWorker ? { crashes: loopWorker.crashes, restarts: loopWorker.restarts } : null),
+      });
+      stallFinder.onStall((ms, job) => alertHooks.onFreeze(ms, job));
 
       // Kuru is an order book, not something you find via factory.getPair(),
       // so its market is seeded directly from the known address rather than

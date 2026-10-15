@@ -1,4 +1,5 @@
 import { formatLossCapHit, formatLossCapWarning, formatLivePaused } from '../core/telegramFormatter';
+import { formatProblem } from '../report/alerts';
 
 // ============================================================================
 // SAFETY ALERTS -- Telegram messages when live sending gets paused
@@ -16,6 +17,12 @@ import { formatLossCapHit, formatLossCapWarning, formatLivePaused } from '../cor
 // No spam: each alert is sent at most ONCE per reason per day. The day is the
 // UTC day, the same day the loss cap resets on.
 // Only used in live mode (practice mode never loses money).
+//
+// Style: v2 = true (REPORT_V2, the default in shadowMain) uses the plain
+// "PROBLEM / What it means / What's happening" style. v2 = false keeps the
+// old messages word for word. Which alerts fire, and when, is the same.
+// notify's 2nd argument says "real money, never hold back" (loss cap hit,
+// live sending paused); the 75% warning is not critical.
 // ============================================================================
 
 export type PauseKind = 'loss-cap' | 'kill-switch' | 'bad-setting';
@@ -40,10 +47,11 @@ export class SafetyAlerts {
   private day = '';
 
   constructor(
-    private readonly notify: (html: string) => Promise<void> | void,
+    private readonly notify: (html: string, critical?: boolean) => Promise<void> | void,
     private readonly capUsd: number,
     private readonly chain = 'robinhood',
     private readonly now: () => number = Date.now,
+    private readonly v2 = false,
   ) {}
 
   // True the first time a key is seen today (then remembers it until tomorrow).
@@ -55,9 +63,9 @@ export class SafetyAlerts {
     return true;
   }
 
-  private send(html: string) {
+  private send(html: string, critical = false) {
     try {
-      const p = this.notify(html);
+      const p = this.notify(html, critical);
       if (p && typeof (p as Promise<void>).catch === 'function') (p as Promise<void>).catch(() => { /* logged by sender */ });
     } catch { /* an alert problem must never affect trading */ }
   }
@@ -66,7 +74,14 @@ export class SafetyAlerts {
   private capHit(lostTodayUsd: number) {
     const first = this.firstToday('loss-cap');
     this.sentToday.add('loss-75');
-    if (first) this.send(formatLossCapHit(this.chain, lostTodayUsd, this.capUsd));
+    if (!first) return;
+    if (!this.v2) return this.send(formatLossCapHit(this.chain, lostTodayUsd, this.capUsd), true);
+    this.send(formatProblem({
+      title: 'Daily loss cap hit, live trading paused', severity: 'high', critical: true,
+      meaning: `we lost $${lostTodayUsd.toFixed(2)} today (cap $${this.capUsd.toFixed(2)}, counting trades still waiting for a receipt)`,
+      happening: 'no real trades until midnight UTC, then it resumes on its own',
+      details: ['To resume sooner: raise DAILY_LOSS_CAP_USD in .env and restart the bot.'],
+    }, this.now()), true);
   }
 
   // Call after every loss is recorded, with today's total loss so far.
@@ -75,7 +90,13 @@ export class SafetyAlerts {
     if (lostTodayUsd >= this.capUsd) {
       this.capHit(lostTodayUsd);
     } else if (lostTodayUsd >= 0.75 * this.capUsd) {
-      if (this.firstToday('loss-75')) this.send(formatLossCapWarning(this.chain, lostTodayUsd, this.capUsd));
+      if (this.firstToday('loss-75')) {
+        this.send(!this.v2 ? formatLossCapWarning(this.chain, lostTodayUsd, this.capUsd) : formatProblem({
+          title: '75% of the daily loss cap used', severity: 'high',
+          meaning: `we lost $${lostTodayUsd.toFixed(2)} of the $${this.capUsd.toFixed(2)} allowed today (gas on lost races plus any losing trades)`,
+          happening: `still trading; real trades stop for the day at $${this.capUsd.toFixed(2)}`,
+        }, this.now()));
+      }
     }
   }
 
@@ -89,6 +110,13 @@ export class SafetyAlerts {
       this.capHit(lostTodayUsd);
       return;
     }
-    if (this.firstToday(kind)) this.send(formatLivePaused(this.chain, reason, FIX[kind]));
+    if (!this.firstToday(kind)) return;
+    this.send(!this.v2 ? formatLivePaused(this.chain, reason, FIX[kind]) : formatProblem({
+      title: kind === 'kill-switch' ? 'Kill switch on, live trading paused' : 'Bad safety setting, live trading paused',
+      severity: 'high', critical: true,
+      meaning: 'no real trades are being sent',
+      happening: FIX[kind],
+      details: [`Reason: ${reason}`],
+    }, this.now()), true);
   }
 }
