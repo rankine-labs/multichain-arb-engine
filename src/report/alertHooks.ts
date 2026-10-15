@@ -67,6 +67,19 @@ export class AlertHooks {
   private pendingModeChange: { from: Mode; to: Mode; at: number } | null = null;
   private heartbeat: NodeJS.Timeout | null = null;
   private lastSignal: string | undefined;
+  // Saved files as they were BEFORE this run wrote anything (read once by
+  // installExitRecorder, used by startup). undefined = not read yet.
+  private savedState: SavedState | null | undefined;
+  private savedExit: SavedExit | null | undefined;
+  // The heartbeat only writes once startup() has read the old state and set
+  // the real mode (review fix: it used to overwrite the file first).
+  private started = false;
+  // Last live check result seen (so a mode change after startup can say it).
+  private liveChecks: string | null = null;
+  // "Live trade could not be sent": one entry per kind of error (bounded).
+  private sendFails = new Map<string, { windowStart: number; extra: number; lastLabel: string; lastError: string; timer: NodeJS.Timeout | null }>();
+  static SEND_FAIL_WINDOW_MS = 5 * 60_000;
+  static SEND_FAIL_KINDS_MAX = 50;
 
   constructor(o: HooksOptions) {
     this.send = o.send;
@@ -120,16 +133,55 @@ export class AlertHooks {
   }
 
   // A live trade could not even be sent (node refused it, network error).
+  // Review fix (no flood): one alert per KIND of error. The first failure of
+  // a kind is sent right away (critical). More of the same kind within 5 min
+  // are counted and sent as ONE "N more in 5 min" message at the end of the
+  // 5 minutes (also critical, so never held back). A quiet 5 minutes ends it.
   liveSendFailed(label: string, error: string): void {
     this.guard(() => {
       if (!this.v2) return;
-      this.center.event(`live-send-fail:${this.now()}`, {
+      const kind = errorKind(error);
+      const now = this.now();
+      const s = this.sendFails.get(kind);
+      if (s) { s.extra++; s.lastLabel = label; s.lastError = String(error).slice(0, 160); return; }
+      // Bounded: forget the oldest kind that has nothing waiting.
+      if (this.sendFails.size >= AlertHooks.SEND_FAIL_KINDS_MAX) {
+        for (const [k, v] of this.sendFails) if (!v.extra) { if (v.timer) clearTimeout(v.timer); this.sendFails.delete(k); break; }
+      }
+      const entry = { windowStart: now, extra: 0, lastLabel: label, lastError: String(error).slice(0, 160), timer: null as NodeJS.Timeout | null };
+      this.sendFails.set(kind, entry);
+      this.center.event(`live-send-fail:${kind}`, {
         title: 'Live trade could not be sent', severity: 'high', critical: true,
         meaning: 'a real trade was ready but the node did not accept it, so nothing was traded (no cost)',
-        happening: 'the bot keeps going and tries the next chance normally',
+        happening: 'the bot keeps going and tries the next chance normally. More of the same error in the next 5 min come as one message',
         details: [`Trade: ${label}`, `Error: ${String(error).slice(0, 160)}`],
       });
+      this.armSendFailTimer(kind);
     });
+  }
+
+  // End of a 5 minute window for one kind of send error: one roll-up message
+  // if more came in (and keep watching), otherwise forget the kind.
+  private armSendFailTimer(kind: string): void {
+    const e = this.sendFails.get(kind);
+    if (!e) return;
+    e.timer = setTimeout(() => this.guard(() => this.flushSendFails(kind)), AlertHooks.SEND_FAIL_WINDOW_MS);
+    e.timer.unref?.();
+  }
+
+  // Exposed for tests (the timer calls it).
+  flushSendFails(kind: string): void {
+    const e = this.sendFails.get(kind);
+    if (!e) return;
+    if (!e.extra) { this.sendFails.delete(kind); return; }
+    const n = e.extra;
+    e.extra = 0; e.windowStart = this.now();
+    this.center.post(formatNote(`Live trade could not be sent: ${n} more in 5 min`, [
+      `Same error: ${e.lastError}`,
+      `Last trade: ${e.lastLabel}`,
+      'Nothing was traded (no cost). Still watching; the next roll-up comes in 5 min if it keeps happening.',
+    ], this.now(), torontoTime, '🛑', 'STILL FAILING'), { critical: true, label: 'Live trade could not be sent (roll-up)' });
+    this.armSendFailTimer(kind);
   }
 
   // Readiness checks before real sends failed (retried every 5 min).
@@ -145,7 +197,8 @@ export class AlertHooks {
         happening: 'checking again every 5 min',
         details: problems.map((p) => `• ${p}`),
       });
-      this.resolveModeChange(`live checks FAILED: ${problems.join('; ')}`);
+      this.liveChecks = `live checks FAILED: ${problems.join('; ')}`;
+      this.resolveModeChange(this.liveChecks);
     });
   }
 
@@ -153,7 +206,8 @@ export class AlertHooks {
     this.guard(() => {
       if (!this.v2) return;
       this.center.clear('live-checks', 'Live checks passed, real trades allowed');
-      this.resolveModeChange('live checks passed, ready to send real trades');
+      this.liveChecks = 'live checks passed, ready to send real trades';
+      this.resolveModeChange(this.liveChecks);
     });
   }
 
@@ -162,7 +216,7 @@ export class AlertHooks {
     this.guard(() => {
       if (!this.v2) return this.sendOld(`⚠️ <b>LOW GAS</b> · ${msg}`);
       this.center.raise('low-gas', {
-        title: 'Bot wallet low on gas', severity: 'high',
+        title: 'Bot wallet low on gas', severity: 'high', critical: true,
         meaning: "real trades will fail or be skipped if the wallet can't pay gas",
         happening: 'add ETH to the bot wallet (checked again at the next restart)',
         details: [msg],
@@ -177,8 +231,9 @@ export class AlertHooks {
     this.guard(() => {
       this.mode = live ? 'live' : 'practice';
       if (!this.v2) { this.sendOld(oldMessage()); return; }
-      const state = this.read<SavedState>('alert-state.json');
-      const exit = this.read<SavedExit>('last-exit.json');
+      // The files as they were before this run touched them.
+      const state = this.savedState !== undefined ? this.savedState : this.read<SavedState>('alert-state.json');
+      const exit = this.savedExit !== undefined ? this.savedExit : this.read<SavedExit>('last-exit.json');
       const now = this.now();
       const why = restartReason(state, exit);
       const feeds = Object.entries(chains).map(([c, s]) => `${s.online ? '✅' : '❌'} ${c.charAt(0).toUpperCase()}${c.slice(1)}`).join('  ');
@@ -191,8 +246,11 @@ export class AlertHooks {
       if (state?.mode && state.mode !== this.mode) {
         this.pendingModeChange = { from: state.mode, to: this.mode, at: now };
         if (this.mode === 'practice') this.resolveModeChange('no real trades will be sent');
+        // Live checks may already have finished before startup: say the result.
+        else if (this.liveChecks) this.resolveModeChange(this.liveChecks);
         else setTimeout(() => this.resolveModeChange('live checks have not finished yet (a separate alert follows if they fail)'), this.modeReadyWaitMs).unref?.();
       }
+      this.started = true;
       this.saveState();
       try { if (exit) unlinkSync(join(this.dir, 'last-exit.json')); } catch { /* fine */ }
     });
@@ -216,6 +274,11 @@ export class AlertHooks {
   installExitRecorder(): void {
     this.guard(() => {
       if (!this.v2) return;
+      // Read what the LAST run left BEFORE anything is written (review fix:
+      // startup() runs minutes later and must see the old mode / alive time).
+      this.savedState = this.read<SavedState>('alert-state.json');
+      this.savedExit = this.read<SavedExit>('last-exit.json');
+      // Writes nothing until startup() has run (see saveState).
       this.heartbeat = setInterval(() => this.saveState(), 60_000);
       this.heartbeat.unref?.();
       for (const sig of ['SIGINT', 'SIGTERM'] as const) process.prependListener(sig, () => { this.lastSignal = sig; });
@@ -243,7 +306,10 @@ export class AlertHooks {
   clear(key: string, text: string, word?: string): void { this.guard(() => { if (this.v2) this.center.clear(key, text, word); }); }
 
   // ---- small file helpers --------------------------------------------------
-  private saveState(): void { try { this.write('alert-state.json', { mode: this.mode, aliveAt: this.now() }); } catch { /* best effort */ } }
+  private saveState(): void {
+    if (!this.started) return; // never overwrite the last run's state before startup() read it
+    try { this.write('alert-state.json', { mode: this.mode, aliveAt: this.now() }); } catch { /* best effort */ }
+  }
   private write(name: string, obj: unknown): void {
     if (!existsSync(this.dir)) mkdirSync(this.dir, { recursive: true });
     writeFileSync(join(this.dir, name), JSON.stringify(obj));
@@ -251,6 +317,13 @@ export class AlertHooks {
   private read<T>(name: string): T | null {
     try { return JSON.parse(readFileSync(join(this.dir, name), 'utf8')) as T; } catch { return null; }
   }
+}
+
+// The kind of a send error, so the same problem is one alert: numbers, hex
+// and quoted parts removed, first 60 characters.
+export function errorKind(error: string): string {
+  return String(error ?? '').toLowerCase().replace(/0x[0-9a-f]+/g, '0x').replace(/"[^"]*"|'[^']*'/g, '""')
+    .replace(/\d+(\.\d+)?/g, 'N').replace(/\s+/g, ' ').trim().slice(0, 60) || 'unknown';
 }
 
 function firstWords(html: string): string {

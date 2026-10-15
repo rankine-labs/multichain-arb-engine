@@ -597,7 +597,7 @@ const funnelSkip = (why: string) => funnel.skip.set(why, (funnel.skip.get(why) ?
 // Keeps 4-hour totals of the hourly numbers plus each win as it is counted,
 // saved to data/report-4h.json so a restart keeps them. Never touches trading.
 const REPORT_4H_ON = reportV2On(process.env);
-const fourHour: FourHourStats | null = REPORT_4H_ON ? new FourHourStats('data/report-4h.json') : null;
+const fourHour: FourHourStats | null = REPORT_4H_ON ? new FourHourStats('data/report-4h.json', Date.now, process.env.REPORT_4H_TZ || 'America/Toronto') : null;
 if (fourHour) setInterval(() => timed('4h report save', () => fourHour.save()), 60_000);
 // Read-only facts the 4-hour report shows, filled in further down where they exist.
 let lastLoopSample: LoopSample | null = null;        // the loop trader's last hour (set when the hourly code takes it)
@@ -1189,7 +1189,7 @@ const countVerifiedWin = (usd: number, label: string, win: WinFacts, pairTokens:
       const verdict = realisticPnl.record(usd, win);
       // Same win into the hourly money ledgers. The hourly report AND the
       // 4-hour report read them, so their money numbers always agree.
-      moneyLedgers.notePracticeWin(usd, label, verdict);
+      try { moneyLedgers.notePracticeWin(usd, label, verdict); } catch { /* reporting only */ }
       stableTally.noteWin(pairTokens, win.startToken, usd);
 };
 // Save on shutdown too: pm2 restart/stop (every deploy) sends SIGINT, and the
@@ -3957,6 +3957,7 @@ for (let i = 0; i < resolved.length; i++) {
       // hourly when that hour is a 4-hour mark, so the hourly goes first and
       // the 4-hour report uses the same collection (no second take).
       let afterTopOfHour: (() => Promise<void>) | null = null;
+      let lastHourlyKey = -1;
       if (REPORT_V2) {
             // Top of each clock hour (+1 s so the time reads 15:00, not 14:59).
             // Recomputed every time, so it never drifts.
@@ -3965,6 +3966,10 @@ for (let i = 0; i < resolved.length; i++) {
                   const next = Math.floor(t / 3_600_000) * 3_600_000 + 3_600_000 + 1_000;
                   setTimeout(() => {
                         scheduleNextHourly();
+                        // One hourly per clock hour, even if the clock jumps (review fix).
+                        const hourKey = Math.floor(Date.now() / 3_600_000);
+                        if (hourKey === lastHourlyKey) return;
+                        lastHourlyKey = hourKey;
                         void (async () => {
                               await sendHourlyDigest();
                               try { if (afterTopOfHour) await afterTopOfHour(); } catch (err) { console.error('[report4h] after hourly failed:', err); }
@@ -4027,14 +4032,19 @@ for (let i = 0; i < resolved.length; i++) {
       // ======================================================================
       const REPORT_4H_TZ = process.env.REPORT_4H_TZ || 'America/Toronto';
       let sending4h = false;
+      // The mark whose part-hour was already collected: a retry of the same
+      // mark never takes the hourly counters again (review fix).
+      let collectedMark = '';
       // collect=false: the top-of-hour hourly has just taken this hour's
       // numbers (one collection feeds both). collect=true (fallback, e.g. the
       // bot restarted at 16:10): take the part-hour first, without an hourly message.
       const sendFourHourReport = async (markKey: string, collect = true) => {
             if (!fourHour || sending4h) return;
             sending4h = true;
+            let closed = false;
             try {
-                  if (collect) await sendHourlyDigest(false); // the numbers since the last hourly take
+                  if (collect && collectedMark !== markKey) { collectedMark = markKey; await sendHourlyDigest(false); } // the numbers since the last hourly take
+                  collectedMark = markKey;
                   const now = Date.now();
                   // The 4-hour mark this report ends at, and the one it starts at.
                   // (now minus the minutes and seconds past the mark's hour)
@@ -4078,12 +4088,22 @@ for (let i = 0; i < resolved.length; i++) {
                   };
                   // Close the period first: a failed send never makes a second copy later.
                   const { totals, prev } = fourHour.close(markKey, now);
+                  closed = true;
                   const msgs = formatFourHourReport({ tz: REPORT_4H_TZ, scheduledFromMs, toMs: now, totals, prevWins: prev, snap });
                   console.log(`[report4h] sending 4-hour report ${markKey} (${msgs.map((m) => m.length).join('/')} chars)`);
                   for (const m of msgs) await sendTelegramMessage(m);
             } catch (err) {
                   console.error('[telegram] 4-hour report failed:', err);
-            } finally { sending4h = false; }
+            } finally {
+                  // Never left open: a failure before close() (e.g. a snapshot
+                  // read threw) closes the period anyway, so the fallback does
+                  // not retry every minute (each retry used to take the hourly
+                  // counters again). The numbers of that period are logged as lost.
+                  if (!closed) {
+                        try { fourHour.close(markKey, Date.now()); console.warn(`[report4h] ${markKey}: report failed before sending, period closed (not sent)`); } catch { /* reporting only */ }
+                  }
+                  sending4h = false;
+            }
       };
       if (fourHour && chainOn('robinhood') && !chainOn('monad') && !chainOn('avalanche')) {
             // Normal path: right after the top-of-hour hourly (hourly first, then

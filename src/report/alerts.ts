@@ -163,6 +163,10 @@ export class AlertCenter {
   sent = 0;
   heldCount = 0;
   dropped = 0;
+  // Critical alerts that could not be queued because the queue was full of
+  // critical alerts (hard cap). Never silently lost: a summary is sent once
+  // there is room again.
+  criticalOverflow = 0;
 
   constructor(private readonly o: AlertCenterOptions) {
     this.now = o.now ?? Date.now;
@@ -315,22 +319,51 @@ export class AlertCenter {
     while (this.sentTimes.length && now - this.sentTimes[0]! >= 3_600_000) this.sentTimes.shift();
   }
 
-  // One-off keys are remembered for a day at most (keeps the map small).
+  // One-off keys are remembered for two days at most, and never more than
+  // 1,000 keys (oldest first), so the map stays small.
   private trimEvents(now: number): void {
     if (this.lastEventAt.size < 500) return;
     for (const [k, t] of this.lastEventAt) if (now - t > 2 * 24 * 3600_000) this.lastEventAt.delete(k);
+    if (this.lastEventAt.size > 1_000) {
+      for (const k of this.lastEventAt.keys()) { this.lastEventAt.delete(k); if (this.lastEventAt.size <= 500) break; }
+    }
   }
 
-  // Bounded queue: when full, the oldest non-critical message is dropped first.
+  // Bounded queue. When full:
+  //   - drop the oldest NON-critical message (or the new one, if it is not
+  //     critical and only critical ones are waiting)
+  //   - critical (safety / real money) messages are never dropped: they may
+  //     go over the normal cap up to 4x; past that they are counted and one
+  //     summary is sent once there is room (never silently lost)
   private enqueue(item: QueueItem): void {
     if (this.queue.length >= this.queueMax) {
       const i = this.queue.findIndex((q) => !q.critical);
-      this.queue.splice(i >= 0 ? i : 0, 1);
-      this.dropped++;
-      this.log('[alerts] queue full (Telegram slow or down?): oldest alert dropped');
+      if (i >= 0) {
+        this.queue.splice(i, 1);
+        this.dropped++;
+        this.log('[alerts] queue full (Telegram slow or down?): oldest non-critical alert dropped');
+      } else if (!item.critical) {
+        this.dropped++;
+        this.log('[alerts] queue full of critical alerts: new non-critical alert dropped');
+        return;
+      } else if (this.queue.length >= this.queueMax * 4) {
+        this.criticalOverflow++;
+        this.log('[alerts] queue full of critical alerts: counted for a summary');
+        return;
+      }
     }
     this.queue.push(item);
     void this.drain();
+  }
+
+  // Room again after a critical overflow: one summary, itself critical.
+  private overflowSummary(): void {
+    if (!this.criticalOverflow || this.queue.length >= this.queueMax) return;
+    const n = this.criticalOverflow;
+    this.criticalOverflow = 0;
+    this.queue.push({ html: formatNote(`${n} more real-money alert${n === 1 ? '' : 's'} could not be shown`, [
+      'Telegram was too slow to keep up. Check the bot logs ([alerts] and [fire] lines) for each one.',
+    ], this.now(), this.timeLabel, '🛑', 'ALERTS MISSED'), critical: true });
   }
 
   // Sends one message at a time in the background. Each send gives up after
@@ -350,6 +383,7 @@ export class AlertCenter {
         } catch (err) {
           this.log(`[alerts] send failed: ${(err as Error)?.message ?? err}`);
         }
+        this.overflowSummary();
       }
     } finally {
       this.draining = false;

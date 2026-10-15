@@ -32,7 +32,10 @@ import type { HourMoney } from './fourHourStats';
 //   (reads and resets) once per report. That gives the exact numbers for the
 //   report's own window, not a clock-hour guess. The period counter lives in
 //   memory only: after a restart the report says the period is partial, so
-//   a fresh counter is the honest number.
+//   a fresh counter is the honest number. EXCEPT real money: the real-trade
+//   part of the period is saved with the hour buckets (data/live-money.json)
+//   after every real result, so a restart never loses real trades from the
+//   next hourly / 4-hour total (review fix).
 //
 //   Real money has no other store that survives restarts (the live trade
 //   log rotates), so it is kept here in hour buckets (one per UTC hour,
@@ -86,7 +89,8 @@ export interface RealResultIn {
 
 // One saved UTC-hour bucket of real money.
 interface RealHour { madeUsd: number; won: number; gasUsd: number; failed: number; failedCostUsd: number }
-interface RealState { version: 1; hours: Record<string, RealHour> }
+// period: real trades since the last hourly collection (not yet reported).
+interface RealState { version: 1; hours: Record<string, RealHour>; period?: RealHour }
 
 const emptyReal = (): RealPeriod => ({ madeUsd: 0, won: 0, gasUsd: 0, failed: 0, failedCostUsd: 0 });
 const num = (x: unknown) => (Number.isFinite(Number(x)) ? Number(x) : 0);
@@ -112,6 +116,7 @@ export class RealMoneyLedger {
         const s = JSON.parse(readFileSync(file, 'utf8'));
         if (s?.version === 1 && s.hours && typeof s.hours === 'object') {
           for (const [k, h] of Object.entries(s.hours)) if (/^\d+$/.test(k)) this.state.hours[k] = fixHour(h);
+          if (s.period && typeof s.period === 'object') this.state.period = fixHour(s.period);
         }
       } catch { /* no file yet: start at zero */ }
     }
@@ -170,6 +175,12 @@ export class RealMoneyLedger {
 
   hourCount(): number { return Object.keys(this.state.hours).length; }
 
+  // Real trades since the last collection, as saved (survives restarts).
+  savedPeriod(): RealPeriod | null { return this.state.period ? { ...this.state.period } : null; }
+  // Save the not-yet-reported real trades (after each result, and when a
+  // collection takes them: then it is all zeros).
+  savePeriod(p: RealPeriod) { this.state.period = fixHour(p); this.save(); }
+
   // Atomic write (temp file + rename). Tiny file, written only on a real result.
   save() {
     if (!this.file) return;
@@ -216,6 +227,9 @@ export class MoneyLedgers {
     private readonly now: () => number = Date.now,
   ) {
     this.period = MoneyLedgers.freshPeriod(now());
+    // Real trades not yet reported before a restart carry on into this period.
+    const saved = real.savedPeriod();
+    if (saved) this.period.real = saved;
   }
 
   private static freshPeriod(startMs: number): PeriodCounter {
@@ -244,6 +258,7 @@ export class MoneyLedgers {
     if (!d) return;
     const p = this.period.real;
     p.madeUsd += d.madeUsd; p.won += d.won; p.gasUsd += d.gasUsd; p.failed += d.failed; p.failedCostUsd += d.failedCostUsd;
+    this.real.savePeriod(p);
   }
 
   // Read the current period without resetting it.
@@ -254,6 +269,8 @@ export class MoneyLedgers {
     const end = this.now();
     const s = this.snapshot(end);
     this.period = MoneyLedgers.freshPeriod(end);
+    // Only touch the file when there was something real to hand over.
+    if (s.realPeriod.won || s.realPeriod.failed || s.realPeriod.gasUsd) this.real.savePeriod(this.period.real);
     return s;
   }
 

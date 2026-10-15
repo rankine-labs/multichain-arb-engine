@@ -210,7 +210,7 @@ async function main() {
     const sa = new SafetyAlerts((h, crit) => { msgs.push({ h, crit }); }, 20, 'robinhood', now, true);
     sa.onLoss(16); sa.onLoss(21); sa.onBlocked('kill switch is on', 21);
     console.log('--- example loss cap hit:\n' + msgs[1]?.h);
-    assert(msgs.length === 3 && msgs[0]!.h.includes('75% of the daily loss cap used') && !msgs[0]!.crit, 'v2: 75% warning, not critical');
+    assert(msgs.length === 3 && msgs[0]!.h.includes('75% of the daily loss cap used') && msgs[0]!.crit === true, 'v2: 75% warning is critical (real money, never held back)');
     assert(msgs[1]!.h.includes('Daily loss cap hit') && msgs[1]!.crit === true, 'v2: loss cap hit is critical');
     assert(msgs[2]!.h.includes('Kill switch on') && msgs[2]!.crit === true, 'v2: kill switch is critical');
     const old: string[] = [];
@@ -252,6 +252,70 @@ async function main() {
     assert(out.length === 3 && out[2]!.includes('Live trade failed on-chain') && out[2]!.includes('real money') && out[2]!.includes('$0.03'), 'reverted live trade: one plain critical alert (old one replaced)');
     assert(JSON.parse(readFileSync(join(dir, 'alert-state.json'), 'utf8')).mode === 'live' && !existsSync(join(dir, 'last-exit.json')), 'mode saved, exit file used up');
     assert(!out.join('\n').match(/[\u2014\u2013]/), 'no em dashes in any hook message');
+  }
+
+  // --- Review fixes (Oct 15) -------------------------------------------------
+  {
+    // 1. The heartbeat must not overwrite the last run's state before startup().
+    const dir = mkdtempSync(join(tmpdir(), 'alerts-hb-'));
+    writeFileSync(join(dir, 'alert-state.json'), JSON.stringify({ mode: 'live', aliveAt: clock - 120_000 }));
+    const out: string[] = [];
+    const center = new AlertCenter({ send: (h) => { out.push(h); }, now, timeLabel: time, log: () => {} });
+    const h = new AlertHooks({ send: () => {}, v2: true, dataDir: dir, now, center, modeReadyWaitMs: 60_000 });
+    h.installExitRecorder();
+    (h as any).saveState();              // what the 60 s heartbeat does
+    assert(JSON.parse(readFileSync(join(dir, 'alert-state.json'), 'utf8')).mode === 'live', 'heartbeat writes nothing before startup (old state kept)');
+    // Live checks finished BEFORE startup: the mode change says the real result.
+    h.liveChecksPassed();
+    h.startup(() => 'OLD', { robinhood: { online: true } }, false);   // live -> practice
+    await center.flush();
+    assert(out[0]!.includes('stopped without warning'), 'restart reason read from the saved state, not this run');
+    assert(out.some((m) => m.includes('MODE CHANGE') && m.includes('Was: Live') && m.includes('Now: Practice')), 'real live -> practice change is reported');
+    assert(JSON.parse(readFileSync(join(dir, 'alert-state.json'), 'utf8')).mode === 'practice', 'state saved after startup');
+    clearInterval((h as any).heartbeat);
+
+    const out2: string[] = [];
+    const c2 = new AlertCenter({ send: (x) => { out2.push(x); }, now, timeLabel: time, log: () => {} });
+    const dir2 = mkdtempSync(join(tmpdir(), 'alerts-m-'));
+    writeFileSync(join(dir2, 'alert-state.json'), JSON.stringify({ mode: 'practice', aliveAt: clock - 30_000 }));
+    const h2 = new AlertHooks({ send: () => {}, v2: true, dataDir: dir2, now, center: c2, modeReadyWaitMs: 60_000 });
+    h2.liveChecksPassed();
+    h2.startup(() => 'OLD', { robinhood: { online: true } }, true);  // practice -> live, checks already passed
+    await c2.flush();
+    assert(out2.some((m) => m.includes('MODE CHANGE') && m.includes('Readiness: live checks passed')), 'mode change right away when live checks already passed');
+
+    // 2. Low gas is critical (never held back by the rate limit).
+    const c3 = new AlertCenter({ send: () => {}, now, timeLabel: time, log: () => {}, maxPerHour: 0 });
+    const h3 = new AlertHooks({ send: () => {}, v2: true, dataDir: dir2, now, center: c3 });
+    h3.lowGas('bot wallet has 0.001 ETH');
+    assert(c3.heldCount === 0, 'low gas is never held back');
+
+    // 3. Send failures: one alert per kind, repeats rolled up.
+    const out4: string[] = [];
+    const c4 = new AlertCenter({ send: (x) => { out4.push(x); }, now, timeLabel: time, log: () => {} });
+    const h4 = new AlertHooks({ send: () => {}, v2: true, dataDir: dir2, now, center: c4 });
+    for (let i = 0; i < 40; i++) h4.liveSendFailed('WETH/USDG a>b', `nonce too low: next nonce ${100 + i}, tx nonce ${99 + i}`);
+    h4.liveSendFailed('WETH/USDG a>b', 'insufficient funds for gas');
+    await c4.flush();
+    assert(out4.length === 2, `40 of the same error = 1 alert, a different error = 1 more (${out4.length})`);
+    for (const k of (h4 as any).sendFails.keys()) h4.flushSendFails(k);
+    await c4.flush();
+    assert(out4.length === 3 && out4[2]!.includes('39 more in 5 min'), 'repeats come as one roll-up message');
+    for (const v of (h4 as any).sendFails.values()) if (v.timer) clearTimeout(v.timer);
+
+    // Queue never drops critical alerts.
+    const hung = new AlertCenter({ send: () => new Promise<void>(() => {}), now, timeLabel: time, log: () => {}, queueMax: 3, sendTimeoutMs: 60_000 });
+    hung.post('normal 1'); hung.post('crit 1', { critical: true }); hung.post('crit 2', { critical: true }); hung.post('crit 3', { critical: true });
+    hung.post('crit 4', { critical: true }); hung.post('normal 2');
+    const q = (hung as any).queue.map((x: any) => x.html);
+    assert(!q.includes('normal 1') && !q.includes('normal 2') && ['crit 2', 'crit 3', 'crit 4'].every((c) => q.includes(c)), 'full queue: non-critical dropped, critical kept');
+    for (let i = 0; i < 20; i++) hung.post(`crit x${i}`, { critical: true });
+    assert((hung as any).queue.length <= 12 && hung.criticalOverflow > 0, 'past the hard cap, critical alerts are counted for a summary, not dropped silently');
+
+    // lastEventAt stays bounded.
+    const c5 = new AlertCenter({ send: () => {}, now, timeLabel: time, log: () => {} });
+    for (let i = 0; i < 3_000; i++) c5.post('x', { onceKey: `k${i}` });
+    assert((c5 as any).lastEventAt.size <= 1_000, 'remembered one-off keys stay bounded');
   }
 
   // --- Restart reasons ------------------------------------------------------

@@ -101,6 +101,7 @@ export interface PeriodTotals {
   toMs: number;
   coveredMs: number;       // time covered by hour samples (less than toMs - fromMs after a restart)
   restarts: number;        // bot restarts seen during this period
+  dropped: { fromMs: number; toMs: number; hours: number } | null; // an older period dropped (bot down over its report time)
   hours: number;           // hour samples added
   wins: { n: number; usd: number; best: { usd: number; label: string } | null; liveOk: Bucket; leftOut: Record<'otherCoin' | 'overSize' | 'loan', Bucket> };
   outliers: { n: number; biggestUsd: number };
@@ -130,6 +131,9 @@ const MAX_CAUSES = 12, MAX_ROUTES = 6, MAX_VENUES = 20, MAX_COUNTERS = 40;
 interface PeriodState {
   fromMs: number;
   restarts: number;
+  // Set when an older period could not be reported (the bot was down over
+  // its report time) and was dropped at startup: shown in the next report.
+  dropped?: { fromMs: number; toMs: number; hours: number } | null;
   wins: { n: number; usd: number; best: { usd: number; label: string } | null; liveOk: Bucket; leftOut: Record<'otherCoin' | 'overSize' | 'loan', Bucket> };
   outliers: { n: number; biggestUsd: number };
   testsByKind: Record<string, { tests: number; wins: number }>;
@@ -195,7 +199,9 @@ export class FourHourStats {
   private s: FileState;
   private dirty = false;
 
-  constructor(private readonly file: string | null, private readonly now: () => number = Date.now) {
+  // tz: the 4-hour marks' zone (used to spot a saved period whose report
+  // time passed while the bot was down).
+  constructor(private readonly file: string | null, private readonly now: () => number = Date.now, private readonly tz = 'America/Toronto') {
     this.s = { version: 1, current: emptyPeriod(now()), prev: null, lastSentKey: '', counters: {} };
     if (!file) return;
     try {
@@ -215,6 +221,16 @@ export class FourHourStats {
           lastSentKey: typeof raw.lastSentKey === 'string' ? raw.lastSentKey : '',
           counters: raw.counters && typeof raw.counters === 'object' ? raw.counters : {},
         };
+        // Review fix: the bot was down over this period's report time (its
+        // report can no longer be sent, the 30 min grace is over). Its numbers
+        // must not be reported under the new window: drop them and say so.
+        const due = nextMarkAfter(this.s.current.fromMs, this.tz);
+        if (now() >= due + 30 * 60_000) {
+          const old = this.s.current;
+          const lastTo = old.hours.length ? Math.max(...old.hours.map((h) => fin(h.toMs))) : old.fromMs;
+          this.s.current = { ...emptyPeriod(now()), restarts: 1, dropped: { fromMs: old.fromMs, toMs: lastTo, hours: old.hours.length } };
+          this.s.prev = null; // the "vs last 4h" change would compare with a period never reported
+        }
         this.dirty = true;
       }
     } catch { /* no file yet, or unreadable: start fresh */ }
@@ -413,7 +429,7 @@ export function totalsOf(p: PeriodState, toMs: number): PeriodTotals {
   for (const h of H) if (h.money) for (const k of Object.keys(realMoney) as (keyof PeriodTotals['money'])[]) realMoney[k] += fin(h.money[k]);
 
   return {
-    fromMs: p.fromMs, toMs, coveredMs, restarts: p.restarts, hours: H.length,
+    fromMs: p.fromMs, toMs, coveredMs, restarts: p.restarts, dropped: p.dropped ?? null, hours: H.length,
     wins,
     outliers: { ...p.outliers },
     testsByKind: JSON.parse(JSON.stringify(p.testsByKind)),
@@ -437,6 +453,14 @@ export function zonedParts(ms: number, tz: string): { date: string; hour: number
   const parts = new Intl.DateTimeFormat('en-CA', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false }).formatToParts(new Date(ms));
   const get = (t: string) => parts.find((p) => p.type === t)?.value ?? '';
   return { date: `${get('year')}-${get('month')}-${get('day')}`, hour: Number(get('hour')) % 24, minute: Number(get('minute')) };
+}
+
+// The first 4-hour mark (00/04/08/12/16/20 in tz) strictly after `ms`.
+// Steps through whole UTC hours (Toronto is a whole number of hours off UTC).
+export function nextMarkAfter(ms: number, tz: string): number {
+  let t = Math.floor(ms / 3_600_000) * 3_600_000 + 3_600_000;
+  for (let i = 0; i < 30; i++, t += 3_600_000) if (zonedParts(t, tz).hour % 4 === 0) return t;
+  return t;
 }
 
 // If `ms` is within the first `graceMin` minutes of a 4-hour mark

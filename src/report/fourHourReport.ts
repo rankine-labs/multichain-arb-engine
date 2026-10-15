@@ -121,6 +121,7 @@ export function periodLine(i: FourHourInput): { line: string; partial: string | 
   const notes: string[] = [];
   if (t.fromMs > i.scheduledFromMs + 2 * 60_000) notes.push(`counting started ${clock(t.fromMs, i.tz)}, not ${clock(i.scheduledFromMs, i.tz)}`);
   if (t.restarts > 0) notes.push(`bot restarted ${t.restarts}x, up to an hour of detail may be missing each time`);
+  if (t.dropped) notes.push(`older numbers from ${clock(t.dropped.fromMs, i.tz)} to ${clock(t.dropped.toMs, i.tz)} were not reported (bot was down at their report time) and are not included`);
   if (t.hours === 0) notes.push('no detailed numbers collected yet');
   else if (t.coveredMs < span * 0.9) notes.push(`detailed numbers cover ${Math.round(t.coveredMs / 60_000)} of ${Math.round(span / 60_000)} min`);
   return { line, partial: notes.length ? `Partial period: ${notes.join('; ')}` : null };

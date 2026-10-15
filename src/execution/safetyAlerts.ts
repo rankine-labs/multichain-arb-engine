@@ -91,11 +91,12 @@ export class SafetyAlerts {
       this.capHit(lostTodayUsd);
     } else if (lostTodayUsd >= 0.75 * this.capUsd) {
       if (this.firstToday('loss-75')) {
+        // Critical (review fix): real money, never held back by the rate limit.
         this.send(!this.v2 ? formatLossCapWarning(this.chain, lostTodayUsd, this.capUsd) : formatProblem({
-          title: '75% of the daily loss cap used', severity: 'high',
+          title: '75% of the daily loss cap used', severity: 'high', critical: true,
           meaning: `we lost $${lostTodayUsd.toFixed(2)} of the $${this.capUsd.toFixed(2)} allowed today (gas on lost races plus any losing trades)`,
           happening: `still trading; real trades stop for the day at $${this.capUsd.toFixed(2)}`,
-        }, this.now()));
+        }, this.now()), true);
       }
     }
   }

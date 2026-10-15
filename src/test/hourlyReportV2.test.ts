@@ -88,6 +88,39 @@ const H = 3_600_000, D = 86_400_000;
   assert(s3.checked.lastHour === 0 && s3.couldEarn.lastHour === 0, 'live results never touch the practice ledgers');
 }
 
+// --- Review fix: real trades since the last collection survive a restart --------
+{
+  let clock = Date.UTC(2026, 9, 15, 18, 0);
+  const file = join(dir(), 'live-money.json');
+  const practice = { checked: () => ({ today: 0, week: 0 }), couldEarn: () => ({ today: 0, week: 0 }) };
+  const ml = new MoneyLedgers(practice, new RealMoneyLedger(file, 'America/Toronto', () => clock), () => clock);
+  ml.noteRealResult({ status: 'profit', gasUsd: 0.25, profitUsd: 3.25 }, true);
+  ml.noteRealResult({ status: 'reverted', gasUsd: 0.4 }, true);
+  // Restart before the hourly collection.
+  const ml2 = new MoneyLedgers(practice, new RealMoneyLedger(file, 'America/Toronto', () => clock), () => clock);
+  const s = ml2.takePeriod();
+  assert(near(s.real.lastHour, 2.6) && s.realPeriod.failed === 1 && near(s.realPeriod.gasUsd, 0.65), 'restart: real trades not yet reported carry into the next collection');
+  const ml3 = new MoneyLedgers(practice, new RealMoneyLedger(file, 'America/Toronto', () => clock), () => clock);
+  assert(ml3.takePeriod().real.lastHour === 0, 'after the collection, a restart does not count them twice');
+}
+
+// --- Review fix: a 4-hour period whose report time passed while the bot was down -
+{
+  const file = join(dir(), 'report-4h.json');
+  let clock = Date.UTC(2026, 9, 15, 16, 0, 30);   // 12:00 Toronto
+  const a = new FourHourStats(file, () => clock);
+  a.addHour({ ...hourSampleLite(clock), money: undefined });
+  a.save();
+  clock = Date.UTC(2026, 9, 15, 20, 10);           // 16:10: still inside the grace window
+  assert(new FourHourStats(file, () => clock).peek().hours === 1, 'restart inside the grace window: period kept (the late report still covers it)');
+  clock = Date.UTC(2026, 9, 15, 21, 30);           // 17:30: the 16:00 report can no longer be sent
+  const b = new FourHourStats(file, () => clock);
+  const t = b.peek();
+  assert(t.hours === 0 && t.dropped !== null && t.dropped.hours === 1 && t.fromMs === clock, 'down over the report time: old numbers dropped, not shown under the new window');
+  const msg = formatFourHourReport({ tz: 'America/Toronto', scheduledFromMs: Date.UTC(2026, 9, 15, 20, 0), toMs: Date.UTC(2026, 9, 16, 0, 0), totals: b.peek(Date.UTC(2026, 9, 16, 0, 0)), prevWins: null, snap: fourSnapLite() });
+  assert(msg[0]!.includes('older numbers from 12:00 to 13:00 were not reported'), 'the next 4-hour report says so honestly');
+}
+
 // --- Formatter ------------------------------------------------------------------
 const snap = (over: Partial<LedgerSnapshot> = {}): LedgerSnapshot => ({
   periodStartMs: Date.UTC(2026, 9, 15, 18, 0), periodEndMs: Date.UTC(2026, 9, 15, 19, 0, 1),
@@ -174,6 +207,8 @@ const input = (over: Partial<HourlyReportInput> = {}): HourlyReportInput => ({
 // --- One collection feeds the hourly AND the 4-hour report ----------------------
 // Four hourly collections: each takes the money ledgers once (like
 // shadowMain), and the same snapshot goes into the 4-hour totals.
+function hourSampleLite(fromMs: number): HourSample { return hourSample(fromMs, 1); }
+function fourSnapLite(): FourHourSnapshot { return fourSnap(false); }
 function hourSample(fromMs: number, k: number): HourSample {
   return {
     fromMs, toMs: fromMs + H,
@@ -190,12 +225,14 @@ function hourSample(fromMs: number, k: number): HourSample {
     venues: [], live: { sent: k === 1 ? 2 : 0, won: 0, profitUsd: 0, gasUsd: 0 }, feedDrops: 0,
   };
 }
-const fourSnap = (live: boolean): FourHourSnapshot => ({
+function fourSnap(live: boolean): FourHourSnapshot {
+  return {
   live, loansOn: false, pairs: 214, pools: 538, gasPerTradeUsd: 0.021, gasSamples: 14, gasCalibrated: true, gasSource: 'live', feePoolsFromSwaps: 6,
   otherStables: null, rivals: null, rivalBotsKnown: 41, newPools: null, thinPools: 4,
   memory: { rssMb: 612, peakRssMb: 740, heapMb: 310, notes: null }, feedOkNow: true, ws: null, checkNode: 'QuickNode (backup: Alchemy)',
   nodeErrors: { blockReaderErrors: 0, blockReaderRateLimited: 0, freeNodeRests: 0 }, nodeUsage: [], loopsOn: true, maxLoopPools: 5, emergencyStop: 'off',
-});
+};
+}
 for (const live of [false, true]) {
   const start = Date.UTC(2026, 9, 15, 16, 0);  // 12:00 Toronto
   let clock = start;
