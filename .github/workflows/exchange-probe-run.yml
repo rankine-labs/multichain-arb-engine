@@ -1,0 +1,37 @@
+# ============================================================================
+# EXCHANGE PROBE (one-off, read-only). Runs scripts/probe-exchanges.ts on
+# GitHub's computers against the PUBLIC Robinhood node and commits the result
+# (results/exchange-probe.json) back to the probe-exchanges branch.
+# Never touches the bot server, any key or any funds; sends no transactions.
+# ============================================================================
+name: Exchange probe (one-off)
+
+on:
+  push:
+    branches: [probe-exchanges]
+    paths: ['scripts/probe-exchanges.ts', 'scripts/exchange-probe-pools.json', '.github/workflows/exchange-probe-run.yml']
+
+permissions:
+  contents: write
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install --no-audit --no-fund
+      - run: npx tsc -p tsconfig.scripts.json
+      - name: Probe every workbook pool (read-only)
+        run: node .scripts-build/scripts/probe-exchanges.js
+      - name: Commit the result back to the branch
+        if: always()
+        run: |
+          git config user.name "exchange-probe"
+          git config user.email "exchange-probe@users.noreply.github.com"
+          git add -f results/exchange-probe.json || exit 0
+          git commit -m "Exchange probe result (read-only)" || exit 0
+          git push
