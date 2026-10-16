@@ -29,13 +29,18 @@ import { dirname } from 'path';
 // ============================================================================
 
 // Why a win was left out of the live-realistic total.
-export type ExcludeReason = 'otherCoin' | 'overSize' | 'loan';
+// 'venue' (Oct 16): a pool on an exchange or pool type live trading refuses
+// (practice-only venues, non-standard V4 settings), so live could not take it.
+export type ExcludeReason = 'otherCoin' | 'venue' | 'overSize' | 'loan';
 
 // What we know about one verified win.
 export interface WinFacts {
   startToken: string;       // the coin the trade starts and ends in (profit coin)
   sizeUsd: number;          // trade size in dollars
   lender?: string;          // loan pool address, or undefined for own money
+  // Set when a pool in the trade is one live trading refuses (the reason,
+  // e.g. "exchange not cleared for trading"). Unset = both pools tradable.
+  notLive?: string;
 }
 
 export interface RealisticConfig {
@@ -48,6 +53,7 @@ export interface RealisticConfig {
 // Returns 'ok' or the first rule the win breaks.
 export function realisticVerdict(w: WinFacts, cfg: RealisticConfig): 'ok' | ExcludeReason {
   if (!cfg.startCoins.has(String(w.startToken).toLowerCase())) return 'otherCoin';
+  if (w.notLive) return 'venue';
   // A missing or broken size is treated as "too big" (never counts as realistic).
   if (!(w.sizeUsd > 0) || !Number.isFinite(w.sizeUsd) || w.sizeUsd > cfg.ownMaxUsd) return 'overSize';
   if (w.lender) return 'loan';
@@ -71,7 +77,7 @@ interface State { version: 1; days: Record<string, RealisticDay> }
 
 const emptyDay = (): RealisticDay => ({
   usd: 0, count: 0,
-  excluded: { otherCoin: { usd: 0, n: 0 }, overSize: { usd: 0, n: 0 }, loan: { usd: 0, n: 0 } },
+  excluded: { otherCoin: { usd: 0, n: 0 }, venue: { usd: 0, n: 0 }, overSize: { usd: 0, n: 0 }, loan: { usd: 0, n: 0 } },
 });
 // Older or hand-edited files may miss fields: fill them in so reading never breaks.
 const fixDay = (d: any): RealisticDay => {
@@ -79,7 +85,7 @@ const fixDay = (d: any): RealisticDay => {
   if (!d || typeof d !== 'object') return e;
   const num = (x: any) => (Number.isFinite(Number(x)) ? Number(x) : 0);
   e.usd = num(d.usd); e.count = num(d.count);
-  for (const k of ['otherCoin', 'overSize', 'loan'] as ExcludeReason[]) {
+  for (const k of ['otherCoin', 'venue', 'overSize', 'loan'] as ExcludeReason[]) {
     e.excluded[k] = { usd: num(d.excluded?.[k]?.usd), n: num(d.excluded?.[k]?.n) };
   }
   return e;
@@ -158,7 +164,7 @@ export class RealisticPnl {
     const e = s.today.excluded;
     return [
       `live-realistic (${this.cfg.startLabel ?? 'USDG/WETH'} start, own money <= ${cap}, no loan): today ${$(s.today.usd)} from ${s.today.count}, 7 days ${$(s.weekUsd)}`,
-      `left out today: started in another coin ${$(e.otherCoin.usd)} (${e.otherCoin.n}), over own-money size ${$(e.overSize.usd)} (${e.overSize.n}), needed a loan ${$(e.loan.usd)} (${e.loan.n})`,
+      `left out today: started in another coin ${$(e.otherCoin.usd)} (${e.otherCoin.n}), exchange not live yet ${$(e.venue.usd)} (${e.venue.n}), over own-money size ${$(e.overSize.usd)} (${e.overSize.n}), needed a loan ${$(e.loan.usd)} (${e.loan.n})`,
     ];
   }
 

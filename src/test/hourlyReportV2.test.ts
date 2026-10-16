@@ -129,7 +129,7 @@ const snap = (over: Partial<LedgerSnapshot> = {}): LedgerSnapshot => ({
   real: { lastHour: 0, today: 0, week: 0 },
   realPeriod: { madeUsd: 0, won: 0, gasUsd: 0, failed: 0, failedCostUsd: 0 },
   checkedCount: 4, couldEarnCount: 3,
-  leftOut: { otherCoin: { n: 1, usd: 2.18 }, overSize: { n: 0, usd: 0 }, loan: { n: 0, usd: 0 } },
+  leftOut: { otherCoin: { n: 1, usd: 2.18 }, venue: { n: 0, usd: 0 }, overSize: { n: 0, usd: 0 }, loan: { n: 0, usd: 0 } },
   best: { usd: 2.31, label: 'WETH ramses-v3->uniswap-v2' },
   ...over,
 });

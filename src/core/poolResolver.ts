@@ -1,3 +1,4 @@
+import { STANDARD_V4_TIERS, V4_LOOKUP_TIERS } from '../config/v4Tiers';
 import { ethers } from 'ethers';
 import { PoolState, ChainName } from './types';
 // Type-only (removed when compiled): the Kuru SDK and ethers v5 are only
@@ -299,7 +300,11 @@ export async function resolveAndFetchV3Pool(
 //   In 'spacing' mode the fee is read from the pool itself.
 // ============================================================================
 
-export const V3_FEE_TIERS_ALL = [100, 500, 2500, 3000, 10000];
+// V3-style fee tiers looked up on factories keyed by fee. 50 (0.005%) and
+// 2000 (0.2%) added Oct 16: GIGA CL pools use them (WETH/USDG 0.005% does
+// ~$2M a day, MSTR/USDG 0.2%), and the bot never found them. A factory that
+// doesn't have a tier just answers "no pool", so extra tiers cost one read.
+export const V3_FEE_TIERS_ALL = [50, 100, 500, 2000, 2500, 3000, 10000];
 export const V3_TICK_SPACINGS = [1, 5, 10, 50, 100, 200];
 const V3_FACTORY_BY_SPACING_ABI = ['function getPool(address tokenA, address tokenB, int24 tickSpacing) view returns (address pool)'];
 const V3_POOL_FEE_ABI = ['function fee() view returns (uint24)'];
@@ -503,12 +508,10 @@ const V4_STATE_VIEW_ABI = [
       'function getLiquidity(bytes32 poolId) view returns (uint128 liquidity)',
     ];
 
-export const STANDARD_V4_FEE_TIERS: [number, number][] = [
-      [500, 10],
-      [3000, 60],
-      [10000, 200],
-      [100, 1],
-    ];
+// The 4 standard settings, kept for code that asks for "standard" only.
+// Lookups use V4_LOOKUP_TIERS: these 4 plus the non-standard settings seen on
+// real pools (config/v4Tiers.ts, Oct 16).
+export const STANDARD_V4_FEE_TIERS: [number, number][] = STANDARD_V4_TIERS.map(([f, t]) => [f, t]);
 
 // Pool id of a V4 pool: keccak256 of its key. hooks = 0 for every pool we trade.
 export function v4PoolId(currency0: string, currency1: string, fee: number, tickSpacing: number, hooks = ethers.ZeroAddress): string {
@@ -516,8 +519,9 @@ export function v4PoolId(currency0: string, currency1: string, fee: number, tick
     ['address', 'address', 'uint24', 'int24', 'address'], [currency0, currency1, fee, tickSpacing, hooks]));
 }
 
-// Every HOOKLESS standard V4 pool for (tokenA, tokenB) with liquidity: the 4
-// usual fee / tick-spacing combos, plus the native-ETH versions when one side
+// Every HOOKLESS V4 pool for (tokenA, tokenB) with liquidity: every fee /
+// tick-spacing setting in V4_LOOKUP_TIERS (the 4 standard ones and the
+// non-standard ones seen on real pools, config/v4Tiers.ts), plus the native-ETH versions when one side
 // is WETH (most V4 ETH pools hold native ETH, not WETH). Pools with hooks
 // (custom add-on code) are never returned: the contract won't trade them.
 //
@@ -536,7 +540,7 @@ export async function resolveAllV4Pools(
 
   const out: PoolState[] = [];
   for (const v of variants) {
-    for (const [fee, tickSpacing] of STANDARD_V4_FEE_TIERS) {
+    for (const [fee, tickSpacing] of V4_LOOKUP_TIERS) {
       try {
         const id = v4PoolId(v.c0, v.c1, fee, tickSpacing);
         const liquidity: bigint = await stateView.getLiquidity(id);
@@ -582,7 +586,7 @@ export async function resolveAndFetchV4Pool(
               const stateView = new ethers.Contract(stateViewAddress, V4_STATE_VIEW_ABI, provider);
               const [currency0, currency1] = tokenA.toLowerCase() < tokenB.toLowerCase() ? [tokenA, tokenB] : [tokenB, tokenA];
 
-              for (const [fee, tickSpacing] of STANDARD_V4_FEE_TIERS) {
+              for (const [fee, tickSpacing] of V4_LOOKUP_TIERS) {
                         try {
                                     const encoded = ethers.AbiCoder.defaultAbiCoder().encode(
                                                   ['address', 'address', 'uint24', 'int24', 'address'],

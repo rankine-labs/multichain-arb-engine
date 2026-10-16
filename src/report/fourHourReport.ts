@@ -165,6 +165,7 @@ function moneySection(i: FourHourInput): string[] {
   const lo = w.leftOut;
   const left = [
     row("Started in a coin we don't hold", `${money(lo.otherCoin.usd)} (${lo.otherCoin.n})`, 31),
+    row('Exchange not live yet', `${money(lo.venue?.usd ?? 0)} (${lo.venue?.n ?? 0})`, 31),
     row('Bigger than our money', `${money(lo.overSize.usd)} (${lo.overSize.n})`, 31),
     row('Needed a loan', `${money(lo.loan.usd)} (${lo.loan.n})`, 31),
   ];

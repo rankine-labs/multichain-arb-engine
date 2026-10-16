@@ -1,3 +1,4 @@
+import { V4_LOOKUP_TIERS } from '../config/v4Tiers';
 import { readFileSync, writeFileSync, mkdirSync, renameSync } from 'fs';
 import { dirname } from 'path';
 import { ethers } from 'ethers';
@@ -9,7 +10,7 @@ import { timed, markStretch } from './stallFinder';
 import {
   resolveAndFetchV2Pool, resolveAndFetchSolidlyV2Pool, resolveAllV3Pools, resolveAllV4Pools,
   refetchV2PoolPrice, refetchV3PoolPrice, refetchV4PoolPrice,
-  v4PoolId, V3_FEE_TIERS_ALL, V3_TICK_SPACINGS, STANDARD_V4_FEE_TIERS,
+  v4PoolId, V3_FEE_TIERS_ALL, V3_TICK_SPACINGS,
 } from './poolResolver';
 
 // ============================================================================
@@ -186,7 +187,7 @@ export async function discoverPairPoolsMulticall(
       const a = tokenA.toLowerCase(), b = tokenB.toLowerCase(), w = v.weth.toLowerCase();
       const variants: { c0: string; c1: string; native: boolean }[] = [a < b ? { c0: tokenA, c1: tokenB, native: false } : { c0: tokenB, c1: tokenA, native: false }];
       if (a === w || b === w) variants.push({ c0: ethers.ZeroAddress, c1: a === w ? tokenB : tokenA, native: true });
-      for (const vr of variants) for (const [fee, tickSpacing] of STANDARD_V4_FEE_TIERS) {
+      for (const vr of variants) for (const [fee, tickSpacing] of V4_LOOKUP_TIERS) {
         const id = v4PoolId(vr.c0, vr.c1, fee, tickSpacing);
         pend.push({ venue: v, kind: 'v4', id, fee, tickSpacing, native: vr.native, c0: vr.c0, c1: vr.c1,
           liqIdx: push(v.factory, iSV.encodeFunctionData('getLiquidity', [id])), slotIdx: push(v.factory, iSV.encodeFunctionData('getSlot0', [id])) });
