@@ -11,7 +11,7 @@ name: Follow the money (one-off)
 
 on:
   push:
-    branches: [ftm-run]
+    branches: [ftm-run-1h]
 
 permissions:
   contents: read
@@ -26,15 +26,15 @@ jobs:
         with:
           node-version: 22
       - run: npm install --no-audit --no-fund
-      - name: Follow the money (6 hours of chain history, public node, gentle)
+      - name: Follow the money (1 hour of chain history, public node, gentle)
         env:
           FTM_RPC: https://rpc.mainnet.chain.robinhood.com
-        run: npm run follow-money -- --hours 6 --rps 6
+        run: npm run follow-money -- --hours 1 --rps 6
       - name: Save the report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: follow-the-money
+          name: follow-the-money-1h
           path: |
             data/ftm-report-*.md
             data/ftm-arbs-*.csv
