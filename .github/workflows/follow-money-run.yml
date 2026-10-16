@@ -1,0 +1,50 @@
+# ============================================================================
+# FOLLOW THE MONEY (one-off run on GitHub's computers, read-only).
+# Runs the arbitrage study (scripts/follow-the-money.ts) against the PUBLIC
+# Robinhood node, so nothing on the bot server or any key is involved.
+# Triggered by a push to the ftm-run branch only. The study is capped at
+# 60 minutes; whatever it read by then is turned into a report (the study
+# saves progress as it goes), and the report is posted as a GitHub issue.
+# Never sends transactions.
+# Note: the bot's watch list (data/watched-pools.json) lives on the server,
+# so in this run no pool counts as "watched"; everything else is reported.
+# ============================================================================
+name: Follow the money (one-off)
+
+on:
+  push:
+    branches: [ftm-run]
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  study:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install --no-audit --no-fund
+      - name: Follow the money (3 hours of history, capped at 60 min)
+        env:
+          FTM_RPC: https://rpc.mainnet.chain.robinhood.com
+        run: |
+          mkdir -p data
+          npm run follow-money -- --hours 3 --rps 8 --max-minutes 60 2>&1 | tee data/ftm-run.log || true
+      - name: Report from whatever was read
+        if: always()
+        run: |
+          ls data/ftm-report-*.md >/dev/null 2>&1 || npm run follow-money -- --report-only 2>&1 | tee -a data/ftm-run.log || true
+      - name: Post the report as an issue
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          f=$(ls -t data/ftm-report-*.md 2>/dev/null | head -1)
+          { echo "Run log (last 40 lines):"; echo '```'; tail -40 data/ftm-run.log 2>/dev/null; echo '```'; echo; [ -n "$f" ] && cat "$f" || echo "No report was produced."; } > body.md
+          head -c 60000 body.md > body-trim.md
+          gh issue create --repo "${{ github.repository }}" --title "Follow the money report ($(date -u +%Y-%m-%d\ %H:%M) UTC)" --body-file body-trim.md
