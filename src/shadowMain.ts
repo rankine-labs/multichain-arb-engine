@@ -2768,7 +2768,10 @@ await chainManager.startAll();
                   const mainOpts = { minProfitUsd: GAP_MIN_USD, flashFee: RH_OWN_MONEY ? 0 : 0.0005, gasUsd: rhGasUsd(0.05), maxTradeUsd: MAX_TRADE_USD,
                         // Top 3 pool combinations per coin pair (was only the best): a muted
                         // combination no longer hides the other pools of the same pair.
-                        perPair: 3 };
+                        perPair: 3,
+                        // Oct 16 (owner approved): start every gap from a coin we hold
+                        // (USDG/WETH) when the pair has one. GAP_START_HELD=0 = old rule.
+                        ...(process.env.GAP_START_HELD !== '0' ? { startCoins: [ROBINHOOD_TOKENS.USDG, ROBINHOOD_TOKENS.WETH] } : {}) };
                   const gaps = GAP_SCAN_FAST
                         ? await runSteps(findStandingGapsSteps(pairs, gapDecimals, usdRh, mainOpts, gapMemoMain), 'gap scan', GAP_SCAN_SLICE_MS)
                         : findStandingGaps(pairs, gapDecimals, usdRh, mainOpts);
