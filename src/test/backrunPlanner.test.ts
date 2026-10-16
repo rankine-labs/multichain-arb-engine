@@ -76,3 +76,21 @@ assert(cache.get('avalanche', '0xA')?.reserveA === 1_000n * E18, 'prediction nev
   assert(capped !== null && capped.sizing.optimalTradeSizeUsd <= cap + 1e-6, 'with a $20k cap the trade is shrunk to $20k or less');
   assert((capped?.profit.conservativeNetProfitUsd ?? 0) > 0 && (capped?.profit.conservativeNetProfitUsd ?? 0) <= (uncapped?.profit.conservativeNetProfitUsd ?? 0), 'shrunk trade still makes money (less than uncapped)');
 }
+
+// Oct 16 (owner approved): OUR start coin can differ from the coin the other
+// trader sold. Someone dumps 50 WETH into pool A (WETH now cheap there). If we
+// only held USDC, the old plan started from WETH (we'd need WETH we don't
+// have). With startToken = USDC we start from USDC: buy the cheap WETH on pool
+// A, sell it on pool B, end with more USDC. Same gap, same two pools.
+{
+  const fromTheirCoin = planBackrun(cache, victim, peer, { ...bigSell, stateType: 'PENDING' }, 3400, costs);
+  const fromOurCoin = planBackrun(cache, victim, peer, { ...bigSell, stateType: 'PENDING' }, 1, costs, 18, { startToken: 'USDC' });
+  assert(fromOurCoin !== null && fromOurCoin.usedPrediction, 'start from our coin: still predicts THEIR trade (WETH dumped into pool A)');
+  assert(fromOurCoin?.buyPool.dex === 'dexA' && fromOurCoin?.sellPool.dex === 'dexB',
+    'start from USDC: buys the cheap WETH on the pushed pool (A), sells on the other (B)');
+  const a = fromTheirCoin?.profit.conservativeNetProfitUsd ?? 0, b = fromOurCoin?.profit.conservativeNetProfitUsd ?? 0;
+  assert(b > 20 && b / a > 0.5 && b / a < 2, `same gap from our coin is worth about the same ($${b.toFixed(2)} vs $${a.toFixed(2)} from their coin)`);
+  // Default (no startToken) is exactly the old behaviour.
+  const dflt = planBackrun(cache, victim, peer, { ...bigSell, stateType: 'PENDING' }, 3400, costs, 18, {});
+  assert(dflt?.profit.conservativeNetProfitUsd === a && dflt?.buyPool.dex === fromTheirCoin?.buyPool.dex, 'no startToken: same plan as before');
+}

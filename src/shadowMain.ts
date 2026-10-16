@@ -2378,7 +2378,17 @@ if (registerIfApproved('avalanche', entry.dex, resolved)) pool = resolved;
             }
       }
 
-const usdPerToken = priceOracle.getUsdPrice(swap.chain, swap.tokenIn);
+// OUR start coin (Oct 16, owner approved). Robinhood: if the other trader
+// sold a coin we don't hold (e.g. ORBIO) and the pair has USDG/WETH, our trade
+// starts and ends in USDG/WETH: buy the coin they just made cheap, sell it
+// where it's dear. Before, we started from THEIR coin (ORBIO), which live
+// can never send (we hold no ORBIO). TRIGGER_START_HELD=0 = old behaviour.
+const heldStart = swap.chain === 'robinhood' && process.env.TRIGGER_START_HELD !== '0'
+      ? new Set([ROBINHOOD_TOKENS.USDG.toLowerCase(), ROBINHOOD_TOKENS.WETH.toLowerCase()]) : null;
+const flipStart = !!heldStart && !heldStart.has(swap.tokenIn.toLowerCase()) && heldStart.has(swap.tokenOut.toLowerCase());
+const planIn = flipStart ? swap.tokenOut : swap.tokenIn;   // we start and end with this
+const planOut = flipStart ? swap.tokenIn : swap.tokenOut;  // passes through in the middle
+const usdPerToken = priceOracle.getUsdPrice(swap.chain, planIn);
 if (usdPerToken === null) { if (swap.chain === 'robinhood') funnel.noUsdPrice++; return; }
 
 // Predict the price AFTER this pending swap lands, then size the arb
@@ -2394,14 +2404,14 @@ for (const peer of peers) {
       //  - finer size search (pure maths, no node requests)
       // Other chains keep the old figures.
       const rh = swap.chain === 'robinhood';
-      const loanBps = rh ? rhLoanFeeBps(swap.tokenIn, pool, peer) : 9;
+      const loanBps = rh ? rhLoanFeeBps(planIn, pool, peer) : 9;
       const candidate = planBackrun(cache, pool, peer, swap, usdPerToken, {
             gasPriceUsd: rh ? rhGasUsd(0.05, loanBps !== null, [kindForPool(pool), kindForPool(peer)]) : 2,
             dexFeeBps: { buy: pool.feeBps, sell: peer.feeBps }, // overwritten per direction inside planBackrun
             flashLoanFeeBps: loanBps ?? 0,
             usingFlashLoan: !rh || loanBps !== null,
             safetyMarginPct: 0.15,
-      }, decimalsOf(swap.chain, swap.tokenIn), rh ? { refineSize: true, maxTradeUsd: involvesAutoVetted([swap.tokenIn, swap.tokenOut]) ? Math.min(MAX_TRADE_USD, AUTO_VET_MAX_TRADE_USD) : MAX_TRADE_USD, ...(loanBps === null ? { funding: 'own-capital' as const } : {}) } : {});
+      }, decimalsOf(swap.chain, planIn), rh ? { refineSize: true, maxTradeUsd: involvesAutoVetted([swap.tokenIn, swap.tokenOut]) ? Math.min(MAX_TRADE_USD, AUTO_VET_MAX_TRADE_USD) : MAX_TRADE_USD, ...(loanBps === null ? { funding: 'own-capital' as const } : {}), ...(flipStart ? { startToken: planIn } : {}) } : {});
       if (candidate && (!plan || candidate.profit.conservativeNetProfitUsd > plan.profit.conservativeNetProfitUsd)) plan = candidate;
 }
 trace?.mark('math');
@@ -2430,7 +2440,7 @@ chain: swap.chain,
 });
 
 const opportunity = buildOpportunity(
-swap.chain, [swap.tokenIn, swap.tokenOut],
+swap.chain, [planIn, planOut],   // [0] = our start coin (outcome check reads it)
 buyPoolUsed.dex, buyPoolUsed.poolAddress, sellPoolUsed.dex, sellPoolUsed.poolAddress,
 sizing, profit, event, score,
 );
@@ -2458,14 +2468,14 @@ if (swap.chain === 'robinhood') {
       if (research.enabled && (sizing.grossProfitUsd < SIM_MIN_GROSS_USD || !simVetted)) {
             const rc: ResearchCandidate = {
                   reason: sizing.grossProfitUsd < SIM_MIN_GROSS_USD ? 'below_sim_bar' : 'unvetted_token', source: 'trigger',
-                  tokenIn: swap.tokenIn, buyPool: buyPoolUsed, sellPool: sellPoolUsed, sizeUsd: sizing.optimalTradeSizeUsd,
+                  tokenIn: planIn, buyPool: buyPoolUsed, sellPool: sellPoolUsed, sizeUsd: sizing.optimalTradeSizeUsd,
                   modelGrossUsd: sizing.grossProfitUsd, usdPerToken, vetted: simVetted, triggerHash: (event.raw as any)?.hash,
             };
             research.offer(rc.reason, `${buyPoolUsed.poolAddress}>${sellPoolUsed.poolAddress}`, () => rc);
       }
 }
 if (sizing.grossProfitUsd >= SIM_MIN_GROSS_USD && simAllowed) {
-      queueSimulation(swap.chain, swap.tokenIn, buyPoolUsed, sellPoolUsed, sizing.optimalTradeSizeUsd, sizing.grossProfitUsd, usdPerToken, (event.raw as any)?.hash, simVetted);
+      queueSimulation(swap.chain, planIn, buyPoolUsed, sellPoolUsed, sizing.optimalTradeSizeUsd, sizing.grossProfitUsd, usdPerToken, (event.raw as any)?.hash, simVetted);
 }
 
 if (!profit.qualifies) {
@@ -2481,13 +2491,13 @@ shadowLogger.record({ opportunity, outcome: 'SKIPPED_BELOW_MIN_PROFIT', ourHypot
               // oriented the same way, so the prices shown are real market
               // prices (previously raw ratios: off by 10^12 on WMON/USDC).
               // Buy price is the PREDICTED post-trade price if the guess was used.
-              const buyPrice = priceOf(buyPoolUsed, swap.tokenIn, decimalsOf);
-              const sellPrice = priceOf(sellPoolUsed, swap.tokenIn, decimalsOf);
+              const buyPrice = priceOf(buyPoolUsed, planIn, decimalsOf);
+              const sellPrice = priceOf(sellPoolUsed, planIn, decimalsOf);
               if (buyPrice !== null && sellPrice !== null) {
                       const gapPct = spreadPct(buyPrice, sellPrice);
                       await sendTelegramMessage(formatSkippedOpportunity({
                               chain: swap.chain,
-        pair: `${symbolOf(swap.chain, swap.tokenIn)}/${symbolOf(swap.chain, swap.tokenOut)}`,
+        pair: `${symbolOf(swap.chain, planIn)}/${symbolOf(swap.chain, planOut)}`,
                               buyDex: buyPoolUsed.dex,
                               sellDex: sellPoolUsed.dex,
                               buyPrice,
@@ -2522,12 +2532,12 @@ console.log(
       // Build -> safety gate -> sign (send only if live). Shared with the
       // standing-gap scanner; see fireTrade() above.
       await fireTrade({
-            chain: swap.chain, tokenIn: swap.tokenIn, tokenOut: swap.tokenOut,
+            chain: swap.chain, tokenIn: planIn, tokenOut: planOut,
             buyPool: buyPoolUsed, sellPool: sellPoolUsed,
             tradeSizeUsd: sizing.optimalTradeSizeUsd, netProfitUsd: profit.conservativeNetProfitUsd,
             usdPerTokenIn: usdPerToken, seenAtMs: event.receivedAtMs, source: 'trade', trace,
             // Planned with a loan fee only when own money is switched off.
-            plannedLoanPips: swap.chain === 'robinhood' && !RH_OWN_MONEY ? (rhLoanFeeBps(swap.tokenIn, buyPoolUsed, sellPoolUsed) ?? 0) * 100 : 0,
+            plannedLoanPips: swap.chain === 'robinhood' && !RH_OWN_MONEY ? (rhLoanFeeBps(planIn, buyPoolUsed, sellPoolUsed) ?? 0) * 100 : 0,
       });
 };
 // Stall finder: each feed trade is timed as "feed trade" up to its first wait

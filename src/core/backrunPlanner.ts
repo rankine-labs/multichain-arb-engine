@@ -48,6 +48,14 @@ export interface PlanOptions {
   // bigger, the trade is SHRUNK to this size (and priced at that size)
   // instead of being planned too big and then refused by the send check.
   maxTradeUsd?: number;
+  // The coin OUR round trip starts and ends with (Oct 16, owner approved).
+  // Default: the coin the other trader sold (swap.tokenIn), as before. The
+  // bot passes USDG/WETH here when the other trader sold a coin we don't hold
+  // (e.g. sold ORBIO for USDG): we then start from USDG, buy the ORBIO they
+  // just made cheap, and sell it where it's dear. usdPerTokenIn and
+  // tokenInDecimals must then be for this coin. The price prediction of the
+  // other trader's swap still uses swap.tokenIn (it's THEIR trade).
+  startToken?: string;
 }
 
 export function planBackrun(
@@ -67,13 +75,15 @@ export function planBackrun(
   // even when the real lender charges 1 bp). Own capital: no fee.
   const sizingRateBps = ownCapital ? 0 : (costs.usingFlashLoan ? costs.flashLoanFeeBps : 0);
   const sizingOpts: SizingOptions = { refine: opts.refineSize === true };
-  const tokenIn = swap.tokenIn.toLowerCase();
+  // Their coin (for predicting their trade) vs our start coin (for our trade).
+  const theirTokenIn = swap.tokenIn.toLowerCase();
+  const tokenIn = (opts.startToken ?? swap.tokenIn).toLowerCase();
 
   // Step 1: predict the victim pool AFTER the big swap lands.
   let predictedVictim = victimPool;
   let usedPrediction = false;
   if (PREDICTABLE_STATES.includes(swap.stateType) && swap.amountIn > 0n) {
-    const victimTokenInIsA = victimPool.tokenA.toLowerCase() === tokenIn;
+    const victimTokenInIsA = victimPool.tokenA.toLowerCase() === theirTokenIn;
     const predicted = cache.predictPostTradeState(victimPool, victimTokenInIsA, swap.amountIn);
     // predictPostTradeState returns the SAME object when it can't model the
     // pool (order book, stable, missing data). Only count it as a real
