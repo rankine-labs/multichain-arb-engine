@@ -2,6 +2,7 @@ import { ethers } from 'ethers';
 import {
   FTM_TOPICS, decodeSwapLog, classifyTx, receiptGasWei, obsFromSwap, buildPriceBook, priceArb, timingOf, buildReport,
   sizeBucket, profitBucket, RawLog, SwapRow, PriceCtx, ArbRecord, PricedArb,
+  swapCaller, KNOWN_DECIMALS, ethUsdFromSqrtPrice, ethUsdFromReserves, orderCandidates, unpricedReasons,
 } from '../core/followMoney';
 
 // ============================================================================
@@ -225,4 +226,72 @@ const ctxFor = (watched: Set<string>): PriceCtx => ({
   assert(!rep.md.includes(EM) && !rep.csv.includes(EM), 'no em dashes in the report');
   assert(rep.csv.trim().split('\n').length === 3 && rep.csv.startsWith('hash,block'), 'CSV: header + one line per arbitrage');
   assert(rep.md.includes(POOL_B), 'unwatched pool listed in the top-20 table');
+}
+
+// ============================================================================
+// Oct 16 fixes: a CI run with no bot data files priced NOTHING (USDG decimals
+// were only known from a look-up step the cut-short run never reached).
+// ============================================================================
+
+// --- USDG / WETH decimals are built in ------------------------------------------
+{
+  assert(KNOWN_DECIMALS[USDG] === 6 && KNOWN_DECIMALS[WETH] === 18, 'USDG (6) and WETH (18) decimals known without any look-up or data file');
+  // With only the built-in decimals, sample swaps give an ETH price.
+  const o = obsFromSwap(100, POOL_B, USDG, WETH, -2000n * E6, E18, KNOWN_DECIMALS[USDG], KNOWN_DECIMALS[WETH], isQuote);
+  assert(close(buildPriceBook(o, stables, WETH).ethAt(100), 2000), 'ETH price from sample swaps with built-in decimals only');
+}
+
+// --- ETH price straight from a pool -----------------------------------------------
+{
+  // WETH is token0 (lower address): raw price = 2000 * 1e6 / 1e18 USDG units per WETH unit.
+  const sqrt = BigInt(Math.round(Math.sqrt(2000 * 1e6 / 1e18) * 2 ** 96));
+  assert(close(ethUsdFromSqrtPrice(sqrt, true), 2000, 0.01), 'V3 slot0 price -> $2,000 (WETH is token0)');
+  const sqrtInv = BigInt(Math.round(Math.sqrt(1e18 / (2000 * 1e6)) * 2 ** 96));
+  assert(close(ethUsdFromSqrtPrice(sqrtInv, false), 2000, 0.01), 'V3 slot0 price -> $2,000 (WETH is token1)');
+  assert(ethUsdFromSqrtPrice(0n, true) === null, 'empty pool gives no price');
+  assert(close(ethUsdFromReserves(100n * E18, 201_000n * E6), 2010), 'V2 reserves -> $2,010');
+}
+
+// --- who called the pool (bot contract vs router) ----------------------------------
+{
+  assert(swapCaller(v3Swap(POOL_B, 1n, -1n)) === ROUTER, 'V3 swap caller = first indexed address');
+  assert(swapCaller(v4Swap(V4_ID, BOT, 1n, -1n)) === BOT, 'V4 swap caller = the sender topic');
+  assert(swapCaller(transfer(USDG, BOT, USER, 1n)) === null, 'not a swap: no caller');
+}
+
+// --- reading order when time is short ---------------------------------------------
+{
+  const callers = ['0xr', '0xa', '0xb', '0xb', '0xc', '0xb', '0xr', ''];
+  const routers = new Set(['0xr']);
+  const idx = callers.map((_, i) => i);
+  const o1 = orderCandidates(idx, (i) => callers[i], routers, new Map());
+  assert(o1[0] === 2 && o1[1] === 3 && o1[2] === 5, 'repeat caller (3 txs) read first');
+  assert(o1.slice(-2).join() === '0,6', 'router trades read last');
+  const o2 = orderCandidates(idx, (i) => callers[i], routers, new Map([['0xc', 1]]));
+  assert(o2[0] === 4, 'a caller already proven to be an arbitrage bot jumps to the front');
+  assert(o1.length === idx.length && new Set(o1).size === idx.length, 'reordering never drops or repeats a transaction');
+}
+
+// --- why trades stayed unpriced, and the diagnostics section ------------------------
+{
+  const a = classifyTx(arbLogs, OWNER, BOT, '0x1', meta, opts).arb!;
+  const noDec: PriceCtx = { ...ctxFor(new Set()), decimals: () => null };
+  const p1 = priceArb(a, noDec);
+  assert(p1.trust === 'unpriced' && p1.unpricedWhy.includes('coin decimals unknown: USDG'), 'unpriced because decimals are unknown (named coin)');
+  const odd: ArbRecord = { ...a, net: [[TOK, '5']], hops: [] };
+  const p2 = priceArb(odd, { ...ctxFor(new Set()), book: buildPriceBook([], stables, WETH) });
+  assert(p2.unpricedWhy.includes('no market price: TOK'), 'unpriced because the coin never traded against USDG/WETH');
+  const weth: ArbRecord = { ...a, net: [[WETH, '5']], hops: [] };
+  const p3 = priceArb(weth, { ...ctxFor(new Set()), book: buildPriceBook([], stables, WETH), weth: WETH });
+  assert(p3.unpricedWhy.includes('no ETH price'), 'unpriced because there is no ETH price');
+  const reasons = unpricedReasons([p1, p1, p2]);
+  assert(reasons[0][0] === 'coin decimals unknown: USDG' && reasons[0][1] === 2, 'top unpriced reasons counted');
+  const rep = buildReport({
+    dateLabel: '2026-10-16', fromBlock: 1, toBlock: 10, fromMs: 0, toMs: 3_600_000, swaps: 1, swapTxs: 1, multiSwapTxs: 1, multiPoolTxs: 1,
+    checked: 1, reasons: {}, arbs: [p1, p2], pairOf: () => '?', dexSupport: () => 'no', watchInfo: 'none', ethUsd: null, bigSwapUsd: 1000, notes: [],
+    diag: { coinsNeeded: 3, coinsWithDecimals: 1, poolsNeeded: 4, poolsWithTokens: 2, priceObs: 0, ethObs: 0, ethSource: 'NONE', coverage: 'read 1 of 9' },
+  });
+  for (const s of ['## Diagnostics', 'Coins with known decimals: 1 of 3', 'Pools with known coins: 2 of 4', 'Price observations: 0', 'ETH price source: NONE', 'coin decimals unknown: USDG: 1', 'Coverage: read 1 of 9']) {
+    assert(rep.md.includes(s), `diagnostics show "${s}"`);
+  }
 }

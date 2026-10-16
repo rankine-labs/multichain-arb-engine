@@ -19,7 +19,12 @@
 //   --hours N     how far back to look (default 6, max 48)
 //   --fresh       ignore a half-finished earlier run and start again
 //   --rps N       most requests per second (default 10, or FTM_RPS)
-//   --report-only rebuild the report from the saved progress (no new reads)
+//   --report-only rebuild the report from the saved progress (no new chain
+//                 reading; coin / pool look-ups are still done if a node answers)
+//   --max-minutes N  stop reading new data after about N minutes and still
+//                 write the report from what was read (for CI: no external
+//                 timeout needed). Time is split: swaps up to 40%, receipts
+//                 up to 85%, the rest for look-ups and the report.
 // Settings in .env (all optional):
 //   FTM_RPC                 node to read from (else CHAINSTACK_RPC_ROBINHOOD,
 //                           else ROBINHOOD_RPC_HTTP, else the public node)
@@ -38,8 +43,11 @@ import { readFileSync, writeFileSync, mkdirSync, renameSync, existsSync } from '
 import {
   ALL_SWAP_TOPICS, KIND_CODES, V4_INITIALIZE, ZERO_ADDR, ArbRecord, ClassifyReason, PriceObs, PricedArb, RawLog, SwapRow,
   buildPriceBook, buildReport, classifyTx, decodeSwapLog, obsFromSwap, priceArb, receiptGasWei, timingOf, fmtUsd,
+  swapCaller, orderCandidates, KNOWN_DECIMALS, ethUsdFromSqrtPrice, ethUsdFromReserves, ReportDiag,
 } from '../src/core/followMoney';
-import { ROBINHOOD_V4, ROBINHOOD_TOKENS, ROBINHOOD_SCAN_FACTORIES } from '../src/config/knownAddresses';
+import {
+  ROBINHOOD_V4, ROBINHOOD_TOKENS, ROBINHOOD_SCAN_FACTORIES, ROBINHOOD_V2, ROBINHOOD_V3, ROBINHOOD_PANCAKE, ROBINHOOD_RAMSES, ROBINHOOD_UR_COPIES,
+} from '../src/config/knownAddresses';
 import { ROBINHOOD_VENUES, venueByFactory } from '../src/config/robinhoodVenues';
 import { ROBINHOOD_SEED_PAIRS } from '../src/config/robinhoodSeedPairs';
 import { loadStartPairs } from '../src/core/seedPairs';
@@ -68,6 +76,21 @@ const CONCURRENCY = Math.max(1, Number(process.env.FTM_CONCURRENCY ?? 4) || 4);
 const BATCH = Math.max(1, Math.min(50, Number(process.env.FTM_BATCH ?? 10) || 10));
 const BIG_SWAP_USD = Number(process.env.FTM_BIG_SWAP_USD ?? 1_000) || 1_000;
 const ETH_FALLBACK = process.env.FTM_ETH_USD ? Number(process.env.FTM_ETH_USD) : null;
+const MAX_MINUTES = Number(argVal('--max-minutes') ?? 0) > 0 ? Number(argVal('--max-minutes')) : null;
+// Pools with the most swaps in the sample whose coins we look up (price sources).
+const BUSY_POOLS = Math.max(0, Number(process.env.FTM_BUSY_POOLS ?? 400) || 0);
+
+// Time budget (--max-minutes): each phase stops reading new data at its share.
+const T_START = Date.now();
+const budgetLeft = (share: number): boolean => MAX_MINUTES === null || Date.now() - T_START < MAX_MINUTES * 60_000 * share;
+
+// DEX routers: transactions that call pools through these are mostly normal
+// user trades, so they are read last when time is short.
+const ROUTERS = new Set<string>([
+  ROBINHOOD_V4.UNIVERSAL_ROUTER, ...ROBINHOOD_UR_COPIES, ROBINHOOD_V3.SWAP_ROUTER_02, ROBINHOOD_V2.ROUTER,
+  ROBINHOOD_PANCAKE.V2_ROUTER, ROBINHOOD_PANCAKE.SMART_ROUTER, ROBINHOOD_PANCAKE.V3_UNIVERSAL_ROUTER,
+  ROBINHOOD_RAMSES.V2_ROUTER, ROBINHOOD_RAMSES.V3_SWAP_ROUTER, ROBINHOOD_RAMSES.DLMM_ROUTER, ROBINHOOD_V4.POOL_MANAGER,
+].map((x) => x.toLowerCase()));
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const hex = (n: number) => '0x' + n.toString(16);
@@ -81,6 +104,7 @@ const log = (m: string) => console.log(`[ftm] ${m}`);
 // ---------------------------------------------------------------------------
 class SlowDown extends Error {}
 class TooBig extends Error {}
+class Final extends Error {}  // a real answer (e.g. the call reverted): never retried
 
 class Rpc {
   calls = 0;                 // requests counted against the rate limit
@@ -142,6 +166,7 @@ class Rpc {
     const code = err?.code;
     if (code === -32005 && /rate|limit/i.test(msg) && !/range|results|block/i.test(msg)) return new SlowDown(msg);
     if (/rate limit|too many requests|capacity|throttl|exceeded the allowed|request limit/i.test(msg) && !/range|results|response size/i.test(msg)) return new SlowDown(msg);
+    if (/revert|invalid opcode|out of gas|execution error|invalid jump/i.test(msg) || code === 3) return new Final(msg);
     if (/block range|range is too|range too|more than|too many results|response size|limit exceeded|query returned|max results|exceed|timeout|10000|Log response/i.test(msg)) return new TooBig(msg);
     return new Error(msg);
   }
@@ -158,7 +183,7 @@ class Rpc {
       } catch (e) {
         let err: any = e;
         if ((e as any)?.name === 'TimeoutError' || (e as any)?.name === 'AbortError') err = method === 'eth_getLogs' ? new TooBig('timeout') : new SlowDown('timeout');
-        if (err instanceof TooBig) throw err;
+        if (err instanceof TooBig || err instanceof Final) throw err;
         lastErr = err;
         if (attempt === 6) break;
         const wait = Math.min(30_000, 1_000 * 2 ** attempt) + Math.floor(Math.random() * 300);
@@ -177,12 +202,13 @@ class Rpc {
         try {
           const j = await this.post(calls.map((c, i) => ({ jsonrpc: '2.0', id: i + 1, ...c })), calls.length, 60_000);
           if (!Array.isArray(j)) { if (j?.error && /rate|limit/i.test(String(j.error.message))) throw new SlowDown('rate'); this.batchOk = false; break; }
-          const out: any[] = new Array(calls.length).fill(null);
+          const out: any[] = new Array(calls.length).fill(undefined);
           let limited = 0;
           for (const r of j) {
             const i = Number(r?.id) - 1;
             if (!(i >= 0 && i < calls.length)) continue;
-            if (r.error) { if (/rate|limit|too many/i.test(String(r.error.message))) limited++; out[i] = undefined; } else out[i] = r.result;
+            // Rate-limited calls are asked again; other errors (reverts) are final.
+            if (r.error) { if (/rate|limit|too many|capacity/i.test(String(r.error.message))) { limited++; out[i] = undefined; } else out[i] = null; } else out[i] = r.result;
           }
           // Calls refused for rate reasons are asked again one by one below.
           for (let i = 0; i < calls.length; i++) if (out[i] === undefined) { try { out[i] = await this.call(calls[i].method, calls[i].params); } catch { out[i] = null; } }
@@ -234,7 +260,11 @@ interface Progress {
   pools: string[];
   rows: SwapRow[];
   stats: { swaps: number; swapTxs: number; multiSwapTxs: number; multiPoolTxs: number; logCalls: number };
-  cands: [string, number, number][];   // [tx hash, block, tx index]
+  cands: [string, number, number, string?][];   // [tx hash, block, tx index, main pool caller]
+  order?: number[];                    // reading order of cands (most promising first)
+  capped?: boolean;                    // --max-minutes cut the run short
+  ethAnchor?: { usd: number; source: string } | null; // ETH price read straight from a pool
+  busyLooked?: boolean;                // busiest pools' coins looked up
   candV4: string[];
   v4: Record<string, V4Info | null>;
   doneIdx: number;
@@ -326,8 +356,14 @@ function loadBotFiles(): BotFiles {
     if (m?.symbol) f.symbols.set(lc(m.token), m.symbol);
     if (m?.group === 'Dollars' && m.kind !== 'copy' && Math.abs((m.priceUsd ?? 1) - 1) < 0.02) f.stables.add(lc(m.token));
   }
+  // Coin names from the repo's backup pair list labels ("SPY/USDG" etc.).
+  for (const sp of ROBINHOOD_SEED_PAIRS) {
+    const [la, lb] = (sp.label ?? '').split('/');
+    if (la && !f.symbols.has(lc(sp.a))) f.symbols.set(lc(sp.a), la);
+    if (lb && !f.symbols.has(lc(sp.b))) f.symbols.set(lc(sp.b), lb);
+  }
   f.symbols.set(WETH, 'WETH'); f.symbols.set(USDG, 'USDG');
-  f.decimals.set(WETH, 18);
+  for (const [t, d] of Object.entries(KNOWN_DECIMALS)) f.decimals.set(t, d);
   // Every pool on the chain the bot has found (data/robinhood-universe.json).
   const st = readJson(`${DATA}/robinhood-universe.json`);
   if (st?.version === 1 && Array.isArray(st.pools)) f.scanState = st;
@@ -371,6 +407,15 @@ async function scanSwaps(rpc: Rpc, p: Progress) {
   let lastSave = Date.now();
   let slow = 0;
   while (p.nextBlock <= p.toBlock) {
+    if (!budgetLeft(0.4)) {
+      // Out of time for this phase: the study covers what was read so far.
+      log(`time limit: stopped reading swaps at block ${(p.nextBlock - 1).toLocaleString('en-US')}`);
+      const last = await blockAt(rpc, Math.max(p.fromBlock, p.nextBlock - 1)).catch(() => null);
+      p.toBlock = Math.max(p.fromBlock, p.nextBlock - 1);
+      if (last) p.toTs = last.ts;
+      p.capped = true;
+      break;
+    }
     const from = p.nextBlock;
     const to = Math.min(p.toBlock, from + p.chunk - 1);
     let logs: RawLog[];
@@ -391,7 +436,7 @@ async function scanSwaps(rpc: Rpc, p: Progress) {
     }
     if (!Array.isArray(logs)) logs = [];
     // Group this chunk's swaps by transaction (a block is never split across chunks).
-    const byTx = new Map<string, { hash: string; block: number; ti: number; swaps: number; pools: Set<string>; v4: string[] }>();
+    const byTx = new Map<string, { hash: string; block: number; ti: number; swaps: number; pools: Set<string>; v4: string[]; callers: Map<string, number> }>();
     const chunkRows: SwapRow[] = [];
     for (const l of logs) {
       if ((l as any).removed) continue;
@@ -403,8 +448,10 @@ async function scanSwaps(rpc: Rpc, p: Progress) {
       if (pi === undefined) { pi = p.pools.push(s.pool) - 1; poolIdx.set(s.pool, pi); }
       chunkRows.push([b, ti, pi, KIND_CODES.indexOf(s.kind), s.a0 !== undefined ? s.a0.toString() : '', s.a1 !== undefined ? s.a1.toString() : '']);
       const key = `${b}:${ti}`;
-      const e = byTx.get(key) ?? { hash: lc(l.transactionHash ?? ''), block: b, ti, swaps: 0, pools: new Set<string>(), v4: [] };
+      const e = byTx.get(key) ?? { hash: lc(l.transactionHash ?? ''), block: b, ti, swaps: 0, pools: new Set<string>(), v4: [], callers: new Map<string, number>() };
       e.swaps++; e.pools.add(s.pool);
+      const caller = swapCaller(l);
+      if (caller) e.callers.set(caller, (e.callers.get(caller) ?? 0) + 1);
       if (s.kind === 'v4') e.v4.push(s.pool);
       byTx.set(key, e);
     }
@@ -417,7 +464,9 @@ async function scanSwaps(rpc: Rpc, p: Progress) {
       if (e.pools.size >= 2 && e.hash && !candSet.has(e.hash)) {
         p.stats.multiPoolTxs++;
         candSet.add(e.hash);
-        p.cands.push([e.hash, e.block, e.ti]);
+        // Main caller: the address that called the most pools in this tx.
+        const main = [...e.callers.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] ?? '';
+        p.cands.push([e.hash, e.block, e.ti, main]);
         for (const id of e.v4) if (!v4Set.has(id)) { v4Set.add(id); p.candV4.push(id); }
       }
     }
@@ -475,9 +524,32 @@ async function readReceipts(rpc: Rpc, p: Progress) {
   const v4Currencies = (id: string) => p.v4[id] ?? null;
   let lastSave = Date.now();
   const window = BATCH * CONCURRENCY;
+  // Reading order: most promising first (see orderCandidates). Older saved
+  // runs had no order: they keep chain order for what was already read.
+  const callerOf = (i: number) => lc(p.cands[i]?.[3] ?? '');
+  if (!p.order || p.order.length !== total) {
+    const done = Array.from({ length: Math.min(p.doneIdx, total) }, (_, i) => i);
+    const rest = Array.from({ length: total - done.length }, (_, i) => i + done.length);
+    p.order = [...done, ...orderCandidates(rest, callerOf, ROUTERS, new Map())];
+  }
+  // Pool callers proven to be arbitrage bots in this run (caller -> arbs).
+  const proven = new Map<string, number>();
+  const callerByHash = new Map(p.cands.map((c) => [c[0], lc(c[3] ?? '')]));
+  for (const a of p.arbs) { const c = callerByHash.get(a.hash); if (c) proven.set(c, (proven.get(c) ?? 0) + 1); }
+  let provenAtSort = proven.size;
   while (p.doneIdx < total) {
-    const slice = p.cands.slice(p.doneIdx, p.doneIdx + window);
-    const groups: [string, number, number][][] = [];
+    if (!budgetLeft(0.85)) {
+      log(`time limit: stopped after ${p.doneIdx.toLocaleString('en-US')} of ${total.toLocaleString('en-US')} multi-pool transactions (most promising first)`);
+      p.capped = true;
+      break;
+    }
+    // New bots proven since the last sort: move their other trades forward.
+    if (proven.size > provenAtSort) {
+      p.order = [...p.order.slice(0, p.doneIdx), ...orderCandidates(p.order.slice(p.doneIdx), callerOf, ROUTERS, proven)];
+      provenAtSort = proven.size;
+    }
+    const slice = p.order.slice(p.doneIdx, p.doneIdx + window).map((i) => p.cands[i]);
+    const groups: [string, number, number, string?][][] = [];
     for (let i = 0; i < slice.length; i += BATCH) groups.push(slice.slice(i, i + BATCH));
     const results = await Promise.all(groups.map((g) => rpc.many(g.map((c) => ({ method: 'eth_getTransactionReceipt', params: [c[0]] })))));
     const found: ArbRecord[] = [];
@@ -488,7 +560,11 @@ async function readReceipts(rpc: Rpc, p: Progress) {
         const gas = receiptGasWei(r);
         const res = classifyTx(r.logs, r.from, r.to, r.status, { hash: c[0], block: c[1], txIndex: c[2], ...gas }, { poolManager: PM, weth: WETH, v4Currencies });
         reason = res.reason;
-        if (res.arb) found.push(res.arb);
+        if (res.arb) {
+          found.push(res.arb);
+          const caller = lc(c[3] ?? '');
+          if (caller && !ROUTERS.has(caller)) proven.set(caller, (proven.get(caller) ?? 0) + 1);
+        }
       }
       p.reasons[reason] = (p.reasons[reason] ?? 0) + 1;
     }));
@@ -511,22 +587,34 @@ async function readReceipts(rpc: Rpc, p: Progress) {
 // ---------------------------------------------------------------------------
 // Phase 4: coin decimals / names and pool coins / factory (bundled reads).
 // ---------------------------------------------------------------------------
-async function callMany(rpc: Rpc, calls: { target: string; data: string }[], useMulticall: boolean): Promise<(string | null)[]> {
+
+// One read per call, sent in batches when the node allows (null = failed).
+async function singles(rpc: Rpc, calls: { target: string; data: string }[]): Promise<(string | null)[]> {
   const out: (string | null)[] = [];
-  if (useMulticall) {
-    for (let i = 0; i < calls.length; i += 200) {
-      const slice = calls.slice(i, i + 200);
-      try {
-        const ret = await rpc.call('eth_call', [{ to: MULTICALL3, data: encodeAggregate3(slice) }, 'latest']);
-        const dec = decodeAggregate3(ret);
-        for (let j = 0; j < slice.length; j++) out.push(dec[j] ?? null);
-      } catch {
-        for (const c of slice) { try { out.push(await rpc.call('eth_call', [{ to: c.target, data: c.data }, 'latest'])); } catch { out.push(null); } }
-      }
-    }
-    return out;
+  for (let i = 0; i < calls.length; i += BATCH) {
+    const res = await rpc.many(calls.slice(i, i + BATCH).map((c) => ({ method: 'eth_call', params: [{ to: c.target, data: c.data }, 'latest'] })));
+    for (const r of res) out.push(typeof r === 'string' && r !== '0x' ? r : null);
   }
-  for (const c of calls) { try { out.push(await rpc.call('eth_call', [{ to: c.target, data: c.data }, 'latest'])); } catch { out.push(null); } }
+  return out;
+}
+
+// Many contract reads. Uses Multicall3 when it exists, but any bundle whose
+// answer can't be read (error, empty "0x", wrong length, or every answer
+// empty) is asked again one call at a time, so a node quirk never turns into
+// "no decimals / no coins" for everything (Oct 16 fix).
+async function callMany(rpc: Rpc, calls: { target: string; data: string }[], useMulticall: boolean): Promise<(string | null)[]> {
+  if (!useMulticall) return singles(rpc, calls);
+  const out: (string | null)[] = [];
+  for (let i = 0; i < calls.length; i += 200) {
+    const slice = calls.slice(i, i + 200);
+    let dec: (string | null)[] | null = null;
+    try {
+      const ret = await rpc.call('eth_call', [{ to: MULTICALL3, data: encodeAggregate3(slice) }, 'latest']);
+      if (typeof ret === 'string' && ret.length > 2) dec = decodeAggregate3(ret);
+    } catch { dec = null; }
+    if (!dec || dec.length !== slice.length || (slice.length >= 3 && dec.every((x) => !x))) dec = await singles(rpc, slice);
+    for (const d of dec) out.push(d ?? null);
+  }
   return out;
 }
 
@@ -534,15 +622,69 @@ const SEL = { decimals: '0x313ce567', symbol: '0x95d89b41', token0: '0x0dfe1681'
 const asAddr = (r: string | null) => (r && r.length >= 66 ? '0x' + r.slice(26, 66).toLowerCase() : undefined);
 const asUint = (r: string | null): number | null => { if (!r || r.length < 66) return null; try { const v = Number(BigInt(r.slice(0, 66))); return v <= 255 ? v : null; } catch { return null; } };
 
+const word = (addr: string) => addr.slice(2).toLowerCase().padStart(64, '0');
+const SEL2 = { getPool: '0x1698ee82', getPair: '0xe6a43905', slot0: '0x3850c7bd', getReserves: '0x0902f1ac', balanceOf: '0x70a08231' };
+
+// ETH price read straight from the deepest WETH/USDG pool among the repo's
+// known factories (Uniswap / PancakeSwap V3 fee tiers, Uniswap / PancakeSwap
+// V2), so the report never shows "ETH price: ?" (Oct 16 fix). The pool with
+// the most USDG in it wins.
+async function readEthAnchor(rpc: Rpc, useMc: boolean): Promise<{ usd: number; source: string } | null> {
+  const pair = word(WETH) + word(USDG);
+  const ask: { target: string; data: string; kind: 'v3' | 'v2'; label: string }[] = [];
+  for (const [label, factory, fees] of [['Uniswap V3', ROBINHOOD_V3.FACTORY, [100, 500, 3000, 10000]], ['PancakeSwap V3', ROBINHOOD_PANCAKE.V3_FACTORY, [100, 500, 2500, 10000]]] as [string, string, number[]][]) {
+    for (const fee of fees) ask.push({ target: factory, data: SEL2.getPool + pair + fee.toString(16).padStart(64, '0'), kind: 'v3', label: `${label} ${fee / 10000}%` });
+  }
+  for (const [label, factory] of [['Uniswap V2', ROBINHOOD_V2.FACTORY], ['PancakeSwap V2', ROBINHOOD_PANCAKE.V2_FACTORY]] as [string, string][]) {
+    ask.push({ target: factory, data: SEL2.getPair + pair, kind: 'v2', label });
+  }
+  const found = await callMany(rpc, ask.map(({ target, data }) => ({ target, data })), useMc);
+  const pools = ask.map((a, i) => ({ ...a, pool: asAddr(found[i]) })).filter((x) => x.pool && x.pool !== ZERO_ADDR) as (typeof ask[number] & { pool: string })[];
+  if (!pools.length) return null;
+  const reads = await callMany(rpc, pools.flatMap((x) => [
+    { target: USDG, data: SEL2.balanceOf + word(x.pool) },
+    { target: x.pool, data: x.kind === 'v3' ? SEL2.slot0 : SEL2.getReserves },
+  ]), useMc);
+  let best: { usd: number; source: string; depth: number } | null = null;
+  const wethIs0 = WETH < USDG; // token0 = the lower address
+  pools.forEach((x, i) => {
+    const bal = reads[2 * i], st = reads[2 * i + 1];
+    if (!bal || !st || st.length < 130) return;
+    const depth = Number(BigInt(bal.slice(0, 66))) / 1e6;
+    let usd: number | null = null;
+    if (x.kind === 'v3') usd = ethUsdFromSqrtPrice(BigInt(st.slice(0, 66)), wethIs0);
+    else {
+      const r0 = BigInt('0x' + st.slice(2, 66)), r1 = BigInt('0x' + st.slice(66, 130));
+      usd = wethIs0 ? ethUsdFromReserves(r0, r1) : ethUsdFromReserves(r1, r0);
+    }
+    if (usd !== null && usd > 10 && usd < 1e6 && (!best || depth > best.depth)) best = { usd, depth, source: `${x.label} WETH/USDG pool ${x.pool.slice(0, 10)} (holds ${fmtUsd(depth)} USDG)` };
+  });
+  return best ? { usd: (best as any).usd, source: (best as any).source } : null;
+}
+
+// Pools whose coins we need: every arbitrage pool, plus the busiest pools in
+// the sample (they are where most prices come from). Without the bot's scan
+// file NOTHING else tells us a pool's coins (the Oct 16 "priced none" run).
+function poolsToLookUp(p: Progress, scanPools: Map<string, unknown>): { arb: string[]; busy: string[] } {
+  const known = (x: string) => scanPools.has(x) || x in p.poolInfo || x.length !== 42;
+  const arb = new Set<string>();
+  for (const a of p.arbs) for (const x of a.pools) if (!known(x)) arb.add(x);
+  const counts = new Map<number, number>();
+  for (const r of p.rows) counts.set(r[2], (counts.get(r[2]) ?? 0) + 1);
+  const busy = [...counts.entries()].sort((a, b) => b[1] - a[1]).map(([i]) => p.pools[i])
+    .filter((x) => x && !known(x) && !arb.has(x)).slice(0, BUSY_POOLS);
+  return { arb: [...arb], busy };
+}
+
 async function lookups(rpc: Rpc, p: Progress, files: BotFiles, scanPools: Map<string, { dex: string; t0: string; t1: string }>) {
   let useMc = false;
   try { const code = await rpc.call('eth_getCode', [MULTICALL3, 'latest']); useMc = typeof code === 'string' && code.length > 2; } catch { /* single calls */ }
-  // Pools in arbitrage routes whose coins / exchange we don't know yet.
-  const pools = new Set<string>();
-  for (const a of p.arbs) for (const x of a.pools) if (x.length === 42 && !scanPools.has(x) && !(x in p.poolInfo)) pools.add(x);
-  const pl = [...pools];
+  log(`reads: ${useMc ? 'bundled (Multicall3)' : 'one by one (no Multicall3)'}`);
+  // Pools: coins and exchange.
+  const { arb, busy } = poolsToLookUp(p, scanPools);
+  const pl = [...arb, ...busy];
   if (pl.length) {
-    log(`looking up ${pl.length} pools (coins and exchange)`);
+    log(`looking up ${pl.length} pools (${arb.length} in arbitrage routes, ${busy.length} busiest), coins and exchange`);
     const res = await callMany(rpc, pl.flatMap((x) => [{ target: x, data: SEL.token0 }, { target: x, data: SEL.token1 }, { target: x, data: SEL.factory }]), useMc);
     pl.forEach((x, i) => { p.poolInfo[x] = { t0: asAddr(res[3 * i]), t1: asAddr(res[3 * i + 1]), factory: asAddr(res[3 * i + 2]) }; });
   }
@@ -553,14 +695,22 @@ async function lookups(rpc: Rpc, p: Progress, files: BotFiles, scanPools: Map<st
     for (const [t] of a.outflow) toks.add(t);
     for (const h of a.hops) { if (h.tin) toks.add(h.tin); if (h.tout) toks.add(h.tout); }
   }
-  const tl = [...toks].filter((t) => !(t in p.tokens) && t.length === 42);
-  if (tl.length) {
-    log(`looking up ${tl.length} coins (decimals and names)`);
-    const res = await callMany(rpc, tl.flatMap((t) => [{ target: t, data: SEL.decimals }, { target: t, data: SEL.symbol }]), useMc);
-    tl.forEach((t, i) => {
+  // Known decimals never need a read; earlier failed reads are tried again.
+  const tl = [...toks].filter((t) => t.length === 42 && (!(t in p.tokens) || p.tokens[t].d === null || p.tokens[t].d === undefined));
+  for (const t of tl) if (KNOWN_DECIMALS[t] !== undefined) p.tokens[t] = { d: KNOWN_DECIMALS[t], s: files.symbols.get(t) ?? null };
+  const ask = tl.filter((t) => KNOWN_DECIMALS[t] === undefined);
+  if (ask.length) {
+    log(`looking up ${ask.length} coins (decimals and names)`);
+    const res = await callMany(rpc, ask.flatMap((t) => [{ target: t, data: SEL.decimals }, { target: t, data: SEL.symbol }]), useMc);
+    ask.forEach((t, i) => {
       const s = fastDecodeString(res[2 * i + 1]);
       p.tokens[t] = { d: files.decimals.get(t) ?? asUint(res[2 * i]), s: files.symbols.get(t) ?? (s ? s.replace(/[^\x20-\x7e]/g, '').slice(0, 16) || null : null) };
     });
+  }
+  // ETH price straight from a pool (used when the sample has no WETH/USDG swaps we can read).
+  if (!p.ethAnchor) {
+    try { p.ethAnchor = await readEthAnchor(rpc, useMc); } catch (e) { log(`could not read an ETH price from a pool: ${rpc.clean(e)}`); }
+    log(p.ethAnchor ? `ETH price from a pool: ${fmtUsd(p.ethAnchor.usd)}` : 'no ETH price from a pool');
   }
 }
 
@@ -585,7 +735,8 @@ function dexSupport(dex: string): string {
 }
 
 function makeReport(p: Progress, files: BotFiles, scanPools: Map<string, { dex: string; t0: string; t1: string }>) {
-  const tokenDec = (t: string): number | null => (t === WETH ? 18 : p.tokens[t]?.d ?? files.decimals.get(t) ?? null);
+  // Decimals: the repo's known coins first (WETH 18, USDG 6), then look-ups, then bot files.
+  const tokenDec = (t: string): number | null => KNOWN_DECIMALS[t] ?? p.tokens[t]?.d ?? files.decimals.get(t) ?? null;
   const symbol = (t: string): string => p.tokens[t]?.s ?? files.symbols.get(t) ?? (t ? t.slice(0, 8) : '?');
   const poolTokens = (pool: string): { t0: string; t1: string } | null => {
     const s = scanPools.get(pool);
@@ -631,7 +782,14 @@ function makeReport(p: Progress, files: BotFiles, scanPools: Map<string, { dex: 
     if (d0 === null || d1 === null) continue;
     for (const o of obsFromSwap(a.block, h.pool, h.tin, h.tout, BigInt(h.ain), -BigInt(h.aout), d0, d1, isQuote)) obs.push(o);
   }
-  const book = buildPriceBook(obs, files.stables, WETH, { ethFallbackUsd: ETH_FALLBACK });
+  // ETH: swaps in the sample first; else the price read from a pool; else FTM_ETH_USD.
+  const ethObs = obs.filter((o) => o.token === WETH && files.stables.has(o.quote)).length;
+  const ethFallback = p.ethAnchor?.usd ?? ETH_FALLBACK;
+  const book = buildPriceBook(obs, files.stables, WETH, { ethFallbackUsd: ethFallback });
+  const ethSource = ethObs ? `WETH swaps against dollar coins in the sample (${ethObs.toLocaleString('en-US')})`
+    : p.ethAnchor ? `read from a pool: ${p.ethAnchor.source}`
+    : ETH_FALLBACK ? 'the FTM_ETH_USD setting'
+    : 'NONE: no readable WETH/USDG swaps and no pool answered (set FTM_ETH_USD to force one)';
 
   // Dollar size of any swap row (for "after a big swap").
   const poolIdx = new Map(p.pools.map((x, i) => [x, i]));
@@ -656,7 +814,7 @@ function makeReport(p: Progress, files: BotFiles, scanPools: Map<string, { dex: 
     book, decimals: tokenDec, symbol, dexOf,
     isWatched: (pool) => files.watched.has(pool),
     botCanTrade: (d) => BOT_TRADES.has(d),
-    timeOf,
+    timeOf, weth: WETH,
     timing: (rec) => timingOf(rec, p.rows, (x) => poolIdx.get(x), swapUsd, BIG_SWAP_USD),
   }));
 
@@ -672,11 +830,27 @@ function makeReport(p: Progress, files: BotFiles, scanPools: Map<string, { dex: 
   notes.push(`RPC requests used: about ${p.rpcCalls.toLocaleString('en-US')}.`);
   const dateLabel = new Date(p.toTs * 1000).toISOString().slice(0, 10);
   const midBlock = Math.floor((p.fromBlock + p.toBlock) / 2);
+  // Diagnostics: how far the look-ups got.
+  const arbPools = new Set<string>();
+  for (const a of p.arbs) for (const x of a.pools) arbPools.add(x);
+  const counts = new Map<number, number>();
+  for (const r of p.rows) counts.set(r[2], (counts.get(r[2]) ?? 0) + 1);
+  const busyTop = [...counts.entries()].sort((a, b) => b[1] - a[1]).slice(0, BUSY_POOLS).map(([i]) => p.pools[i]);
+  const poolsNeeded = new Set([...arbPools, ...busyTop]);
+  const coinsNeeded = [...need].filter((t) => t && t.length === 42);
+  const diag: ReportDiag = {
+    coinsNeeded: coinsNeeded.length, coinsWithDecimals: coinsNeeded.filter((t) => tokenDec(t) !== null).length,
+    poolsNeeded: poolsNeeded.size, poolsWithTokens: [...poolsNeeded].filter((x) => poolTokens(x) !== null).length,
+    priceObs: obs.length, ethObs, ethSource,
+    coverage: `read ${p.doneIdx.toLocaleString('en-US')} of ${p.cands.length.toLocaleString('en-US')} multi-pool transactions`
+      + (p.doneIdx < p.cands.length ? ' (most promising first: known repeat bots before router trades), so totals are a LOWER bound' : '')
+      + (p.capped ? `; the --max-minutes limit cut the run short` : ''),
+  };
   const rep = buildReport({
     dateLabel, fromBlock: p.fromBlock, toBlock: p.toBlock, fromMs: p.fromTs * 1000, toMs: p.toTs * 1000,
     swaps: p.stats.swaps, swapTxs: p.stats.swapTxs, multiSwapTxs: p.stats.multiSwapTxs, multiPoolTxs: p.stats.multiPoolTxs,
     checked: p.doneIdx, reasons: p.reasons, arbs: priced, pairOf, dexSupport, watchInfo: files.watchInfo,
-    ethUsd: book.ethAt(midBlock), bigSwapUsd: BIG_SWAP_USD, notes,
+    ethUsd: book.ethAt(midBlock), bigSwapUsd: BIG_SWAP_USD, notes, diag,
   });
   return { ...rep, dateLabel };
 }
@@ -693,6 +867,13 @@ function makeReport(p: Progress, files: BotFiles, scanPools: Map<string, { dex: 
 
   if (REPORT_ONLY) {
     if (!p) throw new Error('no saved progress to report on (data/ftm-progress.json)');
+    // No new chain reading, but coin / pool look-ups still run if a node
+    // answers: a run stopped early never got to them, and without them
+    // nothing can be priced (the Oct 16 "priced none" run).
+    if (p.phase !== 'report' && p.phase !== 'done') {
+      try { rpc = (await pickNode()).rpc; rpc.calls = p.rpcCalls ?? 0; } catch { log('no node answered: building the report without look-ups'); }
+      if (rpc) p.phase = 'lookups';
+    }
   } else {
     const node = await pickNode();
     rpc = node.rpc;
@@ -712,7 +893,7 @@ function makeReport(p: Progress, files: BotFiles, scanPools: Map<string, { dex: 
     }
     if (p.phase === 'logs') { await scanSwaps(rpc, p); p.phase = 'v4'; saveProgress(p, rpc); }
     log(`swaps: ${p.stats.swaps.toLocaleString('en-US')}, multi-pool transactions to check: ${p.cands.length.toLocaleString('en-US')}`);
-    if (p.phase === 'v4') { await lookupV4(rpc, p, files); p.phase = 'receipts'; saveProgress(p, rpc); }
+    if (p.phase === 'v4') { if (budgetLeft(0.5)) await lookupV4(rpc, p, files); p.phase = 'receipts'; saveProgress(p, rpc); }
     if (p.phase === 'receipts') { await readReceipts(rpc, p); p.phase = 'lookups'; saveProgress(p, rpc); }
   }
 
@@ -729,7 +910,11 @@ function makeReport(p: Progress, files: BotFiles, scanPools: Map<string, { dex: 
     }
     files.scanState = null; // free the memory
   }
-  if (rpc && p!.phase === 'lookups') { await lookups(rpc, p!, files, scanPools); p!.phase = 'report'; saveProgress(p!, rpc); }
+  if (rpc && p!.phase === 'lookups') {
+    try { await lookups(rpc, p!, files, scanPools); }
+    catch (e) { log(`look-ups stopped early (${rpc.clean(e)}); the report uses what was found`); }
+    p!.phase = 'report'; saveProgress(p!, rpc);
+  }
 
   const rep = makeReport(p!, files, scanPools);
   const mdFile = `${DATA}/ftm-report-${rep.dateLabel}.md`;
@@ -737,7 +922,7 @@ function makeReport(p: Progress, files: BotFiles, scanPools: Map<string, { dex: 
   writeFileSync(mdFile, rep.md);
   writeFileSync(csvFile, rep.csv);
   console.log('\n' + rep.md);
-  if (p!.phase !== 'done' && !REPORT_ONLY) { p!.phase = 'done'; saveProgress(p!, rpc ?? undefined); }
+  if (p!.phase !== 'done') { p!.phase = 'done'; saveProgress(p!, rpc ?? undefined); }
   log(`done in ${Math.round((Date.now() - t0) / 60_000)} min, ${(rpc?.calls ?? p!.rpcCalls).toLocaleString('en-US')} requests. Kept after gas: ${fmtUsd(rep.totals.netUsd)} (${fmtUsd(rep.totals.perDayUsd)}/day).`);
   log(`wrote ${mdFile} and ${csvFile}`);
   if (existsSync(PROGRESS_FILE)) log(`progress kept in ${PROGRESS_FILE} (run again with --report-only to rebuild the report)`);

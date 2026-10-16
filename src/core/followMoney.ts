@@ -146,6 +146,62 @@ export function decodeSwapLog(l: { address: string; topics: string[]; data: stri
   return null;
 }
 
+// Who called the pool in a swap event (the bot contract for most arbitrage,
+// a DEX router for most normal trades). Null when the event doesn't say.
+export function swapCaller(l: { topics: string[] }): string | null {
+  const t0 = l?.topics?.[0]?.toLowerCase();
+  const kind = t0 ? SWAP_KIND_BY_TOPIC[t0] : undefined;
+  if (!kind || kind === 'balancer' || kind === 'curve') return null;
+  const t = kind === 'v4' ? l.topics[2] : l.topics[1];
+  return t && t.length === 66 ? addrFromTopic(t) : null;
+}
+
+// Coins whose decimals we never need to ask the chain for (the bot's own
+// TOKEN_DECIMALS in shadowMain: WETH 18, USDG 6). Without USDG here a run
+// that never reached the look-up step could not price anything at all.
+export const KNOWN_DECIMALS: Record<string, number> = {
+  '0x0bd7d308f8e1639fab988df18a8011f41eacad73': 18, // WETH
+  '0x5fc5360d0400a0fd4f2af552add042d716f1d168': 6,  // USDG
+};
+
+// ETH price from a Uniswap V3 style pool's slot0 sqrtPriceX96.
+//   wethIsToken0 = WETH is the pool's token0 (the lower address)
+export function ethUsdFromSqrtPrice(sqrtPriceX96: bigint, wethIsToken0: boolean, wethDec = 18, usdDec = 6): number | null {
+  if (sqrtPriceX96 <= 0n) return null;
+  const r = Number(sqrtPriceX96) / 2 ** 96;
+  const raw = r * r; // token1 per token0, in raw units
+  const px = wethIsToken0 ? raw * 10 ** (wethDec - usdDec) : (1 / raw) * 10 ** (wethDec - usdDec);
+  return isFinite(px) && px > 0 ? px : null;
+}
+// ETH price from a V2 pair's reserves.
+export function ethUsdFromReserves(rWeth: bigint, rUsd: bigint, wethDec = 18, usdDec = 6): number | null {
+  if (rWeth <= 0n || rUsd <= 0n) return null;
+  const px = (Number(rUsd) / 10 ** usdDec) / (Number(rWeth) / 10 ** wethDec);
+  return isFinite(px) && px > 0 ? px : null;
+}
+
+// Order in which to read candidate transactions when time is short: the
+// ones most likely to be arbitrage first.
+//   - pool caller already PROVEN to be an arbitrage bot in this run: first
+//   - known DEX routers (normal user trades): last
+//   - otherwise, callers that show up in many multi-pool transactions first
+//     (bots repeat; people trading through a router mostly don't)
+// `idx` = candidate indexes still to read; returns them reordered.
+export function orderCandidates(
+  idx: number[], callerOf: (i: number) => string, routers: Set<string>, proven: Map<string, number>,
+): number[] {
+  const count = new Map<string, number>();
+  for (const i of idx) { const c = callerOf(i); if (c) count.set(c, (count.get(c) ?? 0) + 1); }
+  const score = (i: number) => {
+    const c = callerOf(i);
+    if (!c) return 0;
+    if (routers.has(c)) return -1;
+    return (proven.has(c) ? 1e9 + (proven.get(c) ?? 0) * 1e3 : 0) + (count.get(c) ?? 0);
+  };
+  // Stable sort: equal scores keep chain order.
+  return idx.map((i, k) => ({ i, k, s: score(i) })).sort((a, b) => b.s - a.s || a.k - b.k).map((x) => x.i);
+}
+
 // ---------------------------------------------------------------------------
 // Classifying one transaction from its receipt.
 // ---------------------------------------------------------------------------
@@ -506,6 +562,7 @@ export interface PricedArb {
   unwatchedPools: string[];
   supportedAll: boolean;   // every pool on an exchange our bot can trade
   timing: Timing;
+  unpricedWhy: string[];   // why the dollar result is missing, e.g. "no market price: TOK"
 }
 
 export interface PriceCtx {
@@ -518,6 +575,7 @@ export interface PriceCtx {
   timeOf: (block: number) => number;
   timing: (rec: ArbRecord) => Timing;
   thinVolumeUsd?: number;  // a coin priced from less trading than this is "thin" (default $1,000)
+  weth?: string;           // WETH address (only used to explain "no ETH price")
 }
 
 // Dollar value of a raw coin amount (null if no price or no decimals).
@@ -545,6 +603,8 @@ export function priceArb(rec: ArbRecord, ctx: PriceCtx): PricedArb {
     }
     return null;
   };
+  const unpricedWhy: string[] = [];
+  const why = (w: string) => { if (!unpricedWhy.includes(w)) unpricedWhy.push(w); };
   const value = (token: string, raw: bigint): number | null => {
     const u = usdOf(ctx, token, raw, rec.block);
     if (u) { if (u.volumeUsd < thinV && !doubtWhy.includes('thin-price')) doubtWhy.push('thin-price'); return u.usd; }
@@ -553,9 +613,17 @@ export function priceArb(rec: ArbRecord, ctx: PriceCtx): PricedArb {
     if (per !== null && d !== null) { if (!doubtWhy.includes('same-trade-price')) doubtWhy.push('same-trade-price'); return (Number(raw) / 10 ** d) * per; }
     return null;
   };
+  // Records why a coin in the result could not be valued (for diagnostics).
+  const explain = (token: string) => {
+    const name = ctx.symbol(token);
+    if (ctx.decimals(token) === null || ctx.decimals(token) === undefined) why(`coin decimals unknown: ${name}`);
+    else if (token.toLowerCase() === (ctx.weth ?? '').toLowerCase() && ctx.book.ethAt(rec.block) === null) why('no ETH price');
+    else why(`no market price: ${name}`);
+  };
 
   let gross = 0, unpriced = false;
-  for (const [t, v] of rec.net) { const u = value(t, BigInt(v)); if (u === null) unpriced = true; else gross += u; }
+  for (const [t, v] of rec.net) { const u = value(t, BigInt(v)); if (u === null) { unpriced = true; explain(t); } else gross += u; }
+  if (!rec.net.length) why('no coin gain recorded');
   // Trade size: what went into the first pool, else the biggest coin sent out.
   let size: number | null = null;
   const h0 = rec.hops[0];
@@ -592,6 +660,7 @@ export function priceArb(rec: ArbRecord, ctx: PriceCtx): PricedArb {
     unwatchedPools: rec.pools.filter((p) => !ctx.isWatched(p)),
     supportedAll: dexes.every((d) => ctx.botCanTrade(d)),
     timing: ctx.timing(rec),
+    unpricedWhy: grossUsd === null ? unpricedWhy : [],
   };
 }
 
@@ -655,6 +724,24 @@ export interface ReportInput {
   ethUsd: number | null;
   bigSwapUsd: number;
   notes: string[];              // extra lines (data files missing, etc.)
+  diag?: ReportDiag;            // how well pricing worked (diagnostics section)
+}
+
+// Numbers that show whether pricing worked, and why not when it didn't.
+export interface ReportDiag {
+  coinsNeeded: number; coinsWithDecimals: number;
+  poolsNeeded: number; poolsWithTokens: number;
+  priceObs: number;             // exchange rates seen (swaps against USDG / dollar coins / WETH)
+  ethObs: number;               // of those, WETH against a dollar coin
+  ethSource: string;            // where the ETH price came from
+  coverage?: string;            // e.g. "read 8,360 of 35,263 (most promising first)"
+}
+
+// Top reasons trades stayed unpriced, with counts.
+export function unpricedReasons(arbs: PricedArb[], top = 10): [string, number][] {
+  const m = new Map<string, number>();
+  for (const a of arbs) if (a.trust === 'unpriced') for (const w of a.unpricedWhy.length ? a.unpricedWhy : ['unknown']) m.set(w, (m.get(w) ?? 0) + 1);
+  return [...m.entries()].sort((a, b) => b[1] - a[1]).slice(0, top);
 }
 
 // $1,234 / $56.7k / $1.2M; small values with cents.
@@ -839,6 +926,21 @@ export function buildReport(r: ReportInput): { md: string; csv: string; totals: 
   }
   for (const m of means) L.push(`- ${m}`);
   L.push('');
+  if (r.diag) {
+    const d = r.diag;
+    L.push('## Diagnostics (how well the pricing worked)');
+    if (d.coverage) L.push(`- Coverage: ${d.coverage}`);
+    L.push(`- Coins with known decimals: ${d.coinsWithDecimals} of ${d.coinsNeeded}`);
+    L.push(`- Pools with known coins: ${d.poolsWithTokens} of ${d.poolsNeeded} (arbitrage pools plus the busiest pools)`);
+    L.push(`- Price observations: ${d.priceObs.toLocaleString('en-US')} (WETH against dollar coins: ${d.ethObs.toLocaleString('en-US')})`);
+    L.push(`- ETH price source: ${d.ethSource}`);
+    const ur = unpricedReasons(r.arbs);
+    if (ur.length) {
+      L.push('- Why trades stayed unpriced (a trade can have more than one reason):');
+      for (const [w, n] of ur) L.push(`  - ${w}: ${n}`);
+    } else L.push('- No trade stayed unpriced.');
+    L.push('');
+  }
   L.push('## Notes');
   L.push(`- Watch list: ${r.watchInfo}`);
   for (const n of r.notes) L.push(`- ${n}`);
