@@ -1,0 +1,41 @@
+# ============================================================================
+# FOLLOW THE MONEY (one-off run on GitHub's computers, read-only).
+# Runs the arbitrage study (scripts/follow-the-money.ts) against the PUBLIC
+# Robinhood node, so nothing on the bot server or any key is involved.
+# Triggered by a push to the ftm-run branch only; the report and CSV are
+# saved as a downloadable artifact of the run. Never sends transactions.
+# Note: the bot's watch list (data/watched-pools.json) lives on the server,
+# so in this run no pool counts as "watched"; everything else is reported.
+# ============================================================================
+name: Follow the money (one-off)
+
+on:
+  push:
+    branches: [ftm-run]
+
+permissions:
+  contents: read
+
+jobs:
+  study:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install --no-audit --no-fund
+      - name: Follow the money (6 hours of chain history, public node, gentle)
+        env:
+          FTM_RPC: https://rpc.mainnet.chain.robinhood.com
+        run: npm run follow-money -- --hours 6 --rps 6
+      - name: Save the report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: follow-the-money
+          path: |
+            data/ftm-report-*.md
+            data/ftm-arbs-*.csv
+          if-no-files-found: warn
