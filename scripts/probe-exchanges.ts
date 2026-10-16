@@ -255,7 +255,7 @@ async function main() {
     const addr = String(l.address).toLowerCase();
     found.set(id, { manager: addr, managerLabel: CANDIDATES[addr] ?? null, block: Number(l.blockNumber), currency0: c0, currency1: c1, ...key, dynamicFee: (key.fee & 0x800000) !== 0 });
   };
-  for (const id of ids) {
+  for (const id of (process.env.PROBE_EXPLORER === '1' ? ids : [])) {
     for (const m of managers) {
       if (found.has(id)) break;
       for (const t0 of [T_INIT_UNI, T_INIT_PCS]) {
@@ -271,6 +271,37 @@ async function main() {
     }
   }
   console.log(`[probe] explorer log search: ${found.size}/${ids.length} ids found`);
+  // Precise path: each workbook pool has its creation time, so find the
+  // block at that time (binary search on block timestamps) and ask the node
+  // for Initialize logs in a small window around it.
+  const tsCache = new Map<number, number>();
+  const blockTime = async (n: number): Promise<number> => {
+    if (tsCache.has(n)) return tsCache.get(n)!;
+    const b = await rpc('eth_getBlockByNumber', [ethers.toQuantity(n), false]);
+    const t = Number(b.timestamp); tsCache.set(n, t); return t;
+  };
+  const blockAt = async (unix: number): Promise<number> => {
+    let lo = 0, hi = latest;
+    while (hi - lo > 2_000) { const mid = Math.floor((lo + hi) / 2); if (await blockTime(mid) < unix) lo = mid; else hi = mid; }
+    return lo;
+  };
+  const createdOf = new Map<string, number>();
+  for (const p of p32) { const t = Date.parse(String(p.created).replace(' ', 'T') + (String(p.created).endsWith('Z') ? '' : 'Z')); if (Number.isFinite(t)) createdOf.set(p.pool.toLowerCase(), Math.floor(t / 1000)); }
+  for (const id of ids) {
+    if (found.has(id) || !createdOf.has(id)) continue;
+    try {
+      const b = await blockAt(createdOf.get(id)!);
+      for (const win of [20_000, 200_000]) {
+        const f = Math.max(0, b - win), t = Math.min(latest, b + win);
+        try {
+          const logs: any[] = await rpc('eth_getLogs', [{ address: managers, fromBlock: ethers.toQuantity(f), toBlock: ethers.toQuantity(t), topics: [[T_INIT_UNI, T_INIT_PCS], [id]] }]);
+          for (const l of logs) decodeInit(l);
+        } catch (e) { result.errors.push(`window logs ${id.slice(0, 10)} +-${win}: ${(e as Error).message.slice(0, 100)}`); }
+        if (found.has(id)) break;
+      }
+    } catch (e) { result.errors.push(`block for ${id.slice(0, 10)}: ${(e as Error).message.slice(0, 100)}`); }
+  }
+  console.log(`[probe] creation-time window search: ${found.size}/${ids.length} ids found (${calls} requests)`);
   const missing = ids.filter((id) => !found.has(id));
   for (let k = 0; k < (process.env.PROBE_RPC_LOGS === '1' ? missing.length : 0); k += 40) {
     const chunk0 = missing;
