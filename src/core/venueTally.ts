@@ -85,5 +85,11 @@ export class VenueTally {
     return `[venues] practice tests by exchange, last hour (today): ${p.length ? p.join('; ') : 'none on the new exchanges yet'}`;
   }
 
+  // This hour's counts per exchange as [name, tests, wins, win $] (read only,
+  // for the 4-hour report; call before resetHour).
+  hourCounts(): [string, number, number, number][] {
+    return [...this.hour.entries()].map(([id, c]) => [this.nameOf(id), c.tests, c.wins, c.winUsd] as [string, number, number, number]);
+  }
+
   resetHour(): void { this.hour.clear(); }
 }

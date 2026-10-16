@@ -141,6 +141,9 @@ export class StallFinder {
   // Last heap size reading (for the memory-made-per-second estimate).
   private lastHeap = -1;
   private readonly heapUsed: () => number;
+  // Called with (freeze length in ms, the job that took most of it) for every freeze.
+  private listeners: ((ms: number, biggestJob: string | null) => void)[] = [];
+  onStall(f: (ms: number, biggestJob: string | null) => void): void { this.listeners.push(f); }
 
   constructor(opts: StallFinderOptions = {}) {
     this.thresholdMs = opts.thresholdMs ?? 50;
@@ -227,6 +230,13 @@ export class StallFinder {
       if (o > 0) gcMs += o;
     }
     this.stalls.push({ start, end, ms, jobs, during, gcMs });
+    // Telegram alerts (report/alertWatch.ts) hear about each freeze. Measurement
+    // only: a listener problem is ignored.
+    if (this.listeners.length) {
+      let top: string | null = null, topMs = 0;
+      for (const [name, t] of jobs) if (t > topMs) { top = name; topMs = t; }
+      for (const f of this.listeners) { try { f(ms, top); } catch { /* reporting only */ } }
+    }
     for (const w of [this.win.fiveMin, this.win.hour]) {
       w.freezes++;
       if (ms > w.worstMs) w.worstMs = ms;
