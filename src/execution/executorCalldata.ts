@@ -139,6 +139,7 @@ export const COPY_V3_CALLBACK: Readonly<Record<string, 'uniswapV3SwapCallback' |
   'up-cl': 'uniswapV3SwapCallback',        // Slipstream (Velodrome/Aerodrome CL) copy
   'topaz-cl': 'uniswapV3SwapCallback',     // Slipstream copy
   'raphael-cl': 'uniswapV3SwapCallback',   // Slipstream copy
+  'abyss-cl': 'uniswapV3SwapCallback',     // Uniswap V3 copy (Oct 16 probe: pool code calls uniswapV3SwapCallback)
 };
 
 // Which contract "kind" a pool maps to, or null if the contract can't trade it.

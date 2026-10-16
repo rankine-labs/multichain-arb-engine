@@ -149,9 +149,9 @@ const rhBase: BuildInput = {
   tradeSizeUsd: 100, netProfitUsd: 1, usdPerTokenIn: 2_500, tokenInDecimals: 18, maxBlock: 1n,
 };
 
-assert(Object.keys(COPY_V3_CALLBACK).sort().join(',') === 'giga-cl,raphael-cl,sushiswap-v3,swaphood-v3,topaz-cl,up-cl', 'all 6 copy exchanges are mapped');
+assert(Object.keys(COPY_V3_CALLBACK).sort().join(',') === 'abyss-cl,giga-cl,raphael-cl,sushiswap-v3,swaphood-v3,topaz-cl,up-cl', 'all 7 copy exchanges are mapped');
 assert(['giga-cl', 'swaphood-v3'].every((d) => COPY_V3_CALLBACK[d] === 'pancakeV3SwapCallback'), 'PancakeSwap copies use the PancakeSwap callback');
-assert(['sushiswap-v3', 'up-cl', 'topaz-cl', 'raphael-cl'].every((d) => COPY_V3_CALLBACK[d] === 'uniswapV3SwapCallback'), 'Uniswap and Slipstream copies use the Uniswap callback');
+assert(['sushiswap-v3', 'up-cl', 'topaz-cl', 'raphael-cl', 'abyss-cl'].every((d) => COPY_V3_CALLBACK[d] === 'uniswapV3SwapCallback'), 'Uniswap and Slipstream copies use the Uniswap callback');
 
 for (const dex of Object.keys(COPY_V3_CALLBACK)) {
   const copy = rhPool(dex, '0x4444444444444444444444444444444444444444');

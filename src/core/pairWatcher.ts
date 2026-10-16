@@ -1,4 +1,5 @@
 import { V4_LOOKUP_TIERS } from '../config/v4Tiers';
+import type { V4ListedKey } from '../config/robinhoodHookedPools';
 import { readFileSync, writeFileSync, mkdirSync, renameSync } from 'fs';
 import { dirname } from 'path';
 import { ethers } from 'ethers';
@@ -43,12 +44,16 @@ export interface Venue {
   // 'algebra':     Algebra Integral factory, factory.poolByPair(a, b)
   // 'v4-registry': hooked V4 pools listed by a registry (Fables): `factory`
   //                is the StateView, `registry` lists the pools.
-  kind: 'v2' | 'solidly' | 'v3-fee' | 'v3-spacing' | 'v4' | 'algebra' | 'v4-registry';
+  // 'v4-keys':     hooked V4 pools given as a fixed list of pool keys
+  //                (config/robinhoodHookedPools.ts, read from each pool's
+  //                own Initialize event): `factory` is the StateView.
+  kind: 'v2' | 'solidly' | 'v3-fee' | 'v3-spacing' | 'v4' | 'algebra' | 'v4-registry' | 'v4-keys';
   factory: string;   // kind 'v4': the StateView contract (where V4 prices are read)
   feeBps?: number;   // V2-style pools: swap fee in bps
   poolManager?: string; // kind 'v4' only: where V4 trades go
   weth?: string;     // kind 'v4' only: WETH, which stands in for native ETH
   registry?: string; // kind 'v4-registry': contract with activePools()
+  keys?: V4ListedKey[]; // kind 'v4-keys': the pools, with their full keys
   pairFee?: boolean; // kind 'solidly': read each pair's own fee() (in millionths)
 }
 
@@ -72,6 +77,7 @@ export interface PairWatcherOptions {
 }
 
 type TokenMeta = { symbol: string; decimals: number };
+
 
 const ERC20_META = ['function symbol() view returns (string)', 'function decimals() view returns (uint8)'];
 
@@ -171,6 +177,7 @@ export async function discoverPairPoolsMulticall(
 ): Promise<{ pools: PoolState[]; meta: Record<string, MetaResult> }> {
   type Pending = { venue: Venue; kind: 'v2' | 'solidly' | 'v3' | 'algebra'; feeKey?: number; spacing?: boolean; idx: number }
     | { venue: Venue; kind: 'v4-registry'; idx: number }
+    | { venue: Venue; kind: 'v4-keys' }
     | { venue: Venue; kind: 'v4'; id: string; fee: number; tickSpacing: number; native: boolean; c0: string; c1: string; liqIdx: number; slotIdx: number };
   const calls: { target: string; data: string }[] = [];
   const pend: Pending[] = [];
@@ -183,6 +190,7 @@ export async function discoverPairPoolsMulticall(
     else if (v.kind === 'v3-spacing') for (const sp of V3_TICK_SPACINGS) pend.push({ venue: v, kind: 'v3', feeKey: sp, spacing: true, idx: push(v.factory, iV3S.encodeFunctionData('getPool', [tokenA, tokenB, sp])) });
     else if (v.kind === 'algebra') pend.push({ venue: v, kind: 'algebra', idx: push(v.factory, iAlgF.encodeFunctionData('poolByPair', [tokenA, tokenB])) });
     else if (v.kind === 'v4-registry' && v.registry && v.poolManager && v.weth) pend.push({ venue: v, kind: 'v4-registry', idx: push(v.registry, iReg.encodeFunctionData('activePools')) });
+    else if (v.kind === 'v4-keys' && v.keys?.length && v.poolManager && v.weth) pend.push({ venue: v, kind: 'v4-keys' }); // list is local: nothing to ask in round 1
     else if (v.kind === 'v4' && v.poolManager && v.weth) {
       const a = tokenA.toLowerCase(), b = tokenB.toLowerCase(), w = v.weth.toLowerCase();
       const variants: { c0: string; c1: string; native: boolean }[] = [a < b ? { c0: tokenA, c1: tokenB, native: false } : { c0: tokenB, c1: tokenA, native: false }];
@@ -211,9 +219,29 @@ export async function discoverPairPoolsMulticall(
   // Round 2: state of the V2 / Solidly / V3 pools that exist.
   const found: { p: Pending & { kind: 'v2' | 'solidly' | 'v3' | 'algebra' }; addr: string; base: number }[] = [];
   const calls2: { target: string; data: string }[] = [];
-  // Hooked V4 pools (registry) matching this pair: their state is read in round 2.
+  // Hooked V4 pools (registry or fixed list) matching this pair: their state is read in round 2.
   const hooked: { venue: Venue; id: string; fee: number; tickSpacing: number; native: boolean; c1: string; c0: string; hooks: string; base: number }[] = [];
   for (const p of pend) {
+    if (p.kind === 'v4-keys') {
+      // Fixed list: keep the entries for THIS pair (native ETH counts as
+      // WETH), at most MAX_HOOKED_POOLS_PER_PAIR, and read their state in
+      // round 2 exactly like registry pools.
+      const v = p.venue;
+      const a = tokenA.toLowerCase(), b = tokenB.toLowerCase(), w = v.weth!.toLowerCase();
+      let matched = 0;
+      for (const k of v.keys!) {
+        if (matched >= MAX_HOOKED_POOLS_PER_PAIR) break;
+        const c0 = k.currency0.toLowerCase(), c1 = k.currency1.toLowerCase();
+        const native = c0 === ethers.ZeroAddress;
+        const x0 = native ? w : c0;
+        if (!((x0 === a && c1 === b) || (x0 === b && c1 === a))) continue;
+        matched++;
+        const base = calls2.length;
+        calls2.push({ target: v.factory, data: iSV.encodeFunctionData('getSlot0', [k.id]) }, { target: v.factory, data: iSV.encodeFunctionData('getLiquidity', [k.id]) });
+        hooked.push({ venue: v, id: k.id.toLowerCase(), fee: k.fee, tickSpacing: k.tickSpacing, native, c0, c1, hooks: k.hooks.toLowerCase(), base });
+      }
+      continue;
+    }
     if (p.kind === 'v4-registry') {
       const v = p.venue;
       let list: any[] = [];

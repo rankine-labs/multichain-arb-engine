@@ -35,11 +35,17 @@
 //                  balances: can't be priced from pool state, only quoted
 //   'prop-amm'     a market maker's own contract (quotes change off chain)
 //   'singleton'    one contract holds every pool (own pool ids and maths)
+//   'v4-listed'    Uniswap V4 pools with a hook, given as a fixed list of
+//                  full pool keys (config/robinhoodHookedPools.ts, read from
+//                  each pool's Initialize event); only hooks whose address
+//                  flags say they cannot change swap amounts are listed
 // ============================================================================
+
+import { listedKeysFor, type V4ListedKey } from './robinhoodHookedPools';
 
 export type VenueModel =
   | 'uniswap-v3' | 'pancake-v3' | 'slipstream' | 'algebra' | 'solidly'
-  | 'v4-hooked' | 'oracle-amm' | 'prop-amm' | 'singleton';
+  | 'v4-hooked' | 'oracle-amm' | 'prop-amm' | 'singleton' | 'v4-listed';
 
 export interface VenueContract {
   role: 'factory' | 'registry' | 'core' | 'swap' | 'retired-factory' | 'pair-config';
@@ -68,6 +74,11 @@ export interface RobinhoodVenue {
   // `run` is the CI run that showed it, `date` when. This allows PRACTICE
   // testing only (isPracticeTestableVenue); it never turns on real trading.
   practiceTested?: { run: string; date: string };
+  // PRACTICE checks allowed without a venue-specific fork run, with the
+  // reason (Oct 16). Used only where every practice check is a full
+  // simulation through the pool's real code, so a wrong assumption shows up
+  // as a failed check, never as counted money. Never allows real trading.
+  practiceOk?: string;
 }
 
 // Where the copy-exchange fork test passed (CI 'contracts' job, annotation
@@ -148,6 +159,14 @@ export const ROBINHOOD_VENUES: readonly RobinhoodVenue[] = [
     executionBlocker: 'One core contract with its own pool ids, extensions and lock/callback settlement; needs its own adapter.',
     source: ['https://docs.ekubo.org/reference/contracts/evm-v3/', 'PR #75'],
   },
+  {
+    id: 'v4-hooks', name: 'Uniswap V4 hooked pools (listed)', priority: 'P0', model: 'v4-listed',
+    contracts: [{ role: 'core', address: '0x8366a39CC670B4001A1121B8F6A443A643e40951' }],
+    priceable: true, executionEnabled: false,
+    executionBlocker: 'Hooked V4 pools trade through the hooked-V4 trade type, which only the contract SOURCE has (fork-tested on Fables); the deployed contract lacks it, so real trades need a redeploy and owner approval.',
+    source: ['Oct 16 pair workbook (GeckoTerminal pool ids)', 'read-only probe scripts/probe-exchanges.ts: each pool\'s Initialize event on the Uniswap V4 PoolManager (full key incl. hook)'],
+    practiceOk: 'every practice check simulates the trade through the pool\'s real hook with the hooked-V4 trade type (same code path the Fables fork test proved), so a hook that refuses or charges more shows up as a failed check; only hooks whose address flags forbid changing swap amounts are listed (config/robinhoodHookedPools.ts)',
+  },
   // ---- P1: other unknown factories seen in rival trades ----------------------
   {
     id: 'up-cl', name: 'UP CL (Slipstream copy)', priority: 'P1', model: 'slipstream',
@@ -197,6 +216,19 @@ export const ROBINHOOD_VENUES: readonly RobinhoodVenue[] = [
     source: ['DefiLlama dimension-adapters dexs/kittenswap-algebra/index.ts', 'venue probe run 37845231412'],
     practiceTested: ALGEBRA_FORK_RUN,
   },
+  {
+    // Oct 16: the factory 0xe7fef2bc... from the Oct 8 rival study (8 pool
+    // uses by rival bots) is the one behind GeckoTerminal's "Abyss" pools.
+    // Probe (scripts/probe-exchanges.ts): its pools answer slot0/liquidity/fee
+    // like Uniswap V3 (1% fee, tick spacing 200) and their code calls
+    // uniswapV3SwapCallback, which our contract already answers.
+    id: 'abyss-cl', name: 'Abyss (Uniswap V3 copy)', priority: 'P1', model: 'uniswap-v3',
+    contracts: [{ role: 'factory', address: '0xe7fef2bc860b25bbdeb6f6ab96d88baaa77ddad7' }],
+    priceable: true, executionEnabled: false,
+    executionBlocker: 'Uniswap V3 copy (uniswapV3SwapCallback); not yet fork-tested against the deployed contract or approved for real trades.',
+    source: ['rival-trade probe run 37835060856 (unknown factory, 8 uses)', 'probe-exchanges run (pool code, slot0, fee 10000 / spacing 200)', 'GeckoTerminal label "Abyss"'],
+    practiceOk: 'practice checks are full simulations of our contract through the pool\'s own code (same callback as the fork-tested UP and Sushi copies), so a pool that does not pay out shows up as a failed check',
+  },
   // ---- P2: documented by the project, not seen in rival trades ---------------
   {
     id: 'goo-exchange', name: 'Goo Exchange', priority: 'P2', model: 'uniswap-v3',
@@ -234,7 +266,7 @@ export function isPracticeTestableVenue(dex: string): boolean {
   return isPracticeTestableIn(ROBINHOOD_VENUES, dex);
 }
 export function isPracticeTestableIn(venues: readonly RobinhoodVenue[], dex: string): boolean {
-  return venues.some((v) => v.id === dex && !!v.practiceTested);
+  return venues.some((v) => v.id === dex && (!!v.practiceTested || !!v.practiceOk));
 }
 
 // The bot's planning gate (shadowMain canPracticeTest): may the practice
@@ -271,8 +303,9 @@ export function venueByFactory(factory: string): RobinhoodVenue | undefined {
 
 // How the pair watcher should look pools up on each priceable venue
 // (core/pairWatcher.ts Venue kinds). Venues not listed here are not read.
-export function watcherKindOf(v: RobinhoodVenue): 'algebra' | 'v3-fee' | 'v3-spacing' | 'solidly' | 'v4-registry' | null {
+export function watcherKindOf(v: RobinhoodVenue): 'algebra' | 'v3-fee' | 'v3-spacing' | 'solidly' | 'v4-registry' | 'v4-keys' | null {
   switch (v.model) {
+    case 'v4-listed': return 'v4-keys';
     case 'algebra': return 'algebra';
     case 'pancake-v3': case 'uniswap-v3': return 'v3-fee';
     case 'slipstream': return 'v3-spacing';
@@ -285,10 +318,15 @@ export function watcherKindOf(v: RobinhoodVenue): 'algebra' | 'v3-fee' | 'v3-spa
 // Extra pair-watcher venues (price reading only). The caller adds them only
 // when RH_EXTRA_VENUES=1; the trade path refuses them via isExecutableVenue().
 export function extraWatcherVenues(v4: { stateView: string; poolManager: string; weth: string }) {
-  const out: { dex: string; kind: 'algebra' | 'v3-fee' | 'v3-spacing' | 'solidly' | 'v4-registry'; factory: string; registry?: string; poolManager?: string; weth?: string; pairFee?: boolean }[] = [];
+  const out: { dex: string; kind: 'algebra' | 'v3-fee' | 'v3-spacing' | 'solidly' | 'v4-registry' | 'v4-keys'; factory: string; registry?: string; poolManager?: string; weth?: string; pairFee?: boolean; keys?: V4ListedKey[] }[] = [];
   for (const v of priceableVenues()) {
     const kind = watcherKindOf(v);
     if (!kind) continue;
+    if (kind === 'v4-keys') {
+      const keys = listedKeysFor(v.id);
+      if (keys.length) out.push({ dex: v.id, kind, factory: v4.stateView, poolManager: v4.poolManager, weth: v4.weth, keys });
+      continue;
+    }
     if (kind === 'v4-registry') {
       const reg = v.contracts.find((c) => c.role === 'registry');
       if (reg) out.push({ dex: v.id, kind, factory: v4.stateView, registry: reg.address, poolManager: v4.poolManager, weth: v4.weth });
@@ -305,7 +343,7 @@ export function extraScanFactories(): { dex: string; kind: 'v2' | 'solidly' | 'v
   return priceableVenues().flatMap((v) => {
     const kind = watcherKindOf(v);
     const f = v.contracts.find((c) => c.role === 'factory');
-    if (!kind || kind === 'v4-registry' || !f) return [];
+    if (!kind || kind === 'v4-registry' || kind === 'v4-keys' || !f) return [];
     return [{ dex: v.id, kind: kind === 'solidly' ? 'solidly' as const : 'v3' as const, factory: f.address }];
   });
 }
