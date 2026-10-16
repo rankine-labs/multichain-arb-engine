@@ -8,7 +8,7 @@ name: Exchange probe (one-off)
 
 on:
   push:
-    branches: [probe-exchanges]
+    branches: [probe-exchanges, probe-exchanges-2]
     paths: ['scripts/probe-exchanges.ts', 'scripts/exchange-probe-pools.json', '.github/workflows/exchange-probe-run.yml']
 
 permissions:

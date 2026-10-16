@@ -238,8 +238,43 @@ async function main() {
   const ids = [...new Set(p32.map((p) => p.pool.toLowerCase()))];
   const managers = Object.entries(result.candidates).filter(([, c]: any) => c.codeBytes > 0 && /PoolManager|Ekubo/i.test(c.label)).map(([a]) => a);
   const found = new Map<string, any>();
-  for (let k = 0; k < ids.length; k += 40) {
-    const chunk = ids.slice(k, k + 40);
+  // Fast path: the public explorer's indexed log search, one id at a time.
+  const decodeInit = (l: any) => {
+    const id = String(l.topics[1]).toLowerCase();
+    const c0 = '0x' + String(l.topics[2]).slice(26), c1 = '0x' + String(l.topics[3]).slice(26);
+    const d = String(l.data).slice(2);
+    const w = (i: number) => d.slice(i * 64, (i + 1) * 64);
+    let key: any;
+    if (String(l.topics[0]).toLowerCase() === T_INIT_UNI.toLowerCase()) {
+      key = { layout: 'uniswap-v4', fee: Number(BigInt('0x' + w(0))), tickSpacing: Number(BigInt.asIntN(24, BigInt('0x' + w(1)))), hooks: '0x' + w(2).slice(24) };
+    } else {
+      const params = '0x' + w(2);
+      key = { layout: 'pancake-infinity-cl', hooks: '0x' + w(0).slice(24), fee: Number(BigInt('0x' + w(1))), parameters: params,
+        tickSpacing: Number(BigInt.asIntN(24, (BigInt(params) >> 16n) & 0xffffffn)) };
+    }
+    const addr = String(l.address).toLowerCase();
+    found.set(id, { manager: addr, managerLabel: CANDIDATES[addr] ?? null, block: Number(l.blockNumber), currency0: c0, currency1: c1, ...key, dynamicFee: (key.fee & 0x800000) !== 0 });
+  };
+  for (const id of ids) {
+    for (const m of managers) {
+      if (found.has(id)) break;
+      for (const t0 of [T_INIT_UNI, T_INIT_PCS]) {
+        try {
+          const u = `https://robinhoodchain.blockscout.com/api?module=logs&action=getLogs&fromBlock=0&toBlock=latest&address=${m}&topic0=${t0}&topic1=${id}&topic0_1_opr=and`;
+          const r = await fetch(u, { signal: AbortSignal.timeout(20_000) });
+          const j: any = r.ok ? await r.json() : null;
+          for (const l of (Array.isArray(j?.result) ? j.result : [])) decodeInit(l);
+        } catch (e) { result.errors.push(`explorer logs ${id.slice(0, 10)}: ${(e as Error).message.slice(0, 80)}`); }
+        await sleep(150);
+        if (found.has(id)) break;
+      }
+    }
+  }
+  console.log(`[probe] explorer log search: ${found.size}/${ids.length} ids found`);
+  const missing = ids.filter((id) => !found.has(id));
+  for (let k = 0; k < (process.env.PROBE_RPC_LOGS === '1' ? missing.length : 0); k += 40) {
+    const chunk0 = missing;
+    const chunk = chunk0.slice(k, k + 40);
     const stack: [number, number][] = [];
     for (let f = 0; f <= latest; f += LOG_RANGE) stack.push([f, Math.min(latest, f + LOG_RANGE - 1)]);
     stack.reverse();
@@ -269,7 +304,7 @@ async function main() {
         else result.errors.push(`logs ${f}-${t}: ${(e as Error).message.slice(0, 120)}`);
       }
     }
-    console.log(`[probe] ids ${k + chunk.length}/${ids.length}: ${found.size} found (${calls} requests)`);
+    console.log(`[probe] rpc ids ${k + chunk.length}/${missing.length}: ${found.size} found (${calls} requests)`);
   }
 
   // Live state of Uniswap V4 pools found (price, liquidity, current LP fee),
