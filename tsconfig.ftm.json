@@ -1,0 +1,8 @@
+{
+  // Builds only the follow-the-money study (scripts/follow-the-money.ts) and
+  // the bot code it imports, so one broken diagnostic script elsewhere can
+  // never stop it from running. Used by `npm run follow-money`.
+  "extends": "./tsconfig.json",
+  "include": ["scripts/follow-the-money.ts"],
+  "compilerOptions": { "rootDir": ".", "outDir": ".scripts-build", "sourceMap": false, "declaration": false, "declarationMap": false }
+}
