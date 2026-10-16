@@ -6,7 +6,8 @@
     "scripts": {
         "typecheck": "tsc --noEmit -p .",
         "build": "rm -rf dist && tsc -p .",
-        "test": "tsc -p . --outDir .test-build && node scripts/run-tests.js"
+        "test": "tsc -p . --outDir .test-build && node scripts/run-tests.js",
+        "follow-money": "tsc -p tsconfig.ftm.json && node .scripts-build/scripts/follow-the-money.js"
     },
     "keywords": [],
     "author": "",
