@@ -41,6 +41,32 @@ export interface GapOptions {
   // How many pool combinations to return per coin pair, best first (default 1).
   // The scanner asks for 3 so a muted best combination doesn't hide the others.
   perPair?: number;
+  // Coins we actually hold (USDG, WETH). When a pair contains one of them, the
+  // gap is always traded STARTING from that coin: buy the other coin where it
+  // is cheap, sell it where it is dear, end with more of our own coin.
+  // (Oct 16, owner approved. Before, the scanner started from token1 when it
+  // had a price; on a pair like USDG/ORBIO that meant starting from ORBIO,
+  // which we don't hold, so live could never send it.) Empty/unset = old rule.
+  startCoins?: string[];
+}
+
+// Which coin a gap starts and ends with (the "quote"), and its USD price.
+// 1. If one coin is a coin we hold (opts.startCoins) and has a price: that one.
+//    (If both are, e.g. WETH/USDG, the old rule below decides.)
+// 2. Otherwise the old rule: token1 if it has a USD price, else token0.
+export function pickQuote(
+  t0: string, t1: string, usdOf: (token: string) => number | null, startCoins?: string[],
+): { quote: string; base: string; quoteUsd: number } | null {
+  const u0 = usdOf(t0), u1 = usdOf(t1);
+  if (startCoins && startCoins.length) {
+    const held = new Set(startCoins.map((c) => c.toLowerCase()));
+    const h0 = held.has(t0) && !!u0 && u0 > 0, h1 = held.has(t1) && !!u1 && u1 > 0;
+    if (h0 && !h1) return { quote: t0, base: t1, quoteUsd: u0! };
+    if (h1 && !h0) return { quote: t1, base: t0, quoteUsd: u1! };
+  }
+  if (u1 && u1 > 0) return { quote: t1, base: t0, quoteUsd: u1 };
+  if (u0 && u0 > 0) return { quote: t0, base: t1, quoteUsd: u0 };
+  return null;
 }
 
 const Q96 = 2 ** 96;
@@ -97,10 +123,10 @@ export function findStandingGaps(
     const t0 = usable[0].tokenA.toLowerCase(), t1 = usable[0].tokenB.toLowerCase();
     const d0 = decimalsOf(t0), d1 = decimalsOf(t1);
     if (d0 === undefined || d1 === undefined) continue; // never guess decimals
-    // Quote = the side with a USD price (prefer token1, usually the stable / WETH).
-    const u1 = usdOf(t1), u0 = usdOf(t0);
-    const [quote, base, quoteUsd] = u1 ? [t1, t0, u1] : u0 ? [t0, t1, u0] : [null, null, 0];
-    if (!quote || !base || !(quoteUsd > 0)) continue;
+    // Start coin: one we hold if the pair has it, else the old rule (pickQuote).
+    const pq = pickQuote(t0, t1, usdOf, opts.startCoins);
+    if (!pq) continue;
+    const { quote, base, quoteUsd } = pq;
 
     const found: StandingGap[] = [];
     for (const buy of usable) {
@@ -187,7 +213,7 @@ export class GapScanMemo {
   // trade size cap) changed = forget everything. Gas, the minimum profit and
   // perPair are applied fresh every scan, so they are not part of this.
   begin(opts: GapOptions): number {
-    const k = `${opts.flashFee}|${opts.maxTradeUsd}`;
+    const k = `${opts.flashFee}|${opts.maxTradeUsd}|${(opts.startCoins ?? []).join(',')}`;
     if (k !== this.optsKey) { this.pairs.clear(); this.optsKey = k; }
     return ++this.scan;
   }
@@ -265,9 +291,10 @@ export function* findStandingGapsSteps(
     const t0 = usable[0].tokenA.toLowerCase(), t1 = usable[0].tokenB.toLowerCase();
     const d0 = decimalsOf(t0), d1 = decimalsOf(t1);
     if (d0 === undefined || d1 === undefined) continue; // never guess decimals
-    const u1 = usdOf(t1), u0 = usdOf(t0);
-    const [quote, base, quoteUsd] = u1 ? [t1, t0, u1] : u0 ? [t0, t1, u0] : [null, null, 0];
-    if (!quote || !base || !(quoteUsd > 0)) continue;
+    // Start coin: one we hold if the pair has it, else the old rule (pickQuote).
+    const pq = pickQuote(t0, t1, usdOf, opts.startCoins);
+    if (!pq) continue;
+    const { quote, base, quoteUsd } = pq;
 
     // What this pair's answer depends on, right now.
     const prints = usable.map((p) => printOf(p, base, quote));
