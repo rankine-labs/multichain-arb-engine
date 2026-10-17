@@ -99,6 +99,20 @@ export function defineLazyFrom(target: { from?: string | null }, tx: Transaction
   });
 }
 
+// On by default; FEED_LAZY_HASH=0 turns it off (read per call so tests can switch it).
+function lazyHash(): boolean { return process.env.FEED_LAZY_HASH !== '0'; }
+
+// Adds a `hash` property that hashes the raw signed bytes the first time it
+// is read and caches the answer. Enumerable, so it still looks like a field.
+export function defineLazyHash(target: { hash?: string }, raw: string): void {
+  let value: string | null = null;
+  Object.defineProperty(target, 'hash', {
+    enumerable: true,
+    configurable: true,
+    get() { if (value === null) value = keccak256(raw); return value; },
+  });
+}
+
 // Parses one websocket frame into the transactions it contains.
 // Returns [] for anything unexpected; never throws.
 export function parseFeedFrame(frame: unknown): FeedTx[] {
@@ -125,7 +139,12 @@ export function parseFeedFrame(frame: unknown): FeedTx[] {
       try {
         if (!tx.to || !tx.data || tx.data === '0x') continue; // plain transfers aren't swaps
         // A tx hash is keccak256 of its raw signed bytes: no ethers validation involved.
-        const out = { sequenceNumber: seq, hash: keccak256(raw), to: tx.to, data: tx.data, value: tx.value.toString() } as FeedTx;
+        const out = { sequenceNumber: seq, to: tx.to, data: tx.data, value: tx.value.toString() } as FeedTx;
+        // HASH IS WORKED OUT ONLY WHEN SOMEONE ASKS FOR IT (experiment, Oct 16).
+        // keccak256 of the raw bytes, computed on first read and remembered.
+        // FEED_LAZY_HASH=0 restores the old eager behaviour.
+        if (lazyHash()) defineLazyHash(out, raw);
+        else out.hash = keccak256(raw);
         // SENDER ("from") IS WORKED OUT ONLY WHEN SOMEONE ASKS FOR IT (Oct 13).
         // Finding the sender means checking the signature, which takes about
         // 1-2 ms per transaction in JavaScript. A feed frame often holds 20-40
