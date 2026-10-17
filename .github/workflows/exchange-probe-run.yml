@@ -8,8 +8,8 @@ name: Exchange probe (one-off)
 
 on:
   push:
-    branches: [probe-exchanges, probe-exchanges-2, probe-exchanges-3]
-    paths: ['scripts/probe-exchanges.ts', 'scripts/exchange-probe-pools.json', '.github/workflows/exchange-probe-run.yml']
+    branches: [probe-exchanges, probe-exchanges-2, probe-exchanges-3, probe-exchanges-4]
+    paths: ['scripts/probe-v4keys.ts', 'scripts/probe-exchanges.ts', 'scripts/exchange-probe-pools.json', '.github/workflows/exchange-probe-run.yml']
 
 permissions:
   contents: write
@@ -28,12 +28,13 @@ jobs:
       - name: Probe every workbook pool (read-only)
         env:
           PROBE_ONLY: ${{ github.ref_name == 'probe-exchanges-3' && 'ids' || '' }}
-        run: node .scripts-build/scripts/probe-exchanges.js
+        run: |
+          if [ "${{ github.ref_name }}" = "probe-exchanges-4" ]; then node .scripts-build/scripts/probe-v4keys.js; else node .scripts-build/scripts/probe-exchanges.js; fi
       - name: Commit the result back to the branch
         if: always()
         run: |
           git config user.name "exchange-probe"
           git config user.email "exchange-probe@users.noreply.github.com"
-          git add -f results/exchange-probe.json || exit 0
+          git add -f results/ || exit 0
           git commit -m "Exchange probe result (read-only)" || exit 0
           git push
