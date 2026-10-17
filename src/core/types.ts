@@ -119,6 +119,9 @@ export interface ArbOpportunity {
 // this much profit AFTER gas, exchange fees, any loan fee and a 15% safety
 // haircut. Was a fixed $20, which meant almost none of our real wins (nearly
 // all under $20) would ever be sent once live. Owner decision Oct 11: $0.10.
+// Owner decision Oct 16 (go-live): $0.25. With ~2 cents of gas lost per
+// failed send, $0.10 needs us to win 17% of races just to cover gas; $0.25
+// needs 7.4%. (docs/GO_LIVE_CHECKLIST.md already suggested $0.25.)
 //
 // Why $0.10 is safe: a trade that loses the race costs only its gas (~2
 // cents) because the contract cancels any trade that wouldn't make money,
@@ -126,13 +129,13 @@ export interface ArbOpportunity {
 // trades burn too much gas in a day.
 //
 // Setting: MIN_EXEC_NET_USD (dollars, above 0). Unset, empty, zero or
-// invalid -> $0.10 (zero would let through trades whose profit floor rounds
-// to nothing).
+// invalid -> $0.25 (zero would let through trades whose profit floor rounds
+// to nothing). A value in .env still wins over this default.
 // Other bars are separate and unchanged: SIM_MIN_GROSS_USD decides what gets
 // a practice check, COUNT_MIN_USD what counts in practice reports, and the
 // contract's own minProfit check is set per trade from this expected profit.
 // ----------------------------------------------------------------------------
-export const DEFAULT_MIN_EXEC_NET_USD = 0.10;
+export const DEFAULT_MIN_EXEC_NET_USD = 0.25;
 export function readMinExecNetUsd(raw: string | undefined = process.env.MIN_EXEC_NET_USD): number {
   if (raw === undefined || raw.trim() === '') return DEFAULT_MIN_EXEC_NET_USD;
   const v = Number(raw);

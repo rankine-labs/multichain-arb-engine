@@ -13,14 +13,16 @@
 //   pool id (the fingerprint matched exactly), so none of them is a guess.
 //
 //   Our deployed contract trades any hook-free V4 pool (the fee and tick
-//   spacing travel inside each trade), but these pools are PRACTICE ONLY for
-//   now: isPracticeOnlyPool() below makes the live send refuse them until
-//   the owner approves them in code. Practice checks, reports and research
-//   use them like any other pool.
+//   spacing travel inside each trade; fork test ForkNewVenues.t.sol traded
+//   the two biggest WETH/USDG ones both ways, CI run 38996170909).
+//   Oct 16, 23:02 (owner approved for go-live): these pools may be traded
+//   for real, like any standard V4 pool. RH_V4_EXTRA_LIVE=0 in .env makes
+//   them practice only again (the live send then refuses them).
 //
 // Settings (.env, optional):
 //   RH_V4_EXTRA_TIERS=0          look up only the 4 standard settings (old behaviour)
 //   RH_V4_MORE_TIERS=fee:ts,...  add more settings, e.g. "750:15,4000:80"
+//   RH_V4_EXTRA_LIVE=0           pools at the extra settings: practice only
 // ============================================================================
 
 export type V4Tier = [fee: number, tickSpacing: number];
@@ -90,11 +92,13 @@ export function isStandardV4Tier(fee: number, tickSpacing: number): boolean {
 }
 
 // Live send refuses these pools (practice only). Returns the reason, or null.
-// Hook-free V4 pools at a non-standard setting: practice only until the
-// owner approves them by removing this rule in code.
-export function practiceOnlyReason(pool: { v4?: { fee: number; tickSpacing: number; hooks?: string } }): string | null {
+// Hook-free V4 pools at a non-standard setting are live-tradable since the
+// owner's go-live approval (Oct 16); RH_V4_EXTRA_LIVE=0 makes them practice
+// only again.
+export function practiceOnlyReason(pool: { v4?: { fee: number; tickSpacing: number; hooks?: string } }, env: Record<string, string | undefined> = process.env): string | null {
   const v = pool.v4;
   if (!v) return null;
+  if (env.RH_V4_EXTRA_LIVE !== '0' && env.RH_V4_EXTRA_LIVE !== 'off') return null;
   const hookless = !v.hooks || /^0x0{40}$/i.test(v.hooks);
   if (hookless && !isStandardV4Tier(v.fee, v.tickSpacing)) return `Uniswap V4 pool at a non-standard setting (${v.fee / 10_000}% / spacing ${v.tickSpacing}), practice only`;
   return null;
