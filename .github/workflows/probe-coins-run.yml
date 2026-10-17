@@ -1,0 +1,23 @@
+# One-off, read-only: names and beacons of top coins (scripts/probe-coins.ts),
+# result committed back to the probe-coins branch. Sends nothing.
+name: Coin probe (one-off)
+on:
+  push:
+    branches: [probe-coins]
+    paths: ['scripts/probe-coins.ts', '.github/workflows/probe-coins-run.yml']
+permissions:
+  contents: write
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - run: npm install --no-audit --no-fund
+      - run: npx tsc -p tsconfig.scripts.json && node .scripts-build/scripts/probe-coins.js
+      - if: always()
+        run: |
+          git config user.name "coin-probe"; git config user.email "coin-probe@users.noreply.github.com"
+          git add -f results/ || exit 0; git commit -m "Coin probe result (read-only)" || exit 0; git push
