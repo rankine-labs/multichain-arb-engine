@@ -246,7 +246,22 @@ export function priceableVenues(): RobinhoodVenue[] {
   return ROBINHOOD_VENUES.filter((v) => v.priceable);
 }
 
-// The one gate for trading: nothing in this file may be traded.
+// TESTED VENUES LIVE (Oct 17, owner approved): the fork-tested venues
+// (practiceTested set: the copy exchanges, Algebra, Fables, Abyss) may be
+// traded for real ONLY when BOTH are true:
+//   1. the owner turned it on: RH_TESTED_VENUES_LIVE=1 in .env, and
+//   2. the bot checked at start that the contract deployed on chain is
+//      byte-for-byte the tested contract code (execution/contractMatch.ts).
+// shadowMain calls setTestedVenuesLive() after that check. Until then (and
+// by default) every venue in this file stays refused, as before. Venues in
+// LIVE_NEVER are never enabled this way (owner's no-meme-coin rule).
+let testedVenuesLive = false;
+export const LIVE_NEVER = new Set(['abyss-cl']); // only meme-coin pools
+export function setTestedVenuesLive(on: boolean): void { testedVenuesLive = on; }
+export function testedVenuesAreLive(): boolean { return testedVenuesLive; }
+
+// The one gate for trading: nothing in this file may be traded, except
+// fork-tested venues once setTestedVenuesLive(true) (see above).
 export function isExecutableVenue(dex: string): boolean {
   return isExecutableIn(ROBINHOOD_VENUES, dex);
 }
@@ -254,8 +269,10 @@ export function isExecutableVenue(dex: string): boolean {
 // Same gate against a given venue list (tests use a copy of the registry
 // with one venue changed). Kept separate from isExecutableVenue so that
 // `list.every(isExecutableVenue)` can never pass an index as the list.
-export function isExecutableIn(venues: readonly RobinhoodVenue[], dex: string): boolean {
-  return !venues.some((v) => v.id === dex);
+export function isExecutableIn(venues: readonly RobinhoodVenue[], dex: string, liveTested: boolean = testedVenuesLive): boolean {
+  const v = venues.find((x) => x.id === dex);
+  if (!v) return true; // not an extra venue: an exchange we already trade
+  return liveTested && !!v.practiceTested && !LIVE_NEVER.has(v.id);
 }
 
 // PRACTICE testing only (never real money): true only for venues whose

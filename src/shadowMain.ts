@@ -101,8 +101,10 @@ import { readOutlierConfig, isOutlier, confirmOutlier, withDeadline, OutlierVerd
 import type { ExecutorHop } from './execution/executorCalldata';
 import { RivalWatch } from './core/rivalWatch';
 import { V3BalanceBook, V3_BALANCES_FILE } from './core/v3BalanceBook';
-import { extraWatcherVenues, extraScanFactories, isExecutableVenue, canPracticeTestVenue, reportedVenueIds, venueShortName } from './config/robinhoodVenues';
+import { extraWatcherVenues, extraScanFactories, isExecutableVenue, canPracticeTestVenue, reportedVenueIds, venueShortName, setTestedVenuesLive } from './config/robinhoodVenues';
 import { practiceOnlyReason } from './config/v4Tiers';
+import { LiveCoinRule } from './core/liveCoins';
+import { checkDeployedContract } from './execution/contractMatch';
 import { VenueTally } from './core/venueTally';
 // Practice-test a pool: exchanges we trade, plus extra venues that passed the
 // executor fork test (config/robinhoodVenues.ts canPracticeTestVenue). Fables
@@ -113,9 +115,19 @@ const canPracticeTest = (dex: string) => canPracticeTestVenue(dex);
 // it could take it: an exchange not cleared for trading, or a pool that is
 // practice only (Uniswap V4 at a non-standard setting, config/v4Tiers.ts).
 // Used by the live send (fireTrade) and by "could earn live" so the two agree.
-const liveBlocker = (buy: { dex?: string; v4?: any } | undefined, sell: { dex?: string; v4?: any } | undefined): string | null => {
+// Oct 17: plus the live coin rule (core/liveCoins.ts, no meme coins) for
+// Robinhood trades.
+let liveCoins: LiveCoinRule | null = null; // set once the Robinhood read node exists
+const liveBlocker = (buy: { dex?: string; v4?: any; chain?: string; tokenA?: string; tokenB?: string } | undefined,
+      sell: { dex?: string; v4?: any; chain?: string; tokenA?: string; tokenB?: string } | undefined): string | null => {
       if (!isExecutableVenue(buy?.dex ?? '') || !isExecutableVenue(sell?.dex ?? '')) return `exchange not cleared for trading (${buy?.dex} / ${sell?.dex})`;
-      return practiceOnlyReason(buy ?? {}) ?? practiceOnlyReason(sell ?? {});
+      const po = practiceOnlyReason(buy ?? {}) ?? practiceOnlyReason(sell ?? {});
+      if (po) return po;
+      if (liveCoins && (buy?.chain === 'robinhood' || sell?.chain === 'robinhood')) {
+            const coins = [buy?.tokenA, buy?.tokenB, sell?.tokenA, sell?.tokenB].filter((t): t is string => !!t);
+            return liveCoins.blocker([...new Set(coins.map((t) => t.toLowerCase()))]);
+      }
+      return null;
 };
 // Practice tests and wins per new exchange, for the hourly report and the
 // status page (core/venueTally.ts). Fixed list of venue ids = bounded memory.
@@ -1026,6 +1038,22 @@ const robinhoodWatcher = new PairWatcher('robinhood', robinhoodReadProvider, ROB
       // ~700 pools cost ~4 requests per refresh. ROBINHOOD_MAX_PAIRS overrides.
       { maxPairs: Number(process.env.ROBINHOOD_MAX_PAIRS ?? 150), rediscoverMs: 60 * 60_000, refreshMs: 5_000, discoveryProvider: robinhoodReadProvider,
         onRefreshed: () => requestGapScan() });
+// LIVE COIN RULE (core/liveCoins.ts, Oct 17): which coins a REAL trade may
+// touch (USDG, WETH, official Robinhood stock tokens, LIVE_EXTRA_COINS).
+liveCoins = new LiveCoinRule(robinhoodReadProvider, [ROBINHOOD_TOKENS.USDG, ROBINHOOD_TOKENS.WETH]);
+console.log(`[live-coins] rule ${liveCoins.on ? 'ON (no meme coins in real trades; LIVE_COIN_RULE=off to disable)' : 'OFF'}`);
+setInterval(() => { const st = liveCoins?.stats(); if (st) console.log(`[live-coins] ${st.allowed} of ${st.checked} checked coins allowed for real trades`); }, 60 * 60_000);
+// TESTED VENUES LIVE (config/robinhoodVenues.ts, Oct 17): is the deployed
+// contract exactly the tested code? Read-only, logged every start. Only with
+// RH_TESTED_VENUES_LIVE=1 AND a match do the fork-tested exchanges (UP,
+// Sushi, GIGA, SwapHood, Topaz, Raphael, Alandale, KittenSwap, Fables)
+// become tradable for real.
+void (async () => {
+      const r = await checkDeployedContract(robinhoodReadProvider, executorConfig('robinhood').executorAddress);
+      const wanted = process.env.RH_TESTED_VENUES_LIVE === '1';
+      setTestedVenuesLive(wanted && r.match);
+      console.log(`[contract] ${r.reason}. Tested exchanges for real trades: ${wanted && r.match ? 'ON' : wanted ? 'OFF (contract does not match)' : 'OFF (RH_TESTED_VENUES_LIVE not 1)'}`);
+})();
 // Restore the last watch list (saved every 10 min and at shutdown) so a
 // restart doesn't re-discover every pair in one burst.
 const WATCH_FILE = 'data/watched-pools.json';
@@ -3133,6 +3161,8 @@ await chainManager.startAll();
       if (SCAN_TOP > 0) {
             const start = loadStartPairs(TOP_PAIRS_FILE, ROBINHOOD_SEED_PAIRS);
             const pairs = start.pairs.slice(0, SCAN_TOP);
+            // Look up the start list's coins for the live coin rule now, in the background.
+            void (async () => { for (const p of pairs) { await liveCoins?.lookup(p.a.toLowerCase()); await liveCoins?.lookup(p.b.toLowerCase()); } })();
             safetyGate.allowTokens(pairs.flatMap((p) => [p.a, p.b]));
             void (async () => {
                   // One at a time, in the background: startup is never delayed.
