@@ -118,6 +118,12 @@ jobs:
           loops="${loops//'%'/'%25'}"
           loops="${loops//$'\n'/'%0A'}"
           echo "::notice title=Loop fork results::${loops}"
+          # Pools added Oct 16 (ForkNewVenues.t.sol): non-standard V4 settings,
+          # listed hooked V4 pools, Abyss. Own note, short.
+          nv=$(grep -E "NEWVENUE|newVenues|v4ExtraTiers|listedHooks|robinhood_abyss" fork-output.txt | head -60)
+          nv="${nv//'%'/'%25'}"
+          nv="${nv//$'\n'/'%0A'}"
+          echo "::notice title=New venue fork results::${nv}"
           exit $status
         env:
           AVALANCHE_RPC_URL: https://api.avax.network/ext/bc/C/rpc
