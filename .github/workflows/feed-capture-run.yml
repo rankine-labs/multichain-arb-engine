@@ -1,0 +1,35 @@
+# ============================================================================
+# FEED FRAME CAPTURE (one-off, read-only). Saves real Robinhood sequencer feed
+# frames to results/feed-frames.json on the feed-capture branch, for the
+# feed-parser benchmark. Never touches the bot server, keys or funds.
+# ============================================================================
+name: Feed frame capture (one-off)
+
+on:
+  push:
+    branches: [feed-capture]
+    paths: ['scripts/capture-feed-frames.js', '.github/workflows/feed-capture-run.yml']
+
+permissions:
+  contents: write
+
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install --no-audit --no-fund
+      - name: Capture feed frames (read-only)
+        run: node scripts/capture-feed-frames.js 3000 900
+      - name: Commit the frames back to the branch
+        if: always()
+        run: |
+          git config user.name "feed-capture"
+          git config user.email "feed-capture@users.noreply.github.com"
+          git add -f results/feed-frames.json || exit 0
+          git commit -m "Feed frame capture (read-only)" || exit 0
+          git push
