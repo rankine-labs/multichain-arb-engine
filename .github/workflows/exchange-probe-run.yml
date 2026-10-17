@@ -8,7 +8,7 @@ name: Exchange probe (one-off)
 
 on:
   push:
-    branches: [probe-exchanges, probe-exchanges-2, probe-exchanges-3, probe-exchanges-4]
+    branches: [probe-exchanges, probe-exchanges-2, probe-exchanges-3, probe-exchanges-4, probe-exchanges-5]
     paths: ['scripts/probe-v4keys.ts', 'scripts/probe-exchanges.ts', 'scripts/exchange-probe-pools.json', '.github/workflows/exchange-probe-run.yml']
 
 permissions:
@@ -29,7 +29,7 @@ jobs:
         env:
           PROBE_ONLY: ${{ github.ref_name == 'probe-exchanges-3' && 'ids' || '' }}
         run: |
-          if [ "${{ github.ref_name }}" = "probe-exchanges-4" ]; then node .scripts-build/scripts/probe-v4keys.js; else node .scripts-build/scripts/probe-exchanges.js; fi
+          if [ "${{ github.ref_name }}" = "probe-exchanges-4" ] || [ "${{ github.ref_name }}" = "probe-exchanges-5" ]; then node .scripts-build/scripts/probe-v4keys.js; else node .scripts-build/scripts/probe-exchanges.js; fi
       - name: Commit the result back to the branch
         if: always()
         run: |

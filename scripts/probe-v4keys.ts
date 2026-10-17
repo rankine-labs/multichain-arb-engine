@@ -42,18 +42,21 @@ async function rpc(method: string, params: unknown[]): Promise<any> {
   }
   throw lastErr;
 }
-const mc = new ethers.Interface(['function aggregate3((address target,bool allowFailure,bytes callData)[] calls) view returns ((bool success,bytes returnData)[])']);
-// Does each pool have a price at `block`? (sqrtPrice != 0)
-async function hasPriceAt(ids: string[], block: number): Promise<boolean[]> {
+// Does each pool have a price at `block`? Read straight from the
+// PoolManager's storage with extsload (it exists from the chain's first V4
+// block, unlike Multicall3/StateView): a pool's slot0 word sits at
+// keccak256(poolId, POOLS_SLOT = 6) and is non-zero once initialized.
+const pmI = new ethers.Interface(['function extsload(bytes32[] slots) view returns (bytes32[])']);
+const slotOf = (id: string) => ethers.keccak256(ethers.concat([id, ethers.zeroPadValue('0x06', 32)]));
+async function hasPriceAt(ids: string[], block: number | 'latest'): Promise<boolean[]> {
   const out: boolean[] = [];
   for (let i = 0; i < ids.length; i += 200) {
     const chunk = ids.slice(i, i + 200);
-    const data = mc.encodeFunctionData('aggregate3', [chunk.map((id) => ({ target: SV, allowFailure: true, callData: SEL_SLOT0 + id.slice(2) }))]);
     try {
-      const raw = await rpc('eth_call', [{ to: MC3, data }, ethers.toQuantity(block)]);
-      const [res] = mc.decodeFunctionResult('aggregate3', raw);
-      for (const r of res as any[]) out.push(r.success && r.returnData.length >= 66 && BigInt(r.returnData.slice(0, 66)) !== 0n);
-    } catch (e) { for (const _ of chunk) out.push(false); errors.push(`hasPriceAt ${block}: ${String((e as Error).message).slice(0, 120)}`); }
+      const raw = await rpc('eth_call', [{ to: PM, data: pmI.encodeFunctionData('extsload', [chunk.map(slotOf)]) }, block === 'latest' ? 'latest' : ethers.toQuantity(block)]);
+      const [words] = pmI.decodeFunctionResult('extsload', raw);
+      for (const w of words as string[]) out.push(BigInt(w) !== 0n);
+    } catch (e) { for (const _ of chunk) out.push(false); errors.push(`hasPriceAt ${block}: ${String((e as Error).message).slice(0, 160)}`); }
   }
   return out;
 }
@@ -75,13 +78,14 @@ async function main() {
   } catch (e) { errors.push(`fables: ${(e as Error).message.slice(0, 100)}`); }
   // Archive check: a pool created at block 44,905 must have a price at 100,000.
   const arch = await hasPriceAt(['0x' + 'f'.repeat(64)], 100_000).catch(() => [false]);
+  console.log(`[v4keys] archive test errors so far: ${errors.length}`);
   console.log(`[v4keys] ${ids.length} ids, latest ${latest}, archive call ok: ${arch.length === 1}`);
 
   // 1) Brackets.
   const STEP = 1_000_000;
   const points: number[] = []; for (let b = STEP; b < latest; b += STEP) points.push(b); points.push(latest);
   const firstSeen = new Map<string, number>(); // index into points
-  const now = await hasPriceAt(ids, latest);
+  const now = await hasPriceAt(ids, 'latest');
   const live = ids.filter((_, i) => now[i]);
   console.log(`[v4keys] ${live.length}/${ids.length} ids have a price on the Uniswap V4 PoolManager now`);
   for (let k = 0; k < points.length; k++) {
