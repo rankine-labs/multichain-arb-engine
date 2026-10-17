@@ -225,9 +225,11 @@ export const ROBINHOOD_VENUES: readonly RobinhoodVenue[] = [
     id: 'abyss-cl', name: 'Abyss (Uniswap V3 copy)', priority: 'P1', model: 'uniswap-v3',
     contracts: [{ role: 'factory', address: '0xe7fef2bc860b25bbdeb6f6ab96d88baaa77ddad7' }],
     priceable: true, executionEnabled: false,
-    executionBlocker: 'Uniswap V3 copy (uniswapV3SwapCallback); not yet fork-tested against the deployed contract or approved for real trades.',
+    executionBlocker: 'Uniswap V3 copy (uniswapV3SwapCallback); our executor traded its ABYSS/WETH pool both ways on a fork (practiceTested). Not yet approved for real trades.',
     source: ['rival-trade probe run 37835060856 (unknown factory, 8 uses)', 'probe-exchanges run (pool code, slot0, fee 10000 / spacing 200)', 'GeckoTerminal label "Abyss"'],
-    practiceOk: 'practice checks are full simulations of our contract through the pool\'s own code (same callback as the fork-tested UP and Sushi copies), so a pool that does not pay out shows up as a failed check',
+    // contracts/test/ForkNewVenues.t.sol: ABYSS/WETH pool, WETH in and out,
+    // every swap executed, stopped only by our profit check.
+    practiceTested: { run: 'https://github.com/rankine-labs/multichain-arb-engine/actions/runs/38996170909', date: '2026-10-17' },
   },
   // ---- P2: documented by the project, not seen in rival trades ---------------
   {

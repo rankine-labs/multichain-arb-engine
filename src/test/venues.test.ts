@@ -27,9 +27,10 @@ async function main() {
   // Plus the 2 Algebra exchanges whose fork test passed (ForkAlgebraVenues.t.sol).
   const ALGEBRA = ['alandale', 'kittenswap-algebra'];
   // Plus (Oct 16) the venues allowed practice checks with a written reason
-  // (practiceOk): Abyss (a Uniswap V3 copy) and the listed hooked V4 pools.
-  const PRACTICE_OK = ['abyss-cl', 'v4-hooks'];
-  const PRACTICE = [...COPIES, ...ALGEBRA, 'fables', ...PRACTICE_OK];
+  // (practiceOk): the listed hooked V4 pools. And Abyss, fork-tested Oct 17
+  // (contracts/test/ForkNewVenues.t.sol).
+  const PRACTICE_OK = ['v4-hooks'];
+  const PRACTICE = [...COPIES, ...ALGEBRA, 'fables', 'abyss-cl', ...PRACTICE_OK];
   assert(PRACTICE_OK.every((id) => (ROBINHOOD_VENUES.find((v) => v.id === id)?.practiceOk ?? '').length > 40), 'practiceOk venues explain why practice checks are safe');
   assert(COPIES.every(isPracticeTestableVenue), 'all 6 fork-tested copy exchanges are practice-testable');
   assert(ALGEBRA.every(isPracticeTestableVenue), 'both fork-tested Algebra exchanges (Alandale, KittenSwap) are practice-testable');
