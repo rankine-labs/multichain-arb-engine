@@ -41,8 +41,8 @@ contract RobinhoodForkTestNewVenues is ForkBase {
     address constant WETH = 0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73;
     address constant USDG = 0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168;
     address constant UNI_V3_WETH_USDG = 0x52e65B17fB6E5BA00Ed806f37Afcd2DaA50271Ca;
-    address constant ABYSS_WETH_POOL = 0xdec74A2AFabd34aA6F268C5161D2e9E210CA7185;
-    address constant ABYSS = 0x15F3385625d7e364c5a6216FbBcEaDF10fa90E7D;
+    address constant ABYSS_WETH_POOL = 0xDec74a2AfABD34aA6f268c5161D2E9e210ca7185;
+    address constant ABYSS = 0x15f3385625D7e364C5a6216FBbceadf10fa90e7d;
 
     uint8 constant KIND_V3 = 2;
     uint8 constant KIND_V4 = 3;
