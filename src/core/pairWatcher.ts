@@ -78,7 +78,6 @@ export interface PairWatcherOptions {
 
 type TokenMeta = { symbol: string; decimals: number };
 
-
 const ERC20_META = ['function symbol() view returns (string)', 'function decimals() view returns (uint8)'];
 
 // Finds every pool for (tokenA, tokenB) across all venues, in parallel.

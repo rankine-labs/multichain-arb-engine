@@ -1,0 +1,7 @@
+{
+  // Builds only scripts/hooked-pool-keys.ts and what it imports. Used by
+  // `npm run hooked-keys` (read-only; see the script header).
+  "extends": "./tsconfig.json",
+  "include": ["scripts/hooked-pool-keys.ts"],
+  "compilerOptions": { "rootDir": ".", "outDir": ".scripts-build", "sourceMap": false, "declaration": false, "declarationMap": false }
+}

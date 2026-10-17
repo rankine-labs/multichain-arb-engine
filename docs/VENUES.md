@@ -88,3 +88,21 @@ Recommend closing #75 once this is approved, or keeping its Reisa entry, which t
 3. **Algebra (Alandale, KittenSwap):** `algebraSwapCallback` is now in the contract source (branch `algebra-support`, Oct 9) and both venues passed the fork test `contracts/test/ForkAlgebraVenues.t.sol` (WETH/USDG, both directions, CI run 37944712215), so they are PRACTICE-testable: the practice simulator runs the new contract code. The contract deployed on chain does NOT have this callback yet, so a real Algebra trade would need a redeploy (owner approval) on top of turning on real trading for these venues.
 4. **Fables:** predict the hook fee; V4 hook pools also need the hook address in the pool key the executor builds.
 5. **Metric, Tessera, BrownFi, Ekubo:** quote-call or custom adapters. Not worth it until the counters show money there.
+
+## Oct 16: pools the bot was missing (pair workbook check)
+
+Source: the Oct 16 pair workbook (387 GeckoTerminal pools) checked against the code, then a read-only probe of every pool on chain (`probe-exchanges` branches, `scripts/probe-exchanges.ts`). Everything below is price reading and practice checks only. Live trading refuses all of it.
+
+| What | Found | Change |
+|---|---|---|
+| Uniswap V4 pools with no hook at non-standard fee / tick spacing | 39 pools, ~$13M, ~$19M a day (SPY/USDG 0.05%/5 $980k, ETH/USDG 0.046%/9 $730k, MSTR/USDG 0.25%/25 $1.4M, cbBTC, CRCL, HIMS, amc...) | `config/v4Tiers.ts`: 27 settings recovered exactly from the pool ids, looked up by the pair watcher and the scan. Pools at those settings are **practice only** (`practiceOnlyReason`) |
+| GIGA CL pools at 0.005% and 0.2% | 3 pools (GIGA WETH/USDG 0.005%, ~$2M a day) | `V3_FEE_TIERS_ALL` adds 50 and 2000 |
+| GeckoTerminal "Pons V1" | 9 pools | Already read: they are plain Uniswap V3 pools (factory = Uniswap V3) |
+| GeckoTerminal "Abyss" | 2 pools (meme coins) | Factory `0xe7fef2bc860b25bbdeb6f6ab96d88baaa77ddad7`, the unnamed factory from the Oct 8 rival study. A Uniswap V3 copy (slot0, fee 1%, spacing 200, `uniswapV3SwapCallback`). New venue `abyss-cl`, practice only |
+| Hooked V4 pools | ~62 pools | **21 are Fables pools, which the bot already reads**, including the $23M WETH/USDG pool, SPY $1.8M, gld $2.0M, NVDA, SPCX, PONS. The other ~41 (SPCX, BABA, U and many meme coins) need their full key from the Initialize event. The free public node keeps no old state or logs, so run `npm run hooked-keys` on the server (paid node): it writes `data/robinhood-hooked-pools.json`, read at start by the new venue `v4-hooks` (only hooks whose address flags forbid changing swap amounts) |
+| Fuller Router V4 trade reader | built Oct 12, off | Now on by default (`FEED_DECODE_UR_V4=0` turns it off) |
+| PancakeSwap Infinity, Zia, Orvex V4, Ekubo, Bankr, Clanker, BrownFi | ~$11M, mostly meme coins | Not added. PancakeSwap Infinity has no contract at its usual address on this chain; Orvex and Latch run their own CL pool managers (Infinity forks); Ekubo is a singleton; BrownFi prices from an oracle. Little money on reputable pairs |
+
+"Could earn live" now also leaves out wins through an exchange live trading would refuse (new line "Exchange not live yet"), so practice-only venues never inflate it.
+
+Contract check: `contracts/test/ForkNewVenues.t.sol` trades the two biggest non-standard V4 pools (`KIND_V4`, which the deployed contract also has) and the Abyss pool on a fork, both directions.

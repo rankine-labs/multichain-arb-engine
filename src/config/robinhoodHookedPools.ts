@@ -18,9 +18,17 @@
 //   left out on purpose.
 //
 //   Every entry comes from the pool's own Initialize event on the Uniswap V4
-//   PoolManager (read-only probe scripts/probe-exchanges.ts, results in
-//   results/exchange-probe.json on the probe-exchanges branch), so the key
-//   (coins, fee, tick spacing, hook) is exactly what the chain stored.
+//   PoolManager, so the key (coins, fee, tick spacing, hook) is exactly what
+//   the chain stored. Where the list comes from:
+//     - the file data/robinhood-hooked-pools.json on the server, written by
+//       the read-only script scripts/hooked-pool-keys.ts (run it on the
+//       server: the free public node keeps no history, so it can't find
+//       these events; the paid node can). Read once at start.
+//     - entries typed in ROBINHOOD_HOOKED_POOLS below (none yet).
+//   Oct 16 finding: 21 of the workbook's ~62 hooked pools, including the
+//   $23M WETH/USDG pool, are Fables pools, which the bot ALREADY reads from
+//   the Fables registry. This list is for the other ~41 (SPCX, BABA, U and
+//   many meme coins).
 //
 //   Fees: the fee our maths uses is the pool's current LP fee from StateView
 //   (pairWatcher.hookedFee). For "dynamic fee" pools whose LP fee reads 0,
@@ -33,6 +41,8 @@
 //   contract deployed on chain does not have it. Real trades need a redeploy
 //   and owner approval.
 // ============================================================================
+
+import { readFileSync } from 'fs';
 
 // One hooked V4 pool given by its full key. currency0 is the zero address
 // for native-ETH pools (the bot uses WETH in its place).
@@ -57,9 +67,27 @@ export function hookKeepsSwapMaths(hook: string): boolean {
 // Filled from the probe (see header). Kept sorted by pair.
 export const ROBINHOOD_HOOKED_POOLS: HookedPoolEntry[] = [];
 
-// The keys for one venue, only hooks that keep normal swap maths (a guard in
-// case a bad entry is ever added by hand).
-export function listedKeysFor(venueId: string): V4ListedKey[] {
-  return ROBINHOOD_HOOKED_POOLS.filter((p) => p.venue === venueId && hookKeepsSwapMaths(p.hooks))
+export const HOOKED_POOLS_FILE = 'data/robinhood-hooked-pools.json';
+const MAX_FILE_POOLS = 500; // memory guard
+
+// Entries from the server file (see header). Bad entries are skipped; a
+// missing or broken file just means "none".
+export function loadHookedPoolFile(file = HOOKED_POOLS_FILE): HookedPoolEntry[] {
+  try {
+    const raw = JSON.parse(readFileSync(file, 'utf8'));
+    const list: any[] = Array.isArray(raw?.pools) ? raw.pools : [];
+    const hex = (x: unknown, n: number) => typeof x === 'string' && new RegExp(`^0x[0-9a-fA-F]{${n}}$`).test(x);
+    return list.slice(0, MAX_FILE_POOLS).filter((p) => hex(p?.id, 64) && hex(p?.currency0, 40) && hex(p?.currency1, 40) && hex(p?.hooks, 40)
+      && Number.isInteger(p?.fee) && Number.isInteger(p?.tickSpacing) && p.tickSpacing > 0)
+      .map((p) => ({ venue: 'v4-hooks', label: String(p.label ?? '').slice(0, 80), id: p.id.toLowerCase(), currency0: p.currency0.toLowerCase(),
+        currency1: p.currency1.toLowerCase(), fee: p.fee, tickSpacing: p.tickSpacing, hooks: p.hooks.toLowerCase() }));
+  } catch { return []; }
+}
+
+// The keys for one venue: typed entries plus the server file, only hooks
+// that keep normal swap maths (a guard against a bad entry), no duplicates.
+export function listedKeysFor(venueId: string, fromFile: HookedPoolEntry[] = loadHookedPoolFile()): V4ListedKey[] {
+  const seen = new Set<string>();
+  return [...ROBINHOOD_HOOKED_POOLS, ...fromFile].filter((p) => p.venue === venueId && hookKeepsSwapMaths(p.hooks) && !seen.has(p.id) && !!seen.add(p.id))
     .map(({ id, currency0, currency1, fee, tickSpacing, hooks }) => ({ id, currency0, currency1, fee, tickSpacing, hooks }));
 }

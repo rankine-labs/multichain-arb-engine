@@ -18,10 +18,7 @@ import {ForkBase} from "./Fork.t.sol";
 //        tick spacing simply travel inside the trade.
 //          - ETH/USDG 0.046%, tick spacing 9 (native ETH), ~$730k
 //          - WETH/USDG 0.02%, tick spacing 4, ~$260k
-//     2. Uniswap V4 pools WITH a hook (listed in src/config/
-//        robinhoodHookedPools.ts): the hooked-V4 trade type (KIND_V4_HOOKED),
-//        which only this branch's contract SOURCE has (fork-tested on Fables).
-//     3. Abyss (a Uniswap V3 copy, factory 0xe7fef2bc...): ABYSS/WETH 1% pool,
+//     2. Abyss (a Uniswap V3 copy, factory 0xe7fef2bc...): ABYSS/WETH 1% pool,
 //        WETH in and back out of the same pool (that proves the pool's swap
 //        and pay-me callback work with our contract in both directions).
 //   PASS = every swap ran. Pools are usually in balance, so the normal end is
@@ -49,7 +46,7 @@ contract RobinhoodForkTestNewVenues is ForkBase {
 
     uint8 constant KIND_V3 = 2;
     uint8 constant KIND_V4 = 3;
-    uint8 constant KIND_V4_HOOKED = 4;
+    uint8 constant KIND_V4_HOOKED = 4; // hooked pools are covered by ForkFablesVenues.t.sol
     uint256 constant WETH_SIZE = 0.01 ether;
 
     // One V4 pool to test: its key and whether it holds native ETH.
@@ -114,17 +111,6 @@ contract RobinhoodForkTestNewVenues is ForkBase {
         assertTrue(a && b, "non-standard V4 pool round trip failed");
     }
 
-    // 2) Hooked V4 pools from the listed set (KIND_V4_HOOKED, contract source only).
-    function test_fork_robinhood_listedHooks() public {
-        if (!_fork("ROBINHOOD_RPC_URL")) return;
-        _setUpV4();
-        V4Case[] memory cs = _hookedCases();
-        bool all = true;
-        for (uint256 i = 0; i < cs.length; i++) all = _bothWays(cs[i]) && all;
-        console.log(string.concat("NEWVENUE LISTED HOOKS -> ", all ? "PASS" : "FAIL", " (", vm.toString(cs.length), " pools)"));
-        assertTrue(all, "listed hooked pool round trip failed");
-    }
-
     // 3) Abyss (Uniswap V3 copy): WETH -> ABYSS -> WETH on the same pool.
     function test_fork_robinhood_abyss() public {
         if (!_fork("ROBINHOOD_RPC_URL")) return;
@@ -135,10 +121,5 @@ contract RobinhoodForkTestNewVenues is ForkBase {
         bool ok = _run("abyss ABYSS/WETH in and out", h);
         console.log(string.concat("NEWVENUE ABYSS -> ", ok ? "PASS" : "FAIL"));
         assertTrue(ok, "abyss round trip failed");
-    }
-
-    // WETH/USDG and ETH/USDG hooked pools to test (filled from the probe).
-    function _hookedCases() internal pure returns (V4Case[] memory cs) {
-        cs = new V4Case[](0);
     }
 }
