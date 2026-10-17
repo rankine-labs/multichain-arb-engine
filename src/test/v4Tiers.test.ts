@@ -44,11 +44,13 @@ assert(has(2400, 24) && lc(v4PoolId(m0, m1, 2400, 24)) === '0xc105b8300ff65d750a
 
 // 3) Practice-only rule.
 assert(isStandardV4Tier(500, 10) && !isStandardV4Tier(500, 5), 'standard check');
-assert(practiceOnlyReason({ v4: { fee: 500, tickSpacing: 10 } }) === null, 'standard hook-free pool: live-tradable');
-assert(/practice only/.test(practiceOnlyReason({ v4: { fee: 500, tickSpacing: 5 } }) ?? ''), 'non-standard hook-free pool: practice only');
-assert(/practice only/.test(practiceOnlyReason({ v4: { fee: 460, tickSpacing: 9, hooks: ZERO } }) ?? ''), 'zero hook address counts as hook-free');
-assert(practiceOnlyReason({ v4: { fee: 0x800000, tickSpacing: 9, hooks: '0x1111111111111111111111111111111111111111' } }) === null, 'hooked pools are gated by their venue, not by this rule');
-assert(practiceOnlyReason({}) === null, 'not a V4 pool: not affected');
+const OFF = { RH_V4_EXTRA_LIVE: '0' };
+assert(practiceOnlyReason({ v4: { fee: 500, tickSpacing: 5 } }, {}) === null, 'go-live (Oct 16): non-standard hook-free pool is live-tradable by default');
+assert(practiceOnlyReason({ v4: { fee: 500, tickSpacing: 10 } }, OFF) === null, 'standard hook-free pool: always live-tradable');
+assert(/practice only/.test(practiceOnlyReason({ v4: { fee: 500, tickSpacing: 5 } }, OFF) ?? ''), 'RH_V4_EXTRA_LIVE=0: non-standard hook-free pool is practice only');
+assert(/practice only/.test(practiceOnlyReason({ v4: { fee: 460, tickSpacing: 9, hooks: ZERO } }, OFF) ?? ''), 'zero hook address counts as hook-free');
+assert(practiceOnlyReason({ v4: { fee: 0x800000, tickSpacing: 9, hooks: '0x1111111111111111111111111111111111111111' } }, OFF) === null, 'hooked pools are gated by their venue, not by this rule');
+assert(practiceOnlyReason({}, OFF) === null, 'not a V4 pool: not affected');
 
 // 4) "Could earn live" leaves practice-only trades out, with their own reason.
 const cfg = { startCoins: new Set([lc(USDG)]), ownMaxUsd: 2_000 };

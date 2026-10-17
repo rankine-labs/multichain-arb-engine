@@ -4,9 +4,9 @@ import { scoreOpportunity, shouldPreArm } from '../core/opportunityScorer';
 import { OwnMoneyBook, useOwnMoney, OWN_MONEY_CUSHION, OWN_MONEY_MAX_AGE_MS } from '../core/ownMoney';
 
 // ============================================================================
-// Send minimum ($0.10, was $20) and own-money funding (Oct 11).
-//   1. The setting reads safely (bad values fall back to $0.10).
-//   2. $0.09 is refused, $0.10 and $0.11 pass -- the line sits exactly at the minimum.
+// Send minimum ($0.25 since Oct 16; $0.10 from Oct 11; was $20) and own-money funding.
+//   1. The setting reads safely (bad values fall back to $0.25).
+//   2. $0.24 is refused, $0.25 and $0.26 pass -- the line sits exactly at the minimum.
 //   3. The score no longer hides a ~$5 bar on Robinhood.
 //   4. Own money is used only when the trade fits under BOTH the $2,000 limit
 //      and what the contract really holds (live); otherwise the trade borrows.
@@ -19,34 +19,35 @@ function assert(cond: boolean, msg: string) {
 
 async function main() {
   // 1. Setting
-  assert(DEFAULT_MIN_EXEC_NET_USD === 0.10 && readMinExecNetUsd(undefined) === 0.10, 'default send minimum is $0.10');
+  assert(DEFAULT_MIN_EXEC_NET_USD === 0.25 && readMinExecNetUsd(undefined) === 0.25, 'default send minimum is $0.25 (go-live, Oct 16)');
   assert(readMinExecNetUsd('0.5') === 0.5 && readMinExecNetUsd('20') === 20, 'MIN_EXEC_NET_USD can raise it');
-  assert(readMinExecNetUsd('') === 0.10 && readMinExecNetUsd('abc') === 0.10 && readMinExecNetUsd('-1') === 0.10 && readMinExecNetUsd('0') === 0.10, 'empty, junk, negative or zero -> $0.10');
-  assert(MIN_NET_PROFIT_USD === 0.10, 'the bot uses $0.10 when the setting is not set (tests run without it)');
+  assert(readMinExecNetUsd('') === 0.25 && readMinExecNetUsd('abc') === 0.25 && readMinExecNetUsd('-1') === 0.25 && readMinExecNetUsd('0') === 0.25, 'empty, junk, negative or zero -> $0.25');
+  assert(readMinExecNetUsd('0.10') === 0.10, 'MIN_EXEC_NET_USD=0.10 in .env can still lower it');
+  assert(MIN_NET_PROFIT_USD === 0.25, 'the bot uses $0.25 when the setting is not set (tests run without it)');
 
   // 2. The line: net after gas, loan fee and safety haircut (all 0 here so net = gross).
   const net = (gross: number) => calculateAllInProfit({ optimalTradeSizeUsd: 100, grossProfitUsd: gross }, {
     gasPriceUsd: 0, dexFeeBps: { buy: 0, sell: 0 }, flashLoanFeeBps: 0, usingFlashLoan: false, safetyMarginPct: 0,
   });
-  assert(!net(0.09).qualifies, '$0.09 net: not sent');
-  assert(net(0.10).qualifies, '$0.10 net: sent (exactly on the line)');
-  assert(net(0.11).qualifies, '$0.11 net: sent');
+  assert(!net(0.24).qualifies, '$0.24 net: not sent');
+  assert(net(0.25).qualifies, '$0.25 net: sent (exactly on the line)');
+  assert(net(0.26).qualifies, '$0.26 net: sent');
   assert(net(5).qualifies && net(19.99).qualifies, '$5 and $19.99: sent (all refused under the old $20 rule)');
-  // Costs still come off first: $0.12 gross with 2.4 cents gas is under the line.
-  const withGas = calculateAllInProfit({ optimalTradeSizeUsd: 100, grossProfitUsd: 0.12 }, {
+  // Costs still come off first: $0.28 gross with 2.4 cents gas and the haircut is under the line.
+  const withGas = calculateAllInProfit({ optimalTradeSizeUsd: 100, grossProfitUsd: 0.28 }, {
     gasPriceUsd: 0.024, dexFeeBps: { buy: 30, sell: 30 }, flashLoanFeeBps: 0, usingFlashLoan: false, safetyMarginPct: 0.15,
   });
-  assert(!withGas.qualifies && withGas.conservativeNetProfitUsd < 0.10, 'gas and safety haircut are taken off before the $0.10 test');
-  // Loan fee counts: $0.20 gross on a $2,000 loan at 0.01% ($0.20 fee) is nothing.
-  const withLoan = calculateAllInProfit({ optimalTradeSizeUsd: 2_000, grossProfitUsd: 0.20 }, {
+  assert(!withGas.qualifies && withGas.conservativeNetProfitUsd < 0.25, 'gas and safety haircut are taken off before the $0.25 test');
+  // Loan fee counts: $0.40 gross on a $2,000 loan at 0.01% ($0.20 fee) leaves $0.20, under the line.
+  const withLoan = calculateAllInProfit({ optimalTradeSizeUsd: 2_000, grossProfitUsd: 0.40 }, {
     gasPriceUsd: 0, dexFeeBps: { buy: 0, sell: 0 }, flashLoanFeeBps: 1, usingFlashLoan: true, safetyMarginPct: 0,
   });
-  assert(!withLoan.qualifies, 'loan fee is taken off before the $0.10 test');
+  assert(!withLoan.qualifies, 'loan fee is taken off before the $0.25 test');
 
   // 3. Score: no hidden bar.
   const score = (n: number) => scoreOpportunity({ conservativeNetProfitUsd: n, stateType: 'SEQUENCED', chain: 'robinhood' });
-  assert(!shouldPreArm(score(0.09)), 'score: $0.09 blocked');
-  assert(shouldPreArm(score(0.10)) && shouldPreArm(score(3)), 'score: $0.10 and $3 pass (the old 40-point gate needed ~$5)');
+  assert(!shouldPreArm(score(0.24)), 'score: $0.24 blocked');
+  assert(shouldPreArm(score(0.25)) && shouldPreArm(score(3)), 'score: $0.25 and $3 pass (the old 40-point gate needed ~$5)');
   assert(shouldPreArm(scoreOpportunity({ conservativeNetProfitUsd: 0.5, stateType: 'SPECULATIVE', chain: 'monad' })), 'same rule on other chains');
 
   // 4a. Own money or loan.

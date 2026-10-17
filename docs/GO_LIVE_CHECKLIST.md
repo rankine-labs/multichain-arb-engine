@@ -150,7 +150,7 @@ cast call 0xContract "flashPools(address)(bool)" 0xPool1 --rpc-url $R  # = true
 MAX_TRADE_USD=250            # biggest trade (code default 20,000)
 OWN_MONEY_MAX_USD=250        # own-money trade size cap (code default 2,000)
 AUTO_VET_MAX_TRADE_USD=100   # cap on newly auto-vetted coins (default 300)
-MIN_EXEC_NET_USD=0.25        # only send if expected profit after costs >= $0.25 (default 0.10)
+MIN_EXEC_NET_USD=0.25        # only send if expected profit after costs >= $0.25 (code default 0.25 since Oct 16)
 DAILY_LOSS_CAP_USD=10        # stop sending for the day after $10 lost (default 25)
 MAX_SENDS_PER_MIN=3          # default 6
 ```

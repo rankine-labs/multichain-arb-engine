@@ -1948,7 +1948,7 @@ const fireTrade = async (o: {
                   netProfitUsd -= o.tradeSizeUsd * Math.max(0, actualPips - o.plannedLoanPips) / 1_000_000;
             }
             // The one send minimum, for every kind of trade (trigger and
-            // sitting gap): MIN_NET_PROFIT_USD ($0.10 default) after all costs.
+            // sitting gap): MIN_NET_PROFIT_USD ($0.25 default since Oct 16) after all costs.
             if (!(netProfitUsd >= MIN_NET_PROFIT_USD)) { block('expected profit under the send minimum'); return; }
             const dry = buildExecuteCall({
                   chain: o.chain, tokenIn: o.tokenIn, buyPool: o.buyPool, sellPool: o.sellPool,
