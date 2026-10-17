@@ -185,7 +185,10 @@ async function main() {
   const result: any = { latestBlock: latest, at: new Date().toISOString(), candidates: {}, pools20: [], pools32: [], hooks: {}, errors: [] };
 
   // ---- 3. Candidate contracts: code size + explorer name ------------------
-  for (const [addr, label] of Object.entries(CANDIDATES)) {
+  const ONLY_IDS = process.env.PROBE_ONLY === 'ids';
+  const save = () => { mkdirSync('results', { recursive: true }); writeFileSync('results/exchange-probe.json', JSON.stringify(result, null, 1)); };
+  const DEADLINE = t0 + Number(process.env.PROBE_MAX_MIN ?? 70) * 60_000;
+  for (const [addr, label] of Object.entries(ONLY_IDS ? { [UNI_V4_PM.toLowerCase()]: 'Uniswap V4 PoolManager', '0xd01c774d4a66408326bc65728ac5ae5aaf004032': 'Orvex CLPoolManager', '0x3d4afd3190b1e5036e410abb576f99c02d6fbb20': 'Latch CLPoolManager', '0x00000000000014aa86c5d3c41765bb24e11bd701': 'Ekubo core' } : CANDIDATES)) {
     try {
       const code: string = await rpc('eth_getCode', [addr, 'latest']);
       result.candidates[addr] = { label, codeBytes: (code.length - 2) / 2, explorer: code.length > 2 ? await explorerName(addr) : null };
@@ -194,7 +197,7 @@ async function main() {
   console.log('[probe] candidates done');
 
   // ---- 1. Normal pools -----------------------------------------------------
-  const p20 = pools.filter((p) => p.pool.length === 42);
+  const p20 = ONLY_IDS ? [] : pools.filter((p) => p.pool.length === 42);
   const sels = {
     factory: ethers.id('factory()').slice(0, 10), token0: ethers.id('token0()').slice(0, 10), token1: ethers.id('token1()').slice(0, 10),
     fee: ethers.id('fee()').slice(0, 10), tickSpacing: ethers.id('tickSpacing()').slice(0, 10), liquidity: ethers.id('liquidity()').slice(0, 10),
@@ -280,18 +283,30 @@ async function main() {
     const b = await rpc('eth_getBlockByNumber', [ethers.toQuantity(n), false]);
     const t = Number(b.timestamp); tsCache.set(n, t); return t;
   };
+  // Interpolation search on block times (block times are nearly regular, so
+  // this needs a handful of reads instead of ~16).
   const blockAt = async (unix: number): Promise<number> => {
-    let lo = 0, hi = latest;
-    while (hi - lo > 2_000) { const mid = Math.floor((lo + hi) / 2); if (await blockTime(mid) < unix) lo = mid; else hi = mid; }
-    return lo;
+    let lo = 1, hi = latest, tlo = await blockTime(lo), thi = await blockTime(hi);
+    for (let i = 0; i < 12 && hi - lo > 5_000; i++) {
+      if (unix <= tlo) return lo;
+      if (unix >= thi) return hi;
+      let mid = Math.round(lo + (hi - lo) * (unix - tlo) / Math.max(1, thi - tlo));
+      mid = Math.min(hi - 1, Math.max(lo + 1, mid));
+      const tm = await blockTime(mid);
+      if (tm < unix) { lo = mid; tlo = tm; } else { hi = mid; thi = tm; }
+    }
+    return Math.round((lo + hi) / 2);
   };
   const createdOf = new Map<string, number>();
   for (const p of p32) { const t = Date.parse(String(p.created).replace(' ', 'T') + (String(p.created).endsWith('Z') ? '' : 'Z')); if (Number.isFinite(t)) createdOf.set(p.pool.toLowerCase(), Math.floor(t / 1000)); }
+  let doneIds = 0;
   for (const id of ids) {
+    if (++doneIds % 10 === 0) { result.pools32 = p32.map((p) => ({ ...p, initialize: found.get(p.pool.toLowerCase()) ?? null })); result.partial = true; save(); console.log(`[probe] window search ${doneIds}/${ids.length}: ${found.size} found (${calls} requests)`); }
+    if (Date.now() > DEADLINE) { result.errors.push('deadline reached in window search'); break; }
     if (found.has(id) || !createdOf.has(id)) continue;
     try {
       const b = await blockAt(createdOf.get(id)!);
-      for (const win of [20_000, 200_000]) {
+      for (const win of [30_000, 300_000]) {
         const f = Math.max(0, b - win), t = Math.min(latest, b + win);
         try {
           const logs: any[] = await rpc('eth_getLogs', [{ address: managers, fromBlock: ethers.toQuantity(f), toBlock: ethers.toQuantity(t), topics: [[T_INIT_UNI, T_INIT_PCS], [id]] }]);
@@ -374,8 +389,8 @@ async function main() {
   result.fablesRegistrySize = fables.size;
   result.requests = calls;
   result.seconds = Math.round((Date.now() - t0) / 1000);
-  mkdirSync('results', { recursive: true });
-  writeFileSync('results/exchange-probe.json', JSON.stringify(result, null, 1));
+  result.partial = false;
+  save();
   console.log(`[probe] done in ${result.seconds}s, ${calls} requests, ${found.size}/${ids.length} ids found, ${hooks.length} hooks, ${result.errors.length} errors`);
 }
 

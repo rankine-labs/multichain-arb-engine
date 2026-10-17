@@ -8,7 +8,7 @@ name: Exchange probe (one-off)
 
 on:
   push:
-    branches: [probe-exchanges, probe-exchanges-2]
+    branches: [probe-exchanges, probe-exchanges-2, probe-exchanges-3]
     paths: ['scripts/probe-exchanges.ts', 'scripts/exchange-probe-pools.json', '.github/workflows/exchange-probe-run.yml']
 
 permissions:
@@ -26,6 +26,8 @@ jobs:
       - run: npm install --no-audit --no-fund
       - run: npx tsc -p tsconfig.scripts.json
       - name: Probe every workbook pool (read-only)
+        env:
+          PROBE_ONLY: ${{ github.ref_name == 'probe-exchanges-3' && 'ids' || '' }}
         run: node .scripts-build/scripts/probe-exchanges.js
       - name: Commit the result back to the branch
         if: always()
