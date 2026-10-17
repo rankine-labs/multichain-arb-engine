@@ -53,7 +53,7 @@ assert(near(s.today.excluded.overSize.usd, 7) && s.today.excluded.overSize.n ===
 assert(near(s.today.excluded.loan.usd, 2) && s.today.excluded.loan.n === 1, 'excluded: needed a loan $2 (1)');
 const [l1, l2] = r.lines();
 assert(l1 === 'live-realistic (USDG/WETH start, own money <= $2,000, no loan): today $8.00 from 2, 7 days $8.00', `line 1: ${l1}`);
-assert(l2 === 'left out today: started in another coin $10.00 (1), over own-money size $7.00 (1), needed a loan $2.00 (1)', `line 2: ${l2}`);
+assert(l2 === 'left out today: started in another coin $10.00 (1), exchange not live yet $0.00 (0), over own-money size $7.00 (1), needed a loan $2.00 (1)', `line 2: ${l2}`);
 assert(!/\u2014/.test(l1 + l2), 'no em dashes in report lines');
 
 r.save();

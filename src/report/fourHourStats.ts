@@ -38,7 +38,7 @@ import type { LoopHour } from '../core/loopTrader';
 // ============================================================================
 
 // How a checked win counts for "could earn live" (same words as core/realisticPnl.ts).
-export type LiveVerdict = 'ok' | 'otherCoin' | 'overSize' | 'loan';
+export type LiveVerdict = 'ok' | 'otherCoin' | 'venue' | 'overSize' | 'loan';
 
 export interface Bucket { n: number; usd: number }
 
@@ -61,7 +61,7 @@ export interface LoopSample {
 export interface HourMoney {
   checkedUsd: number; checkedCount: number;      // Checked wins
   couldEarnUsd: number; couldEarnCount: number;  // Could earn live
-  leftOut: Record<'otherCoin' | 'overSize' | 'loan', Bucket>; // left out of Could earn live
+  leftOut: Record<'otherCoin' | 'venue' | 'overSize' | 'loan', Bucket>; // left out of Could earn live
   best: { usd: number; label: string } | null;   // biggest checked win
   realUsd: number;                               // Real money made: true account change (won profit minus all gas)
   realWon: number;                               // real trades that landed and paid
@@ -103,7 +103,7 @@ export interface PeriodTotals {
   restarts: number;        // bot restarts seen during this period
   dropped: { fromMs: number; toMs: number; hours: number } | null; // an older period dropped (bot down over its report time)
   hours: number;           // hour samples added
-  wins: { n: number; usd: number; best: { usd: number; label: string } | null; liveOk: Bucket; leftOut: Record<'otherCoin' | 'overSize' | 'loan', Bucket> };
+  wins: { n: number; usd: number; best: { usd: number; label: string } | null; liveOk: Bucket; leftOut: Record<'otherCoin' | 'venue' | 'overSize' | 'loan', Bucket> };
   outliers: { n: number; biggestUsd: number };
   testsByKind: Record<string, { tests: number; wins: number }>;
   funnel: HourSample['funnel'];
@@ -134,7 +134,7 @@ interface PeriodState {
   // Set when an older period could not be reported (the bot was down over
   // its report time) and was dropped at startup: shown in the next report.
   dropped?: { fromMs: number; toMs: number; hours: number } | null;
-  wins: { n: number; usd: number; best: { usd: number; label: string } | null; liveOk: Bucket; leftOut: Record<'otherCoin' | 'overSize' | 'loan', Bucket> };
+  wins: { n: number; usd: number; best: { usd: number; label: string } | null; liveOk: Bucket; leftOut: Record<'otherCoin' | 'venue' | 'overSize' | 'loan', Bucket> };
   outliers: { n: number; biggestUsd: number };
   testsByKind: Record<string, { tests: number; wins: number }>;
   hours: HourSample[];
@@ -150,7 +150,7 @@ interface FileState {
 const zb = (): Bucket => ({ n: 0, usd: 0 });
 const emptyPeriod = (fromMs: number): PeriodState => ({
   fromMs, restarts: 0,
-  wins: { n: 0, usd: 0, best: null, liveOk: zb(), leftOut: { otherCoin: zb(), overSize: zb(), loan: zb() } },
+  wins: { n: 0, usd: 0, best: null, liveOk: zb(), leftOut: { otherCoin: zb(), venue: zb(), overSize: zb(), loan: zb() } },
   outliers: { n: 0, biggestUsd: 0 },
   testsByKind: {},
   hours: [],
@@ -422,7 +422,7 @@ export function totalsOf(p: PeriodState, toMs: number): PeriodTotals {
     if (!m) continue;
     wins.n += fin(m.checkedCount); wins.usd += fin(m.checkedUsd);
     wins.liveOk.n += fin(m.couldEarnCount); wins.liveOk.usd += fin(m.couldEarnUsd);
-    for (const k of ['otherCoin', 'overSize', 'loan'] as const) { wins.leftOut[k].n += fin(m.leftOut?.[k]?.n); wins.leftOut[k].usd += fin(m.leftOut?.[k]?.usd); }
+    for (const k of ['otherCoin', 'venue', 'overSize', 'loan'] as const) { wins.leftOut[k].n += fin(m.leftOut?.[k]?.n); wins.leftOut[k].usd += fin(m.leftOut?.[k]?.usd); }
     if (m.best && Number.isFinite(m.best.usd) && (!wins.best || m.best.usd > wins.best.usd)) wins.best = { usd: m.best.usd, label: String(m.best.label).slice(0, 60) };
   }
   const realMoney: PeriodTotals['money'] = { realUsd: 0, realWon: 0, gasUsd: 0, failed: 0, failedCostUsd: 0 };

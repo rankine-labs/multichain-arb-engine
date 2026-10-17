@@ -1,3 +1,4 @@
+import { V4_LOOKUP_TIERS } from '../config/v4Tiers';
 import { ethers } from 'ethers';
 import type { ScannedPool } from './universeScan';
 
@@ -14,15 +15,16 @@ import type { ScannedPool } from './universeScan';
 //     2. ASKS V4 whether that pair has a pool, the same way the pair watcher
 //        already does for the pairs it watches: a V4 pool's id is just a
 //        hash of (coin0, coin1, fee, tick spacing, hooks), so we compute the
-//        ids of the 4 standard fee tiers (+ the native-ETH versions when one
+//        ids of every setting in V4_TIERS (4 standard + non-standard ones seen on real pools; + the native-ETH versions when one
 //        coin is WETH) and ask StateView for their liquidity.
 //   A few thousand small reads per scan; nothing about V4 is stored.
 //   Hooked pools are never asked about (hooks = 0): the bot can't trade them.
 // ============================================================================
 
-// Same tiers as the pair watcher (core/poolResolver.ts STANDARD_V4_FEE_TIERS),
-// copied here so the scan doesn't load the pair watcher's heavy libraries.
-export const V4_TIERS: [number, number][] = [[500, 10], [3000, 60], [10000, 200], [100, 1]];
+// Same settings as the pair watcher (config/v4Tiers.ts V4_LOOKUP_TIERS: the
+// 4 standard ones plus the non-standard ones seen on real pools). That file
+// is tiny, so the scan still doesn't load the pair watcher's libraries.
+export const V4_TIERS: [number, number][] = V4_LOOKUP_TIERS.map(([f, t]) => [f, t]);
 
 export const SEL_V4_SLOT0 = ethers.id('getSlot0(bytes32)').slice(0, 10);
 export const SEL_V4_LIQ = ethers.id('getLiquidity(bytes32)').slice(0, 10);
@@ -44,14 +46,16 @@ export interface V4Ask {
 }
 
 // Every pool id worth asking about for these (quote, other) pairs.
-export function v4Asks(pairs: { quote: string; other: string }[], weth: string): V4Ask[] {
+// `tiers` defaults to every lookup setting; the scan passes the 4 standard
+// ones for its long tail of pairs (see universeScan.ts) to bound its work.
+export function v4Asks(pairs: { quote: string; other: string }[], weth: string, tiers: [number, number][] = V4_TIERS): V4Ask[] {
   const w = weth.toLowerCase();
   const out: V4Ask[] = [];
   for (const { quote, other } of pairs) {
     const q = quote.toLowerCase(), o = other.toLowerCase();
     const variants: { c0: string; c1: string; native: boolean }[] = [q < o ? { c0: q, c1: o, native: false } : { c0: o, c1: q, native: false }];
     if (q === w) variants.push({ c0: ZERO, c1: o, native: true }); // most V4 ETH pools hold native ETH
-    for (const v of variants) for (const [fee, ts] of V4_TIERS) out.push({ quote: q, other: o, id: v4Id(v.c0, v.c1, fee, ts), c0: v.c0, c1: v.c1, fee, tickSpacing: ts, native: v.native });
+    for (const v of variants) for (const [fee, ts] of tiers) out.push({ quote: q, other: o, id: v4Id(v.c0, v.c1, fee, ts), c0: v.c0, c1: v.c1, fee, tickSpacing: ts, native: v.native });
   }
   return out;
 }

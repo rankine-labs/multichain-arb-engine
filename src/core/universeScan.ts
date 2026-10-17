@@ -1,5 +1,6 @@
 import { ethers } from 'ethers';
-import { v4Asks, findV4Pools } from './v4Lookup';
+import { v4Asks, findV4Pools, V4_TIERS } from './v4Lookup';
+import { STANDARD_V4_TIERS } from '../config/v4Tiers';
 import { Steps, drainSteps, runSteps, yieldToLoop, Pacer } from './chunked';
 import { timed } from './stallFinder';
 
@@ -73,7 +74,7 @@ export interface ScanOptions {
   // start with sensible slices instead of one huge ask that gets split anyway.
   maxLogRange?: number;
   // Uniswap V4, asked per pair (core/v4Lookup.ts). Leave out to skip V4.
-  v4?: { stateView: string; poolManager: string; maxPairs?: number; pauseMs?: number };
+  v4?: { stateView: string; poolManager: string; maxPairs?: number; pauseMs?: number; extraTierPairs?: number };
   // Go over the full pool list in ~5 ms bites (core/chunked.ts) instead of
   // one long freeze. Same result either way. STALL_FIX_SCAN_EXPAND=0 = off.
   chunked?: boolean;
@@ -905,12 +906,27 @@ export async function scanUniverse(
         const other = lc(p.token0) === q ? lc(p.token1) : lc(p.token0);
         pairs.set(pairKey(p), { quote: q, other });
       };
-      for (const p of kept) addPair(p);
+      // Already-picked pairs first, then the deepest single-exchange pairs.
       for (const c of candidates) addPair({ token0: c.tokenA, token1: c.tokenB });
-      const found = await findV4Pools(callMany, v4Asks([...pairs.values()], opts.wrappedNative), {
-        stateView: opts.v4.stateView, poolManager: opts.v4.poolManager, weth: opts.wrappedNative,
-        quoteUsd: qUsd, quoteDecimals: qDec, minUsd: minPoolUsd,
-      });
+      for (const p of kept) addPair(p);
+      // Every pair gets the 4 standard V4 settings. The non-standard ones
+      // seen on real pools (config/v4Tiers.ts, ~30 more) go only to the first
+      // V4_EXTRA_TIER_PAIRS pairs (default 1,000: the picked pairs and the
+      // deepest others), and pairs are asked in batches, so memory and
+      // requests stay bounded (the V4 scan has run out of memory before).
+      const list = [...pairs.values()];
+      const extraN = opts.v4.extraTierPairs ?? 1_000;
+      const found: ScannedPool[] = [];
+      const BATCH = 300;
+      for (let i = 0; i < list.length; i += BATCH) {
+        const batch = list.slice(i, i + BATCH);
+        const asks = batch.flatMap((pr, j) => v4Asks([pr], opts.wrappedNative, i + j < extraN ? V4_TIERS : STANDARD_V4_TIERS));
+        found.push(...await findV4Pools(callMany, asks, {
+          stateView: opts.v4.stateView, poolManager: opts.v4.poolManager, weth: opts.wrappedNative,
+          quoteUsd: qUsd, quoteDecimals: qDec, minUsd: minPoolUsd,
+        }));
+        if (i + BATCH < list.length) await sleep(opts.v4.pauseMs ?? 500);
+      }
       if (found.length) ({ candidates } = paced ? await runSteps(rankCandidatesSteps([...multi, ...kept, ...found], minPoolUsd), 'pool scan pricing', sliceMs) : rankCandidates([...multi, ...kept, ...found], minPoolUsd));
       v4 = { singles: singles.length, withMoney: withMoney.length, pairsAsked: pairs.size, found: found.length,
         candidatesWithV4: candidates.filter((c) => c.pools.some((p) => p.kind === 'v4')).length };

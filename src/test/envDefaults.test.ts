@@ -19,6 +19,7 @@ const QN = 'https://x.robinhood.quiknode.pro/def/';
   assert(env.CHECK_RPC_MAIN === CS && env.CHECK_RPC_MAIN_DAILY === '120000', 'checks move to Chainstack with a 120000/day allowance');
   assert(env.CHECK_RPC_FALLBACK === QN && env.CHECK_RPC_FALLBACK_DAILY === '14000', 'QuickNode becomes the backup with 14000/day');
   assert(env.LOOP_TRADER === '0', 'loop trader off by default (Oct 14)');
+  assert(env.FEED_DECODE_UR_V4 === '1', 'fuller Router V4 reader on by default (Oct 16)');
   assert(notes.every((n) => !n.includes('http') && !n.includes('abc') && !n.includes('def')), 'notes never include the links or keys');
   assert(env.BLOCK_READER_WSS === undefined, 'no WSS link saved: WebSocket reader not switched on');
 }
@@ -72,7 +73,8 @@ const QN = 'https://x.robinhood.quiknode.pro/def/';
 
 // 7. Owner can still turn loops on.
 {
-  const env: Record<string, string | undefined> = { LOOP_TRADER: '1' };
+  const env: Record<string, string | undefined> = { LOOP_TRADER: '1', FEED_DECODE_UR_V4: '0' };
   applyEnvDefaults(env);
   assert(env.LOOP_TRADER === '1', 'LOOP_TRADER=1 in .env keeps loops on');
+  assert(env.FEED_DECODE_UR_V4 === '0', 'FEED_DECODE_UR_V4=0 in .env keeps the fuller V4 reader off');
 }

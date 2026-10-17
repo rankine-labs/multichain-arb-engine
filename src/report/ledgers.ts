@@ -67,9 +67,9 @@ export interface BestWin { usd: number; label: string }
 
 // The running counter for the current report period (memory only).
 // Why a checked win was left out of "Could earn live" (same words as core/realisticPnl.ts).
-export type LeftOutReason = 'otherCoin' | 'overSize' | 'loan';
+export type LeftOutReason = 'otherCoin' | 'venue' | 'overSize' | 'loan';
 export type LeftOut = Record<LeftOutReason, { n: number; usd: number }>;
-const emptyLeftOut = (): LeftOut => ({ otherCoin: { n: 0, usd: 0 }, overSize: { n: 0, usd: 0 }, loan: { n: 0, usd: 0 } });
+const emptyLeftOut = (): LeftOut => ({ otherCoin: { n: 0, usd: 0 }, venue: { n: 0, usd: 0 }, overSize: { n: 0, usd: 0 }, loan: { n: 0, usd: 0 } });
 
 interface PeriodCounter {
   startMs: number;

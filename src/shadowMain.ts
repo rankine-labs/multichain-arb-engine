@@ -102,12 +102,21 @@ import type { ExecutorHop } from './execution/executorCalldata';
 import { RivalWatch } from './core/rivalWatch';
 import { V3BalanceBook, V3_BALANCES_FILE } from './core/v3BalanceBook';
 import { extraWatcherVenues, extraScanFactories, isExecutableVenue, canPracticeTestVenue, reportedVenueIds, venueShortName } from './config/robinhoodVenues';
+import { practiceOnlyReason } from './config/v4Tiers';
 import { VenueTally } from './core/venueTally';
 // Practice-test a pool: exchanges we trade, plus extra venues that passed the
 // executor fork test (config/robinhoodVenues.ts canPracticeTestVenue). Fables
 // stays watch-only until its practiceTested run is recorded there. Real
 // trades still need isExecutableVenue (fireTrade refuses everything else).
 const canPracticeTest = (dex: string) => canPracticeTestVenue(dex);
+// Why live trading would refuse a trade through these two pools, or null if
+// it could take it: an exchange not cleared for trading, or a pool that is
+// practice only (Uniswap V4 at a non-standard setting, config/v4Tiers.ts).
+// Used by the live send (fireTrade) and by "could earn live" so the two agree.
+const liveBlocker = (buy: { dex?: string; v4?: any } | undefined, sell: { dex?: string; v4?: any } | undefined): string | null => {
+      if (!isExecutableVenue(buy?.dex ?? '') || !isExecutableVenue(sell?.dex ?? '')) return `exchange not cleared for trading (${buy?.dex} / ${sell?.dex})`;
+      return practiceOnlyReason(buy ?? {}) ?? practiceOnlyReason(sell ?? {});
+};
 // Practice tests and wins per new exchange, for the hourly report and the
 // status page (core/venueTally.ts). Fixed list of venue ids = bounded memory.
 const venueTally = new VenueTally(reportedVenueIds(), venueShortName);
@@ -877,7 +886,7 @@ const runSimulation = (
                         if (chain === 'robinhood' && net >= MIN_COUNTED_USD && vetted
                               && await outlierCountOk(`${pair} after trigger`, net, tradeSizeUsd, { tokenIn, hops: built.hops, amountIn: built.amountIn, profit: r.profit, v3Lender: lender?.poolAddress, ...(spot ? { blockTag: spot.block } : {}) })) {
                               countVerifiedWin(net, `${symbolOf(chain, tokenIn)} ${buyPool.dex}->${sellPool.dex}`,
-                                    { startToken: tokenIn, sizeUsd: tradeSizeUsd, lender: lender?.poolAddress }, [buyPool.tokenA, buyPool.tokenB]);
+                                    { startToken: tokenIn, sizeUsd: tradeSizeUsd, lender: lender?.poolAddress, notLive: liveBlocker(buyPool, sellPool) ?? undefined }, [buyPool.tokenA, buyPool.tokenB]);
                         }
                         if (chain === 'robinhood') { routeScores.record(routeKey, net); if (vetted) winSizes.add(net); profitBands.add(net, torontoDay()); }
                         // Race check for trigger wins: we'd send ~0.1 s after seeing the trigger,
@@ -1913,8 +1922,9 @@ const fireTrade = async (o: {
       try {
             // Hard stop: never build a trade on an exchange that isn't cleared
             // for trading (config/robinhoodVenues.ts executionEnabled: false).
-            if (!isExecutableVenue(o.buyPool?.dex ?? '') || !isExecutableVenue(o.sellPool?.dex ?? '')) {
-                  console.log(`[exec-dryrun] ${o.chain} NOT executable: exchange not cleared for trading (${o.buyPool?.dex} / ${o.sellPool?.dex})`);
+            const notLive = liveBlocker(o.buyPool, o.sellPool);
+            if (notLive) {
+                  console.log(`[exec-dryrun] ${o.chain} NOT executable: ${notLive}`);
                   return;
             }
             const block = (r: string) => { fireStats.blocked.set(r, (fireStats.blocked.get(r) ?? 0) + 1); };
@@ -2878,7 +2888,7 @@ await chainManager.startAll();
                         // Outliers (too good to be true, e.g. the $785 USDG/ORBIO gap) count
                         // only after a second check agrees (core/outlierGuard.ts).
                         if (gapVetted && gapNew >= MIN_COUNTED_USD && await outlierCountOk(`${label} gap`, simNet, g.sizeUsd, check.trade)) {
-                              countVerifiedWin(gapNew, `${label} gap`, { startToken: g.quote, sizeUsd: g.sizeUsd, lender: check.trade.v3Lender }, [g.base, g.quote]);
+                              countVerifiedWin(gapNew, `${label} gap`, { startToken: g.quote, sizeUsd: g.sizeUsd, lender: check.trade.v3Lender, notLive: liveBlocker(g.buyPool, g.sellPool) ?? undefined }, [g.base, g.quote]);
                         }
                         if (gapNew > 0) profitBands.add(gapNew, torontoDay());
                         if (gapNew < simNet) console.log(`[gap] ${label}: same open gap grew, counted only the extra $${gapNew.toFixed(2)} of $${simNet.toFixed(2)}`);
@@ -3174,7 +3184,7 @@ await chainManager.startAll();
                   // per factory, so a second attempt repeats nothing.
                   const scanOpts = { usdToken: ROBINHOOD_TOKENS.USDG, wrappedNative: ROBINHOOD_TOKENS.WETH, minPoolUsd: SCAN_MIN_USD,
                         maxLogRange: Number(process.env.ROBINHOOD_SCAN_LOG_RANGE ?? 500_000), log: (m: string) => console.log(m),
-                        v4: RH_V4_SCAN ? { stateView: ROBINHOOD_V4.STATE_VIEW, poolManager: ROBINHOOD_V4.POOL_MANAGER } : undefined,
+                        v4: RH_V4_SCAN ? { stateView: ROBINHOOD_V4.STATE_VIEW, poolManager: ROBINHOOD_V4.POOL_MANAGER, extraTierPairs: Number(process.env.V4_EXTRA_TIER_PAIRS ?? 1_000) } : undefined,
                         chunked: STALL_FIX_SCAN_EXPAND, paced: REBUILD_PACED };
                   // Gentle lane on the free node (see robinhoodScanProvider).
                   const res = await scanUniverse(robinhoodScanProvider, RH_EXTRA_VENUES ? [...ROBINHOOD_SCAN_FACTORIES, ...extraScanFactories()] : ROBINHOOD_SCAN_FACTORIES, scanOpts, scanState);

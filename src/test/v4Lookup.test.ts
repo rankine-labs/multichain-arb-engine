@@ -10,7 +10,8 @@
 //     option no V4 call is made at all.
 import { ethers } from 'ethers';
 import { v4Id, v4Asks, v4Virtual, findV4Pools, SEL_V4_LIQ, SEL_V4_SLOT0, V4_TIERS } from '../core/v4Lookup';
-import { v4PoolId, STANDARD_V4_FEE_TIERS } from '../core/poolResolver';
+import { v4PoolId } from '../core/poolResolver';
+import { V4_LOOKUP_TIERS, STANDARD_V4_TIERS } from '../config/v4Tiers';
 import { scanUniverse, emptyScanState, stateToPools, type ScanFactory } from '../core/universeScan';
 
 function assert(cond: boolean, msg: string) {
@@ -35,11 +36,14 @@ async function main() {
   // -------------------------------------------------------------------------
   const [c0, c1] = lc(USDG) < lc(HOOD) ? [USDG, HOOD] : [HOOD, USDG];
   assert(v4Id(c0, c1, 3000, 60) === lc(v4PoolId(c0, c1, 3000, 60)), 'pool id matches the pair watcher\'s own V4 id');
-  assert(JSON.stringify(V4_TIERS) === JSON.stringify(STANDARD_V4_FEE_TIERS), 'same fee tiers as the pair watcher');
+  assert(JSON.stringify(V4_TIERS) === JSON.stringify(V4_LOOKUP_TIERS), 'same fee settings as the pair watcher');
+  const N = V4_LOOKUP_TIERS.length;
   const usdgAsks = v4Asks([{ quote: USDG, other: HOOD }], WETH);
-  assert(usdgAsks.length === 4 && usdgAsks.every((a) => !a.native), 'USDG pair: the 4 standard tiers');
+  assert(N > 4 && usdgAsks.length === N && usdgAsks.every((a) => !a.native), `USDG pair: every lookup setting (${N})`);
   const wethAsks = v4Asks([{ quote: WETH, other: HOOD }], WETH);
-  assert(wethAsks.length === 8 && wethAsks.filter((a) => a.native && a.c0 === lc(ZERO)).length === 4, 'WETH pair: + 4 native-ETH versions');
+  assert(wethAsks.length === 2 * N && wethAsks.filter((a) => a.native && a.c0 === lc(ZERO)).length === N, 'WETH pair: + the native-ETH versions');
+  const stdAsks = v4Asks([{ quote: USDG, other: HOOD }], WETH, STANDARD_V4_TIERS);
+  assert(stdAsks.length === 4, 'standard-only asks (the scan\'s long tail): 4');
   const v = v4Virtual(2n * Q96, 1000n * E18);
   assert(v.a0 === 500n * E18 && v.a1 === 2000n * E18, 'virtual amounts at price 4');
 

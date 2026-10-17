@@ -7,7 +7,8 @@
         "typecheck": "tsc --noEmit -p .",
         "build": "rm -rf dist && tsc -p .",
         "test": "tsc -p . --outDir .test-build && node scripts/run-tests.js",
-        "follow-money": "tsc -p tsconfig.ftm.json && node .scripts-build/scripts/follow-the-money.js"
+        "follow-money": "tsc -p tsconfig.ftm.json && node .scripts-build/scripts/follow-the-money.js",
+        "hooked-keys": "tsc -p tsconfig.hooked.json && node .scripts-build/scripts/hooked-pool-keys.js"
     },
     "keywords": [],
     "author": "",

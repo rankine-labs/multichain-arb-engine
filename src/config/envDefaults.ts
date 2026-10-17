@@ -17,6 +17,7 @@
 //     CHECK_RPC_FALLBACK_DAILY <- 14000                      (QuickNode's daily allowance)
 //     LOOP_TRADER              <- 0                          (Oct 14: off by default, loop
 //                                                             scans were the main freeze cause)
+//     FEED_DECODE_UR_V4        <- 1                          (Oct 16: read more Uniswap V4 trades)
 //   Set LOOP_TRADER=1 in .env to turn loops back on (practice only).
 //
 //     BLOCK_READER_WSS         <- CHAINSTACK_WSS_ROBINHOOD   (owner upgraded to Growth Oct 13
@@ -65,6 +66,17 @@ export function applyEnvDefaults(env: Env): string[] {
   if (!has('LOOP_TRADER')) {
     env.LOOP_TRADER = '0';
     notes.push('loop trader OFF (set LOOP_TRADER=1 in .env to turn on)');
+  }
+  // Oct 16 (owner approved: "see every trade we need to see"): the fuller
+  // Router V4 reader (core/decoderV4Router.ts, built Oct 12, PR #110) is ON
+  // by default. It reads V4 trades the older reader skips ("buy exactly Y"
+  // trades, newer router formats, hooked pools we watch). Reading only: it
+  // never sends anything, and when it can't read a swap the older reader
+  // still gets its turn, so it never reads FEWER trades. FEED_DECODE_UR_V4=0
+  // in .env turns it off.
+  if (!has('FEED_DECODE_UR_V4')) {
+    env.FEED_DECODE_UR_V4 = '1';
+    notes.push('fuller Router V4 trade reader ON (set FEED_DECODE_UR_V4=0 in .env to turn off)');
   }
   return notes;
 }
