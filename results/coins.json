@@ -1,0 +1,176 @@
+{
+ "SPY": {
+  "address": "0x117cc2133c37b721f49de2a7a74833232b3b4c0c",
+  "beacon": "0xe10b6f6b275de231345c20d14ab812db62151b00",
+  "name": "SPDR S&P 500 ETF Trust • Robinhood Token",
+  "symbol": "SPY"
+ },
+ "NVDA": {
+  "address": "0xd0601ce157db5bdc3162bbac2a2c8af5320d9eec",
+  "beacon": "0xe10b6f6b275de231345c20d14ab812db62151b00",
+  "name": "NVIDIA • Robinhood Token",
+  "symbol": "NVDA"
+ },
+ "TSLA": {
+  "address": "0x322f0929c4625ed5bad873c95208d54e1c003b2d",
+  "beacon": "0xe10b6f6b275de231345c20d14ab812db62151b00",
+  "name": "Tesla • Robinhood Token",
+  "symbol": "TSLA"
+ },
+ "META": {
+  "address": "0xc0d6457c16cc70d6790dd43521c899c87ce02f35",
+  "beacon": "0xe10b6f6b275de231345c20d14ab812db62151b00",
+  "name": "Meta Platforms • Robinhood Token",
+  "symbol": "META"
+ },
+ "AAPL": {
+  "address": "0xaf3d76f1834a1d425780943c99ea8a608f8a93f9",
+  "beacon": "0xe10b6f6b275de231345c20d14ab812db62151b00",
+  "name": "Apple • Robinhood Token",
+  "symbol": "AAPL"
+ },
+ "GOOGL": {
+  "address": "0x2e0847e8910a9732eb3fb1bb4b70a580adad4fe3",
+  "beacon": "0xe10b6f6b275de231345c20d14ab812db62151b00",
+  "name": "Alphabet Class A • Robinhood Token",
+  "symbol": "GOOGL"
+ },
+ "gld": {
+  "address": "0xc9a981fee1f9dec688bb123ccdecc63d0debfc4e",
+  "beacon": "0xe10b6f6b275de231345c20d14ab812db62151b00",
+  "name": "SPDR Gold Trust • Robinhood Token",
+  "symbol": "GLD"
+ },
+ "SPCX": {
+  "address": "0x4a0e65a3eccec6dbe60ae065f2e7bb85fae35eea",
+  "beacon": "0xe10b6f6b275de231345c20d14ab812db62151b00",
+  "name": "Space Exploration Technologies Corp. Class A Common Stock • Robinhood Token",
+  "symbol": "SPCX"
+ },
+ "MSTR": {
+  "address": "0xec262a75e413fafd0df80480274532c79d42da09",
+  "beacon": "0xe10b6f6b275de231345c20d14ab812db62151b00",
+  "name": "Strategy Inc. • Robinhood Token",
+  "symbol": "MSTR"
+ },
+ "CRCL": {
+  "address": "0xdf0992e440dd0be65bd8439b609d6d4366bf1cb5",
+  "beacon": "0xe10b6f6b275de231345c20d14ab812db62151b00",
+  "name": "Circle Internet Group • Robinhood Token",
+  "symbol": "CRCL"
+ },
+ "amc": {
+  "address": "0x05a3d1cd21d0c88145e82600e62e7e496e0f222b",
+  "beacon": "0xe10b6f6b275de231345c20d14ab812db62151b00",
+  "name": "AMC Entertainment • Robinhood Token",
+  "symbol": "AMC"
+ },
+ "HIMS": {
+  "address": "0xccee82fe024c36fa15e1005ede3e9e4787e23d09",
+  "beacon": "0xe10b6f6b275de231345c20d14ab812db62151b00",
+  "name": "Hims & Hers Health • Robinhood Token",
+  "symbol": "HIMS"
+ },
+ "USO": {
+  "address": "0xa30fa36db767ad9ed3f7a60fc79526fb4d56d344",
+  "beacon": "0xe10b6f6b275de231345c20d14ab812db62151b00",
+  "name": "United States Oil Fund • Robinhood Token",
+  "symbol": "USO"
+ },
+ "PLTR": {
+  "address": "0x894e1ec2d74ffe5aef8dc8a9e84686accb964f2a",
+  "beacon": "0xe10b6f6b275de231345c20d14ab812db62151b00",
+  "name": "Palantir Technologies • Robinhood Token",
+  "symbol": "PLTR"
+ },
+ "cbBTC": {
+  "address": "0xcec185eb182c47d1ba1efc84e6959e18cd620be4",
+  "beacon": "0x0000000000000000000000000000000000000000",
+  "name": "Coinbase Wrapped BTC",
+  "symbol": "cbBTC"
+ },
+ "MU": {
+  "address": "0xff080c8ce2e5feadaca0da81314ae59d232d4afd",
+  "beacon": "0xe10b6f6b275de231345c20d14ab812db62151b00",
+  "name": "Micron Technology • Robinhood Token",
+  "symbol": "MU"
+ },
+ "INTC": {
+  "address": "0xc72b96e0e48ecd4dc75e1e45396e26300bc39681",
+  "beacon": "0xe10b6f6b275de231345c20d14ab812db62151b00",
+  "name": "Intel • Robinhood Token",
+  "symbol": "INTC"
+ },
+ "AMD": {
+  "address": "0x86923f96303d656e4aa86d9d42d1e57ad2023fdc",
+  "beacon": "0xe10b6f6b275de231345c20d14ab812db62151b00",
+  "name": "AMD • Robinhood Token",
+  "symbol": "AMD"
+ },
+ "GME": {
+  "address": "0x1b0e319c6a659f002271b69db8a7df2f911c153e",
+  "beacon": "0xe10b6f6b275de231345c20d14ab812db62151b00",
+  "name": "GameStop • Robinhood Token",
+  "symbol": "GME"
+ },
+ "NET": {
+  "address": "0xca9c78dd337a67f6e0077f65f5e9218719d30edf",
+  "beacon": "0x0000000000000000000000000000000000000000",
+  "name": "NetNet",
+  "symbol": "NET"
+ },
+ "LLY": {
+  "address": "0x8005d266423c7ea827372c9c864491e5786600ea",
+  "beacon": "0xe10b6f6b275de231345c20d14ab812db62151b00",
+  "name": "Eli Lilly • Robinhood Token",
+  "symbol": "LLY"
+ },
+ "MRNA": {
+  "address": "0x43b07d15ce533bec5476d70c22a78a1b2b662155",
+  "beacon": "0xe10b6f6b275de231345c20d14ab812db62151b00",
+  "name": "Moderna • Robinhood Token",
+  "symbol": "MRNA"
+ },
+ "RBLX": {
+  "address": "0xf0c4bf4c582cb3836e98394b1d4e7b7281101be8",
+  "beacon": "0xe10b6f6b275de231345c20d14ab812db62151b00",
+  "name": "Roblox • Robinhood Token",
+  "symbol": "RBLX"
+ },
+ "SGOV": {
+  "address": "0x92fd66527192e3e61d4ddd13322aa222de86f9b5",
+  "beacon": "0xe10b6f6b275de231345c20d14ab812db62151b00",
+  "name": "iShares 0-3 Month Treasury Bond • Robinhood Token",
+  "symbol": "SGOV"
+ },
+ "CASHCAT": {
+  "address": "0x020bfc650a365f8bb26819deaabf3e21291018b4",
+  "beacon": "0x0000000000000000000000000000000000000000",
+  "name": "Cash Cat",
+  "symbol": "CASHCAT"
+ },
+ "PONS": {
+  "address": "0x39dbed3a2bd333467115de45665cc57f813c4571",
+  "beacon": "0x0000000000000000000000000000000000000000",
+  "name": "Pons",
+  "symbol": "PONS"
+ },
+ "VIRTUAL": {
+  "address": "0xc6911796042b15d7fa4f6cde69e245ddcd3d9c31",
+  "beacon": "0x0000000000000000000000000000000000000000",
+  "name": "Virtuals Protocol",
+  "symbol": "VIRTUAL"
+ },
+ "U": {
+  "address": "0xce24439f2d9c6a2289f741120fe202248b666666",
+  "beacon": "0x0000000000000000000000000000000000000000",
+  "name": "United Stables",
+  "symbol": "U"
+ },
+ "USDG": {
+  "address": "0x5fc5360d0400a0fd4f2af552add042d716f1d168",
+  "beacon": "0x0000000000000000000000000000000000000000",
+  "name": "Global Dollar",
+  "symbol": "USDG"
+ }
+}
