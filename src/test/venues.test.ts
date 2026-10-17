@@ -26,7 +26,11 @@ async function main() {
   const COPIES = ['giga-cl', 'swaphood-v3', 'sushiswap-v3', 'up-cl', 'topaz-cl', 'raphael-cl'];
   // Plus the 2 Algebra exchanges whose fork test passed (ForkAlgebraVenues.t.sol).
   const ALGEBRA = ['alandale', 'kittenswap-algebra'];
-  const PRACTICE = [...COPIES, ...ALGEBRA, 'fables'];
+  // Plus (Oct 16) the venues allowed practice checks with a written reason
+  // (practiceOk): Abyss (a Uniswap V3 copy) and the listed hooked V4 pools.
+  const PRACTICE_OK = ['abyss-cl', 'v4-hooks'];
+  const PRACTICE = [...COPIES, ...ALGEBRA, 'fables', ...PRACTICE_OK];
+  assert(PRACTICE_OK.every((id) => (ROBINHOOD_VENUES.find((v) => v.id === id)?.practiceOk ?? '').length > 40), 'practiceOk venues explain why practice checks are safe');
   assert(COPIES.every(isPracticeTestableVenue), 'all 6 fork-tested copy exchanges are practice-testable');
   assert(ALGEBRA.every(isPracticeTestableVenue), 'both fork-tested Algebra exchanges (Alandale, KittenSwap) are practice-testable');
   assert(ROBINHOOD_VENUES.filter((v) => isPracticeTestableVenue(v.id)).map((v) => v.id).sort().join(',') === [...PRACTICE].sort().join(','), 'no other venue is practice-testable (oracle venues etc. stay out)');
@@ -100,6 +104,15 @@ async function main() {
   const fab = wPools.find((p) => p.dex === 'fables');
   assert(!!fab && fab.v4?.hooks === '0x' + '99'.repeat(20) && fab.v4.native && fab.feePips === 3000 && fab.poolAddress === id, 'Fables pool found in the registry (native ETH as WETH); listed fee 0 -> conservative 0.30% estimate');
   assert(!pools.some((p) => p.dex === 'fables'), 'Fables pool not matched to the wrong pair');
+  // Listed hooked pools (kind 'v4-keys', Oct 16): same pool read from a fixed
+  // key list instead of a registry, no registry call needed.
+  const listed: Venue[] = [{ dex: 'v4-hooks', kind: 'v4-keys', factory: SV, poolManager: PM, weth: W,
+    keys: [{ id, currency0: ethers.ZeroAddress, currency1: B, fee: 0x800000, tickSpacing: 60, hooks: '0x' + '99'.repeat(20) }] }];
+  const { pools: lPools } = await discoverPairPoolsMulticall(fake, 'robinhood', listed, W, B);
+  const lst = lPools.find((p) => p.dex === 'v4-hooks');
+  assert(!!lst && lst.v4?.hooks === '0x' + '99'.repeat(20) && lst.v4.native && lst.v4.tickSpacing === 60 && lst.poolAddress === id, 'listed hooked pool found from its key (native ETH as WETH)');
+  const { pools: lWrong } = await discoverPairPoolsMulticall(fake, 'robinhood', listed, A, B);
+  assert(!lWrong.some((p) => p.dex === 'v4-hooks'), 'listed hooked pool not matched to the wrong pair');
   // Refresh keeps dynamic fees current.
   const fake2 = async (calls: { target: string; data: string }[]) => calls.map((c) => {
     const s4 = c.data.slice(0, 10);
