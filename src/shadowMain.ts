@@ -1042,7 +1042,7 @@ const robinhoodWatcher = new PairWatcher('robinhood', robinhoodReadProvider, ROB
 // LIVE COIN RULE (core/liveCoins.ts, Oct 17): which coins a REAL trade may
 // touch (USDG, WETH, official Robinhood stock tokens, LIVE_EXTRA_COINS).
 liveCoins = new LiveCoinRule(robinhoodReadProvider, [ROBINHOOD_TOKENS.USDG, ROBINHOOD_TOKENS.WETH]);
-console.log(`[live-coins] rule ${liveCoins.on ? 'ON (no meme coins in real trades; LIVE_COIN_RULE=off to disable)' : 'OFF'}`);
+console.log(`[live-coins] rule ${liveCoins.on ? 'ON (no meme coins in real trades)' : 'OFF (meme coins allowed in real trades; LIVE_COIN_RULE=on to block them)'}`);
 setInterval(() => { const st = liveCoins?.stats(); if (st) console.log(`[live-coins] ${st.allowed} of ${st.checked} checked coins allowed for real trades`); }, 60 * 60_000);
 // TESTED VENUES LIVE (config/robinhoodVenues.ts, Oct 17): is the deployed
 // contract exactly the tested code? Read-only, logged every start. Only with
