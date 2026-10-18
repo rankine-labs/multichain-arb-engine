@@ -192,6 +192,25 @@ export function optimizeTradeSize(
   return best;
 }
 
+// Round-trip quote for a two-pool trade starting in `tokenIn`: buy on
+// buyPool, sell back on sellPool. Same maths as findOptimalTradeSize below
+// (used to re-price a trade at a smaller size, e.g. to fit the wallet).
+export function roundTripQuote(buyPool: PoolState, sellPool: PoolState, tokenIn: string, usdPerToken: number, tokenInDecimals: number): RoundTripQuote {
+  const scale = 10 ** tokenInDecimals;
+  const inIsA = buyPool.tokenA.toLowerCase() === tokenIn.toLowerCase();
+  const buyOutToken = (inIsA ? buyPool.tokenB : buyPool.tokenA).toLowerCase();
+  const sellInIsA = sellPool.tokenA.toLowerCase() === buyOutToken;
+  return (usdSize) => {
+    if (!(usdSize > 0) || !(usdPerToken > 0)) return null;
+    const amountIn = BigInt(Math.floor((usdSize / usdPerToken) * scale));
+    const mid = computeAmountOut(buyPool, inIsA, amountIn);
+    if (mid === null || mid <= 0n) return null;
+    const out = computeAmountOut(sellPool, sellInIsA, mid);
+    if (out === null || out <= 0n) return null;
+    return (Number(out) / scale) * usdPerToken - usdSize;
+  };
+}
+
 export function findOptimalTradeSize(
 buyPool: PoolState,
 sellPool: PoolState,

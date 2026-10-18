@@ -34,7 +34,7 @@ import { TransactionDecoder, DEFAULT_ROUTER_REGISTRY } from './core/decoder';
 import { urV4DecodeOn, takeUrV4Hour } from './core/decoderV4Router';
 import { FastFilter } from './core/fastFilter';
 import { PriceOracle } from './core/priceOracle';
-import { findOptimalTradeSize, calculateAllInProfit, buildOpportunity, calculateLiquidityCeiling } from './core/profitCalculator';
+import { findOptimalTradeSize, calculateAllInProfit, buildOpportunity, calculateLiquidityCeiling, roundTripQuote } from './core/profitCalculator';
 import { scoreOpportunity, shouldPreArm } from './core/opportunityScorer';
 import { planBackrun } from './core/backrunPlanner';
 import { seedKnownAddresses } from './config/knownAddresses';
@@ -91,7 +91,7 @@ const RH_V4_SCAN = process.env.RH_V4_SCAN !== '0';
 import { buildExecuteCall, executionRequested, executorConfig, pickV3Lender, kindForPool } from './execution/executorCalldata';
 import { GasModel, GasCalibration, gasSettingsFromEnv, routeKeyFor, twoPoolKey, defaultUnitsFor, costsLine, loopKey } from './core/gasModel';
 import { recordEventFee, eventFeeCounts, feeFromEventsOn, setHeadBlockSource, currentHeadBlock } from './core/eventFees';
-import { OwnMoneyBook, useOwnMoney } from './core/ownMoney';
+import { OwnMoneyBook, useOwnMoney, fitTradeToWallet } from './core/ownMoney';
 import { BlockReader, PoolUpdate } from './core/blockReader';
 import { AutoVet, CheckOutcome } from './core/autoVet';
 import { FailTally } from './core/failReasons';
@@ -1995,6 +1995,24 @@ const fireTrade = async (o: {
             if (o.chain === 'robinhood' && o.source === 'trade' && o.netProfitUsd < BENCH_BYPASS_USD && routeScores.isBenched(RouteScores.key(o.buyPool.poolAddress, o.sellPool.poolAddress))) {
                   block('pool pair benched (practice checks keep losing)');
                   return;
+            }
+            // FIT TO WALLET (core/ownMoney.ts fitTradeToWallet, Oct 18, owner approved).
+            // Live, own money, no loan pools approved: a best size bigger than the
+            // wallet is shrunk to what the wallet holds (2% cushion) and re-priced
+            // with the same pool maths. The send minimum below still decides.
+            // LIVE_FIT_TO_WALLET=0 = old behaviour (too-big trades are skipped).
+            if (o.chain === 'robinhood' && robinhoodSender.live && RH_OWN_MONEY && !approvedLenders('robinhood').size && process.env.LIVE_FIT_TO_WALLET !== '0') {
+                  const dec = TOKEN_DECIMALS.robinhood?.[o.tokenIn.toLowerCase()];
+                  if (dec !== undefined) {
+                        const cap = Math.min(OWN_MONEY_MAX_USD, MAX_TRADE_USD, ownMoney.availableUsd(o.tokenIn, o.usdPerTokenIn, dec));
+                        const fit = fitTradeToWallet({ sizeUsd: o.tradeSizeUsd, netUsd: o.netProfitUsd, capUsd: cap, quote: roundTripQuote(o.buyPool, o.sellPool, o.tokenIn, o.usdPerTokenIn, dec), gasUsd: rhGasUsd(0.05) });
+                        if (fit) {
+                              console.log(`[fit-wallet] ${symbolOf(o.chain, o.tokenIn)}/${symbolOf(o.chain, o.tokenOut)}: best size $${Math.round(o.tradeSizeUsd)} > wallet $${Math.round(cap)}, trading $${Math.round(fit.sizeUsd)} for ~$${fit.netUsd.toFixed(2)} (was ~$${o.netProfitUsd.toFixed(2)})`);
+                              // The practice check's number (outlier guard) drops by the same amount.
+                              const drop = o.netProfitUsd - fit.netUsd;
+                              o = { ...o, tradeSizeUsd: fit.sizeUsd, netProfitUsd: fit.netUsd, checkedProfitUsd: o.checkedProfitUsd === undefined ? undefined : o.checkedProfitUsd - drop };
+                        }
+                  }
             }
             // Auto-vetted coins: smaller trade limit (their rules could still change).
             if (o.chain === 'robinhood' && involvesAutoVetted([o.tokenIn, o.tokenOut]) && o.tradeSizeUsd > AUTO_VET_MAX_TRADE_USD) {
