@@ -59,6 +59,10 @@ export function restartReason(state: SavedState | null, exit: SavedExit | null, 
 export class AlertHooks {
   readonly v2: boolean;
   readonly center: AlertCenter;
+  // True when the live Telegram layout sends its own ✅ WON / ❌ MISSED message
+  // for every real trade (set in shadowMain): the older per-trade messages are
+  // then skipped so nothing is sent twice.
+  liveTradeMessages = false;
   watch: AlertWatch | null = null;
   private readonly send: Send;
   private readonly dir: string;
@@ -113,6 +117,8 @@ export class AlertHooks {
   // With REPORT_V2 the REVERTED one is replaced by onLiveResult's plain alert.
   liveTrackerNotify(html: string): void {
     this.guard(() => {
+      // Live layout (report/liveTelegram.ts) sends its own per-trade message.
+      if (this.liveTradeMessages && /<b>TRADE (WON|REVERTED|DROPPED)<\/b>/.test(html)) return;
       if (!this.v2) return this.sendOld(html);
       if (html.includes('<b>TRADE REVERTED</b>')) return;
       this.center.post(html, { critical: true, label: firstWords(html) });
@@ -122,7 +128,7 @@ export class AlertHooks {
   // Every live trade result. A revert = trade failed on-chain: critical, each one.
   onLiveResult(r: { status: string; label: string; gasUsd: number; hash: string }): void {
     this.guard(() => {
-      if (!this.v2 || r.status !== 'reverted') return;
+      if (!this.v2 || r.status !== 'reverted' || this.liveTradeMessages) return;
       this.center.event(`live-fail:${r.hash}`, {
         title: 'Live trade failed on-chain', severity: 'high', critical: true,
         meaning: `we paid $${r.gasUsd.toFixed(2)} gas but the trade did not go through (someone was faster or the price moved)`,

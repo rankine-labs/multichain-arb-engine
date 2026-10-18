@@ -101,7 +101,7 @@ msgs.forEach((m, k) => assert(balanced(m), `message ${k + 1}: every tag closed`)
 assert(msgs.every((m) => !m.includes('—')), 'no em dashes anywhere');
 assert(msgs.every((m) => !bareAmp(m)), 'no bare & anywhere (Telegram HTML)');
 assert(msgs[0].includes('Toronto\n\n<b>1 · MONEY</b>'), 'blank line between header and first section');
-assert(msgs[0].includes('Practice mode · 12:00 – 16:00 Toronto'), 'period line in Toronto time');
+assert(msgs[0].includes('🧪 PRACTICE mode · 12:00 – 16:00 Toronto'), 'period line in Toronto time');
 assert(!msgs[0].includes('Partial period'), 'full period: no partial note');
 assert(msgs[0].includes('1 · MONEY') && msgs[0].includes('2 · WHAT HAPPENED'), 'message 1: sections 1 and 2');
 assert(msgs[1].includes('3 · LOOP TRADES') && msgs[1].includes('4 · OTHER BOTS') && msgs[1].includes('5 · EXCHANGES'), 'message 2: sections 3 to 5');
