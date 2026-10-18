@@ -1045,15 +1045,30 @@ liveCoins = new LiveCoinRule(robinhoodReadProvider, [ROBINHOOD_TOKENS.USDG, ROBI
 console.log(`[live-coins] rule ${liveCoins.on ? 'ON (no meme coins in real trades; LIVE_COIN_RULE=off to disable)' : 'OFF'}`);
 setInterval(() => { const st = liveCoins?.stats(); if (st) console.log(`[live-coins] ${st.allowed} of ${st.checked} checked coins allowed for real trades`); }, 60 * 60_000);
 // TESTED VENUES LIVE (config/robinhoodVenues.ts, Oct 17): is the deployed
-// contract exactly the tested code? Read-only, logged every start. Only with
-// RH_TESTED_VENUES_LIVE=1 AND a match do the fork-tested exchanges (UP,
-// Sushi, GIGA, SwapHood, Topaz, Raphael, Alandale, KittenSwap, Fables)
-// become tradable for real.
+// contract exactly the tested code? Read-only, checked every start. With a
+// match, the fork-tested exchanges (UP, Sushi, GIGA, SwapHood, Topaz,
+// Raphael, Alandale, KittenSwap, Fables) become tradable for real.
+// Since Oct 18 (owner decision) this is ON by default: no server setting
+// needed. The contract match is still required (a different contract keeps
+// them off automatically). RH_TESTED_VENUES_LIVE=0 turns them off.
+// The result is also sent to Telegram once per start (live mode only), so
+// the owner can see it without reading the server log.
 void (async () => {
       const r = await checkDeployedContract(robinhoodReadProvider, executorConfig('robinhood').executorAddress);
-      const wanted = process.env.RH_TESTED_VENUES_LIVE === '1';
-      setTestedVenuesLive(wanted && r.match);
-      console.log(`[contract] ${r.reason}. Tested exchanges for real trades: ${wanted && r.match ? 'ON' : wanted ? 'OFF (contract does not match)' : 'OFF (RH_TESTED_VENUES_LIVE not 1)'}`);
+      const wanted = process.env.RH_TESTED_VENUES_LIVE !== '0';
+      const on = wanted && r.match;
+      setTestedVenuesLive(on);
+      const why = on ? 'ON' : wanted ? 'OFF (contract does not match)' : 'OFF (RH_TESTED_VENUES_LIVE=0)';
+      console.log(`[contract] ${r.reason}. Tested exchanges for real trades: ${why}`);
+      // Same live test as FastSender (the sender itself is created further down).
+      if (process.env.EXECUTION_ENABLED === 'true' && process.env.LIVE_SEND_CONFIRM === 'yes-real-money') {
+            const msg = on
+                  ? '🟢 LIVE · Extra exchanges ON\nYour contract matches the tested version, so UP, Sushi, GIGA, SwapHood, Topaz, Raphael, Alandale, KittenSwap and Fables can be traded.'
+                  : wanted
+                        ? `🟢 LIVE · Extra exchanges OFF\nYour contract is not the tested version (${r.reason.replace(/[<>&]/g, '')}). Trades use the main exchanges only. Nothing else to do unless you want them.`
+                        : '🟢 LIVE · Extra exchanges OFF (turned off with RH_TESTED_VENUES_LIVE=0)';
+            void sendTelegramMessage(msg).catch(() => undefined);
+      }
 })();
 // Restore the last watch list (saved every 10 min and at shutdown) so a
 // restart doesn't re-discover every pair in one burst.
