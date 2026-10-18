@@ -1,7 +1,7 @@
 import { ethers } from 'ethers';
 
 // ============================================================================
-// LIVE COIN RULE: no meme coins in real trades (Oct 17, owner approved)
+// LIVE COIN RULE: no meme coins in real trades (Oct 17; OFF by default since Oct 18)
 //
 // Plain English:
 //   The owner's live rule: we hold only USDG and WETH, and real trades may
@@ -32,8 +32,13 @@ import { ethers } from 'ethers';
 // U (United Stables), and the meme coins (CASHCAT, PONS, VIRTUAL, and the
 // "NET" in NET/USDG, which is a meme coin called NetNet, not Cloudflare).
 //
-// Settings: LIVE_COIN_RULE=off turns the rule off (any vetted coin, the old
-// behaviour). LIVE_EXTRA_COINS=0x...,0x... adds approved coins.
+// Settings: since Oct 18 the rule is OFF by default (owner decision: a meme
+// coin in the middle of a trade can only cost gas, because every trade must
+// end with more USDG/WETH than it started with or it is cancelled). Real
+// trades may then use any VETTED coin (the safety gate's coin checks, the
+// $300 limit for auto-vetted coins and the outlier guard all still apply).
+// LIVE_COIN_RULE=on turns the no-meme-coin rule back on.
+// LIVE_EXTRA_COINS=0x...,0x... adds approved coins (when the rule is on).
 // ============================================================================
 
 // EIP-1967 beacon slot, and the beacon behind official Robinhood stock
@@ -56,7 +61,8 @@ export class LiveCoinRule {
     base: string[],
     env: Record<string, string | undefined> = process.env,
   ) {
-    this.on = !['off', '0', 'false'].includes(String(env.LIVE_COIN_RULE ?? '').trim().toLowerCase());
+    // Off unless LIVE_COIN_RULE is on / 1 / true (owner decision Oct 18).
+    this.on = ['on', '1', 'true'].includes(String(env.LIVE_COIN_RULE ?? '').trim().toLowerCase());
     const extra = String(env.LIVE_EXTRA_COINS ?? '').split(',').map((x) => x.trim()).filter((x) => /^0x[0-9a-fA-F]{40}$/.test(x));
     this.always = new Set([...base, ...extra].map((x) => x.toLowerCase()));
   }

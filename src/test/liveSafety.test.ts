@@ -26,8 +26,10 @@ async function main() {
     getStorage: async (a: string) => (a === NVDA || a === FAKE ? word(a === NVDA ? ROBINHOOD_TOKEN_BEACON : '0x' + '99'.repeat(20)) : '0x' + '0'.repeat(64)),
     call: async (tx: { to: string }) => nameRet(tx.to === NVDA ? 'NVIDIA • Robinhood Token' : tx.to === FAKE ? 'NVIDIA • Robinhood Token' : 'CASHCAT'),
   };
-  const rule = new LiveCoinRule(fake, [USDG, WETH], { LIVE_EXTRA_COINS: CBBTC });
-  assert(rule.on, 'rule is on by default');
+  const dflt = new LiveCoinRule(fake, [USDG, WETH], {});
+  assert(!dflt.on && dflt.verdict(MEME) === 'allowed' && dflt.blocker([USDG, MEME]) === null, 'rule is OFF by default (owner Oct 18): meme coins allowed');
+  const rule = new LiveCoinRule(fake, [USDG, WETH], { LIVE_COIN_RULE: 'on', LIVE_EXTRA_COINS: CBBTC });
+  assert(rule.on, 'LIVE_COIN_RULE=on turns it on');
   assert(rule.verdict(USDG) === 'allowed' && rule.verdict(WETH) === 'allowed', 'USDG and WETH always allowed');
   assert(rule.verdict(CBBTC) === 'allowed', 'LIVE_EXTRA_COINS allowed');
   assert(rule.verdict(NVDA) === 'unknown' && rule.blocker([USDG, NVDA]) !== null, 'unchecked coin: not allowed yet (never delays a trade)');
