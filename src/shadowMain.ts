@@ -1061,6 +1061,9 @@ void (async () => {
       setTestedVenuesLive(on);
       const why = on ? 'ON' : wanted ? 'OFF (contract does not match)' : 'OFF (RH_TESTED_VENUES_LIVE=0)';
       console.log(`[contract] ${r.reason}. Tested exchanges for real trades: ${why}`);
+      // Also saved for the GitHub status page (deploy/status-report.js), so the
+      // owner can see the result without reading the server log.
+      try { mkdirSync('data', { recursive: true }); writeFileSync('data/contract-check.txt', `${r.reason}. Tested exchanges for real trades: ${why}`); } catch { /* reporting only */ }
       // Same live test as FastSender (the sender itself is created further down).
       if (process.env.EXECUTION_ENABLED === 'true' && process.env.LIVE_SEND_CONFIRM === 'yes-real-money') {
             const msg = on

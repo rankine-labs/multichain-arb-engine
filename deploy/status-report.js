@@ -232,6 +232,9 @@ function loopTradeLines(lines) {
 }
 
 // Deploy lock: auto-deploy.sh writes "<sha> <title>" here while live instead of deploying.
+// Contract check written by the bot at start (shadowMain: is the deployed
+// contract the tested code, and are the tested exchanges on for real trades?).
+const contractCheck = () => { try { return fs.readFileSync(path.join(APP_DIR, 'data', 'contract-check.txt'), 'utf8').trim().slice(0, 260); } catch { return ''; } };
 const pendingDeploy = () => { try { return fs.readFileSync(path.join(APP_DIR, 'data', 'deploy-pending.txt'), 'utf8').trim().slice(0, 160); } catch { return ''; } };
 
 async function main() {
@@ -426,6 +429,7 @@ async function main() {
     ...(readerLine ? [`- Every-block reader: ${readerLine.replace(/^\[blockreader\] /, '').slice(0, 220)}`] : []),
     ...(thinLine ? [`- Thin pools skipped: ${thinLine.replace(/^\[thinpools\] /, '').slice(0, 320)}`] : []),
     ...(limitsLine ? [`- Limits in use:${limitsLine.replace(/^\[limits\] /, '').slice(0, 260)}`] : []),
+    ...(contractCheck() ? [`- Contract check: ${contractCheck()}`] : []),
     ...(openLine ? [`- Market-open watch: ${openLine.replace(/^\[openwatch\] /, '').slice(0, 220)}`] : []),
     `- New pool counter: ${newPoolsLine ? newPoolsLine.replace(/^\[newpools\] /, '') : 'no hourly line yet'} · this window: ${newPoolsWaiting} new pool(s) for deep coins, ${newPoolsFirstMoney.length} measured, ${newPoolsFails} failed poll(s)`,
     ...newPoolsFirstMoney.slice(-3).map((l) => `  - ${l.replace(/^\[newpools\] /, '').slice(0, 200)}`),
