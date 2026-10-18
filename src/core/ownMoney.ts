@@ -88,3 +88,49 @@ export function useOwnMoney(o: {
 }): boolean {
   return o.ownMoneyOn && !o.noBalanceSlot && o.tradeSizeUsd <= Math.min(o.ownMaxUsd, o.ownAvailableUsd);
 }
+
+// ============================================================================
+// FIT A TRADE TO THE WALLET (Oct 18, owner approved: "trade whatever is in
+// the wallet if the best trade is higher")
+//
+// Plain English:
+//   The bot picks the best size for a trade. With real money and no loans,
+//   a best size BIGGER than what the contract holds used to be skipped
+//   (it needed a loan we don't take). Now it is shrunk to what the wallet
+//   holds and the profit is worked out again at that size, with the same
+//   pool maths the bot used to pick the size. It is only sent if the new,
+//   smaller profit still clears the send minimum (checked by the caller,
+//   exactly as for any other trade).
+//
+//   Costs: gas is the same for any size, so it is taken off in full. The
+//   rest of what the original estimate knocked off the pool maths (safety
+//   margin, and anything the practice check found on top) grows with the
+//   trade, so the same SHARE is knocked off the smaller trade:
+//     new profit = new gross x (old profit + gas) / old gross  - gas
+//   Example: full size $1,000 grosses $10, estimate says $7.98 after $0.02
+//   gas, so 80% of the gross is kept. At $200 the pools gross $2.10:
+//   $2.10 x 80% - $0.02 = $1.66.
+//
+//   Returns null when nothing should change (trade fits, wallet empty, or the
+//   pools can't price the smaller size); the caller then carries on exactly
+//   as before (and an empty wallet is still refused by the usual checks).
+// ============================================================================
+export interface FitResult { sizeUsd: number; netUsd: number; grossUsd: number }
+
+export function fitTradeToWallet(o: {
+  sizeUsd: number;                         // size the pools picked
+  netUsd: number;                          // expected profit after all costs at that size
+  capUsd: number;                          // what the wallet can spend (OwnMoneyBook.availableUsd, capped)
+  quote: (usdSize: number) => number | null; // gross profit (before gas) at a size, same maths as sizing
+  gasUsd: number;                          // gas for one trade (same at any size)
+}): FitResult | null {
+  if (!(o.capUsd > 0) || !(o.sizeUsd > o.capUsd) || !Number.isFinite(o.netUsd)) return null;
+  const gas = Number.isFinite(o.gasUsd) && o.gasUsd > 0 ? o.gasUsd : 0;
+  const grossFull = o.quote(o.sizeUsd);
+  const grossFit = o.quote(o.capUsd);
+  if (grossFull === null || grossFit === null || !Number.isFinite(grossFull) || !Number.isFinite(grossFit) || !(grossFull > 0)) return null;
+  // Share of the pool maths' gross the original estimate kept before gas (0..1:
+  // never more than the maths says, never below nothing).
+  const keep = Math.min(1, Math.max(0, (o.netUsd + gas) / grossFull));
+  return { sizeUsd: o.capUsd, netUsd: Math.max(0, grossFit) * keep - gas, grossUsd: grossFit };
+}
