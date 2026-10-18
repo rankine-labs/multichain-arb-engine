@@ -4051,7 +4051,13 @@ for (let i = 0; i < resolved.length; i++) {
                                     wallet: LIVE_WALLET_COINS.map((c) => ({ coin: c.coin, now: walletWatch.now(c.coin), start: liveBook.startOf(c.coin), digits: c.digits })),
                                     gas: { ...liveGas },
                                     loss: { usedUsd: safetyGate.lossTodayUsd(), capUsd: safetyConfigFromEnv().dailyLossCapUsd },
-                                    maxTradeUsd: MAX_TRADE_USD,
+                                    // What the wallet can really trade per coin (same cap as fit-to-wallet).
+                                    biggestTrade: LIVE_WALLET_COINS.map((c) => {
+                                          const dec = TOKEN_DECIMALS.robinhood?.[c.address.toLowerCase()];
+                                          const px = priceOracle.getUsdPrice('robinhood', c.address);
+                                          if (dec === undefined || !px || ownMoney.lastReadAgeMs() === null) return { coin: c.coin, usd: null };
+                                          return { coin: c.coin, usd: Math.min(OWN_MONEY_MAX_USD, MAX_TRADE_USD, ownMoney.availableUsd(c.address, px, dec)) };
+                                    }),
                                     bot: { ok: verdict.mark === '✅' && v2Input.feedOk !== false, text: verdict.text },
                               }));
                         } else if (sendHourly) await sendTelegramMessage(hourlyMessage(REPORT_V2, v2Input, hourInput));

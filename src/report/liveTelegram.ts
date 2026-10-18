@@ -130,7 +130,9 @@ export interface LiveHourlyIn {
   wallet: WalletRow[];
   gas: { eth: number | null; tradesLeft: number | null };
   loss: { usedUsd: number; capUsd: number };
-  maxTradeUsd: number;
+  // Biggest trade the bot can make right now, per start coin: what the wallet
+  // holds (less the 2% cushion), capped by the own-money / trade limits. null = not read yet.
+  biggestTrade: { coin: string; usd: number | null }[];
   bot: { ok: boolean; text: string };
 }
 
@@ -158,7 +160,7 @@ export function formatLiveHourly(h: LiveHourlyIn): string {
   out.push('🛡️ <b>SAFETY</b>');
   out.push(pre([
     padR('Loss limit today', 19) + `${usd(h.loss.usedUsd)} used of ${usd(h.loss.capUsd)}`,
-    padR('Biggest trade', 19) + usd(h.maxTradeUsd),
+    padR('Biggest trade', 19) + (h.biggestTrade.length ? h.biggestTrade.map((b) => `${b.coin} ${b.usd === null ? 'n/a' : usd(b.usd)}`).join(' · ') : 'n/a') + ' (your wallet)',
     padR('Bot', 19) + (h.bot.ok ? '✅ running, connected' : `⚠️ ${h.bot.text}`),
   ]));
   return out.join('\n');
