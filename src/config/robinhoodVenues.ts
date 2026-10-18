@@ -107,7 +107,7 @@ export const ROBINHOOD_VENUES: readonly RobinhoodVenue[] = [
     id: 'giga-cl', name: 'GIGA DEX CL', priority: 'P0', model: 'pancake-v3',
     contracts: [{ role: 'factory', address: '0xEce6eCd61177336ea6Fb9b17937AC439D85EE20B' }],
     priceable: true, executionEnabled: false,
-    executionBlocker: 'PancakeSwap V3 callback; our executor traded its WETH/USDG pool both ways on a fork (practiceTested). Not yet approved for real trades.',
+    executionBlocker: 'PancakeSwap V3 callback; our executor traded its WETH/USDG pool both ways on a fork (practiceTested). Approved for real trades Oct 18 (owner: meme coins allowed), with the contract match check.',
     source: ['https://docs.gigadex.fi/security/contracts', 'DefiLlama dimension-adapters dexs/giga-dex/index.ts'],
     practiceTested: COPY_FORK_RUN,
   },
@@ -255,9 +255,13 @@ export function priceableVenues(): RobinhoodVenue[] {
 //      byte-for-byte the tested contract code (execution/contractMatch.ts).
 // shadowMain calls setTestedVenuesLive() after that check. Until then (and
 // whenever the contract does not match) every venue in this file stays refused. Venues in
-// LIVE_NEVER are never enabled this way (owner's no-meme-coin rule).
+// LIVE_NEVER are never enabled this way (empty since Oct 18).
 let testedVenuesLive = false;
-export const LIVE_NEVER = new Set(['abyss-cl']); // only meme-coin pools
+// Abyss (only meme-coin pools) was here until Oct 18; the owner allowed meme
+// coins in real trades (a failed trade only costs gas), so it is now treated
+// like every other fork-tested exchange. Kept as a list in case one is ever
+// needed again.
+export const LIVE_NEVER = new Set<string>([]);
 export function setTestedVenuesLive(on: boolean): void { testedVenuesLive = on; }
 export function testedVenuesAreLive(): boolean { return testedVenuesLive; }
 

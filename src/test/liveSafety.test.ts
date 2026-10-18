@@ -3,7 +3,7 @@
 //     Robinhood stock tokens (name AND beacon) and LIVE_EXTRA_COINS;
 //   - the tested-venues gate (config/robinhoodVenues.ts): fork-tested
 //     exchanges become live only when switched on after a contract match,
-//     never Abyss (meme coins), never untested venues;
+//     Abyss included since Oct 18 (owner allowed meme coins), never untested venues;
 //   - the contract match (execution/contractMatch.ts): same code by hash.
 import { LiveCoinRule, ROBINHOOD_TOKEN_BEACON } from '../core/liveCoins';
 import { isExecutableIn, ROBINHOOD_VENUES, setTestedVenuesLive, isExecutableVenue } from '../config/robinhoodVenues';
@@ -44,12 +44,12 @@ async function main() {
   // ---- tested venues gate --------------------------------------------------
   assert(ROBINHOOD_VENUES.every((v) => !isExecutableIn(ROBINHOOD_VENUES, v.id, false)), 'switched off: every extra venue refused (as before)');
   const liveWhenOn = ROBINHOOD_VENUES.filter((v) => isExecutableIn(ROBINHOOD_VENUES, v.id, true)).map((v) => v.id).sort();
-  assert(liveWhenOn.join(',') === ['alandale', 'fables', 'giga-cl', 'kittenswap-algebra', 'raphael-cl', 'sushiswap-v3', 'swaphood-v3', 'topaz-cl', 'up-cl'].join(','),
-    `switched on: exactly the fork-tested venues, no Abyss, nothing untested (${liveWhenOn.join(',')})`);
+  assert(liveWhenOn.join(',') === ['abyss-cl', 'alandale', 'fables', 'giga-cl', 'kittenswap-algebra', 'raphael-cl', 'sushiswap-v3', 'swaphood-v3', 'topaz-cl', 'up-cl'].join(','),
+    `switched on: exactly the fork-tested venues incl. Abyss (Oct 18), nothing untested (${liveWhenOn.join(',')})`);
   assert(isExecutableIn(ROBINHOOD_VENUES, 'uniswap-v3', false) && isExecutableIn(ROBINHOOD_VENUES, 'uniswap-v3', true), 'core exchanges always pass');
   assert(!isExecutableVenue('up-cl'), 'default (process state): UP refused');
   setTestedVenuesLive(true);
-  assert(isExecutableVenue('up-cl') && !isExecutableVenue('abyss-cl') && !isExecutableVenue('metric'), 'after the contract check: UP live, Abyss and untested venues still refused');
+  assert(isExecutableVenue('up-cl') && isExecutableVenue('abyss-cl') && !isExecutableVenue('metric'), 'after the contract check: UP and Abyss live, untested venues still refused');
   setTestedVenuesLive(false);
 
   // ---- contract match ------------------------------------------------------

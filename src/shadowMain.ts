@@ -1047,7 +1047,8 @@ setInterval(() => { const st = liveCoins?.stats(); if (st) console.log(`[live-co
 // TESTED VENUES LIVE (config/robinhoodVenues.ts, Oct 17): is the deployed
 // contract exactly the tested code? Read-only, checked every start. With a
 // match, the fork-tested exchanges (UP, Sushi, GIGA, SwapHood, Topaz,
-// Raphael, Alandale, KittenSwap, Fables) become tradable for real.
+// Raphael, Alandale, KittenSwap, Fables, and Abyss since Oct 18) become
+// tradable for real.
 // Since Oct 18 (owner decision) this is ON by default: no server setting
 // needed. The contract match is still required (a different contract keeps
 // them off automatically). RH_TESTED_VENUES_LIVE=0 turns them off.
@@ -1063,7 +1064,7 @@ void (async () => {
       // Same live test as FastSender (the sender itself is created further down).
       if (process.env.EXECUTION_ENABLED === 'true' && process.env.LIVE_SEND_CONFIRM === 'yes-real-money') {
             const msg = on
-                  ? '🟢 LIVE · Extra exchanges ON\nYour contract matches the tested version, so UP, Sushi, GIGA, SwapHood, Topaz, Raphael, Alandale, KittenSwap and Fables can be traded.'
+                  ? '🟢 LIVE · Extra exchanges ON\nYour contract matches the tested version, so UP, Sushi, GIGA, SwapHood, Topaz, Raphael, Alandale, KittenSwap, Fables and Abyss can be traded.'
                   : wanted
                         ? `🟢 LIVE · Extra exchanges OFF\nYour contract is not the tested version (${r.reason.replace(/[<>&]/g, '')}). Trades use the main exchanges only. Nothing else to do unless you want them.`
                         : '🟢 LIVE · Extra exchanges OFF (turned off with RH_TESTED_VENUES_LIVE=0)';
