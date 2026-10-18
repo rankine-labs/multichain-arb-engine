@@ -249,11 +249,12 @@ export function priceableVenues(): RobinhoodVenue[] {
 // TESTED VENUES LIVE (Oct 17, owner approved): the fork-tested venues
 // (practiceTested set: the copy exchanges, Algebra, Fables, Abyss) may be
 // traded for real ONLY when BOTH are true:
-//   1. the owner turned it on: RH_TESTED_VENUES_LIVE=1 in .env, and
+//   1. it is switched on: ON by default since Oct 18 (owner decision);
+//      RH_TESTED_VENUES_LIVE=0 in .env turns it off, and
 //   2. the bot checked at start that the contract deployed on chain is
 //      byte-for-byte the tested contract code (execution/contractMatch.ts).
 // shadowMain calls setTestedVenuesLive() after that check. Until then (and
-// by default) every venue in this file stays refused, as before. Venues in
+// whenever the contract does not match) every venue in this file stays refused. Venues in
 // LIVE_NEVER are never enabled this way (owner's no-meme-coin rule).
 let testedVenuesLive = false;
 export const LIVE_NEVER = new Set(['abyss-cl']); // only meme-coin pools
