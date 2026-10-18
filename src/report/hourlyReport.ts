@@ -6,7 +6,7 @@
 //   approved:
 //
 //     🤖 ROBINHOOD · HOURLY
-//     Practice mode (no real money yet)         (or "LIVE (real money)")
+//     🧪 PRACTICE (no real money yet)           (or "🟢 LIVE (real money)")
 //     14:00 – 15:00 Toronto · full hour         (or "partial: ...")
 //
 //     💰 MONEY       Last hour / Today / 7 days for three lines
@@ -150,7 +150,7 @@ export function formatHourlyV2(r: HourlyReportInput): string {
   const out: string[] = [];
 
   out.push('🤖 <b>ROBINHOOD · HOURLY</b>');
-  out.push(r.live ? '<b>LIVE (real money)</b>' : 'Practice mode (no real money yet)');
+  out.push(r.live ? '🟢 <b>LIVE (real money)</b>' : '🧪 PRACTICE (no real money yet)');
   out.push(esc(periodLine(m.periodStartMs, m.periodEndMs, r.tz, tzLabel, r.restarted)));
   out.push('');
 

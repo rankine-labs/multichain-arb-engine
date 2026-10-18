@@ -142,7 +142,7 @@ const input = (over: Partial<HourlyReportInput> = {}): HourlyReportInput => ({
 {
   const msg = formatHourlyV2(input());
   console.log('----- practice sample -----\n' + msg + '\n---------------------------');
-  assert(msg.startsWith('🤖 <b>ROBINHOOD · HOURLY</b>\nPractice mode (no real money yet)\n14:00 – 15:00 Toronto · full hour'), 'header, mode and full-hour period line');
+  assert(msg.startsWith('🤖 <b>ROBINHOOD · HOURLY</b>\n🧪 PRACTICE (no real money yet)\n14:00 – 15:00 Toronto · full hour'), 'header, mode and full-hour period line');
   assert(/Checked wins\s+\$6\.28\s+\$41\.10\s+\$312\.40/.test(msg), 'checked wins row: last hour / today / 7 days');
   assert(/Could earn live\s+\$4\.10\s+\$22\.60\s+\$140\.20/.test(msg), 'could earn live row');
   assert(/Real money made\s+\$0\.00\s+\$0\.00\s+\$0\.00/.test(msg), 'real money row is $0.00 in practice');
@@ -166,7 +166,7 @@ const input = (over: Partial<HourlyReportInput> = {}): HourlyReportInput => ({
     money: snap({ real: { lastHour: 2.6, today: 12.5, week: 1234.5 }, realPeriod: { madeUsd: 2.6, won: 1, gasUsd: 0.65, failed: 1, failedCostUsd: 0.4 } }),
   }));
   console.log('----- live sample -----\n' + live + '\n-----------------------');
-  assert(live.includes('<b>LIVE (real money)</b>') && !live.includes('Practice mode'), 'live header');
+  assert(live.includes('<b>LIVE (real money)</b>') && !live.includes('PRACTICE'), 'live header');
   assert(/Real money made\s+\$2\.60\s+\$12\.50\s+\$1,234\.50/.test(live), 'live: real money row filled (with thousands comma)');
   assert(live.includes('Gas paid $0.65 · Failed trades 1 (cost $0.40)'), 'live: gas paid and failed trades line');
 

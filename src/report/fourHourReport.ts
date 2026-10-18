@@ -115,7 +115,7 @@ export function fitBlocks(blocks: string[], limit = SAFE_LIMIT): string {
 export function periodLine(i: FourHourInput): { line: string; partial: string | null } {
   const t = i.totals;
   const from = Math.max(i.scheduledFromMs, t.fromMs);
-  const mode = i.snap.live ? 'LIVE mode (real money)' : 'Practice mode';
+  const mode = i.snap.live ? '🟢 LIVE mode (real money)' : '🧪 PRACTICE mode';
   const line = `${mode} · ${clock(from, i.tz)} – ${clock(i.toMs, i.tz)} ${zoneName(i.tz)}`;
   const span = Math.max(1, i.toMs - from);
   const notes: string[] = [];

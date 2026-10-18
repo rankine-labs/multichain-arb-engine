@@ -179,7 +179,8 @@ import { StableTally, parseStableEnv } from './core/stableTally';
 // Hourly report version 2 (Oct 15, reporting only): money ledgers, the new
 // plain hourly message and the 4-hour accumulator (src/report/).
 import { MoneyLedgers, RealMoneyLedger, hourMoneyOf } from './report/ledgers';
-import { hourlyMessage, reportV2On, HourlyReportInput, FULL_HOUR_MIN_MS } from './report/hourlyReport';
+import { hourlyMessage, reportV2On, HourlyReportInput, FULL_HOUR_MIN_MS, overallVerdict } from './report/hourlyReport';
+import { liveLayoutOn, LiveTradeBook, WalletWatch, formatLiveTrade, formatLiveHourly, formatLive4h, gasLowSpec, walletChangedSpec } from './report/liveTelegram';
 import { FailoverJsonRpcProvider } from './core/failoverRpc';
 import { makeCaller } from './core/universeScan';
 import { loadNodeUsage, saveNodeUsage, nodeUsageToday, NodeBudget, budgetForUrl, callsInBody } from './core/nodeBudget';
@@ -1355,6 +1356,34 @@ const liveTradeLog = new LiveTradeLog();
 const alertHooks = new AlertHooks({ send: (html) => sendTelegramMessage(html) });
 alertHooks.installExitRecorder();
 const safetyAlerts = new SafetyAlerts((html, critical) => alertHooks.safetyNotify(html, critical), safetyConfigFromEnv().dailyLossCapUsd, 'robinhood', Date.now, alertHooks.v2);
+// LIVE TELEGRAM LAYOUT (report/liveTelegram.ts, Oct 18): once real money is
+// on, Telegram shows real money only: one message per real trade, a short
+// hourly and 4-hourly, and alerts. Practice mode is unchanged.
+// TELEGRAM_LIVE_LAYOUT=0 keeps the old messages in live mode too.
+const LIVE_LAYOUT = robinhoodSender.live && liveLayoutOn();
+const liveBook = new LiveTradeBook(LIVE_LAYOUT ? (process.env.LIVE_TELEGRAM_FILE ?? 'data/live-telegram.json') : null, process.env.REPORT_TZ || 'America/Toronto');
+alertHooks.liveTradeMessages = LIVE_LAYOUT;
+// Coins of the trade contract shown in the wallet table (name, address, digits shown).
+const LIVE_WALLET_COINS = [
+      { coin: 'USDG', address: ROBINHOOD_TOKENS.USDG, digits: 2 },
+      { coin: 'WETH', address: ROBINHOOD_TOKENS.WETH, digits: 4 },
+];
+// A coin dropping with no trade to explain it: alert (never pauses trading).
+const walletWatch = new WalletWatch(liveBook, (coin, dropped) => {
+      const digits = LIVE_WALLET_COINS.find((c) => c.coin === coin)?.digits ?? 4;
+      try { alertHooks.center.event(`wallet-drop:${coin}:${Date.now()}`, walletChangedSpec(coin, dropped, digits)); } catch { /* reporting only */ }
+});
+// Gas wallet: last read balance and the "trades left" it buys (updated every 5 min when live).
+const liveGas: { eth: number | null; tradesLeft: number | null } = { eth: null, tradesLeft: null };
+const LIVE_GAS_LOW_TRADES = Number(process.env.LIVE_GAS_LOW_TRADES ?? 20);
+// One real trade's final result: book it and send the ✅ / ❌ message.
+const sendLiveTradeMessage = (r: { status: 'profit' | 'reverted' | 'dropped'; label: string; gasUsd: number; profitUsd?: number; sizeUsd?: number }) => {
+      if (!LIVE_LAYOUT) return;
+      try {
+            liveBook.add(r);
+            void sendTelegramMessage(formatLiveTrade({ ...r, today: liveBook.today() })).catch(() => undefined);
+      } catch (err) { console.warn('[live-telegram] trade message failed:', (err as Error).message); }
+};
 
 // LIVE results (only used once live sending is switched on): receipt, profit
 // from the contract's Executed event, gas cost; losses feed the daily cap.
@@ -1369,7 +1398,7 @@ const liveTracker = new LiveTradeTracker({
       recordLoss: (usd) => { safetyGate.recordLoss(usd); safetyAlerts.onLoss(safetyGate.lossTodayUsd()); },
       // Every final result: the status page's file, the instant alerts, and the
       // hourly report's "Real money made" ledger (only counted when really live).
-      onResult: (r) => { liveTradeLog.result(r); alertHooks.onLiveResult(r); moneyLedgers.noteRealResult(r, robinhoodSender.live); },
+      onResult: (r) => { liveTradeLog.result(r); alertHooks.onLiveResult(r); moneyLedgers.noteRealResult(r, robinhoodSender.live); sendLiveTradeMessage(r); },
       noteGasUsed: (gas, info) => { robinhoodSender.noteGasUsed(gas); if (info?.routeKey) void noteReceiptGas(info.routeKey, info.hash, gas, info.success); },
       notify: (html) => alertHooks.liveTrackerNotify(html),
       onSettled: (hash) => { safetyGate.releasePending(hash); robinhoodSender.settled(hash); },
@@ -1408,6 +1437,10 @@ const refreshOwnMoney = async () => {
       try {
             rhDecisionCallMany ??= (await makeCaller(robinhoodReadProvider)).callMany;
             await ownMoney.refresh(rhDecisionCallMany, holder, OWN_MONEY_TOKENS);
+            if (LIVE_LAYOUT) for (const c of LIVE_WALLET_COINS) {
+                  const dec = TOKEN_DECIMALS.robinhood?.[c.address.toLowerCase()];
+                  if (dec !== undefined) walletWatch.observe(c.coin, Number(ownMoney.raw(c.address)) / 10 ** dec);
+            }
       } catch (err) {
             console.warn('[own-money] balance read failed (keeping last numbers):', (err as Error).message);
       }
@@ -2081,7 +2114,7 @@ const fireTrade = async (o: {
                   setTimeout(() => { void refreshOwnMoney(); }, 3_000);
                   // Worst-case gas (2x today's cost) held against the daily loss cap until the receipt.
                   safetyGate.reservePending(fired.txHash, 2 * rhGasUsd(0.05));
-                  liveTracker.track(fired.txHash, { expectedProfitUsd: netProfitUsd, label: tradeLabel, routeKey: routeKeyFor(dry.hops.map((h) => h.kind), dry.funding === 'v3-flash') });
+                  liveTracker.track(fired.txHash, { expectedProfitUsd: netProfitUsd, label: tradeLabel, sizeUsd: o.tradeSizeUsd, routeKey: routeKeyFor(dry.hops.map((h) => h.kind), dry.funding === 'v3-flash') });
             }
             console.log(`[fire] robinhood ${fired.live ? 'LIVE' : 'DRY RUN'} (${o.source}) ready ${readyMs}ms after ${o.source === 'trade' ? 'the trigger' : 'the price update'} (sign ${fired.signMs.toFixed(1)}ms)` +
                   `${fired.txHash ? ` tx ${fired.txHash}` : ''}${fired.error ? ` error: ${fired.error}` : ''}`);
@@ -2615,6 +2648,24 @@ if (chainOn('robinhood')) {
                               const msg = `bot wallet ${robinhoodSender.address} has ${ethers.formatEther(b.balance)} ETH, needs ${ethers.formatEther(b.needed)} per trade at the gas cap`;
                               console.warn(`[fire] LOW GAS: ${msg}`);
                               alertHooks.lowGas(msg);
+                        }
+                        // Live layout: read the gas wallet every 5 min for the hourly
+                        // "≈ N trades left" and the "gas low" alert (read only).
+                        if (LIVE_LAYOUT) {
+                              const checkGas = async () => {
+                                    try {
+                                          const g = await robinhoodSender.balanceCheck();
+                                          const eth = Number(ethers.formatEther(g.balance));
+                                          const ethUsd = priceOracle.getUsdPrice('robinhood', ROBINHOOD_TOKENS.WETH) ?? 0;
+                                          const perTrade = gasModel.twoPool(!RH_OWN_MONEY).usd;
+                                          liveGas.eth = eth;
+                                          liveGas.tradesLeft = ethUsd > 0 && Number.isFinite(perTrade) && perTrade > 0 ? Math.floor((eth * ethUsd) / perTrade) : null;
+                                          if (liveGas.tradesLeft !== null && liveGas.tradesLeft < LIVE_GAS_LOW_TRADES) alertHooks.center.raise('live-gas-low', gasLowSpec(liveGas.tradesLeft, eth));
+                                          else if (liveGas.tradesLeft !== null) alertHooks.center.clear('live-gas-low', `Gas topped up: about ${liveGas.tradesLeft} trades left`);
+                                    } catch (err) { console.warn('[live-telegram] gas read failed:', (err as Error).message); }
+                              };
+                              void checkGas();
+                              setInterval(() => { void checkGas(); }, 5 * 60_000);
                         }
                   }
             })
@@ -3955,7 +4006,21 @@ for (let i = 0; i < resolved.length; i++) {
                         // same money the hourly shows (reporting only, never throws).
                         if (fourHour) report4h(() => fourHour.addHour({ ...hourSampleFrom(hourInput, fromMs, now, stats.seen, stageHour.summary, stallHour), money: hourMoneyOf(moneySnap) }));
                         if (REPORT_V2) console.log(`[report] hourly v2${sendHourly ? '' : ' (collected for the 4-hour report, not sent)'}: checked ${moneySnap.checked.lastHour.toFixed(2)}, could earn live ${moneySnap.couldEarn.lastHour.toFixed(2)}, real ${moneySnap.real.lastHour.toFixed(2)}`);
-                        if (sendHourly) await sendTelegramMessage(hourlyMessage(REPORT_V2, v2Input, hourInput));
+                        if (sendHourly && LIVE_LAYOUT) {
+                              const verdict = overallVerdict(v2Input);
+                              await sendTelegramMessage(formatLiveHourly({
+                                    tz: REPORT_TZ, fromMs, toMs: now,
+                                    partial: v2Input.restarted ? 'bot restarted' : now - fromMs < FULL_HOUR_MIN_MS ? 'short hour' : null,
+                                    hour: liveBook.window(fromMs, now),
+                                    todayUsd: liveBook.today().usd,
+                                    sinceStartUsd: liveBook.sinceStart(),
+                                    wallet: LIVE_WALLET_COINS.map((c) => ({ coin: c.coin, now: walletWatch.now(c.coin), start: liveBook.startOf(c.coin), digits: c.digits })),
+                                    gas: { ...liveGas },
+                                    loss: { usedUsd: safetyGate.lossTodayUsd(), capUsd: safetyConfigFromEnv().dailyLossCapUsd },
+                                    maxTradeUsd: MAX_TRADE_USD,
+                                    bot: { ok: verdict.mark === '✅' && v2Input.feedOk !== false, text: verdict.text },
+                              }));
+                        } else if (sendHourly) await sendTelegramMessage(hourlyMessage(REPORT_V2, v2Input, hourInput));
                   } else if (sendHourly) await sendTelegramMessage(formatHourlyDigest({
                         windowLabel: `${hhmm(lastDigestAt)} to ${hhmm(now)}`,
                         chains: (['avalanche', 'monad', 'robinhood'] as const).filter(chainOn).map((chain) => ({
@@ -4142,7 +4207,17 @@ for (let i = 0; i < resolved.length; i++) {
                   // Close the period first: a failed send never makes a second copy later.
                   const { totals, prev } = fourHour.close(markKey, now);
                   closed = true;
-                  const msgs = formatFourHourReport({ tz: REPORT_4H_TZ, scheduledFromMs, toMs: now, totals, prevWins: prev, snap });
+                  const detail = formatFourHourReport({ tz: REPORT_4H_TZ, scheduledFromMs, toMs: now, totals, prevWins: prev, snap });
+                  let msgs: string[] = detail;
+                  if (LIVE_LAYOUT) {
+                        const w = liveBook.window(fromMs, now), b = liveBook.breakdown(fromMs, now);
+                        const live4h = formatLive4h({
+                              tz: REPORT_4H_TZ, fromMs, toMs: now, keptUsd: w.usd, won: w.won, missed: w.missed,
+                              best: b.best, gasUsd: w.gas, byHour: b.byHour, topPairs: b.topPairs,
+                              found: Number.isFinite((totals as any)?.funnel?.found) ? (totals as any).funnel.found : null,
+                        });
+                        msgs = process.env.LIVE_TELEGRAM_DETAIL === '1' ? [live4h, ...detail] : [live4h];
+                  }
                   console.log(`[report4h] sending 4-hour report ${markKey} (${msgs.map((m) => m.length).join('/')} chars)`);
                   for (const m of msgs) await sendTelegramMessage(m);
             } catch (err) {
