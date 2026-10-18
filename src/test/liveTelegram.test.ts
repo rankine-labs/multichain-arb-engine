@@ -51,21 +51,21 @@ assert(liveLayoutOn({}) && !liveLayoutOn({ TELEGRAM_LIVE_LAYOUT: '0' }), 'switch
     tz: TZ, fromMs: T0, toMs: T0 + 3600_000, partial: null,
     hour: { usd: 0.85, won: 3, missed: 2 }, todayUsd: 2.08, sinceStartUsd: 5.4,
     wallet: [{ coin: 'USDG', now: 201.9, start: 200, digits: 2 }, { coin: 'WETH', now: 0.0067, start: 0.0067, digits: 4 }],
-    gas: { eth: 0.0033, tradesLeft: 180 }, loss: { usedUsd: 0.12, capUsd: 25 }, maxTradeUsd: 200,
+    gas: { eth: 0.0033, tradesLeft: 180 }, loss: { usedUsd: 0.12, capUsd: 25 }, biggestTrade: [{ coin: 'USDG', usd: 196 }, { coin: 'WETH', usd: 19.6 }],
     bot: { ok: true, text: 'all good' },
   });
   assert(h.startsWith('🟢 <b>LIVE · 2pm–3pm</b>'), 'hourly: LIVE banner and time range');
   assert(h.includes('This hour') && h.includes('+$0.85') && h.includes('(3 won, 2 missed)') && h.includes('Since start') && h.includes('+$5.40'), 'hourly: real money lines');
   assert(/USDG\s+201\.90\s+200\.00/.test(h) && /WETH\s+0\.0067\s+0\.0067/.test(h), 'hourly: wallet now vs started');
   assert(/Gas \(ETH\)\s+0\.0033\s+≈ 180 trades left/.test(h), 'hourly: gas and trades left');
-  assert(h.includes('$0.12 used of $25.00') && h.includes('Biggest trade      $200.00') && h.includes('✅ running, connected'), 'hourly: safety block');
+  assert(h.includes('$0.12 used of $25.00') && h.includes('Biggest trade      USDG $196.00 · WETH $19.60 (your wallet)') && h.includes('✅ running, connected'), 'hourly: safety block');
   assert(!h.includes('Checked wins') && !h.includes('Could earn live') && noEmDash(h), 'hourly: no practice numbers, no em dashes');
   const bad = formatLiveHourly({
     tz: TZ, fromMs: T0, toMs: T0 + 1200_000, partial: 'bot restarted', hour: { usd: 0, won: 0, missed: 0 }, todayUsd: 0, sinceStartUsd: 0,
     wallet: [{ coin: 'USDG', now: null, start: null, digits: 2 }], gas: { eth: null, tradesLeft: null }, loss: { usedUsd: 0, capUsd: 25 },
-    maxTradeUsd: 200, bot: { ok: false, text: 'live trade feed down' },
+    biggestTrade: [{ coin: 'USDG', usd: null }], bot: { ok: false, text: 'live trade feed down' },
   });
-  assert(bad.includes('(bot restarted)') && /USDG\s+n\/a\s+n\/a/.test(bad) && bad.includes('n/a   n/a') && bad.includes('⚠️ live trade feed down'), 'hourly: partial, unknown numbers as n/a, health problem shown');
+  assert(bad.includes('(bot restarted)') && /USDG\s+n\/a\s+n\/a/.test(bad) && bad.includes('n/a   n/a') && bad.includes('⚠️ live trade feed down') && bad.includes('USDG n/a (your wallet)'), 'hourly: partial, unknown numbers as n/a, health problem shown');
   assert(h.length < 4096, 'hourly fits in one Telegram message');
 }
 
