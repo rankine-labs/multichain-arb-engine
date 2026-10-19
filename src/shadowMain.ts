@@ -92,6 +92,7 @@ import { buildExecuteCall, executionRequested, executorConfig, pickV3Lender, kin
 import { GasModel, GasCalibration, gasSettingsFromEnv, routeKeyFor, twoPoolKey, defaultUnitsFor, costsLine, loopKey } from './core/gasModel';
 import { recordEventFee, eventFeeCounts, feeFromEventsOn, setHeadBlockSource, currentHeadBlock } from './core/eventFees';
 import { OwnMoneyBook, useOwnMoney, fitTradeToWallet } from './core/ownMoney';
+import { readIncludesTrade } from './core/tradeInclusion';
 import { BlockReader, PoolUpdate } from './core/blockReader';
 import { AutoVet, CheckOutcome } from './core/autoVet';
 import { FailTally } from './core/failReasons';
@@ -564,6 +565,10 @@ const simDisabled: Record<string, { reason: string; until: number }> = {};
 // Pairs tested 3+ times without a real win are benched for 6 h. Saved to disk.
 const ROUTE_FILE = 'data/route-scores.json';
 const routeScores = new RouteScores();
+// Double-count guard counters (logged every 10 min): fresh reads that already
+// had the followed trade in them vs reads still from before it.
+const tradeInclusionStats = { included: 0, notYet: 0 };
+setInterval(() => { if (tradeInclusionStats.included || tradeInclusionStats.notYet) console.log(`[double-count] last 10 min: fresh read already had the trade ${tradeInclusionStats.included}x (not applied again), still before it ${tradeInclusionStats.notYet}x`); tradeInclusionStats.included = tradeInclusionStats.notYet = 0; }, 10 * 60_000);
 // LIVE ROUTE BLOCK (core/routeScore.ts, Oct 19): one failed/losing real check
 // or one failed live trade on a pool pair stops REAL sends on it for 6 h.
 const liveBlocks = new LiveRouteBlock();
@@ -2473,7 +2478,15 @@ if (registerIfApproved('avalanche', entry.dex, resolved)) pool = resolved;
           : await Promise.all([priceAtDecision(pool, true), ...cachedPeers.map((p) => priceAtDecision(p))]);
     // Stall finder: sizing / profit maths after the prices came back.
     markStretch('feed trade decide');
+    // DOUBLE-COUNT GUARD (core/tradeInclusion.ts, Oct 19): did the fresh read
+    // already include the trade we follow? Then the planner must not apply it
+    // again. TRADE_INCLUDED_CHECK=0 = old behaviour (always predict).
+    const preReadPool = pool;
     pool = freshPool;
+    const inclusion = swap.chain === 'robinhood' && process.env.TRADE_INCLUDED_CHECK !== '0' && swap.amountIn > 0n
+          ? readIncludesTrade(preReadPool, pool, (p) => cache.predictPostTradeState(p, p.tokenA.toLowerCase() === swap.tokenIn.toLowerCase(), swap.amountIn))
+          : { includes: false, share: null };
+    if (inclusion.includes) tradeInclusionStats.included++; else if (inclusion.share !== null) tradeInclusionStats.notYet++;
     trace?.mark('prices');
 
       // Record this real, genuine match for the hourly proof-of-activity
@@ -2545,7 +2558,7 @@ for (const peer of peers) {
             flashLoanFeeBps: loanBps ?? 0,
             usingFlashLoan: !rh || loanBps !== null,
             safetyMarginPct: 0.15,
-      }, decimalsOf(swap.chain, planIn), rh ? { refineSize: true, maxTradeUsd: involvesAutoVetted([swap.tokenIn, swap.tokenOut]) ? Math.min(MAX_TRADE_USD, AUTO_VET_MAX_TRADE_USD) : MAX_TRADE_USD, ...(loanBps === null ? { funding: 'own-capital' as const } : {}), ...(flipStart ? { startToken: planIn } : {}) } : {});
+      }, decimalsOf(swap.chain, planIn), rh ? { refineSize: true, maxTradeUsd: involvesAutoVetted([swap.tokenIn, swap.tokenOut]) ? Math.min(MAX_TRADE_USD, AUTO_VET_MAX_TRADE_USD) : MAX_TRADE_USD, ...(loanBps === null ? { funding: 'own-capital' as const } : {}), ...(flipStart ? { startToken: planIn } : {}), ...(inclusion.includes ? { stateIncludesTrade: true } : {}) } : {});
       if (candidate && (!plan || candidate.profit.conservativeNetProfitUsd > plan.profit.conservativeNetProfitUsd)) plan = candidate;
 }
 trace?.mark('math');

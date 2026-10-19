@@ -56,6 +56,10 @@ export interface PlanOptions {
   // tokenInDecimals must then be for this coin. The price prediction of the
   // other trader's swap still uses swap.tokenIn (it's THEIR trade).
   startToken?: string;
+  // The victim pool's state ALREADY includes the trade we follow (a fresh
+  // node read taken after it landed, see core/tradeInclusion.ts). Then the
+  // trade must not be applied again: plan with the state as is.
+  stateIncludesTrade?: boolean;
 }
 
 export function planBackrun(
@@ -82,7 +86,7 @@ export function planBackrun(
   // Step 1: predict the victim pool AFTER the big swap lands.
   let predictedVictim = victimPool;
   let usedPrediction = false;
-  if (PREDICTABLE_STATES.includes(swap.stateType) && swap.amountIn > 0n) {
+  if (PREDICTABLE_STATES.includes(swap.stateType) && swap.amountIn > 0n && !opts.stateIncludesTrade) {
     const victimTokenInIsA = victimPool.tokenA.toLowerCase() === theirTokenIn;
     const predicted = cache.predictPostTradeState(victimPool, victimTokenInIsA, swap.amountIn);
     // predictPostTradeState returns the SAME object when it can't model the
