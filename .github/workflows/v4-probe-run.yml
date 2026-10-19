@@ -1,0 +1,28 @@
+# One-off, READ-ONLY: why do live trades with Uniswap V4 pools fail? Commits
+# results/v4-probe.txt back to the v4-probe branch. No keys, no transactions.
+name: V4 probe (one-off)
+on:
+  push:
+    branches: [v4-probe]
+    paths: ['scripts/v4-probe.js', '.github/workflows/v4-probe-run.yml']
+permissions:
+  contents: write
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install --no-audit --no-fund
+      - run: node scripts/v4-probe.js
+      - name: Commit the result
+        if: always()
+        run: |
+          git config user.name "v4-probe"
+          git config user.email "v4-probe@users.noreply.github.com"
+          git add -f results/v4-probe.txt || exit 0
+          git commit -m "V4 probe result (read-only)" || exit 0
+          git push
