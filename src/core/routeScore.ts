@@ -72,6 +72,75 @@ export class RouteScores {
 }
 
 // ----------------------------------------------------------------------------
+// LIVE ROUTE BLOCK (Oct 19, owner approved after the first live trades)
+//
+// Plain English:
+//   On the first live day, the same two pool pairs (GLXY and META, Uniswap
+//   V3 -> V4) were sent 9 times and failed 9 times. The bot's own real-chain
+//   check said "FAILS" / "LOSS" for those exact pairs, but trigger trades are
+//   sent BEFORE that check finishes (speed), and the old bench needed 3 failed
+//   checks and let anything over $1 skip it.
+//
+//   Now, for REAL sends only:
+//     - one failed or losing real check on a pool pair, or one live trade on
+//       it that fails on the chain, blocks that pair for LIVE_BLOCK_MS (6 h),
+//       whatever the expected profit (no $1 bypass);
+//     - a real check that makes money on the pair lifts the block at once.
+//   Practice checks are NOT blocked, so the bot keeps testing the pair and
+//   can learn that it pays again. Saved to disk so a restart keeps it.
+// ----------------------------------------------------------------------------
+type LiveBlock = { until: number; why: string };
+
+export class LiveRouteBlock {
+  private blocks = new Map<string, LiveBlock>();
+  constructor(
+    private readonly blockMs = Number(process.env.LIVE_BLOCK_MS ?? 6 * 60 * 60_000),
+    private readonly now: () => number = Date.now,
+    private readonly maxEntries = 5_000,
+  ) {}
+
+  // Block a pool pair (both directions: the same two pools are just as wrong either way).
+  block(buyPool: string, sellPool: string, why: string): void {
+    const until = this.now() + this.blockMs;
+    for (const k of [RouteScores.key(buyPool, sellPool), RouteScores.key(sellPool, buyPool)]) this.blocks.set(k, { until, why: String(why).slice(0, 120) });
+    if (this.blocks.size > this.maxEntries) this.prune();
+  }
+
+  // A real check made money on this pair: it is fine again.
+  clear(buyPool: string, sellPool: string): void {
+    this.blocks.delete(RouteScores.key(buyPool, sellPool));
+    this.blocks.delete(RouteScores.key(sellPool, buyPool));
+  }
+
+  // Why the pair is blocked right now, or null.
+  reason(buyPool: string, sellPool: string): string | null {
+    const b = this.blocks.get(RouteScores.key(buyPool, sellPool));
+    return b && b.until > this.now() ? b.why : null;
+  }
+
+  count(): number { const t = this.now(); let n = 0; for (const b of this.blocks.values()) if (b.until > t) n++; return n; }
+
+  private prune() { const t = this.now(); for (const [k, b] of this.blocks) if (b.until <= t) this.blocks.delete(k); }
+
+  load(file: string): number {
+    try {
+      const j = JSON.parse(readFileSync(file, 'utf8')) as Record<string, LiveBlock>;
+      for (const [k, b] of Object.entries(j)) if (b && Number.isFinite(b.until) && b.until > this.now()) this.blocks.set(k, { until: b.until, why: String(b.why ?? '') });
+      return this.count();
+    } catch { return 0; }
+  }
+
+  save(file: string): void {
+    try {
+      this.prune();
+      mkdirSync(dirname(file), { recursive: true });
+      writeFileSync(file + '.tmp', JSON.stringify(Object.fromEntries(this.blocks)));
+      renameSync(file + '.tmp', file);
+    } catch { /* best effort: reporting only */ }
+  }
+}
+
+// ----------------------------------------------------------------------------
 // WIN SIZES -- how many real wins (after gas, vetted coins) cleared each bar,
 // so the firing bar ($20 today) can be set from data. Per hour and per day
 // (Toronto day, like the rest of the hourly report).
