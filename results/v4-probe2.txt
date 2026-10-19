@@ -1,0 +1,8 @@
+probe error: SyntaxError: Unexpected token '<', "<!DOCTYPE "... is not valid JSON
+    at JSON.parse (<anonymous>)
+    at parseJSONFromBytes (node:internal/deps/undici/undici:5895:19)
+    at successSteps (node:internal/deps/undici/undici:5876:27)
+    at fullyReadBody (node:internal/deps/undici/undici:4768:9)
+    at process.processTicksAndRejections (node:internal/process/task_queues:103:5)
+    at async consumeBody (node:internal/deps/undici/undici:5885:7)
+    at async /home/runner/work/multichain-arb-engine/multichain-arb-engine/scripts/v4-probe2.js:66:13
