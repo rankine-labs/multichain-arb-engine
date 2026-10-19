@@ -1,9 +1,24 @@
-V4 probe at block 92893839 (read-only, nothing sent)
+V4 probe at block 92894691 (read-only, nothing sent)
 
 ===== META/USDG (token 0xc0d6457c16cc70d6790dd43521c899c87ce02f35, 18 decimals) =====
+V3  fee 0.3%  0x107a7Cb40d8665360ba10E59471Af06150A50922  price 705.1620 USDG  L=73548658169077773
+V3  fee 1%  0x6FD62e9843aD2Ac2c4fbf2b62647953EA29B3537  price 701.9698 USDG  L=633628899800937
 V4  fee 0.3% ts 60  0x5875d407a4  price 704.6598 USDG  L=1241661002950554416  tick 210743 lpFee 3000
 V4  fee 0.031% ts 3  0xc58bb68060  price 706.3156 USDG  L=26278108691789279  tick 210720 lpFee 310
+  $10 V3(0.3%) -> V4(0.3%/60): WORKS: returns 0.000000 USDG profit on 10 (real result)
+  $10 V4(0.3%/60) -> V3(0.3%): WORKS: returns 0.000000 USDG profit on 10 (real result)
+  $10 V3(0.3%) -> V4(0.031%/3): WORKS: returns 0.000000 USDG profit on 10 (real result)
+  $10 V4(0.031%/3) -> V3(0.3%): WORKS: returns 0.000000 USDG profit on 10 (real result)
+  $10 V3(1%) -> V4(0.3%/60): WORKS: returns 0.000000 USDG profit on 10 (real result)
+  $10 V4(0.3%/60) -> V3(1%): WORKS: returns 0.000000 USDG profit on 10 (real result)
+  $10 V3(1%) -> V4(0.031%/3): WORKS: returns 0.000000 USDG profit on 10 (real result)
+  $10 V4(0.031%/3) -> V3(1%): WORKS: returns 0.000000 USDG profit on 10 (real result)
 
 ===== PLTR/USDG (token 0x894e1ec2d74ffe5aef8dc8a9e84686accb964f2a, 18 decimals) =====
-V4  fee 1% ts 200  0xee430ee100  price 195.3847 USDG  L=436916763411458358  tick 223571 lpFee 10000
+V3  fee 0.3%  0x851680416A4f4E1c463d45171d61ACDdBc8554c0  price 194.3251 USDG  L=138425983365926332
+V4  fee 1% ts 200  0xee430ee100  price 195.3981 USDG  L=436916763411458358  tick 223570 lpFee 10000
 V4  fee 0.15% ts 15  0xc59eaeda6d  price 194.4926 USDG  L=62638262249141570  tick 223617 lpFee 1500
+  $10 V3(0.3%) -> V4(1%/200): WORKS: returns 0.000000 USDG profit on 10 (real result)
+  $10 V4(1%/200) -> V3(0.3%): WORKS: returns 0.000000 USDG profit on 10 (real result)
+  $10 V3(0.3%) -> V4(0.15%/15): WORKS: returns 0.000000 USDG profit on 10 (real result)
+  $10 V4(0.15%/15) -> V3(0.3%): WORKS: returns 0.000000 USDG profit on 10 (real result)
