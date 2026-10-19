@@ -93,6 +93,7 @@ import { GasModel, GasCalibration, gasSettingsFromEnv, routeKeyFor, twoPoolKey, 
 import { recordEventFee, eventFeeCounts, feeFromEventsOn, setHeadBlockSource, currentHeadBlock } from './core/eventFees';
 import { OwnMoneyBook, useOwnMoney, fitTradeToWallet } from './core/ownMoney';
 import { readIncludesTrade } from './core/tradeInclusion';
+import { checkFirstOn, waitForTrade, decideCheckFirst } from './core/checkFirst';
 import { BlockReader, PoolUpdate } from './core/blockReader';
 import { AutoVet, CheckOutcome } from './core/autoVet';
 import { FailTally } from './core/failReasons';
@@ -567,6 +568,18 @@ const ROUTE_FILE = 'data/route-scores.json';
 const routeScores = new RouteScores();
 // Double-count guard counters (logged every 10 min): fresh reads that already
 // had the followed trade in them vs reads still from before it.
+// Check first, then send (core/checkFirst.ts): what happened to live "follow a
+// trade" sends in the last 10 min (passed = sent after a winning real check).
+const checkFirstStats = { passed: 0, refused: 0, noLanding: 0, ms: [] as number[] };
+setInterval(() => {
+      const s = checkFirstStats;
+      if (s.passed || s.refused || s.noLanding) {
+            const sorted = [...s.ms].sort((a, b) => a - b);
+            const med = sorted.length ? sorted[Math.floor(sorted.length / 2)] : 0;
+            console.log(`[check-first] last 10 min: sent ${s.passed}, refused by the real check ${s.refused}, followed trade not landed in time ${s.noLanding} (median wait+check ${med} ms)`);
+      }
+      s.passed = s.refused = s.noLanding = 0; s.ms = [];
+}, 10 * 60_000);
 const tradeInclusionStats = { included: 0, notYet: 0 };
 setInterval(() => { if (tradeInclusionStats.included || tradeInclusionStats.notYet) console.log(`[double-count] last 10 min: fresh read already had the trade ${tradeInclusionStats.included}x (not applied again), still before it ${tradeInclusionStats.notYet}x`); tradeInclusionStats.included = tradeInclusionStats.notYet = 0; }, 10 * 60_000);
 // LIVE ROUTE BLOCK (core/routeScore.ts, Oct 19): one failed/losing real check
@@ -2019,6 +2032,8 @@ const fireTrade = async (o: {
       // the bigger of this and netProfitUsd, so a $785 check result can't slip
       // past it just because the model said $15.
       checkedProfitUsd?: number;
+      // The trade we follow (trigger trades): check-first waits for it to land.
+      triggerHash?: string;
 }) => {
       try {
             // Hard stop: never build a trade on an exchange that isn't cleared
@@ -2066,6 +2081,38 @@ const fireTrade = async (o: {
             if (o.chain === 'robinhood' && involvesAutoVetted([o.tokenIn, o.tokenOut]) && o.tradeSizeUsd > AUTO_VET_MAX_TRADE_USD) {
                   block(`auto-vetted coin: over the $${AUTO_VET_MAX_TRADE_USD} limit`);
                   return;
+            }
+            // CHECK FIRST, THEN SEND (core/checkFirst.ts, Oct 19, owner approved).
+            // Live "follow a trade" sends: wait for the followed trade to land,
+            // run the real check of our exact trade, send only if it makes money.
+            // (Before: sent on the guess first; the check said WIN 0 times in 360.)
+            if (o.chain === 'robinhood' && robinhoodSender.live && o.source === 'trade' && checkFirstOn()) {
+                  const startedMs = Date.now();
+                  const landed = await waitForTrade(simRpc.robinhood, o.triggerHash ?? '', RH_TRIGGER_POLL_MS, RH_TRIGGER_MAX_POLLS);
+                  markStretch('check-first wait');
+                  if (!landed) {
+                        checkFirstStats.noLanding++;
+                        block('check first: followed trade not in a block in time');
+                        return;
+                  }
+                  const c = await checkRoundTrip('robinhood', o.tokenIn, o.buyPool, o.sellPool, o.tradeSizeUsd, o.usdPerTokenIn);
+                  markStretch('check-first result');
+                  const v = decideCheckFirst(c, rhGasUsd(0.05), MIN_NET_PROFIT_USD, o.netProfitUsd);
+                  const label = `${symbolOf(o.chain, o.tokenIn)}/${symbolOf(o.chain, o.tokenOut)} ${o.buyPool.dex}>${o.sellPool.dex}`;
+                  const tookMs = Date.now() - startedMs;
+                  checkFirstStats.ms.push(tookMs);
+                  if (checkFirstStats.ms.length > 200) checkFirstStats.ms.shift();
+                  if (!v.send) {
+                        checkFirstStats.refused++;
+                        console.log(`[check-first] NOT SENT ${label}: guess $${o.netProfitUsd.toFixed(2)}, ${v.why} (${tookMs} ms)`);
+                        if (v.blockPair) liveBlocks.block(o.buyPool.poolAddress, o.sellPool.poolAddress, v.why);
+                        block(`check first: ${v.why.replace(/\$[\d.]+/g, '$N')}`);
+                        return;
+                  }
+                  checkFirstStats.passed++;
+                  console.log(`[check-first] PASSED ${label}: guess $${o.netProfitUsd.toFixed(2)}, real check $${v.netUsd.toFixed(2)} after gas (${tookMs} ms), sending`);
+                  // Never send on more than the check found; the outlier guard sees the check's number.
+                  o = { ...o, netProfitUsd: v.netUsd, checkedProfitUsd: v.netUsd };
             }
             // Own money or loan (same choice as the practice check, see pickLender).
             const lender = pickLender(o.chain, o.tokenIn, o.buyPool, o.sellPool, o.tradeSizeUsd, o.usdPerTokenIn);
@@ -2683,6 +2730,7 @@ console.log(
             buyPool: buyPoolUsed, sellPool: sellPoolUsed,
             tradeSizeUsd: sizing.optimalTradeSizeUsd, netProfitUsd: profit.conservativeNetProfitUsd,
             usdPerTokenIn: usdPerToken, seenAtMs: event.receivedAtMs, source: 'trade', trace,
+            triggerHash: (event.raw as any)?.hash,
             // Planned with a loan fee only when own money is switched off.
             plannedLoanPips: swap.chain === 'robinhood' && !RH_OWN_MONEY ? (rhLoanFeeBps(planIn, buyPoolUsed, sellPoolUsed) ?? 0) * 100 : 0,
       });
