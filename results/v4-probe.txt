@@ -1,0 +1,9 @@
+V4 probe at block 92893839 (read-only, nothing sent)
+
+===== META/USDG (token 0xc0d6457c16cc70d6790dd43521c899c87ce02f35, 18 decimals) =====
+V4  fee 0.3% ts 60  0x5875d407a4  price 704.6598 USDG  L=1241661002950554416  tick 210743 lpFee 3000
+V4  fee 0.031% ts 3  0xc58bb68060  price 706.3156 USDG  L=26278108691789279  tick 210720 lpFee 310
+
+===== PLTR/USDG (token 0x894e1ec2d74ffe5aef8dc8a9e84686accb964f2a, 18 decimals) =====
+V4  fee 1% ts 200  0xee430ee100  price 195.3847 USDG  L=436916763411458358  tick 223571 lpFee 10000
+V4  fee 0.15% ts 15  0xc59eaeda6d  price 194.4926 USDG  L=62638262249141570  tick 223617 lpFee 1500
