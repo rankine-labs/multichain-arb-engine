@@ -96,7 +96,7 @@ import { BlockReader, PoolUpdate } from './core/blockReader';
 import { AutoVet, CheckOutcome } from './core/autoVet';
 import { FailTally } from './core/failReasons';
 import { LenderBalances } from './core/lenderBalances';
-import { RouteScores, WinSizes, WIN_BARS } from './core/routeScore';
+import { RouteScores, WinSizes, WIN_BARS, LiveRouteBlock } from './core/routeScore';
 import { readOutlierConfig, isOutlier, confirmOutlier, withDeadline, OutlierVerdict } from './core/outlierGuard';
 import type { ExecutorHop } from './execution/executorCalldata';
 import { RivalWatch } from './core/rivalWatch';
@@ -564,6 +564,14 @@ const simDisabled: Record<string, { reason: string; until: number }> = {};
 // Pairs tested 3+ times without a real win are benched for 6 h. Saved to disk.
 const ROUTE_FILE = 'data/route-scores.json';
 const routeScores = new RouteScores();
+// LIVE ROUTE BLOCK (core/routeScore.ts, Oct 19): one failed/losing real check
+// or one failed live trade on a pool pair stops REAL sends on it for 6 h.
+const liveBlocks = new LiveRouteBlock();
+const LIVE_BLOCK_FILE = 'data/live-blocks.json';
+{ const n = liveBlocks.load(LIVE_BLOCK_FILE); if (n) console.log(`[live-block] restored ${n} blocked pool pairs`); }
+setInterval(() => timed('live blocks save', () => liveBlocks.save(LIVE_BLOCK_FILE)), 5 * 60_000);
+// Live trade hash -> its two pools, so a failed live trade can block its pair.
+const livePools = new Map<string, [string, string]>();
 { const n = routeScores.load(ROUTE_FILE); if (n) console.log(`[sim] robinhood: restored scores for ${n} pool pairs`); }
 setInterval(() => timed('route scores save', () => routeScores.save(ROUTE_FILE)), 10 * 60_000);
 // Real wins by size ($1/$2/$5/$10/$20 bars), to set the firing bar from data.
@@ -902,16 +910,18 @@ const runSimulation = (
                                     { startToken: tokenIn, sizeUsd: tradeSizeUsd, lender: lender?.poolAddress, notLive: liveBlocker(buyPool, sellPool) ?? undefined }, [buyPool.tokenA, buyPool.tokenB]);
                         }
                         if (chain === 'robinhood') { routeScores.record(routeKey, net); if (vetted) winSizes.add(net); profitBands.add(net, torontoDay()); }
+                        // Real check: makes money -> live block lifted; doesn't -> blocked for live.
+                        if (chain === 'robinhood') { if (net >= 0.1) liveBlocks.clear(buyPool.poolAddress, sellPool.poolAddress); else liveBlocks.block(buyPool.poolAddress, sellPool.poolAddress, `real check made only $${net.toFixed(2)}`); }
                         // Race check for trigger wins: we'd send ~0.1 s after seeing the trigger,
                         // so "ready" is the block after the trigger's block.
                         if (chain === 'robinhood' && spot && net > 0) void raceChecker.record({ label: `${pair} after trigger`, pools: [buyPool.poolAddress, sellPool.poolAddress], netUsd: net, source: 'trigger', spottedBlock: Number(spot.block), readyDelayMs: 100, ignoreTx: triggerHash, ...(spot.index !== undefined ? { afterTxIndex: spot.index } : {}) });
                   } else if (r.status === 'loss') {
                         simStats.loss++;
-                        if (chain === 'robinhood') routeScores.record(routeKey, 0);
+                        if (chain === 'robinhood') { routeScores.record(routeKey, 0); liveBlocks.block(buyPool.poolAddress, sellPool.poolAddress, 'real check: loss'); }
                         console.log(`[sim] ${chain} ${pair} ${route} real: LOSS | ${model}`);
                   } else {
                         simStats.fail++;
-                        if (chain === 'robinhood') { failTally.add(r.reason); routeScores.record(routeKey, 0); }
+                        if (chain === 'robinhood') { failTally.add(r.reason); routeScores.record(routeKey, 0); liveBlocks.block(buyPool.poolAddress, sellPool.poolAddress, `real check failed: ${r.reason}`); }
                         console.log(`[sim] ${chain} ${pair} ${route} real: FAILS (${r.reason}) | ${model}`);
                   }
             } catch (err) {
@@ -1417,7 +1427,13 @@ const liveTracker = new LiveTradeTracker({
       recordLoss: (usd) => { safetyGate.recordLoss(usd); safetyAlerts.onLoss(safetyGate.lossTodayUsd()); },
       // Every final result: the status page's file, the instant alerts, and the
       // hourly report's "Real money made" ledger (only counted when really live).
-      onResult: (r) => { liveTradeLog.result(r); alertHooks.onLiveResult(r); moneyLedgers.noteRealResult(r, robinhoodSender.live); sendLiveTradeMessage(r); },
+      onResult: (r) => {
+            liveTradeLog.result(r); alertHooks.onLiveResult(r); moneyLedgers.noteRealResult(r, robinhoodSender.live); sendLiveTradeMessage(r);
+            // A live trade that failed on the chain blocks its pool pair for 6 h.
+            const pools = livePools.get(r.hash);
+            if (pools && r.status === 'reverted') { liveBlocks.block(pools[0], pools[1], 'live trade failed on chain'); console.log(`[live-block] ${r.label}: live trade failed, pool pair blocked 6 h`); }
+            livePools.delete(r.hash);
+      },
       noteGasUsed: (gas, info) => { robinhoodSender.noteGasUsed(gas); if (info?.routeKey) void noteReceiptGas(info.routeKey, info.hash, gas, info.success); },
       notify: (html) => alertHooks.liveTrackerNotify(html),
       onSettled: (hash) => { safetyGate.releasePending(hash); robinhoodSender.settled(hash); },
@@ -2008,6 +2024,14 @@ const fireTrade = async (o: {
                   return;
             }
             const block = (r: string) => { fireStats.blocked.set(r, (fireStats.blocked.get(r) ?? 0) + 1); };
+            // LIVE ROUTE BLOCK: a pair whose real check failed / lost, or whose live
+            // trade failed, in the last 6 h is not sent for real (no $1 bypass).
+            // Trigger trades only: sitting gaps are sent right after a fresh real
+            // check that passed (and a pass lifts the block anyway).
+            if (o.chain === 'robinhood' && robinhoodSender.live && o.source === 'trade') {
+                  const why = liveBlocks.reason(o.buyPool.poolAddress, o.sellPool.poolAddress);
+                  if (why) { block('pool pair blocked for live (failed real check or live trade, 6 h)'); return; }
+            }
             // Pool pairs whose practice checks keep losing (benched 6 h) aren't
             // sent either: a trade the checks say never pays would only burn gas.
             // Big gaps ($1+ expected, BENCH_BYPASS_USD) are sent even on a benched pair.
@@ -2151,6 +2175,8 @@ const fireTrade = async (o: {
                   setTimeout(() => { void refreshOwnMoney(); }, 3_000);
                   // Worst-case gas (2x today's cost) held against the daily loss cap until the receipt.
                   safetyGate.reservePending(fired.txHash, 2 * rhGasUsd(0.05));
+                  livePools.set(fired.txHash, [o.buyPool.poolAddress, o.sellPool.poolAddress]);
+                  if (livePools.size > 500) livePools.delete(livePools.keys().next().value as string);
                   liveTracker.track(fired.txHash, { expectedProfitUsd: netProfitUsd, label: tradeLabel, sizeUsd: o.tradeSizeUsd, routeKey: routeKeyFor(dry.hops.map((h) => h.kind), dry.funding === 'v3-flash') });
             }
             console.log(`[fire] robinhood ${fired.live ? 'LIVE' : 'DRY RUN'} (${o.source}) ready ${readyMs}ms after ${o.source === 'trade' ? 'the trigger' : 'the price update'} (sign ${fired.signMs.toFixed(1)}ms)` +
