@@ -62,13 +62,20 @@ async function swapsIn(receipt) {
 }
 
 (async () => {
-  // Bot trades from the explorer (two API styles tried, both read-only).
+  // Bot trades: scan the blocks of the live window (Oct 19, 19:05-20:10 UTC)
+  // for transactions from the bot wallet. Plain block reads, no explorer.
   let txs = [];
-  const tries = [
-    async () => { const r = await fetch(`https://robinhoodchain.blockscout.com/api/v2/addresses/${BOT}/transactions?filter=from`, { headers: { accept: 'application/json', 'user-agent': 'Mozilla/5.0' } }); const t = await r.text(); try { const j = JSON.parse(t); return (j.items || []).map((x) => ({ hash: x.hash, to: x.to?.hash, timestamp: x.timestamp })); } catch { log(`v2 api: ${r.status} ${t.slice(0, 120).replace(/\s+/g, ' ')}`); return []; } },
-    async () => { const r = await fetch(`https://robinhoodchain.blockscout.com/api?module=account&action=txlist&address=${BOT}&sort=desc`, { headers: { accept: 'application/json', 'user-agent': 'Mozilla/5.0' } }); const t = await r.text(); try { const j = JSON.parse(t); return (j.result || []).map((x) => ({ hash: x.hash, to: x.to, timestamp: new Date(Number(x.timeStamp) * 1000).toISOString() })); } catch { log(`etherscan api: ${r.status} ${t.slice(0, 120).replace(/\s+/g, ' ')}`); return []; } },
-  ];
-  for (const f of tries) { if (!txs.length) txs = await f().catch((e) => { log(`api error ${e.message}`); return []; }); }
+  const at = async (n) => (await p.getBlock(n)).timestamp;
+  const findBlock = async (ts) => { let lo = 92700000, hi = await p.getBlockNumber(); while (lo < hi) { const m = Math.floor((lo + hi) / 2); if ((await at(m)) < ts) lo = m + 1; else hi = m; } return lo; };
+  const from = await findBlock(Date.UTC(2026, 9, 19, 19, 5) / 1000), to = await findBlock(Date.UTC(2026, 9, 19, 20, 10) / 1000);
+  log(`scanning blocks ${from}..${to} (${to - from} blocks) for bot transactions`);
+  const bot = BOT.toLowerCase();
+  for (let b = from; b <= to; b += 200) {
+    const nums = []; for (let k = b; k < Math.min(b + 200, to + 1); k++) nums.push(k);
+    const blocks = await Promise.all(nums.map((n) => p.send('eth_getBlockByNumber', ['0x' + n.toString(16), true]).catch(() => null)));
+    for (const bl of blocks) for (const x of bl?.transactions || []) if ((x.from || '').toLowerCase() === bot) txs.push({ hash: x.hash, to: x.to, timestamp: new Date(Number(bl.timestamp) * 1000).toISOString() });
+  }
+  txs.reverse();
   txs = txs.filter((t) => (t.to || '').toLowerCase() === EXEC).slice(0, 20);
   log(`${txs.length} bot trades found (newest first)\n`);
   for (const t of txs) {
