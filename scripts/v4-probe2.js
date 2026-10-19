@@ -62,9 +62,14 @@ async function swapsIn(receipt) {
 }
 
 (async () => {
-  const r = await fetch(`https://robinhoodchain.blockscout.com/api/v2/addresses/${BOT}/transactions?filter=from`);
-  const j = await r.json();
-  const txs = (j.items || []).filter((t) => (t.to?.hash || '').toLowerCase() === EXEC).slice(0, 20);
+  // Bot trades from the explorer (two API styles tried, both read-only).
+  let txs = [];
+  const tries = [
+    async () => { const r = await fetch(`https://robinhoodchain.blockscout.com/api/v2/addresses/${BOT}/transactions?filter=from`, { headers: { accept: 'application/json', 'user-agent': 'Mozilla/5.0' } }); const t = await r.text(); try { const j = JSON.parse(t); return (j.items || []).map((x) => ({ hash: x.hash, to: x.to?.hash, timestamp: x.timestamp })); } catch { log(`v2 api: ${r.status} ${t.slice(0, 120).replace(/\s+/g, ' ')}`); return []; } },
+    async () => { const r = await fetch(`https://robinhoodchain.blockscout.com/api?module=account&action=txlist&address=${BOT}&sort=desc`, { headers: { accept: 'application/json', 'user-agent': 'Mozilla/5.0' } }); const t = await r.text(); try { const j = JSON.parse(t); return (j.result || []).map((x) => ({ hash: x.hash, to: x.to, timestamp: new Date(Number(x.timeStamp) * 1000).toISOString() })); } catch { log(`etherscan api: ${r.status} ${t.slice(0, 120).replace(/\s+/g, ' ')}`); return []; } },
+  ];
+  for (const f of tries) { if (!txs.length) txs = await f().catch((e) => { log(`api error ${e.message}`); return []; }); }
+  txs = txs.filter((t) => (t.to || '').toLowerCase() === EXEC).slice(0, 20);
   log(`${txs.length} bot trades found (newest first)\n`);
   for (const t of txs) {
     const tx = await p.getTransaction(t.hash); const rc = await p.getTransactionReceipt(t.hash);
