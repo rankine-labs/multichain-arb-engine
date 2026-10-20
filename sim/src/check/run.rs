@@ -27,25 +27,33 @@
 // ============================================================================
 use std::sync::OnceLock;
 
-use revm::context::{BlockEnv, CfgEnv, Context, Evm, Journal, JournalInner, TxEnv};
+use revm::context::{JournalInner, TxEnv};
 use revm::context_interface::result::{EVMError, ExecutionResult, Output};
 use revm::context_interface::transaction::{AccessList, AccessListItem};
-use revm::handler::{instructions::EthInstructions, EthFrame, PrecompileProvider};
-use revm::interpreter::interpreter::EthInterpreter;
-use revm::primitives::{hardfork::SpecId, Address, Bytes, TxKind, U256};
+use revm::primitives::{Address, Bytes, TxKind, U256};
 use revm::ExecuteEvm;
 
 use super::db::{CheckDb, DbErr};
 use super::overrides::Overrides;
 use super::rawtx::{decode_signed_tx, DecodedTx, UNSUPPORTED_TX_PREFIX};
 use super::{CallOutcome, CallReq, CheckUnknown, UnknownReason, DEFAULT_CALL_GAS};
-use crate::arb::{self, ArbPrecompiles, BlockCtx};
+use crate::arb::{self, evm::ArbEvm, ArbConfig, BlockCtx};
 use crate::state::{MissItem, StateRead};
 
-/// revm types for one check (database = CheckDb, borrowed for the session).
-pub type CheckCtx<'a> = Context<BlockEnv, TxEnv, CfgEnv, CheckDb<'a>, Journal<CheckDb<'a>>, ()>;
-pub type CheckEvm<'a> =
-    Evm<CheckCtx<'a>, (), EthInstructions<EthInterpreter, CheckCtx<'a>>, ArbPrecompiles, EthFrame<EthInterpreter>>;
+/// revm EVM for one check: workstream B's Nitro-rules EVM (arb::evm) on our
+/// CheckDb (database borrowed for the session).
+pub type CheckEvm<'a> = ArbEvm<CheckDb<'a>>;
+
+/// Which block details the calls see.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlockEnvMode {
+    /// Like a node's eth_call / eth_simulateV1 with gas price 0 (the bot's
+    /// checks): BASEFEE and GASPRICE read 0. Default.
+    EthCall,
+    /// Like a mined transaction: BASEFEE = the block's base fee. Used for the
+    /// offline fixtures (recorded on anvil with its real base fee).
+    Mined,
+}
 
 /// Knobs for a check (defaults are what the sidecar uses).
 #[derive(Clone, Copy, Debug)]
@@ -56,11 +64,13 @@ pub struct CheckOptions {
     pub collect_misses: bool,
     /// Gas charged per ArbSys.arbBlockNumber() call (workstream B's number).
     pub arbsys_gas: u64,
+    /// eth_call block details (default) or mined-block details.
+    pub block_env: BlockEnvMode,
 }
 
 impl Default for CheckOptions {
     fn default() -> Self {
-        CheckOptions { collect_misses: true, arbsys_gas: default_arbsys_gas() }
+        CheckOptions { collect_misses: true, arbsys_gas: default_arbsys_gas(), block_env: BlockEnvMode::EthCall }
     }
 }
 
@@ -72,20 +82,6 @@ pub fn default_arbsys_gas() -> u64 {
     })
 }
 
-/// Arbitrum's built-in contract addresses (Nitro precompiles + NodeInterface).
-/// On Robinhood Chain a call to one of these runs Nitro's own code; if our
-/// precompile set doesn't imitate it, the check can't be sure -> unknown.
-pub fn arbitrum_builtin_addresses() -> Vec<Address> {
-    let mut v: Vec<Address> = (0x64u64..=0x74).map(addr_u64).collect();
-    v.extend([0xc8u64, 0xc9, 0xff].map(addr_u64));
-    v
-}
-
-fn addr_u64(n: u64) -> Address {
-    let mut a = [0u8; 20];
-    a[12..].copy_from_slice(&n.to_be_bytes());
-    Address::from(a)
-}
 
 /// Scratch state saved by `Session::snapshot` (to go back to it later).
 #[derive(Clone)]
@@ -101,30 +97,24 @@ pub struct Session<'a> {
 impl<'a> Session<'a> {
     /// New scratch pad on `view` + `overrides`, in block `ctx`.
     pub fn new(view: &'a dyn StateRead, ctx: &BlockCtx, overrides: &'a Overrides, opts: CheckOptions) -> Self {
-        let l2 = ctx.l2_block_number.map(U256::from);
-        let precompiles = ArbPrecompiles::new(l2, opts.arbsys_gas);
-        let mut db = CheckDb::new(view, overrides, opts.collect_misses);
+        let db = CheckDb::new(view, overrides, opts.collect_misses);
+        // B's builder: EVM rule set for the ArbOS version, Nitro opcodes,
+        // Nitro precompiles with exact gas, eth_call settings.
+        let ethcall = opts.block_env == BlockEnvMode::EthCall;
+        let mut evm = arb::evm::build_evm(db, ctx, &ArbConfig::default(), opts.arbsys_gas, ethcall);
+        // eth_call: no gas fee is charged or paid out at all. Same answers as
+        // gas price 0, but the coinbase account is never loaded (it would
+        // otherwise be a needless "missing" item on the live copy).
+        evm.ctx.modify_cfg(|cfg| cfg.disable_fee_charge = true);
         // Arbitrum mode (we know the chain's own block number): touching a
-        // Nitro built-in we don't imitate makes the answer unsure.
-        // Without it (plain-EVM test fixtures) those addresses are ordinary
-        // empty accounts, exactly like a local test chain.
-        if l2.is_some() {
-            let unsupported: Vec<Address> = arbitrum_builtin_addresses()
-                .into_iter()
-                .filter(|a| !<ArbPrecompiles as PrecompileProvider<CheckCtx<'a>>>::contains(&precompiles, a))
-                .collect();
-            db.set_unsupported_builtins(unsupported);
+        // Nitro built-in we don't imitate (even just its balance or code)
+        // makes the answer unsure. Without it (plain-EVM test fixtures)
+        // those addresses are ordinary empty accounts, like a test chain.
+        if ctx.l2_block_number.is_some() {
+            let unsupported: Vec<Address> =
+                arb::arbitrum_builtin_addresses().into_iter().filter(|a| !evm.precompiles.implements(a)).collect();
+            evm.ctx.journaled_state.database.set_unsupported_builtins(unsupported);
         }
-        let mut c: CheckCtx<'a> = Context::new(db, SpecId::CANCUN);
-        c.modify_cfg(|cfg| {
-            arb::configure_cfg(cfg);
-            // eth_call: no gas fee is charged or paid out at all. Same answers
-            // as gas price 0, but the coinbase account is never loaded (it
-            // would otherwise be a needless "missing" item on the live copy).
-            cfg.disable_fee_charge = true;
-        });
-        c.block = arb::block_env(ctx);
-        let evm = Evm::new(c, EthInstructions::new_mainnet_with_spec(SpecId::CANCUN), precompiles);
         Session { evm, fatal: None }
     }
 
@@ -213,6 +203,12 @@ impl<'a> Session<'a> {
                 CallOutcome { success: false, output: Bytes::new(), gas_used: 0, halt: Some(format!("invalid: {e:?}")) }
             }
             Err(EVMError::Database(e)) => return Err(self.fail(db_unknown(e, &self.evm.ctx.journaled_state.database.missing))),
+            // B's precompiles abort the run with this text when it touches
+            // Nitro code we don't imitate (ArbRetryableTx, NodeInterface,
+            // Stylus contracts, ...).
+            Err(EVMError::Custom(m)) if m.starts_with(arb::UNSUPPORTED_PRECOMPILE_PREFIX) || self.evm.precompiles.unsupported().is_some() => {
+                return Err(self.fail(CheckUnknown::new(UnknownReason::UnsupportedPrecompile, m)))
+            }
             Err(e) => return Err(self.fail(CheckUnknown::new(UnknownReason::Engine, format!("{e:?}")))),
         };
         Ok(out)
@@ -233,6 +229,10 @@ impl<'a> Session<'a> {
     pub fn verdict(&self) -> Result<(), CheckUnknown> {
         if let Some(f) = &self.fatal {
             return Err(f.clone());
+        }
+        // Belt and braces: an unsupported Nitro hit is never a sure answer.
+        if let Some(h) = self.evm.precompiles.unsupported() {
+            return Err(CheckUnknown::new(UnknownReason::UnsupportedPrecompile, h.to_string()));
         }
         let m = self.missing();
         if !m.is_empty() {

@@ -57,10 +57,10 @@ pub const NITRO_BLOCK_GAS_LIMIT: u64 = 1 << 50;
 /// ArbOS version we assume for Robinhood Chain when nothing better is known.
 /// ArbOS 51 "Dia" (Fusaka/Osaka EVM) was the current release when Robinhood
 /// mainnet launched (2026-07-01); ArbOS 61 "Elara" (Aug 2026) has the same
-/// EVM rules for our purposes. VERIFY on the server: tools/gas-diff.js prints
-/// the real version (from the block header and the ArbOS state).
+/// EVM rules for our purposes. VERIFIED Oct 20 2026 on the server
+/// (tools/gas-diff.js, 50 real trades): Robinhood runs ArbOS 61, no tips.
 /// Override with env ARBSIM_ARBOS_VERSION.
-pub const DEFAULT_ARBOS_VERSION: u64 = 51;
+pub const DEFAULT_ARBOS_VERSION: u64 = 61;
 
 /// Chain settings that change EVM behaviour.
 #[derive(Clone, Debug, PartialEq, Eq)]

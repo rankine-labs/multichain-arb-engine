@@ -179,19 +179,27 @@ fn overrides_fill_misses() {
 }
 
 // On Robinhood (ArbSys known), touching a Nitro built-in we don't imitate
-// (here 0x6c ArbGasInfo) = unknown, never a guess. ArbSys itself is fine.
+// (here 0x6e ArbRetryableTx, or the ArbOS "acts" address 0x...0a4b05) =
+// unknown, never a guess. ArbSys (0x64) and ArbGasInfo (0x6c) are imitated.
 #[test]
 fn unsupported_arbitrum_builtin_is_unknown() {
     let mut s = base();
-    add_contract(&mut s, addr(0xca11), code_staticcall(0x6c), &[]);
+    add_contract(&mut s, addr(0xca11), code_staticcall(0x6e), &[]);
     add_contract(&mut s, addr(0xca12), code_staticcall(0x64), &[]);
+    // BALANCE of the ArbOS acts address (only its account is touched).
+    let mut bal = hex("73"); // PUSH20 <addr> BALANCE STOP
+    bal.extend(arbsim::arb::arbos::ARBOS_ACTS_ADDRESS.as_slice());
+    bal.extend(hex("31 00"));
+    add_contract(&mut s, addr(0xca13), bal, &[]);
     let mut c = ctx();
     c.l2_block_number = Some(123);
     let call = |to: u64| CallReq { from: addr(USER), to: Some(addr(to)), data: Bytes::new(), gas: Some(200_000), value: U256::ZERO };
     let e = run_calls(&s, &c, &Overrides::none(), &[], &[call(0xca11)]).unwrap_err();
-    assert_eq!(e.reason, UnknownReason::UnsupportedPrecompile);
+    assert_eq!(e.reason, UnknownReason::UnsupportedPrecompile, "{e}");
+    let e = run_calls(&s, &c, &Overrides::none(), &[], &[call(0xca13)]).unwrap_err();
+    assert_eq!(e.reason, UnknownReason::UnsupportedPrecompile, "{e}");
     assert!(run_calls(&s, &c, &Overrides::none(), &[], &[call(0xca12)]).is_ok());
-    // Plain-EVM mode (no ArbSys): 0x6c is just an empty account.
+    // Plain-EVM mode (no ArbSys): 0x6e is just an empty account.
     assert!(run_calls(&s, &ctx(), &Overrides::none(), &[], &[call(0xca11)]).is_ok());
 }
 

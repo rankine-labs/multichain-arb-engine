@@ -20,7 +20,7 @@ use super::fixture::Fixture;
 use super::hexutil::to_hex;
 use super::overrides::Overrides;
 use super::search::{size_search, SizeSearchAmounts, SizeTemplate};
-use super::{run_calls, CallReq};
+use super::{run_calls, run_calls_opts, CallReq};
 
 fn arg_after(args: &[String], flag: &str) -> Option<String> {
     args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).cloned()
@@ -46,7 +46,9 @@ fn load_or_exit(args: &[String], cmd: &str) -> Fixture {
 pub fn check_fixture_value(f: &Fixture) -> serde_json::Value {
     let ov = Overrides::none();
     let t = Instant::now();
-    let r = run_calls(&f.state, &f.ctx, &ov, &[], std::slice::from_ref(&f.call));
+    // Fixtures were recorded on anvil as real calls with the block's base fee
+    // in place, so they run in "mined" block mode (see fixture::fixture_opts).
+    let r = run_calls_opts(&f.state, &f.ctx, &ov, &[], std::slice::from_ref(&f.call), super::fixture::fixture_opts());
     let us = t.elapsed().as_secs_f64() * 1e6;
     match r {
         Ok(out) => {

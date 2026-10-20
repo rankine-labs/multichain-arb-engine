@@ -44,7 +44,7 @@ pub mod run;
 pub mod search;
 
 pub use overrides::{AccountOverride, Overrides};
-pub use run::{run_calls, run_calls_opts, CheckOptions, Session};
+pub use run::{run_calls, run_calls_opts, BlockEnvMode, CheckOptions, Session};
 pub use search::{size_search, SizeSearchAmounts, SizeSearchBest, SizeSearchResult, SizeTemplate, SizeTry};
 
 /// Gas used for a call that doesn't say (same as geth's default eth_call cap).
@@ -70,8 +70,14 @@ pub struct CallOutcome {
     pub success: bool,
     /// Return data on success, revert data on revert, empty on a halt.
     pub output: Bytes,
-    /// Gas used at transaction level (includes the 21,000 base + calldata
-    /// cost, after refunds): the same number eth_simulateV1 / callTracer give.
+    /// Gas used at transaction level: 21,000 base + calldata cost +
+    /// execution, after refunds. This is EXECUTION gas only, and equals what
+    /// a Nitro node's eth_simulateV1 reports (without a baseFeePerGas
+    /// override, the bot's replay). It does NOT include Nitro's L1 data fee
+    /// ("poster gas", receipt field gasUsedForL1): a mined tx's receipt /
+    /// callTracer gasUsed, and eth_call / debug_traceCall gasUsed (which add
+    /// an estimate), are higher by that amount. The bot's gas model adds the
+    /// L1 fee separately. (Workstream B, sim/ARBITRUM_NOTES.md section 1.)
     pub gas_used: u64,
     /// Why it stopped abnormally (out of gas, invalid opcode, invalid tx...).
     /// None for success and for a normal revert.

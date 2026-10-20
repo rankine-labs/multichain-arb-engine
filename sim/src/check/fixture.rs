@@ -11,7 +11,16 @@ use revm::primitives::{B256, U256};
 use serde_json::Value;
 
 use super::hexutil::{parse_address, parse_bytes, parse_u256, parse_u64, to_hex};
+use super::run::{BlockEnvMode, CheckOptions};
 use super::{CallOutcome, CallReq};
+
+/// Check options for offline fixtures: "mined" block details (BASEFEE = the
+/// fixture's base fee), because anvil recorded them that way. None of the
+/// current fixtures read BASEFEE/GASPRICE, so eth_call mode gives the same
+/// answers (proven in tests/check_fixtures.rs).
+pub fn fixture_opts() -> CheckOptions {
+    CheckOptions { block_env: BlockEnvMode::Mined, ..CheckOptions::default() }
+}
 use crate::arb::BlockCtx;
 use crate::state::mem::MemState;
 

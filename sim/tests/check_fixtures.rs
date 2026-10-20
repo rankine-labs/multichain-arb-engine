@@ -6,14 +6,15 @@
 // ============================================================================
 mod check_util;
 
-use arbsim::check::fixture::Fixture;
+use arbsim::check::fixture::{fixture_opts, Fixture};
+use arbsim::check::run_calls_opts;
 use arbsim::check::hexutil::to_hex;
 use arbsim::check::{run_calls, CallReq, Overrides};
 use check_util::fixture_path;
 
 fn run(name: &str) -> (Fixture, arbsim::check::CallOutcome) {
     let f = Fixture::load(&fixture_path(name)).unwrap();
-    let out = run_calls(&f.state, &f.ctx, &Overrides::none(), &[], std::slice::from_ref(&f.call)).unwrap();
+    let out = run_calls_opts(&f.state, &f.ctx, &Overrides::none(), &[], std::slice::from_ref(&f.call), fixture_opts()).unwrap();
     let o = out.into_iter().next().unwrap();
     (f, o)
 }
@@ -82,4 +83,33 @@ fn chained_reverted_trade_leaves_no_trace() {
     assert_eq!(to_hex(&both[0].output[..4]), "0x4e88422a");
     assert!(!both[0].success);
     assert_eq!(both[1], alone[0]);
+}
+
+// Block-detail mode: fixtures run as "mined" (anvil's real base fee). None of
+// them read BASEFEE/GASPRICE, so the eth_call mode the sidecar uses (BASEFEE
+// 0, like a node's eth_call / eth_simulateV1) gives identical answers.
+#[test]
+fn ethcall_and_mined_block_modes_agree_on_fixtures() {
+    for name in ["offline-v3-v3-small", "offline-v3-v2-v3", "offline-v3-v3-small-arbsys"] {
+        let f = Fixture::load(&fixture_path(name)).unwrap();
+        let call = std::slice::from_ref(&f.call);
+        let mined = run_calls_opts(&f.state, &f.ctx, &Overrides::none(), &[], call, fixture_opts()).unwrap();
+        let ethcall = run_calls(&f.state, &f.ctx, &Overrides::none(), &[], call).unwrap();
+        assert_eq!(mined, ethcall, "{name}");
+    }
+}
+
+// BASEFEE really differs between the modes (contract returning BASEFEE).
+#[test]
+fn basefee_reads_zero_in_ethcall_mode() {
+    use arbsim::check::{BlockEnvMode, CheckOptions};
+    use revm::primitives::{Bytes, U256};
+    let s = check_util::state_with(&[(check_util::addr(0xbf), check_util::hex("48600052 6020 6000 f3"), vec![])], false);
+    let mut c = check_util::ctx();
+    c.basefee = 777;
+    let call = CallReq { from: check_util::addr(1), to: Some(check_util::addr(0xbf)), data: Bytes::new(), gas: Some(100_000), value: U256::ZERO };
+    let e = run_calls(&s, &c, &Overrides::none(), &[], std::slice::from_ref(&call)).unwrap();
+    assert_eq!(U256::from_be_slice(&e[0].output), U256::ZERO);
+    let m = run_calls_opts(&s, &c, &Overrides::none(), &[], &[call], CheckOptions { block_env: BlockEnvMode::Mined, ..CheckOptions::default() }).unwrap();
+    assert_eq!(U256::from_be_slice(&m[0].output), U256::from(777));
 }
