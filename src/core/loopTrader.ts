@@ -312,6 +312,7 @@ export class LoopTrader {
   // ROUTE MEMORY: loop sig -> failed checks in a row, benched until.
   private bench = new Map<string, { fails: number; until: number }>();
   private taxPools = 0;
+  private lastPreTest = 0;
 
   constructor(readonly cfg: LoopTraderConfig, private deps: LoopTraderDeps) {
     this.finder = new LoopFinder({ bases: deps.bases, maxPools: cfg.maxPools, maxCycles: cfg.maxCycles, maxTradeUsd: cfg.maxTradeUsd, depthShare: cfg.depthShare, longSlack: cfg.longSlack ?? 0.02 }, deps.env);
@@ -362,6 +363,19 @@ export class LoopTrader {
       }
       usable.length = w;
       this.taxPools = dropped;
+      // Test every coin on the remaining pools ahead of time (not only when a
+      // loop through it pays), so loops don't wait for a test when they appear.
+      // Repeats and already-tested coins are ignored by request(); the test
+      // queue and its per-minute limit keep this small.
+      if (now - this.lastPreTest > 30_000) {
+        this.lastPreTest = now;
+        for (const p of usable) {
+          const holder = coinHolderOf(p);
+          if (!holder) continue;
+          if (tax.verdict(p.tokenA) === undefined) tax.request(p.tokenA, holder);
+          if (tax.verdict(p.tokenB) === undefined) tax.request(p.tokenB, holder);
+        }
+      }
     }
     // CHEAP SCAN: nothing changed since the last scan (same pool states, same
     // order, none aged out) and the finder has nothing waiting: skip it. The
