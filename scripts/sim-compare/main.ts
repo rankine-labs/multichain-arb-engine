@@ -96,7 +96,7 @@ const HELP = `sim-compare: does arbsim give the same answers as the node? (read 
   --rps 5 --concurrency 2 --max-requests 30000   node limits for this run
   --engine arbsim|fixture|echo   fast side (echo = FAKE, pipeline test)
   --socket /tmp/arbsim.sock --arbsim <path to arbsim binary> --keep-fixtures
-  --node SIM_RPC_ROBINHOOD|QUICKNODE_RPC_ROBINHOOD|ROBINHOOD_RPC_HTTP   pick one node setting
+  --node CHAINSTACK_RPC_ROBINHOOD|SIM_RPC_ROBINHOOD|QUICKNODE_RPC_ROBINHOOD|ROBINHOOD_RPC_HTTP   pick one node setting
   --pools <file>                 watch list (default <bot>/data/watched-pools.json)
   --resume                       continue a stopped run (answers are never asked twice anyway)`;
 

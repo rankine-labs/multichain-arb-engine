@@ -95,7 +95,8 @@ export function pct(xs: number[], p: number): number | null {
 // ---- Which node to use -----------------------------------------------------
 // Same preference order as the bot's simulator (simRpcUrl) and the fixture
 // grabber: the explicit check node first, then the paid nodes.
-export const NODE_VARS = ['SIM_RPC_ROBINHOOD', 'QUICKNODE_RPC_ROBINHOOD', 'ROBINHOOD_RPC_HTTP'] as const;
+// CHAINSTACK first: it has the most room (20M request units a month, Oct 2026).
+export const NODE_VARS = ['CHAINSTACK_RPC_ROBINHOOD', 'SIM_RPC_ROBINHOOD', 'QUICKNODE_RPC_ROBINHOOD', 'ROBINHOOD_RPC_HTTP'] as const;
 
 // Returns the first usable node URL. Looks at the process environment first,
 // then ONLY the NODE_VARS lines of <botDir>/.env. `only` = use just that variable.
