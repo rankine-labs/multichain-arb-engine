@@ -1,4 +1,132 @@
 // ============================================================================
 // CHECKS (owner: workstream C) - run calls on a state view, eth_call style.
-// See DESIGN.md "Checks". Placeholder until C lands.
+//
+// Plain English:
+//   This is the part that actually answers the bot's question "what would
+//   happen if our contract ran this trade right now?". It takes:
+//     - a read-only view of the chain (state/), which may say "I don't know
+//       this item" (Missing),
+//     - the block details (arb::BlockCtx),
+//     - pretend-state for this one question (overrides: our contract's code
+//       at a test address, a pretend token balance, ...),
+//     - optionally some signed transactions to apply first (e.g. the trade
+//       we are following, before it shows up in the feed),
+//     - and the calls to run, in order.
+//   It runs them on a scratch copy (nothing is ever written back) and returns
+//   per call: did it succeed, what it returned (or the refusal data), and the
+//   gas it used.
+//
+//   If ANY step needs something our copy of the chain doesn't have, the whole
+//   answer is "unknown" plus the list of missing items. Never a guess.
+//
+// Files:
+//   types (this file)   requests / answers shared by everything below
+//   overrides.rs        geth-style pretend-state (code, balance, nonce, state, stateDiff)
+//   db.rs               connects revm to our state view (+ overrides), detects misses
+//   rawtx.rs            decodes signed transactions and recovers who sent them
+//   run.rs              run_calls(): the main entry point
+//   search.rs           size_search(): finds the most profitable trade size
+//   proto_types.rs      socket request/answer shapes + handle_call/handle_size_search
+//   fixture.rs, cli.rs  test files (fixtures) and the check-fixture/bench-fixture commands
 // ============================================================================
+use revm::primitives::{Address, Bytes, U256};
+
+use crate::state::MissItem;
+
+pub mod cli;
+pub mod db;
+pub mod fixture;
+pub mod hexutil;
+pub mod overrides;
+pub mod proto_types;
+pub mod rawtx;
+pub mod run;
+pub mod search;
+
+pub use overrides::{AccountOverride, Overrides};
+pub use run::{run_calls, run_calls_opts, CheckOptions, Session};
+pub use search::{size_search, SizeSearchAmounts, SizeSearchBest, SizeSearchResult, SizeTemplate, SizeTry};
+
+/// Gas used for a call that doesn't say (same as geth's default eth_call cap).
+pub const DEFAULT_CALL_GAS: u64 = 50_000_000;
+
+/// One call to run, eth_call style.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CallReq {
+    /// Who the call is "from" (geth default: the zero address).
+    pub from: Address,
+    /// Contract to call. None = contract creation (data = init code).
+    pub to: Option<Address>,
+    pub data: Bytes,
+    /// Gas limit. None = DEFAULT_CALL_GAS.
+    pub gas: Option<u64>,
+    pub value: U256,
+}
+
+/// What one call did.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CallOutcome {
+    /// true = finished normally; false = reverted / halted / invalid.
+    pub success: bool,
+    /// Return data on success, revert data on revert, empty on a halt.
+    pub output: Bytes,
+    /// Gas used at transaction level (includes the 21,000 base + calldata
+    /// cost, after refunds): the same number eth_simulateV1 / callTracer give.
+    pub gas_used: u64,
+    /// Why it stopped abnormally (out of gas, invalid opcode, invalid tx...).
+    /// None for success and for a normal revert.
+    pub halt: Option<String>,
+}
+
+/// Why a check could not give a sure answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnknownReason {
+    /// Our copy of the chain is missing something the check needed.
+    Miss,
+    /// The check touched an Arbitrum built-in contract we don't imitate.
+    UnsupportedPrecompile,
+    /// A signed transaction of a kind we can't replay (blob, 7702, Arbitrum system).
+    UnsupportedTx,
+    /// The request itself was malformed (bad hex, both state and stateDiff, ...).
+    BadRequest,
+    /// Anything else that went wrong inside the engine.
+    Engine,
+}
+
+impl UnknownReason {
+    /// Wire name used in socket answers (`"unknown": "<this>"`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            UnknownReason::Miss => "miss",
+            UnknownReason::UnsupportedPrecompile => "unsupported_precompile",
+            UnknownReason::UnsupportedTx => "unsupported_tx",
+            UnknownReason::BadRequest => "bad_request",
+            UnknownReason::Engine => "engine_error",
+        }
+    }
+}
+
+/// "Can't answer for sure": why, and (for misses) exactly what to fetch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CheckUnknown {
+    pub reason: UnknownReason,
+    /// Items our state didn't have (fetch these, then ask again).
+    pub missing: Vec<MissItem>,
+    /// Short human-readable detail for logs.
+    pub detail: String,
+}
+
+impl CheckUnknown {
+    pub fn new(reason: UnknownReason, detail: impl Into<String>) -> Self {
+        CheckUnknown { reason, missing: Vec::new(), detail: detail.into() }
+    }
+    pub fn bad_request(detail: impl Into<String>) -> Self {
+        Self::new(UnknownReason::BadRequest, detail)
+    }
+}
+
+impl std::fmt::Display for CheckUnknown {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {} ({} missing)", self.reason.as_str(), self.detail, self.missing.len())
+    }
+}
