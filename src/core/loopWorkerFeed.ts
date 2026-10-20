@@ -1,3 +1,4 @@
+import type { CoinTaxConfig } from './coinTax';
 import type { PoolState } from './types';
 import type { ConfirmedInfo } from './poolCache';
 import type { TriggerTrade, LoopFixSwitches } from './loopPrices';
@@ -100,6 +101,8 @@ export interface LoopWorkerInit {
   fixedClock?: boolean;        // tests: the worker's clock = the batch's `now`
   testHooks?: boolean;         // tests: allow the 'crash' message and fake checks
   fakeCheck?: 'loss' | 'profit' | 'fail';
+  // COIN TAX TEST (Oct 20, core/coinTax.ts). Missing = off.
+  tax?: { cfg: CoinTaxConfig; file: string | null };
   // Tests: finder time limits (Infinity = the answer never depends on machine speed).
   testFinder?: { updateBudgetMs?: number; sliceMs?: number };
 }

@@ -55,6 +55,24 @@ export function modelVsCheckText(cv: LoopCheckSummary): string | null {
   return `model vs check (profit before gas, by timing): ${parts.join('; ')}`;
 }
 
+// "coins tax-tested 41 (taxed 2: MCD, XYZ; blocked 0), pools left out 6,
+// waiting for coin test 3, benched routes 4 (now 2), skipped benched 120".
+// COIN TAX TEST + ROUTE MEMORY (Oct 20). null = both off.
+export function coinsText(h: LoopHour): string | null {
+  const c = h.coins;
+  if (!c) return null;
+  const parts: string[] = [];
+  if (c.tax) {
+    const names = c.tax.taxedNames.length ? `: ${c.tax.taxedNames.join(', ')}` : '';
+    parts.push(`coins tax-tested ${c.tax.tested} (taxed ${c.tax.taxed}, blocked ${c.tax.blocked}${names})`);
+    if (c.taxPools) parts.push(`pools left out ${c.taxPools}`);
+    if (c.waitTest) parts.push(`waiting for coin test ${c.waitTest}`);
+    if (c.tax.waiting) parts.push(`coin tests queued ${c.tax.waiting}`);
+  }
+  if (c.benchStarts || c.benchedNow || c.benchedSkips) parts.push(`benched routes ${c.benchStarts} (now ${c.benchedNow}), skipped benched ${c.benchedSkips}`);
+  return parts.length ? parts.join(', ') : null;
+}
+
 // ONE plain log line with the loop numbers, for the status page
 // (deploy/status-report.js reads the bot's log, it can't see Telegram).
 //   label: "hour" for the full hour (logged when the hourly report takes the
@@ -78,6 +96,8 @@ export function loopLogLine(h: LoopHour, maxPools: number, label: string, node?:
   if (h.skippedCap) parts.push(`not checked ${h.skippedCap}`);
   parts.push(`by length ${lens.join(' ')}`);
   if (node) parts.push(node);
+  const coins = coinsText(h);
+  if (coins) parts.push(coins); // plain text (escaped only in the Telegram block)
   // The model vs check text is written for Telegram (HTML escaped): undo that.
   const mvc = h.checkVsEstimate ? modelVsCheckText(h.checkVsEstimate) : null;
   const plain = (s: string) => s.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&').replace(/\s*\n\s*/g, ' ');
@@ -96,6 +116,8 @@ export function formatLoopHour(h: LoopHour, maxPools: number, extra?: { fresh: n
   const mvc = cv ? modelVsCheckText(cv) : null;
   if (mvc) L.push(`  ${mvc}`);
   if (h.skippedCap) L.push(`  not checked (loop check limit or line busy): ${h.skippedCap}`);
+  const coins = coinsText(h);
+  if (coins) L.push(`  ${esc(coins)}`);
   if (h.cantRunWhy.length) L.push(`  can't run because: ${h.cantRunWhy.slice(0, 3).map(([w, n]) => `${esc(w)} ${n}`).join('; ')}`);
   h.topRoutes.forEach((r, i) => L.push(`  ${i + 1}) ${esc(r.label)}: ${r.n}x, best ${money(r.bestUsd)}`));
   const rv = h.rival;
