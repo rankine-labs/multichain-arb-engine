@@ -1,0 +1,32 @@
+# ---------------------------------------------------------------------------
+# revm-bench: candidate engine #2 for the "run ArbExecutor locally" speed test.
+# One binary, two modes:  `bench <fixture>`  and  `serve <fixture> <socket>`.
+# ---------------------------------------------------------------------------
+[package]
+name = "revm-bench"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# revm 43.0.3 = latest stable on crates.io as of 2026-10-20.
+# Default features minus "tracer" (we don't trace), plus the "optional_*" switches
+# that let us behave like eth_call: no base-fee check, no balance check,
+# no block-gas-limit check, allow calls "from" an address that has code.
+revm = { version = "=43.0.3", default-features = false, features = [
+    "std", "secp256k1", "portable", "c-kzg", "blst",
+    "optional_no_base_fee", "optional_balance_check",
+    "optional_block_gas_limit", "optional_eip3607",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Release build: full optimisation, link-time optimisation, single codegen unit
+# (slower compile, faster binary), abort on panic (smaller/faster; a crash just
+# restarts the sidecar).
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = false
+strip = true
