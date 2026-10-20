@@ -93,7 +93,8 @@ import { GasModel, GasCalibration, gasSettingsFromEnv, routeKeyFor, twoPoolKey, 
 import { recordEventFee, eventFeeCounts, feeFromEventsOn, setHeadBlockSource, currentHeadBlock } from './core/eventFees';
 import { OwnMoneyBook, useOwnMoney, fitTradeToWallet } from './core/ownMoney';
 import { readIncludesTrade } from './core/tradeInclusion';
-import { checkFirstOn, waitForTrade, decideCheckFirst } from './core/checkFirst';
+import { checkFirstOn, waitForTrade, decideCheckFirst, checkLoanPips, extraLoanFeeUsd } from './core/checkFirst';
+import { WhyNotSent, formatWhyNotSent } from './report/whyNotSent';
 import { BlockReader, PoolUpdate } from './core/blockReader';
 import { AutoVet, CheckOutcome } from './core/autoVet';
 import { FailTally } from './core/failReasons';
@@ -166,7 +167,7 @@ import { makeRpc, simulateRoundTrip, simulateWithRecheck, simRpcUrl, Rpc, makeFa
 import { FastSender, SafetyGate, safetyConfigFromEnv } from './execution/fastSender';
 import { DEFAULT_FILTER_CONFIG } from './core/fastFilter';
 import { checkLiveReady } from './execution/liveReadiness';
-import { LiveTradeTracker } from './execution/liveTracker';
+import { LiveTradeTracker, Funding } from './execution/liveTracker';
 import { LiveTradeLog } from './execution/liveTradeLog';
 import { SafetyAlerts } from './execution/safetyAlerts';
 import { AlertHooks } from './report/alertHooks';
@@ -181,7 +182,7 @@ import { StableTally, parseStableEnv } from './core/stableTally';
 // Hourly report version 2 (Oct 15, reporting only): money ledgers, the new
 // plain hourly message and the 4-hour accumulator (src/report/).
 import { MoneyLedgers, RealMoneyLedger, hourMoneyOf } from './report/ledgers';
-import { hourlyMessage, reportV2On, HourlyReportInput, FULL_HOUR_MIN_MS, overallVerdict } from './report/hourlyReport';
+import { hourlyMessage, reportV2On, HourlyReportInput, FULL_HOUR_MIN_MS, overallVerdict, esc as escHtml } from './report/hourlyReport';
 import { liveLayoutOn, LiveTradeBook, WalletWatch, formatLiveTrade, formatLiveHourly, formatLive4h, gasLowSpec, walletChangedSpec } from './report/liveTelegram';
 import { FailoverJsonRpcProvider } from './core/failoverRpc';
 import { makeCaller } from './core/universeScan';
@@ -566,20 +567,34 @@ const simDisabled: Record<string, { reason: string; until: number }> = {};
 // Pairs tested 3+ times without a real win are benched for 6 h. Saved to disk.
 const ROUTE_FILE = 'data/route-scores.json';
 const routeScores = new RouteScores();
-// Double-count guard counters (logged every 10 min): fresh reads that already
-// had the followed trade in them vs reads still from before it.
+// WHY NOT SENT (report/whyNotSent.ts, Oct 20): every 10 min, one line in the log
+// and (live layout) Telegram: chances that reached the send step, how many were
+// sent, and why the rest stopped. Quiet when nothing happened. Reporting only.
+const whyNotSent = new WhyNotSent();
+const WHY_NOT_SENT_MIN = 10;
+setInterval(() => {
+      try {
+            const line = formatWhyNotSent(whyNotSent.take(), WHY_NOT_SENT_MIN);
+            if (!line) return;
+            console.log(`[why-not-sent] ${line}`);
+            if (robinhoodSender.live && LIVE_LAYOUT && process.env.WHY_NOT_SENT_TELEGRAM !== '0') void sendTelegramMessage(`🟢 LIVE · ${escHtml(line)}`).catch(() => undefined);
+      } catch { /* reporting only */ }
+}, WHY_NOT_SENT_MIN * 60_000);
 // Check first, then send (core/checkFirst.ts): what happened to live "follow a
 // trade" sends in the last 10 min (passed = sent after a winning real check).
-const checkFirstStats = { passed: 0, refused: 0, noLanding: 0, ms: [] as number[] };
+const checkFirstStats = { passed: 0, refused: 0, noLanding: 0, ms: [] as number[], waitMs: [] as number[], checkMs: [] as number[] };
+// How often check-first asks "has the followed trade landed?" (ms). Was 150.
+const CHECK_FIRST_POLL_MS = Math.max(20, Number(process.env.CHECK_FIRST_POLL_MS ?? 50));
 setInterval(() => {
       const s = checkFirstStats;
       if (s.passed || s.refused || s.noLanding) {
-            const sorted = [...s.ms].sort((a, b) => a - b);
-            const med = sorted.length ? sorted[Math.floor(sorted.length / 2)] : 0;
-            console.log(`[check-first] last 10 min: sent ${s.passed}, refused by the real check ${s.refused}, followed trade not landed in time ${s.noLanding} (median wait+check ${med} ms)`);
+            const median = (xs: number[]) => { const a = [...xs].sort((x, y) => x - y); return a.length ? a[Math.floor(a.length / 2)] : 0; };
+            console.log(`[check-first] last 10 min: sent ${s.passed}, refused by the real check ${s.refused}, followed trade not landed in time ${s.noLanding} (median wait+check ${median(s.ms)} ms = wait ${median(s.waitMs)} + check ${median(s.checkMs)})`);
       }
-      s.passed = s.refused = s.noLanding = 0; s.ms = [];
+      s.passed = s.refused = s.noLanding = 0; s.ms = []; s.waitMs = []; s.checkMs = [];
 }, 10 * 60_000);
+// Double-count guard counters (logged every 10 min): fresh reads that already
+// had the followed trade in them vs reads still from before it.
 const tradeInclusionStats = { included: 0, notYet: 0 };
 setInterval(() => { if (tradeInclusionStats.included || tradeInclusionStats.notYet) console.log(`[double-count] last 10 min: fresh read already had the trade ${tradeInclusionStats.included}x (not applied again), still before it ${tradeInclusionStats.notYet}x`); tradeInclusionStats.included = tradeInclusionStats.notYet = 0; }, 10 * 60_000);
 // LIVE ROUTE BLOCK (core/routeScore.ts, Oct 19): one failed/losing real check
@@ -1424,7 +1439,7 @@ const walletWatch = new WalletWatch(liveBook, (coin, dropped) => {
 const liveGas: { eth: number | null; tradesLeft: number | null } = { eth: null, tradesLeft: null };
 const LIVE_GAS_LOW_TRADES = Number(process.env.LIVE_GAS_LOW_TRADES ?? 20);
 // One real trade's final result: book it and send the ✅ / ❌ message.
-const sendLiveTradeMessage = (r: { status: 'profit' | 'reverted' | 'dropped'; label: string; gasUsd: number; profitUsd?: number; sizeUsd?: number }) => {
+const sendLiveTradeMessage = (r: { status: 'profit' | 'reverted' | 'dropped'; label: string; gasUsd: number; profitUsd?: number; sizeUsd?: number; funding?: Funding }) => {
       if (!LIVE_LAYOUT) return;
       try {
             liveBook.add(r);
@@ -2036,14 +2051,23 @@ const fireTrade = async (o: {
       triggerHash?: string;
 }) => {
       try {
+            // WHY NOT SENT (report/whyNotSent.ts): every live chance that gets here is
+            // counted, and so is its outcome (sent, or the reason it stopped).
+            const liveRh = o.chain === 'robinhood' && robinhoodSender.live;
+            if (liveRh) whyNotSent.chance();
             // Hard stop: never build a trade on an exchange that isn't cleared
             // for trading (config/robinhoodVenues.ts executionEnabled: false).
             const notLive = liveBlocker(o.buyPool, o.sellPool);
             if (notLive) {
                   console.log(`[exec-dryrun] ${o.chain} NOT executable: ${notLive}`);
+                  if (liveRh) whyNotSent.blocked(`exchange not live yet: ${notLive}`);
                   return;
             }
-            const block = (r: string) => { fireStats.blocked.set(r, (fireStats.blocked.get(r) ?? 0) + 1); };
+            const block = (r: string) => {
+                  fireStats.blocked.set(r, (fireStats.blocked.get(r) ?? 0) + 1);
+                  // Live: also into the 10-min "why not sent" line and the status page's file.
+                  if (liveRh) { whyNotSent.blocked(r); liveTradeLog.noteBlocked(r); }
+            };
             // LIVE ROUTE BLOCK: a pair whose real check failed / lost, or whose live
             // trade failed, in the last 6 h is not sent for real (no $1 bypass).
             // Trigger trades only: sitting gaps are sent right after a fresh real
@@ -2085,41 +2109,52 @@ const fireTrade = async (o: {
             // CHECK FIRST, THEN SEND (core/checkFirst.ts, Oct 19, owner approved).
             // Live "follow a trade" sends: wait for the followed trade to land,
             // run the real check of our exact trade, send only if it makes money.
-            // (Before: sent on the guess first; the check said WIN 0 times in 360.)
+            // (Before: sent on the guess first; only about 1 in 5 guesses is a real win.)
             if (o.chain === 'robinhood' && robinhoodSender.live && o.source === 'trade' && checkFirstOn()) {
                   const startedMs = Date.now();
-                  const landed = await waitForTrade(simRpc.robinhood, o.triggerHash ?? '', RH_TRIGGER_POLL_MS, RH_TRIGGER_MAX_POLLS);
+                  // Ask the SAME node that runs the check (simRpc): if another node saw the
+                  // block first, the check could still run on the state before the trade.
+                  // Polled every CHECK_FIRST_POLL_MS (50 ms; was 150 ms), for up to ~1.8 s.
+                  const landed = await waitForTrade(simRpc.robinhood, o.triggerHash ?? '', CHECK_FIRST_POLL_MS, Math.ceil(1_800 / CHECK_FIRST_POLL_MS));
+                  const waitMs = Date.now() - startedMs;
                   markStretch('check-first wait');
                   if (!landed) {
                         checkFirstStats.noLanding++;
                         block('check first: followed trade not in a block in time');
                         return;
                   }
+                  // Live check-first: one simulation on the checking node, no second "free node"
+                  // re-check unless the first answer is a reasonless failure (it only ever turns
+                  // those into a clearer answer; a win or a loss is never re-asked).
                   const c = await checkRoundTrip('robinhood', o.tokenIn, o.buyPool, o.sellPool, o.tradeSizeUsd, o.usdPerTokenIn);
+                  const checkMs = Date.now() - startedMs - waitMs;
                   markStretch('check-first result');
                   const v = decideCheckFirst(c, rhGasUsd(0.05), MIN_NET_PROFIT_USD, o.netProfitUsd);
                   const label = `${symbolOf(o.chain, o.tokenIn)}/${symbolOf(o.chain, o.tokenOut)} ${o.buyPool.dex}>${o.sellPool.dex}`;
                   const tookMs = Date.now() - startedMs;
-                  checkFirstStats.ms.push(tookMs);
-                  if (checkFirstStats.ms.length > 200) checkFirstStats.ms.shift();
+                  checkFirstStats.ms.push(tookMs); checkFirstStats.waitMs.push(waitMs); checkFirstStats.checkMs.push(checkMs);
+                  if (checkFirstStats.ms.length > 200) { checkFirstStats.ms.shift(); checkFirstStats.waitMs.shift(); checkFirstStats.checkMs.shift(); }
                   if (!v.send) {
                         checkFirstStats.refused++;
-                        console.log(`[check-first] NOT SENT ${label}: guess $${o.netProfitUsd.toFixed(2)}, ${v.why} (${tookMs} ms)`);
+                        console.log(`[check-first] NOT SENT ${label}: guess $${o.netProfitUsd.toFixed(2)}, ${v.why} (${tookMs} ms: wait ${waitMs} + check ${checkMs})`);
                         if (v.blockPair) liveBlocks.block(o.buyPool.poolAddress, o.sellPool.poolAddress, v.why);
                         block(`check first: ${v.why.replace(/\$[\d.]+/g, '$N')}`);
                         return;
                   }
                   checkFirstStats.passed++;
-                  console.log(`[check-first] PASSED ${label}: guess $${o.netProfitUsd.toFixed(2)}, real check $${v.netUsd.toFixed(2)} after gas (${tookMs} ms), sending`);
+                  console.log(`[check-first] PASSED ${label}: guess $${o.netProfitUsd.toFixed(2)}, real check $${v.netUsd.toFixed(2)} after gas (${tookMs} ms: wait ${waitMs} + check ${checkMs}), sending`);
                   // Never send on more than the check found; the outlier guard sees the check's number.
-                  o = { ...o, netProfitUsd: v.netUsd, checkedProfitUsd: v.netUsd };
+                  // The check already ran WITH the loan (same pickLender choice), so its profit is
+                  // after the loan fee: record the fee it used, so the fee line below doesn't take
+                  // it off a second time (Oct 20 fix: it was counted twice on flash-loan trades).
+                  o = { ...o, netProfitUsd: v.netUsd, checkedProfitUsd: v.netUsd, plannedLoanPips: checkLoanPips(c) };
             }
             // Own money or loan (same choice as the practice check, see pickLender).
             const lender = pickLender(o.chain, o.tokenIn, o.buyPool, o.sellPool, o.tradeSizeUsd, o.usdPerTokenIn);
             let netProfitUsd = o.netProfitUsd;
             if (o.chain === 'robinhood') {
                   const actualPips = lender ? (lender.feePips ?? lender.feeBps * 100) : 0;
-                  netProfitUsd -= o.tradeSizeUsd * Math.max(0, actualPips - o.plannedLoanPips) / 1_000_000;
+                  netProfitUsd -= extraLoanFeeUsd(o.tradeSizeUsd, actualPips, o.plannedLoanPips);
             }
             // The one send minimum, for every kind of trade (trigger and
             // sitting gap): MIN_NET_PROFIT_USD ($0.25 default since Oct 16) after all costs.
@@ -2138,7 +2173,7 @@ const fireTrade = async (o: {
                   ...executorConfig(o.chain),
                   v3Lender: lender?.poolAddress,
             });
-            if ('reason' in dry) { console.log(`[exec-dryrun] ${o.chain} NOT executable: ${dry.reason}`); return; }
+            if ('reason' in dry) { console.log(`[exec-dryrun] ${o.chain} NOT executable: ${dry.reason}`); if (liveRh) whyNotSent.blocked(`trade couldn't be built: ${dry.reason}`); return; }
             if (o.chain === 'robinhood' && robinhoodSender.live) {
                   // No fresh block number = no safe deadline: don't send.
                   if (robinhoodSender.deadlineBlock() === null) { block('block info stale'); return; }
@@ -2197,7 +2232,7 @@ const fireTrade = async (o: {
             if (!gate.ok) {
                   const r = 'reason' in gate ? gate.reason.replace(/\$\d+/g, '$N').replace(/0x[0-9a-f]+/gi, '0x…') : 'blocked';
                   fireStats.blocked.set(r, (fireStats.blocked.get(r) ?? 0) + 1);
-                  if (robinhoodSender.live) { liveTradeLog.noteBlocked(r); safetyAlerts.onBlocked('reason' in gate ? gate.reason : '', safetyGate.lossTodayUsd(true)); }
+                  if (robinhoodSender.live) { liveTradeLog.noteBlocked(r); whyNotSent.blocked(r); safetyAlerts.onBlocked('reason' in gate ? gate.reason : '', safetyGate.lossTodayUsd(true)); }
                   return;
             }
             if (robinhoodSender.live && !dry.to) {
@@ -2219,17 +2254,23 @@ const fireTrade = async (o: {
             const readyMs = (fired.signedAtMs ?? Date.now()) - o.seenAtMs;
             if (o.source === 'trade') fireStats.readyMs.push(readyMs);
             const tradeLabel = `${symbolOf(o.chain, o.tokenIn)}/${symbolOf(o.chain, o.tokenOut)} ${o.buyPool.dex}>${o.sellPool.dex}`;
-            if (fired.live && !fired.txHash && fired.error) { liveTradeLog.sendFailed(tradeLabel, o.tradeSizeUsd, fired.error); alertHooks.liveSendFailed(tradeLabel, fired.error); }
+            if (fired.live && !fired.txHash && fired.error) { liveTradeLog.sendFailed(tradeLabel, o.tradeSizeUsd, fired.error); alertHooks.liveSendFailed(tradeLabel, fired.error); whyNotSent.blocked('node refused the send'); }
+            // How this trade is paid for (Oct 20): own money, or a flash loan and its fee.
+            const lenderPips = lender ? (lender.feePips ?? lender.feeBps * 100) : 0;
+            const funding: Funding = dry.funding === 'v3-flash'
+                  ? { kind: 'flash', feePct: lenderPips / 10_000, feeUsd: o.tradeSizeUsd * lenderPips / 1_000_000 }
+                  : { kind: 'own' };
             if (fired.txHash) {
                   fireStats.sent++;
-                  liveTradeLog.sent(fired.txHash, tradeLabel, o.tradeSizeUsd, netProfitUsd);
+                  if (fired.live) whyNotSent.sent();
+                  liveTradeLog.sent(fired.txHash, tradeLabel, o.tradeSizeUsd, netProfitUsd, funding);
                   // Our balances change when it lands: re-read them a few seconds later.
                   setTimeout(() => { void refreshOwnMoney(); }, 3_000);
                   // Worst-case gas (2x today's cost) held against the daily loss cap until the receipt.
                   safetyGate.reservePending(fired.txHash, 2 * rhGasUsd(0.05));
                   livePools.set(fired.txHash, [o.buyPool.poolAddress, o.sellPool.poolAddress]);
                   if (livePools.size > 500) livePools.delete(livePools.keys().next().value as string);
-                  liveTracker.track(fired.txHash, { expectedProfitUsd: netProfitUsd, label: tradeLabel, sizeUsd: o.tradeSizeUsd, routeKey: routeKeyFor(dry.hops.map((h) => h.kind), dry.funding === 'v3-flash') });
+                  liveTracker.track(fired.txHash, { expectedProfitUsd: netProfitUsd, label: tradeLabel, sizeUsd: o.tradeSizeUsd, funding, routeKey: routeKeyFor(dry.hops.map((h) => h.kind), dry.funding === 'v3-flash') });
             }
             console.log(`[fire] robinhood ${fired.live ? 'LIVE' : 'DRY RUN'} (${o.source}) ready ${readyMs}ms after ${o.source === 'trade' ? 'the trigger' : 'the price update'} (sign ${fired.signMs.toFixed(1)}ms)` +
                   `${fired.txHash ? ` tx ${fired.txHash}` : ''}${fired.error ? ` error: ${fired.error}` : ''}`);
@@ -4149,6 +4190,7 @@ for (let i = 0; i < resolved.length; i++) {
                                           return { coin: c.coin, usd: Math.min(OWN_MONEY_MAX_USD, MAX_TRADE_USD, ownMoney.availableUsd(c.address, px, dec)) };
                                     }),
                                     bot: { ok: verdict.mark === '✅' && v2Input.feedOk !== false, text: verdict.text },
+                                    loans: liveBook.loanSplit(fromMs, now),
                               }));
                         } else if (sendHourly) await sendTelegramMessage(hourlyMessage(REPORT_V2, v2Input, hourInput));
                   } else if (sendHourly) await sendTelegramMessage(formatHourlyDigest({
@@ -4345,6 +4387,7 @@ for (let i = 0; i < resolved.length; i++) {
                               tz: REPORT_4H_TZ, fromMs, toMs: now, keptUsd: w.usd, won: w.won, missed: w.missed,
                               best: b.best, gasUsd: w.gas, byHour: b.byHour, topPairs: b.topPairs,
                               found: Number.isFinite((totals as any)?.funnel?.found) ? (totals as any).funnel.found : null,
+                              loans: liveBook.loanSplit(fromMs, now),
                         });
                         msgs = process.env.LIVE_TELEGRAM_DETAIL === '1' ? [live4h, ...detail] : [live4h];
                   }

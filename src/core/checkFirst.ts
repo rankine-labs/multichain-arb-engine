@@ -70,3 +70,18 @@ export function decideCheckFirst(c: CheckAnswer, gasUsd: number, minUsd: number,
   if (!(net >= minUsd)) return no(`real check: only $${checkNet.toFixed(2)} after gas (under the $${minUsd.toFixed(2)} minimum)`, checkNet <= 0);
   return { send: true, netUsd: net, why: '', blockPair: false };
 }
+
+// Loan fee (pips, 100 = 0.01%) the real check traded with: 0 for own money.
+// The check's profit is already AFTER this fee, so the send path must not take
+// it off again (Oct 20: it did, so flash-loan trades looked smaller than they
+// were and borderline ones were skipped).
+export function checkLoanPips(c: unknown): number {
+  const p = (c as { status?: string; loanPips?: unknown })?.status === 'profit' ? (c as { loanPips?: unknown }).loanPips : 0;
+  return typeof p === 'number' && Number.isFinite(p) && p > 0 ? p : 0;
+}
+
+// Fee taken off at send time: only the part of the loan fee that wasn't
+// already counted when the profit was worked out (same rule as shadowMain).
+export function extraLoanFeeUsd(sizeUsd: number, actualPips: number, plannedPips: number): number {
+  return sizeUsd * Math.max(0, actualPips - plannedPips) / 1_000_000;
+}

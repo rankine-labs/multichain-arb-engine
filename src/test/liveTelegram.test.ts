@@ -5,7 +5,7 @@ import { tmpdir } from 'os';
 import { join } from 'path';
 import {
   formatLiveTrade, formatLiveHourly, formatLive4h, LiveTradeBook, WalletWatch,
-  splitLabel, signedUsd, bar, liveLayoutOn, gasLowSpec, walletChangedSpec,
+  splitLabel, signedUsd, bar, liveLayoutOn, gasLowSpec, walletChangedSpec, paidWithText, loanSplitLines,
 } from '../report/liveTelegram';
 
 function assert(cond: boolean, msg: string) {
@@ -144,4 +144,38 @@ assert(liveLayoutOn({}) && !liveLayoutOn({ TELEGRAM_LIVE_LAYOUT: '0' }), 'switch
   assert(book.startOf('WETH') === 0.0067 && drops.length === 1, 'wallet: first deposit into an empty coin');
   ww.observe('USDG', NaN);
   assert(ww.now('USDG') === 285.39, 'wallet: a bad read is ignored');
+}
+
+// --- Oct 20: how each live trade was paid for (own money / flash loan + fee) ---
+{
+  assert(paidWithText({ kind: 'own' }) === 'your money', 'paid with: your money');
+  assert(paidWithText({ kind: 'flash', feePct: 0.01, feeUsd: 0.04 }) === 'flash loan (0.01% pool), fee $0.04', 'paid with: flash loan, pool and fee');
+  assert(paidWithText(undefined) === null, 'paid with: unknown -> no line');
+
+  const wonFlash = formatLiveTrade({ status: 'profit', label: 'WETH/AI fables>uniswap-v3', gasUsd: 0.02, profitUsd: 1.84, sizeUsd: 385, today: { usd: 1.82, won: 1, missed: 0 }, funding: { kind: 'flash', feePct: 0.01, feeUsd: 0.0385 } });
+  console.log(wonFlash);
+  assert(wonFlash.includes('Paid w/  flash loan (0.01% pool), fee $0.04') && wonFlash.includes('Profit shown is after the loan fee.'), 'won with a flash loan: shows the loan, its fee, and that profit is after it');
+  const wonOwn = formatLiveTrade({ status: 'profit', label: 'WETH/USDG', gasUsd: 0.02, profitUsd: 0.4, sizeUsd: 49, today: { usd: 0.38, won: 1, missed: 0 }, funding: { kind: 'own' } });
+  assert(wonOwn.includes('Paid w/  your money') && !wonOwn.includes('loan fee'), 'won with own money: says so, no loan note');
+  const revFlash = formatLiveTrade({ status: 'reverted', label: 'USDG/GLD a>b', gasUsd: 0.02, today: { usd: -0.02, won: 0, missed: 1 }, funding: { kind: 'flash', feePct: 0.01, feeUsd: 0.05 } });
+  assert(revFlash.includes('no loan fee paid'), 'failed flash trade: the loan was cancelled, no fee');
+  const oldStyle = formatLiveTrade({ status: 'profit', label: 'WETH/USDG', gasUsd: 0.02, profitUsd: 0.4, today: { usd: 0.38, won: 1, missed: 0 } });
+  assert(!oldStyle.includes('Paid w/'), 'no funding info (older trades): message unchanged');
+
+  // Book: flash vs own split for the hourly / 4-hour line.
+  let t = 1_000_000;
+  const book = new LiveTradeBook(null, 'America/Toronto', () => t);
+  book.add({ status: 'profit', label: 'WETH/AI x>y', gasUsd: 0.02, profitUsd: 1.84, funding: { kind: 'flash', feePct: 0.01, feeUsd: 0.04 } }); t += 1;
+  book.add({ status: 'reverted', label: 'USDG/GLD x>y', gasUsd: 0.02, funding: { kind: 'flash', feePct: 0.01, feeUsd: 0.05 } }); t += 1;
+  book.add({ status: 'profit', label: 'WETH/USDG x>y', gasUsd: 0.02, profitUsd: 0.10, funding: { kind: 'own' } }); t += 1;
+  book.add({ status: 'profit', label: 'OLD/USDG', gasUsd: 0.02, profitUsd: 0.5 }); t += 1; // no funding: left out of the split
+  const sp = book.loanSplit(0, t);
+  assert(sp.flash.n === 2 && Math.abs(sp.flash.feesUsd - 0.04) < 1e-9 && Math.abs(sp.flash.keptUsd - (1.82 - 0.02)) < 1e-9, 'split: 2 flash trades, fee only on the one that went through ($0.04), kept +$1.80');
+  assert(sp.own.n === 1 && Math.abs(sp.own.keptUsd - 0.08) < 1e-9, 'split: 1 own-money trade, kept +$0.08');
+  const lines = loanSplitLines(sp)!;
+  console.log('  ' + lines.join('\n  '));
+  assert(lines[0] === 'Flash loans  2 trades · fees $0.04 · kept +$1.80 (after fees)' && lines[1] === 'Your money   1 trade · kept +$0.08', 'split lines read plainly');
+  assert(loanSplitLines({ flash: { n: 0, feesUsd: 0, keptUsd: 0 }, own: { n: 0, keptUsd: 0 } }) === null, 'no known-funding trades: no lines');
+  const hourly = formatLiveHourly({ tz: 'America/Toronto', fromMs: 0, toMs: 3600_000, partial: null, hour: { usd: 1.88, won: 2, missed: 1 }, todayUsd: 1.88, sinceStartUsd: 1.88, wallet: [], gas: { eth: 0.002, tradesLeft: 100 }, loss: { usedUsd: 0.02, capUsd: 25 }, biggestTrade: [], bot: { ok: true, text: '' }, loans: sp });
+  assert(hourly.includes('Flash loans  2 trades'), 'hourly shows the flash loan line');
 }

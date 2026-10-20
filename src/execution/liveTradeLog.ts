@@ -1,6 +1,6 @@
 import { appendFileSync, existsSync, mkdirSync, renameSync, statSync } from 'fs';
 import { dirname } from 'path';
-import type { LiveResult } from './liveTracker';
+import type { LiveResult, Funding } from './liveTracker';
 
 // ============================================================================
 // LIVE TRADE LOG -- a small file that records every real (live) send
@@ -40,6 +40,18 @@ export interface LiveTradeRecord {
   netUsd?: number;           // profit after gas: won = profit - gas, reverted = -gas, dropped = 0
   error?: string;            // send_failed only
   counts?: Record<string, number>; // blocked only: reason -> how many
+  // How it was paid for (sent / result, Oct 20): 'own' money or a 'flash' loan,
+  // with the lender's fee in percent and that fee on this trade in dollars.
+  funding?: 'own' | 'flash';
+  loanFeePct?: number;
+  loanFeeUsd?: number;
+}
+
+// The funding fields as they go into the file (nothing for unknown funding).
+function fundingFields(f?: Funding): Pick<LiveTradeRecord, 'funding' | 'loanFeePct' | 'loanFeeUsd'> {
+  if (!f) return {};
+  if (f.kind === 'own') return { funding: 'own' };
+  return { funding: 'flash', ...(Number.isFinite(f.feePct) ? { loanFeePct: round(f.feePct as number, 4) } : {}), ...(Number.isFinite(f.feeUsd) ? { loanFeeUsd: round(f.feeUsd as number, 4) } : {}) };
 }
 
 export class LiveTradeLog {
@@ -77,8 +89,8 @@ export class LiveTradeLog {
   }
 
   // A real trade went out (we have a tx hash).
-  sent(hash: string, label: string, sizeUsd: number, expectedProfitUsd: number) {
-    this.append({ kind: 'sent', hash, label, sizeUsd: round(sizeUsd), expectedProfitUsd: round(expectedProfitUsd, 4) });
+  sent(hash: string, label: string, sizeUsd: number, expectedProfitUsd: number, funding?: Funding) {
+    this.append({ kind: 'sent', hash, label, sizeUsd: round(sizeUsd), expectedProfitUsd: round(expectedProfitUsd, 4), ...fundingFields(funding) });
   }
 
   // The node refused the send: nothing reached the chain, no gas paid.
@@ -94,6 +106,7 @@ export class LiveTradeLog {
       kind: 'result', hash: r.hash, label: r.label, status,
       profitUsd: r.profitUsd === undefined ? (status === 'won' ? null : undefined) : round(r.profitUsd, 4),
       gasUsd: round(r.gasUsd, 4), netUsd: round(netUsd, 4), expectedProfitUsd: round(r.expectedProfitUsd, 4),
+      ...fundingFields(r.funding),
     });
   }
 

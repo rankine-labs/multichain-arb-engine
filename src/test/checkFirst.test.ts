@@ -78,3 +78,22 @@ const noSleep = async () => {};
   assert(!checkFirstOn(), 'TRIGGER_CHECK_FIRST=0 turns it off');
   if (old === undefined) delete process.env.TRIGGER_CHECK_FIRST; else process.env.TRIGGER_CHECK_FIRST = old;
 })();
+
+// --- Oct 20: the loan fee is counted ONCE on flash-loan trades ---
+import { checkLoanPips, extraLoanFeeUsd } from '../core/checkFirst';
+{
+  // The real check traded with the 0.01% lender (100 pips) and found $1.02 AFTER that fee.
+  const check = { status: 'profit', usd: 1.02, loanPips: 100 };
+  const planned = checkLoanPips(check);
+  const size = 400;
+  // Old code: planned pips were 0 for trigger trades, so the send path took the fee off again.
+  const oldExtra = extraLoanFeeUsd(size, 100, 0);
+  const newExtra = extraLoanFeeUsd(size, 100, planned);
+  assert(planned === 100, 'check reports the loan fee it used (100 pips = 0.01%)');
+  assert(Math.abs(oldExtra - 0.04) < 1e-12, 'old code: $0.04 taken off a second time on a $400 loan');
+  assert(newExtra === 0, 'new: nothing extra taken off (fee already in the check profit)');
+  // Lender changed to a pricier one between the check and the send: only the difference.
+  assert(Math.abs(extraLoanFeeUsd(size, 500, planned) - 0.16) < 1e-12, 'pricier lender at send time: only the extra $0.16 comes off');
+  assert(checkLoanPips({ status: 'profit', usd: 1, loanPips: 0 }) === 0, 'own money: no loan fee');
+  assert(checkLoanPips({ status: 'loss', reason: 'x' }) === 0 && checkLoanPips(undefined) === 0 && checkLoanPips({ status: 'profit', usd: 1, loanPips: NaN }) === 0, 'losses, nothing, or bad numbers: 0');
+}
