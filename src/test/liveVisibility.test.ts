@@ -146,12 +146,12 @@ assert(/### Live trades \(real money\)/.test(page), 'status: live section headin
 assert(/\| Sent \| 2 \| 3 \|/.test(page), 'status: sent this window (2) and today (3)');
 assert(/\| Landed and won \(profit after gas\) \| 0 \(\$0\.00\) \| 1 \(\+\$1\.00\) \|/.test(page), 'status: won count + profit after gas');
 assert(/\| Landed but reverted \(gas lost\) \| 1 \(\$0\.25\) \| 1 \(\$0\.25\) \|/.test(page), 'status: reverted count + gas lost (yesterday excluded)');
-assert(/\| Not sent: stopped by safety gate \| 6 \| 7 \|/.test(page), 'status: safety gate stops, window and today');
+assert(/\| Not sent \(all reasons, see below\) \| 6 \| 7 \|/.test(page), 'status: not-sent stops (all reasons), window and today');
 assert(/2x daily loss cap \$N reached/.test(page) && /4x send rate limit/.test(page), 'status: stops by reason');
 assert(/Net today: \+\$0\.75/.test(page), 'status: net today (1.00 - 0.25)');
 assert(/Daily loss used: \$0\.25 of \$1\.00 cap \(25%\)/.test(page), 'status: daily loss used vs cap');
-assert(/NVDA\/USDG v3>v2 \| \$400 \| waiting for receipt \| `0x333333…3333`/.test(page), 'status: newest trade first, pending, short hash');
-assert(/AAPL\/USDG v3>v2 \| \$900 \| reverted, gas lost \$0\.25/.test(page), 'status: reverted trade row');
+assert(/NVDA\/USDG v3>v2 \| \$400 \| - \| waiting for receipt \| `0x333333…3333`/.test(page), 'status: newest trade first, pending, short hash (no funding info: -)');
+assert(/AAPL\/USDG v3>v2 \| \$900 \| - \| reverted, gas lost \$0\.25/.test(page), 'status: reverted trade row');
 assert(/won \+\$1\.00 after gas/.test(page), 'status: won trade row');
 assert(!page.includes(String.fromCharCode(0x2014)), 'status: no em dashes in the section');
 const capPage: string = status.liveSection(read, { windowStart: win, now, capUsd: 0.2 }).join('\n');

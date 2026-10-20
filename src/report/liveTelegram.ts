@@ -88,6 +88,19 @@ export interface LiveTradeMsgIn {
   profitUsd?: number;     // profit before gas (from the contract's Executed event); undefined = no price
   sizeUsd?: number;       // dollars put in (from the send), if known
   today: DayCount;        // running totals INCLUDING this trade
+  // How it was paid for (Oct 20): own money, or a flash loan with its fee.
+  // The contract's profit is already after the loan fee.
+  funding?: { kind: 'own' | 'flash'; feePct?: number; feeUsd?: number };
+}
+
+// "Paid with" line for a trade message: "your money" or
+// "flash loan (0.01% pool), fee $0.04". null when not known.
+export function paidWithText(f?: LiveTradeMsgIn['funding']): string | null {
+  if (!f) return null;
+  if (f.kind === 'own') return 'your money';
+  const pct = Number.isFinite(f.feePct) ? ` (${(f.feePct as number).toFixed(2)}% pool)` : '';
+  const fee = Number.isFinite(f.feeUsd) ? `, fee ${usd(f.feeUsd as number)}` : '';
+  return `flash loan${pct}${fee}`;
 }
 
 export function formatLiveTrade(t: LiveTradeMsgIn): string {
@@ -104,12 +117,18 @@ export function formatLiveTrade(t: LiveTradeMsgIn): string {
     } else if (known) {
       lines.push(`Profit   ${signedUsd(t.profitUsd)}`);
     }
-    lines.push(`Gas      ${usd(-t.gasUsd)}`, todayLine);
-    return ['🟢 LIVE', head, esc(pair + (route ? ` · ${route}` : '')), pre(lines)].join('\n');
+    lines.push(`Gas      ${usd(-t.gasUsd)}`);
+    const paid = paidWithText(t.funding);
+    if (paid) lines.push(`Paid w/  ${paid}`);
+    lines.push(todayLine);
+    const note = t.funding?.kind === 'flash' ? '\nProfit shown is after the loan fee.' : '';
+    return ['🟢 LIVE', head, esc(pair + (route ? ` · ${route}` : '')), pre(lines) + note].join('\n');
   }
   if (t.status === 'reverted') {
     return ['🟢 LIVE', `❌ <b>MISSED  ${esc(usd(-t.gasUsd))}</b>`, esc(pair),
-      'Another bot got there first (or the price moved).', 'Only gas was lost. Your coins are safe.', pre([todayLine])].join('\n');
+      'Another bot got there first (or the price moved).', 'Only gas was lost. Your coins are safe.',
+      ...(t.funding?.kind === 'flash' ? ['The flash loan was cancelled with it: no loan fee paid.'] : []),
+      pre([todayLine])].join('\n');
   }
   // Dropped: never made it into a block, so nothing was paid.
   return ['🟢 LIVE', '⚪ <b>NOT SENT THROUGH  $0.00</b>', esc(pair),
@@ -134,6 +153,7 @@ export interface LiveHourlyIn {
   // holds (less the 2% cushion), capped by the own-money / trade limits. null = not read yet.
   biggestTrade: { coin: string; usd: number | null }[];
   bot: { ok: boolean; text: string };
+  loans?: LoanSplit;                // flash loan vs own money this hour (optional)
 }
 
 const amt = (x: number | null, d: number) => (x === null || !Number.isFinite(x) ? 'n/a' : x.toFixed(d));
@@ -148,6 +168,7 @@ export function formatLiveHourly(h: LiveHourlyIn): string {
     padR('This hour', W0) + padL(signedUsd(h.hour.usd), W) + `   ${countText(h.hour)}`,
     padR('Today', W0) + padL(signedUsd(h.todayUsd), W),
     padR('Since start', W0) + padL(signedUsd(h.sinceStartUsd), W),
+    ...((h.loans && loanSplitLines(h.loans)) || []),
   ]));
 
   out.push('💼 <b>WALLET</b>');
@@ -179,6 +200,7 @@ export interface Live4hIn {
   byHour: { startMs: number; usd: number }[];
   topPairs: { pair: string; usd: number; n: number }[];
   found: number | null;             // chances the bot found (practice funnel), null = unknown
+  loans?: LoanSplit;                // flash loan vs own money over the 4 hours (optional)
 }
 
 // One bar character per hour, scaled to the biggest hour ("▁▂▃▄▅▆▇█").
@@ -198,6 +220,7 @@ export function formatLive4h(r: Live4hIn): string {
     `Won ${r.won} · Missed ${r.missed} · Win rate ${rate}`,
     `Best trade  ${r.best ? `${signedUsd(r.best.usd)} ${r.best.pair}` : 'none yet'}`,
     `Gas spent   ${usd(r.gasUsd)}`,
+    ...((r.loans && loanSplitLines(r.loans)) || []),
   ]));
 
   out.push('📈 <b>BY HOUR</b>');
@@ -241,7 +264,22 @@ export function walletChangedSpec(coin: string, dropped: number, digits: number)
 // ----------------------------------------------------------------------------
 // THE BOOK: real trade results + starting wallet, saved to disk.
 // ----------------------------------------------------------------------------
-export interface LiveTradeRec { t: number; pair: string; kept: number; gas: number; status: 'profit' | 'reverted' | 'dropped' }
+// flash: paid with a flash loan; fee: that loan's fee in dollars (only paid when it won;
+// a failed trade cancels the loan too). Both optional: older records have neither.
+export interface LiveTradeRec { t: number; pair: string; kept: number; gas: number; status: 'profit' | 'reverted' | 'dropped'; flash?: boolean; fee?: number }
+
+// Flash loan vs own money split for a time window (hourly / 4-hour line).
+export interface LoanSplit { flash: { n: number; feesUsd: number; keptUsd: number }; own: { n: number; keptUsd: number } }
+
+// "Flash loans  3 trades · fees $0.12 · kept +$2.40 (after fees)" and the own-money
+// twin. null when there were no trades with known funding in the window.
+export function loanSplitLines(x: LoanSplit): string[] | null {
+  if (!x.flash.n && !x.own.n) return null;
+  return [
+    `Flash loans  ${x.flash.n} trade${x.flash.n === 1 ? '' : 's'} · fees ${usd(x.flash.feesUsd)} · kept ${signedUsd(x.flash.keptUsd)} (after fees)`,
+    `Your money   ${x.own.n} trade${x.own.n === 1 ? '' : 's'} · kept ${signedUsd(x.own.keptUsd)}`,
+  ];
+}
 interface BookState { version: 1; startedAt: number | null; start: Record<string, number>; trades: LiveTradeRec[] }
 
 export class LiveTradeBook {
@@ -264,11 +302,16 @@ export class LiveTradeBook {
   }
 
   // One final real result. Returns the record it stored.
-  add(r: { status: 'profit' | 'reverted' | 'dropped'; label: string; gasUsd: number; profitUsd?: number }): LiveTradeRec {
+  add(r: { status: 'profit' | 'reverted' | 'dropped'; label: string; gasUsd: number; profitUsd?: number; funding?: LiveTradeMsgIn['funding'] }): LiveTradeRec {
     const gas = Number.isFinite(r.gasUsd) && r.gasUsd > 0 ? r.gasUsd : 0;
     // Same rule as the hourly ledger: won = profit minus gas, failed = minus gas, dropped = 0.
     const kept = r.status === 'profit' ? (Number.isFinite(r.profitUsd) ? (r.profitUsd as number) : 0) - gas : r.status === 'reverted' ? -gas : 0;
     const rec: LiveTradeRec = { t: this.now(), pair: splitLabel(r.label).pair, kept, gas, status: r.status };
+    if (r.funding) {
+      rec.flash = r.funding.kind === 'flash';
+      // The fee is only paid when the trade went through (a failed trade cancels the loan).
+      if (rec.flash && r.status === 'profit' && Number.isFinite(r.funding.feeUsd)) rec.fee = r.funding.feeUsd;
+    }
     if (this.s.startedAt === null) this.s.startedAt = rec.t;
     this.s.trades.push(rec);
     this.prune();
@@ -306,6 +349,17 @@ export class LiveTradeBook {
       if (x.status === 'profit') c.won++; else if (x.status === 'reverted') c.missed++;
     }
     return c;
+  }
+
+  // Flash loan vs own money between two times (trades with unknown funding are left out).
+  loanSplit(fromMs: number, toMs: number): LoanSplit {
+    const out: LoanSplit = { flash: { n: 0, feesUsd: 0, keptUsd: 0 }, own: { n: 0, keptUsd: 0 } };
+    for (const x of this.s.trades) {
+      if (x.t < fromMs || x.t > toMs || x.status === 'dropped' || x.flash === undefined) continue;
+      if (x.flash) { out.flash.n++; out.flash.feesUsd += x.fee ?? 0; out.flash.keptUsd += x.kept; }
+      else { out.own.n++; out.own.keptUsd += x.kept; }
+    }
+    return out;
   }
 
   sinceStart(): number { return this.sinceStartOld + this.s.trades.reduce((a, x) => a + x.kept, 0); }

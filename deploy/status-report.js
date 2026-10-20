@@ -128,7 +128,7 @@ function liveSection(records, { windowStart, now, capUsd }) {
     if (r.kind === 'send_failed') return `send refused by node (no cost): ${String(r.error || '').replace(/[|`]/g, ' ').slice(0, 60)}`;
     const res = resultByHash.get(r.hash);
     if (!res) return 'waiting for receipt';
-    if (res.status === 'won') return `won ${signed(Number(res.netUsd || 0))} after gas${res.profitUsd === null ? ' (profit price unknown)' : ''}`;
+    if (res.status === 'won') return `won ${signed(Number(res.netUsd || 0))} after gas${res.profitUsd === null ? ' (profit price unknown)' : ''}${r.funding === 'flash' ? ` (flash loan, fee ${money(Number(r.loanFeeUsd || 0))})` : ''}`;
     if (res.status === 'reverted') return `reverted, gas lost ${money(Number(res.gasUsd || 0))}`;
     return 'dropped (never mined, no cost)';
   };
@@ -142,17 +142,17 @@ function liveSection(records, { windowStart, now, capUsd }) {
     `| Landed but reverted (gas lost) | ${w.rev} (${money(w.revGas)}) | ${t.rev} (${money(t.revGas)}) |`,
     ...(w.dropped || t.dropped ? [`| Dropped (never mined, no cost) | ${w.dropped} | ${t.dropped} |`] : []),
     ...(w.sendFailed || t.sendFailed ? [`| Send refused by node (no cost) | ${w.sendFailed} | ${t.sendFailed} |`] : []),
-    `| Not sent: stopped by safety gate | ${w.blockedTotal} | ${t.blockedTotal} |`,
+    `| Not sent (all reasons, see below) | ${w.blockedTotal} | ${t.blockedTotal} |`,
     '',
     `- **Net today: ${signed(t.net)}** (all landed trades, after gas)`,
     `- Daily loss used: ${money(t.loss)} of ${money(capUsd)} cap (${usedPct}%)${t.loss >= capUsd && capUsd > 0 ? ' · **CAP HIT: live sending paused until midnight UTC**' : ''}`,
-    `- Stopped by safety gate this window, by reason: ${reasons(w.blocked)}`,
-    ...(t.blockedTotal !== w.blockedTotal ? [`- Stopped by safety gate today, by reason: ${reasons(t.blocked)}`] : []),
+    `- Not sent this window, by reason: ${reasons(w.blocked)}`,
+    ...(t.blockedTotal !== w.blockedTotal ? [`- Not sent today, by reason: ${reasons(t.blocked)}`] : []),
     '',
     '**Last 5 trades**',
     ...(recent.length
-      ? ['| Time (Toronto) | Pair / route | Size | Result | Tx |', '|---|---|---|---|---|',
-        ...recent.map((r) => `| ${time(r.t)} | ${String(r.label || '?').replace(/\|/g, '/')} | ${money(Number(r.sizeUsd || 0)).replace(/\.\d\d$/, '')} | ${outcome(r)} | ${r.hash ? `\`${shortHash(r.hash)}\`` : '-'} |`)]
+      ? ['| Time (Toronto) | Pair / route | Size | Paid with | Result | Tx |', '|---|---|---|---|---|---|',
+        ...recent.map((r) => `| ${time(r.t)} | ${String(r.label || '?').replace(/\|/g, '/')} | ${money(Number(r.sizeUsd || 0)).replace(/\.\d\d$/, '')} | ${r.funding === 'flash' ? 'flash loan' : r.funding === 'own' ? 'own money' : '-'} | ${outcome(r)} | ${r.hash ? `\`${shortHash(r.hash)}\`` : '-'} |`)]
       : ['- no live sends yet']),
     '',
   ];
