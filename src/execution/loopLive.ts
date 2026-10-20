@@ -116,7 +116,7 @@ export interface LoopLiveDeps {
   executor: () => string | undefined;
   fire: (to: string, data: string) => Promise<{ live: boolean; txHash?: string; error?: string; signMs?: number }>;
   // After a real send: the same bookkeeping as 2-pool trades (trade file, tracker, pending gas).
-  afterSent: (hash: string, info: { label: string; sizeUsd: number; netUsd: number; funding: LoopFunding; kinds: number[]; poolKeys: string[] }) => void;
+  afterSent: (hash: string, info: { label: string; sizeUsd: number; netUsd: number; funding: LoopFunding; kinds: number[]; poolKeys: string[]; gasUsd: number }) => void;
   log: (m: string) => void;
   alert: (html: string) => void;
   dayOf?: (ms: number) => string;                        // Toronto day (loss cap)
@@ -140,7 +140,10 @@ export class LoopLiveSender {
   private lossToday = 0;
   private pausedDay: string | null = null;
   private hour = emptyHour();
-  private sentHashes = new Map<string, string>(); // hash -> loop sig (our live loop trades)
+  // Our live loop trades not settled yet: hash -> loop, its pools, and the gas it could lose.
+  // A loop (or any loop sharing a pool) is not sent again while one is in flight,
+  // and their gas counts toward the loop loss cap until they settle.
+  private sentHashes = new Map<string, { sig: string; pools: string[]; holdUsd: number; at: number }>();
 
   constructor(readonly cfg: LoopLiveConfig, private d: LoopLiveDeps) {
     this.day = this.dayOf(d.now());
@@ -151,19 +154,40 @@ export class LoopLiveSender {
   private rollDay(): void { const d = this.dayOf(this.d.now()); if (d !== this.day) { this.day = d; this.lossToday = 0; } }
   pausedToday(): boolean { this.rollDay(); return this.pausedDay === this.day; }
   isLoopTrade(hash: string): boolean { return this.sentHashes.has(hash.toLowerCase()); }
+  // In-flight entries older than 10 min are dropped (the tracker reports every
+  // trade well before that; this only guards against a lost result).
+  private inflight(): { pools: Set<string>; sigs: Set<string>; holdUsd: number } {
+    const t = this.d.now(), pools = new Set<string>(), sigs = new Set<string>();
+    let hold = 0;
+    for (const [h, e] of this.sentHashes) {
+      if (t - e.at > 10 * 60_000) { this.sentHashes.delete(h); continue; }
+      sigs.add(e.sig); for (const p of e.pools) pools.add(p); hold += e.holdUsd;
+    }
+    return { pools, sigs, holdUsd: hold };
+  }
 
   // A loop from the worker. Never throws; one at a time.
   async offer(c: LoopLiveCandidate): Promise<void> {
     if (!this.cfg.enabled) return;
     this.hour.offered++;
-    const now = this.d.now();
     if (this.busy) { this.skip('another loop is being checked'); return; }
+    this.busy = true;
+    try { await this.tryOne(c); }
+    catch (e) { this.d.log(`[loop-live] ${c.label} skipped (error: ${(e as Error).message})`); this.skip('error'); }
+    finally { this.busy = false; }
+  }
+
+  private async tryOne(c: LoopLiveCandidate): Promise<void> {
+    const now = this.d.now();
     if (this.pausedToday()) { this.skip('loop loss cap reached today'); return; }
     if (now - c.foundAt > this.cfg.maxAgeMs) { this.skip('found too long ago'); return; }
     if (c.hops.length > this.cfg.maxPools) { this.skip(`more than ${this.cfg.maxPools} pools`); return; }
     if (c.sizeUsd > this.cfg.maxTradeUsd) { this.skip('over the loop size limit'); return; }
+    if (c.hops[0]?.tokenIn.toLowerCase() !== c.base.toLowerCase() || c.hops[c.hops.length - 1]?.tokenOut.toLowerCase() !== c.base.toLowerCase()) { this.skip('route does not start and end in the base coin'); return; }
     const f = this.fails.get(c.sig);
     if (f && f.until > now) { this.skip('this loop failed its last real checks'); return; }
+    const fl = this.inflight();
+    if (fl.sigs.has(c.sig) || c.poolKeys.some((k) => fl.pools.has(k.toLowerCase()))) { this.skip('a loop on these pools is still in flight'); return; }
     while (this.sends.length && now - this.sends[0] > 3600_000) this.sends.shift();
     while (this.checks.length && now - this.checks[0] > 3600_000) this.checks.shift();
     if (this.sends.length >= this.cfg.maxPerHour) { this.skip('hourly send limit'); return; }
@@ -174,10 +198,10 @@ export class LoopLiveSender {
     if (!funding) { this.skip('no own money and no usable lender'); return; }
     const flash = funding.kind === 'flash';
     if (!this.d.gasLimitOk(loopGasUnits(c.hops.length) + (flash ? 100_000 : 0))) { this.skip('sender gas limit too low for this loop'); return; }
-    this.busy = true;
-    try { await this.checkAndSend(c, funding); }
-    catch (e) { this.d.log(`[loop-live] ${c.label} skipped (error: ${(e as Error).message})`); this.skip('error'); }
-    finally { this.busy = false; }
+    // Loss cap with the trades still in flight counted as if they failed.
+    const gasUsd = this.d.gasUsd(c.hops.length, flash);
+    if (this.lossTodayUsd() + fl.holdUsd + gasUsd > this.cfg.lossCapUsd) { this.skip('loop loss cap (counting trades in flight)'); return; }
+    await this.checkAndSend(c, funding);
   }
 
   private async checkAndSend(c: LoopLiveCandidate, funding: LoopFunding): Promise<void> {
@@ -192,6 +216,9 @@ export class LoopLiveSender {
     this.hour.checked++;
     const r = await this.d.check(c, lender);
     const gasUsd = this.d.gasUsd(c.hops.length, flash);
+    // The check measured the gas our loop really uses (replays report it): it must fit the limit too.
+    const used = (r.status === 'profit' || r.status === 'loss') && r.gasUsed ? Number(r.gasUsed) : 0;
+    if (used > 0 && !this.d.gasLimitOk(used)) { this.skip('sender gas limit too low for this loop (measured)'); return; }
     // The check reports profit in base-coin units; decideCheckFirst wants USD.
     const dec = this.d.decimalsOf(c.base), usd = this.d.usdOf(c.base);
     const answer = r.status === 'profit'
@@ -216,19 +243,20 @@ export class LoopLiveSender {
     if (this.d.isOutlier(Math.max(v.netUsd, checkNet), c.sizeUsd)) { this.d.log(`[loop-live] NOT SENT ${c.label}: $${v.netUsd.toFixed(2)} on $${Math.round(c.sizeUsd)} is too good to be true (outlier guard)`); this.skip('outlier profit (too good to be true)'); return; }
     const unsafe = this.d.safety(c.sizeUsd, c.coins);
     if (unsafe) { this.skip(`safety gate: ${unsafe}`.replace(/\$\d+(\.\d+)?/g, '$N').slice(0, 80)); return; }
-    const notReady = this.d.live() ? this.d.ready() : null;
+    const live = this.d.live(); // read once for this send
+    const notReady = live ? this.d.ready() : null;
     if (notReady) { this.skip(notReady); return; }
-    const deadline = this.d.live() ? this.d.deadline() : 0n;
+    const deadline = live ? this.d.deadline() : 0n;
     if (deadline === null) { this.skip('block info stale'); return; }
     if (dec === undefined || !usd) { this.skip('unknown price or decimals'); return; }
     const minProfit = usdToTokenUnits(v.netUsd, usd, dec);
     if (minProfit <= 0n) { this.skip('profit floor rounds to zero'); return; }
     const to = this.d.executor();
-    if (this.d.live() && !to) { this.skip('no trade contract set'); return; }
+    if (live && !to) { this.skip('no trade contract set'); return; }
     const trade = { token: c.hops[0].tokenIn, amountIn: c.amountIn, minProfit, maxBlock: deadline, hops: c.hops };
     const data = lender ? encodeExecuteV3FlashRaw(trade, lender) : encodeExecuteRaw(trade);
     const fired = await this.d.fire(to ?? '0x0000000000000000000000000000000000000000', data);
-    if (!fired.live) {
+    if (!fired.live || !live) {
       this.hour.dryRun++;
       this.d.log(`[loop-live] DRY RUN (bot not live) ${c.label}: would send for $${v.netUsd.toFixed(2)} after gas on $${Math.round(c.sizeUsd)} (${pay}), checked in ${ms} ms`);
       return;
@@ -240,10 +268,10 @@ export class LoopLiveSender {
     }
     this.sends.push(this.d.now());
     this.hour.sent++;
-    this.sentHashes.set(fired.txHash.toLowerCase(), c.sig);
+    this.sentHashes.set(fired.txHash.toLowerCase(), { sig: c.sig, pools: c.poolKeys.map((k) => k.toLowerCase()), holdUsd: gasUsd, at: this.d.now() });
     if (this.sentHashes.size > 500) this.sentHashes.delete(this.sentHashes.keys().next().value as string);
     this.d.log(`[loop-live] SENT ${c.label}: $${v.netUsd.toFixed(2)} after gas on $${Math.round(c.sizeUsd)} (${pay}), checked in ${ms} ms, tx ${fired.txHash}`);
-    this.d.afterSent(fired.txHash, { label: `loop ${c.label}`, sizeUsd: c.sizeUsd, netUsd: v.netUsd, funding, kinds: c.hops.map((h) => h.kind), poolKeys: c.poolKeys });
+    this.d.afterSent(fired.txHash, { label: `loop ${c.label}`, sizeUsd: c.sizeUsd, netUsd: v.netUsd, funding, kinds: c.hops.map((h) => h.kind), poolKeys: c.poolKeys, gasUsd });
   }
 
   private noteFail(c: LoopLiveCandidate): void {
@@ -256,8 +284,9 @@ export class LoopLiveSender {
 
   // The final result of one of OUR live loop trades (from the live tracker).
   noteResult(r: { hash: string; status: 'profit' | 'reverted' | 'dropped'; gasUsd: number; profitUsd?: number; label: string }): void {
-    const sig = this.sentHashes.get(r.hash.toLowerCase());
-    if (sig === undefined) return;
+    const e = this.sentHashes.get(r.hash.toLowerCase());
+    if (e === undefined) return;
+    const sig = e.sig;
     this.sentHashes.delete(r.hash.toLowerCase());
     this.rollDay();
     if (r.status === 'profit') { this.hour.won++; this.hour.wonUsd += r.profitUsd ?? 0; return; }

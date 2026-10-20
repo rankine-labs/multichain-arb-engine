@@ -1689,7 +1689,9 @@ const loopLive: LoopLiveSender | null = loopCfg.enabled && loopLiveCfg.enabled ?
             if (dec === undefined) return null;
             // Wallet first: the contract really holds the whole amount (live), or
             // practice: the same "own money" assumption as practice checks.
-            if (robinhoodSender.live ? ownMoney.covers(c.base, c.amountIn) : RH_OWN_MONEY && c.sizeUsd <= OWN_MONEY_MAX_USD) return { kind: 'own' };
+            // Same rule as 2-pool trades: own money on (RH_FUNDING), up to OWN_MONEY_MAX_USD,
+            // and live the contract must really hold the whole amount.
+            if (RH_OWN_MONEY && c.sizeUsd <= OWN_MONEY_MAX_USD && (!robinhoodSender.live || ownMoney.covers(c.base, c.amountIn))) return { kind: 'own' };
             // Otherwise a flash loan: approved lender, not one of the loop's pools, holds enough.
             if (!lenderBalances.lastRefreshMs) return null;
             const exclude = c.poolKeys.map((k) => cache.get('robinhood', k)?.poolAddress ?? k);
@@ -1719,7 +1721,7 @@ const loopLive: LoopLiveSender | null = loopCfg.enabled && loopLiveCfg.enabled ?
             whyNotSent.sent();
             liveTradeLog.sent(hash, info.label, info.sizeUsd, info.netUsd, funding);
             setTimeout(() => { void refreshOwnMoney(); }, 3_000);
-            safetyGate.reservePending(hash, 2 * gasModel.loopUsd(info.kinds.length, 0.05));
+            safetyGate.reservePending(hash, 2 * info.gasUsd);
             liveTracker.track(hash, { expectedProfitUsd: info.netUsd, label: info.label, sizeUsd: info.sizeUsd, funding, routeKey: routeKeyFor(info.kinds, info.funding.kind === 'flash') });
       },
       log: (m) => console.log(m),

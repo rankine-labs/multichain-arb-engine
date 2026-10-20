@@ -153,10 +153,10 @@ function rig(env: Record<string, string> = {}, over: Partial<LoopLiveDeps> = {},
   {
     const r = rig({ LOOP_LIVE_MAX_PER_HOUR: '1' });
     await r.s.offer(cand({ sig: 'a' }));
-    await r.s.offer(cand({ sig: 'b' }));
+    await r.s.offer(cand({ sig: 'b', poolKeys: [A(41), A(42), A(43)] }));
     assert(r.fired.length === 1 && r.s.hourLine().includes('hourly send limit'), 'LOOP_LIVE_MAX_PER_HOUR=1: second loop not sent');
     r.t.now += 3601_000;
-    await r.s.offer(cand({ sig: 'c', foundAt: r.t.now }));
+    await r.s.offer(cand({ sig: 'c', foundAt: r.t.now, poolKeys: [A(51), A(52), A(53)] }));
     assert(r.fired.length === 2, 'next hour: sends again');
     let release: () => void = () => {};
     const slow = rig({}, { check: () => new Promise<SimResult>((res) => { release = () => res({ status: 'profit', profit: E18 / 1000n }); }) });
@@ -164,6 +164,38 @@ function rig(env: Record<string, string> = {}, over: Partial<LoopLiveDeps> = {},
     await slow.s.offer(cand({ sig: 'y' }));
     release(); await first;
     assert(slow.fired.length === 1 && slow.s.hourLine().includes('another loop is being checked'), 'one loop at a time: a second loop while one is being checked is skipped');
+  }
+
+  // ---- in flight: the same loop (or a loop on the same pools) is not sent twice ----
+  {
+    const r = rig();
+    await r.s.offer(cand({ sig: 'a' }));
+    await r.s.offer(cand({ sig: 'a', foundAt: r.t.now }));
+    await r.s.offer(cand({ sig: 'other', poolKeys: [A(99), A(12), A(98)], foundAt: r.t.now }));
+    assert(r.fired.length === 1 && r.s.hourLine().includes('still in flight'), 'same loop / shared pool while the first is in flight: not sent again');
+    r.s.noteResult({ hash: '0x' + 'ab'.repeat(32), status: 'profit', gasUsd: 0.03, profitUsd: 1, label: 'loop x' });
+    await r.s.offer(cand({ sig: 'a', foundAt: r.t.now }));
+    assert(r.fired.length === 2, 'after it settled: can be sent again');
+    // Loss cap counts trades in flight: $1.99 lost + $0.03 in flight would pass $2.
+    const c = rig();
+    await c.s.offer(cand({ sig: 'a' }));
+    c.s.noteResult({ hash: '0x' + 'ab'.repeat(32), status: 'reverted', gasUsd: 1.95, label: 'loop x' });
+    let n = 0;
+    c.d.fire = async (to, data) => { c.fired.push({ to, data }); n++; return { live: true, txHash: '0x' + String(n).padStart(64, '0') }; };
+    await c.s.offer(cand({ sig: 'b', poolKeys: [A(61), A(62), A(63)], foundAt: c.t.now }));
+    await c.s.offer(cand({ sig: 'c', poolKeys: [A(71), A(72), A(73)], foundAt: c.t.now }));
+    assert(c.fired.length === 2 && c.s.hourLine().includes('counting trades in flight'), 'loss cap counts the gas of loops still in flight');
+    // Measured gas from the check must fit the sender limit too.
+    const g = rig({}, { gasLimitOk: (u) => u < 900_000 }, { status: 'profit', profit: E18 / 1000n, gasUsed: 950_000n });
+    await g.s.offer(cand());
+    assert(g.fired.length === 0 && g.s.hourLine().includes('(measured)'), 'check measured more gas than the sender limit allows: not sent');
+    const bad = rig();
+    await bad.s.offer(cand({ base: A(2) }));
+    assert(bad.fired.length === 0 && bad.s.hourLine().includes('base coin'), 'route that does not start and end in the base coin: not sent');
+    const boom = rig({}, { funding: () => { throw new Error('boom'); } });
+    await boom.s.offer(cand());
+    await boom.s.offer(cand({ sig: 'z', foundAt: boom.t.now }));
+    assert(boom.s.hourLine().includes('error 2'), 'an error in a check is caught and the lock released (2 tries, 2 errors)');
   }
 
   // ---- loop loss cap ----
