@@ -96,6 +96,7 @@ export type LocalSimClientOptions = {
   backoffMaxMs?: number;
   log?: (msg: string) => void;
   autoConnect?: boolean;      // default true
+  onConnect?: () => void;     // told each time the connection is (re)made (e.g. to send the warm list)
 };
 
 type Pending = { resolve: (a: SidecarAnswer) => void; timer: NodeJS.Timeout };
@@ -112,6 +113,7 @@ export class LocalSimClient {
   private readonly backoffMinMs: number;
   private readonly backoffMaxMs: number;
   private readonly log: (msg: string) => void;
+  private readonly onConnect: () => void;
 
   private sock: Socket | null = null;
   private connected = false;
@@ -139,6 +141,7 @@ export class LocalSimClient {
     this.backoffMaxMs = opts.backoffMaxMs ?? 5_000;
     this.backoff = this.backoffMinMs;
     this.log = opts.log ?? (() => {});
+    this.onConnect = opts.onConnect ?? (() => {});
     if (opts.autoConnect !== false) this.connect();
   }
 
@@ -222,6 +225,7 @@ export class LocalSimClient {
       const q = this.feedQueue;
       this.feedQueue = [];
       for (const b of q) { s.write(b); this.stats.feedSent++; }
+      try { this.onConnect(); } catch { /* a listener problem must not break the connection */ }
     });
     s.on('data', (chunk: Buffer) => this.onData(s, chunk));
     s.on('error', () => { /* 'close' follows and handles it */ });
@@ -304,6 +308,13 @@ export type LocalRpcOptions = {
   timeoutMs?: number; // per question (default: the client's)
   // Told about every answer the sidecar couldn't give (for logs / counters).
   onUnknown?: (method: string, why: string) => void;
+  // Which state to ask about, instead of the one the block tag names. Used
+  // for "right after the trade we follow" ({afterTx: hash}), which no node
+  // block tag can say. Left out = from the block tag, as before.
+  at?: Record<string, unknown>;
+  // Told about every sure answer, with the question that was sent (for
+  // timing / gas logs and the size search). Never changes the answer.
+  onAnswer?: (method: string, answer: SidecarAnswer, sent: Record<string, unknown>) => void;
 };
 
 // Which state a block tag means, in sidecar terms. null = not supported here.
@@ -368,17 +379,23 @@ export function makeLocalRpc(client: LocalSimClient, fallback?: Rpc, opts: Local
     }
     return { error: { message: localUnknownMessage(why) } };
   };
+  // Sure answers: tell the listener (logging only; its problems are ignored).
+  const noteAnswer = (method: string, a: SidecarAnswer, sent: Record<string, unknown>): void => {
+    try { opts.onAnswer?.(method, a, sent); } catch { /* logging must not break checks */ }
+  };
 
   return async (method, params) => {
     try {
       const p = (params ?? []) as any[];
       if (method === 'eth_call') {
-        const at = blockTagToAt(p[1]);
+        const at = opts.at ?? blockTagToAt(p[1]);
         if (!at) return unknown(method, params, 'unsupported_block_tag');
         const call = p[0];
         if (!call || typeof call !== 'object') return unknown(method, params, 'bad_request');
-        const a = await client.request({ type: 'call', at, overrides: p[2] ?? {}, calls: [call] }, opts.timeoutMs);
+        const sent = { type: 'call', at, overrides: p[2] ?? {}, calls: [call] };
+        const a = await client.request(sent, opts.timeoutMs);
         if (a.ok !== true) return unknown(method, params, a.unknown);
+        noteAnswer(method, a, sent);
         const r = a.results?.[0];
         if (!r || a.results!.length !== 1) return unknown(method, params, 'bad_answer');
         return ethCallAnswer(r);
@@ -391,7 +408,7 @@ export function makeLocalRpc(client: LocalSimClient, fallback?: Rpc, opts: Local
         if (!Array.isArray(bscs) || bscs.length !== 1 || req.validation === true || req.traceTransfers || req.returnFullTransactions) {
           return unknown(method, params, 'unsupported_simulate_shape');
         }
-        const at = blockTagToAt(p[1]);
+        const at = opts.at ?? blockTagToAt(p[1]);
         if (!at) return unknown(method, params, 'unsupported_block_tag');
         const b = bscs[0] ?? {};
         const calls = Array.isArray(b.calls) ? b.calls : [];
@@ -400,10 +417,10 @@ export function makeLocalRpc(client: LocalSimClient, fallback?: Rpc, opts: Local
         const bo = b.blockOverrides ?? {};
         const extra = Object.keys(bo).filter((k) => k !== 'time' && k !== 'gasLimit');
         if (extra.length) return unknown(method, params, 'unsupported_block_override');
-        const a = await client.request({
-          type: 'call', at, nextBlock: true, blockOverrides: bo, overrides: b.stateOverrides ?? {}, calls,
-        }, opts.timeoutMs);
+        const sent = { type: 'call', at, nextBlock: true, blockOverrides: bo, overrides: b.stateOverrides ?? {}, calls };
+        const a = await client.request(sent, opts.timeoutMs);
         if (a.ok !== true) return unknown(method, params, a.unknown);
+        noteAnswer(method, a, sent);
         if (!Array.isArray(a.results) || a.results.length !== calls.length) return unknown(method, params, 'bad_answer');
         return { result: simulateV1Result(a.results) };
       }

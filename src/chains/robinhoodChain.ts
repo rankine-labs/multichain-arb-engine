@@ -45,6 +45,15 @@ export class RobinhoodChainAdapter implements ChainCapability {
       private lastSeqSeen = 0;
       private lastMessageAtMs = 0;
       private openedAtMs = 0;
+      // FAST CHECK (execution/localSimHost.ts): told every raw feed message,
+      // as text, unchanged, before anything else is done with it. Set only
+      // when LOCAL_SIM is shadow/on; it just hands the text on (no waiting).
+      private rawTap: ((text: string) => void) | null = null;
+
+  // Pass every raw feed message (text) to `fn`, before it is parsed.
+  setRawFrameTap(fn: ((text: string) => void) | null): void {
+        this.rawTap = fn;
+  }
 
   async connect(): Promise<void> {
         // Clean up any previous connection before reconnecting -- otherwise a
@@ -92,9 +101,14 @@ export class RobinhoodChainAdapter implements ChainCapability {
                     const receivedAtMs = Date.now();
                     this.lastMessageAtMs = receivedAtMs;
 
+                    const text = raw.toString();
+                    // Fast check: the raw message goes to the sidecar first, untouched
+                    // (including backlog repeats after a reconnect: it skips those itself).
+                    if (this.rawTap) { try { this.rawTap(text); } catch { /* never breaks the feed */ } }
+
                     let parsed: any;
                     try {
-                          parsed = JSON.parse(raw.toString());
+                          parsed = JSON.parse(text);
                     } catch {
                           return; // malformed frame, drop it
                     }
