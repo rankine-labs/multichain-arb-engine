@@ -1,5 +1,5 @@
 import { ethers } from 'ethers';
-import { v4Asks, findV4Pools, V4_TIERS } from './v4Lookup';
+import { v4AsksPaced, findV4Pools, V4_TIERS } from './v4Lookup';
 import { STANDARD_V4_TIERS } from '../config/v4Tiers';
 import { Steps, drainSteps, runSteps, yieldToLoop, Pacer } from './chunked';
 import { timed } from './stallFinder';
@@ -920,7 +920,8 @@ export async function scanUniverse(
       const BATCH = 300;
       for (let i = 0; i < list.length; i += BATCH) {
         const batch = list.slice(i, i + BATCH);
-        const asks = batch.flatMap((pr, j) => v4Asks([pr], opts.wrappedNative, i + j < extraN ? V4_TIERS : STANDARD_V4_TIERS));
+        // Freeze fix (Oct 20): ids worked out with short breaks (and remembered between scans).
+        const asks = await v4AsksPaced(batch, opts.wrappedNative, (j) => (i + j < extraN ? V4_TIERS : STANDARD_V4_TIERS));
         found.push(...await findV4Pools(callMany, asks, {
           stateView: opts.v4.stateView, poolManager: opts.v4.poolManager, weth: opts.wrappedNative,
           quoteUsd: qUsd, quoteDecimals: qDec, minUsd: minPoolUsd,
