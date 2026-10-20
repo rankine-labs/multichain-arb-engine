@@ -7,4 +7,8 @@
 pub mod arb;
 pub mod check;
 pub mod feed;
+pub mod node;
+pub mod proto;
+pub mod server;
+pub mod serve;
 pub mod state;

@@ -17,7 +17,14 @@ use std::collections::HashMap;
 use revm::primitives::{Address, B256, U256};
 use revm::state::{AccountInfo, Bytecode};
 
+pub mod db;
+pub mod diff;
+pub mod fill;
 pub mod mem;
+pub mod mirror;
+pub mod pinned;
+pub mod snap;
+pub mod updater;
 
 /// Result of looking something up in our copy of the chain.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -53,6 +60,15 @@ pub trait StateRead: Send + Sync {
     /// Where this view sits: (L2 block number of the base, last feed message
     /// sequence number applied on top, if any). For logging and answers.
     fn position(&self) -> StatePosition;
+    /// Is this account's ETH balance exact? (Extension, default yes.)
+    /// The live mirror replays feed transactions WITHOUT charging gas fees
+    /// (Nitro's fee includes an L1 part we can't compute), so the balance of
+    /// an account that paid fees is only approximately right. Code that READS
+    /// such a balance (BALANCE / SELFBALANCE opcodes) must treat the answer
+    /// as unsure. Contract balances and token balances are always exact.
+    fn balance_exact(&self, _addr: Address) -> bool {
+        true
+    }
 }
 
 /// Where a state view sits on the chain.
@@ -80,4 +96,14 @@ pub struct AccountDiff {
     pub code: Option<Bytecode>,
     /// Slot -> new value (U256::ZERO = cleared).
     pub storage: HashMap<U256, U256>,
+    /// (Extension) true = ALL old storage is gone before `storage` applies
+    /// (account newly created or destroyed): unlisted slots are now zero.
+    pub storage_cleared: bool,
+    /// (Extension) true = after this change the ETH balance is only
+    /// approximately known (see StateRead::balance_exact).
+    pub balance_inexact: bool,
+    /// (Extension) true = after this change NOTHING about this account is
+    /// known any more (e.g. a sender we only pretended to know). All other
+    /// fields are ignored.
+    pub forget: bool,
 }
