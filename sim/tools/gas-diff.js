@@ -41,7 +41,7 @@ const { execFileSync } = require('child_process');
 const HOME = os.homedir();
 const BOT_DIR = process.env.BOT_DIR || path.join(HOME, 'multichain-arb-engine');
 const SIM_DIR = path.join(__dirname, '..');
-const NODE_VARS = ['ROBINHOOD_RPC_HTTP', 'QUICKNODE_RPC_ROBINHOOD', 'SIM_RPC_ROBINHOOD'];
+const NODE_VARS = ['CHAINSTACK_RPC_ROBINHOOD', 'ROBINHOOD_RPC_HTTP', 'QUICKNODE_RPC_ROBINHOOD', 'SIM_RPC_ROBINHOOD']; // Chainstack first: most monthly room
 const ARBOS_STATE = '0xa4b05fffffffffffffffffffffffffffffffffff';
 const ARBSYS = '0x0000000000000000000000000000000000000064';
 
