@@ -45,6 +45,8 @@ export interface LoopWorkerCoreDeps {
   installGlobals?: boolean;
   // COIN TAX TEST (core/coinTax.ts): missing = off.
   coinTax?: CoinTaxGate;
+  // LIVE LOOPS: hand a qualifying loop to the main thread (true = taken).
+  liveOffer?: (c: import('../execution/loopLive').LoopLiveCandidate) => boolean;
 }
 
 export class LoopWorkerCore {
@@ -106,6 +108,7 @@ export class LoopWorkerCore {
       fix: init.fix,
       noteGas: (pools, gasUsed) => deps.noteGas(pools, gasUsed),
       ...(deps.coinTax ? { coinTax: deps.coinTax } : {}),
+      ...(deps.liveOffer ? { liveOffer: deps.liveOffer } : {}),
       log: (m) => {
         const t = Date.now();
         this.logTimes = this.logTimes.filter((x) => t - x < 60_000);
