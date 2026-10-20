@@ -33,9 +33,35 @@ const Q96 = 2n ** 96n;
 const coder = ethers.AbiCoder.defaultAbiCoder();
 
 // Pool id = keccak256(abi.encode(currency0, currency1, fee, tickSpacing, hooks=0)).
-export function v4Id(c0: string, c1: string, fee: number, tickSpacing: number): string {
+// The general ABI coder (kept for the test that proves the fast one matches).
+export function v4IdSlow(c0: string, c1: string, fee: number, tickSpacing: number): string {
   return ethers.keccak256(coder.encode(['address', 'address', 'uint24', 'int24', 'address'], [c0, c1, fee, tickSpacing, ZERO])).toLowerCase();
 }
+
+// FREEZE FIX (Oct 20): the pool scan works out ~70,000 of these ids per scan,
+// in batches with no breaks. A 2-minute CPU recording of the live bot showed it
+// was the single biggest CPU user (15 of 120 s) and froze the bot ~1 s per
+// batch. Two changes, same ids:
+//   1. The 5 words are written straight into bytes (no general ABI coder).
+//   2. Each id is remembered: a pool id never changes, so later scans reuse it.
+// Bounded memory: at most V4_ID_CACHE_MAX ids are kept (oldest dropped first).
+const V4_ID_CACHE_MAX = Number(process.env.V4_ID_CACHE_MAX ?? 250_000);
+const idCache = new Map<string, string>();
+const word = (hex: string) => hex.padStart(64, '0');
+const addrWord = (a: string) => word(a.toLowerCase().replace(/^0x/, ''));
+// uint24 / int24 as one 32-byte word (int24 is sign-extended, as abi.encode does).
+const intWord = (n: number) => (n >= 0 ? word(n.toString(16)) : (2n ** 256n + BigInt(n)).toString(16));
+
+export function v4Id(c0: string, c1: string, fee: number, tickSpacing: number): string {
+  const key = `${c0}|${c1}|${fee}|${tickSpacing}`;
+  const hit = idCache.get(key);
+  if (hit !== undefined) return hit;
+  const id = ethers.keccak256('0x' + addrWord(c0) + addrWord(c1) + intWord(fee) + intWord(tickSpacing) + word('')).toLowerCase();
+  idCache.set(key, id);
+  if (idCache.size > V4_ID_CACHE_MAX) idCache.delete(idCache.keys().next().value as string);
+  return id;
+}
+export const v4IdCacheSize = () => idCache.size;
 
 export interface V4Ask {
   quote: string;        // the pair's USDG/WETH side (lowercase)
@@ -43,6 +69,18 @@ export interface V4Ask {
   id: string;
   c0: string; c1: string; // the pool key's coins (c0 = 0x0 for native ETH)
   fee: number; tickSpacing: number; native: boolean;
+}
+
+// Same as v4Asks, but takes a short break every few milliseconds so incoming
+// trades never wait behind it (the scan's V4 batches froze the bot ~1 s each).
+export async function v4AsksPaced(pairs: { quote: string; other: string }[], weth: string, tiersFor: (i: number) => [number, number][], sliceMs = 4): Promise<V4Ask[]> {
+  const out: V4Ask[] = [];
+  let t0 = performance.now();
+  for (let i = 0; i < pairs.length; i++) {
+    for (const a of v4Asks([pairs[i]], weth, tiersFor(i))) out.push(a);
+    if (performance.now() - t0 >= sliceMs) { await new Promise<void>((r) => setImmediate(r)); t0 = performance.now(); }
+  }
+  return out;
 }
 
 // Every pool id worth asking about for these (quote, other) pairs.
