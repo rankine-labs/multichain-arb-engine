@@ -24,6 +24,9 @@ revm = { version = "=43.0.3", default-features = false, features = [
     # node's eth_call: then the block's coinbase account is never touched, so
     # a check can't come back "unknown" just because we never loaded it.
     "optional_fee_charge",
+    # (workstream B) Nitro applies the EIP-7623 calldata floor only when the
+    # chain enabled it (off by default); lets arb::configure_cfg turn it off.
+    "optional_eip7623",
 ] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -51,3 +54,9 @@ codegen-units = 1
 panic = "abort"
 debug = false
 strip = true
+
+# (workstream B) per-call-frame gas tracer, the counterpart of tools/gas-diff.js:
+#   cargo run --release --example gas_trace -- <fixture.json>
+[[example]]
+name = "gas_trace"
+path = "tools/gas_trace.rs"
