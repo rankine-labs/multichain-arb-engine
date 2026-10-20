@@ -39,6 +39,40 @@ jobs:
       - name: Tests
         run: npm test
 
+  # Fast-check sidecar (sim/, Rust program "arbsim"). Separate job so a
+  # sidecar problem never blocks the bot's own checks, and vice versa.
+  # Builds the same optimised version the server runs, then runs its tests.
+  sim:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: sim
+    steps:
+      - uses: actions/checkout@v4
+
+      # The Rust toolchain is preinstalled on GitHub's Ubuntu machines.
+      - name: Rust version
+        run: rustc --version && cargo --version
+
+      # Keep downloaded crates and compiled dependencies between runs
+      # (a cold build takes several minutes; a warm one well under one).
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            sim/target
+          key: arbsim-${{ runner.os }}-${{ hashFiles('sim/Cargo.lock') }}
+          restore-keys: arbsim-${{ runner.os }}-
+
+      - name: Build (release)
+        run: cargo build --release --locked
+
+      - name: Tests
+        run: cargo test --release --locked
+
   # Solidity execution contract (contracts/). Separate job so a contract
   # problem never blocks the bot's own checks, and vice versa.
   contracts:
