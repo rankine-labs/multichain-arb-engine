@@ -171,6 +171,8 @@ function start(cfg: LoopWorkerInit): void {
   if (taxBook) setInterval(() => taxBook.save(), 60_000).unref?.();
   core = new LoopWorkerCore(cfg, {
     ...(taxBook ? { coinTax: taxBook } : {}),
+    // LIVE LOOPS: the main thread decides and sends; this thread only offers.
+    ...(cfg.live ? { liveOffer: (c: import('../execution/loopLive').LoopLiveCandidate) => { post({ t: 'liveCandidate', c }); return true; } } : {}),
     runCheck: (trade, ctx) => loopCheck(trade, ctx?.triggerHash),
     canCheckNode: () => guard!.canCheck(),
     log: (m) => log(m),

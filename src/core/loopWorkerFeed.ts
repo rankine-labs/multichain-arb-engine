@@ -1,4 +1,5 @@
 import type { CoinTaxConfig } from './coinTax';
+import type { LoopLiveCandidate } from '../execution/loopLive';
 import type { PoolState } from './types';
 import type { ConfirmedInfo } from './poolCache';
 import type { TriggerTrade, LoopFixSwitches } from './loopPrices';
@@ -103,6 +104,8 @@ export interface LoopWorkerInit {
   fakeCheck?: 'loss' | 'profit' | 'fail';
   // COIN TAX TEST (Oct 20, core/coinTax.ts). Missing = off.
   tax?: { cfg: CoinTaxConfig; file: string | null };
+  // LIVE LOOPS (Oct 20, execution/loopLive.ts): hand qualifying loops to the main thread.
+  live?: boolean;
   // Tests: finder time limits (Infinity = the answer never depends on machine speed).
   testFinder?: { updateBudgetMs?: number; sliceMs?: number };
 }
@@ -125,6 +128,7 @@ export type FromWorker =
   | { t: 'noteGas'; pools: number; gasUsed: bigint }
   | { t: 'hour'; id: number; h: LoopHour; node: string }
   | { t: 'stats'; s: WorkerStats }
+  | { t: 'liveCandidate'; c: LoopLiveCandidate }
   | { t: 'error'; message: string };
 
 // ---- Switch ----------------------------------------------------------------

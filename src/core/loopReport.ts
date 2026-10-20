@@ -97,6 +97,7 @@ export function loopLogLine(h: LoopHour, maxPools: number, label: string, node?:
   if (h.skippedCap) parts.push(`not checked ${h.skippedCap}`);
   parts.push(`by length ${lens.join(' ')}`);
   if (node) parts.push(node);
+  if (h.liveOffered !== undefined) parts.push(`handed to live ${h.liveOffered}`);
   const coins = coinsText(h);
   if (coins) parts.push(coins); // plain text (escaped only in the Telegram block)
   // The model vs check text is written for Telegram (HTML escaped): undo that.

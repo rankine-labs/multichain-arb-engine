@@ -5,6 +5,7 @@ import type { LoopFixSwitches } from './loopPrices';
 import { ExecutorHop, hopFor, kindForPool, v4KeyMatchesId, KIND_V4_HOOKED } from '../execution/executorCalldata';
 import type { SimResult } from '../execution/simulator';
 import { CoinTaxGate, CoinTaxStats, coinHolderOf } from './coinTax';
+import type { LoopLiveCandidate } from '../execution/loopLive';
 
 // ============================================================================
 // LOOP TRADER v1 -- PRACTICE ONLY
@@ -49,6 +50,9 @@ export interface LoopTraderConfig {
   // in a row is benched (not checked) for benchMs. 0 = off.
   benchAfter?: number;     // LOOP_BENCH_AFTER (default 5)
   benchMs?: number;        // LOOP_BENCH_MIN minutes (default 20)
+  // LIVE LOOPS (Oct 20, execution/loopLive.ts): loops of at most this many
+  // pools on vetted coins are handed to the live sender instead of a practice check.
+  liveMaxPools?: number;   // LOOP_LIVE_MAX_POOLS (default 3)
 }
 
 const num = (raw: string | undefined, dflt: number, min: number, max: number): number => {
@@ -95,7 +99,8 @@ export function loopConfigFromEnv(env: Record<string, string | undefined> = proc
     enabled: env.LOOP_TRADER === '1' || env.LOOP_TRADER === 'true',
     maxPools: loopMaxPoolsFromEnv(env.LOOP_MAX_POOLS, warn),
     maxCycles: Math.round(num(env.LOOP_MAX_CYCLES, 5_000, 1, 50_000)),
-    maxTradeUsd: num(env.LOOP_MAX_TRADE_USD, 2_000, 1, 1e6),
+    // Live loops can borrow (flash loan) for bigger sizes: default $10,000 then.
+    maxTradeUsd: num(env.LOOP_MAX_TRADE_USD, ['1', 'true', 'on'].includes((env.LOOP_LIVE ?? '').trim().toLowerCase()) ? 10_000 : 2_000, 1, 1e6),
     depthShare: num(env.LOOP_DEPTH_SHARE, 0.3, 0.001, 1),
     minNetUsd: num(env.LOOP_MIN_NET_USD, bar, 0.0001, 1e6),
     checksPerMin: Math.round(num(env.LOOP_CHECKS_PER_MIN, 6, 0, 60)),
@@ -103,6 +108,7 @@ export function loopConfigFromEnv(env: Record<string, string | undefined> = proc
     longSlack: num(env.LOOP_LONG_SLACK, 0.02, 0, 0.2),
     benchAfter: Math.round(num(env.LOOP_BENCH_AFTER, 5, 0, 1_000)),
     benchMs: num(env.LOOP_BENCH_MIN, 20, 1, 24 * 60) * 60_000,
+    liveMaxPools: Math.round(num(env.LOOP_LIVE_MAX_POOLS, 3, 3, 5)),
   };
 }
 
@@ -134,6 +140,10 @@ export interface LoopTraderDeps {
   // are left out of loops; untested coins are tested once before a loop that
   // uses them is checked. Missing = off (old behaviour).
   coinTax?: CoinTaxGate;
+  // LIVE LOOPS (execution/loopLive.ts): set only with LOOP_LIVE=1. A loop that
+  // passed every filter here is offered to the live sender (main thread);
+  // true = taken (no practice check for it). This file still never sends.
+  liveOffer?: (c: LoopLiveCandidate) => boolean;
 }
 
 // What a loop practice check is told, and what it answers.
@@ -292,6 +302,7 @@ export interface LoopHour {
     benchStarts: number;        // routes benched this hour
     benchedNow: number;         // routes benched right now
   };
+  liveOffered?: number;         // LIVE LOOPS: loops handed to the live sender this hour
 }
 
 export class LoopTrader {
@@ -326,7 +337,7 @@ export class LoopTrader {
       checks: [] as LoopCheckRecord[],
       skipped: 0,
       rival: { loops: 0, comparable: 0, weFound: 0, leads: [] as number[], longer: 0, unseen: 0, bots: new Map<string, number>() },
-      waitTest: 0, benchedSkips: 0, benchStarts: 0,
+      waitTest: 0, benchedSkips: 0, benchStarts: 0, liveOffered: 0,
     };
   }
 
@@ -475,6 +486,16 @@ export class LoopTrader {
         untested = true;
       }
       if (untested) { h.waitTest++; return; }
+    }
+    // LIVE LOOPS: vetted coins, short enough: hand it to the live sender.
+    if (this.deps.liveOffer && r.tradable && r.cycle.hops.length <= (this.cfg.liveMaxPools ?? 3)) {
+      const taken = this.deps.liveOffer({
+        sig: r.cycle.sig, label, base: r.cycle.base, amountIn: r.amountIn, sizeUsd: r.sizeUsd, netUsd: r.netUsd,
+        poolKeys: r.cycle.hops.map((x) => x.poolKey), hops: built.trade.hops,
+        coins: [...new Set(r.cycle.tokens.map((t) => t.toLowerCase()))],
+        ...(triggerHash ? { triggerHash } : {}), foundAt: now,
+      });
+      if (taken) { h.liveOffered++; this.deps.log?.(`${base}: handed to live loops`); return; }
     }
     this.deps.log?.(`${base}: queued for a practice check`);
     this.waiting.push({ r, trade: built.trade, at: now, ...(triggerHash ? { triggerHash } : {}) });
@@ -670,6 +691,7 @@ export class LoopTrader {
         waitTest: h.waitTest, benchedSkips: h.benchedSkips, benchStarts: h.benchStarts,
         benchedNow: (() => { const t = this.deps.env.now(); let n = 0; for (const v of this.bench.values()) if (v.until > t) n++; return n; })(),
       } } : {}),
+      ...(this.deps.liveOffer ? { liveOffered: h.liveOffered } : {}),
     };
   }
 }
