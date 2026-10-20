@@ -198,6 +198,7 @@ import { poolDepthUsd, setRealBalanceSource, thinPools, thinPoolsSteps } from '.
 // Loop trader v1 (3-5 pool loops, practice only, off unless LOOP_TRADER=1).
 import { LoopTrader, loopConfigFromEnv, LoopCheckResult, LoopTrade } from './core/loopTrader';
 // Which node loop practice checks run on (LOOP_CHECK_NODE, default the free public node).
+import { CoinTaxBook, coinTaxConfigFromEnv, testCoinTax } from './core/coinTax';
 import { loopNodeFromEnv, LoopNodeGuard, runLoopCheck, LoopCheckDeps, loopNodeText, LoopNodeThrottle, LoopNodeBusy, loopMaxRpsFromEnv } from './core/loopNode';
 // Loop fix phase 2: real (block-confirmed) prices, trigger replay, cheap scans (core/loopPrices.ts).
 import { loopFixFromEnv, PendingTrades, loopPoolState } from './core/loopPrices';
@@ -1767,7 +1768,26 @@ if (loopCfg.enabled && !loopWorkerOn) {
                   if (loopThrottle.sentThisCheck > 0) loopGuard.countCheck();
             }
       };
+      // COIN TAX TEST (Oct 20, core/coinTax.ts): coins that take a cut when
+      // moved are left out of loops. One free simulation per coin on the loop
+      // node, only while no loop check runs. LOOP_TAX_TEST=0 = off.
+      const loopTaxCfg = coinTaxConfigFromEnv(process.env);
+      const loopTaxBook = loopTaxCfg.enabled ? new CoinTaxBook(loopTaxCfg, async (token, holder) => {
+            if (!loopOnMain) loopThrottle.beginCheck();
+            try { return await testCoinTax(loopNodeRpc, token, holder); }
+            catch (e) {
+                  if (e instanceof LoopNodeBusy) { loopThrottle.busySkips++; return { verdict: null, why: e.message }; }
+                  return { verdict: null, why: (e as Error).message };
+            }
+      }, {
+            file: 'data/coin-tax.json',
+            log: (m) => console.log(m),
+            symbolOf: (t) => symbolOf('robinhood', t),
+            alwaysOk: [ROBINHOOD_TOKENS.WETH, ROBINHOOD_TOKENS.USDG],
+      }) : null;
+      if (loopTaxBook) setInterval(() => loopTaxBook.save(), 60_000).unref?.();
       const loopTrader = new LoopTrader(loopCfg, {
+            ...(loopTaxBook ? { coinTax: loopTaxBook } : {}),
             bases: [ROBINHOOD_TOKENS.WETH, ROBINHOOD_TOKENS.USDG],
             env: {
                   decimalsOf: (t) => TOKEN_DECIMALS.robinhood?.[t.toLowerCase()],
@@ -1967,6 +1987,8 @@ if (loopWorkerOn) {
                         sharedBudget: !!loopNodeBudget,
                   },
                   statsMs: 30_000, peekMs: 15 * 60_000, logPerMin: 60,
+                  // COIN TAX TEST (Oct 20, core/coinTax.ts): LOOP_TAX_TEST=0 = off.
+                  tax: { cfg: coinTaxConfigFromEnv(process.env), file: 'data/coin-tax.json' },
             },
             feeder,
             // Same rule as LoopNodeThrottle.sharedHasRoom (core/loopNode.ts):
