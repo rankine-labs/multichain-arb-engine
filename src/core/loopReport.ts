@@ -68,6 +68,7 @@ export function coinsText(h: LoopHour): string | null {
     if (c.taxPools) parts.push(`pools left out ${c.taxPools}`);
     if (c.waitTest) parts.push(`waiting for coin test ${c.waitTest}`);
     if (c.tax.waiting) parts.push(`coin tests queued ${c.tax.waiting}`);
+    if (c.tax.unclear) parts.push(`coin tests unclear ${c.tax.unclear}${c.tax.topUnclear ? ` (mostly: ${c.tax.topUnclear[0]})` : ''}`);
   }
   if (c.benchStarts || c.benchedNow || c.benchedSkips) parts.push(`benched routes ${c.benchStarts} (now ${c.benchedNow}), skipped benched ${c.benchedSkips}`);
   return parts.length ? parts.join(', ') : null;

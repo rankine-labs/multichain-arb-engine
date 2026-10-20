@@ -155,6 +155,7 @@ function start(cfg: LoopWorkerInit): void {
   // when no loop check is running (the loop trader makes sure of that).
   const taxBook = cfg.tax?.cfg.enabled ? new CoinTaxBook(cfg.tax.cfg, async (token, holder) => {
     const th = throttle!;
+    guard!.noteStart(); // a fresh start for "slow down" bookkeeping, like a loop check
     th.beginCheck();
     try { return cfg.testHooks && cfg.fakeCheck ? { verdict: 'ok' as const } : await testCoinTax(rpc, token, holder); }
     catch (e) {

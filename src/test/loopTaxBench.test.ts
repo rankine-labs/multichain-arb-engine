@@ -102,6 +102,7 @@ function fakeNode(o: { bal: bigint; taxPct?: number; outOk?: boolean; backOk?: b
     now += 61_000;
     await book.runNext();
     assert(book.verdict(A(12)) === undefined && book.stats().unclear === 1, 'unclear answer: nothing recorded');
+    assert(logs.some((l) => l.includes("couldn't tell")) && book.stats().topUnclear?.[1] === 1, 'unclear answer logged, reason counted for the hour line');
     book.request(A(12), POOL);
     assert(book.stats().waiting === 0, 'unclear coin not asked again for 10 minutes');
     now += 11 * 60_000;
@@ -119,7 +120,15 @@ function fakeNode(o: { bal: bigint; taxPct?: number; outOk?: boolean; backOk?: b
     now += 18 * 3600_000;
     again.request(A(11), POOL);
     assert(again.stats().waiting === 1, 'taxed coin re-tested after 24 h');
-    assert(!coinTaxConfigFromEnv({ LOOP_TAX_TEST: '0' }).enabled && coinTaxConfigFromEnv({}).enabled, 'LOOP_TAX_TEST=0 turns it off; on by default');
+    assert(!coinTaxConfigFromEnv({ LOOP_TAX_TEST: '0' }).enabled && coinTaxConfigFromEnv({}).enabled && coinTaxConfigFromEnv({}).perMin === 10, 'LOOP_TAX_TEST=0 turns it off; on by default, 10 tests a minute');
+    // A busy node: tried again after 1 minute (not 10).
+    let t2 = 0;
+    const busyBook = new CoinTaxBook(cfg, async () => ({ verdict: null, why: 'skipped: node busy' }), { now: () => t2 });
+    busyBook.request(A(20), POOL); await busyBook.runNext();
+    t2 += 30_000; busyBook.request(A(20), POOL);
+    const early = busyBook.stats().waiting;
+    t2 += 31_000; busyBook.request(A(20), POOL);
+    assert(early === 0 && busyBook.stats().waiting === 1, 'node busy: tried again after 1 minute');
     fs.rmSync(dir, { recursive: true, force: true });
   }
 
@@ -145,7 +154,7 @@ function fakeNode(o: { bal: bigint; taxPct?: number; outOk?: boolean; backOk?: b
     asked: [string, string][] = [];
     runs = 0;
     pending: string[] = [];
-    verdict(t: string) { return this.v.get(t.toLowerCase()); }
+    verdict(t: string) { return t.toLowerCase() === W ? 'ok' : this.v.get(t.toLowerCase()); }
     request(t: string, holder: string) { this.asked.push([t, holder]); if (!this.pending.includes(t)) this.pending.push(t); }
     hasWork() { return this.pending.length > 0; }
     async runNext() { const t = this.pending.shift(); if (!t) return false; this.runs++; this.v.set(t, this.result(t)); return true; }
@@ -186,6 +195,14 @@ function fakeNode(o: { bal: bigint; taxPct?: number; outOk?: boolean; backOk?: b
     assert(h.wouldMake === 1, 'and the real profit counted');
   }
   {
+    // Coins are tested ahead of time: pools with no paying loop still get their coins queued.
+    const gate = new FakeGate();
+    const t = mk({}, [], gate, () => ({ status: 'loss' }));
+    clock += 120_000;
+    t.onUpdate([v2(91, W, A(500), 1_000, 1_000), v2(92, A(500), A(501), 1_000, 1_000)]);
+    assert(gate.asked.some(([c]) => c === A(500)) && gate.asked.some(([c]) => c === A(501)) && !gate.asked.some(([c]) => c === W), 'coins on loop pools tested ahead of time (base coins never)');
+  }
+  {
     // A taxed coin: its pools are left out, so the loop is never even found.
     const checks: LoopTrade[] = [];
     const gate = new FakeGate();
@@ -198,7 +215,7 @@ function fakeNode(o: { bal: bigint; taxPct?: number; outOk?: boolean; backOk?: b
     assert(h.found === 0 && checks.length === 0 && t.finder.cycleCount() === 0, 'taxed coin: its pools are left out, no loop built, no check');
     assert(h.coins?.taxPools === 2, `hour line: 2 pools left out (${h.coins?.taxPools})`);
     const line = loopLogLine(h, 5, 'hour');
-    assert(line.includes('pools left out 2') && line.includes('coins tax-tested 1 (taxed 1'), `log line shows it: ${line.slice(line.indexOf('coins'))}`);
+    assert(line.includes('pools left out 2') && line.includes('(taxed 1,'), `log line shows it: ${line.slice(line.indexOf('coins'))}`);
     assert(formatLoopHour(h, 5).includes('pools left out 2'), 'Telegram block shows it');
   }
   {

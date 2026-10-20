@@ -24,6 +24,8 @@ import type { Rpc } from '../execution/simulator';
 //   on later); a taxed or blocked coin after 24 hours.
 //
 //   Results are saved to data/coin-tax.json so a restart doesn't re-test.
+//   Coins on the loop pools are tested ahead of time (LOOP_TAX_TESTS_PER_MIN,
+//   default 10 a minute), so most are known before a loop through them pays.
 //   LOOP_TAX_TEST=0 turns all of this off (loops behave exactly as before).
 // ============================================================================
 
@@ -53,7 +55,7 @@ export function coinTaxConfigFromEnv(env: Record<string, string | undefined> = p
   const raw = (env.LOOP_TAX_TEST ?? '').trim().toLowerCase();
   return {
     enabled: !(raw === '0' || raw === 'false' || raw === 'off'),
-    perMin: Math.round(num(env.LOOP_TAX_TESTS_PER_MIN, 6, 1, 60)),
+    perMin: Math.round(num(env.LOOP_TAX_TESTS_PER_MIN, 10, 1, 60)),
     okRecheckMs: 6 * 3600_000,
     badRecheckMs: 24 * 3600_000,
     retryMs: 10 * 60_000,
@@ -138,7 +140,7 @@ export interface CoinTaxGate {
   // Report numbers (cumulative since start).
   stats(): CoinTaxStats;
 }
-export interface CoinTaxStats { tested: number; ok: number; taxed: number; blocked: number; waiting: number; unclear: number; taxedNames: string[] }
+export interface CoinTaxStats { tested: number; ok: number; taxed: number; blocked: number; waiting: number; unclear: number; taxedNames: string[]; topUnclear?: [string, number] | null }
 
 export class CoinTaxBook implements CoinTaxGate {
   private recs = new Map<string, TaxRec>();
@@ -147,6 +149,8 @@ export class CoinTaxBook implements CoinTaxGate {
   private retryAt = new Map<string, number>();
   private times: number[] = [];
   private unclear = 0;
+  private unclearWhy = new Map<string, number>();
+  private lastUnclearLog = 0;
   private dirty = false;
   private lastSave = 0;
 
@@ -213,7 +217,17 @@ export class CoinTaxBook implements CoinTaxGate {
     catch (e) { r = { verdict: null, why: (e as Error).message }; }
     if (r.verdict === null) {
       this.unclear++;
-      this.retryAt.set(job.token, this.now() + this.cfg.retryMs);
+      // Why it couldn't tell (shown in the hour line, logged at most once a minute).
+      const why = (r.why ?? 'unknown').replace(/0x[0-9a-fA-F]{8,}/g, '0x..').slice(0, 60);
+      this.unclearWhy.set(why, (this.unclearWhy.get(why) ?? 0) + 1);
+      if (this.unclearWhy.size > 20) this.unclearWhy.clear();
+      if (this.now() - this.lastUnclearLog > 60_000) {
+        this.lastUnclearLog = this.now();
+        this.o.log?.(`[loop] coin test for ${this.sym(job.token)} couldn't tell (${why}): tried again later`);
+      }
+      // A busy node is a passing problem: try again in 1 minute, not 10.
+      const busy = /busy|too long|slow down|429|rate/i.test(why);
+      this.retryAt.set(job.token, this.now() + (busy ? 60_000 : this.cfg.retryMs));
       if (this.retryAt.size > 5_000) this.retryAt.clear();
       return true;
     }
@@ -237,7 +251,8 @@ export class CoinTaxBook implements CoinTaxGate {
       if (r.v === 'ok') ok++;
       else { if (r.v === 'taxed') taxed++; else blocked++; if (names.length < 8) names.push(this.sym(t)); }
     }
-    return { tested: ok + taxed + blocked, ok, taxed, blocked, waiting: this.queue.length, unclear: this.unclear, taxedNames: names };
+    const top = [...this.unclearWhy.entries()].sort((a, b) => b[1] - a[1])[0] ?? null;
+    return { tested: ok + taxed + blocked, ok, taxed, blocked, waiting: this.queue.length, unclear: this.unclear, taxedNames: names, topUnclear: top };
   }
 
   // ---- saved results (data/coin-tax.json) ----

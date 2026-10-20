@@ -1773,7 +1773,7 @@ if (loopCfg.enabled && !loopWorkerOn) {
       // node, only while no loop check runs. LOOP_TAX_TEST=0 = off.
       const loopTaxCfg = coinTaxConfigFromEnv(process.env);
       const loopTaxBook = loopTaxCfg.enabled ? new CoinTaxBook(loopTaxCfg, async (token, holder) => {
-            if (!loopOnMain) loopThrottle.beginCheck();
+            if (!loopOnMain) { loopGuard.noteStart(); loopThrottle.beginCheck(); }
             try { return await testCoinTax(loopNodeRpc, token, holder); }
             catch (e) {
                   if (e instanceof LoopNodeBusy) { loopThrottle.busySkips++; return { verdict: null, why: e.message }; }
