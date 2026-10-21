@@ -11,7 +11,16 @@
 //     warm          accounts / slots the bot will ask about -> {ok}
 //     call          run calls (check engine: check::proto_types::CallRequest)
 //     size_search   find the best trade size (check::proto_types::SizeSearchRequest)
-//     status        counters and health
+//     status        counters and health ({"pools":true} adds copy 2's
+//                   per-pool list: address, v4Id, kind, state, reason)
+//   Copy 2 only (ARBSIM_SOURCE=pool-events, see copy2/intake.rs):
+//     track         {pools:[{address, v4Id?, kind, token0, token1, fee,
+//                   tickSpacing}], coinSlots?:{"0xcoin":{layout,slot}}}
+//                   -> {ok, tracked, skipped}
+//     pool_logs     {block, timestamp, l1Block?, baseFee?, prevBlock?,
+//                   logs:[raw eth logs]} (no answer)
+//     block_tick    {block, timestamp, l1Block?, baseFee?, prevBlock?}
+//                   (no answer)
 //
 //   `at` (which state a call / size_search is about):
 //     {"after":"head"}          newest replayed block (default)
