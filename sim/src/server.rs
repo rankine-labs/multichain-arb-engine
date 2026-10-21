@@ -206,6 +206,7 @@ pub fn handle(ctx: &Ctx, req: &Value) -> Value {
             None => bad_request(&id, "coin_slots needs ARBSIM_SOURCE=pool-events"),
         },
         Some("call") => {
+            let req = &caller_as_empty(ctx, req);
             let r: CallRequest = match serde_json::from_value(req.clone()) {
                 Ok(r) => r,
                 Err(e) => return bad_request(&id, &format!("call: {e}")),
@@ -213,6 +214,7 @@ pub fn handle(ctx: &Ctx, req: &Value) -> Value {
             check(ctx, &id, &r.at, t0, |view, c| handle_call(view, c, &r))
         }
         Some("size_search") => {
+            let req = &caller_as_empty(ctx, req);
             let r: SizeSearchRequest = match serde_json::from_value(req.clone()) {
                 Ok(r) => r,
                 Err(e) => return bad_request(&id, &format!("size_search: {e}")),
@@ -222,6 +224,44 @@ pub fn handle(ctx: &Ctx, req: &Value) -> Value {
         Some(t) => bad_request(&id, &format!("unknown request type '{t}'")),
         None => bad_request(&id, "request has no type"),
     }
+}
+
+/// Copy 2 only: the CALLER (`from`) of a check is usually a plain wallet
+/// (the bot's sim caller, the checker's probe address) that copy 2 never
+/// follows, so its basics are unknown and every check would answer "miss".
+/// A check runs with gas price 0, no fee charged, no balance / nonce checks,
+/// so the caller's basics only matter if the called code reads the caller's
+/// own ETH balance / code / nonce. We therefore answer as if the request had
+/// the override {from: {balance 0, nonce 0, code empty}} (only when the
+/// request doesn't override `from` itself and the copy doesn't know it).
+/// The answer is EXACTLY what the node gives for the same call with that
+/// override (the checker should pass it to the node too when comparing).
+fn caller_as_empty(ctx: &Ctx, req: &Value) -> Value {
+    let Some(_) = &ctx.copy2 else { return req.clone() };
+    let mut out = req.clone();
+    let mut froms: Vec<String> = Vec::new();
+    if let Some(cs) = req.get("calls").and_then(|c| c.as_array()) {
+        froms.extend(cs.iter().filter_map(|c| c.get("from").and_then(|f| f.as_str()).map(|s| s.to_string())));
+    }
+    if let Some(f) = req.get("template").and_then(|t| t.get("from")).and_then(|f| f.as_str()) {
+        froms.push(f.to_string());
+    }
+    let head = ctx.shared.head();
+    for f in froms {
+        let Ok(a) = crate::check::hexutil::parse_address(&f) else { continue };
+        let known = head.as_ref().is_some_and(|h| !matches!(h.snap.account(a), crate::state::Lookup::Missing));
+        let has_ov = req.get("overrides").and_then(|o| o.as_object()).is_some_and(|o| {
+            o.keys().any(|k| crate::check::hexutil::parse_address(k).ok() == Some(a))
+        });
+        if known || has_ov {
+            continue;
+        }
+        if !out.get("overrides").is_some_and(|o| o.is_object()) {
+            out["overrides"] = json!({});
+        }
+        out["overrides"][format!("{a:#x}")] = json!({ "balance": "0x0", "nonce": "0x0", "code": "0x" });
+    }
+    out
 }
 
 /// Pick the state for `at`, run the check, learn from misses.
@@ -254,6 +294,9 @@ fn check(ctx: &Ctx, id: &Value, at: &Value, t0: Instant, run: impl Fn(&dyn State
         let missing = parse_missing(&answer);
         if !missing.is_empty() {
             Stats::inc(&sh.stats.misses);
+            if let Some(c) = &ctx.copy2 {
+                c.note_misses(&missing);
+            }
             // Copy 2: missing because a pool on the route isn't ready?
             if let Some(why) = ctx.copy2.as_ref().and_then(|c| c.unsure_reason(&missing)) {
                 answer["unknown"] = json!("unsure_pool");

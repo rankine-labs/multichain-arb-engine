@@ -272,6 +272,17 @@ trade ~20 ms.
   - Soak (plan 100 HTTP req/s, RPS 80, 8 in flight, 300 ms answers, checks
     missing values at 2x, 40x time): 800/800 ready at 67 simulated s, 133
     HTTP requests in total, 0 x 429.
+- Dry runs #11b/#12 fixes:
+  - Every "unknown: miss" answer lists its items in `missing`
+    ([{account, slot?}]); status copy2.missesByClass counts them by class.
+  - Caller: in copy-2 mode a check's `from` that the copy doesn't know is
+    run as if the request had the override {from: {balance 0, nonce 0, code
+    empty}} (only if the request doesn't override `from`). Exactly the
+    node's answer for the same call WITH that override; differs only if the
+    called code reads the caller's own ETH balance / code / nonce.
+  - Loads / probes / traces / fills read at the copy's head (or the node's
+    tip if behind) AS OF WHEN THE JOB STARTS, not when queued. A catch-up
+    more than 8 blocks old restarts that pool's load at the newest block.
 - Status: `status` -> `copy2` {pools, loading, ready, unsure, lastBlock,
   unsureReasons, counters}; with {"pools": true} also `list` of {address,
   v4Id, kind, state, reason, events}. Checks touching a pool that isn't

@@ -460,6 +460,10 @@ pub struct C2Shared {
     pub load_round: Mutex<LoadRound>,
     /// Node's newest block as the loaders last saw it.
     pub node_tip: Arc<AtomicU64>,
+    /// Newest block applied, shared with the loaders.
+    pub head_block: Arc<AtomicU64>,
+    /// Items checks found missing, by class (status).
+    pub misses: Mutex<HashMap<String, u64>>,
     /// What the loader threads are doing (status).
     pub loader: Arc<LoaderStats>,
     /// Background work in flight (for status): (node jobs, pools carrying).
@@ -580,6 +584,34 @@ impl Copy2Handle {
         let _ = self.tx.send(Input::Stop);
     }
 
+    /// Count the items a check found missing, by class (status): pool /
+    /// coin / other contract / account, slot or basics.
+    pub fn note_misses(&self, missing: &[MissItem]) {
+        let reg = self.c2.reg.read().unwrap();
+        let mut m = self.c2.misses.lock().unwrap();
+        for it in missing {
+            let (a, what) = match it {
+                MissItem::Account(a) => (*a, "basics"),
+                MissItem::Slot(a, _) => (*a, "slot"),
+                MissItem::Code(_) => {
+                    *m.entry("code".into()).or_default() += 1;
+                    continue;
+                }
+            };
+            let who = if reg.by_addr.contains_key(&a) {
+                let ready = reg.pools_of(&a).iter().all(|k| reg.pools.get(k).is_some_and(|e| e.state == PoolState::Ready));
+                if ready { "ready pool" } else { "pool not ready" }
+            } else if reg.holders.contains_key(&a) {
+                "coin"
+            } else if reg.owner_of.contains_key(&a) {
+                "pool's own account"
+            } else {
+                "other account"
+            };
+            *m.entry(format!("{who} {what}")).or_default() += 1;
+        }
+    }
+
     /// If a check's missing items belong to a pool that isn't ready: why.
     pub fn unsure_reason(&self, missing: &[MissItem]) -> Option<String> {
         let reg = self.c2.reg.read().unwrap();
@@ -620,6 +652,7 @@ impl Copy2Handle {
             "loadingReasons": top_reasons(reg.pools.values().filter(|e| e.state == PoolState::Loading).map(|e| e.reason.as_str())),
             "counters": Value::Object(self.c2.stats.json()),
             "loader": self.c2.loader.json(),
+            "missesByClass": self.c2.misses.lock().unwrap().clone(),
         });
         if with_pools {
             let list: Vec<Value> = reg
@@ -823,13 +856,15 @@ pub fn manual(sh: Arc<Shared>, fills: Arc<FillQueue>, cfg: C2Config) -> (Intake,
         node_requests: Arc::new(AtomicU64::new(0)),
         load_round: Mutex::new(LoadRound::default()),
         node_tip: Arc::new(AtomicU64::new(0)),
+        head_block: Arc::new(AtomicU64::new(0)),
+        misses: Mutex::new(HashMap::new()),
         loader: Arc::new(LoaderStats::default()),
         in_flight: Mutex::new((0, 0)),
     });
     let loaders = sh
         .node
         .clone()
-        .map(|n| Loaders::spawn(cfg.loaders, n, tx.clone(), c2.node_requests.clone(), c2.node_tip.clone(), c2.loader.clone()));
+        .map(|n| Loaders::spawn(cfg.loaders, n, tx.clone(), c2.node_requests.clone(), c2.node_tip.clone(), c2.loader.clone(), c2.head_block.clone()));
     let i = Intake {
         sh: sh.clone(),
         c2: c2.clone(),
@@ -1477,6 +1512,7 @@ impl Intake {
         }
         self.last_block = Some(block);
         self.c2.last_block.store(block, Ordering::Relaxed);
+        self.c2.head_block.store(block, Ordering::Relaxed);
         self.sh.notify();
     }
 
@@ -2362,6 +2398,17 @@ impl Intake {
     fn send_need_job(&mut self, key: PoolKey, part: Partial, items: Vec<MissItem>) {
         let gen = part.gen;
         let at = part.cursor.0.saturating_sub(1);
+        // An old block is a slow archive read on this node: start the load
+        // over at the newest block instead (it then carries only a few blocks).
+        if self.last_block.unwrap_or(0).saturating_sub(at) > 8 {
+            self.partials.insert(key, part);
+            self.retry_later_quiet(key, gen, "catch-up block too old, reloading at the newest block");
+            if let Some(e) = self.c2.reg.write().unwrap().pools.get_mut(&key) {
+                e.retry_at = Instant::now();
+                e.fails = e.fails.saturating_sub(1);
+            }
+            return;
+        }
         self.partials.insert(key, part);
         let id = self.new_job(JobFor::Need { key, gen, items: items.clone() });
         match &self.loaders {

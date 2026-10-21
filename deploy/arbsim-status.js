@@ -183,6 +183,9 @@ async function main() {
       lines.push(`    last node answer ${ld.secondsSinceLastAnswer ?? '?'} s ago` +
         (ld.secondsSinceLastAnswer > 30 ? '  <-- STUCK? see "copy2 WATCHDOG" in pm2 logs arbsim' : ''));
     }
+    if (c2.missesByClass && Object.keys(c2.missesByClass).length) {
+      lines.push(`    checks' missing items: ${Object.entries(c2.missesByClass).map(([k, v]) => `${k} ${n(v)}`).join(', ')}`);
+    }
     const show = (title, list) => {
       if (Array.isArray(list) && list.length) lines.push(`    ${title}: ${list.slice(0, 5).map((r) => `${String(r.why).replace(/^loading: /, '')} (${n(r.n)})`).join('; ')}`);
     };

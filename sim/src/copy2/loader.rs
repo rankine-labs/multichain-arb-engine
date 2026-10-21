@@ -303,14 +303,17 @@ struct Env {
     requests: Arc<AtomicU64>,
     tip: Arc<Tip>,
     stats: Arc<LoaderStats>,
+    head: Arc<AtomicU64>,
 }
 
 impl Loaders {
     /// Start `n` workers (= at most `n` node requests in flight). Answers go
     /// into `out` (the intake's input). `tip_out`: node's newest block.
-    pub fn spawn(n: usize, node: Arc<dyn NodeApi>, out: SyncSender<Input>, requests: Arc<AtomicU64>, tip_out: Arc<AtomicU64>, stats: Arc<LoaderStats>) -> Loaders {
+    /// `head`: the copy's newest block (loads read at min(head, node tip)
+    /// as of when the job STARTS, not when it was queued).
+    pub fn spawn(n: usize, node: Arc<dyn NodeApi>, out: SyncSender<Input>, requests: Arc<AtomicU64>, tip_out: Arc<AtomicU64>, stats: Arc<LoaderStats>, head: Arc<AtomicU64>) -> Loaders {
         let q = Arc::new(Queue { m: Mutex::new(Lanes { urgent: VecDeque::new(), bulk: VecDeque::new(), closed: false }), cv: Condvar::new(), stats: stats.clone() });
-        let env = Env { node, out, requests, tip: Arc::new(Tip { known: Mutex::new((0, None)), out: tip_out }), stats: stats.clone() };
+        let env = Env { node, out, requests, tip: Arc::new(Tip { known: Mutex::new((0, None)), out: tip_out }), stats: stats.clone(), head };
         let n = n.max(1);
         stats.threads.store(n as u64, Ordering::Relaxed);
         for i in 0..n {
@@ -487,7 +490,10 @@ fn one(env: &Env, job: Job) -> (&'static str, Done) {
                     Err(e) => Err(e),
                 }
             } else {
-                env.tip.at_most(node, block)
+                // Read at the NEWEST block (old blocks are slow archive reads
+                // on this node and have no proofs): the copy's head now, or
+                // the node's tip if it is behind. The intake carries forward.
+                env.tip.at_most(node, block.max(env.head.load(Ordering::Relaxed)))
             };
             let res = at.and_then(|b| {
                 let class = if bulk { Class::Bulk } else { Class::Fill };
@@ -499,14 +505,16 @@ fn one(env: &Env, job: Job) -> (&'static str, Done) {
             }
         }
         Job::Trace { id, block, coin, holder } => {
-            let res = env.tip.at_most(node, block).and_then(|b| trace_balance(node, b, coin, holder).map(|r| (b, r)));
+            let want = block.max(env.head.load(Ordering::Relaxed));
+            let res = env.tip.at_most(node, want).and_then(|b| trace_balance(node, b, coin, holder).map(|r| (b, r)));
             match res {
                 Ok((b, r)) => ("trace", Done::Trace { id, block: b, coin, holder, res: Ok(r) }),
                 Err(e) => ("trace", Done::Trace { id, block, coin, holder, res: Err(e) }),
             }
         }
         Job::Probe { id, coin, block } => {
-            let res = env.tip.at_most(node, block).and_then(|b| probe_layout(node, coin, b));
+            let want = block.max(env.head.load(Ordering::Relaxed));
+            let res = env.tip.at_most(node, want).and_then(|b| probe_layout(node, coin, b));
             ("probe", Done::Probe { id, coin, res })
         }
         Job::Tip { id } => {

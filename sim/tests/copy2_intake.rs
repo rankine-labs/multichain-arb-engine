@@ -55,6 +55,10 @@ struct FakeChain {
     proofs: Mutex<u32>,
     /// Like this Nitro node: eth_getProof only at the newest block.
     proof_tip_only: Mutex<bool>,
+    /// Real code for some contracts (others: one 0x00 byte).
+    codes: Mutex<HashMap<Address, Vec<u8>>>,
+    /// Blocks eth_getProof was asked at.
+    proof_blocks: Mutex<Vec<u64>>,
     /// eth_getStorageAt requests seen.
     storage_reads: Mutex<u32>,
 }
@@ -129,10 +133,15 @@ impl NodeApi for FakeChain {
                     "eth_getProof" => {
                         // Like Nitro: balance, nonce, code hash + storage values in order.
                         *self.proofs.lock().unwrap() += 1;
+                        self.proof_blocks.lock().unwrap().push(blk(2));
                         let acct = parse_address(p[0].as_str().unwrap()).unwrap();
                         let st = self.at(blk(2));
                         let exists = st.contains_key(&acct);
-                        let code_hash = if exists { keccak256([0u8]) } else { revm::primitives::KECCAK_EMPTY };
+                        let code_hash = match self.codes.lock().unwrap().get(&acct) {
+                            Some(c) => keccak256(c),
+                            None if exists => keccak256([0u8]),
+                            None => revm::primitives::KECCAK_EMPTY,
+                        };
                         let sp: Vec<Value> = p[1]
                             .as_array()
                             .unwrap()
@@ -155,6 +164,9 @@ impl NodeApi for FakeChain {
                     // Contracts (anything with storage) have code, like on chain.
                     "eth_getCode" => {
                         let acct = parse_address(p[0].as_str().unwrap()).unwrap();
+                        if let Some(c) = self.codes.lock().unwrap().get(&acct) {
+                            return Ok(json!(format!("0x{}", c.iter().map(|b| format!("{b:02x}")).collect::<String>())));
+                        }
                         Ok(json!(if self.at(blk(1)).contains_key(&acct) { "0x00" } else { "0x" }))
                     }
                     "eth_call" => {
@@ -1279,4 +1291,76 @@ fn proofs_refused_for_older_blocks_are_read_the_plain_way_at_that_block() {
     assert!(*r.chain.proofs.lock().unwrap() >= 1);
     assert!(*r.chain.storage_reads.lock().unwrap() >= 1);
     assert_eq!(r.h.c2.stats.node_errors.load(std::sync::atomic::Ordering::Relaxed), 0);
+}
+
+#[test]
+fn ready_pool_answers_a_getter_call_from_an_unknown_caller_at_a_recent_block() {
+    use std::time::{Duration, Instant};
+    let chain = Arc::new(FakeChain::new());
+    chain.set(100, genesis());
+    // getReserves-like getter: return slot 8.
+    chain.codes.lock().unwrap().insert(a(V2P), vec![0x60, 0x08, 0x54, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3]);
+    let ctx = arbsim::serve::build_with(Config::for_tests(), Some(chain.clone() as Arc<dyn NodeApi>), arbsim::serve::Source::PoolEvents);
+    let c2 = ctx.copy2.clone().unwrap();
+    c2.track_json(&json!(1), &json!({"pools": [{"address": format!("{}", a(V2P)), "kind": "v2", "token0": format!("{}", a(COIN0)), "token1": format!("{}", a(COIN1))}]}));
+    let t0 = Instant::now();
+    let mut b = 100u64;
+    while c2.status_json(false)["ready"] != json!(1) {
+        let mut m = tick(b, 1000 + b);
+        m.prev_block = if b > 100 { Some(b - 1) } else { None };
+        c2.block(m);
+        b += 1;
+        assert!(t0.elapsed() < Duration::from_secs(10));
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    for _ in 0..3 {
+        let mut m = tick(b, 1000 + b);
+        m.prev_block = Some(b - 1);
+        c2.block(m);
+        b += 1;
+    }
+    std::thread::sleep(Duration::from_millis(50));
+    let caller = Address::with_last_byte(0xe0); // an EOA nobody tracks
+    let call = |block: u64| {
+        arbsim::server::handle(&ctx, &json!({"id": 9, "type": "call", "at": {"block": block}, "calls": [{
+            "from": format!("{caller}"), "to": format!("{}", a(V2P)), "data": "0x0902f1ac", "gas": "0x100000"}]}))
+    };
+    // A block two behind the head (where the checker asks).
+    let ans = call(b - 3);
+    assert_eq!(ans["ok"], json!(true), "{ans}");
+    let want = format!("{:#066x}", u(1000) | (u(4000) << 112usize) | (u(50) << 224usize));
+    assert_eq!(ans["results"][0]["output"], json!(want), "{ans}");
+    c2.stop();
+}
+
+#[test]
+fn queued_loads_read_at_the_newest_block_when_they_start() {
+    // One worker, slow node: loads queued at block 100 start much later; they
+    // must read at the copy's newest block then, not at 100 (old blocks are
+    // slow archive reads on the real node).
+    let mut r = rig_with(C2Config { loaders: 1, load_batch: 1, ..C2Config::for_tests() });
+    *r.chain.delay_ms.lock().unwrap() = 20;
+    let pools: Vec<TrackedPool> = (0..4u8).map(|i| TrackedPool { address: a(0xd0 + i), ..v2_pool() }).collect();
+    let mut s = genesis();
+    for p in &pools {
+        let g = s[&a(V2P)].clone();
+        s.insert(p.address, g);
+        for c in [COIN0, COIN1] {
+            let v = s[&a(c)][&map_slot(a(V2P), 0)];
+            s.get_mut(&a(c)).unwrap().insert(map_slot(p.address, 0), v);
+        }
+    }
+    r.chain.set(100, s);
+    r.track(pools.clone());
+    for b in 100..140u64 {
+        r.h.block(tick(b, 1000 + b));
+        r.intake.pump();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    r.settle();
+    for p in &pools {
+        assert_eq!(r.state(p).0, PoolState::Ready);
+    }
+    let asked = r.chain.proof_blocks.lock().unwrap().clone();
+    assert!(asked.iter().any(|b| *b >= 110), "loads read at old blocks: {asked:?}");
 }
