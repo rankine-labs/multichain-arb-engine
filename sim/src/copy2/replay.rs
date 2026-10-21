@@ -54,6 +54,8 @@
 //     ExcessTokens by running the pool's own sync(); anything else = UNSURE.
 //     THE INTAKE MUST CALL finish_block() for every Algebra pool that had
 //     events, after the block's last event and before publishing the block.
+//     Notes carry their block number; notes left from an earlier block (e.g.
+//     the pool went unsure and was reloaded) are ignored, never applied.
 //
 // Interface (agreed with workstream A, see copy2/overlay.rs):
 //   apply_replay(db, pool, log, ctx) -> ApplyResult
@@ -611,6 +613,12 @@ pub fn finish_block(db: &mut Overlay, pool: &TrackedPool, ctx: &BlockCtx) -> App
         return ApplyResult::Applied;
     }
     let mut fork = db.fork();
+    if notes.block != ctx.number {
+        // Stale (from an earlier block that already ended): drop them.
+        Notes::default().store(&mut fork, pool.address, &notes);
+        db.commit(fork.changes());
+        return ApplyResult::Applied;
+    }
     match flush_notes(&mut fork, pool, &notes, ctx) {
         Ok(()) => {
             Notes::default().store(&mut fork, pool.address, &notes);
@@ -815,6 +823,10 @@ fn v3_family(db: &mut Overlay, pool: &TrackedPool, log: &PoolLog, ctx: &BlockCtx
 struct Notes {
     /// Transaction these notes belong to (zero = no notes).
     tx: B256,
+    /// Block they belong to. Notes from an earlier block are stale and
+    /// ignored: every block ends with finish_block(), which either applied
+    /// them or made the pool unsure (then it is reloaded from the node).
+    block: u64,
     /// Side events seen before the main event (hashes, in order).
     pre: Vec<B256>,
     /// ExcessTokens amounts among `pre` (coins counted as fees).
@@ -829,6 +841,7 @@ const N_POST: u64 = 2;
 const N_EXCESS0: u64 = 3;
 const N_EXCESS1: u64 = 4;
 const N_HAS_EXCESS: u64 = 5;
+const N_BLOCK: u64 = 6;
 const N_PRE_BASE: u64 = 0x100;
 const N_POST_BASE: u64 = 0x200;
 /// Most side events one action can produce (more = unsure).
@@ -857,6 +870,7 @@ impl Notes {
         let n_post = g(N_POST).saturating_to::<usize>().min(N_MAX);
         Notes {
             tx: B256::from(g(N_TX).to_be_bytes::<32>()),
+            block: g(N_BLOCK).saturating_to::<u64>(),
             pre: (0..n_pre).map(|i| B256::from(g(N_PRE_BASE + i as u64).to_be_bytes::<32>())).collect(),
             excess: if g(N_HAS_EXCESS).is_zero() { None } else { Some((g(N_EXCESS0), g(N_EXCESS1))) },
             post: (0..n_post).map(|i| B256::from(g(N_POST_BASE + i as u64).to_be_bytes::<32>())).collect(),
@@ -874,6 +888,7 @@ impl Notes {
             d.storage.insert(U256::from(s), v);
         };
         put(N_TX, U256::from_be_bytes(self.tx.0));
+        put(N_BLOCK, U256::from(self.block));
         put(N_PRE, U256::from(self.pre.len()));
         put(N_POST, U256::from(self.post.len()));
         let (e0, e1) = self.excess.unwrap_or_default();
@@ -975,7 +990,8 @@ fn algebra(db: &mut Overlay, pool: &TrackedPool, log: &PoolLog, ctx: &BlockCtx) 
     let pa = pool.address;
     let old = Notes::load(db, pa);
     let mut fork = db.fork();
-    let mut notes = old.clone();
+    // Notes from an earlier block are stale (see Notes::block).
+    let mut notes = if old.block == log.block { old.clone() } else { Notes::default() };
     // Notes from an earlier transaction: settle them first.
     if !notes.is_empty() && notes.tx != log.tx_hash {
         flush_notes(&mut fork, pool, &notes, ctx)?;
@@ -1004,6 +1020,7 @@ fn algebra(db: &mut Overlay, pool: &TrackedPool, log: &PoolLog, ctx: &BlockCtx) 
             notes.pre.push(h);
         }
         notes.tx = if notes.is_empty() { B256::ZERO } else { log.tx_hash };
+        notes.block = if notes.is_empty() { 0 } else { log.block };
         if notes.is_empty() {
             notes.excess = None;
         }
@@ -1090,7 +1107,13 @@ fn algebra(db: &mut Overlay, pool: &TrackedPool, log: &PoolLog, ctx: &BlockCtx) 
             if post.len() > N_MAX {
                 return Err(Stop::Unsure("too many Algebra side events".into()));
             }
-            let new = Notes { tx: if post.is_empty() { B256::ZERO } else { log.tx_hash }, pre: Vec::new(), excess: None, post };
+            let new = Notes {
+                tx: if post.is_empty() { B256::ZERO } else { log.tx_hash },
+                block: if post.is_empty() { 0 } else { log.block },
+                pre: Vec::new(),
+                excess: None,
+                post,
+            };
             new.store(&mut fork, pa, &old);
             Ok(fork.into_parts().1)
         }
@@ -1352,8 +1375,13 @@ mod tests {
         let before = db.changes().clone();
         assert!(matches!(finish_block(&mut db, &p, &ctx()), ApplyResult::Unsure(_)));
         assert_eq!(db.changes().accounts.len(), before.accounts.len());
+        // The same notes seen from a LATER block are stale: dropped quietly.
+        let later = BlockCtx { number: 101, ..ctx() };
+        let mut db_l = db.fork();
+        assert_eq!(finish_block(&mut db_l, &p, &later), ApplyResult::Applied);
+        assert!(!has_pending(&db_l, &p));
         // Notes encode / decode.
-        let full = Notes { tx: B256::with_last_byte(7), pre: vec![B256::with_last_byte(1)], excess: Some((U256::from(3), U256::from(4))), post: vec![B256::with_last_byte(2), B256::with_last_byte(8)] };
+        let full = Notes { tx: B256::with_last_byte(7), block: 100, pre: vec![B256::with_last_byte(1)], excess: Some((U256::from(3), U256::from(4))), post: vec![B256::with_last_byte(2), B256::with_last_byte(8)] };
         let mut db2 = Overlay::new(Snapshot::default());
         full.store(&mut db2, p.address, &Notes::default());
         assert_eq!(Notes::load(&db2, p.address), full);
@@ -1365,15 +1393,4 @@ mod tests {
         let l = log(&p, vec![topics().flash, B256::with_last_byte(3), B256::with_last_byte(4)], vec![0u8; 128]);
         assert!(matches!(apply_replay(&mut db3, &p, &l, &ctx()), ApplyResult::NeedItems(_) | ApplyResult::Unsure(_)));
     }
-}
-
-/// End of a block for one pool (Algebra side events; see B's file). The
-/// placeholder has nothing waiting.
-pub fn finish_block(_db: &mut Overlay, _pool: &TrackedPool, _ctx: &BlockCtx) -> ApplyResult {
-    ApplyResult::Applied
-}
-
-/// Algebra side events waiting for their main event? (placeholder: never)
-pub fn has_pending(_db: &Overlay, _pool: &TrackedPool) -> bool {
-    false
 }
