@@ -86,3 +86,27 @@ trade ~20 ms.
 - Keep existing tests passing: `cd sim && cargo test`, `npx tsc --noEmit`,
   `npm test` (bot), sim-compare tests.
 - Report back: what you built, tests run + results, what is NOT done, risks.
+
+## Workstream A: what was built (for C / D / the coordinator)
+- Files: copy2/overlay.rs (working copy B replays on), copy2/fields.rs (V2 +
+  Solidly), copy2/coins.rs (coin balance places), copy2/intake.rs (thread,
+  wire parsing, status), copy2/replay.rs = PLACEHOLDER: when merging B, take
+  B's replay.rs whole (same signatures: apply_replay, finish_block, has_pending).
+- Switch: ARBSIM_SOURCE=pool-events (default feed). Tunables:
+  ARBSIM_COPY2_RELOAD_MS 2000, ARBSIM_COPY2_RELOAD_MAX_MS 600000,
+  ARBSIM_COPY2_LAYOUT_RETRY_S 3600, ARBSIM_COPY2_LOAD_BATCH 20.
+- Socket (C): `track` {pools:[{address, v4Id?, kind: v2|solidly|v3|pancake-v3|
+  algebra|v4, token0, token1, fee, tickSpacing}], coinSlots?: the bot's
+  data/balance-slots.json entries} -> {ok, tracked, skipped}.
+  `pool_logs` {block, timestamp, l1Block, baseFee?, prevBlock, logs} and
+  `block_tick` {block, timestamp, l1Block, prevBlock}: no answer.
+  PLEASE send a block_tick for EVERY block without events (checks at
+  {"block":N} need a version for N, and head's time must be current) and
+  always `prevBlock` (= block of your previous pool_logs/block_tick): a
+  mismatch means a lost message and every pool is reloaded.
+  Forward ALL coin Transfer logs to/from tracked pool addresses (incl. the V4
+  PoolManager), also while pools are loading.
+- Status: `status` -> `copy2` {pools, loading, ready, unsure, lastBlock,
+  unsureReasons, counters}; with {"pools": true} also `list` of {address,
+  v4Id, kind, state, reason, events}. Checks touching a pool that isn't
+  ready answer unknown "unsure_pool".

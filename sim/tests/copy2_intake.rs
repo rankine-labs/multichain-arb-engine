@@ -470,9 +470,11 @@ fn replay_kinds_wait_for_workstream_b() {
     assert_eq!(r.head_slot(a(COIN0), map_slot(a(0xc3), 0)), Lookup::Known(u(7)));
     let swap = lg(a(0xc3), vec![topic("Swap(address,address,int256,int256,uint160,uint128,int24)")], data(&[u(0); 5]), 101, 0, 0);
     r.intake.process(msg(101, 61, vec![swap]));
+    // A malformed Swap: unsure whether replay is the placeholder ("replay
+    // not built") or workstream B's real one ("too few topics").
     let (s, why) = r.state(&v3);
-    assert_eq!(s, PoolState::Unsure);
-    assert!(why.contains("replay not built"), "{why}");
+    assert_eq!(s, PoolState::Unsure, "{why}");
+    assert!(!why.is_empty());
 }
 
 #[test]
