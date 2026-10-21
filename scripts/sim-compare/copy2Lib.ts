@@ -209,6 +209,7 @@ export class BlockAssembler {
   }
 
   addHead(h: Head): void {
+    if (h.block > this.lastHead) this.lastHead = h.block;
     if (this.lastSent && h.block <= this.lastSent) return;
     if (!this.heads.has(h.block)) this.heads.set(h.block, h);
     if (h.block > this.newest) this.newest = h.block;
@@ -238,12 +239,15 @@ export class BlockAssembler {
     return out;
   }
 
-  // Blocks missed between what we sent and a newly seen header (e.g. after
-  // a reconnect): [from, to] to read back from the node, or null.
+  // Blocks missed between the newest header seen so far and a newly seen
+  // header (e.g. after a reconnect): [from, to] to read back from the node,
+  // or null. Call BEFORE addHead for that header.
   gapBefore(block: number): { from: number; to: number } | null {
-    if (!this.lastSent || block <= this.lastSent + 1) return null;
-    return { from: this.lastSent + 1, to: block - 1 };
+    const last = Math.max(this.lastHead, this.lastSent);
+    if (!last || block <= last + 1) return null;
+    return { from: last + 1, to: block - 1 };
   }
+  private lastHead = 0;
 }
 
 // The messages for one finished block (plan shapes).
@@ -469,7 +473,8 @@ export class Score {
   checks: Record<CheckVerdict, number> = { exact: 0, 'same-verdict': 0, different: 0, 'fast-unsure': 0, 'fast-missing': 0, 'node-trouble': 0 };
   checkWhy: Record<string, number> = {};
   wrong = 0; missed = 0; profitDiffs: number = 0; gasDiffs: number[] = [];
-  updateMs: number[] = [];
+  updateMs: number[] = [];   // first report of a block arrives -> copy updated (includes our wait for the block to be complete)
+  applyMs: number[] = [];    // block handed to arbsim -> copy updated (arbsim's own part)
   nodeReads = 0;
   arbsimNodeStart: number | null = null; arbsimNodeNow: number | null = null;
   arbsimPublicStart: number | null = null; arbsimPublicNow: number | null = null;
@@ -509,7 +514,8 @@ export class Score {
         WRONG_fastSaidProfitNodeSaidNo: this.wrong, missed_nodeSaidProfitFastSaidNo: this.missed, profitAmountDiffers: this.profitDiffs,
         gasDiff: { n: this.gasDiffs.length, medianAbs: median(absGas), maxAbs: absGas.length ? Math.max(...absGas) : null }, why: this.checkWhy },
       nodeReads: { checker: this.nodeReads, arbsimPaid: this.arbsimNodeNow !== null && this.arbsimNodeStart !== null ? this.arbsimNodeNow - this.arbsimNodeStart : null, arbsimPublic: this.arbsimPublicNow !== null && this.arbsimPublicStart !== null ? this.arbsimPublicNow - this.arbsimPublicStart : null },
-      timing: { how: this.ackMode, n: this.updateMs.length, logToCopyMs_median: median(this.updateMs), p90: pct(this.updateMs, 0.9), p99: pct(this.updateMs, 0.99), max: this.updateMs.length ? Math.max(...this.updateMs) : null },
+      timing: { how: this.ackMode, n: this.updateMs.length, logToCopyMs_median: median(this.updateMs), p90: pct(this.updateMs, 0.9), p99: pct(this.updateMs, 0.99), max: this.updateMs.length ? Math.max(...this.updateMs) : null,
+        sendToCopyMs_median: median(this.applyMs), sendToCopyMs_p90: pct(this.applyMs, 0.9) },
     };
   }
 }
@@ -535,6 +541,7 @@ export function summaryText(j: any, final = false): string {
   L.push(`   Gas difference (copy - node): median ${v(j.checks.gasDiff.medianAbs)}, worst ${v(j.checks.gasDiff.maxAbs)} gas over ${j.checks.gasDiff.n} checks.`);
   L.push(`Node reads used: checker ${j.nodeReads.checker}; test arbsim paid node ${v(j.nodeReads.arbsimPaid)}, free public node ${v(j.nodeReads.arbsimPublic)}.`);
   L.push(`Speed (report arrives -> copy updated, measured by ${j.timing.how}): median ${v(j.timing.logToCopyMs_median)} ms, 90% ${v(j.timing.p90)} ms, worst ${v(j.timing.max)} ms (${j.timing.n} blocks).`);
+  L.push(`   of which arbsim itself (block handed over -> copy updated): median ${v(j.timing.sendToCopyMs_median)} ms, 90% ${v(j.timing.sendToCopyMs_p90)} ms; the rest is waiting until the block's reports are complete (--grace-ms).`);
   const verdict = j.checks.WRONG_fastSaidProfitNodeSaidNo > 0 || j.slots.different > 0 || j.checks.different > 0
     ? 'NOT READY: the copy disagreed with the node (see probes.jsonl / checks.jsonl for each case).'
     : (j.slots.probes + j.checks.checks) === 0 ? 'NO DATA YET.'

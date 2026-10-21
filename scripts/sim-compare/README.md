@@ -227,3 +227,40 @@ Tests: `npx tsc -p scripts/sim-compare/tsconfig.json && node .scripts-build/scri
 (89 PASS lines; any FAIL exits non-zero). `npm test` covers `src/test/` only and
 still passes. To make it run these tests too, the owner of `package.json` can
 add the line above to the `test` script.
+
+## Copy 2 live dry run (`copy2-dryrun.ts`): is the event-updated pool copy right?
+
+**Plain English:** copy 2 (sim/COPY2_PLAN.md) keeps arbsim's copy of OUR pools
+current from the pools' own reports. This checker runs next to the bot, read
+only, with its OWN test arbsim and its OWN Chainstack subscription:
+
+1. starts the arbsim binary you name on a test socket (`ARBSIM_SOURCE=pool-events`,
+   own daily node allowance `--arbsim-cap`, own allowance file in `--out`)
+2. sends `track` (pools whose pair is on 2+ exchanges and whose kind copy 2
+   follows: v2, solidly, v3, pancakev3, algebra, hook-free v4; `--only-proven`
+   leaves out V3 forks) and then one `pool_logs` per block (pool reports + coin
+   Transfers to/from the pools, in block order; `block_tick` for empty blocks).
+   Missed blocks (WebSocket drop) are read back from the node.
+3. every `--every` blocks, at that block: (a) `--pools` READY pools: price,
+   liquidity and coin balances (V4: PoolManager slots via extsload) from the copy
+   vs the node, byte for byte; (b) `--checks` real 2-pool round trips through
+   the bot's own `simulateRoundTrip`, answered by the copy and by the node
+   (`debug_traceCall`, so gas is compared too): verdict, profit, gas.
+4. `summary.txt` every 5 min and at the end: pools ready/unsure, pool-state
+   match %, check match %, **WRONG** (copy said profit, node said no), node
+   reads used (checker + test arbsim), and report -> copy updated time.
+   Per case: `probes.jsonl`, `checks.jsonl`; arbsim status every 30 s in `status.jsonl`.
+
+Reads only `CHAINSTACK_WSS_ROBINHOOD` / `CHAINSTACK_RPC_ROBINHOOD` from `.env`
+(never printed). Signs nothing, sends nothing. Refuses the bot's socket.
+
+```bash
+npx tsc -p scripts/sim-compare/tsconfig.json
+nice -n 19 node .scripts-build/scripts/sim-compare/copy2-dryrun.js --arbsim <path/to/copy2 arbsim> \
+  --minutes 60 --out ~/sim-compare-runs/copy2-1 [--every 40 --pools 2 --checks 2 --rps 3 --max-node-reads 20000]
+```
+
+Tests (offline): `node .scripts-build/scripts/sim-compare/test/copy2.test.js`.
+Message and status field names follow the plan; the status reader accepts a few
+likely shapes (`copy2.pools` list/map, `readyPools`...). If workstream A's real
+names differ, change `copy2Lib.ts` only.

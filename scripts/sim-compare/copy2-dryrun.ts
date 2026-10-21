@@ -171,7 +171,7 @@ async function sendTrack(): Promise<void> {
 const asm = new BlockAssembler(GRACE_MS);
 const recentlyChanged = new Map<string, number>(); // pool key -> last block it had a report
 let backfilling = false;
-let timingWatch: { block: number; since: number } | null = null;
+let timingWatch: { block: number; since: number; sentAt: number } | null = null;
 let roundBusy = false;
 let lastRoundBlock = 0;
 const appliedWaiters: Array<{ block: number; resolve: () => void }> = [];
@@ -203,14 +203,15 @@ function sendBlock(b: BlockOut) {
     }
   }
   const since = b.firstLogAt;
+  const sentAt = Date.now();
   feed.request(msg).then((a) => {
     // arbsim answers block messages: that answer = "copy updated".
-    if (a?.ok === true) { score.ackMode = 'answer'; if (since !== null && b.logs.length) score.updateMs.push(Date.now() - since); noteApplied(b.block); }
+    if (a?.ok === true) { score.ackMode = 'answer'; if (since !== null && b.logs.length) score.updateMs.push(Date.now() - since); score.applyMs.push(Date.now() - sentAt); noteApplied(b.block); }
     else if (a && a.ok === false && score.blocksSent < 5) log(`arbsim refused a block message: ${JSON.stringify(a).slice(0, 200)}`);
   }).catch(() => {
     // No answer (fire-and-forget like `feed`): measure through `status` instead.
     if (score.ackMode === 'unknown') score.ackMode = 'status';
-    if (score.ackMode === 'status' && b.logs.length && since !== null && !timingWatch) timingWatch = { block: b.block, since };
+    if (score.ackMode === 'status' && b.logs.length && since !== null && !timingWatch) timingWatch = { block: b.block, since, sentAt };
   });
   if (b.block - lastRoundBlock >= EVERY && !roundBusy && !b.late) { lastRoundBlock = b.block; void runRound(b.block); }
 }
@@ -224,7 +225,7 @@ setInterval(async () => {
   const st = await arbsimStatus();
   polling = false;
   if (st?.block) noteApplied(st.block);
-  if (timingWatch && st?.block && st.block >= timingWatch.block) { score.updateMs.push(Date.now() - timingWatch.since); timingWatch = null; }
+  if (timingWatch && st?.block && st.block >= timingWatch.block) { score.updateMs.push(Date.now() - timingWatch.since); score.applyMs.push(Date.now() - timingWatch.sentAt); timingWatch = null; }
   else if (timingWatch && Date.now() - timingWatch.since > 5_000) timingWatch = null;
 }, 50);
 
