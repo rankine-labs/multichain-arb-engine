@@ -24,6 +24,12 @@ use revm::primitives::{Address, Bytes, B256, U256};
 
 use crate::state::MissItem;
 
+// Working copy the events are applied to (workstream A; B runs revm on it).
+pub mod overlay;
+// Replay of V3 / PancakeV3 / Algebra / V4 events (workstream B; placeholder
+// answering Unsure until B's file replaces it).
+pub mod replay;
+
 /// Which kind of pool (decides how its events are applied).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum PoolKind {
