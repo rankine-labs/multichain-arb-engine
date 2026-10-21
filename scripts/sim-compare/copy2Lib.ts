@@ -379,7 +379,9 @@ export type FastOutcome = { kind: 'answer'; results: RawAnswer[]; atBlock: numbe
 export function readFastAnswer(ans: any, expected: number): FastOutcome {
   if (!ans || ans.ok !== true) {
     const why = ans?.unknown ? String(ans.unknown) : ans?.timeout ? 'timeout' : `error: ${String(ans?.error ?? 'bad answer').slice(0, 100)}`;
-    return { kind: 'unknown', why };
+    // arbsim lists exactly what it was missing (address + slot): keep the first few.
+    const missing = Array.isArray(ans?.missing) ? ans.missing.slice(0, 5) : undefined;
+    return { kind: 'unknown', why, ...(missing ? { missing } : {}) } as FastOutcome;
   }
   const rs: any[] = Array.isArray(ans.results) ? ans.results : [];
   if (rs.length !== expected) return { kind: 'unknown', why: `${rs.length} answers for ${expected} calls` };
