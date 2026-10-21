@@ -978,7 +978,9 @@ const runSimulation = (
       // decided by the node): ask the same question "right after the trigger" as
       // soon as possible. setImmediate: never adds work to the feed handler itself.
       let fastLc: LocalCheck | null = null;
-      if (followTrigger && localSim) {
+      // (Copy 2 running: "right after this transaction" can't be answered per
+      // block, so these practice comparisons are skipped; gaps are compared instead.)
+      if (followTrigger && localSim && !localSim.copy2Running()) {
             setImmediate(() => {
                   try {
                         const trade = { token: tokenIn, amountIn: built.amountIn, hops: built.hops };

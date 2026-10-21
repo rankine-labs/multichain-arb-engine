@@ -249,6 +249,10 @@ export class FeedBlockTimes {
 
   set(block: number, timestamp: number, l1Block: number): void {
     if (!Number.isSafeInteger(block) || block < 0 || !Number.isSafeInteger(timestamp) || timestamp <= 0) return;
+    // Nitro never lets a block's time or L1 block number go backwards: a
+    // message stamped earlier than its parent block gets the parent's values.
+    const parent = this.times.get(block - 1);
+    if (parent) { timestamp = Math.max(timestamp, parent.timestamp); l1Block = Math.max(l1Block, parent.l1Block); }
     this.times.set(block, { timestamp, l1Block });
     this.noted++;
     if (block > this.newest) this.newest = block;
