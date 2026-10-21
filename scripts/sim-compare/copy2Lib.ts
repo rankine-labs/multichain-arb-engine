@@ -183,6 +183,10 @@ export interface BlockOut { block: number; timestamp: number | null; l1Block: nu
 const num = (v: unknown): number | null => { if (v === undefined || v === null || v === '') return null; try { return Number(BigInt(v as string)); } catch { return null; } };
 export const logOrder = (a: any, b: any) => (num(a.transactionIndex) ?? 0) - (num(b.transactionIndex) ?? 0) || (num(a.logIndex) ?? 0) - (num(b.logIndex) ?? 0);
 
+// How long a block whose reports arrived without its header waits for the
+// header before it is sent anyway (header then read from the node).
+export const HEADERLESS_WAIT_MS = 400;
+
 export class BlockAssembler {
   private logs = new Map<number, any[]>();
   private firstAt = new Map<number, number>();
@@ -223,7 +227,14 @@ export class BlockAssembler {
     for (const b of pending) {
       const h = this.heads.get(b);
       const first = this.firstAt.get(b);
-      const ready = (h && now - h.at >= this.graceMs) || this.newest >= b + 2 || (!h && first !== undefined && now - first >= this.maxWaitMs);
+      // A block needs its header (block time) before it can go out: arbsim
+      // refuses block messages without a timestamp. So a block whose reports
+      // came in before its header waits for the header (normally a few ms),
+      // and only after HEADERLESS_WAIT_MS is it sent anyway; the caller then
+      // reads the header from the node first (see copy2-dryrun pump()).
+      const ready = h
+        ? now - h.at >= this.graceMs || this.newest >= b + 2
+        : first !== undefined && now - first >= Math.min(this.maxWaitMs, HEADERLESS_WAIT_MS) && this.newest >= b + 1;
       if (ready) upto = b; // everything older is sent with it (order kept)
     }
     const out: BlockOut[] = [];
@@ -476,6 +487,8 @@ export class Score {
   updateMs: number[] = [];   // first report of a block arrives -> copy updated (includes our wait for the block to be complete)
   applyMs: number[] = [];    // block handed to arbsim -> copy updated (arbsim's own part)
   nodeReads = 0;
+  headersFetched = 0;  // block headers read from the node (header never came over the WebSocket)
+  blocksNoTime = 0;    // blocks dropped: no block time even from the node
   arbsimNodeStart: number | null = null; arbsimNodeNow: number | null = null;
   arbsimPublicStart: number | null = null; arbsimPublicNow: number | null = null;
   lastStatus: Copy2Status | null = null; tracked = 0; notFollowed: Record<string, number> = {};
@@ -506,7 +519,7 @@ export class Score {
     const absGas = this.gasDiffs.map(Math.abs);
     return {
       minutes: +((now - this.started) / 60_000).toFixed(1),
-      feed: { blocksSent: this.blocksSent, poolLogs: this.logsSent, coinTransfers: this.transfersSent, emptyBlockTicks: this.ticksSent, ignoredLogs: this.ignoredLogs, reorgRemovedLogs: this.removedLogs, gapsBackfilled: this.gapsBackfilled, gapBlocks: this.gapBlocks },
+      feed: { blocksSent: this.blocksSent, poolLogs: this.logsSent, coinTransfers: this.transfersSent, emptyBlockTicks: this.ticksSent, ignoredLogs: this.ignoredLogs, reorgRemovedLogs: this.removedLogs, gapsBackfilled: this.gapsBackfilled, gapBlocks: this.gapBlocks, headersFetched: this.headersFetched, blocksNoTime: this.blocksNoTime },
       pools: { followed: this.tracked, notFollowed: this.notFollowed, trackAccepted: this.trackOk, copyBlock: st?.block ?? null, ready: st?.counts.ready ?? null, unsure: st?.counts.unsure ?? null, loading: st?.counts.loading ?? null, eventsApplied: st?.eventsApplied ?? null },
       slots: { probes: allP, same: this.probes.same, different: this.probes.different, fastUnsure: this.probes['fast-unsure'], fastMissing: this.probes['fast-missing'], nodeTrouble: this.probes['node-trouble'], matchPct: pc(this.probes.same, allP), matchPctWhenAnswered: pc(this.probes.same, answeredP), why: this.probeWhy },
       checks: { checks: allC, exact: this.checks.exact, sameVerdictOnly: this.checks['same-verdict'], different: this.checks.different, fastUnsure: this.checks['fast-unsure'], fastMissing: this.checks['fast-missing'], nodeTrouble: this.checks['node-trouble'],
@@ -531,7 +544,7 @@ export function summaryText(j: any, final = false): string {
   const nf = Object.entries(j.pools.notFollowed ?? {});
   if (nf.length) L.push(`  Not followed by copy 2: ${nf.map(([k, n]) => `${n} (${k})`).join('; ')}.`);
   if (j.pools.trackAccepted === false) L.push('  WARNING: arbsim did not accept the pool list ("track"). Is the binary built from copy 2 (workstream A)?');
-  L.push(`Feed: ${j.feed.blocksSent} blocks sent (${j.feed.poolLogs} pool reports, ${j.feed.coinTransfers} coin transfers, ${j.feed.emptyBlockTicks} empty-block ticks); ${j.feed.reorgRemovedLogs} reports taken back by the chain; ${j.feed.gapBlocks} missed blocks read back from the node.`);
+  L.push(`Feed: ${j.feed.blocksSent} blocks sent (${j.feed.poolLogs} pool reports, ${j.feed.coinTransfers} coin transfers, ${j.feed.emptyBlockTicks} empty-block ticks); ${j.feed.reorgRemovedLogs} reports taken back by the chain; ${j.feed.gapBlocks} missed blocks read back from the node; ${j.feed.headersFetched ?? 0} block times read from the node; ${j.feed.blocksNoTime ?? 0} blocks dropped (no block time).`);
   L.push('');
   L.push(`1) Pool state (price, liquidity, coin balances) copy vs node at the same block: ${j.slots.same} of ${j.slots.probes} pools identical = ${pctTxt(j.slots.matchPct)}.`);
   L.push(`   Different: ${j.slots.different}. Copy said "unsure": ${j.slots.fastUnsure}. Copy could not answer: ${j.slots.fastMissing}. (Node errors, left out: ${j.slots.nodeTrouble}.)`);

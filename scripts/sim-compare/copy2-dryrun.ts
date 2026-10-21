@@ -229,11 +229,26 @@ setInterval(async () => {
   else if (timingWatch && Date.now() - timingWatch.since > 5_000) timingWatch = null;
 }, 50);
 
-function pump() {
-  if (backfilling) return;
-  for (const b of asm.due(Date.now())) sendBlock(b);
+// Sends finished blocks in order. A block that still has no block time
+// (its header never came over the WebSocket) gets its header read from the
+// node first: arbsim refuses block messages without a timestamp.
+let pumping = false;
+async function pump() {
+  if (backfilling || pumping) return;
+  pumping = true;
+  try {
+    for (const b of asm.due(Date.now())) {
+      if (b.timestamp === null) {
+        const h = await node('eth_getBlockByNumber', [hex(b.block), false]);
+        const head = h.result ? headFromNewHeads(h.result, Date.now()) : null;
+        if (head) { b.timestamp = head.timestamp; b.l1Block = head.l1Block; score.headersFetched = (score.headersFetched ?? 0) + 1; }
+      }
+      if (b.timestamp === null) { score.blocksNoTime = (score.blocksNoTime ?? 0) + 1; continue; } // can't send without a time: arbsim will see a gap and reload
+      sendBlock(b);
+    }
+  } finally { pumping = false; }
 }
-setInterval(pump, 10);
+setInterval(() => { void pump(); }, 10);
 
 // Missed blocks (e.g. the WebSocket dropped): read them back from the node
 // with the same filters, so the copy never skips a report.
