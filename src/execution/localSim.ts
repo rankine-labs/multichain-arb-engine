@@ -189,6 +189,22 @@ export class LocalSimClient {
     }
   }
 
+  // Hand one message to the sidecar without waiting for an answer (copy 2's
+  // per-block pool reports). Unlike feed frames, nothing is kept while the
+  // sidecar is unreachable: true = handed to the socket, false = dropped
+  // (not connected, or the socket is backed up). The caller then tells the
+  // sidecar "gap" with its next message, so a drop is never silent.
+  sendOneWay(msg: Record<string, unknown>): boolean {
+    try {
+      if (!this.connected || !this.sock) return false;
+      if (this.sock.writableLength > this.maxBufferedBytes) return false;
+      this.sock.write(frame({ ...msg, id: 0 }));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   // Stop for good (tests, shutdown). Questions in flight answer "unknown".
   close(): void {
     this.closed = true;

@@ -165,7 +165,7 @@ import { GapCredit } from './core/gapCredit';
 import { FablesFeeBook, readFablesFees } from './core/fablesFee';
 import { setHookedFeeSource } from './core/pairWatcher';
 import { SimBucketTally, classifySimOutcome } from './core/failReasons';
-import { makeRpc, simulateRoundTrip, simulateWithRecheck, simRpcUrl, Rpc, makeFallbackRpc, loadBalanceSlots, wssToHttps, replayRpc, ReplayCall } from './execution/simulator';
+import { makeRpc, simulateRoundTrip, simulateWithRecheck, simRpcUrl, Rpc, makeFallbackRpc, loadBalanceSlots, wssToHttps, replayRpc, ReplayCall, SimResult } from './execution/simulator';
 import { FastSender, SafetyGate, safetyConfigFromEnv } from './execution/fastSender';
 import { DEFAULT_FILTER_CONFIG } from './core/fastFilter';
 import { checkLiveReady } from './execution/liveReadiness';
@@ -502,6 +502,9 @@ const rhFreeSimRpc: Rpc = makeRpc('https://rpc.mainnet.chain.robinhood.com');
 // default): then none of the fast-check code below does anything at all.
 // Created where the Robinhood feed is set up (search "FAST CHECK: start").
 let localSim: LocalSimHost | null = null;
+// COPY 2: the pool keys (addresses / V4 ids) the block readers follow. The
+// block reader setup replaces this with its own list; until then: watched pairs.
+let copy2PoolKeys: () => string[] = () => robinhoodWatcher.watchedPairPools().flat();
 // Per-node usage today (speed limits + daily allowances, core/nodeBudget.ts):
 // restored so a restart doesn't reset the counts, saved every minute.
 loadNodeUsage('data/node-usage.json');
@@ -776,13 +779,24 @@ const buildCheck = (
 //           1 in 10 fast decisions is re-checked with the node afterwards
 //           (background), which can switch the fast check back to practice.
 // ==========================================================================
-type FastAsk = { kind: LocalKind; triggerHash?: string; seenMs?: number; label?: string; existing?: LocalCheck | null };
+// at: which state to ask about (copy 2: right after block N); left out = as before.
+type FastAsk = { kind: LocalKind; triggerHash?: string; seenMs?: number; label?: string; existing?: LocalCheck | null; at?: Record<string, unknown> };
 // Starts a fast check for this trade (Robinhood only). null = off / not possible.
 const startFastCheck = (ask: FastAsk, b: BuiltCheck): LocalCheck | null => {
       if (!localSim) return null;
       try {
-            return localSim.begin({ kind: ask.kind, trade: b.trade, simOpts: b.simOpts, triggerHash: ask.triggerHash, seenMs: ask.seenMs ?? localSim.seenMsOf(ask.triggerHash), label: ask.label });
+            return localSim.begin({ kind: ask.kind, trade: b.trade, simOpts: b.simOpts, at: ask.at, triggerHash: ask.triggerHash, seenMs: ask.seenMs ?? localSim.seenMsOf(ask.triggerHash), label: ask.label });
       } catch { return null; }
+};
+// COPY 2 (execution/copy2.ts): the pools a check touches, for the "is every
+// pool ready" rule: both trading pools (V4: their pool ids) and the loan pool.
+const routeKeys = (buyPool: any, sellPool: any, lender?: { poolAddress?: string } | null): string[] =>
+      [buyPool?.poolAddress, sellPool?.poolAddress, lender?.poolAddress].filter((k): k is string => typeof k === 'string' && k.length > 0);
+// The block a copy-2 fast check was asked about ({block:"0x.."}), if any:
+// its node re-check then runs on that same block, so both answer the same question.
+const fastBlockTag = (lc: LocalCheck): string | undefined => {
+      const b = (lc.q.at as { block?: unknown } | undefined)?.block;
+      return typeof b === 'string' && /^0x[0-9a-f]+$/i.test(b) ? b : undefined;
 };
 // A SURE fast answer -> the same result the node path gives (on mode).
 const fastToCheck = async (lc: LocalCheck, lo: LocalOutcome, b: BuiltCheck, tokenIn: string, tradeSizeUsd: number, usdPerToken: number): Promise<RoundTripCheck> => {
@@ -814,11 +828,15 @@ const sampleWithNode = (lc: LocalCheck, b: BuiltCheck): void => {
       void (async () => {
             try {
                   const hash = lc.q.triggerHash;
-                  if (hash) {
+                  if (hash && !fastBlockTag(lc)) {
                         const spot = await findTriggerSpot(simRpc.robinhood, hash);
                         if (!spot) { lc.nodeDone(null, startMs, 'trigger not found'); return; }
                         const r = await simulateRoundTrip(replayRpc(simRpc.robinhood, spot.parent, spot.prefix, spot.time), 'robinhood', b.trade, b.simOpts);
                         lc.nodeDone(r, startMs, 'right after trigger (re-check)');
+                  } else if (fastBlockTag(lc)) {
+                        // Copy 2: the node answers for the very block the fast check used.
+                        const r = await simulateRoundTrip(simRpc.robinhood, 'robinhood', b.trade, { ...b.simOpts, blockTag: fastBlockTag(lc) });
+                        lc.nodeDone(r, startMs, 'same block (re-check)');
                   } else {
                         const r = await simulateRoundTrip(simRpc.robinhood, 'robinhood', b.trade, b.simOpts);
                         lc.nodeDone(r, startMs, 'latest (re-check)');
@@ -855,6 +873,14 @@ const checkRoundTrip = async (
       if ('skip' in b) { fast?.existing?.noNode(); return { status: 'skipped', reason: b.skip }; }
       const { decimals, lender } = b;
       const built = { amountIn: b.trade.amountIn, hops: b.trade.hops };
+      // COPY 2 (execution/copy2.ts): while the fast check follows our pools from
+      // their events, it is asked ONLY when every pool on the route (and the
+      // loan pool) is ready, about the newest block whose reports it got.
+      // Otherwise no fast check at all: the node decides, as today.
+      if (fast && !fast.existing && chain === 'robinhood' && localSim?.copy2Running()) {
+            const route = localSim.copy2Route(routeKeys(buyPool, sellPool, lender));
+            fast = route ? { ...fast, at: route.at } : undefined;
+      }
       // FAST CHECK, on mode: fast answer first; a sure one is used as is.
       let lc: LocalCheck | null = fast?.existing ?? null;
       if (fast && !lc && chain === 'robinhood' && localSim?.isOn()) {
@@ -952,7 +978,9 @@ const runSimulation = (
       // decided by the node): ask the same question "right after the trigger" as
       // soon as possible. setImmediate: never adds work to the feed handler itself.
       let fastLc: LocalCheck | null = null;
-      if (followTrigger && localSim) {
+      // (Copy 2 running: "right after this transaction" can't be answered per
+      // block, so these practice comparisons are skipped; gaps are compared instead.)
+      if (followTrigger && localSim && !localSim.copy2Running()) {
             setImmediate(() => {
                   try {
                         const trade = { token: tokenIn, amountIn: built.amountIn, hops: built.hops };
@@ -1805,6 +1833,36 @@ const loopNodeCfgShared = (() => {
 // otherwise a flash loan from an approved lender that is not on the loop.
 // LOOP_LIVE unset / 0 = loops stay practice only (nothing here runs).
 const loopLiveCfg = loopLiveConfigFromEnv(process.env);
+// The real check of a live loop. FAST CHECK (copy 2, on mode): when every pool
+// on the loop (and the loan pool) is ready in the copy, the fast check answers
+// about the newest block it has (at least the block of the trade that opened
+// the loop); a SURE answer decides, 1 in 10 is re-checked on the node for the
+// same block (that agreement count can step the fast check back to practice).
+// Anything else (off, practice, not ready, unsure): the node, as before.
+const loopLiveCheck = async (c: LoopLiveCandidate, lender: string | undefined): Promise<SimResult> => {
+      const trade = { token: c.hops[0].tokenIn, amountIn: c.amountIn, hops: c.hops };
+      const simOpts = { weth: ROBINHOOD_TOKENS.WETH, ...(lender ? { v3Lender: lender } : {}) };
+      const onNode = (blockTag?: string) => simulateRoundTrip(simRpc.robinhood, 'robinhood', trade, blockTag ? { ...simOpts, blockTag } : simOpts);
+      const host = localSim;
+      const route = host?.isOn() && host.copy2Running()
+            ? host.copy2Route([...c.poolKeys, lender], host.copy2?.forwarder.txBlockOf(c.triggerHash) ?? -1)
+            : null;
+      if (!host || !route) return onNode();
+      const lc = host.begin({ kind: 'loop_live', trade, simOpts, at: route.at, triggerHash: c.triggerHash, label: `loop ${c.label}` });
+      const lo = await lc.result;
+      const startMs = Date.now();
+      if (lo.sure) {
+            lc.decidedByLocal = true;
+            if (host.shouldSample()) {
+                  lc.sampled = true;
+                  void onNode(route.at.block).then((r) => lc.nodeDone(r, startMs, 'same block (re-check)'), () => lc.nodeDone(null, startMs, 'error'));
+            } else lc.noNode();
+            return lo.sim;
+      }
+      const r = await onNode();
+      lc.nodeDone(r, startMs, 'latest');
+      return r;
+};
 const loopLive: LoopLiveSender | null = loopCfg.enabled && loopLiveCfg.enabled ? new LoopLiveSender(loopLiveCfg, {
       now: Date.now,
       live: () => robinhoodSender.live,
@@ -1833,9 +1891,14 @@ const loopLive: LoopLiveSender | null = loopCfg.enabled && loopLiveCfg.enabled ?
             const l = pickV3Lender(lenderCandidates('robinhood'), c.base, exclude, (pool, token) => lenderBalances.canLend(pool, token, c.amountIn, LENDER_HEADROOM));
             return l ? { kind: 'flash', lender: l.poolAddress, feePips: l.feePips ?? l.feeBps * 100 } : null;
       },
-      // Same node and polling as 2-pool check-first.
-      waitForTrade: (hash) => waitForTrade(simRpc.robinhood, hash, CHECK_FIRST_POLL_MS, Math.ceil(1_800 / CHECK_FIRST_POLL_MS)),
-      check: (c, lender) => simulateRoundTrip(simRpc.robinhood, 'robinhood', { token: c.hops[0].tokenIn, amountIn: c.amountIn, hops: c.hops }, { weth: ROBINHOOD_TOKENS.WETH, ...(lender ? { v3Lender: lender } : {}) }),
+      // Same node and polling as 2-pool check-first. COPY 2 on: the trade's
+      // pool reports arriving means it is in a block (no node polling needed);
+      // not seen in time = the node is asked as before.
+      waitForTrade: async (hash) => {
+            if (localSim?.isOn() && localSim.copy2Running() && (await localSim.copy2WaitForTx(hash, 1_800)) !== null) return true;
+            return waitForTrade(simRpc.robinhood, hash, CHECK_FIRST_POLL_MS, Math.ceil(1_800 / CHECK_FIRST_POLL_MS));
+      },
+      check: (c, lender) => loopLiveCheck(c, lender),
       gasUsd: (pools, flash) => gasModel.loopUsd(pools, 0.05) + (flash ? Math.max(0, rhGasUsd(0.05, true) - rhGasUsd(0.05, false)) : 0),
       minNetUsd: () => MIN_NET_PROFIT_USD,
       usdOf: (t) => priceOracle.getUsdPrice('robinhood', t),
@@ -2360,7 +2423,23 @@ const fireTrade = async (o: {
                   let waitMs = 0;
                   let decidedBy: 'local' | 'node' = 'node';
                   const fb = localSim && o.triggerHash ? buildCheck('robinhood', o.tokenIn, o.buyPool, o.sellPool, o.tradeSizeUsd, o.usdPerTokenIn) : null;
-                  if (fb && !('skip' in fb)) {
+                  if (fb && !('skip' in fb) && localSim?.copy2Running()) {
+                        // COPY 2: answers are per block. On mode, every pool ready: wait for
+                        // the followed trade's pool reports (it is then in a block, no node
+                        // receipt polling), and ask about that block. Not ready, practice
+                        // mode, or not seen in time: today's node path below.
+                        const keys = routeKeys(o.buyPool, o.sellPool, fb.lender);
+                        if (localSim.isOn() && localSim.copy2?.notReadyWhy(keys) === null) {
+                              const blk = await localSim.copy2WaitForTx(o.triggerHash, 1_800);
+                              const route = blk !== null ? localSim.copy2Route(keys, blk) : null;
+                              if (route) {
+                                    waitMs = Date.now() - startedMs;
+                                    fastLc = startFastCheck({ kind: 'trig_live', at: route.at, triggerHash: o.triggerHash, seenMs: o.seenAtMs, label: `${symbolOf(o.chain, o.tokenIn)}/${symbolOf(o.chain, o.tokenOut)} ${o.buyPool.dex}>${o.sellPool.dex}` }, fb);
+                                    c = await fastDecide(fastLc, fb, o.tokenIn, o.tradeSizeUsd, o.usdPerTokenIn);
+                                    if (c) { decidedBy = 'local'; markStretch('check-first fast check'); }
+                              }
+                        }
+                  } else if (fb && !('skip' in fb)) {
                         fastLc = startFastCheck({ kind: 'trig_live', triggerHash: o.triggerHash, seenMs: o.seenAtMs, label: `${symbolOf(o.chain, o.tokenIn)}/${symbolOf(o.chain, o.tokenOut)} ${o.buyPool.dex}>${o.sellPool.dex}` }, fb);
                         c = await fastDecide(fastLc, fb, o.tokenIn, o.tradeSizeUsd, o.usdPerTokenIn);
                         if (c) { decidedBy = 'local'; markStretch('check-first fast check'); }
@@ -2657,6 +2736,12 @@ console.log(`[chains] enabled: ${[...ENABLED_CHAINS].join(', ')}`);
 // ==========================================================================
 localSim = createLocalSimHost(chainOn('robinhood'), {
       alert: (t) => { void sendTelegramMessage(escHtml(t)).catch(() => undefined); },
+      // COPY 2 (execution/copy2.ts): the pools the block readers follow (watched
+      // pairs + loop extra pools; set by the block reader setup below), with
+      // their full details from the price cache. Used only while the fast check
+      // runs in pool-events mode.
+      copy2Pools: () => copy2PoolKeys().map((k) => cache.get('robinhood', k)),
+      poolManager: ROBINHOOD_V4.POOL_MANAGER,
       warmSource: () => {
             const out: string[] = [];
             const exec = executorConfig('robinhood').executorAddress;
@@ -3596,6 +3681,13 @@ await chainManager.startAll();
             // applyUpdate path. The poll reader below stays quiet while the push
             // feed is healthy and takes over whenever it isn't.
             let wsReader: WsBlockReader | null = null;
+            // COPY 2 (execution/copy2.ts; fast check on and in pool-events mode):
+            // follows the same pools as the readers, gets every pushed pool event
+            // through the WebSocket's tap, and fills in outages on the same HTTP node.
+            copy2PoolKeys = () => { const t = targets(); return [...t.addrs, ...t.ids]; };
+            const copy2Link = localSim?.copy2 ?? null;
+            copy2Link?.setBackfillRpc(readerRpc);
+            if (copy2Link && !process.env.BLOCK_READER_WSS) console.log('[copy2] needs the WebSocket block reader (BLOCK_READER_WSS): without it the node decides every check');
             if (process.env.BLOCK_READER_WSS) {
                   wsReader = new WsBlockReader({
                         url: process.env.BLOCK_READER_WSS,
@@ -3613,6 +3705,8 @@ await chainManager.startAll();
                         onUpdates: (latest) => onReaderUpdates(latest),
                         // Push feed down: polling resumes from the last block it delivered.
                         onHealthChange: (healthy, last) => { if (!healthy && last > 0) blockReader.setBookmark(last - 1); },
+                        // Copy 2 only (LOCAL_SIM shadow/on): unset = exactly as before.
+                        ...(copy2Link ? { rawLogTap: copy2Link.tap } : {}),
                   });
                   wsReaderRef = wsReader; // read by the 4-hour report (connections)
                   wsFacts = wsReader; // SPEED_TRUST_WS reads its health facts (core/trustFresh.ts)
