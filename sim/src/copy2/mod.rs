@@ -24,8 +24,12 @@ use revm::primitives::{Address, Bytes, B256, U256};
 
 use crate::state::MissItem;
 
+// Where coins keep balances; coin Transfer -> pool balances (workstream A).
+pub mod coins;
 // V2 / Solidly: write the numbers the events state (workstream A).
 pub mod fields;
+// The thread that applies each block's events and publishes versions (A).
+pub mod intake;
 // Working copy the events are applied to (workstream A; B runs revm on it).
 pub mod overlay;
 // Replay of V3 / PancakeV3 / Algebra / V4 events (workstream B; placeholder
