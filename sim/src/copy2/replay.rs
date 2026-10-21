@@ -30,3 +30,14 @@ use super::{ApplyResult, BlockCtx, PoolLog, TrackedPool};
 pub fn apply_replay(_db: &mut Overlay, _pool: &TrackedPool, _log: &PoolLog, _ctx: &BlockCtx) -> ApplyResult {
     ApplyResult::Unsure("replay not built".into())
 }
+
+/// End of a block for one pool (Algebra side events; see B's file). The
+/// placeholder has nothing waiting.
+pub fn finish_block(_db: &mut Overlay, _pool: &TrackedPool, _ctx: &BlockCtx) -> ApplyResult {
+    ApplyResult::Applied
+}
+
+/// Algebra side events waiting for their main event? (placeholder: never)
+pub fn has_pending(_db: &Overlay, _pool: &TrackedPool) -> bool {
+    false
+}

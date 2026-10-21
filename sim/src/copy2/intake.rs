@@ -52,7 +52,7 @@ use serde_json::{json, Value};
 use super::coins::{balance_of_data, probe_layout, BalanceLayout};
 use super::fields::{self, apply_fields, core_slots, obs_slot, sol, topic_addr, topics, v2};
 use super::overlay::Overlay;
-use super::replay::apply_replay;
+use super::replay::{apply_replay, finish_block};
 use super::{ApplyResult, BlockCtx as ReplayCtx, PoolKind, PoolLog, TrackedPool};
 use crate::arb::{self, BlockCtx};
 use crate::check::hexutil::{parse_address, parse_bytes, parse_u256, parse_u64, to_hex};
@@ -773,6 +773,22 @@ impl Intake {
         }
         touched.sort();
         touched.dedup();
+        // End of block for replayed pools (Algebra side events still waiting,
+        // see replay.rs): must run before publishing.
+        for k in &touched {
+            let pool = {
+                let reg = self.c2.reg.read().unwrap();
+                match reg.pools.get(k) {
+                    Some(e) if e.state == PoolState::Ready && e.pool.kind == PoolKind::Algebra => e.pool.clone(),
+                    _ => continue,
+                }
+            };
+            match self.with_fetch(&mut ov, m.block, |o| finish_block(o, &pool, &rctx)) {
+                ApplyResult::Applied => {}
+                ApplyResult::Unsure(why) => self.make_unsure(*k, &format!("end of block: {why}"), Some(&mut ov), m.block),
+                ApplyResult::NeedItems(_) => self.make_unsure(*k, "end of block: still missing items", Some(&mut ov), m.block),
+            }
+        }
         self.recent.push_back((m.block, log_ids(&m.logs), touched));
         while self.recent.len() > self.sh.cfg.history {
             self.recent.pop_front();
@@ -882,7 +898,7 @@ impl Intake {
         let before: HashSet<Address> = ov.changes().accounts.keys().copied().collect();
         let res = match pool.kind {
             PoolKind::V2 | PoolKind::Solidly => apply_fields(ov, &pool, log, rctx.timestamp),
-            _ => self.replay_with_fetch(ov, &pool, log, rctx, block),
+            _ => self.with_fetch(ov, block, |o| apply_replay(o, &pool, log, rctx)),
         };
         match res {
             ApplyResult::Applied => {
@@ -920,10 +936,10 @@ impl Intake {
 
     /// Replay (workstream B), fetching what it needs at the block before
     /// (the pool's state then = our copy's, see file header), a few rounds.
-    fn replay_with_fetch(&mut self, ov: &mut Overlay, pool: &TrackedPool, log: &PoolLog, rctx: &ReplayCtx, block: u64) -> ApplyResult {
+    fn with_fetch(&mut self, ov: &mut Overlay, block: u64, mut run: impl FnMut(&mut Overlay) -> ApplyResult) -> ApplyResult {
         let rounds = self.sh.cfg.max_fill_rounds;
         for _ in 0..rounds {
-            match apply_replay(ov, pool, log, rctx) {
+            match run(ov) {
                 ApplyResult::NeedItems(items) => {
                     inc(&self.c2.stats.need_item_rounds);
                     let Some(node) = self.sh.node.clone() else { return ApplyResult::Unsure("needs node data, no node configured".into()) };
