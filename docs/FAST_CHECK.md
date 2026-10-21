@@ -58,6 +58,56 @@ After 6 hours it decides again (`⚡ FAST CHECK back ON`).
 If the fast check program is stopped, crashed or slow, the bot just uses the
 node (logged at most once a minute). It can never stop the bot.
 
+## Copy 2: the fast check follows our pools from their own reports
+
+When the fast check program runs in **pool-events mode** (`ARBSIM_SOURCE=pool-events`
+on its side, see sim/COPY2_PLAN.md), the bot notices it by itself (status
+check every 2 s) and then:
+
+- asks the block reader's WebSocket (`BLOCK_READER_WSS`, required) for
+  **every** event of our pools, every Uniswap V4 event of our V4 pool ids, and
+  coin transfers into / out of our pools, and passes them on block by block
+  (`pool_logs`, in order; `block_tick` for quiet blocks). Each block's time
+  comes from the sequencer feed. Nothing here ever waits on the node or
+  blocks the bot; a message that can't be handed over is dropped, counted,
+  and the next one makes the copy reload (never a silent gap). A WebSocket
+  outage is filled in from the HTTP node (up to 200 blocks), otherwise the
+  copy reloads.
+- tells it which pools to follow (`track`): watched pools of a type the copy
+  can follow exactly: Uniswap / PancakeSwap V2, Ramses V2 and GIGA Classic
+  (Solidly), Uniswap V3 and copies, PancakeSwap V3 and copies, Algebra
+  (Alandale, KittenSwap), Uniswap V4 **without** a hook. Not followed (the
+  node keeps checking them): V4 with a hook (Fables...), Ramses V3,
+  Slipstream copies, bins, order books, oracle pools.
+- **routes** checks: a sitting gap, a live follow-a-trade check and a live
+  loop check go to the fast check only when **every pool on the route (and
+  the loan pool) is ready** in the copy, its readiness is fresh (under 10 s),
+  and the reports are flowing without a gap. Then the fast check is asked
+  about the newest block it has. Anything else: the node, exactly as before.
+  Follow-a-trade: the trade's own pool reports say it is in a block (no node
+  receipt polling); then the fast check answers for that block.
+- In `on` mode the 1-in-10 node re-check runs on **the same block** the fast
+  check used, so the automatic step back compares like with like.
+- Hourly line adds e.g.
+  `copy 2: 412 ready, 3 unsure, 5 loading of 420 pools; routed to fast check 120, to node 30 (pool unsure 20, readiness too old 10); pool reports live: 5321 blocks passed on`
+
+Cost: the WebSocket pushes roughly 2-3 times more (billed) messages on the
+same pools (each swap also moves two coins). They count against
+`BLOCK_READER_WSS_DAILY` (400,000 a day by default); when that cap is hit the
+push feed stops, copy 2 stops being ready and the node decides. Raise the cap
+if the hourly "(pushed messages)" line shows it getting close.
+
+Settings (all optional): `LOCAL_SIM_COPY2=off` (never use copy 2),
+`COPY2_SKIP_DEXES` (exchange names never followed, comma separated),
+`COPY2_HOLD_MS` (4), `COPY2_TS_WAIT_MS` (40, wait for a block's time from the
+feed; a block whose time never comes is not sent and the copy reloads),
+`COPY2_TICK_MS` (250, 0 = no quiet-block ticks), `COPY2_STATUS_MS` (2000),
+`COPY2_MAX_STATUS_AGE_MS` (10000), `COPY2_BACKFILL_MAX` (200),
+`ARBSIM_L2_BLOCK_OFFSET` (0 on Robinhood).
+
+Log lines start with `[copy2]`; the `[blockreader]` line shows
+`copy 2 events live (N logs)`.
+
 ## Turning it off
 
 Set `LOCAL_SIM=off` in `.env` and `pm2 restart dex-arb-shadow`. That's all.
