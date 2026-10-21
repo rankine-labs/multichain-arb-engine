@@ -178,14 +178,9 @@ struct BudgetInner {
     used: u64,
     per_class: [u64; 6],
     refused: u64,
-    /// Requests the speed limit turned away (NOT sent, NOT allowance).
-    throttled: u64,
-    /// Speed limit, two lanes: [0] everything else, [1] copy 2's bulk loads.
-    /// `vt` = when the lane's reserved requests are done ("virtual time");
-    /// a lane may start up to `burst` requests early (the bucket's credit).
+    /// Speed limit: tokens in the bucket, and vt[0] = when they were counted.
+    tokens: f64,
     vt: [Instant; 2],
-    /// When each lane last reserved (is the other lane busy?).
-    lane_last: [Option<Instant>; 2],
     last_save: Instant,
     unsaved: u64,
 }
@@ -206,9 +201,8 @@ impl Budget {
             used: 0,
             per_class: [0; 6],
             refused: 0,
-            throttled: 0,
+            tokens: rps.max(1.0),
             vt: [Instant::now(), Instant::now()],
-            lane_last: [None, None],
             last_save: Instant::now(),
             unsaved: 0,
         };
@@ -235,19 +229,13 @@ impl Budget {
         Budget::new(cap, rps, if file.is_empty() { None } else { Some(file) })
     }
 
-    /// Reserve `n` requests for `class` and wait for the speed limit.
-    ///
-    /// Plain English (fixed after copy 2 dry run #6, where loading stalled):
-    ///   The speed limit is EXACT and FIFO: requests are spaced so no
-    ///   1-second window holds more than ARBSIM_NODE_RPS, and nobody can
-    ///   starve anybody (before, a steady stream of urgent requests kept the
-    ///   limit "in debt" and copy 2's loads never got a turn; and waits were
-    ///   cut at 10 s, so a crowd of callers could go faster than the limit).
-    ///   A request that would have to wait more than max_queue is refused instead
-    ///   (the caller tries another node or later), so queues can't pile up.
-    ///   Refuses too when today's allowance share is used up.
+    /// Take `n` HTTP requests for `class`: waits for the speed limit (a plain
+    /// token bucket at ARBSIM_NODE_RPS requests per second, up to that many
+    /// at once). Never refuses for speed; refuses only when today's
+    /// allowance share is used up. (NodeClient takes 1 per HTTP request, so
+    /// a batch or an eth_getProof counts once, however many values it holds.)
     pub fn take(&self, class: Class, n: u64) -> Result<(), NodeErr> {
-        let wait = {
+        {
             let mut b = self.inner.lock().unwrap();
             let today = utc_day();
             if today != b.day {
@@ -267,30 +255,6 @@ impl Budget {
                     class.share_pct()
                 )));
             }
-            let now = Instant::now();
-            let lane = usize::from(class == Class::Bulk);
-            // ONE clock for everybody, strict spacing: a request goes out when
-            // the previous ones' share of time has passed (never early), at
-            // 97 % of the rate (timing jitter), so no 1-second window ever
-            // holds more than the rate. FIFO: nobody starves. (Copy 2 shares
-            // its own part between urgent work and loading before it sends.)
-            let rate = self.rps * 0.97;
-            let start = b.vt[0].max(now);
-            let after = start + Duration::from_secs_f64(n as f64 / rate);
-            let wait = start.saturating_duration_since(now);
-            if wait > self.max_queue {
-                // Not sent and not the daily allowance: counted apart.
-                b.throttled += n;
-                return Err(NodeErr::Budget(format!(
-                    "{SPEED_LIMIT}: {} requests would wait {} ms (> {} ms queue)",
-                    class.name(),
-                    wait.as_millis(),
-                    self.max_queue.as_millis()
-                )));
-            }
-            b.vt[0] = after;
-            b.vt[1] = after;
-            b.lane_last[lane] = Some(now);
             b.used += n;
             b.per_class[class_idx(class)] += n;
             b.unsaved += n;
@@ -299,19 +263,24 @@ impl Budget {
                 b.last_save = Instant::now();
                 self.save(&b);
             }
-            wait
-        };
-        if !wait.is_zero() {
+        }
+        // Speed limit: wait for the tokens.
+        let need = n as f64;
+        loop {
+            let wait = {
+                let mut b = self.inner.lock().unwrap();
+                let now = Instant::now();
+                let el = now.duration_since(b.vt[0]).as_secs_f64();
+                b.vt[0] = now;
+                b.tokens = (b.tokens + el * self.rps).min(self.burst.max(need));
+                if b.tokens >= need {
+                    b.tokens -= need;
+                    return Ok(());
+                }
+                Duration::from_secs_f64(((need - b.tokens) / self.rps).clamp(0.001, 1.0))
+            };
             std::thread::sleep(wait);
         }
-        Ok(())
-    }
-
-    /// How long a new request would wait right now, per lane (status).
-    pub fn backlog_ms(&self) -> (u64, u64) {
-        let b = self.inner.lock().unwrap();
-        let now = Instant::now();
-        (b.vt[0].saturating_duration_since(now).as_millis() as u64, b.vt[1].saturating_duration_since(now).as_millis() as u64)
     }
 
     fn save(&self, b: &BudgetInner) {
@@ -331,10 +300,8 @@ impl Budget {
         for c in Class::ALL {
             per.insert(c.name().into(), Value::from(b.per_class[class_idx(c)]));
         }
-        let now = Instant::now();
-        let bl = |i: usize| b.vt[i].saturating_duration_since(now).as_millis() as u64;
-        json!({ "usedToday": b.used, "cap": self.cap, "refusedToday": b.refused, "throttledToday": b.throttled, "byClass": per, "utcDay": b.day,
-                "waitMs": { "main": bl(0), "bulk": bl(1) } })
+        json!({ "usedToday": b.used, "cap": self.cap, "refusedToday": b.refused, "byClass": per, "utcDay": b.day,
+                "rps": self.rps, "tokens": (b.tokens * 10.0).round() / 10.0 })
     }
 
     /// Used so far today (for tests / status).
@@ -470,12 +437,11 @@ impl NodeClient {
             if todo.is_empty() {
                 break;
             }
-            // Copy 2's bulk work (loads, traces, probes) never goes to the free
-            // public node: it would only hammer it.
-            if paid_first && class == Class::Bulk && ep.budget != 0 {
+            // Copy 2 (paid_first) uses only the paid node(s).
+            if paid_first && ep.budget != 0 {
                 continue;
             }
-            if let Err(e) = self.budgets[ep.budget].take(class, todo.len() as u64) {
+            if let Err(e) = self.budgets[ep.budget].take(class, 1) {
                 // Copy 2 paces itself: a speed-limit refusal means "later",
                 // not "try the next node".
                 let speed = matches!(&e, NodeErr::Budget(m) if m.starts_with(SPEED_LIMIT));
@@ -499,7 +465,9 @@ impl NodeClient {
                     let mut again = Vec::new();
                     for (r, k) in rs.into_iter().zip(todo.iter().copied()) {
                         match &r {
-                            Err(e) if state_unavailable(e) => {
+                            // Copy 2 reads old state the plain way itself
+                            // (loader.rs): no re-routing to other nodes.
+                            Err(e) if state_unavailable(e) && !paid_first => {
                                 results[k] = Some(r);
                                 again.push(k);
                             }
@@ -805,43 +773,32 @@ mod tests {
     }
 
     #[test]
-    fn speed_limit_is_fair_between_bulk_and_the_rest_and_never_stalls() {
-        // Copy 2 dry run #6: a steady stream of urgent requests starved bulk
-        // loads forever. Now both lanes get about half while both are busy.
+    fn speed_limit_is_a_plain_bucket_that_waits_and_never_refuses() {
+        // 8 callers hammering a 100/s bucket for 1.5 s: about 100 (bucket)
+        // + 150 go through, every caller gets some, nobody is refused.
         use std::sync::atomic::{AtomicU64, Ordering};
         use std::sync::Arc;
-        let b = Arc::new(Budget::new(1_000_000, 200.0, None));
-        let counts = Arc::new([AtomicU64::new(0), AtomicU64::new(0)]);
+        let b = Arc::new(Budget::new(1_000_000, 100.0, None));
+        let counts: Arc<Vec<AtomicU64>> = Arc::new((0..8).map(|_| AtomicU64::new(0)).collect());
         let stop = Instant::now() + Duration::from_millis(1500);
-        let mut hs = Vec::new();
-        for i in 0..8 {
-            let (b, counts) = (b.clone(), counts.clone());
-            hs.push(std::thread::spawn(move || {
-                let (class, lane) = if i % 2 == 0 { (Class::Fill, 0) } else { (Class::Bulk, 1) };
-                while Instant::now() < stop {
-                    if b.take(class, 10).is_ok() {
-                        counts[lane].fetch_add(10, Ordering::Relaxed);
+        let hs: Vec<_> = (0..8)
+            .map(|i| {
+                let (b, counts) = (b.clone(), counts.clone());
+                std::thread::spawn(move || {
+                    while Instant::now() < stop {
+                        b.take(if i % 2 == 0 { Class::Fill } else { Class::Bulk }, 1).unwrap();
+                        counts[i].fetch_add(1, Ordering::Relaxed);
                     }
-                }
-            }));
-        }
+                })
+            })
+            .collect();
         for h in hs {
             h.join().unwrap();
         }
-        let (u, k) = (counts[0].load(Ordering::Relaxed), counts[1].load(Ordering::Relaxed));
-        let total = u + k;
-        // ~1.5 s x 200/s = 300 (+ burst); never more than the limit allows.
-        assert!(total <= 300 + 200 + 80, "over the speed limit: {total}");
-        assert!(k * 4 >= total && u * 4 >= total, "unfair: main {u}, bulk {k}");
-    }
-
-    #[test]
-    fn speed_limit_refuses_instead_of_queueing_over_30_s() {
-        let b = Budget::new(1_000_000, 1.0, None);
-        assert!(b.take(Class::Fill, 40).is_ok()); // goes now; next slot in 40 s
-        assert!(matches!(b.take(Class::Fill, 1), Err(NodeErr::Budget(m)) if m.starts_with(SPEED_LIMIT)));
-        assert_eq!(b.usage()["throttledToday"], 1);
-        assert_eq!(b.usage()["refusedToday"], 0); // not the daily allowance
+        let total: u64 = counts.iter().map(|c| c.load(Ordering::Relaxed)).sum();
+        assert!(total <= 100 + 150 + 16, "over the limit: {total}");
+        assert!(total >= 200, "too slow: {total}");
+        assert!(counts.iter().all(|c| c.load(Ordering::Relaxed) > 0), "somebody starved");
     }
 
     #[test]

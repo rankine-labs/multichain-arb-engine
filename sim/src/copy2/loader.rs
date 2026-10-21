@@ -15,24 +15,18 @@
 //   Answers go back to the intake thread as messages; nothing is written
 //   into the copy here.
 //
-//   THREE LANES, so slow things never hold up quick ones:
-//     urgent  values a check missed, values a pool's catch-up needs, coin
-//             probes, tip           -> general threads, before bulk
-//     bulk    first loads of many pools at once -> general threads
-//     trace   balance traces (slow, ~1 s each) -> their own threads
-//   [ARBSIM_COPY2_LOADERS 16 general threads, ARBSIM_COPY2_TRACE_LOADERS 6]
-//
-//   SELF-PACING (after dry runs #6/#7): copy 2 never hands the node client
-//   more than it may send. A job only leaves the queue when copy 2's own
-//   call budget has room for its calls: ARBSIM_COPY2_RATE_PCT (80) % of
-//   ARBSIM_NODE_RPS calls per second, with at most 0.1 s worth let out at once.
-//   So the node client's speed limit never has to refuse, nothing piles up,
-//   and nothing is retried in a loop. While both are waiting, urgent work
-//   gets at most ARBSIM_COPY2_URGENT_PCT (25) % of that budget and loading
-//   the rest; alone, either gets all of it. Calls are counted when really
-//   sent (a refusal by our own limiter is not a node request).
-//   Bulk work (loads, traces, probes) never falls back to the public node.
-//
+//   SIMPLE BY DESIGN (after dry runs #6-#10):
+//     - A fixed number of worker threads [ARBSIM_COPY2_INFLIGHT, 8] = at
+//       most that many node requests in flight. Nothing else limits copy 2.
+//     - ONE queue, two priorities: urgent (values a pool's catch-up needs,
+//       the one fill job at a time, the node tip) before bulk (first loads,
+//       coin probes and traces). Loads are queued most-recently-active first.
+//     - The node client's speed limit (node.rs) is one plain token bucket at
+//       ARBSIM_NODE_RPS counting HTTP REQUESTS (a batch or a proof = 1); it
+//       makes a request wait for its token, it never refuses.
+//     - Status counts real HTTP requests (ceil(calls / ARBSIM_NODE_BATCH)).
+//     - Copy 2 only uses the paid node (no public fallback, no re-routing).
+
 //   ONE REQUEST PER ACCOUNT (dry run #8): every value a job needs is grouped
 //   by account into one eth_getProof(account, [slots], block). Its answer
 //   has the account's balance, nonce, code hash AND the storage values.
@@ -56,10 +50,8 @@
 //   A node ERROR is never read as an answer: it comes back as an error and
 //   the intake tries again later.
 //
-//   Node choice: the PAID node first (call_batch_paid), the free public node
-//   only if the paid one refuses (daily allowance used up) or fails.
-//   Status (copy2.loader): threads busy, queue lengths, node requests per
-//   second over the last minute, average answer time per kind.
+//   Status (copy2.loader): in-flight requests (busy workers), queue lengths,
+//   HTTP requests per second over the last minute, answer time per kind.
 // ============================================================================
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -131,7 +123,6 @@ pub struct LoaderStats {
     last_done: Mutex<Option<Instant>>,
     /// Errors seen per kind, and the first few messages (status + log).
     errors: Mutex<(HashMap<String, u64>, Vec<String>)>,
-    pace: Mutex<Option<Pace>>,
 }
 
 impl LoaderStats {
@@ -237,141 +228,43 @@ impl LoaderStats {
             "busy": self.busy.load(Ordering::Relaxed),
             "queued": { "urgent": u, "bulk": b, "trace": t },
             "requestsPerSecLastMin": (reqs as f64 / 60.0 * 10.0).round() / 10.0,
-            "pace": self.pace.lock().unwrap().map(|p| json!({ "callsPerSec": (p.rate * 10.0).round() / 10.0, "urgentShare": p.urgent_share })),
+            "inFlight": self.busy.load(Ordering::Relaxed),
             "byKind": Value::Object(kinds),
         })
     }
 }
 
 // ---------------------------------------------------------------------------
-// Queues + threads
+// One queue, N workers
 // ---------------------------------------------------------------------------
 struct Lanes {
     urgent: VecDeque<Job>,
     bulk: VecDeque<Job>,
-    trace: VecDeque<Job>,
     closed: bool,
-    /// Copy 2's call budget (see file header).
-    tokens: f64,
-    last: Instant,
-    /// Recent calls per lane (urgent, bulk+trace), fading over ~10 s.
-    used: [f64; 2],
-}
-
-/// Copy 2's own pacing settings.
-#[derive(Clone, Copy, Debug)]
-pub struct Pace {
-    /// Calls per second copy 2 may send.
-    pub rate: f64,
-    /// Share of `rate` urgent work may use while loading waits (0..1).
-    pub urgent_share: f64,
-}
-
-impl Pace {
-    /// ARBSIM_NODE_RPS x ARBSIM_COPY2_RATE_PCT, urgent ARBSIM_COPY2_URGENT_PCT.
-    pub fn from_env() -> Self {
-        let rps = std::env::var("ARBSIM_NODE_RPS").ok().and_then(|s| s.parse::<f64>().ok()).unwrap_or(8.0);
-        let pct = crate::node::env_u64("ARBSIM_COPY2_RATE_PCT", 80).clamp(1, 100) as f64;
-        let up = crate::node::env_u64("ARBSIM_COPY2_URGENT_PCT", 25).clamp(1, 99) as f64;
-        Pace { rate: (rps * pct / 100.0).max(0.5), urgent_share: up / 100.0 }
-    }
-    /// Most calls let out at once (0.1 s worth, at least one 25-call request).
-    fn burst(&self) -> f64 {
-        (self.rate * 0.1).max(25.0)
-    }
 }
 
 struct Queue {
     m: Mutex<Lanes>,
     cv: Condvar,
     stats: Arc<LoaderStats>,
-    pace: Pace,
-}
-
-/// Calls a job will send (charged before it leaves the queue; the
-/// difference to what it really sent is settled afterwards).
-fn cost(j: &Job) -> f64 {
-    match j {
-        Job::Fetch { items, calls, .. } => count_calls(items, calls) as f64,
-        Job::Trace { .. } => 2.0,
-        Job::Probe { .. } => 3.0,
-        Job::Tip { .. } => 2.0,
-    }
 }
 
 impl Queue {
     fn publish_len(&self, l: &Lanes) {
-        *self.stats.queued.lock().unwrap() = (l.urgent.len(), l.bulk.len(), l.trace.len());
+        *self.stats.queued.lock().unwrap() = (l.urgent.len(), l.bulk.len(), 0);
     }
-    /// Next job for a general (trace = false) or trace thread, once copy 2's
-    /// call budget has room for it. None = stop.
-    fn take(&self, trace: bool) -> Option<Job> {
+    /// Next job, urgent first. None = stop.
+    fn take(&self) -> Option<Job> {
         let mut g = self.m.lock().unwrap();
         loop {
             if g.closed {
                 return None;
             }
-            // Refill the budget, fade the usage memory.
-            let now = Instant::now();
-            let el = now.duration_since(g.last).as_secs_f64();
-            g.last = now;
-            g.tokens = (g.tokens + el * self.pace.rate).min(self.pace.burst());
-            let fade = (-el / 10.0).exp();
-            g.used[0] *= fade;
-            g.used[1] *= fade;
-            // Which lane may go: urgent first unless it already had its share
-            // while loading waits.
-            let loading_waits = !g.bulk.is_empty() || !g.trace.is_empty();
-            let total = g.used[0] + g.used[1];
-            let urgent_ok = !g.urgent.is_empty() && (!loading_waits || g.used[0] <= self.pace.urgent_share * total + 1.0);
-            let lane: Option<usize> = if trace {
-                if g.trace.is_empty() || urgent_ok { None } else { Some(2) }
-            } else if urgent_ok {
-                Some(0)
-            } else if !g.bulk.is_empty() {
-                Some(1)
-            } else if !g.urgent.is_empty() {
-                Some(0)
-            } else {
-                None
-            };
-            let Some(lane) = lane else {
-                g = self.cv.wait_timeout(g, Duration::from_millis(100)).unwrap().0;
-                continue;
-            };
-            let front = match lane {
-                0 => g.urgent.front(),
-                1 => g.bulk.front(),
-                _ => g.trace.front(),
-            };
-            let c = front.map(cost).unwrap_or(1.0);
-            let need = c.min(self.pace.burst());
-            if g.tokens >= need {
-                g.tokens -= c;
-                g.used[usize::from(lane != 0)] += c;
-                let j = match lane {
-                    0 => g.urgent.pop_front(),
-                    1 => g.bulk.pop_front(),
-                    _ => g.trace.pop_front(),
-                };
+            if let Some(j) = g.urgent.pop_front().or_else(|| g.bulk.pop_front()) {
                 self.publish_len(&g);
-                self.cv.notify_all();
-                return j;
+                return Some(j);
             }
-            let wait = Duration::from_secs_f64(((need - g.tokens) / self.pace.rate).clamp(0.001, 1.0));
-            g = self.cv.wait_timeout(g, wait).unwrap().0;
-        }
-    }
-
-    /// Settle a job's real calls against what it was charged.
-    fn settle(&self, charged: f64, sent: u64) {
-        let extra = sent as f64 - charged;
-        if extra.abs() > 0.0 {
-            let mut g = self.m.lock().unwrap();
-            g.tokens -= extra;
-            if g.tokens > self.pace.burst() {
-                g.tokens = self.pace.burst();
-            }
+            g = self.cv.wait(g).unwrap();
         }
     }
 }
@@ -399,55 +292,32 @@ struct Env {
 }
 
 impl Loaders {
-    /// Start `n` general + `n_trace` trace threads. Answers go into `out`
-    /// (the intake's input). `tip_out`: the node's newest block (status).
-    pub fn spawn(
-        n: usize,
-        n_trace: usize,
-        pace: Pace,
-        node: Arc<dyn NodeApi>,
-        out: SyncSender<Input>,
-        requests: Arc<AtomicU64>,
-        tip_out: Arc<AtomicU64>,
-        stats: Arc<LoaderStats>,
-    ) -> Loaders {
-        let q = Arc::new(Queue {
-            m: Mutex::new(Lanes {
-                urgent: VecDeque::new(),
-                bulk: VecDeque::new(),
-                trace: VecDeque::new(),
-                closed: false,
-                tokens: pace.burst(),
-                last: Instant::now(),
-                used: [0.0, 0.0],
-            }),
-            cv: Condvar::new(),
-            stats: stats.clone(),
-            pace,
-        });
-        *stats.pace.lock().unwrap() = Some(pace);
+    /// Start `n` workers (= at most `n` node requests in flight). Answers go
+    /// into `out` (the intake's input). `tip_out`: node's newest block.
+    pub fn spawn(n: usize, node: Arc<dyn NodeApi>, out: SyncSender<Input>, requests: Arc<AtomicU64>, tip_out: Arc<AtomicU64>, stats: Arc<LoaderStats>) -> Loaders {
+        let q = Arc::new(Queue { m: Mutex::new(Lanes { urgent: VecDeque::new(), bulk: VecDeque::new(), closed: false }), cv: Condvar::new(), stats: stats.clone() });
         let env = Env { node, out, requests, tip: Arc::new(Tip { known: Mutex::new((0, None)), out: tip_out }), stats: stats.clone() };
-        let (n, n_trace) = (n.max(1), n_trace.max(1));
-        stats.threads.store((n + n_trace) as u64, Ordering::Relaxed);
-        for i in 0..n + n_trace {
+        let n = n.max(1);
+        stats.threads.store(n as u64, Ordering::Relaxed);
+        for i in 0..n {
             let (q, env) = (q.clone(), env.clone());
-            let trace = i >= n;
-            let name = if trace { format!("arbsim-copy2-trace-{}", i - n) } else { format!("arbsim-copy2-load-{i}") };
-            std::thread::Builder::new().name(name).spawn(move || run(q, env, trace, i)).expect("loader thread");
+            std::thread::Builder::new().name(format!("arbsim-copy2-load-{i}")).spawn(move || run(q, env, i)).expect("loader thread");
         }
         Loaders { q }
     }
 
+    /// Queue a job: first loads, probes and traces are bulk; the rest urgent.
     pub fn send(&self, j: Job) {
+        let bulk = matches!(j, Job::Fetch { bulk: true, .. } | Job::Trace { .. } | Job::Probe { .. });
         let mut g = self.q.m.lock().unwrap();
-        match &j {
-            Job::Fetch { bulk: true, .. } => g.bulk.push_back(j),
-            Job::Trace { .. } => g.trace.push_back(j),
-            _ => g.urgent.push_back(j),
+        if bulk {
+            g.bulk.push_back(j);
+        } else {
+            g.urgent.push_back(j);
         }
         self.q.publish_len(&g);
         drop(g);
-        self.q.cv.notify_all();
+        self.q.cv.notify_one();
     }
 }
 
@@ -459,15 +329,13 @@ struct Tip {
 }
 
 impl Tip {
-    fn get(&self, node: &dyn NodeApi, want: u64, requests: &AtomicU64) -> Result<u64, NodeErr> {
+    fn get(&self, node: &dyn NodeApi, want: u64) -> Result<u64, NodeErr> {
         {
             let g = self.known.lock().unwrap();
             if g.0 >= want || g.1.is_some_and(|t| t.elapsed() < Duration::from_millis(250)) {
                 return Ok(g.0);
             }
         }
-        let _ = requests;
-        // Ask the node that will serve the fetch (paid first).
         let r = node.call_batch_paid(Class::Fill, &[("eth_blockNumber", json!([]))])?;
         let t = match r.into_iter().next() {
             Some(Ok(Value::String(s))) => parse_u64(&s).map_err(NodeErr::BadResponse)?,
@@ -481,28 +349,26 @@ impl Tip {
     }
 
     /// At most `want`, at most the node's newest block.
-    fn at_most(&self, node: &dyn NodeApi, want: u64, requests: &AtomicU64) -> Result<u64, NodeErr> {
-        self.get(node, want, requests).map(|t| if t == 0 { want } else { want.min(t) })
+    fn at_most(&self, node: &dyn NodeApi, want: u64) -> Result<u64, NodeErr> {
+        self.get(node, want).map(|t| if t == 0 { want } else { want.min(t) })
     }
 }
 
-fn run(q: Arc<Queue>, env: Env, trace_lane: bool, me: usize) {
+fn run(q: Arc<Queue>, env: Env, me: usize) {
     env.stats.set_state(me, "idle".into());
-    // This thread's node, counting the calls it really sends.
-    let counter = Arc::new(Counting { inner: env.node.clone(), sent: AtomicU64::new(0) });
+    // This worker's node, counting the HTTP requests it really sends.
+    let counter = Arc::new(Counting { inner: env.node.clone(), sent: AtomicU64::new(0), batch: crate::node::env_u64("ARBSIM_NODE_BATCH", 25).max(1) });
     let mut env = env;
     env.node = counter.clone();
-    while let Some(job) = q.take(trace_lane) {
+    while let Some(job) = q.take() {
         env.stats.set_state(me, describe(&job));
         env.stats.busy.fetch_add(1, Ordering::Relaxed);
         let t0 = Instant::now();
-        let charged = cost(&job);
         let s0 = counter.sent.load(Ordering::Relaxed);
         let (kind, done) = one(&env, job);
         let used = counter.sent.load(Ordering::Relaxed) - s0;
         report_errors(&env.stats, kind, &done);
         env.requests.fetch_add(used, Ordering::Relaxed);
-        q.settle(charged, used);
         env.stats.note(kind, used, t0.elapsed().as_millis() as u64);
         env.stats.busy.fetch_sub(1, Ordering::Relaxed);
         env.stats.set_state(me, "idle".into());
@@ -512,17 +378,18 @@ fn run(q: Arc<Queue>, env: Env, trace_lane: bool, me: usize) {
     }
 }
 
-/// A node that counts the calls really sent: a refusal by a speed limit or
-/// the daily allowance (nothing sent) is not counted.
+/// A node that counts the HTTP requests really sent (a batch of up to
+/// ARBSIM_NODE_BATCH calls = 1); a refusal (nothing sent) is not counted.
 struct Counting {
     inner: Arc<dyn NodeApi>,
     sent: AtomicU64,
+    batch: u64,
 }
 
 impl Counting {
     fn count<T>(&self, n: usize, r: &Result<T, NodeErr>) {
         if !matches!(r, Err(NodeErr::Budget(_)) | Err(NodeErr::NoNode)) {
-            self.sent.fetch_add(n as u64, Ordering::Relaxed);
+            self.sent.fetch_add((n as u64).div_ceil(self.batch), Ordering::Relaxed);
         }
     }
 }
@@ -582,18 +449,17 @@ fn describe(j: &Job) -> String {
 
 fn one(env: &Env, job: Job) -> (&'static str, Done) {
     let node = &*env.node;
-    let req = &*env.requests;
     match job {
         Job::Fetch { id, block, exact, bulk, items, calls } => {
             let kind = if bulk { "load" } else if exact { "catchup" } else { "fill" };
             let at = if exact {
-                match env.tip.get(node, block, req) {
+                match env.tip.get(node, block) {
                     Ok(t) if t >= block => Ok(block),
                     Ok(t) => Err(NodeErr::BadResponse(format!("node at block {t}, block {block} {NOT_YET}"))),
                     Err(e) => Err(e),
                 }
             } else {
-                env.tip.at_most(node, block, req)
+                env.tip.at_most(node, block)
             };
             let res = at.and_then(|b| {
                 let class = if bulk { Class::Bulk } else { Class::Fill };
@@ -605,14 +471,14 @@ fn one(env: &Env, job: Job) -> (&'static str, Done) {
             }
         }
         Job::Trace { id, block, coin, holder } => {
-            let res = env.tip.at_most(node, block, req).and_then(|b| trace_balance(node, b, coin, holder).map(|r| (b, r)));
+            let res = env.tip.at_most(node, block).and_then(|b| trace_balance(node, b, coin, holder).map(|r| (b, r)));
             match res {
                 Ok((b, r)) => ("trace", Done::Trace { id, block: b, coin, holder, res: Ok(r) }),
                 Err(e) => ("trace", Done::Trace { id, block, coin, holder, res: Err(e) }),
             }
         }
         Job::Probe { id, coin, block } => {
-            let res = env.tip.at_most(node, block, req).and_then(|b| probe_layout(node, coin, b));
+            let res = env.tip.at_most(node, block).and_then(|b| probe_layout(node, coin, b));
             ("probe", Done::Probe { id, coin, res })
         }
         Job::Tip { id } => {

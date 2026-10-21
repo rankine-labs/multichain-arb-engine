@@ -254,6 +254,24 @@ trade ~20 ms.
     queue cap is only a safety valve now (ARBSIM_NODE_MAX_QUEUE_MS 10000).
     A speed-limit refusal (nothing sent) is retried in ~0.3 s and is not a
     failure (no growing backoff).
+- Dry run #10 -> SIMPLIFIED (replaces the pacing / lanes / refusals of #6-#9):
+  - Bug: the node client charged one token PER VALUE inside a request (a
+    25-value batch = 0.25 s of a 100/s budget) and re-routed refused proofs
+    to the other paid node and the public node.
+  - node.rs speed limit: one plain token bucket at ARBSIM_NODE_RPS counting
+    HTTP requests (a batch or an eth_getProof = 1); waits, never refuses for
+    speed. Daily allowance also counted in HTTP requests.
+  - Copy 2: ARBSIM_COPY2_INFLIGHT (8) workers = at most 8 requests in
+    flight, one queue: urgent (catch-up, the one fill job, tip) before bulk
+    (loads most-recently-active first, probes, traces). Paid node only, no
+    re-routing. Any error: 1-30 s backoff; first 5 errors per kind logged.
+    Removed: ARBSIM_COPY2_LOADERS / TRACE_LOADERS / RATE_PCT / URGENT_PCT /
+    FILL_RPS, ARBSIM_NODE_MAX_QUEUE_MS.
+  - Status copy2.loader: requestsPerSecLastMin (HTTP), inFlight, threads,
+    queued {urgent, bulk}, byKind answer times, firstErrors.
+  - Soak (plan 100 HTTP req/s, RPS 80, 8 in flight, 300 ms answers, checks
+    missing values at 2x, 40x time): 800/800 ready at 67 simulated s, 133
+    HTTP requests in total, 0 x 429.
 - Status: `status` -> `copy2` {pools, loading, ready, unsure, lastBlock,
   unsureReasons, counters}; with {"pools": true} also `list` of {address,
   v4Id, kind, state, reason, events}. Checks touching a pool that isn't

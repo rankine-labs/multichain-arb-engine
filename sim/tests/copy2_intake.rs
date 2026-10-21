@@ -1020,7 +1020,7 @@ fn pools_with_recent_events_load_first() {
     }
     r.settle();
     let st = r.h.status_json(false);
-    assert!(st["loader"]["threads"].as_u64().unwrap() >= 2, "{st}");
+    assert!(st["loader"]["threads"].as_u64().unwrap() >= 1, "{st}");
     assert!(st["loader"]["byKind"]["load"]["jobs"].as_u64().unwrap() >= 2, "{st}");
 }
 
@@ -1076,7 +1076,7 @@ fn loading_keeps_flowing_under_the_speed_limit_with_checks_asking_too() {
     // 400 calls/s, chunks of 25 take 10 ms: ~1,700 calls needed -> ~4-5 s.
     let node: Arc<dyn NodeApi> = Arc::new(RateLimited { chain: chain.clone(), budget: arbsim::node::Budget::new(1_000_000, 400.0, None), per_chunk_ms: 10 });
     let sh = Shared::new(Config::for_tests(), Some(node), Arc::new(Volatile::default()));
-    let cfg = C2Config { loaders: 16, trace_loaders: 6, load_batch: 25, ..C2Config::for_tests() };
+    let cfg = C2Config { loaders: 8, load_batch: 25, ..C2Config::for_tests() };
     let h = arbsim::copy2::intake::spawn(sh.clone(), Arc::new(FillQueue::new(100_000, 100)), cfg);
     assert_eq!(h.track_json(&json!(1), &json!({"pools": pj}))["tracked"], json!(n as u64));
     let t0 = Instant::now();
@@ -1109,9 +1109,9 @@ fn loading_keeps_flowing_under_the_speed_limit_with_checks_asking_too() {
     h.stop();
 }
 
-/// A node like Chainstack under a plan limit: requests of 25 calls, each
-/// taking `latency`; more than `limit` calls in any 1 s window and the node
-/// answers "rate limited (429)" (the calls still count against the plan).
+/// A node like Chainstack under a plan limit: HTTP requests of up to 25
+/// calls, each taking `latency`; more than `limit` HTTP REQUESTS in any 1 s
+/// window and the node answers "rate limited (429)".
 struct PlanNode {
     chain: Arc<FakeChain>,
     limit: u64,
@@ -1146,9 +1146,10 @@ impl NodeApi for PlanNode {
     fn call_batch(&self, c: Class, calls: &[(&str, Value)]) -> Result<Vec<CallResult>, NodeErr> {
         let mut out = Vec::new();
         for ch in calls.chunks(25) {
-            self.budget.take(c, ch.len() as u64)?;
+            // As NodeClient: one token per HTTP request.
+            self.budget.take(c, 1)?;
             std::thread::sleep(self.latency);
-            if !self.admit(ch.len() as u64) {
+            if !self.admit(1) {
                 return Err(NodeErr::Transport("node1: rate limited (429)".into()));
             }
             out.extend(self.chain.call_batch(c, ch)?);
@@ -1162,12 +1163,13 @@ impl NodeApi for PlanNode {
 
 #[test]
 fn soak_800_pools_at_the_plan_limit_with_checks_asking_twice_the_limit() {
-    // Time runs 40x fast: 25 calls/s -> 1,000; 300 ms answers -> 7.5 ms;
-    // 5 simulated minutes -> 7.5 s.
+    // Plan: 100 HTTP requests/s; ARBSIM_NODE_RPS 80; 8 in flight; answers in
+    // 300 ms; checks miss values at 2x the rate. Time runs 40x fast.
     use std::sync::atomic::Ordering::Relaxed;
     use std::time::{Duration, Instant};
     const X: f64 = 40.0;
-    let limit = (25.0 * X) as u64;
+    let limit = (100.0 * X) as u64;
+    let rps = 80.0 * X;
     let chain = Arc::new(FakeChain::new());
     let pool_addr = |i: u16| {
         let mut b = [0u8; 20];
@@ -1198,13 +1200,11 @@ fn soak_800_pools_at_the_plan_limit_with_checks_asking_twice_the_limit() {
         sent: Default::default(),
         rejected: Default::default(),
         worst_second: Default::default(),
-        budget: arbsim::node::Budget::new(u64::MAX / 4, limit as f64, None),
+        budget: arbsim::node::Budget::new(u64::MAX / 4, rps, None),
     });
     let sh = Shared::new(Config::for_tests(), Some(node.clone() as Arc<dyn NodeApi>), Arc::new(Volatile::default()));
-    // As in production: 80 % of the plan rate, urgent at most 25 % while loading waits.
-    let pace = arbsim::copy2::loader::Pace { rate: limit as f64 * 0.8, urgent_share: 0.25 };
-    // Reports kept: production's 2,400 blocks (~10 min at 4 blocks/s).
-    let cfg = C2Config { loaders: 16, trace_loaders: 6, load_batch: 25, pace, reload_ms: 1000, keep_blocks: 2400, max_keep_blocks: 40_000, fill_rps: 10.0 * X, ..C2Config::for_tests() };
+    // As in production: 8 in flight; reports kept 2,400 blocks (~10 min).
+    let cfg = C2Config { loaders: 8, load_batch: 25, reload_ms: 1000, keep_blocks: 2400, max_keep_blocks: 40_000, ..C2Config::for_tests() };
     let h = arbsim::copy2::intake::spawn(sh.clone(), Arc::new(FillQueue::new(1_000_000, 100)), cfg);
     assert_eq!(h.track_json(&json!(1), &json!({"pools": pj}))["tracked"], json!(n as u64));
     let t0 = Instant::now();
@@ -1213,14 +1213,14 @@ fn soak_800_pools_at_the_plan_limit_with_checks_asking_twice_the_limit() {
     let (mut last_sent, mut last_t) = (0u64, Instant::now());
     let mut ready = 0;
     let mut all_ready_at: Option<f64> = None;
-    // 5 simulated minutes (eth_getProof: ~2 requests per pool).
-    while t0.elapsed() < Duration::from_secs_f64(5.0 * 60.0 / X) {
+    // 2 simulated minutes.
+    while t0.elapsed() < Duration::from_secs_f64(2.0 * 60.0 / X) {
         // A block every 250 ms of chain time; checks miss 2x the plan limit.
         let mut m = tick(b, 1000 + b);
         m.prev_block = if b > 100 { Some(b - 1) } else { None };
         h.block(m);
         b += 1;
-        let per_tick = (2.0 * limit as f64 * 0.25 / X * X / 4.0) as u64; // 2x limit over 250 ms / X
+        let per_tick = (2.0 * 80.0 * 0.25) as u64; // values missed per 250 ms of chain time: 2x the rate
         let miss: Vec<MissItem> = (0..per_tick.max(1)).map(|i| MissItem::Slot(a(USER), U256::from(b * 100_000 + i))).collect();
         h.fill(miss);
         std::thread::sleep(Duration::from_secs_f64(0.25 / X));

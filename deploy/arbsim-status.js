@@ -173,15 +173,13 @@ async function main() {
     if (ld) {
       const q = ld.queued || {};
       const kinds = Object.entries(ld.byKind || {}).map(([k, v]) => `${k} ${v.avgMsLastMin ?? v.avgMs ?? '?'} ms`).join(', ');
-      lines.push(`    node loaders: ${n(ld.busy)} of ${n(ld.threads)} busy, ${ld.requestsPerSecLastMin} node requests/s (last min); ` +
-        `waiting: ${n(q.urgent)} urgent, ${n(q.bulk)} bulk, ${n(q.trace)} traces; answer times: ${kinds || '-'}`);
+      lines.push(`    node: ${ld.requestsPerSecLastMin} HTTP requests/s (last min), ${n(ld.inFlight ?? ld.busy)} of ${n(ld.threads)} in flight; ` +
+        `queued: ${n(q.urgent)} urgent, ${n(q.bulk)} loads; answer times: ${kinds || '-'}`);
       if (Array.isArray(ld.firstErrors) && ld.firstErrors.length) {
         lines.push(`    first node errors: ${ld.firstErrors.slice(-5).join(' | ')}`);
       }
-      const wm = (s.node && s.node.waitMs) || {};
       lines.push(`    last node answer ${ld.secondsSinceLastAnswer ?? '?'} s ago` +
-        (ld.secondsSinceLastAnswer > 30 ? '  <-- STUCK? see "copy2 WATCHDOG" in pm2 logs arbsim' : '') +
-        `; speed-limit wait now: main ${n(wm.main)} ms, bulk ${n(wm.bulk)} ms`);
+        (ld.secondsSinceLastAnswer > 30 ? '  <-- STUCK? see "copy2 WATCHDOG" in pm2 logs arbsim' : ''));
     }
     const show = (title, list) => {
       if (Array.isArray(list) && list.length) lines.push(`    ${title}: ${list.slice(0, 5).map((r) => `${String(r.why).replace(/^loading: /, '')} (${n(r.n)})`).join('; ')}`);
@@ -221,7 +219,6 @@ async function main() {
     const used = node.usedToday || 0, cap = node.cap || 0;
     lines.push(`  Paid node use today (UTC): ${n(used)} of ${n(cap)} allowed (${pct(used, cap)})` +
       (node.refusedToday ? `, ${n(node.refusedToday)} refused (allowance used up)` : '') +
-      (node.throttledToday ? `, ${n(node.throttledToday)} held back by the speed limit (not sent)` : '') +
       `; nodes: ${(node.nodes || []).join(', ') || '?'}` + (node.errors ? `; ${n(node.errors)} node errors` : ''));
     if (node.public) lines.push(`  Free public node use today: ${n(node.public.usedToday)}`);
   }
