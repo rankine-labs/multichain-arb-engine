@@ -179,6 +179,23 @@ trade ~20 ms.
     jobsLastMin, avgMsLastMin, jobs, avgMs. Shown by deploy/arbsim-status.js.
   - A pool going unsure on a report logs kind, pool, block, tx, log index and
     the reason; replay reverts now include the revert reason (e.g. "LS").
+- Dry run #6 stall (fixed): root cause = the node speed limiter (node.rs
+  Budget). Urgent requests (fills of checks' misses, probes) were allowed to
+  run the limit into debt and their waits were cut at 10 s, so a steady
+  stream of them kept it in debt forever; the "bulk" class waited for a
+  positive bucket and never got one -> 16 threads stuck in bulk loads, 0
+  requests, probes ~30 s (3 x 10 s debt waits). Now: exact, fair limiter
+  with two lanes (bulk / everything else): one busy lane gets the full rate,
+  both busy get half each; no 10 s cut; a request facing > 30 s of queue is
+  refused (tried on another node or later). One fill job at a time (100
+  values). Test reproducing it: copy2_intake
+  loading_keeps_flowing_under_the_speed_limit_with_checks_asking_too (before
+  the fix: 0 of 120 pools ready after 40 s; after: all in ~13 s), plus
+  node.rs speed_limit_is_fair_... .
+  Watchdog: "[arbsim] copy2 WATCHDOG: no node answer for N s while M job(s)
+  wait or run ..." with each busy loader thread's job and the speed-limit
+  wait per lane (at most every 30 s). status: copy2.loader.busyThreads,
+  secondsSinceLastAnswer; node.waitMs {main, bulk}.
 - Status: `status` -> `copy2` {pools, loading, ready, unsure, lastBlock,
   unsureReasons, counters}; with {"pools": true} also `list` of {address,
   v4Id, kind, state, reason, events}. Checks touching a pool that isn't

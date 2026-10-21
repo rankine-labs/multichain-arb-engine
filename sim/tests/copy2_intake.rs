@@ -993,3 +993,88 @@ fn pools_with_recent_events_load_first() {
     assert!(st["loader"]["threads"].as_u64().unwrap() >= 2, "{st}");
     assert!(st["loader"]["byKind"]["load"]["jobs"].as_u64().unwrap() >= 2, "{st}");
 }
+
+/// The fake node behind the REAL node budget (speed limit), used the way
+/// NodeClient uses it: every chunk of 25 calls takes its share first.
+struct RateLimited {
+    chain: Arc<FakeChain>,
+    budget: arbsim::node::Budget,
+    per_chunk_ms: u64,
+}
+impl NodeApi for RateLimited {
+    fn call_batch(&self, c: Class, calls: &[(&str, Value)]) -> Result<Vec<CallResult>, NodeErr> {
+        let mut out = Vec::new();
+        for ch in calls.chunks(25) {
+            self.budget.take(c, ch.len() as u64)?;
+            std::thread::sleep(std::time::Duration::from_millis(self.per_chunk_ms));
+            out.extend(self.chain.call_batch(c, ch)?);
+        }
+        Ok(out)
+    }
+    fn call_batch_paid(&self, c: Class, calls: &[(&str, Value)]) -> Result<Vec<CallResult>, NodeErr> {
+        *self.chain.paid_calls.lock().unwrap() += calls.len();
+        self.call_batch(c, calls)
+    }
+}
+
+#[test]
+fn loading_keeps_flowing_under_the_speed_limit_with_checks_asking_too() {
+    use std::sync::atomic::Ordering::Relaxed;
+    use std::time::{Duration, Instant};
+    let chain = Arc::new(FakeChain::new());
+    let pool_addr = |i: u16| {
+        let mut b = [0u8; 20];
+        b[0] = 0x77;
+        b[18..].copy_from_slice(&i.to_be_bytes());
+        Address::from(b)
+    };
+    let n = 120u16;
+    let mut s = genesis();
+    let mut pj = Vec::new();
+    for i in 0..n {
+        let p = pool_addr(i);
+        let st = s.entry(p).or_default();
+        st.insert(u(0), u(2000));
+        st.insert(u(6), addr_word(a(COIN0)));
+        st.insert(u(7), addr_word(a(COIN1)));
+        st.insert(u(8), u(1000) | (u(4000) << 112usize) | (u(1000) << 224usize));
+        s.get_mut(&a(COIN0)).unwrap().insert(map_slot(p, 0), u(1000));
+        s.get_mut(&a(COIN1)).unwrap().insert(map_slot(p, 0), u(4000));
+        pj.push(json!({"address": format!("{p}"), "kind": "v2", "token0": format!("{}", a(COIN0)), "token1": format!("{}", a(COIN1))}));
+    }
+    chain.set(100, s);
+    // 400 calls/s, chunks of 25 take 10 ms: ~1,700 calls needed -> ~4-5 s.
+    let node: Arc<dyn NodeApi> = Arc::new(RateLimited { chain: chain.clone(), budget: arbsim::node::Budget::new(1_000_000, 400.0, None), per_chunk_ms: 10 });
+    let sh = Shared::new(Config::for_tests(), Some(node), Arc::new(Volatile::default()));
+    let cfg = C2Config { loaders: 16, trace_loaders: 6, load_batch: 25, ..C2Config::for_tests() };
+    let h = arbsim::copy2::intake::spawn(sh.clone(), Arc::new(FillQueue::new(100_000, 100)), cfg);
+    assert_eq!(h.track_json(&json!(1), &json!({"pools": pj}))["tracked"], json!(n as u64));
+    let t0 = Instant::now();
+    let mut b = 100u64;
+    let mut last_req = 0;
+    let mut last_move = Instant::now();
+    loop {
+        // Blocks keep coming, and checks keep asking for values (fills).
+        let mut m = tick(b, 1000 + b);
+        m.prev_block = if b > 100 { Some(b - 1) } else { None };
+        h.block(m);
+        b += 1;
+        let miss: Vec<MissItem> = (0..40u64).map(|i| MissItem::Slot(a(USER), U256::from(b * 1000 + i))).collect();
+        h.fill(miss);
+        std::thread::sleep(Duration::from_millis(50));
+        let st = h.status_json(false);
+        let req = st["nodeRequests"].as_u64().unwrap();
+        if req != last_req {
+            last_req = req;
+            last_move = Instant::now();
+        }
+        assert!(last_move.elapsed() < Duration::from_secs(5), "node requests stopped flowing: {st}");
+        if st["ready"] == json!(n as u64) {
+            break;
+        }
+        assert!(t0.elapsed() < Duration::from_secs(40), "not all ready in 40 s: {st}");
+    }
+    eprintln!("flowing test: {n} pools ready in {:?}", t0.elapsed());
+    assert!(h.c2.last_block.load(Relaxed) >= 100);
+    h.stop();
+}

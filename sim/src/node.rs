@@ -170,8 +170,12 @@ struct BudgetInner {
     used: u64,
     per_class: [u64; 6],
     refused: u64,
-    tokens: f64,
-    last_refill: Instant,
+    /// Speed limit, two lanes: [0] everything else, [1] copy 2's bulk loads.
+    /// `vt` = when the lane's reserved requests are done ("virtual time");
+    /// a lane may start up to `burst` requests early (the bucket's credit).
+    vt: [Instant; 2],
+    /// When each lane last reserved (is the other lane busy?).
+    lane_last: [Option<Instant>; 2],
     last_save: Instant,
     unsaved: u64,
 }
@@ -192,8 +196,8 @@ impl Budget {
             used: 0,
             per_class: [0; 6],
             refused: 0,
-            tokens: rps.max(1.0),
-            last_refill: Instant::now(),
+            vt: [Instant::now(), Instant::now()],
+            lane_last: [None, None],
             last_save: Instant::now(),
             unsaved: 0,
         };
@@ -219,25 +223,20 @@ impl Budget {
         Budget::new(cap, rps, if file.is_empty() { None } else { Some(file) })
     }
 
-    /// Reserve `n` requests for `class`. Waits for the speed limit (at most
-    /// a few seconds); refuses when today's allowance share is used up.
+    /// Reserve `n` requests for `class` and wait for the speed limit.
+    ///
+    /// Plain English (fixed after copy 2 dry run #6, where loading stalled):
+    ///   The speed limit is EXACT and FAIR. Requests line up in two lanes:
+    ///   copy 2's bulk first loads, and everything else. If only one lane is
+    ///   busy it gets the whole rate; if both are, each gets half. So neither
+    ///   can starve the other (before, a steady stream of urgent requests
+    ///   kept the limit "in debt" and bulk loads never got a turn), and the
+    ///   rate is really kept (before, waits were cut at 10 s, so a crowd of
+    ///   callers could go faster than the limit).
+    ///   A request that would have to wait more than 30 s is refused instead
+    ///   (the caller tries another node or later), so queues can't pile up.
+    ///   Refuses too when today's allowance share is used up.
     pub fn take(&self, class: Class, n: u64) -> Result<(), NodeErr> {
-        if class == Class::Bulk {
-            // Wait until the bucket has room (no debt), checking every 20 ms.
-            let need = (n as f64).min(self.burst.max(1.0));
-            loop {
-                let mut b = self.inner.lock().unwrap();
-                let now = Instant::now();
-                let el = now.duration_since(b.last_refill).as_secs_f64();
-                b.tokens = (b.tokens + el * self.rps).min(self.burst.max(1.0));
-                b.last_refill = now;
-                if b.tokens >= need {
-                    break;
-                }
-                drop(b);
-                std::thread::sleep(Duration::from_millis(20));
-            }
-        }
         let wait = {
             let mut b = self.inner.lock().unwrap();
             let today = utc_day();
@@ -258,16 +257,25 @@ impl Budget {
                     class.share_pct()
                 )));
             }
-            // Speed limit: token bucket refilled at `rps` per second.
             let now = Instant::now();
-            let el = now.duration_since(b.last_refill).as_secs_f64();
-            b.tokens = (b.tokens + el * self.rps).min(self.burst.max(1.0));
-            b.last_refill = now;
-            b.tokens -= n as f64;
+            let lane = usize::from(class == Class::Bulk);
+            let other = 1 - lane;
+            let other_busy = b.vt[other] > now || b.lane_last[other].is_some_and(|t| now.duration_since(t) < Duration::from_secs(1));
+            let rate = if other_busy { self.rps / 2.0 } else { self.rps };
+            let credit = Duration::from_secs_f64(self.burst.max(1.0) / self.rps);
+            let floor = now.checked_sub(credit).unwrap_or(now);
+            let start = b.vt[lane].max(floor);
+            let after = start + Duration::from_secs_f64(n as f64 / rate);
+            let wait = after.saturating_duration_since(now);
+            if wait > Duration::from_secs(30) {
+                b.refused += n;
+                return Err(NodeErr::Budget(format!("speed limit: {} requests already waiting over 30 s ({})", class.name(), if lane == 1 { "bulk lane" } else { "main lane" })));
+            }
+            b.vt[lane] = after;
+            b.lane_last[lane] = Some(now);
             b.used += n;
             b.per_class[class_idx(class)] += n;
             b.unsaved += n;
-            let wait = if b.tokens < 0.0 { Duration::from_secs_f64(-b.tokens / self.rps) } else { Duration::ZERO };
             if b.unsaved >= 25 || b.last_save.elapsed() > Duration::from_secs(30) {
                 b.unsaved = 0;
                 b.last_save = Instant::now();
@@ -276,9 +284,16 @@ impl Budget {
             wait
         };
         if !wait.is_zero() {
-            std::thread::sleep(wait.min(Duration::from_secs(10)));
+            std::thread::sleep(wait);
         }
         Ok(())
+    }
+
+    /// How long a new request would wait right now, per lane (status).
+    pub fn backlog_ms(&self) -> (u64, u64) {
+        let b = self.inner.lock().unwrap();
+        let now = Instant::now();
+        (b.vt[0].saturating_duration_since(now).as_millis() as u64, b.vt[1].saturating_duration_since(now).as_millis() as u64)
     }
 
     fn save(&self, b: &BudgetInner) {
@@ -298,7 +313,10 @@ impl Budget {
         for c in Class::ALL {
             per.insert(c.name().into(), Value::from(b.per_class[class_idx(c)]));
         }
-        json!({ "usedToday": b.used, "cap": self.cap, "refusedToday": b.refused, "byClass": per, "utcDay": b.day })
+        let now = Instant::now();
+        let bl = |i: usize| b.vt[i].saturating_duration_since(now).as_millis() as u64;
+        json!({ "usedToday": b.used, "cap": self.cap, "refusedToday": b.refused, "byClass": per, "utcDay": b.day,
+                "waitMs": { "main": bl(0), "bulk": bl(1) } })
     }
 
     /// Used so far today (for tests / status).
@@ -755,6 +773,44 @@ mod tests {
         assert!(r[0].as_ref().unwrap_err().is_block_unavailable());
         assert_eq!(r[1], Ok(json!("0x2")));
         assert!(r[2].is_err()); // missing answer
+    }
+
+    #[test]
+    fn speed_limit_is_fair_between_bulk_and_the_rest_and_never_stalls() {
+        // Copy 2 dry run #6: a steady stream of urgent requests starved bulk
+        // loads forever. Now both lanes get about half while both are busy.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Arc;
+        let b = Arc::new(Budget::new(1_000_000, 200.0, None));
+        let counts = Arc::new([AtomicU64::new(0), AtomicU64::new(0)]);
+        let stop = Instant::now() + Duration::from_millis(1500);
+        let mut hs = Vec::new();
+        for i in 0..8 {
+            let (b, counts) = (b.clone(), counts.clone());
+            hs.push(std::thread::spawn(move || {
+                let (class, lane) = if i % 2 == 0 { (Class::Fill, 0) } else { (Class::Bulk, 1) };
+                while Instant::now() < stop {
+                    if b.take(class, 10).is_ok() {
+                        counts[lane].fetch_add(10, Ordering::Relaxed);
+                    }
+                }
+            }));
+        }
+        for h in hs {
+            h.join().unwrap();
+        }
+        let (u, k) = (counts[0].load(Ordering::Relaxed), counts[1].load(Ordering::Relaxed));
+        let total = u + k;
+        // ~1.5 s x 200/s = 300 (+ burst); never more than the limit allows.
+        assert!(total <= 300 + 200 + 80, "over the speed limit: {total}");
+        assert!(k * 4 >= total && u * 4 >= total, "unfair: main {u}, bulk {k}");
+    }
+
+    #[test]
+    fn speed_limit_refuses_instead_of_queueing_over_30_s() {
+        let b = Budget::new(1_000_000, 1.0, None);
+        assert!(b.take(Class::Fill, 1).is_ok()); // burst credit
+        assert!(matches!(b.take(Class::Fill, 100), Err(NodeErr::Budget(_))));
     }
 
     #[test]

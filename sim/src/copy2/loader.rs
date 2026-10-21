@@ -99,11 +99,45 @@ pub struct LoaderStats {
     total: Mutex<Vec<(&'static str, u64, u64)>>,
     /// Queue lengths (urgent, bulk, trace).
     pub queued: Mutex<(usize, usize, usize)>,
+    /// What each thread is doing right now (watchdog): (what, since).
+    states: Mutex<Vec<(String, Instant)>>,
+    /// When a job last finished.
+    last_done: Mutex<Option<Instant>>,
 }
 
 impl LoaderStats {
+    fn set_state(&self, i: usize, what: String) {
+        let mut g = self.states.lock().unwrap();
+        if g.len() <= i {
+            g.resize(i + 1, ("idle".into(), Instant::now()));
+        }
+        g[i] = (what, Instant::now());
+    }
+
+    /// Seconds since a job last finished (None = none finished yet).
+    pub fn since_last_done(&self) -> Option<Duration> {
+        self.last_done.lock().unwrap().map(|t| t.elapsed())
+    }
+
+    /// Busy threads: "thread N: what (for S s)".
+    pub fn thread_states(&self) -> Vec<String> {
+        self.states
+            .lock()
+            .unwrap()
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.0 != "idle")
+            .map(|(i, s)| format!("#{i}: {} ({:.1} s)", s.0, s.1.elapsed().as_secs_f64()))
+            .collect()
+    }
+
+    pub fn queue_lengths(&self) -> (usize, usize, usize) {
+        *self.queued.lock().unwrap()
+    }
+
     fn note(&self, kind: &'static str, requests: u64, ms: u64) {
         let now = Instant::now();
+        *self.last_done.lock().unwrap() = Some(now);
         let mut r = self.recent.lock().unwrap();
         r.push_back((now, kind, requests, ms));
         while r.front().is_some_and(|x| now.duration_since(x.0) > Duration::from_secs(60)) || r.len() > 20_000 {
@@ -144,8 +178,12 @@ impl LoaderStats {
                 }),
             );
         }
+        drop(r);
         let (u, b, t) = *self.queued.lock().unwrap();
+        let states = self.thread_states();
         json!({
+            "busyThreads": states,
+            "secondsSinceLastAnswer": self.since_last_done().map(|d| d.as_secs()),
             "threads": self.threads.load(Ordering::Relaxed),
             "busy": self.busy.load(Ordering::Relaxed),
             "queued": { "urgent": u, "bulk": b, "trace": t },
@@ -238,7 +276,7 @@ impl Loaders {
             let (q, env) = (q.clone(), env.clone());
             let trace = i >= n;
             let name = if trace { format!("arbsim-copy2-trace-{}", i - n) } else { format!("arbsim-copy2-load-{i}") };
-            std::thread::Builder::new().name(name).spawn(move || run(q, env, trace)).expect("loader thread");
+            std::thread::Builder::new().name(name).spawn(move || run(q, env, trace, i)).expect("loader thread");
         }
         Loaders { q }
     }
@@ -291,8 +329,10 @@ impl Tip {
     }
 }
 
-fn run(q: Arc<Queue>, env: Env, trace_lane: bool) {
+fn run(q: Arc<Queue>, env: Env, trace_lane: bool, me: usize) {
+    env.stats.set_state(me, "idle".into());
     while let Some(job) = q.take(trace_lane) {
+        env.stats.set_state(me, describe(&job));
         env.stats.busy.fetch_add(1, Ordering::Relaxed);
         let t0 = Instant::now();
         let r0 = env.requests.load(Ordering::Relaxed);
@@ -300,9 +340,24 @@ fn run(q: Arc<Queue>, env: Env, trace_lane: bool) {
         let used = env.requests.load(Ordering::Relaxed).saturating_sub(r0);
         env.stats.note(kind, used, t0.elapsed().as_millis() as u64);
         env.stats.busy.fetch_sub(1, Ordering::Relaxed);
+        env.stats.set_state(me, "idle".into());
         if env.out.send(Input::Done(done)).is_err() {
             return;
         }
+    }
+}
+
+/// One line about a job (watchdog).
+fn describe(j: &Job) -> String {
+    match j {
+        Job::Fetch { block, exact, bulk, items, calls, .. } => format!(
+            "{} at block {block}: {} calls",
+            if *bulk { "bulk load" } else if *exact { "catch-up fetch" } else { "fill" },
+            count_calls(items, calls)
+        ),
+        Job::Trace { coin, holder, .. } => format!("balance trace {coin} / {holder}"),
+        Job::Probe { coin, .. } => format!("coin probe {coin}"),
+        Job::Tip { .. } => "node tip".into(),
     }
 }
 

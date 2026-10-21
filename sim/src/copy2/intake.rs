@@ -780,6 +780,8 @@ pub struct Intake {
     trace_retry: HashMap<(Address, Address), Instant>,
     trace_failed: HashMap<(Address, Address), (Instant, String)>,
     unsure_logged: u64,
+    last_watchdog: Option<Instant>,
+    started: Instant,
     /// Load answers waiting to be digested, one pool at a time.
     load_q: VecDeque<(LoadReq, Arc<FetchOut>, u64)>,
     buf: VecDeque<BufBlock>,
@@ -848,6 +850,8 @@ pub fn manual(sh: Arc<Shared>, fills: Arc<FillQueue>, cfg: C2Config) -> (Intake,
         trace_failed: HashMap::new(),
         unsure_logged: 0,
         load_q: VecDeque::new(),
+        last_watchdog: None,
+        started: Instant::now(),
         buf: VecDeque::new(),
         partials: HashMap::new(),
         jobs: HashMap::new(),
@@ -1066,6 +1070,7 @@ impl Intake {
         self.dispatch_loads();
         self.dispatch_fills();
         self.note_round();
+        self.watchdog();
         *self.c2.in_flight.lock().unwrap() = (self.jobs.len(), self.partials.len());
         if self.last_evict.elapsed() > Duration::from_secs(60) {
             self.last_evict = Instant::now();
@@ -2502,10 +2507,12 @@ impl Intake {
 
     /// Send items checks missed to the loaders (fetched at the head block).
     fn dispatch_fills(&mut self) {
-        if self.loaders.is_none() || self.jobs.values().filter(|j| matches!(j, JobFor::Fill)).count() >= 2 {
+        // One fill job at a time, at most 100 values: fills share the main
+        // lane of the speed limit with catch-up fetches (see node.rs Budget).
+        if self.loaders.is_none() || self.jobs.values().any(|j| matches!(j, JobFor::Fill)) {
             return;
         }
-        let items = self.fills.take(200);
+        let items = self.fills.take(100);
         if items.is_empty() {
             return;
         }
@@ -2610,6 +2617,30 @@ impl Intake {
         self.last_tip = Some(Instant::now());
         let id = self.new_job(JobFor::Tip);
         self.loaders.as_ref().unwrap().send(Job::Tip { id });
+    }
+
+    /// Loud log line if node work is waiting but no answer came back for
+    /// 30 s (at most once per 30 s): what each loader thread is doing, the
+    /// queues, and the node client's speed-limit wait per lane.
+    fn watchdog(&mut self) {
+        if self.jobs.is_empty() || self.last_watchdog.is_some_and(|t| t.elapsed() < Duration::from_secs(30)) {
+            return;
+        }
+        let ls = &self.c2.loader;
+        let quiet = ls.since_last_done().unwrap_or_else(|| self.started.elapsed());
+        if quiet < Duration::from_secs(30) {
+            return;
+        }
+        self.last_watchdog = Some(Instant::now());
+        let (u, b, t) = ls.queue_lengths();
+        let node = self.sh.node.as_ref().map(|n| n.usage()).unwrap_or(Value::Null);
+        eprintln!(
+            "[arbsim] copy2 WATCHDOG: no node answer for {} s while {} job(s) wait or run (queued: {u} urgent, {b} bulk, {t} traces). Threads: {}. Node: {}",
+            quiet.as_secs(),
+            self.jobs.len(),
+            ls.thread_states().join("; "),
+            node
+        );
     }
 
     /// Log (once) when every pool of the current load round has been tried.
