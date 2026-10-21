@@ -7,7 +7,9 @@
 //      No node at all is allowed (checks then only use what the feed replay
 //      can do on its own, which is almost nothing: everything answers
 //      "unknown"), but it's logged loudly.
-//   3. Start the updater thread (keeps the copy current from the feed).
+//   3. Start the thread that keeps the copy current. ARBSIM_SOURCE picks it:
+//        feed         (default) the feed updater (state/updater.rs, copy 1)
+//        pool-events  copy 2: our pools' own events (copy2/intake.rs)
 //   4. Serve the socket forever. Node trouble never stops the server: the
 //      checks just answer "unknown" (not_ready / dirty) until it recovers.
 // ============================================================================
@@ -29,13 +31,48 @@ pub fn default_volatile() -> Volatile {
     Volatile::with_whole(&[ARBOS_STATE_ADDRESS])
 }
 
-/// Build everything (no socket yet). Used by `serve` and tests.
+/// Where the copy's updates come from (ARBSIM_SOURCE).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Source {
+    /// The sequencer feed, every transaction replayed (copy 1, default).
+    Feed,
+    /// Our pools' own events (copy 2).
+    PoolEvents,
+}
+
+impl Source {
+    pub fn from_env() -> Result<Self, String> {
+        match std::env::var("ARBSIM_SOURCE").unwrap_or_default().trim() {
+            "" | "feed" => Ok(Source::Feed),
+            "pool-events" => Ok(Source::PoolEvents),
+            o => Err(format!("ARBSIM_SOURCE='{o}' (use 'feed' or 'pool-events')")),
+        }
+    }
+}
+
+/// Build everything (no socket yet), feed source. Used by `serve` and tests.
 pub fn build(cfg: Config, node: Option<Arc<dyn NodeApi>>) -> Arc<Ctx> {
+    build_with(cfg, node, Source::Feed)
+}
+
+/// Build everything for the given source.
+pub fn build_with(cfg: Config, node: Option<Arc<dyn NodeApi>>, source: Source) -> Arc<Ctx> {
     let fills = Arc::new(FillQueue::new(20_000, cfg.max_warm));
     let pin_cache = cfg.pin_cache;
     let shared = Shared::new(cfg, node, Arc::new(default_volatile()));
-    let updater = updater::spawn(shared.clone(), fills.clone());
-    Arc::new(Ctx { shared, updater, fills, pinned: PinnedCache::new(pin_cache) })
+    match source {
+        Source::Feed => {
+            let updater = updater::spawn(shared.clone(), fills.clone());
+            Arc::new(Ctx { shared, updater, fills, pinned: PinnedCache::new(pin_cache), copy2: None })
+        }
+        Source::PoolEvents => {
+            // The feed updater is NOT started (one writer only); its handle
+            // exists but nothing reads it.
+            let (_unused, updater) = updater::manual(shared.clone(), fills.clone());
+            let c2 = crate::copy2::intake::spawn(shared.clone(), fills.clone(), crate::copy2::intake::C2Config::from_env());
+            Arc::new(Ctx { shared, updater, fills, pinned: PinnedCache::new(pin_cache), copy2: Some(c2) })
+        }
+    }
 }
 
 pub fn serve_main(args: &[String]) {
@@ -62,7 +99,15 @@ pub fn serve_main(args: &[String]) {
         cfg.verify_min_interval_s,
         crate::node::env_u64("ARBSIM_NODE_DAILY_CAP", 6000)
     );
-    let ctx = build(cfg, node);
+    let source = match Source::from_env() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[arbsim] {e}");
+            std::process::exit(2);
+        }
+    };
+    eprintln!("[arbsim] source: {source:?}");
+    let ctx = build_with(cfg, node, source);
     if let Err(e) = serve(ctx, &socket) {
         eprintln!("[arbsim] socket error: {e}");
         std::process::exit(1);

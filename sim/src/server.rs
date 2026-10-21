@@ -16,6 +16,12 @@
 //   the missing items are queued for fetching so the next check is warm.
 //   Pinned checks (`at.pinned`): run on a separate exact view of block N
 //   that is filled from the node until the check is sure (state/pinned.rs).
+//
+//   Copy 2 (ARBSIM_SOURCE=pool-events, copy2/intake.rs): `pool_logs` and
+//   `block_tick` go straight to the copy-2 thread like feed frames (no
+//   answer); `track` answers {ok, tracked}; missed items and `warm` go to
+//   copy 2 instead of the feed updater; a check whose missing items belong
+//   to a pool that isn't ready answers "unknown: unsure_pool".
 // ============================================================================
 use std::io::BufWriter;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -27,6 +33,7 @@ use serde_json::{json, Value};
 
 use crate::arb::BlockCtx;
 use crate::check::proto_types::{handle_call, handle_size_search, CallRequest, SizeSearchRequest};
+use crate::copy2::intake::Copy2Handle;
 use crate::node::env_u64;
 use crate::proto::{bad_request, parse_at, parse_missing, parse_warm, read_msg, unknown, write_msg};
 use crate::state::fill::FillQueue;
@@ -42,6 +49,18 @@ pub struct Ctx {
     pub updater: UpdaterHandle,
     pub fills: Arc<FillQueue>,
     pub pinned: PinnedCache,
+    /// Copy 2 (pool-events source); None = the feed updater is the source.
+    pub copy2: Option<Copy2Handle>,
+}
+
+impl Ctx {
+    /// Items a check missed: to whichever thread keeps the copy.
+    fn fill(&self, items: Vec<crate::state::MissItem>) {
+        match &self.copy2 {
+            Some(c) => c.fill(items),
+            None => self.updater.fill(items),
+        }
+    }
 }
 
 type Writer = Arc<Mutex<BufWriter<UnixStream>>>;
@@ -119,8 +138,20 @@ fn connection(ctx: Arc<Ctx>, stream: UnixStream, jobs: SyncSender<Job>) -> std::
                 continue;
             }
         };
+        // Copy 2 block reports: straight to the copy-2 thread, no answer.
+        let ty = req.get("type").and_then(|t| t.as_str());
+        if ty == Some("pool_logs") || ty == Some("block_tick") {
+            if let Some(c) = &ctx.copy2 {
+                c.block_json(&req);
+            }
+            continue;
+        }
         // Feed frames: straight to the updater, no answer, never blocks.
+        // (Ignored in copy-2 mode: the feed is not the source then.)
         if req.get("type").and_then(|t| t.as_str()) == Some("feed") {
+            if ctx.copy2.is_some() {
+                continue;
+            }
             if let Some(f) = req.get("frame") {
                 let text = match f {
                     Value::String(s) => s.clone(),
@@ -150,15 +181,25 @@ pub fn handle(ctx: &Ctx, req: &Value) -> Value {
             s["fillQueueDropped"] = json!(ctx.fills.dropped());
             s["warmItems"] = json!(ctx.fills.warm_len());
             s["pinnedBlocks"] = json!(ctx.pinned.cached());
+            if let Some(c) = &ctx.copy2 {
+                s["copy2"] = c.status_json(req.get("pools").and_then(|p| p.as_bool()).unwrap_or(false));
+            }
             s
         }
         Some("warm") => match parse_warm(req) {
             Ok(items) => {
                 let n = items.len();
-                ctx.updater.warm(items);
+                match &ctx.copy2 {
+                    Some(c) => c.fill(items),
+                    None => ctx.updater.warm(items),
+                }
                 json!({ "id": id, "ok": true, "queued": n })
             }
             Err(e) => bad_request(&id, &e),
+        },
+        Some("track") => match &ctx.copy2 {
+            Some(c) => c.track_json(&id, req),
+            None => bad_request(&id, "track needs ARBSIM_SOURCE=pool-events"),
         },
         Some("call") => {
             let r: CallRequest = match serde_json::from_value(req.clone()) {
@@ -199,7 +240,9 @@ fn check(ctx: &Ctx, id: &Value, at: &Value, t0: Instant, run: impl Fn(&dyn State
     };
     let view = View::new(picked.snap);
     let mut answer = run(&view, &picked.ctx);
-    ctx.updater.touched(view.take_touched());
+    if ctx.copy2.is_none() {
+        ctx.updater.touched(view.take_touched());
+    }
     if answer.get("ok") == Some(&Value::Bool(true)) {
         Stats::inc(&sh.stats.checks_ok);
     } else {
@@ -207,7 +250,12 @@ fn check(ctx: &Ctx, id: &Value, at: &Value, t0: Instant, run: impl Fn(&dyn State
         let missing = parse_missing(&answer);
         if !missing.is_empty() {
             Stats::inc(&sh.stats.misses);
-            ctx.updater.fill(missing);
+            // Copy 2: missing because a pool on the route isn't ready?
+            if let Some(why) = ctx.copy2.as_ref().and_then(|c| c.unsure_reason(&missing)) {
+                answer["unknown"] = json!("unsure_pool");
+                answer["detail"] = json!(why);
+            }
+            ctx.fill(missing);
         }
     }
     // Total time inside the sidecar (state pick + check).

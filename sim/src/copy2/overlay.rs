@@ -105,6 +105,20 @@ impl Overlay {
         self.changes.accounts.insert(addr, AccountDiff { forget: true, ..Default::default() });
     }
 
+    /// Make ONE slot unknown again (we can't vouch for its value any more).
+    /// If the account was "complete" (every unlisted slot is zero) we can't
+    /// express "this one slot is unknown", so the whole account is dropped.
+    /// (Not recorded in `changes`: copy 2 doesn't carry late fills through
+    /// block changes, see intake.rs "fills".)
+    pub fn forget_slot(&mut self, addr: Address, slot: U256) {
+        let complete = self.snap.accounts.get(&addr).is_some_and(|a| a.storage_complete);
+        if complete {
+            self.forget(addr);
+        } else if let Some(a) = self.snap.accounts.get_mut(&addr) {
+            a.storage.remove(&slot);
+        }
+    }
+
     /// Read one slot (strict).
     pub fn slot(&self, addr: Address, slot: U256) -> Lookup<U256> {
         self.snap.storage(addr, slot)
