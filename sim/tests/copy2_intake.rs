@@ -146,7 +146,7 @@ impl NodeApi for FakeChain {
                             if self.namespaced.lock().unwrap().contains(&to) {
                                 return Ok(json!(w(U256::ZERO))); // reads its real (empty) place
                             }
-                            let k = w(BalanceLayout { vyper: false, slot: 0 }.key(PROBE_HOLDER));
+                            let k = w(BalanceLayout::solidity(0).key(PROBE_HOLDER));
                             return Ok(diff.get(&k).cloned().unwrap_or(json!(w(U256::ZERO))));
                         }
                         let s = |n: u64| self.sload(b, to, U256::from(n));
@@ -638,7 +638,7 @@ fn wire_messages_parse() {
     .unwrap();
     assert_eq!(pools.len(), 1);
     assert_eq!(skipped.len(), 2); // unknown kind; v4 without id
-    assert_eq!(layouts, vec![(a(2), BalanceLayout { vyper: false, slot: 3 })]);
+    assert_eq!(layouts, vec![(a(2), BalanceLayout::solidity(3))]);
 }
 
 #[test]
@@ -1076,5 +1076,152 @@ fn loading_keeps_flowing_under_the_speed_limit_with_checks_asking_too() {
     }
     eprintln!("flowing test: {n} pools ready in {:?}", t0.elapsed());
     assert!(h.c2.last_block.load(Relaxed) >= 100);
+    h.stop();
+}
+
+/// A node like Chainstack under a plan limit: requests of 25 calls, each
+/// taking `latency`; more than `limit` calls in any 1 s window and the node
+/// answers "rate limited (429)" (the calls still count against the plan).
+struct PlanNode {
+    chain: Arc<FakeChain>,
+    limit: u64,
+    latency: std::time::Duration,
+    window: Mutex<std::collections::VecDeque<(std::time::Instant, u64)>>,
+    sent: std::sync::atomic::AtomicU64,
+    rejected: std::sync::atomic::AtomicU64,
+    worst_second: std::sync::atomic::AtomicU64,
+    /// The node client's own speed limit (node.rs Budget), as in production.
+    budget: arbsim::node::Budget,
+}
+impl PlanNode {
+    fn admit(&self, n: u64) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        let now = std::time::Instant::now();
+        let mut w = self.window.lock().unwrap();
+        while w.front().is_some_and(|x| now.duration_since(x.0) >= std::time::Duration::from_secs(1)) {
+            w.pop_front();
+        }
+        let used: u64 = w.iter().map(|x| x.1).sum();
+        self.sent.fetch_add(n, Relaxed);
+        w.push_back((now, n));
+        self.worst_second.fetch_max(used + n, Relaxed);
+        if used + n > self.limit {
+            self.rejected.fetch_add(n, Relaxed);
+            return false;
+        }
+        true
+    }
+}
+impl NodeApi for PlanNode {
+    fn call_batch(&self, c: Class, calls: &[(&str, Value)]) -> Result<Vec<CallResult>, NodeErr> {
+        let mut out = Vec::new();
+        for ch in calls.chunks(25) {
+            self.budget.take(c, ch.len() as u64)?;
+            std::thread::sleep(self.latency);
+            if !self.admit(ch.len() as u64) {
+                return Err(NodeErr::Transport("node1: rate limited (429)".into()));
+            }
+            out.extend(self.chain.call_batch(c, ch)?);
+        }
+        Ok(out)
+    }
+    fn call_batch_paid(&self, c: Class, calls: &[(&str, Value)]) -> Result<Vec<CallResult>, NodeErr> {
+        self.call_batch(c, calls)
+    }
+}
+
+#[test]
+fn soak_800_pools_at_the_plan_limit_with_checks_asking_twice_the_limit() {
+    // Time runs 40x fast: 25 calls/s -> 1,000; 300 ms answers -> 7.5 ms;
+    // 15 simulated minutes -> 22.5 s.
+    use std::sync::atomic::Ordering::Relaxed;
+    use std::time::{Duration, Instant};
+    const X: f64 = 40.0;
+    let limit = (25.0 * X) as u64;
+    let chain = Arc::new(FakeChain::new());
+    let pool_addr = |i: u16| {
+        let mut b = [0u8; 20];
+        b[0] = 0x55;
+        b[18..].copy_from_slice(&i.to_be_bytes());
+        Address::from(b)
+    };
+    let n = 800u16;
+    let mut s = genesis();
+    let mut pj = Vec::new();
+    for i in 0..n {
+        let p = pool_addr(i);
+        let st = s.entry(p).or_default();
+        st.insert(u(0), u(2000));
+        st.insert(u(6), addr_word(a(COIN0)));
+        st.insert(u(7), addr_word(a(COIN1)));
+        st.insert(u(8), u(1000) | (u(4000) << 112usize) | (u(1000) << 224usize));
+        s.get_mut(&a(COIN0)).unwrap().insert(map_slot(p, 0), u(1000));
+        s.get_mut(&a(COIN1)).unwrap().insert(map_slot(p, 0), u(4000));
+        pj.push(json!({"address": format!("{p}"), "kind": "v2", "token0": format!("{}", a(COIN0)), "token1": format!("{}", a(COIN1))}));
+    }
+    chain.set(100, s);
+    let node = Arc::new(PlanNode {
+        chain: chain.clone(),
+        limit,
+        latency: Duration::from_secs_f64(0.3 / X),
+        window: Mutex::new(Default::default()),
+        sent: Default::default(),
+        rejected: Default::default(),
+        worst_second: Default::default(),
+        budget: arbsim::node::Budget::new(u64::MAX / 4, limit as f64, None),
+    });
+    let sh = Shared::new(Config::for_tests(), Some(node.clone() as Arc<dyn NodeApi>), Arc::new(Volatile::default()));
+    // As in production: 80 % of the plan rate, urgent at most 25 % while loading waits.
+    let pace = arbsim::copy2::loader::Pace { rate: limit as f64 * 0.8, urgent_share: 0.25 };
+    // Reports kept: production's 2,400 blocks (~10 min at 4 blocks/s).
+    let cfg = C2Config { loaders: 16, trace_loaders: 6, load_batch: 25, pace, reload_ms: 1000, keep_blocks: 2400, max_keep_blocks: 40_000, ..C2Config::for_tests() };
+    let h = arbsim::copy2::intake::spawn(sh.clone(), Arc::new(FillQueue::new(1_000_000, 100)), cfg);
+    assert_eq!(h.track_json(&json!(1), &json!({"pools": pj}))["tracked"], json!(n as u64));
+    let t0 = Instant::now();
+    let mut b = 100u64;
+    let mut worst_rate = 0f64;
+    let (mut last_sent, mut last_t) = (0u64, Instant::now());
+    let mut ready = 0;
+    while t0.elapsed() < Duration::from_secs_f64(15.0 * 60.0 / X) {
+        // A block every 250 ms of chain time; checks miss 2x the plan limit.
+        let mut m = tick(b, 1000 + b);
+        m.prev_block = if b > 100 { Some(b - 1) } else { None };
+        h.block(m);
+        b += 1;
+        let per_tick = (2.0 * limit as f64 * 0.25 / X * X / 4.0) as u64; // 2x limit over 250 ms / X
+        let miss: Vec<MissItem> = (0..per_tick.max(1)).map(|i| MissItem::Slot(a(USER), U256::from(b * 100_000 + i))).collect();
+        h.fill(miss);
+        std::thread::sleep(Duration::from_secs_f64(0.25 / X));
+        if last_t.elapsed() >= Duration::from_secs(1) {
+            let s = node.sent.load(Relaxed);
+            worst_rate = worst_rate.max((s - last_sent) as f64 / last_t.elapsed().as_secs_f64());
+            last_sent = s;
+            last_t = Instant::now();
+        }
+        if b % 20 == 0 {
+            ready = h.status_json(false)["ready"].as_u64().unwrap();
+            if ready == n as u64 {
+                break;
+            }
+        }
+    }
+    let st = h.status_json(false);
+    eprintln!(
+        "soak: {ready}/{n} ready after {:.1} simulated min; node calls {} (copy 2 counted {}), rejected 429 {}, worst 1-s window {} (limit {limit}), worst rate {worst_rate:.0}/s; loader {}",
+        t0.elapsed().as_secs_f64() * X / 60.0,
+        node.sent.load(Relaxed),
+        st["nodeRequests"],
+        node.rejected.load(Relaxed),
+        node.worst_second.load(Relaxed),
+        st["loader"]
+    );
+    // Never over the plan's limit, no retry storm, nearly everything ready.
+    assert_eq!(node.rejected.load(Relaxed), 0, "sent over the plan limit");
+    assert!(node.worst_second.load(Relaxed) <= limit);
+    // Copy 2's count = real sends (a failed request may count calls not sent).
+    let (counted, sent) = (st["nodeRequests"].as_u64().unwrap(), node.sent.load(Relaxed));
+    // (Jobs still running are counted when they finish.)
+    assert!(counted <= sent + sent / 20, "copy 2 counted {counted}, node got {sent}");
+    assert!(ready * 10 >= n as u64 * 9, "only {ready} of {n} ready: {st}");
     h.stop();
 }

@@ -36,18 +36,65 @@ use crate::check::hexutil::{parse_u256, to_hex};
 use crate::node::{tag, Class, NodeApi, NodeErr};
 
 /// Where a coin keeps balances.
+///   solidity  keccak(holder . slot)          (most coins; slot 0..60, or a
+///             big "namespaced" base such as OpenZeppelin v5's ERC20 storage)
+///   vyper     keccak(slot . holder)
+///   solady    keccak(holder . 8 zero bytes . 4-byte seed)   (Solady ERC20,
+///             `slot` holds the seed)
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct BalanceLayout {
-    /// false = Solidity mapping keccak(holder . slot); true = Vyper keccak(slot . holder).
     pub vyper: bool,
-    pub slot: u64,
+    pub slot: U256,
+    pub solady: bool,
+}
+
+/// OpenZeppelin Contracts v5 upgradeable ERC20: balances mapping at this
+/// namespaced base (keccak256(abi.encode(uint256(keccak256(
+/// "openzeppelin.storage.ERC20")) - 1)) & ~0xff).
+pub const OZ5_ERC20_BASE: U256 =
+    U256::from_be_bytes(hex_literal_32("52c63247e1f47db19d5ce0460030c497f067ca4cebf71ba98eeadabe20bace00"));
+/// Solady ERC20's balance seed.
+pub const SOLADY_BALANCE_SEED: u64 = 0x87a211a2;
+
+const fn hex_literal_32(h: &str) -> [u8; 32] {
+    let b = h.as_bytes();
+    let mut out = [0u8; 32];
+    let mut i = 0;
+    while i < 32 {
+        let hi = hexval(b[2 * i]);
+        let lo = hexval(b[2 * i + 1]);
+        out[i] = hi * 16 + lo;
+        i += 1;
+    }
+    out
+}
+
+const fn hexval(c: u8) -> u8 {
+    match c {
+        b'0'..=b'9' => c - b'0',
+        b'a'..=b'f' => c - b'a' + 10,
+        _ => c - b'A' + 10,
+    }
 }
 
 impl BalanceLayout {
+    pub fn solidity(slot: u64) -> Self {
+        BalanceLayout { vyper: false, slot: U256::from(slot), solady: false }
+    }
+    pub fn vyper(slot: u64) -> Self {
+        BalanceLayout { vyper: true, slot: U256::from(slot), solady: false }
+    }
+
     /// Storage slot holding `holder`'s balance.
     pub fn key(&self, holder: Address) -> U256 {
+        if self.solady {
+            let mut buf = [0u8; 32];
+            buf[..20].copy_from_slice(holder.as_slice());
+            buf[28..].copy_from_slice(&self.slot.to_be_bytes::<32>()[28..]);
+            return U256::from_be_bytes(keccak256(buf).0);
+        }
         let mut buf = [0u8; 64];
-        let s = U256::from(self.slot).to_be_bytes::<32>();
+        let s = self.slot.to_be_bytes::<32>();
         if self.vyper {
             buf[..32].copy_from_slice(&s);
             buf[44..64].copy_from_slice(holder.as_slice());
@@ -58,19 +105,42 @@ impl BalanceLayout {
         U256::from_be_bytes(keccak256(buf).0)
     }
 
-    /// From the bot's JSON ({"layout":"solidity"|"vyper","slot":N}).
+    /// From the bot's JSON ({"layout":"solidity"|"vyper"|"solady","slot":N or "0x.."}).
     pub fn from_json(v: &Value) -> Option<Self> {
-        let vyper = match v.get("layout").and_then(|x| x.as_str()) {
-            Some("solidity") => false,
-            Some("vyper") => true,
+        let (vyper, solady) = match v.get("layout").and_then(|x| x.as_str()) {
+            Some("solidity") => (false, false),
+            Some("vyper") => (true, false),
+            Some("solady") => (false, true),
             _ => return None,
         };
-        let slot = v.get("slot").and_then(|x| x.as_u64())?;
-        (slot <= 1000).then_some(BalanceLayout { vyper, slot })
+        let slot = match v.get("slot")? {
+            Value::Number(n) => U256::from(n.as_u64()?),
+            Value::String(t) => parse_u256(t).ok()?,
+            _ => return None,
+        };
+        Some(BalanceLayout { vyper, slot, solady })
     }
 
     pub fn to_json(&self) -> Value {
-        json!({ "layout": if self.vyper { "vyper" } else { "solidity" }, "slot": self.slot })
+        let name = if self.solady { "solady" } else if self.vyper { "vyper" } else { "solidity" };
+        let slot = if self.slot < U256::from(1u64 << 53) { json!(self.slot.to::<u64>()) } else { json!(format!("{:#x}", self.slot)) };
+        json!({ "layout": name, "slot": slot })
+    }
+
+    /// Given one holder's balance slot (found by a trace), the standard
+    /// layout it comes from, if any: then every other holder of the coin is
+    /// known without another trace.
+    pub fn guess(holder: Address, slot: U256) -> Option<Self> {
+        let mut cands: Vec<BalanceLayout> = Vec::new();
+        for n in 0..=200u64 {
+            cands.push(BalanceLayout::solidity(n));
+            cands.push(BalanceLayout::vyper(n));
+        }
+        for off in 0..4u64 {
+            cands.push(BalanceLayout { vyper: false, slot: OZ5_ERC20_BASE + U256::from(off), solady: false });
+        }
+        cands.push(BalanceLayout { vyper: false, slot: U256::from(SOLADY_BALANCE_SEED), solady: true });
+        cands.into_iter().find(|c| c.key(holder) == slot)
     }
 }
 
@@ -95,8 +165,8 @@ pub fn balance_of_data(holder: Address) -> String {
 fn candidates() -> Vec<BalanceLayout> {
     let mut v = Vec::new();
     for slot in 0..=MAX_SLOT {
-        v.push(BalanceLayout { vyper: false, slot });
-        v.push(BalanceLayout { vyper: true, slot });
+        v.push(BalanceLayout::solidity(slot));
+        v.push(BalanceLayout::vyper(slot));
     }
     v
 }
@@ -115,7 +185,8 @@ fn probe_calls(node: &dyn NodeApi, coin: Address, block: u64, diffs: Vec<serde_j
         .into_iter()
         .map(|d| ("eth_call", json!([{ "to": c, "data": balance_of_data(PROBE_HOLDER) }, tag(block), { c.clone(): { "stateDiff": Value::Object(d) } }])))
         .collect();
-    let r = node.call_batch_paid(Class::Fill, &calls)?;
+    // Bulk class: never falls back to the public node (copy 2 paces itself).
+    let r = node.call_batch_paid(Class::Bulk, &calls)?;
     Ok(r.into_iter()
         .map(|x| match x {
             Ok(Value::String(s)) => parse_u256(&s).ok(),
@@ -154,7 +225,7 @@ pub fn probe_layout(node: &dyn NodeApi, coin: Address, block: u64) -> Result<Opt
     }
     if found.is_none() {
         // One place per call (slots 0..30), like the bot, but in one batch.
-        let few: Vec<BalanceLayout> = cands.iter().filter(|c| c.slot <= 30).copied().collect();
+        let few: Vec<BalanceLayout> = cands.iter().filter(|c| c.slot <= U256::from(30)).copied().collect();
         let r = probe_calls(node, coin, block, few.iter().map(|c| one(c, MAGIC)).collect())?;
         let any_error = r.iter().any(|v| v.is_none());
         found = few.iter().zip(r).find(|(_, v)| *v == Some(U256::from(MAGIC))).map(|(c, _)| *c);
@@ -180,12 +251,12 @@ mod tests {
     fn keys_match_solidity_and_vyper_encoding() {
         let h = Address::with_last_byte(0x42);
         // Solidity: keccak(pad(h) . pad(3)) - same as fields::map_slot.
-        assert_eq!(BalanceLayout { vyper: false, slot: 3 }.key(h), crate::copy2::fields::map_slot(h, 3));
+        assert_eq!(BalanceLayout::solidity(3).key(h), crate::copy2::fields::map_slot(h, 3));
         let mut b = [0u8; 64];
         b[31] = 3;
         b[63] = 0x42;
-        assert_eq!(BalanceLayout { vyper: true, slot: 3 }.key(h), U256::from_be_bytes(keccak256(b).0));
-        assert_eq!(BalanceLayout::from_json(&json!({"layout":"vyper","slot":3})), Some(BalanceLayout { vyper: true, slot: 3 }));
+        assert_eq!(BalanceLayout::vyper(3).key(h), U256::from_be_bytes(keccak256(b).0));
+        assert_eq!(BalanceLayout::from_json(&json!({"layout":"vyper","slot":3})), Some(BalanceLayout::vyper(3)));
         assert_eq!(BalanceLayout::from_json(&json!({"layout":"x","slot":3})), None);
     }
 
@@ -196,7 +267,7 @@ mod tests {
     impl NodeApi for FakeCoin {
         fn call_batch(&self, _c: Class, calls: &[(&str, Value)]) -> Result<Vec<CallResult>, NodeErr> {
             *self.calls.lock().unwrap() += calls.len();
-            let want = slot_hex(BalanceLayout { vyper: false, slot: 9 }.key(PROBE_HOLDER));
+            let want = slot_hex(BalanceLayout::solidity(9).key(PROBE_HOLDER));
             Ok(calls
                 .iter()
                 .map(|(_, p)| {
@@ -208,10 +279,25 @@ mod tests {
     }
 
     #[test]
+    fn guess_recognises_namespaced_and_solady_layouts() {
+        let h = Address::with_last_byte(0x42);
+        let oz = BalanceLayout { vyper: false, slot: OZ5_ERC20_BASE, solady: false };
+        assert_eq!(BalanceLayout::guess(h, oz.key(h)), Some(oz));
+        let sol = BalanceLayout { vyper: false, slot: U256::from(SOLADY_BALANCE_SEED), solady: true };
+        assert_eq!(BalanceLayout::guess(h, sol.key(h)), Some(sol));
+        assert_eq!(BalanceLayout::guess(h, BalanceLayout::solidity(150).key(h)), Some(BalanceLayout::solidity(150)));
+        assert_eq!(BalanceLayout::guess(h, U256::from(12345)), None);
+        // OZ v5 base as published.
+        assert_eq!(format!("{:#x}", OZ5_ERC20_BASE), "0x52c63247e1f47db19d5ce0460030c497f067ca4cebf71ba98eeadabe20bace00");
+        let j = oz.to_json();
+        assert_eq!(BalanceLayout::from_json(&j), Some(oz));
+    }
+
+    #[test]
     fn probe_finds_the_slot_in_two_requests() {
         let n = FakeCoin { calls: Mutex::new(0) };
         let l = probe_layout(&n, Address::with_last_byte(7), 100).unwrap();
-        assert_eq!(l, Some(BalanceLayout { vyper: false, slot: 9 }));
+        assert_eq!(l, Some(BalanceLayout::solidity(9)));
         assert_eq!(*n.calls.lock().unwrap(), 2);
     }
 }

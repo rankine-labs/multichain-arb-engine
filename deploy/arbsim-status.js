@@ -218,6 +218,7 @@ async function main() {
     const used = node.usedToday || 0, cap = node.cap || 0;
     lines.push(`  Paid node use today (UTC): ${n(used)} of ${n(cap)} allowed (${pct(used, cap)})` +
       (node.refusedToday ? `, ${n(node.refusedToday)} refused (allowance used up)` : '') +
+      (node.throttledToday ? `, ${n(node.throttledToday)} held back by the speed limit (not sent)` : '') +
       `; nodes: ${(node.nodes || []).join(', ') || '?'}` + (node.errors ? `; ${n(node.errors)} node errors` : ''));
     if (node.public) lines.push(`  Free public node use today: ${n(node.public.usedToday)}`);
   }

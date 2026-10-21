@@ -196,6 +196,35 @@ trade ~20 ms.
   wait or run ..." with each busy loader thread's job and the speed-limit
   wait per lane (at most every 30 s). status: copy2.loader.busyThreads,
   secondsSinceLastAnswer; node.waitMs {main, bulk}.
+- Dry run #7 retry storm (fixed by making copy 2 SELF-PACING):
+  - Cause: copy 2 handed the node client far more than the rate allowed
+    (16+6 threads, 325-call jobs); the limiter's 30 s refusals were counted
+    as "allowance used up" (that was the 21,004 "refused" at 4.4 % used: not
+    the class shares), as node requests and as node errors, retried after
+    2-3 s, and fell back to the public node.
+  - Now: copy 2's loader queue holds its own call budget,
+    ARBSIM_COPY2_RATE_PCT (80) % of ARBSIM_NODE_RPS, at most 0.1 s worth let
+    out at once; a job only leaves the queue when there is room for its
+    calls. Urgent work (fills, catch-up) gets at most ARBSIM_COPY2_URGENT_PCT
+    (25) % while loading waits. Bulk work in flight is capped at ~2 s of
+    budget; load jobs ~2 s of calls each. Calls are counted only when really
+    sent. Bulk/trace/probe work never goes to the public node.
+  - node.rs speed limiter: one FIFO clock, strict spacing at 97 % of
+    ARBSIM_NODE_RPS (no 1-s window over the plan rate); a refusal (> 30 s
+    queue) is "speed limit", counted as throttledToday, NOT as allowance.
+  - Every retry backs off: 1 s doubling to 30 s, +-25 % jitter (loads,
+    traces, probes, catch-up fetches).
+  - Coin places: probe once per coin; if it fails, ONE trace per coin; if
+    that slot fits a standard layout (Solidity/Vyper slot 0-200, OpenZeppelin
+    v5 namespaced ERC20, Solady) the layout is known for every pool of the
+    coin; only coins with no standard layout get one trace per pool.
+  - Soak test (copy2_intake soak_800_pools_...): 800 pools, node with 300 ms
+    answers and a 25/s plan limit answering 429 when exceeded, checks missing
+    values at 2x the limit; time runs 40x fast. Result: 800/800 ready after
+    12.5 simulated minutes, 0 x 429, worst 1-s window 85 % of the limit.
+  - Expected live at ARBSIM_NODE_RPS=25: copy 2 sends <= 20 calls/s; loading
+    gets 15-20/s -> 800 pools (~13 calls each) in ~9-12 min. 5 min is not
+    possible at 25/s: 800 x 13 calls need >= 7 min at the FULL rate.
 - Status: `status` -> `copy2` {pools, loading, ready, unsure, lastBlock,
   unsureReasons, counters}; with {"pools": true} also `list` of {address,
   v4Id, kind, state, reason, events}. Checks touching a pool that isn't

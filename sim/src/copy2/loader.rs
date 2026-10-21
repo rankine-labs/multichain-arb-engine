@@ -21,9 +21,17 @@
 //     bulk    first loads of many pools at once -> general threads
 //     trace   balance traces (slow, ~1 s each) -> their own threads
 //   [ARBSIM_COPY2_LOADERS 16 general threads, ARBSIM_COPY2_TRACE_LOADERS 6]
-//   Bulk loads use the node budget class "bulk", which never pushes the
-//   speed limit (ARBSIM_NODE_RPS) into debt: they use the room the urgent
-//   ones leave, so a check's missing value is never stuck behind loading.
+//
+//   SELF-PACING (after dry runs #6/#7): copy 2 never hands the node client
+//   more than it may send. A job only leaves the queue when copy 2's own
+//   call budget has room for its calls: ARBSIM_COPY2_RATE_PCT (80) % of
+//   ARBSIM_NODE_RPS calls per second, with at most 0.1 s worth let out at once.
+//   So the node client's speed limit never has to refuse, nothing piles up,
+//   and nothing is retried in a loop. While both are waiting, urgent work
+//   gets at most ARBSIM_COPY2_URGENT_PCT (25) % of that budget and loading
+//   the rest; alone, either gets all of it. Calls are counted when really
+//   sent (a refusal by our own limiter is not a node request).
+//   Bulk work (loads, traces, probes) never falls back to the public node.
 //
 //   Which block: the bot's websocket reports run a few blocks AHEAD of what
 //   the node answers over HTTP. Loads, fills, probes and traces are fetched
@@ -103,6 +111,7 @@ pub struct LoaderStats {
     states: Mutex<Vec<(String, Instant)>>,
     /// When a job last finished.
     last_done: Mutex<Option<Instant>>,
+    pace: Mutex<Option<Pace>>,
 }
 
 impl LoaderStats {
@@ -188,6 +197,7 @@ impl LoaderStats {
             "busy": self.busy.load(Ordering::Relaxed),
             "queued": { "urgent": u, "bulk": b, "trace": t },
             "requestsPerSecLastMin": (reqs as f64 / 60.0 * 10.0).round() / 10.0,
+            "pace": self.pace.lock().unwrap().map(|p| json!({ "callsPerSec": (p.rate * 10.0).round() / 10.0, "urgentShare": p.urgent_share })),
             "byKind": Value::Object(kinds),
         })
     }
@@ -201,31 +211,127 @@ struct Lanes {
     bulk: VecDeque<Job>,
     trace: VecDeque<Job>,
     closed: bool,
+    /// Copy 2's call budget (see file header).
+    tokens: f64,
+    last: Instant,
+    /// Recent calls per lane (urgent, bulk+trace), fading over ~10 s.
+    used: [f64; 2],
+}
+
+/// Copy 2's own pacing settings.
+#[derive(Clone, Copy, Debug)]
+pub struct Pace {
+    /// Calls per second copy 2 may send.
+    pub rate: f64,
+    /// Share of `rate` urgent work may use while loading waits (0..1).
+    pub urgent_share: f64,
+}
+
+impl Pace {
+    /// ARBSIM_NODE_RPS x ARBSIM_COPY2_RATE_PCT, urgent ARBSIM_COPY2_URGENT_PCT.
+    pub fn from_env() -> Self {
+        let rps = std::env::var("ARBSIM_NODE_RPS").ok().and_then(|s| s.parse::<f64>().ok()).unwrap_or(8.0);
+        let pct = crate::node::env_u64("ARBSIM_COPY2_RATE_PCT", 80).clamp(1, 100) as f64;
+        let up = crate::node::env_u64("ARBSIM_COPY2_URGENT_PCT", 25).clamp(1, 99) as f64;
+        Pace { rate: (rps * pct / 100.0).max(0.5), urgent_share: up / 100.0 }
+    }
+    /// Most calls let out at once (0.1 s worth, at least one 25-call request).
+    fn burst(&self) -> f64 {
+        (self.rate * 0.1).max(25.0)
+    }
 }
 
 struct Queue {
     m: Mutex<Lanes>,
     cv: Condvar,
     stats: Arc<LoaderStats>,
+    pace: Pace,
+}
+
+/// Calls a job will send (charged before it leaves the queue; the
+/// difference to what it really sent is settled afterwards).
+fn cost(j: &Job) -> f64 {
+    match j {
+        Job::Fetch { items, calls, .. } => count_calls(items, calls) as f64,
+        Job::Trace { .. } => 2.0,
+        Job::Probe { .. } => 3.0,
+        Job::Tip { .. } => 2.0,
+    }
 }
 
 impl Queue {
     fn publish_len(&self, l: &Lanes) {
         *self.stats.queued.lock().unwrap() = (l.urgent.len(), l.bulk.len(), l.trace.len());
     }
-    /// Next job for a general (trace = false) or trace thread. None = stop.
+    /// Next job for a general (trace = false) or trace thread, once copy 2's
+    /// call budget has room for it. None = stop.
     fn take(&self, trace: bool) -> Option<Job> {
         let mut g = self.m.lock().unwrap();
         loop {
             if g.closed {
                 return None;
             }
-            let j = if trace { g.trace.pop_front() } else { g.urgent.pop_front().or_else(|| g.bulk.pop_front()) };
-            if let Some(j) = j {
+            // Refill the budget, fade the usage memory.
+            let now = Instant::now();
+            let el = now.duration_since(g.last).as_secs_f64();
+            g.last = now;
+            g.tokens = (g.tokens + el * self.pace.rate).min(self.pace.burst());
+            let fade = (-el / 10.0).exp();
+            g.used[0] *= fade;
+            g.used[1] *= fade;
+            // Which lane may go: urgent first unless it already had its share
+            // while loading waits.
+            let loading_waits = !g.bulk.is_empty() || !g.trace.is_empty();
+            let total = g.used[0] + g.used[1];
+            let urgent_ok = !g.urgent.is_empty() && (!loading_waits || g.used[0] <= self.pace.urgent_share * total + 1.0);
+            let lane: Option<usize> = if trace {
+                if g.trace.is_empty() || urgent_ok { None } else { Some(2) }
+            } else if urgent_ok {
+                Some(0)
+            } else if !g.bulk.is_empty() {
+                Some(1)
+            } else if !g.urgent.is_empty() {
+                Some(0)
+            } else {
+                None
+            };
+            let Some(lane) = lane else {
+                g = self.cv.wait_timeout(g, Duration::from_millis(100)).unwrap().0;
+                continue;
+            };
+            let front = match lane {
+                0 => g.urgent.front(),
+                1 => g.bulk.front(),
+                _ => g.trace.front(),
+            };
+            let c = front.map(cost).unwrap_or(1.0);
+            let need = c.min(self.pace.burst());
+            if g.tokens >= need {
+                g.tokens -= c;
+                g.used[usize::from(lane != 0)] += c;
+                let j = match lane {
+                    0 => g.urgent.pop_front(),
+                    1 => g.bulk.pop_front(),
+                    _ => g.trace.pop_front(),
+                };
                 self.publish_len(&g);
-                return Some(j);
+                self.cv.notify_all();
+                return j;
             }
-            g = self.cv.wait(g).unwrap();
+            let wait = Duration::from_secs_f64(((need - g.tokens) / self.pace.rate).clamp(0.001, 1.0));
+            g = self.cv.wait_timeout(g, wait).unwrap().0;
+        }
+    }
+
+    /// Settle a job's real calls against what it was charged.
+    fn settle(&self, charged: f64, sent: u64) {
+        let extra = sent as f64 - charged;
+        if extra.abs() > 0.0 {
+            let mut g = self.m.lock().unwrap();
+            g.tokens -= extra;
+            if g.tokens > self.pace.burst() {
+                g.tokens = self.pace.burst();
+            }
         }
     }
 }
@@ -258,6 +364,7 @@ impl Loaders {
     pub fn spawn(
         n: usize,
         n_trace: usize,
+        pace: Pace,
         node: Arc<dyn NodeApi>,
         out: SyncSender<Input>,
         requests: Arc<AtomicU64>,
@@ -265,10 +372,20 @@ impl Loaders {
         stats: Arc<LoaderStats>,
     ) -> Loaders {
         let q = Arc::new(Queue {
-            m: Mutex::new(Lanes { urgent: VecDeque::new(), bulk: VecDeque::new(), trace: VecDeque::new(), closed: false }),
+            m: Mutex::new(Lanes {
+                urgent: VecDeque::new(),
+                bulk: VecDeque::new(),
+                trace: VecDeque::new(),
+                closed: false,
+                tokens: pace.burst(),
+                last: Instant::now(),
+                used: [0.0, 0.0],
+            }),
             cv: Condvar::new(),
             stats: stats.clone(),
+            pace,
         });
+        *stats.pace.lock().unwrap() = Some(pace);
         let env = Env { node, out, requests, tip: Arc::new(Tip { known: Mutex::new((0, None)), out: tip_out }), stats: stats.clone() };
         let (n, n_trace) = (n.max(1), n_trace.max(1));
         stats.threads.store((n + n_trace) as u64, Ordering::Relaxed);
@@ -309,7 +426,7 @@ impl Tip {
                 return Ok(g.0);
             }
         }
-        requests.fetch_add(1, Ordering::Relaxed);
+        let _ = requests;
         // Ask the node that will serve the fetch (paid first).
         let r = node.call_batch_paid(Class::Fill, &[("eth_blockNumber", json!([]))])?;
         let t = match r.into_iter().next() {
@@ -331,19 +448,57 @@ impl Tip {
 
 fn run(q: Arc<Queue>, env: Env, trace_lane: bool, me: usize) {
     env.stats.set_state(me, "idle".into());
+    // This thread's node, counting the calls it really sends.
+    let counter = Arc::new(Counting { inner: env.node.clone(), sent: AtomicU64::new(0) });
+    let mut env = env;
+    env.node = counter.clone();
     while let Some(job) = q.take(trace_lane) {
         env.stats.set_state(me, describe(&job));
         env.stats.busy.fetch_add(1, Ordering::Relaxed);
         let t0 = Instant::now();
-        let r0 = env.requests.load(Ordering::Relaxed);
+        let charged = cost(&job);
+        let s0 = counter.sent.load(Ordering::Relaxed);
         let (kind, done) = one(&env, job);
-        let used = env.requests.load(Ordering::Relaxed).saturating_sub(r0);
+        let used = counter.sent.load(Ordering::Relaxed) - s0;
+        env.requests.fetch_add(used, Ordering::Relaxed);
+        q.settle(charged, used);
         env.stats.note(kind, used, t0.elapsed().as_millis() as u64);
         env.stats.busy.fetch_sub(1, Ordering::Relaxed);
         env.stats.set_state(me, "idle".into());
         if env.out.send(Input::Done(done)).is_err() {
             return;
         }
+    }
+}
+
+/// A node that counts the calls really sent: a refusal by a speed limit or
+/// the daily allowance (nothing sent) is not counted.
+struct Counting {
+    inner: Arc<dyn NodeApi>,
+    sent: AtomicU64,
+}
+
+impl Counting {
+    fn count<T>(&self, n: usize, r: &Result<T, NodeErr>) {
+        if !matches!(r, Err(NodeErr::Budget(_)) | Err(NodeErr::NoNode)) {
+            self.sent.fetch_add(n as u64, Ordering::Relaxed);
+        }
+    }
+}
+
+impl NodeApi for Counting {
+    fn call_batch(&self, class: Class, calls: &[(&str, Value)]) -> Result<Vec<CallResult>, NodeErr> {
+        let r = self.inner.call_batch(class, calls);
+        self.count(calls.len(), &r);
+        r
+    }
+    fn call_batch_paid(&self, class: Class, calls: &[(&str, Value)]) -> Result<Vec<CallResult>, NodeErr> {
+        let r = self.inner.call_batch_paid(class, calls);
+        self.count(calls.len(), &r);
+        r
+    }
+    fn usage(&self) -> Value {
+        self.inner.usage()
     }
 }
 
@@ -377,7 +532,6 @@ fn one(env: &Env, job: Job) -> (&'static str, Done) {
                 env.tip.at_most(node, block, req)
             };
             let res = at.and_then(|b| {
-                req.fetch_add(count_calls(&items, &calls), Ordering::Relaxed);
                 let class = if bulk { Class::Bulk } else { Class::Fill };
                 fetch(node, class, b, &items, &calls).map(|o| (b, o))
             });
@@ -387,24 +541,17 @@ fn one(env: &Env, job: Job) -> (&'static str, Done) {
             }
         }
         Job::Trace { id, block, coin, holder } => {
-            let res = env.tip.at_most(node, block, req).and_then(|b| {
-                req.fetch_add(2, Ordering::Relaxed);
-                trace_balance(node, b, coin, holder).map(|r| (b, r))
-            });
+            let res = env.tip.at_most(node, block, req).and_then(|b| trace_balance(node, b, coin, holder).map(|r| (b, r)));
             match res {
                 Ok((b, r)) => ("trace", Done::Trace { id, block: b, coin, holder, res: Ok(r) }),
                 Err(e) => ("trace", Done::Trace { id, block, coin, holder, res: Err(e) }),
             }
         }
         Job::Probe { id, coin, block } => {
-            let res = env.tip.at_most(node, block, req).and_then(|b| {
-                req.fetch_add(2, Ordering::Relaxed);
-                probe_layout(node, coin, b)
-            });
+            let res = env.tip.at_most(node, block, req).and_then(|b| probe_layout(node, coin, b));
             ("probe", Done::Probe { id, coin, res })
         }
         Job::Tip { id } => {
-            req.fetch_add(2, Ordering::Relaxed);
             let res = crate::node::block_number(node, Class::Header).and_then(|t| {
                 {
                     let mut g = env.tip.known.lock().unwrap();
@@ -440,7 +587,7 @@ fn trace_balance(node: &dyn NodeApi, block: u64, coin: Address, holder: Address)
         ("eth_call", json!([{ "to": c, "data": data }, t])),
         ("debug_traceCall", json!([{ "to": c, "data": data }, t, { "tracer": "prestateTracer" }])),
     ];
-    let r = node.call_batch_paid(Class::Fill, &rpc)?;
+    let r = node.call_batch_paid(Class::Bulk, &rpc)?;
     let bal = match r.first() {
         Some(Ok(Value::String(s))) => {
             let b = parse_bytes(s).map_err(NodeErr::BadResponse)?;

@@ -80,7 +80,7 @@ use serde_json::{json, Value};
 
 use super::coins::{balance_of_data, BalanceLayout};
 use super::fields::{apply_fields, core_slots, map_slot, obs_slot, sol, topic_addr, topics, v2};
-use super::loader::{out_word, Done, FetchOut, Job, LoaderStats, Loaders, NOT_YET};
+use super::loader::{out_word, Done, FetchOut, Job, LoaderStats, Loaders, Pace, NOT_YET};
 use super::overlay::Overlay;
 use super::replay::{apply_replay, finish_block};
 use super::{ApplyResult, BlockCtx as ReplayCtx, PoolKind, PoolLog, TrackedPool};
@@ -293,6 +293,8 @@ pub struct PoolEntry {
     pub ever_ready: bool,
     /// Fetch rounds of the current load.
     pub rounds: u32,
+    /// Failed load attempts in a row (node trouble): decides the wait.
+    pub fails: u32,
 }
 
 /// Everything about the followed pools (behind one lock).
@@ -404,7 +406,7 @@ c2counters!(
     coin_slot_mismatch, other_side_forgotten, logs_ignored, duplicate_blocks, reorgs, gaps, loads, load_ok,
     load_failed, unsure_marked, need_item_rounds, node_errors, fills, fill_items, fill_refused, fill_retry,
     probes, probe_not_found, probe_errors, track_msgs, dropped_msgs, carried_events, carry_too_old, merges, apply_us_max,
-    late_reports_applied, late_reports_unsure, coin_slot_msgs, coin_traces, coin_trace_found, coin_trace_not_found,
+    late_reports_applied, late_reports_unsure, coin_slot_msgs, throttled, layouts_guessed, coin_traces, coin_trace_found, coin_trace_not_found,
 );
 
 fn inc(c: &AtomicU64) {
@@ -661,6 +663,8 @@ pub struct C2Config {
     /// [ARBSIM_COPY2_TRACE_LOADERS, 6] (traces are slow: own lane).
     pub loaders: usize,
     pub trace_loaders: usize,
+    /// Copy 2's own pacing of node calls (loader.rs).
+    pub pace: Pace,
     /// Blocks of reports always kept for carrying loads forward
     /// [ARBSIM_COPY2_KEEP_BLOCKS, 2400 = ~10 min]; older ones are kept as
     /// long as a running load still needs them, up to
@@ -682,6 +686,7 @@ impl C2Config {
             load_batch: env_u64("ARBSIM_COPY2_LOAD_BATCH", 25).clamp(1, 500) as usize,
             loaders: env_u64("ARBSIM_COPY2_LOADERS", 16).clamp(1, 64) as usize,
             trace_loaders: env_u64("ARBSIM_COPY2_TRACE_LOADERS", 6).clamp(1, 64) as usize,
+            pace: Pace::from_env(),
             keep_blocks: env_u64("ARBSIM_COPY2_KEEP_BLOCKS", 2400).clamp(16, 100_000) as usize,
             max_keep_blocks: env_u64("ARBSIM_COPY2_MAX_KEEP_BLOCKS", 40_000).clamp(16, 1_000_000) as usize,
             max_rounds: env_u64("ARBSIM_COPY2_MAX_ROUNDS", 40).clamp(1, 1000) as u32,
@@ -689,7 +694,7 @@ impl C2Config {
         }
     }
     pub fn for_tests() -> Self {
-        C2Config { reload_ms: 0, reload_max_ms: 0, layout_retry_s: 3600, load_batch: 25, loaders: 2, trace_loaders: 2, keep_blocks: 400, max_keep_blocks: 4000, max_rounds: 40, tip_every_s: 0 }
+        C2Config { reload_ms: 0, reload_max_ms: 0, layout_retry_s: 3600, load_batch: 25, loaders: 2, trace_loaders: 2, pace: Pace { rate: 1_000_000.0, urgent_share: 0.25 }, keep_blocks: 400, max_keep_blocks: 4000, max_rounds: 40, tip_every_s: 0 }
     }
 }
 
@@ -764,7 +769,7 @@ pub struct Intake {
     /// Need fetches to send again after a node error: (when, pool, gen, items).
     delayed: Vec<(Instant, PoolKey, u64, Vec<MissItem>)>,
     /// Coins whose probe failed with a node error: ask again after this.
-    probe_retry: HashMap<Address, Instant>,
+    probe_retry: HashMap<Address, (Instant, u32)>,
     outcomes: Outcomes,
     last_progress: Instant,
     /// Position of the last report applied to each pool / to each followed
@@ -777,7 +782,12 @@ pub struct Intake {
     /// Balance traces running / to retry after a node error / judged
     /// "not found" (coin, holder).
     tracing: HashSet<(Address, Address)>,
-    trace_retry: HashMap<(Address, Address), Instant>,
+    trace_retry: HashMap<(Address, Address), (Instant, u32)>,
+    /// Coins with a balance trace running (one per coin until we know the
+    /// coin needs one trace per pool, see on_trace).
+    coins_tracing: HashMap<Address, u32>,
+    /// Coins whose traced slot fits no standard layout: one trace per pool.
+    per_pool_coins: HashSet<Address>,
     trace_failed: HashMap<(Address, Address), (Instant, String)>,
     unsure_logged: u64,
     last_watchdog: Option<Instant>,
@@ -825,7 +835,7 @@ pub fn manual(sh: Arc<Shared>, fills: Arc<FillQueue>, cfg: C2Config) -> (Intake,
     let loaders = sh
         .node
         .clone()
-        .map(|n| Loaders::spawn(cfg.loaders, cfg.trace_loaders, n, tx.clone(), c2.node_requests.clone(), c2.node_tip.clone(), c2.loader.clone()));
+        .map(|n| Loaders::spawn(cfg.loaders, cfg.trace_loaders, cfg.pace, n, tx.clone(), c2.node_requests.clone(), c2.node_tip.clone(), c2.loader.clone()));
     let i = Intake {
         sh: sh.clone(),
         c2: c2.clone(),
@@ -847,6 +857,8 @@ pub fn manual(sh: Arc<Shared>, fills: Arc<FillQueue>, cfg: C2Config) -> (Intake,
         received: std::collections::BTreeSet::new(),
         tracing: HashSet::new(),
         trace_retry: HashMap::new(),
+        coins_tracing: HashMap::new(),
+        per_pool_coins: HashSet::new(),
         trace_failed: HashMap::new(),
         unsure_logged: 0,
         load_q: VecDeque::new(),
@@ -1132,6 +1144,7 @@ impl Intake {
                         busy: false,
                         ever_ready: false,
                         rounds: 0,
+                        fails: 0,
                     },
                 );
             }
@@ -1766,7 +1779,10 @@ impl Intake {
             }
             return;
         }
-        let max_jobs = self.cfg.loaders;
+        // Bulk work in flight at most ~2 s of copy 2's call budget (pools then
+        // finish steadily instead of in late lumps), at least 2 jobs.
+        let per_job_calls = ((self.cfg.pace.rate * 2.0 / 14.0) as usize).clamp(1, self.cfg.load_batch) as f64 * 14.0;
+        let max_jobs = ((self.cfg.pace.rate * 2.0 / per_job_calls).ceil() as usize).clamp(2.min(self.cfg.loaders), self.cfg.loaders);
         if self.load_jobs_in_flight() >= max_jobs {
             return;
         }
@@ -1789,7 +1805,7 @@ impl Intake {
                 .filter(|e| e.state != PoolState::Ready && !e.busy && e.retry_at <= now)
                 .flat_map(|e| [e.pool.token0, e.pool.token1])
                 .filter(|c| *c != Address::ZERO && !reg.layouts.contains_key(c) && !self.probing.contains(c))
-                .filter(|c| self.probe_retry.get(c).is_none_or(|t| *t <= now))
+                .filter(|c| self.probe_retry.get(c).is_none_or(|t| t.0 <= now))
                 .collect();
             v.sort();
             v.dedup();
@@ -1832,7 +1848,8 @@ impl Intake {
                     }
                     waiting = true;
                     e.reason = format!("loading: finding where coin {c} keeps its balance");
-                    if !self.tracing.contains(&pair) && self.trace_retry.get(&pair).is_none_or(|t| *t <= now) {
+                    let coin_free = self.per_pool_coins.contains(c) || !self.coins_tracing.contains_key(c);
+                    if coin_free && !self.tracing.contains(&pair) && self.trace_retry.get(&pair).is_none_or(|t| t.0 <= now) {
                         traces.push(pair);
                     }
                 }
@@ -1847,6 +1864,11 @@ impl Intake {
         traces.sort();
         traces.dedup();
         for pair in traces {
+            // One per coin unless the coin is known to need one per pool.
+            if !self.per_pool_coins.contains(&pair.0) && self.coins_tracing.contains_key(&pair.0) {
+                continue;
+            }
+            *self.coins_tracing.entry(pair.0).or_insert(0) += 1;
             self.tracing.insert(pair);
             self.trace_failed.remove(&pair);
             inc(&self.c2.stats.coin_traces);
@@ -1855,8 +1877,11 @@ impl Intake {
         }
         due.sort();
         let mut due = due.into_iter().map(|x| x.2).peekable();
+        // Small jobs (~2 s of copy 2's call budget, ~14 calls per pool) keep
+        // the pacing smooth; never more than load_batch pools.
+        let per_job = ((self.cfg.pace.rate * 2.0 / 14.0) as usize).clamp(1, self.cfg.load_batch);
         while due.peek().is_some() && self.load_jobs_in_flight() < max_jobs {
-            let keys: Vec<PoolKey> = due.by_ref().take(self.cfg.load_batch).collect();
+            let keys: Vec<PoolKey> = due.by_ref().take(per_job).collect();
             self.send_load(&keys, head.block, &head.snap);
         }
     }
@@ -1969,10 +1994,11 @@ impl Intake {
                         reg.layouts.insert(coin, l);
                     }
                     Err(_) => {
-                        // Node error: NOT "not found". Ask again in a few seconds.
+                        // Node error: NOT "not found". Ask again later (backoff).
                         inc(&self.c2.stats.probe_errors);
                         self.outcomes.node_error += 1;
-                        self.probe_retry.insert(coin, Instant::now() + Duration::from_secs(3));
+                        let n = self.probe_retry.get(&coin).map(|x| x.1 + 1).unwrap_or(1);
+                        self.probe_retry.insert(coin, (Instant::now() + backoff(n), n));
                     }
                 }
             }
@@ -1998,20 +2024,42 @@ impl Intake {
     fn on_trace(&mut self, coin: Address, holder: Address, res: Result<(U256, Value), crate::node::NodeErr>) {
         let pair = (coin, holder);
         self.tracing.remove(&pair);
+        if let Some(n) = self.coins_tracing.get_mut(&coin) {
+            *n -= 1;
+            if *n == 0 {
+                self.coins_tracing.remove(&coin);
+            }
+        }
         let (bal, tr) = match res {
             Ok(x) => x,
-            Err(_) => {
-                inc(&self.c2.stats.node_errors);
-                self.outcomes.node_error += 1;
-                self.trace_retry.insert(pair, Instant::now() + Duration::from_secs(3));
+            Err(e) => {
+                self.note_node_error(&e.to_string());
+                let n = self.trace_retry.get(&pair).map(|x| x.1 + 1).unwrap_or(1);
+                self.trace_retry.insert(pair, (Instant::now() + backoff(n), n));
                 return;
             }
         };
+        self.trace_retry.remove(&pair);
         let (found, facts) = read_trace(&tr, coin, bal);
         match found {
             Ok(slot) => {
                 inc(&self.c2.stats.coin_trace_found);
-                self.c2.reg.write().unwrap().pair_slots.insert(pair, slot);
+                {
+                    let mut reg = self.c2.reg.write().unwrap();
+                    reg.pair_slots.insert(pair, slot);
+                    // A standard layout (e.g. OpenZeppelin v5 namespaced,
+                    // Solady)? Then every pool of this coin is known now.
+                    match BalanceLayout::guess(holder, slot) {
+                        Some(l) => {
+                            inc(&self.c2.stats.layouts_guessed);
+                            reg.layouts.insert(coin, Some(l));
+                            reg.not_found_at.remove(&coin);
+                        }
+                        None => {
+                            self.per_pool_coins.insert(coin);
+                        }
+                    }
+                }
                 // The coin's code and the settings balanceOf read: put in
                 // where the copy doesn't know them (like a fill). The balance
                 // itself comes with the pool's load, at its block.
@@ -2065,17 +2113,48 @@ impl Intake {
     }
 
     /// Put a pool back in the queue (node trouble, not the pool's fault).
-    fn retry_later(&mut self, k: PoolKey, gen: u64, why: &str) {
+    /// Count a failed node job: our own speed limit (nothing was sent) or a
+    /// real node error.
+    fn note_node_error(&mut self, why: &str) {
+        if why.contains(crate::node::SPEED_LIMIT) {
+            inc(&self.c2.stats.throttled);
+        } else {
+            inc(&self.c2.stats.node_errors);
+            self.outcomes.node_error += 1;
+        }
+    }
+
+    /// retry_later without counting (the job's error was counted once).
+    fn retry_later_quiet(&mut self, k: PoolKey, gen: u64, why: &str) {
         self.partials.remove(&k);
         let mut reg = self.c2.reg.write().unwrap();
         if let Some(e) = reg.pools.get_mut(&k) {
             if e.gen == gen {
-                self.outcomes.node_error += 1;
                 e.busy = false;
                 e.state = PoolState::Loading;
                 e.reason = format!("loading: {why}");
                 e.gen += 1;
-                e.retry_at = Instant::now() + Duration::from_millis(self.cfg.reload_ms.max(500));
+                e.fails = e.fails.saturating_add(1);
+                e.retry_at = Instant::now() + backoff(e.fails);
+            }
+        }
+    }
+
+    fn retry_later(&mut self, k: PoolKey, gen: u64, why: &str) {
+        if why.starts_with("node") || why.contains("node error") {
+            self.note_node_error(why);
+        }
+        self.partials.remove(&k);
+        let mut reg = self.c2.reg.write().unwrap();
+        if let Some(e) = reg.pools.get_mut(&k) {
+            if e.gen == gen {
+                e.busy = false;
+                e.state = PoolState::Loading;
+                e.reason = format!("loading: {why}");
+                e.gen += 1;
+                e.fails = e.fails.saturating_add(1);
+                // Wait longer each time in a row (1 s doubling to 30 s, +-25 %).
+                e.retry_at = Instant::now() + backoff(e.fails);
             }
         }
     }
@@ -2084,9 +2163,10 @@ impl Intake {
         let out = match res {
             Ok(o) => o,
             Err(e) => {
-                inc(&self.c2.stats.node_errors);
+                let why = format!("node: {e}");
+                self.note_node_error(&why);
                 for r in pools {
-                    self.retry_later(r.key, r.gen, &format!("node: {e}"));
+                    self.retry_later_quiet(r.key, r.gen, &why);
                 }
                 return;
             }
@@ -2205,14 +2285,15 @@ impl Intake {
             return;
         }
         if let Some(why) = why {
-            inc(&self.c2.stats.node_errors);
+            self.note_node_error(&why);
             part.errors += 1;
+            let errs = part.errors;
             if part.errors >= 10 {
                 self.partials.insert(key, part);
                 self.retry_later(key, gen, &why);
             } else {
                 self.partials.insert(key, part);
-                self.delayed.push((Instant::now() + Duration::from_secs(1), key, gen, items));
+                self.delayed.push((Instant::now() + backoff(errs), key, gen, items));
             }
             return;
         }
@@ -2479,6 +2560,7 @@ impl Intake {
             e.reason = String::new();
             e.busy = false;
             e.ever_ready = true;
+            e.fails = 0;
             e.ready_since = head.block;
             e.items.extend(items);
             e.accounts.extend(accounts);
@@ -2539,9 +2621,13 @@ impl Intake {
 
     /// Fill answers: used only if nothing we follow touched them after k.
     fn on_fill(&mut self, k: u64, res: Result<FetchOut, crate::node::NodeErr>) {
-        let Ok(out) = res else {
-            inc(&self.c2.stats.node_errors);
-            return;
+        let out = match res {
+            Ok(o) => o,
+            Err(e) => {
+                // Dropped: a check that still needs them asks again.
+                self.note_node_error(&e.to_string());
+                return;
+            }
         };
         let mut good: Vec<Fetched> = Vec::new();
         let mut again: Vec<MissItem> = Vec::new();
@@ -2782,6 +2868,15 @@ fn read_trace(tr: &Value, coin: Address, bal: U256) -> (Result<U256, usize>, Vec
         facts.retain(|f| !matches!(f, Fact::Slot(x, _, _) if *x == coin));
     }
     (found, facts)
+}
+
+/// Wait before trying again after `n` failures in a row: 1 s doubling up to
+/// 30 s, +-25 % so retries don't line up.
+fn backoff(n: u32) -> Duration {
+    let base = (1u64 << n.saturating_sub(1).min(5)).min(30) as f64;
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0);
+    let jitter = 0.75 + 0.5 * (nanos % 1000) as f64 / 1000.0;
+    Duration::from_secs_f64(base * jitter)
 }
 
 /// A report's identity: (tx index, log index, tx hash).
