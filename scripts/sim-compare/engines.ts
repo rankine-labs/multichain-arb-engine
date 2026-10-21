@@ -199,6 +199,13 @@ export type DiffTx = { pre: Record<string, PrestateAcct>; post: Record<string, P
 // deleted (balance 0, nonce 0, no code, storage wiped).
 // `only`: block positions to include (the bot's replay runs user txs only, so
 // Arbitrum's system txs are left out here too). Not given = all up to `upto`.
+// Nitro refuses state overrides on its own system accounts ("overriding
+// address 0xA4B05FFF... not allowed", seen Oct 20 on all 9,742 follow-a-trade
+// checks). Those are ArbOS's internal bookkeeping (fees, L1 pricing), which
+// our trades never read, so their changes are left out of the overrides.
+const ARB_SYSTEM_ACCOUNT = /^0x(a4b05f{35}|0{38}[6-9a-f][0-9a-f]|0{35}a4b05)$/; // ArbOS state, precompiles 0x60-0xff, 0xa4b05
+export function isArbSystemAccount(a: string): boolean { return ARB_SYSTEM_ACCOUNT.test(lc(a)); }
+
 export function prefixDiffOverrides(diffs: DiffTx[], upto: number, only?: Set<number>): Record<string, any> {
   const o: Record<string, any> = {};
   const acct = (a: string) => (o[a] ??= {});
@@ -208,6 +215,7 @@ export function prefixDiffOverrides(diffs: DiffTx[], upto: number, only?: Set<nu
     if (!d) continue;
     for (const [a0, pre] of Object.entries(d.pre ?? {})) {
       const a = lc(a0);
+      if (isArbSystemAccount(a)) continue;
       const post = Object.entries(d.post ?? {}).find(([k]) => lc(k) === a)?.[1];
       if (!post) { o[a] = { balance: '0x0', nonce: '0x0', code: '0x', state: {} }; continue; }
       for (const slot of Object.keys(pre.storage ?? {})) {
@@ -219,6 +227,7 @@ export function prefixDiffOverrides(diffs: DiffTx[], upto: number, only?: Set<nu
     }
     for (const [a0, post] of Object.entries(d.post ?? {})) {
       const a = lc(a0);
+      if (isArbSystemAccount(a)) continue;
       const x = acct(a);
       if (post.balance !== undefined) x.balance = post.balance;
       if (post.nonce !== undefined) x.nonce = hex(post.nonce);
