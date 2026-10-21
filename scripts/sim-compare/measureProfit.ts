@@ -181,7 +181,7 @@ async function learnCoin(t: string) {
 
 // --- our route from the rival's route ---------------------------------------
 const missingPools = new Map<string, number>(); // pools rivals used that we don't watch -> how many arbitrages
-type Built = { ok: true; token: string; hops: ExecutorHop[]; firstIn: bigint } | { ok: false; why: string };
+type Built = { ok: true; token: string; hops: ExecutorHop[]; firstIn: bigint; open?: { start: string; end: string } } | { ok: false; why: string };
 // The route's coins and amounts read straight from the swap reports in the
 // receipt (the arbitrage reader leaves them blank when it can't follow the
 // coin transfers): for each swap, the coin the pool received went IN.
@@ -216,9 +216,52 @@ function ourRoute(rec: ArbRecord): Built {
     try { hops.push(hopFor(kind, p, tin, tout)); } catch (e) { return { ok: false, why: `could not encode hop (${(e as Error).message})` }; }
   }
   for (let i = 1; i < hops.length; i++) if (lc(hops[i - 1].tokenOut) !== lc(hops[i].tokenIn)) return { ok: false, why: 'route does not chain' };
-  if (lc(hops[0].tokenIn) !== lc(hops[hops.length - 1].tokenOut)) return { ok: false, why: 'not a loop (ends in another coin)' };
   const firstIn = rec.hops[0].ain ? BigInt(rec.hops[0].ain) : 0n;
+  if (lc(hops[0].tokenIn) !== lc(hops[hops.length - 1].tokenOut)) {
+    if (!CLOSE) return { ok: false, why: 'not a loop (ends in another coin)' };
+    // --close: keep it; a closing step back to the start coin is added later.
+    return { ok: true, token: hops[0].tokenIn, hops, firstIn, open: { start: lc(hops[0].tokenIn), end: lc(hops[hops.length - 1].tokenOut) } };
+  }
   return { ok: true, token: hops[0].tokenIn, hops, firstIn };
+}
+
+// --- --close: turn a rival's open route into a loop ---------------------------
+// Plain English: many rivals start with one coin and end with another (they
+// keep stockpiles of several coins). Our contract only runs loops, so we add
+// a closing step from the end coin back to the start coin and test whether
+// the whole thing still pays after the extra pool fee. Closing steps tried
+// (one quick check each at the rival's size, the best one is then sized):
+//   - direct: every pool we know (watched or read from chain) for that pair
+//   - via a hub coin (WETH or USDG): end -> hub -> start, up to 2 pools per step
+const CLOSE = args.includes('--close');
+const MAX_DIRECT = 5, MAX_PER_STEP = 2;
+function poolsForPair(a: string, b: string): any[] {
+  const out: any[] = [];
+  for (const p of pools.values()) {
+    const x = lc(p.tokenA), y = lc(p.tokenB);
+    if (!((x === a && y === b) || (x === b && y === a))) continue;
+    const kind = kindForPool(p);
+    if (kind === null || (kind === KIND_V4_HOOKED && !v4KeyMatchesId(p))) continue;
+    out.push(p);
+  }
+  return out;
+}
+function hopVia(p: any, tin: string, tout: string): ExecutorHop | null {
+  const kind = kindForPool(p); if (kind === null) return null;
+  const a = lc(p.tokenA) === tin ? p.tokenA : p.tokenB, b = lc(p.tokenA) === tout ? p.tokenA : p.tokenB;
+  try { return hopFor(kind, p, a, b); } catch { return null; }
+}
+function closers(start: string, end: string): { hops: ExecutorHop[]; label: string }[] {
+  const out: { hops: ExecutorHop[]; label: string }[] = [];
+  for (const p of poolsForPair(end, start).slice(0, MAX_DIRECT)) { const h = hopVia(p, end, start); if (h) out.push({ hops: [h], label: `direct ${p.dex}` }); }
+  for (const hub of [WETH, USDG]) {
+    if (hub === start || hub === end) continue;
+    for (const p1 of poolsForPair(end, hub).slice(0, MAX_PER_STEP)) for (const p2 of poolsForPair(hub, start).slice(0, MAX_PER_STEP)) {
+      const h1 = hopVia(p1, end, hub), h2 = hopVia(p2, hub, start);
+      if (h1 && h2) out.push({ hops: [h1, h2], label: `via ${hub === WETH ? 'WETH' : 'USDG'} (${p1.dex}, ${p2.dex})` });
+    }
+  }
+  return out;
 }
 
 async function main() {
@@ -298,6 +341,19 @@ async function main() {
     // Sizes: the rival's own size x 1/8 .. 4, plus our own-money limit.
     const base = built.firstIn > 0n ? built.firstIn : (tokenUsd && dec != null ? BigInt(Math.floor((500 / tokenUsd.usd) * 10 ** dec)) : 0n);
     const capRaw = tokenUsd && dec != null ? BigInt(Math.floor((CAP_USD / tokenUsd.usd) * 10 ** dec)) : null;
+    if (built.open) {
+      const cands = closers(built.open.start, built.open.end);
+      if (!cands.length) { row.ours = { status: 'not-ours', why: 'open route, no pool to close the loop' }; rows.push(row); appendFileSync(outFile, JSON.stringify(row) + '\n'); continue; }
+      let pick = cands[0], pickProfit = -1n;
+      for (const c of cands) {
+        if (base <= 0n) break;
+        const r = await simulateRoundTrip(sim, 'robinhood', { token: built.token, amountIn: base, hops: [...built.hops, ...c.hops] }, { weth: ROBINHOOD_TOKENS.WETH });
+        const pr = r.status === 'profit' ? r.profit : -1n;
+        if (pr > pickProfit) { pick = c; pickProfit = pr; }
+      }
+      built.hops = [...built.hops, ...pick.hops];
+      row.closedWith = pick.label; row.closeOptionsTried = cands.length;
+    }
     const tried: { amt: bigint; r: SimResult }[] = [];
     const run = async (amt: bigint) => {
       if (amt <= 0n || tried.some((t) => t.amt === amt)) return;
@@ -339,6 +395,7 @@ async function main() {
     ourNetUsd_withinCap_trustedPriceOnly: sum(rs.filter((r) => trusted(r) && !r.ours?.thinPrice).map((r) => oursNet(r, 'withinCap'))),
   });
   const groups = [group('all', done)];
+  if (CLOSE) { groups.push(group('rival loop (no closing step needed)', done.filter((r) => r.ours && r.ours.status !== 'not-ours' && !r.closedWith))); groups.push(group('rival open route, we added a closing step', done.filter((r) => r.closedWith))); }
   if (done.some((r) => r.hadTrigger !== null)) { groups.push(group('right after a trade (trigger)', done.filter((r) => r.hadTrigger))); groups.push(group('sitting gap / after another arb', done.filter((r) => r.hadTrigger === false))); }
   for (const bk of [...new Set(done.map((r) => r.bucket).filter(Boolean))]) groups.push(group(`gap age: ${bk}`, done.filter((r) => r.bucket === bk)));
   const bySize = new Map<string, any[]>();
@@ -354,10 +411,11 @@ async function main() {
     byRivalTradeSize: [...bySize.entries()].map(([k, rs]) => group(`rival size ${k}`, rs)),
     whyNotOurs: Object.fromEntries([...notOurs.entries()].sort((x, y) => y[1] - x[1])),
     ourReplayOutcome: Object.fromEntries(replayOutcome),
+    closingSteps: CLOSE ? Object.fromEntries([...done.filter((r) => r.closedWith).reduce((m, r) => { const k = r.closedWith.replace(/ \(.*\)$/, ''); const e = m.get(k) ?? { tried: 0, weProfit: 0, netUsd: 0 }; e.tried++; const n = oursNet(r, 'withinCap'); if (n > 0) { e.weProfit++; e.netUsd = +(e.netUsd + n).toFixed(2); } m.set(k, e); return m; }, new Map<string, any>())]) : undefined,
     unwatchedPoolsUsedByRivals: missingPools.size,
     topUnwatchedPools: [...missingPools.entries()].sort((x, y) => y[1] - x[1]).slice(0, 15).map(([pool, n]) => ({ pool, arbs: n })),
     top10_ourNetWithinCap: done.filter((r) => oursNet(r, 'withinCap') > 0).sort((x, y) => oursNet(y, 'withinCap') - oursNet(x, 'withinCap')).slice(0, 10)
-      .map((r) => ({ hash: r.hash, path: r.path, ourNetUsd: +oursNet(r, 'withinCap').toFixed(2), sizeUsd: r.ours.withinCap.sizeUsd && +r.ours.withinCap.sizeUsd.toFixed(0), rivalNetUsd: r.rival.netUsd && +r.rival.netUsd.toFixed(2) })),
+      .map((r) => ({ hash: r.hash, path: r.path, closedWith: r.closedWith, trust: r.rival.trust, ourNetUsd: +oursNet(r, 'withinCap').toFixed(2), sizeUsd: r.ours.withinCap.sizeUsd && +r.ours.withinCap.sizeUsd.toFixed(0), rivalNetUsd: r.rival.netUsd && +r.rival.netUsd.toFixed(2) })),
     // --learn: each pool we don't watch, what it is, and what our replay found on it.
     learnedPools: LEARN ? (() => {
       // Pool types our event-updated pool copy is proven exact on (InBot_Design2_Proof).
