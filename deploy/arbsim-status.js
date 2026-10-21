@@ -169,6 +169,13 @@ async function main() {
     const k = c2.counters || {};
     lines.push(`    events applied ${n(k.events_applied)}, reports carried into loads ${n(k.carried_events)}, ` +
       `node requests by copy 2 ${n(c2.nodeRequests)}, node jobs running ${n(c2.nodeJobsInFlight)}, slowest block ${n(k.apply_us_max)} microseconds`);
+    const ld = c2.loader;
+    if (ld) {
+      const q = ld.queued || {};
+      const kinds = Object.entries(ld.byKind || {}).map(([k, v]) => `${k} ${v.avgMsLastMin ?? v.avgMs ?? '?'} ms`).join(', ');
+      lines.push(`    node loaders: ${n(ld.busy)} of ${n(ld.threads)} busy, ${ld.requestsPerSecLastMin} node requests/s (last min); ` +
+        `waiting: ${n(q.urgent)} urgent, ${n(q.bulk)} bulk, ${n(q.trace)} traces; answer times: ${kinds || '-'}`);
+    }
     const show = (title, list) => {
       if (Array.isArray(list) && list.length) lines.push(`    ${title}: ${list.slice(0, 5).map((r) => `${String(r.why).replace(/^loading: /, '')} (${n(r.n)})`).join('; ')}`);
     };

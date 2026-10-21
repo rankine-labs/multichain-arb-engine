@@ -273,12 +273,16 @@ struct Rig {
 }
 
 fn rig() -> Rig {
+    rig_with(C2Config::for_tests())
+}
+
+fn rig_with(cfg: C2Config) -> Rig {
     let chain = Arc::new(FakeChain::new());
     chain.set(100, genesis());
     let node: Arc<dyn NodeApi> = chain.clone();
     let sh = Shared::new(Config::for_tests(), Some(node), Arc::new(Volatile::default()));
     let fills = Arc::new(FillQueue::new(1000, 100));
-    let (intake, h) = manual(sh.clone(), fills, C2Config::for_tests());
+    let (intake, h) = manual(sh.clone(), fills, cfg);
     Rig { chain, sh, intake, h }
 }
 
@@ -954,4 +958,38 @@ fn ready_pools_hold_their_code_and_swap_slots() {
     for sl in [0u128, 6, 7, 8, 9, 10, 12] {
         assert!(matches!(head.snap.storage(a(V2P), u(sl)), Lookup::Known(_)), "slot {sl}");
     }
+}
+
+#[test]
+fn pools_with_recent_events_load_first() {
+    // One loader, one pool per load: the order is visible.
+    let mut r = rig_with(C2Config { loaders: 1, load_batch: 1, ..C2Config::for_tests() });
+    let quiet = v2_pool();
+    let busy = TrackedPool { address: a(0xa3), ..v2_pool() };
+    let mut s = genesis();
+    let g = s[&a(V2P)].clone();
+    s.insert(a(0xa3), g);
+    for c in [COIN0, COIN1] {
+        let v = s[&a(c)][&map_slot(a(V2P), 0)];
+        s.get_mut(&a(c)).unwrap().insert(map_slot(a(0xa3), 0), v);
+    }
+    r.chain.set(100, s);
+    r.track(vec![quiet.clone(), busy.clone()]);
+    // The busy pool trades in the first block we see.
+    r.h.block(msg(100, 60, vec![lg(a(0xa3), vec![topics().v2_sync], data(&[u(1000), u(4000)]), 100, 0, 0)]));
+    let t0 = std::time::Instant::now();
+    loop {
+        r.intake.pump();
+        let (qs, bs) = (r.state(&quiet).0, r.state(&busy).0);
+        if qs == PoolState::Ready || bs == PoolState::Ready {
+            assert_eq!(bs, PoolState::Ready, "the pool with events should be ready first");
+            break;
+        }
+        assert!(t0.elapsed().as_secs() < 10);
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    r.settle();
+    let st = r.h.status_json(false);
+    assert!(st["loader"]["threads"].as_u64().unwrap() >= 2, "{st}");
+    assert!(st["loader"]["byKind"]["load"]["jobs"].as_u64().unwrap() >= 2, "{st}");
 }

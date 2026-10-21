@@ -164,6 +164,21 @@ trade ~20 ms.
   - Cost: ~14 paid calls per V2 pool, ~25 per Solidly, ~10 per V3/V4 (+2 per
     coin+pool without a known layout). 800 pools ~ 9,000-12,000 calls =
     6-8 min at ARBSIM_NODE_RPS=25. Sending coin_slots saves the probes.
+- Dry run #5 fixes (loading speed):
+  - 16 general loader threads (ARBSIM_COPY2_LOADERS) + 6 balance-trace
+    threads (ARBSIM_COPY2_TRACE_LOADERS); lanes urgent > bulk, traces apart.
+  - Bulk loads use node budget class "bulk": they only use speed-limit room
+    (never push ARBSIM_NODE_RPS into debt), so urgent fetches never wait
+    behind them. Expected: loading runs at ~ARBSIM_NODE_RPS calls/s.
+  - Exact-block catch-up fetches answer "not there yet" at once (no thread
+    sleeps); asked again after 300 ms, not counted as errors.
+  - Pools that had events most recently load first.
+  - A load answer is digested one pool at a time; new blocks go in between.
+  - status copy2.loader: threads / busy, queued (urgent, bulk, trace),
+    requestsPerSecLastMin, byKind {load, catchup, fill, trace, probe, tip}:
+    jobsLastMin, avgMsLastMin, jobs, avgMs. Shown by deploy/arbsim-status.js.
+  - A pool going unsure on a report logs kind, pool, block, tx, log index and
+    the reason; replay reverts now include the revert reason (e.g. "LS").
 - Status: `status` -> `copy2` {pools, loading, ready, unsure, lastBlock,
   unsureReasons, counters}; with {"pools": true} also `list` of {address,
   v4Id, kind, state, reason, events}. Checks touching a pool that isn't

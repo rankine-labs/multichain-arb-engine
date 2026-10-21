@@ -57,6 +57,10 @@ pub enum Class {
     Pinned,
     /// Sampled accuracy checks (our replay vs the node's trace): up to 80%.
     Verify,
+    /// Copy 2's bulk first loads: up to 95%, and NEVER runs the speed limit
+    /// into debt (waits for room first), so other classes (a check's missing
+    /// value) don't queue behind minutes of loading.
+    Bulk,
 }
 
 impl Class {
@@ -67,6 +71,7 @@ impl Class {
             Class::Fill | Class::Header => 95,
             Class::Pinned => 90,
             Class::Verify => 80,
+            Class::Bulk => 95,
         }
     }
     fn name(self) -> &'static str {
@@ -76,9 +81,10 @@ impl Class {
             Class::Header => "header",
             Class::Pinned => "pinned",
             Class::Verify => "verify",
+            Class::Bulk => "bulk",
         }
     }
-    const ALL: [Class; 5] = [Class::Critical, Class::Fill, Class::Header, Class::Pinned, Class::Verify];
+    const ALL: [Class; 6] = [Class::Critical, Class::Fill, Class::Header, Class::Pinned, Class::Verify, Class::Bulk];
 }
 
 // ---------------------------------------------------------------------------
@@ -162,7 +168,7 @@ pub struct Budget {
 struct BudgetInner {
     day: u64,
     used: u64,
-    per_class: [u64; 5],
+    per_class: [u64; 6],
     refused: u64,
     tokens: f64,
     last_refill: Instant,
@@ -184,7 +190,7 @@ impl Budget {
         let mut b = BudgetInner {
             day: utc_day(),
             used: 0,
-            per_class: [0; 5],
+            per_class: [0; 6],
             refused: 0,
             tokens: rps.max(1.0),
             last_refill: Instant::now(),
@@ -216,13 +222,29 @@ impl Budget {
     /// Reserve `n` requests for `class`. Waits for the speed limit (at most
     /// a few seconds); refuses when today's allowance share is used up.
     pub fn take(&self, class: Class, n: u64) -> Result<(), NodeErr> {
+        if class == Class::Bulk {
+            // Wait until the bucket has room (no debt), checking every 20 ms.
+            let need = (n as f64).min(self.burst.max(1.0));
+            loop {
+                let mut b = self.inner.lock().unwrap();
+                let now = Instant::now();
+                let el = now.duration_since(b.last_refill).as_secs_f64();
+                b.tokens = (b.tokens + el * self.rps).min(self.burst.max(1.0));
+                b.last_refill = now;
+                if b.tokens >= need {
+                    break;
+                }
+                drop(b);
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
         let wait = {
             let mut b = self.inner.lock().unwrap();
             let today = utc_day();
             if today != b.day {
                 b.day = today;
                 b.used = 0;
-                b.per_class = [0; 5];
+                b.per_class = [0; 6];
                 b.refused = 0;
             }
             let limit = self.cap * class.share_pct() / 100;

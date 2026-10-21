@@ -453,6 +453,12 @@ fn run(view: &dyn StateRead, p: &Pretend, ctx: &BlockCtx, calls: &[Call]) -> Res
                 };
                 logs.extend(l);
             }
+            Ok(ExecutionResult::Revert { output: o, .. }) => {
+                // Keep the revert data (A, dry run #5: reported with the reason).
+                output = o;
+                ok = false;
+                break;
+            }
             Ok(_) => {
                 ok = false;
                 break;
@@ -537,6 +543,19 @@ enum Tried {
     Miss(String),
 }
 
+/// Revert data in words: Error(string) decoded ("LS", "NP", ...), else hex.
+fn revert_text(o: &Bytes) -> String {
+    if o.is_empty() {
+        return String::new();
+    }
+    if o.len() >= 68 && o[..4] == [0x08, 0xc3, 0x79, 0xa0] {
+        let n = word(&o[4..], 1).saturating_to::<usize>().min(o.len().saturating_sub(68));
+        return format!(" (\"{}\")", String::from_utf8_lossy(&o[68..68 + n]));
+    }
+    let h: String = o.iter().take(36).map(|b| format!("{b:02x}")).collect();
+    format!(" (0x{h})")
+}
+
 /// Try candidate runs in order; the first one whose pool logs pass `accept`
 /// wins. Missing items stop everything (the copy must be filled first).
 fn try_runs(
@@ -550,7 +569,7 @@ fn try_runs(
     for (name, calls) in candidates {
         let r = run(view, p, ctx, calls)?;
         if !r.ok {
-            why.push(format!("{name}: reverted"));
+            why.push(format!("{name}: reverted{}", revert_text(&r.output)));
             continue;
         }
         match accept(&r) {

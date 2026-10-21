@@ -80,7 +80,7 @@ use serde_json::{json, Value};
 
 use super::coins::{balance_of_data, BalanceLayout};
 use super::fields::{apply_fields, core_slots, map_slot, obs_slot, sol, topic_addr, topics, v2};
-use super::loader::{out_word, Done, FetchOut, Job, Loaders};
+use super::loader::{out_word, Done, FetchOut, Job, LoaderStats, Loaders, NOT_YET};
 use super::overlay::Overlay;
 use super::replay::{apply_replay, finish_block};
 use super::{ApplyResult, BlockCtx as ReplayCtx, PoolKind, PoolLog, TrackedPool};
@@ -458,6 +458,8 @@ pub struct C2Shared {
     pub load_round: Mutex<LoadRound>,
     /// Node's newest block as the loaders last saw it.
     pub node_tip: Arc<AtomicU64>,
+    /// What the loader threads are doing (status).
+    pub loader: Arc<LoaderStats>,
     /// Background work in flight (for status): (node jobs, pools carrying).
     pub in_flight: Mutex<(usize, usize)>,
 }
@@ -615,6 +617,7 @@ impl Copy2Handle {
             "unsureReasons": top_reasons(reg.pools.values().filter(|e| e.state == PoolState::Unsure).map(|e| e.reason.as_str())),
             "loadingReasons": top_reasons(reg.pools.values().filter(|e| e.state == PoolState::Loading).map(|e| e.reason.as_str())),
             "counters": Value::Object(self.c2.stats.json()),
+            "loader": self.c2.loader.json(),
         });
         if with_pools {
             let list: Vec<Value> = reg
@@ -653,9 +656,11 @@ pub struct C2Config {
     /// Pools per load job [ARBSIM_COPY2_LOAD_BATCH, 25] (a job is split into
     /// node requests of ARBSIM_NODE_BATCH calls).
     pub load_batch: usize,
-    /// Loader threads [ARBSIM_COPY2_LOADERS, 4]; load jobs in flight at most
-    /// 2 per thread.
+    /// General loader threads [ARBSIM_COPY2_LOADERS, 16] (load jobs in flight
+    /// at most one per thread) and balance-trace threads
+    /// [ARBSIM_COPY2_TRACE_LOADERS, 6] (traces are slow: own lane).
     pub loaders: usize,
+    pub trace_loaders: usize,
     /// Blocks of reports always kept for carrying loads forward
     /// [ARBSIM_COPY2_KEEP_BLOCKS, 2400 = ~10 min]; older ones are kept as
     /// long as a running load still needs them, up to
@@ -675,7 +680,8 @@ impl C2Config {
             reload_max_ms: env_u64("ARBSIM_COPY2_RELOAD_MAX_MS", 600_000),
             layout_retry_s: env_u64("ARBSIM_COPY2_LAYOUT_RETRY_S", 3600),
             load_batch: env_u64("ARBSIM_COPY2_LOAD_BATCH", 25).clamp(1, 500) as usize,
-            loaders: env_u64("ARBSIM_COPY2_LOADERS", 4).clamp(1, 32) as usize,
+            loaders: env_u64("ARBSIM_COPY2_LOADERS", 16).clamp(1, 64) as usize,
+            trace_loaders: env_u64("ARBSIM_COPY2_TRACE_LOADERS", 6).clamp(1, 64) as usize,
             keep_blocks: env_u64("ARBSIM_COPY2_KEEP_BLOCKS", 2400).clamp(16, 100_000) as usize,
             max_keep_blocks: env_u64("ARBSIM_COPY2_MAX_KEEP_BLOCKS", 40_000).clamp(16, 1_000_000) as usize,
             max_rounds: env_u64("ARBSIM_COPY2_MAX_ROUNDS", 40).clamp(1, 1000) as u32,
@@ -683,7 +689,7 @@ impl C2Config {
         }
     }
     pub fn for_tests() -> Self {
-        C2Config { reload_ms: 0, reload_max_ms: 0, layout_retry_s: 3600, load_batch: 25, loaders: 2, keep_blocks: 400, max_keep_blocks: 4000, max_rounds: 40, tip_every_s: 0 }
+        C2Config { reload_ms: 0, reload_max_ms: 0, layout_retry_s: 3600, load_batch: 25, loaders: 2, trace_loaders: 2, keep_blocks: 400, max_keep_blocks: 4000, max_rounds: 40, tip_every_s: 0 }
     }
 }
 
@@ -718,6 +724,8 @@ enum JobFor {
     /// `want` = the block asked for (the answer may be older).
     Load { pools: Vec<LoadReq>, want: u64 },
     Need { key: PoolKey, gen: u64, items: Vec<MissItem> },
+    /// Where a coin keeps one pool's balance (debug_traceCall).
+    Trace,
     Fill,
     Probe,
     Tip,
@@ -733,8 +741,6 @@ struct LoadReq {
     getters: Vec<(&'static str, usize)>,
     /// Coin checks: (coin, balance slot, item index, balanceOf call index).
     coin_checks: Vec<(Address, U256, usize, usize)>,
-    /// Coins without a known balance place: (coin, trace index, balanceOf call index).
-    trace_checks: Vec<(Address, usize, usize)>,
 }
 
 pub struct Intake {
@@ -768,6 +774,14 @@ pub struct Intake {
     coin_pos: HashMap<(Address, Address), Pos>,
     /// Blocks we got a message for (lost-message check).
     received: std::collections::BTreeSet<u64>,
+    /// Balance traces running / to retry after a node error / judged
+    /// "not found" (coin, holder).
+    tracing: HashSet<(Address, Address)>,
+    trace_retry: HashMap<(Address, Address), Instant>,
+    trace_failed: HashMap<(Address, Address), (Instant, String)>,
+    unsure_logged: u64,
+    /// Load answers waiting to be digested, one pool at a time.
+    load_q: VecDeque<(LoadReq, Arc<FetchOut>, u64)>,
     buf: VecDeque<BufBlock>,
     partials: HashMap<PoolKey, Partial>,
     jobs: HashMap<u64, JobFor>,
@@ -803,9 +817,13 @@ pub fn manual(sh: Arc<Shared>, fills: Arc<FillQueue>, cfg: C2Config) -> (Intake,
         node_requests: Arc::new(AtomicU64::new(0)),
         load_round: Mutex::new(LoadRound::default()),
         node_tip: Arc::new(AtomicU64::new(0)),
+        loader: Arc::new(LoaderStats::default()),
         in_flight: Mutex::new((0, 0)),
     });
-    let loaders = sh.node.clone().map(|n| Loaders::spawn(cfg.loaders, n, tx.clone(), c2.node_requests.clone(), c2.node_tip.clone()));
+    let loaders = sh
+        .node
+        .clone()
+        .map(|n| Loaders::spawn(cfg.loaders, cfg.trace_loaders, n, tx.clone(), c2.node_requests.clone(), c2.node_tip.clone(), c2.loader.clone()));
     let i = Intake {
         sh: sh.clone(),
         c2: c2.clone(),
@@ -825,6 +843,11 @@ pub fn manual(sh: Arc<Shared>, fills: Arc<FillQueue>, cfg: C2Config) -> (Intake,
         last_pos: HashMap::new(),
         coin_pos: HashMap::new(),
         received: std::collections::BTreeSet::new(),
+        tracing: HashSet::new(),
+        trace_retry: HashMap::new(),
+        trace_failed: HashMap::new(),
+        unsure_logged: 0,
+        load_q: VecDeque::new(),
         buf: VecDeque::new(),
         partials: HashMap::new(),
         jobs: HashMap::new(),
@@ -948,7 +971,7 @@ impl Intake {
 
     /// Node jobs in flight + answers not used yet (tests wait for 0).
     pub fn outstanding(&self) -> usize {
-        self.jobs.len() + self.done.len() + self.pending.len() + self.delayed.len()
+        self.jobs.len() + self.done.len() + self.pending.len() + self.delayed.len() + self.load_q.len()
     }
 
     /// Coin balance places the bot knows: used instead of probing (and
@@ -1028,8 +1051,12 @@ impl Intake {
                 let m = self.pending.remove(&b).unwrap();
                 self.process(m);
             }
-            let Some(d) = self.done.pop_front() else { break };
-            self.on_done(d);
+            if let Some((r, out, block)) = self.load_q.pop_front() {
+                self.on_load_one(r, out, block);
+            } else {
+                let Some(d) = self.done.pop_front() else { break };
+                self.on_done(d);
+            }
             if !self.drain() {
                 break;
             }
@@ -1339,6 +1366,7 @@ impl Intake {
                     }
                     ApplyResult::Unsure(why) => {
                         inc(&st.late_reports_unsure);
+                        self.log_unsure(k, log, n, &format!("late report: {why}"));
                         self.make_unsure(k, &format!("late report: {why}"), Some(&mut ov), n);
                     }
                     ApplyResult::NeedItems(_) => {
@@ -1525,6 +1553,7 @@ impl Intake {
             }
             ApplyResult::Unsure(why) => {
                 inc(&st.events_unsure);
+                self.log_unsure(k, log, rctx.number, &why);
                 self.make_unsure(k, &why, Some(ov), rctx.number);
             }
             ApplyResult::NeedItems(items) => {
@@ -1767,10 +1796,13 @@ impl Intake {
             let id = self.new_job(JobFor::Probe);
             self.loaders.as_ref().unwrap().send(Job::Probe { id, coin: c, block: head.block });
         }
-        // Pools ready to load (both coins' places known).
-        let mut due: Vec<(Instant, PoolKey)> = {
+        // Pools ready to load (both coins' balance places known); pools that
+        // had events most recently first (they matter most), then by wait.
+        let mut traces: Vec<(Address, Address)> = Vec::new();
+        let mut due: Vec<(std::cmp::Reverse<u64>, Instant, PoolKey)> = {
             let mut reg = self.c2.reg.write().unwrap();
             let layouts = reg.layouts.clone();
+            let pairs = reg.pair_slots.clone();
             let mut d = Vec::new();
             for (k, e) in reg.pools.iter_mut() {
                 if e.state == PoolState::Ready || e.busy || e.retry_at > now {
@@ -1780,13 +1812,44 @@ impl Intake {
                 if coins.iter().any(|c| !layouts.contains_key(c)) {
                     continue; // still probing
                 }
-                // No general layout: the load finds this pool's slot by trace.
-                d.push((e.retry_at, *k));
+                // No general layout: find this pool's slot by trace first.
+                let mut waiting = false;
+                for c in coins.iter().filter(|c| layouts[*c].is_none() && !pairs.contains_key(&(**c, e.pool.address))) {
+                    let pair = (*c, e.pool.address);
+                    if let Some((t, why)) = self.trace_failed.get(&pair) {
+                        if t.elapsed() < Duration::from_secs(self.cfg.layout_retry_s) {
+                            e.state = PoolState::Unsure;
+                            e.reason = why.clone();
+                            e.retry_at = *t + Duration::from_secs(self.cfg.layout_retry_s);
+                            waiting = true;
+                            break;
+                        }
+                    }
+                    waiting = true;
+                    e.reason = format!("loading: finding where coin {c} keeps its balance");
+                    if !self.tracing.contains(&pair) && self.trace_retry.get(&pair).is_none_or(|t| *t <= now) {
+                        traces.push(pair);
+                    }
+                }
+                if waiting {
+                    continue;
+                }
+                let active = self.touched_addr.get(&e.pool.address).copied().unwrap_or(0);
+                d.push((std::cmp::Reverse(active), e.retry_at, *k));
             }
             d
         };
+        traces.sort();
+        traces.dedup();
+        for pair in traces {
+            self.tracing.insert(pair);
+            self.trace_failed.remove(&pair);
+            inc(&self.c2.stats.coin_traces);
+            let id = self.new_job(JobFor::Trace);
+            self.loaders.as_ref().unwrap().send(Job::Trace { id, block: head.block, coin: pair.0, holder: pair.1 });
+        }
         due.sort();
-        let mut due = due.into_iter().map(|x| x.1).peekable();
+        let mut due = due.into_iter().map(|x| x.2).peekable();
         while due.peek().is_some() && self.load_jobs_in_flight() < max_jobs {
             let keys: Vec<PoolKey> = due.by_ref().take(self.cfg.load_batch).collect();
             self.send_load(&keys, head.block, &head.snap);
@@ -1799,7 +1862,6 @@ impl Intake {
     fn send_load(&mut self, keys: &[PoolKey], block: u64, head: &Snapshot) {
         let mut items: Vec<MissItem> = Vec::new();
         let mut calls: Vec<(Address, Bytes)> = Vec::new();
-        let mut traces: Vec<(Address, Bytes)> = Vec::new();
         let mut reqs = Vec::new();
         let head_has_code = |a: &Address| head.accounts.get(a).is_some_and(|x| matches!(&x.basics, Basics::Known(Some(i)) if head.codes.contains_key(&i.code_hash) || i.code_hash == revm::primitives::KECCAK_EMPTY));
         {
@@ -1831,7 +1893,6 @@ impl Intake {
                     push(&mut items, MissItem::Account(*a));
                 }
                 let mut coin_checks = Vec::new();
-                let mut trace_checks = Vec::new();
                 for c in [p.token0, p.token1] {
                     if c == Address::ZERO {
                         continue;
@@ -1849,14 +1910,8 @@ impl Intake {
                                 calls.push((c, bal_call));
                             }
                         }
-                        None => {
-                            // The trace also brings the coin's code and what
-                            // its balanceOf reads.
-                            inc(&self.c2.stats.coin_traces);
-                            trace_checks.push((c, traces.len(), calls.len()));
-                            traces.push((c, bal_call.clone()));
-                            calls.push((c, bal_call));
-                        }
+                        // Not known yet: dispatch_loads traces it before loading.
+                        None => {}
                     }
                 }
                 let mut getters = Vec::new();
@@ -1875,7 +1930,7 @@ impl Intake {
                 e.state = PoolState::Loading;
                 e.reason = "loading: fetching from the node".into();
                 e.rounds = 1;
-                reqs.push(LoadReq { key: *k, gen: e.gen, items: (start, items.len()), getters, coin_checks, trace_checks });
+                reqs.push(LoadReq { key: *k, gen: e.gen, items: (start, items.len()), getters, coin_checks });
             }
         }
         if reqs.is_empty() {
@@ -1884,13 +1939,13 @@ impl Intake {
         add(&self.c2.stats.loads, reqs.len() as u64);
         let id = self.new_job(JobFor::Load { pools: reqs, want: block });
         // At most `block`: the loader uses an older block if the node isn't there yet.
-        self.loaders.as_ref().unwrap().send(Job::Fetch { id, block, exact: false, bulk: true, items, calls, traces });
+        self.loaders.as_ref().unwrap().send(Job::Fetch { id, block, exact: false, bulk: true, items, calls });
     }
 
     // ---- node answers ----
     fn on_done(&mut self, d: Done) {
         let id = match &d {
-            Done::Fetch { id, .. } | Done::Probe { id, .. } | Done::Tip { id, .. } => *id,
+            Done::Fetch { id, .. } | Done::Probe { id, .. } | Done::Tip { id, .. } | Done::Trace { id, .. } => *id,
         };
         let Some(job) = self.jobs.remove(&id) else { return };
         match (job, d) {
@@ -1927,7 +1982,80 @@ impl Intake {
             (JobFor::Load { pools, .. }, Done::Fetch { block, res, .. }) => self.on_load(pools, block, res),
             (JobFor::Need { key, gen, items }, Done::Fetch { block, res, .. }) => self.on_need(key, gen, items, block, res),
             (JobFor::Fill, Done::Fetch { block, res, .. }) => self.on_fill(block, res),
+            (JobFor::Trace, Done::Trace { coin, holder, res, .. }) => self.on_trace(coin, holder, res),
             _ => {}
+        }
+    }
+
+    /// A balance trace came back: remember the slot (the load then fetches
+    /// it at its own block), or mark the pool(s) unsure if no single slot
+    /// holds exactly the balance. Node error: ask again in 3 s.
+    fn on_trace(&mut self, coin: Address, holder: Address, res: Result<(U256, Value), crate::node::NodeErr>) {
+        let pair = (coin, holder);
+        self.tracing.remove(&pair);
+        let (bal, tr) = match res {
+            Ok(x) => x,
+            Err(_) => {
+                inc(&self.c2.stats.node_errors);
+                self.outcomes.node_error += 1;
+                self.trace_retry.insert(pair, Instant::now() + Duration::from_secs(3));
+                return;
+            }
+        };
+        let (found, facts) = read_trace(&tr, coin, bal);
+        match found {
+            Ok(slot) => {
+                inc(&self.c2.stats.coin_trace_found);
+                self.c2.reg.write().unwrap().pair_slots.insert(pair, slot);
+                // The coin's code and the settings balanceOf read: put in
+                // where the copy doesn't know them (like a fill). The balance
+                // itself comes with the pool's load, at its block.
+                let facts: Vec<Fact> = facts.into_iter().filter(|f| !matches!(f, Fact::Slot(a, s, _) if *a == coin && *s == slot)).collect();
+                if let Some(b) = self.last_block {
+                    self.into_head(b, |s| {
+                        for f in &facts {
+                            let known = match f {
+                                Fact::Slot(a, sl, _) => !matches!(s.storage(*a, *sl), Lookup::Missing),
+                                Fact::Basics { addr, .. } => s.accounts.get(addr).is_some_and(|x| x.basics != Basics::Unknown),
+                                _ => true,
+                            };
+                            if !known {
+                                s.apply_fact(f);
+                            }
+                        }
+                    });
+                }
+            }
+            Err(n) => {
+                inc(&self.c2.stats.coin_trace_not_found);
+                self.outcomes.coin_not_found += 1;
+                let why = format!("coin {coin}: can't find where it keeps this pool's balance ({n} storage values equal it)");
+                self.trace_failed.insert(pair, (Instant::now(), why.clone()));
+                let mut reg = self.c2.reg.write().unwrap();
+                let until = Instant::now() + Duration::from_secs(self.cfg.layout_retry_s);
+                for e in reg.pools.values_mut().filter(|e| e.pool.address == holder && (e.pool.token0 == coin || e.pool.token1 == coin)) {
+                    if e.state != PoolState::Ready && !e.busy {
+                        e.state = PoolState::Unsure;
+                        e.reason = why.clone();
+                        e.retry_at = until;
+                    }
+                }
+            }
+        }
+    }
+
+    /// One log line when a pool goes unsure because of a report (first 200,
+    /// then every 100th): kind, pool, block, transaction, log index, why.
+    fn log_unsure(&mut self, k: PoolKey, log: &PoolLog, block: u64, why: &str) {
+        self.unsure_logged += 1;
+        let n = self.unsure_logged;
+        if n <= 200 || n % 100 == 0 {
+            let kind = self.c2.reg.read().unwrap().pools.get(&k).map(|e| kind_name(e.pool.kind)).unwrap_or("?");
+            let id = k.1.map(|i| format!(" id {i}")).unwrap_or_default();
+            eprintln!(
+                "[arbsim] copy2: {kind} pool {}{id} unsure at block {block} tx {} (index {}) log {}: {why} [#{n}]",
+                k.0, log.tx_hash, log.tx_index, log.log_index
+            );
         }
     }
 
@@ -1958,121 +2086,97 @@ impl Intake {
                 return;
             }
         };
+        // Each pool is digested on its own (work() lets new blocks in between).
+        let out = Arc::new(out);
         for r in pools {
-            let pool = {
-                let reg = self.c2.reg.read().unwrap();
-                match reg.pools.get(&r.key) {
-                    Some(e) if e.gen == r.gen && e.busy => e.pool.clone(),
-                    _ => continue, // untracked / unsure meanwhile
+            self.load_q.push_back((r, out.clone(), block));
+        }
+    }
+
+    /// Digest one pool's part of a load answer.
+    fn on_load_one(&mut self, r: LoadReq, out: Arc<FetchOut>, block: u64) {
+        let pool = {
+            let reg = self.c2.reg.read().unwrap();
+            match reg.pools.get(&r.key) {
+                Some(e) if e.gen == r.gen && e.busy => e.pool.clone(),
+                _ => return, // untracked / unsure meanwhile
+            }
+        };
+        let mut facts = Vec::new();
+        let mut vals: HashMap<(Address, U256), U256> = HashMap::new();
+        let mut err: Option<(bool, String)> = None; // (node's fault, why)
+        for (it, f) in &out.items[r.items.0..r.items.1] {
+            match f {
+                Ok(f) => {
+                    if let Fetched::Slot(a, s, v) = f {
+                        vals.insert((*a, *s), *v);
+                    }
+                    facts.push(fact_of(f));
                 }
+                Err(ItemErr::BlockUnavailable) => err = Some((true, "node not at that block yet".into())),
+                Err(e) => err = Some((true, format!("node could not give {it:?}: {e:?}"))),
+            }
+        }
+        // A getter / balanceOf that came back with an error object is the
+        // node's trouble, not a mismatch: ask again later.
+        if err.is_none() {
+            for i in r.getters.iter().map(|g| g.1).chain(r.coin_checks.iter().map(|c| c.3)) {
+                if let Err(e) = &out.calls[i] {
+                    err = Some((true, format!("node error on a check call: {e}")));
+                }
+            }
+        }
+        if let Some((_, why)) = err {
+            self.retry_later(r.key, r.gen, &why);
+            return;
+        }
+        // Storage layout check (first load only).
+        if !r.getters.is_empty() {
+            let get = |name: &str, w: usize| -> Result<U256, String> {
+                let i = r.getters.iter().find(|x| x.0 == name).map(|x| x.1).ok_or("getter missing")?;
+                out_word(&out.calls[i], w).map_err(|e| format!("layout: {name} failed ({e})"))
             };
-            let mut facts = Vec::new();
-            let mut vals: HashMap<(Address, U256), U256> = HashMap::new();
-            let mut err: Option<(bool, String)> = None; // (node's fault, why)
-            for (it, f) in &out.items[r.items.0..r.items.1] {
-                match f {
-                    Ok(f) => {
-                        if let Fetched::Slot(a, s, v) = f {
-                            vals.insert((*a, *s), *v);
-                        }
-                        facts.push(fact_of(f));
-                    }
-                    Err(ItemErr::BlockUnavailable) => err = Some((true, "node not at that block yet".into())),
-                    Err(e) => err = Some((true, format!("node could not give {it:?}: {e:?}"))),
-                }
-            }
-            // A getter / balanceOf that came back with an error object is the
-            // node's trouble, not a mismatch: ask again later.
-            if err.is_none() {
-                for i in r.getters.iter().map(|g| g.1).chain(r.coin_checks.iter().map(|c| c.3)).chain(r.trace_checks.iter().map(|c| c.2)) {
-                    if let Err(e) = &out.calls[i] {
-                        err = Some((true, format!("node error on a check call: {e}")));
-                    }
-                }
-                for (_, ti, _) in &r.trace_checks {
-                    if let Err(e) = &out.traces[*ti] {
-                        err = Some((true, format!("node error on a balance trace: {e}")));
-                    }
-                }
-            }
-            if let Some((_, why)) = err {
-                self.retry_later(r.key, r.gen, &why);
-                continue;
-            }
-            // Storage layout check (first load only).
-            if !r.getters.is_empty() {
-                let get = |name: &str, w: usize| -> Result<U256, String> {
-                    let i = r.getters.iter().find(|x| x.0 == name).map(|x| x.1).ok_or("getter missing")?;
-                    out_word(&out.calls[i], w).map_err(|e| format!("layout: {name} failed ({e})"))
-                };
-                if let Err(why) = verify_layout(&pool, &vals, get) {
-                    self.outcomes.mismatch += 1;
-                    inc(&self.c2.stats.load_failed);
-                    self.make_unsure(r.key, &why, None, block + 1);
-                    continue;
-                }
-            }
-            // Coin check: the balance really is that storage value (once per coin).
-            let mut coin_bad = None;
-            for (c, slot, _, ci) in &r.coin_checks {
-                let held = vals.get(&(*c, *slot)).copied();
-                match out_word(&out.calls[*ci], 0) {
-                    Ok(b) if Some(b) == held => {
-                        self.coin_ok.insert(*c);
-                    }
-                    Ok(b) => coin_bad = Some((*c, format!("coin {c}: balance not readable from its storage (slot {held:?} vs balanceOf {b})"))),
-                    Err(e) => coin_bad = Some((*c, format!("coin {c}: balanceOf failed ({e})"))),
-                }
-            }
-            // Coins without a known place: the one slot the trace shows
-            // holding exactly the balance (plus the coin's code and the
-            // other values its balanceOf read).
-            let mut trace_bad = None;
-            for (c, ti, ci) in &r.trace_checks {
-                let bal = out_word(&out.calls[*ci], 0).unwrap_or_default();
-                let tr = out.traces[*ti].as_ref().cloned().unwrap_or_default();
-                let (found, tfacts) = read_trace(&tr, *c, bal);
-                facts.extend(tfacts);
-                match found {
-                    Ok(slot) => {
-                        inc(&self.c2.stats.coin_trace_found);
-                        self.c2.reg.write().unwrap().pair_slots.insert((*c, pool.address), slot);
-                        facts.push(Fact::Slot(*c, slot, bal));
-                    }
-                    Err(n) => {
-                        inc(&self.c2.stats.coin_trace_not_found);
-                        trace_bad = Some(format!("coin {c}: can't find where it keeps this pool's balance ({n} storage values equal it)"));
-                    }
-                }
-            }
-            if let Some(why) = trace_bad {
-                self.outcomes.coin_not_found += 1;
-                self.make_unsure(r.key, &why, None, block + 1);
-                continue;
-            }
-            if let Some((c, why)) = coin_bad {
+            if let Err(why) = verify_layout(&pool, &vals, get) {
                 self.outcomes.mismatch += 1;
                 inc(&self.c2.stats.load_failed);
-                {
-                    let mut reg = self.c2.reg.write().unwrap();
-                    reg.layouts.insert(c, None);
-                    reg.not_found_at.insert(c, Instant::now());
-                }
                 self.make_unsure(r.key, &why, None, block + 1);
-                continue;
+                return;
             }
+        }
+        // Coin check: the balance really is that storage value (once per coin).
+        let mut coin_bad = None;
+        for (c, slot, _, ci) in &r.coin_checks {
+            let held = vals.get(&(*c, *slot)).copied();
+            match out_word(&out.calls[*ci], 0) {
+                Ok(b) if Some(b) == held => {
+                    self.coin_ok.insert(*c);
+                }
+                Ok(b) => coin_bad = Some((*c, format!("coin {c}: balance not readable from its storage (slot {held:?} vs balanceOf {b})"))),
+                Err(e) => coin_bad = Some((*c, format!("coin {c}: balanceOf failed ({e})"))),
+            }
+        }
+        if let Some((c, why)) = coin_bad {
+            self.outcomes.mismatch += 1;
+            inc(&self.c2.stats.load_failed);
             {
                 let mut reg = self.c2.reg.write().unwrap();
-                if let Some(e) = reg.pools.get_mut(&r.key) {
-                    e.verified = true;
-                }
+                reg.layouts.insert(c, None);
+                reg.not_found_at.insert(c, Instant::now());
             }
-            let mut ov = self.empty_copy();
-            for f in &facts {
-                ov.learn(f);
-            }
-            self.continue_partial(r.key, Partial { ov, cursor: (block + 1, 0, 0), gen: r.gen, errors: 0 });
+            self.make_unsure(r.key, &why, None, block + 1);
+            return;
         }
+        {
+            let mut reg = self.c2.reg.write().unwrap();
+            if let Some(e) = reg.pools.get_mut(&r.key) {
+                e.verified = true;
+            }
+        }
+        let mut ov = self.empty_copy();
+        for f in &facts {
+            ov.learn(f);
+        }
+        self.continue_partial(r.key, Partial { ov, cursor: (block + 1, 0, 0), gen: r.gen, errors: 0 });
     }
 
     fn on_need(&mut self, key: PoolKey, gen: u64, items: Vec<MissItem>, block: u64, res: Result<FetchOut, crate::node::NodeErr>) {
@@ -2086,6 +2190,15 @@ impl Intake {
             Err(e) => Some(format!("node: {e}")),
             Ok(o) => o.items.iter().find_map(|(it, f)| f.as_ref().err().map(|e| format!("node could not give {it:?} at block {block}: {e:?}"))),
         };
+        // The node simply isn't at that block yet (it trails the websocket by
+        // a few blocks): ask again shortly, not counted as an error.
+        let not_yet = matches!(&res, Err(crate::node::NodeErr::BadResponse(m)) if m.contains(NOT_YET))
+            || matches!(&res, Ok(o) if o.items.iter().any(|(_, f)| matches!(f, Err(ItemErr::BlockUnavailable))));
+        if not_yet {
+            self.partials.insert(key, part);
+            self.delayed.push((Instant::now() + Duration::from_millis(300), key, gen, items));
+            return;
+        }
         if let Some(why) = why {
             inc(&self.c2.stats.node_errors);
             part.errors += 1;
@@ -2141,7 +2254,7 @@ impl Intake {
         self.partials.insert(key, part);
         let id = self.new_job(JobFor::Need { key, gen, items: items.clone() });
         match &self.loaders {
-            Some(l) => l.send(Job::Fetch { id, block: at, exact: true, bulk: false, items, calls: vec![], traces: vec![] }),
+            Some(l) => l.send(Job::Fetch { id, block: at, exact: true, bulk: false, items, calls: vec![] }),
             None => {
                 self.jobs.remove(&id);
                 self.make_unsure(key, "no node configured to load it from", None, u64::MAX);
@@ -2243,6 +2356,7 @@ impl Intake {
                         }
                         ApplyResult::Unsure(why) => {
                             self.outcomes.other_unsure += 1;
+                            self.log_unsure(key, log, block, &format!("while loading: {why}"));
                             self.make_unsure(key, &why, None, u64::MAX);
                             return;
                         }
@@ -2413,7 +2527,7 @@ impl Intake {
         }
         inc(&self.c2.stats.fills);
         let id = self.new_job(JobFor::Fill);
-        self.loaders.as_ref().unwrap().send(Job::Fetch { id, block: head.block, exact: false, bulk: false, items: ok, calls: vec![], traces: vec![] });
+        self.loaders.as_ref().unwrap().send(Job::Fetch { id, block: head.block, exact: false, bulk: false, items: ok, calls: vec![] });
     }
 
     /// Fill answers: used only if nothing we follow touched them after k.
