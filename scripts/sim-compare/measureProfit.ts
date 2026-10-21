@@ -111,6 +111,7 @@ async function learnCoin(t: string) {
 }
 
 // --- our route from the rival's route ---------------------------------------
+const missingPools = new Map<string, number>(); // pools rivals used that we don't watch -> how many arbitrages
 type Built = { ok: true; token: string; hops: ExecutorHop[]; firstIn: bigint } | { ok: false; why: string };
 // The route's coins and amounts read straight from the swap reports in the
 // receipt (the arbitrage reader leaves them blank when it can't follow the
@@ -129,7 +130,8 @@ function fillHopsFromLogs(rec: ArbRecord, logs: any[]) {
 }
 function ourRoute(rec: ArbRecord): Built {
   if (!rec.hops.length || rec.hops.length < 2) return { ok: false, why: 'fewer than 2 hops' };
-  if (rec.hops.some((h) => !pools.has(lc(h.pool)))) return { ok: false, why: 'pool not on our watch list' };
+  const missing = rec.hops.filter((h) => !pools.has(lc(h.pool)));
+  if (missing.length) { for (const h of missing) missingPools.set(lc(h.pool), (missingPools.get(lc(h.pool)) ?? 0) + 1); return { ok: false, why: `${missing.length} of ${rec.hops.length} pools not on our watch list` }; }
   const hops: ExecutorHop[] = [];
   for (const h of rec.hops) {
     if (!h.tin || !h.tout) return { ok: false, why: 'route coins unreadable' };
@@ -280,6 +282,8 @@ async function main() {
     byRivalTradeSize: [...bySize.entries()].map(([k, rs]) => group(`rival size ${k}`, rs)),
     whyNotOurs: Object.fromEntries([...notOurs.entries()].sort((x, y) => y[1] - x[1])),
     ourReplayOutcome: Object.fromEntries(replayOutcome),
+    unwatchedPoolsUsedByRivals: missingPools.size,
+    topUnwatchedPools: [...missingPools.entries()].sort((x, y) => y[1] - x[1]).slice(0, 15).map(([pool, n]) => ({ pool, arbs: n })),
     top10_ourNetWithinCap: done.filter((r) => oursNet(r, 'withinCap') > 0).sort((x, y) => oursNet(y, 'withinCap') - oursNet(x, 'withinCap')).slice(0, 10)
       .map((r) => ({ hash: r.hash, path: r.path, ourNetUsd: +oursNet(r, 'withinCap').toFixed(2), sizeUsd: r.ours.withinCap.sizeUsd && +r.ours.withinCap.sizeUsd.toFixed(0), rivalNetUsd: r.rival.netUsd && +r.rival.netUsd.toFixed(2) })),
     nodeRequestsUsed: requests,
