@@ -6,6 +6,7 @@ import { loopLogLine } from './loopReport';
 import { loopResultsDigest } from './loopWorkerFeed';
 import type { ToWorker, FromWorker, LoopWorkerInit, LoopBatch } from './loopWorkerFeed';
 import type { LoopTrade, LoopCheckResult } from './loopTrader';
+import { CoinTaxBook, testCoinTax } from './coinTax';
 import { makeRpc, simulateRoundTrip, replayRpc, loadBalanceSlots, Rpc, SimResult, ReplayCall } from '../execution/simulator';
 
 // ============================================================================
@@ -149,7 +150,29 @@ function start(cfg: LoopWorkerInit): void {
       if (th.sentThisCheck > 0) g.countCheck();
     }
   };
+  // COIN TAX TEST (Oct 20): one free simulation per coin on the loop node,
+  // through the same gate as loop checks (own limit + permission), run only
+  // when no loop check is running (the loop trader makes sure of that).
+  const taxBook = cfg.tax?.cfg.enabled ? new CoinTaxBook(cfg.tax.cfg, async (token, holder) => {
+    const th = throttle!;
+    guard!.noteStart(); // a fresh start for "slow down" bookkeeping, like a loop check
+    th.beginCheck();
+    try { return cfg.testHooks && cfg.fakeCheck ? { verdict: 'ok' as const } : await testCoinTax(rpc, token, holder); }
+    catch (e) {
+      if (e instanceof LoopNodeBusy) { th.busySkips++; return { verdict: null, why: e.message }; }
+      return { verdict: null, why: (e as Error).message };
+    }
+  }, {
+    file: cfg.tax.file,
+    log: (m) => log(m),
+    symbolOf: (t) => core?.symbolOf(t) ?? t,
+    alwaysOk: cfg.bases,
+  }) : null;
+  if (taxBook) setInterval(() => taxBook.save(), 60_000).unref?.();
   core = new LoopWorkerCore(cfg, {
+    ...(taxBook ? { coinTax: taxBook } : {}),
+    // LIVE LOOPS: the main thread decides and sends; this thread only offers.
+    ...(cfg.live ? { liveOffer: (c: import('../execution/loopLive').LoopLiveCandidate) => { post({ t: 'liveCandidate', c }); return true; } } : {}),
     runCheck: (trade, ctx) => loopCheck(trade, ctx?.triggerHash),
     canCheckNode: () => guard!.canCheck(),
     log: (m) => log(m),

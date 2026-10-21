@@ -200,6 +200,8 @@ import { poolDepthUsd, setRealBalanceSource, thinPools, thinPoolsSteps } from '.
 // Loop trader v1 (3-5 pool loops, practice only, off unless LOOP_TRADER=1).
 import { LoopTrader, loopConfigFromEnv, LoopCheckResult, LoopTrade } from './core/loopTrader';
 // Which node loop practice checks run on (LOOP_CHECK_NODE, default the free public node).
+import { CoinTaxBook, coinTaxConfigFromEnv, testCoinTax } from './core/coinTax';
+import { LoopLiveSender, loopLiveConfigFromEnv, LoopLiveCandidate } from './execution/loopLive';
 import { loopNodeFromEnv, LoopNodeGuard, runLoopCheck, LoopCheckDeps, loopNodeText, LoopNodeThrottle, LoopNodeBusy, loopMaxRpsFromEnv } from './core/loopNode';
 // Loop fix phase 2: real (block-confirmed) prices, trigger replay, cheap scans (core/loopPrices.ts).
 import { loopFixFromEnv, PendingTrades, loopPoolState } from './core/loopPrices';
@@ -1584,6 +1586,8 @@ const sendLiveTradeMessage = (r: { status: 'profit' | 'reverted' | 'dropped'; la
 
 // LIVE results (only used once live sending is switched on): receipt, profit
 // from the contract's Executed event, gas cost; losses feed the daily cap.
+// Set once live loops are created (further down); the tracker reports loop results to it.
+let loopLiveRef: LoopLiveSender | null = null;
 const liveTracker = new LiveTradeTracker({
       provider: robinhoodReadProvider,
       ethUsd: () => priceOracle.getUsdPrice('robinhood', ROBINHOOD_TOKENS.WETH) ?? 0,
@@ -1597,6 +1601,8 @@ const liveTracker = new LiveTradeTracker({
       // hourly report's "Real money made" ledger (only counted when really live).
       onResult: (r) => {
             liveTradeLog.result(r); alertHooks.onLiveResult(r); moneyLedgers.noteRealResult(r, robinhoodSender.live); sendLiveTradeMessage(r);
+            // LIVE LOOPS: wins, and gas lost toward the loop loss cap.
+            loopLiveRef?.noteResult(r);
             // A live trade that failed on the chain blocks its pool pair for 6 h.
             const pools = livePools.get(r.hash);
             if (pools && r.status === 'reverted') { liveBlocks.block(pools[0], pools[1], 'live trade failed on chain'); console.log(`[live-block] ${r.label}: live trade failed, pool pair blocked 6 h`); }
@@ -1791,6 +1797,76 @@ const loopNodeCfgShared = (() => {
       }
       return cfg;
 })();
+// LIVE LOOPS (execution/loopLive.ts, Oct 20, owner approved). LOOP_LIVE=1:
+// loops that pass every filter in the loop trader are checked on the paid
+// checking node and, if the real check says they pay, sent for real through
+// the same sender, safety gate and live tracker as 2-pool trades.
+// Wallet first: the contract's own money if it holds the whole amount,
+// otherwise a flash loan from an approved lender that is not on the loop.
+// LOOP_LIVE unset / 0 = loops stay practice only (nothing here runs).
+const loopLiveCfg = loopLiveConfigFromEnv(process.env);
+const loopLive: LoopLiveSender | null = loopCfg.enabled && loopLiveCfg.enabled ? new LoopLiveSender(loopLiveCfg, {
+      now: Date.now,
+      live: () => robinhoodSender.live,
+      liveBlocker: (c) => {
+            for (const k of c.poolKeys) {
+                  const p = cache.get('robinhood', k);
+                  if (!p) return 'pool not in the cache';
+                  const why = liveBlocker(p, p);
+                  if (why) return why;
+            }
+            for (const t of c.coins) if (!safetyGate.isAllowed(t)) return 'coin not on the allowed list';
+            if (involvesAutoVetted(c.coins) && c.sizeUsd > AUTO_VET_MAX_TRADE_USD) return `auto-vetted coin: over the $${AUTO_VET_MAX_TRADE_USD} limit`;
+            return null;
+      },
+      funding: (c) => {
+            const dec = TOKEN_DECIMALS.robinhood?.[c.base.toLowerCase()];
+            if (dec === undefined) return null;
+            // Wallet first: the contract really holds the whole amount (live), or
+            // practice: the same "own money" assumption as practice checks.
+            // Same rule as 2-pool trades: own money on (RH_FUNDING), up to OWN_MONEY_MAX_USD,
+            // and live the contract must really hold the whole amount.
+            if (RH_OWN_MONEY && c.sizeUsd <= OWN_MONEY_MAX_USD && (!robinhoodSender.live || ownMoney.covers(c.base, c.amountIn))) return { kind: 'own' };
+            // Otherwise a flash loan: approved lender, not one of the loop's pools, holds enough.
+            if (!lenderBalances.lastRefreshMs) return null;
+            const exclude = c.poolKeys.map((k) => cache.get('robinhood', k)?.poolAddress ?? k);
+            const l = pickV3Lender(lenderCandidates('robinhood'), c.base, exclude, (pool, token) => lenderBalances.canLend(pool, token, c.amountIn, LENDER_HEADROOM));
+            return l ? { kind: 'flash', lender: l.poolAddress, feePips: l.feePips ?? l.feeBps * 100 } : null;
+      },
+      // Same node and polling as 2-pool check-first.
+      waitForTrade: (hash) => waitForTrade(simRpc.robinhood, hash, CHECK_FIRST_POLL_MS, Math.ceil(1_800 / CHECK_FIRST_POLL_MS)),
+      check: (c, lender) => simulateRoundTrip(simRpc.robinhood, 'robinhood', { token: c.hops[0].tokenIn, amountIn: c.amountIn, hops: c.hops }, { weth: ROBINHOOD_TOKENS.WETH, ...(lender ? { v3Lender: lender } : {}) }),
+      gasUsd: (pools, flash) => gasModel.loopUsd(pools, 0.05) + (flash ? Math.max(0, rhGasUsd(0.05, true) - rhGasUsd(0.05, false)) : 0),
+      minNetUsd: () => MIN_NET_PROFIT_USD,
+      usdOf: (t) => priceOracle.getUsdPrice('robinhood', t),
+      decimalsOf: (t) => TOKEN_DECIMALS.robinhood?.[t.toLowerCase()],
+      isOutlier: (net, size) => isOutlier(net, size, OUTLIER_CFG),
+      safety: (sizeUsd, coins) => { const g = safetyGate.check({ tradeSizeUsd: sizeUsd, tokens: coins }); return g.ok ? null : ('reason' in g ? g.reason : 'blocked'); },
+      deadline: () => robinhoodSender.deadlineBlock(),
+      ready: () => (liveChecks.ok ? null : 'live checks not passed'),
+      // L2 part of the sender's limit (the L1 part is added on top by the sender).
+      gasLimitOk: (units) => robinhoodSender.currentGasLimit - (robinhoodSender.l1GasNow * 3n) / 2n >= BigInt(Math.ceil(units * 1.2)),
+      executor: () => executorConfig('robinhood').executorAddress,
+      fire: (to, data) => robinhoodSender.fire(to, data),
+      afterSent: (hash, info) => {
+            const funding: Funding = info.funding.kind === 'flash'
+                  ? { kind: 'flash', feePct: info.funding.feePips / 10_000, feeUsd: info.sizeUsd * info.funding.feePips / 1_000_000 }
+                  : { kind: 'own' };
+            fireStats.sent++;
+            whyNotSent.sent();
+            liveTradeLog.sent(hash, info.label, info.sizeUsd, info.netUsd, funding);
+            setTimeout(() => { void refreshOwnMoney(); }, 3_000);
+            safetyGate.reservePending(hash, 2 * info.gasUsd);
+            liveTracker.track(hash, { expectedProfitUsd: info.netUsd, label: info.label, sizeUsd: info.sizeUsd, funding, routeKey: routeKeyFor(info.kinds, info.funding.kind === 'flash') });
+      },
+      log: (m) => console.log(m),
+      alert: (html) => { void sendTelegramMessage(html).catch(() => undefined); },
+}) : null;
+loopLiveRef = loopLive;
+if (loopLive) console.log(`[loop-live] LIVE LOOPS ON (LOOP_LIVE=1): up to ${loopLiveCfg.maxPools} pools, wallet first then flash loan, max $${loopLiveCfg.maxTradeUsd.toLocaleString('en-US')} a loop, ${loopLiveCfg.maxPerHour} sends and ${loopLiveCfg.checksPerHour} real checks an hour, loop loss cap $${loopLiveCfg.lossCapUsd}/day${robinhoodSender.live ? '' : ' (bot not live: dry run only)'}`);
+// Hourly line for the status page (one line, plain text).
+if (loopLive) setInterval(() => { try { console.log(loopLive.hourLine(true)); } catch { /* reporting only */ } }, 3600_000).unref?.();
+const offerLoopLive = (c: LoopLiveCandidate): boolean => { if (!loopLive) return false; void loopLive.offer(c); return true; };
 // LOOP WORKER (core/loopWorkerHost.ts, Oct 15, owner approved): the loop
 // trader runs in its own thread so loop scans never freeze the main thread
 // (trade feed, 2-pool trades). On by default with LOOP_TRADER=1;
@@ -1902,7 +1978,27 @@ if (loopCfg.enabled && !loopWorkerOn) {
                   if (loopThrottle.sentThisCheck > 0) loopGuard.countCheck();
             }
       };
+      // COIN TAX TEST (Oct 20, core/coinTax.ts): coins that take a cut when
+      // moved are left out of loops. One free simulation per coin on the loop
+      // node, only while no loop check runs. LOOP_TAX_TEST=0 = off.
+      const loopTaxCfg = coinTaxConfigFromEnv(process.env);
+      const loopTaxBook = loopTaxCfg.enabled ? new CoinTaxBook(loopTaxCfg, async (token, holder) => {
+            if (!loopOnMain) { loopGuard.noteStart(); loopThrottle.beginCheck(); }
+            try { return await testCoinTax(loopNodeRpc, token, holder); }
+            catch (e) {
+                  if (e instanceof LoopNodeBusy) { loopThrottle.busySkips++; return { verdict: null, why: e.message }; }
+                  return { verdict: null, why: (e as Error).message };
+            }
+      }, {
+            file: 'data/coin-tax.json',
+            log: (m) => console.log(m),
+            symbolOf: (t) => symbolOf('robinhood', t),
+            alwaysOk: [ROBINHOOD_TOKENS.WETH, ROBINHOOD_TOKENS.USDG],
+      }) : null;
+      if (loopTaxBook) setInterval(() => loopTaxBook.save(), 60_000).unref?.();
       const loopTrader = new LoopTrader(loopCfg, {
+            ...(loopTaxBook ? { coinTax: loopTaxBook } : {}),
+            ...(loopLive ? { liveOffer: offerLoopLive } : {}),
             bases: [ROBINHOOD_TOKENS.WETH, ROBINHOOD_TOKENS.USDG],
             env: {
                   decimalsOf: (t) => TOKEN_DECIMALS.robinhood?.[t.toLowerCase()],
@@ -2102,7 +2198,12 @@ if (loopWorkerOn) {
                         sharedBudget: !!loopNodeBudget,
                   },
                   statsMs: 30_000, peekMs: 15 * 60_000, logPerMin: 60,
+                  // COIN TAX TEST (Oct 20, core/coinTax.ts): LOOP_TAX_TEST=0 = off.
+                  tax: { cfg: coinTaxConfigFromEnv(process.env), file: 'data/coin-tax.json' },
+                  // LIVE LOOPS: the worker hands qualifying loops over (offerLoopLive).
+                  live: !!loopLive,
             },
+            onLiveCandidate: (c) => { offerLoopLive(c); },
             feeder,
             // Same rule as LoopNodeThrottle.sharedHasRoom (core/loopNode.ts):
             // nobody waiting, under half the speed limit used in the last

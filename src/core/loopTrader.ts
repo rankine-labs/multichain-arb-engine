@@ -4,6 +4,8 @@ import { drainSteps, Steps } from './chunked';
 import type { LoopFixSwitches } from './loopPrices';
 import { ExecutorHop, hopFor, kindForPool, v4KeyMatchesId, KIND_V4_HOOKED } from '../execution/executorCalldata';
 import type { SimResult } from '../execution/simulator';
+import { CoinTaxGate, CoinTaxStats, coinHolderOf } from './coinTax';
+import type { LoopLiveCandidate } from '../execution/loopLive';
 
 // ============================================================================
 // LOOP TRADER v1 -- PRACTICE ONLY
@@ -44,6 +46,13 @@ export interface LoopTraderConfig {
   checksPerMin: number;    // LOOP_CHECKS_PER_MIN (default 6, 0 = never check)
   maxPoolAgeMs: number;    // LOOP_MAX_POOL_AGE_MS: pools with older prices are left out (default 30 s)
   longSlack: number;       // LOOP_LONG_SLACK: 6-8 pool loops are listed only if within this share of paying (default 0.02)
+  // ROUTE MEMORY (Oct 20): a loop whose practice check failed this many times
+  // in a row is benched (not checked) for benchMs. 0 = off.
+  benchAfter?: number;     // LOOP_BENCH_AFTER (default 5)
+  benchMs?: number;        // LOOP_BENCH_MIN minutes (default 20)
+  // LIVE LOOPS (Oct 20, execution/loopLive.ts): loops of at most this many
+  // pools on vetted coins are handed to the live sender instead of a practice check.
+  liveMaxPools?: number;   // LOOP_LIVE_MAX_POOLS (default 3)
 }
 
 const num = (raw: string | undefined, dflt: number, min: number, max: number): number => {
@@ -90,12 +99,16 @@ export function loopConfigFromEnv(env: Record<string, string | undefined> = proc
     enabled: env.LOOP_TRADER === '1' || env.LOOP_TRADER === 'true',
     maxPools: loopMaxPoolsFromEnv(env.LOOP_MAX_POOLS, warn),
     maxCycles: Math.round(num(env.LOOP_MAX_CYCLES, 5_000, 1, 50_000)),
-    maxTradeUsd: num(env.LOOP_MAX_TRADE_USD, 2_000, 1, 1e6),
+    // Live loops can borrow (flash loan) for bigger sizes: default $10,000 then.
+    maxTradeUsd: num(env.LOOP_MAX_TRADE_USD, ['1', 'true', 'on'].includes((env.LOOP_LIVE ?? '').trim().toLowerCase()) ? 10_000 : 2_000, 1, 1e6),
     depthShare: num(env.LOOP_DEPTH_SHARE, 0.3, 0.001, 1),
     minNetUsd: num(env.LOOP_MIN_NET_USD, bar, 0.0001, 1e6),
     checksPerMin: Math.round(num(env.LOOP_CHECKS_PER_MIN, 6, 0, 60)),
     maxPoolAgeMs: num(env.LOOP_MAX_POOL_AGE_MS, 30_000, 1_000, 3_600_000),
     longSlack: num(env.LOOP_LONG_SLACK, 0.02, 0, 0.2),
+    benchAfter: Math.round(num(env.LOOP_BENCH_AFTER, 5, 0, 1_000)),
+    benchMs: num(env.LOOP_BENCH_MIN, 20, 1, 24 * 60) * 60_000,
+    liveMaxPools: Math.round(num(env.LOOP_LIVE_MAX_POOLS, 3, 3, 5)),
   };
 }
 
@@ -123,6 +136,14 @@ export interface LoopTraderDeps {
   // LOOP_MODEL_VS_CHECK: a check reported the gas our loop really used
   // (replays do): teach the gas model (shadowMain: gasModel.notePractice).
   noteGas?: (pools: number, gasUsed: bigint) => void;
+  // COIN TAX TEST (Oct 20, core/coinTax.ts): coins that take a cut when moved
+  // are left out of loops; untested coins are tested once before a loop that
+  // uses them is checked. Missing = off (old behaviour).
+  coinTax?: CoinTaxGate;
+  // LIVE LOOPS (execution/loopLive.ts): set only with LOOP_LIVE=1. A loop that
+  // passed every filter here is offered to the live sender (main thread);
+  // true = taken (no practice check for it). This file still never sends.
+  liveOffer?: (c: LoopLiveCandidate) => boolean;
 }
 
 // What a loop practice check is told, and what it answers.
@@ -272,6 +293,16 @@ export interface LoopHour {
   // unseen: within our max, but we didn't see every pool of their route.
   rival: { loops: number; comparable: number; weFound: number; leadMsMedian: number | null; longer: number; unseen: number; topBot: [string, number] | null };
   checkVsEstimate: LoopCheckSummary; // practice check results against the finder's estimates
+  // COIN TAX TEST + ROUTE MEMORY (Oct 20). Missing when both are off.
+  coins?: {
+    tax: CoinTaxStats | null;   // coins tested so far (since start), null = tax test off
+    taxPools: number;           // pools left out of the last scan (a coin on them takes a cut)
+    waitTest: number;           // paying loops not checked this hour: a coin not tested yet
+    benchedSkips: number;       // paying loops not checked this hour: route benched
+    benchStarts: number;        // routes benched this hour
+    benchedNow: number;         // routes benched right now
+  };
+  liveOffered?: number;         // LIVE LOOPS: loops handed to the live sender this hour
 }
 
 export class LoopTrader {
@@ -289,6 +320,10 @@ export class LoopTrader {
   // no copies). A scan with exactly the same states, and nothing waiting in
   // the finder, would change nothing, so it is skipped.
   private lastInput: PoolState[] = [];
+  // ROUTE MEMORY: loop sig -> failed checks in a row, benched until.
+  private bench = new Map<string, { fails: number; until: number }>();
+  private taxPools = 0;
+  private lastPreTest = 0;
 
   constructor(readonly cfg: LoopTraderConfig, private deps: LoopTraderDeps) {
     this.finder = new LoopFinder({ bases: deps.bases, maxPools: cfg.maxPools, maxCycles: cfg.maxCycles, maxTradeUsd: cfg.maxTradeUsd, depthShare: cfg.depthShare, longSlack: cfg.longSlack ?? 0.02 }, deps.env);
@@ -302,6 +337,7 @@ export class LoopTrader {
       checks: [] as LoopCheckRecord[],
       skipped: 0,
       rival: { loops: 0, comparable: 0, weFound: 0, leads: [] as number[], longer: 0, unseen: 0, bots: new Map<string, number>() },
+      waitTest: 0, benchedSkips: 0, benchStarts: 0, liveOffered: 0,
     };
   }
 
@@ -324,6 +360,33 @@ export class LoopTrader {
       const p = pools[i];
       if (now - p.lastUpdatedMs <= this.cfg.maxPoolAgeMs) usable.push(p);
       if ((i & 511) === 511) yield;
+    }
+    // COIN TAX TEST: pools with a coin known to take a cut (or that can't be
+    // moved freely) are left out, so the finder never builds loops on them.
+    const tax = this.deps.coinTax;
+    if (tax) {
+      let w = 0, dropped = 0;
+      for (let i = 0; i < usable.length; i++) {
+        const p = usable[i];
+        const va = tax.verdict(p.tokenA), vb = tax.verdict(p.tokenB);
+        if (va === 'taxed' || va === 'blocked' || vb === 'taxed' || vb === 'blocked') { dropped++; continue; }
+        usable[w++] = p;
+      }
+      usable.length = w;
+      this.taxPools = dropped;
+      // Test every coin on the remaining pools ahead of time (not only when a
+      // loop through it pays), so loops don't wait for a test when they appear.
+      // Repeats and already-tested coins are ignored by request(); the test
+      // queue and its per-minute limit keep this small.
+      if (now - this.lastPreTest > 30_000) {
+        this.lastPreTest = now;
+        for (const p of usable) {
+          const holder = coinHolderOf(p);
+          if (!holder) continue;
+          if (tax.verdict(p.tokenA) === undefined) tax.request(p.tokenA, holder);
+          if (tax.verdict(p.tokenB) === undefined) tax.request(p.tokenB, holder);
+        }
+      }
     }
     // CHEAP SCAN: nothing changed since the last scan (same pool states, same
     // order, none aged out) and the finder has nothing waiting: skip it. The
@@ -403,6 +466,37 @@ export class LoopTrader {
       return;
     }
     if (this.cfg.checksPerMin <= 0) return;
+    // ROUTE MEMORY: this exact loop failed its last checks: not checked again yet.
+    const b = this.bench.get(r.cycle.sig);
+    if (b && b.until > now) { h.benchedSkips++; return; }
+    // COIN TAX TEST: every coin the loop passes through must have passed the
+    // tax test. Untested coins are queued for a test (the pool the coin comes
+    // out of holds it); the loop is checked the next time it shows up.
+    const tax = this.deps.coinTax;
+    if (tax) {
+      let untested = false;
+      for (let i = 0; i < r.cycle.hops.length; i++) {
+        const tok = r.cycle.hops[i].tokenOut;
+        if (tok === r.cycle.base) continue;
+        const v = tax.verdict(tok);
+        if (v === 'ok') continue;
+        if (v === 'taxed' || v === 'blocked') return; // left out (the next scan drops its pools)
+        const holder = coinHolderOf(r.pools[i]);
+        if (holder) tax.request(tok, holder);
+        untested = true;
+      }
+      if (untested) { h.waitTest++; return; }
+    }
+    // LIVE LOOPS: vetted coins, short enough: hand it to the live sender.
+    if (this.deps.liveOffer && r.tradable && r.cycle.hops.length <= (this.cfg.liveMaxPools ?? 3)) {
+      const taken = this.deps.liveOffer({
+        sig: r.cycle.sig, label, base: r.cycle.base, amountIn: r.amountIn, sizeUsd: r.sizeUsd, netUsd: r.netUsd,
+        poolKeys: r.cycle.hops.map((x) => x.poolKey), hops: built.trade.hops,
+        coins: [...new Set(r.cycle.tokens.map((t) => t.toLowerCase()))],
+        ...(triggerHash ? { triggerHash } : {}), foundAt: now,
+      });
+      if (taken) { h.liveOffered++; this.deps.log?.(`${base}: handed to live loops`); return; }
+    }
     this.deps.log?.(`${base}: queued for a practice check`);
     this.waiting.push({ r, trade: built.trade, at: now, ...(triggerHash ? { triggerHash } : {}) });
     // Vetted coins first, then bigger profit. Short line: 10 max.
@@ -413,7 +507,16 @@ export class LoopTrader {
   // Starts at most one loop check at a time, within the per-minute cap, and
   // only when the normal check line is idle.
   drain(): void {
-    if (this.checking || !this.waiting.length) return;
+    if (this.checking) return;
+    // COIN TAX TEST: a waiting coin test goes first (it unlocks loops), on the
+    // same loop node, one request job at a time, within its own per-minute limit.
+    const tax = this.deps.coinTax;
+    if (tax && tax.hasWork() && this.deps.env.now() >= this.pausedUntil && this.deps.canCheckNow()) {
+      this.checking = true;
+      void tax.runNext().catch(() => false).finally(() => { this.checking = false; this.drain(); });
+      return;
+    }
+    if (!this.waiting.length) return;
     const now = this.deps.env.now();
     // A loop waiting more than 2 s is usually gone (same as the normal line).
     const before = this.waiting.length;
@@ -460,6 +563,27 @@ export class LoopTrader {
       h.checks.push({ route: label, estUsd: est, delayMs, ...extra, ...rec });
     };
     if (mvc) this.logModelVsCheck(w, r, label, timing);
+    // ROUTE MEMORY: a real profit clears the count; anything else adds one.
+    const benchAfter = this.cfg.benchAfter ?? 0;
+    if (benchAfter > 0) {
+      const sig = w.r.cycle.sig;
+      const madeMoney = r.status === 'profit' && w.trade.amountIn > 0n
+        && Number(r.profit) / Number(w.trade.amountIn) <= MAX_PLAUSIBLE_PROFIT_SHARE
+        && (() => { const d = this.deps.decimalsOf(w.r.cycle.base), u = this.deps.env.usdOf(w.r.cycle.base); return d !== undefined && !!u && (Number(r.profit) / 10 ** d) * u - gasUsd > 0; })();
+      if (madeMoney) this.bench.delete(sig);
+      else {
+        const e = this.bench.get(sig) ?? { fails: 0, until: 0 };
+        e.fails++;
+        if (e.fails >= benchAfter) {
+          e.fails = 0;
+          e.until = this.deps.env.now() + (this.cfg.benchMs ?? 20 * 60_000);
+          h.benchStarts++;
+          this.deps.log?.(`[loop] ${label} benched for ${Math.round((this.cfg.benchMs ?? 20 * 60_000) / 60_000)} min after ${benchAfter} failed checks in a row`);
+        }
+        this.bench.set(sig, e);
+        if (this.bench.size > 5_000) { const t = this.deps.env.now(); for (const [k, v] of this.bench) if (v.until <= t) this.bench.delete(k); }
+      }
+    }
     if (r.status === 'profit') {
       const dec = this.deps.decimalsOf(w.r.cycle.base), usd = this.deps.env.usdOf(w.r.cycle.base);
       const plausible = w.trade.amountIn > 0n && Number(r.profit) / Number(w.trade.amountIn) <= MAX_PLAUSIBLE_PROFIT_SHARE;
@@ -561,6 +685,13 @@ export class LoopTrader {
       rival: { loops: h.rival.loops, comparable: h.rival.comparable, weFound: h.rival.weFound,
         leadMsMedian: leads.length ? leads[Math.floor(leads.length / 2)] : null, longer: h.rival.longer, unseen: h.rival.unseen, topBot: top },
       checkVsEstimate: summarizeLoopChecks(h.checks),
+      ...(this.deps.coinTax || (this.cfg.benchAfter ?? 0) > 0 ? { coins: {
+        tax: this.deps.coinTax ? this.deps.coinTax.stats() : null,
+        taxPools: this.taxPools,
+        waitTest: h.waitTest, benchedSkips: h.benchedSkips, benchStarts: h.benchStarts,
+        benchedNow: (() => { const t = this.deps.env.now(); let n = 0; for (const v of this.bench.values()) if (v.until > t) n++; return n; })(),
+      } } : {}),
+      ...(this.deps.liveOffer ? { liveOffered: h.liveOffered } : {}),
     };
   }
 }

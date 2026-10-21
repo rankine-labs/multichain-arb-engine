@@ -56,6 +56,8 @@ export interface LoopWorkerHostOptions {
   readyTimeoutMs?: number;        // a started worker must say "ready" within this (10 s)
   permitMaxAgeMs?: number;        // older "may I?" questions are answered no (900 ms; the worker gives up at 1 s)
   autoFlush?: boolean;            // tests: false = send only on flushNow (default true)
+  // LIVE LOOPS: a loop the worker handed over (execution/loopLive.ts decides).
+  onLiveCandidate?: (c: import('../execution/loopLive').LoopLiveCandidate) => void;
 }
 
 export function loopWorkerHeapMbFromEnv(env: Record<string, string | undefined> = process.env): number {
@@ -238,6 +240,7 @@ export class LoopWorkerHost {
           break;
         }
         case 'stats': this.stats = m.s; break;
+        case 'liveCandidate': this.o.onLiveCandidate?.(m.c); break;
         case 'error': this.o.warn(`[loop] worker problem (ignored): ${m.message}`); break;
       }
     } catch (err) {

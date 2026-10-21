@@ -7,6 +7,7 @@ import { deepEnough, poolDepthUsd, setRealBalanceSource } from './poolPrice';
 import { setHeadBlockSource } from './eventFees';
 import { drainSteps, Steps } from './chunked';
 import type { LoopWorkerInit, LoopBatch, PoolRec, EnvDelta } from './loopWorkerFeed';
+import type { CoinTaxGate } from './coinTax';
 
 // ============================================================================
 // LOOP WORKER CORE (Oct 15, owner approved). PRACTICE ONLY, NEVER SENDS.
@@ -42,6 +43,10 @@ export interface LoopWorkerCoreDeps {
   // Set the worker-wide real-balance and head-block lookups (true in the worker;
   // tests running several cores side by side may leave it off).
   installGlobals?: boolean;
+  // COIN TAX TEST (core/coinTax.ts): missing = off.
+  coinTax?: CoinTaxGate;
+  // LIVE LOOPS: hand a qualifying loop to the main thread (true = taken).
+  liveOffer?: (c: import('../execution/loopLive').LoopLiveCandidate) => boolean;
 }
 
 export class LoopWorkerCore {
@@ -102,6 +107,8 @@ export class LoopWorkerCore {
       runCheck: (trade, ctx) => deps.runCheck(trade, ctx),
       fix: init.fix,
       noteGas: (pools, gasUsed) => deps.noteGas(pools, gasUsed),
+      ...(deps.coinTax ? { coinTax: deps.coinTax } : {}),
+      ...(deps.liveOffer ? { liveOffer: deps.liveOffer } : {}),
       log: (m) => {
         const t = Date.now();
         this.logTimes = this.logTimes.filter((x) => t - x < 60_000);
@@ -117,6 +124,8 @@ export class LoopWorkerCore {
   readonly now!: () => number;
 
   poolCount(): number { return this.recs.size; }
+  // Coin name for log lines (same names the loop trader uses).
+  symbolOf(t: string): string { return this.sym.get(t.toLowerCase()) ?? `${t.slice(0, 6)}...${t.slice(-4)}`; }
   pendingCount(): number { return this.pending.size(); }
 
   // Take in one message from the main thread (cheap: no loop maths here).
