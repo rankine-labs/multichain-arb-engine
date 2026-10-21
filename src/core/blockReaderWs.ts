@@ -785,6 +785,8 @@ export class WsBlockReader {
     const s = this.stats();
     return `push ${this.label}: ${s.capped ? 'OFF (daily cap, polling)' : s.healthy ? 'live' : 'DOWN (polling)'}, msgs ${s.messages} (today ${s.todayMessages}), reconnects ${s.reconnects}, fallback ${s.fallbackSeconds} s, last block ${s.lastBlock}` +
       (s.resubscribes ? `, list renewals ${s.resubscribes}` : '') +
-      (s.backfills ? `, gap fills ${s.backfills}` : '') + (s.reorgs ? `, reorg events ${s.reorgs}` : '') + (s.subscribeErrors ? `, refused ${s.subscribeErrors}` : '');
+      (s.backfills ? `, gap fills ${s.backfills}` : '') + (s.reorgs ? `, reorg events ${s.reorgs}` : '') + (s.subscribeErrors ? `, refused ${s.subscribeErrors}` : '') +
+      // Copy 2 tap (only when the fast check follows our pools).
+      (this.tapOn ? `, copy 2 events ${this.tapLive ? 'live' : 'starting'} (${this.tapLogs} logs)` : this.tapRefused ? ', copy 2 events REFUSED by provider' : '');
   }
 }

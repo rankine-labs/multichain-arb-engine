@@ -4,6 +4,8 @@ import { LocalSimClient, LocalSimClientOptions, LocalSimMode, localSimMode, make
 import { simulateRoundTrip, SimResult, SIM_EXECUTOR_ADDRESS } from './simulator';
 import type { ExecutorHop } from './executorCalldata';
 import { classifySimOutcome, isTradeVerdict } from '../core/failReasons';
+import type { PoolState } from '../core/types';
+import { Copy2Link, Copy2Route, copy2Settings } from './copy2';
 
 // ============================================================================
 // FAST CHECK HOST: runs the local simulator ("arbsim" sidecar) inside the bot
@@ -52,12 +54,17 @@ export type LocalSimOpts = { v3Lender?: string; weth?: string };
 //   gap         a sitting gap (standing price difference), checked on the newest state
 //   trig        practice "follow a trade" check, right after the trade we follow
 //   trig_live   the live "follow a trade" check (check-first, before sending)
-export type LocalKind = 'gap' | 'trig' | 'trig_live';
+//   loop_live   the live loop check (3+ pools, execution/loopLive.ts)
+export type LocalKind = 'gap' | 'trig' | 'trig_live' | 'loop_live';
 
 export type LocalQuestion = {
   kind: LocalKind;
   trade: LocalTrade;
   simOpts: LocalSimOpts;
+  // Which state to ask about, when the caller knows better (copy 2: "right
+  // after block N", the newest block whose pool reports were passed on).
+  // Left out: right after the trigger (follow-a-trade) or the newest state.
+  at?: Record<string, unknown>;
   triggerHash?: string;     // follow-a-trade: ask "right after this transaction"
   seenMs?: number;          // when the bot saw the trigger in the feed (for timing)
   label?: string;           // short pair/route name for the log
@@ -272,6 +279,11 @@ export type LocalSimHostOptions = {
   warmEveryMs?: number;                                 // default 10 min
   statusEveryMs?: number;                               // default 60 s
   logFlushMs?: number;                                  // default 2 s
+  // COPY 2 (execution/copy2.ts): the watched Robinhood pools and the V4
+  // PoolManager. Left out = no copy 2 (the host works exactly as before).
+  copy2Pools?: () => Iterable<PoolState | undefined>;
+  poolManager?: string;
+  copy2Link?: Copy2Link;                                // tests pass their own
 };
 
 export class LocalSimHost {
@@ -293,6 +305,8 @@ export class LocalSimHost {
   private lastStatus: Record<string, unknown> | null = null;
   private notReachableLoggedMs = 0;
   private shadowReasonLogged = false;
+  // COPY 2 (execution/copy2.ts). null = not used (old behaviour).
+  copy2: Copy2Link | null = null;
 
   // Hourly counters (taken by takeHourLine).
   private hour = this.freshHour();
@@ -324,8 +338,18 @@ export class LocalSimHost {
     };
     this.client = opts.client ?? new LocalSimClient({
       socketPath: this.settings.socketPath, timeoutMs: this.settings.timeoutMs, log: clientLog,
-      onConnect: () => { void this.sendWarm(); }, ...(opts.clientOptions ?? {}),
+      onConnect: () => { void this.sendWarm(); try { this.copy2?.onClientConnect(); } catch { /* never breaks the connection */ } },
+      ...(opts.clientOptions ?? {}),
     });
+    // COPY 2: only when the bot hands over its watched pools and it isn't
+    // switched off (LOCAL_SIM_COPY2=off). Does nothing until the fast check
+    // says it runs in pool-events mode.
+    const c2 = copy2Settings(opts.env ?? process.env);
+    if (opts.copy2Link) this.copy2 = opts.copy2Link;
+    else if (opts.copy2Pools && c2.mode !== 'off') {
+      this.copy2 = new Copy2Link({ client: this.client, settings: c2, pools: opts.copy2Pools, poolManager: opts.poolManager ?? '', now: this.now, log: (m) => this.log(m) });
+    }
+    if (this.copy2 && this.client.isConnected()) this.copy2.onClientConnect();
     this.shadowLog = new JsonlLog(this.settings.logFile, this.settings.maxLogBytes, opts.logFlushMs ?? 2_000);
     const every = (fn: () => void, ms: number) => { const t = setInterval(() => { try { fn(); } catch { /* never throws */ } }, ms); t.unref?.(); this.timers.push(t); };
     every(() => { void this.sendWarm(); }, opts.warmEveryMs ?? 10 * 60_000);
@@ -361,6 +385,27 @@ export class LocalSimHost {
   // The raw live-feed message, passed on unchanged. Fire-and-forget.
   forwardFeed(text: string): void {
     try { this.client.sendFeed(text); } catch { /* never breaks the feed */ }
+    // Copy 2: each block's time and L1 block number come from the feed.
+    try { this.copy2?.noteFeed(text); } catch { /* never breaks the feed */ }
+  }
+
+  // ---- copy 2 ----------------------------------------------------------------
+  // Copy 2 is running (the fast check follows our pools from their events).
+  // Its answers are then about whole blocks: "right after this transaction"
+  // is not available, so follow-a-trade checks wait for the trade's block.
+  copy2Running(): boolean { try { return !!this.copy2?.running(); } catch { return false; } }
+
+  // May the fast check decide a route with these pools (addresses, V4 ids,
+  // the loan pool)? Returns the state to ask about, or null = the node
+  // decides (copy 2 not running, a pool not ready, reports not flowing...).
+  copy2Route(keys: Array<string | undefined | null>, minBlock = -1): Copy2Route | null {
+    try { return this.copy2?.route(keys, minBlock) ?? null; } catch { return null; }
+  }
+
+  // Copy 2: wait until the trade's pool reports arrived (= it is in a block).
+  // The block number, or null (copy 2 not running / not seen within ms).
+  copy2WaitForTx(hash: string | undefined, ms: number): Promise<number | null> {
+    try { return this.copy2?.waitForTx(hash, ms) ?? Promise.resolve(null); } catch { return Promise.resolve(null); }
   }
 
   // When the bot saw a trigger trade (only for trades that go to a check).
@@ -458,7 +503,7 @@ export class LocalSimHost {
     try {
       if (!this.client.isConnected()) return unknown('disconnected');
       let gasUsed: bigint | undefined;
-      const at = q.triggerHash ? { afterTx: q.triggerHash.toLowerCase() } : { after: 'head' };
+      const at = q.at ?? (q.triggerHash ? { afterTx: q.triggerHash.toLowerCase() } : { after: 'head' });
       const rpc = makeLocalRpc(this.client, undefined, {
         timeoutMs: this.settings.timeoutMs,
         at,
@@ -591,8 +636,12 @@ export class LocalSimHost {
     this.hour = this.freshHour();
     const label = this.isOn() ? 'on' : 'practice';
     const parts: string[] = [];
+    // Copy 2: pools ready / unsure, checks routed to the fast check vs the node.
+    let c2: string | null = null;
+    try { c2 = this.copy2?.hourText() ?? null; } catch { c2 = null; }
     if (!h.checks && !h.down) {
-      const line = this.client.isConnected() ? `Fast check (${label}): connected, no checks this hour` : `Fast check (${label}): sidecar not reachable, the node did every check`;
+      let line = this.client.isConnected() ? `Fast check (${label}): connected, no checks this hour` : `Fast check (${label}): sidecar not reachable, the node did every check`;
+      if (c2) line += `; ${c2}`;
       this.log(`[local-sim] hour: ${line}`);
       return line;
     }
@@ -607,6 +656,7 @@ export class LocalSimHost {
     if (h.down) line += `; sidecar down for ${h.down} checks`;
     if (h.mismatchNew) line += `; ${h.mismatchNew} replay mismatch(es)`;
     if (h.autoOffs) line += '; STEPPED BACK to practice';
+    if (c2) line += `; ${c2}`;
     const whys = Object.entries(h.unknownWhy).sort((a, b) => b[1] - a[1]).slice(0, 3).map(([w, n]) => `${w} ${n}`).join(', ');
     this.log(`[local-sim] hour: ${line}${whys ? ` | unknown because: ${whys}` : ''}${h.errors ? ` | errors ${h.errors}` : ''}${this.shadowLog.dropped ? ` | log lines dropped ${this.shadowLog.dropped}` : ''}`);
     return line;
@@ -618,6 +668,7 @@ export class LocalSimHost {
     for (const t of this.timers) clearInterval(t);
     this.timers = [];
     for (const c of [...this.open]) c.expire();
+    try { this.copy2?.stop(); } catch { /* already stopped */ }
     try { this.client.close(); } catch { /* already closed */ }
     return this.shadowLog.stop();
   }
