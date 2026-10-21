@@ -165,6 +165,13 @@ async function sendTrack(): Promise<void> {
     score.trackOk = a?.ok === true;
     log(`track: ${pools.length} pools sent, arbsim ${a?.ok ? 'accepted' : `refused: ${JSON.stringify(a).slice(0, 200)}`}`);
   } catch (e) { score.trackOk = false; log(`track: no answer (${(e as Error).message})`); }
+  // The coin balance places the bot already knows (data/balance-slots.json,
+  // same method, same node): arbsim then skips probing those coins.
+  try {
+    const coinSlots = JSON.parse(readFileSync(join(BOT_DIR, 'data', 'balance-slots.json'), 'utf8'));
+    const a = await calls.request({ type: 'coin_slots', coinSlots });
+    log(`coin_slots: ${Object.keys(coinSlots).length} known coin balance places sent, arbsim accepted ${a?.accepted ?? '?'}`);
+  } catch (e) { log(`coin_slots: not sent (${(e as Error).message.slice(0, 80)})`); }
 }
 
 // --- feeding blocks to the copy ---------------------------------------------
