@@ -53,6 +53,10 @@ struct FakeChain {
     traces: Mutex<u32>,
     /// eth_getProof requests seen.
     proofs: Mutex<u32>,
+    /// Like this Nitro node: eth_getProof only at the newest block.
+    proof_tip_only: Mutex<bool>,
+    /// eth_getStorageAt requests seen.
+    storage_reads: Mutex<u32>,
 }
 
 /// Balance slot of a holder in a namespaced coin.
@@ -118,6 +122,10 @@ impl NodeApi for FakeChain {
                     "eth_getStorageAt" | "eth_call" | "eth_getProof" if blk(if *m == "eth_call" { 1 } else { 2 }) > *self.tip.lock().unwrap() => {
                         Err(RpcErr { code: -32000, message: "header not found".into() })
                     }
+                    "eth_getProof" if *self.proof_tip_only.lock().unwrap() && blk(2) < *self.tip.lock().unwrap() => {
+                        *self.proofs.lock().unwrap() += 1;
+                        Err(RpcErr { code: -32000, message: "historical state 27a8441d0f is not available".into() })
+                    }
                     "eth_getProof" => {
                         // Like Nitro: balance, nonce, code hash + storage values in order.
                         *self.proofs.lock().unwrap() += 1;
@@ -138,6 +146,7 @@ impl NodeApi for FakeChain {
                                   "codeHash": format!("{code_hash}"), "storageHash": format!("{:#066x}", 0), "accountProof": [], "storageProof": sp}))
                     }
                     "eth_getStorageAt" => {
+                        *self.storage_reads.lock().unwrap() += 1;
                         let acct = parse_address(p[0].as_str().unwrap()).unwrap();
                         let s = parse_u256(p[1].as_str().unwrap()).unwrap();
                         Ok(json!(w(self.sload(blk(2), acct, s))))
@@ -1250,4 +1259,24 @@ fn soak_800_pools_at_the_plan_limit_with_checks_asking_twice_the_limit() {
     assert!(counted <= sent + sent / 20, "copy 2 counted {counted}, node got {sent}");
     assert!(ready * 10 >= n as u64 * 9, "only {ready} of {n} ready: {st}");
     h.stop();
+}
+
+#[test]
+fn proofs_refused_for_older_blocks_are_read_the_plain_way_at_that_block() {
+    // This Nitro node gives eth_getProof only at its newest block (103);
+    // our copy (and so the load) is at 100: those accounts are read with
+    // eth_getStorageAt at block 100 instead, exactly, in the same job.
+    let mut r = rig();
+    *r.chain.tip.lock().unwrap() = 103;
+    *r.chain.proof_tip_only.lock().unwrap() = true;
+    let mut later = genesis();
+    later.get_mut(&a(V2P)).unwrap().insert(u(8), u(1) | (u(1) << 112usize) | (u(99) << 224usize));
+    r.chain.set(103, later); // the node's newest state differs: must NOT be used
+    r.track(vec![v2_pool()]);
+    r.send(tick(100, 60));
+    assert_eq!(r.state(&v2_pool()).0, PoolState::Ready, "{:?}", r.state(&v2_pool()));
+    assert_eq!(r.head_slot(a(V2P), u(8)), Lookup::Known(u(1000) | (u(4000) << 112usize) | (u(50) << 224usize)));
+    assert!(*r.chain.proofs.lock().unwrap() >= 1);
+    assert!(*r.chain.storage_reads.lock().unwrap() >= 1);
+    assert_eq!(r.h.c2.stats.node_errors.load(std::sync::atomic::Ordering::Relaxed), 0);
 }

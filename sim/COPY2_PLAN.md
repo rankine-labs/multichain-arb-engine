@@ -244,6 +244,16 @@ trade ~20 ms.
     total incl. fills (947 eth_getProof), 0 x 429, worst second 86 % of the
     limit. Expected live at ARBSIM_NODE_RPS=100 (copy 2 at 80/s): ~1,700
     load requests -> roughly 30-60 s for 800 pools.
+- Dry run #9 fixes:
+  - This Nitro node gives eth_getProof only for very recent state
+    ("historical state ... is not available"). Such accounts are read with
+    eth_getStorageAt / eth_getBalance / eth_getTransactionCount / eth_getCode
+    AT THE SAME BLOCK in the same job (exact, no retry loop); eth_getProof is
+    still used whenever the node answers it.
+  - Requests WAIT their turn in the node client (copy 2 paces itself); the
+    queue cap is only a safety valve now (ARBSIM_NODE_MAX_QUEUE_MS 10000).
+    A speed-limit refusal (nothing sent) is retried in ~0.3 s and is not a
+    failure (no growing backoff).
 - Status: `status` -> `copy2` {pools, loading, ready, unsure, lastBlock,
   unsureReasons, counters}; with {"pools": true} also `list` of {address,
   v4Id, kind, state, reason, events}. Checks touching a pool that isn't

@@ -167,9 +167,9 @@ pub struct Budget {
     pub burst: f64,
     file: Option<String>,
     inner: Mutex<BudgetInner>,
-    /// Longest queue a request may join [ARBSIM_NODE_MAX_QUEUE_MS, 2000];
-    /// beyond it the request is refused (caller tries later), so no batch can
-    /// line up minutes of work.
+    /// Longest queue a request may join [ARBSIM_NODE_MAX_QUEUE_MS, 10000]: a
+    /// safety valve only. Requests normally WAIT their turn (copy 2 paces
+    /// itself so the queue stays short); beyond this they are refused.
     pub max_queue: Duration,
 }
 
@@ -222,7 +222,7 @@ impl Budget {
                 }
             }
         }
-        let max_queue = Duration::from_millis(env_u64("ARBSIM_NODE_MAX_QUEUE_MS", 2000).max(100));
+        let max_queue = Duration::from_millis(env_u64("ARBSIM_NODE_MAX_QUEUE_MS", 10_000).max(100));
         Budget { cap, rps: rps.max(0.1), burst: rps.max(1.0), file, inner: Mutex::new(b), max_queue }
     }
 

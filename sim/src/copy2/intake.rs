@@ -2005,6 +2005,7 @@ impl Intake {
                         self.outcomes.node_error += 1;
                         let n = self.probe_retry.get(&coin).map(|x| x.1 + 1).unwrap_or(1);
                         self.probe_retry.insert(coin, (Instant::now() + backoff(n), n));
+                        let _ = soon;
                     }
                 }
             }
@@ -2039,9 +2040,14 @@ impl Intake {
         let (bal, tr) = match res {
             Ok(x) => x,
             Err(e) => {
-                self.note_node_error(&e.to_string());
-                let n = self.trace_retry.get(&pair).map(|x| x.1 + 1).unwrap_or(1);
-                self.trace_retry.insert(pair, (Instant::now() + backoff(n), n));
+                let why = e.to_string();
+                self.note_node_error(&why);
+                if why.contains(crate::node::SPEED_LIMIT) {
+                    self.trace_retry.insert(pair, (Instant::now() + soon(), 0));
+                } else {
+                    let n = self.trace_retry.get(&pair).map(|x| x.1 + 1).unwrap_or(1);
+                    self.trace_retry.insert(pair, (Instant::now() + backoff(n), n));
+                }
                 return;
             }
         };
@@ -2140,8 +2146,14 @@ impl Intake {
                 e.state = PoolState::Loading;
                 e.reason = format!("loading: {why}");
                 e.gen += 1;
-                e.fails = e.fails.saturating_add(1);
-                e.retry_at = Instant::now() + backoff(e.fails);
+                if why.contains(crate::node::SPEED_LIMIT) {
+                    // Our own speed limit, nothing was sent: try again soon,
+                    // not counted as a failure.
+                    e.retry_at = Instant::now() + soon();
+                } else {
+                    e.fails = e.fails.saturating_add(1);
+                    e.retry_at = Instant::now() + backoff(e.fails);
+                }
             }
         }
     }
@@ -2158,9 +2170,13 @@ impl Intake {
                 e.state = PoolState::Loading;
                 e.reason = format!("loading: {why}");
                 e.gen += 1;
-                e.fails = e.fails.saturating_add(1);
-                // Wait longer each time in a row (1 s doubling to 30 s, +-25 %).
-                e.retry_at = Instant::now() + backoff(e.fails);
+                if why.contains(crate::node::SPEED_LIMIT) {
+                    e.retry_at = Instant::now() + soon();
+                } else {
+                    e.fails = e.fails.saturating_add(1);
+                    // Wait longer each time in a row (1 s doubling to 30 s, +-25 %).
+                    e.retry_at = Instant::now() + backoff(e.fails);
+                }
             }
         }
     }
@@ -2292,6 +2308,12 @@ impl Intake {
         }
         if let Some(why) = why {
             self.note_node_error(&why);
+            if why.contains(crate::node::SPEED_LIMIT) {
+                // Nothing was sent: try again soon, not an error.
+                self.partials.insert(key, part);
+                self.delayed.push((Instant::now() + soon(), key, gen, items));
+                return;
+            }
             part.errors += 1;
             let errs = part.errors;
             if part.errors >= 10 {
@@ -2880,6 +2902,12 @@ fn read_trace(tr: &Value, coin: Address, bal: U256) -> (Result<U256, usize>, Vec
         facts.retain(|f| !matches!(f, Fact::Slot(x, _, _) if *x == coin));
     }
     (found, facts)
+}
+
+/// After a refusal by our own speed limit (nothing sent): ~0.3 s.
+fn soon() -> Duration {
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0);
+    Duration::from_millis(200 + (nanos % 200) as u64)
 }
 
 /// Wait before trying again after `n` failures in a row: 1 s doubling up to

@@ -40,6 +40,11 @@
 //   kept (most pools share their code). A V2 pool costs ~2 requests instead
 //   of ~14. If the node doesn't know eth_getProof, the old way (one request
 //   per value) is used instead.
+//   This node (Nitro, path-based state) answers eth_getProof only for very
+//   recent blocks ("historical state ... is not available"), while
+//   eth_getStorageAt / eth_getCode / eth_call work at older blocks. So an
+//   account whose proof is refused that way is read the plain way AT THE
+//   SAME BLOCK, in the same job (exact; no retry loop).
 //   The first 5 errors of each kind are logged (job, method, message).
 //
 //   Which block: the bot's websocket reports run a few blocks AHEAD of what
@@ -743,6 +748,8 @@ fn fetch_proof(node: &dyn NodeApi, class: Class, block: u64, items: &[MissItem],
     }
     // Per account: basics (balance, nonce, code hash) and slot values.
     type Basics = (U256, u64, B256);
+    // Accounts to read the plain way (no proof for that block).
+    let mut plain: Vec<Address> = Vec::new();
     let mut basics: HashMap<Address, Result<Basics, ItemErr>> = HashMap::new();
     let mut slots: HashMap<(Address, U256), Result<U256, ItemErr>> = HashMap::new();
     for ((a, keys), r) in asked.iter().zip(res[..call_at].iter()) {
@@ -782,12 +789,32 @@ fn fetch_proof(node: &dyn NodeApi, class: Class, block: u64, items: &[MissItem],
                     if l.contains("method not found") || l.contains("not supported") || l.contains("does not exist") || l.contains("not available") && l.contains("method") {
                         return Err(NodeErr::BadResponse(format!("eth_getProof unsupported: {m}")));
                     }
+                    // No proof for an older block: read it the plain way.
+                    if l.contains("historical state") || l.contains("missing trie node") || l.contains("state not available") || l.contains("not available") {
+                        if !plain.contains(a) {
+                            plain.push(*a);
+                        }
+                        continue;
+                    }
                 }
                 basics.insert(*a, Err(e.clone()));
                 for k in keys {
                     slots.insert((*a, *k), Err(e.clone()));
                 }
             }
+        }
+    }
+    // Accounts without a proof for this block: plain reads, same block.
+    let mut plain_out: HashMap<MissItem, Result<Fetched, ItemErr>> = HashMap::new();
+    if !plain.is_empty() {
+        let pitems: Vec<MissItem> = items
+            .iter()
+            .filter(|m| matches!(m, MissItem::Slot(a, _) | MissItem::Account(a) if plain.contains(a)))
+            .cloned()
+            .collect();
+        let o = fetch_plain(node, class, block, &pitems, &[])?;
+        for (it, r) in o.items {
+            plain_out.insert(it, r);
         }
     }
     // Code for accounts asked as accounts, by hash (cached).
@@ -829,6 +856,10 @@ fn fetch_proof(node: &dyn NodeApi, class: Class, block: u64, items: &[MissItem],
     }
     let mut out = Vec::with_capacity(items.len());
     for it in items {
+        if let Some(r) = plain_out.get(it) {
+            out.push((it.clone(), r.clone()));
+            continue;
+        }
         let r = match it {
             MissItem::Slot(a, sl) => slots.get(&(*a, *sl)).cloned().unwrap_or(Err(ItemErr::Unsupported)).map(|v| Fetched::Slot(*a, *sl, v)),
             MissItem::Account(a) => match basics.get(a).cloned().unwrap_or(Err(ItemErr::Unsupported)) {
