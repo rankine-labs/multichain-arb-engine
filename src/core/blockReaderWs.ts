@@ -94,7 +94,39 @@ export interface WsBlockReaderOptions {
   // DAILY CAP: stop the push feed for the rest of the UTC day after this many
   // pushed messages (the poll reader takes over). 0 = no cap. Default 400,000.
   dailyMessageCap?: number;
+  // COPY 2 TAP (execution/copy2.ts, fast check "copy 2"). Only set when
+  // LOCAL_SIM is shadow/on; unset = this reader behaves exactly as before.
+  rawLogTap?: RawLogTap;
 }
+
+// ---------------------------------------------------------------------------
+// COPY 2 TAP. When the fast check follows our pools from their events, it
+// needs EVERY event of those pools, not just Sync/Swap, plus coin transfers
+// into / out of them. While tap.wanted() is true (and the address filter is
+// on) the subscriptions change like this:
+//   1) our pool contracts: ALL their events (instead of Sync/Swap only)
+//   3) V4 PoolManager: ALL events for our V4 pool ids (instead of Swap only)
+//   4) + coin Transfer events FROM our contract pools (coins of those pools)
+//   5) + coin Transfer events TO our contract pools
+// The extra events (mint, burn, LP moves...) also reach the normal price
+// path, which ignores events it doesn't know (as the poll reader does).
+// Every pushed log is handed to tap.onLogs as received (a quick hand-off);
+// logs of 4) and 5) go ONLY to the tap. tap.onLive / tap.onDown say when
+// all subscriptions are confirmed / when the connection is gone (so the
+// copy knows events may have been missed).
+// Cost: more pushed (billed) messages, roughly 2-3x today's on the same
+// pools (each swap moves two coins), all counted against the daily cap.
+// ---------------------------------------------------------------------------
+export interface RawLogTap {
+  wanted(): boolean;
+  transferFilter(): { coins: string[]; pools: string[] } | null;
+  onLogs(logs: RpcLog[]): void;
+  onLive(coverage: { pools: Set<string>; ids: Set<string>; transferPools: Set<string>; coins: Set<string> }): void;
+  onDown(): void;
+}
+// ERC-20 Transfer(address indexed from, address indexed to, uint256).
+const TRANSFER_TOPIC = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
+const padTopic = (a: string): string => '0x' + '0'.repeat(24) + a.toLowerCase().slice(2);
 
 // Read a hex block number. null when missing / unreadable.
 function toNum(v: unknown): number | null {
@@ -186,6 +218,14 @@ export class WsBlockReader {
   private dayKey = '';                     // UTC day the message count belongs to
   private dayMessages = 0;                 // pushed messages today (UTC)
   private capped = false;                  // daily cap hit: push feed off until the next UTC day
+  // Copy 2 tap state (see RawLogTap above).
+  private tapOn = false;                   // this connection asked for the copy-2 subscriptions
+  private tapSubs = new Set<string>();     // subscription ids of 4) and 5) (tap only)
+  private tapWaiting = new Set<number>();  // request ids still waiting for their reply
+  private tapLive = false;                 // tap.onLive was called for this connection
+  private tapRefused = false;              // provider refused a copy-2 subscription: don't ask again
+  private tapCoverage: { pools: Set<string>; ids: Set<string>; transferPools: Set<string>; coins: Set<string> } | null = null;
+  private tapLogs = 0;                     // logs that reached the tap
 
   constructor(o: WsBlockReaderOptions) {
     this.o = o;
@@ -319,8 +359,10 @@ export class WsBlockReader {
       }
       // Watch list changed: renew the subscription so new pools are included
       // (at most every resubscribeMs, so a busy list doesn't cause churn).
+      // Copy 2 switched on or off: renew sooner (at most every 30 s).
+      const tapFlip = !!this.o.rawLogTap && this.tapWanted() !== this.tapOn && t - this.lastSubAt >= 30_000;
       if (this.socket && this.subscribed && this.o.addressFilter !== false &&
-          t - this.lastSubAt >= (this.o.resubscribeMs ?? 600_000) &&
+          (tapFlip || t - this.lastSubAt >= (this.o.resubscribeMs ?? 600_000)) &&
           this.listSig() !== this.subSig) {
         this.counts.resubscribes++;
         this.log(`${this.label}: watch list changed, renewing the subscription`);
@@ -388,12 +430,25 @@ export class WsBlockReader {
         this.lastSubAt = this.now();
         if (this.o.addressFilter !== false) {
           const { pools, ids } = this.subscribeLists();
-          this.subSig = pools.join(',') + '|' + ids.join(',');
+          this.subSig = this.listSig();
           this.subPools = new Set(pools); this.subIds = new Set(ids); // what this subscription covers (read-only facts above)
           const nonV4 = HANDLED_TOPICS.filter((t) => t !== V4_SWAP_TOPIC);
-          sock.send(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_subscribe', params: ['logs', { address: pools, topics: [nonV4] }] }));
+          // Copy 2 (tap wanted): every event of our pools. Never an
+          // address-less request (an empty list could mean "the whole chain").
+          const tf = this.tapWanted() && pools.length > 0 ? this.tapFilter() : null;
+          this.tapOn = !!tf;
+          this.tapSubs = new Set(); this.tapWaiting = new Set(); this.tapLive = false; this.tapCoverage = null;
+          sock.send(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_subscribe', params: ['logs', this.tapOn ? { address: pools } : { address: pools, topics: [nonV4] }] }));
           const pm = (this.o.poolManager || '').toLowerCase();
-          if (pm && ids.length) sock.send(JSON.stringify({ jsonrpc: '2.0', id: 3, method: 'eth_subscribe', params: ['logs', { address: pm, topics: [[V4_SWAP_TOPIC], ids] }] }));
+          const v4 = !!pm && ids.length > 0;
+          if (v4) sock.send(JSON.stringify({ jsonrpc: '2.0', id: 3, method: 'eth_subscribe', params: ['logs', { address: pm, topics: this.tapOn ? [null, ids] : [[V4_SWAP_TOPIC], ids] }] }));
+          if (tf) {
+            const padded = tf.pools.map(padTopic);
+            sock.send(JSON.stringify({ jsonrpc: '2.0', id: 4, method: 'eth_subscribe', params: ['logs', { address: tf.coins, topics: [TRANSFER_TOPIC, padded] }] }));
+            sock.send(JSON.stringify({ jsonrpc: '2.0', id: 5, method: 'eth_subscribe', params: ['logs', { address: tf.coins, topics: [TRANSFER_TOPIC, null, padded] }] }));
+            this.tapWaiting = new Set(v4 ? [1, 3, 4, 5] : [1, 4, 5]);
+            this.tapCoverage = { pools: new Set(pools), ids: new Set(v4 ? ids : []), transferPools: new Set(tf.pools), coins: new Set(tf.coins) };
+          }
         } else {
           this.subSig = '';
           sock.send(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_subscribe', params: ['logs', { topics: [HANDLED_TOPICS] }] }));
@@ -420,6 +475,7 @@ export class WsBlockReader {
   // Forget the current socket (its later events are ignored) and close it.
   private dropSocket(): void {
     const s = this.socket;
+    this.tapDown();
     this.gen++;
     this.socket = null;
     this.subscribed = false;
@@ -457,6 +513,22 @@ export class WsBlockReader {
       try { m = JSON.parse(text); } catch { return; }   // not JSON: ignore
       if (!m || typeof m !== 'object') return;
 
+      // Replies to the copy-2 transfer subscriptions (only sent when the tap is on).
+      if ((m.id === 4 || m.id === 5) && this.tapOn) {
+        if (m.error || typeof m.result !== 'string') {
+          // Provider refuses this filter: copy 2 stays off on this reader
+          // (the fast check falls back to the node), normal events continue.
+          this.tapRefused = true;
+          this.counts.subscribeErrors++;
+          this.log(`${this.label}: copy-2 subscription refused (${String(m.error?.message ?? 'no id').slice(0, 80).replace(/https?:\/\/\S+|wss?:\/\/\S+/g, '[url]')}); copy 2 off, reconnecting without it`);
+          this.dropSocket();
+          this.scheduleReconnect();
+          return;
+        }
+        this.tapSubs.add(m.result);
+        this.tapReplied(m.id);
+        return;
+      }
       // Replies to our subscribe requests.
       if (m.id === 1 || m.id === 2 || m.id === 3) {
         if (m.error || typeof m.result !== 'string') {
@@ -476,8 +548,10 @@ export class WsBlockReader {
           this.noteHealth();
           // Gap fill: blocks we may have missed while disconnected.
           if (reconnect && this.lastBlock >= 0) void this.backfill(this.lastBlock, 'gap');
+          this.tapReplied(1);
         } else if (m.id === 3) {
           this.v4Sub = m.result;
+          this.tapReplied(3);
         } else {
           this.headsSub = m.result;
         }
@@ -494,10 +568,17 @@ export class WsBlockReader {
           this.markData();
           return;
         }
+        // Copy-2 transfer subscriptions: only for the tap, never the price path.
+        if (sub && this.tapSubs.has(sub) && r) {
+          this.markData();
+          this.toTap(Array.isArray(r) ? r : [r]);
+          return;
+        }
         if (sub && (sub === this.logsSub || sub === this.v4Sub) && r) {
           this.markData();
           if (sub === this.logsSub) this.dataAt.pools = this.now(); else this.dataAt.v4 = this.now();
           const logs: RpcLog[] = Array.isArray(r) ? r : [r];
+          if (this.tapOn) this.toTap(logs);
           for (const l of logs) {
             this.counts.logs++;
             if (l?.removed) {
@@ -526,7 +607,54 @@ export class WsBlockReader {
     for (const id of this.o.v4Ids() ?? []) if (id && id.length === 66) ids.add(id.toLowerCase());
     return { pools: [...pools].sort(), ids: [...ids].sort() };
   }
-  private listSig(): string { const { pools, ids } = this.subscribeLists(); return pools.join(',') + '|' + ids.join(','); }
+  private listSig(): string {
+    const { pools, ids } = this.subscribeLists();
+    let sig = pools.join(',') + '|' + ids.join(',');
+    // Copy 2: whether its subscriptions are wanted, and their coin / pool lists.
+    const tf = this.tapWanted() && pools.length > 0 ? this.tapFilter() : null;
+    if (tf) sig += '|tap|' + tf.coins.join(',') + '|' + tf.pools.join(',');
+    return sig;
+  }
+
+  // ---- copy 2 tap helpers (all do nothing without a tap) --------------------
+  private tapWanted(): boolean {
+    const t = this.o.rawLogTap;
+    if (!t || this.tapRefused || this.o.addressFilter === false) return false;
+    try { return t.wanted() === true; } catch { return false; }
+  }
+  // The transfer filter, lower case and sorted; null = nothing to ask for.
+  private tapFilter(): { coins: string[]; pools: string[] } | null {
+    try {
+      const f = this.o.rawLogTap?.transferFilter();
+      if (!f) return null;
+      const clean = (xs: string[] | undefined) => [...new Set((xs ?? []).filter((a) => typeof a === 'string' && /^0x[0-9a-fA-F]{40}$/.test(a)).map((a) => a.toLowerCase()))].sort();
+      const coins = clean(f.coins), pools = clean(f.pools);
+      // Never an empty list: an empty address / topic list could mean "everything".
+      return coins.length && pools.length ? { coins, pools } : null;
+    } catch { return null; }
+  }
+  private toTap(logs: RpcLog[]): void {
+    this.tapLogs += logs.length;
+    try { this.o.rawLogTap?.onLogs(logs); } catch { /* the tap must never break the reader */ }
+  }
+  // One subscription confirmed; when all are, the tap is live.
+  private tapReplied(id: number): void {
+    if (!this.tapOn || this.tapLive) return;
+    this.tapWaiting.delete(id);
+    if (this.tapWaiting.size > 0 || !this.tapCoverage) return;
+    this.tapLive = true;
+    try { this.o.rawLogTap?.onLive(this.tapCoverage); } catch { /* tap problem: ignored */ }
+  }
+  // Connection gone (or renewed): events may be missed from here on.
+  private tapDown(): void {
+    if (!this.tapOn) return;
+    this.tapOn = false; this.tapLive = false; this.tapSubs = new Set(); this.tapWaiting = new Set();
+    try { this.o.rawLogTap?.onDown(); } catch { /* ignored */ }
+  }
+  // Copy-2 facts for the status line.
+  tapStatus(): { on: boolean; live: boolean; refused: boolean; logs: number } {
+    return { on: this.tapOn, live: this.tapLive, refused: this.tapRefused, logs: this.tapLogs };
+  }
 
   private utcDay(t: number): string { return new Date(t).toISOString().slice(0, 10); }
 
