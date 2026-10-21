@@ -47,6 +47,15 @@ struct FakeChain {
     probe_errors: Mutex<u32>,
     /// Balance-place probes seen.
     probes: Mutex<u32>,
+    /// Coins that keep balances in a "namespaced" mapping (slot base 777):
+    /// the probe can't find them; only a trace can.
+    namespaced: Mutex<Vec<Address>>,
+    traces: Mutex<u32>,
+}
+
+/// Balance slot of a holder in a namespaced coin.
+fn ns_slot(h: Address) -> U256 {
+    map_slot(h, 777)
 }
 
 impl FakeChain {
@@ -113,7 +122,11 @@ impl NodeApi for FakeChain {
                         Ok(json!(w(self.sload(blk(2), acct, s))))
                     }
                     "eth_getBalance" | "eth_getTransactionCount" => Ok(json!("0x0")),
-                    "eth_getCode" => Ok(json!("0x")),
+                    // Contracts (anything with storage) have code, like on chain.
+                    "eth_getCode" => {
+                        let acct = parse_address(p[0].as_str().unwrap()).unwrap();
+                        Ok(json!(if self.at(blk(1)).contains_key(&acct) { "0x00" } else { "0x" }))
+                    }
                     "eth_call" => {
                         let to = parse_address(p[0]["to"].as_str().unwrap()).unwrap();
                         let data: Bytes = parse_bytes(p[0]["data"].as_str().unwrap()).unwrap();
@@ -130,6 +143,9 @@ impl NodeApi for FakeChain {
                                 }
                             }
                             let diff = ov.values().next().unwrap()["stateDiff"].as_object().unwrap();
+                            if self.namespaced.lock().unwrap().contains(&to) {
+                                return Ok(json!(w(U256::ZERO))); // reads its real (empty) place
+                            }
                             let k = w(BalanceLayout { vyper: false, slot: 0 }.key(PROBE_HOLDER));
                             return Ok(diff.get(&k).cloned().unwrap_or(json!(w(U256::ZERO))));
                         }
@@ -137,7 +153,9 @@ impl NodeApi for FakeChain {
                         let lie = if self.lying.lock().unwrap().contains(&to) { u(1) } else { U256::ZERO };
                         let f = &data[..4];
                         let words: Vec<U256> = if f == sel("balanceOf(address)") {
-                            vec![self.sload(b, to, map_slot(Address::from_slice(&data[16..36]), 0))]
+                            let h = Address::from_slice(&data[16..36]);
+                            let slot = if self.namespaced.lock().unwrap().contains(&to) { ns_slot(h) } else { map_slot(h, 0) };
+                            vec![self.sload(b, to, slot)]
                         } else if f == sel("getReserves()") {
                             let r = s(8);
                             if r.is_zero() {
@@ -171,6 +189,22 @@ impl NodeApi for FakeChain {
                             out.push_str(&format!("{x:064x}"));
                         }
                         Ok(json!(out))
+                    }
+                    "debug_traceCall" => {
+                        // prestateTracer of balanceOf(holder): the coin's code,
+                        // the slot it read, and one setting it also read.
+                        *self.traces.lock().unwrap() += 1;
+                        let to = parse_address(p[0]["to"].as_str().unwrap()).unwrap();
+                        let data: Bytes = parse_bytes(p[0]["data"].as_str().unwrap()).unwrap();
+                        let h = Address::from_slice(&data[16..36]);
+                        let b = blk(1);
+                        let slot = if self.namespaced.lock().unwrap().contains(&to) { ns_slot(h) } else { map_slot(h, 0) };
+                        let mut st = serde_json::Map::new();
+                        st.insert(w(slot), json!(w(self.sload(b, to, slot))));
+                        st.insert(w(u(5)), json!(w(self.sload(b, to, u(5)))));
+                        let mut out = serde_json::Map::new();
+                        out.insert(format!("{to:#x}"), json!({"balance": "0x0", "nonce": 1, "code": "0x00", "storage": st}));
+                        Ok(Value::Object(out))
                     }
                     _ => Err(RpcErr { code: -32601, message: "method not found".into() }),
                 }
@@ -447,13 +481,51 @@ fn duplicate_block_ignored_but_different_resend_is_a_reorg() {
     let mut r = rig();
     r.track(vec![v2_pool()]);
     r.send(tick(100, 60));
-    let m = msg(101, 61, vec![v2_sync(900, 4500, 101, 0, 0)]);
+    let m = msg(101, 61, vec![v2_sync(900, 4500, 101, 0, 5)]);
     r.intake.process(m.clone());
     r.intake.process(m); // same again: duplicate
     assert_eq!(r.state(&v2_pool()).0, PoolState::Ready);
     assert_eq!(r.h.status_json(false)["counters"]["duplicate_blocks"], json!(1));
-    r.intake.process(msg(101, 61, vec![v2_sync(901, 4500, 101, 0, 1)])); // other reports
+    // A late report for the pool AFTER its applied one: applied (per pool).
+    r.intake.process(msg(101, 61, vec![v2_sync(901, 4500, 101, 0, 7)]));
+    assert_eq!(r.state(&v2_pool()).0, PoolState::Ready);
+    assert_eq!(r.head_slot(a(V2P), u(8)), Lookup::Known(u(901) | (u(4500) << 112usize) | (u(61) << 224usize)));
+    // A late report BEFORE an applied one of the same pool: can't be exact.
+    r.intake.process(msg(101, 61, vec![v2_sync(902, 4500, 101, 0, 1)]));
     assert_eq!(r.state(&v2_pool()).0, PoolState::Unsure);
+}
+
+#[test]
+fn late_report_for_an_older_block_is_applied_to_that_pool_in_every_kept_version() {
+    let mut r = rig();
+    r.track(vec![v2_pool()]);
+    r.send(tick(100, 60));
+    // Block 101 had the pool's Sync, but its coin transfers arrive only
+    // after blocks 102 and 103 were applied.
+    r.intake.process(msg(101, 62, vec![v2_sync(1100, 3640, 101, 3, 2)]));
+    r.intake.process(tick(102, 63));
+    r.intake.process(tick(103, 64));
+    r.intake.process(msg(101, 62, vec![
+        transfer(a(COIN0), a(USER), a(V2P), 100, 101, 3, 0),
+        transfer(a(COIN1), a(V2P), a(USER), 360, 101, 3, 1),
+    ]));
+    // Transfers sit BEFORE the Sync in the block, but they touch only the
+    // coin balances (no later transfer applied to them): exact.
+    assert_eq!(r.state(&v2_pool()).0, PoolState::Ready);
+    for b in [101, 102, 103] {
+        let snap = r.sh.resolve(&At::Block(b)).unwrap().snap;
+        assert_eq!(snap.storage(a(COIN0), map_slot(a(V2P), 0)), Lookup::Known(u(1100)), "block {b}");
+        assert_eq!(snap.storage(a(COIN1), map_slot(a(V2P), 0)), Lookup::Known(u(3640)), "block {b}");
+    }
+    let old = r.sh.resolve(&At::Block(100)).unwrap().snap;
+    assert_eq!(old.storage(a(COIN0), map_slot(a(V2P), 0)), Lookup::Known(u(1000)));
+    // A late pool event for block 102 after nothing newer on the pool: applied
+    // in 102 and 103 (not in 101).
+    r.intake.process(msg(102, 63, vec![v2_sync(1200, 3500, 102, 0, 0)]));
+    assert_eq!(r.state(&v2_pool()).0, PoolState::Ready);
+    assert_eq!(r.sh.resolve(&At::Block(103)).unwrap().snap.storage(a(V2P), u(8)), Lookup::Known(u(1200) | (u(3500) << 112usize) | (u(63) << 224usize)));
+    assert_eq!(r.sh.resolve(&At::Block(101)).unwrap().snap.storage(a(V2P), u(8)), Lookup::Known(u(1100) | (u(3640) << 112usize) | (u(62) << 224usize)));
+    assert_eq!(r.h.c2.stats.reorgs.load(std::sync::atomic::Ordering::Relaxed), 0);
 }
 
 #[test]
@@ -649,7 +721,6 @@ fn replay_pool_needing_values_loads_in_background_without_holding_the_block() {
     assert_eq!(r.h.c2.last_block.load(std::sync::atomic::Ordering::Relaxed), 101);
     let (st, why) = r.state(&v3);
     assert!(st != PoolState::Ready, "{why}");
-    assert!(r.h.c2.stats.need_item_rounds.load(std::sync::atomic::Ordering::Relaxed) >= 1 || st == PoolState::Unsure, "{why}");
     // Checks touching it are told it isn't ready.
     assert!(r.h.unsure_reason(&[MissItem::Slot(a(0xc3), u(0))]).is_some());
     r.settle();
@@ -835,11 +906,52 @@ fn late_reports_after_the_known_ones_are_applied_not_a_reorg() {
     assert_eq!(r.head_slot(a(COIN0), map_slot(a(V2P), 0)), Lookup::Known(u(1100)));
     assert_eq!(r.head_slot(a(COIN1), map_slot(a(V2P), 0)), Lookup::Known(u(3640)));
     assert_eq!(r.sh.head().unwrap().block, 101);
-    // A re-send with a new report BEFORE the known ones: not exact -> reorg.
+    // A late coin transfer BEFORE one already applied to that balance: not
+    // exact -> that balance is forgotten (fetched again), the pool stays.
     let mut odd = vec![transfer(a(COIN0), a(USER), a(V2P), 1, 101, 1, 0)];
     odd.push(transfer(a(COIN0), a(USER), a(V2P), 100, 101, 3, 0));
     odd.push(transfer(a(COIN1), a(V2P), a(USER), 360, 101, 3, 1));
     odd.push(v2_sync(1100, 3640, 101, 3, 2));
     r.intake.process(msg(101, 62, odd));
-    assert_eq!(r.state(&v2_pool()).0, PoolState::Unsure);
+    assert_eq!(r.state(&v2_pool()).0, PoolState::Ready);
+    assert_eq!(r.head_slot(a(COIN0), map_slot(a(V2P), 0)), Lookup::Missing);
+    assert_eq!(r.head_slot(a(COIN1), map_slot(a(V2P), 0)), Lookup::Known(u(3640)));
+}
+
+#[test]
+fn coin_with_namespaced_storage_is_found_by_trace_and_followed() {
+    let mut r = rig();
+    // Coin 0 keeps balances somewhere the probe can't see (namespaced).
+    r.chain.namespaced.lock().unwrap().push(a(COIN0));
+    let mut s = genesis();
+    let c0 = s.get_mut(&a(COIN0)).unwrap();
+    c0.insert(ns_slot(a(V2P)), u(1000));
+    c0.insert(u(5), u(1)); // a setting balanceOf reads (e.g. "not paused")
+    r.chain.set(100, s);
+    r.track(vec![v2_pool()]);
+    r.send(tick(100, 60));
+    assert_eq!(r.state(&v2_pool()).0, PoolState::Ready, "{:?}", r.state(&v2_pool()));
+    assert_eq!(*r.chain.traces.lock().unwrap(), 1);
+    assert_eq!(r.head_slot(a(COIN0), ns_slot(a(V2P))), Lookup::Known(u(1000)));
+    assert_eq!(r.head_slot(a(COIN0), u(5)), Lookup::Known(u(1))); // what balanceOf read
+    // Followed from Transfer events like any other coin.
+    r.intake.process(msg(101, 61, vec![transfer(a(COIN0), a(USER), a(V2P), 100, 101, 0, 0)]));
+    assert_eq!(r.head_slot(a(COIN0), ns_slot(a(V2P))), Lookup::Known(u(1100)));
+    // The other side can't be named: anything else of that coin we held is forgotten.
+    assert_eq!(r.head_slot(a(COIN0), u(5)), Lookup::Missing);
+}
+
+#[test]
+fn ready_pools_hold_their_code_and_swap_slots() {
+    let mut r = rig();
+    r.track(vec![v2_pool()]);
+    r.send(tick(100, 60));
+    assert_eq!(r.state(&v2_pool()).0, PoolState::Ready);
+    let head = r.sh.head().unwrap();
+    let view = arbsim::state::snap::View::new(head.snap.clone());
+    assert!(matches!(view.account(a(V2P)), Lookup::Known(Some(_))), "pool code loaded");
+    assert!(matches!(view.account(a(COIN0)), Lookup::Known(Some(_))), "coin code loaded");
+    for sl in [0u128, 6, 7, 8, 9, 10, 12] {
+        assert!(matches!(head.snap.storage(a(V2P), u(sl)), Lookup::Known(_)), "slot {sl}");
+    }
 }

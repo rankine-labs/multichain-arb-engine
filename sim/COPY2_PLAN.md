@@ -141,6 +141,29 @@ trade ~20 ms.
   Each load round logs "copy2: load round done: ... outcomes: N ready, N
   coin balance place not found, N node errors (retried), N layout/balance
   mismatch, N other unsure" (and a progress line every 60 s while running).
+- Dry run #4 fixes:
+  - Late reports are judged PER POOL (the bot hears reports on ~18 separate
+    subscriptions): a message for an already-applied block adds the reports
+    we didn't have; each is applied to its pool if that pool has nothing
+    applied after it (written into every kept version from that block on),
+    else that pool alone goes unsure. Coin transfers likewise per (coin,
+    pool): a transfer older than one already applied forgets that balance
+    (fetched again) instead. Only `removed: true` reports are reorgs. Two
+    messages for a block not yet applied are merged. prevBlock only flags a
+    lost message when the block it names never arrived.
+  - Coins without a general balance layout: per (coin, pool) the load runs
+    debug_traceCall(balanceOf(pool), prestateTracer); the one coin slot equal
+    to the balance is that pool's balance slot (2 calls per coin+pool, once;
+    status counters coin_traces / coin_trace_found / coin_trace_not_found).
+    The trace also loads the coin's code and the settings balanceOf reads.
+  - READY now includes what a check needs: pool code + the slots its swap
+    reads (V2: 0,6-10,12; Solidly: 2,10-23 + factory 0,1,2,customFee + clone
+    implementation; V3: 0-4; PancakeV3: 0-5; V4: pools[id] 0-3), coin code.
+  - Loader queues: values checks missed and catch-up fetches go BEFORE bulk
+    first loads (before, fills waited behind minutes of loading).
+  - Cost: ~14 paid calls per V2 pool, ~25 per Solidly, ~10 per V3/V4 (+2 per
+    coin+pool without a known layout). 800 pools ~ 9,000-12,000 calls =
+    6-8 min at ARBSIM_NODE_RPS=25. Sending coin_slots saves the probes.
 - Status: `status` -> `copy2` {pools, loading, ready, unsure, lastBlock,
   unsureReasons, counters}; with {"pools": true} also `list` of {address,
   v4Id, kind, state, reason, events}. Checks touching a pool that isn't

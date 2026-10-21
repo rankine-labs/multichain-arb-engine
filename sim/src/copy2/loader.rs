@@ -29,10 +29,20 @@
 //   only if the paid one refuses (daily allowance used up) or fails. The
 //   daily allowance and speed limit of node.rs apply as always.
 //   Several loader threads run side by side [ARBSIM_COPY2_LOADERS, 4].
+//
+//   Two queues: URGENT (values a check missed, values a pool's catch-up
+//   needs, coin probes, the node's newest block) always go before BULK
+//   (first loads of many pools at once). Otherwise a check's missing value
+//   would wait behind minutes of initial loading.
+//
+//   `traces`: debug_traceCall with the prestate tracer = "which storage
+//   slots did this call read, and their values" (used to find where a coin
+//   keeps one pool's balance, see intake.rs).
 // ============================================================================
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{channel, Receiver, Sender, SyncSender};
-use std::sync::{Arc, Mutex};
+use std::collections::VecDeque;
+use std::sync::mpsc::SyncSender;
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use revm::primitives::{Address, Bytes, U256};
@@ -48,7 +58,8 @@ use crate::state::MissItem;
 pub enum Job {
     /// `exact` = must be at `block`; otherwise at most `block` (an older
     /// block the node has is fine: the answer says which block was used).
-    Fetch { id: u64, block: u64, exact: bool, items: Vec<MissItem>, calls: Vec<(Address, Bytes)> },
+    /// `bulk` = first loads (go after everything urgent).
+    Fetch { id: u64, block: u64, exact: bool, bulk: bool, items: Vec<MissItem>, calls: Vec<(Address, Bytes)>, traces: Vec<(Address, Bytes)> },
     Probe { id: u64, coin: Address, block: u64 },
     Tip { id: u64 },
 }
@@ -57,6 +68,8 @@ pub enum Job {
 pub struct FetchOut {
     pub items: Vec<(MissItem, Result<Fetched, ItemErr>)>,
     pub calls: Vec<Result<Bytes, String>>,
+    /// Prestate traces: {address: {storage: {slot: value}}} per trace asked.
+    pub traces: Vec<Result<Value, String>>,
 }
 
 /// An answer, sent back to the intake thread.
@@ -68,25 +81,64 @@ pub enum Done {
 
 /// Handle to the loader threads.
 pub struct Loaders {
-    tx: Sender<Job>,
+    q: Arc<Queue>,
+}
+
+/// The two job queues (urgent, bulk) shared by the loader threads.
+struct Queue {
+    m: Mutex<(VecDeque<Job>, VecDeque<Job>, bool)>,
+    cv: Condvar,
+}
+
+impl Queue {
+    /// Next job, urgent first. None = shutting down.
+    fn take(&self) -> Option<Job> {
+        let mut g = self.m.lock().unwrap();
+        loop {
+            if g.2 {
+                return None;
+            }
+            if let Some(j) = g.0.pop_front() {
+                return Some(j);
+            }
+            if let Some(j) = g.1.pop_front() {
+                return Some(j);
+            }
+            g = self.cv.wait(g).unwrap();
+        }
+    }
+}
+
+impl Drop for Loaders {
+    fn drop(&mut self) {
+        self.q.m.lock().unwrap().2 = true;
+        self.q.cv.notify_all();
+    }
 }
 
 impl Loaders {
     /// Start `n` threads. Answers go into `out` (the intake's input).
     /// `tip_out`: where the node's newest block is published (status).
     pub fn spawn(n: usize, node: Arc<dyn NodeApi>, out: SyncSender<Input>, requests: Arc<AtomicU64>, tip_out: Arc<AtomicU64>) -> Loaders {
-        let (tx, rx) = channel::<Job>();
-        let rx = Arc::new(Mutex::new(rx));
+        let q = Arc::new(Queue { m: Mutex::new((VecDeque::new(), VecDeque::new(), false)), cv: Condvar::new() });
         let tip = Arc::new(Tip { known: Mutex::new((0, None)), out: tip_out });
         for i in 0..n.max(1) {
-            let (rx, node, out, req, tip) = (rx.clone(), node.clone(), out.clone(), requests.clone(), tip.clone());
-            std::thread::Builder::new().name(format!("arbsim-copy2-load-{i}")).spawn(move || run(rx, node, out, req, tip)).expect("loader thread");
+            let (q, node, out, req, tip) = (q.clone(), node.clone(), out.clone(), requests.clone(), tip.clone());
+            std::thread::Builder::new().name(format!("arbsim-copy2-load-{i}")).spawn(move || run(q, node, out, req, tip)).expect("loader thread");
         }
-        Loaders { tx }
+        Loaders { q }
     }
 
     pub fn send(&self, j: Job) {
-        let _ = self.tx.send(j);
+        let bulk = matches!(j, Job::Fetch { bulk: true, .. });
+        let mut g = self.q.m.lock().unwrap();
+        if bulk {
+            g.1.push_back(j);
+        } else {
+            g.0.push_back(j);
+        }
+        drop(g);
+        self.q.cv.notify_one();
     }
 }
 
@@ -119,15 +171,12 @@ impl Tip {
     }
 }
 
-fn run(rx: Arc<Mutex<Receiver<Job>>>, node: Arc<dyn NodeApi>, out: SyncSender<Input>, requests: Arc<AtomicU64>, tip: Arc<Tip>) {
+fn run(q: Arc<Queue>, node: Arc<dyn NodeApi>, out: SyncSender<Input>, requests: Arc<AtomicU64>, tip: Arc<Tip>) {
     let fresh = Duration::from_millis(250);
     loop {
-        let job = match rx.lock().unwrap().recv() {
-            Ok(j) => j,
-            Err(_) => return, // intake gone
-        };
+        let Some(job) = q.take() else { return }; // intake gone
         let done = match job {
-            Job::Fetch { id, block, exact, items, calls } => {
+            Job::Fetch { id, block, exact, items, calls, traces, .. } => {
                 // Pick the block (see file header).
                 let at = if exact {
                     let t0 = Instant::now();
@@ -144,8 +193,8 @@ fn run(rx: Arc<Mutex<Receiver<Job>>>, node: Arc<dyn NodeApi>, out: SyncSender<In
                 };
                 match at {
                     Ok(b) => {
-                        requests.fetch_add(count_calls(&items, &calls), Ordering::Relaxed);
-                        Done::Fetch { id, block: b, res: fetch(&*node, b, &items, &calls) }
+                        requests.fetch_add(count_calls(&items, &calls) + traces.len() as u64, Ordering::Relaxed);
+                        Done::Fetch { id, block: b, res: fetch(&*node, b, &items, &calls, &traces) }
                     }
                     Err(e) => Done::Fetch { id, block, res: Err(e) },
                 }
@@ -190,7 +239,7 @@ fn count_calls(items: &[MissItem], calls: &[(Address, Bytes)]) -> u64 {
 }
 
 /// One batch at `block`: slots, account basics (3 calls each) and eth_calls.
-pub fn fetch(node: &dyn NodeApi, block: u64, items: &[MissItem], calls: &[(Address, Bytes)]) -> Result<FetchOut, NodeErr> {
+pub fn fetch(node: &dyn NodeApi, block: u64, items: &[MissItem], calls: &[(Address, Bytes)], traces: &[(Address, Bytes)]) -> Result<FetchOut, NodeErr> {
     let t = tag(block);
     let mut rpc: Vec<(&str, Value)> = Vec::new();
     let mut at: Vec<Option<usize>> = Vec::with_capacity(items.len());
@@ -213,6 +262,13 @@ pub fn fetch(node: &dyn NodeApi, block: u64, items: &[MissItem], calls: &[(Addre
     let call_at = rpc.len();
     for (to, data) in calls {
         rpc.push(("eth_call", json!([{ "to": to_hex(to.as_slice()), "data": to_hex(data) }, t])));
+    }
+    let trace_at = rpc.len();
+    for (to, data) in traces {
+        rpc.push((
+            "debug_traceCall",
+            json!([{ "to": to_hex(to.as_slice()), "data": to_hex(data) }, t, { "tracer": "prestateTracer" }]),
+        ));
     }
     let res = if rpc.is_empty() { Vec::new() } else { node.call_batch_paid(Class::Fill, &rpc)? };
     if res.len() != rpc.len() {
@@ -244,7 +300,15 @@ pub fn fetch(node: &dyn NodeApi, block: u64, items: &[MissItem], calls: &[(Addre
         };
         out.push((it.clone(), r));
     }
-    let calls_out = res[call_at..]
+    let traces_out = res[trace_at..]
+        .iter()
+        .map(|r| match r {
+            Ok(v @ Value::Object(_)) => Ok(v.clone()),
+            Ok(_) => Err("node has no trace for that block yet".to_string()),
+            Err(e) => Err(format!("node error: {}", e.message)),
+        })
+        .collect();
+    let calls_out = res[call_at..trace_at]
         .iter()
         .map(|r| match r {
             Ok(Value::String(s)) => parse_bytes(s),
@@ -252,7 +316,7 @@ pub fn fetch(node: &dyn NodeApi, block: u64, items: &[MissItem], calls: &[(Addre
             Err(e) => Err(format!("node error: {}", e.message)),
         })
         .collect();
-    Ok(FetchOut { items: out, calls: calls_out })
+    Ok(FetchOut { items: out, calls: calls_out, traces: traces_out })
 }
 
 /// Word `w` of a call answer.

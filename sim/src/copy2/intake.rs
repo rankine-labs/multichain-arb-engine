@@ -47,9 +47,23 @@
 //      answers over HTTP: loads are fetched at the newest block the NODE has
 //      (loader.rs) and carried forward from there. A node error is never
 //      read as "not found": the pool / coin is simply asked about again.
-//   6. Late reports: when a block is re-sent with the same reports plus new
-//      ones AFTER them, only the new ones are applied (exact). Anything else
-//      about an already-applied block is treated as a reorg (pools unsure).
+//   6. Late reports, PER POOL: the bot hears reports on many separate
+//      subscriptions, so a pool's coin Transfer often arrives after its
+//      block was already applied. A message about an already-applied block
+//      N adds the reports we didn't have yet. For each pool they touch: if
+//      that pool has nothing applied AFTER that report, the report is
+//      applied to it (exact: its state hasn't moved since) and written into
+//      every kept version from N on. Otherwise that pool alone is unsure.
+//      Same for coin Transfers (per coin + pool). Only `removed` reports are
+//      a reorg.
+//   7. Where a coin keeps a pool's balance: the coin's general layout (probe,
+//      or the bot's `coin_slots`), else EXACTLY per pool: debug_traceCall of
+//      balanceOf(pool) with the prestate tracer lists the coin storage slots
+//      read; the one slot whose value equals the balance is it (works for
+//      namespaced / proxy / odd layouts). No single match -> pool unsure.
+//   8. READY means a check can run on the pool: its code and the slots its
+//      swap reads are loaded with it (not only what its events change), plus
+//      its coins' code and what their balanceOf reads.
 //
 // Strict, always: a value we don't hold is MISSING (never zero); a pool we
 // can't follow exactly is unsure. Node reads use the daily allowance
@@ -65,7 +79,7 @@ use revm::primitives::{keccak256, Address, Bytes, B256, U256};
 use serde_json::{json, Value};
 
 use super::coins::{balance_of_data, BalanceLayout};
-use super::fields::{apply_fields, core_slots, obs_slot, sol, topic_addr, topics, v2};
+use super::fields::{apply_fields, core_slots, map_slot, obs_slot, sol, topic_addr, topics, v2};
 use super::loader::{out_word, Done, FetchOut, Job, Loaders};
 use super::overlay::Overlay;
 use super::replay::{apply_replay, finish_block};
@@ -296,6 +310,9 @@ pub struct Registry {
     /// When a coin's balance place was judged "not found" (asked again
     /// after ARBSIM_COPY2_LAYOUT_RETRY_S).
     pub not_found_at: HashMap<Address, Instant>,
+    /// (coin, pool) -> the slot holding that pool's balance, found by a
+    /// trace (coins without a general layout).
+    pub pair_slots: HashMap<(Address, Address), U256>,
 }
 
 impl Registry {
@@ -313,6 +330,14 @@ impl Registry {
             for o in &e.owned {
                 self.owner_of.insert(*o, *k);
             }
+        }
+    }
+
+    /// The storage slot holding `holder`'s balance of `coin`, if known.
+    pub fn bal_slot(&self, coin: Address, holder: Address) -> Option<U256> {
+        match self.layouts.get(&coin) {
+            Some(Some(l)) => Some(l.key(holder)),
+            _ => self.pair_slots.get(&(coin, holder)).copied(),
         }
     }
 
@@ -379,7 +404,7 @@ c2counters!(
     coin_slot_mismatch, other_side_forgotten, logs_ignored, duplicate_blocks, reorgs, gaps, loads, load_ok,
     load_failed, unsure_marked, need_item_rounds, node_errors, fills, fill_items, fill_refused, fill_retry,
     probes, probe_not_found, probe_errors, track_msgs, dropped_msgs, carried_events, carry_too_old, merges, apply_us_max,
-    late_reports_applied, coin_slot_msgs,
+    late_reports_applied, late_reports_unsure, coin_slot_msgs, coin_traces, coin_trace_found, coin_trace_not_found,
 );
 
 fn inc(c: &AtomicU64) {
@@ -708,6 +733,8 @@ struct LoadReq {
     getters: Vec<(&'static str, usize)>,
     /// Coin checks: (coin, balance slot, item index, balanceOf call index).
     coin_checks: Vec<(Address, U256, usize, usize)>,
+    /// Coins without a known balance place: (coin, trace index, balanceOf call index).
+    trace_checks: Vec<(Address, usize, usize)>,
 }
 
 pub struct Intake {
@@ -734,6 +761,13 @@ pub struct Intake {
     probe_retry: HashMap<Address, Instant>,
     outcomes: Outcomes,
     last_progress: Instant,
+    /// Position of the last report applied to each pool / to each followed
+    /// coin balance (coin, holder). A load or a fill counts as "everything
+    /// up to the end of its block".
+    last_pos: HashMap<PoolKey, Pos>,
+    coin_pos: HashMap<(Address, Address), Pos>,
+    /// Blocks we got a message for (lost-message check).
+    received: std::collections::BTreeSet<u64>,
     buf: VecDeque<BufBlock>,
     partials: HashMap<PoolKey, Partial>,
     jobs: HashMap<u64, JobFor>,
@@ -788,6 +822,9 @@ pub fn manual(sh: Arc<Shared>, fills: Arc<FillQueue>, cfg: C2Config) -> (Intake,
         probe_retry: HashMap::new(),
         outcomes: Outcomes::default(),
         last_progress: Instant::now(),
+        last_pos: HashMap::new(),
+        coin_pos: HashMap::new(),
+        received: std::collections::BTreeSet::new(),
         buf: VecDeque::new(),
         partials: HashMap::new(),
         jobs: HashMap::new(),
@@ -835,6 +872,26 @@ fn missing_core(pool: &TrackedPool, ov: &Overlay) -> Vec<MissItem> {
     let mut m: Vec<MissItem> =
         core_slots(pool.kind).iter().map(|s| U256::from(*s)).filter(|s| matches!(ov.slot(p, *s), Lookup::Missing)).map(|s| MissItem::Slot(p, s)).collect();
     if pool.kind == PoolKind::Solidly {
+        // A swap also asks the factory (paused? fee?) and runs the shared
+        // implementation behind the pool's tiny proxy.
+        if let Lookup::Known(f) = ov.slot(p, U256::from(sol::FACTORY)) {
+            let factory = Address::from_slice(&f.to_be_bytes::<32>()[12..]);
+            if factory != Address::ZERO {
+                if matches!(ov.account(factory), Lookup::Missing) {
+                    m.push(MissItem::Account(factory));
+                }
+                for s in [U256::from(0), U256::from(1), U256::from(2), map_slot(p, 8)] {
+                    if matches!(ov.slot(factory, s), Lookup::Missing) {
+                        m.push(MissItem::Slot(factory, s));
+                    }
+                }
+            }
+        }
+        if let Some(imp) = proxy_target(ov, p) {
+            if matches!(ov.account(imp), Lookup::Missing) {
+                m.push(MissItem::Account(imp));
+            }
+        }
         if let Lookup::Known(len) = ov.slot(p, U256::from(sol::OBS_LEN)) {
             if !len.is_zero() {
                 let s = obs_slot(len - U256::from(1), 0);
@@ -939,9 +996,21 @@ impl Intake {
                 self.on_layouts(layouts);
             }
             // Keep the newest message per block (a re-sent block replaces).
-            Input::Block(m) => {
-                self.pending.insert(m.block, m);
-            }
+            Input::Block(m) => match self.pending.get_mut(&m.block) {
+                // Two messages for a block not applied yet: keep every report.
+                Some(old) => {
+                    let have: HashSet<LogId> = old.logs.iter().map(log_id).collect();
+                    let extra: Vec<PoolLog> = m.logs.into_iter().filter(|l| l.removed || !have.contains(&log_id(l))).collect();
+                    old.logs.extend(extra);
+                    old.tick = old.tick && m.tick;
+                    if old.prev_block.is_none() {
+                        old.prev_block = m.prev_block;
+                    }
+                }
+                None => {
+                    self.pending.insert(m.block, m);
+                }
+            },
             Input::Fill(items) => {
                 self.fills.push(items);
             }
@@ -1051,8 +1120,8 @@ impl Intake {
                 forget.extend(e.items.iter().copied());
                 for c in [e.pool.token0, e.pool.token1] {
                     let still = reg.holders.get(&c).is_some_and(|h| h.contains(&e.pool.address));
-                    if let (false, Some(Some(l))) = (still, reg.layouts.get(&c)) {
-                        forget.push((c, l.key(e.pool.address)));
+                    if let (false, Some(sl)) = (still, reg.bal_slot(c, e.pool.address)) {
+                        forget.push((c, sl));
                     }
                 }
             }
@@ -1085,11 +1154,12 @@ impl Intake {
         let t0 = Instant::now();
         let c2 = self.c2.clone();
         let st = &c2.stats;
-        // Lost message? (only if the bot tells us its previous block)
-        if let (Some(prev), Some(last)) = (m.prev_block, self.last_msg_block) {
-            if prev != last && m.block > last {
+        // Lost message? The bot's previous message (prevBlock) must be one we
+        // got. (Late messages for older blocks are normal, see header.)
+        if let (Some(prev), Some(&first)) = (m.prev_block, self.received.first()) {
+            if prev >= first && !self.received.contains(&prev) {
                 inc(&st.gaps);
-                eprintln!("[arbsim] copy2: message(s) lost between block {last} and {} (bot's previous: {prev}); reloading every pool", m.block);
+                eprintln!("[arbsim] copy2: message(s) lost (bot's previous block {prev} never arrived; now at {}); reloading every pool", m.block);
                 self.unsure_all(&format!("lost message before block {}", m.block), m.block);
                 // The buffer has a hole: no load may carry across it.
                 self.buf.clear();
@@ -1097,6 +1167,10 @@ impl Intake {
         }
         if m.block > self.last_msg_block.unwrap_or(0) {
             self.last_msg_block = Some(m.block);
+        }
+        self.received.insert(m.block);
+        while self.received.len() > 4096 {
+            self.received.pop_first();
         }
         // Reorged reports ("removed") make their pools unsure from that block on.
         let removed: Vec<PoolLog> = m.logs.iter().filter(|l| l.removed).cloned().collect();
@@ -1106,47 +1180,14 @@ impl Intake {
             let keys = self.pools_touched(&removed);
             self.unsure_from(&keys, "reorg (report taken back)", from);
         }
-        // An old block again: identical = duplicate; different = reorg.
+        // A block we applied already: its reports we didn't have yet are
+        // late reports (per pool, see header).
         if let Some(last) = self.last_block {
             if m.block <= last {
-                if m.tick {
-                    return;
+                if !m.tick {
+                    let logs: Vec<PoolLog> = m.logs.iter().filter(|l| !l.removed).cloned().collect();
+                    self.on_late(m.block, logs);
                 }
-                let ids = log_ids(&m.logs);
-                let known = self.recent.iter().find(|r| r.0 == m.block).cloned();
-                if known.as_ref().is_some_and(|k| k.1 == ids) {
-                    inc(&st.duplicate_blocks);
-                    return;
-                }
-                // Same reports as before plus new ones strictly AFTER them?
-                if let Some(k) = &known {
-                    let old: HashSet<LogId> = k.1.iter().copied().collect();
-                    let last_old = k.1.iter().map(|x| (x.0, x.1)).max();
-                    let all_old_there = k.1.iter().all(|x| ids.contains(x));
-                    let added: Vec<PoolLog> = m.logs.iter().filter(|l| !l.removed && !old.contains(&log_id(l))).cloned().collect();
-                    let after = added.iter().all(|l| last_old.is_none_or(|lo| (l.tx_index, l.log_index) > lo));
-                    if all_old_there && after && !added.is_empty() {
-                        if m.block == last {
-                            self.apply_late(m.block, added, ids);
-                        } else {
-                            // Later blocks are applied already: only the
-                            // pools these new reports touch become unsure.
-                            inc(&st.reorgs);
-                            let keys = self.pools_touched(&added);
-                            self.unsure_from(&keys, "late report for an older block", m.block);
-                            if let Some(r) = self.recent.iter_mut().find(|r| r.0 == m.block) {
-                                r.1 = ids;
-                            }
-                        }
-                        return;
-                    }
-                }
-                inc(&st.reorgs);
-                let mut keys = self.pools_touched(&m.logs);
-                if let Some(k) = known {
-                    keys.extend(k.2);
-                }
-                self.unsure_from(&keys, "reorg (block re-sent with other reports)", m.block);
                 return;
             }
         }
@@ -1178,7 +1219,7 @@ impl Intake {
                 self.touched_addr.insert(log.address, m.block);
                 self.apply_ready_event(&mut ov, k, log, &rctx);
             }
-            if self.apply_coin_transfer(&mut ov, log, m.block) {
+            if self.apply_coin_transfer(&mut ov, log, (m.block, log.tx_index, log.log_index), false) {
                 used = true;
             }
             if !used {
@@ -1235,67 +1276,119 @@ impl Intake {
         }
     }
 
-    /// Late reports for the newest block (same as before + new ones after
-    /// them): apply only the new ones, in order, and replace the newest
-    /// version with the result. Exact: nothing after them has been applied.
-    fn apply_late(&mut self, block: u64, added: Vec<PoolLog>, ids: Vec<LogId>) {
-        let Some(head) = self.sh.head() else { return };
-        let Some(bb) = self.buf.back() else { return };
-        if head.block != block || bb.block != block {
+    /// Reports for block `n` (already applied) that we may not have had.
+    fn on_late(&mut self, n: u64, logs: Vec<PoolLog>) {
+        let c2 = self.c2.clone();
+        let st = &c2.stats;
+        // What we had for block n.
+        let known: Option<HashSet<LogId>> = match self.recent.iter().find(|r| r.0 == n) {
+            Some(r) => Some(r.1.iter().copied().collect()),
+            None => self.buf.iter().find(|b| b.block == n).map(|b| b.logs.iter().map(log_id).collect()),
+        };
+        let rctx = self.buf.iter().find(|b| b.block == n).map(|b| b.rctx);
+        let (Some(known), Some(rctx)) = (known, rctx) else {
+            // Too old to place: the pools these reports touch are unsure.
+            let keys = self.pools_touched(&logs);
+            if !keys.is_empty() {
+                inc(&st.late_reports_unsure);
+                self.unsure_from(&keys, "late report for a block no longer kept", n);
+            }
+            return;
+        };
+        let mut added: Vec<PoolLog> = logs.into_iter().filter(|l| !known.contains(&log_id(l))).collect();
+        if added.is_empty() {
+            inc(&st.duplicate_blocks);
             return;
         }
-        let rctx = bb.rctx;
-        let mut added = added;
         added.sort_by_key(|l| (l.tx_index, l.log_index));
+        added.dedup_by_key(|l| log_id(l));
+        let Some(head) = self.sh.head() else { return };
         let mut ov = Overlay::from_arc(&head.snap);
-        ov.set_position(StatePosition { base_block: block, after_seq: None });
         let mut touched: Vec<PoolKey> = Vec::new();
         for log in &added {
+            let pos: Pos = (n, log.tx_index, log.log_index);
             for k in self.pool_keys_for(log) {
                 touched.push(k);
-                self.touched_addr.insert(log.address, block);
-                let (kind, ready) = {
+                let t = self.touched_addr.entry(log.address).or_insert(0);
+                *t = (*t).max(n);
+                let (kind, ready, gen, pool) = {
                     let reg = self.c2.reg.read().unwrap();
                     let e = &reg.pools[&k];
-                    (e.pool.kind, e.state == PoolState::Ready)
+                    (e.pool.kind, e.state == PoolState::Ready, e.gen, e.pool.clone())
                 };
-                if kind == PoolKind::Algebra && ready {
-                    // Its end-of-block step already ran: can't be exact.
-                    self.make_unsure(k, "late report after its end of block", Some(&mut ov), block);
-                } else if !ready {
-                    // A load already carried past this block would miss it.
-                    if self.partials.get(&k).is_some_and(|p| p.cursor.0 > block) {
-                        let gen = self.partials[&k].gen;
+                if !ready {
+                    // Not followed right now; a load that already carried
+                    // past this report would miss it: start that load over.
+                    if self.partials.get(&k).is_some_and(|p| p.cursor > pos) {
                         self.retry_later(k, gen, "late report while loading");
                     }
-                } else {
-                    self.apply_ready_event(&mut ov, k, log, &rctx);
+                    continue;
+                }
+                if self.last_pos.get(&k).is_some_and(|lp| *lp >= pos) || kind == PoolKind::Algebra {
+                    inc(&st.late_reports_unsure);
+                    self.make_unsure(k, "late report after a later one was applied", Some(&mut ov), n);
+                    continue;
+                }
+                let mut f = ov.fork();
+                match apply_event(&mut f, &pool, log, &rctx) {
+                    ApplyResult::Applied => {
+                        inc(&st.late_reports_applied);
+                        inc(&st.events_applied);
+                        self.keep_fork(&mut ov, &f, k);
+                        self.last_pos.insert(k, pos);
+                    }
+                    ApplyResult::Unsure(why) => {
+                        inc(&st.late_reports_unsure);
+                        self.make_unsure(k, &format!("late report: {why}"), Some(&mut ov), n);
+                    }
+                    ApplyResult::NeedItems(_) => {
+                        inc(&st.late_reports_unsure);
+                        self.make_unsure(k, "late report needs values we don't hold", Some(&mut ov), n);
+                    }
                 }
             }
-            self.apply_coin_transfer(&mut ov, log, block);
+            self.apply_coin_transfer(&mut ov, log, pos, true);
         }
-        inc(&self.c2.stats.late_reports_applied);
+        // Write the result into every kept version from block n on (the
+        // pools / balances it changed did not move after n, see above).
+        let changes = ov.changes().clone();
+        let forgot = ov.forgotten().to_vec();
+        {
+            let mut p = self.sh.published.write().unwrap();
+            rewrite_from(&mut p.versions, n, |snap| {
+                for (a, d) in &changes.accounts {
+                    if !d.storage.is_empty() {
+                        snap.apply_account_diff(*a, &crate::state::AccountDiff { storage: d.storage.clone(), ..Default::default() });
+                    }
+                }
+                for (a, sl) in &forgot {
+                    forget_slot(snap, *a, *sl);
+                }
+            });
+        }
         // The kept reports and the recent list learn the new ones.
-        if let Some(bb) = self.buf.back_mut() {
+        if let Some(bb) = self.buf.iter_mut().find(|b| b.block == n) {
             let mut v: Vec<PoolLog> = (*bb.logs).clone();
-            v.extend(added);
+            v.extend(added.iter().cloned());
             v.sort_by_key(|l| (l.tx_index, l.log_index));
             bb.logs = Arc::new(v);
         }
-        if let Some(r) = self.recent.iter_mut().find(|r| r.0 == block) {
-            r.1 = ids;
-            r.2.extend(touched);
-            r.2.sort();
-            r.2.dedup();
+        match self.recent.iter_mut().find(|r| r.0 == n) {
+            Some(r) => {
+                r.1.extend(added.iter().map(log_id));
+                r.1.sort();
+                r.2.extend(touched);
+                r.2.sort();
+                r.2.dedup();
+            }
+            None => {
+                let mut ids: Vec<LogId> = known.into_iter().chain(added.iter().map(log_id)).collect();
+                ids.sort();
+                touched.sort();
+                touched.dedup();
+                self.recent.push_back((n, ids, touched));
+            }
         }
-        let (snap, diff) = ov.into_parts();
-        let mut p = self.sh.published.write().unwrap();
-        let n = p.versions.len();
-        let h = p.versions[n - 1].clone();
-        let mut d = (*h.diff).clone();
-        crate::state::diff::merge(&mut d, &diff);
-        p.versions[n - 1] = Arc::new(Version { snap: Arc::new(snap), diff: Arc::new(d), applied: Instant::now(), ..(*h).clone() });
-        drop(p);
         self.sh.notify();
     }
 
@@ -1420,6 +1513,7 @@ impl Intake {
             ApplyResult::Applied => {
                 inc(&st.events_applied);
                 self.keep_fork(ov, &f, k);
+                self.last_pos.insert(k, (rctx.number, log.tx_index, log.log_index));
                 let mut reg = self.c2.reg.write().unwrap();
                 if let Some(e) = reg.pools.get_mut(&k) {
                     e.events += 1;
@@ -1441,35 +1535,47 @@ impl Intake {
     }
 
     /// A coin Transfer to / from one of our pools: move that pool's balance.
-    /// Returns true if the log was such a transfer.
-    fn apply_coin_transfer(&mut self, ov: &mut Overlay, log: &PoolLog, block: u64) -> bool {
+    /// Returns true if the log was such a transfer. `late`: the report is
+    /// for an already-applied block (see on_late): a balance that already
+    /// took a LATER transfer is forgotten instead (never a guess).
+    fn apply_coin_transfer(&mut self, ov: &mut Overlay, log: &PoolLog, pos: Pos, late: bool) -> bool {
         let Some((coin, from, to, v)) = coin_transfer(log) else { return false };
-        let (followed, layout) = {
+        let block = pos.0;
+        let (followed, layout, slots) = {
             let reg = self.c2.reg.read().unwrap();
             let Some(h) = reg.holders.get(&coin) else { return false };
             if !h.contains(&from) && !h.contains(&to) {
                 return false;
             }
-            (h.clone(), reg.layouts.get(&coin).copied().flatten())
+            let slots: HashMap<Address, U256> = h.iter().filter_map(|x| reg.bal_slot(coin, *x).map(|s| (*x, s))).collect();
+            (h.clone(), reg.layouts.get(&coin).copied().flatten(), slots)
         };
         inc(&self.c2.stats.coin_transfers);
         for side in [from, to] {
             if followed.contains(&side) {
-                self.touched_addr.insert(side, block);
+                let t = self.touched_addr.entry(side).or_insert(0);
+                *t = (*t).max(block);
             }
         }
-        // No known layout: the pools' balance slot isn't held, nothing to update.
-        let Some(layout) = layout else { return true };
         for (side, is_from) in [(from, true), (to, false)] {
             if side == Address::ZERO {
                 continue; // mint / burn of the coin: no balance slot
             }
-            let slot = layout.key(side);
-            self.touched_slot.insert((coin, slot), block);
             if followed.contains(&side) {
+                let Some(slot) = slots.get(&side).copied() else { continue };
+                let t = self.touched_slot.entry((coin, slot)).or_insert(0);
+                *t = (*t).max(block);
+                if late && self.coin_pos.get(&(coin, side)).is_some_and(|p| *p >= pos) {
+                    inc(&self.c2.stats.coin_slot_mismatch);
+                    ov.forget_slot(coin, slot);
+                    continue;
+                }
                 if let Lookup::Known(cur) = ov.slot(coin, slot) {
                     match if is_from { cur.checked_sub(v) } else { cur.checked_add(v) } {
-                        Some(x) => ov.set_slot(coin, slot, x),
+                        Some(x) => {
+                            ov.set_slot(coin, slot, x);
+                            self.coin_pos.insert((coin, side), pos);
+                        }
                         None => {
                             // Our copy of that balance was wrong: forget it
                             // (fetched again when needed). Never a guess.
@@ -1478,13 +1584,36 @@ impl Intake {
                         }
                     }
                 }
-            } else if matches!(ov.slot(coin, slot), Lookup::Known(_)) {
+            } else {
                 // A wallet / the bot's contract: its other transfers never
                 // reach us, so we don't vouch for its balance.
-                inc(&self.c2.stats.other_side_forgotten);
-                ov.forget_slot(coin, slot);
+                match layout {
+                    Some(l) => {
+                        let slot = l.key(side);
+                        let t = self.touched_slot.entry((coin, slot)).or_insert(0);
+                        *t = (*t).max(block);
+                        if matches!(ov.slot(coin, slot), Lookup::Known(_)) {
+                            inc(&self.c2.stats.other_side_forgotten);
+                            ov.forget_slot(coin, slot);
+                        }
+                    }
+                    None => {
+                        // We can't name its slot: forget every value of this
+                        // coin we hold except our pools' balances.
+                        let ours: HashSet<U256> = slots.values().copied().collect();
+                        let held: Vec<U256> =
+                            ov.snapshot().accounts.get(&coin).map(|a| a.storage.keys().copied().filter(|s| !ours.contains(s)).collect()).unwrap_or_default();
+                        for sl in held {
+                            let t = self.touched_slot.entry((coin, sl)).or_insert(0);
+                            *t = (*t).max(block);
+                            inc(&self.c2.stats.other_side_forgotten);
+                            ov.forget_slot(coin, sl);
+                        }
+                    }
+                }
             }
         }
+        // from == to: the pool's balance is unchanged (sub then add): fine.
         true
     }
 
@@ -1537,8 +1666,8 @@ impl Intake {
             for k in keys {
                 if let Some(e) = reg.pools.get(k) {
                     for c in [e.pool.token0, e.pool.token1] {
-                        if let Some(Some(l)) = reg.layouts.get(&c) {
-                            slots.push((c, l.key(e.pool.address)));
+                        if let Some(sl) = reg.bal_slot(c, e.pool.address) {
+                            slots.push((c, sl));
                         }
                     }
                 }
@@ -1603,7 +1732,7 @@ impl Intake {
             }
             return;
         }
-        let max_jobs = self.cfg.loaders * 2;
+        let max_jobs = self.cfg.loaders;
         if self.load_jobs_in_flight() >= max_jobs {
             return;
         }
@@ -1651,13 +1780,7 @@ impl Intake {
                 if coins.iter().any(|c| !layouts.contains_key(c)) {
                     continue; // still probing
                 }
-                if let Some(c) = coins.iter().find(|c| layouts[*c].is_none()) {
-                    self.outcomes.coin_not_found += 1;
-                    e.state = PoolState::Unsure;
-                    e.reason = format!("coin {c}: can't find where it keeps balances");
-                    e.retry_at = now + Duration::from_secs(self.cfg.layout_retry_s);
-                    continue;
-                }
+                // No general layout: the load finds this pool's slot by trace.
                 d.push((e.retry_at, *k));
             }
             d
@@ -1666,18 +1789,27 @@ impl Intake {
         let mut due = due.into_iter().map(|x| x.1).peekable();
         while due.peek().is_some() && self.load_jobs_in_flight() < max_jobs {
             let keys: Vec<PoolKey> = due.by_ref().take(self.cfg.load_batch).collect();
-            self.send_load(&keys, head.block);
+            self.send_load(&keys, head.block, &head.snap);
         }
     }
 
-    /// One load job for these pools at `block`.
-    fn send_load(&mut self, keys: &[PoolKey], block: u64) {
+    /// One load job for these pools at `block`: per pool its code, the slots
+    /// its swap reads (load_slots), what it held before, its coins' code and
+    /// its balance of each coin (or a trace to find where that balance is).
+    fn send_load(&mut self, keys: &[PoolKey], block: u64, head: &Snapshot) {
         let mut items: Vec<MissItem> = Vec::new();
         let mut calls: Vec<(Address, Bytes)> = Vec::new();
+        let mut traces: Vec<(Address, Bytes)> = Vec::new();
         let mut reqs = Vec::new();
+        let head_has_code = |a: &Address| head.accounts.get(a).is_some_and(|x| matches!(&x.basics, Basics::Known(Some(i)) if head.codes.contains_key(&i.code_hash) || i.code_hash == revm::primitives::KECCAK_EMPTY));
         {
             let mut reg = self.c2.reg.write().unwrap();
-            let layouts = reg.layouts.clone();
+            let bal: HashMap<(Address, Address), Option<U256>> = keys
+                .iter()
+                .filter_map(|k| reg.pools.get(k).map(|e| e.pool.clone()))
+                .flat_map(|p| [(p.token0, p.address), (p.token1, p.address)])
+                .map(|(c, h)| ((c, h), reg.bal_slot(c, h)))
+                .collect();
             for k in keys {
                 let Some(e) = reg.pools.get_mut(k) else { continue };
                 let p = e.pool.clone();
@@ -1688,37 +1820,43 @@ impl Intake {
                         items.push(m);
                     }
                 };
-                for s in core_slots(p.kind) {
-                    push(&mut items, MissItem::Slot(p.address, U256::from(*s)));
+                push(&mut items, MissItem::Account(p.address));
+                for (a, sl) in load_slots(&p) {
+                    push(&mut items, MissItem::Slot(a, sl));
                 }
-                if !e.verified {
-                    let tok: &[u64] = match p.kind {
-                        PoolKind::V2 => &[v2::TOKEN0, v2::TOKEN1],
-                        PoolKind::Solidly => &[sol::TOKEN1],
-                        _ => &[],
-                    };
-                    for s in tok {
-                        push(&mut items, MissItem::Slot(p.address, U256::from(*s)));
-                    }
-                }
-                for (a, s) in &e.items {
-                    push(&mut items, MissItem::Slot(*a, *s));
+                for (a, sl) in &e.items {
+                    push(&mut items, MissItem::Slot(*a, *sl));
                 }
                 for a in &e.accounts {
                     push(&mut items, MissItem::Account(*a));
                 }
                 let mut coin_checks = Vec::new();
+                let mut trace_checks = Vec::new();
                 for c in [p.token0, p.token1] {
                     if c == Address::ZERO {
                         continue;
                     }
-                    let Some(Some(l)) = layouts.get(&c) else { continue };
-                    let slot = l.key(p.address);
-                    let idx = items.len();
-                    push(&mut items, MissItem::Slot(c, slot));
-                    if !self.coin_ok.contains(&c) && items.len() > idx {
-                        coin_checks.push((c, slot, idx, calls.len()));
-                        calls.push((c, parse_bytes(&balance_of_data(p.address)).unwrap_or_default()));
+                    let bal_call = parse_bytes(&balance_of_data(p.address)).unwrap_or_default();
+                    match bal.get(&(c, p.address)).copied().flatten() {
+                        Some(slot) => {
+                            if !head_has_code(&c) {
+                                push(&mut items, MissItem::Account(c));
+                            }
+                            let idx = items.len();
+                            push(&mut items, MissItem::Slot(c, slot));
+                            if !self.coin_ok.contains(&c) && items.len() > idx {
+                                coin_checks.push((c, slot, idx, calls.len()));
+                                calls.push((c, bal_call));
+                            }
+                        }
+                        None => {
+                            // The trace also brings the coin's code and what
+                            // its balanceOf reads.
+                            inc(&self.c2.stats.coin_traces);
+                            trace_checks.push((c, traces.len(), calls.len()));
+                            traces.push((c, bal_call.clone()));
+                            calls.push((c, bal_call));
+                        }
                     }
                 }
                 let mut getters = Vec::new();
@@ -1737,7 +1875,7 @@ impl Intake {
                 e.state = PoolState::Loading;
                 e.reason = "loading: fetching from the node".into();
                 e.rounds = 1;
-                reqs.push(LoadReq { key: *k, gen: e.gen, items: (start, items.len()), getters, coin_checks });
+                reqs.push(LoadReq { key: *k, gen: e.gen, items: (start, items.len()), getters, coin_checks, trace_checks });
             }
         }
         if reqs.is_empty() {
@@ -1746,7 +1884,7 @@ impl Intake {
         add(&self.c2.stats.loads, reqs.len() as u64);
         let id = self.new_job(JobFor::Load { pools: reqs, want: block });
         // At most `block`: the loader uses an older block if the node isn't there yet.
-        self.loaders.as_ref().unwrap().send(Job::Fetch { id, block, exact: false, items, calls });
+        self.loaders.as_ref().unwrap().send(Job::Fetch { id, block, exact: false, bulk: true, items, calls, traces });
     }
 
     // ---- node answers ----
@@ -1846,9 +1984,14 @@ impl Intake {
             // A getter / balanceOf that came back with an error object is the
             // node's trouble, not a mismatch: ask again later.
             if err.is_none() {
-                for i in r.getters.iter().map(|g| g.1).chain(r.coin_checks.iter().map(|c| c.3)) {
+                for i in r.getters.iter().map(|g| g.1).chain(r.coin_checks.iter().map(|c| c.3)).chain(r.trace_checks.iter().map(|c| c.2)) {
                     if let Err(e) = &out.calls[i] {
                         err = Some((true, format!("node error on a check call: {e}")));
+                    }
+                }
+                for (_, ti, _) in &r.trace_checks {
+                    if let Err(e) = &out.traces[*ti] {
+                        err = Some((true, format!("node error on a balance trace: {e}")));
                     }
                 }
             }
@@ -1880,6 +2023,32 @@ impl Intake {
                     Ok(b) => coin_bad = Some((*c, format!("coin {c}: balance not readable from its storage (slot {held:?} vs balanceOf {b})"))),
                     Err(e) => coin_bad = Some((*c, format!("coin {c}: balanceOf failed ({e})"))),
                 }
+            }
+            // Coins without a known place: the one slot the trace shows
+            // holding exactly the balance (plus the coin's code and the
+            // other values its balanceOf read).
+            let mut trace_bad = None;
+            for (c, ti, ci) in &r.trace_checks {
+                let bal = out_word(&out.calls[*ci], 0).unwrap_or_default();
+                let tr = out.traces[*ti].as_ref().cloned().unwrap_or_default();
+                let (found, tfacts) = read_trace(&tr, *c, bal);
+                facts.extend(tfacts);
+                match found {
+                    Ok(slot) => {
+                        inc(&self.c2.stats.coin_trace_found);
+                        self.c2.reg.write().unwrap().pair_slots.insert((*c, pool.address), slot);
+                        facts.push(Fact::Slot(*c, slot, bal));
+                    }
+                    Err(n) => {
+                        inc(&self.c2.stats.coin_trace_not_found);
+                        trace_bad = Some(format!("coin {c}: can't find where it keeps this pool's balance ({n} storage values equal it)"));
+                    }
+                }
+            }
+            if let Some(why) = trace_bad {
+                self.outcomes.coin_not_found += 1;
+                self.make_unsure(r.key, &why, None, block + 1);
+                continue;
             }
             if let Some((c, why)) = coin_bad {
                 self.outcomes.mismatch += 1;
@@ -1972,7 +2141,7 @@ impl Intake {
         self.partials.insert(key, part);
         let id = self.new_job(JobFor::Need { key, gen, items: items.clone() });
         match &self.loaders {
-            Some(l) => l.send(Job::Fetch { id, block: at, exact: true, items, calls: vec![] }),
+            Some(l) => l.send(Job::Fetch { id, block: at, exact: true, bulk: false, items, calls: vec![], traces: vec![] }),
             None => {
                 self.jobs.remove(&id);
                 self.make_unsure(key, "no node configured to load it from", None, u64::MAX);
@@ -2006,13 +2175,13 @@ impl Intake {
                 }
             }
         }
-        let layouts = self.c2.reg.read().unwrap().layouts.clone();
-        for c in [pool.token0, pool.token1] {
-            if let Some(Some(l)) = layouts.get(&c) {
-                let s = l.key(pool.address);
-                if let Lookup::Known(v) = ov.slot(c, s) {
-                    part.learn(&Fact::Slot(c, s, v));
-                }
+        let bals: Vec<(Address, U256)> = {
+            let reg = self.c2.reg.read().unwrap();
+            [pool.token0, pool.token1].into_iter().filter_map(|c| reg.bal_slot(c, pool.address).map(|s| (c, s))).collect()
+        };
+        for (c, s) in bals {
+            if let Lookup::Known(v) = ov.slot(c, s) {
+                part.learn(&Fact::Slot(c, s, v));
             }
         }
         // The block copy no longer vouches for it.
@@ -2049,9 +2218,10 @@ impl Intake {
             self.retry_later(key, part.gen, "load took longer than the reports kept (ARBSIM_COPY2_KEEP_BLOCKS)");
             return;
         }
-        let layout = |c: Address| self.c2.reg.read().unwrap().layouts.get(&c).copied().flatten();
-        let coin_slots: Vec<(Address, U256)> =
-            [pool.token0, pool.token1].into_iter().filter(|c| *c != Address::ZERO).filter_map(|c| layout(c).map(|l| (c, l.key(pool.address)))).collect();
+        let coin_slots: Vec<(Address, U256)> = {
+            let reg = self.c2.reg.read().unwrap();
+            [pool.token0, pool.token1].into_iter().filter(|c| *c != Address::ZERO).filter_map(|c| reg.bal_slot(c, pool.address).map(|s| (c, s))).collect()
+        };
         let start = self.buf.partition_point(|b| b.block < part.cursor.0);
         let blocks: Vec<(u64, ReplayCtx, Arc<Vec<PoolLog>>)> = self.buf.iter().skip(start).map(|b| (b.block, b.rctx, b.logs.clone())).collect();
         for (block, rctx, logs) in blocks {
@@ -2121,38 +2291,40 @@ impl Intake {
     /// the head version and mark the pool READY.
     fn merge(&mut self, key: PoolKey, part: Partial) {
         let Some(head) = self.sh.head() else { return };
-        let (pool, holders, layouts) = {
+        let (pool, holders, old_owned, bal_slots) = {
             let reg = self.c2.reg.read().unwrap();
             let Some(e) = reg.pools.get(&key) else { return };
-            (e.pool.clone(), reg.holders.keys().copied().collect::<HashSet<Address>>(), reg.layouts.clone())
+            let bs: Vec<(Address, U256)> =
+                [e.pool.token0, e.pool.token1].into_iter().filter_map(|c| reg.bal_slot(c, e.pool.address).map(|s| (c, s))).collect();
+            (e.pool.clone(), reg.holders.keys().copied().collect::<HashSet<Address>>(), e.owned.clone(), bs)
         };
         let snap = part.ov.snapshot();
+        // Accounts the pool's own replays change (e.g. an Algebra plugin)
+        // are its own; other accounts (coins, a factory, an implementation)
+        // are shared: their values are put in, but not followed with it.
+        let mut owned: Vec<Address> = old_owned;
+        for a in part.ov.changes().accounts.keys() {
+            if *a != pool.address && !holders.contains(a) && !owned.contains(a) {
+                owned.push(*a);
+            }
+        }
         let mut facts: Vec<Fact> = Vec::new();
         let mut items: HashSet<(Address, U256)> = HashSet::new();
         let mut accounts: HashSet<Address> = HashSet::new();
-        let mut owned: Vec<Address> = Vec::new();
         for (addr, acct) in snap.accounts.iter() {
-            if holders.contains(addr) && *addr != pool.address {
-                // A coin: only this pool's balance.
-                if let Some(Some(l)) = layouts.get(addr) {
-                    let s = l.key(pool.address);
-                    if let Some(v) = acct.storage.get(&s) {
-                        facts.push(Fact::Slot(*addr, s, *v));
-                    }
-                }
-                continue;
-            }
+            let own = *addr == pool.address || owned.contains(addr);
             if let Basics::Known(info) = &acct.basics {
-                accounts.insert(*addr);
+                if own {
+                    accounts.insert(*addr);
+                }
                 let code = info.as_ref().and_then(|i| snap.codes.get(&i.code_hash).cloned());
                 facts.push(Fact::Basics { addr: *addr, info: info.clone(), code });
             }
             for (s, v) in acct.storage.iter() {
-                items.insert((*addr, *s));
+                if own {
+                    items.insert((*addr, *s));
+                }
                 facts.push(Fact::Slot(*addr, *s, *v));
-            }
-            if *addr != pool.address {
-                owned.push(*addr);
             }
         }
         // Write where the head doesn't know the value (values the head knows
@@ -2177,6 +2349,11 @@ impl Intake {
         inc(&self.c2.stats.merges);
         inc(&self.c2.stats.load_ok);
         self.outcomes.ready += 1;
+        // Everything up to the end of this block is in it now.
+        self.last_pos.insert(key, (head.block, END, END));
+        for (c, _) in &bal_slots {
+            self.coin_pos.insert((*c, pool.address), (head.block, END, END));
+        }
         let mut reg = self.c2.reg.write().unwrap();
         if let Some(e) = reg.pools.get_mut(&key) {
             e.state = PoolState::Ready;
@@ -2203,8 +2380,8 @@ impl Intake {
         if reg.by_addr.contains_key(&a) || reg.owner_of.contains_key(&a) {
             return Some(a);
         }
-        if let (Some(h), Some(Some(l))) = (reg.holders.get(&a), reg.layouts.get(&a)) {
-            return h.iter().find(|h| l.key(**h) == s).copied();
+        if let Some(h) = reg.holders.get(&a) {
+            return h.iter().find(|h| reg.bal_slot(a, **h) == Some(s)).copied();
         }
         None
     }
@@ -2236,7 +2413,7 @@ impl Intake {
         }
         inc(&self.c2.stats.fills);
         let id = self.new_job(JobFor::Fill);
-        self.loaders.as_ref().unwrap().send(Job::Fetch { id, block: head.block, exact: false, items: ok, calls: vec![] });
+        self.loaders.as_ref().unwrap().send(Job::Fetch { id, block: head.block, exact: false, bulk: false, items: ok, calls: vec![], traces: vec![] });
     }
 
     /// Fill answers: used only if nothing we follow touched them after k.
@@ -2280,7 +2457,13 @@ impl Intake {
                                 if let Some(e) = reg.pools.get_mut(&pk) {
                                     e.items.insert((*a, *s));
                                 }
+                                let lp = self.last_pos.entry(pk).or_insert((0, 0, 0));
+                                *lp = (*lp).max((k, END, END));
                             }
+                        } else {
+                            // A pool's coin balance.
+                            let cp = self.coin_pos.entry((*a, g)).or_insert((0, 0, 0));
+                            *cp = (*cp).max((k, END, END));
                         }
                     }
                 }
@@ -2369,6 +2552,91 @@ impl Intake {
             snap.evict(ma, ms, |_| 0, |x| keep.contains(x));
         });
     }
+}
+
+
+/// Slots a pool's swap reads besides what its events change (loaded with it),
+/// as (account, slot). Ticks / bitmap words / observations of replay pools
+/// are fetched when their replays or checks need them.
+fn load_slots(p: &TrackedPool) -> Vec<(Address, U256)> {
+    let a = p.address;
+    let n = |v: &[u64]| v.iter().map(|x| (a, U256::from(*x))).collect::<Vec<_>>();
+    match p.kind {
+        // totalSupply, token0/1, reserves, price totals, lock
+        PoolKind::V2 => n(&[0, 6, 7, 8, 9, 10, 12]),
+        // supply, stable|token0, token1, poolFees, factory, observations,
+        // decimals, reserves, time, totals, fee index
+        PoolKind::Solidly => n(&[2, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]),
+        // slot0, fee growth x2, protocol fees, liquidity
+        PoolKind::V3 => n(&[0, 1, 2, 3, 4]),
+        // slot0 (two slots), fee growth x2, protocol fees, liquidity
+        PoolKind::PancakeV3 => n(&[0, 1, 2, 3, 4, 5]),
+        // V4: _pools[id] (PoolManager slot 6): slot0, fee growth x2, liquidity
+        PoolKind::V4 => match p.v4_id {
+            Some(id) => {
+                let mut buf = [0u8; 64];
+                buf[..32].copy_from_slice(id.as_slice());
+                buf[63] = 6;
+                let base = U256::from_be_bytes(keccak256(buf).0);
+                (0..4u64).map(|i| (a, base + U256::from(i))).collect()
+            }
+            None => vec![],
+        },
+        PoolKind::Algebra => vec![],
+    }
+}
+
+/// The implementation a minimal proxy (EIP-1167 clone) forwards to.
+fn proxy_target(ov: &Overlay, a: Address) -> Option<Address> {
+    let Lookup::Known(Some(info)) = ov.account(a) else { return None };
+    let Lookup::Known(code) = ov.code_by_hash(info.code_hash) else { return None };
+    let b = code.original_byte_slice();
+    // 363d3d373d3d3d363d73 <20 bytes> 5af43d82803e903d91602b57fd5bf3
+    if b.len() == 45 && b[..10] == [0x36, 0x3d, 0x3d, 0x37, 0x3d, 0x3d, 0x3d, 0x36, 0x3d, 0x73] {
+        Some(Address::from_slice(&b[10..30]))
+    } else {
+        None
+    }
+}
+
+/// A prestate trace of coin.balanceOf(pool): Ok(the one slot of `coin`
+/// holding exactly `bal`) or Err(how many did), plus facts for every
+/// account / value the call read (code, the coin's settings), exact at the
+/// traced block.
+fn read_trace(tr: &Value, coin: Address, bal: U256) -> (Result<U256, usize>, Vec<Fact>) {
+    let mut facts = Vec::new();
+    let mut cands = Vec::new();
+    let Some(m) = tr.as_object() else { return (Err(0), facts) };
+    for (k, acct) in m {
+        let Ok(a) = parse_address(k) else { continue };
+        let bal_of = acct.get("balance").and_then(|x| x.as_str()).and_then(|x| parse_u256(x).ok()).unwrap_or_default();
+        let nonce = match acct.get("nonce") {
+            Some(Value::Number(n)) => n.as_u64().unwrap_or(0),
+            Some(Value::String(t)) => parse_u64(t).unwrap_or(0),
+            _ => 0,
+        };
+        let code = acct.get("code").and_then(|x| x.as_str()).and_then(|x| parse_bytes(x).ok()).unwrap_or_default();
+        let fa = crate::node::FetchedAccount { balance: bal_of, nonce, code };
+        let empty = fa.balance.is_zero() && fa.nonce == 0 && fa.code.is_empty();
+        let (info, code) = account_info(if empty { None } else { Some(&fa) });
+        facts.push(Fact::Basics { addr: a, info, code });
+        if let Some(st) = acct.get("storage").and_then(|x| x.as_object()) {
+            for (sk, sv) in st {
+                let (Ok(sk), Ok(sv)) = (parse_u256(sk), sv.as_str().map(parse_u256).unwrap_or(Err(String::new()))) else { continue };
+                if a == coin && sv == bal {
+                    cands.push(sk);
+                }
+                facts.push(Fact::Slot(a, sk, sv));
+            }
+        }
+    }
+    let found = if cands.len() == 1 { Ok(cands[0]) } else { Err(cands.len()) };
+    // The candidate itself is added by the caller (as the pool's balance);
+    // with no single candidate, no coin value is kept at all.
+    if found.is_err() {
+        facts.retain(|f| !matches!(f, Fact::Slot(x, _, _) if *x == coin));
+    }
+    (found, facts)
 }
 
 /// A report's identity: (tx index, log index, tx hash).
