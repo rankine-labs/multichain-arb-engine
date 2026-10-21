@@ -46,20 +46,26 @@ import type { RawLogTap } from '../core/blockReaderWs';
 //   {type:"track", pools:[{address, v4Id?, kind, token0, token1, fee, tickSpacing}]}
 //       (answer {ok:true}); sent when the list changes, on (re)connect and
 //       every 10 minutes.
-//   {type:"pool_logs", block, timestamp?, l1Block?, prevBlock, gap?, logs:[...]}
+//   {type:"pool_logs", block, timestamp, l1Block?, prevBlock, gap?, logs:[...]}
 //       one per block that has events on tracked pools, in block order.
-//       prevBlock = the block of the previous pool_logs this connection
-//       delivered (-1 = none): if the copy's last block differs, it missed
-//       one. gap:true = "something was missed (dropped message, WebSocket
-//       outage that could not be filled in): mark pools unsure and reload".
+//       prevBlock = the block of the previous message we delivered (-1 =
+//       none yet). The copy compares it with its own last block: different
+//       = it missed something and reloads every pool. After anything was
+//       missed on our side (dropped message, WebSocket outage that could not
+//       be filled in, a block whose time is unknown, a fresh start) we send
+//       prevBlock 0 (+ gap:true) on purpose, so the copy reloads.
 //       timestamp / l1Block come from the sequencer feed (header of that
-//       block's message) or from the log itself (blockTimestamp); missing =
-//       unknown (the copy must not guess it).
-//   {type:"pool_logs", block, late:true, logs}   events that arrived AFTER
-//       their block was already passed on (should be very rare): the copy
-//       should mark those pools unsure and reload them.
-//   {type:"pool_logs", block, reorg:true, logs}  the node took these events
-//       back (block replaced): same, mark those pools unsure and reload.
+//       block's message) or from the log itself (blockTimestamp). A block
+//       whose time is unknown is never sent with a guessed time: it is
+//       skipped and the copy reloads (above).
+//   {type:"block_tick", block, timestamp, l1Block?, prevBlock}  "block N had
+//       nothing for you": the newest block the feed announced, once it is
+//       COPY2_TICK_MS old and none of our pools had reports in it.
+//   {type:"pool_logs", block, timestamp, late:true | reorg:true, logs}
+//       reports that arrived AFTER their block was passed on, or that the
+//       node took back (block replaced). Always sent for an already-passed
+//       block, so the copy sees "this block changed" and reloads those
+//       pools (it never applies them as new). Should be very rare.
 //
 // Read only. No keys, no transactions. Never throws into the bot.
 // ============================================================================
@@ -218,9 +224,10 @@ export function coveredPools(pools: readonly Copy2Pool[], cov: Copy2Coverage): C
 export class FeedBlockTimes {
   private readonly times = new Map<number, { timestamp: number; l1Block: number }>();
   private newest = -1;
+  private newestAt = 0;      // when the newest block was first heard of (clock ms)
   noted = 0;
 
-  constructor(private readonly offset = 0, private readonly keep = 1024) {}
+  constructor(private readonly offset = 0, private readonly keep = 1024, private readonly now: () => number = Date.now) {}
 
   noteFrame(text: string): void {
     try {
@@ -255,7 +262,7 @@ export class FeedBlockTimes {
     if (parent) { timestamp = Math.max(timestamp, parent.timestamp); l1Block = Math.max(l1Block, parent.l1Block); }
     this.times.set(block, { timestamp, l1Block });
     this.noted++;
-    if (block > this.newest) this.newest = block;
+    if (block > this.newest) { this.newest = block; this.newestAt = this.now(); }
     if (this.times.size > this.keep) {
       // Forget the oldest ones (insertion order is close to block order).
       const cut = this.times.size - this.keep;
@@ -266,6 +273,8 @@ export class FeedBlockTimes {
 
   get(block: number): { timestamp: number; l1Block: number } | undefined { return this.times.get(block); }
   newestBlock(): number { return this.newest; }
+  // The newest block the feed told us about, and when (for "block_tick").
+  newestNote(): { block: number; at: number } | null { return this.newest >= 0 ? { block: this.newest, at: this.newestAt } : null; }
 }
 
 // ----------------------------------------------------------------------------
@@ -291,6 +300,11 @@ export type Copy2ForwarderOptions = {
   tsWaitMs?: number;      // wait at most this long for a block's time from the feed (default 40)
   maxBackfill?: number;   // most blocks filled in after an outage (default 200)
   maxPendingBlocks?: number; // safety cap on blocks held (default 64)
+  // block_tick: "block N had nothing for you". The newest block the feed
+  // announced, sent once it is tickDelayMs old and none of our pools had
+  // reports in it (so the copy's newest block stays current). 0 = no ticks.
+  tickDelayMs?: number;      // default 250
+  feedNewest?: () => { block: number; at: number } | null;
   now?: () => number;
   schedule?: (fn: () => void, ms: number) => () => void;
   log?: (m: string) => void;
@@ -342,8 +356,12 @@ export class Copy2Forwarder {
   private liveSince = 0;
   private txBlock = new Map<string, number>();
   private txWaiters = new Map<string, Array<(b: number) => void>>();
+  private sentTs = new Map<number, number>();   // block -> the time it was sent with (recent blocks)
+  private lastTs = 0;                           // newest block time sent
+  private cancelTicker: (() => void) | null = null;
+  private noTsLoggedAt = -Infinity;
 
-  readonly counts = { logsIn: 0, logsKept: 0, blocksSent: 0, msgsDropped: 0, late: 0, reorgLogs: 0, gaps: 0, backfills: 0, backfillFails: 0, backfillLogs: 0, noTimestamp: 0, forced: 0 };
+  readonly counts = { logsIn: 0, logsKept: 0, blocksSent: 0, ticks: 0, msgsDropped: 0, late: 0, reorgLogs: 0, gaps: 0, backfills: 0, backfillFails: 0, backfillLogs: 0, noTimestamp: 0, forced: 0 };
 
   constructor(o: Copy2ForwarderOptions) {
     this.o = o;
@@ -364,8 +382,36 @@ export class Copy2Forwarder {
     // Whatever the copy had before is no longer known to match: start with "gap".
     this.gapFlag = true;
     this.prevSent = -1;
-    if (!on) { this.backfillFrom = -1; }
-    else if (this.mode === 'live' || this.mode === 'backfilling') this.liveSince = this.now();
+    if (this.cancelTicker) { this.cancelTicker(); this.cancelTicker = null; }
+    if (!on) { this.backfillFrom = -1; return; }
+    if (this.mode === 'live' || this.mode === 'backfilling') this.liveSince = this.now();
+    this.startTicker();
+  }
+
+  // Every 100 ms: send a block_tick if the feed announced a newer block with
+  // nothing for us (see tickDelayMs).
+  private startTicker(): void {
+    const delay = this.o.tickDelayMs ?? 250;
+    if (delay <= 0 || !this.o.feedNewest) return;
+    const loop = () => {
+      this.cancelTicker = null;
+      if (!this.active) return;
+      try { this.maybeTick(delay); } catch { /* never throws */ }
+      this.cancelTicker = this.schedule(loop, 100);
+    };
+    this.cancelTicker = this.schedule(loop, 100);
+  }
+
+  private maybeTick(delay: number): void {
+    if (this.mode !== 'live' || this.pending.size > 0) return;
+    const f = this.o.feedNewest?.();
+    if (!f || f.block <= this.lastEmitted || f.block <= this.newestSeen) return;
+    if (this.now() - f.at < delay) return;
+    const t = this.o.blockTime?.(f.block);
+    if (!t) return;
+    const msg: Record<string, unknown> = { type: 'block_tick', block: f.block, timestamp: t.timestamp, prevBlock: this.gapFlag ? 0 : this.prevSent };
+    if (t.l1Block !== undefined) msg.l1Block = t.l1Block;
+    this.deliver(f.block, msg, t.timestamp, true);
   }
   isActive(): boolean { return this.active; }
 
@@ -414,6 +460,9 @@ export class Copy2Forwarder {
         if (l.removed) {
           this.counts.reorgLogs++;
           this.push(this.reorg, b, l);
+          // Not passed on yet: that block was replaced, forget what we held for it
+          // (its replacement's reports come again).
+          if (b > this.lastEmitted) this.pending.delete(b);
           continue;
         }
         this.noteTx(l.transactionHash, b);
@@ -510,16 +559,37 @@ export class Copy2Forwarder {
 
   private emit(b: number, p: Pending, time: { timestamp: number; l1Block?: number } | undefined): void {
     this.pending.delete(b);
+    this.lastEmitted = Math.max(this.lastEmitted, b);
+    if (!time) {
+      // The block's time is not known (feed silent, node gave none). The copy
+      // needs it to apply events exactly and must never guess it, so this
+      // block is NOT passed on; the next message makes the copy reload
+      // (prevBlock 0). Routing goes to the node meanwhile.
+      this.counts.noTimestamp++;
+      this.gapFlag = true;
+      if (this.now() - this.noTsLoggedAt > 60_000) { this.noTsLoggedAt = this.now(); this.log(`[copy2] block ${b}: its time is not known (sequencer feed quiet?), the copy reloads instead`); }
+      return;
+    }
     const logs = p.logs.slice().sort((x, y) => ((hexNum(x.transactionIndex) ?? 0) - (hexNum(y.transactionIndex) ?? 0)) || ((hexNum(x.logIndex) ?? 0) - (hexNum(y.logIndex) ?? 0)));
-    const msg: Record<string, unknown> = { type: 'pool_logs', block: b, prevBlock: this.prevSent, logs: logs.map(slim) };
-    if (time) { msg.timestamp = time.timestamp; if (time.l1Block !== undefined) msg.l1Block = time.l1Block; }
-    else this.counts.noTimestamp++;
+    // prevBlock: the block of our previous delivered message, so the copy can
+    // tell it missed one. After a gap it is 0 on purpose: never the copy's
+    // last block, so the copy reloads every pool instead of trusting it.
+    const msg: Record<string, unknown> = { type: 'pool_logs', block: b, timestamp: time.timestamp, prevBlock: this.gapFlag ? 0 : this.prevSent, logs: logs.map(slim) };
+    if (time.l1Block !== undefined) msg.l1Block = time.l1Block;
+    this.deliver(b, msg, time.timestamp, false);
+  }
+
+  // Hand a pool_logs / block_tick message over and keep the bookkeeping.
+  private deliver(b: number, msg: Record<string, unknown>, ts: number, tick: boolean): void {
     const gap = this.gapFlag;
     if (gap) msg.gap = true;
     this.lastEmitted = Math.max(this.lastEmitted, b);
     if (this.send(msg)) {
-      this.counts.blocksSent++;
+      if (tick) this.counts.ticks++; else this.counts.blocksSent++;
       this.prevSent = b;
+      this.lastTs = Math.max(this.lastTs, ts);
+      this.sentTs.set(b, ts);
+      if (this.sentTs.size > 512) this.sentTs.delete(this.sentTs.keys().next().value as number);
       if (gap) { this.gapFlag = false; this.gapSentAt = this.now(); this.counts.gaps++; }
     } else {
       this.counts.msgsDropped++;
@@ -527,8 +597,16 @@ export class Copy2Forwarder {
     }
   }
 
+  // Late or taken-back reports: sent for an ALREADY passed-on block, so the
+  // copy treats them as "this block changed" and reloads those pools (it
+  // never applies them as new). Before anything was passed on: nothing to say.
   private sendFlagged(b: number, logs: RpcLog[], flag: 'late' | 'reorg'): void {
-    if (!this.send({ type: 'pool_logs', block: b, [flag]: true, logs: logs.map(slim) })) { this.counts.msgsDropped++; this.gapFlag = true; }
+    const blk = Math.min(b, this.lastEmitted);
+    // A reload is already coming (gap): it covers these pools too.
+    if (blk < 0 || this.gapFlag) return;
+    const ts = this.sentTs.get(blk) ?? this.o.blockTime?.(blk)?.timestamp ?? this.lastTs;
+    if (!ts) return;
+    if (!this.send({ type: 'pool_logs', block: blk, timestamp: ts, [flag]: true, logs: logs.map(slim) })) { this.counts.msgsDropped++; this.gapFlag = true; }
   }
 
   private send(msg: Record<string, unknown>): boolean {
@@ -599,7 +677,8 @@ export class Copy2Forwarder {
   live(): boolean { return this.active && this.mode === 'live' && !this.gapFlag; }
   // When the copy was last told "gap" (a status taken before that is outdated).
   lastGapAt(): number { return this.gapSentAt; }
-  newestBlock(): number { return this.newestSeen; }
+  // Newest block the copy has (or is about to get): reports seen, or a tick sent.
+  newestBlock(): number { return Math.max(this.newestSeen, this.prevSent); }
   modeText(): string { return !this.active ? 'off' : this.mode === 'live' ? (this.gapFlag ? 'live (gap pending)' : 'live') : this.mode; }
 
   // The block a transaction's events came in (null = not seen).
@@ -666,13 +745,15 @@ export function parseCopy2Status(s: unknown): Copy2Status {
     if (!s || typeof s !== 'object') return out;
     const st = s as Record<string, any>;
     const c = st.copy2 && typeof st.copy2 === 'object' ? st.copy2 : null;
-    const src = String(st.source ?? c?.source ?? '').toLowerCase();
+    const src = String(c?.source ?? st.source ?? '').toLowerCase();
     out.active = src === 'pool-events' || (!!c && c.active !== false && src !== 'feed');
     if (!out.active) return out;
     const body = c ?? st;
     const states = new Map<string, Copy2PoolState>();
     let seen = false;
-    const pools = body.pools;
+    // arbsim (sim/src/copy2/intake.rs status_json): `pools` is a count and the
+    // per-pool list is `list` ([{address, v4Id, kind, state, reason}]).
+    const pools = Array.isArray(body.list) ? body.list : body.pools;
     if (Array.isArray(pools)) {
       seen = true;
       for (const p of pools) {
@@ -698,7 +779,7 @@ export function parseCopy2Status(s: unknown): Copy2Status {
       out.counts = n;
     } else {
       const num = (k: string) => (Number.isFinite(Number(body[k])) ? Number(body[k]) : 0);
-      const n = { ready: num('ready'), loading: num('loading'), unsure: num('unsure'), tracked: num('tracked') };
+      const n = { ready: num('ready'), loading: num('loading'), unsure: num('unsure'), tracked: num('tracked') || num('pools') };
       if (n.ready || n.loading || n.unsure || n.tracked) out.counts = { ...n, tracked: n.tracked || n.ready + n.loading + n.unsure };
     }
   } catch { /* unreadable status: treated as "not running" */ }
@@ -728,6 +809,8 @@ export function parseCopy2Status(s: unknown): Copy2Status {
 //   COPY2_STATUS_MS          2000  how often readiness is asked
 //   COPY2_MAX_STATUS_AGE_MS  10000 older readiness = not trusted (node decides)
 //   COPY2_BACKFILL_MAX       200   most blocks filled in after an outage
+//   COPY2_TICK_MS            250   "nothing for you in block N" sent once the
+//                                  feed's block N is this old (0 = never)
 //   ARBSIM_L2_BLOCK_OFFSET   0     block number = feed sequence number + this
 // ============================================================================
 export type Copy2Settings = {
@@ -738,6 +821,7 @@ export type Copy2Settings = {
   statusEveryMs: number;
   maxStatusAgeMs: number;
   maxBackfill: number;
+  tickDelayMs: number;
   l2Offset: number;
 };
 
@@ -752,6 +836,7 @@ export function copy2Settings(env: Record<string, string | undefined> = process.
     statusEveryMs: num('COPY2_STATUS_MS', 2_000, 200),
     maxStatusAgeMs: num('COPY2_MAX_STATUS_AGE_MS', 10_000, 500),
     maxBackfill: num('COPY2_BACKFILL_MAX', 200, 1),
+    tickDelayMs: num('COPY2_TICK_MS', 250),
     l2Offset: num('ARBSIM_L2_BLOCK_OFFSET', 0),
   };
 }
@@ -804,7 +889,7 @@ export class Copy2Link {
     this.o = o;
     this.now = o.now ?? Date.now;
     const s = o.settings;
-    this.times = new FeedBlockTimes(s.l2Offset);
+    this.times = new FeedBlockTimes(s.l2Offset, 1024, this.now);
     this.forwarder = new Copy2Forwarder({
       send: (m) => o.client.sendOneWay(m),
       index: () => this.index,
@@ -813,6 +898,8 @@ export class Copy2Link {
       holdMs: s.holdMs,
       tsWaitMs: s.tsWaitMs,
       maxBackfill: s.maxBackfill,
+      tickDelayMs: s.tickDelayMs,
+      feedNewest: () => this.times.newestNote(),
       now: this.now,
       schedule: o.schedule,
       log: (m) => this.log(m),

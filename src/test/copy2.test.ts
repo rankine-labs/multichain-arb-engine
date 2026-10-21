@@ -148,7 +148,7 @@ async function forwarderTests() {
   const ID = '0x' + 'cd'.repeat(32), ID2 = '0x' + 'ee'.repeat(32);
   const index: Copy2Index = { pools: new Set([P1, P2]), ids: new Set([ID]), poolManager: PM, coins: new Set([WETH, USDG]) };
   const times = new FeedBlockTimes(0);
-  for (let b = 10; b <= 12; b++) times.set(b, 1_760_000_000 + b, 23_000_000);
+  for (const b of [10, 11, 12, 15, 16, 17, 18, 19]) times.set(b, 1_760_000_000 + b, 23_000_000);
   const { f, sent, setOk } = makeForwarder(index, times);
 
   f.onLogs([L(P1, [SYNC_TOPIC], 10, 0, 0)]);
@@ -174,7 +174,7 @@ async function forwarderTests() {
   advance(2);
   assert(sent.length === 1 && sent[0].type === 'pool_logs' && sent[0].block === 10, 'block passed on after a short quiet time');
   const m0 = sent[0];
-  assert(m0.gap === true && m0.prevBlock === -1, 'first message says gap (start / reload), prevBlock -1');
+  assert(m0.gap === true && m0.prevBlock === 0, 'first message says gap with prevBlock 0 (the copy reloads anything it had)');
   assert(m0.timestamp === 1_760_000_010 && m0.l1Block === 23_000_000, 'block time and L1 block from the feed');
   const idxs = m0.logs.map((l: any) => Number(l.logIndex));
   assert(JSON.stringify(idxs) === JSON.stringify([1, 4, 5, 7, 8]), `only our pools' logs, once each, in transaction then log order (got ${idxs})`);
@@ -187,32 +187,34 @@ async function forwarderTests() {
   advance(4);
   assert(sent.length === 3 && sent[2].block === 12, 'block 12 after its quiet time');
 
-  // Block 13 without a known time: waits up to tsWaitMs, then goes without.
+  // Block 13 without a known time: waits up to tsWaitMs, then is NOT sent (never a guessed time).
   f.onLogs([L(P2, [SYNC_TOPIC], 13, 0, 0)]);
   advance(10);
   assert(sent.length === 3, 'block without a known time waits for the feed');
   advance(40);
-  assert(sent.length === 4 && sent[3].block === 13 && sent[3].timestamp === undefined && f.counts.noTimestamp === 1, 'after tsWaitMs: sent without a time (never guessed), counted');
+  assert(sent.length === 3 && f.counts.noTimestamp === 1 && !f.live(), 'after tsWaitMs: block skipped (time never guessed), counted, routing stops');
   // Time from the log itself (blockTimestamp) is used when the feed has none.
   f.onLogs([L(P2, [SYNC_TOPIC], 14, 0, 0, undefined, { blockTimestamp: q(1_760_000_014) })]);
   advance(5);
-  assert(sent[4].block === 14 && sent[4].timestamp === 1_760_000_014, 'block time from the log (blockTimestamp) when present');
+  assert(sent[3].block === 14 && sent[3].timestamp === 1_760_000_014, 'block time from the log (blockTimestamp) when present');
+  assert(sent[3].prevBlock === 0 && sent[3].gap === true && f.live(), 'after a skipped block the copy is told to reload (prevBlock 0); flowing again');
 
-  // A dropped message: the next one says gap.
+  // A dropped message: the next one makes the copy reload.
   setOk(false);
   f.onLogs([L(P1, [SYNC_TOPIC], 15, 0, 0)]); advance(50);
   assert(f.counts.msgsDropped === 1 && !f.live(), 'socket busy: message dropped and counted, routing stops');
   setOk(true);
   f.onLogs([L(P1, [SYNC_TOPIC], 16, 0, 0)]); advance(50);
   const m16 = sent[sent.length - 1];
-  assert(m16.block === 16 && m16.gap === true && m16.prevBlock === 14, 'after a drop the next message says gap (prevBlock = last delivered)');
-  assert(f.live(), 'gap delivered: flowing again');
+  assert(m16.block === 16 && m16.gap === true && m16.prevBlock === 0, 'after a drop the next message has prevBlock 0 (copy reloads)');
+  assert(f.live(), 'reload message delivered: flowing again');
 
   // Late and taken-back reports.
   f.onLogs([L(P1, [SYNC_TOPIC], 12, 3, 9)]); advance(0);
-  assert(sent[sent.length - 1].late === true && sent[sent.length - 1].block === 12, 'a report for an already-passed block is sent flagged late');
+  const late = sent[sent.length - 1];
+  assert(late.late === true && late.block === 12 && late.timestamp === 1_760_000_012, 'a report for an already-passed block is sent flagged late, with that block\'s time');
   f.onLogs([L(P1, [SYNC_TOPIC], 16, 0, 0, undefined, { removed: true })]); advance(0);
-  assert(sent[sent.length - 1].reorg === true && sent[sent.length - 1].logs[0].removed === true, 'a report the node took back is sent flagged reorg');
+  assert(sent[sent.length - 1].reorg === true && sent[sent.length - 1].block === 16 && sent[sent.length - 1].logs[0].removed === true, 'a report the node took back is sent flagged reorg');
 
   // Waiting for a transaction's reports.
   assert(f.txBlockOf('0x' + 'b1'.repeat(32)) === 11, 'transaction -> block remembered');
@@ -225,6 +227,41 @@ async function forwarderTests() {
   advance(101);
   assert((await never) === null, 'waitForTx: null after the time limit');
   advance(10);
+  // A block taken back before it was passed on: dropped, the copy told about the last passed block.
+  const before = sent.length;
+  f.onLogs([L(P2, [SYNC_TOPIC], 19, 0, 0)]);
+  f.onLogs([L(P2, [SYNC_TOPIC], 19, 0, 0, undefined, { removed: true })]);
+  advance(10);
+  const after = sent.slice(before);
+  assert(after.length === 1 && after[0].reorg === true && after[0].block === 17 && !after.some((m) => m.block === 19 && !m.reorg), 'taken back before passing on: block 19 never sent as new; reorg note for the last passed block');
+}
+
+async function tickTests() {
+  const index: Copy2Index = { pools: new Set([P1]), ids: new Set<string>(), poolManager: PM, coins: new Set([WETH]) };
+  const times = new FeedBlockTimes(0, 1024, () => clock);
+  const sent: any[] = [];
+  const f = new Copy2Forwarder({
+    send: (m) => { sent.push(JSON.parse(JSON.stringify(m))); return true; },
+    index: () => index, blockTime: (b) => times.get(b), holdMs: 4, tsWaitMs: 40, tickDelayMs: 250,
+    feedNewest: () => times.newestNote(), now: () => clock, schedule,
+  });
+  f.onLive(); f.setActive(true);
+  times.set(30, 1_760_000_030, 7);
+  advance(100);
+  assert(sent.length === 0, 'block_tick waits until the feed\'s block is COPY2_TICK_MS old');
+  advance(200);
+  assert(sent.length === 1 && sent[0].type === 'block_tick' && sent[0].block === 30 && sent[0].timestamp === 1_760_000_030 && sent[0].l1Block === 7 && sent[0].prevBlock === 0, 'block_tick for a quiet block (first message: prevBlock 0)');
+  advance(300);
+  assert(sent.length === 1, 'no second tick for the same block');
+  times.set(31, 1_760_000_031, 7);
+  f.onLogs([L(P1, [SYNC_TOPIC], 31, 0, 0)]);
+  advance(5);
+  assert(sent.length === 2 && sent[1].type === 'pool_logs' && sent[1].prevBlock === 30, 'next pool_logs chains on the tick');
+  advance(400);
+  assert(sent.length === 2, 'a block that had reports gets no tick');
+  assert(f.newestBlock() === 31, 'newest block for routing');
+  f.setActive(false);
+  advance(1000);
 }
 
 async function backfillTests() {
@@ -284,6 +321,16 @@ function statusTests() {
   assert(b.active && b.states?.get('0x' + 'cd'.repeat(32)) === 'ready' && b.states?.get(P1) === 'unsure', 'status list: V4 keyed by pool id');
   const c = parseCopy2Status({ ok: true, source: 'pool-events', ready: [P1], unsure: [P2] });
   assert(c.states?.get(P1) === 'ready' && c.states?.get(P2) === 'unsure', 'status lists: ready / unsure arrays');
+  // The exact shape arbsim sends (sim/src/copy2/intake.rs status_json, asked with pools:true).
+  const idA = '0x' + 'ab'.repeat(32);
+  const e = parseCopy2Status({ ok: true, ready: true, copy2: { source: 'pool-events', pools: 3, loading: 1, ready: 1, unsure: 1, lastBlock: 99, list: [
+    { address: P1, v4Id: null, kind: 'v2', state: 'ready', reason: null, events: 4 },
+    { address: PM, v4Id: idA, kind: 'v4', state: 'loading', reason: 'new', events: 0 },
+    { address: P2, v4Id: null, kind: 'v3', state: 'unsure', reason: 'replay mismatch', events: 9 },
+  ] } });
+  assert(e.active && e.states?.get(P1) === 'ready' && e.states?.get(idA) === 'loading' && e.states?.get(P2) === 'unsure' && e.counts?.tracked === 3, 'arbsim status shape: copy2.list read, V4 by id');
+  const e2 = parseCopy2Status({ ok: true, copy2: { source: 'pool-events', pools: 7, loading: 2, ready: 4, unsure: 1 } });
+  assert(e2.active && e2.states === null && e2.counts?.tracked === 7 && e2.counts?.ready === 4, 'arbsim status without the list: counts only');
   const d = parseCopy2Status({ ok: true, source: 'pool-events', copy2: { ready: 5, unsure: 1, loading: 2 } });
   assert(d.states === null && d.counts?.tracked === 8, 'status numbers only: counts, but no per-pool readiness (routing stays on the node)');
 }
@@ -328,6 +375,7 @@ async function linkTests() {
   assert(v4 && v4.address === PM && v4.v4Id === id && v4.fee === 3000 && v4.tickSpacing === 60 && v4.token0 === WETH, 'track: V4 entry carries PoolManager, id, fee, tick spacing, coins');
   assert(link.notReadyWhy([P1]) === 'pool reports not flowing', 'track accepted but nothing passed on yet (gap pending): node decides');
   // First block passes (with gap), then a fresh status says ready.
+  link.times.set(40, 1_760_000_040, 1);
   link.tap.onLogs([L(P1, [SYNC_TOPIC], 40, 0, 0), L(PM, [V4_SWAP_TOPIC, id], 40, 1, 1)]);
   advance(50);
   assert(client.oneWay.length === 1 && client.oneWay[0].block === 40 && client.oneWay[0].gap === true, 'pool_logs passed to the fast check (first with gap)');
@@ -501,6 +549,7 @@ async function main() {
   feedTimesTests();
   await forwarderTests();
   await backfillTests();
+  await tickTests();
   statusTests();
   await linkTests();
   wsTapTests();
