@@ -24,6 +24,8 @@ use revm::primitives::{Address, Bytes, B256, U256};
 
 use crate::state::MissItem;
 
+// V2 / Solidly: write the numbers the events state (workstream A).
+pub mod fields;
 // Working copy the events are applied to (workstream A; B runs revm on it).
 pub mod overlay;
 // Replay of V3 / PancakeV3 / Algebra / V4 events (workstream B; placeholder
