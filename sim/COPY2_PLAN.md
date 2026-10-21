@@ -225,6 +225,25 @@ trade ~20 ms.
   - Expected live at ARBSIM_NODE_RPS=25: copy 2 sends <= 20 calls/s; loading
     gets 15-20/s -> 800 pools (~13 calls each) in ~9-12 min. 5 min is not
     possible at 25/s: 800 x 13 calls need >= 7 min at the FULL rate.
+- Dry run #8 (simpler loading with eth_getProof):
+  - Every job (load, catch-up, fill) asks ONE eth_getProof per account with
+    all its slots (balance, nonce, code hash + values come back together);
+    eth_getCode once per code hash (cached). V2 pool ~2 requests instead of
+    ~14; coins' balance slots for many pools come in one proof per coin. If
+    the node doesn't know eth_getProof, one request per value as before.
+  - Fills: one job at a time, <= ARBSIM_COPY2_FILL_RPS (10) requests/s,
+    grouped per account; values of pools still loading are refused (the
+    load brings them).
+  - node.rs: a request that would queue more than ARBSIM_NODE_MAX_QUEUE_MS
+    (2000) is refused (not sent, counted as throttled), so no batch lines up
+    20 s of work.
+  - First 5 node errors per job kind are logged ("copy2 node error #n (kind:
+    method/item: message)") and shown in status copy2.loader.firstErrors /
+    errorsByKind (and by deploy/arbsim-status.js).
+  - Soak (40x time): 800/800 ready at 128 simulated s, 2,555 node calls in
+    total incl. fills (947 eth_getProof), 0 x 429, worst second 86 % of the
+    limit. Expected live at ARBSIM_NODE_RPS=100 (copy 2 at 80/s): ~1,700
+    load requests -> roughly 30-60 s for 800 pools.
 - Status: `status` -> `copy2` {pools, loading, ready, unsure, lastBlock,
   unsureReasons, counters}; with {"pools": true} also `list` of {address,
   v4Id, kind, state, reason, events}. Checks touching a pool that isn't

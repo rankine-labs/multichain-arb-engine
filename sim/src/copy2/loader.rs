@@ -33,6 +33,15 @@
 //   sent (a refusal by our own limiter is not a node request).
 //   Bulk work (loads, traces, probes) never falls back to the public node.
 //
+//   ONE REQUEST PER ACCOUNT (dry run #8): every value a job needs is grouped
+//   by account into one eth_getProof(account, [slots], block). Its answer
+//   has the account's balance, nonce, code hash AND the storage values.
+//   Contract code is fetched with eth_getCode once per code hash, then
+//   kept (most pools share their code). A V2 pool costs ~2 requests instead
+//   of ~14. If the node doesn't know eth_getProof, the old way (one request
+//   per value) is used instead.
+//   The first 5 errors of each kind are logged (job, method, message).
+//
 //   Which block: the bot's websocket reports run a few blocks AHEAD of what
 //   the node answers over HTTP. Loads, fills, probes and traces are fetched
 //   at min(wanted block, node's newest block); the intake carries values
@@ -53,7 +62,11 @@ use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use revm::primitives::{Address, Bytes, U256};
+use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::AtomicBool;
+use std::sync::OnceLock;
+
+use revm::primitives::{keccak256, Address, Bytes, B256, KECCAK_EMPTY, U256};
 use serde_json::{json, Value};
 
 use super::coins::{balance_of_data, probe_layout, BalanceLayout};
@@ -111,6 +124,8 @@ pub struct LoaderStats {
     states: Mutex<Vec<(String, Instant)>>,
     /// When a job last finished.
     last_done: Mutex<Option<Instant>>,
+    /// Errors seen per kind, and the first few messages (status + log).
+    errors: Mutex<(HashMap<String, u64>, Vec<String>)>,
     pace: Mutex<Option<Pace>>,
 }
 
@@ -126,6 +141,24 @@ impl LoaderStats {
     /// Seconds since a job last finished (None = none finished yet).
     pub fn since_last_done(&self) -> Option<Duration> {
         self.last_done.lock().unwrap().map(|t| t.elapsed())
+    }
+
+    /// Note a node error of a job kind; the first 5 per kind are logged.
+    pub fn note_error(&self, kind: &str, what: &str) {
+        let mut g = self.errors.lock().unwrap();
+        let n = {
+            let c = g.0.entry(kind.to_string()).or_insert(0);
+            *c += 1;
+            *c
+        };
+        if n <= 5 {
+            let line: String = format!("{kind}: {what}").chars().take(300).collect();
+            eprintln!("[arbsim] copy2 node error #{n} ({line})");
+            g.1.push(line);
+            if g.1.len() > 30 {
+                g.1.remove(0);
+            }
+        }
     }
 
     /// Busy threads: "thread N: what (for S s)".
@@ -192,6 +225,8 @@ impl LoaderStats {
         let states = self.thread_states();
         json!({
             "busyThreads": states,
+            "errorsByKind": self.errors.lock().unwrap().0.clone(),
+            "firstErrors": self.errors.lock().unwrap().1.clone(),
             "secondsSinceLastAnswer": self.since_last_done().map(|d| d.as_secs()),
             "threads": self.threads.load(Ordering::Relaxed),
             "busy": self.busy.load(Ordering::Relaxed),
@@ -460,6 +495,7 @@ fn run(q: Arc<Queue>, env: Env, trace_lane: bool, me: usize) {
         let s0 = counter.sent.load(Ordering::Relaxed);
         let (kind, done) = one(&env, job);
         let used = counter.sent.load(Ordering::Relaxed) - s0;
+        report_errors(&env.stats, kind, &done);
         env.requests.fetch_add(used, Ordering::Relaxed);
         q.settle(charged, used);
         env.stats.note(kind, used, t0.elapsed().as_millis() as u64);
@@ -499,6 +535,29 @@ impl NodeApi for Counting {
     }
     fn usage(&self) -> Value {
         self.inner.usage()
+    }
+}
+
+/// Log what went wrong in a job (first 5 per kind, see LoaderStats).
+fn report_errors(stats: &LoaderStats, kind: &str, d: &Done) {
+    match d {
+        Done::Fetch { res: Err(e), .. } | Done::Probe { res: Err(e), .. } | Done::Tip { res: Err(e), .. } | Done::Trace { res: Err(e), .. } => {
+            if !e.to_string().contains(crate::node::SPEED_LIMIT) {
+                stats.note_error(kind, &e.to_string());
+            }
+        }
+        Done::Fetch { res: Ok(o), .. } => {
+            if let Some((it, e)) = o.items.iter().find_map(|(it, r)| match r {
+                Err(ItemErr::Other(m)) => Some((it, m.clone())),
+                _ => None,
+            }) {
+                stats.note_error(kind, &format!("item {it:?}: {e}"));
+            }
+            if let Some(Err(e)) = o.calls.iter().find(|c| c.is_err()) {
+                stats.note_error(kind, &format!("eth_call: {e}"));
+            }
+        }
+        _ => {}
     }
 }
 
@@ -567,15 +626,28 @@ fn one(env: &Env, job: Job) -> (&'static str, Done) {
 }
 
 fn count_calls(items: &[MissItem], calls: &[(Address, Bytes)]) -> u64 {
-    let i: u64 = items
-        .iter()
-        .map(|m| match m {
-            MissItem::Slot(..) => 1,
-            MissItem::Account(_) => 3,
-            MissItem::Code(_) => 0,
-        })
-        .sum();
-    i + calls.len() as u64
+    if NO_PROOF.load(Ordering::Relaxed) {
+        let i: u64 = items
+            .iter()
+            .map(|m| match m {
+                MissItem::Slot(..) => 1,
+                MissItem::Account(_) => 3,
+                MissItem::Code(_) => 0,
+            })
+            .sum();
+        return i + calls.len() as u64;
+    }
+    let mut per: HashMap<Address, u64> = HashMap::new();
+    for m in items {
+        match m {
+            MissItem::Slot(a, _) => *per.entry(*a).or_insert(0) += 1,
+            MissItem::Account(a) => {
+                per.entry(*a).or_insert(0);
+            }
+            MissItem::Code(_) => {}
+        }
+    }
+    per.values().map(|n| n.div_ceil(PROOF_SLOTS).max(1)).sum::<u64>() + calls.len() as u64
 }
 
 /// balanceOf(holder) + its prestate trace, one batch at `block`.
@@ -606,8 +678,190 @@ fn trace_balance(node: &dyn NodeApi, block: u64, coin: Address, holder: Address)
     }
 }
 
-/// One batch at `block`: slots, account basics (3 calls each) and eth_calls.
+/// Most storage keys asked in one eth_getProof.
+const PROOF_SLOTS: u64 = 100;
+/// Set when the node doesn't know eth_getProof: the plain way from then on.
+static NO_PROOF: AtomicBool = AtomicBool::new(false);
+
+/// Contract code by hash, shared by all loader threads (capped).
+fn code_cache() -> &'static Mutex<HashMap<B256, Bytes>> {
+    static C: OnceLock<Mutex<HashMap<B256, Bytes>>> = OnceLock::new();
+    C.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// One job's values at `block`: eth_getProof per account (see file header),
+/// eth_getCode for code we haven't seen, plus the eth_calls.
 pub fn fetch(node: &dyn NodeApi, class: Class, block: u64, items: &[MissItem], calls: &[(Address, Bytes)]) -> Result<FetchOut, NodeErr> {
+    if !NO_PROOF.load(Ordering::Relaxed) {
+        match fetch_proof(node, class, block, items, calls) {
+            Err(NodeErr::BadResponse(m)) if m.starts_with("eth_getProof unsupported") => {
+                eprintln!("[arbsim] copy2: the node doesn't support eth_getProof ({m}); using one request per value");
+                NO_PROOF.store(true, Ordering::Relaxed);
+            }
+            r => return r,
+        }
+    }
+    fetch_plain(node, class, block, items, calls)
+}
+
+fn fetch_proof(node: &dyn NodeApi, class: Class, block: u64, items: &[MissItem], calls: &[(Address, Bytes)]) -> Result<FetchOut, NodeErr> {
+    let t = tag(block);
+    // Group by account: (slots asked, in order).
+    let mut by: BTreeMap<Address, Vec<U256>> = BTreeMap::new();
+    for m in items {
+        match m {
+            MissItem::Slot(a, s) => {
+                let v = by.entry(*a).or_default();
+                if !v.contains(s) {
+                    v.push(*s);
+                }
+            }
+            MissItem::Account(a) => {
+                by.entry(*a).or_default();
+            }
+            MissItem::Code(_) => {}
+        }
+    }
+    let mut rpc: Vec<(&str, Value)> = Vec::new();
+    // (account, slots in this request)
+    let mut asked: Vec<(Address, Vec<U256>)> = Vec::new();
+    for (a, slots) in &by {
+        let chunks: Vec<Vec<U256>> = if slots.is_empty() { vec![vec![]] } else { slots.chunks(PROOF_SLOTS as usize).map(|c| c.to_vec()).collect() };
+        for c in chunks {
+            let keys: Vec<String> = c.iter().map(|s| format!("{s:#066x}")).collect();
+            rpc.push(("eth_getProof", json!([to_hex(a.as_slice()), keys, t])));
+            asked.push((*a, c));
+        }
+    }
+    let call_at = rpc.len();
+    for (to, data) in calls {
+        rpc.push(("eth_call", json!([{ "to": to_hex(to.as_slice()), "data": to_hex(data) }, t])));
+    }
+    let res = if rpc.is_empty() { Vec::new() } else { node.call_batch_paid(class, &rpc)? };
+    if res.len() != rpc.len() {
+        return Err(NodeErr::BadResponse(format!("{} answers for {} calls", res.len(), rpc.len())));
+    }
+    // Per account: basics (balance, nonce, code hash) and slot values.
+    type Basics = (U256, u64, B256);
+    let mut basics: HashMap<Address, Result<Basics, ItemErr>> = HashMap::new();
+    let mut slots: HashMap<(Address, U256), Result<U256, ItemErr>> = HashMap::new();
+    for ((a, keys), r) in asked.iter().zip(res[..call_at].iter()) {
+        let parsed = (|| -> Result<(Basics, Vec<U256>), ItemErr> {
+            let v = match r {
+                Ok(Value::Null) => return Err(ItemErr::BlockUnavailable),
+                Ok(v) => v,
+                Err(e) if e.is_block_unavailable() => return Err(ItemErr::BlockUnavailable),
+                Err(e) => return Err(ItemErr::Other(format!("eth_getProof: {}", e.message))),
+            };
+            let txt = |k: &str| v.get(k).and_then(|x| x.as_str()).ok_or(ItemErr::Other(format!("eth_getProof: no {k}")));
+            let bal = parse_u256(txt("balance")?).map_err(ItemErr::Other)?;
+            let nonce = parse_u64(txt("nonce")?).map_err(ItemErr::Other)?;
+            let ch = parse_u256(txt("codeHash")?).map_err(ItemErr::Other)?;
+            let sp = v.get("storageProof").and_then(|x| x.as_array()).ok_or(ItemErr::Other("eth_getProof: no storageProof".into()))?;
+            if sp.len() != keys.len() {
+                return Err(ItemErr::Other(format!("eth_getProof: {} values for {} keys", sp.len(), keys.len())));
+            }
+            let mut vals = Vec::with_capacity(keys.len());
+            for e in sp {
+                let val = e.get("value").and_then(|x| x.as_str()).ok_or(ItemErr::Other("eth_getProof: value missing".into()))?;
+                vals.push(parse_u256(val).map_err(ItemErr::Other)?);
+            }
+            Ok(((bal, nonce, B256::from(ch.to_be_bytes::<32>())), vals))
+        })();
+        match parsed {
+            Ok((b, vals)) => {
+                basics.insert(*a, Ok(b));
+                for (k, v) in keys.iter().zip(vals) {
+                    slots.insert((*a, *k), Ok(v));
+                }
+            }
+            Err(e) => {
+                // A node that doesn't know the method at all: plain way.
+                if let ItemErr::Other(m) = &e {
+                    let l = m.to_ascii_lowercase();
+                    if l.contains("method not found") || l.contains("not supported") || l.contains("does not exist") || l.contains("not available") && l.contains("method") {
+                        return Err(NodeErr::BadResponse(format!("eth_getProof unsupported: {m}")));
+                    }
+                }
+                basics.insert(*a, Err(e.clone()));
+                for k in keys {
+                    slots.insert((*a, *k), Err(e.clone()));
+                }
+            }
+        }
+    }
+    // Code for accounts asked as accounts, by hash (cached).
+    let mut need_code: Vec<(Address, B256)> = Vec::new();
+    for m in items {
+        if let MissItem::Account(a) = m {
+            if let Some(Ok((_, _, h))) = basics.get(a) {
+                if *h != KECCAK_EMPTY && !h.is_zero() && !code_cache().lock().unwrap().contains_key(h) && !need_code.iter().any(|x| x.1 == *h) {
+                    need_code.push((*a, *h));
+                }
+            }
+        }
+    }
+    if !need_code.is_empty() {
+        let rpc: Vec<(&str, Value)> = need_code.iter().map(|(a, _)| ("eth_getCode", json!([to_hex(a.as_slice()), tag(block)]))).collect();
+        let res = node.call_batch_paid(class, &rpc)?;
+        for ((a, h), r) in need_code.iter().zip(res) {
+            match r {
+                Ok(Value::String(sx)) => {
+                    let code = parse_bytes(&sx).map_err(NodeErr::BadResponse)?;
+                    if keccak256(&code) == *h {
+                        let mut c = code_cache().lock().unwrap();
+                        if c.len() > 5000 {
+                            c.clear();
+                        }
+                        c.insert(*h, code);
+                    } else {
+                        basics.insert(*a, Err(ItemErr::Other("eth_getCode: code doesn't match the account's code hash".into())));
+                    }
+                }
+                Ok(_) => {
+                    basics.insert(*a, Err(ItemErr::BlockUnavailable));
+                }
+                Err(e) => {
+                    basics.insert(*a, Err(ItemErr::Other(format!("eth_getCode: {}", e.message))));
+                }
+            }
+        }
+    }
+    let mut out = Vec::with_capacity(items.len());
+    for it in items {
+        let r = match it {
+            MissItem::Slot(a, sl) => slots.get(&(*a, *sl)).cloned().unwrap_or(Err(ItemErr::Unsupported)).map(|v| Fetched::Slot(*a, *sl, v)),
+            MissItem::Account(a) => match basics.get(a).cloned().unwrap_or(Err(ItemErr::Unsupported)) {
+                Ok((bal, nonce, h)) => {
+                    let no_code = h == KECCAK_EMPTY || h.is_zero();
+                    let code = if no_code { Some(Bytes::new()) } else { code_cache().lock().unwrap().get(&h).cloned() };
+                    match code {
+                        Some(code) => {
+                            let empty = bal.is_zero() && nonce == 0 && code.is_empty();
+                            Ok(Fetched::Account(*a, if empty { None } else { Some(FetchedAccount { balance: bal, nonce, code }) }))
+                        }
+                        None => Err(ItemErr::Other("code not fetched".into())),
+                    }
+                }
+                Err(e) => Err(e),
+            },
+            MissItem::Code(_) => Err(ItemErr::Unsupported),
+        };
+        out.push((it.clone(), r));
+    }
+    let calls_out = res[call_at..]
+        .iter()
+        .map(|r| match r {
+            Ok(Value::String(s)) => parse_bytes(s),
+            Ok(_) => Err("node has no answer for that block yet".into()),
+            Err(e) => Err(format!("node error: {}", e.message)),
+        })
+        .collect();
+    Ok(FetchOut { items: out, calls: calls_out })
+}
+
+/// The old way: one request per slot, 3 per account, plus the eth_calls.
+fn fetch_plain(node: &dyn NodeApi, class: Class, block: u64, items: &[MissItem], calls: &[(Address, Bytes)]) -> Result<FetchOut, NodeErr> {
     let t = tag(block);
     let mut rpc: Vec<(&str, Value)> = Vec::new();
     let mut at: Vec<Option<usize>> = Vec::with_capacity(items.len());

@@ -175,6 +175,9 @@ async function main() {
       const kinds = Object.entries(ld.byKind || {}).map(([k, v]) => `${k} ${v.avgMsLastMin ?? v.avgMs ?? '?'} ms`).join(', ');
       lines.push(`    node loaders: ${n(ld.busy)} of ${n(ld.threads)} busy, ${ld.requestsPerSecLastMin} node requests/s (last min); ` +
         `waiting: ${n(q.urgent)} urgent, ${n(q.bulk)} bulk, ${n(q.trace)} traces; answer times: ${kinds || '-'}`);
+      if (Array.isArray(ld.firstErrors) && ld.firstErrors.length) {
+        lines.push(`    first node errors: ${ld.firstErrors.slice(-5).join(' | ')}`);
+      }
       const wm = (s.node && s.node.waitMs) || {};
       lines.push(`    last node answer ${ld.secondsSinceLastAnswer ?? '?'} s ago` +
         (ld.secondsSinceLastAnswer > 30 ? '  <-- STUCK? see "copy2 WATCHDOG" in pm2 logs arbsim' : '') +

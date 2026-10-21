@@ -167,6 +167,10 @@ pub struct Budget {
     pub burst: f64,
     file: Option<String>,
     inner: Mutex<BudgetInner>,
+    /// Longest queue a request may join [ARBSIM_NODE_MAX_QUEUE_MS, 2000];
+    /// beyond it the request is refused (caller tries later), so no batch can
+    /// line up minutes of work.
+    pub max_queue: Duration,
 }
 
 struct BudgetInner {
@@ -218,7 +222,8 @@ impl Budget {
                 }
             }
         }
-        Budget { cap, rps: rps.max(0.1), burst: rps.max(1.0), file, inner: Mutex::new(b) }
+        let max_queue = Duration::from_millis(env_u64("ARBSIM_NODE_MAX_QUEUE_MS", 2000).max(100));
+        Budget { cap, rps: rps.max(0.1), burst: rps.max(1.0), file, inner: Mutex::new(b), max_queue }
     }
 
     /// From env: ARBSIM_NODE_DAILY_CAP (6000), ARBSIM_NODE_RPS (8),
@@ -238,7 +243,7 @@ impl Budget {
     ///   starve anybody (before, a steady stream of urgent requests kept the
     ///   limit "in debt" and copy 2's loads never got a turn; and waits were
     ///   cut at 10 s, so a crowd of callers could go faster than the limit).
-    ///   A request that would have to wait more than 30 s is refused instead
+    ///   A request that would have to wait more than max_queue is refused instead
     ///   (the caller tries another node or later), so queues can't pile up.
     ///   Refuses too when today's allowance share is used up.
     pub fn take(&self, class: Class, n: u64) -> Result<(), NodeErr> {
@@ -273,10 +278,15 @@ impl Budget {
             let start = b.vt[0].max(now);
             let after = start + Duration::from_secs_f64(n as f64 / rate);
             let wait = start.saturating_duration_since(now);
-            if wait > Duration::from_secs(30) {
+            if wait > self.max_queue {
                 // Not sent and not the daily allowance: counted apart.
                 b.throttled += n;
-                return Err(NodeErr::Budget(format!("{SPEED_LIMIT}: {} requests already waiting over 30 s ({})", class.name(), if lane == 1 { "bulk lane" } else { "main lane" })));
+                return Err(NodeErr::Budget(format!(
+                    "{SPEED_LIMIT}: {} requests would wait {} ms (> {} ms queue)",
+                    class.name(),
+                    wait.as_millis(),
+                    self.max_queue.as_millis()
+                )));
             }
             b.vt[0] = after;
             b.vt[1] = after;

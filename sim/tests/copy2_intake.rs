@@ -51,6 +51,8 @@ struct FakeChain {
     /// the probe can't find them; only a trace can.
     namespaced: Mutex<Vec<Address>>,
     traces: Mutex<u32>,
+    /// eth_getProof requests seen.
+    proofs: Mutex<u32>,
 }
 
 /// Balance slot of a holder in a namespaced coin.
@@ -113,8 +115,27 @@ impl NodeApi for FakeChain {
                 match *m {
                     "eth_blockNumber" => Ok(json!(format!("{:#x}", *self.tip.lock().unwrap()))),
                     "eth_getBlockByNumber" => Ok(Value::Null),
-                    "eth_getStorageAt" | "eth_call" if blk(if *m == "eth_call" { 1 } else { 2 }) > *self.tip.lock().unwrap() => {
+                    "eth_getStorageAt" | "eth_call" | "eth_getProof" if blk(if *m == "eth_call" { 1 } else { 2 }) > *self.tip.lock().unwrap() => {
                         Err(RpcErr { code: -32000, message: "header not found".into() })
+                    }
+                    "eth_getProof" => {
+                        // Like Nitro: balance, nonce, code hash + storage values in order.
+                        *self.proofs.lock().unwrap() += 1;
+                        let acct = parse_address(p[0].as_str().unwrap()).unwrap();
+                        let st = self.at(blk(2));
+                        let exists = st.contains_key(&acct);
+                        let code_hash = if exists { keccak256([0u8]) } else { revm::primitives::KECCAK_EMPTY };
+                        let sp: Vec<Value> = p[1]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .map(|k| {
+                                let key = parse_u256(k.as_str().unwrap()).unwrap();
+                                json!({"key": k, "value": format!("{:#x}", self.sload(blk(2), acct, key)), "proof": []})
+                            })
+                            .collect();
+                        Ok(json!({"address": format!("{acct:#x}"), "balance": "0x0", "nonce": if exists { "0x1" } else { "0x0" },
+                                  "codeHash": format!("{code_hash}"), "storageHash": format!("{:#066x}", 0), "accountProof": [], "storageProof": sp}))
                     }
                     "eth_getStorageAt" => {
                         let acct = parse_address(p[0].as_str().unwrap()).unwrap();
@@ -1133,7 +1154,7 @@ impl NodeApi for PlanNode {
 #[test]
 fn soak_800_pools_at_the_plan_limit_with_checks_asking_twice_the_limit() {
     // Time runs 40x fast: 25 calls/s -> 1,000; 300 ms answers -> 7.5 ms;
-    // 15 simulated minutes -> 22.5 s.
+    // 5 simulated minutes -> 7.5 s.
     use std::sync::atomic::Ordering::Relaxed;
     use std::time::{Duration, Instant};
     const X: f64 = 40.0;
@@ -1174,7 +1195,7 @@ fn soak_800_pools_at_the_plan_limit_with_checks_asking_twice_the_limit() {
     // As in production: 80 % of the plan rate, urgent at most 25 % while loading waits.
     let pace = arbsim::copy2::loader::Pace { rate: limit as f64 * 0.8, urgent_share: 0.25 };
     // Reports kept: production's 2,400 blocks (~10 min at 4 blocks/s).
-    let cfg = C2Config { loaders: 16, trace_loaders: 6, load_batch: 25, pace, reload_ms: 1000, keep_blocks: 2400, max_keep_blocks: 40_000, ..C2Config::for_tests() };
+    let cfg = C2Config { loaders: 16, trace_loaders: 6, load_batch: 25, pace, reload_ms: 1000, keep_blocks: 2400, max_keep_blocks: 40_000, fill_rps: 10.0 * X, ..C2Config::for_tests() };
     let h = arbsim::copy2::intake::spawn(sh.clone(), Arc::new(FillQueue::new(1_000_000, 100)), cfg);
     assert_eq!(h.track_json(&json!(1), &json!({"pools": pj}))["tracked"], json!(n as u64));
     let t0 = Instant::now();
@@ -1182,7 +1203,9 @@ fn soak_800_pools_at_the_plan_limit_with_checks_asking_twice_the_limit() {
     let mut worst_rate = 0f64;
     let (mut last_sent, mut last_t) = (0u64, Instant::now());
     let mut ready = 0;
-    while t0.elapsed() < Duration::from_secs_f64(15.0 * 60.0 / X) {
+    let mut all_ready_at: Option<f64> = None;
+    // 5 simulated minutes (eth_getProof: ~2 requests per pool).
+    while t0.elapsed() < Duration::from_secs_f64(5.0 * 60.0 / X) {
         // A block every 250 ms of chain time; checks miss 2x the plan limit.
         let mut m = tick(b, 1000 + b);
         m.prev_block = if b > 100 { Some(b - 1) } else { None };
@@ -1201,18 +1224,21 @@ fn soak_800_pools_at_the_plan_limit_with_checks_asking_twice_the_limit() {
         if b % 20 == 0 {
             ready = h.status_json(false)["ready"].as_u64().unwrap();
             if ready == n as u64 {
+                all_ready_at = Some(t0.elapsed().as_secs_f64());
                 break;
             }
         }
     }
     let st = h.status_json(false);
     eprintln!(
-        "soak: {ready}/{n} ready after {:.1} simulated min; node calls {} (copy 2 counted {}), rejected 429 {}, worst 1-s window {} (limit {limit}), worst rate {worst_rate:.0}/s; loader {}",
+        "soak: {ready}/{n} ready after {:.1} simulated min (all ready at {:?} simulated s); node calls {} (copy 2 counted {}), rejected 429 {}, worst 1-s window {} (limit {limit}), worst rate {worst_rate:.0}/s; getProof {}; loader {}",
         t0.elapsed().as_secs_f64() * X / 60.0,
+        all_ready_at.map(|t| (t * X) as u64),
         node.sent.load(Relaxed),
         st["nodeRequests"],
         node.rejected.load(Relaxed),
         node.worst_second.load(Relaxed),
+        chain.proofs.lock().unwrap(),
         st["loader"]
     );
     // Never over the plan's limit, no retry storm, nearly everything ready.

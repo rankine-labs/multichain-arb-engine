@@ -665,6 +665,8 @@ pub struct C2Config {
     pub trace_loaders: usize,
     /// Copy 2's own pacing of node calls (loader.rs).
     pub pace: Pace,
+    /// Fill requests per second at most [ARBSIM_COPY2_FILL_RPS, 10].
+    pub fill_rps: f64,
     /// Blocks of reports always kept for carrying loads forward
     /// [ARBSIM_COPY2_KEEP_BLOCKS, 2400 = ~10 min]; older ones are kept as
     /// long as a running load still needs them, up to
@@ -687,6 +689,7 @@ impl C2Config {
             loaders: env_u64("ARBSIM_COPY2_LOADERS", 16).clamp(1, 64) as usize,
             trace_loaders: env_u64("ARBSIM_COPY2_TRACE_LOADERS", 6).clamp(1, 64) as usize,
             pace: Pace::from_env(),
+            fill_rps: env_u64("ARBSIM_COPY2_FILL_RPS", 10).max(1) as f64,
             keep_blocks: env_u64("ARBSIM_COPY2_KEEP_BLOCKS", 2400).clamp(16, 100_000) as usize,
             max_keep_blocks: env_u64("ARBSIM_COPY2_MAX_KEEP_BLOCKS", 40_000).clamp(16, 1_000_000) as usize,
             max_rounds: env_u64("ARBSIM_COPY2_MAX_ROUNDS", 40).clamp(1, 1000) as u32,
@@ -694,7 +697,7 @@ impl C2Config {
         }
     }
     pub fn for_tests() -> Self {
-        C2Config { reload_ms: 0, reload_max_ms: 0, layout_retry_s: 3600, load_batch: 25, loaders: 2, trace_loaders: 2, pace: Pace { rate: 1_000_000.0, urgent_share: 0.25 }, keep_blocks: 400, max_keep_blocks: 4000, max_rounds: 40, tip_every_s: 0 }
+        C2Config { reload_ms: 0, reload_max_ms: 0, layout_retry_s: 3600, load_batch: 25, loaders: 2, trace_loaders: 2, pace: Pace { rate: 1_000_000.0, urgent_share: 0.25 }, fill_rps: 1_000_000.0, keep_blocks: 400, max_keep_blocks: 4000, max_rounds: 40, tip_every_s: 0 }
     }
 }
 
@@ -791,6 +794,8 @@ pub struct Intake {
     trace_failed: HashMap<(Address, Address), (Instant, String)>,
     unsure_logged: u64,
     last_watchdog: Option<Instant>,
+    /// No new fill job before this (fill rate cap).
+    fill_next_at: Instant,
     started: Instant,
     /// Load answers waiting to be digested, one pool at a time.
     load_q: VecDeque<(LoadReq, Arc<FetchOut>, u64)>,
@@ -863,6 +868,7 @@ pub fn manual(sh: Arc<Shared>, fills: Arc<FillQueue>, cfg: C2Config) -> (Intake,
         unsure_logged: 0,
         load_q: VecDeque::new(),
         last_watchdog: None,
+        fill_next_at: Instant::now(),
         started: Instant::now(),
         buf: VecDeque::new(),
         partials: HashMap::new(),
@@ -1781,7 +1787,7 @@ impl Intake {
         }
         // Bulk work in flight at most ~2 s of copy 2's call budget (pools then
         // finish steadily instead of in late lumps), at least 2 jobs.
-        let per_job_calls = ((self.cfg.pace.rate * 2.0 / 14.0) as usize).clamp(1, self.cfg.load_batch) as f64 * 14.0;
+        let per_job_calls = ((self.cfg.pace.rate * 2.0 / 3.0) as usize).clamp(1, self.cfg.load_batch) as f64 * 3.0;
         let max_jobs = ((self.cfg.pace.rate * 2.0 / per_job_calls).ceil() as usize).clamp(2.min(self.cfg.loaders), self.cfg.loaders);
         if self.load_jobs_in_flight() >= max_jobs {
             return;
@@ -1877,9 +1883,9 @@ impl Intake {
         }
         due.sort();
         let mut due = due.into_iter().map(|x| x.2).peekable();
-        // Small jobs (~2 s of copy 2's call budget, ~14 calls per pool) keep
+        // Small jobs (~2 s of copy 2's call budget, ~3 requests per pool) keep
         // the pacing smooth; never more than load_batch pools.
-        let per_job = ((self.cfg.pace.rate * 2.0 / 14.0) as usize).clamp(1, self.cfg.load_batch);
+        let per_job = ((self.cfg.pace.rate * 2.0 / 3.0) as usize).clamp(1, self.cfg.load_batch);
         while due.peek().is_some() && self.load_jobs_in_flight() < max_jobs {
             let keys: Vec<PoolKey> = due.by_ref().take(per_job).collect();
             self.send_load(&keys, head.block, &head.snap);
@@ -2589,9 +2595,10 @@ impl Intake {
 
     /// Send items checks missed to the loaders (fetched at the head block).
     fn dispatch_fills(&mut self) {
-        // One fill job at a time, at most 100 values: fills share the main
-        // lane of the speed limit with catch-up fetches (see node.rs Budget).
-        if self.loaders.is_none() || self.jobs.values().any(|j| matches!(j, JobFor::Fill)) {
+        // One fill job at a time, at most 100 values (grouped into one
+        // eth_getProof per account), and at most ARBSIM_COPY2_FILL_RPS (10)
+        // requests a second: fills never crowd out loading.
+        if self.loaders.is_none() || self.jobs.values().any(|j| matches!(j, JobFor::Fill)) || Instant::now() < self.fill_next_at {
             return;
         }
         let items = self.fills.take(100);
@@ -2615,6 +2622,11 @@ impl Intake {
             return;
         }
         inc(&self.c2.stats.fills);
+        let accounts: HashSet<Address> = ok.iter().filter_map(|m| match m {
+            MissItem::Account(a) | MissItem::Slot(a, _) => Some(*a),
+            MissItem::Code(_) => None,
+        }).collect();
+        self.fill_next_at = Instant::now() + Duration::from_secs_f64(accounts.len() as f64 / self.cfg.fill_rps.max(0.1));
         let id = self.new_job(JobFor::Fill);
         self.loaders.as_ref().unwrap().send(Job::Fetch { id, block: head.block, exact: false, bulk: false, items: ok, calls: vec![] });
     }
