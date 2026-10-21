@@ -112,8 +112,24 @@ async function learnCoin(t: string) {
 
 // --- our route from the rival's route ---------------------------------------
 type Built = { ok: true; token: string; hops: ExecutorHop[]; firstIn: bigint } | { ok: false; why: string };
+// The route's coins and amounts read straight from the swap reports in the
+// receipt (the arbitrage reader leaves them blank when it can't follow the
+// coin transfers): for each swap, the coin the pool received went IN.
+function fillHopsFromLogs(rec: ArbRecord, logs: any[]) {
+  const legs: { pool: string; tin: string; tout: string; ain: bigint; aout: bigint }[] = [];
+  for (const l of logs) {
+    const s = decodeSwapLog(l); const cc = s && coinsOf(s.pool);
+    if (!s || !cc || s.a0 === undefined || s.a1 === undefined || s.a0 === 0n || s.a1 === 0n) continue;
+    const in0 = s.a0 > 0n;
+    legs.push({ pool: lc(s.pool), tin: asWeth(in0 ? cc.c0 : cc.c1), tout: asWeth(in0 ? cc.c1 : cc.c0), ain: in0 ? s.a0 : s.a1, aout: -(in0 ? s.a1 : s.a0) });
+  }
+  // Only when every hop of the route is one of these swaps, in the same order.
+  if (legs.length !== rec.hops.length || legs.some((g, i) => g.pool !== lc(rec.hops[i].pool))) return;
+  legs.forEach((g, i) => { const h = rec.hops[i]; h.tin ??= g.tin; h.tout ??= g.tout; h.ain ??= g.ain.toString(); h.aout ??= g.aout.toString(); });
+}
 function ourRoute(rec: ArbRecord): Built {
   if (!rec.hops.length || rec.hops.length < 2) return { ok: false, why: 'fewer than 2 hops' };
+  if (rec.hops.some((h) => !pools.has(lc(h.pool)))) return { ok: false, why: 'pool not on our watch list' };
   const hops: ExecutorHop[] = [];
   for (const h of rec.hops) {
     if (!h.tin || !h.tout) return { ok: false, why: 'route coins unreadable' };
@@ -154,6 +170,7 @@ async function main() {
       { hash: a.hash, block, txIndex, gasWei: g.gasWei, l1GasUsed: g.l1GasUsed, value: BigInt(tx.result.value ?? 0) },
       { weth: WETH, poolManager: RH_POOL_MANAGER, v4Currencies: (id) => coinsOf(id) });
     if (!c.arb) continue;
+    fillHopsFromLogs(c.arb, rc.result.logs);
     recs.set(a.hash, { rec: c.arb, rc: rc.result });
     for (const l of rc.result.logs) {
       const s = decodeSwapLog(l); const cc = s && coinsOf(s.pool);
