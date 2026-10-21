@@ -297,7 +297,7 @@ export interface Copy2Status {
 export function readCopy2Status(s: any): Copy2Status {
   const c = s?.copy2 ?? s?.poolEvents ?? s ?? {};
   const n = (...vs: unknown[]) => { for (const v of vs) { const x = typeof v === 'number' ? v : num(v); if (x !== null && Number.isFinite(x)) return x; } return null; };
-  const block = n(c.block, c.head?.block, c.headBlock, c.appliedBlock, c.copyBlock, s?.copy2Block);
+  const block = n(c.lastBlock, c.block, c.head?.block, c.headBlock, c.appliedBlock, c.copyBlock, s?.copy2Block);
   let ready: Set<string> | null = null, unsure: Set<string> | null = null, loading: Set<string> | null = null;
   const put = (key: string, state: string) => {
     const st = lc(state);
@@ -307,7 +307,9 @@ export function readCopy2Status(s: any): Copy2Status {
     else if (st === 'loading') (loading ??= new Set()).add(k);
   };
   const keyOf = (e: any) => e?.v4Id ?? e?.v4_id ?? e?.id ?? e?.pool ?? e?.address;
-  const pools = c.pools ?? c.perPool;
+  // arbsim (copy2/intake.rs status_json): `pools` is a COUNT; the per-pool
+  // list is `list` (only when asked with {pools:true}).
+  const pools = Array.isArray(c.list) ? c.list : typeof c.pools === 'number' ? undefined : c.pools ?? c.perPool;
   if (Array.isArray(pools)) {
     for (const e of pools) { const k = keyOf(e); const st = e?.state ?? e?.status; if (typeof k === 'string' && typeof st === 'string') put(k, st); }
   } else if (pools && typeof pools === 'object') {

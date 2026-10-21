@@ -128,6 +128,10 @@ function testStatus() {
   assert(s1.counts.ready === 1 && s1.counts.unsure === 1 && s1.eventsApplied === 9 && s1.nodeUsedToday === 50 && s1.publicUsedToday === 7, 'status: counts + node use');
   const s2 = readCopy2Status({ copy2: { head: { block: '0x10' }, pools: { [P_V3.toUpperCase()]: 'ready', [P_V2]: { state: 'unsure' } }, ready: 1, unsure: 1 } });
   assert(s2.block === 16 && s2.ready!.has(P_V3) && s2.unsure!.has(P_V2), 'status: per-pool map, any letter case');
+  // The real arbsim shape (copy2/intake.rs status_json): pools = COUNT, list = per pool, lastBlock.
+  const s5 = readCopy2Status({ copy2: { source: 'pool-events', pools: 3, loading: 1, ready: 1, unsure: 1, lastBlock: 94558674,
+    list: [{ address: P_V3, v4Id: null, kind: 'V3', state: 'ready' }, { address: RH_POOL_MANAGER, v4Id: V4_ID, kind: 'V4', state: 'unsure', reason: 'x' }, { address: P_V2, v4Id: null, state: 'loading' }] } });
+  assert(s5.block === 94558674 && !!s5.ready?.has(P_V3.toLowerCase()) && !!s5.unsure?.has(V4_ID.toLowerCase()) && !!s5.loading?.has(P_V2.toLowerCase()), 'real arbsim status: lastBlock + list read');
   const s3 = readCopy2Status({ copy2: { readyPools: [P_CAKE], unsurePools: [] } });
   assert(s3.ready!.has(P_CAKE) && s3.unsure!.size === 0, 'status: ready/unsure lists');
   const s4 = readCopy2Status({ ok: true, head: { block: 5 } });

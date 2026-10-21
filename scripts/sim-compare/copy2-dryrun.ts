@@ -155,7 +155,7 @@ const calls = new ArbsimClient(SOCKET, 30_000);   // questions (call / status / 
 const feed = new ArbsimClient(SOCKET, 1_500);     // one connection for the block messages, so their order is kept
 
 async function arbsimStatus(): Promise<Copy2Status | null> {
-  try { const s = await calls.request({ type: 'status' }); const st = readCopy2Status(s); score.arbsimStatus(st); return st; } catch { return null; }
+  try { const s = await calls.request({ type: 'status', pools: true }); const st = readCopy2Status(s); score.arbsimStatus(st); return st; } catch { return null; }
 }
 
 async function sendTrack(): Promise<void> {
@@ -419,7 +419,7 @@ async function main() {
       if (JSON.stringify([...f.pools.values()].map((x) => x.track)) !== before) { followed = f; score.tracked = f.pools.size; score.notFollowed = f.notFollowed; void sendTrack(); }
     } catch (e) { log(`watch list re-read failed: ${(e as Error).message}`); }
   }, 10 * 60_000);
-  setInterval(async () => { try { writeLine('status.jsonl', { t: Date.now(), ...(await calls.request({ type: 'status' })) }); } catch { /* arbsim gone: logged by exit */ } }, 30_000);
+  setInterval(async () => { try { writeLine('status.jsonl', { t: Date.now(), ...(await calls.request({ type: 'status', pools: true })) }); } catch { /* arbsim gone: logged by exit */ } }, 30_000);
   setInterval(() => writeSummary(false), SUMMARY_MS);
   const stop = async () => {
     await arbsimStatus();
