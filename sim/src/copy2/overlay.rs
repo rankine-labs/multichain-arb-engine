@@ -53,12 +53,14 @@ pub struct Overlay {
     snap: Snapshot,
     /// Everything changed since `new` (for late-fill carry-forward).
     changes: StateDiff,
+    /// Slots made unknown since `new` (forget_slot), so `absorb` can repeat it.
+    forgot: Vec<(Address, U256)>,
 }
 
 impl Overlay {
     /// Start from a frozen snapshot (usually the head version's).
     pub fn new(base: Snapshot) -> Self {
-        Overlay { snap: base, changes: StateDiff::default() }
+        Overlay { snap: base, changes: StateDiff::default(), forgot: Vec::new() }
     }
 
     /// Start from a shared frozen snapshot (cheap: persistent maps).
@@ -68,7 +70,21 @@ impl Overlay {
 
     /// An independent scratch copy (changes to it don't affect `self`).
     pub fn fork(&self) -> Overlay {
-        Overlay { snap: self.snap.clone(), changes: StateDiff::default() }
+        Overlay { snap: self.snap.clone(), changes: StateDiff::default(), forgot: Vec::new() }
+    }
+
+    /// Take over everything a fork of this overlay did (changes AND
+    /// forgotten slots).
+    pub fn absorb(&mut self, fork: &Overlay) {
+        self.commit(&fork.changes);
+        for (a, s) in &fork.forgot {
+            self.forget_slot(*a, *s);
+        }
+    }
+
+    /// Slots made unknown since `new`.
+    pub fn forgotten(&self) -> &[(Address, U256)] {
+        &self.forgot
     }
 
     /// Keep a set of changes (e.g. what a replayed swap changed).
@@ -111,6 +127,10 @@ impl Overlay {
     /// (Not recorded in `changes`: copy 2 doesn't carry late fills through
     /// block changes, see intake.rs "fills".)
     pub fn forget_slot(&mut self, addr: Address, slot: U256) {
+        self.forgot.push((addr, slot));
+        if let Some(d) = self.changes.accounts.get_mut(&addr) {
+            d.storage.remove(&slot);
+        }
         let complete = self.snap.accounts.get(&addr).is_some_and(|a| a.storage_complete);
         if complete {
             self.forget(addr);

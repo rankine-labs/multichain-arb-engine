@@ -138,6 +138,12 @@ pub trait NodeApi: Send + Sync {
     fn usage(&self) -> Value {
         Value::Null
     }
+    /// Same as call_batch, but the PAID node(s) first and the free public
+    /// node only as a fallback (copy 2's bulk loading: the public node is
+    /// slow and rate-limited). Default: same as call_batch.
+    fn call_batch_paid(&self, class: Class, calls: &[(&str, Value)]) -> Result<Vec<CallResult>, NodeErr> {
+        self.call_batch(class, calls)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -391,12 +397,18 @@ impl NodeClient {
 
     // Send one chunk through the endpoints in order. Calls the cheap node
     // can't answer (old state, debug methods) move on to the next node.
-    fn send_chunk(&self, class: Class, chunk: &[(&str, Value)]) -> Result<Vec<CallResult>, NodeErr> {
+    fn send_chunk(&self, class: Class, chunk: &[(&str, Value)], paid_first: bool) -> Result<Vec<CallResult>, NodeErr> {
         let needs_debug = chunk.iter().any(|(m, _)| m.starts_with("debug_"));
         let mut results: Vec<Option<CallResult>> = vec![None; chunk.len()];
         let mut todo: Vec<usize> = (0..chunk.len()).collect();
         let mut last = NodeErr::NoNode;
-        for ep in self.endpoints.iter().filter(|e| e.debug || !needs_debug) {
+        // Normal order: cheap public node first. paid_first: paid nodes
+        // (budget 0) first, the public node last (fallback).
+        let mut order: Vec<&Endpoint> = self.endpoints.iter().filter(|e| e.debug || !needs_debug).collect();
+        if paid_first {
+            order.sort_by_key(|e| e.budget != 0);
+        }
+        for ep in order {
             if todo.is_empty() {
                 break;
             }
@@ -462,7 +474,15 @@ impl NodeApi for NodeClient {
     fn call_batch(&self, class: Class, calls: &[(&str, Value)]) -> Result<Vec<CallResult>, NodeErr> {
         let mut out: Vec<CallResult> = Vec::with_capacity(calls.len());
         for chunk in calls.chunks(self.max_batch) {
-            out.extend(self.send_chunk(class, chunk)?);
+            out.extend(self.send_chunk(class, chunk, false)?);
+        }
+        Ok(out)
+    }
+
+    fn call_batch_paid(&self, class: Class, calls: &[(&str, Value)]) -> Result<Vec<CallResult>, NodeErr> {
+        let mut out: Vec<CallResult> = Vec::with_capacity(calls.len());
+        for chunk in calls.chunks(self.max_batch) {
+            out.extend(self.send_chunk(class, chunk, true)?);
         }
         Ok(out)
     }

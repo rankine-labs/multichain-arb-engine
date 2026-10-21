@@ -105,20 +105,33 @@ fn slot_hex(s: U256) -> String {
     format!("{s:#066x}")
 }
 
-/// One eth_call balanceOf(PROBE_HOLDER) on `coin` at `block` with storage
-/// overrides. Ok(None) = the call failed (revert, unsupported overrides).
-fn probe_call(node: &dyn NodeApi, coin: Address, block: u64, diff: serde_json::Map<String, Value>) -> Result<Option<U256>, NodeErr> {
+/// eth_call balanceOf(PROBE_HOLDER) on `coin` at `block`, once per
+/// override set, all in ONE node batch (paid node first). None = that call
+/// failed (revert, overrides unsupported).
+fn probe_calls(node: &dyn NodeApi, coin: Address, block: u64, diffs: Vec<serde_json::Map<String, Value>>) -> Result<Vec<Option<U256>>, NodeErr> {
     let c = to_hex(coin.as_slice());
-    let params = json!([{ "to": c, "data": balance_of_data(PROBE_HOLDER) }, tag(block), { c.clone(): { "stateDiff": Value::Object(diff) } }]);
-    let r = node.call_batch(Class::Fill, &[("eth_call", params)])?;
-    Ok(match r.into_iter().next() {
-        Some(Ok(Value::String(s))) => parse_u256(&s).ok(),
-        _ => None,
-    })
+    let calls: Vec<(&str, Value)> = diffs
+        .into_iter()
+        .map(|d| ("eth_call", json!([{ "to": c, "data": balance_of_data(PROBE_HOLDER) }, tag(block), { c.clone(): { "stateDiff": Value::Object(d) } }])))
+        .collect();
+    let r = node.call_batch_paid(Class::Fill, &calls)?;
+    Ok(r.into_iter()
+        .map(|x| match x {
+            Ok(Value::String(s)) => parse_u256(&s).ok(),
+            _ => None,
+        })
+        .collect())
 }
 
-/// Find where `coin` keeps balances (2 node requests; up to 2 + 62 for odd
-/// coins that also read another per-account flag). Ok(None) = not found.
+fn one(c: &BalanceLayout, v: u64) -> serde_json::Map<String, Value> {
+    let mut d = serde_json::Map::new();
+    d.insert(slot_hex(c.key(PROBE_HOLDER)), json!(slot_hex(U256::from(v))));
+    d
+}
+
+/// Find where `coin` keeps balances: 2 node requests (all places at once,
+/// then a confirmation); odd coins that also read another per-account flag
+/// take one extra batch of 62 single-place calls. Ok(None) = not found.
 pub fn probe_layout(node: &dyn NodeApi, coin: Address, block: u64) -> Result<Option<BalanceLayout>, NodeErr> {
     let cands = candidates();
     let mut diff = serde_json::Map::new();
@@ -126,27 +139,21 @@ pub fn probe_layout(node: &dyn NodeApi, coin: Address, block: u64) -> Result<Opt
         diff.insert(slot_hex(c.key(PROBE_HOLDER)), json!(slot_hex(U256::from(BASE + i as u64))));
     }
     let mut found = None;
-    if let Some(v) = probe_call(node, coin, block, diff)? {
+    if let Some(Some(v)) = probe_calls(node, coin, block, vec![diff])?.into_iter().next() {
         if v >= U256::from(BASE) && v < U256::from(BASE + cands.len() as u64) {
             found = Some(cands[(v - U256::from(BASE)).to::<usize>()]);
         }
     }
     if found.is_none() {
-        // One place at a time (slots 0..30), like the bot.
-        for c in cands.iter().filter(|c| c.slot <= 30) {
-            let mut d = serde_json::Map::new();
-            d.insert(slot_hex(c.key(PROBE_HOLDER)), json!(slot_hex(U256::from(MAGIC))));
-            if probe_call(node, coin, block, d)? == Some(U256::from(MAGIC)) {
-                found = Some(*c);
-                break;
-            }
-        }
+        // One place per call (slots 0..30), like the bot, but in one batch.
+        let few: Vec<BalanceLayout> = cands.iter().filter(|c| c.slot <= 30).copied().collect();
+        let r = probe_calls(node, coin, block, few.iter().map(|c| one(c, MAGIC)).collect())?;
+        found = few.iter().zip(r).find(|(_, v)| *v == Some(U256::from(MAGIC))).map(|(c, _)| *c);
     }
     let Some(l) = found else { return Ok(None) };
     // Confirm with that one place alone.
-    let mut d = serde_json::Map::new();
-    d.insert(slot_hex(l.key(PROBE_HOLDER)), json!(slot_hex(U256::from(MAGIC))));
-    Ok((probe_call(node, coin, block, d)? == Some(U256::from(MAGIC))).then_some(l))
+    let ok = probe_calls(node, coin, block, vec![one(&l, MAGIC)])?.into_iter().next().flatten() == Some(U256::from(MAGIC));
+    Ok(ok.then_some(l))
 }
 
 #[cfg(test)]

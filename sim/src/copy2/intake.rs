@@ -6,61 +6,69 @@
 //   track       the list of pools to follow (re-sent when it changes)
 //   pool_logs   one message per block that has events on our pools: the
 //               pools' own reports + coin Transfer reports to/from them
-//   block_tick  "block N had nothing for you" (keeps the copy current;
-//               the bot should send one for every block without events)
+//   block_tick  "block N had nothing for you" (keeps the copy current)
 //   + `warm` / items checks missed (fetched from the node, see "fills")
 //
-// What we keep per pool: its storage, and its two coins' balance slots for
-// it. Each pool is in one of three states:
-//   loading  just added: its values are fetched from the node (checked
-//            against the pool's own getters so a fork with a different
-//            storage layout is never followed), then READY
+// Each pool is in one of three states:
+//   loading  its values are being fetched in the background (first time,
+//            or after it went unsure / needed more values)
 //   ready    every event is applied: V2 / Solidly by writing the numbers
 //            the event states (fields.rs), V3 / PancakeSwap V3 / Algebra /
 //            V4 by re-running the action with the pool's own code
-//            (replay.rs, workstream B)
+//            (replay.rs)
 //   unsure   an event couldn't be applied exactly, or a reorg / gap hit it.
-//            Everything we held about it is FORGOTTEN (so checks touching it
-//            answer "unknown: unsure_pool" and the bot asks the node), and it
-//            is reloaded after a short wait (longer each time it happens).
+//            Its values are FORGOTTEN (checks touching it answer
+//            "unknown: unsure_pool" and the bot asks the node), and it is
+//            reloaded after a short wait (longer each time it happens).
 //
-// The loop (one thread, the ONLY writer of the published versions):
-//   1. Blocks in order. For each: start from the newest version, apply its
-//      events in (transaction, log) order, publish the result as the next
-//      Version (state/mirror.rs), so `call` / `size_search` at
-//      {"after":"head"} or {"block":N} read it. A tick publishes the same
-//      state with the new block's details (cheap: shared memory).
-//   2. When no block is waiting: load / reload pools, then fills.
+// THE MOST IMPORTANT RULE: this thread NEVER waits for the node. Applying
+// each block takes microseconds; a node answer takes 100+ ms. So:
+//   1. Blocks first, always, in order: apply the block's events to the pools
+//      that are ready, publish the result as the next Version (mirror.rs),
+//      so `call` / `size_search` at {"after":"head"} / {"block":N} read it.
+//      Every block's reports are also kept in a short history ("buffer",
+//      ARBSIM_COPY2_KEEP_BLOCKS, default 2400 blocks = about 10 minutes).
+//   2. Node questions go to the loader threads (loader.rs): paid node first,
+//      many questions per request. A pool to load is fetched AT block k
+//      (the newest block at that moment). When the answer comes back, the
+//      chain has moved on to block B, so the pool's own reports for blocks
+//      k+1..B are taken from the buffer and applied to the fetched values
+//      ("carried forward"), in a private working copy. If the carry needs a
+//      value we don't have yet (a replay touched a new tick, say), that
+//      value is fetched at the block right before the report that needs it,
+//      and the carry continues from there. Once the working copy reaches B,
+//      its values are put into the newest version and the pool is READY.
+//   3. A ready replay pool whose event needs a value we don't have doesn't
+//      wait either: it becomes "loading" at that report, the value is
+//      fetched in the background, and the carry continues as in 2.
+//   4. Fills (values a check missed) are fetched in the background at block
+//      k and only used if nothing we follow touched them after k.
 //
 // Strict, always: a value we don't hold is MISSING (never zero); a pool we
 // can't follow exactly is unsure. Node reads use the daily allowance
-// (node.rs classes): in-block fetches "critical", loads and fills "fill".
-//
-// Fills are simpler than copy 1's: they are fetched AT the newest version's
-// block, on this thread, so nothing can change in between (no carrying
-// values forward). They are refused for pools that aren't ready.
+// (node.rs classes) and are counted in status (copy2.nodeRequests).
 // ============================================================================
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use revm::primitives::{keccak256, Address, Bytes, B256, U256};
 use serde_json::{json, Value};
 
-use super::coins::{balance_of_data, probe_layout, BalanceLayout};
-use super::fields::{self, apply_fields, core_slots, obs_slot, sol, topic_addr, topics, v2};
+use super::coins::{balance_of_data, BalanceLayout};
+use super::fields::{apply_fields, core_slots, obs_slot, sol, topic_addr, topics, v2};
+use super::loader::{out_word, Done, FetchOut, Job, Loaders};
 use super::overlay::Overlay;
 use super::replay::{apply_replay, finish_block};
 use super::{ApplyResult, BlockCtx as ReplayCtx, PoolKind, PoolLog, TrackedPool};
 use crate::arb::{self, BlockCtx};
 use crate::check::hexutil::{parse_address, parse_bytes, parse_u256, parse_u64, to_hex};
-use crate::node::{self, env_u64, tag, Class, NodeApi, NodeErr};
-use crate::state::fill::{rewrite_from, FillQueue};
+use crate::node::{env_u64, Fetched, ItemErr};
+use crate::state::fill::{account_info, reconcile, rewrite_from, FillQueue};
 use crate::state::mirror::{Shared, Version};
-use crate::state::snap::{Fact, Snapshot};
-use crate::state::updater::fetch_facts;
+use crate::state::snap::{Basics, Fact, Snapshot};
 use crate::state::{Lookup, MissItem, StateDiff, StatePosition, StateRead};
 
 // ---------------------------------------------------------------------------
@@ -208,6 +216,7 @@ pub fn parse_block_msg(v: &Value) -> Result<BlockMsg, String> {
     })
 }
 
+
 // ---------------------------------------------------------------------------
 // Shared registry (read by the socket threads for status / answers)
 // ---------------------------------------------------------------------------
@@ -229,7 +238,7 @@ pub enum PoolState {
 pub struct PoolEntry {
     pub pool: TrackedPool,
     pub state: PoolState,
-    /// Why it's unsure (or the last reason it was).
+    /// Why it's unsure / loading (or the last reason it was).
     pub reason: String,
     /// Events applied since tracking began.
     pub events: u64,
@@ -237,10 +246,26 @@ pub struct PoolEntry {
     pub strikes: u32,
     /// Events applied since it was last loaded (resets strikes at 50).
     pub clean_events: u64,
-    /// When it may be reloaded.
+    /// When it may be (re)loaded.
     pub retry_at: Instant,
     /// Other accounts its replays change (e.g. an Algebra plugin).
     pub owned: Vec<Address>,
+    /// The storage values of this pool we hold and follow (pool contract,
+    /// owned accounts, its V4 PoolManager slots). Forgotten together.
+    pub items: HashSet<(Address, U256)>,
+    /// Accounts whose basics / code it needs (fetched again on reload).
+    pub accounts: HashSet<Address>,
+    /// Storage layout checked against the pool's getters.
+    pub verified: bool,
+    /// Changes every time the pool stops being ready (old answers ignored).
+    pub gen: u64,
+    /// Block from which it has been ready.
+    pub ready_since: u64,
+    /// A background load is running for it.
+    pub busy: bool,
+    pub ever_ready: bool,
+    /// Fetch rounds of the current load.
+    pub rounds: u32,
 }
 
 /// Everything about the followed pools (behind one lock).
@@ -253,12 +278,15 @@ pub struct Registry {
     pub layouts: HashMap<Address, Option<BalanceLayout>>,
     /// Coin -> addresses whose balance of it we follow (our pools).
     pub holders: HashMap<Address, HashSet<Address>>,
+    /// Owned account -> its pool.
+    pub owner_of: HashMap<Address, PoolKey>,
 }
 
 impl Registry {
     fn rebuild_index(&mut self) {
         self.by_addr.clear();
         self.holders.clear();
+        self.owner_of.clear();
         for (k, e) in &self.pools {
             self.by_addr.entry(k.0).or_default().push(*k);
             for c in [e.pool.token0, e.pool.token1] {
@@ -266,25 +294,29 @@ impl Registry {
                     self.holders.entry(c).or_default().insert(e.pool.address);
                 }
             }
+            for o in &e.owned {
+                self.owner_of.insert(*o, *k);
+            }
         }
     }
 
-    /// May the node's value for this account be put into the copy now?
-    /// No for a pool that isn't ready (its events aren't being applied),
-    /// the accounts its replays change, and a V4 PoolManager while any of
-    /// its pools isn't ready (we can't tell its pools' slots apart).
-    pub fn blocked_account(&self, a: &Address) -> Option<String> {
-        if let Some(keys) = self.by_addr.get(a) {
-            for k in keys {
-                let e = &self.pools[k];
-                if e.state != PoolState::Ready {
-                    return Some(format!("{} pool {a} is {}: {}", kind_name(e.pool.kind), state_name(e.state), e.reason));
-                }
-            }
+    /// Pools whose state an account's storage belongs to.
+    fn pools_of(&self, a: &Address) -> Vec<PoolKey> {
+        let mut v = self.by_addr.get(a).cloned().unwrap_or_default();
+        if let Some(k) = self.owner_of.get(a) {
+            v.push(*k);
         }
-        for e in self.pools.values() {
-            if e.state != PoolState::Ready && e.owned.contains(a) {
-                return Some(format!("account {a} belongs to {} pool {} which is {}", kind_name(e.pool.kind), e.pool.address, state_name(e.state)));
+        v
+    }
+
+    /// May the node's value for this account be put into the copy now?
+    /// No while a pool it belongs to isn't ready (its events aren't being
+    /// applied). For a V4 PoolManager: while any of its pools isn't ready.
+    pub fn blocked_account(&self, a: &Address) -> Option<String> {
+        for k in self.pools_of(a) {
+            let e = &self.pools[&k];
+            if e.state != PoolState::Ready {
+                return Some(format!("{} pool {} is {}: {}", kind_name(e.pool.kind), e.pool.address, state_name(e.state), e.reason));
             }
         }
         None
@@ -329,8 +361,8 @@ macro_rules! c2counters {
 c2counters!(
     msgs, msgs_bad, ticks, blocks, logs, events_applied, events_skipped_not_ready, events_unsure, coin_transfers,
     coin_slot_mismatch, other_side_forgotten, logs_ignored, duplicate_blocks, reorgs, gaps, loads, load_ok,
-    load_failed, unsure_marked, need_item_rounds, node_items, node_errors, fills, fill_items, fill_refused,
-    probes, probe_not_found, track_msgs, dropped_msgs,
+    load_failed, unsure_marked, need_item_rounds, node_errors, fills, fill_items, fill_refused, fill_retry,
+    probes, probe_not_found, track_msgs, dropped_msgs, carried_events, carry_too_old, merges, apply_us_max,
 );
 
 fn inc(c: &AtomicU64) {
@@ -340,12 +372,28 @@ fn add(c: &AtomicU64, n: u64) {
     c.fetch_add(n, Ordering::Relaxed);
 }
 
+/// The last finished load round (for status and the log).
+#[derive(Clone, Debug, Default)]
+pub struct LoadRound {
+    pub pools: usize,
+    pub seconds: f64,
+    pub requests: u64,
+    pub ready: usize,
+    pub unsure: usize,
+    pub done: bool,
+}
+
 /// What the socket threads share with the intake thread.
 pub struct C2Shared {
     pub reg: RwLock<Registry>,
     pub stats: C2Stats,
     /// Newest block applied (0 = none yet).
     pub last_block: AtomicU64,
+    /// Node requests made by copy 2 (each call in a batch counts as one).
+    pub node_requests: Arc<AtomicU64>,
+    pub load_round: Mutex<LoadRound>,
+    /// Background work in flight (for status): (node jobs, pools carrying).
+    pub in_flight: Mutex<(usize, usize)>,
 }
 
 // ---------------------------------------------------------------------------
@@ -355,6 +403,8 @@ pub enum Input {
     Track(Vec<TrackedPool>, Vec<(Address, BalanceLayout)>),
     Block(BlockMsg),
     Fill(Vec<MissItem>),
+    /// An answer from a loader thread.
+    Done(Done),
     Stop,
 }
 
@@ -363,6 +413,40 @@ pub struct Copy2Handle {
     tx: SyncSender<Input>,
     pub sh: Arc<Shared>,
     pub c2: Arc<C2Shared>,
+}
+
+/// Group reasons: addresses / numbers replaced so the same kind counts once.
+fn reason_key(r: &str) -> String {
+    let mut out = String::new();
+    let mut chars = r.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '0' && chars.peek() == Some(&'x') {
+            chars.next();
+            while chars.peek().is_some_and(|x| x.is_ascii_hexdigit()) {
+                chars.next();
+            }
+            out.push_str("0x..");
+        } else if c.is_ascii_digit() {
+            while chars.peek().is_some_and(|x| x.is_ascii_digit()) {
+                chars.next();
+            }
+            out.push('N');
+        } else {
+            out.push(c);
+        }
+    }
+    out.chars().take(80).collect()
+}
+
+fn top_reasons<'a>(it: impl Iterator<Item = &'a str>) -> Vec<Value> {
+    let mut m: HashMap<String, u64> = HashMap::new();
+    for r in it {
+        *m.entry(reason_key(r)).or_default() += 1;
+    }
+    let mut v: Vec<(String, u64)> = m.into_iter().collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    v.truncate(10);
+    v.into_iter().map(|(k, n)| json!({ "why": k, "n": n })).collect()
 }
 
 impl Copy2Handle {
@@ -387,8 +471,8 @@ impl Copy2Handle {
             p.received_seq = Some(p.received_seq.map_or(seq, |r| r.max(seq)));
         }
         if self.tx.try_send(Input::Block(m)).is_err() {
-            // Hopelessly behind: dropping a block breaks the copy, so the
-            // next message's gap check (or the counter) shows it.
+            // Hopelessly behind: dropping a block breaks the copy; the next
+            // message's prevBlock check reloads everything.
             inc(&self.c2.stats.dropped_msgs);
         }
     }
@@ -429,24 +513,29 @@ impl Copy2Handle {
     pub fn status_json(&self, with_pools: bool) -> Value {
         let reg = self.c2.reg.read().unwrap();
         let (loading, ready, unsure) = reg.counts();
-        let mut reasons: HashMap<String, u64> = HashMap::new();
-        for e in reg.pools.values().filter(|e| e.state == PoolState::Unsure) {
-            let k: String = e.reason.chars().take(60).collect();
-            *reasons.entry(k).or_default() += 1;
-        }
-        let mut reasons: Vec<(String, u64)> = reasons.into_iter().collect();
-        reasons.sort_by(|a, b| b.1.cmp(&a.1));
-        reasons.truncate(10);
+        let last = self.c2.last_block.load(Ordering::Relaxed);
+        let tip = self.sh.node_tip.load(Ordering::Relaxed);
+        let lr = self.c2.load_round.lock().unwrap().clone();
+        let (jobs, carrying) = *self.c2.in_flight.lock().unwrap();
         let mut out = json!({
             "source": "pool-events",
             "pools": reg.pools.len(),
             "loading": loading,
             "ready": ready,
             "unsure": unsure,
-            "lastBlock": self.c2.last_block.load(Ordering::Relaxed),
+            "lastBlock": last,
+            "copyBlock": last,
+            "nodeTip": tip,
+            "behindBlocks": if tip > 0 && last > 0 { Some(tip.saturating_sub(last)) } else { None },
+            "nodeRequests": self.c2.node_requests.load(Ordering::Relaxed),
+            "nodeJobsInFlight": jobs,
+            "poolsCarrying": carrying,
+            "loadRound": { "pools": lr.pools, "done": lr.done, "seconds": (lr.seconds * 10.0).round() / 10.0,
+                           "requests": lr.requests, "ready": lr.ready, "unsure": lr.unsure },
             "coinsWithLayout": reg.layouts.values().filter(|l| l.is_some()).count(),
             "coinsWithoutLayout": reg.layouts.values().filter(|l| l.is_none()).count(),
-            "unsureReasons": reasons.iter().map(|(k, n)| json!({ "why": k, "n": n })).collect::<Vec<_>>(),
+            "unsureReasons": top_reasons(reg.pools.values().filter(|e| e.state == PoolState::Unsure).map(|e| e.reason.as_str())),
+            "loadingReasons": top_reasons(reg.pools.values().filter(|e| e.state == PoolState::Loading).map(|e| e.reason.as_str())),
             "counters": Value::Object(self.c2.stats.json()),
         });
         if with_pools {
@@ -461,6 +550,7 @@ impl Copy2Handle {
                         "state": state_name(e.state),
                         "reason": if e.state == PoolState::Ready { Value::Null } else { json!(e.reason) },
                         "events": e.events,
+                        "values": e.items.len(),
                     })
                 })
                 .collect();
@@ -482,8 +572,19 @@ pub struct C2Config {
     /// Wait after a pool's storage layout didn't match its getters
     /// [ARBSIM_COPY2_LAYOUT_RETRY_S, 3600].
     pub layout_retry_s: u64,
-    /// Pools loaded per node batch [ARBSIM_COPY2_LOAD_BATCH, 20].
+    /// Pools per load job [ARBSIM_COPY2_LOAD_BATCH, 25] (a job is split into
+    /// node requests of ARBSIM_NODE_BATCH calls).
     pub load_batch: usize,
+    /// Loader threads [ARBSIM_COPY2_LOADERS, 4]; load jobs in flight at most
+    /// 2 per thread.
+    pub loaders: usize,
+    /// Blocks of reports kept for carrying loads forward
+    /// [ARBSIM_COPY2_KEEP_BLOCKS, 2400 = ~10 min].
+    pub keep_blocks: usize,
+    /// Fetch rounds one load may take [ARBSIM_COPY2_MAX_ROUNDS, 40].
+    pub max_rounds: u32,
+    /// Node tip check for status [ARBSIM_COPY2_TIP_EVERY_S, 30].
+    pub tip_every_s: u64,
 }
 
 impl C2Config {
@@ -492,70 +593,196 @@ impl C2Config {
             reload_ms: env_u64("ARBSIM_COPY2_RELOAD_MS", 2000),
             reload_max_ms: env_u64("ARBSIM_COPY2_RELOAD_MAX_MS", 600_000),
             layout_retry_s: env_u64("ARBSIM_COPY2_LAYOUT_RETRY_S", 3600),
-            load_batch: env_u64("ARBSIM_COPY2_LOAD_BATCH", 20).clamp(1, 200) as usize,
+            load_batch: env_u64("ARBSIM_COPY2_LOAD_BATCH", 25).clamp(1, 500) as usize,
+            loaders: env_u64("ARBSIM_COPY2_LOADERS", 4).clamp(1, 32) as usize,
+            keep_blocks: env_u64("ARBSIM_COPY2_KEEP_BLOCKS", 2400).clamp(16, 100_000) as usize,
+            max_rounds: env_u64("ARBSIM_COPY2_MAX_ROUNDS", 40).clamp(1, 1000) as u32,
+            tip_every_s: env_u64("ARBSIM_COPY2_TIP_EVERY_S", 30),
         }
     }
     pub fn for_tests() -> Self {
-        C2Config { reload_ms: 0, reload_max_ms: 0, layout_retry_s: 0, load_batch: 20 }
+        C2Config { reload_ms: 0, reload_max_ms: 0, layout_retry_s: 3600, load_batch: 25, loaders: 2, keep_blocks: 400, max_rounds: 40, tip_every_s: 0 }
     }
 }
 
 // ---------------------------------------------------------------------------
 // The intake thread
 // ---------------------------------------------------------------------------
+/// Position of a report inside the chain: (block, tx index, log index).
+/// (b, MAX, MAX) = "end of block b" (Algebra finish_block).
+type Pos = (u64, u32, u32);
+const END: u32 = u32::MAX;
+
+/// One block's reports, kept for carrying loads forward.
+struct BufBlock {
+    block: u64,
+    rctx: ReplayCtx,
+    /// Sorted by (tx, log index); reorged ones left out.
+    logs: Arc<Vec<PoolLog>>,
+}
+
+/// A pool being loaded: its private working copy and where it has got to.
+struct Partial {
+    ov: Overlay,
+    /// Next report to apply (everything before it is in `ov`).
+    cursor: Pos,
+    gen: u64,
+}
+
+/// What a node job was for.
+enum JobFor {
+    Load { pools: Vec<LoadReq> },
+    Need { key: PoolKey, gen: u64 },
+    Fill,
+    Probe,
+    Tip,
+}
+
+/// One pool's part of a load job.
+struct LoadReq {
+    key: PoolKey,
+    gen: u64,
+    /// Its items: range in the job's item list.
+    items: (usize, usize),
+    /// Layout check getters: (name, index in the job's call list).
+    getters: Vec<(&'static str, usize)>,
+    /// Coin checks: (coin, balance slot, item index, balanceOf call index).
+    coin_checks: Vec<(Address, U256, usize, usize)>,
+}
+
 pub struct Intake {
     sh: Arc<Shared>,
     c2: Arc<C2Shared>,
     cfg: C2Config,
     rx: Receiver<Input>,
     fills: Arc<FillQueue>,
+    loaders: Option<Loaders>,
     /// Blocks received, not applied yet (by block number).
     pending: BTreeMap<u64, BlockMsg>,
+    /// Node answers waiting to be used.
+    done: VecDeque<Done>,
     /// Newest block applied.
     last_block: Option<u64>,
     /// Block of the previous message received (for the bot's prevBlock).
     last_msg_block: Option<u64>,
-    /// Recent blocks: the (tx, log index) list applied and pools touched
-    /// (duplicates vs reorgs).
+    /// Recent blocks: (tx, log index) list and pools touched (duplicates vs reorgs).
     recent: VecDeque<(u64, Vec<(B256, u32)>, Vec<PoolKey>)>,
+    buf: VecDeque<BufBlock>,
+    partials: HashMap<PoolKey, Partial>,
+    jobs: HashMap<u64, JobFor>,
+    next_id: u64,
+    probing: HashSet<Address>,
+    /// Coins whose storage balance was checked against balanceOf once.
+    coin_ok: HashSet<Address>,
+    /// Last block an event touched this pool address / coin holder.
+    touched_addr: HashMap<Address, u64>,
+    /// Last block a coin transfer changed this (coin, slot).
+    touched_slot: HashMap<(Address, U256), u64>,
     basefee: u64,
-    last_header: Option<Instant>,
+    last_tip: Option<Instant>,
     last_evict: Instant,
+    /// Current load round: (started, requests before, pools).
+    round: Option<(Instant, u64, usize)>,
 }
 
-/// Start the intake thread.
+/// Start the intake thread (+ loader threads).
 pub fn spawn(sh: Arc<Shared>, fills: Arc<FillQueue>, cfg: C2Config) -> Copy2Handle {
-    let (intake, h) = manual(sh, fills, cfg);
-    let mut intake = intake;
+    let (mut intake, h) = manual(sh, fills, cfg);
     std::thread::Builder::new().name("arbsim-copy2".into()).spawn(move || intake.run()).expect("copy2 thread");
     h
 }
 
-/// For tests: an intake driven by hand (`pump`), no thread.
+/// For tests: an intake driven by hand (`pump`); loader threads still run.
 pub fn manual(sh: Arc<Shared>, fills: Arc<FillQueue>, cfg: C2Config) -> (Intake, Copy2Handle) {
-    let (tx, rx) = std::sync::mpsc::sync_channel(8192);
-    let c2 = Arc::new(C2Shared { reg: RwLock::new(Registry::default()), stats: C2Stats::default(), last_block: AtomicU64::new(0) });
+    let (tx, rx) = std::sync::mpsc::sync_channel(16_384);
+    let c2 = Arc::new(C2Shared {
+        reg: RwLock::new(Registry::default()),
+        stats: C2Stats::default(),
+        last_block: AtomicU64::new(0),
+        node_requests: Arc::new(AtomicU64::new(0)),
+        load_round: Mutex::new(LoadRound::default()),
+        in_flight: Mutex::new((0, 0)),
+    });
+    let loaders = sh.node.clone().map(|n| Loaders::spawn(cfg.loaders, n, tx.clone(), c2.node_requests.clone()));
     let i = Intake {
         sh: sh.clone(),
         c2: c2.clone(),
         cfg,
         rx,
         fills,
+        loaders,
         pending: BTreeMap::new(),
+        done: VecDeque::new(),
         last_block: None,
         last_msg_block: None,
         recent: VecDeque::new(),
+        buf: VecDeque::new(),
+        partials: HashMap::new(),
+        jobs: HashMap::new(),
+        next_id: 1,
+        probing: HashSet::new(),
+        coin_ok: HashSet::new(),
+        touched_addr: HashMap::new(),
+        touched_slot: HashMap::new(),
         basefee: 0,
-        last_header: None,
+        last_tip: None,
         last_evict: Instant::now(),
+        round: None,
     };
     (i, Copy2Handle { tx, sh, c2 })
 }
 
-/// Result of one coin-transfer side.
-enum Side {
-    Pool,
-    Other,
+/// Apply one event of a pool (fields or replay) to `ov`.
+fn apply_event(ov: &mut Overlay, pool: &TrackedPool, log: &PoolLog, rctx: &ReplayCtx) -> ApplyResult {
+    match pool.kind {
+        PoolKind::V2 | PoolKind::Solidly => apply_fields(ov, pool, log, rctx.timestamp),
+        _ => apply_replay(ov, pool, log, rctx),
+    }
+}
+
+/// Is this log an event of `pool`?
+fn is_pool_event(pool: &TrackedPool, log: &PoolLog) -> bool {
+    log.address == pool.address
+        && match pool.v4_id {
+            Some(id) => log.topics.get(1) == Some(&id),
+            None => true,
+        }
+}
+
+/// A coin Transfer log: (coin, from, to, amount).
+fn coin_transfer(log: &PoolLog) -> Option<(Address, Address, Address, U256)> {
+    if log.topics.len() != 3 || log.topics[0] != topics().transfer || log.data.len() != 32 {
+        return None;
+    }
+    Some((log.address, topic_addr(&log.topics[1]), topic_addr(&log.topics[2]), super::word(&log.data, 0)))
+}
+
+/// Slots a pool needs before its events can be applied, given what `ov` holds.
+fn missing_core(pool: &TrackedPool, ov: &Overlay) -> Vec<MissItem> {
+    let p = pool.address;
+    let mut m: Vec<MissItem> =
+        core_slots(pool.kind).iter().map(|s| U256::from(*s)).filter(|s| matches!(ov.slot(p, *s), Lookup::Missing)).map(|s| MissItem::Slot(p, s)).collect();
+    if pool.kind == PoolKind::Solidly {
+        if let Lookup::Known(len) = ov.slot(p, U256::from(sol::OBS_LEN)) {
+            if !len.is_zero() {
+                let s = obs_slot(len - U256::from(1), 0);
+                if matches!(ov.slot(p, s), Lookup::Missing) {
+                    m.push(MissItem::Slot(p, s));
+                }
+            }
+        }
+    }
+    m
+}
+
+fn fact_of(f: &Fetched) -> Fact {
+    match f {
+        Fetched::Slot(a, s, v) => Fact::Slot(*a, *s, *v),
+        Fetched::Account(a, acc) => {
+            let (info, code) = account_info(acc.as_ref());
+            Fact::Basics { addr: *a, info, code }
+        }
+    }
 }
 
 impl Intake {
@@ -566,59 +793,88 @@ impl Intake {
                 Ok(i) => self.input(i),
                 Err(RecvTimeoutError::Timeout) => {}
             }
-            while let Ok(i) = self.rx.try_recv() {
-                if matches!(i, Input::Stop) {
-                    return;
-                }
-                self.input(i);
+            if !self.drain() {
+                return;
             }
             self.work();
         }
     }
 
-    /// Take everything waiting, then work (tests).
-    pub fn pump(&mut self) {
+    /// Take everything waiting in the input queue. false = Stop.
+    fn drain(&mut self) -> bool {
         while let Ok(i) = self.rx.try_recv() {
+            if matches!(i, Input::Stop) {
+                return false;
+            }
             self.input(i);
         }
+        true
+    }
+
+    /// Take everything waiting, then work (tests).
+    pub fn pump(&mut self) {
+        self.drain();
         self.work();
+    }
+
+    /// Node jobs in flight + answers not used yet (tests wait for 0).
+    pub fn outstanding(&self) -> usize {
+        self.jobs.len() + self.done.len() + self.pending.len()
     }
 
     fn input(&mut self, i: Input) {
         match i {
             Input::Track(pools, layouts) => self.on_track(pools, layouts),
+            // Keep the newest message per block (a re-sent block replaces).
             Input::Block(m) => {
-                // Keep the newest message per block (a re-sent block replaces).
                 self.pending.insert(m.block, m);
             }
             Input::Fill(items) => {
                 self.fills.push(items);
             }
+            Input::Done(d) => self.done.push_back(d),
             Input::Stop => {}
         }
     }
 
+    /// Blocks first; node answers in between, one at a time, re-checking
+    /// for new blocks after each; then send new node jobs.
     pub fn work(&mut self) {
-        self.upkeep_header();
-        while let Some((&b, _)) = self.pending.iter().next() {
-            let m = self.pending.remove(&b).unwrap();
-            self.process(m);
+        loop {
+            while let Some((&b, _)) = self.pending.iter().next() {
+                let m = self.pending.remove(&b).unwrap();
+                self.process(m);
+            }
+            let Some(d) = self.done.pop_front() else { break };
+            self.on_done(d);
+            if !self.drain() {
+                break;
+            }
         }
-        // Idle: reloads, then fills (both fetch at the newest version's block).
-        self.do_loads();
-        if self.pending.is_empty() {
-            self.do_fills();
-        }
+        self.dispatch_tip();
+        self.dispatch_loads();
+        self.dispatch_fills();
+        self.note_round();
+        *self.c2.in_flight.lock().unwrap() = (self.jobs.len(), self.partials.len());
         if self.last_evict.elapsed() > Duration::from_secs(60) {
             self.last_evict = Instant::now();
             self.evict();
+            self.prune_touched();
         }
+    }
+
+    fn new_job(&mut self, f: JobFor) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.jobs.insert(id, f);
+        id
     }
 
     // ---- track ----
     fn on_track(&mut self, pools: Vec<TrackedPool>, layouts: Vec<(Address, BalanceLayout)>) {
         inc(&self.c2.stats.track_msgs);
         let mut gone: Vec<PoolEntry> = Vec::new();
+        let mut added = 0;
         {
             let mut reg = self.c2.reg.write().unwrap();
             for (c, l) in layouts {
@@ -637,44 +893,56 @@ impl Intake {
                 }
             }
             for (k, p) in new {
-                reg.pools.entry(k).or_insert_with(|| PoolEntry {
-                    pool: p,
-                    state: PoolState::Loading,
-                    reason: "loading".into(),
-                    events: 0,
-                    strikes: 0,
-                    clean_events: 0,
-                    retry_at: Instant::now(),
-                    owned: Vec::new(),
-                });
+                if reg.pools.contains_key(&k) {
+                    continue;
+                }
+                added += 1;
+                reg.pools.insert(
+                    k,
+                    PoolEntry {
+                        pool: p,
+                        state: PoolState::Loading,
+                        reason: "loading: waiting for its turn".into(),
+                        events: 0,
+                        strikes: 0,
+                        clean_events: 0,
+                        retry_at: Instant::now(),
+                        owned: Vec::new(),
+                        items: HashSet::new(),
+                        accounts: HashSet::new(),
+                        verified: false,
+                        gen: 0,
+                        ready_since: 0,
+                        busy: false,
+                        ever_ready: false,
+                        rounds: 0,
+                    },
+                );
             }
             reg.rebuild_index();
         }
-        // Forget what we held about pools we no longer follow (it would go
-        // stale), including their coin balances (unless another pool at the
-        // same address still follows that coin).
+        if added > 0 && self.round.is_none() {
+            self.round = Some((Instant::now(), self.c2.node_requests.load(Ordering::Relaxed), added));
+            *self.c2.load_round.lock().unwrap() = LoadRound { pools: added, ..Default::default() };
+        }
+        // Forget what we held about pools we no longer follow (it would go stale).
         if !gone.is_empty() {
             let reg = self.c2.reg.read().unwrap();
-            let mut forget_accts: Vec<Address> = Vec::new();
-            let mut forget_slots: Vec<(Address, U256)> = Vec::new();
+            let mut forget: Vec<(Address, U256)> = Vec::new();
             for e in &gone {
-                if !reg.by_addr.contains_key(&e.pool.address) {
-                    forget_accts.push(e.pool.address);
-                }
-                forget_accts.extend(e.owned.iter().copied());
+                self.partials.remove(&key_of(&e.pool));
+                forget.extend(e.items.iter().copied());
                 for c in [e.pool.token0, e.pool.token1] {
                     let still = reg.holders.get(&c).is_some_and(|h| h.contains(&e.pool.address));
                     if let (false, Some(Some(l))) = (still, reg.layouts.get(&c)) {
-                        forget_slots.push((c, l.key(e.pool.address)));
+                        forget.push((c, l.key(e.pool.address)));
                     }
                 }
             }
             drop(reg);
-            self.rewrite_all(|s| {
-                for a in &forget_accts {
-                    s.apply_fact(&Fact::Forget(*a));
-                }
-                for (a, k) in &forget_slots {
+            let mut p = self.sh.published.write().unwrap();
+            rewrite_from(&mut p.versions, 0, |s| {
+                for (a, k) in &forget {
                     forget_slot(s, *a, *k);
                 }
             });
@@ -694,8 +962,10 @@ impl Intake {
         }
     }
 
-    /// Apply one block message (or tick), publish the result.
+    /// Apply one block message (or tick), publish the result. Never waits
+    /// for the node.
     pub fn process(&mut self, m: BlockMsg) {
+        let t0 = Instant::now();
         let c2 = self.c2.clone();
         let st = &c2.stats;
         // Lost message? (only if the bot tells us its previous block)
@@ -704,17 +974,19 @@ impl Intake {
                 inc(&st.gaps);
                 eprintln!("[arbsim] copy2: message(s) lost between block {last} and {} (bot's previous: {prev}); reloading every pool", m.block);
                 self.unsure_all(&format!("lost message before block {}", m.block), m.block);
+                // The buffer has a hole: no load may carry across it.
+                self.buf.clear();
             }
         }
         if m.block > self.last_msg_block.unwrap_or(0) {
             self.last_msg_block = Some(m.block);
         }
         // Reorged reports ("removed") make their pools unsure from that block on.
-        let removed: Vec<&PoolLog> = m.logs.iter().filter(|l| l.removed).collect();
+        let removed: Vec<PoolLog> = m.logs.iter().filter(|l| l.removed).cloned().collect();
         if !removed.is_empty() {
             inc(&st.reorgs);
             let from = removed.iter().map(|l| l.block).min().unwrap_or(m.block);
-            let keys = self.pools_touched(&removed.iter().map(|l| (*l).clone()).collect::<Vec<_>>());
+            let keys = self.pools_touched(&removed);
             self.unsure_from(&keys, "reorg (report taken back)", from);
         }
         // An old block again: identical = duplicate; different = reorg.
@@ -744,17 +1016,18 @@ impl Intake {
             None => self.bootstrap(m.block),
         };
         let ctx = self.block_ctx(&m, head.ctx.as_ref());
+        let rctx = ReplayCtx { number: m.block, timestamp: m.timestamp, l1_number: ctx.l1_block_number };
+        let mut logs: Vec<PoolLog> = m.logs.iter().filter(|l| !l.removed).cloned().collect();
+        logs.sort_by_key(|l| (l.tx_index, l.log_index));
         if m.tick {
             inc(&st.ticks);
+            self.push_buf(m.block, rctx, Vec::new());
             self.publish(m.block, head.snap.clone(), ctx, StateDiff::default());
             return;
         }
         inc(&st.blocks);
-        let rctx = ReplayCtx { number: m.block, timestamp: m.timestamp, l1_number: ctx.l1_block_number };
         let mut ov = Overlay::from_arc(&head.snap);
         ov.set_position(StatePosition { base_block: m.block, after_seq: None });
-        let mut logs: Vec<PoolLog> = m.logs.iter().filter(|l| !l.removed).cloned().collect();
-        logs.sort_by_key(|l| (l.tx_index, l.log_index));
         add(&st.logs, logs.len() as u64);
         let mut touched: Vec<PoolKey> = Vec::new();
         for log in &logs {
@@ -762,9 +1035,10 @@ impl Intake {
             for k in self.pool_keys_for(log) {
                 used = true;
                 touched.push(k);
-                self.apply_pool_event(&mut ov, k, log, &rctx, m.block);
+                self.touched_addr.insert(log.address, m.block);
+                self.apply_ready_event(&mut ov, k, log, &rctx);
             }
-            if self.apply_coin_transfer(&mut ov, log) {
+            if self.apply_coin_transfer(&mut ov, log, m.block) {
                 used = true;
             }
             if !used {
@@ -783,21 +1057,32 @@ impl Intake {
                     _ => continue,
                 }
             };
-            match self.with_fetch(&mut ov, m.block, |o| finish_block(o, &pool, &rctx)) {
-                ApplyResult::Applied => {}
+            let mut f = ov.fork();
+            match finish_block(&mut f, &pool, &rctx) {
+                ApplyResult::Applied => self.keep_fork(&mut ov, &f, *k),
                 ApplyResult::Unsure(why) => self.make_unsure(*k, &format!("end of block: {why}"), Some(&mut ov), m.block),
-                ApplyResult::NeedItems(_) => self.make_unsure(*k, "end of block: still missing items", Some(&mut ov), m.block),
+                ApplyResult::NeedItems(items) => self.start_partial_in_block(&mut ov, *k, (m.block, END, END), items),
             }
         }
         self.recent.push_back((m.block, log_ids(&m.logs), touched));
-        while self.recent.len() > self.sh.cfg.history {
+        while self.recent.len() > 256 {
             self.recent.pop_front();
         }
+        self.push_buf(m.block, rctx, logs);
         let (snap, diff) = ov.into_parts();
         self.publish(m.block, Arc::new(snap), ctx, diff);
+        let us = t0.elapsed().as_micros() as u64;
+        st.apply_us_max.fetch_max(us, Ordering::Relaxed);
     }
 
-    /// First message: an empty copy right before it (everything lazily loaded).
+    fn push_buf(&mut self, block: u64, rctx: ReplayCtx, logs: Vec<PoolLog>) {
+        self.buf.push_back(BufBlock { block, rctx, logs: Arc::new(logs) });
+        while self.buf.len() > self.cfg.keep_blocks {
+            self.buf.pop_front();
+        }
+    }
+
+    /// First message: an empty copy right before it (everything loaded later).
     fn bootstrap(&mut self, block: u64) -> Arc<Version> {
         let b = block.saturating_sub(1);
         let snap = Snapshot { pos: StatePosition { base_block: b, after_seq: None }, ..Snapshot::new(self.sh.volatile.clone()) };
@@ -849,14 +1134,7 @@ impl Intake {
     fn pool_keys_for(&self, log: &PoolLog) -> Vec<PoolKey> {
         let reg = self.c2.reg.read().unwrap();
         let Some(keys) = reg.by_addr.get(&log.address) else { return vec![] };
-        keys.iter()
-            .filter(|k| match k.1 {
-                // V4: the PoolManager's event names the pool id in topic 1.
-                Some(id) => log.topics.get(1) == Some(&id),
-                None => true,
-            })
-            .copied()
-            .collect()
+        keys.iter().filter(|k| is_pool_event(&reg.pools[*k].pool, log)).copied().collect()
     }
 
     fn pools_touched(&self, logs: &[PoolLog]) -> Vec<PoolKey> {
@@ -867,8 +1145,8 @@ impl Intake {
                 out.extend(keys.iter().copied());
             }
             // Coin transfers: the pools on either side.
-            if l.topics.len() == 3 && l.topics[0] == topics().transfer {
-                for side in [topic_addr(&l.topics[1]), topic_addr(&l.topics[2])] {
+            if let Some((_, from, to, _)) = coin_transfer(l) {
+                for side in [from, to] {
                     if let Some(keys) = reg.by_addr.get(&side) {
                         out.extend(keys.iter().copied());
                     }
@@ -880,8 +1158,34 @@ impl Intake {
         out
     }
 
-    /// Apply one event to one pool (if it's ready).
-    fn apply_pool_event(&mut self, ov: &mut Overlay, k: PoolKey, log: &PoolLog, rctx: &ReplayCtx, block: u64) {
+    /// Take a fork's changes into the block's copy and note the values the
+    /// pool now holds (they are forgotten with it if it goes unsure).
+    fn keep_fork(&mut self, ov: &mut Overlay, f: &Overlay, k: PoolKey) {
+        ov.absorb(f);
+        let mut reg = self.c2.reg.write().unwrap();
+        let holders: HashSet<Address> = reg.holders.keys().copied().collect();
+        let mut new_owned = Vec::new();
+        if let Some(e) = reg.pools.get_mut(&k) {
+            for (a, d) in &f.changes().accounts {
+                if holders.contains(a) && *a != e.pool.address {
+                    continue; // coin contract: balances are followed separately
+                }
+                for s in d.storage.keys() {
+                    e.items.insert((*a, *s));
+                }
+                if *a != e.pool.address && !e.owned.contains(a) {
+                    e.owned.push(*a);
+                    new_owned.push(*a);
+                }
+            }
+        }
+        for a in new_owned {
+            reg.owner_of.insert(a, k);
+        }
+    }
+
+    /// Apply one event to one READY pool.
+    fn apply_ready_event(&mut self, ov: &mut Overlay, k: PoolKey, log: &PoolLog, rctx: &ReplayCtx) {
         let c2 = self.c2.clone();
         let st = &c2.stats;
         let (pool, state) = {
@@ -890,25 +1194,15 @@ impl Intake {
             (e.pool.clone(), e.state)
         };
         if state != PoolState::Ready {
-            // Not loaded yet / unsure: its values are fetched later, at a
-            // block that already includes this event.
+            // Loading / unsure: the buffer keeps this report for its load.
             inc(&st.events_skipped_not_ready);
             return;
         }
-        let before: HashSet<Address> = ov.changes().accounts.keys().copied().collect();
-        let res = match pool.kind {
-            PoolKind::V2 | PoolKind::Solidly => apply_fields(ov, &pool, log, rctx.timestamp),
-            _ => self.with_fetch(ov, block, |o| apply_replay(o, &pool, log, rctx)),
-        };
-        match res {
+        let mut f = ov.fork();
+        match apply_event(&mut f, &pool, log, rctx) {
             ApplyResult::Applied => {
                 inc(&st.events_applied);
-                // Accounts a replay changed besides the pool and coins
-                // belong to it (forgotten with it if it goes unsure).
-                let new_owned: Vec<Address> = {
-                    let reg = self.c2.reg.read().unwrap();
-                    ov.changes().accounts.keys().filter(|a| !before.contains(*a) && **a != pool.address && !reg.holders.contains_key(*a)).copied().collect()
-                };
+                self.keep_fork(ov, &f, k);
                 let mut reg = self.c2.reg.write().unwrap();
                 if let Some(e) = reg.pools.get_mut(&k) {
                     e.events += 1;
@@ -916,156 +1210,103 @@ impl Intake {
                     if e.clean_events >= 50 {
                         e.strikes = 0;
                     }
-                    for a in new_owned {
-                        if !e.owned.contains(&a) {
-                            e.owned.push(a);
-                        }
-                    }
                 }
             }
             ApplyResult::Unsure(why) => {
                 inc(&st.events_unsure);
-                self.make_unsure(k, &why, Some(ov), block);
+                self.make_unsure(k, &why, Some(ov), rctx.number);
             }
             ApplyResult::NeedItems(items) => {
-                inc(&st.events_unsure);
-                self.make_unsure(k, &format!("still missing {} item(s) after fetching", items.len()), Some(ov), block);
+                // Don't wait: carry on in the background from this report.
+                self.start_partial_in_block(ov, k, (log.block.max(rctx.number), log.tx_index, log.log_index), items);
             }
         }
-    }
-
-    /// Replay (workstream B), fetching what it needs at the block before
-    /// (the pool's state then = our copy's, see file header), a few rounds.
-    fn with_fetch(&mut self, ov: &mut Overlay, block: u64, mut run: impl FnMut(&mut Overlay) -> ApplyResult) -> ApplyResult {
-        let rounds = self.sh.cfg.max_fill_rounds;
-        for _ in 0..rounds {
-            match run(ov) {
-                ApplyResult::NeedItems(items) => {
-                    inc(&self.c2.stats.need_item_rounds);
-                    let Some(node) = self.sh.node.clone() else { return ApplyResult::Unsure("needs node data, no node configured".into()) };
-                    // Code-by-hash can't be fetched: ask for that account instead
-                    // (the replayer should name the account; we can't map a hash).
-                    let fetchable: Vec<MissItem> = items.into_iter().filter(|i| !matches!(i, MissItem::Code(_))).collect();
-                    if fetchable.is_empty() {
-                        return ApplyResult::Unsure("needs contract code by hash only".into());
-                    }
-                    add(&self.c2.stats.node_items, fetchable.len() as u64);
-                    match fetch_facts(&*node, Class::Critical, block.saturating_sub(1), &fetchable) {
-                        Ok((facts, unavailable, failed)) => {
-                            if unavailable + failed > 0 && facts.is_empty() {
-                                inc(&self.c2.stats.node_errors);
-                                return ApplyResult::Unsure("node could not give the items it needs".into());
-                            }
-                            for f in &facts {
-                                ov.learn(f);
-                            }
-                        }
-                        Err(e) => {
-                            inc(&self.c2.stats.node_errors);
-                            return ApplyResult::Unsure(format!("node: {e}"));
-                        }
-                    }
-                }
-                r => return r,
-            }
-        }
-        ApplyResult::Unsure("too many fetch rounds".into())
     }
 
     /// A coin Transfer to / from one of our pools: move that pool's balance.
     /// Returns true if the log was such a transfer.
-    fn apply_coin_transfer(&mut self, ov: &mut Overlay, log: &PoolLog) -> bool {
-        let t = topics();
-        if log.topics.len() != 3 || log.topics[0] != t.transfer || log.data.len() != 32 {
-            return false;
-        }
-        let coin = log.address;
+    fn apply_coin_transfer(&mut self, ov: &mut Overlay, log: &PoolLog, block: u64) -> bool {
+        let Some((coin, from, to, v)) = coin_transfer(log) else { return false };
         let (followed, layout) = {
             let reg = self.c2.reg.read().unwrap();
             let Some(h) = reg.holders.get(&coin) else { return false };
+            if !h.contains(&from) && !h.contains(&to) {
+                return false;
+            }
             (h.clone(), reg.layouts.get(&coin).copied().flatten())
         };
-        let (from, to) = (topic_addr(&log.topics[1]), topic_addr(&log.topics[2]));
-        if !followed.contains(&from) && !followed.contains(&to) {
-            return false;
-        }
         inc(&self.c2.stats.coin_transfers);
-        // No known layout: the pools' balance slot isn't held (loading
-        // checks it), nothing to update.
+        for side in [from, to] {
+            if followed.contains(&side) {
+                self.touched_addr.insert(side, block);
+            }
+        }
+        // No known layout: the pools' balance slot isn't held, nothing to update.
         let Some(layout) = layout else { return true };
-        let v = super::word(&log.data, 0);
         for (side, is_from) in [(from, true), (to, false)] {
             if side == Address::ZERO {
                 continue; // mint / burn of the coin: no balance slot
             }
-            let kind = if followed.contains(&side) { Side::Pool } else { Side::Other };
             let slot = layout.key(side);
-            match kind {
-                Side::Pool => {
-                    if let Lookup::Known(cur) = ov.slot(coin, slot) {
-                        let nv = if is_from { cur.checked_sub(v) } else { cur.checked_add(v) };
-                        match nv {
-                            Some(x) => ov.set_slot(coin, slot, x),
-                            None => {
-                                // Our copy of that balance was wrong: forget it
-                                // (fetched again when needed). Never a guess.
-                                inc(&self.c2.stats.coin_slot_mismatch);
-                                ov.forget_slot(coin, slot);
-                            }
+            self.touched_slot.insert((coin, slot), block);
+            if followed.contains(&side) {
+                if let Lookup::Known(cur) = ov.slot(coin, slot) {
+                    match if is_from { cur.checked_sub(v) } else { cur.checked_add(v) } {
+                        Some(x) => ov.set_slot(coin, slot, x),
+                        None => {
+                            // Our copy of that balance was wrong: forget it
+                            // (fetched again when needed). Never a guess.
+                            inc(&self.c2.stats.coin_slot_mismatch);
+                            ov.forget_slot(coin, slot);
                         }
                     }
                 }
-                Side::Other => {
-                    // A wallet / the bot's contract: its other transfers never
-                    // reach us, so we don't vouch for its balance.
-                    if matches!(ov.slot(coin, slot), Lookup::Known(_)) {
-                        inc(&self.c2.stats.other_side_forgotten);
-                        ov.forget_slot(coin, slot);
-                    }
-                }
+            } else if matches!(ov.slot(coin, slot), Lookup::Known(_)) {
+                // A wallet / the bot's contract: its other transfers never
+                // reach us, so we don't vouch for its balance.
+                inc(&self.c2.stats.other_side_forgotten);
+                ov.forget_slot(coin, slot);
             }
         }
-        // from == to: the pool's balance is unchanged (sub then add): fine.
         true
     }
 
     // ---- unsure ----
     fn backoff(&self, strikes: u32, reason: &str) -> Duration {
-        if reason.starts_with("layout") {
+        if reason.starts_with("layout") || reason.starts_with("coin") {
             return Duration::from_secs(self.cfg.layout_retry_s);
         }
         let ms = self.cfg.reload_ms.saturating_mul(1u64 << strikes.saturating_sub(1).min(20));
         Duration::from_millis(ms.min(self.cfg.reload_max_ms.max(self.cfg.reload_ms)))
     }
 
-    /// Mark a pool unsure and forget what we held about it: in the block
-    /// being built (`ov`), and in every kept version from `from_block` on.
+    /// Mark a pool unsure and forget its values: in the block being built
+    /// (`ov`), and in every kept version from `from_block` on.
     fn make_unsure(&mut self, k: PoolKey, why: &str, ov: Option<&mut Overlay>, from_block: u64) {
-        let forget = {
+        self.partials.remove(&k);
+        let forget: Vec<(Address, U256)> = {
             let mut reg = self.c2.reg.write().unwrap();
             let Some(e) = reg.pools.get_mut(&k) else { return };
             e.strikes = e.strikes.saturating_add(1);
             e.clean_events = 0;
             e.state = PoolState::Unsure;
             e.reason = why.to_string();
+            e.gen += 1;
+            e.busy = false;
             let wait = self.backoff(e.strikes, why);
             e.retry_at = Instant::now() + wait;
-            let mut f = e.owned.clone();
-            f.push(e.pool.address);
-            f
+            e.items.iter().copied().collect()
         };
         inc(&self.c2.stats.unsure_marked);
         if let Some(ov) = ov {
-            for a in &forget {
-                ov.forget(*a);
+            for (a, s) in &forget {
+                ov.forget_slot(*a, *s);
             }
         }
-        let fb = from_block;
-        let f2 = forget.clone();
         let mut p = self.sh.published.write().unwrap();
-        rewrite_from(&mut p.versions, fb, |s| {
-            for a in &f2 {
-                s.apply_fact(&Fact::Forget(*a));
+        rewrite_from(&mut p.versions, from_block, |s| {
+            for (a, sl) in &forget {
+                forget_slot(s, *a, *sl);
             }
         });
     }
@@ -1102,315 +1343,731 @@ impl Intake {
         self.unsure_from(&keys, why, from);
     }
 
-    fn rewrite_all(&self, f: impl Fn(&mut Snapshot)) {
-        let mut p = self.sh.published.write().unwrap();
-        rewrite_from(&mut p.versions, 0, f);
-    }
-
-    // ---- loading ----
-    /// Load (or reload) pools that are due, at the newest version's block.
-    fn do_loads(&mut self) {
-        let now = Instant::now();
-        let due: Vec<PoolKey> = {
-            let reg = self.c2.reg.read().unwrap();
-            let mut d: Vec<(Instant, PoolKey)> = reg
-                .pools
-                .iter()
-                .filter(|(_, e)| e.state != PoolState::Ready && e.retry_at <= now)
-                .map(|(k, e)| (e.retry_at, *k))
-                .collect();
-            d.sort();
-            d.into_iter().take(self.cfg.load_batch).map(|x| x.1).collect()
-        };
-        if due.is_empty() {
-            return;
-        }
-        let Some(head) = self.sh.head() else { return };
-        let Some(node) = self.sh.node.clone() else {
-            let mut reg = self.c2.reg.write().unwrap();
-            for k in &due {
-                if let Some(e) = reg.pools.get_mut(k) {
-                    e.state = PoolState::Unsure;
-                    e.reason = "no node configured to load it from".into();
-                    e.retry_at = now + Duration::from_secs(3600);
-                }
-            }
-            return;
-        };
-        add(&self.c2.stats.loads, due.len() as u64);
-        match self.load_pools(&*node, head.block, &due) {
-            Ok(results) => {
-                let mut facts_all: Vec<Fact> = Vec::new();
-                let mut forget: Vec<Address> = Vec::new();
-                let mut reg = self.c2.reg.write().unwrap();
-                for (k, r) in results {
-                    let wait_reason;
-                    {
-                        let Some(e) = reg.pools.get_mut(&k) else { continue };
-                        forget.push(e.pool.address);
-                        forget.extend(e.owned.drain(..));
-                        match r {
-                            Ok(f) => {
-                                inc(&self.c2.stats.load_ok);
-                                facts_all.extend(f);
-                                e.state = PoolState::Ready;
-                                e.reason = String::new();
-                                continue;
-                            }
-                            Err(why) => {
-                                inc(&self.c2.stats.load_failed);
-                                e.strikes = e.strikes.saturating_add(1);
-                                e.state = PoolState::Unsure;
-                                e.reason = why.clone();
-                                wait_reason = (e.strikes, why);
-                            }
-                        }
-                    }
-                    let wait = self.backoff(wait_reason.0, &wait_reason.1);
-                    if let Some(e) = reg.pools.get_mut(&k) {
-                        e.retry_at = now + wait;
-                    }
-                }
-                drop(reg);
-                // Fresh values replace whatever we held (fetched AT the head block).
-                self.into_head(head.block, |s| {
-                    for a in &forget {
-                        s.apply_fact(&Fact::Forget(*a));
-                    }
-                    for f in &facts_all {
-                        s.apply_fact(f);
-                    }
-                });
-            }
-            Err(e) => {
-                inc(&self.c2.stats.node_errors);
-                let mut reg = self.c2.reg.write().unwrap();
-                for k in &due {
-                    if let Some(p) = reg.pools.get_mut(k) {
-                        p.retry_at = now + Duration::from_millis(self.cfg.reload_ms.max(1000));
-                        if p.state == PoolState::Loading {
-                            p.reason = format!("loading (node: {e})");
-                        }
-                    }
-                }
-            }
-        }
-    }
-
     /// Replace the head version's state (only if it is still at `block`).
-    fn into_head(&self, block: u64, f: impl Fn(&mut Snapshot)) {
+    fn into_head(&self, block: u64, f: impl Fn(&mut Snapshot)) -> bool {
         let mut p = self.sh.published.write().unwrap();
         let n = p.versions.len();
         if n == 0 {
-            return;
+            return false;
         }
         let h = p.versions[n - 1].clone();
         if h.block != block {
-            return;
+            return false;
         }
         let mut s = (*h.snap).clone();
         f(&mut s);
         p.versions[n - 1] = Arc::new(Version { snap: Arc::new(s), ..(*h).clone() });
         drop(p);
         self.sh.notify();
+        true
     }
 
-    /// Fetch + verify pools at `block`. Per pool: the facts to learn, or why not.
-    #[allow(clippy::type_complexity)]
-    fn load_pools(&mut self, node: &dyn NodeApi, block: u64, keys: &[PoolKey]) -> Result<Vec<(PoolKey, Result<Vec<Fact>, String>)>, NodeErr> {
-        let pools: Vec<TrackedPool> = {
-            let reg = self.c2.reg.read().unwrap();
-            keys.iter().filter_map(|k| reg.pools.get(k).map(|e| e.pool.clone())).collect()
-        };
-        // 1. Coin balance places we don't know yet (2 requests per coin, once).
-        let coins: Vec<Address> = {
-            let reg = self.c2.reg.read().unwrap();
-            let mut c: Vec<Address> = pools.iter().flat_map(|p| [p.token0, p.token1]).filter(|c| *c != Address::ZERO && !reg.layouts.contains_key(c)).collect();
-            c.sort();
-            c.dedup();
-            c
-        };
-        for c in coins {
-            inc(&self.c2.stats.probes);
-            add(&self.c2.stats.node_items, 2);
-            let l = probe_layout(node, c, block)?;
-            if l.is_none() {
-                inc(&self.c2.stats.probe_not_found);
+    // ---- loads: dispatch ----
+    /// An empty working copy (contract code is shared: it never changes).
+    fn empty_copy(&self) -> Overlay {
+        let codes = self.sh.head().map(|h| h.snap.codes.clone()).unwrap_or_default();
+        Overlay::new(Snapshot { codes, ..Snapshot::new(self.sh.volatile.clone()) })
+    }
+
+    fn load_jobs_in_flight(&self) -> usize {
+        self.jobs.values().filter(|j| matches!(j, JobFor::Load { .. })).count()
+    }
+
+    /// Send load jobs for pools that are due (never waits).
+    fn dispatch_loads(&mut self) {
+        let Some(head) = self.sh.head() else { return };
+        let now = Instant::now();
+        if self.loaders.is_none() {
+            let mut reg = self.c2.reg.write().unwrap();
+            for e in reg.pools.values_mut().filter(|e| e.state != PoolState::Ready && e.retry_at <= now) {
+                e.state = PoolState::Unsure;
+                e.reason = "no node configured to load it from".into();
+                e.retry_at = now + Duration::from_secs(3600);
             }
-            self.c2.reg.write().unwrap().layouts.insert(c, l);
+            return;
         }
-        // 2. One batch: core slots + getters + coin balances (slot vs balanceOf).
-        let reg = self.c2.reg.read().unwrap();
-        let mut b = Batch::new(block);
-        let mut plans: Vec<(PoolKey, Result<LoadPlan, String>)> = Vec::new();
-        for p in &pools {
-            let plan = (|| -> Result<LoadPlan, String> {
-                let mut lp = LoadPlan { slots: Vec::new(), getters: Vec::new(), coins: Vec::new() };
+        let max_jobs = self.cfg.loaders * 2;
+        if self.load_jobs_in_flight() >= max_jobs {
+            return;
+        }
+        // Coins whose balance place is unknown: find it first (probe).
+        let probe: Vec<Address> = {
+            let reg = self.c2.reg.read().unwrap();
+            let mut v: Vec<Address> = reg
+                .pools
+                .values()
+                .filter(|e| e.state != PoolState::Ready && !e.busy && e.retry_at <= now)
+                .flat_map(|e| [e.pool.token0, e.pool.token1])
+                .filter(|c| *c != Address::ZERO && !reg.layouts.contains_key(c) && !self.probing.contains(c))
+                .collect();
+            v.sort();
+            v.dedup();
+            v
+        };
+        for c in probe.into_iter().take(64usize.saturating_sub(self.probing.len())) {
+            self.probing.insert(c);
+            inc(&self.c2.stats.probes);
+            let id = self.new_job(JobFor::Probe);
+            self.loaders.as_ref().unwrap().send(Job::Probe { id, coin: c, block: head.block });
+        }
+        // Pools ready to load (both coins' places known).
+        let mut due: Vec<(Instant, PoolKey)> = {
+            let mut reg = self.c2.reg.write().unwrap();
+            let layouts = reg.layouts.clone();
+            let mut d = Vec::new();
+            for (k, e) in reg.pools.iter_mut() {
+                if e.state == PoolState::Ready || e.busy || e.retry_at > now {
+                    continue;
+                }
+                let coins: Vec<Address> = [e.pool.token0, e.pool.token1].into_iter().filter(|c| *c != Address::ZERO).collect();
+                if coins.iter().any(|c| !layouts.contains_key(c)) {
+                    continue; // still probing
+                }
+                if let Some(c) = coins.iter().find(|c| layouts[*c].is_none()) {
+                    e.state = PoolState::Unsure;
+                    e.reason = format!("coin {c}: can't find where it keeps balances");
+                    e.retry_at = now + Duration::from_secs(self.cfg.layout_retry_s);
+                    continue;
+                }
+                d.push((e.retry_at, *k));
+            }
+            d
+        };
+        due.sort();
+        let mut due = due.into_iter().map(|x| x.1).peekable();
+        while due.peek().is_some() && self.load_jobs_in_flight() < max_jobs {
+            let keys: Vec<PoolKey> = due.by_ref().take(self.cfg.load_batch).collect();
+            self.send_load(&keys, head.block);
+        }
+    }
+
+    /// One load job for these pools at `block`.
+    fn send_load(&mut self, keys: &[PoolKey], block: u64) {
+        let mut items: Vec<MissItem> = Vec::new();
+        let mut calls: Vec<(Address, Bytes)> = Vec::new();
+        let mut reqs = Vec::new();
+        {
+            let mut reg = self.c2.reg.write().unwrap();
+            let layouts = reg.layouts.clone();
+            for k in keys {
+                let Some(e) = reg.pools.get_mut(k) else { continue };
+                let p = e.pool.clone();
+                let start = items.len();
+                let mut seen: HashSet<MissItem> = HashSet::new();
+                let mut push = |items: &mut Vec<MissItem>, m: MissItem| {
+                    if seen.insert(m.clone()) {
+                        items.push(m);
+                    }
+                };
+                for s in core_slots(p.kind) {
+                    push(&mut items, MissItem::Slot(p.address, U256::from(*s)));
+                }
+                if !e.verified {
+                    let tok: &[u64] = match p.kind {
+                        PoolKind::V2 => &[v2::TOKEN0, v2::TOKEN1],
+                        PoolKind::Solidly => &[sol::TOKEN1],
+                        _ => &[],
+                    };
+                    for s in tok {
+                        push(&mut items, MissItem::Slot(p.address, U256::from(*s)));
+                    }
+                }
+                for (a, s) in &e.items {
+                    push(&mut items, MissItem::Slot(*a, *s));
+                }
+                for a in &e.accounts {
+                    push(&mut items, MissItem::Account(*a));
+                }
+                let mut coin_checks = Vec::new();
                 for c in [p.token0, p.token1] {
                     if c == Address::ZERO {
-                        continue; // native ETH (V4): no coin contract
+                        continue;
                     }
-                    let l = reg.layouts.get(&c).copied().flatten().ok_or(format!("coin {c}: can't find where it keeps balances"))?;
-                    let holder = p.address;
-                    lp.coins.push((c, l.key(holder), b.slot(c, l.key(holder)), b.call(c, &balance_of_data(holder))));
-                }
-                for s in core_slots(p.kind) {
-                    lp.slots.push((U256::from(*s), b.slot(p.address, U256::from(*s))));
-                }
-                match p.kind {
-                    PoolKind::V2 => {
-                        for s in [v2::TOKEN0, v2::TOKEN1] {
-                            lp.slots.push((U256::from(s), b.slot(p.address, U256::from(s))));
-                        }
-                        for g in ["getReserves()", "totalSupply()", "price0CumulativeLast()", "price1CumulativeLast()"] {
-                            lp.getters.push((g, b.call(p.address, &selector(g))));
-                        }
+                    let Some(Some(l)) = layouts.get(&c) else { continue };
+                    let slot = l.key(p.address);
+                    let idx = items.len();
+                    push(&mut items, MissItem::Slot(c, slot));
+                    if !self.coin_ok.contains(&c) && items.len() > idx {
+                        coin_checks.push((c, slot, idx, calls.len()));
+                        calls.push((c, parse_bytes(&balance_of_data(p.address)).unwrap_or_default()));
                     }
-                    PoolKind::Solidly => {
-                        lp.slots.push((U256::from(sol::TOKEN1), b.slot(p.address, U256::from(sol::TOKEN1))));
-                        for g in [
-                            "getReserves()", "totalSupply()", "reserve0CumulativeLast()", "reserve1CumulativeLast()",
-                            "index0()", "index1()", "observationLength()",
-                        ] {
-                            lp.getters.push((g, b.call(p.address, &selector(g))));
-                        }
-                    }
-                    _ => {}
                 }
-                Ok(lp)
-            })();
-            plans.push((key_of(p), plan));
+                let mut getters = Vec::new();
+                if !e.verified {
+                    let names: &[&'static str] = match p.kind {
+                        PoolKind::V2 => &["getReserves()"],
+                        PoolKind::Solidly => &["getReserves()", "index0()", "observationLength()"],
+                        _ => &[],
+                    };
+                    for g in names {
+                        getters.push((*g, calls.len()));
+                        calls.push((p.address, Bytes::copy_from_slice(&keccak256(g.as_bytes())[..4])));
+                    }
+                }
+                e.busy = true;
+                e.state = PoolState::Loading;
+                e.reason = "loading: fetching from the node".into();
+                e.rounds = 1;
+                reqs.push(LoadReq { key: *k, gen: e.gen, items: (start, items.len()), getters, coin_checks });
+            }
         }
-        drop(reg);
-        add(&self.c2.stats.node_items, b.calls.len() as u64);
-        let res = b.send(node)?;
-        // 3. Solidly: the last observation's time (needs the count first).
-        let mut b2 = Batch::new(block);
-        let mut obs_idx: HashMap<PoolKey, (U256, usize)> = HashMap::new();
-        for (p, (k, plan)) in pools.iter().zip(plans.iter()) {
-            if let (PoolKind::Solidly, Ok(lp)) = (p.kind, plan) {
-                if let Some(Ok(len)) = lp.slots.iter().find(|s| s.0 == U256::from(sol::OBS_LEN)).map(|s| res.u256(s.1)) {
-                    if !len.is_zero() {
-                        let slot = obs_slot(len - U256::from(1), 0);
-                        obs_idx.insert(*k, (slot, b2.slot(p.address, slot)));
+        if reqs.is_empty() {
+            return;
+        }
+        add(&self.c2.stats.loads, reqs.len() as u64);
+        let id = self.new_job(JobFor::Load { pools: reqs });
+        self.loaders.as_ref().unwrap().send(Job::Fetch { id, block, items, calls });
+    }
+
+    // ---- node answers ----
+    fn on_done(&mut self, d: Done) {
+        let id = match &d {
+            Done::Fetch { id, .. } | Done::Probe { id, .. } | Done::Tip { id, .. } => *id,
+        };
+        let Some(job) = self.jobs.remove(&id) else { return };
+        match (job, d) {
+            (JobFor::Probe, Done::Probe { coin, res, .. }) => {
+                self.probing.remove(&coin);
+                match res {
+                    Ok(l) => {
+                        if l.is_none() {
+                            inc(&self.c2.stats.probe_not_found);
+                        }
+                        self.c2.reg.write().unwrap().layouts.insert(coin, l);
+                    }
+                    Err(_) => inc(&self.c2.stats.node_errors), // asked again next time
+                }
+            }
+            (JobFor::Tip, Done::Tip { res, .. }) => {
+                if let Ok((tip, bf)) = res {
+                    self.sh.node_tip.store(tip, Ordering::Relaxed);
+                    if bf > 0 {
+                        self.basefee = bf;
                     }
                 }
             }
+            (JobFor::Load { pools }, Done::Fetch { block, res, .. }) => self.on_load(pools, block, res),
+            (JobFor::Need { key, gen }, Done::Fetch { block, res, .. }) => self.on_need(key, gen, block, res),
+            (JobFor::Fill, Done::Fetch { block, res, .. }) => self.on_fill(block, res),
+            _ => {}
         }
-        let res2 = if b2.calls.is_empty() {
-            BatchRes { r: vec![] }
-        } else {
-            add(&self.c2.stats.node_items, b2.calls.len() as u64);
-            b2.send(node)?
+    }
+
+    /// Put a pool back in the queue (node trouble, not the pool's fault).
+    fn retry_later(&mut self, k: PoolKey, gen: u64, why: &str) {
+        self.partials.remove(&k);
+        let mut reg = self.c2.reg.write().unwrap();
+        if let Some(e) = reg.pools.get_mut(&k) {
+            if e.gen == gen {
+                e.busy = false;
+                e.state = PoolState::Loading;
+                e.reason = format!("loading: {why}");
+                e.gen += 1;
+                e.retry_at = Instant::now() + Duration::from_millis(self.cfg.reload_ms.max(500));
+            }
+        }
+    }
+
+    fn on_load(&mut self, pools: Vec<LoadReq>, block: u64, res: Result<FetchOut, crate::node::NodeErr>) {
+        let out = match res {
+            Ok(o) => o,
+            Err(e) => {
+                inc(&self.c2.stats.node_errors);
+                for r in pools {
+                    self.retry_later(r.key, r.gen, &format!("node: {e}"));
+                }
+                return;
+            }
         };
-        // 4. Check and turn into facts.
-        let mut out = Vec::new();
-        for (p, (k, plan)) in pools.iter().zip(plans) {
-            let r = plan.and_then(|lp| {
-                let mut facts = Vec::new();
-                let mut vals: HashMap<U256, U256> = HashMap::new();
-                for (s, i) in &lp.slots {
-                    let v = res.u256(*i)?;
-                    vals.insert(*s, v);
-                    facts.push(Fact::Slot(p.address, *s, v));
+        for r in pools {
+            let pool = {
+                let reg = self.c2.reg.read().unwrap();
+                match reg.pools.get(&r.key) {
+                    Some(e) if e.gen == r.gen && e.busy => e.pool.clone(),
+                    _ => continue, // untracked / unsure meanwhile
                 }
-                if let Some((slot, i)) = obs_idx.get(&k) {
-                    let v = res2.u256(*i)?;
-                    facts.push(Fact::Slot(p.address, *slot, v));
-                }
-                verify_layout(p, &vals, &lp.getters, &res)?;
-                for (c, slot, si, ci) in &lp.coins {
-                    let held = res.u256(*si)?;
-                    let bal = res.word(*ci, 0).map_err(|e| format!("coin {c}: balanceOf failed ({e})"))?;
-                    if held != bal {
-                        return Err(format!("coin {c}: balance not readable from its storage (slot {held} vs balanceOf {bal})"));
+            };
+            let mut facts = Vec::new();
+            let mut vals: HashMap<(Address, U256), U256> = HashMap::new();
+            let mut err: Option<(bool, String)> = None; // (node's fault, why)
+            for (it, f) in &out.items[r.items.0..r.items.1] {
+                match f {
+                    Ok(f) => {
+                        if let Fetched::Slot(a, s, v) = f {
+                            vals.insert((*a, *s), *v);
+                        }
+                        facts.push(fact_of(f));
                     }
-                    facts.push(Fact::Slot(*c, *slot, held));
+                    Err(ItemErr::BlockUnavailable) => err = Some((true, "node not at that block yet".into())),
+                    Err(e) => err = Some((true, format!("node could not give {it:?}: {e:?}"))),
                 }
-                Ok(facts)
-            });
-            out.push((k, r));
+            }
+            if let Some((_, why)) = err {
+                self.retry_later(r.key, r.gen, &why);
+                continue;
+            }
+            // Storage layout check (first load only).
+            if !r.getters.is_empty() {
+                let get = |name: &str, w: usize| -> Result<U256, String> {
+                    let i = r.getters.iter().find(|x| x.0 == name).map(|x| x.1).ok_or("getter missing")?;
+                    out_word(&out.calls[i], w).map_err(|e| format!("layout: {name} failed ({e})"))
+                };
+                if let Err(why) = verify_layout(&pool, &vals, get) {
+                    inc(&self.c2.stats.load_failed);
+                    self.make_unsure(r.key, &why, None, block + 1);
+                    continue;
+                }
+            }
+            // Coin check: the balance really is that storage value (once per coin).
+            let mut coin_bad = None;
+            for (c, slot, _, ci) in &r.coin_checks {
+                let held = vals.get(&(*c, *slot)).copied();
+                match out_word(&out.calls[*ci], 0) {
+                    Ok(b) if Some(b) == held => {
+                        self.coin_ok.insert(*c);
+                    }
+                    Ok(b) => coin_bad = Some((*c, format!("coin {c}: balance not readable from its storage (slot {held:?} vs balanceOf {b})"))),
+                    Err(e) => coin_bad = Some((*c, format!("coin {c}: balanceOf failed ({e})"))),
+                }
+            }
+            if let Some((c, why)) = coin_bad {
+                inc(&self.c2.stats.load_failed);
+                self.c2.reg.write().unwrap().layouts.insert(c, None);
+                self.make_unsure(r.key, &why, None, block + 1);
+                continue;
+            }
+            {
+                let mut reg = self.c2.reg.write().unwrap();
+                if let Some(e) = reg.pools.get_mut(&r.key) {
+                    e.verified = true;
+                }
+            }
+            let mut ov = self.empty_copy();
+            for f in &facts {
+                ov.learn(f);
+            }
+            self.continue_partial(r.key, Partial { ov, cursor: (block + 1, 0, 0), gen: r.gen });
         }
-        Ok(out)
+    }
+
+    fn on_need(&mut self, key: PoolKey, gen: u64, block: u64, res: Result<FetchOut, crate::node::NodeErr>) {
+        let Some(mut part) = self.partials.remove(&key) else { return };
+        if part.gen != gen {
+            return;
+        }
+        let out = match res {
+            Ok(o) => o,
+            Err(e) => {
+                inc(&self.c2.stats.node_errors);
+                self.retry_later(key, gen, &format!("node: {e}"));
+                return;
+            }
+        };
+        for (it, f) in &out.items {
+            match f {
+                Ok(f) => part.ov.learn(&fact_of(f)),
+                Err(e) => {
+                    self.retry_later(key, gen, &format!("node could not give {it:?} at block {block}: {e:?}"));
+                    return;
+                }
+            }
+        }
+        self.continue_partial(key, part);
+    }
+
+    /// Ask for items a working copy needs, at the block before its cursor.
+    fn send_need(&mut self, key: PoolKey, part: Partial, items: Vec<MissItem>) {
+        inc(&self.c2.stats.need_item_rounds);
+        let gen = part.gen;
+        let over = {
+            let mut reg = self.c2.reg.write().unwrap();
+            match reg.pools.get_mut(&key) {
+                Some(e) => {
+                    e.rounds += 1;
+                    e.reason = format!("loading: fetching {} more value(s) (round {})", items.len(), e.rounds);
+                    e.rounds > self.cfg.max_rounds
+                }
+                None => return,
+            }
+        };
+        if over {
+            self.make_unsure(key, "too many fetch rounds while loading", None, u64::MAX);
+            return;
+        }
+        // Code can't be fetched by hash; the replayer names accounts instead.
+        let items: Vec<MissItem> = items.into_iter().filter(|m| !matches!(m, MissItem::Code(_))).collect();
+        if items.is_empty() {
+            self.make_unsure(key, "needs contract code it can't name", None, u64::MAX);
+            return;
+        }
+        let at = part.cursor.0.saturating_sub(1);
+        self.partials.insert(key, part);
+        let id = self.new_job(JobFor::Need { key, gen });
+        match &self.loaders {
+            Some(l) => l.send(Job::Fetch { id, block: at, items, calls: vec![] }),
+            None => {
+                self.jobs.remove(&id);
+                self.make_unsure(key, "no node configured to load it from", None, u64::MAX);
+            }
+        }
+    }
+
+    /// A ready replay pool needs values it doesn't hold, in the middle of a
+    /// block: from this report on it loads in the background (never waits).
+    fn start_partial_in_block(&mut self, ov: &mut Overlay, k: PoolKey, cursor: Pos, items: Vec<MissItem>) {
+        let (pool, owned_items, accounts, gen) = {
+            let mut reg = self.c2.reg.write().unwrap();
+            let Some(e) = reg.pools.get_mut(&k) else { return };
+            e.gen += 1;
+            e.state = PoolState::Loading;
+            e.busy = true;
+            e.rounds = 0;
+            (e.pool.clone(), e.items.clone(), e.accounts.clone(), e.gen)
+        };
+        // Its working copy: what the block copy holds for it right now.
+        let mut part = self.empty_copy();
+        for (a, s) in &owned_items {
+            if let Lookup::Known(v) = ov.slot(*a, *s) {
+                part.learn(&Fact::Slot(*a, *s, v));
+            }
+        }
+        for a in accounts.iter().chain(std::iter::once(&pool.address)) {
+            if let Some(acct) = ov.snapshot().accounts.get(a) {
+                if let Basics::Known(info) = &acct.basics {
+                    part.learn(&Fact::Basics { addr: *a, info: info.clone(), code: None });
+                }
+            }
+        }
+        let layouts = self.c2.reg.read().unwrap().layouts.clone();
+        for c in [pool.token0, pool.token1] {
+            if let Some(Some(l)) = layouts.get(&c) {
+                let s = l.key(pool.address);
+                if let Lookup::Known(v) = ov.slot(c, s) {
+                    part.learn(&Fact::Slot(c, s, v));
+                }
+            }
+        }
+        // The block copy no longer vouches for it.
+        for (a, s) in &owned_items {
+            ov.forget_slot(*a, *s);
+        }
+        self.send_need(k, Partial { ov: part, cursor, gen }, items);
+    }
+
+    /// Carry a working copy forward through the buffered reports up to the
+    /// newest block, then put it into the copy (pool READY). Pauses when it
+    /// needs node values (send_need).
+    fn continue_partial(&mut self, key: PoolKey, mut part: Partial) {
+        let (pool, gen_now) = {
+            let reg = self.c2.reg.read().unwrap();
+            match reg.pools.get(&key) {
+                Some(e) => (e.pool.clone(), e.gen),
+                None => return,
+            }
+        };
+        if gen_now != part.gen {
+            return;
+        }
+        // Missing core values (e.g. Solidly's last observation): fetch first.
+        let core = missing_core(&pool, &part.ov);
+        if !core.is_empty() {
+            self.send_need(key, part, core);
+            return;
+        }
+        let last = self.last_block.unwrap_or(0);
+        if part.cursor.0 <= last && self.buf.front().is_none_or(|b| b.block > part.cursor.0) {
+            // The reports since the fetch are no longer kept (too slow): start over.
+            inc(&self.c2.stats.carry_too_old);
+            self.retry_later(key, part.gen, "load took longer than the reports kept (ARBSIM_COPY2_KEEP_BLOCKS)");
+            return;
+        }
+        let layout = |c: Address| self.c2.reg.read().unwrap().layouts.get(&c).copied().flatten();
+        let coin_slots: Vec<(Address, U256)> =
+            [pool.token0, pool.token1].into_iter().filter(|c| *c != Address::ZERO).filter_map(|c| layout(c).map(|l| (c, l.key(pool.address)))).collect();
+        let start = self.buf.partition_point(|b| b.block < part.cursor.0);
+        let blocks: Vec<(u64, ReplayCtx, Arc<Vec<PoolLog>>)> = self.buf.iter().skip(start).map(|b| (b.block, b.rctx, b.logs.clone())).collect();
+        for (block, rctx, logs) in blocks {
+            part.ov.set_position(StatePosition { base_block: block, after_seq: None });
+            for log in logs.iter() {
+                let pos = (block, log.tx_index, log.log_index);
+                if pos < part.cursor {
+                    continue;
+                }
+                if is_pool_event(&pool, log) {
+                    inc(&self.c2.stats.carried_events);
+                    let mut f = part.ov.fork();
+                    match apply_event(&mut f, &pool, log, &rctx) {
+                        ApplyResult::Applied => part.ov.absorb(&f),
+                        ApplyResult::NeedItems(items) => {
+                            part.cursor = pos;
+                            self.send_need(key, part, items);
+                            return;
+                        }
+                        ApplyResult::Unsure(why) => {
+                            self.make_unsure(key, &why, None, u64::MAX);
+                            return;
+                        }
+                    }
+                }
+                // Its coin balances.
+                if let Some((coin, from, to, v)) = coin_transfer(log) {
+                    for (side, is_from) in [(from, true), (to, false)] {
+                        if side != pool.address {
+                            continue;
+                        }
+                        let Some((_, slot)) = coin_slots.iter().find(|(c, _)| *c == coin) else { continue };
+                        if let Lookup::Known(cur) = part.ov.slot(coin, *slot) {
+                            match if is_from { cur.checked_sub(v) } else { cur.checked_add(v) } {
+                                Some(x) => part.ov.set_slot(coin, *slot, x),
+                                None => {
+                                    self.make_unsure(key, &format!("coin {coin}: balance went below zero while loading"), None, u64::MAX);
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if pool.kind == PoolKind::Algebra && part.cursor <= (block, END, END) {
+                let mut f = part.ov.fork();
+                match finish_block(&mut f, &pool, &rctx) {
+                    ApplyResult::Applied => part.ov.absorb(&f),
+                    ApplyResult::NeedItems(items) => {
+                        part.cursor = (block, END, END);
+                        self.send_need(key, part, items);
+                        return;
+                    }
+                    ApplyResult::Unsure(why) => {
+                        self.make_unsure(key, &format!("end of block: {why}"), None, u64::MAX);
+                        return;
+                    }
+                }
+            }
+            part.cursor = (block + 1, 0, 0);
+        }
+        self.merge(key, part);
+    }
+
+    /// The working copy has reached the newest block: put its values into
+    /// the head version and mark the pool READY.
+    fn merge(&mut self, key: PoolKey, part: Partial) {
+        let Some(head) = self.sh.head() else { return };
+        let (pool, holders, layouts) = {
+            let reg = self.c2.reg.read().unwrap();
+            let Some(e) = reg.pools.get(&key) else { return };
+            (e.pool.clone(), reg.holders.keys().copied().collect::<HashSet<Address>>(), reg.layouts.clone())
+        };
+        let snap = part.ov.snapshot();
+        let mut facts: Vec<Fact> = Vec::new();
+        let mut items: HashSet<(Address, U256)> = HashSet::new();
+        let mut accounts: HashSet<Address> = HashSet::new();
+        let mut owned: Vec<Address> = Vec::new();
+        for (addr, acct) in snap.accounts.iter() {
+            if holders.contains(addr) && *addr != pool.address {
+                // A coin: only this pool's balance.
+                if let Some(Some(l)) = layouts.get(addr) {
+                    let s = l.key(pool.address);
+                    if let Some(v) = acct.storage.get(&s) {
+                        facts.push(Fact::Slot(*addr, s, *v));
+                    }
+                }
+                continue;
+            }
+            if let Basics::Known(info) = &acct.basics {
+                accounts.insert(*addr);
+                let code = info.as_ref().and_then(|i| snap.codes.get(&i.code_hash).cloned());
+                facts.push(Fact::Basics { addr: *addr, info: info.clone(), code });
+            }
+            for (s, v) in acct.storage.iter() {
+                items.insert((*addr, *s));
+                facts.push(Fact::Slot(*addr, *s, *v));
+            }
+            if *addr != pool.address {
+                owned.push(*addr);
+            }
+        }
+        // Write where the head doesn't know the value (values the head knows
+        // are followed exactly already, e.g. a coin balance or a V4
+        // PoolManager slot shared with a ready pool).
+        let ok = self.into_head(head.block, |s| {
+            for f in &facts {
+                let known = match f {
+                    Fact::Slot(a, sl, _) => !matches!(s.storage(*a, *sl), Lookup::Missing),
+                    Fact::Basics { addr, .. } => s.accounts.get(addr).is_some_and(|x| x.basics != Basics::Unknown),
+                    _ => true,
+                };
+                if !known {
+                    s.apply_fact(f);
+                }
+            }
+        });
+        if !ok {
+            self.retry_later(key, part.gen, "copy moved on while merging");
+            return;
+        }
+        inc(&self.c2.stats.merges);
+        inc(&self.c2.stats.load_ok);
+        let mut reg = self.c2.reg.write().unwrap();
+        if let Some(e) = reg.pools.get_mut(&key) {
+            e.state = PoolState::Ready;
+            e.reason = String::new();
+            e.busy = false;
+            e.ever_ready = true;
+            e.ready_since = head.block;
+            e.items.extend(items);
+            e.accounts.extend(accounts);
+            for o in &owned {
+                if !e.owned.contains(o) {
+                    e.owned.push(*o);
+                }
+            }
+        }
+        for o in owned {
+            reg.owner_of.insert(o, key);
+        }
     }
 
     // ---- fills ----
-    /// Fetch items checks missed, AT the head block, refusing pools that
-    /// aren't ready.
-    fn do_fills(&mut self) {
-        let items = self.fills.take(100);
+    /// Which address's pools a slot belongs to (None = not followed).
+    fn gate_of(reg: &Registry, a: Address, s: U256) -> Option<Address> {
+        if reg.by_addr.contains_key(&a) || reg.owner_of.contains_key(&a) {
+            return Some(a);
+        }
+        if let (Some(h), Some(Some(l))) = (reg.holders.get(&a), reg.layouts.get(&a)) {
+            return h.iter().find(|h| l.key(**h) == s).copied();
+        }
+        None
+    }
+
+    /// Send items checks missed to the loaders (fetched at the head block).
+    fn dispatch_fills(&mut self) {
+        if self.loaders.is_none() || self.jobs.values().filter(|j| matches!(j, JobFor::Fill)).count() >= 2 {
+            return;
+        }
+        let items = self.fills.take(200);
         if items.is_empty() {
             return;
         }
-        let Some(node) = self.sh.node.clone() else { return };
         let Some(head) = self.sh.head() else { return };
         let (ok, refused): (Vec<MissItem>, Vec<MissItem>) = {
             let reg = self.c2.reg.read().unwrap();
-            items
-                .into_iter()
-                .filter(|m| needs(&head.snap, m))
-                .partition(|m| match m {
-                    MissItem::Account(_) => true, // basics + code: never pool-specific state
-                    MissItem::Slot(a, _) => reg.blocked_account(a).is_none(),
-                    MissItem::Code(_) => false,
-                })
+            items.into_iter().filter(|m| needs(&head.snap, m)).partition(|m| match m {
+                MissItem::Account(_) => true, // basics + code
+                MissItem::Slot(a, s) => match Self::gate_of(&reg, *a, *s) {
+                    Some(g) => reg.blocked_account(&g).is_none(),
+                    None => true,
+                },
+                MissItem::Code(_) => false,
+            })
         };
         add(&self.c2.stats.fill_refused, refused.len() as u64);
         if ok.is_empty() {
             return;
         }
         inc(&self.c2.stats.fills);
-        add(&self.c2.stats.node_items, ok.len() as u64);
-        match fetch_facts(&*node, Class::Fill, head.block, &ok) {
-            Ok((facts, unavailable, _)) => {
-                add(&self.c2.stats.fill_items, facts.len() as u64);
-                if unavailable > 0 {
-                    // The node isn't at our block yet: try again later.
-                    self.fills.push(ok.iter().filter(|m| !facts.iter().any(|f| fact_item(f).as_ref() == Some(*m))).cloned());
-                }
-                // Re-check after the fetch: a pool may have gone unsure meanwhile.
-                let reg = self.c2.reg.read().unwrap();
-                let facts: Vec<Fact> = facts
-                    .into_iter()
-                    .filter(|f| match f {
-                        Fact::Slot(a, _, _) => reg.blocked_account(a).is_none(),
-                        _ => true,
-                    })
-                    .collect();
-                drop(reg);
-                self.into_head(head.block, |s| {
-                    for f in &facts {
-                        // Never overwrite something the copy already knows.
-                        let known = match f {
-                            Fact::Slot(a, sl, _) => !matches!(s.storage(*a, *sl), Lookup::Missing),
-                            _ => false,
-                        };
-                        if !known {
-                            s.apply_fact(f);
+        let id = self.new_job(JobFor::Fill);
+        self.loaders.as_ref().unwrap().send(Job::Fetch { id, block: head.block, items: ok, calls: vec![] });
+    }
+
+    /// Fill answers: used only if nothing we follow touched them after k.
+    fn on_fill(&mut self, k: u64, res: Result<FetchOut, crate::node::NodeErr>) {
+        let Ok(out) = res else {
+            inc(&self.c2.stats.node_errors);
+            return;
+        };
+        let mut good: Vec<Fetched> = Vec::new();
+        let mut again: Vec<MissItem> = Vec::new();
+        {
+            let mut reg = self.c2.reg.write().unwrap();
+            for (it, f) in out.items {
+                let f = match f {
+                    Ok(f) => f,
+                    Err(ItemErr::BlockUnavailable) => {
+                        again.push(it);
+                        continue;
+                    }
+                    Err(_) => continue,
+                };
+                if let Fetched::Slot(a, s, _) = &f {
+                    if self.touched_slot.get(&(*a, *s)).is_some_and(|b| *b > k) {
+                        again.push(it);
+                        continue;
+                    }
+                    if let Some(g) = Self::gate_of(&reg, *a, *s) {
+                        let keys = reg.pools_of(&g);
+                        let all_ok = keys.iter().all(|pk| reg.pools.get(pk).is_some_and(|e| e.state == PoolState::Ready && e.ready_since <= k));
+                        let quiet = self.touched_addr.get(&g).is_none_or(|b| *b <= k);
+                        if !all_ok {
+                            continue; // refused: the pool isn't followed right now
+                        }
+                        if !quiet {
+                            again.push(it);
+                            continue;
+                        }
+                        // A pool's own value: followed (and forgotten) with it.
+                        if reg.by_addr.contains_key(a) || reg.owner_of.contains_key(a) {
+                            for pk in keys {
+                                if let Some(e) = reg.pools.get_mut(&pk) {
+                                    e.items.insert((*a, *s));
+                                }
+                            }
                         }
                     }
-                });
-            }
-            Err(_) => {
-                inc(&self.c2.stats.node_errors);
+                }
+                good.push(f);
             }
         }
+        if !again.is_empty() {
+            add(&self.c2.stats.fill_retry, again.len() as u64);
+            self.fills.push(again);
+        }
+        if good.is_empty() {
+            return;
+        }
+        add(&self.c2.stats.fill_items, good.len() as u64);
+        {
+            let mut p = self.sh.published.write().unwrap();
+            reconcile(&mut p.versions, k, &good);
+        }
+        self.sh.notify();
     }
 
     // ---- upkeep ----
-    fn upkeep_header(&mut self) {
-        let Some(node) = self.sh.node.clone() else { return };
-        let every = Duration::from_secs(self.sh.cfg.header_every_s.max(1));
-        if self.last_header.is_some_and(|t| t.elapsed() < every) {
+    fn dispatch_tip(&mut self) {
+        if self.loaders.is_none() || self.cfg.tip_every_s == 0 {
             return;
         }
-        self.last_header = Some(Instant::now());
-        if let Ok(tip) = node::block_number(&*node, Class::Header) {
-            self.sh.node_tip.store(tip, Ordering::Relaxed);
-            if let Ok(Some(h)) = node::get_header(&*node, Class::Header, tip) {
-                self.basefee = h.base_fee;
-            }
+        if self.last_tip.is_some_and(|t| t.elapsed() < Duration::from_secs(self.cfg.tip_every_s)) {
+            return;
         }
+        self.last_tip = Some(Instant::now());
+        let id = self.new_job(JobFor::Tip);
+        self.loaders.as_ref().unwrap().send(Job::Tip { id });
+    }
+
+    /// Log (once) when every pool of the current load round has been tried.
+    fn note_round(&mut self) {
+        let Some((t0, req0, n)) = self.round else { return };
+        let (waiting, ready, unsure) = {
+            let reg = self.c2.reg.read().unwrap();
+            let waiting = reg.pools.values().filter(|e| e.state == PoolState::Loading && !e.ever_ready).count();
+            let (_, r, u) = reg.counts();
+            (waiting, r, u)
+        };
+        let requests = self.c2.node_requests.load(Ordering::Relaxed) - req0;
+        let secs = t0.elapsed().as_secs_f64();
+        *self.c2.load_round.lock().unwrap() = LoadRound { pools: n, seconds: secs, requests, ready, unsure, done: waiting == 0 };
+        if waiting == 0 {
+            eprintln!("[arbsim] copy2: load round done: {n} new pool(s) in {secs:.1} s using {requests} node requests; now {ready} ready, {unsure} unsure");
+            self.round = None;
+        }
+    }
+
+    fn prune_touched(&mut self) {
+        let oldest = self.buf.front().map(|b| b.block).unwrap_or(0);
+        let keep_from = oldest.min(self.sh.published.read().unwrap().versions.front().map(|v| v.block).unwrap_or(0));
+        self.touched_addr.retain(|_, b| *b >= keep_from);
+        self.touched_slot.retain(|_, b| *b >= keep_from);
     }
 
     /// Memory cap: drop accounts that aren't our pools / coins / owned.
@@ -1419,9 +2076,7 @@ impl Intake {
             let reg = self.c2.reg.read().unwrap();
             let mut k: HashSet<Address> = reg.by_addr.keys().copied().collect();
             k.extend(reg.holders.keys().copied());
-            for e in reg.pools.values() {
-                k.extend(e.owned.iter().copied());
-            }
+            k.extend(reg.owner_of.keys().copied());
             k
         };
         let (ma, ms) = (self.sh.cfg.max_accounts, self.sh.cfg.max_slots);
@@ -1430,8 +2085,7 @@ impl Intake {
         if a <= ma && s <= ms {
             return;
         }
-        let block = h.block;
-        self.into_head(block, |snap| {
+        self.into_head(h.block, |snap| {
             snap.evict(ma, ms, |_| 0, |x| keep.contains(x));
         });
     }
@@ -1465,89 +2119,15 @@ fn needs(s: &Snapshot, m: &MissItem) -> bool {
     }
 }
 
-fn fact_item(f: &Fact) -> Option<MissItem> {
-    match f {
-        Fact::Slot(a, s, _) => Some(MissItem::Slot(*a, *s)),
-        Fact::Basics { addr, .. } => Some(MissItem::Account(*addr)),
-        _ => None,
-    }
-}
-
 /// 4-byte function selector as call data.
 pub fn selector(sig: &str) -> String {
     to_hex(&keccak256(sig.as_bytes()).0[..4])
 }
 
-// ---------------------------------------------------------------------------
-// Load batch + layout check
-// ---------------------------------------------------------------------------
-struct LoadPlan {
-    /// (slot, index in batch)
-    slots: Vec<(U256, usize)>,
-    /// (getter signature, index in batch)
-    getters: Vec<(&'static str, usize)>,
-    /// (coin, balance slot of the pool, slot read index, balanceOf call index)
-    coins: Vec<(Address, U256, usize, usize)>,
-}
-
-/// One node batch at a fixed block.
-struct Batch {
-    block: u64,
-    calls: Vec<(&'static str, Value)>,
-}
-
-impl Batch {
-    fn new(block: u64) -> Self {
-        Batch { block, calls: Vec::new() }
-    }
-    fn slot(&mut self, a: Address, s: U256) -> usize {
-        self.calls.push(("eth_getStorageAt", json!([to_hex(a.as_slice()), format!("{s:#066x}"), tag(self.block)])));
-        self.calls.len() - 1
-    }
-    fn call(&mut self, to: Address, data: &str) -> usize {
-        self.calls.push(("eth_call", json!([{ "to": to_hex(to.as_slice()), "data": data }, tag(self.block)])));
-        self.calls.len() - 1
-    }
-    fn send(&self, node: &dyn NodeApi) -> Result<BatchRes, NodeErr> {
-        let calls: Vec<(&str, Value)> = self.calls.iter().map(|(m, v)| (*m, v.clone())).collect();
-        Ok(BatchRes { r: node.call_batch(Class::Fill, &calls)? })
-    }
-}
-
-struct BatchRes {
-    r: Vec<node::CallResult>,
-}
-
-impl BatchRes {
-    fn text(&self, i: usize) -> Result<&str, String> {
-        match self.r.get(i) {
-            Some(Ok(Value::String(s))) => Ok(s),
-            Some(Ok(_)) => Err("node has no answer for that block yet".into()),
-            Some(Err(e)) => Err(format!("node error: {}", e.message)),
-            None => Err("no answer".into()),
-        }
-    }
-    fn u256(&self, i: usize) -> Result<U256, String> {
-        parse_u256(self.text(i)?)
-    }
-    /// Word `w` of an eth_call answer.
-    fn word(&self, i: usize, w: usize) -> Result<U256, String> {
-        let b: Bytes = parse_bytes(self.text(i)?)?;
-        if b.len() < (w + 1) * 32 {
-            return Err(format!("answer too short ({} bytes)", b.len()));
-        }
-        Ok(super::word(&b, w))
-    }
-}
-
 /// Do the slots we read say the same as the pool's own getters? (A fork
 /// with another storage layout fails here and is never followed.)
-fn verify_layout(p: &TrackedPool, vals: &HashMap<U256, U256>, getters: &[(&str, usize)], res: &BatchRes) -> Result<(), String> {
-    let g = |name: &str, w: usize| -> Result<U256, String> {
-        let i = getters.iter().find(|x| x.0 == name).map(|x| x.1).ok_or("getter missing")?;
-        res.word(i, w).map_err(|e| format!("layout: {name} failed ({e})"))
-    };
-    let s = |n: u64| vals.get(&U256::from(n)).copied().unwrap_or_default();
+fn verify_layout(p: &TrackedPool, vals: &HashMap<(Address, U256), U256>, g: impl Fn(&str, usize) -> Result<U256, String>) -> Result<(), String> {
+    let s = |n: u64| vals.get(&(p.address, U256::from(n))).copied().unwrap_or_default();
     let bad = |what: &str| Err(format!("layout: {what} in storage doesn't match the pool's getter (not a standard {} pool)", kind_name(p.kind)));
     let addr_word = |a: Address| U256::from_be_slice(a.as_slice());
     let mask112 = (U256::from(1) << 112usize) - U256::from(1);
@@ -1557,12 +2137,6 @@ fn verify_layout(p: &TrackedPool, vals: &HashMap<U256, U256>, getters: &[(&str, 
             if g("getReserves()", 0)? != r & mask112 || g("getReserves()", 1)? != (r >> 112usize) & mask112 || g("getReserves()", 2)? != r >> 224usize {
                 return bad("reserves");
             }
-            if g("totalSupply()", 0)? != s(v2::TOTAL_SUPPLY) {
-                return bad("totalSupply");
-            }
-            if g("price0CumulativeLast()", 0)? != s(v2::PRICE0_CUM) || g("price1CumulativeLast()", 0)? != s(v2::PRICE1_CUM) {
-                return bad("price totals");
-            }
             if s(v2::TOKEN0) != addr_word(p.token0) || s(v2::TOKEN1) != addr_word(p.token1) {
                 return bad("token0/token1");
             }
@@ -1571,13 +2145,7 @@ fn verify_layout(p: &TrackedPool, vals: &HashMap<U256, U256>, getters: &[(&str, 
             if g("getReserves()", 0)? != s(sol::RESERVE0) || g("getReserves()", 1)? != s(sol::RESERVE1) || g("getReserves()", 2)? != s(sol::TS_LAST) {
                 return bad("reserves");
             }
-            if g("totalSupply()", 0)? != s(sol::TOTAL_SUPPLY) {
-                return bad("totalSupply");
-            }
-            if g("reserve0CumulativeLast()", 0)? != s(sol::CUM0) || g("reserve1CumulativeLast()", 0)? != s(sol::CUM1) {
-                return bad("reserve totals");
-            }
-            if g("index0()", 0)? != s(sol::INDEX0) || g("index1()", 0)? != s(sol::INDEX1) {
+            if g("index0()", 0)? != s(sol::INDEX0) {
                 return bad("fee index");
             }
             if g("observationLength()", 0)? != s(sol::OBS_LEN) || s(sol::OBS_LEN).is_zero() {
@@ -1589,6 +2157,5 @@ fn verify_layout(p: &TrackedPool, vals: &HashMap<U256, U256>, getters: &[(&str, 
         }
         _ => {}
     }
-    let _ = fields::map_slot; // (layout constants live in fields.rs)
     Ok(())
 }

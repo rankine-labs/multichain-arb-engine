@@ -94,7 +94,20 @@ trade ~20 ms.
   B's replay.rs whole (same signatures: apply_replay, finish_block, has_pending).
 - Switch: ARBSIM_SOURCE=pool-events (default feed). Tunables:
   ARBSIM_COPY2_RELOAD_MS 2000, ARBSIM_COPY2_RELOAD_MAX_MS 600000,
-  ARBSIM_COPY2_LAYOUT_RETRY_S 3600, ARBSIM_COPY2_LOAD_BATCH 20.
+  ARBSIM_COPY2_LAYOUT_RETRY_S 3600, ARBSIM_COPY2_LOAD_BATCH 25 (pools per
+  job), ARBSIM_COPY2_LOADERS 4 (threads), ARBSIM_COPY2_KEEP_BLOCKS 2400
+  (reports kept for carrying loads forward), ARBSIM_COPY2_MAX_ROUNDS 40,
+  ARBSIM_COPY2_TIP_EVERY_S 30.
+- Loading never holds up blocks (fix after the Oct 21 dry run): all node
+  questions go to loader threads (copy2/loader.rs), PAID node first
+  (call_batch_paid), ARBSIM_NODE_BATCH calls per HTTP request; values are
+  fetched at block k and the pool's own reports for k+1..now are applied from
+  the buffer before it turns ready. Load speed = paid calls / ARBSIM_NODE_RPS
+  (default 8 calls/s!): about 9.5 calls per V2 pool, ~16 per Solidly pool,
+  ~2 per V3/V4/Algebra pool up front + values fetched when its first events
+  arrive. 800 pools ~ 6,000-8,000 calls: ~15 min at RPS 8, ~4-5 min at
+  RPS 25-30 (set ARBSIM_NODE_RPS to what the Chainstack plan allows). The log
+  prints "copy2: load round done: N pools in T s using X node requests".
 - Socket (C): `track` {pools:[{address, v4Id?, kind: v2|solidly|v3|pancake-v3|
   algebra|v4, token0, token1, fee, tickSpacing}], coinSlots?: the bot's
   data/balance-slots.json entries} -> {ok, tracked, skipped}.

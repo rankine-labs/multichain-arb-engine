@@ -147,11 +147,35 @@ async function main() {
   } else {
     lines.push('  No copy of the chain yet' + (s.nodeTip ? ` (chain is at block ${n(s.nodeTip)})` : ''));
   }
-  if (s.lastFrameAgoMs == null) lines.push('  Feed: no messages from the bot yet (is LOCAL_SIM set and the bot running?)');
+  if (s.copy2) { /* copy 2: the feed / replay lines below are about copy 1 */ } else if (s.lastFrameAgoMs == null) lines.push('  Feed: no messages from the bot yet (is LOCAL_SIM set and the bot running?)');
   else lines.push(`  Feed: last message from the bot ${dur(s.lastFrameAgoMs)} ago; ${n(s.frames)} received, ${n(s.frames_dropped)} dropped, ${n(s.frames_bad)} unreadable`);
 
-  // 3. How the copy is kept current
+  // 2b. Copy 2 (ARBSIM_SOURCE=pool-events): our pools kept current from their own events
+  const c2 = s.copy2;
+  if (c2) {
+    const chainTip = tip || c2.nodeTip || 0;
+    const behind = chainTip && c2.copyBlock ? chainTip - c2.copyBlock : null;
+    lines.push(`  COPY 2 (pool events): ${n(c2.pools)} pools followed: ${n(c2.ready)} ready, ${n(c2.loading)} loading, ${n(c2.unsure)} unsure`);
+    lines.push(`    copy at block ${n(c2.copyBlock)}` + (chainTip ? `, chain at ${n(chainTip)}: ` +
+      (behind <= 2 ? 'up to date' : `${n(behind)} blocks BEHIND  <-- tell Claude`) : ''));
+    const lr = c2.loadRound || {};
+    if (lr.pools) {
+      lines.push(`    last load round: ${n(lr.pools)} pools, ${lr.done ? 'finished' : 'still running'} after ${dur((lr.seconds || 0) * 1000)}, ` +
+        `${n(lr.requests)} node requests (${n(lr.ready)} ready, ${n(lr.unsure)} unsure)`);
+    }
+    const k = c2.counters || {};
+    lines.push(`    events applied ${n(k.events_applied)}, reports carried into loads ${n(k.carried_events)}, ` +
+      `node requests by copy 2 ${n(c2.nodeRequests)}, node jobs running ${n(c2.nodeJobsInFlight)}, slowest block ${n(k.apply_us_max)} microseconds`);
+    const show = (title, list) => {
+      if (Array.isArray(list) && list.length) lines.push(`    ${title}: ${list.slice(0, 5).map((r) => `${String(r.why).replace(/^loading: /, '')} (${n(r.n)})`).join('; ')}`);
+    };
+    show('why unsure', c2.unsureReasons);
+    show('loading now', c2.loadingReasons);
+  }
+
+  // 3. How the copy is kept current (copy 1, the feed replay)
   const rep = s.msgs_replayed || 0, tr = s.msgs_traced || 0;
+  if (!c2) {
   lines.push(`  Kept current by: ${n(rep)} messages replayed on its own, ${n(tr)} looked up on the node (${pct(tr, rep + tr)} needed the node)`);
   if (Array.isArray(s.traceReasons) && s.traceReasons.length) {
     lines.push(`    why the node was needed: ${s.traceReasons.slice(0, 5).map((r) => `${r.why} ${n(r.n)}`).join(', ')}`);
@@ -165,6 +189,7 @@ async function main() {
   lines.push(`  Self-check vs node: ${n(ok)} match, ${n(mm)} mismatch` +
     (mm > 0 ? '  <-- mismatches mean its copy was wrong somewhere; it corrects itself, but tell Claude' : (ok ? '  (good)' : '')) +
     `; ${n(s.verify_items)} items compared, ${n(s.verify_item_mismatches)} differed`);
+  }
 
   // 5. Checks answered
   const c = s.checks || 0;

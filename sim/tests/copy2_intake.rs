@@ -36,6 +36,10 @@ struct FakeChain {
     /// Pools whose getters answer something else than storage (bad layout).
     lying: Mutex<Vec<Address>>,
     calls: Mutex<usize>,
+    /// Calls that came through the paid-first path.
+    paid_calls: Mutex<usize>,
+    /// Pretend each batch takes this long (a slow node).
+    delay_ms: Mutex<u64>,
 }
 
 fn u(n: u128) -> U256 {
@@ -70,8 +74,16 @@ fn sel(sig: &str) -> [u8; 4] {
 }
 
 impl NodeApi for FakeChain {
+    fn call_batch_paid(&self, class: Class, calls: &[(&str, Value)]) -> Result<Vec<CallResult>, NodeErr> {
+        *self.paid_calls.lock().unwrap() += calls.len();
+        self.call_batch(class, calls)
+    }
     fn call_batch(&self, _class: Class, calls: &[(&str, Value)]) -> Result<Vec<CallResult>, NodeErr> {
         *self.calls.lock().unwrap() += calls.len();
+        let d = *self.delay_ms.lock().unwrap();
+        if d > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(d));
+        }
         Ok(calls
             .iter()
             .map(|(m, p)| -> CallResult {
@@ -254,11 +266,23 @@ impl Rig {
             .collect();
         let ans = self.h.track_json(&json!(1), &json!({ "type": "track", "pools": pools }));
         assert_eq!(ans["ok"], json!(true), "{ans}");
-        self.intake.pump();
+        self.settle();
     }
     fn send(&mut self, m: BlockMsg) {
         self.h.block(m);
-        self.intake.pump();
+        self.settle();
+    }
+    /// Run until every background node job is answered and used.
+    fn settle(&mut self) {
+        let t0 = std::time::Instant::now();
+        loop {
+            self.intake.pump();
+            if self.intake.outstanding() == 0 {
+                return;
+            }
+            assert!(t0.elapsed().as_secs() < 10, "background work never finished");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
     fn head_slot(&self, acct: Address, slot: U256) -> Lookup<U256> {
         self.sh.head().unwrap().snap.storage(acct, slot)
@@ -368,7 +392,7 @@ fn unknown_event_makes_pool_unsure_then_reload_from_node() {
     let mut s = genesis();
     s.get_mut(&a(V2P)).unwrap().insert(u(8), u(1) | (u(1) << 112usize) | (u(62) << 224usize));
     r.chain.set(102, s);
-    r.intake.pump(); // reload at the head block (102)
+    r.settle(); // reload at the head block (102)
     assert_eq!(r.state(&v2_pool()).0, PoolState::Ready);
     assert_eq!(r.head_slot(a(V2P), u(8)), Lookup::Known(u(1) | (u(1) << 112usize) | (u(62) << 224usize)));
 }
@@ -432,7 +456,7 @@ fn coin_underflow_forgets_balance_and_other_side_is_forgotten() {
     r.send(tick(100, 60));
     // A check loaded the user's coin0 balance (fill at head).
     r.h.fill(vec![MissItem::Slot(a(COIN0), map_slot(a(USER), 0))]);
-    r.intake.pump();
+    r.settle();
     assert_eq!(r.head_slot(a(COIN0), map_slot(a(USER), 0)), Lookup::Known(u(1_000_000)));
     // Pool sends 2000 coin0 while we think it holds 1000: our value was wrong.
     r.intake.process(msg(101, 61, vec![transfer(a(COIN0), a(V2P), a(USER), 2000, 101, 0, 0)]));
@@ -448,7 +472,7 @@ fn fills_refused_for_pools_not_ready() {
     r.track(vec![v2_pool()]);
     r.send(tick(100, 60));
     r.h.fill(vec![MissItem::Slot(a(V2P), u(8))]);
-    r.intake.pump();
+    r.settle();
     assert_eq!(r.head_slot(a(V2P), u(8)), Lookup::Missing);
     assert!(r.h.status_json(false)["counters"]["fill_refused"].as_u64().unwrap() >= 1);
 }
@@ -533,4 +557,180 @@ fn server_answers_track_and_status_in_pool_events_mode() {
     let ans = arbsim::server::handle(&feed, &json!({"id": 3, "type": "track", "pools": []}));
     assert_eq!(ans["ok"], json!(false));
     ctx.copy2.as_ref().unwrap().stop();
+}
+
+#[test]
+fn load_is_carried_forward_through_reports_after_the_fetch() {
+    // The node answers slowly: block 101 arrives while the pool's values
+    // (fetched AT block 100) are still on their way. Its reports for 101
+    // must be applied to them from the buffer, exactly.
+    let mut r = rig();
+    *r.chain.delay_ms.lock().unwrap() = 30;
+    r.track(vec![v2_pool()]); // nothing to do yet (no block)
+    r.h.block(tick(100, 60));
+    let t0 = std::time::Instant::now();
+    // Wait until the load itself (not just the coin probes) is on its way.
+    while r.h.c2.stats.loads.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+        r.intake.pump();
+        assert!(t0.elapsed().as_secs() < 5);
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert_eq!(r.state(&v2_pool()).0, PoolState::Loading);
+    let logs = vec![
+        transfer(a(COIN0), a(USER), a(V2P), 100, 101, 3, 0),
+        transfer(a(COIN1), a(V2P), a(USER), 360, 101, 3, 1),
+        v2_sync(1100, 3640, 101, 3, 2),
+    ];
+    r.h.block(msg(101, 62, logs));
+    r.intake.pump(); // applied at once, without waiting for the node
+    assert_eq!(r.h.c2.last_block.load(std::sync::atomic::Ordering::Relaxed), 101);
+    r.settle();
+    assert_eq!(r.state(&v2_pool()).0, PoolState::Ready, "{:?}", r.state(&v2_pool()));
+    assert!(r.h.c2.stats.carried_events.load(std::sync::atomic::Ordering::Relaxed) >= 1);
+    let q = U256::from(1) << 112usize;
+    assert_eq!(r.head_slot(a(V2P), u(8)), Lookup::Known(u(1100) | (u(3640) << 112usize) | (u(62) << 224usize)));
+    assert_eq!(r.head_slot(a(V2P), u(9)), Lookup::Known(u(5) + (u(4000) * q / u(1000)) * u(12)));
+    assert_eq!(r.head_slot(a(COIN0), map_slot(a(V2P), 0)), Lookup::Known(u(1100)));
+    assert_eq!(r.head_slot(a(COIN1), map_slot(a(V2P), 0)), Lookup::Known(u(3640)));
+    // Every node call went the paid-first way.
+    assert_eq!(*r.chain.paid_calls.lock().unwrap(), *r.chain.calls.lock().unwrap());
+}
+
+#[test]
+fn replay_pool_needing_values_loads_in_background_without_holding_the_block() {
+    let mut r = rig();
+    let v3 = TrackedPool { address: a(0xc3), kind: PoolKind::V3, ..v2_pool() };
+    let mut s = genesis();
+    s.get_mut(&a(COIN0)).unwrap().insert(map_slot(a(0xc3), 0), u(7));
+    s.get_mut(&a(COIN1)).unwrap().insert(map_slot(a(0xc3), 0), u(8));
+    r.chain.set(100, s);
+    r.track(vec![v3.clone()]);
+    r.send(tick(100, 60));
+    assert_eq!(r.state(&v3).0, PoolState::Ready);
+    *r.chain.delay_ms.lock().unwrap() = 30;
+    // A well-formed V3 Swap: the replay needs the pool's code / storage,
+    // which we never loaded.
+    let swap = lg(
+        a(0xc3),
+        vec![topic("Swap(address,address,int256,int256,uint160,uint128,int24)"), topic_of(a(USER)), topic_of(a(USER))],
+        data(&[u(100), U256::ZERO.wrapping_sub(u(90)), U256::from(1) << 96usize, u(1_000_000), u(0)]),
+        101,
+        0,
+        0,
+    );
+    let t = std::time::Instant::now();
+    r.intake.process(msg(101, 61, vec![swap]));
+    r.intake.pump(); // sends the background fetch, doesn't wait for it
+    assert!(t.elapsed() < std::time::Duration::from_millis(25), "block waited for the node");
+    assert_eq!(r.h.c2.last_block.load(std::sync::atomic::Ordering::Relaxed), 101);
+    let (st, why) = r.state(&v3);
+    assert!(st != PoolState::Ready, "{why}");
+    assert!(r.h.c2.stats.need_item_rounds.load(std::sync::atomic::Ordering::Relaxed) >= 1 || st == PoolState::Unsure, "{why}");
+    // Checks touching it are told it isn't ready.
+    assert!(r.h.unsure_reason(&[MissItem::Slot(a(0xc3), u(0))]).is_some());
+    r.settle();
+}
+
+/// A fake node that is slow like a real one: 20 ms per 25 calls.
+struct SlowChain(Arc<FakeChain>);
+impl NodeApi for SlowChain {
+    fn call_batch(&self, c: Class, calls: &[(&str, Value)]) -> Result<Vec<CallResult>, NodeErr> {
+        std::thread::sleep(std::time::Duration::from_millis(20 * calls.len().div_ceil(25) as u64));
+        self.0.call_batch(c, calls)
+    }
+    fn call_batch_paid(&self, c: Class, calls: &[(&str, Value)]) -> Result<Vec<CallResult>, NodeErr> {
+        *self.0.paid_calls.lock().unwrap() += calls.len();
+        self.call_batch(c, calls)
+    }
+}
+
+#[test]
+fn loading_800_pools_does_not_delay_block_application() {
+    use std::sync::atomic::Ordering::Relaxed;
+    use std::time::{Duration, Instant};
+    let chain = Arc::new(FakeChain::default());
+    let pool_addr = |i: u16| {
+        let mut b = [0u8; 20];
+        b[0] = 0x99;
+        b[18..].copy_from_slice(&i.to_be_bytes());
+        Address::from(b)
+    };
+    let mut s = genesis();
+    let mut pools = Vec::new();
+    for i in 0..800u16 {
+        let p = pool_addr(i);
+        let st = s.entry(p).or_default();
+        st.insert(u(0), u(2000));
+        st.insert(u(6), addr_word(a(COIN0)));
+        st.insert(u(7), addr_word(a(COIN1)));
+        st.insert(u(8), u(1000) | (u(4000) << 112usize) | (u(1000) << 224usize));
+        s.get_mut(&a(COIN0)).unwrap().insert(map_slot(p, 0), u(1000));
+        s.get_mut(&a(COIN1)).unwrap().insert(map_slot(p, 0), u(4000));
+        pools.push(TrackedPool { address: p, ..v2_pool() });
+    }
+    chain.set(100, s.clone());
+    // Pool 0 trades at block 130 (all blocks share timestamp 1000, so the
+    // price totals don't move): the node's state from 130 on shows it.
+    let p0 = pool_addr(0);
+    s.get_mut(&p0).unwrap().insert(u(8), u(1100) | (u(3640) << 112usize) | (u(1000) << 224usize));
+    s.get_mut(&a(COIN0)).unwrap().insert(map_slot(p0, 0), u(1100));
+    s.get_mut(&a(COIN1)).unwrap().insert(map_slot(p0, 0), u(3640));
+    chain.set(130, s);
+
+    let node: Arc<dyn NodeApi> = Arc::new(SlowChain(chain.clone()));
+    let sh = Shared::new(Config::for_tests(), Some(node), Arc::new(Volatile::default()));
+    let cfg = C2Config { loaders: 4, ..C2Config::for_tests() };
+    let h = arbsim::copy2::intake::spawn(sh.clone(), Arc::new(FillQueue::new(1000, 100)), cfg);
+    let pj: Vec<Value> = pools
+        .iter()
+        .map(|p| json!({"address": format!("{}", p.address), "kind": "v2", "token0": format!("{}", a(COIN0)), "token1": format!("{}", a(COIN1))}))
+        .collect();
+    assert_eq!(h.track_json(&json!(1), &json!({"pools": pj}))["tracked"], json!(800));
+
+    let mut worst = Duration::ZERO;
+    let mut loading_seen = 0;
+    for b in 100..=160u64 {
+        let logs = if b == 130 {
+            vec![
+                transfer(a(COIN0), a(USER), p0, 100, 130, 0, 0),
+                transfer(a(COIN1), p0, a(USER), 360, 130, 0, 1),
+                lg(p0, vec![topics().v2_sync], data(&[u(1100), u(3640)]), 130, 0, 2),
+            ]
+        } else {
+            vec![]
+        };
+        let mut m = if logs.is_empty() { tick(b, 1000) } else { msg(b, 1000, logs) };
+        m.prev_block = if b > 100 { Some(b - 1) } else { None };
+        let t = Instant::now();
+        h.block(m);
+        while h.c2.last_block.load(Relaxed) < b {
+            assert!(t.elapsed() < Duration::from_secs(5), "block {b} never applied");
+            std::thread::sleep(Duration::from_micros(200));
+        }
+        worst = worst.max(t.elapsed());
+        loading_seen = loading_seen.max(h.status_json(false)["loading"].as_u64().unwrap());
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // Pools were still loading while blocks went in, and no block waited.
+    assert!(loading_seen > 0, "the test should overlap loading and blocks");
+    assert!(worst < Duration::from_millis(250), "a block waited {worst:?} (loading must never hold blocks up)");
+
+    let t = Instant::now();
+    loop {
+        let st = h.status_json(false);
+        if st["ready"] == json!(800) {
+            break;
+        }
+        assert!(t.elapsed() < Duration::from_secs(30), "not all pools ready: {st}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let head = sh.head().unwrap();
+    assert_eq!(head.block, 160);
+    assert_eq!(head.snap.storage(p0, u(8)), Lookup::Known(u(1100) | (u(3640) << 112usize) | (u(1000) << 224usize)));
+    assert_eq!(head.snap.storage(a(COIN0), map_slot(p0, 0)), Lookup::Known(u(1100)));
+    assert_eq!(head.snap.storage(pool_addr(799), u(8)), Lookup::Known(u(1000) | (u(4000) << 112usize) | (u(1000) << 224usize)));
+    let st = h.status_json(false);
+    eprintln!("800 pools: worst block wait {worst:?}; node requests {}; load round {}", st["nodeRequests"], st["loadRound"]);
+    assert_eq!(*chain.paid_calls.lock().unwrap(), *chain.calls.lock().unwrap());
+    h.stop();
 }

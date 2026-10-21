@@ -30,6 +30,8 @@ pub mod coins;
 pub mod fields;
 // The thread that applies each block's events and publishes versions (A).
 pub mod intake;
+// Background threads that ask the node for copy 2 (never the intake thread).
+pub mod loader;
 // Working copy the events are applied to (workstream A; B runs revm on it).
 pub mod overlay;
 // Replay of V3 / PancakeV3 / Algebra / V4 events (workstream B; placeholder
