@@ -3,6 +3,10 @@ pragma solidity 0.8.26;
 
 // ============================================================================
 // Helper contracts for the practice chain (anvil) ONLY.
+// (Copy of bench/event-copy-test/Helpers.sol, used by
+// sim/tests/copy2_replay_anvil.rs; compiled by sim/tools/copy2/build.js into
+// tests/fixtures/copy2/artifacts.json. The `Replayer` here is the original
+// the sidecar's ReplayHelper.sol was ported from; the test doesn't use it.)
 //
 // Plain English:
 //   - Token:  a plain coin that behaves like a normal ERC-20 and, importantly,
