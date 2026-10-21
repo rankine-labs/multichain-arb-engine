@@ -106,12 +106,15 @@ function testAssembler() {
   // Later report for an already-sent block = late (sent on its own, counted).
   const late = a.addLog(L(100, 3, 9), 2200);
   assert(!!late && late.late === true && a.late === 1, 'report for a block already sent = late, counted');
-  // Block without a header: sent once something 2 blocks later shows up (order kept).
+  // Block without a header: waits for its header (arbsim needs the block time);
+  // once a later block shows up AND it waited HEADERLESS_WAIT_MS, it is sent
+  // (the dry run then reads its time from the node). Order kept.
   a.addLog(L(102, 0, 0), 3000); a.addLog(L(104, 0, 0), 3001);
-  const o2 = a.due(3002);
-  assert(o2.length === 1 && o2[0]!.block === 102 && o2[0]!.timestamp === null && a.noHeader === 1, 'no header but block+2 seen: sent, counted as no-header');
+  assert(a.due(3002).length === 0, 'no header yet: waits for it instead of sending without a block time');
+  const o2 = a.due(3000 + 400);
+  assert(o2.length === 1 && o2[0]!.block === 102 && o2[0]!.timestamp === null && a.noHeader === 1, 'no header after the short wait, later block seen: sent, counted as no-header');
   // ... or after maxWait.
-  assert(a.due(3002 + 1500).map((b) => b.block).join(',') === '104', 'no header, nothing later: sent after the longest wait');
+  assert(a.due(3001 + 1500).map((b) => b.block).join(',') === '104', 'no header, nothing later: sent after the longest wait');
   assert(JSON.stringify(a.gapBefore(110)) === JSON.stringify({ from: 105, to: 109 }) && a.gapBefore(105) === null, 'missed blocks after a reconnect are found');
   a.addHead({ block: 105, timestamp: 1, l1Block: 1, at: 5000 });
   assert(a.gapBefore(106) === null, 'next header while the previous block still waits for its grace = no gap (no false read-back)');

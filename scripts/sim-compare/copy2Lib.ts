@@ -234,7 +234,7 @@ export class BlockAssembler {
       // reads the header from the node first (see copy2-dryrun pump()).
       const ready = h
         ? now - h.at >= this.graceMs || this.newest >= b + 2
-        : first !== undefined && now - first >= Math.min(this.maxWaitMs, HEADERLESS_WAIT_MS) && this.newest >= b + 1;
+        : first !== undefined && ((now - first >= Math.min(this.maxWaitMs, HEADERLESS_WAIT_MS) && this.newest >= b + 1) || now - first >= this.maxWaitMs);
       if (ready) upto = b; // everything older is sent with it (order kept)
     }
     const out: BlockOut[] = [];
