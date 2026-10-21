@@ -290,7 +290,7 @@ function openPush() {
     }
     if (!classifyLog(r, followed)) { score.ignoredLogs++; return; }
     const late = asm.addLog(r, now);
-    if (late) sendBlock(late);
+    if (late) { if (late.timestamp !== null) sendBlock(late); else score.blocksNoTime++; }
   });
   ws.on('close', () => { log('WebSocket closed, reconnecting in 2 s'); setTimeout(openPush, 2000); });
   ws.on('error', (e) => log(`WebSocket error: ${e.message}`));

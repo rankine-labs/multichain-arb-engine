@@ -191,6 +191,7 @@ export class BlockAssembler {
   private logs = new Map<number, any[]>();
   private firstAt = new Map<number, number>();
   private heads = new Map<number, Head>();
+  private sentHeads = new Map<number, Head>(); // headers of the last 256 blocks sent (for late reports)
   private newest = 0;
   lastSent = 0;   // highest block already sent (0 = nothing yet)
   late = 0;       // reports that arrived after their block was sent
@@ -203,7 +204,9 @@ export class BlockAssembler {
     if (b === null) return null;
     if (this.lastSent && b <= this.lastSent) {
       this.late++;
-      const h = this.heads.get(b);
+      // The header was already used and forgotten: take the block time we
+      // remembered when the block went out (arbsim needs it on every message).
+      const h = this.heads.get(b) ?? this.sentHeads.get(b);
       return { block: b, timestamp: h?.timestamp ?? null, l1Block: h?.l1Block ?? null, logs: [log], firstLogAt: now, headAt: h?.at ?? null, late: true };
     }
     (this.logs.get(b) ?? this.logs.set(b, []).get(b)!).push(log);
@@ -244,6 +247,7 @@ export class BlockAssembler {
       const logs = (this.logs.get(b) ?? []).sort(logOrder);
       if (!h && logs.length) this.noHeader++;
       out.push({ block: b, timestamp: h?.timestamp ?? null, l1Block: h?.l1Block ?? null, logs, firstLogAt: this.firstAt.get(b) ?? null, headAt: h?.at ?? null });
+      if (h) { this.sentHeads.set(b, h); if (this.sentHeads.size > 256) this.sentHeads.delete(this.sentHeads.keys().next().value!); }
       this.logs.delete(b); this.firstAt.delete(b); this.heads.delete(b);
       this.lastSent = b;
     }
