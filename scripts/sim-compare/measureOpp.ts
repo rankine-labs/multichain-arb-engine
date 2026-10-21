@@ -42,7 +42,8 @@ const FROM = Number(arg('from')), TO = Number(arg('to'));
 const OUT = arg('out', `${process.env.HOME}/sim-compare-runs/opp1`)!;
 const RPS = Number(arg('rps', '5'));
 const NODE_VAR = arg('node', 'CHAINSTACK_RPC_ROBINHOOD')!;
-const LOOKBACK_BLOCKS = 4;
+const LOOKBACK_BLOCKS = 4;   // an "opportunity trade" must be at most this many blocks before the arbitrage
+const HISTORY_BLOCKS = 40;   // how far back we fetch, to see when the pools last changed
 const OUR_BOT = '0x09b4fb908ff646afa9c9878c082add7e4b3784d6'; // bot wallet (Go_Live record)
 const OUR_CONTRACT = '0x7e0f847dd429e7c15ab08686d28710389c1f7837';
 if (!Number.isFinite(FROM) || !Number.isFinite(TO) || TO < FROM) { console.error('need --from and --to'); process.exit(1); }
@@ -102,11 +103,11 @@ const word = (x: bigint) => (x < 0n ? -x : x).toString(16).padStart(64, '0');
 type T = { hash: string; block: number; index: number; from: string; to: string; input: string; value: string; logs: any[]; swaps: any[]; arb: any };
 
 async function main() {
-  console.log(`pools we trade: ${ours.size}; blocks ${FROM - LOOKBACK_BLOCKS}-${TO}`);
+  console.log(`pools we trade: ${ours.size}; blocks ${FROM - HISTORY_BLOCKS}-${TO}`);
   // 1. Every transaction that swapped on our pools (with a little look-back).
   const addrs = [...ours.keys()].filter((a) => a.length === 42), ids = [...ours.keys()].filter((a) => a.length === 66);
   const hashes = new Set<string>();
-  for (let b = FROM - LOOKBACK_BLOCKS; b <= TO; b += 250) {
+  for (let b = FROM - HISTORY_BLOCKS; b <= TO; b += 250) {
     const range = { fromBlock: '0x' + b.toString(16), toBlock: '0x' + Math.min(TO, b + 249).toString(16) };
     for (let i = 0; i < addrs.length; i += 200) for (const l of (await rpc('eth_getLogs', [{ ...range, address: addrs.slice(i, i + 200) }])).result ?? []) if (decodeSwapLog(l)) hashes.add(lc(l.transactionHash));
     for (let i = 0; i < ids.length; i += 100) for (const l of (await rpc('eth_getLogs', [{ ...range, address: RH_POOL_MANAGER, topics: [null, ids.slice(i, i + 100)] }])).result ?? []) if (decodeSwapLog(l)) hashes.add(lc(l.transactionHash));
@@ -147,12 +148,19 @@ async function main() {
   const rows: any[] = [];
   const c = { arbs: 0, ourBotArbs: 0, withTrigger: 0, noTrigger_followedAnotherArbOrStanding: 0, trigA: 0, trigB: 0, trigToKnownRouter: 0, trigSingleSwap: 0, trigSameBlock: 0 };
   const senders = new Map<string, { n: number; B: number; known: boolean }>();
+  const reaction = new Map<string, number>(); // arbitrages by blocks since the last change on their pools
   for (let i = 0; i < txs.length; i++) {
     const a = txs[i];
     if (!a.arb || a.block < FROM || !a.swaps.some((s) => ours.has(s.pool))) continue;
     c.arbs++;
     if (a.from === OUR_BOT || a.to === OUR_CONTRACT) c.ourBotArbs++;
     const pools = new Set(a.swaps.map((s) => s.pool));
+    // How long the gap sat: blocks since the last transaction (of any kind)
+    // that touched these pools before this arbitrage (same block = 0).
+    let lastChange: number | null = null;
+    for (let j = i - 1; j >= 0; j--) { const t = txs[j]; if (t.swaps.some((s) => pools.has(s.pool))) { lastChange = a.block - t.block; break; } }
+    const bucket = lastChange === null ? 'none seen' : lastChange === 0 ? 'same block' : lastChange === 1 ? '1 block' : lastChange <= 4 ? '2-4 blocks' : lastChange <= 40 ? '5-40 blocks (1-10 s)' : '>40 blocks';
+    reaction.set(bucket, (reaction.get(bucket) ?? 0) + 1);
     let trig: T | null = null;
     for (let j = i - 1; j >= 0; j--) {
       const t = txs[j];
@@ -178,6 +186,7 @@ async function main() {
     blocks: TO - FROM + 1, ...c,
     pct_trig_readableToday_A: pct(c.trigA), pct_trig_readableBetterReader_B: pct(c.trigB),
     pct_trig_toKnownRouter: pct(c.trigToKnownRouter), pct_trig_singleSwap: pct(c.trigSingleSwap), pct_trig_sameBlockAsArb: pct(c.trigSameBlock),
+    arbsByBlocksSinceLastPoolChange: Object.fromEntries(reaction),
     topTriggerSenders: [...senders.entries()].sort((x, y) => y[1].n - x[1].n).slice(0, 12).map(([to, v]) => ({ to, ...v })),
     nodeRequestsUsed: requests,
   };
