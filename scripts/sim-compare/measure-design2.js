@@ -70,12 +70,28 @@ for (const p of all) {
   const k = [lc(p.tokenA), lc(p.tokenB)].sort().join('/');
   (byPair.get(k) || byPair.set(k, []).get(k)).push(p);
 }
-const pools = new Map(); // addr -> { type, dex, pair }
+// Pools with their own contract (20-byte address) vs Uniswap V4 pools, which
+// are a 32-byte id INSIDE one shared PoolManager contract (its storage holds
+// every V4 pool, its events carry the id as the first topic).
+const pools = new Map();     // contract address -> { type, pair }
+const v4Ids = new Map();     // pool id -> { type, pair, manager }
+const managers = new Set();  // V4 PoolManager contracts
+const RH_POOL_MANAGER = '0x8366a39cc670b4001a1121b8f6a443a643e40951'; // src/config/knownAddresses.ts
 for (const [k, list] of byPair) {
   if (new Set(list.map((p) => p.dex)).size < 2) continue;
-  for (const p of list) pools.set(lc(p.poolAddress), { type: `${p.dex}:${p.poolType}`, pair: k });
+  for (const p of list) {
+    const a = lc(p.poolAddress);
+    if (a.length === 42) pools.set(a, { type: `${p.dex}:${p.poolType}`, pair: k });
+    else if (a.length === 66) {
+      const m = lc(p.v4?.poolManager || RH_POOL_MANAGER);
+      v4Ids.set(a, { type: `${p.dex}:v4`, pair: k, manager: m });
+      managers.add(m);
+    }
+  }
 }
-const tokens = new Set([...pools.values()].flatMap((p) => p.pair.split('/')));
+// The PoolManager's own storage and coin balances count as "our pools".
+for (const m of managers) pools.set(m, { type: 'v4-poolmanager', pair: '' });
+const tokens = new Set([...pools.values(), ...v4Ids.values()].flatMap((p) => p.pair.split('/')).filter(Boolean));
 
 // Pools' own coin-balance slots (so they're not mistaken for traders' balances),
 // using the balance-slot locations the bot already learned (data/balance-slots.json).
@@ -89,23 +105,21 @@ for (const [k, spec] of Object.entries(slotSpecs)) {
   if (spec && (spec.layout === 'solidity' || spec.layout === 'vyper')) specByToken.set(lc(k.split(':').pop()), spec);
   const token = lc(k.split(':').pop());
   if (!tokens.has(token) || !spec) continue;
-  for (const addr of pools.keys()) {
-    const key = spec.layout === 'vyper' ? ethers.keccak256(abi.encode(['uint256', 'address'], [spec.slot, addr])) : ethers.keccak256(abi.encode(['address', 'uint256'], [addr, spec.slot]));
-    poolBalanceKeys.add(`${token}:${lc(key)}`);
-  }
+  for (const addr of pools.keys()) poolBalanceKeys.add(`${token}:${balKey(spec, addr)}`);
 }
 
 async function main() {
-  console.log(`pairs on 2+ exchanges: ${[...byPair.values()].filter((l) => new Set(l.map((p) => p.dex)).size >= 2).length} of ${byPair.size}; pools ${pools.size} of ${all.length}; coins ${tokens.size}; known pool-balance keys ${poolBalanceKeys.size}`);
+  console.log(`pairs on 2+ exchanges: ${[...byPair.values()].filter((l) => new Set(l.map((p) => p.dex)).size >= 2).length} of ${byPair.size}; pool contracts ${pools.size - managers.size} + V4 pools ${v4Ids.size} (in ${managers.size} PoolManager) of ${all.length} watched; coins ${tokens.size}; known pool-balance keys ${poolBalanceKeys.size}`);
   // Q1: transactions touching these pools.
-  const addrs = [...pools.keys()];
+  const addrs = [...pools.keys()].filter((a) => !managers.has(a));
+  const ids = [...v4Ids.keys()];
   const txs = new Map(); let events = 0;
+  const take = (r) => { for (const l of r.result || []) { events++; txs.set(lc(l.transactionHash), { block: parseInt(l.blockNumber, 16), index: parseInt(l.transactionIndex, 16) }); } };
   for (let b = FROM; b <= TO; b += 250) {
-    const e = Math.min(TO, b + 249);
-    for (let i = 0; i < addrs.length; i += 200) {
-      const r = await rpc('eth_getLogs', [{ fromBlock: '0x' + b.toString(16), toBlock: '0x' + e.toString(16), address: addrs.slice(i, i + 200) }]);
-      for (const l of r.result || []) { events++; txs.set(lc(l.transactionHash), { block: parseInt(l.blockNumber, 16), index: parseInt(l.transactionIndex, 16) }); }
-    }
+    const range = { fromBlock: '0x' + b.toString(16), toBlock: '0x' + Math.min(TO, b + 249).toString(16) };
+    for (let i = 0; i < addrs.length; i += 200) take(await rpc('eth_getLogs', [{ ...range, address: addrs.slice(i, i + 200) }]));
+    // V4: the PoolManager's events whose first topic is one of our pool ids.
+    for (const m of managers) for (let i = 0; i < ids.length; i += 100) take(await rpc('eth_getLogs', [{ ...range, address: m, topics: [null, ids.slice(i, i + 100)] }]));
   }
   const list = [...txs.entries()].sort((a, b) => a[1].block - b[1].block || a[1].index - b[1].index).slice(0, MAX_TXS);
   console.log(`events ${events}, transactions ${txs.size} (measuring ${list.length})`);
