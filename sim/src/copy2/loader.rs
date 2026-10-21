@@ -14,6 +14,17 @@
 //   Answers go back to the intake thread as messages; it decides what to do
 //   with them (nothing is written into the copy here).
 //
+//   Which block: the bot's reports (websocket) usually run a few blocks
+//   AHEAD of what the node answers over HTTP. A fetch "at the copy's newest
+//   block" would then fail ("header not found"). So loads, fills and coin
+//   probes are fetched at min(wanted block, node's newest block); the
+//   intake carries the values forward from there with the kept reports.
+//   Fetches that must be at one exact block (values a working copy needs
+//   right before a report) wait here, in the background, until the node
+//   has that block (up to ~3 s), then try.
+//   A node ERROR is never read as an answer: it comes back as an error and
+//   the intake tries again later.
+//
 //   Node choice: the PAID node first (call_batch_paid), the free public node
 //   only if the paid one refuses (daily allowance used up) or fails. The
 //   daily allowance and speed limit of node.rs apply as always.
@@ -22,6 +33,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use revm::primitives::{Address, Bytes, U256};
 use serde_json::{json, Value};
@@ -34,7 +46,9 @@ use crate::state::MissItem;
 
 /// A question for the node.
 pub enum Job {
-    Fetch { id: u64, block: u64, items: Vec<MissItem>, calls: Vec<(Address, Bytes)> },
+    /// `exact` = must be at `block`; otherwise at most `block` (an older
+    /// block the node has is fine: the answer says which block was used).
+    Fetch { id: u64, block: u64, exact: bool, items: Vec<MissItem>, calls: Vec<(Address, Bytes)> },
     Probe { id: u64, coin: Address, block: u64 },
     Tip { id: u64 },
 }
@@ -59,12 +73,14 @@ pub struct Loaders {
 
 impl Loaders {
     /// Start `n` threads. Answers go into `out` (the intake's input).
-    pub fn spawn(n: usize, node: Arc<dyn NodeApi>, out: SyncSender<Input>, requests: Arc<AtomicU64>) -> Loaders {
+    /// `tip_out`: where the node's newest block is published (status).
+    pub fn spawn(n: usize, node: Arc<dyn NodeApi>, out: SyncSender<Input>, requests: Arc<AtomicU64>, tip_out: Arc<AtomicU64>) -> Loaders {
         let (tx, rx) = channel::<Job>();
         let rx = Arc::new(Mutex::new(rx));
+        let tip = Arc::new(Tip { known: Mutex::new((0, None)), out: tip_out });
         for i in 0..n.max(1) {
-            let (rx, node, out, req) = (rx.clone(), node.clone(), out.clone(), requests.clone());
-            std::thread::Builder::new().name(format!("arbsim-copy2-load-{i}")).spawn(move || run(rx, node, out, req)).expect("loader thread");
+            let (rx, node, out, req, tip) = (rx.clone(), node.clone(), out.clone(), requests.clone(), tip.clone());
+            std::thread::Builder::new().name(format!("arbsim-copy2-load-{i}")).spawn(move || run(rx, node, out, req, tip)).expect("loader thread");
         }
         Loaders { tx }
     }
@@ -74,25 +90,81 @@ impl Loaders {
     }
 }
 
-fn run(rx: Arc<Mutex<Receiver<Job>>>, node: Arc<dyn NodeApi>, out: SyncSender<Input>, requests: Arc<AtomicU64>) {
+/// The node's newest block, shared by the loader threads (asked at most
+/// every 250 ms, only when a job wants a newer block than we know of).
+struct Tip {
+    known: Mutex<(u64, Option<Instant>)>,
+    out: Arc<AtomicU64>,
+}
+
+impl Tip {
+    /// Newest block the node has; asked again only if what we know is
+    /// below `want` and older than `max_age`.
+    fn get(&self, node: &dyn NodeApi, want: u64, requests: &AtomicU64, max_age: Duration) -> Result<u64, NodeErr> {
+        let mut g = self.known.lock().unwrap();
+        if g.0 >= want || g.1.is_some_and(|t| t.elapsed() < max_age) {
+            return Ok(g.0);
+        }
+        requests.fetch_add(1, Ordering::Relaxed);
+        // Ask the node that will serve the fetch (paid first).
+        let r = node.call_batch_paid(Class::Fill, &[("eth_blockNumber", json!([]))])?;
+        let t = match r.into_iter().next() {
+            Some(Ok(Value::String(s))) => parse_u64(&s).map_err(NodeErr::BadResponse)?,
+            Some(Err(e)) => return Err(NodeErr::BadResponse(format!("eth_blockNumber: {}", e.message))),
+            _ => return Err(NodeErr::BadResponse("eth_blockNumber: no number".into())),
+        };
+        *g = (g.0.max(t), Some(Instant::now()));
+        self.out.fetch_max(g.0, Ordering::Relaxed);
+        Ok(g.0)
+    }
+}
+
+fn run(rx: Arc<Mutex<Receiver<Job>>>, node: Arc<dyn NodeApi>, out: SyncSender<Input>, requests: Arc<AtomicU64>, tip: Arc<Tip>) {
+    let fresh = Duration::from_millis(250);
     loop {
         let job = match rx.lock().unwrap().recv() {
             Ok(j) => j,
             Err(_) => return, // intake gone
         };
         let done = match job {
-            Job::Fetch { id, block, items, calls } => {
-                let n = count_calls(&items, &calls);
-                requests.fetch_add(n, Ordering::Relaxed);
-                Done::Fetch { id, block, res: fetch(&*node, block, &items, &calls) }
+            Job::Fetch { id, block, exact, items, calls } => {
+                // Pick the block (see file header).
+                let at = if exact {
+                    let t0 = Instant::now();
+                    loop {
+                        match tip.get(&*node, block, &requests, fresh) {
+                            Ok(t) if t >= block => break Ok(block),
+                            Ok(_) if t0.elapsed() < Duration::from_secs(3) => std::thread::sleep(fresh),
+                            Ok(t) => break Err(NodeErr::BadResponse(format!("node at block {t}, block {block} not there yet"))),
+                            Err(e) => break Err(e),
+                        }
+                    }
+                } else {
+                    tip.get(&*node, block, &requests, fresh).map(|t| if t == 0 { block } else { block.min(t) })
+                };
+                match at {
+                    Ok(b) => {
+                        requests.fetch_add(count_calls(&items, &calls), Ordering::Relaxed);
+                        Done::Fetch { id, block: b, res: fetch(&*node, b, &items, &calls) }
+                    }
+                    Err(e) => Done::Fetch { id, block, res: Err(e) },
+                }
             }
             Job::Probe { id, coin, block } => {
-                requests.fetch_add(2, Ordering::Relaxed);
-                Done::Probe { id, coin, res: probe_layout(&*node, coin, block) }
+                let res = tip.get(&*node, block, &requests, fresh).and_then(|t| {
+                    requests.fetch_add(2, Ordering::Relaxed);
+                    probe_layout(&*node, coin, if t == 0 { block } else { block.min(t) })
+                });
+                Done::Probe { id, coin, res }
             }
             Job::Tip { id } => {
                 requests.fetch_add(2, Ordering::Relaxed);
                 let res = crate::node::block_number(&*node, Class::Header).and_then(|t| {
+                    {
+                        let mut g = tip.known.lock().unwrap();
+                        *g = (g.0.max(t), Some(Instant::now()));
+                    }
+                    tip.out.fetch_max(t, Ordering::Relaxed);
                     let bf = crate::node::get_header(&*node, Class::Header, t)?.map(|h| h.base_fee).unwrap_or(0);
                     Ok((t, bf))
                 });

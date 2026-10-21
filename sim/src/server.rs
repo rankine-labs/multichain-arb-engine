@@ -201,6 +201,10 @@ pub fn handle(ctx: &Ctx, req: &Value) -> Value {
             Some(c) => c.track_json(&id, req),
             None => bad_request(&id, "track needs ARBSIM_SOURCE=pool-events"),
         },
+        Some("coin_slots") => match &ctx.copy2 {
+            Some(c) => c.coin_slots_json(&id, req),
+            None => bad_request(&id, "coin_slots needs ARBSIM_SOURCE=pool-events"),
+        },
         Some("call") => {
             let r: CallRequest = match serde_json::from_value(req.clone()) {
                 Ok(r) => r,

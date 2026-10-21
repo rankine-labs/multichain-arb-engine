@@ -162,6 +162,9 @@ async function main() {
     if (lr.pools) {
       lines.push(`    last load round: ${n(lr.pools)} pools, ${lr.done ? 'finished' : 'still running'} after ${dur((lr.seconds || 0) * 1000)}, ` +
         `${n(lr.requests)} node requests (${n(lr.ready)} ready, ${n(lr.unsure)} unsure)`);
+      const o = lr.outcomes;
+      if (o) lines.push(`    load outcomes: ${n(o.ready)} ready, ${n(o.coinNotFound)} coin balance place not found, ` +
+        `${n(o.nodeError)} node errors (retried), ${n(o.mismatch)} layout/balance mismatch, ${n(o.otherUnsure)} other unsure`);
     }
     const k = c2.counters || {};
     lines.push(`    events applied ${n(k.events_applied)}, reports carried into loads ${n(k.carried_events)}, ` +

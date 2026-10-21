@@ -119,6 +119,28 @@ trade ~20 ms.
   mismatch means a lost message and every pool is reloaded.
   Forward ALL coin Transfer logs to/from tracked pool addresses (incl. the V4
   PoolManager), also while pools are loading.
+- Coin balance places the bot already knows (saves 2+ node requests per
+  coin and avoids probing): send the content of data/balance-slots.json,
+  either inside `track` as `coinSlots`, or on its own (any time, e.g. at
+  start and whenever the file changes):
+    {"id": 7, "type": "coin_slots", "coinSlots": {
+       "robinhood:0x5fc5...": {"layout": "solidity", "slot": 1},
+       "robinhood:0x0bd7...": {"layout": "solidity", "slot": 51},
+       "0xabc...":            {"layout": "vyper",    "slot": 3} }}
+    -> {"id": 7, "ok": true, "accepted": 3}
+  Keys: "chain:0xtoken" (the file's own keys) or plain "0xtoken"; layout
+  "solidity" = keccak(holder . slot), "vyper" = keccak(slot . holder).
+  They replace a "not found", and pools waiting on that coin retry at once.
+  arbsim still checks each coin ONCE (storage value == balanceOf(pool)).
+- Node behind the websocket (dry run #3): loads / probes / fills are fetched
+  at min(copy block, node's newest block) and carried forward; a node error
+  object (unknown block, rate limit, timeout...) is never "not found", it is
+  retried. Reports are kept while a load still needs them
+  (ARBSIM_COPY2_MAX_KEEP_BLOCKS, 40000). A block re-sent with the same
+  reports plus new ones after them applies just the new ones (no reorg).
+  Each load round logs "copy2: load round done: ... outcomes: N ready, N
+  coin balance place not found, N node errors (retried), N layout/balance
+  mismatch, N other unsure" (and a progress line every 60 s while running).
 - Status: `status` -> `copy2` {pools, loading, ready, unsure, lastBlock,
   unsureReasons, counters}; with {"pools": true} also `list` of {address,
   v4Id, kind, state, reason, events}. Checks touching a pool that isn't

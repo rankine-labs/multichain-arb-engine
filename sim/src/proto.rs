@@ -17,6 +17,8 @@
 //     track         {pools:[{address, v4Id?, kind, token0, token1, fee,
 //                   tickSpacing}], coinSlots?:{"0xcoin":{layout,slot}}}
 //                   -> {ok, tracked, skipped}
+//     coin_slots    {coinSlots:{"robinhood:0xcoin":{layout,slot}}} (the bot's
+//                   data/balance-slots.json) -> {ok, accepted}
 //     pool_logs     {block, timestamp, l1Block?, baseFee?, prevBlock?,
 //                   logs:[raw eth logs]} (no answer)
 //     block_tick    {block, timestamp, l1Block?, baseFee?, prevBlock?}

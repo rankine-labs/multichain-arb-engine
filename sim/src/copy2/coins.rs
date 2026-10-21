@@ -106,8 +106,9 @@ fn slot_hex(s: U256) -> String {
 }
 
 /// eth_call balanceOf(PROBE_HOLDER) on `coin` at `block`, once per
-/// override set, all in ONE node batch (paid node first). None = that call
-/// failed (revert, overrides unsupported).
+/// override set, all in ONE node batch (paid node first). Ok(None) = that
+/// call came back with an error object (unknown block, rate limit, revert,
+/// overrides refused...): NOT an answer, see probe_layout.
 fn probe_calls(node: &dyn NodeApi, coin: Address, block: u64, diffs: Vec<serde_json::Map<String, Value>>) -> Result<Vec<Option<U256>>, NodeErr> {
     let c = to_hex(coin.as_slice());
     let calls: Vec<(&str, Value)> = diffs
@@ -131,29 +132,42 @@ fn one(c: &BalanceLayout, v: u64) -> serde_json::Map<String, Value> {
 
 /// Find where `coin` keeps balances: 2 node requests (all places at once,
 /// then a confirmation); odd coins that also read another per-account flag
-/// take one extra batch of 62 single-place calls. Ok(None) = not found.
+/// take one extra batch of 31 single-place calls.
+/// Ok(None) = "not found", ONLY when every answer was a clean number that
+/// didn't match. Any error object from the node = Err (asked again later):
+/// a node that doesn't have the block yet must never condemn a coin.
 pub fn probe_layout(node: &dyn NodeApi, coin: Address, block: u64) -> Result<Option<BalanceLayout>, NodeErr> {
+    let err = || NodeErr::BadResponse(format!("probe of coin {coin}: the node answered with an error (will ask again)"));
     let cands = candidates();
     let mut diff = serde_json::Map::new();
     for (i, c) in cands.iter().enumerate() {
         diff.insert(slot_hex(c.key(PROBE_HOLDER)), json!(slot_hex(U256::from(BASE + i as u64))));
     }
     let mut found = None;
-    if let Some(Some(v)) = probe_calls(node, coin, block, vec![diff])?.into_iter().next() {
-        if v >= U256::from(BASE) && v < U256::from(BASE + cands.len() as u64) {
-            found = Some(cands[(v - U256::from(BASE)).to::<usize>()]);
+    match probe_calls(node, coin, block, vec![diff])?.into_iter().next().flatten() {
+        Some(v) => {
+            if v >= U256::from(BASE) && v < U256::from(BASE + cands.len() as u64) {
+                found = Some(cands[(v - U256::from(BASE)).to::<usize>()]);
+            }
         }
+        None => return Err(err()),
     }
     if found.is_none() {
         // One place per call (slots 0..30), like the bot, but in one batch.
         let few: Vec<BalanceLayout> = cands.iter().filter(|c| c.slot <= 30).copied().collect();
         let r = probe_calls(node, coin, block, few.iter().map(|c| one(c, MAGIC)).collect())?;
+        let any_error = r.iter().any(|v| v.is_none());
         found = few.iter().zip(r).find(|(_, v)| *v == Some(U256::from(MAGIC))).map(|(c, _)| *c);
+        if found.is_none() && any_error {
+            return Err(err());
+        }
     }
     let Some(l) = found else { return Ok(None) };
     // Confirm with that one place alone.
-    let ok = probe_calls(node, coin, block, vec![one(&l, MAGIC)])?.into_iter().next().flatten() == Some(U256::from(MAGIC));
-    Ok(ok.then_some(l))
+    match probe_calls(node, coin, block, vec![one(&l, MAGIC)])?.into_iter().next().flatten() {
+        Some(v) => Ok((v == U256::from(MAGIC)).then_some(l)),
+        None => Err(err()),
+    }
 }
 
 #[cfg(test)]

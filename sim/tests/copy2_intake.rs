@@ -40,6 +40,19 @@ struct FakeChain {
     paid_calls: Mutex<usize>,
     /// Pretend each batch takes this long (a slow node).
     delay_ms: Mutex<u64>,
+    /// The node's newest block (eth_blockNumber). Asking about a newer
+    /// block gets "header not found", like a node behind the websocket.
+    tip: Mutex<u64>,
+    /// The next N balance-place probes answer with an error object.
+    probe_errors: Mutex<u32>,
+    /// Balance-place probes seen.
+    probes: Mutex<u32>,
+}
+
+impl FakeChain {
+    fn new() -> Self {
+        FakeChain { tip: Mutex::new(1_000_000), ..Default::default() }
+    }
 }
 
 fn u(n: u128) -> U256 {
@@ -89,8 +102,11 @@ impl NodeApi for FakeChain {
             .map(|(m, p)| -> CallResult {
                 let blk = |i: usize| p[i].as_str().and_then(|s| parse_u64(s).ok()).unwrap_or(0);
                 match *m {
-                    "eth_blockNumber" => Ok(json!("0x0")),
+                    "eth_blockNumber" => Ok(json!(format!("{:#x}", *self.tip.lock().unwrap()))),
                     "eth_getBlockByNumber" => Ok(Value::Null),
+                    "eth_getStorageAt" | "eth_call" if blk(if *m == "eth_call" { 1 } else { 2 }) > *self.tip.lock().unwrap() => {
+                        Err(RpcErr { code: -32000, message: "header not found".into() })
+                    }
                     "eth_getStorageAt" => {
                         let acct = parse_address(p[0].as_str().unwrap()).unwrap();
                         let s = parse_u256(p[1].as_str().unwrap()).unwrap();
@@ -105,6 +121,14 @@ impl NodeApi for FakeChain {
                         // Balance-place probe (state override): our fake coins
                         // keep balances at Solidity mapping slot 0.
                         if let Some(ov) = p.get(2).and_then(|o| o.as_object()) {
+                            *self.probes.lock().unwrap() += 1;
+                            {
+                                let mut pe = self.probe_errors.lock().unwrap();
+                                if *pe > 0 {
+                                    *pe -= 1;
+                                    return Err(RpcErr { code: 429, message: "rate limit".into() });
+                                }
+                            }
                             let diff = ov.values().next().unwrap()["stateDiff"].as_object().unwrap();
                             let k = w(BalanceLayout { vyper: false, slot: 0 }.key(PROBE_HOLDER));
                             return Ok(diff.get(&k).cloned().unwrap_or(json!(w(U256::ZERO))));
@@ -215,7 +239,7 @@ struct Rig {
 }
 
 fn rig() -> Rig {
-    let chain = Arc::new(FakeChain::default());
+    let chain = Arc::new(FakeChain::new());
     chain.set(100, genesis());
     let node: Arc<dyn NodeApi> = chain.clone();
     let sh = Shared::new(Config::for_tests(), Some(node), Arc::new(Volatile::default()));
@@ -543,7 +567,7 @@ fn wire_messages_parse() {
 
 #[test]
 fn server_answers_track_and_status_in_pool_events_mode() {
-    let chain = Arc::new(FakeChain::default());
+    let chain = Arc::new(FakeChain::new());
     chain.set(100, genesis());
     let ctx = arbsim::serve::build_with(Config::for_tests(), Some(chain as Arc<dyn NodeApi>), arbsim::serve::Source::PoolEvents);
     let ans = arbsim::server::handle(&ctx, &json!({"id": 1, "type": "track", "pools": [{
@@ -648,7 +672,7 @@ impl NodeApi for SlowChain {
 fn loading_800_pools_does_not_delay_block_application() {
     use std::sync::atomic::Ordering::Relaxed;
     use std::time::{Duration, Instant};
-    let chain = Arc::new(FakeChain::default());
+    let chain = Arc::new(FakeChain::new());
     let pool_addr = |i: u16| {
         let mut b = [0u8; 20];
         b[0] = 0x99;
@@ -733,4 +757,89 @@ fn loading_800_pools_does_not_delay_block_application() {
     eprintln!("800 pools: worst block wait {worst:?}; node requests {}; load round {}", st["nodeRequests"], st["loadRound"]);
     assert_eq!(*chain.paid_calls.lock().unwrap(), *chain.calls.lock().unwrap());
     h.stop();
+}
+
+#[test]
+fn node_behind_the_copy_loads_at_its_block_and_carries_forward() {
+    // The websocket reports run AHEAD of the node: the node only has block
+    // 100 while the copy is at 103. Loading must fetch at 100 (not fail, and
+    // never call a coin "not found") and apply 101..103 from the reports.
+    let mut r = rig();
+    *r.chain.tip.lock().unwrap() = 100;
+    r.track(vec![v2_pool()]);
+    r.h.block(tick(100, 60));
+    r.h.block(tick(101, 61));
+    r.h.block(msg(102, 62, vec![
+        transfer(a(COIN0), a(USER), a(V2P), 100, 102, 0, 0),
+        transfer(a(COIN1), a(V2P), a(USER), 360, 102, 0, 1),
+        v2_sync(1100, 3640, 102, 0, 2),
+    ]));
+    r.h.block(tick(103, 63));
+    r.settle();
+    assert_eq!(r.state(&v2_pool()).0, PoolState::Ready, "{:?}", r.state(&v2_pool()));
+    let q = U256::from(1) << 112usize;
+    assert_eq!(r.head_slot(a(V2P), u(8)), Lookup::Known(u(1100) | (u(3640) << 112usize) | (u(62) << 224usize)));
+    assert_eq!(r.head_slot(a(V2P), u(9)), Lookup::Known(u(5) + (u(4000) * q / u(1000)) * u(12)));
+    assert_eq!(r.head_slot(a(COIN0), map_slot(a(V2P), 0)), Lookup::Known(u(1100)));
+    assert_eq!(r.sh.head().unwrap().block, 103);
+}
+
+#[test]
+fn probe_errors_are_retried_not_called_not_found() {
+    let mut r = rig();
+    *r.chain.probe_errors.lock().unwrap() = 3; // rate limited three times
+    r.track(vec![v2_pool()]);
+    r.h.block(tick(100, 60));
+    let t0 = std::time::Instant::now();
+    while r.state(&v2_pool()).0 != PoolState::Ready {
+        r.intake.pump();
+        let (st, why) = r.state(&v2_pool());
+        assert!(!why.contains("can't find"), "condemned on a node error: {why}");
+        assert!(st != PoolState::Unsure, "{why}");
+        assert!(t0.elapsed().as_secs() < 20, "never ready: {why}");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(r.h.c2.stats.probe_errors.load(std::sync::atomic::Ordering::Relaxed) >= 1);
+}
+
+#[test]
+fn coin_slots_from_the_bot_skip_probing() {
+    let mut r = rig();
+    let ans = r.h.coin_slots_json(&json!(5), &json!({"type": "coin_slots", "coinSlots": {
+        format!("robinhood:{}", a(COIN0)): {"layout": "solidity", "slot": 0},
+        format!("{}", a(COIN1)): {"layout": "solidity", "slot": 0}
+    }}));
+    assert_eq!(ans["accepted"], json!(2));
+    r.track(vec![v2_pool()]);
+    r.send(tick(100, 60));
+    assert_eq!(r.state(&v2_pool()).0, PoolState::Ready);
+    assert_eq!(*r.chain.probes.lock().unwrap(), 0);
+}
+
+#[test]
+fn late_reports_after_the_known_ones_are_applied_not_a_reorg() {
+    let mut r = rig();
+    r.track(vec![v2_pool()]);
+    r.send(tick(100, 60));
+    let first = vec![transfer(a(COIN0), a(USER), a(V2P), 100, 101, 3, 0)];
+    r.intake.process(msg(101, 62, first.clone()));
+    // Re-sent with the rest of the same transaction after it.
+    let mut all = first.clone();
+    all.push(transfer(a(COIN1), a(V2P), a(USER), 360, 101, 3, 1));
+    all.push(v2_sync(1100, 3640, 101, 3, 2));
+    r.intake.process(msg(101, 62, all));
+    assert_eq!(r.state(&v2_pool()).0, PoolState::Ready, "{:?}", r.state(&v2_pool()));
+    assert_eq!(r.h.c2.stats.reorgs.load(std::sync::atomic::Ordering::Relaxed), 0);
+    assert_eq!(r.h.c2.stats.late_reports_applied.load(std::sync::atomic::Ordering::Relaxed), 1);
+    assert_eq!(r.head_slot(a(V2P), u(8)), Lookup::Known(u(1100) | (u(3640) << 112usize) | (u(62) << 224usize)));
+    assert_eq!(r.head_slot(a(COIN0), map_slot(a(V2P), 0)), Lookup::Known(u(1100)));
+    assert_eq!(r.head_slot(a(COIN1), map_slot(a(V2P), 0)), Lookup::Known(u(3640)));
+    assert_eq!(r.sh.head().unwrap().block, 101);
+    // A re-send with a new report BEFORE the known ones: not exact -> reorg.
+    let mut odd = vec![transfer(a(COIN0), a(USER), a(V2P), 1, 101, 1, 0)];
+    odd.push(transfer(a(COIN0), a(USER), a(V2P), 100, 101, 3, 0));
+    odd.push(transfer(a(COIN1), a(V2P), a(USER), 360, 101, 3, 1));
+    odd.push(v2_sync(1100, 3640, 101, 3, 2));
+    r.intake.process(msg(101, 62, odd));
+    assert_eq!(r.state(&v2_pool()).0, PoolState::Unsure);
 }
