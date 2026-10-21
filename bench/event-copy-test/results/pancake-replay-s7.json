@@ -1,0 +1,110 @@
+{
+ "type": "pancake",
+ "variant": "replay",
+ "seed": 7,
+ "opsRequested": 330,
+ "ops": {
+  "sent": 330,
+  "succeeded": 309,
+  "reverted": 21,
+  "byKind": {
+   "swap": 166,
+   "burn": 19,
+   "mint": 27,
+   "collect": 16,
+   "swapExactOut": 32,
+   "donate": 27,
+   "flash": 7,
+   "flash:reverted": 2,
+   "growHistory": 12,
+   "swapLimit": 24,
+   "mint:reverted": 2,
+   "swap:reverted": 12,
+   "swapExactOut:reverted": 2,
+   "swapLimit:reverted": 3
+  }
+ },
+ "blocks": 133,
+ "events": {
+  "total": 816,
+  "byName": {
+   "Pool.Swap": 205,
+   "Token.Transfer": 523,
+   "Pool.Burn": 19,
+   "Pool.Collect": 28,
+   "Pool.Mint": 25,
+   "Pool.IncreaseObservationCardinalityNext": 11,
+   "Pool.Flash": 5
+  }
+ },
+ "reReads": {
+  "events": 0,
+  "slots": 0,
+  "byReason": {}
+ },
+ "replays": {
+  "calls": 293,
+  "byReason": {
+   "Swap:exactIn": 163,
+   "Burn": 19,
+   "Collect": 28,
+   "Mint": 25,
+   "Swap:exactOut": 29,
+   "Swap:toPrice": 10,
+   "IncreaseObservationCardinalityNext": 11,
+   "Swap:exactIn+limit": 3,
+   "Flash": 5
+  }
+ },
+ "stateDiff": {
+  "checkpoints": 133,
+  "divergentSlotsMax": 0,
+  "byCategory": {},
+  "unsound": 0,
+  "unsoundExamples": []
+ },
+ "checks": {
+  "total": 990,
+  "nodeVsEngineTruth": {
+   "outputMatch": 990,
+   "successMatch": 990,
+   "gasEqual": 990,
+   "gasDiffs": {}
+  },
+  "profitPositive": 610,
+  "profitZero": 335,
+  "profitPositiveMatch": 610,
+  "otherRevert": 45,
+  "revertKinds": {
+   "Error(SPL)": 45
+  },
+  "lenient": {
+   "outputMatch": 990,
+   "successMatch": 990,
+   "mismatch": 0,
+   "gasEqual": 990,
+   "gasDiffHist": {
+    "0": 990
+   },
+   "firstMismatches": []
+  },
+  "copyNode": {
+   "outputMatch": 990
+  },
+  "strict": {
+   "known": 990,
+   "knownMatch": 990,
+   "knownMismatch": 0,
+   "needsNode": 0,
+   "missingByCategory": {},
+   "unknownOther": 0
+  },
+  "readDiffByCategory": {},
+  "checksWithReadDiff": 0
+ },
+ "negativeControl": {
+  "checks": 18,
+  "differencesDetected": 12
+ },
+ "seconds": 48
+}

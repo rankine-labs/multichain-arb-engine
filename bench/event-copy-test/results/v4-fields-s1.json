@@ -1,0 +1,124 @@
+{
+ "type": "v4",
+ "variant": "fields",
+ "seed": 1,
+ "opsRequested": 330,
+ "ops": {
+  "sent": 330,
+  "succeeded": 317,
+  "reverted": 13,
+  "byKind": {
+   "coinDonate": 11,
+   "swap": 171,
+   "v4donate": 25,
+   "removeLiq": 33,
+   "swapExactOut": 37,
+   "swap:reverted": 8,
+   "addLiq": 32,
+   "swapLimit": 21,
+   "swapExactOut:reverted": 3,
+   "addLiq:reverted": 2
+  }
+ },
+ "blocks": 130,
+ "events": {
+  "total": 908,
+  "byName": {
+   "Token.Transfer": 602,
+   "PM.Swap": 218,
+   "PM.Donate": 25,
+   "PM.ModifyLiquidity": 63
+  }
+ },
+ "reReads": {
+  "events": 51,
+  "slots": 855,
+  "byReason": {
+   "ModifyLiquidity": 39,
+   "ModifyLiquidity+ModifyLiquidity": 12
+  }
+ },
+ "replays": {
+  "calls": 0,
+  "byReason": {}
+ },
+ "stateDiff": {
+  "checkpoints": 130,
+  "divergentSlotsMax": 74,
+  "byCategory": {
+   "PoolManager:other.feeGrowthGlobal0": 90,
+   "PoolManager:other.tick.feeOutside0": 1597,
+   "PoolManager:other.tick.feeOutside1": 1597,
+   "PoolManager:test.feeGrowthGlobal0": 77,
+   "PoolManager:test.feeGrowthGlobal1": 73,
+   "PoolManager:other.feeGrowthGlobal1": 103,
+   "PoolManager:test.tick.feeOutside0": 2008,
+   "PoolManager:test.tick.feeOutside1": 1983
+  },
+  "unsound": 0,
+  "unsoundExamples": []
+ },
+ "checks": {
+  "total": 1008,
+  "nodeVsEngineTruth": {
+   "outputMatch": 1008,
+   "successMatch": 1008,
+   "gasEqual": 1008,
+   "gasDiffs": {}
+  },
+  "profitPositive": 645,
+  "profitZero": 354,
+  "profitPositiveMatch": 645,
+  "otherRevert": 9,
+  "revertKinds": {
+   "0x1f2a2005": 9
+  },
+  "lenient": {
+   "outputMatch": 1008,
+   "successMatch": 1008,
+   "mismatch": 0,
+   "gasEqual": 814,
+   "gasDiffHist": {
+    "0": 814,
+    "17100": 17,
+    "34200": 103,
+    "68400": 50,
+    "102600": 10,
+    "136800": 8,
+    "171000": 1,
+    "205200": 1,
+    "-2800": 1,
+    "-17100": 3
+   },
+   "firstMismatches": []
+  },
+  "copyNode": {
+   "outputMatch": 1008
+  },
+  "strict": {
+   "known": 0,
+   "knownMatch": 0,
+   "knownMismatch": 0,
+   "needsNode": 1008,
+   "missingByCategory": {
+    "PoolManager:test.feeGrowthGlobal0": 669,
+    "PoolManager:test.feeGrowthGlobal1": 660,
+    "PoolManager:test.tick.feeOutside0": 321,
+    "PoolManager:test.tick.feeOutside1": 321
+   },
+   "unknownOther": 0
+  },
+  "readDiffByCategory": {
+   "PoolManager:test.feeGrowthGlobal0": 358,
+   "PoolManager:test.feeGrowthGlobal1": 324,
+   "PoolManager:test.tick.feeOutside0": 576,
+   "PoolManager:test.tick.feeOutside1": 576
+  },
+  "checksWithReadDiff": 670
+ },
+ "negativeControl": {
+  "checks": 18,
+  "differencesDetected": 13
+ },
+ "seconds": 52
+}

@@ -1,0 +1,151 @@
+{
+ "type": "algebra",
+ "variant": "fields-plugin",
+ "seed": 7,
+ "opsRequested": 330,
+ "ops": {
+  "sent": 330,
+  "succeeded": 319,
+  "reverted": 11,
+  "byKind": {
+   "swap": 179,
+   "burn": 25,
+   "mint": 30,
+   "collect": 20,
+   "swapExactOut": 37,
+   "donate": 24,
+   "flash": 15,
+   "swap:reverted": 11
+  }
+ },
+ "blocks": 134,
+ "events": {
+  "total": 1131,
+  "byName": {
+   "Pool.SwapFee": 205,
+   "Pool.Swap": 205,
+   "Pool.PluginConfig": 1,
+   "Token.Transfer": 576,
+   "Pool.BurnFee": 25,
+   "Pool.Burn": 25,
+   "Pool.Collect": 16,
+   "Pool.Mint": 30,
+   "Pool.ExcessTokens": 33,
+   "Pool.Flash": 15
+  }
+ },
+ "reReads": {
+  "events": 54,
+  "slots": 3830,
+  "byReason": {
+   "Burn+Collect": 7,
+   "Mint": 13,
+   "Mint+Flash": 3,
+   "Burn": 8,
+   "Flash": 7,
+   "Mint+Mint": 4,
+   "Burn+Mint+Burn": 1,
+   "Collect": 2,
+   "Flash+Burn+Collect": 1,
+   "Mint+Burn+Collect": 2,
+   "Mint+Burn": 1,
+   "Burn+Collect+Burn+Collect": 1,
+   "Burn+Mint": 1,
+   "Flash+Flash": 2,
+   "Mint+Burn+Collect+Collect": 1
+  }
+ },
+ "replays": {
+  "calls": 205,
+  "byReason": {
+   "plugin.beforeSwap": 205
+  }
+ },
+ "stateDiff": {
+  "checkpoints": 134,
+  "divergentSlotsMax": 101,
+  "byCategory": {
+   "algebra:totalFeeGrowth1": 63,
+   "algebra:communityFeePending|lastFeeTransferTs": 76,
+   "algebra:totalFeeGrowth0": 63,
+   "algebra:tick.outerFeeGrowth0": 3689,
+   "algebra:tick.outerFeeGrowth1": 3684
+  },
+  "unsound": 0,
+  "unsoundExamples": []
+ },
+ "checks": {
+  "total": 990,
+  "nodeVsEngineTruth": {
+   "outputMatch": 990,
+   "successMatch": 990,
+   "gasEqual": 990,
+   "gasDiffs": {}
+  },
+  "profitPositive": 529,
+  "profitZero": 389,
+  "profitPositiveMatch": 529,
+  "otherRevert": 72,
+  "revertKinds": {
+   "0x16626723": 45,
+   "empty revert": 9,
+   "0x1f2a2005": 18
+  },
+  "lenient": {
+   "outputMatch": 990,
+   "successMatch": 990,
+   "mismatch": 0,
+   "gasEqual": 735,
+   "gasDiffHist": {
+    "0": 735,
+    "534": 3,
+    "535": 3,
+    "1068": 1,
+    "1069": 2,
+    "17100": 6,
+    "21148": 15,
+    "34200": 161,
+    "51300": 3,
+    "55348": 3,
+    "68400": 36,
+    "102600": 13,
+    "136800": 3,
+    "-19900": 3,
+    "-17100": 3
+   },
+   "firstMismatches": []
+  },
+  "copyNode": {
+   "outputMatch": 990
+  },
+  "strict": {
+   "known": 45,
+   "knownMatch": 45,
+   "knownMismatch": 0,
+   "needsNode": 945,
+   "missingByCategory": {
+    "algebra:totalFeeGrowth0": 650,
+    "algebra:communityFeePending|lastFeeTransferTs": 945,
+    "algebra:pluginFeePending": 945,
+    "algebra:totalFeeGrowth1": 690,
+    "algebra:tick.outerFeeGrowth1": 335,
+    "algebra:tick.outerFeeGrowth0": 335
+   },
+   "unknownOther": 0
+  },
+  "readDiffByCategory": {
+   "algebra:totalFeeGrowth0": 264,
+   "algebra:communityFeePending|lastFeeTransferTs": 450,
+   "algebra:totalFeeGrowth1": 255,
+   "algebra:tick.outerFeeGrowth0": 698,
+   "algebra:tick.outerFeeGrowth1": 695,
+   "ref100:other": 56
+  },
+  "checksWithReadDiff": 616
+ },
+ "negativeControl": {
+  "checks": 18,
+  "differencesDetected": 12
+ },
+ "seconds": 75
+}

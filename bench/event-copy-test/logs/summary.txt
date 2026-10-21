@@ -1,0 +1,270 @@
+┌─────────┬────────────────────────────┬───────────┬────────┬────────┬────────┬──────────┬───────────────────┬─────────────┬─────────────┬─────────────┬──────────────────┬───────────────────────────┬──────────────────┬─────────────────────┬─────────┬───────────────┬───────────────┬──────────┐
+│ (index) │ run                        │ ops       │ blocks │ events │ checks │ profit>0 │ node=engine(true) │ copy out == │ copy out != │ copy gas == │ gas diff range   │ strict ok/needsNode/WRONG │ reRead ev/100ops │ reRead slots/100ops │ replays │ replay FAILED │ unsound slots │ neg.ctrl │
+├─────────┼────────────────────────────┼───────────┼────────┼────────┼────────┼──────────┼───────────────────┼─────────────┼─────────────┼─────────────┼──────────────────┼───────────────────────────┼──────────────────┼─────────────────────┼─────────┼───────────────┼───────────────┼──────────┤
+│ 0       │ 'algebra/fields-plugin/s1' │ '321/330' │ 132    │ 1163   │ 954    │ 576      │ '954+gas954'      │ 954         │ 0           │ 715         │ '34200..273600'  │ '45/909/0'                │ '18.8'           │ '1304.5'            │ 213     │ 0             │ 0             │ '12/18'  │
+│ 1       │ 'algebra/fields-plugin/s7' │ '319/330' │ 134    │ 1131   │ 990    │ 529      │ '990+gas990'      │ 990         │ 0           │ 735         │ '-19900..136800' │ '45/945/0'                │ '16.4'           │ '1160.6'            │ 205     │ 0             │ 0             │ '12/18'  │
+│ 2       │ 'algebra/fields/s1'        │ '321/330' │ 132    │ 1163   │ 954    │ 576      │ '954+gas954'      │ 565         │ 389         │ 0           │ '-1347..301961'  │ '0/954/0'                 │ '18.8'           │ '1304.5'            │ 0       │ 0             │ 0             │ '12/18'  │
+│ 3       │ 'algebra/fields/s7'        │ '319/330' │ 134    │ 1131   │ 990    │ 529      │ '990+gas990'      │ 876         │ 114         │ 0           │ '-2418..134800'  │ '0/990/0'                 │ '16.4'           │ '1160.6'            │ 0       │ 0             │ 0             │ '12/18'  │
+│ 4       │ 'algebra/replay/s1'        │ '321/330' │ 132    │ 1163   │ 954    │ 576      │ '954+gas954'      │ 954         │ 0           │ 954         │ '-'              │ '954/0/0'                 │ '0.0'            │ '0.0'               │ 298     │ 0             │ 0             │ '12/18'  │
+│ 5       │ 'algebra/replay/s7'        │ '319/330' │ 134    │ 1131   │ 990    │ 529      │ '990+gas990'      │ 990         │ 0           │ 990         │ '-'              │ '990/0/0'                 │ '0.0'            │ '0.0'               │ 291     │ 0             │ 0             │ '12/18'  │
+│ 6       │ 'pancake/fields/s1'        │ '312/330' │ 135    │ 843    │ 990    │ 553      │ '990+gas990'      │ 990         │ 0           │ 692         │ '1335..256500'   │ '72/918/0'                │ '22.4'           │ '372.1'             │ 0       │ 0             │ 0             │ '9/18'   │
+│ 7       │ 'pancake/fields/s7'        │ '309/330' │ 133    │ 816    │ 990    │ 610      │ '990+gas990'      │ 990         │ 0           │ 818         │ '34200..239400'  │ '45/945/0'                │ '21.2'           │ '336.1'             │ 0       │ 0             │ 0             │ '12/18'  │
+│ 8       │ 'pancake/replay/s1'        │ '312/330' │ 135    │ 843    │ 990    │ 553      │ '990+gas990'      │ 990         │ 0           │ 990         │ '-'              │ '990/0/0'                 │ '0.0'            │ '0.0'               │ 298     │ 0             │ 0             │ '9/18'   │
+│ 9       │ 'pancake/replay/s7'        │ '309/330' │ 133    │ 816    │ 990    │ 610      │ '990+gas990'      │ 990         │ 0           │ 990         │ '-'              │ '990/0/0'                 │ '0.0'            │ '0.0'               │ 293     │ 0             │ 0             │ '12/18'  │
+│ 10      │ 'solidly/default/s1'       │ '330/330' │ 126    │ 1718   │ 972    │ 527      │ '972+gas972'      │ 972         │ 0           │ 972         │ '-'              │ '972/0/0'                 │ '0.0'            │ '0.0'               │ 0       │ 0             │ 0             │ '9/18'   │
+│ 11      │ 'solidly/default/s7'       │ '330/330' │ 133    │ 1692   │ 1008   │ 530      │ '1008+gas1008'    │ 1008        │ 0           │ 1008        │ '-'              │ '1008/0/0'                │ '0.0'            │ '0.0'               │ 0       │ 0             │ 0             │ '9/18'   │
+│ 12      │ 'v2/default/s1'            │ '330/330' │ 124    │ 1225   │ 972    │ 514      │ '972+gas972'      │ 972         │ 0           │ 972         │ '-'              │ '972/0/0'                 │ '0.0'            │ '0.0'               │ 0       │ 0             │ 0             │ '9/18'   │
+│ 13      │ 'v2/default/s7'            │ '330/330' │ 133    │ 1189   │ 990    │ 517      │ '990+gas990'      │ 990         │ 0           │ 990         │ '-'              │ '990/0/0'                 │ '0.0'            │ '0.0'               │ 0       │ 0             │ 0             │ '9/18'   │
+│ 14      │ 'v3/fields/s1'             │ '312/330' │ 135    │ 845    │ 990    │ 549      │ '990+gas990'      │ 990         │ 0           │ 693         │ '1335..256500'   │ '72/918/0'                │ '22.7'           │ '376.7'             │ 0       │ 0             │ 0             │ '9/18'   │
+│ 15      │ 'v3/fields/s7'             │ '313/330' │ 133    │ 831    │ 990    │ 636      │ '990+gas990'      │ 990         │ 0           │ 827         │ '17100..205200'  │ '27/963/0'                │ '21.8'           │ '344.2'             │ 0       │ 0             │ 0             │ '12/18'  │
+│ 16      │ 'v3/replay/s1'             │ '312/330' │ 135    │ 845    │ 990    │ 549      │ '990+gas990'      │ 990         │ 0           │ 990         │ '-'              │ '990/0/0'                 │ '0.0'            │ '0.0'               │ 298     │ 0             │ 0             │ '9/18'   │
+│ 17      │ 'v3/replay/s7'             │ '313/330' │ 133    │ 831    │ 990    │ 636      │ '990+gas990'      │ 990         │ 0           │ 990         │ '-'              │ '990/0/0'                 │ '0.0'            │ '0.0'               │ 297     │ 0             │ 0             │ '12/18'  │
+│ 18      │ 'v4/fields/s1'             │ '317/330' │ 130    │ 908    │ 1008   │ 645      │ '1008+gas1008'    │ 1008        │ 0           │ 814         │ '-17100..205200' │ '0/1008/0'                │ '15.5'           │ '259.1'             │ 0       │ 0             │ 0             │ '13/18'  │
+│ 19      │ 'v4/fields/s7'             │ '317/330' │ 121    │ 856    │ 954    │ 581      │ '954+gas954'      │ 954         │ 0           │ 704         │ '-2800..205200'  │ '27/927/0'                │ '17.0'           │ '278.5'             │ 0       │ 0             │ 0             │ '12/18'  │
+│ 20      │ 'v4/replay/s1'             │ '317/330' │ 130    │ 908    │ 1008   │ 645      │ '1008+gas1008'    │ 1008        │ 0           │ 1008        │ '-'              │ '1008/0/0'                │ '0.0'            │ '0.0'               │ 306     │ 0             │ 0             │ '13/18'  │
+│ 21      │ 'v4/replay/s7'             │ '317/330' │ 121    │ 856    │ 954    │ 581      │ '954+gas954'      │ 954         │ 0           │ 954         │ '-'              │ '954/0/0'                 │ '0.0'            │ '0.0'               │ 287     │ 0             │ 0             │ '12/18'  │
+└─────────┴────────────────────────────┴───────────┴────────┴────────┴────────┴──────────┴───────────────────┴─────────────┴─────────────┴─────────────┴──────────────────┴───────────────────────────┴──────────────────┴─────────────────────┴─────────┴───────────────┴───────────────┴──────────┘
+
+### algebra/fields-plugin/s1
+ops by kind: {"swap":184,"mint":36,"flash":14,"swapExactOut":35,"donate":26,"collect":12,"burn":23,"swapExactOut:reverted":1,"swap:reverted":5,"flash:reverted":1,"mint:reverted":2}
+events: {"Pool.SwapFee":213,"Pool.Swap":213,"Pool.PluginConfig":1,"Token.Transfer":594,"Pool.Mint":34,"Pool.Flash":13,"Pool.ExcessTokens":34,"Pool.BurnFee":23,"Pool.Burn":23,"Pool.Collect":15}
+re-reads by reason: {"Mint":24,"Flash":9,"Burn+Mint":1,"Burn+Collect":7,"Mint+Mint":1,"Mint+Burn":4,"Flash+Flash":1,"Burn":7,"Collect":3,"Burn+Collect+Mint":1,"Collect+Flash":1,"Mint+Burn+Collect":2,"Flash+Burn+Collect":1}
+replays: {"plugin.beforeSwap":213}
+slots the copy had WRONG at some block end (by name, count of slot-blocks): {"algebra:totalFeeGrowth0":56,"algebra:communityFeePending|lastFeeTransferTs":68,"algebra:tick.outerFeeGrowth0":3277,"algebra:tick.outerFeeGrowth1":3277,"algebra:totalFeeGrowth1":61}
+slots the check READ that differed: {"algebra:tick.outerFeeGrowth0":539,"algebra:tick.outerFeeGrowth1":539,"algebra:totalFeeGrowth0":184,"algebra:communityFeePending|lastFeeTransferTs":342,"algebra:totalFeeGrowth1":261} checks with any: 484
+strict: missing by category: {"algebra:totalFeeGrowth0":652,"algebra:communityFeePending|lastFeeTransferTs":909,"algebra:pluginFeePending":909,"algebra:totalFeeGrowth1":660,"algebra:tick.outerFeeGrowth1":331,"algebra:tick.outerFeeGrowth0":331}
+other reverts: {"0x16626723":45}
+gas diff histogram (copy - true): {"0":715,"34200":132,"68400":73,"102600":12,"136800":3,"171000":1,"205200":8,"239400":9,"273600":1}
+
+### algebra/fields-plugin/s7
+ops by kind: {"swap":179,"burn":25,"mint":30,"collect":20,"swapExactOut":37,"donate":24,"flash":15,"swap:reverted":11}
+events: {"Pool.SwapFee":205,"Pool.Swap":205,"Pool.PluginConfig":1,"Token.Transfer":576,"Pool.BurnFee":25,"Pool.Burn":25,"Pool.Collect":16,"Pool.Mint":30,"Pool.ExcessTokens":33,"Pool.Flash":15}
+re-reads by reason: {"Burn+Collect":7,"Mint":13,"Mint+Flash":3,"Burn":8,"Flash":7,"Mint+Mint":4,"Burn+Mint+Burn":1,"Collect":2,"Flash+Burn+Collect":1,"Mint+Burn+Collect":2,"Mint+Burn":1,"Burn+Collect+Burn+Collect":1,"Burn+Mint":1,"Flash+Flash":2,"Mint+Burn+Collect+Collect":1}
+replays: {"plugin.beforeSwap":205}
+slots the copy had WRONG at some block end (by name, count of slot-blocks): {"algebra:totalFeeGrowth1":63,"algebra:communityFeePending|lastFeeTransferTs":76,"algebra:totalFeeGrowth0":63,"algebra:tick.outerFeeGrowth0":3689,"algebra:tick.outerFeeGrowth1":3684}
+slots the check READ that differed: {"algebra:totalFeeGrowth0":264,"algebra:communityFeePending|lastFeeTransferTs":450,"algebra:totalFeeGrowth1":255,"algebra:tick.outerFeeGrowth0":698,"algebra:tick.outerFeeGrowth1":695,"ref100:other":56} checks with any: 616
+strict: missing by category: {"algebra:totalFeeGrowth0":650,"algebra:communityFeePending|lastFeeTransferTs":945,"algebra:pluginFeePending":945,"algebra:totalFeeGrowth1":690,"algebra:tick.outerFeeGrowth1":335,"algebra:tick.outerFeeGrowth0":335}
+other reverts: {"0x16626723":45,"empty revert":9,"0x1f2a2005":18}
+gas diff histogram (copy - true): {"0":735,"534":3,"535":3,"1068":1,"1069":2,"17100":6,"21148":15,"34200":161,"51300":3,"55348":3,"68400":36,"102600":13,"136800":3,"-19900":3,"-17100":3}
+
+### algebra/fields/s1
+ops by kind: {"swap":184,"mint":36,"flash":14,"swapExactOut":35,"donate":26,"collect":12,"burn":23,"swapExactOut:reverted":1,"swap:reverted":5,"flash:reverted":1,"mint:reverted":2}
+events: {"Pool.SwapFee":213,"Pool.Swap":213,"Pool.PluginConfig":1,"Token.Transfer":594,"Pool.Mint":34,"Pool.Flash":13,"Pool.ExcessTokens":34,"Pool.BurnFee":23,"Pool.Burn":23,"Pool.Collect":15}
+re-reads by reason: {"Mint":24,"Flash":9,"Burn+Mint":1,"Burn+Collect":7,"Mint+Mint":1,"Mint+Burn":4,"Flash+Flash":1,"Burn":7,"Collect":3,"Burn+Collect+Mint":1,"Collect+Flash":1,"Mint+Burn+Collect":2,"Flash+Burn+Collect":1}
+replays: {}
+slots the copy had WRONG at some block end (by name, count of slot-blocks): {"algebra:totalFeeGrowth0":56,"algebra:communityFeePending|lastFeeTransferTs":68,"plugin:slot4":132,"plugin:timepoints":5813,"plugin:slot5":131,"algebra:tick.outerFeeGrowth0":3277,"algebra:tick.outerFeeGrowth1":3277,"plugin:slot6":129,"algebra:totalFeeGrowth1":61,"plugin:slot7":128}
+slots the check READ that differed: {"plugin:slot5":18,"plugin:slot6":18,"plugin:timepoints":2880,"algebra:tick.outerFeeGrowth0":539,"algebra:tick.outerFeeGrowth1":539,"algebra:totalFeeGrowth0":184,"algebra:communityFeePending|lastFeeTransferTs":342,"algebra:totalFeeGrowth1":261} checks with any: 954
+strict: missing by category: {"plugin:timepoints":954}
+other reverts: {"0x16626723":45}
+gas diff histogram (copy - true): {"26770":1,"26799":3,"27388":1,"27487":1,"27501":1,"27524":1,"27629":1,"27632":1,"27633":20,"27638":4,"27644":9,"28040":1,"28095":1,"28185":1,"28189":1,"28199":12,"28243":1,"28292":1,"28319":1,"28334":1,"28335":1,"28346":3,"28347":12,"28348":3,"28349":1,"28353":2,"28354":108,"28355":1,"28358":1,"28361":239,"28362":2,"28363":1,"28364":1,"28368":1,"28375":1,"28393":1,"28470":4,"28486":1,"28548":1,"28576":1,"28646":1,"28926":1,"28936":2,"28937":12,"28945":2,"28960":12,"28997":15,"29019":12,"29027":3,"29028":12,"29031":30,"29052":1,"29072":1,"29078":33,"29092":32,"29093":2,"29094":14,"29101":2,"29102":1,"29106":27,"29107":1,"29175":1,"29208":3,"29212":1,"29222":2,"29348":1,"29376":1,"29899":3,"30064":1,"30119":1,"32046":1,"32090":1,"32126":2,"32838":1,"32867":1,"32927":1,"32930":1,"32931":1,"32933":1,"33765":1,"61565":1,"61700":1,"61714":1,"61844":3,"62367":1,"62413":1,"62417":1,"62438":1,"62526":1,"62528":1,"62536":1,"62543":1,"62550":1,"62561":51,"62567":1,"62569":1,"62573":2,"62680":1,"63104":1,"63137":1,"63144":1,"63146":1,"63180":1,"63189":3,"63213":1,"63219":4,"63223":1,"63228":2,"63231":2,"63243":1,"63250":1,"63259":1,"63262":1,"63264":1,"63277":1,"63286":1,"63291":2,"63292":2,"63295":2,"63298":2,"63300":1,"63306":9,"63311":1,"63322":2,"63383":1,"64126":1,"64184":1,"64309":1,"67038":1,"67044":1,"67084":1,"67133":3,"67134":1,"78983":1,"94920":1,"95215":2,"95746":1,"95898":1,"95900":1,"95915":1,"95927":1,"95933":1,"95944":1,"95983":1,"96039":3,"96179":1,"96655":3,"96697":1,"96713":1,"96730":1,"96735":2,"96742":1,"96761":29,"96767":2,"96774":1,"97431":4,"97494":1,"97525":1,"97551":1,"97555":1,"97591":1,"97607":1,"130920":1,"130934":1,"130961":9,"131619":1,"165229":1,"165259":1,"165261":1,"199361":1,"233561":8,"266197":1,"266225":1,"267217":1,"267761":6,"301961":1,"-1283":7,"-1284":3,"-1275":1,"-1282":1,"-1347":12,"-1267":12}
+first mismatches: [{"check":"algebra-1-ref500>test-100","truthProfit":"6603240","copyProfit":"6595327"},{"check":"algebra-1-ref500>test-5000","truthProfit":"328306672","copyProfit":"327911309"},{"check":"algebra-1-ref500>test-250000","truthProfit":"11891669894","copyProfit":"11872511884"}]
+
+### algebra/fields/s7
+ops by kind: {"swap":179,"burn":25,"mint":30,"collect":20,"swapExactOut":37,"donate":24,"flash":15,"swap:reverted":11}
+events: {"Pool.SwapFee":205,"Pool.Swap":205,"Pool.PluginConfig":1,"Token.Transfer":576,"Pool.BurnFee":25,"Pool.Burn":25,"Pool.Collect":16,"Pool.Mint":30,"Pool.ExcessTokens":33,"Pool.Flash":15}
+re-reads by reason: {"Burn+Collect":7,"Mint":13,"Mint+Flash":3,"Burn":8,"Flash":7,"Mint+Mint":4,"Burn+Mint+Burn":1,"Collect":2,"Flash+Burn+Collect":1,"Mint+Burn+Collect":2,"Mint+Burn":1,"Burn+Collect+Burn+Collect":1,"Burn+Mint":1,"Flash+Flash":2,"Mint+Burn+Collect+Collect":1}
+replays: {}
+slots the copy had WRONG at some block end (by name, count of slot-blocks): {"algebra:totalFeeGrowth1":63,"algebra:communityFeePending|lastFeeTransferTs":76,"plugin:slot4":134,"plugin:timepoints":5347,"plugin:slot5":132,"algebra:totalFeeGrowth0":63,"plugin:slot6":131,"algebra:tick.outerFeeGrowth0":3689,"algebra:tick.outerFeeGrowth1":3684,"plugin:slot7":128}
+slots the check READ that differed: {"plugin:slot5":18,"plugin:slot6":18,"plugin:timepoints":3060,"algebra:totalFeeGrowth0":264,"algebra:communityFeePending|lastFeeTransferTs":450,"plugin:slot7":18,"algebra:totalFeeGrowth1":255,"algebra:tick.outerFeeGrowth0":698,"algebra:tick.outerFeeGrowth1":695,"ref100:other":66} checks with any: 990
+strict: missing by category: {"plugin:timepoints":990}
+other reverts: {"0x16626723":45,"empty revert":9,"0x1f2a2005":18}
+gas diff histogram (copy - true): {"503":3,"504":1,"977":1,"978":1,"1038":2,"1511":1,"7421":1,"7718":1,"7723":1,"7728":1,"11261":3,"15056":1,"20337":1,"27533":1,"27623":6,"27692":1,"27705":1,"27706":2,"27709":1,"27710":7,"27714":3,"28243":1,"28295":1,"28319":1,"28325":1,"28347":1,"28350":1,"28351":1,"28354":20,"28355":2,"28361":510,"28363":1,"28365":1,"28373":1,"28377":3,"28393":1,"28470":2,"29002":3,"29003":9,"29024":13,"29043":1,"29047":1,"29051":2,"29075":1,"29089":12,"29101":1,"29106":18,"29815":1,"30039":1,"30045":1,"32200":29,"32869":1,"32876":1,"37806":1,"44723":6,"49509":15,"62561":126,"63147":1,"63210":1,"63260":1,"64037":1,"66400":4,"78902":1,"78928":1,"78934":1,"83709":3,"96761":29,"96993":2,"98001":1,"130961":13,"134800":3,"-2000":66,"-1337":21,"-1333":3,"-340":1,"-1294":1,"-1338":1,"-1322":1,"-1323":1,"-2418":1,"-1336":1}
+first mismatches: [{"check":"algebra-0-test>ref500-100","truthProfit":"2296530","copyProfit":"2295507"},{"check":"algebra-0-test>ref500-5000","truthProfit":"112813938","copyProfit":"112762825"},{"check":"algebra-0-test>ref500-250000","truthProfit":"708269937","copyProfit":"705811968"}]
+
+### algebra/replay/s1
+ops by kind: {"swap":184,"mint":36,"flash":14,"swapExactOut":35,"donate":26,"collect":12,"burn":23,"swapExactOut:reverted":1,"swap:reverted":5,"flash:reverted":1,"mint:reverted":2}
+events: {"Pool.SwapFee":213,"Pool.Swap":213,"Pool.PluginConfig":1,"Token.Transfer":594,"Pool.Mint":34,"Pool.Flash":13,"Pool.ExcessTokens":34,"Pool.BurnFee":23,"Pool.Burn":23,"Pool.Collect":15}
+re-reads by reason: {}
+replays: {"Swap:exactIn":173,"Mint":34,"Flash":13,"Swap:exactOut":30,"Burn":23,"Collect":15,"Swap:toPrice":10}
+slots the copy had WRONG at some block end (by name, count of slot-blocks): {}
+slots the check READ that differed: {} checks with any: 0
+strict: missing by category: {}
+other reverts: {"0x16626723":45}
+gas diff histogram (copy - true): {"0":954}
+
+### algebra/replay/s7
+ops by kind: {"swap":179,"burn":25,"mint":30,"collect":20,"swapExactOut":37,"donate":24,"flash":15,"swap:reverted":11}
+events: {"Pool.SwapFee":205,"Pool.Swap":205,"Pool.PluginConfig":1,"Token.Transfer":576,"Pool.BurnFee":25,"Pool.Burn":25,"Pool.Collect":16,"Pool.Mint":30,"Pool.ExcessTokens":33,"Pool.Flash":15}
+re-reads by reason: {}
+replays: {"Swap:exactIn":166,"Burn":25,"Collect":16,"Mint":30,"Swap:exactOut":33,"Flash":15,"Swap:toPrice":6}
+slots the copy had WRONG at some block end (by name, count of slot-blocks): {}
+slots the check READ that differed: {} checks with any: 0
+strict: missing by category: {}
+other reverts: {"0x16626723":45,"empty revert":9,"0x1f2a2005":18}
+gas diff histogram (copy - true): {"0":990}
+
+### pancake/fields/s1
+ops by kind: {"swap":165,"mint":34,"growHistory":5,"swapLimit":19,"donate":23,"collect":16,"flash":14,"burn":19,"swapExactOut":35,"swap:reverted":10,"flash:reverted":3,"mint:reverted":3,"swapLimit:reverted":2}
+events: {"Pool.Swap":207,"Token.Transfer":545,"Pool.Mint":31,"Pool.IncreaseObservationCardinalityNext":5,"Pool.Collect":25,"Pool.Flash":11,"Pool.Burn":19}
+re-reads by reason: {"Mint":19,"block:history":10,"IncreaseObservationCardinalityNext+Mint":1,"Collect+Collect+Collect":1,"Collect+Flash":2,"IncreaseObservationCardinalityNext+Burn+Collect":1,"Burn+Collect":6,"Mint+Mint":2,"Flash+Flash":1,"Burn":7,"Collect":7,"Flash":7,"Mint+Collect":2,"Burn+Collect+Mint":1,"Mint+Collect+Burn+Collect":1,"IncreaseObservationCardinalityNext":3,"Mint+Burn+Collect":1,"Mint+Burn":2}
+replays: {}
+slots the copy had WRONG at some block end (by name, count of slot-blocks): {"pancake:feeGrowthGlobal0":51,"pancake:feeGrowthGlobal1":56,"pancake:tick.feeOutside0":2821,"pancake:tick.feeOutside1":2818,"pancake:tick.cumulatives|initialized":2809}
+slots the check READ that differed: {"pancake:tick.feeOutside0":1089,"pancake:tick.feeOutside1":1086,"pancake:tick.cumulatives|initialized":1046,"pancake:feeGrowthGlobal1":261,"pancake:feeGrowthGlobal0":253,"ref100:other":348} checks with any: 560
+strict: missing by category: {"pancake:feeGrowthGlobal0":644,"pancake:feeGrowthGlobal1":645,"pancake:tick.feeOutside0":371,"pancake:tick.feeOutside1":371,"pancake:tick.cumulatives|initialized":371}
+other reverts: {"Error(SPL)":72,"empty revert":21}
+gas diff histogram (copy - true): {"0":692,"1335":2,"1336":12,"2404":2,"2405":2,"2940":1,"4008":2,"17100":9,"34200":123,"51300":19,"68400":49,"85500":29,"102600":20,"119700":1,"136800":4,"153900":8,"171000":6,"188100":2,"205200":3,"256500":4}
+
+### pancake/fields/s7
+ops by kind: {"swap":166,"burn":19,"mint":27,"collect":16,"swapExactOut":32,"donate":27,"flash":7,"flash:reverted":2,"growHistory":12,"swapLimit":24,"mint:reverted":2,"swap:reverted":12,"swapExactOut:reverted":2,"swapLimit:reverted":3}
+events: {"Pool.Swap":205,"Token.Transfer":523,"Pool.Burn":19,"Pool.Collect":28,"Pool.Mint":25,"Pool.IncreaseObservationCardinalityNext":11,"Pool.Flash":5}
+re-reads by reason: {"Burn+Collect":5,"block:history":14,"Mint+Collect":1,"Collect":12,"Mint":12,"Burn":4,"IncreaseObservationCardinalityNext+IncreaseObservationCardinalityNext+Mint":1,"Burn+Burn+Collect":1,"IncreaseObservationCardinalityNext":5,"Mint+Mint":3,"Mint+IncreaseObservationCardinalityNext":1,"Collect+Burn+Collect+Mint":1,"Flash+Burn+Collect":1,"Burn+IncreaseObservationCardinalityNext":1,"Mint+Burn+Collect":1,"Burn+Collect+Burn+Collect":1,"Flash":3,"IncreaseObservationCardinalityNext+Flash":1,"Mint+Burn+Collect+Collect":1,"Mint+Burn+Collect+IncreaseObservationCardinalityNext":1}
+replays: {}
+slots the copy had WRONG at some block end (by name, count of slot-blocks): {"pancake:feeGrowthGlobal1":62,"pancake:feeGrowthGlobal0":58,"pancake:tick.feeOutside0":3447,"pancake:tick.feeOutside1":3447,"pancake:tick.cumulatives|initialized":3628}
+slots the check READ that differed: {"pancake:feeGrowthGlobal1":264,"pancake:tick.feeOutside0":556,"pancake:tick.feeOutside1":556,"pancake:tick.cumulatives|initialized":607,"pancake:feeGrowthGlobal0":245} checks with any: 571
+strict: missing by category: {"pancake:feeGrowthGlobal0":653,"pancake:feeGrowthGlobal1":624,"pancake:tick.feeOutside0":332,"pancake:tick.feeOutside1":332,"pancake:tick.cumulatives|initialized":332}
+other reverts: {"Error(SPL)":45}
+gas diff histogram (copy - true): {"0":818,"34200":114,"68400":36,"102600":9,"136800":8,"171000":3,"205200":1,"239400":1}
+
+### pancake/replay/s1
+ops by kind: {"swap":165,"mint":34,"growHistory":5,"swapLimit":19,"donate":23,"collect":16,"flash":14,"burn":19,"swapExactOut":35,"swap:reverted":10,"flash:reverted":3,"mint:reverted":3,"swapLimit:reverted":2}
+events: {"Pool.Swap":207,"Token.Transfer":545,"Pool.Mint":31,"Pool.IncreaseObservationCardinalityNext":5,"Pool.Collect":25,"Pool.Flash":11,"Pool.Burn":19}
+re-reads by reason: {}
+replays: {"Swap:exactIn":167,"Mint":31,"IncreaseObservationCardinalityNext":5,"Collect":25,"Flash":11,"Burn":19,"Swap:exactOut":29,"Swap:exactIn+limit":4,"Swap:toPrice":7}
+slots the copy had WRONG at some block end (by name, count of slot-blocks): {}
+slots the check READ that differed: {} checks with any: 0
+strict: missing by category: {}
+other reverts: {"Error(SPL)":72,"empty revert":21}
+gas diff histogram (copy - true): {"0":990}
+
+### pancake/replay/s7
+ops by kind: {"swap":166,"burn":19,"mint":27,"collect":16,"swapExactOut":32,"donate":27,"flash":7,"flash:reverted":2,"growHistory":12,"swapLimit":24,"mint:reverted":2,"swap:reverted":12,"swapExactOut:reverted":2,"swapLimit:reverted":3}
+events: {"Pool.Swap":205,"Token.Transfer":523,"Pool.Burn":19,"Pool.Collect":28,"Pool.Mint":25,"Pool.IncreaseObservationCardinalityNext":11,"Pool.Flash":5}
+re-reads by reason: {}
+replays: {"Swap:exactIn":163,"Burn":19,"Collect":28,"Mint":25,"Swap:exactOut":29,"Swap:toPrice":10,"IncreaseObservationCardinalityNext":11,"Swap:exactIn+limit":3,"Flash":5}
+slots the copy had WRONG at some block end (by name, count of slot-blocks): {}
+slots the check READ that differed: {} checks with any: 0
+strict: missing by category: {}
+other reverts: {"Error(SPL)":45}
+gas diff histogram (copy - true): {"0":990}
+
+### solidly/default/s1
+ops by kind: {"swap":239,"sync":7,"donate":34,"claimFees":5,"mint":25,"skim":10,"burn":10}
+events: {"Token.Transfer":862,"Pair.Fees":252,"Pair.Sync":281,"Pair.Swap":239,"Pair.Claim":4,"Pair.Transfer":45,"Pair.Mint":25,"Pair.Burn":10}
+re-reads by reason: {}
+replays: {}
+slots the copy had WRONG at some block end (by name, count of slot-blocks): {}
+slots the check READ that differed: {} checks with any: 0
+strict: missing by category: {}
+other reverts: {}
+gas diff histogram (copy - true): {"0":972}
+
+### solidly/default/s7
+ops by kind: {"swap":230,"donate":43,"sync":5,"claimFees":10,"mint":23,"skim":8,"burn":11}
+events: {"Token.Transfer":855,"Pair.Fees":250,"Pair.Sync":269,"Pair.Swap":230,"Pair.Claim":9,"Pair.Transfer":45,"Pair.Mint":23,"Pair.Burn":11}
+re-reads by reason: {}
+replays: {}
+slots the copy had WRONG at some block end (by name, count of slot-blocks): {}
+slots the check READ that differed: {} checks with any: 0
+strict: missing by category: {}
+other reverts: {}
+gas diff histogram (copy - true): {"0":1008}
+
+### v2/default/s1
+ops by kind: {"swap":241,"sync":9,"donate":33,"burn":14,"skim":10,"mint":23}
+events: {"Token.Transfer":609,"Pair.Sync":287,"Pair.Swap":241,"Pair.Transfer(LP)":51,"Pair.Burn":14,"Pair.Mint":23}
+re-reads by reason: {}
+replays: {}
+slots the copy had WRONG at some block end (by name, count of slot-blocks): {}
+slots the check READ that differed: {} checks with any: 0
+strict: missing by category: {}
+other reverts: {}
+gas diff histogram (copy - true): {"0":972}
+
+### v2/default/s7
+ops by kind: {"swap":227,"donate":46,"sync":12,"burn":16,"mint":23,"skim":6}
+events: {"Token.Transfer":590,"Pair.Sync":278,"Pair.Swap":227,"Pair.Transfer(LP)":55,"Pair.Burn":16,"Pair.Mint":23}
+re-reads by reason: {}
+replays: {}
+slots the copy had WRONG at some block end (by name, count of slot-blocks): {}
+slots the check READ that differed: {} checks with any: 0
+strict: missing by category: {}
+other reverts: {}
+gas diff histogram (copy - true): {"0":990}
+
+### v3/fields/s1
+ops by kind: {"swap":165,"mint":34,"growHistory":5,"swapLimit":19,"donate":23,"collect":16,"flash":14,"burn":19,"swapExactOut":35,"swap:reverted":10,"flash:reverted":3,"mint:reverted":3,"swapLimit:reverted":2}
+events: {"Pool.Swap":207,"Token.Transfer":547,"Pool.Mint":31,"Pool.IncreaseObservationCardinalityNext":5,"Pool.Collect":25,"Pool.Flash":11,"Pool.Burn":19}
+re-reads by reason: {"Mint":19,"block:history":11,"IncreaseObservationCardinalityNext+Mint":1,"Collect+Collect+Collect":1,"Collect+Flash":2,"IncreaseObservationCardinalityNext+Burn+Collect":1,"Burn+Collect":6,"Mint+Mint":2,"Flash+Flash":1,"Burn":7,"Collect":7,"Flash":7,"Mint+Collect":2,"Burn+Collect+Mint":1,"Mint+Collect+Burn+Collect":1,"IncreaseObservationCardinalityNext":3,"Mint+Burn+Collect":1,"Mint+Burn":2}
+replays: {}
+slots the copy had WRONG at some block end (by name, count of slot-blocks): {"univ3:feeGrowthGlobal0":51,"univ3:protocolFees":69,"univ3:feeGrowthGlobal1":56,"univ3:tick.feeOutside0":2908,"univ3:tick.feeOutside1":2905,"univ3:tick.cumulatives|initialized":2902}
+slots the check READ that differed: {"univ3:tick.feeOutside0":990,"univ3:tick.feeOutside1":987,"univ3:tick.cumulatives|initialized":951,"univ3:protocolFees":423,"univ3:feeGrowthGlobal1":258,"univ3:feeGrowthGlobal0":247,"ref100:other":337} checks with any: 606
+strict: missing by category: {"univ3:feeGrowthGlobal0":631,"univ3:protocolFees":918,"univ3:feeGrowthGlobal1":648,"univ3:tick.feeOutside0":361,"univ3:tick.feeOutside1":361,"univ3:tick.cumulatives|initialized":361}
+other reverts: {"Error(SPL)":72,"empty revert":21}
+gas diff histogram (copy - true): {"0":693,"1335":1,"1336":13,"1871":1,"2404":2,"2405":2,"4008":2,"17100":9,"34200":125,"51300":21,"68400":49,"85500":29,"102600":17,"119700":2,"136800":6,"153900":8,"171000":3,"205200":3,"256500":4}
+
+### v3/fields/s7
+ops by kind: {"swap":166,"burn":19,"mint":27,"collect":16,"swapExactOut":32,"donate":27,"flash":7,"growHistory":12,"swapLimit":24,"mint:reverted":2,"swap:reverted":10,"swapExactOut:reverted":2,"swapLimit:reverted":2,"flash:reverted":1}
+events: {"Pool.Swap":208,"Token.Transfer":534,"Pool.Burn":19,"Pool.Collect":28,"Pool.Mint":25,"Pool.Flash":6,"Pool.IncreaseObservationCardinalityNext":11}
+re-reads by reason: {"Burn+Collect":5,"block:history":16,"Mint+Collect":1,"Collect":12,"Mint+Flash":1,"Burn":4,"IncreaseObservationCardinalityNext+IncreaseObservationCardinalityNext+Mint":1,"Mint":11,"Burn+Burn+Collect":1,"IncreaseObservationCardinalityNext":5,"Mint+Mint":3,"Mint+IncreaseObservationCardinalityNext":1,"Collect+Burn+Collect+Mint":1,"Flash+Burn+Collect":1,"Burn+IncreaseObservationCardinalityNext":1,"Mint+Burn+Collect":1,"Burn+Collect+Burn+Collect":1,"Flash":3,"IncreaseObservationCardinalityNext+Flash":1,"Mint+Burn+Collect+Collect":1,"Mint+Burn+Collect+IncreaseObservationCardinalityNext":1}
+replays: {}
+slots the copy had WRONG at some block end (by name, count of slot-blocks): {"univ3:feeGrowthGlobal1":63,"univ3:protocolFees":76,"univ3:feeGrowthGlobal0":60,"univ3:tick.feeOutside0":3054,"univ3:tick.feeOutside1":3054,"univ3:tick.cumulatives|initialized":3146}
+slots the check READ that differed: {"univ3:protocolFees":504,"univ3:feeGrowthGlobal1":270,"univ3:tick.feeOutside0":470,"univ3:tick.feeOutside1":470,"univ3:tick.cumulatives|initialized":482,"univ3:feeGrowthGlobal0":254} checks with any: 618
+strict: missing by category: {"univ3:feeGrowthGlobal0":648,"univ3:protocolFees":963,"univ3:feeGrowthGlobal1":630,"univ3:tick.feeOutside0":315,"univ3:tick.feeOutside1":315,"univ3:tick.cumulatives|initialized":315}
+other reverts: {"Error(SPL)":27}
+gas diff histogram (copy - true): {"0":827,"17100":4,"34200":85,"51300":1,"68400":37,"85500":4,"102600":10,"136800":5,"171000":13,"205200":4}
+
+### v3/replay/s1
+ops by kind: {"swap":165,"mint":34,"growHistory":5,"swapLimit":19,"donate":23,"collect":16,"flash":14,"burn":19,"swapExactOut":35,"swap:reverted":10,"flash:reverted":3,"mint:reverted":3,"swapLimit:reverted":2}
+events: {"Pool.Swap":207,"Token.Transfer":547,"Pool.Mint":31,"Pool.IncreaseObservationCardinalityNext":5,"Pool.Collect":25,"Pool.Flash":11,"Pool.Burn":19}
+re-reads by reason: {}
+replays: {"Swap:exactIn":167,"Mint":31,"IncreaseObservationCardinalityNext":5,"Collect":25,"Flash":11,"Burn":19,"Swap:exactOut":29,"Swap:exactIn+limit":4,"Swap:toPrice":7}
+slots the copy had WRONG at some block end (by name, count of slot-blocks): {}
+slots the check READ that differed: {} checks with any: 0
+strict: missing by category: {}
+other reverts: {"Error(SPL)":72,"empty revert":21}
+gas diff histogram (copy - true): {"0":990}
+
+### v3/replay/s7
+ops by kind: {"swap":166,"burn":19,"mint":27,"collect":16,"swapExactOut":32,"donate":27,"flash":7,"growHistory":12,"swapLimit":24,"mint:reverted":2,"swap:reverted":10,"swapExactOut:reverted":2,"swapLimit:reverted":2,"flash:reverted":1}
+events: {"Pool.Swap":208,"Token.Transfer":534,"Pool.Burn":19,"Pool.Collect":28,"Pool.Mint":25,"Pool.Flash":6,"Pool.IncreaseObservationCardinalityNext":11}
+re-reads by reason: {}
+replays: {"Swap:exactIn":171,"Burn":19,"Collect":28,"Mint":25,"Swap:exactOut":29,"Flash":6,"IncreaseObservationCardinalityNext":11,"Swap:toPrice":6,"Swap:exactIn+limit":2}
+slots the copy had WRONG at some block end (by name, count of slot-blocks): {}
+slots the check READ that differed: {} checks with any: 0
+strict: missing by category: {}
+other reverts: {"Error(SPL)":27}
+gas diff histogram (copy - true): {"0":990}
+
+### v4/fields/s1
+ops by kind: {"coinDonate":11,"swap":171,"v4donate":25,"removeLiq":33,"swapExactOut":37,"swap:reverted":8,"addLiq":32,"swapLimit":21,"swapExactOut:reverted":3,"addLiq:reverted":2}
+events: {"Token.Transfer":602,"PM.Swap":218,"PM.Donate":25,"PM.ModifyLiquidity":63}
+re-reads by reason: {"ModifyLiquidity":39,"ModifyLiquidity+ModifyLiquidity":12}
+replays: {}
+slots the copy had WRONG at some block end (by name, count of slot-blocks): {"PoolManager:other.feeGrowthGlobal0":90,"PoolManager:other.tick.feeOutside0":1597,"PoolManager:other.tick.feeOutside1":1597,"PoolManager:test.feeGrowthGlobal0":77,"PoolManager:test.feeGrowthGlobal1":73,"PoolManager:other.feeGrowthGlobal1":103,"PoolManager:test.tick.feeOutside0":2008,"PoolManager:test.tick.feeOutside1":1983}
+slots the check READ that differed: {"PoolManager:test.feeGrowthGlobal0":358,"PoolManager:test.feeGrowthGlobal1":324,"PoolManager:test.tick.feeOutside0":576,"PoolManager:test.tick.feeOutside1":576} checks with any: 670
+strict: missing by category: {"PoolManager:test.feeGrowthGlobal0":669,"PoolManager:test.feeGrowthGlobal1":660,"PoolManager:test.tick.feeOutside0":321,"PoolManager:test.tick.feeOutside1":321}
+other reverts: {"0x1f2a2005":9}
+gas diff histogram (copy - true): {"0":814,"17100":17,"34200":103,"68400":50,"102600":10,"136800":8,"171000":1,"205200":1,"-2800":1,"-17100":3}
+
+### v4/fields/s7
+ops by kind: {"swap":152,"removeLiq":35,"swap:reverted":10,"addLiq":32,"coinDonate":30,"swapLimit":20,"addLiq:reverted":1,"swapExactOut":39,"v4donate":22,"swapExactOut:reverted":1,"swapLimit:reverted":1}
+events: {"PM.Swap":199,"Token.Transfer":569,"PM.ModifyLiquidity":66,"PM.Donate":22}
+re-reads by reason: {"ModifyLiquidity":46,"ModifyLiquidity+ModifyLiquidity":10}
+replays: {}
+slots the copy had WRONG at some block end (by name, count of slot-blocks): {"PoolManager:other.feeGrowthGlobal1":50,"PoolManager:test.feeGrowthGlobal0":77,"PoolManager:test.feeGrowthGlobal1":73,"PoolManager:other.tick.feeOutside0":1575,"PoolManager:other.tick.feeOutside1":1575,"PoolManager:other.feeGrowthGlobal0":46,"PoolManager:test.tick.feeOutside0":2723,"PoolManager:test.tick.feeOutside1":2719}
+slots the check READ that differed: {"PoolManager:test.feeGrowthGlobal0":398,"PoolManager:test.feeGrowthGlobal1":381,"PoolManager:test.tick.feeOutside0":618,"PoolManager:test.tick.feeOutside1":612,"ref100:other":146} checks with any: 654
+strict: missing by category: {"PoolManager:test.feeGrowthGlobal0":608,"PoolManager:test.feeGrowthGlobal1":621,"PoolManager:test.tick.feeOutside0":302,"PoolManager:test.tick.feeOutside1":302}
+other reverts: {"0x7c9c6e8f":27,"empty revert":12,"0x1f2a2005":27}
+gas diff histogram (copy - true): {"0":704,"534":4,"535":4,"2939":3,"3206":1,"17100":14,"34200":103,"51300":7,"68400":38,"85500":1,"102600":48,"136800":3,"153900":4,"188100":8,"205200":8,"-2800":4}
+
+### v4/replay/s1
+ops by kind: {"coinDonate":11,"swap":171,"v4donate":25,"removeLiq":33,"swapExactOut":37,"swap:reverted":8,"addLiq":32,"swapLimit":21,"swapExactOut:reverted":3,"addLiq:reverted":2}
+events: {"Token.Transfer":602,"PM.Swap":218,"PM.Donate":25,"PM.ModifyLiquidity":63}
+re-reads by reason: {}
+replays: {"Swap:exactIn":170,"Swap:toPrice":6,"Donate":25,"ModifyLiquidity":63,"Swap:exactOut":34,"Swap:exactIn+limit":8}
+slots the copy had WRONG at some block end (by name, count of slot-blocks): {}
+slots the check READ that differed: {} checks with any: 0
+strict: missing by category: {}
+other reverts: {"0x1f2a2005":9}
+gas diff histogram (copy - true): {"0":1008}
+
+### v4/replay/s7
+ops by kind: {"swap":152,"removeLiq":35,"swap:reverted":10,"addLiq":32,"coinDonate":30,"swapLimit":20,"addLiq:reverted":1,"swapExactOut":39,"v4donate":22,"swapExactOut:reverted":1,"swapLimit:reverted":1}
+events: {"PM.Swap":199,"Token.Transfer":569,"PM.ModifyLiquidity":66,"PM.Donate":22}
+re-reads by reason: {}
+replays: {"Swap:exactIn":150,"ModifyLiquidity":66,"Swap:toPrice":10,"Swap:exactOut":35,"Swap:exactIn+limit":4,"Donate":22}
+slots the copy had WRONG at some block end (by name, count of slot-blocks): {}
+slots the check READ that differed: {} checks with any: 0
+strict: missing by category: {}
+other reverts: {"0x7c9c6e8f":27,"empty revert":12,"0x1f2a2005":27}
+gas diff histogram (copy - true): {"0":954}

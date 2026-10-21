@@ -1,0 +1,157 @@
+{
+ "type": "pancake",
+ "variant": "fields",
+ "seed": 1,
+ "opsRequested": 330,
+ "ops": {
+  "sent": 330,
+  "succeeded": 312,
+  "reverted": 18,
+  "byKind": {
+   "swap": 165,
+   "mint": 34,
+   "growHistory": 5,
+   "swapLimit": 19,
+   "donate": 23,
+   "collect": 16,
+   "flash": 14,
+   "burn": 19,
+   "swapExactOut": 35,
+   "swap:reverted": 10,
+   "flash:reverted": 3,
+   "mint:reverted": 3,
+   "swapLimit:reverted": 2
+  }
+ },
+ "blocks": 135,
+ "events": {
+  "total": 843,
+  "byName": {
+   "Pool.Swap": 207,
+   "Token.Transfer": 545,
+   "Pool.Mint": 31,
+   "Pool.IncreaseObservationCardinalityNext": 5,
+   "Pool.Collect": 25,
+   "Pool.Flash": 11,
+   "Pool.Burn": 19
+  }
+ },
+ "reReads": {
+  "events": 74,
+  "slots": 1228,
+  "byReason": {
+   "Mint": 19,
+   "block:history": 10,
+   "IncreaseObservationCardinalityNext+Mint": 1,
+   "Collect+Collect+Collect": 1,
+   "Collect+Flash": 2,
+   "IncreaseObservationCardinalityNext+Burn+Collect": 1,
+   "Burn+Collect": 6,
+   "Mint+Mint": 2,
+   "Flash+Flash": 1,
+   "Burn": 7,
+   "Collect": 7,
+   "Flash": 7,
+   "Mint+Collect": 2,
+   "Burn+Collect+Mint": 1,
+   "Mint+Collect+Burn+Collect": 1,
+   "IncreaseObservationCardinalityNext": 3,
+   "Mint+Burn+Collect": 1,
+   "Mint+Burn": 2
+  }
+ },
+ "replays": {
+  "calls": 0,
+  "byReason": {}
+ },
+ "stateDiff": {
+  "checkpoints": 135,
+  "divergentSlotsMax": 114,
+  "byCategory": {
+   "pancake:feeGrowthGlobal0": 51,
+   "pancake:feeGrowthGlobal1": 56,
+   "pancake:tick.feeOutside0": 2821,
+   "pancake:tick.feeOutside1": 2818,
+   "pancake:tick.cumulatives|initialized": 2809
+  },
+  "unsound": 0,
+  "unsoundExamples": []
+ },
+ "checks": {
+  "total": 990,
+  "nodeVsEngineTruth": {
+   "outputMatch": 990,
+   "successMatch": 990,
+   "gasEqual": 990,
+   "gasDiffs": {}
+  },
+  "profitPositive": 553,
+  "profitZero": 344,
+  "profitPositiveMatch": 553,
+  "otherRevert": 93,
+  "revertKinds": {
+   "Error(SPL)": 72,
+   "empty revert": 21
+  },
+  "lenient": {
+   "outputMatch": 990,
+   "successMatch": 990,
+   "mismatch": 0,
+   "gasEqual": 692,
+   "gasDiffHist": {
+    "0": 692,
+    "1335": 2,
+    "1336": 12,
+    "2404": 2,
+    "2405": 2,
+    "2940": 1,
+    "4008": 2,
+    "17100": 9,
+    "34200": 123,
+    "51300": 19,
+    "68400": 49,
+    "85500": 29,
+    "102600": 20,
+    "119700": 1,
+    "136800": 4,
+    "153900": 8,
+    "171000": 6,
+    "188100": 2,
+    "205200": 3,
+    "256500": 4
+   },
+   "firstMismatches": []
+  },
+  "copyNode": {
+   "outputMatch": 990
+  },
+  "strict": {
+   "known": 72,
+   "knownMatch": 72,
+   "knownMismatch": 0,
+   "needsNode": 918,
+   "missingByCategory": {
+    "pancake:feeGrowthGlobal0": 644,
+    "pancake:feeGrowthGlobal1": 645,
+    "pancake:tick.feeOutside0": 371,
+    "pancake:tick.feeOutside1": 371,
+    "pancake:tick.cumulatives|initialized": 371
+   },
+   "unknownOther": 0
+  },
+  "readDiffByCategory": {
+   "pancake:tick.feeOutside0": 1089,
+   "pancake:tick.feeOutside1": 1086,
+   "pancake:tick.cumulatives|initialized": 1046,
+   "pancake:feeGrowthGlobal1": 261,
+   "pancake:feeGrowthGlobal0": 253,
+   "ref100:other": 348
+  },
+  "checksWithReadDiff": 560
+ },
+ "negativeControl": {
+  "checks": 18,
+  "differencesDetected": 9
+ },
+ "seconds": 53
+}

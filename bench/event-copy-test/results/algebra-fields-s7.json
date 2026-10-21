@@ -1,0 +1,340 @@
+{
+ "type": "algebra",
+ "variant": "fields",
+ "seed": 7,
+ "opsRequested": 330,
+ "ops": {
+  "sent": 330,
+  "succeeded": 319,
+  "reverted": 11,
+  "byKind": {
+   "swap": 179,
+   "burn": 25,
+   "mint": 30,
+   "collect": 20,
+   "swapExactOut": 37,
+   "donate": 24,
+   "flash": 15,
+   "swap:reverted": 11
+  }
+ },
+ "blocks": 134,
+ "events": {
+  "total": 1131,
+  "byName": {
+   "Pool.SwapFee": 205,
+   "Pool.Swap": 205,
+   "Pool.PluginConfig": 1,
+   "Token.Transfer": 576,
+   "Pool.BurnFee": 25,
+   "Pool.Burn": 25,
+   "Pool.Collect": 16,
+   "Pool.Mint": 30,
+   "Pool.ExcessTokens": 33,
+   "Pool.Flash": 15
+  }
+ },
+ "reReads": {
+  "events": 54,
+  "slots": 3830,
+  "byReason": {
+   "Burn+Collect": 7,
+   "Mint": 13,
+   "Mint+Flash": 3,
+   "Burn": 8,
+   "Flash": 7,
+   "Mint+Mint": 4,
+   "Burn+Mint+Burn": 1,
+   "Collect": 2,
+   "Flash+Burn+Collect": 1,
+   "Mint+Burn+Collect": 2,
+   "Mint+Burn": 1,
+   "Burn+Collect+Burn+Collect": 1,
+   "Burn+Mint": 1,
+   "Flash+Flash": 2,
+   "Mint+Burn+Collect+Collect": 1
+  }
+ },
+ "replays": {
+  "calls": 0,
+  "byReason": {}
+ },
+ "stateDiff": {
+  "checkpoints": 134,
+  "divergentSlotsMax": 187,
+  "byCategory": {
+   "algebra:totalFeeGrowth1": 63,
+   "algebra:communityFeePending|lastFeeTransferTs": 76,
+   "plugin:slot4": 134,
+   "plugin:timepoints": 5347,
+   "plugin:slot5": 132,
+   "algebra:totalFeeGrowth0": 63,
+   "plugin:slot6": 131,
+   "algebra:tick.outerFeeGrowth0": 3689,
+   "algebra:tick.outerFeeGrowth1": 3684,
+   "plugin:slot7": 128
+  },
+  "unsound": 0,
+  "unsoundExamples": []
+ },
+ "checks": {
+  "total": 990,
+  "nodeVsEngineTruth": {
+   "outputMatch": 990,
+   "successMatch": 990,
+   "gasEqual": 990,
+   "gasDiffs": {}
+  },
+  "profitPositive": 529,
+  "profitZero": 389,
+  "profitPositiveMatch": 417,
+  "otherRevert": 72,
+  "revertKinds": {
+   "0x16626723": 45,
+   "empty revert": 9,
+   "0x1f2a2005": 18
+  },
+  "lenient": {
+   "outputMatch": 876,
+   "successMatch": 990,
+   "mismatch": 114,
+   "gasEqual": 0,
+   "gasDiffHist": {
+    "503": 3,
+    "504": 1,
+    "977": 1,
+    "978": 1,
+    "1038": 2,
+    "1511": 1,
+    "7421": 1,
+    "7718": 1,
+    "7723": 1,
+    "7728": 1,
+    "11261": 3,
+    "15056": 1,
+    "20337": 1,
+    "27533": 1,
+    "27623": 6,
+    "27692": 1,
+    "27705": 1,
+    "27706": 2,
+    "27709": 1,
+    "27710": 7,
+    "27714": 3,
+    "28243": 1,
+    "28295": 1,
+    "28319": 1,
+    "28325": 1,
+    "28347": 1,
+    "28350": 1,
+    "28351": 1,
+    "28354": 20,
+    "28355": 2,
+    "28361": 510,
+    "28363": 1,
+    "28365": 1,
+    "28373": 1,
+    "28377": 3,
+    "28393": 1,
+    "28470": 2,
+    "29002": 3,
+    "29003": 9,
+    "29024": 13,
+    "29043": 1,
+    "29047": 1,
+    "29051": 2,
+    "29075": 1,
+    "29089": 12,
+    "29101": 1,
+    "29106": 18,
+    "29815": 1,
+    "30039": 1,
+    "30045": 1,
+    "32200": 29,
+    "32869": 1,
+    "32876": 1,
+    "37806": 1,
+    "44723": 6,
+    "49509": 15,
+    "62561": 126,
+    "63147": 1,
+    "63210": 1,
+    "63260": 1,
+    "64037": 1,
+    "66400": 4,
+    "78902": 1,
+    "78928": 1,
+    "78934": 1,
+    "83709": 3,
+    "96761": 29,
+    "96993": 2,
+    "98001": 1,
+    "130961": 13,
+    "134800": 3,
+    "-2000": 66,
+    "-1337": 21,
+    "-1333": 3,
+    "-340": 1,
+    "-1294": 1,
+    "-1338": 1,
+    "-1322": 1,
+    "-1323": 1,
+    "-2418": 1,
+    "-1336": 1
+   },
+   "firstMismatches": [
+    {
+     "check": "algebra-0-test>ref500-100",
+     "truth": {
+      "success": false,
+      "output": "0x4e88422a0000000000000000000000000000000000000000000000000000000000230ad2ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+     },
+     "copy": {
+      "success": false,
+      "output": "0x4e88422a00000000000000000000000000000000000000000000000000000000002306d3ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+     },
+     "decoded": {
+      "truthProfit": "2296530",
+      "copyProfit": "2295507"
+     }
+    },
+    {
+     "check": "algebra-0-test>ref500-5000",
+     "truth": {
+      "success": false,
+      "output": "0x4e88422a0000000000000000000000000000000000000000000000000000000006b96772ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+     },
+     "copy": {
+      "success": false,
+      "output": "0x4e88422a0000000000000000000000000000000000000000000000000000000006b89fc9ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+     },
+     "decoded": {
+      "truthProfit": "112813938",
+      "copyProfit": "112762825"
+     }
+    },
+    {
+     "check": "algebra-0-test>ref500-250000",
+     "truth": {
+      "success": false,
+      "output": "0x4e88422a000000000000000000000000000000000000000000000000000000002a375771ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+     },
+     "copy": {
+      "success": false,
+      "output": "0x4e88422a000000000000000000000000000000000000000000000000000000002a11d600ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+     },
+     "decoded": {
+      "truthProfit": "708269937",
+      "copyProfit": "705811968"
+     }
+    },
+    {
+     "check": "algebra-0-ref3000>test-100",
+     "truth": {
+      "success": false,
+      "output": "0x4e88422a000000000000000000000000000000000000000000000000000000000014dc75ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+     },
+     "copy": {
+      "success": false,
+      "output": "0x4e88422a000000000000000000000000000000000000000000000000000000000014d880ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+     },
+     "decoded": {
+      "truthProfit": "1367157",
+      "copyProfit": "1366144"
+     }
+    },
+    {
+     "check": "algebra-0-ref3000>test-5000",
+     "truth": {
+      "success": false,
+      "output": "0x4e88422a0000000000000000000000000000000000000000000000000000000003f44abbffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+     },
+     "copy": {
+      "success": false,
+      "output": "0x4e88422a0000000000000000000000000000000000000000000000000000000003f384e0ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+     },
+     "decoded": {
+      "truthProfit": "66341563",
+      "copyProfit": "66290912"
+     }
+    },
+    {
+     "check": "algebra-0-test>ref100-100",
+     "truth": {
+      "success": false,
+      "output": "0x4e88422a0000000000000000000000000000000000000000000000000000000005fff96effffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+     },
+     "copy": {
+      "success": false,
+      "output": "0x4e88422a0000000000000000000000000000000000000000000000000000000005fff197ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+     },
+     "decoded": {
+      "truthProfit": "100661614",
+      "copyProfit": "100659607"
+     }
+    },
+    {
+     "check": "algebra-0-test>ref100-5000",
+     "truth": {
+      "success": false,
+      "output": "0x4e88422a000000000000000000000000000000000000000000000000000000012bbf18c7ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+     },
+     "copy": {
+      "success": false,
+      "output": "0x4e88422a000000000000000000000000000000000000000000000000000000012bbd9126ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+     },
+     "decoded": {
+      "truthProfit": "5028911303",
+      "copyProfit": "5028811046"
+     }
+    },
+    {
+     "check": "algebra-0-test>ref100-250000",
+     "truth": {
+      "success": false,
+      "output": "0x4e88422a000000000000000000000000000000000000000000000000000000382aeed068ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+     },
+     "copy": {
+      "success": false,
+      "output": "0x4e88422a000000000000000000000000000000000000000000000000000000382aa56818ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+     },
+     "decoded": {
+      "truthProfit": "241238462568",
+      "copyProfit": "241233651736"
+     }
+    }
+   ]
+  },
+  "copyNode": {
+   "outputMatch": 876
+  },
+  "strict": {
+   "known": 0,
+   "knownMatch": 0,
+   "knownMismatch": 0,
+   "needsNode": 990,
+   "missingByCategory": {
+    "plugin:timepoints": 990
+   },
+   "unknownOther": 0
+  },
+  "readDiffByCategory": {
+   "plugin:slot5": 18,
+   "plugin:slot6": 18,
+   "plugin:timepoints": 3060,
+   "algebra:totalFeeGrowth0": 264,
+   "algebra:communityFeePending|lastFeeTransferTs": 450,
+   "plugin:slot7": 18,
+   "algebra:totalFeeGrowth1": 255,
+   "algebra:tick.outerFeeGrowth0": 698,
+   "algebra:tick.outerFeeGrowth1": 695,
+   "ref100:other": 66
+  },
+  "checksWithReadDiff": 990
+ },
+ "negativeControl": {
+  "checks": 18,
+  "differencesDetected": 12
+ },
+ "seconds": 72
+}

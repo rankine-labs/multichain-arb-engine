@@ -1,0 +1,22 @@
+{
+  "name": "event-copy-test",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@cryptoalgebra/integral-base-plugin": "^1.2.4",
+    "@cryptoalgebra/integral-core": "^1.2.10",
+    "@pancakeswap/v3-core": "^1.0.2",
+    "@uniswap/v2-core": "^1.0.1",
+    "@uniswap/v3-core": "^1.0.1",
+    "@uniswap/v4-core": "^1.0.2",
+    "ethers": "^6.17.0",
+    "solc": "^0.8.26"
+  }
+}

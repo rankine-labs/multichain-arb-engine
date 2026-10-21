@@ -1,0 +1,17 @@
+# Tiny wrapper around the bot's own simulator library (arbsim, in the repo's sim/ folder).
+# It runs the SAME engine as `arbsim check-fixture`, with one difference:
+# a fixture may say "unlistedIsEmpty": false, and then any account/slot that is
+# not listed counts as UNKNOWN ("needs node") instead of zero.
+[package]
+name = "copycheck"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+arbsim = { path = "../../multichain-arb-engine/sim" }
+serde_json = "1"
+# Same revm version the simulator uses (only for its data types).
+revm = { version = "=43.0.3", default-features = false, features = ["std"] }
+
+[profile.release]
+opt-level = 3

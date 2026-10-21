@@ -1,0 +1,108 @@
+{
+ "type": "algebra",
+ "variant": "replay",
+ "seed": 1,
+ "opsRequested": 330,
+ "ops": {
+  "sent": 330,
+  "succeeded": 321,
+  "reverted": 9,
+  "byKind": {
+   "swap": 184,
+   "mint": 36,
+   "flash": 14,
+   "swapExactOut": 35,
+   "donate": 26,
+   "collect": 12,
+   "burn": 23,
+   "swapExactOut:reverted": 1,
+   "swap:reverted": 5,
+   "flash:reverted": 1,
+   "mint:reverted": 2
+  }
+ },
+ "blocks": 132,
+ "events": {
+  "total": 1163,
+  "byName": {
+   "Pool.SwapFee": 213,
+   "Pool.Swap": 213,
+   "Pool.PluginConfig": 1,
+   "Token.Transfer": 594,
+   "Pool.Mint": 34,
+   "Pool.Flash": 13,
+   "Pool.ExcessTokens": 34,
+   "Pool.BurnFee": 23,
+   "Pool.Burn": 23,
+   "Pool.Collect": 15
+  }
+ },
+ "reReads": {
+  "events": 0,
+  "slots": 0,
+  "byReason": {}
+ },
+ "replays": {
+  "calls": 298,
+  "byReason": {
+   "Swap:exactIn": 173,
+   "Mint": 34,
+   "Flash": 13,
+   "Swap:exactOut": 30,
+   "Burn": 23,
+   "Collect": 15,
+   "Swap:toPrice": 10
+  }
+ },
+ "stateDiff": {
+  "checkpoints": 132,
+  "divergentSlotsMax": 0,
+  "byCategory": {},
+  "unsound": 0,
+  "unsoundExamples": []
+ },
+ "checks": {
+  "total": 954,
+  "nodeVsEngineTruth": {
+   "outputMatch": 954,
+   "successMatch": 954,
+   "gasEqual": 954,
+   "gasDiffs": {}
+  },
+  "profitPositive": 576,
+  "profitZero": 333,
+  "profitPositiveMatch": 576,
+  "otherRevert": 45,
+  "revertKinds": {
+   "0x16626723": 45
+  },
+  "lenient": {
+   "outputMatch": 954,
+   "successMatch": 954,
+   "mismatch": 0,
+   "gasEqual": 954,
+   "gasDiffHist": {
+    "0": 954
+   },
+   "firstMismatches": []
+  },
+  "copyNode": {
+   "outputMatch": 954
+  },
+  "strict": {
+   "known": 954,
+   "knownMatch": 954,
+   "knownMismatch": 0,
+   "needsNode": 0,
+   "missingByCategory": {},
+   "unknownOther": 0
+  },
+  "readDiffByCategory": {},
+  "checksWithReadDiff": 0
+ },
+ "negativeControl": {
+  "checks": 18,
+  "differencesDetected": 12
+ },
+ "seconds": 56
+}

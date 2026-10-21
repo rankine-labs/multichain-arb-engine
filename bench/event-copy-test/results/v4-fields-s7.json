@@ -1,0 +1,134 @@
+{
+ "type": "v4",
+ "variant": "fields",
+ "seed": 7,
+ "opsRequested": 330,
+ "ops": {
+  "sent": 330,
+  "succeeded": 317,
+  "reverted": 13,
+  "byKind": {
+   "swap": 152,
+   "removeLiq": 35,
+   "swap:reverted": 10,
+   "addLiq": 32,
+   "coinDonate": 30,
+   "swapLimit": 20,
+   "addLiq:reverted": 1,
+   "swapExactOut": 39,
+   "v4donate": 22,
+   "swapExactOut:reverted": 1,
+   "swapLimit:reverted": 1
+  }
+ },
+ "blocks": 121,
+ "events": {
+  "total": 856,
+  "byName": {
+   "PM.Swap": 199,
+   "Token.Transfer": 569,
+   "PM.ModifyLiquidity": 66,
+   "PM.Donate": 22
+  }
+ },
+ "reReads": {
+  "events": 56,
+  "slots": 919,
+  "byReason": {
+   "ModifyLiquidity": 46,
+   "ModifyLiquidity+ModifyLiquidity": 10
+  }
+ },
+ "replays": {
+  "calls": 0,
+  "byReason": {}
+ },
+ "stateDiff": {
+  "checkpoints": 121,
+  "divergentSlotsMax": 104,
+  "byCategory": {
+   "PoolManager:other.feeGrowthGlobal1": 50,
+   "PoolManager:test.feeGrowthGlobal0": 77,
+   "PoolManager:test.feeGrowthGlobal1": 73,
+   "PoolManager:other.tick.feeOutside0": 1575,
+   "PoolManager:other.tick.feeOutside1": 1575,
+   "PoolManager:other.feeGrowthGlobal0": 46,
+   "PoolManager:test.tick.feeOutside0": 2723,
+   "PoolManager:test.tick.feeOutside1": 2719
+  },
+  "unsound": 0,
+  "unsoundExamples": []
+ },
+ "checks": {
+  "total": 954,
+  "nodeVsEngineTruth": {
+   "outputMatch": 954,
+   "successMatch": 954,
+   "gasEqual": 954,
+   "gasDiffs": {}
+  },
+  "profitPositive": 581,
+  "profitZero": 307,
+  "profitPositiveMatch": 581,
+  "otherRevert": 66,
+  "revertKinds": {
+   "0x7c9c6e8f": 27,
+   "empty revert": 12,
+   "0x1f2a2005": 27
+  },
+  "lenient": {
+   "outputMatch": 954,
+   "successMatch": 954,
+   "mismatch": 0,
+   "gasEqual": 704,
+   "gasDiffHist": {
+    "0": 704,
+    "534": 4,
+    "535": 4,
+    "2939": 3,
+    "3206": 1,
+    "17100": 14,
+    "34200": 103,
+    "51300": 7,
+    "68400": 38,
+    "85500": 1,
+    "102600": 48,
+    "136800": 3,
+    "153900": 4,
+    "188100": 8,
+    "205200": 8,
+    "-2800": 4
+   },
+   "firstMismatches": []
+  },
+  "copyNode": {
+   "outputMatch": 954
+  },
+  "strict": {
+   "known": 27,
+   "knownMatch": 27,
+   "knownMismatch": 0,
+   "needsNode": 927,
+   "missingByCategory": {
+    "PoolManager:test.feeGrowthGlobal0": 608,
+    "PoolManager:test.feeGrowthGlobal1": 621,
+    "PoolManager:test.tick.feeOutside0": 302,
+    "PoolManager:test.tick.feeOutside1": 302
+   },
+   "unknownOther": 0
+  },
+  "readDiffByCategory": {
+   "PoolManager:test.feeGrowthGlobal0": 398,
+   "PoolManager:test.feeGrowthGlobal1": 381,
+   "PoolManager:test.tick.feeOutside0": 618,
+   "PoolManager:test.tick.feeOutside1": 612,
+   "ref100:other": 146
+  },
+  "checksWithReadDiff": 654
+ },
+ "negativeControl": {
+  "checks": 18,
+  "differencesDetected": 12
+ },
+ "seconds": 49
+}

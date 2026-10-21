@@ -1,0 +1,110 @@
+{
+ "type": "v3",
+ "variant": "replay",
+ "seed": 7,
+ "opsRequested": 330,
+ "ops": {
+  "sent": 330,
+  "succeeded": 313,
+  "reverted": 17,
+  "byKind": {
+   "swap": 166,
+   "burn": 19,
+   "mint": 27,
+   "collect": 16,
+   "swapExactOut": 32,
+   "donate": 27,
+   "flash": 7,
+   "growHistory": 12,
+   "swapLimit": 24,
+   "mint:reverted": 2,
+   "swap:reverted": 10,
+   "swapExactOut:reverted": 2,
+   "swapLimit:reverted": 2,
+   "flash:reverted": 1
+  }
+ },
+ "blocks": 133,
+ "events": {
+  "total": 831,
+  "byName": {
+   "Pool.Swap": 208,
+   "Token.Transfer": 534,
+   "Pool.Burn": 19,
+   "Pool.Collect": 28,
+   "Pool.Mint": 25,
+   "Pool.Flash": 6,
+   "Pool.IncreaseObservationCardinalityNext": 11
+  }
+ },
+ "reReads": {
+  "events": 0,
+  "slots": 0,
+  "byReason": {}
+ },
+ "replays": {
+  "calls": 297,
+  "byReason": {
+   "Swap:exactIn": 171,
+   "Burn": 19,
+   "Collect": 28,
+   "Mint": 25,
+   "Swap:exactOut": 29,
+   "Flash": 6,
+   "IncreaseObservationCardinalityNext": 11,
+   "Swap:toPrice": 6,
+   "Swap:exactIn+limit": 2
+  }
+ },
+ "stateDiff": {
+  "checkpoints": 133,
+  "divergentSlotsMax": 0,
+  "byCategory": {},
+  "unsound": 0,
+  "unsoundExamples": []
+ },
+ "checks": {
+  "total": 990,
+  "nodeVsEngineTruth": {
+   "outputMatch": 990,
+   "successMatch": 990,
+   "gasEqual": 990,
+   "gasDiffs": {}
+  },
+  "profitPositive": 636,
+  "profitZero": 327,
+  "profitPositiveMatch": 636,
+  "otherRevert": 27,
+  "revertKinds": {
+   "Error(SPL)": 27
+  },
+  "lenient": {
+   "outputMatch": 990,
+   "successMatch": 990,
+   "mismatch": 0,
+   "gasEqual": 990,
+   "gasDiffHist": {
+    "0": 990
+   },
+   "firstMismatches": []
+  },
+  "copyNode": {
+   "outputMatch": 990
+  },
+  "strict": {
+   "known": 990,
+   "knownMatch": 990,
+   "knownMismatch": 0,
+   "needsNode": 0,
+   "missingByCategory": {},
+   "unknownOther": 0
+  },
+  "readDiffByCategory": {},
+  "checksWithReadDiff": 0
+ },
+ "negativeControl": {
+  "checks": 18,
+  "differencesDetected": 12
+ },
+ "seconds": 50
+}

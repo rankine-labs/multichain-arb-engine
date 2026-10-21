@@ -1,0 +1,110 @@
+{
+ "type": "pancake",
+ "variant": "replay",
+ "seed": 1,
+ "opsRequested": 330,
+ "ops": {
+  "sent": 330,
+  "succeeded": 312,
+  "reverted": 18,
+  "byKind": {
+   "swap": 165,
+   "mint": 34,
+   "growHistory": 5,
+   "swapLimit": 19,
+   "donate": 23,
+   "collect": 16,
+   "flash": 14,
+   "burn": 19,
+   "swapExactOut": 35,
+   "swap:reverted": 10,
+   "flash:reverted": 3,
+   "mint:reverted": 3,
+   "swapLimit:reverted": 2
+  }
+ },
+ "blocks": 135,
+ "events": {
+  "total": 843,
+  "byName": {
+   "Pool.Swap": 207,
+   "Token.Transfer": 545,
+   "Pool.Mint": 31,
+   "Pool.IncreaseObservationCardinalityNext": 5,
+   "Pool.Collect": 25,
+   "Pool.Flash": 11,
+   "Pool.Burn": 19
+  }
+ },
+ "reReads": {
+  "events": 0,
+  "slots": 0,
+  "byReason": {}
+ },
+ "replays": {
+  "calls": 298,
+  "byReason": {
+   "Swap:exactIn": 167,
+   "Mint": 31,
+   "IncreaseObservationCardinalityNext": 5,
+   "Collect": 25,
+   "Flash": 11,
+   "Burn": 19,
+   "Swap:exactOut": 29,
+   "Swap:exactIn+limit": 4,
+   "Swap:toPrice": 7
+  }
+ },
+ "stateDiff": {
+  "checkpoints": 135,
+  "divergentSlotsMax": 0,
+  "byCategory": {},
+  "unsound": 0,
+  "unsoundExamples": []
+ },
+ "checks": {
+  "total": 990,
+  "nodeVsEngineTruth": {
+   "outputMatch": 990,
+   "successMatch": 990,
+   "gasEqual": 990,
+   "gasDiffs": {}
+  },
+  "profitPositive": 553,
+  "profitZero": 344,
+  "profitPositiveMatch": 553,
+  "otherRevert": 93,
+  "revertKinds": {
+   "Error(SPL)": 72,
+   "empty revert": 21
+  },
+  "lenient": {
+   "outputMatch": 990,
+   "successMatch": 990,
+   "mismatch": 0,
+   "gasEqual": 990,
+   "gasDiffHist": {
+    "0": 990
+   },
+   "firstMismatches": []
+  },
+  "copyNode": {
+   "outputMatch": 990
+  },
+  "strict": {
+   "known": 990,
+   "knownMatch": 990,
+   "knownMismatch": 0,
+   "needsNode": 0,
+   "missingByCategory": {},
+   "unknownOther": 0
+  },
+  "readDiffByCategory": {},
+  "checksWithReadDiff": 0
+ },
+ "negativeControl": {
+  "checks": 18,
+  "differencesDetected": 9
+ },
+ "seconds": 52
+}

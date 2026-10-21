@@ -1,0 +1,152 @@
+{
+ "type": "v3",
+ "variant": "fields",
+ "seed": 7,
+ "opsRequested": 330,
+ "ops": {
+  "sent": 330,
+  "succeeded": 313,
+  "reverted": 17,
+  "byKind": {
+   "swap": 166,
+   "burn": 19,
+   "mint": 27,
+   "collect": 16,
+   "swapExactOut": 32,
+   "donate": 27,
+   "flash": 7,
+   "growHistory": 12,
+   "swapLimit": 24,
+   "mint:reverted": 2,
+   "swap:reverted": 10,
+   "swapExactOut:reverted": 2,
+   "swapLimit:reverted": 2,
+   "flash:reverted": 1
+  }
+ },
+ "blocks": 133,
+ "events": {
+  "total": 831,
+  "byName": {
+   "Pool.Swap": 208,
+   "Token.Transfer": 534,
+   "Pool.Burn": 19,
+   "Pool.Collect": 28,
+   "Pool.Mint": 25,
+   "Pool.Flash": 6,
+   "Pool.IncreaseObservationCardinalityNext": 11
+  }
+ },
+ "reReads": {
+  "events": 72,
+  "slots": 1136,
+  "byReason": {
+   "Burn+Collect": 5,
+   "block:history": 16,
+   "Mint+Collect": 1,
+   "Collect": 12,
+   "Mint+Flash": 1,
+   "Burn": 4,
+   "IncreaseObservationCardinalityNext+IncreaseObservationCardinalityNext+Mint": 1,
+   "Mint": 11,
+   "Burn+Burn+Collect": 1,
+   "IncreaseObservationCardinalityNext": 5,
+   "Mint+Mint": 3,
+   "Mint+IncreaseObservationCardinalityNext": 1,
+   "Collect+Burn+Collect+Mint": 1,
+   "Flash+Burn+Collect": 1,
+   "Burn+IncreaseObservationCardinalityNext": 1,
+   "Mint+Burn+Collect": 1,
+   "Burn+Collect+Burn+Collect": 1,
+   "Flash": 3,
+   "IncreaseObservationCardinalityNext+Flash": 1,
+   "Mint+Burn+Collect+Collect": 1,
+   "Mint+Burn+Collect+IncreaseObservationCardinalityNext": 1
+  }
+ },
+ "replays": {
+  "calls": 0,
+  "byReason": {}
+ },
+ "stateDiff": {
+  "checkpoints": 133,
+  "divergentSlotsMax": 100,
+  "byCategory": {
+   "univ3:feeGrowthGlobal1": 63,
+   "univ3:protocolFees": 76,
+   "univ3:feeGrowthGlobal0": 60,
+   "univ3:tick.feeOutside0": 3054,
+   "univ3:tick.feeOutside1": 3054,
+   "univ3:tick.cumulatives|initialized": 3146
+  },
+  "unsound": 0,
+  "unsoundExamples": []
+ },
+ "checks": {
+  "total": 990,
+  "nodeVsEngineTruth": {
+   "outputMatch": 990,
+   "successMatch": 990,
+   "gasEqual": 990,
+   "gasDiffs": {}
+  },
+  "profitPositive": 636,
+  "profitZero": 327,
+  "profitPositiveMatch": 636,
+  "otherRevert": 27,
+  "revertKinds": {
+   "Error(SPL)": 27
+  },
+  "lenient": {
+   "outputMatch": 990,
+   "successMatch": 990,
+   "mismatch": 0,
+   "gasEqual": 827,
+   "gasDiffHist": {
+    "0": 827,
+    "17100": 4,
+    "34200": 85,
+    "51300": 1,
+    "68400": 37,
+    "85500": 4,
+    "102600": 10,
+    "136800": 5,
+    "171000": 13,
+    "205200": 4
+   },
+   "firstMismatches": []
+  },
+  "copyNode": {
+   "outputMatch": 990
+  },
+  "strict": {
+   "known": 27,
+   "knownMatch": 27,
+   "knownMismatch": 0,
+   "needsNode": 963,
+   "missingByCategory": {
+    "univ3:feeGrowthGlobal0": 648,
+    "univ3:protocolFees": 963,
+    "univ3:feeGrowthGlobal1": 630,
+    "univ3:tick.feeOutside0": 315,
+    "univ3:tick.feeOutside1": 315,
+    "univ3:tick.cumulatives|initialized": 315
+   },
+   "unknownOther": 0
+  },
+  "readDiffByCategory": {
+   "univ3:protocolFees": 504,
+   "univ3:feeGrowthGlobal1": 270,
+   "univ3:tick.feeOutside0": 470,
+   "univ3:tick.feeOutside1": 470,
+   "univ3:tick.cumulatives|initialized": 482,
+   "univ3:feeGrowthGlobal0": 254
+  },
+  "checksWithReadDiff": 618
+ },
+ "negativeControl": {
+  "checks": 18,
+  "differencesDetected": 12
+ },
+ "seconds": 55
+}

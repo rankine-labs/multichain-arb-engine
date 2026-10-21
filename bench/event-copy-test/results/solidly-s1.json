@@ -1,0 +1,92 @@
+{
+ "type": "solidly",
+ "variant": "default",
+ "seed": 1,
+ "opsRequested": 330,
+ "ops": {
+  "sent": 330,
+  "succeeded": 330,
+  "reverted": 0,
+  "byKind": {
+   "swap": 239,
+   "sync": 7,
+   "donate": 34,
+   "claimFees": 5,
+   "mint": 25,
+   "skim": 10,
+   "burn": 10
+  }
+ },
+ "blocks": 126,
+ "events": {
+  "total": 1718,
+  "byName": {
+   "Token.Transfer": 862,
+   "Pair.Fees": 252,
+   "Pair.Sync": 281,
+   "Pair.Swap": 239,
+   "Pair.Claim": 4,
+   "Pair.Transfer": 45,
+   "Pair.Mint": 25,
+   "Pair.Burn": 10
+  }
+ },
+ "reReads": {
+  "events": 0,
+  "slots": 0,
+  "byReason": {}
+ },
+ "replays": {
+  "calls": 0,
+  "byReason": {}
+ },
+ "stateDiff": {
+  "checkpoints": 126,
+  "divergentSlotsMax": 0,
+  "byCategory": {},
+  "unsound": 0,
+  "unsoundExamples": []
+ },
+ "checks": {
+  "total": 972,
+  "nodeVsEngineTruth": {
+   "outputMatch": 972,
+   "successMatch": 972,
+   "gasEqual": 972,
+   "gasDiffs": {}
+  },
+  "profitPositive": 527,
+  "profitZero": 445,
+  "profitPositiveMatch": 527,
+  "otherRevert": 0,
+  "revertKinds": {},
+  "lenient": {
+   "outputMatch": 972,
+   "successMatch": 972,
+   "mismatch": 0,
+   "gasEqual": 972,
+   "gasDiffHist": {
+    "0": 972
+   },
+   "firstMismatches": []
+  },
+  "copyNode": {
+   "outputMatch": 972
+  },
+  "strict": {
+   "known": 972,
+   "knownMatch": 972,
+   "knownMismatch": 0,
+   "needsNode": 0,
+   "missingByCategory": {},
+   "unknownOther": 0
+  },
+  "readDiffByCategory": {},
+  "checksWithReadDiff": 0
+ },
+ "negativeControl": {
+  "checks": 18,
+  "differencesDetected": 9
+ },
+ "seconds": 42
+}

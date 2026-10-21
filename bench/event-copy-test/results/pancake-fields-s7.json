@@ -1,0 +1,146 @@
+{
+ "type": "pancake",
+ "variant": "fields",
+ "seed": 7,
+ "opsRequested": 330,
+ "ops": {
+  "sent": 330,
+  "succeeded": 309,
+  "reverted": 21,
+  "byKind": {
+   "swap": 166,
+   "burn": 19,
+   "mint": 27,
+   "collect": 16,
+   "swapExactOut": 32,
+   "donate": 27,
+   "flash": 7,
+   "flash:reverted": 2,
+   "growHistory": 12,
+   "swapLimit": 24,
+   "mint:reverted": 2,
+   "swap:reverted": 12,
+   "swapExactOut:reverted": 2,
+   "swapLimit:reverted": 3
+  }
+ },
+ "blocks": 133,
+ "events": {
+  "total": 816,
+  "byName": {
+   "Pool.Swap": 205,
+   "Token.Transfer": 523,
+   "Pool.Burn": 19,
+   "Pool.Collect": 28,
+   "Pool.Mint": 25,
+   "Pool.IncreaseObservationCardinalityNext": 11,
+   "Pool.Flash": 5
+  }
+ },
+ "reReads": {
+  "events": 70,
+  "slots": 1109,
+  "byReason": {
+   "Burn+Collect": 5,
+   "block:history": 14,
+   "Mint+Collect": 1,
+   "Collect": 12,
+   "Mint": 12,
+   "Burn": 4,
+   "IncreaseObservationCardinalityNext+IncreaseObservationCardinalityNext+Mint": 1,
+   "Burn+Burn+Collect": 1,
+   "IncreaseObservationCardinalityNext": 5,
+   "Mint+Mint": 3,
+   "Mint+IncreaseObservationCardinalityNext": 1,
+   "Collect+Burn+Collect+Mint": 1,
+   "Flash+Burn+Collect": 1,
+   "Burn+IncreaseObservationCardinalityNext": 1,
+   "Mint+Burn+Collect": 1,
+   "Burn+Collect+Burn+Collect": 1,
+   "Flash": 3,
+   "IncreaseObservationCardinalityNext+Flash": 1,
+   "Mint+Burn+Collect+Collect": 1,
+   "Mint+Burn+Collect+IncreaseObservationCardinalityNext": 1
+  }
+ },
+ "replays": {
+  "calls": 0,
+  "byReason": {}
+ },
+ "stateDiff": {
+  "checkpoints": 133,
+  "divergentSlotsMax": 112,
+  "byCategory": {
+   "pancake:feeGrowthGlobal1": 62,
+   "pancake:feeGrowthGlobal0": 58,
+   "pancake:tick.feeOutside0": 3447,
+   "pancake:tick.feeOutside1": 3447,
+   "pancake:tick.cumulatives|initialized": 3628
+  },
+  "unsound": 0,
+  "unsoundExamples": []
+ },
+ "checks": {
+  "total": 990,
+  "nodeVsEngineTruth": {
+   "outputMatch": 990,
+   "successMatch": 990,
+   "gasEqual": 990,
+   "gasDiffs": {}
+  },
+  "profitPositive": 610,
+  "profitZero": 335,
+  "profitPositiveMatch": 610,
+  "otherRevert": 45,
+  "revertKinds": {
+   "Error(SPL)": 45
+  },
+  "lenient": {
+   "outputMatch": 990,
+   "successMatch": 990,
+   "mismatch": 0,
+   "gasEqual": 818,
+   "gasDiffHist": {
+    "0": 818,
+    "34200": 114,
+    "68400": 36,
+    "102600": 9,
+    "136800": 8,
+    "171000": 3,
+    "205200": 1,
+    "239400": 1
+   },
+   "firstMismatches": []
+  },
+  "copyNode": {
+   "outputMatch": 990
+  },
+  "strict": {
+   "known": 45,
+   "knownMatch": 45,
+   "knownMismatch": 0,
+   "needsNode": 945,
+   "missingByCategory": {
+    "pancake:feeGrowthGlobal0": 653,
+    "pancake:feeGrowthGlobal1": 624,
+    "pancake:tick.feeOutside0": 332,
+    "pancake:tick.feeOutside1": 332,
+    "pancake:tick.cumulatives|initialized": 332
+   },
+   "unknownOther": 0
+  },
+  "readDiffByCategory": {
+   "pancake:feeGrowthGlobal1": 264,
+   "pancake:tick.feeOutside0": 556,
+   "pancake:tick.feeOutside1": 556,
+   "pancake:tick.cumulatives|initialized": 607,
+   "pancake:feeGrowthGlobal0": 245
+  },
+  "checksWithReadDiff": 571
+ },
+ "negativeControl": {
+  "checks": 18,
+  "differencesDetected": 12
+ },
+ "seconds": 53
+}

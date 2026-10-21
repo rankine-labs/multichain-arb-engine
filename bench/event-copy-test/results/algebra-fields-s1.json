@@ -1,0 +1,438 @@
+{
+ "type": "algebra",
+ "variant": "fields",
+ "seed": 1,
+ "opsRequested": 330,
+ "ops": {
+  "sent": 330,
+  "succeeded": 321,
+  "reverted": 9,
+  "byKind": {
+   "swap": 184,
+   "mint": 36,
+   "flash": 14,
+   "swapExactOut": 35,
+   "donate": 26,
+   "collect": 12,
+   "burn": 23,
+   "swapExactOut:reverted": 1,
+   "swap:reverted": 5,
+   "flash:reverted": 1,
+   "mint:reverted": 2
+  }
+ },
+ "blocks": 132,
+ "events": {
+  "total": 1163,
+  "byName": {
+   "Pool.SwapFee": 213,
+   "Pool.Swap": 213,
+   "Pool.PluginConfig": 1,
+   "Token.Transfer": 594,
+   "Pool.Mint": 34,
+   "Pool.Flash": 13,
+   "Pool.ExcessTokens": 34,
+   "Pool.BurnFee": 23,
+   "Pool.Burn": 23,
+   "Pool.Collect": 15
+  }
+ },
+ "reReads": {
+  "events": 62,
+  "slots": 4305,
+  "byReason": {
+   "Mint": 24,
+   "Flash": 9,
+   "Burn+Mint": 1,
+   "Burn+Collect": 7,
+   "Mint+Mint": 1,
+   "Mint+Burn": 4,
+   "Flash+Flash": 1,
+   "Burn": 7,
+   "Collect": 3,
+   "Burn+Collect+Mint": 1,
+   "Collect+Flash": 1,
+   "Mint+Burn+Collect": 2,
+   "Flash+Burn+Collect": 1
+  }
+ },
+ "replays": {
+  "calls": 0,
+  "byReason": {}
+ },
+ "stateDiff": {
+  "checkpoints": 132,
+  "divergentSlotsMax": 176,
+  "byCategory": {
+   "algebra:totalFeeGrowth0": 56,
+   "algebra:communityFeePending|lastFeeTransferTs": 68,
+   "plugin:slot4": 132,
+   "plugin:timepoints": 5813,
+   "plugin:slot5": 131,
+   "algebra:tick.outerFeeGrowth0": 3277,
+   "algebra:tick.outerFeeGrowth1": 3277,
+   "plugin:slot6": 129,
+   "algebra:totalFeeGrowth1": 61,
+   "plugin:slot7": 128
+  },
+  "unsound": 0,
+  "unsoundExamples": []
+ },
+ "checks": {
+  "total": 954,
+  "nodeVsEngineTruth": {
+   "outputMatch": 954,
+   "successMatch": 954,
+   "gasEqual": 954,
+   "gasDiffs": {}
+  },
+  "profitPositive": 576,
+  "profitZero": 333,
+  "profitPositiveMatch": 199,
+  "otherRevert": 45,
+  "revertKinds": {
+   "0x16626723": 45
+  },
+  "lenient": {
+   "outputMatch": 565,
+   "successMatch": 954,
+   "mismatch": 389,
+   "gasEqual": 0,
+   "gasDiffHist": {
+    "26770": 1,
+    "26799": 3,
+    "27388": 1,
+    "27487": 1,
+    "27501": 1,
+    "27524": 1,
+    "27629": 1,
+    "27632": 1,
+    "27633": 20,
+    "27638": 4,
+    "27644": 9,
+    "28040": 1,
+    "28095": 1,
+    "28185": 1,
+    "28189": 1,
+    "28199": 12,
+    "28243": 1,
+    "28292": 1,
+    "28319": 1,
+    "28334": 1,
+    "28335": 1,
+    "28346": 3,
+    "28347": 12,
+    "28348": 3,
+    "28349": 1,
+    "28353": 2,
+    "28354": 108,
+    "28355": 1,
+    "28358": 1,
+    "28361": 239,
+    "28362": 2,
+    "28363": 1,
+    "28364": 1,
+    "28368": 1,
+    "28375": 1,
+    "28393": 1,
+    "28470": 4,
+    "28486": 1,
+    "28548": 1,
+    "28576": 1,
+    "28646": 1,
+    "28926": 1,
+    "28936": 2,
+    "28937": 12,
+    "28945": 2,
+    "28960": 12,
+    "28997": 15,
+    "29019": 12,
+    "29027": 3,
+    "29028": 12,
+    "29031": 30,
+    "29052": 1,
+    "29072": 1,
+    "29078": 33,
+    "29092": 32,
+    "29093": 2,
+    "29094": 14,
+    "29101": 2,
+    "29102": 1,
+    "29106": 27,
+    "29107": 1,
+    "29175": 1,
+    "29208": 3,
+    "29212": 1,
+    "29222": 2,
+    "29348": 1,
+    "29376": 1,
+    "29899": 3,
+    "30064": 1,
+    "30119": 1,
+    "32046": 1,
+    "32090": 1,
+    "32126": 2,
+    "32838": 1,
+    "32867": 1,
+    "32927": 1,
+    "32930": 1,
+    "32931": 1,
+    "32933": 1,
+    "33765": 1,
+    "61565": 1,
+    "61700": 1,
+    "61714": 1,
+    "61844": 3,
+    "62367": 1,
+    "62413": 1,
+    "62417": 1,
+    "62438": 1,
+    "62526": 1,
+    "62528": 1,
+    "62536": 1,
+    "62543": 1,
+    "62550": 1,
+    "62561": 51,
+    "62567": 1,
+    "62569": 1,
+    "62573": 2,
+    "62680": 1,
+    "63104": 1,
+    "63137": 1,
+    "63144": 1,
+    "63146": 1,
+    "63180": 1,
+    "63189": 3,
+    "63213": 1,
+    "63219": 4,
+    "63223": 1,
+    "63228": 2,
+    "63231": 2,
+    "63243": 1,
+    "63250": 1,
+    "63259": 1,
+    "63262": 1,
+    "63264": 1,
+    "63277": 1,
+    "63286": 1,
+    "63291": 2,
+    "63292": 2,
+    "63295": 2,
+    "63298": 2,
+    "63300": 1,
+    "63306": 9,
+    "63311": 1,
+    "63322": 2,
+    "63383": 1,
+    "64126": 1,
+    "64184": 1,
+    "64309": 1,
+    "67038": 1,
+    "67044": 1,
+    "67084": 1,
+    "67133": 3,
+    "67134": 1,
+    "78983": 1,
+    "94920": 1,
+    "95215": 2,
+    "95746": 1,
+    "95898": 1,
+    "95900": 1,
+    "95915": 1,
+    "95927": 1,
+    "95933": 1,
+    "95944": 1,
+    "95983": 1,
+    "96039": 3,
+    "96179": 1,
+    "96655": 3,
+    "96697": 1,
+    "96713": 1,
+    "96730": 1,
+    "96735": 2,
+    "96742": 1,
+    "96761": 29,
+    "96767": 2,
+    "96774": 1,
+    "97431": 4,
+    "97494": 1,
+    "97525": 1,
+    "97551": 1,
+    "97555": 1,
+    "97591": 1,
+    "97607": 1,
+    "130920": 1,
+    "130934": 1,
+    "130961": 9,
+    "131619": 1,
+    "165229": 1,
+    "165259": 1,
+    "165261": 1,
+    "199361": 1,
+    "233561": 8,
+    "266197": 1,
+    "266225": 1,
+    "267217": 1,
+    "267761": 6,
+    "301961": 1,
+    "-1283": 7,
+    "-1284": 3,
+    "-1275": 1,
+    "-1282": 1,
+    "-1347": 12,
+    "-1267": 12
+   },
+   "firstMismatches": [
+    {
+     "check": "algebra-1-ref500>test-100",
+     "truth": {
+      "success": false,
+      "output": "0x4e88422a000000000000000000000000000000000000000000000000000000000064c1e8ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+     },
+     "copy": {
+      "success": false,
+      "output": "0x4e88422a000000000000000000000000000000000000000000000000000000000064a2ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+     },
+     "decoded": {
+      "truthProfit": "6603240",
+      "copyProfit": "6595327"
+     }
+    },
+    {
+     "check": "algebra-1-ref500>test-5000",
+     "truth": {
+      "success": false,
+      "output": "0x4e88422a0000000000000000000000000000000000000000000000000000000013918ff0ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+     },
+     "copy": {
+      "success": false,
+      "output": "0x4e88422a00000000000000000000000000000000000000000000000000000000138b878dffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+     },
+     "decoded": {
+      "truthProfit": "328306672",
+      "copyProfit": "327911309"
+     }
+    },
+    {
+     "check": "algebra-1-ref500>test-250000",
+     "truth": {
+      "success": false,
+      "output": "0x4e88422a00000000000000000000000000000000000000000000000000000002c4cc7b86ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+     },
+     "copy": {
+      "success": false,
+      "output": "0x4e88422a00000000000000000000000000000000000000000000000000000002c3a8278cffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+     },
+     "decoded": {
+      "truthProfit": "11891669894",
+      "copyProfit": "11872511884"
+     }
+    },
+    {
+     "check": "algebra-1-ref3000>test-100",
+     "truth": {
+      "success": false,
+      "output": "0x4e88422a0000000000000000000000000000000000000000000000000000000000a2ea68ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+     },
+     "copy": {
+      "success": false,
+      "output": "0x4e88422a0000000000000000000000000000000000000000000000000000000000a2ca51ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+     },
+     "decoded": {
+      "truthProfit": "10676840",
+      "copyProfit": "10668625"
+     }
+    },
+    {
+     "check": "algebra-1-ref3000>test-5000",
+     "truth": {
+      "success": false,
+      "output": "0x4e88422a000000000000000000000000000000000000000000000000000000001fb35c92ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+     },
+     "copy": {
+      "success": false,
+      "output": "0x4e88422a000000000000000000000000000000000000000000000000000000001fad1936ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+     },
+     "decoded": {
+      "truthProfit": "531848338",
+      "copyProfit": "531437878"
+     }
+    },
+    {
+     "check": "algebra-1-ref3000>test-250000",
+     "truth": {
+      "success": false,
+      "output": "0x4e88422a000000000000000000000000000000000000000000000000000000050f9b2883ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+     },
+     "copy": {
+      "success": false,
+      "output": "0x4e88422a000000000000000000000000000000000000000000000000000000050e6c0187ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+     },
+     "decoded": {
+      "truthProfit": "21736663171",
+      "copyProfit": "21716795783"
+     }
+    },
+    {
+     "check": "algebra-1-test>ref100-100",
+     "truth": {
+      "success": false,
+      "output": "0x4e88422a0000000000000000000000000000000000000000000000000000000004ee2fd9ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+     },
+     "copy": {
+      "success": false,
+      "output": "0x4e88422a0000000000000000000000000000000000000000000000000000000004edfadfffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+     },
+     "decoded": {
+      "truthProfit": "82718681",
+      "copyProfit": "82705119"
+     }
+    },
+    {
+     "check": "algebra-1-test>ref100-5000",
+     "truth": {
+      "success": false,
+      "output": "0x4e88422a00000000000000000000000000000000000000000000000000000000f6552f05ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+     },
+     "copy": {
+      "success": false,
+      "output": "0x4e88422a00000000000000000000000000000000000000000000000000000000f64ad811ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+     },
+     "decoded": {
+      "truthProfit": "4132777733",
+      "copyProfit": "4132100113"
+     }
+    }
+   ]
+  },
+  "copyNode": {
+   "outputMatch": 565
+  },
+  "strict": {
+   "known": 0,
+   "knownMatch": 0,
+   "knownMismatch": 0,
+   "needsNode": 954,
+   "missingByCategory": {
+    "plugin:timepoints": 954
+   },
+   "unknownOther": 0
+  },
+  "readDiffByCategory": {
+   "plugin:slot5": 18,
+   "plugin:slot6": 18,
+   "plugin:timepoints": 2880,
+   "algebra:tick.outerFeeGrowth0": 539,
+   "algebra:tick.outerFeeGrowth1": 539,
+   "algebra:totalFeeGrowth0": 184,
+   "algebra:communityFeePending|lastFeeTransferTs": 342,
+   "algebra:totalFeeGrowth1": 261
+  },
+  "checksWithReadDiff": 954
+ },
+ "negativeControl": {
+  "checks": 18,
+  "differencesDetected": 12
+ },
+ "seconds": 67
+}
