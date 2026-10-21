@@ -507,6 +507,9 @@ struct Stats {
     slot_neg_control: bool,
     /// Algebra: side events applied on their own at the block's end.
     lone_flushes: usize,
+    /// Time spent inside apply_replay on warm calls (no items missing), and how many.
+    warm_us: u128,
+    warm_n: usize,
     by_event: std::collections::BTreeMap<String, usize>,
 }
 
@@ -558,8 +561,14 @@ fn parse_addr(v: &Value) -> Address {
 /// Apply one event to the copy, fetching what it asks for; Err = unsure.
 fn apply_one(ov: &mut Overlay, start: &RemoteView, pool: &TrackedPool, pl: &PoolLog, ctx: &BlockCtx, st: &mut Stats) -> Result<(), String> {
     for _ in 0..200 {
-        match apply_replay(ov, pool, pl, ctx) {
-            ApplyResult::Applied => return Ok(()),
+        let t0 = std::time::Instant::now();
+        let r = apply_replay(ov, pool, pl, ctx);
+        match r {
+            ApplyResult::Applied => {
+                st.warm_us += t0.elapsed().as_micros();
+                st.warm_n += 1;
+                return Ok(());
+            }
             ApplyResult::NeedItems(items) => {
                 st.fill_rounds += 1;
                 st.items_filled += fill(ov, start, &items);
@@ -797,7 +806,7 @@ fn run_kind(kind: K) {
         st.slot_neg_control = copy_v != truth_v;
     }
 
-    eprintln!("copy2 replay {kind:?}: events by type {:?}; lone side events applied at block end: {}", st.by_event, st.lone_flushes);
+    eprintln!("copy2 replay {kind:?}: events by type {:?}; lone side events applied at block end: {}; time per applied replay: {} us (this build)", st.by_event, st.lone_flushes, st.warm_us / st.warm_n.max(1) as u128);
     eprintln!(
         "copy2 replay {kind:?}: {} actions ({} succeeded) in {} blocks, {} pool events replayed, {} fill rounds ({} items read at start), \
          {} unsure, {} slot comparisons / {} different, {} checks ({} with a profit number) / {} different, negative control: {} of {} checks changed",
