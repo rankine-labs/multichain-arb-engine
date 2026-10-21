@@ -69,7 +69,12 @@ pub fn build_with(cfg: Config, node: Option<Arc<dyn NodeApi>>, source: Source) -
             // The feed updater is NOT started (one writer only); its handle
             // exists but nothing reads it.
             let (_unused, updater) = updater::manual(shared.clone(), fills.clone());
-            let c2 = crate::copy2::intake::spawn(shared.clone(), fills.clone(), crate::copy2::intake::C2Config::from_env());
+            let c2cfg = crate::copy2::intake::C2Config::from_env();
+            eprintln!(
+                "[arbsim] copy2: {} node workers in flight (ARBSIM_COPY2_INFLIGHT), {} pools per load job (ARBSIM_COPY2_LOAD_BATCH)",
+                c2cfg.loaders, c2cfg.load_batch
+            );
+            let c2 = crate::copy2::intake::spawn(shared.clone(), fills.clone(), c2cfg);
             Arc::new(Ctx { shared, updater, fills, pinned: PinnedCache::new(pin_cache), copy2: Some(c2) })
         }
     }

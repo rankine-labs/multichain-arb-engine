@@ -172,7 +172,9 @@ async function main() {
     const ld = c2.loader;
     if (ld) {
       const q = ld.queued || {};
-      const kinds = Object.entries(ld.byKind || {}).map(([k, v]) => `${k} ${v.avgMsLastMin ?? v.avgMs ?? '?'} ms`).join(', ');
+      // Per job kind: total ms (waiting in queue / node / local), last minute.
+      const kinds = Object.entries(ld.byKind || {}).map(([k, v]) =>
+        `${k} ${v.avgMsLastMin ?? v.avgMs ?? '?'} ms (queue ${v.avgQueueMsLastMin ?? '?'}, node ${v.avgNodeMsLastMin ?? '?'}, local ${v.avgLocalMsLastMin ?? '?'}; ${v.requestsLastMin ?? '?'} req)`).join(', ');
       lines.push(`    node: ${ld.requestsPerSecLastMin} HTTP requests/s (last min), ${n(ld.inFlight ?? ld.busy)} of ${n(ld.threads)} in flight; ` +
         `queued: ${n(q.urgent)} urgent, ${n(q.bulk)} loads; answer times: ${kinds || '-'}`);
       if (Array.isArray(ld.firstErrors) && ld.firstErrors.length) {

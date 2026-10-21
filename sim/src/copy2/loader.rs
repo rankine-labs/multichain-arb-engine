@@ -16,11 +16,19 @@
 //   into the copy here.
 //
 //   SIMPLE BY DESIGN (after dry runs #6-#10):
-//     - A fixed number of worker threads [ARBSIM_COPY2_INFLIGHT, 8] = at
+//     - A fixed number of worker threads [ARBSIM_COPY2_INFLIGHT, 16] = at
 //       most that many node requests in flight. Nothing else limits copy 2.
+//       A worker never sleeps inside a job: a job that has to wait (node not
+//       at the block yet, backoff) is handed back to the intake, which
+//       queues it again later.
 //     - ONE queue, two priorities: urgent (values a pool's catch-up needs,
-//       the one fill job at a time, the node tip) before bulk (first loads,
-//       coin probes and traces). Loads are queued most-recently-active first.
+//       the one fill job at a time, coin probes and traces (loads wait for
+//       them), the node tip) before bulk (first loads, most-recently-active
+//       first, small jobs of ARBSIM_COPY2_LOAD_BATCH (5) pools).
+//     - JSON batches of at most 50 calls (Chainstack's limit; ARBSIM_NODE_BATCH
+//       25 by default); an item refused for a limit (-32005) is asked once more.
+//     - Status per job kind: time waiting in the queue, time the node took,
+//       time spent locally (where does the time go?).
 //     - The node client's speed limit (node.rs) is one plain token bucket at
 //       ARBSIM_NODE_RPS counting HTTP REQUESTS (a batch or a proof = 1); it
 //       makes a request wait for its token, it never refuses.
@@ -111,8 +119,9 @@ pub enum Done {
 pub struct LoaderStats {
     pub busy: AtomicU64,
     pub threads: AtomicU64,
-    /// Recent jobs: (finished, kind, node requests, milliseconds), last minute.
-    recent: Mutex<VecDeque<(Instant, &'static str, u64, u64)>>,
+    /// Recent jobs, last minute: (finished, kind, node requests, total ms,
+    /// queue-wait ms, node ms).
+    recent: Mutex<VecDeque<(Instant, &'static str, u64, u64, u64, u64)>>,
     /// Since start: kind -> (jobs, total ms).
     total: Mutex<Vec<(&'static str, u64, u64)>>,
     /// Queue lengths (urgent, bulk, trace).
@@ -173,11 +182,11 @@ impl LoaderStats {
         *self.queued.lock().unwrap()
     }
 
-    fn note(&self, kind: &'static str, requests: u64, ms: u64) {
+    fn note(&self, kind: &'static str, requests: u64, ms: u64, queue_ms: u64, node_ms: u64) {
         let now = Instant::now();
         *self.last_done.lock().unwrap() = Some(now);
         let mut r = self.recent.lock().unwrap();
-        r.push_back((now, kind, requests, ms));
+        r.push_back((now, kind, requests, ms, queue_ms, node_ms));
         while r.front().is_some_and(|x| now.duration_since(x.0) > Duration::from_secs(60)) || r.len() > 20_000 {
             r.pop_front();
         }
@@ -211,6 +220,10 @@ impl LoaderStats {
                 json!({
                     "jobsLastMin": v.len(),
                     "avgMsLastMin": avg(v.len() as u64, v.iter().map(|x| x.3).sum()),
+                    "avgQueueMsLastMin": avg(v.len() as u64, v.iter().map(|x| x.4).sum()),
+                    "avgNodeMsLastMin": avg(v.len() as u64, v.iter().map(|x| x.5).sum()),
+                    "avgLocalMsLastMin": avg(v.len() as u64, v.iter().map(|x| x.3.saturating_sub(x.5)).sum()),
+                    "requestsLastMin": v.iter().map(|x| x.2).sum::<u64>(),
                     "jobs": all.map(|a| a.0).unwrap_or(0),
                     "avgMs": all.map(|a| avg(a.0, a.1)).unwrap_or(Value::Null),
                 }),
@@ -238,8 +251,9 @@ impl LoaderStats {
 // One queue, N workers
 // ---------------------------------------------------------------------------
 struct Lanes {
-    urgent: VecDeque<Job>,
-    bulk: VecDeque<Job>,
+    /// (queued at, job)
+    urgent: VecDeque<(Instant, Job)>,
+    bulk: VecDeque<(Instant, Job)>,
     closed: bool,
 }
 
@@ -253,8 +267,8 @@ impl Queue {
     fn publish_len(&self, l: &Lanes) {
         *self.stats.queued.lock().unwrap() = (l.urgent.len(), l.bulk.len(), 0);
     }
-    /// Next job, urgent first. None = stop.
-    fn take(&self) -> Option<Job> {
+    /// Next job, urgent first (with when it was queued). None = stop.
+    fn take(&self) -> Option<(Instant, Job)> {
         let mut g = self.m.lock().unwrap();
         loop {
             if g.closed {
@@ -306,14 +320,15 @@ impl Loaders {
         Loaders { q }
     }
 
-    /// Queue a job: first loads, probes and traces are bulk; the rest urgent.
+    /// Queue a job: first loads are bulk; everything else urgent (probes and
+    /// traces too: loads wait for them).
     pub fn send(&self, j: Job) {
-        let bulk = matches!(j, Job::Fetch { bulk: true, .. } | Job::Trace { .. } | Job::Probe { .. });
+        let bulk = matches!(j, Job::Fetch { bulk: true, .. });
         let mut g = self.q.m.lock().unwrap();
         if bulk {
-            g.bulk.push_back(j);
+            g.bulk.push_back((Instant::now(), j));
         } else {
-            g.urgent.push_back(j);
+            g.urgent.push_back((Instant::now(), j));
         }
         self.q.publish_len(&g);
         drop(g);
@@ -357,19 +372,26 @@ impl Tip {
 fn run(q: Arc<Queue>, env: Env, me: usize) {
     env.stats.set_state(me, "idle".into());
     // This worker's node, counting the HTTP requests it really sends.
-    let counter = Arc::new(Counting { inner: env.node.clone(), sent: AtomicU64::new(0), batch: crate::node::env_u64("ARBSIM_NODE_BATCH", 25).max(1) });
+    let counter = Arc::new(Counting {
+        inner: env.node.clone(),
+        sent: AtomicU64::new(0),
+        node_us: AtomicU64::new(0),
+        batch: crate::node::env_u64("ARBSIM_NODE_BATCH", 25).clamp(1, 50),
+    });
     let mut env = env;
     env.node = counter.clone();
-    while let Some(job) = q.take() {
+    while let Some((queued, job)) = q.take() {
         env.stats.set_state(me, describe(&job));
         env.stats.busy.fetch_add(1, Ordering::Relaxed);
         let t0 = Instant::now();
-        let s0 = counter.sent.load(Ordering::Relaxed);
+        let queue_ms = t0.duration_since(queued).as_millis() as u64;
+        let (s0, n0) = (counter.sent.load(Ordering::Relaxed), counter.node_us.load(Ordering::Relaxed));
         let (kind, done) = one(&env, job);
         let used = counter.sent.load(Ordering::Relaxed) - s0;
+        let node_ms = (counter.node_us.load(Ordering::Relaxed) - n0) / 1000;
         report_errors(&env.stats, kind, &done);
         env.requests.fetch_add(used, Ordering::Relaxed);
-        env.stats.note(kind, used, t0.elapsed().as_millis() as u64);
+        env.stats.note(kind, used, t0.elapsed().as_millis() as u64, queue_ms, node_ms);
         env.stats.busy.fetch_sub(1, Ordering::Relaxed);
         env.stats.set_state(me, "idle".into());
         if env.out.send(Input::Done(done)).is_err() {
@@ -383,6 +405,8 @@ fn run(q: Arc<Queue>, env: Env, me: usize) {
 struct Counting {
     inner: Arc<dyn NodeApi>,
     sent: AtomicU64,
+    /// Time spent inside node calls (microseconds).
+    node_us: AtomicU64,
     batch: u64,
 }
 
@@ -396,12 +420,16 @@ impl Counting {
 
 impl NodeApi for Counting {
     fn call_batch(&self, class: Class, calls: &[(&str, Value)]) -> Result<Vec<CallResult>, NodeErr> {
+        let t = Instant::now();
         let r = self.inner.call_batch(class, calls);
+        self.node_us.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
         self.count(calls.len(), &r);
         r
     }
     fn call_batch_paid(&self, class: Class, calls: &[(&str, Value)]) -> Result<Vec<CallResult>, NodeErr> {
+        let t = Instant::now();
         let r = self.inner.call_batch_paid(class, calls);
+        self.node_us.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
         self.count(calls.len(), &r);
         r
     }
@@ -563,6 +591,32 @@ fn code_cache() -> &'static Mutex<HashMap<B256, Bytes>> {
 /// One job's values at `block`: eth_getProof per account (see file header),
 /// eth_getCode for code we haven't seen, plus the eth_calls.
 pub fn fetch(node: &dyn NodeApi, class: Class, block: u64, items: &[MissItem], calls: &[(Address, Bytes)]) -> Result<FetchOut, NodeErr> {
+    let mut out = fetch_once(node, class, block, items, calls)?;
+    // Items the node refused for a limit (-32005 etc.): ask those once more.
+    let limited = |e: &ItemErr| matches!(e, ItemErr::Other(m) if is_limit(m));
+    let again: Vec<MissItem> = out.items.iter().filter(|(_, r)| matches!(r, Err(e) if limited(e))).map(|(it, _)| it.clone()).collect();
+    if !again.is_empty() {
+        if let Ok(o2) = fetch_once(node, class, block, &again, &[]) {
+            let fixed: HashMap<MissItem, Result<Fetched, ItemErr>> = o2.items.into_iter().collect();
+            for (it, r) in out.items.iter_mut() {
+                if matches!(r, Err(e) if limited(e)) {
+                    if let Some(nr) = fixed.get(it) {
+                        *r = nr.clone();
+                    }
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Does this node error text mean "a limit" (rate / batch size), not "no"?
+pub fn is_limit(m: &str) -> bool {
+    let l = m.to_ascii_lowercase();
+    l.contains("-32005") || l.contains("limit") || l.contains("too many") || l.contains("exceeded")
+}
+
+fn fetch_once(node: &dyn NodeApi, class: Class, block: u64, items: &[MissItem], calls: &[(Address, Bytes)]) -> Result<FetchOut, NodeErr> {
     if !NO_PROOF.load(Ordering::Relaxed) {
         match fetch_proof(node, class, block, items, calls) {
             Err(NodeErr::BadResponse(m)) if m.starts_with("eth_getProof unsupported") => {
@@ -624,7 +678,7 @@ fn fetch_proof(node: &dyn NodeApi, class: Class, block: u64, items: &[MissItem],
                 Ok(Value::Null) => return Err(ItemErr::BlockUnavailable),
                 Ok(v) => v,
                 Err(e) if e.is_block_unavailable() => return Err(ItemErr::BlockUnavailable),
-                Err(e) => return Err(ItemErr::Other(format!("eth_getProof: {}", e.message))),
+                Err(e) => return Err(ItemErr::Other(format!("eth_getProof: {} (code {})", e.message, e.code))),
             };
             let txt = |k: &str| v.get(k).and_then(|x| x.as_str()).ok_or(ItemErr::Other(format!("eth_getProof: no {k}")));
             let bal = parse_u256(txt("balance")?).map_err(ItemErr::Other)?;
@@ -791,7 +845,7 @@ fn fetch_plain(node: &dyn NodeApi, class: Class, block: u64, items: &[MissItem],
             Ok(Value::Null) => Err(ItemErr::BlockUnavailable),
             Ok(v) => Ok(v.clone()),
             Err(e) if e.is_block_unavailable() => Err(ItemErr::BlockUnavailable),
-            Err(e) => Err(ItemErr::Other(e.message.clone())),
+            Err(e) => Err(ItemErr::Other(format!("{} (code {})", e.message, e.code))),
         }
     };
     let text = |r: &CallResult| -> Result<String, ItemErr> {

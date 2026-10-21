@@ -655,11 +655,11 @@ pub struct C2Config {
     /// Wait after a pool's storage layout didn't match its getters
     /// [ARBSIM_COPY2_LAYOUT_RETRY_S, 3600].
     pub layout_retry_s: u64,
-    /// Pools per load job [ARBSIM_COPY2_LOAD_BATCH, 25] (a job is split into
+    /// Pools per load job [ARBSIM_COPY2_LOAD_BATCH, 5] (small jobs: mostly one HTTP request each; split into
     /// node requests of ARBSIM_NODE_BATCH calls).
     pub load_batch: usize,
     /// Loader workers = node requests in flight at most
-    /// [ARBSIM_COPY2_INFLIGHT, 8]; load jobs queued at most this many too.
+    /// [ARBSIM_COPY2_INFLIGHT, 16]; load jobs queued at most this many too.
     pub loaders: usize,
     /// Blocks of reports always kept for carrying loads forward
     /// [ARBSIM_COPY2_KEEP_BLOCKS, 2400 = ~10 min]; older ones are kept as
@@ -679,8 +679,8 @@ impl C2Config {
             reload_ms: env_u64("ARBSIM_COPY2_RELOAD_MS", 2000),
             reload_max_ms: env_u64("ARBSIM_COPY2_RELOAD_MAX_MS", 600_000),
             layout_retry_s: env_u64("ARBSIM_COPY2_LAYOUT_RETRY_S", 3600),
-            load_batch: env_u64("ARBSIM_COPY2_LOAD_BATCH", 25).clamp(1, 500) as usize,
-            loaders: env_u64("ARBSIM_COPY2_INFLIGHT", 8).clamp(1, 64) as usize,
+            load_batch: env_u64("ARBSIM_COPY2_LOAD_BATCH", 5).clamp(1, 500) as usize,
+            loaders: env_u64("ARBSIM_COPY2_INFLIGHT", 16).clamp(1, 128) as usize,
             keep_blocks: env_u64("ARBSIM_COPY2_KEEP_BLOCKS", 2400).clamp(16, 100_000) as usize,
             max_keep_blocks: env_u64("ARBSIM_COPY2_MAX_KEEP_BLOCKS", 40_000).clamp(16, 1_000_000) as usize,
             max_rounds: env_u64("ARBSIM_COPY2_MAX_ROUNDS", 40).clamp(1, 1000) as u32,
@@ -2217,6 +2217,15 @@ impl Intake {
         if err.is_none() {
             for i in r.getters.iter().map(|g| g.1).chain(r.coin_checks.iter().map(|c| c.3)) {
                 if let Err(e) = &out.calls[i] {
+                    if e.to_ascii_lowercase().contains("revert") {
+                        // The pool's own getter refuses: not a standard pool
+                        // of this kind (unsure with the long layout wait, not
+                        // retried every few seconds).
+                        self.outcomes.mismatch += 1;
+                        inc(&self.c2.stats.load_failed);
+                        self.make_unsure(r.key, &format!("layout: a getter reverts ({e})"), None, block + 1);
+                        return;
+                    }
                     err = Some((true, format!("node error on a check call: {e}")));
                 }
             }

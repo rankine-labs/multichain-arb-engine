@@ -376,7 +376,7 @@ impl NodeClient {
             endpoints,
             agent: ureq::Agent::new_with_config(cfg),
             budgets: vec![Budget::from_env(), public_budget],
-            max_batch: env_u64("ARBSIM_NODE_BATCH", 25).max(1) as usize,
+            max_batch: env_u64("ARBSIM_NODE_BATCH", 25).clamp(1, 50) as usize, // Chainstack: <= 50
             errors: Mutex::new((0, None)),
         })
     }
