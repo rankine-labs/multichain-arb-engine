@@ -126,6 +126,8 @@ pub mod sol {
     /// stable (bool, byte 0) | token0 (address, bytes 1..21)
     pub const STABLE_TOKEN0: u64 = 10;
     pub const TOKEN1: u64 = 11;
+    pub const POOL_FEES: u64 = 12;
+    pub const FACTORY: u64 = 13;
     /// observations[] length; entries at keccak(14) + 3*i: time, r0Cum, r1Cum.
     pub const OBS_LEN: u64 = 14;
     pub const RESERVE0: u64 = 17;
