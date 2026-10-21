@@ -33,7 +33,7 @@
 import { readFileSync, writeFileSync, mkdirSync, appendFileSync } from 'fs';
 import { join } from 'path';
 import { ethers } from 'ethers';
-import { ROBINHOOD_TOKENS } from '../../src/config/knownAddresses';
+import { ROBINHOOD_TOKENS, ROBINHOOD_SCAN_FACTORIES } from '../../src/config/knownAddresses';
 import { decodeSwapLog, classifyTx, receiptGasWei, obsFromSwap, buildPriceBook, priceArb, usdOf, sizeBucket, ArbRecord, PriceObs, PriceCtx } from '../../src/core/followMoney';
 import { simulateRoundTrip, replayRpc, Rpc, ReplayCall, SimResult } from '../../src/execution/simulator';
 import { kindForPool, hopFor, v4KeyMatchesId, KIND_V4_HOOKED, ExecutorHop } from '../../src/execution/executorCalldata';
@@ -53,6 +53,7 @@ mkdirSync(OUT, { recursive: true });
 const lc = (s: string) => String(s ?? '').toLowerCase();
 const WETH = lc(ROBINHOOD_TOKENS.WETH), USDG = lc(ROBINHOOD_TOKENS.USDG);
 const RH_POOL_MANAGER = '0x8366a39cc670b4001a1121b8f6a443a643e40951';
+const ZERO = '0x0000000000000000000000000000000000000000';
 const USER_TX_TYPES = new Set(['0x0', '0x1', '0x2', '0x3', '0x4']); // same as the bot (skip Arbitrum system txs)
 
 // --- node access: only the one .env line asked for, never printed ----------
@@ -97,6 +98,74 @@ function coinsOf(id: string): { c0: string; c1: string } | null {
   return { c0, c1 };
 }
 const asWeth = (t: string) => (/^0x0+$/.test(t) ? WETH : t);
+
+// --- --learn: pools rivals use that we DON'T watch, read from the chain -----
+// Plain English: for each such pool, work out what it is the way the bot's
+// watch list describes pools, so our contract can be tried on it (in this
+// test only; the bot's list is never changed):
+//   pool contract (V2 / V3 / Algebra): token0(), token1(), factory(), and
+//     fee() (V3) / globalState() (Algebra) / getReserves() (V2). The exchange
+//     name comes from the factory (the bot's list of Robinhood factories);
+//     an unknown factory is named "unknown-v2" / "unknown-v3".
+//   Uniswap V4 pool id: the pool's key (coins, fee, tick spacing, hook) is
+//     read from the rival's own call to the PoolManager (callTracer on the
+//     rival transaction), and checked: the key must hash to the pool id.
+// learnedInfo keeps what was found, for the summary.
+const LEARN = args.includes('--learn');
+const learnedInfo = new Map<string, { kind: string; dex: string; hooked?: boolean; ok: boolean; why?: string }>();
+const FACTORY_DEX = new Map(ROBINHOOD_SCAN_FACTORIES.map((f) => [lc(f.factory), f]));
+const POOL_IFACE = new ethers.Interface([
+  'function token0() view returns (address)', 'function token1() view returns (address)', 'function factory() view returns (address)',
+  'function fee() view returns (uint24)', 'function getReserves() view returns (uint112,uint112,uint32)',
+  'function globalState() view returns (uint160,int24,uint16,uint8,uint16,bool)',
+]);
+const V4_SWAP_SIG = new ethers.Interface(['function swap((address,address,uint24,int24,address) key,(bool,int256,uint160) params,bytes hookData)']);
+const V4_SWAP_SELECTOR = V4_SWAP_SIG.getFunction('swap')!.selector;
+async function poolCall(addr: string, fn: string): Promise<any[] | null> {
+  const r = await rpc('eth_call', [{ to: addr, data: POOL_IFACE.encodeFunctionData(fn) }, 'latest']);
+  if (!r.result || r.result === '0x') return null;
+  try { return [...POOL_IFACE.decodeFunctionResult(fn, r.result)]; } catch { return null; }
+}
+async function learnPool(id: string, txHash: string) {
+  id = lc(id);
+  if (pools.has(id) || learnedInfo.has(id)) return;
+  const fail = (kind: string, why: string) => { learnedInfo.set(id, { kind, dex: '?', ok: false, why }); };
+  if (id.length === 66) {
+    // V4: find the rival's PoolManager.swap call for this pool and read its key.
+    const t = await rpc('debug_traceTransaction', [txHash, { tracer: 'callTracer' }]);
+    if (!t.result) return fail('v4', 'trace unavailable');
+    const calls: any[] = []; const walk = (c: any) => { calls.push(c); for (const s of c.calls ?? []) walk(s); }; walk(t.result);
+    for (const c of calls) {
+      if (lc(c.to) !== RH_POOL_MANAGER || !String(c.input ?? '').startsWith(V4_SWAP_SELECTOR)) continue;
+      let k: any; try { k = V4_SWAP_SIG.decodeFunctionData('swap', c.input).key; } catch { continue; }
+      const key = { c0: lc(k[0]), c1: lc(k[1]), fee: Number(k[2]), ts: Number(k[3]), hooks: lc(k[4]) };
+      const kid = ethers.keccak256(ethers.AbiCoder.defaultAbiCoder().encode(['address', 'address', 'uint24', 'int24', 'address'], [key.c0, key.c1, key.fee, key.ts, key.hooks]));
+      if (lc(kid) !== id) continue;
+      const native = /^0x0+$/.test(key.c0), hooked = !/^0x0+$/.test(key.hooks);
+      pools.set(id, { chain: 'robinhood', dex: 'uniswap-v4', poolAddress: id, poolType: 'v3', tokenA: native ? ROBINHOOD_TOKENS.WETH : ethers.getAddress(key.c0), tokenB: ethers.getAddress(key.c1),
+        feeBps: Math.round(key.fee / 100), lastUpdatedBlock: 0, lastUpdatedMs: 0, learned: true,
+        v4: { fee: key.fee, tickSpacing: key.ts, native, poolManager: ethers.getAddress(RH_POOL_MANAGER), stateView: ZERO, ...(hooked ? { hooks: ethers.getAddress(key.hooks) } : {}) } });
+      learnedInfo.set(id, { kind: hooked ? 'v4 hooked' : 'v4 no-hook', dex: hooked ? `hook ${key.hooks.slice(0, 10)}` : 'uniswap-v4', hooked, ok: true });
+      return;
+    }
+    return fail('v4', 'pool key not found in the rival call');
+  }
+  const [t0, t1, fac] = [await poolCall(id, 'token0'), await poolCall(id, 'token1'), await poolCall(id, 'factory')];
+  if (!t0 || !t1) return fail('?', 'not a pool we can read (no token0/token1)');
+  const f = fac ? FACTORY_DEX.get(lc(fac[0])) : undefined;
+  const fee = await poolCall(id, 'fee');
+  const gs = fee ? null : await poolCall(id, 'globalState');
+  const res = fee || gs ? null : await poolCall(id, 'getReserves');
+  const base = { chain: 'robinhood', poolAddress: ethers.getAddress(id), tokenA: t0[0], tokenB: t1[0], lastUpdatedBlock: 0, lastUpdatedMs: 0, learned: true };
+  if (fee) { const dex = f && f.kind === 'v3' ? f.dex : 'unknown-v3'; pools.set(id, { ...base, dex, poolType: 'v3', feeBps: Math.round(Number(fee[0]) / 100), feePips: Number(fee[0]) }); learnedInfo.set(id, { kind: 'v3', dex, ok: true }); return; }
+  if (gs) { pools.set(id, { ...base, dex: 'unknown-algebra', poolType: 'v3', variant: 'algebra', feeBps: 0 }); learnedInfo.set(id, { kind: 'algebra', dex: 'unknown-algebra', ok: true }); return; }
+  if (res) {
+    const dex = f && f.kind !== 'v3' ? f.dex : 'unknown-v2';
+    pools.set(id, { ...base, dex, poolType: 'v2', feeBps: 30 }); // fee unknown for an unknown V2 copy: 0.30% (Uniswap V2), the replay shows if it's wrong
+    learnedInfo.set(id, { kind: f?.kind === 'solidly' ? 'solidly' : 'v2', dex, ok: true }); return;
+  }
+  return fail('?', 'pool type not recognised');
+}
 
 // --- coin decimals / symbols (cached, read once per coin) -------------------
 const ERC20 = new ethers.Interface(['function decimals() view returns (uint8)', 'function symbol() view returns (string)']);
@@ -172,6 +241,7 @@ async function main() {
       { hash: a.hash, block, txIndex, gasWei: g.gasWei, l1GasUsed: g.l1GasUsed, value: BigInt(tx.result.value ?? 0) },
       { weth: WETH, poolManager: RH_POOL_MANAGER, v4Currencies: (id) => coinsOf(id) });
     if (!c.arb) continue;
+    if (LEARN) for (const h of c.arb.hops) if (!pools.has(lc(h.pool))) await learnPool(h.pool, a.hash);
     fillHopsFromLogs(c.arb, rc.result.logs);
     recs.set(a.hash, { rec: c.arb, rc: rc.result });
     for (const l of rc.result.logs) {
@@ -207,6 +277,8 @@ async function main() {
       hash: a.hash, block: rec.block, hadTrigger: a.hadTrigger, bucket: a.bucket, path: pr.path,
       rival: { sizeUsd: pr.sizeUsd, grossUsd: pr.grossUsd, gasUsd: pr.gasUsd, netUsd: pr.netUsd, trust: pr.trust, doubt: pr.doubtWhy },
     };
+    const learnedHere = rec.hops.filter((h) => pools.get(lc(h.pool))?.learned).map((h) => lc(h.pool));
+    if (learnedHere.length) row.learnedPools = learnedHere;
     const built = ourRoute(rec);
     if (built.ok === false) { row.ours = { status: 'not-ours', why: built.why }; rows.push(row); appendFileSync(outFile, JSON.stringify(row) + '\n'); continue; }
     // State just before the rival: block before + earlier transactions of the same block.
@@ -286,6 +358,32 @@ async function main() {
     topUnwatchedPools: [...missingPools.entries()].sort((x, y) => y[1] - x[1]).slice(0, 15).map(([pool, n]) => ({ pool, arbs: n })),
     top10_ourNetWithinCap: done.filter((r) => oursNet(r, 'withinCap') > 0).sort((x, y) => oursNet(y, 'withinCap') - oursNet(x, 'withinCap')).slice(0, 10)
       .map((r) => ({ hash: r.hash, path: r.path, ourNetUsd: +oursNet(r, 'withinCap').toFixed(2), sizeUsd: r.ours.withinCap.sizeUsd && +r.ours.withinCap.sizeUsd.toFixed(0), rivalNetUsd: r.rival.netUsd && +r.rival.netUsd.toFixed(2) })),
+    // --learn: each pool we don't watch, what it is, and what our replay found on it.
+    learnedPools: LEARN ? (() => {
+      // Pool types our event-updated pool copy is proven exact on (InBot_Design2_Proof).
+      const proven = (i: { kind: string; dex: string }) => i.kind === 'v4 no-hook' || i.kind === 'v2' || i.kind === 'algebra'
+        || (i.kind === 'v3' && ['uniswap-v3', 'pancakeswap-v3'].includes(i.dex)) ? 'proven'
+        : i.kind === 'v4 hooked' ? 'hooked: not tested' : 'fork: not checked';
+      const per = new Map<string, any>();
+      for (const r of done) for (const id of r.learnedPools ?? []) {
+        const e = per.get(id) ?? { arbs: 0, ourRouteSupported: 0, weProfitAfterGas_withinCap: 0, ourNetUsd_withinCap: 0, rivalNetUsd_trusted: 0, replay: {} as Record<string, number> };
+        e.arbs++;
+        if (r.rival.trust === 'ok' && typeof r.rival.netUsd === 'number') e.rivalNetUsd_trusted += r.rival.netUsd;
+        if (r.ours && r.ours.status !== 'not-ours') { e.ourRouteSupported++; const k = r.ours.best?.status ?? r.ours.status; e.replay[k] = (e.replay[k] ?? 0) + 1; }
+        else if (r.ours?.why) e.replay[r.ours.why] = (e.replay[r.ours.why] ?? 0) + 1;
+        const n = oursNet(r, 'withinCap'); if (n > 0) { e.weProfitAfterGas_withinCap++; e.ourNetUsd_withinCap += n; }
+        per.set(id, e);
+      }
+      return {
+        found: learnedInfo.size, readable: [...learnedInfo.values()].filter((i) => i.ok).length,
+        byKind: [...learnedInfo.values()].reduce<Record<string, number>>((m, i) => { const k = `${i.kind} | ${i.dex}${i.ok ? '' : ' | ' + i.why}`; m[k] = (m[k] ?? 0) + 1; return m; }, {}),
+        top: [...per.entries()].sort((x, y) => y[1].arbs - x[1].arbs).slice(0, 15).map(([id, e]) => {
+          const i = learnedInfo.get(id)!; const p = pools.get(id);
+          return { pool: id, kind: i.kind, dex: i.dex, copy: proven(i), coins: p ? `${syms.get(lc(p.tokenA)) ?? lc(p.tokenA).slice(0, 8)}/${syms.get(lc(p.tokenB)) ?? lc(p.tokenB).slice(0, 8)}` : '?',
+            fee: p?.v4?.fee ?? p?.feePips ?? null, ...e, rivalNetUsd_trusted: +e.rivalNetUsd_trusted.toFixed(2), ourNetUsd_withinCap: +e.ourNetUsd_withinCap.toFixed(2) };
+        }),
+      };
+    })() : undefined,
     nodeRequestsUsed: requests,
   };
   writeFileSync(join(OUT, 'profit.json'), JSON.stringify(summary, null, 1));
