@@ -6,6 +6,7 @@
 // ============================================================================
 pub mod arb;
 pub mod check;
+pub mod copy2;
 pub mod feed;
 pub mod node;
 pub mod proto;
