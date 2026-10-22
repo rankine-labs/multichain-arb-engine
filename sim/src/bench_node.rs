@@ -3,6 +3,7 @@
 // time go? (read only: it only asks the node questions)
 //
 //   arbsim node-bench [--url-env NAME] [--n 50] [--parallel 16]
+//                     [--probe-coin 0xCOIN] [--copy2-load pools.json]
 //
 // Plain English:
 //   Uses the SAME node client copy 2 uses (keep-alive pool, speed limit,
@@ -181,5 +182,87 @@ pub fn node_bench(args: &[String]) {
     };
     parallel(&format!("E node client, {par} parallel, eth_getStorageAt at tip"), false);
     parallel(&format!("F raw POST, {par} parallel, eth_getStorageAt at tip"), true);
+
+    // G: a real coin probe (where does the coin keep balances?).
+    if let Some(c) = arg(args, "--probe-coin") {
+        match crate::check::hexutil::parse_address(&c) {
+            Ok(coin) => {
+                let t = Instant::now();
+                let r = crate::copy2::coins::probe_layout(&*client, coin, tip);
+                println!("  G coin probe {coin}: {:.0} ms -> {:?}", t.elapsed().as_secs_f64() * 1000.0, r.map(|l| l.map(|l| l.to_json())));
+            }
+            Err(e) => println!("  G --probe-coin: {e}"),
+        }
+    }
+    // H: a real copy-2 load of the pools in a file (same JSON as `track`).
+    if let Some(f) = arg(args, "--copy2-load") {
+        copy2_load(client.clone(), &f);
+    }
     println!("  node client usage: {}", client.usage());
+}
+
+/// Run copy 2's real loading (intake + loader threads, same code as `serve`)
+/// for the pools in `file` ({"pools":[...]} as in `track`, coinSlots
+/// allowed), feeding it the node's newest block every 250 ms, until every
+/// pool is ready or unsure (or 5 min). Prints progress every 5 s and the
+/// loader's time breakdown. The first 100 HTTP requests are logged
+/// ("copy2 http #n ...").
+fn copy2_load(client: Arc<NodeClient>, file: &str) {
+    let text = match std::fs::read_to_string(file) {
+        Ok(t) => t,
+        Err(e) => return println!("  H --copy2-load: can't read {file}: {e}"),
+    };
+    let v: Value = match serde_json::from_str(&text) {
+        Ok(v) => v,
+        Err(e) => return println!("  H --copy2-load: {file} is not JSON: {e}"),
+    };
+    let v = if v.is_array() { json!({ "pools": v }) } else { v };
+    let node: Arc<dyn NodeApi> = client.clone();
+    let sh = crate::state::mirror::Shared::new(
+        crate::state::mirror::Config::from_env(),
+        Some(node.clone()),
+        Arc::new(crate::serve::default_volatile()),
+    );
+    let cfg = crate::copy2::intake::C2Config::from_env();
+    println!("  H copy-2 load: {} workers, {} pools per job", cfg.loaders, cfg.load_batch);
+    let h = crate::copy2::intake::spawn(sh, Arc::new(crate::state::fill::FillQueue::new(1000, 100)), cfg);
+    let ans = h.track_json(&json!(1), &v);
+    println!("  H track: {ans}");
+    let t0 = Instant::now();
+    let mut last_print = Instant::now();
+    let mut prev: Option<u64> = None;
+    loop {
+        if let Ok(tip) = crate::node::block_number(&*node, Class::Header) {
+            if prev != Some(tip) {
+                let ts = crate::node::get_header(&*node, Class::Header, tip).ok().flatten().map(|h| h.timestamp).unwrap_or(0);
+                let mut m = json!({ "type": "block_tick", "block": tip, "timestamp": ts });
+                if let Some(p) = prev {
+                    m["prevBlock"] = json!(p);
+                }
+                h.block_json(&m);
+                prev = Some(tip);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(250));
+        let st = h.status_json(false);
+        let done = st["loading"] == json!(0) && st["pools"].as_u64().unwrap_or(0) > 0;
+        if done || last_print.elapsed() >= Duration::from_secs(5) || t0.elapsed() > Duration::from_secs(300) {
+            last_print = Instant::now();
+            println!(
+                "  H {:>5.1} s: {} ready, {} loading, {} unsure; {} HTTP requests; loader {}",
+                t0.elapsed().as_secs_f64(),
+                st["ready"],
+                st["loading"],
+                st["unsure"],
+                st["nodeRequests"],
+                st["loader"]["byKind"]
+            );
+        }
+        if done || t0.elapsed() > Duration::from_secs(300) {
+            println!("  H unsure reasons: {}", st["unsureReasons"]);
+            println!("  H first node errors: {}", st["loader"]["firstErrors"]);
+            break;
+        }
+    }
+    h.stop();
 }

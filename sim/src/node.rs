@@ -411,12 +411,15 @@ impl NodeClient {
             .send(body)
             .map_err(|e| NodeErr::Transport(format!("{}: {}", ep.label, safe_err(&e))))?;
         let status = resp.status().as_u16();
+        let t_read = Instant::now();
         let text = resp
             .into_body()
             .with_config()
             .limit(64 * 1024 * 1024)
             .read_to_string()
             .map_err(|e| NodeErr::Transport(format!("{}: reading answer: {}", ep.label, safe_err(&e))))?;
+        let read_ms = t_read.elapsed().as_secs_f64() * 1000.0;
+        LAST_HTTP.with(|c| c.set((text.len(), read_ms)));
         if status == 429 {
             return Err(NodeErr::Transport(format!("{}: rate limited (429)", ep.label)));
         }
@@ -472,10 +475,17 @@ impl NodeClient {
                 .enumerate()
                 .map(|(i, &k)| json!({ "jsonrpc": "2.0", "id": i, "method": chunk[k].0, "params": chunk[k].1 }))
                 .collect();
-            let answer = match self.post(ep, &Value::Array(body).to_string()) {
+            let t_send = Instant::now();
+            LAST_HTTP.with(|c| c.set((0, 0.0)));
+            let posted = self.post(ep, &Value::Array(body).to_string());
+            let total_ms = t_send.elapsed().as_secs_f64() * 1000.0;
+            let answer = match posted {
                 Ok(v) => split_batch_answer(v, todo.len()),
                 Err(e) => Err(e),
             };
+            if paid_first {
+                log_http(ep.label, &todo.iter().map(|k| &chunk[*k]).collect::<Vec<_>>(), total_ms, &answer);
+            }
             match answer {
                 Ok(rs) => {
                     let mut again = Vec::new();
@@ -506,6 +516,57 @@ impl NodeClient {
             .map(|r| r.unwrap_or(Err(RpcErr { code: -1, message: "no node could answer".into() })))
             .collect())
     }
+}
+
+thread_local! {
+    /// (answer bytes, ms reading the answer body) of this thread's last POST.
+    static LAST_HTTP: std::cell::Cell<(usize, f64)> = const { std::cell::Cell::new((0, 0.0)) };
+}
+
+/// Copy-2 HTTP requests logged so far (the first ARBSIM_HTTP_LOG, 100).
+static HTTP_LOGGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// One log line per copy-2 HTTP request (the first ARBSIM_HTTP_LOG, 100):
+/// node, method mix, calls, storage keys / overrides asked, answer size,
+/// total ms and the part spent reading the answer body. Never the URL.
+fn log_http(node: &str, calls: &[&(&str, Value)], total_ms: f64, answer: &Result<Vec<CallResult>, NodeErr>) {
+    let n = HTTP_LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if n >= env_u64("ARBSIM_HTTP_LOG", 100) {
+        return;
+    }
+    let mut mix: Vec<(&str, usize)> = Vec::new();
+    let mut keys = 0usize;
+    for (m, p) in calls {
+        match mix.iter_mut().find(|x| x.0 == *m) {
+            Some(x) => x.1 += 1,
+            None => mix.push((m, 1)),
+        }
+        if *m == "eth_getProof" {
+            keys += p.get(1).and_then(|k| k.as_array()).map(|a| a.len()).unwrap_or(0);
+        }
+        if *m == "eth_call" {
+            keys += p
+                .get(2)
+                .and_then(|o| o.as_object())
+                .map(|o| o.values().map(|v| v["stateDiff"].as_object().map(|d| d.len()).unwrap_or(0)).sum::<usize>())
+                .unwrap_or(0);
+        }
+    }
+    let (bytes, read_ms) = LAST_HTTP.with(|c| c.get());
+    let errs = match answer {
+        Ok(v) => v.iter().filter(|r| r.is_err()).count(),
+        Err(_) => calls.len(),
+    };
+    let mixs: Vec<String> = mix.iter().map(|(m, c)| format!("{m} x{c}")).collect();
+    eprintln!(
+        "[arbsim] copy2 http #{}: {node} [{}] {} calls, {keys} keys/overrides, answer {} KB, {:.0} ms total ({:.0} ms reading the answer), {errs} error item(s)",
+        n + 1,
+        mixs.join(", "),
+        calls.len(),
+        bytes / 1024,
+        total_ms,
+        read_ms
+    );
 }
 
 /// ureq error -> short text WITHOUT the URL (some variants carry it).

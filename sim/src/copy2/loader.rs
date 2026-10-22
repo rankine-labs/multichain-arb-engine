@@ -587,6 +587,8 @@ fn trace_balance(node: &dyn NodeApi, block: u64, coin: Address, holder: Address)
 
 /// Most storage keys asked in one eth_getProof.
 const PROOF_SLOTS: u64 = 100;
+/// Accounts with more values than this are read with plain batches.
+const PROOF_MAX_SLOTS: usize = 12;
 /// Set when the node doesn't know eth_getProof: the plain way from then on.
 static NO_PROOF: AtomicBool = AtomicBool::new(false);
 
@@ -655,10 +657,19 @@ fn fetch_proof(node: &dyn NodeApi, class: Class, block: u64, items: &[MissItem],
             MissItem::Code(_) => {}
         }
     }
+    // Accounts to read the plain way (many values, or no proof for that block).
+    let mut plain: Vec<Address> = Vec::new();
     let mut rpc: Vec<(&str, Value)> = Vec::new();
     // (account, slots in this request)
     let mut asked: Vec<(Address, Vec<U256>)> = Vec::new();
     for (a, slots) in &by {
+        // Proofs are big (every value carries its proof path): accounts with
+        // many values (coins holding balances of many pools) are read with
+        // plain eth_getStorageAt batches instead.
+        if slots.len() > PROOF_MAX_SLOTS {
+            plain.push(*a);
+            continue;
+        }
         let chunks: Vec<Vec<U256>> = if slots.is_empty() { vec![vec![]] } else { slots.chunks(PROOF_SLOTS as usize).map(|c| c.to_vec()).collect() };
         for c in chunks {
             let keys: Vec<String> = c.iter().map(|s| format!("{s:#066x}")).collect();
@@ -676,8 +687,6 @@ fn fetch_proof(node: &dyn NodeApi, class: Class, block: u64, items: &[MissItem],
     }
     // Per account: basics (balance, nonce, code hash) and slot values.
     type Basics = (U256, u64, B256);
-    // Accounts to read the plain way (no proof for that block).
-    let mut plain: Vec<Address> = Vec::new();
     let mut basics: HashMap<Address, Result<Basics, ItemErr>> = HashMap::new();
     let mut slots: HashMap<(Address, U256), Result<U256, ItemErr>> = HashMap::new();
     for ((a, keys), r) in asked.iter().zip(res[..call_at].iter()) {
