@@ -300,3 +300,49 @@ trade ~20 ms.
   unsureReasons, counters}; with {"pools": true} also `list` of {address,
   v4Id, kind, state, reason, events}. Checks touching a pool that isn't
   ready answer unknown "unsure_pool".
+- Dry run #16 fixes (inbot-sim/copy2-f):
+  - Request storm (from minute ~22: ~95 requests/s = our own cap while
+    Chainstack answered -32005 "You've exceeded the RPS limit"; ready
+    776 -> 650, loading 12 -> 139). Ready pools turn "loading" only when a
+    replay needs a value the copy doesn't hold (start_partial_in_block, also
+    Algebra end of block). The escalation: the catch-up fetch was refused,
+    retried after 1-2 s, by then > 8 blocks old -> the pool's WHOLE load was
+    restarted (every slot it ever held asked again), refused again, ... Fix:
+    a "too fast" refusal only waits and asks again (1, 2, 4 s), never
+    restarts the load; the old-block restart rule is 64 blocks
+    (ARBSIM_COPY2_CATCHUP_MAX_BLOCKS) and is suspended while refused. Any
+    refusal pauses new first loads and fills for 1-4 s.
+  - node.rs adaptive speed limit: a provider refusal (-32005, HTTP 429,
+    "rate limit") halves the allowed rate at once (at most once per second,
+    floor ARBSIM_NODE_MIN_RPS 2) and drops saved-up burst; after 2 s without
+    a refusal it grows back by 5 % of ARBSIM_NODE_RPS per second. Status:
+    node usage rpsNow / providerRefusals / rateCuts; copy2.nodeRate; copy2
+    counters node_refusals, need_refusal_retries.
+  - eth_blockNumber: loads / fills / probes use the last known node tip
+    (refreshed at most every ARBSIM_COPY2_TIP_MS 2000); exact catch-ups at
+    most every ARBSIM_COPY2_TIP_EXACT_MS 500; a failed refresh never fails a
+    job when a tip is known, and pauses refreshes 5 s.
+  - Fills: values asked again after "pool traded after the read" wait 1 s
+    (no tight loop); a slot of one ordinary pool ready since the read is
+    used even if the pool traded since (its events' changes are carried).
+  - Coin balance drift (41 of 627 probes, persistent offsets), two causes,
+    each reproduced by a test first:
+    1. The checker subscribes to Transfers FROM our pools and TO our pools
+       separately, so a transfer between two followed pools came twice in
+       one block message and was applied twice (copy2_intake
+       the_same_report_twice_in_one_message_is_applied_once). Now repeated
+       reports in a message are dropped (counter duplicate_logs).
+    2. A late coin Transfer for a pool whose load was WAITING for node values
+       past that place was lost: the buffer got it, but the load had already
+       carried beyond it and the copy didn't hold the balance yet, so the
+       pool became ready off by exactly that transfer (copy2_coins_anvil
+       late_coin_transfer_while_a_load_waits_for_values_is_not_lost, real V3
+       pool on anvil). Now added to the waiting load (counter
+       late_transfers_to_loading).
+    Safety net: a reload whose own coin balance disagrees with the one the
+    copy followed makes that balance MISSING in every kept version and logs
+    "copy2: coin ... the copy followed X but its reload says Y" (counter
+    coin_balance_disagree).
+  - Replay: "owner() on <factory> did not answer" now says how (reverted +
+    reason / halted + why / answered N bytes + what the copy holds there).
+
