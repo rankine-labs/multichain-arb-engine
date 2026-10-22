@@ -1390,6 +1390,11 @@ struct Partial {
     /// after `base` and before `cursor` is not in them and must be added
     /// (on_late). (0,0,0) = it holds no coin balance of its own.
     base: Pos,
+    /// Where it last asked the node for values: the fetch-round limit
+    /// (ARBSIM_COPY2_MAX_ROUNDS) counts rounds WITHOUT progress (copy2-n:
+    /// a catch-up carries a working copy across many blocks at once, one
+    /// round per new tick a mint touches; 40 per whole carry was too few).
+    need_at: Pos,
 }
 
 /// What a node job was for.
@@ -3518,7 +3523,7 @@ impl Intake {
         for f in &facts {
             ov.learn(f);
         }
-        self.continue_partial(r.key, Partial { ov, cursor: (block + 1, 0, 0), gen: r.gen, errors: 0, hard_errors: 0, refusals: 0, base: (block, END, END) });
+        self.continue_partial(r.key, Partial { ov, cursor: (block + 1, 0, 0), gen: r.gen, errors: 0, hard_errors: 0, refusals: 0, base: (block, END, END), need_at: (0, 0, 0) });
     }
 
     fn on_need(&mut self, key: PoolKey, gen: u64, items: Vec<MissItem>, block: u64, res: Result<FetchOut, crate::node::NodeErr>) {
@@ -3587,12 +3592,18 @@ impl Intake {
     }
 
     /// Ask for items a working copy needs, at the block before its cursor.
-    fn send_need(&mut self, key: PoolKey, part: Partial, items: Vec<MissItem>) {
+    fn send_need(&mut self, key: PoolKey, mut part: Partial, items: Vec<MissItem>) {
         inc(&self.c2.stats.need_item_rounds);
+        // Progress since the last round (the carry moved on): count afresh.
+        let progressed = part.cursor > part.need_at;
+        part.need_at = part.cursor;
         let over = {
             let mut reg = crate::timing::TimedWrite::new(&self.c2.reg);
             match reg.pools.get_mut(&key) {
                 Some(e) => {
+                    if progressed {
+                        e.rounds = 0;
+                    }
                     e.rounds += 1;
                     e.reason = format!("loading: fetching {} more value(s) (round {})", items.len(), e.rounds);
                     e.rounds > self.cfg.max_rounds
@@ -3681,7 +3692,7 @@ impl Intake {
         for (a, s) in &owned_items {
             ov.forget_slot(*a, *s);
         }
-        self.send_need(k, Partial { ov: part, cursor, gen, errors: 0, hard_errors: 0, refusals: 0, base: (0, 0, 0) }, items);
+        self.send_need(k, Partial { ov: part, cursor, gen, errors: 0, hard_errors: 0, refusals: 0, base: (0, 0, 0), need_at: (0, 0, 0) }, items);
     }
 
     /// Carry a working copy forward through the buffered reports up to the
@@ -4871,6 +4882,7 @@ impl Intake {
         self.set_resume("savedPools", json!(n_pools));
         self.set_resume("savedAgeS", json!(age_s.round()));
         self.set_resume("state", json!(format!("restored {n_pools} pools at block {block}: waiting for the bot's first block to catch up")));
+        inc(&self.c2.stats.catchups);
         self.catchup = Some(CatchUp {
             restored: true,
             applied: block,
