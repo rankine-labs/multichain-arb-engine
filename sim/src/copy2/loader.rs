@@ -11,7 +11,9 @@
 //     Trace  "where does this coin keep this pool's balance?":
 //            balanceOf(pool) + debug_traceCall of it with the prestate tracer
 //     Probe  where a coin keeps balances in general (coins.rs)
-//     Tip    the node's newest block (for status)
+//     Tip    the node's newest block (for status; loads / fills use the
+//            last known one, refreshed at most every 2 s, catch-ups every
+//            0.5 s; a refused refresh never fails a job when a tip is known)
 //   Answers go back to the intake thread as messages; nothing is written
 //   into the copy here.
 //
@@ -313,7 +315,7 @@ impl Loaders {
     /// as of when the job STARTS, not when it was queued).
     pub fn spawn(n: usize, node: Arc<dyn NodeApi>, out: SyncSender<Input>, requests: Arc<AtomicU64>, tip_out: Arc<AtomicU64>, stats: Arc<LoaderStats>, head: Arc<AtomicU64>) -> Loaders {
         let q = Arc::new(Queue { m: Mutex::new(Lanes { urgent: VecDeque::new(), bulk: VecDeque::new(), closed: false }), cv: Condvar::new(), stats: stats.clone() });
-        let env = Env { node, out, requests, tip: Arc::new(Tip { known: Mutex::new((0, None)), out: tip_out }), stats: stats.clone(), head };
+        let env = Env { node, out, requests, tip: Arc::new(Tip::new(tip_out)), stats: stats.clone(), head };
         let n = n.max(1);
         stats.threads.store(n as u64, Ordering::Relaxed);
         for i in 0..n {
@@ -339,41 +341,79 @@ impl Loaders {
     }
 }
 
-/// The node's newest block, shared by the loader threads (asked at most
-/// every 250 ms, only when a job wants a newer block than we know of).
+/// The node's newest block, shared by the loader threads.
+///
+/// eth_blockNumber is asked RARELY (dry run #16: it was refused for the RPS
+/// limit and that failed whole jobs):
+///   - one refresh at a time; the others use the known tip meanwhile
+///   - exact catch-up fetches (must be AT a block) refresh at most every
+///     ARBSIM_COPY2_TIP_EXACT_MS (500 ms); everything else (loads, fills,
+///     probes, traces: an older block is fine, the intake carries forward)
+///     at most every ARBSIM_COPY2_TIP_MS (2000 ms)
+///   - after a failed refresh: none for 5 s, and the jobs use the tip we
+///     already know instead of failing (only with no tip known at all does
+///     the error reach the job)
 struct Tip {
-    known: Mutex<(u64, Option<Instant>)>,
+    /// (newest block known, when a refresh was last tried, last one failed)
+    known: Mutex<(u64, Option<Instant>, bool)>,
     out: Arc<AtomicU64>,
+    exact_every: Duration,
+    every: Duration,
 }
 
 impl Tip {
-    fn get(&self, node: &dyn NodeApi, want: u64) -> Result<u64, NodeErr> {
+    fn new(out: Arc<AtomicU64>) -> Tip {
+        Tip {
+            known: Mutex::new((0, None, false)),
+            out,
+            exact_every: Duration::from_millis(crate::node::env_u64("ARBSIM_COPY2_TIP_EXACT_MS", 500)),
+            every: Duration::from_millis(crate::node::env_u64("ARBSIM_COPY2_TIP_MS", 2000)),
+        }
+    }
+
+    /// The node's newest block as far as we know, refreshed if it is below
+    /// `want` and the last try is older than `every` (5 s after a failure).
+    fn get(&self, node: &dyn NodeApi, want: u64, every: Duration) -> Result<u64, NodeErr> {
         {
-            // One refresh at a time, at most every 250 ms: the copy usually
-            // runs a block or two AHEAD of the node, so `want` is often above
-            // the tip; without this every worker asked eth_blockNumber for
-            // every job (16 at a time), eating the speed limit.
             let mut g = self.known.lock().unwrap();
-            if g.0 >= want || g.1.is_some_and(|t| t.elapsed() < Duration::from_millis(250)) {
+            let wait = if g.2 { every.max(Duration::from_secs(5)) } else { every };
+            if g.0 >= want || g.1.is_some_and(|t| t.elapsed() < wait) {
                 return Ok(g.0);
             }
             g.1 = Some(Instant::now()); // others use the known tip meanwhile
         }
-        let r = node.call_batch_paid(Class::Fill, &[("eth_blockNumber", json!([]))])?;
-        let t = match r.into_iter().next() {
-            Some(Ok(Value::String(s))) => parse_u64(&s).map_err(NodeErr::BadResponse)?,
-            Some(Err(e)) => return Err(NodeErr::BadResponse(format!("eth_blockNumber: {}", e.message))),
-            _ => return Err(NodeErr::BadResponse("eth_blockNumber: no number".into())),
-        };
+        let r = node.call_batch_paid(Class::Fill, &[("eth_blockNumber", json!([]))]).and_then(|r| match r.into_iter().next() {
+            Some(Ok(Value::String(s))) => parse_u64(&s).map_err(NodeErr::BadResponse),
+            Some(Err(e)) => Err(NodeErr::BadResponse(format!("eth_blockNumber: {}", e.message))),
+            _ => Err(NodeErr::BadResponse("eth_blockNumber: no number".into())),
+        });
         let mut g = self.known.lock().unwrap();
-        *g = (g.0.max(t), Some(Instant::now()));
-        self.out.fetch_max(g.0, Ordering::Relaxed);
-        Ok(g.0)
+        match r {
+            Ok(t) => {
+                *g = (g.0.max(t), Some(Instant::now()), false);
+                self.out.fetch_max(g.0, Ordering::Relaxed);
+                Ok(g.0)
+            }
+            // A refusal (RPS limit) or other trouble: keep using what we know.
+            Err(e) => {
+                g.2 = true;
+                if g.0 > 0 {
+                    Ok(g.0)
+                } else {
+                    Err(e)
+                }
+            }
+        }
+    }
+
+    /// For an exact fetch at `block`.
+    fn for_exact(&self, node: &dyn NodeApi, block: u64) -> Result<u64, NodeErr> {
+        self.get(node, block, self.exact_every)
     }
 
     /// At most `want`, at most the node's newest block.
     fn at_most(&self, node: &dyn NodeApi, want: u64) -> Result<u64, NodeErr> {
-        self.get(node, want).map(|t| if t == 0 { want } else { want.min(t) })
+        self.get(node, want, self.every).map(|t| if t == 0 { want } else { want.min(t) })
     }
 }
 
@@ -489,7 +529,7 @@ fn one(env: &Env, job: Job) -> (&'static str, Done) {
         Job::Fetch { id, block, exact, bulk, items, calls } => {
             let kind = if bulk { "load" } else if exact { "catchup" } else { "fill" };
             let at = if exact {
-                match env.tip.get(node, block) {
+                match env.tip.for_exact(node, block) {
                     Ok(t) if t >= block => Ok(block),
                     Ok(t) => Err(NodeErr::BadResponse(format!("node at block {t}, block {block} {NOT_YET}"))),
                     Err(e) => Err(e),
@@ -526,7 +566,7 @@ fn one(env: &Env, job: Job) -> (&'static str, Done) {
             let res = crate::node::block_number(node, Class::Header).and_then(|t| {
                 {
                     let mut g = env.tip.known.lock().unwrap();
-                    *g = (g.0.max(t), Some(Instant::now()));
+                    *g = (g.0.max(t), Some(Instant::now()), false);
                 }
                 env.tip.out.fetch_max(t, Ordering::Relaxed);
                 let bf = crate::node::get_header(node, Class::Header, t)?.map(|h| h.base_fee).unwrap_or(0);

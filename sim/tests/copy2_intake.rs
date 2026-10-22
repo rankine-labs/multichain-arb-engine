@@ -1498,3 +1498,179 @@ fn proxy_coin_balance_is_the_real_balance_or_unknown_never_empty() {
     }
     assert_eq!(answers.last().unwrap()["ok"], json!(true), "never answered: {answers:?}");
 }
+
+// ---------------------------------------------------------------------------
+// Coin balances that drifted in dry run #16 (wrong value, not "unsure")
+// ---------------------------------------------------------------------------
+/// Two followed pools, both ready at block 100 (pool B = 0xa3, same coins).
+fn two_pool_rig() -> (Rig, TrackedPool, TrackedPool) {
+    let mut r = rig();
+    let pa_ = v2_pool();
+    let pb = TrackedPool { address: a(0xa3), ..v2_pool() };
+    let mut s = genesis();
+    let g = s[&a(V2P)].clone();
+    s.insert(pb.address, g);
+    for c in [COIN0, COIN1] {
+        let v = s[&a(c)][&map_slot(a(V2P), 0)];
+        s.get_mut(&a(c)).unwrap().insert(map_slot(pb.address, 0), v);
+    }
+    r.chain.set(100, s);
+    r.track(vec![pa_.clone(), pb.clone()]);
+    r.send(tick(100, 60));
+    assert_eq!(r.state(&pa_).0, PoolState::Ready);
+    assert_eq!(r.state(&pb).0, PoolState::Ready);
+    (r, pa_, pb)
+}
+
+#[test]
+fn the_same_report_twice_in_one_message_is_applied_once() {
+    // Dry run #16: the checker subscribes to coin Transfers FROM our pools
+    // and TO our pools separately, so a transfer from one followed pool to
+    // another (a multi-hop route) arrives twice and was put twice into the
+    // same block message. arbsim applied it twice: both pools' balances
+    // drifted by exactly that amount, for good.
+    let (mut r, pa_, pb) = two_pool_rig();
+    let t = transfer(a(COIN0), pa_.address, pb.address, 100, 101, 0, 0);
+    r.send(msg(101, 61, vec![t.clone(), t.clone()]));
+    assert_eq!(r.head_slot(a(COIN0), map_slot(pa_.address, 0)), Lookup::Known(u(900)));
+    assert_eq!(r.head_slot(a(COIN0), map_slot(pb.address, 0)), Lookup::Known(u(1100)));
+    // Two messages for a block not applied yet, each with the report twice.
+    let t2 = transfer(a(COIN0), pa_.address, pb.address, 7, 102, 0, 0);
+    r.h.block(msg(102, 62, vec![t2.clone(), t2.clone()]));
+    r.h.block(msg(102, 62, vec![t2.clone(), t2]));
+    r.settle();
+    assert_eq!(r.head_slot(a(COIN0), map_slot(pa_.address, 0)), Lookup::Known(u(893)));
+    assert_eq!(r.head_slot(a(COIN0), map_slot(pb.address, 0)), Lookup::Known(u(1107)));
+}
+
+#[test]
+fn reload_that_disagrees_with_a_followed_coin_balance_forgets_it() {
+    // Safety net: when a pool is (re)loaded while the copy already follows
+    // one of its coin balances, the load's own value (node value carried to
+    // the same block) must agree. If not, one of them is wrong: the balance
+    // becomes MISSING (a check then misses it and a fill reads it fresh).
+    let mut r = rig();
+    r.track(vec![v2_pool()]);
+    r.send(tick(100, 60));
+    // A transfer the chain never had (stands for any report applied wrongly):
+    // the copy now says 1100 while the node keeps 1000.
+    r.intake.process(msg(101, 61, vec![transfer(a(COIN0), a(USER), a(V2P), 100, 101, 0, 0)]));
+    assert_eq!(r.head_slot(a(COIN0), map_slot(a(V2P), 0)), Lookup::Known(u(1100)));
+    // Something makes the pool reload (an event we can't apply).
+    let weird = lg(a(V2P), vec![topic("FeeChanged(uint256)")], data(&[u(1)]), 102, 0, 0);
+    r.intake.process(msg(102, 62, vec![weird]));
+    r.settle();
+    assert_eq!(r.state(&v2_pool()).0, PoolState::Ready, "{:?}", r.state(&v2_pool()));
+    assert_eq!(r.head_slot(a(COIN0), map_slot(a(V2P), 0)), Lookup::Missing, "a balance two sources disagree on must be MISSING");
+    // The other coin agreed: still followed.
+    assert_eq!(r.head_slot(a(COIN1), map_slot(a(V2P), 0)), Lookup::Known(u(4000)));
+    assert_eq!(r.h.c2.stats.coin_balance_disagree.load(std::sync::atomic::Ordering::Relaxed), 1);
+}
+
+/// Chainstack under a plan SHARED with another program (the live bot): it
+/// lets `limit` HTTP requests per second through for us; more and every
+/// value in the request is answered -32005 "You've exceeded the RPS limit".
+/// In front of it, our node client's real speed limit (node.rs Budget),
+/// which sees those answers exactly like NodeClient does (Budget::observe).
+struct SharedPlan {
+    chain: Arc<FakeChain>,
+    limit: u64,
+    window: Mutex<std::collections::VecDeque<std::time::Instant>>,
+    log: Mutex<Vec<(std::time::Instant, bool)>>,
+    budget: arbsim::node::Budget,
+}
+impl NodeApi for SharedPlan {
+    fn call_batch(&self, c: Class, calls: &[(&str, Value)]) -> Result<Vec<CallResult>, NodeErr> {
+        let mut out = Vec::new();
+        for ch in calls.chunks(25) {
+            self.budget.take(c, 1)?;
+            std::thread::sleep(std::time::Duration::from_millis(15));
+            let now = std::time::Instant::now();
+            let ok = {
+                let mut w = self.window.lock().unwrap();
+                while w.front().is_some_and(|t| now.duration_since(*t) >= std::time::Duration::from_secs(1)) {
+                    w.pop_front();
+                }
+                let ok = (w.len() as u64) < self.limit;
+                if ok {
+                    w.push_back(now);
+                }
+                ok
+            };
+            self.log.lock().unwrap().push((now, ok));
+            let ans: Result<Vec<CallResult>, NodeErr> = if ok {
+                self.chain.call_batch(c, ch)
+            } else {
+                Ok(ch.iter().map(|_| Err(RpcErr { code: -32005, message: "You've exceeded the RPS limit available on the current plan.".into() })).collect())
+            };
+            self.budget.observe(&ans);
+            out.extend(ans?);
+        }
+        Ok(out)
+    }
+    fn call_batch_paid(&self, c: Class, calls: &[(&str, Value)]) -> Result<Vec<CallResult>, NodeErr> {
+        self.call_batch(c, calls)
+    }
+    fn usage(&self) -> Value {
+        self.budget.usage()
+    }
+}
+
+#[test]
+fn provider_refusing_for_rps_makes_us_slow_down_instead_of_storming() {
+    // Dry run #16: our limit 100/s, the shared plan refused us (-32005) and
+    // we kept sending ~95/s for 10 minutes. Here: our limit 60/s, the plan
+    // lets 20/s through; 300 pools to load and checks asking for values.
+    use std::time::{Duration, Instant};
+    let chain = Arc::new(FakeChain::new());
+    let pool_addr = |i: u16| {
+        let mut b = [0u8; 20];
+        b[0] = 0x66;
+        b[18..].copy_from_slice(&i.to_be_bytes());
+        Address::from(b)
+    };
+    let n = 300u16;
+    let mut s = genesis();
+    let mut pj = Vec::new();
+    for i in 0..n {
+        let p = pool_addr(i);
+        let st = s.entry(p).or_default();
+        st.insert(u(0), u(2000));
+        st.insert(u(6), addr_word(a(COIN0)));
+        st.insert(u(7), addr_word(a(COIN1)));
+        st.insert(u(8), u(1000) | (u(4000) << 112usize) | (u(1000) << 224usize));
+        s.get_mut(&a(COIN0)).unwrap().insert(map_slot(p, 0), u(1000));
+        s.get_mut(&a(COIN1)).unwrap().insert(map_slot(p, 0), u(4000));
+        pj.push(json!({"address": format!("{p}"), "kind": "v2", "token0": format!("{}", a(COIN0)), "token1": format!("{}", a(COIN1))}));
+    }
+    chain.set(100, s);
+    let node = Arc::new(SharedPlan { chain: chain.clone(), limit: 20, window: Mutex::new(Default::default()), log: Mutex::new(Vec::new()), budget: arbsim::node::Budget::new(u64::MAX / 4, 60.0, None) });
+    let sh = Shared::new(Config::for_tests(), Some(node.clone() as Arc<dyn NodeApi>), Arc::new(Volatile::default()));
+    let cfg = C2Config { loaders: 16, load_batch: 1, reload_ms: 1000, ..C2Config::for_tests() };
+    let h = arbsim::copy2::intake::spawn(sh.clone(), Arc::new(FillQueue::new(100_000, 100)), cfg);
+    h.coin_slots_json(&json!(1), &json!({"coinSlots": {format!("{}", a(COIN0)): {"layout": "solidity", "slot": 0}, format!("{}", a(COIN1)): {"layout": "solidity", "slot": 0}}}));
+    assert_eq!(h.track_json(&json!(2), &json!({"pools": pj}))["tracked"], json!(n as u64));
+    let t0 = Instant::now();
+    let mut b = 100u64;
+    while t0.elapsed() < Duration::from_secs(10) {
+        let mut m = tick(b, 1000 + b);
+        m.prev_block = if b > 100 { Some(b - 1) } else { None };
+        h.block(m);
+        b += 1;
+        let miss: Vec<MissItem> = (0..10u64).map(|i| MissItem::Slot(a(USER), U256::from(b * 1000 + i))).collect();
+        h.fill(miss);
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let log = node.log.lock().unwrap().clone();
+    let late: Vec<&(Instant, bool)> = log.iter().filter(|x| x.0.duration_since(t0) >= Duration::from_secs(5)).collect();
+    let sent = late.len() as f64 / 5.0;
+    let refused = late.iter().filter(|x| !x.1).count() as f64 / late.len().max(1) as f64;
+    let st = h.status_json(false);
+    eprintln!("shared plan: last 5 s: {sent:.1} requests/s, {:.0} % refused; ready {}; nodeRate {}; status {}", refused * 100.0, st["ready"], st["nodeRate"], st);
+    assert!(sent <= 32.0, "still sending {sent:.1}/s into a plan that lets 20/s through");
+    assert!(refused <= 0.35, "{:.0} % of requests refused in the last 5 s: no storm allowed", refused * 100.0);
+    assert!(st["nodeRate"]["providerRefusals"].as_u64().unwrap() > 0, "{st}");
+    assert!(st["counters"]["node_refusals"].as_u64().unwrap() > 0, "{st}");
+    assert!(st["ready"].as_u64().unwrap() > 0, "loading must go on (slower): {st}");
+    h.stop();
+}

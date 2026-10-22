@@ -55,7 +55,16 @@
 //      applied to it (exact: its state hasn't moved since) and written into
 //      every kept version from N on. Otherwise that pool alone is unsure.
 //      Same for coin Transfers (per coin + pool). Only `removed` reports are
-//      a reorg.
+//      a reorg. A late coin Transfer is also added to a load that is
+//      waiting for node values PAST its place (it would never see it).
+//      The same report twice in one message is applied once.
+//   6b. Coin balances, belt and braces (dry run #16): when a pool is
+//      reloaded while the copy already follows its coin balance, the two
+//      values must agree; if not, the balance becomes MISSING.
+//   6c. The node refusing us for going too fast ("exceeded the RPS limit"):
+//      no new first loads / fills for 1-4 s, waiting loads only wait and
+//      ask again (never restart: a restart asks for everything again), and
+//      the node client slows down by itself (node.rs, adaptive limit).
 //   7. Where a coin keeps a pool's balance: the coin's general layout (probe,
 //      or the bot's `coin_slots`), else EXACTLY per pool: debug_traceCall of
 //      balanceOf(pool) with the prestate tracer lists the coin storage slots
@@ -407,6 +416,7 @@ c2counters!(
     load_failed, unsure_marked, need_item_rounds, node_errors, fills, fill_items, fill_refused, fill_retry,
     probes, probe_not_found, probe_errors, track_msgs, dropped_msgs, carried_events, carry_too_old, merges, apply_us_max,
     late_reports_applied, late_reports_unsure, coin_slot_msgs, throttled, layouts_guessed, coin_traces, coin_trace_found, coin_trace_not_found,
+    coin_balance_disagree, duplicate_logs, late_transfers_to_loading, node_refusals, need_refusal_retries,
 );
 
 fn inc(c: &AtomicU64) {
@@ -653,6 +663,13 @@ impl Copy2Handle {
             "counters": Value::Object(self.c2.stats.json()),
             "loader": self.c2.loader.json(),
             "missesByClass": self.c2.misses.lock().unwrap().clone(),
+            // The node client's adaptive speed limit (dry run #16): the rate
+            // allowed now, the plan rate, refusals by the provider.
+            "nodeRate": self.sh.node.as_ref().map(|n| {
+                let u = n.usage();
+                json!({ "rpsNow": u["rpsNow"], "rpsMax": u["rps"], "providerRefusals": u["providerRefusals"],
+                        "rateCuts": u["rateCuts"], "secondsSinceRefusal": u["secondsSinceRefusal"] })
+            }),
         });
         if with_pools {
             let list: Vec<Value> = reg
@@ -704,6 +721,13 @@ pub struct C2Config {
     pub max_rounds: u32,
     /// Node tip check for status [ARBSIM_COPY2_TIP_EVERY_S, 30].
     pub tip_every_s: u64,
+    /// A catch-up fetch (values a waiting load needs, read AT the block
+    /// before its report) older than this many blocks restarts the pool's
+    /// load at the newest block instead [ARBSIM_COPY2_CATCHUP_MAX_BLOCKS, 64]
+    /// (old blocks are slower reads). Never while the node is refusing us for
+    /// going too fast: a restart asks for EVERYTHING the pool held again,
+    /// which turned a short refusal into a request storm (dry run #16).
+    pub catchup_max_blocks: u64,
 }
 
 impl C2Config {
@@ -718,10 +742,11 @@ impl C2Config {
             max_keep_blocks: env_u64("ARBSIM_COPY2_MAX_KEEP_BLOCKS", 40_000).clamp(16, 1_000_000) as usize,
             max_rounds: env_u64("ARBSIM_COPY2_MAX_ROUNDS", 40).clamp(1, 1000) as u32,
             tip_every_s: env_u64("ARBSIM_COPY2_TIP_EVERY_S", 30),
+            catchup_max_blocks: env_u64("ARBSIM_COPY2_CATCHUP_MAX_BLOCKS", 64).max(2),
         }
     }
     pub fn for_tests() -> Self {
-        C2Config { reload_ms: 0, reload_max_ms: 0, layout_retry_s: 3600, load_batch: 25, loaders: 2, keep_blocks: 400, max_keep_blocks: 4000, max_rounds: 40, tip_every_s: 0 }
+        C2Config { reload_ms: 0, reload_max_ms: 0, layout_retry_s: 3600, load_batch: 25, loaders: 2, keep_blocks: 400, max_keep_blocks: 4000, max_rounds: 40, tip_every_s: 0, catchup_max_blocks: 64 }
     }
 }
 
@@ -747,8 +772,19 @@ struct Partial {
     /// Next report to apply (everything before it is in `ov`).
     cursor: Pos,
     gen: u64,
-    /// Node errors in a row while fetching for it.
+    /// Node errors in a row while fetching for it (decides the wait).
     errors: u32,
+    /// Of those, real errors (not "too fast" refusals): 10 in a row restart
+    /// the load. Refusals alone never do (they only wait, see on_need).
+    hard_errors: u32,
+    /// Fetches refused for the RPS limit in a row (while > 0 the catch-up
+    /// block may be old: see C2Config::catchup_max_blocks).
+    refusals: u32,
+    /// Its coin balances are node values as of the end of this position
+    /// (a load fetched at block b: (b, END, END)). A late coin Transfer
+    /// after `base` and before `cursor` is not in them and must be added
+    /// (on_late). (0,0,0) = it holds no coin balance of its own.
+    base: Pos,
 }
 
 /// What a node job was for.
@@ -837,6 +873,14 @@ pub struct Intake {
     last_evict: Instant,
     /// Current load round: (started, requests before, pools).
     round: Option<(Instant, u64, usize)>,
+    /// The node refused us for going too fast ("exceeded the RPS limit"):
+    /// no new first loads / fills before this (1 s, doubling to 4 s while
+    /// refusals go on; answers of jobs that were in flight together count
+    /// once per second; catch-ups of waiting loads go on with their own
+    /// waits). (until, step, when the step last grew)
+    refusing: Option<(Instant, u32, Instant)>,
+    /// Fill items to ask again a little later (not in a tight loop).
+    fill_later: Vec<(Instant, MissItem)>,
 }
 
 /// Start the intake thread (+ loader threads).
@@ -905,6 +949,8 @@ pub fn manual(sh: Arc<Shared>, fills: Arc<FillQueue>, cfg: C2Config) -> (Intake,
         last_tip: None,
         last_evict: Instant::now(),
         round: None,
+        refusing: None,
+        fill_later: Vec::new(),
     };
     (i, Copy2Handle { tx, sh, c2 })
 }
@@ -1224,10 +1270,15 @@ impl Intake {
 
     /// Apply one block message (or tick), publish the result. Never waits
     /// for the node.
-    pub fn process(&mut self, m: BlockMsg) {
+    pub fn process(&mut self, mut m: BlockMsg) {
         let t0 = Instant::now();
         let c2 = self.c2.clone();
         let st = &c2.stats;
+        // The same report twice in one message (the bot hears a transfer
+        // between two of our pools on BOTH its "from our pools" and "to our
+        // pools" subscriptions): keep it once. Applying it twice moved both
+        // pools' balances twice, for good (dry run #16).
+        add(&st.duplicate_logs, dedup_logs(&mut m.logs) as u64);
         // Lost message? The bot's previous message (prevBlock) must be one we
         // got. (Late messages for older blocks are normal, see header.)
         if let (Some(prev), Some(&first)) = (m.prev_block, self.received.first()) {
@@ -1423,6 +1474,7 @@ impl Intake {
                 }
             }
             self.apply_coin_transfer(&mut ov, log, pos, true);
+            self.late_transfer_to_partials(log, pos);
         }
         // Write the result into every kept version from block n on (the
         // pools / balances it changed did not move after n, see above).
@@ -1694,6 +1746,42 @@ impl Intake {
         true
     }
 
+    /// A late coin Transfer and the loads that are WAITING (for node
+    /// values) past its place: the buffer gets the report, but such a load
+    /// has already carried its working copy beyond it and would never see
+    /// it. Its coin balance is a node value from its load block (`base`)
+    /// plus the transfers since, so a transfer after `base` and before its
+    /// cursor is added to it now (adding is exact in any order; a balance
+    /// that would go below zero is forgotten instead). Before this fix the
+    /// transfer was simply lost and the pool became ready with a balance
+    /// off by exactly that amount, for good (dry run #16, 0x52e65b17).
+    fn late_transfer_to_partials(&mut self, log: &PoolLog, pos: Pos) {
+        let Some((coin, from, to, v)) = coin_transfer(log) else { return };
+        let keys: Vec<PoolKey> = self.partials.iter().filter(|(k, p)| (k.0 == from || k.0 == to) && p.base < pos && pos < p.cursor).map(|(k, _)| *k).collect();
+        for k in keys {
+            let slot = {
+                let reg = self.c2.reg.read().unwrap();
+                match reg.pools.get(&k) {
+                    Some(e) if e.pool.token0 == coin || e.pool.token1 == coin => reg.bal_slot(coin, k.0),
+                    _ => None,
+                }
+            };
+            let (Some(slot), Some(part)) = (slot, self.partials.get_mut(&k)) else { continue };
+            inc(&self.c2.stats.late_transfers_to_loading);
+            for (side, is_from) in [(from, true), (to, false)] {
+                if side != k.0 {
+                    continue;
+                }
+                if let Lookup::Known(cur) = part.ov.slot(coin, slot) {
+                    match if is_from { cur.checked_sub(v) } else { cur.checked_add(v) } {
+                        Some(x) => part.ov.set_slot(coin, slot, x),
+                        None => part.ov.forget_slot(coin, slot),
+                    }
+                }
+            }
+        }
+    }
+
     // ---- unsure ----
     fn backoff(&self, strikes: u32, reason: &str) -> Duration {
         if reason.starts_with("layout") || reason.starts_with("coin") {
@@ -1813,7 +1901,7 @@ impl Intake {
         // finish steadily instead of in late lumps), at least 2 jobs.
         // At most one queued/running load job per worker.
         let max_jobs = self.cfg.loaders;
-        if self.load_jobs_in_flight() >= max_jobs {
+        if self.load_jobs_in_flight() >= max_jobs || self.refusing_now() {
             return;
         }
         // "Not found" is asked again after a while (it may have been a bad moment).
@@ -2004,6 +2092,7 @@ impl Intake {
 
     // ---- node answers ----
     fn on_done(&mut self, d: Done) {
+        self.note_refusals(&d);
         let id = match &d {
             Done::Fetch { id, .. } | Done::Probe { id, .. } | Done::Tip { id, .. } | Done::Trace { id, .. } => *id,
         };
@@ -2154,6 +2243,38 @@ impl Intake {
             inc(&self.c2.stats.node_errors);
             self.outcomes.node_error += 1;
         }
+    }
+
+    /// Did a node answer contain a "too fast" refusal (RPS limit)? Then no
+    /// new first loads / fills for a while (1 s doubling to 4 s while it
+    /// goes on); an answer without one ends that.
+    fn note_refusals(&mut self, d: &Done) {
+        let refused = match d {
+            Done::Fetch { res: Ok(o), .. } => {
+                o.items.iter().any(|(_, r)| matches!(r, Err(ItemErr::Other(m)) if is_refusal(m))) || o.calls.iter().any(|c| matches!(c, Err(m) if is_refusal(m)))
+            }
+            Done::Fetch { res: Err(e), .. } | Done::Probe { res: Err(e), .. } | Done::Tip { res: Err(e), .. } | Done::Trace { res: Err(e), .. } => is_refusal(&e.to_string()),
+            _ => false,
+        };
+        if refused {
+            inc(&self.c2.stats.node_refusals);
+            let now = Instant::now();
+            let (n, grew) = match self.refusing {
+                // 16 jobs in flight refused at once = one step, not 16.
+                Some((_, n, g)) if now.duration_since(g) < Duration::from_secs(1) => (n, g),
+                Some((_, n, _)) => (n + 1, now),
+                None => (1, now),
+            };
+            let wait = Duration::from_millis(1000u64 << (n - 1).min(2));
+            self.refusing = Some((now + wait, n, grew));
+        } else if matches!(d, Done::Fetch { res: Ok(_), .. }) && self.refusing.is_some_and(|r| r.0 <= Instant::now()) {
+            self.refusing = None;
+        }
+    }
+
+    /// Is the node refusing us right now (no new bulk work)?
+    fn refusing_now(&self) -> bool {
+        self.refusing.is_some_and(|r| r.0 > Instant::now())
     }
 
     /// retry_later without counting (the job's error was counted once).
@@ -2312,7 +2433,7 @@ impl Intake {
         for f in &facts {
             ov.learn(f);
         }
-        self.continue_partial(r.key, Partial { ov, cursor: (block + 1, 0, 0), gen: r.gen, errors: 0 });
+        self.continue_partial(r.key, Partial { ov, cursor: (block + 1, 0, 0), gen: r.gen, errors: 0, hard_errors: 0, refusals: 0, base: (block, END, END) });
     }
 
     fn on_need(&mut self, key: PoolKey, gen: u64, items: Vec<MissItem>, block: u64, res: Result<FetchOut, crate::node::NodeErr>) {
@@ -2344,8 +2465,21 @@ impl Intake {
                 return;
             }
             part.errors += 1;
+            // "Too fast" (RPS limit): only wait and ask again (1, 2, 4 s; the
+            // node client has slowed down meanwhile). It never restarts the
+            // load: that would ask for everything the pool held again (the
+            // storm of dry run #16). Real errors: 10 in a row restart it.
+            if is_refusal(&why) {
+                part.refusals += 1;
+                inc(&self.c2.stats.need_refusal_retries);
+                let wait = backoff(part.refusals.min(3));
+                self.partials.insert(key, part);
+                self.delayed.push((Instant::now() + wait, key, gen, items));
+                return;
+            }
+            part.hard_errors += 1;
             let errs = part.errors;
-            if part.errors >= 10 {
+            if part.hard_errors >= 10 {
                 self.partials.insert(key, part);
                 self.retry_later(key, gen, &why);
             } else {
@@ -2355,6 +2489,8 @@ impl Intake {
             return;
         }
         part.errors = 0;
+        part.hard_errors = 0;
+        part.refusals = 0;
         for (_, f) in &res.unwrap().items {
             if let Ok(f) = f {
                 part.ov.learn(&fact_of(f));
@@ -2394,9 +2530,13 @@ impl Intake {
     fn send_need_job(&mut self, key: PoolKey, part: Partial, items: Vec<MissItem>) {
         let gen = part.gen;
         let at = part.cursor.0.saturating_sub(1);
-        // An old block is a slow archive read on this node: start the load
-        // over at the newest block instead (it then carries only a few blocks).
-        if self.last_block.unwrap_or(0).saturating_sub(at) > 8 {
+        // An old block is a slower read on this node: start the load over at
+        // the newest block instead (it then carries only a few blocks). Not
+        // while the node refuses us for going too fast (a restart asks for
+        // everything again), unless it got really old (half the kept reports).
+        let age = self.last_block.unwrap_or(0).saturating_sub(at);
+        let limit = if part.refusals > 0 { (self.cfg.keep_blocks as u64 / 2).max(self.cfg.catchup_max_blocks) } else { self.cfg.catchup_max_blocks };
+        if age > limit {
             self.partials.insert(key, part);
             self.retry_later_quiet(key, gen, "catch-up block too old, reloading at the newest block");
             if let Some(e) = self.c2.reg.write().unwrap().pools.get_mut(&key) {
@@ -2442,20 +2582,15 @@ impl Intake {
                 }
             }
         }
-        let bals: Vec<(Address, U256)> = {
-            let reg = self.c2.reg.read().unwrap();
-            [pool.token0, pool.token1].into_iter().filter_map(|c| reg.bal_slot(c, pool.address).map(|s| (c, s))).collect()
-        };
-        for (c, s) in bals {
-            if let Lookup::Known(v) = ov.slot(c, s) {
-                part.learn(&Fact::Slot(c, s, v));
-            }
-        }
-        // The block copy no longer vouches for it.
+        // Its coin balances are NOT copied: the block copy keeps following
+        // them from Transfers (it holds them), and the merge keeps the block
+        // copy's value. (A copy here would be a second, unchecked version of
+        // the same number; see late_transfer_to_partials / merge.)
+        // The block copy no longer vouches for its own values.
         for (a, s) in &owned_items {
             ov.forget_slot(*a, *s);
         }
-        self.send_need(k, Partial { ov: part, cursor, gen, errors: 0 }, items);
+        self.send_need(k, Partial { ov: part, cursor, gen, errors: 0, hard_errors: 0, refusals: 0, base: (0, 0, 0) }, items);
     }
 
     /// Carry a working copy forward through the buffered reports up to the
@@ -2567,6 +2702,41 @@ impl Intake {
             (e.pool.clone(), reg.holders.keys().copied().collect::<HashSet<Address>>(), e.owned.clone(), bs)
         };
         let snap = part.ov.snapshot();
+        // Safety net (dry run #16): a coin balance the copy already follows
+        // must agree with this load's own value (node value carried to the
+        // same block through the same reports). If they differ, one of them
+        // is wrong and we can't tell which: the balance becomes MISSING in
+        // every kept version (a check then misses it and a fill reads it).
+        let mut disagree: Vec<(Address, U256)> = Vec::new();
+        for (c, sl) in &bal_slots {
+            if let (Lookup::Known(mine), Lookup::Known(theirs)) = (snap.storage(*c, *sl), head.snap.storage(*c, *sl)) {
+                if mine != theirs {
+                    inc(&self.c2.stats.coin_balance_disagree);
+                    let delta = if mine >= theirs { format!("+{}", mine - theirs) } else { format!("-{}", theirs - mine) };
+                    eprintln!(
+                        "[arbsim] copy2: coin {c} balance of {} pool {}: the copy followed {theirs} but its reload says {mine} at block {} (load minus copy {delta}); forgetting it (MISSING until read again)",
+                        kind_name(pool.kind), pool.address, head.block
+                    );
+                    disagree.push((*c, *sl));
+                }
+            }
+        }
+        if !disagree.is_empty() {
+            let mut p = self.sh.published.write().unwrap();
+            rewrite_from(&mut p.versions, 0, |s| {
+                for (a, sl) in &disagree {
+                    forget_slot(s, *a, *sl);
+                }
+            });
+            drop(p);
+            for (c, _) in &disagree {
+                self.coin_pos.remove(&(*c, pool.address));
+            }
+        }
+        let head = match self.sh.head() {
+            Some(h) => h,
+            None => return,
+        };
         // Accounts the pool's own replays change (e.g. an Algebra plugin)
         // are its own; other accounts (coins, a factory, an implementation)
         // are shared: their values are put in, but not followed with it.
@@ -2591,6 +2761,9 @@ impl Intake {
             for (s, v) in acct.storage.iter() {
                 if own {
                     items.insert((*addr, *s));
+                }
+                if disagree.contains(&(*addr, *s)) {
+                    continue;
                 }
                 facts.push(Fact::Slot(*addr, *s, *v));
             }
@@ -2619,8 +2792,10 @@ impl Intake {
         self.outcomes.ready += 1;
         // Everything up to the end of this block is in it now.
         self.last_pos.insert(key, (head.block, END, END));
-        for (c, _) in &bal_slots {
-            self.coin_pos.insert((*c, pool.address), (head.block, END, END));
+        for (c, sl) in &bal_slots {
+            if !disagree.contains(&(*c, *sl)) {
+                self.coin_pos.insert((*c, pool.address), (head.block, END, END));
+            }
         }
         let mut reg = self.c2.reg.write().unwrap();
         if let Some(e) = reg.pools.get_mut(&key) {
@@ -2660,7 +2835,13 @@ impl Intake {
         // One fill job at a time (so fills use at most one worker), at most
         // 100 values grouped into one eth_getProof per account; values of
         // pools that aren't ready are refused (their load brings them).
-        if self.loaders.is_none() || self.jobs.values().any(|j| matches!(j, JobFor::Fill)) {
+        if !self.fill_later.is_empty() {
+            let now = Instant::now();
+            let (due, wait): (Vec<_>, Vec<_>) = std::mem::take(&mut self.fill_later).into_iter().partition(|x| x.0 <= now);
+            self.fill_later = wait;
+            self.fills.push(due.into_iter().map(|x| x.1));
+        }
+        if self.loaders.is_none() || self.refusing_now() || self.jobs.values().any(|j| matches!(j, JobFor::Fill)) {
             return;
         }
         let items = self.fills.take(100);
@@ -2724,7 +2905,17 @@ impl Intake {
                     if let Some(g) = Self::gate_of(&reg, *a, *s) {
                         let keys = reg.pools_of(&g);
                         let all_ok = keys.iter().all(|pk| reg.pools.get(pk).is_some_and(|e| e.state == PoolState::Ready && e.ready_since <= k));
-                        let quiet = self.touched_addr.get(&g).is_none_or(|b| *b <= k);
+                        // A slot of ONE ordinary pool (or its own account)
+                        // that has been ready since k: every change its
+                        // events made after k is in the versions' changes
+                        // (a replay can't write a slot it doesn't hold
+                        // without asking for it first, which takes the pool
+                        // out of ready), so the value is carried forward
+                        // exactly; no need to ask again because the pool
+                        // traded. Coin balances and the shared V4
+                        // PoolManager keep the strict rule.
+                        let own_slot = (reg.by_addr.get(a).is_some_and(|v| v.len() == 1 && v[0].1.is_none()) || reg.owner_of.contains_key(a)) && keys.len() == 1;
+                        let quiet = own_slot || self.touched_addr.get(&g).is_none_or(|b| *b <= k);
                         if !all_ok {
                             continue; // refused: the pool isn't followed right now
                         }
@@ -2752,8 +2943,11 @@ impl Intake {
             }
         }
         if !again.is_empty() {
+            // Asked again in ~1 s (the node trails the copy by a few blocks;
+            // asking at once just repeats the same answer).
             add(&self.c2.stats.fill_retry, again.len() as u64);
-            self.fills.push(again);
+            let at = Instant::now() + Duration::from_millis(1000);
+            self.fill_later.extend(again.into_iter().map(|m| (at, m)));
         }
         if good.is_empty() {
             return;
@@ -2995,6 +3189,20 @@ fn backoff(n: u32) -> Duration {
     let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0);
     let jitter = 0.75 + 0.5 * (nanos % 1000) as f64 / 1000.0;
     Duration::from_secs_f64(base * jitter)
+}
+
+/// A "too fast" refusal from the provider (RPS limit), as error text.
+fn is_refusal(m: &str) -> bool {
+    crate::node::is_rate_refusal(0, m)
+}
+
+/// Drop repeated reports (same transaction, log index and `removed` flag),
+/// keeping the first. Returns how many were dropped.
+fn dedup_logs(logs: &mut Vec<PoolLog>) -> usize {
+    let before = logs.len();
+    let mut seen: HashSet<(LogId, bool)> = HashSet::with_capacity(before);
+    logs.retain(|l| seen.insert((log_id(l), l.removed)));
+    before - logs.len()
 }
 
 /// A report's identity: (tx index, log index, tx hash).

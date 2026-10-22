@@ -6,7 +6,15 @@
 //   The sidecar keeps its own copy of the chain. Sometimes it needs a fact it
 //   doesn't have ("what is in storage slot X of pool P at block N?"). This
 //   file asks the node, with three safety rails:
-//     1. SPEED LIMIT  (ARBSIM_NODE_RPS, default 8 requests/second).
+//     1. SPEED LIMIT  (ARBSIM_NODE_RPS, default 8 requests/second). It is
+//        ADAPTIVE (dry run #16): the paid plan is shared with the live bot,
+//        so when the provider answers "You've exceeded the RPS limit"
+//        (-32005 / HTTP 429) our allowed rate is halved at once (at most
+//        once per second, never below ARBSIM_NODE_MIN_RPS, default 2), and
+//        it creeps back up by 5 % of ARBSIM_NODE_RPS per second once 2 s
+//        pass without a refusal. So we never keep hammering at our own cap
+//        while the provider refuses. Counted in status (providerRefusals,
+//        rateCuts, rpsNow).
 //     2. DAILY ALLOWANCE (ARBSIM_NODE_DAILY_CAP, default 6,000 requests/day,
 //        counted per call inside a batch, saved to a small file so restarts
 //        don't reset it, new day at midnight UTC). Different jobs may use
@@ -171,6 +179,8 @@ pub struct Budget {
     /// safety valve only. Requests normally WAIT their turn (copy 2 paces
     /// itself so the queue stays short); beyond this they are refused.
     pub max_queue: Duration,
+    /// Lowest rate the adaptive limit may cut to [ARBSIM_NODE_MIN_RPS, 2].
+    pub min_rps: f64,
 }
 
 struct BudgetInner {
@@ -183,6 +193,36 @@ struct BudgetInner {
     vt: [Instant; 2],
     last_save: Instant,
     unsaved: u64,
+    /// Adaptive limit: the rate allowed right now (<= rps), when it was last
+    /// brought up to date, the last refusal and the last cut.
+    rate: f64,
+    rate_at: Instant,
+    last_refusal: Option<Instant>,
+    last_cut: Option<Instant>,
+    /// Provider refusals seen ("exceeded the RPS limit" / 429) and cuts made
+    /// (since start).
+    provider_refusals: u64,
+    cuts: u64,
+}
+
+/// Seconds without a refusal before the adaptive rate starts to recover.
+const RECOVER_AFTER_S: f64 = 2.0;
+/// Recovery speed: this share of ARBSIM_NODE_RPS per second.
+const RECOVER_PER_S: f64 = 0.05;
+
+/// Does this node error mean "the provider refused us for going too fast"
+/// (Chainstack: code -32005 "You've exceeded the RPS limit available on the
+/// current plan", or HTTP 429)? NOT a size limit or a missing block.
+pub fn is_rate_refusal(code: i64, message: &str) -> bool {
+    let m = message.to_ascii_lowercase();
+    code == -32005
+        || code == 429
+        || m.contains("rps limit")
+        || m.contains("rate limit")
+        || m.contains("too many requests")
+        || m.contains("exceeded the rps")
+        || m.contains("request limit reached")
+        || m.contains("(429)")
 }
 
 fn utc_day() -> u64 {
@@ -205,6 +245,12 @@ impl Budget {
             vt: [Instant::now(), Instant::now()],
             last_save: Instant::now(),
             unsaved: 0,
+            rate: rps.max(0.1),
+            rate_at: Instant::now(),
+            last_refusal: None,
+            last_cut: None,
+            provider_refusals: 0,
+            cuts: 0,
         };
         // Pick up today's count from the file (restarts don't reset it).
         if let Some(f) = &file {
@@ -217,7 +263,60 @@ impl Budget {
             }
         }
         let max_queue = Duration::from_millis(env_u64("ARBSIM_NODE_MAX_QUEUE_MS", 10_000).max(100));
-        Budget { cap, rps: rps.max(0.1), burst: rps.max(1.0), file, inner: Mutex::new(b), max_queue }
+        let min_rps = std::env::var("ARBSIM_NODE_MIN_RPS").ok().and_then(|s| s.parse::<f64>().ok()).unwrap_or(2.0).max(0.1).min(rps.max(0.1));
+        Budget { cap, rps: rps.max(0.1), burst: rps.max(1.0), file, inner: Mutex::new(b), max_queue, min_rps }
+    }
+
+    /// The adaptive rate right now (brought up to date: recovers by 5 % of
+    /// the full rate per second once RECOVER_AFTER_S passed without a refusal).
+    fn rate_now(&self, b: &mut BudgetInner, now: Instant) -> f64 {
+        let el = now.duration_since(b.rate_at).as_secs_f64();
+        b.rate_at = now;
+        let quiet = b.last_refusal.map_or(f64::MAX, |t| now.duration_since(t).as_secs_f64());
+        if quiet >= RECOVER_AFTER_S && b.rate < self.rps {
+            // Only the part of `el` after the quiet period counts.
+            let grow_s = el.min(quiet - RECOVER_AFTER_S);
+            b.rate = (b.rate + RECOVER_PER_S * self.rps * grow_s).min(self.rps);
+        }
+        b.rate
+    }
+
+    /// The provider refused a request for going too fast: halve the rate
+    /// (at most once per second, so 16 refusals in flight at once count as
+    /// one), drop any saved-up burst. Returns the new rate.
+    pub fn note_refusal(&self) -> f64 {
+        let mut b = self.inner.lock().unwrap();
+        let now = Instant::now();
+        let cur = self.rate_now(&mut b, now);
+        b.provider_refusals += 1;
+        b.last_refusal = Some(now);
+        if b.last_cut.is_none_or(|t| now.duration_since(t) >= Duration::from_secs(1)) {
+            b.rate = (cur / 2.0).max(self.min_rps);
+            b.last_cut = Some(now);
+            b.cuts += 1;
+            b.tokens = b.tokens.min(0.0);
+        }
+        b.rate
+    }
+
+    /// Look at one answer for provider refusals (whole request or any item
+    /// inside a batch); cut the rate if so. Returns true if it was refused.
+    pub fn observe(&self, answer: &Result<Vec<CallResult>, NodeErr>) -> bool {
+        let refused = match answer {
+            Ok(rs) => rs.iter().any(|r| matches!(r, Err(e) if is_rate_refusal(e.code, &e.message))),
+            Err(NodeErr::Transport(m)) | Err(NodeErr::BadResponse(m)) => is_rate_refusal(0, m),
+            Err(_) => false,
+        };
+        if refused {
+            self.note_refusal();
+        }
+        refused
+    }
+
+    /// The rate allowed right now (requests per second).
+    pub fn current_rps(&self) -> f64 {
+        let mut b = self.inner.lock().unwrap();
+        self.rate_now(&mut b, Instant::now())
     }
 
     /// From env: ARBSIM_NODE_DAILY_CAP (6000), ARBSIM_NODE_RPS (8),
@@ -264,20 +363,23 @@ impl Budget {
                 self.save(&b);
             }
         }
-        // Speed limit: wait for the tokens.
+        // Speed limit: wait for the tokens (at the adaptive rate; the burst
+        // shrinks with it).
         let need = n as f64;
         loop {
             let wait = {
                 let mut b = self.inner.lock().unwrap();
                 let now = Instant::now();
+                let rate = self.rate_now(&mut b, now);
+                let burst = (self.burst * rate / self.rps).max(1.0);
                 let el = now.duration_since(b.vt[0]).as_secs_f64();
                 b.vt[0] = now;
-                b.tokens = (b.tokens + el * self.rps).min(self.burst.max(need));
+                b.tokens = (b.tokens + el * rate).min(burst.max(need));
                 if b.tokens >= need {
                     b.tokens -= need;
                     return Ok(());
                 }
-                Duration::from_secs_f64(((need - b.tokens) / self.rps).clamp(0.001, 1.0))
+                Duration::from_secs_f64(((need - b.tokens) / rate).clamp(0.001, 1.0))
             };
             std::thread::sleep(wait);
         }
@@ -295,13 +397,16 @@ impl Budget {
 
     /// Requests used today, the cap, and per-class counts.
     pub fn usage(&self) -> Value {
-        let b = self.inner.lock().unwrap();
+        let mut b = self.inner.lock().unwrap();
+        let rate = self.rate_now(&mut b, Instant::now());
         let mut per = serde_json::Map::new();
         for c in Class::ALL {
             per.insert(c.name().into(), Value::from(b.per_class[class_idx(c)]));
         }
         json!({ "usedToday": b.used, "cap": self.cap, "refusedToday": b.refused, "byClass": per, "utcDay": b.day,
-                "rps": self.rps, "tokens": (b.tokens * 10.0).round() / 10.0 })
+                "rps": self.rps, "rpsNow": (rate * 10.0).round() / 10.0, "tokens": (b.tokens * 10.0).round() / 10.0,
+                "providerRefusals": b.provider_refusals, "rateCuts": b.cuts,
+                "secondsSinceRefusal": b.last_refusal.map(|t| t.elapsed().as_secs()) })
     }
 
     /// Used so far today (for tests / status).
@@ -486,6 +591,8 @@ impl NodeClient {
                 Ok(v) => split_batch_answer(v, todo.len()),
                 Err(e) => Err(e),
             };
+            // The provider said "too fast": cut our rate (adaptive limit).
+            self.budgets[ep.budget].observe(&answer);
             if paid_first {
                 log_http(ep.label, &todo.iter().map(|k| &chunk[*k]).collect::<Vec<_>>(), total_ms, &answer);
             }
@@ -882,6 +989,60 @@ mod tests {
         assert!(total <= 100 + 150 + 16, "over the limit: {total}");
         assert!(total >= 200, "too slow: {total}");
         assert!(counts.iter().all(|c| c.load(Ordering::Relaxed) > 0), "somebody starved");
+    }
+
+    #[test]
+    fn provider_refusals_halve_the_rate_once_per_second_then_it_recovers() {
+        let b = Budget::new(1_000_000, 100.0, None);
+        assert_eq!(b.current_rps(), 100.0);
+        // 16 refusals at once (16 requests in flight): ONE cut.
+        for _ in 0..16 {
+            b.note_refusal();
+        }
+        assert!((b.current_rps() - 50.0).abs() < 0.5, "{}", b.current_rps());
+        assert_eq!(b.usage()["providerRefusals"], json!(16));
+        assert_eq!(b.usage()["rateCuts"], json!(1));
+        // A refusal a second later: halved again; never below the floor.
+        std::thread::sleep(Duration::from_millis(1050));
+        b.note_refusal();
+        assert!((b.current_rps() - 25.0).abs() < 0.5, "{}", b.current_rps());
+        for _ in 0..10 {
+            b.inner.lock().unwrap().last_cut = None;
+            b.note_refusal();
+        }
+        assert!((b.current_rps() - b.min_rps).abs() < 1e-9);
+        // No growth during the first 2 s after a refusal, then +5 %/s of 100.
+        std::thread::sleep(Duration::from_millis(1500));
+        assert!(b.current_rps() < b.min_rps + 0.5, "{}", b.current_rps());
+        std::thread::sleep(Duration::from_millis(1500));
+        let r = b.current_rps();
+        assert!(r > b.min_rps + 3.0 && r < b.min_rps + 8.0, "{r}");
+    }
+
+    #[test]
+    fn refused_requests_are_recognised_and_slow_the_bucket() {
+        // Chainstack's words, an HTTP 429, a batch refused whole: refusals.
+        assert!(is_rate_refusal(-32005, "You've exceeded the RPS limit available on the current plan."));
+        assert!(is_rate_refusal(0, "node1: rate limited (429)"));
+        assert!(is_rate_refusal(0, "batch refused: You've exceeded the RPS limit available on the current plan."));
+        // Not refusals: a size limit, a missing block, old state.
+        assert!(!is_rate_refusal(-32000, "header not found"));
+        assert!(!is_rate_refusal(-32000, "historical state 27a8 is not available"));
+        assert!(!is_rate_refusal(-32602, "batch size limit exceeded: max 50"));
+        let b = Budget::new(1_000_000, 100.0, None);
+        let refused: Result<Vec<CallResult>, NodeErr> = Ok(vec![Ok(json!("0x1")), Err(RpcErr { code: -32005, message: "You've exceeded the RPS limit available on the current plan.".into() })]);
+        assert!(b.observe(&refused));
+        assert!(!b.observe(&Ok(vec![Ok(json!("0x1"))])));
+        assert!(b.observe(&Err(NodeErr::Transport("node1: rate limited (429)".into()))));
+        assert!(b.current_rps() <= 50.5);
+        // The bucket now lets ~50/s through, not 100/s.
+        let t = Instant::now();
+        let mut n = 0;
+        while t.elapsed() < Duration::from_millis(1000) {
+            b.take(Class::Fill, 1).unwrap();
+            n += 1;
+        }
+        assert!(n <= 60, "{n} requests in 1 s after a cut to 50/s");
     }
 
     #[test]

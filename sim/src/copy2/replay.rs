@@ -404,6 +404,8 @@ struct RunOut {
     ok: bool,
     /// Output of the last call.
     output: Bytes,
+    /// Why the last call stopped, if it halted (out of gas, bad opcode...).
+    halt: Option<String>,
     /// Logs of all calls, in order.
     logs: Vec<Log>,
     /// Everything touched (to pick out the storage changes we keep).
@@ -431,6 +433,7 @@ fn run(view: &dyn StateRead, p: &Pretend, ctx: &BlockCtx, calls: &[Call]) -> Res
     evm.ctx.modify_cfg(|cfg| cfg.disable_fee_charge = true);
     let mut ok = true;
     let mut output = Bytes::new();
+    let mut halt = None;
     let mut logs = Vec::new();
     for c in calls {
         let tx = TxEnv {
@@ -459,7 +462,8 @@ fn run(view: &dyn StateRead, p: &Pretend, ctx: &BlockCtx, calls: &[Call]) -> Res
                 ok = false;
                 break;
             }
-            Ok(_) => {
+            Ok(ExecutionResult::Halt { reason, .. }) => {
+                halt = Some(format!("{reason:?}"));
                 ok = false;
                 break;
             }
@@ -479,7 +483,7 @@ fn run(view: &dyn StateRead, p: &Pretend, ctx: &BlockCtx, calls: &[Call]) -> Res
         return Err(Stop::Unsure(format!("pool code touched {u}")));
     }
     let state = evm.finalize();
-    Ok(RunOut { ok, output, logs, state })
+    Ok(RunOut { ok, output, halt, logs, state })
 }
 
 /// A read-only call to a real contract on our copy (pool getters).
@@ -490,11 +494,30 @@ fn view_call(view: &dyn StateRead, ctx: &BlockCtx, to: Address, data: Bytes) -> 
 }
 
 /// Getter returning one address (e.g. token0(), factory(), plugin()).
+/// When it fails, the reason says HOW (dry run #16: 15 V3 pools went unsure
+/// with just "owner() on <factory> did not answer"): reverted (+ reason),
+/// halted (+ why), or answered too short (e.g. the account has no code in
+/// our copy).
 fn view_addr(view: &dyn StateRead, ctx: &BlockCtx, to: Address, sig: &str) -> Result<Address, Stop> {
-    match view_call(view, ctx, to, call(sig, &[]))? {
-        Some(o) if o.len() >= 32 => Ok(word_addr(word(&o, 0))),
-        _ => Err(Stop::Unsure(format!("{sig} on {to} did not answer"))),
+    let p = Pretend::default();
+    let r = run(view, &p, ctx, &[Call { from: REPLAY_CALLER, to, data: call(sig, &[]) }])?;
+    if r.ok && r.output.len() >= 32 {
+        return Ok(word_addr(word(&r.output, 0)));
     }
+    let how = if let Some(h) = &r.halt {
+        format!("halted: {h}")
+    } else if !r.ok {
+        format!("reverted{}", revert_text(&r.output))
+    } else {
+        let code = match view.account(to) {
+            Lookup::Known(Some(i)) if i.code_hash == KECCAK_EMPTY || i.code_hash.is_zero() => "; the copy holds it as an account WITHOUT code".to_string(),
+            Lookup::Known(Some(i)) => format!("; code hash {}", i.code_hash),
+            Lookup::Known(None) => "; the copy holds it as an EMPTY account".to_string(),
+            Lookup::Missing => String::new(),
+        };
+        format!("answered {} bytes{code}", r.output.len())
+    };
+    Err(Stop::Unsure(format!("{sig} on {to} did not answer ({how})")))
 }
 
 /// Storage changes to keep: every slot of a REAL contract (not pretend)
