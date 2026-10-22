@@ -283,6 +283,19 @@ trade ~20 ms.
   - Loads / probes / traces / fills read at the copy's head (or the node's
     tip if behind) AS OF WHEN THE JOB STARTS, not when queued. A catch-up
     more than 8 blocks old restarts that pool's load at the newest block.
+- Node timing tools (read only):
+  - `arbsim node-bench [--url-env NAME] [--n 50] [--parallel 16]
+    [--probe-coin 0xCOIN] [--copy2-load pools.json]` (from the app folder;
+    reads .env; never prints the URL). A-F: raw vs node client, sequential
+    vs parallel. G: one real coin probe. H: copy 2's real loading of the
+    pools in pools.json (same JSON as `track`: {"pools":[{address, kind,
+    token0, token1, fee?, tickSpacing?, v4Id?}], "coinSlots"?}) fed with the
+    node's newest block every 250 ms, progress every 5 s.
+  - The first ARBSIM_HTTP_LOG (100) copy-2 HTTP requests are logged:
+    "copy2 http #n: node1 [eth_getProof x5, eth_call x2] 7 calls, 31 keys,
+    answer 220 KB, 140 ms total (60 ms reading the answer), 0 error item(s)".
+  - eth_getProof only for accounts with <= 12 values; accounts with more
+    (coins holding many pools' balances) use plain eth_getStorageAt batches.
 - Status: `status` -> `copy2` {pools, loading, ready, unsure, lastBlock,
   unsureReasons, counters}; with {"pools": true} also `list` of {address,
   v4Id, kind, state, reason, events}. Checks touching a pool that isn't
