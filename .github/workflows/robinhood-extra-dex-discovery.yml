@@ -1,0 +1,56 @@
+# ============================================================================
+# ADDITIONAL DEX DISCOVERY — manually runnable, read-only Robinhood scan
+#
+# GitHub Actions -> "Robinhood extra DEX discovery" -> Run workflow.
+# This workflow NEVER executes transactions, deploys, or modifies main.
+# The full JSON report is attached to the run as an artifact.
+# ============================================================================
+name: Robinhood extra DEX discovery
+
+on:
+  workflow_dispatch:
+    inputs:
+      blocks:
+        description: 'Number of recent blocks to scan (1-200000)'
+        required: false
+        default: '10000'
+      from_block:
+        description: 'Optional starting block (blank = latest minus blocks)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  discovery:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+      - name: Typecheck all bot and research code
+        run: npm run typecheck
+      - name: Read-only contract and pool discovery
+        env:
+          ROBINHOOD_RPC_HTTP: https://rpc.mainnet.chain.robinhood.com
+          EXTRA_DEX_BLOCKS: ${{ inputs.blocks }}
+          EXTRA_DEX_FROM_BLOCK: ${{ inputs.from_block }}
+          EXTRA_DEX_OUTPUT: data/extra-dex-discovery.json
+          EXTRA_DEX_RPC_DELAY_MS: '300'
+        run: |
+          # Empty optional input must be unset; the script otherwise treats it
+          # as block zero, potentially scanning irrelevant historical blocks.
+          if [ -z "$EXTRA_DEX_FROM_BLOCK" ]; then unset EXTRA_DEX_FROM_BLOCK; fi
+          timeout 2100 node scripts/discover-extra-dexes.js
+      - name: Upload full discovery results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: robinhood-extra-dex-discovery
+          path: data/extra-dex-discovery.json
+          if-no-files-found: warn
