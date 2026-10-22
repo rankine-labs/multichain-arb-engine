@@ -876,3 +876,105 @@ trade ~20 ms.
   decides (`lu` "not_ready" in the jsonl). If that is common, the bot
   could wait for the forwarder to pass that block on (<= ~30 ms) before
   asking.
+
+- Warm restart (inbot-sim/copy2-n; owner: "why do you need to start from the
+  beginning each time"). Before: every deploy / restart of the bot or the
+  sidecar threw the copy away and loaded ~650 pools again (loads, tick
+  walks, coin layouts): ~13 min to fully ready, thousands of node requests,
+  and the reload bursts caused bugs (#16, copy2-j, copy2-m).
+  1. Save (copy2/persist.rs): every ARBSIM_COPY2_SAVE_S (60) and on SIGTERM /
+     SIGINT (serve.rs catches them; pm2 kill_timeout 30 s, deploy/
+     arbsim-pm2.sh re-creates an app with a shorter one), the READY pools'
+     state goes to ARBSIM_COPY2_STATE_FILE (runner: data/arbsim-copy2-
+     state.bin; "off" = never): the block it is exact at (+ its time /
+     parent-chain block / base fee), every value the head holds (pool slots,
+     walked tick data, coin balances, basics, code by hash; never-trusted
+     accounts left out), the never-trust lists, per ready pool its
+     bookkeeping (items, walked, walk, far-zero words, owned, accounts,
+     base_block, ready_since, last report applied), coin layouts / traced
+     slots / coin_ok, followed balances' coin_pos / coin_base, and the last
+     ARBSIM_COPY2_RESUME_OVERLAP_BLOCKS (64) blocks' reports. Pools not ready
+     (or pending from before the overlap) are left out WITH their values.
+     Binary, FORMAT version 1 (other versions refused: bump it whenever what
+     the copy holds or a field means changes), FNV-64 checksum, temp file +
+     fsync + rename. The intake thread only clones (head snapshot = pointer
+     copy, ready pools' entries); a saver thread writes; a save still
+     running skips the round. A catch-up running = no save (the older file
+     stays valid).
+  2. Start (intake.rs restore): the file's copy becomes the copy at its block
+     S (version with no block details: nothing answered AT S), its pools
+     READY, blocks held. When the bot's first block B > S arrives (the bot
+     always sends "gap: start" then), ONE loader job (loader.rs catch_up)
+     reads every report of our pools (settle_filters: pool events, their
+     coins' Transfers to / from them, V4 ids) in S-63..B-1: ranges of
+     ARBSIM_COPY2_RESUME_RANGE (500) blocks, each range in ONE request with
+     its last block's header (= proof this node has the whole range: a
+     lagging node can't silently return fewer logs), free node first, paid
+     node if that fails, ranges halved when "too big"; block time from the
+     logs' blockTimestamp (else the header), parent-chain block by halving
+     (it never decreases, so equal ends fill everything between: ~25 header
+     reads per 5 min). Reports for blocks <= S the copy didn't have = late
+     reports (on_late, exact as always); S+1..B-1 go through process() one
+     block at a time (versions get no block details: "repaired", checks AT
+     them answer not_ready; reports are complete: no "pending"). Then (only
+     after a restart) every held value nothing follows is re-read EXACTLY at
+     the new head (changed = replaced, unreadable = forgotten), then the
+     held blocks go on. Gap > ARBSIM_COPY2_RESUME_MAX_BLOCKS (18000, ~30
+     min), no node, missing / damaged / other-version file, or no complete
+     answer within ARBSIM_COPY2_RESUME_TIMEOUT_S (120): the normal full load.
+  3. Gaps while running (the bot restarted, an outage it couldn't fill, a
+     lost message): process() starts the same catch-up from the copy's
+     newest block (overlap re-read too: the old bot's late reports) instead
+     of reload_all_after_gap; the message waits, then goes on. Only when
+     that isn't possible / fails: the old reload. (Bot side unchanged apart
+     from wording: it still sends prevBlock = the block itself after a gap.)
+  4. Parking: the bot's first track after its restart lacks its loop-extra
+     pools for ~3 min (core/loopExtraPools.ts start delay), and around a
+     WebSocket renewal some pools wait to be listed. A READY pool leaving
+     the list is parked: its values (own slots, walked, coin balances that
+     descend from the same node read as its own values) and basics kept
+     aside, taken out of the copy (no longer followed). Listed again within
+     the catch-up limit: one log read for that pool from its overlap, its
+     reports put into the kept reports (pinned while parked), and its kept
+     values carried forward from where it was parked like a load (merge ->
+     READY). A late report about it while parked, the kept reports no
+     longer reaching back, a report <= its block the copy never had, or
+     node trouble: normal load. Counters pools_parked / parked_resumed /
+     parked_fallback / parked_expired.
+  5. Fetch-round limit (ARBSIM_COPY2_MAX_ROUNDS) now counts rounds without
+     progress (a catch-up carries a working copy across many blocks at
+     once, one round per new tick a mint touches).
+  Tests: tests/copy2_resume_anvil.rs (anvil: V3 0.01 %, V3 0.05 %, V4; random
+  swaps / mints / burns with and without collect / collects / plain coin
+  transfers): warm_restart_catches_up_exactly (save at S with one coin
+  Transfer withheld = a late report never received; 25 blocks while down;
+  restored copy catches up, finds the withheld Transfer in the overlap,
+  loads 0 pools, 617 values exact vs chain AND equal to a never-restarted
+  copy; again 10 blocks later), damaged_or_other_version_file_means_a_
+  normal_load (flipped byte, other FORMAT, no file), too_big_a_gap_means_
+  a_normal_load, bot_restart_gap_is_filled_from_logs_without_reloading
+  (15 blocks missed, free node refuses getLogs -> paid; first track lists 1
+  of 3 pools, the 2 others trade while parked and are resumed: 0 loads,
+  exact), deploy_restarting_both_loads_nothing (restored + parked at the
+  saved block + resumed later: 0 loads, exact); persist.rs unit tests
+  (round trip, stripped values, every damaged byte refused, atomic write).
+  Measured (tests/copy2_resume_bench.rs, release, made-up copy of 650
+  pools / 259k values / 423 accounts, fake node 80 ms per request, ~1
+  transaction with 3 reports per block, parent-chain block every 120
+  blocks): file 37 MB; intake thread's part of a save median 2 ms, max 5 ms;
+  writing 0.12 s (saver thread); reading back 0.15 s; block application
+  p50 0.09 ms / p99 0.23-0.29 ms with and without saves every second (7
+  saves during the run). Catch-up 5 min (3,000 blocks, 9,177 reports): 19
+  HTTP requests (1 per 500-block range + header rounds; ~25 at Chainstack's
+  25-calls-per-request batching), 195 headers, 1.8 s until answering;
+  30 min (18,000 blocks, 54,363 reports): 52 requests (~93 at 25 per
+  batch), 1,149 headers, 5.6 s, applying the blocks 0.75 s. (Before: a full
+  load ~1,700+ requests + one heavy trace per tick pool, ~13 min.)
+  Not covered / to watch: values nothing follows (coin settings) are
+  re-read at the new head after a restart but were used unverified during
+  the replays of the gap (same trust as between two verify rounds live); a
+  pool whose replay needs a value in the gap fetches it at that old block
+  (> 64 blocks old = reloads that pool at the newest block: a 30-min gap
+  reloads pools with new-tick mints early in the gap); a fix to how copy 2
+  follows pools needs FORMAT bumped (or the file deleted) or the old
+  copy's mistakes survive the deploy.

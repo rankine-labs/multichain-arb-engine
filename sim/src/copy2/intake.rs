@@ -1309,9 +1309,10 @@ pub struct C2Config {
     /// Catch-up from the node's logs: at most this many blocks between the
     /// copy and the bot's first new block [ARBSIM_COPY2_RESUME_MAX_BLOCKS,
     /// 18000 = ~30 min at ~10 blocks/s; 0 = never: the old reload]; beyond
-    /// it the pools load normally. Measured (tests/copy2_resume_anvil.rs
-    /// catch_up_cost): a 30 min gap costs ~40 requests / a few seconds,
-    /// a full load ~2,000+ requests and ~13 min with the tick walks.
+    /// it the pools load normally. Measured (tests/copy2_resume_bench.rs,
+    /// 650 pools, 80 ms per request): a 30 min gap ~50-95 requests (mostly
+    /// to the free node) and ~6 s; a full load ~1,700+ paid requests plus a
+    /// tick walk per pool, ~13 min live.
     pub resume_max_blocks: u64,
     /// Blocks before the copy's block whose reports are read again (late
     /// reports the copy may never have got) [ARBSIM_COPY2_RESUME_OVERLAP_BLOCKS, 64].

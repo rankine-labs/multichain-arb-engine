@@ -915,7 +915,9 @@ mod tests {
         assert!(back.snap.accounts.get(&a(3)).is_none());
         assert_eq!(back.snap.accounts.get(&a(2)).unwrap().basics, Basics::Known(None));
         let x = back.snap.accounts.get(&a(1)).unwrap();
-        assert_eq!(x.storage.len(), 10);
+        // Slot 9 is in `strip` (a pool left out): not saved.
+        assert_eq!(x.storage.len(), 9);
+        assert!(x.storage.get(&U256::from(9)).is_none());
         assert_eq!(x.storage.get(&U256::from(3)), Some(&U256::from(22)));
         assert_eq!(back.snap.codes.len(), 1);
         let (e, lp) = &back.pools[0];
