@@ -78,7 +78,11 @@ const N_CHECKS = Number(arg('checks', '2'));                  // real checks per
 const RPS = Number(arg('rps', '3'));                          // checker's own node speed limit
 const MAX_NODE_READS = Number(arg('max-node-reads', '20000')); // checker's own node reads, whole run
 const ARBSIM_CAP = arg('arbsim-cap', '3000')!;                // test arbsim's daily paid-node allowance
-const ARBSIM_RPS = arg('arbsim-rps', '2')!;
+// The test arbsim's node speed limit (HTTP requests/s). Was 2 by default,
+// which silently capped every dry run up to #14 at ~2 requests/s (the
+// ARBSIM_NODE_RPS set in the shell is NOT passed on: the child gets a minimal
+// environment). Default 50 now; the Chainstack Growth plan allows 250/s.
+const ARBSIM_RPS = arg('arbsim-rps', process.env.ARBSIM_NODE_RPS ?? '50')!;
 const GRACE_MS = Number(arg('grace-ms', '30'));
 const ONLY_PROVEN = flag('only-proven');
 const NODE_GAS = arg('node-gas', 'trace');                    // trace = debug_traceCall (gives gas) | call = plain eth_call
@@ -143,6 +147,8 @@ async function startArbsim(): Promise<void> {
     ARBSIM_NODE_URL: HTTP!, ARBSIM_NODE_DAILY_CAP: ARBSIM_CAP, ARBSIM_NODE_RPS: ARBSIM_RPS,
     ARBSIM_BUDGET_FILE: join(OUT, 'arbsim-node-budget.json'),
   };
+  // Copy-2 settings set in the shell (ARBSIM_COPY2_*) are passed on too.
+  for (const [k, v] of Object.entries(process.env)) if (/^ARBSIM_COPY2_[A-Z0-9_]+$/.test(k) && v !== undefined) env[k] = v;
   // Extra test settings: --arbsim-env ARBSIM_X=1 (ARBSIM_ names only).
   args.forEach((a, i) => { if (a === '--arbsim-env') { const m = /^(ARBSIM_[A-Z0-9_]+)=(.*)$/.exec(args[i + 1] ?? ''); if (m) env[m[1]!] = m[2]!; } });
   const logFd = openSync(join(OUT, 'arbsim.log'), 'a');
@@ -414,7 +420,7 @@ function writeSummary(final: boolean) {
 async function main() {
   log(`following ${followed.pools.size} pools (${Object.entries(followed.notFollowed).map(([k, n]) => `${n} not followed: ${k}`).join('; ') || 'all followed'}); run ${MINUTES} min, round every ${EVERY} blocks`);
   await startArbsim();
-  log(`test arbsim ${NO_SPAWN ? 'found' : 'started'} on ${SOCKET} (pool-events mode, daily paid-node allowance ${ARBSIM_CAP})`);
+  log(`test arbsim ${NO_SPAWN ? 'found' : 'started'} on ${SOCKET} (pool-events mode, daily paid-node allowance ${ARBSIM_CAP}, speed limit ${ARBSIM_RPS} requests/s)`);
   await arbsimStatus();
   await sendTrack();
   openPush();
