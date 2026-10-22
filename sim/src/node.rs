@@ -460,7 +460,10 @@ impl NodeClient {
             if paid_first && ep.budget != 0 {
                 continue;
             }
-            if let Err(e) = self.budgets[ep.budget].take(class, 1) {
+            let t_wait = Instant::now();
+            let took = self.budgets[ep.budget].take(class, 1);
+            LAST_WAIT.with(|c| c.set(t_wait.elapsed().as_secs_f64() * 1000.0));
+            if let Err(e) = took {
                 // Copy 2 paces itself: a speed-limit refusal means "later",
                 // not "try the next node".
                 let speed = matches!(&e, NodeErr::Budget(m) if m.starts_with(SPEED_LIMIT));
@@ -521,6 +524,8 @@ impl NodeClient {
 thread_local! {
     /// (answer bytes, ms reading the answer body) of this thread's last POST.
     static LAST_HTTP: std::cell::Cell<(usize, f64)> = const { std::cell::Cell::new((0, 0.0)) };
+    /// ms this thread's last request waited for the speed limit / allowance.
+    static LAST_WAIT: std::cell::Cell<f64> = const { std::cell::Cell::new(0.0) };
 }
 
 /// Copy-2 HTTP requests logged so far (the first ARBSIM_HTTP_LOG, 100).
@@ -553,13 +558,14 @@ fn log_http(node: &str, calls: &[&(&str, Value)], total_ms: f64, answer: &Result
         }
     }
     let (bytes, read_ms) = LAST_HTTP.with(|c| c.get());
+    let wait_ms = LAST_WAIT.with(|c| c.get());
     let errs = match answer {
         Ok(v) => v.iter().filter(|r| r.is_err()).count(),
         Err(_) => calls.len(),
     };
     let mixs: Vec<String> = mix.iter().map(|(m, c)| format!("{m} x{c}")).collect();
     eprintln!(
-        "[arbsim] copy2 http #{}: {node} [{}] {} calls, {keys} keys/overrides, answer {} KB, {:.0} ms total ({:.0} ms reading the answer), {errs} error item(s)",
+        "[arbsim] copy2 http #{}: {node} [{}] {} calls, {keys} keys/overrides, answer {} KB, waited {wait_ms:.0} ms for the speed limit before sending, then {:.0} ms total ({:.0} ms reading the answer), {errs} error item(s)",
         n + 1,
         mixs.join(", "),
         calls.len(),

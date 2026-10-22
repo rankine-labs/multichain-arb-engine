@@ -89,7 +89,7 @@ pub fn serve_main(args: &[String]) {
     let cfg = Config::from_env();
     let node: Option<Arc<dyn NodeApi>> = match NodeClient::from_env() {
         Some(n) => {
-            eprintln!("[arbsim] nodes: {}", n.labels().join(", "));
+            eprintln!("[arbsim] nodes: {}; speed limit {} HTTP requests/s (ARBSIM_NODE_RPS{}), daily cap {}", n.labels().join(", "), n.usage()["rps"], if std::env::var("ARBSIM_NODE_RPS").is_ok() { "" } else { " NOT SET: default 8" }, n.usage()["cap"]);
             Some(Arc::new(n))
         }
         None => {

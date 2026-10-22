@@ -349,10 +349,15 @@ struct Tip {
 impl Tip {
     fn get(&self, node: &dyn NodeApi, want: u64) -> Result<u64, NodeErr> {
         {
-            let g = self.known.lock().unwrap();
+            // One refresh at a time, at most every 250 ms: the copy usually
+            // runs a block or two AHEAD of the node, so `want` is often above
+            // the tip; without this every worker asked eth_blockNumber for
+            // every job (16 at a time), eating the speed limit.
+            let mut g = self.known.lock().unwrap();
             if g.0 >= want || g.1.is_some_and(|t| t.elapsed() < Duration::from_millis(250)) {
                 return Ok(g.0);
             }
+            g.1 = Some(Instant::now()); // others use the known tip meanwhile
         }
         let r = node.call_batch_paid(Class::Fill, &[("eth_blockNumber", json!([]))])?;
         let t = match r.into_iter().next() {
