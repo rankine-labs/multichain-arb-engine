@@ -119,7 +119,7 @@ use crate::check::hexutil::{parse_address, parse_bytes, parse_u256, parse_u64, t
 use crate::node::{env_u64, Fetched, ItemErr};
 use crate::state::fill::{account_info, reconcile, rewrite_from, FillQueue};
 use crate::state::mirror::{Shared, Version};
-use crate::state::snap::{Basics, Fact, Snapshot};
+use crate::state::snap::{Acct, Basics, Fact, Snapshot};
 use crate::state::{Lookup, MissItem, StateDiff, StatePosition, StateRead};
 
 // ---------------------------------------------------------------------------
@@ -604,6 +604,11 @@ c2counters!(
     // blocks applied from them, reports read, late reports they found for
     // blocks the copy already had.
     catchups, catchups_done, catchups_failed, catchup_blocks, catchup_logs, catchup_late_found,
+    // Ready pools the bot stopped listing (its first `track` after a restart
+    // lacks the loop-extra pools for ~3 min): values kept aside ("parked");
+    // re-listed and caught up from that pool's logs / given up (normal load)
+    // / dropped after ARBSIM_COPY2_RESUME_MAX_BLOCKS.
+    pools_parked, parked_resumed, parked_fallback, parked_expired,
 );
 
 fn inc(c: &AtomicU64) {
@@ -1417,6 +1422,29 @@ enum JobFor {
     CatchUp,
     /// Warm restart, stage 2: re-reading every value nothing follows.
     ResumeVerify,
+    /// A parked pool listed again: its own reports since it was parked.
+    PoolCatchUp { key: PoolKey, gen: u64 },
+}
+
+/// A ready pool the bot stopped listing (see on_track "parking"): what the
+/// copy held for it, exact at the end of block `at`.
+struct Parked {
+    entry: PoolEntry,
+    at: u64,
+    /// First block whose reports are read again when it is resumed (the
+    /// overlap before `at`, within the kept reports).
+    from: u64,
+    last_pos: Option<Pos>,
+    /// Its own slots (incl. walked tick data) and its coin balances.
+    slots: Vec<(Address, U256, U256)>,
+    /// Basics of its accounts (code is shared, kept in every snapshot).
+    basics: Vec<(Address, Option<revm::state::AccountInfo>)>,
+    /// A report about it came for a block <= `at` after it was parked (it
+    /// may lack it): resuming is not exact, it loads normally instead.
+    late_seen: bool,
+    since: Instant,
+    /// Its log read is asked (again) not before this.
+    retry: Instant,
 }
 
 /// A catch-up from the node's logs in progress (see "warm restart" below).
@@ -1576,6 +1604,10 @@ pub struct Intake {
     last_save: Instant,
     /// A stop signal asked for a final save (answered by run()).
     shutdown: Option<SyncSender<Result<persist::SaveReport, String>>>,
+    /// Ready pools the bot stopped listing (kept aside, see on_track), and
+    /// parked pools listed again whose own reports are being read.
+    parked: HashMap<PoolKey, Parked>,
+    resuming: HashMap<PoolKey, Parked>,
 }
 
 /// Start the intake thread (+ loader threads).
@@ -1674,6 +1706,8 @@ pub fn manual(sh: Arc<Shared>, fills: Arc<FillQueue>, cfg: C2Config) -> (Intake,
         saver: None,
         last_save: Instant::now(),
         shutdown: None,
+        parked: HashMap::new(),
+        resuming: HashMap::new(),
     };
     let mut i = i;
     if let Some(path) = i.cfg.state_file.clone() {
@@ -1908,6 +1942,9 @@ impl Intake {
         // (they would read at the copy's old block); work already running
         // goes on.
         if self.catchup.is_none() {
+            if !self.resuming.is_empty() {
+                self.dispatch_pool_catchups();
+            }
             self.dispatch_loads();
             self.dispatch_fills();
             self.dispatch_walks();
@@ -1923,6 +1960,7 @@ impl Intake {
             self.last_evict = Instant::now();
             self.evict();
             self.prune_touched();
+            self.expire_parked();
         }
     }
 
@@ -1958,6 +1996,24 @@ impl Intake {
             for (k, p) in new {
                 if reg.pools.contains_key(&k) {
                     continue;
+                }
+                // Listed again after being parked: catch it up from its own
+                // reports instead of loading it (see park / resume below).
+                if let Some(pk) = self.parked.remove(&k) {
+                    let o = &pk.entry.pool;
+                    let same = o.kind == p.kind && o.token0 == p.token0 && o.token1 == p.token1 && o.fee == p.fee && o.tick_spacing == p.tick_spacing;
+                    if same && !pk.late_seen {
+                        let mut e = pk.entry.clone();
+                        e.state = PoolState::Loading;
+                        e.busy = true;
+                        e.gen += 1;
+                        e.pending_from = None;
+                        e.retry_at = Instant::now();
+                        e.reason = format!("loading: listed again, reading its reports since block {} (kept aside meanwhile)", pk.at);
+                        reg.pools.insert(k, e);
+                        self.resuming.insert(k, pk);
+                        continue;
+                    }
                 }
                 added += 1;
                 reg.pools.insert(
@@ -1999,6 +2055,16 @@ impl Intake {
             self.last_progress = Instant::now();
             self.round = Some((Instant::now(), self.c2.node_requests.load(Ordering::Relaxed), added));
             *self.c2.load_round.lock().unwrap() = LoadRound { pools: added, ..Default::default() };
+        }
+        // Ready pools the bot no longer lists: parked (their values kept
+        // aside), so that listing them again costs a few log reads instead of
+        // a full load + tick walk (the bot's first track after a restart
+        // lacks its loop-extra pools for ~3 min).
+        // (Pools listed again are caught up from work(), never while a
+        // catch-up of the whole copy is running: its log read may not have
+        // included them.)
+        for e in &gone {
+            self.park(e);
         }
         // Forget what we held about pools we no longer follow (it would go stale).
         if !gone.is_empty() {
@@ -2204,6 +2270,8 @@ impl Intake {
                 JobFor::Load { want, .. } => Some(want.saturating_sub(self.cfg.keep_blocks as u64 / 4)),
                 _ => None,
             }))
+            // Parked pools: resuming one carries it through these reports.
+            .chain(self.parked.values().chain(self.resuming.values()).map(|p| p.from))
             .min()
             .unwrap_or(u64::MAX);
         while self.buf.len() > self.cfg.max_keep_blocks || (self.buf.len() > self.cfg.keep_blocks && self.buf.front().is_some_and(|b| b.block < need_from)) {
@@ -2277,6 +2345,7 @@ impl Intake {
             inc(&st.duplicate_blocks);
             return 0;
         }
+        self.note_parked_late(n, &added);
         added.sort_by_key(|l| (l.tx_index, l.log_index));
         added.dedup_by_key(|l| log_id(l));
         let Some(head) = self.sh.head() else { return 0 };
@@ -2397,6 +2466,7 @@ impl Intake {
     ///     n on (read again when a check needs it); working copies get the
     ///     transfer added (late_transfer_to_partials).
     fn late_not_kept(&mut self, n: u64, logs: &[PoolLog]) {
+        self.note_parked_late(n, logs);
         let c2 = self.c2.clone();
         let st = &c2.stats;
         let mut unsure: Vec<PoolKey> = Vec::new();
@@ -3206,6 +3276,7 @@ impl Intake {
             (JobFor::Verify, Done::Fetch { block, res, .. }) => self.on_verify(block, res),
             (JobFor::CatchUp, Done::CatchUp { id, res }) => self.on_catchup(id, res),
             (JobFor::ResumeVerify, Done::Fetch { id, block, res }) => self.on_resume_verify(id, block, res),
+            (JobFor::PoolCatchUp { key, gen }, Done::CatchUp { res, .. }) => self.on_pool_catchup(key, gen, res),
             _ => {}
         }
     }
@@ -5274,8 +5345,8 @@ impl Intake {
         let why = cu.why.clone();
         let reqs = self.c2.node_requests.load(Ordering::Relaxed) - cu.req0;
         eprintln!(
-            "[arbsim] copy2: caught up blocks {}..{to} from the node's logs ({}): {n_logs} reports in {blocks} blocks applied in {} ms, {late} late report(s) for older blocks; {} requests ({} public, {} paid, {} headers{}); now {ready} ready, {loading} loading, {unsure} unsure; {secs:.1} s since start",
-            applied + 1,
+            "[arbsim] copy2: caught up {} from the node's logs ({}): {n_logs} reports (blocks {from}..{to}) applied in {} ms, {blocks} blocks with reports, {late} late report(s) for blocks the copy had; {} requests ({} public, {} paid, {} headers{}); now {ready} ready, {loading} loading, {unsure} unsure; {secs:.1} s since start",
+            if to > applied { format!("blocks {}..{to}", applied + 1) } else { "no missing block".to_string() },
             why,
             t0.elapsed().as_millis(),
             reqs,
@@ -5397,6 +5468,237 @@ impl Intake {
             // The buffer has a hole: no load may carry across it.
             self.buf.clear();
             self.gap_filled_until = None;
+        }
+    }
+
+    // ---- parking (pools the bot stops listing for a while) ----
+    //
+    // Plain English: after a bot restart its first `track` lacks the
+    // loop-extra pools (the bot picks them ~3 min later), and around a
+    // WebSocket renewal a few pools wait to be listed again. Forgetting such
+    // a pool meant a full load + tick walk when it came back. Now a READY
+    // pool that leaves the list is PARKED: its values are taken out of the
+    // copy (nothing answers from them: they are no longer followed) and kept
+    // aside, exact at the copy's block `at`. When it is listed again within
+    // ARBSIM_COPY2_RESUME_MAX_BLOCKS, ONE log read brings its own reports
+    // since `at` (eth_getLogs for that pool, like the catch-up), they are put
+    // into the kept reports, and the pool is carried forward from `at` like
+    // any load: exact, a few requests instead of a load + walk. Anything not
+    // exact (a late report about it came meanwhile, the kept reports no
+    // longer reach `at`, node trouble): it loads normally.
+
+    /// Park a pool that left the bot's list (only a ready one).
+    fn park(&mut self, e: &PoolEntry) {
+        let k = key_of(&e.pool);
+        let Some(at) = self.last_block else { return };
+        if self.cfg.resume_max_blocks == 0 || self.loaders.is_none() || e.state != PoolState::Ready || e.busy || self.partials.contains_key(&k) {
+            return;
+        }
+        if self.c2.reg.read().unwrap().pools.contains_key(&k) {
+            return; // listed again with other details: a new pool
+        }
+        let Some(head) = self.sh.head() else { return };
+        let snap = &head.snap;
+        let mut slots = Vec::new();
+        for (a, sl) in e.items.iter().chain(e.walked.iter()) {
+            if let Lookup::Known(v) = snap.storage(*a, *sl) {
+                slots.push((*a, *sl, v));
+            }
+        }
+        // Its coin balances (contract pools), only when they descend from the
+        // same node read as its own values (else a late Transfer could be
+        // counted twice when it is resumed): else they are read again.
+        if !(self.cfg.pm_bound && e.pool.kind == PoolKind::V4) {
+            let reg = self.c2.reg.read().unwrap();
+            for c in [e.pool.token0, e.pool.token1] {
+                let Some(sl) = reg.bal_slot(c, e.pool.address) else { continue };
+                if self.coin_base.get(&(c, e.pool.address)) != Some(&e.base_block) {
+                    continue;
+                }
+                if let Lookup::Known(v) = snap.storage(c, sl) {
+                    slots.push((c, sl, v));
+                }
+            }
+        }
+        let mut basics = Vec::new();
+        for a in e.accounts.iter().chain(std::iter::once(&e.pool.address)) {
+            if let Some(Acct { basics: Basics::Known(info), .. }) = snap.accounts.get(a) {
+                basics.push((*a, info.clone()));
+            }
+        }
+        inc(&self.c2.stats.pools_parked);
+        let from = self.overlap_from(at);
+        self.parked.insert(k, Parked { entry: e.clone(), at, from, last_pos: self.last_pos.get(&k).copied(), slots, basics, late_seen: false, since: Instant::now(), retry: Instant::now() });
+        self.last_pos.remove(&k);
+    }
+
+    /// A report for block `n` (late) about a parked pool: its kept values
+    /// may lack it, so it can't be resumed exactly.
+    fn note_parked_late(&mut self, n: u64, logs: &[PoolLog]) {
+        if self.parked.is_empty() && self.resuming.is_empty() {
+            return;
+        }
+        for p in self.parked.values_mut().chain(self.resuming.values_mut()) {
+            if n > p.at || p.late_seen {
+                continue;
+            }
+            let pool = &p.entry.pool;
+            if logs.iter().any(|l| is_pool_event(pool, l) || coin_transfer(l).is_some_and(|(_, f, t, _)| f == pool.address || t == pool.address)) {
+                p.late_seen = true;
+            }
+        }
+    }
+
+    /// Parked pools kept longer than the catch-up limit are dropped (they
+    /// load normally if listed again).
+    fn expire_parked(&mut self) {
+        let Some(last) = self.last_block else { return };
+        let max = self.cfg.resume_max_blocks;
+        let before = self.parked.len();
+        self.parked.retain(|_, p| last.saturating_sub(p.at) <= max && p.since.elapsed() < Duration::from_secs(6 * 3600));
+        add(&self.c2.stats.parked_expired, (before - self.parked.len()) as u64);
+    }
+
+    /// Send the log read for every parked pool listed again.
+    fn dispatch_pool_catchups(&mut self) {
+        let Some(last) = self.last_block else { return };
+        let keys: Vec<PoolKey> = self.resuming.keys().copied().collect();
+        for k in keys {
+            let (at, from, gen) = {
+                let reg = self.c2.reg.read().unwrap();
+                match (self.resuming.get(&k), reg.pools.get(&k)) {
+                    (Some(p), Some(e)) => (p.at, p.from, e.gen),
+                    _ => {
+                        self.resuming.remove(&k);
+                        continue;
+                    }
+                }
+            };
+            if self.resuming.get(&k).is_some_and(|p| p.retry > Instant::now()) || self.jobs.values().any(|j| matches!(j, JobFor::PoolCatchUp { key, .. } if *key == k)) {
+                continue;
+            }
+            let filters = {
+                let reg = self.c2.reg.read().unwrap();
+                settle_filters(&reg, &[k].into_iter().collect())
+            };
+            let id = self.new_job(JobFor::PoolCatchUp { key: k, gen });
+            self.loaders.as_ref().unwrap().send(Job::CatchUp { id, from, to: last.max(at), filters, range: self.cfg.resume_range });
+        }
+    }
+
+    /// Resuming a parked pool is not possible: it loads normally.
+    fn resume_fallback(&mut self, k: PoolKey, why: &str) {
+        self.resuming.remove(&k);
+        let n = self.c2.stats.parked_fallback.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 20 || n % 100 == 0 {
+            eprintln!("[arbsim] copy2: pool {}{} listed again, not resumed: {why} [#{n}]", k.0, k.1.map(|i| format!(" id {i}")).unwrap_or_default());
+        }
+        let mut reg = crate::timing::TimedWrite::new(&self.c2.reg);
+        if let Some(e) = reg.pools.get_mut(&k) {
+            e.busy = false;
+            e.gen += 1;
+            e.retry_at = Instant::now();
+            e.reason = format!("loading: {why}");
+        }
+    }
+
+    /// A parked pool's own reports came back: put them into the kept
+    /// reports and carry its kept values forward from where it was parked.
+    fn on_pool_catchup(&mut self, k: PoolKey, gen: u64, res: Result<CatchUpOut, crate::node::NodeErr>) {
+        let ok_gen = self.c2.reg.read().unwrap().pools.get(&k).is_some_and(|e| e.gen == gen && e.busy);
+        if !ok_gen || !self.resuming.contains_key(&k) {
+            return;
+        }
+        let out = match res {
+            Ok(o) => o,
+            Err(e) => {
+                let m = e.to_string();
+                if m.contains(NOT_YET) || m.contains(crate::node::SPEED_LIMIT) {
+                    // Asked again on the next round of work (the node is a block behind).
+                    self.delayed_pool_catchup(k);
+                    return;
+                }
+                self.note_node_error(&format!("resume: {m}"));
+                self.resume_fallback(k, &format!("its reports could not be read ({m}): loading it"));
+                return;
+            }
+        };
+        let pk = self.resuming.remove(&k).unwrap();
+        if pk.late_seen {
+            self.resume_fallback(k, "a late report about it came while it was kept aside: loading it");
+            return;
+        }
+        let pool = pk.entry.pool.clone();
+        let (at, from) = (pk.at, pk.from);
+        if self.buf.front().is_none_or(|b| b.block > from) {
+            self.resume_fallback(k, "the kept reports no longer reach back to when it was kept aside: loading it");
+            return;
+        }
+        // Its reports (pool events, its coins' Transfers to / from it).
+        let mut logs: Vec<PoolLog> = Vec::new();
+        for v in &out.logs {
+            let Some(b) = num(v.get("blockNumber")) else { continue };
+            if let Ok(l) = parse_log(v, b) {
+                if !l.removed && b >= from && (is_pool_event(&pool, &l) || coin_transfer(&l).is_some_and(|(c, f, t, _)| (c == pool.token0 || c == pool.token1) && (f == pool.address || t == pool.address))) {
+                    logs.push(l);
+                }
+            }
+        }
+        let groups = persist::by_block(logs);
+        // Up to `at` the kept values have every report the copy had; one the
+        // copy never had (late, never arrived) can't be placed: load instead.
+        for (b, ls) in groups.range(..=at) {
+            let known: HashSet<LogId> = self.buf.iter().find(|x| x.block == *b).map(|x| x.logs.iter().map(log_id).collect()).unwrap_or_default();
+            if ls.iter().any(|l| !known.contains(&log_id(l))) {
+                self.resume_fallback(k, &format!("a report of block {b} the copy never had: loading it"));
+                return;
+            }
+        }
+        // After `at`: into the kept reports (blocks the copy has no message
+        // for are added with the node's block time).
+        for (b, ls) in groups.range(at + 1..) {
+            if self.last_block.is_some_and(|l| *b > l) {
+                continue; // the bot sends these itself (the pool is listed)
+            }
+            let at_i = self.buf.partition_point(|x| x.block < *b);
+            if self.buf.get(at_i).is_some_and(|x| x.block == *b) {
+                let bb = &mut self.buf[at_i];
+                let have: HashSet<LogId> = bb.logs.iter().map(log_id).collect();
+                let extra: Vec<PoolLog> = ls.iter().filter(|l| !have.contains(&log_id(l))).cloned().collect();
+                if !extra.is_empty() {
+                    let mut v: Vec<PoolLog> = (*bb.logs).clone();
+                    v.extend(extra);
+                    v.sort_by_key(|l| (l.tx_index, l.log_index));
+                    bb.logs = Arc::new(v);
+                }
+            } else {
+                let Some(&(ts, l1)) = out.blocks.get(b) else {
+                    self.resume_fallback(k, &format!("no time for block {b}: loading it"));
+                    return;
+                };
+                self.buf.insert(at_i, BufBlock { block: *b, rctx: ReplayCtx { number: *b, timestamp: ts, l1_number: l1 }, logs: Arc::new(ls.clone()) });
+            }
+        }
+        // Its kept values, carried forward from the end of block `at` like a load.
+        let mut ov = self.empty_copy();
+        for (a, sl, v) in &pk.slots {
+            ov.learn(&Fact::Slot(*a, *sl, *v));
+        }
+        for (a, info) in &pk.basics {
+            ov.learn(&Fact::Basics { addr: *a, info: info.clone(), code: None });
+        }
+        if let Some(lp) = pk.last_pos {
+            self.last_pos.insert(k, lp);
+        }
+        inc(&self.c2.stats.parked_resumed);
+        let base = pk.entry.base_block;
+        self.continue_partial(k, Partial { ov, cursor: (at + 1, 0, 0), gen, errors: 0, hard_errors: 0, refusals: 0, base: (base, END, END), need_at: (0, 0, 0) });
+    }
+
+    /// Ask again for a parked pool's reports a little later.
+    fn delayed_pool_catchup(&mut self, k: PoolKey) {
+        if let Some(p) = self.resuming.get_mut(&k) {
+            p.retry = Instant::now() + Duration::from_millis(300);
         }
     }
 

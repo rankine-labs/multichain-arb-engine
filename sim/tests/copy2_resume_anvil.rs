@@ -23,6 +23,10 @@
 //      The sidecar keeps running, the bot restarts (blocks missing, then
 //      "gap: start"): no pool may be reloaded; the gap comes from the logs.
 //      The free node refuses getLogs here: the paid node must answer.
+//      Like the live bot, its first `track` after the restart lists only
+//      some pools (the loop-extra pools come ~3 min later): the others are
+//      kept aside ("parked") and, listed again, caught up from their own
+//      reports, not loaded.
 //
 //   Skipped (passes with a note) when anvil isn't installed.
 // ============================================================================
@@ -335,9 +339,13 @@ impl Chain {
     }
 
     fn track_json(&self) -> Value {
-        let list: Vec<Value> = self
-            .pools
+        self.track_json_of(&[0, 1, 2])
+    }
+
+    fn track_json_of(&self, which: &[usize]) -> Value {
+        let list: Vec<Value> = which
             .iter()
+            .map(|i| &self.pools[*i])
             .map(|p| json!({"address": ha(p.address), "kind": if p.v4_id.is_some() { "v4" } else { "v3" }, "token0": ha(p.token0), "token1": ha(p.token1), "fee": p.fee, "tickSpacing": p.tick_spacing, "v4Id": p.v4_id.map(|i| format!("{i}"))}))
             .collect();
         json!({ "pools": list })
@@ -357,12 +365,16 @@ impl Chain {
 
     /// What the bot does when it (re)connects: coin slots + track.
     fn connect(&self, c: &mut Copy) {
+        self.connect_with(c, &[0, 1, 2]);
+    }
+
+    fn connect_with(&self, c: &mut Copy, which: &[usize]) {
         let mut slots = serde_json::Map::new();
         for t in [self.uu, self.ww] {
             slots.insert(ha(t), json!({"layout": "solidity", "slot": 0}));
         }
         c.h.coin_slots_json(&json!(1), &json!({"type": "coin_slots", "coinSlots": slots}));
-        let ans = c.h.track_json(&json!(2), &self.track_json());
+        let ans = c.h.track_json(&json!(2), &self.track_json_of(which));
         assert_eq!(ans["ok"], json!(true), "{ans}");
         c.intake.pump();
     }
@@ -707,7 +719,9 @@ fn bot_restart_gap_is_filled_from_logs_without_reloading() {
     run_blocks(&mut ch, &mut nothing, 15, &mut last);
     c.gate.public_refuses_logs.store(true, Ordering::SeqCst);
     let paid0 = c.gate.paid.load(Ordering::Relaxed);
-    ch.connect(&mut c); // the new bot sends track again (same pools)
+    // The new bot's first track lists only the first pool.
+    ch.connect_with(&mut c, &[0]);
+    assert_eq!(c.c("pools_parked"), 2, "{:?}", c.states());
     let txs = ch.random_txs();
     let n = ch.mine(&txs);
     let logs = ch.reports(n);
@@ -722,11 +736,82 @@ fn bot_restart_gap_is_filled_from_logs_without_reloading() {
     assert_eq!(c.c("catchups_done"), 1, "{}", st["resume"]);
     assert_eq!(c.c("loads"), loads, "no pool loaded again");
     assert_eq!(c.c("unsure_marked"), unsure, "no pool went unsure");
-    assert!(c.c("catchup_blocks") >= 10, "the missing blocks came from the logs: {}", st["resume"]);
+    assert!(c.c("catchup_blocks") >= 3, "the missing blocks came from the logs: {}", st["resume"]);
+    assert_eq!(st["resume"]["lastCatchUp"]["toBlock"], json!(n - 1), "every block up to the bot's new one: {}", st["resume"]);
     assert!(c.gate.paid.load(Ordering::Relaxed) > paid0, "the paid node answered what the free one refused");
     exact_vs_chain(&ch, &c, "after the bot's restart");
     run_blocks(&mut ch, &mut [&mut c], 5, &mut last);
     c.settle();
     exact_vs_chain(&ch, &c, "5 blocks later");
+    // Meanwhile the other two pools traded (the bot doesn't send their
+    // reports: only the listed pool's). Then the bot lists them again.
+    for _ in 0..6 {
+        let txs = vec![ch.swap_tx(1, 3_000, true), ch.swap_tx(2, 2_000, false)];
+        let n = ch.mine(&txs);
+        let logs: Vec<PoolLog> = ch.reports(n).into_iter().filter(|l| {
+            let p = &ch.pools[0];
+            l.address == p.address || (l.topics.len() == 3 && (Address::from_slice(&l.topics[1].as_slice()[12..]) == p.address || Address::from_slice(&l.topics[2].as_slice()[12..]) == p.address))
+        }).collect();
+        c.send(ch.msg(n, logs, Some(last)));
+        last = n;
+    }
+    c.settle();
+    ch.connect_with(&mut c, &[0, 1, 2]);
+    run_blocks(&mut ch, &mut [&mut c], 3, &mut last);
+    c.settle();
+    eprintln!("parked: {} resumed, {} loaded instead", c.c("parked_resumed"), c.c("parked_fallback"));
+    assert_eq!(c.c("parked_resumed"), 2, "{:?}", c.states());
+    assert_eq!(c.c("parked_fallback"), 0);
+    assert_eq!(c.c("loads"), loads, "no pool loaded again after being listed again");
+    exact_vs_chain(&ch, &c, "parked pools listed again");
     let _ = HashSet::<u8>::new();
+}
+
+/// A deploy restarts BOTH: the sidecar starts from its file and the new
+/// bot's first track lists only some pools (loop-extra pools come later).
+/// The others are parked at the saved block and, listed again, caught up
+/// from their own reports: no pool is loaded, every value exact.
+#[test]
+fn deploy_restarting_both_loads_nothing() {
+    let Some(mut ch) = Chain::start() else {
+        eprintln!("copy2 resume anvil test SKIPPED: no ~/.foundry/bin/anvil");
+        return;
+    };
+    let mut last = 0;
+    let path = saved_copy(&mut ch, "deploy", &mut last);
+    let mut nothing: [&mut Copy; 0] = [];
+    run_blocks(&mut ch, &mut nothing, 10, &mut last);
+    let mut b2 = ch.copy(Some(&path), |_| {});
+    ch.connect_with(&mut b2, &[0]);
+    assert_eq!(b2.c("pools_parked"), 2);
+    let only0 = |ch: &Chain, n: u64| -> Vec<PoolLog> {
+        let p = ch.pools[0].address;
+        ch.reports(n)
+            .into_iter()
+            .filter(|l| l.address == p || (l.topics.len() == 3 && (Address::from_slice(&l.topics[1].as_slice()[12..]) == p || Address::from_slice(&l.topics[2].as_slice()[12..]) == p)))
+            .collect()
+    };
+    let txs = ch.random_txs();
+    let n = ch.mine(&txs);
+    let mut m = ch.msg(n, only0(&ch, n), Some(n));
+    m.gap_reason = Some("start".into());
+    b2.send(m);
+    last = n;
+    b2.settle();
+    assert_eq!(b2.c("catchups_done"), 1);
+    // ~3 minutes in the bot's life: the other pools trade, the bot sends
+    // only the listed pool's reports.
+    for _ in 0..8 {
+        let txs = ch.random_txs();
+        let n = ch.mine(&txs);
+        b2.send(ch.msg(n, only0(&ch, n), Some(last)));
+        last = n;
+    }
+    b2.settle();
+    ch.connect_with(&mut b2, &[0, 1, 2]);
+    run_blocks(&mut ch, &mut [&mut b2], 3, &mut last);
+    b2.settle();
+    assert_eq!(b2.c("parked_resumed"), 2, "{:?}", b2.states());
+    assert_eq!(b2.c("loads"), 0, "no pool loaded: {:?}", b2.states());
+    exact_vs_chain(&ch, &b2, "deploy: both restarted");
 }
