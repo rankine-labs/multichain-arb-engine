@@ -909,7 +909,7 @@ pub struct C2Config {
     /// (busiest first).
     pub walk_max_slots: usize,
     /// Memory guard: no new walks while the process uses more than this
-    /// [ARBSIM_COPY2_WALK_MAX_RSS_MB, 300; 0 = no guard] (pm2 restarts the
+    /// [ARBSIM_COPY2_WALK_MAX_RSS_MB, 550; 0 = no guard] (pm2 restarts the
     /// sidecar at 400 MB, deploy/arbsim-pm2.sh). Status
     /// poolCoverage.walkPaused says why walks wait.
     pub walk_max_rss_mb: u64,
@@ -942,7 +942,7 @@ impl C2Config {
             walk: WalkCfg::from_env(),
             walks_inflight: env_u64("ARBSIM_COPY2_WALKS", 2).min(16) as usize,
             walk_max_slots: env_u64("ARBSIM_COPY2_WALK_MAX_SLOTS", 600_000) as usize,
-            walk_max_rss_mb: env_u64("ARBSIM_COPY2_WALK_MAX_RSS_MB", 300),
+            walk_max_rss_mb: env_u64("ARBSIM_COPY2_WALK_MAX_RSS_MB", 550),
             max_keep_logs: env_u64("ARBSIM_COPY2_MAX_KEEP_LOGS", 150_000).max(1000) as usize,
             pending_ms: env_u64("ARBSIM_COPY2_PENDING_MS", 1500),
         }

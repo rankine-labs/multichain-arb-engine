@@ -12,18 +12,20 @@
 #   like before the sidecar existed.
 #
 #   pm2 settings: name "arbsim", low priority (nice 5), restarted if it uses
-#   more than 400 MB, waits longer and longer between crash restarts (1 s up
+#   more than 800 MB, waits longer and longer between crash restarts (1 s up
 #   to 15 s) so a broken sidecar can't hog the server, timestamps in the
 #   logs. Log files are rotated by pm2-logrotate (already installed).
 #
-#   Why 400 MB (dry run #18 sizing, sim/tests/copy2_memory.rs): with ALL
-#   ~800 pools tick-walked (~300k values) copy 2 holds ~80 MB of data and
-#   the whole program measured ~100-145 MB steady, flat over thousands of
-#   blocks. 400 MB is ~3x that: room for load / walk bursts, busy checks and
-#   allocator slack, while the server keeps > 1.3 GB free next to the bot
-#   (~1.1 GB). The sidecar itself stops sending new tick walks at 300 MB
-#   (ARBSIM_COPY2_WALK_MAX_RSS_MB), well before this restart line. (The old
-#   150 MB line was below a fully walked copy: it would restart-loop.)
+#   Why 800 MB (live dry run #19 on this server, Oct 22 2026): with 733 of
+#   ~790 pools tick-walked the sidecar settled at ~393 MB RSS and stayed
+#   flat for 16+ minutes (the test sizing of ~145 MB was too low: real pools
+#   have more ticks). 800 MB is ~2x that: room for the remaining walks, load
+#   bursts and allocator slack, while the server keeps > 1 GB free next to
+#   the bot (~1.1 GB) on the 3.8 GB machine. The sidecar stops sending new
+#   tick walks at 550 MB (ARBSIM_COPY2_WALK_MAX_RSS_MB), well before this
+#   restart line. A restart is harmless anyway: the bot asks the node until
+#   the copy is ready again (~1 min). (The old 150 / 400 MB lines were at or
+#   below a fully walked copy: they would restart-loop.)
 #   A changed limit applies when pm2 (re)creates the app: on the next
 #   program update, or `bash deploy/arbsim-pm2.sh restart` after a stop.
 #
@@ -47,7 +49,7 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/arbsim-lib.sh"
 
 PM2_STATE_FILE="$BIN_DIR/.arbsim-pm2-state"
 # pm2 restarts the sidecar above this much memory (MB); see the header.
-ARBSIM_MEM_LIMIT_MB=400
+ARBSIM_MEM_LIMIT_MB=800
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [arbsim] $*"; }
 
 # say_once KEY MESSAGE: log only when the situation changes (no spam).

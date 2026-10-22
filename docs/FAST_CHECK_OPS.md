@@ -68,7 +68,7 @@ Turning it on for the first time:
 3. `pm2 restart dex-arb-shadow --update-env` (so the bot reads `LOCAL_SIM`).
 
 pm2 settings: app name `arbsim`, low priority (`nice 5`), restarted above
-400 MB memory (a fully tick-walked copy of ~800 pools measured ~100-145 MB;
+800 MB memory (dry run #19 on the server: ~393 MB with ~730 pools tick-walked, flat;
 see deploy/arbsim-pm2.sh), crash restarts wait longer each time (1 s up to 15 s), log
 lines timestamped, logs rotated by pm2-logrotate. After a server reboot it
 comes back by itself within 2 minutes (auto-deploy), no `pm2 save` needed.
@@ -128,7 +128,7 @@ Fastest first. None of these touch the bot's trading.
 3. Send Claude the output of `bash deploy/arbsim-pm2.sh status` and
    `pm2 logs arbsim --lines 100`. Things to look for:
    - `mismatch` above zero in "Self-check vs node"
-   - memory near 400 MB (new tick walks pause at 300 MB), or `pm2 status` showing many restarts
+   - memory near 800 MB (new tick walks pause at 550 MB), or `pm2 status` showing many restarts
    - "Paid node use today" near its cap, or "refused"
    - "NOT READY" for more than a few minutes while the bot is running
 

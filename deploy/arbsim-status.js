@@ -132,7 +132,7 @@ async function main() {
   else if (!s.ready) verdict = 'NOT READY yet: no copy of the chain yet (waiting for feed messages from the bot and the node); checks answer "unknown", the bot uses the node';
   else verdict = 'READY: answering checks from its own copy';
   lines.push(`FAST CHECK SIDECAR: ${verdict}`);
-  lines.push(`  Running for ${dur((s.uptimeS || 0) * 1000)}, memory ${s.rssMb ?? '?'} MB (pm2 restarts it above 400 MB)`);
+  lines.push(`  Running for ${dur((s.uptimeS || 0) * 1000)}, memory ${s.rssMb ?? '?'} MB (pm2 restarts it above 800 MB)`);
   if (info) lines.push(`  Program: built from ${(info.source_commit || '?').slice(0, 7)} on ${info.built_at || '?'} (sim ${(info.sim_tree || '?').slice(0, 8)})`);
 
   // 2. Head vs chain
