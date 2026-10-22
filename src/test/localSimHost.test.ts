@@ -70,7 +70,7 @@ function answerProfit(got: bigint, gas = '0x5323b'): Handler {
     if (m.type !== 'call') return reply({ id: m.id, ok: false, unknown: 'bad_request' });
     const call = m.calls[m.calls.length - 1];
     if (call.to?.toLowerCase() === SIM_EXECUTOR_ADDRESS) {
-      return reply({ id: m.id, ok: true, results: m.calls.map(() => ({ success: false, output: got > 0n ? insufficient(got) : insufficient(0n), gasUsed: gas })) });
+      return reply({ id: m.id, ok: true, us: 2400, t: { queue: 100, prep: 50, resolve: 0, facts: 300, runs: [1200, 600], post: 50 }, results: m.calls.map(() => ({ success: false, output: got > 0n ? insufficient(got) : insufficient(0n), gasUsed: gas })) });
     }
     // balanceOf probe: echo the single stateDiff value (slot found).
     const d: any = Object.values(m.overrides ?? {})[0];
@@ -173,6 +173,7 @@ async function main() {
     const trig = lines.find((l) => l.k === 'trig');
     assert(lines.length >= 3 && trig && trig.lv === 'loss' && trig.nv === 'profit' && trig.same === false && trig.np === '777' && typeof trig.lms === 'number' && typeof trig.lseen === 'number' && trig.seen && trig.sent && trig.ans, 'shadow log line: both verdicts, profits, times, timestamps (seen / sent / answer)');
     assert(lines.some((l) => l.lu === 'miss'), 'shadow log line carries the unknown reason');
+    assert(trig.lus === 2.5 && typeof trig.lrt === 'number' && trig.lt?.runs?.length === 2, `shadow log line carries arbsim's own time (lus ${trig.lus}), the round trip (lrt) and arbsim's split (lt)`);
     const hourLine = shadow.takeHourLine()!;
     assert(/^Fast check \(practice\): 3 checks, same answer 50%, unknown 33%, median \d+ ms vs node \d+ ms/.test(hourLine), `hour line in the agreed wording: "${hourLine}"`);
 

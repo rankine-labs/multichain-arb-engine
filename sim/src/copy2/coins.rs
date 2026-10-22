@@ -85,6 +85,24 @@ impl BalanceLayout {
         BalanceLayout { vyper: true, slot: U256::from(slot), solady: false }
     }
 
+    /// The 64 bytes hashed for `holder`'s balance slot (None: Solady's
+    /// 32-byte layout). Lets callers keep the result (checkview::memo_slot).
+    pub fn preimage(&self, holder: Address) -> Option<[u8; 64]> {
+        if self.solady {
+            return None;
+        }
+        let mut buf = [0u8; 64];
+        let s = self.slot.to_be_bytes::<32>();
+        if self.vyper {
+            buf[..32].copy_from_slice(&s);
+            buf[44..64].copy_from_slice(holder.as_slice());
+        } else {
+            buf[12..32].copy_from_slice(holder.as_slice());
+            buf[32..].copy_from_slice(&s);
+        }
+        Some(buf)
+    }
+
     /// Storage slot holding `holder`'s balance.
     pub fn key(&self, holder: Address) -> U256 {
         if self.solady {

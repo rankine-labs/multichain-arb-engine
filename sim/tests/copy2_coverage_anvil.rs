@@ -139,11 +139,16 @@ struct Opts {
     full_words: u64,
     /// Test pool: every position ABOVE the price (no liquidity below it).
     one_sided: bool,
+    /// V4 only: a second, deep V4 pool on the same two coins (0.3 %,
+    /// spacing 60) at pools[2] (copy2-p: the PoolManager balance bound).
+    second_v4: bool,
+    /// Test pool positions 100x thinner (a check can drain it).
+    thin: bool,
 }
 
 impl Default for Opts {
     fn default() -> Self {
-        Opts { walks: true, lm_credit: None, bot_shape: false, pm_bound: true, full_words: arbsim::copy2::walk::WalkCfg::default().full_words, one_sided: false }
+        Opts { walks: true, lm_credit: None, bot_shape: false, pm_bound: true, full_words: arbsim::copy2::walk::WalkCfg::default().full_words, one_sided: false, second_v4: false, thin: false }
     }
 }
 
@@ -243,7 +248,23 @@ impl World {
                 (p, 10)
             }
         };
-        let pools = vec![test, tracked(refp, PoolKind::V3, t0, t1)];
+        let mut pools = vec![test, tracked(refp, PoolKind::V3, t0, t1)];
+        if o.second_v4 && kind == K::V4 {
+            let pm = pools[0].address;
+            let mut p2 = TrackedPool { address: pm, v4_id: None, kind: PoolKind::V4, token0: t0, token1: t1, fee: 3000, tick_spacing: 60 };
+            p2.v4_id = Some(arbsim::copy2::replay::v4_pool_id(&p2));
+            a.send_ok(pm, &calldata("initialize((address,address,uint24,int24,address),uint160)", &[Arg::A(t0), Arg::A(t1), Arg::W(U256::from(3000)), Arg::I(60), Arg::A(Address::ZERO), Arg::W(sqrt_price_for(2500.0, uu, ww))]));
+            let s0 = u(&a.ok("eth_getStorageAt", json!([ha(pm), hx64(map_slot(U256::from_be_bytes(p2.v4_id.unwrap().0), U256::from(6))), "latest"])));
+            let t = ((s0 >> 160usize) & U256::from(0xff_ffffu32)).to::<i64>();
+            let t = if t >= 1 << 23 { t - (1 << 24) } else { t };
+            let b = t.div_euclid(60) * 60;
+            // Deep: 100x the test pool's biggest position, +-12,000 ticks.
+            a.send_ok(trader, &calldata(
+                "modify((address,address,uint24,int24,address),int24,int24,int256,bytes32)",
+                &[Arg::A(t0), Arg::A(t1), Arg::W(U256::from(3000)), Arg::I(60), Arg::A(Address::ZERO), Arg::I((b - 12_000) as i128), Arg::I((b + 12_000) as i128), Arg::W(q(18)), Arg::W(U256::ZERO)],
+            ));
+            pools.push(p2);
+        }
         // The copy (it starts only with `track` + the first block message).
         let node = Arc::new(Node { a: a.clone(), calls: Mutex::new(HashMap::new()), requests: AtomicU64::new(0) });
         let nd: Arc<dyn NodeApi> = node.clone();
@@ -262,7 +283,7 @@ impl World {
         // Many positions, spread far (quadratic widths): big swaps cross
         // many ticks and many tick-map words.
         for k in 1..=18i64 {
-            let liq = q(15) * U256::from((k % 4 + 1) as u64);
+            let liq = q(if o.thin { 13 } else { 15 }) * U256::from((k % 4 + 1) as u64);
             let tick = w.tick(0);
             let b = tick.div_euclid(spacing) * spacing;
             // Widest position ~30,000 ticks (inside the walked window).
@@ -1097,5 +1118,71 @@ fn bot_v4_protocol_fee_counter_answers_with_the_higher_gas() {
     assert!(extra.iter().any(|x| *x == 17_100), "the costlier zero -> non-zero store is reported: {extra:?}");
     assert!(st["counters"]["protocol_fee_same"].as_u64().unwrap() >= 6);
     assert_eq!(st["counters"]["protocol_fee_differ"], json!(0));
+    w.h.stop();
+}
+
+/// copy2-p (live Oct 22 16:19: checks ~120 ms): a check's PoolManager
+/// balance bound is first summed over the pools the check itself traded on
+/// (cheap); only if the two runs then differ is the check run again with
+/// the full bound (every ready V4 pool), exactly the old way. Here: a
+/// check that drains the test pool's USD side takes MORE than that pool's
+/// own bound (rounding), so the route-only bound gives different runs; the
+/// second, deep V4 pool on the same coins makes the full bound enough:
+/// the check is answered, exactly as the chain does (and as before). Small
+/// checks never need the full bound.
+#[test]
+fn bot_v4_route_bound_falls_back_to_the_full_bound() {
+    // The test pool holds only token0 (every position above the price): a
+    // check whose V4 hop pays token0 out can drain it.
+    let o = Opts { bot_shape: true, pm_bound: true, full_words: 8000, second_v4: true, one_sided: true, thin: true, ..Opts::default() };
+    let Some(mut w) = World::start_with(K::V4, o) else {
+        eprintln!("copy2 coverage anvil test SKIPPED: no ~/.foundry/bin/anvil");
+        return;
+    };
+    w.go_live();
+    w.wait("tick walks", |w| w.walked());
+    w.settle();
+    let n = w.block(&[]);
+    w.settle();
+    // V4 first (USD in, WETH out) pays WETH; V3 first then V4 (WETH in,
+    // USD out) pays USD: pick the one paying token0.
+    let t0_is_weth = w.ww < w.uu;
+    let dir = t0_is_weth;
+    for _ in 0..3 {
+        let _ = w.compare(n, 100, dir);
+        w.settle();
+    }
+    let c = |w: &World, k: &str| w.h.status_json(false)["counters"][k].as_u64().unwrap_or(0);
+    // Small checks: the route's own pool is enough.
+    for usd in [100u64, 1_000] {
+        let (same, d) = w.compare(n, usd, dir);
+        assert_eq!(same, Some(true), "small check exact ({usd} USD): {d}");
+    }
+    assert_eq!(c(&w, "pm_bound_full_retry"), 0, "small checks never need the full bound");
+    assert!(c(&w, "pm_bound_route_only") >= 2);
+    // Bigger and bigger checks paying USD out of the test pool (V3 first,
+    // then the V4 test pool sells WETH for USD): one drains its USD side.
+    let (mut answered, mut retried_and_answered) = (0, 0);
+    for usd in [10_000u64, 30_000, 100_000, 300_000, 1_000_000] {
+        let before = c(&w, "pm_bound_full_retry");
+        match w.compare(n, usd, dir) {
+            (Some(same), d) => {
+                assert!(same, "copy answer DIFFERS from the chain ({usd} USD): {d}");
+                answered += 1;
+                if c(&w, "pm_bound_full_retry") > before {
+                    retried_and_answered += 1;
+                }
+                eprintln!("answered ({usd} USD): full bound needed {}: {}", c(&w, "pm_bound_full_retry") > before, d["copy"]["output"].as_str().unwrap_or("").get(..10).unwrap_or(""));
+            }
+            (None, a) => eprintln!("unknown ({usd} USD): {}", a["unknown"]),
+        }
+        w.settle();
+    }
+    let st = w.h.status_json(false);
+    eprintln!(
+        "route bound: answered {answered}, of which needed the full bound {retried_and_answered}; counters route-only {} full retry {} same {} differ {}",
+        st["counters"]["pm_bound_route_only"], st["counters"]["pm_bound_full_retry"], st["counters"]["pm_bound_same"], st["counters"]["pm_bound_differ"]
+    );
+    assert!(retried_and_answered >= 1, "a drain of the test pool is answered with the full bound: {st}");
     w.h.stop();
 }

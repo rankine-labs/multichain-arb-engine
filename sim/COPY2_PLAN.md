@@ -793,3 +793,86 @@ trade ~20 ms.
   checks answered (the rest: other first-read misses, pending reports).
   Not addressed: "reports may be missing and the node's logs could not be
   read" (14; settle eth_getLogs failing > 60 s) - watch it next hour.
+
+- Live shadow Oct 22 16:19-17:35 UTC, check speed (inbot-sim/copy2-p): the
+  bot timed its fast check at p50 63 ms / p90 122 ms (max 237), slower than
+  the node (61-147 ms); 257 of its questions hit LOCAL_SIM_TIMEOUT_MS (60)
+  ("lu":"timeout"), so "copy 2 vs node: 90 checks ... fast check unsure 90".
+  1. Measuring: every `call` / `size_search` answer now carries `t` =
+     microseconds per step (queue for a worker, prep = reading the request,
+     resolve = picking the version incl. a "dirty" wait, facts = copy 2's
+     V4 facts, runs = each EVM run, post); `status` shows checkTiming
+     (p50 / p90 / p99 / max of the last 1000, plus the time to write the
+     answer), applyTiming (copy-2 block applies) and lockHold (the copy's
+     thread holding a lock checks need for > 1 ms) (src/timing.rs;
+     deploy/arbsim-status.js prints them). Bot side: data/local-sim-
+     shadow.jsonl lines carry `lus` (arbsim's own time incl. queue, ms),
+     `lrt` (socket round trip the bot measured) and `lt` (arbsim's split);
+     the hourly log line adds "arbsim own time median / p90" and answers
+     that came after the timeout (how late, arbsim's own time for them).
+  2. Bench (tests/copy2_latency.rs, anvil, live shape: one V4 PoolManager
+     with stock-coin / USDG pools, half with a protocol fee on, the same
+     pairs as V3 pools with price histories, USDG / WETH on both, the
+     bot's report shape; copy 2 on its own thread with loaders and walks,
+     a block maker trading ~9 blocks/s, the bot's real 2-pool round trip
+     over the real socket server, every 5th answer compared with the
+     chain). Full size `COPY2_LAT_PAIRS=320` = 640 pools, 88k walked
+     values, 2 workers. BEFORE: ~150 ms per check (warm-up avg 152 ms,
+     max 287 ms): t = queue 0.01, prep 0.05, resolve 0, facts 0.8-1.3 ms,
+     FIRST EVM run 118-157 ms, every later run 0.4 ms. Cause: the first
+     run that reads a V4 PoolManager coin balance computes the proven lower
+     bound (dry run "PoolManager balance" fix) = the sum over EVERY ready
+     V4 pool holding that coin (USDG: all ~320) of a walk over that pool's
+     whole tick map (tick spacing 60: ~60 words each way, spacing 1: ~3500),
+     and every word not held was looked up in EVERY pool's far-zero list
+     (320 binary searches per word). Scales with the number of V4 pools:
+     48 pools gave 4 ms, 640 pools 150 ms (live ~290 V4 pools: ~60-130 ms,
+     matching the bot's 63 / 122).
+  3. Fixes (same answers; checkview.rs header):
+     - The bound is first summed over the pools THIS check traded on (the
+       run read their slot0 before the PoolManager settles / takes), plus
+       other pools only while it is still 0 (the coin a check pays in on a
+       one-sided pool). Any proven lower bound is sound; a too small one
+       only makes the two runs differ, and then (only then) both runs are
+       repeated with the full bound (every ready V4 pool), exactly the old
+       way. Counters pm_bound_route_only / pm_bound_full_retry.
+       ARBSIM_COPY2_BOUND_FULL=1 = always the full bound (old way, slower).
+     - Far-zero lookups: one merged sorted list per account, cached across
+       checks while the very same lists apply (the cache holds the lists,
+       so "same" can't be a look-alike); the bound reads only its own
+       pool's list.
+     - Tick-map word slots per pool computed once (keccak) and kept;
+       protocol-fee / balance / slot0 slot numbers remembered (each check
+       built ~1,600 keccaks into its facts).
+     Proof of "same answers": the full bench run with
+     ARBSIM_COPY2_BOUND_FULL=1 and without gives the same answered /
+     unknown counts (166 answered, 17 pool_manager_balance, 17 miss of
+     200), every 5th answer equals the chain; checkview tests
+     (remembered numbers == computed ones, route / full bound), anvil
+     bot_v4_route_bound_falls_back_to_the_full_bound (a check that drains
+     its pool needs the full bound: answered exactly via the retry; small
+     checks never retry), and all earlier copy-2 tests.
+  4. AFTER (640 pools, 200 checks, bot-side): p50 2.8 ms, p90 8.3 ms, p99
+     21 ms (all checks); one EVM run p50 0.6 ms; facts p50 0.5 ms; queue
+     ~0; block apply p50 1.0 ms, max 5 ms; no lock held > 1 ms. The tail is
+     checks that needed the full bound (most then still "unknown":
+     pool_manager_balance) and 4-run protocol-fee checks; size_search
+     (on mode) p50 4.8 ms, p99 17 ms. Normal test (120 pairs = 240 pools)
+     fails if the bot-side p50 of answered checks > 10 ms or p99 > 40 ms
+     (COPY2_LAT_MAX_P50_MS / _P99_MS).
+  Not changed: ARBSIM_WORKERS stays 2 (t3.medium = 2 vCPUs, shared with
+  the bot; checks are now a few ms, the queue wait ~0); the release
+  build already has lto=fat, codegen-units=1, panic=abort (no
+  target-cpu: the binary must run on any x86-64); the bot's
+  LOCAL_SIM_TIMEOUT_MS stays 60 (10x the expected p50; raising it would
+  only hide a slow sidecar and delay the node fallback).
+  Not answered here: "slowest block 807 ms" (status apply_us_max) did not
+  show in the bench (max 5-7 ms); applyTiming now gives its p50 / p99 live.
+  The likely one-off is the first block after start ("start" reload of
+  every pool). Also to watch: a trigger check asks about the block of the
+  trade's reports (copy2Route(minBlock = the trade's block)), which the
+  bot's forwarder may pass on only up to COPY2_GRACE_MS (30) later; such
+  a check gets "not_ready: seq N not received yet" at once and the node
+  decides (`lu` "not_ready" in the jsonl). If that is common, the bot
+  could wait for the forwarder to pass that block on (<= ~30 ms) before
+  asking.

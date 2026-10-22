@@ -1,6 +1,6 @@
 import { promises as fsp, existsSync, statSync, mkdirSync } from 'fs';
 import { dirname } from 'path';
-import { LocalSimClient, LocalSimClientOptions, LocalSimMode, localSimMode, makeLocalRpc, SidecarAnswer, LOCAL_UNKNOWN_PREFIX } from './localSim';
+import { LocalSimClient, LocalSimClientOptions, LocalSimMode, localSimMode, makeLocalRpc, SidecarAnswer, SidecarTiming, insideMs, LOCAL_UNKNOWN_PREFIX } from './localSim';
 import { simulateRoundTrip, SimResult, SIM_EXECUTOR_ADDRESS } from './simulator';
 import type { ExecutorHop } from './executorCalldata';
 import { classifySimOutcome, isTradeVerdict } from '../core/failReasons';
@@ -210,6 +210,11 @@ const median = (xs: number[]): number | null => {
   const a = [...xs].sort((x, y) => x - y);
   return a[Math.floor(a.length / 2)];
 };
+const p90 = (xs: number[]): number | null => {
+  if (!xs.length) return null;
+  const a = [...xs].sort((x, y) => x - y);
+  return a[Math.min(a.length - 1, Math.floor(a.length * 0.9))];
+};
 const pct = (n: number, d: number): string => (d ? `${Math.round((100 * n) / d)}%` : 'n/a');
 const ADDR_RE = /^0x[0-9a-fA-F]{40}$/;
 const short = (h?: string) => (h ? h.slice(0, 12) : undefined);
@@ -221,6 +226,10 @@ export class LocalCheck {
   local: LocalOutcome | null = null;
   // The last question sent to the sidecar for OUR contract call (for the size search).
   lastSent: Record<string, unknown> | null = null;
+  // Timing of the sidecar's reply to OUR contract call (sure or not):
+  // inside = arbsim's own time incl. its queue (ms), rt = round trip the
+  // bot measured (ms), t = arbsim's split (microseconds). For the log.
+  sidecar: { inside?: number; rt?: number; t?: SidecarTiming } | null = null;
   decidedByLocal = false;   // on mode: the fast check made the decision
   sampled = false;          // on mode: this decision is re-checked with the node
   private node: { sim: SimResult | null; startMs: number; endMs: number; where?: string } | null = null;
@@ -310,11 +319,14 @@ export class LocalSimHost {
 
   // Hourly counters (taken by takeHourLine).
   private hour = this.freshHour();
+  private lateSeen = 0;
   private freshHour() {
     return {
       checks: 0, compared: 0, same: 0, unknown: 0, down: 0, errors: 0,
       decidedLocal: 0, decidedNode: 0, sampleChecks: 0, sampleSame: 0,
       localMs: [] as number[], nodeMs: [] as number[], seenToAnswerMs: [] as number[],
+      // arbsim's own time for our contract call (ms, its queue included).
+      insideMs: [] as number[],
       unknownWhy: {} as Record<string, number>,
       mismatchNew: 0, autoOffs: 0,
       // Copy 2 only (checks asked about a copy-2 block, at:{block}): the
@@ -521,6 +533,11 @@ export class LocalSimHost {
           const g = (a as { results?: Array<{ gasUsed?: string }> }).results?.[0]?.gasUsed;
           try { gasUsed = g ? BigInt(g) : undefined; } catch { gasUsed = undefined; }
         },
+        onReply: (_m: string, a: SidecarAnswer, sent: Record<string, unknown>) => {
+          const call = (sent.calls as Array<{ to?: string }> | undefined)?.[0];
+          if (call?.to?.toLowerCase() !== SIM_EXECUTOR_ADDRESS) return;
+          c.sidecar = { inside: insideMs(a), rt: typeof a.rtMs === 'number' ? a.rtMs : undefined, t: a.t };
+        },
       });
       // slotReadOnly: a local answer may READ the bot's "where does this coin
       // keep balances" notes, never add to them (so it can't change node checks).
@@ -593,6 +610,7 @@ export class LocalSimHost {
       const seen = c.q.seenMs ?? this.seenMsOf(c.q.triggerHash);
       this.hour.checks++;
       this.hour.localMs.push(l.answerMs - l.requestMs);
+      if (c.sidecar?.inside !== undefined) { this.hour.insideMs.push(c.sidecar.inside); if (this.hour.insideMs.length > 5_000) this.hour.insideMs.shift(); }
       if (seen !== undefined) this.hour.seenToAnswerMs.push(l.answerMs - seen);
       if (node) this.hour.nodeMs.push(node.endMs - node.startMs);
       if (!l.sure) { this.hour.unknown++; const w = l.why ?? 'unknown'; this.hour.unknownWhy[w] = (this.hour.unknownWhy[w] ?? 0) + 1; }
@@ -622,6 +640,11 @@ export class LocalSimHost {
         // local answer
         lv: l.verdict, lp: profitOf(l.sim), lg: l.gasUsed, lu: l.sure ? undefined : l.why,
         lms: l.answerMs - l.requestMs, lseen: seen !== undefined ? l.answerMs - seen : undefined,
+        // arbsim's own time for our contract call (ms, queue included), the
+        // socket round trip the bot measured (ms) and arbsim's split (us):
+        // lms much above lrt = the bot's own wait; lrt much above lus =
+        // socket / the bot reading late; lt says which arbsim step.
+        lus: c.sidecar?.inside, lrt: c.sidecar?.rt, lt: c.sidecar?.t,
         // node answer (absent = no node check: on mode, not re-checked)
         nv, np: profitOf(node?.sim), ng: gasN,
         nr: node?.sim && 'reason' in node.sim ? node.sim.reason.slice(0, 80) : node?.sim && node.sim.status !== 'profit' && node.sim.status !== 'loss' ? node.sim.status : undefined,
@@ -679,7 +702,15 @@ export class LocalSimHost {
     if (h.c2.checks) line += `; copy 2 vs node: ${h.c2.checks} checks, same ${h.c2.same}, different ${h.c2.different}, fast check unsure ${h.c2.unknown}${h.c2.noNode ? `, node no answer ${h.c2.noNode}` : ''} (same answer ${pct(h.c2.same, h.c2.same + h.c2.different)})`;
     if (c2) line += `; ${c2}`;
     const whys = Object.entries(h.unknownWhy).sort((a, b) => b[1] - a[1]).slice(0, 3).map(([w, n]) => `${w} ${n}`).join(', ');
-    this.log(`[local-sim] hour: ${line}${whys ? ` | unknown because: ${whys}` : ''}${h.errors ? ` | errors ${h.errors}` : ''}${this.shadowLog.dropped ? ` | log lines dropped ${this.shadowLog.dropped}` : ''}`);
+    // arbsim's own time (vs the bot-side median above) and answers that came
+    // after the bot had given up: log only.
+    const st = this.client.stats;
+    const late = st.lateAnswers - this.lateSeen;
+    this.lateSeen = st.lateAnswers;
+    const im = median(h.insideMs), ip = p90(h.insideMs);
+    const timing = im !== null ? ` | arbsim own time median ${im} ms, p90 ${ip} ms` : '';
+    const lateTxt = late > 0 ? ` | ${late} answer(s) came after the ${this.settings.timeoutMs} ms timeout (median ${median(st.lateMs) ?? 'n/a'} ms after sending; arbsim own time median ${median(st.lateInsideMs) ?? 'n/a'} ms)` : '';
+    this.log(`[local-sim] hour: ${line}${whys ? ` | unknown because: ${whys}` : ''}${timing}${lateTxt}${h.errors ? ` | errors ${h.errors}` : ''}${this.shadowLog.dropped ? ` | log lines dropped ${this.shadowLog.dropped}` : ''}`);
     return line;
   }
 

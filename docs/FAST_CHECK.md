@@ -44,7 +44,11 @@ pools and their coins, the V4 PoolManager, approved loan pools, routers).
   2 MB, the older half in `.jsonl.1`). Fields: `lv`/`nv` fast/node verdict,
   `lp`/`np` profit, `lg`/`ng` gas, `lms`/`nms` time to answer, `lseen`/`nseen`
   time since the trade was seen, `lu` why it wasn't sure, `seen`/`sent`/`ans`
-  timestamps. Lines with `"k":"signed"` give "trade seen -> trade signed" for
+  timestamps, and (since copy2-p) `lus` = the fast check's OWN time for our
+  contract call (ms, its queue included), `lrt` = the socket round trip the
+  bot measured (ms), `lt` = the fast check's split in microseconds (queue /
+  prep / resolve / facts / runs / post). `lms` far above `lrt` = the bot
+  itself was busy; `lrt` far above `lus` = the answer was read late. Lines with `"k":"signed"` give "trade seen -> trade signed" for
   live sends (`seenToSignedMs`), the number behind the 10-20 ms target.
 
 ## Automatic safety
@@ -189,6 +193,21 @@ the node. So:
 Set `LOCAL_SIM=off` in `.env` and `pm2 restart dex-arb-shadow`. That's all.
 For an instant stop without restarting the bot: `bash deploy/arbsim-pm2.sh stop`
 (the bot falls back to the node within a fraction of a second).
+
+## Speed (copy2-p)
+
+Each check should take a few ms inside the fast check (bench with 640
+pools: median ~3 ms, p99 ~20 ms). Where to look if it is slow:
+
+- `pm2 logs dex-arb-shadow | grep "local-sim] hour"`: `arbsim own time
+  median X ms, p90 Y ms`, and `N answer(s) came after the 60 ms timeout`.
+- `bash deploy/arbsim-pm2.sh status`: "Check speed" lines (queue, pick
+  block, copy-2 facts, EVM runs, ...), block apply times, locks held.
+- `ARBSIM_COPY2_BOUND_FULL=1` (arbsim side) = the old, slower V4
+  PoolManager balance bound (only to compare; answers are the same).
+
+`LOCAL_SIM_TIMEOUT_MS` stays 60: about 10x the expected time. Raising it
+would only hide a slow fast check and start the node later.
 
 ## Rarely needed settings
 

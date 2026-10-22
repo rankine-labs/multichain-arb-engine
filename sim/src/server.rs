@@ -43,6 +43,7 @@ use crate::state::pinned::{PinnedCache, PinnedErr};
 use crate::state::snap::View;
 use crate::state::updater::UpdaterHandle;
 use crate::state::StateRead;
+use crate::timing::Tm;
 
 /// Everything request handlers need.
 pub struct Ctx {
@@ -70,6 +71,8 @@ type Writer = Arc<Mutex<BufWriter<UnixStream>>>;
 struct Job {
     req: Value,
     out: Writer,
+    /// When the socket thread read it (queue wait = until a worker takes it).
+    queued: Instant,
 }
 
 /// Start the server (blocks forever, serving connections).
@@ -115,8 +118,14 @@ fn worker(ctx: Arc<Ctx>, rx: Arc<Mutex<Receiver<Job>>>) {
             Ok(j) => j,
             Err(_) => return,
         };
-        let answer = handle(&ctx, &job.req);
+        let mut tm = Tm { queue_us: job.queued.elapsed().as_micros() as u64, ..Tm::default() };
+        let answer = handle_tm(&ctx, &job.req, &mut tm);
+        let t_send = Instant::now();
         send(&job.out, &answer);
+        if answer.get("t").is_some() {
+            let inside = tm.queue_us + answer.get("us").and_then(|u| u.as_u64()).unwrap_or(0);
+            crate::timing::record_check(&tm, inside, t_send.elapsed().as_micros() as u64);
+        }
     }
 }
 
@@ -163,7 +172,7 @@ fn connection(ctx: Arc<Ctx>, stream: UnixStream, jobs: SyncSender<Job>) -> std::
             continue;
         }
         let id = req.get("id").cloned().unwrap_or(Value::Null);
-        if jobs.try_send(Job { req, out: out.clone() }).is_err() {
+        if jobs.try_send(Job { req, out: out.clone(), queued: Instant::now() }).is_err() {
             send(&out, &unknown(&id, "not_ready", "sidecar busy", 0));
         }
     }
@@ -172,6 +181,11 @@ fn connection(ctx: Arc<Ctx>, stream: UnixStream, jobs: SyncSender<Job>) -> std::
 
 /// Answer one question (also used directly by tests).
 pub fn handle(ctx: &Ctx, req: &Value) -> Value {
+    handle_tm(ctx, req, &mut Tm::default())
+}
+
+/// Answer one question, noting where the time went (checks: answer "t").
+pub fn handle_tm(ctx: &Ctx, req: &Value, tm: &mut Tm) -> Value {
     let id = req.get("id").cloned().unwrap_or(Value::Null);
     let t0 = Instant::now();
     match req.get("type").and_then(|t| t.as_str()) {
@@ -184,6 +198,11 @@ pub fn handle(ctx: &Ctx, req: &Value) -> Value {
             s["pinnedBlocks"] = json!(ctx.pinned.cached());
             if let Some(c) = &ctx.copy2 {
                 s["copy2"] = c.status_json(req.get("pools").and_then(|p| p.as_bool()).unwrap_or(false));
+            }
+            if let Value::Object(t) = crate::timing::status() {
+                for (k, v) in t {
+                    s[k] = v;
+                }
             }
             s
         }
@@ -213,7 +232,8 @@ pub fn handle(ctx: &Ctx, req: &Value) -> Value {
                 Ok(r) => r,
                 Err(e) => return bad_request(&id, &format!("call: {e}")),
             };
-            check(ctx, &id, &r.at, t0, |view, c| handle_call(view, c, &r))
+            tm.prep_us = t0.elapsed().as_micros() as u64;
+            check(ctx, &id, &r.at, t0, tm, |view, c| handle_call(view, c, &r))
         }
         Some("size_search") => {
             warm_check_accounts(ctx, req);
@@ -222,7 +242,8 @@ pub fn handle(ctx: &Ctx, req: &Value) -> Value {
                 Ok(r) => r,
                 Err(e) => return bad_request(&id, &format!("size_search: {e}")),
             };
-            check(ctx, &id, &r.at, t0, |view, c| handle_size_search(view, c, &r))
+            tm.prep_us = t0.elapsed().as_micros() as u64;
+            check(ctx, &id, &r.at, t0, tm, |view, c| handle_size_search(view, c, &r))
         }
         Some(t) => bad_request(&id, &format!("unknown request type '{t}'")),
         None => bad_request(&id, "request has no type"),
@@ -283,7 +304,15 @@ fn caller_as_empty(ctx: &Ctx, req: &Value) -> Value {
 }
 
 /// Pick the state for `at`, run the check, learn from misses.
-fn check(ctx: &Ctx, id: &Value, at: &Value, t0: Instant, run: impl Fn(&dyn StateRead, &BlockCtx) -> Value) -> Value {
+fn check(ctx: &Ctx, id: &Value, at: &Value, t0: Instant, tm: &mut Tm, run: impl Fn(&dyn StateRead, &BlockCtx) -> Value) -> Value {
+    let mut a = check_inner(ctx, id, at, t0, tm, run);
+    let used = tm.prep_us + tm.resolve_us + tm.facts_us + tm.runs_us.iter().sum::<u64>();
+    tm.post_us = (t0.elapsed().as_micros() as u64).saturating_sub(used);
+    a["t"] = tm.json();
+    a
+}
+
+fn check_inner(ctx: &Ctx, id: &Value, at: &Value, t0: Instant, tm: &mut Tm, run: impl Fn(&dyn StateRead, &BlockCtx) -> Value) -> Value {
     let sh = &ctx.shared;
     Stats::inc(&sh.stats.checks);
     let at = match parse_at(at) {
@@ -293,7 +322,10 @@ fn check(ctx: &Ctx, id: &Value, at: &Value, t0: Instant, run: impl Fn(&dyn State
     if let At::Pinned { block, next } = at {
         return pinned_check(ctx, id, block, next, t0, run);
     }
-    let picked = match sh.resolve(&at) {
+    let t_res = Instant::now();
+    let resolved = sh.resolve(&at);
+    tm.resolve_us = t_res.elapsed().as_micros() as u64;
+    let picked = match resolved {
         Ok(p) => p,
         Err(e) => {
             Stats::inc(&sh.stats.checks_unknown);
@@ -306,8 +338,13 @@ fn check(ctx: &Ctx, id: &Value, at: &Value, t0: Instant, run: impl Fn(&dyn State
     let block = picked.seq + sh.cfg.l2_offset;
     let view = View::new(picked.snap);
     let mut answer = match &ctx.copy2 {
-        None => run(&view, &picked.ctx),
-        Some(c) => copy2_run(c, &view, block, &picked.ctx, &run),
+        None => {
+            let t = Instant::now();
+            let a = run(&view, &picked.ctx);
+            tm.runs_us.push(t.elapsed().as_micros() as u64);
+            a
+        }
+        Some(c) => copy2_run(c, &view, block, &picked.ctx, tm, &run),
     };
     if ctx.copy2.is_none() {
         ctx.updater.touched(view.take_touched());
@@ -365,15 +402,30 @@ fn check(ctx: &Ctx, id: &Value, at: &Value, t0: Instant, run: impl Fn(&dyn State
 /// too, if it read a balance): the answer stands only if the two differ in
 /// gas alone; it then reports the HIGHER gas of each gas field (counter 0 =
 /// the costlier 0 -> non-zero store), so the bot never overestimates profit.
-fn copy2_run(c: &Copy2Handle, view: &View, block: u64, bctx: &BlockCtx, run: &impl Fn(&dyn StateRead, &BlockCtx) -> Value) -> Value {
+fn copy2_run(c: &Copy2Handle, view: &View, block: u64, bctx: &BlockCtx, tm: &mut Tm, run: &impl Fn(&dyn StateRead, &BlockCtx) -> Value) -> Value {
+    let t_facts = Instant::now();
     let facts = c.check_facts(block);
+    tm.facts_us = t_facts.elapsed().as_micros() as u64;
+    let runs = std::cell::RefCell::new(Vec::<u64>::new());
+    let a = copy2_runs(c, view, &facts, bctx, &runs, run);
+    tm.runs_us = runs.into_inner();
+    a
+}
+
+fn copy2_runs(c: &Copy2Handle, view: &View, facts: &crate::copy2::checkview::C2Facts, bctx: &BlockCtx, runs: &std::cell::RefCell<Vec<u64>>, run: &impl Fn(&dyn StateRead, &BlockCtx) -> Value) -> Value {
+    let timed = |v: &dyn StateRead| {
+        let t = Instant::now();
+        let a = run(v, bctx);
+        runs.borrow_mut().push(t.elapsed().as_micros() as u64);
+        a
+    };
     if facts.is_empty() {
-        return run(view, bctx);
+        return timed(view);
     }
     let zero = revm::primitives::U256::ZERO;
     let run_at = |offset, fee| {
-        let v = C2View::with_fee(view, &facts, offset, fee);
-        let a = run(&v, bctx);
+        let v = C2View::with_fee(view, facts, offset, fee);
+        let a = timed(&v);
         let (b, f) = (v.used_bound(), v.used_fee());
         (a, b, f)
     };
@@ -385,18 +437,29 @@ fn copy2_run(c: &Copy2Handle, view: &View, block: u64, bctx: &BlockCtx, run: &im
     const PM_DETAIL: &str = "the answer depends on the V4 PoolManager's coin / ETH balance, which copy 2 does not follow (same check at a proven lower bound and far above it differ)";
     // One fee value: the run at the bound, confirmed far above it if it read
     // a PoolManager balance. Err = the unknown answer to give.
+    // The bound is first summed over the pools this check traded on only
+    // (checkview.rs: any proven lower bound is sound; a too small one only
+    // makes the two runs differ). If they differ with that smaller bound,
+    // both runs again with the full bound (every ready V4 pool), as before.
     let confirmed = |fee| -> Result<(Value, bool), Value> {
-        let (a, used_bound, used_fee) = run_at(zero, fee);
-        if !used_bound || !ok(&a) {
-            return Ok((a, used_fee));
-        }
-        let (again, _, _) = run_at(high_offset(), fee);
-        let same = strip_us(&a) == strip_us(&again);
-        c.note_pm_bound(same);
-        if same {
-            Ok((a, used_fee))
-        } else {
-            Err(unknown(&a, "pool_manager_balance", PM_DETAIL))
+        loop {
+            let (a, used_bound, used_fee) = run_at(zero, fee);
+            if !used_bound || !ok(&a) {
+                return Ok((a, used_fee));
+            }
+            let (again, _, _) = run_at(high_offset(), fee);
+            let same = strip_us(&a) == strip_us(&again);
+            let partial = facts.partial_used.load(std::sync::atomic::Ordering::Relaxed) && !facts.full.load(std::sync::atomic::Ordering::Relaxed);
+            if !same && partial {
+                c.note_pm_bound_kind(true);
+                facts.go_full();
+                continue;
+            }
+            if partial {
+                c.note_pm_bound_kind(false);
+            }
+            c.note_pm_bound(same);
+            return if same { Ok((a, used_fee)) } else { Err(unknown(&a, "pool_manager_balance", PM_DETAIL)) };
         }
     };
     let (a, used_fee) = match confirmed(zero) {

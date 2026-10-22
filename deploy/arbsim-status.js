@@ -204,6 +204,27 @@ async function main() {
     if (k.protocol_fee_checks) {
       lines.push(`    V4 protocol fee counter: ${n(k.protocol_fee_checks)} checks ran with it 0 and not 0: ${n(k.protocol_fee_same)} answered (higher gas reported), ${n(k.protocol_fee_differ)} unknown`);
     }
+    // copy2-p: PoolManager balance bound from the route's pools first.
+    if (k.pm_bound_checks) {
+      lines.push(`    V4 PoolManager balance: ${n(k.pm_bound_checks)} checks ran at a lower bound and far above it: ${n(k.pm_bound_same)} same, ${n(k.pm_bound_differ)} different (unknown); ` +
+        `bound from the route's pools ${n(k.pm_bound_route_only)}, run again with every pool ${n(k.pm_bound_full_retry)}`);
+    }
+  }
+
+  // 2c. Check speed (copy2-p): where a check's time goes inside arbsim.
+  const ct = s.checkTiming;
+  if (ct && ct.total && ct.total.n) {
+    const ms = (v) => (v == null ? '?' : (v / 1000).toFixed(1));
+    const p = (x) => (x && x.n ? `${ms(x.p50)} / ${ms(x.p90)} / ${ms(x.p99)}` : '-');
+    lines.push(`  Check speed, last ${n(ct.total.n)} checks (ms, median / p90 / p99): total inside arbsim ${p(ct.total)}` +
+      (ct.total.p50 > 10000 ? '  <-- SLOW, tell Claude' : ''));
+    lines.push(`    queue ${p(ct.queue)}, read request ${p(ct.prep)}, pick block ${p(ct.resolve)}, copy-2 facts ${p(ct.facts)}, ` +
+      `EVM runs ${p(ct.runSum)} (runs per check median ${ct.runs && ct.runs.p50}, max ${ct.runs && ct.runs.max}), after ${p(ct.post)}, writing answer ${p(ct.send)}`);
+  }
+  const at = s.applyTiming;
+  if (at && at.n) {
+    lines.push(`    copy-2 block apply (ms, last ${n(at.n)}): median ${(at.p50 / 1000).toFixed(1)}, p90 ${(at.p90 / 1000).toFixed(1)}, p99 ${(at.p99 / 1000).toFixed(1)}, max ${(at.max / 1000).toFixed(1)}` +
+      (s.lockHold && s.lockHold.n ? `; locks held over 1 ms: ${n(s.lockHold.n)}, longest ${(s.lockHold.max / 1000).toFixed(1)} ms` : ''));
   }
 
   // 3. How the copy is kept current (copy 1, the feed replay)
