@@ -361,6 +361,9 @@ export type Copy2ForwarderOptions = {
   headerTries?: number;      // header reads from the node per block (node a little behind: null answer), default 3
   headerRetryMs?: number;    // wait between those reads (default 150)
   maxBackfill?: number;      // most blocks filled in after an outage (default 200)
+  fillWaitMs?: number;       // fill-in: wait at most this long for the HTTP node to catch up (default 3000)
+  fillPollMs?: number;       // fill-in: ask the node's newest block again this often meanwhile (default 150)
+  timeReadsPerMin?: number;  // headerless: block times read from the HTTP node, at most this many a minute (default 30, 0 = never)
   pumpMs?: number;           // how often held blocks are looked at (default 10, the checker's)
   now?: () => number;
   schedule?: (fn: () => void, ms: number) => () => void;
@@ -383,6 +386,13 @@ function slim(l: RpcLog & { blockHash?: string }): Record<string, unknown> {
     transactionIndex: l.transactionIndex, logIndex: l.logIndex, transactionHash: l.transactionHash,
   };
   if (l.blockHash) o.blockHash = l.blockHash;
+  // The block's own time, when the node puts it on its logs (Chainstack
+  // does): the assembler uses it when the sequencer feed has not given the
+  // block's time yet (Oct 22 live failure: it was dropped here, so every
+  // block whose feed message came a little after its reports was skipped
+  // and the copy reloaded). arbsim ignores the field.
+  const bt = (l as { blockTimestamp?: unknown }).blockTimestamp;
+  if (typeof bt === 'string' && /^0x[0-9a-fA-F]{1,16}$/.test(bt)) o.blockTimestamp = bt;
   if (l.removed) o.removed = true;
   return o;
 }
@@ -411,6 +421,10 @@ export class Copy2Forwarder {
   private prevSent = -1;             // newest block delivered on this connection
   private newestSeen = -1;           // newest block any tracked log came from
   private gapFlag = true;            // next message says "gap" (always true for the first one)
+  private gapReason = 'start';       // why (the first cause since the last gap message; sent as gapReason)
+  private fillGen = 0;               // fill-in run id (a newer outage makes an older run stop)
+  private liveFeedBlock = -1;        // sequencer feed's newest block when the subscription went live (fill-in target)
+  private timeReadAt: number[] = []; // when block times were read from the node (last minute)
   private pumping = false;
   private headerFill = false;        // headers of skipped blocks being read: hold the pump
   private cancelPump: (() => void) | null = null;
@@ -422,7 +436,12 @@ export class Copy2Forwarder {
   private txWaiters = new Map<string, Array<(b: number) => void>>();
   private noTsLoggedAt = -Infinity;
 
-  readonly counts = { logsIn: 0, logsKept: 0, heads: 0, blocksSent: 0, ticks: 0, msgsDropped: 0, late: 0, lateDup: 0, dupLogs: 0, reorgLogs: 0, gaps: 0, backfills: 0, backfillFails: 0, backfillLogs: 0, noTimestamp: 0, headersFetched: 0, headerFails: 0, headerGaps: 0 };
+  readonly counts = { logsIn: 0, logsKept: 0, heads: 0, blocksSent: 0, ticks: 0, msgsDropped: 0, late: 0, lateDup: 0, dupLogs: 0, reorgLogs: 0, gaps: 0, backfills: 0, backfillFails: 0, backfillLogs: 0, noTimestamp: 0, headersFetched: 0, headerFails: 0, headerGaps: 0, timesRead: 0, timeReadFails: 0, fillWaits: 0 };
+  // Forced reloads actually sent to the copy (a message with gap / prevBlock
+  // = itself), by the reason that caused them. "start" = the copy (re)starts
+  // following (fresh track list / reconnect): a fresh arbsim does NOT reload
+  // for it. Everything else should stay near zero.
+  readonly reloadReasons: Record<string, number> = {};
 
   constructor(o: Copy2ForwarderOptions) {
     this.o = o;
@@ -458,6 +477,7 @@ export class Copy2Forwarder {
     // with "gap" (the copy reloads), from the next block.
     this.resetBlocks();
     this.gapFlag = true;
+    this.gapReason = 'start';
     this.prevSent = -1;
     if (!on) { this.backfillFrom = -1; return; }
     if (this.mode === 'live' || this.mode === 'backfilling') this.liveSince = this.now();
@@ -469,10 +489,16 @@ export class Copy2Forwarder {
     try {
       if (this.mode === 'live' || this.mode === 'backfilling') return;
       this.liveSince = this.now();
+      // Every block the sequencer had made by now may have been processed by
+      // the node before our new subscription existed: the fill-in must reach
+      // at least this block (blocks after it are pushed to us live).
+      let fb: { block: number } | null = null;
+      try { fb = this.o.feedNewest?.() ?? null; } catch { fb = null; }
+      this.liveFeedBlock = fb ? fb.block : -1;
       if (this.active && this.backfillFrom >= 0) { this.mode = 'backfilling'; this.liveMin = Infinity; void this.backfill(this.backfillFrom); }
       else this.mode = 'live';
       this.backfillFrom = -1;
-    } catch { this.mode = 'live'; this.markGap(); }
+    } catch { this.mode = 'live'; this.markGap('error'); }
   }
 
   // The WebSocket dropped: events from now on are missed until it is back.
@@ -483,12 +509,16 @@ export class Copy2Forwarder {
       this.mode = 'down';
       // Held blocks may be only partly received: they are filled in later.
       this.dropHeld();
+      this.fillGen++;                   // a fill-in still running belongs to the old connection: it stops
       if (this.active) {
-        if (wasBackfilling) { this.backfillFrom = -1; this.markGap(); }    // two outages in a row: just reload
-        else if (this.lastEmitted >= 0) this.backfillFrom = this.lastEmitted + 1;
-        else this.markGap();
+        // Fill in from the block after the last one passed on. Two outages in
+        // a row (a renewal while the previous one was still being filled in):
+        // nothing was passed on meanwhile, so the same start block covers
+        // both; what was held from the first is dropped and read again.
+        if (this.lastEmitted >= 0 && !this.gapFlag) this.backfillFrom = this.lastEmitted + 1;
+        else if (!this.gapFlag) this.markGap(wasBackfilling ? 'outage during fill-in' : 'outage before the first block');
       }
-    } catch { this.markGap(); }
+    } catch { this.markGap('error'); }
   }
 
   // ---- headers in ----------------------------------------------------------
@@ -600,10 +630,18 @@ export class Copy2Forwarder {
         if (this.stopped()) return;
         this.held.delete(b.block);
         if (this.headers && (b.timestamp === null || !b.logsBloom)) await this.readHeader(b);
+        // Headerless: neither the feed nor the reports gave this block's time
+        // (feed message late or lost). One block read from the HTTP node
+        // (budgeted), never a guess; the blocks after it wait meanwhile.
+        else if (!this.headers && b.timestamp === null && b.logs.length) await this.readTime(b);
         // (The WebSocket may have dropped while the node answered.)
         if (this.stopped()) return;
         this.emit(b);
       }
+      // Late reports whose block time is unknown (headerless): read it first.
+      // (Awaited only when needed: otherwise the pump stays synchronous.)
+      for (const b of this.lateQ) if (!this.headers && b.timestamp === null && !this.gapFlag && !this.stopped()) await this.readTime(b);
+      if (this.stopped()) return;
       this.sendLate();
     } catch { /* never throws */ } finally {
       this.pumping = false;
@@ -627,7 +665,25 @@ export class Copy2Forwarder {
     this.asm.rememberSent(h);
   }
 
-  private async fetchHead(block: number): Promise<Head | null> {
+  // Headerless: a block's time + parent-chain block from the HTTP node
+  // (BLOCK_READER_RPC), at most timeReadsPerMin a minute. Leaves the time
+  // unknown when the budget is used up or the node can't say (the block is
+  // then skipped and the copy reloads: never a guessed time).
+  private async readTime(b: BlockOut): Promise<void> {
+    const per = Math.max(0, this.o.timeReadsPerMin ?? 30);
+    const t = this.now();
+    this.timeReadAt = this.timeReadAt.filter((x) => t - x < 60_000);
+    if (this.timeReadAt.length >= per) return;
+    this.timeReadAt.push(t);
+    const h = await this.fetchHead(b.block, false);
+    if (!h || h.timestamp === null) { this.counts.timeReadFails++; return; }
+    this.counts.timesRead++;
+    b.timestamp = h.timestamp;
+    if (h.l1Block !== null) b.l1Block = h.l1Block;
+    this.asm.rememberSent({ block: b.block, timestamp: h.timestamp, l1Block: b.l1Block, at: this.now() });
+  }
+
+  private async fetchHead(block: number, needBloom = true): Promise<Head | null> {
     const rpc = this.o.backfillRpc?.() ?? null;
     if (!rpc) return null;
     const tries = Math.max(1, this.o.headerTries ?? 3);
@@ -635,12 +691,12 @@ export class Copy2Forwarder {
       try {
         const r = await rpc('eth_getBlockByNumber', [hexBlock(block), false]);
         const h = r ? headFromNewHeads(r, this.now()) : null;
-        if (h && h.block === block && h.timestamp !== null && h.logsBloom) { this.counts.headersFetched++; return h; }
+        if (h && h.block === block && h.timestamp !== null && (h.logsBloom || !needBloom)) { if (needBloom) this.counts.headersFetched++; return h; }
       } catch { /* try again */ }
       // null = the node is a little behind the WebSocket: ask again shortly.
       if (i + 1 < tries) await new Promise<void>((res) => this.schedule(res, this.o.headerRetryMs ?? 150));
     }
-    this.counts.headerFails++;
+    if (needBloom) this.counts.headerFails++;
     return null;
   }
 
@@ -648,7 +704,7 @@ export class Copy2Forwarder {
   private async fillHeaders(from: number, to: number): Promise<void> {
     if (this.headerFill) return;
     this.counts.headerGaps++;
-    if (to - from + 1 > (this.o.maxBackfill ?? 200)) { this.markGap(); return; }
+    if (to - from + 1 > (this.o.maxBackfill ?? 200)) { this.markGap('headers missing (too many)'); return; }
     this.headerFill = true;
     try {
       for (let b = from; b <= to; b++) {
@@ -657,7 +713,7 @@ export class Copy2Forwarder {
         if (h) this.asm.addHead({ ...h, at: this.now() - 10_000 });
         // A header the node can't give: that block (if it had no reports)
         // would never go out; the copy reloads instead.
-        else this.markGap();
+        else this.markGap('header unreadable');
       }
     } finally {
       this.headerFill = false;
@@ -675,7 +731,7 @@ export class Copy2Forwarder {
       // the next message makes the copy reload (prevBlock 0). Routing goes
       // to the node meanwhile.
       this.counts.noTimestamp++;
-      this.gapFlag = true;
+      this.markGap(this.headers ? 'header unreadable' : 'block time unknown');
       if (this.now() - this.noTsLoggedAt > 60_000) { this.noTsLoggedAt = this.now(); this.log(this.headers ? `[copy2] block ${b.block}: its header could not be read (WebSocket and node), the copy reloads instead` : `[copy2] block ${b.block}: its time is not known (sequencer feed quiet?), the copy reloads instead`); }
       return;
     }
@@ -701,16 +757,28 @@ export class Copy2Forwarder {
   // Hand a pool_logs / block_tick message over and keep the bookkeeping.
   private deliver(b: number, msg: Record<string, unknown>, tick: boolean): void {
     const gap = this.gapFlag;
-    if (gap) msg.gap = true;
+    if (gap) { msg.gap = true; msg.gapReason = this.gapReason; }
     if (this.send(msg)) {
       if (tick) this.counts.ticks++; else this.counts.blocksSent++;
       this.prevSent = b;
-      if (gap) { this.gapFlag = false; this.gapSentAt = this.now(); this.counts.gaps++; }
+      if (gap) {
+        this.gapFlag = false; this.gapSentAt = this.now(); this.counts.gaps++;
+        this.reloadReasons[this.gapReason] = (this.reloadReasons[this.gapReason] ?? 0) + 1;
+        if (this.gapReason !== 'start') this.log(`[copy2] the copy was told to reload every pool (${this.gapReason}); forced reloads so far: ${this.reloadText()}`);
+      }
     } else {
       this.counts.msgsDropped++;
-      this.gapFlag = true;
+      this.markGap('message not handed over (socket busy)');
     }
   }
+
+  // "block time unknown 2, start 1" (forced reloads by reason, most first).
+  reloadText(): string {
+    const e = Object.entries(this.reloadReasons).sort((a, b) => b[1] - a[1]);
+    return e.length ? e.map(([w, n]) => `${w} ${n}`).join(', ') : 'none';
+  }
+  // Forced reloads other than the (re)start one.
+  forcedReloads(): number { let n = 0; for (const [w, k] of Object.entries(this.reloadReasons)) if (w !== 'start') n += k; return n; }
 
   // Late reports: their own message for an ALREADY passed-on block, with
   // that block's own time (no bloom, no prevBlock: as the checker sends
@@ -721,10 +789,10 @@ export class Copy2Forwarder {
     this.lateQ = [];
     for (const b of q) {
       if (this.gapFlag) return;
-      if (b.timestamp === null) { this.markGap(); return; }
+      if (b.timestamp === null) { this.markGap('late report, block time unknown'); return; }
       if (b.l1Block === null) { const f = this.o.blockTime?.(b.block); if (f?.l1Block !== undefined) b.l1Block = f.l1Block; }
       const msg = { ...blockMessage(b), late: true };
-      if (!this.send(msg)) { this.counts.msgsDropped++; this.gapFlag = true; }
+      if (!this.send(msg)) { this.counts.msgsDropped++; this.markGap('message not handed over (socket busy)'); }
     }
   }
 
@@ -739,7 +807,12 @@ export class Copy2Forwarder {
     try { return this.o.send(msg) === true; } catch { return false; }
   }
 
-  private markGap(): void { this.gapFlag = true; }
+  // The next message makes the copy reload every pool. The first cause since
+  // the last such message is the one reported.
+  private markGap(reason: string): void {
+    if (!this.gapFlag) this.gapReason = reason;
+    this.gapFlag = true;
+  }
   private stopped(): boolean { return !this.active || this.mode === 'down'; }
 
   // Held (not passed on) blocks forgotten; what was passed on is kept.
@@ -759,56 +832,81 @@ export class Copy2Forwarder {
     this.sentIds.clear();
   }
 
-  // ---- fill-in after a WebSocket outage --------------------------------------
-  // One read per kind of subscription over the missed blocks, plus each
-  // missed block's header (HTTP node), merged with what arrived live
-  // meanwhile, then passed on in order (empty blocks as ticks, as the
-  // checker does). Anything that fails: the copy is told "gap" (it reloads;
-  // never a guess).
+  // ---- fill-in after a WebSocket outage / subscription renewal ---------------
+  // The block reader renews its WebSocket subscription whenever the watch
+  // list changes (and reconnects after a drop). Between the old subscription
+  // ending and the new one being confirmed, the node pushes nothing; those
+  // blocks are read back from the HTTP node here: one read per kind of
+  // subscription over the missed blocks (plus each block's header with
+  // COPY2_HEADERS=on), merged with what arrived live meanwhile, then passed
+  // on in order. A hole that is filled this way is NOT a lost message: the
+  // copy carries on without reloading.
+  //
+  // How far to read (Oct 22 live failure: the free node is often a few
+  // blocks behind the WebSocket node, and the old code either gave up, which
+  // made the copy reload at every renewal, or, when the free node was so far
+  // behind that it had none of the missed blocks yet, silently read nothing):
+  //   - at least up to the sequencer feed's newest block at the moment the
+  //     new subscription went live (anything newer is pushed to us live),
+  //   - and up to the block before the first one heard live meanwhile;
+  //   - if the node is not there yet, ask again every fillPollMs, for at most
+  //     fillWaitMs (default 3 s); only then give up (the copy reloads).
+  // Anything that fails: the copy is told "gap" (it reloads; never a guess).
   private async backfill(from: number): Promise<void> {
     const rpc = this.o.backfillRpc?.() ?? null;
-    const done = (ok: boolean) => {
-      if (this.mode !== 'backfilling') return;        // went down again meanwhile (onDown handled it)
-      if (!ok) { this.counts.backfillFails++; this.markGap(); this.asm.dropPending(); this.held.clear(); }
+    const gen = ++this.fillGen;
+    const mine = () => this.fillGen === gen && this.mode === 'backfilling';
+    const done = (ok: boolean, why = '') => {
+      if (!mine()) return;        // went down again meanwhile (onDown handled it)
+      if (!ok) { this.counts.backfillFails++; this.markGap(why || 'outage not filled in'); this.asm.dropPending(); this.held.clear(); }
       this.mode = 'live';
       this.schedulePump(0);
     };
+    const wait = (ms: number) => new Promise<void>((res) => this.schedule(res, ms));
     try {
-      if (!rpc) { done(false); return; }
-      const headRaw = await rpc('eth_blockNumber', []);
-      const head = hexNum(headRaw);
-      if (head === null) { done(false); return; }
-      if (head < from) { done(true); return; }
-      if (head - from + 1 > (this.o.maxBackfill ?? 200)) { this.log('[copy2] outage too long to fill in, the copy reloads instead'); done(false); return; }
-      const idx = this.o.index();
-      const range = { fromBlock: hexBlock(from), toBlock: hexBlock(head) };
-      const pools = [...idx.pools], ids = [...idx.ids], coins = [...idx.coins];
-      const padded = pools.map(padAddr);
-      const asks: Array<Promise<any>> = [];
-      if (pools.length) asks.push(rpc('eth_getLogs', [{ ...range, address: pools }]));
-      if (ids.length && idx.poolManager) asks.push(rpc('eth_getLogs', [{ ...range, address: idx.poolManager, topics: [null, ids] }]));
-      if (coins.length && padded.length) {
-        asks.push(rpc('eth_getLogs', [{ ...range, address: coins, topics: [TRANSFER_TOPIC, padded] }]));
-        asks.push(rpc('eth_getLogs', [{ ...range, address: coins, topics: [TRANSFER_TOPIC, null, padded] }]));
-      }
-      const results = await Promise.all(asks);
-      if (this.mode !== 'backfilling') return;
+      if (!rpc) { done(false, 'outage not filled in (no HTTP node)'); return; }
+      const max = this.o.maxBackfill ?? 200;
+      const deadline = this.now() + Math.max(0, this.o.fillWaitMs ?? 3_000);
+      // The newest block the fill-in must reach (see above).
+      const target = () => Math.max(from - 1, this.liveFeedBlock, this.liveMin === Infinity ? -1 : this.liveMin - 1);
       const all: RpcLog[] = [];
-      for (const r of results) { if (!Array.isArray(r)) { done(false); return; } all.push(...r); }
+      let next = from;            // first block not read yet
+      let waited = false;
+      for (;;) {
+        const head = hexNum(await rpc('eth_blockNumber', []));
+        if (!mine()) return;
+        if (head === null) { done(false, 'outage not filled in (node error)'); return; }
+        if (Math.max(head, target()) - from + 1 > max) { this.log('[copy2] outage too long to fill in, the copy reloads instead'); done(false, 'outage too long to fill in'); return; }
+        if (head >= next) {
+          const logs = await this.readLogs(rpc, next, head);
+          if (!mine()) return;
+          if (!logs) { done(false, 'outage not filled in (node error)'); return; }
+          all.push(...logs);
+          next = head + 1;
+        }
+        if (next - 1 >= target()) break;
+        // The node has not got every missed block yet: ask again shortly.
+        if (this.now() >= deadline) {
+          this.log(`[copy2] fill-in: the HTTP node is still at block ${next - 1}, the missed blocks go up to ${target()}; the copy reloads instead`);
+          done(false, 'outage not filled in (HTTP node behind)');
+          return;
+        }
+        if (!waited) { waited = true; this.counts.fillWaits++; }
+        await wait(Math.max(10, this.o.fillPollMs ?? 150));
+        if (!mine()) return;
+      }
+      const last = next - 1;
       // Headers on: each missed block's header (time + bloom), as the checker
       // does (10 at a time: never a burst of 200 requests at the node).
-      // Headerless: times from the feed / the logs, no header reads.
+      // Headerless: times from the feed / the logs (read from the node only
+      // for a block that has neither, when it is passed on).
       const heads: Array<Head | null> = [];
-      for (let b = from; this.headers && b <= head && this.mode === 'backfilling'; b += 10) {
-        const n = Math.min(10, head - b + 1);
+      for (let b = from; this.headers && b <= last && mine(); b += 10) {
+        const n = Math.min(10, last - b + 1);
         heads.push(...await Promise.all(Array.from({ length: n }, (_, i) => this.fetchHead(b + i))));
       }
-      if (this.mode !== 'backfilling') return;
-      if (heads.some((h) => !h)) { done(false); return; }
-      // Blocks between the node's newest and the first block heard live
-      // after the reconnect would be missing (the node is a little behind
-      // the WebSocket): the copy reloads instead.
-      if (this.liveMin !== Infinity && this.liveMin > head + 1) { done(false); return; }
+      if (!mine()) return;
+      if (heads.some((h) => !h)) { done(false, 'outage not filled in (header unreadable)'); return; }
       this.counts.backfills++;
       this.counts.backfillLogs += all.length;
       // Merge: same path as live logs (one report once), headers already old
@@ -820,8 +918,28 @@ export class Copy2Forwarder {
       done(true);
     } catch (e) {
       this.log(`[copy2] fill-in after the WebSocket outage failed (${String((e as Error)?.message ?? e).slice(0, 60).replace(/https?:\/\/\S+|wss?:\/\/\S+/g, '[url]')}), the copy reloads instead`);
-      done(false);
+      done(false, 'outage not filled in (node error)');
     }
+  }
+
+  // Every report of the followed pools in blocks from..to (HTTP node), or
+  // null when any read failed.
+  private async readLogs(rpc: (method: string, params: unknown[]) => Promise<any>, from: number, to: number): Promise<RpcLog[] | null> {
+    const idx = this.o.index();
+    const range = { fromBlock: hexBlock(from), toBlock: hexBlock(to) };
+    const pools = [...idx.pools], ids = [...idx.ids], coins = [...idx.coins];
+    const padded = pools.map(padAddr);
+    const asks: Array<Promise<any>> = [];
+    if (pools.length) asks.push(rpc('eth_getLogs', [{ ...range, address: pools }]));
+    if (ids.length && idx.poolManager) asks.push(rpc('eth_getLogs', [{ ...range, address: idx.poolManager, topics: [null, ids] }]));
+    if (coins.length && padded.length) {
+      asks.push(rpc('eth_getLogs', [{ ...range, address: coins, topics: [TRANSFER_TOPIC, padded] }]));
+      asks.push(rpc('eth_getLogs', [{ ...range, address: coins, topics: [TRANSFER_TOPIC, null, padded] }]));
+    }
+    const results = await Promise.all(asks);
+    const all: RpcLog[] = [];
+    for (const r of results) { if (!Array.isArray(r)) return null; all.push(...r); }
+    return all;
   }
 
   // ---- facts for the bot ----------------------------------------------------
@@ -975,6 +1093,13 @@ export function parseCopy2Status(s: unknown): Copy2Status {
 //   COPY2_STATUS_MS          2000  how often readiness is asked
 //   COPY2_MAX_STATUS_AGE_MS  10000 older readiness = not trusted (node decides)
 //   COPY2_BACKFILL_MAX       200   most blocks filled in after an outage
+//   COPY2_FILL_WAIT_MS       3000  fill-in after a renewal / outage: wait at
+//                                  most this long for the HTTP node to have
+//                                  every missed block (else the copy reloads)
+//   COPY2_TIME_READS_PER_MIN 30    headerless: a block whose time neither the
+//                                  feed nor its reports gave is read from the
+//                                  HTTP node, at most this many a minute
+//                                  (0 = never: the copy reloads instead)
 //   COPY2_WSS_MAX_PCT        80    copy 2's WebSocket subscriptions (incl.
 //                                  newHeads, ~1 message per block) stop for
 //                                  the rest of the UTC day once today's pushed
@@ -994,6 +1119,8 @@ export type Copy2Settings = {
   statusEveryMs: number;
   maxStatusAgeMs: number;
   maxBackfill: number;
+  fillWaitMs: number;
+  timeReadsPerMin: number;
   wssMaxPct: number;
   l2Offset: number;
 };
@@ -1012,6 +1139,8 @@ export function copy2Settings(env: Record<string, string | undefined> = process.
     statusEveryMs: num('COPY2_STATUS_MS', 2_000, 200),
     maxStatusAgeMs: num('COPY2_MAX_STATUS_AGE_MS', 10_000, 500),
     maxBackfill: num('COPY2_BACKFILL_MAX', 200, 1),
+    fillWaitMs: num('COPY2_FILL_WAIT_MS', 3_000),
+    timeReadsPerMin: num('COPY2_TIME_READS_PER_MIN', 30),
     wssMaxPct: Math.min(100, num('COPY2_WSS_MAX_PCT', 80)),
     l2Offset: num('ARBSIM_L2_BLOCK_OFFSET', 0),
   };
@@ -1078,6 +1207,8 @@ export class Copy2Link {
       graceMs: s.graceMs,
       maxWaitMs: s.headerlessMaxMs,
       maxBackfill: s.maxBackfill,
+      fillWaitMs: s.fillWaitMs,
+      timeReadsPerMin: s.timeReadsPerMin,
       now: this.now,
       schedule: o.schedule,
       log: (m) => this.log(m),
@@ -1263,13 +1394,22 @@ export class Copy2Link {
     return [
       c ? `copy 2: ${c.ready} ready, ${c.unsure} unsure, ${c.loading} loading of ${c.tracked} pools` : `copy 2: following ${this.tracked.length} pools (readiness not reported)`,
       `routed to fast check ${h.fast}, to node ${node}${whys ? ` (${whys})` : ''}`,
-      `pool reports ${this.forwarder.modeText()}: ${f.blocksSent} blocks passed on${f.msgsDropped ? `, ${f.msgsDropped} DROPPED` : ''}${f.gaps ? `, ${f.gaps} gaps` : ''}${f.late ? `, ${f.late} late` : ''}${f.backfills ? `, ${f.backfills} outages filled in` : ''}${f.backfillFails ? `, ${f.backfillFails} not filled` : ''}${f.noTimestamp ? `, ${f.noTimestamp} skipped (no header)` : ''}${f.headersFetched ? `, ${f.headersFetched} headers read from the node` : ''}`,
+      `pool reports ${this.forwarder.modeText()}: ${f.blocksSent} blocks passed on${f.msgsDropped ? `, ${f.msgsDropped} DROPPED` : ''}${f.gaps ? `, ${f.gaps} gaps` : ''}${f.late ? `, ${f.late} late` : ''}${f.backfills ? `, ${f.backfills} outages filled in` : ''}${f.backfillFails ? `, ${f.backfillFails} not filled` : ''}${f.noTimestamp ? `, ${f.noTimestamp} skipped (time / header unknown)` : ''}${f.headersFetched ? `, ${f.headersFetched} headers read from the node` : ''}${f.timesRead ? `, ${f.timesRead} block times read from the node` : ''}`,
+      `forced reloads ${this.forwarder.forcedReloads()}${this.forwarder.forcedReloads() ? ` (${this.reloadWhys()})` : ''}`,
     ].join('; ');
   }
 
-  // Short state, logged when it changes (checked every 30 s).
+  // Forced reloads by reason, without the (re)start one.
+  private reloadWhys(): string {
+    return Object.entries(this.forwarder.reloadReasons).filter(([w]) => w !== 'start').sort((a, b) => b[1] - a[1]).map(([w, n]) => `${w} ${n}`).join(', ');
+  }
+
+  // Short state, logged when it changes (checked every 30 s), e.g.
+  // "on / following 677 / reports live / forced reloads 0 / outages filled 3"
   stateLine(): string {
-    return `${this.sidecarOn ? 'on' : 'off'} / following ${this.trackOk ? this.tracked.length : 'none'} / reports ${this.forwarder.modeText()}`;
+    const f = this.forwarder.counts;
+    const n = this.forwarder.forcedReloads();
+    return `${this.sidecarOn ? 'on' : 'off'} / following ${this.trackOk ? this.tracked.length : 'none'} / reports ${this.forwarder.modeText()} / forced reloads ${n}${n ? ` (${this.reloadWhys()})` : ''} / outages filled ${f.backfills}${f.timesRead ? ` / block times read ${f.timesRead}` : ''}`;
   }
   logIfChanged(): void {
     const s = this.stateLine();

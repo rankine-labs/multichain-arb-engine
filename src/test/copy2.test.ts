@@ -350,28 +350,31 @@ async function headerlessForwarderTests() {
   advance(300);
   const tick = sent.find((m) => m.type === 'block_tick');
   assert(!!tick && tick.block === 60 && tick.prevBlock === 52 && tick.logsBloom === undefined, 'headerless: block_tick for the newest feed block (no bloom), chained');
-  // Block time unknown: not sent, the copy reloads.
+  // Block time unknown (feed and reports quiet about it): ONE block read from
+  // the HTTP node (3 tries, the node may be a moment behind). It can't say
+  // either -> not sent, the copy reloads (never a guessed time).
   f.onLogs([L(P1, [SYNC_TOPIC], 61, 0, 0)]);
-  advance(200);
-  assert(!sent.some((m) => m.block === 61) && f.counts.noTimestamp === 1 && !f.live() && !calls.includes('eth_getBlockByNumber'), 'headerless: time unknown -> block skipped (never guessed, no header read), routing stops');
+  advance(80); await settle(150, 8);
+  assert(!sent.some((m) => m.block === 61) && f.counts.noTimestamp === 1 && !f.live() && calls.filter((c) => c === 'eth_getBlockByNumber').length === 3 && f.counts.timeReadFails === 1, 'headerless: time unknown and the node cannot say -> block skipped (never guessed), routing stops');
   times.set(62, 1_760_000_062, 23_000_000);
   f.onLogs([L(P1, [SYNC_TOPIC], 62, 0, 0)]); advance(40);
   const m62 = sent[sent.length - 1];
-  assert(m62.block === 62 && m62.prevBlock === 62 && m62.gap === true, 'next message: prevBlock = itself (the copy reloads)');
+  assert(m62.block === 62 && m62.prevBlock === 62 && m62.gap === true && m62.gapReason === 'block time unknown' && f.reloadReasons['block time unknown'] === 1, 'next message: prevBlock = itself (the copy reloads), reason given and counted');
   // Dropped message: next one reloads.
   times.set(63, 1_760_000_063, 23_000_000); times.set(64, 1_760_000_064, 23_000_000);
   setOk(false); f.onLogs([L(P1, [SYNC_TOPIC], 63, 0, 0)]); advance(40); setOk(true);
   f.onLogs([L(P1, [SYNC_TOPIC], 64, 0, 0)]); advance(40);
   const m64 = sent[sent.length - 1];
-  assert(m64.block === 64 && m64.prevBlock === 64, 'after a dropped message: prevBlock = itself (copy reloads)');
+  assert(m64.block === 64 && m64.prevBlock === 64 && m64.gapReason === 'message not handed over (socket busy)', 'after a dropped message: prevBlock = itself (copy reloads), with its reason');
   // Late report.
   f.onLogs([L(P2, [SYNC_TOPIC], 52, 4, 9)]); advance(0);
   const late = sent[sent.length - 1];
   assert(late.late === true && late.block === 52 && late.timestamp === 1_760_000_052 && late.logsBloom === undefined, 'headerless: late report on its own, with its block\'s time');
   // Outage fill-in: reports only, no header reads.
+  const headerReads = calls.filter((c) => c === 'eth_getBlockByNumber').length;
   f.onDown(); f.onLive();
   await settle(10, 6);
-  assert(calls.filter((c) => c === 'eth_getLogs').length === 3 && !calls.includes('eth_getBlockByNumber'), 'headerless outage fill-in: report reads only, never a header read');
+  assert(calls.filter((c) => c === 'eth_getLogs').length === 3 && calls.filter((c) => c === 'eth_getBlockByNumber').length === headerReads, 'headerless outage fill-in: report reads only, never a header read');
   f.setActive(false);
   advance(200);
 }
@@ -410,7 +413,7 @@ async function parityTests(headers: boolean) {
     }
     if (t % 10 === 0) for (const b of asm.due(clock)) ref.push(blockMessage(b));
   }
-  const strip = (m: any) => { const { prevBlock, gap, late, ...rest } = m; void prevBlock; void gap; void late; return rest; };
+  const strip = (m: any) => { const { prevBlock, gap, gapReason, late, ...rest } = m; void prevBlock; void gap; void gapReason; void late; return rest; };
   const refDedup = ref.map((m) => (m.logs ? { ...m, logs: m.logs.filter((l: any, i: number, a: any[]) => a.findIndex((x) => x.logIndex === l.logIndex && x.transactionHash === l.transactionHash) === i) } : m));
   const a = JSON.stringify(sent.map(strip)), b = JSON.stringify(refDedup.map((m) => JSON.parse(JSON.stringify(m))));
   const mode = headers ? 'headers on' : 'headerless';
@@ -775,6 +778,8 @@ async function hostTests() {
   assert(link.times.get(9)?.timestamp === 1_760_000_000 && host.copy2Running(), 'copy 2 running: block times read from the feed the bot already forwards');
   const line = host.takeHourLine() ?? '';
   assert(line.includes('copy 2:'), `hourly Telegram line carries the copy 2 part (${line})`);
+  assert(line.includes('copy 2 vs node: 1 checks, same 0, different 0, fast check unsure 1'), `hourly line: copy-2 accuracy tally vs the node (same / different / unsure) (${line})`);
+  assert(/forced reloads 0/.test(line), `hourly line: forced reloads by reason (${line})`);
   await host.stop();
 }
 

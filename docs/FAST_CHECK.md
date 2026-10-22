@@ -72,9 +72,12 @@ check every 2 s) and then:
   shared; the checker's `--no-headers` = the bot's default):
   - **Headers off (default, `COPY2_HEADERS=off`)**: a block goes out as soon
     as a report of a later block arrives, or 30 ms after its first report.
-    Its time and parent-chain block come from the sequencer feed (or the
-    logs' own blockTimestamp); a block whose time is still unknown 40 ms
-    later is not sent and the copy reloads (never a guessed time). No
+    Its time and parent-chain block come from the sequencer feed or the
+    logs' own blockTimestamp (Chainstack puts it on every log); a block
+    whose time is still unknown 40 ms later has it read from the HTTP node
+    (`BLOCK_READER_RPC`, one eth_getBlockByNumber, at most
+    `COPY2_TIME_READS_PER_MIN` a minute); only if that fails too is it not
+    sent and the copy reloads (never a guessed time). No
     logsBloom: arbsim still marks a pool "pending" from its transfer /
     event pairing rules. `block_tick` for the feed's newest block once it is
     250 ms old with nothing held.
@@ -87,9 +90,13 @@ check every 2 s) and then:
     block; a missing header is read from the HTTP node (counted as "copy 2
     headers / fill-ins"); no header at all = not sent, the copy reloads.
   A message that can't be handed over is dropped, counted, and the next one
-  makes the copy reload (never a silent gap). A WebSocket outage is filled
-  in from the HTTP node (up to 200 blocks; with headers on, with their
-  headers too), otherwise the copy reloads.
+  makes the copy reload (never a silent gap). A WebSocket renewal (the
+  block reader renews its subscription when the watch list changes) or
+  outage is filled in from the HTTP node (up to 200 blocks; with headers
+  on, with their headers too): the fill-in waits up to `COPY2_FILL_WAIT_MS`
+  (3 s) for that node to have every missed block (it is often a few blocks
+  behind), then passes them on in order. That is NOT a lost message: no
+  reload. Only a hole that can't be filled makes the copy reload.
 - tells it which pools to follow (`track`): watched pools of a type the copy
   can follow exactly: Uniswap / PancakeSwap V2, Ramses V2 and GIGA Classic
   (Solidly), Uniswap V3 and copies, PancakeSwap V3 and copies, Algebra
@@ -129,6 +136,53 @@ headers on), `COPY2_WSS_MAX_PCT` (80, 0 = no copy-2 limit), `COPY2_STATUS_MS` (2
 
 Log lines start with `[copy2]`; the `[blockreader]` line shows
 `copy 2 events live (N logs, M headers)` (M = 0 with headers off).
+
+### Forced reloads (the Oct 22 go-live failure)
+
+A "forced reload" = the bot tells the copy "I missed something, reload
+every pool". Every one costs minutes of loading, so it must stay rare.
+Where to see them:
+
+- Bot log, when it changes:
+  `[copy2] on / following 677 / reports live / forced reloads 0 / outages filled 12`
+  and one line per forced reload:
+  `[copy2] the copy was told to reload every pool (block time unknown); forced reloads so far: ...`
+- Hourly line: `forced reloads K (reason n, ...)`.
+- arbsim status (`bash deploy/arbsim-pm2.sh status`, line "forced reloads (every pool)"):
+  `copy2.gapReasons` = the same reasons as the copy saw them, plus
+  `message lost on the way` (a message lost between bot and arbsim).
+
+Reasons: `start` (copy starts following: harmless, a fresh arbsim ignores
+it), `block time unknown`, `late report, block time unknown`, `outage not
+filled in (HTTP node behind | node error | no HTTP node | header
+unreadable)`, `outage too long to fill in`, `message not handed over
+(socket busy)`, `outage before the first block`. Healthy: 0-2 an hour.
+
+Settings: `COPY2_FILL_WAIT_MS` (3000), `COPY2_TIME_READS_PER_MIN` (30, 0 =
+never read a time: skip + reload instead).
+
+## Validating copy 2 in practice BEFORE switching it on
+
+`LOCAL_SIM=shadow` runs copy 2 with exactly the same live feed, WebSocket
+subscriptions, renewals and fill-ins as `on`; only the decisions stay with
+the node. So:
+
+1. arbsim with `ARBSIM_SOURCE=pool-events`, bot `.env` `LOCAL_SIM=shadow`,
+   `pm2 restart dex-arb-shadow`.
+2. Wait for the load round (`copy2: load round done ...` in the arbsim log,
+   ~5-15 min), then watch for 1-2 hours:
+   - `pm2 logs dex-arb-shadow | grep copy2`: `forced reloads` stays at 0-2
+     (`outages filled` going up is fine: renewals filled in).
+   - arbsim status: `ready` close to `pools`, `gapReasons` small, `unsure`
+     not stuck on `lost message before block N`.
+   - Hourly Telegram line: `copy 2 vs node: N checks, same a, different b,
+     fast check unsure c (same answer x%)`. These are the checks the fast
+     check would have decided with copy 2; want same answer 98%+ with N in
+     the tens or more. (In practice the node answers on the newest block a
+     few ms later than the copy's block, so a few "different" can be the
+     market moving; `data/local-sim-shadow.jsonl` lines with `c2blk` hold
+     each one, with `lv`/`nv` and `lp`/`np` to look at.)
+3. Only then `LOCAL_SIM=on` + `LOCAL_SIM_CONFIRM=yes-fast-check`.
 
 ## Turning it off
 
