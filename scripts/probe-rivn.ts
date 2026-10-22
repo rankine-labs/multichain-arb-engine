@@ -179,6 +179,19 @@ function v4Of(p: PoolState) { return (p as any).v4 as { poolManager: string; fee
     if (rSlot) {
       for (const v of [1n << 200n, (1n << 200n) + BigInt(realR)]) say(`  RIVN balanceOf(PM) with raw ${v} -> ${await balOf(coin, PM, { [coin]: { stateDiff: { [rSlot]: '0x' + pad(hex(v)) } } })}`);
     }
+    // USDG: what balanceOf says for raw stored values (does the whole word count?).
+    if (usdgSlot) {
+      say(`  USDG raw PM slot ${(await rpc('eth_getStorageAt', [USDG, usdgSlot, tag])).result}`);
+      for (const v of [1n << 200n, (1n << 200n) + 5n, 1n << 128n, (1n << 128n) + 5n, 1n << 160n, (1n << 255n) + 5n, realU + (1n << 200n)]) {
+        say(`  USDG balanceOf(PM) with raw 0x${v.toString(16)} -> ${await balOf(USDG, PM, { [USDG]: { stateDiff: { [usdgSlot]: '0x' + pad(hex(v)) } } })}`);
+      }
+      // A plain transfer FROM the PoolManager with those raw values.
+      const tdata = new ethers.Interface(['function transfer(address,uint256)']).encodeFunctionData('transfer', [SIM_EXECUTOR_ADDRESS, 1000n]);
+      for (const v of [realU, 1n << 200n, (1n << 200n) + 999n, (1n << 200n) + 1000n, (1n << 200n) + realU, 999n, 1000n]) {
+        const r = await rpc('eth_call', [{ from: PM, to: USDG, data: tdata }, tag, { [USDG]: { stateDiff: { [usdgSlot]: '0x' + pad(hex(v)) } } }]);
+        say(`  USDG transfer 1000 from PM with raw 0x${v.toString(16)}: ${r.error ? 'REVERT ' + short(r.error, 300) : 'ok'}`);
+      }
+    }
     const feeSlot = (c: string) => ethers.keccak256(abi.encode(['address', 'uint256'], [c, 1]));
     say(`protocolFeesAccrued RIVN ${(await rpc('eth_getStorageAt', [PM, feeSlot(coin), tag])).result} USDG ${(await rpc('eth_getStorageAt', [PM, feeSlot(USDG), tag])).result}`);
     const R = BigInt(realR.startsWith('ERR') ? '0' : realR);
@@ -187,11 +200,13 @@ function v4Of(p: PoolState) { return (p as any).v4 as { poolManager: string; fee
       ['rivnHi', { r: R + (1n << 200n) }], ['usdgHi', { u: realU + (1n << 200n) }], ['bothHi', { r: R + (1n << 200n), u: realU + (1n << 200n) }],
       ['bothHi fee0', { r: R + (1n << 200n), u: realU + (1n << 200n), fee: 0n }], ['bothHi fee1', { r: R + (1n << 200n), u: realU + (1n << 200n), fee: 1n }],
       ['rivn 1e18', { r: 10n ** 18n }], ['usdg 1e6', { u: 10n ** 6n }], ['rivn 2^200', { r: 1n << 200n }], ['usdg 2^200', { u: 1n << 200n }],
+      ['usdg 1', { u: 1n }], ['usdg 1+2^200', { u: 1n + (1n << 200n) }], ['usdg 1000', { u: 1000n }], ['usdg 1000+2^200', { u: 1000n + (1n << 200n) }],
+      ['usdg 1e5', { u: 10n ** 5n }], ['usdg 1e5+2^200', { u: 10n ** 5n + (1n << 200n) }],
     ];
     const v4p = pools.find((p) => v4Of(p))!;
     for (const other of pools.filter((p) => !v4Of(p))) {
       for (const [buy, sell] of [[other, v4p], [v4p, other]]) {
-        for (const usd of [30, 300, 3000]) {
+        for (const usd of (process.env.PROBE_OVR_SIZES ?? '30,3000').split(',').map(Number)) {
           const built: any = buildExecuteCall({ chain: 'robinhood', tokenIn: USDG, buyPool: buy, sellPool: sell, tradeSizeUsd: usd, netProfitUsd: 1, usdPerTokenIn: 1, tokenInDecimals: 6, maxBlock: 0n } as any);
           if (built.ok === false) { say(`not built ${built.reason}`); continue; }
           const data = encodeExecuteRaw({ token: USDG, amountIn: built.amountIn, minProfit: (1n << 256n) - 1n, maxBlock: (1n << 256n) - 1n, hops: built.hops });
@@ -210,7 +225,7 @@ function v4Of(p: PoolState) { return (p as any).v4 as { poolManager: string; fee
             if (v.fee !== undefined) ov[PM] = { stateDiff: { [feeSlot(coin)]: '0x' + pad(hex(v.fee)), [feeSlot(USDG)]: '0x' + pad(hex(v.fee)) } };
             const r = await rpc('eth_call', [{ from: SIM_CALLER, to: SIM_EXECUTOR_ADDRESS, data, gas: '0x7a1200' }, tag, ov]);
             const d = typeof r.error?.data === 'string' ? r.error.data : (r.error?.data?.data ?? '');
-            const tagOut = !r.error ? 'ok?!' : d.startsWith('0x4e88422a') ? `IP(${BigInt('0x' + d.slice(10, 74))})` : `${d.slice(0, 10) || 'nodata'}:${String(r.error.message).slice(0, 40)}${d.length > 10 ? ':' + d.slice(10, 140) : ''}`;
+            const tagOut = !r.error ? 'ok?!' : d.startsWith('0x4e88422a') ? `IP(${BigInt('0x' + d.slice(10, 74))})` : `${d.slice(0, 10) || 'nodata'}:${String(r.error.message).slice(0, 40)}${d.length > 10 ? ':' + d.slice(10) : ''}`;
             line.push(`${nm}=${tagOut}`);
             await sleep(120);
           }
