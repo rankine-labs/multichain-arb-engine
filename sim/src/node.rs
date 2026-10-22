@@ -367,7 +367,16 @@ impl NodeClient {
             return None;
         }
         let timeout = Duration::from_millis(env_u64("ARBSIM_NODE_TIMEOUT_MS", 8000));
-        let cfg = ureq::Agent::config_builder().timeout_global(Some(timeout)).http_status_as_error(false).build();
+        // Keep-alive pool big enough for all parallel requests (ureq keeps
+        // only 3 idle connections per host by default: with 16 in flight, 13
+        // would open a new TLS connection every time).
+        let pool = env_u64("ARBSIM_NODE_POOL", 64).max(4) as usize;
+        let cfg = ureq::Agent::config_builder()
+            .timeout_global(Some(timeout))
+            .http_status_as_error(false)
+            .max_idle_connections(pool * 2)
+            .max_idle_connections_per_host(pool)
+            .build();
         let public_rps = std::env::var("ARBSIM_PUBLIC_RPS").ok().and_then(|s| s.parse().ok()).unwrap_or(6.0);
         let public_cap = env_u64("ARBSIM_PUBLIC_DAILY_CAP", 0);
         let mut public_budget = Budget::new(if public_cap == 0 { u64::MAX / 4 } else { public_cap }, public_rps, None);
@@ -387,6 +396,13 @@ impl NodeClient {
     }
 
     // One HTTP POST of one batch to one endpoint.
+    /// node-bench only: one POST to the first paid node, bypassing the
+    /// speed limit and the daily allowance (to see the raw network time).
+    pub fn post_paid_raw(&self, body: &str) -> Result<Value, NodeErr> {
+        let ep = self.endpoints.iter().find(|e| e.budget == 0).ok_or(NodeErr::NoNode)?;
+        self.post(ep, body)
+    }
+
     fn post(&self, ep: &Endpoint, body: &str) -> Result<Value, NodeErr> {
         let resp = self
             .agent
