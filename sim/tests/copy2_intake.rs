@@ -1364,3 +1364,120 @@ fn queued_loads_read_at_the_newest_block_when_they_start() {
     let asked = r.chain.proof_blocks.lock().unwrap().clone();
     assert!(asked.iter().any(|b| *b >= 110), "loads read at old blocks: {asked:?}");
 }
+
+// ---------------------------------------------------------------------------
+// Proxy coins (dry run with 7a8a2e5 + d5a54b1: balanceOf on EIP-1967 proxy
+// coins answered success with EMPTY output on the copy)
+// ---------------------------------------------------------------------------
+// (Addresses above 0x100: 0x01..0x0a are Ethereum precompiles.)
+fn pa(n: u8) -> Address {
+    let mut b = [0u8; 20];
+    b[0] = 0x77;
+    b[19] = n;
+    Address::from(b)
+}
+fn pcoin() -> Address {
+    pa(0xc0)
+}
+fn pimpl() -> Address {
+    pa(0x5e)
+}
+fn ppool() -> Address {
+    pa(0xa3)
+}
+
+fn eip1967_slot() -> U256 {
+    parse_u256("0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc").unwrap()
+}
+
+/// Minimal EIP-1967 proxy: delegatecall everything to sload(IMPL_SLOT).
+fn proxy_code() -> Vec<u8> {
+    let mut c = vec![0x36, 0x60, 0x00, 0x60, 0x00, 0x37, 0x60, 0x00, 0x60, 0x00, 0x36, 0x60, 0x00, 0x7f];
+    c.extend_from_slice(&eip1967_slot().to_be_bytes::<32>());
+    c.extend_from_slice(&[0x54, 0x5a, 0xf4, 0x3d, 0x60, 0x00, 0x60, 0x00, 0x3e, 0x3d, 0x60, 0x00, 0xf3]);
+    c
+}
+
+/// Implementation: balanceOf(holder) = sload(keccak(holder . 0)).
+fn impl_code() -> Vec<u8> {
+    vec![
+        0x60, 0x04, 0x35, 0x60, 0x00, 0x52, 0x60, 0x00, 0x60, 0x20, 0x52, 0x60, 0x40, 0x60, 0x00, 0x20, 0x54, 0x60, 0x00, 0x52, 0x60, 0x20,
+        0x60, 0x00, 0xf3,
+    ]
+}
+
+/// The V2 pool `ppool()` trading the proxy coin against COIN1.
+fn proxy_pool() -> TrackedPool {
+    TrackedPool { address: ppool(), token0: pcoin(), ..v2_pool() }
+}
+
+fn proxy_chain() -> Arc<FakeChain> {
+    let chain = Arc::new(FakeChain::new());
+    let mut g = genesis();
+    let mut p = g[&a(V2P)].clone();
+    p.insert(u(6), addr_word(pcoin()));
+    g.insert(ppool(), p);
+    let c = g.entry(pcoin()).or_default();
+    c.insert(eip1967_slot(), addr_word(pimpl()));
+    c.insert(map_slot(ppool(), 0), u(1000));
+    g.get_mut(&a(COIN1)).unwrap().insert(map_slot(ppool(), 0), u(4000));
+    chain.set(100, g);
+    chain.codes.lock().unwrap().insert(pcoin(), proxy_code());
+    chain.codes.lock().unwrap().insert(pimpl(), impl_code());
+    chain
+}
+
+fn balance_of(h: Address) -> String {
+    let mut data = sel("balanceOf(address)").to_vec();
+    data.extend_from_slice(&[0u8; 12]);
+    data.extend_from_slice(h.as_slice());
+    format!("0x{}", data.iter().map(|x| format!("{x:02x}")).collect::<String>())
+}
+
+/// Follow the pool, then ask balanceOf(pool) on the proxy coin until the
+/// copy answers (fills bring what it misses). Returns every answer.
+fn proxy_balance_answers(chain: Arc<FakeChain>) -> Vec<Value> {
+    use std::time::{Duration, Instant};
+    let ctx = arbsim::serve::build_with(Config::for_tests(), Some(chain.clone() as Arc<dyn NodeApi>), arbsim::serve::Source::PoolEvents);
+    let c2 = ctx.copy2.clone().unwrap();
+    let pp = proxy_pool();
+    c2.track_json(&json!(1), &json!({"pools": [{"address": format!("{}", pp.address), "kind": "v2", "token0": format!("{}", pp.token0), "token1": format!("{}", pp.token1)}]}));
+    let t0 = Instant::now();
+    let mut b = 100u64;
+    let next = |b: &mut u64| {
+        let mut m = tick(*b, 1000 + *b);
+        m.prev_block = if *b > 100 { Some(*b - 1) } else { None };
+        c2.block(m);
+        *b += 1;
+    };
+    while c2.status_json(false)["ready"] != json!(1) {
+        next(&mut b);
+        assert!(t0.elapsed() < Duration::from_secs(10), "pool never ready: {}", c2.status_json(true));
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let mut out = Vec::new();
+    for _ in 0..40 {
+        next(&mut b);
+        std::thread::sleep(Duration::from_millis(30));
+        let ans = arbsim::server::handle(&ctx, &json!({"id": 9, "type": "call", "calls": [{
+            "from": format!("{}", pa(0xe0)), "to": format!("{}", pcoin()), "data": balance_of(pp.address), "gas": "0x100000"}]}));
+        let done = ans["ok"] == json!(true);
+        out.push(ans);
+        if done {
+            break;
+        }
+    }
+    c2.stop();
+    out
+}
+
+#[test]
+fn proxy_coin_balance_is_the_real_balance_or_unknown_never_empty() {
+    let answers = proxy_balance_answers(proxy_chain());
+    for ans in &answers {
+        if ans["ok"] == json!(true) {
+            assert_eq!(ans["results"][0]["output"], json!(w(u(1000))), "{answers:?}");
+        }
+    }
+    assert_eq!(answers.last().unwrap()["ok"], json!(true), "never answered: {answers:?}");
+}

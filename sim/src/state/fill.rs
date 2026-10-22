@@ -28,7 +28,7 @@ use revm::state::{AccountInfo, Bytecode};
 use rustc_hash::FxHashSet;
 
 use super::mirror::Version;
-use super::snap::{Acct, Basics, Snapshot};
+use super::snap::{normalize, Acct, Basics, Snapshot};
 use super::{MissItem, StateDiff};
 use crate::node::{Fetched, FetchedAccount};
 
@@ -218,7 +218,12 @@ impl Carry {
                 if known_exact {
                     return false;
                 }
-                if let (Some(i), Some(c)) = (info, code) {
+                // Same shape as Snapshot::apply_fact: no code body inside
+                // the basics (it lives in the code map, by hash). A body left
+                // in (revm's AccountInfo::default() puts an EMPTY one there)
+                // is used by the EVM as is: a contract would run as code-less.
+                let info = normalize(info.clone());
+                if let (Some(i), Some(c)) = (&info, code) {
                     snap.put_code(i.code_hash, c.clone());
                 }
                 let acct = snap.accounts.entry(*a).or_insert_with(Acct::default);
@@ -245,7 +250,9 @@ pub fn account_info(acc: Option<&FetchedAccount>) -> (Option<AccountInfo>, Optio
             } else {
                 (keccak256(&f.code), Some(Bytecode::new_raw(f.code.clone())))
             };
-            (Some(AccountInfo { balance: f.balance, nonce: f.nonce, code_hash: hash, ..Default::default() }), code)
+            // `code: None` explicitly: AccountInfo::default() carries an EMPTY
+            // code body, which the EVM would run instead of the real code.
+            (Some(AccountInfo { balance: f.balance, nonce: f.nonce, code_hash: hash, code: None, ..Default::default() }), code)
         }
     }
 }
@@ -437,6 +444,35 @@ mod tests {
         assert_eq!(vs[0].snap.storage(a(1), U256::from(1)), Lookup::Known(U256::from(3)));
         assert!(vs[0].snap.balance_exact(a(2)));
         assert_eq!(vs[0].snap.account(a(2)), Lookup::Known(Some(AccountInfo { balance: U256::from(90), nonce: 1, code_hash: KECCAK_EMPTY, ..Default::default() })));
+    }
+
+    /// Dry run (7a8a2e5 + d5a54b1): balanceOf on EIP-1967 proxy coins came
+    /// back "success, empty output". The proxy's implementation only ever
+    /// arrives through a fill, and a filled contract account was stored with
+    /// `info.code = Some(empty)` (revm's AccountInfo::default() fills the
+    /// code field with EMPTY bytecode, and AccountInfo's `==` ignores code,
+    /// so nothing noticed). The EVM uses a code body it is handed and never
+    /// looks the hash up: the implementation ran as an account WITHOUT code.
+    #[test]
+    fn filled_contract_account_keeps_its_code() {
+        use revm::primitives::Bytes;
+        let code = Bytes::from(vec![0x60, 0x2a, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3]); // return 42
+        let mut vs = VecDeque::from([version(5, Snapshot::default(), StateDiff::default())]);
+        let f = vec![Fetched::Account(a(9), Some(FetchedAccount { balance: U256::ZERO, nonce: 1, code: code.clone() }))];
+        assert_eq!(reconcile(&mut vs, 5, &f).applied, 1);
+        let snap = vs[0].snap.clone();
+        let view = crate::state::snap::View::new(snap.clone());
+        let Lookup::Known(Some(info)) = view.account(a(9)) else { panic!("filled account not known: {:?}", view.account(a(9))) };
+        assert_eq!(info.code_hash, keccak256(&code));
+        // Basics never carry a code body (it is looked up by hash): a body
+        // here, even an empty one, would replace the real code in the EVM.
+        assert!(info.code.is_none(), "basics carry a code body: {:?}", info.code);
+        assert_eq!(view.code_by_hash(info.code_hash), Lookup::Known(Bytecode::new_raw(code.clone())));
+        // And the EVM really runs it.
+        let mut db = crate::state::db::ViewDb::new(&view);
+        use revm::database_interface::Database;
+        let got = db.basic(a(9)).unwrap().unwrap();
+        assert_eq!(got.code.map(|c| c.original_bytes()), Some(code));
     }
 
     #[test]

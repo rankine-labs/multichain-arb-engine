@@ -157,8 +157,9 @@ fn info_is_empty(i: &AccountInfo) -> bool {
     i.balance.is_zero() && i.nonce == 0 && (i.code_hash == KECCAK_EMPTY || i.code_hash == B256::ZERO)
 }
 
-/// Basics without the code body, empty -> None.
-fn normalize(info: Option<AccountInfo>) -> Option<AccountInfo> {
+/// Basics without the code body, empty -> None. Every write of basics into a
+/// snapshot goes through this (apply_fact, apply_account_diff, fills).
+pub fn normalize(info: Option<AccountInfo>) -> Option<AccountInfo> {
     info.and_then(|mut i| {
         if i.code_hash == B256::ZERO {
             i.code_hash = KECCAK_EMPTY;
@@ -338,7 +339,13 @@ impl Snapshot {
                         return Lookup::Missing;
                     }
                 }
-                Lookup::Known(i.clone())
+                // Never hand out a code body inside the basics: the EVM
+                // would run it as is (an empty one = a code-less contract)
+                // instead of loading the code by hash.
+                Lookup::Known(i.clone().map(|mut i| {
+                    i.code = None;
+                    i
+                }))
             }
             _ => Lookup::Missing,
         }
