@@ -538,6 +538,9 @@ pub struct C2Shared {
     /// bot's simulated ArbExecutor) -> how many coin layouts we knew when we
     /// last warmed their coin balances (see warm_check_accounts).
     pub check_accounts: Mutex<HashMap<Address, usize>>,
+    /// Why new tick walks are not sent right now (None = they are): the
+    /// slot cap or the memory guard (status poolCoverage.walkPaused).
+    pub walk_paused: Mutex<Option<String>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -788,7 +791,8 @@ impl Copy2Handle {
             let pct = if c.0 + c.5 > 0 { Some((((c.1 + c.5) as f64) * 1000.0 / (c.0 + c.5) as f64).round() / 10.0) } else { None };
             let slots: u64 = reg.pools.values().map(|e| e.walked.len() as u64).sum();
             json!({ "readyTickPools": c.0, "fullTickData": c.1, "partialTickData": c.2, "walking": c.3, "waiting": c.4,
-                    "readyV2Like": c.5, "fullPct": pct, "walkSlots": slots })
+                    "readyV2Like": c.5, "fullPct": pct, "walkSlots": slots,
+                    "walkPaused": *self.c2.walk_paused.lock().unwrap() })
         };
         let misses_top: Vec<Value> = {
             let ma = self.c2.miss_accounts.lock().unwrap();
@@ -897,10 +901,24 @@ pub struct C2Config {
     /// [ARBSIM_COPY2_WALKS, 2; 0 = off].
     pub walk: WalkCfg,
     pub walks_inflight: usize,
-    /// Memory guard: walked values held in total at most
-    /// [ARBSIM_COPY2_WALK_MAX_SLOTS, 150000] (~370 bytes each in the copy
-    /// = ~55 MB); pools beyond it are not walked (busiest first).
+    /// Safety cap: walked values held in total at most
+    /// [ARBSIM_COPY2_WALK_MAX_SLOTS, 600000]. Full coverage of ~800 pools is
+    /// ~250-300k values; measured ~280 bytes of copy-2 memory per walked
+    /// value with everything else included (tests/copy2_memory.rs), so the
+    /// cap is ~2x full coverage, ~170 MB. Pools beyond it are not walked
+    /// (busiest first).
     pub walk_max_slots: usize,
+    /// Memory guard: no new walks while the process uses more than this
+    /// [ARBSIM_COPY2_WALK_MAX_RSS_MB, 300; 0 = no guard] (pm2 restarts the
+    /// sidecar at 400 MB, deploy/arbsim-pm2.sh). Status
+    /// poolCoverage.walkPaused says why walks wait.
+    pub walk_max_rss_mb: u64,
+    /// Reports kept for carrying loads forward, in reports (not blocks): past
+    /// keep_blocks, old blocks are dropped once more than this many reports
+    /// are kept [ARBSIM_COPY2_MAX_KEEP_LOGS, 150000; ~190 bytes each = ~30
+    /// MB] even if a slow load still needs them (it then starts over), so
+    /// a busy chain plus a stuck load can't grow the buffer for hours.
+    pub max_keep_logs: usize,
     /// A pool whose reports for a block may be missing is settled from the
     /// node's logs after this long [ARBSIM_COPY2_PENDING_MS, 1500] (late
     /// reports usually arrive within a second; settling earlier just costs
@@ -923,12 +941,14 @@ impl C2Config {
             catchup_max_blocks: env_u64("ARBSIM_COPY2_CATCHUP_MAX_BLOCKS", 64).max(2),
             walk: WalkCfg::from_env(),
             walks_inflight: env_u64("ARBSIM_COPY2_WALKS", 2).min(16) as usize,
-            walk_max_slots: env_u64("ARBSIM_COPY2_WALK_MAX_SLOTS", 150_000) as usize,
+            walk_max_slots: env_u64("ARBSIM_COPY2_WALK_MAX_SLOTS", 600_000) as usize,
+            walk_max_rss_mb: env_u64("ARBSIM_COPY2_WALK_MAX_RSS_MB", 300),
+            max_keep_logs: env_u64("ARBSIM_COPY2_MAX_KEEP_LOGS", 150_000).max(1000) as usize,
             pending_ms: env_u64("ARBSIM_COPY2_PENDING_MS", 1500),
         }
     }
     pub fn for_tests() -> Self {
-        C2Config { reload_ms: 0, reload_max_ms: 0, layout_retry_s: 3600, load_batch: 25, loaders: 2, keep_blocks: 400, max_keep_blocks: 4000, max_rounds: 40, tip_every_s: 0, catchup_max_blocks: 64, walk: WalkCfg::default(), walks_inflight: 2, walk_max_slots: 1_000_000, pending_ms: 300 }
+        C2Config { reload_ms: 0, reload_max_ms: 0, layout_retry_s: 3600, load_batch: 25, loaders: 2, keep_blocks: 400, max_keep_blocks: 4000, max_rounds: 40, tip_every_s: 0, catchup_max_blocks: 64, walk: WalkCfg::default(), walks_inflight: 2, walk_max_slots: 1_000_000, walk_max_rss_mb: 0, max_keep_logs: 1_000_000, pending_ms: 300 }
     }
 }
 
@@ -1074,6 +1094,9 @@ pub struct Intake {
     settle_retry: Option<(Instant, u32)>,
     /// The node can't do the walk's debug_traceCall: walks off.
     walk_off: bool,
+    /// Process memory (MB) and when it was read (the walk guard reads it at
+    /// most once a second).
+    rss: std::cell::Cell<(f64, Option<Instant>)>,
 }
 
 /// Start the intake thread (+ loader threads).
@@ -1099,6 +1122,7 @@ pub fn manual(sh: Arc<Shared>, fills: Arc<FillQueue>, cfg: C2Config) -> (Intake,
         in_flight: Mutex::new((0, 0)),
         miss_accounts: Mutex::new(HashMap::new()),
         check_accounts: Mutex::new(HashMap::new()),
+        walk_paused: Mutex::new(None),
     });
     let loaders = sh
         .node
@@ -1149,6 +1173,7 @@ pub fn manual(sh: Arc<Shared>, fills: Arc<FillQueue>, cfg: C2Config) -> (Intake,
         suspects: BTreeMap::new(),
         settle_retry: None,
         walk_off: false,
+        rss: std::cell::Cell::new((0.0, None)),
     };
     (i, Copy2Handle { tx, sh, c2 })
 }
@@ -1261,6 +1286,11 @@ impl Intake {
     /// Node jobs in flight + answers not used yet (tests wait for 0).
     pub fn outstanding(&self) -> usize {
         self.jobs.len() + self.done.len() + self.pending.len() + self.delayed.len() + self.load_q.len() + self.suspects.len()
+    }
+
+    /// Reports kept for carrying loads forward: (blocks, reports) (tests).
+    pub fn buffered(&self) -> (usize, usize) {
+        (self.buf.len(), self.buf.iter().map(|b| b.logs.len()).sum())
     }
 
     /// Coin balance places the bot knows: used instead of probing (and
@@ -1607,6 +1637,16 @@ impl Intake {
             .unwrap_or(u64::MAX);
         while self.buf.len() > self.cfg.max_keep_blocks || (self.buf.len() > self.cfg.keep_blocks && self.buf.front().is_some_and(|b| b.block < need_from)) {
             self.buf.pop_front();
+        }
+        // Memory bound in reports (see C2Config::max_keep_logs): only blocks
+        // beyond the always-kept keep_blocks are dropped.
+        if self.buf.len() > self.cfg.keep_blocks {
+            let mut total: usize = self.buf.iter().map(|b| b.logs.len()).sum();
+            while total > self.cfg.max_keep_logs && self.buf.len() > self.cfg.keep_blocks {
+                if let Some(b) = self.buf.pop_front() {
+                    total -= b.logs.len();
+                }
+            }
         }
     }
 
@@ -3049,6 +3089,17 @@ impl Intake {
     }
 
 
+    /// Process memory in MB, read at most once a second.
+    fn rss_mb_cached(&self) -> f64 {
+        let (mb, at) = self.rss.get();
+        if at.is_some_and(|t| t.elapsed() < Duration::from_secs(1)) {
+            return mb;
+        }
+        let mb = Shared::rss_mb();
+        self.rss.set((mb, Some(Instant::now())));
+        mb
+    }
+
     // ---- tick walks (copy2/walk.rs) ----
     /// Send tick walks for ready V3-style pools that have none yet (or whose
     /// price has moved more than half the window away from the walk).
@@ -3064,8 +3115,22 @@ impl Intake {
         let now = Instant::now();
         let half = (self.cfg.walk.window_ticks / 2) as i64;
         let held: usize = self.c2.reg.read().unwrap().pools.values().map(|e| e.walked.len()).sum();
-        if held >= self.cfg.walk_max_slots {
-            return; // memory guard (status poolCoverage.walkSlots)
+        let paused = if held >= self.cfg.walk_max_slots {
+            Some(format!("walked values {held} >= ARBSIM_COPY2_WALK_MAX_SLOTS {}", self.cfg.walk_max_slots))
+        } else if self.cfg.walk_max_rss_mb > 0 && self.rss_mb_cached() >= self.cfg.walk_max_rss_mb as f64 {
+            Some(format!("memory {:.0} MB >= ARBSIM_COPY2_WALK_MAX_RSS_MB {}", self.rss_mb_cached(), self.cfg.walk_max_rss_mb))
+        } else {
+            None
+        };
+        {
+            let mut p = self.c2.walk_paused.lock().unwrap();
+            if paused.is_some() && p.is_none() {
+                eprintln!("[arbsim] copy2: new tick walks paused: {}", paused.as_deref().unwrap_or(""));
+            }
+            *p = paused.clone();
+        }
+        if paused.is_some() {
+            return;
         }
         let mut due: Vec<(bool, std::cmp::Reverse<u64>, PoolKey)> = {
             let reg = self.c2.reg.read().unwrap();
@@ -3171,6 +3236,8 @@ impl Intake {
                 e.walked.extend(out.slots.iter().map(|(a, s, _)| (*a, *s)));
                 e.walked.sort_unstable();
                 e.walked.dedup();
+                // Kept for the pool's life: no spare capacity (memory, #18).
+                e.walked.shrink_to_fit();
                 e.walk = Some(WalkInfo { block: k, done: out.done, center: out.center, word_lo: out.word_lo, word_hi: out.word_hi, ticks: out.ticks, slots: out.slots.len() });
                 if out.done {
                     e.walk_fails = 0;
@@ -3623,8 +3690,20 @@ impl Intake {
             k.extend(reg.owner_of.keys().copied());
             k
         };
-        let (ma, ms) = (self.sh.cfg.max_accounts, self.sh.cfg.max_slots);
         let Some(h) = self.sh.head() else { return };
+        // The caps (ARBSIM_MAX_ACCOUNTS / _SLOTS) count only what may be
+        // dropped: our pools / coins / owned accounts are always kept, and
+        // with full tick walks they alone hold ~300k slots (more than
+        // ARBSIM_MAX_SLOTS 250k), which made every 60 s eviction throw away
+        // ALL other accounts (dry run #18 sizing).
+        let (mut kept_a, mut kept_s) = (0usize, 0usize);
+        for (addr, x) in h.snap.accounts.iter() {
+            if keep.contains(addr) {
+                kept_a += 1;
+                kept_s += x.storage.len();
+            }
+        }
+        let (ma, ms) = (self.sh.cfg.max_accounts + kept_a, self.sh.cfg.max_slots + kept_s);
         let (a, s, _) = h.snap.counts();
         if a <= ma && s <= ms {
             return;

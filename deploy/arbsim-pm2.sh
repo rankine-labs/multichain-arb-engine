@@ -12,9 +12,20 @@
 #   like before the sidecar existed.
 #
 #   pm2 settings: name "arbsim", low priority (nice 5), restarted if it uses
-#   more than 150 MB, waits longer and longer between crash restarts (1 s up
+#   more than 400 MB, waits longer and longer between crash restarts (1 s up
 #   to 15 s) so a broken sidecar can't hog the server, timestamps in the
 #   logs. Log files are rotated by pm2-logrotate (already installed).
+#
+#   Why 400 MB (dry run #18 sizing, sim/tests/copy2_memory.rs): with ALL
+#   ~800 pools tick-walked (~300k values) copy 2 holds ~80 MB of data and
+#   the whole program measured ~100-145 MB steady, flat over thousands of
+#   blocks. 400 MB is ~3x that: room for load / walk bursts, busy checks and
+#   allocator slack, while the server keeps > 1.3 GB free next to the bot
+#   (~1.1 GB). The sidecar itself stops sending new tick walks at 300 MB
+#   (ARBSIM_COPY2_WALK_MAX_RSS_MB), well before this restart line. (The old
+#   150 MB line was below a fully walked copy: it would restart-loop.)
+#   A changed limit applies when pm2 (re)creates the app: on the next
+#   program update, or `bash deploy/arbsim-pm2.sh restart` after a stop.
 #
 # Commands (run from anywhere; the bot folder is found automatically):
 #   bash deploy/arbsim-pm2.sh ensure      match LOCAL_SIM + program (auto-deploy
@@ -35,6 +46,8 @@ set -uo pipefail
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/arbsim-lib.sh"
 
 PM2_STATE_FILE="$BIN_DIR/.arbsim-pm2-state"
+# pm2 restarts the sidecar above this much memory (MB); see the header.
+ARBSIM_MEM_LIMIT_MB=400
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [arbsim] $*"; }
 
 # say_once KEY MESSAGE: log only when the situation changes (no spam).
@@ -76,7 +89,7 @@ start_app() {
     --name "$ARBSIM_APP" \
     --interpreter bash \
     --cwd "$APP_DIR" \
-    --max-memory-restart 150M \
+    --max-memory-restart "${ARBSIM_MEM_LIMIT_MB}M" \
     --exp-backoff-restart-delay 1000 \
     --kill-timeout 5000 \
     --time > /dev/null 2>&1
@@ -119,7 +132,18 @@ case "$cmd" in
         # Stopped by hand (arbsim-pm2.sh stop / pm2 stop arbsim): respect it.
         say_once "manual-stop" "sidecar is stopped by hand; leaving it stopped (start: bash deploy/arbsim-pm2.sh start)" ;;
       *)
-        if [ "$want_restart" = 1 ]; then
+        # An app created with an older, LOWER memory limit (150 MB before
+        # dry run #18) keeps it through "pm2 restart": re-create it once.
+        # Only ever raised (never a loop if pm2 reports it differently).
+        cur_mb="$(pm2_app_mem_limit_mb)"
+        if [ -n "$cur_mb" ] && [ "$cur_mb" -lt $((ARBSIM_MEM_LIMIT_MB * 9 / 10)) ]; then
+          pm2 delete "$ARBSIM_APP" > /dev/null 2>&1 || true
+          if start_app; then
+            log "sidecar re-created with memory limit ${ARBSIM_MEM_LIMIT_MB} MB (was ${cur_mb} MB)"
+          else
+            log "PROBLEM: pm2 could not re-create the sidecar"; exit 1
+          fi
+        elif [ "$want_restart" = 1 ]; then
           pm2 restart "$ARBSIM_APP" > /dev/null 2>&1 && log "sidecar restarted on the newly installed program" \
             || { log "PROBLEM: pm2 restart of the sidecar failed"; exit 1; }
         fi
