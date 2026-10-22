@@ -106,7 +106,7 @@ use revm::primitives::{keccak256, Address, Bytes, B256, U256};
 use serde_json::{json, Value};
 
 use super::coins::{balance_of_data, BalanceLayout};
-use super::fields::{apply_fields, core_slots, map_slot, obs_slot, sol, topic_addr, topics, v2};
+use super::fields::{self, apply_fields, core_slots, map_slot, obs_slot, sol, topic_addr, topics, v2};
 use super::loader::{out_word, Done, FetchOut, Job, LoaderStats, Loaders, NOT_YET};
 use super::overlay::Overlay;
 use super::replay::{apply_replay, finish_block};
@@ -343,10 +343,24 @@ pub struct PoolEntry {
     /// memory, forgotten together with them; a reload doesn't ask for them:
     /// the next walk brings them in one request).
     pub walked: Vec<(Address, U256)>,
+    /// V4 full walks: tick-map words outside the walked window that were
+    /// zero at the walk's block (copy2/walk.rs far_zero). Checks (only)
+    /// answer them 0 while the pool stays ready (copy2/checkview.rs);
+    /// dropped together with `walk`.
+    pub far_zero: Option<FarZero>,
     /// Reports of this pool for this block (or later) may not have arrived
     /// yet (header bloom / missing coin transfers, see "pending"): checks
     /// touching it at that block or later answer unknown until settled.
     pub pending_from: Option<u64>,
+}
+
+/// Zero tick-map words far from the price (one V4 full walk).
+#[derive(Clone, Debug)]
+pub struct FarZero {
+    /// The walk's block: true from here on (with every change the copy made since).
+    pub block: u64,
+    /// Sorted PoolManager slots.
+    pub slots: Arc<Vec<U256>>,
 }
 
 /// One tick walk taken in.
@@ -380,6 +394,10 @@ pub struct Registry {
     /// (coin, pool) -> the slot holding that pool's balance, found by a
     /// trace (coins without a general layout).
     pub pair_slots: HashMap<(Address, Address), U256>,
+    /// V4 PoolManagers' coin balances are NOT followed (C2Config.pm_bound;
+    /// false = the old behaviour: loaded with each V4 pool and changed only
+    /// by transfers that also involve another followed pool = stale).
+    pub pm_bound: bool,
 }
 
 impl Registry {
@@ -389,8 +407,11 @@ impl Registry {
         self.owner_of.clear();
         for (k, e) in &self.pools {
             self.by_addr.entry(k.0).or_default().push(*k);
+            // A V4 PoolManager's coin balances are moved by every V4 pool on
+            // the chain: never followed (see C2Config.pm_bound).
+            let follows_coins = !(self.pm_bound && e.pool.kind == PoolKind::V4);
             for c in [e.pool.token0, e.pool.token1] {
-                if c != Address::ZERO {
+                if c != Address::ZERO && follows_coins {
                     self.holders.entry(c).or_default().insert(e.pool.address);
                 }
             }
@@ -406,6 +427,32 @@ impl Registry {
             Some(Some(l)) => Some(l.key(holder)),
             _ => self.pair_slots.get(&(coin, holder)).copied(),
         }
+    }
+
+    /// Is `a` a V4 PoolManager we follow pools in?
+    pub fn is_pm(&self, a: &Address) -> bool {
+        self.by_addr.get(a).is_some_and(|v| v.iter().any(|k| k.1.is_some()))
+    }
+
+    /// The V4 PoolManagers we follow pools in.
+    pub fn pms(&self) -> Vec<Address> {
+        self.by_addr.iter().filter(|(_, v)| v.iter().any(|k| k.1.is_some())).map(|(a, _)| *a).collect()
+    }
+
+    /// Is (coin, slot) a V4 PoolManager's balance of that coin?
+    pub fn is_pm_balance(&self, coin: Address, slot: U256) -> bool {
+        self.pms().into_iter().any(|pm| self.bal_slot(coin, pm) == Some(slot))
+    }
+
+    /// Is `slot` one of the 4 base slots (slot0, fee growth x2, liquidity)
+    /// of one of our V4 pools at this PoolManager?
+    pub fn is_pm_base_slot(&self, pm: Address, slot: U256) -> bool {
+        self.by_addr.get(&pm).is_some_and(|v| {
+            v.iter().filter_map(|k| k.1).any(|id| {
+                let base = map_slot_id(id);
+                slot >= base && slot < base + U256::from(4u8)
+            })
+        })
     }
 
     /// Pools whose state an account's storage belongs to.
@@ -475,6 +522,18 @@ c2counters!(
     coin_balance_disagree, duplicate_logs, late_transfers_to_loading, node_refusals, need_refusal_retries,
     walks, walks_done, walks_partial, walk_errors, walks_refused, walk_slots, pending_marked, pending_settles,
     pending_found, pending_checks, pending_errors, blooms,
+    // ---- bot's checks (live Oct 22) ----
+    // Zero tick-map words far from the price kept compactly (V4 full walks).
+    walk_far_zero,
+    // Fill refused: a V4 PoolManager's own coin balance (not followed:
+    // checks use the proven lower bound instead, copy2/checkview.rs).
+    fill_refused_pm_balance,
+    // Fill refused: a PoolManager slot that is not a base slot of one of
+    // our V4 pools (another pool's / beyond our walk: never followed).
+    fill_refused_pm_slot,
+    // Checks that read a PoolManager balance and ran twice; answered (same
+    // result at the bound and far above it) / unknown (different).
+    pm_bound_checks, pm_bound_same, pm_bound_differ,
 );
 
 fn inc(c: &AtomicU64) {
@@ -539,6 +598,10 @@ pub struct C2Shared {
     /// Missed items per (class, account) (status "missesTop": names the
     /// accounts behind each class, for the next dry run).
     pub miss_accounts: Mutex<HashMap<(String, Address), u64>>,
+    /// Missed items per (class, account, slot) (status "missesTopSlots":
+    /// WHICH values, named where we can: live Oct 22 needed this to see
+    /// that the 503 PoolManager misses were far tick-map words).
+    pub miss_slots: Mutex<HashMap<(String, Address, U256), u64>>,
     /// Check contracts (accounts a check gives code by override, e.g. the
     /// bot's simulated ArbExecutor) -> how many coin layouts we knew when we
     /// last warmed their coin balances (see warm_check_accounts).
@@ -723,6 +786,14 @@ impl Copy2Handle {
             if ma.len() < 5000 || ma.contains_key(&(format!("{who} {what}"), a)) {
                 *ma.entry((format!("{who} {what}"), a)).or_default() += 1;
             }
+            drop(ma);
+            if let MissItem::Slot(_, sl) = it {
+                let key = (format!("{who} {what}"), a, *sl);
+                let mut ms = self.c2.miss_slots.lock().unwrap();
+                if ms.len() < 5000 || ms.contains_key(&key) {
+                    *ms.entry(key).or_default() += 1;
+                }
+            }
         }
     }
 
@@ -758,6 +829,53 @@ impl Copy2Handle {
             MissItem::Account(a) | MissItem::Slot(a, _) => reg.blocked_account(a),
             MissItem::Code(_) => None,
         })
+    }
+
+    /// What the copy vouches for in a check at the version of `block`
+    /// beyond its held values (copy2/checkview.rs): far zero tick-map words
+    /// of V4 pools ready without a break since their walk, and the V4
+    /// PoolManagers' balances (by a proven lower bound).
+    pub fn check_facts(&self, block: u64) -> super::checkview::C2Facts {
+        let reg = self.c2.reg.read().unwrap();
+        let mut f = super::checkview::C2Facts { block, ..Default::default() };
+        if !reg.pm_bound {
+            return f;
+        }
+        for pm in reg.pms() {
+            f.pms.insert(pm, Vec::new());
+        }
+        for e in reg.pools.values() {
+            if e.pool.kind != PoolKind::V4 {
+                continue;
+            }
+            // Every V4 coin's PoolManager balance goes through the bound
+            // (a value the copy may still hold for it is never used).
+            for c in [e.pool.token0, e.pool.token1] {
+                if c == Address::ZERO {
+                    continue;
+                }
+                if let Some(sl) = reg.bal_slot(c, e.pool.address) {
+                    f.inject.insert((c, sl), (e.pool.address, c));
+                }
+            }
+            // Exact at this version: ready since then, nothing pending.
+            if e.state != PoolState::Ready || e.ready_since > block || e.pending_from.is_some_and(|b| b <= block) {
+                continue;
+            }
+            if let (Some(fz), Some(_)) = (&e.far_zero, &e.walk) {
+                if fz.block.max(e.ready_since) <= block {
+                    f.far.entry(e.pool.address).or_default().push(fz.slots.clone());
+                }
+            }
+            f.pms.entry(e.pool.address).or_default().push(e.pool.clone());
+        }
+        f
+    }
+
+    /// A check read a PoolManager balance and ran twice: same / different.
+    pub fn note_pm_bound(&self, same: bool) {
+        inc(&self.c2.stats.pm_bound_checks);
+        inc(if same { &self.c2.stats.pm_bound_same } else { &self.c2.stats.pm_bound_differ });
     }
 
     /// The `copy2` part of `status` (with the per-pool list if asked).
@@ -797,8 +915,9 @@ impl Copy2Handle {
             }
             let pct = if c.0 + c.5 > 0 { Some((((c.1 + c.5) as f64) * 1000.0 / (c.0 + c.5) as f64).round() / 10.0) } else { None };
             let slots: u64 = reg.pools.values().map(|e| e.walked.len() as u64).sum();
+            let far: u64 = reg.pools.values().filter_map(|e| e.far_zero.as_ref()).map(|f| f.slots.len() as u64).sum();
             json!({ "readyTickPools": c.0, "fullTickData": c.1, "partialTickData": c.2, "walking": c.3, "waiting": c.4,
-                    "readyV2Like": c.5, "fullPct": pct, "walkSlots": slots,
+                    "readyV2Like": c.5, "fullPct": pct, "walkSlots": slots, "farZeroWords": far,
                     "walkPaused": *self.c2.walk_paused.lock().unwrap() })
         };
         let misses_top: Vec<Value> = {
@@ -806,6 +925,18 @@ impl Copy2Handle {
             let mut v: Vec<(&(String, Address), &u64)> = ma.iter().collect();
             v.sort_by(|a, b| b.1.cmp(a.1));
             v.into_iter().take(20).map(|((c, a), n)| json!([c, to_hex(a.as_slice()), n])).collect()
+        };
+        // The 20 missed VALUES with the most misses: [class, account, slot,
+        // count, what it is (where we can tell)].
+        let misses_top_slots: Vec<Value> = {
+            let ms = self.c2.miss_slots.lock().unwrap();
+            let mut v: Vec<(&(String, Address, U256), &u64)> = ms.iter().collect();
+            v.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+            let checkers: Vec<Address> = self.c2.check_accounts.lock().unwrap().keys().copied().collect();
+            v.into_iter()
+                .take(20)
+                .map(|((c, a, sl), n)| json!([c, to_hex(a.as_slice()), format!("{sl:#x}"), n, describe_slot(&reg, &checkers, *a, *sl)]))
+                .collect()
         };
         let mut out = json!({
             "source": "pool-events",
@@ -838,6 +969,7 @@ impl Copy2Handle {
             "pendingPools": reg.pools.values().filter(|e| e.pending_from.is_some()).count(),
             // The 20 accounts with the most missed items (class, account, count).
             "missesTop": misses_top,
+            "missesTopSlots": misses_top_slots,
             "outsideContracts": self.sh.volatile.whole_len(),
             // The node client's adaptive speed limit (dry run #16): the rate
             // allowed now, the plan rate, refusals by the provider.
@@ -933,6 +1065,11 @@ pub struct C2Config {
     /// reports usually arrive within a second; settling earlier just costs
     /// requests).
     pub pending_ms: u64,
+    /// Never hold a V4 PoolManager's coin / ETH balances; checks that read
+    /// them run at a proven lower bound and far above it and answer only
+    /// when both agree (copy2/checkview.rs) [ARBSIM_COPY2_PM_BOUND, 1;
+    /// 0 = the old behaviour, only for tests: a stale held balance].
+    pub pm_bound: bool,
 }
 
 impl C2Config {
@@ -954,10 +1091,11 @@ impl C2Config {
             walk_max_rss_mb: env_u64("ARBSIM_COPY2_WALK_MAX_RSS_MB", 550),
             max_keep_logs: env_u64("ARBSIM_COPY2_MAX_KEEP_LOGS", 150_000).max(1000) as usize,
             pending_ms: env_u64("ARBSIM_COPY2_PENDING_MS", 1500),
+            pm_bound: env_u64("ARBSIM_COPY2_PM_BOUND", 1) != 0,
         }
     }
     pub fn for_tests() -> Self {
-        C2Config { reload_ms: 0, reload_max_ms: 0, layout_retry_s: 3600, load_batch: 25, loaders: 2, keep_blocks: 400, max_keep_blocks: 4000, max_rounds: 40, tip_every_s: 0, catchup_max_blocks: 64, walk: WalkCfg::default(), walks_inflight: 2, walk_max_slots: 1_000_000, walk_max_rss_mb: 0, max_keep_logs: 1_000_000, pending_ms: 300 }
+        C2Config { reload_ms: 0, reload_max_ms: 0, layout_retry_s: 3600, load_batch: 25, loaders: 2, keep_blocks: 400, max_keep_blocks: 4000, max_rounds: 40, tip_every_s: 0, catchup_max_blocks: 64, walk: WalkCfg::default(), walks_inflight: 2, walk_max_slots: 1_000_000, walk_max_rss_mb: 0, max_keep_logs: 1_000_000, pending_ms: 300, pm_bound: true }
     }
 }
 
@@ -1119,7 +1257,7 @@ pub fn spawn(sh: Arc<Shared>, fills: Arc<FillQueue>, cfg: C2Config) -> Copy2Hand
 pub fn manual(sh: Arc<Shared>, fills: Arc<FillQueue>, cfg: C2Config) -> (Intake, Copy2Handle) {
     let (tx, rx) = std::sync::mpsc::sync_channel(16_384);
     let c2 = Arc::new(C2Shared {
-        reg: RwLock::new(Registry::default()),
+        reg: RwLock::new(Registry { pm_bound: cfg.pm_bound, ..Registry::default() }),
         stats: C2Stats::default(),
         last_block: AtomicU64::new(0),
         node_requests: Arc::new(AtomicU64::new(0)),
@@ -1130,6 +1268,7 @@ pub fn manual(sh: Arc<Shared>, fills: Arc<FillQueue>, cfg: C2Config) -> (Intake,
         loader: Arc::new(LoaderStats::default()),
         in_flight: Mutex::new((0, 0)),
         miss_accounts: Mutex::new(HashMap::new()),
+        miss_slots: Mutex::new(HashMap::new()),
         check_accounts: Mutex::new(HashMap::new()),
         walk_paused: Mutex::new(None),
         gap_reasons: Mutex::new(HashMap::new()),
@@ -1465,6 +1604,7 @@ impl Intake {
                         walk_retry_at: Instant::now(),
                         walk_fails: 0,
                         walked: Vec::new(),
+                        far_zero: None,
                         pending_from: None,
                     },
                 );
@@ -2087,6 +2227,7 @@ impl Intake {
             e.gen += 1;
             e.busy = false;
             e.walk = None;
+            e.far_zero = None;
             let walked = std::mem::take(&mut e.walked);
             if strike {
                 let wait = self.backoff(e.strikes, why);
@@ -2335,6 +2476,7 @@ impl Intake {
                 .flat_map(|p| [(p.token0, p.address), (p.token1, p.address)])
                 .map(|(c, h)| ((c, h), reg.bal_slot(c, h)))
                 .collect();
+            let pm_bound = reg.pm_bound;
             for k in keys {
                 let Some(e) = reg.pools.get_mut(k) else { continue };
                 let p = e.pool.clone();
@@ -2356,12 +2498,13 @@ impl Intake {
                 // them (one request) instead of hundreds of single values.
                 e.walked.clear();
                 e.walk = None;
+                e.far_zero = None;
                 for a in &e.accounts {
                     push(&mut items, MissItem::Account(*a));
                 }
                 let mut coin_checks = Vec::new();
                 for c in [p.token0, p.token1] {
-                    if c == Address::ZERO {
+                    if c == Address::ZERO || (pm_bound && p.kind == PoolKind::V4) {
                         continue;
                     }
                     let bal_call = parse_bytes(&balance_of_data(p.address)).unwrap_or_default();
@@ -2952,7 +3095,11 @@ impl Intake {
         }
         let coin_slots: Vec<(Address, U256)> = {
             let reg = self.c2.reg.read().unwrap();
-            [pool.token0, pool.token1].into_iter().filter(|c| *c != Address::ZERO).filter_map(|c| reg.bal_slot(c, pool.address).map(|s| (c, s))).collect()
+            if reg.pm_bound && pool.kind == PoolKind::V4 {
+                Vec::new()
+            } else {
+                [pool.token0, pool.token1].into_iter().filter(|c| *c != Address::ZERO).filter_map(|c| reg.bal_slot(c, pool.address).map(|s| (c, s))).collect()
+            }
         };
         let start = self.buf.partition_point(|b| b.block < part.cursor.0);
         let blocks: Vec<(u64, ReplayCtx, Arc<Vec<PoolLog>>)> = self.buf.iter().skip(start).map(|b| (b.block, b.rctx, b.logs.clone())).collect();
@@ -3027,8 +3174,11 @@ impl Intake {
         let (pool, holders, old_owned, bal_slots) = {
             let reg = self.c2.reg.read().unwrap();
             let Some(e) = reg.pools.get(&key) else { return };
-            let bs: Vec<(Address, U256)> =
-                [e.pool.token0, e.pool.token1].into_iter().filter_map(|c| reg.bal_slot(c, e.pool.address).map(|s| (c, s))).collect();
+            let bs: Vec<(Address, U256)> = if reg.pm_bound && e.pool.kind == PoolKind::V4 {
+                Vec::new()
+            } else {
+                [e.pool.token0, e.pool.token1].into_iter().filter_map(|c| reg.bal_slot(c, e.pool.address).map(|s| (c, s))).collect()
+            };
             (e.pool.clone(), reg.holders.keys().copied().collect::<HashSet<Address>>(), e.owned.clone(), bs)
         };
         let snap = part.ov.snapshot();
@@ -3301,6 +3451,15 @@ impl Intake {
                 // Kept for the pool's life: no spare capacity (memory, #18).
                 e.walked.shrink_to_fit();
                 e.walk = Some(WalkInfo { block: k, done: out.done, center: out.center, word_lo: out.word_lo, word_hi: out.word_hi, ticks: out.ticks, slots: out.slots.len() });
+                // A newer walk's far words replace the older ones (an older
+                // set stays true too, but one set per pool keeps it simple:
+                // a word only the old walk knew is then just missing).
+                if !out.far_zero.is_empty() {
+                    let mut fz = out.far_zero.clone();
+                    fz.shrink_to_fit();
+                    add(&self.c2.stats.walk_far_zero, fz.len() as u64);
+                    e.far_zero = Some(FarZero { block: k, slots: Arc::new(fz) });
+                }
                 if out.done {
                     e.walk_fails = 0;
                 } else {
@@ -3561,9 +3720,24 @@ impl Intake {
         let (ok, refused): (Vec<MissItem>, Vec<MissItem>) = {
             let reg = self.c2.reg.read().unwrap();
             let vol = &self.sh.volatile;
+            let st = &self.c2.stats;
             items.into_iter().filter(|m| needs(&head.snap, m)).partition(|m| match m {
                 MissItem::Account(a) | MissItem::Slot(a, _) if vol.is_whole(a) => false, // outside contract: never kept
                 MissItem::Account(_) => true, // basics + code
+                // A V4 PoolManager's coin balance: never held (checks use
+                // the proven bound, copy2/checkview.rs).
+                MissItem::Slot(a, s) if reg.pm_bound && reg.is_pm_balance(*a, *s) => {
+                    inc(&st.fill_refused_pm_balance);
+                    false
+                }
+                // A PoolManager slot that isn't a base slot of one of our V4
+                // pools: another pool's data (or beyond our walk). The fill
+                // used to put it into the copy as if followed by ALL our V4
+                // pools: a stale value as soon as that pool traded.
+                MissItem::Slot(a, s) if reg.pm_bound && reg.is_pm(a) && !reg.is_pm_base_slot(*a, *s) => {
+                    inc(&st.fill_refused_pm_slot);
+                    false
+                }
                 MissItem::Slot(a, s) => match Self::gate_of(&reg, *a, *s) {
                     Some(g) => reg.blocked_account(&g).is_none(),
                     None => true,
@@ -3913,6 +4087,69 @@ fn current_tick(p: &TrackedPool, s: &Snapshot) -> Option<i64> {
     let Lookup::Known(w) = w else { return None };
     let t = ((w >> 160usize) & U256::from(0xff_ffffu32)).to::<i64>();
     Some(if t >= 1 << 23 { t - (1 << 24) } else { t })
+}
+
+/// What a missed value is, where we can tell (status missesTopSlots).
+fn describe_slot(reg: &Registry, checkers: &[Address], a: Address, sl: U256) -> String {
+    // A coin: whose balance?
+    if reg.layouts.contains_key(&a) || reg.holders.contains_key(&a) {
+        for pm in reg.pms() {
+            if reg.bal_slot(a, pm) == Some(sl) {
+                return "balance of the V4 PoolManager (not followed: checks use the bound)".into();
+            }
+        }
+        if let Some(h) = reg.holders.get(&a) {
+            for x in h {
+                if reg.bal_slot(a, *x) == Some(sl) {
+                    return format!("balance of our pool {x}");
+                }
+            }
+        }
+        if let Some(Some(l)) = reg.layouts.get(&a) {
+            for c in checkers {
+                if l.key(*c) == sl {
+                    return format!("balance of the check's contract {c}");
+                }
+            }
+            return "not a balance of a pool / PoolManager / check contract we know".into();
+        }
+        return "coin without a known balance layout".into();
+    }
+    // A V4 PoolManager: which pool's value?
+    if reg.is_pm(&a) {
+        for k in reg.by_addr.get(&a).cloned().unwrap_or_default() {
+            let Some(id) = k.1 else { continue };
+            let base = map_slot_id(id);
+            if sl >= base && sl < base + U256::from(4u8) {
+                let n = ["slot0", "feeGrowthGlobal0", "feeGrowthGlobal1", "liquidity"][(sl - base).to::<usize>()];
+                return format!("pool {id} {n}");
+            }
+            if let Some(e) = reg.pools.get(&k) {
+                if e.walked.binary_search(&(a, sl)).is_ok() {
+                    return format!("pool {id}: a walked value (held)");
+                }
+                if e.far_zero.as_ref().is_some_and(|f| f.slots.binary_search(&sl).is_ok()) {
+                    return format!("pool {id}: far zero tick-map word (checks answer it)");
+                }
+            }
+        }
+        if sl < U256::from(8u8) {
+            return format!("PoolManager setting slot {sl} (owner / protocol fee controller / ...)");
+        }
+        for c in reg.pools.values().filter(|e| e.pool.address == a && e.pool.v4_id.is_some()).flat_map(|e| [e.pool.token0, e.pool.token1]) {
+            if fields::map_slot(c, 1) == sl {
+                return format!("protocolFeesAccrued[{c}]");
+            }
+        }
+        return "not a base slot / walked value of our V4 pools (another pool, a tick beyond our walk, claims ...)".into();
+    }
+    if reg.by_addr.contains_key(&a) {
+        return "our pool's own storage".into();
+    }
+    if sl < U256::from(64u8) {
+        return format!("slot {sl}");
+    }
+    String::new()
 }
 
 fn map_slot_id(id: B256) -> U256 {
