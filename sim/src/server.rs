@@ -33,7 +33,7 @@ use serde_json::{json, Value};
 
 use crate::arb::BlockCtx;
 use crate::check::proto_types::{handle_call, handle_size_search, CallRequest, SizeSearchRequest};
-use crate::copy2::checkview::{high_offset, C2View};
+use crate::copy2::checkview::{fee_nonzero, high_offset, C2View};
 use crate::copy2::intake::Copy2Handle;
 use crate::node::env_u64;
 use crate::proto::{bad_request, parse_at, parse_missing, parse_warm, read_msg, unknown, write_msg};
@@ -357,36 +357,126 @@ fn check(ctx: &Ctx, id: &Value, at: &Value, t0: Instant, run: impl Fn(&dyn State
 
 /// Copy 2: run the check on the copy's view plus what the copy vouches for
 /// without holding it (copy2/checkview.rs: far zero tick-map words, the V4
-/// PoolManager's balances at a proven lower bound). A run that read a
-/// PoolManager balance is repeated with that balance 2^200 higher; the
-/// answer stands only if both runs agree exactly, else "unknown".
+/// PoolManager's balances at a proven lower bound, the V4 protocol fee
+/// counters). A run that read a PoolManager balance is repeated with that
+/// balance 2^200 higher; the answer stands only if both runs agree exactly,
+/// else "unknown". A run that read a protocolFeesAccrued counter (never
+/// held) is repeated with the counter not zero (and that run's balance pair
+/// too, if it read a balance): the answer stands only if the two differ in
+/// gas alone; it then reports the HIGHER gas of each gas field (counter 0 =
+/// the costlier 0 -> non-zero store), so the bot never overestimates profit.
 fn copy2_run(c: &Copy2Handle, view: &View, block: u64, bctx: &BlockCtx, run: &impl Fn(&dyn StateRead, &BlockCtx) -> Value) -> Value {
     let facts = c.check_facts(block);
     if facts.is_empty() {
         return run(view, bctx);
     }
-    let low = C2View::new(view, &facts, revm::primitives::U256::ZERO);
-    let answer = run(&low, bctx);
-    if !low.used_bound() || answer.get("ok") != Some(&Value::Bool(true)) {
-        return answer;
-    }
-    let high = C2View::new(view, &facts, high_offset());
-    let again = run(&high, bctx);
-    let strip = |v: &Value| {
-        let mut v = v.clone();
-        if let Some(m) = v.as_object_mut() {
-            m.remove("us");
-        }
-        v
+    let zero = revm::primitives::U256::ZERO;
+    let run_at = |offset, fee| {
+        let v = C2View::with_fee(view, &facts, offset, fee);
+        let a = run(&v, bctx);
+        let (b, f) = (v.used_bound(), v.used_fee());
+        (a, b, f)
     };
-    let same = strip(&answer) == strip(&again);
-    c.note_pm_bound(same);
-    if same {
-        return answer;
+    let ok = |v: &Value| v.get("ok") == Some(&Value::Bool(true));
+    let unknown = |a: &Value, why: &str, detail: &str| {
+        let id = a.get("id").cloned().unwrap_or(Value::Null);
+        json!({ "id": id, "ok": false, "unknown": why, "detail": detail })
+    };
+    const PM_DETAIL: &str = "the answer depends on the V4 PoolManager's coin / ETH balance, which copy 2 does not follow (same check at a proven lower bound and far above it differ)";
+    // One fee value: the run at the bound, confirmed far above it if it read
+    // a PoolManager balance. Err = the unknown answer to give.
+    let confirmed = |fee| -> Result<(Value, bool), Value> {
+        let (a, used_bound, used_fee) = run_at(zero, fee);
+        if !used_bound || !ok(&a) {
+            return Ok((a, used_fee));
+        }
+        let (again, _, _) = run_at(high_offset(), fee);
+        let same = strip_us(&a) == strip_us(&again);
+        c.note_pm_bound(same);
+        if same {
+            Ok((a, used_fee))
+        } else {
+            Err(unknown(&a, "pool_manager_balance", PM_DETAIL))
+        }
+    };
+    let (a, used_fee) = match confirmed(zero) {
+        Ok(x) => x,
+        Err(u) => return u,
+    };
+    if !used_fee || !ok(&a) {
+        return a;
     }
-    let id = answer.get("id").cloned().unwrap_or(Value::Null);
-    json!({ "id": id, "ok": false, "unknown": "pool_manager_balance",
-            "detail": "the answer depends on the V4 PoolManager's coin / ETH balance, which copy 2 does not follow (same check at a proven lower bound and far above it differ)" })
+    let (b, _) = match confirmed(fee_nonzero()) {
+        Ok(x) => x,
+        Err(u) => return u,
+    };
+    if !ok(&b) {
+        // e.g. the other path reads a value the copy doesn't hold: that
+        // answer (its misses get filled).
+        c.note_protocol_fee(false);
+        return b;
+    }
+    let merged = same_but_gas(&strip_us(&a), &strip_us(&b));
+    c.note_protocol_fee(merged.is_some());
+    match merged {
+        Some(mut m) => {
+            if let (Some(us), Some(o)) = (a.get("us").cloned(), m.as_object_mut()) {
+                o.insert("us".into(), us);
+            }
+            m
+        }
+        None => unknown(
+            &a,
+            "protocol_fee",
+            "the answer depends on a V4 protocolFeesAccrued counter beyond gas (copy 2 does not follow it; the check with it 0 and not 0 differ)",
+        ),
+    }
+}
+
+fn strip_us(v: &Value) -> Value {
+    let mut v = v.clone();
+    if let Some(m) = v.as_object_mut() {
+        m.remove("us");
+    }
+    v
+}
+
+/// Two answers that are identical except for `gasUsed` fields: one answer
+/// with the higher value of each gas field. None if anything else differs.
+pub fn same_but_gas(a: &Value, b: &Value) -> Option<Value> {
+    match (a, b) {
+        (Value::Object(x), Value::Object(y)) => {
+            if x.len() != y.len() {
+                return None;
+            }
+            let mut out = serde_json::Map::new();
+            for (k, va) in x {
+                let vb = y.get(k)?;
+                if k == "gasUsed" {
+                    let (ga, gb) = (gas_num(va)?, gas_num(vb)?);
+                    out.insert(k.clone(), if gb > ga { vb.clone() } else { va.clone() });
+                } else {
+                    out.insert(k.clone(), same_but_gas(va, vb)?);
+                }
+            }
+            Some(Value::Object(out))
+        }
+        (Value::Array(x), Value::Array(y)) => {
+            if x.len() != y.len() {
+                return None;
+            }
+            Some(Value::Array(x.iter().zip(y).map(|(p, q)| same_but_gas(p, q)).collect::<Option<Vec<_>>>()?))
+        }
+        _ => (a == b).then(|| a.clone()),
+    }
+}
+
+fn gas_num(v: &Value) -> Option<u64> {
+    match v {
+        Value::String(s) => crate::check::hexutil::parse_u64(s).ok(),
+        Value::Number(n) => n.as_u64(),
+        _ => None,
+    }
 }
 
 fn pinned_check(ctx: &Ctx, id: &Value, block: u64, next: bool, t0: Instant, run: impl Fn(&dyn StateRead, &BlockCtx) -> Value) -> Value {
@@ -428,4 +518,26 @@ fn pinned_check(ctx: &Ctx, id: &Value, block: u64, next: bool, t0: Instant, run:
     }
     answer["us"] = json!(t0.elapsed().as_micros() as u64);
     answer
+}
+
+#[cfg(test)]
+mod tests {
+    use super::same_but_gas;
+    use serde_json::json;
+
+    #[test]
+    fn same_but_gas_takes_the_higher_gas_and_nothing_else_may_differ() {
+        let a = json!({"ok": true, "results": [{"success": true, "output": "0x01", "gasUsed": "0x10"}, {"success": false, "output": "0x", "gasUsed": "0x30"}]});
+        let b = json!({"ok": true, "results": [{"success": true, "output": "0x01", "gasUsed": "0x20"}, {"success": false, "output": "0x", "gasUsed": "0x05"}]});
+        let m = same_but_gas(&a, &b).unwrap();
+        assert_eq!(m["results"][0]["gasUsed"], json!("0x20"));
+        assert_eq!(m["results"][1]["gasUsed"], json!("0x30"));
+        let c = json!({"ok": true, "results": [{"success": true, "output": "0x02", "gasUsed": "0x10"}, {"success": false, "output": "0x", "gasUsed": "0x30"}]});
+        assert!(same_but_gas(&a, &c).is_none(), "output differs");
+        let s1 = json!({"ok": true, "best": {"amount": "0x5", "profit": "0x7", "gasUsed": "0x100"}, "tried": [{"amount": "0x5", "status": "profit", "profit": "0x7", "gasUsed": "0x100", "reason": null}]});
+        let s2 = json!({"ok": true, "best": {"amount": "0x5", "profit": "0x7", "gasUsed": "0x90"}, "tried": [{"amount": "0x5", "status": "profit", "profit": "0x7", "gasUsed": "0x90", "reason": null}]});
+        assert_eq!(same_but_gas(&s1, &s2).unwrap(), s1);
+        let s3 = json!({"ok": true, "best": null, "tried": []});
+        assert!(same_but_gas(&s1, &s3).is_none());
+    }
 }

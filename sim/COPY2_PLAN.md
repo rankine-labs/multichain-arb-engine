@@ -705,3 +705,91 @@ trade ~20 ms.
      shadow hour shows whether every unknown check is a missed value and
      which value alone blocks how many. deploy/arbsim-status.js prints both.
      describe_slot names "probably totalSupply" and namespaced settings.
+- Live shadow after the efa0a85 restart, Oct 22 13:34 UTC (inbot-sim/copy2-m):
+  9 min after start 323 of 648 pools unsure "late report for a block no
+  longer kept" (292); at 68 min 260 pools LOADING with 0 node jobs ("last
+  load round ... still running after 24 min, 98 node requests"); checks
+  102 asked, 24 sure; misses led by protocolFeesAccrued[0x2D42..] 28/27 and
+  [0xB90A..] 15/14 (stock-coin V4 pools, the bot's most common checks).
+  1. Restart burst. A late report for a block the copy can't place went
+     to on_late's "no longer kept" branch: blocks before the copy's first
+     block (the bot's first seconds after a restart), blocks older than the
+     kept reports or before a lost-message reload (buffer cleared), and
+     quiet blocks: the bot sends a message only for blocks with reports (a
+     tick only for the newest quiet one), so a block whose every report
+     came late had no message at all. That branch made every pool the
+     report touched unsure WITH a strike (wait doubling 2 s ... 10 min,
+     strikes reset only after 50 events while ready), cancelled loads in
+     flight, and "touched" was by address: one V4 PoolManager report = ALL
+     V4 pools at the PoolManager (~290). A trickle of such reports kept
+     the V4 pools unsure (~9 strikes = waits of 10 min). Tests
+     (tests/copy2_intake.rs; each fails on the old code):
+     late_reports_from_before_the_copy_started_change_nothing / _do_not_
+     cancel_loads, late_pool_manager_report_touches_only_its_own_pool,
+     late_reports_for_a_block_without_a_message_are_placed_exactly,
+     a_load_older_than_an_unplaceable_late_report_reads_again.
+     Fix: every pool has base_block = the node block its values were read
+     at (a load's fetch block); a late report for block n <= base_block is
+     already in them: ignored (also in the normal late path; counter
+     late_old_covered). A quiet block inside the kept range is placed like
+     any late report, with the late message's own block time (inserted into
+     the kept reports so loads carry through it; late_hole_blocks). Not
+     placeable: a ready pool read before n goes unsure WITHOUT a strike; a
+     loading / waiting pool gets need_base = n (a load whose node read is
+     older reads again, on_load_one) and a working copy read before n starts
+     over (late_old_reload); a followed coin balance read before n
+     (coin_base) is forgotten from n; working copies get the transfer added.
+     pools_touched (reorgs too) is per pool: a PoolManager report = that
+     pool id; a coin Transfer = the pools whose balance of THAT coin we
+     follow (never all V4 pools through the PoolManager's balance).
+  2. Load stall. A retry left over from an EARLIER load of a pool (node
+     "not at that block yet" 300 ms retry, error backoff, or a Need answer
+     still in flight) did `partials.remove(pool)` before checking the
+     generation: once the pool had gone unsure and started a NEW load, the
+     old retry threw the new load's working copy away; the pool stayed
+     "loading: fetching N more value(s)" with busy set and nothing working
+     for it, forever (dispatch_loads skips busy pools). The restart burst
+     (pools made unsure over and over while their catch-ups waited) made it
+     common. Test an_old_loads_retry_never_takes_the_new_loads_working_copy
+     (fake node "not at the block" for one value; old code: stuck). Fix:
+     dispatch_delayed / on_need only take the working copy of their own
+     generation; merge without a copy reschedules instead of dropping.
+     Guard: a pool loading + busy with no node job, working copy, queued
+     answer or retry for ARBSIM_COPY2_STALL_S (30) is rescheduled (counter
+     stall_rescheduled, log "copy2 STALL ... (were: <reasons>)"); pools due
+     30+ s but not sent are logged once a minute with why loads are held
+     back (job cap, node refusing, probes, traces)
+     (a_loading_pool_with_nothing_working_for_it_is_rescheduled).
+  3. protocolFeesAccrued[coin] (V4 PoolManager slot keccak(coin . 1)). Its
+     value never changes a swap (only `+= protocol fee`, unchecked); it
+     only decides the store's gas: 0 -> non-zero 20,000, non-zero ->
+     non-zero 2,900 (+2,100 cold either way): 17,100 apart. Checks now read
+     it as 0 in one run and as 1 (placeholder for "not zero": R + fee and
+     1 + fee are both non-zero, every SSTORE gas class identical) in a
+     second run (each confirmed far above the PoolManager balance bound if
+     it read one). Same success / output / everything but gas -> answered,
+     each gasUsed field = the HIGHER of the two (the zero case); else
+     unknown "protocol_fee". A value the copy holds (a replay of our own
+     pool's swap fetches and moves it) is never used by checks (other
+     pools' swaps / collections change it unseen). Only checks that read
+     the counter (pools with a protocol fee on in that direction) pay the
+     extra runs. Counters protocol_fee_checks / _same / _differ; status
+     label "checks run with it 0 and not 0 ...". Anvil test
+     bot_v4_protocol_fee_counter_answers_with_the_higher_gas (real
+     PoolManager, protocol fee 0.1 % both ways): counter 0 on the chain ->
+     exact (4/4); non-zero -> 6/6 answered, success / output exact, gas
+     exactly 17,100 above the chain's.
+     Bot impact: the sidecar's gasUsed feeds the gas calibration (median
+     per route kind, core/gasModel.ts) and the gas-limit check
+     (loopLive gasLimitOk); the profit decision itself uses gasModel's USD
+     estimate. 17,100 gas at Robinhood's ~0.01 gwei L2 base fee = 1.7e-7
+     ETH = ~$0.0007 at $4,000 ETH (x GAS_MARGIN 1.3 = ~$0.0009), far below
+     GAS_MIN_USD ($0.01). Always on the high side: profit may look up to
+     ~$0.001 smaller than real, never bigger.
+  Expected: the restart burst no longer makes pools unsure / stuck (all
+  ready within the first load round, as in the previous shadow hour);
+  checks blocked only by the protocol fee counter (41 of the 102) answered;
+  with the unsure_pool / not_ready ones gone, roughly 70-85 % of the bot's
+  checks answered (the rest: other first-read misses, pending reports).
+  Not addressed: "reports may be missing and the node's logs could not be
+  read" (14; settle eth_getLogs failing > 60 s) - watch it next hour.

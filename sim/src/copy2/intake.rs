@@ -352,6 +352,14 @@ pub struct PoolEntry {
     /// yet (header bloom / missing coin transfers, see "pending"): checks
     /// touching it at that block or later answer unknown until settled.
     pub pending_from: Option<u64>,
+    /// The block its current values were read at (the load's node block):
+    /// every report up to the end of it is inside them, so a late report
+    /// for such a block changes nothing (on_late). 0 = none yet.
+    pub base_block: u64,
+    /// A late report for this block could not be placed (no longer kept)
+    /// while the pool was not ready: its next load must read at or after
+    /// it (an older read would lack that report), else it starts over.
+    pub need_base: u64,
 }
 
 /// Zero tick-map words far from the price (one V4 full walk).
@@ -556,6 +564,25 @@ c2counters!(
     verify_rounds, verify_items, unfollowed_changed,
     // How many such values the copy held at the last round (a level).
     unfollowed_held,
+    // ---- copy2-m (live Oct 22, 13:34 restart) ----
+    // Checks that read a V4 protocolFeesAccrued counter (never held) and ran
+    // with it 0 and not 0: answered (same apart from gas; the higher gas is
+    // reported) / unknown "protocol_fee" (different).
+    protocol_fee_checks, protocol_fee_same, protocol_fee_differ,
+    // Late reports for a block the copy has no message for (a quiet block
+    // whose every report came late): placed with the late message's own
+    // block time like any late report (was: the pool unsure).
+    late_hole_blocks,
+    // Late reports for a block no longer kept (before the copy's first
+    // block, or older than the kept reports) that every touched pool's
+    // node values already include (read at or after that block): ignored.
+    late_old_covered,
+    // ... that a pool still loading (or waiting to load) can't have: its
+    // load starts over / its next load must read at or after that block.
+    late_old_reload,
+    // Loading pools with no node job / working copy for 30 s: rescheduled
+    // (copy2 STALL log line names each reason).
+    stall_rescheduled,
 );
 
 fn inc(c: &AtomicU64) {
@@ -905,6 +932,13 @@ impl Copy2Handle {
     pub fn check_facts(&self, block: u64) -> super::checkview::C2Facts {
         let reg = self.c2.reg.read().unwrap();
         let mut f = super::checkview::C2Facts { block, ..Default::default() };
+        // protocolFeesAccrued of every coin of our V4 pools (never held:
+        // answered by two runs, counter 0 and not 0; checkview.rs 3.).
+        for e in reg.pools.values().filter(|e| e.pool.kind == PoolKind::V4) {
+            for c in [e.pool.token0, e.pool.token1] {
+                f.fees.insert((e.pool.address, super::checkview::protocol_fee_slot(c)));
+            }
+        }
         if !reg.pm_bound {
             return f;
         }
@@ -943,6 +977,13 @@ impl Copy2Handle {
     pub fn note_pm_bound(&self, same: bool) {
         inc(&self.c2.stats.pm_bound_checks);
         inc(if same { &self.c2.stats.pm_bound_same } else { &self.c2.stats.pm_bound_differ });
+    }
+
+    /// A check read an unheld protocolFeesAccrued counter and ran with it 0
+    /// and not 0: same apart from gas (answered, higher gas) / different.
+    pub fn note_protocol_fee(&self, same: bool) {
+        inc(&self.c2.stats.protocol_fee_checks);
+        inc(if same { &self.c2.stats.protocol_fee_same } else { &self.c2.stats.protocol_fee_differ });
     }
 
     /// The `copy2` part of `status` (with the per-pool list if asked).
@@ -1160,6 +1201,10 @@ pub struct C2Config {
     /// [ARBSIM_COPY2_VERIFY_MAX, 400] values a round.
     pub verify_every_s: u64,
     pub verify_max: usize,
+    /// A pool "loading" with no node job, no working copy and no answer
+    /// waiting for this long is rescheduled (logged with its reason)
+    /// [ARBSIM_COPY2_STALL_S, 30].
+    pub stall_s: u64,
 }
 
 impl C2Config {
@@ -1184,10 +1229,11 @@ impl C2Config {
             pm_bound: env_u64("ARBSIM_COPY2_PM_BOUND", 1) != 0,
             verify_every_s: env_u64("ARBSIM_COPY2_VERIFY_S", 60),
             verify_max: env_u64("ARBSIM_COPY2_VERIFY_MAX", 400).clamp(1, 10_000) as usize,
+            stall_s: env_u64("ARBSIM_COPY2_STALL_S", 30),
         }
     }
     pub fn for_tests() -> Self {
-        C2Config { reload_ms: 0, reload_max_ms: 0, layout_retry_s: 3600, load_batch: 25, loaders: 2, keep_blocks: 400, max_keep_blocks: 4000, max_rounds: 40, tip_every_s: 0, catchup_max_blocks: 64, walk: WalkCfg::default(), walks_inflight: 2, walk_max_slots: 1_000_000, walk_max_rss_mb: 0, max_keep_logs: 1_000_000, pending_ms: 300, pm_bound: true, verify_every_s: 0, verify_max: 400 }
+        C2Config { reload_ms: 0, reload_max_ms: 0, layout_retry_s: 3600, load_batch: 25, loaders: 2, keep_blocks: 400, max_keep_blocks: 4000, max_rounds: 40, tip_every_s: 0, catchup_max_blocks: 64, walk: WalkCfg::default(), walks_inflight: 2, walk_max_slots: 1_000_000, walk_max_rss_mb: 0, max_keep_logs: 1_000_000, pending_ms: 300, pm_bound: true, verify_every_s: 0, verify_max: 400, stall_s: 30 }
     }
 }
 
@@ -1348,6 +1394,10 @@ pub struct Intake {
     settle_retry: Option<(Instant, u32)>,
     /// The node can't do the walk's debug_traceCall: walks off.
     walk_off: bool,
+    /// Loading pools seen with nothing working for them: since when.
+    orphan_since: HashMap<PoolKey, Instant>,
+    last_stall_check: Instant,
+    last_stall_log: Option<Instant>,
     /// Last round of re-reading the values nothing follows.
     last_verify: Instant,
     /// Process memory (MB) and when it was read (the walk guard reads it at
@@ -1437,6 +1487,9 @@ pub fn manual(sh: Arc<Shared>, fills: Arc<FillQueue>, cfg: C2Config) -> (Intake,
         suspects: BTreeMap::new(),
         settle_retry: None,
         walk_off: false,
+        orphan_since: HashMap::new(),
+        last_stall_check: Instant::now(),
+        last_stall_log: None,
         last_verify: Instant::now(),
         rss: std::cell::Cell::new((0.0, None)),
     };
@@ -1588,10 +1641,14 @@ impl Intake {
         let (due, wait): (Vec<_>, Vec<_>) = std::mem::take(&mut self.delayed).into_iter().partition(|d| d.0 <= now);
         self.delayed = wait;
         for (_, key, gen, items) in due {
-            let Some(part) = self.partials.remove(&key) else { continue };
-            if part.gen != gen {
+            // Only this load's own working copy: a retry left over from an
+            // earlier load of the pool (it went unsure / restarted since)
+            // must not take the NEWER load's working copy away (live Oct 22
+            // 13:34: that left ~260 pools "loading" with no job, for good).
+            if self.partials.get(&key).is_none_or(|p| p.gen != gen) {
                 continue;
             }
+            let part = self.partials.remove(&key).unwrap();
             self.send_need_job(key, part, items);
         }
     }
@@ -1654,6 +1711,7 @@ impl Intake {
         self.dispatch_verify();
         self.note_round();
         self.watchdog();
+        self.stall_watch();
         *self.c2.in_flight.lock().unwrap() = (self.jobs.len(), self.partials.len());
         if self.last_evict.elapsed() > Duration::from_secs(60) {
             self.last_evict = Instant::now();
@@ -1723,6 +1781,8 @@ impl Intake {
                         walked: Vec::new(),
                         far_zero: None,
                         pending_from: None,
+                        base_block: 0,
+                        need_base: 0,
                     },
                 );
             }
@@ -1823,7 +1883,11 @@ impl Intake {
             if m.block <= last {
                 if !m.tick {
                     let logs: Vec<PoolLog> = m.logs.iter().filter(|l| !l.removed).cloned().collect();
-                    self.on_late(m.block, logs);
+                    // The late message's own block time (the bot sends the
+                    // block's real time; 0 = unknown): places reports for a
+                    // block the copy has no message for.
+                    let time = (m.timestamp > 0).then_some((m.timestamp, m.l1_block));
+                    self.on_late_at(m.block, logs, time);
                 }
                 return;
             }
@@ -1928,21 +1992,52 @@ impl Intake {
     /// Reports for block `n` (already applied) that we may not have had.
     /// Returns how many of the reports were new.
     fn on_late(&mut self, n: u64, logs: Vec<PoolLog>) -> usize {
+        self.on_late_at(n, logs, None)
+    }
+
+    /// Do pool `k`'s node values (held, or in its working copy) already
+    /// include every report of block `n`? (read at or after n)
+    fn covers(&self, reg: &Registry, k: &PoolKey, n: u64) -> bool {
+        let Some(e) = reg.pools.get(k) else { return true };
+        match self.partials.get(k) {
+            Some(p) if p.base.0 > 0 => p.base.0 >= n,
+            // In-block working copy: descends from the ready pool's values.
+            Some(_) => e.base_block >= n,
+            None => e.state == PoolState::Ready && e.base_block >= n,
+        }
+    }
+
+    /// `time`: the late message's (block time, parent-chain block), used to
+    /// place reports for a block the copy got no message for.
+    fn on_late_at(&mut self, n: u64, logs: Vec<PoolLog>, time: Option<(u64, Option<u64>)>) -> usize {
         let c2 = self.c2.clone();
         let st = &c2.stats;
         // What we had for block n.
-        let known: Option<HashSet<LogId>> = match self.recent.iter().find(|r| r.0 == n) {
+        let mut known: Option<HashSet<LogId>> = match self.recent.iter().find(|r| r.0 == n) {
             Some(r) => Some(r.1.iter().copied().collect()),
             None => self.buf.iter().find(|b| b.block == n).map(|b| b.logs.iter().map(log_id).collect()),
         };
-        let rctx = self.buf.iter().find(|b| b.block == n).map(|b| b.rctx);
-        let (Some(known), Some(rctx)) = (known, rctx) else {
-            // Too old to place: the pools these reports touch are unsure.
-            let keys = self.pools_touched(&logs);
-            if !keys.is_empty() {
-                inc(&st.late_reports_unsure);
-                self.unsure_from(&keys, "late report for a block no longer kept", n);
+        let mut rctx = self.buf.iter().find(|b| b.block == n).map(|b| b.rctx);
+        // A quiet block (the bot sends a message only for blocks with
+        // reports, and a tick for the newest quiet one) whose every report
+        // came late: inside the kept range, no message for it ever came, so
+        // the copy has nothing for it. Placed like any late report, with
+        // the message's own block time (was: every pool it touched unsure).
+        if known.is_none() && rctx.is_none() {
+            if let (Some((ts, l1)), Some(front)) = (time, self.buf.front().map(|b| b.block)) {
+                if front < n && self.last_block.is_some_and(|l| n <= l) {
+                    let at = self.buf.partition_point(|b| b.block < n);
+                    let l1 = l1.unwrap_or_else(|| self.buf[at - 1].rctx.l1_number);
+                    let r = ReplayCtx { number: n, timestamp: ts, l1_number: l1 };
+                    self.buf.insert(at, BufBlock { block: n, rctx: r, logs: Arc::new(Vec::new()) });
+                    inc(&st.late_hole_blocks);
+                    known = Some(HashSet::new());
+                    rctx = Some(r);
+                }
             }
+        }
+        let (Some(known), Some(rctx)) = (known, rctx) else {
+            self.late_not_kept(n, &logs);
             return logs.len();
         };
         let mut added: Vec<PoolLog> = logs.into_iter().filter(|l| !known.contains(&log_id(l))).collect();
@@ -1961,11 +2056,16 @@ impl Intake {
                 touched.push(k);
                 let t = self.touched_addr.entry(log.address).or_insert(0);
                 *t = (*t).max(n);
-                let (kind, ready, gen, pool) = {
+                let (kind, ready, gen, pool, covered) = {
                     let reg = self.c2.reg.read().unwrap();
                     let e = &reg.pools[&k];
-                    (e.pool.kind, e.state == PoolState::Ready, e.gen, e.pool.clone())
+                    (e.pool.kind, e.state == PoolState::Ready, e.gen, e.pool.clone(), self.covers(&reg, &k, n))
                 };
+                if covered {
+                    // Its values were read at or after block n: already in.
+                    inc(&st.late_old_covered);
+                    continue;
+                }
                 if !ready {
                     // Not followed right now; a load that already carried
                     // past this report would miss it: start that load over.
@@ -2048,6 +2148,115 @@ impl Intake {
         added.len()
     }
 
+    /// Late reports for block `n` that can't be placed: older than the kept
+    /// reports, or before the copy's first block (the bot's first seconds
+    /// after a restart deliver such reports). Live Oct 22 13:34: every such
+    /// report made the pools it touched unsure WITH a strike (doubling the
+    /// wait, cancelling a load in flight), and a V4 PoolManager report made
+    /// ALL V4 pools unsure; a trickle of them kept ~290 pools unsure for
+    /// 15+ min. Now, per pool:
+    ///   - values read at or after block n (any load that started after the
+    ///     copy did): the report is already in them, nothing to do;
+    ///   - ready from an older read: unsure (no strike: not its fault);
+    ///   - loading / waiting: a working copy from an older read starts over;
+    ///     the next load must read at or after n (need_base), else it reads
+    ///     again (on_load_one);
+    ///   - a followed coin balance read before n (coin_base): forgotten from
+    ///     n on (read again when a check needs it); working copies get the
+    ///     transfer added (late_transfer_to_partials).
+    fn late_not_kept(&mut self, n: u64, logs: &[PoolLog]) {
+        let c2 = self.c2.clone();
+        let st = &c2.stats;
+        let mut unsure: Vec<PoolKey> = Vec::new();
+        let mut restart: Vec<(PoolKey, u64)> = Vec::new();
+        let mut forget_bal: Vec<(Address, Address, U256)> = Vec::new();
+        let mut any = false;
+        {
+            let mut reg = self.c2.reg.write().unwrap();
+            for log in logs {
+                let event_keys: Vec<PoolKey> = reg.by_addr.get(&log.address).map(|ks| ks.iter().filter(|k| is_pool_event(&reg.pools[*k].pool, log)).copied().collect()).unwrap_or_default();
+                let mut keys: Vec<(PoolKey, Option<(Address, U256)>)> = event_keys.into_iter().map(|k| (k, None)).collect();
+                if let Some((coin, from, to, _)) = coin_transfer(log) {
+                    for side in [from, to] {
+                        if !reg.holders.get(&coin).is_some_and(|h| h.contains(&side)) {
+                            continue;
+                        }
+                        let Some(slot) = reg.bal_slot(coin, side) else { continue };
+                        for k in reg.by_addr.get(&side).cloned().unwrap_or_default() {
+                            if reg.pools.get(&k).is_some_and(|e| e.pool.token0 == coin || e.pool.token1 == coin) {
+                                keys.push((k, Some((coin, slot))));
+                            }
+                        }
+                    }
+                }
+                for (k, bal) in keys {
+                    any = true;
+                    let covered = match bal {
+                        // A coin balance: its node read's block.
+                        // (A working copy's own balance is handled by
+                        // late_transfer_to_partials below.)
+                        Some((coin, _)) => self.coin_base.get(&(coin, k.0)).is_some_and(|b| *b >= n),
+                        None => self.covers(&reg, &k, n),
+                    };
+                    if covered {
+                        inc(&st.late_old_covered);
+                        continue;
+                    }
+                    let Some(e) = reg.pools.get_mut(&k) else { continue };
+                    if let Some((coin, slot)) = bal {
+                        // The balance in the copy lacks it: forgotten from n.
+                        forget_bal.push((coin, k.0, slot));
+                        if e.state != PoolState::Ready {
+                            e.need_base = e.need_base.max(n);
+                        }
+                        continue;
+                    }
+                    if e.state == PoolState::Ready {
+                        unsure.push(k);
+                    } else {
+                        inc(&st.late_old_reload);
+                        e.need_base = e.need_base.max(n);
+                        if self.partials.contains_key(&k) {
+                            restart.push((k, e.gen));
+                        }
+                    }
+                }
+            }
+        }
+        if any {
+            inc(&st.late_reports_unsure);
+        }
+        for log in logs {
+            self.late_transfer_to_partials(log, (n, log.tx_index, log.log_index));
+        }
+        for (k, gen) in restart {
+            self.retry_later_quiet(k, gen, "a late report came for a block before its read (no longer kept): starting over");
+            if let Some(e) = self.c2.reg.write().unwrap().pools.get_mut(&k) {
+                e.fails = e.fails.saturating_sub(1);
+                e.retry_at = Instant::now();
+            }
+        }
+        unsure.sort();
+        unsure.dedup();
+        for k in unsure {
+            self.make_unsure_with(k, "late report for a block no longer kept", None, n, false);
+        }
+        if !forget_bal.is_empty() {
+            for (coin, holder, _) in &forget_bal {
+                self.coin_base.remove(&(*coin, *holder));
+                self.coin_pos.remove(&(*coin, *holder));
+            }
+            let mut p = self.sh.published.write().unwrap();
+            rewrite_from(&mut p.versions, n, |s| {
+                for (c, _, sl) in &forget_bal {
+                    forget_slot(s, *c, *sl);
+                }
+            });
+            drop(p);
+            self.sh.notify();
+        }
+    }
+
     /// First message: an empty copy right before it (everything loaded later).
     fn bootstrap(&mut self, block: u64) -> Arc<Version> {
         let b = block.saturating_sub(1);
@@ -2104,18 +2313,27 @@ impl Intake {
         keys.iter().filter(|k| is_pool_event(&reg.pools[*k].pool, log)).copied().collect()
     }
 
+    /// The pools a report is about: the pool whose event it is (for a V4
+    /// PoolManager report only THAT pool id, not every pool there: live Oct
+    /// 22 13:34 one late PoolManager report made all ~290 V4 pools unsure),
+    /// and for a coin Transfer the pools on either side whose balance of
+    /// that coin we follow (a V4 PoolManager's balance is not followed).
     fn pools_touched(&self, logs: &[PoolLog]) -> Vec<PoolKey> {
         let reg = self.c2.reg.read().unwrap();
         let mut out = Vec::new();
         for l in logs {
             if let Some(keys) = reg.by_addr.get(&l.address) {
-                out.extend(keys.iter().copied());
+                out.extend(keys.iter().filter(|k| is_pool_event(&reg.pools[*k].pool, l)).copied());
             }
             // Coin transfers: the pools on either side.
-            if let Some((_, from, to, _)) = coin_transfer(l) {
+            if let Some((coin, from, to, _)) = coin_transfer(l) {
+                let followed = reg.holders.get(&coin);
                 for side in [from, to] {
+                    if !followed.is_some_and(|h| h.contains(&side)) {
+                        continue;
+                    }
                     if let Some(keys) = reg.by_addr.get(&side) {
-                        out.extend(keys.iter().copied());
+                        out.extend(keys.iter().filter(|k| reg.pools.get(*k).is_some_and(|e| e.pool.token0 == coin || e.pool.token1 == coin)).copied());
                     }
                 }
             }
@@ -2967,6 +3185,18 @@ impl Intake {
                 _ => return, // untracked / unsure meanwhile
             }
         };
+        // A late report that could not be placed came for a block after
+        // this read: the load would lack it. Read again (the node is a block
+        // or two behind; not the pool's fault).
+        let need = self.c2.reg.read().unwrap().pools.get(&r.key).map(|e| e.need_base).unwrap_or(0);
+        if block < need {
+            self.retry_later_quiet(r.key, r.gen, &format!("read at block {block}, but a late report came for block {need}: reading again"));
+            if let Some(e) = self.c2.reg.write().unwrap().pools.get_mut(&r.key) {
+                e.fails = e.fails.saturating_sub(1);
+                e.retry_at = Instant::now() + soon();
+            }
+            return;
+        }
         let mut facts = Vec::new();
         let mut vals: HashMap<(Address, U256), U256> = HashMap::new();
         let mut err: Option<(bool, String)> = None; // (node's fault, why)
@@ -3054,10 +3284,12 @@ impl Intake {
     }
 
     fn on_need(&mut self, key: PoolKey, gen: u64, items: Vec<MissItem>, block: u64, res: Result<FetchOut, crate::node::NodeErr>) {
-        let Some(mut part) = self.partials.remove(&key) else { return };
-        if part.gen != gen {
+        // An answer for an earlier load of this pool: ignored, and the
+        // current load's working copy (if any) stays (see dispatch_delayed).
+        if self.partials.get(&key).is_none_or(|p| p.gen != gen) {
             return;
         }
+        let mut part = self.partials.remove(&key).unwrap();
         // Node trouble: keep the working copy, ask again in a second (10x
         // in a row = start the load over).
         let why = match &res {
@@ -3318,7 +3550,10 @@ impl Intake {
     /// The working copy has reached the newest block: put its values into
     /// the head version and mark the pool READY.
     fn merge(&mut self, key: PoolKey, part: Partial) {
-        let Some(head) = self.sh.head() else { return };
+        let Some(head) = self.sh.head() else {
+            self.retry_later_quiet(key, part.gen, "no copy to merge into yet");
+            return;
+        };
         let (pool, holders, old_owned, bal_slots) = {
             let reg = self.c2.reg.read().unwrap();
             let Some(e) = reg.pools.get(&key) else { return };
@@ -3364,7 +3599,10 @@ impl Intake {
         }
         let head = match self.sh.head() {
             Some(h) => h,
-            None => return,
+            None => {
+                self.retry_later_quiet(key, part.gen, "no copy to merge into yet");
+                return;
+            }
         };
         // Accounts the pool's own replays change (e.g. an Algebra plugin)
         // are its own; other accounts (coins, a factory, an implementation)
@@ -3448,6 +3686,11 @@ impl Intake {
             e.ever_ready = true;
             e.fails = 0;
             e.ready_since = head.block;
+            // A load's node block (an in-block working copy keeps the old
+            // one: its values descend from it).
+            if part.base.0 > 0 {
+                e.base_block = part.base.0;
+            }
             e.items.extend(items);
             e.accounts.extend(accounts);
             for o in &owned {
@@ -4279,6 +4522,99 @@ impl Intake {
         );
     }
 
+    /// Load stall guard (live Oct 22 13:34: ~260 pools "loading" for tens of
+    /// minutes with 0 node jobs). A pool loading with `busy` set must have
+    /// something working for it: a node job, a working copy (waiting for a
+    /// retry or carrying), or a load answer queued. One with none of these
+    /// for ARBSIM_COPY2_STALL_S is rescheduled at once (busy off, older
+    /// answers ignored) and logged with its reason. Pools loading WITHOUT
+    /// busy whose wait ended that long ago but were not sent are logged too
+    /// (with why loads are held back), once a minute.
+    fn stall_watch(&mut self) {
+        let every = Duration::from_secs(self.cfg.stall_s.clamp(1, 5));
+        if self.cfg.stall_s > 0 && self.last_stall_check.elapsed() < every {
+            return;
+        }
+        self.last_stall_check = Instant::now();
+        let limit = Duration::from_secs(self.cfg.stall_s);
+        let mut working: HashSet<PoolKey> = self.partials.keys().copied().collect();
+        for j in self.jobs.values() {
+            match j {
+                JobFor::Load { pools, .. } => working.extend(pools.iter().map(|r| r.key)),
+                JobFor::Need { key, .. } => {
+                    working.insert(*key);
+                }
+                _ => {}
+            }
+        }
+        working.extend(self.load_q.iter().map(|(r, _, _)| r.key));
+        working.extend(self.delayed.iter().map(|d| d.1));
+        let now = Instant::now();
+        let mut stuck: Vec<(PoolKey, String)> = Vec::new();
+        let mut overdue: Vec<String> = Vec::new();
+        {
+            let reg = self.c2.reg.read().unwrap();
+            let mut seen: HashSet<PoolKey> = HashSet::new();
+            for (k, e) in &reg.pools {
+                if e.state != PoolState::Loading {
+                    continue;
+                }
+                if !e.busy {
+                    if now.saturating_duration_since(e.retry_at) >= limit.max(Duration::from_secs(1)) {
+                        overdue.push(e.reason.clone());
+                    }
+                    continue;
+                }
+                if working.contains(k) {
+                    continue;
+                }
+                seen.insert(*k);
+                let since = *self.orphan_since.entry(*k).or_insert(now);
+                if now.duration_since(since) >= limit {
+                    stuck.push((*k, e.reason.clone()));
+                }
+            }
+            self.orphan_since.retain(|k, _| seen.contains(k));
+        }
+        for (k, why) in &stuck {
+            self.orphan_since.remove(k);
+            inc(&self.c2.stats.stall_rescheduled);
+            let mut reg = self.c2.reg.write().unwrap();
+            if let Some(e) = reg.pools.get_mut(k) {
+                e.busy = false;
+                e.gen += 1;
+                e.retry_at = now;
+                e.reason = format!("loading: rescheduled (nothing worked on it for {} s; was: {why})", self.cfg.stall_s);
+            }
+        }
+        let log_due = self.last_stall_log.is_none_or(|t| t.elapsed() >= Duration::from_secs(60));
+        if !stuck.is_empty() || (!overdue.is_empty() && log_due) {
+            self.last_stall_log = Some(now);
+            let reasons = |v: &mut dyn Iterator<Item = &str>| top_reasons(v).iter().map(|x| format!("{} x{}", x["why"].as_str().unwrap_or(""), x["n"])).collect::<Vec<_>>().join("; ");
+            if !stuck.is_empty() {
+                eprintln!(
+                    "[arbsim] copy2 STALL: {} loading pool(s) had no node job, working copy or answer for {} s: rescheduled now (were: {})",
+                    stuck.len(),
+                    self.cfg.stall_s,
+                    reasons(&mut stuck.iter().map(|x| x.1.as_str()))
+                );
+            }
+            if !overdue.is_empty() {
+                eprintln!(
+                    "[arbsim] copy2 STALL: {} loading pool(s) due for {}+ s but not sent (load jobs {} of {}, node refusing: {}, probes {}, traces {}): {}",
+                    overdue.len(),
+                    self.cfg.stall_s,
+                    self.load_jobs_in_flight(),
+                    self.cfg.loaders,
+                    self.refusing_now(),
+                    self.probing.len(),
+                    self.tracing.len(),
+                    reasons(&mut overdue.iter().map(|x| x.as_str()))
+                );
+            }
+        }
+    }
+
     /// Log (once) when every pool of the current load round has been tried.
     fn note_round(&mut self) {
         let Some((t0, req0, n)) = self.round else { return };
@@ -4597,7 +4933,7 @@ fn describe_slot(reg: &Registry, checkers: &[Address], a: Address, sl: U256) -> 
         }
         for c in reg.pools.values().filter(|e| e.pool.address == a && e.pool.v4_id.is_some()).flat_map(|e| [e.pool.token0, e.pool.token1]) {
             if fields::map_slot(c, 1) == sl {
-                return format!("protocolFeesAccrued[{c}] (V4 protocol fee counter: swaps of every protocol-fee pool in that coin and fee collections, which leave no event, move it; not followable; fills refused: checks through a pool with a protocol fee on in this direction stay unknown)");
+                return format!("protocolFeesAccrued[{c}] (V4 protocol fee counter: swaps of every protocol-fee pool in that coin and fee collections, which leave no event, move it; not followed, fills refused; checks run with it 0 and not 0 and answer when only the gas differs, with the higher gas)");
             }
         }
         return "not a base slot / walked value of our V4 pools (another pool, a tick beyond our walk, claims ...)".into();

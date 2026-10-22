@@ -195,6 +195,15 @@ async function main() {
     // harmless; anything else more than a few an hour: tell Claude.
     const gr = c2.gapReasons && typeof c2.gapReasons === 'object' ? Object.entries(c2.gapReasons) : [];
     if (gr.length) lines.push(`    forced reloads (every pool): ${gr.sort((a, b) => b[1] - a[1]).map(([w, v]) => `${w} ${n(v)}`).join(', ')}`);
+    // copy2-m: late reports, stalled loads, V4 protocol fee counters.
+    if (k.late_hole_blocks || k.late_old_covered || k.late_old_reload || k.stall_rescheduled) {
+      lines.push(`    late reports: ${n(k.late_hole_blocks)} quiet blocks placed, ${n(k.late_old_covered)} already in the pools' values, ` +
+        `${n(k.late_old_reload)} made a loading pool read again; stalled loads rescheduled ${n(k.stall_rescheduled)}` +
+        (k.stall_rescheduled ? '  <-- see "copy2 STALL" in pm2 logs arbsim, tell Claude' : ''));
+    }
+    if (k.protocol_fee_checks) {
+      lines.push(`    V4 protocol fee counter: ${n(k.protocol_fee_checks)} checks ran with it 0 and not 0: ${n(k.protocol_fee_same)} answered (higher gas reported), ${n(k.protocol_fee_differ)} unknown`);
+    }
   }
 
   // 3. How the copy is kept current (copy 1, the feed replay)

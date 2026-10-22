@@ -1961,3 +1961,274 @@ fn values_nothing_follows_are_reread_and_forgotten_when_the_chain_changed_them()
     let st = r.h.status_json(false);
     assert_eq!(st["unfollowedChanged"][0][1], json!("0x5"), "{st}");
 }
+
+// ---------------------------------------------------------------------------
+// copy2-m: live Oct 22 13:34 restart (bot + arbsim restarted together)
+// ---------------------------------------------------------------------------
+fn counter(r: &Rig, n: &str) -> u64 {
+    r.h.status_json(false)["counters"][n].as_u64().unwrap_or_else(|| panic!("no counter {n}"))
+}
+
+/// After a restart the bot's first seconds deliver reports for blocks
+/// BEFORE the copy's first block (late, on another subscription). Every
+/// pool's values are read at or after the copy's first block, so such a
+/// report is already in them. Old code: "late report for a block no longer
+/// kept" made each touched pool unsure WITH a strike, every time (the wait
+/// doubles: 2 s ... 10 min), for a pool still loading too (its load
+/// cancelled). Live: ~290 pools unsure for 15+ minutes.
+#[test]
+fn late_reports_from_before_the_copy_started_change_nothing() {
+    let mut r = rig();
+    r.track(vec![v2_pool(), sol_pool()]);
+    r.send(tick(100, 60)); // the copy starts at 100; loads read at 100
+    assert_eq!(r.state(&v2_pool()).0, PoolState::Ready);
+    let before = r.head_slot(a(V2P), u(8));
+    for i in 0..10u32 {
+        // Blocks 95..99 (before the copy's first block), pool events and
+        // coin transfers of the pool.
+        let b = 95 + (i as u64 % 5);
+        r.send(msg(b, 55, vec![v2_sync(1, 2, b, i, 0), transfer(a(COIN0), a(USER), a(V2P), 5, b, i, 1)]));
+    }
+    let (s, why) = r.state(&v2_pool());
+    assert_eq!(s, PoolState::Ready, "{why}");
+    assert_eq!(r.head_slot(a(V2P), u(8)), before, "already in the node values read at block 100");
+    assert_eq!(r.head_slot(a(COIN0), map_slot(a(V2P), 0)), Lookup::Known(u(1000)));
+    assert_eq!(r.state(&sol_pool()).0, PoolState::Ready);
+    let reg = r.h.c2.reg.read().unwrap();
+    assert!(reg.pools.values().all(|e| e.strikes == 0));
+    drop(reg);
+    assert!(counter(&r, "late_old_covered") >= 10);
+    assert_eq!(counter(&r, "unsure_marked"), 0);
+}
+
+/// The same while the pool is still LOADING (the burst comes in the first
+/// seconds, when nothing is ready yet): the load in flight is not cancelled
+/// and nothing counts against the pool.
+#[test]
+fn late_reports_from_before_the_copy_started_do_not_cancel_loads() {
+    let mut r = rig();
+    *r.chain.delay_ms.lock().unwrap() = 40;
+    r.track(vec![v2_pool()]);
+    r.h.block(tick(100, 60));
+    let t0 = std::time::Instant::now();
+    while r.h.c2.stats.loads.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+        r.intake.pump();
+        assert!(t0.elapsed().as_secs() < 5);
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert_eq!(r.state(&v2_pool()).0, PoolState::Loading);
+    for b in [97u64, 98, 99, 98] {
+        r.h.block(msg(b, 58, vec![v2_sync(1, 2, b, 0, 0)]));
+        r.intake.pump();
+    }
+    r.settle();
+    assert_eq!(r.state(&v2_pool()).0, PoolState::Ready, "{:?}", r.state(&v2_pool()));
+    assert_eq!(counter(&r, "loads"), 1, "the load in flight was kept, not cancelled and sent again");
+    assert_eq!(r.h.c2.reg.read().unwrap().pools.values().next().unwrap().strikes, 0);
+    assert_eq!(counter(&r, "unsure_marked"), 0);
+}
+
+/// Per pool, not per address: a late V4 PoolManager report is about ONE
+/// pool id. Old code made every pool at the PoolManager unsure (live: all
+/// ~290 V4 stock pools at once). A late report the pool's values can't
+/// contain (read before it) makes only that pool unsure, with no strike.
+#[test]
+fn late_pool_manager_report_touches_only_its_own_pool() {
+    let mut r = rig_with(C2Config { walks_inflight: 0, ..C2Config::for_tests() });
+    r.track(vec![v2_pool()]);
+    r.send(tick(100, 60));
+    let pm = a(0x44);
+    let ids: Vec<B256> = (1..=5u8).map(B256::with_last_byte).collect();
+    {
+        let mut reg = r.h.c2.reg.write().unwrap();
+        let tmpl = reg.pools.values().next().unwrap().clone();
+        for id in &ids {
+            let mut e = tmpl.clone();
+            e.pool = TrackedPool { address: pm, v4_id: Some(*id), kind: PoolKind::V4, token0: a(COIN0), token1: a(COIN1), fee: 3000, tick_spacing: 60 };
+            e.items.clear();
+            e.base_block = 100;
+            e.ready_since = 100;
+            reg.pools.insert((pm, Some(*id)), e);
+            reg.by_addr.entry(pm).or_default().push((pm, Some(*id)));
+        }
+    }
+    r.send(tick(101, 61));
+    let swap = |id: B256, b: u64| lg(pm, vec![topic("Swap(bytes32,address,int128,int128,uint160,uint128,int24,uint24)"), id], data(&[u(0); 6]), b, 0, 0);
+    // Before the copy's first block: already in every pool's values.
+    r.intake.process(msg(97, 57, vec![swap(ids[0], 97)]));
+    let reg = r.h.c2.reg.read().unwrap();
+    assert!(reg.pools.values().all(|e| e.state == PoolState::Ready), "nothing to do for a report its values already contain");
+    drop(reg);
+    assert_eq!(counter(&r, "unsure_marked"), 0);
+    // Pool 0's values pretend to come from an older read (block 50): this
+    // report (block 97, not kept) is missing from them -> only pool 0 unsure.
+    r.h.c2.reg.write().unwrap().pools.get_mut(&(pm, Some(ids[0]))).unwrap().base_block = 50;
+    r.intake.process(msg(97, 57, vec![swap(ids[0], 97)]));
+    let reg = r.h.c2.reg.read().unwrap();
+    let e0 = &reg.pools[&(pm, Some(ids[0]))];
+    assert_eq!(e0.state, PoolState::Unsure);
+    assert_eq!(e0.strikes, 0, "not the pool's fault: no strike");
+    for id in &ids[1..] {
+        assert_eq!(reg.pools[&(pm, Some(*id))].state, PoolState::Ready, "another pool at the same PoolManager");
+    }
+    drop(reg);
+    assert_eq!(counter(&r, "unsure_marked"), 1, "one pool, not all five");
+    let reg = r.h.c2.reg.read().unwrap();
+    assert_eq!(reg.pools[&(a(V2P), None)].state, PoolState::Ready);
+}
+
+/// The bot sends a message only for blocks with reports (and a tick for the
+/// newest quiet one). A block whose every report came late has NO message:
+/// old code called it "no longer kept" and made the pool unsure. Now it is
+/// placed with the late message's own block time, exactly.
+#[test]
+fn late_reports_for_a_block_without_a_message_are_placed_exactly() {
+    let mut r = rig();
+    r.track(vec![v2_pool()]);
+    r.send(tick(100, 60));
+    r.send(tick(101, 61));
+    r.send(tick(104, 64)); // 102, 103: quiet, no message
+    let logs = vec![
+        transfer(a(COIN0), a(USER), a(V2P), 100, 102, 3, 0),
+        transfer(a(COIN1), a(V2P), a(USER), 360, 102, 3, 1),
+        v2_sync(1100, 3640, 102, 3, 2),
+    ];
+    r.send(msg(102, 62, logs));
+    let (s, why) = r.state(&v2_pool());
+    assert_eq!(s, PoolState::Ready, "{why}");
+    let want = Lookup::Known(u(1100) | (u(3640) << 112usize) | (u(62) << 224usize));
+    assert_eq!(r.head_slot(a(V2P), u(8)), want);
+    assert_eq!(r.head_slot(a(COIN0), map_slot(a(V2P), 0)), Lookup::Known(u(1100)));
+    assert_eq!(r.head_slot(a(COIN1), map_slot(a(V2P), 0)), Lookup::Known(u(3640)));
+    // Versions before 102 keep the old values.
+    assert_eq!(r.sh.resolve(&At::Block(101)).unwrap().snap.storage(a(COIN0), map_slot(a(V2P), 0)), Lookup::Known(u(1000)));
+    assert_eq!(counter(&r, "late_hole_blocks"), 1);
+    // The kept reports have it (a later load carries through it).
+    assert_eq!(r.intake.buffered(), (4, 3));
+}
+
+/// A node that is "not at the block yet" (header not found) for reads of
+/// some storage values (any block): those fetches wait and are retried.
+struct NotYetFor {
+    inner: Arc<FakeChain>,
+    slots: Mutex<Vec<U256>>,
+}
+impl NodeApi for NotYetFor {
+    fn call_batch(&self, c: Class, calls: &[(&str, Value)]) -> Result<Vec<CallResult>, NodeErr> {
+        let mut out = self.inner.call_batch(c, calls)?;
+        let slots = self.slots.lock().unwrap();
+        for (i, (m, p)) in calls.iter().enumerate() {
+            let asks: Vec<U256> = match *m {
+                "eth_getProof" => p[1].as_array().map(|v| v.iter().filter_map(|x| x.as_str().and_then(|s| parse_u256(s).ok())).collect()).unwrap_or_default(),
+                "eth_getStorageAt" => p[1].as_str().and_then(|s| parse_u256(s).ok()).into_iter().collect(),
+                _ => continue,
+            };
+            if asks.iter().any(|x| slots.contains(x)) {
+                out[i] = Err(RpcErr { code: -32000, message: "header not found".into() });
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// Live Oct 22 13:34: ~260 pools "loading" for tens of minutes with 0 node
+/// jobs. Cause: a retry left over from an EARLIER load of a pool (the pool
+/// went unsure and reloaded meanwhile) took the NEWER load's working copy
+/// away when it came due (dispatch_delayed / on_need removed the pool's
+/// working copy before checking whose it was), leaving the pool "loading"
+/// with nothing working for it, for good. Reproduced: a Solidly load's
+/// catch-up fetch (its last observation) waits for the node ("not at that
+/// block yet": asked again in 300 ms), the pool goes unsure (a report taken
+/// back) and loads again, and the new load waits the same way; the first
+/// retry comes due first.
+#[test]
+fn an_old_loads_retry_never_takes_the_new_loads_working_copy() {
+    let chain = Arc::new(FakeChain::new());
+    chain.set(100, genesis());
+    let node = Arc::new(NotYetFor { inner: chain.clone(), slots: Mutex::new(vec![obs_slot(u(0), 0)]) });
+    let sh = Shared::new(Config::for_tests(), Some(node.clone() as Arc<dyn NodeApi>), Arc::new(Volatile::default()));
+    let (intake, h) = manual(sh.clone(), Arc::new(FillQueue::new(1000, 100)), C2Config::for_tests());
+    let mut r = Rig { chain, sh, intake, h };
+    r.track(vec![sol_pool()]);
+    r.h.block(tick(100, 60));
+    let need_rounds = |r: &Rig| r.h.c2.stats.need_item_rounds.load(std::sync::atomic::Ordering::Relaxed);
+    let t0 = std::time::Instant::now();
+    while need_rounds(&r) < 1 {
+        r.intake.pump();
+        assert!(t0.elapsed().as_secs() < 2);
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    // The catch-up fetch is answered "not yet" (retried in 300 ms).
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    r.intake.pump();
+    assert_eq!(r.state(&sol_pool()).0, PoolState::Loading);
+    // A report of the pool is taken back: unsure, loaded again at once;
+    // that load's catch-up waits the same way.
+    let mut gone = lg(a(SOLP), vec![topics().sol_sync], data(&[u(1), u(2)]), 100, 0, 0);
+    gone.removed = true;
+    r.intake.process(msg(101, 61, vec![gone]));
+    let t0 = std::time::Instant::now();
+    while need_rounds(&r) < 2 {
+        r.intake.pump();
+        assert!(t0.elapsed() < std::time::Duration::from_millis(250), "reload too slow for this test");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    // The first retry comes due first.
+    let t0 = std::time::Instant::now();
+    while t0.elapsed() < std::time::Duration::from_millis(330) {
+        r.intake.pump();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    // The node catches up: everything waiting is answered.
+    node.slots.lock().unwrap().clear();
+    r.settle();
+    let reg = r.h.c2.reg.read().unwrap();
+    let e = &reg.pools[&(a(SOLP), None)];
+    assert!(!(e.state == PoolState::Loading && e.busy), "stuck loading with nothing working for it: {:?} {}", e.state, e.reason);
+    assert_eq!(e.state, PoolState::Ready, "{}", e.reason);
+}
+
+/// The guard: a pool "loading" with nothing working for it (no node job,
+/// working copy or answer) for ARBSIM_COPY2_STALL_S is rescheduled and
+/// logged, so a bookkeeping slip can never freeze a pool again.
+#[test]
+fn a_loading_pool_with_nothing_working_for_it_is_rescheduled() {
+    let mut r = rig_with(C2Config { stall_s: 0, ..C2Config::for_tests() });
+    r.track(vec![v2_pool()]);
+    r.send(tick(100, 60));
+    {
+        let mut reg = r.h.c2.reg.write().unwrap();
+        let e = reg.pools.get_mut(&(a(V2P), None)).unwrap();
+        e.state = PoolState::Loading;
+        e.busy = true;
+        e.reason = "loading: fetching from the node".into();
+    }
+    r.send(tick(101, 61));
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    r.send(tick(102, 62));
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    r.send(tick(103, 63));
+    assert_eq!(r.state(&v2_pool()).0, PoolState::Ready, "{:?}", r.state(&v2_pool()));
+    assert_eq!(counter(&r, "stall_rescheduled"), 1);
+}
+
+/// A load that read the node BEFORE a late report that could not be placed
+/// (not kept) would lack it: it reads again.
+#[test]
+fn a_load_older_than_an_unplaceable_late_report_reads_again() {
+    let mut r = rig();
+    r.track(vec![v2_pool()]);
+    {
+        let mut reg = r.h.c2.reg.write().unwrap();
+        reg.pools.get_mut(&(a(V2P), None)).unwrap().need_base = 150;
+    }
+    *r.chain.tip.lock().unwrap() = 100;
+    r.h.block(tick(100, 60));
+    let t0 = std::time::Instant::now();
+    while counter(&r, "loads") < 2 {
+        r.intake.pump();
+        assert!(t0.elapsed().as_secs() < 5, "read at 100 < 150 must be read again");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert_ne!(r.state(&v2_pool()).0, PoolState::Ready);
+}

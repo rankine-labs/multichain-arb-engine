@@ -48,6 +48,27 @@
 //      with a rule that changes inside that range gives different results
 //      at the two ends and answers unknown.
 //
+//   3. The V4 PoolManager's protocolFeesAccrued[coin] (slot keccak(coin . 1)).
+//      A V4 swap through a pool with a protocol fee on in that direction
+//      does `protocolFeesAccrued[coin] += fee` (unchecked). The copy can't
+//      follow the counter (other pools' swaps add to it; collections empty
+//      it and leave no PoolManager event), and fills of it are refused. But
+//      its exact value never changes the swap: it is only ADDED to. The only
+//      thing it changes is the gas of that store: 0 -> non-zero costs
+//      ~20,000 gas, non-zero -> non-zero ~2,900 (+2,100 cold read either
+//      way). So the check runs with the counter = 0 and again with it = 1
+//      (a placeholder for "not zero": for any real non-zero value R, R +
+//      fee and 1 + fee are both non-zero, every SSTORE gas class is the
+//      same, nothing else reads it). If success / output / every other
+//      field are identical, the answer stands, with the HIGHER gas of the
+//      two runs per gas field (the bot then never overestimates its profit;
+//      it may underestimate it by up to ~17,100 gas, a fraction of a cent on
+//      Robinhood chain). Different (e.g. a check that reads the counter
+//      itself, or runs out of gas only with the costlier store): unknown
+//      "protocol_fee". A value the copy holds (a replay of our own pool's
+//      swap fetched it and adds to it) is NOT used by checks: other pools'
+//      swaps and collections change it unseen.
+//
 //   Nothing here asks the node or changes the copy.
 // ============================================================================
 use std::collections::HashMap;
@@ -79,12 +100,26 @@ pub struct C2Facts {
     pub pms: HashMap<Address, Vec<TrackedPool>>,
     /// Lower bounds computed so far: (PoolManager, coin; ZERO = ETH) -> bound.
     pub(crate) cache: Mutex<HashMap<(Address, Address), U256>>,
+    /// (PoolManager, slot) = protocolFeesAccrued[coin] for a coin of one of
+    /// our V4 pools there: a check reads it as 0 or 1 (C2View.fee), never
+    /// as a held value (see the header, 3.).
+    pub fees: std::collections::HashSet<(Address, U256)>,
 }
 
 impl C2Facts {
     pub fn is_empty(&self) -> bool {
-        self.far.is_empty() && self.inject.is_empty() && self.pms.is_empty()
+        self.far.is_empty() && self.inject.is_empty() && self.pms.is_empty() && self.fees.is_empty()
     }
+}
+
+/// The second fee run's placeholder for "the counter is not zero".
+pub fn fee_nonzero() -> U256 {
+    U256::from(1u8)
+}
+
+/// protocolFeesAccrued[coin] slot of a V4 PoolManager (mapping at slot 1).
+pub fn protocol_fee_slot(coin: Address) -> U256 {
+    super::fields::map_slot(coin, 1)
 }
 
 /// The second run's offset (above any real balance: 2^200 base units is
@@ -99,16 +134,30 @@ pub struct C2View<'a> {
     f: &'a C2Facts,
     offset: U256,
     used: AtomicBool,
+    /// Value given for an unheld protocolFeesAccrued counter (0 or 1).
+    fee: U256,
+    used_fee: AtomicBool,
 }
 
 impl<'a> C2View<'a> {
     pub fn new(inner: &'a dyn StateRead, f: &'a C2Facts, offset: U256) -> Self {
-        C2View { inner, f, offset, used: AtomicBool::new(false) }
+        Self::with_fee(inner, f, offset, U256::ZERO)
+    }
+
+    /// `fee`: what an unheld protocolFeesAccrued counter reads as.
+    pub fn with_fee(inner: &'a dyn StateRead, f: &'a C2Facts, offset: U256, fee: U256) -> Self {
+        C2View { inner, f, offset, used: AtomicBool::new(false), fee, used_fee: AtomicBool::new(false) }
     }
 
     /// Did the run read a PoolManager balance (so a second run must confirm)?
     pub fn used_bound(&self) -> bool {
         self.used.load(Ordering::Relaxed)
+    }
+
+    /// Did the run read an unheld protocolFeesAccrued counter (so a run with
+    /// the other value must confirm)?
+    pub fn used_fee(&self) -> bool {
+        self.used_fee.load(Ordering::Relaxed)
     }
 
     /// A storage value as the copy knows it: held, or a far zero word.
@@ -164,6 +213,15 @@ impl StateRead for C2View<'_> {
         if let Some((pm, coin)) = self.f.inject.get(&(addr, slot)) {
             self.used.store(true, Ordering::Relaxed);
             return Lookup::Known(self.lower_bound(*pm, *coin).saturating_add(self.offset));
+        }
+        // A protocol fee counter: always the run's value, even when the copy
+        // holds one (a replay of our pool's swap fetched and moves it, but
+        // other pools' swaps and collections change it unseen: a held
+        // non-zero may really be 0, which would make the gas look 17,100
+        // lower than real).
+        if self.f.fees.contains(&(addr, slot)) {
+            self.used_fee.store(true, Ordering::Relaxed);
+            return Lookup::Known(self.fee);
         }
         self.read(addr, slot)
     }
