@@ -69,9 +69,26 @@
 //      swap fetched it and adds to it) is NOT used by checks: other pools'
 //      swaps and collections change it unseen.
 //
+//   Speed (live Oct 22 16:19, checks ~120 ms instead of ~5): the lower
+//   bound used to be the sum over EVERY ready V4 pool holding the coin
+//   (~320 stock / USDG pools), walking each pool's whole tick map, and every
+//   tick-map word not held was looked up in every pool's far-zero list.
+//   Now:
+//     - any proven lower bound will do (the two runs decide), and a smaller
+//       one only risks "different" (then unknown), never a wrong answer. So
+//       the bound first sums only the pools THIS check has traded on so far
+//       (it read their slot0: the PoolManager swaps before it settles /
+//       takes), which pays out at least what the check takes in the normal
+//       case. Only if the two runs then differ is the check run again with
+//       the full bound (every ready V4 pool), exactly as before.
+//     - far-zero lookups: one merged sorted list per account (cached across
+//       checks while the same lists apply), and the bound's own reads use
+//       only that pool's list.
+//   Same answers as before; "unknown" can only come where it came before.
+//
 //   Nothing here asks the node or changes the copy.
 // ============================================================================
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -92,6 +109,19 @@ pub struct C2Facts {
     pub block: u64,
     /// Account -> sorted zero far words valid at `block` (one list per pool).
     pub far: HashMap<Address, Vec<Arc<Vec<U256>>>>,
+    /// The same, all of an account's lists merged into one sorted list
+    /// (lookups: one binary search instead of one per pool).
+    pub far_merged: HashMap<Address, Arc<Vec<U256>>>,
+    /// V4 pool id -> its own far zero list (the bound reads only its own).
+    pub far_of: HashMap<B256, Arc<Vec<U256>>>,
+    /// (PoolManager, a pool's slot0 slot) -> pool id: a run that read it
+    /// traded on (or looked at) that pool.
+    pub bases: HashMap<(Address, U256), B256>,
+    /// true: bounds over every pool in `pms` (else only the pools the run
+    /// touched before it first read the balance).
+    pub full: AtomicBool,
+    /// A bound was computed from fewer pools than `full` would use.
+    pub partial_used: AtomicBool,
     /// (coin, slot) = a V4 PoolManager's balance of that coin -> (PoolManager, coin).
     pub inject: HashMap<(Address, U256), (Address, Address)>,
     /// Every V4 PoolManager we follow pools in -> our V4 pools whose values
@@ -99,7 +129,7 @@ pub struct C2Facts {
     /// lower bound's pools (may be empty: bound 0).
     pub pms: HashMap<Address, Vec<TrackedPool>>,
     /// Lower bounds computed so far: (PoolManager, coin; ZERO = ETH) -> bound.
-    pub(crate) cache: Mutex<HashMap<(Address, Address), U256>>,
+    pub cache: Mutex<HashMap<(Address, Address), U256>>,
     /// (PoolManager, slot) = protocolFeesAccrued[coin] for a coin of one of
     /// our V4 pools there: a check reads it as 0 or 1 (C2View.fee), never
     /// as a held value (see the header, 3.).
@@ -110,6 +140,53 @@ impl C2Facts {
     pub fn is_empty(&self) -> bool {
         self.far.is_empty() && self.inject.is_empty() && self.pms.is_empty() && self.fees.is_empty()
     }
+
+    /// From now on, bounds over every pool (the cheaper bound wasn't
+    /// enough): forget the bounds computed so far.
+    pub fn go_full(&self) {
+        self.full.store(true, Ordering::Relaxed);
+        self.cache.lock().unwrap().clear();
+    }
+
+    /// Fill `far_merged` / `far_of` / `bases` from `far` and `pms` (no cache).
+    pub fn index(&mut self) {
+        for (a, lists) in &self.far {
+            self.far_merged.insert(*a, merge_lists(lists));
+        }
+        self.index_pools();
+    }
+
+    /// `bases` and `far_of` (per pool) from `pms` and the per-pool lists.
+    pub fn index_pools(&mut self) {
+        for (pm, pools) in &self.pms {
+            for p in pools {
+                if let Some(id) = p.v4_id {
+                    self.bases.insert((*pm, pool_base_slot(id)), id);
+                }
+            }
+        }
+    }
+}
+
+/// ARBSIM_COPY2_BOUND_FULL=1 (read once): every check's PoolManager
+/// balance bound over every ready V4 pool (the old, slower way).
+pub fn bound_full_env() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("ARBSIM_COPY2_BOUND_FULL").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// Several sorted lists -> one sorted list without repeats.
+pub fn merge_lists(lists: &[Arc<Vec<U256>>]) -> Arc<Vec<U256>> {
+    if lists.len() == 1 {
+        return lists[0].clone();
+    }
+    let mut v: Vec<U256> = Vec::with_capacity(lists.iter().map(|l| l.len()).sum());
+    for l in lists {
+        v.extend_from_slice(l);
+    }
+    v.sort_unstable();
+    v.dedup();
+    Arc::new(v)
 }
 
 /// The second fee run's placeholder for "the counter is not zero".
@@ -119,7 +196,38 @@ pub fn fee_nonzero() -> U256 {
 
 /// protocolFeesAccrued[coin] slot of a V4 PoolManager (mapping at slot 1).
 pub fn protocol_fee_slot(coin: Address) -> U256 {
-    super::fields::map_slot(coin, 1)
+    let mut b = [0u8; 64];
+    b[12..32].copy_from_slice(coin.as_slice());
+    b[63] = 1;
+    memo_slot(b)
+}
+
+/// keccak256 of 64 bytes as a slot number, remembered (every check builds
+/// its facts from the same few thousand slot numbers: ~0.3 us of keccak
+/// each, ~1 ms per check with ~300 V4 pools). Always the same answer as
+/// computing it (a pure function); the memory is bounded.
+pub fn memo_slot(b: [u8; 64]) -> U256 {
+    type Memo = Mutex<HashMap<[u8; 64], U256>>;
+    static MEMO: std::sync::OnceLock<Memo> = std::sync::OnceLock::new();
+    let m = MEMO.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(v) = m.lock().unwrap().get(&b) {
+        return *v;
+    }
+    let v = U256::from_be_bytes(keccak256(b).0);
+    let mut g = m.lock().unwrap();
+    if g.len() >= 200_000 {
+        g.clear();
+    }
+    g.insert(b, v);
+    v
+}
+
+/// A V4 pool's slot0 slot at its PoolManager (pools[id], mapping at 6).
+pub fn pool_base_slot(id: B256) -> U256 {
+    let mut b = [0u8; 64];
+    b[..32].copy_from_slice(id.as_slice());
+    b[63] = 6;
+    memo_slot(b)
 }
 
 /// The second run's offset (above any real balance: 2^200 base units is
@@ -137,6 +245,8 @@ pub struct C2View<'a> {
     /// Value given for an unheld protocolFeesAccrued counter (0 or 1).
     fee: U256,
     used_fee: AtomicBool,
+    /// V4 pools this run has read slot0 of (so far).
+    touched: Mutex<Vec<B256>>,
 }
 
 impl<'a> C2View<'a> {
@@ -146,7 +256,7 @@ impl<'a> C2View<'a> {
 
     /// `fee`: what an unheld protocolFeesAccrued counter reads as.
     pub fn with_fee(inner: &'a dyn StateRead, f: &'a C2Facts, offset: U256, fee: U256) -> Self {
-        C2View { inner, f, offset, used: AtomicBool::new(false), fee, used_fee: AtomicBool::new(false) }
+        C2View { inner, f, offset, used: AtomicBool::new(false), fee, used_fee: AtomicBool::new(false), touched: Mutex::new(Vec::new()) }
     }
 
     /// Did the run read a PoolManager balance (so a second run must confirm)?
@@ -165,7 +275,23 @@ impl<'a> C2View<'a> {
         match self.inner.storage(a, s) {
             Lookup::Known(v) => Lookup::Known(v),
             Lookup::Missing => {
-                if self.f.far.get(&a).is_some_and(|lists| lists.iter().any(|l| l.binary_search(&s).is_ok())) {
+                if self.f.far_merged.get(&a).is_some_and(|l| l.binary_search(&s).is_ok()) {
+                    Lookup::Known(U256::ZERO)
+                } else {
+                    Lookup::Missing
+                }
+            }
+        }
+    }
+
+    /// A storage value of pool `id` (at its PoolManager `pm`) as the copy
+    /// knows it: held, or one of THAT pool's far zero words (the same
+    /// answer as `read`: another pool's words are other slots).
+    fn read_pool(&self, pm: Address, id: Option<B256>, s: U256) -> Lookup<U256> {
+        match self.inner.storage(pm, s) {
+            Lookup::Known(v) => Lookup::Known(v),
+            Lookup::Missing => {
+                if id.and_then(|i| self.f.far_of.get(&i)).is_some_and(|l| l.binary_search(&s).is_ok()) {
                     Lookup::Known(U256::ZERO)
                 } else {
                     Lookup::Missing
@@ -179,16 +305,44 @@ impl<'a> C2View<'a> {
         if let Some(v) = self.f.cache.lock().unwrap().get(&(pm, coin)) {
             return *v;
         }
+        let full = self.f.full.load(Ordering::Relaxed);
+        let touched: HashSet<B256> = if full { HashSet::new() } else { self.touched.lock().unwrap().iter().copied().collect() };
         let mut sum = U256::ZERO;
-        for p in self.f.pms.get(&pm).map(|v| v.as_slice()).unwrap_or(&[]) {
-            let out0 = if p.token0 == coin {
-                true
-            } else if p.token1 == coin && coin != Address::ZERO {
-                false
-            } else {
-                continue;
-            };
-            sum = sum.saturating_add(payout_bound(&|s| self.read(pm, s), p, out0));
+        let mut skipped = false;
+        let pools: Vec<(&TrackedPool, bool)> = self
+            .f
+            .pms
+            .get(&pm)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
+            .iter()
+            .filter_map(|p| {
+                if p.token0 == coin {
+                    Some((p, true))
+                } else if p.token1 == coin && coin != Address::ZERO {
+                    Some((p, false))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let on_route = |p: &TrackedPool| full || p.v4_id.is_some_and(|i| touched.contains(&i));
+        for (p, out0) in pools.iter().filter(|(p, _)| on_route(p)) {
+            sum = sum.saturating_add(payout_bound(&|s| self.read_pool(pm, p.v4_id, s), p, *out0));
+        }
+        // The route's pools hold none of this coin (e.g. the coin the check
+        // PAYS IN on a one-sided pool): a bound of 0 makes the two runs
+        // differ (a 0 -> non-zero store costs more gas), so add other pools
+        // until it isn't 0 (any subset is a proven bound).
+        for (p, out0) in pools.iter().filter(|(p, _)| !on_route(p)) {
+            if !sum.is_zero() {
+                skipped = true;
+                break;
+            }
+            sum = sum.saturating_add(payout_bound(&|s| self.read_pool(pm, p.v4_id, s), p, *out0));
+        }
+        if skipped {
+            self.f.partial_used.store(true, Ordering::Relaxed);
         }
         self.f.cache.lock().unwrap().insert((pm, coin), sum);
         sum
@@ -210,6 +364,12 @@ impl StateRead for C2View<'_> {
         r
     }
     fn storage(&self, addr: Address, slot: U256) -> Lookup<U256> {
+        if let Some(id) = self.f.bases.get(&(addr, slot)) {
+            let mut t = self.touched.lock().unwrap();
+            if !t.contains(id) {
+                t.push(*id);
+            }
+        }
         if let Some((pm, coin)) = self.f.inject.get(&(addr, slot)) {
             self.used.store(true, Ordering::Relaxed);
             return Lookup::Known(self.lower_bound(*pm, *coin).saturating_add(self.offset));
@@ -358,6 +518,27 @@ fn net_of(w: U256) -> i128 {
     hi as i128
 }
 
+/// Every tick-map word slot (word w_min..=w_max) of V4 pool `id`, cached:
+/// the same numbers forever (keccak of the word index and the pool's
+/// mapping slot), so computing them once per pool is exact.
+fn word_slots(id: B256, base: U256, sp: i64, w_min: i64, w_max: i64) -> Arc<Vec<U256>> {
+    type Cache = Mutex<HashMap<(B256, i64), Arc<Vec<U256>>>>;
+    static CACHE: std::sync::OnceLock<Cache> = std::sync::OnceLock::new();
+    let c = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(v) = c.lock().unwrap().get(&(id, sp)) {
+        return v.clone();
+    }
+    let wb = base + U256::from(5u8);
+    let v: Arc<Vec<U256>> = Arc::new((w_min..=w_max).map(|w| map_slot(int_word(w), wb)).collect());
+    let mut g = c.lock().unwrap();
+    // Bounded (each entry is a few KB; ~1 per V4 pool ever followed).
+    if g.len() > 20_000 {
+        g.clear();
+    }
+    g.insert((id, sp), v.clone());
+    v
+}
+
 /// Lower bound of what a swap draining V4 pool `p` of token0 (`out0`) or
 /// token1 would pay out, over the tick data `read` knows (stops at the
 /// first unknown value: a smaller bound, still a bound). 0 when unsure.
@@ -390,7 +571,13 @@ fn payout_inner(read: &dyn Fn(U256) -> Lookup<U256>, p: &TrackedPool, out0: bool
     // initialized tick and each word boundary); we may cut fewer steps.
     let mut steps: u64 = 2;
     let tick_net = |t: i64| -> Option<i128> { known(map_slot(int_word(t), base + U256::from(4u8))).map(net_of) };
-    let word = |w: i64| known(map_slot(int_word(w), base + U256::from(5u8)));
+    // Tick-map word slots of this pool, computed once per pool (a keccak
+    // each; the walk below may visit thousands of words per check).
+    let slots = word_slots(id, base, sp, w_min, w_max);
+    if !(MIN_TICK..=MAX_TICK).contains(&tick) {
+        return None;
+    }
+    let word = |w: i64| slots.get(usize::try_from(w - w_min).ok()?).copied().and_then(known);
     let add = |a: Option<U256>, amount: &mut U256| -> Option<()> {
         *amount = amount.checked_add(a?)?;
         Some(())
@@ -478,6 +665,96 @@ fn payout_inner(read: &dyn Fn(U256) -> Lookup<U256>, p: &TrackedPool, out0: bool
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// copy2-p speed-ups give exactly the same numbers as before.
+    #[test]
+    fn remembered_slots_and_merged_lists_are_exact() {
+        let coin = Address::with_last_byte(0x2d);
+        assert_eq!(protocol_fee_slot(coin), super::super::fields::map_slot(coin, 1));
+        assert_eq!(protocol_fee_slot(coin), protocol_fee_slot(coin), "remembered value");
+        let id = B256::with_last_byte(9);
+        assert_eq!(pool_base_slot(id), map_slot(U256::from_be_bytes(id.0), U256::from(6u8)));
+        for (vyper, slot) in [(false, 0u64), (false, 51), (true, 3)] {
+            let l = super::super::coins::BalanceLayout { slot: U256::from(slot), vyper, solady: false };
+            let h = Address::with_last_byte(0x77);
+            assert_eq!(memo_slot(l.preimage(h).unwrap()), l.key(h));
+        }
+        let sol = super::super::coins::BalanceLayout { slot: U256::from(1u8), vyper: false, solady: true };
+        assert!(sol.preimage(Address::ZERO).is_none(), "Solady's 32-byte layout is never remembered as 64 bytes");
+        let a = Arc::new(vec![U256::from(1u8), U256::from(5u8), U256::from(9u8)]);
+        let b = Arc::new(vec![U256::from(2u8), U256::from(5u8)]);
+        let m = merge_lists(&[a.clone(), b]);
+        assert_eq!(*m, vec![U256::from(1u8), U256::from(2u8), U256::from(5u8), U256::from(9u8)]);
+        assert!(Arc::ptr_eq(&merge_lists(std::slice::from_ref(&a)), &a), "one list: itself");
+        // Word slots of a pool: the same as computing each.
+        let base = pool_base_slot(id);
+        let (wl, wh) = (MIN_TICK.div_euclid(60) >> 8, MAX_TICK.div_euclid(60) >> 8);
+        let ws = word_slots(id, base, 60, wl, wh);
+        for w in [wl, -1, 0, 7, wh] {
+            assert_eq!(ws[(w - wl) as usize], map_slot(int_word(w), base + U256::from(5u8)));
+        }
+    }
+
+    /// A route-only bound counts only the pools the run read slot0 of (plus
+    /// other pools only while it is still 0); go_full counts every pool.
+    #[test]
+    fn route_bound_counts_the_touched_pools_then_everything() {
+        let l: u128 = 1_000_000_000_000_000_000;
+        let mk = |n: u8| TrackedPool { address: Address::with_last_byte(4), v4_id: Some(B256::with_last_byte(n)), kind: super::super::PoolKind::V4, token0: Address::with_last_byte(1), token1: Address::with_last_byte(2), fee: 3000, tick_spacing: 60 };
+        let (p1, p2) = (mk(7), mk(8));
+        let pm = p1.address;
+        let mut m: HashMap<U256, U256> = HashMap::new();
+        for p in [&p1, &p2] {
+            let base = pool_base_slot(p.v4_id.unwrap());
+            m.insert(base, q96());
+            m.insert(base + U256::from(3u8), U256::from(l));
+            let (wl, wh) = (MIN_TICK.div_euclid(60) >> 8, MAX_TICK.div_euclid(60) >> 8);
+            for w in wl..=wh {
+                m.insert(map_slot(int_word(w), base + U256::from(5u8)), U256::ZERO);
+            }
+            m.insert(map_slot(int_word(-1), base + U256::from(5u8)), U256::from(1u8) << 246usize);
+            m.insert(map_slot(int_word(0), base + U256::from(5u8)), U256::from(1u8) << 10usize);
+            let pos = |net: i128| (U256::from(net as u128) << 128usize) | U256::from(l);
+            m.insert(map_slot(int_word(-600), base + U256::from(4u8)), pos(l as i128));
+            m.insert(map_slot(int_word(600), base + U256::from(4u8)), pos(-(l as i128)));
+        }
+        struct Fake(HashMap<U256, U256>, Address);
+        impl StateRead for Fake {
+            fn account(&self, _a: Address) -> Lookup<Option<AccountInfo>> {
+                Lookup::Missing
+            }
+            fn storage(&self, a: Address, s: U256) -> Lookup<U256> {
+                if a != self.1 {
+                    return Lookup::Missing;
+                }
+                self.0.get(&s).copied().map(Lookup::Known).unwrap_or(Lookup::Missing)
+            }
+            fn code_by_hash(&self, _h: B256) -> Lookup<Bytecode> {
+                Lookup::Missing
+            }
+            fn position(&self) -> StatePosition {
+                StatePosition::default()
+            }
+        }
+        let st = Fake(m, pm);
+        let mut f = C2Facts::default();
+        f.pms.insert(pm, vec![p1.clone(), p2.clone()]);
+        f.index_pools();
+        let one = {
+            let v = C2View::new(&st, &f, U256::ZERO);
+            let _ = v.storage(pm, pool_base_slot(p1.v4_id.unwrap()));
+            v.lower_bound(pm, p1.token0)
+        };
+        assert!(!one.is_zero() && f.partial_used.load(Ordering::Relaxed), "route-only: one pool");
+        f.go_full();
+        let both = C2View::new(&st, &f, U256::ZERO).lower_bound(pm, p1.token0);
+        assert_eq!(both, one + one, "full: both pools (same shape)");
+        // Nothing touched: the first pool with a non-zero bound (never 0).
+        let mut f2 = C2Facts::default();
+        f2.pms.insert(pm, vec![p1, p2]);
+        f2.index_pools();
+        assert_eq!(C2View::new(&st, &f2, U256::ZERO).lower_bound(pm, Address::with_last_byte(1)), one);
+    }
 
     #[test]
     fn tick_math_matches_known_values() {

@@ -583,6 +583,12 @@ c2counters!(
     // Loading pools with no node job / working copy for 30 s: rescheduled
     // (copy2 STALL log line names each reason).
     stall_rescheduled,
+    // ---- copy2-p (live Oct 22 16:19: checks ~120 ms, the bound was
+    // summed over EVERY V4 pool's whole tick map in every check) ----
+    // PoolManager balance bounds computed from only the pools the check
+    // itself traded on (cheap); and checks where that smaller bound wasn't
+    // enough and the full bound (every ready V4 pool) was used instead.
+    pm_bound_route_only, pm_bound_full_retry,
 );
 
 fn inc(c: &AtomicU64) {
@@ -670,6 +676,10 @@ pub struct C2Shared {
     /// Values nothing follows that the chain had changed (verify rounds):
     /// (account, slot) -> times (status `unfollowedChanged`).
     pub unfollowed_changes: Mutex<HashMap<(Address, U256), u64>>,
+    /// Checks' merged far-zero list per account, with the per-pool lists it
+    /// was made from (checkview.rs; reused while the same lists apply).
+    #[allow(clippy::type_complexity)]
+    pub far_cache: Mutex<HashMap<Address, (Vec<Arc<Vec<U256>>>, Arc<Vec<U256>>)>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -743,7 +753,7 @@ impl Copy2Handle {
     pub fn block(&self, m: BlockMsg) {
         {
             // Freshness and "newer block received" for the mirror's resolve().
-            let mut p = self.sh.published.write().unwrap();
+            let mut p = crate::timing::TimedWrite::new(&self.sh.published);
             p.last_frame = Some(Instant::now());
             let seq = m.block.saturating_sub(self.sh.cfg.l2_offset);
             p.received_seq = Some(p.received_seq.map_or(seq, |r| r.max(seq)));
@@ -932,6 +942,11 @@ impl Copy2Handle {
     pub fn check_facts(&self, block: u64) -> super::checkview::C2Facts {
         let reg = self.c2.reg.read().unwrap();
         let mut f = super::checkview::C2Facts { block, ..Default::default() };
+        // ARBSIM_COPY2_BOUND_FULL=1: always the full PoolManager balance
+        // bound (every ready V4 pool), the pre-copy2-p behaviour (slower).
+        if super::checkview::bound_full_env() {
+            f.full.store(true, Ordering::Relaxed);
+        }
         // protocolFeesAccrued of every coin of our V4 pools (never held:
         // answered by two runs, counter 0 and not 0; checkview.rs 3.).
         for e in reg.pools.values().filter(|e| e.pool.kind == PoolKind::V4) {
@@ -955,7 +970,11 @@ impl Copy2Handle {
                 if c == Address::ZERO {
                     continue;
                 }
-                if let Some(sl) = reg.bal_slot(c, e.pool.address) {
+                let memo = match reg.layouts.get(&c) {
+                    Some(Some(l)) => l.preimage(e.pool.address).map(super::checkview::memo_slot),
+                    _ => None,
+                };
+                if let Some(sl) = memo.or_else(|| reg.bal_slot(c, e.pool.address)) {
                     f.inject.insert((c, sl), (e.pool.address, c));
                 }
             }
@@ -966,11 +985,40 @@ impl Copy2Handle {
             if let (Some(fz), Some(_)) = (&e.far_zero, &e.walk) {
                 if fz.block.max(e.ready_since) <= block {
                     f.far.entry(e.pool.address).or_default().push(fz.slots.clone());
+                    if let Some(id) = e.pool.v4_id {
+                        f.far_of.insert(id, fz.slots.clone());
+                    }
                 }
             }
             f.pms.entry(e.pool.address).or_default().push(e.pool.clone());
         }
+        drop(reg);
+        // One merged far-zero list per account, reused while the same lists
+        // apply (the cache holds the lists themselves, so "same" = the very
+        // same lists, never a look-alike).
+        {
+            let mut cache = self.c2.far_cache.lock().unwrap();
+            for (a, lists) in &f.far {
+                let hit = cache.get(a).filter(|(l, _)| l.len() == lists.len() && l.iter().zip(lists).all(|(x, y)| Arc::ptr_eq(x, y))).map(|(_, m)| m.clone());
+                let merged = match hit {
+                    Some(m) => m,
+                    None => {
+                        let m = super::checkview::merge_lists(lists);
+                        cache.insert(*a, (lists.clone(), m.clone()));
+                        m
+                    }
+                };
+                f.far_merged.insert(*a, merged);
+            }
+        }
+        f.index_pools();
         f
+    }
+
+    /// A check's PoolManager balance bound: from the route's pools only
+    /// (`full_retry` false) / that wasn't enough, run again with the full one.
+    pub fn note_pm_bound_kind(&self, full_retry: bool) {
+        inc(if full_retry { &self.c2.stats.pm_bound_full_retry } else { &self.c2.stats.pm_bound_route_only });
     }
 
     /// A check read a PoolManager balance and ran twice: same / different.
@@ -1434,6 +1482,7 @@ pub fn manual(sh: Arc<Shared>, fills: Arc<FillQueue>, cfg: C2Config) -> (Intake,
         unknown_by: Mutex::new(HashMap::new()),
         blocked_by: Mutex::new(HashMap::new()),
         unfollowed_changes: Mutex::new(HashMap::new()),
+        far_cache: Mutex::new(HashMap::new()),
     });
     let loaders = sh
         .node
@@ -1618,7 +1667,7 @@ impl Intake {
             return;
         }
         inc(&self.c2.stats.coin_slot_msgs);
-        let mut reg = self.c2.reg.write().unwrap();
+        let mut reg = crate::timing::TimedWrite::new(&self.c2.reg);
         let coins: HashSet<Address> = l.iter().map(|x| x.0).collect();
         for (c, lay) in l {
             reg.layouts.insert(c, Some(lay));
@@ -1733,7 +1782,7 @@ impl Intake {
         let mut gone: Vec<PoolEntry> = Vec::new();
         let mut added = 0;
         {
-            let mut reg = self.c2.reg.write().unwrap();
+            let mut reg = crate::timing::TimedWrite::new(&self.c2.reg);
             for (c, l) in layouts {
                 reg.layouts.insert(c, Some(l));
             }
@@ -1810,7 +1859,7 @@ impl Intake {
                 }
             }
             drop(reg);
-            let mut p = self.sh.published.write().unwrap();
+            let mut p = crate::timing::TimedWrite::new(&self.sh.published);
             rewrite_from(&mut p.versions, 0, |s| {
                 for (a, k) in &forget {
                     forget_slot(s, *a, *k);
@@ -1957,6 +2006,7 @@ impl Intake {
         self.publish(m.block, Arc::new(snap), ctx, diff);
         let us = t0.elapsed().as_micros() as u64;
         st.apply_us_max.fetch_max(us, Ordering::Relaxed);
+        crate::timing::record_apply(us);
     }
 
     fn push_buf(&mut self, block: u64, rctx: ReplayCtx, logs: Vec<PoolLog>) {
@@ -2106,7 +2156,7 @@ impl Intake {
         let changes = ov.changes().clone();
         let forgot = ov.forgotten().to_vec();
         {
-            let mut p = self.sh.published.write().unwrap();
+            let mut p = crate::timing::TimedWrite::new(&self.sh.published);
             rewrite_from(&mut p.versions, n, |snap| {
                 for (a, d) in &changes.accounts {
                     if !d.storage.is_empty() {
@@ -2172,7 +2222,7 @@ impl Intake {
         let mut forget_bal: Vec<(Address, Address, U256)> = Vec::new();
         let mut any = false;
         {
-            let mut reg = self.c2.reg.write().unwrap();
+            let mut reg = crate::timing::TimedWrite::new(&self.c2.reg);
             for log in logs {
                 let event_keys: Vec<PoolKey> = reg.by_addr.get(&log.address).map(|ks| ks.iter().filter(|k| is_pool_event(&reg.pools[*k].pool, log)).copied().collect()).unwrap_or_default();
                 let mut keys: Vec<(PoolKey, Option<(Address, U256)>)> = event_keys.into_iter().map(|k| (k, None)).collect();
@@ -2231,7 +2281,7 @@ impl Intake {
         }
         for (k, gen) in restart {
             self.retry_later_quiet(k, gen, "a late report came for a block before its read (no longer kept): starting over");
-            if let Some(e) = self.c2.reg.write().unwrap().pools.get_mut(&k) {
+            if let Some(e) = crate::timing::TimedWrite::new(&self.c2.reg).pools.get_mut(&k) {
                 e.fails = e.fails.saturating_sub(1);
                 e.retry_at = Instant::now();
             }
@@ -2246,7 +2296,7 @@ impl Intake {
                 self.coin_base.remove(&(*coin, *holder));
                 self.coin_pos.remove(&(*coin, *holder));
             }
-            let mut p = self.sh.published.write().unwrap();
+            let mut p = crate::timing::TimedWrite::new(&self.sh.published);
             rewrite_from(&mut p.versions, n, |s| {
                 for (c, _, sl) in &forget_bal {
                     forget_slot(s, *c, *sl);
@@ -2273,7 +2323,7 @@ impl Intake {
             applied: Instant::now(),
         });
         {
-            let mut p = self.sh.published.write().unwrap();
+            let mut p = crate::timing::TimedWrite::new(&self.sh.published);
             p.versions.clear();
             p.versions.push_back(v.clone());
             p.stalled = None;
@@ -2294,7 +2344,7 @@ impl Intake {
             applied: Instant::now(),
         };
         {
-            let mut p = self.sh.published.write().unwrap();
+            let mut p = crate::timing::TimedWrite::new(&self.sh.published);
             p.versions.push_back(Arc::new(v));
             while p.versions.len() > self.sh.cfg.history {
                 p.versions.pop_front();
@@ -2347,7 +2397,7 @@ impl Intake {
     /// pool now holds (they are forgotten with it if it goes unsure).
     fn keep_fork(&mut self, ov: &mut Overlay, f: &Overlay, k: PoolKey) {
         ov.absorb(f);
-        let mut reg = self.c2.reg.write().unwrap();
+        let mut reg = crate::timing::TimedWrite::new(&self.c2.reg);
         let holders: HashSet<Address> = reg.holders.keys().copied().collect();
         let mut new_owned = Vec::new();
         if let Some(e) = reg.pools.get_mut(&k) {
@@ -2389,7 +2439,7 @@ impl Intake {
                 inc(&st.events_applied);
                 self.keep_fork(ov, &f, k);
                 self.last_pos.insert(k, (rctx.number, log.tx_index, log.log_index));
-                let mut reg = self.c2.reg.write().unwrap();
+                let mut reg = crate::timing::TimedWrite::new(&self.c2.reg);
                 if let Some(e) = reg.pools.get_mut(&k) {
                     e.events += 1;
                     e.clean_events += 1;
@@ -2579,7 +2629,7 @@ impl Intake {
     fn make_unsure_with(&mut self, k: PoolKey, why: &str, ov: Option<&mut Overlay>, from_block: u64, strike: bool) {
         self.partials.remove(&k);
         let forget: Vec<(Address, U256)> = {
-            let mut reg = self.c2.reg.write().unwrap();
+            let mut reg = crate::timing::TimedWrite::new(&self.c2.reg);
             let Some(e) = reg.pools.get_mut(&k) else { return };
             let was_ready = e.state == PoolState::Ready;
             let old_retry = e.retry_at;
@@ -2611,7 +2661,7 @@ impl Intake {
                 ov.forget_slot(*a, *s);
             }
         }
-        let mut p = self.sh.published.write().unwrap();
+        let mut p = crate::timing::TimedWrite::new(&self.sh.published);
         rewrite_from(&mut p.versions, from_block, |s| {
             for (a, sl) in &forget {
                 forget_slot(s, *a, *sl);
@@ -2632,7 +2682,11 @@ impl Intake {
             for k in keys {
                 if let Some(e) = reg.pools.get(k) {
                     for c in [e.pool.token0, e.pool.token1] {
-                        if let Some(sl) = reg.bal_slot(c, e.pool.address) {
+                        let memo = match reg.layouts.get(&c) {
+                    Some(Some(l)) => l.preimage(e.pool.address).map(super::checkview::memo_slot),
+                    _ => None,
+                };
+                if let Some(sl) = memo.or_else(|| reg.bal_slot(c, e.pool.address)) {
                             slots.push((c, sl));
                         }
                     }
@@ -2642,7 +2696,7 @@ impl Intake {
         for k in keys {
             self.make_unsure_with(*k, why, None, from, strike);
         }
-        let mut p = self.sh.published.write().unwrap();
+        let mut p = crate::timing::TimedWrite::new(&self.sh.published);
         rewrite_from(&mut p.versions, from, |s| {
             for (a, sl) in &slots {
                 forget_slot(s, *a, *sl);
@@ -2677,7 +2731,7 @@ impl Intake {
 
     /// Replace the head version's state (only if it is still at `block`).
     fn into_head(&self, block: u64, f: impl Fn(&mut Snapshot)) -> bool {
-        let mut p = self.sh.published.write().unwrap();
+        let mut p = crate::timing::TimedWrite::new(&self.sh.published);
         let n = p.versions.len();
         if n == 0 {
             return false;
@@ -2710,7 +2764,7 @@ impl Intake {
         let Some(head) = self.sh.head() else { return };
         let now = Instant::now();
         if self.loaders.is_none() {
-            let mut reg = self.c2.reg.write().unwrap();
+            let mut reg = crate::timing::TimedWrite::new(&self.c2.reg);
             for e in reg.pools.values_mut().filter(|e| e.state != PoolState::Ready && e.retry_at <= now) {
                 e.state = PoolState::Unsure;
                 e.reason = "no node configured to load it from".into();
@@ -2727,7 +2781,7 @@ impl Intake {
         }
         // "Not found" is asked again after a while (it may have been a bad moment).
         {
-            let mut reg = self.c2.reg.write().unwrap();
+            let mut reg = crate::timing::TimedWrite::new(&self.c2.reg);
             let again: Vec<Address> =
                 reg.not_found_at.iter().filter(|(_, t)| t.elapsed() >= Duration::from_secs(self.cfg.layout_retry_s)).map(|(c, _)| *c).collect();
             for c in again {
@@ -2760,7 +2814,7 @@ impl Intake {
         // had events most recently first (they matter most), then by wait.
         let mut traces: Vec<(Address, Address)> = Vec::new();
         let mut due: Vec<(std::cmp::Reverse<u64>, Instant, PoolKey)> = {
-            let mut reg = self.c2.reg.write().unwrap();
+            let mut reg = crate::timing::TimedWrite::new(&self.c2.reg);
             let layouts = reg.layouts.clone();
             let pairs = reg.pair_slots.clone();
             let mut d = Vec::new();
@@ -2834,7 +2888,7 @@ impl Intake {
         let mut reqs = Vec::new();
         let head_has_code = |a: &Address| head.accounts.get(a).is_some_and(|x| matches!(&x.basics, Basics::Known(Some(i)) if head.codes.contains_key(&i.code_hash) || i.code_hash == revm::primitives::KECCAK_EMPTY));
         {
-            let mut reg = self.c2.reg.write().unwrap();
+            let mut reg = crate::timing::TimedWrite::new(&self.c2.reg);
             let bal: HashMap<(Address, Address), Option<U256>> = keys
                 .iter()
                 .filter_map(|k| reg.pools.get(k).map(|e| e.pool.clone()))
@@ -2927,7 +2981,7 @@ impl Intake {
         match (job, d) {
             (JobFor::Probe, Done::Probe { coin, res, .. }) => {
                 self.probing.remove(&coin);
-                let mut reg = self.c2.reg.write().unwrap();
+                let mut reg = crate::timing::TimedWrite::new(&self.c2.reg);
                 if matches!(reg.layouts.get(&coin), Some(Some(_))) {
                     return; // the bot told us meanwhile
                 }
@@ -3000,7 +3054,7 @@ impl Intake {
             Ok(slot) => {
                 inc(&self.c2.stats.coin_trace_found);
                 {
-                    let mut reg = self.c2.reg.write().unwrap();
+                    let mut reg = crate::timing::TimedWrite::new(&self.c2.reg);
                     reg.pair_slots.insert(pair, slot);
                     // A standard layout (e.g. OpenZeppelin v5 namespaced,
                     // Solady)? Then every pool of this coin is known now.
@@ -3024,7 +3078,7 @@ impl Intake {
                 let facts: Vec<Fetched> = facts.into_iter().filter(|f| !matches!(f, Fetched::Slot(a, s, _) if *a == coin && *s == slot)).collect();
                 if !facts.is_empty() {
                     {
-                        let mut p = self.sh.published.write().unwrap();
+                        let mut p = crate::timing::TimedWrite::new(&self.sh.published);
                         reconcile(&mut p.versions, block, &facts);
                     }
                     self.sh.notify();
@@ -3035,7 +3089,7 @@ impl Intake {
                 self.outcomes.coin_not_found += 1;
                 let why = format!("coin {coin}: can't find where it keeps this pool's balance ({n} storage values equal it)");
                 self.trace_failed.insert(pair, (Instant::now(), why.clone()));
-                let mut reg = self.c2.reg.write().unwrap();
+                let mut reg = crate::timing::TimedWrite::new(&self.c2.reg);
                 let until = Instant::now() + Duration::from_secs(self.cfg.layout_retry_s);
                 for e in reg.pools.values_mut().filter(|e| e.pool.address == holder && (e.pool.token0 == coin || e.pool.token1 == coin)) {
                     if e.state != PoolState::Ready && !e.busy {
@@ -3115,7 +3169,7 @@ impl Intake {
     /// retry_later without counting (the job's error was counted once).
     fn retry_later_quiet(&mut self, k: PoolKey, gen: u64, why: &str) {
         self.partials.remove(&k);
-        let mut reg = self.c2.reg.write().unwrap();
+        let mut reg = crate::timing::TimedWrite::new(&self.c2.reg);
         if let Some(e) = reg.pools.get_mut(&k) {
             if e.gen == gen {
                 e.busy = false;
@@ -3139,7 +3193,7 @@ impl Intake {
             self.note_node_error(why);
         }
         self.partials.remove(&k);
-        let mut reg = self.c2.reg.write().unwrap();
+        let mut reg = crate::timing::TimedWrite::new(&self.c2.reg);
         if let Some(e) = reg.pools.get_mut(&k) {
             if e.gen == gen {
                 e.busy = false;
@@ -3191,7 +3245,7 @@ impl Intake {
         let need = self.c2.reg.read().unwrap().pools.get(&r.key).map(|e| e.need_base).unwrap_or(0);
         if block < need {
             self.retry_later_quiet(r.key, r.gen, &format!("read at block {block}, but a late report came for block {need}: reading again"));
-            if let Some(e) = self.c2.reg.write().unwrap().pools.get_mut(&r.key) {
+            if let Some(e) = crate::timing::TimedWrite::new(&self.c2.reg).pools.get_mut(&r.key) {
                 e.fails = e.fails.saturating_sub(1);
                 e.retry_at = Instant::now() + soon();
             }
@@ -3263,7 +3317,7 @@ impl Intake {
             self.outcomes.mismatch += 1;
             inc(&self.c2.stats.load_failed);
             {
-                let mut reg = self.c2.reg.write().unwrap();
+                let mut reg = crate::timing::TimedWrite::new(&self.c2.reg);
                 reg.layouts.insert(c, None);
                 reg.not_found_at.insert(c, Instant::now());
             }
@@ -3271,7 +3325,7 @@ impl Intake {
             return;
         }
         {
-            let mut reg = self.c2.reg.write().unwrap();
+            let mut reg = crate::timing::TimedWrite::new(&self.c2.reg);
             if let Some(e) = reg.pools.get_mut(&r.key) {
                 e.verified = true;
             }
@@ -3352,7 +3406,7 @@ impl Intake {
     fn send_need(&mut self, key: PoolKey, part: Partial, items: Vec<MissItem>) {
         inc(&self.c2.stats.need_item_rounds);
         let over = {
-            let mut reg = self.c2.reg.write().unwrap();
+            let mut reg = crate::timing::TimedWrite::new(&self.c2.reg);
             match reg.pools.get_mut(&key) {
                 Some(e) => {
                     e.rounds += 1;
@@ -3388,7 +3442,7 @@ impl Intake {
         if age > limit {
             self.partials.insert(key, part);
             self.retry_later_quiet(key, gen, "catch-up block too old, reloading at the newest block");
-            if let Some(e) = self.c2.reg.write().unwrap().pools.get_mut(&key) {
+            if let Some(e) = crate::timing::TimedWrite::new(&self.c2.reg).pools.get_mut(&key) {
                 e.retry_at = Instant::now();
                 e.fails = e.fails.saturating_sub(1);
             }
@@ -3409,7 +3463,7 @@ impl Intake {
     /// block: from this report on it loads in the background (never waits).
     fn start_partial_in_block(&mut self, ov: &mut Overlay, k: PoolKey, cursor: Pos, items: Vec<MissItem>) {
         let (pool, owned_items, accounts, gen) = {
-            let mut reg = self.c2.reg.write().unwrap();
+            let mut reg = crate::timing::TimedWrite::new(&self.c2.reg);
             let Some(e) = reg.pools.get_mut(&k) else { return };
             e.gen += 1;
             e.state = PoolState::Loading;
@@ -3585,7 +3639,7 @@ impl Intake {
             }
         }
         if !disagree.is_empty() {
-            let mut p = self.sh.published.write().unwrap();
+            let mut p = crate::timing::TimedWrite::new(&self.sh.published);
             rewrite_from(&mut p.versions, 0, |s| {
                 for (a, sl) in &disagree {
                     forget_slot(s, *a, *sl);
@@ -3673,12 +3727,12 @@ impl Intake {
                 // chain and its coin_base stay.
                 if part.base.0 > 0 && head_missing.contains(&(*c, *sl)) && matches!(part.ov.snapshot().storage(*c, *sl), Lookup::Known(_)) {
                     self.coin_base.insert((*c, pool.address), part.base.0);
-                    let mut p = self.sh.published.write().unwrap();
+                    let mut p = crate::timing::TimedWrite::new(&self.sh.published);
                     forget_before(&mut p.versions, head.block, *c, *sl);
                 }
             }
         }
-        let mut reg = self.c2.reg.write().unwrap();
+        let mut reg = crate::timing::TimedWrite::new(&self.c2.reg);
         if let Some(e) = reg.pools.get_mut(&key) {
             e.state = PoolState::Ready;
             e.reason = String::new();
@@ -3766,7 +3820,7 @@ impl Intake {
         due.sort();
         for (_, _, k) in due.into_iter().take(self.cfg.walks_inflight - running) {
             let (pool, gen) = {
-                let mut reg = self.c2.reg.write().unwrap();
+                let mut reg = crate::timing::TimedWrite::new(&self.c2.reg);
                 let Some(e) = reg.pools.get_mut(&k) else { continue };
                 e.walk_busy = true;
                 (e.pool.clone(), e.gen)
@@ -3795,7 +3849,7 @@ impl Intake {
                     eprintln!("[arbsim] copy2: the node can't run the tick walk ({m}); tick walks off");
                     self.walk_off = true;
                 }
-                let mut reg = self.c2.reg.write().unwrap();
+                let mut reg = crate::timing::TimedWrite::new(&self.c2.reg);
                 if let Some(e) = reg.pools.get_mut(&key) {
                     e.walk_busy = false;
                     e.walk_fails = e.walk_fails.saturating_add(1);
@@ -3805,7 +3859,7 @@ impl Intake {
             }
         };
         let (pool, owned, ok) = {
-            let mut reg = self.c2.reg.write().unwrap();
+            let mut reg = crate::timing::TimedWrite::new(&self.c2.reg);
             let Some(e) = reg.pools.get_mut(&key) else { return };
             e.walk_busy = false;
             let ok = e.gen == gen && e.state == PoolState::Ready && e.ready_since <= k;
@@ -3828,13 +3882,13 @@ impl Intake {
             .map(|(a, s, v)| Fetched::Slot(*a, *s, *v))
             .collect();
         let res = {
-            let mut p = self.sh.published.write().unwrap();
+            let mut p = crate::timing::TimedWrite::new(&self.sh.published);
             reconcile(&mut p.versions, k, &facts)
         };
         if res.too_old > 0 && res.applied == 0 && !facts.is_empty() {
             // The kept versions don't reach back to k: walk again.
             inc(&self.c2.stats.walks_refused);
-            let mut reg = self.c2.reg.write().unwrap();
+            let mut reg = crate::timing::TimedWrite::new(&self.c2.reg);
             if let Some(e) = reg.pools.get_mut(&key) {
                 e.walk_retry_at = Instant::now() + Duration::from_secs(1);
             }
@@ -3847,7 +3901,7 @@ impl Intake {
             inc(&self.c2.stats.walks_partial);
         }
         {
-            let mut reg = self.c2.reg.write().unwrap();
+            let mut reg = crate::timing::TimedWrite::new(&self.c2.reg);
             if let Some(e) = reg.pools.get_mut(&key) {
                 e.walked.extend(out.slots.iter().map(|(a, s, _)| (*a, *s)));
                 e.walked.sort_unstable();
@@ -3974,7 +4028,7 @@ impl Intake {
         }
         add(&self.c2.stats.pending_marked, sus.len() as u64);
         {
-            let mut reg = self.c2.reg.write().unwrap();
+            let mut reg = crate::timing::TimedWrite::new(&self.c2.reg);
             for k in &sus {
                 if let Some(e) = reg.pools.get_mut(k) {
                     e.pending_from = Some(e.pending_from.map_or(m.block, |b| b.min(m.block)));
@@ -4084,7 +4138,7 @@ impl Intake {
                 first.entry(*k).or_insert(*b);
             }
         }
-        let mut reg = self.c2.reg.write().unwrap();
+        let mut reg = crate::timing::TimedWrite::new(&self.c2.reg);
         for (k, e) in reg.pools.iter_mut() {
             e.pending_from = first.get(k).copied();
         }
@@ -4178,7 +4232,7 @@ impl Intake {
         // (coin, slot, pool, node value at k): busy pools' coin balances.
         let mut carried: Vec<(Address, U256, Address, U256)> = Vec::new();
         {
-            let mut reg = self.c2.reg.write().unwrap();
+            let mut reg = crate::timing::TimedWrite::new(&self.c2.reg);
             for (it, f) in out.items {
                 let f = match f {
                     Ok(f) => f,
@@ -4262,7 +4316,7 @@ impl Intake {
         }
         add(&self.c2.stats.fill_items, good.len() as u64);
         {
-            let mut p = self.sh.published.write().unwrap();
+            let mut p = crate::timing::TimedWrite::new(&self.sh.published);
             reconcile(&mut p.versions, k, &good);
         }
         self.sh.notify();
@@ -4313,7 +4367,7 @@ impl Intake {
                 }
             }
         }
-        let mut p = self.sh.published.write().unwrap();
+        let mut p = crate::timing::TimedWrite::new(&self.sh.published);
         let mut vals: Vec<(usize, U256)> = Vec::new();
         for (i, ver) in p.versions.iter().enumerate() {
             if ver.block < k {
@@ -4474,7 +4528,7 @@ impl Intake {
             }
         }
         let fresh: Vec<Fetched> = changed.iter().map(|(a, sl, _, v)| Fetched::Slot(*a, *sl, *v)).collect();
-        let mut p = self.sh.published.write().unwrap();
+        let mut p = crate::timing::TimedWrite::new(&self.sh.published);
         rewrite_from(&mut p.versions, 0, |s| {
             for (a, sl, _, _) in &changed {
                 forget_slot(s, *a, *sl);
@@ -4579,7 +4633,7 @@ impl Intake {
         for (k, why) in &stuck {
             self.orphan_since.remove(k);
             inc(&self.c2.stats.stall_rescheduled);
-            let mut reg = self.c2.reg.write().unwrap();
+            let mut reg = crate::timing::TimedWrite::new(&self.c2.reg);
             if let Some(e) = reg.pools.get_mut(k) {
                 e.busy = false;
                 e.gen += 1;

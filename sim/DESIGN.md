@@ -110,6 +110,11 @@ Requests:
 `amountOffset`: byte offset of the amountIn word inside `data` (after the 4-byte
 selector), so the sidecar can patch the size without ABI work.
 
+Every `call` / `size_search` answer also carries `"t"` (copy2-p): microseconds
+per step inside arbsim, `{"queue","prep","resolve","facts","runs":[..],"post"}`
+(src/timing.rs); `status` has `checkTiming` / `applyTiming` / `lockHold`
+(p50 / p90 / p99 / max of the last 1000).
+
 ## Bot side (owner: C client, integration later)
 - `src/execution/localSim.ts`: sidecar client + an `Rpc`-compatible adapter that
   answers `eth_call` (with overrides) and `eth_simulateV1` (as used by

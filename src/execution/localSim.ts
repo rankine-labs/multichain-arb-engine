@@ -69,9 +69,14 @@ export function localSimMode(env: Record<string, string | undefined> = process.e
 // Sidecar answers (see sim/DESIGN.md "Socket protocol").
 // ---------------------------------------------------------------------------
 export type SidecarCallResult = { success: boolean; output: string; gasUsed: string; halt?: string };
+// `us`: time inside arbsim (microseconds, without the queue wait); `t`:
+// arbsim's own split of it (queue / prep / resolve / facts / runs / post,
+// microseconds, sim/src/timing.rs); `rtMs`: added by the client = the time
+// from sending the question to reading its answer, as the bot saw it.
+export type SidecarTiming = { queue?: number; prep?: number; resolve?: number; facts?: number; runs?: number[]; post?: number };
 export type SidecarAnswer =
-  | { id?: number; ok: true; at?: unknown; results?: SidecarCallResult[]; best?: unknown; tried?: unknown[]; us?: number; [k: string]: unknown }
-  | { id?: number; ok: false; unknown: string; missing?: unknown[]; detail?: string; us?: number };
+  | { id?: number; ok: true; at?: unknown; results?: SidecarCallResult[]; best?: unknown; tried?: unknown[]; us?: number; t?: SidecarTiming; rtMs?: number; [k: string]: unknown }
+  | { id?: number; ok: false; unknown: string; missing?: unknown[]; detail?: string; us?: number; t?: SidecarTiming; rtMs?: number };
 
 export type LocalSimStats = {
   sent: number;          // questions sent to the sidecar
@@ -84,6 +89,12 @@ export type LocalSimStats = {
   feedSent: number;
   feedDropped: number;   // feed frames dropped (sidecar down / too slow)
   connected: boolean;
+  // Answers that came AFTER their question had timed out: how many, and for
+  // the last 200 how long after sending they came / how long arbsim itself
+  // took (tells "arbsim slow" apart from "the bot read it late").
+  lateAnswers: number;
+  lateMs: number[];
+  lateInsideMs: number[];
 };
 
 export type LocalSimClientOptions = {
@@ -99,7 +110,7 @@ export type LocalSimClientOptions = {
   onConnect?: () => void;     // told each time the connection is (re)made (e.g. to send the warm list)
 };
 
-type Pending = { resolve: (a: SidecarAnswer) => void; timer: NodeJS.Timeout };
+type Pending = { resolve: (a: SidecarAnswer) => void; timer: NodeJS.Timeout; sentMs: number };
 
 // ---------------------------------------------------------------------------
 // LocalSimClient: the socket connection.
@@ -122,6 +133,8 @@ export class LocalSimClient {
   private reconnectTimer: NodeJS.Timeout | null = null;
   private nextId = 1;
   private pending = new Map<number, Pending>();
+  // Questions that timed out (id -> when sent), to time their late answers.
+  private timedOut = new Map<number, number>();
   private feedQueue: Buffer[] = [];
   private inbuf: Buffer = Buffer.alloc(0);
   private everConnected = false;
@@ -129,6 +142,7 @@ export class LocalSimClient {
   readonly stats: LocalSimStats = {
     sent: 0, answered: 0, unknown: 0, unknownByWhy: {}, timeouts: 0, fallbacks: 0,
     reconnects: 0, feedSent: 0, feedDropped: 0, connected: false,
+    lateAnswers: 0, lateMs: [], lateInsideMs: [],
   };
 
   constructor(opts: LocalSimClientOptions = {}) {
@@ -155,13 +169,16 @@ export class LocalSimClient {
         if (!this.connected || !this.sock) { resolve(this.noteUnknown({ ok: false, unknown: 'disconnected' })); return; }
         const id = this.nextId++;
         if (this.nextId > 2_000_000_000) this.nextId = 1; // ids wrap around, never collide in practice
+        const sentMs = Date.now();
         const timer = setTimeout(() => {
           if (!this.pending.delete(id)) return;
           this.stats.timeouts++;
-          resolve(this.noteUnknown({ id, ok: false, unknown: 'timeout' }));
+          this.timedOut.set(id, sentMs);
+          if (this.timedOut.size > 500) this.timedOut.delete(this.timedOut.keys().next().value as number);
+          resolve(this.noteUnknown({ id, ok: false, unknown: 'timeout', rtMs: Date.now() - sentMs }));
         }, timeoutMs);
         timer.unref?.();
-        this.pending.set(id, { resolve, timer });
+        this.pending.set(id, { resolve, timer, sentMs });
         this.stats.sent++;
         this.sock.write(frame({ ...msg, id }));
       } catch (e) {
@@ -285,12 +302,26 @@ export class LocalSimClient {
       try { msg = JSON.parse(body.toString('utf8')); } catch { continue; } // a broken answer: its question times out
       const id = typeof msg?.id === 'number' ? msg.id : -1;
       const p = this.pending.get(id);
-      if (!p) continue; // late answer (already timed out) or unsolicited
+      if (!p) { this.noteLate(id, msg); continue; } // late answer (already timed out) or unsolicited
       this.pending.delete(id);
       clearTimeout(p.timer);
+      msg.rtMs = Date.now() - p.sentMs;
       if (msg.ok === true) { this.stats.answered++; p.resolve(msg as SidecarAnswer); }
       else p.resolve(this.noteUnknown({ ...msg, ok: false, unknown: typeof msg?.unknown === 'string' ? msg.unknown : 'sidecar_error' }));
     }
+  }
+
+  // An answer whose question already timed out: how late was it?
+  private noteLate(id: number, msg: any): void {
+    const sent = this.timedOut.get(id);
+    if (sent === undefined) return;
+    this.timedOut.delete(id);
+    const st = this.stats;
+    st.lateAnswers++;
+    st.lateMs.push(Date.now() - sent);
+    if (st.lateMs.length > 200) st.lateMs.shift();
+    const inside = insideMs(msg);
+    if (inside !== undefined) { st.lateInsideMs.push(inside); if (st.lateInsideMs.length > 200) st.lateInsideMs.shift(); }
   }
 
   private failAll(why: string): void {
@@ -304,6 +335,14 @@ export class LocalSimClient {
     this.stats.unknownByWhy[a.unknown] = (this.stats.unknownByWhy[a.unknown] ?? 0) + 1;
     return a;
   }
+}
+
+// Time inside arbsim for an answer (ms, queue wait included, 0.1 ms
+// steps), or undefined if it doesn't say.
+export function insideMs(a: { us?: unknown; t?: { queue?: unknown } } | null | undefined): number | undefined {
+  if (!a || typeof a.us !== 'number') return undefined;
+  const q = typeof a.t?.queue === 'number' ? a.t.queue : 0;
+  return Math.round((a.us + q) / 100) / 10;
 }
 
 // 4-byte big-endian length + UTF-8 JSON.
@@ -331,6 +370,9 @@ export type LocalRpcOptions = {
   // Told about every sure answer, with the question that was sent (for
   // timing / gas logs and the size search). Never changes the answer.
   onAnswer?: (method: string, answer: SidecarAnswer, sent: Record<string, unknown>) => void;
+  // Told about EVERY reply to a question (sure, unknown, timeout), for
+  // timing only. Never changes the answer.
+  onReply?: (method: string, answer: SidecarAnswer, sent: Record<string, unknown>) => void;
 };
 
 // Which state a block tag means, in sidecar terms. null = not supported here.
@@ -399,6 +441,9 @@ export function makeLocalRpc(client: LocalSimClient, fallback?: Rpc, opts: Local
   const noteAnswer = (method: string, a: SidecarAnswer, sent: Record<string, unknown>): void => {
     try { opts.onAnswer?.(method, a, sent); } catch { /* logging must not break checks */ }
   };
+  const noteReply = (method: string, a: SidecarAnswer, sent: Record<string, unknown>): void => {
+    try { opts.onReply?.(method, a, sent); } catch { /* logging must not break checks */ }
+  };
 
   return async (method, params) => {
     try {
@@ -410,6 +455,7 @@ export function makeLocalRpc(client: LocalSimClient, fallback?: Rpc, opts: Local
         if (!call || typeof call !== 'object') return unknown(method, params, 'bad_request');
         const sent = { type: 'call', at, overrides: p[2] ?? {}, calls: [call] };
         const a = await client.request(sent, opts.timeoutMs);
+        noteReply(method, a, sent);
         if (a.ok !== true) return unknown(method, params, a.unknown);
         noteAnswer(method, a, sent);
         const r = a.results?.[0];
@@ -435,6 +481,7 @@ export function makeLocalRpc(client: LocalSimClient, fallback?: Rpc, opts: Local
         if (extra.length) return unknown(method, params, 'unsupported_block_override');
         const sent = { type: 'call', at, nextBlock: true, blockOverrides: bo, overrides: b.stateOverrides ?? {}, calls };
         const a = await client.request(sent, opts.timeoutMs);
+        noteReply(method, a, sent);
         if (a.ok !== true) return unknown(method, params, a.unknown);
         noteAnswer(method, a, sent);
         if (!Array.isArray(a.results) || a.results.length !== calls.length) return unknown(method, params, 'bad_answer');

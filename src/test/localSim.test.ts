@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import {
-  LocalSimClient, makeLocalRpc, localSimMode, localUnknownMessage, blockTagToAt, frame, LOCAL_UNKNOWN_PREFIX,
+  LocalSimClient, makeLocalRpc, localSimMode, localUnknownMessage, blockTagToAt, frame, LOCAL_UNKNOWN_PREFIX, insideMs,
 } from '../execution/localSim';
 import { readReplayAnswer, replayRpc, simulateRoundTrip, isRateLimited, isNoReasonFail, SIM_EXECUTOR_ADDRESS, Rpc } from '../execution/simulator';
 import { classifySimOutcome, isTradeVerdict } from '../core/failReasons';
@@ -195,6 +195,24 @@ async function main() {
     assert(rv.error?.message === localUnknownMessage('unsupported_simulate_shape'), 'validation:true simulate not served locally');
     const rbo = await rpc('eth_simulateV1', [{ blockStateCalls: [{ calls: [{ to: '0x01' }], blockOverrides: { baseFeePerGas: '0x1' } }] }, 'latest']);
     assert(rbo.error?.message === localUnknownMessage('unsupported_block_override'), 'unknown block override not served locally');
+
+    // 5d2. Timing (copy2-p): every reply carries the round trip the bot saw
+    // (rtMs) and is passed to onReply (sure or not, incl. timeouts); an
+    // answer that comes after the timeout is counted with how late it was
+    // and arbsim's own time (insideMs = us + t.queue).
+    assert(insideMs({ us: 2500, t: { queue: 300 } }) === 2.8 && insideMs({ us: 1000 }) === 1 && insideMs({}) === undefined, 'insideMs = (us + queue) in ms');
+    const replies: any[] = [];
+    const rpcT = makeLocalRpc(client, undefined, { onReply: (_m, a) => replies.push(a) });
+    fake.handler = (m, reply) => setTimeout(() => reply({ id: m.id, ok: true, us: 1500, t: { queue: 100, runs: [900] }, results: [{ success: true, output: '0x01', gasUsed: '0x5208' }] }), 5);
+    await rpcT('eth_call', [{ to: '0x01' }, 'latest']);
+    assert(replies.length === 1 && replies[0].ok === true && typeof replies[0].rtMs === 'number' && replies[0].rtMs >= 4 && replies[0].t.runs[0] === 900, `sure reply: rtMs + arbsim timing passed on (${JSON.stringify(replies[0])})`);
+    fake.handler = (m, reply) => setTimeout(() => reply({ id: m.id, ok: true, us: 90_000, t: { queue: 0 }, results: [{ success: true, output: '0x01', gasUsed: '0x5208' }] }), 90);
+    const lateBefore = client.stats.lateAnswers;
+    await rpcT('eth_call', [{ to: '0x01' }, 'latest']);
+    assert(replies.length === 2 && replies[1].ok === false && replies[1].unknown === 'timeout' && replies[1].rtMs >= 45, 'timeout reply passed on with its wait');
+    assert(await waitFor(() => client.stats.lateAnswers === lateBefore + 1), 'the late answer is counted');
+    const lateMs = client.stats.lateMs[client.stats.lateMs.length - 1];
+    assert(lateMs >= 85 && lateMs < 1000 && client.stats.lateInsideMs[client.stats.lateInsideMs.length - 1] === 90, `late answer: ${lateMs} ms after sending, arbsim own time 90 ms`);
 
     // 5e. Feed frames are forwarded, no answer expected.
     const before = fake.seen.length;
