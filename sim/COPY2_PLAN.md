@@ -978,3 +978,60 @@ trade ~20 ms.
   reloads pools with new-tick mints early in the gap); a fix to how copy 2
   follows pools needs FORMAT bumped (or the file deleted) or the old
   copy's mistakes survive the deploy.
+
+- Live shadow after the copy2-p deploy, Oct 22 19:52 UTC, 29 min
+  (inbot-sim/copy2-q): arbsim's own check time median 11.8 / p90 43.6 /
+  p99 192.8 ms, of which "facts" ~14 ms (bench: 0.5 ms); 484 lock holds
+  over 1 ms by the copy's thread, longest 197 ms; slowest block 421 ms.
+  1. Causes. The facts step read copy 2's pool registry under its lock and
+     went through ALL ~650 pools per check; checks also took the mirror's
+     version lock (resolve, status). On a 2-vCPU server shared with the
+     bot, the copy's thread holding either lock (and being descheduled
+     while holding it) made checks wait. The socket thread also took the
+     version lock for every block message, so a check sent after a block
+     message on the same connection waited too.
+  2. Fixes (no change to what copy 2 holds or follows; no state file
+     format change):
+     - mirror.rs PubLock: checks (resolve, head, status) read a copy of the
+       published versions refreshed whenever a write lock is released;
+       they never take the lock (a check then sees the versions as they
+       were just before that write began). Block messages note "newest
+       received" without the lock.
+     - timing.rs GenLock: the registry's lock counts changes.
+       copy2/checkcore.rs CheckCore = everything checks need from the
+       registry (V4 bound pools, far zero words, protocol-fee counters,
+       pending pools, not-ready pools, coin layouts), rebuilt only when
+       the registry changed: by the copy's thread after each block / work
+       round, else by a check. The facts sets are prebuilt once per core
+       for every block from `stable_from` (newest "ready since" / walk
+       block) to `pending_min` (first block with reports maybe missing) =
+       every check at the newest blocks; other blocks get their own sets
+       from the core (no lock). A core is used while the registry is
+       unchanged, or by a check whose version came from the readers' copy
+       that was current when the core was built (= a check that came at
+       that moment). Only otherwise does a check read the registry (and
+       may wait). Status counting (missesBy..., blockedBy) skips rather
+       than waits.
+     - lockHold in status now names the source lines (bySite: count over
+       1 ms, total, longest), printed by deploy/arbsim-status.js.
+  3. Bench (tests/copy2_latency.rs, 640 pools, + COPY2_LAT_HOG=2 threads
+     burning CPU like the bot): facts p50 0.00 / p99 0.00 / max 3 ms (was
+     0.5 / 3-6 ms in the bench, 14 ms live); answered checks bot-side p50
+     2.2 ms, p90 6.5, p99 11.9; checks asked while a test thread holds the
+     version lock or the registry lock for 300 ms: 1.2-10 ms (before: they
+     waited the 300 ms). Same answered / unknown counts as before (245 /
+     29 pool_manager_balance / 26 miss of 300; 48 compared with the chain).
+     The latency test now also fails if such a check waits >= 100 ms.
+  4. Disagreement re-check (bot, shadow and on): when copy 2 and the node
+     give different verdicts for a check about a copy-2 block, the bot asks
+     the node the same check pinned at the copy's block (c2blk) once, in
+     the background (at most 30 an hour), and logs a jsonl line
+     {"k":"recheck", c2blk, lv/lp, nv/np, nvAt/npAt, result}: "market
+     moved" (the node at the copy's block agrees with the copy), "COPY
+     WRONG" (it agrees with its own later answer; Telegram alert) or
+     "unclear". Hourly line: "disagreements asked again at the copy's
+     block: market moved a, COPY WRONG b, unclear c".
+  The Oct 22 disagreement (VIRTUAL/WETH gap, copy profit 2.1e14 wei at
+  block 0x5af41a4, node loss at "latest" 125 ms later = ~1 block later)
+  can't be decided offline (no node here); see the report. The re-check
+  decides the next one automatically.

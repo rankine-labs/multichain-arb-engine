@@ -392,6 +392,8 @@ struct Results {
     bot_ms: Vec<f64>,
     /// Bot-side time of the checks the copy answered (the goal's numbers).
     answered_ms: Vec<f64>,
+    /// Checks asked while the copy's thread held a lock for 300 ms.
+    held_ms: Vec<f64>,
     answered: usize,
     unknown: HashMap<String, usize>,
     compared: usize,
@@ -452,6 +454,20 @@ fn bench(pairs: usize, checks: usize) -> Option<Results> {
     // From here everything runs like live: the copy's own thread, the
     // socket server with its workers, a block maker, the "bot".
     let stop = Arc::new(AtomicBool::new(false));
+    // COPY2_LAT_HOG=N: N threads burning CPU (live: the bot shares the
+    // server's 2 vCPUs with arbsim).
+    for _ in 0..env_n("COPY2_LAT_HOG", 0) {
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            let mut x: u64 = 1;
+            while !stop.load(Ordering::Relaxed) {
+                for _ in 0..100_000 {
+                    x = x.wrapping_mul(6364136223846793005).wrapping_add(1);
+                }
+                std::hint::black_box(x);
+            }
+        });
+    }
     let intake_t = std::thread::spawn(move || intake.run());
     let sock = format!("{}/arbsim-lat-{}.sock", std::env::temp_dir().display(), std::process::id());
     let listener = arbsim::server::bind(&sock).unwrap();
@@ -529,7 +545,7 @@ fn bench(pairs: usize, checks: usize) -> Option<Results> {
     }
     eprintln!("[bench] warm-up {:.1} s: {wn} checks, avg {:.1} ms, max {wmax:.1} ms, {wwhy:?}", t_warm.elapsed().as_secs_f64(), wms / wn.max(1) as f64);
     arbsim::timing::reset();
-    let mut r = Results { bot_ms: Vec::new(), answered_ms: Vec::new(), answered: 0, unknown: HashMap::new(), compared: 0, report: String::new() };
+    let mut r = Results { bot_ms: Vec::new(), answered_ms: Vec::new(), held_ms: Vec::new(), answered: 0, unknown: HashMap::new(), compared: 0, report: String::new() };
     let mut steps: HashMap<&str, Vec<f64>> = HashMap::new();
     let gap_ms = env_n("COPY2_LAT_GAP_MS", 40);
     for k in 0..checks {
@@ -587,6 +603,39 @@ fn bench(pairs: usize, checks: usize) -> Option<Results> {
         }
         std::thread::sleep(Duration::from_millis(gap_ms));
     }
+    // copy2-q (live: 484 lock holds over 1 ms, up to 197 ms, and checks
+    // waited): while the copy's thread holds the published versions or the
+    // pool registry for 300 ms, checks still answer at once.
+    for which in ["published", "registry"] {
+        let (sh2, h2) = (sh.clone(), h.clone());
+        let held = Arc::new(AtomicBool::new(false));
+        let held2 = held.clone();
+        let t = std::thread::spawn(move || {
+            if which == "published" {
+                let _g = sh2.published.write().unwrap();
+                held2.store(true, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(300));
+            } else {
+                let _g = h2.c2.reg.write().unwrap();
+                held2.store(true, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(300));
+            }
+        });
+        // A block the copy has applied already (while the copy's thread is
+        // held, newer blocks wait: those checks rightly answer "dirty"
+        // after ARBSIM_WAIT_MS).
+        let n = h.c2.last_block.load(Ordering::SeqCst);
+        while !held.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        for _ in 0..5 {
+            let i = rng.int(0, w.pairs.len() as i64 - 1) as usize;
+            let (ans, ms, _, _) = ask(&mut cl, i, 500, true, n);
+            r.held_ms.push(ms);
+            eprintln!("[bench] check while the copy holds the {which} lock: {ms:.1} ms ({})", ans["unknown"].as_str().unwrap_or("answered"));
+        }
+        t.join().unwrap();
+    }
     let st = cl.ask(json!({"type": "status"}));
     stop.store(true, Ordering::Relaxed);
     maker.join().unwrap();
@@ -633,6 +682,8 @@ fn copy2_check_latency() {
     let p99 = pctl(&mut r.answered_ms, 0.99);
     let max50 = env_n("COPY2_LAT_MAX_P50_MS", 10) as f64;
     let max99 = env_n("COPY2_LAT_MAX_P99_MS", 40) as f64;
+    let held_max = r.held_ms.iter().cloned().fold(0.0, f64::max);
+    assert!(held_max < 100.0, "a check waited for the copy's lock: {held_max:.1} ms ({:?})", r.held_ms);
     assert!(p50 <= max50, "bot-side p50 {p50:.1} ms > {max50} ms\n{}", r.report);
     assert!(p99 <= max99, "bot-side p99 {p99:.1} ms > {max99} ms\n{}", r.report);
 }

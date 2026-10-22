@@ -99,7 +99,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -653,7 +653,9 @@ impl Outcomes {
 
 /// What the socket threads share with the intake thread.
 pub struct C2Shared {
-    pub reg: RwLock<Registry>,
+    /// The pool registry; its lock counts changes (checks reuse a summary
+    /// of it while unchanged: checkcore.rs).
+    pub reg: crate::timing::GenLock<Registry>,
     pub stats: C2Stats,
     /// Newest block applied (0 = none yet).
     pub last_block: AtomicU64,
@@ -698,8 +700,11 @@ pub struct C2Shared {
     pub unfollowed_changes: Mutex<HashMap<(Address, U256), u64>>,
     /// Checks' merged far-zero list per account, with the per-pool lists it
     /// was made from (checkview.rs; reused while the same lists apply).
-    #[allow(clippy::type_complexity)]
-    pub far_cache: Mutex<HashMap<Address, (Vec<Arc<Vec<U256>>>, Arc<Vec<U256>>)>>,
+    pub far_cache: super::checkcore::FarCache,
+    /// What checks need from the registry, while it is unchanged (copy2-q).
+    pub core: Mutex<Arc<super::checkcore::CheckCore>>,
+    /// The mirror (its readers' copy goes into the registry summary).
+    pub mirror: Arc<Shared>,
     /// Warm restart (status `resume`): the saved file, the last save, the
     /// current / last catch-up.
     pub resume: Mutex<serde_json::Map<String, Value>>,
@@ -762,6 +767,48 @@ fn top_reasons<'a>(it: impl Iterator<Item = &'a str>) -> Vec<Value> {
     v.into_iter().map(|(k, n)| json!({ "why": k, "n": n })).collect()
 }
 
+impl C2Shared {
+    /// What checks need from the registry (checkcore.rs), current: the
+    /// kept one while the registry is unchanged (no lock), else rebuilt
+    /// under a read lock (the copy's thread rebuilds it right after its own
+    /// changes, so checks rarely do).
+    pub fn check_core(&self) -> Arc<super::checkcore::CheckCore> {
+        self.check_core_for(None)
+    }
+
+    /// The same for a check whose version came from `from` (mirror.rs
+    /// Picked.from): a core built while that very readers' copy was current
+    /// is used even if the registry changed since (checkcore.rs header).
+    pub fn check_core_for(&self, from: Option<&Arc<crate::state::mirror::PubView>>) -> Arc<super::checkcore::CheckCore> {
+        let cur = self.core.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if cur.gen == self.reg.gen() {
+            return cur;
+        }
+        if let (Some(a), Some(b)) = (from, cur.view.as_ref()) {
+            if Arc::ptr_eq(a, b) {
+                return cur;
+            }
+        }
+        // Rebuild: the readers' copy first, then the registry.
+        let view = Some(self.mirror.published.view());
+        let reg = self.reg.read().unwrap_or_else(|e| e.into_inner());
+        let gen = self.reg.gen();
+        {
+            let cur = self.core.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            if cur.gen == gen {
+                return cur;
+            }
+        }
+        let c = Arc::new(super::checkcore::CheckCore::build(&reg, gen, view, &self.far_cache));
+        drop(reg);
+        let mut g = self.core.lock().unwrap_or_else(|e| e.into_inner());
+        if g.gen < gen {
+            *g = c.clone();
+        }
+        c
+    }
+}
+
 impl Copy2Handle {
     /// A pool_logs / block_tick message (no answer; never blocks).
     pub fn block_json(&self, v: &Value) {
@@ -776,13 +823,11 @@ impl Copy2Handle {
     }
 
     pub fn block(&self, m: BlockMsg) {
-        {
-            // Freshness and "newer block received" for the mirror's resolve().
-            let mut p = crate::timing::TimedWrite::new(&self.sh.published);
-            p.last_frame = Some(Instant::now());
-            let seq = m.block.saturating_sub(self.sh.cfg.l2_offset);
-            p.received_seq = Some(p.received_seq.map_or(seq, |r| r.max(seq)));
-        }
+        // Freshness and "newer block received" for the mirror's resolve():
+        // noted without the copy's lock (a block message must never wait
+        // for the copy's thread: the bot's checks on the same connection
+        // are read after it; copy2-q).
+        self.sh.published.note_received(m.block.saturating_sub(self.sh.cfg.l2_offset));
         if self.tx.try_send(Input::Block(m)).is_err() {
             // Hopelessly behind: dropping a block breaks the copy; the next
             // message's prevBlock check reloads everything.
@@ -821,9 +866,7 @@ impl Copy2Handle {
         if accts.is_empty() {
             return;
         }
-        let reg = self.c2.reg.read().unwrap();
-        let layouts: Vec<(Address, BalanceLayout)> = reg.layouts.iter().filter_map(|(c, l)| l.map(|l| (*c, l))).collect();
-        drop(reg);
+        let layouts: Vec<(Address, BalanceLayout)> = self.c2.check_core().layouts.clone();
         let mut seen = self.c2.check_accounts.lock().unwrap();
         let mut items = Vec::new();
         for a in accts {
@@ -872,7 +915,9 @@ impl Copy2Handle {
     /// Count the items a check found missing, by class (status): pool /
     /// coin / other contract / account, slot or basics.
     pub fn note_misses(&self, missing: &[MissItem]) {
-        let reg = self.c2.reg.read().unwrap();
+        // Status only: never wait for the copy's thread (a check's answer
+        // is sent after this); skipped while it holds the registry.
+        let Ok(reg) = self.c2.reg.try_read() else { return };
         let mut m = self.c2.misses.lock().unwrap();
         for it in missing {
             let (a, what) = match it {
@@ -928,7 +973,8 @@ impl Copy2Handle {
             return;
         }
         let labels: std::collections::BTreeSet<String> = {
-            let reg = self.c2.reg.read().unwrap();
+            // Status only: never wait for the copy's thread (see note_misses).
+            let Ok(reg) = self.c2.reg.try_read() else { return };
             let checkers: Vec<Address> = self.c2.check_accounts.lock().unwrap().keys().copied().collect();
             missing.iter().map(|m| miss_label(&reg, &checkers, &self.sh.volatile, m)).collect()
         };
@@ -951,31 +997,23 @@ impl Copy2Handle {
     /// have all arrived yet? Then the answer must be "unknown" (why).
     /// `all`: the touched list overflowed (then any pending pool counts).
     pub fn pending_reason(&self, touched: &[Address], block: u64, all: bool) -> Option<String> {
-        let reg = self.c2.reg.read().unwrap();
-        let every: Vec<Address> = if all { reg.by_addr.keys().copied().collect() } else { Vec::new() };
-        for a in touched.iter().chain(every.iter()) {
-            for k in reg.pools_of(a) {
-                if let Some(e) = reg.pools.get(&k) {
-                    if e.pending_from.is_some_and(|b| b <= block) {
-                        inc(&self.c2.stats.pending_checks);
-                        return Some(format!(
-                            "{} pool {} may still be missing reports from block {} (header bloom says so); settling",
-                            kind_name(e.pool.kind),
-                            e.pool.address,
-                            e.pending_from.unwrap()
-                        ));
-                    }
-                }
-            }
-        }
-        None
+        self.pending_reason_with(&self.c2.check_core(), touched, block, all)
+    }
+
+    pub fn pending_reason_with(&self, core: &super::checkcore::CheckCore, touched: &[Address], block: u64, all: bool) -> Option<String> {
+        let (kind, addr, from) = core.pending_reason(touched, block, all)?;
+        inc(&self.c2.stats.pending_checks);
+        Some(format!("{} pool {} may still be missing reports from block {} (header bloom says so); settling", kind_name(kind), addr, from))
     }
 
     /// If a check's missing items belong to a pool that isn't ready: why.
     pub fn unsure_reason(&self, missing: &[MissItem]) -> Option<String> {
-        let reg = self.c2.reg.read().unwrap();
+        self.unsure_reason_with(&self.c2.check_core(), missing)
+    }
+
+    pub fn unsure_reason_with(&self, core: &super::checkcore::CheckCore, missing: &[MissItem]) -> Option<String> {
         missing.iter().find_map(|m| match m {
-            MissItem::Account(a) | MissItem::Slot(a, _) => reg.blocked_account(a),
+            MissItem::Account(a) | MissItem::Slot(a, _) => core.not_ready.get(a).cloned(),
             MissItem::Code(_) => None,
         })
     }
@@ -985,78 +1023,24 @@ impl Copy2Handle {
     /// of V4 pools ready without a break since their walk, and the V4
     /// PoolManagers' balances (by a proven lower bound).
     pub fn check_facts(&self, block: u64) -> super::checkview::C2Facts {
-        let reg = self.c2.reg.read().unwrap();
-        let mut f = super::checkview::C2Facts { block, ..Default::default() };
+        self.check_facts_with(&self.c2.check_core(), block)
+    }
+
+    /// The registry summary for one check (server.rs: one per check, used
+    /// for its facts, pending and unsure reasons).
+    pub fn core_for(&self, from: Option<&Arc<crate::state::mirror::PubView>>) -> Arc<super::checkcore::CheckCore> {
+        self.c2.check_core_for(from)
+    }
+
+    pub fn check_facts_with(&self, core: &super::checkcore::CheckCore, block: u64) -> super::checkview::C2Facts {
+        // From the registry summary (checkcore.rs): no lock while it is
+        // current, and the sets for the newest blocks are shared.
+        let f = super::checkview::C2Facts::new(block, core.sets_for(block, &self.c2.far_cache));
         // ARBSIM_COPY2_BOUND_FULL=1: always the full PoolManager balance
         // bound (every ready V4 pool), the pre-copy2-p behaviour (slower).
         if super::checkview::bound_full_env() {
             f.full.store(true, Ordering::Relaxed);
         }
-        // protocolFeesAccrued of every coin of our V4 pools (never held:
-        // answered by two runs, counter 0 and not 0; checkview.rs 3.).
-        for e in reg.pools.values().filter(|e| e.pool.kind == PoolKind::V4) {
-            for c in [e.pool.token0, e.pool.token1] {
-                f.fees.insert((e.pool.address, super::checkview::protocol_fee_slot(c)));
-            }
-        }
-        if !reg.pm_bound {
-            return f;
-        }
-        for pm in reg.pms() {
-            f.pms.insert(pm, Vec::new());
-        }
-        for e in reg.pools.values() {
-            if e.pool.kind != PoolKind::V4 {
-                continue;
-            }
-            // Every V4 coin's PoolManager balance goes through the bound
-            // (a value the copy may still hold for it is never used).
-            for c in [e.pool.token0, e.pool.token1] {
-                if c == Address::ZERO {
-                    continue;
-                }
-                let memo = match reg.layouts.get(&c) {
-                    Some(Some(l)) => l.preimage(e.pool.address).map(super::checkview::memo_slot),
-                    _ => None,
-                };
-                if let Some(sl) = memo.or_else(|| reg.bal_slot(c, e.pool.address)) {
-                    f.inject.insert((c, sl), (e.pool.address, c));
-                }
-            }
-            // Exact at this version: ready since then, nothing pending.
-            if e.state != PoolState::Ready || e.ready_since > block || e.pending_from.is_some_and(|b| b <= block) {
-                continue;
-            }
-            if let (Some(fz), Some(_)) = (&e.far_zero, &e.walk) {
-                if fz.block.max(e.ready_since) <= block {
-                    f.far.entry(e.pool.address).or_default().push(fz.slots.clone());
-                    if let Some(id) = e.pool.v4_id {
-                        f.far_of.insert(id, fz.slots.clone());
-                    }
-                }
-            }
-            f.pms.entry(e.pool.address).or_default().push(e.pool.clone());
-        }
-        drop(reg);
-        // One merged far-zero list per account, reused while the same lists
-        // apply (the cache holds the lists themselves, so "same" = the very
-        // same lists, never a look-alike).
-        {
-            let mut cache = self.c2.far_cache.lock().unwrap();
-            for (a, lists) in &f.far {
-                let hit = cache.get(a).filter(|(l, _)| l.len() == lists.len() && l.iter().zip(lists).all(|(x, y)| Arc::ptr_eq(x, y))).map(|(_, m)| m.clone());
-                let merged = match hit {
-                    Some(m) => m,
-                    None => {
-                        let m = super::checkview::merge_lists(lists);
-                        cache.insert(*a, (lists.clone(), m.clone()));
-                        m
-                    }
-                };
-                f.far_merged.insert(*a, merged);
-            }
-        }
-        f.index_pools();
         f
     }
 
@@ -1622,7 +1606,7 @@ pub fn spawn(sh: Arc<Shared>, fills: Arc<FillQueue>, cfg: C2Config) -> Copy2Hand
 pub fn manual(sh: Arc<Shared>, fills: Arc<FillQueue>, cfg: C2Config) -> (Intake, Copy2Handle) {
     let (tx, rx) = std::sync::mpsc::sync_channel(16_384);
     let c2 = Arc::new(C2Shared {
-        reg: RwLock::new(Registry { pm_bound: cfg.pm_bound, ..Registry::default() }),
+        reg: crate::timing::GenLock::new(Registry { pm_bound: cfg.pm_bound, ..Registry::default() }),
         stats: C2Stats::default(),
         last_block: AtomicU64::new(0),
         node_requests: Arc::new(AtomicU64::new(0)),
@@ -1641,6 +1625,8 @@ pub fn manual(sh: Arc<Shared>, fills: Arc<FillQueue>, cfg: C2Config) -> (Intake,
         blocked_by: Mutex::new(HashMap::new()),
         unfollowed_changes: Mutex::new(HashMap::new()),
         far_cache: Mutex::new(HashMap::new()),
+        core: Mutex::new(Arc::new(super::checkcore::CheckCore::default())),
+        mirror: sh.clone(),
         resume: Mutex::new(serde_json::Map::new()),
     });
     let loaders = sh
@@ -1925,6 +1911,9 @@ impl Intake {
             while let Some((&b, _)) = self.pending.iter().next().filter(|_| self.catchup.is_none()) {
                 let m = self.pending.remove(&b).unwrap();
                 self.process(m);
+                // Checks about this block find the registry summary ready
+                // (checkcore.rs; rebuilt only if the registry changed).
+                let _ = self.c2.check_core();
             }
             if let Some((r, out, block)) = self.load_q.pop_front() {
                 self.on_load_one(r, out, block);
@@ -1963,6 +1952,7 @@ impl Intake {
             self.prune_touched();
             self.expire_parked();
         }
+        let _ = self.c2.check_core();
     }
 
     fn new_job(&mut self, f: JobFor) -> u64 {

@@ -102,12 +102,13 @@ use crate::state::{Lookup, StatePosition, StateRead};
 
 type U512 = Uint<512, 8>;
 
-/// What the copy vouches for in one check (built from the registry per check).
-#[derive(Default)]
-pub struct C2Facts {
-    /// The version's block.
-    pub block: u64,
-    /// Account -> sorted zero far words valid at `block` (one list per pool).
+/// What the copy vouches for at one block: the sets a check reads. Built
+/// from copy 2's pool registry (intake.rs CheckCore), shared by every check
+/// whose block they are valid for (copy2-q: was rebuilt per check, ~14 ms
+/// live with ~290 V4 pools on a busy 2-vCPU server).
+#[derive(Clone, Default)]
+pub struct FactSets {
+    /// Account -> sorted zero far words valid at the block (one list per pool).
     pub far: HashMap<Address, Vec<Arc<Vec<U256>>>>,
     /// The same, all of an account's lists merged into one sorted list
     /// (lookups: one binary search instead of one per pool).
@@ -117,35 +118,21 @@ pub struct C2Facts {
     /// (PoolManager, a pool's slot0 slot) -> pool id: a run that read it
     /// traded on (or looked at) that pool.
     pub bases: HashMap<(Address, U256), B256>,
-    /// true: bounds over every pool in `pms` (else only the pools the run
-    /// touched before it first read the balance).
-    pub full: AtomicBool,
-    /// A bound was computed from fewer pools than `full` would use.
-    pub partial_used: AtomicBool,
     /// (coin, slot) = a V4 PoolManager's balance of that coin -> (PoolManager, coin).
     pub inject: HashMap<(Address, U256), (Address, Address)>,
     /// Every V4 PoolManager we follow pools in -> our V4 pools whose values
-    /// are exact at `block` (ready since <= block, no report pending): the
-    /// lower bound's pools (may be empty: bound 0).
+    /// are exact at the block (ready since <= block, no report pending):
+    /// the lower bound's pools (may be empty: bound 0).
     pub pms: HashMap<Address, Vec<TrackedPool>>,
-    /// Lower bounds computed so far: (PoolManager, coin; ZERO = ETH) -> bound.
-    pub cache: Mutex<HashMap<(Address, Address), U256>>,
     /// (PoolManager, slot) = protocolFeesAccrued[coin] for a coin of one of
     /// our V4 pools there: a check reads it as 0 or 1 (C2View.fee), never
     /// as a held value (see the header, 3.).
-    pub fees: std::collections::HashSet<(Address, U256)>,
+    pub fees: HashSet<(Address, U256)>,
 }
 
-impl C2Facts {
+impl FactSets {
     pub fn is_empty(&self) -> bool {
         self.far.is_empty() && self.inject.is_empty() && self.pms.is_empty() && self.fees.is_empty()
-    }
-
-    /// From now on, bounds over every pool (the cheaper bound wasn't
-    /// enough): forget the bounds computed so far.
-    pub fn go_full(&self) {
-        self.full.store(true, Ordering::Relaxed);
-        self.cache.lock().unwrap().clear();
     }
 
     /// Fill `far_merged` / `far_of` / `bases` from `far` and `pms` (no cache).
@@ -156,7 +143,7 @@ impl C2Facts {
         self.index_pools();
     }
 
-    /// `bases` and `far_of` (per pool) from `pms` and the per-pool lists.
+    /// `bases` from `pms`.
     pub fn index_pools(&mut self) {
         for (pm, pools) in &self.pms {
             for p in pools {
@@ -165,6 +152,41 @@ impl C2Facts {
                 }
             }
         }
+    }
+}
+
+/// One check's facts: the (shared) sets plus this check's own bounds.
+#[derive(Default)]
+pub struct C2Facts {
+    /// The version's block.
+    pub block: u64,
+    pub sets: Arc<FactSets>,
+    /// true: bounds over every pool in `pms` (else only the pools the run
+    /// touched before it first read the balance).
+    pub full: AtomicBool,
+    /// A bound was computed from fewer pools than `full` would use.
+    pub partial_used: AtomicBool,
+    /// Lower bounds computed so far: (PoolManager, coin; ZERO = ETH) -> bound.
+    pub cache: Mutex<HashMap<(Address, Address), U256>>,
+}
+
+impl std::ops::Deref for C2Facts {
+    type Target = FactSets;
+    fn deref(&self) -> &FactSets {
+        &self.sets
+    }
+}
+
+impl C2Facts {
+    pub fn new(block: u64, sets: Arc<FactSets>) -> Self {
+        C2Facts { block, sets, ..Default::default() }
+    }
+
+    /// From now on, bounds over every pool (the cheaper bound wasn't
+    /// enough): forget the bounds computed so far.
+    pub fn go_full(&self) {
+        self.full.store(true, Ordering::Relaxed);
+        self.cache.lock().unwrap().clear();
     }
 }
 
@@ -737,9 +759,10 @@ mod tests {
             }
         }
         let st = Fake(m, pm);
-        let mut f = C2Facts::default();
-        f.pms.insert(pm, vec![p1.clone(), p2.clone()]);
-        f.index_pools();
+        let mut sets = FactSets::default();
+        sets.pms.insert(pm, vec![p1.clone(), p2.clone()]);
+        sets.index_pools();
+        let f = C2Facts::new(0, Arc::new(sets));
         let one = {
             let v = C2View::new(&st, &f, U256::ZERO);
             let _ = v.storage(pm, pool_base_slot(p1.v4_id.unwrap()));
@@ -750,9 +773,10 @@ mod tests {
         let both = C2View::new(&st, &f, U256::ZERO).lower_bound(pm, p1.token0);
         assert_eq!(both, one + one, "full: both pools (same shape)");
         // Nothing touched: the first pool with a non-zero bound (never 0).
-        let mut f2 = C2Facts::default();
-        f2.pms.insert(pm, vec![p1, p2]);
-        f2.index_pools();
+        let mut sets2 = FactSets::default();
+        sets2.pms.insert(pm, vec![p1, p2]);
+        sets2.index_pools();
+        let f2 = C2Facts::new(0, Arc::new(sets2));
         assert_eq!(C2View::new(&st, &f2, U256::ZERO).lower_bound(pm, Address::with_last_byte(1)), one);
     }
 

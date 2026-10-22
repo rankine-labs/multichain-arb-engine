@@ -2742,6 +2742,9 @@ localSim = createLocalSimHost(chainOn('robinhood'), {
       // runs in pool-events mode.
       copy2Pools: () => copy2PoolKeys().map((k) => cache.get('robinhood', k)),
       poolManager: ROBINHOOD_V4.POOL_MANAGER,
+      // Copy 2 vs node disagreements: the node again, pinned at the copy's
+      // block (tells "market moved" from "copy wrong"; a few an hour at most).
+      nodeAtBlock: (q, blockTag) => simulateRoundTrip(simRpc.robinhood, 'robinhood', q.trade, { ...q.simOpts, blockTag }),
       warmSource: () => {
             const out: string[] = [];
             const exec = executorConfig('robinhood').executorAddress;

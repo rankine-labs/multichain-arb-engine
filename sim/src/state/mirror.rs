@@ -181,6 +181,106 @@ impl Published {
     }
 }
 
+/// What checks read: a copy of Published taken when its last write lock
+/// was released (copy2-q, live Oct 22 20:00: the copy-keeping thread held
+/// the lock up to ~200 ms while folding node values into every kept
+/// version, and checks waited). Checks never take the lock: they get the
+/// state as it was just before that write began, exactly what a check that
+/// came a moment earlier would have seen.
+#[derive(Debug, Default)]
+pub struct PubView {
+    pub versions: VecDeque<Arc<Version>>,
+    pub received_seq: Option<u64>,
+    pub last_frame: Option<Instant>,
+    pub stalled: Option<String>,
+}
+
+impl PubView {
+    pub fn head(&self) -> Option<&Arc<Version>> {
+        self.versions.back()
+    }
+}
+
+/// The lock around Published, plus the readers' copy (PubView) and the
+/// "newest block received" note that the socket threads update without
+/// the lock (a block message must never wait for the copy's thread: the
+/// bot's checks on the same connection are read after it).
+#[derive(Default)]
+pub struct PubLock {
+    inner: RwLock<Published>,
+    view: Mutex<Arc<PubView>>,
+    /// (last message time, newest block received) noted by socket threads.
+    recv: Mutex<(Option<Instant>, Option<u64>)>,
+}
+
+/// Write guard: on release, the readers' copy is refreshed (a copy of 64
+/// pointers, ~1 us) while the lock is still held.
+pub struct PubWriteGuard<'a> {
+    g: std::sync::RwLockWriteGuard<'a, Published>,
+    lock: &'a PubLock,
+}
+
+impl PubLock {
+    pub fn read(&self) -> std::sync::LockResult<std::sync::RwLockReadGuard<'_, Published>> {
+        self.inner.read()
+    }
+    pub fn write(&self) -> std::sync::LockResult<PubWriteGuard<'_>> {
+        let g = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        Ok(PubWriteGuard { g, lock: self })
+    }
+    /// The readers' copy (never waits for a writer).
+    pub fn view(&self) -> Arc<PubView> {
+        self.view.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+    /// A block message arrived (socket threads; never waits for the copy).
+    pub fn note_received(&self, seq: u64) {
+        let mut r = self.recv.lock().unwrap_or_else(|e| e.into_inner());
+        r.0 = Some(Instant::now());
+        r.1 = Some(r.1.map_or(seq, |x| x.max(seq)));
+    }
+    /// (last message time, newest received) from both notes.
+    pub fn received(&self, v: &PubView) -> (Option<Instant>, Option<u64>) {
+        let r = *self.recv.lock().unwrap_or_else(|e| e.into_inner());
+        let lf = match (v.last_frame, r.0) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        };
+        let rs = match (v.received_seq, r.1) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        };
+        (lf, rs)
+    }
+}
+
+impl std::ops::Deref for PubWriteGuard<'_> {
+    type Target = Published;
+    fn deref(&self) -> &Published {
+        &self.g
+    }
+}
+
+impl std::ops::DerefMut for PubWriteGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Published {
+        &mut self.g
+    }
+}
+
+impl Drop for PubWriteGuard<'_> {
+    fn drop(&mut self) {
+        let p = &*self.g;
+        let v = Arc::new(PubView { versions: p.versions.clone(), received_seq: p.received_seq, last_frame: p.last_frame, stalled: p.stalled.clone() });
+        *self.lock.view.lock().unwrap_or_else(|e| e.into_inner()) = v;
+    }
+}
+
+impl<'a> crate::timing::WriteLock<'a> for PubLock {
+    type Guard = PubWriteGuard<'a>;
+    fn lock_write(&'a self) -> Self::Guard {
+        self.write().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Counters
 // ---------------------------------------------------------------------------
@@ -223,7 +323,7 @@ impl Stats {
 /// Everything readers and the background threads share.
 pub struct Shared {
     pub cfg: Config,
-    pub published: RwLock<Published>,
+    pub published: PubLock,
     /// Signalled every time a version is published (checks waiting for it).
     pub changed: (Mutex<u64>, Condvar),
     pub stats: Stats,
@@ -269,13 +369,16 @@ pub struct Picked {
     pub snap: Arc<Snapshot>,
     pub ctx: BlockCtx,
     pub seq: u64,
+    /// The readers' copy it was picked from (copy 2: a registry summary
+    /// built while this very copy was current may be used, checkcore.rs).
+    pub from: Option<Arc<PubView>>,
 }
 
 impl Shared {
     pub fn new(cfg: Config, node: Option<Arc<dyn NodeApi>>, volatile: Arc<Volatile>) -> Arc<Self> {
         Arc::new(Shared {
             cfg,
-            published: RwLock::new(Published::default()),
+            published: PubLock::default(),
             changed: (Mutex::new(0), Condvar::new()),
             stats: Stats::default(),
             volatile,
@@ -313,7 +416,7 @@ impl Shared {
 
     /// The head version, if any.
     pub fn head(&self) -> Option<Arc<Version>> {
-        self.published.read().unwrap().head().cloned()
+        self.published.view().head().cloned()
     }
 
     /// Find the version for a live `at` (not Pinned). Waits up to
@@ -335,16 +438,18 @@ impl Shared {
     }
 
     fn try_resolve(&self, at: &At) -> Result<Picked, NotSure> {
-        let p = self.published.read().unwrap();
+        // The readers' copy: never waits for the copy-keeping thread.
+        let p = self.published.view();
         if let Some(why) = &p.stalled {
             return Err(NotSure::new("not_ready", why.clone()));
         }
         let Some(head) = p.head() else { return Err(NotSure::new("not_ready", "no feed messages replayed yet")) };
-        let fresh = p.last_frame.is_some_and(|t| t.elapsed() <= Duration::from_millis(self.cfg.max_stale_ms));
-        let received = p.received_seq.unwrap_or(head.seq);
+        let (last_frame, received_seq) = self.published.received(&p);
+        let fresh = last_frame.is_some_and(|t| t.elapsed() <= Duration::from_millis(self.cfg.max_stale_ms));
+        let received = received_seq.unwrap_or(head.seq);
         let pick = |v: &Arc<Version>, snap: Arc<Snapshot>| -> Result<Picked, NotSure> {
             match &v.ctx {
-                Some(c) => Ok(Picked { snap, ctx: c.clone(), seq: v.seq }),
+                Some(c) => Ok(Picked { snap, ctx: c.clone(), seq: v.seq, from: Some(p.clone()) }),
                 None => Err(NotSure::new("not_ready", format!("block {} has no block details (repaired from a node trace)", v.block))),
             }
         };
@@ -403,7 +508,8 @@ impl Shared {
 
     /// The `status` answer body.
     pub fn status_json(&self) -> Value {
-        let p = self.published.read().unwrap();
+        let p = self.published.view();
+        let (last_frame, received_seq) = self.published.received(&p);
         let head = p.head();
         let (accounts, slots, codes) = head.map(|h| h.snap.counts()).unwrap_or((0, 0, 0));
         let mut m = self.stats.json();
@@ -411,7 +517,7 @@ impl Shared {
         let ds = self.dirty_since_ms.load(Ordering::Relaxed);
         let cur_dirty = if ds > 0 { self.now_ms().saturating_sub(ds) } else { 0 };
         m.insert("dirty_ms_total".into(), json!(self.stats.dirty_ms_total.load(Ordering::Relaxed) + cur_dirty));
-        let received = p.received_seq;
+        let received = received_seq;
         let dirty_from = match (head, received) {
             (Some(h), Some(r)) if r > h.seq => Some(h.seq + 1),
             _ => None,
@@ -425,7 +531,7 @@ impl Shared {
             "receivedSeq": received,
             "overlayDepth": p.versions.len(),
             "dirtyFrom": dirty_from,
-            "lastFrameAgoMs": p.last_frame.map(|t| t.elapsed().as_millis() as u64),
+            "lastFrameAgoMs": last_frame.map(|t| t.elapsed().as_millis() as u64),
             "accounts": accounts,
             "slots": slots,
             "codes": codes,
