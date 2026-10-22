@@ -148,6 +148,41 @@ function v4Of(p: PoolState) { return (p as any).v4 as { poolManager: string; fee
     const liq = (await rpc('eth_getStorageAt', [PM, hex(BigInt(baseSlot) + 3n), BLOCKS[0]])).result;
     say(`v4 ${p.poolAddress.slice(0, 10)} slot0 ${s0} liquidity ${liq}`);
   }
+  // What happened on the RIVN/USDG pools (and RIVN itself) just before each
+  // mismatch block: logs are kept for old blocks even where state is not.
+  if (process.env.PROBE_LOGS) {
+    const names: Record<string, string> = {
+      [ethers.id('Swap(bytes32,address,int128,int128,uint160,uint128,int24,uint24)')]: 'V4 Swap',
+      [ethers.id('ModifyLiquidity(bytes32,address,int24,int24,int256,bytes32)')]: 'V4 ModifyLiquidity',
+      [ethers.id('Swap(address,address,int256,int256,uint160,uint128,int24)')]: 'V3 Swap',
+      [ethers.id('Mint(address,address,int24,int24,uint128,uint256,uint256)')]: 'V3 Mint',
+      [ethers.id('Burn(address,int24,int24,uint128,uint256,uint256)')]: 'V3 Burn',
+      [ethers.id('Collect(address,address,int24,int24,uint128,uint128)')]: 'V3 Collect',
+      [ethers.id('Transfer(address,address,uint256)')]: 'Transfer',
+    };
+    const v4ids = pools.filter((p) => v4Of(p)).map((p) => p.poolAddress.toLowerCase());
+    const v3s = pools.filter((p) => !v4Of(p)).map((p) => p.poolAddress.toLowerCase());
+    const back = Number(process.env.PROBE_LOGS);
+    for (const b of MISMATCH_BLOCKS.split(',')) {
+      const n = parseInt(b, 16);
+      say(`== logs ${n - back}..${n + 2} (mismatch block ${n})`);
+      const r = await rpc('eth_getLogs', [{ address: [PM, coin, ...v3s], fromBlock: hex(n - back), toBlock: hex(n + 2) }]);
+      if (r.error) { say(`  ERR ${short(r.error, 160)}`); continue; }
+      for (const l of r.result ?? []) {
+        const a = String(l.address).toLowerCase();
+        const nm = names[l.topics[0]] ?? l.topics[0].slice(0, 10);
+        if (a === PM && !v4ids.includes(String(l.topics[1]).toLowerCase())) continue;
+        if (a === coin && nm === 'Transfer') {
+          const from = '0x' + String(l.topics[1]).slice(26), to = '0x' + String(l.topics[2]).slice(26);
+          say(`  ${parseInt(l.blockNumber, 16)}/${parseInt(l.logIndex, 16)} RIVN Transfer ${from.slice(0, 10)} -> ${to.slice(0, 10)} ${BigInt(l.data)} tx ${String(l.transactionHash).slice(0, 12)}`);
+          continue;
+        }
+        if (a === coin) { say(`  ${parseInt(l.blockNumber, 16)} RIVN event ${nm} topics ${short(l.topics.slice(1), 200)} data ${String(l.data).slice(0, 200)}`); continue; }
+        say(`  ${parseInt(l.blockNumber, 16)}/${parseInt(l.logIndex, 16)} ${a === PM ? 'v4' : a.slice(0, 10)} ${nm} ${short(l.topics.slice(2), 140)} data ${String(l.data).slice(2).match(/.{64}/g)?.map((w: string) => { const v = BigInt('0x' + w); return v > (1n << 255n) ? '-' + ((1n << 256n) - v).toString() : v.toString(); }).join(' ')} tx ${String(l.transactionHash).slice(0, 12)}`);
+      }
+    }
+    process.exit(0);
+  }
   const sizes = (process.env.PROBE_SIZES ?? '30,100,300,1000,3000').split(',').map(Number);
   type Hit = { b: string; buy: PoolState; sell: PoolState; usd: number; amountIn: bigint; hops: any[]; status: string; gas: number; reason: string };
   const hits: Hit[] = [];
