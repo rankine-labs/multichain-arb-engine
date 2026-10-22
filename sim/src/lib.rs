@@ -5,6 +5,7 @@
 // StateDiff}, arb::{BlockCtx, block_env, configure_cfg, ArbPrecompiles}.
 // ============================================================================
 pub mod arb;
+pub mod bench_node;
 pub mod check;
 pub mod copy2;
 pub mod feed;
