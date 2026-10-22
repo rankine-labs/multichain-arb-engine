@@ -352,7 +352,7 @@ fn v2_sync(r0: u128, r1: u128, block: u64, tx: u32, li: u32) -> PoolLog {
     lg(a(V2P), vec![topics().v2_sync], data(&[u(r0), u(r1)]), block, tx, li)
 }
 fn msg(block: u64, ts: u64, logs: Vec<PoolLog>) -> BlockMsg {
-    BlockMsg { block, timestamp: ts, l1_block: Some(9_000), base_fee: Some(10), prev_block: None, logs, tick: false, bloom: None }
+    BlockMsg { block, timestamp: ts, l1_block: Some(9_000), base_fee: Some(10), prev_block: None, logs, tick: false, gap_reason: None, bloom: None }
 }
 fn tick(block: u64, ts: u64) -> BlockMsg {
     BlockMsg { tick: true, ..msg(block, ts, vec![]) }
@@ -591,6 +591,55 @@ fn lost_message_reloads_everything() {
     assert_eq!(r.state(&v2_pool()).0, PoolState::Unsure);
     assert_eq!(r.state(&sol_pool()).0, PoolState::Unsure);
     assert_eq!(r.h.status_json(false)["counters"]["gaps"], json!(1));
+}
+
+/// Oct 22 live failure: the bot sent "reload every pool" (prevBlock = this
+/// block) every 2-25 s. Each signal used to count as a strike against EVERY
+/// pool, doubling its wait before reloading (2 s, 4 s, ... 10 min), so after
+/// a burst the copy sat at 0 loading / all unsure for minutes. Now: no
+/// strike, one reload per pool, the reason counted in status, and the pools
+/// come back as soon as the signals stop.
+#[test]
+fn gap_signal_burst_does_not_keep_the_copy_unsure() {
+    let cfg = C2Config { reload_ms: 40, reload_max_ms: 600_000, ..C2Config::for_tests() };
+    let mut r = rig_with(cfg);
+    r.track(vec![v2_pool(), sol_pool()]);
+    r.send(tick(100, 60));
+    assert_eq!(r.state(&v2_pool()).0, PoolState::Ready);
+    // A burst of 12 "I missed something" signals (prevBlock = the block itself).
+    for b in 101..=112u64 {
+        let mut m = tick(b, 60 + b - 100);
+        m.prev_block = Some(b);
+        m.gap_reason = Some("block time unknown".into());
+        r.intake.process(m);
+        r.intake.pump();
+    }
+    assert_eq!(r.state(&v2_pool()).0, PoolState::Unsure);
+    {
+        let reg = r.h.c2.reg.read().unwrap();
+        for e in reg.pools.values() {
+            assert_eq!(e.strikes, 0, "a gap signal is not the pool's fault: no strike");
+            assert!(e.retry_at <= std::time::Instant::now() + std::time::Duration::from_millis(40), "reload not pushed back by the burst");
+        }
+    }
+    let st = r.h.status_json(false);
+    assert_eq!(st["counters"]["gaps"], json!(12));
+    assert_eq!(st["gapReasons"]["block time unknown"], json!(12), "{st}");
+    // The signals stop: the next blocks arrive in order, pools reload once.
+    std::thread::sleep(std::time::Duration::from_millis(60));
+    let mut m = tick(113, 73);
+    m.prev_block = Some(112);
+    r.send(m);
+    let mut m = tick(114, 74);
+    m.prev_block = Some(113);
+    r.send(m);
+    assert_eq!(r.state(&v2_pool()).0, PoolState::Ready, "{:?}", r.state(&v2_pool()));
+    assert_eq!(r.state(&sol_pool()).0, PoolState::Ready, "{:?}", r.state(&sol_pool()));
+    // A message really lost between bot and copy (no reason, prev != block).
+    let mut m = tick(120, 80);
+    m.prev_block = Some(119);
+    r.intake.process(m);
+    assert_eq!(r.h.status_json(false)["gapReasons"]["message lost on the way"], json!(1));
 }
 
 #[test]

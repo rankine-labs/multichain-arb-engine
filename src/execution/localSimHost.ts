@@ -317,6 +317,13 @@ export class LocalSimHost {
       localMs: [] as number[], nodeMs: [] as number[], seenToAnswerMs: [] as number[],
       unknownWhy: {} as Record<string, number>,
       mismatchNew: 0, autoOffs: 0,
+      // Copy 2 only (checks asked about a copy-2 block, at:{block}): the
+      // fast check's answer against the node's, so practice mode
+      // (LOCAL_SIM=shadow) shows how accurate copy 2 is before it decides.
+      //   same / different: both sure, verdicts agree / disagree
+      //   unknown: the fast check wasn't sure (the node answered)
+      //   noNode: the node gave no usable answer (not compared)
+      c2: { checks: 0, same: 0, different: 0, unknown: 0, noNode: 0 },
     };
   }
 
@@ -594,6 +601,17 @@ export class LocalSimHost {
       const both = l.sure && nv !== undefined && nv !== 'unknown';
       const same = both && l.verdict === nv;
       if (both) { this.hour.compared++; if (same) this.hour.same++; }
+      // Copy 2 (asked about a block the copy follows): its own tally.
+      const c2Block = (c.q.at as { block?: unknown } | undefined)?.block;
+      const isC2 = typeof c2Block === 'string';
+      if (isC2) {
+        const t = this.hour.c2;
+        t.checks++;
+        if (!l.sure) t.unknown++;
+        else if (nv === undefined || nv === 'unknown') t.noNode++;
+        else if (same) t.same++;
+        else t.different++;
+      }
       if (c.sampled && both) this.noteSample(same);
       if (this.hour.localMs.length > 5_000) { this.hour.localMs.shift(); }
       if (this.hour.nodeMs.length > 5_000) { this.hour.nodeMs.shift(); }
@@ -609,6 +627,8 @@ export class LocalSimHost {
         nr: node?.sim && 'reason' in node.sim ? node.sim.reason.slice(0, 80) : node?.sim && node.sim.status !== 'profit' && node.sim.status !== 'loss' ? node.sim.status : undefined,
         nms: node ? node.endMs - node.startMs : undefined, nseen: node && seen !== undefined ? node.endMs - seen : undefined, nwhere: node?.where,
         same: both ? same : undefined, dec: c.decidedByLocal ? 'local' : 'node', smp: c.sampled || undefined,
+        // copy 2: the block the fast check was asked about (absent = not a copy-2 check)
+        c2blk: isC2 ? c2Block : undefined,
         // timestamps (clock ms): trigger seen in feed, question sent, answer back
         seen, sent: l.requestMs, ans: l.answerMs,
       });
@@ -656,6 +676,7 @@ export class LocalSimHost {
     if (h.down) line += `; sidecar down for ${h.down} checks`;
     if (h.mismatchNew) line += `; ${h.mismatchNew} replay mismatch(es)`;
     if (h.autoOffs) line += '; STEPPED BACK to practice';
+    if (h.c2.checks) line += `; copy 2 vs node: ${h.c2.checks} checks, same ${h.c2.same}, different ${h.c2.different}, fast check unsure ${h.c2.unknown}${h.c2.noNode ? `, node no answer ${h.c2.noNode}` : ''} (same answer ${pct(h.c2.same, h.c2.same + h.c2.different)})`;
     if (c2) line += `; ${c2}`;
     const whys = Object.entries(h.unknownWhy).sort((a, b) => b[1] - a[1]).slice(0, 3).map(([w, n]) => `${w} ${n}`).join(', ');
     this.log(`[local-sim] hour: ${line}${whys ? ` | unknown because: ${whys}` : ''}${h.errors ? ` | errors ${h.errors}` : ''}${this.shadowLog.dropped ? ` | log lines dropped ${this.shadowLog.dropped}` : ''}`);

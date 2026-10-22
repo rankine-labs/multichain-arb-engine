@@ -112,7 +112,10 @@ export class BlockAssembler {
       // The header was already used and forgotten: take the block time we
       // remembered when the block went out (arbsim needs it on every message).
       const h = this.heads.get(b) ?? this.sentHeads.get(b);
-      const t = !h && !this.headers ? this.timeFor(b) : null;
+      // (Headerless: the block's time from the feed, or the report's own
+      // blockTimestamp when the node put one on it.)
+      const own = num(log?.blockTimestamp);
+      const t = !h && !this.headers ? (this.timeFor(b) ?? (own !== null && own > 0 ? { timestamp: own, l1Block: null } : null)) : null;
       return { block: b, timestamp: h?.timestamp ?? t?.timestamp ?? null, l1Block: h?.l1Block ?? t?.l1Block ?? null, logs: [log], firstLogAt: now, headAt: h?.at ?? null, late: true };
     }
     (this.logs.get(b) ?? this.logs.set(b, []).get(b)!).push(log);

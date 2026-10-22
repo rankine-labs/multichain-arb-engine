@@ -511,3 +511,53 @@ trade ~20 ms.
     copy2_memory -- --nocapture --test-threads=1` (default size 200 pools
     runs in the normal suite and asserts no walk bulge, flat heap and
     <= 400 bytes per walked value).
+- Live go-live failure Oct 22 07:36 UTC (inbot-sim/copy2-j): LOCAL_SIM=on,
+  pool-events, headers off. arbsim logged "message(s) lost (bot's previous
+  block N never arrived; now at N)" every 2-25 s, status 677 pools, 0
+  ready, 0 loading, all unsure "lost message before block N", 0 events.
+  Rolled back at 07:42. Causes (each proven by a test in
+  src/test/copy2LiveFeed.test.ts, which drives the real WebSocket reader
+  with renewals every 5-20 s, the real Copy2Link / forwarder / assembler,
+  a feed whose times sometimes come after the reports, and a free node
+  that lags 0-300 ms; on the old code: 19 and 29 forced reloads in 120 s
+  and 118 / 127 reports silently missing; now 0 and 0):
+  1. Bot: the logs' `blockTimestamp` (Chainstack puts it on every log) was
+     dropped when the forwarder slimmed a log, so the assembler's fallback
+     never worked: every block whose feed message came > 70 ms after its
+     reports was skipped and the copy told to reload (the "time is not
+     known" log line is throttled to once a minute, so 2 lines hid many
+     more). Fixed: kept (proof/blockTimestamp). A block whose time neither
+     the feed nor its reports give is read from the free node
+     (eth_getBlockByNumber, at most COPY2_TIME_READS_PER_MIN=30 a minute,
+     never a guess; past the budget: skipped + reload) (proof/time-read).
+     Late reports also use their own blockTimestamp.
+  2. Bot: the fill-in after a subscription renewal / reconnect read the
+     free node (BLOCK_READER_RPC), which lags the WebSocket node. When it
+     had not reached the first block heard live it gave up (reload); when
+     its newest block was below the first missed block it treated the hole
+     as empty (reports SILENTLY lost). Fixed: the fill-in must reach the
+     sequencer feed's newest block at the moment the new subscription went
+     live and the block before the first one heard live; it asks the node
+     again every 150 ms for up to COPY2_FILL_WAIT_MS=3000, reading only up
+     to what the node has, then merges and passes everything on in order
+     (no reload). Only a node still behind after that (or an error, or >200
+     blocks) reloads. A renewal during a fill-in restarts the fill-in from
+     the same block instead of reloading (proof/fill-in).
+  3. arbsim: every "reload every pool" counted as a strike against every
+     pool and doubled its wait (2 s ... 10 min), and also restarted loads
+     in flight, so a burst left the copy at 0 loading for minutes. Fixed:
+     a lost-message reload is no strike (wait = ARBSIM_COPY2_RELOAD_MS,
+     never shorter than a wait the pool had for its own trouble), and a
+     pool already unsure from an earlier lost-message signal and not
+     loading is left alone (its reload is already due). Test:
+     copy2_intake gap_signal_burst_does_not_keep_the_copy_unsure.
+  Observability: the bot sends `gapReason` with every reload message
+  ("start", "block time unknown", "outage not filled in (HTTP node
+  behind)", "message not handed over (socket busy)", ...); arbsim counts
+  them in status `gapReasons` (+ "message lost on the way" when prevBlock
+  differs without a reason). Bot: `[copy2] on / following N / reports live
+  / forced reloads K (reason n, ...) / outages filled M` (logged when it
+  changes) and one line per forced reload; hourly line adds `forced
+  reloads K (...)` and, for checks asked about a copy-2 block, `copy 2 vs
+  node: N checks, same a, different b, fast check unsure c (same answer
+  x%)` (jsonl field `c2blk`).

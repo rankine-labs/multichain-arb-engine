@@ -191,6 +191,10 @@ async function main() {
     };
     show('why unsure', c2.unsureReasons);
     show('loading now', c2.loadingReasons);
+    // Forced reloads ("reload every pool") by the bot's reason. "start" is
+    // harmless; anything else more than a few an hour: tell Claude.
+    const gr = c2.gapReasons && typeof c2.gapReasons === 'object' ? Object.entries(c2.gapReasons) : [];
+    if (gr.length) lines.push(`    forced reloads (every pool): ${gr.sort((a, b) => b[1] - a[1]).map(([w, v]) => `${w} ${n(v)}`).join(', ')}`);
   }
 
   // 3. How the copy is kept current (copy 1, the feed replay)

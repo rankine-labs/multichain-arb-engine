@@ -137,6 +137,10 @@ pub struct BlockMsg {
     pub prev_block: Option<u64>,
     pub logs: Vec<PoolLog>,
     pub tick: bool,
+    /// Why the bot says "reload every pool" (its `gapReason`, sent with
+    /// gap:true / prevBlock = this block): counted per reason in status
+    /// (`gapReasons`), so a live run shows what keeps forcing reloads.
+    pub gap_reason: Option<String>,
     /// The block header's logsBloom (256 bytes), if the bot sends it. With
     /// it the copy notices pools whose reports for this block may not have
     /// arrived yet (see "pending" in the header), instead of answering
@@ -273,6 +277,7 @@ pub fn parse_block_msg(v: &Value) -> Result<BlockMsg, String> {
         prev_block: num(v.get("prevBlock")),
         logs,
         tick,
+        gap_reason: v.get("gapReason").and_then(|x| x.as_str()).map(|x| x.chars().take(80).collect()),
         bloom: v.get("logsBloom").and_then(|b| b.as_str()).and_then(|b| parse_bytes(b).ok()).map(|b| b.to_vec()).filter(|b| b.len() == 256),
     })
 }
@@ -541,6 +546,8 @@ pub struct C2Shared {
     /// Why new tick walks are not sent right now (None = they are): the
     /// slot cap or the memory guard (status poolCoverage.walkPaused).
     pub walk_paused: Mutex<Option<String>>,
+    /// Lost-message reloads by the bot's reason (status `gapReasons`).
+    pub gap_reasons: Mutex<HashMap<String, u64>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -819,6 +826,8 @@ impl Copy2Handle {
                                          "mismatch": lr.out.mismatch, "otherUnsure": lr.out.other_unsure } },
             "coinsWithLayout": reg.layouts.values().filter(|l| l.is_some()).count(),
             "coinsWithoutLayout": reg.layouts.values().filter(|l| l.is_none()).count(),
+            // Reloads the bot asked for (or messages lost), by reason.
+            "gapReasons": self.c2.gap_reasons.lock().unwrap().clone(),
             "unsureReasons": top_reasons(reg.pools.values().filter(|e| e.state == PoolState::Unsure).map(|e| e.reason.as_str())),
             "loadingReasons": top_reasons(reg.pools.values().filter(|e| e.state == PoolState::Loading).map(|e| e.reason.as_str())),
             "counters": Value::Object(self.c2.stats.json()),
@@ -1123,6 +1132,7 @@ pub fn manual(sh: Arc<Shared>, fills: Arc<FillQueue>, cfg: C2Config) -> (Intake,
         miss_accounts: Mutex::new(HashMap::new()),
         check_accounts: Mutex::new(HashMap::new()),
         walk_paused: Mutex::new(None),
+        gap_reasons: Mutex::new(HashMap::new()),
     });
     let loaders = sh
         .node
@@ -1521,8 +1531,16 @@ impl Intake {
         if let (Some(prev), Some(&first)) = (m.prev_block, self.received.first()) {
             if prev >= first && !self.received.contains(&prev) {
                 inc(&st.gaps);
-                eprintln!("[arbsim] copy2: message(s) lost (bot's previous block {prev} never arrived; now at {}); reloading every pool", m.block);
-                self.unsure_all(&format!("lost message before block {}", m.block), m.block);
+                // prevBlock == this block is the bot saying "I missed something"
+                // (with its reason); anything else is a message lost between us.
+                let why = match (&m.gap_reason, prev == m.block) {
+                    (Some(r), _) => r.clone(),
+                    (None, true) => "bot gave no reason".to_string(),
+                    (None, false) => "message lost on the way".to_string(),
+                };
+                *self.c2.gap_reasons.lock().unwrap().entry(why.clone()).or_default() += 1;
+                eprintln!("[arbsim] copy2: message(s) lost (bot's previous block {prev} never arrived; now at {}; why: {why}); reloading every pool", m.block);
+                self.reload_all_after_gap(&format!("lost message before block {}", m.block), m.block);
                 // The buffer has a hole: no load may carry across it.
                 self.buf.clear();
             }
@@ -2045,11 +2063,24 @@ impl Intake {
     /// Mark a pool unsure and forget its values: in the block being built
     /// (`ov`), and in every kept version from `from_block` on.
     fn make_unsure(&mut self, k: PoolKey, why: &str, ov: Option<&mut Overlay>, from_block: u64) {
+        self.make_unsure_with(k, why, ov, from_block, true)
+    }
+
+    /// `strike`: counts against the pool (its wait before reloading doubles
+    /// each time in a row). A reload every pool gets because the bot missed
+    /// something is NOT the pool's fault: no strike (Oct 22 live failure: a
+    /// burst of such signals doubled every pool's wait up to 10 min, so the
+    /// copy sat at 0 loading / all unsure).
+    fn make_unsure_with(&mut self, k: PoolKey, why: &str, ov: Option<&mut Overlay>, from_block: u64, strike: bool) {
         self.partials.remove(&k);
         let forget: Vec<(Address, U256)> = {
             let mut reg = self.c2.reg.write().unwrap();
             let Some(e) = reg.pools.get_mut(&k) else { return };
-            e.strikes = e.strikes.saturating_add(1);
+            let was_ready = e.state == PoolState::Ready;
+            let old_retry = e.retry_at;
+            if strike {
+                e.strikes = e.strikes.saturating_add(1);
+            }
             e.clean_events = 0;
             e.state = PoolState::Unsure;
             e.reason = why.to_string();
@@ -2057,8 +2088,15 @@ impl Intake {
             e.busy = false;
             e.walk = None;
             let walked = std::mem::take(&mut e.walked);
-            let wait = self.backoff(e.strikes, why);
-            e.retry_at = Instant::now() + wait;
+            if strike {
+                let wait = self.backoff(e.strikes, why);
+                e.retry_at = Instant::now() + wait;
+            } else {
+                // Reload soon (the normal first wait), but never sooner than
+                // a wait the pool already had for its own trouble.
+                let soon = Instant::now() + Duration::from_millis(self.cfg.reload_ms);
+                e.retry_at = if was_ready { soon } else { soon.max(old_retry) };
+            }
             e.items.iter().copied().chain(walked).collect()
         };
         inc(&self.c2.stats.unsure_marked);
@@ -2078,6 +2116,10 @@ impl Intake {
     /// Reorg: these pools unsure from `from`, and their coin balances
     /// forgotten too (the reorged transfers changed them).
     fn unsure_from(&mut self, keys: &[PoolKey], why: &str, from: u64) {
+        self.unsure_from_with(keys, why, from, true)
+    }
+
+    fn unsure_from_with(&mut self, keys: &[PoolKey], why: &str, from: u64, strike: bool) {
         let mut slots: Vec<(Address, U256)> = Vec::new();
         {
             let reg = self.c2.reg.read().unwrap();
@@ -2092,7 +2134,7 @@ impl Intake {
             }
         }
         for k in keys {
-            self.make_unsure(*k, why, None, from);
+            self.make_unsure_with(*k, why, None, from, strike);
         }
         let mut p = self.sh.published.write().unwrap();
         rewrite_from(&mut p.versions, from, |s| {
@@ -2102,9 +2144,29 @@ impl Intake {
         });
     }
 
+    #[allow(dead_code)]
     fn unsure_all(&mut self, why: &str, from: u64) {
         let keys: Vec<PoolKey> = self.c2.reg.read().unwrap().pools.keys().copied().collect();
         self.unsure_from(&keys, why, from);
+    }
+
+    /// The bot missed something (or a message was lost): every pool whose
+    /// copy may now lack reports is reloaded, ONCE. Pools already unsure
+    /// from an earlier such signal and not loading yet need nothing new
+    /// (their values are forgotten already, their reload is already due):
+    /// a burst of signals therefore can't keep pushing their reload back.
+    /// Pools ready or loading (a load fetched before this block can't carry
+    /// across the hole) are made unsure without a strike.
+    fn reload_all_after_gap(&mut self, why: &str, from: u64) {
+        let keys: Vec<PoolKey> = {
+            let reg = self.c2.reg.read().unwrap();
+            reg.pools
+                .iter()
+                .filter(|(_, e)| !(e.state == PoolState::Unsure && !e.busy && e.reason.starts_with("lost message")))
+                .map(|(k, _)| *k)
+                .collect()
+        };
+        self.unsure_from_with(&keys, why, from, false);
     }
 
     /// Replace the head version's state (only if it is still at `block`).

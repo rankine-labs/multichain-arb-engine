@@ -337,7 +337,7 @@ fn block_msg(world: &World, b: u64, trades: usize, reserves: &mut HashMap<Addres
         logs.push(lg(p, vec![topics().v2_sync], data(&[U256::from(r.0), U256::from(r.1)]), b, tx, 2));
         logs.push(lg(p, vec![topics().v2_swap, topic_of(user), topic_of(user)], data(&[U256::from(in0), U256::from(in1), U256::from(out0), U256::from(out1)]), b, tx, 3));
     }
-    BlockMsg { block: b, timestamp: 1000 + b, l1_block: Some(9_000), base_fee: Some(10), prev_block: Some(b - 1), logs, tick: false, bloom: None }
+    BlockMsg { block: b, timestamp: 1000 + b, l1_block: Some(9_000), base_fee: Some(10), prev_block: Some(b - 1), logs, tick: false, gap_reason: None, bloom: None }
 }
 
 // ---------------------------------------------------------------------------
@@ -553,7 +553,7 @@ fn small_rig(n: usize, c2cfg: C2Config) -> (Arc<World>, arbsim::copy2::intake::I
 fn run_blocks(world: &World, intake: &mut arbsim::copy2::intake::Intake, h: &arbsim::copy2::intake::Copy2Handle, from: u64, n: u64) {
     let _ = world;
     for b in from..from + n {
-        h.block(BlockMsg { block: b, timestamp: 1000 + b, l1_block: Some(9_000), base_fee: Some(10), prev_block: Some(b - 1), logs: vec![], tick: true, bloom: None });
+        h.block(BlockMsg { block: b, timestamp: 1000 + b, l1_block: Some(9_000), base_fee: Some(10), prev_block: Some(b - 1), logs: vec![], tick: true, gap_reason: None, bloom: None });
         let until = Instant::now() + Duration::from_millis(5);
         while Instant::now() < until {
             intake.pump();

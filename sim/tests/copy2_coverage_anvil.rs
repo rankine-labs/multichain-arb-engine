@@ -345,7 +345,7 @@ impl World {
             self.last_sent = n;
         }
         let bloom = if with_bloom { Some(self.bloom(n)) } else { None };
-        BlockMsg { block: n, timestamp: ts, l1_block: Some(n), base_fee: Some(0), prev_block: prev, tick: logs.is_empty(), logs, bloom }
+        BlockMsg { block: n, timestamp: ts, l1_block: Some(n), base_fee: Some(0), prev_block: prev, tick: logs.is_empty(), logs, gap_reason: None, bloom }
     }
 
     fn send(&mut self, m: BlockMsg) {
