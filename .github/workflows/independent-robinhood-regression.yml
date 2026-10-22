@@ -1,0 +1,27 @@
+# Independent regression CI: tests only, never deploys or uses secrets.
+# Runs on this research branch and PRs, so failures are visible before merge.
+name: Independent Robinhood regression
+on:
+  push:
+    branches:
+      - independent-simulation-regression-20261008
+  pull_request:
+    paths:
+      - 'src/test/robinhoodProfitRegression.test.ts'
+      - '.github/workflows/independent-robinhood-regression.yml'
+permissions:
+  contents: read
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      # Main branch currently has no package-lock.json; npm ci would fail.
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+      - name: Run existing test suite
+        run: npm test
