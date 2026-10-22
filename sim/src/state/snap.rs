@@ -520,6 +520,24 @@ mod tests {
     }
 
     #[test]
+    fn basics_never_hand_out_a_code_body() {
+        // Even if some writer left a body inside the basics (revm's
+        // AccountInfo::default() carries an EMPTY one), readers get none, so
+        // the EVM loads the code by hash (or misses).
+        let mut s = Snapshot::default();
+        let h = revm::primitives::keccak256([0x60u8, 0x01]);
+        let bad = AccountInfo { nonce: 1, code_hash: h, ..Default::default() };
+        assert!(bad.code.is_some());
+        s.accounts.insert(a(3), Acct { basics: Basics::Known(Some(bad)), ..Default::default() });
+        assert_eq!(s.account(a(3)), Lookup::Missing); // code not held: missing
+        s.put_code(h, Bytecode::new_raw(vec![0x60u8, 0x01].into()));
+        match s.account(a(3)) {
+            Lookup::Known(Some(i)) => assert!(i.code.is_none()),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
     fn volatile_accounts_are_always_missing() {
         let mut s = Snapshot::new(Arc::new(Volatile::with_whole(&[a(9)])));
         s.apply_fact(&Fact::Slot(a(9), U256::from(1), U256::from(1)));

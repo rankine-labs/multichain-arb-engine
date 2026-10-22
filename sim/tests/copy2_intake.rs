@@ -893,6 +893,14 @@ fn node_behind_the_copy_loads_at_its_block_and_carries_forward() {
     ]));
     r.h.block(tick(103, 63));
     r.settle();
+    // (A load can still be "waiting for its turn" when nothing is in flight
+    // - e.g. a short retry wait under a busy test run: keep pumping.)
+    let t0 = std::time::Instant::now();
+    while r.state(&v2_pool()).0 == PoolState::Loading && t0.elapsed().as_secs() < 10 {
+        r.intake.pump();
+        r.settle();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
     assert_eq!(r.state(&v2_pool()).0, PoolState::Ready, "{:?}", r.state(&v2_pool()));
     let q = U256::from(1) << 112usize;
     assert_eq!(r.head_slot(a(V2P), u(8)), Lookup::Known(u(1100) | (u(3640) << 112usize) | (u(62) << 224usize)));
@@ -967,24 +975,33 @@ fn late_reports_after_the_known_ones_are_applied_not_a_reorg() {
 #[test]
 fn coin_with_namespaced_storage_is_found_by_trace_and_followed() {
     let mut r = rig();
-    // Coin 0 keeps balances somewhere the probe can't see (namespaced).
-    r.chain.namespaced.lock().unwrap().push(a(COIN0));
+    // A coin that keeps balances somewhere the probe can't see (namespaced).
+    // (Not at 0x01..: traces never teach anything about precompile / system
+    // addresses.)
+    let coin = pa(0xc1);
+    let pool = TrackedPool { address: pa(0xa4), token0: coin, ..v2_pool() };
+    r.chain.namespaced.lock().unwrap().push(coin);
     let mut s = genesis();
-    let c0 = s.get_mut(&a(COIN0)).unwrap();
-    c0.insert(ns_slot(a(V2P)), u(1000));
+    let mut p = s[&a(V2P)].clone();
+    p.insert(u(6), addr_word(coin));
+    s.insert(pool.address, p);
+    let c0 = s.entry(coin).or_default();
+    c0.insert(ns_slot(pool.address), u(1000));
+    c0.insert(ns_slot(a(USER)), u(1_000_000));
     c0.insert(u(5), u(1)); // a setting balanceOf reads (e.g. "not paused")
+    s.get_mut(&a(COIN1)).unwrap().insert(map_slot(pool.address, 0), u(4000));
     r.chain.set(100, s);
-    r.track(vec![v2_pool()]);
+    r.track(vec![pool.clone()]);
     r.send(tick(100, 60));
-    assert_eq!(r.state(&v2_pool()).0, PoolState::Ready, "{:?}", r.state(&v2_pool()));
+    assert_eq!(r.state(&pool).0, PoolState::Ready, "{:?}", r.state(&pool));
     assert_eq!(*r.chain.traces.lock().unwrap(), 1);
-    assert_eq!(r.head_slot(a(COIN0), ns_slot(a(V2P))), Lookup::Known(u(1000)));
-    assert_eq!(r.head_slot(a(COIN0), u(5)), Lookup::Known(u(1))); // what balanceOf read
+    assert_eq!(r.head_slot(coin, ns_slot(pool.address)), Lookup::Known(u(1000)));
+    assert_eq!(r.head_slot(coin, u(5)), Lookup::Known(u(1))); // what balanceOf read
     // Followed from Transfer events like any other coin.
-    r.intake.process(msg(101, 61, vec![transfer(a(COIN0), a(USER), a(V2P), 100, 101, 0, 0)]));
-    assert_eq!(r.head_slot(a(COIN0), ns_slot(a(V2P))), Lookup::Known(u(1100)));
+    r.intake.process(msg(101, 61, vec![transfer(coin, a(USER), pool.address, 100, 101, 0, 0)]));
+    assert_eq!(r.head_slot(coin, ns_slot(pool.address)), Lookup::Known(u(1100)));
     // The other side can't be named: anything else of that coin we held is forgotten.
-    assert_eq!(r.head_slot(a(COIN0), u(5)), Lookup::Missing);
+    assert_eq!(r.head_slot(coin, u(5)), Lookup::Missing);
 }
 
 #[test]

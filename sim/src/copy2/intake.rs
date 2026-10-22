@@ -2044,7 +2044,7 @@ impl Intake {
             (JobFor::Load { pools, .. }, Done::Fetch { block, res, .. }) => self.on_load(pools, block, res),
             (JobFor::Need { key, gen, items }, Done::Fetch { block, res, .. }) => self.on_need(key, gen, items, block, res),
             (JobFor::Fill, Done::Fetch { block, res, .. }) => self.on_fill(block, res),
-            (JobFor::Trace, Done::Trace { coin, holder, res, .. }) => self.on_trace(coin, holder, res),
+            (JobFor::Trace, Done::Trace { coin, holder, block, res, .. }) => self.on_trace(coin, holder, block, res),
             _ => {}
         }
     }
@@ -2052,7 +2052,7 @@ impl Intake {
     /// A balance trace came back: remember the slot (the load then fetches
     /// it at its own block), or mark the pool(s) unsure if no single slot
     /// holds exactly the balance. Node error: ask again in 3 s.
-    fn on_trace(&mut self, coin: Address, holder: Address, res: Result<(U256, Value), crate::node::NodeErr>) {
+    fn on_trace(&mut self, coin: Address, holder: Address, block: u64, res: Result<(U256, Value), crate::node::NodeErr>) {
         let pair = (coin, holder);
         self.tracing.remove(&pair);
         if let Some(n) = self.coins_tracing.get_mut(&coin) {
@@ -2096,23 +2096,19 @@ impl Intake {
                         }
                     }
                 }
-                // The coin's code and the settings balanceOf read: put in
-                // where the copy doesn't know them (like a fill). The balance
-                // itself comes with the pool's load, at its block.
-                let facts: Vec<Fact> = facts.into_iter().filter(|f| !matches!(f, Fact::Slot(a, s, _) if *a == coin && *s == slot)).collect();
-                if let Some(b) = self.last_block {
-                    self.into_head(b, |s| {
-                        for f in &facts {
-                            let known = match f {
-                                Fact::Slot(a, sl, _) => !matches!(s.storage(*a, *sl), Lookup::Missing),
-                                Fact::Basics { addr, .. } => s.accounts.get(addr).is_some_and(|x| x.basics != Basics::Unknown),
-                                _ => true,
-                            };
-                            if !known {
-                                s.apply_fact(f);
-                            }
-                        }
-                    });
+                // The coin's code, a proxy's implementation and the coin
+                // settings balanceOf read: fitted in exactly like a fill, at
+                // the TRACED block (only where the copy doesn't know them;
+                // too old / ahead of the copy = dropped, a check then misses
+                // and a fill reads them). The balance itself comes with the
+                // pool's load, at its block.
+                let facts: Vec<Fetched> = facts.into_iter().filter(|f| !matches!(f, Fetched::Slot(a, s, _) if *a == coin && *s == slot)).collect();
+                if !facts.is_empty() {
+                    {
+                        let mut p = self.sh.published.write().unwrap();
+                        reconcile(&mut p.versions, block, &facts);
+                    }
+                    self.sh.notify();
                 }
             }
             Err(n) => {
@@ -2908,34 +2904,72 @@ fn proxy_target(ov: &Overlay, a: Address) -> Option<Address> {
     }
 }
 
+/// ArbOS / chain-system addresses and precompiles: 0x0 - 0xffff (Ethereum
+/// and Nitro precompiles, 0x0, NodeInterface) and 0xa4b0... (ArbOS state,
+/// the batch poster / coinbase, fee accounts). ArbOS changes these in every
+/// block in ways copy 2 never follows, so nothing about them is ever learned
+/// from a trace (a check that needs them misses, and a fill reads them).
+fn is_system_address(a: &Address) -> bool {
+    let b = a.as_slice();
+    b[..18].iter().all(|x| *x == 0) || (b[0] == 0xa4 && b[1] == 0xb0)
+}
+
+/// One account entry of a prestate trace -> its basics, ONLY when the entry
+/// proves them: a non-empty code body that parses (and matches `codeHash`
+/// when the node gives one), a balance that parses, a nonce that parses
+/// (absent = 0: the tracer leaves zero nonces out). Anything else = None
+/// (the account stays MISSING; never "an account without code").
+fn trace_basics(acct: &Value) -> Option<crate::node::FetchedAccount> {
+    let code = parse_bytes(acct.get("code")?.as_str()?).ok()?;
+    if code.is_empty() {
+        return None;
+    }
+    if let Some(h) = acct.get("codeHash") {
+        let h = parse_u256(h.as_str()?).ok()?;
+        if B256::from(h.to_be_bytes::<32>()) != keccak256(&code) {
+            return None;
+        }
+    }
+    let balance = parse_u256(acct.get("balance")?.as_str()?).ok()?;
+    let nonce = match acct.get("nonce") {
+        None => 0,
+        Some(Value::Number(n)) => n.as_u64()?,
+        Some(Value::String(t)) => parse_u64(t).ok()?,
+        Some(_) => return None,
+    };
+    Some(crate::node::FetchedAccount { balance, nonce, code })
+}
+
 /// A prestate trace of coin.balanceOf(pool): Ok(the one slot of `coin`
-/// holding exactly `bal`) or Err(how many did), plus facts for every
-/// account / value the call read (code, the coin's settings), exact at the
-/// traced block.
-fn read_trace(tr: &Value, coin: Address, bal: U256) -> (Result<U256, usize>, Vec<Fact>) {
+/// holding exactly `bal`) or Err(how many did), plus the values it proves,
+/// exact at the traced block:
+///   - basics of contracts the call ran (the coin, a proxy's implementation),
+///     only with their real code (see trace_basics)
+///   - the coin's own storage it read (its settings, a proxy's
+///     implementation slot); never other accounts' storage
+///   - nothing at all about ArbOS / system addresses or precompiles
+fn read_trace(tr: &Value, coin: Address, bal: U256) -> (Result<U256, usize>, Vec<Fetched>) {
     let mut facts = Vec::new();
     let mut cands = Vec::new();
     let Some(m) = tr.as_object() else { return (Err(0), facts) };
     for (k, acct) in m {
         let Ok(a) = parse_address(k) else { continue };
-        let bal_of = acct.get("balance").and_then(|x| x.as_str()).and_then(|x| parse_u256(x).ok()).unwrap_or_default();
-        let nonce = match acct.get("nonce") {
-            Some(Value::Number(n)) => n.as_u64().unwrap_or(0),
-            Some(Value::String(t)) => parse_u64(t).unwrap_or(0),
-            _ => 0,
-        };
-        let code = acct.get("code").and_then(|x| x.as_str()).and_then(|x| parse_bytes(x).ok()).unwrap_or_default();
-        let fa = crate::node::FetchedAccount { balance: bal_of, nonce, code };
-        let empty = fa.balance.is_zero() && fa.nonce == 0 && fa.code.is_empty();
-        let (info, code) = account_info(if empty { None } else { Some(&fa) });
-        facts.push(Fact::Basics { addr: a, info, code });
+        if is_system_address(&a) {
+            continue;
+        }
+        if let Some(fa) = trace_basics(acct) {
+            facts.push(Fetched::Account(a, Some(fa)));
+        }
+        if a != coin {
+            continue;
+        }
         if let Some(st) = acct.get("storage").and_then(|x| x.as_object()) {
             for (sk, sv) in st {
                 let (Ok(sk), Ok(sv)) = (parse_u256(sk), sv.as_str().map(parse_u256).unwrap_or(Err(String::new()))) else { continue };
-                if a == coin && sv == bal {
+                if sv == bal {
                     cands.push(sk);
                 }
-                facts.push(Fact::Slot(a, sk, sv));
+                facts.push(Fetched::Slot(a, sk, sv));
             }
         }
     }
@@ -2943,7 +2977,7 @@ fn read_trace(tr: &Value, coin: Address, bal: U256) -> (Result<U256, usize>, Vec
     // The candidate itself is added by the caller (as the pool's balance);
     // with no single candidate, no coin value is kept at all.
     if found.is_err() {
-        facts.retain(|f| !matches!(f, Fact::Slot(x, _, _) if *x == coin));
+        facts.retain(|f| !matches!(f, Fetched::Slot(x, _, _) if *x == coin));
     }
     (found, facts)
 }
@@ -3037,4 +3071,83 @@ fn verify_layout(p: &TrackedPool, vals: &HashMap<(Address, U256), U256>, g: impl
         _ => {}
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod trace_tests {
+    use super::*;
+    use crate::node::FetchedAccount;
+
+    fn ad(s: &str) -> Address {
+        parse_address(s).unwrap()
+    }
+    fn hexs(b: &[u8]) -> String {
+        format!("0x{}", b.iter().map(|x| format!("{x:02x}")).collect::<String>())
+    }
+
+    /// The shape this Nitro node's prestateTracer gives for
+    /// USDG.balanceOf(pool) (dry run, 2026-10-21), plus doubtful entries.
+    #[test]
+    fn trace_learns_only_proven_basics_and_only_the_coins_storage() {
+        let coin = ad("0x5fc5360d0400a0fd4f2af552add042d716f1d168");
+        let imp = ad("0x68184c449e1a8f34fa18d289737129fd27b66f8f");
+        let pool = ad("0x00000000000000000000000000000000000a11ce");
+        let bal_slot = map_slot(pool, 0);
+        let impl_slot = parse_u256("0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc").unwrap();
+        let proxy_code = vec![0x60u8, 0x80, 0x60, 0x40, 0x52];
+        let impl_code = vec![0x60u8, 0x01, 0x60, 0x02];
+        let bal = U256::from(123_456u64);
+        let no_code = ad("0x1111111111111111111111111111111111111111");
+        let bad_hash = ad("0x2222222222222222222222222222222222222222");
+        let other = ad("0x3333333333333333333333333333333333333333");
+        let tr = json!({
+            format!("{coin:#x}"): {"balance": "0x0", "nonce": 1, "code": hexs(&proxy_code),
+                "storage": { format!("{impl_slot:#066x}"): format!("{:#066x}", U256::from_be_slice(imp.as_slice())), format!("{bal_slot:#066x}"): format!("{bal:#066x}") }},
+            format!("{imp:#x}"): {"balance": "0x0", "nonce": 1, "code": hexs(&impl_code), "codeHash": format!("{}", keccak256(&impl_code))},
+            "0x0000000000000000000000000000000000000000": {"balance": "0x0"},
+            "0x0000000000000000000000000000000000000071": {"balance": "0x0", "code": "0xfe"},
+            "0x0000000000000000000000000000000000000072": {"balance": "0x0", "code": "0xfe"},
+            "0xa4b00000000000000000000000000000000000f6": {"balance": "0x1"},
+            "0xa4b000000000000000000073657175656e636572": {"balance": "0x5"},
+            "0xa4b05fffffffffffffffffffffffffffffffffff": {"balance": "0x0", "nonce": 1, "storage": {"0x0000000000000000000000000000000000000000000000000000000000000001": "0x0000000000000000000000000000000000000000000000000000000000000002"}},
+            format!("{no_code:#x}"): {"balance": "0x0", "nonce": 1},
+            format!("{bad_hash:#x}"): {"balance": "0x0", "nonce": 1, "code": "0x6001", "codeHash": format!("{}", keccak256([0x60u8, 0x02]))},
+            format!("{other:#x}"): {"balance": "0x0", "nonce": 1, "code": "0x6001", "storage": {"0x0000000000000000000000000000000000000000000000000000000000000009": "0x0000000000000000000000000000000000000000000000000000000000000001"}},
+        });
+        let (found, facts) = read_trace(&tr, coin, bal);
+        assert_eq!(found, Ok(bal_slot));
+        let accounts: Vec<Address> = facts.iter().filter_map(|f| match f { Fetched::Account(a, _) => Some(*a), _ => None }).collect();
+        // Real code only; never system addresses, never code-less basics.
+        let mut want = vec![coin, imp, other];
+        want.sort();
+        let mut got = accounts.clone();
+        got.sort();
+        assert_eq!(got, want, "{facts:?}");
+        for f in &facts {
+            match f {
+                Fetched::Account(_, Some(FetchedAccount { code, .. })) => assert!(!code.is_empty()),
+                Fetched::Account(a, None) => panic!("learned {a} as an empty account"),
+                Fetched::Slot(a, _, _) => assert_eq!(*a, coin, "storage of another account learned"),
+            }
+        }
+        assert!(facts.iter().any(|f| matches!(f, Fetched::Account(a, Some(x)) if *a == imp && x.code.as_ref() == impl_code.as_slice() && x.nonce == 1)));
+        assert!(facts.iter().any(|f| matches!(f, Fetched::Slot(a, s, _) if *a == coin && *s == impl_slot)));
+    }
+
+    #[test]
+    fn unreadable_trace_fields_are_never_defaults() {
+        let coin = ad("0x5fc5360d0400a0fd4f2af552add042d716f1d168");
+        for entry in [
+            json!({"balance": "0x0", "nonce": 1, "code": "0xzz"}),
+            json!({"balance": "bad", "nonce": 1, "code": "0x6001"}),
+            json!({"nonce": 1, "code": "0x6001"}),
+            json!({"balance": "0x0", "nonce": "x", "code": "0x6001"}),
+            json!({"balance": "0x0", "nonce": 1, "code": "0x"}),
+            json!({"balance": "0x0", "nonce": 1, "code": null}),
+        ] {
+            let tr = json!({ format!("{coin:#x}"): entry });
+            let (_, facts) = read_trace(&tr, coin, U256::from(1u64));
+            assert!(!facts.iter().any(|f| matches!(f, Fetched::Account(..))), "{entry}: {facts:?}");
+        }
+    }
 }
