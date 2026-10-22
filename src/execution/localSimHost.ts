@@ -687,24 +687,26 @@ export class LocalSimHost {
       const base = { t: now, k: 'recheck', pair: c.q.label, tx: short(c.q.triggerHash), c2blk: blockTag, lv, lp: profitOf(lsim), nv, np: profitOf(nsim) };
       if (this.recheckTimes.length >= this.recheckPerHour) {
         this.hour.c2re.unclear++;
-        this.shadowLog.add({ ...base, result: 'skipped (re-check budget used up this hour)' });
+        this.shadowLog.add({ ...base, result: "COULDN'T CHECK (re-check budget used up this hour)" });
         return;
       }
       this.recheckTimes.push(now);
       const startMs = now;
       void this.nodeAtBlock(c.q, blockTag).then((r) => {
         const v = verdictOf(r);
-        const result = v === 'unknown' ? 'unclear (node gave no usable answer at that block)'
-          : v === lv ? 'market moved (the node at the copy block agrees with the copy)'
-          : v === nv ? 'COPY WRONG (the node at the copy block agrees with its later answer)'
-          : `unclear (a third answer: ${v})`;
-        if (result.startsWith('market')) this.hour.c2re.moved++;
-        else if (result.startsWith('COPY')) this.hour.c2re.wrong++;
+        // Plain labels (owner request): EARLY = the copy was right at its own moment and saw the gap first;
+        // MISMATCH = copy and chain disagree at the SAME moment (needs a look); COULDN'T CHECK = no usable node answer.
+        const result = v === 'unknown' ? "COULDN'T CHECK (node gave no usable answer at that moment)"
+          : v === lv ? 'EARLY: copy right, gap closed after (the node at the same moment agrees with the copy)'
+          : v === nv ? 'MISMATCH at same moment (the node at the same moment agrees with its later answer, not the copy)'
+          : `COULDN'T CHECK (a third answer: ${v})`;
+        if (result.startsWith('EARLY')) this.hour.c2re.moved++;
+        else if (result.startsWith('MISMATCH')) this.hour.c2re.wrong++;
         else this.hour.c2re.unclear++;
         this.shadowLog.add({ ...base, nvAt: v, npAt: profitOf(r), nrAt: 'reason' in r ? String(r.reason).slice(0, 80) : undefined, nmsAt: this.now() - startMs, result });
         this.log(`[local-sim] copy 2 vs node disagreed on ${c.q.label ?? 'a check'} (copy ${lv} at block ${blockTag}, node ${nv} later): ${result}`);
-        if (result.startsWith('COPY')) this.safeAlert(`⚠️ FAST CHECK copy 2 gave a different answer than the node AT THE SAME BLOCK (${c.q.label ?? 'check'}, block ${parseInt(blockTag, 16)}: copy ${lv}, node ${v}). Tell Claude (data/local-sim-shadow.jsonl, "k":"recheck").`);
-      }, () => { this.hour.c2re.unclear++; this.shadowLog.add({ ...base, result: 'unclear (node error)' }); });
+        if (result.startsWith('MISMATCH')) this.safeAlert(`⚠️ FAST CHECK MISMATCH at same moment: the copy and the chain disagree at the same block (${c.q.label ?? 'check'}, block ${parseInt(blockTag, 16)}: copy ${lv}, chain ${v}). Tell Claude (data/local-sim-shadow.jsonl, "k":"recheck").`);
+      }, () => { this.hour.c2re.unclear++; this.shadowLog.add({ ...base, result: "COULDN'T CHECK (node error)" }); });
     } catch { this.hour.errors++; }
   }
 
@@ -749,7 +751,7 @@ export class LocalSimHost {
     if (h.down) line += `; sidecar down for ${h.down} checks`;
     if (h.mismatchNew) line += `; ${h.mismatchNew} replay mismatch(es)`;
     if (h.autoOffs) line += '; STEPPED BACK to practice';
-    if (h.c2.checks) line += `; copy 2 vs node: ${h.c2.checks} checks, same ${h.c2.same}, different ${h.c2.different}, fast check unsure ${h.c2.unknown}${h.c2.noNode ? `, node no answer ${h.c2.noNode}` : ''} (same answer ${pct(h.c2.same, h.c2.same + h.c2.different)})${h.c2re.moved + h.c2re.wrong + h.c2re.unclear ? `; disagreements asked again at the copy's block: market moved ${h.c2re.moved}, COPY WRONG ${h.c2re.wrong}, unclear ${h.c2re.unclear}` : ''}`;
+    if (h.c2.checks) line += `; copy 2 vs node: ${h.c2.checks} checks, same ${h.c2.same}, different ${h.c2.different}, fast check unsure ${h.c2.unknown}${h.c2.noNode ? `, node no answer ${h.c2.noNode}` : ''} (same answer ${pct(h.c2.same, h.c2.same + h.c2.different)})${h.c2re.moved + h.c2re.wrong + h.c2re.unclear ? `; disagreements checked at the same moment: EARLY (copy right, gap closed after) ${h.c2re.moved}, MISMATCH at same moment ${h.c2re.wrong}, couldn't check ${h.c2re.unclear}` : ''}`;
     if (c2) line += `; ${c2}`;
     const whys = Object.entries(h.unknownWhy).sort((a, b) => b[1] - a[1]).slice(0, 3).map(([w, n]) => `${w} ${n}`).join(', ');
     // arbsim's own time (vs the bot-side median above) and answers that came

@@ -209,9 +209,15 @@ pools: median ~3 ms, p99 ~20 ms). Where to look if it is slow:
 Copy 2 vs node disagreements (copy2-q): when the fast check and the node
 give different verdicts, the bot asks the node again pinned at the copy's
 block (a few an hour at most) and logs `"k":"recheck"` lines with
-`result` "market moved" (the node at the copy's block agrees with the
-copy: the price changed before the node's later answer), "COPY WRONG"
-(Telegram alert: tell Claude) or "unclear". The hourly line counts them.
+`result` in plain words:
+- "EARLY: copy right, gap closed after": the node at the same moment
+  agrees with the copy; the gap was real and someone took it before the
+  node's later look (we were early: good).
+- "MISMATCH at same moment": copy and chain disagree at the same block
+  (Telegram alert: tell Claude). Cause can be stale/missing data, a maths
+  issue, or the re-check asking slightly differently.
+- "COULDN'T CHECK": no usable node answer (or the hourly re-check budget).
+The hourly line counts them.
 
 `LOCAL_SIM_TIMEOUT_MS` stays 60: about 10x the expected time. Raising it
 would only hide a slow fast check and start the node later.
