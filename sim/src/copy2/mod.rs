@@ -26,6 +26,7 @@ use crate::state::MissItem;
 
 // What a check reads from copy 2 (far zero tick-map words, PoolManager
 // balances by a proven lower bound + a confirming second run).
+pub mod checkcore;
 pub mod checkview;
 // Where coins keep balances; coin Transfer -> pool balances (workstream A).
 pub mod coins;

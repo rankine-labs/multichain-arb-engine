@@ -173,6 +173,37 @@ async function main() {
     const trig = lines.find((l) => l.k === 'trig');
     assert(lines.length >= 3 && trig && trig.lv === 'loss' && trig.nv === 'profit' && trig.same === false && trig.np === '777' && typeof trig.lms === 'number' && typeof trig.lseen === 'number' && trig.seen && trig.sent && trig.ans, 'shadow log line: both verdicts, profits, times, timestamps (seen / sent / answer)');
     assert(lines.some((l) => l.lu === 'miss'), 'shadow log line carries the unknown reason');
+
+    // ---- 5b. Copy 2 disagreement: the node again AT THE COPY'S BLOCK (copy2-q) ----
+    // Copy (at block 0x10) says profit, the node (later) says loss.
+    fake.handler = answerProfit(500n);
+    const lossSim = { status: 'loss', reason: 'ends with less' } as any;
+    const asked: string[] = [];
+    const reAlerts: string[] = [];
+    for (const [nodeThere, want] of [[{ status: 'profit', profit: 400n } as any, 'market moved'], [lossSim, 'COPY WRONG']] as const) {
+      const h = mk({ LOCAL_SIM: 'shadow' }, { alert: (t) => reAlerts.push(t), nodeAtBlock: async (_q, tag) => { asked.push(tag); return nodeThere; } })!;
+      assert(await waitFor(() => h.client.isConnected()), 'recheck host connects');
+      const c = h.begin({ kind: 'gap', trade: TRADE, simOpts: SIMOPTS, at: { block: '0x10' }, label: 'VIRTUAL/WETH gap' });
+      await c.result;
+      c.nodeDone(lossSim, Date.now() - 125, 'latest');
+      await sleep(20);
+      await h.shadowLog.flush();
+      const re = readFileSync(baseEnv.LOCAL_SIM_LOG, 'utf8').trim().split('\n').map((l) => JSON.parse(l)).filter((l) => l.k === 'recheck');
+      const last = re[re.length - 1];
+      assert(last && last.c2blk === '0x10' && last.lv === 'profit' && last.nv === 'loss' && String(last.result).startsWith(want), `disagreement asked again at the copy's block -> "${want}" (${last?.result})`);
+      const line = h.takeHourLine() ?? '';
+      assert(want === 'market moved' ? /market moved 1, COPY WRONG 0/.test(line) : /market moved 0, COPY WRONG 1/.test(line), `hourly line counts it (${line})`);
+    }
+    assert(asked.length === 2 && asked.every((t) => t === '0x10'), 'the node is asked pinned at the copy block');
+    assert(reAlerts.length === 1 && /SAME BLOCK/.test(reAlerts[0]), 'only "copy wrong" alerts');
+    // Agreement: no re-check.
+    const h3 = mk({ LOCAL_SIM: 'shadow' }, { nodeAtBlock: async (_q, tag) => { asked.push(tag); return lossSim; } })!;
+    assert(await waitFor(() => h3.client.isConnected()), 'host connects');
+    const c3 = h3.begin({ kind: 'gap', trade: TRADE, simOpts: SIMOPTS, at: { block: '0x11' } });
+    await c3.result;
+    c3.nodeDone({ status: 'profit', profit: 450n } as any, Date.now() - 100, 'latest');
+    await sleep(20);
+    assert(asked.length === 2, 'same verdict: no re-check');
     assert(trig.lus === 2.5 && typeof trig.lrt === 'number' && trig.lt?.runs?.length === 2, `shadow log line carries arbsim's own time (lus ${trig.lus}), the round trip (lrt) and arbsim's split (lt)`);
     const hourLine = shadow.takeHourLine()!;
     assert(/^Fast check \(practice\): 3 checks, same answer 50%, unknown 33%, median \d+ ms vs node \d+ ms/.test(hourLine), `hour line in the agreed wording: "${hourLine}"`);

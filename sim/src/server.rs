@@ -336,6 +336,11 @@ fn check_inner(ctx: &Ctx, id: &Value, at: &Value, t0: Instant, tm: &mut Tm, run:
         }
     };
     let block = picked.seq + sh.cfg.l2_offset;
+    // Copy 2: one registry summary for the whole check (checkcore.rs: no
+    // waiting for the copy's thread while it is valid for this version).
+    let t_core = Instant::now();
+    let core = ctx.copy2.as_ref().map(|c| c.core_for(picked.from.as_ref()));
+    tm.facts_us = t_core.elapsed().as_micros() as u64;
     let view = View::new(picked.snap);
     let mut answer = match &ctx.copy2 {
         None => {
@@ -344,7 +349,7 @@ fn check_inner(ctx: &Ctx, id: &Value, at: &Value, t0: Instant, tm: &mut Tm, run:
             tm.runs_us.push(t.elapsed().as_micros() as u64);
             a
         }
-        Some(c) => copy2_run(c, &view, block, &picked.ctx, tm, &run),
+        Some(c) => copy2_run(c, core.as_deref().expect("copy 2 core"), &view, block, &picked.ctx, tm, &run),
     };
     if ctx.copy2.is_none() {
         ctx.updater.touched(view.take_touched());
@@ -356,7 +361,7 @@ fn check_inner(ctx: &Ctx, id: &Value, at: &Value, t0: Instant, tm: &mut Tm, run:
         // (Only an ANSWER is withheld: a miss stays a miss, so its fills run.)
         let all = view.touched_overflow();
         let answered = answer.get("ok") == Some(&Value::Bool(true));
-        if let Some(why) = if answered { c.pending_reason(&view.take_touched(), block, all) } else { None } {
+        if let Some(why) = if answered { c.pending_reason_with(core.as_deref().expect("copy 2 core"), &view.take_touched(), block, all) } else { None } {
             let id = answer.get("id").cloned().unwrap_or(Value::Null);
             answer = json!({ "id": id, "ok": false, "unknown": "pending_reports", "detail": why });
         }
@@ -372,7 +377,7 @@ fn check_inner(ctx: &Ctx, id: &Value, at: &Value, t0: Instant, tm: &mut Tm, run:
                 c.note_misses(&missing);
             }
             // Copy 2: missing because a pool on the route isn't ready?
-            if let Some(why) = ctx.copy2.as_ref().and_then(|c| c.unsure_reason(&missing)) {
+            if let Some(why) = ctx.copy2.as_ref().zip(core.as_deref()).and_then(|(c, k)| c.unsure_reason_with(k, &missing)) {
                 answer["unknown"] = json!("unsure_pool");
                 answer["detail"] = json!(why);
             }
@@ -402,10 +407,10 @@ fn check_inner(ctx: &Ctx, id: &Value, at: &Value, t0: Instant, tm: &mut Tm, run:
 /// too, if it read a balance): the answer stands only if the two differ in
 /// gas alone; it then reports the HIGHER gas of each gas field (counter 0 =
 /// the costlier 0 -> non-zero store), so the bot never overestimates profit.
-fn copy2_run(c: &Copy2Handle, view: &View, block: u64, bctx: &BlockCtx, tm: &mut Tm, run: &impl Fn(&dyn StateRead, &BlockCtx) -> Value) -> Value {
+fn copy2_run(c: &Copy2Handle, core: &crate::copy2::checkcore::CheckCore, view: &View, block: u64, bctx: &BlockCtx, tm: &mut Tm, run: &impl Fn(&dyn StateRead, &BlockCtx) -> Value) -> Value {
     let t_facts = Instant::now();
-    let facts = c.check_facts(block);
-    tm.facts_us = t_facts.elapsed().as_micros() as u64;
+    let facts = c.check_facts_with(core, block);
+    tm.facts_us += t_facts.elapsed().as_micros() as u64;
     let runs = std::cell::RefCell::new(Vec::<u64>::new());
     let a = copy2_runs(c, view, &facts, bctx, &runs, run);
     tm.runs_us = runs.into_inner();

@@ -18,7 +18,10 @@
 //   checks are kept here and `status` shows their p50 / p90 / p99 / max
 //   ("checkTiming"), plus how long copy 2's block applies took
 //   ("applyTiming") and how long the copy-keeping thread held the locks
-//   checks need ("lockHold").
+//   checks need ("lockHold", with the 10 source lines holding longest).
+//   Also here (copy2-q): the lock wrappers that time those holds
+//   (TimedWrite) and GenLock (a lock with a change counter, so checks can
+//   reuse a summary of copy 2's pool registry without taking its lock).
 //   Nothing here changes an answer.
 // ============================================================================
 use std::collections::VecDeque;
@@ -68,9 +71,11 @@ struct Rings {
     checks: VecDeque<Sample>,
     applies: VecDeque<u64>,
     holds: VecDeque<u64>,
+    /// Lock holds over 1 ms per source line: (count, total us, max us).
+    sites: std::collections::BTreeMap<String, (u64, u64, u64)>,
 }
 
-static RINGS: Mutex<Rings> = Mutex::new(Rings { checks: VecDeque::new(), applies: VecDeque::new(), holds: VecDeque::new() });
+static RINGS: Mutex<Rings> = Mutex::new(Rings { checks: VecDeque::new(), applies: VecDeque::new(), holds: VecDeque::new(), sites: std::collections::BTreeMap::new() });
 
 fn push<T>(q: &mut VecDeque<T>, v: T) {
     if q.len() >= KEEP {
@@ -117,6 +122,24 @@ pub fn record_hold(us: u64) {
     }
 }
 
+/// Same, with the source line that took the lock (status lockHold.bySite:
+/// count over 1 ms, total and longest per line).
+pub fn record_hold_at(us: u64, site: &'static std::panic::Location<'static>) {
+    if us < 1000 {
+        return;
+    }
+    if let Ok(mut r) = RINGS.lock() {
+        push(&mut r.holds, us);
+        let key = format!("{}:{}", site.file().rsplit('/').next().unwrap_or(""), site.line());
+        if r.sites.len() < 500 || r.sites.contains_key(&key) {
+            let e = r.sites.entry(key).or_insert((0, 0, 0));
+            e.0 += 1;
+            e.1 += us;
+            e.2 = e.2.max(us);
+        }
+    }
+}
+
 fn pct(v: &mut [u64]) -> Value {
     if v.is_empty() {
         return json!({ "n": 0 });
@@ -145,8 +168,16 @@ pub fn status() -> Value {
             "runMax": col(|s| s.run_max), "runs": col(|s| s.nruns), "post": col(|s| s.post), "send": col(|s| s.send),
         },
         "applyTiming": pct(&mut applies),
-        "lockHold": pct(&mut holds),
+        "lockHold": with_sites(pct(&mut holds), &r.sites),
     })
+}
+
+fn with_sites(mut v: Value, sites: &std::collections::BTreeMap<String, (u64, u64, u64)>) -> Value {
+    let mut top: Vec<(&String, &(u64, u64, u64))> = sites.iter().collect();
+    top.sort_by(|a, b| b.1 .1.cmp(&a.1 .1));
+    top.truncate(10);
+    v["bySite"] = json!(top.into_iter().map(|(k, (n, tot, mx))| json!({"site": k, "n": n, "totalUs": tot, "maxUs": mx})).collect::<Vec<_>>());
+    v
 }
 
 /// Forget everything (tests / benches).
@@ -155,37 +186,119 @@ pub fn reset() {
         r.checks.clear();
         r.applies.clear();
         r.holds.clear();
+        r.sites.clear();
     }
 }
 
-/// A write lock guard that records how long it was held (lockHold).
-pub struct TimedWrite<'a, T> {
-    g: std::sync::RwLockWriteGuard<'a, T>,
+/// Something whose write lock TimedWrite can time (a plain RwLock, the
+/// mirror's PubLock, the registry's GenLock).
+pub trait WriteLock<'a> {
+    type Guard: std::ops::DerefMut;
+    fn lock_write(&'a self) -> Self::Guard;
+}
+
+impl<'a, T: 'a> WriteLock<'a> for std::sync::RwLock<T> {
+    type Guard = std::sync::RwLockWriteGuard<'a, T>;
+    fn lock_write(&'a self) -> Self::Guard {
+        self.write().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// A write lock guard that records how long it was held and WHERE it was
+/// taken (lockHold, per source line: live Oct 22 20:00 showed 484 holds
+/// over 1 ms, the longest 197 ms, without saying which).
+pub struct TimedWrite<G: std::ops::DerefMut> {
+    g: G,
     t: Instant,
+    site: &'static std::panic::Location<'static>,
 }
 
-impl<'a, T> TimedWrite<'a, T> {
-    pub fn new(l: &'a std::sync::RwLock<T>) -> Self {
-        let g = l.write().unwrap_or_else(|e| e.into_inner());
-        TimedWrite { g, t: Instant::now() }
+impl<G: std::ops::DerefMut> TimedWrite<G> {
+    #[track_caller]
+    pub fn new<'a, L: WriteLock<'a, Guard = G> + ?Sized>(l: &'a L) -> Self {
+        let site = std::panic::Location::caller();
+        let g = l.lock_write();
+        TimedWrite { g, t: Instant::now(), site }
     }
 }
 
-impl<T> std::ops::Deref for TimedWrite<'_, T> {
+impl<G: std::ops::DerefMut> std::ops::Deref for TimedWrite<G> {
+    type Target = G::Target;
+    fn deref(&self) -> &G::Target {
+        &self.g
+    }
+}
+
+impl<G: std::ops::DerefMut> std::ops::DerefMut for TimedWrite<G> {
+    fn deref_mut(&mut self) -> &mut G::Target {
+        &mut self.g
+    }
+}
+
+impl<G: std::ops::DerefMut> Drop for TimedWrite<G> {
+    fn drop(&mut self) {
+        record_hold_at(self.t.elapsed().as_micros() as u64, self.site);
+    }
+}
+
+/// An RwLock with a change counter: every write lock bumps it (while still
+/// held), so a reader can tell "nothing changed since I last looked"
+/// without taking the lock (copy 2's pool registry: checks keep a summary
+/// of it and rebuild it only when it changed, intake.rs CheckCore).
+pub struct GenLock<T> {
+    inner: std::sync::RwLock<T>,
+    gen: std::sync::atomic::AtomicU64,
+}
+
+pub struct GenWriteGuard<'a, T> {
+    g: std::sync::RwLockWriteGuard<'a, T>,
+    gen: &'a std::sync::atomic::AtomicU64,
+}
+
+impl<T> GenLock<T> {
+    pub fn new(v: T) -> Self {
+        GenLock { inner: std::sync::RwLock::new(v), gen: std::sync::atomic::AtomicU64::new(1) }
+    }
+    pub fn read(&self) -> std::sync::LockResult<std::sync::RwLockReadGuard<'_, T>> {
+        self.inner.read()
+    }
+    pub fn try_read(&self) -> std::sync::TryLockResult<std::sync::RwLockReadGuard<'_, T>> {
+        self.inner.try_read()
+    }
+    pub fn write(&self) -> std::sync::LockResult<GenWriteGuard<'_, T>> {
+        let g = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        Ok(GenWriteGuard { g, gen: &self.gen })
+    }
+    /// Changes so far (read it while holding a read lock to pair it with
+    /// what you read).
+    pub fn gen(&self) -> u64 {
+        self.gen.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+impl<'a, T: 'a> WriteLock<'a> for GenLock<T> {
+    type Guard = GenWriteGuard<'a, T>;
+    fn lock_write(&'a self) -> Self::Guard {
+        self.write().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+impl<T> std::ops::Deref for GenWriteGuard<'_, T> {
     type Target = T;
     fn deref(&self) -> &T {
         &self.g
     }
 }
 
-impl<T> std::ops::DerefMut for TimedWrite<'_, T> {
+impl<T> std::ops::DerefMut for GenWriteGuard<'_, T> {
     fn deref_mut(&mut self) -> &mut T {
         &mut self.g
     }
 }
 
-impl<T> Drop for TimedWrite<'_, T> {
+impl<T> Drop for GenWriteGuard<'_, T> {
     fn drop(&mut self) {
-        record_hold(self.t.elapsed().as_micros() as u64);
+        // Still holding the lock here (the guard field drops after this).
+        self.gen.fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 }

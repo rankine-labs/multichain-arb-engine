@@ -293,6 +293,13 @@ export type LocalSimHostOptions = {
   copy2Pools?: () => Iterable<PoolState | undefined>;
   poolManager?: string;
   copy2Link?: Copy2Link;                                // tests pass their own
+  // Copy 2 disagreements (copy2-q): the node's answer for the SAME check
+  // pinned at the copy's block ("0x.." block tag). When the fast check and
+  // the node's later answer disagree, the host asks this once to tell "the
+  // market moved between the two blocks" from "the copy is wrong at its own
+  // block". Left out = no such re-check.
+  nodeAtBlock?: (q: LocalQuestion, blockTag: string) => Promise<SimResult>;
+  disagreeRecheckPerHour?: number;                      // default 30
 };
 
 export class LocalSimHost {
@@ -319,6 +326,9 @@ export class LocalSimHost {
 
   // Hourly counters (taken by takeHourLine).
   private hour = this.freshHour();
+  private readonly nodeAtBlock: ((q: LocalQuestion, blockTag: string) => Promise<SimResult>) | null;
+  private readonly recheckPerHour: number;
+  private recheckTimes: number[] = [];
   private lateSeen = 0;
   private freshHour() {
     return {
@@ -336,6 +346,12 @@ export class LocalSimHost {
       //   unknown: the fast check wasn't sure (the node answered)
       //   noNode: the node gave no usable answer (not compared)
       c2: { checks: 0, same: 0, different: 0, unknown: 0, noNode: 0 },
+      // Copy-2 disagreements asked again on the node AT THE COPY'S BLOCK:
+      // moved = the node there agrees with the copy (the market moved
+      // before the node's later answer); wrong = the node there agrees with
+      // its later answer (the copy was wrong at its own block); unclear =
+      // a third answer / node error / skipped (budget).
+      c2re: { moved: 0, wrong: 0, unclear: 0 },
     };
   }
 
@@ -344,6 +360,8 @@ export class LocalSimHost {
     this.now = opts.now ?? Date.now;
     this.log = opts.log ?? ((m) => console.log(m));
     this.alert = opts.alert ?? (() => {});
+    this.nodeAtBlock = opts.nodeAtBlock ?? null;
+    this.recheckPerHour = opts.disagreeRecheckPerHour ?? 30;
     this.warmSource = opts.warmSource ?? (() => []);
     // The client's own messages: "retrying" lines at most once a minute.
     const clientLog = (m: string) => {
@@ -628,7 +646,7 @@ export class LocalSimHost {
         if (!l.sure) t.unknown++;
         else if (nv === undefined || nv === 'unknown') t.noNode++;
         else if (same) t.same++;
-        else t.different++;
+        else { t.different++; this.recheckDisagreement(c, l.verdict, nv as Verdict, l.sim, node?.sim ?? null, c2Block as string); }
       }
       if (c.sampled && both) this.noteSample(same);
       if (this.hour.localMs.length > 5_000) { this.hour.localMs.shift(); }
@@ -655,6 +673,38 @@ export class LocalSimHost {
         // timestamps (clock ms): trigger seen in feed, question sent, answer back
         seen, sent: l.requestMs, ans: l.answerMs,
       });
+    } catch { this.hour.errors++; }
+  }
+
+  // Copy 2: the fast check (at its block) and the node (usually at a later
+  // block) disagree. Ask the node the same check AT THE COPY'S BLOCK, once,
+  // in the background (a few per hour at most), and log which it was.
+  private recheckDisagreement(c: LocalCheck, lv: Verdict, nv: Verdict, lsim: SimResult, nsim: SimResult | null, blockTag: string): void {
+    try {
+      if (!this.nodeAtBlock) return;
+      const now = this.now();
+      this.recheckTimes = this.recheckTimes.filter((t) => now - t < 3_600_000);
+      const base = { t: now, k: 'recheck', pair: c.q.label, tx: short(c.q.triggerHash), c2blk: blockTag, lv, lp: profitOf(lsim), nv, np: profitOf(nsim) };
+      if (this.recheckTimes.length >= this.recheckPerHour) {
+        this.hour.c2re.unclear++;
+        this.shadowLog.add({ ...base, result: 'skipped (re-check budget used up this hour)' });
+        return;
+      }
+      this.recheckTimes.push(now);
+      const startMs = now;
+      void this.nodeAtBlock(c.q, blockTag).then((r) => {
+        const v = verdictOf(r);
+        const result = v === 'unknown' ? 'unclear (node gave no usable answer at that block)'
+          : v === lv ? 'market moved (the node at the copy block agrees with the copy)'
+          : v === nv ? 'COPY WRONG (the node at the copy block agrees with its later answer)'
+          : `unclear (a third answer: ${v})`;
+        if (result.startsWith('market')) this.hour.c2re.moved++;
+        else if (result.startsWith('COPY')) this.hour.c2re.wrong++;
+        else this.hour.c2re.unclear++;
+        this.shadowLog.add({ ...base, nvAt: v, npAt: profitOf(r), nrAt: 'reason' in r ? String(r.reason).slice(0, 80) : undefined, nmsAt: this.now() - startMs, result });
+        this.log(`[local-sim] copy 2 vs node disagreed on ${c.q.label ?? 'a check'} (copy ${lv} at block ${blockTag}, node ${nv} later): ${result}`);
+        if (result.startsWith('COPY')) this.safeAlert(`⚠️ FAST CHECK copy 2 gave a different answer than the node AT THE SAME BLOCK (${c.q.label ?? 'check'}, block ${parseInt(blockTag, 16)}: copy ${lv}, node ${v}). Tell Claude (data/local-sim-shadow.jsonl, "k":"recheck").`);
+      }, () => { this.hour.c2re.unclear++; this.shadowLog.add({ ...base, result: 'unclear (node error)' }); });
     } catch { this.hour.errors++; }
   }
 
@@ -699,7 +749,7 @@ export class LocalSimHost {
     if (h.down) line += `; sidecar down for ${h.down} checks`;
     if (h.mismatchNew) line += `; ${h.mismatchNew} replay mismatch(es)`;
     if (h.autoOffs) line += '; STEPPED BACK to practice';
-    if (h.c2.checks) line += `; copy 2 vs node: ${h.c2.checks} checks, same ${h.c2.same}, different ${h.c2.different}, fast check unsure ${h.c2.unknown}${h.c2.noNode ? `, node no answer ${h.c2.noNode}` : ''} (same answer ${pct(h.c2.same, h.c2.same + h.c2.different)})`;
+    if (h.c2.checks) line += `; copy 2 vs node: ${h.c2.checks} checks, same ${h.c2.same}, different ${h.c2.different}, fast check unsure ${h.c2.unknown}${h.c2.noNode ? `, node no answer ${h.c2.noNode}` : ''} (same answer ${pct(h.c2.same, h.c2.same + h.c2.different)})${h.c2re.moved + h.c2re.wrong + h.c2re.unclear ? `; disagreements asked again at the copy's block: market moved ${h.c2re.moved}, COPY WRONG ${h.c2re.wrong}, unclear ${h.c2re.unclear}` : ''}`;
     if (c2) line += `; ${c2}`;
     const whys = Object.entries(h.unknownWhy).sort((a, b) => b[1] - a[1]).slice(0, 3).map(([w, n]) => `${w} ${n}`).join(', ');
     // arbsim's own time (vs the bot-side median above) and answers that came

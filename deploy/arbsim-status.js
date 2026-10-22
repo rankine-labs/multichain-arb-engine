@@ -238,6 +238,9 @@ async function main() {
   if (at && at.n) {
     lines.push(`    copy-2 block apply (ms, last ${n(at.n)}): median ${(at.p50 / 1000).toFixed(1)}, p90 ${(at.p90 / 1000).toFixed(1)}, p99 ${(at.p99 / 1000).toFixed(1)}, max ${(at.max / 1000).toFixed(1)}` +
       (s.lockHold && s.lockHold.n ? `; locks held over 1 ms: ${n(s.lockHold.n)}, longest ${(s.lockHold.max / 1000).toFixed(1)} ms` : ''));
+    // copy2-q: which source lines held them (checks no longer wait for them).
+    const bs = s.lockHold && Array.isArray(s.lockHold.bySite) ? s.lockHold.bySite.slice(0, 3) : [];
+    if (bs.length) lines.push(`    longest lock holders: ${bs.map((x) => `${x.site} ${n(x.n)}x, longest ${(x.maxUs / 1000).toFixed(1)} ms`).join('; ')}`);
   }
 
   // 3. How the copy is kept current (copy 1, the feed replay)

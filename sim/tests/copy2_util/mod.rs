@@ -124,7 +124,18 @@ impl Anvil {
         }
         let base = self.id.fetch_add(reqs.len() as u64, Ordering::Relaxed);
         let body: Vec<Value> = reqs.iter().enumerate().map(|(i, (m, p))| json!({"jsonrpc":"2.0","id":base + i as u64,"method":m,"params":p})).collect();
-        let v = self.post(&Value::Array(body)).expect("batch");
+        // Read-only batches (the copy's node questions): a dropped local
+        // connection (anvil busy, e.g. the latency bench's CPU load) is
+        // asked again.
+        let mut v = self.post(&Value::Array(body.clone()));
+        for _ in 0..5 {
+            if v.is_ok() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+            v = self.post(&Value::Array(body.clone()));
+        }
+        let v = v.expect("batch");
         let mut out: Vec<Option<Result<Value, String>>> = vec![None; reqs.len()];
         for r in v.as_array().expect("batch answer") {
             let i = (r["id"].as_u64().unwrap() - base) as usize;
