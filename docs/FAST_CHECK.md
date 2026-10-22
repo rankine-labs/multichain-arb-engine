@@ -67,19 +67,29 @@ check every 2 s) and then:
 - asks the block reader's WebSocket (`BLOCK_READER_WSS`, required) for
   **every** event of our pools, every Uniswap V4 event of our V4 pool ids, and
   coin transfers into / out of our pools, and passes them on block by block
-  (`pool_logs`, in order; `block_tick` for every block with nothing for our
-  pools). Each message carries the block's header from the WebSocket's
-  `newHeads` subscription: time, parent-chain block and **logsBloom**, so
-  the copy answers "unknown" for a pool whose reports for that block are
-  still on their way (dry run #17). Blocks are put together by exactly the
-  dry-run checker's rules (`src/execution/copy2Blocks.ts`, shared): a block
-  goes out 30 ms after its header, or once a block 2 later shows up; a
-  block whose header never came has it read from the HTTP node (counted as
-  "copy 2 headers / fill-ins"); no header at all = the block is not sent and
-  the copy reloads. A message that can't be handed over is dropped, counted,
-  and the next one makes the copy reload (never a silent gap). A WebSocket
-  outage is filled in from the HTTP node (up to 200 blocks, with their
-  headers), otherwise the copy reloads.
+  (`pool_logs`, in order; `block_tick` for quiet blocks), put together by
+  exactly the dry-run checker's rules (`src/execution/copy2Blocks.ts`,
+  shared; the checker's `--no-headers` = the bot's default):
+  - **Headers off (default, `COPY2_HEADERS=off`)**: a block goes out as soon
+    as a report of a later block arrives, or 30 ms after its first report.
+    Its time and parent-chain block come from the sequencer feed (or the
+    logs' own blockTimestamp); a block whose time is still unknown 40 ms
+    later is not sent and the copy reloads (never a guessed time). No
+    logsBloom: arbsim still marks a pool "pending" from its transfer /
+    event pairing rules. `block_tick` for the feed's newest block once it is
+    250 ms old with nothing held.
+  - **Headers on (`COPY2_HEADERS=on`, needs a bigger provider plan)**: each
+    message also carries the block header's **logsBloom** from a `newHeads`
+    subscription (one billed WebSocket message per block, ~845k a day), so
+    the copy also answers "unknown" for a pool whose reports for that block
+    are still on their way (dry run #17). A block goes out 30 ms after its
+    header, or once a block 2 later shows up; `block_tick` for every quiet
+    block; a missing header is read from the HTTP node (counted as "copy 2
+    headers / fill-ins"); no header at all = not sent, the copy reloads.
+  A message that can't be handed over is dropped, counted, and the next one
+  makes the copy reload (never a silent gap). A WebSocket outage is filled
+  in from the HTTP node (up to 200 blocks; with headers on, with their
+  headers too), otherwise the copy reloads.
 - tells it which pools to follow (`track`): watched pools of a type the copy
   can follow exactly: Uniswap / PancakeSwap V2, Ramses V2 and GIGA Classic
   (Solidly), Uniswap V3 and copies, PancakeSwap V3 and copies, Algebra
@@ -99,25 +109,26 @@ check every 2 s) and then:
   `copy 2: 412 ready, 3 unsure, 5 loading of 420 pools; routed to fast check 120, to node 30 (pool unsure 20, readiness too old 10); pool reports live: 5321 blocks passed on`
 
 Cost: the WebSocket pushes roughly 2-3 times more (billed) messages on the
-same pools (each swap also moves two coins), **plus one header per block**
-(~9 a second on Robinhood, roughly 780,000 a day at 0.11 s blocks). They
-count against `BLOCK_READER_WSS_DAILY` (400,000 a day by default). Copy 2's
-subscriptions stop for the rest of the UTC day once today's messages reach
-`COPY2_WSS_MAX_PCT` (80) % of that cap, so the price feed always keeps its
-share; copy 2 then stops being ready and the node decides. To run copy 2 all
-day, the cap has to be raised (about 1.2 million covers headers + events)
-and the provider plan must allow it.
+same pools (each swap also moves two coins). With `COPY2_HEADERS=on` add
+one header per block (~9.8 a second measured, ~845,000 a day = ~25M a
+month, more than the whole Chainstack Growth plan of 20M): that is why it
+is off by default. They count against `BLOCK_READER_WSS_DAILY` (400,000 a
+day by default). Copy 2's subscriptions stop for the rest of the UTC day
+once today's messages reach `COPY2_WSS_MAX_PCT` (80) % of that cap, so the
+price feed always keeps its share; copy 2 then stops being ready and the
+node decides.
 
 Settings (all optional): `LOCAL_SIM_COPY2=off` (never use copy 2),
 `COPY2_SKIP_DEXES` (exchange names never followed, comma separated),
-`COPY2_GRACE_MS` (30, a block is complete this long after its header),
-`COPY2_HEADERLESS_MAX_MS` (1500), `COPY2_WSS_MAX_PCT` (80, 0 = no copy-2
-limit), `COPY2_STATUS_MS` (2000),
+`COPY2_HEADERS` (off), `COPY2_GRACE_MS` (30), `COPY2_TS_WAIT_MS` (40,
+headers off: wait for a block's time from the feed), `COPY2_TICK_MS` (250,
+headers off: quiet-block tick, 0 = none), `COPY2_HEADERLESS_MAX_MS` (1500,
+headers on), `COPY2_WSS_MAX_PCT` (80, 0 = no copy-2 limit), `COPY2_STATUS_MS` (2000),
 `COPY2_MAX_STATUS_AGE_MS` (10000), `COPY2_BACKFILL_MAX` (200),
 `ARBSIM_L2_BLOCK_OFFSET` (0 on Robinhood).
 
 Log lines start with `[copy2]`; the `[blockreader]` line shows
-`copy 2 events live (N logs, M headers)`.
+`copy 2 events live (N logs, M headers)` (M = 0 with headers off).
 
 ## Turning it off
 

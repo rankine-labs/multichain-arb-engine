@@ -446,3 +446,19 @@ trade ~20 ms.
     UTC day at 80 % of the cap (price feed keeps going, the node decides
     checks). Running copy 2 all day needs the cap (and plan) raised to
     ~1.2M. Outage fill-ins also read each missed header (<= 200).
+  - Follow-up (same branch): newHeads is billed per push by Chainstack;
+    the dry run measured ~9.8 blocks/s = ~845k RU/day = ~25M/month, more
+    than the Growth plan (20M, extra usage off). So COPY2_HEADERS=off is
+    the bot's default: no newHeads, no per-block header reads, no
+    logsBloom. Headerless assembly (copy2Blocks.ts {headers:false}, also
+    the checker's --no-headers): a block goes once a later block reports
+    or COPY2_GRACE_MS (30) after its first report; time / parent-chain
+    block from the sequencer feed (or logs' blockTimestamp), unknown after
+    COPY2_TS_WAIT_MS (40) more = not sent, copy reloads; block_tick for the
+    newest known block after COPY2_TICK_MS (250) with nothing held; late
+    reports as before. prevBlock headerless = the previous block passed on
+    (not every block goes out), the block itself after a gap. With
+    COPY2_HEADERS=on everything above (bloom) is unchanged. The checker's
+    --no-headers still takes block TIMES from its own newHeads (the bot
+    uses its feed; same values) but ignores them for completeness and
+    never sends a bloom.

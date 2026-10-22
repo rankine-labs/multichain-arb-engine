@@ -44,6 +44,12 @@
 //     [--socket /tmp/arbsim-copy2-test.sock] [--every 40] [--pools 2] [--checks 2] \
 //     [--rps 3] [--max-node-reads 20000] [--arbsim-cap 3000] [--only-proven]
 //   --no-spawn: use an arbsim already running on --socket (started by you).
+//   --no-headers: the LIVE BOT's default mode (COPY2_HEADERS=off): blocks are
+//     put together without headers (a block goes once a later block reports
+//     or --grace-ms after its first report), no logsBloom on any message,
+//     block_tick only for the newest block once --tick-ms (250) old. Block
+//     times still come from this checker's own newHeads (the bot takes them
+//     from its sequencer feed; same values), a missing one from the node.
 // ============================================================================
 import { spawn, ChildProcess } from 'child_process';
 import { readFileSync, writeFileSync, mkdirSync, appendFileSync, existsSync, unlinkSync, openSync } from 'fs';
@@ -85,6 +91,8 @@ const ARBSIM_CAP = arg('arbsim-cap', '3000')!;                // test arbsim's d
 const ARBSIM_RPS = arg('arbsim-rps', process.env.ARBSIM_NODE_RPS ?? '50')!;
 const GRACE_MS = Number(arg('grace-ms', '30'));
 const ONLY_PROVEN = flag('only-proven');
+const NO_HEADERS = flag('no-headers');
+const TICK_MS = Number(arg('tick-ms', '250'));
 const NODE_GAS = arg('node-gas', 'trace');                    // trace = debug_traceCall (gives gas) | call = plain eth_call
 const SUMMARY_MS = 5 * 60_000;
 const WETH = ROBINHOOD_TOKENS.WETH.toLowerCase();
@@ -181,7 +189,9 @@ async function sendTrack(): Promise<void> {
 }
 
 // --- feeding blocks to the copy ---------------------------------------------
-const asm = new BlockAssembler(GRACE_MS);
+// Same assembler as the bot (src/execution/copy2Blocks.ts); --no-headers =
+// the bot's default headerless mode (headers then only give block times).
+const asm = new BlockAssembler(GRACE_MS, 1500, { headers: !NO_HEADERS, tickMs: TICK_MS });
 const recentlyChanged = new Map<string, number>(); // pool key -> last block it had a report
 let backfilling = false;
 let timingWatch: { block: number; since: number; sentAt: number } | null = null;
@@ -257,7 +267,7 @@ async function pump() {
       if (b.timestamp === null) {
         const h = await node('eth_getBlockByNumber', [hex(b.block), false]);
         const head = h.result ? headFromNewHeads(h.result, Date.now()) : null;
-        if (head) { b.timestamp = head.timestamp; b.l1Block = head.l1Block; b.logsBloom = head.logsBloom ?? null; score.headersFetched = (score.headersFetched ?? 0) + 1; }
+        if (head) { b.timestamp = head.timestamp; b.l1Block = head.l1Block; b.logsBloom = NO_HEADERS ? null : head.logsBloom ?? null; score.headersFetched = (score.headersFetched ?? 0) + 1; }
       }
       if (b.timestamp === null) { score.blocksNoTime = (score.blocksNoTime ?? 0) + 1; continue; } // can't send without a time: arbsim will see a gap and reload
       sendBlock(b);
@@ -421,6 +431,7 @@ function writeSummary(final: boolean) {
 }
 
 async function main() {
+  if (NO_HEADERS) log(`--no-headers: blocks assembled as the live bot does by default (no logsBloom, grace ${GRACE_MS} ms, tick ${TICK_MS} ms)`);
   log(`following ${followed.pools.size} pools (${Object.entries(followed.notFollowed).map(([k, n]) => `${n} not followed: ${k}`).join('; ') || 'all followed'}); run ${MINUTES} min, round every ${EVERY} blocks`);
   await startArbsim();
   log(`test arbsim ${NO_SPAWN ? 'found' : 'started'} on ${SOCKET} (pool-events mode, daily paid-node allowance ${ARBSIM_CAP}, speed limit ${ARBSIM_RPS} requests/s)`);

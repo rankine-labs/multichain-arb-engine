@@ -141,13 +141,13 @@ const H = (b: number, extra: Record<string, unknown> = {}) => ({ number: q(b), p
 // Let pending promises (node reads) run, with the fake clock moving.
 async function settle(ms = 0, rounds = 6) { for (let i = 0; i < rounds; i++) { await tick(); advance(ms); } }
 
-function makeForwarder(index: Copy2Index, rpc: ((m: string, p: unknown[]) => Promise<any>) | null = null, times?: FeedBlockTimes) {
+function makeForwarder(index: Copy2Index, rpc: ((m: string, p: unknown[]) => Promise<any>) | null = null, times?: FeedBlockTimes, headers = true) {
   const sent: any[] = [];
   let ok = true;
   const f = new Copy2Forwarder({
     send: (m) => { if (!ok) return false; sent.push(JSON.parse(JSON.stringify(m))); return true; },
-    index: () => index, backfillRpc: () => rpc, now: () => clock, schedule,
-    ...(times ? { blockTime: (b: number) => times.get(b) } : {}),
+    index: () => index, backfillRpc: () => rpc, now: () => clock, schedule, headers,
+    ...(times ? { blockTime: (b: number) => times.get(b), feedNewest: () => times.newestNote() } : {}),
   });
   return { f, sent, setOk: (v: boolean) => { ok = v; } };
 }
@@ -287,14 +287,106 @@ async function feedL1Tests() {
   advance(100);
 }
 
+// The shared assembler's headerless mode (COPY2_HEADERS=off / --no-headers).
+async function headerlessAssemblerTests() {
+  const times = new Map<number, { timestamp: number; l1Block: number }>();
+  let newest: { block: number; at: number } | null = null;
+  const asm = new BlockAssembler(30, 1500, { headers: false, timeWaitMs: 40, tickMs: 250, timeOf: (b) => times.get(b), newestKnown: () => newest });
+  const t = 5_000;
+  times.set(100, { timestamp: 1_000, l1Block: 7 }); times.set(101, { timestamp: 1_001, l1Block: 7 });
+  asm.addLog(L(P1, [SYNC_TOPIC], 100, 0, 0), t);
+  assert(asm.due(t + 10).length === 0, 'headerless: block waits while no later report and under the grace time');
+  asm.addLog(L(P1, [SYNC_TOPIC], 101, 0, 0), t + 11);
+  const o = asm.due(t + 11);
+  assert(o.length === 1 && o[0]!.block === 100 && o[0]!.timestamp === 1_000 && o[0]!.l1Block === 7 && !o[0]!.logsBloom, 'headerless: a report of a LATER block -> block goes at once, time from the feed, no bloom');
+  assert(asm.due(t + 40).length === 0 && asm.due(t + 41)[0]?.block === 101, 'headerless: newest block goes graceMs after its first report');
+  // Time not known: waits timeWaitMs more, then comes out without a time (caller skips it).
+  asm.addLog(L(P1, [SYNC_TOPIC], 102, 0, 0), t + 100);
+  assert(asm.due(t + 140).length === 0, 'headerless: complete but time unknown -> waits for the feed');
+  const nt = asm.due(t + 171);
+  assert(nt.length === 1 && nt[0]!.block === 102 && nt[0]!.timestamp === null, 'headerless: still unknown after grace + timeWaitMs -> out with timestamp null (never guessed)');
+  // The log's own blockTimestamp is used when the feed has none.
+  asm.addLog(L(P1, [SYNC_TOPIC], 103, 0, 0, undefined, { blockTimestamp: q(1_003) }), t + 200);
+  assert(asm.due(t + 230)[0]?.timestamp === 1_003, 'headerless: time from the log\'s blockTimestamp');
+  // Ticks: newest known block, once tickMs old, only with nothing held.
+  times.set(110, { timestamp: 1_010, l1Block: 8 }); newest = { block: 110, at: t + 300 };
+  asm.addLog(L(P1, [SYNC_TOPIC], 109, 0, 0), t + 300);
+  assert(asm.due(t + 560).filter((x) => !x.logs.length).length === 0 || asm.lastSent === 110, 'headerless: no tick jumps ahead of a held block');
+  const tk = asm.due(t + 600);
+  assert(asm.lastSent === 110 && (tk.length === 0 || tk[tk.length - 1]!.block === 110), 'headerless: block_tick for the newest feed block once old enough');
+  // Late: the block's remembered time, no bloom.
+  const late = asm.addLog(L(P1, [SYNC_TOPIC], 101, 2, 3), t + 700);
+  assert(!!late && late.late === true && late.timestamp === 1_001 && !late.logsBloom && !(blockMessage(late) as any).logsBloom, 'headerless: late report -> its own message with the block\'s time, no bloom');
+  // Checker style: times given with addHead (bloom ignored), ticks from them.
+  const a2 = new BlockAssembler(30, 1500, { headers: false, tickMs: 250 });
+  a2.addHead(headFromNewHeads(H(200), t)!);
+  assert(a2.due(t + 100).length === 0, 'headerless: a header alone never makes a block due (only its time is kept)');
+  const k = a2.due(t + 250);
+  assert(k.length === 1 && k[0]!.block === 200 && k[0]!.logs.length === 0 && (blockMessage(k[0]!) as any).type === 'block_tick' && !(blockMessage(k[0]!) as any).logsBloom, 'headerless (checker): tick for the newest header after tickMs, without its bloom');
+}
+
+// The bot's forwarder in its default headerless mode.
+async function headerlessForwarderTests() {
+  const index: Copy2Index = { pools: new Set([P1, P2]), ids: new Set<string>(), poolManager: PM, coins: new Set([WETH, USDG, MEME]), poolCoins: new Map([[P1, [WETH, USDG]], [P2, [MEME, WETH]]]) };
+  const times = new FeedBlockTimes(0, 1024, () => clock);
+  const calls: string[] = [];
+  const rpc = async (m: string) => { calls.push(m); if (m === 'eth_blockNumber') return q(70); if (m === 'eth_getLogs') return []; return null; };
+  const { f, sent, setOk } = makeForwarder(index, rpc, times, false);
+  assert(!f.usesHeaders(), 'forwarder default for the bot: headerless');
+  f.onLive(); f.setActive(true);
+  for (let b = 50; b <= 60; b++) times.set(b, 1_760_000_000 + b, 23_000_000);
+  f.onLogs([L(P1, [SYNC_TOPIC], 50, 0, 0), L(WETH, [TRANSFER_TOPIC, pad(P1), pad(P2)], 50, 0, 1)]);
+  f.onLogs([L(WETH, [TRANSFER_TOPIC, pad(P1), pad(P2)], 50, 0, 1)]);      // same transfer via the "to" subscription
+  f.onHead(H(50));                                                         // ignored headerless
+  advance(20);
+  assert(sent.length === 0, 'headerless: block held while its reports may still come (no later block yet)');
+  f.onLogs([L(P2, [SYNC_TOPIC], 52, 0, 0)]);
+  advance(10);
+  assert(sent.length === 1 && sent[0].block === 50 && sent[0].logs.length === 2 && sent[0].timestamp === 1_760_000_050 && sent[0].l1Block === 23_000_000 && sent[0].logsBloom === undefined, 'headerless: a later block reported -> block 50 at once, feed time, no bloom, transfer once');
+  assert(sent[0].prevBlock === 50 && sent[0].gap === true, 'first message: prevBlock = itself (reload if the copy already followed)');
+  advance(30);
+  assert(sent.length === 2 && sent[1].block === 52 && sent[1].prevBlock === 50 && !sent[1].gap, 'headerless: newest block after COPY2_GRACE_MS; prevBlock = previous block passed on (51 had nothing)');
+  // Tick for the feed's newest block (nothing held).
+  advance(300);
+  const tick = sent.find((m) => m.type === 'block_tick');
+  assert(!!tick && tick.block === 60 && tick.prevBlock === 52 && tick.logsBloom === undefined, 'headerless: block_tick for the newest feed block (no bloom), chained');
+  // Block time unknown: not sent, the copy reloads.
+  f.onLogs([L(P1, [SYNC_TOPIC], 61, 0, 0)]);
+  advance(200);
+  assert(!sent.some((m) => m.block === 61) && f.counts.noTimestamp === 1 && !f.live() && !calls.includes('eth_getBlockByNumber'), 'headerless: time unknown -> block skipped (never guessed, no header read), routing stops');
+  times.set(62, 1_760_000_062, 23_000_000);
+  f.onLogs([L(P1, [SYNC_TOPIC], 62, 0, 0)]); advance(40);
+  const m62 = sent[sent.length - 1];
+  assert(m62.block === 62 && m62.prevBlock === 62 && m62.gap === true, 'next message: prevBlock = itself (the copy reloads)');
+  // Dropped message: next one reloads.
+  times.set(63, 1_760_000_063, 23_000_000); times.set(64, 1_760_000_064, 23_000_000);
+  setOk(false); f.onLogs([L(P1, [SYNC_TOPIC], 63, 0, 0)]); advance(40); setOk(true);
+  f.onLogs([L(P1, [SYNC_TOPIC], 64, 0, 0)]); advance(40);
+  const m64 = sent[sent.length - 1];
+  assert(m64.block === 64 && m64.prevBlock === 64, 'after a dropped message: prevBlock = itself (copy reloads)');
+  // Late report.
+  f.onLogs([L(P2, [SYNC_TOPIC], 52, 4, 9)]); advance(0);
+  const late = sent[sent.length - 1];
+  assert(late.late === true && late.block === 52 && late.timestamp === 1_760_000_052 && late.logsBloom === undefined, 'headerless: late report on its own, with its block\'s time');
+  // Outage fill-in: reports only, no header reads.
+  f.onDown(); f.onLive();
+  await settle(10, 6);
+  assert(calls.filter((c) => c === 'eth_getLogs').length === 3 && !calls.includes('eth_getBlockByNumber'), 'headerless outage fill-in: report reads only, never a header read');
+  f.setActive(false);
+  advance(200);
+}
+
 // Same reports and headers through the dry-run checker's assembly
 // (copy2Blocks.ts, as copy2-dryrun.ts uses it) and through the bot's
 // forwarder: the messages arbsim gets must be the same (the bot only adds
 // prevBlock / gap, and sends a repeated report once; arbsim drops repeats).
-async function parityTests() {
+async function parityTests(headers: boolean) {
   const index: Copy2Index = { pools: new Set([P1, P2]), ids: new Set<string>(), poolManager: PM, coins: new Set([WETH, USDG, MEME]), poolCoins: new Map([[P1, [WETH, USDG]], [P2, [MEME, WETH]]]) };
-  const { f, sent } = makeForwarder(index);
-  const asm = new BlockAssembler(30, 1500);
+  // Headerless: the bot takes block times from its sequencer feed, the
+  // checker from the headers it is given (same values).
+  const times = new FeedBlockTimes(0, 1024, () => clock);
+  const { f, sent } = makeForwarder(index, null, headers ? undefined : times, headers);
+  const asm = new BlockAssembler(30, 1500, { headers });
   const ref: any[] = [];
   const xfer = L(WETH, [TRANSFER_TOPIC, pad(P1), pad(P2)], 50, 0, 1);   // between two followed pools
   const events: Array<{ t: number; log?: Log; head?: any }> = [
@@ -314,15 +406,17 @@ async function parityTests() {
     advance(t0 + t - clock);
     for (const e of events.filter((x) => x.t === t)) {
       if (e.log) { f.onLogs([e.log]); const late = asm.addLog(e.log, clock); if (late) ref.push(blockMessage(late)); }
-      if (e.head) { f.onHead(e.head); asm.addHead(headFromNewHeads(e.head, clock)!); }
+      if (e.head) { f.onHead(e.head); asm.addHead(headFromNewHeads(e.head, clock)!); times.set(Number(BigInt(e.head.number)), Number(BigInt(e.head.timestamp)), Number(BigInt(e.head.l1BlockNumber))); }
     }
     if (t % 10 === 0) for (const b of asm.due(clock)) ref.push(blockMessage(b));
   }
   const strip = (m: any) => { const { prevBlock, gap, late, ...rest } = m; void prevBlock; void gap; void late; return rest; };
   const refDedup = ref.map((m) => (m.logs ? { ...m, logs: m.logs.filter((l: any, i: number, a: any[]) => a.findIndex((x) => x.logIndex === l.logIndex && x.transactionHash === l.transactionHash) === i) } : m));
   const a = JSON.stringify(sent.map(strip)), b = JSON.stringify(refDedup.map((m) => JSON.parse(JSON.stringify(m))));
-  assert(a === b, `bot block messages = the checker's (same blocks, order, logs, time, bloom; late as its own message)${a === b ? '' : `\n bot ${a}\n ref ${b}`}`);
-  assert(ref[0].logs.length === 3 && sent[0].logs.length === 2 && f.counts.dupLogs === 1, 'transfer between two followed pools (from- AND to- subscription): checker sends it twice (arbsim drops the repeat), bot once');
+  const mode = headers ? 'headers on' : 'headerless';
+  assert(a === b && sent.length >= 3, `${mode}: bot block messages = the checker's (same blocks, order, logs, time, bloom; late as its own message)${a === b ? '' : `\n bot ${a}\n ref ${b}`}`);
+  assert(ref[0].logs.length === 3 && sent[0].logs.length === 2 && f.counts.dupLogs === 1, `${mode}: transfer between two followed pools (from- AND to- subscription): checker sends it twice (arbsim drops the repeat), bot once`);
+  if (!headers) assert(sent.every((m) => m.logsBloom === undefined), 'headerless: no logsBloom on any message');
   f.setActive(false);
   advance(100);
 }
@@ -462,11 +556,12 @@ async function linkTests() {
   assert(v4 && v4.address === PM && v4.v4Id === id && v4.fee === 3000 && v4.tickSpacing === 60 && v4.token0 === WETH, 'track: V4 entry carries PoolManager, id, fee, tick spacing, coins');
   assert(link.notReadyWhy([P1]) === 'pool reports not flowing', 'track accepted but nothing passed on yet (gap pending): node decides');
   // First block passes (with gap), then a fresh status says ready.
+  link.times.set(40, 1_760_000_040, 1);
   link.tap.onLogs([L(P1, [SYNC_TOPIC], 40, 0, 0), L(PM, [V4_SWAP_TOPIC, id], 40, 1, 1)]);
-  link.tap.onHead!(H(40));
   advance(50);
-  assert(client.oneWay.length === 1 && client.oneWay[0].block === 40 && client.oneWay[0].gap === true && client.oneWay[0].logsBloom === BLOOM, 'pool_logs passed to the fast check (first with gap), carrying the header bloom');
+  assert(client.oneWay.length === 1 && client.oneWay[0].block === 40 && client.oneWay[0].gap === true && client.oneWay[0].timestamp === 1_760_000_040 && client.oneWay[0].logsBloom === undefined, 'pool_logs passed to the fast check (first with gap), time from the feed, no bloom (headers off by default)');
   assert(link.tap.dailyShare!() === 0.8 && copy2Settings({ COPY2_WSS_MAX_PCT: '50' }).wssMaxPct === 50 && copy2Settings({}).graceMs === 30, 'settings: copy-2 share of the daily WebSocket cap (80 %), grace 30 ms');
+  assert(!copy2Settings({}).headers && link.tap.headers!() === false && copy2Settings({ COPY2_HEADERS: 'on' }).headers, 'COPY2_HEADERS: off by default (no newHeads, no header reads), on when set');
   assert(link.notReadyWhy([P1]) === 'reloading after a gap', 'status taken before the gap is not trusted');
   advance(1);
   link.applyStatus({ ok: true, source: 'pool-events', copy2: { pools: { [P1]: 'ready', [P2]: 'unsure', [id]: 'ready' } } });
@@ -494,7 +589,7 @@ async function linkTests() {
   link2.applyStatus({ ok: true, source: 'pool-events' });
   link2.tap.onLive({ pools: new Set([P1]), ids: new Set(), transferPools: new Set([P1]), coins: new Set([WETH, USDG]) });
   await tick(); await tick();
-  link2.tap.onLogs([L(P1, [SYNC_TOPIC], 50, 0, 0)]); link2.tap.onHead!(H(50)); advance(50);
+  link2.tap.onLogs([L(P1, [SYNC_TOPIC], 50, 0, 0)]); advance(50);
   assert(c2.oneWay.length === 0 && link2.notReadyWhy([P1]) === 'track list not accepted yet', 'track refused: nothing passed on, node decides');
   // LOCAL_SIM_COPY2=off
   assert(copy2Settings({ LOCAL_SIM_COPY2: 'off' }).mode === 'off' && copy2Settings({}).mode === 'auto', 'LOCAL_SIM_COPY2=off switch');
@@ -553,12 +648,12 @@ function wsTapTests() {
     const got: RpcLog[][] = [];
     let live: any = null, downs = 0;
     const heads: any[] = [];
-    const tap = { wanted: () => true, transferFilter: () => ({ coins: [USDG, WETH], pools: [P1, P2] }), onLogs: (l: RpcLog[]) => got.push(l), onHead: (h: any) => heads.push(h), onLive: (c: any) => { live = c; }, onDown: () => { downs++; } };
+    const tap = { wanted: () => true, headers: () => true, transferFilter: () => ({ coins: [USDG, WETH], pools: [P1, P2] }), onLogs: (l: RpcLog[]) => got.push(l), onHead: (h: any) => heads.push(h), onLive: (c: any) => { live = c; }, onDown: () => { downs++; } };
     const { r, sockets, applied } = make(tap);
     r.start(); sockets[0]!.open();
     const s = sockets[0]!.sent;
     assert(s.length === 5, 'tap wanted: five subscriptions');
-    assert(s[4].params[0] === 'newHeads' && s[4].id === 2, 'tap wanted: block headers too (newHeads: time + logsBloom for each block message)');
+    assert(s[4].params[0] === 'newHeads' && s[4].id === 2, 'tap wanted with COPY2_HEADERS=on: block headers too (newHeads: time + logsBloom for each block message)');
     assert(!s[0].params[1].topics && JSON.stringify(s[0].params[1].address) === JSON.stringify([P1, P2]), 'our pools: ALL their events (no topic filter), still only our addresses');
     assert(s[1].params[1].topics[0] === null && s[1].params[1].topics[1][0] === ID, 'V4: every PoolManager event for our pool ids');
     assert(s[2].params[1].topics[0] === TRANSFER_TOPIC && s[2].params[1].topics[1][0] === pad(P1) && JSON.stringify(s[2].params[1].address) === JSON.stringify([USDG, WETH]), 'coin transfers FROM our pools (our coins only)');
@@ -597,10 +692,22 @@ function wsTapTests() {
     assert(sockets[1]!.sent.length === 2 && !!sockets[1]!.sent[0].params[1].topics, 'reconnected with the normal subscriptions only');
     r.stop();
   }
+  // COPY2_HEADERS off (default): the tap's subscriptions without newHeads.
+  {
+    let live: any = null;
+    const tap = { wanted: () => true, headers: () => false, transferFilter: () => ({ coins: [WETH], pools: [P1] }), onLogs: () => {}, onHead: () => {}, onLive: (c: any) => { live = c; }, onDown: () => {} };
+    const { r, sockets } = make(tap);
+    r.start(); sockets[0]!.open();
+    const sub = sockets[0]!.sent;
+    assert(sub.length === 4 && !sub.some((x) => x.params?.[0] === 'newHeads'), 'headers off: four tap subscriptions, NO newHeads (no billed message per block)');
+    for (const id of [1, 3, 4, 5]) sockets[0]!.reply(id, '0xs' + id);
+    assert(!!live, 'headers off: tap live without a header subscription');
+    r.stop();
+  }
   // Provider refuses the header subscription: copy 2 off on this reader, normal events go on.
   {
     let downs = 0;
-    const tap = { wanted: () => true, transferFilter: () => ({ coins: [WETH], pools: [P1] }), onLogs: () => {}, onHead: () => {}, onLive: () => {}, onDown: () => { downs++; } };
+    const tap = { wanted: () => true, headers: () => true, transferFilter: () => ({ coins: [WETH], pools: [P1] }), onLogs: () => {}, onHead: () => {}, onLive: () => {}, onDown: () => { downs++; } };
     const { r, sockets } = make(tap);
     r.start(); sockets[0]!.open();
     sockets[0]!.reply(1, '0xs1'); sockets[0]!.replyError(2, 'newHeads not allowed');
@@ -613,7 +720,7 @@ function wsTapTests() {
   // Copy-2 budget: past its share of the daily cap, copy 2's subscriptions stop for the day.
   {
     let downs = 0;
-    const tap = { wanted: () => true, dailyShare: () => 0.5, transferFilter: () => ({ coins: [WETH], pools: [P1] }), onLogs: () => {}, onHead: () => {}, onLive: () => {}, onDown: () => { downs++; } };
+    const tap = { wanted: () => true, headers: () => true, dailyShare: () => 0.5, transferFilter: () => ({ coins: [WETH], pools: [P1] }), onLogs: () => {}, onHead: () => {}, onLive: () => {}, onDown: () => { downs++; } };
     const sockets: FakeSocket[] = [];
     const r = new WsBlockReader({
       url: 'wss://example.invalid/KEY', httpRpc: async () => [], poolManager: PM, addresses: () => [P1], v4Ids: () => new Set<string>(),
@@ -677,7 +784,10 @@ async function main() {
   await forwarderTests();
   await feedL1Tests();
   await headerlessTests();
-  await parityTests();
+  await parityTests(true);
+  await parityTests(false);
+  await headerlessAssemblerTests();
+  await headerlessForwarderTests();
   await backfillTests();
   statusTests();
   await linkTests();
