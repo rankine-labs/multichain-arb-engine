@@ -5666,6 +5666,15 @@ impl Intake {
                 let have: HashSet<LogId> = bb.logs.iter().map(log_id).collect();
                 let extra: Vec<PoolLog> = ls.iter().filter(|l| !have.contains(&log_id(l))).cloned().collect();
                 if !extra.is_empty() {
+                    // The recent list learns them too (a late message with
+                    // them is then not new).
+                    if let Some(r) = self.recent.iter_mut().find(|r| r.0 == *b) {
+                        r.1.extend(extra.iter().map(log_id));
+                        r.1.sort();
+                        r.2.push(k);
+                        r.2.sort();
+                        r.2.dedup();
+                    }
                     let mut v: Vec<PoolLog> = (*bb.logs).clone();
                     v.extend(extra);
                     v.sort_by_key(|l| (l.tx_index, l.log_index));
@@ -5766,6 +5775,8 @@ impl Intake {
         }
         working.extend(self.load_q.iter().map(|(r, _, _)| r.key));
         working.extend(self.delayed.iter().map(|d| d.1));
+        // Parked pools listed again wait for their log read (copy2-n).
+        working.extend(self.resuming.keys().copied());
         let now = Instant::now();
         let mut stuck: Vec<(PoolKey, String)> = Vec::new();
         let mut overdue: Vec<String> = Vec::new();
