@@ -190,6 +190,22 @@ pub fn node_bench(args: &[String]) {
                 let t = Instant::now();
                 let r = crate::copy2::coins::probe_layout(&*client, coin, tip);
                 println!("  G coin probe {coin}: {:.0} ms -> {:?}", t.elapsed().as_secs_f64() * 1000.0, r.map(|l| l.map(|l| l.to_json())));
+                // G2: the same probe from `par` threads at once (copy 2's
+                // workers, its exact node class "bulk").
+                let t0 = Instant::now();
+                let hs: Vec<_> = (0..par)
+                    .map(|_| {
+                        let c = client.clone();
+                        std::thread::spawn(move || {
+                            let t = Instant::now();
+                            let ok = crate::copy2::coins::probe_layout(&*c, coin, tip).is_ok();
+                            (t.elapsed().as_secs_f64() * 1000.0, ok)
+                        })
+                    })
+                    .collect();
+                let res: Vec<(f64, bool)> = hs.into_iter().map(|h| h.join().unwrap()).collect();
+                let ms: Vec<f64> = res.iter().filter(|x| x.1).map(|x| x.0).collect();
+                stats(&format!("G2 coin probe x{par} in parallel (copy 2's path)"), ms, res.iter().filter(|x| !x.1).count(), t0.elapsed());
             }
             Err(e) => println!("  G --probe-coin: {e}"),
         }
