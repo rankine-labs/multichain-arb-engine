@@ -627,3 +627,81 @@ trade ~20 ms.
   Cost: 0 new WebSocket messages, 0 new node requests (the same one
   debug_traceCall per V4 pool, bigger answer); memory: far zero words ~32
   bytes each (~700 per spacing-10 pool, ~6900 per spacing-1 pool).
+- Live shadow Oct 22 10:36 UTC, 89 min (inbot-sim/copy2-l): healthy (632/656
+  ready, walks 100 %, 1 forced reload, 307 MB) and accurate (11/11 answers
+  same as the node) but few answered: hourly 11 of 38, status 4 of 62
+  (counted since arbsim started; one bot check can be several sidecar
+  checks). missesTopSlots: WETH 17 + USDG 16 = the balances of ONE pool,
+  0x52e65b17 (V3 WETH/USDG, the busiest); protocolFeesAccrued[0x2d42..]
+  14 (+5 as "pool not ready"); first-time misses of coin settings (WETH
+  0x35, 0x2d42.. ..d00/..d01, 2 each) and of 0xe10b6f6b.. (9).
+  1. Pool balance MISSING over and over. Two causes, both reproduced in
+     tests/copy2_intake.rs (they fail on the old code, pass now):
+     a. A late coin Transfer (the bot hears it on another subscription
+        after the block went out, or a settle finds it ~1.5 s later) for a
+        balance that already had a LATER transfer applied made the balance
+        forgotten (old rule "a transfer older than one already applied
+        forgets that balance"). On a pool trading every few blocks that is
+        nearly every late transfer
+        (late_coin_transfer_after_a_later_one_is_added_not_forgotten,
+        late_coin_transfer_already_in_the_node_value_changes_nothing).
+     b. Once missing, a fill read at node block k was thrown away ("asked
+        again in 1 s") whenever the pool had a transfer after k: for this
+        pool, always (busy_pool_coin_balance_fill_is_carried_forward_exactly).
+     Not causes: replays never write coin storage; WETH (OZ upgradeable
+     ERC20, balances at 0x33) and USDG (mapping slot 1) move balances only
+     with Transfer events.
+     Fix (exact, no new node requests): every followed pool balance has a
+     coin_base = the block of the node value it descends from (load fetch
+     block / fill block; older versions forget it when a newer read is put
+     in). A late Transfer at block n > base is ADDED to every kept version
+     from n on (per version, all of a slot's late amounts summed first:
+     order-free; below zero = that version's value was wrong -> forgotten
+     there and after). n <= base: already inside the node value, nothing
+     added (versions in [n, base) forget). Fills of a pool balance: node
+     value at k plus/minus the kept Transfers of blocks k+1..j into every
+     version j >= k (needs the copy at/past k and the report buffer
+     reaching past k with no hole; else asked again). Counters
+     late_coin_deltas, late_coin_included, fill_balance_carried.
+  2. protocolFeesAccrued[coin] (PoolManager slot keccak(coin . 1)): the V4
+     swap adds the protocol fee to it (unchecked +=) when the pool has a
+     protocol fee on in that direction. Its value only matters as zero /
+     not zero (SSTORE gas 20000 vs 2900; no revert possible), so the
+     two-run trick works IF it is proven non-zero. It is not provable:
+     collectProtocolFees (protocol fee controller) can empty it and leaves
+     NO PoolManager event (only a coin Transfer from the PoolManager, which
+     the bot does not subscribe to: every V4 take is one). Other pools'
+     swaps also add to it. So: not followed, fills refused (as before),
+     those checks stay unknown; status names it. Options (not built): the
+     bot sends the PoolManager's outgoing Transfers of the protocol-fee
+     coins (collections become visible; cost = every V4 payout of those
+     coins), or the bot accepts a gas number that may be 17,100 low.
+  3./4. Coin settings and other accounts: WETH slot 0x35 = totalSupply (OZ
+     order balances 0x33, allowances 0x34, totalSupply 0x35): moves with
+     every wrap / unwrap on the chain (our contract unwraps / wraps for
+     native-ETH V4 pools); cannot be followed from our reports. 0x2d42..'s
+     ..d00 / ..d01 are a namespaced (ERC-7201 style) struct the coin reads
+     on every transfer (the coin HAS a general balance layout: the label
+     "not a balance ..." is only given then); 0xe10b6f6b.. could not be
+     identified offline (no chain access from here). These are "first
+     read" misses (2 each = two checks at once before the fill landed):
+     after the fill the copy HOLDS them, and nothing ever refreshed them
+     (a changed pause flag / allow list would have been used stale).
+     Now: every ARBSIM_COPY2_VERIFY_S (60) one bulk fetch re-reads up to
+     ARBSIM_COPY2_VERIFY_MAX (400) held values nothing follows (all
+     storage of accounts that are not a pool / pool-owned / PoolManager /
+     outside contract; for coins every slot except our pools' balances);
+     a value the chain changed is forgotten in every version, put in again
+     from the re-read block (like a fill), counted (unfollowed_changed,
+     status unfollowedChanged [account, slot, times]) and logged (first 3
+     per value). WETH totalSupply will show up there every round (expected:
+     its absolute value doesn't change a check's result as long as it is
+     not near zero); anything else there = tell Claude. Cost: ~1 bulk
+     eth_getProof per held account per minute (tens of requests a minute).
+  5. Status: checks.unknownBy {reason: n} (miss, pending_reports,
+     unsure_pool, pool_manager_balance, not_ready, stale, dirty, ...) and
+     checks.blockedBy [label, checks missing it, checks missing ONLY it]
+     (label = class + short account + what the slot is), so the next
+     shadow hour shows whether every unknown check is a missed value and
+     which value alone blocks how many. deploy/arbsim-status.js prints both.
+     describe_slot names "probably totalSupply" and namespaced settings.

@@ -1011,15 +1011,16 @@ fn late_reports_after_the_known_ones_are_applied_not_a_reorg() {
     assert_eq!(r.head_slot(a(COIN0), map_slot(a(V2P), 0)), Lookup::Known(u(1100)));
     assert_eq!(r.head_slot(a(COIN1), map_slot(a(V2P), 0)), Lookup::Known(u(3640)));
     assert_eq!(r.sh.head().unwrap().block, 101);
-    // A late coin transfer BEFORE one already applied to that balance: not
-    // exact -> that balance is forgotten (fetched again), the pool stays.
+    // A late coin transfer BEFORE one already applied to that balance: it
+    // used to make the balance forgotten; adding is exact in any order
+    // (copy2-l), so it is added; the pool stays.
     let mut odd = vec![transfer(a(COIN0), a(USER), a(V2P), 1, 101, 1, 0)];
     odd.push(transfer(a(COIN0), a(USER), a(V2P), 100, 101, 3, 0));
     odd.push(transfer(a(COIN1), a(V2P), a(USER), 360, 101, 3, 1));
     odd.push(v2_sync(1100, 3640, 101, 3, 2));
     r.intake.process(msg(101, 62, odd));
     assert_eq!(r.state(&v2_pool()).0, PoolState::Ready);
-    assert_eq!(r.head_slot(a(COIN0), map_slot(a(V2P), 0)), Lookup::Missing);
+    assert_eq!(r.head_slot(a(COIN0), map_slot(a(V2P), 0)), Lookup::Known(u(1101)));
     assert_eq!(r.head_slot(a(COIN1), map_slot(a(V2P), 0)), Lookup::Known(u(3640)));
 }
 
@@ -1773,4 +1774,190 @@ fn kept_reports_are_bounded_while_a_slow_load_holds_them() {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     assert_eq!(r.state(&v2_pool()).0, PoolState::Ready, "{:?}", r.state(&v2_pool()));
+}
+
+// ---------------------------------------------------------------------------
+// copy2-l (live Oct 22 shadow): the busiest pool's coin balances went
+// MISSING over and over ("coin slot" misses of WETH / USDG at
+// 0x52e65b17, 33 in 89 min).
+// ---------------------------------------------------------------------------
+
+fn bal_at(r: &Rig, block: u64, coin: u8, holder: u8) -> Lookup<U256> {
+    r.sh.resolve(&At::Block(block)).unwrap().snap.storage(a(coin), map_slot(a(holder), 0))
+}
+
+/// Cause 1: a late coin Transfer (its subscription delivered it after the
+/// block went out, or a settle found it ~1.5 s later) arriving after a
+/// LATER transfer of the same balance had been applied made the balance
+/// MISSING ("a transfer older than one already applied forgets that
+/// balance"). On a pool trading every few blocks that is almost every late
+/// transfer. Adding is exact in any order: now the late amount is added to
+/// every kept version from its block on, and nothing is forgotten.
+#[test]
+fn late_coin_transfer_after_a_later_one_is_added_not_forgotten() {
+    let mut r = rig();
+    r.track(vec![v2_pool()]);
+    r.send(tick(100, 60));
+    assert_eq!(bal_at(&r, 100, COIN0, V2P), Lookup::Known(u(1000)));
+    // Blocks 101 and 102 arrive with one transfer each.
+    r.intake.process(msg(101, 61, vec![transfer(a(COIN0), a(USER), a(V2P), 100, 101, 1, 0)]));
+    r.intake.process(msg(102, 62, vec![transfer(a(COIN0), a(USER), a(V2P), 50, 102, 0, 0)]));
+    assert_eq!(bal_at(&r, 102, COIN0, V2P), Lookup::Known(u(1150)));
+    // Block 101's other transfer (the pool paid 30 out, tx 0) arrives late.
+    r.intake.process(msg(101, 61, vec![transfer(a(COIN0), a(V2P), a(USER), 30, 101, 0, 0)]));
+    assert_eq!(bal_at(&r, 100, COIN0, V2P), Lookup::Known(u(1000)), "before the transfer: unchanged");
+    assert_eq!(bal_at(&r, 101, COIN0, V2P), Lookup::Known(u(1070)));
+    assert_eq!(bal_at(&r, 102, COIN0, V2P), Lookup::Known(u(1120)), "the late amount is in every version from its block on");
+    let c = |n: &str| r.h.status_json(false)["counters"][n].as_u64().unwrap();
+    assert_eq!(c("late_coin_deltas"), 1);
+    assert_eq!(c("coin_slot_mismatch"), 0, "nothing forgotten");
+    // A late transfer that would take a version below zero: that version's
+    // value was wrong -> forgotten there and after (never a guess).
+    r.intake.process(msg(102, 62, vec![transfer(a(COIN0), a(V2P), a(USER), 1_100, 102, 1, 0)]));
+    assert_eq!(bal_at(&r, 102, COIN0, V2P), Lookup::Known(u(20)));
+    r.intake.process(msg(101, 61, vec![transfer(a(COIN0), a(V2P), a(USER), 1_080, 101, 2, 0)]));
+    assert_eq!(bal_at(&r, 101, COIN0, V2P), Lookup::Missing, "1070 - 1080 < 0: wrong, forgotten");
+    assert_eq!(bal_at(&r, 102, COIN0, V2P), Lookup::Missing, "and in every newer version");
+    assert_eq!(bal_at(&r, 100, COIN0, V2P), Lookup::Known(u(1000)), "older versions untouched");
+}
+
+/// A late Transfer from a block at or before the block the held value was
+/// read from the node at is already inside that value: nothing is added
+/// (the old rule forgot the balance here too).
+#[test]
+fn late_coin_transfer_already_in_the_node_value_changes_nothing() {
+    let mut r = rig();
+    r.track(vec![v2_pool()]);
+    r.send(tick(100, 60)); // loaded at block 100: the node value has block 100 in it
+    r.intake.process(tick(101, 61));
+    r.intake.process(msg(100, 60, vec![transfer(a(COIN0), a(USER), a(V2P), 77, 100, 0, 0)]));
+    assert_eq!(bal_at(&r, 101, COIN0, V2P), Lookup::Known(u(1000)));
+    assert_eq!(bal_at(&r, 100, COIN0, V2P), Lookup::Known(u(1000)));
+    assert_eq!(r.h.status_json(false)["counters"]["late_coin_included"], json!(1));
+}
+
+/// Cause 2: once missing, the balance of a pool that trades every few
+/// blocks was never filled: a fill read at block k was thrown away (asked
+/// again in 1 s) whenever the pool had a transfer after k, i.e. always.
+/// Now the node value at k is carried forward through the kept Transfers
+/// since k, exactly, into every version from k on; a Transfer for a block
+/// after k that arrives later still is added (it is not in the node value),
+/// one for a block <= k is not (it is).
+#[test]
+fn busy_pool_coin_balance_fill_is_carried_forward_exactly() {
+    let mut r = rig();
+    *r.chain.tip.lock().unwrap() = 102; // the node trails the copy
+    r.track(vec![v2_pool()]);
+    r.send(tick(100, 60));
+    let slot = map_slot(a(V2P), 0);
+    // The chain: the pool gets 10 coin0 in every block 101..=105.
+    let mut st = genesis();
+    for b in 101..=105u64 {
+        st.get_mut(&a(COIN0)).unwrap().insert(slot, u(1000 + 10 * (b as u128 - 100)));
+        r.chain.set(b, st.clone());
+    }
+    // The copy lost the balance (stands for any forget) before block 101.
+    {
+        let mut p = r.sh.published.write().unwrap();
+        for i in 0..p.versions.len() {
+            let v = p.versions[i].clone();
+            let mut s = (*v.snap).clone();
+            if let Some(acct) = s.accounts.get_mut(&a(COIN0)) {
+                acct.storage.remove(&slot);
+            }
+            p.versions[i] = Arc::new(arbsim::state::mirror::Version { snap: Arc::new(s), ..(*v).clone() });
+        }
+    }
+    for b in 101..=105u64 {
+        r.intake.process(msg(b, 60 + b - 100, vec![transfer(a(COIN0), a(USER), a(V2P), 10, b, 0, 0)]));
+    }
+    assert_eq!(bal_at(&r, 105, COIN0, V2P), Lookup::Missing);
+    // A check misses it: the fill reads block 102 (the node's newest).
+    r.h.fill(vec![MissItem::Slot(a(COIN0), slot)]);
+    r.settle();
+    for b in 102..=105u64 {
+        assert_eq!(bal_at(&r, b, COIN0, V2P), Lookup::Known(u(1000 + 10 * (b as u128 - 100))), "block {b}");
+    }
+    assert_eq!(bal_at(&r, 101, COIN0, V2P), Lookup::Missing, "older than the node read: not vouched for");
+    let c = |n: &str| r.h.status_json(false)["counters"][n].as_u64().unwrap();
+    assert_eq!(c("fill_balance_carried"), 1);
+    assert_eq!(c("fill_retry"), 0, "not asked again");
+    // A late transfer for block 104 (after the node read): added from 104 on.
+    r.intake.process(msg(104, 64, vec![transfer(a(COIN0), a(USER), a(V2P), 5, 104, 1, 0)]));
+    assert_eq!(bal_at(&r, 103, COIN0, V2P), Lookup::Known(u(1030)));
+    assert_eq!(bal_at(&r, 104, COIN0, V2P), Lookup::Known(u(1045)));
+    assert_eq!(bal_at(&r, 105, COIN0, V2P), Lookup::Known(u(1055)));
+    // A late transfer for block 102 (inside the node read): nothing to add.
+    r.intake.process(msg(102, 62, vec![transfer(a(COIN0), a(USER), a(V2P), 7, 102, 1, 0)]));
+    assert_eq!(bal_at(&r, 105, COIN0, V2P), Lookup::Known(u(1055)));
+    assert_eq!(bal_at(&r, 102, COIN0, V2P), Lookup::Known(u(1020)));
+    // The next on-time transfer is followed as usual.
+    r.intake.process(msg(106, 66, vec![transfer(a(COIN0), a(V2P), a(USER), 55, 106, 0, 0)]));
+    assert_eq!(bal_at(&r, 106, COIN0, V2P), Lookup::Known(u(1000)));
+}
+
+/// The status says why each unanswered check was unknown, and what the
+/// "miss" ones missed (live Oct 22: 4 of 62 answered; this tells whether
+/// every unknown check is explained by a missed value and which value
+/// alone blocks how many checks).
+#[test]
+fn status_counts_unknown_checks_by_reason_and_missed_value() {
+    let mut r = rig();
+    r.track(vec![v2_pool()]);
+    r.send(tick(100, 60));
+    r.h.note_unknown("pending_reports", &[]);
+    r.h.note_unknown("miss", &[MissItem::Slot(a(COIN0), map_slot(a(V2P), 0))]);
+    r.h.note_unknown("miss", &[MissItem::Slot(a(COIN0), map_slot(a(V2P), 0)), MissItem::Account(a(0x99))]);
+    let st = r.h.status_json(false);
+    assert_eq!(st["checks"]["unknownBy"]["miss"], json!(2), "{st}");
+    assert_eq!(st["checks"]["unknownBy"]["pending_reports"], json!(1));
+    let bb = st["checks"]["blockedBy"].as_array().unwrap();
+    let row = |needle: &str| bb.iter().find(|x| x[0].as_str().unwrap().contains(needle)).cloned().unwrap_or(json!(null));
+    assert_eq!(row("other account basics"), json!(["other account basics 0x00000000", 1, 0]), "{bb:?}");
+    assert_eq!(row("coin slot")[1], json!(2), "{bb:?}");
+    assert_eq!(row("coin slot")[2], json!(1), "{bb:?}");
+}
+
+/// Values the copy holds but nothing follows (a coin's settings, another
+/// contract's storage, read once by a fill) are re-read every
+/// ARBSIM_COPY2_VERIFY_S; one the chain changed is forgotten everywhere,
+/// put in again from the re-read's block on (like a fill) and counted (live Oct 22: a stock coin's namespaced settings and the
+/// contract 0xe10b6f6b.. were read by the bot's checks and then kept with
+/// nothing to say when they change). Followed values (our pools' coin
+/// balances) are not re-read.
+#[test]
+fn values_nothing_follows_are_reread_and_forgotten_when_the_chain_changed_them() {
+    let cfg = C2Config { verify_every_s: 1, ..C2Config::for_tests() };
+    let mut r = rig_with(cfg);
+    let mut st = genesis();
+    st.get_mut(&a(COIN0)).unwrap().insert(u(5), u(7)); // a coin setting
+    st.entry(a(0xe1)).or_default().insert(u(3), u(1)); // another contract
+    r.chain.set(100, st.clone());
+    r.track(vec![v2_pool()]);
+    r.send(tick(100, 60));
+    r.h.fill(vec![MissItem::Slot(a(COIN0), u(5)), MissItem::Slot(a(0xe1), u(3))]);
+    r.settle();
+    assert_eq!(r.head_slot(a(COIN0), u(5)), Lookup::Known(u(7)));
+    assert_eq!(r.head_slot(a(0xe1), u(3)), Lookup::Known(u(1)));
+    // Nothing changed: a round re-reads both and forgets nothing.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    r.send(tick(101, 61));
+    let c = |r: &Rig, n: &str| r.h.status_json(false)["counters"][n].as_u64().unwrap();
+    assert_eq!(c(&r, "verify_rounds"), 1);
+    assert_eq!(c(&r, "verify_items"), 2, "only the two unfollowed values (not the pool's balances)");
+    assert_eq!(c(&r, "unfollowed_changed"), 0);
+    assert_eq!(r.head_slot(a(COIN0), u(5)), Lookup::Known(u(7)));
+    // The chain changes the setting at block 102.
+    st.get_mut(&a(COIN0)).unwrap().insert(u(5), u(8));
+    r.chain.set(102, st.clone());
+    r.send(tick(102, 62));
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    r.send(tick(103, 63));
+    assert_eq!(c(&r, "unfollowed_changed"), 1);
+    assert_eq!(r.head_slot(a(COIN0), u(5)), Lookup::Known(u(8)), "changed on the chain: refreshed");
+    assert_eq!(r.sh.resolve(&At::Block(101)).unwrap().snap.storage(a(COIN0), u(5)), Lookup::Missing, "older versions: forgotten (since when it changed is unknown)");
+    assert_eq!(r.head_slot(a(0xe1), u(3)), Lookup::Known(u(1)));
+    assert_eq!(r.head_slot(a(COIN0), map_slot(a(V2P), 0)), Lookup::Known(u(1000)));
+    let st = r.h.status_json(false);
+    assert_eq!(st["unfollowedChanged"][0][1], json!("0x5"), "{st}");
 }

@@ -297,6 +297,9 @@ fn check(ctx: &Ctx, id: &Value, at: &Value, t0: Instant, run: impl Fn(&dyn State
         Ok(p) => p,
         Err(e) => {
             Stats::inc(&sh.stats.checks_unknown);
+            if let Some(c) = &ctx.copy2 {
+                c.note_unknown(e.reason, &[]);
+            }
             return unknown(id, e.reason, &e.detail, t0.elapsed().as_micros() as u64);
         }
     };
@@ -336,6 +339,14 @@ fn check(ctx: &Ctx, id: &Value, at: &Value, t0: Instant, run: impl Fn(&dyn State
                 answer["unknown"] = json!("unsure_pool");
                 answer["detail"] = json!(why);
             }
+        }
+        // Copy 2: every unanswered check counted by its reason (status
+        // checks.unknownBy) and, for misses, by what it missed (blockedBy).
+        if let Some(c) = &ctx.copy2 {
+            let why = answer.get("unknown").and_then(|u| u.as_str()).unwrap_or("error");
+            c.note_unknown(why, &missing);
+        }
+        if !missing.is_empty() {
             ctx.fill(missing);
         }
     }

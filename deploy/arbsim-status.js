@@ -218,6 +218,16 @@ async function main() {
   // 5. Checks answered
   const c = s.checks || 0;
   lines.push(`  Checks: ${n(c)} asked, ${n(s.checks_ok)} sure answers (${pct(s.checks_ok || 0, c)}), ${n(s.checks_unknown)} "unknown" (the bot then uses the node)`);
+  // Copy 2: why the unanswered ones were unknown, and what the "miss" ones
+  // missed ([label, checks missing it, checks missing ONLY it]).
+  const ck = s.copy2 && s.copy2.checks;
+  if (ck && ck.unknownBy && Object.keys(ck.unknownBy).length) {
+    lines.push(`    unknown because: ${Object.entries(ck.unknownBy).sort((a, b) => b[1] - a[1]).map(([k, v]) => `${k} ${n(v)}`).join(', ')}`);
+  }
+  if (ck && Array.isArray(ck.blockedBy) && ck.blockedBy.length) {
+    lines.push('    missed values (checks missing it / missing only it):');
+    for (const [label, all, only] of ck.blockedBy.slice(0, 8)) lines.push(`      ${n(all)} / ${n(only)}  ${label}`);
+  }
   lines.push(`  Its copy holds ${n(s.accounts)} accounts, ${n(s.slots)} storage values; ${n(s.fillQueue)} waiting to be fetched`);
 
   // 6. Node use today vs cap
