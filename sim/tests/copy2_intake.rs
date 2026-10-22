@@ -576,9 +576,12 @@ fn late_report_for_an_older_block_is_applied_to_that_pool_in_every_kept_version(
     assert_eq!(r.h.c2.stats.reorgs.load(std::sync::atomic::Ordering::Relaxed), 0);
 }
 
+/// (copy2-n: a gap is first filled from the node's logs, see
+/// tests/copy2_resume_anvil.rs; this is the reload when that is not
+/// possible: here switched off, ARBSIM_COPY2_RESUME_MAX_BLOCKS=0.)
 #[test]
 fn lost_message_reloads_everything() {
-    let mut r = rig();
+    let mut r = rig_with(C2Config { resume_max_blocks: 0, ..C2Config::for_tests() });
     r.track(vec![v2_pool(), sol_pool()]);
     r.send(tick(100, 60));
     let mut m = tick(101, 61);
@@ -601,7 +604,9 @@ fn lost_message_reloads_everything() {
 /// come back as soon as the signals stop.
 #[test]
 fn gap_signal_burst_does_not_keep_the_copy_unsure() {
-    let cfg = C2Config { reload_ms: 40, reload_max_ms: 600_000, ..C2Config::for_tests() };
+    // The reload path (when a gap can't be filled from the node's logs;
+    // copy2-n fills it first: tests/copy2_resume_anvil.rs).
+    let cfg = C2Config { reload_ms: 40, reload_max_ms: 600_000, resume_max_blocks: 0, ..C2Config::for_tests() };
     let mut r = rig_with(cfg);
     r.track(vec![v2_pool(), sol_pool()]);
     r.send(tick(100, 60));

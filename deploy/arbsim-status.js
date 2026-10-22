@@ -191,10 +191,23 @@ async function main() {
     };
     show('why unsure', c2.unsureReasons);
     show('loading now', c2.loadingReasons);
-    // Forced reloads ("reload every pool") by the bot's reason. "start" is
-    // harmless; anything else more than a few an hour: tell Claude.
+    // Gaps the bot reported (or messages lost), by reason. Since copy2-n they
+    // are filled from the node's logs (a reload only when that fails: see
+    // "catch-ups failed" below). "start" is harmless.
     const gr = c2.gapReasons && typeof c2.gapReasons === 'object' ? Object.entries(c2.gapReasons) : [];
-    if (gr.length) lines.push(`    forced reloads (every pool): ${gr.sort((a, b) => b[1] - a[1]).map(([w, v]) => `${w} ${n(v)}`).join(', ')}`);
+    if (gr.length) lines.push(`    gaps (bot restarts / missed blocks): ${gr.sort((a, b) => b[1] - a[1]).map(([w, v]) => `${w} ${n(v)}`).join(', ')}`);
+    // copy2-n: warm restart (saved copy, catch-ups from the node's logs, parked pools).
+    const rs = c2.resume || {};
+    if (rs.state) lines.push(`    warm restart: ${rs.state}`);
+    if (rs.lastCatchUp) {
+      const lc = rs.lastCatchUp;
+      lines.push(`    last catch-up (${lc.why}): blocks ${n(lc.fromBlock)}..${n(lc.toBlock)}, ${n(lc.reports)} reports, ${n(lc.requests)} node requests, ${lc.seconds} s`);
+    }
+    if (k.catchups || k.saves || k.pools_parked) {
+      lines.push(`    catch-ups ${n(k.catchups_done)} done / ${n(k.catchups_failed)} failed` + (k.catchups_failed ? '  <-- a failed one reloads every pool: see pm2 logs arbsim' : '') +
+        `; saves ${n(k.saves)} (${n(k.save_errors)} failed, slowest preparation ${((k.save_prep_us_max || 0) / 1000).toFixed(1)} ms)` +
+        `; pools kept aside ${n(k.pools_parked)}: ${n(k.parked_resumed)} caught up, ${n(k.parked_fallback)} loaded instead`);
+    }
     // copy2-m: late reports, stalled loads, V4 protocol fee counters.
     if (k.late_hole_blocks || k.late_old_covered || k.late_old_reload || k.stall_rescheduled) {
       lines.push(`    late reports: ${n(k.late_hole_blocks)} quiet blocks placed, ${n(k.late_old_covered)} already in the pools' values, ` +

@@ -47,6 +47,12 @@ fi
 # Daily node-use counter lives in data/ (kept across restarts, never in git).
 mkdir -p "$APP_DIR/data"
 export ARBSIM_BUDGET_FILE="${ARBSIM_BUDGET_FILE:-$APP_DIR/data/arbsim-node-budget.json}"
+# Warm restart (copy2-n): copy 2 saves itself here every minute and when
+# pm2 stops it, and continues from it at the next start (instead of loading
+# every pool from the node again). An ARBSIM_COPY2_STATE_FILE line in .env
+# wins; "off" there = never saved / read.
+export ARBSIM_COPY2_STATE_FILE="${ARBSIM_COPY2_STATE_FILE:-$APP_DIR/data/arbsim-copy2-state.bin}"
+[ "$ARBSIM_COPY2_STATE_FILE" = "off" ] && export ARBSIM_COPY2_STATE_FILE=""
 
 # Memory: at most 2 malloc "arenas" (glibc's default is 8 per CPU core).
 # The sidecar runs ~20 threads (16 node workers parse big JSON answers);

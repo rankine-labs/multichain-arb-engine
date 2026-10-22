@@ -135,6 +135,10 @@ impl Volatile {
     pub fn is_balance(&self, a: &Address) -> bool {
         self.balance.read().unwrap().contains(a)
     }
+    /// All never-trusted accounts (warm restart save).
+    pub fn whole_list(&self) -> Vec<Address> {
+        self.whole.read().unwrap().iter().copied().collect()
+    }
     /// All volatile-balance accounts (for status).
     pub fn balance_list(&self) -> Vec<Address> {
         self.balance.read().unwrap().iter().copied().collect()

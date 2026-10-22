@@ -41,6 +41,10 @@ rustc-hash = "2"
 base64 = "0.23"
 # Small blocking HTTPS client for the node's JSON-RPC (rustls, no OpenSSL).
 ureq = { version = "3", default-features = false, features = ["rustls"] }
+# (copy2-n, warm restart) catch SIGTERM / SIGINT so the copy is saved before
+# exiting. Already in the build (revm and others use it): nothing new downloaded.
+libc = "0.2"
+
 
 [dev-dependencies]
 # Tests only (workstream C): sign test transactions to check sender recovery.

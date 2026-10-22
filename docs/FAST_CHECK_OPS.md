@@ -73,6 +73,32 @@ see deploy/arbsim-pm2.sh), crash restarts wait longer each time (1 s up to 15 s)
 lines timestamped, logs rotated by pm2-logrotate. After a server reboot it
 comes back by itself within 2 minutes (auto-deploy), no `pm2 save` needed.
 
+### Warm restart (copy 2, since copy2-n)
+
+The sidecar no longer starts from nothing after a restart / deploy:
+
+- Every minute, and when pm2 stops it, copy 2 saves itself to
+  `data/arbsim-copy2-state.bin` (~40 MB, written in the background in
+  ~0.1 s; pm2 waits up to 30 s for the final save before killing).
+- At the next start it reads that file, and as soon as the bot's first
+  block arrives it reads the missing blocks' pool reports from the node's
+  logs (free node first, paid node if that fails: ~20 requests for a
+  5-minute gap, ~50-100 for 30 minutes) and applies them. Checks get
+  answers again after a few seconds instead of ~13 minutes, and no pool is
+  loaded again.
+- The same happens when only the BOT restarts (the sidecar keeps running):
+  the blocks the bot didn't send are read from the node's logs instead of
+  reloading every pool. Pools the new bot doesn't list yet (its loop-extra
+  pools come ~3 minutes after its start) are kept aside and caught up from
+  their own reports when it lists them again.
+- Falls back to the normal full load by itself when the file is missing,
+  damaged, from another program format, or more than 30 minutes
+  (`ARBSIM_COPY2_RESUME_MAX_BLOCKS`) behind.
+- To force a fresh load (e.g. after a fix to how copy 2 follows pools):
+  `rm data/arbsim-copy2-state.bin` before restarting the sidecar (or set
+  `ARBSIM_COPY2_STATE_FILE=off`). Status: `bash deploy/arbsim-pm2.sh status`
+  shows the "warm restart" line.
+
 ## 3. See how it's doing
 
 ```bash
@@ -180,6 +206,13 @@ and nothing else. Node links are never printed, and never stored in pm2.
 | `ARBSIM_COPY2_WALK_FULL_WORDS` | 8000 (0 = off) | copy 2: a V4 pool's tick walk reads its WHOLE tick map when it has at most this many words (8000 = every tick spacing), so checks that run the price to its limit (thin pools, "ZeroAmount") are answered |
 | `ARBSIM_COPY2_PM_BOUND` | 1 | copy 2: never hold the V4 PoolManager's coin / ETH balances (nobody reports them to us); checks that read them run at a proven lower bound and far above it and answer only when both agree. 0 = old behaviour (tests only: a stale balance) |
 | `ARBSIM_COPY2_MAX_KEEP_LOGS` | 150000 | copy 2: most pool reports kept for slow loads (beyond the 10 minutes always kept) |
+| `ARBSIM_COPY2_STATE_FILE` | `data/arbsim-copy2-state.bin` (set by the runner; `off` = never) | copy 2 warm restart: where the copy is saved and read back at start |
+| `ARBSIM_COPY2_SAVE_S` | 60 | copy 2: save the copy every this many seconds (and always when pm2 stops it) |
+| `ARBSIM_COPY2_RESUME_MAX_BLOCKS` | 18000 (~30 min; 0 = off) | copy 2: catch up at most this many blocks from the node's logs (after a restart, or when the bot missed blocks); more = normal full load / reload |
+| `ARBSIM_COPY2_RESUME_OVERLAP_BLOCKS` | 64 | copy 2: blocks before the saved one whose reports are read again (late reports the copy may never have got) |
+| `ARBSIM_COPY2_RESUME_RANGE` | 500 | copy 2: blocks per eth_getLogs request (halved by itself when the node says too big) |
+| `ARBSIM_COPY2_RESUME_TIMEOUT_S` | 120 | copy 2: a catch-up without a complete answer for this long gives up (normal load / reload) |
+| `ARBSIM_COPY2_SAVE_TIMEOUT_S` | 20 | copy 2: longest wait for the final save when pm2 stops the sidecar |
 | `ARBSIM_IDLE_EVICT_S` | 21600 (6 h) | drop accounts unused this long |
 | `ARBSIM_HEADER_EVERY_S` | 300 | block-header refresh |
 | `ARBSIM_MAX_WARM` | 20000 | most "warm-up" items kept |
@@ -207,3 +240,4 @@ After changing any of these: `bash deploy/arbsim-pm2.sh restart`.
 | `deploy/arbsim-lib.sh` | shared helpers |
 | `deploy/arbsim-status.js` | plain-English status |
 | `bin/` (server only) | `arbsim`, `arbsim.prev`, their `.build_info`, `ARBSIM_PINNED` |
+| `data/arbsim-copy2-state.bin` (server only) | copy 2's saved copy (warm restart); safe to delete (the next start loads normally) |

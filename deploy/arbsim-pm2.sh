@@ -29,6 +29,14 @@
 #   A changed limit applies when pm2 (re)creates the app: on the next
 #   program update, or `bash deploy/arbsim-pm2.sh restart` after a stop.
 #
+#   Stopping (warm restart, copy2-n): pm2 sends a stop signal (SIGINT) and
+#   kills the sidecar only after kill_timeout. On the signal the sidecar
+#   saves its copy (data/arbsim-copy2-state.bin, ~40 MB, well under a
+#   second) and exits by itself; the next start continues from that file
+#   instead of loading every pool again. kill_timeout is 30 s (was 5 s) so
+#   a busy server still lets the save finish. An app created with a shorter
+#   kill_timeout is re-created once (like the memory limit below).
+#
 # Commands (run from anywhere; the bot folder is found automatically):
 #   bash deploy/arbsim-pm2.sh ensure      match LOCAL_SIM + program (auto-deploy
 #                                         runs this every 2 minutes; quiet when
@@ -50,6 +58,8 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/arbsim-lib.sh"
 PM2_STATE_FILE="$BIN_DIR/.arbsim-pm2-state"
 # pm2 restarts the sidecar above this much memory (MB); see the header.
 ARBSIM_MEM_LIMIT_MB=800
+# pm2 waits this long (ms) after the stop signal before killing (final save).
+ARBSIM_KILL_TIMEOUT_MS=30000
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [arbsim] $*"; }
 
 # say_once KEY MESSAGE: log only when the situation changes (no spam).
@@ -93,7 +103,7 @@ start_app() {
     --cwd "$APP_DIR" \
     --max-memory-restart "${ARBSIM_MEM_LIMIT_MB}M" \
     --exp-backoff-restart-delay 1000 \
-    --kill-timeout 5000 \
+    --kill-timeout "$ARBSIM_KILL_TIMEOUT_MS" \
     --time > /dev/null 2>&1
 }
 
@@ -138,10 +148,21 @@ case "$cmd" in
         # dry run #18) keeps it through "pm2 restart": re-create it once.
         # Only ever raised (never a loop if pm2 reports it differently).
         cur_mb="$(pm2_app_mem_limit_mb)"
+        cur_kill="$(pm2_app_kill_timeout_ms)"
         if [ -n "$cur_mb" ] && [ "$cur_mb" -lt $((ARBSIM_MEM_LIMIT_MB * 9 / 10)) ]; then
           pm2 delete "$ARBSIM_APP" > /dev/null 2>&1 || true
           if start_app; then
             log "sidecar re-created with memory limit ${ARBSIM_MEM_LIMIT_MB} MB (was ${cur_mb} MB)"
+          else
+            log "PROBLEM: pm2 could not re-create the sidecar"; exit 1
+          fi
+        elif [ -n "$cur_kill" ] && [ "$cur_kill" -lt "$ARBSIM_KILL_TIMEOUT_MS" ]; then
+          # Older app with a 5 s kill timeout: re-created once so a stop
+          # leaves time for the final save (the deleted app gets the stop
+          # signal and saves too; the new one starts from that file).
+          pm2 delete "$ARBSIM_APP" > /dev/null 2>&1 || true
+          if start_app; then
+            log "sidecar re-created with stop wait ${ARBSIM_KILL_TIMEOUT_MS} ms (was ${cur_kill} ms) for the warm-restart save"
           else
             log "PROBLEM: pm2 could not re-create the sidecar"; exit 1
           fi

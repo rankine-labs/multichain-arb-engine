@@ -86,6 +86,19 @@ pm2_app_status() {
     });' "$ARBSIM_APP"
 }
 
+# pm2_app_kill_timeout_ms -> how long pm2 waits after its stop signal
+# before killing the arbsim app, in ms (empty when unknown / app missing).
+pm2_app_kill_timeout_ms() {
+  pm2 jlist 2>/dev/null | node -e '
+    let s = ""; process.stdin.on("data", d => s += d).on("end", () => {
+      try {
+        const p = JSON.parse(s).find(x => x.name === process.argv[1]);
+        const v = p && p.pm2_env ? Number(p.pm2_env.kill_timeout) : NaN;
+        console.log(v > 0 ? Math.round(v) : "");
+      } catch { console.log(""); }
+    });' "$ARBSIM_APP"
+}
+
 # pm2_app_mem_limit_mb -> the memory restart limit pm2 has for the arbsim
 # app, in MB (empty when unknown / not set / app missing).
 pm2_app_mem_limit_mb() {

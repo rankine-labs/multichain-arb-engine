@@ -743,9 +743,11 @@ export class Copy2Forwarder {
     //   - normally block - 1: every block goes out (ticks included), so a
     //     block that silently went missing is noticed by the copy;
     //   - after a gap (message dropped, block skipped, outage not filled,
-    //     fresh start): THIS block, which the copy can't have yet, so it
-    //     reloads. (prevBlock 0 never triggered a reload: 0 is below the
-    //     copy's first block.) A fresh arbsim has received nothing: no reload.
+    //     fresh start): THIS block, which the copy can't have yet. Since
+    //     copy2-n the copy then reads the blocks it missed from the node's
+    //     logs (a bot restart no longer wipes it) and reloads every pool only
+    //     if that fails. (prevBlock 0 never triggered anything: 0 is below
+    //     the copy's first block.) A fresh arbsim has received nothing.
     // Headerless: not every block goes out (only the newest quiet one is
     // ticked), so prevBlock = the previous block we passed on (or tried to:
     // a dropped one sets the gap anyway).
@@ -764,7 +766,10 @@ export class Copy2Forwarder {
       if (gap) {
         this.gapFlag = false; this.gapSentAt = this.now(); this.counts.gaps++;
         this.reloadReasons[this.gapReason] = (this.reloadReasons[this.gapReason] ?? 0) + 1;
-        if (this.gapReason !== 'start') this.log(`[copy2] the copy was told to reload every pool (${this.gapReason}); forced reloads so far: ${this.reloadText()}`);
+        // Since copy2-n the fast check first fills such a gap from the node's
+        // logs (sim/src/copy2/intake.rs "warm restart"); it reloads every pool
+        // only if that fails (its status shows catch-ups done / failed).
+        if (this.gapReason !== 'start') this.log(`[copy2] the copy was told about a gap (${this.gapReason}): it reads the missing blocks from the node's logs (reloads only if that fails); gaps so far: ${this.reloadText()}`);
       }
     } else {
       this.counts.msgsDropped++;
