@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       only:
-        description: 'Run one step only: feeds, sim, pairs, watch, universe, backtest, latency, lenders, smoke, seed, routers, v4, arbsys, nodes, multicall, simv1, ramsessim, routes, venues, fablesfee, blockreader, urv4, nvda (blank = all except backtest)'
+        description: 'Run one step only: feeds, sim, pairs, watch, universe, backtest, latency, lenders, smoke, seed, routers, v4, arbsys, nodes, multicall, simv1, ramsessim, routes, venues, fablesfee, blockreader, urv4, nvda, rivn (blank = all except backtest)'
         required: false
         default: ''
 
@@ -102,6 +102,15 @@ jobs:
             out="${out//'%'/'%25'}"; out="${out//$'\n'/'%0A'}"
             echo "::notice title=NVDA probe part ${n}::${out}"
           done
+      # RIVN (Oct 22, copy2-r): the copy-2 "reverts" vs node "loss" checks on
+      # RIVN/USDG: the bot's own check at those blocks, call trees and every
+      # value read. Read-only.
+      - name: RIVN/USDG check probe (read-only)
+        if: inputs.only == 'rivn'
+        shell: bash
+        run: |
+          timeout 2400 node .scripts-build/scripts/probe-rivn.js > rivn.txt 2>&1 || true
+          cat rivn.txt
       - name: Probe free simulation on real chains
         if: inputs.only == '' || inputs.only == 'sim'
         shell: bash
