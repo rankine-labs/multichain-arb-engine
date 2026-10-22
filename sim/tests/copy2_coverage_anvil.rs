@@ -1005,3 +1005,97 @@ fn walk_cost() {
         }
     }
 }
+
+/// V4 pools with a protocol fee (live Oct 22 13:34: the bot's most common
+/// checks, stock-coin V4 pools, all blocked on protocolFeesAccrued[coin],
+/// which the copy can't follow: other pools' swaps add to it, collections
+/// empty it without a PoolManager event). Its value only decides the gas of
+/// one store (0 -> non-zero 20,000 vs non-zero 2,900); the swap amounts
+/// never depend on it. The copy runs the check with it 0 and not 0 and
+/// answers when only the gas differs, with the HIGHER gas: same success /
+/// output as the chain, gas never below the chain's (the bot never
+/// overestimates profit), at most ~17,100 above.
+#[test]
+fn bot_v4_protocol_fee_counter_answers_with_the_higher_gas() {
+    let o = Opts { bot_shape: true, pm_bound: true, full_words: 8000, ..Opts::default() };
+    let Some(mut w) = World::start_with(K::V4, o) else {
+        eprintln!("copy2 coverage anvil test SKIPPED: no ~/.foundry/bin/anvil");
+        return;
+    };
+    let p = w.pools[0].clone();
+    let me = w.a.me;
+    // Protocol fee on, both directions (0.1 % each; 12 bits per direction).
+    let fee = U256::from(1000u32 | (1000u32 << 12));
+    w.mine(&[(p.address, calldata("setProtocolFeeController(address)", &[Arg::A(me)]))]);
+    w.mine(&[(
+        p.address,
+        calldata(
+            "setProtocolFee((address,address,uint24,int24,address),uint24)",
+            &[Arg::A(p.token0), Arg::A(p.token1), Arg::W(U256::from(p.fee)), Arg::I(p.tick_spacing as i128), Arg::A(Address::ZERO), Arg::W(fee)],
+        ),
+    )]);
+    let counter = |w: &World, c: Address| -> U256 {
+        let s = arbsim::copy2::checkview::protocol_fee_slot(c);
+        u(&w.a.ok("eth_getStorageAt", json!([ha(p.address), hx64(s), "latest"])))
+    };
+    w.go_live();
+    w.wait("tick walks", |w| w.walked());
+    w.settle();
+    // Counter zero on the chain: the copy's answer is exact (gas too).
+    let n0 = w.block(&[]);
+    w.settle();
+    for _ in 0..3 {
+        let _ = w.compare(n0, 100, true);
+        w.settle();
+    }
+    assert!(counter(&w, w.uu).is_zero() && counter(&w, w.ww).is_zero());
+    let mut exact0 = 0;
+    for usd in [1_000u64, 20_000] {
+        for dir in [true, false] {
+            let (same, d) = w.compare(n0, usd, dir);
+            assert_eq!(same, Some(true), "counter 0 on the chain: exact ({usd} USD, {dir}): {d}");
+            exact0 += 1;
+        }
+    }
+    // Trades: the counters become non-zero on the chain.
+    trade_some(&mut w);
+    let n = w.block(&[]);
+    w.settle();
+    assert!(!counter(&w, w.uu).is_zero() && !counter(&w, w.ww).is_zero(), "the protocol fee was charged");
+    for _ in 0..3 {
+        let _ = w.compare(n, 100, true);
+        w.settle();
+    }
+    let (mut answered, mut unknown) = (0, 0);
+    let mut extra: Vec<u64> = Vec::new();
+    for usd in [1_000u64, 20_000, 150_000] {
+        for dir in [true, false] {
+            let (call, ov) = w.round_trip(usd, dir);
+            let ans = w.ask(n, &call, &ov);
+            if ans["ok"] != json!(true) {
+                eprintln!("unknown ({usd} USD, {dir}): {ans}");
+                unknown += 1;
+                continue;
+            }
+            let r = &ans["results"][0];
+            let (ts, to, tg) = w.truth(n, &call, &ov);
+            assert_eq!(r["success"], json!(ts), "{ans}");
+            assert_eq!(r["output"], json!(to), "success / output exact ({usd} USD, {dir})");
+            let g = arbsim::check::hexutil::parse_u64(r["gasUsed"].as_str().unwrap()).unwrap();
+            assert!(g >= tg, "gas never below the chain's: copy {g}, chain {tg}");
+            assert!(g - tg <= 17_100, "at most one store's difference: copy {g}, chain {tg}");
+            extra.push(g - tg);
+            answered += 1;
+        }
+    }
+    let st = w.h.status_json(false);
+    eprintln!(
+        "protocol fee: {exact0} exact with the counter 0; {answered} answered / {unknown} unknown with it non-zero, copy gas minus chain gas {extra:?}; counters checks {} same {} differ {}",
+        st["counters"]["protocol_fee_checks"], st["counters"]["protocol_fee_same"], st["counters"]["protocol_fee_differ"]
+    );
+    assert_eq!(unknown, 0, "{st}");
+    assert!(extra.iter().any(|x| *x == 17_100), "the costlier zero -> non-zero store is reported: {extra:?}");
+    assert!(st["counters"]["protocol_fee_same"].as_u64().unwrap() >= 6);
+    assert_eq!(st["counters"]["protocol_fee_differ"], json!(0));
+    w.h.stop();
+}
