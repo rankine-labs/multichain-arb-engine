@@ -561,3 +561,69 @@ trade ~20 ms.
   reloads K (...)` and, for checks asked about a copy-2 block, `copy 2 vs
   node: N checks, same a, different b, fast check unsure c (same answer
   x%)` (jsonl field `c2blk`).
+- Live shadow hour Oct 22 08:26-09:31 UTC (inbot-sim/copy2-k): copy
+  healthy (623/649 ready, 0 forced reloads, 574/576 tick pools walked) but
+  the bot's REAL checks were answered 7 of 44 times (16 %; the checker's own
+  probes ~67 %). missesTop: 503 "ready pool slot" at the V4 PoolManager;
+  "coin slot" USDG 22 / WETH 12 / stock coins 4-8 each; 0xe10b6f6b.. 11;
+  executor / 0x64 3 each. Causes, each reproduced on anvil
+  (tests/copy2_coverage_anvil.rs bot_v4_*, the bot's shape: no PoolManager
+  coin transfers in the reports, our contract's min / max price limit):
+  1. PoolManager "ready pool slot" = tick-map words BEYOND the walked window.
+     The bot's checks on thin pools (stock / USDG "gap" checks, node answer
+     ZeroAmount or loss) run the price to its limit and read every word on
+     the way (up to 64 missed per check, MAX_COLLECT). Fills then put such
+     a word into the copy as a value of ALL our V4 pools (unsound for
+     another pool's word). Reproduced: bot_v4_check_into_an_empty_side
+     (old walk: misses with "not a base slot / walked value", 64+ per
+     check). Fix: V4 tick walks read the WHOLE tick map when it has at most
+     ARBSIM_COPY2_WALK_FULL_WORDS (8000 = every spacing; spacing 1 = 6932
+     words; batched extsload(bytes32[]); measured on anvil: spacing 10
+     2.7M gas + 168 KB answer, spacing 1 25.8M gas + 994 KB; walk_cost).
+     Zero words outside the window are kept compactly (sorted list, 32
+     bytes each: PoolEntry.far_zero, status poolCoverage.farZeroWords,
+     counter walk_far_zero) and answered 0 by CHECKS only
+     (copy2/checkview.rs), for versions from max(walk block, ready_since)
+     while the pool stays ready (held values always win; replays never use
+     them). PoolManager fills are now refused unless the slot is a base slot
+     of one of our pools (fill_refused_pm_slot). After: 9/9 ZeroAmount
+     checks answered, exact.
+  2. "coin slot" USDG / WETH / stocks = the PoolManager's OWN coin balance
+     (sync / settle / take in our contract's V4 swap). Nobody reports its
+     transfers to us (the bot leaves the PoolManager out of the transfer
+     subscription on purpose), yet the copy loaded that balance with each
+     V4 pool and moved it only by transfers that also involved another
+     followed pool: a STALE value. Reproduced: bot_v4_pool_manager_balance
+     (old: 3 of 12 checks answered WRONG: copy "TransferFailed (underflow)",
+     chain "InsufficientProfit"). Following it exactly would need a push for
+     every V4 transfer of those coins on the whole chain (incl. hooked pools
+     like Fables' WETH/USDG, the biggest volume): not cheap. Exact and free
+     instead (ARBSIM_COPY2_PM_BOUND=1): the copy never holds a PoolManager
+     coin / ETH balance (V4 pools are not coin "holders", loads don't fetch
+     it, fills refused: fill_refused_pm_balance); a check that reads one runs
+     at a proven LOWER BOUND P and again at P + 2^200 and answers only if
+     both results are identical (success, output, gas), else unknown
+     "pool_manager_balance" (counters pm_bound_checks / _same / _differ).
+     P = sum over our ready V4 pools of what a swap draining that coin
+     would pay out over the tick data held (TickMath / SqrtPriceMath,
+     rounding down, minus 1 per price step): the PoolManager must be able
+     to pay any swap out (solvency). Why two runs prove it: settle uses
+     only the difference; take needs balance >= amount (passes at both ends
+     => passes for R in between); a written balance is 0 at neither end
+     (else the gas differs) so storage gas is the same; a coin with another
+     rule in that range shows different results => unknown. Assumes the
+     PoolManager holds < 2^200 base units and standard coin behaviour
+     (balance check + store), no admin seizure from the PoolManager.
+     After: 12/12 checks same as the chain at sizes up to 2M USD (6M:
+     unknown, beyond the walk), 0 different. A check that pays a coin the
+     PoolManager holds none of (R = 0: the gas really differs) answers
+     unknown (bot_v4_check_into_an_empty_side, other way).
+  3. Status: missesTopSlots = top 20 [class, account, slot, count, what]
+     (named: PoolManager balance / our pool's balance / the check
+     contract's balance / pool <id> slot0..liquidity / walked / far zero /
+     protocolFeesAccrued / PoolManager setting / "not a base slot ..."),
+     so the next live hour shows WHICH values miss (0xe10b6f6b.. could not
+     be identified offline: not in our code or configs).
+  Cost: 0 new WebSocket messages, 0 new node requests (the same one
+  debug_traceCall per V4 pool, bigger answer); memory: far zero words ~32
+  bytes each (~700 per spacing-10 pool, ~6900 per spacing-1 pool).

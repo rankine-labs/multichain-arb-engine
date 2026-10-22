@@ -21,7 +21,9 @@ pragma solidity 0.8.26;
 //     - Algebra Integral: every initialized tick (Algebra keeps them in a
 //       linked list from MIN_TICK to MAX_TICK), its tick tree, settings.
 //     - Uniswap V4 (pool inside the PoolManager): the same tick-map window
-//       and ticks, read with the PoolManager's own extsload.
+//       and ticks, read with the PoolManager's own extsload; when the whole
+//       tick map has at most `fullWords` words, EVERY word of it (a check
+//       that uses up the liquidity runs the price to its limit).
 //     - V3 / Pancake / Algebra: two small "probe" swaps (one each way, a
 //       ~2% price move) that are cancelled inside the pay-me callback: the
 //       pool runs its real swap code up to the payment, so it reads
@@ -61,6 +63,8 @@ contract TickLens {
         uint256 maxTicks;    // stop after this many initialized ticks
         uint256 maxObs;      // at most this many price-history entries
         uint256 probeBps;    // probe swap: sqrt price moved by this (1/10000)
+        uint256 fullWords;   // V4: read EVERY tick-map word of the whole price
+                             // range when it has at most this many (0 = off)
     }
 
     // Any call into the lens other than walk() (the pools' pay-me callbacks
@@ -75,16 +79,19 @@ contract TickLens {
         int256 lo;
         int256 hi;
         int256 center;
+        bool full;
         if (a.kind == 4) {
-            (lo, hi, center, ticks) = _v4(a);
+            (lo, hi, center, ticks, full) = _v4(a);
         } else if (a.kind == 3) {
             (center, ticks) = _algebra(a);
         } else {
             (lo, hi, center, ticks) = _v3(a);
         }
         if (hi >= lo && a.kind != 3) words = uint256(hi - lo + 1);
-        // Finished: details packed in the low 128 bits of the marker slot.
+        // Finished: details packed in the low 128 bits of the marker slot
+        // (bit 96: the WHOLE tick map was read, see _v4).
         uint256 key = DONE_BASE
+            | (full ? (uint256(1) << 96) : 0)
             | (uint256(uint16(int16(lo))) << 0)
             | (uint256(uint16(int16(hi))) << 16)
             | (uint256(uint24(int24(center))) << 32)
@@ -225,26 +232,66 @@ contract TickLens {
         if (ok) v = _word(out, 0);
     }
 
-    function _v4(Args calldata a) internal view returns (int256 lo, int256 hi, int256 center, uint256 ticks) {
-        address pm = a.pool;
-        uint256 base = uint256(keccak256(abi.encode(a.v4id, uint256(6))));
-        uint256 s0 = _ext(pm, bytes32(base));
-        for (uint256 i = 1; i < 4; i++) _ext(pm, bytes32(base + i));
-        center = int256(int24(int256(s0 >> 160)));
-        int256 sp = a.v4spacing;
-        if (sp <= 0) return (1, 0, center, 0);
-        (lo, hi) = _window(center, sp, a);
-        for (int256 w = lo; w <= hi; w++) {
-            uint256 bits = _ext(pm, keccak256(abi.encode(int16(w), base + 5)));
-            while (bits != 0 && ticks < a.maxTicks) {
-                uint256 b = _lsb(bits);
-                bits &= bits - 1;
-                int256 t = ((w << 8) + int256(b)) * sp;
-                uint256 ts = uint256(keccak256(abi.encode(int24(t), base + 4)));
-                for (uint256 k = 0; k < 3; k++) _ext(pm, bytes32(ts + k));
-                ticks++;
+    // Many PoolManager slots in one call (extsload(bytes32[])); a failed
+    // call reads nothing (the walk then simply doesn't hold those slots).
+    function _extMany(address pm, bytes32[] memory slots) internal view returns (bytes32[] memory out) {
+        (bool ok, bytes memory r) = _call(pm, abi.encodeWithSignature("extsload(bytes32[])", slots));
+        if (ok && r.length >= 64) out = abi.decode(r, (bytes32[]));
+    }
+
+    // Words lo..hi: read in batches; every initialized tick in them too.
+    function _v4Words(address pm, uint256 base, int256 lo, int256 hi, int256 sp, uint256 room) internal view returns (uint256 ticks) {
+        for (int256 start = lo; start <= hi; start += 256) {
+            uint256 n = uint256((start + 255 > hi ? hi : start + 255) - start + 1);
+            bytes32[] memory slots = new bytes32[](n);
+            for (uint256 i = 0; i < n; i++) slots[i] = keccak256(abi.encode(int16(start + int256(i)), base + 5));
+            bytes32[] memory vals = _extMany(pm, slots);
+            if (vals.length != n) continue;
+            for (uint256 i = 0; i < n && ticks < room; i++) {
+                if (vals[i] != 0) ticks += _v4Ticks(pm, base, start + int256(i), uint256(vals[i]), sp, room - ticks);
             }
         }
+    }
+
+    // The 3 slots of each initialized tick of one word (at most `room` ticks).
+    function _v4Ticks(address pm, uint256 base, int256 w, uint256 bits, int256 sp, uint256 room) internal view returns (uint256 n) {
+        while (bits != 0 && n < room) {
+            uint256 b = _lsb(bits);
+            bits &= bits - 1;
+            uint256 ts = uint256(keccak256(abi.encode(int24(((w << 8) + int256(b)) * sp), base + 4)));
+            for (uint256 k = 0; k < 3; k++) _ext(pm, bytes32(ts + k));
+            n++;
+        }
+    }
+
+    // The window around the price (lo..hi, reported in the marker) and,
+    // when the whole tick map has at most fullWords words, every word from
+    // the lowest to the highest price too (`full`): a check whose swap uses
+    // up the liquidity runs the price to its limit (our contract swaps with
+    // the min / max price limit) and reads every word on the way, e.g. a
+    // thin stock-token pool or one with no liquidity on one side (the bot's
+    // "ZeroAmount" checks, live Oct 22). Words outside lo..hi are almost all
+    // zero; arbsim keeps those compactly (copy2/walk.rs far_zero).
+    function _v4(Args calldata a) internal view returns (int256 lo, int256 hi, int256 center, uint256 ticks, bool full) {
+        uint256 base = uint256(keccak256(abi.encode(a.v4id, uint256(6))));
+        uint256 s0 = _ext(a.pool, bytes32(base));
+        for (uint256 i = 1; i < 4; i++) _ext(a.pool, bytes32(base + i));
+        center = int256(int24(int256(s0 >> 160)));
+        if (a.v4spacing <= 0) return (1, 0, center, 0, false);
+        (lo, hi) = _window(center, a.v4spacing, a);
+        (ticks, full) = _v4Map(a, base, lo, hi);
+    }
+
+    function _v4Map(Args calldata a, uint256 base, int256 lo, int256 hi) internal view returns (uint256 ticks, bool full) {
+        int256 sp = a.v4spacing;
+        int256 wMin = _floorDiv(int256(MIN_TICK), sp) >> 8;
+        int256 wMax = _floorDiv(int256(MAX_TICK), sp) >> 8;
+        full = a.fullWords > 0 && uint256(wMax - wMin + 1) <= a.fullWords;
+        // Window first (its ticks count first against maxTicks), then the rest.
+        ticks = _v4Words(a.pool, base, lo, hi, sp, a.maxTicks);
+        if (!full) return (ticks, false);
+        if (wMin < lo) ticks += _v4Words(a.pool, base, wMin, lo - 1, sp, a.maxTicks - ticks);
+        if (hi < wMax) ticks += _v4Words(a.pool, base, hi + 1, wMax, sp, a.maxTicks - ticks);
     }
 
     // ---- probe swaps (cancelled in the callback, see header) ----

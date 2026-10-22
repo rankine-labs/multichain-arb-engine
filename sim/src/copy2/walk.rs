@@ -27,7 +27,10 @@
 //       plugin), never coins or anything else;
 //     - V4: only this pool's own entries in the PoolManager (its 4 base
 //       slots, its tick-map words of the walked window, the 3 slots of each
-//       initialized tick in them), computed here from the pool id.
+//       initialized tick in them), computed here from the pool id. A "full"
+//       V4 walk (WalkCfg.full_words) reads every word of the tick map; the
+//       zero ones outside the window come back as `far_zero` (kept
+//       compactly, answered only by checks: copy2/checkview.rs).
 //   The pool's own code decides which slots it reads, so no storage layout
 //   is assumed for V3 / Pancake / Algebra.
 //
@@ -81,6 +84,14 @@ pub struct WalkCfg {
     pub probe_bps: u64,
     /// Gas for the pretend call [ARBSIM_COPY2_WALK_GAS, 40,000,000].
     pub gas: u64,
+    /// V4: read the pool's WHOLE tick map (every word from the lowest to the
+    /// highest price) when it has at most this many words
+    /// [ARBSIM_COPY2_WALK_FULL_WORDS, 8000 = every tick spacing (spacing 1:
+    /// 6932 words); 0 = window only]. Live Oct 22: 503 of the bot's missed
+    /// items were PoolManager tick-map words beyond the window: checks on
+    /// thin pools (or with no liquidity on one side) run the price to its
+    /// limit. Zero words outside the window are kept compactly (far_zero).
+    pub full_words: u64,
 }
 
 impl WalkCfg {
@@ -93,13 +104,14 @@ impl WalkCfg {
             max_obs: env_u64("ARBSIM_COPY2_WALK_MAX_OBS", 1024),
             probe_bps: env_u64("ARBSIM_COPY2_WALK_PROBE_BPS", 100).min(5000),
             gas: env_u64("ARBSIM_COPY2_WALK_GAS", 40_000_000),
+            full_words: env_u64("ARBSIM_COPY2_WALK_FULL_WORDS", 8000).min(8000),
         }
     }
 }
 
 impl Default for WalkCfg {
     fn default() -> Self {
-        WalkCfg { window_ticks: 32_768, min_side_words: 8, max_ticks: 3000, max_obs: 1024, probe_bps: 100, gas: 40_000_000 }
+        WalkCfg { window_ticks: 32_768, min_side_words: 8, max_ticks: 3000, max_obs: 1024, probe_bps: 100, gas: 40_000_000, full_words: 8000 }
     }
 }
 
@@ -128,7 +140,7 @@ fn int_word(v: i64) -> U256 {
 
 /// The debug_traceCall params for one pool's walk at `tag` (block tag).
 pub fn trace_params(p: &TrackedPool, cfg: &WalkCfg, tag: &Value) -> Value {
-    let sel = &keccak256("walk((uint256,address,bytes32,int256,uint256,uint256,uint256,uint256,uint256))".as_bytes())[..4];
+    let sel = &keccak256("walk((uint256,address,bytes32,int256,uint256,uint256,uint256,uint256,uint256,uint256))".as_bytes())[..4];
     let words = [
         U256::from(kind_code(p.kind)),
         U256::from_be_slice(p.address.as_slice()),
@@ -139,6 +151,7 @@ pub fn trace_params(p: &TrackedPool, cfg: &WalkCfg, tag: &Value) -> Value {
         U256::from(cfg.max_ticks),
         U256::from(cfg.max_obs),
         U256::from(cfg.probe_bps),
+        U256::from(if p.kind == PoolKind::V4 { cfg.full_words } else { 0 }),
     ];
     let mut data = sel.to_vec();
     for w in words {
@@ -168,6 +181,14 @@ pub struct WalkOut {
     pub slots: Vec<(Address, U256, U256)>,
     /// Slots the trace listed that we did NOT take (other accounts).
     pub ignored: usize,
+    /// V4: the lens read the WHOLE tick map (marker bit 96).
+    pub full: bool,
+    /// V4 full walks: tick-map words OUTSIDE the window (word_lo..word_hi)
+    /// that were zero at the walked block (sorted PoolManager slots). Not in
+    /// `slots`: kept compactly by the intake (PoolEntry.far_zero, ~32 bytes
+    /// each instead of ~280 for a held value) and answered as 0 by checks
+    /// only (copy2/checkview.rs), never by replays.
+    pub far_zero: Vec<U256>,
 }
 
 fn signed16(x: u64) -> i64 {
@@ -190,22 +211,31 @@ fn map_slot(key: U256, base: U256) -> U256 {
     U256::from_be_bytes(keccak256(b).0)
 }
 
-/// V4: this pool's own PoolManager slots for the walked window, given the
-/// tick-map words the trace returned (their set bits name the ticks).
-fn v4_allowed(p: &TrackedPool, lo: i64, hi: i64, storage: &dyn Fn(U256) -> Option<U256>) -> HashSet<U256> {
+/// Word range of the whole tick map for this spacing (MIN_TICK..MAX_TICK).
+pub fn full_word_range(spacing: i64) -> (i64, i64) {
+    const MAX_TICK: i64 = 887_272;
+    (((-MAX_TICK).div_euclid(spacing)) >> 8, (MAX_TICK.div_euclid(spacing)) >> 8)
+}
+
+/// V4: this pool's own PoolManager slots for words lo..hi, given the
+/// tick-map words the trace returned (their set bits name the ticks), plus
+/// the word slots by index.
+fn v4_allowed_words(p: &TrackedPool, lo: i64, hi: i64, storage: &dyn Fn(U256) -> Option<U256>) -> (HashSet<U256>, Vec<(i64, U256)>) {
     let mut ok = HashSet::new();
-    let Some(id) = p.v4_id else { return ok };
+    let mut words = Vec::new();
+    let Some(id) = p.v4_id else { return (ok, words) };
     let base = map_slot(U256::from_be_bytes(id.0), U256::from(6u8));
     for i in 0..4u64 {
         ok.insert(base + U256::from(i));
     }
     let sp = p.tick_spacing as i64;
     if sp <= 0 || hi < lo || hi - lo > 8000 {
-        return ok;
+        return (ok, words);
     }
     for w in lo..=hi {
         let ws = map_slot(int_word(w), base + U256::from(5u8));
         ok.insert(ws);
+        words.push((w, ws));
         let Some(bits) = storage(ws) else { continue };
         for b in 0..256usize {
             if bits.bit(b) {
@@ -217,7 +247,7 @@ fn v4_allowed(p: &TrackedPool, lo: i64, hi: i64, storage: &dyn Fn(U256) -> Optio
             }
         }
     }
-    ok
+    (ok, words)
 }
 
 /// Read a prestate trace of one walk. `owned`: accounts the pool's replays
@@ -241,6 +271,7 @@ pub fn read_walk(tr: &Value, p: &TrackedPool, owned: &[Address]) -> WalkOut {
                 out.center = signed24(((low >> 32) & 0xff_ffff) as u64);
                 out.ticks = ((low >> 56) & 0xff_ffff) as u64;
                 out.words = ((low >> 80) & 0xffff) as u64;
+                out.full = (low >> 96) & 1 == 1;
             }
         }
     }
@@ -263,14 +294,32 @@ pub fn read_walk(tr: &Value, p: &TrackedPool, owned: &[Address]) -> WalkOut {
         let slots = read(acct);
         if a == p.address && p.kind == PoolKind::V4 {
             let have: std::collections::HashMap<U256, U256> = slots.iter().copied().collect();
-            let ok = if out.done { v4_allowed(p, out.word_lo, out.word_hi, &|s| have.get(&s).copied()) } else { v4_allowed(p, 0, -1, &|_| None) };
+            // A full walk: the whole word range (else the window).
+            let (lo, hi) = match (out.done, out.full, p.tick_spacing > 0) {
+                (true, true, true) => full_word_range(p.tick_spacing as i64),
+                (true, _, _) => (out.word_lo, out.word_hi),
+                _ => (0, -1),
+            };
+            let (ok, words) = v4_allowed_words(p, lo, hi, &|s| have.get(&s).copied());
+            // Zero words outside the window: compact (never in `slots`).
+            let mut far: HashSet<U256> = HashSet::new();
+            if out.done && out.full {
+                for (w, ws) in &words {
+                    if (*w < out.word_lo || *w > out.word_hi) && have.get(ws).is_some_and(|v| v.is_zero()) {
+                        far.insert(*ws);
+                    }
+                }
+            }
             for (s, v) in slots {
-                if ok.contains(&s) {
+                if far.contains(&s) {
+                    out.far_zero.push(s);
+                } else if ok.contains(&s) {
                     out.slots.push((a, s, v));
                 } else {
                     out.ignored += 1;
                 }
             }
+            out.far_zero.sort_unstable();
         } else if a == p.address || owned.contains(&a) {
             out.slots.extend(slots.into_iter().map(|(s, v)| (a, s, v)));
         } else {
@@ -296,7 +345,7 @@ mod tests {
         let p = TrackedPool { address: Address::with_last_byte(9), v4_id: None, kind: PoolKind::V3, token0: Address::ZERO, token1: Address::ZERO, fee: 0, tick_spacing: 0 };
         let v = trace_params(&p, &WalkCfg::default(), &json!("0x10"));
         assert_eq!(v[2]["tracer"], "prestateTracer");
-        assert_eq!(v[0]["data"].as_str().unwrap().len(), 2 + 8 + 9 * 64);
+        assert_eq!(v[0]["data"].as_str().unwrap().len(), 2 + 8 + 10 * 64);
     }
 
     #[test]

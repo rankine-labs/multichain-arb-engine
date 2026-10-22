@@ -122,6 +122,29 @@ struct World {
     runtime: String,
     ts: u64,
     last_sent: u64,
+    /// The bot's report rule: coin Transfers only for CONTRACT pools (the
+    /// bot never subscribes to the V4 PoolManager's transfers).
+    bot_shape: bool,
+}
+
+/// World options (World::start = the defaults).
+#[derive(Clone, Copy)]
+struct Opts {
+    walks: bool,
+    lm_credit: Option<u64>,
+    bot_shape: bool,
+    /// C2Config.pm_bound (false = the old stale PoolManager balances).
+    pm_bound: bool,
+    /// WalkCfg.full_words (0 = window only, the old walk).
+    full_words: u64,
+    /// Test pool: every position ABOVE the price (no liquidity below it).
+    one_sided: bool,
+}
+
+impl Default for Opts {
+    fn default() -> Self {
+        Opts { walks: true, lm_credit: None, bot_shape: false, pm_bound: true, full_words: arbsim::copy2::walk::WalkCfg::default().full_words, one_sided: false }
+    }
 }
 
 fn tracked(address: Address, kind: PoolKind, t0: Address, t1: Address) -> TrackedPool {
@@ -142,6 +165,11 @@ fn kind_str(k: PoolKind) -> &'static str {
 impl World {
     /// `walks`: tick walks on (false = dry run #17 behaviour).
     fn start(kind: K, walks: bool, lm_credit: Option<u64>) -> Option<World> {
+        World::start_with(kind, Opts { walks, lm_credit, ..Opts::default() })
+    }
+
+    fn start_with(kind: K, o: Opts) -> Option<World> {
+        let (walks, lm_credit) = (o.walks, o.lm_credit);
         let a = Arc::new(Anvil::start()?);
         let arts = artifacts();
         let tok = art(&arts, "Token");
@@ -224,11 +252,13 @@ impl World {
         if !walks {
             cfg.walks_inflight = 0;
         }
+        cfg.pm_bound = o.pm_bound;
+        cfg.walk.full_words = o.full_words;
         let fills = Arc::new(FillQueue::new(1000, 100));
         let (intake, h) = manual(sh.clone(), fills.clone(), cfg);
         let (_u, updater) = arbsim::state::updater::manual(sh.clone(), fills.clone());
         let ctx = Ctx { shared: sh.clone(), updater, fills, pinned: PinnedCache::new(4), copy2: Some(h.clone()) };
-        let mut w = World { a: a.clone(), node, sh, intake, h, ctx, kind, pools, trader, plain, uu, ww, lm, runtime: arb_executor_runtime(), ts: 0, last_sent: 0 };
+        let mut w = World { a: a.clone(), node, sh, intake, h, ctx, kind, pools, trader, plain, uu, ww, lm, runtime: arb_executor_runtime(), ts: 0, last_sent: 0, bot_shape: o.bot_shape };
         // Many positions, spread far (quadratic widths): big swaps cross
         // many ticks and many tick-map words.
         for k in 1..=18i64 {
@@ -237,7 +267,11 @@ impl World {
             let b = tick.div_euclid(spacing) * spacing;
             // Widest position ~30,000 ticks (inside the walked window).
             let f = (30_000 / (spacing * 18 * 18 * 12)).max(1);
-            let (lo, hi) = (b - spacing * f * k * k * 12 - spacing, b + spacing * f * k * k * 9 + spacing);
+            let (lo, hi) = if o.one_sided {
+                (b + spacing * 10 * k, b + spacing * (10 * k + f * k * k * 9 + 1))
+            } else {
+                (b - spacing * f * k * k * 12 - spacing, b + spacing * f * k * k * 9 + spacing)
+            };
             let (to, d) = w.mint_call(0, lo, hi, liq);
             a.send_ok(to, &d);
         }
@@ -327,7 +361,10 @@ impl World {
                 self.pools.iter().any(|p| {
                     (p.v4_id.is_none() && l.address == p.address)
                         || (p.v4_id.is_some() && l.address == p.address && l.topics.get(1).is_some_and(|t| Some(*t) == p.v4_id))
-                        || ((l.address == p.token0 || l.address == p.token1) && l.topics.len() == 3 && (side(&l.topics[1]) == p.address || side(&l.topics[2]) == p.address))
+                        || (!(self.bot_shape && p.v4_id.is_some())
+                            && (l.address == p.token0 || l.address == p.token1)
+                            && l.topics.len() == 3
+                            && (side(&l.topics[1]) == p.address || side(&l.topics[2]) == p.address))
                 })
             })
             .collect()
@@ -553,7 +590,9 @@ fn big_checks(kind: K) {
         for dir in [true, false] {
             match w.compare(n, usd, dir) {
                 (None, a) => {
-                    assert_eq!(a["unknown"], json!("miss"), "{a}");
+                    // V4 without walks: the PoolManager balance bound only
+                    // counts tick data the copy holds (~none): unknown too.
+                    assert!(a["unknown"] == json!("miss") || (kind == K::V4 && a["unknown"] == json!("pool_manager_balance")), "{a}");
                     misses_before += 1;
                 }
                 (Some(same), d) => {
@@ -781,6 +820,156 @@ fn late_swap_without_bloom_is_noticed_from_its_coin_transfers() {
     late_case(false, true, false);
 }
 
+// ---------------------------------------------------------------------------
+// The BOT's check shape on V4 (live Oct 22, shadow hour 08:26-09:31 UTC: of
+// 44 real checks 7 answered; missesTop: 503 "ready pool slot" at the V4
+// PoolManager, 22 + 12 "coin slot" at USDG / WETH). The bot's reports never
+// include the PoolManager's coin transfers (bot_shape), its contract swaps
+// with the min / max price limit, and many of its checks were on thin
+// stock-token pools ("ZeroAmount(): pool gave back nothing").
+// ---------------------------------------------------------------------------
+
+fn zero_amount_selector() -> String {
+    hb(&sel("ZeroAmount()"))
+}
+
+/// A V4 pool with NO liquidity below its price: a check selling token0 into
+/// it runs the price to the minimum (every tick-map word on the way) and
+/// gets nothing (ZeroAmount). Before: missed on PoolManager words beyond
+/// the walked window (the live 503). After (full walk + far zero words):
+/// answered, exactly the chain's answer.
+fn zero_amount_case(full: bool) -> Option<(usize, usize, Value)> {
+    let o = Opts { bot_shape: true, one_sided: true, full_words: if full { 8000 } else { 0 }, pm_bound: full, ..Opts::default() };
+    let mut w = World::start_with(K::V4, o)?;
+    w.go_live();
+    w.wait("tick walks", |w| w.walked());
+    w.settle();
+    let n = w.block(&[]);
+    w.settle();
+    // The test hop sells token0 (price down, into the empty side).
+    let dir = w.uu < w.ww;
+    // Warm up the check's own items (our contract's slots / coin balances)
+    // with checks the old walk also answers (into the side with liquidity).
+    for _ in 0..3 {
+        let _ = w.compare(n, 100, !dir);
+        w.settle();
+    }
+    let (mut answered, mut missed) = (0, 0);
+    for usd in [100u64, 1_000, 2_000] {
+        for _ in 0..3 {
+            let (call, ov) = w.round_trip(usd, dir);
+            let (_, out, _) = w.truth(n, &call, &ov);
+            assert!(out.starts_with(&zero_amount_selector()), "test setup: the chain says ZeroAmount ({out})");
+            match w.compare(n, usd, dir) {
+                (Some(same), d) => {
+                    assert!(same, "copy answer DIFFERS from the chain ({usd} USD): {d}");
+                    answered += 1;
+                }
+                (None, a) => {
+                    assert_eq!(a["unknown"], json!("miss"), "{a}");
+                    missed += 1;
+                }
+            }
+            w.settle();
+        }
+    }
+    // The other way (pays token1 in): the PoolManager holds NO token1 (the
+    // only pool's liquidity is all token0), so its balance goes 0 -> x on
+    // chain (more gas); the copy can't prove it isn't 0: unknown, never wrong.
+    for usd in [100u64, 1_000] {
+        if let (Some(same), d) = w.compare(n, usd, !dir) {
+            assert!(same, "copy answer DIFFERS from the chain ({usd} USD, other way): {d}");
+        }
+    }
+    let st = w.h.status_json(false);
+    w.h.stop();
+    Some((answered, missed, st))
+}
+
+#[test]
+fn bot_v4_check_into_an_empty_side_is_answered_exactly() {
+    let Some((a, m, st)) = zero_amount_case(false) else {
+        eprintln!("copy2 coverage anvil test SKIPPED: no ~/.foundry/bin/anvil");
+        return;
+    };
+    eprintln!("ZeroAmount checks, OLD walk (window only): {a} answered, {m} missed; missesTopSlots {}", st["missesTopSlots"]);
+    // (The old copy filled the missed words a few at a time (64 per check)
+    // and, for the PoolManager, as values of ALL our V4 pools: answered
+    // only after several misses, and unsound for another pool's words.)
+    assert!(m >= 3, "the old walk misses checks that run the price to its limit ({a} answered, {m} missed)");
+    let pm_misses = st["missesTop"].as_array().unwrap().iter().filter(|r| r[0] == json!("ready pool slot")).map(|r| r[2].as_u64().unwrap()).sum::<u64>();
+    assert!(pm_misses >= 64, "expected the live pattern (PoolManager words beyond the walk): {st}");
+    assert!(st["missesTopSlots"].as_array().unwrap().iter().any(|r| r[4].as_str().unwrap().starts_with("not a base slot")), "{}", st["missesTopSlots"]);
+    let (a, m, st) = zero_amount_case(true).unwrap();
+    eprintln!("ZeroAmount checks, FULL walk: {a} answered, {m} missed; far zero words {}; pm bound {} / same {} / differ {}",
+        st["counters"]["walk_far_zero"], st["counters"]["pm_bound_checks"], st["counters"]["pm_bound_same"], st["counters"]["pm_bound_differ"]);
+    assert_eq!(m, 0, "{st}");
+    assert_eq!(a, 9);
+    assert!(st["counters"]["walk_far_zero"].as_u64().unwrap() > 300, "{st}");
+}
+
+/// The PoolManager's coin balances are NOT reported to the copy (the bot
+/// never subscribes to them). Old: the copy held the balance read at load
+/// and answered with it after V4 trades / new liquidity moved it: a WRONG
+/// answer when a check takes out more than that stale number. New: checks
+/// run at a proven lower bound and far above it; same answer = exact.
+fn pm_balance_case(pm_bound: bool) -> Option<(usize, usize, usize, Value)> {
+    let o = Opts { bot_shape: true, pm_bound, full_words: if pm_bound { 8000 } else { 0 }, ..Opts::default() };
+    let mut w = World::start_with(K::V4, o)?;
+    w.go_live();
+    w.wait("tick walks", |w| w.walked());
+    w.settle();
+    trade_some(&mut w);
+    // Much more liquidity (its event is reported; the coins it brings into
+    // the PoolManager are not).
+    let t = w.tick(0);
+    let b = t.div_euclid(10) * 10;
+    let (to, d) = w.mint_call(0, b - 20_000, b + 20_000, q(19));
+    w.block(&[(to, d)]);
+    w.settle();
+    let n = w.block(&[]);
+    w.settle();
+    for _ in 0..3 {
+        let _ = w.compare(n, 100, true);
+        w.settle();
+    }
+    let (mut same, mut differ, mut unknown) = (0, 0, 0);
+    for usd in [1_000u64, 20_000, 150_000, 600_000, 2_000_000, 6_000_000] {
+        for dir in [true, false] {
+            match w.compare(n, usd, dir) {
+                (Some(true), _) => same += 1,
+                (Some(false), d) => {
+                    eprintln!("DIFFERS ({usd} USD, test first {dir}): {d}");
+                    differ += 1;
+                }
+                (None, a) => {
+                    eprintln!("unknown ({usd} USD, test first {dir}): {}", a["unknown"]);
+                    unknown += 1;
+                }
+            }
+            w.settle();
+        }
+    }
+    let st = w.h.status_json(false);
+    w.h.stop();
+    Some((same, differ, unknown, st))
+}
+
+#[test]
+fn bot_v4_pool_manager_balance_is_never_stale() {
+    let Some((s, d, u, st)) = pm_balance_case(false) else {
+        eprintln!("copy2 coverage anvil test SKIPPED: no ~/.foundry/bin/anvil");
+        return;
+    };
+    eprintln!("OLD (PoolManager balance held): same {s}, DIFFERENT {d}, unknown {u}; coin_balance_disagree {}", st["counters"]["coin_balance_disagree"]);
+    assert!(d > 0, "expected the old copy to answer wrongly with a stale PoolManager balance");
+    let (s, d, u, st) = pm_balance_case(true).unwrap();
+    eprintln!("NEW (lower bound + second run): same {s}, different {d}, unknown {u}; pm bound checks {} same {} differ {}; fills refused (pm balance) {}",
+        st["counters"]["pm_bound_checks"], st["counters"]["pm_bound_same"], st["counters"]["pm_bound_differ"], st["counters"]["fill_refused_pm_balance"]);
+    assert_eq!(d, 0, "never a wrong answer");
+    assert!(s >= 10, "most checks answered: same {s}, unknown {u}");
+}
+
 /// Size of one walk's answer and its gas (printed; run with --ignored --nocapture).
 #[test]
 #[ignore]
@@ -797,5 +986,22 @@ fn walk_cost() {
         c[2]["tracer"] = json!("callTracer");
         let g = w.a.ok("debug_traceCall", c);
         eprintln!("{kind:?}: walk answer {} KB, {} slots learned ({} ignored), {} ticks, {} words, done {}, gas {}", bytes / 1024, out.slots.len(), out.ignored, out.ticks, out.words, out.done, u64v(&g["gasUsed"]));
+        if kind == K::V4 {
+            // The biggest full walk: tick spacing 1 (6932 words).
+            let mut p1 = w.pools[0].clone();
+            p1.fee = 100;
+            p1.tick_spacing = 1;
+            p1.v4_id = Some(arbsim::copy2::replay::v4_pool_id(&p1));
+            let init = calldata("initialize((address,address,uint24,int24,address),uint160)", &[Arg::A(p1.token0), Arg::A(p1.token1), Arg::W(U256::from(100)), Arg::I(1), Arg::A(Address::ZERO), Arg::W(sqrt_price_for(2500.0, w.uu, w.ww))]);
+            w.mine(&[(p1.address, init)]);
+            let p = arbsim::copy2::walk::trace_params(&p1, &cfg, &json!("latest"));
+            let t = w.a.ok("debug_traceCall", p.clone());
+            let out = arbsim::copy2::walk::read_walk(&t, &p1, &[]);
+            let mut c = p.clone();
+            c[2]["tracer"] = json!("callTracer");
+            let g = w.a.ok("debug_traceCall", c);
+            eprintln!("V4 spacing 1: walk answer {} KB, {} slots learned, {} far zero words, full {}, done {}, gas {}", t.to_string().len() / 1024, out.slots.len(), out.far_zero.len(), out.full, out.done, u64v(&g["gasUsed"]));
+            assert!(out.done && out.full);
+        }
     }
 }

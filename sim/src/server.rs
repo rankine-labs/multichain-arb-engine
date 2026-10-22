@@ -33,6 +33,7 @@ use serde_json::{json, Value};
 
 use crate::arb::BlockCtx;
 use crate::check::proto_types::{handle_call, handle_size_search, CallRequest, SizeSearchRequest};
+use crate::copy2::checkview::{high_offset, C2View};
 use crate::copy2::intake::Copy2Handle;
 use crate::node::env_u64;
 use crate::proto::{bad_request, parse_at, parse_missing, parse_warm, read_msg, unknown, write_msg};
@@ -301,7 +302,10 @@ fn check(ctx: &Ctx, id: &Value, at: &Value, t0: Instant, run: impl Fn(&dyn State
     };
     let block = picked.seq + sh.cfg.l2_offset;
     let view = View::new(picked.snap);
-    let mut answer = run(&view, &picked.ctx);
+    let mut answer = match &ctx.copy2 {
+        None => run(&view, &picked.ctx),
+        Some(c) => copy2_run(c, &view, block, &picked.ctx, &run),
+    };
     if ctx.copy2.is_none() {
         ctx.updater.touched(view.take_touched());
     } else if let Some(c) = &ctx.copy2 {
@@ -338,6 +342,40 @@ fn check(ctx: &Ctx, id: &Value, at: &Value, t0: Instant, run: impl Fn(&dyn State
     // Total time inside the sidecar (state pick + check).
     answer["us"] = json!(t0.elapsed().as_micros() as u64);
     answer
+}
+
+/// Copy 2: run the check on the copy's view plus what the copy vouches for
+/// without holding it (copy2/checkview.rs: far zero tick-map words, the V4
+/// PoolManager's balances at a proven lower bound). A run that read a
+/// PoolManager balance is repeated with that balance 2^200 higher; the
+/// answer stands only if both runs agree exactly, else "unknown".
+fn copy2_run(c: &Copy2Handle, view: &View, block: u64, bctx: &BlockCtx, run: &impl Fn(&dyn StateRead, &BlockCtx) -> Value) -> Value {
+    let facts = c.check_facts(block);
+    if facts.is_empty() {
+        return run(view, bctx);
+    }
+    let low = C2View::new(view, &facts, revm::primitives::U256::ZERO);
+    let answer = run(&low, bctx);
+    if !low.used_bound() || answer.get("ok") != Some(&Value::Bool(true)) {
+        return answer;
+    }
+    let high = C2View::new(view, &facts, high_offset());
+    let again = run(&high, bctx);
+    let strip = |v: &Value| {
+        let mut v = v.clone();
+        if let Some(m) = v.as_object_mut() {
+            m.remove("us");
+        }
+        v
+    };
+    let same = strip(&answer) == strip(&again);
+    c.note_pm_bound(same);
+    if same {
+        return answer;
+    }
+    let id = answer.get("id").cloned().unwrap_or(Value::Null);
+    json!({ "id": id, "ok": false, "unknown": "pool_manager_balance",
+            "detail": "the answer depends on the V4 PoolManager's coin / ETH balance, which copy 2 does not follow (same check at a proven lower bound and far above it differ)" })
 }
 
 fn pinned_check(ctx: &Ctx, id: &Value, block: u64, next: bool, t0: Instant, run: impl Fn(&dyn StateRead, &BlockCtx) -> Value) -> Value {
