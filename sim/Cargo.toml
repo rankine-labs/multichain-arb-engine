@@ -1,0 +1,62 @@
+# ---------------------------------------------------------------------------
+# arbsim: the in-bot simulator sidecar (see DESIGN.md).
+# Runs our ArbExecutor contract on an in-memory copy of Robinhood Chain state.
+# ---------------------------------------------------------------------------
+[package]
+name = "arbsim"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "arbsim"
+path = "src/main.rs"
+
+[dependencies]
+# Same revm build that passed go/no-go #1 (50/50 real trades exact).
+revm = { version = "=43.0.3", default-features = false, features = [
+    "std", "secp256k1", "portable", "c-kzg", "blst",
+    "optional_no_base_fee", "optional_balance_check",
+    "optional_block_gas_limit", "optional_eip3607",
+    # (workstream C) lets checks skip gas-fee bookkeeping entirely, like a
+    # node's eth_call: then the block's coinbase account is never touched, so
+    # a check can't come back "unknown" just because we never loaded it.
+    "optional_fee_charge",
+    # (workstream B) Nitro applies the EIP-7623 calldata floor only when the
+    # chain enabled it (off by default); lets arb::configure_cfg turn it off.
+    "optional_eip7623",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# --- workstream A (state mirror, feed, node client, socket server) ---
+# Persistent ("copy-on-write") maps: many readers keep using an old version of
+# the state while the mirror builds the next one, without copying everything.
+imbl = "7"
+# Fast hashing for our in-memory maps (keys are addresses / storage slots).
+rustc-hash = "2"
+# The feed carries transactions as base64 text.
+base64 = "0.23"
+# Small blocking HTTPS client for the node's JSON-RPC (rustls, no OpenSSL).
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+
+[dev-dependencies]
+# Tests only (workstream C): sign test transactions to check sender recovery.
+# Same version revm already builds, so nothing new is downloaded or compiled.
+secp256k1 = { version = "=0.31.1", features = ["recovery", "global-context"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = false
+strip = true
+
+# (workstream B) per-call-frame gas tracer, the counterpart of tools/gas-diff.js:
+#   cargo run --release --example gas_trace -- <fixture.json>
+[[example]]
+name = "gas_trace"
+path = "tools/gas_trace.rs"

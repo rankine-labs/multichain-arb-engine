@@ -1,0 +1,132 @@
+# ============================================================================
+# ARBSIM BINARY - builds the fast-check sidecar program for the server.
+#
+# Plain English:
+#   The server can't build Rust itself (no Rust installed, too little
+#   memory), so GitHub builds it here after every merge to main that touches
+#   sim/, runs all its tests, and stores the result on a separate branch
+#   called "arbsim-bin". That branch only ever holds ONE commit (it is
+#   replaced each time), with three files:
+#     arbsim          the program
+#     arbsim.sha256   its checksum (the server refuses a damaged download)
+#     BUILD_INFO      what it was built from:
+#                       source_commit  the main commit
+#                       sim_tree       git's fingerprint of the sim/ folder
+#                                      at that commit (git rev-parse HEAD:sim)
+#                       glibc_max      newest system library it needs
+#   The server (deploy/arbsim-update.sh) only installs a build whose
+#   sim_tree equals the sim/ folder it has deployed. Nothing here touches
+#   the server: it downloads the program itself with its read-only key.
+#
+#   Server = Ubuntu 26.04 (glibc 2.43). Built on Ubuntu 24.04 (glibc 2.39),
+#   so it runs there; the build fails here if it ever needs newer than 2.39.
+#
+# Run by hand: Actions -> "Arbsim binary" -> Run workflow (e.g. the first
+# time, or to rebuild).
+# ============================================================================
+name: Arbsim binary
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'sim/**'
+      - '.github/workflows/arbsim-binary.yml'
+  workflow_dispatch:
+
+# This is the ONLY workflow allowed to write to the repo, and it only ever
+# writes the arbsim-bin branch.
+permissions:
+  contents: write
+
+# Two merges close together: builds run one after the other (never two
+# pushes to arbsim-bin at once). A build already running is never cut off
+# halfway; GitHub keeps only the newest waiting one.
+concurrency:
+  group: arbsim-binary
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            sim/target
+          key: arbsim-${{ runner.os }}-${{ hashFiles('sim/Cargo.lock') }}
+          restore-keys: arbsim-${{ runner.os }}-
+
+      - name: Build (release)
+        working-directory: sim
+        run: cargo build --release --locked
+
+      - name: Tests
+        working-directory: sim
+        run: cargo test --release --locked
+
+      # Package the program + checksum + build info, and check it before
+      # publishing: it must start (usage line) and must not need a newer
+      # system library than the server has.
+      - name: Package and check
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          cp sim/target/release/arbsim out/arbsim
+          chmod 755 out/arbsim
+          # Newest glibc version the program asks for (server has 2.43).
+          need=$(objdump -T out/arbsim | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -uV | tail -n 1)
+          echo "needs glibc $need"
+          if [ "$(printf '%s\n%s\n' "$need" 2.43 | sort -V | tail -n 1)" != "2.43" ]; then
+            echo "::error::arbsim needs glibc $need, server only has 2.43"; exit 1
+          fi
+          # Smoke test: with no arguments it prints its usage and exits 2.
+          set +e; msg=$(out/arbsim 2>&1); code=$?; set -e
+          echo "$msg"
+          [ "$code" = 2 ] && echo "$msg" | grep -q '^usage: arbsim serve' || { echo "::error::smoke test failed"; exit 1; }
+          (cd out && sha256sum arbsim > arbsim.sha256)
+          {
+            echo "source_commit=$(git rev-parse HEAD)"
+            echo "sim_tree=$(git rev-parse HEAD:sim)"
+            echo "source_ref=${GITHUB_REF_NAME}"
+            echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "glibc_max=$need"
+            echo "rustc=$(rustc --version)"
+            echo "runner=$(. /etc/os-release && echo "$PRETTY_NAME")"
+            echo "workflow_run=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          } > out/BUILD_INFO
+          cat out/BUILD_INFO out/arbsim.sha256
+          ls -la out
+
+      # Replace the arbsim-bin branch with ONE fresh commit holding just
+      # these three files (no history, so the branch stays ~5 MB).
+      # Only builds of main are published (the server only deploys main).
+      # Running it by hand on another branch builds and tests, nothing more.
+      - name: Publish to the arbsim-bin branch
+        if: github.ref == 'refs/heads/main'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd out
+          git init -q -b arbsim-bin
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          printf '%s\n' \
+            "Built automatically by .github/workflows/arbsim-binary.yml." \
+            "Do not edit or merge this branch. The server downloads it read-only" \
+            "(deploy/arbsim-update.sh). See docs/FAST_CHECK_OPS.md." > README
+          git add arbsim arbsim.sha256 BUILD_INFO README
+          git commit -q -m "arbsim for ${GITHUB_SHA::7} (sim $(git -C .. rev-parse --short=8 HEAD:sim))"
+          git push -q --force \
+            "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+            HEAD:refs/heads/arbsim-bin
+          echo "::notice title=arbsim published::$(tr '\n' ' ' < BUILD_INFO)"
+        env:
+          GH_TOKEN: ${{ github.token }}

@@ -214,6 +214,32 @@ mark_failed() {
   rm -f "$ALLOW_FILE" "$PENDING_FILE"
 }
 
+# --- Fast-check sidecar (arbsim) ---------------------------------------------
+# deploy/arbsim-update.sh puts the GitHub-built program for the DEPLOYED
+# sim/ code in bin/arbsim and starts / stops the "arbsim" pm2 app to match
+# LOCAL_SIM in .env. It never touches the bot (dex-arb-shadow), never pulls
+# or changes the bot's code, and only installs a program built for exactly
+# the code already deployed, so the deploy lock is not affected. Runs every
+# 2 minutes (a build finishes a few minutes after a merge; LOCAL_SIM may be
+# switched) and around each deploy. Telegram only on a new install or a
+# NEW problem (the script itself stays quiet when nothing changes).
+arbsim_update() {
+  [ -f "$SCRIPT_DIR/arbsim-update.sh" ] || return 0
+  local rc
+  # 9>&- : don't hand our deploy lock to it (if it ever had to start pm2's
+  # background daemon, that daemon would otherwise hold the lock forever).
+  APP_DIR="$APP_DIR" timeout 300 bash "$SCRIPT_DIR/arbsim-update.sh" 9>&-; rc=$?
+  case "$rc" in
+    0) ;;
+    10) notify "⚡ <b>FAST CHECK UPDATED</b>
+Sidecar program installed for the deployed code (sim $(git rev-parse --short=8 HEAD:sim 2>/dev/null)). Previous kept as bin/arbsim.prev." ;;
+    *) notify "⚠️ <b>FAST CHECK PROBLEM</b>
+deploy/arbsim-update.sh exited $rc (see deploy/auto-deploy.log). The bot is unaffected: it uses the node for checks." ;;
+  esac
+  return 0
+}
+arbsim_update
+
 # --- 1. Anything new on GitHub? ---------------------------------------------
 if ! git fetch --quiet origin "$BRANCH" 2>/dev/null; then
   log "git fetch failed (network blip or GitHub access problem); will retry next run"
@@ -333,6 +359,9 @@ rollback() {
       [ "$RB_STATUS" = "online" ] || rb_err="old version not running after rollback (status: $RB_STATUS)"
     fi
   fi
+  # Fast-check sidecar back to the program for the OLD code (it may have
+  # been switched to the new one just before the restart).
+  [ -z "$rb_err" ] && arbsim_update
   if [ -n "$rb_err" ]; then
     notify "🆘 <b>DEPLOY FAILED + ROLLBACK FAILED</b> <code>${SHORT}</code>
 $(html "$SUBJECT")
@@ -394,6 +423,12 @@ Needs a manual look before the bot restarts for any reason."
   exit 0
 fi
 
+# Fast-check sidecar for the NEW code, before the bot restarts: installs the
+# matching program if GitHub has built it already; if not, stops the old one
+# so it never answers the new bot with code it wasn't built for (the bot
+# uses the node meanwhile). Never blocks or fails the deploy.
+arbsim_update
+
 pm2 restart "$PM2_NAME" --update-env > /dev/null 2>&1 || rollback "pm2 restart failed"
 RESTARTED=1
 # The live-deploy permission is used up the moment the restart happens.
@@ -426,6 +461,9 @@ read -r STATUS_C RESTARTS_C <<< "$(pm2_info)"
 [ "$RESTARTS_C" = "$RESTARTS_A" ] || rollback "bot crashed and restarted $((RESTARTS_C - RESTARTS_A))x right after startup"
 
 rm -f "$FAILED_SHA_FILE" "$PENDING_FILE"
+# Deploy succeeded: one more fast-check pass (picks up a program that GitHub
+# finished building during the startup watch).
+arbsim_update
 if [ "$STARTED" = 1 ]; then
   notify "🚀 <b>DEPLOYED</b> <code>${SHORT}</code>
 $(html "$SUBJECT")

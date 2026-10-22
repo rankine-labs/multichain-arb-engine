@@ -24,3 +24,5 @@ dist/
 deploy/.status-state.json
 # Deploy lock: owner's one-time "deploy while live" permission (server only)
 DEPLOY_ALLOW_LIVE
+# Fast-check sidecar program, downloaded by deploy/arbsim-update.sh (server only)
+bin/

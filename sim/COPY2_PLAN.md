@@ -1,0 +1,513 @@
+# Copy 2: our pools' copy kept current from pool events (build plan, Oct 21 2026)
+
+Owner: Rudy (not a developer: comments in plain English, every file explains itself).
+Goal: the fast check (arbsim engine, already proven 10,142/10,142 exact vs node) answers
+from a copy of OUR pools that is kept current from those pools' own events, so the bot
+checks a gap in ~1 ms instead of asking the node (160 to 250 ms). Trigger to signed
+trade ~20 ms.
+
+## Why (all measured, see project doc InBot_Profit_Reaction_2026-10-21)
+- Copy 1 (replay every chain tx, sim/src/state/updater.rs + feed/) FAILED live:
+  ~2.1M node reads/day. Keep its code; copy 2 is a NEW source of truth next to it.
+- Offline proof (branch inbot-sim/bench, bench/event-copy-test/, results.md):
+  event "fields" exact for V2 and Solidly (0 node reads); event "replay with the
+  pool's own code" exact for V3, PancakeSwap V3, Algebra Integral (+plugin), V4
+  hook-free (21,618 checks, 0 wrong in strict mode). Helpers.sol + lib.js +
+  types/*.js + copycheck/ show exactly how each type was replayed. READ THEM.
+- Pool reports (Chainstack WSS logs) arrive as fast as the sequencer feed
+  (median 7 ms earlier). Live: ~10 tx/s touch our ~800 pools.
+
+## Shape
+- arbsim (Rust sidecar, Unix socket, 4-byte BE length + JSON) gets a new source:
+  ARBSIM_SOURCE=pool-events (default stays the old feed mode until we switch).
+- Bot (TypeScript) sends:
+  - `track` {pools:[{address, v4Id?, kind, token0, token1, fee, tickSpacing}]}
+    (the watched pools whose type copy 2 supports; re-sent on change / every 10 min)
+  - `pool_logs` {block, timestamp, l1Block?, logs:[raw eth logs]} one message per
+    block that has events on tracked pools (also coin Transfer logs to/from those
+    pools), in block order. Blocks with no events: optional `block_tick` so the
+    copy knows it is current.
+- arbsim keeps, per tracked pool, the pool's storage + its two coins' balance slots
+  for the pool (+ PoolManager slots for V4 ids, + Algebra plugin storage). First load:
+  lazy fill from the node at the copy's block (state/fill.rs already handles
+  "fetched at k, copy at B" carry-forward). Then each event is applied:
+  fields (V2/Solidly) or replay (others). Publishes a Version per block into the
+  existing mirror (state/mirror.rs, snap.rs) so `call` / `size_search` with
+  at {"after":"head"} or {"block":N} read it.
+- STRICT, ALWAYS: anything not exactly known is MISSING (never zero). A pool whose
+  event can't be applied exactly -> UNSURE (checks touching it answer
+  "unknown: unsure-pool"), reload it from the node in the background. Reorg
+  (removed log) -> that block's pools UNSURE + reload. Never a guess.
+- Status: per-pool state (loading / ready / unsure), events applied, unsure count,
+  node reads used (daily allowance applies: node.rs budget classes).
+
+## Workstreams (parallel; each its own branch off inbot-sim/main)
+- A (Rust) `inbot-sim/copy2-a`: sim/src/copy2/intake.rs + wiring. `track` and
+  `pool_logs` in proto/server; tracked pool set; per-block apply loop (ordered by
+  block, tx index, log index); V2 + Solidly field application; coin Transfer ->
+  pool coin balance slots (find the balance slot layout once via the node, like
+  the bot's findBalanceSlot, cached); lazy fill + UNSURE + reload; publish
+  Versions; status counters; ARBSIM_SOURCE switch. Calls B through
+  `copy2::replay::apply_replay(...)`; until B lands, those kinds are UNSURE.
+- B (Rust) `inbot-sim/copy2-b`: sim/src/copy2/replay.rs. `pub fn apply_replay(
+  db: &mut <A's mutable overlay>, pool: &TrackedPool, log: &PoolLog, ctx: &BlockCtx)
+  -> ApplyResult` for V3, PancakeV3, Algebra (+ plugin beforeSwap), V4 no-hook:
+  re-run Swap / Mint / Burn / Collect / Flash / (V4 ModifyLiquidity, Donate) with the
+  pool's own code inside revm on the copy, using a helper caller (port Helpers.sol
+  logic; compiled bytecode embedded) that pays callbacks; then CHECK the result
+  matches the event's own numbers (price, tick, liquidity, amounts) else Unsure.
+  Agree the overlay type with A by reading A's branch / DESIGN; if A isn't there
+  yet, write against a small trait in replay.rs that A implements.
+- C (TypeScript) `inbot-sim/copy2-c`: bot side. Tap the block reader's pool logs
+  (src/core/blockReader.ts, WSS) and forward per block as `pool_logs`; send
+  `track` from the watch list (kind mapping: kindForPool / dex names); add copy-2
+  readiness to localSimHost (per pool ready flag from status); route sitting-gap
+  and loop checks to the fast check when every pool on the route is ready, else
+  node as today. Switch LOCAL_SIM=on + LOCAL_SIM_CONFIRM=yes-fast-check already
+  exists (auto step-back on disagreement already built). Rudy wants it LIVE
+  directly (no long practice), so make "on" mode solid; keep off by default.
+  Hourly Telegram line: copy ready pools, unsure, fast checks, node checks.
+- D (TypeScript/JS) `inbot-sim/copy2-d`: checker. scripts/sim-compare/copy2-dryrun.js:
+  runs a separate arbsim (test socket) in pool-events mode next to the bot,
+  feeds it from its own Chainstack WSS log subscription, and every N blocks
+  compares (1) each ready pool's key slots vs the node at that block and
+  (2) fast vs node answers for real checks (bot's simulateRoundTrip on the node).
+  Read only; reads only CHAINSTACK_* lines from .env, never prints them. Output a
+  plain-English summary (match %, unsure %, node reads). Plus offline tests.
+
+## Rules for every agent
+- Never touch, print or ask for private keys. No transactions, no deploys.
+- Work only on your branch; push it (git push origin <branch>). Do not merge to
+  main, do not open PRs (the coordinator does). Do not run git checkout -- . or
+  anything that throws away work.
+- This sandbox cannot reach chain RPCs. Test offline: cargo test (sim/), the
+  bench offline harness (anvil/forge in ~/.foundry/bin), npm test / tsc for TS.
+- Every new file starts with a plain-English header; comment the why.
+- Keep existing tests passing: `cd sim && cargo test`, `npx tsc --noEmit`,
+  `npm test` (bot), sim-compare tests.
+- Report back: what you built, tests run + results, what is NOT done, risks.
+
+## Workstream A: what was built (for C / D / the coordinator)
+- Files: copy2/overlay.rs (working copy B replays on), copy2/fields.rs (V2 +
+  Solidly), copy2/coins.rs (coin balance places), copy2/intake.rs (thread,
+  wire parsing, status), copy2/replay.rs = PLACEHOLDER: when merging B, take
+  B's replay.rs whole (same signatures: apply_replay, finish_block, has_pending).
+- Switch: ARBSIM_SOURCE=pool-events (default feed). Tunables:
+  ARBSIM_COPY2_RELOAD_MS 2000, ARBSIM_COPY2_RELOAD_MAX_MS 600000,
+  ARBSIM_COPY2_LAYOUT_RETRY_S 3600, ARBSIM_COPY2_LOAD_BATCH 25 (pools per
+  job), ARBSIM_COPY2_LOADERS 4 (threads), ARBSIM_COPY2_KEEP_BLOCKS 2400
+  (reports kept for carrying loads forward), ARBSIM_COPY2_MAX_ROUNDS 40,
+  ARBSIM_COPY2_TIP_EVERY_S 30.
+- Loading never holds up blocks (fix after the Oct 21 dry run): all node
+  questions go to loader threads (copy2/loader.rs), PAID node first
+  (call_batch_paid), ARBSIM_NODE_BATCH calls per HTTP request; values are
+  fetched at block k and the pool's own reports for k+1..now are applied from
+  the buffer before it turns ready. Load speed = paid calls / ARBSIM_NODE_RPS
+  (default 8 calls/s!): about 9.5 calls per V2 pool, ~16 per Solidly pool,
+  ~2 per V3/V4/Algebra pool up front + values fetched when its first events
+  arrive. 800 pools ~ 6,000-8,000 calls: ~15 min at RPS 8, ~4-5 min at
+  RPS 25-30 (set ARBSIM_NODE_RPS to what the Chainstack plan allows). The log
+  prints "copy2: load round done: N pools in T s using X node requests".
+- Socket (C): `track` {pools:[{address, v4Id?, kind: v2|solidly|v3|pancake-v3|
+  algebra|v4, token0, token1, fee, tickSpacing}], coinSlots?: the bot's
+  data/balance-slots.json entries} -> {ok, tracked, skipped}.
+  `pool_logs` {block, timestamp, l1Block, baseFee?, prevBlock, logs} and
+  `block_tick` {block, timestamp, l1Block, prevBlock}: no answer.
+  PLEASE send a block_tick for EVERY block without events (checks at
+  {"block":N} need a version for N, and head's time must be current) and
+  always `prevBlock` (= block of your previous pool_logs/block_tick): a
+  mismatch means a lost message and every pool is reloaded.
+  Forward ALL coin Transfer logs to/from tracked pool addresses (incl. the V4
+  PoolManager), also while pools are loading.
+- Coin balance places the bot already knows (saves 2+ node requests per
+  coin and avoids probing): send the content of data/balance-slots.json,
+  either inside `track` as `coinSlots`, or on its own (any time, e.g. at
+  start and whenever the file changes):
+    {"id": 7, "type": "coin_slots", "coinSlots": {
+       "robinhood:0x5fc5...": {"layout": "solidity", "slot": 1},
+       "robinhood:0x0bd7...": {"layout": "solidity", "slot": 51},
+       "0xabc...":            {"layout": "vyper",    "slot": 3} }}
+    -> {"id": 7, "ok": true, "accepted": 3}
+  Keys: "chain:0xtoken" (the file's own keys) or plain "0xtoken"; layout
+  "solidity" = keccak(holder . slot), "vyper" = keccak(slot . holder).
+  They replace a "not found", and pools waiting on that coin retry at once.
+  arbsim still checks each coin ONCE (storage value == balanceOf(pool)).
+- Node behind the websocket (dry run #3): loads / probes / fills are fetched
+  at min(copy block, node's newest block) and carried forward; a node error
+  object (unknown block, rate limit, timeout...) is never "not found", it is
+  retried. Reports are kept while a load still needs them
+  (ARBSIM_COPY2_MAX_KEEP_BLOCKS, 40000). A block re-sent with the same
+  reports plus new ones after them applies just the new ones (no reorg).
+  Each load round logs "copy2: load round done: ... outcomes: N ready, N
+  coin balance place not found, N node errors (retried), N layout/balance
+  mismatch, N other unsure" (and a progress line every 60 s while running).
+- Dry run #4 fixes:
+  - Late reports are judged PER POOL (the bot hears reports on ~18 separate
+    subscriptions): a message for an already-applied block adds the reports
+    we didn't have; each is applied to its pool if that pool has nothing
+    applied after it (written into every kept version from that block on),
+    else that pool alone goes unsure. Coin transfers likewise per (coin,
+    pool): a transfer older than one already applied forgets that balance
+    (fetched again) instead. Only `removed: true` reports are reorgs. Two
+    messages for a block not yet applied are merged. prevBlock only flags a
+    lost message when the block it names never arrived.
+  - Coins without a general balance layout: per (coin, pool) the load runs
+    debug_traceCall(balanceOf(pool), prestateTracer); the one coin slot equal
+    to the balance is that pool's balance slot (2 calls per coin+pool, once;
+    status counters coin_traces / coin_trace_found / coin_trace_not_found).
+    The trace also loads the coin's code and the settings balanceOf reads.
+  - READY now includes what a check needs: pool code + the slots its swap
+    reads (V2: 0,6-10,12; Solidly: 2,10-23 + factory 0,1,2,customFee + clone
+    implementation; V3: 0-4; PancakeV3: 0-5; V4: pools[id] 0-3), coin code.
+  - Loader queues: values checks missed and catch-up fetches go BEFORE bulk
+    first loads (before, fills waited behind minutes of loading).
+  - Cost: ~14 paid calls per V2 pool, ~25 per Solidly, ~10 per V3/V4 (+2 per
+    coin+pool without a known layout). 800 pools ~ 9,000-12,000 calls =
+    6-8 min at ARBSIM_NODE_RPS=25. Sending coin_slots saves the probes.
+- Dry run #5 fixes (loading speed):
+  - 16 general loader threads (ARBSIM_COPY2_LOADERS) + 6 balance-trace
+    threads (ARBSIM_COPY2_TRACE_LOADERS); lanes urgent > bulk, traces apart.
+  - Bulk loads use node budget class "bulk": they only use speed-limit room
+    (never push ARBSIM_NODE_RPS into debt), so urgent fetches never wait
+    behind them. Expected: loading runs at ~ARBSIM_NODE_RPS calls/s.
+  - Exact-block catch-up fetches answer "not there yet" at once (no thread
+    sleeps); asked again after 300 ms, not counted as errors.
+  - Pools that had events most recently load first.
+  - A load answer is digested one pool at a time; new blocks go in between.
+  - status copy2.loader: threads / busy, queued (urgent, bulk, trace),
+    requestsPerSecLastMin, byKind {load, catchup, fill, trace, probe, tip}:
+    jobsLastMin, avgMsLastMin, jobs, avgMs. Shown by deploy/arbsim-status.js.
+  - A pool going unsure on a report logs kind, pool, block, tx, log index and
+    the reason; replay reverts now include the revert reason (e.g. "LS").
+- Dry run #6 stall (fixed): root cause = the node speed limiter (node.rs
+  Budget). Urgent requests (fills of checks' misses, probes) were allowed to
+  run the limit into debt and their waits were cut at 10 s, so a steady
+  stream of them kept it in debt forever; the "bulk" class waited for a
+  positive bucket and never got one -> 16 threads stuck in bulk loads, 0
+  requests, probes ~30 s (3 x 10 s debt waits). Now: exact, fair limiter
+  with two lanes (bulk / everything else): one busy lane gets the full rate,
+  both busy get half each; no 10 s cut; a request facing > 30 s of queue is
+  refused (tried on another node or later). One fill job at a time (100
+  values). Test reproducing it: copy2_intake
+  loading_keeps_flowing_under_the_speed_limit_with_checks_asking_too (before
+  the fix: 0 of 120 pools ready after 40 s; after: all in ~13 s), plus
+  node.rs speed_limit_is_fair_... .
+  Watchdog: "[arbsim] copy2 WATCHDOG: no node answer for N s while M job(s)
+  wait or run ..." with each busy loader thread's job and the speed-limit
+  wait per lane (at most every 30 s). status: copy2.loader.busyThreads,
+  secondsSinceLastAnswer; node.waitMs {main, bulk}.
+- Dry run #7 retry storm (fixed by making copy 2 SELF-PACING):
+  - Cause: copy 2 handed the node client far more than the rate allowed
+    (16+6 threads, 325-call jobs); the limiter's 30 s refusals were counted
+    as "allowance used up" (that was the 21,004 "refused" at 4.4 % used: not
+    the class shares), as node requests and as node errors, retried after
+    2-3 s, and fell back to the public node.
+  - Now: copy 2's loader queue holds its own call budget,
+    ARBSIM_COPY2_RATE_PCT (80) % of ARBSIM_NODE_RPS, at most 0.1 s worth let
+    out at once; a job only leaves the queue when there is room for its
+    calls. Urgent work (fills, catch-up) gets at most ARBSIM_COPY2_URGENT_PCT
+    (25) % while loading waits. Bulk work in flight is capped at ~2 s of
+    budget; load jobs ~2 s of calls each. Calls are counted only when really
+    sent. Bulk/trace/probe work never goes to the public node.
+  - node.rs speed limiter: one FIFO clock, strict spacing at 97 % of
+    ARBSIM_NODE_RPS (no 1-s window over the plan rate); a refusal (> 30 s
+    queue) is "speed limit", counted as throttledToday, NOT as allowance.
+  - Every retry backs off: 1 s doubling to 30 s, +-25 % jitter (loads,
+    traces, probes, catch-up fetches).
+  - Coin places: probe once per coin; if it fails, ONE trace per coin; if
+    that slot fits a standard layout (Solidity/Vyper slot 0-200, OpenZeppelin
+    v5 namespaced ERC20, Solady) the layout is known for every pool of the
+    coin; only coins with no standard layout get one trace per pool.
+  - Soak test (copy2_intake soak_800_pools_...): 800 pools, node with 300 ms
+    answers and a 25/s plan limit answering 429 when exceeded, checks missing
+    values at 2x the limit; time runs 40x fast. Result: 800/800 ready after
+    12.5 simulated minutes, 0 x 429, worst 1-s window 85 % of the limit.
+  - Expected live at ARBSIM_NODE_RPS=25: copy 2 sends <= 20 calls/s; loading
+    gets 15-20/s -> 800 pools (~13 calls each) in ~9-12 min. 5 min is not
+    possible at 25/s: 800 x 13 calls need >= 7 min at the FULL rate.
+- Dry run #8 (simpler loading with eth_getProof):
+  - Every job (load, catch-up, fill) asks ONE eth_getProof per account with
+    all its slots (balance, nonce, code hash + values come back together);
+    eth_getCode once per code hash (cached). V2 pool ~2 requests instead of
+    ~14; coins' balance slots for many pools come in one proof per coin. If
+    the node doesn't know eth_getProof, one request per value as before.
+  - Fills: one job at a time, <= ARBSIM_COPY2_FILL_RPS (10) requests/s,
+    grouped per account; values of pools still loading are refused (the
+    load brings them).
+  - node.rs: a request that would queue more than ARBSIM_NODE_MAX_QUEUE_MS
+    (2000) is refused (not sent, counted as throttled), so no batch lines up
+    20 s of work.
+  - First 5 node errors per job kind are logged ("copy2 node error #n (kind:
+    method/item: message)") and shown in status copy2.loader.firstErrors /
+    errorsByKind (and by deploy/arbsim-status.js).
+  - Soak (40x time): 800/800 ready at 128 simulated s, 2,555 node calls in
+    total incl. fills (947 eth_getProof), 0 x 429, worst second 86 % of the
+    limit. Expected live at ARBSIM_NODE_RPS=100 (copy 2 at 80/s): ~1,700
+    load requests -> roughly 30-60 s for 800 pools.
+- Dry run #9 fixes:
+  - This Nitro node gives eth_getProof only for very recent state
+    ("historical state ... is not available"). Such accounts are read with
+    eth_getStorageAt / eth_getBalance / eth_getTransactionCount / eth_getCode
+    AT THE SAME BLOCK in the same job (exact, no retry loop); eth_getProof is
+    still used whenever the node answers it.
+  - Requests WAIT their turn in the node client (copy 2 paces itself); the
+    queue cap is only a safety valve now (ARBSIM_NODE_MAX_QUEUE_MS 10000).
+    A speed-limit refusal (nothing sent) is retried in ~0.3 s and is not a
+    failure (no growing backoff).
+- Dry run #10 -> SIMPLIFIED (replaces the pacing / lanes / refusals of #6-#9):
+  - Bug: the node client charged one token PER VALUE inside a request (a
+    25-value batch = 0.25 s of a 100/s budget) and re-routed refused proofs
+    to the other paid node and the public node.
+  - node.rs speed limit: one plain token bucket at ARBSIM_NODE_RPS counting
+    HTTP requests (a batch or an eth_getProof = 1); waits, never refuses for
+    speed. Daily allowance also counted in HTTP requests.
+  - Copy 2: ARBSIM_COPY2_INFLIGHT (8) workers = at most 8 requests in
+    flight, one queue: urgent (catch-up, the one fill job, tip) before bulk
+    (loads most-recently-active first, probes, traces). Paid node only, no
+    re-routing. Any error: 1-30 s backoff; first 5 errors per kind logged.
+    Removed: ARBSIM_COPY2_LOADERS / TRACE_LOADERS / RATE_PCT / URGENT_PCT /
+    FILL_RPS, ARBSIM_NODE_MAX_QUEUE_MS.
+  - Status copy2.loader: requestsPerSecLastMin (HTTP), inFlight, threads,
+    queued {urgent, bulk}, byKind answer times, firstErrors.
+  - Soak (plan 100 HTTP req/s, RPS 80, 8 in flight, 300 ms answers, checks
+    missing values at 2x, 40x time): 800/800 ready at 67 simulated s, 133
+    HTTP requests in total, 0 x 429.
+- Dry runs #11b/#12 fixes:
+  - Every "unknown: miss" answer lists its items in `missing`
+    ([{account, slot?}]); status copy2.missesByClass counts them by class.
+  - Caller: in copy-2 mode a check's `from` that the copy doesn't know is
+    run as if the request had the override {from: {balance 0, nonce 0, code
+    empty}} (only if the request doesn't override `from`). Exactly the
+    node's answer for the same call WITH that override; differs only if the
+    called code reads the caller's own ETH balance / code / nonce.
+  - Loads / probes / traces / fills read at the copy's head (or the node's
+    tip if behind) AS OF WHEN THE JOB STARTS, not when queued. A catch-up
+    more than 8 blocks old restarts that pool's load at the newest block.
+- Node timing tools (read only):
+  - `arbsim node-bench [--url-env NAME] [--n 50] [--parallel 16]
+    [--probe-coin 0xCOIN] [--copy2-load pools.json]` (from the app folder;
+    reads .env; never prints the URL). A-F: raw vs node client, sequential
+    vs parallel. G: one real coin probe. H: copy 2's real loading of the
+    pools in pools.json (same JSON as `track`: {"pools":[{address, kind,
+    token0, token1, fee?, tickSpacing?, v4Id?}], "coinSlots"?}) fed with the
+    node's newest block every 250 ms, progress every 5 s.
+  - The first ARBSIM_HTTP_LOG (100) copy-2 HTTP requests are logged:
+    "copy2 http #n: node1 [eth_getProof x5, eth_call x2] 7 calls, 31 keys,
+    answer 220 KB, 140 ms total (60 ms reading the answer), 0 error item(s)".
+  - eth_getProof only for accounts with <= 12 values; accounts with more
+    (coins holding many pools' balances) use plain eth_getStorageAt batches.
+- Status: `status` -> `copy2` {pools, loading, ready, unsure, lastBlock,
+  unsureReasons, counters}; with {"pools": true} also `list` of {address,
+  v4Id, kind, state, reason, events}. Checks touching a pool that isn't
+  ready answer unknown "unsure_pool".
+- Dry run #16 fixes (inbot-sim/copy2-f):
+  - Request storm (from minute ~22: ~95 requests/s = our own cap while
+    Chainstack answered -32005 "You've exceeded the RPS limit"; ready
+    776 -> 650, loading 12 -> 139). Ready pools turn "loading" only when a
+    replay needs a value the copy doesn't hold (start_partial_in_block, also
+    Algebra end of block). The escalation: the catch-up fetch was refused,
+    retried after 1-2 s, by then > 8 blocks old -> the pool's WHOLE load was
+    restarted (every slot it ever held asked again), refused again, ... Fix:
+    a "too fast" refusal only waits and asks again (1, 2, 4 s), never
+    restarts the load; the old-block restart rule is 64 blocks
+    (ARBSIM_COPY2_CATCHUP_MAX_BLOCKS) and is suspended while refused. Any
+    refusal pauses new first loads and fills for 1-4 s.
+  - node.rs adaptive speed limit: a provider refusal (-32005, HTTP 429,
+    "rate limit") halves the allowed rate at once (at most once per second,
+    floor ARBSIM_NODE_MIN_RPS 2) and drops saved-up burst; after 2 s without
+    a refusal it grows back by 5 % of ARBSIM_NODE_RPS per second. Status:
+    node usage rpsNow / providerRefusals / rateCuts; copy2.nodeRate; copy2
+    counters node_refusals, need_refusal_retries.
+  - eth_blockNumber: loads / fills / probes use the last known node tip
+    (refreshed at most every ARBSIM_COPY2_TIP_MS 2000); exact catch-ups at
+    most every ARBSIM_COPY2_TIP_EXACT_MS 500; a failed refresh never fails a
+    job when a tip is known, and pauses refreshes 5 s.
+  - Fills: values asked again after "pool traded after the read" wait 1 s
+    (no tight loop); a slot of one ordinary pool ready since the read is
+    used even if the pool traded since (its events' changes are carried).
+  - Coin balance drift (41 of 627 probes, persistent offsets), two causes,
+    each reproduced by a test first:
+    1. The checker subscribes to Transfers FROM our pools and TO our pools
+       separately, so a transfer between two followed pools came twice in
+       one block message and was applied twice (copy2_intake
+       the_same_report_twice_in_one_message_is_applied_once). Now repeated
+       reports in a message are dropped (counter duplicate_logs).
+    2. A late coin Transfer for a pool whose load was WAITING for node values
+       past that place was lost: the buffer got it, but the load had already
+       carried beyond it and the copy didn't hold the balance yet, so the
+       pool became ready off by exactly that transfer (copy2_coins_anvil
+       late_coin_transfer_while_a_load_waits_for_values_is_not_lost, real V3
+       pool on anvil). Now added to the waiting load (counter
+       late_transfers_to_loading).
+    Safety net: a reload whose own coin balance disagrees with the one the
+    copy followed makes that balance MISSING in every kept version and logs
+    "copy2: coin ... the copy followed X but its reload says Y" (counter
+    coin_balance_disagree).
+  - Replay: "owner() on <factory> did not answer" now says how (reverted +
+    reason / halted + why / answered N bytes + what the copy holds there).
+
+- Dry run #17 fixes (inbot-sim/copy2-g): coverage (1/3 -> nearly all checks
+  answered by the copy) and three accuracy holes.
+  - Misses, proved (tests/copy2_coverage_anvil.rs big_checks_*, walks off =
+    the #17 code): a ready pool held only V3 slots 0-4 / Pancake 0-5 / V4
+    pools[id] 0-3 / Algebra nothing + what its replays had asked for. The
+    2-pool round trip at 100 USD answered; 1k..150k USD missed on the
+    pools' own tick-map words, ticks and price history ("ready pool slot":
+    24..182 per run), exactly #17's class.
+  - Tick walk (copy2/walk.rs + TickLens.sol): ONE debug_traceCall per pool
+    with the prestateTracer of a lens contract (state override, never
+    deployed) that asks the pool through ITS OWN getters for every
+    tick-map word in +-ARBSIM_COPY2_WALK_TICKS (32768 ticks, at least 8
+    words each side), every initialized tick in it (Algebra: the whole tick
+    list + tick tree), the price history (up to 1024 entries) and settings,
+    and runs two probe swaps (~2 % price move) cancelled in the callback.
+    Only the pool's own storage is learned (V4: only this pool's entries in
+    the PoolManager, computed from the id; owned plugin storage); taken in
+    like fills (pool ready since <= k, same load), last_pos moved to k.
+    Re-walked when the price moves half the window away. After walks: 12/12
+    sizes answered and exact (success, output, gas) for V3 (spacing 1),
+    PancakeV3, Algebra (+plugin), V4. A swap that uses up ALL liquidity
+    walks to the price limit (beyond the window): may miss, never wrong.
+    Settings: ARBSIM_COPY2_WALKS (2 at once, 0 = off), _WALK_TICKS,
+    _WALK_MIN_WORDS, _WALK_MAX_TICKS (3000), _WALK_MAX_OBS, _WALK_PROBE_BPS,
+    _WALK_GAS (40M), _WALK_MAX_SLOTS (150000 total, memory guard).
+    Cost per pool (anvil, 18 positions): V3 spacing 1 446 slots / 121 KB
+    answer / 1.7M gas; Pancake 161 / 84 KB; Algebra 204 / 121 KB; V4 133 /
+    75 KB. Memory ~315 B per slot in the copy (imbl) + 52 B bookkeeping.
+  - Accuracy 1, PancakeSwap farm (#17: 8 of 9 "LS" checks on Pancake
+    0x18AB..2486; #16 log "replay did not reproduce: exactIn reverted
+    (LS)"). Cause: the pool calls its farm (lmPool) on every swap /
+    crossed tick; the farm's numbers also change by MasterChef stakes that
+    emit NO pool event, so the copy's farm went stale and its swap failed
+    with the farm's "LS" (reproduced: pancake_farm_* with the fix switched
+    off gives exactly that log). Fix (replay.rs outside_ok): in V3 / Pancake
+    swap / mint / burn / collect / flash replays every other contract the
+    pool calls is a STOP stand-in (exact for the pool's storage: the real
+    call didn't fail, and a call returning nothing can't change what the
+    pool computes); that contract becomes VOLATILE: checks through a
+    farmed Pancake pool answer unknown (never wrong). Status
+    outsideContracts; missesByClass "outside contract (never kept)".
+  - Accuracy 2, late reports (#17: 4 probes with wrong slot0 / coin
+    balances). Cause: the checker (and the bot) send a block when its
+    header + a grace time passed; reports come on ~18 separate
+    subscriptions, so some arrive after the block went out. The copy's
+    version of that block lacked them and ANSWERED (reproduced in
+    late_coin_transfers_*: with the new gate switched off the probe answers
+    ok with the old balances; slot0 right, balances wrong = 0x0c0c's
+    pattern). Fix: "pending" pools (header logsBloom positive without such a
+    report; swap / mint / collect without its coin Transfers; coin
+    Transfers of a V3-style pool without its event): answers touching them
+    at that block or later = unknown "pending_reports"; after
+    ARBSIM_COPY2_PENDING_MS (1500) one eth_getLogs batch (pool addresses,
+    Transfers from / to them, V4 ids) settles the blocks, missing reports
+    are applied as late reports. Messages may now carry `logsBloom` (the
+    checker sends the header's; the bot's feed has no header bloom: only
+    the transfer / event rules apply there until it sends one).
+  - Coin slots: the check's executor (code override) gets its coin balance
+    slots fetched ahead for every coin with a known layout
+    (warm_check_accounts). Status missesTop names the 20 accounts behind the
+    misses. Coins WITHOUT a general layout forget every non-pool slot on
+    each wallet transfer (unchanged, strict): suspected source of repeated
+    "coin slot" misses + fill_retry; missesTop will show it.
+  - Status: checks {total, answered, answeredPct}, poolCoverage
+    {readyTickPools, fullTickData, partialTickData, walking, waiting,
+    readyV2Like, fullPct, walkSlots}, pendingPools, outsideContracts,
+    missesTop; counters walks*, pending_*; per pool tickData, pendingFrom.
+
+- Bot feed = checker feed (inbot-sim/copy2-h, bot side only, no arbsim
+  change): the live bot's copy-2 messages now carry the header logsBloom
+  like the dry run's.
+  - Block assembly moved UNCHANGED from scripts/sim-compare/copy2Lib.ts to
+    src/execution/copy2Blocks.ts (copy2Lib re-exports it); the bot's
+    Copy2Forwarder uses it: header + 30 ms (COPY2_GRACE_MS) or a block 2
+    later; headerless 400 / 1500 ms then header read from the HTTP node
+    (eth_getBlockByNumber, counted "copy 2 headers / fill-ins"); block_tick
+    with bloom for EVERY block without our reports; late report = its own
+    message, the block's time, no bloom. Removed reports go in the block
+    message (as the checker). Coin Transfers only of the pool's own coins
+    (classifyLog rule). Same report from from- and to- subscriptions is
+    passed on once (arbsim also dedupes). Test parityTests: same inputs
+    through both give the same messages.
+  - Header source: newHeads on the bot's existing WebSocket, subscribed only
+    while the copy-2 tap is on; tap live only when it is confirmed; refused
+    = copy 2 off on that reader (like the transfer filters).
+  - No header anywhere (WebSocket + node) or no readable bloom: the block is
+    NOT sent and the copy reloads (arbsim marks pending from a bloom only, so
+    a bloom-less block could miss a late report).
+  - prevBlock fix: arbsim reloads on prevBlock >= its first block and not
+    received; the bot's old "prevBlock 0 = reload" never triggered (0 is
+    below the first block). Now prevBlock = block - 1 normally (every block
+    goes out, a missing one is noticed) and = the block itself after a gap
+    on the bot's side (dropped message, skipped block, outage not filled,
+    fresh start) so the copy really reloads.
+  - Cost: newHeads = 1 pushed message per block (~9/s at 0.11 s blocks, about
+    780k a day): more than BLOCK_READER_WSS_DAILY's default 400k alone.
+    COPY2_WSS_MAX_PCT (80): copy 2's subscriptions stop for the rest of the
+    UTC day at 80 % of the cap (price feed keeps going, the node decides
+    checks). Running copy 2 all day needs the cap (and plan) raised to
+    ~1.2M. Outage fill-ins also read each missed header (<= 200).
+  - Follow-up (same branch): newHeads is billed per push by Chainstack;
+    the dry run measured ~9.8 blocks/s = ~845k RU/day = ~25M/month, more
+    than the Growth plan (20M, extra usage off). So COPY2_HEADERS=off is
+    the bot's default: no newHeads, no per-block header reads, no
+    logsBloom. Headerless assembly (copy2Blocks.ts {headers:false}, also
+    the checker's --no-headers): a block goes once a later block reports
+    or COPY2_GRACE_MS (30) after its first report; time / parent-chain
+    block from the sequencer feed (or logs' blockTimestamp), unknown after
+    COPY2_TS_WAIT_MS (40) more = not sent, copy reloads; block_tick for the
+    newest known block after COPY2_TICK_MS (250) with nothing held; late
+    reports as before. prevBlock headerless = the previous block passed on
+    (not every block goes out), the block itself after a gap. With
+    COPY2_HEADERS=on everything above (bloom) is unchanged. The checker's
+    --no-headers still takes block TIMES from its own newHeads (the bot
+    uses its feed; same values) but ignores them for completeness and
+    never sends a bloom.
+
+- Dry run #18 memory (inbot-sim/copy2-i): 2 min after start 430 pools
+  walked (151,642 values, the old cap 150k) and the process at 331 MB RSS,
+  over pm2's 150 MB restart line. Measured with tests/copy2_memory.rs (real
+  intake: track -> load -> tick walk -> blocks, history 64, a counting
+  allocator for the heap + process RSS; fake node with N V3 pools x 375
+  walk values, 40 V2 pools trading every block, 60 coins).
+  - Cause (most of it): state/fill.rs reconcile learned the walked values
+    into EVERY kept version from the walk's block k to now SEPARATELY, so
+    each of those versions got its own copy of the pool's storage tree
+    (~400 values) plus the account-map path; a walk is answered several
+    versions after k (node tip cached up to 2 s, the answer's own time,
+    queueing behind loads), and those copies lived until the versions aged
+    out. Before the fix, 150k values, 16 walks at once, 150 ms answers:
+    heap peak 157 MB (steady 60), RSS 177 MB and staying there (glibc keeps
+    freed memory); 300k values: heap peak 204 MB, RSS 230 MB. Fix: a
+    version whose account didn't change in its block takes the previous
+    rebuilt version's account as is (one shared tree), a tick version (the
+    very same snapshot) the previous rebuilt snapshot whole. Proven equal
+    to the old per-version learning on 400 random version chains (ticks,
+    changes, forgets outside the diff, one-version fills, restarts, basics
+    with code): fill.rs shared_reconcile_equals_learning_into_every_version;
+    walked_values_are_stored_once_across_unchanged_versions checks sharing.
+    After: 150k values peak 62 MB, RSS 80 MB; 300k values (800 pools x
+    375) peak 116 MB heap (44 MB of it the fake node), steady heap 124 MB of
+    which copy 2 = 80 MB (~280 bytes per walked value, everything
+    included), RSS 142-145 MB, flat over 1000 blocks after the buffers fill.
+  - Not causes (measured): Snapshot clone in needs() (persistent maps: a
+    pointer copy), per-version storage when pools change every block
+    (~145-170 KB per kept version = ~10 MB for 64), code cache (one entry
+    per factory), walk JSON (dropped after reading).
+  - Other bounds: the report buffer is bounded in reports too
+    (ARBSIM_COPY2_MAX_KEEP_LOGS 150000, ~190 bytes each) beyond the
+    always-kept ARBSIM_COPY2_KEEP_BLOCKS, so a stuck load can't hold 40000
+    blocks of reports; copy 2's eviction caps (ARBSIM_MAX_ACCOUNTS /
+    _SLOTS) count only accounts it may drop (fully walked pools alone hold
+    ~300k slots > 250k, which made every 60 s eviction drop ALL other
+    accounts); `walked` lists have no spare capacity.
+  - Defaults: ARBSIM_COPY2_WALK_MAX_SLOTS 600000 (~2x all pools), new walks
+    pause while RSS >= ARBSIM_COPY2_WALK_MAX_RSS_MB 300 (status
+    poolCoverage.walkPaused says why); pm2 restart line 400 MB (re-created
+    once if the app still has the old lower limit); the runner sets
+    MALLOC_ARENA_MAX=2 (fewer glibc arenas for ~20 threads: less retained
+    memory; small effect in the bench, which has few busy threads).
+  - Bench: `COPY2_MEM_POOLS=800 COPY2_MEM_KEEP=2400 COPY2_MEM_BLOCKS=1000
+    COPY2_MEM_WALKS=16 COPY2_MEM_TRACE_MS=150 cargo test --release --test
+    copy2_memory -- --nocapture --test-threads=1` (default size 200 pools
+    runs in the normal suite and asserts no walk bulge, flat heap and
+    <= 400 bytes per walked value).

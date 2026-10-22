@@ -1,0 +1,8 @@
+{
+  // Builds only the comparison harness (scripts/sim-compare) and the bot code
+  // it imports, so a broken diagnostic script elsewhere can never stop it.
+  // Same output folder as the other script builds (.scripts-build).
+  "extends": "../../tsconfig.json",
+  "include": ["./*.ts", "./test/*.ts"],
+  "compilerOptions": { "rootDir": "../..", "outDir": "../../.scripts-build", "sourceMap": false, "declaration": false, "declarationMap": false }
+}
