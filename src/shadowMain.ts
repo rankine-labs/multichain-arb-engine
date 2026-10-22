@@ -3686,7 +3686,11 @@ await chainManager.startAll();
             // through the WebSocket's tap, and fills in outages on the same HTTP node.
             copy2PoolKeys = () => { const t = targets(); return [...t.addrs, ...t.ids]; };
             const copy2Link = localSim?.copy2 ?? null;
-            copy2Link?.setBackfillRpc(readerRpc);
+            // Each copy-2 node read (block headers the WebSocket didn't give,
+            // outage fill-ins) is counted under its own name in the node usage lines.
+            const copy2RpcLabel = `${endpointLabel(READER_URL)} (copy 2 headers / fill-ins)`;
+            if (copy2Link) nodeUsageCounter.track(copy2RpcLabel);
+            copy2Link?.setBackfillRpc(async (method, params) => { nodeUsageCounter.countRequest(copy2RpcLabel); return readerRpc(method, params); });
             if (copy2Link && !process.env.BLOCK_READER_WSS) console.log('[copy2] needs the WebSocket block reader (BLOCK_READER_WSS): without it the node decides every check');
             if (process.env.BLOCK_READER_WSS) {
                   wsReader = new WsBlockReader({

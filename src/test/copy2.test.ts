@@ -10,6 +10,7 @@ import { WsBlockReader, SocketLike } from '../core/blockReaderWs';
 import { SYNC_TOPIC, V4_SWAP_TOPIC, RpcLog } from '../core/blockReader';
 import { NodeUsageCounter } from '../core/nodeUsage';
 import { LocalSimHost, createLocalSimHost } from '../execution/localSimHost';
+import { BlockAssembler, blockMessage, headFromNewHeads } from '../execution/copy2Blocks';
 import type { PoolState } from '../core/types';
 
 // COPY 2, bot side (execution/copy2.ts + the WebSocket tap + the host):
@@ -133,26 +134,35 @@ type Log = RpcLog & { blockTimestamp?: string };
 const L = (address: string, topics: string[], block: number, txi: number, li: number, tx = '0x' + 'aa'.repeat(31) + (txi + 16).toString(16).padStart(2, '0'), extra: Partial<Log> = {}): Log =>
   ({ address, topics, data: '0x', blockNumber: q(block), transactionIndex: q(txi), logIndex: q(li), transactionHash: tx, ...extra });
 
-function makeForwarder(index: Copy2Index, times: FeedBlockTimes, rpc: ((m: string, p: unknown[]) => Promise<any>) | null = null) {
+// A block header as newHeads pushes it (and eth_getBlockByNumber answers).
+const BLOOM = '0x' + '0'.repeat(510) + '01';
+const BLOOM2 = '0x' + '0'.repeat(510) + '02';
+const H = (b: number, extra: Record<string, unknown> = {}) => ({ number: q(b), parentHash: '0x' + '11'.repeat(32), timestamp: q(1_760_000_000 + b), l1BlockNumber: q(23_000_000), logsBloom: BLOOM, ...extra });
+// Let pending promises (node reads) run, with the fake clock moving.
+async function settle(ms = 0, rounds = 6) { for (let i = 0; i < rounds; i++) { await tick(); advance(ms); } }
+
+function makeForwarder(index: Copy2Index, rpc: ((m: string, p: unknown[]) => Promise<any>) | null = null, times?: FeedBlockTimes) {
   const sent: any[] = [];
   let ok = true;
   const f = new Copy2Forwarder({
     send: (m) => { if (!ok) return false; sent.push(JSON.parse(JSON.stringify(m))); return true; },
-    index: () => index, blockTime: (b) => times.get(b), backfillRpc: () => rpc,
-    holdMs: 4, tsWaitMs: 40, now: () => clock, schedule,
+    index: () => index, backfillRpc: () => rpc, now: () => clock, schedule,
+    ...(times ? { blockTime: (b: number) => times.get(b) } : {}),
   });
   return { f, sent, setOk: (v: boolean) => { ok = v; } };
 }
 
 async function forwarderTests() {
   const ID = '0x' + 'cd'.repeat(32), ID2 = '0x' + 'ee'.repeat(32);
-  const index: Copy2Index = { pools: new Set([P1, P2]), ids: new Set([ID]), poolManager: PM, coins: new Set([WETH, USDG]) };
-  const times = new FeedBlockTimes(0);
-  for (const b of [10, 11, 12, 15, 16, 17, 18, 19]) times.set(b, 1_760_000_000 + b, 23_000_000);
-  const { f, sent, setOk } = makeForwarder(index, times);
+  // P1 holds WETH/USDG, P2 holds MEME/WETH (each pool's own coins).
+  const index: Copy2Index = { pools: new Set([P1, P2]), ids: new Set([ID]), poolManager: PM, coins: new Set([WETH, USDG, MEME]), poolCoins: new Map([[P1, [WETH, USDG]], [P2, [MEME, WETH]]]) };
+  const headerAnswers = new Map<number, any>();
+  const rpcCalls: string[] = [];
+  const rpc = async (m: string, p: unknown[]) => { rpcCalls.push(m); return m === 'eth_getBlockByNumber' ? (headerAnswers.get(Number(BigInt((p as any[])[0]))) ?? null) : null; };
+  const { f, sent, setOk } = makeForwarder(index, rpc);
 
-  f.onLogs([L(P1, [SYNC_TOPIC], 10, 0, 0)]);
-  advance(10);
+  f.onLogs([L(P1, [SYNC_TOPIC], 10, 0, 0)]); f.onHead(H(10));
+  advance(100);
   assert(sent.length === 0, 'not following yet (no track accepted): nothing passed on');
 
   f.onLive(); f.setActive(true);
@@ -161,153 +171,230 @@ async function forwarderTests() {
     L(P1, [SYNC_TOPIC], 10, 1, 5),
     L(P2, ['0x' + '11'.repeat(32)], 10, 0, 1),                    // any event of a tracked pool
     L(P3, [SYNC_TOPIC], 10, 0, 2),                                  // untracked pool
-    L(WETH, [TRANSFER_TOPIC, pad(STRANGER), pad(P1)], 10, 1, 4),    // coin into a tracked pool
+    L(WETH, [TRANSFER_TOPIC, pad(STRANGER), pad(P1)], 10, 1, 4),    // P1's coin into P1
     L(USDG, [TRANSFER_TOPIC, pad(STRANGER), pad(P3)], 10, 0, 3),    // coin into an untracked pool
-    L(MEME, [TRANSFER_TOPIC, pad(P1), pad(STRANGER)], 10, 1, 6),    // a coin we don't list
+    L(USDG, [TRANSFER_TOPIC, pad(P2), pad(STRANGER)], 10, 1, 10),   // a listed coin, but not one of P2's coins
+    L(STRANGER, [TRANSFER_TOPIC, pad(P1), pad(STRANGER)], 10, 1, 6),// a coin we don't list
+    L(P1, [TRANSFER_TOPIC, pad(STRANGER), pad(P2)], 10, 1, 11),     // P1's own LP token moving (pool report)
     L(PM, [V4_SWAP_TOPIC, ID], 10, 2, 7),                           // our V4 pool
     L(PM, ['0x' + '22'.repeat(32), ID], 10, 2, 8),                  // our V4 pool, other event (e.g. ModifyLiquidity)
     L(PM, [V4_SWAP_TOPIC, ID2], 10, 2, 9),                          // someone else's V4 pool
   ]);
   f.onLogs([L(P1, [SYNC_TOPIC], 10, 1, 5)]);                        // same log again (second subscription)
-  advance(3);
-  assert(sent.length === 0, 'newest block is held while its reports may still be coming');
-  advance(2);
-  assert(sent.length === 1 && sent[0].type === 'pool_logs' && sent[0].block === 10, 'block passed on after a short quiet time');
-  const m0 = sent[0];
-  assert(m0.gap === true && m0.prevBlock === 0, 'first message says gap with prevBlock 0 (the copy reloads anything it had)');
-  assert(m0.timestamp === 1_760_000_010 && m0.l1Block === 23_000_000, 'block time and L1 block from the feed');
-  const idxs = m0.logs.map((l: any) => Number(l.logIndex));
-  assert(JSON.stringify(idxs) === JSON.stringify([1, 4, 5, 7, 8]), `only our pools' logs, once each, in transaction then log order (got ${idxs})`);
-
-  // Block 11 and 12: 11 goes as soon as 12 starts.
-  f.onLogs([L(P1, [SYNC_TOPIC], 11, 0, 0, '0x' + 'b1'.repeat(32))]);
-  f.onLogs([L(P2, [SYNC_TOPIC], 12, 0, 0)]);
-  advance(0);
-  assert(sent.length === 2 && sent[1].block === 11 && sent[1].prevBlock === 10 && !sent[1].gap, 'a newer block started: the older one is passed on at once, chained by prevBlock');
-  advance(4);
-  assert(sent.length === 3 && sent[2].block === 12, 'block 12 after its quiet time');
-
-  // Block 13 without a known time: waits up to tsWaitMs, then is NOT sent (never a guessed time).
-  f.onLogs([L(P2, [SYNC_TOPIC], 13, 0, 0)]);
+  advance(200);
+  assert(sent.length === 0, 'reports without their header wait (the header brings time + bloom)');
+  f.onHead(H(10));
+  advance(20);
+  assert(sent.length === 0, 'header arrived: block waits the grace time (30 ms) for stragglers');
   advance(10);
-  assert(sent.length === 3, 'block without a known time waits for the feed');
-  advance(40);
-  assert(sent.length === 3 && f.counts.noTimestamp === 1 && !f.live(), 'after tsWaitMs: block skipped (time never guessed), counted, routing stops');
-  // Time from the log itself (blockTimestamp) is used when the feed has none.
-  f.onLogs([L(P2, [SYNC_TOPIC], 14, 0, 0, undefined, { blockTimestamp: q(1_760_000_014) })]);
-  advance(5);
-  assert(sent[3].block === 14 && sent[3].timestamp === 1_760_000_014, 'block time from the log (blockTimestamp) when present');
-  assert(sent[3].prevBlock === 0 && sent[3].gap === true && f.live(), 'after a skipped block the copy is told to reload (prevBlock 0); flowing again');
+  assert(sent.length === 1 && sent[0].type === 'pool_logs' && sent[0].block === 10, 'block passed on 30 ms after its header (the checker\'s rule)');
+  const m0 = sent[0];
+  assert(m0.logsBloom === BLOOM && m0.timestamp === 1_760_000_010 && m0.l1Block === 23_000_000, 'block message carries the header\'s logsBloom, time and parent-chain block');
+  assert(m0.gap === true && m0.prevBlock === 10, 'first message: gap, prevBlock = its own block (an arbsim that already follows reloads; a fresh one has nothing to compare)');
+  const idxs = m0.logs.map((l: any) => Number(l.logIndex));
+  assert(JSON.stringify(idxs) === JSON.stringify([1, 4, 5, 11, 7, 8]), `only our pools' logs (transfers only of the pool's OWN coins), once each, in transaction then log order (got ${idxs})`);
+  assert(f.counts.dupLogs === 1, 'the repeated report was counted and passed on once');
+
+  // A block with nothing for our pools: block_tick with its bloom.
+  f.onHead(H(11, { logsBloom: BLOOM2 }));
+  advance(30);
+  assert(sent.length === 2 && sent[1].type === 'block_tick' && sent[1].block === 11 && sent[1].logsBloom === BLOOM2 && sent[1].prevBlock === 10 && !sent[1].gap, 'quiet block: block_tick with bloom, chained by prevBlock = block - 1');
+
+  // Two blocks later arrived: block 12 goes at once, without waiting the grace time.
+  f.onLogs([L(P2, [SYNC_TOPIC], 12, 0, 0, '0x' + 'b1'.repeat(32))]); f.onHead(H(12));
+  advance(10);
+  f.onHead(H(13)); f.onHead(H(14));
+  advance(10);
+  assert(sent.length === 3 && sent[2].block === 12, 'a header 2 blocks later arrived: block 12 passed on before its grace time');
+  advance(30);
+  assert(sent.length === 5 && sent[3].block === 13 && sent[4].block === 14 && sent[4].prevBlock === 13, 'blocks 13, 14 follow in order');
+
+  // Header never came over the WebSocket: read from the node (counted).
+  headerAnswers.set(15, H(15, { logsBloom: BLOOM2 }));
+  f.onLogs([L(P1, [SYNC_TOPIC], 15, 0, 0)]);
+  advance(300);
+  f.onHead(H(16));
+  assert(sent.length === 5, 'headerless block waits (HEADERLESS_WAIT_MS)');
+  await settle(10, 15);
+  const m15 = sent.find((m) => m.block === 15);
+  assert(!!m15 && m15.logsBloom === BLOOM2 && m15.timestamp === 1_760_000_015 && f.counts.headersFetched === 1 && rpcCalls.includes('eth_getBlockByNumber'), 'missing header (header 16 came after 14) read from the node: block sent with ITS bloom and time');
+  assert(sent.findIndex((m) => m.block === 15) < sent.findIndex((m) => m.block === 16), 'still in block order');
+
+  // Header unknown even to the node: block NOT sent, the copy reloads.
+  f.onLogs([L(P1, [SYNC_TOPIC], 17, 0, 0)]);
+  advance(1_600);
+  await settle(200, 10);
+  assert(!sent.some((m) => m.block === 17) && f.counts.noTimestamp === 1 && f.counts.headerFails === 1 && !f.live(), 'no header anywhere: block skipped (never a guessed time / missing bloom), counted, routing stops');
+  f.onHead(H(18)); advance(40);
+  const m18 = sent[sent.length - 1];
+  assert(m18.block === 18 && m18.prevBlock === 18 && m18.gap === true && f.live(), 'next message: prevBlock = its own block (the copy reloads); flowing again');
 
   // A dropped message: the next one makes the copy reload.
   setOk(false);
-  f.onLogs([L(P1, [SYNC_TOPIC], 15, 0, 0)]); advance(50);
+  f.onHead(H(19)); advance(40);
   assert(f.counts.msgsDropped === 1 && !f.live(), 'socket busy: message dropped and counted, routing stops');
   setOk(true);
-  f.onLogs([L(P1, [SYNC_TOPIC], 16, 0, 0)]); advance(50);
-  const m16 = sent[sent.length - 1];
-  assert(m16.block === 16 && m16.gap === true && m16.prevBlock === 0, 'after a drop the next message has prevBlock 0 (copy reloads)');
-  assert(f.live(), 'reload message delivered: flowing again');
+  f.onHead(H(20)); advance(40);
+  const m20 = sent[sent.length - 1];
+  assert(m20.block === 20 && m20.gap === true && m20.prevBlock === 20, 'after a drop the next message says prevBlock = itself (copy reloads)');
 
-  // Late and taken-back reports.
-  f.onLogs([L(P1, [SYNC_TOPIC], 12, 3, 9)]); advance(0);
+  // Late reports: their own message, the block's own time, no bloom.
+  f.onLogs([L(P2, [SYNC_TOPIC], 12, 3, 9)]); advance(0);
   const late = sent[sent.length - 1];
-  assert(late.late === true && late.block === 12 && late.timestamp === 1_760_000_012, 'a report for an already-passed block is sent flagged late, with that block\'s time');
-  f.onLogs([L(P1, [SYNC_TOPIC], 16, 0, 0, undefined, { removed: true })]); advance(0);
-  assert(sent[sent.length - 1].reorg === true && sent[sent.length - 1].block === 16 && sent[sent.length - 1].logs[0].removed === true, 'a report the node took back is sent flagged reorg');
+  assert(late.late === true && late.block === 12 && late.timestamp === 1_760_000_012 && late.logsBloom === undefined && late.prevBlock === undefined, 'late report: sent at once for its block, with that block\'s time, no bloom (as the checker)');
+  const n = sent.length;
+  f.onLogs([L(P2, [SYNC_TOPIC], 12, 0, 0, '0x' + 'b1'.repeat(32))]); advance(0);
+  assert(sent.length === n && f.counts.lateDup === 1, 'a report already passed on (second subscription, after its block went) is not sent again');
+  // Taken back before its block went out: goes in that block, marked removed.
+  f.onLogs([L(P2, [SYNC_TOPIC], 21, 0, 0)]);
+  f.onLogs([L(P2, [SYNC_TOPIC], 21, 0, 0, undefined, { removed: true })]);
+  f.onHead(H(21)); advance(40);
+  const m21 = sent[sent.length - 1];
+  assert(m21.block === 21 && m21.logs.length === 2 && m21.logs.some((l: any) => l.removed === true), 'report taken back: passed on with removed=true (arbsim makes the pool unsure)');
+
+  // Headers skipped while the WebSocket stayed up: read from the node, sent in order.
+  headerAnswers.set(22, H(22)); headerAnswers.set(23, H(23));
+  f.onHead(H(24));
+  await settle(10, 10);
+  const tail = sent.slice(-3).map((m) => m.block);
+  assert(JSON.stringify(tail) === JSON.stringify([22, 23, 24]) && sent.slice(-3).every((m) => m.logsBloom) && f.counts.headerGaps === 2, `skipped headers read from the node, blocks sent in order with blooms (got ${tail})`);
 
   // Waiting for a transaction's reports.
-  assert(f.txBlockOf('0x' + 'b1'.repeat(32)) === 11, 'transaction -> block remembered');
+  assert(f.txBlockOf('0x' + 'b1'.repeat(32)) === 12, 'transaction -> block remembered');
   const seen = await f.waitForTx('0x' + 'b1'.repeat(32), 100);
-  assert(seen === 11, 'waitForTx: already seen -> its block at once');
+  assert(seen === 12, 'waitForTx: already seen -> its block at once');
   const later = f.waitForTx('0x' + 'c3'.repeat(32), 100);
-  f.onLogs([L(P2, [SYNC_TOPIC], 17, 0, 0, '0x' + 'c3'.repeat(32))]);
-  assert((await later) === 17, 'waitForTx: resolves when the reports arrive');
+  f.onLogs([L(P2, [SYNC_TOPIC], 25, 0, 0, '0x' + 'c3'.repeat(32))]);
+  assert((await later) === 25, 'waitForTx: resolves when the reports arrive');
   const never = f.waitForTx('0x' + 'd4'.repeat(32), 100);
   advance(101);
   assert((await never) === null, 'waitForTx: null after the time limit');
-  advance(10);
-  // A block taken back before it was passed on: dropped, the copy told about the last passed block.
-  const before = sent.length;
-  f.onLogs([L(P2, [SYNC_TOPIC], 19, 0, 0)]);
-  f.onLogs([L(P2, [SYNC_TOPIC], 19, 0, 0, undefined, { removed: true })]);
-  advance(10);
-  const after = sent.slice(before);
-  assert(after.length === 1 && after[0].reorg === true && after[0].block === 17 && !after.some((m) => m.block === 19 && !m.reorg), 'taken back before passing on: block 19 never sent as new; reorg note for the last passed block');
+  f.setActive(false);
+  advance(100);
 }
 
-async function tickTests() {
+// The feed's parent-chain block fills in a header without one.
+async function feedL1Tests() {
   const index: Copy2Index = { pools: new Set([P1]), ids: new Set<string>(), poolManager: PM, coins: new Set([WETH]) };
   const times = new FeedBlockTimes(0, 1024, () => clock);
-  const sent: any[] = [];
-  const f = new Copy2Forwarder({
-    send: (m) => { sent.push(JSON.parse(JSON.stringify(m))); return true; },
-    index: () => index, blockTime: (b) => times.get(b), holdMs: 4, tsWaitMs: 40, tickDelayMs: 250,
-    feedNewest: () => times.newestNote(), now: () => clock, schedule,
-  });
-  f.onLive(); f.setActive(true);
   times.set(30, 1_760_000_030, 7);
-  advance(100);
-  assert(sent.length === 0, 'block_tick waits until the feed\'s block is COPY2_TICK_MS old');
-  advance(200);
-  assert(sent.length === 1 && sent[0].type === 'block_tick' && sent[0].block === 30 && sent[0].timestamp === 1_760_000_030 && sent[0].l1Block === 7 && sent[0].prevBlock === 0, 'block_tick for a quiet block (first message: prevBlock 0)');
-  advance(300);
-  assert(sent.length === 1, 'no second tick for the same block');
-  times.set(31, 1_760_000_031, 7);
-  f.onLogs([L(P1, [SYNC_TOPIC], 31, 0, 0)]);
-  advance(5);
-  assert(sent.length === 2 && sent[1].type === 'pool_logs' && sent[1].prevBlock === 30, 'next pool_logs chains on the tick');
-  advance(400);
-  assert(sent.length === 2, 'a block that had reports gets no tick');
-  assert(f.newestBlock() === 31, 'newest block for routing');
+  const { f, sent } = makeForwarder(index, null, times);
+  f.onLive(); f.setActive(true);
+  f.onHead(H(30, { l1BlockNumber: undefined }));
+  advance(40);
+  assert(sent.length === 1 && sent[0].type === 'block_tick' && sent[0].l1Block === 7 && sent[0].timestamp === 1_760_000_030, 'header without parent-chain block: taken from the sequencer feed');
   f.setActive(false);
-  advance(1000);
+  advance(100);
+}
+
+// Same reports and headers through the dry-run checker's assembly
+// (copy2Blocks.ts, as copy2-dryrun.ts uses it) and through the bot's
+// forwarder: the messages arbsim gets must be the same (the bot only adds
+// prevBlock / gap, and sends a repeated report once; arbsim drops repeats).
+async function parityTests() {
+  const index: Copy2Index = { pools: new Set([P1, P2]), ids: new Set<string>(), poolManager: PM, coins: new Set([WETH, USDG, MEME]), poolCoins: new Map([[P1, [WETH, USDG]], [P2, [MEME, WETH]]]) };
+  const { f, sent } = makeForwarder(index);
+  const asm = new BlockAssembler(30, 1500);
+  const ref: any[] = [];
+  const xfer = L(WETH, [TRANSFER_TOPIC, pad(P1), pad(P2)], 50, 0, 1);   // between two followed pools
+  const events: Array<{ t: number; log?: Log; head?: any }> = [
+    { t: 0, log: L(P1, [SYNC_TOPIC], 50, 0, 0) },
+    { t: 1, log: xfer },                       // via "transfers FROM our pools"
+    { t: 2, log: xfer },                       // the same report via "transfers TO our pools"
+    { t: 5, head: H(50) },
+    { t: 40, head: H(51) },
+    { t: 45, log: L(P2, [SYNC_TOPIC], 52, 0, 0) },
+    { t: 50, head: H(52) },
+    { t: 120, log: L(USDG, [TRANSFER_TOPIC, pad(STRANGER), pad(P1)], 50, 3, 7) },   // late
+  ];
+  f.onLive(); f.setActive(true);
+  const t0 = clock;
+  // 1 ms steps; the checker's pump looks every 10 ms (copy2-dryrun setInterval).
+  for (let t = 0; t <= 300; t++) {
+    advance(t0 + t - clock);
+    for (const e of events.filter((x) => x.t === t)) {
+      if (e.log) { f.onLogs([e.log]); const late = asm.addLog(e.log, clock); if (late) ref.push(blockMessage(late)); }
+      if (e.head) { f.onHead(e.head); asm.addHead(headFromNewHeads(e.head, clock)!); }
+    }
+    if (t % 10 === 0) for (const b of asm.due(clock)) ref.push(blockMessage(b));
+  }
+  const strip = (m: any) => { const { prevBlock, gap, late, ...rest } = m; void prevBlock; void gap; void late; return rest; };
+  const refDedup = ref.map((m) => (m.logs ? { ...m, logs: m.logs.filter((l: any, i: number, a: any[]) => a.findIndex((x) => x.logIndex === l.logIndex && x.transactionHash === l.transactionHash) === i) } : m));
+  const a = JSON.stringify(sent.map(strip)), b = JSON.stringify(refDedup.map((m) => JSON.parse(JSON.stringify(m))));
+  assert(a === b, `bot block messages = the checker's (same blocks, order, logs, time, bloom; late as its own message)${a === b ? '' : `\n bot ${a}\n ref ${b}`}`);
+  assert(ref[0].logs.length === 3 && sent[0].logs.length === 2 && f.counts.dupLogs === 1, 'transfer between two followed pools (from- AND to- subscription): checker sends it twice (arbsim drops the repeat), bot once');
+  f.setActive(false);
+  advance(100);
+}
+
+// Reports whose header never comes and no later block either: after
+// maxWaitMs the pump reads the header from the node, then sends.
+async function headerlessTests() {
+  const index: Copy2Index = { pools: new Set([P1]), ids: new Set<string>(), poolManager: PM, coins: new Set([WETH]) };
+  const asked: number[] = [];
+  const rpc = async (m: string, p: unknown[]) => { const b = Number(BigInt((p as any[])[0])); asked.push(b); return m === 'eth_getBlockByNumber' ? H(b, { logsBloom: BLOOM2 }) : null; };
+  const { f, sent } = makeForwarder(index, rpc);
+  f.onLive(); f.setActive(true);
+  f.onLogs([L(P1, [SYNC_TOPIC], 40, 0, 0)]);
+  advance(1_400);
+  assert(sent.length === 0, 'headerless block, nothing later: waits up to maxWaitMs (1500)');
+  advance(110);
+  await settle(10, 6);
+  assert(sent.length === 1 && sent[0].block === 40 && sent[0].logsBloom === BLOOM2 && JSON.stringify(asked) === '[40]' && f.counts.headersFetched === 1, 'then its header is read from the node (one request) and the block sent with that bloom');
+  // A header without a bloom counts as missing: also read from the node.
+  f.onHead(H(41, { logsBloom: '0x12' }));
+  advance(40);
+  await settle(10, 6);
+  assert(sent.length === 2 && sent[1].block === 41 && sent[1].logsBloom === BLOOM2 && asked.includes(41), 'a header without a readable bloom: header read from the node (never sent bloom-less)');
+  f.setActive(false);
+  advance(100);
 }
 
 async function backfillTests() {
   const index: Copy2Index = { pools: new Set([P1]), ids: new Set<string>(), poolManager: PM, coins: new Set([WETH, USDG]) };
-  const times = new FeedBlockTimes(0);
-  for (let b = 1; b <= 40; b++) times.set(b, 1_760_000_000 + b, 1);
   const calls: any[] = [];
   let fail = false;
   const rpc = async (m: string, p: unknown[]) => {
     calls.push({ m, p });
     if (fail) throw new Error('fetch failed https://secret.example/key');
     if (m === 'eth_blockNumber') return q(23);
+    if (m === 'eth_getBlockByNumber') return H(Number(BigInt((p as any[])[0])));
     const f = (p as any[])[0];
     if (!f.topics) return [L(P1, [SYNC_TOPIC], 21, 0, 0), L(P1, [SYNC_TOPIC], 22, 0, 0)];
     if (f.topics[1]) return [L(WETH, [TRANSFER_TOPIC, pad(P1), pad(STRANGER)], 21, 0, 1)];
     return [L(USDG, [TRANSFER_TOPIC, pad(STRANGER), pad(P1)], 23, 0, 0)];
   };
-  const { f, sent } = makeForwarder(index, times, rpc);
+  const { f, sent } = makeForwarder(index, rpc);
   f.onLive(); f.setActive(true);
-  f.onLogs([L(P1, [SYNC_TOPIC], 20, 0, 0)]); advance(5);
+  f.onLogs([L(P1, [SYNC_TOPIC], 20, 0, 0)]); f.onHead(H(20)); advance(40);
   assert(sent.length === 1 && sent[0].block === 20, 'before the outage: block 20 passed on');
   // Outage: partial block 21 held, then the socket drops.
   f.onLogs([L(P1, [SYNC_TOPIC], 21, 0, 0)]);
   f.onDown();
   assert(!f.live(), 'WebSocket down: not ready');
   f.onLogs([L(P1, [SYNC_TOPIC], 22, 0, 0)]);
-  advance(10);
+  advance(100);
   assert(sent.length === 1, 'nothing passed on while down (held partial block dropped)');
-  // Back: fill in 21..23 from the HTTP node, merged with live block 24.
+  // Back: fill in 21..23 (reports + headers) from the HTTP node, merged with live block 24.
   f.onLive();
-  f.onLogs([L(P1, [SYNC_TOPIC], 24, 0, 0)]);
-  await tick(); await tick(); await tick();
-  advance(5);
+  f.onLogs([L(P1, [SYNC_TOPIC], 24, 0, 0)]); f.onHead(H(24));
+  await settle(10, 10);
   const blocks = sent.map((m) => m.block);
   assert(JSON.stringify(blocks) === JSON.stringify([20, 21, 22, 23, 24]), `outage filled in from the node, then live, in block order (got ${blocks})`);
-  assert(sent.slice(1).every((m) => !m.gap), 'filled-in outage: no gap (the copy missed nothing)');
+  assert(sent.slice(1).every((m, i) => !m.gap && m.prevBlock === m.block - 1 && m.logsBloom === BLOOM), 'filled-in outage: no gap, chained, every block with its header bloom');
   assert(sent[1].logs.length === 2, 'filled block 21: pool event + coin transfer');
   const ask = calls.filter((c) => c.m === 'eth_getLogs');
   assert(ask.length === 3 && ask.every((c) => c.p[0].fromBlock === q(21) && c.p[0].toBlock === q(23)), 'fill-in asks exactly the missed blocks (pool events + transfers from / to)');
-  // Second outage, node fails: the copy is told gap.
+  assert(calls.filter((c) => c.m === 'eth_getBlockByNumber').length === 3, 'and the 3 missed headers (one read each)');
+  // Second outage, node fails: the copy is told to reload.
   fail = true;
   f.onDown(); f.onLive();
-  await tick(); await tick();
-  f.onLogs([L(P1, [SYNC_TOPIC], 30, 0, 0)]); advance(5);
+  await settle(0, 4);
+  f.onLogs([L(P1, [SYNC_TOPIC], 30, 0, 0)]); f.onHead(H(30)); advance(40);
   const last = sent[sent.length - 1];
-  assert(last.block === 30 && last.gap === true && f.counts.backfillFails === 1, 'fill-in failed: next message says gap (copy reloads, never guesses)');
+  assert(last.block === 30 && last.gap === true && last.prevBlock === 30 && f.counts.backfillFails === 1, 'fill-in failed: next message has prevBlock = itself (copy reloads, never guesses)');
+  f.setActive(false);
+  advance(100);
 }
 
 // =============================================================================
@@ -375,10 +462,11 @@ async function linkTests() {
   assert(v4 && v4.address === PM && v4.v4Id === id && v4.fee === 3000 && v4.tickSpacing === 60 && v4.token0 === WETH, 'track: V4 entry carries PoolManager, id, fee, tick spacing, coins');
   assert(link.notReadyWhy([P1]) === 'pool reports not flowing', 'track accepted but nothing passed on yet (gap pending): node decides');
   // First block passes (with gap), then a fresh status says ready.
-  link.times.set(40, 1_760_000_040, 1);
   link.tap.onLogs([L(P1, [SYNC_TOPIC], 40, 0, 0), L(PM, [V4_SWAP_TOPIC, id], 40, 1, 1)]);
+  link.tap.onHead!(H(40));
   advance(50);
-  assert(client.oneWay.length === 1 && client.oneWay[0].block === 40 && client.oneWay[0].gap === true, 'pool_logs passed to the fast check (first with gap)');
+  assert(client.oneWay.length === 1 && client.oneWay[0].block === 40 && client.oneWay[0].gap === true && client.oneWay[0].logsBloom === BLOOM, 'pool_logs passed to the fast check (first with gap), carrying the header bloom');
+  assert(link.tap.dailyShare!() === 0.8 && copy2Settings({ COPY2_WSS_MAX_PCT: '50' }).wssMaxPct === 50 && copy2Settings({}).graceMs === 30, 'settings: copy-2 share of the daily WebSocket cap (80 %), grace 30 ms');
   assert(link.notReadyWhy([P1]) === 'reloading after a gap', 'status taken before the gap is not trusted');
   advance(1);
   link.applyStatus({ ok: true, source: 'pool-events', copy2: { pools: { [P1]: 'ready', [P2]: 'unsure', [id]: 'ready' } } });
@@ -406,7 +494,7 @@ async function linkTests() {
   link2.applyStatus({ ok: true, source: 'pool-events' });
   link2.tap.onLive({ pools: new Set([P1]), ids: new Set(), transferPools: new Set([P1]), coins: new Set([WETH, USDG]) });
   await tick(); await tick();
-  link2.tap.onLogs([L(P1, [SYNC_TOPIC], 50, 0, 0)]); advance(50);
+  link2.tap.onLogs([L(P1, [SYNC_TOPIC], 50, 0, 0)]); link2.tap.onHead!(H(50)); advance(50);
   assert(c2.oneWay.length === 0 && link2.notReadyWhy([P1]) === 'track list not accepted yet', 'track refused: nothing passed on, node decides');
   // LOCAL_SIM_COPY2=off
   assert(copy2Settings({ LOCAL_SIM_COPY2: 'off' }).mode === 'off' && copy2Settings({}).mode === 'auto', 'LOCAL_SIM_COPY2=off switch');
@@ -464,11 +552,13 @@ function wsTapTests() {
   {
     const got: RpcLog[][] = [];
     let live: any = null, downs = 0;
-    const tap = { wanted: () => true, transferFilter: () => ({ coins: [USDG, WETH], pools: [P1, P2] }), onLogs: (l: RpcLog[]) => got.push(l), onLive: (c: any) => { live = c; }, onDown: () => { downs++; } };
+    const heads: any[] = [];
+    const tap = { wanted: () => true, transferFilter: () => ({ coins: [USDG, WETH], pools: [P1, P2] }), onLogs: (l: RpcLog[]) => got.push(l), onHead: (h: any) => heads.push(h), onLive: (c: any) => { live = c; }, onDown: () => { downs++; } };
     const { r, sockets, applied } = make(tap);
     r.start(); sockets[0]!.open();
     const s = sockets[0]!.sent;
-    assert(s.length === 4, 'tap wanted: four subscriptions');
+    assert(s.length === 5, 'tap wanted: five subscriptions');
+    assert(s[4].params[0] === 'newHeads' && s[4].id === 2, 'tap wanted: block headers too (newHeads: time + logsBloom for each block message)');
     assert(!s[0].params[1].topics && JSON.stringify(s[0].params[1].address) === JSON.stringify([P1, P2]), 'our pools: ALL their events (no topic filter), still only our addresses');
     assert(s[1].params[1].topics[0] === null && s[1].params[1].topics[1][0] === ID, 'V4: every PoolManager event for our pool ids');
     assert(s[2].params[1].topics[0] === TRANSFER_TOPIC && s[2].params[1].topics[1][0] === pad(P1) && JSON.stringify(s[2].params[1].address) === JSON.stringify([USDG, WETH]), 'coin transfers FROM our pools (our coins only)');
@@ -476,6 +566,8 @@ function wsTapTests() {
     sockets[0]!.reply(1, '0xs1'); sockets[0]!.reply(3, '0xs3'); sockets[0]!.reply(4, '0xs4');
     assert(live === null, 'not live until every subscription is confirmed');
     sockets[0]!.reply(5, '0xs5');
+    assert(live === null, 'not live until the header subscription is confirmed too');
+    sockets[0]!.reply(2, '0xs2');
     assert(live && live.pools.has(P1) && live.ids.has(ID) && live.transferPools.has(P2) && live.coins.has(WETH), 'all confirmed: tap live with what is covered');
     sockets[0]!.push('0xs4', L(WETH, [TRANSFER_TOPIC, pad(P1), pad(STRANGER)], 60, 0, 0));
     advance(10);
@@ -486,6 +578,8 @@ function wsTapTests() {
     sockets[0]!.push('0xs1', L(P1, ['0x' + '33'.repeat(32)], 62, 0, 0));
     advance(10);
     assert(got.length === 3 && applied.length === 1, 'an event the price path does not know is ignored there (tap still gets it)');
+    sockets[0]!.push('0xs2', H(62));
+    assert(heads.length === 1 && heads[0].logsBloom === BLOOM && applied.length === 1 && r.tapStatus().heads === 1, 'block header handed to the tap as received (never to the price path)');
     sockets[0]!.emit('close');
     assert(downs === 1, 'connection closed: tap told (copy marks a possible gap)');
     r.stop();
@@ -501,6 +595,39 @@ function wsTapTests() {
     advance(2_000);
     sockets[1]!.open();
     assert(sockets[1]!.sent.length === 2 && !!sockets[1]!.sent[0].params[1].topics, 'reconnected with the normal subscriptions only');
+    r.stop();
+  }
+  // Provider refuses the header subscription: copy 2 off on this reader, normal events go on.
+  {
+    let downs = 0;
+    const tap = { wanted: () => true, transferFilter: () => ({ coins: [WETH], pools: [P1] }), onLogs: () => {}, onHead: () => {}, onLive: () => {}, onDown: () => { downs++; } };
+    const { r, sockets } = make(tap);
+    r.start(); sockets[0]!.open();
+    sockets[0]!.reply(1, '0xs1'); sockets[0]!.replyError(2, 'newHeads not allowed');
+    assert(sockets[0]!.closed && downs === 1 && r.tapStatus().refused, 'header subscription refused: tap down, reconnects without it');
+    advance(2_000);
+    sockets[1]!.open();
+    assert(sockets[1]!.sent.length === 2 && !sockets[1]!.sent.some((x) => x.params?.[0] === 'newHeads'), 'reconnected with the normal subscriptions only (no headers)');
+    r.stop();
+  }
+  // Copy-2 budget: past its share of the daily cap, copy 2's subscriptions stop for the day.
+  {
+    let downs = 0;
+    const tap = { wanted: () => true, dailyShare: () => 0.5, transferFilter: () => ({ coins: [WETH], pools: [P1] }), onLogs: () => {}, onHead: () => {}, onLive: () => {}, onDown: () => { downs++; } };
+    const sockets: FakeSocket[] = [];
+    const r = new WsBlockReader({
+      url: 'wss://example.invalid/KEY', httpRpc: async () => [], poolManager: PM, addresses: () => [P1], v4Ids: () => new Set<string>(),
+      onUpdates: () => {}, connect: () => { const x = new FakeSocket(); sockets.push(x); return x; },
+      schedule, now: () => clock, autoTick: false, usage: new NodeUsageCounter(() => clock), log: () => {}, dailyMessageCap: 20, rawLogTap: tap,
+    });
+    r.start(); sockets[0]!.open();
+    for (const id of [1, 2, 4, 5]) sockets[0]!.reply(id, '0xs' + id);
+    for (let i = 0; i < 6; i++) sockets[0]!.push('0xs2', H(70 + i));   // 4 replies + 6 headers = 10 = half the cap
+    r.tick();
+    assert(sockets[0]!.closed && downs === 1, 'copy 2 at its share of the daily cap: subscriptions renewed at once without it');
+    sockets[1]!.open();
+    assert(sockets[1]!.sent.length === 1 && !!sockets[1]!.sent[0].params[1].topics && !sockets[1]!.sent.some((x) => x.params?.[0] === 'newHeads'), 'price feed keeps going (normal subscription only, no headers)');
+    assert(r.stats().capped === false, 'the daily cap itself is not hit');
     r.stop();
   }
   // Empty transfer lists: never an address-less subscription.
@@ -548,8 +675,10 @@ async function main() {
   mappingTests();
   feedTimesTests();
   await forwarderTests();
+  await feedL1Tests();
+  await headerlessTests();
+  await parityTests();
   await backfillTests();
-  await tickTests();
   statusTests();
   await linkTests();
   wsTapTests();

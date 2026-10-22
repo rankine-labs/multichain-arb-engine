@@ -4,6 +4,7 @@ import { isHookedV4, v4KeyMatchesId, v4KeyOf } from './executorCalldata';
 import { ROBINHOOD_VENUES } from '../config/robinhoodVenues';
 import type { LocalSimClient, SidecarAnswer } from './localSim';
 import type { RawLogTap } from '../core/blockReaderWs';
+import { BlockAssembler, BlockOut, Head, blockMessage, headFromNewHeads } from './copy2Blocks';
 
 // ============================================================================
 // COPY 2, BOT SIDE (sim/COPY2_PLAN.md, workstream C)
@@ -32,9 +33,12 @@ import type { RawLogTap } from '../core/blockReaderWs';
 //        transfers into / out of our pools (the copy keeps the pools' coin
 //        balances too). They come from the block reader's WebSocket (the node
 //        pushes them); this file only sorts them per block and passes them
-//        on. It never waits for anything slow and never stops the bot: if
-//        the fast check's socket is busy the message is dropped, counted,
-//        and the next message says "gap" so the copy reloads instead of
+//        on. Each block also carries its header (time, parent-chain block,
+//        logsBloom) from the WebSocket's newHeads subscription, and blocks
+//        go out by EXACTLY the dry-run checker's rules (copy2Blocks.ts), so
+//        the live copy behaves like the one being validated. It never stops
+//        the bot: if the fast check's socket is busy the message is dropped,
+//        counted, and the next message makes the copy reload instead of
 //        guessing.
 //
 //   And it reads back, per pool, whether the copy is READY (exact and
@@ -46,26 +50,30 @@ import type { RawLogTap } from '../core/blockReaderWs';
 //   {type:"track", pools:[{address, v4Id?, kind, token0, token1, fee, tickSpacing}]}
 //       (answer {ok:true}); sent when the list changes, on (re)connect and
 //       every 10 minutes.
-//   {type:"pool_logs", block, timestamp, l1Block?, prevBlock, gap?, logs:[...]}
+//   {type:"pool_logs", block, timestamp, l1Block?, logsBloom, prevBlock, gap?, logs:[...]}
 //       one per block that has events on tracked pools, in block order.
-//       prevBlock = the block of the previous message we delivered (-1 =
-//       none yet). The copy compares it with its own last block: different
-//       = it missed something and reloads every pool. After anything was
-//       missed on our side (dropped message, WebSocket outage that could not
-//       be filled in, a block whose time is unknown, a fresh start) we send
-//       prevBlock 0 (+ gap:true) on purpose, so the copy reloads.
-//       timestamp / l1Block come from the sequencer feed (header of that
-//       block's message) or from the log itself (blockTimestamp). A block
-//       whose time is unknown is never sent with a guessed time: it is
-//       skipped and the copy reloads (above).
-//   {type:"block_tick", block, timestamp, l1Block?, prevBlock}  "block N had
-//       nothing for you": the newest block the feed announced, once it is
-//       COPY2_TICK_MS old and none of our pools had reports in it.
-//   {type:"pool_logs", block, timestamp, late:true | reorg:true, logs}
-//       reports that arrived AFTER their block was passed on, or that the
-//       node took back (block replaced). Always sent for an already-passed
-//       block, so the copy sees "this block changed" and reloads those
-//       pools (it never applies them as new). Should be very rare.
+//       timestamp / l1Block / logsBloom come from the block's header
+//       (newHeads; read from the HTTP node when it never came). With the
+//       bloom arbsim marks a pool "pending" (answers "unknown") when the
+//       bloom says the pool appears in the block but its report has not
+//       arrived yet (dry run #17). A block whose header can't be had is
+//       never sent with a guessed time or without a bloom: it is skipped
+//       and the copy reloads.
+//       prevBlock = block - 1 (every block goes out, so a missing one is
+//       noticed by the copy, which then reloads every pool); after anything
+//       was missed on our side (dropped message, outage not filled in,
+//       block skipped, fresh start) prevBlock = this block (+ gap:true), so
+//       the copy reloads.
+//       Reports the node took back ("removed") go in the same way (arbsim
+//       makes those pools unsure).
+//   {type:"block_tick", block, timestamp, l1Block?, logsBloom, prevBlock}
+//       "block N had nothing for you", for EVERY block without reports on
+//       our pools (with its bloom: a pool whose reports all come late is
+//       still noticed).
+//   {type:"pool_logs", block, timestamp, l1Block?, late:true, logs}
+//       reports that arrived AFTER their block was passed on, with that
+//       block's own time (no bloom). arbsim applies them to a pool with
+//       nothing after them, else that pool alone reloads.
 //
 // Read only. No keys, no transactions. Never throws into the bot.
 // ============================================================================
@@ -215,7 +223,9 @@ export function coveredPools(pools: readonly Copy2Pool[], cov: Copy2Coverage): C
 }
 
 // ----------------------------------------------------------------------------
-// FeedBlockTimes: each block's time and parent-chain (L1) block number, read
+// FeedBlockTimes (since copy2-h only a fallback for the parent-chain block
+// when a block header has none; block messages take time + bloom from the
+// header): each block's time and parent-chain (L1) block number, read
 // from the sequencer feed messages the bot already receives (the header of
 // each message: Robinhood Chain makes one block per feed message, block
 // number = sequence number + ARBSIM_L2_BLOCK_OFFSET, 0 on Robinhood).
@@ -278,14 +288,38 @@ export class FeedBlockTimes {
 }
 
 // ----------------------------------------------------------------------------
-// Copy2Forwarder: sorts the pushed logs per block and passes each block on,
-// in order, as one pool_logs message.
+// Copy2Forwarder: puts the pushed reports of each block together and passes
+// each block on, in order, as one message: by EXACTLY the rules of the
+// dry-run checker that validates copy 2 (execution/copy2Blocks.ts, shared
+// with scripts/sim-compare/copy2-dryrun.ts):
+//   - every block header the WebSocket pushes (newHeads) gives the block's
+//     time, parent-chain block and logsBloom;
+//   - a block goes out once its header arrived + graceMs (30), or once
+//     something 2+ blocks later arrived; a block with reports but no header
+//     waits HEADERLESS_WAIT_MS (400) / maxWaitMs (1500), then its header is
+//     read from the HTTP node (counted). Never sent without a time or bloom:
+//     if the node can't give the header either, the block is skipped and the
+//     copy reloads (prevBlock 0), because arbsim only marks "pending" pools
+//     from a bloom; without one a late report could be missed (wrong price);
+//   - a block with nothing for our pools goes out as block_tick (with its
+//     bloom), so the copy also notices a pool whose reports for that block
+//     all arrive late;
+//   - a report for a block already passed on goes out at once as its own
+//     message ("late", no bloom, the block's own time). arbsim applies it to
+//     that pool if nothing came after it, else that pool alone reloads.
+// On top of the checker's rules (bot only): prevBlock / gap so the copy
+// notices a lost message, the same report twice is passed on once (arbsim
+// also drops repeats), and fill-in after a WebSocket outage.
 // ----------------------------------------------------------------------------
 export type Copy2Index = {
   pools: ReadonlySet<string>;   // tracked contract pools
   ids: ReadonlySet<string>;     // tracked V4 pool ids
   poolManager: string;          // V4 PoolManager (lower case)
   coins: ReadonlySet<string>;   // coins of tracked contract pools
+  // Each contract pool's own two coins. A coin Transfer to / from a pool is
+  // passed on only when the coin is one of THAT pool's coins (same rule as
+  // the checker's classifyLog). Missing = any listed coin (older callers).
+  poolCoins?: ReadonlyMap<string, readonly string[]>;
 };
 
 export type Copy2ForwarderOptions = {
@@ -293,24 +327,23 @@ export type Copy2ForwarderOptions = {
   // busy): the forwarder then marks the next message "gap".
   send: (msg: Record<string, unknown>) => boolean;
   index: () => Copy2Index;
+  // Block time / parent-chain block from the sequencer feed: only used for
+  // the parent-chain block when a header has none.
   blockTime?: (block: number) => { timestamp: number; l1Block?: number } | undefined;
-  // HTTP node for filling in blocks missed while the WebSocket was down.
+  // HTTP node: headers that never came over the WebSocket, and filling in
+  // blocks missed while the WebSocket was down. Each call is one request
+  // (the caller counts them).
   backfillRpc?: () => ((method: string, params: unknown[]) => Promise<any>) | null;
-  holdMs?: number;        // wait this long after the last log before passing on the newest block (default 4)
-  tsWaitMs?: number;      // wait at most this long for a block's time from the feed (default 40)
-  maxBackfill?: number;   // most blocks filled in after an outage (default 200)
-  maxPendingBlocks?: number; // safety cap on blocks held (default 64)
-  // block_tick: "block N had nothing for you". The newest block the feed
-  // announced, sent once it is tickDelayMs old and none of our pools had
-  // reports in it (so the copy's newest block stays current). 0 = no ticks.
-  tickDelayMs?: number;      // default 250
-  feedNewest?: () => { block: number; at: number } | null;
+  graceMs?: number;          // header arrived + this = block complete (default 30, the checker's --grace-ms)
+  maxWaitMs?: number;        // headerless block sent anyway after this (default 1500, the checker's)
+  headerTries?: number;      // header reads from the node per block (node a little behind: null answer), default 3
+  headerRetryMs?: number;    // wait between those reads (default 150)
+  maxBackfill?: number;      // most blocks filled in after an outage (default 200)
+  pumpMs?: number;           // how often held blocks are looked at (default 10, the checker's)
   now?: () => number;
   schedule?: (fn: () => void, ms: number) => () => void;
   log?: (m: string) => void;
 };
-
-type Pending = { logs: RpcLog[]; keys: Set<string>; firstAt: number };
 
 const hexNum = (v: unknown): number | null => {
   if (v === undefined || v === null) return null;
@@ -319,6 +352,7 @@ const hexNum = (v: unknown): number | null => {
 const topicAddr = (t: string | undefined): string | null =>
   typeof t === 'string' && t.length === 66 ? ('0x' + t.slice(26)).toLowerCase() : null;
 const padAddr = (a: string): string => '0x' + '0'.repeat(24) + a.toLowerCase().slice(2);
+const hexBlock = (b: number) => '0x' + b.toString(16);
 
 // The fields of a log the copy needs, as the node sent them.
 function slim(l: RpcLog & { blockHash?: string }): Record<string, unknown> {
@@ -331,44 +365,49 @@ function slim(l: RpcLog & { blockHash?: string }): Record<string, unknown> {
   return o;
 }
 
+// A report's identity, as arbsim sees it (copy2/intake.rs log_id + removed).
+const logKey = (l: RpcLog): string =>
+  `${hexNum(l.transactionIndex) ?? -1}:${hexNum(l.logIndex) ?? -1}:${String(l.transactionHash ?? '').toLowerCase()}:${l.removed ? 1 : 0}`;
+
 const realSchedule = (fn: () => void, ms: number) => { const t = setTimeout(fn, ms); (t as any).unref?.(); return () => clearTimeout(t); };
 
 export class Copy2Forwarder {
   private readonly o: Copy2ForwarderOptions;
   private readonly now: () => number;
   private readonly schedule: (fn: () => void, ms: number) => () => void;
-  private readonly holdMs: number;
-  private readonly tsWaitMs: number;
+  private readonly graceMs: number;
+  private readonly maxWaitMs: number;
 
   private active = false;            // the fast check follows our pools (track accepted)
   private mode: 'down' | 'live' | 'backfilling' = 'down';   // the WebSocket side
-  private pending = new Map<number, Pending>();
-  private late = new Map<number, RpcLog[]>();
-  private reorg = new Map<number, RpcLog[]>();
+  private asm: BlockAssembler;
+  private held = new Map<number, Set<string>>();   // block -> report ids held (not passed on yet)
+  private sentIds = new Map<number, Set<string>>(); // block -> report ids passed on (recent blocks)
+  private lateQ: BlockOut[] = [];   // late reports waiting for the pump (keeps them after their block)
   private lastEmitted = -1;          // newest block passed on (or given up on)
   private prevSent = -1;             // newest block delivered on this connection
   private newestSeen = -1;           // newest block any tracked log came from
   private gapFlag = true;            // next message says "gap" (always true for the first one)
-  private lastLogAt = 0;
-  private cancelFlush: (() => void) | null = null;
+  private pumping = false;
+  private headerFill = false;        // headers of skipped blocks being read: hold the pump
+  private cancelPump: (() => void) | null = null;
   private backfillFrom = -1;         // first block to fill in after an outage (-1 = nothing to fill)
+  private liveMin = Infinity;        // lowest block heard live while filling in
   private gapSentAt = 0;             // when the copy was last told "gap"
   private liveSince = 0;
   private txBlock = new Map<string, number>();
   private txWaiters = new Map<string, Array<(b: number) => void>>();
-  private sentTs = new Map<number, number>();   // block -> the time it was sent with (recent blocks)
-  private lastTs = 0;                           // newest block time sent
-  private cancelTicker: (() => void) | null = null;
   private noTsLoggedAt = -Infinity;
 
-  readonly counts = { logsIn: 0, logsKept: 0, blocksSent: 0, ticks: 0, msgsDropped: 0, late: 0, reorgLogs: 0, gaps: 0, backfills: 0, backfillFails: 0, backfillLogs: 0, noTimestamp: 0, forced: 0 };
+  readonly counts = { logsIn: 0, logsKept: 0, heads: 0, blocksSent: 0, ticks: 0, msgsDropped: 0, late: 0, lateDup: 0, dupLogs: 0, reorgLogs: 0, gaps: 0, backfills: 0, backfillFails: 0, backfillLogs: 0, noTimestamp: 0, headersFetched: 0, headerFails: 0, headerGaps: 0 };
 
   constructor(o: Copy2ForwarderOptions) {
     this.o = o;
     this.now = o.now ?? Date.now;
     this.schedule = o.schedule ?? realSchedule;
-    this.holdMs = Math.max(0, o.holdMs ?? 4);
-    this.tsWaitMs = Math.max(0, o.tsWaitMs ?? 40);
+    this.graceMs = Math.max(0, o.graceMs ?? 30);
+    this.maxWaitMs = Math.max(1, o.maxWaitMs ?? 1500);
+    this.asm = new BlockAssembler(this.graceMs, this.maxWaitMs);
   }
 
   private log(m: string): void { try { (this.o.log ?? (() => {}))(m); } catch { /* logging only */ } }
@@ -378,49 +417,22 @@ export class Copy2Forwarder {
   setActive(on: boolean): void {
     if (on === this.active) return;
     this.active = on;
-    this.clearHeld();
-    // Whatever the copy had before is no longer known to match: start with "gap".
+    // Whatever the copy had before is no longer known to match: start over
+    // with "gap" (the copy reloads), from the next block.
+    this.resetBlocks();
     this.gapFlag = true;
     this.prevSent = -1;
-    if (this.cancelTicker) { this.cancelTicker(); this.cancelTicker = null; }
     if (!on) { this.backfillFrom = -1; return; }
     if (this.mode === 'live' || this.mode === 'backfilling') this.liveSince = this.now();
-    this.startTicker();
-  }
-
-  // Every 100 ms: send a block_tick if the feed announced a newer block with
-  // nothing for us (see tickDelayMs).
-  private startTicker(): void {
-    const delay = this.o.tickDelayMs ?? 250;
-    if (delay <= 0 || !this.o.feedNewest) return;
-    const loop = () => {
-      this.cancelTicker = null;
-      if (!this.active) return;
-      try { this.maybeTick(delay); } catch { /* never throws */ }
-      this.cancelTicker = this.schedule(loop, 100);
-    };
-    this.cancelTicker = this.schedule(loop, 100);
-  }
-
-  private maybeTick(delay: number): void {
-    if (this.mode !== 'live' || this.pending.size > 0) return;
-    const f = this.o.feedNewest?.();
-    if (!f || f.block <= this.lastEmitted || f.block <= this.newestSeen) return;
-    if (this.now() - f.at < delay) return;
-    const t = this.o.blockTime?.(f.block);
-    if (!t) return;
-    const msg: Record<string, unknown> = { type: 'block_tick', block: f.block, timestamp: t.timestamp, prevBlock: this.gapFlag ? 0 : this.prevSent };
-    if (t.l1Block !== undefined) msg.l1Block = t.l1Block;
-    this.deliver(f.block, msg, t.timestamp, true);
   }
   isActive(): boolean { return this.active; }
 
-  // The WebSocket subscription (with our extra filters) is live.
+  // The WebSocket subscriptions (our extra filters + block headers) are live.
   onLive(): void {
     try {
       if (this.mode === 'live' || this.mode === 'backfilling') return;
       this.liveSince = this.now();
-      if (this.active && this.backfillFrom >= 0) { this.mode = 'backfilling'; void this.backfill(this.backfillFrom); }
+      if (this.active && this.backfillFrom >= 0) { this.mode = 'backfilling'; this.liveMin = Infinity; void this.backfill(this.backfillFrom); }
       else this.mode = 'live';
       this.backfillFrom = -1;
     } catch { this.mode = 'live'; this.markGap(); }
@@ -432,8 +444,8 @@ export class Copy2Forwarder {
       if (this.mode === 'down') return;
       const wasBackfilling = this.mode === 'backfilling';
       this.mode = 'down';
-      // The newest held block may be only partly received: it is filled in later.
-      this.clearHeld();
+      // Held blocks may be only partly received: they are filled in later.
+      this.dropHeld();
       if (this.active) {
         if (wasBackfilling) { this.backfillFrom = -1; this.markGap(); }    // two outages in a row: just reload
         else if (this.lastEmitted >= 0) this.backfillFrom = this.lastEmitted + 1;
@@ -442,154 +454,208 @@ export class Copy2Forwarder {
     } catch { this.markGap(); }
   }
 
+  // ---- headers in ----------------------------------------------------------
+  // Every block header the WebSocket pushed (newHeads), as received.
+  onHead(raw: unknown): void {
+    try {
+      if (!this.active || this.mode === 'down') return;
+      const h = headFromNewHeads(raw, this.now());
+      if (!h) return;
+      this.counts.heads++;
+      if (this.mode === 'backfilling') { this.liveMin = Math.min(this.liveMin, h.block); this.asm.addHead(h); return; }
+      // Headers skipped while the WebSocket stayed up (the node left some
+      // out): read them from the node (logs subscriptions are separate, so
+      // their reports still come), holding the pump meanwhile so the blocks
+      // still go out in order, each with its bloom. As the checker does.
+      // (Not when a reload is coming anyway: gap pending.)
+      const gap = this.lastEmitted >= 0 && !this.gapFlag ? this.asm.gapBefore(h.block) : null;
+      this.asm.addHead(h);
+      if (gap && gap.from > this.lastEmitted) void this.fillHeaders(gap.from, gap.to);
+      this.schedulePump(this.o.pumpMs ?? 10);
+    } catch { /* never breaks the reader */ }
+  }
+
   // ---- logs in -------------------------------------------------------------
   // Every log the WebSocket pushed (all subscriptions), as received. Cheap:
-  // filter, sort into its block, schedule a pass-on. Never throws.
+  // filter, put into its block, schedule the pump. Never throws.
   onLogs(logs: RpcLog[]): void {
     try {
       if (!this.active || this.mode === 'down') return;
       const idx = this.o.index();
-      let newer = false;
+      const t = this.now();
+      let any = false;
       for (const l of logs) {
         this.counts.logsIn++;
         if (!l || !this.relevant(l, idx)) continue;
         const b = hexNum(l.blockNumber);
-        const li = hexNum(l.logIndex);
-        if (b === null || li === null) continue;
+        if (b === null || hexNum(l.logIndex) === null) continue;
         this.counts.logsKept++;
-        if (l.removed) {
-          this.counts.reorgLogs++;
-          this.push(this.reorg, b, l);
-          // Not passed on yet: that block was replaced, forget what we held for it
-          // (its replacement's reports come again).
-          if (b > this.lastEmitted) this.pending.delete(b);
+        if (l.removed) this.counts.reorgLogs++;
+        else this.noteTx(l.transactionHash, b);
+        if (this.mode === 'backfilling') this.liveMin = Math.min(this.liveMin, b);
+        // The same report from two subscriptions (a transfer between two of
+        // our pools comes as "from" AND "to"): passed on once.
+        const key = logKey(l);
+        if (this.held.get(b)?.has(key) || this.sentIds.get(b)?.has(key)) {
+          if (this.sentIds.get(b)?.has(key)) this.counts.lateDup++; else this.counts.dupLogs++;
           continue;
         }
-        this.noteTx(l.transactionHash, b);
-        if (b <= this.lastEmitted) {
-          // Its block was already passed on: send it flagged "late".
+        const late = this.asm.addLog(slim(l), t);
+        if (late) {
+          // Its block was already passed on: its own message, after the pump.
           this.counts.late++;
-          this.push(this.late, b, l);
-          continue;
+          this.noteSent(b, key);
+          this.lateQ.push(late);
+        } else {
+          (this.held.get(b) ?? this.held.set(b, new Set()).get(b)!).add(key);
+          if (b > this.newestSeen && !l.removed) this.newestSeen = b;
         }
-        let p = this.pending.get(b);
-        if (!p) {
-          p = { logs: [], keys: new Set(), firstAt: this.now() };
-          this.pending.set(b, p);
-          for (const k of this.pending.keys()) if (k < b) { newer = true; break; }
-        }
-        const key = `${li}`;
-        if (p.keys.has(key)) continue;   // same log from two subscriptions
-        p.keys.add(key);
-        p.logs.push(l);
-        if (b > this.newestSeen) this.newestSeen = b;
+        any = true;
       }
-      this.lastLogAt = this.now();
-      // A newer block started: the older ones are complete, pass them on now.
-      this.scheduleFlush(newer || this.late.size || this.reorg.size ? 0 : this.holdMs);
+      if (any) this.schedulePump(this.lateQ.length ? 0 : (this.o.pumpMs ?? 10));
     } catch { /* never breaks the reader */ }
   }
 
-  private push(m: Map<number, RpcLog[]>, b: number, l: RpcLog): void {
-    const a = m.get(b);
-    if (a) a.push(l); else m.set(b, [l]);
-  }
-
-  // Is this log about a tracked pool?
+  // Is this log about a tracked pool? (the checker's classifyLog rule)
   private relevant(l: RpcLog, idx: Copy2Index): boolean {
     const addr = (l.address || '').toLowerCase();
-    if (idx.pools.has(addr)) return true;
     const t0 = (l.topics?.[0] || '').toLowerCase();
+    if (t0 === TRANSFER_TOPIC && l.topics?.length === 3) {
+      // A coin Transfer to / from one of our pools, of one of ITS coins.
+      const from = topicAddr(l.topics[1]), to = topicAddr(l.topics[2]);
+      for (const side of [from, to]) {
+        if (!side || !idx.pools.has(side)) continue;
+        const own = idx.poolCoins?.get(side);
+        if (own ? own.includes(addr) : idx.coins.has(addr)) return true;
+      }
+      // A Transfer of a pool's OWN LP token (V2 pairs) is a pool report.
+      return idx.pools.has(addr);
+    }
+    if (idx.pools.has(addr)) return true;
     if (addr === idx.poolManager) {
       const id = (l.topics?.[1] || '').toLowerCase();
       return !!id && idx.ids.has(id);
     }
-    if (t0 === TRANSFER_TOPIC && (l.topics?.length ?? 0) >= 3 && idx.coins.has(addr)) {
-      const from = topicAddr(l.topics[1]), to = topicAddr(l.topics[2]);
-      return (!!from && idx.pools.has(from)) || (!!to && idx.pools.has(to));
-    }
     return false;
   }
 
-  // ---- logs out ------------------------------------------------------------
-  private scheduleFlush(ms: number): void {
-    if (this.cancelFlush) {
+  // ---- blocks out ----------------------------------------------------------
+  private schedulePump(ms: number): void {
+    if (this.cancelPump) {
       if (ms > 0) return;               // already planned
-      this.cancelFlush(); this.cancelFlush = null;
+      this.cancelPump(); this.cancelPump = null;
     }
-    this.cancelFlush = this.schedule(() => { this.cancelFlush = null; this.flush(); }, ms);
+    this.cancelPump = this.schedule(() => { this.cancelPump = null; void this.pump(); }, Math.max(0, ms));
   }
 
-  // Pass on every block that is complete. The newest block waits until no
-  // log arrived for holdMs (its logs come in one quick burst); a block
-  // waits for its time from the feed for at most tsWaitMs.
-  flush(force = false): void {
+  // Pass on every block that is complete (in order), then late reports.
+  // A block without a header (or without a bloom) gets its header read from
+  // the node first. Runs again every pumpMs while blocks are held.
+  async pump(): Promise<void> {
+    if (this.pumping) return;
+    this.pumping = true;
     try {
-      if (!this.active || this.mode !== 'live') return;
-      for (const [b, logs] of this.reorg) this.sendFlagged(b, logs, 'reorg');
-      this.reorg.clear();
-      for (const [b, logs] of this.late) this.sendFlagged(b, logs, 'late');
-      this.late.clear();
-      const blocks = [...this.pending.keys()].sort((x, y) => x - y);
-      const t = this.now();
-      const maxPending = this.o.maxPendingBlocks ?? 64;
-      for (let i = 0; i < blocks.length; i++) {
-        const b = blocks[i]!;
-        const p = this.pending.get(b)!;
-        const newest = i === blocks.length - 1;
-        const overfull = blocks.length - i > maxPending;
-        if (newest && !force && !overfull && t - this.lastLogAt < this.holdMs) { this.scheduleFlush(Math.max(1, this.holdMs - (t - this.lastLogAt))); return; }
-        const time = this.timeOf(b, p);
-        if (!time && !force && !overfull && t - p.firstAt < this.tsWaitMs) { this.scheduleFlush(5); return; }
-        if (overfull) this.counts.forced++;
-        this.emit(b, p, time);
+      if (!this.active || this.mode !== 'live' || this.headerFill) return;
+      for (const b of this.asm.due(this.now())) {
+        if (this.stopped()) return;
+        this.held.delete(b.block);
+        if (b.timestamp === null || !b.logsBloom) await this.readHeader(b);
+        // (The WebSocket may have dropped while the node answered.)
+        if (this.stopped()) return;
+        this.emit(b);
       }
-    } catch { /* never throws */ }
-  }
-
-  private timeOf(b: number, p: Pending): { timestamp: number; l1Block?: number } | undefined {
-    const f = this.o.blockTime?.(b);
-    if (f) return f;
-    for (const l of p.logs) {
-      const ts = hexNum((l as any).blockTimestamp);
-      if (ts !== null && ts > 0) return { timestamp: ts };
+      this.sendLate();
+    } catch { /* never throws */ } finally {
+      this.pumping = false;
+      if (this.active && this.mode === 'live' && (this.asm.pendingCount() > 0 || this.lateQ.length)) this.schedulePump(this.lateQ.length ? 0 : (this.o.pumpMs ?? 10));
     }
-    return undefined;
   }
 
-  private emit(b: number, p: Pending, time: { timestamp: number; l1Block?: number } | undefined): void {
-    this.pending.delete(b);
-    this.lastEmitted = Math.max(this.lastEmitted, b);
-    if (!time) {
-      // The block's time is not known (feed silent, node gave none). The copy
-      // needs it to apply events exactly and must never guess it, so this
-      // block is NOT passed on; the next message makes the copy reload
-      // (prevBlock 0). Routing goes to the node meanwhile.
+  // The header of a block that went out of the assembler without one (or
+  // without a bloom): read from the HTTP node (one request per try).
+  private async readHeader(b: BlockOut): Promise<void> {
+    const h = await this.fetchHead(b.block);
+    if (!h) return;
+    b.timestamp = h.timestamp;
+    b.l1Block = h.l1Block;
+    b.logsBloom = h.logsBloom ?? null;
+    this.asm.rememberSent(h);
+  }
+
+  private async fetchHead(block: number): Promise<Head | null> {
+    const rpc = this.o.backfillRpc?.() ?? null;
+    if (!rpc) return null;
+    const tries = Math.max(1, this.o.headerTries ?? 3);
+    for (let i = 0; i < tries; i++) {
+      try {
+        const r = await rpc('eth_getBlockByNumber', [hexBlock(block), false]);
+        const h = r ? headFromNewHeads(r, this.now()) : null;
+        if (h && h.block === block && h.timestamp !== null && h.logsBloom) { this.counts.headersFetched++; return h; }
+      } catch { /* try again */ }
+      // null = the node is a little behind the WebSocket: ask again shortly.
+      if (i + 1 < tries) await new Promise<void>((res) => this.schedule(res, this.o.headerRetryMs ?? 150));
+    }
+    this.counts.headerFails++;
+    return null;
+  }
+
+  // Headers the WebSocket skipped (blocks from..to): read from the node.
+  private async fillHeaders(from: number, to: number): Promise<void> {
+    if (this.headerFill) return;
+    this.counts.headerGaps++;
+    if (to - from + 1 > (this.o.maxBackfill ?? 200)) { this.markGap(); return; }
+    this.headerFill = true;
+    try {
+      for (let b = from; b <= to; b++) {
+        const h = await this.fetchHead(b);
+        if (!this.active || this.mode !== 'live') return;
+        if (h) this.asm.addHead({ ...h, at: this.now() - 10_000 });
+        // A header the node can't give: that block (if it had no reports)
+        // would never go out; the copy reloads instead.
+        else this.markGap();
+      }
+    } finally {
+      this.headerFill = false;
+      this.schedulePump(0);
+    }
+  }
+
+  private emit(b: BlockOut): void {
+    this.lastEmitted = Math.max(this.lastEmitted, b.block);
+    if (b.timestamp === null || !b.logsBloom) {
+      // Header unknown even from the node. arbsim needs the time to apply
+      // the block exactly, and the bloom to notice reports still on their
+      // way; it must never get a guess, so this block is NOT passed on and
+      // the next message makes the copy reload (prevBlock 0). Routing goes
+      // to the node meanwhile.
       this.counts.noTimestamp++;
       this.gapFlag = true;
-      if (this.now() - this.noTsLoggedAt > 60_000) { this.noTsLoggedAt = this.now(); this.log(`[copy2] block ${b}: its time is not known (sequencer feed quiet?), the copy reloads instead`); }
+      if (this.now() - this.noTsLoggedAt > 60_000) { this.noTsLoggedAt = this.now(); this.log(`[copy2] block ${b.block}: its header could not be read (WebSocket and node), the copy reloads instead`); }
       return;
     }
-    const logs = p.logs.slice().sort((x, y) => ((hexNum(x.transactionIndex) ?? 0) - (hexNum(y.transactionIndex) ?? 0)) || ((hexNum(x.logIndex) ?? 0) - (hexNum(y.logIndex) ?? 0)));
-    // prevBlock: the block of our previous delivered message, so the copy can
-    // tell it missed one. After a gap it is 0 on purpose: never the copy's
-    // last block, so the copy reloads every pool instead of trusting it.
-    const msg: Record<string, unknown> = { type: 'pool_logs', block: b, timestamp: time.timestamp, prevBlock: this.gapFlag ? 0 : this.prevSent, logs: logs.map(slim) };
-    if (time.l1Block !== undefined) msg.l1Block = time.l1Block;
-    this.deliver(b, msg, time.timestamp, false);
+    // Parent-chain block: the header's; the feed's if the header has none.
+    if (b.l1Block === null) { const f = this.o.blockTime?.(b.block); if (f?.l1Block !== undefined) b.l1Block = f.l1Block; }
+    const msg = blockMessage(b);
+    // prevBlock (arbsim reloads every pool when prevBlock >= its first block
+    // and it never received prevBlock: copy2/intake.rs process()):
+    //   - normally block - 1: every block goes out (ticks included), so a
+    //     block that silently went missing is noticed by the copy;
+    //   - after a gap (message dropped, block skipped, outage not filled,
+    //     fresh start): THIS block, which the copy can't have yet, so it
+    //     reloads. (prevBlock 0 never triggered a reload: 0 is below the
+    //     copy's first block.) A fresh arbsim has received nothing: no reload.
+    msg.prevBlock = this.gapFlag ? b.block : b.block - 1;
+    for (const l of b.logs) this.noteSent(b.block, logKey(l as RpcLog));
+    this.deliver(b.block, msg, !b.logs.length);
   }
 
   // Hand a pool_logs / block_tick message over and keep the bookkeeping.
-  private deliver(b: number, msg: Record<string, unknown>, ts: number, tick: boolean): void {
+  private deliver(b: number, msg: Record<string, unknown>, tick: boolean): void {
     const gap = this.gapFlag;
     if (gap) msg.gap = true;
-    this.lastEmitted = Math.max(this.lastEmitted, b);
     if (this.send(msg)) {
       if (tick) this.counts.ticks++; else this.counts.blocksSent++;
       this.prevSent = b;
-      this.lastTs = Math.max(this.lastTs, ts);
-      this.sentTs.set(b, ts);
-      if (this.sentTs.size > 512) this.sentTs.delete(this.sentTs.keys().next().value as number);
       if (gap) { this.gapFlag = false; this.gapSentAt = this.now(); this.counts.gaps++; }
     } else {
       this.counts.msgsDropped++;
@@ -597,16 +663,27 @@ export class Copy2Forwarder {
     }
   }
 
-  // Late or taken-back reports: sent for an ALREADY passed-on block, so the
-  // copy treats them as "this block changed" and reloads those pools (it
-  // never applies them as new). Before anything was passed on: nothing to say.
-  private sendFlagged(b: number, logs: RpcLog[], flag: 'late' | 'reorg'): void {
-    const blk = Math.min(b, this.lastEmitted);
-    // A reload is already coming (gap): it covers these pools too.
-    if (blk < 0 || this.gapFlag) return;
-    const ts = this.sentTs.get(blk) ?? this.o.blockTime?.(blk)?.timestamp ?? this.lastTs;
-    if (!ts) return;
-    if (!this.send({ type: 'pool_logs', block: blk, timestamp: ts, [flag]: true, logs: logs.map(slim) })) { this.counts.msgsDropped++; this.gapFlag = true; }
+  // Late reports: their own message for an ALREADY passed-on block, with
+  // that block's own time (no bloom, no prevBlock: as the checker sends
+  // them). A reload already coming (gap) covers them; a block whose time is
+  // forgotten can't be described exactly: the copy reloads instead.
+  private sendLate(): void {
+    const q = this.lateQ;
+    this.lateQ = [];
+    for (const b of q) {
+      if (this.gapFlag) return;
+      if (b.timestamp === null) { this.markGap(); return; }
+      if (b.l1Block === null) { const f = this.o.blockTime?.(b.block); if (f?.l1Block !== undefined) b.l1Block = f.l1Block; }
+      const msg = { ...blockMessage(b), late: true };
+      if (!this.send(msg)) { this.counts.msgsDropped++; this.gapFlag = true; }
+    }
+  }
+
+  private noteSent(b: number, key: string): void {
+    const s = this.sentIds.get(b);
+    if (s) { s.add(key); return; }
+    this.sentIds.set(b, new Set([key]));
+    if (this.sentIds.size > 64) this.sentIds.delete(this.sentIds.keys().next().value as number);
   }
 
   private send(msg: Record<string, unknown>): boolean {
@@ -614,25 +691,38 @@ export class Copy2Forwarder {
   }
 
   private markGap(): void { this.gapFlag = true; }
+  private stopped(): boolean { return !this.active || this.mode === 'down'; }
 
-  private clearHeld(): void {
-    this.pending.clear();
-    this.late.clear();
-    this.reorg.clear();
-    if (this.cancelFlush) { this.cancelFlush(); this.cancelFlush = null; }
+  // Held (not passed on) blocks forgotten; what was passed on is kept.
+  private dropHeld(): void {
+    this.asm.dropPending();
+    this.held.clear();
+    this.lateQ = [];
+    if (this.cancelPump) { this.cancelPump(); this.cancelPump = null; }
+  }
+
+  // Start over (track list changed / copy 2 off): a fresh assembler that
+  // continues after the newest block already passed on.
+  private resetBlocks(): void {
+    this.dropHeld();
+    this.asm = new BlockAssembler(this.graceMs, this.maxWaitMs);
+    if (this.lastEmitted >= 0) this.asm.lastSent = this.lastEmitted;
+    this.sentIds.clear();
   }
 
   // ---- fill-in after a WebSocket outage --------------------------------------
-  // One read per kind of subscription over the missed blocks (HTTP node),
-  // merged with what arrived live meanwhile, then passed on in order.
-  // Anything that fails: the copy is told "gap" (it reloads; never a guess).
+  // One read per kind of subscription over the missed blocks, plus each
+  // missed block's header (HTTP node), merged with what arrived live
+  // meanwhile, then passed on in order (empty blocks as ticks, as the
+  // checker does). Anything that fails: the copy is told "gap" (it reloads;
+  // never a guess).
   private async backfill(from: number): Promise<void> {
     const rpc = this.o.backfillRpc?.() ?? null;
     const done = (ok: boolean) => {
       if (this.mode !== 'backfilling') return;        // went down again meanwhile (onDown handled it)
-      if (!ok) { this.counts.backfillFails++; this.markGap(); }
+      if (!ok) { this.counts.backfillFails++; this.markGap(); this.asm.dropPending(); this.held.clear(); }
       this.mode = 'live';
-      this.flush();
+      this.schedulePump(0);
     };
     try {
       if (!rpc) { done(false); return; }
@@ -642,7 +732,7 @@ export class Copy2Forwarder {
       if (head < from) { done(true); return; }
       if (head - from + 1 > (this.o.maxBackfill ?? 200)) { this.log('[copy2] outage too long to fill in, the copy reloads instead'); done(false); return; }
       const idx = this.o.index();
-      const range = { fromBlock: '0x' + from.toString(16), toBlock: '0x' + head.toString(16) };
+      const range = { fromBlock: hexBlock(from), toBlock: hexBlock(head) };
       const pools = [...idx.pools], ids = [...idx.ids], coins = [...idx.coins];
       const padded = pools.map(padAddr);
       const asks: Array<Promise<any>> = [];
@@ -656,15 +746,27 @@ export class Copy2Forwarder {
       if (this.mode !== 'backfilling') return;
       const all: RpcLog[] = [];
       for (const r of results) { if (!Array.isArray(r)) { done(false); return; } all.push(...r); }
+      // Each missed block's header (time + bloom), as the checker does.
+      // (10 at a time: never a burst of 200 requests at the node.)
+      const heads: Array<Head | null> = [];
+      for (let b = from; b <= head && this.mode === 'backfilling'; b += 10) {
+        const n = Math.min(10, head - b + 1);
+        heads.push(...await Promise.all(Array.from({ length: n }, (_, i) => this.fetchHead(b + i))));
+      }
+      if (this.mode !== 'backfilling') return;
+      if (heads.some((h) => !h)) { done(false); return; }
+      // Blocks between the node's newest and the first block heard live
+      // after the reconnect would be missing (the node is a little behind
+      // the WebSocket): the copy reloads instead.
+      if (this.liveMin !== Infinity && this.liveMin > head + 1) { done(false); return; }
       this.counts.backfills++;
       this.counts.backfillLogs += all.length;
-      // Merge: same path as live logs (dedupe per block + log index).
-      const prevMode = this.mode;
+      // Merge: same path as live logs (one report once), headers already old
+      // (due at once).
       this.mode = 'live';
-      const before = this.lastLogAt;
       this.onLogs(all.filter((l) => !l?.removed));
-      this.lastLogAt = before;
-      this.mode = prevMode;
+      for (const h of heads) this.asm.addHead({ ...h!, at: this.now() - 10_000 });
+      this.mode = 'backfilling';
       done(true);
     } catch (e) {
       this.log(`[copy2] fill-in after the WebSocket outage failed (${String((e as Error)?.message ?? e).slice(0, 60).replace(/https?:\/\/\S+|wss?:\/\/\S+/g, '[url]')}), the copy reloads instead`);
@@ -677,7 +779,7 @@ export class Copy2Forwarder {
   live(): boolean { return this.active && this.mode === 'live' && !this.gapFlag; }
   // When the copy was last told "gap" (a status taken before that is outdated).
   lastGapAt(): number { return this.gapSentAt; }
-  // Newest block the copy has (or is about to get): reports seen, or a tick sent.
+  // Newest block the copy has (or is about to get): reports seen, or a block sent.
   newestBlock(): number { return Math.max(this.newestSeen, this.prevSent); }
   modeText(): string { return !this.active ? 'off' : this.mode === 'live' ? (this.gapFlag ? 'live (gap pending)' : 'live') : this.mode; }
 
@@ -804,24 +906,30 @@ export function parseCopy2Status(s: unknown): Copy2Status {
 //   LOCAL_SIM_COPY2          auto (default): used when the fast check runs in
 //                            pool-events mode; off: never (old behaviour)
 //   COPY2_SKIP_DEXES         exchange names never followed, comma separated
-//   COPY2_HOLD_MS            4     wait after a block's last report
-//   COPY2_TS_WAIT_MS         40    wait for a block's time from the feed
+//   COPY2_GRACE_MS           30    a block is complete this long after its
+//                                  header (the dry run's --grace-ms)
+//   COPY2_HEADERLESS_MAX_MS  1500  a block whose header never came is sent
+//                                  (header read from the node) after this
 //   COPY2_STATUS_MS          2000  how often readiness is asked
 //   COPY2_MAX_STATUS_AGE_MS  10000 older readiness = not trusted (node decides)
 //   COPY2_BACKFILL_MAX       200   most blocks filled in after an outage
-//   COPY2_TICK_MS            250   "nothing for you in block N" sent once the
-//                                  feed's block N is this old (0 = never)
+//   COPY2_WSS_MAX_PCT        80    copy 2's WebSocket subscriptions (incl.
+//                                  newHeads, ~1 message per block) stop for
+//                                  the rest of the UTC day once today's pushed
+//                                  messages reach this % of
+//                                  BLOCK_READER_WSS_DAILY, so the price feed
+//                                  keeps its share (0 = no copy-2 limit)
 //   ARBSIM_L2_BLOCK_OFFSET   0     block number = feed sequence number + this
 // ============================================================================
 export type Copy2Settings = {
   mode: 'auto' | 'off';
   skipDexes: Set<string>;
-  holdMs: number;
-  tsWaitMs: number;
+  graceMs: number;
+  headerlessMaxMs: number;
   statusEveryMs: number;
   maxStatusAgeMs: number;
   maxBackfill: number;
-  tickDelayMs: number;
+  wssMaxPct: number;
   l2Offset: number;
 };
 
@@ -831,12 +939,12 @@ export function copy2Settings(env: Record<string, string | undefined> = process.
   return {
     mode: mode === 'off' || mode === '0' || mode === 'no' ? 'off' : 'auto',
     skipDexes: new Set((env.COPY2_SKIP_DEXES ?? '').split(',').map((s) => s.trim().toLowerCase()).filter(Boolean)),
-    holdMs: num('COPY2_HOLD_MS', 4),
-    tsWaitMs: num('COPY2_TS_WAIT_MS', 40),
+    graceMs: num('COPY2_GRACE_MS', 30),
+    headerlessMaxMs: num('COPY2_HEADERLESS_MAX_MS', 1_500, 1),
     statusEveryMs: num('COPY2_STATUS_MS', 2_000, 200),
     maxStatusAgeMs: num('COPY2_MAX_STATUS_AGE_MS', 10_000, 500),
     maxBackfill: num('COPY2_BACKFILL_MAX', 200, 1),
-    tickDelayMs: num('COPY2_TICK_MS', 250),
+    wssMaxPct: Math.min(100, num('COPY2_WSS_MAX_PCT', 80)),
     l2Offset: num('ARBSIM_L2_BLOCK_OFFSET', 0),
   };
 }
@@ -895,11 +1003,9 @@ export class Copy2Link {
       index: () => this.index,
       blockTime: (b) => this.times.get(b),
       backfillRpc: () => this.backfillRpc,
-      holdMs: s.holdMs,
-      tsWaitMs: s.tsWaitMs,
+      graceMs: s.graceMs,
+      maxWaitMs: s.headerlessMaxMs,
       maxBackfill: s.maxBackfill,
-      tickDelayMs: s.tickDelayMs,
-      feedNewest: () => this.times.newestNote(),
       now: this.now,
       schedule: o.schedule,
       log: (m) => this.log(m),
@@ -909,6 +1015,8 @@ export class Copy2Link {
       wanted: () => s.mode !== 'off' && this.sidecarOn,
       transferFilter: () => transferFilterOf(this.desiredList()),
       onLogs: (logs) => this.forwarder.onLogs(logs),
+      onHead: (h) => this.forwarder.onHead(h),
+      dailyShare: () => s.wssMaxPct / 100,
       onLive: (cov) => {
         this.coverage = cov;
         this.forwarder.onLive();
@@ -929,7 +1037,8 @@ export class Copy2Link {
   // The HTTP node used to fill in blocks missed during a WebSocket outage.
   setBackfillRpc(rpc: ((method: string, params: unknown[]) => Promise<any>) | null): void { this.backfillRpc = rpc; }
 
-  // Every raw sequencer-feed message (for block times). Cheap; only while copy 2 runs.
+  // Every raw sequencer-feed message (parent-chain block for a header that
+  // has none). Cheap; only while copy 2 runs.
   noteFeed(text: string): void { if (this.sidecarOn) this.times.noteFrame(text); }
 
   // The pools copy 2 should follow (from the watch list, rebuilt at most every 5 s).
@@ -1081,7 +1190,7 @@ export class Copy2Link {
     return [
       c ? `copy 2: ${c.ready} ready, ${c.unsure} unsure, ${c.loading} loading of ${c.tracked} pools` : `copy 2: following ${this.tracked.length} pools (readiness not reported)`,
       `routed to fast check ${h.fast}, to node ${node}${whys ? ` (${whys})` : ''}`,
-      `pool reports ${this.forwarder.modeText()}: ${f.blocksSent} blocks passed on${f.msgsDropped ? `, ${f.msgsDropped} DROPPED` : ''}${f.gaps ? `, ${f.gaps} gaps` : ''}${f.late ? `, ${f.late} late` : ''}${f.backfills ? `, ${f.backfills} outages filled in` : ''}${f.backfillFails ? `, ${f.backfillFails} not filled` : ''}${f.noTimestamp ? `, ${f.noTimestamp} without block time` : ''}`,
+      `pool reports ${this.forwarder.modeText()}: ${f.blocksSent} blocks passed on${f.msgsDropped ? `, ${f.msgsDropped} DROPPED` : ''}${f.gaps ? `, ${f.gaps} gaps` : ''}${f.late ? `, ${f.late} late` : ''}${f.backfills ? `, ${f.backfills} outages filled in` : ''}${f.backfillFails ? `, ${f.backfillFails} not filled` : ''}${f.noTimestamp ? `, ${f.noTimestamp} skipped (no header)` : ''}${f.headersFetched ? `, ${f.headersFetched} headers read from the node` : ''}`,
     ].join('; ');
   }
 
@@ -1105,12 +1214,16 @@ export class Copy2Link {
 
 function indexOf(list: readonly Copy2Pool[], poolManager: string): Copy2Index {
   const pools = new Set<string>(), ids = new Set<string>(), coins = new Set<string>();
+  const poolCoins = new Map<string, string[]>();
   for (const p of list) {
     if (p.kind === 'V4') { if (p.v4Id) ids.add(p.v4Id.toLowerCase()); continue; }
-    pools.add(p.address.toLowerCase());
-    for (const t of [p.token0, p.token1]) if (t !== ZERO_ADDR) coins.add(t.toLowerCase());
+    const a = p.address.toLowerCase();
+    pools.add(a);
+    const own = [p.token0, p.token1].filter((t) => t !== ZERO_ADDR).map((t) => t.toLowerCase());
+    poolCoins.set(a, own);
+    for (const t of own) coins.add(t);
   }
-  return { pools, ids, poolManager: (poolManager || '').toLowerCase(), coins };
+  return { pools, ids, poolManager: (poolManager || '').toLowerCase(), coins, poolCoins };
 }
 
 function kindCounts(list: readonly Copy2Pool[]): string {

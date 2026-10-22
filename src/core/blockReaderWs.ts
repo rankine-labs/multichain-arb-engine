@@ -108,6 +108,10 @@ export interface WsBlockReaderOptions {
 //   3) V4 PoolManager: ALL events for our V4 pool ids (instead of Swap only)
 //   4) + coin Transfer events FROM our contract pools (coins of those pools)
 //   5) + coin Transfer events TO our contract pools
+//   2) + newHeads (block headers: time, parent-chain block, logsBloom), so
+//        each block message to the copy carries its header exactly as the
+//        dry-run checker sends it. One pushed message per block (~9 a second
+//        on Robinhood), only while the tap is on.
 // The extra events (mint, burn, LP moves...) also reach the normal price
 // path, which ignores events it doesn't know (as the poll reader does).
 // Every pushed log is handed to tap.onLogs as received (a quick hand-off);
@@ -115,12 +119,20 @@ export interface WsBlockReaderOptions {
 // all subscriptions are confirmed / when the connection is gone (so the
 // copy knows events may have been missed).
 // Cost: more pushed (billed) messages, roughly 2-3x today's on the same
-// pools (each swap moves two coins), all counted against the daily cap.
+// pools (each swap moves two coins), plus one header per block, all counted
+// against the daily cap. COPY-2 BUDGET: once today's pushed messages reach
+// dailyShare() of the cap (default 80 %), the tap is switched off for the
+// rest of the UTC day (subscriptions renewed without it), so copy 2 can
+// never use up the price feed's messages; it comes back the next UTC day.
 // ---------------------------------------------------------------------------
 export interface RawLogTap {
   wanted(): boolean;
   transferFilter(): { coins: string[]; pools: string[] } | null;
   onLogs(logs: RpcLog[]): void;
+  // Each pushed block header (newHeads result), as received.
+  onHead?(header: unknown): void;
+  // Share of the daily cap copy 2 may use (0.8 = 80 %; 0 = no copy-2 limit).
+  dailyShare?(): number;
   onLive(coverage: { pools: Set<string>; ids: Set<string>; transferPools: Set<string>; coins: Set<string> }): void;
   onDown(): void;
 }
@@ -226,6 +238,8 @@ export class WsBlockReader {
   private tapRefused = false;              // provider refused a copy-2 subscription: don't ask again
   private tapCoverage: { pools: Set<string>; ids: Set<string>; transferPools: Set<string>; coins: Set<string> } | null = null;
   private tapLogs = 0;                     // logs that reached the tap
+  private tapHeads = 0;                    // block headers that reached the tap
+  private tapBudgetDay = '';               // UTC day the copy-2 budget stop was logged
 
   constructor(o: WsBlockReaderOptions) {
     this.o = o;
@@ -360,7 +374,9 @@ export class WsBlockReader {
       // Watch list changed: renew the subscription so new pools are included
       // (at most every resubscribeMs, so a busy list doesn't cause churn).
       // Copy 2 switched on or off: renew sooner (at most every 30 s).
-      const tapFlip = !!this.o.rawLogTap && this.tapWanted() !== this.tapOn && t - this.lastSubAt >= 30_000;
+      // Copy 2 over its share of today's messages: renew at once without it.
+      const overBudget = this.tapOn && this.copy2OverBudget();
+      const tapFlip = !!this.o.rawLogTap && this.tapWanted() !== this.tapOn && (overBudget || t - this.lastSubAt >= 30_000);
       if (this.socket && this.subscribed && this.o.addressFilter !== false &&
           (tapFlip || t - this.lastSubAt >= (this.o.resubscribeMs ?? 600_000)) &&
           this.listSig() !== this.subSig) {
@@ -446,14 +462,16 @@ export class WsBlockReader {
             const padded = tf.pools.map(padTopic);
             sock.send(JSON.stringify({ jsonrpc: '2.0', id: 4, method: 'eth_subscribe', params: ['logs', { address: tf.coins, topics: [TRANSFER_TOPIC, padded] }] }));
             sock.send(JSON.stringify({ jsonrpc: '2.0', id: 5, method: 'eth_subscribe', params: ['logs', { address: tf.coins, topics: [TRANSFER_TOPIC, null, padded] }] }));
-            this.tapWaiting = new Set(v4 ? [1, 3, 4, 5] : [1, 4, 5]);
+            // + block headers (id 2 below): live only once all are confirmed.
+            this.tapWaiting = new Set(v4 ? [1, 2, 3, 4, 5] : [1, 2, 4, 5]);
             this.tapCoverage = { pools: new Set(pools), ids: new Set(v4 ? ids : []), transferPools: new Set(tf.pools), coins: new Set(tf.coins) };
           }
         } else {
           this.subSig = '';
           sock.send(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_subscribe', params: ['logs', { topics: [HANDLED_TOPICS] }] }));
         }
-        if (this.o.heads) sock.send(JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'eth_subscribe', params: ['newHeads'] }));
+        // Block headers: when asked for (BLOCK_READER_WSS_HEADS), or for the copy-2 tap.
+        if (this.o.heads || this.tapOn) sock.send(JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'eth_subscribe', params: ['newHeads'] }));
       } catch (e) {
         this.counts.socketErrors++;
         this.dropSocket();
@@ -513,8 +531,9 @@ export class WsBlockReader {
       try { m = JSON.parse(text); } catch { return; }   // not JSON: ignore
       if (!m || typeof m !== 'object') return;
 
-      // Replies to the copy-2 transfer subscriptions (only sent when the tap is on).
-      if ((m.id === 4 || m.id === 5) && this.tapOn) {
+      // Replies to the copy-2 transfer subscriptions (only sent when the tap is on),
+      // and to the header subscription when the tap asked for it.
+      if ((m.id === 4 || m.id === 5 || (m.id === 2 && !this.o.heads)) && this.tapOn) {
         if (m.error || typeof m.result !== 'string') {
           // Provider refuses this filter: copy 2 stays off on this reader
           // (the fast check falls back to the node), normal events continue.
@@ -525,7 +544,7 @@ export class WsBlockReader {
           this.scheduleReconnect();
           return;
         }
-        this.tapSubs.add(m.result);
+        if (m.id === 2) this.headsSub = m.result; else this.tapSubs.add(m.result);
         this.tapReplied(m.id);
         return;
       }
@@ -554,6 +573,7 @@ export class WsBlockReader {
           this.tapReplied(3);
         } else {
           this.headsSub = m.result;
+          this.tapReplied(2);
         }
         return;
       }
@@ -566,6 +586,7 @@ export class WsBlockReader {
           const n = toNum(r?.number);
           if (n !== null && n > this.head) this.head = n;
           this.markData();
+          if (this.tapOn && r) { this.tapHeads++; try { this.o.rawLogTap?.onHead?.(r); } catch { /* the tap must never break the reader */ } }
           return;
         }
         // Copy-2 transfer subscriptions: only for the tap, never the price path.
@@ -620,7 +641,24 @@ export class WsBlockReader {
   private tapWanted(): boolean {
     const t = this.o.rawLogTap;
     if (!t || this.tapRefused || this.o.addressFilter === false) return false;
+    if (this.copy2OverBudget()) return false;
     try { return t.wanted() === true; } catch { return false; }
+  }
+  // Copy 2 has used its share of today's pushed messages (see COPY-2 BUDGET).
+  private copy2OverBudget(): boolean {
+    const cap = this.o.dailyMessageCap ?? 400_000;
+    if (cap <= 0 || !this.o.rawLogTap) return false;
+    let share = 0.8;
+    try { const v = this.o.rawLogTap.dailyShare?.(); if (typeof v === 'number' && Number.isFinite(v)) share = v; } catch { /* default */ }
+    if (share <= 0) return false;
+    const day = this.utcDay(this.now());
+    const today = day === this.dayKey ? this.dayMessages : 0;
+    if (today < cap * share) return false;
+    if (this.tapBudgetDay !== day) {
+      this.tapBudgetDay = day;
+      this.log(`${this.label}: ${today} pushed messages today = ${Math.round(share * 100)} % of the daily cap: copy-2 events off until midnight UTC (the node decides checks; price feed unchanged)`);
+    }
+    return true;
   }
   // The transfer filter, lower case and sorted; null = nothing to ask for.
   private tapFilter(): { coins: string[]; pools: string[] } | null {
@@ -652,8 +690,8 @@ export class WsBlockReader {
     try { this.o.rawLogTap?.onDown(); } catch { /* ignored */ }
   }
   // Copy-2 facts for the status line.
-  tapStatus(): { on: boolean; live: boolean; refused: boolean; logs: number } {
-    return { on: this.tapOn, live: this.tapLive, refused: this.tapRefused, logs: this.tapLogs };
+  tapStatus(): { on: boolean; live: boolean; refused: boolean; logs: number; heads: number } {
+    return { on: this.tapOn, live: this.tapLive, refused: this.tapRefused, logs: this.tapLogs, heads: this.tapHeads };
   }
 
   private utcDay(t: number): string { return new Date(t).toISOString().slice(0, 10); }
@@ -787,6 +825,6 @@ export class WsBlockReader {
       (s.resubscribes ? `, list renewals ${s.resubscribes}` : '') +
       (s.backfills ? `, gap fills ${s.backfills}` : '') + (s.reorgs ? `, reorg events ${s.reorgs}` : '') + (s.subscribeErrors ? `, refused ${s.subscribeErrors}` : '') +
       // Copy 2 tap (only when the fast check follows our pools).
-      (this.tapOn ? `, copy 2 events ${this.tapLive ? 'live' : 'starting'} (${this.tapLogs} logs)` : this.tapRefused ? ', copy 2 events REFUSED by provider' : '');
+      (this.tapOn ? `, copy 2 events ${this.tapLive ? 'live' : 'starting'} (${this.tapLogs} logs, ${this.tapHeads} headers)` : this.tapRefused ? ', copy 2 events REFUSED by provider' : '');
   }
 }

@@ -413,3 +413,36 @@ trade ~20 ms.
     {readyTickPools, fullTickData, partialTickData, walking, waiting,
     readyV2Like, fullPct, walkSlots}, pendingPools, outsideContracts,
     missesTop; counters walks*, pending_*; per pool tickData, pendingFrom.
+
+- Bot feed = checker feed (inbot-sim/copy2-h, bot side only, no arbsim
+  change): the live bot's copy-2 messages now carry the header logsBloom
+  like the dry run's.
+  - Block assembly moved UNCHANGED from scripts/sim-compare/copy2Lib.ts to
+    src/execution/copy2Blocks.ts (copy2Lib re-exports it); the bot's
+    Copy2Forwarder uses it: header + 30 ms (COPY2_GRACE_MS) or a block 2
+    later; headerless 400 / 1500 ms then header read from the HTTP node
+    (eth_getBlockByNumber, counted "copy 2 headers / fill-ins"); block_tick
+    with bloom for EVERY block without our reports; late report = its own
+    message, the block's time, no bloom. Removed reports go in the block
+    message (as the checker). Coin Transfers only of the pool's own coins
+    (classifyLog rule). Same report from from- and to- subscriptions is
+    passed on once (arbsim also dedupes). Test parityTests: same inputs
+    through both give the same messages.
+  - Header source: newHeads on the bot's existing WebSocket, subscribed only
+    while the copy-2 tap is on; tap live only when it is confirmed; refused
+    = copy 2 off on that reader (like the transfer filters).
+  - No header anywhere (WebSocket + node) or no readable bloom: the block is
+    NOT sent and the copy reloads (arbsim marks pending from a bloom only, so
+    a bloom-less block could miss a late report).
+  - prevBlock fix: arbsim reloads on prevBlock >= its first block and not
+    received; the bot's old "prevBlock 0 = reload" never triggered (0 is
+    below the first block). Now prevBlock = block - 1 normally (every block
+    goes out, a missing one is noticed) and = the block itself after a gap
+    on the bot's side (dropped message, skipped block, outage not filled,
+    fresh start) so the copy really reloads.
+  - Cost: newHeads = 1 pushed message per block (~9/s at 0.11 s blocks, about
+    780k a day): more than BLOCK_READER_WSS_DAILY's default 400k alone.
+    COPY2_WSS_MAX_PCT (80): copy 2's subscriptions stop for the rest of the
+    UTC day at 80 % of the cap (price feed keeps going, the node decides
+    checks). Running copy 2 all day needs the cap (and plan) raised to
+    ~1.2M. Outage fill-ins also read each missed header (<= 200).

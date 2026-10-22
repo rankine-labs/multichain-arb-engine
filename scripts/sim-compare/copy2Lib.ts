@@ -167,122 +167,14 @@ export function classifyLog(log: any, f: Followed): 'pool' | 'transfer' | null {
 // ---------------------------------------------------------------------------
 // 3. One message per block, in block order
 // ---------------------------------------------------------------------------
-// Plain English: reports arrive one by one, from several subscriptions. A
-// block is sent to arbsim (as one `pool_logs`) once we're confident all its
-// reports are in:
-//   - its header has arrived and `graceMs` has passed since (the node sends a
-//     block's reports before its header, the grace covers the rest), or
-//   - something from 2+ blocks later has arrived, or
-//   - no header came at all and `maxWaitMs` passed since its first report.
-// Blocks always go out in increasing order. A report for a block that has
-// already been sent is "late": it is still sent (as its own message, so
-// arbsim can mark that pool unsure) and counted.
-// logsBloom: the header's bloom (hex), passed on to arbsim so it can tell
-// when a pool's reports for a block may not all have arrived yet.
-export interface Head { block: number; timestamp: number | null; l1Block: number | null; at: number; logsBloom?: string | null }
-export interface BlockOut { block: number; timestamp: number | null; l1Block: number | null; logs: any[]; firstLogAt: number | null; headAt: number | null; late?: boolean; logsBloom?: string | null }
+// The block assembly (when a block is complete, the message shapes, the
+// newHeads reader) moved to src/execution/copy2Blocks.ts UNCHANGED, so the
+// live bot sends blocks by exactly the rules this dry run validates.
+// Re-exported here: the checker and its tests use it as before.
+export { BlockAssembler, blockMessage, headFromNewHeads, logOrder, HEADERLESS_WAIT_MS } from '../../src/execution/copy2Blocks';
+export type { Head, BlockOut } from '../../src/execution/copy2Blocks';
 
 const num = (v: unknown): number | null => { if (v === undefined || v === null || v === '') return null; try { return Number(BigInt(v as string)); } catch { return null; } };
-export const logOrder = (a: any, b: any) => (num(a.transactionIndex) ?? 0) - (num(b.transactionIndex) ?? 0) || (num(a.logIndex) ?? 0) - (num(b.logIndex) ?? 0);
-
-// How long a block whose reports arrived without its header waits for the
-// header before it is sent anyway (header then read from the node).
-export const HEADERLESS_WAIT_MS = 400;
-
-export class BlockAssembler {
-  private logs = new Map<number, any[]>();
-  private firstAt = new Map<number, number>();
-  private heads = new Map<number, Head>();
-  private sentHeads = new Map<number, Head>(); // headers of the last 256 blocks sent (for late reports)
-  private newest = 0;
-  lastSent = 0;   // highest block already sent (0 = nothing yet)
-  late = 0;       // reports that arrived after their block was sent
-  noHeader = 0;   // blocks sent without a header (timestamp unknown)
-  constructor(private readonly graceMs = 30, private readonly maxWaitMs = 1500) {}
-
-  // Returns a ready "late" message when the block was already sent.
-  addLog(log: any, now: number): BlockOut | null {
-    const b = num(log?.blockNumber);
-    if (b === null) return null;
-    if (this.lastSent && b <= this.lastSent) {
-      this.late++;
-      // The header was already used and forgotten: take the block time we
-      // remembered when the block went out (arbsim needs it on every message).
-      const h = this.heads.get(b) ?? this.sentHeads.get(b);
-      return { block: b, timestamp: h?.timestamp ?? null, l1Block: h?.l1Block ?? null, logs: [log], firstLogAt: now, headAt: h?.at ?? null, late: true };
-    }
-    (this.logs.get(b) ?? this.logs.set(b, []).get(b)!).push(log);
-    if (!this.firstAt.has(b)) this.firstAt.set(b, now);
-    if (b > this.newest) this.newest = b;
-    return null;
-  }
-
-  addHead(h: Head): void {
-    if (h.block > this.lastHead) this.lastHead = h.block;
-    if (this.lastSent && h.block <= this.lastSent) return;
-    if (!this.heads.has(h.block)) this.heads.set(h.block, h);
-    if (h.block > this.newest) this.newest = h.block;
-  }
-
-  // Blocks ready to send now, oldest first. Blocks with a header but no
-  // reports come out with logs = [] (sent as `block_tick`).
-  due(now: number): BlockOut[] {
-    const pending = [...new Set([...this.logs.keys(), ...this.heads.keys()])].filter((b) => b > this.lastSent).sort((a, b) => a - b);
-    let upto = -1;
-    for (const b of pending) {
-      const h = this.heads.get(b);
-      const first = this.firstAt.get(b);
-      // A block needs its header (block time) before it can go out: arbsim
-      // refuses block messages without a timestamp. So a block whose reports
-      // came in before its header waits for the header (normally a few ms),
-      // and only after HEADERLESS_WAIT_MS is it sent anyway; the caller then
-      // reads the header from the node first (see copy2-dryrun pump()).
-      const ready = h
-        ? now - h.at >= this.graceMs || this.newest >= b + 2
-        : first !== undefined && ((now - first >= Math.min(this.maxWaitMs, HEADERLESS_WAIT_MS) && this.newest >= b + 1) || now - first >= this.maxWaitMs);
-      if (ready) upto = b; // everything older is sent with it (order kept)
-    }
-    const out: BlockOut[] = [];
-    for (const b of pending) {
-      if (b > upto) break;
-      const h = this.heads.get(b);
-      const logs = (this.logs.get(b) ?? []).sort(logOrder);
-      if (!h && logs.length) this.noHeader++;
-      out.push({ block: b, timestamp: h?.timestamp ?? null, l1Block: h?.l1Block ?? null, logs, firstLogAt: this.firstAt.get(b) ?? null, headAt: h?.at ?? null, logsBloom: h?.logsBloom ?? null });
-      if (h) { this.sentHeads.set(b, h); if (this.sentHeads.size > 256) this.sentHeads.delete(this.sentHeads.keys().next().value!); }
-      this.logs.delete(b); this.firstAt.delete(b); this.heads.delete(b);
-      this.lastSent = b;
-    }
-    return out;
-  }
-
-  // Blocks missed between the newest header seen so far and a newly seen
-  // header (e.g. after a reconnect): [from, to] to read back from the node,
-  // or null. Call BEFORE addHead for that header.
-  gapBefore(block: number): { from: number; to: number } | null {
-    const last = Math.max(this.lastHead, this.lastSent);
-    if (!last || block <= last + 1) return null;
-    return { from: last + 1, to: block - 1 };
-  }
-  private lastHead = 0;
-}
-
-// The messages for one finished block (plan shapes).
-// The header's logsBloom goes along (not on late messages): arbsim then
-// answers "unknown" for a pool whose reports for that block may still be on
-// their way, until it has checked the block's logs (dry run #17).
-export function blockMessage(b: BlockOut): Record<string, unknown> {
-  const bloom = !b.late && b.logsBloom ? { logsBloom: b.logsBloom } : {};
-  if (!b.logs.length) return { type: 'block_tick', block: b.block, timestamp: b.timestamp, ...(b.l1Block !== null ? { l1Block: b.l1Block } : {}), ...bloom };
-  return { type: 'pool_logs', block: b.block, timestamp: b.timestamp, ...(b.l1Block !== null ? { l1Block: b.l1Block } : {}), logs: b.logs, ...bloom };
-}
-
-export function headFromNewHeads(r: any, now: number): Head | null {
-  const block = num(r?.number);
-  if (block === null) return null;
-  const bloom = typeof r.logsBloom === 'string' && /^0x[0-9a-fA-F]{512}$/.test(r.logsBloom) ? r.logsBloom : null;
-  return { block, timestamp: num(r.timestamp), l1Block: num(r.l1BlockNumber), at: now, ...(bloom ? { logsBloom: bloom } : {}) };
-}
 
 // ---------------------------------------------------------------------------
 // 4. arbsim's status: which pools are ready / unsure / loading
