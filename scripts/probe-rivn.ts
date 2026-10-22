@@ -60,24 +60,24 @@ async function logsChunked(filter: Record<string, unknown>, from: number, to: nu
   return [...(await logsChunked(filter, from, mid)), ...(await logsChunked(filter, mid + 1, to))];
 }
 
-// Every coin paired with USDG in a V4 Initialize or V3 PoolCreated event.
-async function findCoin(latest: number): Promise<string | null> {
-  const init = ethers.id('Initialize(bytes32,address,address,uint24,int24,address,uint160,int24)');
-  const created = ethers.id('PoolCreated(address,address,uint24,int24,address)');
-  const u = '0x' + pad(USDG);
-  const cand = new Set<string>();
-  for (const f of [
-    { address: PM, topics: [init, null, u] }, { address: PM, topics: [init, u] },
-    { address: ROBINHOOD_V3.FACTORY, topics: [created, null, u] }, { address: ROBINHOOD_V3.FACTORY, topics: [created, u] },
-  ]) {
-    const logs = await logsChunked(f, 0, latest);
-    for (const l of logs) for (const t of [l.topics[1], l.topics[2]]) { const a = '0x' + String(t).slice(26); if (a !== USDG) cand.add(a); }
+// The coin: every Transfer-emitting contract in the few blocks before each
+// mismatch block (the gap's trigger trade is there), by symbol.
+async function findCoin(): Promise<string | null> {
+  const topic = ethers.id('Transfer(address,address,uint256)');
+  const seen = new Set<string>();
+  for (const b of BLOCKS) {
+    const n = parseInt(b, 16);
+    const logs = await rpc('eth_getLogs', [{ topics: [topic], fromBlock: hex(n - 40), toBlock: hex(n) }]);
+    if (logs.error) { say(`  getLogs near ${b}: ERR ${short(logs.error, 120)}`); continue; }
+    for (const l of logs.result ?? []) {
+      const a = String(l.address).toLowerCase();
+      if (seen.has(a)) continue;
+      seen.add(a);
+      const sym = str(await view(a, 'symbol()'));
+      if (sym.toUpperCase() === WANT || sym.toUpperCase().startsWith(WANT)) { say(`  ${WANT} = ${a} (symbol "${sym}", name "${str(await view(a, 'name()'))}")`); return a; }
+    }
   }
-  say(`coins paired with USDG: ${cand.size}`);
-  for (const c of cand) {
-    const s = str(await view(c, 'symbol()'));
-    if (s.toUpperCase() === WANT || s.toUpperCase().startsWith(WANT)) { say(`  ${WANT} = ${c} (symbol "${s}", name "${str(await view(c, 'name()'))}")`); return c; }
-  }
+  say(`  coins seen near the blocks: ${seen.size}, none is ${WANT}`);
   return null;
 }
 
@@ -107,7 +107,7 @@ function v4Of(p: PoolState) { return (p as any).v4 as { poolManager: string; fee
     const blk = await rpc('eth_getBlockByNumber', [b, false]);
     say(`block ${b} = ${parseInt(b, 16)} at ${blk.result ? new Date(parseInt(blk.result.timestamp, 16) * 1000).toISOString() : short(blk.error)}`);
   }
-  const coin = process.env.PROBE_TOKEN?.toLowerCase() ?? await findCoin(latest);
+  const coin = process.env.PROBE_TOKEN?.toLowerCase() ?? await findCoin();
   if (!coin) { say(`${WANT} not found`); process.exit(0); }
   await tokenSection(coin);
   const dec = Number(big(await view(coin, 'decimals()')));
@@ -126,7 +126,7 @@ function v4Of(p: PoolState) { return (p as any).v4 as { poolManager: string; fee
   for (const t of [coin, USDG]) {
     try { const s = await findBalanceSlot(rpc, 'robinhood:' + t, t); say(`balance slot lookup ${t}: ${s === null ? 'NOT FOUND' : short(s && 'slot' in (s as any) ? (s as any).slot : s, 200)}`); } catch (e) { say(`balance slot lookup ${t}: error ${(e as Error).message}`); }
   }
-  const sizes = (process.env.PROBE_SIZES ?? '20,60,150,400,1000,3000').split(',').map(Number);
+  const sizes = (process.env.PROBE_SIZES ?? '30,100,300,1000,3000').split(',').map(Number);
   type Hit = { b: string; buy: PoolState; sell: PoolState; usd: number; amountIn: bigint; hops: any[]; status: string; gas: number; reason: string };
   const hits: Hit[] = [];
   for (const b of BLOCKS) {
