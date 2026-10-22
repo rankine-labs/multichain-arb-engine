@@ -332,3 +332,29 @@ contract V4Trader {
         }
     }
 }
+
+// ============================================================================
+// TestLmPool: stand-in for PancakeSwap's farm contract ("LM pool").
+//
+// Plain English: a PancakeSwap V3 pool with a farm calls it on every swap
+// (accumulateReward) and on every crossed price point (crossLmTick). The
+// farm's own numbers are ALSO changed by the farm's owner (staking /
+// unstaking through MasterChef) in transactions that emit NO pool event,
+// so a copy that follows only the pool's events can't keep the farm
+// current. Here: crossLmTick uses up one unit of `credit` and refuses
+// with "LS" (the real farm's LiquidityMath error) when there is none left;
+// `addCredit` is the owner's out-of-band change. A stale copy of `credit`
+// makes a copy-side swap fail with "LS" while the chain's swap succeeds,
+// which is exactly what dry run #17 saw on a PancakeSwap pool.
+// ============================================================================
+contract TestLmPool {
+    uint256 public credit;
+    uint256 public rewards;
+    constructor(uint256 c) { credit = c; }
+    function accumulateReward(uint32 t) external { rewards += t; }
+    function crossLmTick(int24, bool) external {
+        require(credit > 0, "LS");
+        credit -= 1;
+    }
+    function addCredit(uint256 c) external { credit += c; }
+}

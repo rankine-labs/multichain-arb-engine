@@ -268,12 +268,49 @@ struct Pretend {
     callers: Vec<Address>,
     /// Accounts given plenty of ETH (V4 PoolManager pays out native ETH).
     rich: Vec<Address>,
+    /// V3 / PancakeSwap V3 swap, mint, burn, collect, flash: Some(pool).
+    /// Every OTHER contract the pool calls (not a coin, not the helper /
+    /// caller, not a chain system address) is an "outside contract", e.g.
+    /// PancakeSwap's farm (lmPool, called on every swap and crossed tick).
+    /// Its state is changed by transactions that emit no pool event (farm
+    /// stakes through MasterChef), so the copy can never hold it exactly:
+    /// dry run #17 had a stale farm make the copy's swap fail with "LS"
+    /// while the chain's succeeded. In a replay it is answered by code that
+    /// accepts any call and returns nothing (STOP). That is EXACT for the
+    /// pool's own storage: the real call did not fail (the chain's action
+    /// succeeded) and a call returning nothing can't change what the pool
+    /// computes; a pool that USES an answer of such a call fails to decode
+    /// the empty answer, the replay doesn't reproduce the event and the
+    /// pool goes unsure (never a guess). The outside contract is also made
+    /// VOLATILE (always MISSING): a CHECK through the pool needs its real,
+    /// current state, which the copy doesn't have, so the check answers
+    /// "unknown" and the bot asks the node.
+    outside_ok: Option<Address>,
+}
+
+/// Code that accepts any call and returns nothing (STOP).
+fn accept_all_code() -> &'static (B256, Bytecode) {
+    static C: OnceLock<(B256, Bytecode)> = OnceLock::new();
+    C.get_or_init(|| (keccak256([0u8]), Bytecode::new_raw(Bytes::from_static(&[0u8]))))
+}
+
+/// Chain system addresses / precompiles (never treated as outside contracts).
+fn is_system(a: &Address) -> bool {
+    let b = a.as_slice();
+    b[..18].iter().all(|x| *x == 0) || (b[0] == 0xa4 && b[1] == 0xb0)
 }
 
 impl Pretend {
     /// Accounts whose changes are never kept.
     fn is_pretend(&self, a: &Address) -> bool {
         *a == REPLAY_CALLER || self.helpers.contains(a) || self.stubs.contains(a) || self.callers.contains(a)
+    }
+    /// Is `a` an outside contract in this run (see `outside_ok`)?
+    fn is_outside(&self, a: &Address) -> bool {
+        match self.outside_ok {
+            Some(pool) => *a != pool && !self.is_pretend(a) && !self.rich.contains(a) && !is_system(a),
+            None => false,
+        }
     }
 }
 
@@ -283,6 +320,8 @@ struct ReplayDb<'a> {
     /// Missing items seen (collect mode: keep going to find them all at once;
     /// the run's result is then thrown away, only the list is used).
     missing: Vec<MissItem>,
+    /// Outside contracts the pool called (see Pretend::outside_ok).
+    outside: Vec<Address>,
 }
 
 impl ReplayDb<'_> {
@@ -307,6 +346,13 @@ impl Database for ReplayDb<'_> {
         }
         if self.p.stubs.contains(&address) {
             let (h, c) = stub_code();
+            return Ok(Some(AccountInfo { nonce: 1, code_hash: *h, code: Some(c.clone()), ..Default::default() }));
+        }
+        if self.p.is_outside(&address) {
+            if !self.outside.contains(&address) {
+                self.outside.push(address);
+            }
+            let (h, c) = accept_all_code();
             return Ok(Some(AccountInfo { nonce: 1, code_hash: *h, code: Some(c.clone()), ..Default::default() }));
         }
         let rich = self.p.rich.contains(&address);
@@ -342,7 +388,7 @@ impl Database for ReplayDb<'_> {
         if code_hash == KECCAK_EMPTY || code_hash.is_zero() {
             return Ok(Bytecode::default());
         }
-        for (h, c) in [helper_code(), stub_code()] {
+        for (h, c) in [helper_code(), stub_code(), accept_all_code()] {
             if *h == code_hash {
                 return Ok(c.clone());
             }
@@ -362,8 +408,8 @@ impl Database for ReplayDb<'_> {
             }
             return Ok(big());
         }
-        if self.p.helpers.contains(&address) {
-            // ReplayHelper has no storage of its own.
+        if self.p.helpers.contains(&address) || self.p.is_outside(&address) {
+            // ReplayHelper / an outside stand-in has no storage of its own.
             return Ok(U256::ZERO);
         }
         match self.view.storage(address, index) {
@@ -427,7 +473,7 @@ fn arb_ctx(ctx: &BlockCtx) -> arb::BlockCtx {
 
 /// Run `calls` in order (each sees the previous ones' changes) on `view`.
 fn run(view: &dyn StateRead, p: &Pretend, ctx: &BlockCtx, calls: &[Call]) -> Result<RunOut, Stop> {
-    let db = ReplayDb { view, p, missing: Vec::new() };
+    let db = ReplayDb { view, p, missing: Vec::new(), outside: Vec::new() };
     let mut evm = arb::evm::build_evm(db, &arb_ctx(ctx), &ArbConfig::default(), arb::ARBSYS_GAS_DEFAULT, true);
     // No gas fees at all (like eth_call): the coinbase is never touched.
     evm.ctx.modify_cfg(|cfg| cfg.disable_fee_charge = true);
@@ -476,6 +522,8 @@ fn run(view: &dyn StateRead, p: &Pretend, ctx: &BlockCtx, calls: &[Call]) -> Res
         }
     }
     let missing = std::mem::take(&mut evm.ctx.journaled_state.database.missing);
+    let outside = std::mem::take(&mut evm.ctx.journaled_state.database.outside);
+    note_outside(view, &outside);
     if !missing.is_empty() {
         return Err(Stop::Need(missing));
     }
@@ -484,6 +532,23 @@ fn run(view: &dyn StateRead, p: &Pretend, ctx: &BlockCtx, calls: &[Call]) -> Res
     }
     let state = evm.finalize();
     Ok(RunOut { ok, output, halt, logs, state })
+}
+
+/// Outside contracts a pool called are never held by the copy: make them
+/// VOLATILE (always MISSING, for every version and every check; shared by
+/// all snapshots of this copy). See Pretend::outside_ok.
+fn note_outside(view: &dyn StateRead, outside: &[Address]) {
+    if outside.is_empty() {
+        return;
+    }
+    if let Some(v) = view.volatile() {
+        for a in outside {
+            if !v.is_whole(a) {
+                eprintln!("[arbsim] copy2: {a} is an outside contract a pool calls (e.g. a PancakeSwap farm): never kept, checks touching it answer unknown");
+                v.add_whole(*a);
+            }
+        }
+    }
 }
 
 /// A read-only call to a real contract on our copy (pool getters).
@@ -525,7 +590,7 @@ fn view_addr(view: &dyn StateRead, ctx: &BlockCtx, to: Address, sig: &str) -> Re
 fn kept_changes(view: &dyn StateRead, p: &Pretend, state: &EvmState) -> Result<StateDiff, Stop> {
     let mut d = StateDiff::default();
     for (addr, acc) in state.iter() {
-        if p.is_pretend(addr) {
+        if p.is_pretend(addr) || p.is_outside(addr) {
             continue;
         }
         if acc.is_selfdestructed() || acc.is_created() {
@@ -738,7 +803,7 @@ fn v3_pretend(view: &dyn StateRead, pool: &TrackedPool, ctx: &BlockCtx, helpers:
             return Err(Stop::Unsure(format!("event sender {h} is the pool or one of its coins")));
         }
     }
-    Ok(Pretend { helpers, stubs: vec![t0, t1], seeds: Vec::new(), callers, rich: Vec::new() })
+    Ok(Pretend { helpers, stubs: vec![t0, t1], seeds: Vec::new(), callers, rich: Vec::new(), outside_ok: None })
 }
 
 /// Accept a run whose pool logs are exactly [the event].
@@ -849,6 +914,11 @@ fn v3_family(db: &mut Overlay, pool: &TrackedPool, log: &PoolLog, ctx: &BlockCtx
         return Err(Stop::Unsure(format!("unknown pool event {}", log.topics[0])));
     };
 
+    // Pool actions (not owner settings): outside contracts get stand-ins.
+    let mut pretend = pretend;
+    if is_swap || t0 == t.mint || t0 == t.burn || t0 == t.collect || t0 == t.flash {
+        pretend.outside_ok = Some(pa);
+    }
     match try_runs(view, &pretend, ctx, &candidates, &accept)? {
         Tried::Hit(diff, _) => Ok(diff),
         Tried::Miss(why) => Err(Stop::Unsure(format!("replay did not reproduce the event: {why}"))),
@@ -1215,7 +1285,7 @@ fn v4(db: &mut Overlay, pool: &TrackedPool, log: &PoolLog, ctx: &BlockCtx) -> Re
                 return Err(Stop::Unsure(format!("event sender {h} is the PoolManager or a coin")));
             }
         }
-        Ok(Pretend { helpers, stubs: stubs.clone(), seeds: Vec::new(), callers, rich: vec![pm] })
+        Ok(Pretend { helpers, stubs: stubs.clone(), seeds: Vec::new(), callers, rich: vec![pm], outside_ok: None })
     };
 
     let (pretend, candidates): (Pretend, Vec<(&str, Vec<Call>)>) = if t0 == t.v4_swap {

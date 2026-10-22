@@ -122,6 +122,8 @@ impl NodeApi for FakeChain {
                 let blk = |i: usize| p[i].as_str().and_then(|s| parse_u64(s).ok()).unwrap_or(0);
                 match *m {
                     "eth_blockNumber" => Ok(json!(format!("{:#x}", *self.tip.lock().unwrap()))),
+                    // Settling pools whose reports may be missing: nothing missing here.
+                    "eth_getLogs" => Ok(json!([])),
                     "eth_getBlockByNumber" => Ok(Value::Null),
                     "eth_getStorageAt" | "eth_call" | "eth_getProof" if blk(if *m == "eth_call" { 1 } else { 2 }) > *self.tip.lock().unwrap() => {
                         Err(RpcErr { code: -32000, message: "header not found".into() })
@@ -350,7 +352,7 @@ fn v2_sync(r0: u128, r1: u128, block: u64, tx: u32, li: u32) -> PoolLog {
     lg(a(V2P), vec![topics().v2_sync], data(&[u(r0), u(r1)]), block, tx, li)
 }
 fn msg(block: u64, ts: u64, logs: Vec<PoolLog>) -> BlockMsg {
-    BlockMsg { block, timestamp: ts, l1_block: Some(9_000), base_fee: Some(10), prev_block: None, logs, tick: false }
+    BlockMsg { block, timestamp: ts, l1_block: Some(9_000), base_fee: Some(10), prev_block: None, logs, tick: false, bloom: None }
 }
 fn tick(block: u64, ts: u64) -> BlockMsg {
     BlockMsg { tick: true, ..msg(block, ts, vec![]) }

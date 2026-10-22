@@ -58,6 +58,9 @@ console.log('solc', solc.version());
 const rh = compile(path.join(SIM, 'src/copy2/ReplayHelper.sol'));
 fs.writeFileSync(path.join(SIM, 'src/copy2/replay_helper.hex'), rh.ReplayHelper.runtime + '\n');
 fs.writeFileSync(path.join(SIM, 'src/copy2/stub_token.hex'), rh.StubToken.runtime + '\n');
+// 1b. Tick lens (copy2/walk.rs): asks a pool for all its tick data under a trace.
+const tl = compile(path.join(SIM, 'src/copy2/TickLens.sol'));
+fs.writeFileSync(path.join(SIM, 'src/copy2/tick_lens.hex'), tl.TickLens.runtime + '\n');
 
 // 2. Test artifacts (deploy code).
 const th = compile(path.join(SIM, 'tests/fixtures/copy2/TestHelpers.sol'));
@@ -69,6 +72,7 @@ const artifacts = {
   Trader: th.Trader.bytecode,
   PancakeDeployer: th.PancakeDeployer.bytecode,
   V4Trader: th.V4Trader.bytecode,
+  TestLmPool: th.TestLmPool.bytecode,
   UniswapV3Factory: bc(req('@uniswap/v3-core/artifacts/contracts/UniswapV3Factory.sol/UniswapV3Factory.json').bytecode),
   PancakeV3Pool: bc(req('@pancakeswap/v3-core/artifacts/contracts/PancakeV3Pool.sol/PancakeV3Pool.json').bytecode),
   AlgebraFactory: bc(A('integral-core/artifacts/contracts/AlgebraFactory.sol/AlgebraFactory.json').bytecode),
@@ -78,4 +82,4 @@ const artifacts = {
   PoolManager: bc(req('@uniswap/v4-core/out/PoolManager.sol/PoolManager.json').bytecode),
 };
 fs.writeFileSync(path.join(SIM, 'tests/fixtures/copy2/artifacts.json'), JSON.stringify(artifacts, null, 1) + '\n');
-console.log('wrote replay_helper.hex, stub_token.hex, tests/fixtures/copy2/artifacts.json');
+console.log('wrote replay_helper.hex, stub_token.hex, tick_lens.hex, tests/fixtures/copy2/artifacts.json');

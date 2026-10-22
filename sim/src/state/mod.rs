@@ -69,6 +69,12 @@ pub trait StateRead: Send + Sync {
     fn balance_exact(&self, _addr: Address) -> bool {
         true
     }
+    /// The copy's shared "never trust these accounts" list, if this view
+    /// has one (copy 2 adds outside contracts a pool calls, see
+    /// copy2/replay.rs). Default: none.
+    fn volatile(&self) -> Option<&snap::Volatile> {
+        None
+    }
 }
 
 /// Where a state view sits on the chain.

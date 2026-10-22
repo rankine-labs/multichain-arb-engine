@@ -257,7 +257,7 @@ async function pump() {
       if (b.timestamp === null) {
         const h = await node('eth_getBlockByNumber', [hex(b.block), false]);
         const head = h.result ? headFromNewHeads(h.result, Date.now()) : null;
-        if (head) { b.timestamp = head.timestamp; b.l1Block = head.l1Block; score.headersFetched = (score.headersFetched ?? 0) + 1; }
+        if (head) { b.timestamp = head.timestamp; b.l1Block = head.l1Block; b.logsBloom = head.logsBloom ?? null; score.headersFetched = (score.headersFetched ?? 0) + 1; }
       }
       if (b.timestamp === null) { score.blocksNoTime = (score.blocksNoTime ?? 0) + 1; continue; } // can't send without a time: arbsim will see a gap and reload
       sendBlock(b);

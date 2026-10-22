@@ -125,6 +125,10 @@ impl Volatile {
     pub fn add_balance(&self, a: Address) -> bool {
         self.balance.write().unwrap().insert(a)
     }
+    /// How many accounts are never trusted (status).
+    pub fn whole_len(&self) -> usize {
+        self.whole.read().unwrap().len()
+    }
     pub fn is_whole(&self, a: &Address) -> bool {
         self.whole.read().unwrap().contains(a)
     }
@@ -396,6 +400,9 @@ impl StateRead for Snapshot {
     fn code_by_hash(&self, hash: B256) -> Lookup<Bytecode> {
         self.lookup_code(hash)
     }
+    fn volatile(&self) -> Option<&Volatile> {
+        Some(&self.volatile)
+    }
     fn position(&self) -> StatePosition {
         self.pos
     }
@@ -411,13 +418,19 @@ impl StateRead for Snapshot {
 pub struct View {
     pub snap: Arc<Snapshot>,
     touched: std::sync::Mutex<Vec<Address>>,
+    /// More distinct accounts touched than the list keeps.
+    overflow: std::sync::atomic::AtomicBool,
 }
 
 impl View {
     pub fn new(snap: Arc<Snapshot>) -> Self {
-        View { snap, touched: std::sync::Mutex::new(Vec::new()) }
+        View { snap, touched: std::sync::Mutex::new(Vec::new()), overflow: std::sync::atomic::AtomicBool::new(false) }
     }
     /// Accounts the check looked at (deduplicated).
+    /// Did the run touch more accounts than the touched list keeps?
+    pub fn touched_overflow(&self) -> bool {
+        self.overflow.load(std::sync::atomic::Ordering::Relaxed)
+    }
     pub fn take_touched(&self) -> Vec<Address> {
         let mut v = std::mem::take(&mut *self.touched.lock().unwrap());
         v.sort_unstable();
@@ -429,8 +442,15 @@ impl View {
 impl StateRead for View {
     fn account(&self, addr: Address) -> Lookup<Option<AccountInfo>> {
         if let Ok(mut t) = self.touched.lock() {
-            if t.len() < 512 {
-                t.push(addr);
+            // Distinct accounts only (a size search runs many tries); copy 2
+            // relies on this list to refuse answers touching a pool whose
+            // reports may be incomplete, so overflowing is recorded.
+            if !t.contains(&addr) {
+                if t.len() < 4096 {
+                    t.push(addr);
+                } else {
+                    self.overflow.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
             }
         }
         self.snap.lookup_account(addr, true)

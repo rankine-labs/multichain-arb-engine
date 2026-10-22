@@ -96,6 +96,12 @@ pub enum Job {
     Trace { id: u64, block: u64, coin: Address, holder: Address },
     Probe { id: u64, coin: Address, block: u64 },
     Tip { id: u64 },
+    /// One pool's tick walk (copy2/walk.rs): debug_traceCall with these
+    /// params' block replaced by min(`block`, node tip). Bulk lane.
+    Walk { id: u64, block: u64, pool: super::TrackedPool, cfg: super::walk::WalkCfg },
+    /// The logs of blocks from..=to (pools whose reports may be missing,
+    /// see intake.rs "pending"): eth_getLogs with each filter.
+    Logs { id: u64, from: u64, to: u64, filters: Vec<Value> },
 }
 
 /// What a Fetch brought back (same order as asked).
@@ -111,6 +117,10 @@ pub enum Done {
     Trace { id: u64, block: u64, coin: Address, holder: Address, res: Result<(U256, Value), NodeErr> },
     Probe { id: u64, coin: Address, res: Result<Option<BalanceLayout>, NodeErr> },
     Tip { id: u64, res: Result<(u64, u64), NodeErr> },
+    /// The prestate trace of a walk, at `block`.
+    Walk { id: u64, block: u64, res: Result<Value, NodeErr> },
+    /// All logs the filters matched in `block` (one list).
+    Logs { id: u64, block: u64, res: Result<Vec<Value>, NodeErr> },
 }
 
 // ---------------------------------------------------------------------------
@@ -328,7 +338,7 @@ impl Loaders {
     /// Queue a job: first loads are bulk; everything else urgent (probes and
     /// traces too: loads wait for them).
     pub fn send(&self, j: Job) {
-        let bulk = matches!(j, Job::Fetch { bulk: true, .. });
+        let bulk = matches!(j, Job::Fetch { bulk: true, .. } | Job::Walk { .. });
         let mut g = self.q.m.lock().unwrap();
         if bulk {
             g.bulk.push_back((Instant::now(), j));
@@ -489,7 +499,12 @@ impl NodeApi for Counting {
 /// Log what went wrong in a job (first 5 per kind, see LoaderStats).
 fn report_errors(stats: &LoaderStats, kind: &str, d: &Done) {
     match d {
-        Done::Fetch { res: Err(e), .. } | Done::Probe { res: Err(e), .. } | Done::Tip { res: Err(e), .. } | Done::Trace { res: Err(e), .. } => {
+        Done::Fetch { res: Err(e), .. }
+        | Done::Probe { res: Err(e), .. }
+        | Done::Tip { res: Err(e), .. }
+        | Done::Trace { res: Err(e), .. }
+        | Done::Walk { res: Err(e), .. }
+        | Done::Logs { res: Err(e), .. } => {
             if !e.to_string().contains(crate::node::SPEED_LIMIT) {
                 stats.note_error(kind, &e.to_string());
             }
@@ -520,6 +535,8 @@ fn describe(j: &Job) -> String {
         Job::Trace { coin, holder, .. } => format!("balance trace {coin} / {holder}"),
         Job::Probe { coin, .. } => format!("coin probe {coin}"),
         Job::Tip { .. } => "node tip".into(),
+        Job::Walk { pool, block, .. } => format!("tick walk {} at block {block}", pool.address),
+        Job::Logs { from, to, filters, .. } => format!("logs of blocks {from}..{to} ({} filters)", filters.len()),
     }
 }
 
@@ -573,6 +590,53 @@ fn one(env: &Env, job: Job) -> (&'static str, Done) {
                 Ok((t, bf))
             });
             ("tip", Done::Tip { id, res })
+        }
+        Job::Walk { id, block, pool, cfg } => {
+            let want = block.max(env.head.load(Ordering::Relaxed));
+            let res = env.tip.at_most(node, want).and_then(|b| {
+                let params = super::walk::trace_params(&pool, &cfg, &tag(b));
+                let r = node.call_batch_paid(Class::Bulk, &[("debug_traceCall", params)])?;
+                match r.into_iter().next() {
+                    Some(Ok(v @ Value::Object(_))) => Ok((b, v)),
+                    Some(Ok(other)) => Err(NodeErr::BadResponse(format!("walk trace: unexpected answer {}", other.to_string().chars().take(80).collect::<String>()))),
+                    Some(Err(e)) => Err(NodeErr::BadResponse(format!("walk trace: {}", e.message))),
+                    None => Err(NodeErr::BadResponse("walk trace: no answer".into())),
+                }
+            });
+            match res {
+                Ok((b, v)) => ("walk", Done::Walk { id, block: b, res: Ok(v) }),
+                Err(e) => ("walk", Done::Walk { id, block, res: Err(e) }),
+            }
+        }
+        Job::Logs { id, from, to, filters } => {
+            let block = to;
+            let res = match env.tip.for_exact(node, to) {
+                Ok(t) if t >= to => {
+                    let calls: Vec<(&str, Value)> = filters
+                        .iter()
+                        .map(|f| {
+                            let mut f = f.clone();
+                            f["fromBlock"] = tag(from);
+                            f["toBlock"] = tag(to);
+                            ("eth_getLogs", json!([f]))
+                        })
+                        .collect();
+                    node.call_batch_paid(Class::Fill, &calls).and_then(|r| {
+                        let mut all = Vec::new();
+                        for x in r {
+                            match x {
+                                Ok(Value::Array(v)) => all.extend(v),
+                                Ok(other) => return Err(NodeErr::BadResponse(format!("eth_getLogs: unexpected answer {}", other.to_string().chars().take(80).collect::<String>()))),
+                                Err(e) => return Err(NodeErr::BadResponse(format!("eth_getLogs: {}", e.message))),
+                            }
+                        }
+                        Ok(all)
+                    })
+                }
+                Ok(t) => Err(NodeErr::BadResponse(format!("node at block {t}, block {block} {NOT_YET}"))),
+                Err(e) => Err(e),
+            };
+            ("logs", Done::Logs { id, block, res })
         }
     }
 }

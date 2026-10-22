@@ -206,6 +206,7 @@ pub fn handle(ctx: &Ctx, req: &Value) -> Value {
             None => bad_request(&id, "coin_slots needs ARBSIM_SOURCE=pool-events"),
         },
         Some("call") => {
+            warm_check_accounts(ctx, req);
             let req = &caller_as_empty(ctx, req);
             let r: CallRequest = match serde_json::from_value(req.clone()) {
                 Ok(r) => r,
@@ -214,6 +215,7 @@ pub fn handle(ctx: &Ctx, req: &Value) -> Value {
             check(ctx, &id, &r.at, t0, |view, c| handle_call(view, c, &r))
         }
         Some("size_search") => {
+            warm_check_accounts(ctx, req);
             let req = &caller_as_empty(ctx, req);
             let r: SizeSearchRequest = match serde_json::from_value(req.clone()) {
                 Ok(r) => r,
@@ -224,6 +226,21 @@ pub fn handle(ctx: &Ctx, req: &Value) -> Value {
         Some(t) => bad_request(&id, &format!("unknown request type '{t}'")),
         None => bad_request(&id, "request has no type"),
     }
+}
+
+/// Copy 2 only: accounts the request gives contract CODE by override (the
+/// bot's simulated ArbExecutor): their coin balance slots are fetched ahead
+/// (Copy2Handle::warm_check_accounts), so a check through a new coin doesn't
+/// miss them the first time.
+fn warm_check_accounts(ctx: &Ctx, req: &Value) {
+    let Some(c) = &ctx.copy2 else { return };
+    let Some(ov) = req.get("overrides").and_then(|o| o.as_object()) else { return };
+    let accts: Vec<revm::primitives::Address> = ov
+        .iter()
+        .filter(|(_, v)| v.get("code").is_some())
+        .filter_map(|(k, _)| crate::check::hexutil::parse_address(k).ok())
+        .collect();
+    c.warm_check_accounts(&accts);
 }
 
 /// Copy 2 only: the CALLER (`from`) of a check is usually a plain wallet
@@ -282,10 +299,23 @@ fn check(ctx: &Ctx, id: &Value, at: &Value, t0: Instant, run: impl Fn(&dyn State
             return unknown(id, e.reason, &e.detail, t0.elapsed().as_micros() as u64);
         }
     };
+    let block = picked.seq + sh.cfg.l2_offset;
     let view = View::new(picked.snap);
     let mut answer = run(&view, &picked.ctx);
     if ctx.copy2.is_none() {
         ctx.updater.touched(view.take_touched());
+    } else if let Some(c) = &ctx.copy2 {
+        // Copy 2: a pool on the route may still be missing reports of this
+        // block (header bloom / coin transfers not in yet): never answer
+        // from such a version (dry run #17: 4 probes with a wrong price /
+        // coin balances).
+        // (Only an ANSWER is withheld: a miss stays a miss, so its fills run.)
+        let all = view.touched_overflow();
+        let answered = answer.get("ok") == Some(&Value::Bool(true));
+        if let Some(why) = if answered { c.pending_reason(&view.take_touched(), block, all) } else { None } {
+            let id = answer.get("id").cloned().unwrap_or(Value::Null);
+            answer = json!({ "id": id, "ok": false, "unknown": "pending_reports", "detail": why });
+        }
     }
     if answer.get("ok") == Some(&Value::Bool(true)) {
         Stats::inc(&sh.stats.checks_ok);

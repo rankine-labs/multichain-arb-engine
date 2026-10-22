@@ -181,6 +181,9 @@ impl StateRead for Overlay {
     fn balance_exact(&self, addr: Address) -> bool {
         self.snap.balance_exact(addr)
     }
+    fn volatile(&self) -> Option<&crate::state::snap::Volatile> {
+        Some(&self.snap.volatile)
+    }
 }
 
 #[cfg(test)]

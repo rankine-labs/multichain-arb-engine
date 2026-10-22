@@ -177,8 +177,10 @@ export function classifyLog(log: any, f: Followed): 'pool' | 'transfer' | null {
 // Blocks always go out in increasing order. A report for a block that has
 // already been sent is "late": it is still sent (as its own message, so
 // arbsim can mark that pool unsure) and counted.
-export interface Head { block: number; timestamp: number | null; l1Block: number | null; at: number }
-export interface BlockOut { block: number; timestamp: number | null; l1Block: number | null; logs: any[]; firstLogAt: number | null; headAt: number | null; late?: boolean }
+// logsBloom: the header's bloom (hex), passed on to arbsim so it can tell
+// when a pool's reports for a block may not all have arrived yet.
+export interface Head { block: number; timestamp: number | null; l1Block: number | null; at: number; logsBloom?: string | null }
+export interface BlockOut { block: number; timestamp: number | null; l1Block: number | null; logs: any[]; firstLogAt: number | null; headAt: number | null; late?: boolean; logsBloom?: string | null }
 
 const num = (v: unknown): number | null => { if (v === undefined || v === null || v === '') return null; try { return Number(BigInt(v as string)); } catch { return null; } };
 export const logOrder = (a: any, b: any) => (num(a.transactionIndex) ?? 0) - (num(b.transactionIndex) ?? 0) || (num(a.logIndex) ?? 0) - (num(b.logIndex) ?? 0);
@@ -246,7 +248,7 @@ export class BlockAssembler {
       const h = this.heads.get(b);
       const logs = (this.logs.get(b) ?? []).sort(logOrder);
       if (!h && logs.length) this.noHeader++;
-      out.push({ block: b, timestamp: h?.timestamp ?? null, l1Block: h?.l1Block ?? null, logs, firstLogAt: this.firstAt.get(b) ?? null, headAt: h?.at ?? null });
+      out.push({ block: b, timestamp: h?.timestamp ?? null, l1Block: h?.l1Block ?? null, logs, firstLogAt: this.firstAt.get(b) ?? null, headAt: h?.at ?? null, logsBloom: h?.logsBloom ?? null });
       if (h) { this.sentHeads.set(b, h); if (this.sentHeads.size > 256) this.sentHeads.delete(this.sentHeads.keys().next().value!); }
       this.logs.delete(b); this.firstAt.delete(b); this.heads.delete(b);
       this.lastSent = b;
@@ -266,15 +268,20 @@ export class BlockAssembler {
 }
 
 // The messages for one finished block (plan shapes).
+// The header's logsBloom goes along (not on late messages): arbsim then
+// answers "unknown" for a pool whose reports for that block may still be on
+// their way, until it has checked the block's logs (dry run #17).
 export function blockMessage(b: BlockOut): Record<string, unknown> {
-  if (!b.logs.length) return { type: 'block_tick', block: b.block, timestamp: b.timestamp, ...(b.l1Block !== null ? { l1Block: b.l1Block } : {}) };
-  return { type: 'pool_logs', block: b.block, timestamp: b.timestamp, ...(b.l1Block !== null ? { l1Block: b.l1Block } : {}), logs: b.logs };
+  const bloom = !b.late && b.logsBloom ? { logsBloom: b.logsBloom } : {};
+  if (!b.logs.length) return { type: 'block_tick', block: b.block, timestamp: b.timestamp, ...(b.l1Block !== null ? { l1Block: b.l1Block } : {}), ...bloom };
+  return { type: 'pool_logs', block: b.block, timestamp: b.timestamp, ...(b.l1Block !== null ? { l1Block: b.l1Block } : {}), logs: b.logs, ...bloom };
 }
 
 export function headFromNewHeads(r: any, now: number): Head | null {
   const block = num(r?.number);
   if (block === null) return null;
-  return { block, timestamp: num(r.timestamp), l1Block: num(r.l1BlockNumber), at: now };
+  const bloom = typeof r.logsBloom === 'string' && /^0x[0-9a-fA-F]{512}$/.test(r.logsBloom) ? r.logsBloom : null;
+  return { block, timestamp: num(r.timestamp), l1Block: num(r.l1BlockNumber), at: now, ...(bloom ? { logsBloom: bloom } : {}) };
 }
 
 // ---------------------------------------------------------------------------

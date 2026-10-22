@@ -120,6 +120,19 @@ function testAssembler() {
   assert(a.gapBefore(106) === null, 'next header while the previous block still waits for its grace = no gap (no false read-back)');
   const h = headFromNewHeads({ number: '0x64', timestamp: '0x10', l1BlockNumber: '0x20', parentHash: '0x' }, 5);
   assert(!!h && h.block === 100 && h.timestamp === 16 && h.l1Block === 32 && h.at === 5, 'newHeads header read (L2 number, time, L1 block)');
+  // The header's logsBloom is passed on with the block message (arbsim's
+  // "reports may still be missing" check), never on late messages.
+  {
+    const bloom = '0x' + '00'.repeat(255) + '01';
+    const hb = headFromNewHeads({ number: '0x65', timestamp: '0x12', l1BlockNumber: '0x20', parentHash: '0x', logsBloom: bloom }, 6)!;
+    assert(hb.logsBloom === bloom, 'logsBloom read from the header');
+    const asm2 = new BlockAssembler(0, 1500);
+    asm2.addHead(hb);
+    const o = asm2.due(1000);
+    assert(o.length === 1 && (blockMessage(o[0]!) as any).logsBloom === bloom, 'block_tick carries logsBloom');
+    assert((blockMessage({ ...o[0]!, late: true }) as any).logsBloom === undefined, 'late message without logsBloom');
+    assert(headFromNewHeads({ number: '0x66', timestamp: '0x12', logsBloom: '0x12' }, 7)!.logsBloom === undefined, 'malformed bloom ignored');
+  }
 }
 
 function testStatus() {

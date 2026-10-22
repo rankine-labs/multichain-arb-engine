@@ -37,6 +37,8 @@ pub mod overlay;
 // Replay of V3 / PancakeV3 / Algebra / V4 events (workstream B; placeholder
 // answering Unsure until B's file replaces it).
 pub mod replay;
+// Tick walk: all the tick data a ready V3-style pool needs (one trace each).
+pub mod walk;
 
 /// Which kind of pool (decides how its events are applied).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

@@ -173,7 +173,9 @@ impl World {
         });
         let node: Arc<dyn NodeApi> = gate.clone();
         let sh = Shared::new(Config::for_tests(), Some(node), Arc::new(Volatile::default()));
-        let (intake, h) = manual(sh.clone(), Arc::new(FillQueue::new(1000, 100)), C2Config::for_tests());
+        // Tick walks off: these tests need a swap whose replay asks the node
+        // for tick values (a walked pool already holds them).
+        let (intake, h) = manual(sh.clone(), Arc::new(FillQueue::new(1000, 100)), C2Config { walks_inflight: 0, ..C2Config::for_tests() });
         // The coins' balance places (as the bot's balance-slots.json would).
         let mut slots = serde_json::Map::new();
         for c in [uu, ww] {
@@ -230,7 +232,7 @@ impl World {
         if n > self.last_sent {
             self.last_sent = n;
         }
-        BlockMsg { block: n, timestamp: ts, l1_block: Some(n), base_fee: Some(0), prev_block: prev, tick: logs.is_empty(), logs }
+        BlockMsg { block: n, timestamp: ts, l1_block: Some(n), base_fee: Some(0), prev_block: prev, tick: logs.is_empty(), logs, bloom: None }
     }
 
     fn send(&mut self, m: BlockMsg) {

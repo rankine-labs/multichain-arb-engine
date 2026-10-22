@@ -346,3 +346,70 @@ trade ~20 ms.
   - Replay: "owner() on <factory> did not answer" now says how (reverted +
     reason / halted + why / answered N bytes + what the copy holds there).
 
+- Dry run #17 fixes (inbot-sim/copy2-g): coverage (1/3 -> nearly all checks
+  answered by the copy) and three accuracy holes.
+  - Misses, proved (tests/copy2_coverage_anvil.rs big_checks_*, walks off =
+    the #17 code): a ready pool held only V3 slots 0-4 / Pancake 0-5 / V4
+    pools[id] 0-3 / Algebra nothing + what its replays had asked for. The
+    2-pool round trip at 100 USD answered; 1k..150k USD missed on the
+    pools' own tick-map words, ticks and price history ("ready pool slot":
+    24..182 per run), exactly #17's class.
+  - Tick walk (copy2/walk.rs + TickLens.sol): ONE debug_traceCall per pool
+    with the prestateTracer of a lens contract (state override, never
+    deployed) that asks the pool through ITS OWN getters for every
+    tick-map word in +-ARBSIM_COPY2_WALK_TICKS (32768 ticks, at least 8
+    words each side), every initialized tick in it (Algebra: the whole tick
+    list + tick tree), the price history (up to 1024 entries) and settings,
+    and runs two probe swaps (~2 % price move) cancelled in the callback.
+    Only the pool's own storage is learned (V4: only this pool's entries in
+    the PoolManager, computed from the id; owned plugin storage); taken in
+    like fills (pool ready since <= k, same load), last_pos moved to k.
+    Re-walked when the price moves half the window away. After walks: 12/12
+    sizes answered and exact (success, output, gas) for V3 (spacing 1),
+    PancakeV3, Algebra (+plugin), V4. A swap that uses up ALL liquidity
+    walks to the price limit (beyond the window): may miss, never wrong.
+    Settings: ARBSIM_COPY2_WALKS (2 at once, 0 = off), _WALK_TICKS,
+    _WALK_MIN_WORDS, _WALK_MAX_TICKS (3000), _WALK_MAX_OBS, _WALK_PROBE_BPS,
+    _WALK_GAS (40M), _WALK_MAX_SLOTS (150000 total, memory guard).
+    Cost per pool (anvil, 18 positions): V3 spacing 1 446 slots / 121 KB
+    answer / 1.7M gas; Pancake 161 / 84 KB; Algebra 204 / 121 KB; V4 133 /
+    75 KB. Memory ~315 B per slot in the copy (imbl) + 52 B bookkeeping.
+  - Accuracy 1, PancakeSwap farm (#17: 8 of 9 "LS" checks on Pancake
+    0x18AB..2486; #16 log "replay did not reproduce: exactIn reverted
+    (LS)"). Cause: the pool calls its farm (lmPool) on every swap /
+    crossed tick; the farm's numbers also change by MasterChef stakes that
+    emit NO pool event, so the copy's farm went stale and its swap failed
+    with the farm's "LS" (reproduced: pancake_farm_* with the fix switched
+    off gives exactly that log). Fix (replay.rs outside_ok): in V3 / Pancake
+    swap / mint / burn / collect / flash replays every other contract the
+    pool calls is a STOP stand-in (exact for the pool's storage: the real
+    call didn't fail, and a call returning nothing can't change what the
+    pool computes); that contract becomes VOLATILE: checks through a
+    farmed Pancake pool answer unknown (never wrong). Status
+    outsideContracts; missesByClass "outside contract (never kept)".
+  - Accuracy 2, late reports (#17: 4 probes with wrong slot0 / coin
+    balances). Cause: the checker (and the bot) send a block when its
+    header + a grace time passed; reports come on ~18 separate
+    subscriptions, so some arrive after the block went out. The copy's
+    version of that block lacked them and ANSWERED (reproduced in
+    late_coin_transfers_*: with the new gate switched off the probe answers
+    ok with the old balances; slot0 right, balances wrong = 0x0c0c's
+    pattern). Fix: "pending" pools (header logsBloom positive without such a
+    report; swap / mint / collect without its coin Transfers; coin
+    Transfers of a V3-style pool without its event): answers touching them
+    at that block or later = unknown "pending_reports"; after
+    ARBSIM_COPY2_PENDING_MS (1500) one eth_getLogs batch (pool addresses,
+    Transfers from / to them, V4 ids) settles the blocks, missing reports
+    are applied as late reports. Messages may now carry `logsBloom` (the
+    checker sends the header's; the bot's feed has no header bloom: only
+    the transfer / event rules apply there until it sends one).
+  - Coin slots: the check's executor (code override) gets its coin balance
+    slots fetched ahead for every coin with a known layout
+    (warm_check_accounts). Status missesTop names the 20 accounts behind the
+    misses. Coins WITHOUT a general layout forget every non-pool slot on
+    each wallet transfer (unchanged, strict): suspected source of repeated
+    "coin slot" misses + fill_retry; missesTop will show it.
+  - Status: checks {total, answered, answeredPct}, poolCoverage
+    {readyTickPools, fullTickData, partialTickData, walking, waiting,
+    readyV2Like, fullPct, walkSlots}, pendingPools, outsideContracts,
+    missesTop; counters walks*, pending_*; per pool tickData, pendingFrom.
