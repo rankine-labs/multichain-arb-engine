@@ -187,6 +187,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "imbl",
+ "libc",
  "revm",
  "rustc-hash",
  "secp256k1",

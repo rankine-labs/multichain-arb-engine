@@ -112,7 +112,33 @@ pub fn serve_main(args: &[String]) {
         }
     };
     eprintln!("[arbsim] source: {source:?}");
+    // Stop signals (pm2 stop / restart / deploy): copy 2 saves itself first
+    // (warm restart, copy2/persist.rs), then the process exits. Installed
+    // before anything starts so an early signal still exits cleanly.
+    crate::copy2::persist::install_stop_handlers();
     let ctx = build_with(cfg, node, source);
+    {
+        let ctx = ctx.clone();
+        std::thread::Builder::new()
+            .name("arbsim-stop".into())
+            .spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                if !crate::copy2::persist::STOP.load(std::sync::atomic::Ordering::SeqCst) {
+                    continue;
+                }
+                eprintln!("[arbsim] stop signal received");
+                if let Some(c2) = &ctx.copy2 {
+                    // pm2 waits ARBSIM kill_timeout (deploy/arbsim-pm2.sh) before
+                    // killing: the save takes well under a second.
+                    let secs = crate::node::env_u64("ARBSIM_COPY2_SAVE_TIMEOUT_S", 20);
+                    if let Err(e) = c2.shutdown(std::time::Duration::from_secs(secs)) {
+                        eprintln!("[arbsim] copy2: no final save ({e}); the last periodic save (if any) is used at the next start");
+                    }
+                }
+                std::process::exit(0);
+            })
+            .expect("stop thread");
+    }
     if let Err(e) = serve(ctx, &socket) {
         eprintln!("[arbsim] socket error: {e}");
         std::process::exit(1);

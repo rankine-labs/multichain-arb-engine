@@ -37,6 +37,8 @@ pub mod intake;
 pub mod loader;
 // Working copy the events are applied to (workstream A; B runs revm on it).
 pub mod overlay;
+// Warm restart: the copy saved to a file and read back at start.
+pub mod persist;
 // Replay of V3 / PancakeV3 / Algebra / V4 events (workstream B; placeholder
 // answering Unsure until B's file replaces it).
 pub mod replay;

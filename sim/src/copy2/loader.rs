@@ -102,6 +102,28 @@ pub enum Job {
     /// The logs of blocks from..=to (pools whose reports may be missing,
     /// see intake.rs "pending"): eth_getLogs with each filter.
     Logs { id: u64, from: u64, to: u64, filters: Vec<Value> },
+    /// Warm restart / gap catch-up (intake.rs "warm restart"): every report
+    /// of our pools in blocks from..=to, read in ranges of `range` blocks,
+    /// each range in ONE request together with the header of its last
+    /// block (proof that this node has the whole range), free public node
+    /// first, paid node if that fails; plus the time and parent-chain block
+    /// of every block with reports.
+    CatchUp { id: u64, from: u64, to: u64, filters: Vec<Value>, range: u64 },
+}
+
+/// What a catch-up read brought back.
+#[derive(Debug, Default)]
+pub struct CatchUpOut {
+    /// Every log the filters matched in from..=to (raw JSON).
+    pub logs: Vec<Value>,
+    /// Block -> (time, parent-chain block) for every block with logs.
+    pub blocks: BTreeMap<u64, (u64, u64)>,
+    /// HTTP requests used (public, paid) and headers read.
+    pub public_requests: u64,
+    pub paid_requests: u64,
+    pub headers: u64,
+    /// Ranges that had to be split (the node refused them as too big).
+    pub splits: u64,
 }
 
 /// What a Fetch brought back (same order as asked).
@@ -121,6 +143,7 @@ pub enum Done {
     Walk { id: u64, block: u64, res: Result<Value, NodeErr> },
     /// All logs the filters matched in `block` (one list).
     Logs { id: u64, block: u64, res: Result<Vec<Value>, NodeErr> },
+    CatchUp { id: u64, res: Result<CatchUpOut, NodeErr> },
 }
 
 // ---------------------------------------------------------------------------
@@ -220,7 +243,7 @@ impl LoaderStats {
         let in_min: Vec<_> = r.iter().filter(|x| now.duration_since(x.0) <= Duration::from_secs(60)).collect();
         let reqs: u64 = in_min.iter().map(|x| x.2).sum();
         let mut kinds = serde_json::Map::new();
-        for k in ["load", "catchup", "fill", "trace", "probe", "tip"] {
+        for k in ["load", "catchup", "fill", "trace", "probe", "tip", "resume"] {
             let v: Vec<_> = in_min.iter().filter(|x| x.1 == k).collect();
             let all = self.total.lock().unwrap().iter().find(|x| x.0 == k).map(|x| (x.1, x.2));
             if v.is_empty() && all.is_none() {
@@ -504,8 +527,9 @@ fn report_errors(stats: &LoaderStats, kind: &str, d: &Done) {
         | Done::Tip { res: Err(e), .. }
         | Done::Trace { res: Err(e), .. }
         | Done::Walk { res: Err(e), .. }
-        | Done::Logs { res: Err(e), .. } => {
-            if !e.to_string().contains(crate::node::SPEED_LIMIT) {
+        | Done::Logs { res: Err(e), .. }
+        | Done::CatchUp { res: Err(e), .. } => {
+            if !e.to_string().contains(crate::node::SPEED_LIMIT) && !e.to_string().contains(NOT_YET) {
                 stats.note_error(kind, &e.to_string());
             }
         }
@@ -537,6 +561,7 @@ fn describe(j: &Job) -> String {
         Job::Tip { .. } => "node tip".into(),
         Job::Walk { pool, block, .. } => format!("tick walk {} at block {block}", pool.address),
         Job::Logs { from, to, filters, .. } => format!("logs of blocks {from}..{to} ({} filters)", filters.len()),
+        Job::CatchUp { from, to, .. } => format!("catch-up logs of blocks {from}..{to}"),
     }
 }
 
@@ -638,7 +663,240 @@ fn one(env: &Env, job: Job) -> (&'static str, Done) {
             };
             ("logs", Done::Logs { id, block, res })
         }
+        Job::CatchUp { id, from, to, filters, range } => ("resume", Done::CatchUp { id, res: catch_up(node, from, to, &filters, range) }),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Catch-up from logs (warm restart, gaps)
+// ---------------------------------------------------------------------------
+/// A range the node refuses as too big ("block range too large", "query
+/// returned more than 10000 results", ...): split it.
+fn too_big(m: &str) -> bool {
+    let l = m.to_ascii_lowercase();
+    !crate::node::is_rate_refusal(0, m)
+        && (l.contains("range") || l.contains("too many") || l.contains("more than") || l.contains("too large") || l.contains("limit exceeded") || l.contains("response size"))
+}
+
+enum ChunkErr {
+    /// The node doesn't have the range's last block yet.
+    NotYet,
+    TooBig(String),
+    Other(String),
+}
+
+/// One range's logs + its last block's header, all in ONE request (so the
+/// same node answered both: it has the whole range, the logs are complete).
+fn read_range(r: Result<Vec<CallResult>, NodeErr>) -> Result<(Vec<Value>, Option<(u64, u64, u64)>), ChunkErr> {
+    let r = r.map_err(|e| ChunkErr::Other(e.to_string()))?;
+    let mut it = r.into_iter();
+    let hdr = match it.next() {
+        Some(Ok(Value::Null)) | None => return Err(ChunkErr::NotYet),
+        Some(Ok(h)) => header_time(&h).map_err(ChunkErr::Other)?,
+        Some(Err(e)) if e.is_block_unavailable() => return Err(ChunkErr::NotYet),
+        Some(Err(e)) => return Err(ChunkErr::Other(format!("eth_getBlockByNumber: {}", e.message))),
+    };
+    let mut logs = Vec::new();
+    for x in it {
+        match x {
+            Ok(Value::Array(v)) => logs.extend(v),
+            Ok(other) => return Err(ChunkErr::Other(format!("eth_getLogs: unexpected answer {}", other.to_string().chars().take(80).collect::<String>()))),
+            Err(e) if too_big(&e.message) => return Err(ChunkErr::TooBig(e.message)),
+            Err(e) => return Err(ChunkErr::Other(format!("eth_getLogs: {}", e.message))),
+        }
+    }
+    Ok((logs, Some(hdr)))
+}
+
+/// (number, time, parent-chain block) of a header. The parent-chain block
+/// (what NUMBER returns on Nitro) must be there: never a guess.
+fn header_time(h: &Value) -> Result<(u64, u64, u64), String> {
+    let f = |k: &str| h.get(k).and_then(|x| x.as_str()).ok_or_else(|| format!("header has no {k}")).and_then(|s| parse_u64(s));
+    Ok((f("number")?, f("timestamp")?, f("l1BlockNumber")?))
+}
+
+/// Headers of these blocks: free node first, the paid node for what it
+/// could not give. Err = some header not available from either.
+fn headers(node: &dyn NodeApi, blocks: &[u64], out: &mut CatchUpOut) -> Result<BTreeMap<u64, (u64, u64)>, NodeErr> {
+    let mut got = BTreeMap::new();
+    if blocks.is_empty() {
+        return Ok(got);
+    }
+    let calls: Vec<(&str, Value)> = blocks.iter().map(|b| ("eth_getBlockByNumber", json!([tag(*b), false]))).collect();
+    out.headers += blocks.len() as u64;
+    let mut todo: Vec<usize> = Vec::new();
+    match node.call_batch(Class::Critical, &calls) {
+        Ok(r) => {
+            out.public_requests += 1;
+            for (i, x) in r.into_iter().enumerate() {
+                match x.ok().filter(|v| !v.is_null()).map(|v| header_time(&v)) {
+                    Some(Ok((n, ts, l1))) if n == blocks[i] => {
+                        got.insert(n, (ts, l1));
+                    }
+                    _ => todo.push(i),
+                }
+            }
+        }
+        Err(_) => todo = (0..blocks.len()).collect(),
+    }
+    if todo.is_empty() {
+        return Ok(got);
+    }
+    let again: Vec<(&str, Value)> = todo.iter().map(|i| calls[*i].clone()).collect();
+    out.paid_requests += 1;
+    let r = node.call_batch_paid(Class::Critical, &again)?;
+    for (k, x) in todo.iter().zip(r) {
+        match x {
+            Ok(v) if !v.is_null() => {
+                let (n, ts, l1) = header_time(&v).map_err(NodeErr::BadResponse)?;
+                if n != blocks[*k] {
+                    return Err(NodeErr::BadResponse(format!("asked header {}, got {n}", blocks[*k])));
+                }
+                got.insert(n, (ts, l1));
+            }
+            Ok(_) => return Err(NodeErr::BadResponse(format!("node at block < {}, block {} {NOT_YET}", blocks[*k], blocks[*k]))),
+            Err(e) => return Err(NodeErr::BadResponse(format!("eth_getBlockByNumber {}: {}", blocks[*k], e.message))),
+        }
+    }
+    Ok(got)
+}
+
+/// Every report the filters match in from..=to, plus each such block's time
+/// and parent-chain block (see Job::CatchUp).
+///   - ranges of at most `range` blocks; a range the node calls too big is
+///     halved (down to one block);
+///   - time: the logs' own `blockTimestamp` when every log of the block has
+///     the same one, else its header;
+///   - parent-chain block: never decreases from one block to the next on
+///     Nitro, so when two blocks have the same one, every block between
+///     them has it too: headers are read only where it changes (halving
+///     the interval), ~25 L1 blocks per 5 minutes x a few reads each.
+pub fn catch_up(node: &dyn NodeApi, from: u64, to: u64, filters: &[Value], range: u64) -> Result<CatchUpOut, NodeErr> {
+    let mut out = CatchUpOut::default();
+    let mut known: BTreeMap<u64, (u64, u64)> = BTreeMap::new();
+    if from > to {
+        return Ok(out);
+    }
+    let range = range.max(1);
+    // Filters per request: up to 24 next to the header (25 calls = one HTTP
+    // request at the default ARBSIM_NODE_BATCH).
+    let groups: Vec<&[Value]> = filters.chunks(24).collect();
+    let mut a = from;
+    let mut step = range;
+    while a <= to {
+        let b = (a + step - 1).min(to);
+        let mut chunk_logs = Vec::new();
+        let mut split = false;
+        for g in &groups {
+            let mut calls: Vec<(&str, Value)> = vec![("eth_getBlockByNumber", json!([tag(b), false]))];
+            for f in g.iter() {
+                let mut f = f.clone();
+                f["fromBlock"] = tag(a);
+                f["toBlock"] = tag(b);
+                calls.push(("eth_getLogs", json!([f])));
+            }
+            out.public_requests += 1;
+            let first = read_range(node.call_batch(Class::Critical, &calls));
+            let r = match first {
+                Ok(x) => Ok(x),
+                // Free node lagging / refusing / too small a limit: the paid one.
+                Err(_) => {
+                    out.paid_requests += 1;
+                    read_range(node.call_batch_paid(Class::Critical, &calls))
+                }
+            };
+            match r {
+                Ok((logs, h)) => {
+                    if let Some((n, ts, l1)) = h {
+                        known.insert(n, (ts, l1));
+                    }
+                    chunk_logs.extend(logs);
+                }
+                Err(ChunkErr::NotYet) => return Err(NodeErr::BadResponse(format!("node at block < {b}, block {b} {NOT_YET}"))),
+                Err(ChunkErr::TooBig(m)) if step > 1 => {
+                    let _ = m;
+                    split = true;
+                    break;
+                }
+                Err(ChunkErr::TooBig(m)) | Err(ChunkErr::Other(m)) => return Err(NodeErr::BadResponse(format!("catch-up logs {a}..{b}: {m}"))),
+            }
+        }
+        if split {
+            out.splits += 1;
+            step = (step / 2).max(1);
+            continue;
+        }
+        out.logs.extend(chunk_logs);
+        a = b + 1;
+    }
+    // Blocks with logs: time from the logs where they say it.
+    let mut ts_of: BTreeMap<u64, Option<u64>> = BTreeMap::new();
+    for l in &out.logs {
+        let Some(b) = l.get("blockNumber").and_then(|x| x.as_str()).and_then(|s| parse_u64(s).ok()) else {
+            return Err(NodeErr::BadResponse("catch-up: a log without blockNumber".into()));
+        };
+        let t = l.get("blockTimestamp").and_then(|x| x.as_str()).and_then(|s| parse_u64(s).ok());
+        let e = ts_of.entry(b).or_insert(t);
+        if *e != t {
+            *e = None; // logs disagree / some lack it: read the header
+        }
+    }
+    let blocks: Vec<u64> = ts_of.keys().copied().collect();
+    if blocks.is_empty() {
+        return Ok(out);
+    }
+    // Headers needed for time + both ends (parent-chain block).
+    let mut need: Vec<u64> = ts_of.iter().filter(|(_, t)| t.is_none()).map(|(b, _)| *b).collect();
+    need.push(blocks[0]);
+    need.push(*blocks.last().unwrap());
+    need.sort();
+    need.dedup();
+    need.retain(|b| !known.contains_key(b));
+    known.extend(headers(node, &need, &mut out)?);
+    // Parent-chain block by halving: intervals (i, j) of `blocks` with both
+    // ends known; equal ends fill everything between.
+    let mut l1: Vec<Option<u64>> = blocks.iter().map(|b| known.get(b).map(|x| x.1)).collect();
+    let mut open: Vec<(usize, usize)> = vec![(0, blocks.len() - 1)];
+    while !open.is_empty() {
+        let mut mids = Vec::new();
+        let mut next = Vec::new();
+        for (i, j) in open {
+            let (li, lj) = (l1[i].unwrap(), l1[j].unwrap());
+            if lj < li {
+                return Err(NodeErr::BadResponse(format!("parent-chain block went down between blocks {} and {}", blocks[i], blocks[j])));
+            }
+            if j <= i + 1 {
+                continue;
+            }
+            if li == lj {
+                for x in l1.iter_mut().take(j).skip(i + 1) {
+                    *x = Some(li);
+                }
+                continue;
+            }
+            let m = (i + j) / 2;
+            if l1[m].is_none() {
+                mids.push(m);
+            }
+            next.push((i, m));
+            next.push((m, j));
+        }
+        let want: Vec<u64> = mids.iter().map(|m| blocks[*m]).filter(|b| !known.contains_key(b)).collect();
+        known.extend(headers(node, &want, &mut out)?);
+        for m in mids {
+            l1[m] = known.get(&blocks[m]).map(|x| x.1);
+        }
+        open = next;
+    }
+    for (k, b) in blocks.iter().enumerate() {
+        let ts = match ts_of[b] {
+            Some(t) => t,
+            None => known.get(b).map(|x| x.0).ok_or_else(|| NodeErr::BadResponse(format!("no time for block {b}")))?,
+        };
+        let l = l1[k].ok_or_else(|| NodeErr::BadResponse(format!("no parent-chain block for block {b}")))?;
+        out.blocks.insert(*b, (ts, l));
+    }
+    Ok(out)
 }
 
 fn count_calls(items: &[MissItem], calls: &[(Address, Bytes)]) -> u64 {

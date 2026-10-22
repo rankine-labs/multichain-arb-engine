@@ -100,6 +100,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex, RwLock};
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use revm::primitives::{keccak256, Address, Bytes, B256, U256};
@@ -107,7 +108,8 @@ use serde_json::{json, Value};
 
 use super::coins::{balance_of_data, BalanceLayout};
 use super::fields::{self, apply_fields, core_slots, map_slot, obs_slot, sol, topic_addr, topics, v2};
-use super::loader::{out_word, Done, FetchOut, Job, LoaderStats, Loaders, NOT_YET};
+use super::loader::{out_word, CatchUpOut, Done, FetchOut, Job, LoaderStats, Loaders, NOT_YET};
+use super::persist;
 use super::overlay::Overlay;
 use super::replay::{apply_replay, finish_block};
 use super::walk::{read_walk, walks, WalkCfg};
@@ -589,6 +591,19 @@ c2counters!(
     // itself traded on (cheap); and checks where that smaller bound wasn't
     // enough and the full bound (every ready V4 pool) was used instead.
     pm_bound_route_only, pm_bound_full_retry,
+    // ---- copy2-n (warm restart, copy2/persist.rs) ----
+    // Saves of the copy to ARBSIM_COPY2_STATE_FILE: written / skipped
+    // (the previous one still writing) / failed; the longest time the intake
+    // thread spent preparing one (microseconds; the writing is elsewhere).
+    saves, saves_skipped, save_errors, save_prep_us_max,
+    // Pools taken over from the saved file at start; a file that was there
+    // but not usable (format, checksum, ...).
+    resume_pools, resume_refused,
+    // Catch-ups from the node's logs (start from a saved file, or a gap
+    // while running): started / done / failed (then: normal load / reload),
+    // blocks applied from them, reports read, late reports they found for
+    // blocks the copy already had.
+    catchups, catchups_done, catchups_failed, catchup_blocks, catchup_logs, catchup_late_found,
 );
 
 fn inc(c: &AtomicU64) {
@@ -680,6 +695,9 @@ pub struct C2Shared {
     /// was made from (checkview.rs; reused while the same lists apply).
     #[allow(clippy::type_complexity)]
     pub far_cache: Mutex<HashMap<Address, (Vec<Arc<Vec<U256>>>, Arc<Vec<U256>>)>>,
+    /// Warm restart (status `resume`): the saved file, the last save, the
+    /// current / last catch-up.
+    pub resume: Mutex<serde_json::Map<String, Value>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -694,6 +712,8 @@ pub enum Input {
     /// An answer from a loader thread.
     Done(Done),
     Stop,
+    /// Save the copy (warm restart), answer, then stop (SIGTERM / SIGINT).
+    Shutdown(SyncSender<Result<persist::SaveReport, String>>),
 }
 
 #[derive(Clone)]
@@ -822,6 +842,26 @@ impl Copy2Handle {
 
     pub fn stop(&self) {
         let _ = self.tx.send(Input::Stop);
+    }
+
+    /// Stop signal: the intake saves the copy (warm restart) and stops.
+    /// Waits at most `timeout` (pm2 kills the process after its
+    /// kill_timeout anyway, deploy/arbsim-pm2.sh).
+    pub fn shutdown(&self, timeout: Duration) -> Result<persist::SaveReport, String> {
+        let t0 = Instant::now();
+        let (rtx, rrx) = std::sync::mpsc::sync_channel(1);
+        let mut msg = Input::Shutdown(rtx);
+        loop {
+            match self.tx.try_send(msg) {
+                Ok(()) => break,
+                Err(std::sync::mpsc::TrySendError::Full(m)) if t0.elapsed() < timeout => {
+                    msg = m;
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(_) => return Err("the copy's thread is not taking messages".into()),
+            }
+        }
+        rrx.recv_timeout(timeout.saturating_sub(t0.elapsed())).map_err(|_| "timed out".to_string())?
     }
 
     /// Count the items a check found missing, by class (status): pool /
@@ -1145,6 +1185,8 @@ impl Copy2Handle {
             // changed one] (should stay empty; anything here: tell Claude).
             "unfollowedChanged": unfollowed_changed,
             "outsideContracts": self.sh.volatile.whole_len(),
+            // Warm restart (copy2/persist.rs): saved file, last save, catch-up.
+            "resume": Value::Object(self.c2.resume.lock().unwrap().clone()),
             // The node client's adaptive speed limit (dry run #16): the rate
             // allowed now, the plan rate, refusals by the provider.
             "nodeRate": self.sh.node.as_ref().map(|n| {
@@ -1253,6 +1295,28 @@ pub struct C2Config {
     /// waiting for this long is rescheduled (logged with its reason)
     /// [ARBSIM_COPY2_STALL_S, 30].
     pub stall_s: u64,
+    /// Warm restart (copy2/persist.rs): where the copy is saved
+    /// [ARBSIM_COPY2_STATE_FILE; unset = never saved / read; the runner
+    /// deploy/arbsim-run.sh sets <bot folder>/data/arbsim-copy2-state.bin],
+    /// how often [ARBSIM_COPY2_SAVE_S, 60] (and always at a stop signal).
+    pub state_file: Option<String>,
+    pub save_every_s: u64,
+    /// Catch-up from the node's logs: at most this many blocks between the
+    /// copy and the bot's first new block [ARBSIM_COPY2_RESUME_MAX_BLOCKS,
+    /// 18000 = ~30 min at ~10 blocks/s; 0 = never: the old reload]; beyond
+    /// it the pools load normally. Measured (tests/copy2_resume_anvil.rs
+    /// catch_up_cost): a 30 min gap costs ~40 requests / a few seconds,
+    /// a full load ~2,000+ requests and ~13 min with the tick walks.
+    pub resume_max_blocks: u64,
+    /// Blocks before the copy's block whose reports are read again (late
+    /// reports the copy may never have got) [ARBSIM_COPY2_RESUME_OVERLAP_BLOCKS, 64].
+    pub resume_overlap: u64,
+    /// Blocks per eth_getLogs range [ARBSIM_COPY2_RESUME_RANGE, 500]
+    /// (halved automatically when the node calls a range too big).
+    pub resume_range: u64,
+    /// A catch-up not done after this long gives up (normal load / reload)
+    /// [ARBSIM_COPY2_RESUME_TIMEOUT_S, 120].
+    pub resume_timeout_s: u64,
 }
 
 impl C2Config {
@@ -1278,10 +1342,16 @@ impl C2Config {
             verify_every_s: env_u64("ARBSIM_COPY2_VERIFY_S", 60),
             verify_max: env_u64("ARBSIM_COPY2_VERIFY_MAX", 400).clamp(1, 10_000) as usize,
             stall_s: env_u64("ARBSIM_COPY2_STALL_S", 30),
+            state_file: std::env::var("ARBSIM_COPY2_STATE_FILE").ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
+            save_every_s: env_u64("ARBSIM_COPY2_SAVE_S", 60).max(1),
+            resume_max_blocks: env_u64("ARBSIM_COPY2_RESUME_MAX_BLOCKS", 18_000),
+            resume_overlap: env_u64("ARBSIM_COPY2_RESUME_OVERLAP_BLOCKS", 64).max(1),
+            resume_range: env_u64("ARBSIM_COPY2_RESUME_RANGE", 500).max(1),
+            resume_timeout_s: env_u64("ARBSIM_COPY2_RESUME_TIMEOUT_S", 120).max(1),
         }
     }
     pub fn for_tests() -> Self {
-        C2Config { reload_ms: 0, reload_max_ms: 0, layout_retry_s: 3600, load_batch: 25, loaders: 2, keep_blocks: 400, max_keep_blocks: 4000, max_rounds: 40, tip_every_s: 0, catchup_max_blocks: 64, walk: WalkCfg::default(), walks_inflight: 2, walk_max_slots: 1_000_000, walk_max_rss_mb: 0, max_keep_logs: 1_000_000, pending_ms: 300, pm_bound: true, verify_every_s: 0, verify_max: 400, stall_s: 30 }
+        C2Config { reload_ms: 0, reload_max_ms: 0, layout_retry_s: 3600, load_batch: 25, loaders: 2, keep_blocks: 400, max_keep_blocks: 4000, max_rounds: 40, tip_every_s: 0, catchup_max_blocks: 64, walk: WalkCfg::default(), walks_inflight: 2, walk_max_slots: 1_000_000, walk_max_rss_mb: 0, max_keep_logs: 1_000_000, pending_ms: 300, pm_bound: true, verify_every_s: 0, verify_max: 400, stall_s: 30, state_file: None, save_every_s: 3600, resume_max_blocks: 18_000, resume_overlap: 64, resume_range: 500, resume_timeout_s: 60 }
     }
 }
 
@@ -1338,6 +1408,38 @@ enum JobFor {
     Logs { from: u64, to: u64 },
     /// Re-reading values nothing follows (dispatch_verify).
     Verify,
+    /// Warm restart / gap: the reports of a block range (copy2/loader.rs catch_up).
+    CatchUp,
+    /// Warm restart, stage 2: re-reading every value nothing follows.
+    ResumeVerify,
+}
+
+/// A catch-up from the node's logs in progress (see "warm restart" below).
+struct CatchUp {
+    /// Started from the saved file (else: a gap while running).
+    restored: bool,
+    /// Newest block the copy had applied.
+    applied: u64,
+    /// First block whose reports are read (the overlap before `applied`).
+    from: u64,
+    /// Last block to read; None = the block before the bot's first new one
+    /// (warm restart: not known until the bot sends it).
+    target: Option<u64>,
+    /// When the first read was sent (the time limit counts from here).
+    since: Option<Instant>,
+    job: Option<u64>,
+    /// Last block of the read in flight.
+    to: u64,
+    tries: u32,
+    retry_at: Instant,
+    /// Reports applied; stage 2 (restored only) still to do.
+    caught: bool,
+    verify_job: Option<u64>,
+    /// Why it started (log / status).
+    why: String,
+    started: Instant,
+    /// Node requests before it started (cost, for the log).
+    req0: u64,
 }
 
 /// One pool's part of a load job.
@@ -1451,6 +1553,24 @@ pub struct Intake {
     /// Process memory (MB) and when it was read (the walk guard reads it at
     /// most once a second).
     rss: std::cell::Cell<(f64, Option<Instant>)>,
+    // ---- warm restart (copy2/persist.rs) ----
+    /// Catch-up from the node's logs in progress: blocks are held meanwhile.
+    catchup: Option<CatchUp>,
+    /// The details of the newest block applied (fallback for the next
+    /// block's parent-chain block / base fee when a version has none).
+    last_ctx: Option<BlockCtx>,
+    /// Applying blocks read from the node's logs: their versions get no
+    /// block details (checks AT them answer not_ready, like copy 1's
+    /// repaired blocks), and their reports are complete (no "pending").
+    repairing: bool,
+    /// A gap the catch-up filled up to this block: the bot's next message
+    /// naming a block we never got is not a new gap.
+    gap_filled_until: Option<u64>,
+    /// The thread that writes saves; when the last save was prepared.
+    saver: Option<persist::Saver>,
+    last_save: Instant,
+    /// A stop signal asked for a final save (answered by run()).
+    shutdown: Option<SyncSender<Result<persist::SaveReport, String>>>,
 }
 
 /// Start the intake thread (+ loader threads).
@@ -1483,6 +1603,7 @@ pub fn manual(sh: Arc<Shared>, fills: Arc<FillQueue>, cfg: C2Config) -> (Intake,
         blocked_by: Mutex::new(HashMap::new()),
         unfollowed_changes: Mutex::new(HashMap::new()),
         far_cache: Mutex::new(HashMap::new()),
+        resume: Mutex::new(serde_json::Map::new()),
     });
     let loaders = sh
         .node
@@ -1541,7 +1662,22 @@ pub fn manual(sh: Arc<Shared>, fills: Arc<FillQueue>, cfg: C2Config) -> (Intake,
         last_stall_log: None,
         last_verify: Instant::now(),
         rss: std::cell::Cell::new((0.0, None)),
+        catchup: None,
+        last_ctx: None,
+        repairing: false,
+        gap_filled_until: None,
+        saver: None,
+        last_save: Instant::now(),
+        shutdown: None,
     };
+    let mut i = i;
+    if let Some(path) = i.cfg.state_file.clone() {
+        i.saver = Some(persist::Saver::spawn(path.clone()));
+        i.c2.resume.lock().unwrap().insert("file".into(), json!(path));
+        i.try_restore(&path);
+    } else {
+        i.c2.resume.lock().unwrap().insert("state".into(), json!("off (ARBSIM_COPY2_STATE_FILE not set)"));
+    }
     (i, Copy2Handle { tx, sh, c2 })
 }
 
@@ -1627,6 +1763,12 @@ impl Intake {
                 Err(RecvTimeoutError::Timeout) => {}
             }
             if !self.drain() {
+                return;
+            }
+            if let Some(reply) = self.shutdown.take() {
+                // Stop signal: apply what already came in, save, answer, stop.
+                self.work();
+                let _ = reply.send(self.save_now());
                 return;
             }
             self.work();
@@ -1730,6 +1872,7 @@ impl Intake {
             Input::Layouts(l) => self.on_layouts(l),
             Input::Done(d) => self.done.push_back(d),
             Input::Stop => {}
+            Input::Shutdown(reply) => self.shutdown = Some(reply),
         }
     }
 
@@ -1737,7 +1880,9 @@ impl Intake {
     /// for new blocks after each; then send new node jobs.
     pub fn work(&mut self) {
         loop {
-            while let Some((&b, _)) = self.pending.iter().next() {
+            // While catching up from the node's logs, blocks wait (they are
+            // applied after the blocks before them).
+            while let Some((&b, _)) = self.pending.iter().next().filter(|_| self.catchup.is_none()) {
                 let m = self.pending.remove(&b).unwrap();
                 self.process(m);
             }
@@ -1753,11 +1898,18 @@ impl Intake {
         }
         self.dispatch_tip();
         self.dispatch_delayed();
-        self.dispatch_loads();
-        self.dispatch_fills();
-        self.dispatch_walks();
-        self.dispatch_settle();
-        self.dispatch_verify();
+        self.dispatch_catchup();
+        // New loads / fills / walks / settles / re-reads wait for a catch-up
+        // (they would read at the copy's old block); work already running
+        // goes on.
+        if self.catchup.is_none() {
+            self.dispatch_loads();
+            self.dispatch_fills();
+            self.dispatch_walks();
+            self.dispatch_settle();
+            self.dispatch_verify();
+            self.maybe_save();
+        }
         self.note_round();
         self.watchdog();
         self.stall_watch();
@@ -1895,7 +2047,10 @@ impl Intake {
         // Lost message? The bot's previous message (prevBlock) must be one we
         // got. (Late messages for older blocks are normal, see header.)
         if let (Some(prev), Some(&first)) = (m.prev_block, self.received.first()) {
-            if prev >= first && !self.received.contains(&prev) {
+            // Blocks a catch-up just filled from the node's logs: the bot's
+            // "gap" (its start, an outage, ...) is already closed.
+            let filled = self.gap_filled_until.is_some_and(|t| m.block <= t + 1);
+            if prev >= first && !self.received.contains(&prev) && !filled {
                 inc(&st.gaps);
                 // prevBlock == this block is the bot saying "I missed something"
                 // (with its reason); anything else is a message lost between us.
@@ -1905,11 +2060,27 @@ impl Intake {
                     (None, false) => "message lost on the way".to_string(),
                 };
                 *self.c2.gap_reasons.lock().unwrap().entry(why.clone()).or_default() += 1;
+                // Warm restart / gap: fill the missing blocks from the node's
+                // logs (this message waits until they are applied), instead
+                // of reloading every pool. Only when that is not possible
+                // (too big, no node) or fails: the old reload.
+                if self.start_gap_catchup(m.block, &why) {
+                    eprintln!(
+                        "[arbsim] copy2: message(s) lost (bot's previous block {prev} never arrived; now at {}; why: {why}); filling the missing blocks from the node's logs",
+                        m.block
+                    );
+                    m.prev_block = None;
+                    self.pending.insert(m.block, m);
+                    return;
+                }
                 eprintln!("[arbsim] copy2: message(s) lost (bot's previous block {prev} never arrived; now at {}; why: {why}); reloading every pool", m.block);
                 self.reload_all_after_gap(&format!("lost message before block {}", m.block), m.block);
                 // The buffer has a hole: no load may carry across it.
                 self.buf.clear();
             }
+        }
+        if self.gap_filled_until.is_some_and(|t| m.block > t + 1) {
+            self.gap_filled_until = None;
         }
         if m.block > self.last_msg_block.unwrap_or(0) {
             self.last_msg_block = Some(m.block);
@@ -1946,18 +2117,24 @@ impl Intake {
             Some(h) => h,
             None => self.bootstrap(m.block),
         };
-        let ctx = self.block_ctx(&m, head.ctx.as_ref());
+        let prev_ctx = head.ctx.clone().or_else(|| self.last_ctx.clone());
+        let ctx = self.block_ctx(&m, prev_ctx.as_ref());
         let rctx = ReplayCtx { number: m.block, timestamp: m.timestamp, l1_number: ctx.l1_block_number };
         let mut logs: Vec<PoolLog> = m.logs.iter().filter(|l| !l.removed).cloned().collect();
         logs.sort_by_key(|l| (l.tx_index, l.log_index));
         if m.tick {
             inc(&st.ticks);
-            self.note_suspects(&m);
+            if !self.repairing {
+                self.note_suspects(&m);
+            }
             self.push_buf(m.block, rctx, Vec::new());
             self.publish(m.block, head.snap.clone(), ctx, StateDiff::default());
             return;
         }
-        self.note_suspects(&m);
+        // Blocks read from the node's logs are complete: nothing pending.
+        if !self.repairing {
+            self.note_suspects(&m);
+        }
         inc(&st.blocks);
         let mut ov = Overlay::from_arc(&head.snap);
         ov.set_position(StatePosition { base_block: m.block, after_seq: None });
@@ -2332,11 +2509,15 @@ impl Intake {
     }
 
     fn publish(&mut self, block: u64, snap: Arc<Snapshot>, ctx: BlockCtx, diff: StateDiff) {
+        self.last_ctx = Some(ctx.clone());
         let v = Version {
             seq: block.saturating_sub(self.sh.cfg.l2_offset),
             block,
             snap,
-            ctx: Some(ctx),
+            // A block filled in from the node's logs has no details a check
+            // could rely on (only what replays need): checks AT it answer
+            // not_ready ("repaired"), like copy 1's trace-repaired blocks.
+            ctx: if self.repairing { None } else { Some(ctx) },
             txs: vec![],
             diff: Arc::new(diff),
             restart: false,
@@ -2975,7 +3156,7 @@ impl Intake {
     fn on_done(&mut self, d: Done) {
         self.note_refusals(&d);
         let id = match &d {
-            Done::Fetch { id, .. } | Done::Probe { id, .. } | Done::Tip { id, .. } | Done::Trace { id, .. } | Done::Walk { id, .. } | Done::Logs { id, .. } => *id,
+            Done::Fetch { id, .. } | Done::Probe { id, .. } | Done::Tip { id, .. } | Done::Trace { id, .. } | Done::Walk { id, .. } | Done::Logs { id, .. } | Done::CatchUp { id, .. } => *id,
         };
         let Some(job) = self.jobs.remove(&id) else { return };
         match (job, d) {
@@ -3018,6 +3199,8 @@ impl Intake {
             (JobFor::Walk { key, gen }, Done::Walk { block, res, .. }) => self.on_walk(key, gen, block, res),
             (JobFor::Logs { from, to }, Done::Logs { res, .. }) => self.on_settle(from, to, res),
             (JobFor::Verify, Done::Fetch { block, res, .. }) => self.on_verify(block, res),
+            (JobFor::CatchUp, Done::CatchUp { id, res }) => self.on_catchup(id, res),
+            (JobFor::ResumeVerify, Done::Fetch { id, block, res }) => self.on_resume_verify(id, block, res),
             _ => {}
         }
     }
@@ -3142,7 +3325,8 @@ impl Intake {
             | Done::Tip { res: Err(e), .. }
             | Done::Trace { res: Err(e), .. }
             | Done::Walk { res: Err(e), .. }
-            | Done::Logs { res: Err(e), .. } => is_refusal(&e.to_string()),
+            | Done::Logs { res: Err(e), .. }
+            | Done::CatchUp { res: Err(e), .. } => is_refusal(&e.to_string()),
             _ => false,
         };
         if refused {
@@ -4537,6 +4721,671 @@ impl Intake {
         reconcile(&mut p.versions, k, &fresh);
         drop(p);
         self.sh.notify();
+    }
+
+    // ---- warm restart (copy2/persist.rs) ----
+    //
+    // Plain English:
+    //   SAVE: every ARBSIM_COPY2_SAVE_S and at a stop signal, the ready
+    //   pools' state is handed to the saver thread (persist.rs). Here only a
+    //   cheap copy is made (the head snapshot is shared, the pool list
+    //   cloned): measured ~ms for 650 pools (tests/copy2_resume_anvil.rs).
+    //   START: the saved copy becomes the copy at its block S, its pools
+    //   READY, but nothing is answered yet: blocks wait until the copy has
+    //   caught up. CATCH-UP: when the bot's first new block B arrives, every
+    //   report of our pools in blocks S-63..B-1 is read from the node's logs
+    //   (copy2/loader.rs catch_up: free node first, paid fallback, ranges of
+    //   ARBSIM_COPY2_RESUME_RANGE, each range's completeness proven by its
+    //   last block's header in the same request), with each block's time and
+    //   parent-chain block. Reports for blocks <= S the copy didn't have are
+    //   late reports (on_late, exact as always); blocks S+1..B-1 are applied
+    //   one by one through the normal block path (process), so every pool
+    //   moves exactly as if the bot had sent them. A pool whose report can't
+    //   be applied exactly goes unsure and reloads, as always. Then (only
+    //   after a restart) every held value nothing follows (coin settings,
+    //   ...) is read again at the new block: changed ones are replaced.
+    //   Only then do the waiting blocks go on and checks get answers.
+    //   GAPS WHILE RUNNING (the bot restarted, an outage it could not fill, a
+    //   lost message): the same catch-up from the copy's newest block instead
+    //   of reloading every pool.
+    //   Too big a gap (ARBSIM_COPY2_RESUME_MAX_BLOCKS), no node, or no
+    //   complete answer within ARBSIM_COPY2_RESUME_TIMEOUT_S: the old way
+    //   (normal load after a restart, reload of every pool after a gap).
+
+    fn set_resume(&self, k: &str, v: Value) {
+        self.c2.resume.lock().unwrap().insert(k.into(), v);
+    }
+
+    /// Read the saved copy at start (see above). A missing / unusable file
+    /// just means the normal load.
+    fn try_restore(&mut self, path: &str) {
+        let t0 = Instant::now();
+        if !Path::new(path).exists() {
+            eprintln!("[arbsim] copy2: no saved copy at {path}: loading every pool from the node");
+            self.set_resume("state", json!("no saved copy: normal load"));
+            return;
+        }
+        match persist::load(path, self.sh.volatile.clone()) {
+            Ok(st) => self.restore(st, t0),
+            Err(e) => {
+                inc(&self.c2.stats.resume_refused);
+                eprintln!("[arbsim] copy2: saved copy {path} not used ({e}): loading every pool from the node");
+                self.set_resume("state", json!(format!("saved copy not used ({e}): normal load")));
+            }
+        }
+    }
+
+    /// Take a saved copy over: the copy at its block, its pools ready,
+    /// waiting for the catch-up.
+    pub fn restore(&mut self, st: persist::State, t0: Instant) {
+        let block = st.block;
+        for a in &st.volatile_whole {
+            self.sh.volatile.add_whole(*a);
+        }
+        for a in &st.volatile_balance {
+            self.sh.volatile.add_balance(*a);
+        }
+        let snap = Snapshot { volatile: self.sh.volatile.clone(), pos: StatePosition { base_block: block, after_seq: None }, ..(*st.snap).clone() };
+        let (n_acc, n_slots, _) = snap.counts();
+        {
+            let mut p = crate::timing::TimedWrite::new(&self.sh.published);
+            p.versions.clear();
+            p.versions.push_back(Arc::new(Version {
+                seq: block.saturating_sub(self.sh.cfg.l2_offset),
+                block,
+                snap: Arc::new(snap),
+                // No details: nothing is answered AT the saved block (it may
+                // still lack late reports; the catch-up reads them again).
+                ctx: None,
+                txs: vec![],
+                diff: Arc::new(StateDiff::default()),
+                restart: true,
+                block_hash: None,
+                applied: Instant::now(),
+            }));
+            p.stalled = None;
+        }
+        self.last_block = Some(block);
+        self.last_msg_block = Some(block);
+        self.c2.last_block.store(block, Ordering::Relaxed);
+        self.c2.head_block.store(block, Ordering::Relaxed);
+        if let Some((ts, l1, bf)) = st.ctx {
+            self.last_ctx = Some(BlockCtx {
+                l1_block_number: l1,
+                l2_block_number: Some(block),
+                timestamp: ts,
+                basefee: bf,
+                coinbase: arb::arbos::BATCH_POSTER_ADDRESS,
+                gas_limit: arb::NITRO_BLOCK_GAS_LIMIT,
+                prevrandao: arb::NITRO_PREVRANDAO,
+            });
+            if bf > 0 {
+                self.basefee = bf;
+            }
+        }
+        let n_pools = st.pools.len();
+        {
+            let mut reg = crate::timing::TimedWrite::new(&self.c2.reg);
+            for (c, l) in &st.layouts {
+                reg.layouts.insert(*c, Some(*l));
+            }
+            for (k, s) in &st.pair_slots {
+                reg.pair_slots.insert(*k, *s);
+            }
+            for (e, lp) in st.pools {
+                let k = key_of(&e.pool);
+                if let Some(lp) = lp {
+                    self.last_pos.insert(k, lp);
+                }
+                reg.pools.insert(k, e);
+            }
+            reg.rebuild_index();
+        }
+        self.per_pool_coins.extend(st.per_pool_coins);
+        self.coin_ok.extend(st.coin_ok);
+        for (k, pos, base) in st.coins {
+            if let Some(p) = pos {
+                self.coin_pos.insert(k, p);
+            }
+            if let Some(b) = base {
+                self.coin_base.insert(k, b);
+            }
+        }
+        for (b, rctx, logs) in st.buf {
+            if !logs.is_empty() {
+                let touched = self.pools_touched(&logs);
+                self.recent.push_back((b, log_ids(&logs), touched));
+            }
+            self.received.insert(b);
+            self.buf.push_back(BufBlock { block: b, rctx, logs });
+        }
+        self.received.insert(block);
+        let from = self.overlap_from(block);
+        add(&self.c2.stats.resume_pools, n_pools as u64);
+        let age_s = persist::now_ms().saturating_sub(st.saved_ms) as f64 / 1000.0;
+        eprintln!(
+            "[arbsim] copy2: WARM RESTART from the saved copy: {n_pools} ready pool(s) at block {block} (saved {age_s:.0} s ago; {n_acc} accounts, {n_slots} values; read in {} ms). Catching up from the node's logs when the bot's first block arrives.",
+            t0.elapsed().as_millis()
+        );
+        self.set_resume("savedBlock", json!(block));
+        self.set_resume("savedPools", json!(n_pools));
+        self.set_resume("savedAgeS", json!(age_s.round()));
+        self.set_resume("state", json!(format!("restored {n_pools} pools at block {block}: waiting for the bot's first block to catch up")));
+        self.catchup = Some(CatchUp {
+            restored: true,
+            applied: block,
+            from,
+            target: None,
+            since: None,
+            job: None,
+            to: block,
+            tries: 0,
+            retry_at: Instant::now(),
+            caught: false,
+            verify_job: None,
+            why: "restart".into(),
+            started: Instant::now(),
+            req0: self.c2.node_requests.load(Ordering::Relaxed),
+        });
+    }
+
+    /// First block whose reports a catch-up from `applied` reads again: the
+    /// overlap, but not before the kept reports (they tell which reports
+    /// the copy already had).
+    fn overlap_from(&self, applied: u64) -> u64 {
+        let want = applied.saturating_sub(self.cfg.resume_overlap.saturating_sub(1));
+        match self.buf.front() {
+            Some(b) => want.max(b.block).min(applied + 1),
+            None => applied + 1,
+        }
+    }
+
+    /// The saved copy can't be brought forward: forget it, every pool loads
+    /// normally (as if there had been no file).
+    fn abandon_restore(&mut self) {
+        {
+            let mut p = crate::timing::TimedWrite::new(&self.sh.published);
+            p.versions.clear();
+        }
+        self.last_block = None;
+        self.last_msg_block = None;
+        self.c2.last_block.store(0, Ordering::Relaxed);
+        self.c2.head_block.store(0, Ordering::Relaxed);
+        self.buf.clear();
+        self.recent.clear();
+        self.received.clear();
+        self.last_pos.clear();
+        self.coin_pos.clear();
+        self.coin_base.clear();
+        self.partials.clear();
+        self.gap_filled_until = None;
+        let n = {
+            let mut reg = crate::timing::TimedWrite::new(&self.c2.reg);
+            let now = Instant::now();
+            for e in reg.pools.values_mut() {
+                e.state = PoolState::Loading;
+                e.reason = "loading: waiting for its turn".into();
+                e.retry_at = now;
+                e.busy = false;
+                e.gen += 1;
+                e.ready_since = 0;
+                e.base_block = 0;
+                e.ever_ready = false;
+                e.walk = None;
+                e.walked = Vec::new();
+                e.far_zero = None;
+                e.pending_from = None;
+            }
+            reg.pools.len()
+        };
+        if n > 0 {
+            self.outcomes = Outcomes::default();
+            self.last_progress = Instant::now();
+            self.round = Some((Instant::now(), self.c2.node_requests.load(Ordering::Relaxed), n));
+            *self.c2.load_round.lock().unwrap() = LoadRound { pools: n, ..Default::default() };
+        }
+    }
+
+    /// The copy's state for a save (cheap: the head snapshot is shared, the
+    /// ready pools' bookkeeping cloned). None = nothing to save now (a
+    /// catch-up is running: the file from before stays, or no pool ready).
+    pub fn save_state(&self) -> Option<persist::State> {
+        if self.catchup.is_some() {
+            return None;
+        }
+        let head = self.sh.head()?;
+        let block = head.block;
+        let overlap_from = block.saturating_sub(self.cfg.resume_overlap.saturating_sub(1));
+        let reg = self.c2.reg.read().unwrap();
+        let mut pools = Vec::new();
+        let mut strip: HashSet<(Address, U256)> = HashSet::new();
+        let mut saved_at: HashSet<Address> = HashSet::new();
+        let mut left_out: Vec<&PoolEntry> = Vec::new();
+        for (k, e) in reg.pools.iter() {
+            // Ready, nothing working on it, and any report it may still lack
+            // is inside the overlap the catch-up reads again.
+            let ok = e.state == PoolState::Ready
+                && !e.busy
+                && !self.partials.contains_key(k)
+                && e.ready_since <= block
+                && e.pending_from.is_none_or(|b| b >= overlap_from);
+            if ok {
+                pools.push((e.clone(), self.last_pos.get(k).copied()));
+                saved_at.insert(e.pool.address);
+            } else {
+                left_out.push(e);
+            }
+        }
+        if pools.is_empty() {
+            return None;
+        }
+        // Values of pools left out are not saved (they load normally).
+        for e in left_out {
+            strip.extend(e.items.iter().copied());
+            strip.extend(e.walked.iter().copied());
+            if !saved_at.contains(&e.pool.address) {
+                for c in [e.pool.token0, e.pool.token1] {
+                    if let Some(sl) = reg.bal_slot(c, e.pool.address) {
+                        strip.insert((c, sl));
+                    }
+                }
+            }
+        }
+        let layouts: Vec<(Address, BalanceLayout)> = reg.layouts.iter().filter_map(|(c, l)| l.map(|l| (*c, l))).collect();
+        let pair_slots: Vec<((Address, Address), U256)> = reg.pair_slots.iter().map(|(k, v)| (*k, *v)).collect();
+        drop(reg);
+        let mut coin_keys: HashSet<(Address, Address)> = self.coin_pos.keys().copied().collect();
+        coin_keys.extend(self.coin_base.keys().copied());
+        let coins = coin_keys
+            .into_iter()
+            .filter(|(_, h)| saved_at.contains(h))
+            .map(|k| (k, self.coin_pos.get(&k).copied(), self.coin_base.get(&k).copied()))
+            .collect();
+        let ctx = head.ctx.as_ref().or(self.last_ctx.as_ref()).map(|c| (c.timestamp, c.l1_block_number, c.basefee));
+        Some(persist::State {
+            block,
+            ctx,
+            saved_ms: persist::now_ms(),
+            snap: head.snap.clone(),
+            strip,
+            volatile_whole: self.sh.volatile.whole_list(),
+            volatile_balance: self.sh.volatile.balance_list(),
+            pools,
+            layouts,
+            pair_slots,
+            per_pool_coins: self.per_pool_coins.iter().copied().collect(),
+            coin_ok: self.coin_ok.iter().copied().collect(),
+            coins,
+            buf: self.buf.iter().filter(|b| b.block >= overlap_from).map(|b| (b.block, b.rctx, b.logs.clone())).collect(),
+        })
+    }
+
+    /// Every ARBSIM_COPY2_SAVE_S: hand the state to the saver thread.
+    fn maybe_save(&mut self) {
+        let Some(saver) = &self.saver else { return };
+        if self.last_save.elapsed() < Duration::from_secs(self.cfg.save_every_s) {
+            return;
+        }
+        self.last_save = Instant::now();
+        if let Some(Err(e)) = saver.last.lock().unwrap().take() {
+            inc(&self.c2.stats.save_errors);
+            self.set_resume("lastSaveError", json!(e));
+        }
+        let t0 = Instant::now();
+        let Some(st) = self.save_state() else { return };
+        let block = st.block;
+        let us = t0.elapsed().as_micros() as u64;
+        self.c2.stats.save_prep_us_max.fetch_max(us, Ordering::Relaxed);
+        if saver.offer(st) {
+            inc(&self.c2.stats.saves);
+            self.set_resume("lastSave", json!({ "block": block, "prepMs": us as f64 / 1000.0, "atMs": persist::now_ms() }));
+        } else {
+            inc(&self.c2.stats.saves_skipped);
+        }
+    }
+
+    /// Save now and wait for the file (stop signal; tests).
+    pub fn save_now(&mut self) -> Result<persist::SaveReport, String> {
+        let Some(saver) = &self.saver else { return Err("no state file (ARBSIM_COPY2_STATE_FILE)".into()) };
+        let t0 = Instant::now();
+        let Some(st) = self.save_state() else {
+            let why = if self.catchup.is_some() { "catching up: the saved copy from before stays" } else { "no ready pool" };
+            eprintln!("[arbsim] copy2: not saved ({why})");
+            return Err(why.into());
+        };
+        let prep = t0.elapsed();
+        let r = saver.save_and_wait(st, Duration::from_secs(20));
+        match &r {
+            Ok(rep) => {
+                inc(&self.c2.stats.saves);
+                eprintln!(
+                    "[arbsim] copy2: saved the copy for a warm restart: {} pools, {} values, {:.1} MB at block {} (prepared in {} ms, written in {:.0} ms)",
+                    rep.pools,
+                    rep.slots,
+                    rep.bytes as f64 / 1e6,
+                    rep.block,
+                    prep.as_millis(),
+                    rep.write_ms
+                );
+            }
+            Err(e) => {
+                inc(&self.c2.stats.save_errors);
+                eprintln!("[arbsim] copy2: saving the copy failed: {e}");
+            }
+        }
+        r
+    }
+
+    /// A gap before block `next` while running: catch it up from the
+    /// node's logs instead of reloading every pool (false = not possible:
+    /// the caller reloads as before).
+    fn start_gap_catchup(&mut self, next: u64, why: &str) -> bool {
+        if self.cfg.resume_max_blocks == 0 || self.loaders.is_none() || self.catchup.is_some() {
+            return false;
+        }
+        let Some(last) = self.last_block else { return false };
+        let to = next.saturating_sub(1).max(last);
+        if to - last > self.cfg.resume_max_blocks {
+            eprintln!(
+                "[arbsim] copy2: gap of {} blocks is more than ARBSIM_COPY2_RESUME_MAX_BLOCKS {}: reloading instead of catching up",
+                to - last,
+                self.cfg.resume_max_blocks
+            );
+            return false;
+        }
+        inc(&self.c2.stats.catchups);
+        self.catchup = Some(CatchUp {
+            restored: false,
+            applied: last,
+            from: self.overlap_from(last),
+            target: Some(to),
+            since: None,
+            job: None,
+            to,
+            tries: 0,
+            retry_at: Instant::now(),
+            caught: false,
+            verify_job: None,
+            why: why.to_string(),
+            started: Instant::now(),
+            req0: self.c2.node_requests.load(Ordering::Relaxed),
+        });
+        self.set_resume("state", json!(format!("catching up blocks {}..{to} ({why})", last + 1)));
+        true
+    }
+
+    /// Send the catch-up read (or stage 2) when due; give up when too late.
+    fn dispatch_catchup(&mut self) {
+        let Some(cu) = &self.catchup else { return };
+        if cu.job.is_some() || cu.verify_job.is_some() {
+            return;
+        }
+        if cu.since.is_some_and(|t| t.elapsed() > Duration::from_secs(self.cfg.resume_timeout_s)) {
+            let why = format!("no complete answer from the node within {} s (ARBSIM_COPY2_RESUME_TIMEOUT_S)", self.cfg.resume_timeout_s);
+            self.catchup_failed(&why);
+            return;
+        }
+        if cu.retry_at > Instant::now() {
+            return;
+        }
+        if cu.caught {
+            self.dispatch_resume_verify();
+            return;
+        }
+        let applied = cu.applied;
+        // Up to the block before the bot's first new one.
+        let to = match cu.target {
+            Some(t) => t,
+            None => match self.pending.range(applied + 1..).next() {
+                Some((b, _)) => b - 1,
+                None => return, // waiting for the bot
+            },
+        };
+        if to - applied > self.cfg.resume_max_blocks {
+            let why = format!("{} blocks to catch up, more than ARBSIM_COPY2_RESUME_MAX_BLOCKS {}", to - applied, self.cfg.resume_max_blocks);
+            self.catchup_failed(&why);
+            return;
+        }
+        if self.loaders.is_none() {
+            self.catchup_failed("no node configured");
+            return;
+        }
+        let filters = {
+            let reg = self.c2.reg.read().unwrap();
+            let keys: HashSet<PoolKey> = reg.pools.keys().copied().collect();
+            settle_filters(&reg, &keys)
+        };
+        let from = cu.from;
+        let id = self.new_job(JobFor::CatchUp);
+        let cu = self.catchup.as_mut().unwrap();
+        cu.job = Some(id);
+        cu.to = to;
+        cu.since.get_or_insert_with(Instant::now);
+        let state = format!("reading the reports of blocks {from}..{to} from the node ({})", cu.why);
+        self.set_resume("state", json!(state));
+        if filters.is_empty() {
+            // No pool to read reports for: nothing to catch up.
+            self.jobs.remove(&id);
+            self.on_catchup(id, Ok(CatchUpOut::default()));
+            return;
+        }
+        self.loaders.as_ref().unwrap().send(Job::CatchUp { id, from, to, filters, range: self.cfg.resume_range });
+    }
+
+    /// The reports of the catch-up range came back: apply them (see above).
+    fn on_catchup(&mut self, id: u64, res: Result<CatchUpOut, crate::node::NodeErr>) {
+        let Some(cu) = self.catchup.as_mut().filter(|c| c.job == Some(id)) else { return };
+        cu.job = None;
+        let out = match res {
+            Ok(o) => o,
+            Err(e) => {
+                let m = e.to_string();
+                cu.tries += 1;
+                let not_yet = m.contains(NOT_YET) || m.contains(crate::node::SPEED_LIMIT);
+                cu.retry_at = Instant::now() + if not_yet { Duration::from_millis(300) } else { backoff(cu.tries) };
+                let tries = cu.tries;
+                if !not_yet {
+                    self.note_node_error(&format!("catch-up: {m}"));
+                    if tries <= 3 {
+                        eprintln!("[arbsim] copy2: catch-up read failed ({m}); trying again");
+                    }
+                }
+                return;
+            }
+        };
+        let (from, to, applied, restored) = (cu.from, cu.to, cu.applied, cu.restored);
+        let t0 = Instant::now();
+        // Our pools' reports only (the filters can match more), by block.
+        let mut logs: Vec<PoolLog> = Vec::new();
+        for v in &out.logs {
+            let Some(b) = num(v.get("blockNumber")) else { continue };
+            if b < from || b > to {
+                continue;
+            }
+            if let Ok(l) = parse_log(v, b) {
+                if !l.removed {
+                    logs.push(l);
+                }
+            }
+        }
+        logs.retain(|l| {
+            !self.pool_keys_for(l).is_empty()
+                || coin_transfer(l).is_some_and(|(c, f, t, _)| {
+                    let reg = self.c2.reg.read().unwrap();
+                    reg.holders.get(&c).is_some_and(|h| h.contains(&f) || h.contains(&t))
+                })
+        });
+        let n_logs = logs.len();
+        let groups = persist::by_block(logs);
+        // 1. Blocks the copy has: reports it never got are late reports.
+        let mut late = 0usize;
+        for (b, ls) in groups.range(..=applied) {
+            let time = out.blocks.get(b).map(|(ts, l1)| (*ts, Some(*l1)));
+            late += self.on_late_at(*b, ls.clone(), time);
+        }
+        // 2. Blocks after it: applied one by one, like the bot's messages.
+        let mut blocks = 0u64;
+        self.repairing = true;
+        for (b, ls) in groups.range(applied + 1..) {
+            let Some(&(ts, l1)) = out.blocks.get(b) else {
+                // Never without its time (catch_up gives every block's).
+                self.repairing = false;
+                self.catchup_failed(&format!("no time for block {b}"));
+                return;
+            };
+            blocks += 1;
+            self.process(BlockMsg { block: *b, timestamp: ts, l1_block: Some(l1), base_fee: None, prev_block: None, logs: ls.clone(), tick: false, gap_reason: None, bloom: None });
+        }
+        self.repairing = false;
+        // Every block up to `to` is in the copy now (quiet ones had nothing).
+        for b in (applied + 1).max(to.saturating_sub(4095))..=to {
+            self.received.insert(b);
+        }
+        while self.received.len() > 4096 {
+            self.received.pop_first();
+        }
+        if to > self.last_msg_block.unwrap_or(0) {
+            self.last_msg_block = Some(to);
+        }
+        self.gap_filled_until = Some(to);
+        add(&self.c2.stats.catchup_blocks, blocks);
+        add(&self.c2.stats.catchup_logs, n_logs as u64);
+        add(&self.c2.stats.catchup_late_found, late as u64);
+        let (ready, unsure, loading) = {
+            let reg = self.c2.reg.read().unwrap();
+            let (l, r, u) = reg.counts();
+            (r, u, l)
+        };
+        let cu = self.catchup.as_mut().unwrap();
+        cu.caught = true;
+        let secs = cu.started.elapsed().as_secs_f64();
+        let why = cu.why.clone();
+        let reqs = self.c2.node_requests.load(Ordering::Relaxed) - cu.req0;
+        eprintln!(
+            "[arbsim] copy2: caught up blocks {}..{to} from the node's logs ({}): {n_logs} reports in {blocks} blocks applied in {} ms, {late} late report(s) for older blocks; {} requests ({} public, {} paid, {} headers{}); now {ready} ready, {loading} loading, {unsure} unsure; {secs:.1} s since start",
+            applied + 1,
+            why,
+            t0.elapsed().as_millis(),
+            reqs,
+            out.public_requests,
+            out.paid_requests,
+            out.headers,
+            if out.splits > 0 { format!(", {} ranges split", out.splits) } else { String::new() },
+        );
+        self.set_resume(
+            "lastCatchUp",
+            json!({ "why": why, "fromBlock": applied + 1, "toBlock": to, "blocks": blocks, "reports": n_logs, "lateReports": late,
+                    "requests": reqs, "publicRequests": out.public_requests, "paidRequests": out.paid_requests, "headers": out.headers,
+                    "seconds": (secs * 10.0).round() / 10.0, "ready": ready, "unsure": unsure, "loading": loading }),
+        );
+        if restored {
+            self.dispatch_resume_verify();
+        } else {
+            self.finish_catchup();
+        }
+    }
+
+    /// Stage 2 after a restart: re-read (exactly at the copy's block) every
+    /// held value nothing follows; changed ones are replaced, unreadable
+    /// ones forgotten.
+    fn dispatch_resume_verify(&mut self) {
+        let Some(head) = self.sh.head() else {
+            self.finish_catchup();
+            return;
+        };
+        let items = self.unfollowed_items(&head.snap);
+        if items.is_empty() || self.loaders.is_none() {
+            self.finish_catchup();
+            return;
+        }
+        let n = items.len();
+        let id = self.new_job(JobFor::ResumeVerify);
+        if let Some(cu) = self.catchup.as_mut() {
+            cu.verify_job = Some(id);
+        }
+        self.set_resume("state", json!(format!("re-reading {n} held value(s) nothing follows at block {}", head.block)));
+        self.loaders.as_ref().unwrap().send(Job::Fetch { id, block: head.block, exact: true, bulk: false, items, calls: vec![] });
+    }
+
+    fn on_resume_verify(&mut self, id: u64, k: u64, res: Result<FetchOut, crate::node::NodeErr>) {
+        let Some(cu) = self.catchup.as_mut().filter(|c| c.verify_job == Some(id)) else { return };
+        cu.verify_job = None;
+        let out = match res {
+            Ok(o) if !o.items.iter().any(|(_, r)| matches!(r, Err(ItemErr::BlockUnavailable))) => o,
+            other => {
+                cu.tries += 1;
+                let not_yet = match &other {
+                    Ok(_) => true,
+                    Err(e) => e.to_string().contains(NOT_YET) || e.to_string().contains(crate::node::SPEED_LIMIT),
+                };
+                cu.retry_at = Instant::now() + if not_yet { Duration::from_millis(300) } else { backoff(cu.tries) };
+                return;
+            }
+        };
+        // Values the node could not give: forgotten (read again when needed).
+        let unreadable: Vec<(Address, U256)> = out
+            .items
+            .iter()
+            .filter_map(|(it, r)| match (it, r) {
+                (MissItem::Slot(a, s), Err(_)) => Some((*a, *s)),
+                _ => None,
+            })
+            .collect();
+        let n = out.items.len();
+        let before = self.c2.stats.unfollowed_changed.load(Ordering::Relaxed);
+        self.on_verify(k, Ok(out));
+        let changed = self.c2.stats.unfollowed_changed.load(Ordering::Relaxed) - before;
+        if !unreadable.is_empty() {
+            let mut p = crate::timing::TimedWrite::new(&self.sh.published);
+            rewrite_from(&mut p.versions, 0, |s| {
+                for (a, sl) in &unreadable {
+                    forget_slot(s, *a, *sl);
+                }
+            });
+        }
+        eprintln!(
+            "[arbsim] copy2: re-read {n} held value(s) nothing follows at block {k}: {changed} changed while the sidecar was down (replaced), {} unreadable (forgotten)",
+            unreadable.len()
+        );
+        self.finish_catchup();
+    }
+
+    /// Catch-up done: the waiting blocks go on, checks get answers again.
+    fn finish_catchup(&mut self) {
+        let Some(cu) = self.catchup.take() else { return };
+        inc(&self.c2.stats.catchups_done);
+        self.last_save = Instant::now() - Duration::from_secs(self.cfg.save_every_s.saturating_sub(5));
+        let state = format!(
+            "{} at {}: caught up from block {} in {:.1} s",
+            if cu.restored { "warm restart done" } else { "gap filled" },
+            self.last_block.unwrap_or(0),
+            cu.applied,
+            cu.started.elapsed().as_secs_f64()
+        );
+        if cu.restored {
+            eprintln!("[arbsim] copy2: {state}; answering checks again");
+        }
+        self.set_resume("state", json!(state));
+        self.sh.notify();
+    }
+
+    /// Catch-up not possible: after a restart every pool loads normally;
+    /// after a gap every pool is reloaded (the old way).
+    fn catchup_failed(&mut self, why: &str) {
+        let Some(cu) = self.catchup.take() else { return };
+        inc(&self.c2.stats.catchups_failed);
+        if cu.restored {
+            eprintln!("[arbsim] copy2: warm restart not possible ({why}): loading every pool from the node");
+            self.set_resume("state", json!(format!("warm restart not possible ({why}): normal load")));
+            self.abandon_restore();
+        } else {
+            eprintln!("[arbsim] copy2: catching up the gap after block {} failed ({why}): reloading every pool", cu.applied);
+            self.set_resume("state", json!(format!("gap after block {} not filled ({why}): every pool reloaded", cu.applied)));
+            self.reload_all_after_gap(&format!("lost message after block {} (catch-up failed)", cu.applied), cu.applied + 1);
+            // The buffer has a hole: no load may carry across it.
+            self.buf.clear();
+            self.gap_filled_until = None;
+        }
     }
 
     // ---- upkeep ----
