@@ -86,6 +86,24 @@ pm2_app_status() {
     });' "$ARBSIM_APP"
 }
 
+# pm2_app_mem_limit_mb -> the memory restart limit pm2 has for the arbsim
+# app, in MB (empty when unknown / not set / app missing).
+pm2_app_mem_limit_mb() {
+  pm2 jlist 2>/dev/null | node -e '
+    let s = ""; process.stdin.on("data", d => s += d).on("end", () => {
+      try {
+        const p = JSON.parse(s).find(x => x.name === process.argv[1]);
+        let v = p && p.pm2_env ? p.pm2_env.max_memory_restart : undefined;
+        if (typeof v === "string") {
+          const m = v.trim().match(/^([0-9.]+)\s*([KMG]?)B?$/i);
+          const mul = { "": 1, K: 1024, M: 1048576, G: 1073741824 };
+          v = m ? Number(m[1]) * mul[m[2].toUpperCase()] : NaN;
+        }
+        console.log(typeof v === "number" && v > 0 ? Math.round(v / 1048576) : "");
+      } catch { console.log(""); }
+    });' "$ARBSIM_APP"
+}
+
 # smoke_test FILE -> succeeds if FILE runs on this server (right CPU, new
 # enough system libraries) and is really arbsim: run with no arguments it
 # prints its usage line and exits with code 2. Touches nothing.

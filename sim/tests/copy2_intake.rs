@@ -1676,3 +1676,52 @@ fn provider_refusing_for_rps_makes_us_slow_down_instead_of_storming() {
     assert!(st["ready"].as_u64().unwrap() > 0, "loading must go on (slower): {st}");
     h.stop();
 }
+
+/// Memory (dry run #18 sizing): while a slow load holds old blocks of
+/// reports, the buffer is bounded in REPORTS (ARBSIM_COPY2_MAX_KEEP_LOGS),
+/// not only in blocks: past keep_blocks the oldest blocks go once too many
+/// reports are kept.
+#[test]
+fn kept_reports_are_bounded_while_a_slow_load_holds_them() {
+    let cfg = C2Config { keep_blocks: 16, max_keep_blocks: 4000, max_keep_logs: 200, ..C2Config::for_tests() };
+    let mut r = rig_with(cfg);
+    *r.chain.delay_ms.lock().unwrap() = 1500;
+    let pools: Vec<Value> = vec![json!({"address": format!("{}", a(V2P)), "kind": "v2", "token0": format!("{}", a(COIN0)), "token1": format!("{}", a(COIN1))})];
+    assert_eq!(r.h.track_json(&json!(1), &json!({"type": "track", "pools": pools, "coinSlots": {format!("{:#x}", a(COIN0)): {"layout": "solidity", "slot": 0}, format!("{:#x}", a(COIN1)): {"layout": "solidity", "slot": 0}}}))["ok"], json!(true));
+    r.h.block(tick(100, 60));
+    r.intake.pump();
+    // 100 blocks x 10 reports of other coins while the load is in flight.
+    for b in 101..201u64 {
+        let logs: Vec<PoolLog> = (0..10u32).map(|i| transfer(a(0x55), a(USER), a(0x56), 1, b, i, 0)).collect();
+        r.h.block(msg(b, 60 + b, logs));
+        r.intake.pump();
+    }
+    let (blocks, reports) = r.intake.buffered();
+    assert!(blocks >= 16, "keep_blocks are always kept: {blocks}");
+    assert!(reports <= 200, "{reports} reports kept in {blocks} blocks (cap 200)");
+    // Without the report cap the load in flight would hold all ~100 blocks.
+    let cfg2 = C2Config { keep_blocks: 16, max_keep_blocks: 4000, max_keep_logs: 1_000_000, ..C2Config::for_tests() };
+    let mut r2 = rig_with(cfg2);
+    *r2.chain.delay_ms.lock().unwrap() = 1500;
+    let pools: Vec<Value> = vec![json!({"address": format!("{}", a(V2P)), "kind": "v2", "token0": format!("{}", a(COIN0)), "token1": format!("{}", a(COIN1))})];
+    r2.h.track_json(&json!(1), &json!({"type": "track", "pools": pools, "coinSlots": {format!("{:#x}", a(COIN0)): {"layout": "solidity", "slot": 0}, format!("{:#x}", a(COIN1)): {"layout": "solidity", "slot": 0}}}));
+    r2.h.block(tick(100, 60));
+    r2.intake.pump();
+    for b in 101..201u64 {
+        let logs: Vec<PoolLog> = (0..10u32).map(|i| transfer(a(0x55), a(USER), a(0x56), 1, b, i, 0)).collect();
+        r2.h.block(msg(b, 60 + b, logs));
+        r2.intake.pump();
+    }
+    assert!(r2.intake.buffered().1 > 500, "control: the slow load holds the blocks: {:?}", r2.intake.buffered());
+    // The load still finishes (it may start over) and the pool gets ready.
+    *r.chain.delay_ms.lock().unwrap() = 0;
+    r.settle();
+    let t0 = std::time::Instant::now();
+    let mut b = 201u64;
+    while r.state(&v2_pool()).0 != PoolState::Ready && t0.elapsed().as_secs() < 10 {
+        r.send(tick(b, 100 + b));
+        b += 1;
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(r.state(&v2_pool()).0, PoolState::Ready, "{:?}", r.state(&v2_pool()));
+}

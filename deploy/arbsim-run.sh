@@ -48,6 +48,14 @@ fi
 mkdir -p "$APP_DIR/data"
 export ARBSIM_BUDGET_FILE="${ARBSIM_BUDGET_FILE:-$APP_DIR/data/arbsim-node-budget.json}"
 
+# Memory: at most 2 malloc "arenas" (glibc's default is 8 per CPU core).
+# The sidecar runs ~20 threads (16 node workers parse big JSON answers);
+# each extra arena keeps its own freed-but-not-returned memory, so with many
+# arenas the process size (what pm2's memory limit sees) drifts far above
+# what is really in use. 2 arenas cost nothing measurable in speed here.
+# (MALLOC_ARENA_MAX already set in the environment wins.)
+export MALLOC_ARENA_MAX="${MALLOC_ARENA_MAX:-2}"
+
 # Same socket the bot uses (bot default /tmp/arbsim.sock, or ARBSIM_SOCKET).
 SOCKET="${ARBSIM_SOCKET:-/tmp/arbsim.sock}"
 

@@ -68,7 +68,8 @@ Turning it on for the first time:
 3. `pm2 restart dex-arb-shadow --update-env` (so the bot reads `LOCAL_SIM`).
 
 pm2 settings: app name `arbsim`, low priority (`nice 5`), restarted above
-150 MB memory, crash restarts wait longer each time (1 s up to 15 s), log
+400 MB memory (a fully tick-walked copy of ~800 pools measured ~100-145 MB;
+see deploy/arbsim-pm2.sh), crash restarts wait longer each time (1 s up to 15 s), log
 lines timestamped, logs rotated by pm2-logrotate. After a server reboot it
 comes back by itself within 2 minutes (auto-deploy), no `pm2 save` needed.
 
@@ -127,7 +128,7 @@ Fastest first. None of these touch the bot's trading.
 3. Send Claude the output of `bash deploy/arbsim-pm2.sh status` and
    `pm2 logs arbsim --lines 100`. Things to look for:
    - `mismatch` above zero in "Self-check vs node"
-   - memory near 150 MB, or `pm2 status` showing many restarts
+   - memory near 400 MB (new tick walks pause at 300 MB), or `pm2 status` showing many restarts
    - "Paid node use today" near its cap, or "refused"
    - "NOT READY" for more than a few minutes while the bot is running
 
@@ -173,7 +174,10 @@ and nothing else. Node links are never printed, and never stored in pm2.
 | `ARBSIM_GAP_WAIT_MS` | 1500 | wait for missing feed messages before looking them up |
 | `ARBSIM_MAX_FILL_ROUNDS` | 12 | fetch rounds before giving up on a message |
 | `ARBSIM_MAX_ACCOUNTS` | 50000 | memory cap: accounts |
-| `ARBSIM_MAX_SLOTS` | 250000 | memory cap: storage values |
+| `ARBSIM_MAX_SLOTS` | 250000 | memory cap: storage values (copy 2: not counting our pools / coins, which are always kept) |
+| `ARBSIM_COPY2_WALK_MAX_SLOTS` | 600000 | copy 2: most tick-walked values in total (~2x all ~800 pools) |
+| `ARBSIM_COPY2_WALK_MAX_RSS_MB` | 300 (0 = off) | copy 2: no new tick walks while the program uses more memory than this |
+| `ARBSIM_COPY2_MAX_KEEP_LOGS` | 150000 | copy 2: most pool reports kept for slow loads (beyond the 10 minutes always kept) |
 | `ARBSIM_IDLE_EVICT_S` | 21600 (6 h) | drop accounts unused this long |
 | `ARBSIM_HEADER_EVERY_S` | 300 | block-header refresh |
 | `ARBSIM_MAX_WARM` | 20000 | most "warm-up" items kept |

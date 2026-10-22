@@ -192,6 +192,23 @@ impl Carry {
         }
     }
 
+    /// The account this value belongs to (None = no longer valid).
+    fn account(&self) -> Option<Address> {
+        match self {
+            Carry::Void => None,
+            Carry::Slot { a, .. } | Carry::Basics { a, .. } => Some(*a),
+        }
+    }
+
+    /// Only the code part of `learn` (the account itself came shared from
+    /// the previous version, see reconcile).
+    fn put_code(&self, snap: &mut Snapshot) {
+        if let Carry::Basics { info: Some(i), code: Some(c), .. } = self {
+            let h = if i.code_hash.is_zero() { KECCAK_EMPTY } else { i.code_hash };
+            snap.put_code(h, c.clone());
+        }
+    }
+
     /// Write the value into a snapshot unless it already knows it exactly.
     fn learn(&self, snap: &mut Snapshot) -> bool {
         match self {
@@ -237,6 +254,16 @@ impl Carry {
                 true
             }
         }
+    }
+}
+
+/// Same account knowledge AND the very same storage tree (no content
+/// comparison: a shared tree is what makes it cheap).
+fn same_acct(x: Option<&Acct>, y: Option<&Acct>) -> bool {
+    match (x, y) {
+        (None, None) => true,
+        (Some(x), Some(y)) => x.storage.ptr_eq(&y.storage) && x.basics == y.basics && x.balance_exact == y.balance_exact && x.storage_complete == y.storage_complete,
+        _ => false,
     }
 }
 
@@ -291,11 +318,47 @@ pub fn reconcile(versions: &mut VecDeque<Arc<Version>>, k: u64, fetched: &[Fetch
     let mut carry: Vec<Carry> = fetched.iter().map(Carry::from_fetched).collect();
     let n = versions.len();
     let mut newest_learned = vec![false; carry.len()];
+    // MEMORY (dry run #18): learning the same values separately into every
+    // kept version gave each version its OWN copy of the account's storage
+    // tree (a tick walk = ~400 values per pool, x every version between the
+    // walk's block and now: hundreds of MB while walks ran). Instead, a
+    // version whose account did not change in its block takes the previous
+    // (already rebuilt) version's account as is: one shared copy. The result
+    // is identical: same old content + the same carried values (a block
+    // that doesn't mention the account can't move them).
+    //   prev = (old snapshot, rebuilt snapshot, learned flags) of version i-1.
+    let mut prev: Option<(Arc<Snapshot>, Arc<Snapshot>, Vec<bool>)> = None;
+    let carried_accts: Vec<Address> = {
+        let mut v: Vec<Address> = carry.iter().filter_map(|c| c.account()).collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    };
     for i in start..n {
         let v = versions[i].clone();
         if v.block > k && v.restart {
             // A restart point: nothing older than it can be carried across.
             break;
+        }
+        if v.block > k && v.txs.is_empty() {
+            if let Some((p_old, p_new, p_learned)) = &prev {
+                // A block that changed nothing (a tick: the very same
+                // snapshot as before): the rebuilt previous one, shared whole.
+                if Arc::ptr_eq(p_old, &v.snap) {
+                    for c in carry.iter_mut() {
+                        c.advance(&v.diff);
+                    }
+                    let learned = p_learned.clone();
+                    if i == n - 1 {
+                        newest_learned = learned.clone();
+                    }
+                    if !Arc::ptr_eq(p_old, p_new) {
+                        versions[i] = Arc::new(Version { snap: p_new.clone(), ..(*v).clone() });
+                    }
+                    prev = Some((v.snap.clone(), p_new.clone(), learned));
+                    continue;
+                }
+            }
         }
         let mut txs = v.txs.clone();
         if v.block > k {
@@ -319,15 +382,53 @@ pub fn reconcile(versions: &mut VecDeque<Arc<Version>>, k: u64, fetched: &[Fetch
         }
         let mut s = (*v.snap).clone();
         let mut any = false;
+        // Accounts this block left alone: take the rebuilt previous
+        // version's account (shared storage tree), see above.
+        let mut shared: Vec<Address> = Vec::new();
+        if let (Some((p_old, p_new, _)), true) = (&prev, v.block > k && v.txs.is_empty()) {
+            for a in &carried_accts {
+                if v.diff.accounts.contains_key(a) || !same_acct(p_old.accounts.get(a), v.snap.accounts.get(a)) {
+                    continue;
+                }
+                match (p_new.accounts.get(a), p_old.accounts.get(a)) {
+                    (Some(nw), old) => {
+                        // Unchanged by learning in version i-1 too: nothing to share.
+                        if !same_acct(Some(nw), old) {
+                            s.accounts.insert(*a, nw.clone());
+                            any = true;
+                        }
+                        shared.push(*a);
+                    }
+                    (None, _) => {}
+                }
+            }
+        }
+        let mut learned = vec![false; carry.len()];
         for (j, c) in carry.iter().enumerate() {
-            let l = c.learn(&mut s);
+            let l = match (&prev, c.account()) {
+                // Shared account: learned here exactly when it was learned
+                // into version i-1 (same base, same carried value). Its code
+                // (by hash) must be in this version's code map too.
+                (Some((_, _, p_learned)), Some(a)) if shared.binary_search(&a).is_ok() => {
+                    if p_learned[j] {
+                        c.put_code(&mut s);
+                    }
+                    p_learned[j]
+                }
+                _ => c.learn(&mut s),
+            };
+            learned[j] = l;
             any |= l;
             if i == n - 1 {
                 newest_learned[j] = l;
             }
         }
         if any || txs.iter().zip(v.txs.iter()).any(|(a, b)| !Arc::ptr_eq(&a.snap, &b.snap)) {
-            versions[i] = Arc::new(Version { snap: Arc::new(s), txs, ..(*v).clone() });
+            let snap = Arc::new(s);
+            prev = Some((v.snap.clone(), snap.clone(), learned));
+            versions[i] = Arc::new(Version { snap, txs, ..(*v).clone() });
+        } else {
+            prev = Some((v.snap.clone(), v.snap.clone(), learned));
         }
     }
     for (l, c) in newest_learned.into_iter().zip(carry.iter()) {
@@ -488,5 +589,208 @@ mod tests {
         }
         assert_eq!(q.len(), 16);
         assert!(q.dropped() > 0);
+    }
+
+    // ---- reconcile shares unchanged accounts across versions (dry run #18) ----
+
+    /// The reconcile before the memory fix (every version learns on its own):
+    /// the reference the shared version must equal exactly.
+    fn reconcile_reference(versions: &mut VecDeque<Arc<Version>>, k: u64, fetched: &[Fetched]) -> FillResult {
+        let mut res = FillResult::default();
+        let Some(start) = versions.iter().position(|v| v.block >= k) else {
+            res.too_old = fetched.len();
+            return res;
+        };
+        if versions[start].block > k {
+            res.too_old = fetched.len();
+            return res;
+        }
+        let mut carry: Vec<Carry> = fetched.iter().map(Carry::from_fetched).collect();
+        let n = versions.len();
+        let mut newest = vec![false; carry.len()];
+        for i in start..n {
+            let v = versions[i].clone();
+            if v.block > k && v.restart {
+                break;
+            }
+            if v.block > k {
+                for c in carry.iter_mut() {
+                    c.advance(&v.diff);
+                }
+            }
+            let mut s = (*v.snap).clone();
+            let mut any = false;
+            for (j, c) in carry.iter().enumerate() {
+                let l = c.learn(&mut s);
+                any |= l;
+                if i == n - 1 {
+                    newest[j] = l;
+                }
+            }
+            if any {
+                versions[i] = Arc::new(Version { snap: Arc::new(s), ..(*v).clone() });
+            }
+        }
+        for (l, c) in newest.into_iter().zip(carry.iter()) {
+            if matches!(c, Carry::Void) {
+                res.too_old += 1;
+            } else if l {
+                res.applied += 1;
+            } else {
+                res.already_known += 1;
+            }
+        }
+        res
+    }
+
+    /// Everything a snapshot knows, comparable.
+    fn content(s: &Snapshot) -> Vec<(Address, String, bool, bool, Vec<(U256, U256)>)> {
+        let mut v: Vec<_> = s
+            .accounts
+            .iter()
+            .map(|(a, x)| {
+                let mut st: Vec<(U256, U256)> = x.storage.iter().map(|(k, v)| (*k, *v)).collect();
+                st.sort();
+                (*a, format!("{:?}", x.basics), x.balance_exact, x.storage_complete, st)
+            })
+            .collect();
+        v.sort_by(|x, y| x.0.cmp(&y.0));
+        v
+    }
+
+    /// Small seeded random numbers.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    /// A chain of versions built the way copy 2 builds them: each block from
+    /// the previous one plus its changes (ticks = the very same snapshot),
+    /// sometimes a slot forgotten without a diff, sometimes a value learned
+    /// into one version only (an earlier fill), an account forgotten, a
+    /// restart point.
+    fn random_chain(r: &mut Rng, blocks: u64) -> VecDeque<Arc<Version>> {
+        let mut vs: VecDeque<Arc<Version>> = VecDeque::new();
+        let mut s = Snapshot::default();
+        for acct in 1..=6u8 {
+            for sl in 0..20u64 {
+                s.apply_fact(&crate::state::snap::Fact::Slot(a(acct), U256::from(sl), U256::from(sl + 1000)));
+            }
+        }
+        vs.push_back(version(100, s, StateDiff::default()));
+        for b in 101..101 + blocks {
+            let prev = vs.back().unwrap().clone();
+            let kind = r.below(10);
+            if kind < 4 {
+                // Tick: the same snapshot.
+                vs.push_back(Arc::new(Version { seq: b, block: b, diff: Arc::new(StateDiff::default()), ..(*prev).clone() }));
+                continue;
+            }
+            let mut s = (*prev.snap).clone();
+            let mut d = StateDiff::default();
+            let changes = 1 + r.below(3);
+            for _ in 0..changes {
+                let acct = a(1 + r.below(8) as u8);
+                let sl = U256::from(r.below(40));
+                let val = U256::from(r.next() % 5000);
+                if r.below(25) == 0 {
+                    d.accounts.insert(acct, AccountDiff { forget: true, ..Default::default() });
+                } else {
+                    d.accounts.entry(acct).or_default().storage.insert(sl, val);
+                }
+            }
+            s.apply_diff(&d);
+            if r.below(6) == 0 {
+                // A slot forgotten outside the diff (forget_slot).
+                let acct = a(1 + r.below(8) as u8);
+                if let Some(x) = s.accounts.get_mut(&acct) {
+                    x.storage.remove(&U256::from(r.below(40)));
+                }
+            }
+            if r.below(6) == 0 {
+                // An earlier fill that reached only this version.
+                s.apply_fact(&crate::state::snap::Fact::Slot(a(1 + r.below(8) as u8), U256::from(r.below(60)), U256::from(7)));
+            }
+            let mut v = (*version(b, s, d)).clone();
+            v.restart = r.below(40) == 0;
+            vs.push_back(Arc::new(v));
+        }
+        vs
+    }
+
+    #[test]
+    fn shared_reconcile_equals_learning_into_every_version() {
+        let mut r = Rng(0x9e3779b97f4a7c15);
+        for round in 0..400 {
+            let len = 5 + r.below(40);
+            let vs = random_chain(&mut r, len);
+            let first = vs.front().unwrap().block;
+            let last = vs.back().unwrap().block;
+            let k = first + r.below(last - first + 2); // sometimes ahead (too old)
+            let mut fetched = Vec::new();
+            for _ in 0..(1 + r.below(30)) {
+                let acct = a(1 + r.below(9) as u8);
+                fetched.push(Fetched::Slot(acct, U256::from(r.below(70)), U256::from(r.next() % 9999)));
+            }
+            if r.below(4) == 0 {
+                let acc = crate::node::FetchedAccount { balance: U256::from(r.below(100)), nonce: 1, code: revm::primitives::Bytes::from(vec![0x60, 0x00, r.below(250) as u8]) };
+                fetched.push(Fetched::Account(a(1 + r.below(9) as u8), Some(acc)));
+            }
+            let mut want = vs.clone();
+            let mut got = vs.clone();
+            let rw = reconcile_reference(&mut want, k, &fetched);
+            let rg = reconcile(&mut got, k, &fetched);
+            assert_eq!(rg, rw, "round {round}: result");
+            for (i, (x, y)) in got.iter().zip(want.iter()).enumerate() {
+                assert_eq!(content(&x.snap), content(&y.snap), "round {round}: version {i} (block {}) differs, k = {k}", x.block);
+                let mut ck: Vec<_> = x.snap.codes.keys().copied().collect();
+                let mut cw: Vec<_> = y.snap.codes.keys().copied().collect();
+                ck.sort();
+                cw.sort();
+                assert_eq!(ck, cw, "round {round}: version {i} codes");
+            }
+        }
+    }
+
+    #[test]
+    fn walked_values_are_stored_once_across_unchanged_versions() {
+        // 30 versions: a(1) changes in block 110 only, the rest are ticks or
+        // blocks touching a(2). A walk at block 101 with 300 values for a(1).
+        let mut vs: VecDeque<Arc<Version>> = VecDeque::new();
+        vs.push_back(version(100, Snapshot::default(), StateDiff::default()));
+        for b in 101..130u64 {
+            let prev = vs.back().unwrap().clone();
+            if b % 3 == 0 {
+                vs.push_back(Arc::new(Version { seq: b, block: b, ..(*prev).clone() }));
+                continue;
+            }
+            let d = if b == 110 { slot_diff(a(1), 5, b) } else { slot_diff(a(2), b % 4, b) };
+            let mut s = (*prev.snap).clone();
+            s.apply_diff(&d);
+            vs.push_back(version(b, s, d));
+        }
+        let fetched: Vec<Fetched> = (1000..1300u64).map(|i| Fetched::Slot(a(1), U256::from(i), U256::from(i))).collect();
+        let r = reconcile(&mut vs, 101, &fetched);
+        assert_eq!(r.applied, 300);
+        let tree = |i: usize| vs[i].snap.accounts.get(&a(1)).unwrap().storage.clone();
+        let (i101, i110) = (1usize, 10usize);
+        for i in i101 + 1..vs.len() {
+            let same = tree(i).ptr_eq(&tree(i - 1));
+            if i == i110 {
+                assert!(!same, "block 110 changed a(1)");
+            } else {
+                assert!(same, "version {i} (block {}) has its own copy of a(1)'s storage", vs[i].block);
+            }
+        }
+        assert_eq!(vs.back().unwrap().snap.storage(a(1), U256::from(1299)), Lookup::Known(U256::from(1299)));
+        assert_eq!(vs.back().unwrap().snap.storage(a(1), U256::from(5)), Lookup::Known(U256::from(110)));
     }
 }

@@ -413,3 +413,52 @@ trade ~20 ms.
     {readyTickPools, fullTickData, partialTickData, walking, waiting,
     readyV2Like, fullPct, walkSlots}, pendingPools, outsideContracts,
     missesTop; counters walks*, pending_*; per pool tickData, pendingFrom.
+
+- Dry run #18 memory (inbot-sim/copy2-i): 2 min after start 430 pools
+  walked (151,642 values, the old cap 150k) and the process at 331 MB RSS,
+  over pm2's 150 MB restart line. Measured with tests/copy2_memory.rs (real
+  intake: track -> load -> tick walk -> blocks, history 64, a counting
+  allocator for the heap + process RSS; fake node with N V3 pools x 375
+  walk values, 40 V2 pools trading every block, 60 coins).
+  - Cause (most of it): state/fill.rs reconcile learned the walked values
+    into EVERY kept version from the walk's block k to now SEPARATELY, so
+    each of those versions got its own copy of the pool's storage tree
+    (~400 values) plus the account-map path; a walk is answered several
+    versions after k (node tip cached up to 2 s, the answer's own time,
+    queueing behind loads), and those copies lived until the versions aged
+    out. Before the fix, 150k values, 16 walks at once, 150 ms answers:
+    heap peak 157 MB (steady 60), RSS 177 MB and staying there (glibc keeps
+    freed memory); 300k values: heap peak 204 MB, RSS 230 MB. Fix: a
+    version whose account didn't change in its block takes the previous
+    rebuilt version's account as is (one shared tree), a tick version (the
+    very same snapshot) the previous rebuilt snapshot whole. Proven equal
+    to the old per-version learning on 400 random version chains (ticks,
+    changes, forgets outside the diff, one-version fills, restarts, basics
+    with code): fill.rs shared_reconcile_equals_learning_into_every_version;
+    walked_values_are_stored_once_across_unchanged_versions checks sharing.
+    After: 150k values peak 62 MB, RSS 80 MB; 300k values (800 pools x
+    375) peak 116 MB heap (44 MB of it the fake node), steady heap 124 MB of
+    which copy 2 = 80 MB (~280 bytes per walked value, everything
+    included), RSS 142-145 MB, flat over 1000 blocks after the buffers fill.
+  - Not causes (measured): Snapshot clone in needs() (persistent maps: a
+    pointer copy), per-version storage when pools change every block
+    (~145-170 KB per kept version = ~10 MB for 64), code cache (one entry
+    per factory), walk JSON (dropped after reading).
+  - Other bounds: the report buffer is bounded in reports too
+    (ARBSIM_COPY2_MAX_KEEP_LOGS 150000, ~190 bytes each) beyond the
+    always-kept ARBSIM_COPY2_KEEP_BLOCKS, so a stuck load can't hold 40000
+    blocks of reports; copy 2's eviction caps (ARBSIM_MAX_ACCOUNTS /
+    _SLOTS) count only accounts it may drop (fully walked pools alone hold
+    ~300k slots > 250k, which made every 60 s eviction drop ALL other
+    accounts); `walked` lists have no spare capacity.
+  - Defaults: ARBSIM_COPY2_WALK_MAX_SLOTS 600000 (~2x all pools), new walks
+    pause while RSS >= ARBSIM_COPY2_WALK_MAX_RSS_MB 300 (status
+    poolCoverage.walkPaused says why); pm2 restart line 400 MB (re-created
+    once if the app still has the old lower limit); the runner sets
+    MALLOC_ARENA_MAX=2 (fewer glibc arenas for ~20 threads: less retained
+    memory; small effect in the bench, which has few busy threads).
+  - Bench: `COPY2_MEM_POOLS=800 COPY2_MEM_KEEP=2400 COPY2_MEM_BLOCKS=1000
+    COPY2_MEM_WALKS=16 COPY2_MEM_TRACE_MS=150 cargo test --release --test
+    copy2_memory -- --nocapture --test-threads=1` (default size 200 pools
+    runs in the normal suite and asserts no walk bulge, flat heap and
+    <= 400 bytes per walked value).
