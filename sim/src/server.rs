@@ -407,31 +407,70 @@ fn check_inner(ctx: &Ctx, id: &Value, at: &Value, t0: Instant, tm: &mut Tm, run:
 /// too, if it read a balance): the answer stands only if the two differ in
 /// gas alone; it then reports the HIGHER gas of each gas field (counter 0 =
 /// the costlier 0 -> non-zero store), so the bot never overestimates profit.
+///
+/// copy2-r ("the trade reverts" must be proven): a run whose result FAILS
+/// (a call reverted / halted) while its PoolManager balance was only the
+/// route's lower bound (some V4 pools left out of it) is never answered
+/// from that bound: both runs are repeated with the full bound first. A
+/// failure seen only at a bound that is merely "at least this much" is not
+/// proof the real balance fails too.
 fn copy2_run(c: &Copy2Handle, core: &crate::copy2::checkcore::CheckCore, view: &View, block: u64, bctx: &BlockCtx, tm: &mut Tm, run: &impl Fn(&dyn StateRead, &BlockCtx) -> Value) -> Value {
     let t_facts = Instant::now();
     let facts = c.check_facts_with(core, block);
     tm.facts_us += t_facts.elapsed().as_micros() as u64;
-    let runs = std::cell::RefCell::new(Vec::<u64>::new());
+    let runs = std::cell::RefCell::new(RunLog::default());
     let a = copy2_runs(c, view, &facts, bctx, &runs, run);
-    tm.runs_us = runs.into_inner();
+    let r = runs.into_inner();
+    tm.runs_us = r.us;
+    tm.runs_what = r.what;
+    tm.far_used = r.far;
     a
 }
 
-fn copy2_runs(c: &Copy2Handle, view: &View, facts: &crate::copy2::checkview::C2Facts, bctx: &BlockCtx, runs: &std::cell::RefCell<Vec<u64>>, run: &impl Fn(&dyn StateRead, &BlockCtx) -> Value) -> Value {
-    let timed = |v: &dyn StateRead| {
-        let t = Instant::now();
-        let a = run(v, bctx);
-        runs.borrow_mut().push(t.elapsed().as_micros() as u64);
-        a
-    };
+/// The EVM runs of one copy-2 check: time, what each was, far words read.
+#[derive(Default)]
+pub struct RunLog {
+    pub us: Vec<u64>,
+    pub what: Vec<String>,
+    pub far: u64,
+}
+
+/// The bot's check contract reports a finished route by reverting with
+/// InsufficientProfit(got, wanted) (it always asks for minProfit = max):
+/// that revert is the bot's "profit" / "loss" answer, not a failure.
+pub const INSUFFICIENT_PROFIT: &str = "0x4e88422a";
+
+/// Did any call of this answer FAIL (revert / halt other than the bot
+/// contract's profit report)? A size search's tried sizes count too.
+pub fn answer_fails(a: &Value) -> bool {
+    let calls = a.get("results").and_then(|r| r.as_array()).is_some_and(|r| {
+        r.iter().any(|x| x.get("success") == Some(&Value::Bool(false)) && !x.get("output").and_then(|o| o.as_str()).is_some_and(|o| o.starts_with(INSUFFICIENT_PROFIT)))
+    });
+    let tried = a.get("tried").and_then(|r| r.as_array()).is_some_and(|r| r.iter().any(|x| x.get("status").and_then(|s| s.as_str()).is_some_and(|s| s != "profit" && s != "loss")));
+    calls || tried
+}
+
+pub fn copy2_runs(c: &Copy2Handle, view: &View, facts: &crate::copy2::checkview::C2Facts, bctx: &BlockCtx, runs: &std::cell::RefCell<RunLog>, run: &impl Fn(&dyn StateRead, &BlockCtx) -> Value) -> Value {
+    use std::sync::atomic::Ordering::Relaxed;
     if facts.is_empty() {
-        return timed(view);
+        let t = Instant::now();
+        let a = run(view, bctx);
+        let mut r = runs.borrow_mut();
+        r.us.push(t.elapsed().as_micros() as u64);
+        r.what.push("p".into());
+        return a;
     }
     let zero = revm::primitives::U256::ZERO;
-    let run_at = |offset, fee| {
+    let run_at = |high: bool, fee: revm::primitives::U256| {
+        let offset = if high { high_offset() } else { zero };
         let v = C2View::with_fee(view, facts, offset, fee);
-        let a = timed(&v);
+        let t = Instant::now();
+        let a = run(&v, bctx);
         let (b, f) = (v.used_bound(), v.used_fee());
+        let mut r = runs.borrow_mut();
+        r.us.push(t.elapsed().as_micros() as u64);
+        r.what.push(format!("{}{}{}", if high { "h" } else { "b" }, if fee.is_zero() { "0" } else { "1" }, if facts.full.load(Relaxed) { "f" } else { "" }));
+        r.far = r.far.max(v.far_hits());
         (a, b, f)
     };
     let ok = |v: &Value| v.get("ok") == Some(&Value::Bool(true));
@@ -445,17 +484,18 @@ fn copy2_runs(c: &Copy2Handle, view: &View, facts: &crate::copy2::checkview::C2F
     // The bound is first summed over the pools this check traded on only
     // (checkview.rs: any proven lower bound is sound; a too small one only
     // makes the two runs differ). If they differ with that smaller bound,
-    // both runs again with the full bound (every ready V4 pool), as before.
+    // or the check FAILS with it (copy2-r), both runs again with the full
+    // bound (every ready V4 pool), as before.
     let confirmed = |fee| -> Result<(Value, bool), Value> {
         loop {
-            let (a, used_bound, used_fee) = run_at(zero, fee);
+            let (a, used_bound, used_fee) = run_at(false, fee);
             if !used_bound || !ok(&a) {
                 return Ok((a, used_fee));
             }
-            let (again, _, _) = run_at(high_offset(), fee);
+            let (again, _, _) = run_at(true, fee);
             let same = strip_us(&a) == strip_us(&again);
-            let partial = facts.partial_used.load(std::sync::atomic::Ordering::Relaxed) && !facts.full.load(std::sync::atomic::Ordering::Relaxed);
-            if !same && partial {
+            let partial = facts.partial_used.load(Relaxed) && !facts.full.load(Relaxed);
+            if partial && (!same || answer_fails(&a)) {
                 c.note_pm_bound_kind(true);
                 facts.go_full();
                 continue;

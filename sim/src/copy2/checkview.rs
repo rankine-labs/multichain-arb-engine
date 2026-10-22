@@ -269,6 +269,8 @@ pub struct C2View<'a> {
     used_fee: AtomicBool,
     /// V4 pools this run has read slot0 of (so far).
     touched: Mutex<Vec<B256>>,
+    /// Far zero words this run read (reported in the answer's "t").
+    far_hits: std::sync::atomic::AtomicU64,
 }
 
 impl<'a> C2View<'a> {
@@ -278,7 +280,12 @@ impl<'a> C2View<'a> {
 
     /// `fee`: what an unheld protocolFeesAccrued counter reads as.
     pub fn with_fee(inner: &'a dyn StateRead, f: &'a C2Facts, offset: U256, fee: U256) -> Self {
-        C2View { inner, f, offset, used: AtomicBool::new(false), fee, used_fee: AtomicBool::new(false), touched: Mutex::new(Vec::new()) }
+        C2View { inner, f, offset, used: AtomicBool::new(false), fee, used_fee: AtomicBool::new(false), touched: Mutex::new(Vec::new()), far_hits: Default::default() }
+    }
+
+    /// Far zero words this run read.
+    pub fn far_hits(&self) -> u64 {
+        self.far_hits.load(Ordering::Relaxed)
     }
 
     /// Did the run read a PoolManager balance (so a second run must confirm)?
@@ -298,6 +305,7 @@ impl<'a> C2View<'a> {
             Lookup::Known(v) => Lookup::Known(v),
             Lookup::Missing => {
                 if self.f.far_merged.get(&a).is_some_and(|l| l.binary_search(&s).is_ok()) {
+                    self.far_hits.fetch_add(1, Ordering::Relaxed);
                     Lookup::Known(U256::ZERO)
                 } else {
                     Lookup::Missing

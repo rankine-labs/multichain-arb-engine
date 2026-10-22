@@ -98,6 +98,16 @@ export function verdictOf(r: SimResult | null | undefined): Verdict {
   return 'unknown';
 }
 
+// A check answer's reason in a log line: the decoded revert / halt for a
+// "fail", the bucket's words for anything else that isn't profit / loss.
+// Long enough to keep a WrappedError's inner error (120 chars).
+export function reasonOf(r: SimResult | null | undefined): string | undefined {
+  if (!r) return undefined;
+  if ('reason' in r && r.reason) return String(r.reason).slice(0, 120);
+  if (r.status !== 'profit' && r.status !== 'loss') return r.status;
+  return undefined;
+}
+
 // The "why" inside a local-unknown marker ("miss", "timeout", ...).
 function unknownWhy(r: SimResult): string {
   if ('reason' in r) {
@@ -657,6 +667,10 @@ export class LocalSimHost {
         t: this.now(), k: c.q.kind, mode: c.decidedByLocal ? 'on' : 'shadow', pair: c.q.label, tx: short(c.q.triggerHash),
         // local answer
         lv: l.verdict, lp: profitOf(l.sim), lg: l.gasUsed, lu: l.sure ? undefined : l.why,
+        // why the copy said "fail" (decoded revert / halt, as the node's
+        // reason is written): without it a fail-vs-loss mismatch can't be
+        // traced (Oct 22 RIVN/USDG).
+        lr: reasonOf(l.sim),
         lms: l.answerMs - l.requestMs, lseen: seen !== undefined ? l.answerMs - seen : undefined,
         // arbsim's own time for our contract call (ms, queue included), the
         // socket round trip the bot measured (ms) and arbsim's split (us):
@@ -665,7 +679,7 @@ export class LocalSimHost {
         lus: c.sidecar?.inside, lrt: c.sidecar?.rt, lt: c.sidecar?.t,
         // node answer (absent = no node check: on mode, not re-checked)
         nv, np: profitOf(node?.sim), ng: gasN,
-        nr: node?.sim && 'reason' in node.sim ? node.sim.reason.slice(0, 80) : node?.sim && node.sim.status !== 'profit' && node.sim.status !== 'loss' ? node.sim.status : undefined,
+        nr: reasonOf(node?.sim),
         nms: node ? node.endMs - node.startMs : undefined, nseen: node && seen !== undefined ? node.endMs - seen : undefined, nwhere: node?.where,
         same: both ? same : undefined, dec: c.decidedByLocal ? 'local' : 'node', smp: c.sampled || undefined,
         // copy 2: the block the fast check was asked about (absent = not a copy-2 check)
@@ -684,7 +698,7 @@ export class LocalSimHost {
       if (!this.nodeAtBlock) return;
       const now = this.now();
       this.recheckTimes = this.recheckTimes.filter((t) => now - t < 3_600_000);
-      const base = { t: now, k: 'recheck', pair: c.q.label, tx: short(c.q.triggerHash), c2blk: blockTag, lv, lp: profitOf(lsim), nv, np: profitOf(nsim) };
+      const base = { t: now, k: 'recheck', pair: c.q.label, tx: short(c.q.triggerHash), c2blk: blockTag, lv, lp: profitOf(lsim), lr: reasonOf(lsim), lg: c.local?.gasUsed, nv, np: profitOf(nsim), nr: reasonOf(nsim) };
       if (this.recheckTimes.length >= this.recheckPerHour) {
         this.hour.c2re.unclear++;
         this.shadowLog.add({ ...base, result: "COULDN'T CHECK (re-check budget used up this hour)" });
@@ -703,7 +717,7 @@ export class LocalSimHost {
         if (result.startsWith('EARLY')) this.hour.c2re.moved++;
         else if (result.startsWith('MISMATCH')) this.hour.c2re.wrong++;
         else this.hour.c2re.unclear++;
-        this.shadowLog.add({ ...base, nvAt: v, npAt: profitOf(r), nrAt: 'reason' in r ? String(r.reason).slice(0, 80) : undefined, nmsAt: this.now() - startMs, result });
+        this.shadowLog.add({ ...base, nvAt: v, npAt: profitOf(r), nrAt: reasonOf(r), ngAt: 'gasUsed' in r && r.gasUsed !== undefined ? r.gasUsed : undefined, nmsAt: this.now() - startMs, result });
         this.log(`[local-sim] copy 2 vs node disagreed on ${c.q.label ?? 'a check'} (copy ${lv} at block ${blockTag}, node ${nv} later): ${result}`);
         if (result.startsWith('MISMATCH')) this.safeAlert(`⚠️ FAST CHECK MISMATCH at same moment: the copy and the chain disagree at the same block (${c.q.label ?? 'check'}, block ${parseInt(blockTag, 16)}: copy ${lv}, chain ${v}). Tell Claude (data/local-sim-shadow.jsonl, "k":"recheck").`);
       }, () => { this.hour.c2re.unclear++; this.shadowLog.add({ ...base, result: "COULDN'T CHECK (node error)" }); });

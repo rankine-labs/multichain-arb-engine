@@ -125,6 +125,9 @@ struct World {
     /// The bot's report rule: coin Transfers only for CONTRACT pools (the
     /// bot never subscribes to the V4 PoolManager's transfers).
     bot_shape: bool,
+    /// The round trip's other hop is pools[2] (a second V4 pool on the same
+    /// coins) instead of the V3 reference pool.
+    ref_v4: bool,
 }
 
 /// World options (World::start = the defaults).
@@ -279,7 +282,7 @@ impl World {
         let (intake, h) = manual(sh.clone(), fills.clone(), cfg);
         let (_u, updater) = arbsim::state::updater::manual(sh.clone(), fills.clone());
         let ctx = Ctx { shared: sh.clone(), updater, fills, pinned: PinnedCache::new(4), copy2: Some(h.clone()) };
-        let mut w = World { a: a.clone(), node, sh, intake, h, ctx, kind, pools, trader, plain, uu, ww, lm, runtime: arb_executor_runtime(), ts: 0, last_sent: 0, bot_shape: o.bot_shape };
+        let mut w = World { a: a.clone(), node, sh, intake, h, ctx, kind, pools, trader, plain, uu, ww, lm, runtime: arb_executor_runtime(), ts: 0, last_sent: 0, bot_shape: o.bot_shape, ref_v4: false };
         // Many positions, spread far (quadratic widths): big swaps cross
         // many ticks and many tick-map words.
         for k in 1..=18i64 {
@@ -473,7 +476,14 @@ impl World {
             K::V4 => hop_words(3, p.address, tin, tout, p.fee, p.tick_spacing),
             _ => hop_words(2, p.address, tin, tout, 0, 0),
         };
-        let ref_hop = |tin: Address, tout: Address| hop_words(2, self.pools[1].address, tin, tout, 0, 0);
+        let ref_hop = |tin: Address, tout: Address| {
+            if self.ref_v4 {
+                let q2 = &self.pools[2];
+                hop_words(3, q2.address, tin, tout, q2.fee, q2.tick_spacing)
+            } else {
+                hop_words(2, self.pools[1].address, tin, tout, 0, 0)
+            }
+        };
         let hops = if test_first { vec![test_hop(self.uu, self.ww), ref_hop(self.ww, self.uu)] } else { vec![ref_hop(self.uu, self.ww), test_hop(self.ww, self.uu)] };
         let amt = U256::from(usd) * q(6);
         let mut d = sel.to_vec();
@@ -1184,5 +1194,153 @@ fn bot_v4_route_bound_falls_back_to_the_full_bound() {
         st["counters"]["pm_bound_route_only"], st["counters"]["pm_bound_full_retry"], st["counters"]["pm_bound_same"], st["counters"]["pm_bound_differ"]
     );
     assert!(retried_and_answered >= 1, "a drain of the test pool is answered with the full bound: {st}");
+    w.h.stop();
+}
+
+/// EXPLORATION (copy2-r): live-shaped stock pool with a protocol fee, random
+/// trades / positions (incl. full range and far ones) / burns, many check
+/// sizes both ways; every answer compared with the chain.
+#[test]
+#[ignore]
+fn explore_stock_pool_mismatch() {
+    let seed: u32 = std::env::var("SEED").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+    let o = Opts { bot_shape: true, pm_bound: true, full_words: 8000, thin: std::env::var("THIN").is_ok(), one_sided: std::env::var("ONESIDED").is_ok(), second_v4: std::env::var("SECOND").is_ok(), ..Opts::default() };
+    let Some(mut w) = World::start_with(K::V4, o) else { return };
+    w.ref_v4 = o.second_v4 && std::env::var("V4V4").is_ok();
+    let p = w.pools[0].clone();
+    let me = w.a.me;
+    let fee = U256::from(1000u32 | (1000u32 << 12));
+    w.mine(&[(p.address, calldata("setProtocolFeeController(address)", &[Arg::A(me)]))]);
+    w.mine(&[(p.address, calldata("setProtocolFee((address,address,uint24,int24,address),uint24)", &[Arg::A(p.token0), Arg::A(p.token1), Arg::W(U256::from(p.fee)), Arg::I(p.tick_spacing as i128), Arg::A(Address::ZERO), Arg::W(fee)]))]);
+    w.go_live();
+    w.wait("tick walks", |w| w.walked());
+    w.settle();
+    let mut r = Rng::new(seed);
+    let (mut same, mut differ, mut unknown) = (0, 0, HashMap::<String, u32>::new());
+    let mut positions: Vec<(i64, i64, U256)> = Vec::new();
+    let sp = p.tick_spacing as i64;
+    for round in 0..25 {
+        let mut txs = Vec::new();
+        for _ in 0..r.int(1, 3) {
+            let k = r.int(0, 9);
+            if k <= 4 {
+                let in_u = r.next() < 0.5;
+                let usd = r.int(100, 40_000) as u64;
+                let amt = if in_u { U256::from(usd) * q(6) } else { U256::from(usd) * q(18) / U256::from(2500) };
+                let zfo = in_u == (w.uu < w.ww);
+                let tx = if r.next() < 0.6 {
+                    (w.trader, calldata("swap((address,address,uint24,int24,address),bool,int256,uint160)", &[Arg::A(p.token0), Arg::A(p.token1), Arg::W(U256::from(p.fee)), Arg::I(p.tick_spacing as i128), Arg::A(Address::ZERO), Arg::B(zfo), Arg::W(U256::ZERO.wrapping_sub(amt)), Arg::W(U256::ZERO)]))
+                } else {
+                    (w.plain_trader(), calldata("swapV3(address,bool,int256,uint160)", &[Arg::A(w.pools[1].address), Arg::B(zfo), Arg::W(amt), Arg::W(U256::ZERO)]))
+                };
+                txs.push(tx);
+            } else if k <= 7 {
+                let t = w.tick(0);
+                let b = t.div_euclid(sp) * sp;
+                let (lo, hi) = match r.int(0, 3) {
+                    0 => ((-887_272i64).div_euclid(sp) * sp + sp, 887_272i64.div_euclid(sp) * sp),
+                    1 => (b - sp * r.int(1, 30), b + sp * r.int(1, 30)),
+                    2 => (b + sp * r.int(5000, 20000), b + sp * r.int(20001, 30000)),
+                    _ => (b - sp * r.int(20001, 30000), b - sp * r.int(5000, 20000)),
+                };
+                let lo = lo.max((-887_272i64).div_euclid(sp) * sp + sp);
+                let hi = hi.min(887_272i64.div_euclid(sp) * sp);
+                let liq = q(12) * U256::from(r.int(1, 50) as u64);
+                positions.push((lo, hi, liq));
+                txs.push(w.mint_call(0, lo, hi, liq));
+            } else if !positions.is_empty() {
+                let i = r.int(0, positions.len() as i64 - 1) as usize;
+                let (lo, hi, liq) = positions.remove(i);
+                txs.push((w.trader, calldata("modify((address,address,uint24,int24,address),int24,int24,int256,bytes32)", &[Arg::A(p.token0), Arg::A(p.token1), Arg::W(U256::from(p.fee)), Arg::I(p.tick_spacing as i128), Arg::A(Address::ZERO), Arg::I(lo as i128), Arg::I(hi as i128), Arg::W(U256::ZERO.wrapping_sub(liq)), Arg::W(U256::ZERO)])));
+            }
+        }
+        for tx in txs {
+            if w.a.call(tx.0, &tx.1).is_ok() {
+                w.block(&[tx]);
+            }
+        }
+        w.settle();
+        if round % 3 != 2 {
+            continue;
+        }
+        let n = w.block(&[]);
+        w.settle();
+        for usd in [50u64, 500, 3_000, 20_000, 100_000, 400_000, 2_000_000] {
+            for dir in [true, false] {
+                match w.compare(n, usd, dir) {
+                    (Some(true), _) => same += 1,
+                    (Some(false), d) => {
+                        let g = arbsim::check::hexutil::parse_u64(d["copy"]["gasUsed"].as_str().unwrap()).unwrap();
+                        let tg = d["truth"]["gasUsed"].as_u64().unwrap();
+                        if d["copy"]["success"] == d["truth"]["success"] && d["copy"]["output"] == d["truth"]["output"] && g >= tg && g - tg <= 34_200 {
+                            same += 1;
+                        } else {
+                            eprintln!("DIFFERS round {round} {usd} USD test first {dir}: {d}");
+                            differ += 1;
+                        }
+                    }
+                    (None, a) => *unknown.entry(a["unknown"].as_str().unwrap_or("?").to_string()).or_default() += 1,
+                }
+                w.settle();
+            }
+        }
+    }
+    let st = w.h.status_json(false);
+    eprintln!("seed {seed}: same {same} differ {differ} unknown {unknown:?}; counters pm {} {} {} fee {} {} {}", st["counters"]["pm_bound_checks"], st["counters"]["pm_bound_same"], st["counters"]["pm_bound_differ"], st["counters"]["protocol_fee_checks"], st["counters"]["protocol_fee_same"], st["counters"]["protocol_fee_differ"]);
+    w.h.stop();
+    assert_eq!(differ, 0);
+}
+
+/// copy2-r (live Oct 22 21:22, RIVN/USDG: copy "the trade reverts", the
+/// node at the SAME block "completes at a loss"): a check whose result is a
+/// FAILURE computed while the PoolManager balance was only the ROUTE's lower
+/// bound (other V4 pools left out of it) is never answered from that bound:
+/// both runs are repeated with the full bound first ("at least this much"
+/// is no proof that the real balance fails too). Profit / loss reports
+/// (InsufficientProfit) never pay for that. The answer says what each EVM
+/// run was ("t.what").
+#[test]
+fn bot_v4_failure_at_a_route_only_bound_is_checked_with_the_full_bound() {
+    let o = Opts { bot_shape: true, pm_bound: true, full_words: 8000, second_v4: true, ..Opts::default() };
+    let Some(mut w) = World::start_with(K::V4, o) else {
+        eprintln!("copy2 coverage anvil test SKIPPED: no ~/.foundry/bin/anvil");
+        return;
+    };
+    w.go_live();
+    w.wait("tick walks", |w| w.walked());
+    w.settle();
+    let n = w.block(&[]);
+    w.settle();
+    let c = |w: &World, k: &str| w.h.status_json(false)["counters"][k].as_u64().unwrap_or(0);
+    for _ in 0..3 {
+        let _ = w.compare(n, 100, true);
+        w.settle();
+    }
+    // A finished route (InsufficientProfit = the bot's profit / loss
+    // report): route-only bound, no full retry.
+    let before = c(&w, "pm_bound_full_retry");
+    let (same, d) = w.compare(n, 1_000, true);
+    assert_eq!(same, Some(true), "{d}");
+    assert_eq!(c(&w, "pm_bound_full_retry"), before, "a profit / loss report never needs the full bound");
+    // A route that FAILS after the V4 hop took its coins (2nd hop: a "V3
+    // pool" with no code -> the call reverts): retried with the full bound.
+    let real = w.pools[1].address;
+    w.pools[1].address = Address::with_last_byte(0x77);
+    let (call, ov) = w.round_trip(1_000, true);
+    w.pools[1].address = real;
+    let mut ans = w.ask(n, &call, &ov);
+    if ans["unknown"] == json!("miss") {
+        // First sight of that address: the fill brings its (empty) basics.
+        w.settle();
+        ans = w.ask(n, &call, &ov);
+    }
+    let (ts, to, tg) = w.truth(n, &call, &ov);
+    assert!(!ts && !to.starts_with(arbsim::server::INSUFFICIENT_PROFIT), "test setup: the chain says the route fails ({to})");
+    assert_eq!(ans["ok"], json!(true), "{ans}");
+    let r = &ans["results"][0];
+    assert_eq!((r["success"].clone(), r["output"].clone(), r["gasUsed"].clone()), (json!(ts), json!(to), json!(format!("{tg:#x}"))), "exactly the chain's failure: {ans}");
+    assert_eq!(c(&w, "pm_bound_full_retry"), before + 1, "the failure was checked with the full bound");
+    let what: Vec<String> = ans["t"]["what"].as_array().unwrap().iter().map(|x| x.as_str().unwrap().to_string()).collect();
+    assert_eq!(what, vec!["b0", "h0", "b0f", "h0f"], "what each run was: {}", ans["t"]);
     w.h.stop();
 }

@@ -5,6 +5,7 @@ import { join } from 'path';
 import { frame, LocalSimClient } from '../execution/localSim';
 import { createLocalSimHost, LocalSimHost, JsonlLog, verdictOf, hostSettings } from '../execution/localSimHost';
 import { simulateRoundTrip, SIM_EXECUTOR_ADDRESS, Rpc, SimResult } from '../execution/simulator';
+import { ethers } from 'ethers';
 
 // FAST CHECK host (execution/localSimHost.ts): switch, practice mode never
 // changing a decision, unknown -> node, ON needs the confirm word, automatic
@@ -195,6 +196,33 @@ async function main() {
       assert(want === 'EARLY' ? /EARLY \(copy right, gap closed after\) 1, MISMATCH at same moment 0/.test(line) : /EARLY \(copy right, gap closed after\) 0, MISMATCH at same moment 1/.test(line), `hourly line counts it (${line})`);
     }
     assert(asked.length === 2 && asked.every((t) => t === '0x10'), 'the node is asked pinned at the copy block');
+    // copy2-r (Oct 22 RIVN/USDG): the copy's FAIL reason is in the shadow line
+    // and in the re-check line (it was missing: "lr" absent).
+    {
+      const zeroAmount = '0x' + ethers.id('ZeroAmount()').slice(2, 10);
+      fake.handler = (m, reply) => {
+        if (m.type !== 'call') return answerProfit(0n)(m, reply);
+        const call = m.calls[m.calls.length - 1];
+        if (call.to?.toLowerCase() !== SIM_EXECUTOR_ADDRESS) return answerProfit(0n)(m, reply);
+        return reply({ id: m.id, ok: true, us: 900, t: { runs: [300, 200, 200, 200], what: ['b0', 'h0', 'b1', 'h1'] }, results: [{ success: false, output: zeroAmount, gasUsed: '0xcd7c5' }] });
+      };
+      const asked2: string[] = [];
+      const h = mk({ LOCAL_SIM: 'shadow' }, { nodeAtBlock: async (_q, tag) => { asked2.push(tag); return lossSim; } })!;
+      assert(await waitFor(() => h.client.isConnected()), 'fail-reason host connects');
+      const c = h.begin({ kind: 'gap', trade: TRADE, simOpts: SIMOPTS, at: { block: '0x12' }, label: 'RIVN/USDG gap' });
+      const lo = await c.result;
+      assert(lo.verdict === 'fail', `copy says fail (${lo.verdict})`);
+      c.nodeDone(lossSim, Date.now() - 100, 'latest');
+      await sleep(20);
+      await h.shadowLog.flush();
+      const all = readFileSync(baseEnv.LOCAL_SIM_LOG, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+      const gap = all.filter((l) => l.k === 'gap' && l.c2blk === '0x12').pop();
+      const re = all.filter((l) => l.k === 'recheck' && l.c2blk === '0x12').pop();
+      assert(gap && /ZeroAmount/.test(gap.lr) && gap.lv === 'fail' && gap.lg === '841669' && gap.nr === 'ends with less', `shadow line carries the copy's fail reason (lr ${gap?.lr}, lg ${gap?.lg}, nr ${gap?.nr})`);
+      assert(gap.lt?.what?.join(',') === 'b0,h0,b1,h1', 'shadow line carries what each EVM run was (lt.what)');
+      assert(re && /ZeroAmount/.test(re.lr) && re.lg === '841669' && re.nr === 'ends with less' && re.nrAt === 'ends with less' && String(re.result).startsWith('MISMATCH'), `re-check line carries both reasons (lr ${re?.lr}, nrAt ${re?.nrAt})`);
+      fake.handler = answerProfit(500n);
+    }
     assert(reAlerts.length === 1 && /MISMATCH at same moment/.test(reAlerts[0]), 'only a MISMATCH alerts');
     // Agreement: no re-check.
     const h3 = mk({ LOCAL_SIM: 'shadow' }, { nodeAtBlock: async (_q, tag) => { asked.push(tag); return lossSim; } })!;
