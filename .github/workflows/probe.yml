@@ -111,7 +111,7 @@ jobs:
         env:
           PROBE_BLOCKS: latest
           PROBE_TRACES: '3'
-          PROBE_LOGS: '120'
+          PROBE_OVR: '1'
         run: |
           timeout 2400 node .scripts-build/scripts/probe-rivn.js > rivn.txt 2>&1 || true
           cat rivn.txt

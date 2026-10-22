@@ -134,6 +134,7 @@ function v4Of(p: PoolState) { return (p as any).v4 as { poolManager: string; fee
   for (const t of [coin, USDG]) {
     try { const s = await findBalanceSlot(rpc, 'robinhood:' + t, t); say(`balance slot lookup ${t}: ${s === null ? 'NOT FOUND' : short(s && 'slot' in (s as any) ? (s as any).slot : s, 200)}`); } catch (e) { say(`balance slot lookup ${t}: error ${(e as Error).message}`); }
   }
+  const slot = await findBalanceSlot(rpc, 'robinhood:' + USDG, USDG);
   // Where RIVN keeps the PoolManager's / a pool's balance: the slots balanceOf reads.
   for (const holder of [PM, ...pools.filter((p) => !v4Of(p)).map((p) => p.poolAddress)]) {
     const tr = await rpc('debug_traceCall', [{ to: coin, data: ethers.id('balanceOf(address)').slice(0, 10) + pad(holder) }, BLOCKS[0], { tracer: 'prestateTracer' }]);
@@ -147,6 +148,77 @@ function v4Of(p: PoolState) { return (p as any).v4 as { poolManager: string; fee
     const s0 = (await rpc('eth_getStorageAt', [PM, baseSlot, BLOCKS[0]])).result;
     const liq = (await rpc('eth_getStorageAt', [PM, hex(BigInt(baseSlot) + 3n), BLOCKS[0]])).result;
     say(`v4 ${p.poolAddress.slice(0, 10)} slot0 ${s0} liquidity ${liq}`);
+  }
+  // The copy's assumed values, tried on the REAL chain state with state
+  // overrides (PROBE_OVR): the PoolManager's coin balances at a low value /
+  // far above the real one (+2^200) and protocolFeesAccrued at 0 / 1, as the
+  // copy's two-run checks do. If the bot's check FAILS with some of them
+  // while the plain call completes, that assumption is what breaks it.
+  if (process.env.PROBE_OVR) {
+    const tag = BLOCKS[0];
+    const abi = ethers.AbiCoder.defaultAbiCoder();
+    const oz5 = '0x52c63247e1f47db19d5ce0460030c497f067ca4cebf71ba98eeadabe20bace00';
+    const balOf = async (c: string, h: string, ov?: Record<string, unknown>) => {
+      const r = await rpc('eth_call', [{ to: c, data: ethers.id('balanceOf(address)').slice(0, 10) + pad(h) }, tag, ...(ov ? [ov] : [])]);
+      return r.error ? `ERR ${short(r.error, 200)}` : BigInt(r.result).toString();
+    };
+    // RIVN's balance place for the PoolManager: OZ5 namespaced or slots 0..60 / Solady.
+    const cands: [string, string][] = [['oz5', ethers.keccak256(abi.encode(['address', 'bytes32'], [PM, oz5]))]];
+    for (let i = 0; i <= 60; i++) cands.push([`sol${i}`, ethers.keccak256(abi.encode(['address', 'uint256'], [PM, i]))]);
+    let rSlot: string | null = null;
+    const realR = await balOf(coin, PM);
+    for (const [nm, sl] of cands) {
+      const got = await balOf(coin, PM, { [coin]: { stateDiff: { [sl]: '0x' + pad(hex(777n * 10n ** 18n)) } } });
+      if (got !== realR) { say(`RIVN PoolManager balance place: ${nm} ${sl}; real ${realR}; with 777e18 there balanceOf -> ${got}; raw slot ${(await rpc('eth_getStorageAt', [coin, sl, tag])).result}`); rSlot = sl; break; }
+    }
+    if (!rSlot) say('RIVN PoolManager balance place NOT found among oz5 / 0..60');
+    const usdgSlot = (slot && 'key' in (slot as any)) ? (slot as any).key(PM) as string : null;
+    const realU = BigInt(await balOf(USDG, PM));
+    say(`USDG PoolManager balance place ${usdgSlot} real ${realU}`);
+    // What the RIVN token reads / does: its code size, and the high value through balanceOf.
+    if (rSlot) {
+      for (const v of [1n << 200n, (1n << 200n) + BigInt(realR)]) say(`  RIVN balanceOf(PM) with raw ${v} -> ${await balOf(coin, PM, { [coin]: { stateDiff: { [rSlot]: '0x' + pad(hex(v)) } } })}`);
+    }
+    const feeSlot = (c: string) => ethers.keccak256(abi.encode(['address', 'uint256'], [c, 1]));
+    say(`protocolFeesAccrued RIVN ${(await rpc('eth_getStorageAt', [PM, feeSlot(coin), tag])).result} USDG ${(await rpc('eth_getStorageAt', [PM, feeSlot(USDG), tag])).result}`);
+    const R = BigInt(realR.startsWith('ERR') ? '0' : realR);
+    const variants: [string, { r?: bigint; u?: bigint; fee?: bigint }][] = [
+      ['plain', {}], ['fee0', { fee: 0n }], ['fee1', { fee: 1n }],
+      ['rivnHi', { r: R + (1n << 200n) }], ['usdgHi', { u: realU + (1n << 200n) }], ['bothHi', { r: R + (1n << 200n), u: realU + (1n << 200n) }],
+      ['bothHi fee0', { r: R + (1n << 200n), u: realU + (1n << 200n), fee: 0n }], ['bothHi fee1', { r: R + (1n << 200n), u: realU + (1n << 200n), fee: 1n }],
+      ['rivn 1e18', { r: 10n ** 18n }], ['usdg 1e6', { u: 10n ** 6n }], ['rivn 2^200', { r: 1n << 200n }], ['usdg 2^200', { u: 1n << 200n }],
+    ];
+    const v4p = pools.find((p) => v4Of(p))!;
+    for (const other of pools.filter((p) => !v4Of(p))) {
+      for (const [buy, sell] of [[other, v4p], [v4p, other]]) {
+        for (const usd of [30, 300, 3000]) {
+          const built: any = buildExecuteCall({ chain: 'robinhood', tokenIn: USDG, buyPool: buy, sellPool: sell, tradeSizeUsd: usd, netProfitUsd: 1, usdPerTokenIn: 1, tokenInDecimals: 6, maxBlock: 0n } as any);
+          if (built.ok === false) { say(`not built ${built.reason}`); continue; }
+          const data = encodeExecuteRaw({ token: USDG, amountIn: built.amountIn, minProfit: (1n << 256n) - 1n, maxBlock: (1n << 256n) - 1n, hops: built.hops });
+          const line: string[] = [];
+          for (const [nm, v] of variants) {
+            const ov: Record<string, any> = { [SIM_EXECUTOR_ADDRESS]: { code: ARB_EXECUTOR_RUNTIME_CODE, stateDiff: {
+              ['0x' + pad(hex(EXECUTOR_STORAGE_SLOT))]: '0x' + pad(SIM_CALLER),
+              ['0x' + pad(hex(V4_POOL_MANAGER_STORAGE_SLOT))]: '0x' + pad(PM),
+              ['0x' + pad(hex(WETH_STORAGE_SLOT))]: '0x' + pad(ROBINHOOD_TOKENS.WETH),
+            } } };
+            const usdgDiff: Record<string, string> = {};
+            if (slot && 'key' in (slot as any)) usdgDiff[(slot as any).key(SIM_EXECUTOR_ADDRESS)] = '0x' + pad(hex(built.amountIn));
+            if (v.u !== undefined && usdgSlot) usdgDiff[usdgSlot] = '0x' + pad(hex(v.u));
+            ov[USDG] = { stateDiff: usdgDiff };
+            if (v.r !== undefined && rSlot) ov[coin] = { stateDiff: { [rSlot]: '0x' + pad(hex(v.r)) } };
+            if (v.fee !== undefined) ov[PM] = { stateDiff: { [feeSlot(coin)]: '0x' + pad(hex(v.fee)), [feeSlot(USDG)]: '0x' + pad(hex(v.fee)) } };
+            const r = await rpc('eth_call', [{ from: SIM_CALLER, to: SIM_EXECUTOR_ADDRESS, data, gas: '0x7a1200' }, tag, ov]);
+            const d = typeof r.error?.data === 'string' ? r.error.data : (r.error?.data?.data ?? '');
+            const tagOut = !r.error ? 'ok?!' : d.startsWith('0x4e88422a') ? `IP(${BigInt('0x' + d.slice(10, 74))})` : `${d.slice(0, 10) || 'nodata'}:${String(r.error.message).slice(0, 40)}${d.length > 10 ? ':' + d.slice(10, 140) : ''}`;
+            line.push(`${nm}=${tagOut}`);
+            await sleep(120);
+          }
+          say(`  $${usd} ${buy.dex}${v4Of(buy) ? '' : ' ' + buy.poolAddress.slice(0, 8)} -> ${sell.dex}${v4Of(sell) ? '' : ' ' + sell.poolAddress.slice(0, 8)}: ${line.join(' | ')}`);
+        }
+      }
+    }
+    process.exit(0);
   }
   // What happened on the RIVN/USDG pools (and RIVN itself) just before each
   // mismatch block: logs are kept for old blocks even where state is not.
@@ -203,7 +275,6 @@ function v4Of(p: PoolState) { return (p as any).v4 as { poolManager: string; fee
   }
   // The loss checks closest to the copy's gas: what they did, and every value they read.
   const near = hits.filter((h) => h.status === 'loss' && h.gas > 0).sort((x, y) => Math.abs(x.gas - COPY_GAS) - Math.abs(y.gas - COPY_GAS)).slice(0, Number(process.env.PROBE_TRACES ?? 2));
-  const slot = await findBalanceSlot(rpc, 'robinhood:' + USDG, USDG);
   for (const h of near) {
     say(`== trace: block ${h.b} $${h.usd} ${h.buy.dex} -> ${h.sell.dex} (node gas ${h.gas})`);
     const data = encodeExecuteRaw({ token: USDG, amountIn: h.amountIn, minProfit: (1n << 256n) - 1n, maxBlock: (1n << 256n) - 1n, hops: h.hops });
