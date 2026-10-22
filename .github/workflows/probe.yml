@@ -108,6 +108,9 @@ jobs:
       - name: RIVN/USDG check probe (read-only)
         if: inputs.only == 'rivn'
         shell: bash
+        env:
+          PROBE_BLOCKS: latest
+          PROBE_TRACES: '3'
         run: |
           timeout 2400 node .scripts-build/scripts/probe-rivn.js > rivn.txt 2>&1 || true
           cat rivn.txt

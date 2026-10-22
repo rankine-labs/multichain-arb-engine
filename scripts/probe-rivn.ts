@@ -25,7 +25,8 @@ import { PoolState } from '../src/core/types';
 
 const URL_ = process.env.ROBINHOOD_RPC_URL ?? 'https://rpc.mainnet.chain.robinhood.com';
 const WANT = (process.env.PROBE_SYMBOL ?? 'RIVN').toUpperCase();
-const BLOCKS = (process.env.PROBE_BLOCKS ?? '0x5b03bfb,0x5b03c03,0x5b07fbd,0x5b080b5').split(',').map((s) => s.trim()).filter(Boolean);
+const MISMATCH_BLOCKS = '0x5b03bfb,0x5b03c03,0x5b07fbd,0x5b080b5';
+let BLOCKS = (process.env.PROBE_BLOCKS ?? MISMATCH_BLOCKS).split(',').map((s) => s.trim()).filter(Boolean);
 const COPY_GAS = 841_669;
 const USDG = ROBINHOOD_TOKENS.USDG.toLowerCase();
 const PM = ROBINHOOD_V4.POOL_MANAGER.toLowerCase();
@@ -65,7 +66,7 @@ async function logsChunked(filter: Record<string, unknown>, from: number, to: nu
 async function findCoin(): Promise<string | null> {
   const topic = ethers.id('Transfer(address,address,uint256)');
   const seen = new Set<string>();
-  for (const b of BLOCKS) {
+  for (const b of MISMATCH_BLOCKS.split(',')) {
     const n = parseInt(b, 16);
     const logs = await rpc('eth_getLogs', [{ topics: [topic], fromBlock: hex(n - 40), toBlock: hex(n) }]);
     if (logs.error) { say(`  getLogs near ${b}: ERR ${short(logs.error, 120)}`); continue; }
@@ -100,6 +101,13 @@ function v4Of(p: PoolState) { return (p as any).v4 as { poolManager: string; fee
 (async () => {
   const latest = Number((await rpc('eth_blockNumber', [])).result);
   say(`latest block ${latest} (${hex(latest)})`);
+  // How far back does this node keep state?
+  for (const back of [10, 100, 400, 1000, 4000]) {
+    const r = await rpc('eth_getBalance', [PM, hex(latest - back)]);
+    say(`  state ${back} blocks back: ${r.error ? 'NO' : 'yes'}`);
+  }
+  // "latest": one fixed recent block for the whole probe (the gap stands).
+  if (BLOCKS.length === 1 && BLOCKS[0] === 'latest') BLOCKS = [hex(latest - 2)];
   // Archive? (state at the first mismatch block)
   const arch = await rpc('eth_getBalance', [PM, BLOCKS[0]]);
   say(`state at ${BLOCKS[0]}: ${arch.error ? 'NOT AVAILABLE ' + short(arch.error, 160) : 'available'}`);
@@ -125,6 +133,20 @@ function v4Of(p: PoolState) { return (p as any).v4 as { poolManager: string; fee
   // Balance slots (how a copy finds them): the bot's lookup on both coins.
   for (const t of [coin, USDG]) {
     try { const s = await findBalanceSlot(rpc, 'robinhood:' + t, t); say(`balance slot lookup ${t}: ${s === null ? 'NOT FOUND' : short(s && 'slot' in (s as any) ? (s as any).slot : s, 200)}`); } catch (e) { say(`balance slot lookup ${t}: error ${(e as Error).message}`); }
+  }
+  // Where RIVN keeps the PoolManager's / a pool's balance: the slots balanceOf reads.
+  for (const holder of [PM, ...pools.filter((p) => !v4Of(p)).map((p) => p.poolAddress)]) {
+    const tr = await rpc('debug_traceCall', [{ to: coin, data: ethers.id('balanceOf(address)').slice(0, 10) + pad(holder) }, BLOCKS[0], { tracer: 'prestateTracer' }]);
+    const bal = await view(coin, 'balanceOf(address)', pad(holder), BLOCKS[0]);
+    if (tr.error) { say(`balanceOf(${holder}) trace: ${short(tr.error, 160)}`); continue; }
+    say(`balanceOf(${holder.slice(0, 10)}) = ${big(bal)} reads:`);
+    for (const [a, acct] of Object.entries<any>(tr.result ?? {})) for (const [k, v] of Object.entries<any>(acct.storage ?? {})) say(`   ${a.slice(0, 10)} ${k} = ${v}`);
+  }
+  for (const p of pools.filter((q) => v4Of(q))) {
+    const baseSlot = ethers.keccak256(ethers.AbiCoder.defaultAbiCoder().encode(['bytes32', 'uint256'], [p.poolAddress, 6]));
+    const s0 = (await rpc('eth_getStorageAt', [PM, baseSlot, BLOCKS[0]])).result;
+    const liq = (await rpc('eth_getStorageAt', [PM, hex(BigInt(baseSlot) + 3n), BLOCKS[0]])).result;
+    say(`v4 ${p.poolAddress.slice(0, 10)} slot0 ${s0} liquidity ${liq}`);
   }
   const sizes = (process.env.PROBE_SIZES ?? '30,100,300,1000,3000').split(',').map(Number);
   type Hit = { b: string; buy: PoolState; sell: PoolState; usd: number; amountIn: bigint; hops: any[]; status: string; gas: number; reason: string };
