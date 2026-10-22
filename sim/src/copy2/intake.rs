@@ -534,6 +534,28 @@ c2counters!(
     // Checks that read a PoolManager balance and ran twice; answered (same
     // result at the bound and far above it) / unknown (different).
     pm_bound_checks, pm_bound_same, pm_bound_differ,
+    // ---- copy2-l (live Oct 22, 10:36 shadow) ----
+    // Late coin Transfers of a followed pool balance applied exactly to
+    // every kept version from their block on (was: balance forgotten when a
+    // later transfer had been applied already).
+    late_coin_deltas,
+    // Late coin Transfers already inside the balance's node value (their
+    // block <= the block the value was read at): nothing to add; versions
+    // older than that read forget it.
+    late_coin_included,
+    // Fills of a busy pool's coin balance carried forward exactly through
+    // the kept reports since the node's block (was: asked again until the
+    // pool was quiet for a whole node round trip).
+    fill_balance_carried,
+    // Values the copy holds that NOTHING follows (coin settings such as a
+    // stock coin's namespaced config or WETH's totalSupply, other accounts'
+    // storage such as a coin's compliance contract, wallets' coin
+    // balances), read once by a fill and kept: re-read every
+    // ARBSIM_COPY2_VERIFY_S; a value the chain changed is forgotten in
+    // every version (read again when a check needs it) and counted.
+    verify_rounds, verify_items, unfollowed_changed,
+    // How many such values the copy held at the last round (a level).
+    unfollowed_held,
 );
 
 fn inc(c: &AtomicU64) {
@@ -611,6 +633,16 @@ pub struct C2Shared {
     pub walk_paused: Mutex<Option<String>>,
     /// Lost-message reloads by the bot's reason (status `gapReasons`).
     pub gap_reasons: Mutex<HashMap<String, u64>>,
+    /// Unanswered checks by their reason (status `checks.unknownBy`: miss,
+    /// pending_reports, unsure_pool, pool_manager_balance, not_ready, ...).
+    pub unknown_by: Mutex<HashMap<String, u64>>,
+    /// Unanswered checks by WHAT they missed (status `checks.blockedBy`):
+    /// label -> (checks that missed at least one such value, checks that
+    /// missed ONLY such values = what following it alone would answer).
+    pub blocked_by: Mutex<HashMap<String, (u64, u64)>>,
+    /// Values nothing follows that the chain had changed (verify rounds):
+    /// (account, slot) -> times (status `unfollowedChanged`).
+    pub unfollowed_changes: Mutex<HashMap<(Address, U256), u64>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -797,6 +829,41 @@ impl Copy2Handle {
         }
     }
 
+    /// An unanswered check (server.rs): count its reason, and for a miss
+    /// what it missed (one count per label per check; `only` when every
+    /// missed value has the same label). Live Oct 22 the copy answered 4 of
+    /// 62 checks while the misses named only a few dozen values: this says
+    /// whether every unknown check is explained by a missing value, and
+    /// which value alone blocks how many checks.
+    pub fn note_unknown(&self, why: &str, missing: &[MissItem]) {
+        {
+            let mut u = self.c2.unknown_by.lock().unwrap();
+            if u.len() < 100 || u.contains_key(why) {
+                *u.entry(why.to_string()).or_default() += 1;
+            }
+        }
+        if missing.is_empty() {
+            return;
+        }
+        let labels: std::collections::BTreeSet<String> = {
+            let reg = self.c2.reg.read().unwrap();
+            let checkers: Vec<Address> = self.c2.check_accounts.lock().unwrap().keys().copied().collect();
+            missing.iter().map(|m| miss_label(&reg, &checkers, &self.sh.volatile, m)).collect()
+        };
+        let mut b = self.c2.blocked_by.lock().unwrap();
+        let only = labels.len() == 1;
+        for l in labels {
+            if b.len() >= 300 && !b.contains_key(&l) {
+                continue;
+            }
+            let e = b.entry(l).or_default();
+            e.0 += 1;
+            if only {
+                e.1 += 1;
+            }
+        }
+    }
+
     /// Copy 2: a check that ran on the version of `block` and touched these
     /// accounts: is one of them a pool whose reports for that block may not
     /// have all arrived yet? Then the answer must be "unknown" (why).
@@ -889,9 +956,18 @@ impl Copy2Handle {
         let checks_v = {
             let t = self.sh.stats.checks.load(Ordering::Relaxed);
             let ok = self.sh.stats.checks_ok.load(Ordering::Relaxed);
+            // Unanswered checks by reason, and what the "miss" ones missed:
+            // [label, checks missing it, checks missing ONLY it] (top 15).
+            let unknown_by: serde_json::Map<String, Value> = self.c2.unknown_by.lock().unwrap().iter().map(|(k, v)| (k.clone(), json!(v))).collect();
+            let mut bb: Vec<(String, (u64, u64))> = self.c2.blocked_by.lock().unwrap().iter().map(|(k, v)| (k.clone(), *v)).collect();
+            bb.sort_by(|x, y| y.1 .0.cmp(&x.1 .0).then(y.1 .1.cmp(&x.1 .1)).then(x.0.cmp(&y.0)));
+            let blocked: Vec<Value> = bb.into_iter().take(15).map(|(k, (n, only))| json!([k, n, only])).collect();
             // Share of checks (calls / size searches, all callers) the copy
             // answered itself (the rest: unknown, the bot asks the node).
-            json!({ "total": t, "answered": ok, "answeredPct": if t > 0 { Some(((ok as f64) * 1000.0 / t as f64).round() / 10.0) } else { None } })
+            // Counted since arbsim started (the bot's hourly line counts its
+            // own checks per hour: one bot check can be several of these).
+            json!({ "total": t, "answered": ok, "answeredPct": if t > 0 { Some(((ok as f64) * 1000.0 / t as f64).round() / 10.0) } else { None },
+                    "unknownBy": unknown_by, "blockedBy": blocked })
         };
         // Tick data of V3-style pools (copy2/walk.rs): pools whose ready copy
         // holds every tick a realistic check can touch.
@@ -938,6 +1014,11 @@ impl Copy2Handle {
                 .map(|((c, a, sl), n)| json!([c, to_hex(a.as_slice()), format!("{sl:#x}"), n, describe_slot(&reg, &checkers, *a, *sl)]))
                 .collect()
         };
+        let unfollowed_changed: Vec<Value> = {
+            let mut v: Vec<((Address, U256), u64)> = self.c2.unfollowed_changes.lock().unwrap().iter().map(|(k, n)| (*k, *n)).collect();
+            v.sort_by(|x, y| y.1.cmp(&x.1).then(x.0.cmp(&y.0)));
+            v.into_iter().take(20).map(|((a, sl), n)| json!([to_hex(a.as_slice()), format!("{sl:#x}"), n])).collect()
+        };
         let mut out = json!({
             "source": "pool-events",
             "pools": reg.pools.len(),
@@ -970,6 +1051,10 @@ impl Copy2Handle {
             // The 20 accounts with the most missed items (class, account, count).
             "missesTop": misses_top,
             "missesTopSlots": misses_top_slots,
+            // Values held that nothing follows, re-read every
+            // ARBSIM_COPY2_VERIFY_S: [account, slot, times the chain had
+            // changed one] (should stay empty; anything here: tell Claude).
+            "unfollowedChanged": unfollowed_changed,
             "outsideContracts": self.sh.volatile.whole_len(),
             // The node client's adaptive speed limit (dry run #16): the rate
             // allowed now, the plan rate, refusals by the provider.
@@ -1070,6 +1155,11 @@ pub struct C2Config {
     /// when both agree (copy2/checkview.rs) [ARBSIM_COPY2_PM_BOUND, 1;
     /// 0 = the old behaviour, only for tests: a stale held balance].
     pub pm_bound: bool,
+    /// Re-read the values the copy holds but nothing follows every N
+    /// seconds [ARBSIM_COPY2_VERIFY_S, 60; 0 = off], at most
+    /// [ARBSIM_COPY2_VERIFY_MAX, 400] values a round.
+    pub verify_every_s: u64,
+    pub verify_max: usize,
 }
 
 impl C2Config {
@@ -1092,10 +1182,12 @@ impl C2Config {
             max_keep_logs: env_u64("ARBSIM_COPY2_MAX_KEEP_LOGS", 150_000).max(1000) as usize,
             pending_ms: env_u64("ARBSIM_COPY2_PENDING_MS", 1500),
             pm_bound: env_u64("ARBSIM_COPY2_PM_BOUND", 1) != 0,
+            verify_every_s: env_u64("ARBSIM_COPY2_VERIFY_S", 60),
+            verify_max: env_u64("ARBSIM_COPY2_VERIFY_MAX", 400).clamp(1, 10_000) as usize,
         }
     }
     pub fn for_tests() -> Self {
-        C2Config { reload_ms: 0, reload_max_ms: 0, layout_retry_s: 3600, load_batch: 25, loaders: 2, keep_blocks: 400, max_keep_blocks: 4000, max_rounds: 40, tip_every_s: 0, catchup_max_blocks: 64, walk: WalkCfg::default(), walks_inflight: 2, walk_max_slots: 1_000_000, walk_max_rss_mb: 0, max_keep_logs: 1_000_000, pending_ms: 300, pm_bound: true }
+        C2Config { reload_ms: 0, reload_max_ms: 0, layout_retry_s: 3600, load_batch: 25, loaders: 2, keep_blocks: 400, max_keep_blocks: 4000, max_rounds: 40, tip_every_s: 0, catchup_max_blocks: 64, walk: WalkCfg::default(), walks_inflight: 2, walk_max_slots: 1_000_000, walk_max_rss_mb: 0, max_keep_logs: 1_000_000, pending_ms: 300, pm_bound: true, verify_every_s: 0, verify_max: 400 }
     }
 }
 
@@ -1150,6 +1242,8 @@ enum JobFor {
     Walk { key: PoolKey, gen: u64 },
     /// Settling pools whose reports for blocks from..=to may be missing.
     Logs { from: u64, to: u64 },
+    /// Re-reading values nothing follows (dispatch_verify).
+    Verify,
 }
 
 /// One pool's part of a load job.
@@ -1193,6 +1287,19 @@ pub struct Intake {
     /// up to the end of its block".
     last_pos: HashMap<PoolKey, Pos>,
     coin_pos: HashMap<(Address, Address), Pos>,
+    /// Followed coin balance (coin, holder) -> the block of the NODE value
+    /// it descends from (a load's fetch block, a fill's block): everything
+    /// up to the end of that block is in it; transfers after it were added
+    /// one by one. Decides what a late Transfer means (apply_coin_transfer).
+    coin_base: HashMap<(Address, Address), u64>,
+    /// Late coin Transfers to apply to every kept version from their block
+    /// on, collected by apply_coin_transfer(late) and applied by on_late:
+    /// (coin, balance slot, block, is_from, amount).
+    late_deltas: Vec<(Address, U256, u64, bool, U256)>,
+    /// Late coin Transfers already inside the node value: versions from
+    /// their block up to (not incl.) the node value's block forget the
+    /// balance: (coin, slot, from block, base block).
+    late_included: Vec<(Address, U256, u64, u64)>,
     /// Blocks we got a message for (lost-message check).
     received: std::collections::BTreeSet<u64>,
     /// Balance traces running / to retry after a node error / judged
@@ -1241,6 +1348,8 @@ pub struct Intake {
     settle_retry: Option<(Instant, u32)>,
     /// The node can't do the walk's debug_traceCall: walks off.
     walk_off: bool,
+    /// Last round of re-reading the values nothing follows.
+    last_verify: Instant,
     /// Process memory (MB) and when it was read (the walk guard reads it at
     /// most once a second).
     rss: std::cell::Cell<(f64, Option<Instant>)>,
@@ -1272,6 +1381,9 @@ pub fn manual(sh: Arc<Shared>, fills: Arc<FillQueue>, cfg: C2Config) -> (Intake,
         check_accounts: Mutex::new(HashMap::new()),
         walk_paused: Mutex::new(None),
         gap_reasons: Mutex::new(HashMap::new()),
+        unknown_by: Mutex::new(HashMap::new()),
+        blocked_by: Mutex::new(HashMap::new()),
+        unfollowed_changes: Mutex::new(HashMap::new()),
     });
     let loaders = sh
         .node
@@ -1295,6 +1407,9 @@ pub fn manual(sh: Arc<Shared>, fills: Arc<FillQueue>, cfg: C2Config) -> (Intake,
         last_progress: Instant::now(),
         last_pos: HashMap::new(),
         coin_pos: HashMap::new(),
+        coin_base: HashMap::new(),
+        late_deltas: Vec::new(),
+        late_included: Vec::new(),
         received: std::collections::BTreeSet::new(),
         tracing: HashSet::new(),
         trace_retry: HashMap::new(),
@@ -1322,6 +1437,7 @@ pub fn manual(sh: Arc<Shared>, fills: Arc<FillQueue>, cfg: C2Config) -> (Intake,
         suspects: BTreeMap::new(),
         settle_retry: None,
         walk_off: false,
+        last_verify: Instant::now(),
         rss: std::cell::Cell::new((0.0, None)),
     };
     (i, Copy2Handle { tx, sh, c2 })
@@ -1535,6 +1651,7 @@ impl Intake {
         self.dispatch_fills();
         self.dispatch_walks();
         self.dispatch_settle();
+        self.dispatch_verify();
         self.note_round();
         self.watchdog();
         *self.c2.in_flight.lock().unwrap() = (self.jobs.len(), self.partials.len());
@@ -1900,6 +2017,9 @@ impl Intake {
                     forget_slot(snap, *a, *sl);
                 }
             });
+            let deltas = std::mem::take(&mut self.late_deltas);
+            let included = std::mem::take(&mut self.late_included);
+            apply_late_coin_changes(&mut p.versions, &deltas, &included);
         }
         // The kept reports and the recent list learn the new ones.
         if let Some(bb) = self.buf.iter_mut().find(|b| b.block == n) {
@@ -2103,9 +2223,36 @@ impl Intake {
                 let Some(slot) = slots.get(&side).copied() else { continue };
                 let t = self.touched_slot.entry((coin, slot)).or_insert(0);
                 *t = (*t).max(block);
-                if late && self.coin_pos.get(&(coin, side)).is_some_and(|p| *p >= pos) {
-                    inc(&self.c2.stats.coin_slot_mismatch);
-                    ov.forget_slot(coin, slot);
+                if late {
+                    // A late Transfer (live Oct 22: the busiest pool,
+                    // WETH/USDG 0x52e65b17, lost its balances this way over
+                    // and over: its reports come on separate subscriptions
+                    // and settles add missed ones ~1.5 s later, by when the
+                    // pool has traded again; the old rule "a later transfer
+                    // was applied already -> forget" then made the balance
+                    // MISSING, and a fill of a pool that trades every few
+                    // blocks was asked again forever).
+                    // Adding is exact in any order: the held value of every
+                    // version from block n on lacks exactly this transfer IF
+                    // it descends from a node value read before block n
+                    // (coin_base). A node value read at or after block n has
+                    // it already: nothing to add there; versions in between
+                    // (older chain values) forget it.
+                    match self.coin_base.get(&(coin, side)).copied() {
+                        Some(base) if block > base => {
+                            inc(&self.c2.stats.late_coin_deltas);
+                            self.late_deltas.push((coin, slot, block, is_from, v));
+                        }
+                        Some(base) => {
+                            inc(&self.c2.stats.late_coin_included);
+                            self.late_included.push((coin, slot, block, base));
+                        }
+                        None => {
+                            // Where its value came from is unknown: never guess.
+                            inc(&self.c2.stats.coin_slot_mismatch);
+                            ov.forget_slot(coin, slot);
+                        }
+                    }
                     continue;
                 }
                 if let Lookup::Known(cur) = ov.slot(coin, slot) {
@@ -2598,6 +2745,7 @@ impl Intake {
             (JobFor::Trace, Done::Trace { coin, holder, block, res, .. }) => self.on_trace(coin, holder, block, res),
             (JobFor::Walk { key, gen }, Done::Walk { block, res, .. }) => self.on_walk(key, gen, block, res),
             (JobFor::Logs { from, to }, Done::Logs { res, .. }) => self.on_settle(from, to, res),
+            (JobFor::Verify, Done::Fetch { block, res, .. }) => self.on_verify(block, res),
             _ => {}
         }
     }
@@ -3211,6 +3359,7 @@ impl Intake {
             drop(p);
             for (c, _) in &disagree {
                 self.coin_pos.remove(&(*c, pool.address));
+                self.coin_base.remove(&(*c, pool.address));
             }
         }
         let head = match self.sh.head() {
@@ -3250,6 +3399,7 @@ impl Intake {
                 facts.push(Fact::Slot(*addr, *s, *v));
             }
         }
+        let head_missing: HashSet<(Address, U256)> = bal_slots.iter().filter(|(c, sl)| matches!(head.snap.storage(*c, *sl), Lookup::Missing)).copied().collect();
         // Write where the head doesn't know the value (values the head knows
         // are followed exactly already, e.g. a coin balance or a V4
         // PoolManager slot shared with a ready pool).
@@ -3277,6 +3427,17 @@ impl Intake {
         for (c, sl) in &bal_slots {
             if !disagree.contains(&(*c, *sl)) {
                 self.coin_pos.insert((*c, pool.address), (head.block, END, END));
+                // The head now holds this load's node value (read at
+                // part.base) if it didn't hold the balance before: from now
+                // on every held value of it descends from that read
+                // (coin_base), so older versions (older reads) forget it.
+                // If the head held it already (and it agreed), the followed
+                // chain and its coin_base stay.
+                if part.base.0 > 0 && head_missing.contains(&(*c, *sl)) && matches!(part.ov.snapshot().storage(*c, *sl), Lookup::Known(_)) {
+                    self.coin_base.insert((*c, pool.address), part.base.0);
+                    let mut p = self.sh.published.write().unwrap();
+                    forget_before(&mut p.versions, head.block, *c, *sl);
+                }
             }
         }
         let mut reg = self.c2.reg.write().unwrap();
@@ -3771,6 +3932,8 @@ impl Intake {
         };
         let mut good: Vec<Fetched> = Vec::new();
         let mut again: Vec<MissItem> = Vec::new();
+        // (coin, slot, pool, node value at k): busy pools' coin balances.
+        let mut carried: Vec<(Address, U256, Address, U256)> = Vec::new();
         {
             let mut reg = self.c2.reg.write().unwrap();
             for (it, f) in out.items {
@@ -3782,7 +3945,21 @@ impl Intake {
                     }
                     Err(_) => continue,
                 };
-                if let Fetched::Slot(a, s, _) = &f {
+                if let Fetched::Slot(a, s, v) = &f {
+                    // A followed pool's coin balance (live Oct 22: WETH/USDG
+                    // 0x52e65b17 trades every few blocks, so "nothing touched
+                    // it since k" almost never held and its balance stayed
+                    // missing): the node value at k plus the kept Transfers
+                    // since k, exactly (fill_balance_carried).
+                    let bal_of = if reg.by_addr.contains_key(a) || reg.owner_of.contains_key(a) { None } else { Self::gate_of(&reg, *a, *s) };
+                    if let Some(g) = bal_of {
+                        let keys = reg.pools_of(&g);
+                        if !keys.iter().all(|pk| reg.pools.get(pk).is_some_and(|e| e.state == PoolState::Ready && e.ready_since <= k)) {
+                            continue; // refused: the pool isn't followed right now
+                        }
+                        carried.push((*a, *s, g, *v));
+                        continue;
+                    }
                     if self.touched_slot.get(&(*a, *s)).is_some_and(|b| *b > k) {
                         again.push(it);
                         continue;
@@ -3817,14 +3994,17 @@ impl Intake {
                                 let lp = self.last_pos.entry(pk).or_insert((0, 0, 0));
                                 *lp = (*lp).max((k, END, END));
                             }
-                        } else {
-                            // A pool's coin balance.
-                            let cp = self.coin_pos.entry((*a, g)).or_insert((0, 0, 0));
-                            *cp = (*cp).max((k, END, END));
                         }
                     }
                 }
                 good.push(f);
+            }
+        }
+        for (c, sl, g, v) in carried {
+            if self.fill_balance_carried(c, sl, g, k, v) {
+                inc(&self.c2.stats.fill_balance_carried);
+            } else {
+                again.push(MissItem::Slot(c, sl));
             }
         }
         if !again.is_empty() {
@@ -3842,6 +4022,223 @@ impl Intake {
             let mut p = self.sh.published.write().unwrap();
             reconcile(&mut p.versions, k, &good);
         }
+        self.sh.notify();
+    }
+
+    /// A busy pool's coin balance read from the node at block `k` (value
+    /// `v`): in a kept version j (block >= k) it is v plus / minus the
+    /// Transfers of that coin to / from the pool in the kept reports of
+    /// blocks k+1..=j (a followed balance changes ONLY by its Transfers;
+    /// replays never write coin storage). Written into each version that
+    /// doesn't hold the balance. Needs the copy at or past k and every
+    /// report since k (the buffer reaches back past k with no hole). A
+    /// Transfer for a block after k that is still on the way (late report,
+    /// settle) is added when it comes: coin_base = k.
+    /// false = not possible now (asked again later).
+    fn fill_balance_carried(&mut self, coin: Address, slot: U256, holder: Address, k: u64, v: U256) -> bool {
+        let Some(head) = self.sh.head() else { return false };
+        if head.block < k {
+            return false; // the node is ahead of the copy: a value from the future
+        }
+        let first_after = {
+            let p = self.sh.published.read().unwrap();
+            if p.versions.iter().any(|x| x.block > k && x.restart) {
+                return false;
+            }
+            if p.versions.front().is_none_or(|x| x.block > k) {
+                return false; // the versions since k are no longer all kept
+            }
+            p.versions.iter().find(|x| x.block > k).map(|x| x.block)
+        };
+        if let Some(fa) = first_after {
+            if self.buf.front().is_none_or(|b| b.block > fa) {
+                return false; // reports since k no longer all kept (or a hole)
+            }
+        }
+        let mut deltas: Vec<(u64, bool, U256)> = Vec::new();
+        for b in self.buf.iter().filter(|b| b.block > k) {
+            for l in b.logs.iter() {
+                let Some((c, from, to, amt)) = coin_transfer(l) else { continue };
+                if c != coin || from == to {
+                    continue;
+                }
+                if from == holder {
+                    deltas.push((b.block, true, amt));
+                }
+                if to == holder {
+                    deltas.push((b.block, false, amt));
+                }
+            }
+        }
+        let mut p = self.sh.published.write().unwrap();
+        let mut vals: Vec<(usize, U256)> = Vec::new();
+        for (i, ver) in p.versions.iter().enumerate() {
+            if ver.block < k {
+                continue;
+            }
+            let (mut add, mut sub) = (U256::ZERO, U256::ZERO);
+            for (b, is_from, amt) in &deltas {
+                if *b > ver.block {
+                    continue;
+                }
+                let t = if *is_from { &mut sub } else { &mut add };
+                let Some(x) = t.checked_add(*amt) else { return false };
+                *t = x;
+            }
+            // Below zero: the node value and the reports don't fit
+            // together (never a guess: asked again).
+            let Some(x) = v.checked_add(add).and_then(|y| y.checked_sub(sub)) else { return false };
+            vals.push((i, x));
+        }
+        // Every version from k on gets exactly this value; older versions
+        // (values from an older node read) forget it. Then every value of
+        // this balance the copy holds descends from the read at k, which is
+        // what coin_base says (a late Transfer is judged against it).
+        let mut differ = 0u64;
+        for i in 0..p.versions.len() {
+            let ver = p.versions[i].clone();
+            let want = vals.iter().find(|x| x.0 == i).map(|x| x.1);
+            let have = ver.snap.storage(coin, slot);
+            let mut s = (*ver.snap).clone();
+            match (want, have) {
+                (Some(x), Lookup::Known(h)) if h == x => continue,
+                (Some(x), h) => {
+                    if matches!(h, Lookup::Known(_)) {
+                        differ += 1;
+                    }
+                    s.apply_fact(&Fact::Slot(coin, slot, x));
+                }
+                (None, Lookup::Known(_)) => forget_slot(&mut s, coin, slot),
+                (None, Lookup::Missing) => continue,
+            }
+            let txs = ver.txs.iter().map(|t| {
+                let mut ts = (*t.snap).clone();
+                forget_slot(&mut ts, coin, slot);
+                crate::feed::replay::TxSnap { hash: t.hash, snap: Arc::new(ts), diff: t.diff.clone() }
+            }).collect();
+            p.versions[i] = Arc::new(Version { snap: Arc::new(s), txs, ..(*ver).clone() });
+        }
+        drop(p);
+        if differ > 0 {
+            // A version held another value (it went missing in a newer one):
+            // the node read wins (it is exact by construction).
+            add(&self.c2.stats.coin_balance_disagree, differ);
+        }
+        let cp = self.coin_pos.entry((coin, holder)).or_insert((0, 0, 0));
+        *cp = (*cp).max((k, END, END));
+        self.coin_base.insert((coin, holder), k);
+        add(&self.c2.stats.fill_items, 1);
+        self.sh.notify();
+        true
+    }
+
+    /// Values the head holds that nothing follows: storage of accounts
+    /// that are not a pool, a pool's own account, a V4 PoolManager or an
+    /// outside contract; for coins, every slot except our pools' balances.
+    fn unfollowed_items(&self, head: &Snapshot) -> Vec<MissItem> {
+        let reg = self.c2.reg.read().unwrap();
+        let mut out = Vec::new();
+        // Our own made-up accounts (Algebra replay notes): not on the chain.
+        let notes: HashSet<Address> = reg.pools.values().map(|e| super::replay::notes_address(e.pool.address)).collect();
+        for (a, acct) in head.accounts.iter() {
+            if reg.by_addr.contains_key(a) || reg.owner_of.contains_key(a) || reg.is_pm(a) || self.sh.volatile.is_whole(a) || notes.contains(a) {
+                continue;
+            }
+            let ours: HashSet<U256> = reg.holders.get(a).map(|h| h.iter().filter_map(|x| reg.bal_slot(*a, *x)).collect()).unwrap_or_default();
+            for (sl, _) in acct.storage.iter() {
+                if !ours.contains(sl) {
+                    out.push(MissItem::Slot(*a, *sl));
+                }
+            }
+        }
+        out.sort_by(|x, y| format!("{x:?}").cmp(&format!("{y:?}")));
+        out
+    }
+
+    /// Every ARBSIM_COPY2_VERIFY_S: re-read (one fetch job, at the node's
+    /// block) the values nothing follows. They are kept because they almost
+    /// never change (coin settings, a compliance contract's lists), but
+    /// nothing tells the copy when they do; this bounds how long a changed
+    /// one can be used and shows whether it happens at all.
+    fn dispatch_verify(&mut self) {
+        if self.cfg.verify_every_s == 0 || self.last_verify.elapsed() < Duration::from_secs(self.cfg.verify_every_s) {
+            return;
+        }
+        if self.loaders.is_none() || self.refusing_now() || self.jobs.values().any(|j| matches!(j, JobFor::Verify)) {
+            return;
+        }
+        self.last_verify = Instant::now();
+        let Some(head) = self.sh.head() else { return };
+        let mut items = self.unfollowed_items(&head.snap);
+        self.c2.stats.unfollowed_held.store(items.len() as u64, Ordering::Relaxed);
+        if items.is_empty() {
+            return;
+        }
+        // A round covers at most verify_max values, rotating through them.
+        let n = items.len();
+        let start = (self.c2.stats.verify_rounds.load(Ordering::Relaxed) as usize * self.cfg.verify_max) % n;
+        items.rotate_left(start);
+        items.truncate(self.cfg.verify_max);
+        inc(&self.c2.stats.verify_rounds);
+        add(&self.c2.stats.verify_items, items.len() as u64);
+        let id = self.new_job(JobFor::Verify);
+        self.loaders.as_ref().unwrap().send(Job::Fetch { id, block: head.block, exact: false, bulk: true, items, calls: vec![] });
+    }
+
+    /// Verify answers (values at block k): a held value that differs from
+    /// the chain's is forgotten in every kept version (we can't tell since
+    /// when it was wrong), then the chain's value at k is put in from k on
+    /// (exactly what a fill does: the same as forgetting it and the next
+    /// check reading it again, without that check being unknown), counted
+    /// and reported (status unfollowedChanged; log for the first 3 changes
+    /// of each value). E.g. WETH's totalSupply (slot 0x35) moves with every
+    /// wrap / unwrap on the chain and is refreshed each round; a stock
+    /// coin's settings should never show up here.
+    fn on_verify(&mut self, k: u64, res: Result<FetchOut, crate::node::NodeErr>) {
+        let Ok(out) = res else { return };
+        let mut changed: Vec<(Address, U256, U256, U256)> = Vec::new();
+        {
+            let p = self.sh.published.read().unwrap();
+            let Some(v) = p.versions.iter().rev().find(|v| v.block <= k) else { return };
+            for (_, f) in out.items {
+                let Ok(Fetched::Slot(a, sl, val)) = f else { continue };
+                if let Lookup::Known(h) = v.snap.storage(a, sl) {
+                    if h != val {
+                        changed.push((a, sl, h, val));
+                    }
+                }
+            }
+        }
+        if changed.is_empty() {
+            return;
+        }
+        add(&self.c2.stats.unfollowed_changed, changed.len() as u64);
+        for (a, sl, old, new) in &changed {
+            let n = {
+                let mut m = self.c2.unfollowed_changes.lock().unwrap();
+                if m.len() < 1000 || m.contains_key(&(*a, *sl)) {
+                    let e = m.entry((*a, *sl)).or_default();
+                    *e += 1;
+                    *e
+                } else {
+                    u64::MAX
+                }
+            };
+            if n <= 3 {
+                eprintln!(
+                    "[arbsim] copy2: a value nothing follows CHANGED on the chain: account {a} slot {sl:#x} held {old:#x}, chain {new:#x} at block {k}; refreshed (status unfollowedChanged counts further changes)"
+                );
+            }
+        }
+        let fresh: Vec<Fetched> = changed.iter().map(|(a, sl, _, v)| Fetched::Slot(*a, *sl, *v)).collect();
+        let mut p = self.sh.published.write().unwrap();
+        rewrite_from(&mut p.versions, 0, |s| {
+            for (a, sl, _, _) in &changed {
+                forget_slot(s, *a, *sl);
+            }
+        });
+        reconcile(&mut p.versions, k, &fresh);
+        drop(p);
         self.sh.notify();
     }
 
@@ -4089,6 +4486,60 @@ fn current_tick(p: &TrackedPool, s: &Snapshot) -> Option<i64> {
     Some(if t >= 1 << 23 { t - (1 << 24) } else { t })
 }
 
+/// Short label of a missed item for `checks.blockedBy`: the class (as
+/// missesByClass) and, for a slot, what it is (describe_slot), with long
+/// hex numbers cut to their first 10 characters (bounded, still telling).
+fn miss_label(reg: &Registry, checkers: &[Address], vol: &crate::state::snap::Volatile, m: &MissItem) -> String {
+    let (a, what) = match m {
+        MissItem::Account(a) => (*a, "basics"),
+        MissItem::Slot(a, _) => (*a, "slot"),
+        MissItem::Code(_) => return "code".into(),
+    };
+    let who = if vol.is_whole(&a) {
+        "outside contract"
+    } else if reg.by_addr.contains_key(&a) {
+        "pool"
+    } else if reg.holders.contains_key(&a) {
+        "coin"
+    } else if reg.owner_of.contains_key(&a) {
+        "pool's own account"
+    } else {
+        "other account"
+    };
+    let detail = match m {
+        MissItem::Slot(_, sl) => describe_slot(reg, checkers, a, *sl),
+        _ => String::new(),
+    };
+    let mut out = format!("{who} {what} {}", short_hex(&format!("{a:#x}")));
+    if !detail.is_empty() {
+        out.push_str(": ");
+        out.push_str(&short_hex(&detail));
+    }
+    out
+}
+
+/// Every hex number longer than 10 characters cut to its first 10.
+fn short_hex(t: &str) -> String {
+    let b = t.as_bytes();
+    let mut out = String::with_capacity(t.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'0' && i + 1 < b.len() && (b[i + 1] == b'x' || b[i + 1] == b'X') {
+            let mut j = i + 2;
+            while j < b.len() && b[j].is_ascii_hexdigit() {
+                j += 1;
+            }
+            let end = j.min(i + 10);
+            out.push_str(&t[i..end]);
+            i = j;
+            continue;
+        }
+        out.push(b[i] as char);
+        i += 1;
+    }
+    out
+}
+
 /// What a missed value is, where we can tell (status missesTopSlots).
 fn describe_slot(reg: &Registry, checkers: &[Address], a: Address, sl: U256) -> String {
     // A coin: whose balance?
@@ -4110,6 +4561,14 @@ fn describe_slot(reg: &Registry, checkers: &[Address], a: Address, sl: U256) -> 
                 if l.key(*c) == sl {
                     return format!("balance of the check's contract {c}");
                 }
+            }
+            // OpenZeppelin ERC20 keeps balances, allowances, totalSupply in
+            // that order (WETH here: balances 0x33, totalSupply 0x35).
+            if !l.vyper && !l.solady && l.slot < U256::from(1u64 << 32) && sl == l.slot + U256::from(2u8) {
+                return "probably totalSupply (OpenZeppelin order: balances, allowances, totalSupply): moves with every mint / burn on the chain (WETH: wrap / unwrap); held from a fill, refreshed every ARBSIM_COPY2_VERIFY_S".into();
+            }
+            if (sl & U256::from(0xffu8)) < U256::from(16u8) && sl > (U256::from(1u8) << 64usize) {
+                return "not a balance; looks like a namespaced (ERC-7201) setting of the coin (base ..00 + field): held from a fill, refreshed every ARBSIM_COPY2_VERIFY_S".into();
             }
             return "not a balance of a pool / PoolManager / check contract we know".into();
         }
@@ -4138,7 +4597,7 @@ fn describe_slot(reg: &Registry, checkers: &[Address], a: Address, sl: U256) -> 
         }
         for c in reg.pools.values().filter(|e| e.pool.address == a && e.pool.v4_id.is_some()).flat_map(|e| [e.pool.token0, e.pool.token1]) {
             if fields::map_slot(c, 1) == sl {
-                return format!("protocolFeesAccrued[{c}]");
+                return format!("protocolFeesAccrued[{c}] (V4 protocol fee counter: swaps of every protocol-fee pool in that coin and fee collections, which leave no event, move it; not followable; fills refused: checks through a pool with a protocol fee on in this direction stay unknown)");
             }
         }
         return "not a base slot / walked value of our V4 pools (another pool, a tick beyond our walk, claims ...)".into();
@@ -4300,6 +4759,122 @@ fn log_ids(logs: &[PoolLog]) -> Vec<LogId> {
     let mut v: Vec<LogId> = logs.iter().filter(|l| !l.removed).map(log_id).collect();
     v.sort();
     v
+}
+
+/// A followed coin balance changes ONLY by its Transfers (replays never
+/// write coin storage), so a late Transfer at block n changes every kept
+/// version from n on by exactly its amount, whatever else happened in
+/// between (adding is order-free). `deltas` (coin, slot, n, is_from,
+/// amount): applied to each version from n on that HOLDS the balance (a
+/// missing one stays missing); per version all of a slot's deltas are
+/// summed first, so their order doesn't matter. A version where the sum
+/// would go below zero held a wrong value: the balance is forgotten there
+/// and in every newer version (never a guess). `included` (coin, slot, n,
+/// base): a Transfer the node value read at `base` already contains:
+/// versions in [n, base) (older values that lack it) forget the balance.
+pub fn apply_late_coin_changes(versions: &mut VecDeque<Arc<Version>>, deltas: &[(Address, U256, u64, bool, U256)], included: &[(Address, U256, u64, u64)]) {
+    if deltas.is_empty() && included.is_empty() {
+        return;
+    }
+    let mut slots: Vec<(Address, U256)> = deltas.iter().map(|d| (d.0, d.1)).chain(included.iter().map(|x| (x.0, x.1))).collect();
+    slots.sort();
+    slots.dedup();
+    let mut broken: HashMap<(Address, U256), u64> = HashMap::new();
+    for i in 0..versions.len() {
+        let v = versions[i].clone();
+        let mut s = (*v.snap).clone();
+        let mut changed = false;
+        let mut forget: Vec<(Address, U256)> = Vec::new();
+        for &(c, sl) in &slots {
+            if broken.get(&(c, sl)).is_some_and(|b| v.block >= *b) {
+                forget.push((c, sl));
+                continue;
+            }
+            if included.iter().any(|x| x.0 == c && x.1 == sl && v.block >= x.2 && v.block < x.3) {
+                forget.push((c, sl));
+                continue;
+            }
+            let (mut add, mut sub) = (U256::ZERO, U256::ZERO);
+            let mut any = false;
+            for d in deltas.iter().filter(|d| d.0 == c && d.1 == sl && v.block >= d.2) {
+                any = true;
+                let t = if d.3 { &mut sub } else { &mut add };
+                match t.checked_add(d.4) {
+                    Some(x) => *t = x,
+                    None => {
+                        broken.insert((c, sl), v.block);
+                        break;
+                    }
+                }
+            }
+            if broken.contains_key(&(c, sl)) {
+                forget.push((c, sl));
+                continue;
+            }
+            if !any {
+                continue;
+            }
+            if let Lookup::Known(x) = s.storage(c, sl) {
+                match x.checked_add(add).and_then(|y| y.checked_sub(sub)) {
+                    Some(y) => {
+                        if y != x {
+                            s.apply_fact(&Fact::Slot(c, sl, y));
+                            changed = true;
+                        }
+                    }
+                    None => {
+                        broken.insert((c, sl), v.block);
+                        forget.push((c, sl));
+                    }
+                }
+            }
+        }
+        for (c, sl) in &forget {
+            if matches!(s.storage(*c, *sl), Lookup::Known(_)) {
+                forget_slot(&mut s, *c, *sl);
+                changed = true;
+            }
+        }
+        if !changed && v.txs.is_empty() {
+            continue;
+        }
+        // Per-transaction states (copy 2 keeps none): never left holding an
+        // old value next to a changed block state.
+        let txs = v
+            .txs
+            .iter()
+            .map(|t| {
+                let mut ts = (*t.snap).clone();
+                for &(c, sl) in &slots {
+                    forget_slot(&mut ts, c, sl);
+                }
+                crate::feed::replay::TxSnap { hash: t.hash, snap: Arc::new(ts), diff: t.diff.clone() }
+            })
+            .collect();
+        versions[i] = Arc::new(Version { snap: Arc::new(s), txs, ..(*v).clone() });
+    }
+}
+
+/// Forget one slot in every kept version older than `block`.
+fn forget_before(versions: &mut VecDeque<Arc<Version>>, block: u64, a: Address, slot: U256) {
+    for i in 0..versions.len() {
+        let v = versions[i].clone();
+        if v.block >= block || (matches!(v.snap.storage(a, slot), Lookup::Missing) && v.txs.is_empty()) {
+            continue;
+        }
+        let mut s = (*v.snap).clone();
+        forget_slot(&mut s, a, slot);
+        let txs = v
+            .txs
+            .iter()
+            .map(|t| {
+                let mut ts = (*t.snap).clone();
+                forget_slot(&mut ts, a, slot);
+                crate::feed::replay::TxSnap { hash: t.hash, snap: Arc::new(ts), diff: t.diff.clone() }
+            })
+            .collect();
+        versions[i] = Arc::new(Version { snap: Arc::new(s), txs, ..(*v).clone() });
+    }
 }
 
 /// Forget one slot in a snapshot (whole account if it was "complete").
