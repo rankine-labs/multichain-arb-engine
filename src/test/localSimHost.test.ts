@@ -180,7 +180,7 @@ async function main() {
     const lossSim = { status: 'loss', reason: 'ends with less' } as any;
     const asked: string[] = [];
     const reAlerts: string[] = [];
-    for (const [nodeThere, want] of [[{ status: 'profit', profit: 400n } as any, 'market moved'], [lossSim, 'COPY WRONG']] as const) {
+    for (const [nodeThere, want] of [[{ status: 'profit', profit: 400n } as any, 'EARLY'], [lossSim, 'MISMATCH']] as const) {
       const h = mk({ LOCAL_SIM: 'shadow' }, { alert: (t) => reAlerts.push(t), nodeAtBlock: async (_q, tag) => { asked.push(tag); return nodeThere; } })!;
       assert(await waitFor(() => h.client.isConnected()), 'recheck host connects');
       const c = h.begin({ kind: 'gap', trade: TRADE, simOpts: SIMOPTS, at: { block: '0x10' }, label: 'VIRTUAL/WETH gap' });
@@ -192,10 +192,10 @@ async function main() {
       const last = re[re.length - 1];
       assert(last && last.c2blk === '0x10' && last.lv === 'profit' && last.nv === 'loss' && String(last.result).startsWith(want), `disagreement asked again at the copy's block -> "${want}" (${last?.result})`);
       const line = h.takeHourLine() ?? '';
-      assert(want === 'market moved' ? /market moved 1, COPY WRONG 0/.test(line) : /market moved 0, COPY WRONG 1/.test(line), `hourly line counts it (${line})`);
+      assert(want === 'EARLY' ? /EARLY \(copy right, gap closed after\) 1, MISMATCH at same moment 0/.test(line) : /EARLY \(copy right, gap closed after\) 0, MISMATCH at same moment 1/.test(line), `hourly line counts it (${line})`);
     }
     assert(asked.length === 2 && asked.every((t) => t === '0x10'), 'the node is asked pinned at the copy block');
-    assert(reAlerts.length === 1 && /SAME BLOCK/.test(reAlerts[0]), 'only "copy wrong" alerts');
+    assert(reAlerts.length === 1 && /MISMATCH at same moment/.test(reAlerts[0]), 'only a MISMATCH alerts');
     // Agreement: no re-check.
     const h3 = mk({ LOCAL_SIM: 'shadow' }, { nodeAtBlock: async (_q, tag) => { asked.push(tag); return lossSim; } })!;
     assert(await waitFor(() => h3.client.isConnected()), 'host connects');
