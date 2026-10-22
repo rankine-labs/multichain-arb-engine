@@ -217,6 +217,9 @@ function sendBlock(b: BlockOut) {
   }
   const since = b.firstLogAt;
   const sentAt = Date.now();
+  // Status mode: start the clock now (the request below only fails after its
+  // 1.5 s timeout; starting the clock there measured the timeout, not arbsim).
+  if (score.ackMode === 'status' && b.logs.length && since !== null && !timingWatch) timingWatch = { block: b.block, since, sentAt };
   feed.request(msg).then((a) => {
     // arbsim answers block messages: that answer = "copy updated".
     if (a?.ok === true) { score.ackMode = 'answer'; if (since !== null && b.logs.length) score.updateMs.push(Date.now() - since); score.applyMs.push(Date.now() - sentAt); noteApplied(b.block); }
