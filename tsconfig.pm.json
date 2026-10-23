@@ -1,0 +1,7 @@
+{
+  // Builds only the profit-measure research script and the bot code it
+  // imports (read-only study on the throwaway branch profit-measure-run).
+  "extends": "./tsconfig.json",
+  "include": ["scripts/profit-measure/measure.ts"],
+  "compilerOptions": { "rootDir": ".", "outDir": ".scripts-build", "sourceMap": false, "declaration": false, "declarationMap": false }
+}
