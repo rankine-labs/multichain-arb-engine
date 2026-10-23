@@ -25,7 +25,6 @@
 // ============================================================================
 use std::io::BufWriter;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -35,6 +34,7 @@ use crate::arb::BlockCtx;
 use crate::check::proto_types::{handle_call, handle_size_search, CallRequest, SizeSearchRequest};
 use crate::copy2::checkview::{fee_nonzero, high_offset, C2View};
 use crate::copy2::intake::Copy2Handle;
+use crate::jobq::{is_fast, JobQueue};
 use crate::node::env_u64;
 use crate::proto::{bad_request, parse_at, parse_missing, parse_warm, read_msg, unknown, write_msg};
 use crate::state::fill::FillQueue;
@@ -92,32 +92,33 @@ pub fn bind(path: &str) -> std::io::Result<UnixListener> {
 
 /// Serve connections on an already-bound listener (tests use this).
 pub fn run(ctx: Arc<Ctx>, listener: UnixListener) -> std::io::Result<()> {
+    // Workers: more than the machine's CPU cores does not help (they only
+    // take turns on the same cores); the default stays 2 (the live server
+    // has 2 vCPUs). Trigger-entry work skips the line instead (jobq.rs).
     let workers = env_u64("ARBSIM_WORKERS", 2).clamp(1, 16) as usize;
     // Bounded: if the workers are swamped, new questions get "busy" at once.
-    let (tx, rx) = sync_channel::<Job>(256);
-    let rx = Arc::new(Mutex::new(rx));
+    // ARBSIM_PRIO_BURST [4]: most trigger-entry jobs in a row while other
+    // questions wait (0 = no fast lane, first come first served).
+    let burst = env_u64("ARBSIM_PRIO_BURST", 4).min(64) as usize;
+    let jobs: Arc<JobQueue<Job>> = Arc::new(JobQueue::new(256, burst));
     for i in 0..workers {
-        let rx = rx.clone();
+        let jobs = jobs.clone();
         let ctx = ctx.clone();
-        std::thread::Builder::new().name(format!("arbsim-worker-{i}")).spawn(move || worker(ctx, rx))?;
+        std::thread::Builder::new().name(format!("arbsim-worker-{i}")).spawn(move || worker(ctx, jobs))?;
     }
     for conn in listener.incoming() {
         let Ok(stream) = conn else { continue };
         let ctx = ctx.clone();
-        let tx = tx.clone();
+        let jobs = jobs.clone();
         std::thread::Builder::new().name("arbsim-conn".into()).spawn(move || {
-            let _ = connection(ctx, stream, tx);
+            let _ = connection(ctx, stream, jobs);
         })?;
     }
     Ok(())
 }
 
-fn worker(ctx: Arc<Ctx>, rx: Arc<Mutex<Receiver<Job>>>) {
-    loop {
-        let job = match rx.lock().unwrap().recv() {
-            Ok(j) => j,
-            Err(_) => return,
-        };
+fn worker(ctx: Arc<Ctx>, jobs: Arc<JobQueue<Job>>) {
+    while let Some(job) = jobs.pop() {
         let mut tm = Tm { queue_us: job.queued.elapsed().as_micros() as u64, ..Tm::default() };
         let answer = handle_tm(&ctx, &job.req, &mut tm);
         let t_send = Instant::now();
@@ -137,7 +138,7 @@ fn send(out: &Writer, v: &Value) {
     }
 }
 
-fn connection(ctx: Arc<Ctx>, stream: UnixStream, jobs: SyncSender<Job>) -> std::io::Result<()> {
+fn connection(ctx: Arc<Ctx>, stream: UnixStream, jobs: Arc<JobQueue<Job>>) -> std::io::Result<()> {
     let out: Writer = Arc::new(Mutex::new(BufWriter::new(stream.try_clone()?)));
     let mut r = std::io::BufReader::new(stream);
     while let Some(body) = read_msg(&mut r)? {
@@ -172,7 +173,15 @@ fn connection(ctx: Arc<Ctx>, stream: UnixStream, jobs: SyncSender<Job>) -> std::
             continue;
         }
         let id = req.get("id").cloned().unwrap_or(Value::Null);
-        if jobs.try_send(Job { req, out: out.clone(), queued: Instant::now() }).is_err() {
+        // Trigger-entry candidate table (check/entry.rs): stored right here
+        // (no worker needed, it only swaps the table), answered at once.
+        if ty == Some("trig_table") {
+            send(&out, &crate::check::entry::apply_table(&id, &req));
+            continue;
+        }
+        // Trigger-entry work goes in the fast lane (jobq.rs).
+        let fast = is_fast(&req);
+        if jobs.push(Job { req, out: out.clone(), queued: Instant::now() }, fast).is_err() {
             send(&out, &unknown(&id, "not_ready", "sidecar busy", 0));
         }
     }
@@ -251,6 +260,8 @@ pub fn handle_tm(ctx: &Ctx, req: &Value, tm: &mut Tm) -> Value {
             check(ctx, &id, &r.at, t0, tm, |view, c| handle_size_search(view, c, &r))
         }
         Some("trig_discover") => trig_discover(ctx, &id, req, t0, tm),
+        Some("trig_entry") => trig_entry(ctx, &id, req, t0, tm),
+        Some("trig_table") => crate::check::entry::apply_table(&id, req),
         Some(t) => bad_request(&id, &format!("unknown request type '{t}'")),
         None => bad_request(&id, "request has no type"),
     }
@@ -504,6 +515,84 @@ fn trig_discover_inner(ctx: &Ctx, id: &Value, req: &Value, t0: Instant, tm: &mut
     let mut a = after_pick(ctx, picked, t0, tm, &run, false);
     a["us"] = json!(t0.elapsed().as_micros() as u64);
     a
+}
+
+/// TRIGGER-ENTRY ONE TRIP (check/entry.rs): `{"type":"trig_entry", "at",
+/// "feed", "limit", "maxPools", "minConf", "budgetUs"}`.
+/// Plain English: discovery and the candidate checks in ONE question, so
+/// the bot doesn't wait for two answers in a row:
+///   1. discover the moved pools (exactly trig_discover; its answer goes
+///      back unchanged as `disc`);
+///   2. pick the candidates for those pools from the bot's table (same
+///      picking as the bot);
+///   3. check them best-ranked first, each exactly as the bot's own
+///      trigger-first `call` would (same handler, same feed with that
+///      route, same size ladder), stopping at the first answer the bot would
+///      send, or when `budgetUs` is used up.
+/// Answer: {ok:true, disc, found, sel:[entry ids], cands:[{e, a}], stopped,
+/// cut, tableGen, us, t}. No table yet: `table:"none"` (the bot then checks
+/// the old way). Each check's `a` is the very answer a `call` gives.
+fn trig_entry(ctx: &Ctx, id: &Value, req: &Value, t0: Instant, tm: &mut Tm) -> Value {
+    let at = req.get("at").cloned().unwrap_or_else(|| json!({ "after": "head" }));
+    let Some(feed) = req.get("feed").filter(|f| f.is_object()) else { return bad_request(id, "trig_entry needs feed") };
+    // 1. Discover (its own timing; the queue wait is this job's).
+    let mut dtm = Tm::default();
+    let disc = trig_discover(ctx, id, &json!({ "id": id, "type": "trig_discover", "at": at, "feed": feed }), Instant::now(), &mut dtm);
+    let mut out = json!({ "id": id, "ok": true, "disc": disc });
+    let finish = |mut o: Value, tm: &mut Tm| {
+        o["us"] = json!(t0.elapsed().as_micros() as u64);
+        tm.post_us = t0.elapsed().as_micros() as u64;
+        o["t"] = tm.json();
+        o
+    };
+    if out["disc"].get("ok") != Some(&Value::Bool(true)) {
+        return finish(out, tm);
+    }
+    let pools: Vec<String> = out["disc"].get("pools").and_then(|p| p.as_array()).map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_ascii_lowercase())).collect()).unwrap_or_default();
+    let max_pools = req.get("maxPools").and_then(|m| m.as_u64()).unwrap_or(4) as usize;
+    if pools.is_empty() || pools.len() > max_pools {
+        return finish(out, tm);
+    }
+    let limit = req.get("limit").and_then(|m| m.as_u64()).unwrap_or(6).min(32) as usize;
+    let min_conf = req.get("minConf").and_then(|m| m.as_str()).unwrap_or("medium").to_string();
+    let budget = req.get("budgetUs").and_then(|b| b.as_u64()).unwrap_or(200_000);
+    let res = crate::check::entry::pick(&pools, limit).map(|(gen, codes, picked, found)| {
+        let sel: Vec<Value> = picked.iter().map(|r| json!(r.e.clone())).collect();
+        // 3. Check, best-ranked first.
+        let (mut cands, mut stopped, mut cut) = (Vec::new(), false, false);
+        for (i, r) in picked.iter().enumerate() {
+            if t0.elapsed().as_micros() as u64 >= budget {
+                cut = true;
+                break;
+            }
+            let Some(c) = &r.c else {
+                cands.push(json!({ "e": r.e, "a": null }));
+                continue;
+            };
+            let call = crate::check::entry::call_for(&codes, c, id, &at, feed, true);
+            let mut ctm = Tm::default();
+            let a = handle_tm(ctx, &call, &mut ctm);
+            let good = crate::check::entry::good_enough(&a, c, &min_conf);
+            cands.push(json!({ "e": r.e, "a": a }));
+            if good {
+                stopped = i + 1 < picked.len();
+                break;
+            }
+        }
+        (gen, found, sel, cands, stopped, cut)
+    });
+    match res {
+        None => out["table"] = json!("none"),
+        Some((gen, found, sel, cands, stopped, cut)) => {
+            out["tableGen"] = json!(gen);
+            out["found"] = json!(found);
+            out["sel"] = json!(sel);
+            out["cands"] = json!(cands);
+            out["stopped"] = json!(stopped);
+            out["cut"] = json!(cut);
+        }
+    }
+    finish(out, tm)
 }
 
 /// How much a trigger-first check may assume (ARBSIM_TRIG_CALL_TRUST).

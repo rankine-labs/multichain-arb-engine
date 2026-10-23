@@ -2615,3 +2615,63 @@ fn bench_entry_server_path_test_numbers_only() {
     let chk = t.elapsed().as_micros() / n;
     println!("[bench, test numbers only] server path (copy 2 rig, 1 feed tx): trig_discover {disc} us, candidate check + 2-size ladder {chk} us ({} build)", if cfg!(debug_assertions) { "debug" } else { "release" });
 }
+
+// TRIGGER-ENTRY ONE TRIP (server.rs trig_entry + check/entry.rs): discovery
+// and the candidate checks in one question. Each candidate's answer must be
+// EXACTLY what the bot's own trigger-first `call` gets (same handler, same
+// feed with that route, same size ladder), so the bot's decision can't
+// differ from the two-step path.
+#[test]
+fn trig_entry_one_trip_equals_discover_then_call() {
+    // The V2 pool: 4-byte-plus call = getter (slot 8); exactly 32 bytes = "swap" (writes slot 8).
+    let code = vec![0x36, 0x60, 0x20, 0x14, 0x60, 0x12, 0x57, 0x60, 0x08, 0x54, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3, 0x5b, 0x60, 0x00, 0x35, 0x60, 0x08, 0x55, 0x00];
+    let (_r, ctx) = trig_world_code(code);
+    let mut word = vec![0u8; 32];
+    word[31] = 9;
+    let swap = signed(0, a(V2P), word);
+    let feed = json!({"trigger": hexb(keccak256(&swap).as_slice()), "triggerSeq": 102, "msgs": [{"seq": 102, "ts": 63, "l1": 9000, "txs": [hexb(&swap)]}]});
+    let pool = format!("{:#x}", a(V2P));
+    let mut data = vec![0x09, 0x02, 0xf1, 0xac];
+    data.extend([0u8; 31]);
+    data.push(9);
+    let check = json!({"calls": [{"from": format!("{}", a(0xe0)), "to": pool.clone(), "data": hexb(&data), "gas": "0x100000"}],
+        "overrides": {}, "sizes": {"amountOffset": 0, "amounts": ["0x3", "0x5"]}, "route": [pool.clone()], "stop": "0x1", "amt": "0x9"});
+    let entry = |id: u64| arbsim::server::handle(&ctx, &json!({"id": id, "type": "trig_entry", "at": {"after": "head"}, "feed": feed, "limit": 6, "maxPools": 4, "minConf": "medium", "budgetUs": 5_000_000}));
+    // No table yet: discovery still answered, candidates left to the bot.
+    arbsim::check::entry::clear_table();
+    let a0 = entry(1);
+    assert_eq!(a0["ok"], json!(true), "{a0}");
+    assert_eq!(a0["disc"]["pools"], json!([pool.clone()]), "{a0}");
+    assert_eq!(a0["table"], json!("none"), "{a0}");
+    // The table: two routes for the pool (one better scored), one the bot couldn't build.
+    let t = arbsim::server::handle(&ctx, &json!({"id": 2, "type": "trig_table", "gen": 7, "full": true, "codes": [], "pools": {pool.clone(): [
+        {"rid": "r1", "h": true, "s": 1.0, "e": "e1", "c": check},
+        {"rid": "r2", "h": true, "s": 2.0, "e": "e2", "c": check},
+        {"rid": "r3", "h": true, "s": 3.0, "e": null},
+    ]}}));
+    assert_eq!(t["ok"], json!(true), "{t}");
+    let a1 = entry(3);
+    assert_eq!(a1["tableGen"], json!(7), "{a1}");
+    assert_eq!(a1["sel"], json!(["e2", "e1"]), "best score first; the unbuildable row dropped: {a1}");
+    assert_eq!(a1["found"], json!(3), "{a1}");
+    // The one-trip discovery equals a plain trig_discover...
+    let d = arbsim::server::handle(&ctx, &json!({"id": 3, "type": "trig_discover", "at": {"after": "head"}, "feed": feed}));
+    let strip = |v: &Value| { let mut v = v.clone(); for k in ["us", "t", "id"] { v.as_object_mut().unwrap().remove(k); } v };
+    assert_eq!(strip(&a1["disc"]), strip(&d), "discovery part");
+    // ... and each candidate's answer equals the bot's own call.
+    let mut f = feed.clone();
+    f["route"] = json!([pool.clone()]);
+    let c = arbsim::server::handle(&ctx, &json!({"id": 3, "type": "call", "at": {"after": "head"}, "feed": f, "prio": true,
+        "sizes": {"amountOffset": 0, "amounts": ["0x3", "0x5"]}, "overrides": {},
+        "calls": [{"from": format!("{}", a(0xe0)), "to": pool.clone(), "data": hexb(&data), "gas": "0x100000"}]}));
+    assert_eq!(c["ok"], json!(true), "{c}");
+    let cands = a1["cands"].as_array().unwrap();
+    assert_eq!(cands.len(), 2, "not good enough to send: both checked: {a1}");
+    for x in cands {
+        assert_eq!(strip(&x["a"]), strip(&c), "candidate {} answer", x["e"]);
+    }
+    // A partial update for a generation the sidecar doesn't hold is refused.
+    let bad = arbsim::server::handle(&ctx, &json!({"id": 4, "type": "trig_table", "gen": 9, "full": false, "base": 3, "pools": {}}));
+    assert_eq!(bad["unknown"], json!("table_gen"), "{bad}");
+    arbsim::check::entry::clear_table();
+}

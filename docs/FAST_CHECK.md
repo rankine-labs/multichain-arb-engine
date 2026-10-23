@@ -472,6 +472,61 @@ What to read:
   held back (why), feed->discover / answer / submit p50 / p90, top unknown
   reasons. Real sends are on the scoreboard as path `trig_first`, `src:"entry"`.
 
+### Trigger-entry speed + visibility (Oct 23, second pass)
+
+Live shadow (~45 min): feed -> answer p50 47 ms / p90 98 ms while the work
+itself is ~0.05 ms; not-profitable answers logged no numbers. Changes:
+
+1. **Logging.** Every answered trigger logs its best candidate even when it
+   loses: `best` / `size` / `net` (after gas, can be negative), `bv` its
+   verdict, `nle: true` = a "loss" answer (our contract only says "no
+   profit", so the net is AT MOST minus gas), `cv` = every checked
+   candidate `{l label, v verdict, n net, s size, r reason, c confidence}`.
+   A SAMPLE of not-profitable answers (`TRIG_ENTRY_AGREE_SAMPLE`, 1 in 5,
+   at most `TRIG_ENTRY_AGREE_SAMPLE_PER_HOUR` = 120) gets the later
+   same-block re-check too: `smp: true`, `agree`, `agV`, `agNet` (the
+   re-check's net). Hour line: best-net distribution (over $0.25 / $0-0.25 /
+   -$0.10-0 / under -$0.10) and "not-profitable sample re-checked N: agree
+   a/b, missed chances (re-check profitable) m".
+2. **Per-hop timestamps** (`hops`, ms after the websocket frame arrived, 2
+   decimals): `parse`, `queue`, `start`, `dSent` / `dAns` (discover or
+   one-trip question sent / answer read), `scQ` / `scW` (the sidecar's own
+   wait for a worker / work), `dW` (one trip: discovery's share), `built`,
+   `checks` (per check `[sent, answered, sidecar queue, sidecar work]`; one
+   trip: only work), `dec`, `sign`, `lag` / `lagA` (event-loop lag at the
+   frame / at the answer). Hour line: "hops p50/p90 ms" per hop (`rtt` =
+   answered - sent, `other` = rtt - sidecar queue - sidecar work = socket +
+   the bot's own loop) and "event-loop lag p50 / p90 / max".
+3. **One trip** (`TRIG_ENTRY_ONE_TRIP=1`, default). The bot keeps a candidate
+   table in the sidecar (`trig_table`, rebuilt every `TRIG_ENTRY_TABLE_MS`,
+   only changed pools re-sent): per watched pool its routes, the ranking
+   facts and our exact check call (built by the same code as the two-step
+   path). One question `trig_entry` = discover + pick (same picking as the
+   bot, shared fixture `sim/tests/fixtures/trig_entry_select.json`) + check
+   (each exactly as a trigger-first `call`), stopping at the first answer
+   the bot would send. The bot reads every answer with its own code; when it
+   disagrees with the sidecar's stop, or an entry is missing, it checks the
+   rest the old way. No table / older sidecar = two steps, unchanged
+   (`one` in the line: `1` = used, else why not).
+4. **Priority.** The sidecar serves trigger-entry questions first, at most
+   `ARBSIM_PRIO_BURST` (4) in a row while other questions wait
+   (`sim/src/jobq.rs`). The bot starts entry work inside the feed handler
+   (`TRIG_ENTRY_IMMEDIATE=1`) and, while it is in flight, background jobs
+   in bites (gap scan, loop scan, reports...) take at most
+   `TRIG_ENTRY_YIELD_SLICE_MS` (2) ms per bite instead of 5-8 ms.
+5. `ARBSIM_WORKERS` stays 2: the server has 2 vCPUs, and more workers than
+   cores do not make answers faster.
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `TRIG_ENTRY_ONE_TRIP` | `1` | discover + checks in one sidecar question (0 = two steps) |
+| `TRIG_ENTRY_TABLE_MS` | `1000` | candidate table rebuild interval (0 = never by itself) |
+| `TRIG_ENTRY_AGREE_SAMPLE` | `5` | re-check 1 in N not-profitable answers (0 = none) |
+| `TRIG_ENTRY_AGREE_SAMPLE_PER_HOUR` | `120` | at most this many sampled re-checks an hour |
+| `TRIG_ENTRY_IMMEDIATE` | `1` | start entry work inside the feed handler (0 = setImmediate, as before) |
+| `TRIG_ENTRY_YIELD_SLICE_MS` | `2` | longest background-job bite while entry work runs (0 = unchanged) |
+| `ARBSIM_PRIO_BURST` (sidecar) | `4` | fast-lane jobs in a row before a waiting normal one (0 = no fast lane) |
+
 ## Rarely needed settings
 
 `ARBSIM_SOCKET` (default `/tmp/arbsim.sock`), `LOCAL_SIM_TIMEOUT_MS` (60, per

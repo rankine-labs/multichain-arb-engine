@@ -34,6 +34,21 @@ export function drainSteps<T>(job: Steps<T>): T {
   }
 }
 
+// SLICE CAP (trigger-entry speed, Oct 23): while time-critical work is in
+// flight (a feed transaction being checked as a possible trigger), big jobs
+// take SHORTER bites, so the answer waiting on the socket is read sooner.
+// The cap function returns the longest bite allowed right now in ms (0 or
+// less = no cap). Same results, only the timing changes. Set by the host
+// (shadowMain.ts: TRIG_ENTRY_YIELD_SLICE_MS while trigger-entry work runs).
+let sliceCap: (() => number) | null = null;
+export function setSliceCap(fn: (() => number) | null): void { sliceCap = fn; }
+export function effectiveSliceMs(ms: number): number {
+  try {
+    const c = sliceCap?.() ?? 0;
+    return c > 0 ? Math.min(ms, c) : ms;
+  } catch { return ms; }
+}
+
 // Let the rest of the bot run (feed messages, timers, node replies).
 export const yieldToLoop = (): Promise<void> => new Promise((res) => setImmediate(res));
 
@@ -43,9 +58,10 @@ export async function runSteps<T>(job: Steps<T>, name: string, sliceMs = 5): Pro
   for (;;) {
     const end = stallFinder.begin(name);
     const t0 = performance.now();
+    const bite = effectiveSliceMs(sliceMs);
     let r: IteratorResult<void, T>;
     try {
-      do { r = job.next(); } while (!r.done && performance.now() - t0 < sliceMs);
+      do { r = job.next(); } while (!r.done && performance.now() - t0 < bite);
     } finally { end(); }
     if (r.done) return r.value;
     await yieldToLoop();
@@ -74,7 +90,7 @@ export class Pacer {
   constructor(private readonly name: string, private readonly sliceMs = 5, private readonly enabled = true) {}
   due(): boolean {
     if (!this.enabled || (++this.calls & 255) !== 0) return false;
-    return performance.now() - this.t0 >= this.sliceMs;
+    return performance.now() - this.t0 >= effectiveSliceMs(this.sliceMs);
   }
   async rest(): Promise<void> {
     // The named stretch before this break ends here.

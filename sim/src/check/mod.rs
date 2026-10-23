@@ -37,6 +37,7 @@ use crate::state::MissItem;
 
 pub mod cli;
 pub mod db;
+pub mod entry;
 pub mod fixture;
 pub mod hexutil;
 // Trigger-first: replay the feed's ordered transactions, then our calls.

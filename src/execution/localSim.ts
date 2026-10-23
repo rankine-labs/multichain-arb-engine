@@ -373,6 +373,9 @@ export type LocalRpcOptions = {
   // Told about EVERY reply to a question (sure, unknown, timeout), for
   // timing only. Never changes the answer.
   onReply?: (method: string, answer: SidecarAnswer, sent: Record<string, unknown>) => void;
+  // Told just before a question goes to the sidecar (timing only: the
+  // trigger-entry per-hop timestamps). Never changes the question.
+  onSend?: (method: string, sent: Record<string, unknown>) => void;
   // Extra fields added to every eth_call question (trigger-first: `feed`,
   // the ordered feed transactions to replay first, execution/triggerFirst.ts).
   // With it, eth_simulateV1 is not answered here (its block rules and the
@@ -459,6 +462,7 @@ export function makeLocalRpc(client: LocalSimClient, fallback?: Rpc, opts: Local
         const call = p[0];
         if (!call || typeof call !== 'object') return unknown(method, params, 'bad_request');
         const sent = { type: 'call', at, overrides: p[2] ?? {}, calls: [call], ...(opts.extra ?? {}) };
+        try { opts.onSend?.(method, sent); } catch { /* timing only */ }
         const a = await client.request(sent, opts.timeoutMs);
         noteReply(method, a, sent);
         if (a.ok !== true) return unknown(method, params, a.unknown);
