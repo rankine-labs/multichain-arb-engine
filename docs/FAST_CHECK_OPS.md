@@ -158,6 +158,58 @@ Fastest first. None of these touch the bot's trading.
    - "Paid node use today" near its cap, or "refused"
    - "NOT READY" for more than a few minutes while the bot is running
 
+## 5b. If the bot freezes
+
+"Freezes" = the bot's one thread is busy and every feed trade waits. The
+`[stalls]` log line (every 5 min) and the hourly report count them:
+`Freezes over 50 ms: 204 (worst 630 ms) · top causes: ...`. A few per
+5 min is normal; hundreds are not.
+
+**1. Read what the bot already wrote (nothing to change):**
+
+```bash
+pm2 logs dex-arb-shadow --lines 3000 --nostream | grep -E "\[stalls\]|\[freeze-profile\]|\[mem\]|\[trig-entry\] hour|sequencer feed connected"
+```
+
+- `[freeze-profile]` (since Oct 23, `FREEZE_PROFILE=1` default): after 3
+  freezes over 200 ms within a minute the bot records a 5 s CPU profile and
+  logs the 10 functions that used the most time, e.g.
+  `top self time: keccak (sha3.js:120) 820 ms 16%, ...`. Send Claude this
+  line; the full profile is in `data/profiles/` (newest 5 kept).
+- `[stalls]` top causes: since Oct 23 the feed has its own names:
+  `feed unpack` (reading transactions out of a feed message), `feed tap`
+  (trigger-first order buffer + entry skip test), `trig entry` (starting a
+  trigger check), `feed decode` (trade list), `trig table` (one-trip table),
+  `feed frame` (the rest). A busy name points at the setting to try below.
+- Many `sequencer feed connected` lines = the feed keeps reconnecting (each
+  reconnect replays a backlog; since Oct 23 messages already seen are skipped).
+- `[trig-entry] hour`: `table N pools / R routes (X reused unchanged), rebuilt in T ms`.
+  A big R and T means the one-trip table is the heavy job.
+
+**2. Settings to try, cheapest and safest first.** One at a time, then
+`pm2 restart dex-arb-shadow --update-env` and compare the next `[stalls]` lines
+(wait 10-15 min). None of them changes what a check answers; each only
+changes how much work runs on the bot's thread.
+
+| Step | Setting in `.env` | What it does | Cost |
+|---|---|---|---|
+| 1 | `TRIG_ENTRY_TABLE_MS=3000` | one-trip table rebuilt every 3 s instead of every 1 s | table up to 3 s old: more triggers fall back to the two-step path (slower, same decisions) |
+| 2 | `TRIG_ENTRY_ONE_TRIP=0` | no one-trip table at all (two steps per trigger, as before Oct 23) | trigger answers a little slower |
+| 3 | `TRIG_ENTRY_IMMEDIATE=0` | trigger checks start right AFTER the feed message is handled, not inside it | ~0.1-1 ms later start |
+| 4 | `TRIG_FIRST_ENTRY=0` | entry point off: no feed transaction is checked as a trigger | trigger-first entry trades stop (the older paths still trade) |
+| 5 | `LOCAL_SIM_TRIGGER_FIRST=off` | trigger-first off completely (order buffer, entry point) | as before the trigger-first work |
+
+Fix switches (only if Claude asks; each puts back the old behaviour of one
+Oct 23 fix): `FEED_TX_MEMO=0` (unpack each feed transaction again per
+reader), `FEED_SKIP_REPEATS=0` (unpack a reconnect's backlog again),
+`TRIG_ENTRY_TABLE_REUSE_MS=0` (rebuild every table route every time).
+Profiler: `FREEZE_PROFILE=0` off; `FREEZE_PROFILE_MS` (200),
+`FREEZE_PROFILE_COUNT` (3), `FREEZE_PROFILE_WINDOW_S` (60),
+`FREEZE_PROFILE_SECONDS` (5), `FREEZE_PROFILE_EVERY_MIN` (30),
+`FREEZE_PROFILE_KEEP` (5), `FREEZE_PROFILE_DIR` (`data/profiles`).
+
+**3. Send Claude** the lines from step 1 (before and after a change).
+
 ## 6. Settings (all optional; put them in `.env`)
 
 `deploy/arbsim-run.sh` (what pm2 starts) reads ONLY these lines from `.env`

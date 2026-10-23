@@ -221,6 +221,7 @@ import { StageTimers, StageTrace } from './core/stageTimer';
 import { trustFreshConfigFromEnv, wsTrustProblem, WsFacts } from './core/trustFresh';
 // Stall finder (Oct 14): which job froze the bot, plus chunked versions of the big jobs.
 import { stallFinder, timed, timedAsync, formatStallLine, formatStallDetail, markStretch, labelled } from './core/stallFinder';
+import { FreezeProfiler } from './core/freezeProfile';
 import { runSteps, drainSteps, writeJsonChunkedQueued, setSliceCap } from './core/chunked';
 // 4-HOUR REPORT (reporting only): 4-hour totals of the hourly numbers, and the 3-message formatter.
 import { FourHourStats, HourSample, LoopSample, loopSampleFrom, fourHourMark, zonedParts } from './report/fourHourStats';
@@ -258,6 +259,16 @@ const REBUILD_PACED = stallFixOn('REBUILD_PACED');
 
 async function main() {
 stallFinder.start();
+// FREEZE PROFILE (core/freezeProfile.ts, Oct 23): after repeated long
+// freezes, a 5 s CPU profile is recorded (at most every 30 min) and its top
+// 10 functions logged as one "[freeze-profile]" line. FREEZE_PROFILE=0 = off.
+{
+      const fp = new FreezeProfiler();
+      if (fp.s.enabled && stallFinder.enabled) {
+            stallFinder.onStall((ms) => { try { fp.noteFreeze(ms); } catch { /* measurement only */ } });
+            console.log(`[freeze-profile] on: a ${fp.s.seconds} s CPU profile after ${fp.s.count} freezes over ${fp.s.freezeMs} ms within ${fp.s.windowMs / 1000} s (at most every ${fp.s.everyMs / 60_000} min, newest ${fp.s.keep} kept in ${fp.s.dir})`);
+      }
+}
 const cache = new PoolCache();
 const shadowLogger = new ShadowLogger();
 // Memory line every 5 min (core/memReport.ts; MEM_LOG=0 turns it off). Measurement only.
@@ -2909,7 +2920,10 @@ type EntryRouteT = { buy: any; sell: any; tokenIn: string; tokenOut: string; id:
 const entryRoutesOf = (keys: string[]): EntryRouteT[] => {
       const lc = (x: string) => (x ?? '').toLowerCase();
       return enumerateRoutes<any>(keys, {
-            pool: (k) => cache.get('robinhood', k) ?? cache.allForChain('robinhood').find((x: any) => lc(x.poolAddress) === lc(k)),
+            // (Freeze fix, Oct 23: the old fall-back walked a fresh copy of
+            // every pool for each key the cache didn't hold, and could never
+            // find one: the cache files every pool under its lower-case address.)
+            pool: (k) => cache.get('robinhood', k),
             peers: (p) => cache.findPeerPools('robinhood', p.tokenA, p.tokenB, p.poolAddress),
             addr: (p) => p.poolAddress, tokens: (p) => [p.tokenA, p.tokenB],
             startCoins: [ROBINHOOD_TOKENS.USDG, ROBINHOOD_TOKENS.WETH],
@@ -2970,9 +2984,17 @@ const entryCandidatesFor = (keys: string[], limit: number): { cands: EntryCandid
 // ONE TRIP table (execution/trigEntry.ts refreshTable): every pool copy 2
 // follows, with ITS routes (same rules), ranking facts and build, so the
 // sidecar can pick and check exactly what entryCandidatesFor would.
+// Freeze fix (Oct 23): each pool's routes are listed only when the table
+// builder reaches it (in small bites), and each route says what its
+// question is made of (`inputs`: both pool states, their seen-fee records,
+// the start coin's price and decimals), so an unchanged route is not built
+// again (TRIG_ENTRY_TABLE_REUSE_MS). Same routes, same order as before.
 const entryTableRoutes = (): TablePool[] => copy2PoolKeys().map((k) => ({
       pool: k,
-      routes: entryRoutesOf([k]).map((r) => ({ rid: r.id, held: entryHeld(r), score: entryScore(r), build: () => entryBuild(r) })),
+      routes: () => entryRoutesOf([k]).map((r) => ({
+            rid: r.id, held: entryHeld(r), score: entryScore(r), build: () => entryBuild(r),
+            inputs: [r.buy, r.buy?.observedFee, r.sell, r.sell?.observedFee, entryUsdOf(r.tokenIn), entryDecOf(r.tokenIn)],
+      })),
 }));
 // TRIGGER-FIRST: needs the fast check's connection and copy 2 (LOCAL_SIM
 // shadow / on and LOCAL_SIM_TRIGGER_FIRST shadow / on).

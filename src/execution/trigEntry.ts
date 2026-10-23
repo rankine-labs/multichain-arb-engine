@@ -1,10 +1,11 @@
-import { Transaction } from 'ethers';
-import type { FeedMsg } from '../chains/nitroFeed';
+import type { Transaction } from 'ethers';
+import { FeedMsg, decodeFeedTx } from '../chains/nitroFeed';
 import { performance } from 'perf_hooks';
 import { LocalSimClient, SidecarAnswer } from './localSim';
 import { JsonlLog, LocalTrade, LocalSimOpts, reasonOf } from './localSimHost';
 import { TriggerFirst, TrigOutcome, TrigConfidence, TrigQuestion, CannedAnswer, CapturedCheck, checkSig, confidenceAtLeast } from './triggerFirst';
 import { loopLag } from '../core/loopLag';
+import { stallFinder, markStretch } from '../core/stallFinder';
 
 // ============================================================================
 // TRIGGER-FIRST ENTRY POINT: every feed transaction is a possible trigger.
@@ -127,6 +128,7 @@ export type EntrySettings = {
   lockMs: number;                // how long a trigger stays claimed [120000]
   oneTrip: boolean;              // TRIG_ENTRY_ONE_TRIP [1] discovery + checks in one sidecar question (0 = two steps, as before)
   tableMs: number;               // TRIG_ENTRY_TABLE_MS [1000] how often the candidate table is rebuilt (0 = only when asked)
+  tableReuseMs: number;          // TRIG_ENTRY_TABLE_REUSE_MS [5000] a route whose pools did not change keeps its written-down question this long (0 = rebuild every route every time)
   agreeSample: number;           // TRIG_ENTRY_AGREE_SAMPLE [5] re-check 1 in N not-profitable answers (0 = none)
   agreeSamplePerHour: number;    // TRIG_ENTRY_AGREE_SAMPLE_PER_HOUR [120] at most this many of those per hour
   immediate: boolean;            // TRIG_ENTRY_IMMEDIATE [1] start entry work inside the feed handler (0 = after it, setImmediate)
@@ -150,6 +152,7 @@ export function entrySettings(env: Record<string, string | undefined> = process.
     lockMs: 120_000,
     oneTrip: (env.TRIG_ENTRY_ONE_TRIP ?? '1').trim() !== '0',
     tableMs: num('TRIG_ENTRY_TABLE_MS', 1_000, 0),
+    tableReuseMs: num('TRIG_ENTRY_TABLE_REUSE_MS', 5_000, 0),
     agreeSample: Math.round(num('TRIG_ENTRY_AGREE_SAMPLE', 5, 0)),
     agreeSamplePerHour: Math.round(num('TRIG_ENTRY_AGREE_SAMPLE_PER_HOUR', 120, 0)),
     immediate: (env.TRIG_ENTRY_IMMEDIATE ?? '1').trim() !== '0',
@@ -165,8 +168,10 @@ const NON_SWAP = new Set(['0x095ea7b3', '0xa9059cbb', '0x23b872dd', '0xd0e30db0'
 // Why a feed transaction needs no work at all (null = look at it).
 export function quickSkip(raw: string, hash: string, ours: { isOurTx: (h: string) => boolean; addresses: Set<string> }): string | null {
   if (ours.isOurTx(hash)) return 'ours';
-  let tx: Transaction;
-  try { tx = Transaction.from(raw); } catch { return 'unreadable'; }
+  // Unpacked once per transaction and shared with the trade decoder's
+  // pass over the same message (chains/nitroFeed.ts decodeFeedTx; freeze fix).
+  const tx: Transaction | null = decodeFeedTx(raw);
+  if (!tx) return 'unreadable';
   if (!tx.to) return 'create';
   if (ours.addresses.has(tx.to.toLowerCase())) return 'ours';
   const data = tx.data ?? '0x';
@@ -316,8 +321,17 @@ export type EntryPick = {
 
 // One watched pool's routes for the one-trip table (host: the same route
 // rules, ranking facts and build as candidatesFor).
-export type TableRoute = { rid: string; held: boolean; score: number | null; build: () => EntryCandidate | null };
-export type TablePool = { pool: string; routes: TableRoute[] };
+// `inputs` (freeze fix, Oct 23, optional): what this route's written-down
+// question is made from, as things that are replaced (never edited) when
+// they change: the two pool states, their seen-fee records, the start
+// coin's price and decimals. Same things (===) as last time = the question
+// written last time is reused (up to TRIG_ENTRY_TABLE_REUSE_MS old) instead
+// of being built again (~1 ms each). Not given = always rebuilt.
+export type TableRoute = { rid: string; held: boolean; score: number | null; build: () => EntryCandidate | null; inputs?: unknown[] };
+// `routes` may be a function (freeze fix): then a pool's routes are listed
+// only when the table builder reaches that pool, in small bites, instead
+// of every pool's routes in one go before building starts.
+export type TablePool = { pool: string; routes: TableRoute[] | (() => TableRoute[]) };
 
 export type EntryDeps = {
   tf: TriggerFirst;
@@ -368,6 +382,12 @@ function withDeadline<T>(p: Promise<T>, ms: number): Promise<T | null> {
   });
 }
 const yieldNow = (): Promise<void> => new Promise((r) => setImmediate(r));
+// Same things, one by one (===), same count.
+function sameItems(a: unknown[], b: unknown[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
 
 // High-resolution times of one feed frame (performance.now() ms).
 export type FrameTimes = { recv: number; parsed?: number; queued?: number };
@@ -469,7 +489,9 @@ export class TrigEntry {
         this.inFlight++;
         const hash = t.hash.toLowerCase();
         const times: FrameTimes = { recv, parsed: hr?.parsed, queued: performance.now() };
-        const run = () => { void this.process(hash, at, times).catch(() => { this.hour.errors++; }).finally(() => { this.inFlight--; }); };
+        // Timed as "trig entry" (its own name in the freeze report, not
+        // part of "feed frame"); the parts after its waits are named too.
+        const run = () => { const end = stallFinder.begin('trig entry'); try { void this.process(hash, at, times).catch(() => { this.hour.errors++; }).finally(() => { this.inFlight--; }); } finally { end(); } };
         if (this.settings.immediate) run(); else setImmediate(run);
       }
     }
@@ -504,6 +526,7 @@ export class TrigEntry {
           minConf: this.d.tf.settings.minConfidence, budgetUs: Math.max(1_000, Math.round((left - 10) * 1_000)), gen: this.tbl.ackGen,
         }, left), left + 20);
       } catch { r = null; }
+      markStretch('trig entry');
       hops.dAns = rel(performance.now());
       hops.lagA = this.lagNow();
       if (r && r.ok === true && r.disc && typeof r.disc === 'object') { one = r; a = r.disc as Record<string, unknown>; }
@@ -529,6 +552,7 @@ export class TrigEntry {
       try {
         a = await withDeadline(this.d.client.request({ type: 'trig_discover', at: { after: 'head' }, feed: built.feed }, s.discoverTimeoutMs), s.discoverTimeoutMs + 20);
       } catch { a = null; }
+      markStretch('trig entry');
       hops.dAns = rel(performance.now());
       hops.lagA = this.lagNow();
       const t = (a as { t?: { queue?: number } } | null)?.t;
@@ -591,6 +615,7 @@ export class TrigEntry {
     const results = oneTrip
       ? await this.runOneTrip(cands, oneTrip, hash, seenMs, left, rec, one!)
       : await this.runRanked(cands, hash, seenMs, left, rec);
+    markStretch('trig entry');
     rec.answerMs = this.now() - seenMs;
     keep(h.answerMs, rec.answerMs);
     // Per-check hops: [sent, answered, sidecar queue, sidecar work] (ms).
@@ -805,6 +830,7 @@ export class TrigEntry {
     const { main, b, others } = plan;
     const q: TrigQuestion = { trade: b.trade, simOpts: b.simOpts, triggerHash: hash, seenMs, keys: c.keys, label: c.label };
     const out = await this.d.tf.askOnly(q, others, canned);
+    markStretch('trig entry');
     if (!out.sure) return { out, cand: c, q };
     // Every size: net after gas; the best one. (A profit bigger than the
     // trade itself is bad data, never used.) `pick` = the best PROFITABLE
@@ -846,59 +872,108 @@ export class TrigEntry {
     meta: new Map<string, TableMeta>(),
     retired: new Map<string, number>(),
     codes: [] as string[],
-    seq: 0, lastMs: 0, lastRoutes: 0, sends: 0, sendFails: 0,
+    seq: 0, lastMs: 0, lastRoutes: 0, lastReused: 0, sends: 0, sendFails: 0,
   };
 
-  tableInfo(): { ackGen: number; pools: number; entries: number; lastMs: number; routes: number } {
-    return { ackGen: this.tbl.ackGen, pools: this.tbl.pools.size, entries: this.tbl.meta.size, lastMs: this.tbl.lastMs, routes: this.tbl.lastRoutes };
+  tableInfo(): { ackGen: number; pools: number; entries: number; lastMs: number; routes: number; reused: number } {
+    return { ackGen: this.tbl.ackGen, pools: this.tbl.pools.size, entries: this.tbl.meta.size, lastMs: this.tbl.lastMs, routes: this.tbl.lastRoutes, reused: this.tbl.lastReused };
   }
 
   // Rebuild the table and send what changed. true = the sidecar holds it.
+  //
+  // FREEZE FIX (Oct 23), same table, cheaper and in named bites:
+  //   - every stretch of work is timed as "trig table" (it used to show up
+  //     as unnamed "other" in the freeze report), at most ~2 ms each;
+  //   - a pool's routes are listed when the builder reaches it (the host
+  //     may pass them as a function), not all pools at once up front;
+  //   - a route whose inputs did not change (same pool states, same coin
+  //     price, same size cap, gas, route pools; see TableRoute.inputs)
+  //     keeps the question written last time, for up to
+  //     TRIG_ENTRY_TABLE_REUSE_MS (default 5 s), instead of building it
+  //     again. Safe for decisions: when a trigger uses a table entry the bot
+  //     still rebuilds its own trade and only accepts the sidecar's answer
+  //     if it is EXACTLY the same question (checkSig); anything else is
+  //     checked the old way;
+  //   - the "did this pool change?" fingerprint reuses each route's text
+  //     instead of turning the whole question into text again every second.
   async refreshTable(): Promise<boolean> {
     const T = this.tbl;
     if (T.building || !this.oneTripOn() || !this.active()) return false;
     T.building = true;
     const t0 = performance.now();
+    // Named stretches: `pause()` ends the current one, lets the bot run,
+    // and starts a new one.
+    let endStretch = stallFinder.begin('trig table');
+    let slice = performance.now();
+    const pause = async () => { endStretch(); await yieldNow(); endStretch = stallFinder.begin('trig table'); slice = performance.now(); };
+    const waitFor = async <X>(p: Promise<X>): Promise<X> => { endStretch(); try { return await p; } finally { endStretch = stallFinder.begin('trig table'); } };
     try {
       const src = this.d.tableRoutes!();
-      let slice = performance.now();
       const now = this.now();
+      const reuseMs = this.settings.tableReuseMs;
+      const sizesKey = this.settings.sizesUsd.join(',');
       const fresh = new Map<string, { fp: string; rows: Array<Record<string, unknown>>; metas: Array<TableMeta | null> }>();
-      let routes = 0;
-      for (const { pool, routes: rs } of src) {
-        const key = (pool ?? '').toLowerCase();
+      let routes = 0, reused = 0;
+      for (const tp of src) {
+        const key = (tp.pool ?? '').toLowerCase();
         if (!key || fresh.has(key)) continue;
+        if (performance.now() - slice > 2) await pause();
+        let rs: TableRoute[];
+        try { rs = typeof tp.routes === 'function' ? tp.routes() : tp.routes; } catch { rs = []; }
         const rows: Array<Record<string, unknown>> = [];
         const metas: Array<TableMeta | null> = [];
-        const fps: unknown[] = [];
+        const fps: string[] = [];
         for (const r of rs) {
           routes++;
-          if (performance.now() - slice > 2) { await yieldNow(); slice = performance.now(); }
+          if (performance.now() - slice > 2) await pause();
           let cand: EntryCandidate | null = null;
           try { cand = r.build(); } catch { cand = null; }
           const score = r.score !== null && Number.isFinite(r.score) ? r.score : null;
-          if (!cand) { rows.push({ rid: r.rid.toLowerCase(), h: r.held, s: score, e: null }); metas.push(null); fps.push([r.rid, r.held, score, null]); continue; }
+          if (!cand) { rows.push({ rid: r.rid.toLowerCase(), h: r.held, s: score, e: null }); metas.push(null); fps.push(JSON.stringify([r.rid, r.held, score, null])); continue; }
           const meta: TableMeta = { cand };
+          // Reuse last time's written-down question when nothing it is made of changed.
+          const rid = r.rid.toLowerCase();
+          const sameAs = this.memoKey(cand, sizesKey);
+          const memo = reuseMs > 0 && r.inputs ? this.tblMemo.get(rid) : undefined;
           let c: Record<string, unknown> | null = null;
-          const plan = ladderPlan(cand, this.settings.sizesUsd);
-          if (plan) {
-            const cap = await this.captureFor(cand, plan);
-            const stop = stopUnits(cand, this.settings.minNetUsd);
-            if (cap && stop !== null) {
-              c = {
-                calls: cap.calls, overrides: this.codeRefs(cap.overrides), ...(cap.sizes ? { sizes: cap.sizes } : {}),
-                route: cand.keys.filter((k): k is string => typeof k === 'string' && VALID_KEY.test(k)).map((k) => k.toLowerCase()),
-                stop: hex(stop), amt: hex(plan.b.trade.amountIn),
-              };
-              meta.sig = checkSig(cap.data, cap.overrides, cap.sizes);
-            } else meta.fallback = true;
+          let cJson: string;
+          if (memo && now - memo.at <= reuseMs && memo.codesEpoch === this.codesEpoch && memo.sameAs === sameAs && sameItems(memo.inputs, r.inputs!)) {
+            c = memo.c; cJson = memo.cJson;
+            if (memo.sig !== undefined) meta.sig = memo.sig;
+            if (memo.fallback) meta.fallback = true;
+            reused++;
+          } else {
+            const plan = ladderPlan(cand, this.settings.sizesUsd);
+            if (plan) {
+              const cap = await this.captureForTimed(cand, plan, waitFor);
+              const stop = stopUnits(cand, this.settings.minNetUsd);
+              if (cap && stop !== null) {
+                c = {
+                  calls: cap.calls, overrides: this.codeRefs(cap.overrides), ...(cap.sizes ? { sizes: cap.sizes } : {}),
+                  route: cand.keys.filter((k): k is string => typeof k === 'string' && VALID_KEY.test(k)).map((k) => k.toLowerCase()),
+                  stop: hex(stop), amt: hex(plan.b.trade.amountIn),
+                };
+                meta.sig = checkSig(cap.data, cap.overrides, cap.sizes);
+              } else meta.fallback = true;
+            }
+            cJson = c === null ? 'null' : JSON.stringify(c);
+            if (reuseMs > 0 && r.inputs) {
+              if (this.tblMemo.size > 20_000) this.tblMemo.clear(); // memory bound
+              // (codesEpoch read AFTER codeRefs: a code list reset during this route counts.)
+              this.tblMemo.set(rid, { at: now, inputs: r.inputs.slice(), sameAs, codesEpoch: this.codesEpoch, c, cJson, sig: meta.sig, fallback: meta.fallback });
+            } else this.tblMemo.delete(rid);
           }
-          rows.push({ rid: r.rid.toLowerCase(), h: r.held, s: score, e: '', c });
+          rows.push({ rid, h: r.held, s: score, e: '', c });
           metas.push(meta);
-          fps.push([r.rid, r.held, score, cand.label, cand.gasUsd, cand.maxSizeUsd, !!meta.fallback, c]);
+          // Fingerprint: the route's small facts + its question's text (exactly
+          // the same text as before for the same question, so "changed?" is the
+          // same answer as when the whole list was turned into text).
+          fps.push(JSON.stringify([r.rid, r.held, score, cand.label, cand.gasUsd, cand.maxSizeUsd, !!meta.fallback]) + cJson);
         }
-        fresh.set(key, { fp: JSON.stringify(fps), rows, metas });
+        fresh.set(key, { fp: fps.join('\n'), rows, metas });
       }
+      // Memo entries of routes that are gone: forgotten once old.
+      if (this.tblMemo.size) for (const [k, m] of this.tblMemo) if (now - m.at > Math.max(reuseMs, 1_000) * 3) this.tblMemo.delete(k);
       // What changed since the last table (new ids only for changed pools).
       const changed: Record<string, unknown[] | null> = {};
       for (const [key, f] of fresh) {
@@ -925,13 +1000,14 @@ export class TrigEntry {
       // Forget entries retired more than 30 s ago.
       for (const [id, at] of [...T.retired]) if (now - at > 30_000) { T.retired.delete(id); T.meta.delete(id); }
       T.lastRoutes = routes;
+      T.lastReused = reused;
       if (!Object.keys(changed).length && !T.needFull) return T.ackGen >= 0;
       const full = T.needFull || T.ackGen < 0;
       const gen = T.gen + 1;
       const pools = full ? Object.fromEntries([...T.pools].map(([k, v]) => [k, v.rows])) : changed;
       T.gen = gen;
       T.sends++;
-      const a = await this.d.client.request({ type: 'trig_table', gen, full, base: T.ackGen, codes: T.codes, pools }, 3_000);
+      const a = await waitFor(this.d.client.request({ type: 'trig_table', gen, full, base: T.ackGen, codes: T.codes, pools }, 3_000));
       if (a.ok === true) { T.ackGen = gen; T.needFull = false; return true; }
       T.sendFails++;
       T.needFull = true;
@@ -941,9 +1017,24 @@ export class TrigEntry {
       T.needFull = true;
       return false;
     } finally {
+      endStretch();
       T.lastMs = r2(performance.now() - t0);
       T.building = false;
     }
+  }
+
+  // Reuse memory of the one-trip table (see refreshTable): route id ->
+  // what its question was made of, and the question as written.
+  private readonly tblMemo = new Map<string, { at: number; inputs: unknown[]; sameAs: string; codesEpoch: number; c: Record<string, unknown> | null; cJson: string; sig?: string; fallback?: boolean }>();
+  // Bumped whenever the long-code list is started over (codeRefs): questions
+  // written before that point at old list positions and are never reused.
+  private codesEpoch = 0;
+  // The candidate's own facts that its question depends on (besides `inputs`).
+  private memoKey(c: EntryCandidate, sizesKey: string): string {
+    return JSON.stringify([c.label, c.buyPool, c.sellPool, c.tokenIn, c.maxSizeUsd, c.gasUsd, c.keys, sizesKey, this.settings.minNetUsd]);
+  }
+  private captureForTimed(cand: EntryCandidate, plan: NonNullable<ReturnType<typeof ladderPlan>>, waitFor: <X>(p: Promise<X>) => Promise<X>): Promise<CapturedCheck | null> {
+    return waitFor(this.captureFor(cand, plan));
   }
 
   // Our exact check question for one candidate at its ladder. Writing it
@@ -976,7 +1067,7 @@ export class TrigEntry {
       if (o && typeof o.code === 'string' && o.code.length > 200) {
         let i = this.tbl.codes.indexOf(o.code);
         if (i < 0) {
-          if (this.tbl.codes.length >= 8) { this.tbl.codes = []; this.tbl.needFull = true; }
+          if (this.tbl.codes.length >= 8) { this.tbl.codes = []; this.tbl.needFull = true; this.codesEpoch++; }
           i = this.tbl.codes.push(o.code) - 1;
         }
         out[acct] = { ...o, code: `$code:${i}` };
@@ -1039,7 +1130,7 @@ export class TrigEntry {
     if (!target) { write(); return; }
     // The re-check waits for the trigger's block reports (bounded by the
     // trigger-first settings); never holds up anything else.
-    void withDeadline(this.d.tf.agreeLater(target.q, target.out), this.d.tf.settings.finalizeMs).then((ag) => write(ag ?? { agSkip: 'not in time' }, target.cand));
+    void withDeadline(this.d.tf.agreeLater(target.q, target.out), this.d.tf.settings.finalizeMs).then((ag) => stallFinder.run('trig entry log', () => write(ag ?? { agSkip: 'not in time' }, target.cand)));
   }
 
   // ---- hourly line --------------------------------------------------------------
@@ -1071,7 +1162,7 @@ export class TrigEntry {
       if (n.over + n.small + n.slightLoss + n.loss) parts.push(`best net after gas: over $0.25 ${n.over}, $0-0.25 ${n.small}, -$0.10-0 ${n.slightLoss}, under -$0.10 ${n.loss}`);
       const S = h.smp;
       if (S.asked) parts.push(`not-profitable sample re-checked ${S.asked}: agree ${S.agree}/${S.agree + S.disagree}${S.notCompared ? `, not compared ${S.notCompared}` : ''}, missed chances (re-check profitable) ${S.missed}`);
-      if (this.oneTripOn()) parts.push(`one trip ${h.one.used}${Object.keys(h.one.why).length ? ` (two steps: ${top(h.one.why)})` : ''}; table ${this.tbl.pools.size} pools / ${this.tbl.lastRoutes} routes, rebuilt in ${this.tbl.lastMs} ms`);
+      if (this.oneTripOn()) parts.push(`one trip ${h.one.used}${Object.keys(h.one.why).length ? ` (two steps: ${top(h.one.why)})` : ''}; table ${this.tbl.pools.size} pools / ${this.tbl.lastRoutes} routes (${this.tbl.lastReused} reused unchanged), rebuilt in ${this.tbl.lastMs} ms`);
       const hp = HOP_NAMES.filter((k) => h.hops[k].length).map((k) => `${k} ${pctl(h.hops[k], 0.5)}/${pctl(h.hops[k], 0.9)}`);
       if (hp.length) parts.push(`hops p50/p90 ms: ${hp.join(', ')}`);
       if (lag) parts.push(`event-loop lag p50 ${lag.p50} ms, p90 ${lag.p90} ms, max ${lag.max} ms`);

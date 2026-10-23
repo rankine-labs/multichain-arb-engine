@@ -521,6 +521,7 @@ itself is ~0.05 ms; not-profitable answers logged no numbers. Changes:
 |---|---|---|
 | `TRIG_ENTRY_ONE_TRIP` | `1` | discover + checks in one sidecar question (0 = two steps) |
 | `TRIG_ENTRY_TABLE_MS` | `1000` | candidate table rebuild interval (0 = never by itself) |
+| `TRIG_ENTRY_TABLE_REUSE_MS` | `5000` | a table route whose pools, coin price, size cap, gas and route pools did not change keeps its written-down question this long instead of being built again (~1 ms each); the bot still checks the question is exactly its own before using an answer. 0 = rebuild every route every time |
 | `TRIG_ENTRY_AGREE_SAMPLE` | `5` | re-check 1 in N not-profitable answers (0 = none) |
 | `TRIG_ENTRY_AGREE_SAMPLE_PER_HOUR` | `120` | at most this many sampled re-checks an hour |
 | `TRIG_ENTRY_IMMEDIATE` | `1` | start entry work inside the feed handler (0 = setImmediate, as before) |

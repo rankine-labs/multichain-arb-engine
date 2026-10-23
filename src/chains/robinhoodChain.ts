@@ -3,7 +3,7 @@ import {
       ChainCapability, RawChainEvent, PreparedTransaction, FireResult,
 } from '../core/types';
 import { parseFeedFrame, parseFeedMessages, maxSequenceNumber, FeedMsg } from './nitroFeed';
-import { labelled } from '../core/stallFinder';
+import { labelled, timed } from '../core/stallFinder';
 
 // ============================================================================
 // ROBINHOOD CHAIN ADAPTER
@@ -130,7 +130,19 @@ export class RobinhoodChainAdapter implements ChainCapability {
                     // Trigger-first order buffer: every message, also backlog
                     // repeats after a reconnect (the buffer keeps one copy per
                     // sequence number), before the repeat check below.
-                    if (this.msgTap) { try { const fm = parseFeedMessages(parsed); this.msgTap(fm, receivedAtMs, { recv: recvHr, parsed: performance.now() }); } catch { /* never breaks the feed */ } }
+                    // Freeze fix (Oct 23): messages we already had (a reconnect's
+                    // backlog replay, same sequence number or older) are not
+                    // unpacked again or offered as new triggers. FEED_SKIP_REPEATS=0
+                    // = old behaviour (every message unpacked and offered).
+                    // Timed under its own names, so a freeze report can tell
+                    // unpacking from the trigger work that follows.
+                    if (this.msgTap) {
+                          try {
+                                const after = process.env.FEED_SKIP_REPEATS === '0' ? undefined : this.lastSeqSeen;
+                                const fm = timed('feed unpack', () => parseFeedMessages(parsed, after));
+                                if (fm.length) { const tap = this.msgTap; timed('feed tap', () => tap(fm, receivedAtMs, { recv: recvHr, parsed: performance.now() })); }
+                          } catch { /* never breaks the feed */ }
+                    }
 
                     const seq = maxSequenceNumber(parsed);
                     // After a reconnect the broadcaster can replay its backlog.
@@ -144,7 +156,8 @@ export class RobinhoodChainAdapter implements ChainCapability {
                     // One frame can hold many transactions (see nitroFeed.ts).
                     // Emit one event per contract call with plain { to, data },
                     // which is what the decoder understands.
-                    for (const tx of parseFeedFrame(parsed)) {
+                    const txs = timed('feed decode', () => parseFeedFrame(parsed));
+                    for (const tx of txs) {
                           const event: RawChainEvent = {
                                 chain: 'robinhood',
                                 stateType: 'SEQUENCED',

@@ -216,7 +216,8 @@ export class StallFinder {
       const overlap = Math.min(s.end, end) - Math.max(s.start, start);
       if (overlap <= 0 || dur <= 0) continue;
       const own = overlap * Math.min(1, Math.max(0, s.selfMs / dur));
-      if (own > 0) jobs.set(s.name, (jobs.get(s.name) ?? 0) + own);
+      // (Oct 23) A job can never explain more than the whole freeze.
+      if (own > 0) jobs.set(s.name, Math.min(ms, (jobs.get(s.name) ?? 0) + own));
     }
     const during = this.inFlight.size ? [...this.inFlight.keys()].sort() : [];
     // Memory clean-ups already reported that overlapped this freeze. (One
@@ -314,9 +315,20 @@ export class StallFinder {
   // Name the rest of the current stretch of work, e.g. right after an
   // "await" (where run/runAsync stopped timing). The stretch ends when the
   // current piece of code gives the thread back (next microtask turn).
+  //
+  // Oct 23 fix (measurement only): two marked stretches never overlap any
+  // more. When many feed trades resume in the same turn, each one's mark
+  // used to stay open until ALL of them had run (its end waits in the
+  // queue behind the others), so the same work was counted once per trade:
+  // the 5-min line showed "feed trade max 3220 ms" while the worst freeze
+  // was 630 ms. Now a new mark first ends the one still open, so each
+  // stretch only covers its own code.
+  private openMark: (() => void) | null = null;
   mark(name: string): void {
+    if (this.openMark) { const prev = this.openMark; this.openMark = null; prev(); }
     const end = this.begin(name);
-    queueMicrotask(end);
+    this.openMark = end;
+    queueMicrotask(() => { end(); if (this.openMark === end) this.openMark = null; });
   }
 
   // Time an async job. The part before its first "await" is timed as one
