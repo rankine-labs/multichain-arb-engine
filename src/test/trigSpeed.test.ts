@@ -311,8 +311,8 @@ async function main() {
     const tb = side.table()!;
     const anyC = Object.values(tb.pools).flat().find((r: any) => r.c)!;
     assert(tb.codes.length === 0 || /^\$code:/.test(JSON.stringify(anyC.c.overrides)) || true, 'table sent');
-    assert(Array.isArray(anyC.c.calls) && anyC.c.calls[0].to.toLowerCase() === SIM_EXECUTOR_ADDRESS && typeof anyC.c.stop === 'string' && anyC.c.sizes?.amounts?.length === 2,
-      'each table entry holds our exact check call, its size ladder and the stop units');
+    assert(Array.isArray(anyC.c.calls) && anyC.c.calls[0].to.toLowerCase() === SIM_EXECUTOR_ADDRESS && typeof anyC.c.stop === 'string' && anyC.c.sizes?.amounts?.length === 3 && typeof anyC.c.sizes?.calc?.lo === 'string',
+      'each table entry holds our exact check call (at the cap), its size calculation (+ the ladder as fallback) and the stop units');
     const before = side.asked.length;
     assert(await x.te.refreshTable() && side.asked.length === before, 'nothing changed: nothing re-sent');
     uni[POOL_C][1].score = 0.7;

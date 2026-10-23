@@ -985,6 +985,10 @@ pub fn copy2_runs(c: &Copy2Handle, view: &View, facts: &crate::copy2::checkview:
             if let (Some(us), Some(o)) = (a.get("us").cloned(), m.as_object_mut()) {
                 o.insert("us".into(), us);
             }
+            // The calculated size's own time (taken out for the comparison).
+            if let (Some(us), Some(c)) = (a.get("calc").and_then(|c| c.get("us")).cloned(), m.get_mut("calc").and_then(|c| c.as_object_mut())) {
+                c.insert("us".into(), us);
+            }
             m
         }
         None => unknown(
@@ -995,10 +999,15 @@ pub fn copy2_runs(c: &Copy2Handle, view: &View, facts: &crate::copy2::checkview:
     }
 }
 
+/// An answer without its timings (`us`, and the calculated size's
+/// `calc.us`), for comparing two runs of one check.
 fn strip_us(v: &Value) -> Value {
     let mut v = v.clone();
     if let Some(m) = v.as_object_mut() {
         m.remove("us");
+        if let Some(c) = m.get_mut("calc").and_then(|c| c.as_object_mut()) {
+            c.remove("us");
+        }
     }
     v
 }

@@ -3,7 +3,7 @@ import type { FeedMsg } from '../chains/nitroFeed';
 import { performance } from 'perf_hooks';
 import { LocalSimClient, SidecarAnswer } from './localSim';
 import { JsonlLog, LocalTrade, LocalSimOpts, reasonOf } from './localSimHost';
-import { TriggerFirst, TrigOutcome, TrigConfidence, TrigQuestion, CannedAnswer, CapturedCheck, checkSig, confidenceAtLeast } from './triggerFirst';
+import { TriggerFirst, TrigOutcome, TrigConfidence, TrigQuestion, CannedAnswer, CapturedCheck, SizeAsk, checkSig, confidenceAtLeast, sizesWire } from './triggerFirst';
 import { loopLag } from '../core/loopLag';
 
 // ============================================================================
@@ -106,6 +106,22 @@ import { loopLag } from '../core/loopLag';
 //             is the same as the two-step path (tested). Anything missing
 //             (no table yet, an old sidecar, a changed trade) = the two-step
 //             path, unchanged.
+//   SIZE      (Oct 23, TRIG_ENTRY_SIZE_MODE=calc, default) the trade size
+//             is CALCULATED, not picked from the fixed ladder: our check is
+//             asked at the biggest size allowed (the cap: MAX_TRADE_USD,
+//             wallet room, auto-vetted coin limit; the lender is picked for
+//             that size, so every smaller size fits it too) and the sidecar
+//             works out, on the pools right after the trigger, the size that
+//             makes the most (sim/src/check/sizing.rs: where the two pools'
+//             prices meet after fees, measured with our real contract), then
+//             runs that size and a smaller backup (60%). The bot picks the
+//             best net of: the cap, the calculated size, the backup. If the
+//             calculation fails (a size it can't measure) the ladder sizes,
+//             sent along, run on the same replay and decide as before. In
+//             shadow mode the ladder also runs, so the log shows what the
+//             ladder would have made next to the calculated size
+//             (TRIG_ENTRY_CALC_COMPARE). TRIG_ENTRY_SIZE_MODE=ladder = the
+//             old ladder only.
 //   PRIORITY  the sidecar serves trigger-entry questions first (bounded,
 //             sim/src/jobq.rs); the bot starts entry work right inside the
 //             feed handler (TRIG_ENTRY_IMMEDIATE=1) and, while it is in
@@ -131,6 +147,11 @@ export type EntrySettings = {
   agreeSamplePerHour: number;    // TRIG_ENTRY_AGREE_SAMPLE_PER_HOUR [120] at most this many of those per hour
   immediate: boolean;            // TRIG_ENTRY_IMMEDIATE [1] start entry work inside the feed handler (0 = after it, setImmediate)
   yieldSliceMs: number;          // TRIG_ENTRY_YIELD_SLICE_MS [2] big jobs' longest bite while entry work runs (0 = no change)
+  sizeMode: 'calc' | 'ladder';   // TRIG_ENTRY_SIZE_MODE [calc] calculated best size (ladder as fallback) / the fixed ladder only
+  calcMinUsd: number;            // TRIG_ENTRY_CALC_MIN_USD [10] smallest size the calculation looks at ($)
+  calcBackup: number;            // TRIG_ENTRY_CALC_BACKUP [0.6] backup size = this share of the calculated size (0 = none)
+  calcProbes: number;            // TRIG_ENTRY_CALC_PROBES [12] most contract runs one calculation may use (backup included)
+  calcCompare: 'auto' | 'on' | 'off'; // TRIG_ENTRY_CALC_COMPARE [auto] also run the ladder to compare (auto = shadow mode only)
 };
 
 export function entrySettings(env: Record<string, string | undefined> = process.env, minNetUsd = 0.25): EntrySettings {
@@ -154,6 +175,11 @@ export function entrySettings(env: Record<string, string | undefined> = process.
     agreeSamplePerHour: Math.round(num('TRIG_ENTRY_AGREE_SAMPLE_PER_HOUR', 120, 0)),
     immediate: (env.TRIG_ENTRY_IMMEDIATE ?? '1').trim() !== '0',
     yieldSliceMs: num('TRIG_ENTRY_YIELD_SLICE_MS', 2, 0),
+    sizeMode: (env.TRIG_ENTRY_SIZE_MODE ?? 'calc').trim().toLowerCase() === 'ladder' ? 'ladder' : 'calc',
+    calcMinUsd: num('TRIG_ENTRY_CALC_MIN_USD', 10, 0.01),
+    calcBackup: Math.min(0.95, num('TRIG_ENTRY_CALC_BACKUP', 0.6, 0)),
+    calcProbes: Math.round(Math.min(24, num('TRIG_ENTRY_CALC_PROBES', 12, 2))),
+    calcCompare: ((v) => (v === 'on' || v === '1' ? 'on' : v === 'off' || v === '0' ? 'off' : 'auto'))((env.TRIG_ENTRY_CALC_COMPARE ?? 'auto').trim().toLowerCase()),
   };
 }
 
@@ -189,6 +215,8 @@ export type EntryCandidate = {
   build: (sizeUsd: number) => { trade: LocalTrade; simOpts: LocalSimOpts } | null;
   usdOf: (units: bigint) => number;       // start-coin units -> $
   host?: unknown;                // host data for the send (pool objects, ...)
+  loanPips?: number;             // fee of the lender the check uses, millionths (0 / missing = own money)
+  hooked?: boolean;              // a pool with a hook (fee may change with size): calculated by search, not the curve fit
 };
 
 // A route's id: "buy>sell:start" (lowercase). Two pools moved by one
@@ -267,6 +295,39 @@ export function ladderPlan(c: EntryCandidate, sizesUsd: number[]): { main: numbe
   return { main, b, others };
 }
 
+// THE SIZE QUESTION of one candidate (shared by the check and the one-trip
+// table, so both ask exactly the same):
+//   ladder mode: ladderPlan (biggest ladder size = the trade, the smaller
+//                ones ride along).
+//   calc mode:   the trade at the cap (c.maxSizeUsd), the ladder sizes ride
+//                along (they run only for comparison or as the fallback),
+//                and the sidecar calculates the best size between
+//                TRIG_ENTRY_CALC_MIN_USD and the cap. If the trade can't be
+//                built at the cap, the ladder plan is used.
+// `ladderAmounts`: the amounts the old ladder would have tried (for the
+// shadow comparison: what the ladder's best would have been).
+export type SizePlan = { mode: 'calc' | 'ladder'; main: number; b: { trade: LocalTrade; simOpts: LocalSimOpts }; others: bigint[]; ask: SizeAsk; ladderAmounts: bigint[] };
+export function sizePlan(c: EntryCandidate, s: Pick<EntrySettings, 'sizesUsd' | 'sizeMode' | 'calcMinUsd' | 'calcBackup' | 'calcProbes'>, compare = false): SizePlan | null {
+  const ladder = (): SizePlan | null => {
+    const p = ladderPlan(c, s.sizesUsd);
+    return p ? { mode: 'ladder', ...p, ask: { amounts: p.others }, ladderAmounts: [...p.others, p.b.trade.amountIn] } : null;
+  };
+  if (s.sizeMode !== 'calc' || !(c.maxSizeUsd > 0)) return ladder();
+  const main = c.maxSizeUsd;
+  const b = c.build(main);
+  if (!b || !(b.trade.amountIn > 0n)) return ladder();
+  const amt = (usd: number) => (b.trade.amountIn * BigInt(Math.round(usd * 1e6))) / BigInt(Math.max(1, Math.round(main * 1e6)));
+  // The old ladder's sizes under the cap (none = the cap itself, as ladderPlan).
+  const lad = s.sizesUsd.filter((x) => x <= main);
+  const ladderAmounts = lad.length ? lad.map((u) => (u === main ? b.trade.amountIn : amt(u))).filter((x) => x > 0n) : [b.trade.amountIn];
+  const others = ladderAmounts.filter((x) => x !== b.trade.amountIn).slice(0, 8);
+  const lo = amt(Math.min(s.calcMinUsd, main));
+  return {
+    mode: 'calc', main, b, others, ladderAmounts,
+    ask: { amounts: others, calc: { lo: lo > 0n ? lo : 1n, loanPips: c.loanPips, fit: !c.hooked, backup: s.calcBackup, probes: s.calcProbes, compare } },
+  };
+}
+
 // The smallest profit (start-coin units) that clears the send minimum
 // after gas, by the candidate's OWN money conversion (so the sidecar's stop
 // rule "profit >= this" is exactly the bot's "net >= minimum"). null = none.
@@ -283,8 +344,8 @@ export function stopUnits(c: EntryCandidate, minNetUsd: number): bigint | null {
 // A written-down check question with other amounts put in (see
 // TrigEntry.captureFor): the call's amountIn word (4th word after the 4-byte
 // code) and every pretend-state value that held exactly the old amount (the
-// test contract's trading money), plus the ladder amounts.
-export function patchAmounts(cap: CapturedCheck, oldAmount: bigint, amount: bigint, others: bigint[]): CapturedCheck {
+// test contract's trading money), plus the ladder amounts / size calculation.
+export function patchAmounts(cap: CapturedCheck, oldAmount: bigint, amount: bigint, others: bigint[] | SizeAsk): CapturedCheck {
   const w = (n: bigint) => '0x' + n.toString(16).padStart(64, '0');
   const oldW = w(oldAmount).toLowerCase();
   const newW = w(amount);
@@ -297,10 +358,10 @@ export function patchAmounts(cap: CapturedCheck, oldAmount: bigint, amount: bigi
     return v;
   };
   const calls = cap.calls.map((c, i) => (i === 0 ? { ...(c as Record<string, unknown>), data } : c));
-  return {
-    calls, overrides: swap(cap.overrides) as Record<string, unknown>, data,
-    ...(cap.sizes ? { sizes: { amountOffset: cap.sizes.amountOffset, amounts: others.slice(0, 8).map((a) => '0x' + a.toString(16)) } } : {}),
-  };
+  // The sizes part is written again exactly as a fresh question would
+  // (sizesWire), so the table's question matches the bot's check.
+  const sizes = cap.sizes ? sizesWire(others) : undefined;
+  return { calls, overrides: swap(cap.overrides) as Record<string, unknown>, data, ...(sizes ? { sizes } : {}) };
 }
 
 // The chosen trade.
@@ -408,7 +469,26 @@ export class TrigEntry {
       // one trip: used / why not
       one: { used: 0, why: {} as Record<string, number> },
       hops: Object.fromEntries(HOP_NAMES.map((n) => [n, [] as number[]])) as Record<HopName, number[]>,
+      // sizing of every sure candidate answer: how the size was found, the
+      // calculation's time (µs), and (shadow) calc vs ladder best net
+      sz: { calc: 0, ladder: 0, fallback: 0, how: {} as Record<string, number>, us: [] as number[], runs: [] as number[], better: 0, same: 0, worse: 0, gainUsd: 0 },
     };
+  }
+
+  // Count one sure answer's sizing for the hourly line.
+  private countSizing(z: SizeFacts): void {
+    const S = this.hour.sz;
+    if (z.m === 'ladder') S.ladder++;
+    else if (z.how === 'fit' || z.how === 'search' || z.how === 'none') S.calc++;
+    else S.fallback++;
+    if (z.how) S.how[z.how] = (S.how[z.how] ?? 0) + 1;
+    if (typeof z.us === 'number') keep(S.us, z.us);
+    if (typeof z.pr === 'number') keep(S.runs, z.pr);
+    if (typeof z.lad === 'number' && typeof z.cn === 'number') {
+      const d = z.cn - z.lad;
+      if (d > 0.005) S.better++; else if (d < -0.005) S.worse++; else S.same++;
+      S.gainUsd += d;
+    }
   }
 
   constructor(deps: EntryDeps) {
@@ -419,7 +499,10 @@ export class TrigEntry {
     this.lagNow = deps.lag ?? (() => loopLag.now());
     this.ours = { isOurTx: deps.isOurTx, addresses: new Set(deps.ourAddresses.map((a) => a.toLowerCase())) };
     const one = this.oneTripOn() ? `one trip (table every ${this.settings.tableMs} ms)` : 'two steps';
-    this.log(`[trig-entry] ${this.active() ? deps.tf.mode() : 'off'}: every feed transaction checked as a possible trigger (max ${this.settings.maxInFlight} at once, ${this.settings.maxCandidates} candidates each, sizes $${this.settings.sizesUsd.join('/$')}, ${one})`);
+    const sizing = this.settings.sizeMode === 'calc'
+      ? `size calculated from $${this.settings.calcMinUsd} up to the cap (backup ${Math.round(this.settings.calcBackup * 100)}%, ladder $${this.settings.sizesUsd.join('/$')} as fallback${this.compareOn() ? ' and for comparison' : ''})`
+      : `sizes $${this.settings.sizesUsd.join('/$')}`;
+    this.log(`[trig-entry] ${this.active() ? deps.tf.mode() : 'off'}: every feed transaction checked as a possible trigger (max ${this.settings.maxInFlight} at once, ${this.settings.maxCandidates} candidates each, ${sizing}, ${one})`);
     if (this.active()) {
       if (!deps.lag) loopLag.start();
       if (this.oneTripOn() && this.settings.tableMs > 0) {
@@ -602,6 +685,9 @@ export class TrigEntry {
       c: r.out.sure ? r.out.confidence : undefined,
     }));
     const viewBest = results.filter((r) => r.out.sure && r.view).sort((x, y) => y.view!.netUsd - x.view!.netUsd)[0];
+    // Sizing (log + hourly): the best candidate's, and every sure answer counted.
+    rec.sz = viewBest?.sz;
+    for (const r of results) if (r.out.sure && r.sz) this.countSizing(r.sz);
     if (viewBest) rec.view = { label: viewBest.cand.label, sizeUsd: viewBest.view!.sizeUsd, netUsd: viewBest.view!.netUsd, verdict: viewBest.view!.verdict, le: viewBest.view!.le, conf: viewBest.out.confidence, as: viewBest.out.assumptions };
     const picks = results.filter((r) => !!r);
     const sure = picks.filter((r) => r.out.sure);
@@ -796,40 +882,84 @@ export class TrigEntry {
     return null;
   }
 
-  // One candidate: the full trigger-first check at the biggest size of the
-  // ladder, the smaller sizes on the same replay; its best size. `canned`
+  // Run the ladder next to the calculated size (shadow comparison)?
+  compareOn(): boolean {
+    const c = this.settings.calcCompare;
+    return c === 'on' || (c === 'auto' && this.d.tf.mode() !== 'on');
+  }
+
+  // One candidate: the full trigger-first check at its size plan (calc mode:
+  // at the cap, the sidecar calculating the best size on the same replay;
+  // ladder mode: the biggest ladder size, the smaller ones on the same
+  // replay); its best size. `canned`
   // (one trip): the sidecar's answer is already here; read it, don't ask.
   private async checkCandidate(c: EntryCandidate, hash: string, seenMs: number, canned?: CannedAnswer): Promise<CandResult | null> {
-    const plan = ladderPlan(c, this.settings.sizesUsd);
+    const plan = sizePlan(c, this.settings, this.compareOn());
     if (!plan) return null;
-    const { main, b, others } = plan;
+    const { main, b } = plan;
     const q: TrigQuestion = { trade: b.trade, simOpts: b.simOpts, triggerHash: hash, seenMs, keys: c.keys, label: c.label };
-    const out = await this.d.tf.askOnly(q, others, canned);
+    const out = await this.d.tf.askOnly(q, plan.ask, canned);
     if (!out.sure) return { out, cand: c, q };
     // Every size: net after gas; the best one. (A profit bigger than the
     // trade itself is bad data, never used.) `pick` = the best PROFITABLE
-    // size (decisions, unchanged); `view` = the best of every size,
-    // losses included (logging only: a "loss" answer only says "no
-    // profit", so its net is at most minus gas).
-    const rows: Array<{ amount: bigint; profit: bigint; sizeUsd: number; status: string }> = [];
+    // size (decisions); `view` = the best of every size, losses included
+    // (logging only: a "loss" answer only says "no profit", so its net is
+    // at most minus gas).
+    // Which sizes may be picked: with a calculated size (the sidecar's
+    // calc answer, not "failed"): the main size (the cap) and the
+    // calculated + backup rows. Otherwise (ladder mode, calculation failed,
+    // an older sidecar): the main size and the ladder rows, as before.
+    type Row = { amount: bigint; profit: bigint; sizeUsd: number; status: string; src?: 'calc' | 'backup' | 'main' };
+    const usdSize = (amount: bigint) => (main * Number(amount)) / Number(b.trade.amountIn);
+    const all: Row[] = [];
     const st = out.sim.status;
-    if (st === 'profit' || st === 'loss') rows.push({ amount: b.trade.amountIn, profit: st === 'profit' ? out.sim.profit : 0n, sizeUsd: main, status: st });
-    for (const r of out.ladder ?? []) if (r.status === 'profit' || r.status === 'loss') rows.push({ amount: r.amount, profit: r.profit, sizeUsd: (main * Number(r.amount)) / Number(b.trade.amountIn), status: r.status });
+    if (st === 'profit' || st === 'loss') all.push({ amount: b.trade.amountIn, profit: st === 'profit' ? out.sim.profit : 0n, sizeUsd: main, status: st, src: 'main' });
+    // (Never a size above the trade's own amount, the cap: bad data.)
+    for (const r of out.ladder ?? []) if ((r.status === 'profit' || r.status === 'loss') && r.amount > 0n && r.amount <= b.trade.amountIn) all.push({ amount: r.amount, profit: r.profit, sizeUsd: usdSize(r.amount), status: r.status, src: r.src });
+    const calcOk = plan.mode === 'calc' && !!out.calc && out.calc.how !== 'failed';
+    const rows = all.filter((r) => (calcOk ? r.src !== undefined : r.src === undefined || r.src === 'main'));
+    const netOf = (r: Row): number | null => {
+      if (r.status === 'loss' || r.profit <= 0n) return -c.gasUsd;
+      if (r.profit > r.amount) return null;
+      const n = c.usdOf(r.profit) - c.gasUsd;
+      return Number.isFinite(n) ? n : null;
+    };
     let pick: EntryPick | undefined;
     let view: CandResult['view'];
     for (const r of rows) {
+      const net = netOf(r);
+      if (net === null) continue;
       if (r.status === 'loss' || r.profit <= 0n) {
-        const net = -c.gasUsd;
         if (!view || net > view.netUsd) view = { sizeUsd: r.sizeUsd, netUsd: net, verdict: 'loss', le: true };
         continue;
       }
-      if (r.profit > r.amount) continue;
-      const net = c.usdOf(r.profit) - c.gasUsd;
-      if (!Number.isFinite(net)) continue;
       if (!pick || net > pick.netUsd) pick = { cand: c, sizeUsd: r.sizeUsd, amountIn: r.amount, profitUnits: r.profit, netUsd: net, out, q };
       if (!view || net > view.netUsd || view.le) view = { sizeUsd: r.sizeUsd, netUsd: net, verdict: 'profit' };
     }
-    return { out, pick, view, cand: c, q };
+    // SIZING facts for the log (see EntryRecord.sz).
+    let sz: SizeFacts | undefined;
+    try {
+      const best = (rs: Row[]) => rs.reduce<number | undefined>((m, r) => { const n = netOf(r); return n === null ? m : m === undefined ? n : Math.max(m, n); }, undefined);
+      const calcRow = all.find((r) => r.src === 'calc');
+      const backRow = all.find((r) => r.src === 'backup');
+      const usdP = (r?: Row) => (r ? r2(r.status === 'profit' && r.profit <= r.amount ? c.usdOf(r.profit) : 0) : undefined);
+      // What the old ladder would have made (its sizes ran: ladder mode,
+      // the comparison, or the fallback).
+      const ladSet = new Set(plan.ladderAmounts.map((a) => a.toString()));
+      const ladRows = all.filter((r) => (r.src === undefined || r.src === 'main') && ladSet.has(r.amount.toString()));
+      const ladderRan = plan.mode === 'ladder' || !!out.calc?.ladder || !out.calc;
+      sz = {
+        m: plan.mode, how: plan.mode === 'calc' ? (out.calc?.how ?? 'no_answer') : undefined,
+        calc: out.calc?.size !== undefined ? r2(usdSize(out.calc.size)) : undefined,
+        ch: pick ? r2(pick.sizeUsd) : undefined,
+        pc: usdP(calcRow), pb: usdP(backRow),
+        pr: out.calc?.probes, us: out.calc?.us,
+        lad: ladderRan && ladRows.length ? r2(best(ladRows)!) : undefined,
+        cn: calcOk ? (best(rows) !== undefined ? r2(best(rows)!) : undefined) : undefined,
+        why: out.calc?.how === 'failed' || out.calc?.how === 'search' ? out.calc.why : undefined,
+      };
+    } catch { sz = undefined; }
+    return { out, pick, view, cand: c, q, sz };
   }
 
   // ---- ONE TRIP TABLE ------------------------------------------------------------
@@ -880,7 +1010,7 @@ export class TrigEntry {
           if (!cand) { rows.push({ rid: r.rid.toLowerCase(), h: r.held, s: score, e: null }); metas.push(null); fps.push([r.rid, r.held, score, null]); continue; }
           const meta: TableMeta = { cand };
           let c: Record<string, unknown> | null = null;
-          const plan = ladderPlan(cand, this.settings.sizesUsd);
+          const plan = sizePlan(cand, this.settings, this.compareOn());
           if (plan) {
             const cap = await this.captureFor(cand, plan);
             const stop = stopUnits(cand, this.settings.minNetUsd);
@@ -954,13 +1084,16 @@ export class TrigEntry {
   // changes too). If that ever differs from a fresh build, the answer is
   // simply not recognised and that candidate is checked the old way.
   private readonly capCache = new Map<string, { cap: CapturedCheck; amount: bigint }>();
-  private async captureFor(cand: EntryCandidate, plan: NonNullable<ReturnType<typeof ladderPlan>>): Promise<CapturedCheck | null> {
+  private async captureFor(cand: EntryCandidate, plan: SizePlan): Promise<CapturedCheck | null> {
     const t = plan.b.trade;
-    const key = JSON.stringify({ token: t.token, hops: t.hops, o: plan.b.simOpts, n: plan.others.length }, (_k, v) => (typeof v === 'bigint' ? v.toString() : v));
+    // Route shape: coin, hops, lender, number of ladder sizes, whether (and
+    // how) a size is calculated. Amounts (incl. the calculation's lo) are put in.
+    const calcShape = plan.ask.calc ? { ...plan.ask.calc, lo: undefined } : null;
+    const key = JSON.stringify({ token: t.token, hops: t.hops, o: plan.b.simOpts, n: plan.others.length, calc: calcShape }, (_k, v) => (typeof v === 'bigint' ? v.toString() : v));
     const hit = this.capCache.get(key);
-    if (hit) return patchAmounts(hit.cap, hit.amount, t.amountIn, plan.others);
+    if (hit) return patchAmounts(hit.cap, hit.amount, t.amountIn, plan.ask);
     const q: TrigQuestion = { trade: t, simOpts: plan.b.simOpts, triggerHash: '', seenMs: 0, keys: cand.keys, label: cand.label };
-    const cap = await this.d.tf.capture(q, plan.others);
+    const cap = await this.d.tf.capture(q, plan.ask);
     if (!cap) return null;
     if (this.capCache.size > 2_000) this.capCache.clear(); // memory bound
     this.capCache.set(key, { cap, amount: t.amountIn });
@@ -1020,6 +1153,9 @@ export class TrigEntry {
           conf: v?.conf ?? rec.best?.conf, as: (v?.as ?? rec.best?.as)?.length ? (v?.as ?? rec.best?.as) : undefined, u: rec.unknown,
           // every checked candidate: label, verdict, net, size, reason (fail / unknown), confidence
           cv: rec.cv?.length ? rec.cv : undefined,
+          // sizing of the best candidate: mode, how, calculated / chosen size,
+          // profit at calc vs backup, runs, µs, (shadow) ladder's best net vs calc's (SizeFacts)
+          sz: rec.sz,
           // decision: would send (shadow) / sent (on), or what held it back
           would: rec.wouldSend || undefined, held: rec.held,
           // one trip used (1) or why not; candidates the sidecar left to the old way; ran out of its time
@@ -1072,6 +1208,15 @@ export class TrigEntry {
       const S = h.smp;
       if (S.asked) parts.push(`not-profitable sample re-checked ${S.asked}: agree ${S.agree}/${S.agree + S.disagree}${S.notCompared ? `, not compared ${S.notCompared}` : ''}, missed chances (re-check profitable) ${S.missed}`);
       if (this.oneTripOn()) parts.push(`one trip ${h.one.used}${Object.keys(h.one.why).length ? ` (two steps: ${top(h.one.why)})` : ''}; table ${this.tbl.pools.size} pools / ${this.tbl.lastRoutes} routes, rebuilt in ${this.tbl.lastMs} ms`);
+      const Z = h.sz;
+      const zn = Z.calc + Z.ladder + Z.fallback;
+      if (zn) {
+        const hows = Object.entries(Z.how).sort((a, b) => b[1] - a[1]).map(([k, n]) => `${k} ${n}`).join(', ');
+        let t = `sizing: ${pct(Z.calc, zn)} of ${zn} answers sized by calculation${hows ? ` (${hows})` : ''}${Z.fallback ? `, ladder fallback ${Z.fallback}` : ''}${Z.ladder ? `, ladder mode ${Z.ladder}` : ''}`;
+        if (Z.us.length) t += `, sizing time median ${pctl(Z.us, 0.5)} us (p90 ${pctl(Z.us, 0.9)} us), runs median ${pctl(Z.runs, 0.5)}`;
+        if (Z.better + Z.same + Z.worse) t += `; calc vs ladder (same replay): calc better ${Z.better}, same ${Z.same}, ladder better ${Z.worse}, net difference $${Z.gainUsd.toFixed(2)}`;
+        parts.push(t);
+      }
       const hp = HOP_NAMES.filter((k) => h.hops[k].length).map((k) => `${k} ${pctl(h.hops[k], 0.5)}/${pctl(h.hops[k], 0.9)}`);
       if (hp.length) parts.push(`hops p50/p90 ms: ${hp.join(', ')}`);
       if (lag) parts.push(`event-loop lag p50 ${lag.p50} ms, p90 ${lag.p90} ms, max ${lag.max} ms`);
@@ -1083,7 +1228,21 @@ export class TrigEntry {
   }
 }
 
+// SIZING facts of one checked candidate (log field `sz`, $ and µs):
+//   m    size mode: calc / ladder
+//   how  calc mode: fit (the pool curve) / search (real runs) / none (no
+//        profitable size) / failed (couldn't measure: the ladder decided) /
+//        no_answer (an older sidecar: the ladder decided)
+//   calc the calculated size ($); ch: the size picked ($)
+//   pc / pb  profit before gas at the calculated / backup size ($)
+//   pr   contract runs the calculation used; us: its time (µs)
+//   lad  shadow: best net after gas the old ladder would have made ($)
+//   cn   best net after gas of the calculated sizes (incl. the cap) ($)
+//   why  why the search was used / why it failed
+export type SizeFacts = { m: 'calc' | 'ladder'; how?: string; calc?: number; ch?: number; pc?: number; pb?: number; pr?: number; us?: number; lad?: number; cn?: number; why?: string };
+
 type CandResult = {
+  sz?: SizeFacts;
   out: TrigOutcome;
   pick?: EntryPick;
   // The best size of every size, losses included (logging only).
@@ -1140,4 +1299,5 @@ export type EntryRecord = {
   hops?: Hops;
   wouldSend?: boolean;
   held?: string;
+  sz?: SizeFacts;                 // sizing of the best candidate (see SizeFacts)
 };

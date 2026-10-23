@@ -2957,6 +2957,11 @@ const entryBuild = ({ buy, sell, tokenIn, tokenOut }: EntryRouteT): EntryCandida
             build: (usd) => { const b = buildCheck('robinhood', tokenIn, buy, sell, usd, usdPer); return 'skip' in b ? null : { trade: b.trade, simOpts: b.simOpts }; },
             usdOf: (units) => (Number(units) / 10 ** dec) * usdPer,
             host,
+            // Calculated size (execution/trigEntry.ts sizePlan): the lender's
+            // fee (picked for the cap, as the check) and whether a pool has a
+            // hook (its fee may change with size: search, not the curve fit).
+            loanPips: lender ? (lender.feePips ?? lender.feeBps * 100) : 0,
+            hooked: [buy, sell].some((p: any) => typeof p?.hooks === 'string' && /^0x[0-9a-fA-F]{40}$/.test(p.hooks) && !/^0x0{40}$/.test(p.hooks)),
       };
 };
 // Two steps: routes for the moved pools, ranked and capped BEFORE building.

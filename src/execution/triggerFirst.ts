@@ -227,11 +227,47 @@ export type TrigInfo = { snapBlock?: number; included?: boolean; triggerOk?: boo
 
 // Entry point size ladder (execution/trigEntry.ts): our trade tried at
 // other sizes on the SAME feed replay, in the same request (sidecar
-// proto_types.rs WireSizes). One row per extra size.
-export type TrigLadderRow = { amount: bigint; status: 'profit' | 'loss' | 'fail' | 'unknown'; profit: bigint };
+// proto_types.rs WireSizes). One row per extra size. `src` (calculated
+// size, sim/src/check/sizing.rs): 'calc' = the best size the sidecar worked
+// out, 'backup' = the smaller backup size; no src = a ladder size.
+export type TrigLadderRow = { amount: bigint; status: 'profit' | 'loss' | 'fail' | 'unknown'; profit: bigint; src?: 'calc' | 'backup' };
+
+// CALCULATED SIZE (entry point, Oct 23): instead of only the fixed ladder,
+// the sidecar works out the most profitable size on the replayed feed
+// (between `lo` and the main call's amount, the bot's cap) and runs it plus
+// a smaller backup. `loanPips`: the lender's fee (0 = own money); `fit`:
+// false for routes with a hook pool (search with real runs instead);
+// `compare`: also run the ladder (shadow measurement). The ladder amounts
+// are always sent: they run anyway if the calculation fails.
+export type SizeCalcAsk = { lo: bigint; loanPips?: number; fit?: boolean; backup?: number; probes?: number; compare?: boolean };
+export type SizeAsk = { amounts: bigint[]; calc?: SizeCalcAsk };
+// What the sidecar said about the calculation (answer field `calc`).
+export type TrigCalcInfo = { how: 'fit' | 'search' | 'none' | 'failed'; size?: bigint; fit?: bigint; backup?: bigint; probes?: number; why?: string; ladder?: boolean; us?: number };
+export type SizesWire = { amountOffset: number; amounts: string[]; calc?: { lo: string; loanPips?: number; fit?: boolean; backup?: number; probes?: number; compare?: boolean } };
+
+// The `sizes` field of a check question (amountIn is the 4th 32-byte word
+// after the 4-byte code of both executor calls). A plain list = ladder only
+// (the old question, unchanged). undefined = no extra sizes.
+export function sizesWire(ask?: bigint[] | SizeAsk): SizesWire | undefined {
+  const a: SizeAsk | undefined = Array.isArray(ask) ? { amounts: ask } : ask;
+  if (!a || (!a.amounts.length && !a.calc)) return undefined;
+  const hx = (n: bigint) => '0x' + n.toString(16);
+  const out: SizesWire = { amountOffset: 96, amounts: a.amounts.slice(0, 8).map(hx) };
+  if (a.calc) {
+    const c = a.calc;
+    out.calc = { lo: hx(c.lo > 0n ? c.lo : 1n) };
+    if (c.loanPips !== undefined && Number.isFinite(c.loanPips) && c.loanPips > 0) out.calc.loanPips = Math.round(c.loanPips);
+    if (c.fit === false) out.calc.fit = false;
+    if (c.backup !== undefined && Number.isFinite(c.backup)) out.calc.backup = c.backup;
+    if (c.probes !== undefined && Number.isFinite(c.probes)) out.calc.probes = Math.round(c.probes);
+    if (c.compare) out.calc.compare = true;
+  }
+  return out;
+}
 
 export type TrigOutcome = {
   ladder?: TrigLadderRow[];             // entry point: the other sizes' results (sure answers only)
+  calc?: TrigCalcInfo;                  // entry point: how the sidecar calculated the size (if asked)
   sure: boolean;                        // a real profit / loss / fail verdict
   verdict: Verdict;
   sim: SimResult;
@@ -281,7 +317,7 @@ function codeTag(code: string): string {
 
 // What our exact check question looks like (for the one-trip table): the
 // `call` fields a trigger-first check sends, minus the feed.
-export type CapturedCheck = { calls: unknown[]; overrides: Record<string, unknown>; sizes?: { amountOffset: number; amounts: string[] }; data: string };
+export type CapturedCheck = { calls: unknown[]; overrides: Record<string, unknown>; sizes?: SizesWire; data: string };
 
 // Unknown reasons that mean "the state we needed wasn't there" (for the
 // "required state available" share in the hourly line).
@@ -314,10 +350,24 @@ function readLadder(v: unknown): TrigLadderRow[] | undefined {
       const st = (r as { status?: unknown }).status;
       if (st !== 'profit' && st !== 'loss' && st !== 'fail' && st !== 'unknown') continue;
       const p = (r as { profit?: unknown }).profit;
-      out.push({ amount: BigInt((r as { amount: string }).amount), status: st, profit: typeof p === 'string' ? BigInt(p) : 0n });
+      const src = (r as { src?: unknown }).src;
+      out.push({ amount: BigInt((r as { amount: string }).amount), status: st, profit: typeof p === 'string' ? BigInt(p) : 0n, ...(src === 'calc' || src === 'backup' ? { src } : {}) });
     } catch { /* a bad row is skipped */ }
   }
   return out;
+}
+
+// The sidecar's `calc` field -> TrigCalcInfo (undefined: none / unreadable).
+function readCalc(v: unknown): TrigCalcInfo | undefined {
+  try {
+    if (!v || typeof v !== 'object') return undefined;
+    const c = v as Record<string, unknown>;
+    const how = c.how;
+    if (how !== 'fit' && how !== 'search' && how !== 'none' && how !== 'failed') return undefined;
+    const big = (x: unknown) => (typeof x === 'string' && /^0x[0-9a-f]+$/i.test(x) ? BigInt(x) : undefined);
+    const num = (x: unknown) => (typeof x === 'number' && Number.isFinite(x) ? x : undefined);
+    return { how, size: big(c.size), fit: big(c.fit), backup: big(c.backup), probes: num(c.probes), why: typeof c.why === 'string' ? c.why.slice(0, 80) : undefined, ladder: c.ladder === true, us: num(c.us) };
+  } catch { return undefined; }
 }
 
 // The promise's answer, or null if it takes longer than ms.
@@ -580,7 +630,7 @@ export class TriggerFirst {
   // `canned` (one trip): read the sidecar's answer from the combined
   // question instead of asking again; everything else is the same code.
   // Entry checks are marked `prio` (the sidecar's fast lane, sim/src/jobq.rs).
-  async askOnly(q: TrigQuestion, sizes?: bigint[], canned?: CannedAnswer): Promise<TrigOutcome> {
+  async askOnly(q: TrigQuestion, sizes?: bigint[] | SizeAsk, canned?: CannedAnswer): Promise<TrigOutcome> {
     const requestMs = this.now();
     const unknown = (why: string, extra: Partial<TrigOutcome> = {}): TrigOutcome => ({
       sure: false, verdict: 'unknown', why, requestMs, answerMs: this.now(), seenMs: q.seenMs,
@@ -594,10 +644,10 @@ export class TriggerFirst {
   // calldata, pretend state, size ladder), WITHOUT asking anything about it.
   // The token's balance location may be looked up from the sidecar (once
   // per token, like any check). null = it couldn't be worked out.
-  async capture(q: TrigQuestion, sizes?: bigint[]): Promise<CapturedCheck | null> {
+  async capture(q: TrigQuestion, sizes?: bigint[] | SizeAsk): Promise<CapturedCheck | null> {
     try {
       let got: CapturedCheck | null = null;
-      const ladderReq = sizes?.length ? { amountOffset: 96, amounts: sizes.slice(0, 8).map((a) => '0x' + a.toString(16)) } : undefined;
+      const ladderReq = sizesWire(sizes);
       const plain = makeLocalRpc(this.client, undefined, { timeoutMs: 300 });
       const rpc = async (method: string, params: unknown[]) => {
         const p = (params ?? []) as any[];
@@ -624,7 +674,7 @@ export class TriggerFirst {
     return { agree: rec.agree, agV: rec.agreeVerdict, agP: rec.agreeProfit, same: rec.sameState, agSkip: rec.agreeSkipped, rblk: rec.reportBlock ?? undefined, rAfterMs: rec.reportMs !== undefined ? rec.reportMs - out.answerMs : undefined };
   }
 
-  private async ask(q: TrigQuestion, requestMs: number, unknown: (why: string, extra?: Partial<TrigOutcome>) => TrigOutcome, sizes?: bigint[], canned?: CannedAnswer, prio = false): Promise<TrigOutcome> {
+  private async ask(q: TrigQuestion, requestMs: number, unknown: (why: string, extra?: Partial<TrigOutcome>) => TrigOutcome, sizes?: bigint[] | SizeAsk, canned?: CannedAnswer, prio = false): Promise<TrigOutcome> {
     const s = this.settings;
     if (s.mode === 'off') return unknown('off');
     if (!canned && !this.client.isConnected()) return unknown('disconnected');
@@ -655,10 +705,13 @@ export class TriggerFirst {
       },
     } as unknown as LocalSimClient) : this.client;
     const hop: NonNullable<TrigOutcome['hop']> = {};
-    // Size ladder (entry point): amountIn is the 4th 32-byte word after the
-    // 4-byte code of both executor calls (localSimHost.ts sizeSearch).
-    const ladderReq = sizes?.length ? { sizes: { amountOffset: 96, amounts: sizes.slice(0, 8).map((a) => '0x' + a.toString(16)) } } : {};
+    // Size ladder / calculated size (entry point): amountIn is the 4th
+    // 32-byte word after the 4-byte code of both executor calls
+    // (localSimHost.ts sizeSearch).
+    const sw = sizesWire(sizes);
+    const ladderReq = sw ? { sizes: sw } : {};
     let ladder: TrigLadderRow[] | undefined;
+    let calc: TrigCalcInfo | undefined;
     let info: TrigInfo | undefined;
     let missing: WarmItem[] = [];
     let insideMs: number | undefined;
@@ -680,6 +733,7 @@ export class TriggerFirst {
         if (typeof a.us === 'number') insideMs = Math.round(a.us / 100) / 10;
         if (a.ok === true) info = (a as { trig?: TrigInfo }).trig;
         if (a.ok === true) ladder = readLadder((a as { sizes?: unknown }).sizes);
+        if (a.ok === true) calc = readCalc((a as { calc?: unknown }).calc);
         else missing = Array.isArray((a as { missing?: unknown[] }).missing) ? ((a as { missing?: WarmItem[] }).missing ?? []) : [];
       },
     });
@@ -692,7 +746,7 @@ export class TriggerFirst {
     const ti = info as TrigInfo | undefined;
     const confidence: TrigConfidence = ti?.conf === 'medium' || ti?.conf === 'low' ? ti.conf : 'high';
     const assumptions = Array.isArray(ti?.assumed) ? ti!.assumed!.filter((x) => typeof x === 'string').slice(0, 8) : [];
-    return { sure: true, sim, verdict, requestMs, answerMs: this.now(), seenMs: q.seenMs, triggerSeq: seq, info, insideMs, confidence, assumptions, hop, ...(ladder ? { ladder } : {}) };
+    return { sure: true, sim, verdict, requestMs, answerMs: this.now(), seenMs: q.seenMs, triggerSeq: seq, info, insideMs, confidence, assumptions, hop, ...(ladder ? { ladder } : {}), ...(calc ? { calc } : {}) };
   }
 
   // ---- what happened next (for the log) -------------------------------------

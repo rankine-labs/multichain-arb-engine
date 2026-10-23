@@ -503,11 +503,31 @@ pub struct Assume {
 /// `amount_offset` (after the 4-byte code) changed, and every slot in
 /// `slots` (own money: the test contract's trading money) served as the
 /// amount. The feed is replayed ONCE for all sizes.
+///
+/// CALCULATED SIZE (`calc`, Oct 23, check/sizing.rs): instead of (or, in
+/// shadow, besides) the fixed amounts, work out the most profitable size on
+/// the same copy right after the replay, then run that size and a smaller
+/// backup. The fixed amounts then run only when `calc.compare` is set
+/// (measurement) or the calculation failed (fallback).
 #[derive(Clone, Debug, Default)]
 pub struct Ladder {
     pub amount_offset: usize,
     pub amounts: Vec<U256>,
     pub slots: Vec<(Address, U256)>,
+    pub calc: Option<super::sizing::CalcParams>,
+}
+
+/// What the calculated size did (see `Ladder.calc`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CalcReport {
+    pub out: super::sizing::CalcOut,
+    /// Our trade at the calculated size, and at the backup size.
+    pub calc_row: Option<LadderRow>,
+    pub backup_row: Option<LadderRow>,
+    /// Time the calculation took (microseconds; probes included).
+    pub us: u64,
+    /// The fixed amounts ran too (shadow comparison, or the fallback).
+    pub ladder_ran: bool,
 }
 
 /// One ladder size's result (None: unknown at this size, e.g. a value we
@@ -908,6 +928,8 @@ pub struct OrderedOut {
     pub hashes: Vec<(U256, U256, U256)>,
     /// The size ladder's results (`run_ordered_sizes`), in order.
     pub ladder: Vec<LadderRow>,
+    /// The calculated size (`Ladder.calc`), if asked.
+    pub calc: Option<CalcReport>,
 }
 
 /// TRIGGER-FIRST ENTRY POINT ("discover", server.rs trig_discover):
@@ -1277,7 +1299,7 @@ fn one_round(
         }
     }
     // The copy right after the replay (size ladder: put back before each size).
-    let after_replay = ladder.filter(|l| !l.amounts.is_empty() && calls.len() == 1).map(|_| evm.ctx.journaled_state.state.clone());
+    let after_replay = ladder.filter(|l| (!l.amounts.is_empty() || l.calc.is_some()) && calls.len() == 1).map(|_| evm.ctx.journaled_state.state.clone());
     // 3. Our calls, in the block of the last message replayed.
     evm.inspector.replaying = false;
     evm.inspector.cur_sender = None;
@@ -1316,28 +1338,95 @@ fn one_round(
     assumed.call_fill |= l.call_fill;
     let mut hashes: Vec<(U256, U256, U256)> = evm.inspector.hashes.take().map(|m| m.into_iter().map(|(h, (a, b))| (h, a, b)).collect()).unwrap_or_default();
     hashes.sort();
-    // 4. Size ladder: the copy as it was right after the replay, our trade
-    //    again at each size (the amount word + the trading-money slots,
-    //    served first by the database's patches). Nothing here changes the
-    //    main answer above.
+    // 4. Size ladder / calculated size: the copy as it was right after the
+    //    replay, our trade again at each size (the amount word + the
+    //    trading-money slots, served first by the database's patches).
+    //    Nothing here changes the main answer above.
     let mut rows = Vec::new();
+    let mut calc = None;
     if let (Some(l), Some(base_state)) = (ladder, after_replay) {
         let base_patches: Vec<(Address, U256, U256)> = patched.iter().map(|(a, s)| (*a, *s, assumed_funds())).collect();
-        for amount in l.amounts.iter().take(8) {
-            let Ok(data) = super::search::patch_amount(&calls[0].data, l.amount_offset, *amount) else { break };
-            evm.ctx.journaled_state.state = base_state.clone();
-            let mut p = base_patches.clone();
-            p.extend(l.slots.iter().map(|(a, s)| (*a, *s, *amount)));
-            evm.ctx.journaled_state.database.set_patches(p);
-            let miss_before = evm.ctx.journaled_state.database.missing.len();
-            let c = CallReq { data, ..calls[0].clone() };
-            let r = run_one(&mut evm, call_env_of(&c));
-            let clean = evm.ctx.journaled_state.database.missing.len() == miss_before && evm.precompiles.unsupported().is_none() && evm.inspector.unsure.take().is_none();
-            evm.ctx.journaled_state.database.missing.truncate(miss_before);
-            rows.push(LadderRow { amount: *amount, outcome: r.ok().filter(|_| clean) });
+        let call = &calls[0];
+        let ladder_rows = |evm: &mut WatchedEvm<'_>| -> Vec<LadderRow> {
+            l.amounts.iter().take(8).map(|a| LadderRow { amount: *a, outcome: run_size(evm, &base_state, &base_patches, l, call, *a) }).collect()
+        };
+        match &l.calc {
+            None => rows = ladder_rows(&mut evm),
+            Some(cp) => {
+                use super::sizing::{calc_size, Method, Probe};
+                let probe_of = |amount: U256, o: Option<&CallOutcome>| o.map_or(Probe::Unknown, |o| Probe::of(&super::search::classify(amount, o)));
+                // Shadow comparison: the old ladder first (its sizes are free
+                // starting points for the calculation, too).
+                if cp.compare {
+                    rows = ladder_rows(&mut evm);
+                }
+                // Sizes already measured on this replay: the main check (at
+                // the cap) and the ladder's.
+                let mut outs: HashMap<U256, Option<CallOutcome>> = HashMap::new();
+                if let (Some(main), Some(o)) = (amount_word(&call.data, l.amount_offset), results.first()) {
+                    outs.insert(main, Some(o.clone()));
+                }
+                for r in &rows {
+                    outs.entry(r.amount).or_insert_with(|| r.outcome.clone());
+                }
+                let seeds: Vec<(U256, Probe)> = outs.iter().map(|(a, o)| (*a, probe_of(*a, o.as_ref()))).collect();
+                let t = std::time::Instant::now();
+                let co = {
+                    let mut run = |x: U256| {
+                        let o = run_size(&mut evm, &base_state, &base_patches, l, call, x);
+                        let pr = probe_of(x, o.as_ref());
+                        outs.insert(x, o);
+                        pr
+                    };
+                    calc_size(cp, &seeds, &mut run)
+                };
+                let us = t.elapsed().as_micros() as u64;
+                let row = |a: Option<U256>| a.map(|a| LadderRow { amount: a, outcome: outs.get(&a).cloned().flatten() });
+                let (calc_row, backup_row) = (row(co.calc), row(co.backup));
+                // Fallback: the calculation couldn't measure; the old ladder decides.
+                let mut ladder_ran = cp.compare;
+                if co.method == Method::Failed && !ladder_ran {
+                    rows = ladder_rows(&mut evm);
+                    ladder_ran = true;
+                }
+                calc = Some(CalcReport { out: co, calc_row, backup_row, us, ladder_ran });
+            }
         }
     }
-    Ok(Next::Done(OrderedOut { replayed, results, assumed, changed, hashes, ladder: rows }))
+    Ok(Next::Done(OrderedOut { replayed, results, assumed, changed, hashes, ladder: rows, calc }))
+}
+
+/// The amountIn word of our call (after the 4-byte code), if it is there.
+fn amount_word(data: &[u8], amount_offset: usize) -> Option<U256> {
+    let start = 4usize.checked_add(amount_offset)?;
+    let end = start.checked_add(32)?;
+    (end <= data.len()).then(|| U256::from_be_slice(&data[start..end]))
+}
+
+/// Our trade at one more size, on the copy as it was right after the
+/// replay (size ladder / calculated size): the copy put back, the amount
+/// word changed, the trading-money slots set to the amount. None = not
+/// answerable at this size (a value we don't hold, an unsupported built-in,
+/// a watch problem); nothing it did is kept.
+fn run_size(
+    evm: &mut WatchedEvm<'_>,
+    base_state: &revm::state::EvmState,
+    base_patches: &[(Address, U256, U256)],
+    l: &Ladder,
+    call: &CallReq,
+    amount: U256,
+) -> Option<CallOutcome> {
+    let data = super::search::patch_amount(&call.data, l.amount_offset, amount).ok()?;
+    evm.ctx.journaled_state.state = base_state.clone();
+    let mut p = base_patches.to_vec();
+    p.extend(l.slots.iter().map(|(a, s)| (*a, *s, amount)));
+    evm.ctx.journaled_state.database.set_patches(p);
+    let miss_before = evm.ctx.journaled_state.database.missing.len();
+    let c = CallReq { data, ..call.clone() };
+    let r = run_one(evm, call_env_of(&c));
+    let clean = evm.ctx.journaled_state.database.missing.len() == miss_before && evm.precompiles.unsupported().is_none() && evm.inspector.unsure.take().is_none();
+    evm.ctx.journaled_state.database.missing.truncate(miss_before);
+    r.ok().filter(|_| clean)
 }
 
 /// A replayed transaction needed values we don't hold: assume its sender's,
