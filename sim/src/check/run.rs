@@ -271,7 +271,7 @@ impl<'a> Session<'a> {
 }
 
 // A database error -> "unknown" with the details.
-fn db_unknown(e: DbErr, missing: &[MissItem]) -> CheckUnknown {
+pub(crate) fn db_unknown(e: DbErr, missing: &[MissItem]) -> CheckUnknown {
     match e {
         DbErr::Miss(_) | DbErr::TooManyMisses => CheckUnknown {
             reason: UnknownReason::Miss,

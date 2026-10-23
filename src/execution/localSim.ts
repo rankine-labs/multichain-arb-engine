@@ -373,6 +373,11 @@ export type LocalRpcOptions = {
   // Told about EVERY reply to a question (sure, unknown, timeout), for
   // timing only. Never changes the answer.
   onReply?: (method: string, answer: SidecarAnswer, sent: Record<string, unknown>) => void;
+  // Extra fields added to every eth_call question (trigger-first: `feed`,
+  // the ordered feed transactions to replay first, execution/triggerFirst.ts).
+  // With it, eth_simulateV1 is not answered here (its block rules and the
+  // feed's would mix): "unknown".
+  extra?: Record<string, unknown>;
 };
 
 // Which state a block tag means, in sidecar terms. null = not supported here.
@@ -453,7 +458,7 @@ export function makeLocalRpc(client: LocalSimClient, fallback?: Rpc, opts: Local
         if (!at) return unknown(method, params, 'unsupported_block_tag');
         const call = p[0];
         if (!call || typeof call !== 'object') return unknown(method, params, 'bad_request');
-        const sent = { type: 'call', at, overrides: p[2] ?? {}, calls: [call] };
+        const sent = { type: 'call', at, overrides: p[2] ?? {}, calls: [call], ...(opts.extra ?? {}) };
         const a = await client.request(sent, opts.timeoutMs);
         noteReply(method, a, sent);
         if (a.ok !== true) return unknown(method, params, a.unknown);
@@ -465,6 +470,7 @@ export function makeLocalRpc(client: LocalSimClient, fallback?: Rpc, opts: Local
       if (method === 'eth_simulateV1') {
         // Exactly the shape replayRpc sends: one simulated block on top of the
         // given block, validation off. Anything else goes to the node.
+        if (opts.extra) return unknown(method, params, 'unsupported_simulate_shape');
         const req = p[0];
         const bscs = req?.blockStateCalls;
         if (!Array.isArray(bscs) || bscs.length !== 1 || req.validation === true || req.traceTransfers || req.returnFullTransactions) {

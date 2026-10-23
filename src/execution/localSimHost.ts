@@ -725,7 +725,7 @@ export class LocalSimHost {
   }
 
   // Live: a follow-a-trade send was signed. Proves "trigger seen -> signed".
-  noteSigned(triggerHash: string | undefined, seenMs: number, signedMs: number, decidedBy: 'local' | 'node'): void {
+  noteSigned(triggerHash: string | undefined, seenMs: number, signedMs: number, decidedBy: 'trig_first' | 'local' | 'node'): void {
     try {
       this.shadowLog.add({ t: this.now(), k: 'signed', tx: short(triggerHash), dec: decidedBy, seen: seenMs, signed: signedMs, seenToSignedMs: signedMs - seenMs });
     } catch { /* reporting only */ }

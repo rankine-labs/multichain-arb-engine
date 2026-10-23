@@ -2,7 +2,7 @@ import WebSocket from 'ws';
 import {
       ChainCapability, RawChainEvent, PreparedTransaction, FireResult,
 } from '../core/types';
-import { parseFeedFrame, maxSequenceNumber } from './nitroFeed';
+import { parseFeedFrame, parseFeedMessages, maxSequenceNumber, FeedMsg } from './nitroFeed';
 import { labelled } from '../core/stallFinder';
 
 // ============================================================================
@@ -53,6 +53,16 @@ export class RobinhoodChainAdapter implements ChainCapability {
   // Pass every raw feed message (text) to `fn`, before it is parsed.
   setRawFrameTap(fn: ((text: string) => void) | null): void {
         this.rawTap = fn;
+  }
+
+  // TRIGGER-FIRST (execution/triggerFirst.ts): every feed message, complete
+  // (all its signed transactions, block time, sequence number), handed on
+  // BEFORE the trades in it are decoded, so the order buffer always holds
+  // the trigger's message by the time the bot reacts to it. Set only when
+  // LOCAL_SIM_TRIGGER_FIRST is shadow / on; null = no extra work at all.
+  private msgTap: ((msgs: FeedMsg[], receivedAtMs: number) => void) | null = null;
+  setFeedMsgTap(fn: ((msgs: FeedMsg[], receivedAtMs: number) => void) | null): void {
+        this.msgTap = fn;
   }
 
   async connect(): Promise<void> {
@@ -113,6 +123,11 @@ export class RobinhoodChainAdapter implements ChainCapability {
                           return; // malformed frame, drop it
                     }
 
+                    // Trigger-first order buffer: every message, also backlog
+                    // repeats after a reconnect (the buffer keeps one copy per
+                    // sequence number), before the repeat check below.
+                    if (this.msgTap) { try { this.msgTap(parseFeedMessages(parsed), receivedAtMs); } catch { /* never breaks the feed */ } }
+
                     const seq = maxSequenceNumber(parsed);
                     // After a reconnect the broadcaster can replay its backlog.
                     // Frames we've already seen are dropped so the same swap is
@@ -131,7 +146,9 @@ export class RobinhoodChainAdapter implements ChainCapability {
                                 stateType: 'SEQUENCED',
                                 blockOrSeq: tx.sequenceNumber ?? seq ?? 'unknown',
                                 receivedAtMs,
-                                raw: withSender({ to: tx.to, data: tx.data, value: tx.value, hash: tx.hash }, tx),
+                                // rawTx / seq / txIndex: the signed bytes and their place in
+                                // the feed (trigger-first replays them in order).
+                                raw: withSender({ to: tx.to, data: tx.data, value: tx.value, hash: tx.hash, rawTx: tx.raw, seq: tx.sequenceNumber, txIndex: tx.txIndex }, tx),
                           };
                           for (const h of this.handlers) h(event);
                     }

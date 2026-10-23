@@ -745,6 +745,32 @@ pub struct Copy2Handle {
     pub c2: Arc<C2Shared>,
 }
 
+/// Which values copy 2 holds EXACTLY at one block (trigger-first,
+/// check/ordered.rs Provenance; built by Copy2Handle::provenance_at):
+///   - every held value of a pool contract (or its owned account, e.g. an
+///     Algebra plugin) whose pools have all been READY since that block:
+///     their reports keep them exact
+///   - the V4 PoolManager (only our V4 pools' data is ever held there; its
+///     coin / ETH balances are vouched for by the bound runs)
+///   - our pools' coin balances, and the PoolManager's and the test
+///     contract's
+/// Everything else held is a fill (re-read about once a minute): not exact.
+#[derive(Default, Debug)]
+pub struct Copy2Prov {
+    pub accts: HashSet<Address>,
+    pub pms: HashSet<Address>,
+    pub slots: HashSet<(Address, U256)>,
+}
+
+impl crate::check::ordered::Provenance for Copy2Prov {
+    fn slot_exact(&self, a: Address, slot: U256) -> bool {
+        self.accts.contains(&a) || self.pms.contains(&a) || self.slots.contains(&(a, slot))
+    }
+    fn balance_exact(&self, a: Address) -> bool {
+        self.pms.contains(&a)
+    }
+}
+
 /// Group reasons: addresses / numbers replaced so the same kind counts once.
 fn reason_key(r: &str) -> String {
     let mut out = String::new();
@@ -778,6 +804,50 @@ fn top_reasons<'a>(it: impl Iterator<Item = &'a str>) -> Vec<Value> {
     v.truncate(10);
     v.into_iter().map(|(k, n)| json!({ "why": k, "n": n })).collect()
 }
+
+impl Copy2Handle {
+    /// Trigger-first (check/ordered.rs): which values copy 2 holds EXACTLY
+    /// at block `n` (Copy2Prov). `extra_holders`: accounts a check gives
+    /// contract code by override (the bot's made-up test contract address,
+    /// which never exists on the chain, so its coin balances are always
+    /// exactly what the copy holds: zero, fetched once).
+    pub fn provenance_at(&self, n: u64, extra_holders: &[Address]) -> Copy2Prov {
+        let reg = self.c2.reg.read().unwrap();
+        let ready_at = |pk: &PoolKey| reg.pools.get(pk).is_some_and(|e| e.state == PoolState::Ready && e.ready_since <= n);
+        let mut p = Copy2Prov::default();
+        for (a, pks) in &reg.by_addr {
+            if reg.is_pm(a) {
+                p.pms.insert(*a);
+            } else if !pks.is_empty() && pks.iter().all(&ready_at) {
+                p.accts.insert(*a);
+            }
+        }
+        for (a, pk) in &reg.owner_of {
+            if ready_at(pk) {
+                p.accts.insert(*a);
+            }
+        }
+        for (coin, hs) in &reg.holders {
+            for h in hs {
+                if p.accts.contains(h) || p.pms.contains(h) {
+                    if let Some(sl) = reg.bal_slot(*coin, *h) {
+                        p.slots.insert((*coin, sl));
+                    }
+                }
+            }
+        }
+        // The PoolManager's own coin balances (vouched for by the lower
+        // bound + far-above runs, checkview.rs) and the test contract's.
+        for (coin, l) in &reg.layouts {
+            let Some(l) = l else { continue };
+            for h in p.pms.iter().chain(extra_holders.iter()) {
+                p.slots.insert((*coin, l.key(*h)));
+            }
+        }
+        p
+    }
+}
+
 
 impl C2Shared {
     /// What checks need from the registry (checkcore.rs), current: the
