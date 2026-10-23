@@ -38,6 +38,14 @@ pub struct Tm {
     pub resolve_us: u64,
     pub facts_us: u64,
     pub runs_us: Vec<u64>,
+    /// What each EVM run was (copy 2, copy2-r): "b" at the PoolManager
+    /// balance's proven lower bound / "h" far above it, "0" / "1" the
+    /// protocol fee counter's value, "f" = the full bound (every ready V4
+    /// pool, else only the route's pools), "p" = a plain run (nothing
+    /// assumed). E.g. ["b0","h0","b1","h1"].
+    pub runs_what: Vec<String>,
+    /// Far zero tick-map words (copy2/checkview.rs) the answer's runs read.
+    pub far_used: u64,
     pub post_us: u64,
 }
 
@@ -46,6 +54,7 @@ impl Tm {
         json!({
             "queue": self.queue_us, "prep": self.prep_us, "resolve": self.resolve_us,
             "facts": self.facts_us, "runs": self.runs_us, "post": self.post_us,
+            "what": self.runs_what, "far": self.far_used,
         })
     }
 }

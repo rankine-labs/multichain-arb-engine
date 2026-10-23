@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       only:
-        description: 'Run one step only: feeds, sim, pairs, watch, universe, backtest, latency, lenders, smoke, seed, routers, v4, arbsys, nodes, multicall, simv1, ramsessim, routes, venues, fablesfee, blockreader, urv4, nvda (blank = all except backtest)'
+        description: 'Run one step only: feeds, sim, pairs, watch, universe, backtest, latency, lenders, smoke, seed, routers, v4, arbsys, nodes, multicall, simv1, ramsessim, routes, venues, fablesfee, blockreader, urv4, nvda, rivn (blank = all except backtest)'
         required: false
         default: ''
 
@@ -102,6 +102,36 @@ jobs:
             out="${out//'%'/'%25'}"; out="${out//$'\n'/'%0A'}"
             echo "::notice title=NVDA probe part ${n}::${out}"
           done
+      # RIVN (Oct 22, copy2-r): the copy-2 "reverts" vs node "loss" checks on
+      # RIVN/USDG: the bot's own check at those blocks, call trees and every
+      # value read. Read-only.
+      - name: RIVN/USDG check probe (read-only)
+        if: inputs.only == 'rivn'
+        shell: bash
+        env:
+          PROBE_BLOCKS: latest
+          PROBE_TRACES: '3'
+          PROBE_OVR: '1'
+        run: |
+          timeout 2400 node .scripts-build/scripts/probe-rivn.js > rivn.txt 2>&1 || true
+          cat rivn.txt
+          # Logs may not be downloadable: the output also goes out as up to
+          # 30 annotations of ~3.8 KB (10 notices, 10 warnings, 10 errors).
+          python3 - <<'PY'
+          import re
+          text = open('rivn.txt', encoding='utf-8', errors='replace').read()
+          chunks, cur = [], ''
+          for line in text.splitlines():
+              line = line[:600]
+              if len(cur) + len(line) + 1 > 3800:
+                  chunks.append(cur); cur = ''
+              cur += line + '\n'
+          if cur: chunks.append(cur)
+          kinds = ['notice'] * 10 + ['warning'] * 10 + ['error'] * 10
+          for i, c in enumerate(chunks[:30]):
+              c = c.replace('%', '%25').replace('\r', '').replace('\n', '%0A')
+              print(f"::{kinds[i]} title=RIVN probe part {i + 1} of {len(chunks)}::{c}")
+          PY
       - name: Probe free simulation on real chains
         if: inputs.only == '' || inputs.only == 'sim'
         shell: bash

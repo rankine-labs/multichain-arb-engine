@@ -144,11 +144,14 @@ struct Opts {
     second_v4: bool,
     /// Test pool positions 100x thinner (a check can drain it).
     thin: bool,
+    /// Both coins count only the low 128 bits of their balance word (like
+    /// live USDG, copy2-r), with a smaller supply (1e30 base units each).
+    coin128: bool,
 }
 
 impl Default for Opts {
     fn default() -> Self {
-        Opts { walks: true, lm_credit: None, bot_shape: false, pm_bound: true, full_words: arbsim::copy2::walk::WalkCfg::default().full_words, one_sided: false, second_v4: false, thin: false }
+        Opts { walks: true, lm_credit: None, bot_shape: false, pm_bound: true, full_words: arbsim::copy2::walk::WalkCfg::default().full_words, one_sided: false, second_v4: false, thin: false, coin128: false }
     }
 }
 
@@ -177,14 +180,15 @@ impl World {
         let (walks, lm_credit) = (o.walks, o.lm_credit);
         let a = Arc::new(Anvil::start()?);
         let arts = artifacts();
-        let tok = art(&arts, "Token");
+        let tok = art(&arts, if o.coin128 { "Token128" } else { "Token" });
+        let big = q(if o.coin128 { 30 } else { 36 });
         let uu = a.deploy(&tok, &encode(&[Arg::D(b"USD".to_vec()), Arg::W(U256::from(6))]));
         let ww = a.deploy(&tok, &encode(&[Arg::D(b"WETH".to_vec()), Arg::W(U256::from(18))]));
         let (t0, t1) = if uu < ww { (uu, ww) } else { (ww, uu) };
         let plain = a.deploy(&art(&arts, "Trader"), &[]);
         let mut trader = plain;
         for t in [uu, ww] {
-            a.send_ok(t, &calldata("mint(address,uint256)", &[Arg::A(plain), Arg::W(q(36))]));
+            a.send_ok(t, &calldata("mint(address,uint256)", &[Arg::A(plain), Arg::W(big)]));
         }
         // Reference pool: Uniswap V3, 0.05 %, spacing 10, priced 2 % off.
         let f = a.deploy(&art(&arts, "UniswapV3Factory"), &[]);
@@ -239,7 +243,7 @@ impl World {
                 let pm = a.deploy(&art(&arts, "PoolManager"), &encode(&[Arg::A(a.me)]));
                 let vt = a.deploy(&art(&arts, "V4Trader"), &encode(&[Arg::A(pm)]));
                 for t in [uu, ww] {
-                    a.send_ok(t, &calldata("mint(address,uint256)", &[Arg::A(vt), Arg::W(q(36))]));
+                    a.send_ok(t, &calldata("mint(address,uint256)", &[Arg::A(vt), Arg::W(big)]));
                 }
                 trader = vt;
                 let mut p = TrackedPool { address: pm, v4_id: None, kind: PoolKind::V4, token0: t0, token1: t1, fee: 500, tick_spacing: 10 };
@@ -1185,4 +1189,80 @@ fn bot_v4_route_bound_falls_back_to_the_full_bound() {
     );
     assert!(retried_and_answered >= 1, "a drain of the test pool is answered with the full bound: {st}");
     w.h.stop();
+}
+
+/// copy2-r (live Oct 22 21:22-22:25, RIVN/USDG: copy 2 said "the trade
+/// reverts" 4 times, the node AT THE SAME BLOCK "completes at a loss").
+/// Proved on the live chain (scripts/probe-rivn.ts, state overrides on the
+/// real state): USDG counts only the LOW 128 bits of its balance word (raw
+/// 2^128 + 5 reads 5; raw 2^200 + 999 can't pay 1000, raw 2^200 + 1000 can).
+/// So the high run "bound + 2^200" was the bound run again. A check that
+/// drains a V4 pool's USDG side (the RIVN/USDG V4 pool pays < $1 that way:
+/// a fake gap) takes slightly MORE than that pool's own bound (rounding
+/// margin), so take() reverted in BOTH runs, identically: reported as a
+/// proven revert while the real PoolManager holds ~$37M USDG.
+/// Here: both coins are such 128-bit coins; a drain of the test pool's
+/// token0 side. The chain: InsufficientProfit (the route completes). The
+/// copy must never say "reverts": with a second V4 pool it answers exactly
+/// (full bound, high value 2^126 read back by the coin, above its supply);
+/// without, "unknown".
+fn coin128_case(second_v4: bool) -> Option<(usize, usize, Vec<String>, Value)> {
+    let o = Opts { bot_shape: true, pm_bound: true, full_words: 8000, second_v4, one_sided: true, thin: true, coin128: true, ..Opts::default() };
+    let mut w = World::start_with(K::V4, o)?;
+    w.go_live();
+    w.wait("tick walks", |w| w.walked());
+    w.settle();
+    let n = w.block(&[]);
+    w.settle();
+    let dir = w.ww < w.uu; // the V4 hop pays token0 (the pool's only coin)
+    for _ in 0..3 {
+        let _ = w.compare(n, 100, dir);
+        w.settle();
+    }
+    // The live mechanism on the chain itself: the coin reads "x + 2^200" as x.
+    let pm = w.pools[0].address;
+    let t0 = w.pools[0].token0;
+    let slot = map_slot(U256::from_be_slice(pm.as_slice()), U256::ZERO);
+    let real = u(&w.a.ok("eth_getStorageAt", json!([ha(t0), hx64(slot), format!("{n:#x}")])));
+    let ov = json!({ ha(t0): { "stateDiff": { hx64(slot): hx64((U256::from(1u8) << 200usize) + U256::from(5u8)) } } });
+    let seen = w.a.ok("eth_call", json!([{ "to": ha(t0), "data": hb(&[sel("balanceOf(address)").to_vec(), vec![0u8; 12], pm.as_slice().to_vec()].concat()) }, format!("{n:#x}"), ov]));
+    assert_eq!(u(&seen), U256::from(5u8), "test setup: the coin counts only the low 128 bits (real PoolManager balance {real})");
+    let (mut answered, mut unknown, mut whats) = (0, 0, Vec::new());
+    for usd in [10_000u64, 30_000, 100_000, 300_000, 1_000_000] {
+        let (call, ov) = w.round_trip(usd, dir);
+        let (ts, to, tg) = w.truth(n, &call, &ov);
+        let mut ans = w.ask(n, &call, &ov);
+        if ans["unknown"] == json!("miss") {
+            w.settle();
+            ans = w.ask(n, &call, &ov);
+        }
+        whats.push(format!("{usd}: {}", ans["t"]["what"]));
+        if ans["ok"] == json!(true) {
+            let r = &ans["results"][0];
+            assert_eq!((r["success"].clone(), r["output"].clone(), r["gasUsed"].clone()), (json!(ts), json!(to), json!(format!("{tg:#x}"))), "copy answer DIFFERS from the chain ({usd} USD, chain {}): {ans}", &to[..10.min(to.len())]);
+            answered += 1;
+        } else {
+            assert_eq!(ans["unknown"], json!("pool_manager_balance"), "{ans}");
+            unknown += 1;
+        }
+        w.settle();
+    }
+    let st = w.h.status_json(false);
+    w.h.stop();
+    Some((answered, unknown, whats, st))
+}
+
+#[test]
+fn bot_v4_coin_counting_part_of_its_balance_word_never_gives_a_false_revert() {
+    let Some((a, u, whats, st)) = coin128_case(true) else {
+        eprintln!("copy2 coverage anvil test SKIPPED: no ~/.foundry/bin/anvil");
+        return;
+    };
+    eprintln!("128-bit coins, second V4 pool: {a} answered exactly, {u} unknown; runs {whats:?}; counters narrow {} refused {} full retry {}", st["counters"]["pm_high_narrow"], st["counters"]["pm_high_refused"], st["counters"]["pm_bound_full_retry"]);
+    assert!(a >= 3, "most answered: {a} / {u}");
+    assert!(st["counters"]["pm_high_narrow"].as_u64().unwrap() > 0, "the high run used the coin's own range: {st}");
+    assert!(st["counters"]["pm_bound_full_retry"].as_u64().unwrap() > 0, "a drain needed the full bound: {st}");
+    let (a, u, whats, st) = coin128_case(false).unwrap();
+    eprintln!("128-bit coins, one V4 pool: {a} answered exactly, {u} unknown; runs {whats:?}; counters narrow {}", st["counters"]["pm_high_narrow"]);
+    assert!(u >= 1, "a drain the copy can't bound is unknown, never a revert");
 }

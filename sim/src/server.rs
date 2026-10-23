@@ -401,38 +401,165 @@ fn check_inner(ctx: &Ctx, id: &Value, at: &Value, t0: Instant, tm: &mut Tm, run:
 /// without holding it (copy2/checkview.rs: far zero tick-map words, the V4
 /// PoolManager's balances at a proven lower bound, the V4 protocol fee
 /// counters). A run that read a PoolManager balance is repeated with that
-/// balance 2^200 higher; the answer stands only if both runs agree exactly,
+/// balance far higher; the answer stands only if both runs agree exactly,
 /// else "unknown". A run that read a protocolFeesAccrued counter (never
 /// held) is repeated with the counter not zero (and that run's balance pair
 /// too, if it read a balance): the answer stands only if the two differ in
 /// gas alone; it then reports the HIGHER gas of each gas field (counter 0 =
 /// the costlier 0 -> non-zero store), so the bot never overestimates profit.
+///
+/// copy2-r (live Oct 22, RIVN/USDG: copy "the trade reverts", the node at
+/// the same block "completes at a loss"): the "far higher" run must make the
+/// COIN see a balance above any real one. Live USDG counts only the low 128
+/// bits of its balance word, so "bound + 2^200" read as "bound": both runs
+/// ran at the (too small) lower bound, both reverted the same way in the
+/// PoolManager's take, and that agreement was reported as a proven revert.
+/// Now each coin's high value is checked first (coin_highs): the coin must
+/// read back the bound exactly and the high value exactly, and the high
+/// value must be above the coin's whole supply; else "unknown".
 fn copy2_run(c: &Copy2Handle, core: &crate::copy2::checkcore::CheckCore, view: &View, block: u64, bctx: &BlockCtx, tm: &mut Tm, run: &impl Fn(&dyn StateRead, &BlockCtx) -> Value) -> Value {
     let t_facts = Instant::now();
     let facts = c.check_facts_with(core, block);
     tm.facts_us += t_facts.elapsed().as_micros() as u64;
-    let runs = std::cell::RefCell::new(Vec::<u64>::new());
+    let runs = std::cell::RefCell::new(RunLog::default());
     let a = copy2_runs(c, view, &facts, bctx, &runs, run);
-    tm.runs_us = runs.into_inner();
+    let r = runs.into_inner();
+    tm.runs_us = r.us;
+    tm.runs_what = r.what;
+    tm.far_used = r.far;
     a
 }
 
-fn copy2_runs(c: &Copy2Handle, view: &View, facts: &crate::copy2::checkview::C2Facts, bctx: &BlockCtx, runs: &std::cell::RefCell<Vec<u64>>, run: &impl Fn(&dyn StateRead, &BlockCtx) -> Value) -> Value {
-    let timed = |v: &dyn StateRead| {
+/// The EVM runs of one copy-2 check: time, what each was, far words read.
+#[derive(Default)]
+pub struct RunLog {
+    pub us: Vec<u64>,
+    /// "b" bound run / "h" high run, then the protocol fee counter value
+    /// ("0" / "1"), then "f" when the bound was the full one; "p" = a plain
+    /// run (nothing assumed); "c" = a coin's balanceOf / totalSupply read
+    /// to pick its high value.
+    pub what: Vec<String>,
+    pub far: u64,
+}
+
+/// One word returned by a view call on `v` (None: reverted / short output).
+fn view_word(v: &dyn StateRead, bctx: &BlockCtx, to: revm::primitives::Address, data: Vec<u8>) -> Result<Option<revm::primitives::U256>, crate::check::CheckUnknown> {
+    let call = crate::check::CallReq { from: revm::primitives::Address::ZERO, to: Some(to), data: data.into(), gas: Some(1_000_000), value: revm::primitives::U256::ZERO };
+    let out = crate::check::run_calls(v, bctx, &crate::check::Overrides::default(), &[], std::slice::from_ref(&call))?;
+    Ok(out.first().filter(|o| o.success && o.output.len() >= 32).map(|o| revm::primitives::U256::from_be_slice(&o.output[..32])))
+}
+
+fn abi_addr(sel: &str, a: revm::primitives::Address) -> Vec<u8> {
+    let mut d = revm::primitives::keccak256(sel.as_bytes())[..4].to_vec();
+    d.extend_from_slice(&[0u8; 12]);
+    d.extend_from_slice(a.as_slice());
+    d
+}
+
+/// Remembered per coin: which high candidate worked last time (only a
+/// starting point: it is checked again every time).
+fn high_hint() -> &'static Mutex<std::collections::HashMap<revm::primitives::Address, usize>> {
+    static H: std::sync::OnceLock<Mutex<std::collections::HashMap<revm::primitives::Address, usize>>> = std::sync::OnceLock::new();
+    H.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+/// copy2-r: for each PoolManager coin balance the bound run read, the value
+/// the high run adds, such that the coin itself reads back the bound P and
+/// P + H exactly (balanceOf(PoolManager)) and P + H is above everything the
+/// coin can owe anyone (H = 2^200 as before; a smaller H only if the coin's
+/// totalSupply, times 2^16 for headroom, is below P + H). Err = the answer
+/// to give (unknown "pool_manager_balance", or a "miss" for the coin values
+/// the reads needed, which then get filled).
+pub fn coin_highs(
+    view: &dyn StateRead,
+    facts: &crate::copy2::checkview::C2Facts,
+    bctx: &BlockCtx,
+    coins: &[(revm::primitives::Address, revm::primitives::Address)],
+    runs: &std::cell::RefCell<RunLog>,
+) -> Result<(std::collections::HashMap<revm::primitives::Address, revm::primitives::U256>, bool), (String, Option<crate::check::CheckUnknown>)> {
+    use revm::primitives::{Address, U256};
+    let mut out = std::collections::HashMap::new();
+    let mut narrow = false;
+    let timed = |f: &mut dyn FnMut() -> Result<Option<U256>, crate::check::CheckUnknown>| {
         let t = Instant::now();
-        let a = run(v, bctx);
-        runs.borrow_mut().push(t.elapsed().as_micros() as u64);
-        a
+        let r = f();
+        let mut l = runs.borrow_mut();
+        l.us.push(t.elapsed().as_micros() as u64);
+        l.what.push("c".into());
+        r
     };
+    for (pm, coin) in coins {
+        if *coin == Address::ZERO {
+            continue; // ETH: a plain account balance, every bit counts
+        }
+        let low = C2View::new(view, facts, U256::ZERO);
+        let p = low.lower_bound(*pm, *coin);
+        let bal = abi_addr("balanceOf(address)", *pm);
+        let seen = timed(&mut || view_word(&low, bctx, *coin, bal.clone())).map_err(|u| (String::new(), Some(u)))?;
+        if seen != Some(p) {
+            return Err((format!("coin {coin}: balanceOf(PoolManager) does not read the stored balance word (stored {p:#x}, reads {seen:?}): its bound can't be put in"), None));
+        }
+        let mut supply_read = false;
+        let mut supply: Option<U256> = None;
+        let cands = crate::copy2::checkview::high_candidates();
+        let start = high_hint().lock().unwrap().get(coin).copied().unwrap_or(0).min(cands.len() - 1);
+        let mut found = None;
+        for (i, h) in cands.iter().enumerate().skip(start).chain(cands.iter().enumerate().take(start)) {
+            let want = p.saturating_add(*h);
+            let hv = C2View::with_offsets(view, facts, crate::copy2::checkview::high_offset(), U256::ZERO, std::collections::HashMap::from([(*coin, *h)]));
+            let got = timed(&mut || view_word(&hv, bctx, *coin, bal.clone())).map_err(|u| (String::new(), Some(u)))?;
+            if got != Some(want) {
+                continue;
+            }
+            if i > 0 {
+                if !supply_read {
+                    supply_read = true;
+                    supply = timed(&mut || view_word(&low, bctx, *coin, revm::primitives::keccak256(b"totalSupply()")[..4].to_vec())).map_err(|u| (String::new(), Some(u)))?;
+                }
+                // Above the whole supply with room to spare (a held supply
+                // may be up to one verify round old).
+                if !supply.is_some_and(|s| s.checked_shl(16).is_some_and(|s16| s16 < want)) {
+                    continue;
+                }
+                narrow = true;
+            }
+            found = Some((i, *h));
+            break;
+        }
+        let Some((i, h)) = found else {
+            return Err((format!("coin {coin}: no high balance value the coin reads back above its whole supply (it counts only part of its balance word?)"), None));
+        };
+        high_hint().lock().unwrap().insert(*coin, i);
+        out.insert(*coin, h);
+    }
+    Ok((out, narrow))
+}
+
+pub fn copy2_runs(c: &Copy2Handle, view: &View, facts: &crate::copy2::checkview::C2Facts, bctx: &BlockCtx, runs: &std::cell::RefCell<RunLog>, run: &impl Fn(&dyn StateRead, &BlockCtx) -> Value) -> Value {
+    use std::sync::atomic::Ordering::Relaxed;
     if facts.is_empty() {
-        return timed(view);
+        let t = Instant::now();
+        let a = run(view, bctx);
+        let mut r = runs.borrow_mut();
+        r.us.push(t.elapsed().as_micros() as u64);
+        r.what.push("p".into());
+        return a;
     }
     let zero = revm::primitives::U256::ZERO;
-    let run_at = |offset, fee| {
-        let v = C2View::with_fee(view, facts, offset, fee);
-        let a = timed(&v);
+    type Highs = std::collections::HashMap<revm::primitives::Address, revm::primitives::U256>;
+    let run_at = |high: Option<&Highs>, fee: revm::primitives::U256| {
+        let v = match high {
+            None => C2View::with_fee(view, facts, zero, fee),
+            Some(m) => C2View::with_offsets(view, facts, high_offset(), fee, m.clone()),
+        };
+        let t = Instant::now();
+        let a = run(&v, bctx);
         let (b, f) = (v.used_bound(), v.used_fee());
-        (a, b, f)
+        let mut r = runs.borrow_mut();
+        r.us.push(t.elapsed().as_micros() as u64);
+        r.what.push(format!("{}{}{}", if high.is_some() { "h" } else { "b" }, if fee.is_zero() { "0" } else { "1" }, if facts.full.load(Relaxed) { "f" } else { "" }));
+        r.far = r.far.max(v.far_hits());
+        (a, b, f, v.read_coins())
     };
     let ok = |v: &Value| v.get("ok") == Some(&Value::Bool(true));
     let unknown = |a: &Value, why: &str, detail: &str| {
@@ -448,13 +575,31 @@ fn copy2_runs(c: &Copy2Handle, view: &View, facts: &crate::copy2::checkview::C2F
     // both runs again with the full bound (every ready V4 pool), as before.
     let confirmed = |fee| -> Result<(Value, bool), Value> {
         loop {
-            let (a, used_bound, used_fee) = run_at(zero, fee);
+            let (a, used_bound, used_fee, coins) = run_at(None, fee);
             if !used_bound || !ok(&a) {
                 return Ok((a, used_fee));
             }
-            let (again, _, _) = run_at(high_offset(), fee);
+            let highs = match coin_highs(view, facts, bctx, &coins, runs) {
+                Ok((m, narrow)) => {
+                    if narrow {
+                        c.note_pm_high(true);
+                    }
+                    m
+                }
+                Err((why, miss)) => {
+                    let id = a.get("id").cloned().unwrap_or(Value::Null);
+                    return Err(match miss {
+                        Some(u) => crate::check::proto_types::unknown_json(&id, &u, 0),
+                        None => {
+                            c.note_pm_high(false);
+                            unknown(&a, "pool_manager_balance", &why)
+                        }
+                    });
+                }
+            };
+            let (again, _, _, _) = run_at(Some(&highs), fee);
             let same = strip_us(&a) == strip_us(&again);
-            let partial = facts.partial_used.load(std::sync::atomic::Ordering::Relaxed) && !facts.full.load(std::sync::atomic::Ordering::Relaxed);
+            let partial = facts.partial_used.load(Relaxed) && !facts.full.load(Relaxed);
             if !same && partial {
                 c.note_pm_bound_kind(true);
                 facts.go_full();

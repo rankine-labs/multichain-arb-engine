@@ -47,7 +47,13 @@ pools and their coins, the V4 PoolManager, approved loan pools, routers).
   timestamps, and (since copy2-p) `lus` = the fast check's OWN time for our
   contract call (ms, its queue included), `lrt` = the socket round trip the
   bot measured (ms), `lt` = the fast check's split in microseconds (queue /
-  prep / resolve / facts / runs / post). `lms` far above `lrt` = the bot
+  prep / resolve / facts / runs / post; since copy2-r also `what` = what
+  each EVM run was: `b`/`h` PoolManager balance at the bound / far above it,
+  `0`/`1` protocol fee counter, `f` full bound, `c` a coin read to pick the
+  high value, `p` plain; `far` = far zero tick words read). Since copy2-r
+  `lr` / `nr` = the fast check's / node's reason when it is not profit or
+  loss (decoded revert, e.g. "ZeroAmount(): pool gave back nothing").
+  `lms` far above `lrt` = the bot
   itself was busy; `lrt` far above `lus` = the answer was read late. Lines with `"k":"signed"` give "trade seen -> trade signed" for
   live sends (`seenToSignedMs`), the number behind the 10-20 ms target.
 
@@ -217,7 +223,9 @@ block (a few an hour at most) and logs `"k":"recheck"` lines with
   (Telegram alert: tell Claude). Cause can be stale/missing data, a maths
   issue, or the re-check asking slightly differently.
 - "COULDN'T CHECK": no usable node answer (or the hourly re-check budget).
-The hourly line counts them.
+The hourly line counts them. Re-check lines carry `lr` / `lg` (the copy's
+reason / gas) and `nr` / `nrAt` / `ngAt` (the node's, later and at the
+copy's block), so a MISMATCH can be traced from the line alone.
 
 `LOCAL_SIM_TIMEOUT_MS` stays 60: about 10x the expected time. Raising it
 would only hide a slow fast check and start the node later.

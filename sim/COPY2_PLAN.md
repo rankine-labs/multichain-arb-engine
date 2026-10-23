@@ -1035,3 +1035,55 @@ trade ~20 ms.
   block 0x5af41a4, node loss at "latest" 125 ms later = ~1 block later)
   can't be decided offline (no node here); see the report. The re-check
   decides the next one automatically.
+
+- Live shadow Oct 22 21:22-22:25 UTC (inbot-sim/copy2-r): healthy, 10 of
+  24 bot checks answered; 4 "MISMATCH at same moment", all RIVN/USDG gap:
+  copy "fail" (gas 841,669, 4 EVM runs), node "loss", and the node pinned
+  at the copy's block "loss" again. The shadow line had no copy reason.
+  1. Logging (bot): shadow lines carry `lr` (the copy's reason for anything
+     but profit / loss), `nr` (node's, 120 chars); re-check lines `lr`,
+     `lg`, `nr`, `nrAt`, `ngAt`. arbsim's `t` adds `what` (each EVM run:
+     b/h bound / high, 0/1 fee counter, f full bound, c coin read, p plain)
+     and `far` (far zero words read).
+  2. Cause, proved on the live chain (scripts/probe-rivn.ts via the "Live
+     probe" workflow, only=rivn; the public node keeps ~4000+ blocks of
+     state, not the mismatch blocks, but the gap is standing: every RIVN
+     route is a loss at every size): eth_call with state overrides on the
+     real state. USDG counts only the LOW 128 bits of its balance word:
+     balanceOf(PoolManager) with raw 2^128 + 5 = 5, raw 2^255 + 5 = 5;
+     USDG.transfer(1000) from the PoolManager reverts (0x356680b7) with raw
+     999 AND with raw 2^200 + 999, works with 1000 and 2^200 + 1000. The
+     bot's route V3 -> V4 (RIVN in, USDG out) with the PoolManager's USDG
+     set to 2^200 reverts WrappedError(USDG, transfer, 0x356680b7); set to
+     $1 it completes (IP 0): the V4 RIVN/USDG pool pays < $1 of USDG that
+     way (a fake gap; the swap runs the price to its limit: the 841k gas).
+     So the copy's two runs were "bound P" and "P + 2^200" = P again for
+     USDG; the check takes all the USDG the pool can pay, slightly more
+     than the pool's own bound (rounding margin, 1 per price step), so
+     take() reverted in both runs identically -> "proven" revert, while the
+     real PoolManager holds ~$37M USDG. (RIVN reads the whole word:
+     2^200 reads back 2^200.) Not the protocol fee (all 4 fee / balance
+     variants on the real state give the same loss), not stale RIVN
+     settings (no RIVN events / pool events near the blocks), not tick data.
+     Anvil reproduction (tests/copy2_coverage_anvil.rs bot_v4_coin_counting_
+     part_of_its_balance_word_never_gives_a_false_revert; TestHelpers.sol
+     Token128 = balance in the low 128 bits of the word): one-sided thin V4
+     pool, a check draining its token0 side; old code: copy "WrappedError
+     (coin, transfer, insufficient balance)", chain InsufficientProfit.
+  3. Fix (server.rs coin_highs, checkview.rs): before the high run, per
+     coin whose PoolManager balance the bound run read: the coin's
+     balanceOf(PoolManager) must read back the bound P exactly (else the
+     bound can't be put in: unknown), and the high value H is the largest
+     of 2^200 / 2^160 / 2^126 / 2^112 / 2^96 that the coin reads back as P +
+     H exactly; below 2^200 only if P + H > totalSupply x 2^16 (a held
+     value, re-read every ARBSIM_COPY2_VERIFY_S; first time: "miss", filled).
+     None: unknown "pool_manager_balance" (counter pm_high_refused; narrow
+     values used: pm_high_narrow). The candidate that worked is remembered
+     per coin (checked again every time). A revert / loss / profit is now
+     reported only when it is the same with the coin really seeing a balance
+     above any real one. Cost: 2-3 small balanceOf / totalSupply EVM runs
+     per coin per check (latency bench unchanged within its limits).
+     No change to what copy 2 holds / follows: no state FORMAT bump.
+  Expected live: RIVN/USDG (and every stock/USDG V4 check paying USDG out
+  of the PoolManager) answered "loss" exactly when the full bound covers
+  the take, else unknown; no more fail-vs-loss mismatches of this shape.
