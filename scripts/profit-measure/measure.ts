@@ -28,13 +28,15 @@
 //   PM_RECEIPT_MIN=150  minutes allowed for the receipts phase
 //   PM_CENSUS_MIN=60    minutes allowed for the census phase
 // ============================================================================
-import { writeFileSync, mkdirSync, appendFileSync } from 'fs';
+import { writeFileSync, mkdirSync } from 'fs';
 import {
   ALL_SWAP_TOPICS, V4_INITIALIZE, ZERO_ADDR, ArbRecord, RawLog, PriceObs,
   buildPriceBook, classifyTx, decodeSwapLog, obsFromSwap, receiptGasWei,
 } from '../../src/core/followMoney';
 import { ROBINHOOD_V4, ROBINHOOD_TOKENS, ROBINHOOD_SCAN_FACTORIES } from '../../src/config/knownAddresses';
 import { venueByFactory } from '../../src/config/robinhoodVenues';
+import { ethers } from 'ethers';
+import { V4_LOOKUP_TIERS } from '../../src/config/v4Tiers';
 import { encodeAggregate3, decodeAggregate3, fastDecodeString } from '../../src/core/universeScan';
 
 // ---------------------------------------------------------------------------
@@ -230,27 +232,6 @@ async function main() {
   // V4 pool ids: their creation event (whole history, a few ids at a time).
   const v4ids = pools.filter((p) => p.length === 66);
   const balancerLike = new Set<number>();
-  for (let i = 0; i < v4ids.length; i += 40) {
-    const ids = v4ids.slice(i, i + 40);
-    const stack: [number, number][] = [[0, toBlock]];
-    let guard = 0;
-    while (stack.length && guard++ < 64) {
-      const [f, t] = stack.pop()!;
-      try {
-        const ls: RawLog[] = (await rpc.call('eth_getLogs', [{ address: ROBINHOOD_V4.POOL_MANAGER, fromBlock: hex(f), toBlock: hex(t), topics: [V4_INITIALIZE, ids] }], 90_000)) ?? [];
-        for (const l of ls) {
-          const id = lc(l.topics[1]);
-          const c0 = '0x' + l.topics[2].slice(26).toLowerCase(), c1 = '0x' + l.topics[3].slice(26).toLowerCase();
-          const hooks = lc('0x' + (l.data ?? '').slice(2 + 64 * 2 + 24, 2 + 64 * 3));
-          info.set(id, { t0: c0, t1: c1, dex: hooks === ZERO_ADDR ? 'uniswap-v4' : 'uniswap-v4-hooked', hooks });
-        }
-      } catch (e: any) {
-        if (t - f < 50_000) continue;
-        const mid = Math.floor((f + t) / 2); stack.push([mid + 1, t], [f, mid]);
-      }
-    }
-  }
-  log(`V4 pools identified: ${v4ids.filter((x) => info.has(x)).length}/${v4ids.length}`);
   // Address pools: token0 / token1 / factory through Multicall3.
   const SEL = { token0: '0x0dfe1681', token1: '0xd21220a7', factory: '0xc45a0155', decimals: '0x313ce567', symbol: '0x95d89b41' };
   const asAddr = (r: string | null | undefined) => (r && r.length >= 66 ? '0x' + r.slice(26, 66).toLowerCase() : undefined);
@@ -296,6 +277,38 @@ async function main() {
   });
   tokens[ZERO_ADDR] = { d: 18, s: 'ETH' };
   tokens[WETH] = { d: 18, s: 'WETH' }; tokens[USDG] = { d: tokens[USDG]?.d ?? 6, s: 'USDG' };
+  // V4 pool ids are keccak(coin0, coin1, fee, tickSpacing, hooks). Compute
+  // the ids of every (coin, USDG/WETH/ETH) pair for many fee settings and
+  // match them against the ids seen (no history needed). Hooked pools stay
+  // unknown (their hooks address is not guessable); arbitrage through an
+  // unknown V4 pool is marked doubtful in the report.
+  const matchV4 = (extra: string[]) => {
+    const want = new Set(v4ids.filter((x) => !info.has(x)));
+    if (!want.size) return 0;
+    const bases = [ZERO_ADDR, WETH, USDG];
+    const coins = [...new Set([...tl, ...extra, ZERO_ADDR])];
+    const tiers = new Map<string, [number, number]>();
+    for (const [f, t] of V4_LOOKUP_TIERS) tiers.set(`${f}/${t}`, [f, t]);
+    for (let f = 100; f <= 30_000; f += 100) tiers.set(`${f}/${f / 100}`, [f, f / 100]);
+    for (const f of [1, 5, 10, 25, 30, 50, 80, 100, 150, 200, 250, 300, 400, 500, 1000, 2500, 3000, 5000, 10000, 20000, 30000, 50000, 100000])
+      for (const t of [1, 2, 4, 5, 8, 10, 15, 20, 25, 50, 60, 100, 200, 500, 1000]) tiers.set(`${f}/${t}`, [f, t]);
+    const tierWords = [...tiers.values()].map(([f, t]) => [f.toString(16).padStart(64, '0'), t.toString(16).padStart(64, '0'), f, t] as const);
+    const zeroW = '0'.repeat(64);
+    let found = 0;
+    for (const b of bases) for (const c of coins) {
+      if (b === c) continue;
+      const [c0, c1] = BigInt(b) < BigInt(c) ? [b, c] : [c, b];
+      const head = '0x' + c0.slice(2).padStart(64, '0') + c1.slice(2).padStart(64, '0');
+      for (const [fw, tw] of tierWords) {
+        const id = ethers.keccak256(head + fw + tw + zeroW);
+        if (want.has(id)) { info.set(id, { t0: c0, t1: c1, dex: 'uniswap-v4', hooks: ZERO_ADDR }); want.delete(id); found++; }
+      }
+      if (!want.size) return found;
+    }
+    return found;
+  };
+  const v4Found = matchV4([]);
+  log(`V4 pools identified by id: ${v4Found}/${v4ids.length}`);
   const dec = (t: string): number | null => (t === ZERO_ADDR ? 18 : tokens[t]?.d ?? null);
   const asErc = (t: string) => (t === ZERO_ADDR ? WETH : t);  // plain ETH counts as WETH
   log(`coins: ${tl.length}, decimals known for ${tl.filter((t) => tokens[t].d !== null).length}`);
@@ -378,13 +391,46 @@ async function main() {
         const gas = receiptGasWei(r);
         const out = classifyTx(r.logs, r.from, r.to, r.status, { hash: c.hash, block: c.block, txIndex: c.ti, ...gas }, { poolManager: PM, weth: WETH, v4Currencies });
         reasons[tn][out.reason] = (reasons[tn][out.reason] ?? 0) + 1;
-        if (out.arb) { const a = { ...out.arb, tier: Number(tn) }; arbs.push(a); isArbKey.add(key); appendFileSync(arbsFile, JSON.stringify(a) + '\n'); }
+        if (out.arb) { const a = { ...out.arb, tier: Number(tn) }; arbs.push(a); isArbKey.add(key); }
         else nonArbTo.set(key, lc(r.to ?? ''));
       }));
       if (Date.now() - lastSave > 60_000) { lastSave = Date.now(); log(`receipts: tier1 ${readCount['1']}/${t1.length}, tier2 ${readCount['2']}/${t2.length}, arbitrage so far ${arbs.length}, rps ${rpc.rps.toFixed(1)}, 429s ${rpc.limited}`); }
     }
   }
   log(`receipts done: tier1 ${readCount['1']}/${t1.length}, tier2 ${readCount['2']}/${t2.length}, arbitrage ${arbs.length}`);
+
+  // ---- 5b. Second pass on V4: coins seen in arbitrage that no address pool
+  // had (V4-only coins), then re-check arbitrage that went through a V4 pool
+  // we could not name before (its plain-ETH leg may have been missed).
+  {
+    const extra = new Set<string>();
+    for (const a of arbs) { for (const [t] of a.net) extra.add(t); for (const [t] of a.outflow) extra.add(t); for (const h of a.hops) { if (h.tin) extra.add(h.tin); if (h.tout) extra.add(h.tout); } }
+    const newToks = [...extra].filter((t) => !(t in tokens) && t.length === 42);
+    if (newToks.length) {
+      const r2 = await multi(newToks.flatMap((t) => [{ target: t, data: SEL.decimals }, { target: t, data: SEL.symbol }]));
+      newToks.forEach((t, i) => {
+        let d: number | null = null; const r = r2[2 * i];
+        if (r && r.length >= 66) { try { const v = Number(BigInt(r.slice(0, 66))); d = v <= 36 ? v : null; } catch { /* none */ } }
+        const sy = fastDecodeString(r2[2 * i + 1]);
+        tokens[t] = { d, s: sy ? sy.replace(/[^\x20-\x7e]/g, '').slice(0, 16) : null };
+      });
+    }
+    const f2 = matchV4(newToks);
+    const redo = arbs.filter((a) => a.uncertain.includes('v4-pool-unknown') && a.pools.every((p) => p.length !== 66 || info.has(p)));
+    log(`V4 second pass: ${newToks.length} new coins, ${f2} more V4 pools named (total ${v4ids.filter((x) => info.has(x)).length}/${v4ids.length}); re-checking ${redo.length} arbitrage`);
+    const rr = await rpc.many(redo.map((a) => ({ method: 'eth_getTransactionReceipt', params: [a.hash] })));
+    let dropped = 0;
+    redo.forEach((a, i) => {
+      const r = rr[i]; if (!r?.logs) return;
+      const out = classifyTx(r.logs, r.from, r.to, r.status, { hash: a.hash, block: a.block, txIndex: a.txIndex, ...receiptGasWei(r) }, { poolManager: PM, weth: WETH, v4Currencies });
+      const k = arbs.indexOf(a);
+      if (out.arb) arbs[k] = { ...out.arb, tier: a.tier };
+      else { arbs[k] = null as any; isArbKey.delete(`${a.block}:${a.txIndex}`); dropped++; }
+    });
+    for (let i = arbs.length - 1; i >= 0; i--) if (!arbs[i]) arbs.splice(i, 1);
+    log(`re-check: ${dropped} were not arbitrage after all; ${arbs.length} arbitrage remain`);
+  }
+  writeFileSync(arbsFile, arbs.map((a) => JSON.stringify(a)).join('\n') + '\n');
 
   // ---- 6. Timing: the trade each arbitrage followed --------------------------
   // Per pool, its swap rows in order (block, ti). The "opening trade" is the
@@ -423,14 +469,17 @@ async function main() {
   const censusEndHead = num(await rpc.call('eth_blockNumber', []));
   const nonceEnd = num(await rpc.call('eth_getTransactionCount', [OUR_SENDER, 'latest']));
   const cDeadline = Date.now() + CENSUS_MIN * 60_000;
-  const census = { fromBlock: toBlock + 1, toBlock: toBlock, blocks: 0, txs: 0, failed: 0, byTo: {} as Record<string, { n: number; ok: number; fail: number; arb: number; gasWei: string; senders: Record<string, number> }>, ourTxs: [] as any[], censusArbs: [] as any[] };
+  const census = { fromBlock: toBlock + 1, toBlock: toBlock, blocks: 0, txs: 0, failed: 0, byTo: {} as Record<string, { n: number; ok: number; fail: number; arb: number; gasWei: string; failGasWei: string; senders: Record<string, number> }>, ourTxs: [] as any[], censusArbs: [] as any[] };
   const byToGas = new Map<string, bigint>();
+  const byToFailGas = new Map<string, bigint>();
   let cb = toBlock + 1, stalls = 0;
   while (cb <= censusEndHead && Date.now() < cDeadline) {
     const blocksAsk: number[] = [];
-    for (let k = 0; k < BATCH * 3 && cb + k <= censusEndHead; k++) blocksAsk.push(cb + k);
+    // Whole-block answers are large: small batches, a few in flight.
+    const CB = Number(process.env.PM_CENSUS_BATCH ?? 4);
+    for (let k = 0; k < CB * 4 && cb + k <= censusEndHead; k++) blocksAsk.push(cb + k);
     const groups: number[][] = [];
-    for (let k = 0; k < blocksAsk.length; k += BATCH) groups.push(blocksAsk.slice(k, k + BATCH));
+    for (let k = 0; k < blocksAsk.length; k += CB) groups.push(blocksAsk.slice(k, k + CB));
     const res = await Promise.all(groups.map((g) => rpc.many(g.map((b) => ({ method: 'eth_getBlockReceipts', params: [hex(b)] })), 90_000)));
     let stop = false;
     groups.forEach((g, gi) => g.forEach((b, bi) => {
@@ -444,11 +493,12 @@ async function main() {
         census.txs++;
         const ok = r.status === '0x1';
         if (!ok) census.failed++;
-        const e = census.byTo[to] ?? (census.byTo[to] = { n: 0, ok: 0, fail: 0, arb: 0, gasWei: '0', senders: {} });
+        const e = census.byTo[to] ?? (census.byTo[to] = { n: 0, ok: 0, fail: 0, arb: 0, gasWei: '0', failGasWei: '0', senders: {} });
         e.n++; if (ok) e.ok++; else e.fail++;
         e.senders[from] = (e.senders[from] ?? 0) + 1;
         const gas = receiptGasWei(r);
         byToGas.set(to, (byToGas.get(to) ?? 0n) + gas.gasWei);
+        if (!ok) byToFailGas.set(to, (byToFailGas.get(to) ?? 0n) + gas.gasWei);
         let arb: ArbRecord | null = null;
         if (ok && r.logs?.length >= 2) {
           const out = classifyTx(r.logs, r.from, r.to, r.status, { hash: lc(r.transactionHash), block: b, txIndex: num(r.transactionIndex), ...gas }, { poolManager: PM, weth: WETH, v4Currencies });
@@ -462,6 +512,7 @@ async function main() {
     if (Date.now() - lastSave > 60_000) { lastSave = Date.now(); log(`census: ${census.blocks} blocks (${cb}/${censusEndHead}), ${census.txs} txs, failed ${census.failed}, our txs ${census.ourTxs.length}, rps ${rpc.rps.toFixed(1)}`); }
   }
   for (const [to, g] of byToGas) if (census.byTo[to]) census.byTo[to].gasWei = g.toString();
+  for (const [to, g] of byToFailGas) if (census.byTo[to]) census.byTo[to].failGasWei = g.toString();
   // Keep only addresses that matter (bots: any arbitrage or 20+ txs).
   const keep: typeof census.byTo = {};
   for (const [to, e] of Object.entries(census.byTo)) if (e.arb > 0 || e.n >= 20 || to === OUR_EXEC) { const s = Object.entries(e.senders).sort((x, y) => y[1] - x[1]); keep[to] = { ...e, senders: Object.fromEntries(s.slice(0, 10)) }; (keep[to] as any).senderCount = s.length; }
