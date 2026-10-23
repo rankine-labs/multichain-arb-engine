@@ -69,18 +69,19 @@
 //      swap fetched it and adds to it) is NOT used by checks: other pools'
 //      swaps and collections change it unseen.
 //
-//   copy2-r (live Oct 22 21:22, RIVN/USDG: copy "reverts", the node at the
-//   SAME block "loss"): "P + 2^200 is above any real balance" holds only if
-//   the COIN reads the whole storage word as the balance. Live USDG counts
-//   only the low 128 bits (probed on the chain: raw 2^128 + 5 reads 5, raw
-//   2^200 + 999 can't pay 1000), so the high run was the bound run again,
-//   and a check whose take needed slightly more than the route's bound
-//   reverted in both runs "the same": reported as a proven revert. Now the
-//   high value is chosen per coin (server.rs coin_highs): the coin must read
-//   back P and P + H exactly (balanceOf(PoolManager)); H = 2^200, else the
-//   largest of 2^160 / 2^126 / 2^112 / 2^96 it reads back AND that is above
-//   its totalSupply x 2^16; none: unknown. (2^126: a 128-bit field keeps
-//   room for coins paid in.)
+//   copy2-r / copy2-s (live Oct 22-23, RIVN/USDG): "P + 2^200 is above any
+//   real balance" holds only if the COIN reads the whole storage word as
+//   the balance. Live USDG counts only the LOW 64 bits (probed on the chain:
+//   raw x + 2^k reads back for k <= 63 only; supply 6.85e14 ~ 2^49.3), so
+//   the high run was the bound run again (copy2-r: a take slightly above
+//   the route's bound reverted in both runs = a false "reverts"). Now the
+//   high value is chosen per coin (server.rs coin_highs): the coin must
+//   read back P exactly; H = 2^200 if it reads back P + 2^200, else the
+//   coin's field width w is found (binary search of the largest 2^k it
+//   reads back), H = 2^(w-2) (half the field: room for coins paid in), and
+//   only if P + H >= totalSupply x 2^8 (no balance exceeds the supply; the
+//   held supply is <= one verify round old); else unknown. The width is
+//   remembered per coin and re-confirmed every check (2 runs).
 //
 //   Speed (live Oct 22 16:19, checks ~120 ms instead of ~5): the lower
 //   bound used to be the sum over EVERY ready V4 pool holding the coin
