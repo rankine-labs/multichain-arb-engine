@@ -271,16 +271,6 @@ pub fn high_offset() -> U256 {
     U256::from(1u8) << 200usize
 }
 
-/// High-run values tried per coin, largest first (copy2-r). The high run
-/// must make the coin SEE a balance above any real one: 2^200 for coins
-/// that count the whole storage word; a coin that counts only part of the
-/// word (live USDG: the low 128 bits) gets the largest one it reads back
-/// exactly, and only if that is still above the coin's whole supply.
-pub fn high_candidates() -> [U256; 5] {
-    let one = U256::from(1u8);
-    [one << 200usize, one << 160usize, one << 126usize, one << 112usize, one << 96usize]
-}
-
 /// A check's view of copy 2 (see the header).
 pub struct C2View<'a> {
     inner: &'a dyn StateRead,

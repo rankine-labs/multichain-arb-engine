@@ -456,20 +456,29 @@ fn abi_addr(sel: &str, a: revm::primitives::Address) -> Vec<u8> {
     d
 }
 
-/// Remembered per coin: which high candidate worked last time (only a
+/// Remembered per coin: the high exponent that worked last time (only a
 /// starting point: it is checked again every time).
 fn high_hint() -> &'static Mutex<std::collections::HashMap<revm::primitives::Address, usize>> {
     static H: std::sync::OnceLock<Mutex<std::collections::HashMap<revm::primitives::Address, usize>>> = std::sync::OnceLock::new();
     H.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
 }
 
-/// copy2-r: for each PoolManager coin balance the bound run read, the value
-/// the high run adds, such that the coin itself reads back the bound P and
-/// P + H exactly (balanceOf(PoolManager)) and P + H is above everything the
-/// coin can owe anyone (H = 2^200 as before; a smaller H only if the coin's
-/// totalSupply, times 2^16 for headroom, is below P + H). Err = the answer
-/// to give (unknown "pool_manager_balance", or a "miss" for the coin values
-/// the reads needed, which then get filled).
+/// The high run's value must be at least the coin's totalSupply times this
+/// (2^8): no balance can exceed the supply, and the held supply is at most
+/// one verify round (ARBSIM_COPY2_VERIFY_S, 60 s) old.
+pub const SUPPLY_MARGIN_BITS: usize = 8;
+
+/// copy2-r / copy2-s: for each PoolManager coin balance the bound run read,
+/// the value H the high run adds to the bound P, such that
+///   - the coin reads back P and P + H exactly (balanceOf(PoolManager)),
+///   - P + H is above any balance the coin can have: H = 2^200, or (a coin
+///     that counts only part of its balance word: live USDG counts the low
+///     64 bits) H = 2^(k-1) where 2^k is the largest power the coin still
+///     reads back, and only if P + H >= totalSupply x 2^8,
+///   - and coins paid in during the check can't overflow its field (H is
+///     half the field: P + H + anything up to the supply still fits).
+/// Err = the answer to give (unknown "pool_manager_balance", or a "miss"
+/// for the coin values the reads needed, which then get filled).
 pub fn coin_highs(
     view: &dyn StateRead,
     facts: &crate::copy2::checkview::C2Facts,
@@ -488,6 +497,7 @@ pub fn coin_highs(
         l.what.push("c".into());
         r
     };
+    let miss = |u| (String::new(), Some(u));
     for (pm, coin) in coins {
         if *coin == Address::ZERO {
             continue; // ETH: a plain account balance, every bit counts
@@ -495,42 +505,60 @@ pub fn coin_highs(
         let low = C2View::new(view, facts, U256::ZERO);
         let p = low.lower_bound(*pm, *coin);
         let bal = abi_addr("balanceOf(address)", *pm);
-        let seen = timed(&mut || view_word(&low, bctx, *coin, bal.clone())).map_err(|u| (String::new(), Some(u)))?;
+        let seen = timed(&mut || view_word(&low, bctx, *coin, bal.clone())).map_err(miss)?;
         if seen != Some(p) {
             return Err((format!("coin {coin}: balanceOf(PoolManager) does not read the stored balance word (stored {p:#x}, reads {seen:?}): its bound can't be put in"), None));
         }
-        let mut supply_read = false;
-        let mut supply: Option<U256> = None;
-        let cands = crate::copy2::checkview::high_candidates();
-        let start = high_hint().lock().unwrap().get(coin).copied().unwrap_or(0).min(cands.len() - 1);
-        let mut found = None;
-        for (i, h) in cands.iter().enumerate().skip(start).chain(cands.iter().enumerate().take(start)) {
-            let want = p.saturating_add(*h);
-            let hv = C2View::with_offsets(view, facts, crate::copy2::checkview::high_offset(), U256::ZERO, std::collections::HashMap::from([(*coin, *h)]));
-            let got = timed(&mut || view_word(&hv, bctx, *coin, bal.clone())).map_err(|u| (String::new(), Some(u)))?;
-            if got != Some(want) {
-                continue;
-            }
-            if i > 0 {
-                if !supply_read {
-                    supply_read = true;
-                    supply = timed(&mut || view_word(&low, bctx, *coin, revm::primitives::keccak256(b"totalSupply()")[..4].to_vec())).map_err(|u| (String::new(), Some(u)))?;
-                }
-                // Above the whole supply with room to spare (a held supply
-                // may be up to one verify round old).
-                if !supply.is_some_and(|s| s.checked_shl(16).is_some_and(|s16| s16 < want)) {
-                    continue;
-                }
-                narrow = true;
-            }
-            found = Some((i, *h));
-            break;
-        }
-        let Some((i, h)) = found else {
-            return Err((format!("coin {coin}: no high balance value the coin reads back above its whole supply (it counts only part of its balance word?)"), None));
+        // Does the coin read back P + 2^k exactly?
+        let reads = |k: usize| -> Result<bool, crate::check::CheckUnknown> {
+            let h = U256::from(1u8) << k;
+            let hv = C2View::with_offsets(view, facts, crate::copy2::checkview::high_offset(), U256::ZERO, std::collections::HashMap::from([(*coin, h)]));
+            Ok(timed(&mut || view_word(&hv, bctx, *coin, bal.clone()))? == Some(p.saturating_add(h)))
         };
-        high_hint().lock().unwrap().insert(*coin, i);
-        out.insert(*coin, h);
+        let hint = high_hint().lock().unwrap().get(coin).copied().filter(|h| *h < 200);
+        // A remembered half-field exponent: it still reads back and the
+        // field still ends where it did (2 runs). Else 2^200 (1 run), else
+        // the search.
+        let k = if let Some(h) = hint.filter(|h| reads(*h).unwrap_or(false) && !reads(*h + 2).unwrap_or(true)) {
+            h
+        } else if reads(200).map_err(miss)? {
+            200
+        } else {
+            // Largest k the coin reads back: the coin keeps the low w bits,
+            // P + 2^k reads back exactly while P + 2^k < 2^w (monotone for
+            // k above P's own bits). Binary search over [bits(P), 199].
+            let (mut lo, mut hi) = (p.bit_len().max(8), 199usize);
+            if !reads(lo).map_err(miss)? {
+                return Err((format!("coin {coin}: reads back no larger PoolManager balance than the bound {p:#x}"), None));
+            }
+            while lo < hi {
+                let mid = (lo + hi).div_ceil(2);
+                if reads(mid).map_err(miss)? {
+                    lo = mid;
+                } else {
+                    hi = mid - 1;
+                }
+            }
+            // Half the field (room for coins paid in during the check),
+            // checked to read back too.
+            let k = lo.saturating_sub(1);
+            if !reads(k).map_err(miss)? {
+                high_hint().lock().unwrap().remove(coin);
+                return Err((format!("coin {coin}: no high balance value the coin reads back"), None));
+            }
+            k
+        };
+        if k < 200 {
+            let supply = timed(&mut || view_word(&low, bctx, *coin, revm::primitives::keccak256(b"totalSupply()")[..4].to_vec())).map_err(miss)?;
+            let want = p.saturating_add(U256::from(1u8) << k);
+            if !supply.is_some_and(|s| s.bit_len() + SUPPLY_MARGIN_BITS < 256 && (s << SUPPLY_MARGIN_BITS) <= want) {
+                high_hint().lock().unwrap().insert(*coin, k);
+                return Err((format!("coin {coin}: counts only {} bits of its balance word; the high value ({want:#x}) is not far enough above its totalSupply ({supply:?})", k + 2), None));
+            }
+            narrow = true;
+        }
+        high_hint().lock().unwrap().insert(*coin, k);
+        out.insert(*coin, U256::from(1u8) << k);
     }
     Ok((out, narrow))
 }
