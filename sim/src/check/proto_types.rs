@@ -69,6 +69,11 @@ pub struct CallRequest {
     /// ArbSys.arbBlockNumber() returns N+1.
     #[serde(default, rename = "nextBlock")]
     pub next_block: bool,
+    /// Trigger-first (check/ordered.rs): the feed messages around the trade
+    /// we follow, to replay in sequence order before our calls. The server
+    /// works out which of them the chosen copy version already holds.
+    #[serde(default)]
+    pub feed: Option<Value>,
 }
 
 /// Block details for one request: the server's, plus the request's changes.
@@ -258,6 +263,70 @@ pub fn handle_call(view: &dyn StateRead, ctx: &BlockCtx, req: &CallRequest) -> V
             "results": out.iter().map(WireOutcome::from).collect::<Vec<_>>(),
             "us": t0.elapsed().as_micros() as u64,
         }),
+        Err(u) => unknown_json(&req.id, &u, t0.elapsed().as_micros()),
+    }
+}
+
+/// Run a trigger-first `call` request (`feed` given) on `view`: the plan's
+/// feed transactions in order, then the request's calls (check/ordered.rs).
+/// The answer is a normal call answer plus `trig`: what was replayed. Its
+/// `digest` covers every replayed transaction's success and output, so two
+/// runs of one copy-2 check (server.rs copy2_runs: lower bound / far above
+/// it) only agree if the replayed transactions ran the same way too.
+pub fn handle_trig_call(
+    view: &dyn StateRead,
+    plan: &super::ordered::OrderedPlan,
+    info: &super::ordered::PlanInfo,
+    req: &CallRequest,
+    prov: &dyn super::ordered::Provenance,
+    strict_call: bool,
+) -> Value {
+    let t0 = Instant::now();
+    let parsed = (|| -> Result<(Overrides, Vec<CallReq>), String> {
+        let ov = Overrides::from_json(&req.overrides)?;
+        let calls = req.calls.iter().enumerate().map(|(i, c)| call_from_wire(c).map_err(|e| format!("calls[{i}]: {e}"))).collect::<Result<Vec<_>, _>>()?;
+        if calls.is_empty() {
+            return Err("no calls".into());
+        }
+        Ok((ov, calls))
+    })();
+    let (ov, calls) = match parsed {
+        Ok(x) => x,
+        Err(e) => return unknown_json(&req.id, &CheckUnknown::bad_request(e), t0.elapsed().as_micros()),
+    };
+    match super::ordered::run_ordered(view, plan, &ov, &calls, prov, strict_call) {
+        Ok(out) => {
+            // One fingerprint of how every replayed transaction ended
+            // (success + output; gas is left out so the protocol-fee runs,
+            // which differ in gas only, can still be merged).
+            let mut h: Vec<u8> = Vec::with_capacity(out.replayed.len() * 40);
+            for r in &out.replayed {
+                h.extend_from_slice(r.hash.as_slice());
+                h.push(r.outcome.success as u8);
+                h.extend_from_slice(revm::primitives::keccak256(&r.outcome.output).as_slice());
+            }
+            // How the trigger itself ended (null: already in the copy, not replayed).
+            let trigger_ok = out.replayed.iter().find(|r| r.hash == info.trigger).map(|r| r.outcome.success);
+            serde_json::json!({
+                "id": req.id,
+                "ok": true,
+                "at": at_json(&req.at, view),
+                "results": out.results.iter().map(WireOutcome::from).collect::<Vec<_>>(),
+                "trig": {
+                    "snapBlock": info.snap_block,
+                    "snapSeq": info.snap_seq,
+                    "included": info.included,
+                    "triggerOk": trigger_ok,
+                    "msgs": info.msgs,
+                    "txs": info.txs,
+                    "later": info.later,
+                    "lastSeq": info.last_seq,
+                    "reverted": out.replayed.iter().filter(|r| !r.outcome.success).count(),
+                    "digest": to_hex(revm::primitives::keccak256(&h).as_slice()),
+                },
+                "us": t0.elapsed().as_micros() as u64,
+            })
+        }
         Err(u) => unknown_json(&req.id, &u, t0.elapsed().as_micros()),
     }
 }

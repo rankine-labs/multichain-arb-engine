@@ -37,7 +37,37 @@ export interface FeedTx {
   data: string;
   value: string;   // wei, decimal string (native-coin swaps carry their amount here)
   from: string | null;
+  // TRIGGER-FIRST (execution/triggerFirst.ts): the signed transaction bytes
+  // exactly as the sequencer sent them, and the transaction's place inside
+  // its feed message (0 = first). The fast check replays these bytes.
+  raw: string;
+  txIndex: number;
 }
+
+// ----------------------------------------------------------------------------
+// TRIGGER-FIRST: every feed message, complete, in order
+//
+// Plain English: to work out "our trade right after the trade we follow"
+// without waiting for a block, the fast check must re-run EVERY transaction
+// the sequencer put between its copy and our trade, in order. So for each
+// feed message we keep: its sequence number (= its block), its block time
+// and parent-chain block number, and ALL its signed transactions (also
+// plain transfers, which the trade decoder skips). If a message holds
+// anything we can't hand over exactly (a deposit, a retryable, a compressed
+// or unsigned transaction, a broken batch), it is marked NOT complete: a
+// check that needs it then says "unknown" instead of guessing.
+// ----------------------------------------------------------------------------
+export interface FeedMsgTx { hash: string; raw: string }
+export interface FeedMsg {
+  seq: number;
+  ts: number;            // block time (seconds) from the message header
+  l1: number;            // parent-chain block number from the header
+  txs: FeedMsgTx[];      // every signed transaction, in sequencer order
+  complete: boolean;     // false = holds something we can't replay
+  why?: string;          // why not complete
+}
+
+const L2_KIND_HEARTBEAT = 6; // carries nothing
 
 // Pulls every signed transaction (that calls a contract) out of one l2Msg.
 // Transactions plus their raw signed bytes (the raw bytes give the tx hash
@@ -76,6 +106,72 @@ function parseL2MessageRaw(bytes: Uint8Array, depth = 0): ParsedTx[] {
   }
 
   return [];
+}
+
+// Every signed transaction of one l2Msg, strictly: anything that isn't a
+// signed transaction or a batch of them is written into `problems`
+// (the message is then not complete). Raw bytes + hash only: no decoding,
+// the fast check does that itself.
+function collectL2Strict(bytes: Uint8Array, depth: number, out: FeedMsgTx[], problems: string[]): void {
+  if (depth > MAX_BATCH_DEPTH) { problems.push('batch nested too deep'); return; }
+  if (bytes.length === 0) { problems.push('empty l2 message'); return; }
+  const kind = bytes[0];
+  const body = bytes.subarray(1);
+  if (kind === L2_KIND_SIGNED_TX) {
+    if (!body.length) { problems.push('empty signed transaction'); return; }
+    const raw = '0x' + Buffer.from(body).toString('hex');
+    out.push({ hash: keccak256(raw), raw });
+    return;
+  }
+  if (kind === L2_KIND_BATCH) {
+    let i = 0;
+    while (i < body.length) {
+      if (i + 8 > body.length) { problems.push('broken batch (length)'); return; }
+      const len = Number(Buffer.from(body.subarray(i, i + 8)).readBigUInt64BE());
+      i += 8;
+      if (len <= 0 || i + len > body.length) { problems.push('broken batch (entry)'); return; }
+      collectL2Strict(body.subarray(i, i + len), depth + 1, out, problems);
+      i += len;
+    }
+    return;
+  }
+  if (kind === L2_KIND_HEARTBEAT) return;
+  problems.push(`l2 message kind ${kind}`);
+}
+
+// One feed message -> FeedMsg (null: no sequence number, can't be placed).
+function feedMsgOf(m: any): FeedMsg | null {
+  const seq = m?.sequenceNumber;
+  if (typeof seq !== 'number' || !Number.isSafeInteger(seq) || seq < 0) return null;
+  const inner = m?.message?.message;
+  const header = inner?.header ?? {};
+  const ts = Number(header.timestamp ?? 0);
+  const l1 = Number(header.blockNumber ?? 0);
+  const out: FeedMsg = { seq, ts: Number.isFinite(ts) ? ts : 0, l1: Number.isFinite(l1) ? l1 : 0, txs: [], complete: true };
+  const problems: string[] = [];
+  if (header.kind !== HEADER_KIND_L2_MESSAGE) {
+    // Deposits, retryables, batch-posting reports, ...: they change state
+    // we can't reproduce here.
+    problems.push(`header kind ${header.kind}`);
+  } else if (typeof inner?.l2Msg !== 'string') {
+    problems.push('no l2Msg');
+  } else {
+    try { collectL2Strict(Buffer.from(inner.l2Msg, 'base64'), 0, out.txs, problems); }
+    catch { problems.push('l2Msg unreadable'); }
+  }
+  if (problems.length) { out.complete = false; out.why = problems[0]; }
+  return out;
+}
+
+// Every message of a frame, complete (see above). Never throws.
+export function parseFeedMessages(frame: unknown): FeedMsg[] {
+  const messages = (frame as any)?.messages;
+  if (!Array.isArray(messages)) return [];
+  const out: FeedMsg[] = [];
+  for (const m of messages) {
+    try { const f = feedMsgOf(m); if (f) out.push(f); } catch { /* skip */ }
+  }
+  return out;
 }
 
 // Sender of a transaction, or null if it can't be recovered (unsigned or a
@@ -118,14 +214,16 @@ export function parseFeedFrame(frame: unknown): FeedTx[] {
       continue;
     }
 
+    let txIndex = -1;
     for (const { tx, raw } of parseL2MessageRaw(bytes)) {
+      txIndex++;
       // Every field read is guarded: ethers re-validates some transactions
       // lazily (e.g. a priority fee above the max fee, which Robinhood's
       // sequencer accepts) and throws from inside getters like tx.hash.
       try {
         if (!tx.to || !tx.data || tx.data === '0x') continue; // plain transfers aren't swaps
         // A tx hash is keccak256 of its raw signed bytes: no ethers validation involved.
-        const out = { sequenceNumber: seq, hash: keccak256(raw), to: tx.to, data: tx.data, value: tx.value.toString() } as FeedTx;
+        const out = { sequenceNumber: seq, hash: keccak256(raw), to: tx.to, data: tx.data, value: tx.value.toString(), raw, txIndex } as FeedTx;
         // SENDER ("from") IS WORKED OUT ONLY WHEN SOMEONE ASKS FOR IT (Oct 13).
         // Finding the sender means checking the signature, which takes about
         // 1-2 ms per transaction in JavaScript. A feed frame often holds 20-40

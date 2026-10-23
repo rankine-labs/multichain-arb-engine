@@ -11,6 +11,9 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+// Signing helpers (test keys only) for the trigger-first tests at the end.
+mod check_util;
+
 use arbsim::check::hexutil::{parse_address, parse_bytes, parse_u256, parse_u64};
 use arbsim::copy2::coins::{BalanceLayout, PROBE_HOLDER};
 use arbsim::copy2::fields::{map_slot, obs_slot, topic, topics};
@@ -2282,4 +2285,171 @@ fn fills_and_rereads_at_a_node_block_the_copy_has_no_version_for_are_kept() {
     // Placed at the newest version before the node's block (100): that
     // version and the head have it.
     assert_eq!(r.sh.resolve(&At::Block(100)).unwrap().snap.storage(a(COIN0), u(6)), Lookup::Known(u(9)));
+}
+
+// ---------------------------------------------------------------------------
+// Trigger-first checks on real copy-2 versions (check/ordered.rs + server.rs)
+// ---------------------------------------------------------------------------
+
+/// An outside contract copy 2 doesn't follow (trigger-first tests).
+const OUTSIDE: u8 = 0x99;
+
+/// anvil / hardhat test account #0 (public test key, no funds).
+const TEST_KEY: [u8; 32] = [
+    0xac, 0x09, 0x74, 0xbe, 0xc3, 0x9a, 0x17, 0xe3, 0x6b, 0xa4, 0xa6, 0xb4, 0xd2, 0x38, 0xff, 0x94, 0x4b, 0xac, 0xb4,
+    0x78, 0xcb, 0xed, 0x5e, 0xfc, 0xae, 0x78, 0x4d, 0x7b, 0xf4, 0xf2, 0xff, 0x80,
+];
+
+/// A signed transaction (type 2) from the test key.
+fn signed(nonce: u64, to: Address, data: Vec<u8>) -> Vec<u8> {
+    check_util::sign_typed(&TEST_KEY, 2, &check_util::TestTx { nonce, gas: 200_000, to: Some(to), value: U256::ZERO, data, access_list: vec![] }, 4663)
+}
+
+fn hexb(b: &[u8]) -> String {
+    format!("0x{}", b.iter().map(|x| format!("{x:02x}")).collect::<String>())
+}
+
+/// Copy 2 following the V2 pool (with a real getReserves-like getter that
+/// returns slot 8), plus a server context for `server::handle`.
+fn trig_world() -> (Rig, arbsim::server::Ctx) {
+    let chain = Arc::new(FakeChain::new());
+    // Plus an outside contract (think: a router's settings) holding 42 in
+    // slot 5, returning the slot named by its call data: copy 2 never
+    // follows it, it can only hold it as a fill.
+    let mut g = genesis();
+    g.entry(a(OUTSIDE)).or_default().insert(u(5), u(42));
+    chain.set(100, g);
+    chain.codes.lock().unwrap().insert(a(V2P), vec![0x60, 0x08, 0x54, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3]);
+    chain.codes.lock().unwrap().insert(a(OUTSIDE), vec![0x60, 0x00, 0x35, 0x54, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3]);
+    let node: Arc<dyn NodeApi> = chain.clone();
+    let sh = Shared::new(Config::for_tests(), Some(node), Arc::new(Volatile::default()));
+    let fills = Arc::new(FillQueue::new(1000, 100));
+    let (intake, h) = manual(sh.clone(), fills.clone(), C2Config::for_tests());
+    let (_u, updater) = arbsim::state::updater::manual(sh.clone(), fills.clone());
+    let ctx = arbsim::server::Ctx { shared: sh.clone(), updater, fills, pinned: arbsim::state::pinned::PinnedCache::new(2), copy2: Some(h.clone()) };
+    let mut r = Rig { chain, sh, intake, h };
+    r.track(vec![v2_pool()]);
+    r.send(tick(100, 60));
+    assert_eq!(r.state(&v2_pool()).0, PoolState::Ready, "{:?}", r.state(&v2_pool()));
+    // Block 101: a user swap (100 coin0 in, 360 coin1 out).
+    r.send(msg(101, 62, vec![
+        v2_sync(1100, 3640, 101, 3, 2),
+        transfer(a(COIN0), a(USER), a(V2P), 100, 101, 3, 0),
+        transfer(a(COIN1), a(V2P), a(USER), 360, 101, 3, 1),
+        lg(a(V2P), vec![topics().v2_swap, topic_of(a(USER)), topic_of(a(USER))], data(&[u(100), u(0), u(0), u(360)]), 101, 3, 3),
+    ]));
+    (r, ctx)
+}
+
+fn reserves_word(r0: u128, r1: u128, t: u128) -> String {
+    w(u(r0) | (u(r1) << 112usize) | (u(t) << 224usize))
+}
+
+/// Our "trade": the pool's getter, from a wallet nobody tracks.
+fn trig_call(ctx: &arbsim::server::Ctx, feed: Value) -> Value {
+    arbsim::server::handle(ctx, &json!({"id": 7, "type": "call", "at": {"after": "head"}, "feed": feed, "calls": [{
+        "from": format!("{}", a(0xe0)), "to": format!("{}", a(V2P)), "data": "0x0902f1ac", "gas": "0x100000"}]}))
+}
+
+#[test]
+fn trigger_first_on_copy_2_versions_through_the_server() {
+    let (mut r, ctx) = trig_world();
+    // The trigger: a signed transaction the copy can replay (it reads the pool).
+    let trig = signed(0, a(V2P), vec![0x09, 0x02, 0xf1, 0xac]);
+    let th = hexb(keccak256(&trig).as_slice());
+    // 1. Sequenced after the copy's block 101: replayed, then our call.
+    let ans = trig_call(&ctx, json!({"trigger": th, "triggerSeq": 102, "msgs": [{"seq": 102, "ts": 63, "l1": 9000, "txs": [hexb(&trig)]}]}));
+    assert_eq!(ans["ok"], json!(true), "{ans}");
+    assert_eq!(ans["results"][0]["output"], json!(reserves_word(1100, 3640, 62)), "{ans}");
+    assert_eq!((ans["trig"]["snapBlock"].clone(), ans["trig"]["included"].clone(), ans["trig"]["txs"].clone(), ans["trig"]["triggerOk"].clone()), (json!(101), json!(false), json!(1), json!(true)), "{ans}");
+    // 2. Already in the copy (sequence 101 <= the copy's 101): not replayed.
+    let ans = trig_call(&ctx, json!({"trigger": th, "triggerSeq": 101, "msgs": [{"seq": 101, "ts": 62, "l1": 9000, "txs": [hexb(&trig)]}]}));
+    assert_eq!(ans["ok"], json!(true), "{ans}");
+    assert_eq!((ans["trig"]["included"].clone(), ans["trig"]["txs"].clone(), ans["trig"]["triggerOk"].clone()), (json!(true), json!(0), Value::Null), "{ans}");
+    // 3. A gap between the copy and the trigger's message: unknown.
+    let ans = trig_call(&ctx, json!({"trigger": th, "triggerSeq": 104, "msgs": [{"seq": 104, "ts": 64, "l1": 9000, "txs": [hexb(&trig)]}]}));
+    assert_eq!(ans["unknown"], json!("feed_gap"), "{ans}");
+    // 4. A replayed tx needs state the copy doesn't hold: unknown, and NO
+    //    node request is queued for it (trigger-first reads the node only
+    //    through the bot's budgeted warming). A normal check's miss does.
+    let nowhere = a(0x77);
+    let t2 = signed(0, nowhere, vec![1]);
+    let ans = trig_call(&ctx, json!({"trigger": hexb(keccak256(&t2).as_slice()), "triggerSeq": 102, "msgs": [{"seq": 102, "ts": 63, "l1": 9000, "txs": [hexb(&t2)]}]}));
+    assert_eq!(ans["ok"], json!(false), "{ans}");
+    assert!(ans["missing"].as_array().is_some_and(|m| m.iter().any(|x| x["account"] == json!(format!("{nowhere:#x}")))), "{ans}");
+    let before = *r.chain.calls.lock().unwrap() + *r.chain.paid_calls.lock().unwrap();
+    r.settle();
+    let after = *r.chain.calls.lock().unwrap() + *r.chain.paid_calls.lock().unwrap();
+    assert_eq!(before, after, "trigger-first misses must not reach the node by themselves");
+    let plain = arbsim::server::handle(&ctx, &json!({"id": 8, "type": "call", "calls": [{"from": format!("{}", a(0xe0)), "to": format!("{nowhere}"), "data": "0x01", "gas": "0x100000"}]}));
+    assert_eq!(plain["ok"], json!(false), "{plain}");
+    r.settle();
+    let later = *r.chain.calls.lock().unwrap() + *r.chain.paid_calls.lock().unwrap();
+    assert!(later > after, "a normal check's miss is fetched (contrast)");
+    // 5. Feed fields that can't be mixed: refused.
+    let bad = arbsim::server::handle(&ctx, &json!({"id": 9, "type": "call", "rawTxs": [hexb(&trig)], "feed": {"trigger": th, "triggerSeq": 102, "msgs": []}, "calls": [{"to": format!("{}", a(V2P)), "data": "0x0902f1ac"}]}));
+    assert_eq!(bad["unknown"], json!("bad_request"), "{bad}");
+}
+
+#[test]
+fn reports_arriving_during_a_trigger_first_check_dont_change_it() {
+    let (mut r, _ctx) = trig_world();
+    let trig = signed(0, a(V2P), vec![0x09, 0x02, 0xf1, 0xac]);
+    let feed: arbsim::check::ordered::WireFeed = serde_json::from_value(json!({"trigger": hexb(keccak256(&trig).as_slice()), "triggerSeq": 102, "msgs": [{"seq": 102, "ts": 63, "l1": 9000, "txs": [hexb(&trig)]}]})).unwrap();
+    let req: arbsim::check::proto_types::CallRequest = serde_json::from_value(json!({"id": 1, "overrides": {format!("{}", a(0xe0)): {"balance": "0x0", "nonce": "0x0", "code": "0x"}}, "calls": [{
+        "from": format!("{}", a(0xe0)), "to": format!("{}", a(V2P)), "data": "0x0902f1ac", "gas": "0x100000"}]})).unwrap();
+    // The check picks copy version 101 ...
+    let picked = r.sh.resolve(&At::Head).unwrap();
+    let prov = r.h.provenance_at(picked.seq, &[]);
+    let (plan, info) = arbsim::check::ordered::build_plan(&feed, picked.seq, 0, &picked.ctx).unwrap();
+    let view = arbsim::state::snap::View::new(picked.snap.clone());
+    let first = arbsim::check::proto_types::handle_trig_call(&view, &plan, &info, &req, &prov, true);
+    // ... a report for block 102 arrives and is applied while it works ...
+    r.send(msg(102, 63, vec![
+        v2_sync(1200, 3340, 102, 1, 2),
+        transfer(a(COIN0), a(USER), a(V2P), 100, 102, 1, 0),
+        transfer(a(COIN1), a(V2P), a(USER), 300, 102, 1, 1),
+        lg(a(V2P), vec![topics().v2_swap, topic_of(a(USER)), topic_of(a(USER))], data(&[u(100), u(0), u(0), u(300)]), 102, 1, 3),
+    ]));
+    assert_eq!(r.head_slot(a(V2P), u(8)), Lookup::Known(u(1200) | (u(3340) << 112usize) | (u(63) << 224usize)), "the copy moved on");
+    // ... and the check still answers from the version it picked.
+    let second = arbsim::check::proto_types::handle_trig_call(&view, &plan, &info, &req, &prov, true);
+    assert_eq!(first["results"], second["results"], "{first} vs {second}");
+    assert_eq!(first["results"][0]["output"], json!(reserves_word(1100, 3640, 62)));
+    assert_eq!(first["trig"]["digest"], second["trig"]["digest"]);
+}
+
+#[test]
+fn trigger_first_never_replays_on_a_fill_copy_2_does_not_follow() {
+    let (mut r, ctx) = trig_world();
+    // A normal check reads the outside contract: copy 2 fills it from the
+    // node (it then holds 42 as a fill, re-read about once a minute).
+    let slot5 = format!("0x{:064x}", 5);
+    let mut held = false;
+    for _ in 0..20 {
+        let ans = arbsim::server::handle(&ctx, &json!({"id": 3, "type": "call", "calls": [{"from": format!("{}", a(0xe0)), "to": format!("{}", a(OUTSIDE)), "data": slot5, "gas": "0x100000"}]}));
+        if ans["ok"] == json!(true) {
+            assert_eq!(ans["results"][0]["output"], json!(w(u(42))));
+            held = true;
+            break;
+        }
+        r.settle();
+        r.send(tick(r.sh.head().unwrap().block + 1, 70));
+    }
+    assert!(held, "the fill never arrived");
+    let head = r.sh.head().unwrap().block;
+    // A trigger that reads that fill: never replayed on it (stale_fill).
+    let trig = signed(0, a(OUTSIDE), hex_word(5));
+    let feed = json!({"trigger": hexb(keccak256(&trig).as_slice()), "triggerSeq": head + 1, "msgs": [{"seq": head + 1, "ts": 80, "l1": 9000, "txs": [hexb(&trig)]}]});
+    let ans = trig_call(&ctx, feed);
+    assert_eq!(ans["unknown"], json!("stale_fill"), "{ans}");
+    // A trigger reading only what copy 2 follows (the pool): answered.
+    let trig = signed(0, a(V2P), vec![0x09, 0x02, 0xf1, 0xac]);
+    let feed = json!({"trigger": hexb(keccak256(&trig).as_slice()), "triggerSeq": head + 1, "msgs": [{"seq": head + 1, "ts": 80, "l1": 9000, "txs": [hexb(&trig)]}]});
+    let ans = trig_call(&ctx, feed);
+    assert_eq!(ans["ok"], json!(true), "{ans}");
+}
+
+fn hex_word(n: u64) -> Vec<u8> {
+    u(n as u128).to_be_bytes::<32>().to_vec()
 }

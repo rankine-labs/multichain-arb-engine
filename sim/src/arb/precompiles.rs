@@ -334,6 +334,17 @@ impl ArbPrecompiles {
         Self { eth, cfg: cfg.clone(), l2_block, arbsys_gas, warm, implemented, nitro, initialized: false, unsupported: None }
     }
 
+    /// Change what arbBlockNumber() returns, for the next transactions
+    /// (trigger-first checks replay several feed messages = several blocks
+    /// in one run, check/ordered.rs). Only within the same mode: a Nitro
+    /// set stays Nitro (Some -> Some), a plain-EVM set stays plain (None):
+    /// the precompile addresses were chosen when the set was built.
+    pub fn set_l2_block(&mut self, n: Option<U256>) {
+        if self.l2_block.is_some() == n.is_some() {
+            self.l2_block = n;
+        }
+    }
+
     /// First unsupported thing the runs so far touched (None = all fine).
     pub fn unsupported(&self) -> Option<&UnsupportedHit> {
         self.unsupported.as_ref()

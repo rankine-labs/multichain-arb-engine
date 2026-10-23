@@ -76,6 +76,8 @@ import { formatSkippedOpportunity, formatHourlyDigest, formatDailyReport, format
 import { RobinhoodChainAdapter } from './chains/robinhoodChain';
 // FAST CHECK (arbsim sidecar, LOCAL_SIM=off|shadow|on, default off): see docs/FAST_CHECK.md.
 import { createLocalSimHost, LocalSimHost, LocalCheck, LocalKind, LocalOutcome } from './execution/localSimHost';
+import { TriggerFirst, trigFirstSettings, TrigOutcome } from './execution/triggerFirst';
+import { runCheckFirst } from './execution/checkFirstFlow';
 import { MonadAdapter } from './chains/monad';
 import { AvalancheAdapter } from './chains/avalanche';
 import { RawChainEvent, PoolState, MIN_NET_PROFIT_USD } from './core/types';
@@ -502,6 +504,10 @@ const rhFreeSimRpc: Rpc = makeRpc('https://rpc.mainnet.chain.robinhood.com');
 // default): then none of the fast-check code below does anything at all.
 // Created where the Robinhood feed is set up (search "FAST CHECK: start").
 let localSim: LocalSimHost | null = null;
+// TRIGGER-FIRST (execution/triggerFirst.ts): our trade checked right after the
+// trigger the moment the feed shows it. null = LOCAL_SIM_TRIGGER_FIRST off (the
+// default) or no fast check: nothing at all happens.
+let trigFirst: TriggerFirst | null = null;
 // COPY 2: the pool keys (addresses / V4 ids) the block readers follow. The
 // block reader setup replaces this with its own list; until then: watched pairs.
 let copy2PoolKeys: () => string[] = () => robinhoodWatcher.watchedPairPools().flat();
@@ -817,6 +823,22 @@ const fastToCheck = async (lc: LocalCheck, lo: LocalOutcome, b: BuiltCheck, toke
       }
       if (r.status === 'loss') return { status: 'loss', reason: 'ends with less than it started' };
       return { status: 'fail', reason: 'reason' in r ? r.reason : 'fast check: fails' };
+};
+// TRIGGER-FIRST: a SURE answer -> the same result the node path gives (null =
+// unknown: the existing path decides). Same rules as fastToCheck, but NO size
+// search: a size search would run without the feed replay (another state).
+const trigToCheck = (out: TrigOutcome, b: BuiltCheck, tokenIn: string, usdPerToken: number): RoundTripCheck | null => {
+      if (!out.sure) return null;
+      const r = out.sim;
+      simBuckets.add(r.bucket ?? classifySimOutcome(r.status, 'reason' in r ? r.reason : ''));
+      const loanPips = b.lender ? (b.lender.feePips ?? b.lender.feeBps * 100) : 0;
+      if (r.status === 'profit') {
+            if (!plausibleProfit(r.profit, b.trade.amountIn)) return { status: 'fail', reason: 'implausible profit (bad token or pool data)' };
+            return { status: 'profit', usd: (Number(r.profit) / 10 ** b.decimals) * usdPerToken, loanPips,
+                  trade: { tokenIn, hops: b.trade.hops, amountIn: b.trade.amountIn, profit: r.profit, v3Lender: b.lender?.poolAddress } };
+      }
+      if (r.status === 'loss') return { status: 'loss', reason: 'ends with less than it started' };
+      return { status: 'fail', reason: 'reason' in r ? r.reason : 'trigger-first check: fails' };
 };
 // On mode: re-check 1 in N fast decisions with the node, in the background
 // (never waited for; its answer only feeds the agreement counter). Follow-a-
@@ -2355,7 +2377,7 @@ const fireTrade = async (o: {
             const liveRh = o.chain === 'robinhood' && robinhoodSender.live;
             if (liveRh) whyNotSent.chance();
             // Which check let a live follow-a-trade send through (fast check log timing).
-            let checkFirstDecidedBy: 'local' | 'node' | null = null;
+            let checkFirstDecidedBy: 'trig_first' | 'local' | 'node' | null = null;
             // Hard stop: never build a trade on an exchange that isn't cleared
             // for trading (config/robinhoodVenues.ts executionEnabled: false).
             const notLive = liveBlocker(o.buyPool, o.sellPool);
@@ -2407,61 +2429,77 @@ const fireTrade = async (o: {
                   block(`auto-vetted coin: over the $${AUTO_VET_MAX_TRADE_USD} limit`);
                   return;
             }
+            // TRIGGER-FIRST (execution/triggerFirst.ts, LOCAL_SIM_TRIGGER_FIRST=shadow|on):
+            // our EXACT trade (after fit-to-wallet above) checked right after the
+            // trigger, asked NOW: the fast check replays the feed's transactions on
+            // copy 2 itself, no waiting for pool reports or receipts. Started for
+            // every Robinhood trigger trade (also dry runs: practice numbers);
+            // it decides only in the live check-first step below, in "on" mode.
+            const label0 = `${symbolOf(o.chain, o.tokenIn)}/${symbolOf(o.chain, o.tokenOut)} ${o.buyPool.dex}>${o.sellPool.dex}`;
+            let trigP: Promise<TrigOutcome> | null = null;
+            let trigBuilt: BuiltCheck | null = null;
+            if (trigFirst && o.chain === 'robinhood' && o.source === 'trade' && o.triggerHash) {
+                  const tb = buildCheck('robinhood', o.tokenIn, o.buyPool, o.sellPool, o.tradeSizeUsd, o.usdPerTokenIn);
+                  if (!('skip' in tb)) {
+                        trigBuilt = tb;
+                        trigP = trigFirst.check({ trade: tb.trade, simOpts: tb.simOpts, triggerHash: o.triggerHash, seenMs: o.seenAtMs, keys: routeKeys(o.buyPool, o.sellPool, tb.lender), label: label0 });
+                  }
+            }
             // CHECK FIRST, THEN SEND (core/checkFirst.ts, Oct 19, owner approved).
-            // Live "follow a trade" sends: wait for the followed trade to land,
-            // run the real check of our exact trade, send only if it makes money.
+            // Live "follow a trade" sends: run the real check of our exact trade,
+            // send only if it makes money. Order (execution/checkFirstFlow.ts):
+            //   0. trigger-first, "on" mode + fast check ON: a SURE answer decides
+            //      (no report wait, no receipt polling, no node); unknown -> 1.
+            //   1. FAST CHECK: the same check, "right after the followed trade"
+            //      (copy 2: after waiting for the trade's pool reports, on mode
+            //      and every pool ready); on + sure answer -> it decides; shadow:
+            //      the node's answer is recorded next to the fast one.
+            //   2. the node: wait for the trade to land, then the node's check.
             // (Before: sent on the guess first; only about 1 in 5 guesses is a real win.)
             if (o.chain === 'robinhood' && robinhoodSender.live && o.source === 'trade' && checkFirstOn()) {
                   const startedMs = Date.now();
-                  // FAST CHECK: the same check, "right after the followed trade", asked NOW
-                  // (no waiting for the trade to land: the sidecar replays the feed itself).
-                  //   on + sure answer -> it decides (no receipt wait, no node check)
-                  //   on + unknown, or shadow -> today's path below, unchanged
-                  //   (shadow: the node's answer is recorded next to the fast one)
-                  let fastLc: LocalCheck | null = null;
-                  let c: RoundTripCheck | null = null;
-                  let waitMs = 0;
-                  let decidedBy: 'local' | 'node' = 'node';
                   const fb = localSim && o.triggerHash ? buildCheck('robinhood', o.tokenIn, o.buyPool, o.sellPool, o.tradeSizeUsd, o.usdPerTokenIn) : null;
-                  if (fb && !('skip' in fb) && localSim?.copy2Running()) {
-                        // COPY 2: answers are per block. On mode, every pool ready: wait for
-                        // the followed trade's pool reports (it is then in a block, no node
-                        // receipt polling), and ask about that block. Not ready, practice
-                        // mode, or not seen in time: today's node path below.
-                        const keys = routeKeys(o.buyPool, o.sellPool, fb.lender);
-                        if (localSim.isOn() && localSim.copy2?.notReadyWhy(keys) === null) {
-                              const blk = await localSim.copy2WaitForTx(o.triggerHash, 1_800);
-                              const route = blk !== null ? localSim.copy2Route(keys, blk) : null;
-                              if (route) {
-                                    waitMs = Date.now() - startedMs;
-                                    fastLc = startFastCheck({ kind: 'trig_live', at: route.at, triggerHash: o.triggerHash, seenMs: o.seenAtMs, label: `${symbolOf(o.chain, o.tokenIn)}/${symbolOf(o.chain, o.tokenOut)} ${o.buyPool.dex}>${o.sellPool.dex}` }, fb);
-                                    c = await fastDecide(fastLc, fb, o.tokenIn, o.tradeSizeUsd, o.usdPerTokenIn);
-                                    if (c) { decidedBy = 'local'; markStretch('check-first fast check'); }
-                              }
-                        }
-                  } else if (fb && !('skip' in fb)) {
-                        fastLc = startFastCheck({ kind: 'trig_live', triggerHash: o.triggerHash, seenMs: o.seenAtMs, label: `${symbolOf(o.chain, o.tokenIn)}/${symbolOf(o.chain, o.tokenOut)} ${o.buyPool.dex}>${o.sellPool.dex}` }, fb);
-                        c = await fastDecide(fastLc, fb, o.tokenIn, o.tradeSizeUsd, o.usdPerTokenIn);
-                        if (c) { decidedBy = 'local'; markStretch('check-first fast check'); }
-                  }
-                  if (!c) {
+                  const built = fb && !('skip' in fb) ? fb : null;
+                  const keys = built ? routeKeys(o.buyPool, o.sellPool, built.lender) : [];
+                  const tf = trigFirst;
+                  const tp = trigP;
+                  const tbuilt = trigBuilt;
+                  const run = await runCheckFirst<LocalCheck, RoundTripCheck>({
+                        now: () => Date.now(),
+                        mark: (stage) => markStretch(stage),
+                        // 0. Trigger-first decides only in "on" mode while the fast check is ON.
+                        trigFirst: tf && tp && tbuilt && tf.decides() ? async () => {
+                              const out = await tp;
+                              const tc = trigToCheck(out, tbuilt, o.tokenIn, o.usdPerTokenIn);
+                              if (tc) tf.noteDecided(o.triggerHash);
+                              return tc;
+                        } : null,
+                        hasBuilt: !!built,
+                        copy2Running: () => !!localSim?.copy2Running(),
+                        copy2Deciding: () => !!localSim?.isOn() && localSim.copy2?.notReadyWhy(keys) === null,
+                        copy2WaitForTx: (ms) => localSim ? localSim.copy2WaitForTx(o.triggerHash, ms) : Promise.resolve(null),
+                        copy2Route: (blk) => localSim?.copy2Route(keys, blk) ?? null,
+                        startFast: (at) => built ? startFastCheck({ kind: 'trig_live', at, triggerHash: o.triggerHash, seenMs: o.seenAtMs, label: label0 }, built) : null,
+                        fastDecide: (lc) => built ? fastDecide(lc, built, o.tokenIn, o.tradeSizeUsd, o.usdPerTokenIn) : Promise.resolve(null),
                         // Ask the SAME node that runs the check (simRpc): if another node saw the
                         // block first, the check could still run on the state before the trade.
                         // Polled every CHECK_FIRST_POLL_MS (50 ms; was 150 ms), for up to ~1.8 s.
-                        const landed = await waitForTrade(simRpc.robinhood, o.triggerHash ?? '', CHECK_FIRST_POLL_MS, Math.ceil(1_800 / CHECK_FIRST_POLL_MS));
-                        waitMs = Date.now() - startedMs;
-                        markStretch('check-first wait');
-                        if (!landed) {
-                              fastLc?.noNode();
-                              checkFirstStats.noLanding++;
-                              block('check first: followed trade not in a block in time');
-                              return;
-                        }
+                        waitForTrade: () => waitForTrade(simRpc.robinhood, o.triggerHash ?? '', CHECK_FIRST_POLL_MS, Math.ceil(1_800 / CHECK_FIRST_POLL_MS)),
                         // Live check-first: one simulation on the checking node, no second "free node"
                         // re-check unless the first answer is a reasonless failure (it only ever turns
                         // those into a clearer answer; a win or a loss is never re-asked).
-                        c = await checkRoundTrip('robinhood', o.tokenIn, o.buyPool, o.sellPool, o.tradeSizeUsd, o.usdPerTokenIn, fastLc ? { kind: 'trig_live', existing: fastLc } : undefined);
+                        nodeCheck: (lc) => checkRoundTrip('robinhood', o.tokenIn, o.buyPool, o.sellPool, o.tradeSizeUsd, o.usdPerTokenIn, lc ? { kind: 'trig_live', existing: lc } : undefined),
+                        noNode: (lc) => lc?.noNode(),
+                  });
+                  const decidedBy = run.decidedBy;
+                  const waitMs = run.waitMs;
+                  if (!run.c) {
+                        checkFirstStats.noLanding++;
+                        trigFirst?.noteExisting(o.triggerHash, Date.now(), 'not sent: trigger not in a block in time');
+                        block('check first: followed trade not in a block in time');
+                        return;
                   }
+                  const c: RoundTripCheck = run.c;
                   const checkMs = Date.now() - startedMs - waitMs;
                   markStretch('check-first result');
                   const v = decideCheckFirst(c, rhGasUsd(0.05), MIN_NET_PROFIT_USD, o.netProfitUsd);
@@ -2469,6 +2507,8 @@ const fireTrade = async (o: {
                   const tookMs = Date.now() - startedMs;
                   checkFirstStats.ms.push(tookMs); checkFirstStats.waitMs.push(waitMs); checkFirstStats.checkMs.push(checkMs);
                   if (checkFirstStats.ms.length > 200) { checkFirstStats.ms.shift(); checkFirstStats.waitMs.shift(); checkFirstStats.checkMs.shift(); }
+                  // Shadow: what the existing path decided, and when (trigger-first log).
+                  if (decidedBy !== 'trig_first') trigFirst?.noteExisting(o.triggerHash, Date.now(), v.send ? `send (${c.status})` : `refuse (${c.status})`);
                   if (!v.send) {
                         checkFirstStats.refused++;
                         console.log(`[check-first] NOT SENT ${label}: guess $${o.netProfitUsd.toFixed(2)}, ${v.why} (${tookMs} ms: wait ${waitMs} + check ${checkMs})`);
@@ -2477,7 +2517,7 @@ const fireTrade = async (o: {
                         return;
                   }
                   checkFirstStats.passed++;
-                  console.log(`[check-first] PASSED ${label}: guess $${o.netProfitUsd.toFixed(2)}, real check $${v.netUsd.toFixed(2)} after gas (${tookMs} ms: wait ${waitMs} + check ${checkMs}${decidedBy === 'local' ? ', fast check' : ''}), sending`);
+                  console.log(`[check-first] PASSED ${label}: guess $${o.netProfitUsd.toFixed(2)}, real check $${v.netUsd.toFixed(2)} after gas (${tookMs} ms: wait ${waitMs} + check ${checkMs}${decidedBy === 'local' ? ', fast check' : decidedBy === 'trig_first' ? ', trigger-first' : ''}), sending`);
                   // Fast check's size search found a smaller, better size (never bigger:
                   // every size cap and the wallet fit above still hold).
                   if (c.status === 'profit' && c.sizeUsd !== undefined && c.sizeUsd < o.tradeSizeUsd) {
@@ -2597,6 +2637,8 @@ const fireTrade = async (o: {
             if (o.source === 'trade') fireStats.readyMs.push(readyMs);
             // FAST CHECK timing proof: trigger seen in the feed -> trade signed.
             if (localSim && checkFirstDecidedBy && fired.signedAtMs) localSim.noteSigned(o.triggerHash, o.seenAtMs, fired.signedAtMs, checkFirstDecidedBy);
+            // Trigger-first decided: feed -> signed, and later vs its block's reports.
+            if (trigFirst && checkFirstDecidedBy === 'trig_first' && fired.signedAtMs) trigFirst.noteSubmitted(o.triggerHash, fired.signedAtMs);
             const tradeLabel = `${symbolOf(o.chain, o.tokenIn)}/${symbolOf(o.chain, o.tokenOut)} ${o.buyPool.dex}>${o.sellPool.dex}`;
             if (fired.live && !fired.txHash && fired.error) { liveTradeLog.sendFailed(tradeLabel, o.tradeSizeUsd, fired.error); alertHooks.liveSendFailed(tradeLabel, fired.error); whyNotSent.blocked('node refused the send'); }
             // How this trade is paid for (Oct 20): own money, or a flash loan and its fee.
@@ -2766,9 +2808,20 @@ localSim = createLocalSimHost(chainOn('robinhood'), {
             return out;
       },
 });
+// TRIGGER-FIRST: needs the fast check's connection and copy 2 (LOCAL_SIM
+// shadow / on and LOCAL_SIM_TRIGGER_FIRST shadow / on).
+try {
+      const tfs = trigFirstSettings();
+      if (localSim && tfs.mode !== 'off') {
+            const host = localSim;
+            trigFirst = new TriggerFirst({ client: host.client, settings: tfs, copy2: () => host.copy2, shadowLog: host.shadowLog, hostOn: () => host.isOn() });
+      }
+} catch (e) { console.log(`[trigger-first] could not start (${(e as Error).message}); the existing paths decide`); trigFirst = null; }
 if (chainOn('robinhood')) {
       const rhAdapter = new RobinhoodChainAdapter();
       if (localSim) { const host = localSim; rhAdapter.setRawFrameTap((text) => host.forwardFeed(text)); }
+      // Trigger-first: every feed message, complete, into its order buffer.
+      if (trigFirst) { const tf = trigFirst; rhAdapter.setFeedMsgTap((msgs, at) => tf.onFeedMsgs(msgs, at)); }
       chainManager.register(rhAdapter);
 }
 if (chainOn('monad')) chainManager.register(new MonadAdapter());
@@ -4580,6 +4633,8 @@ for (let i = 0; i < resolved.length; i++) {
                         // every collection so each hour's numbers stand alone.
                         let fastLine: string | null = null;
                         try { fastLine = localSim?.takeHourLine() ?? null; } catch { /* reporting only */ }
+                        // Trigger-first hour line (also logged as "[trigger-first] hour: ...").
+                        try { const tl = trigFirst?.takeHourLine() ?? null; if (tl) fastLine = fastLine ? `${fastLine}\n${tl}` : tl; } catch { /* reporting only */ }
                         // Added only if the message stays under Telegram's 4,096-character limit.
                         const withFast = (text: string) => { const t = fastLine ? `${text}\n⚡ ${escHtml(fastLine)}` : text; return t.length <= 4096 ? t : text; };
                         // 4-hour totals: this collection's numbers, copied once, with the

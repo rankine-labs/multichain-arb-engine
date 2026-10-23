@@ -25,6 +25,8 @@
 //   db.rs               connects revm to our state view (+ overrides), detects misses
 //   rawtx.rs            decodes signed transactions and recovers who sent them
 //   run.rs              run_calls(): the main entry point
+//   ordered.rs          trigger-first: feed transactions in sequence order
+//                       (several blocks), then our calls, strictly watched
 //   search.rs           size_search(): finds the most profitable trade size
 //   proto_types.rs      socket request/answer shapes + handle_call/handle_size_search
 //   fixture.rs, cli.rs  test files (fixtures) and the check-fixture/bench-fixture commands
@@ -37,6 +39,8 @@ pub mod cli;
 pub mod db;
 pub mod fixture;
 pub mod hexutil;
+// Trigger-first: replay the feed's ordered transactions, then our calls.
+pub mod ordered;
 pub mod overrides;
 pub mod proto_types;
 pub mod rawtx;
@@ -97,6 +101,29 @@ pub enum UnknownReason {
     BadRequest,
     /// Anything else that went wrong inside the engine.
     Engine,
+    /// Trigger-first (check/ordered.rs): the feed messages we were given
+    /// don't reach back to the copy's block, or skip a message.
+    FeedGap,
+    /// Trigger-first: the order is not certain (trigger not where the feed
+    /// says, seen twice, block / sequence numbers don't line up).
+    FeedOrder,
+    /// Trigger-first: a feed message in the range holds something we can't
+    /// replay (deposit, retryable, a transaction the bot couldn't unpack).
+    FeedUnreplayable,
+    /// Trigger-first: a replayed transaction looked at something we only
+    /// pretended or can't know exactly (an unknown sender's balance / code,
+    /// BASEFEE, COINBASE, a sender's balance after fees we didn't charge).
+    ReplayWatch,
+    /// Trigger-first: our check's pretend-state (the test contract's
+    /// funding) overlaps what the replayed transactions read, so it could
+    /// have changed how they ran.
+    FundingOverlap,
+    /// Trigger-first: a replayed transaction (or our call, in strict mode)
+    /// read or wrote a value copy 2 holds but does NOT follow exactly at the
+    /// snapshot's block (a fill re-read only every minute, possibly placed
+    /// at an older version): replaying the feed on top of it could apply a
+    /// change twice, or miss one.
+    StaleFill,
 }
 
 impl UnknownReason {
@@ -108,6 +135,12 @@ impl UnknownReason {
             UnknownReason::UnsupportedTx => "unsupported_tx",
             UnknownReason::BadRequest => "bad_request",
             UnknownReason::Engine => "engine_error",
+            UnknownReason::FeedGap => "feed_gap",
+            UnknownReason::FeedOrder => "feed_order",
+            UnknownReason::FeedUnreplayable => "feed_unreplayable",
+            UnknownReason::ReplayWatch => "replay_watch",
+            UnknownReason::FundingOverlap => "funding_overlap",
+            UnknownReason::StaleFill => "stale_fill",
         }
     }
 }

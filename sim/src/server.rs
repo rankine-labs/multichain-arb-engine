@@ -233,6 +233,11 @@ pub fn handle_tm(ctx: &Ctx, req: &Value, tm: &mut Tm) -> Value {
                 Err(e) => return bad_request(&id, &format!("call: {e}")),
             };
             tm.prep_us = t0.elapsed().as_micros() as u64;
+            // Trigger-first (check/ordered.rs): the feed's transactions in
+            // sequence order on a copy version, then our calls.
+            if let Some(f) = r.feed.as_ref().filter(|f| !f.is_null()) {
+                return trig_check(ctx, &id, &r, f, t0, tm);
+            }
             check(ctx, &id, &r.at, t0, tm, |view, c| handle_call(view, c, &r))
         }
         Some("size_search") => {
@@ -335,6 +340,95 @@ fn check_inner(ctx: &Ctx, id: &Value, at: &Value, t0: Instant, tm: &mut Tm, run:
             return unknown(id, e.reason, &e.detail, t0.elapsed().as_micros() as u64);
         }
     };
+    after_pick(ctx, picked, t0, tm, &run, true)
+}
+
+/// Trigger-first check (`call` with `feed`, see check/ordered.rs): pick the
+/// copy version for `at` (the bot asks for the newest), work out which feed
+/// messages it already holds, replay the rest in sequence order, then our
+/// calls. Everything after that is the same as any check (copy 2's lower
+/// bound / far-above runs, reports-pending rule, "unsure pool" label),
+/// EXCEPT that missing items are NOT queued for fetching here: node reads
+/// for trigger-first checks only happen through the bot's budgeted warming
+/// (execution/triggerFirst.ts TrigWarmer -> `warm`).
+fn trig_check(ctx: &Ctx, id: &Value, r: &CallRequest, feed_v: &Value, t0: Instant, tm: &mut Tm) -> Value {
+    let mut a = trig_inner(ctx, id, r, feed_v, t0, tm);
+    let used = tm.prep_us + tm.resolve_us + tm.facts_us + tm.runs_us.iter().sum::<u64>();
+    tm.post_us = (t0.elapsed().as_micros() as u64).saturating_sub(used);
+    a["t"] = tm.json();
+    a
+}
+
+fn trig_inner(ctx: &Ctx, id: &Value, r: &CallRequest, feed_v: &Value, t0: Instant, tm: &mut Tm) -> Value {
+    let sh = &ctx.shared;
+    let feed: crate::check::ordered::WireFeed = match serde_json::from_value(feed_v.clone()) {
+        Ok(f) => f,
+        Err(e) => return bad_request(id, &format!("feed: {e}")),
+    };
+    // The plan sets every block detail itself; mixing in other ways of
+    // changing the state or the block would make the order unclear.
+    if !r.raw_txs.is_empty() || !r.block_overrides.is_null() || r.next_block {
+        return bad_request(id, "feed can't be combined with rawTxs / blockOverrides / nextBlock");
+    }
+    Stats::inc(&sh.stats.checks);
+    let at = match parse_at(&r.at) {
+        Ok(a) => a,
+        Err(e) => return bad_request(id, &e),
+    };
+    if matches!(at, At::Pinned { .. }) {
+        return bad_request(id, "feed checks run on the live copy, not on pinned blocks");
+    }
+    let t_res = Instant::now();
+    let resolved = sh.resolve(&at);
+    tm.resolve_us = t_res.elapsed().as_micros() as u64;
+    let picked = match resolved {
+        Ok(p) => p,
+        Err(e) => {
+            Stats::inc(&sh.stats.checks_unknown);
+            return unknown(id, e.reason, &e.detail, t0.elapsed().as_micros() as u64);
+        }
+    };
+    let (plan, info) = match crate::check::ordered::build_plan(&feed, picked.seq, sh.cfg.l2_offset, &picked.ctx) {
+        Ok(x) => x,
+        Err(u) => {
+            Stats::inc(&sh.stats.checks_unknown);
+            return crate::check::proto_types::unknown_json(id, &u, t0.elapsed().as_micros());
+        }
+    };
+    // Which copy values are exact at the version's block (copy 2: only what
+    // it follows from reports; copy 1 replays everything: all of them).
+    let block = picked.seq + sh.cfg.l2_offset;
+    let prov: Box<dyn crate::check::ordered::Provenance> = match &ctx.copy2 {
+        Some(c) => Box::new(c.provenance_at(block, &override_code_accounts(&r.overrides))),
+        None => Box::new(crate::check::ordered::AllExact),
+    };
+    let strict = trig_call_strict();
+    let run = |view: &dyn StateRead, _c: &BlockCtx| crate::check::proto_types::handle_trig_call(view, &plan, &info, r, prov.as_ref(), strict);
+    after_pick(ctx, picked, t0, tm, &run, false)
+}
+
+/// ARBSIM_TRIG_CALL_TRUST (read once): `strict` [default] = our own calls in
+/// a trigger-first check may only use copy values that are exact at the
+/// block, like the replayed transactions; `copy2` = our calls get the same
+/// trust as every other copy-2 check (fills re-read every minute), while the
+/// replayed transactions stay strict.
+pub fn trig_call_strict() -> bool {
+    static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *S.get_or_init(|| std::env::var("ARBSIM_TRIG_CALL_TRUST").map(|v| v.trim() != "copy2").unwrap_or(true))
+}
+
+/// Accounts a request gives contract code by override (the test contract).
+fn override_code_accounts(ov: &Value) -> Vec<revm::primitives::Address> {
+    ov.as_object()
+        .map(|o| o.iter().filter(|(_, v)| v.get("code").is_some()).filter_map(|(k, _)| crate::check::hexutil::parse_address(k).ok()).collect())
+        .unwrap_or_default()
+}
+
+/// Run the check on the picked version and judge the answer (shared by
+/// normal and trigger-first checks). `learn`: queue missing items for
+/// fetching and count them in copy 2's status (normal checks only).
+fn after_pick(ctx: &Ctx, picked: crate::state::mirror::Picked, t0: Instant, tm: &mut Tm, run: &impl Fn(&dyn StateRead, &BlockCtx) -> Value, learn: bool) -> Value {
+    let sh = &ctx.shared;
     let block = picked.seq + sh.cfg.l2_offset;
     // Copy 2: one registry summary for the whole check (checkcore.rs: no
     // waiting for the copy's thread while it is valid for this version).
@@ -349,7 +443,7 @@ fn check_inner(ctx: &Ctx, id: &Value, at: &Value, t0: Instant, tm: &mut Tm, run:
             tm.runs_us.push(t.elapsed().as_micros() as u64);
             a
         }
-        Some(c) => copy2_run(c, core.as_deref().expect("copy 2 core"), &view, block, &picked.ctx, tm, &run),
+        Some(c) => copy2_run(c, core.as_deref().expect("copy 2 core"), &view, block, &picked.ctx, tm, run),
     };
     if ctx.copy2.is_none() {
         ctx.updater.touched(view.take_touched());
@@ -373,7 +467,7 @@ fn check_inner(ctx: &Ctx, id: &Value, at: &Value, t0: Instant, tm: &mut Tm, run:
         let missing = parse_missing(&answer);
         if !missing.is_empty() {
             Stats::inc(&sh.stats.misses);
-            if let Some(c) = &ctx.copy2 {
+            if let (Some(c), true) = (&ctx.copy2, learn) {
                 c.note_misses(&missing);
             }
             // Copy 2: missing because a pool on the route isn't ready?
@@ -384,11 +478,11 @@ fn check_inner(ctx: &Ctx, id: &Value, at: &Value, t0: Instant, tm: &mut Tm, run:
         }
         // Copy 2: every unanswered check counted by its reason (status
         // checks.unknownBy) and, for misses, by what it missed (blockedBy).
-        if let Some(c) = &ctx.copy2 {
+        if let (Some(c), true) = (&ctx.copy2, learn) {
             let why = answer.get("unknown").and_then(|u| u.as_str()).unwrap_or("error");
             c.note_unknown(why, &missing);
         }
-        if !missing.is_empty() {
+        if !missing.is_empty() && learn {
             ctx.fill(missing);
         }
     }
