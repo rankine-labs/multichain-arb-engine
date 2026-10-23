@@ -255,11 +255,13 @@ safety net. No size search on this path (it would run without the replay).
 |---|---|
 | `LOCAL_SIM_TRIGGER_FIRST=off` or missing (default) | Nothing at all (no buffer, no extra work). |
 | `LOCAL_SIM_TRIGGER_FIRST=shadow` | **Practice.** Asked for every Robinhood trigger trade, logged next to what the existing path decided and when. Never sends. |
-| `LOCAL_SIM_TRIGGER_FIRST=on` | A SURE answer decides (profit: on to the safeguards and the sender; loss / fail: refused as today). Unknown: the existing path, unchanged. Only while the fast check itself is ON (`LOCAL_SIM=on` + `LOCAL_SIM_CONFIRM=yes-fast-check`, not stepped back); otherwise practice. |
+| `LOCAL_SIM_TRIGGER_FIRST=on` | A SURE answer at `TRIG_FIRST_MIN_CONFIDENCE` or better (default medium) decides (profit: on to the safeguards and the sender; loss / fail: refused as today). Unknown: the existing path, unchanged. Only while the fast check itself is ON (`LOCAL_SIM=on` + `LOCAL_SIM_CONFIRM=yes-fast-check`, not stepped back); otherwise practice. |
 
 Needs `LOCAL_SIM` shadow/on and copy 2 running (`ARBSIM_SOURCE=pool-events`).
 
-"Unknown" (the old path decides) whenever anything is not exact:
+Under the strict rules (`TRIG_FIRST_STRICT=1`; since Oct 23 the default is
+"best effort", see below, which turns several of these into named
+assumptions), "unknown" (the old path decides) whenever anything is not exact:
 `miss` (a value the copy doesn't hold, anywhere: routers, coins, other pools,
 hooks, lenders), `stale_fill` (a replayed trade, or our trade, read or wrote a
 value copy 2 only holds as a fill, re-read about once a minute, not followed
@@ -275,12 +277,93 @@ what the replayed trades read), `alignment`, `copy2_*` (a route pool not
 ready, reports not flowing), `trigger_not_in_buffer`, plus the usual
 `unsure_pool`, `pending_reports`, `pool_manager_balance`, `deadline`.
 
-Strictness of OUR trade (arbsim side): `ARBSIM_TRIG_CALL_TRUST=strict`
-(default) = our trade may only use values copy 2 follows exactly too;
-`ARBSIM_TRIG_CALL_TRUST=copy2` = our trade gets the same trust as every other
-copy-2 check (fills), while the replayed trades stay strict. Expect strict to
-answer far less often (most coins keep settings / proxy pointers copy 2 only
-holds as fills): shadow numbers decide whether to relax it.
+### Best effort + confidence (Oct 23)
+
+Owner's rule: "we don't need perfect knowledge of every transaction; we need
+sufficiently accurate predictions, fast execution, and measured results
+showing that wins outweigh failed-trade gas". A wrong prediction costs only
+gas (~0.0000088 ETH, about 3 cents: the contract reverts any trade under its
+on-chain minimum, `InsufficientProfit`); a late perfect answer earns nothing.
+With the $0.25 send minimum, about 1 win in 9 sends breaks even.
+
+So instead of "unknown", the fast check may now make a few NAMED assumptions
+(details: `sim/src/check/ordered.rs`, "BEST EFFORT"), each written into the
+answer and measured:
+
+| Assumption | What it means |
+|---|---|
+| `sender_funds` | Values that belong to a replayed transaction's own sender (its ETH balance / nonce, its coin balances and allowances, Permit2 allowances it holds) are assumed to be enough: the sequencer accepted the transaction. Everything that decides what the trade does to the pools stays exact (amounts and limits in its data, pool state, router / pool / hook code). A trade that reverts on its own slippage limit is still computed exactly; one that fails with a "not enough funds / allowance, bad nonce / signature" error after reading an assumed value = unknown (`sender_funds_revert`). |
+| `recent_fill` | A replayed transaction read a value copy 2 holds only as a fill (re-read about once a minute). |
+| `call_fill` | Our own trade read such a value (the same trust every other copy-2 check has). |
+| `skipped_unrelated:N` | N feed transactions we couldn't run (they needed values we don't hold) were left out: they never used our route's state before the missing value, and neither their `to` nor their data names our route's pools, our V4 pool ids, or both coins of one of our pools. |
+| `skipped_related:N` | Same, but the transaction NAMES our route (it might touch it). |
+
+A transaction that used our route's state and THEN needed a value we don't
+hold is still unknown. The trigger itself is never skipped.
+
+**Confidence** of each answer: `high` = nothing assumed; `medium` = only
+sender_funds / recent_fill / call_fill / skipped_unrelated; `low` = a skipped
+transaction that might matter (skipped_related).
+
+Still unknown (we truly can't run it): unsupported transaction kinds,
+messages we can't unpack, sequence gaps / copy too far behind, missing code /
+state of our route or of the trigger's own path (other than its sender's
+funds), GASPRICE / BASEFEE / COINBASE reads, engine errors.
+
+| Setting (bot `.env`) | Default | What it does |
+|---|---|---|
+| `TRIG_FIRST_MIN_CONFIDENCE` | `medium` | Lowest confidence that may SEND in `on` mode (`high` / `medium` / `low`). Lower answers go to the existing path, unchanged. Shadow logs every level. |
+| `TRIG_FIRST_STRICT` | `0` | `1` = no assumptions at all (the old strict rules). |
+| `TRIG_FIRST_ASSUME` | `sender_funds,recent_fill,skip` | Which assumptions are allowed. |
+
+arbsim side: `ARBSIM_TRIG_CALL_TRUST=best` (default) = the above;
+`strict` = no assumptions at all (the old default); `copy2` = the old opt-in
+(replays strict, our trade trusted like any copy-2 check, unlabelled).
+
+What to read: `trig_first` log lines now carry `conf`, `as` (assumptions)
+and `skp` (feed transactions left out); the hourly `[trigger-first] hour:`
+line adds `confidence high a, medium b, low c`, `agree by confidence: ...;
+by assumption: ...` (the later same-block re-check split by level and by
+assumption kind, `exact` = none: this is how we see which assumptions are
+safe), and in `on` mode `held back by the confidence floor`.
+
+### Scoreboard: live-money truth, and the bot adjusting itself
+
+Every REAL send is written down (`src/report/scoreboard.ts`) with its path
+(`trig_first`, `copy2`, `node`, `guess` = sent on the model with check-first
+off, `gap` = standing gap, `loop`), trigger-first's confidence and
+assumptions, the expected profit, and, once the receipt is in: won / failed
+on chain, the profit won (the contract's Executed event; if it couldn't be
+priced: the expected profit, marked "at expected"), gas in ETH and USD.
+
+- Hourly: log line `[scoreboard] hour: ...` and a `📊 Scoreboard` block in the
+  hourly Telegram message: sends, wins, win rate, won, gas, NET, break-even
+  win rate (= average gas per send / average profit per win: the win rate at
+  which wins exactly pay for all the gas), per path and (trigger-first) per
+  confidence; today's totals (Toronto day); paused buckets.
+- File: `data/scoreboard.jsonl`, one line per settled send (`k:"send"`), plus
+  `k:"pause"` / `k:"stepback"` lines; kept under 2 MB (older half in `.1`).
+  A restart reloads it.
+- **Bucket pause**: each send belongs to buckets (path, confidence,
+  assumption kind; `exact` = none). When a bucket's latest sends (at least 12,
+  at most 50) together lost money, that bucket stops sending for 6 h (log +
+  Telegram `⏸`), then starts counting from zero. A paused trigger-first
+  bucket hands the trade to the existing path.
+- **Overall step back**: if every real send of the last 3 h together lost
+  more than $1.50, trigger-first goes back to practice for 6 h by itself
+  (log + Telegram `⚠️ TRIGGER-FIRST stepped back`; kept across a restart).
+
+| Setting | Default |
+|---|---|
+| `SCORE_SELF_ADJUST` | `1` (`0` = report only, never pause) |
+| `SCORE_BUCKET_MIN_SENDS` / `SCORE_BUCKET_WINDOW` / `SCORE_BUCKET_PAUSE_H` | 12 / 50 / 6 |
+| `SCORE_STEPBACK_NET_USD` / `SCORE_STEPBACK_WINDOW_H` / `SCORE_STEPBACK_H` | 1.5 / 3 / 6 |
+| `SCOREBOARD_FILE` / `SCOREBOARD_MAX_BYTES` | `data/scoreboard.jsonl` / 2000000 |
+
+**Standing-gap fail block**: standing gaps still ignore the 6 h live route
+block by design (each is sent right after its own fresh real check), but a
+pool pair whose standing-gap LIVE trade failed on chain is not sent again as
+a standing gap for `GAP_LIVE_FAIL_BLOCK_MIN` minutes (default 30, 0 = off).
 
 What to read:
 - `data/local-sim-shadow.jsonl` lines `"k":"trig_first"` (one per trigger,
@@ -311,9 +394,9 @@ Other settings (defaults): `TRIG_FIRST_BUFFER_MSGS` (600 feed messages kept),
 `TRIG_FIRST_AGREE_PER_HOUR` (600 later re-checks, fast check only),
 `TRIG_FIRST_AGREE_WAIT_MS` (5000), `TRIG_FIRST_LOG_AFTER_MS` (8000).
 
-Not built (option for later): an automatic step back to practice when the
-later same-state re-checks disagree too often (like the fast check's own
-1-in-10 node re-checks).
+Built since (Oct 23): the scoreboard's automatic step back on REAL money
+lost (above). Not built (option for later): a step back when the later
+same-state re-checks disagree too often.
 
 ## Rarely needed settings
 

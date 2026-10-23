@@ -20,6 +20,7 @@ export interface LiveResult {
   label: string;
   status: 'profit' | 'reverted' | 'dropped';
   gasUsd: number;
+  gasEth?: number;            // gas paid in ETH (scoreboard)
   profitTokenUnits?: bigint;  // raw profit from the Executed event
   profitUsd?: number;
   expectedProfitUsd: number;
@@ -77,7 +78,8 @@ export class LiveTradeTracker {
   // Pure-ish: turns a receipt into a result (exported for tests via record()).
   record(hash: string, meta: { expectedProfitUsd: number; label: string; routeKey?: string; sizeUsd?: number; funding?: Funding }, receipt: Pick<ethers.TransactionReceipt, 'status' | 'gasUsed' | 'gasPrice' | 'logs'>) {
     const gasWei = receipt.gasUsed * (receipt.gasPrice ?? 0n);
-    const gasUsd = Number(ethers.formatEther(gasWei)) * this.d.ethUsd();
+    const gasEth = Number(ethers.formatEther(gasWei));
+    const gasUsd = gasEth * this.d.ethUsd();
     this.d.noteGasUsed(receipt.gasUsed, { hash, routeKey: meta.routeKey, success: receipt.status === 1 });
     if (receipt.status === 1) {
       const ev = receipt.logs.find((l) => l.topics[0] === EXECUTED_TOPIC);
@@ -90,12 +92,12 @@ export class LiveTradeTracker {
       }
       const net = (profitUsd ?? 0) - gasUsd;
       if (net < 0) this.d.recordLoss(-net);
-      this.push({ hash, label: meta.label, status: 'profit', gasUsd, profitTokenUnits, profitUsd, expectedProfitUsd: meta.expectedProfitUsd, sizeUsd: meta.sizeUsd, funding: meta.funding });
+      this.push({ hash, label: meta.label, status: 'profit', gasUsd, gasEth, profitTokenUnits, profitUsd, expectedProfitUsd: meta.expectedProfitUsd, sizeUsd: meta.sizeUsd, funding: meta.funding });
       void this.d.notify(`✅ <b>TRADE WON</b> · ${meta.label}\nProfit ${profitUsd !== undefined ? '$' + profitUsd.toFixed(2) : '?'} · gas $${gasUsd.toFixed(2)} · expected $${meta.expectedProfitUsd.toFixed(2)}\n<code>${hash}</code>`);
     } else {
       // Reverted: someone was faster or the price moved. Only gas is lost.
       this.d.recordLoss(gasUsd);
-      this.push({ hash, label: meta.label, status: 'reverted', gasUsd, expectedProfitUsd: meta.expectedProfitUsd, sizeUsd: meta.sizeUsd, funding: meta.funding });
+      this.push({ hash, label: meta.label, status: 'reverted', gasUsd, gasEth, expectedProfitUsd: meta.expectedProfitUsd, sizeUsd: meta.sizeUsd, funding: meta.funding });
       void this.d.notify(`❌ <b>TRADE REVERTED</b> · ${meta.label}\nLost the race or price moved · gas $${gasUsd.toFixed(2)}\n<code>${hash}</code>`);
     }
   }

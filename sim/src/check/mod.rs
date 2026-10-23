@@ -124,6 +124,11 @@ pub enum UnknownReason {
     /// at an older version): replaying the feed on top of it could apply a
     /// change twice, or miss one.
     StaleFill,
+    /// Trigger-first, best effort: a replayed transaction read a value of
+    /// its own sender that we only ASSUMED was enough (its coin balance or
+    /// allowance) and then failed with a "not enough funds / bad
+    /// signature / bad nonce" error: our guess may be what failed it.
+    SenderFunds,
 }
 
 impl UnknownReason {
@@ -141,6 +146,7 @@ impl UnknownReason {
             UnknownReason::ReplayWatch => "replay_watch",
             UnknownReason::FundingOverlap => "funding_overlap",
             UnknownReason::StaleFill => "stale_fill",
+            UnknownReason::SenderFunds => "sender_funds_revert",
         }
     }
 }

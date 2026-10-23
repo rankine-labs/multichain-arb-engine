@@ -18,7 +18,9 @@
 mod check_util;
 
 use arbsim::arb::BlockCtx;
-use arbsim::check::ordered::{build_plan, run_ordered, AllExact, OrderedOut, PlanInfo, Provenance, WireFeed, WireFeedMsg};
+use arbsim::check::ordered::{
+    assumed_funds, build_plan, funds_error, run_ordered, run_ordered_with, AllExact, Assume, Assumed, OrderedOut, PlanInfo, Provenance, Route, WireFeed, WireFeedMsg,
+};
 use arbsim::check::{CallReq, CheckUnknown, Overrides, UnknownReason};
 use arbsim::state::mem::MemState;
 use arbsim::state::MissItem;
@@ -115,7 +117,7 @@ fn msg(seq: u64, txs: &[Vec<u8>]) -> WireFeedMsg {
 }
 
 fn feed(trigger: &[u8], trigger_seq: u64, msgs: Vec<WireFeedMsg>) -> WireFeed {
-    WireFeed { trigger: hexs(keccak256(trigger).as_slice()), trigger_seq, msgs }
+    WireFeed { trigger: hexs(keccak256(trigger).as_slice()), trigger_seq, msgs, route: vec![], strict: false, assume: None }
 }
 
 /// Our trade: any non-32-byte call to the pool (reverts with the price).
@@ -410,4 +412,351 @@ impl Provenance for NoBalances {
     fn balance_exact(&self, _a: Address) -> bool {
         false
     }
+}
+
+
+// ============================================================================
+// BEST EFFORT (Oct 23): named assumptions instead of "unknown".
+//
+//   COIN       a coin: called with (owner, amount), it takes `amount` from
+//              balance[owner] (slot keccak(owner . 0)); not enough ->
+//              reverts ERC20InsufficientBalance.
+//   COIN_NONCE like a Permit2 nonce check: balance[owner] must be exactly 7,
+//              else reverts InvalidNonce().
+//   ROUTER_F   what users call with (x, limit): pulls x of COIN from the
+//              caller (its SENDER's funds), swaps x on POOL, then reads the
+//              pool price and reverts "SLIP" if it is above `limit` (its own
+//              slippage limit, computed from the pool: exact).
+//   ROUTER_MISS swaps on POOL, then calls an account nobody holds.
+// ============================================================================
+fn coin() -> Address {
+    addr(0x2001)
+}
+fn coin_nonce() -> Address {
+    addr(0x2002)
+}
+fn router_f() -> Address {
+    addr(0x2003)
+}
+fn router_f_nonce() -> Address {
+    addr(0x2004)
+}
+fn router_miss() -> Address {
+    addr(0x2005)
+}
+
+fn sel(sig: &str) -> [u8; 4] {
+    let h = keccak256(sig.as_bytes());
+    [h[0], h[1], h[2], h[3]]
+}
+
+/// PUSH4 selector, shift it to the top, store at 0, REVERT(0, 4).
+fn revert_with(sel4: [u8; 4]) -> Vec<u8> {
+    let mut c = vec![0x63];
+    c.extend_from_slice(&sel4);
+    c.extend(hex("60e0 1b 6000 52 6004 6000 fd"));
+    c
+}
+
+/// Write a 2-byte jump target at `at`.
+fn patch(c: &mut [u8], at: usize, to: usize) {
+    c[at] = (to >> 8) as u8;
+    c[at + 1] = to as u8;
+}
+
+/// keccak(owner . 0) of calldata word 0: the owner's place.
+fn owner_place() -> Vec<u8> {
+    hex("6000 35 6000 52 6000 6020 52 6040 6000 20")
+}
+
+fn coin_code() -> Vec<u8> {
+    let mut c = owner_place();
+    // DUP1 SLOAD CALLDATALOAD(32) DUP1 DUP3 LT PUSH2 fail JUMPI
+    c.extend(hex("80 54 6020 35 80 82 10 61"));
+    let j = c.len();
+    c.extend([0, 0, 0x57]);
+    // SWAP1 SUB SWAP1 SSTORE STOP
+    c.extend(hex("90 03 90 55 00"));
+    let fail = c.len();
+    c.push(0x5b);
+    c.extend(revert_with(sel("ERC20InsufficientBalance(address,uint256,uint256)")));
+    patch(&mut c, j, fail);
+    c
+}
+
+fn coin_nonce_code() -> Vec<u8> {
+    let mut c = owner_place();
+    // SLOAD, == 7 ? ok : revert InvalidNonce()
+    c.extend(hex("54 6007 14 61"));
+    let j = c.len();
+    c.extend([0, 0, 0x57]);
+    c.extend(revert_with(sel("InvalidNonce()")));
+    let ok = c.len();
+    c.extend(hex("5b 00"));
+    patch(&mut c, j, ok);
+    c
+}
+
+/// CALL(gas, to, 0, args 0..size, no return copy).
+fn call_to(c: &mut Vec<u8>, to: Address, size: u8) {
+    c.extend(hex("6000 6000 60"));
+    c.push(size);
+    c.extend(hex("6000 6000 73"));
+    c.extend_from_slice(to.as_slice());
+    c.extend(hex("5a f1"));
+}
+
+fn router_f_code(the_coin: Address) -> Vec<u8> {
+    // mem[0] = CALLER, mem[32] = x; coin.call(owner, x); failed -> bubble
+    let mut c = hex("33 6000 52 6000 35 6020 52");
+    call_to(&mut c, the_coin, 0x40);
+    c.extend(hex("15 61"));
+    let j_bubble = c.len();
+    c.extend([0, 0, 0x57]);
+    // swap x on POOL
+    c.extend(hex("6000 35 6000 52"));
+    call_to(&mut c, pool(), 0x20);
+    c.push(0x50);
+    // the price: POOL reverts InsufficientProfit(price, MAX) for 36 bytes
+    call_to(&mut c, pool(), 0x24);
+    c.push(0x50);
+    // RETURNDATACOPY(0, 4, 32); price > limit -> SLIP
+    c.extend(hex("6020 6004 6000 3e 6000 51 6020 35 10 61"));
+    let j_slip = c.len();
+    c.extend([0, 0, 0x57, 0x00]);
+    let bubble = c.len();
+    c.extend(hex("5b 3d 6000 6000 3e 3d 6000 fd"));
+    let slip = c.len();
+    c.push(0x5b);
+    c.extend(revert_with(*b"SLIP"));
+    patch(&mut c, j_bubble, bubble);
+    patch(&mut c, j_slip, slip);
+    c
+}
+
+fn router_miss_code() -> Vec<u8> {
+    let mut c = hex("6000 35 6000 52");
+    call_to(&mut c, pool(), 0x20);
+    c.push(0x50);
+    call_to(&mut c, addr(0xbad2), 0);
+    c.extend(hex("50 00"));
+    c
+}
+
+/// The copy plus the best-effort contracts. `holder_balance`: the coin
+/// balance the copy holds for KEY_A (None = not held: missing).
+fn copy_be(holder_balance: Option<u64>) -> MemState {
+    let mut s = copy();
+    let place = keccak256([key_address(&KEY_A).into_word().as_slice(), &[0u8; 32]].concat());
+    let held: Vec<(U256, U256)> = holder_balance.map(|b| vec![(U256::from_be_bytes(place.0), U256::from(b))]).unwrap_or_default();
+    add_contract(&mut s, coin(), coin_code(), &held);
+    add_contract(&mut s, coin_nonce(), coin_nonce_code(), &[]);
+    add_contract(&mut s, router_f(), router_f_code(coin()), &[]);
+    add_contract(&mut s, router_f_nonce(), router_f_code(coin_nonce()), &[]);
+    add_contract(&mut s, router_miss(), router_miss_code(), &[]);
+    s
+}
+
+fn route() -> Route {
+    Route { accounts: [pool()].into_iter().collect(), ..Route::default() }
+}
+
+fn best() -> Assume {
+    Assume { sender_funds: true, recent_fill: true, skip: Some(route()) }
+}
+
+fn run_be(view: &MemState, f: &WireFeed, prov: &dyn Provenance, assume: &Assume) -> Result<OrderedOut, CheckUnknown> {
+    let mut b = base();
+    b.l2_block_number = Some(10);
+    let (plan, _) = build_plan(f, 10, 0, &b)?;
+    run_ordered_with(view, &plan, &Overrides::none(), &[our_trade()], prov, true, assume)
+}
+
+fn xl(x: u64, limit: u64) -> Vec<u8> {
+    [w(x), w(limit)].concat()
+}
+
+#[test]
+fn assumed_funds_reads_as_plenty_in_common_layouts() {
+    let v = assumed_funds();
+    let low160 = v & ((U256::from(1u8) << 160usize) - U256::from(1u8));
+    assert!(low160 >= U256::from(1u8) << 150usize, "Permit2 amount");
+    let exp = (v >> 160usize) & ((U256::from(1u8) << 48usize) - U256::from(1u8));
+    assert_eq!(exp, (U256::from(1u8) << 48usize) - U256::from(1u8), "Permit2 expiration: never");
+    assert_eq!(v >> 208usize, U256::ZERO, "Permit2 nonce 0");
+    let low96 = v & ((U256::from(1u8) << 96usize) - U256::from(1u8));
+    assert!(low96 >= U256::from(1u8) << 90usize && low96 < U256::from(1u8) << 95usize, "a 96-bit amount: big, with room to add");
+    assert_eq!(funds_error(&sel("InvalidNonce()")), Some("InvalidNonce()"));
+    let mut wrapped = vec![0xaa; 68];
+    wrapped.extend_from_slice(&sel("ERC20InsufficientBalance(address,uint256,uint256)"));
+    assert!(funds_error(&wrapped).is_some(), "found inside a router's wrapped error too");
+    assert_eq!(funds_error(b"SLIP"), None, "a slippage revert is not a funds error");
+}
+
+#[test]
+fn sender_funds_trigger_whose_coin_balance_we_dont_hold_is_answered_medium() {
+    let trig = stx(&KEY_A, 0, router_f(), xl(5, 1_000));
+    let f = feed(&trig, 11, vec![msg(11, &[trig.clone()])]);
+    // Strict: the sender's coin balance isn't in the copy -> unknown (miss).
+    let u = run_be(&copy_be(None), &f, &AllExact, &Assume::default()).expect_err("strict");
+    assert_eq!(u.reason, UnknownReason::Miss, "{u:?}");
+    assert!(u.missing.iter().any(|m| matches!(m, MissItem::Slot(a, _) if *a == coin())), "{u:?}");
+    // Best effort: assumed enough; the pool effect is exact (5 on 100).
+    let out = run_be(&copy_be(None), &f, &AllExact, &best()).unwrap();
+    assert!(out.replayed[0].outcome.success, "the trigger succeeds");
+    assert_eq!(price_seen(&out), 105);
+    assert_eq!(out.assumed, Assumed { sender_funds: true, ..Assumed::default() });
+    assert_eq!(out.assumed.confidence(), "medium");
+    assert_eq!(out.assumed.labels(), vec!["sender_funds".to_string()]);
+    // The copy holds an exact, sufficient balance: nothing assumed, high.
+    let out = run_be(&copy_be(Some(50)), &f, &AllExact, &best()).unwrap();
+    assert_eq!((price_seen(&out), out.assumed.confidence()), (105, "high"));
+}
+
+#[test]
+fn sender_funds_trigger_reverting_on_its_own_slippage_limit_is_computed_exactly() {
+    // Limit 102, but the swap moves the price to 105: the trigger reverts
+    // on its own limit (computed from the pool), so our trade sees 100.
+    let trig = stx(&KEY_A, 0, router_f(), xl(5, 102));
+    let out = run_be(&copy_be(None), &feed(&trig, 11, vec![msg(11, &[trig.clone()])]), &AllExact, &best()).unwrap();
+    assert!(!out.replayed[0].outcome.success, "the trigger reverts");
+    assert_eq!(&out.replayed[0].outcome.output[..], b"SLIP", "on its slippage limit");
+    assert_eq!(price_seen(&out), 100, "rolled back: our trade sees the old price");
+    assert_eq!(out.assumed.confidence(), "medium");
+    // A held, exact balance that is too small: a real, exact revert (no assumption).
+    let trig = stx(&KEY_A, 0, router_f(), xl(5, 1_000));
+    let out = run_be(&copy_be(Some(1)), &feed(&trig, 11, vec![msg(11, &[trig.clone()])]), &AllExact, &best()).unwrap();
+    assert!(!out.replayed[0].outcome.success);
+    assert_eq!((price_seen(&out), out.assumed.confidence()), (100, "high"));
+}
+
+#[test]
+fn sender_funds_revert_with_a_nonce_error_after_an_assumed_value_is_unknown() {
+    // Our assumed value (nonce 0) is not the 7 the transaction signed for:
+    // it fails InvalidNonce -> our guess may be the cause -> unknown.
+    let trig = stx(&KEY_A, 0, router_f_nonce(), xl(5, 1_000));
+    let u = run_be(&copy_be(None), &feed(&trig, 11, vec![msg(11, &[trig.clone()])]), &AllExact, &best()).expect_err("unknown");
+    assert_eq!(u.reason, UnknownReason::SenderFunds, "{u:?}");
+}
+
+#[test]
+fn sender_funds_value_held_as_a_fill_is_labelled_sender_funds_not_recent_fill() {
+    let trig = stx(&KEY_A, 0, router_f(), xl(5, 1_000));
+    let f = feed(&trig, 11, vec![msg(11, &[trig.clone()])]);
+    // Copy 2 follows the pool and the routers exactly; the coin is a fill.
+    let followed = Followed(vec![pool(), router_f()]);
+    let out = run_be(&copy_be(Some(50)), &f, &followed, &best()).unwrap();
+    assert_eq!(price_seen(&out), 105);
+    assert_eq!(out.assumed, Assumed { sender_funds: true, ..Assumed::default() });
+    // Strict: stale fill.
+    assert_eq!(run_be(&copy_be(Some(50)), &f, &followed, &Assume::default()).expect_err("strict").reason, UnknownReason::StaleFill);
+}
+
+#[test]
+fn replayed_tx_reading_its_senders_eth_balance_is_assumed_with_sender_funds() {
+    let t = stx(&KEY_A, 0, reads_sender_balance(), vec![]);
+    let out = run_be(&copy_be(None), &feed(&t, 11, vec![msg(11, &[t.clone()])]), &AllExact, &best()).unwrap();
+    assert_eq!((price_seen(&out), out.assumed.labels()), (100, vec!["sender_funds".to_string()]));
+    // BASEFEE stays unknown (we don't know the block's real value).
+    let t = stx(&KEY_A, 0, reads_basefee(), vec![]);
+    assert_eq!(run_be(&copy_be(None), &feed(&t, 11, vec![msg(11, &[t.clone()])]), &AllExact, &best()).expect_err("unknown").reason, UnknownReason::ReplayWatch);
+}
+
+#[test]
+fn unrelated_preceding_tx_missing_state_is_skipped_and_recorded() {
+    let trig = stx(&KEY_A, 0, pool(), w(5));
+    let other = stx(&KEY_B, 0, addr(0xbad), w(1));
+    let f = feed(&trig, 12, vec![msg(11, &[other.clone()]), msg(12, &[trig.clone()])]);
+    // Strict: unknown (miss).
+    assert_eq!(run_be(&copy_be(None), &f, &AllExact, &Assume::default()).expect_err("strict").reason, UnknownReason::Miss);
+    // Best effort: skipped, the trigger and our trade exact.
+    let out = run_be(&copy_be(None), &f, &AllExact, &best()).unwrap();
+    assert_eq!(price_seen(&out), 105);
+    assert_eq!(out.replayed.len(), 1, "only the trigger was replayed");
+    assert_eq!((out.assumed.skipped_unrelated, out.assumed.skipped_related), (1, 0));
+    assert_eq!(out.assumed.labels(), vec!["skipped_unrelated:1".to_string()]);
+    assert_eq!(out.assumed.confidence(), "medium");
+    // One that uses a Nitro built-in we don't imitate: the same rules.
+    let builtin = stx(&KEY_B, 0, addr(0x66), w(1));
+    let f = feed(&trig, 12, vec![msg(11, &[builtin]), msg(12, &[trig.clone()])]);
+    assert_eq!(run_be(&copy_be(None), &f, &AllExact, &Assume::default()).expect_err("strict").reason, UnknownReason::UnsupportedPrecompile);
+    let out = run_be(&copy_be(None), &f, &AllExact, &best()).unwrap();
+    assert_eq!((price_seen(&out), out.assumed.skipped_unrelated), (105, 1));
+}
+
+#[test]
+fn preceding_tx_touching_our_pool_is_replayed_exactly() {
+    let trig = stx(&KEY_A, 0, pool(), w(5));
+    let before = stx(&KEY_B, 0, pool(), w(3));
+    let out = run_be(&copy_be(None), &feed(&trig, 12, vec![msg(11, &[before]), msg(12, &[trig.clone()])]), &AllExact, &best()).unwrap();
+    assert_eq!(price_seen(&out), 108, "100 + 3 + 5: both replayed");
+    assert_eq!((out.replayed.len(), out.assumed.confidence()), (2, "high"));
+}
+
+#[test]
+fn tx_that_uses_our_route_then_misses_is_unknown_and_one_that_names_it_is_low() {
+    let trig = stx(&KEY_A, 0, pool(), w(5));
+    // Swaps on our pool, then needs an account we don't hold: unknown.
+    let touch = stx(&KEY_B, 0, router_miss(), w(3));
+    let u = run_be(&copy_be(None), &feed(&trig, 12, vec![msg(11, &[touch]), msg(12, &[trig.clone()])]), &AllExact, &best()).expect_err("unknown");
+    assert_eq!(u.reason, UnknownReason::Miss, "{u:?}");
+    assert!(u.detail.contains("used our route"), "{}", u.detail);
+    assert!(u.missing.contains(&MissItem::Account(addr(0xbad2))), "the miss is reported for warming: {u:?}");
+    // Misses before touching anything, but its data names our pool: it MAY
+    // touch our route -> skipped, LOW confidence.
+    let mut data = vec![0u8; 12];
+    data.extend_from_slice(pool().as_slice());
+    let names = stx(&KEY_B, 0, addr(0xbad), data);
+    let out = run_be(&copy_be(None), &feed(&trig, 12, vec![msg(11, &[names]), msg(12, &[trig.clone()])]), &AllExact, &best()).unwrap();
+    assert_eq!(price_seen(&out), 105);
+    assert_eq!((out.assumed.skipped_related, out.assumed.confidence()), (1, "low"));
+    assert_eq!(out.assumed.labels(), vec!["skipped_related:1".to_string()]);
+    // No route given (skipping not allowed): unknown as before.
+    let no_skip = Assume { skip: None, ..best() };
+    let other = stx(&KEY_B, 0, addr(0xbad), w(1));
+    assert_eq!(run_be(&copy_be(None), &feed(&trig, 12, vec![msg(11, &[other]), msg(12, &[trig.clone()])]), &AllExact, &no_skip).expect_err("no skip").reason, UnknownReason::Miss);
+}
+
+#[test]
+fn the_trigger_itself_is_never_skipped() {
+    let trig = stx(&KEY_A, 0, addr(0xdead), w(5));
+    let u = run_be(&copy_be(None), &feed(&trig, 11, vec![msg(11, &[trig.clone()])]), &AllExact, &best()).expect_err("unknown");
+    assert_eq!(u.reason, UnknownReason::Miss);
+    assert!(u.detail.contains("trigger"), "{}", u.detail);
+}
+
+#[test]
+fn recent_fill_is_allowed_with_a_label_and_strict_restores_unknown() {
+    // The trigger reads DEP, a fill (not followed): best effort answers, labelled.
+    let trig = stx(&KEY_A, 0, router(), w(5));
+    let f = feed(&trig, 11, vec![msg(11, &[trig.clone()])]);
+    let followed = Followed(vec![pool(), router()]);
+    let out = run_be(&copy_be(None), &f, &followed, &best()).unwrap();
+    assert_eq!(price_seen(&out), 110);
+    assert_eq!((out.assumed.labels(), out.assumed.confidence()), (vec!["recent_fill".to_string()], "medium"));
+    assert_eq!(run_be(&copy_be(None), &f, &followed, &Assume::default()).expect_err("strict").reason, UnknownReason::StaleFill);
+    // Our own call on a fill: call_fill.
+    let read_dep = CallReq { from: caller(), to: Some(dep()), data: Bytes::new(), gas: Some(100_000), value: U256::ZERO };
+    let mut b = base();
+    b.l2_block_number = Some(10);
+    let (plan, _) = build_plan(&feed(&trig, 10, vec![]), 10, 0, &b).unwrap();
+    let out = run_ordered_with(&copy_be(None), &plan, &Overrides::none(), &[read_dep], &Followed(vec![pool()]), true, &best()).unwrap();
+    assert_eq!(out.assumed.labels(), vec!["call_fill".to_string()]);
+}
+
+#[test]
+fn route_names_rule() {
+    let r = Route {
+        accounts: [pool()].into_iter().collect(),
+        ids: vec![B256::with_last_byte(9)],
+        pairs: vec![(addr(0x3001), addr(0x3002)), (Address::ZERO, addr(0x3003))],
+        ..Route::default()
+    };
+    assert!(r.named_by(Some(pool()), &[]), "sent to our pool");
+    assert!(r.named_by(None, &[&[1u8; 3][..], pool().as_slice()].concat()), "pool address in the data");
+    assert!(r.named_by(None, B256::with_last_byte(9).as_slice()), "our V4 pool id in the data");
+    assert!(r.named_by(None, &[addr(0x3001).as_slice(), addr(0x3002).as_slice()].concat()), "both coins of one of our pools");
+    assert!(!r.named_by(None, addr(0x3001).as_slice()), "one coin alone is not enough");
+    assert!(!r.named_by(None, &[[0u8; 40].as_slice(), addr(0x3003).as_slice()].concat()), "an ETH pair (zero address) is left out");
+    assert!(!r.named_by(Some(addr(0x77)), &w(1)), "unrelated");
 }
