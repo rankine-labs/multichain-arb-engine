@@ -157,6 +157,31 @@ function v4Of(p: PoolState) { return (p as any).v4 as { poolManager: string; fee
   // copy2-s: how many bits of its balance word does each coin count?
   // (balanceOf(PoolManager) with raw = real + 2^k, k = 40..255), its
   // totalSupply and decimals.
+  // copy2-t: which USDG slots totalSupply() / balanceOf(PM) read, and does
+  // eth_getProof answer them (copy 2's fills use it)?
+  if (process.env.PROBE_SLOTS) {
+    const tag = BLOCKS[0];
+    for (const [nm, data] of [['totalSupply', ethers.id('totalSupply()').slice(0, 10)], ['balanceOf(PM)', ethers.id('balanceOf(address)').slice(0, 10) + pad(PM)], ['decimals', ethers.id('decimals()').slice(0, 10)]] as const) {
+      const r = await rpc('eth_createAccessList', [{ to: USDG, data }, tag]);
+      say(`USDG ${nm}: accessList ${short(r.error ?? r.result, 1500)}`);
+      const list: any[] = r.result?.accessList ?? [];
+      for (const e of list) {
+        if (!e.storageKeys?.length) continue;
+        const pr = await rpc('eth_getProof', [e.address, e.storageKeys, tag]);
+        say(`  getProof ${e.address}: ${pr.error ? 'ERR ' + short(pr.error, 200) : short(pr.result.storageProof.map((x: any) => [x.key, x.value]), 1200)}`);
+        for (const k of e.storageKeys) say(`  getStorageAt ${e.address} ${k} = ${(await rpc('eth_getStorageAt', [e.address, k, tag])).result}`);
+      }
+    }
+    // Same for the stock coin.
+    const r = await rpc('eth_createAccessList', [{ to: coin, data: ethers.id('totalSupply()').slice(0, 10) }, tag]);
+    say(`${WANT} totalSupply accessList ${short(r.error ?? r.result, 800)}`);
+    // Does totalSupply move between recent blocks?
+    const latest = Number((await rpc('eth_blockNumber', [])).result);
+    const seen: string[] = [];
+    for (const back of [0, 50, 200, 1000, 3000]) seen.push(`${back}: ${big(await view(USDG, 'totalSupply()', '', hex(latest - back)))}`);
+    say(`USDG totalSupply blocks back ${seen.join(' | ')}`);
+    process.exit(0);
+  }
   if (process.env.PROBE_WIDTH) {
     const tag = BLOCKS[0];
     const abi = ethers.AbiCoder.defaultAbiCoder();
