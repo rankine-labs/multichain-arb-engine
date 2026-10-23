@@ -471,7 +471,9 @@ fn trig_discover_inner(ctx: &Ctx, id: &Value, req: &Value, t0: Instant, tm: &mut
     let prov = c2.provenance_at(block, &[]);
     // Same assumptions as a trigger-first check (no skipping: only the
     // trigger runs, and the trigger is never skipped).
-    let (strict, assume) = trig_assume(trig_trust(), &feed, |_| None);
+    let (strict, mut assume) = trig_assume(trig_trust(), &feed, |_| None);
+    // Write down the hashes it computes: which pool a changed mapping value belongs to.
+    assume.record_hashes = true;
     let snap_block = info.snap_block;
     let run = |view: &dyn StateRead, _c: &BlockCtx| -> Value {
         match crate::check::ordered::run_ordered_with(view, &alone, &crate::check::Overrides::none(), &[], &prov, strict, &assume) {
@@ -484,9 +486,14 @@ fn trig_discover_inner(ctx: &Ctx, id: &Value, req: &Value, t0: Instant, tm: &mut
                         conf = "medium";
                     }
                 }
+                // Only the pools' OWN state counts (check/moved.rs).
+                let moved = c2.pools_changed(&out.changed, &out.hashes);
                 json!({
                     "id": id, "ok": true,
-                    "changed": out.changed.iter().map(|(a, s)| json!([format!("{a:#x}"), format!("{s:#x}")])).collect::<Vec<_>>(),
+                    "pools": moved.iter().map(|m| m.key.clone()).collect::<Vec<_>>(),
+                    // Debug: which kinds of each pool's values changed (first 8 pools).
+                    "moved": moved.iter().take(8).map(|m| json!([m.key.clone(), m.kinds.clone()])).collect::<Vec<_>>(),
+                    "changed": out.changed.len(),
                     "triggerOk": out.replayed.first().map(|r| r.outcome.success),
                     "conf": conf, "assumed": labels, "snapBlock": snap_block,
                 })
@@ -495,24 +502,6 @@ fn trig_discover_inner(ctx: &Ctx, id: &Value, req: &Value, t0: Instant, tm: &mut
         }
     };
     let mut a = after_pick(ctx, picked, t0, tm, &run, false);
-    // The changed storage -> the pools copy 2 follows (keys as the bot names them).
-    if a.get("ok") == Some(&Value::Bool(true)) {
-        let changed: Vec<(revm::primitives::Address, revm::primitives::U256)> = a
-            .get("changed")
-            .and_then(|c| c.as_array())
-            .map(|l| {
-                l.iter()
-                    .filter_map(|p| {
-                        let ad = crate::check::hexutil::parse_address(p.get(0)?.as_str()?).ok()?;
-                        let sl = crate::check::hexutil::parse_u256(p.get(1)?.as_str()?).ok()?;
-                        Some((ad, sl))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        a["pools"] = json!(c2.pools_changed(&changed));
-        a["changed"] = json!(changed.len());
-    }
     a["us"] = json!(t0.elapsed().as_micros() as u64);
     a
 }
@@ -562,7 +551,7 @@ pub fn trig_assume(trust: TrigTrust, feed: &crate::check::ordered::WireFeed, rou
     }
     let allow = |k: &str| feed.assume.as_ref().is_none_or(|l| l.iter().any(|x| x.trim() == k));
     let skip = if allow("skip") && !feed.route.is_empty() { route_of(&feed.route) } else { None };
-    (true, Assume { sender_funds: allow("sender_funds"), recent_fill: allow("recent_fill"), skip })
+    (true, Assume { sender_funds: allow("sender_funds"), recent_fill: allow("recent_fill"), skip, record_hashes: false })
 }
 
 /// Accounts a request gives contract code by override (the test contract).

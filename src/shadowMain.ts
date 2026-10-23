@@ -78,7 +78,7 @@ import { RobinhoodChainAdapter } from './chains/robinhoodChain';
 import { createLocalSimHost, LocalSimHost, LocalCheck, LocalKind, LocalOutcome } from './execution/localSimHost';
 import { TriggerFirst, trigFirstSettings, TrigOutcome } from './execution/triggerFirst';
 import { Scoreboard, SendPath, Confidence as ScoreConfidence, standingGapFailBlock, entryFailBlock } from './report/scoreboard';
-import { TrigEntry, EntryCandidate, entrySettings, enumerateRoutes } from './execution/trigEntry';
+import { TrigEntry, EntryCandidate, entrySettings, enumerateRoutes, rankRoutes } from './execution/trigEntry';
 import { runCheckFirst } from './execution/checkFirstFlow';
 import { MonadAdapter } from './chains/monad';
 import { AvalancheAdapter } from './chains/avalanche';
@@ -2904,8 +2904,9 @@ localSim = createLocalSimHost(chainOn('robinhood'), {
 // (liveBlocker), both coins on the allowed list, size caps (MAX_TRADE_USD,
 // own-money wallet, auto-vetted coin limit), the lender buildCheck picks.
 type EntryHost = { buy: any; sell: any; tokenIn: string; tokenOut: string; usdPer: number };
-const entryCandidatesFor = (keys: string[]): EntryCandidate[] => {
+const entryCandidatesFor = (keys: string[], limit: number): { cands: EntryCandidate[]; found: number } => {
       const lc = (x: string) => (x ?? '').toLowerCase();
+      // 1. List the routes (cheap tuples, nothing built yet).
       const routes = enumerateRoutes<any>(keys, {
             pool: (k) => cache.get('robinhood', k) ?? cache.allForChain('robinhood').find((x: any) => lc(x.poolAddress) === lc(k)),
             peers: (p) => cache.findPeerPools('robinhood', p.tokenA, p.tokenB, p.poolAddress),
@@ -2914,14 +2915,35 @@ const entryCandidatesFor = (keys: string[]): EntryCandidate[] => {
             coinAllowed: (t) => safetyGate.isAllowed(t),
             venueBlocked: (buy, sell) => liveBlocker(buy, sell),
       });
+      // 2. Rank and cap BEFORE building: a start coin we hold first (own
+      //    money, live: the wallet has at least the smallest ladder size),
+      //    then the model's quick price check at that size (no node).
+      const smallest = trigEntry?.settings.sizesUsd[0] ?? 50;
+      const usdOf = (t: string) => priceOracle.getUsdPrice('robinhood', t) ?? 0;
+      const decOf = (t: string) => TOKEN_DECIMALS.robinhood?.[lc(t)];
+      const ownOnly = RH_OWN_MONEY && !approvedLenders('robinhood').size;
+      const held = (r: { tokenIn: string }) => {
+            if (!ownOnly || !robinhoodSender.live) return true;
+            const d = decOf(r.tokenIn), px = usdOf(r.tokenIn);
+            return d !== undefined && px > 0 && ownMoney.availableUsd(r.tokenIn, px, d) >= smallest;
+      };
+      const score = (r: { buy: any; sell: any; tokenIn: string }) => {
+            try {
+                  const d = decOf(r.tokenIn), px = usdOf(r.tokenIn);
+                  if (d === undefined || !(px > 0)) return null;
+                  return roundTripQuote(r.buy, r.sell, r.tokenIn, px, d)(smallest);
+            } catch { return null; }
+      };
+      const top = rankRoutes<(typeof routes)[number]>(routes, held, score, limit);
+      // 3. Build only those.
       const out: EntryCandidate[] = [];
-      for (const { buy, sell, tokenIn, tokenOut } of routes) {
-            const usdPer = priceOracle.getUsdPrice('robinhood', tokenIn);
-            const dec = TOKEN_DECIMALS.robinhood?.[lc(tokenIn)];
+      for (const { buy, sell, tokenIn, tokenOut } of top) {
+            const usdPer = usdOf(tokenIn);
+            const dec = decOf(tokenIn);
             if (!usdPer || dec === undefined) continue;
             // Size caps: MAX_TRADE_USD, own money (the wallet, live), auto-vetted coin limit.
             let maxSizeUsd = MAX_TRADE_USD;
-            if (RH_OWN_MONEY && !approvedLenders('robinhood').size) maxSizeUsd = Math.min(maxSizeUsd, OWN_MONEY_MAX_USD, robinhoodSender.live ? 0.98 * ownMoney.availableUsd(tokenIn, usdPer, dec) : OWN_MONEY_MAX_USD);
+            if (ownOnly) maxSizeUsd = Math.min(maxSizeUsd, OWN_MONEY_MAX_USD, robinhoodSender.live ? 0.98 * ownMoney.availableUsd(tokenIn, usdPer, dec) : OWN_MONEY_MAX_USD);
             if (involvesAutoVetted([tokenIn, tokenOut])) maxSizeUsd = Math.min(maxSizeUsd, AUTO_VET_MAX_TRADE_USD);
             if (!(maxSizeUsd > 0)) continue;
             const lender = pickLender('robinhood', tokenIn, buy, sell, maxSizeUsd, usdPer);
@@ -2935,7 +2957,7 @@ const entryCandidatesFor = (keys: string[]): EntryCandidate[] => {
                   host,
             });
       }
-      return out;
+      return { cands: out, found: routes.length };
 };
 // TRIGGER-FIRST: needs the fast check's connection and copy 2 (LOCAL_SIM
 // shadow / on and LOCAL_SIM_TRIGGER_FIRST shadow / on).
@@ -2954,7 +2976,7 @@ try {
                   const tf = trigFirst;
                   trigEntry = new TrigEntry({
                         tf, client: host.client, shadowLog: host.shadowLog, settings: es,
-                        candidatesFor: (keys) => entryCandidatesFor(keys),
+                        candidatesFor: (keys, limit) => entryCandidatesFor(keys, limit),
                         // Our own sends (seen again in the feed) and our contract: never triggers.
                         isOurTx: (h) => livePools.has(h) || livePools.has(h.toLowerCase()),
                         ourAddresses: [executorConfig('robinhood').executorAddress, robinhoodSender.live ? robinhoodSender.address : undefined].filter((a): a is string => typeof a === 'string'),

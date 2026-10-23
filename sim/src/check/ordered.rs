@@ -259,6 +259,28 @@ pub struct WireFeedMsg {
     pub why: Option<String>,
 }
 
+/// DECODED TRANSACTION CACHE (entry point speed, Oct 23). Decoding a
+/// signed transaction means recovering its sender from the signature (the
+/// slow part, tens of microseconds). The same feed transactions are decoded
+/// again for every candidate trade of a trigger and for the next triggers,
+/// so decoded ones are kept by hash (the hash is of the exact signed bytes:
+/// same hash = same transaction). Bounded: emptied when full.
+const DECODE_CACHE_MAX: usize = 16_384;
+fn decode_cached(h: B256, raw: &[u8]) -> Result<DecodedTx, String> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<B256, DecodedTx>>> = std::sync::OnceLock::new();
+    let c = CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    if let Some(t) = c.lock().unwrap_or_else(|e| e.into_inner()).get(&h) {
+        return Ok(t.clone());
+    }
+    let t = decode_signed_tx(raw)?;
+    let mut g = c.lock().unwrap_or_else(|e| e.into_inner());
+    if g.len() >= DECODE_CACHE_MAX {
+        g.clear();
+    }
+    g.insert(h, t.clone());
+    Ok(t)
+}
+
 fn yes() -> bool {
     true
 }
@@ -367,7 +389,7 @@ pub fn build_plan(feed: &WireFeed, snap_seq: u64, offset: u64, base: &BlockCtx) 
         };
         let mut decoded = Vec::with_capacity(m.txs.len());
         for (j, (h, raw)) in hashes[i].iter().enumerate() {
-            let t = decode_signed_tx(raw).map_err(|e| {
+            let t = decode_cached(*h, raw).map_err(|e| {
                 let reason = if e.starts_with(UNSUPPORTED_TX_PREFIX) { UnknownReason::UnsupportedTx } else { UnknownReason::FeedUnreplayable };
                 CheckUnknown::new(reason, format!("feed message {} tx {j}: {e}", m.seq))
             })?;
@@ -468,6 +490,32 @@ pub struct Assume {
     /// Skip feed transactions that miss state and don't touch this route
     /// (None = never skip).
     pub skip: Option<Route>,
+    /// Entry point "which pools moved?" (server.rs trig_discover): write
+    /// down the inputs of every 64-byte hash the replayed transactions
+    /// compute (keccak(key . slot): a mapping entry), so check/moved.rs can
+    /// tell which pool a changed mapping value belongs to. Not an assumption.
+    pub record_hashes: bool,
+}
+
+/// SIZE LADDER inside one replay (trigger-first entry point): after our
+/// trade ran, the copy as it was right after the replay is put back and our
+/// trade runs again at each of `amounts`: the amountIn word at
+/// `amount_offset` (after the 4-byte code) changed, and every slot in
+/// `slots` (own money: the test contract's trading money) served as the
+/// amount. The feed is replayed ONCE for all sizes.
+#[derive(Clone, Debug, Default)]
+pub struct Ladder {
+    pub amount_offset: usize,
+    pub amounts: Vec<U256>,
+    pub slots: Vec<(Address, U256)>,
+}
+
+/// One ladder size's result (None: unknown at this size, e.g. a value we
+/// don't hold).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LadderRow {
+    pub amount: U256,
+    pub outcome: Option<CallOutcome>,
 }
 
 /// The assumptions a check actually made (empty = an exact answer).
@@ -625,6 +673,10 @@ struct Watch<'p> {
     tx_route_clean: bool,
     /// Labels made by the watch itself (balances / pretended senders).
     labels: Assumed,
+    /// record_hashes: hash -> its two input words (replayed transactions only).
+    hashes: Option<HashMap<U256, (U256, U256)>>,
+    /// The 64-byte KECCAK256 running now (its input words).
+    pending_pre: Option<(U256, U256)>,
 }
 
 impl Watch<'_> {
@@ -735,6 +787,18 @@ impl<CTX> Inspector<CTX, EthInterpreter> for Watch<'_> {
         match interp.bytecode.opcode() {
             // KECCAK256(offset, size): note storage places computed from the sender.
             0x20 => {
+                // record_hashes: a 64-byte hash's input (a mapping entry's key and slot).
+                if self.replaying && self.hashes.is_some() {
+                    if let (Ok(off), Ok(len)) = (interp.stack.peek(0), interp.stack.peek(1)) {
+                        if len == U256::from(64u8) && off < U256::from(u32::MAX) {
+                            let off = off.to::<usize>();
+                            if off + 64 <= interp.memory.size() {
+                                let m = interp.memory.slice(off..off + 64);
+                                self.pending_pre = Some((U256::from_be_slice(&m[..32]), U256::from_be_slice(&m[32..64])));
+                            }
+                        }
+                    }
+                }
                 if self.replaying && self.sender_funds {
                     if let (Ok(off), Ok(len)) = (interp.stack.peek(0), interp.stack.peek(1)) {
                         if len <= U256::from(MAX_HASH_INPUT) && off < U256::from(u32::MAX) {
@@ -786,6 +850,11 @@ impl<CTX> Inspector<CTX, EthInterpreter> for Watch<'_> {
     }
 
     fn step_end(&mut self, interp: &mut Interpreter<EthInterpreter>, _ctx: &mut CTX) {
+        if let Some(p) = self.pending_pre.take() {
+            if let (Ok(h), Some(m)) = (interp.stack.peek(0), self.hashes.as_mut()) {
+                m.insert(h, p);
+            }
+        }
         // The KECCAK256 just ran: its result (top of the stack) is a place
         // computed from the sender.
         if self.pending_hash {
@@ -834,6 +903,11 @@ pub struct OrderedOut {
     /// the trigger-first entry point's "which of our pools did it move?");
     /// with several transactions it is "changed by one of them".
     pub changed: Vec<(Address, U256)>,
+    /// `Assume.record_hashes`: (hash, first word, second word) of every
+    /// 64-byte hash the replayed transactions computed, sorted.
+    pub hashes: Vec<(U256, U256, U256)>,
+    /// The size ladder's results (`run_ordered_sizes`), in order.
+    pub ladder: Vec<LadderRow>,
 }
 
 /// TRIGGER-FIRST ENTRY POINT ("discover", server.rs trig_discover):
@@ -1010,10 +1084,28 @@ pub fn run_ordered_with(
     strict_call: bool,
     assume: &Assume,
 ) -> Result<OrderedOut, CheckUnknown> {
+    run_ordered_sizes(view, plan, overrides, calls, prov, strict_call, assume, None)
+}
+
+/// `run_ordered_with` plus a size ladder (see `Ladder`): one replay, our
+/// trade at every size. The ladder runs only once the main answer is
+/// complete; a size that can't be answered is a row with no outcome (the
+/// main answer stays as it is).
+#[allow(clippy::too_many_arguments)]
+pub fn run_ordered_sizes(
+    view: &dyn StateRead,
+    plan: &OrderedPlan,
+    overrides: &Overrides,
+    calls: &[CallReq],
+    prov: &dyn Provenance,
+    strict_call: bool,
+    assume: &Assume,
+    ladder: Option<&Ladder>,
+) -> Result<OrderedOut, CheckUnknown> {
     let mut patched: Vec<(Address, U256)> = Vec::new();
     let mut skip: HashMap<(u64, usize), bool> = HashMap::new();
     for _ in 0..MAX_ROUNDS {
-        match one_round(view, plan, overrides, calls, prov, strict_call, assume, &patched, &skip)? {
+        match one_round(view, plan, overrides, calls, prov, strict_call, assume, &patched, &skip, ladder)? {
             Next::Done(mut out) => {
                 out.assumed.sender_funds |= !patched.is_empty();
                 out.assumed.skipped_related = skip.values().filter(|r| **r).count();
@@ -1051,6 +1143,7 @@ fn one_round(
     assume: &Assume,
     patched: &[(Address, U256)],
     skip: &HashMap<(u64, usize), bool>,
+    ladder: Option<&Ladder>,
 ) -> Result<Next, CheckUnknown> {
     let mut db = CheckDb::new(view, overrides, true);
     // Assumed sender values (sender_funds), served before anything else.
@@ -1079,6 +1172,8 @@ fn one_round(
         tx_miss_base: 0,
         tx_route_clean: false,
         labels: Assumed::default(),
+        hashes: if assume.record_hashes { Some(HashMap::new()) } else { None },
+        pending_pre: None,
     };
     let mut evm = build_evm_with_inspector(db, first, &ArbConfig::default(), default_arbsys_gas(), true, watch);
     // eth_call rules: no gas fee charged or paid (see run.rs Session::new).
@@ -1181,6 +1276,8 @@ fn one_round(
             return Err(stale_unknown(&bad, "a replayed transaction"));
         }
     }
+    // The copy right after the replay (size ladder: put back before each size).
+    let after_replay = ladder.filter(|l| !l.amounts.is_empty() && calls.len() == 1).map(|_| evm.ctx.journaled_state.state.clone());
     // 3. Our calls, in the block of the last message replayed.
     evm.inspector.replaying = false;
     evm.inspector.cur_sender = None;
@@ -1217,7 +1314,30 @@ fn one_round(
     assumed.sender_funds |= l.sender_funds;
     assumed.recent_fill |= l.recent_fill;
     assumed.call_fill |= l.call_fill;
-    Ok(Next::Done(OrderedOut { replayed, results, assumed, changed }))
+    let mut hashes: Vec<(U256, U256, U256)> = evm.inspector.hashes.take().map(|m| m.into_iter().map(|(h, (a, b))| (h, a, b)).collect()).unwrap_or_default();
+    hashes.sort();
+    // 4. Size ladder: the copy as it was right after the replay, our trade
+    //    again at each size (the amount word + the trading-money slots,
+    //    served first by the database's patches). Nothing here changes the
+    //    main answer above.
+    let mut rows = Vec::new();
+    if let (Some(l), Some(base_state)) = (ladder, after_replay) {
+        let base_patches: Vec<(Address, U256, U256)> = patched.iter().map(|(a, s)| (*a, *s, assumed_funds())).collect();
+        for amount in l.amounts.iter().take(8) {
+            let Ok(data) = super::search::patch_amount(&calls[0].data, l.amount_offset, *amount) else { break };
+            evm.ctx.journaled_state.state = base_state.clone();
+            let mut p = base_patches.clone();
+            p.extend(l.slots.iter().map(|(a, s)| (*a, *s, *amount)));
+            evm.ctx.journaled_state.database.set_patches(p);
+            let miss_before = evm.ctx.journaled_state.database.missing.len();
+            let c = CallReq { data, ..calls[0].clone() };
+            let r = run_one(&mut evm, call_env_of(&c));
+            let clean = evm.ctx.journaled_state.database.missing.len() == miss_before && evm.precompiles.unsupported().is_none() && evm.inspector.unsure.take().is_none();
+            evm.ctx.journaled_state.database.missing.truncate(miss_before);
+            rows.push(LadderRow { amount: *amount, outcome: r.ok().filter(|_| clean) });
+        }
+    }
+    Ok(Next::Done(OrderedOut { replayed, results, assumed, changed, hashes, ladder: rows }))
 }
 
 /// A replayed transaction needed values we don't hold: assume its sender's,

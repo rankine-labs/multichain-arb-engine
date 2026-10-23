@@ -33,13 +33,19 @@ import { TriggerFirst, TrigOutcome, TrigConfidence, TrigQuestion, confidenceAtLe
 //      to trade: the same pair on another exchange, buy on one and sell on
 //      the other, both directions, starting from a coin we hold (USDG /
 //      WETH). The host (shadowMain.ts) builds them with the existing pool
-//      lists, exchange / coin rules, lender choice and buildCheck. At most
-//      TRIG_ENTRY_MAX_CANDIDATES per trigger.
+//      lists, exchange / coin rules, lender choice and buildCheck. Ranked
+//      (a coin we hold first, then the model's quick price check) and capped
+//      at TRIG_ENTRY_MAX_CANDIDATES BEFORE anything is built. More than
+//      TRIG_ENTRY_MAX_POOLS moved pools = a suspicious answer: skipped.
+//      (Oct 23 fix: the first version named every V4 pool for every V4 swap,
+//      see sim/src/check/moved.rs.)
 //   3. SIZE + CHECK: each candidate is checked with the full trigger-first
 //      check (every feed transaction in sequence order, then our exact
 //      trade), at the biggest allowed size of the ladder TRIG_ENTRY_SIZES_USD,
 //      and the smaller sizes on the SAME replay in the SAME request (size
-//      ladder). The best net profit after gas wins.
+//      ladder, after ONE replay). Best-ranked first, TRIG_ENTRY_PARALLEL
+//      at a time (TRIG_ENTRY_MAX_CHECKS over all triggers), stopping at the
+//      first sure answer good enough to send. The best net after gas wins.
 //   4. DECIDE: profitable (net >= MIN_EXEC_NET_USD) at confidence >=
 //      TRIG_FIRST_MIN_CONFIDENCE ->
 //        on mode:     straight to the safeguards below and then the sender
@@ -74,7 +80,10 @@ import { TriggerFirst, TrigOutcome, TrigConfidence, TrigQuestion, confidenceAtLe
 export type EntrySettings = {
   enabled: boolean;              // TRIG_FIRST_ENTRY [1] (and LOCAL_SIM_TRIGGER_FIRST not off)
   maxInFlight: number;           // TRIG_ENTRY_MAX_IN_FLIGHT [4] triggers worked on at once; more are dropped
-  maxCandidates: number;         // TRIG_ENTRY_MAX_CANDIDATES [6] candidate trades checked per trigger
+  maxCandidates: number;         // TRIG_ENTRY_MAX_CANDIDATES [6] candidate trades built and checked per trigger (best-ranked first)
+  maxPools: number;              // TRIG_ENTRY_MAX_POOLS [4] more moved pools than this = suspicious answer, skipped ("too_many_pools")
+  parallel: number;              // TRIG_ENTRY_PARALLEL [2] candidate checks of one trigger at once
+  maxChecks: number;             // TRIG_ENTRY_MAX_CHECKS [2] candidate checks at once over ALL triggers (sidecar workers: ARBSIM_WORKERS)
   sizesUsd: number[];            // TRIG_ENTRY_SIZES_USD [50,150,400] trade size ladder ($)
   discoverTimeoutMs: number;     // TRIG_ENTRY_DISCOVER_TIMEOUT_MS [40] the "which pools?" question
   deadlineMs: number;            // TRIG_ENTRY_DEADLINE_MS [250] the whole trigger (discover + checks)
@@ -89,6 +98,9 @@ export function entrySettings(env: Record<string, string | undefined> = process.
     enabled: (env.TRIG_FIRST_ENTRY ?? '1').trim() !== '0',
     maxInFlight: Math.round(num('TRIG_ENTRY_MAX_IN_FLIGHT', 4)),
     maxCandidates: Math.round(num('TRIG_ENTRY_MAX_CANDIDATES', 6)),
+    maxPools: Math.round(num('TRIG_ENTRY_MAX_POOLS', 4)),
+    parallel: Math.round(num('TRIG_ENTRY_PARALLEL', 2)),
+    maxChecks: Math.round(num('TRIG_ENTRY_MAX_CHECKS', 2)),
     sizesUsd: sizes.length ? sizes.slice(0, 6) : [50, 150, 400],
     discoverTimeoutMs: num('TRIG_ENTRY_DISCOVER_TIMEOUT_MS', 40),
     deadlineMs: num('TRIG_ENTRY_DEADLINE_MS', 250),
@@ -173,6 +185,15 @@ export function enumerateRoutes<P>(keys: string[], r: RouteRules<P>): Array<{ bu
   return out;
 }
 
+// RANKING before anything is built (cheap): routes starting from a coin we
+// actually hold first, then the model's quick price check (higher = better;
+// null = unknown, last). Returns the best `limit`.
+export function rankRoutes<R>(routes: R[], held: (r: R) => boolean, score: (r: R) => number | null, limit: number): R[] {
+  const scored = routes.map((r, i) => ({ r, i, h: held(r) ? 0 : 1, s: score(r) ?? -Infinity }));
+  scored.sort((a, b) => a.h - b.h || b.s - a.s || a.i - b.i);
+  return scored.slice(0, Math.max(0, limit)).map((x) => x.r);
+}
+
 // The chosen trade.
 export type EntryPick = {
   cand: EntryCandidate;
@@ -190,9 +211,11 @@ export type EntryDeps = {
   shadowLog: JsonlLog;
   settings?: EntrySettings;
   env?: Record<string, string | undefined>;
-  // Candidate trades for the pools the trigger moved (venue / coin rules
-  // already applied by the host; not capped).
-  candidatesFor: (poolKeys: string[]) => EntryCandidate[];
+  // Candidate trades for the pools the trigger moved: the host lists the
+  // routes (cheap), ranks them (rankRoutes: a coin we hold first, then the
+  // model's quick price check) and BUILDS ONLY the best `limit`. found = how
+  // many routes there were before the cap.
+  candidatesFor: (poolKeys: string[], limit: number) => { cands: EntryCandidate[]; found: number };
   isOurTx: (hash: string) => boolean;
   ourAddresses: string[];                 // our executor contract(s), our bot wallet(s)
   // SAFEGUARDS (null = fine, else why not). See the file header.
@@ -315,21 +338,27 @@ export class TrigEntry {
     const pools = Array.isArray(a.pools) ? (a.pools as unknown[]).filter((x): x is string => typeof x === 'string').map((x) => x.toLowerCase()) : [];
     if (!pools.length) return null; // doesn't move any pool we follow: nothing to do
     h.touching++;
+    // Debug: per moved pool, which kinds of its values changed (sidecar, capped small).
+    const moved = Array.isArray(a.moved) ? (a.moved as unknown[]).slice(0, 4).map((m) => (Array.isArray(m) ? `${String(m[0]).slice(0, 12)}:${Array.isArray(m[1]) ? (m[1] as unknown[]).slice(0, 4).join('+') : ''}` : '')).filter(Boolean) : undefined;
     const rec: EntryRecord = {
-      hash, seenMs, pools, discoverMs, discConf: typeof a.conf === 'string' ? a.conf : undefined,
+      hash, seenMs, pools: pools.slice(0, 8), poolCount: pools.length, moved, discoverMs, discConf: typeof a.conf === 'string' ? a.conf : undefined,
       discAssumed: Array.isArray(a.assumed) ? (a.assumed as string[]).slice(0, 8) : undefined,
-      tried: 0, candidates: 0,
+      tried: 0, candidates: 0, found: 0,
     };
-    // 2. CANDIDATES (host rules), capped.
+    // GUARD: one transaction really moves 1-2 pools (a router: a few). Many
+    // more = the answer can't be right (live Oct 23: every V4 pool at once):
+    // skipped, counted, never enumerated.
+    if (pools.length > s.maxPools) { rec.unknown = 'too_many_pools'; unknown('too_many_pools'); this.finish(rec); return rec; }
+    // 2. CANDIDATES: listed, ranked and capped BEFORE anything is built.
     let cands: EntryCandidate[] = [];
-    try { cands = this.d.candidatesFor(pools); } catch { h.errors++; }
+    try { const r = this.d.candidatesFor(pools, s.maxCandidates); cands = r.cands.slice(0, s.maxCandidates); rec.found = r.found; } catch { h.errors++; }
     rec.candidates = cands.length;
-    cands = cands.slice(0, s.maxCandidates);
-    rec.tried = cands.length;
     if (!cands.length) { rec.unknown = 'no_candidates'; unknown('no_candidates'); this.finish(rec); return rec; }
-    // 3. SIZE + CHECK every candidate at once (each one sidecar request).
+    // 3. SIZE + CHECK, best-ranked first, a few at once (bounded per
+    //    trigger and over all triggers), stopping at the first SURE answer
+    //    that would be sent (profitable after gas at the confidence floor).
     const left = Math.max(1, deadlineAt - this.now());
-    const results = await Promise.all(cands.map((c) => withDeadline(this.checkCandidate(c, hash, seenMs), left)));
+    const results = await this.runRanked(cands, hash, seenMs, left, rec);
     rec.answerMs = this.now() - seenMs;
     keep(h.answerMs, rec.answerMs);
     const picks = results.filter((r): r is CandResult => !!r);
@@ -365,6 +394,59 @@ export class TrigEntry {
     }
     this.finish(rec, best);
     return rec;
+  }
+
+  // Candidates in rank order, TRIG_ENTRY_PARALLEL at a time, within the
+  // deadline. Stops at the first sure answer good enough to send (safe: it
+  // passed the full check; a better-ranked candidate was asked first or at
+  // the same time). Those still running are not waited for.
+  private runRanked(cands: EntryCandidate[], hash: string, seenMs: number, leftMs: number, rec: EntryRecord): Promise<CandResult[]> {
+    const s = this.settings;
+    const minConf = this.d.tf.settings.minConfidence;
+    const until = this.now() + leftMs;
+    const out: CandResult[] = [];
+    return new Promise((resolve) => {
+      let next = 0, running = 0, done = false;
+      const finish = () => { if (!done) { done = true; resolve(out.slice()); } };
+      const launch = () => {
+        while (!done && running < Math.max(1, s.parallel) && next < cands.length) {
+          const c = cands[next++];
+          running++;
+          rec.tried++;
+          void withDeadline(this.withSlot(() => this.checkCandidate(c, hash, seenMs), until), Math.max(1, until - this.now()))
+            .then((r) => {
+              running--;
+              if (r) out.push(r);
+              const good = !!r && r.out.sure && !!r.pick && r.pick.netUsd >= s.minNetUsd && confidenceAtLeast(r.out.confidence, minConf);
+              if (good) { rec.early = next < cands.length || running > 0 || undefined; finish(); return; }
+              if (this.now() >= until || (next >= cands.length && running === 0)) { finish(); return; }
+              launch();
+            }, () => { running--; launch(); if (next >= cands.length && running === 0) finish(); });
+        }
+        if (next >= cands.length && running === 0) finish();
+      };
+      launch();
+      const t = setTimeout(finish, Math.max(1, leftMs) + 5);
+      t.unref?.();
+    });
+  }
+
+  // At most TRIG_ENTRY_MAX_CHECKS candidate checks at once over all
+  // triggers (the sidecar has few workers; the old paths use them too).
+  // A check whose turn comes after its trigger's deadline is not run.
+  private slotsUsed = 0;
+  private readonly waiting: Array<() => void> = [];
+  private async withSlot<T>(f: () => Promise<T | null>, until: number): Promise<T | null> {
+    if (this.slotsUsed >= Math.max(1, this.settings.maxChecks)) {
+      await new Promise<void>((r) => this.waiting.push(r));
+    } else this.slotsUsed++;
+    try {
+      if (this.now() >= until) return null;
+      return await f();
+    } finally {
+      const w = this.waiting.shift();
+      if (w) w(); else this.slotsUsed--;
+    }
   }
 
   // SAFEGUARDS checked here before the host's own (see the file header).
@@ -420,9 +502,12 @@ export class TrigEntry {
         this.d.shadowLog.add({
           t: this.now(), k: 'trig_entry', mode: this.d.tf.mode(), tx: rec.hash.slice(0, 12),
           // what it moved, how sure the "which pools" answer was
-          pools: rec.pools, dconf: rec.discConf, das: rec.discAssumed?.length ? rec.discAssumed : undefined,
-          // candidates: found / checked; the best route, size, net after gas
-          cands: rec.candidates, tried: rec.tried,
+          pools: rec.pools, np: rec.poolCount, dconf: rec.discConf, das: rec.discAssumed?.length ? rec.discAssumed : undefined,
+          // debug: per moved pool (first 12 hex chars), which kinds of its values changed
+          mv: rec.moved?.length ? rec.moved : undefined,
+          // candidates: routes found, built (best-ranked, capped), checked; stopped early?
+          found: rec.found, cands: rec.candidates, tried: rec.tried, early: rec.early,
+          // the best route, size, net after gas
           best: rec.best?.label, size: rec.best ? Math.round(rec.best.sizeUsd) : undefined, net: rec.best ? Math.round(rec.best.netUsd * 100) / 100 : undefined,
           conf: rec.best?.conf, as: rec.best?.as?.length ? rec.best.as : undefined, u: rec.unknown,
           // decision: would send (shadow) / sent (on), or what held it back
@@ -476,12 +561,16 @@ type CandResult = { out: TrigOutcome; pick?: EntryPick };
 export type EntryRecord = {
   hash: string;
   seenMs: number;
-  pools: string[];
+  pools: string[];                // moved pools (first 8)
+  poolCount: number;              // how many moved
+  moved?: string[];               // debug: "<pool>:<kinds>" (first 4)
+  found: number;                  // routes found before the cap
+  early?: boolean;                // stopped at the first good answer
   discoverMs: number;
   discConf?: string;
   discAssumed?: string[];
-  candidates: number;
-  tried: number;
+  candidates: number;             // built (best-ranked, capped)
+  tried: number;                  // actually checked
   answerMs?: number;
   submitMs?: number;
   unknown?: string;
