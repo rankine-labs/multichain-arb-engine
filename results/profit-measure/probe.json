@@ -1,0 +1,239 @@
+{
+ "rpc": "public node",
+ "at": "2026-10-23T20:04:13.099Z",
+ "checks": {
+  "history": [
+   {
+    "hoursAgo": 0.5,
+    "block": 96185867,
+    "block_ok": true,
+    "ts": 1792784059,
+    "txs": 8,
+    "logs_ok": true,
+    "logs_n": 150,
+    "receipt_ok": true,
+    "blockReceipts_ok": 8,
+    "ourNonce": "{\"code\":-32000,\"message\":\"historical state 34aa784262d05cf47af225ba398be014e05e791f64a6c1cfa6d50ef94941f4bb is not available\"}"
+   },
+   {
+    "hoursAgo": 1,
+    "block": 96168552,
+    "block_ok": true,
+    "ts": 1792782250,
+    "txs": 6,
+    "logs_ok": true,
+    "logs_n": 91,
+    "receipt_ok": true,
+    "blockReceipts_ok": 6,
+    "ourNonce": "{\"code\":-32000,\"message\":\"historical state 114280da6951df744590ab0c0286812e13a20174eba2c9ae16a0b527c252e402 is not available\"}"
+   },
+   {
+    "hoursAgo": 2,
+    "block": 96133924,
+    "block_ok": true,
+    "ts": 1792778647,
+    "txs": 4,
+    "logs_ok": true,
+    "logs_n": 98,
+    "receipt_ok": true,
+    "blockReceipts_ok": 4,
+    "ourNonce": "{\"code\":-32000,\"message\":\"historical state fa07c4ce4a3562968635fdf37788602c2c1c50406af7994e1aa9fc96b664401f is not available\"}"
+   },
+   {
+    "hoursAgo": 3,
+    "block": 96099295,
+    "block_ok": true,
+    "ts": 1792775048,
+    "txs": 5,
+    "logs_ok": true,
+    "logs_n": 66,
+    "receipt_ok": true,
+    "blockReceipts_ok": 5,
+    "ourNonce": "{\"code\":-32000,\"message\":\"historical state dd24a43105133a2b8a4cbedb4aa2c5c3c4902d908e5e1aefc9efbf4aa2766c26 is not available\"}"
+   },
+   {
+    "hoursAgo": 4,
+    "block": 96064666,
+    "block_ok": true,
+    "ts": 1792771452,
+    "txs": 7,
+    "logs_ok": true,
+    "logs_n": 195,
+    "receipt_ok": true,
+    "blockReceipts_ok": 7,
+    "ourNonce": "{\"code\":-32000,\"message\":\"historical state 7f9331cac80898d594f1d54a1c3f3ea6350dd2a88afb5f57c6d536067144efc8 is not available\"}"
+   },
+   {
+    "hoursAgo": 6,
+    "block": 95995409,
+    "block_ok": true,
+    "ts": 1792764235,
+    "txs": 25,
+    "logs_ok": true,
+    "logs_n": 146,
+    "receipt_ok": true,
+    "blockReceipts_ok": 25,
+    "ourNonce": "{\"code\":-32000,\"message\":\"historical state 50ee2f76d15cf25967de92e5dbb30cf874b6648b2b5c8e1731b588692af969be is not available\"}"
+   },
+   {
+    "hoursAgo": 8,
+    "block": 95926151,
+    "block_ok": true,
+    "ts": 1792756977,
+    "txs": 9,
+    "logs_ok": true,
+    "logs_n": 57,
+    "receipt_ok": true,
+    "blockReceipts_ok": 9,
+    "ourNonce": "{\"code\":-32000,\"message\":\"historical state ad61f3bff34d89fb59134c0d5cd1eaff1bc01de3bfc9bd2eabdcdce01e1c21d8 is not available\"}"
+   },
+   {
+    "hoursAgo": 12,
+    "block": 95787637,
+    "block_ok": true,
+    "ts": 1792742478,
+    "txs": 15,
+    "logs_ok": true,
+    "logs_n": 147,
+    "receipt_ok": true,
+    "blockReceipts_ok": 15,
+    "ourNonce": "{\"code\":-32000,\"message\":\"historical state 4856cc5a58efc19034ec23d7cbd244d24b1931d921efe72d9fc803cbd9b48f7b is not available\"}"
+   },
+   {
+    "hoursAgo": 16,
+    "block": 95649122,
+    "block_ok": true,
+    "ts": 1792728058,
+    "txs": 5,
+    "logs_ok": false,
+    "logs_n": "{\"code\":429,\"message\":\"Too Many Requests\"}",
+    "receipt_ok": true,
+    "blockReceipts_ok": "{\"code\":429,\"message\":\"Too Many Requests\"}",
+    "ourNonce": "{\"code\":-32000,\"message\":\"historical state eb6f4bdff4d2b7fbf04397ca460d64537918a55e3efc97c8815299a534671d7f is not available\"}"
+   },
+   {
+    "hoursAgo": 24,
+    "block": 95372092,
+    "block_ok": false,
+    "ts": null,
+    "txs": null,
+    "logs_ok": false,
+    "logs_n": "{\"code\":429,\"message\":\"Too Many Requests\"}",
+    "receipt_ok": "no tx",
+    "blockReceipts_ok": "{\"code\":429,\"message\":\"Too Many Requests\"}",
+    "ourNonce": "{\"code\":429,\"message\":\"Too Many Requests\"}"
+   },
+   {
+    "hoursAgo": 36,
+    "block": 94956548,
+    "block_ok": false,
+    "ts": null,
+    "txs": null,
+    "logs_ok": false,
+    "logs_n": "{\"code\":429,\"message\":\"Too Many Requests\"}",
+    "receipt_ok": "no tx",
+    "blockReceipts_ok": "{\"code\":429,\"message\":\"Too Many Requests\"}",
+    "ourNonce": "{\"code\":-32000,\"message\":\"historical state 09b4d9cd61df3826e416fd12c823ec1dae4162fbc66217d7b7d1698326c4be91 is not available\"}"
+   },
+   {
+    "hoursAgo": 48,
+    "block": 94541003,
+    "block_ok": true,
+    "ts": 1792612489,
+    "txs": 12,
+    "logs_ok": false,
+    "logs_n": "{\"code\":429,\"message\":\"Too Many Requests\"}",
+    "receipt_ok": true,
+    "blockReceipts_ok": "{\"code\":429,\"message\":\"Too Many Requests\"}",
+    "ourNonce": "{\"code\":-32000,\"message\":\"historical state fb4c494e12812192fcaa130d7e1d852a7602e7a60d903826c5c3bf6375f41d12 is not available\"}"
+   },
+   {
+    "hoursAgo": 72,
+    "block": 93709914,
+    "block_ok": true,
+    "ts": 1792526291,
+    "txs": 6,
+    "logs_ok": true,
+    "logs_n": 166,
+    "receipt_ok": true,
+    "blockReceipts_ok": "{\"code\":429,\"message\":\"Too Many Requests\"}",
+    "ourNonce": "{\"code\":-32000,\"message\":\"historical state dc1b321226e6531bef89436dd286be596ecaea8eac3cf4450905bccf8ea8412d is not available\"}"
+   },
+   {
+    "hoursAgo": 168,
+    "block": 90385559,
+    "block_ok": true,
+    "ts": 1792184707,
+    "txs": 5,
+    "logs_ok": false,
+    "logs_n": "{\"code\":429,\"message\":\"Too Many Requests\"}",
+    "receipt_ok": true,
+    "blockReceipts_ok": "{\"code\":429,\"message\":\"Too Many Requests\"}",
+    "ourNonce": "{\"code\":-32000,\"message\":\"historical state 71bb291e75bb8c53f3048cbbe43668c5e946b4dfdb0d88d3ba4ff803d9eb4790 is not available\"}"
+   }
+  ],
+  "logRange": [
+   {
+    "span": 500,
+    "ok": false,
+    "n": "{\"code\":429,\"message\":\"Too Many Requests\"}",
+    "ms": 24
+   },
+   {
+    "span": 2000,
+    "ok": true,
+    "n": 6573,
+    "ms": 360
+   },
+   {
+    "span": 5000,
+    "ok": false,
+    "n": "{\"code\":-32000,\"message\":\"logs matched by query exceeds limit of 10000\"}",
+    "ms": 80
+   },
+   {
+    "span": 20000,
+    "ok": false,
+    "n": "{\"code\":429,\"message\":\"Too Many Requests\"}",
+    "ms": 30
+   }
+  ],
+  "v4InitAll": {
+   "ok": false,
+   "n": "{\"code\":429,\"message\":\"Too Many Requests\"}",
+   "ms": 26
+  },
+  "ourExecutorLogs": {
+   "ok": false,
+   "n": "{\"code\":429,\"message\":\"Too Many Requests\"}",
+   "sample": null
+  },
+  "batch": {
+   "asked": 3,
+   "answers": 3,
+   "errors": [],
+   "ms": 30
+  },
+  "rate20": {
+   "ok": 60,
+   "errors": []
+  },
+  "blockscoutStats": {
+   "status": 403,
+   "body": "<!DOCTYPE html><html lang=\"en-US\"><head><title>Just a moment...</title><meta http-equiv=\"Content-Type\" content=\"text/html; charset=UTF-8\"><meta http-equiv=\"X-UA-Compatible\" content=\"IE=Edge\"><meta name=\"robots\" content=\"noindex,nofollow\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><meta http-equiv=\"content-security-policy\" content=\"default-src &#39;none&#39;; script-src &#39;nonce-dMwmyBtcUvzbrO44ZYeWDY&#39; &#39;unsafe-eval&#39; https://challenges.cloudflare.com; script-src-attr &#39;none&#39;; style-src &#39;unsafe-inline&#39;; img-src &#39;self&#39; https://challenges"
+  },
+  "blockscoutSenderTxs": {
+   "status": 403,
+   "body": "<!DOCTYPE html><html lang=\"en-US\"><head><title>Just a moment...</title><meta http-equiv=\"Content-Type\" content=\"text/html; charset=UTF-8\"><meta http-equiv=\"X-UA-Compatible\" content=\"IE=Edge\"><meta name=\"robots\" content=\"noindex,nofollow\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><meta http-equiv=\"content-security-policy\" content=\"default-src &#39;none&#39;; script-src &#39;nonce-la0y5jZmiGm96WvAO38wca&#39; &#39;unsafe-eval&#39; https://challenges.cloudflare.com; script-src-attr &#39;none&#39;; style-src &#39;unsafe-inline&#39;; img-src &#39;self&#39; https://challenges.cloudflare.com; connect-src &#39;self&#39; https://challenges.cloudflare.com; frame-src &#39;self&#39; https://challenges.cloudflare.com blob:; child-src &#39;self&#39; https://challenges.cloudflare.com blob:; worker-src blob:; form-action http: https:; base-uri &#39;self&#39;\"><style>*{box-sizing:border-box;margin:0;padding:0}html{line-height:1.15;-webkit-text-size-adjust:100%;color:#313131;font-family:system-ui,-apple-system,BlinkMacSystemFont,\"Segoe UI\",Roboto,\"Helvetica Neue\",Arial,\"Noto Sans\",sans-serif,\"Apple Color Emoji\",\"Segoe UI Emoji\",\"Segoe UI Symbol\",\"Noto Color Emoji\"}body{display:flex;flex-direction:column;height:100vh;min-height:100vh}.main-content{margin:8rem auto;padding-left:1.5rem;max-width:60rem}@media (width <= 720px){.main-content{margin-top:4rem}}#challenge-error-text{background-image:url(\"data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIzMiIgaGVpZ2h0PSIzMiIgZmlsbD0ibm9uZSI+PHBhdGggZmlsbD0iI0IyMEYwMyIgZD0iTTE2IDNhMTMgMTMgMCAxIDAgMTMgMTNBMTMuMDE1IDEzLjAxNSAwIDAgMCAxNiAzbTAgMjRhMTEgMTEgMCAxIDEgMTEtMTEgMTEuMDEgMTEuMDEgMCAwIDEtMTEgMTEiLz48cGF0aCBmaWxsPSIjQjIwRjAzIiBkPSJNMTcuMDM4IDE4LjYxNUgxNC44N0wxNC41NjMgOS41aDIuNzgzem0tMS4wODQgMS40MjdxLjY2IDAgMS4wNTcuMzg4LjQwNy4zODkuNDA3Ljk5NCAwIC41OTYtLjQwNy45ODQtLjM5Ny4zOS0xLjA1Ny4zODktLjY1IDAtMS4wNTYtLjM4OS0uMzk4LS4zODktLjM5OC0uOTg0IDAtLjU5Ny4zOTgtLjk4NS40MDYtLjM5NyAxLjA1Ni0uMzk3Ii8+PC9zdmc+\");background-repeat:no-repeat;background-size:contain;padding-left:34px}</style><meta http-equiv=\"refresh\" content=\"360\"></head><body><div class=\"main-wrapper\" role=\"main\"><div class=\"main-content\"><noscript><div class=\"h2\"><span id=\"challenge-error-text\">Enable JavaScript and cookies to continue</span></div></noscript></div></div><script nonce=\"la0y5jZmiGm96WvAO38wca\">(function(){window._cf_chl_opt = {cFPWv: 'b',cH: 'QYwjStx2SxxByBMwBj3gQWmw5WGB_nwETUuOqyBdqmc-1792785859-1.2.1.1-Y5xUYMsR7rYTLqfmkg5tWBVkY7SNsP8CZr13GXdmDGXOTM54h.nnJ.arKJigXDfN',cITimeS: '1792785859',cN: 'la0y5jZmiGm96WvAO38wca',cRay: 'a4f359a53efcd46f',cTplC:0,cTplO:0,cTplV:5,cType: 'managed',cUPMDTk:\"/api/v2/addresses/0x09b4fb908ff646afa9c9878c082add7e4b3784d6/transactions?__cf_chl_tk=opcuJvVvIRR6S5pvxYwDZFZUAPkYShQyCu_MsLbh9a4-1792785859-1.0.1.1-ByaP7GVC1lIMUH6hPtpsq_.BtLpGS7DH1l.HUXx8tpc\",cvId: '3',cZone: 'robinhoodchain.blockscout.com',fa:\"/api/v2/addresses/0x09b4fb908ff646afa9c9878c082add7e4b3784d6/tra"
+  },
+  "blockscoutSenderCounters": {
+   "status": 403,
+   "body": "<!DOCTYPE html><html lang=\"en-US\"><head><title>Just a moment...</title><meta http-equiv=\"Content-Type\" content=\"text/html; charset=UTF-8\"><meta http-equiv=\"X-UA-Compatible\" content=\"IE=Edge\"><meta name=\"robots\" content=\"noindex,nofollow\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><meta http-equiv=\"content-security-policy\" content=\"default-src &#39;none&#39;; script-src &#39;nonce-In61t8KsQjmh6Lkm9cJ4ay&#39; &#39;unsafe-eval&#39; https://challenges.cloudflare.com; script-src-attr &#39;none&#39;; style-src &#39;unsafe-inline&#39;; img-src &#39;self&#39; https://challenges"
+  }
+ },
+ "latest": {
+  "block": 96203181,
+  "ts": 1792785852,
+  "blocksPerSec": 9.619084263178145
+ }
+}
