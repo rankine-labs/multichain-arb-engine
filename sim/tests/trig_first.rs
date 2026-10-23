@@ -825,7 +825,7 @@ fn entry_size_ladder_runs_each_size_on_the_same_replay() {
         sizes,
         ..CallRequest::default()
     };
-    let a = handle_trig_call_with(&copy(), &plan, &info, &mk(Some(WireSizes { amount_offset: 0, amounts: vec!["0x2".into(), "0x3".into()] })), &AllExact, true, &best());
+    let a = handle_trig_call_with(&copy(), &plan, &info, &mk(Some(WireSizes { amount_offset: 0, amounts: vec!["0x2".into(), "0x3".into()], calc: None })), &AllExact, true, &best());
     assert_eq!(a["ok"], json!(true), "{a}");
     let sizes = a["sizes"].as_array().expect("sizes");
     assert_eq!(sizes.len(), 2);
@@ -837,7 +837,7 @@ fn entry_size_ladder_runs_each_size_on_the_same_replay() {
         assert_eq!(s["profit"], json!("0x69"));
     }
     // The amount word not where it should be (past the end): no ladder, the answer is unchanged.
-    let a = handle_trig_call_with(&copy(), &plan, &info, &mk(Some(WireSizes { amount_offset: 4096, amounts: vec!["0x2".into()] })), &AllExact, true, &best());
+    let a = handle_trig_call_with(&copy(), &plan, &info, &mk(Some(WireSizes { amount_offset: 4096, amounts: vec!["0x2".into()], calc: None })), &AllExact, true, &best());
     assert_eq!(a["ok"], json!(true));
     assert!(a.get("sizes").is_none());
     // No sizes asked: no `sizes` field (old answers unchanged).
@@ -984,7 +984,7 @@ fn entry_ladder_one_replay_each_size_sees_its_own_trading_money() {
     data.extend(w(1));
     let call = CallReq { from: caller(), to: Some(fund()), data: Bytes::from(data), gas: Some(1_000_000), value: U256::ZERO };
     let ov = Overrides::from_json(&json!({ format!("{:#x}", fund()): { "stateDiff": { "0x5": "0x1" } } })).unwrap();
-    let lad = Ladder { amount_offset: 0, amounts: vec![U256::from(2u64), U256::from(3u64)], slots: vec![(fund(), U256::from(5u64))] };
+    let lad = Ladder { amount_offset: 0, amounts: vec![U256::from(2u64), U256::from(3u64)], slots: vec![(fund(), U256::from(5u64))], calc: None };
     let out = run_ordered_sizes(&c, &plan, &ov, std::slice::from_ref(&call), &AllExact, true, &best(), Some(&lad)).unwrap();
     let got = |o: &arbsim::check::CallOutcome| U256::from_be_slice(&o.output[4..36]).to::<u64>();
     assert_eq!(got(&out.results[0]), 1, "main run: the original amount");
@@ -1011,7 +1011,7 @@ fn bench_entry_candidate_check_test_numbers_only() {
     data.extend(w(400));
     let call = CallReq { from: caller(), to: Some(fund()), data: Bytes::from(data), gas: Some(1_000_000), value: U256::ZERO };
     let ov = Overrides::from_json(&json!({ format!("{:#x}", fund()): { "stateDiff": { "0x5": format!("{:#x}", 400) } } })).unwrap();
-    let lad = Ladder { amount_offset: 0, amounts: vec![U256::from(50u64), U256::from(150u64)], slots: vec![(fund(), U256::from(5u64))] };
+    let lad = Ladder { amount_offset: 0, amounts: vec![U256::from(50u64), U256::from(150u64)], slots: vec![(fund(), U256::from(5u64))], calc: None };
     let n = 30;
     let t = std::time::Instant::now();
     for _ in 0..n {
@@ -1032,4 +1032,216 @@ fn bench_entry_candidate_check_test_numbers_only() {
     }
     let disc = t.elapsed().as_micros() / n;
     println!("[bench, test numbers only] entry candidate check, 20 feed txs + 3 sizes: one replay + ladder {one} us vs 3 full replays {three} us; discover (trigger alone) {disc} us ({} build)", if cfg!(debug_assertions) { "debug" } else { "release" });
+}
+
+// ---------------------------------------------------------------------------
+// CALCULATED SIZE inside the replay (check/sizing.rs via run_ordered_sizes):
+// the best size is worked out on the pool AFTER the trigger, with our real
+// call, in the same request; the ladder runs only for comparison or as the
+// fallback.
+// ---------------------------------------------------------------------------
+use arbsim::check::ordered::{run_ordered_sizes, Ladder};
+use arbsim::check::proto_types::WireCalc;
+use arbsim::check::sizing::{CalcParams, Method};
+
+/// A constant-product round trip in one contract: its "reserve" R is slot 0
+/// (a 32-byte call = a swap someone else makes: R += the number). Our trade
+/// (any other call, amount = the word after the 4-byte code) gets back
+/// out = 2*R*x / (R + x) and reverts InsufficientProfit(out - x or 0, MAX).
+/// Best size: x* = (sqrt(2) - 1) * R.
+fn cpool() -> Address {
+    addr(0x2001)
+}
+fn cpool_code() -> Vec<u8> {
+    let mut c = hex("36 6020 14");
+    let trig_at = c.len() + 1;
+    c.extend(hex("6000 57"));
+    // [x] [x R] [x R 2Rx] [x R 2Rx R+x] [x R out] [x out] [x out out>x]
+    c.extend(hex("6004 35 6000 54 81 81 02 6002 02 82 82 01 90 04 90 50 81 81 11"));
+    let sub_at = c.len() + 1;
+    c.extend(hex("6000 57"));
+    // no profit: [0], to the revert
+    c.extend(hex("50 50 6000"));
+    let rev_at = c.len() + 1;
+    c.extend(hex("6000 56"));
+    let sub = c.len();
+    c.extend(hex("5b 03")); // out - x
+    let rev = c.len();
+    c.extend(hex("5b 634e88422a 60e0 1b 6000 52 6004 52 6000 19 6024 52 6044 6000 fd"));
+    let trig = c.len();
+    c.extend(hex("5b 6000 35 6000 54 01 6000 55 00"));
+    c[trig_at] = trig as u8;
+    c[sub_at] = sub as u8;
+    c[rev_at] = rev as u8;
+    c
+}
+/// Profit of that contract (same integer maths).
+fn cpool_profit(x: u128, r: u128) -> u128 {
+    let out = 2 * r * x / (r + x);
+    out.saturating_sub(x)
+}
+/// The true best size by brute force (integer ternary search, then a scan).
+fn cpool_best(r: u128, lo: u128, hi: u128) -> u128 {
+    let (mut l, mut h) = (lo, hi);
+    while h - l > 8 {
+        let (m1, m2) = (l + (h - l) / 3, h - (h - l) / 3);
+        if cpool_profit(m1, r) < cpool_profit(m2, r) {
+            l = m1;
+        } else {
+            h = m2;
+        }
+    }
+    (l..=h).max_by_key(|x| (cpool_profit(*x, r), std::cmp::Reverse(*x))).unwrap()
+}
+
+const R0: u128 = 1_000_000_000_000;
+const R_ADD: u128 = 500_000_000_000;
+
+fn calc_setup() -> (MemState, arbsim::check::ordered::OrderedPlan, arbsim::check::ordered::PlanInfo, CallReq) {
+    let mut c = copy();
+    add_contract(&mut c, cpool(), cpool_code(), &[(U256::ZERO, U256::from(R0))]);
+    // The trigger: someone's swap moves our pool's reserve to 1.5x.
+    let trig = stx(&KEY_A, 0, cpool(), word(U256::from(R_ADD)).to_vec());
+    let mut b = base();
+    b.l2_block_number = Some(10);
+    let (plan, info) = build_plan(&feed(&trig, 11, vec![msg(11, &[trig.clone()])]), 10, 0, &b).unwrap();
+    // Our trade at the cap (1e12), the amount right after the 4-byte code.
+    let mut data = hex("deadbeef");
+    data.extend(word(U256::from(R0)));
+    let call = CallReq { from: caller(), to: Some(cpool()), data: Bytes::from(data), gas: Some(1_000_000), value: U256::ZERO };
+    (c, plan, info, call)
+}
+fn calc_params(compare: bool) -> CalcParams {
+    CalcParams { lo: U256::from(1_000_000_000u64), hi: U256::from(R0), loan_pips: 0, fit: true, backup: 0.6, max_probes: 12, compare }
+}
+fn prof_of(o: &arbsim::check::CallOutcome) -> u128 {
+    U256::from_be_slice(&o.output[4..36]).to::<u128>()
+}
+
+#[test]
+fn entry_calc_size_uses_the_state_after_the_trigger() {
+    let (c, plan, _, call) = calc_setup();
+    let ladder = vec![U256::from(100_000_000_000u64), U256::from(400_000_000_000u64)];
+    let lad = Ladder { amount_offset: 0, amounts: ladder.clone(), slots: vec![], calc: Some(calc_params(false)) };
+    let out = run_ordered_sizes(&c, &plan, &Overrides::none(), std::slice::from_ref(&call), &AllExact, true, &best(), Some(&lad)).unwrap();
+    assert_eq!(out.replayed.len(), 1, "the feed was replayed once");
+    let rep = out.calc.as_ref().expect("calc report");
+    assert_eq!(rep.out.method, Method::Fit, "{rep:?}");
+    let r_after = R0 + R_ADD;
+    let want = cpool_best(r_after, 1_000_000_000, R0);
+    let got = rep.out.calc.unwrap().to::<u128>();
+    println!("calc size after the trigger: {got} vs true best {want} (before the trigger it would be {}); {} runs, {} us [test numbers only]", cpool_best(R0, 1_000_000_000, R0), rep.out.probes, rep.us);
+    assert!((got as f64 - want as f64).abs() / (want as f64) < 0.01, "within 1% of the true best AFTER the trigger");
+    assert!((got as f64 - cpool_best(R0, 1_000_000_000, R0) as f64).abs() / (want as f64) > 0.2, "not the best size before the trigger");
+    // The calculated row is a real run at that size, the backup too (60%).
+    let row = rep.calc_row.as_ref().unwrap();
+    assert_eq!(row.amount.to::<u128>(), got);
+    assert_eq!(prof_of(row.outcome.as_ref().unwrap()), cpool_profit(got, r_after), "the row is our contract's real answer at that size");
+    let b = rep.backup_row.as_ref().unwrap();
+    assert!((b.amount.to::<u128>() as f64 / got as f64 - 0.6).abs() < 0.001);
+    assert_eq!(prof_of(b.outcome.as_ref().unwrap()), cpool_profit(b.amount.to::<u128>(), r_after));
+    // At least as good as every ladder size; the ladder didn't run (not asked to compare).
+    assert!(ladder.iter().all(|a| cpool_profit(a.to::<u128>(), r_after) <= cpool_profit(got, r_after)));
+    assert!(out.ladder.is_empty() && !rep.ladder_ran);
+    assert!(rep.out.probes <= 5, "a few runs: {}", rep.out.probes);
+    // The main answer (at the cap) is unchanged by all of this.
+    assert_eq!(prof_of(&out.results[0]), cpool_profit(R0, r_after));
+}
+
+#[test]
+fn entry_calc_size_compare_runs_the_ladder_too_and_failure_falls_back_to_it() {
+    let (c, plan, _, call) = calc_setup();
+    let amounts = vec![U256::from(100_000_000_000u64), U256::from(400_000_000_000u64)];
+    // Shadow: the ladder runs too (for the comparison), the calc still decides.
+    let lad = Ladder { amount_offset: 0, amounts: amounts.clone(), slots: vec![], calc: Some(calc_params(true)) };
+    let out = run_ordered_sizes(&c, &plan, &Overrides::none(), std::slice::from_ref(&call), &AllExact, true, &best(), Some(&lad)).unwrap();
+    let rep = out.calc.unwrap();
+    assert!(rep.ladder_ran && out.ladder.len() == 2 && rep.out.method == Method::Fit);
+    // Fallback: a contract whose answer needs a value we don't hold at most
+    // sizes (slot = the amount): the calculation can't measure ("failed"),
+    // the ladder runs and answers where it can.
+    let miss = addr(0x2002);
+    let mut c2 = copy();
+    add_contract(&mut c2, cpool(), cpool_code(), &[(U256::ZERO, U256::from(R0))]);
+    let main = U256::from(1_000u64);
+    add_contract(&mut c2, miss, hex("6004 35 54 634e88422a 60e0 1b 6000 52 6004 52 6000 19 6024 52 6044 6000 fd"), &[(main, U256::from(7u64)), (U256::from(400u64), U256::from(9u64))]);
+    let mut data = hex("deadbeef");
+    data.extend(word(main));
+    let call2 = CallReq { from: caller(), to: Some(miss), data: Bytes::from(data), gas: Some(1_000_000), value: U256::ZERO };
+    let p = CalcParams { lo: U256::from(10u64), hi: main, ..calc_params(false) };
+    let lad = Ladder { amount_offset: 0, amounts: vec![U256::from(100u64), U256::from(400u64)], slots: vec![], calc: Some(p) };
+    let out = run_ordered_sizes(&c2, &plan, &Overrides::none(), std::slice::from_ref(&call2), &AllExact, true, &best(), Some(&lad)).unwrap();
+    let rep = out.calc.unwrap();
+    assert_eq!(rep.out.method, Method::Failed, "{rep:?}");
+    assert!(rep.ladder_ran, "fallback: the ladder ran");
+    assert_eq!(out.ladder.len(), 2);
+    assert!(out.ladder[0].outcome.is_none(), "size 100: not answerable");
+    assert_eq!(prof_of(out.ladder[1].outcome.as_ref().unwrap()), 9, "size 400 answered");
+}
+
+#[test]
+fn entry_calc_size_on_the_wire() {
+    let (c, plan, info, call) = calc_setup();
+    let mk = |sizes: Option<WireSizes>| CallRequest {
+        id: json!(1),
+        calls: vec![serde_json::from_value(json!({ "from": format!("{:#x}", call.from), "to": format!("{:#x}", cpool()), "data": hexs(&call.data), "gas": "0xf4240" })).unwrap()],
+        sizes,
+        ..CallRequest::default()
+    };
+    let wire = |compare: bool, hi: Option<&str>| WireSizes {
+        amount_offset: 0,
+        amounts: vec![format!("{:#x}", 100_000_000_000u64), format!("{:#x}", 400_000_000_000u64)],
+        calc: Some(WireCalc { lo: format!("{:#x}", 1_000_000_000u64), hi: hi.map(|h| h.to_string()), loan_pips: 0, fit: true, backup: None, probes: None, compare }),
+    };
+    let a = handle_trig_call_with(&c, &plan, &info, &mk(Some(wire(false, None))), &AllExact, true, &best());
+    assert_eq!(a["ok"], json!(true), "{a}");
+    assert_eq!(a["calc"]["how"], json!("fit"));
+    assert_eq!(a["calc"]["ladder"], json!(false));
+    assert!(a["calc"]["us"].is_u64() && a["calc"]["probes"].as_u64().unwrap() >= 2);
+    let rows = a["sizes"].as_array().unwrap();
+    assert_eq!(rows.len(), 2, "calc + backup only (the ladder didn't run): {rows:?}");
+    assert_eq!(rows[0]["src"], json!("calc"));
+    assert_eq!(rows[1]["src"], json!("backup"));
+    assert_eq!(rows[0]["amount"], a["calc"]["size"]);
+    assert_eq!(rows[0]["status"], json!("profit"));
+    // The stop rule reads the calculated rows.
+    let p0 = arbsim::check::hexutil::parse_u256(rows[0]["profit"].as_str().unwrap()).unwrap();
+    let cc = json!({ "stop": format!("{:#x}", p0), "amt": format!("{:#x}", R0) });
+    assert!(arbsim::check::entry::good_enough(&a, &cc, "medium"), "the calculated size's profit counts for the stop rule");
+    // Compare (shadow): ladder rows first, then calc + backup.
+    let a = handle_trig_call_with(&c, &plan, &info, &mk(Some(wire(true, None))), &AllExact, true, &best());
+    let rows = a["sizes"].as_array().unwrap();
+    assert_eq!(rows.len(), 4);
+    assert!(rows[0].get("src").is_none() && rows[1].get("src").is_none() && rows[2]["src"] == json!("calc"));
+    // A hi above the main amount is cut to it (the bot's cap is never crossed).
+    let a = handle_trig_call_with(&c, &plan, &info, &mk(Some(wire(false, Some("0xffffffffffffffffffff")))), &AllExact, true, &best());
+    let size = arbsim::check::hexutil::parse_u256(a["calc"]["size"].as_str().unwrap()).unwrap();
+    assert!(size <= U256::from(R0));
+    // Calc only (no ladder amounts) still works.
+    let only = WireSizes { amounts: vec![], ..wire(false, None) };
+    let a = handle_trig_call_with(&c, &plan, &info, &mk(Some(only)), &AllExact, true, &best());
+    assert_eq!(a["calc"]["how"], json!("fit"), "{a}");
+}
+
+#[test]
+fn bench_entry_calc_vs_ladder_test_numbers_only() {
+    let (c, plan, _, call) = calc_setup();
+    let amounts = vec![U256::from(100_000_000_000u64), U256::from(400_000_000_000u64)];
+    let n = 200;
+    let time = |lad: &Ladder| {
+        let t = std::time::Instant::now();
+        let mut runs = 0;
+        for _ in 0..n {
+            let out = run_ordered_sizes(&c, &plan, &Overrides::none(), std::slice::from_ref(&call), &AllExact, true, &best(), Some(lad)).unwrap();
+            runs += out.calc.map_or(0, |r| r.out.probes);
+        }
+        (t.elapsed().as_micros() as f64 / n as f64, runs as f64 / n as f64)
+    };
+    let (lad_us, _) = time(&Ladder { amount_offset: 0, amounts: amounts.clone(), slots: vec![], calc: None });
+    let (calc_us, runs) = time(&Ladder { amount_offset: 0, amounts: amounts.clone(), slots: vec![], calc: Some(calc_params(false)) });
+    let (cmp_us, _) = time(&Ladder { amount_offset: 0, amounts, slots: vec![], calc: Some(calc_params(true)) });
+    println!(
+        "[bench, test numbers only] one replay + our trade: ladder (2 extra sizes) {lad_us:.1} us; calculated size {calc_us:.1} us ({runs:.1} runs incl. backup); calc + ladder comparison {cmp_us:.1} us ({} build, tiny test contract: real pools cost more per run)",
+        if cfg!(debug_assertions) { "debug" } else { "release" }
+    );
 }

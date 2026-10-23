@@ -94,7 +94,37 @@ pub struct WireSizes {
     #[serde(rename = "amountOffset")]
     pub amount_offset: usize,
     /// The other amounts to try (hex), at most 8.
+    #[serde(default)]
     pub amounts: Vec<String>,
+    /// CALCULATED SIZE (check/sizing.rs): work out the most profitable size
+    /// on the same replay and run it (plus a backup). Missing = ladder only
+    /// (the old question, unchanged).
+    #[serde(default)]
+    pub calc: Option<WireCalc>,
+}
+
+/// `sizes.calc`: `{"lo":"0x..", "hi":"0x.."?, "loanPips":N?, "fit":bool?,
+/// "backup":0.6?, "probes":12?, "compare":bool?}`. hi defaults to (and is
+/// never above) the main call's amount: the bot's cap.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct WireCalc {
+    pub lo: String,
+    #[serde(default)]
+    pub hi: Option<String>,
+    #[serde(default, rename = "loanPips")]
+    pub loan_pips: u32,
+    #[serde(default = "yes")]
+    pub fit: bool,
+    #[serde(default)]
+    pub backup: Option<f64>,
+    #[serde(default)]
+    pub probes: Option<usize>,
+    #[serde(default)]
+    pub compare: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 /// Block details for one request: the server's, plus the request's changes.
@@ -335,19 +365,27 @@ pub fn handle_trig_call_with(
     let lad = req.sizes.as_ref().and_then(|z| ladder_of(&ov, &calls, z));
     match super::ordered::run_ordered_sizes(view, plan, &ov, &calls, prov, strict_call, assume, lad.as_ref()) {
         Ok(out) => {
+            // Ladder sizes, then the calculated size and its backup (src "calc" / "backup").
             let ladder = lad.as_ref().map(|_| {
-                Value::Array(
-                    out.ladder
-                        .iter()
-                        .map(|r| match &r.outcome {
-                            Some(o) => {
-                                let t = super::search::classify(r.amount, o);
-                                serde_json::json!({ "amount": quantity(t.amount), "status": t.status, "profit": quantity(t.profit), "gasUsed": quantity_u64(t.gas_used), "reason": t.reason })
-                            }
-                            None => serde_json::json!({ "amount": quantity(r.amount), "status": "unknown", "reason": "not answerable at this size" }),
-                        })
-                        .collect(),
-                )
+                let mut v: Vec<Value> = out.ladder.iter().map(|r| size_row(r, None)).collect();
+                if let Some(c) = &out.calc {
+                    v.extend(c.calc_row.iter().map(|r| size_row(r, Some("calc"))));
+                    v.extend(c.backup_row.iter().map(|r| size_row(r, Some("backup"))));
+                }
+                Value::Array(v)
+            });
+            // How the size was calculated (log): method, sizes, runs, time.
+            let calc = out.calc.as_ref().map(|c| {
+                serde_json::json!({
+                    "how": c.out.method.as_str(),
+                    "size": c.out.calc.map(quantity),
+                    "fit": c.out.fit_size.map(quantity),
+                    "backup": c.out.backup.map(quantity),
+                    "probes": c.out.probes,
+                    "why": c.out.why,
+                    "ladder": c.ladder_ran,
+                    "us": c.us,
+                })
             });
             // One fingerprint of how every replayed transaction ended
             // (success + output; gas is left out so the protocol-fee runs,
@@ -386,6 +424,9 @@ pub fn handle_trig_call_with(
             if let (Some(l), Some(o)) = (ladder, a.as_object_mut()) {
                 o.insert("sizes".into(), l);
             }
+            if let (Some(c), Some(o)) = (calc, a.as_object_mut()) {
+                o.insert("calc".into(), c);
+            }
             a
         }
         Err(u) => unknown_json(&req.id, &u, t0.elapsed().as_micros()),
@@ -397,7 +438,7 @@ pub fn handle_trig_call_with(
 /// it should be). The trading-money slots are the pretend slots that hold
 /// exactly the original amount.
 fn ladder_of(ov: &Overrides, calls: &[CallReq], z: &WireSizes) -> Option<super::ordered::Ladder> {
-    if calls.len() != 1 || z.amounts.is_empty() {
+    if calls.len() != 1 || (z.amounts.is_empty() && z.calc.is_none()) {
         return None;
     }
     let data = &calls[0].data;
@@ -419,7 +460,44 @@ fn ladder_of(ov: &Overrides, calls: &[CallReq], z: &WireSizes) -> Option<super::
             }
         }
     }
-    Some(super::ordered::Ladder { amount_offset: z.amount_offset, amounts, slots })
+    // Calculated size: between lo and the cap (the main call's amount, or a
+    // smaller hi). A calc we can't read is left out (the ladder answers).
+    let calc = z.calc.as_ref().and_then(|c| {
+        let lo = parse_u256(&c.lo).ok()?;
+        let hi = match &c.hi {
+            Some(h) => parse_u256(h).ok()?.min(original),
+            None => original,
+        };
+        Some(super::sizing::CalcParams {
+            lo,
+            hi,
+            loan_pips: c.loan_pips,
+            fit: c.fit,
+            backup: c.backup.filter(|b| b.is_finite() && *b >= 0.0 && *b < 1.0).unwrap_or(super::sizing::DEFAULT_BACKUP),
+            max_probes: c.probes.unwrap_or(super::sizing::DEFAULT_PROBES).clamp(2, super::sizing::MAX_PROBES),
+            compare: c.compare,
+        })
+    });
+    if amounts.is_empty() && calc.is_none() {
+        return None;
+    }
+    Some(super::ordered::Ladder { amount_offset: z.amount_offset, amounts, slots, calc })
+}
+
+/// One extra size's row in the answer's `sizes` (src: where it came from;
+/// None = a ladder size).
+fn size_row(r: &super::ordered::LadderRow, src: Option<&str>) -> Value {
+    let mut v = match &r.outcome {
+        Some(o) => {
+            let t = super::search::classify(r.amount, o);
+            serde_json::json!({ "amount": quantity(t.amount), "status": t.status, "profit": quantity(t.profit), "gasUsed": quantity_u64(t.gas_used), "reason": t.reason })
+        }
+        None => serde_json::json!({ "amount": quantity(r.amount), "status": "unknown", "reason": "not answerable at this size" }),
+    };
+    if let (Some(s), Some(o)) = (src, v.as_object_mut()) {
+        o.insert("src".into(), Value::String(s.into()));
+    }
+    v
 }
 
 /// Run a `size_search` request on `view`.

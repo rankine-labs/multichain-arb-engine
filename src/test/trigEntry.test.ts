@@ -40,7 +40,12 @@ const LENDER = '0x' + 'cd'.repeat(20);
 const EXECUTOR = '0x' + 'ee'.repeat(20);
 
 // Fake fast check. Profit (start-coin units, 6 decimals = $) by trade amount.
-function fakeSidecar(o: { pools?: string[]; discover?: Asked; profitAt?: (amount: bigint) => bigint; profitFor?: (pool: string) => bigint | undefined; conf?: string; assumed?: string[]; delayMs?: number } = {}) {
+// Calculated size (sizes.calc): the fake works it out by trying 400 sizes
+// between lo and the main amount (the real sidecar: sim/src/check/sizing.rs)
+// and answers like the real one: calc + backup rows (src), the ladder rows
+// only when comparing or when the calculation failed, and `calc`.
+// calcHow: 'fit' (default) / 'none' / 'failed' / 'old' (an older sidecar: ignores calc).
+function fakeSidecar(o: { pools?: string[]; discover?: Asked; profitAt?: (amount: bigint) => bigint; profitFor?: (pool: string) => bigint | undefined; conf?: string; assumed?: string[]; delayMs?: number; calcHow?: 'fit' | 'none' | 'failed' | 'old'; calcAbove?: boolean } = {}) {
   const asked: Asked[] = [];
   const conc = { now: 0, max: 0 };
   const profitAt = o.profitAt ?? (() => 2_000_000n);
@@ -59,9 +64,26 @@ function fakeSidecar(o: { pools?: string[]; discover?: Asked; profitAt?: (amount
         // Which candidate: its first route key (the buy pool), sent as feed.route.
         const forPool = o.profitFor?.((m.feed?.route ?? [])[0] ?? '');
         const pf = (a: bigint) => forPool ?? profitAt(a);
-        const sizes = m.sizes ? (m.sizes.amounts as string[]).map((a) => ({ amount: a, status: 'profit', profit: '0x' + pf(BigInt(a)).toString(16), gasUsed: '0x1' })) : undefined;
+        const row = (a: bigint, src?: string) => { const p = pf(a); return { amount: '0x' + a.toString(16), status: p > 0n ? 'profit' : 'loss', profit: '0x' + p.toString(16), gasUsed: '0x1', ...(src ? { src } : {}) }; };
+        const how = o.calcHow ?? 'fit';
+        const cq = m.sizes?.calc && how !== 'old' ? m.sizes.calc : undefined;
+        let calc: Asked | undefined;
+        let sizes = m.sizes ? (m.sizes.amounts as string[]).map((a) => ({ ...row(BigInt(a)), status: 'profit' })) : undefined;
+        if (cq) {
+          const lo = BigInt(cq.lo);
+          let best = lo;
+          for (let i = 0; i <= 400; i++) {
+            const x = BigInt(Math.floor(Math.exp(Math.log(Number(lo)) + (Math.log(Number(amount)) - Math.log(Number(lo))) * i / 400)));
+            if (x >= lo && x <= amount && pf(x) > pf(best)) best = x;
+          }
+          if (o.calcAbove) best = amount * 2n;
+          const back = (best * 6n) / 10n;
+          const ladder = cq.compare || how === 'failed' ? sizes ?? [] : [];
+          sizes = [...ladder, ...(how === 'fit' ? [row(best, 'calc'), row(back, 'backup')] : [])];
+          calc = { how, ...(how === 'fit' ? { size: '0x' + best.toString(16), backup: '0x' + back.toString(16) } : {}), probes: 4, us: 37, ladder: ladder.length > 0, why: how === 'failed' ? 'the smallest size can\'t be answered' : null };
+        }
         return { id: 1, ok: true, us: 500, results: [{ success: false, output: insufficient(pf(amount)), gasUsed: '0x5208' }],
-          trig: { snapBlock: 100, included: false, triggerOk: true, msgs: 1, txs: 1, later: 0, lastSeq: 101, conf: o.conf ?? 'high', assumed: o.assumed ?? [] }, ...(sizes ? { sizes } : {}) };
+          trig: { snapBlock: 100, included: false, triggerOk: true, msgs: 1, txs: 1, later: 0, lastSeq: 101, conf: o.conf ?? 'high', assumed: o.assumed ?? [] }, ...(sizes ? { sizes } : {}), ...(calc ? { calc } : {}) };
       }
       return { id: 1, ok: false, unknown: 'bad_request' };
     },
@@ -195,7 +217,7 @@ async function main() {
   // ---- size ladder: the best size wins ------------------------------------------------------
   {
     const profitAt = (a: bigint) => (a === 50_000_000n ? 500_000n : a === 150_000_000n ? 2_000_000n : a === 400_000_000n ? 1_000_000n : 0n);
-    const { tf, te, sc } = setup({ mode: 'shadow', sidecar: fakeSidecar({ profitAt }) });
+    const { tf, te, sc } = setup({ mode: 'shadow', sidecar: fakeSidecar({ profitAt }), env: { TRIG_ENTRY_SIZE_MODE: 'ladder' } });
     tf.onFeedMsgs(msgs, Date.now());
     const rec = await te.process(hash, Date.now());
     const call = sc.asked.find((m) => m.type === 'call')!;
@@ -246,7 +268,7 @@ async function main() {
 
   // ---- SHADOW never sends ---------------------------------------------------------------------
   {
-    const { tf, te, spies, file, log } = setup({ mode: 'shadow' });
+    const { tf, te, spies, file, log } = setup({ mode: 'shadow', env: { TRIG_ENTRY_SIZE_MODE: 'ladder' } });
     tf.onFeedMsgs(msgs, Date.now());
     const rec = await te.process(hash, Date.now());
     assert(spies.sends === 0 && rec!.wouldSend === true, 'shadow: computed and logged as "would send", never sent');
@@ -350,6 +372,113 @@ async function main() {
     assert(sc.conc.max === 2, `never more than TRIG_ENTRY_MAX_CHECKS (2) candidate checks at once over all triggers (max seen ${sc.conc.max})`);
     assert(r1!.tried === 6 && r2!.tried === 6, 'every candidate still checked within the deadline');
     assert(Date.now() - t0 < 6 * 15 * 2, 'two at a time: about half the serial time');
+  }
+
+  // ---- CALCULATED SIZE (TRIG_ENTRY_SIZE_MODE=calc, the default) ------------------------------------------
+  // A profit hill with its top at $640 ($12.80 before gas): the ladder's
+  // best would be $400 ($11.00), the cap $1000 makes $8.75.
+  const X = 640_000_000n;
+  const hill = (a: bigint) => (a >= 2n * X ? 0n : (a * (2n * X - a)) / (X * 50n));
+  {
+    const s = entrySettings({}, 0.25);
+    assert(s.sizeMode === 'calc' && s.calcMinUsd === 10 && s.calcBackup === 0.6 && s.calcProbes === 12 && s.calcCompare === 'auto', 'defaults: size calculated ($10 up to the cap, backup 60%, 12 runs, compare in shadow)');
+    assert(entrySettings({ TRIG_ENTRY_SIZE_MODE: 'ladder' }, 0.25).sizeMode === 'ladder', 'TRIG_ENTRY_SIZE_MODE=ladder: back to the ladder');
+  }
+  {
+    const { tf, te, sc, file, log } = setup({ mode: 'shadow', sidecar: fakeSidecar({ profitAt: hill }) });
+    tf.onFeedMsgs(msgs, Date.now());
+    const rec = await te.process(hash, Date.now());
+    const call = sc.asked.find((m) => m.type === 'call')!;
+    const amt = BigInt('0x' + call.calls[0].data.slice(2 + 8 + 192, 2 + 8 + 256));
+    assert(amt === 1_000_000_000n, 'calc: our check is asked at the cap ($1000 = maxSizeUsd)');
+    assert(call.sizes?.calc?.lo === '0x' + (10_000_000).toString(16) && call.sizes.calc.compare === true && call.sizes.amounts.length === 3,
+      'calc: the sidecar calculates between $10 and the cap; the ladder ($50/$150/$400) rides along; shadow compares');
+    assert(!!rec!.best && Math.abs(rec!.best.sizeUsd - 640) / 640 < 0.01 && Math.abs(rec!.best.netUsd - 12.75) < 0.01, `calc: the calculated size is picked ($${rec!.best?.sizeUsd.toFixed(0)}, net $${rec!.best?.netUsd.toFixed(2)})`);
+    await sleep(80);
+    await log.flush();
+    const l = readFileSync(file, 'utf8').trim().split('\n').map((x) => JSON.parse(x)).find((x) => x.k === 'trig_entry');
+    const z = l?.sz;
+    assert(!!z && z.m === 'calc' && z.how === 'fit' && Math.abs(z.calc - 640) < 7 && Math.abs(z.ch - 640) < 7 && Math.abs(z.pc - 12.8) < 0.01 && Math.abs(z.pb - 10.75) < 0.05 && z.pr === 4 && z.us === 37,
+      `log "sz": mode, how, calculated / chosen size, profit at calc vs backup, runs, sizing us (${JSON.stringify(z)})`);
+    assert(z.lad === 10.95 && z.cn > z.lad, `shadow: what the ladder would have made ($${z?.lad}) next to the calculated size ($${z?.cn})`);
+    const line = te.takeHourLine() ?? '';
+    assert(/sizing: 100% of 1 answers sized by calculation \(fit 1\), sizing time median 37 us/.test(line) && /calc vs ladder \(same replay\): calc better 1/.test(line), `hourly: share sized by calculation, median sizing time, calc vs ladder (${line.slice(line.indexOf('sizing'), line.indexOf('sizing') + 200)})`);
+  }
+  // KEY ACCEPTANCE (calc mode): a profitable trigger reaches the sender at
+  // the calculated size, without waiting for reports / receipts, no node.
+  {
+    let sentSize = 0;
+    const { tf, te, sc, spies } = setup({ mode: 'on', sidecar: fakeSidecar({ profitAt: hill }), deps: { send: async (p) => { spies.sends++; spies.sendWaits.push(0); sentSize = p.sizeUsd; return { signedMs: Date.now() }; } } });
+    tf.onFeedMsgs(msgs, Date.now());
+    const rec = await te.process(hash, Date.now());
+    const call = sc.asked.find((m) => m.type === 'call')!;
+    assert(spies.sends === 1 && rec!.submitMs !== undefined && Math.abs(sentSize - 640) / 640 < 0.01, `calc, on: sent at the calculated size ($${sentSize.toFixed(0)})`);
+    assert(sc.asked.every((m) => m.type === 'trig_discover' || (m.type === 'call' && !!m.feed)), 'calc, on: only fast-check questions on the replayed feed (no waiting, no node)');
+    assert(call.sizes?.calc?.compare === undefined, 'on mode: no ladder comparison (fewer runs)');
+  }
+  {
+    // The real waiting counter: nothing waited before the send.
+    const { tf, te, spies } = setup({ mode: 'on', sidecar: fakeSidecar({ profitAt: hill }) });
+    tf.onFeedMsgs(msgs, Date.now());
+    await te.process(hash, Date.now());
+    assert(spies.sends === 1 && spies.sendWaits[0] === 0, 'calc, on: sent WITHOUT copy2WaitForTx / waitForTrade before the send');
+  }
+  {
+    // Hook pool + lender fee: told to the sidecar.
+    const c = { ...cand(), hooked: true, loanPips: 500 };
+    const { tf, te, sc } = setup({ mode: 'shadow', cands: [c], sidecar: fakeSidecar({ profitAt: hill }) });
+    tf.onFeedMsgs(msgs, Date.now());
+    await te.process(hash, Date.now());
+    const call = sc.asked.find((m) => m.type === 'call')!;
+    assert(call.sizes?.calc?.fit === false && call.sizes.calc.loanPips === 500, 'hooked route: the sidecar is told to search (no curve fit); the lender fee is passed');
+  }
+  {
+    // Calculation failed: the ladder rows (same replay) decide, as before.
+    const { tf, te } = setup({ mode: 'shadow', sidecar: fakeSidecar({ profitAt: hill, calcHow: 'failed' }) });
+    tf.onFeedMsgs(msgs, Date.now());
+    const rec = await te.process(hash, Date.now());
+    assert(rec!.best?.sizeUsd === 400 && rec!.sz?.how === 'failed', `calc failed: the ladder's best size is used ($${rec!.best?.sizeUsd})`);
+  }
+  {
+    // An older sidecar (no calc answer): the ladder rows decide.
+    const { tf, te } = setup({ mode: 'shadow', sidecar: fakeSidecar({ profitAt: hill, calcHow: 'old' }) });
+    tf.onFeedMsgs(msgs, Date.now());
+    const rec = await te.process(hash, Date.now());
+    assert(rec!.best?.sizeUsd === 400 && rec!.sz?.how === 'no_answer', 'older sidecar: the ladder decides');
+  }
+  {
+    // Tiny gap: no profitable size (calc "none") -> nothing to send.
+    const { tf, te, spies } = setup({ mode: 'on', sidecar: fakeSidecar({ profitAt: () => 0n, calcHow: 'none' }) });
+    tf.onFeedMsgs(msgs, Date.now());
+    const rec = await te.process(hash, Date.now());
+    assert(spies.sends === 0 && !rec!.best && rec!.sz?.how === 'none', 'tiny gap: no size, nothing sent');
+    // A tiny profit under gas + minimum: calculated, not sent.
+    const t = setup({ mode: 'on', sidecar: fakeSidecar({ profitAt: (a) => hill(a) / 100n }) });
+    t.tf.onFeedMsgs(msgs, Date.now());
+    const r2 = await t.te.process(hash, Date.now());
+    assert(t.spies.sends === 0 && !!r2!.best && r2!.best.netUsd < 0.25, `tiny gap: best size still under the send minimum after gas (net $${r2!.best?.netUsd.toFixed(3)}), not sent`);
+  }
+  {
+    // Caps: a smaller cap (wallet room) moves the main size; a calculated
+    // row above the cap (bad data) is never used.
+    const { tf, te, sc } = setup({ mode: 'shadow', cands: [cand('capped', 300)], sidecar: fakeSidecar({ profitAt: hill }) });
+    tf.onFeedMsgs(msgs, Date.now());
+    const rec = await te.process(hash, Date.now());
+    const call = sc.asked.find((m) => m.type === 'call')!;
+    const amt = BigInt('0x' + call.calls[0].data.slice(2 + 8 + 192, 2 + 8 + 256));
+    assert(amt === 300_000_000n && call.sizes.amounts.length === 2 && rec!.best!.sizeUsd <= 300, `cap $300: asked at $300, ladder $50/$150, picked $${rec!.best?.sizeUsd.toFixed(0)}`);
+    const x = setup({ mode: 'shadow', sidecar: fakeSidecar({ profitAt: () => 2_000_000n, calcAbove: true }) });
+    x.tf.onFeedMsgs(msgs, Date.now());
+    const r = await x.te.process(hash, Date.now());
+    assert(!!r!.best && r!.best.sizeUsd <= 1_000, 'a calculated size above the cap is ignored');
+  }
+  {
+    // Ladder mode: no calculation asked.
+    const { tf, te, sc } = setup({ mode: 'shadow', sidecar: fakeSidecar({ profitAt: hill }), env: { TRIG_ENTRY_SIZE_MODE: 'ladder' } });
+    tf.onFeedMsgs(msgs, Date.now());
+    const rec = await te.process(hash, Date.now());
+    const call = sc.asked.find((m) => m.type === 'call')!;
+    assert(!call.sizes?.calc && rec!.best?.sizeUsd === 400 && rec!.sz?.m === 'ladder', 'TRIG_ENTRY_SIZE_MODE=ladder: the old ladder, unchanged');
   }
 
   // ---- timing (TEST NUMBERS, fake sidecar answering at once: the bot's own overhead) -------------------

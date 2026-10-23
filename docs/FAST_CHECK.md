@@ -415,9 +415,20 @@ and only after the 6 h "pair blocked" / benched lists (15 of 16 chances in
    starting from USDG / WETH, with the usual exchange / coin rules, size caps
    and lender (at most `TRIG_ENTRY_MAX_CANDIDATES`).
 4. Each candidate gets the full trigger-first check (every feed transaction
-   in order, then our exact trade) at the biggest size of
-   `TRIG_ENTRY_SIZES_USD`; the smaller sizes run on the same replay in the same
-   request (size ladder). Best net after gas wins.
+   in order, then our exact trade). SIZE (Oct 23, `TRIG_ENTRY_SIZE_MODE=calc`,
+   default): the check is asked at the cap (the candidate's biggest allowed
+   size) and the sidecar CALCULATES the most profitable size on the pools
+   right after the trigger (`sim/src/check/sizing.rs`, same request, same
+   replay): it measures sizes with our real contract and uses the pool curve
+   (for V2 / in-range V3 the best size, where the two prices meet after
+   fees, follows from two measured sizes) to land in a few runs; routes with
+   a hook pool, or curves that don't fit, use a search with real runs
+   instead. That size and a backup (60%) are run and the best net after gas
+   of cap / calculated / backup wins. If the calculation can't measure, the
+   ladder `TRIG_ENTRY_SIZES_USD` (sent along) runs on the same replay and
+   decides, as before; in shadow the ladder also runs for comparison (log
+   `sz.lad` vs `sz.cn`). `TRIG_ENTRY_SIZE_MODE=ladder` = the old ladder only
+   (biggest ladder size checked, the smaller ones on the same replay).
 5. Profitable (`MIN_EXEC_NET_USD`) at `TRIG_FIRST_MIN_CONFIDENCE` or better:
    `on` sends at once, `shadow` logs "would send".
 
@@ -437,7 +448,12 @@ paths). One send per trigger: the entry point and the old path share a lock.
 | `TRIG_ENTRY_MAX_POOLS` | `4` | more moved pools than this = suspicious answer: skipped, logged `u:"too_many_pools"` |
 | `TRIG_ENTRY_PARALLEL` | `2` | candidate checks of one trigger at once (best-ranked first; stops at the first sure answer good enough to send) |
 | `TRIG_ENTRY_MAX_CHECKS` | `2` | candidate checks at once over ALL triggers (the sidecar has `ARBSIM_WORKERS` workers, default 2, shared with the old paths) |
-| `TRIG_ENTRY_SIZES_USD` | `50,150,400` | size ladder ($), capped by the trade / wallet limits |
+| `TRIG_ENTRY_SIZES_USD` | `50,150,400` | size ladder ($), capped by the trade / wallet limits (calc mode: fallback + shadow comparison) |
+| `TRIG_ENTRY_SIZE_MODE` | `calc` | `calc` = calculated best size (ladder as fallback); `ladder` = the fixed ladder only |
+| `TRIG_ENTRY_CALC_MIN_USD` | `10` | smallest size the calculation looks at ($) |
+| `TRIG_ENTRY_CALC_BACKUP` | `0.6` | backup size, share of the calculated size (0 = none) |
+| `TRIG_ENTRY_CALC_PROBES` | `12` | most contract runs one calculation may use (backup included; 2..24) |
+| `TRIG_ENTRY_CALC_COMPARE` | `auto` | also run the ladder to compare: `auto` = in shadow mode only, `on`, `off` |
 | `TRIG_ENTRY_DISCOVER_TIMEOUT_MS` | `40` | the "which pools?" question |
 | `TRIG_ENTRY_DEADLINE_MS` | `250` | the whole trigger (discover + checks) |
 

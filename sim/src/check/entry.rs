@@ -16,7 +16,8 @@
 //   call, already built by the bot (same code the two-step path uses). So
 //   ONE question (`trig_entry`, server.rs) does it all: discover the moved
 //   pools, pick the candidates for them the same way the bot does, check
-//   them on the replayed feed (with the size ladder), and answer once.
+//   them on the replayed feed (with the calculated size, check/sizing.rs,
+//   or the size ladder), and answer once.
 //
 //   Picking (must equal the bot's execution/trigEntry.ts enumerateRoutes +
 //   rankRoutes, tested with one shared fixture by both sides):
@@ -214,8 +215,9 @@ fn conf_rank(c: &str) -> usize {
 }
 
 /// STOP RULE: would the bot send on this answer? A sure answer at or above
-/// `min_conf` with a profit (main size or a ladder size) of at least `stop`
-/// units and not more than the size itself.
+/// `min_conf` with a profit (main size, a calculated size, or a ladder size
+/// when no size was calculated) of at least `stop` units and not more than
+/// the size itself.
 pub fn good_enough(answer: &Value, c: &Value, min_conf: &str) -> bool {
     if answer.get("ok") != Some(&Value::Bool(true)) {
         return false;
@@ -240,9 +242,12 @@ pub fn good_enough(answer: &Value, c: &Value, min_conf: &str) -> bool {
             }
         }
     }
-    // Ladder sizes.
+    // Extra sizes. With a calculated size (calc.how not "failed") the bot
+    // picks only the main size and the calculated rows (src calc / backup);
+    // ladder rows there are for comparison only. Otherwise the ladder rows.
+    let calc_ok = answer.get("calc").and_then(|c| c.get("how")).and_then(|h| h.as_str()).is_some_and(|h| h != "failed");
     answer.get("sizes").and_then(|s| s.as_array()).is_some_and(|rows| {
-        rows.iter().any(|row| {
+        rows.iter().filter(|row| !calc_ok || row.get("src").is_some()).any(|row| {
             row.get("status").and_then(|s| s.as_str()) == Some("profit")
                 && match (row.get("amount").and_then(|a| a.as_str()).and_then(|a| parse_u256(a).ok()), row.get("profit").and_then(|p| p.as_str()).and_then(|p| parse_u256(p).ok())) {
                     (Some(a), Some(p)) => ok_row(a, p),
@@ -293,5 +298,11 @@ mod tests {
         assert!(good_enough(&lad, &c("0x32"), "medium"));
         let silly = json!({"ok": true, "results": [], "sizes": [{"amount": "0x10", "status": "profit", "profit": "0x40"}]});
         assert!(!good_enough(&silly, &c("0x32"), "medium"), "profit above the size is bad data");
+        // Calculated size: only its rows count (the ladder ran for comparison).
+        let cmp = json!({"ok": true, "results": [], "calc": {"how": "fit"}, "sizes": [{"amount": "0x64", "status": "profit", "profit": "0x40"}, {"amount": "0x50", "status": "profit", "profit": "0x20", "src": "calc"}]});
+        assert!(!good_enough(&cmp, &c("0x32"), "medium"), "a ladder row doesn't count when a size was calculated");
+        assert!(good_enough(&cmp, &c("0x20"), "medium"), "the calculated row counts");
+        let failed = json!({"ok": true, "results": [], "calc": {"how": "failed"}, "sizes": [{"amount": "0x64", "status": "profit", "profit": "0x40"}]});
+        assert!(good_enough(&failed, &c("0x32"), "medium"), "calculation failed: the ladder decides");
     }
 }

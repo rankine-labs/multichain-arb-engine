@@ -28,6 +28,7 @@
 //   ordered.rs          trigger-first: feed transactions in sequence order
 //                       (several blocks), then our calls, strictly watched
 //   search.rs           size_search(): finds the most profitable trade size
+//   sizing.rs           calc_size(): the best size on the replayed feed (entry point)
 //   proto_types.rs      socket request/answer shapes + handle_call/handle_size_search
 //   fixture.rs, cli.rs  test files (fixtures) and the check-fixture/bench-fixture commands
 // ============================================================================
@@ -48,6 +49,8 @@ pub mod proto_types;
 pub mod rawtx;
 pub mod run;
 pub mod search;
+// Calculated trade size on the replayed feed (trigger-first entry point).
+pub mod sizing;
 
 pub use overrides::{AccountOverride, Overrides};
 pub use run::{run_calls, run_calls_opts, BlockEnvMode, CheckOptions, Session};
