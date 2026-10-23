@@ -69,6 +69,58 @@ export interface FeedMsg {
 
 const L2_KIND_HEARTBEAT = 6; // carries nothing
 
+// ----------------------------------------------------------------------------
+// DECODE EACH TRANSACTION ONCE (freeze fix, Oct 23)
+//
+// Plain English: every feed transaction used to be unpacked three times
+// and its fingerprint (hash) worked out twice, by three different parts of
+// the bot, all inside the same feed message:
+//   1. the trigger-first order buffer (parseFeedMessages: hash)
+//   2. the trigger entry point's "skip it?" test (trigEntry.quickSkip: unpack)
+//   3. the trade decoder's list (parseFeedFrame: unpack + hash again)
+// Measured on a test machine (labelled TEST numbers, 1 KB swap):
+//   unpack (ethers Transaction.from) ~255 us, hash of the text form ~186 us,
+//   hash of the raw bytes ~75 us. So ~0.9 ms of frozen bot per transaction,
+//   ~36 ms for a busy 40-transaction message, and seconds for the backlog a
+//   feed reconnect replays.
+// Now: the hash is taken from the bytes we already have (same answer, no
+// text-to-bytes step), and both the hash and the unpacked transaction are
+// remembered for the last few thousand transactions, so the second and third
+// readers get them for free. Same results, byte for byte (tested).
+//
+// Switch: FEED_TX_MEMO=0 turns the memory off (every reader unpacks again,
+// as before). Memory: at most MEMO_MAX entries (~2 KB each), then cleared.
+// ----------------------------------------------------------------------------
+const MEMO_MAX = 4_096;
+const hashMemo = new Map<string, string>();
+const txMemo = new Map<string, Transaction | null>();
+function memoOn(): boolean { return process.env.FEED_TX_MEMO !== '0'; }
+
+// Forget everything remembered (tests: measure the first, uncached pass).
+export function clearFeedTxMemo(): void { hashMemo.clear(); txMemo.clear(); }
+
+// Hash (keccak256) of a signed transaction. `bytes` = the same transaction
+// as raw bytes, when the caller already has them (saves the text-to-bytes step).
+export function feedTxHash(raw: string, bytes?: Uint8Array): string {
+  const on = memoOn();
+  if (on) { const h = hashMemo.get(raw); if (h !== undefined) return h; }
+  const h = keccak256(bytes ?? raw);
+  if (on) { if (hashMemo.size >= MEMO_MAX) hashMemo.clear(); hashMemo.set(raw, h); }
+  return h;
+}
+
+// The signed transaction unpacked (ethers Transaction), or null when ethers
+// can't read it. Remembered (see above), so a transaction already unpacked
+// by another reader is not unpacked again. Never throws.
+export function decodeFeedTx(raw: string): Transaction | null {
+  const on = memoOn();
+  if (on) { const t = txMemo.get(raw); if (t !== undefined) return t; }
+  let tx: Transaction | null;
+  try { tx = Transaction.from(raw); } catch { tx = null; }
+  if (on) { if (txMemo.size >= MEMO_MAX) txMemo.clear(); txMemo.set(raw, tx); }
+  return tx;
+}
+
 // Pulls every signed transaction (that calls a contract) out of one l2Msg.
 // Transactions plus their raw signed bytes (the raw bytes give the tx hash
 // directly, see parseFeedFrame).
@@ -86,7 +138,9 @@ function parseL2MessageRaw(bytes: Uint8Array, depth = 0): ParsedTx[] {
   if (kind === L2_KIND_SIGNED_TX) {
     try {
       const raw = '0x' + Buffer.from(body).toString('hex');
-      return [{ tx: Transaction.from(raw), raw }];
+      // Unpacked once and remembered (see decodeFeedTx); null = can't parse.
+      const tx = decodeFeedTx(raw);
+      return tx ? [{ tx, raw }] : []; // not a tx we can parse; skip, don't crash
     } catch {
       return []; // not a tx we can parse; skip, don't crash
     }
@@ -120,7 +174,8 @@ function collectL2Strict(bytes: Uint8Array, depth: number, out: FeedMsgTx[], pro
   if (kind === L2_KIND_SIGNED_TX) {
     if (!body.length) { problems.push('empty signed transaction'); return; }
     const raw = '0x' + Buffer.from(body).toString('hex');
-    out.push({ hash: keccak256(raw), raw });
+    // Hash from the bytes we already hold (same answer as hashing `raw`).
+    out.push({ hash: feedTxHash(raw, body), raw });
     return;
   }
   if (kind === L2_KIND_BATCH) {
@@ -164,11 +219,18 @@ function feedMsgOf(m: any): FeedMsg | null {
 }
 
 // Every message of a frame, complete (see above). Never throws.
-export function parseFeedMessages(frame: unknown): FeedMsg[] {
+// `afterSeq` (freeze fix, Oct 23): only messages with a HIGHER sequence
+// number are unpacked. After a feed reconnect the broadcaster replays its
+// backlog (often hundreds of messages we already have); unpacking those
+// again froze the bot for no gain (the order buffer keeps one copy per
+// sequence number anyway, and the trigger entry point must not treat old
+// transactions as new triggers). Not given = every message, as before.
+export function parseFeedMessages(frame: unknown, afterSeq?: number): FeedMsg[] {
   const messages = (frame as any)?.messages;
   if (!Array.isArray(messages)) return [];
   const out: FeedMsg[] = [];
   for (const m of messages) {
+    if (afterSeq !== undefined && typeof m?.sequenceNumber === 'number' && m.sequenceNumber <= afterSeq) continue;
     try { const f = feedMsgOf(m); if (f) out.push(f); } catch { /* skip */ }
   }
   return out;
@@ -223,7 +285,8 @@ export function parseFeedFrame(frame: unknown): FeedTx[] {
       try {
         if (!tx.to || !tx.data || tx.data === '0x') continue; // plain transfers aren't swaps
         // A tx hash is keccak256 of its raw signed bytes: no ethers validation involved.
-        const out = { sequenceNumber: seq, hash: keccak256(raw), to: tx.to, data: tx.data, value: tx.value.toString(), raw, txIndex } as FeedTx;
+        // (Remembered from the order buffer's pass over the same message.)
+        const out = { sequenceNumber: seq, hash: feedTxHash(raw), to: tx.to, data: tx.data, value: tx.value.toString(), raw, txIndex } as FeedTx;
         // SENDER ("from") IS WORKED OUT ONLY WHEN SOMEONE ASKS FOR IT (Oct 13).
         // Finding the sender means checking the signature, which takes about
         // 1-2 ms per transaction in JavaScript. A feed frame often holds 20-40
