@@ -132,7 +132,9 @@ def latest_copy_record(before_ms):
             d = json.loads(l)
         except ValueError:
             continue
-        if d.get('mode') == 'on' and d.get('lv') == 'profit' and d.get('t', 0) <= before_ms + 2000:
+        # Any live-mode check (decided by the copy OR by the node when the copy
+        # was unsure): the newest one before the send is this send's check.
+        if d.get('mode') == 'on' and d.get('k') != 'recheck' and d.get('t', 0) <= before_ms + 2000:
             best = d
     if best and before_ms - best.get('t', 0) > 30_000:
         return None  # too old to be this send's check
@@ -158,7 +160,11 @@ def describe(tx_hash, ctx, seen_ms):
     d = {'tx': tx_hash, 'won': ok, 'landed': landed, 'our_index': int(rec['transactionIndex'], 16),
          'gas_eth': gas_eth, 'context': ctx, 'copy_block': copy_blk,
          'copy_profit_usd': (int(copy['lp']) / 1e6 if copy and copy.get('lp') else None),
-         'copy_answer_ms': (copy.get('lrt') if copy else None), 'log_seen_ms': seen_ms}
+         'copy_answer_ms': (copy.get('lrt') if copy else None), 'log_seen_ms': seen_ms,
+         # who decided: 'local' = Rust copy, 'node' = node (copy unsure); node time in ms
+         'decided_by': (copy.get('dec') if copy else None), 'node_ms': (copy.get('nms') if copy else None),
+         'copy_unknown_why': (copy.get('lu') if copy else None),
+         'check_to_log_ms': (seen_ms - copy['t'] if copy and copy.get('t') else None)}
     if ok:
         return f'{tx_hash[:10]} WON, landed {landed}, gas {gas_eth:.8f} ETH | {ctx}', d
 
@@ -202,7 +208,8 @@ def describe(tx_hash, ctx, seen_ms):
             (f"normal trade {rivals[0]['to'][:10]}" if rivals else 'unknown')
         why = f'closed in block {closed} by {who}'
     op = f"opened in block {opener['block']} (copy block {'' if not copy_blk else copy_blk - opener['block']} later)" if opener else 'opener not found'
-    line = (f"{tx_hash[:10]} LOST | {ctx} | copy blk {copy_blk} said ${d['copy_profit_usd']}, landed {landed} (+{landed - (copy_blk or start)}) idx {d['our_index']} | "
+    dec = f"decided by {d['decided_by']}" + (f" (node {d['node_ms']} ms, copy unsure: {d['copy_unknown_why']})" if d['decided_by'] == 'node' else f" (copy {d['copy_answer_ms']} ms)")
+    line = (f"{tx_hash[:10]} LOST | {ctx} | {dec}, check->send log {d['check_to_log_ms']} ms | copy blk {copy_blk} said ${d['copy_profit_usd']}, landed {landed} (+{landed - (copy_blk or start)}) idx {d['our_index']} | "
             f"{op} | {why} | replay {rep} | gas {gas_eth:.8f} ETH")
     return line, d
 
