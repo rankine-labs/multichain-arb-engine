@@ -40,6 +40,7 @@ pub mod db;
 pub mod fixture;
 pub mod hexutil;
 // Trigger-first: replay the feed's ordered transactions, then our calls.
+pub mod moved;
 pub mod ordered;
 pub mod overrides;
 pub mod proto_types;

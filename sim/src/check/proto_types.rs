@@ -331,10 +331,24 @@ pub fn handle_trig_call_with(
         Ok(x) => x,
         Err(e) => return unknown_json(&req.id, &CheckUnknown::bad_request(e), t0.elapsed().as_micros()),
     };
-    match super::ordered::run_ordered_with(view, plan, &ov, &calls, prov, strict_call, assume) {
+    // Size ladder (entry point): our trade at the other sizes, on the same replay.
+    let lad = req.sizes.as_ref().and_then(|z| ladder_of(&ov, &calls, z));
+    match super::ordered::run_ordered_sizes(view, plan, &ov, &calls, prov, strict_call, assume, lad.as_ref()) {
         Ok(out) => {
-            // Size ladder (entry point): the same replay, our trade at each size.
-            let ladder = req.sizes.as_ref().and_then(|z| size_ladder(view, plan, &ov, &calls, prov, strict_call, assume, z));
+            let ladder = lad.as_ref().map(|_| {
+                Value::Array(
+                    out.ladder
+                        .iter()
+                        .map(|r| match &r.outcome {
+                            Some(o) => {
+                                let t = super::search::classify(r.amount, o);
+                                serde_json::json!({ "amount": quantity(t.amount), "status": t.status, "profit": quantity(t.profit), "gasUsed": quantity_u64(t.gas_used), "reason": t.reason })
+                            }
+                            None => serde_json::json!({ "amount": quantity(r.amount), "status": "unknown", "reason": "not answerable at this size" }),
+                        })
+                        .collect(),
+                )
+            });
             // One fingerprint of how every replayed transaction ended
             // (success + output; gas is left out so the protocol-fee runs,
             // which differ in gas only, can still be merged).
@@ -378,62 +392,34 @@ pub fn handle_trig_call_with(
     }
 }
 
-/// The size ladder (see `WireSizes`): one entry per amount, in order:
-/// {amount, status: profit / loss / fail / unknown, profit, gasUsed, reason}.
-/// None (no `sizes` in the answer) when it can't be applied: not exactly one
-/// call, or the amountIn word isn't where it should be.
-#[allow(clippy::too_many_arguments)]
-fn size_ladder(
-    view: &dyn StateRead,
-    plan: &super::ordered::OrderedPlan,
-    ov: &Overrides,
-    calls: &[CallReq],
-    prov: &dyn super::ordered::Provenance,
-    strict_call: bool,
-    assume: &super::ordered::Assume,
-    z: &WireSizes,
-) -> Option<Value> {
-    use super::search::{classify, patch_amount};
+/// The size ladder (see `WireSizes`) for check/ordered.rs: None when it
+/// can't be applied (not exactly one call, or the amountIn word isn't where
+/// it should be). The trading-money slots are the pretend slots that hold
+/// exactly the original amount.
+fn ladder_of(ov: &Overrides, calls: &[CallReq], z: &WireSizes) -> Option<super::ordered::Ladder> {
     if calls.len() != 1 || z.amounts.is_empty() {
         return None;
     }
-    let call = &calls[0];
+    let data = &calls[0].data;
     let start = 4usize.checked_add(z.amount_offset)?;
     let end = start.checked_add(32)?;
-    if end > call.data.len() {
+    if end > data.len() {
         return None;
     }
-    let original = U256::from_be_slice(&call.data[start..end]);
+    let original = U256::from_be_slice(&data[start..end]);
     if original.is_zero() {
         return None;
     }
-    let mut out = Vec::new();
-    for a in z.amounts.iter().take(8) {
-        let Ok(amount) = parse_u256(a) else { continue };
-        let Ok(data) = patch_amount(&call.data, z.amount_offset, amount) else { return None };
-        // Own money: every pretend slot holding exactly the original amount follows the size.
-        let mut ov2 = ov.clone();
-        for acc in ov2.accounts.values_mut() {
-            for v in acc.state_diff.values_mut() {
-                if *v == original {
-                    *v = amount;
-                }
+    let amounts: Vec<U256> = z.amounts.iter().take(8).filter_map(|a| parse_u256(a).ok()).collect();
+    let mut slots = Vec::new();
+    for (a, acc) in &ov.accounts {
+        for (k, v) in &acc.state_diff {
+            if *v == original {
+                slots.push((*a, *k));
             }
         }
-        let c = CallReq { data, ..call.clone() };
-        let row = match super::ordered::run_ordered_with(view, plan, &ov2, std::slice::from_ref(&c), prov, strict_call, assume) {
-            Ok(r) => match r.results.first() {
-                Some(o) => {
-                    let t = classify(amount, o);
-                    serde_json::json!({ "amount": quantity(t.amount), "status": t.status, "profit": quantity(t.profit), "gasUsed": quantity_u64(t.gas_used), "reason": t.reason })
-                }
-                None => continue,
-            },
-            Err(u) => serde_json::json!({ "amount": quantity(amount), "status": "unknown", "reason": format!("{:?}", u.reason) }),
-        };
-        out.push(row);
     }
-    Some(Value::Array(out))
+    Some(super::ordered::Ladder { amount_offset: z.amount_offset, amounts, slots })
 }
 
 /// Run a `size_search` request on `view`.

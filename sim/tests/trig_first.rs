@@ -562,7 +562,7 @@ fn route() -> Route {
 }
 
 fn best() -> Assume {
-    Assume { sender_funds: true, recent_fill: true, skip: Some(route()) }
+    Assume { sender_funds: true, recent_fill: true, skip: Some(route()), record_hashes: false }
 }
 
 fn run_be(view: &MemState, f: &WireFeed, prov: &dyn Provenance, assume: &Assume) -> Result<OrderedOut, CheckUnknown> {
@@ -843,4 +843,193 @@ fn entry_size_ladder_runs_each_size_on_the_same_replay() {
     // No sizes asked: no `sizes` field (old answers unchanged).
     let a = handle_trig_call_with(&copy(), &plan, &info, &mk(None), &AllExact, true, &best());
     assert!(a.get("sizes").is_none());
+}
+
+// ---------------------------------------------------------------------------
+// WHICH POOLS MOVED (check/moved.rs, entry point fix Oct 23): only a pool's
+// OWN state counts. Live, PR #175 named all 56 V4 pools for every V4 swap
+// (shared PoolManager values were matched against every pool).
+// ---------------------------------------------------------------------------
+use arbsim::check::moved::{moved_pools, v4_base, FollowedPool};
+
+fn pm() -> Address {
+    addr(0x4444)
+}
+fn v3p() -> Address {
+    addr(0x3333)
+}
+fn id(n: u8) -> B256 {
+    B256::with_last_byte(n)
+}
+fn followed() -> Vec<FollowedPool> {
+    vec![
+        FollowedPool { key: format!("{:#x}", id(0xa)), address: pm(), v4_id: Some(id(0xa)) },
+        FollowedPool { key: format!("{:#x}", id(0xb)), address: pm(), v4_id: Some(id(0xb)) },
+        FollowedPool { key: format!("{:#x}", v3p()), address: v3p(), v4_id: None },
+    ]
+}
+/// keccak(key . slot) as a mapping entry, with its preimage row.
+fn entry(key: U256, slot: U256) -> (U256, (U256, U256, U256)) {
+    let mut b = [0u8; 64];
+    b[..32].copy_from_slice(&key.to_be_bytes::<32>());
+    b[32..].copy_from_slice(&slot.to_be_bytes::<32>());
+    let h = U256::from_be_bytes(keccak256(b).0);
+    (h, (h, key, slot))
+}
+
+#[test]
+fn moved_a_single_v4_swap_moves_exactly_its_pool_id() {
+    let base = v4_base(id(0xa));
+    let (tick, tick_pre) = entry(U256::from(60u64), base + U256::from(4u64));
+    let (bm, bm_pre) = entry(U256::from(1u64), base + U256::from(5u64));
+    let coin_bal = (addr(0x7001), U256::from(12345u64));
+    let changed = vec![
+        (pm(), base),                          // slot0
+        (pm(), base + U256::from(3u64)),       // liquidity
+        (pm(), tick + U256::from(1u64)),       // a tick's 2nd field
+        (pm(), bm),                            // tick bitmap word
+        (pm(), U256::from(7u64)),              // a SHARED PoolManager value
+        (pm(), U256::from(0xdead_beefu64) << 128), // another shared / unrelated value
+        coin_bal,                              // a coin balance
+    ];
+    let m = moved_pools(&changed, &[tick_pre, bm_pre], &followed());
+    assert_eq!(m.len(), 1, "{m:?}");
+    assert_eq!(m[0].key, format!("{:#x}", id(0xa)));
+    assert_eq!(m[0].kinds, vec!["bitmap".to_string(), "liquidity".into(), "slot0".into(), "ticks".into()]);
+}
+
+#[test]
+fn moved_a_v3_swap_moves_exactly_that_pool() {
+    let (lp, lp_pre) = entry(U256::from(9u64), U256::from(3u64));
+    let changed = vec![(v3p(), U256::ZERO), (v3p(), U256::from(4u64)), (v3p(), lp), (addr(0x7001), U256::from(1u64))];
+    let m = moved_pools(&changed, &[lp_pre], &followed());
+    assert_eq!(m.len(), 1, "{m:?}");
+    assert_eq!(m[0].key, format!("{:#x}", v3p()));
+    assert_eq!(m[0].kinds, vec!["s0".to_string(), "s4".into()], "hashed entries alone don't count");
+}
+
+#[test]
+fn moved_a_router_swap_through_two_pools_moves_exactly_those_two() {
+    let changed = vec![(pm(), v4_base(id(0xb))), (v3p(), U256::ZERO), (pm(), U256::from(7u64))];
+    let m = moved_pools(&changed, &[], &followed());
+    let keys: Vec<String> = m.iter().map(|x| x.key.clone()).collect();
+    let mut want = vec![format!("{:#x}", id(0xb)), format!("{:#x}", v3p())];
+    want.sort();
+    assert_eq!(keys, want);
+}
+
+#[test]
+fn moved_a_non_swap_call_moves_nothing() {
+    // An approve / transfer: coin storage only; an LP-token transfer on the
+    // V3 pool (hashed balance) and a shared PoolManager value: no pool moved.
+    let (lp, lp_pre) = entry(U256::from(9u64), U256::from(3u64));
+    let changed = vec![(addr(0x7001), U256::from(55u64)), (v3p(), lp), (pm(), U256::from(7u64))];
+    assert!(moved_pools(&changed, &[lp_pre], &followed()).is_empty());
+    assert!(moved_pools(&[], &[], &followed()).is_empty());
+}
+
+/// A miniature PoolManager: calldata (id, tick). Writes _pools[id].slot0
+/// (keccak(id . 6)), one field of ticks[tick] (keccak(tick . base+4) + 1),
+/// and a SHARED slot 7 - like a real swap through the shared contract.
+fn pm_code() -> Vec<u8> {
+    hex("6000 35 6000 52 6006 6020 52 6040 6000 20 80 6001 90 55 6004 01 6020 52 6020 35 6000 52 6040 6000 20 6001 01 6005 90 55 6009 6007 55 00")
+}
+
+#[test]
+fn moved_v4_swap_through_the_evm_names_one_pool_from_the_recorded_hashes() {
+    let pbase = v4_base(id(0xa));
+    let (tick, _) = entry(U256::from(60u64), pbase + U256::from(4u64));
+    let mut c = state_with(&[(pm(), pm_code(), vec![(pbase, U256::ZERO), (tick + U256::from(1u64), U256::ZERO), (U256::from(7u64), U256::ZERO)])], true);
+    add_eoa(&mut c, caller(), U256::ZERO);
+    let mut data = id(0xa).to_vec();
+    data.extend(w(60));
+    let trig = stx(&KEY_A, 0, pm(), data);
+    let mut b = base();
+    b.l2_block_number = Some(10);
+    let (plan, _) = build_plan(&feed(&trig, 11, vec![msg(11, &[trig.clone()])]), 10, 0, &b).unwrap();
+    let (alone, _) = trigger_only(&plan).unwrap();
+    let assume = Assume { record_hashes: true, ..best() };
+    let out = run_ordered_with(&c, &alone, &Overrides::none(), &[], &AllExact, true, &assume).unwrap();
+    assert!(out.replayed[0].outcome.success, "{:?}", out.replayed[0]);
+    assert_eq!(out.changed.len(), 3, "slot0, the tick field and the shared slot changed: {:?}", out.changed);
+    let m = moved_pools(&out.changed, &out.hashes, &followed());
+    assert_eq!(m.len(), 1, "{m:?}");
+    assert_eq!(m[0].key, format!("{:#x}", id(0xa)));
+    assert_eq!(m[0].kinds, vec!["slot0".to_string(), "ticks".into()]);
+    // Without recorded hashes the tick can't be placed (slot0 still is).
+    let out2 = run_ordered_with(&c, &alone, &Overrides::none(), &[], &AllExact, true, &best()).unwrap();
+    assert!(out2.hashes.is_empty());
+}
+
+/// Reverts InsufficientProfit(slot 5, MAX): "profit" = its slot 5 (think:
+/// the test contract's trading money), so a ladder size shows which amount
+/// the slot held for that run.
+fn fund() -> Address {
+    addr(0x5555)
+}
+fn fund_code() -> Vec<u8> {
+    hex("634e88422a 60e0 1b 6000 52 6005 54 6004 52 6000 19 6024 52 6044 6000 fd")
+}
+
+#[test]
+fn entry_ladder_one_replay_each_size_sees_its_own_trading_money() {
+    use arbsim::check::ordered::{run_ordered_sizes, Ladder};
+    let mut c = copy();
+    add_contract(&mut c, fund(), fund_code(), &[(U256::from(5u64), U256::ZERO)]);
+    let trig = stx(&KEY_A, 0, pool(), w(5));
+    let mut b = base();
+    b.l2_block_number = Some(10);
+    let (plan, _) = build_plan(&feed(&trig, 11, vec![msg(11, &[trig.clone()])]), 10, 0, &b).unwrap();
+    let mut data = hex("deadbeef");
+    data.extend(w(1));
+    let call = CallReq { from: caller(), to: Some(fund()), data: Bytes::from(data), gas: Some(1_000_000), value: U256::ZERO };
+    let ov = Overrides::from_json(&json!({ format!("{:#x}", fund()): { "stateDiff": { "0x5": "0x1" } } })).unwrap();
+    let lad = Ladder { amount_offset: 0, amounts: vec![U256::from(2u64), U256::from(3u64)], slots: vec![(fund(), U256::from(5u64))] };
+    let out = run_ordered_sizes(&c, &plan, &ov, std::slice::from_ref(&call), &AllExact, true, &best(), Some(&lad)).unwrap();
+    let got = |o: &arbsim::check::CallOutcome| U256::from_be_slice(&o.output[4..36]).to::<u64>();
+    assert_eq!(got(&out.results[0]), 1, "main run: the original amount");
+    assert_eq!(out.ladder.len(), 2);
+    assert_eq!(out.ladder.iter().map(|r| got(r.outcome.as_ref().unwrap())).collect::<Vec<_>>(), vec![2, 3], "each size saw its own amount (state put back between sizes)");
+    assert_eq!(out.replayed.len(), 1, "the feed was replayed once");
+}
+
+#[test]
+fn bench_entry_candidate_check_test_numbers_only() {
+    use arbsim::check::ordered::{run_ordered_sizes, Ladder};
+    let mut c = copy();
+    add_contract(&mut c, fund(), fund_code(), &[(U256::from(5u64), U256::ZERO)]);
+    let trig = stx(&KEY_A, 0, router(), w(5));
+    let mut msgs: Vec<WireFeedMsg> = Vec::new();
+    for s in 0..19u64 {
+        msgs.push(msg(11 + s, &[stx(&KEY_B, s, pool(), w(1))]));
+    }
+    msgs.push(msg(30, &[trig.clone()]));
+    let mut b = base();
+    b.l2_block_number = Some(10);
+    let (plan, _) = build_plan(&feed(&trig, 30, msgs), 10, 0, &b).unwrap();
+    let mut data = hex("deadbeef");
+    data.extend(w(400));
+    let call = CallReq { from: caller(), to: Some(fund()), data: Bytes::from(data), gas: Some(1_000_000), value: U256::ZERO };
+    let ov = Overrides::from_json(&json!({ format!("{:#x}", fund()): { "stateDiff": { "0x5": format!("{:#x}", 400) } } })).unwrap();
+    let lad = Ladder { amount_offset: 0, amounts: vec![U256::from(50u64), U256::from(150u64)], slots: vec![(fund(), U256::from(5u64))] };
+    let n = 30;
+    let t = std::time::Instant::now();
+    for _ in 0..n {
+        run_ordered_sizes(&c, &plan, &ov, std::slice::from_ref(&call), &AllExact, true, &best(), Some(&lad)).unwrap();
+    }
+    let one = t.elapsed().as_micros() / n;
+    let t = std::time::Instant::now();
+    for _ in 0..n {
+        for _ in 0..3 {
+            run_ordered_with(&c, &plan, &ov, std::slice::from_ref(&call), &AllExact, true, &best()).unwrap();
+        }
+    }
+    let three = t.elapsed().as_micros() / n;
+    let (alone, _) = trigger_only(&plan).unwrap();
+    let t = std::time::Instant::now();
+    for _ in 0..n {
+        run_ordered_with(&c, &alone, &Overrides::none(), &[], &AllExact, true, &Assume { record_hashes: true, ..best() }).unwrap();
+    }
+    let disc = t.elapsed().as_micros() / n;
+    println!("[bench, test numbers only] entry candidate check, 20 feed txs + 3 sizes: one replay + ladder {one} us vs 3 full replays {three} us; discover (trigger alone) {disc} us ({} build)", if cfg!(debug_assertions) { "debug" } else { "release" });
 }

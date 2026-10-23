@@ -433,14 +433,33 @@ paths). One send per trigger: the entry point and the old path share a lock.
 |---|---|---|
 | `TRIG_FIRST_ENTRY` | `1` | `0` = entry point off (`LOCAL_SIM_TRIGGER_FIRST` governs both: off / shadow / on) |
 | `TRIG_ENTRY_MAX_IN_FLIGHT` | `4` | triggers worked on at once; more are dropped (counted) |
-| `TRIG_ENTRY_MAX_CANDIDATES` | `6` | candidate trades checked per trigger |
+| `TRIG_ENTRY_MAX_CANDIDATES` | `6` | candidate trades built and checked per trigger (ranked first, then capped, then built) |
+| `TRIG_ENTRY_MAX_POOLS` | `4` | more moved pools than this = suspicious answer: skipped, logged `u:"too_many_pools"` |
+| `TRIG_ENTRY_PARALLEL` | `2` | candidate checks of one trigger at once (best-ranked first; stops at the first sure answer good enough to send) |
+| `TRIG_ENTRY_MAX_CHECKS` | `2` | candidate checks at once over ALL triggers (the sidecar has `ARBSIM_WORKERS` workers, default 2, shared with the old paths) |
 | `TRIG_ENTRY_SIZES_USD` | `50,150,400` | size ladder ($), capped by the trade / wallet limits |
 | `TRIG_ENTRY_DISCOVER_TIMEOUT_MS` | `40` | the "which pools?" question |
 | `TRIG_ENTRY_DEADLINE_MS` | `250` | the whole trigger (discover + checks) |
 
+**Fix (Oct 23, after the first shadow run):** the first version named all
+56 V4 pools for every V4 swap (it matched the changed values against each
+pool's followed-values list, which for V4 pools also holds SHARED PoolManager
+values), so every trigger built ~1700 candidates and ran out of time. Now
+only a pool's OWN state counts (`sim/src/check/moved.rs`): a V4 pool by its
+id's own slots inside the PoolManager (slot0, fee growth, liquidity, and its
+ticks / bitmap / positions, recognised from the hashes the transaction
+computed), any other pool by its contract's declared variables. Never: coin
+balances, shared PoolManager values, values only read or filled in.
+Candidates are ranked (a coin we hold first, then the model's quick price
+check) and capped before anything is built; the sizes of the ladder run
+after ONE replay; decoded feed transactions are cached in the sidecar.
+
 What to read:
 - `data/local-sim-shadow.jsonl` lines `"k":"trig_entry"` (only for
-  transactions that moved one of our pools): `pools` moved, `dconf` / `das`
+  transactions that moved one of our pools): `pools` moved (first 8), `np`
+  how many, `mv` debug: per moved pool which kinds of its values changed
+  (e.g. `0x1dae69f1..:liquidity+slot0+ticks`), `found` routes before the
+  cap, `early` stopped at the first good answer, `dconf` / `das`
   how sure that answer was (`alone:N` = N earlier feed transactions left out
   of the discover run), `cands` / `tried` candidates found / checked, `best`
   route, `size` ($), `net` ($ after gas), `conf` / `as`, `u` why unknown,

@@ -2554,3 +2554,64 @@ fn trig_discover_names_the_followed_pool_a_feed_tx_moves() {
     let after = *r.chain.calls.lock().unwrap() + *r.chain.paid_calls.lock().unwrap();
     assert_eq!(before, after, "discover never reads the node");
 }
+
+// Entry point fix (Oct 23, live): PR #175 named ALL V4 pools for every V4
+// swap, because each V4 pool's followed values also hold SHARED PoolManager
+// values (here slot 7, as filled for every pool keyed on the PoolManager).
+// pools_changed now counts only each pool's own state (check/moved.rs).
+#[test]
+fn pools_changed_ignores_shared_pool_manager_values() {
+    let mut r = rig_with(C2Config { walks_inflight: 0, ..C2Config::for_tests() });
+    r.track(vec![v2_pool()]);
+    r.send(tick(100, 60));
+    let pm = a(0x44);
+    let ids: Vec<B256> = (1..=5u8).map(B256::with_last_byte).collect();
+    {
+        let mut reg = r.h.c2.reg.write().unwrap();
+        let tmpl = reg.pools.values().next().unwrap().clone();
+        for id in &ids {
+            let mut e = tmpl.clone();
+            e.pool = TrackedPool { address: pm, v4_id: Some(*id), kind: PoolKind::V4, token0: a(COIN0), token1: a(COIN1), fee: 3000, tick_spacing: 60 };
+            e.items.clear();
+            e.items.insert((pm, u(7))); // the shared value, like live
+            reg.pools.insert((pm, Some(*id)), e);
+            reg.by_addr.entry(pm).or_default().push((pm, Some(*id)));
+        }
+    }
+    let base1 = arbsim::check::moved::v4_base(ids[1]);
+    // A V4 swap on pool 1: its slot0 + the shared value.
+    let m = r.h.pools_changed(&[(pm, base1), (pm, u(7))], &[]);
+    assert_eq!(m.iter().map(|x| x.key.clone()).collect::<Vec<_>>(), vec![format!("{:#x}", ids[1])], "{m:?}");
+    // Only the shared value: nothing moved.
+    assert!(r.h.pools_changed(&[(pm, u(7))], &[]).is_empty());
+    // The V2 pool's own reserves: that pool.
+    let m = r.h.pools_changed(&[(a(V2P), u(8))], &[]);
+    assert_eq!(m.iter().map(|x| x.key.clone()).collect::<Vec<_>>(), vec![format!("{:#x}", a(V2P))]);
+}
+
+#[test]
+fn bench_entry_server_path_test_numbers_only() {
+    let (_r, ctx) = trig_world();
+    let trig = signed(0, a(V2P), vec![0x09, 0x02, 0xf1, 0xac]);
+    let feed = json!({"trigger": hexb(keccak256(&trig).as_slice()), "triggerSeq": 102, "msgs": [{"seq": 102, "ts": 63, "l1": 9000, "txs": [hexb(&trig)]}]});
+    let n = 200u128;
+    let t = std::time::Instant::now();
+    for _ in 0..n {
+        let d = arbsim::server::handle(&ctx, &json!({"id": 1, "type": "trig_discover", "at": {"after": "head"}, "feed": feed}));
+        assert_eq!(d["ok"], json!(true), "{d}");
+    }
+    let disc = t.elapsed().as_micros() / n;
+    // A candidate check with a 2-size ladder (the getter stands in for our trade: amount word at offset 0).
+    let mut data = vec![0x09, 0x02, 0xf1, 0xac];
+    data.extend([0u8; 31]);
+    data.push(9);
+    let t = std::time::Instant::now();
+    for _ in 0..n {
+        let c = arbsim::server::handle(&ctx, &json!({"id": 2, "type": "call", "at": {"after": "head"}, "feed": feed,
+            "sizes": {"amountOffset": 0, "amounts": ["0x3", "0x5"]},
+            "calls": [{"from": format!("{}", a(0xe0)), "to": format!("{}", a(V2P)), "data": hexb(&data), "gas": "0x100000"}]}));
+        assert_eq!(c["ok"], json!(true), "{c}");
+    }
+    let chk = t.elapsed().as_micros() / n;
+    println!("[bench, test numbers only] server path (copy 2 rig, 1 feed tx): trig_discover {disc} us, candidate check + 2-size ladder {chk} us ({} build)", if cfg!(debug_assertions) { "debug" } else { "release" });
+}

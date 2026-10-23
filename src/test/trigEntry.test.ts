@@ -1,7 +1,7 @@
 import { Wallet, keccak256 } from 'ethers';
 import { parseFeedMessages, FeedMsg } from '../chains/nitroFeed';
 import { TriggerFirst, TrigCopy2, trigFirstSettings } from '../execution/triggerFirst';
-import { TrigEntry, EntryCandidate, EntryDeps, entrySettings, enumerateRoutes, quickSkip } from '../execution/trigEntry';
+import { TrigEntry, EntryCandidate, EntryDeps, entrySettings, enumerateRoutes, quickSkip, rankRoutes } from '../execution/trigEntry';
 import { JsonlLog } from '../execution/localSimHost';
 import { LocalSimClient } from '../execution/localSim';
 import { SIM_EXECUTOR_ADDRESS } from '../execution/simulator';
@@ -40,8 +40,9 @@ const LENDER = '0x' + 'cd'.repeat(20);
 const EXECUTOR = '0x' + 'ee'.repeat(20);
 
 // Fake fast check. Profit (start-coin units, 6 decimals = $) by trade amount.
-function fakeSidecar(o: { pools?: string[]; discover?: Asked; profitAt?: (amount: bigint) => bigint; conf?: string; assumed?: string[] } = {}) {
+function fakeSidecar(o: { pools?: string[]; discover?: Asked; profitAt?: (amount: bigint) => bigint; profitFor?: (pool: string) => bigint | undefined; conf?: string; assumed?: string[]; delayMs?: number } = {}) {
   const asked: Asked[] = [];
+  const conc = { now: 0, max: 0 };
   const profitAt = o.profitAt ?? (() => 2_000_000n);
   const client = {
     isConnected: () => true,
@@ -50,16 +51,22 @@ function fakeSidecar(o: { pools?: string[]; discover?: Asked; profitAt?: (amount
       asked.push(m);
       if (m.type === 'trig_discover') return { id: 1, ...(o.discover ?? { ok: true, pools: o.pools ?? [POOL_A], conf: 'high', assumed: [] }) };
       if (m.type === 'call' && m.calls?.[0]?.to?.toLowerCase() === SIM_EXECUTOR_ADDRESS) {
+        conc.now++; conc.max = Math.max(conc.max, conc.now);
+        if (o.delayMs) await sleep(o.delayMs);
+        conc.now--;
         const data: string = m.calls[0].data;
         const amount = BigInt('0x' + data.slice(2 + 8 + 192, 2 + 8 + 256));
-        const sizes = m.sizes ? (m.sizes.amounts as string[]).map((a) => ({ amount: a, status: 'profit', profit: '0x' + profitAt(BigInt(a)).toString(16), gasUsed: '0x1' })) : undefined;
-        return { id: 1, ok: true, us: 500, results: [{ success: false, output: insufficient(profitAt(amount)), gasUsed: '0x5208' }],
+        // Which candidate: its first route key (the buy pool), sent as feed.route.
+        const forPool = o.profitFor?.((m.feed?.route ?? [])[0] ?? '');
+        const pf = (a: bigint) => forPool ?? profitAt(a);
+        const sizes = m.sizes ? (m.sizes.amounts as string[]).map((a) => ({ amount: a, status: 'profit', profit: '0x' + pf(BigInt(a)).toString(16), gasUsed: '0x1' })) : undefined;
+        return { id: 1, ok: true, us: 500, results: [{ success: false, output: insufficient(pf(amount)), gasUsed: '0x5208' }],
           trig: { snapBlock: 100, included: false, triggerOk: true, msgs: 1, txs: 1, later: 0, lastSeq: 101, conf: o.conf ?? 'high', assumed: o.assumed ?? [] }, ...(sizes ? { sizes } : {}) };
       }
       return { id: 1, ok: false, unknown: 'bad_request' };
     },
   } as unknown as LocalSimClient;
-  return { client, asked };
+  return { client, asked, conc };
 }
 function fakeCopy2(): TrigCopy2 & { waits: number } {
   const c = {
@@ -73,15 +80,15 @@ function fakeCopy2(): TrigCopy2 & { waits: number } {
 }
 
 // One candidate: USDG start, $1 per unit of 1e6, amountIn = size x 1e6.
-function cand(label = 'USDG/COIN dexA>dexB', maxSizeUsd = 1_000): EntryCandidate {
+function cand(label = 'USDG/COIN dexA>dexB', maxSizeUsd = 1_000, buyPool = POOL_A): EntryCandidate {
   return {
-    label, buyPool: POOL_A, sellPool: POOL_B, tokenIn: USDG, tokens: [USDG, COIN], keys: [POOL_A, POOL_B], maxSizeUsd, gasUsd: 0.05,
+    label, buyPool, sellPool: POOL_B, tokenIn: USDG, tokens: [USDG, COIN], keys: [buyPool, POOL_B], maxSizeUsd, gasUsd: 0.05,
     build: (usd) => ({ trade: { token: USDG, amountIn: BigInt(Math.round(usd * 1e6)), hops: [{ kind: 0, pool: POOL_A, tokenIn: USDG, tokenOut: COIN, feeBps: 30 }] as any }, simOpts: { v3Lender: LENDER } }),
     usdOf: (u) => Number(u) / 1e6,
   };
 }
 
-type Spies = { sends: number; sendWaits: number[]; candKeys: string[][] };
+type Spies = { sends: number; sendWaits: number[]; candKeys: string[][]; limits: number[] };
 function setup(o: { mode?: 'shadow' | 'on'; hostOn?: boolean; env?: Record<string, string>; sidecar?: ReturnType<typeof fakeSidecar>; cands?: EntryCandidate[]; deps?: Partial<EntryDeps> } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'trigentry-'));
   const file = join(dir, 'shadow.jsonl');
@@ -90,10 +97,10 @@ function setup(o: { mode?: 'shadow' | 'on'; hostOn?: boolean; env?: Record<strin
   const c2 = fakeCopy2();
   const env = { LOCAL_SIM_TRIGGER_FIRST: o.mode ?? 'on', ...(o.env ?? {}) };
   const tf = new TriggerFirst({ client: sc.client, settings: { ...trigFirstSettings(env), finalizeMs: 30, agreeWaitMs: 30 }, copy2: () => c2, shadowLog: log, hostOn: () => o.hostOn ?? true, log: () => {} });
-  const spies: Spies = { sends: 0, sendWaits: [], candKeys: [] };
+  const spies: Spies = { sends: 0, sendWaits: [], candKeys: [], limits: [] };
   const te = new TrigEntry({
     tf, client: sc.client, shadowLog: log, settings: { ...entrySettings(env, 0.25), deadlineMs: 2_000, discoverTimeoutMs: 500 },
-    candidatesFor: (keys) => { spies.candKeys.push(keys); return o.cands ?? [cand()]; },
+    candidatesFor: (keys, limit) => { spies.candKeys.push(keys); spies.limits.push(limit); const all = o.cands ?? [cand()]; return { cands: all.slice(0, limit), found: all.length }; },
     isOurTx: () => false, ourAddresses: [EXECUTOR],
     killed: () => false, safety: () => null, failBlocked: () => null, pausedWhy: () => null,
     send: async () => { spies.sends++; spies.sendWaits.push(c2.waits); return { signedMs: Date.now() }; },
@@ -104,6 +111,7 @@ function setup(o: { mode?: 'shadow' | 'on'; hostOn?: boolean; env?: Record<strin
 }
 
 async function main() {
+  // (each block below builds its own fakes)
   const swapData = '0x12345678' + '00'.repeat(32);
   const tSwap = await signed(0, POOL_A, swapData);
   const tSwap2 = await signed(1, POOL_A, swapData);
@@ -173,11 +181,15 @@ async function main() {
     assert(enumerateRoutes([POOL_A], { ...rules, coinAllowed: (t: string) => t !== COIN }).length === 0, 'a coin not on the allowed list: no routes (coin rule)');
     assert(enumerateRoutes([POOL_A], { ...rules, startCoins: ['0x' + '09'.repeat(20)] }).length === 0, 'no coin we hold in the pair: no routes');
     const many = [1, 2, 3, 4, 5].map((i) => cand(`c${i}`));
-    const { tf, te, sc } = setup({ mode: 'shadow', cands: many, env: { TRIG_ENTRY_MAX_CANDIDATES: '2' } });
+    const { tf, te, sc, spies } = setup({ mode: 'shadow', cands: many, env: { TRIG_ENTRY_MAX_CANDIDATES: '2' }, sidecar: fakeSidecar({ profitAt: () => 100_000n }) });
     tf.onFeedMsgs(msgs, Date.now());
     const rec = await te.process(hash, Date.now());
     const checks = sc.asked.filter((m) => m.type === 'call');
-    assert(rec!.candidates === 5 && rec!.tried === 2 && checks.length === 2, 'candidates capped (TRIG_ENTRY_MAX_CANDIDATES)');
+    assert(spies.limits[0] === 2, 'the cap is given to the host BEFORE it builds anything');
+    assert(rec!.found === 5 && rec!.candidates === 2 && rec!.tried === 2 && checks.length === 2, `candidates capped (TRIG_ENTRY_MAX_CANDIDATES): found ${rec!.found}, built ${rec!.candidates}, checked ${rec!.tried}`);
+    // Ranking: a coin we hold first, then the model's price check.
+    const rs = [{ n: 'a', held: false, s: 9 }, { n: 'b', held: true, s: 1 }, { n: 'c', held: true, s: 5 }, { n: 'd', held: true, s: null }];
+    assert(rankRoutes(rs, (r) => r.held, (r) => r.s, 3).map((r) => r.n).join() === 'c,b,d', 'rank: held start coin first, then the best quick price check; capped');
   }
 
   // ---- size ladder: the best size wins ------------------------------------------------------
@@ -276,6 +288,80 @@ async function main() {
     const hour = te.takeHourLine() ?? '';
     assert(/dropped 2 overloaded/.test(hour), `extra triggers dropped and counted: ${hour}`);
     assert(te.inFlightNow() === 0, 'work finished, nothing left in flight');
+  }
+
+  // ---- GUARD: too many moved pools = suspicious, skipped -------------------------------------------
+  {
+    const five = [1, 2, 3, 4, 5].map((i) => '0x' + String(i).repeat(64));
+    const { tf, te, spies, sc, file, log } = setup({ mode: 'on', sidecar: fakeSidecar({ pools: five }) });
+    tf.onFeedMsgs(msgs, Date.now());
+    const rec = await te.process(hash, Date.now());
+    assert(rec!.unknown === 'too_many_pools' && spies.candKeys.length === 0 && sc.asked.length === 1 && spies.sends === 0, 'more than TRIG_ENTRY_MAX_POOLS (4) moved pools: "too_many_pools", nothing enumerated or sent');
+    await log.flush();
+    const l = readFileSync(file, 'utf8').trim().split('\n').map((x) => JSON.parse(x)).find((x) => x.k === 'trig_entry');
+    assert(!!l && l.u === 'too_many_pools' && l.np === 5, 'logged with the pool count');
+  }
+  {
+    const { tf, te, spies } = setup({ mode: 'shadow', sidecar: fakeSidecar({ pools: [POOL_A, POOL_B] }) });
+    tf.onFeedMsgs(msgs, Date.now());
+    await te.process(hash, Date.now());
+    assert(spies.candKeys.length === 1, 'two moved pools (a router through both): enumerated');
+  }
+
+  // ---- debug field: which kinds of each moved pool's values changed ---------------------------------
+  {
+    const { tf, te, file, log } = setup({ mode: 'shadow', sidecar: fakeSidecar({ discover: { ok: true, pools: [POOL_A], moved: [[POOL_A, ['liquidity', 'slot0', 'ticks']]], conf: 'high', assumed: [] } }) });
+    tf.onFeedMsgs(msgs, Date.now());
+    await te.process(hash, Date.now());
+    await sleep(80);
+    await log.flush();
+    const l = readFileSync(file, 'utf8').trim().split('\n').map((x) => JSON.parse(x)).find((x) => x.k === 'trig_entry');
+    assert(!!l && Array.isArray(l.mv) && l.mv[0] === `${POOL_A.slice(0, 12)}:liquidity+slot0+ticks`, `log "mv": ${JSON.stringify(l?.mv)}`);
+  }
+
+  // ---- best-ranked first, stop at the first answer good enough to send ------------------------------
+  {
+    const P = (n: number) => '0x' + String(n).repeat(40);
+    const cs = [1, 2, 3, 4].map((i) => cand(`c${i}`, 1_000, P(i)));
+    const { tf, te, sc } = setup({ mode: 'shadow', cands: cs, env: { TRIG_ENTRY_PARALLEL: '1' }, sidecar: fakeSidecar({ profitFor: (p) => (p === P(1).toLowerCase() ? 2_000_000n : 0n) }) });
+    tf.onFeedMsgs(msgs, Date.now());
+    const rec = await te.process(hash, Date.now());
+    const checks = sc.asked.filter((m) => m.type === 'call');
+    assert(checks.length === 1 && rec!.tried === 1 && rec!.early === true && rec!.best?.label === 'c1', 'the best-ranked candidate is asked first; a sure profitable answer stops the rest');
+  }
+  {
+    const P = (n: number) => '0x' + String(n).repeat(40);
+    const cs = [1, 2, 3, 4].map((i) => cand(`c${i}`, 1_000, P(i)));
+    const { tf, te, sc } = setup({ mode: 'shadow', cands: cs, env: { TRIG_ENTRY_PARALLEL: '1' }, sidecar: fakeSidecar({ profitFor: (p) => (p === P(3).toLowerCase() ? 2_000_000n : 0n) }) });
+    tf.onFeedMsgs(msgs, Date.now());
+    const rec = await te.process(hash, Date.now());
+    const order = sc.asked.filter((m) => m.type === 'call').map((m) => m.feed.route[0]);
+    assert(order.join() === [P(1), P(2), P(3)].map((x) => x.toLowerCase()).join() && rec!.best?.label === 'c3', 'no good answer yet: next in rank order, until one is good');
+  }
+
+  // ---- concurrency: bounded per trigger and over all triggers -----------------------------------------
+  {
+    const cs = [1, 2, 3, 4, 5, 6].map((i) => cand(`c${i}`));
+    const sc = fakeSidecar({ profitAt: () => 0n, delayMs: 15 });
+    const { tf, te } = setup({ mode: 'shadow', cands: cs, sidecar: sc, env: { TRIG_ENTRY_PARALLEL: '3', TRIG_ENTRY_MAX_CHECKS: '2' } });
+    tf.onFeedMsgs(msgs, Date.now());
+    const t0 = Date.now();
+    const [r1, r2] = await Promise.all([te.process(hash, Date.now()), te.process(hash, Date.now())]);
+    assert(sc.conc.max === 2, `never more than TRIG_ENTRY_MAX_CHECKS (2) candidate checks at once over all triggers (max seen ${sc.conc.max})`);
+    assert(r1!.tried === 6 && r2!.tried === 6, 'every candidate still checked within the deadline');
+    assert(Date.now() - t0 < 6 * 15 * 2, 'two at a time: about half the serial time');
+  }
+
+  // ---- timing (TEST NUMBERS, fake sidecar answering at once: the bot's own overhead) -------------------
+  {
+    const cs = [cand('c1'), cand('c2')];
+    const { tf, te } = setup({ mode: 'shadow', cands: cs, sidecar: fakeSidecar({ profitAt: () => 0n }) });
+    tf.onFeedMsgs(msgs, Date.now());
+    const ms: number[] = [];
+    for (let i = 0; i < 50; i++) { const t = performance.now(); await te.process(hash, Date.now()); ms.push(performance.now() - t); }
+    ms.sort((a, b) => a - b);
+    console.log(`[bench, test numbers only] entry point bot-side overhead per trigger (2 candidates, fake sidecar): p50 ${ms[25].toFixed(2)} ms, p90 ${ms[45].toFixed(2)} ms`);
+    assert(ms[25] < 40, 'bot-side overhead per trigger well under the 40 ms target');
   }
 }
 
