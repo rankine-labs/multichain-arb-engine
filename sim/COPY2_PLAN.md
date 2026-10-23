@@ -1087,3 +1087,44 @@ trade ~20 ms.
   Expected live: RIVN/USDG (and every stock/USDG V4 check paying USDG out
   of the PoolManager) answered "loss" exactly when the full bound covers
   the take, else unknown; no more fail-vs-loss mismatches of this shape.
+
+- After the copy2-r deploy, Oct 23 00:36 UTC shadow (inbot-sim/copy2-s): 0
+  mismatches, speed fine, but checks 74 asked, 1 sure; unknown
+  pool_manager_balance 53 (SNDK/USDG 37, RIVN/USDG 8, WETH/USDG 4 ...),
+  each `what` ["b0","c" x6]: every high candidate (2^200 / 2^160 / 2^126 /
+  2^112 / 2^96) failed to read back for USDG.
+  1. Cause, probed on the live chain (scripts/probe-rivn.ts PROBE_WIDTH):
+     USDG counts only the LOW 64 bits of its balance word (raw + 2^k reads
+     back for k = 40..63, not 64..255); decimals 6, totalSupply
+     685,291,600,141,102 (~2^49.3); PoolManager holds 3.8e13 (~$38M). (The
+     copy2-r note "128 bits" was the smallest width that probe could rule
+     out; it is 64.) RIVN counts the whole word (supply 2.79e22).
+  2. Fix (server.rs coin_highs): per coin read by the bound run: P must read
+     back; H = 2^200 if the coin reads back P + 2^200 (1 run; whole-word
+     coins as before); else binary search of the largest k with P + 2^k
+     read back (field width w = k + 1), H = 2^(w-2) (half the field: P + H
+     + coins paid in during the check still fit), checked to read back,
+     and only if P + H >= totalSupply x 2^8 (no balance exceeds the supply;
+     the held supply is <= ARBSIM_COPY2_VERIFY_S old; a first read is a
+     "miss" and gets filled). USDG: H = 2^62 = 4.6e18 vs supply x 256 =
+     1.75e17 (26x room). Width remembered per coin, re-confirmed every check
+     (P + 2^(w-2) reads back, P + 2^w doesn't): a USDG check costs 4 small
+     coin runs (~20 us each), a whole-word coin 2. Same proof as before for
+     R in [P, P + H]: the coin's checks pass / fail at both ends alike, no
+     overflow inside the field.
+     Anvil test bot_v4_coin_counting_part_of_its_balance_word_never_gives_a_
+     false_revert (TestHelpers.sol TokenNarrow(bits): USD 64 bits, WETH 128
+     bits): with a second V4 pool 6/6 sizes answered exactly (drains via the
+     full bound); one V4 pool: unknown (it holds none of the coin paid in:
+     bound 0), never a revert; USD supply 2e17 (x 2^8 > 2^62): unknown
+     ("counts only 64 bits ... not far enough above its totalSupply").
+  3. Option "read balanceOf(PoolManager) from the node every 10-30 s" not
+     built: as a LOWER bound it isn't provable (any V4 pool on the chain,
+     hooks and protocol-fee collections can pay out of it between the read
+     and the check's block, unseen); as a HIGH value it isn't needed (the
+     supply is the provable ceiling). The pool-solvency lower bound stays.
+  No change to what copy 2 holds / follows: no state FORMAT bump.
+  Expected live: the 53 pool_manager_balance checks answered again where the
+  route / full bound covers the take (as before copy2-r, minus the RIVN
+  false reverts): roughly 60-75 % of the bot's checks sure (the rest: first
+  read misses, not_ready after the restart).

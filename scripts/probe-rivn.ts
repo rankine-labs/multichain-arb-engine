@@ -154,6 +154,34 @@ function v4Of(p: PoolState) { return (p as any).v4 as { poolManager: string; fee
   // far above the real one (+2^200) and protocolFeesAccrued at 0 / 1, as the
   // copy's two-run checks do. If the bot's check FAILS with some of them
   // while the plain call completes, that assumption is what breaks it.
+  // copy2-s: how many bits of its balance word does each coin count?
+  // (balanceOf(PoolManager) with raw = real + 2^k, k = 40..255), its
+  // totalSupply and decimals.
+  if (process.env.PROBE_WIDTH) {
+    const tag = BLOCKS[0];
+    const abi = ethers.AbiCoder.defaultAbiCoder();
+    const oz5 = '0x52c63247e1f47db19d5ce0460030c497f067ca4cebf71ba98eeadabe20bace00';
+    const balOf = async (c: string, ov?: Record<string, unknown>) => {
+      const r = await rpc('eth_call', [{ to: c, data: ethers.id('balanceOf(address)').slice(0, 10) + pad(PM) }, tag, ...(ov ? [ov] : [])]);
+      return r.error ? null : BigInt(r.result);
+    };
+    const places: [string, string][] = [[USDG, (slot as any).key(PM)], [coin, ethers.keccak256(abi.encode(['address', 'bytes32'], [PM, oz5]))]];
+    for (const [c, sl] of places) {
+      const raw = BigInt((await rpc('eth_getStorageAt', [c, sl, tag])).result);
+      const real = await balOf(c);
+      say(`coin ${c}: decimals ${big(await view(c, 'decimals()', '', tag))} totalSupply ${big(await view(c, 'totalSupply()', '', tag))} raw ${raw} balanceOf ${real}`);
+      const ok: number[] = [], bad: number[] = [];
+      for (let k = 40; k <= 255; k++) {
+        const v = raw + (1n << BigInt(k));
+        if (v >= 1n << 256n) break;
+        const got = await balOf(c, { [c]: { stateDiff: { [sl]: '0x' + pad(hex(v)) } } });
+        (got === v ? ok : bad).push(k);
+        await sleep(60);
+      }
+      say(`  reads back raw+2^k for k in [${ok.join(',')}]; not for [${bad.join(',')}]`);
+    }
+    process.exit(0);
+  }
   if (process.env.PROBE_OVR) {
     const tag = BLOCKS[0];
     const abi = ethers.AbiCoder.defaultAbiCoder();

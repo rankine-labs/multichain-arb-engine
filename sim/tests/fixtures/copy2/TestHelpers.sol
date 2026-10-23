@@ -60,33 +60,38 @@ contract Token {
     }
 }
 
-// A coin whose balance word counts only its LOW 128 bits (live Robinhood
-// USDG, probed Oct 22 copy2-r: raw 2^128 + 5 reads as 5, raw 2^200 + 999
-// can't pay 1000): the high half of the word is another field. Balances at
-// slot 0 like Token (keccak(holder . 0)).
-contract Token128 {
-    struct Acct { uint128 bal; uint128 other; }
-    mapping(address => Acct) internal acct;
+// A coin whose balance word counts only its LOW `bits` bits (live Robinhood
+// USDG: 64, probed Oct 23 copy2-s; raw x + 2^64 reads x): the rest of the
+// word is other data, kept as is. Balances at slot 0 like Token
+// (keccak(holder . 0)).
+contract TokenNarrow {
+    mapping(address => uint256) internal word;
     mapping(address => mapping(address => uint256)) public allowance;
     uint256 public totalSupply;
     string public symbol;
     uint8 public immutable decimals;
+    uint256 internal immutable mask;
 
     event Transfer(address indexed from, address indexed to, uint256 value);
     event Approval(address indexed owner, address indexed spender, uint256 value);
 
-    constructor(string memory s, uint8 d) { symbol = s; decimals = d; }
+    constructor(string memory s, uint8 d, uint8 bits) { symbol = s; decimals = d; mask = (uint256(1) << bits) - 1; }
 
-    function balanceOf(address a) external view returns (uint256) { return acct[a].bal; }
+    function balanceOf(address a) public view returns (uint256) { return word[a] & mask; }
+    function _set(address a, uint256 v) internal {
+        require(v <= mask, "balance too big");
+        word[a] = (word[a] & ~mask) | v;
+    }
     function mint(address to, uint256 a) external {
         totalSupply += a;
-        acct[to].bal += uint128(a);
+        _set(to, balanceOf(to) + a);
         emit Transfer(address(0), to, a);
     }
     function _move(address f, address t, uint256 a) internal {
-        require(acct[f].bal >= a, "insufficient balance");
-        acct[f].bal -= uint128(a);
-        acct[t].bal += uint128(a);
+        uint256 b = balanceOf(f);
+        require(b >= a, "insufficient balance");
+        _set(f, b - a);
+        _set(t, balanceOf(t) + a);
         emit Transfer(f, t, a);
     }
     function transfer(address to, uint256 a) external returns (bool) { _move(msg.sender, to, a); return true; }
