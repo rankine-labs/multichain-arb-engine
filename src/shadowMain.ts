@@ -77,7 +77,8 @@ import { RobinhoodChainAdapter } from './chains/robinhoodChain';
 // FAST CHECK (arbsim sidecar, LOCAL_SIM=off|shadow|on, default off): see docs/FAST_CHECK.md.
 import { createLocalSimHost, LocalSimHost, LocalCheck, LocalKind, LocalOutcome } from './execution/localSimHost';
 import { TriggerFirst, trigFirstSettings, TrigOutcome } from './execution/triggerFirst';
-import { Scoreboard, SendPath, Confidence as ScoreConfidence, standingGapFailBlock } from './report/scoreboard';
+import { Scoreboard, SendPath, Confidence as ScoreConfidence, standingGapFailBlock, entryFailBlock } from './report/scoreboard';
+import { TrigEntry, EntryCandidate, entrySettings, enumerateRoutes } from './execution/trigEntry';
 import { runCheckFirst } from './execution/checkFirstFlow';
 import { MonadAdapter } from './chains/monad';
 import { AvalancheAdapter } from './chains/avalanche';
@@ -509,6 +510,10 @@ let localSim: LocalSimHost | null = null;
 // trigger the moment the feed shows it. null = LOCAL_SIM_TRIGGER_FIRST off (the
 // default) or no fast check: nothing at all happens.
 let trigFirst: TriggerFirst | null = null;
+// TRIGGER-FIRST ENTRY POINT (execution/trigEntry.ts): every feed transaction
+// checked as a possible trigger, ahead of the old model guess and the 6 h
+// lists. Created with trigFirst (TRIG_FIRST_ENTRY=1, the default).
+let trigEntry: TrigEntry | null = null;
 // COPY 2: the pool keys (addresses / V4 ids) the block readers follow. The
 // block reader setup replaces this with its own list; until then: watched pairs.
 let copy2PoolKeys: () => string[] = () => robinhoodWatcher.watchedPairPools().flat();
@@ -1673,6 +1678,10 @@ const liveTracker = new LiveTradeTracker({
             loopLiveRef?.noteResult(r);
             // Scoreboard: the send's path / confidence and its real result.
             const scored = scoreboard.noteResult(r);
+            // A trigger-first ENTRY send that failed on chain: its pair waits 30 min (entry sends skip the 6 h list).
+            if (GAP_LIVE_FAIL_BLOCK_MIN > 0 && entryFailBlock(scored, (a, b, why) => gapFailBlocks.block(a, b, why))) {
+                  console.log(`[live-block] ${r.label}: trigger-first entry live trade failed, pool pair not sent by the entry point for ${GAP_LIVE_FAIL_BLOCK_MIN} min`);
+            }
             // A standing gap whose live trade failed on chain: not sent again for 30 min.
             if (GAP_LIVE_FAIL_BLOCK_MIN > 0 && standingGapFailBlock(scored, (a, b, why) => gapFailBlocks.block(a, b, why))) {
                   console.log(`[live-block] ${r.label}: standing gap's live trade failed, pool pair not sent as a standing gap for ${GAP_LIVE_FAIL_BLOCK_MIN} min`);
@@ -2400,6 +2409,12 @@ const fireTrade = async (o: {
       checkedProfitUsd?: number;
       // The trade we follow (trigger trades): check-first waits for it to land.
       triggerHash?: string;
+      // TRIGGER-FIRST ENTRY POINT send (execution/trigEntry.ts): our exact
+      // trade was already checked on the replayed feed (out). Such a send
+      // skips the old model guess's check-first step and the 6 h liveBlocks /
+      // bench lists (those stay for the old paths), and keeps every other
+      // safeguard below. onSigned / onBlocked report back to the entry point.
+      entry?: { out: TrigOutcome; onSigned?: (ms: number) => void; onBlocked?: (why: string) => void };
 }) => {
       try {
             // WHY NOT SENT (report/whyNotSent.ts): every live chance that gets here is
@@ -2422,26 +2437,32 @@ const fireTrade = async (o: {
                   fireStats.blocked.set(r, (fireStats.blocked.get(r) ?? 0) + 1);
                   // Live: also into the 10-min "why not sent" line and the status page's file.
                   if (liveRh) { whyNotSent.blocked(r); liveTradeLog.noteBlocked(r); }
+                  try { o.entry?.onBlocked?.(r); } catch { /* reporting only */ }
             };
             // LIVE ROUTE BLOCK: a pair whose real check failed / lost, or whose live
             // trade failed, in the last 6 h is not sent for real (no $1 bypass).
             // Trigger trades only: sitting gaps are sent right after a fresh real
             // check that passed (and a pass lifts the block anyway).
-            if (o.chain === 'robinhood' && robinhoodSender.live && o.source === 'trade') {
+            // NOT for trigger-first ENTRY sends (o.entry): deliberately, it stopped
+            // 15 of 16 entry-worthy chances; a failed entry send blocks its pair
+            // for 30 min instead (just below).
+            if (o.chain === 'robinhood' && robinhoodSender.live && o.source === 'trade' && !o.entry) {
                   const why = liveBlocks.reason(o.buyPool.poolAddress, o.sellPool.poolAddress);
                   if (why) { block('pool pair blocked for live (failed real check or live trade, 6 h)'); return; }
             }
             // STANDING GAPS keep ignoring the 6 h block above (design: each is sent
             // right after its own fresh real check), but a pair whose standing-gap
             // live trade failed on chain waits GAP_LIVE_FAIL_BLOCK_MIN (30 min).
-            if (o.chain === 'robinhood' && robinhoodSender.live && o.source === 'gap' && gapFailBlocks.reason(o.buyPool.poolAddress, o.sellPool.poolAddress)) {
-                  block(`standing gap: live trade failed on this pair (${GAP_LIVE_FAIL_BLOCK_MIN} min)`);
+            // Trigger-first ENTRY sends use the same 30-min block (their own failures, entryFailBlock).
+            if (o.chain === 'robinhood' && robinhoodSender.live && (o.source === 'gap' || o.entry) && gapFailBlocks.reason(o.buyPool.poolAddress, o.sellPool.poolAddress)) {
+                  block(`${o.entry ? 'trigger-first entry' : 'standing gap'}: live trade failed on this pair (${GAP_LIVE_FAIL_BLOCK_MIN} min)`);
                   return;
             }
             // Pool pairs whose practice checks keep losing (benched 6 h) aren't
             // sent either: a trade the checks say never pays would only burn gas.
             // Big gaps ($1+ expected, BENCH_BYPASS_USD) are sent even on a benched pair.
-            if (o.chain === 'robinhood' && o.source === 'trade' && o.netProfitUsd < BENCH_BYPASS_USD && routeScores.isBenched(RouteScores.key(o.buyPool.poolAddress, o.sellPool.poolAddress))) {
+            // (Not for trigger-first ENTRY sends: their exact trade was checked on the replayed feed.)
+            if (o.chain === 'robinhood' && o.source === 'trade' && !o.entry && o.netProfitUsd < BENCH_BYPASS_USD && routeScores.isBenched(RouteScores.key(o.buyPool.poolAddress, o.sellPool.poolAddress))) {
                   block('pool pair benched (practice checks keep losing)');
                   return;
             }
@@ -2477,7 +2498,7 @@ const fireTrade = async (o: {
             const label0 = `${symbolOf(o.chain, o.tokenIn)}/${symbolOf(o.chain, o.tokenOut)} ${o.buyPool.dex}>${o.sellPool.dex}`;
             let trigP: Promise<TrigOutcome> | null = null;
             let trigBuilt: BuiltCheck | null = null;
-            if (trigFirst && o.chain === 'robinhood' && o.source === 'trade' && o.triggerHash) {
+            if (trigFirst && o.chain === 'robinhood' && o.source === 'trade' && o.triggerHash && !o.entry) {
                   const tb = buildCheck('robinhood', o.tokenIn, o.buyPool, o.sellPool, o.tradeSizeUsd, o.usdPerTokenIn);
                   if (!('skip' in tb)) {
                         trigBuilt = tb;
@@ -2495,7 +2516,10 @@ const fireTrade = async (o: {
             //      the node's answer is recorded next to the fast one.
             //   2. the node: wait for the trade to land, then the node's check.
             // (Before: sent on the guess first; only about 1 in 5 guesses is a real win.)
-            if (o.chain === 'robinhood' && robinhoodSender.live && o.source === 'trade' && checkFirstOn()) {
+            // Trigger-first ENTRY send: already checked (its exact trade on the
+            // replayed feed, entry point); no guess, no waiting, no node.
+            if (o.entry) { checkFirstDecidedBy = 'trig_first'; trigUsed = o.entry.out; }
+            if (o.chain === 'robinhood' && robinhoodSender.live && o.source === 'trade' && checkFirstOn() && !o.entry) {
                   const startedMs = Date.now();
                   const fb = localSim && o.triggerHash ? buildCheck('robinhood', o.tokenIn, o.buyPool, o.sellPool, o.tradeSizeUsd, o.usdPerTokenIn) : null;
                   const built = fb && !('skip' in fb) ? fb : null;
@@ -2677,6 +2701,12 @@ const fireTrade = async (o: {
                   const paused = scoreboard.pausedWhy(sendPath, trigConf, trigAssumed);
                   if (paused) { block(`scoreboard: ${sendPath} paused (its recent real sends lost money)`); console.log(`[scoreboard] not sent (${sendPath}): ${paused}`); return; }
             }
+            // ONE SEND PER TRIGGER (trigEntry.claim, shared lock): the entry point
+            // and the old path never both send for the same followed trade.
+            if (o.source === 'trade' && o.triggerHash && trigEntry && !trigEntry.claim(o.triggerHash, o.entry ? 'entry' : 'old')) {
+                  block('another path already sent for this trigger');
+                  return;
+            }
             o.trace?.mark('checks');
             const fired = await robinhoodSender.fire(dry.to ?? '0x0000000000000000000000000000000000000000', dry.data);
             markStretch('fire result'); // stall finder: handling the sender's answer
@@ -2694,7 +2724,8 @@ const fireTrade = async (o: {
             // FAST CHECK timing proof: trigger seen in the feed -> trade signed.
             if (localSim && checkFirstDecidedBy && fired.signedAtMs) localSim.noteSigned(o.triggerHash, o.seenAtMs, fired.signedAtMs, checkFirstDecidedBy);
             // Trigger-first decided: feed -> signed, and later vs its block's reports.
-            if (trigFirst && checkFirstDecidedBy === 'trig_first' && fired.signedAtMs) trigFirst.noteSubmitted(o.triggerHash, fired.signedAtMs);
+            if (trigFirst && checkFirstDecidedBy === 'trig_first' && !o.entry && fired.signedAtMs) trigFirst.noteSubmitted(o.triggerHash, fired.signedAtMs);
+            if (o.entry && fired.signedAtMs) { try { o.entry.onSigned?.(fired.signedAtMs); } catch { /* reporting only */ } }
             const tradeLabel = `${symbolOf(o.chain, o.tokenIn)}/${symbolOf(o.chain, o.tokenOut)} ${o.buyPool.dex}>${o.sellPool.dex}`;
             if (fired.live && !fired.txHash && fired.error) { liveTradeLog.sendFailed(tradeLabel, o.tradeSizeUsd, fired.error); alertHooks.liveSendFailed(tradeLabel, fired.error); whyNotSent.blocked('node refused the send'); }
             // How this trade is paid for (Oct 20): own money, or a flash loan and its fee.
@@ -2713,7 +2744,7 @@ const fireTrade = async (o: {
                   livePools.set(fired.txHash, [o.buyPool.poolAddress, o.sellPool.poolAddress]);
                   if (livePools.size > 500) livePools.delete(livePools.keys().next().value as string);
                   liveTracker.track(fired.txHash, { expectedProfitUsd: netProfitUsd, label: tradeLabel, sizeUsd: o.tradeSizeUsd, funding, routeKey: routeKeyFor(dry.hops.map((h) => h.kind), dry.funding === 'v3-flash') });
-                  if (fired.live) scoreboard.noteSend({ hash: fired.txHash, path: sendPath, confidence: trigConf, assumptions: trigAssumed, expectedUsd: netProfitUsd, label: tradeLabel, pools: [o.buyPool.poolAddress, o.sellPool.poolAddress] });
+                  if (fired.live) scoreboard.noteSend({ hash: fired.txHash, path: sendPath, confidence: trigConf, assumptions: trigAssumed, expectedUsd: netProfitUsd, label: tradeLabel, pools: [o.buyPool.poolAddress, o.sellPool.poolAddress], ...(o.entry ? { src: 'entry' as const } : {}) });
             }
             console.log(`[fire] robinhood ${fired.live ? 'LIVE' : 'DRY RUN'} (${o.source}) ready ${readyMs}ms after ${o.source === 'trade' ? 'the trigger' : 'the price update'} (sign ${fired.signMs.toFixed(1)}ms)` +
                   `${fired.txHash ? ` tx ${fired.txHash}` : ''}${fired.error ? ` error: ${fired.error}` : ''}`);
@@ -2865,6 +2896,47 @@ localSim = createLocalSimHost(chainOn('robinhood'), {
             return out;
       },
 });
+// TRIGGER-FIRST ENTRY POINT candidates (execution/trigEntry.ts): for the pools
+// a feed transaction moved, every route the bot already knows how to trade:
+// the same pair on another exchange (cache.findPeerPools), buy on one pool and
+// sell on the other, both directions, starting from a coin we hold (USDG /
+// WETH). Same rules as every trade: exchange cleared for trading
+// (liveBlocker), both coins on the allowed list, size caps (MAX_TRADE_USD,
+// own-money wallet, auto-vetted coin limit), the lender buildCheck picks.
+type EntryHost = { buy: any; sell: any; tokenIn: string; tokenOut: string; usdPer: number };
+const entryCandidatesFor = (keys: string[]): EntryCandidate[] => {
+      const lc = (x: string) => (x ?? '').toLowerCase();
+      const routes = enumerateRoutes<any>(keys, {
+            pool: (k) => cache.get('robinhood', k) ?? cache.allForChain('robinhood').find((x: any) => lc(x.poolAddress) === lc(k)),
+            peers: (p) => cache.findPeerPools('robinhood', p.tokenA, p.tokenB, p.poolAddress),
+            addr: (p) => p.poolAddress, tokens: (p) => [p.tokenA, p.tokenB],
+            startCoins: [ROBINHOOD_TOKENS.USDG, ROBINHOOD_TOKENS.WETH],
+            coinAllowed: (t) => safetyGate.isAllowed(t),
+            venueBlocked: (buy, sell) => liveBlocker(buy, sell),
+      });
+      const out: EntryCandidate[] = [];
+      for (const { buy, sell, tokenIn, tokenOut } of routes) {
+            const usdPer = priceOracle.getUsdPrice('robinhood', tokenIn);
+            const dec = TOKEN_DECIMALS.robinhood?.[lc(tokenIn)];
+            if (!usdPer || dec === undefined) continue;
+            // Size caps: MAX_TRADE_USD, own money (the wallet, live), auto-vetted coin limit.
+            let maxSizeUsd = MAX_TRADE_USD;
+            if (RH_OWN_MONEY && !approvedLenders('robinhood').size) maxSizeUsd = Math.min(maxSizeUsd, OWN_MONEY_MAX_USD, robinhoodSender.live ? 0.98 * ownMoney.availableUsd(tokenIn, usdPer, dec) : OWN_MONEY_MAX_USD);
+            if (involvesAutoVetted([tokenIn, tokenOut])) maxSizeUsd = Math.min(maxSizeUsd, AUTO_VET_MAX_TRADE_USD);
+            if (!(maxSizeUsd > 0)) continue;
+            const lender = pickLender('robinhood', tokenIn, buy, sell, maxSizeUsd, usdPer);
+            const host: EntryHost = { buy, sell, tokenIn, tokenOut, usdPer };
+            out.push({
+                  label: `${symbolOf('robinhood', tokenIn)}/${symbolOf('robinhood', tokenOut)} ${buy.dex}>${sell.dex}`,
+                  buyPool: buy.poolAddress, sellPool: sell.poolAddress, tokenIn, tokens: [tokenIn, tokenOut],
+                  keys: routeKeys(buy, sell, lender), maxSizeUsd, gasUsd: rhGasUsd(0.05),
+                  build: (usd) => { const b = buildCheck('robinhood', tokenIn, buy, sell, usd, usdPer); return 'skip' in b ? null : { trade: b.trade, simOpts: b.simOpts }; },
+                  usdOf: (units) => (Number(units) / 10 ** dec) * usdPer,
+                  host,
+            });
+      }
+      return out;
+};
 // TRIGGER-FIRST: needs the fast check's connection and copy 2 (LOCAL_SIM
 // shadow / on and LOCAL_SIM_TRIGGER_FIRST shadow / on).
 try {
@@ -2876,13 +2948,44 @@ try {
             const sb = scoreboard.stepBackActiveUntil();
             if (sb) trigFirst.stepBack(sb, 'scoreboard step back from before the restart');
             console.log(`[trigger-first] best effort: ${tfs.strict ? 'STRICT (no assumptions)' : `assumptions allowed: ${tfs.assume.join(', ') || 'none'}`}; lowest confidence that may send (on): ${tfs.minConfidence}`);
+            // ENTRY POINT (TRIG_FIRST_ENTRY=1, default): every feed transaction.
+            const es = entrySettings(process.env, MIN_NET_PROFIT_USD);
+            if (es.enabled) {
+                  const tf = trigFirst;
+                  trigEntry = new TrigEntry({
+                        tf, client: host.client, shadowLog: host.shadowLog, settings: es,
+                        candidatesFor: (keys) => entryCandidatesFor(keys),
+                        // Our own sends (seen again in the feed) and our contract: never triggers.
+                        isOurTx: (h) => livePools.has(h) || livePools.has(h.toLowerCase()),
+                        ourAddresses: [executorConfig('robinhood').executorAddress, robinhoodSender.live ? robinhoodSender.address : undefined].filter((a): a is string => typeof a === 'string'),
+                        killed: () => killSwitchOn(process.env.KILL_SWITCH) || existsSync(process.env.KILL_FILE ?? 'data/KILL'),
+                        safety: (sizeUsd, tokens) => { const g = safetyGate.check({ tradeSizeUsd: sizeUsd, tokens }); return g.ok ? null : ('reason' in g ? g.reason : 'blocked'); },
+                        failBlocked: (a, b) => (GAP_LIVE_FAIL_BLOCK_MIN > 0 ? gapFailBlocks.reason(a, b) ?? null : null),
+                        pausedWhy: (conf, as) => scoreboard.pausedWhy('trig_first', conf as ScoreConfidence | undefined, as),
+                        send: async (pick, trig) => {
+                              const h = pick.cand.host as EntryHost;
+                              let signedMs: number | undefined; let why: string | undefined;
+                              // The check already traded WITH the lender buildCheck picked: its fee is in the profit.
+                              const lender = pickLender('robinhood', h.tokenIn, h.buy, h.sell, pick.sizeUsd, h.usdPer);
+                              await fireTrade({
+                                    chain: 'robinhood', tokenIn: h.tokenIn, tokenOut: h.tokenOut, buyPool: h.buy, sellPool: h.sell,
+                                    tradeSizeUsd: pick.sizeUsd, netProfitUsd: pick.netUsd, checkedProfitUsd: pick.netUsd, usdPerTokenIn: h.usdPer,
+                                    seenAtMs: trig.seenMs, source: 'trade', triggerHash: trig.hash,
+                                    plannedLoanPips: lender ? (lender.feePips ?? lender.feeBps * 100) : 0,
+                                    entry: { out: pick.out, onSigned: (ms) => { signedMs = ms; }, onBlocked: (r) => { why = r; } },
+                              });
+                              return { signedMs, why };
+                        },
+                  });
+            }
       }
-} catch (e) { console.log(`[trigger-first] could not start (${(e as Error).message}); the existing paths decide`); trigFirst = null; }
+} catch (e) { console.log(`[trigger-first] could not start (${(e as Error).message}); the existing paths decide`); trigFirst = null; trigEntry = null; }
 if (chainOn('robinhood')) {
       const rhAdapter = new RobinhoodChainAdapter();
       if (localSim) { const host = localSim; rhAdapter.setRawFrameTap((text) => host.forwardFeed(text)); }
       // Trigger-first: every feed message, complete, into its order buffer.
-      if (trigFirst) { const tf = trigFirst; rhAdapter.setFeedMsgTap((msgs, at) => tf.onFeedMsgs(msgs, at)); }
+      // Then the ENTRY POINT (every transaction a possible trigger; never blocks the feed).
+      if (trigFirst) { const tf = trigFirst; const te = trigEntry; rhAdapter.setFeedMsgTap((msgs, at) => { tf.onFeedMsgs(msgs, at); te?.onFeedMsgs(msgs, at); }); }
       chainManager.register(rhAdapter);
 }
 if (chainOn('monad')) chainManager.register(new MonadAdapter());
@@ -4696,6 +4799,8 @@ for (let i = 0; i < resolved.length; i++) {
                         try { fastLine = localSim?.takeHourLine() ?? null; } catch { /* reporting only */ }
                         // Trigger-first hour line (also logged as "[trigger-first] hour: ...").
                         try { const tl = trigFirst?.takeHourLine() ?? null; if (tl) fastLine = fastLine ? `${fastLine}\n${tl}` : tl; } catch { /* reporting only */ }
+                        // Trigger-first ENTRY POINT hour line ("[trig-entry] hour: ...").
+                        try { const el = trigEntry?.takeHourLine() ?? null; if (el) fastLine = fastLine ? `${fastLine}\n${el}` : el; } catch { /* reporting only */ }
                         // SCOREBOARD (real money by path / confidence, today, paused buckets).
                         let scoreLine: string | null = null;
                         try { scoreLine = scoreboard.hourText(fromMs, now); } catch { /* reporting only */ }

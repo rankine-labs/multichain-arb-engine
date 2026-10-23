@@ -398,6 +398,61 @@ Built since (Oct 23): the scoreboard's automatic step back on REAL money
 lost (above). Not built (option for later): a step back when the later
 same-state re-checks disagree too often.
 
+### Entry point: every feed transaction is a possible trigger (Oct 23)
+
+Before: trigger-first only ran for trades the old model guess had flagged,
+and only after the 6 h "pair blocked" / benched lists (15 of 16 chances in
+~50 min of practice were stopped by "pair blocked"). Now
+(`src/execution/trigEntry.ts`), for EVERY Robinhood feed transaction:
+
+1. Cheap skip: plain ETH transfers, contract creations, our own transactions
+   / calls to our contract, approve / transfer / WETH wrap & unwrap / permit.
+2. "Which of our pools does it move?": the fast check runs the transaction
+   ALONE on copy 2's newest version (sidecar request `trig_discover`; same
+   replay rules and assumptions, no node) and names the followed pools whose
+   state it changed.
+3. Candidate trades: the same pair on another exchange, both directions,
+   starting from USDG / WETH, with the usual exchange / coin rules, size caps
+   and lender (at most `TRIG_ENTRY_MAX_CANDIDATES`).
+4. Each candidate gets the full trigger-first check (every feed transaction
+   in order, then our exact trade) at the biggest size of
+   `TRIG_ENTRY_SIZES_USD`; the smaller sizes run on the same replay in the same
+   request (size ladder). Best net after gas wins.
+5. Profitable (`MIN_EXEC_NET_USD`) at `TRIG_FIRST_MIN_CONFIDENCE` or better:
+   `on` sends at once, `shadow` logs "would send".
+
+An entry-point send still passes: kill file / switch, SafetyGate (coin
+allowlist, caps, daily loss), the minimum profit, the confidence floor, the
+30-min live-fail block on the pool pair (`GAP_LIVE_FAIL_BLOCK_MIN`; a failed
+entry send sets it), the scoreboard's paused buckets, then fireTrade's
+fit-to-wallet, outlier guard and live checks. It does NOT need the old model
+guess and ignores the 6 h liveBlocks / benched lists (they stay for the old
+paths). One send per trigger: the entry point and the old path share a lock.
+
+| Setting | Default | |
+|---|---|---|
+| `TRIG_FIRST_ENTRY` | `1` | `0` = entry point off (`LOCAL_SIM_TRIGGER_FIRST` governs both: off / shadow / on) |
+| `TRIG_ENTRY_MAX_IN_FLIGHT` | `4` | triggers worked on at once; more are dropped (counted) |
+| `TRIG_ENTRY_MAX_CANDIDATES` | `6` | candidate trades checked per trigger |
+| `TRIG_ENTRY_SIZES_USD` | `50,150,400` | size ladder ($), capped by the trade / wallet limits |
+| `TRIG_ENTRY_DISCOVER_TIMEOUT_MS` | `40` | the "which pools?" question |
+| `TRIG_ENTRY_DEADLINE_MS` | `250` | the whole trigger (discover + checks) |
+
+What to read:
+- `data/local-sim-shadow.jsonl` lines `"k":"trig_entry"` (only for
+  transactions that moved one of our pools): `pools` moved, `dconf` / `das`
+  how sure that answer was (`alone:N` = N earlier feed transactions left out
+  of the discover run), `cands` / `tried` candidates found / checked, `best`
+  route, `size` ($), `net` ($ after gas), `conf` / `as`, `u` why unknown,
+  `would` (would send / sent), `held` what stopped it, `discMs` / `ansMs` /
+  `subMs` feed seen -> discover / answer / signed, and the later same-block
+  re-check (`agree`, `agV`, `same`, `agSkip`, `rblk`, `rAfterMs`).
+- hourly `[trig-entry] hour:` line (also in the Telegram fast-check block):
+  feed txs, looked at (skipped, dropped overloaded), moving our pools (% of
+  answered), answered %, profitable ($ sum after gas), would send / sent /
+  held back (why), feed->discover / answer / submit p50 / p90, top unknown
+  reasons. Real sends are on the scoreboard as path `trig_first`, `src:"entry"`.
+
 ## Rarely needed settings
 
 `ARBSIM_SOCKET` (default `/tmp/arbsim.sock`), `LOCAL_SIM_TIMEOUT_MS` (60, per

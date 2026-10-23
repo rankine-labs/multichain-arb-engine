@@ -829,6 +829,40 @@ pub struct OrderedOut {
     pub results: Vec<CallOutcome>,
     /// The assumptions made (empty = exact). See the file header.
     pub assumed: Assumed,
+    /// Storage values the replayed transactions left changed (account,
+    /// slot), sorted. Exact for a one-transaction plan (`trigger_only`,
+    /// the trigger-first entry point's "which of our pools did it move?");
+    /// with several transactions it is "changed by one of them".
+    pub changed: Vec<(Address, U256)>,
+}
+
+/// TRIGGER-FIRST ENTRY POINT ("discover", server.rs trig_discover):
+/// the plan cut down to the trigger ALONE, in its own message's block
+/// details. Plain English: to learn quickly which of our pools a new feed
+/// transaction moves, we run just that transaction on the newest copy
+/// version (one run, a fraction of a millisecond) and look at what it
+/// changed. Feed transactions sequenced between the copy version and the
+/// trigger are left out (counted, `alone:N` in the answer, confidence at
+/// most medium): the full ordered check of each candidate trade afterwards
+/// replays every one of them anyway.
+/// Returns None when the trigger isn't in the plan (it is already in the
+/// copy version: nothing to run). The number is how many other replayable
+/// transactions were left out.
+pub fn trigger_only(plan: &OrderedPlan) -> Option<(OrderedPlan, usize)> {
+    let mut others = 0usize;
+    let mut found: Option<PlanMsg> = None;
+    for m in &plan.msgs {
+        for t in &m.txs {
+            if t.hash == plan.trigger && found.is_none() {
+                found = Some(PlanMsg { seq: m.seq, ctx: m.ctx.clone(), txs: vec![t.clone()] });
+            } else if found.is_none() {
+                others += 1;
+            }
+        }
+    }
+    let m = found?;
+    let call_ctx = m.ctx.clone();
+    Some((OrderedPlan { msgs: vec![m], trigger: plan.trigger, call_ctx }, others))
 }
 
 type WatchedEvm<'a> = ArbEvm<CheckDb<'a>, Watch<'a>>;
@@ -1116,6 +1150,16 @@ fn one_round(
             replayed.push(ReplayedTx { hash: t.hash, seq: m.seq, outcome });
         }
     }
+    // What the replayed transactions left changed (the entry point's
+    // "which pools did the trigger move?"; see OrderedOut.changed).
+    let mut changed: Vec<(Address, U256)> = evm
+        .ctx
+        .journaled_state
+        .state
+        .iter()
+        .flat_map(|(a, acc)| acc.storage.iter().filter(|(_, v)| v.is_changed()).map(move |(k, _)| (*a, *k)))
+        .collect();
+    changed.sort();
     // 2. Our pretend-state must not have changed how they ran, and every
     //    copy value they used must be exact at the snapshot's block (or,
     //    best effort, labelled: a sender's value = sender_funds, a fill =
@@ -1173,7 +1217,7 @@ fn one_round(
     assumed.sender_funds |= l.sender_funds;
     assumed.recent_fill |= l.recent_fill;
     assumed.call_fill |= l.call_fill;
-    Ok(Next::Done(OrderedOut { replayed, results, assumed }))
+    Ok(Next::Done(OrderedOut { replayed, results, assumed, changed }))
 }
 
 /// A replayed transaction needed values we don't hold: assume its sender's,

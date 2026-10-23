@@ -60,6 +60,9 @@ export type ScoreSend = {
   label?: string;
   pools?: string[];               // the pools traded (standing-gap fail block)
   sentMs?: number;
+  // Trigger-first sends: "entry" = started by the entry point on the feed
+  // (execution/trigEntry.ts), not by the old model-guess hook.
+  src?: 'entry';
 };
 
 // One settled send (= one line of data/scoreboard.jsonl).
@@ -145,6 +148,15 @@ export function totals(rs: ScoreRecord[]): ScoreTotals {
 export function standingGapFailBlock(rec: ScoreRecord | null, block: (buyPool: string, sellPool: string, why: string) => void): boolean {
   if (!rec || rec.path !== 'gap' || rec.status !== 'failed' || !rec.pools || rec.pools.length < 2) return false;
   block(rec.pools[0], rec.pools[1], 'standing gap: live trade failed on chain');
+  return true;
+}
+
+// TRIGGER-FIRST ENTRY POINT: an entry-point send that failed on chain blocks
+// its exact pool pair for the same 30 min as a standing gap (entry sends
+// skip the 6 h list on purpose, see execution/trigEntry.ts). true = blocked.
+export function entryFailBlock(rec: ScoreRecord | null, block: (buyPool: string, sellPool: string, why: string) => void): boolean {
+  if (!rec || rec.path !== 'trig_first' || rec.src !== 'entry' || rec.status !== 'failed' || !rec.pools || rec.pools.length < 2) return false;
+  block(rec.pools[0], rec.pools[1], 'trigger-first entry: live trade failed on chain');
   return true;
 }
 

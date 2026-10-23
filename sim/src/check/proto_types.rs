@@ -74,6 +74,27 @@ pub struct CallRequest {
     /// works out which of them the chosen copy version already holds.
     #[serde(default)]
     pub feed: Option<Value>,
+    /// Trigger-first entry point (only with `feed`): also try our trade at
+    /// these other sizes, each on the same replayed feed (see
+    /// `WireSizes`). The answer then carries `sizes`.
+    #[serde(default)]
+    pub sizes: Option<WireSizes>,
+}
+
+/// SIZE LADDER on the replayed feed (trigger-first entry point).
+/// Plain English: our trade size matters (too small = little profit, too
+/// big = the price moves against us). With `sizes`, the same feed replay is
+/// run once per size, each followed by our trade with only its amount
+/// changed: the amountIn word at `amountOffset` (after the 4-byte code)
+/// and, for own-money trades, every pretend balance slot that held exactly
+/// the original amount (the test contract's trading money). One request,
+/// no extra round trips.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct WireSizes {
+    #[serde(rename = "amountOffset")]
+    pub amount_offset: usize,
+    /// The other amounts to try (hex), at most 8.
+    pub amounts: Vec<String>,
 }
 
 /// Block details for one request: the server's, plus the request's changes.
@@ -312,6 +333,8 @@ pub fn handle_trig_call_with(
     };
     match super::ordered::run_ordered_with(view, plan, &ov, &calls, prov, strict_call, assume) {
         Ok(out) => {
+            // Size ladder (entry point): the same replay, our trade at each size.
+            let ladder = req.sizes.as_ref().and_then(|z| size_ladder(view, plan, &ov, &calls, prov, strict_call, assume, z));
             // One fingerprint of how every replayed transaction ended
             // (success + output; gas is left out so the protocol-fee runs,
             // which differ in gas only, can still be merged).
@@ -323,7 +346,7 @@ pub fn handle_trig_call_with(
             }
             // How the trigger itself ended (null: already in the copy, not replayed).
             let trigger_ok = out.replayed.iter().find(|r| r.hash == info.trigger).map(|r| r.outcome.success);
-            serde_json::json!({
+            let mut a = serde_json::json!({
                 "id": req.id,
                 "ok": true,
                 "at": at_json(&req.at, view),
@@ -345,10 +368,72 @@ pub fn handle_trig_call_with(
                     "skipped": out.assumed.skipped_related + out.assumed.skipped_unrelated,
                 },
                 "us": t0.elapsed().as_micros() as u64,
-            })
+            });
+            if let (Some(l), Some(o)) = (ladder, a.as_object_mut()) {
+                o.insert("sizes".into(), l);
+            }
+            a
         }
         Err(u) => unknown_json(&req.id, &u, t0.elapsed().as_micros()),
     }
+}
+
+/// The size ladder (see `WireSizes`): one entry per amount, in order:
+/// {amount, status: profit / loss / fail / unknown, profit, gasUsed, reason}.
+/// None (no `sizes` in the answer) when it can't be applied: not exactly one
+/// call, or the amountIn word isn't where it should be.
+#[allow(clippy::too_many_arguments)]
+fn size_ladder(
+    view: &dyn StateRead,
+    plan: &super::ordered::OrderedPlan,
+    ov: &Overrides,
+    calls: &[CallReq],
+    prov: &dyn super::ordered::Provenance,
+    strict_call: bool,
+    assume: &super::ordered::Assume,
+    z: &WireSizes,
+) -> Option<Value> {
+    use super::search::{classify, patch_amount};
+    if calls.len() != 1 || z.amounts.is_empty() {
+        return None;
+    }
+    let call = &calls[0];
+    let start = 4usize.checked_add(z.amount_offset)?;
+    let end = start.checked_add(32)?;
+    if end > call.data.len() {
+        return None;
+    }
+    let original = U256::from_be_slice(&call.data[start..end]);
+    if original.is_zero() {
+        return None;
+    }
+    let mut out = Vec::new();
+    for a in z.amounts.iter().take(8) {
+        let Ok(amount) = parse_u256(a) else { continue };
+        let Ok(data) = patch_amount(&call.data, z.amount_offset, amount) else { return None };
+        // Own money: every pretend slot holding exactly the original amount follows the size.
+        let mut ov2 = ov.clone();
+        for acc in ov2.accounts.values_mut() {
+            for v in acc.state_diff.values_mut() {
+                if *v == original {
+                    *v = amount;
+                }
+            }
+        }
+        let c = CallReq { data, ..call.clone() };
+        let row = match super::ordered::run_ordered_with(view, plan, &ov2, std::slice::from_ref(&c), prov, strict_call, assume) {
+            Ok(r) => match r.results.first() {
+                Some(o) => {
+                    let t = classify(amount, o);
+                    serde_json::json!({ "amount": quantity(t.amount), "status": t.status, "profit": quantity(t.profit), "gasUsed": quantity_u64(t.gas_used), "reason": t.reason })
+                }
+                None => continue,
+            },
+            Err(u) => serde_json::json!({ "amount": quantity(amount), "status": "unknown", "reason": format!("{:?}", u.reason) }),
+        };
+        out.push(row);
+    }
+    Some(Value::Array(out))
 }
 
 /// Run a `size_search` request on `view`.
