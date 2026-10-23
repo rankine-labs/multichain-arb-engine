@@ -579,7 +579,8 @@ pub fn copy2_runs(c: &Copy2Handle, view: &View, facts: &crate::copy2::checkview:
         let v = match high {
             None => C2View::with_fee(view, facts, zero, fee),
             Some(m) => C2View::with_offsets(view, facts, high_offset(), fee, m.clone()),
-        };
+        }
+        .with_snap(view.snap.clone());
         let t = Instant::now();
         let a = run(&v, bctx);
         let (b, f) = (v.used_bound(), v.used_fee());

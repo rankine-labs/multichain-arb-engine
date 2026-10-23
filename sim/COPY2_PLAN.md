@@ -1128,3 +1128,54 @@ trade ~20 ms.
   route / full bound covers the take (as before copy2-r, minus the RIVN
   false reverts): roughly 60-75 % of the bot's checks sure (the rest: first
   read misses, not_ready after the restart).
+
+- After the copy2-s deploy, Oct 23 02:22 UTC shadow, 64 min, quiet night
+  (inbot-sim/copy2-t): pool_manager_balance unknowns gone, 0 mismatches,
+  first same-moment re-check "EARLY" (copy right). But 27 checks, 7 sure:
+  miss 14 (13 missing ONLY USDG slot "not a balance ..." = its
+  totalSupply, needed by the narrow-coin check), bot timeouts 6 (RIVN /
+  SNAP / USDG, 62-85 ms; arbsim p90 73 ms, p99 175 ms; 7 full-bound retries).
+  1. Why USDG's supply stayed missing (reproduced: tests/copy2_intake.rs
+     fills_and_rereads_at_a_node_block_the_copy_has_no_version_for_are_kept;
+     fails on the old code: "refreshed, not lost" -> Missing). USDG's
+     supply moves every few minutes (bridge mints / burns; probed: 685.3806e12
+     -> 685.3856e12 over 3000 blocks), so the 60 s re-read found it changed
+     and forgot it everywhere, then put the new value in "from the re-read's
+     block". Fills and re-reads read at the node's tip when the node is
+     behind the copy's head, and the copy keeps a version per MESSAGE
+     (blocks with reports for our pools + the newest quiet block): on a
+     quiet night there is usually no version at exactly that block, so
+     state/fill.rs reconcile dropped the value as "too old", silently, and
+     every later fill of it was dropped the same way.
+     Fix (intake.rs place_block): a value read at node block k with no copy
+     version at k (but versions after it) is put in from the newest version
+     before k: the blocks between had no reports for our pools (else the
+     bot sends a message), so every followed value is the same there as at
+     k; a value nothing follows is used with the usual between-re-reads
+     trust; late reports keep their k-based rules (last_pos / coin_base).
+     Counter fill_placed_before. (This also kept OTHER fills from landing
+     on quiet nights, e.g. the WETH totalSupply first-read miss.)
+  2. Slow full-bound retry. The retry summed every ready V4 pool's payout
+     over its WHOLE tick map (live spacing 1 / 10 / 50 pools: thousands of
+     words each). Now (checkview.rs): pools off the route walk at most
+     ARBSIM_COPY2_BOUND_WORDS (16) words from their price (a partial swap's
+     payout is still a proven lower bound; it subtracts its own, fewer,
+     rounding steps); the route's pools walk whole; and each pool's figure
+     is cached per copy version (key: snapshot pointer kept alive by the
+     cache, pool, direction, cap, far list pointer kept alive; newest 4
+     versions), shared by every check of that version. Unit tests: capped
+     walk <= the real amounts and >= the whole-walk figure minus nothing
+     (bound_over_one_position). Bench (copy2_latency, 300 pools, full bound
+     forced on EVERY check, ARBSIM_COPY2_BOUND_FULL=1): warm-up avg 6.1 ms
+     (old, uncapped) -> 1.3 ms; bot-side p50 2.6 / p90 5.6 / p99 10.3 ms;
+     same answered / unknown as always (166 / 17 pmb / 17 miss of 200). The
+     bench's pools are all spacing 60 (~116 words); live spacing-1/10 pools
+     gain far more. Width probes stay cached per coin (4 tiny runs, ~10 us
+     each). ARBSIM_COPY2_BOUND_WORDS=8000 = the old uncapped walk.
+  Known flake (also on origin/main, 1 in 5 runs): copy2_latency "a check
+  waited for the copy's lock: 300 ms" (a check that had to rebuild the
+  check core while the test thread held the registry lock).
+  No change to what copy 2 holds / follows: no state FORMAT bump.
+  Expected live: the 13 USDG-supply misses and the 6 timeouts answered:
+  roughly 70-85 % of the bot's checks sure (the rest: not_ready after a
+  restart, pending reports, first-read misses).

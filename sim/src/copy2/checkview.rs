@@ -83,6 +83,14 @@
 //   held supply is <= one verify round old); else unknown. The width is
 //   remembered per coin and re-confirmed every check (2 runs).
 //
+//   copy2-t (live Oct 23 02:22: checks needing the full bound took 60-170
+//   ms, over the bot's 60 ms limit): pools off the check's route are walked
+//   only ARBSIM_COPY2_BOUND_WORDS (16) tick-map words from their price (a
+//   swap that stops there is still a swap the PoolManager must be able to
+//   pay: a proven lower bound; the route's own pools, which a drain needs,
+//   are walked whole), and each pool's figure is kept per copy version and
+//   shared by every check of that version (BoundCache).
+//
 //   Speed (live Oct 22 16:19, checks ~120 ms instead of ~5): the lower
 //   bound used to be the sum over EVERY ready V4 pool holding the coin
 //   (~320 stock / USDG pools), walking each pool's whole tick map, and every
@@ -292,7 +300,57 @@ pub struct C2View<'a> {
     coin_offsets: HashMap<Address, U256>,
     /// (PoolManager, coin) balances this run read (coin ZERO = ETH).
     read_coins: Mutex<Vec<(Address, Address)>>,
+    /// The copy version's snapshot `inner` reads (when known): per-pool
+    /// bound figures are shared across checks of that very snapshot
+    /// (copy2-t, BoundCache).
+    snap: Option<Arc<crate::state::snap::Snapshot>>,
 }
+
+/// copy2-t: one pool's payout figure for one copy version, shared by every
+/// check of that version (live Oct 23: the full-bound retry walked every V4
+/// pool again in every check, 60-170 ms). A figure depends only on the
+/// version's snapshot (the pool's PoolManager values), the pool's far zero
+/// list, the direction and the word cap: the key holds all four. The
+/// snapshot is matched by pointer AND kept alive by the entry (Arc), and so
+/// is the far list, so a key can never match a different snapshot / list
+/// that reused the memory. The newest 4 snapshots are kept.
+type PoolFig = (B256, bool, Option<usize>, usize);
+type CacheEntry = (Arc<crate::state::snap::Snapshot>, Vec<Arc<Vec<U256>>>, HashMap<PoolFig, U256>);
+
+fn bound_cache() -> &'static Mutex<Vec<CacheEntry>> {
+    static C: std::sync::OnceLock<Mutex<Vec<CacheEntry>>> = std::sync::OnceLock::new();
+    C.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn cached_fig(snap: &Arc<crate::state::snap::Snapshot>, key: PoolFig) -> Option<U256> {
+    let c = bound_cache().lock().unwrap();
+    c.iter().find(|e| Arc::ptr_eq(&e.0, snap)).and_then(|e| e.2.get(&key).copied())
+}
+
+fn store_fig(snap: &Arc<crate::state::snap::Snapshot>, far: Option<&Arc<Vec<U256>>>, key: PoolFig, v: U256) {
+    let mut c = bound_cache().lock().unwrap();
+    let i = match c.iter().position(|e| Arc::ptr_eq(&e.0, snap)) {
+        Some(i) => i,
+        None => {
+            if c.len() >= 4 {
+                c.remove(0);
+            }
+            c.push((snap.clone(), Vec::new(), HashMap::new()));
+            c.len() - 1
+        }
+    };
+    let e = &mut c[i];
+    if let Some(f) = far {
+        if !e.1.iter().any(|x| Arc::ptr_eq(x, f)) {
+            e.1.push(f.clone());
+        }
+    }
+    e.2.insert(key, v);
+}
+
+/// Cache hits / misses of BoundCache (status / tests).
+pub static BOUND_CACHE_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static BOUND_CACHE_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 impl<'a> C2View<'a> {
     pub fn new(inner: &'a dyn StateRead, f: &'a C2Facts, offset: U256) -> Self {
@@ -318,7 +376,30 @@ impl<'a> C2View<'a> {
             far_hits: Default::default(),
             coin_offsets,
             read_coins: Mutex::new(Vec::new()),
+            snap: None,
         }
+    }
+
+    /// The copy version's snapshot this view reads (enables BoundCache).
+    pub fn with_snap(mut self, snap: Arc<crate::state::snap::Snapshot>) -> Self {
+        self.snap = Some(snap);
+        self
+    }
+
+    /// One pool's payout figure (BoundCache when the snapshot is known).
+    fn pool_fig(&self, pm: Address, p: &TrackedPool, out0: bool, words: Option<usize>) -> U256 {
+        let compute = || payout_bound_words(&|s| self.read_pool(pm, p.v4_id, s), p, out0, words);
+        let (Some(snap), Some(id)) = (&self.snap, p.v4_id) else { return compute() };
+        let far = self.f.far_of.get(&id);
+        let key = (id, out0, words, far.map_or(0, |f| Arc::as_ptr(f) as usize));
+        if let Some(v) = cached_fig(snap, key) {
+            BOUND_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+            return v;
+        }
+        BOUND_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
+        let v = compute();
+        store_fig(snap, far, key, v);
+        v
     }
 
     /// The PoolManager balances (PoolManager, coin; ZERO = ETH) this run read.
@@ -400,7 +481,7 @@ impl<'a> C2View<'a> {
         // still a swap the PoolManager must be able to pay, so the smaller
         // sum is still a proven lower bound. The route's own pools (the ones
         // a drain needs) are walked whole.
-        let cap = if bound_full_env() { None } else { Some(bound_words()) };
+        let cap = Some(bound_words());
         let route = |p: &TrackedPool| p.v4_id.is_some_and(|i| touched.contains(&i));
         let mut sum = U256::ZERO;
         let mut skipped = false;
@@ -424,7 +505,7 @@ impl<'a> C2View<'a> {
         let on_route = |p: &TrackedPool| full || route(p);
         for (p, out0) in pools.iter().filter(|(p, _)| on_route(p)) {
             let words = if route(p) { None } else { cap };
-            sum = sum.saturating_add(payout_bound_words(&|s| self.read_pool(pm, p.v4_id, s), p, *out0, words));
+            sum = sum.saturating_add(self.pool_fig(pm, p, *out0, words));
         }
         // The route's pools hold none of this coin (e.g. the coin the check
         // PAYS IN on a one-sided pool): a bound of 0 makes the two runs
@@ -435,7 +516,7 @@ impl<'a> C2View<'a> {
                 skipped = true;
                 break;
             }
-            sum = sum.saturating_add(payout_bound_words(&|s| self.read_pool(pm, p.v4_id, s), p, *out0, cap));
+            sum = sum.saturating_add(self.pool_fig(pm, p, *out0, cap));
         }
         if skipped {
             self.f.partial_used.store(true, Ordering::Relaxed);
