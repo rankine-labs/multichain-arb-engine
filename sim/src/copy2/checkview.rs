@@ -69,6 +69,19 @@
 //      swap fetched it and adds to it) is NOT used by checks: other pools'
 //      swaps and collections change it unseen.
 //
+//   copy2-r (live Oct 22 21:22, RIVN/USDG: copy "reverts", the node at the
+//   SAME block "loss"): "P + 2^200 is above any real balance" holds only if
+//   the COIN reads the whole storage word as the balance. Live USDG counts
+//   only the low 128 bits (probed on the chain: raw 2^128 + 5 reads 5, raw
+//   2^200 + 999 can't pay 1000), so the high run was the bound run again,
+//   and a check whose take needed slightly more than the route's bound
+//   reverted in both runs "the same": reported as a proven revert. Now the
+//   high value is chosen per coin (server.rs coin_highs): the coin must read
+//   back P and P + H exactly (balanceOf(PoolManager)); H = 2^200, else the
+//   largest of 2^160 / 2^126 / 2^112 / 2^96 it reads back AND that is above
+//   its totalSupply x 2^16; none: unknown. (2^126: a 128-bit field keeps
+//   room for coins paid in.)
+//
 //   Speed (live Oct 22 16:19, checks ~120 ms instead of ~5): the lower
 //   bound used to be the sum over EVERY ready V4 pool holding the coin
 //   (~320 stock / USDG pools), walking each pool's whole tick map, and every
