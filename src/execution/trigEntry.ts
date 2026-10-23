@@ -1,8 +1,10 @@
 import { Transaction } from 'ethers';
 import type { FeedMsg } from '../chains/nitroFeed';
-import { LocalSimClient } from './localSim';
-import { JsonlLog, LocalTrade, LocalSimOpts } from './localSimHost';
-import { TriggerFirst, TrigOutcome, TrigConfidence, TrigQuestion, confidenceAtLeast } from './triggerFirst';
+import { performance } from 'perf_hooks';
+import { LocalSimClient, SidecarAnswer } from './localSim';
+import { JsonlLog, LocalTrade, LocalSimOpts, reasonOf } from './localSimHost';
+import { TriggerFirst, TrigOutcome, TrigConfidence, TrigQuestion, CannedAnswer, CapturedCheck, checkSig, confidenceAtLeast } from './triggerFirst';
+import { loopLag } from '../core/loopLag';
 
 // ============================================================================
 // TRIGGER-FIRST ENTRY POINT: every feed transaction is a possible trigger.
@@ -66,7 +68,8 @@ import { TriggerFirst, TrigOutcome, TrigConfidence, TrigQuestion, confidenceAtLe
 // ONE SEND PER TRIGGER: claim() is a lock shared with the old path; whoever
 // claims a trigger first sends, the other doesn't.
 //
-// LOAD: never blocks the feed handler (work starts with setImmediate), at
+// LOAD: never blocks the feed handler (work starts at once, up to the first
+// question, or with setImmediate: TRIG_ENTRY_IMMEDIATE), at
 // most TRIG_ENTRY_MAX_IN_FLIGHT triggers at once (more = dropped, counted),
 // every sidecar question has a timeout and the whole trigger a deadline. No
 // node requests at all in this path.
@@ -75,6 +78,39 @@ import { TriggerFirst, TrigOutcome, TrigConfidence, TrigQuestion, confidenceAtLe
 // the old hook) and TRIG_FIRST_ENTRY (1 = on, the default; 0 = off).
 // LOG: data/local-sim-shadow.jsonl lines "k":"trig_entry" (one per trigger
 // that moved one of our pools) and an hourly "[trig-entry] hour:" line.
+//
+// SPEED + VISIBILITY (Oct 23, second pass; live shadow showed ~45 ms p50 /
+// ~100 ms p90 from feed to answer while the actual work is ~0.05 ms, i.e.
+// almost all of it is WAITING):
+//   LOGGING   every answered trigger now logs its best candidate even when
+//             it loses (net after gas can be negative; a "loss" answer only
+//             says "no profit", so its net is "at most minus gas": nle),
+//             a verdict per candidate (cv), and a SAMPLE of the not-
+//             profitable answers (TRIG_ENTRY_AGREE_SAMPLE, 1 in 5, at most
+//             TRIG_ENTRY_AGREE_SAMPLE_PER_HOUR) gets the later same-block
+//             re-check too, so we can see whether "no profit" was right.
+//   HOPS      per-hop timestamps (ms after the feed frame arrived, 2
+//             decimals) in the log line's `hops` and p50 / p90 per hop in
+//             the hourly line: frame parsed, queued, sent to the sidecar,
+//             answered (+ the sidecar's own queue wait vs work), candidates
+//             built, each check, decision, signed; plus event-loop lag.
+//   ONE TRIP  (TRIG_ENTRY_ONE_TRIP=1, default) discovery AND the candidate
+//             checks in ONE sidecar question (`trig_entry`, sim/src/server.rs
+//             + sim/src/check/entry.rs). The bot keeps a candidate TABLE in
+//             the sidecar (refreshed every TRIG_ENTRY_TABLE_MS): per watched
+//             pool, its routes with the same ranking facts and our exact
+//             check question, built by the same code as the two-step path.
+//             The sidecar picks the candidates exactly like the bot, checks
+//             them, and the bot reads each answer with its OWN code
+//             (TriggerFirst.askOnly with a "canned" answer), so the decision
+//             is the same as the two-step path (tested). Anything missing
+//             (no table yet, an old sidecar, a changed trade) = the two-step
+//             path, unchanged.
+//   PRIORITY  the sidecar serves trigger-entry questions first (bounded,
+//             sim/src/jobq.rs); the bot starts entry work right inside the
+//             feed handler (TRIG_ENTRY_IMMEDIATE=1) and, while it is in
+//             flight, big background jobs take shorter bites
+//             (TRIG_ENTRY_YIELD_SLICE_MS, core/chunked.ts).
 // ============================================================================
 
 export type EntrySettings = {
@@ -89,10 +125,16 @@ export type EntrySettings = {
   deadlineMs: number;            // TRIG_ENTRY_DEADLINE_MS [250] the whole trigger (discover + checks)
   minNetUsd: number;             // MIN_EXEC_NET_USD (the bot's one send minimum)
   lockMs: number;                // how long a trigger stays claimed [120000]
+  oneTrip: boolean;              // TRIG_ENTRY_ONE_TRIP [1] discovery + checks in one sidecar question (0 = two steps, as before)
+  tableMs: number;               // TRIG_ENTRY_TABLE_MS [1000] how often the candidate table is rebuilt (0 = only when asked)
+  agreeSample: number;           // TRIG_ENTRY_AGREE_SAMPLE [5] re-check 1 in N not-profitable answers (0 = none)
+  agreeSamplePerHour: number;    // TRIG_ENTRY_AGREE_SAMPLE_PER_HOUR [120] at most this many of those per hour
+  immediate: boolean;            // TRIG_ENTRY_IMMEDIATE [1] start entry work inside the feed handler (0 = after it, setImmediate)
+  yieldSliceMs: number;          // TRIG_ENTRY_YIELD_SLICE_MS [2] big jobs' longest bite while entry work runs (0 = no change)
 };
 
 export function entrySettings(env: Record<string, string | undefined> = process.env, minNetUsd = 0.25): EntrySettings {
-  const num = (k: string, d: number, min = 1) => { const v = Number(env[k]); return Number.isFinite(v) && v >= min ? v : d; };
+  const num = (k: string, d: number, min = 1) => { const v = Number(env[k]); return env[k] !== undefined && env[k]!.trim() !== '' && Number.isFinite(v) && v >= min ? v : d; };
   const sizes = (env.TRIG_ENTRY_SIZES_USD ?? '50,150,400').split(',').map((x) => Number(x.trim())).filter((x) => Number.isFinite(x) && x > 0).sort((a, b) => a - b);
   return {
     enabled: (env.TRIG_FIRST_ENTRY ?? '1').trim() !== '0',
@@ -106,6 +148,12 @@ export function entrySettings(env: Record<string, string | undefined> = process.
     deadlineMs: num('TRIG_ENTRY_DEADLINE_MS', 250),
     minNetUsd,
     lockMs: 120_000,
+    oneTrip: (env.TRIG_ENTRY_ONE_TRIP ?? '1').trim() !== '0',
+    tableMs: num('TRIG_ENTRY_TABLE_MS', 1_000, 0),
+    agreeSample: Math.round(num('TRIG_ENTRY_AGREE_SAMPLE', 5, 0)),
+    agreeSamplePerHour: Math.round(num('TRIG_ENTRY_AGREE_SAMPLE_PER_HOUR', 120, 0)),
+    immediate: (env.TRIG_ENTRY_IMMEDIATE ?? '1').trim() !== '0',
+    yieldSliceMs: num('TRIG_ENTRY_YIELD_SLICE_MS', 2, 0),
   };
 }
 
@@ -143,6 +191,13 @@ export type EntryCandidate = {
   host?: unknown;                // host data for the send (pool objects, ...)
 };
 
+// A route's id: "buy>sell:start" (lowercase). Two pools moved by one
+// trigger can list the same route; it is checked once.
+export function routeId(buyAddr: string, sellAddr: string, start: string): string {
+  const lc = (x: string) => (x ?? '').toLowerCase();
+  return `${lc(buyAddr)}>${lc(sellAddr)}:${lc(start)}`;
+}
+
 // ROUTES for the pools a trigger moved (pure, so it can be tested): the same
 // pair on another exchange, buy on one pool and sell on the other, both
 // directions, starting from a coin we hold, with the venue rule (exchange
@@ -156,8 +211,9 @@ export type RouteRules<P> = {
   coinAllowed: (token: string) => boolean;       // SafetyGate allowlist
   venueBlocked: (buy: P, sell: P) => string | null; // exchange not cleared for trading
 };
-export function enumerateRoutes<P>(keys: string[], r: RouteRules<P>): Array<{ buy: P; sell: P; tokenIn: string; tokenOut: string }> {
-  const out: Array<{ buy: P; sell: P; tokenIn: string; tokenOut: string }> = [];
+export type EntryRoute<P> = { buy: P; sell: P; tokenIn: string; tokenOut: string; id: string };
+export function enumerateRoutes<P>(keys: string[], r: RouteRules<P>): Array<EntryRoute<P>> {
+  const out: Array<EntryRoute<P>> = [];
   const seen = new Set<string>();
   const lc = (x: string) => (x ?? '').toLowerCase();
   const starts = r.startCoins.map(lc);
@@ -173,11 +229,11 @@ export function enumerateRoutes<P>(keys: string[], r: RouteRules<P>): Array<{ bu
         const tokenIn = lc(a) === start ? a : b;
         const tokenOut = tokenIn === a ? b : a;
         for (const [buy, sell] of [[p, peer], [peer, p]] as Array<[P, P]>) {
-          const id = `${lc(r.addr(buy))}>${lc(r.addr(sell))}:${start}`;
+          const id = routeId(r.addr(buy), r.addr(sell), start);
           if (seen.has(id)) continue;
           seen.add(id);
           if (r.venueBlocked(buy, sell)) continue;
-          out.push({ buy, sell, tokenIn, tokenOut });
+          out.push({ buy, sell, tokenIn, tokenOut, id });
         }
       }
     }
@@ -187,11 +243,64 @@ export function enumerateRoutes<P>(keys: string[], r: RouteRules<P>): Array<{ bu
 
 // RANKING before anything is built (cheap): routes starting from a coin we
 // actually hold first, then the model's quick price check (higher = better;
-// null = unknown, last). Returns the best `limit`.
+// null or not a real number = unknown, last). Returns the best `limit`.
+// (The sidecar's one-trip picking, sim/src/check/entry.rs select, does
+// exactly the same; tests/fixtures/trig_entry_select.json checks both.)
 export function rankRoutes<R>(routes: R[], held: (r: R) => boolean, score: (r: R) => number | null, limit: number): R[] {
-  const scored = routes.map((r, i) => ({ r, i, h: held(r) ? 0 : 1, s: score(r) ?? -Infinity }));
-  scored.sort((a, b) => a.h - b.h || b.s - a.s || a.i - b.i);
+  const scored = routes.map((r, i) => { const s = score(r); return { r, i, h: held(r) ? 0 : 1, s: s !== null && Number.isFinite(s) ? s : -Infinity }; });
+  scored.sort((a, b) => a.h - b.h || (b.s === a.s ? 0 : b.s > a.s ? 1 : -1) || a.i - b.i);
   return scored.slice(0, Math.max(0, limit)).map((x) => x.r);
+}
+
+// The size ladder of one candidate (shared by the check and the one-trip
+// table, so both ask exactly the same): the biggest allowed size of
+// TRIG_ENTRY_SIZES_USD is THE trade, the smaller ones ride along as amounts.
+export function ladderPlan(c: EntryCandidate, sizesUsd: number[]): { main: number; b: { trade: LocalTrade; simOpts: LocalSimOpts }; others: bigint[] } | null {
+  const sizes = sizesUsd.filter((x) => x <= c.maxSizeUsd);
+  if (!sizes.length && c.maxSizeUsd > 0) sizes.push(c.maxSizeUsd);
+  if (!sizes.length) return null;
+  const main = sizes[sizes.length - 1];
+  const b = c.build(main);
+  if (!b) return null;
+  const amt = (usd: number) => (b.trade.amountIn * BigInt(Math.round(usd * 1e6))) / BigInt(Math.round(main * 1e6));
+  const others = sizes.slice(0, -1).map(amt).filter((x) => x > 0n);
+  return { main, b, others };
+}
+
+// The smallest profit (start-coin units) that clears the send minimum
+// after gas, by the candidate's OWN money conversion (so the sidecar's stop
+// rule "profit >= this" is exactly the bot's "net >= minimum"). null = none.
+export function stopUnits(c: EntryCandidate, minNetUsd: number): bigint | null {
+  const ok = (u: bigint) => { const n = c.usdOf(u) - c.gasUsd; return Number.isFinite(n) && n >= minNetUsd; };
+  if (ok(1n)) return 1n;
+  let hi = 2n;
+  while (!ok(hi)) { hi *= 2n; if (hi > 1n << 240n) return null; }
+  let lo = hi / 2n;
+  while (hi - lo > 1n) { const mid = (lo + hi) / 2n; if (ok(mid)) hi = mid; else lo = mid; }
+  return hi;
+}
+
+// A written-down check question with other amounts put in (see
+// TrigEntry.captureFor): the call's amountIn word (4th word after the 4-byte
+// code) and every pretend-state value that held exactly the old amount (the
+// test contract's trading money), plus the ladder amounts.
+export function patchAmounts(cap: CapturedCheck, oldAmount: bigint, amount: bigint, others: bigint[]): CapturedCheck {
+  const w = (n: bigint) => '0x' + n.toString(16).padStart(64, '0');
+  const oldW = w(oldAmount).toLowerCase();
+  const newW = w(amount);
+  const at = 2 + 8 + 3 * 64;
+  const data = cap.data.slice(0, at) + newW.slice(2) + cap.data.slice(at + 64);
+  const swap = (v: unknown): unknown => {
+    if (typeof v === 'string') return v.toLowerCase() === oldW ? newW : v;
+    if (Array.isArray(v)) return v.map(swap);
+    if (v && typeof v === 'object') return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, k === 'code' ? x : swap(x)]));
+    return v;
+  };
+  const calls = cap.calls.map((c, i) => (i === 0 ? { ...(c as Record<string, unknown>), data } : c));
+  return {
+    calls, overrides: swap(cap.overrides) as Record<string, unknown>, data,
+    ...(cap.sizes ? { sizes: { amountOffset: cap.sizes.amountOffset, amounts: others.slice(0, 8).map((a) => '0x' + a.toString(16)) } } : {}),
+  };
 }
 
 // The chosen trade.
@@ -205,6 +314,11 @@ export type EntryPick = {
   q: TrigQuestion;
 };
 
+// One watched pool's routes for the one-trip table (host: the same route
+// rules, ranking facts and build as candidatesFor).
+export type TableRoute = { rid: string; held: boolean; score: number | null; build: () => EntryCandidate | null };
+export type TablePool = { pool: string; routes: TableRoute[] };
+
 export type EntryDeps = {
   tf: TriggerFirst;
   client: LocalSimClient;
@@ -216,6 +330,9 @@ export type EntryDeps = {
   // model's quick price check) and BUILDS ONLY the best `limit`. found = how
   // many routes there were before the cap.
   candidatesFor: (poolKeys: string[], limit: number) => { cands: EntryCandidate[]; found: number };
+  // ONE TRIP: every watched pool with its routes (enumerateRoutes for that
+  // pool alone, in order). Not given = one trip off (two steps, as before).
+  tableRoutes?: () => TablePool[];
   isOurTx: (hash: string) => boolean;
   ourAddresses: string[];                 // our executor contract(s), our bot wallet(s)
   // SAFEGUARDS (null = fine, else why not). See the file header.
@@ -228,6 +345,7 @@ export type EntryDeps = {
   send: (pick: EntryPick, trigger: { hash: string; seenMs: number }) => Promise<{ signedMs?: number; why?: string }>;
   now?: () => number;
   log?: (m: string) => void;
+  lag?: () => number;                     // event-loop lag right now (ms); default core/loopLag.ts
 };
 
 const pctl = (xs: number[], q: number): number | null => {
@@ -237,6 +355,9 @@ const pctl = (xs: number[], q: number): number | null => {
 };
 const pct = (n: number, d: number): string => (d ? `${Math.round((100 * n) / d)}%` : 'n/a');
 const keep = (a: number[], v: number) => { a.push(v); if (a.length > 5_000) a.shift(); };
+const r2 = (x: number) => Math.round(x * 100) / 100;
+const hex = (n: bigint) => '0x' + n.toString(16);
+const VALID_KEY = /^0x[0-9a-fA-F]{40}([0-9a-fA-F]{24})?$/;
 
 // The promise's answer, or null if it takes longer than ms.
 function withDeadline<T>(p: Promise<T>, ms: number): Promise<T | null> {
@@ -246,17 +367,33 @@ function withDeadline<T>(p: Promise<T>, ms: number): Promise<T | null> {
     p.then((v) => { clearTimeout(t); resolve(v); }, () => { clearTimeout(t); resolve(null); });
   });
 }
+const yieldNow = (): Promise<void> => new Promise((r) => setImmediate(r));
+
+// High-resolution times of one feed frame (performance.now() ms).
+export type FrameTimes = { recv: number; parsed?: number; queued?: number };
+
+// One table entry (the bot's side): the candidate, and our call's data as
+// sent (to recognise the answer), or "check it the old way" (fallback).
+type TableMeta = { cand: EntryCandidate; sig?: string; fallback?: boolean };
+
+// Hourly per-hop names (ms): see takeHourLine.
+const HOP_NAMES = ['parse', 'start', 'sent', 'rtt', 'scQueue', 'scWork', 'other', 'build', 'check', 'decide', 'lag'] as const;
+type HopName = (typeof HOP_NAMES)[number];
 
 export class TrigEntry {
   readonly settings: EntrySettings;
   private readonly d: EntryDeps;
   private readonly now: () => number;
   private readonly log: (m: string) => void;
+  private readonly lagNow: () => number;
   private readonly ours: { isOurTx: (h: string) => boolean; addresses: Set<string> };
   private inFlight = 0;
   // ONE SEND PER TRIGGER (shared with the old path): trigger hash -> who and when.
   private readonly claims = new Map<string, { who: string; at: number }>();
   private hour = this.freshHour();
+  private sampleCount = 0;
+  private sampleTimes: number[] = [];
+  private oneTripOffUntil = 0;
 
   private freshHour() {
     return {
@@ -264,6 +401,13 @@ export class TrigEntry {
       answered: 0, profitable: 0, profitUsd: 0, wouldSend: 0, sent: 0, held: 0, errors: 0,
       discoverMs: [] as number[], answerMs: [] as number[], submitMs: [] as number[],
       unknownWhy: {} as Record<string, number>, heldWhy: {} as Record<string, number>,
+      // best net after gas of every answered trigger (profitable or not)
+      net: { over: 0, small: 0, slightLoss: 0, loss: 0 },
+      // later same-block re-check of a SAMPLE of not-profitable answers
+      smp: { asked: 0, agree: 0, disagree: 0, missed: 0, notCompared: 0 },
+      // one trip: used / why not
+      one: { used: 0, why: {} as Record<string, number> },
+      hops: Object.fromEntries(HOP_NAMES.map((n) => [n, [] as number[]])) as Record<HopName, number[]>,
     };
   }
 
@@ -272,12 +416,25 @@ export class TrigEntry {
     this.settings = deps.settings ?? entrySettings(deps.env ?? process.env);
     this.now = deps.now ?? Date.now;
     this.log = deps.log ?? ((m) => console.log(m));
+    this.lagNow = deps.lag ?? (() => loopLag.now());
     this.ours = { isOurTx: deps.isOurTx, addresses: new Set(deps.ourAddresses.map((a) => a.toLowerCase())) };
-    this.log(`[trig-entry] ${this.active() ? deps.tf.mode() : 'off'}: every feed transaction checked as a possible trigger (max ${this.settings.maxInFlight} at once, ${this.settings.maxCandidates} candidates each, sizes $${this.settings.sizesUsd.join('/$')})`);
+    const one = this.oneTripOn() ? `one trip (table every ${this.settings.tableMs} ms)` : 'two steps';
+    this.log(`[trig-entry] ${this.active() ? deps.tf.mode() : 'off'}: every feed transaction checked as a possible trigger (max ${this.settings.maxInFlight} at once, ${this.settings.maxCandidates} candidates each, sizes $${this.settings.sizesUsd.join('/$')}, ${one})`);
+    if (this.active()) {
+      if (!deps.lag) loopLag.start();
+      if (this.oneTripOn() && this.settings.tableMs > 0) {
+        const t = setInterval(() => { void this.refreshTable(); }, this.settings.tableMs);
+        t.unref?.();
+      }
+    }
   }
 
   // Working at all? (TRIG_FIRST_ENTRY=1 and trigger-first not off.)
   active(): boolean { return this.settings.enabled && this.d.tf.mode() !== 'off'; }
+  oneTripOn(): boolean { return this.settings.oneTrip && !!this.d.tableRoutes; }
+  // Background jobs' longest bite right now (core/chunked.ts setSliceCap):
+  // short while a trigger is being worked on, else no cap (0).
+  sliceCapMs(): number { return this.inFlight > 0 ? this.settings.yieldSliceMs : 0; }
 
   // ---- shared per-trigger lock --------------------------------------------
   // true = this caller may send for this trigger (first claim, or its own).
@@ -294,9 +451,13 @@ export class TrigEntry {
 
   // ---- the feed tap (robinhoodChain.ts setFeedMsgTap) ------------------------
   // Called for every feed message, right after the order buffer took it.
-  // Cheap: the skip test per transaction, then work is started later.
-  onFeedMsgs(msgs: FeedMsg[], at: number): void {
+  // Cheap: the skip test per transaction, then work starts AT ONCE
+  // (TRIG_ENTRY_IMMEDIATE=1: the question is on its way to the sidecar
+  // before the rest of the bot handles this frame) or right after
+  // (setImmediate).
+  onFeedMsgs(msgs: FeedMsg[], at: number, hr?: { recv: number; parsed?: number }): void {
     if (!this.active()) return;
+    const recv = hr?.recv ?? performance.now();
     for (const m of msgs) {
       for (const t of m?.txs ?? []) {
         this.hour.feedTxs++;
@@ -307,9 +468,9 @@ export class TrigEntry {
         if (this.inFlight >= this.settings.maxInFlight) { this.hour.dropped++; continue; }
         this.inFlight++;
         const hash = t.hash.toLowerCase();
-        setImmediate(() => {
-          void this.process(hash, at).catch(() => { this.hour.errors++; }).finally(() => { this.inFlight--; });
-        });
+        const times: FrameTimes = { recv, parsed: hr?.parsed, queued: performance.now() };
+        const run = () => { void this.process(hash, at, times).catch(() => { this.hour.errors++; }).finally(() => { this.inFlight--; }); };
+        if (this.settings.immediate) run(); else setImmediate(run);
       }
     }
   }
@@ -317,19 +478,63 @@ export class TrigEntry {
   inFlightNow(): number { return this.inFlight; }
 
   // ---- one trigger ------------------------------------------------------------
-  async process(hash: string, seenMs: number): Promise<EntryRecord | null> {
+  async process(hash: string, seenMs: number, times?: FrameTimes): Promise<EntryRecord | null> {
     const s = this.settings;
     const h = this.hour;
     const deadlineAt = seenMs + s.deadlineMs;
+    const T = times ?? { recv: performance.now() };
+    const rel = (x: number | undefined) => (x === undefined ? undefined : r2(x - T.recv));
+    const hops: Hops = { parse: rel(T.parsed), queue: rel(T.queued), start: rel(performance.now()), lag: this.lagNow() };
     h.asked++;
     const unknown = (why: string) => { h.unknownWhy[why] = (h.unknownWhy[why] ?? 0) + 1; return null; };
     // 1. DISCOVER: which of our pools does it move? (no node)
     const built = this.d.tf.buildFeed(hash, []);
     if ('why' in built) return unknown(`discover_${built.why}`);
-    let a: Record<string, unknown> | null;
-    try {
-      a = await withDeadline(this.d.client.request({ type: 'trig_discover', at: { after: 'head' }, feed: built.feed }, s.discoverTimeoutMs), s.discoverTimeoutMs + 20);
-    } catch { a = null; }
+    let a: Record<string, unknown> | null = null;
+    // ONE TRIP: discovery + candidate checks in one question.
+    let one: Record<string, unknown> | null = null;
+    let oneWhy: string | undefined;
+    if (this.oneTripOn() && this.tbl.ackGen >= 0 && this.now() >= this.oneTripOffUntil) {
+      const left = Math.max(1, deadlineAt - this.now());
+      hops.dSent = rel(performance.now());
+      let r: Record<string, unknown> | null = null;
+      try {
+        r = await withDeadline(this.d.client.request({
+          type: 'trig_entry', at: { after: 'head' }, feed: built.feed, limit: s.maxCandidates, maxPools: s.maxPools,
+          minConf: this.d.tf.settings.minConfidence, budgetUs: Math.max(1_000, Math.round((left - 10) * 1_000)), gen: this.tbl.ackGen,
+        }, left), left + 20);
+      } catch { r = null; }
+      hops.dAns = rel(performance.now());
+      hops.lagA = this.lagNow();
+      if (r && r.ok === true && r.disc && typeof r.disc === 'object') { one = r; a = r.disc as Record<string, unknown>; }
+      else if (r && r.unknown === 'bad_request') {
+        // An older sidecar without `trig_entry`: two steps for 10 min.
+        this.oneTripOffUntil = this.now() + 600_000;
+        oneWhy = 'sidecar_too_old';
+        this.log('[trig-entry] the sidecar does not know the one-trip question (older arbsim?): two steps for 10 min');
+      } else {
+        const ms = this.now() - seenMs;
+        keep(h.discoverMs, ms);
+        return unknown(`one_trip_${String(r?.unknown ?? 'timeout')}`);
+      }
+      if (one) {
+        const sc = one.t as { queue?: number } | undefined;
+        hops.scQ = typeof sc?.queue === 'number' ? r2(sc.queue / 1_000) : undefined;
+        hops.scW = typeof one.us === 'number' ? r2((one.us as number) / 1_000) : undefined;
+        hops.dW = typeof a!.us === 'number' ? r2((a!.us as number) / 1_000) : undefined;
+      }
+    } else if (this.oneTripOn()) oneWhy = this.tbl.ackGen < 0 ? 'no_table_yet' : 'sidecar_too_old';
+    if (!one) {
+      hops.dSent = rel(performance.now());
+      try {
+        a = await withDeadline(this.d.client.request({ type: 'trig_discover', at: { after: 'head' }, feed: built.feed }, s.discoverTimeoutMs), s.discoverTimeoutMs + 20);
+      } catch { a = null; }
+      hops.dAns = rel(performance.now());
+      hops.lagA = this.lagNow();
+      const t = (a as { t?: { queue?: number } } | null)?.t;
+      hops.scQ = typeof t?.queue === 'number' ? r2(t.queue / 1_000) : undefined;
+      hops.scW = typeof a?.us === 'number' ? r2((a.us as number) / 1_000) : undefined;
+    }
     const discoverMs = this.now() - seenMs;
     keep(h.discoverMs, discoverMs);
     if (!a) return unknown('discover_timeout');
@@ -343,37 +548,86 @@ export class TrigEntry {
     const rec: EntryRecord = {
       hash, seenMs, pools: pools.slice(0, 8), poolCount: pools.length, moved, discoverMs, discConf: typeof a.conf === 'string' ? a.conf : undefined,
       discAssumed: Array.isArray(a.assumed) ? (a.assumed as string[]).slice(0, 8) : undefined,
-      tried: 0, candidates: 0, found: 0,
+      tried: 0, candidates: 0, found: 0, hops,
     };
     // GUARD: one transaction really moves 1-2 pools (a router: a few). Many
     // more = the answer can't be right (live Oct 23: every V4 pool at once):
     // skipped, counted, never enumerated.
     if (pools.length > s.maxPools) { rec.unknown = 'too_many_pools'; unknown('too_many_pools'); this.finish(rec); return rec; }
     // 2. CANDIDATES: listed, ranked and capped BEFORE anything is built.
+    //    One trip: the sidecar already picked them from the table, the
+    //    same way (and checked them); the bot looks up its own entries.
     let cands: EntryCandidate[] = [];
-    try { const r = this.d.candidatesFor(pools, s.maxCandidates); cands = r.cands.slice(0, s.maxCandidates); rec.found = r.found; } catch { h.errors++; }
+    let oneTrip: { metas: TableMeta[]; answers: Map<number, SidecarAnswer | null>; seq: number } | null = null;
+    if (one && Array.isArray(one.sel)) {
+      const sel = (one.sel as unknown[]).map((x) => String(x));
+      const metas = sel.map((id) => this.tbl.meta.get(id));
+      if (metas.every((m): m is TableMeta => !!m)) {
+        const byId = new Map<string, SidecarAnswer | null>();
+        for (const c of Array.isArray(one.cands) ? (one.cands as Array<{ e?: unknown; a?: unknown }>) : []) byId.set(String(c.e), (c.a ?? null) as SidecarAnswer | null);
+        const answers = new Map<number, SidecarAnswer | null>();
+        sel.forEach((id, i) => { if (byId.has(id)) answers.set(i, byId.get(id)!); });
+        oneTrip = { metas, answers, seq: Number((built.feed as { triggerSeq?: number }).triggerSeq) };
+        cands = metas.map((m) => m.cand);
+        rec.found = Number(one.found ?? cands.length);
+        rec.one = 1;
+        h.one.used++;
+      } else oneWhy = 'table_changed';
+    } else if (one) {
+      oneWhy = one.table === 'none' ? 'no_table' : 'no_selection';
+      if (one.table === 'none') this.tbl.needFull = true;
+    }
+    if (!oneTrip) {
+      try { const r = this.d.candidatesFor(pools, s.maxCandidates); cands = r.cands.slice(0, s.maxCandidates); rec.found = r.found; } catch { h.errors++; }
+    }
+    if (oneWhy) { rec.one = oneWhy; h.one.why[oneWhy] = (h.one.why[oneWhy] ?? 0) + 1; }
+    hops.built = rel(performance.now());
     rec.candidates = cands.length;
-    if (!cands.length) { rec.unknown = 'no_candidates'; unknown('no_candidates'); this.finish(rec); return rec; }
+    if (!cands.length) { rec.unknown = 'no_candidates'; unknown('no_candidates'); this.finishHops(rec, T); this.finish(rec); return rec; }
     // 3. SIZE + CHECK, best-ranked first, a few at once (bounded per
     //    trigger and over all triggers), stopping at the first SURE answer
     //    that would be sent (profitable after gas at the confidence floor).
     const left = Math.max(1, deadlineAt - this.now());
-    const results = await this.runRanked(cands, hash, seenMs, left, rec);
+    const results = oneTrip
+      ? await this.runOneTrip(cands, oneTrip, hash, seenMs, left, rec, one!)
+      : await this.runRanked(cands, hash, seenMs, left, rec);
     rec.answerMs = this.now() - seenMs;
     keep(h.answerMs, rec.answerMs);
-    const picks = results.filter((r): r is CandResult => !!r);
+    // Per-check hops: [sent, answered, sidecar queue, sidecar work] (ms).
+    hops.checks = results.map((r) => [rel(r.out.hop?.s) ?? null, rel(r.out.hop?.a) ?? null, r.out.hop?.q ?? null, r.out.hop?.w ?? null]);
+    // Every candidate's verdict (log), and the best one even when it loses.
+    rec.cv = results.map((r) => ({
+      l: r.cand.label.slice(0, 40), v: r.out.sure ? r.out.verdict : 'unknown', n: r.view ? r2(r.view.netUsd) : undefined,
+      s: r.view ? Math.round(r.view.sizeUsd) : undefined, r: r.out.sure ? (r.out.verdict === 'fail' ? reasonOf(r.out.sim)?.slice(0, 60) : undefined) : r.out.why,
+      c: r.out.sure ? r.out.confidence : undefined,
+    }));
+    const viewBest = results.filter((r) => r.out.sure && r.view).sort((x, y) => y.view!.netUsd - x.view!.netUsd)[0];
+    if (viewBest) rec.view = { label: viewBest.cand.label, sizeUsd: viewBest.view!.sizeUsd, netUsd: viewBest.view!.netUsd, verdict: viewBest.view!.verdict, le: viewBest.view!.le, conf: viewBest.out.confidence, as: viewBest.out.assumptions };
+    const picks = results.filter((r) => !!r);
     const sure = picks.filter((r) => r.out.sure);
     if (!sure.length) {
       const why = picks.find((r) => r.out.why)?.out.why ?? (picks.length ? 'unknown' : 'deadline');
-      rec.unknown = why; unknown(why); this.finish(rec); return rec;
+      rec.unknown = why; unknown(why); hops.dec = rel(performance.now()); this.finishHops(rec, T); this.finish(rec); return rec;
     }
     h.answered++;
+    if (rec.view) {
+      const n = rec.view.netUsd;
+      if (n > 0.25) h.net.over++; else if (n >= 0) h.net.small++; else if (n >= -0.1) h.net.slightLoss++; else h.net.loss++;
+    }
     const best = sure.map((r) => r.pick).filter((p): p is EntryPick => !!p).sort((x, y) => y.netUsd - x.netUsd)[0];
     if (best) {
       rec.best = { label: best.cand.label, sizeUsd: best.sizeUsd, netUsd: best.netUsd, conf: best.out.confidence, as: best.out.assumptions };
     }
     // 4. DECIDE.
-    if (!best || !(best.netUsd >= s.minNetUsd)) { this.finish(rec, best); return rec; }
+    hops.dec = rel(performance.now());
+    if (!best || !(best.netUsd >= s.minNetUsd)) {
+      // Not profitable: a SAMPLE gets the later same-block re-check too.
+      const sample = viewBest && this.takeSample() ? { q: viewBest.q, out: viewBest.out, cand: viewBest.cand } : undefined;
+      if (sample) rec.sampled = true;
+      this.finishHops(rec, T);
+      this.finish(rec, best, sample);
+      return rec;
+    }
     h.profitable++;
     h.profitUsd += best.netUsd;
     const held = this.gates(best);
@@ -387,13 +641,92 @@ export class TrigEntry {
         rec.wouldSend = true;
         try {
           const r = await this.d.send(best, { hash, seenMs });
-          if (r.signedMs !== undefined) { rec.submitMs = r.signedMs - seenMs; keep(h.submitMs, rec.submitMs); h.sent++; }
+          if (r.signedMs !== undefined) { rec.submitMs = r.signedMs - seenMs; keep(h.submitMs, rec.submitMs); h.sent++; hops.sign = rec.submitMs; }
           else rec.held = `not sent: ${r.why ?? 'stopped by a safeguard'}`;
         } catch { h.errors++; rec.held = 'send error'; }
       }
     }
+    this.finishHops(rec, T);
     this.finish(rec, best);
     return rec;
+  }
+
+  // 1 in TRIG_ENTRY_AGREE_SAMPLE not-profitable answers, at most
+  // TRIG_ENTRY_AGREE_SAMPLE_PER_HOUR an hour.
+  private takeSample(): boolean {
+    const s = this.settings;
+    if (s.agreeSample <= 0 || s.agreeSamplePerHour <= 0) return false;
+    this.sampleCount++;
+    if (this.sampleCount % s.agreeSample !== 0) return false;
+    const t = this.now();
+    this.sampleTimes = this.sampleTimes.filter((x) => t - x < 3_600_000);
+    if (this.sampleTimes.length >= s.agreeSamplePerHour) return false;
+    this.sampleTimes.push(t);
+    return true;
+  }
+
+  // Hourly per-hop numbers (ms) of one trigger.
+  private finishHops(rec: EntryRecord, _T: FrameTimes): void {
+    try {
+      const x = rec.hops;
+      if (!x) return;
+      const H = this.hour.hops;
+      const add = (n: HopName, v: number | undefined | null) => { if (typeof v === 'number' && Number.isFinite(v)) keep(H[n], v); };
+      add('parse', x.parse);
+      add('start', x.start);
+      add('sent', x.dSent);
+      const rtt = x.dAns !== undefined && x.dSent !== undefined ? x.dAns - x.dSent : undefined;
+      add('rtt', rtt);
+      add('scQueue', x.scQ);
+      add('scWork', x.scW);
+      if (rtt !== undefined && x.scW !== undefined) add('other', r2(rtt - (x.scQ ?? 0) - x.scW));
+      if (x.built !== undefined && x.dAns !== undefined) add('build', r2(x.built - x.dAns));
+      for (const c of x.checks ?? []) if (c[0] !== null && c[1] !== null) add('check', r2(c[1] - c[0]));
+      add('decide', x.dec);
+      add('lag', x.lag);
+    } catch { /* reporting only */ }
+  }
+
+  // ONE TRIP: read the sidecar's answers best-ranked first with the bot's
+  // own code (TriggerFirst.askOnly, canned), stopping at the first one the
+  // bot would send, exactly like runRanked with one check at a time.
+  // Candidates the sidecar didn't get to (it stopped where the bot would
+  // not, or ran out of time) and entries it could not prepare are checked
+  // the old way, so nothing is lost.
+  private async runOneTrip(
+    cands: EntryCandidate[], ot: { metas: TableMeta[]; answers: Map<number, SidecarAnswer | null>; seq: number },
+    hash: string, seenMs: number, leftMs: number, rec: EntryRecord, one: Record<string, unknown>,
+  ): Promise<CandResult[]> {
+    const until = this.now() + leftMs;
+    const out: CandResult[] = [];
+    let i = 0;
+    for (; i < cands.length; i++) {
+      if (!ot.answers.has(i) || this.now() >= until) break;
+      const m = ot.metas[i];
+      rec.tried++;
+      let r: CandResult | null;
+      const oldWay = () => withDeadline(this.withSlot(() => this.checkCandidate(cands[i], hash, seenMs), until), Math.max(1, until - this.now()));
+      if (m.fallback) r = await oldWay();
+      else {
+        const a = ot.answers.get(i) ?? null;
+        r = a && m.sig ? await this.checkCandidate(cands[i], hash, seenMs, { answer: a, sig: m.sig, seq: ot.seq }) : null;
+        // Our trade is not exactly the one the table sent: ask the old way.
+        if (r && !r.out.sure && r.out.why === 'one_trip_mismatch') { rec.oneMismatch = (rec.oneMismatch ?? 0) + 1; r = await oldWay(); }
+      }
+      if (r) out.push(r);
+      if (this.good(r)) { rec.early = i + 1 < cands.length || undefined; return out; }
+    }
+    if (i < cands.length && this.now() < until) {
+      rec.oneRest = cands.length - i;
+      out.push(...(await this.runRanked(cands.slice(i), hash, seenMs, until - this.now(), rec)));
+    }
+    if (one.cut === true) rec.oneCut = true;
+    return out;
+  }
+
+  // Would the bot send on this answer (before the safeguards)?
+  private good(r: CandResult | null): boolean {
+    return !!r && r.out.sure && !!r.pick && r.pick.netUsd >= this.settings.minNetUsd && confidenceAtLeast(r.out.confidence, this.d.tf.settings.minConfidence);
   }
 
   // Candidates in rank order, TRIG_ENTRY_PARALLEL at a time, within the
@@ -402,7 +735,6 @@ export class TrigEntry {
   // the same time). Those still running are not waited for.
   private runRanked(cands: EntryCandidate[], hash: string, seenMs: number, leftMs: number, rec: EntryRecord): Promise<CandResult[]> {
     const s = this.settings;
-    const minConf = this.d.tf.settings.minConfidence;
     const until = this.now() + leftMs;
     const out: CandResult[] = [];
     return new Promise((resolve) => {
@@ -417,8 +749,7 @@ export class TrigEntry {
             .then((r) => {
               running--;
               if (r) out.push(r);
-              const good = !!r && r.out.sure && !!r.pick && r.pick.netUsd >= s.minNetUsd && confidenceAtLeast(r.out.confidence, minConf);
-              if (good) { rec.early = next < cands.length || running > 0 || undefined; finish(); return; }
+              if (this.good(r)) { rec.early = next < cands.length || running > 0 || undefined; finish(); return; }
               if (this.now() >= until || (next >= cands.length && running === 0)) { finish(); return; }
               launch();
             }, () => { running--; launch(); if (next >= cands.length && running === 0) finish(); });
@@ -466,39 +797,213 @@ export class TrigEntry {
   }
 
   // One candidate: the full trigger-first check at the biggest size of the
-  // ladder, the smaller sizes on the same replay; its best size.
-  private async checkCandidate(c: EntryCandidate, hash: string, seenMs: number): Promise<CandResult | null> {
-    const sizes = this.settings.sizesUsd.filter((x) => x <= c.maxSizeUsd);
-    if (!sizes.length && c.maxSizeUsd > 0) sizes.push(c.maxSizeUsd);
-    if (!sizes.length) return null;
-    const main = sizes[sizes.length - 1];
-    const b = c.build(main);
-    if (!b) return null;
-    const amt = (usd: number) => (b.trade.amountIn * BigInt(Math.round(usd * 1e6))) / BigInt(Math.round(main * 1e6));
-    const others = sizes.slice(0, -1).map(amt).filter((x) => x > 0n);
+  // ladder, the smaller sizes on the same replay; its best size. `canned`
+  // (one trip): the sidecar's answer is already here; read it, don't ask.
+  private async checkCandidate(c: EntryCandidate, hash: string, seenMs: number, canned?: CannedAnswer): Promise<CandResult | null> {
+    const plan = ladderPlan(c, this.settings.sizesUsd);
+    if (!plan) return null;
+    const { main, b, others } = plan;
     const q: TrigQuestion = { trade: b.trade, simOpts: b.simOpts, triggerHash: hash, seenMs, keys: c.keys, label: c.label };
-    const out = await this.d.tf.askOnly(q, others);
-    if (!out.sure) return { out };
-    // Every profitable size: net after gas; the best one. (A profit bigger
-    // than the trade itself is bad data, never used.)
-    const rows: Array<{ amount: bigint; profit: bigint; sizeUsd: number }> = [];
-    if (out.sim.status === 'profit') rows.push({ amount: b.trade.amountIn, profit: out.sim.profit, sizeUsd: main });
-    for (const r of out.ladder ?? []) if (r.status === 'profit') rows.push({ amount: r.amount, profit: r.profit, sizeUsd: (main * Number(r.amount)) / Number(b.trade.amountIn) });
+    const out = await this.d.tf.askOnly(q, others, canned);
+    if (!out.sure) return { out, cand: c, q };
+    // Every size: net after gas; the best one. (A profit bigger than the
+    // trade itself is bad data, never used.) `pick` = the best PROFITABLE
+    // size (decisions, unchanged); `view` = the best of every size,
+    // losses included (logging only: a "loss" answer only says "no
+    // profit", so its net is at most minus gas).
+    const rows: Array<{ amount: bigint; profit: bigint; sizeUsd: number; status: string }> = [];
+    const st = out.sim.status;
+    if (st === 'profit' || st === 'loss') rows.push({ amount: b.trade.amountIn, profit: st === 'profit' ? out.sim.profit : 0n, sizeUsd: main, status: st });
+    for (const r of out.ladder ?? []) if (r.status === 'profit' || r.status === 'loss') rows.push({ amount: r.amount, profit: r.profit, sizeUsd: (main * Number(r.amount)) / Number(b.trade.amountIn), status: r.status });
     let pick: EntryPick | undefined;
+    let view: CandResult['view'];
     for (const r of rows) {
-      if (r.profit <= 0n || r.profit > r.amount) continue;
+      if (r.status === 'loss' || r.profit <= 0n) {
+        const net = -c.gasUsd;
+        if (!view || net > view.netUsd) view = { sizeUsd: r.sizeUsd, netUsd: net, verdict: 'loss', le: true };
+        continue;
+      }
+      if (r.profit > r.amount) continue;
       const net = c.usdOf(r.profit) - c.gasUsd;
       if (!Number.isFinite(net)) continue;
       if (!pick || net > pick.netUsd) pick = { cand: c, sizeUsd: r.sizeUsd, amountIn: r.amount, profitUnits: r.profit, netUsd: net, out, q };
+      if (!view || net > view.netUsd || view.le) view = { sizeUsd: r.sizeUsd, netUsd: net, verdict: 'profit' };
     }
-    return { out, pick };
+    return { out, pick, view, cand: c, q };
+  }
+
+  // ---- ONE TRIP TABLE ------------------------------------------------------------
+  // Plain English: about once a second, every watched pool's routes are
+  // built (the host's own route rules, ranking facts and buildCheck), our
+  // exact check question is written down for each (TriggerFirst.capture),
+  // and the pools whose routes changed are sent to the sidecar
+  // (`trig_table`). Long contract codes are sent once as "$code:<n>".
+  // Work is done in ~2 ms bites (never freezes the bot). Old entries stay
+  // known for 30 s, so answers already on their way can still be read.
+  private readonly tbl = {
+    gen: 0, ackGen: -1, needFull: true, building: false,
+    pools: new Map<string, { fp: string; rows: unknown[]; ids: string[] }>(),
+    meta: new Map<string, TableMeta>(),
+    retired: new Map<string, number>(),
+    codes: [] as string[],
+    seq: 0, lastMs: 0, lastRoutes: 0, sends: 0, sendFails: 0,
+  };
+
+  tableInfo(): { ackGen: number; pools: number; entries: number; lastMs: number; routes: number } {
+    return { ackGen: this.tbl.ackGen, pools: this.tbl.pools.size, entries: this.tbl.meta.size, lastMs: this.tbl.lastMs, routes: this.tbl.lastRoutes };
+  }
+
+  // Rebuild the table and send what changed. true = the sidecar holds it.
+  async refreshTable(): Promise<boolean> {
+    const T = this.tbl;
+    if (T.building || !this.oneTripOn() || !this.active()) return false;
+    T.building = true;
+    const t0 = performance.now();
+    try {
+      const src = this.d.tableRoutes!();
+      let slice = performance.now();
+      const now = this.now();
+      const fresh = new Map<string, { fp: string; rows: Array<Record<string, unknown>>; metas: Array<TableMeta | null> }>();
+      let routes = 0;
+      for (const { pool, routes: rs } of src) {
+        const key = (pool ?? '').toLowerCase();
+        if (!key || fresh.has(key)) continue;
+        const rows: Array<Record<string, unknown>> = [];
+        const metas: Array<TableMeta | null> = [];
+        const fps: unknown[] = [];
+        for (const r of rs) {
+          routes++;
+          if (performance.now() - slice > 2) { await yieldNow(); slice = performance.now(); }
+          let cand: EntryCandidate | null = null;
+          try { cand = r.build(); } catch { cand = null; }
+          const score = r.score !== null && Number.isFinite(r.score) ? r.score : null;
+          if (!cand) { rows.push({ rid: r.rid.toLowerCase(), h: r.held, s: score, e: null }); metas.push(null); fps.push([r.rid, r.held, score, null]); continue; }
+          const meta: TableMeta = { cand };
+          let c: Record<string, unknown> | null = null;
+          const plan = ladderPlan(cand, this.settings.sizesUsd);
+          if (plan) {
+            const cap = await this.captureFor(cand, plan);
+            const stop = stopUnits(cand, this.settings.minNetUsd);
+            if (cap && stop !== null) {
+              c = {
+                calls: cap.calls, overrides: this.codeRefs(cap.overrides), ...(cap.sizes ? { sizes: cap.sizes } : {}),
+                route: cand.keys.filter((k): k is string => typeof k === 'string' && VALID_KEY.test(k)).map((k) => k.toLowerCase()),
+                stop: hex(stop), amt: hex(plan.b.trade.amountIn),
+              };
+              meta.sig = checkSig(cap.data, cap.overrides, cap.sizes);
+            } else meta.fallback = true;
+          }
+          rows.push({ rid: r.rid.toLowerCase(), h: r.held, s: score, e: '', c });
+          metas.push(meta);
+          fps.push([r.rid, r.held, score, cand.label, cand.gasUsd, cand.maxSizeUsd, !!meta.fallback, c]);
+        }
+        fresh.set(key, { fp: JSON.stringify(fps), rows, metas });
+      }
+      // What changed since the last table (new ids only for changed pools).
+      const changed: Record<string, unknown[] | null> = {};
+      for (const [key, f] of fresh) {
+        const old = T.pools.get(key);
+        if (old && old.fp === f.fp) continue;
+        if (old) for (const id of old.ids) T.retired.set(id, now);
+        const ids: string[] = [];
+        f.rows.forEach((row, i) => {
+          if (row.e === null) return;
+          const id = `${T.gen + 1}.${++T.seq}`;
+          row.e = id;
+          ids.push(id);
+          T.meta.set(id, f.metas[i]!);
+        });
+        T.pools.set(key, { fp: f.fp, rows: f.rows, ids });
+        changed[key] = f.rows;
+      }
+      for (const [key, old] of [...T.pools]) {
+        if (fresh.has(key)) continue;
+        for (const id of old.ids) T.retired.set(id, now);
+        T.pools.delete(key);
+        changed[key] = null;
+      }
+      // Forget entries retired more than 30 s ago.
+      for (const [id, at] of [...T.retired]) if (now - at > 30_000) { T.retired.delete(id); T.meta.delete(id); }
+      T.lastRoutes = routes;
+      if (!Object.keys(changed).length && !T.needFull) return T.ackGen >= 0;
+      const full = T.needFull || T.ackGen < 0;
+      const gen = T.gen + 1;
+      const pools = full ? Object.fromEntries([...T.pools].map(([k, v]) => [k, v.rows])) : changed;
+      T.gen = gen;
+      T.sends++;
+      const a = await this.d.client.request({ type: 'trig_table', gen, full, base: T.ackGen, codes: T.codes, pools }, 3_000);
+      if (a.ok === true) { T.ackGen = gen; T.needFull = false; return true; }
+      T.sendFails++;
+      T.needFull = true;
+      return false;
+    } catch {
+      this.hour.errors++;
+      T.needFull = true;
+      return false;
+    } finally {
+      T.lastMs = r2(performance.now() - t0);
+      T.building = false;
+    }
+  }
+
+  // Our exact check question for one candidate at its ladder. Writing it
+  // down costs ~1 ms (the same encoding a real check does), so it is done
+  // once per route SHAPE (coin, hops, lender, number of sizes) and later
+  // only the amounts are put in (the amountIn word of the call and the test
+  // contract's pretend balance, exactly what the sidecar's size ladder
+  // changes too). If that ever differs from a fresh build, the answer is
+  // simply not recognised and that candidate is checked the old way.
+  private readonly capCache = new Map<string, { cap: CapturedCheck; amount: bigint }>();
+  private async captureFor(cand: EntryCandidate, plan: NonNullable<ReturnType<typeof ladderPlan>>): Promise<CapturedCheck | null> {
+    const t = plan.b.trade;
+    const key = JSON.stringify({ token: t.token, hops: t.hops, o: plan.b.simOpts, n: plan.others.length }, (_k, v) => (typeof v === 'bigint' ? v.toString() : v));
+    const hit = this.capCache.get(key);
+    if (hit) return patchAmounts(hit.cap, hit.amount, t.amountIn, plan.others);
+    const q: TrigQuestion = { trade: t, simOpts: plan.b.simOpts, triggerHash: '', seenMs: 0, keys: cand.keys, label: cand.label };
+    const cap = await this.d.tf.capture(q, plan.others);
+    if (!cap) return null;
+    if (this.capCache.size > 2_000) this.capCache.clear(); // memory bound
+    this.capCache.set(key, { cap, amount: t.amountIn });
+    return cap;
+  }
+
+  // Long contract codes in the pretend state -> "$code:<n>" (sent once per
+  // table message in `codes`).
+  private codeRefs(ov: Record<string, unknown>): Record<string, unknown> {
+    const out: Record<string, unknown> = {};
+    for (const [acct, v] of Object.entries(ov ?? {})) {
+      const o = v as Record<string, unknown>;
+      if (o && typeof o.code === 'string' && o.code.length > 200) {
+        let i = this.tbl.codes.indexOf(o.code);
+        if (i < 0) {
+          if (this.tbl.codes.length >= 8) { this.tbl.codes = []; this.tbl.needFull = true; }
+          i = this.tbl.codes.push(o.code) - 1;
+        }
+        out[acct] = { ...o, code: `$code:${i}` };
+      } else out[acct] = v;
+    }
+    return out;
   }
 
   // ---- log line -----------------------------------------------------------------
   // Written once the later same-block re-check is in (or after finalize ms).
-  private finish(rec: EntryRecord, best?: EntryPick): void {
-    const write = (ag?: Awaited<ReturnType<TriggerFirst['agreeLater']>>) => {
+  // `sample`: a not-profitable answer picked for the re-check (see takeSample).
+  private finish(rec: EntryRecord, best?: EntryPick, sample?: { q: TrigQuestion; out: TrigOutcome; cand: EntryCandidate }): void {
+    const write = (ag?: Awaited<ReturnType<TriggerFirst['agreeLater']>>, cand?: EntryCandidate) => {
       try {
+        // The re-check's net after gas (loss: at most minus gas).
+        let agNet: number | undefined;
+        if (ag && cand) {
+          if (ag.agV === 'profit' && ag.agP !== undefined) agNet = r2(cand.usdOf(ag.agP) - cand.gasUsd);
+          else if (ag.agV === 'loss') agNet = r2(-cand.gasUsd);
+        }
+        if (sample) {
+          const S = this.hour.smp;
+          S.asked++;
+          if (ag?.agree === true) S.agree++; else if (ag?.agree === false) S.disagree++; else S.notCompared++;
+          if (agNet !== undefined && agNet >= this.settings.minNetUsd) S.missed++;
+        }
+        const v = rec.view;
         this.d.shadowLog.add({
           t: this.now(), k: 'trig_entry', mode: this.d.tf.mode(), tx: rec.hash.slice(0, 12),
           // what it moved, how sure the "which pools" answer was
@@ -507,34 +1012,49 @@ export class TrigEntry {
           mv: rec.moved?.length ? rec.moved : undefined,
           // candidates: routes found, built (best-ranked, capped), checked; stopped early?
           found: rec.found, cands: rec.candidates, tried: rec.tried, early: rec.early,
-          // the best route, size, net after gas
-          best: rec.best?.label, size: rec.best ? Math.round(rec.best.sizeUsd) : undefined, net: rec.best ? Math.round(rec.best.netUsd * 100) / 100 : undefined,
-          conf: rec.best?.conf, as: rec.best?.as?.length ? rec.best.as : undefined, u: rec.unknown,
+          // the best route, size, net after gas: the best PROFITABLE one if
+          // any, else the best answer even when it loses (bv = its verdict;
+          // nle = a loss answer only says "no profit": net is AT MOST this)
+          best: v?.label ?? rec.best?.label, size: v ? Math.round(v.sizeUsd) : rec.best ? Math.round(rec.best.sizeUsd) : undefined,
+          net: v ? r2(v.netUsd) : rec.best ? r2(rec.best.netUsd) : undefined, bv: v?.verdict, nle: v?.le || undefined,
+          conf: v?.conf ?? rec.best?.conf, as: (v?.as ?? rec.best?.as)?.length ? (v?.as ?? rec.best?.as) : undefined, u: rec.unknown,
+          // every checked candidate: label, verdict, net, size, reason (fail / unknown), confidence
+          cv: rec.cv?.length ? rec.cv : undefined,
           // decision: would send (shadow) / sent (on), or what held it back
           would: rec.wouldSend || undefined, held: rec.held,
+          // one trip used (1) or why not; candidates the sidecar left to the old way; ran out of its time
+          one: rec.one, oneRest: rec.oneRest, oneCut: rec.oneCut, oneMis: rec.oneMismatch,
           // timing (ms after the feed showed it)
           discMs: rec.discoverMs, ansMs: rec.answerMs, subMs: rec.submitMs,
-          // later same-block re-check of the best candidate (as trig_first lines)
-          agree: ag?.agree, agV: ag?.agV, same: ag?.same, agSkip: ag?.agSkip, rblk: ag?.rblk, rAfterMs: ag?.rAfterMs,
+          // per hop (ms after the feed frame arrived, 2 decimals; see Hops)
+          hops: rec.hops,
+          // later same-block re-check of the best candidate (as trig_first lines);
+          // smp = a not-profitable answer sampled for it; agNet = the re-check's net
+          smp: rec.sampled || undefined, agree: ag?.agree, agV: ag?.agV, agNet, same: ag?.same, agSkip: ag?.agSkip, rblk: ag?.rblk, rAfterMs: ag?.rAfterMs,
           seen: rec.seenMs,
         });
       } catch { this.hour.errors++; }
     };
-    if (!best?.out.sure) { write(); return; }
+    const target = best?.out.sure ? { q: best.q, out: best.out, cand: best.cand } : sample?.out.sure ? sample : undefined;
+    if (!target) { write(); return; }
     // The re-check waits for the trigger's block reports (bounded by the
     // trigger-first settings); never holds up anything else.
-    void withDeadline(this.d.tf.agreeLater(best.q, best.out), this.d.tf.settings.finalizeMs).then((ag) => write(ag ?? { agSkip: 'not in time' }));
+    void withDeadline(this.d.tf.agreeLater(target.q, target.out), this.d.tf.settings.finalizeMs).then((ag) => write(ag ?? { agSkip: 'not in time' }, target.cand));
   }
 
   // ---- hourly line --------------------------------------------------------------
   // "[trig-entry] hour: shadow: 36000 feed txs, 12000 looked at (dropped 0),
   //  moving our pools 300 (3%), answered 250 (83%), profitable 4 ($3.10),
   //  would send 3, sent 0; feed->discover p50 4 ms p90 9 ms; feed->answer
-  //  ...; unknown: ..."
+  //  ...; best net: >$0.25 4, $0-0.25 10, -$0.10-0 200, <-$0.10 36;
+  //  not-profitable sample re-checked 50: agree 48/49, missed chances 1;
+  //  one trip 240 (two steps: no_table_yet 3); hops p50/p90 ms: ...;
+  //  event-loop lag p50 0.4 p90 2.1 max 14 ms | unknown because: ..."
   takeHourLine(): string | null {
     try {
       const h = this.hour;
       this.hour = this.freshHour();
+      const lag = this.d.lag ? null : loopLag.takeHour();
       if (!this.active()) return null;
       const ms = (xs: number[]) => (xs.length ? `p50 ${pctl(xs, 0.5)} ms, p90 ${pctl(xs, 0.9)} ms` : 'n/a');
       const top = (m: Record<string, number>) => Object.entries(m).sort((a, b) => b[1] - a[1]).slice(0, 4).map(([k, n]) => `${k} ${n}`).join(', ');
@@ -547,6 +1067,14 @@ export class TrigEntry {
         `feed->discover ${ms(h.discoverMs)}`, `feed->answer ${ms(h.answerMs)}`,
       ];
       if (h.submitMs.length) parts.push(`feed->submit ${ms(h.submitMs)}`);
+      const n = h.net;
+      if (n.over + n.small + n.slightLoss + n.loss) parts.push(`best net after gas: over $0.25 ${n.over}, $0-0.25 ${n.small}, -$0.10-0 ${n.slightLoss}, under -$0.10 ${n.loss}`);
+      const S = h.smp;
+      if (S.asked) parts.push(`not-profitable sample re-checked ${S.asked}: agree ${S.agree}/${S.agree + S.disagree}${S.notCompared ? `, not compared ${S.notCompared}` : ''}, missed chances (re-check profitable) ${S.missed}`);
+      if (this.oneTripOn()) parts.push(`one trip ${h.one.used}${Object.keys(h.one.why).length ? ` (two steps: ${top(h.one.why)})` : ''}; table ${this.tbl.pools.size} pools / ${this.tbl.lastRoutes} routes, rebuilt in ${this.tbl.lastMs} ms`);
+      const hp = HOP_NAMES.filter((k) => h.hops[k].length).map((k) => `${k} ${pctl(h.hops[k], 0.5)}/${pctl(h.hops[k], 0.9)}`);
+      if (hp.length) parts.push(`hops p50/p90 ms: ${hp.join(', ')}`);
+      if (lag) parts.push(`event-loop lag p50 ${lag.p50} ms, p90 ${lag.p90} ms, max ${lag.max} ms`);
       const line = `Trigger-first entry (${this.d.tf.decides() ? 'on' : this.d.tf.mode()}): ${parts.join('; ')}`;
       const whys = top(h.unknownWhy);
       this.log(`[trig-entry] hour: ${line}${whys ? ` | unknown because: ${whys}` : ''}${h.errors ? ` | errors ${h.errors}` : ''}`);
@@ -555,7 +1083,33 @@ export class TrigEntry {
   }
 }
 
-type CandResult = { out: TrigOutcome; pick?: EntryPick };
+type CandResult = {
+  out: TrigOutcome;
+  pick?: EntryPick;
+  // The best size of every size, losses included (logging only).
+  view?: { sizeUsd: number; netUsd: number; verdict: 'profit' | 'loss'; le?: boolean };
+  cand: EntryCandidate;
+  q: TrigQuestion;
+};
+
+// PER-HOP TIMESTAMPS of one trigger: ms after the feed frame arrived
+// (performance.now(), 2 decimals), and the sidecar's own split.
+export type Hops = {
+  parse?: number;     // frame parsed (feed messages unpacked)
+  queue?: number;     // this transaction queued as a possible trigger
+  start?: number;     // its work started
+  dSent?: number;     // discover (or one-trip) question sent
+  dAns?: number;      // its answer read
+  scQ?: number;       // ...of which the sidecar waited for a worker (ms)
+  scW?: number;       // ...and worked (ms; one trip: discovery + every check)
+  dW?: number;        // one trip: discovery's share of that work (ms)
+  built?: number;     // candidates ready
+  checks?: Array<[number | null, number | null, number | null, number | null]>; // per check: sent, answered, sidecar queue, sidecar work (one trip: only work)
+  dec?: number;       // decision made
+  sign?: number;      // our trade signed (on mode)
+  lag?: number;       // event-loop lag when the frame arrived (worst of the last ~200 ms)
+  lagA?: number;      // ...and when the first answer was read
+};
 
 // One trigger's facts (for its log line; process() returns it for tests).
 export type EntryRecord = {
@@ -575,6 +1129,15 @@ export type EntryRecord = {
   submitMs?: number;
   unknown?: string;
   best?: { label: string; sizeUsd: number; netUsd: number; conf?: TrigConfidence; as?: string[] };
+  // The best answer even when it loses (log): net after gas (le = at most).
+  view?: { label: string; sizeUsd: number; netUsd: number; verdict: 'profit' | 'loss'; le?: boolean; conf?: TrigConfidence; as?: string[] };
+  cv?: Array<{ l: string; v: string; n?: number; s?: number; r?: string; c?: TrigConfidence }>;
+  sampled?: boolean;              // a not-profitable answer picked for the re-check
+  one?: 1 | string;               // one trip used (1), or why not
+  oneRest?: number;               // candidates checked the old way after the one trip
+  oneCut?: boolean;               // the sidecar ran out of its time budget
+  oneMismatch?: number;           // one-trip answers not used (our call differed from the table's): checked the old way
+  hops?: Hops;
   wouldSend?: boolean;
   held?: string;
 };

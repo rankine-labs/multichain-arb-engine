@@ -189,7 +189,8 @@ and nothing else. Node links are never printed, and never stored in pm2.
 | Setting | Default | What it does |
 |---|---|---|
 | `ARBSIM_SOCKET` | `/tmp/arbsim.sock` | socket path (the bot reads the same setting; keep them equal) |
-| `ARBSIM_WORKERS` | 2 (1-16) | threads answering checks |
+| `ARBSIM_WORKERS` | 2 (1-16) | threads answering checks. Keep it at most the number of CPU cores (the live server has 2 vCPUs): more workers than cores only take turns on the same cores and do not make answers faster; the fast lane (`ARBSIM_PRIO_BURST`) is what lets entry work skip the line |
+| `ARBSIM_PRIO_BURST` | 4 (0-64) | trigger-entry questions (`trig_entry`, `trig_discover`, entry checks marked `prio`) skip the line; after this many in a row one waiting normal question goes first (0 = one plain first-come line) |
 | `ARBSIM_MAX_STALE_MS` | 3000 | feed quiet longer than this = "stale" |
 | `ARBSIM_WAIT_MS` | 30 | how long a check waits for the copy to catch up before "dirty" |
 | `ARBSIM_HISTORY` | 64 | recent versions kept |

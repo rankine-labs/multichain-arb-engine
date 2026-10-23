@@ -9,6 +9,7 @@ pub mod bench_node;
 pub mod check;
 pub mod copy2;
 pub mod feed;
+pub mod jobq;
 pub mod node;
 pub mod proto;
 pub mod server;

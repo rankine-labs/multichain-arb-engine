@@ -1,0 +1,38 @@
+{
+  "about": "Trigger-entry one trip: how candidates are picked for the pools a trigger moved. Checked by BOTH the sidecar (sim/tests/trig_entry.rs, check/entry.rs select) and the bot (src/test/trigSpeed.test.ts, execution/trigEntry.ts rankRoutes), so the two can never drift apart. Rows per pool are in the bot's route order; h = start coin we hold; s = quick price score (null = unknown); e = entry id (null = the bot could not build it).",
+  "cases": [
+    {
+      "name": "one pool, two directions, better score first",
+      "table": { "0xa": [ { "rid": "a>b:u", "h": true, "s": 1.5, "e": "e1" }, { "rid": "b>a:u", "h": true, "s": 2.5, "e": "e2" } ] },
+      "moved": ["0xa"], "limit": 6, "expect": ["e2", "e1"], "found": 2
+    },
+    {
+      "name": "a coin we hold beats a better score; unknown score last; cap counts unbuildable rows",
+      "table": {
+        "0xa": [ { "rid": "a>b:u", "h": true, "s": 1.0, "e": "e1" }, { "rid": "b>a:u", "h": true, "s": 3.0, "e": "e2" }, { "rid": "a>c:w", "h": false, "s": 9.0, "e": "e3" } ],
+        "0xb": [ { "rid": "a>b:u", "h": true, "s": 1.0, "e": "dup" }, { "rid": "b>d:u", "h": true, "s": null, "e": "e4" }, { "rid": "d>b:u", "h": true, "s": 2.0, "e": null } ]
+      },
+      "moved": ["0xa", "0xb"], "limit": 4, "expect": ["e2", "e1", "e4"], "found": 5
+    },
+    {
+      "name": "ties keep the order the moved pools were named in",
+      "table": { "0xa": [ { "rid": "1", "h": true, "s": null, "e": "p" } ], "0xb": [ { "rid": "2", "h": true, "s": null, "e": "q" } ] },
+      "moved": ["0xb", "0xa"], "limit": 6, "expect": ["q", "p"], "found": 2
+    },
+    {
+      "name": "equal scores: route order; negative scores still beat unknown",
+      "table": { "0xa": [ { "rid": "1", "h": true, "s": -0.5, "e": "x1" }, { "rid": "2", "h": true, "s": 0.2, "e": "x2" }, { "rid": "3", "h": true, "s": 0.2, "e": "x3" }, { "rid": "4", "h": true, "s": null, "e": "x4" } ] },
+      "moved": ["0xa"], "limit": 3, "expect": ["x2", "x3", "x1"], "found": 4
+    },
+    {
+      "name": "unknown pool and no routes: nothing",
+      "table": { "0xa": [] },
+      "moved": ["0xa", "0xzz"], "limit": 6, "expect": [], "found": 0
+    },
+    {
+      "name": "pool keys are matched without case",
+      "table": { "0xabcdef": [ { "rid": "r", "h": false, "s": 1, "e": "k" } ] },
+      "moved": ["0xABCDEF"], "limit": 1, "expect": ["k"], "found": 1
+    }
+  ]
+}

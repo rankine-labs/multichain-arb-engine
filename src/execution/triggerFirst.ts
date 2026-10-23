@@ -1,4 +1,5 @@
 import { LocalSimClient, makeLocalRpc, SidecarAnswer, localUnknownMessage } from './localSim';
+import { performance } from 'perf_hooks';
 import { simulateRoundTrip, SimResult, SIM_EXECUTOR_ADDRESS } from './simulator';
 import { JsonlLog, verdictOf, reasonOf, Verdict, LocalTrade, LocalSimOpts } from './localSimHost';
 import type { FeedMsg } from '../chains/nitroFeed';
@@ -243,7 +244,44 @@ export type TrigOutcome = {
   insideMs?: number;                    // the sidecar's own time (ms)
   confidence?: TrigConfidence;          // sure answers: high / medium / low
   assumptions?: string[];               // sure answers: what was assumed ([] = exact)
+  // Entry point per-hop timing (execution/trigEntry.ts `hops`): when our
+  // check question was sent / its answer read (performance.now() ms), and
+  // the sidecar's own split: waiting for a worker (q) and working (w), ms.
+  hop?: { s?: number; a?: number; q?: number; w?: number };
 };
+
+// ENTRY POINT "one trip" (execution/trigEntry.ts): the sidecar already ran
+// our check inside the combined `trig_entry` question. `answer` is that very
+// `call` answer; `data` is our call's data as the table sent it (a different
+// one = the trade changed since: not used); `seq` = the trigger's feed
+// sequence number from the discovery feed.
+// `sig` (checkSig): the exact question the table sent (call data, pretend
+// state, ladder amounts); our rebuilt question must match it exactly.
+export type CannedAnswer = { answer: SidecarAnswer; sig: string; seq: number };
+
+// One string for "exactly this check question": call data + pretend state +
+// ladder amounts (what decides the sidecar's answer, besides the feed).
+export function checkSig(data: unknown, overrides: unknown, sizes: unknown): string {
+  // Long contract codes (our test contract, ~25 KB) stand in as a short
+  // fingerprint, worked out once per code (keeps this cheap).
+  return JSON.stringify([data ?? null, overrides ?? {}, sizes ?? null], (k, v) => (k === 'code' && typeof v === 'string' && v.length > 200 ? codeTag(v) : v));
+}
+const codeTags = new Map<string, string>();
+function codeTag(code: string): string {
+  let t = codeTags.get(code);
+  if (t) return t;
+  // FNV-1a over the whole code, plus its length.
+  let h = 0x811c9dc5;
+  for (let i = 0; i < code.length; i++) { h ^= code.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; }
+  t = `code:${code.length}:${h.toString(16)}`;
+  if (codeTags.size > 16) codeTags.clear();
+  codeTags.set(code, t);
+  return t;
+}
+
+// What our exact check question looks like (for the one-trip table): the
+// `call` fields a trigger-first check sends, minus the feed.
+export type CapturedCheck = { calls: unknown[]; overrides: Record<string, unknown>; sizes?: { amountOffset: number; amounts: string[] }; data: string };
 
 // Unknown reasons that mean "the state we needed wasn't there" (for the
 // "required state available" share in the hourly line).
@@ -376,6 +414,7 @@ type TrigRecord = {
   reportMs?: number;                    // when those reports arrived
   agree?: boolean;                      // later same-block re-check agrees
   agreeVerdict?: Verdict;
+  agreeProfit?: bigint;                 // the re-check's profit (when it said profit)
   sameState?: boolean;                  // nothing after the trigger was replayed
   agreeSkipped?: string;
   decided?: boolean;                    // on: this answer decided the trade
@@ -538,36 +577,84 @@ export class TriggerFirst {
   // line, so many candidate trades on one trigger don't overwrite this
   // file's per-trigger record). `sizes`: other trade amounts to try on the
   // same replay (size ladder), answered in `ladder`.
-  async askOnly(q: TrigQuestion, sizes?: bigint[]): Promise<TrigOutcome> {
+  // `canned` (one trip): read the sidecar's answer from the combined
+  // question instead of asking again; everything else is the same code.
+  // Entry checks are marked `prio` (the sidecar's fast lane, sim/src/jobq.rs).
+  async askOnly(q: TrigQuestion, sizes?: bigint[], canned?: CannedAnswer): Promise<TrigOutcome> {
     const requestMs = this.now();
     const unknown = (why: string, extra: Partial<TrigOutcome> = {}): TrigOutcome => ({
       sure: false, verdict: 'unknown', why, requestMs, answerMs: this.now(), seenMs: q.seenMs,
       sim: { status: 'fail', reason: localUnknownMessage(why), bucket: 'replay_unavailable' }, ...extra,
     });
-    try { return await this.ask(q, requestMs, unknown, sizes); } catch { return unknown('client_error'); }
+    try { return await this.ask(q, requestMs, unknown, sizes, canned, true); } catch { return unknown('client_error'); }
+  }
+
+  // ONE TRIP TABLE (execution/trigEntry.ts): the exact check question this
+  // trade would send (same code path as a real check: our contract's
+  // calldata, pretend state, size ladder), WITHOUT asking anything about it.
+  // The token's balance location may be looked up from the sidecar (once
+  // per token, like any check). null = it couldn't be worked out.
+  async capture(q: TrigQuestion, sizes?: bigint[]): Promise<CapturedCheck | null> {
+    try {
+      let got: CapturedCheck | null = null;
+      const ladderReq = sizes?.length ? { amountOffset: 96, amounts: sizes.slice(0, 8).map((a) => '0x' + a.toString(16)) } : undefined;
+      const plain = makeLocalRpc(this.client, undefined, { timeoutMs: 300 });
+      const rpc = async (method: string, params: unknown[]) => {
+        const p = (params ?? []) as any[];
+        if (method === 'eth_call' && String(p[0]?.to ?? '').toLowerCase() === SIM_EXECUTOR_ADDRESS) {
+          got = { calls: [p[0]], overrides: (p[2] ?? {}) as Record<string, unknown>, ...(ladderReq ? { sizes: ladderReq } : {}), data: String(p[0]?.data ?? '') };
+          return { error: { message: localUnknownMessage('captured') } };
+        }
+        return plain(method, params);
+      };
+      await withDeadline(simulateRoundTrip(rpc as any, 'robinhood', q.trade, { ...q.simOpts, slotReadOnly: true }), 2_000);
+      return got;
+    } catch { return null; }
   }
 
   // ENTRY POINT: the later same-block re-check of one answer (the same one
   // check() runs for its own triggers, same hourly budget). Fields as in
   // the trig_first line: agree / agV / same / agSkip, rblk, rAfterMs.
-  async agreeLater(q: TrigQuestion, out: TrigOutcome): Promise<{ agree?: boolean; agV?: Verdict; same?: boolean; agSkip?: string; rblk?: number; rAfterMs?: number }> {
+  // agP: the re-check's profit (start-coin units) when it said profit, so
+  // the entry point can log the re-check's net too.
+  async agreeLater(q: TrigQuestion, out: TrigOutcome): Promise<{ agree?: boolean; agV?: Verdict; agP?: bigint; same?: boolean; agSkip?: string; rblk?: number; rAfterMs?: number }> {
     const rec: TrigRecord = { hash: q.triggerHash.toLowerCase(), label: q.label, out, written: false };
     if (this.settings.mode === 'off' || !this.client.isConnected()) return { agSkip: 'off or disconnected' };
     await this.afterReports(q, rec);
-    return { agree: rec.agree, agV: rec.agreeVerdict, same: rec.sameState, agSkip: rec.agreeSkipped, rblk: rec.reportBlock ?? undefined, rAfterMs: rec.reportMs !== undefined ? rec.reportMs - out.answerMs : undefined };
+    return { agree: rec.agree, agV: rec.agreeVerdict, agP: rec.agreeProfit, same: rec.sameState, agSkip: rec.agreeSkipped, rblk: rec.reportBlock ?? undefined, rAfterMs: rec.reportMs !== undefined ? rec.reportMs - out.answerMs : undefined };
   }
 
-  private async ask(q: TrigQuestion, requestMs: number, unknown: (why: string, extra?: Partial<TrigOutcome>) => TrigOutcome, sizes?: bigint[]): Promise<TrigOutcome> {
+  private async ask(q: TrigQuestion, requestMs: number, unknown: (why: string, extra?: Partial<TrigOutcome>) => TrigOutcome, sizes?: bigint[], canned?: CannedAnswer, prio = false): Promise<TrigOutcome> {
     const s = this.settings;
     if (s.mode === 'off') return unknown('off');
-    if (!this.client.isConnected()) return unknown('disconnected');
+    if (!canned && !this.client.isConnected()) return unknown('disconnected');
     const c2 = this.o.copy2();
     if (!c2 || !c2.running()) return unknown('copy2_not_running');
     const nr = c2.notReadyWhy(q.keys);
     if (nr) return unknown(`copy2_${nr.replace(/[^a-z0-9]+/gi, '_').toLowerCase()}`.slice(0, 40));
-    const built = this.buildFeed(q.triggerHash, q.keys);
-    if ('why' in built) return unknown(built.why, built.seq !== undefined ? { triggerSeq: built.seq } : {});
-    const { feed, seq } = built;
+    // One trip: the feed was already replayed in the combined question.
+    let feed: Record<string, unknown> = {};
+    let seq: number;
+    if (canned) seq = canned.seq;
+    else {
+      const built = this.buildFeed(q.triggerHash, q.keys);
+      if ('why' in built) return unknown(built.why, built.seq !== undefined ? { triggerSeq: built.seq } : {});
+      ({ feed, seq } = built);
+    }
+    // One trip: a stand-in connection that hands back the combined
+    // question's answer for OUR call (only if it is exactly the call the
+    // table sent), and "unknown" for anything else.
+    const client: LocalSimClient = canned ? ({
+      isConnected: () => true,
+      stats: { fallbacks: 0 },
+      request: async (m: Record<string, unknown>) => {
+        const c = (m.calls as Array<{ to?: string; data?: string }> | undefined)?.[0];
+        if (c?.to?.toLowerCase() !== SIM_EXECUTOR_ADDRESS || checkSig(c?.data, m.overrides, m.sizes) !== canned.sig) return { ok: false, unknown: 'one_trip_mismatch' };
+        const a = canned.answer as Record<string, unknown>;
+        return a.ok === true ? a : { ...a, ok: false, unknown: typeof a.unknown === 'string' ? a.unknown : 'sidecar_error' };
+      },
+    } as unknown as LocalSimClient) : this.client;
+    const hop: NonNullable<TrigOutcome['hop']> = {};
     // Size ladder (entry point): amountIn is the 4th 32-byte word after the
     // 4-byte code of both executor calls (localSimHost.ts sizeSearch).
     const ladderReq = sizes?.length ? { sizes: { amountOffset: 96, amounts: sizes.slice(0, 8).map((a) => '0x' + a.toString(16)) } } : {};
@@ -575,13 +662,21 @@ export class TriggerFirst {
     let info: TrigInfo | undefined;
     let missing: WarmItem[] = [];
     let insideMs: number | undefined;
-    const rpc = makeLocalRpc(this.client, undefined, {
+    const rpc = makeLocalRpc(client, undefined, {
       timeoutMs: s.timeoutMs,
       at: { after: 'head' },
-      extra: { feed, ...ladderReq },
+      extra: { feed, ...ladderReq, ...(prio ? { prio: true } : {}) },
+      onSend: (_m: string, sent: Record<string, unknown>) => {
+        const call = (sent.calls as Array<{ to?: string }> | undefined)?.[0];
+        if (!canned && call?.to?.toLowerCase() === SIM_EXECUTOR_ADDRESS) hop.s = performance.now();
+      },
       onReply: (_m: string, a: SidecarAnswer, sent: Record<string, unknown>) => {
         const call = (sent.calls as Array<{ to?: string }> | undefined)?.[0];
         if (call?.to?.toLowerCase() !== SIM_EXECUTOR_ADDRESS) return;
+        if (!canned) hop.a = performance.now();
+        const tq = (a as { t?: { queue?: unknown } }).t?.queue;
+        if (typeof tq === 'number') hop.q = Math.round(tq / 10) / 100;
+        if (typeof a.us === 'number') hop.w = Math.round(a.us / 10) / 100;
         if (typeof a.us === 'number') insideMs = Math.round(a.us / 100) / 10;
         if (a.ok === true) info = (a as { trig?: TrigInfo }).trig;
         if (a.ok === true) ladder = readLadder((a as { sizes?: unknown }).sizes);
@@ -589,15 +684,15 @@ export class TriggerFirst {
       },
     });
     const sim = await withDeadline(simulateRoundTrip(rpc, 'robinhood', q.trade, { ...q.simOpts, slotReadOnly: true }), s.deadlineMs);
-    if (!sim) return unknown('deadline', { triggerSeq: seq, insideMs });
+    if (!sim) return unknown('deadline', { triggerSeq: seq, insideMs, hop });
     const verdict = verdictOf(sim);
     if (missing.length) this.warmer.offer(missing);
-    if (verdict === 'unknown') return { ...unknown(unknownWhy(sim), { triggerSeq: seq, insideMs }), sim };
+    if (verdict === 'unknown') return { ...unknown(unknownWhy(sim), { triggerSeq: seq, insideMs, hop }), sim };
     // How sure (an older fast check sends no confidence: exact = high).
     const ti = info as TrigInfo | undefined;
     const confidence: TrigConfidence = ti?.conf === 'medium' || ti?.conf === 'low' ? ti.conf : 'high';
     const assumptions = Array.isArray(ti?.assumed) ? ti!.assumed!.filter((x) => typeof x === 'string').slice(0, 8) : [];
-    return { sure: true, sim, verdict, requestMs, answerMs: this.now(), seenMs: q.seenMs, triggerSeq: seq, info, insideMs, confidence, assumptions, ...(ladder ? { ladder } : {}) };
+    return { sure: true, sim, verdict, requestMs, answerMs: this.now(), seenMs: q.seenMs, triggerSeq: seq, info, insideMs, confidence, assumptions, hop, ...(ladder ? { ladder } : {}) };
   }
 
   // ---- what happened next (for the log) -------------------------------------
@@ -650,6 +745,7 @@ export class TriggerFirst {
       const r = await withDeadline(simulateRoundTrip(rpc, 'robinhood', q.trade, { ...q.simOpts, slotReadOnly: true }), 2_000);
       const v = verdictOf(r);
       rec.agreeVerdict = v;
+      if (r && r.status === 'profit') rec.agreeProfit = r.profit;
       if (v === 'unknown') { rec.agreeSkipped = `re-check unknown (${r ? unknownWhy(r) : 'deadline'})`; return; }
       rec.agree = v === rec.out.verdict;
       // Exactly the same state: nothing after the trigger was replayed and

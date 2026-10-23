@@ -60,8 +60,11 @@ export class RobinhoodChainAdapter implements ChainCapability {
   // BEFORE the trades in it are decoded, so the order buffer always holds
   // the trigger's message by the time the bot reacts to it. Set only when
   // LOCAL_SIM_TRIGGER_FIRST is shadow / on; null = no extra work at all.
-  private msgTap: ((msgs: FeedMsg[], receivedAtMs: number) => void) | null = null;
-  setFeedMsgTap(fn: ((msgs: FeedMsg[], receivedAtMs: number) => void) | null): void {
+  // `hr` (trigger-entry per-hop timing): when the websocket message arrived
+  // and when it was parsed, high-resolution (performance.now(), ms with
+  // decimals), so the entry point can see where the time goes.
+  private msgTap: ((msgs: FeedMsg[], receivedAtMs: number, hr?: { recv: number; parsed: number }) => void) | null = null;
+  setFeedMsgTap(fn: ((msgs: FeedMsg[], receivedAtMs: number, hr?: { recv: number; parsed: number }) => void) | null): void {
         this.msgTap = fn;
   }
 
@@ -109,6 +112,7 @@ export class RobinhoodChainAdapter implements ChainCapability {
               // timed as "feed frame"; the trades' own work as "feed trade".
               ws.on('message', labelled('feed frame', (raw: WebSocket.RawData) => {
                     const receivedAtMs = Date.now();
+                    const recvHr = performance.now();
                     this.lastMessageAtMs = receivedAtMs;
 
                     const text = raw.toString();
@@ -126,7 +130,7 @@ export class RobinhoodChainAdapter implements ChainCapability {
                     // Trigger-first order buffer: every message, also backlog
                     // repeats after a reconnect (the buffer keeps one copy per
                     // sequence number), before the repeat check below.
-                    if (this.msgTap) { try { this.msgTap(parseFeedMessages(parsed), receivedAtMs); } catch { /* never breaks the feed */ } }
+                    if (this.msgTap) { try { const fm = parseFeedMessages(parsed); this.msgTap(fm, receivedAtMs, { recv: recvHr, parsed: performance.now() }); } catch { /* never breaks the feed */ } }
 
                     const seq = maxSequenceNumber(parsed);
                     // After a reconnect the broadcaster can replay its backlog.
