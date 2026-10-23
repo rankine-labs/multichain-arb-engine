@@ -846,6 +846,51 @@ impl Copy2Handle {
         }
         p
     }
+
+    /// Trigger-first best effort (check/ordered.rs Route): our trade's
+    /// route from the bot's route keys (pool contract addresses, V4 pool
+    /// ids). For each pool: its contract and owned accounts (or, V4, its
+    /// data inside the PoolManager), its coin balances, its coin pair.
+    /// None = a key isn't a pool copy 2 follows (then nothing is skipped).
+    pub fn route_for(&self, keys: &[String]) -> Option<crate::check::ordered::Route> {
+        let reg = self.c2.reg.read().unwrap_or_else(|e| e.into_inner());
+        let mut r = crate::check::ordered::Route::default();
+        for k in keys {
+            let b = crate::check::hexutil::parse_bytes(k).ok()?;
+            let entry = match b.len() {
+                20 => {
+                    let a = Address::from_slice(&b);
+                    reg.by_addr.get(&a)?.iter().find(|pk| pk.1.is_none()).and_then(|pk| reg.pools.get(pk))?
+                }
+                32 => {
+                    let id = B256::from_slice(&b);
+                    reg.pools.iter().find(|(pk, _)| pk.1 == Some(id)).map(|(_, e)| e)?
+                }
+                _ => return None,
+            };
+            let tp = &entry.pool;
+            r.pairs.push((tp.token0, tp.token1));
+            r.names.push(tp.address);
+            match tp.v4_id {
+                // V4: only this pool's own data inside the PoolManager (the
+                // PoolManager itself is shared by every V4 pool).
+                Some(id) => {
+                    r.ids.push(id);
+                    r.slots.extend(entry.items.iter().copied());
+                }
+                None => {
+                    r.accounts.insert(tp.address);
+                    r.accounts.extend(entry.owned.iter().copied());
+                    for coin in [tp.token0, tp.token1] {
+                        if let Some(sl) = reg.bal_slot(coin, tp.address) {
+                            r.slots.insert((coin, sl));
+                        }
+                    }
+                }
+            }
+        }
+        Some(r)
+    }
 }
 
 

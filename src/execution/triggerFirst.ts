@@ -61,9 +61,45 @@ import type { FeedMsg } from '../chains/nitroFeed';
 //
 //   Safety: nothing here signs or sends. Every problem is caught, counted
 //   and turned into "unknown"; it never throws into the bot.
+//
+//   BEST EFFORT + CONFIDENCE (Oct 23, owner: "sufficiently accurate
+//   predictions, fast execution, and measured results showing that wins
+//   outweigh failed-trade gas"). A wrong prediction only costs gas (about
+//   3 cents: the contract reverts a trade under its minimum profit); a late
+//   perfect answer earns nothing. So the fast check may now make a few named
+//   ASSUMPTIONS instead of saying "unknown" (sim/src/check/ordered.rs BEST
+//   EFFORT): sender_funds (the trigger's sender can pay), recent_fill (a
+//   value copy 2 re-reads every minute), call_fill (our trade read such a
+//   value), skipped_unrelated / skipped_related (a feed transaction we can't
+//   run and that can't / might touch our route was left out). Each answer
+//   carries a CONFIDENCE: high (nothing assumed), medium (sender_funds /
+//   fills / skipped_unrelated), low (skipped_related).
+//     - shadow: every level is logged ("conf" / "as" in the trig_first line,
+//       and the later same-block re-check's agreement split by confidence
+//       and by assumption in the hour line), so we can SEE which
+//       assumptions are safe.
+//     - on: an answer decides only at TRIG_FIRST_MIN_CONFIDENCE or better
+//       (default medium); a lower one goes to the existing path, unchanged.
+//     - TRIG_FIRST_STRICT=1: no assumptions at all (the old strict rules).
+//       TRIG_FIRST_ASSUME (default "sender_funds,recent_fill,skip") picks
+//       which assumptions are allowed.
+//   The scoreboard (report/scoreboard.ts) can also put trigger-first back
+//   to practice for a while by itself (stepBack), when real sends lose.
 // ============================================================================
 
 export type TrigFirstMode = 'off' | 'shadow' | 'on';
+export type TrigConfidence = 'high' | 'medium' | 'low';
+const CONF_RANK: Record<TrigConfidence, number> = { low: 0, medium: 1, high: 2 };
+
+// TRIG_FIRST_MIN_CONFIDENCE=high|medium|low (anything else: medium).
+export function minConfidenceOf(v: string | undefined): TrigConfidence {
+  const x = (v ?? '').trim().toLowerCase();
+  return x === 'high' || x === 'low' ? x : 'medium';
+}
+// Is `c` at least `min`?
+export function confidenceAtLeast(c: TrigConfidence | undefined, min: TrigConfidence): boolean {
+  return CONF_RANK[c ?? 'high'] >= CONF_RANK[min];
+}
 
 // LOCAL_SIM_TRIGGER_FIRST=off|shadow|on. Anything else (or unset) = off.
 export function triggerFirstMode(env: Record<string, string | undefined> = process.env): TrigFirstMode {
@@ -85,6 +121,9 @@ export type TrigFirstSettings = {
   agreeWaitMs: number;            // TRIG_FIRST_AGREE_WAIT_MS [5000] wait for the trigger's block reports
   finalizeMs: number;             // TRIG_FIRST_LOG_AFTER_MS [8000] write a trigger's log line this long after its answer
   l2Offset: number;               // ARBSIM_L2_BLOCK_OFFSET [0] block = feed sequence number + this
+  strict: boolean;                // TRIG_FIRST_STRICT [0] 1 = no assumptions at all (old strict rules)
+  assume: string[];               // TRIG_FIRST_ASSUME [sender_funds,recent_fill,skip] allowed assumptions
+  minConfidence: TrigConfidence;  // TRIG_FIRST_MIN_CONFIDENCE [medium] lowest confidence that may send (on mode)
 };
 
 export function trigFirstSettings(env: Record<string, string | undefined> = process.env): TrigFirstSettings {
@@ -102,6 +141,9 @@ export function trigFirstSettings(env: Record<string, string | undefined> = proc
     agreeWaitMs: num('TRIG_FIRST_AGREE_WAIT_MS', 5_000),
     finalizeMs: num('TRIG_FIRST_LOG_AFTER_MS', 8_000),
     l2Offset: Math.round(num('ARBSIM_L2_BLOCK_OFFSET', 0, 0)),
+    strict: (env.TRIG_FIRST_STRICT ?? '').trim() === '1',
+    assume: (env.TRIG_FIRST_ASSUME ?? 'sender_funds,recent_fill,skip').split(',').map((x) => x.trim().toLowerCase()).filter((x) => x === 'sender_funds' || x === 'recent_fill' || x === 'skip'),
+    minConfidence: minConfidenceOf(env.TRIG_FIRST_MIN_CONFIDENCE),
   };
 }
 
@@ -177,7 +219,10 @@ export type TrigQuestion = {
 };
 
 // What the sidecar said about the replay (answer field `trig`).
-export type TrigInfo = { snapBlock?: number; included?: boolean; triggerOk?: boolean | null; msgs?: number; txs?: number; later?: number; lastSeq?: number; reverted?: number };
+// conf / assumed / skipped (best effort): how sure, what was assumed, how
+// many feed transactions were left out. An older fast check sends none of
+// them: its answers are exact (high).
+export type TrigInfo = { snapBlock?: number; included?: boolean; triggerOk?: boolean | null; msgs?: number; txs?: number; later?: number; lastSeq?: number; reverted?: number; conf?: TrigConfidence; assumed?: string[]; skipped?: number };
 
 export type TrigOutcome = {
   sure: boolean;                        // a real profit / loss / fail verdict
@@ -190,6 +235,8 @@ export type TrigOutcome = {
   triggerSeq?: number;
   info?: TrigInfo;
   insideMs?: number;                    // the sidecar's own time (ms)
+  confidence?: TrigConfidence;          // sure answers: high / medium / low
+  assumptions?: string[];               // sure answers: what was assumed ([] = exact)
 };
 
 // Unknown reasons that mean "the state we needed wasn't there" (for the
@@ -349,6 +396,13 @@ export class TriggerFirst {
       included: 0, replayedTxs: 0,
       agree: 0, disagree: 0, sameAgree: 0, sameDisagree: 0, notCompared: 0, alignMismatch: 0,
       decided: 0, errors: 0,
+      // Best effort: sure answers by confidence, answers held back by the
+      // confidence floor (on), later re-check agreement [agree, compared]
+      // by confidence and by assumption kind ("exact" = none).
+      conf: { high: 0, medium: 0, low: 0 } as Record<TrigConfidence, number>,
+      heldBack: 0,
+      agreeByConf: {} as Record<string, [number, number]>,
+      agreeByAssume: {} as Record<string, [number, number]>,
     };
   }
 
@@ -365,9 +419,32 @@ export class TriggerFirst {
 
   mode(): TrigFirstMode { return this.settings.mode; }
 
+  // Back to practice until untilMs (scoreboard overall step back). Logged.
+  private stepBackUntil = 0;
+  stepBack(untilMs: number, why: string): void {
+    if (untilMs <= this.stepBackUntil) return;
+    this.stepBackUntil = untilMs;
+    this.log(`[trigger-first] stepped back to practice until ${new Date(untilMs).toISOString()}: ${why}`);
+  }
+  steppedBackUntil(): number { return this.stepBackUntil > this.now() ? this.stepBackUntil : 0; }
+
+  // May this SURE answer decide (on mode)? null = yes; else why not (the
+  // existing path then decides). Only the confidence is judged here; the
+  // host adds the scoreboard's paused buckets.
+  sendGate(out: TrigOutcome): string | null {
+    if (!out.sure) return `unknown (${out.why ?? 'no reason'})`;
+    if (!confidenceAtLeast(out.confidence, this.settings.minConfidence)) {
+      this.hour.heldBack++;
+      return `confidence ${out.confidence} below TRIG_FIRST_MIN_CONFIDENCE=${this.settings.minConfidence}`;
+    }
+    return null;
+  }
+
   // Does a SURE trigger-first answer decide the trade right now?
   decides(): boolean {
     if (this.settings.mode !== 'on') return false;
+    // Stepped back to practice by the scoreboard (real sends lost money).
+    if (this.now() < this.stepBackUntil) return false;
     if (this.o.hostOn()) return true;
     if (!this.onNotOnLogged) { this.onNotOnLogged = true; this.log('[trigger-first] LOCAL_SIM_TRIGGER_FIRST=on but the fast check is not ON (LOCAL_SIM=on + LOCAL_SIM_CONFIRM, not stepped back): practice only'); }
     return false;
@@ -426,6 +503,11 @@ export class TriggerFirst {
     const feed = {
       trigger: hash, triggerSeq: seq,
       msgs: msgs.map((m) => ({ seq: m.seq, ts: m.ts, l1: m.l1, txs: m.txs.map((t) => t.raw), complete: m.complete, ...(m.why ? { why: m.why } : {}) })),
+      // Best effort: our route (which feed transactions could matter) and
+      // which assumptions are allowed (strict = none at all).
+      route: q.keys.filter((k): k is string => typeof k === 'string' && /^0x[0-9a-fA-F]{40}([0-9a-fA-F]{24})?$/.test(k)).map((k) => k.toLowerCase()),
+      strict: s.strict,
+      assume: s.strict ? [] : s.assume,
     };
     let info: TrigInfo | undefined;
     let missing: WarmItem[] = [];
@@ -447,7 +529,11 @@ export class TriggerFirst {
     const verdict = verdictOf(sim);
     if (missing.length) this.warmer.offer(missing);
     if (verdict === 'unknown') return { ...unknown(unknownWhy(sim), { triggerSeq: seq, insideMs }), sim };
-    return { sure: true, sim, verdict, requestMs, answerMs: this.now(), seenMs: q.seenMs, triggerSeq: seq, info, insideMs };
+    // How sure (an older fast check sends no confidence: exact = high).
+    const ti = info as TrigInfo | undefined;
+    const confidence: TrigConfidence = ti?.conf === 'medium' || ti?.conf === 'low' ? ti.conf : 'high';
+    const assumptions = Array.isArray(ti?.assumed) ? ti!.assumed!.filter((x) => typeof x === 'string').slice(0, 8) : [];
+    return { sure: true, sim, verdict, requestMs, answerMs: this.now(), seenMs: q.seenMs, triggerSeq: seq, info, insideMs, confidence, assumptions };
   }
 
   // ---- what happened next (for the log) -------------------------------------
@@ -457,6 +543,7 @@ export class TriggerFirst {
       h.seen++;
       if (out.sure) {
         if (out.verdict === 'profit') h.profit++; else if (out.verdict === 'loss') h.loss++; else h.fail++;
+        h.conf[out.confidence ?? 'high']++;
         if (out.info?.included) h.included++;
         h.replayedTxs += out.info?.txs ?? 0;
       } else {
@@ -553,11 +640,21 @@ export class TriggerFirst {
       if (rec.agree === true) { h.agree++; if (rec.sameState) h.sameAgree++; }
       else if (rec.agree === false) { h.disagree++; if (rec.sameState) h.sameDisagree++; }
       else if (o.sure) h.notCompared++;
+      // Agreement split by confidence and by assumption kind: which
+      // assumptions are safe.
+      if (rec.agree !== undefined) {
+        const add = (m: Record<string, [number, number]>, k: string) => { const v = m[k] ?? (m[k] = [0, 0]); if (rec.agree) v[0]++; v[1]++; };
+        add(h.agreeByConf, o.confidence ?? 'high');
+        const kinds = [...new Set((o.assumptions ?? []).map((a) => a.split(':')[0]))];
+        for (const k of kinds.length ? kinds : ['exact']) add(h.agreeByAssume, k);
+      }
       this.o.shadowLog.add({
         t: this.now(), k: 'trig_first', mode: this.settings.mode, dec: rec.decided ? 'trig_first' : undefined,
         pair: rec.label, tx: short(rec.hash), seq: o.triggerSeq,
         // the answer
         v: o.verdict, p: o.sim.status === 'profit' ? o.sim.profit : undefined, r: reasonOf(o.sim), u: o.sure ? undefined : o.why,
+        // best effort: how sure, what was assumed, feed transactions left out
+        conf: o.sure ? o.confidence : undefined, as: o.assumptions?.length ? o.assumptions : undefined, skp: o.info?.skipped || undefined,
         // what was replayed (sidecar): copy block, trigger already in it,
         // messages / txs replayed, txs after the trigger, trigger reverted?
         snap: o.info?.snapBlock, incl: o.info?.included, trigOk: o.info?.triggerOk, msgs: o.info?.msgs, txs: o.info?.txs, later: o.info?.later,
@@ -598,7 +695,7 @@ export class TriggerFirst {
       const ms = (xs: number[]) => (xs.length ? `p50 ${pctl(xs, 0.5)} ms, p90 ${pctl(xs, 0.9)} ms` : 'n/a');
       const parts = [
         `${h.seen} triggers`,
-        `answered ${ans} (${pct(ans, h.seen)}: profit ${h.profit}, loss ${h.loss}, fail ${h.fail}; trigger already in the copy ${h.included})`,
+        `answered ${ans} (${pct(ans, h.seen)}: profit ${h.profit}, loss ${h.loss}, fail ${h.fail}; trigger already in the copy ${h.included}; confidence high ${h.conf.high}, medium ${h.conf.medium}, low ${h.conf.low})`,
         `required state there ${pct(h.seen - h.stateMissing, h.seen)}`,
         `feed->answer ${ms(h.ansMs)}`,
       ];
@@ -606,7 +703,10 @@ export class TriggerFirst {
       if (h.earlierMs.length) parts.push(`earlier than the report-based path ${ms(h.earlierMs)}`);
       if (h.reportAfterAnswerMs.length) parts.push(`trigger's block reports came ${ms(h.reportAfterAnswerMs)} after our answer`);
       parts.push(`later same-block re-checks agree ${h.agree}/${h.agree + h.disagree} (exact same state ${h.sameAgree}/${h.sameAgree + h.sameDisagree})${h.notCompared ? `, not compared ${h.notCompared}` : ''}`);
-      if (this.settings.mode === 'on') parts.push(`decided ${h.decided}`);
+      const split = (m: Record<string, [number, number]>) => Object.entries(m).sort((a, b) => b[1][1] - a[1][1]).map(([k, [a, n]]) => `${k} ${a}/${n}`).join(', ');
+      if (h.agree + h.disagree) parts.push(`agree by confidence: ${split(h.agreeByConf)}; by assumption: ${split(h.agreeByAssume)}`);
+      if (this.settings.mode === 'on') parts.push(`decided ${h.decided}${h.heldBack ? `, held back by the confidence floor (${this.settings.minConfidence}) ${h.heldBack}` : ''}`);
+      if (this.steppedBackUntil()) parts.push(`STEPPED BACK to practice until ${new Date(this.stepBackUntil).toISOString().slice(11, 16)} UTC`);
       if (h.alignMismatch) parts.push(`ALIGNMENT MISMATCH ${h.alignMismatch} (feed sequence vs block: check ARBSIM_L2_BLOCK_OFFSET)`);
       parts.push(warm);
       const line = `Trigger-first (${this.settings.mode}): ${parts.join('; ')}`;

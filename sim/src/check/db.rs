@@ -88,6 +88,11 @@ pub struct CheckDb<'a> {
     /// Trigger-first: reads written down while `recording` is on.
     pub reads: ReadLog,
     recording: bool,
+    /// Trigger-first (best effort): counts every time a read found nothing
+    /// in our copy. ordered.rs's watcher compares it before / after a
+    /// transaction touches our route, to tell "touched our route, THEN
+    /// missed something" from "missed something before ever touching it".
+    pub miss_calls: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// Every account / slot read from the database while recording was on
@@ -103,7 +108,7 @@ pub struct ReadLog {
 
 impl<'a> CheckDb<'a> {
     pub fn new(view: &'a dyn StateRead, ov: &'a Overrides, collect: bool) -> Self {
-        CheckDb { view, ov, patches: Vec::new(), missing: Vec::new(), collect, unsupported_builtins: Vec::new(), pretend: Vec::new(), reads: ReadLog::default(), recording: false }
+        CheckDb { view, ov, patches: Vec::new(), missing: Vec::new(), collect, unsupported_builtins: Vec::new(), pretend: Vec::new(), reads: ReadLog::default(), recording: false, miss_calls: Default::default() }
     }
 
     /// Trigger-first: pretend this wallet's basics when our copy doesn't
@@ -132,6 +137,7 @@ impl<'a> CheckDb<'a> {
 
     /// Note a missing item; in stop mode (or past the cap) abort the run.
     fn miss(&mut self, m: MissItem) -> Result<(), DbErr> {
+        self.miss_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if !self.missing.contains(&m) {
             self.missing.push(m.clone());
         }

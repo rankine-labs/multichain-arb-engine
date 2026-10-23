@@ -281,6 +281,22 @@ pub fn handle_trig_call(
     prov: &dyn super::ordered::Provenance,
     strict_call: bool,
 ) -> Value {
+    handle_trig_call_with(view, plan, info, req, prov, strict_call, &super::ordered::Assume::default())
+}
+
+/// `handle_trig_call` with best-effort assumptions (check/ordered.rs BEST
+/// EFFORT). The answer's `trig` then also says `conf` (high / medium /
+/// low) and `assumed` (the labels, e.g. ["sender_funds",
+/// "skipped_unrelated:2"]).
+pub fn handle_trig_call_with(
+    view: &dyn StateRead,
+    plan: &super::ordered::OrderedPlan,
+    info: &super::ordered::PlanInfo,
+    req: &CallRequest,
+    prov: &dyn super::ordered::Provenance,
+    strict_call: bool,
+    assume: &super::ordered::Assume,
+) -> Value {
     let t0 = Instant::now();
     let parsed = (|| -> Result<(Overrides, Vec<CallReq>), String> {
         let ov = Overrides::from_json(&req.overrides)?;
@@ -294,7 +310,7 @@ pub fn handle_trig_call(
         Ok(x) => x,
         Err(e) => return unknown_json(&req.id, &CheckUnknown::bad_request(e), t0.elapsed().as_micros()),
     };
-    match super::ordered::run_ordered(view, plan, &ov, &calls, prov, strict_call) {
+    match super::ordered::run_ordered_with(view, plan, &ov, &calls, prov, strict_call, assume) {
         Ok(out) => {
             // One fingerprint of how every replayed transaction ended
             // (success + output; gas is left out so the protocol-fee runs,
@@ -323,6 +339,10 @@ pub fn handle_trig_call(
                     "lastSeq": info.last_seq,
                     "reverted": out.replayed.iter().filter(|r| !r.outcome.success).count(),
                     "digest": to_hex(revm::primitives::keccak256(&h).as_slice()),
+                    // Best effort: how sure, and what was assumed.
+                    "conf": out.assumed.confidence(),
+                    "assumed": out.assumed.labels(),
+                    "skipped": out.assumed.skipped_related + out.assumed.skipped_unrelated,
                 },
                 "us": t0.elapsed().as_micros() as u64,
             })

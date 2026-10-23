@@ -2438,16 +2438,74 @@ fn trigger_first_never_replays_on_a_fill_copy_2_does_not_follow() {
     }
     assert!(held, "the fill never arrived");
     let head = r.sh.head().unwrap().block;
-    // A trigger that reads that fill: never replayed on it (stale_fill).
+    // A trigger that reads that fill. Strict (the bot's TRIG_FIRST_STRICT=1,
+    // or ARBSIM_TRIG_CALL_TRUST=strict): never replayed on it (stale_fill).
     let trig = signed(0, a(OUTSIDE), hex_word(5));
-    let feed = json!({"trigger": hexb(keccak256(&trig).as_slice()), "triggerSeq": head + 1, "msgs": [{"seq": head + 1, "ts": 80, "l1": 9000, "txs": [hexb(&trig)]}]});
+    let feed = json!({"trigger": hexb(keccak256(&trig).as_slice()), "triggerSeq": head + 1, "strict": true, "msgs": [{"seq": head + 1, "ts": 80, "l1": 9000, "txs": [hexb(&trig)]}]});
     let ans = trig_call(&ctx, feed);
     assert_eq!(ans["unknown"], json!("stale_fill"), "{ans}");
-    // A trigger reading only what copy 2 follows (the pool): answered.
+    // The bot allowing only sender_funds: still stale_fill.
+    let feed = json!({"trigger": hexb(keccak256(&trig).as_slice()), "triggerSeq": head + 1, "assume": ["sender_funds"], "msgs": [{"seq": head + 1, "ts": 80, "l1": 9000, "txs": [hexb(&trig)]}]});
+    assert_eq!(trig_call(&ctx, feed)["unknown"], json!("stale_fill"));
+    // Default (best effort): answered on the fill, labelled recent_fill, medium.
+    let feed = json!({"trigger": hexb(keccak256(&trig).as_slice()), "triggerSeq": head + 1, "msgs": [{"seq": head + 1, "ts": 80, "l1": 9000, "txs": [hexb(&trig)]}]});
+    let ans = trig_call(&ctx, feed);
+    assert_eq!(ans["ok"], json!(true), "{ans}");
+    assert_eq!((ans["trig"]["conf"].clone(), ans["trig"]["assumed"].clone()), (json!("medium"), json!(["recent_fill"])), "{ans}");
+    // A trigger reading only what copy 2 follows (the pool): answered, exact.
     let trig = signed(0, a(V2P), vec![0x09, 0x02, 0xf1, 0xac]);
     let feed = json!({"trigger": hexb(keccak256(&trig).as_slice()), "triggerSeq": head + 1, "msgs": [{"seq": head + 1, "ts": 80, "l1": 9000, "txs": [hexb(&trig)]}]});
     let ans = trig_call(&ctx, feed);
     assert_eq!(ans["ok"], json!(true), "{ans}");
+    assert_eq!((ans["trig"]["conf"].clone(), ans["trig"]["assumed"].clone(), ans["trig"]["skipped"].clone()), (json!("high"), json!([]), json!(0)), "{ans}");
+}
+
+#[test]
+fn trigger_first_route_from_the_bots_keys_and_skipping_through_the_server() {
+    let (mut r, ctx) = trig_world();
+    // The route of our V2 pool: its contract, its two coin balances, its pair.
+    let route = r.h.route_for(&[format!("{:#x}", a(V2P))]).expect("followed pool");
+    assert!(route.accounts.contains(&a(V2P)));
+    assert_eq!(route.pairs, vec![(a(COIN0), a(COIN1))]);
+    assert_eq!(route.slots.iter().filter(|(c, _)| *c == a(COIN0) || *c == a(COIN1)).count(), 2, "{route:?}");
+    assert!(r.h.route_for(&[format!("{:#x}", a(0x55))]).is_none(), "a pool copy 2 doesn't follow: no route (nothing skipped)");
+    // A transaction we can't run (an account nobody holds) BEFORE the
+    // trigger, not touching or naming our pool: skipped with the route, unknown without.
+    let other = signed(0, a(0x3c), vec![1]);
+    let trig = signed(1, a(V2P), vec![0x09, 0x02, 0xf1, 0xac]);
+    let head = r.sh.head().unwrap().block;
+    let msgs = json!([{"seq": head + 1, "ts": 80, "l1": 9000, "txs": [hexb(&other)]}, {"seq": head + 2, "ts": 81, "l1": 9000, "txs": [hexb(&trig)]}]);
+    let th = hexb(keccak256(&trig).as_slice());
+    let ans = trig_call(&ctx, json!({"trigger": th, "triggerSeq": head + 2, "msgs": msgs, "route": [format!("{:#x}", a(V2P))]}));
+    assert_eq!(ans["ok"], json!(true), "{ans}");
+    assert_eq!((ans["trig"]["assumed"].clone(), ans["trig"]["skipped"].clone(), ans["trig"]["conf"].clone()), (json!(["skipped_unrelated:1"]), json!(1), json!("medium")), "{ans}");
+    let ans = trig_call(&ctx, json!({"trigger": th, "triggerSeq": head + 2, "msgs": msgs}));
+    assert_eq!(ans["unknown"], json!("miss"), "no route given: never skipped {ans}");
+    let _ = &mut r;
+}
+
+#[test]
+fn trigger_first_trust_setting_and_the_bots_flags() {
+    use arbsim::server::{trig_assume, trig_trust_from, TrigTrust};
+    assert_eq!(trig_trust_from(None), TrigTrust::Best, "default: best effort");
+    assert_eq!(trig_trust_from(Some("strict")), TrigTrust::Strict);
+    assert_eq!(trig_trust_from(Some(" copy2 ")), TrigTrust::Copy2);
+    assert_eq!(trig_trust_from(Some("whatever")), TrigTrust::Best);
+    let feed = |v: Value| -> arbsim::check::ordered::WireFeed { serde_json::from_value(v).unwrap() };
+    let route = |_: &[String]| Some(arbsim::check::ordered::Route::default());
+    let f = feed(json!({"trigger": "0x00", "triggerSeq": 1, "route": ["0x01"]}));
+    let (strict, a) = trig_assume(TrigTrust::Best, &f, route);
+    assert!(strict && a.sender_funds && a.recent_fill && a.skip.is_some(), "best: everything");
+    let (strict, a) = trig_assume(TrigTrust::Strict, &f, route);
+    assert!(strict && !a.sender_funds && !a.recent_fill && a.skip.is_none(), "strict: nothing");
+    let (strict, a) = trig_assume(TrigTrust::Copy2, &f, route);
+    assert!(!strict && !a.sender_funds && a.skip.is_none(), "copy2: the old opt-in");
+    let (_, a) = trig_assume(TrigTrust::Best, &feed(json!({"trigger": "0x00", "triggerSeq": 1, "strict": true, "route": ["0x01"]})), route);
+    assert!(!a.sender_funds && a.skip.is_none(), "the bot's TRIG_FIRST_STRICT=1 wins");
+    let (_, a) = trig_assume(TrigTrust::Best, &feed(json!({"trigger": "0x00", "triggerSeq": 1, "assume": ["recent_fill"], "route": ["0x01"]})), route);
+    assert!(!a.sender_funds && a.recent_fill && a.skip.is_none(), "only what the bot allows");
+    let (_, a) = trig_assume(TrigTrust::Best, &feed(json!({"trigger": "0x00", "triggerSeq": 1})), route);
+    assert!(a.skip.is_none(), "no route: never skip");
 }
 
 fn hex_word(n: u64) -> Vec<u8> {

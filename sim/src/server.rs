@@ -402,19 +402,59 @@ fn trig_inner(ctx: &Ctx, id: &Value, r: &CallRequest, feed_v: &Value, t0: Instan
         Some(c) => Box::new(c.provenance_at(block, &override_code_accounts(&r.overrides))),
         None => Box::new(crate::check::ordered::AllExact),
     };
-    let strict = trig_call_strict();
-    let run = |view: &dyn StateRead, _c: &BlockCtx| crate::check::proto_types::handle_trig_call(view, &plan, &info, r, prov.as_ref(), strict);
+    // Best effort (check/ordered.rs BEST EFFORT): which assumptions this
+    // check may make (this program's setting, then the bot's request).
+    let (strict, assume) = trig_assume(trig_trust(), &feed, |keys| ctx.copy2.as_ref().and_then(|c| c.route_for(keys)));
+    let run = |view: &dyn StateRead, _c: &BlockCtx| crate::check::proto_types::handle_trig_call_with(view, &plan, &info, r, prov.as_ref(), strict, &assume);
     after_pick(ctx, picked, t0, tm, &run, false)
 }
 
-/// ARBSIM_TRIG_CALL_TRUST (read once): `strict` [default] = our own calls in
-/// a trigger-first check may only use copy values that are exact at the
-/// block, like the replayed transactions; `copy2` = our calls get the same
-/// trust as every other copy-2 check (fills re-read every minute), while the
-/// replayed transactions stay strict.
-pub fn trig_call_strict() -> bool {
-    static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *S.get_or_init(|| std::env::var("ARBSIM_TRIG_CALL_TRUST").map(|v| v.trim() != "copy2").unwrap_or(true))
+/// How much a trigger-first check may assume (ARBSIM_TRIG_CALL_TRUST).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrigTrust {
+    /// `best` [default, Oct 23]: best effort, every assumption the bot
+    /// allows (sender_funds, recent_fill / call_fill, skipping unrelated
+    /// transactions), each written into the answer with a confidence.
+    Best,
+    /// `copy2` (the old opt-in): no assumptions for the replayed
+    /// transactions; our own calls get the same trust as every other copy-2
+    /// check (fills), unlabelled.
+    Copy2,
+    /// `strict` (the old default): no assumptions at all; any doubt = unknown.
+    Strict,
+}
+
+/// ARBSIM_TRIG_CALL_TRUST, read once: best (default) / copy2 / strict.
+pub fn trig_trust() -> TrigTrust {
+    static S: std::sync::OnceLock<TrigTrust> = std::sync::OnceLock::new();
+    *S.get_or_init(|| trig_trust_from(std::env::var("ARBSIM_TRIG_CALL_TRUST").ok().as_deref()))
+}
+
+/// The setting's text -> TrigTrust (anything unknown = best, the default).
+pub fn trig_trust_from(v: Option<&str>) -> TrigTrust {
+    match v.map(|x| x.trim().to_ascii_lowercase()).as_deref() {
+        Some("strict") => TrigTrust::Strict,
+        Some("copy2") => TrigTrust::Copy2,
+        _ => TrigTrust::Best,
+    }
+}
+
+/// Our calls strict?, and the assumptions allowed, for one request:
+/// strict (here or the bot's TRIG_FIRST_STRICT=1, `feed.strict`) = none;
+/// copy2 = none, our calls trusted like any copy-2 check; best = those the
+/// bot allows (`feed.assume`, missing = all). Skipping also needs the route
+/// (`route_of(feed.route)`; None = never skip).
+pub fn trig_assume(trust: TrigTrust, feed: &crate::check::ordered::WireFeed, route_of: impl Fn(&[String]) -> Option<crate::check::ordered::Route>) -> (bool, crate::check::ordered::Assume) {
+    use crate::check::ordered::Assume;
+    if feed.strict || trust == TrigTrust::Strict {
+        return (true, Assume::default());
+    }
+    if trust == TrigTrust::Copy2 {
+        return (false, Assume::default());
+    }
+    let allow = |k: &str| feed.assume.as_ref().is_none_or(|l| l.iter().any(|x| x.trim() == k));
+    let skip = if allow("skip") && !feed.route.is_empty() { route_of(&feed.route) } else { None };
+    (true, Assume { sender_funds: allow("sender_funds"), recent_fill: allow("recent_fill"), skip })
 }
 
 /// Accounts a request gives contract code by override (the test contract).

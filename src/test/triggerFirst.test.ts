@@ -298,6 +298,85 @@ async function main() {
     const rec = readFileSync(file, 'utf8').trim().split('\n').map((l) => JSON.parse(l)).find((l) => l.k === 'trig_first');
     assert(rec?.mode === 'shadow' && rec?.dec === undefined && rec?.exV === 'send (profit)' && typeof rec?.earlierMs === 'number' && rec.earlierMs >= 0, 'shadow line: never decided, the existing path\'s verdict and how much later it decided');
   }
+
+  // ---- BEST EFFORT: what is asked, confidence, gating (Oct 23) ----------------------
+  const withConf = (conf?: string, assumed?: string[]) => (m: Asked): Asked => {
+    const a = profitAnswer(2_000_000_000_000_000n)(m);
+    if (a.trig && conf) a.trig = { ...a.trig, conf, assumed, skipped: (assumed ?? []).reduce((n, x) => n + (x.startsWith('skipped') ? Number(x.split(':')[1] ?? 1) : 0), 0) };
+    return a;
+  };
+  {
+    const v4id = '0x' + 'ab'.repeat(32);
+    const { client, asked } = fakeClient(withConf('medium', ['sender_funds']));
+    const { tf } = mk({ LOCAL_SIM_TRIGGER_FIRST: 'shadow' }, client, fakeCopy2());
+    const out = await tf.check({ ...q, keys: [pool, v4id, null, 'garbage'] });
+    const sent = asked.find((m) => m.feed)!;
+    assert(sent.feed.route.join() === [pool, v4id].join(), 'the route pools (addresses and V4 pool ids) go with the question');
+    assert(sent.feed.strict === false && sent.feed.assume.join() === 'sender_funds,recent_fill,skip', 'default: every assumption allowed');
+    assert(out.sure && out.confidence === 'medium' && out.assumptions?.join() === 'sender_funds', 'the answer\'s confidence and assumptions are kept');
+  }
+  {
+    const { client, asked } = fakeClient(withConf());
+    let { tf } = mk({ LOCAL_SIM_TRIGGER_FIRST: 'shadow', TRIG_FIRST_STRICT: '1' }, client, fakeCopy2());
+    let out = await tf.check(q);
+    assert(asked[0].feed.strict === true && asked[0].feed.assume.length === 0, 'TRIG_FIRST_STRICT=1: no assumptions asked for');
+    assert(out.confidence === 'high' && out.assumptions?.length === 0, 'an answer without confidence (exact / older fast check) = high');
+    ({ tf } = mk({ LOCAL_SIM_TRIGGER_FIRST: 'shadow', TRIG_FIRST_ASSUME: 'recent_fill, bogus' }, client, fakeCopy2()));
+    out = await tf.check(q);
+    assert(asked[1].feed.assume.join() === 'recent_fill', 'TRIG_FIRST_ASSUME picks which assumptions are allowed');
+  }
+  {
+    // Confidence floor (on mode): default medium.
+    const { client } = fakeClient(withConf('low', ['skipped_related:1']));
+    const { tf } = mk({ LOCAL_SIM_TRIGGER_FIRST: 'on' }, client, fakeCopy2(), true);
+    const low = await tf.check(q);
+    assert(/confidence low below TRIG_FIRST_MIN_CONFIDENCE=medium/.test(tf.sendGate(low) ?? ''), 'low answer: not allowed to send (default floor medium)');
+    assert(tf.sendGate({ ...low, confidence: 'medium' }) === null && tf.sendGate({ ...low, confidence: 'high' }) === null, 'medium and high may send');
+    assert(tf.sendGate({ ...low, sure: false, why: 'miss' }) !== null, 'unknown never sends');
+    const hi = mk({ LOCAL_SIM_TRIGGER_FIRST: 'on', TRIG_FIRST_MIN_CONFIDENCE: 'high' }, client, fakeCopy2(), true).tf;
+    assert(hi.sendGate({ ...low, confidence: 'medium' }) !== null && hi.sendGate({ ...low, confidence: 'high' }) === null, 'TRIG_FIRST_MIN_CONFIDENCE=high: only exact answers send');
+    const lo = mk({ LOCAL_SIM_TRIGGER_FIRST: 'on', TRIG_FIRST_MIN_CONFIDENCE: 'low' }, client, fakeCopy2(), true).tf;
+    assert(lo.sendGate(low) === null, 'TRIG_FIRST_MIN_CONFIDENCE=low: everything sure sends');
+    // In the check-first order: a held-back answer -> the existing path, unchanged.
+    const tp = tf.check(q);
+    const order: string[] = [];
+    const run = await runCheckFirst<object, { status: 'profit'; usd: number }>({
+      now: () => Date.now(), mark: () => {},
+      trigFirst: async () => { const o = await tp; if (tf.sendGate(o)) return null; tf.noteDecided(q.triggerHash); return { status: 'profit', usd: 4 }; },
+      hasBuilt: true, copy2Running: () => true, copy2Deciding: () => true,
+      copy2WaitForTx: async () => { order.push('copy2WaitForTx'); return 101; },
+      copy2Route: () => ({ at: { block: '0x65' } }),
+      startFast: () => { order.push('fast'); return {}; },
+      fastDecide: async () => ({ status: 'profit', usd: 2 }),
+      waitForTrade: async () => true, nodeCheck: async () => ({ status: 'profit', usd: 3 }), noNode: () => {},
+    });
+    assert(run.decidedBy === 'local' && order.join() === 'copy2WaitForTx,fast', 'a low-confidence answer goes to the existing path (copy 2), unchanged');
+    const line = tf.takeHourLine() ?? '';
+    assert(/confidence high 0, medium 0, low 2/.test(line) && /held back by the confidence floor \(medium\) /.test(line), `hour line counts confidence and held-back answers: ${line}`);
+  }
+  {
+    // Shadow logs every level, with the later re-check split by confidence / assumption.
+    const { client } = fakeClient(withConf('medium', ['sender_funds', 'skipped_unrelated:2']));
+    const { tf, file, log } = mk({ LOCAL_SIM_TRIGGER_FIRST: 'shadow' }, client, fakeCopy2(), true);
+    await tf.check(q);
+    await sleep(80);
+    tf.finish(q.triggerHash.toLowerCase());
+    await log.flush();
+    const rec = readFileSync(file, 'utf8').trim().split('\n').map((l) => JSON.parse(l)).find((l) => l.k === 'trig_first');
+    assert(rec?.conf === 'medium' && rec?.as?.join() === 'sender_funds,skipped_unrelated:2' && rec?.skp === 2 && rec?.agree === true, `log line: conf, assumptions, skipped count, and the later agreement: ${JSON.stringify(rec)}`);
+    const line = tf.takeHourLine() ?? '';
+    assert(/agree by confidence: medium 1\/1; by assumption: (sender_funds 1\/1, skipped_unrelated 1\/1|skipped_unrelated 1\/1, sender_funds 1\/1)/.test(line), `agreement split by confidence and assumption: ${line}`);
+  }
+  {
+    // Scoreboard step back: trigger-first stops deciding until then.
+    const { client } = fakeClient(withConf());
+    const { tf } = mk({ LOCAL_SIM_TRIGGER_FIRST: 'on' }, client, fakeCopy2(), true);
+    assert(tf.decides(), 'on + fast check ON: decides');
+    tf.stepBack(Date.now() + 60_000, 'test');
+    assert(!tf.decides() && tf.steppedBackUntil() > 0, 'stepped back: practice only');
+    await tf.check(q);
+    assert(/STEPPED BACK/.test(tf.takeHourLine() ?? ''), 'shown in the hour line');
+  }
 }
 
 main().catch((e) => { console.error('FAIL: crashed', e); process.exitCode = 1; });

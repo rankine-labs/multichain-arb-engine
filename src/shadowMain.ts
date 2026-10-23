@@ -77,6 +77,7 @@ import { RobinhoodChainAdapter } from './chains/robinhoodChain';
 // FAST CHECK (arbsim sidecar, LOCAL_SIM=off|shadow|on, default off): see docs/FAST_CHECK.md.
 import { createLocalSimHost, LocalSimHost, LocalCheck, LocalKind, LocalOutcome } from './execution/localSimHost';
 import { TriggerFirst, trigFirstSettings, TrigOutcome } from './execution/triggerFirst';
+import { Scoreboard, SendPath, Confidence as ScoreConfidence, standingGapFailBlock } from './report/scoreboard';
 import { runCheckFirst } from './execution/checkFirstFlow';
 import { MonadAdapter } from './chains/monad';
 import { AvalancheAdapter } from './chains/avalanche';
@@ -622,6 +623,15 @@ const LIVE_BLOCK_FILE = 'data/live-blocks.json';
 setInterval(() => timed('live blocks save', () => liveBlocks.save(LIVE_BLOCK_FILE)), 5 * 60_000);
 // Live trade hash -> its two pools, so a failed live trade can block its pair.
 const livePools = new Map<string, [string, string]>();
+// STANDING-GAP FAIL BLOCK (Oct 23): standing gaps ignore liveBlocks by design
+// (each one is sent right after its own fresh real check, see fireTrade).
+// But a standing gap whose LIVE trade failed on chain is usually still
+// "there" on the next scan (a price we can't really trade), so it would be
+// sent again and again, paying gas each time. After a live on-chain fail,
+// that pool pair is not sent live as a standing gap for
+// GAP_LIVE_FAIL_BLOCK_MIN minutes (default 30; 0 = off). Not saved to disk.
+const GAP_LIVE_FAIL_BLOCK_MIN = Math.max(0, Number(process.env.GAP_LIVE_FAIL_BLOCK_MIN ?? 30) || 0);
+const gapFailBlocks = new LiveRouteBlock(GAP_LIVE_FAIL_BLOCK_MIN * 60_000);
 { const n = routeScores.load(ROUTE_FILE); if (n) console.log(`[sim] robinhood: restored scores for ${n} pool pairs`); }
 setInterval(() => timed('route scores save', () => routeScores.save(ROUTE_FILE)), 10 * 60_000);
 // Real wins by size ($1/$2/$5/$10/$20 bars), to set the firing bar from data.
@@ -1634,6 +1644,14 @@ const sendLiveTradeMessage = (r: { status: 'profit' | 'reverted' | 'dropped'; la
       } catch (err) { console.warn('[live-telegram] trade message failed:', (err as Error).message); }
 };
 
+// SCOREBOARD (report/scoreboard.ts, Oct 23): every real send by path,
+// confidence and assumptions; wins, gas, NET, break-even win rate (hourly
+// log + Telegram, data/scoreboard.jsonl). Self-adjusting: a losing bucket
+// stops sending for 6 h; a losing last 3 h puts trigger-first back to practice.
+const scoreboard = new Scoreboard({
+      notify: (text) => { void sendTelegramMessage(escHtml(text)).catch(() => undefined); },
+      onStepBack: (untilMs, why) => { trigFirst?.stepBack(untilMs, why); },
+});
 // LIVE results (only used once live sending is switched on): receipt, profit
 // from the contract's Executed event, gas cost; losses feed the daily cap.
 // Set once live loops are created (further down); the tracker reports loop results to it.
@@ -1653,6 +1671,12 @@ const liveTracker = new LiveTradeTracker({
             liveTradeLog.result(r); alertHooks.onLiveResult(r); moneyLedgers.noteRealResult(r, robinhoodSender.live); sendLiveTradeMessage(r);
             // LIVE LOOPS: wins, and gas lost toward the loop loss cap.
             loopLiveRef?.noteResult(r);
+            // Scoreboard: the send's path / confidence and its real result.
+            const scored = scoreboard.noteResult(r);
+            // A standing gap whose live trade failed on chain: not sent again for 30 min.
+            if (GAP_LIVE_FAIL_BLOCK_MIN > 0 && standingGapFailBlock(scored, (a, b, why) => gapFailBlocks.block(a, b, why))) {
+                  console.log(`[live-block] ${r.label}: standing gap's live trade failed, pool pair not sent as a standing gap for ${GAP_LIVE_FAIL_BLOCK_MIN} min`);
+            }
             // A live trade that failed on the chain blocks its pool pair for 6 h.
             const pools = livePools.get(r.hash);
             if (pools && r.status === 'reverted') { liveBlocks.block(pools[0], pools[1], 'live trade failed on chain'); console.log(`[live-block] ${r.label}: live trade failed, pool pair blocked 6 h`); }
@@ -1926,7 +1950,12 @@ const loopLive: LoopLiveSender | null = loopCfg.enabled && loopLiveCfg.enabled ?
       usdOf: (t) => priceOracle.getUsdPrice('robinhood', t),
       decimalsOf: (t) => TOKEN_DECIMALS.robinhood?.[t.toLowerCase()],
       isOutlier: (net, size) => isOutlier(net, size, OUTLIER_CFG),
-      safety: (sizeUsd, coins) => { const g = safetyGate.check({ tradeSizeUsd: sizeUsd, tokens: coins }); return g.ok ? null : ('reason' in g ? g.reason : 'blocked'); },
+      safety: (sizeUsd, coins) => {
+            const g = safetyGate.check({ tradeSizeUsd: sizeUsd, tokens: coins });
+            if (!g.ok) return 'reason' in g ? g.reason : 'blocked';
+            // Scoreboard: live loops stop for a while if their recent real sends lost money.
+            return robinhoodSender.live ? scoreboard.pausedWhy('loop') : null;
+      },
       deadline: () => robinhoodSender.deadlineBlock(),
       ready: () => (liveChecks.ok ? null : 'live checks not passed'),
       // L2 part of the sender's limit (the L1 part is added on top by the sender).
@@ -1943,6 +1972,7 @@ const loopLive: LoopLiveSender | null = loopCfg.enabled && loopLiveCfg.enabled ?
             setTimeout(() => { void refreshOwnMoney(); }, 3_000);
             safetyGate.reservePending(hash, 2 * info.gasUsd);
             liveTracker.track(hash, { expectedProfitUsd: info.netUsd, label: info.label, sizeUsd: info.sizeUsd, funding, routeKey: routeKeyFor(info.kinds, info.funding.kind === 'flash') });
+            if (robinhoodSender.live) scoreboard.noteSend({ hash, path: 'loop', expectedUsd: info.netUsd, label: info.label });
       },
       log: (m) => console.log(m),
       alert: (html) => { void sendTelegramMessage(html).catch(() => undefined); },
@@ -2378,6 +2408,8 @@ const fireTrade = async (o: {
             if (liveRh) whyNotSent.chance();
             // Which check let a live follow-a-trade send through (fast check log timing).
             let checkFirstDecidedBy: 'trig_first' | 'local' | 'node' | null = null;
+            // Trigger-first decided: its confidence and assumptions (scoreboard).
+            let trigUsed: TrigOutcome | null = null;
             // Hard stop: never build a trade on an exchange that isn't cleared
             // for trading (config/robinhoodVenues.ts executionEnabled: false).
             const notLive = liveBlocker(o.buyPool, o.sellPool);
@@ -2398,6 +2430,13 @@ const fireTrade = async (o: {
             if (o.chain === 'robinhood' && robinhoodSender.live && o.source === 'trade') {
                   const why = liveBlocks.reason(o.buyPool.poolAddress, o.sellPool.poolAddress);
                   if (why) { block('pool pair blocked for live (failed real check or live trade, 6 h)'); return; }
+            }
+            // STANDING GAPS keep ignoring the 6 h block above (design: each is sent
+            // right after its own fresh real check), but a pair whose standing-gap
+            // live trade failed on chain waits GAP_LIVE_FAIL_BLOCK_MIN (30 min).
+            if (o.chain === 'robinhood' && robinhoodSender.live && o.source === 'gap' && gapFailBlocks.reason(o.buyPool.poolAddress, o.sellPool.poolAddress)) {
+                  block(`standing gap: live trade failed on this pair (${GAP_LIVE_FAIL_BLOCK_MIN} min)`);
+                  return;
             }
             // Pool pairs whose practice checks keep losing (benched 6 h) aren't
             // sent either: a trade the checks say never pays would only burn gas.
@@ -2470,8 +2509,13 @@ const fireTrade = async (o: {
                         // 0. Trigger-first decides only in "on" mode while the fast check is ON.
                         trigFirst: tf && tp && tbuilt && tf.decides() ? async () => {
                               const out = await tp;
+                              // Best effort: only answers at TRIG_FIRST_MIN_CONFIDENCE or better
+                              // decide, and only while the scoreboard hasn't paused their bucket;
+                              // otherwise the existing path decides, unchanged.
+                              const held = out.sure ? (tf.sendGate(out) ?? scoreboard.pausedWhy('trig_first', out.confidence as ScoreConfidence | undefined, out.assumptions)) : null;
+                              if (held) { console.log(`[trigger-first] ${label0}: sure answer (${out.verdict}, ${out.confidence}${out.assumptions?.length ? `: ${out.assumptions.join(', ')}` : ''}) not used: ${held}; the existing path decides`); return null; }
                               const tc = trigToCheck(out, tbuilt, o.tokenIn, o.usdPerTokenIn);
-                              if (tc) tf.noteDecided(o.triggerHash);
+                              if (tc) { tf.noteDecided(o.triggerHash); trigUsed = out; }
                               return tc;
                         } : null,
                         hasBuilt: !!built,
@@ -2621,6 +2665,18 @@ const fireTrade = async (o: {
                   fireStats.blocked.set('no executor deployed', (fireStats.blocked.get('no executor deployed') ?? 0) + 1);
                   return;
             }
+            // SCOREBOARD: which path is sending, and is its bucket paused (its
+            // recent real sends lost money)? Live only.
+            const sendPath: SendPath = o.source === 'gap' ? 'gap'
+                  : checkFirstDecidedBy === 'trig_first' ? 'trig_first'
+                  : checkFirstDecidedBy === 'local' ? 'copy2'
+                  : checkFirstDecidedBy === 'node' ? 'node' : 'guess';
+            const trigConf = sendPath === 'trig_first' ? (trigUsed as TrigOutcome | null)?.confidence as ScoreConfidence | undefined : undefined;
+            const trigAssumed = sendPath === 'trig_first' ? (trigUsed as TrigOutcome | null)?.assumptions : undefined;
+            if (robinhoodSender.live) {
+                  const paused = scoreboard.pausedWhy(sendPath, trigConf, trigAssumed);
+                  if (paused) { block(`scoreboard: ${sendPath} paused (its recent real sends lost money)`); console.log(`[scoreboard] not sent (${sendPath}): ${paused}`); return; }
+            }
             o.trace?.mark('checks');
             const fired = await robinhoodSender.fire(dry.to ?? '0x0000000000000000000000000000000000000000', dry.data);
             markStretch('fire result'); // stall finder: handling the sender's answer
@@ -2657,6 +2713,7 @@ const fireTrade = async (o: {
                   livePools.set(fired.txHash, [o.buyPool.poolAddress, o.sellPool.poolAddress]);
                   if (livePools.size > 500) livePools.delete(livePools.keys().next().value as string);
                   liveTracker.track(fired.txHash, { expectedProfitUsd: netProfitUsd, label: tradeLabel, sizeUsd: o.tradeSizeUsd, funding, routeKey: routeKeyFor(dry.hops.map((h) => h.kind), dry.funding === 'v3-flash') });
+                  if (fired.live) scoreboard.noteSend({ hash: fired.txHash, path: sendPath, confidence: trigConf, assumptions: trigAssumed, expectedUsd: netProfitUsd, label: tradeLabel, pools: [o.buyPool.poolAddress, o.sellPool.poolAddress] });
             }
             console.log(`[fire] robinhood ${fired.live ? 'LIVE' : 'DRY RUN'} (${o.source}) ready ${readyMs}ms after ${o.source === 'trade' ? 'the trigger' : 'the price update'} (sign ${fired.signMs.toFixed(1)}ms)` +
                   `${fired.txHash ? ` tx ${fired.txHash}` : ''}${fired.error ? ` error: ${fired.error}` : ''}`);
@@ -2815,6 +2872,10 @@ try {
       if (localSim && tfs.mode !== 'off') {
             const host = localSim;
             trigFirst = new TriggerFirst({ client: host.client, settings: tfs, copy2: () => host.copy2, shadowLog: host.shadowLog, hostOn: () => host.isOn() });
+            // A scoreboard step back still running from before a restart.
+            const sb = scoreboard.stepBackActiveUntil();
+            if (sb) trigFirst.stepBack(sb, 'scoreboard step back from before the restart');
+            console.log(`[trigger-first] best effort: ${tfs.strict ? 'STRICT (no assumptions)' : `assumptions allowed: ${tfs.assume.join(', ') || 'none'}`}; lowest confidence that may send (on): ${tfs.minConfidence}`);
       }
 } catch (e) { console.log(`[trigger-first] could not start (${(e as Error).message}); the existing paths decide`); trigFirst = null; }
 if (chainOn('robinhood')) {
@@ -4635,8 +4696,16 @@ for (let i = 0; i < resolved.length; i++) {
                         try { fastLine = localSim?.takeHourLine() ?? null; } catch { /* reporting only */ }
                         // Trigger-first hour line (also logged as "[trigger-first] hour: ...").
                         try { const tl = trigFirst?.takeHourLine() ?? null; if (tl) fastLine = fastLine ? `${fastLine}\n${tl}` : tl; } catch { /* reporting only */ }
-                        // Added only if the message stays under Telegram's 4,096-character limit.
-                        const withFast = (text: string) => { const t = fastLine ? `${text}\n⚡ ${escHtml(fastLine)}` : text; return t.length <= 4096 ? t : text; };
+                        // SCOREBOARD (real money by path / confidence, today, paused buckets).
+                        let scoreLine: string | null = null;
+                        try { scoreLine = scoreboard.hourText(fromMs, now); } catch { /* reporting only */ }
+                        // Added only if the message stays under Telegram's 4,096-character
+                        // limit (the scoreboard first, then the fast-check lines).
+                        const withFast = (text: string) => {
+                              const sc = scoreLine ? `${text}\n📊 ${escHtml(scoreLine)}` : text;
+                              const t = fastLine ? `${sc}\n⚡ ${escHtml(fastLine)}` : sc;
+                              return t.length <= 4096 ? t : sc.length <= 4096 ? sc : text;
+                        };
                         // 4-hour totals: this collection's numbers, copied once, with the
                         // same money the hourly shows (reporting only, never throws).
                         if (fourHour) report4h(() => fourHour.addHour({ ...hourSampleFrom(hourInput, fromMs, now, stats.seen, stageHour.summary, stallHour), money: hourMoneyOf(moneySnap) }));
