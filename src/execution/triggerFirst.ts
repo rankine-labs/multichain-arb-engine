@@ -224,7 +224,13 @@ export type TrigQuestion = {
 // them: its answers are exact (high).
 export type TrigInfo = { snapBlock?: number; included?: boolean; triggerOk?: boolean | null; msgs?: number; txs?: number; later?: number; lastSeq?: number; reverted?: number; conf?: TrigConfidence; assumed?: string[]; skipped?: number };
 
+// Entry point size ladder (execution/trigEntry.ts): our trade tried at
+// other sizes on the SAME feed replay, in the same request (sidecar
+// proto_types.rs WireSizes). One row per extra size.
+export type TrigLadderRow = { amount: bigint; status: 'profit' | 'loss' | 'fail' | 'unknown'; profit: bigint };
+
 export type TrigOutcome = {
+  ladder?: TrigLadderRow[];             // entry point: the other sizes' results (sure answers only)
   sure: boolean;                        // a real profit / loss / fail verdict
   verdict: Verdict;
   sim: SimResult;
@@ -259,6 +265,21 @@ function unknownWhy(r: SimResult): string {
     return r.status === 'fail' ? 'no_clear_reason' : r.status;
   }
   return r.status;
+}
+
+// The sidecar's size ladder rows -> TrigLadderRow (bad rows left out).
+function readLadder(v: unknown): TrigLadderRow[] | undefined {
+  if (!Array.isArray(v)) return undefined;
+  const out: TrigLadderRow[] = [];
+  for (const r of v) {
+    try {
+      const st = (r as { status?: unknown }).status;
+      if (st !== 'profit' && st !== 'loss' && st !== 'fail' && st !== 'unknown') continue;
+      const p = (r as { profit?: unknown }).profit;
+      out.push({ amount: BigInt((r as { amount: string }).amount), status: st, profit: typeof p === 'string' ? BigInt(p) : 0n });
+    } catch { /* a bad row is skipped */ }
+  }
+  return out;
 }
 
 // The promise's answer, or null if it takes longer than ms.
@@ -474,21 +495,21 @@ export class TriggerFirst {
     return out;
   }
 
-  private async ask(q: TrigQuestion, requestMs: number, unknown: (why: string, extra?: Partial<TrigOutcome>) => TrigOutcome): Promise<TrigOutcome> {
+  // The `feed` part of a trigger-first question for this trigger (the
+  // ordered feed messages around it), or why it can't be asked. Shared by
+  // the checks here and the ENTRY POINT's "which pools does it move?"
+  // question (execution/trigEntry.ts). No node, no waiting.
+  buildFeed(hash: string, keys: Array<string | undefined | null>): { feed: Record<string, unknown>; seq: number } | { why: string; seq?: number } {
     const s = this.settings;
-    if (s.mode === 'off') return unknown('off');
-    if (!this.client.isConnected()) return unknown('disconnected');
     const c2 = this.o.copy2();
-    if (!c2 || !c2.running()) return unknown('copy2_not_running');
-    const nr = c2.notReadyWhy(q.keys);
-    if (nr) return unknown(`copy2_${nr.replace(/[^a-z0-9]+/gi, '_').toLowerCase()}`.slice(0, 40));
-    const hash = (q.triggerHash ?? '').toLowerCase();
-    const seq = this.buffer.seqOf(hash);
-    if (seq === undefined) return unknown('trigger_not_in_buffer');
+    if (!c2 || !c2.running()) return { why: 'copy2_not_running' };
+    const h = (hash ?? '').toLowerCase();
+    const seq = this.buffer.seqOf(h);
+    if (seq === undefined) return { why: 'trigger_not_in_buffer' };
     // Copy 2 saw the trigger's pool reports in a block: it must be the
     // block its feed sequence number says (else the two can't be lined up).
-    const seenBlock = c2.forwarder.txBlockOf(hash);
-    if (seenBlock !== null && seenBlock !== seq + s.l2Offset) { this.hour.alignMismatch++; return unknown('alignment', { triggerSeq: seq }); }
+    const seenBlock = c2.forwarder.txBlockOf(h);
+    if (seenBlock !== null && seenBlock !== seq + s.l2Offset) { this.hour.alignMismatch++; return { why: 'alignment', seq }; }
     // Which messages to send: from a little before the copy's newest block
     // (or the trigger, if older) up to the newest message we hold. The
     // fast check uses only those after its own version, and says
@@ -498,29 +519,72 @@ export class TriggerFirst {
     const c2Seq = c2Block >= 0 ? c2Block - s.l2Offset : seq;
     let from = Math.min(seq, c2Seq) - s.backMsgs;
     from = Math.max(from, newest - s.maxMsgs + 1);
-    if (from > seq) return unknown('trigger_too_old', { triggerSeq: seq });
+    if (from > seq) return { why: 'trigger_too_old', seq };
     const msgs = this.buffer.range(from, newest);
     const feed = {
-      trigger: hash, triggerSeq: seq,
+      trigger: h, triggerSeq: seq,
       msgs: msgs.map((m) => ({ seq: m.seq, ts: m.ts, l1: m.l1, txs: m.txs.map((t) => t.raw), complete: m.complete, ...(m.why ? { why: m.why } : {}) })),
       // Best effort: our route (which feed transactions could matter) and
       // which assumptions are allowed (strict = none at all).
-      route: q.keys.filter((k): k is string => typeof k === 'string' && /^0x[0-9a-fA-F]{40}([0-9a-fA-F]{24})?$/.test(k)).map((k) => k.toLowerCase()),
+      route: keys.filter((k): k is string => typeof k === 'string' && /^0x[0-9a-fA-F]{40}([0-9a-fA-F]{24})?$/.test(k)).map((k) => k.toLowerCase()),
       strict: s.strict,
       assume: s.strict ? [] : s.assume,
     };
+    return { feed, seq };
+  }
+
+  // ENTRY POINT (execution/trigEntry.ts): the same check as check(), NOT
+  // counted or logged here (the entry point keeps its own numbers and log
+  // line, so many candidate trades on one trigger don't overwrite this
+  // file's per-trigger record). `sizes`: other trade amounts to try on the
+  // same replay (size ladder), answered in `ladder`.
+  async askOnly(q: TrigQuestion, sizes?: bigint[]): Promise<TrigOutcome> {
+    const requestMs = this.now();
+    const unknown = (why: string, extra: Partial<TrigOutcome> = {}): TrigOutcome => ({
+      sure: false, verdict: 'unknown', why, requestMs, answerMs: this.now(), seenMs: q.seenMs,
+      sim: { status: 'fail', reason: localUnknownMessage(why), bucket: 'replay_unavailable' }, ...extra,
+    });
+    try { return await this.ask(q, requestMs, unknown, sizes); } catch { return unknown('client_error'); }
+  }
+
+  // ENTRY POINT: the later same-block re-check of one answer (the same one
+  // check() runs for its own triggers, same hourly budget). Fields as in
+  // the trig_first line: agree / agV / same / agSkip, rblk, rAfterMs.
+  async agreeLater(q: TrigQuestion, out: TrigOutcome): Promise<{ agree?: boolean; agV?: Verdict; same?: boolean; agSkip?: string; rblk?: number; rAfterMs?: number }> {
+    const rec: TrigRecord = { hash: q.triggerHash.toLowerCase(), label: q.label, out, written: false };
+    if (this.settings.mode === 'off' || !this.client.isConnected()) return { agSkip: 'off or disconnected' };
+    await this.afterReports(q, rec);
+    return { agree: rec.agree, agV: rec.agreeVerdict, same: rec.sameState, agSkip: rec.agreeSkipped, rblk: rec.reportBlock ?? undefined, rAfterMs: rec.reportMs !== undefined ? rec.reportMs - out.answerMs : undefined };
+  }
+
+  private async ask(q: TrigQuestion, requestMs: number, unknown: (why: string, extra?: Partial<TrigOutcome>) => TrigOutcome, sizes?: bigint[]): Promise<TrigOutcome> {
+    const s = this.settings;
+    if (s.mode === 'off') return unknown('off');
+    if (!this.client.isConnected()) return unknown('disconnected');
+    const c2 = this.o.copy2();
+    if (!c2 || !c2.running()) return unknown('copy2_not_running');
+    const nr = c2.notReadyWhy(q.keys);
+    if (nr) return unknown(`copy2_${nr.replace(/[^a-z0-9]+/gi, '_').toLowerCase()}`.slice(0, 40));
+    const built = this.buildFeed(q.triggerHash, q.keys);
+    if ('why' in built) return unknown(built.why, built.seq !== undefined ? { triggerSeq: built.seq } : {});
+    const { feed, seq } = built;
+    // Size ladder (entry point): amountIn is the 4th 32-byte word after the
+    // 4-byte code of both executor calls (localSimHost.ts sizeSearch).
+    const ladderReq = sizes?.length ? { sizes: { amountOffset: 96, amounts: sizes.slice(0, 8).map((a) => '0x' + a.toString(16)) } } : {};
+    let ladder: TrigLadderRow[] | undefined;
     let info: TrigInfo | undefined;
     let missing: WarmItem[] = [];
     let insideMs: number | undefined;
     const rpc = makeLocalRpc(this.client, undefined, {
       timeoutMs: s.timeoutMs,
       at: { after: 'head' },
-      extra: { feed },
+      extra: { feed, ...ladderReq },
       onReply: (_m: string, a: SidecarAnswer, sent: Record<string, unknown>) => {
         const call = (sent.calls as Array<{ to?: string }> | undefined)?.[0];
         if (call?.to?.toLowerCase() !== SIM_EXECUTOR_ADDRESS) return;
         if (typeof a.us === 'number') insideMs = Math.round(a.us / 100) / 10;
         if (a.ok === true) info = (a as { trig?: TrigInfo }).trig;
+        if (a.ok === true) ladder = readLadder((a as { sizes?: unknown }).sizes);
         else missing = Array.isArray((a as { missing?: unknown[] }).missing) ? ((a as { missing?: WarmItem[] }).missing ?? []) : [];
       },
     });
@@ -533,7 +597,7 @@ export class TriggerFirst {
     const ti = info as TrigInfo | undefined;
     const confidence: TrigConfidence = ti?.conf === 'medium' || ti?.conf === 'low' ? ti.conf : 'high';
     const assumptions = Array.isArray(ti?.assumed) ? ti!.assumed!.filter((x) => typeof x === 'string').slice(0, 8) : [];
-    return { sure: true, sim, verdict, requestMs, answerMs: this.now(), seenMs: q.seenMs, triggerSeq: seq, info, insideMs, confidence, assumptions };
+    return { sure: true, sim, verdict, requestMs, answerMs: this.now(), seenMs: q.seenMs, triggerSeq: seq, info, insideMs, confidence, assumptions, ...(ladder ? { ladder } : {}) };
   }
 
   // ---- what happened next (for the log) -------------------------------------

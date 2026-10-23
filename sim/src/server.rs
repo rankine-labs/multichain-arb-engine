@@ -250,6 +250,7 @@ pub fn handle_tm(ctx: &Ctx, req: &Value, tm: &mut Tm) -> Value {
             tm.prep_us = t0.elapsed().as_micros() as u64;
             check(ctx, &id, &r.at, t0, tm, |view, c| handle_size_search(view, c, &r))
         }
+        Some("trig_discover") => trig_discover(ctx, &id, req, t0, tm),
         Some(t) => bad_request(&id, &format!("unknown request type '{t}'")),
         None => bad_request(&id, "request has no type"),
     }
@@ -407,6 +408,113 @@ fn trig_inner(ctx: &Ctx, id: &Value, r: &CallRequest, feed_v: &Value, t0: Instan
     let (strict, assume) = trig_assume(trig_trust(), &feed, |keys| ctx.copy2.as_ref().and_then(|c| c.route_for(keys)));
     let run = |view: &dyn StateRead, _c: &BlockCtx| crate::check::proto_types::handle_trig_call_with(view, &plan, &info, r, prov.as_ref(), strict, &assume);
     after_pick(ctx, picked, t0, tm, &run, false)
+}
+
+/// TRIGGER-FIRST ENTRY POINT: `{"type":"trig_discover", "at":{"after":"head"},
+/// "feed":{...same as a trigger-first call...}}`.
+/// Plain English: "which of the pools you follow does this new feed
+/// transaction move?" The trigger ALONE is run (check/ordered.rs
+/// trigger_only, same replay rules and best-effort assumptions as every
+/// trigger-first check, no node calls: a miss is "unknown") on the newest
+/// copy version, and the storage it changed is matched against the pools
+/// copy 2 follows. Answer: {"ok":true, "pools":[keys], "conf", "assumed",
+/// "triggerOk", "snapBlock", "changed": n}. A trigger already in the copy
+/// version answers unknown "already_in_copy" (its effect is already there,
+/// we can't see it any more). Nothing is queued for fetching here.
+fn trig_discover(ctx: &Ctx, id: &Value, req: &Value, t0: Instant, tm: &mut Tm) -> Value {
+    let mut a = trig_discover_inner(ctx, id, req, t0, tm);
+    let used = tm.prep_us + tm.resolve_us + tm.facts_us + tm.runs_us.iter().sum::<u64>();
+    tm.post_us = (t0.elapsed().as_micros() as u64).saturating_sub(used);
+    a["t"] = tm.json();
+    a
+}
+
+fn trig_discover_inner(ctx: &Ctx, id: &Value, req: &Value, t0: Instant, tm: &mut Tm) -> Value {
+    let sh = &ctx.shared;
+    let Some(c2) = &ctx.copy2 else { return bad_request(id, "trig_discover needs ARBSIM_SOURCE=pool-events (copy 2)") };
+    let feed: crate::check::ordered::WireFeed = match req.get("feed").map(|f| serde_json::from_value(f.clone())) {
+        Some(Ok(f)) => f,
+        Some(Err(e)) => return bad_request(id, &format!("feed: {e}")),
+        None => return bad_request(id, "trig_discover needs feed"),
+    };
+    let at = match parse_at(req.get("at").unwrap_or(&Value::Null)) {
+        Ok(a) => a,
+        Err(e) => return bad_request(id, &e),
+    };
+    if matches!(at, At::Pinned { .. }) {
+        return bad_request(id, "feed checks run on the live copy, not on pinned blocks");
+    }
+    Stats::inc(&sh.stats.checks);
+    tm.prep_us = t0.elapsed().as_micros() as u64;
+    let t_res = Instant::now();
+    let resolved = sh.resolve(&at);
+    tm.resolve_us = t_res.elapsed().as_micros() as u64;
+    let picked = match resolved {
+        Ok(p) => p,
+        Err(e) => {
+            Stats::inc(&sh.stats.checks_unknown);
+            return unknown(id, e.reason, &e.detail, t0.elapsed().as_micros() as u64);
+        }
+    };
+    let (plan, info) = match crate::check::ordered::build_plan(&feed, picked.seq, sh.cfg.l2_offset, &picked.ctx) {
+        Ok(x) => x,
+        Err(u) => {
+            Stats::inc(&sh.stats.checks_unknown);
+            return crate::check::proto_types::unknown_json(id, &u, t0.elapsed().as_micros());
+        }
+    };
+    let Some((alone, others)) = crate::check::ordered::trigger_only(&plan) else {
+        Stats::inc(&sh.stats.checks_unknown);
+        return json!({ "id": id, "ok": false, "unknown": "already_in_copy", "detail": "the copy version already holds the trigger", "us": t0.elapsed().as_micros() as u64 });
+    };
+    let block = picked.seq + sh.cfg.l2_offset;
+    let prov = c2.provenance_at(block, &[]);
+    // Same assumptions as a trigger-first check (no skipping: only the
+    // trigger runs, and the trigger is never skipped).
+    let (strict, assume) = trig_assume(trig_trust(), &feed, |_| None);
+    let snap_block = info.snap_block;
+    let run = |view: &dyn StateRead, _c: &BlockCtx| -> Value {
+        match crate::check::ordered::run_ordered_with(view, &alone, &crate::check::Overrides::none(), &[], &prov, strict, &assume) {
+            Ok(out) => {
+                let mut labels = out.assumed.labels();
+                let mut conf = out.assumed.confidence();
+                if others > 0 {
+                    labels.push(format!("alone:{others}"));
+                    if conf == "high" {
+                        conf = "medium";
+                    }
+                }
+                json!({
+                    "id": id, "ok": true,
+                    "changed": out.changed.iter().map(|(a, s)| json!([format!("{a:#x}"), format!("{s:#x}")])).collect::<Vec<_>>(),
+                    "triggerOk": out.replayed.first().map(|r| r.outcome.success),
+                    "conf": conf, "assumed": labels, "snapBlock": snap_block,
+                })
+            }
+            Err(u) => crate::check::proto_types::unknown_json(id, &u, 0),
+        }
+    };
+    let mut a = after_pick(ctx, picked, t0, tm, &run, false);
+    // The changed storage -> the pools copy 2 follows (keys as the bot names them).
+    if a.get("ok") == Some(&Value::Bool(true)) {
+        let changed: Vec<(revm::primitives::Address, revm::primitives::U256)> = a
+            .get("changed")
+            .and_then(|c| c.as_array())
+            .map(|l| {
+                l.iter()
+                    .filter_map(|p| {
+                        let ad = crate::check::hexutil::parse_address(p.get(0)?.as_str()?).ok()?;
+                        let sl = crate::check::hexutil::parse_u256(p.get(1)?.as_str()?).ok()?;
+                        Some((ad, sl))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        a["pools"] = json!(c2.pools_changed(&changed));
+        a["changed"] = json!(changed.len());
+    }
+    a["us"] = json!(t0.elapsed().as_micros() as u64);
+    a
 }
 
 /// How much a trigger-first check may assume (ARBSIM_TRIG_CALL_TRUST).

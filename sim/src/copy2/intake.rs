@@ -852,6 +852,37 @@ impl Copy2Handle {
     /// ids). For each pool: its contract and owned accounts (or, V4, its
     /// data inside the PoolManager), its coin balances, its coin pair.
     /// None = a key isn't a pool copy 2 follows (then nothing is skipped).
+    /// Trigger-first ENTRY POINT (server.rs trig_discover): which pools copy 2
+    /// follows had a value in `changed` (storage the trigger changed). Keys
+    /// as the bot names pools: a V4 pool's id, else the pool contract
+    /// address (lowercase hex). A pool counts when one of the values it
+    /// follows changed (its contract / owned accounts' slots, or, V4, its
+    /// data inside the PoolManager) or, not V4, any slot of its contract.
+    /// Coin balance changes alone (a transfer into a pool) don't count.
+    pub fn pools_changed(&self, changed: &[(Address, U256)]) -> Vec<String> {
+        if changed.is_empty() {
+            return Vec::new();
+        }
+        let reg = self.c2.reg.read().unwrap_or_else(|e| e.into_inner());
+        let accts: HashSet<Address> = changed.iter().map(|(a, _)| *a).collect();
+        let mut out: Vec<String> = Vec::new();
+        for (pk, e) in reg.pools.iter() {
+            let hit = match pk.1 {
+                Some(_) => changed.iter().any(|x| e.items.contains(x)),
+                None => accts.contains(&e.pool.address) || changed.iter().any(|x| e.items.contains(x)),
+            };
+            if hit {
+                out.push(match pk.1 {
+                    Some(id) => format!("{id:#x}"),
+                    None => format!("{:#x}", e.pool.address),
+                });
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
     pub fn route_for(&self, keys: &[String]) -> Option<crate::check::ordered::Route> {
         let reg = self.c2.reg.read().unwrap_or_else(|e| e.into_inner());
         let mut r = crate::check::ordered::Route::default();

@@ -2312,6 +2312,11 @@ fn hexb(b: &[u8]) -> String {
 /// Copy 2 following the V2 pool (with a real getReserves-like getter that
 /// returns slot 8), plus a server context for `server::handle`.
 fn trig_world() -> (Rig, arbsim::server::Ctx) {
+    trig_world_code(vec![0x60, 0x08, 0x54, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3])
+}
+
+/// trig_world with the V2 pool's code given.
+fn trig_world_code(pool_code: Vec<u8>) -> (Rig, arbsim::server::Ctx) {
     let chain = Arc::new(FakeChain::new());
     // Plus an outside contract (think: a router's settings) holding 42 in
     // slot 5, returning the slot named by its call data: copy 2 never
@@ -2319,7 +2324,7 @@ fn trig_world() -> (Rig, arbsim::server::Ctx) {
     let mut g = genesis();
     g.entry(a(OUTSIDE)).or_default().insert(u(5), u(42));
     chain.set(100, g);
-    chain.codes.lock().unwrap().insert(a(V2P), vec![0x60, 0x08, 0x54, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3]);
+    chain.codes.lock().unwrap().insert(a(V2P), pool_code);
     chain.codes.lock().unwrap().insert(a(OUTSIDE), vec![0x60, 0x00, 0x35, 0x54, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3]);
     let node: Arc<dyn NodeApi> = chain.clone();
     let sh = Shared::new(Config::for_tests(), Some(node), Arc::new(Volatile::default()));
@@ -2510,4 +2515,42 @@ fn trigger_first_trust_setting_and_the_bots_flags() {
 
 fn hex_word(n: u64) -> Vec<u8> {
     u(n as u128).to_be_bytes::<32>().to_vec()
+}
+
+// TRIGGER-FIRST ENTRY POINT (server.rs trig_discover): "which pools copy 2
+// follows does this feed transaction move?", answered from the trigger
+// alone, no node.
+#[test]
+fn trig_discover_names_the_followed_pool_a_feed_tx_moves() {
+    // The V2 pool: 4-byte call = getter (slot 8); 32-byte call = "swap" (writes slot 8).
+    let code = vec![0x36, 0x60, 0x20, 0x14, 0x60, 0x12, 0x57, 0x60, 0x08, 0x54, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3, 0x5b, 0x60, 0x00, 0x35, 0x60, 0x08, 0x55, 0x00];
+    let (mut r, ctx) = trig_world_code(code);
+    let disc = |trig: &[u8], seq: u64| {
+        arbsim::server::handle(&ctx, &json!({"id": 11, "type": "trig_discover", "at": {"after": "head"},
+            "feed": {"trigger": hexb(keccak256(trig).as_slice()), "triggerSeq": seq, "msgs": [{"seq": seq, "ts": 63, "l1": 9000, "txs": [hexb(trig)]}]}}))
+    };
+    // 1. A "swap" on the followed pool: named.
+    let mut word = vec![0u8; 32];
+    word[31] = 9;
+    let swap = signed(0, a(V2P), word);
+    let ans = disc(&swap, 102);
+    assert_eq!(ans["ok"], json!(true), "{ans}");
+    assert_eq!(ans["pools"], json!([format!("{:#x}", a(V2P))]), "{ans}");
+    assert_eq!((ans["triggerOk"].clone(), ans["snapBlock"].clone()), (json!(true), json!(101)), "{ans}");
+    // 2. Only reading the pool: nothing moved, no pools.
+    let read = signed(0, a(V2P), vec![0x09, 0x02, 0xf1, 0xac]);
+    let ans = disc(&read, 102);
+    assert_eq!(ans["ok"], json!(true), "{ans}");
+    assert_eq!(ans["pools"], json!([]), "{ans}");
+    // 3. Already in the copy version: unknown already_in_copy.
+    let ans = disc(&swap, 101);
+    assert_eq!(ans["unknown"], json!("already_in_copy"), "{ans}");
+    // 4. Needs state we don't hold: unknown, and nothing goes to the node.
+    let t2 = signed(0, a(0x77), vec![1]);
+    let before = *r.chain.calls.lock().unwrap() + *r.chain.paid_calls.lock().unwrap();
+    let ans = disc(&t2, 102);
+    assert_eq!(ans["ok"], json!(false), "{ans}");
+    r.settle();
+    let after = *r.chain.calls.lock().unwrap() + *r.chain.paid_calls.lock().unwrap();
+    assert_eq!(before, after, "discover never reads the node");
 }

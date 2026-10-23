@@ -760,3 +760,87 @@ fn route_names_rule() {
     assert!(!r.named_by(None, &[[0u8; 40].as_slice(), addr(0x3003).as_slice()].concat()), "an ETH pair (zero address) is left out");
     assert!(!r.named_by(Some(addr(0x77)), &w(1)), "unrelated");
 }
+
+// ---------------------------------------------------------------------------
+// TRIGGER-FIRST ENTRY POINT (Oct 23): "which of our pools does this feed
+// transaction move?" (ordered.rs trigger_only + OrderedOut.changed) and the
+// size ladder on the replayed feed (proto_types.rs WireSizes).
+// ---------------------------------------------------------------------------
+use arbsim::check::ordered::trigger_only;
+use arbsim::check::proto_types::{handle_trig_call_with, CallRequest, WireSizes};
+
+fn discover(view: &MemState, f: &WireFeed, snap_seq: u64) -> Option<(OrderedOut, usize)> {
+    let mut b = base();
+    b.l2_block_number = Some(snap_seq);
+    let (plan, _) = build_plan(f, snap_seq, 0, &b).unwrap();
+    let (alone, others) = trigger_only(&plan)?;
+    Some((run_ordered_with(view, &alone, &Overrides::none(), &[], &AllExact, true, &best()).unwrap(), others))
+}
+
+#[test]
+fn entry_discover_a_swap_on_our_pool_shows_the_pool_changed() {
+    let trig = stx(&KEY_A, 0, pool(), w(5));
+    let (out, others) = discover(&copy(), &feed(&trig, 11, vec![msg(11, &[trig.clone()])]), 10).expect("runs");
+    assert_eq!(others, 0);
+    assert_eq!(out.changed, vec![(pool(), U256::ZERO)], "the pool's price slot changed");
+    assert!(out.results.is_empty(), "no calls of ours in a discover run");
+}
+
+#[test]
+fn entry_discover_a_tx_that_does_not_touch_our_pool_changes_only_other_state() {
+    let trig = stx(&KEY_A, 0, dep(), w(7));
+    let (out, _) = discover(&copy(), &feed(&trig, 11, vec![msg(11, &[trig.clone()])]), 10).expect("runs");
+    assert_eq!(out.changed, vec![(dep(), U256::ZERO)]);
+    assert!(!out.changed.iter().any(|(a, _)| *a == pool()), "our pool untouched");
+    // A reverted trigger leaves nothing changed.
+    let trig = stx(&KEY_A, 0, router_revert(), w(5));
+    let (out, _) = discover(&copy(), &feed(&trig, 11, vec![msg(11, &[trig.clone()])]), 10).expect("runs");
+    assert!(out.changed.is_empty(), "{:?}", out.changed);
+}
+
+#[test]
+fn entry_discover_runs_the_trigger_alone_and_counts_the_others() {
+    // Someone sets DEP before the trigger: left out of the discover run (counted).
+    let set = stx(&KEY_B, 0, dep(), w(3));
+    let trig = stx(&KEY_A, 0, router(), w(5));
+    let (out, others) = discover(&copy(), &feed(&trig, 12, vec![msg(11, &[set.clone()]), msg(12, &[trig.clone()])]), 10).expect("runs");
+    assert_eq!(others, 1);
+    assert_eq!(out.replayed.len(), 1, "only the trigger ran");
+    assert!(out.changed.contains(&(pool(), U256::ZERO)));
+    // Already in the copy version: nothing to run.
+    assert!(discover(&copy(), &feed(&trig, 10, vec![msg(10, &[trig.clone()])]), 10).is_none());
+}
+
+#[test]
+fn entry_size_ladder_runs_each_size_on_the_same_replay() {
+    let trig = stx(&KEY_A, 0, pool(), w(5));
+    let f = feed(&trig, 11, vec![msg(11, &[trig.clone()])]);
+    let mut b = base();
+    b.l2_block_number = Some(10);
+    let (plan, info) = build_plan(&f, 10, 0, &b).unwrap();
+    let c = our_trade();
+    let mk = |sizes: Option<WireSizes>| CallRequest {
+        id: json!(1),
+        calls: vec![serde_json::from_value(json!({ "from": format!("{:#x}", c.from), "to": format!("{:#x}", pool()), "data": hexs(&c.data), "gas": "0xf4240" })).unwrap()],
+        sizes,
+        ..CallRequest::default()
+    };
+    let a = handle_trig_call_with(&copy(), &plan, &info, &mk(Some(WireSizes { amount_offset: 0, amounts: vec!["0x2".into(), "0x3".into()] })), &AllExact, true, &best());
+    assert_eq!(a["ok"], json!(true), "{a}");
+    let sizes = a["sizes"].as_array().expect("sizes");
+    assert_eq!(sizes.len(), 2);
+    assert_eq!(sizes[0]["amount"], json!("0x2"));
+    assert_eq!(sizes[1]["amount"], json!("0x3"));
+    // Each size saw the trigger applied exactly once (price 105), same as the main run.
+    for s in sizes {
+        assert_eq!(s["status"], json!("profit"));
+        assert_eq!(s["profit"], json!("0x69"));
+    }
+    // The amount word not where it should be (past the end): no ladder, the answer is unchanged.
+    let a = handle_trig_call_with(&copy(), &plan, &info, &mk(Some(WireSizes { amount_offset: 4096, amounts: vec!["0x2".into()] })), &AllExact, true, &best());
+    assert_eq!(a["ok"], json!(true));
+    assert!(a.get("sizes").is_none());
+    // No sizes asked: no `sizes` field (old answers unchanged).
+    let a = handle_trig_call_with(&copy(), &plan, &info, &mk(None), &AllExact, true, &best());
+    assert!(a.get("sizes").is_none());
+}
