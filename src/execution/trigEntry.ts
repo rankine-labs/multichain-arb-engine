@@ -382,6 +382,8 @@ function withDeadline<T>(p: Promise<T>, ms: number): Promise<T | null> {
   });
 }
 const yieldNow = (): Promise<void> => new Promise((r) => setImmediate(r));
+// The long-code list is tidied once it grows past this many (see compactCodes).
+const CODES_SOFT_MAX = 8;
 // Same things, one by one (===), same count.
 function sameItems(a: unknown[], b: unknown[]): boolean {
   if (a.length !== b.length) return false;
@@ -959,7 +961,7 @@ export class TrigEntry {
             cJson = c === null ? 'null' : JSON.stringify(c);
             if (reuseMs > 0 && r.inputs) {
               if (this.tblMemo.size > 20_000) this.tblMemo.clear(); // memory bound
-              // (codesEpoch read AFTER codeRefs: a code list reset during this route counts.)
+              // (Numbers only change in compactCodes, after the build: codesEpoch then moves on.)
               this.tblMemo.set(rid, { at: now, inputs: r.inputs.slice(), sameAs, codesEpoch: this.codesEpoch, c, cJson, sig: meta.sig, fallback: meta.fallback });
             } else this.tblMemo.delete(rid);
           }
@@ -1001,6 +1003,8 @@ export class TrigEntry {
       for (const [id, at] of [...T.retired]) if (now - at > 30_000) { T.retired.delete(id); T.meta.delete(id); }
       T.lastRoutes = routes;
       T.lastReused = reused;
+      // Long-code list tidy-up, once the whole table is built (see compactCodes).
+      if (T.codes.length > CODES_SOFT_MAX) this.compactCodes();
       if (!Object.keys(changed).length && !T.needFull) return T.ackGen >= 0;
       const full = T.needFull || T.ackGen < 0;
       const gen = T.gen + 1;
@@ -1026,7 +1030,7 @@ export class TrigEntry {
   // Reuse memory of the one-trip table (see refreshTable): route id ->
   // what its question was made of, and the question as written.
   private readonly tblMemo = new Map<string, { at: number; inputs: unknown[]; sameAs: string; codesEpoch: number; c: Record<string, unknown> | null; cJson: string; sig?: string; fallback?: boolean }>();
-  // Bumped whenever the long-code list is started over (codeRefs): questions
+  // Bumped whenever the long-code list is renumbered (compactCodes): questions
   // written before that point at old list positions and are never reused.
   private codesEpoch = 0;
   // The candidate's own facts that its question depends on (besides `inputs`).
@@ -1059,21 +1063,70 @@ export class TrigEntry {
   }
 
   // Long contract codes in the pretend state -> "$code:<n>" (sent once per
-  // table message in `codes`).
+  // table message in `codes`; the sidecar looks each row's codes up in the
+  // NEWEST list it was sent).
+  //
+  // BUG FIX (Oct 23): when a 9th different code turned up, the list used to
+  // be emptied right there, in the middle of a rebuild. Rows written earlier
+  // (in this rebuild, or kept from earlier ones) still said "$code:3" of the
+  // OLD list, so the sidecar would have run their checks with the wrong
+  // contract code (or none). Now a code's number never changes while any
+  // row may use it: new codes are only added during a rebuild, and the list
+  // is tidied (compactCodes) only after the whole table is built, with every
+  // held row renumbered at the same moment and a full table sent.
   private codeRefs(ov: Record<string, unknown>): Record<string, unknown> {
     const out: Record<string, unknown> = {};
     for (const [acct, v] of Object.entries(ov ?? {})) {
       const o = v as Record<string, unknown>;
       if (o && typeof o.code === 'string' && o.code.length > 200) {
         let i = this.tbl.codes.indexOf(o.code);
-        if (i < 0) {
-          if (this.tbl.codes.length >= 8) { this.tbl.codes = []; this.tbl.needFull = true; this.codesEpoch++; }
-          i = this.tbl.codes.push(o.code) - 1;
-        }
+        if (i < 0) i = this.tbl.codes.push(o.code) - 1;
         out[acct] = { ...o, code: `$code:${i}` };
       } else out[acct] = v;
     }
     return out;
+  }
+
+  // The list grew past CODES_SOFT_MAX: keep only the codes the current
+  // table's rows still use (in first-use order), renumber those rows (new
+  // row objects; questions remembered for reuse are not edited, they are
+  // simply not reused any more: codesEpoch), and send the whole table with
+  // the new list in one message. If every code is still in use, nothing
+  // changes (the list may then be longer than CODES_SOFT_MAX: correct first).
+  private compactCodes(): void {
+    const T = this.tbl;
+    const ref = (v: unknown): number | null => {
+      const m = typeof v === 'string' ? /^\$code:(\d+)$/.exec(v) : null;
+      return m ? Number(m[1]) : null;
+    };
+    const used = new Map<number, number>();   // old number -> new number
+    const keep: string[] = [];
+    for (const { rows } of T.pools.values()) {
+      for (const row of rows as Array<Record<string, any>>) {
+        for (const acct of Object.values((row?.c?.overrides ?? {}) as Record<string, any>)) {
+          const i = ref(acct?.code);
+          if (i !== null && !used.has(i) && i < T.codes.length) { used.set(i, keep.length); keep.push(T.codes[i]); }
+        }
+      }
+    }
+    if (keep.length === T.codes.length) return; // all still used: numbers stay
+    for (const [key, v] of T.pools) {
+      const rows = (v.rows as Array<Record<string, any>>).map((row) => {
+        const ov = row?.c?.overrides as Record<string, any> | undefined;
+        if (!ov) return row;
+        let touched = false;
+        const nov: Record<string, unknown> = {};
+        for (const [acct, o] of Object.entries(ov)) {
+          const i = ref(o?.code);
+          if (i !== null) { touched = true; nov[acct] = { ...o, code: used.has(i) ? `$code:${used.get(i)}` : o.code }; } else nov[acct] = o;
+        }
+        return touched ? { ...row, c: { ...row.c, overrides: nov } } : row;
+      });
+      T.pools.set(key, { ...v, rows });
+    }
+    T.codes = keep;
+    this.codesEpoch++;
+    T.needFull = true;
   }
 
   // ---- log line -----------------------------------------------------------------

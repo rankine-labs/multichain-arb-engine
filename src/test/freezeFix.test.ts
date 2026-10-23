@@ -188,7 +188,7 @@ function entryWith(u: ReturnType<typeof universe>, lazy: boolean, reuseMs: numbe
     isOurTx: () => false, ourAddresses: [], killed: () => false, safety: () => null, failBlocked: () => null, pausedWhy: () => null,
     send: async () => ({}), log: () => {}, lag: () => 0,
   });
-  return { te, tables };
+  return { te, tables, tf };
 }
 // The table as the sidecar holds it (ids left out: they are just labels).
 function heldTable(tables: Array<Record<string, any>>): string {
@@ -236,6 +236,66 @@ async function tableTests() {
   t = performance.now(); await O.te.refreshTable(); const oldMs = performance.now() - t;
   console.log(`[bench, TEST numbers] one-trip table rebuild, 150 pools / 600 routes, 10 pools moved: before ${oldMs.toFixed(0)} ms of work, now ${reuseMs.toFixed(0)} ms (${R.te.tableInfo().reused} routes reused)`);
   assert(reuseMs < oldMs / 3 && heldTable(R.tables) === heldTable(O.tables), 'rebuild is several times cheaper and the table is the same');
+}
+
+// ---- 4b. long-code list: never renumbered under rows that use it ----------------------------------
+// The sidecar's rule (sim/src/check/entry.rs apply_table / call_for): every
+// table message REPLACES its code list when the list is non-empty or the
+// table is full; each row's "$code:<n>" is looked up in the newest list.
+function sidecarCodesOk(tables: Array<Record<string, any>>, expected: (rid: string) => string): { rows: number; bad: number; codes: number } {
+  const pools: Record<string, any[]> = {};
+  let codes: string[] = [];
+  for (const t of tables) {
+    if (t.full) for (const k of Object.keys(pools)) delete pools[k];
+    if (t.full || (t.codes ?? []).length) codes = t.codes;
+    for (const [k, v] of Object.entries(t.pools as Record<string, any>)) { if (v === null) delete pools[k]; else pools[k] = v; }
+  }
+  let rows = 0, bad = 0;
+  for (const list of Object.values(pools)) for (const r of list) {
+    if (!r.c) continue;
+    rows++;
+    for (const acct of Object.values(r.c.overrides as Record<string, any>)) {
+      const m = /^\$code:(\d+)$/.exec(acct.code ?? '');
+      const code = m ? codes[Number(m[1])] : acct.code;
+      if (code !== expected(r.rid)) bad++;
+    }
+  }
+  return { rows, bad, codes: codes.length };
+}
+async function codeListTests() {
+  // 12 pools, each route's pretend state holds a contract code of its own pool
+  // (12 different long codes; the old builder emptied its list at the 9th).
+  const u = universe(12, 0);
+  const X = entryWith(u, true, 5_000);
+  let version = 0;
+  const peerAddr = '0x' + 'b2'.repeat(20);
+  const ownPool = (rid: string) => rid.split(':')[0].split('>').find((a) => a !== peerAddr)!;
+  const codeOf = (pool: string) => '0x' + (pool.slice(-4) + version.toString(16).padStart(2, '0')).repeat(60);
+  const ACCT = '0x' + '5c'.repeat(20);
+  // The real capture writes our check question down via the sidecar; here
+  // it is replaced by one that puts the route's own code in the pretend state.
+  (X.tf as any).capture = async (q: any) => {
+    const pool = q.trade.hops.map((h: any) => h.pool).find((a: string) => a !== peerAddr);
+    const data = '0x12345678' + q.trade.amountIn.toString(16).padStart(64, '0');
+    return { calls: [{ to: ACCT, data }], overrides: { [ACCT]: { code: codeOf(pool) } }, data };
+  };
+  const expected = (rid: string) => codeOf(ownPool(rid));
+  await X.te.refreshTable();
+  let r = sidecarCodesOk(X.tables, expected);
+  assert(r.rows === 48 && r.bad === 0, `12 different codes in one rebuild: every row's code resolves to its own contract (rows ${r.rows}, wrong ${r.bad}; the old builder got rows wrong here)`);
+  // Every code changes (e.g. a contract upgrade): the old 12 are no longer
+  // used, so the list is tidied after the build and the table re-sent whole.
+  version = 1;
+  (X.te as any).capCache.clear();
+  (X.te as any).tblMemo.clear();
+  for (let i = 0; i < 12; i++) u.bump(i);
+  await X.te.refreshTable();
+  r = sidecarCodesOk(X.tables, expected);
+  assert(r.bad === 0 && r.codes === 12 && X.tables[X.tables.length - 1].full === true, `codes replaced: unused ones dropped, rows renumbered, full table sent (codes held ${r.codes}, wrong ${r.bad})`);
+  // Nothing changed afterwards: the next rebuild keeps everything right.
+  await X.te.refreshTable();
+  r = sidecarCodesOk(X.tables, expected);
+  assert(r.bad === 0, 'next rebuild: still every row right');
 }
 
 // ---- 5. freeze profile ----------------------------------------------------------------------------
@@ -296,6 +356,7 @@ async function main() {
   await feedTests();
   await stallTests();
   await tableTests();
+  await codeListTests();
   await profileTests();
 }
 main().catch((e) => { console.error('FAIL: test crashed', e); process.exitCode = 1; });
