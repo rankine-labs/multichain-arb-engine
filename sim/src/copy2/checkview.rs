@@ -83,6 +83,14 @@
 //   held supply is <= one verify round old); else unknown. The width is
 //   remembered per coin and re-confirmed every check (2 runs).
 //
+//   copy2-t (live Oct 23 02:22: checks needing the full bound took 60-170
+//   ms, over the bot's 60 ms limit): pools off the check's route are walked
+//   only ARBSIM_COPY2_BOUND_WORDS (16) tick-map words from their price (a
+//   swap that stops there is still a swap the PoolManager must be able to
+//   pay: a proven lower bound; the route's own pools, which a drain needs,
+//   are walked whole), and each pool's figure is kept per copy version and
+//   shared by every check of that version (BoundCache).
+//
 //   Speed (live Oct 22 16:19, checks ~120 ms instead of ~5): the lower
 //   bound used to be the sum over EVERY ready V4 pool holding the coin
 //   (~320 stock / USDG pools), walking each pool's whole tick map, and every
@@ -292,7 +300,57 @@ pub struct C2View<'a> {
     coin_offsets: HashMap<Address, U256>,
     /// (PoolManager, coin) balances this run read (coin ZERO = ETH).
     read_coins: Mutex<Vec<(Address, Address)>>,
+    /// The copy version's snapshot `inner` reads (when known): per-pool
+    /// bound figures are shared across checks of that very snapshot
+    /// (copy2-t, BoundCache).
+    snap: Option<Arc<crate::state::snap::Snapshot>>,
 }
+
+/// copy2-t: one pool's payout figure for one copy version, shared by every
+/// check of that version (live Oct 23: the full-bound retry walked every V4
+/// pool again in every check, 60-170 ms). A figure depends only on the
+/// version's snapshot (the pool's PoolManager values), the pool's far zero
+/// list, the direction and the word cap: the key holds all four. The
+/// snapshot is matched by pointer AND kept alive by the entry (Arc), and so
+/// is the far list, so a key can never match a different snapshot / list
+/// that reused the memory. The newest 4 snapshots are kept.
+type PoolFig = (B256, bool, Option<usize>, usize);
+type CacheEntry = (Arc<crate::state::snap::Snapshot>, Vec<Arc<Vec<U256>>>, HashMap<PoolFig, U256>);
+
+fn bound_cache() -> &'static Mutex<Vec<CacheEntry>> {
+    static C: std::sync::OnceLock<Mutex<Vec<CacheEntry>>> = std::sync::OnceLock::new();
+    C.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn cached_fig(snap: &Arc<crate::state::snap::Snapshot>, key: PoolFig) -> Option<U256> {
+    let c = bound_cache().lock().unwrap();
+    c.iter().find(|e| Arc::ptr_eq(&e.0, snap)).and_then(|e| e.2.get(&key).copied())
+}
+
+fn store_fig(snap: &Arc<crate::state::snap::Snapshot>, far: Option<&Arc<Vec<U256>>>, key: PoolFig, v: U256) {
+    let mut c = bound_cache().lock().unwrap();
+    let i = match c.iter().position(|e| Arc::ptr_eq(&e.0, snap)) {
+        Some(i) => i,
+        None => {
+            if c.len() >= 4 {
+                c.remove(0);
+            }
+            c.push((snap.clone(), Vec::new(), HashMap::new()));
+            c.len() - 1
+        }
+    };
+    let e = &mut c[i];
+    if let Some(f) = far {
+        if !e.1.iter().any(|x| Arc::ptr_eq(x, f)) {
+            e.1.push(f.clone());
+        }
+    }
+    e.2.insert(key, v);
+}
+
+/// Cache hits / misses of BoundCache (status / tests).
+pub static BOUND_CACHE_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static BOUND_CACHE_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 impl<'a> C2View<'a> {
     pub fn new(inner: &'a dyn StateRead, f: &'a C2Facts, offset: U256) -> Self {
@@ -318,7 +376,30 @@ impl<'a> C2View<'a> {
             far_hits: Default::default(),
             coin_offsets,
             read_coins: Mutex::new(Vec::new()),
+            snap: None,
         }
+    }
+
+    /// The copy version's snapshot this view reads (enables BoundCache).
+    pub fn with_snap(mut self, snap: Arc<crate::state::snap::Snapshot>) -> Self {
+        self.snap = Some(snap);
+        self
+    }
+
+    /// One pool's payout figure (BoundCache when the snapshot is known).
+    fn pool_fig(&self, pm: Address, p: &TrackedPool, out0: bool, words: Option<usize>) -> U256 {
+        let compute = || payout_bound_words(&|s| self.read_pool(pm, p.v4_id, s), p, out0, words);
+        let (Some(snap), Some(id)) = (&self.snap, p.v4_id) else { return compute() };
+        let far = self.f.far_of.get(&id);
+        let key = (id, out0, words, far.map_or(0, |f| Arc::as_ptr(f) as usize));
+        if let Some(v) = cached_fig(snap, key) {
+            BOUND_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+            return v;
+        }
+        BOUND_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
+        let v = compute();
+        store_fig(snap, far, key, v);
+        v
     }
 
     /// The PoolManager balances (PoolManager, coin; ZERO = ETH) this run read.
@@ -393,7 +474,15 @@ impl<'a> C2View<'a> {
             return *v;
         }
         let full = self.f.full.load(Ordering::Relaxed);
-        let touched: HashSet<B256> = if full { HashSet::new() } else { self.touched.lock().unwrap().iter().copied().collect() };
+        let touched: HashSet<B256> = self.touched.lock().unwrap().iter().copied().collect();
+        // Pools off the check's route are walked only `bound_words()` words
+        // from their price (copy2-t: the full retry walked EVERY V4 pool's
+        // whole tick map, 60-170 ms live): a swap over part of a pool is
+        // still a swap the PoolManager must be able to pay, so the smaller
+        // sum is still a proven lower bound. The route's own pools (the ones
+        // a drain needs) are walked whole.
+        let cap = Some(bound_words());
+        let route = |p: &TrackedPool| p.v4_id.is_some_and(|i| touched.contains(&i));
         let mut sum = U256::ZERO;
         let mut skipped = false;
         let pools: Vec<(&TrackedPool, bool)> = self
@@ -413,9 +502,10 @@ impl<'a> C2View<'a> {
                 }
             })
             .collect();
-        let on_route = |p: &TrackedPool| full || p.v4_id.is_some_and(|i| touched.contains(&i));
+        let on_route = |p: &TrackedPool| full || route(p);
         for (p, out0) in pools.iter().filter(|(p, _)| on_route(p)) {
-            sum = sum.saturating_add(payout_bound(&|s| self.read_pool(pm, p.v4_id, s), p, *out0));
+            let words = if route(p) { None } else { cap };
+            sum = sum.saturating_add(self.pool_fig(pm, p, *out0, words));
         }
         // The route's pools hold none of this coin (e.g. the coin the check
         // PAYS IN on a one-sided pool): a bound of 0 makes the two runs
@@ -426,7 +516,7 @@ impl<'a> C2View<'a> {
                 skipped = true;
                 break;
             }
-            sum = sum.saturating_add(payout_bound(&|s| self.read_pool(pm, p.v4_id, s), p, *out0));
+            sum = sum.saturating_add(self.pool_fig(pm, p, *out0, cap));
         }
         if skipped {
             self.f.partial_used.store(true, Ordering::Relaxed);
@@ -632,10 +722,25 @@ fn word_slots(id: B256, base: U256, sp: i64, w_min: i64, w_max: i64) -> Arc<Vec<
 /// token1 would pay out, over the tick data `read` knows (stops at the
 /// first unknown value: a smaller bound, still a bound). 0 when unsure.
 pub fn payout_bound(read: &dyn Fn(U256) -> Lookup<U256>, p: &TrackedPool, out0: bool) -> U256 {
-    payout_inner(read, p, out0).unwrap_or(U256::ZERO)
+    payout_inner(read, p, out0, None).unwrap_or(U256::ZERO)
 }
 
-fn payout_inner(read: &dyn Fn(U256) -> Lookup<U256>, p: &TrackedPool, out0: bool) -> Option<U256> {
+/// The same over at most `max_words` tick-map words from the price (None =
+/// the whole map): the payout of a swap that stops there, also a proven
+/// lower bound (never larger than the whole one).
+pub fn payout_bound_words(read: &dyn Fn(U256) -> Lookup<U256>, p: &TrackedPool, out0: bool, max_words: Option<usize>) -> U256 {
+    payout_inner(read, p, out0, max_words).unwrap_or(U256::ZERO)
+}
+
+/// ARBSIM_COPY2_BOUND_WORDS [16]: tick-map words walked per pool off the
+/// check's route (spacing 60: ~245,000 ticks; spacing 1: 4,096 ticks = a
+/// price move of x1.5 each way).
+pub fn bound_words() -> usize {
+    static W: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *W.get_or_init(|| crate::node::env_u64("ARBSIM_COPY2_BOUND_WORDS", 16).clamp(1, 8000) as usize)
+}
+
+fn payout_inner(read: &dyn Fn(U256) -> Lookup<U256>, p: &TrackedPool, out0: bool, max_words: Option<usize>) -> Option<U256> {
     let id = p.v4_id?;
     let sp = p.tick_spacing as i64;
     if sp <= 0 {
@@ -675,7 +780,13 @@ fn payout_inner(read: &dyn Fn(U256) -> Lookup<U256>, p: &TrackedPool, out0: bool
         // Price goes DOWN (pays token1): initialized ticks <= tick, descending.
         let mut w = comp >> 8;
         let mut complete = true;
+        let mut seen = 0usize;
         while w >= w_min {
+            seen += 1;
+            if max_words.is_some_and(|m| seen > m) {
+                complete = false;
+                break;
+            }
             let Some(bits) = word(w) else {
                 complete = false;
                 break;
@@ -713,7 +824,13 @@ fn payout_inner(read: &dyn Fn(U256) -> Lookup<U256>, p: &TrackedPool, out0: bool
         // Price goes UP (pays token0): initialized ticks > tick, ascending.
         let mut w = comp >> 8;
         let mut complete = true;
+        let mut seen = 0usize;
         while w <= w_max {
+            seen += 1;
+            if max_words.is_some_and(|m| seen > m) {
+                complete = false;
+                break;
+            }
             let Some(bits) = word(w) else {
                 complete = false;
                 break;
@@ -838,13 +955,16 @@ mod tests {
         assert!(!one.is_zero() && f.partial_used.load(Ordering::Relaxed), "route-only: one pool");
         f.go_full();
         let both = C2View::new(&st, &f, U256::ZERO).lower_bound(pm, p1.token0);
-        assert_eq!(both, one + one, "full: both pools (same shape)");
+        // (The off-route pool is walked 16 words: the same amounts, fewer
+        // rounding steps subtracted.)
+        assert!(both >= one + one && both <= one + one + U256::from(1000u32), "full: both pools (same shape): {both} vs {one}");
         // Nothing touched: the first pool with a non-zero bound (never 0).
         let mut sets2 = FactSets::default();
         sets2.pms.insert(pm, vec![p1, p2]);
         sets2.index_pools();
         let f2 = C2Facts::new(0, Arc::new(sets2));
-        assert_eq!(C2View::new(&st, &f2, U256::ZERO).lower_bound(pm, Address::with_last_byte(1)), one);
+        let first = C2View::new(&st, &f2, U256::ZERO).lower_bound(pm, Address::with_last_byte(1));
+        assert!(first >= one && first <= one + U256::from(1000u32), "{first} vs {one}");
     }
 
     #[test]
@@ -906,6 +1026,19 @@ mod tests {
         let b0 = payout_bound(&read, &p, true);
         assert!(b1 <= want1 && b1 + U256::from(5000u32) > want1, "{b1} vs {want1}");
         assert!(b0 <= want0 && b0 + U256::from(5000u32) > want0, "{b0} vs {want0}");
+        // copy2-t: a walk cut after N words = the payout of a swap that stops
+        // there, minus ITS rounding steps (fewer than the whole walk's, so
+        // it may be a few units above b1, never above the real amounts):
+        // the position's ticks are in words -1 / 0, so 2 words going down
+        // get all of it, 1 word only the part above tick -768... none here.
+        let c2 = payout_bound_words(&read, &p, false, Some(2));
+        assert!(c2 >= b1 && c2 <= want1, "{c2} vs {b1} / {want1}");
+        assert!(payout_bound_words(&read, &p, false, Some(1)) < c2);
+        let c0 = payout_bound_words(&read, &p, true, Some(1));
+        assert!(c0 >= b0 && c0 <= want0);
+        for n in 1..6 {
+            assert!(payout_bound_words(&read, &p, false, Some(n)) <= want1);
+        }
         // Unknown word right below the price: nothing below is counted.
         m.remove(&map_slot(int_word(-1), base + U256::from(5u8)));
         let read = |s: U256| m.get(&s).copied().map(Lookup::Known).unwrap_or(Lookup::Missing);

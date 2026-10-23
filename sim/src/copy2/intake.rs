@@ -599,6 +599,10 @@ c2counters!(
     // left unknown because no such value was found (or balanceOf is not the
     // stored word at all).
     pm_high_narrow, pm_high_refused,
+    // ---- copy2-t (Oct 23 02:22 shadow, quiet night) ----
+    // Fills / re-reads read at a node block the copy has no version for,
+    // put in from the newest version before it (were dropped as too old).
+    fill_placed_before,
     // ---- copy2-n (warm restart, copy2/persist.rs) ----
     // Saves of the copy to ARBSIM_COPY2_STATE_FILE: written / skipped
     // (the previous one still writing) / failed; the longest time the intake
@@ -4588,7 +4592,11 @@ impl Intake {
         add(&self.c2.stats.fill_items, good.len() as u64);
         {
             let mut p = crate::timing::TimedWrite::new(&self.sh.published);
-            reconcile(&mut p.versions, k, &good);
+            let at = place_block(&p.versions, k);
+            if at != k {
+                inc(&self.c2.stats.fill_placed_before);
+            }
+            reconcile(&mut p.versions, at, &good);
         }
         self.sh.notify();
     }
@@ -4805,7 +4813,11 @@ impl Intake {
                 forget_slot(s, *a, *sl);
             }
         });
-        reconcile(&mut p.versions, k, &fresh);
+        let at = place_block(&p.versions, k);
+        if at != k {
+            inc(&self.c2.stats.fill_placed_before);
+        }
+        reconcile(&mut p.versions, at, &fresh);
         drop(p);
         self.sh.notify();
     }
@@ -6447,6 +6459,31 @@ fn forget_before(versions: &mut VecDeque<Arc<Version>>, block: u64, a: Address, 
 }
 
 /// Forget one slot in a snapshot (whole account if it was "complete").
+/// copy2-t: the block a value read from the node at block `k` is put in at.
+/// The copy keeps a version per message (blocks with reports for our pools,
+/// plus the newest quiet block), so on a quiet night it often has none at
+/// exactly k when the node is behind its head (fills / re-reads read at the
+/// node's tip): `reconcile` then dropped the value ("too old") and a value
+/// that keeps changing (USDG's totalSupply, forgotten by every re-read) was
+/// never held again (live Oct 23: 13 of 27 checks missed only it). The
+/// blocks between the newest version before k and k had no reports for our
+/// pools (else the bot would have sent them; a late one is handled like any
+/// late report after a fill at k: last_pos / coin_base keep k), so every
+/// value the copy follows is the same at that version as at k, and a value
+/// nothing follows is used with the same trust as between two re-reads.
+/// So the value is put in from that version. k itself when the copy has a
+/// version at k, none before it, or none after it.
+fn place_block(versions: &VecDeque<Arc<crate::state::mirror::Version>>, k: u64) -> u64 {
+    if versions.iter().any(|v| v.block == k) || !versions.iter().any(|v| v.block > k) {
+        return k;
+    }
+    // (A restart point between that version and k: nothing carries across.)
+    match versions.iter().rev().find(|v| v.block < k) {
+        Some(v) if !versions.iter().any(|x| x.block > v.block && x.block <= k && x.restart) => v.block,
+        _ => k,
+    }
+}
+
 fn forget_slot(s: &mut Snapshot, a: Address, slot: U256) {
     let complete = s.accounts.get(&a).is_some_and(|x| x.storage_complete);
     if complete {

@@ -2237,3 +2237,49 @@ fn a_load_older_than_an_unplaceable_late_report_reads_again() {
     }
     assert_ne!(r.state(&v2_pool()).0, PoolState::Ready);
 }
+
+// ---------------------------------------------------------------------------
+// copy2-t: live Oct 23 02:22 shadow (quiet night): 13 of 27 checks missed
+// ONLY USDG's totalSupply (the narrow-coin check needs it), over and over.
+// USDG's supply moves every few minutes (bridge mints / burns), so the 60 s
+// re-read forgot it, and its fill came back "too old": fills and re-reads
+// read at the node's tip when it is behind the copy, and on a quiet night
+// the copy has no version at exactly that block (it keeps one per message:
+// blocks with reports, plus the newest quiet one), so reconcile dropped the
+// value. Such a value is now placed at the copy's newest version before
+// that block (nothing the copy follows changed in between: no reports).
+// ---------------------------------------------------------------------------
+#[test]
+fn fills_and_rereads_at_a_node_block_the_copy_has_no_version_for_are_kept() {
+    let cfg = C2Config { verify_every_s: 1, ..C2Config::for_tests() };
+    let mut r = rig_with(cfg);
+    let mut st = genesis();
+    st.get_mut(&a(COIN0)).unwrap().insert(u(5), u(7)); // e.g. a coin's totalSupply
+    st.get_mut(&a(COIN0)).unwrap().insert(u(6), u(9)); // another setting
+    r.chain.set(100, st.clone());
+    *r.chain.tip.lock().unwrap() = 103; // the node: 2 blocks behind the copy's head below
+    r.track(vec![v2_pool()]);
+    r.send(tick(100, 60));
+    r.h.fill(vec![MissItem::Slot(a(COIN0), u(5))]);
+    r.settle();
+    assert_eq!(r.head_slot(a(COIN0), u(5)), Lookup::Known(u(7)));
+    // The chain moves the supply at 101; the copy's next message is block
+    // 105 (quiet blocks in between); the node is at 103.
+    st.get_mut(&a(COIN0)).unwrap().insert(u(5), u(8));
+    r.chain.set(101, st.clone());
+    r.send(tick(105, 65));
+    // (> ARBSIM_COPY2_TIP_MS, 2 s: the loaders learn the node's new tip.)
+    std::thread::sleep(std::time::Duration::from_millis(2100));
+    r.intake.pump(); // the 60 s re-read (1 s here), at the node's block 103
+    r.settle();
+    let c = |r: &Rig, n: &str| r.h.status_json(false)["counters"][n].as_u64().unwrap();
+    assert_eq!(c(&r, "unfollowed_changed"), 1, "the re-read saw the change");
+    assert_eq!(r.head_slot(a(COIN0), u(5)), Lookup::Known(u(8)), "refreshed, not lost");
+    // A first fill while the node is behind: kept too.
+    r.h.fill(vec![MissItem::Slot(a(COIN0), u(6))]);
+    r.settle();
+    assert_eq!(r.head_slot(a(COIN0), u(6)), Lookup::Known(u(9)));
+    // Placed at the newest version before the node's block (100): that
+    // version and the head have it.
+    assert_eq!(r.sh.resolve(&At::Block(100)).unwrap().snap.storage(a(COIN0), u(6)), Lookup::Known(u(9)));
+}
