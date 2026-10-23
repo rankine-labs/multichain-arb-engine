@@ -1,0 +1,47 @@
+# ============================================================================
+# PROFIT MEASURE (one-off, read-only research run on GitHub's computers).
+# Question: how much arbitrage profit is there on Robinhood Chain, who takes
+# it, how big and how fast. Reads the PUBLIC Robinhood node only; never
+# touches the bot server, never loads a key, never sends a transaction.
+# Triggered ONLY by a push to the throwaway branch profit-measure-run.
+# What to run is set in scripts/profit-measure/run.sh on that branch.
+# Results (JSON + markdown) are committed back to the same branch.
+# ============================================================================
+name: Profit measure (one-off)
+
+on:
+  push:
+    branches: [profit-measure-run]
+
+# Write access only so the job can commit its results back to this branch.
+permissions:
+  contents: write
+
+concurrency:
+  group: profit-measure-run
+  cancel-in-progress: false
+
+jobs:
+  measure:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install --no-audit --no-fund
+      - name: Measure (read-only, public node)
+        env:
+          PM_RPC: https://rpc.mainnet.chain.robinhood.com
+        run: |
+          mkdir -p results/profit-measure
+          timeout 19800 bash scripts/profit-measure/run.sh 2>&1 | tee results/profit-measure/run.log || true
+      - name: Commit results back to this branch
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -f results/profit-measure
+          git commit -m "Profit measure results ($(date -u +%Y-%m-%d\ %H:%M) UTC)" || exit 0
+          for i in 1 2 3; do git pull --rebase -q origin profit-measure-run && git push origin HEAD:profit-measure-run && break; sleep 5; done
