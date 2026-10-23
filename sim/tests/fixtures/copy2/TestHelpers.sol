@@ -60,6 +60,48 @@ contract Token {
     }
 }
 
+// A coin whose balance word counts only its LOW 128 bits (live Robinhood
+// USDG, probed Oct 22 copy2-r: raw 2^128 + 5 reads as 5, raw 2^200 + 999
+// can't pay 1000): the high half of the word is another field. Balances at
+// slot 0 like Token (keccak(holder . 0)).
+contract Token128 {
+    struct Acct { uint128 bal; uint128 other; }
+    mapping(address => Acct) internal acct;
+    mapping(address => mapping(address => uint256)) public allowance;
+    uint256 public totalSupply;
+    string public symbol;
+    uint8 public immutable decimals;
+
+    event Transfer(address indexed from, address indexed to, uint256 value);
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+
+    constructor(string memory s, uint8 d) { symbol = s; decimals = d; }
+
+    function balanceOf(address a) external view returns (uint256) { return acct[a].bal; }
+    function mint(address to, uint256 a) external {
+        totalSupply += a;
+        acct[to].bal += uint128(a);
+        emit Transfer(address(0), to, a);
+    }
+    function _move(address f, address t, uint256 a) internal {
+        require(acct[f].bal >= a, "insufficient balance");
+        acct[f].bal -= uint128(a);
+        acct[t].bal += uint128(a);
+        emit Transfer(f, t, a);
+    }
+    function transfer(address to, uint256 a) external returns (bool) { _move(msg.sender, to, a); return true; }
+    function approve(address s, uint256 a) external returns (bool) {
+        allowance[msg.sender][s] = a;
+        emit Approval(msg.sender, s, a);
+        return true;
+    }
+    function transferFrom(address f, address t, uint256 a) external returns (bool) {
+        if (allowance[f][msg.sender] != type(uint256).max) allowance[f][msg.sender] -= a;
+        _move(f, t, a);
+        return true;
+    }
+}
+
 interface IV3Like {
     function token0() external view returns (address);
     function token1() external view returns (address);

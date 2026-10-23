@@ -258,6 +258,16 @@ pub fn high_offset() -> U256 {
     U256::from(1u8) << 200usize
 }
 
+/// High-run values tried per coin, largest first (copy2-r). The high run
+/// must make the coin SEE a balance above any real one: 2^200 for coins
+/// that count the whole storage word; a coin that counts only part of the
+/// word (live USDG: the low 128 bits) gets the largest one it reads back
+/// exactly, and only if that is still above the coin's whole supply.
+pub fn high_candidates() -> [U256; 5] {
+    let one = U256::from(1u8);
+    [one << 200usize, one << 160usize, one << 126usize, one << 112usize, one << 96usize]
+}
+
 /// A check's view of copy 2 (see the header).
 pub struct C2View<'a> {
     inner: &'a dyn StateRead,
@@ -271,6 +281,13 @@ pub struct C2View<'a> {
     touched: Mutex<Vec<B256>>,
     /// Far zero words this run read (reported in the answer's "t").
     far_hits: std::sync::atomic::AtomicU64,
+    /// High run only: the value added to the bound per COIN (copy2-r: not
+    /// every coin counts the whole storage word as the balance; live USDG
+    /// counts only its low 128 bits, so "+ 2^200" read as "+ 0"). A coin
+    /// missing here gets `offset`.
+    coin_offsets: HashMap<Address, U256>,
+    /// (PoolManager, coin) balances this run read (coin ZERO = ETH).
+    read_coins: Mutex<Vec<(Address, Address)>>,
 }
 
 impl<'a> C2View<'a> {
@@ -280,7 +297,43 @@ impl<'a> C2View<'a> {
 
     /// `fee`: what an unheld protocolFeesAccrued counter reads as.
     pub fn with_fee(inner: &'a dyn StateRead, f: &'a C2Facts, offset: U256, fee: U256) -> Self {
-        C2View { inner, f, offset, used: AtomicBool::new(false), fee, used_fee: AtomicBool::new(false), touched: Mutex::new(Vec::new()), far_hits: Default::default() }
+        Self::with_offsets(inner, f, offset, fee, HashMap::new())
+    }
+
+    /// `coin_offsets`: per coin, what the high run adds to its bound
+    /// (others: `offset`).
+    pub fn with_offsets(inner: &'a dyn StateRead, f: &'a C2Facts, offset: U256, fee: U256, coin_offsets: HashMap<Address, U256>) -> Self {
+        C2View {
+            inner,
+            f,
+            offset,
+            used: AtomicBool::new(false),
+            fee,
+            used_fee: AtomicBool::new(false),
+            touched: Mutex::new(Vec::new()),
+            far_hits: Default::default(),
+            coin_offsets,
+            read_coins: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// The PoolManager balances (PoolManager, coin; ZERO = ETH) this run read.
+    pub fn read_coins(&self) -> Vec<(Address, Address)> {
+        self.read_coins.lock().unwrap().clone()
+    }
+
+    fn note_coin(&self, pm: Address, coin: Address) {
+        let mut r = self.read_coins.lock().unwrap();
+        if !r.contains(&(pm, coin)) {
+            r.push((pm, coin));
+        }
+    }
+
+    fn offset_of(&self, coin: Address) -> U256 {
+        if self.offset.is_zero() {
+            return U256::ZERO;
+        }
+        self.coin_offsets.get(&coin).copied().unwrap_or(self.offset)
     }
 
     /// Far zero words this run read.
@@ -387,6 +440,7 @@ impl StateRead for C2View<'_> {
                 // The ETH balance the copy holds for the PoolManager is a
                 // stale number (native V4 pools move it without a report).
                 self.used.store(true, Ordering::Relaxed);
+                self.note_coin(addr, Address::ZERO);
                 info.balance = self.lower_bound(addr, Address::ZERO).saturating_add(self.offset);
                 return Lookup::Known(Some(info));
             }
@@ -402,7 +456,8 @@ impl StateRead for C2View<'_> {
         }
         if let Some((pm, coin)) = self.f.inject.get(&(addr, slot)) {
             self.used.store(true, Ordering::Relaxed);
-            return Lookup::Known(self.lower_bound(*pm, *coin).saturating_add(self.offset));
+            self.note_coin(*pm, *coin);
+            return Lookup::Known(self.lower_bound(*pm, *coin).saturating_add(self.offset_of(*coin)));
         }
         // A protocol fee counter: always the run's value, even when the copy
         // holds one (a replay of our pool's swap fetched and moves it, but

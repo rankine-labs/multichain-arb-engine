@@ -591,6 +591,14 @@ c2counters!(
     // itself traded on (cheap); and checks where that smaller bound wasn't
     // enough and the full bound (every ready V4 pool) was used instead.
     pm_bound_route_only, pm_bound_full_retry,
+    // ---- copy2-r (live Oct 22 21:22, RIVN/USDG: copy "reverts", chain
+    // "loss" at the same block) ----
+    // High PoolManager-balance runs whose coin counts only part of the
+    // storage word (live USDG: low 128 bits), run with the largest high
+    // value the coin reads back exactly (above its whole supply); and checks
+    // left unknown because no such value was found (or balanceOf is not the
+    // stored word at all).
+    pm_high_narrow, pm_high_refused,
     // ---- copy2-n (warm restart, copy2/persist.rs) ----
     // Saves of the copy to ARBSIM_COPY2_STATE_FILE: written / skipped
     // (the previous one still writing) / failed; the longest time the intake
@@ -1051,6 +1059,12 @@ impl Copy2Handle {
     }
 
     /// A check read a PoolManager balance and ran twice: same / different.
+    /// copy2-r: a high run used a narrower value for a coin (`narrow`), or
+    /// a check went unknown because no value proves "above any balance".
+    pub fn note_pm_high(&self, narrow: bool) {
+        inc(if narrow { &self.c2.stats.pm_high_narrow } else { &self.c2.stats.pm_high_refused });
+    }
+
     pub fn note_pm_bound(&self, same: bool) {
         inc(&self.c2.stats.pm_bound_checks);
         inc(if same { &self.c2.stats.pm_bound_same } else { &self.c2.stats.pm_bound_differ });
