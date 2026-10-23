@@ -230,6 +230,91 @@ copy's block), so a MISMATCH can be traced from the line alone.
 `LOCAL_SIM_TIMEOUT_MS` stays 60: about 10x the expected time. Raising it
 would only hide a slow fast check and start the node later.
 
+## Trigger-first: check our trade the moment the feed shows the trigger
+
+Why (live Oct 23): all 7 real trades lost. Each chance was real, but rivals
+land at the top of block N+1 while we landed in N+2..N+11, because every
+path WAITED for the followed trade first: for its pool reports (copy 2) or
+its receipt (node), and only then checked our trade.
+
+What it does: the moment the feed shows the trigger, the bot asks the fast
+check "take your newest copy-2 version, replay every feed transaction
+sequenced after it (before the trigger, the trigger itself exactly once, and
+the ones after it we already saw: ours lands after them), then run our exact
+trade". If copy 2 already holds the trigger, it is NOT replayed: our trade
+runs on that version plus whatever came after. A sure profit goes straight
+on to every existing safeguard (kill file, safety gate, loss caps, live route
+blocks, send minimum, coin list, fit-to-wallet, outlier guard) and the
+FastSender, **without waiting for pool reports or receipts and without any
+node request**. Whether that lands us in the trigger's block or the next one
+is to be measured, not promised. A local profit is a profit against the
+simulated state; the contract's own on-chain min-profit check stays the
+safety net. No size search on this path (it would run without the replay).
+
+| Setting | What happens |
+|---|---|
+| `LOCAL_SIM_TRIGGER_FIRST=off` or missing (default) | Nothing at all (no buffer, no extra work). |
+| `LOCAL_SIM_TRIGGER_FIRST=shadow` | **Practice.** Asked for every Robinhood trigger trade, logged next to what the existing path decided and when. Never sends. |
+| `LOCAL_SIM_TRIGGER_FIRST=on` | A SURE answer decides (profit: on to the safeguards and the sender; loss / fail: refused as today). Unknown: the existing path, unchanged. Only while the fast check itself is ON (`LOCAL_SIM=on` + `LOCAL_SIM_CONFIRM=yes-fast-check`, not stepped back); otherwise practice. |
+
+Needs `LOCAL_SIM` shadow/on and copy 2 running (`ARBSIM_SOURCE=pool-events`).
+
+"Unknown" (the old path decides) whenever anything is not exact:
+`miss` (a value the copy doesn't hold, anywhere: routers, coins, other pools,
+hooks, lenders), `stale_fill` (a replayed trade, or our trade, read or wrote a
+value copy 2 only holds as a fill, re-read about once a minute, not followed
+exactly at that block: replaying on it could apply a change twice),
+`feed_gap` (the bot's feed messages don't reach back to the copy's block, or
+one is missing), `feed_order` (trigger not where the feed says, seen twice,
+block / sequence numbers don't line up), `feed_unreplayable` (a deposit,
+retryable, batch-posting report, compressed / unsigned transaction in the
+range), `unsupported_tx`, `replay_watch` (a replayed trade read an unknown
+sender's balance / code, a sender's ETH balance, BASEFEE / GASPRICE /
+COINBASE), `funding_overlap` (our test contract's pretend funding overlaps
+what the replayed trades read), `alignment`, `copy2_*` (a route pool not
+ready, reports not flowing), `trigger_not_in_buffer`, plus the usual
+`unsure_pool`, `pending_reports`, `pool_manager_balance`, `deadline`.
+
+Strictness of OUR trade (arbsim side): `ARBSIM_TRIG_CALL_TRUST=strict`
+(default) = our trade may only use values copy 2 follows exactly too;
+`ARBSIM_TRIG_CALL_TRUST=copy2` = our trade gets the same trust as every other
+copy-2 check (fills), while the replayed trades stay strict. Expect strict to
+answer far less often (most coins keep settings / proxy pointers copy 2 only
+holds as fills): shadow numbers decide whether to relax it.
+
+What to read:
+- `data/local-sim-shadow.jsonl` lines `"k":"trig_first"` (one per trigger,
+  written ~8 s later): `v` verdict, `u` why unknown, `snap` copy block,
+  `incl` trigger already in it, `msgs` / `txs` / `later` replayed (and how many
+  after the trigger), `ansMs` feed seen -> answer, `subMs` feed seen ->
+  signed (on), `exV` / `exMs` the existing path's verdict and time (shadow),
+  `earlierMs` how much earlier than the report-based path, `rblk` / `rAfterMs`
+  the trigger's block and when its pool reports came, `agree` / `same` the
+  same trade re-checked later on copy 2 at that block (no feed replay) and
+  whether that was exactly the same state.
+- hourly `[trigger-first] hour:` line (also under the fast-check Telegram
+  line): triggers, answered (profit / loss / fail), "required state there" %,
+  feed->answer and feed->submit p50 / p90, earlier than the report-based
+  path p50 / p90, re-checks agree X/Y (exact same state X/Y), warming node
+  requests, top unknown reasons. "ALIGNMENT MISMATCH" = feed sequence vs
+  block numbers disagree: check `ARBSIM_L2_BLOCK_OFFSET`.
+
+Node use: none in the hot path. Values trigger-first checks miss are NOT
+fetched by the fast check by itself; the bot's warmer asks for an account's
+values once `TRIG_FIRST_WARM_MIN_SEEN` (2) checks missed it, within
+`TRIG_FIRST_WARM_RPC_PER_HOUR` (60) node requests an hour (upper bound:
+one proof per account + one code read per contract), counted in the hour line.
+
+Other settings (defaults): `TRIG_FIRST_BUFFER_MSGS` (600 feed messages kept),
+`TRIG_FIRST_BACK_MSGS` (8), `TRIG_FIRST_MAX_MSGS` (48 per question),
+`TRIG_FIRST_TIMEOUT_MS` (60), `TRIG_FIRST_DEADLINE_MS` (120),
+`TRIG_FIRST_AGREE_PER_HOUR` (600 later re-checks, fast check only),
+`TRIG_FIRST_AGREE_WAIT_MS` (5000), `TRIG_FIRST_LOG_AFTER_MS` (8000).
+
+Not built (option for later): an automatic step back to practice when the
+later same-state re-checks disagree too often (like the fast check's own
+1-in-10 node re-checks).
+
 ## Rarely needed settings
 
 `ARBSIM_SOCKET` (default `/tmp/arbsim.sock`), `LOCAL_SIM_TIMEOUT_MS` (60, per
