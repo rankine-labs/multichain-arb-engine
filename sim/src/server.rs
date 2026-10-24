@@ -998,6 +998,43 @@ pub fn coin_highs(
     Ok((out, narrow))
 }
 
+/// ARBSIM_LOSS_FAST (default on): see LOSS FAST in copy2_runs.
+/// Read every time (cheap) so a test can turn it off for itself.
+fn loss_fast_on() -> bool {
+    std::env::var("ARBSIM_LOSS_FAST").map(|v| v.trim() != "0").unwrap_or(true)
+}
+
+/// A check answer that says "no profit at all": every call reverted with
+/// our contract's InsufficientProfit(got, wanted) with got = 0 (normal end,
+/// no halt), and every size of the size ladder (if any) is "loss".
+/// Anything else (a profit, another revert, a size not answered) = false.
+pub fn clear_loss(a: &Value) -> bool {
+    if a.get("ok") != Some(&Value::Bool(true)) {
+        return false;
+    }
+    let Some(results) = a.get("results").and_then(|r| r.as_array()) else { return false };
+    if results.is_empty() {
+        return false;
+    }
+    // InsufficientProfit(uint256 got, uint256 wanted): 4 + 32 + 32 bytes.
+    let zero_got = |o: &Value| -> bool {
+        if o.get("success") != Some(&Value::Bool(false)) || o.get("halt").is_some_and(|h| !h.is_null()) {
+            return false;
+        }
+        let Some(out) = o.get("output").and_then(|x| x.as_str()) else { return false };
+        let out = out.strip_prefix("0x").unwrap_or(out).to_ascii_lowercase();
+        out.len() == 136 && out.starts_with("4e88422a") && out[8..72].bytes().all(|c| c == b'0')
+    };
+    if !results.iter().all(zero_got) {
+        return false;
+    }
+    match a.get("sizes") {
+        None | Some(Value::Null) => true,
+        Some(Value::Array(rows)) => rows.iter().all(|r| r.get("status").and_then(|s| s.as_str()) == Some("loss")),
+        Some(_) => false,
+    }
+}
+
 pub fn copy2_runs(c: &Copy2Handle, view: &View, facts: &crate::copy2::checkview::C2Facts, bctx: &BlockCtx, runs: &std::cell::RefCell<RunLog>, run: &impl Fn(&dyn StateRead, &BlockCtx) -> Value) -> Value {
     use std::sync::atomic::Ordering::Relaxed;
     if facts.is_empty() {
@@ -1039,9 +1076,23 @@ pub fn copy2_runs(c: &Copy2Handle, view: &View, facts: &crate::copy2::checkview:
     // both runs again with the full bound (every ready V4 pool), as before.
     let confirmed = |fee| -> Result<(Value, bool), Value> {
         loop {
-            let (a, used_bound, used_fee, coins) = run_at(None, fee);
+            let (mut a, used_bound, used_fee, coins) = run_at(None, fee);
             if !used_bound || !ok(&a) {
                 return Ok((a, used_fee));
+            }
+            // LOSS FAST (Oct 24, speed): the first run already says "no
+            // profit at all" (our trade went through every swap and the
+            // profit check saw 0, at every size). The PoolManager balance
+            // and the protocol-fee counter can't turn that into a profit
+            // (they only decide whether a coin transfer goes through, and the
+            // gas), and a loss is never sent, so the confirming runs (far
+            // above the bound, fee not 0: ~4-12 more full runs) are skipped.
+            // Anything else (profit, a revert, an unsure size) is still
+            // confirmed exactly as before. ARBSIM_LOSS_FAST=0 turns it off.
+            if loss_fast_on() && clear_loss(&a) {
+                crate::timing::ph_add("lossFast", 1);
+                a["lossFast"] = json!(true);
+                return Ok((a, false));
             }
             let highs = match coin_highs(view, facts, bctx, &coins, runs) {
                 Ok((m, narrow)) => {
@@ -1201,6 +1252,33 @@ fn pinned_check(ctx: &Ctx, id: &Value, block: u64, next: bool, t0: Instant, run:
 mod tests {
     use super::same_but_gas;
     use serde_json::json;
+
+    // LOSS FAST: only a plain "profit 0 at every size" answer skips the confirming runs.
+    #[test]
+    fn clear_loss_only_for_zero_profit_everywhere() {
+        use super::clear_loss;
+        let ip = |got: &str| format!("0x4e88422a{got}0000000000000000000000000000000000000000000000000000000000000001");
+        let loss = json!({"ok": true, "results": [{"success": false, "output": ip("0000000000000000000000000000000000000000000000000000000000000000"), "gasUsed": "0x10"}]});
+        assert!(clear_loss(&loss));
+        let profit = json!({"ok": true, "results": [{"success": false, "output": ip("0000000000000000000000000000000000000000000000000000000000000001"), "gasUsed": "0x10"}]});
+        assert!(!clear_loss(&profit), "a profit must be confirmed");
+        let other = json!({"ok": true, "results": [{"success": false, "output": "0x08c379a0", "gasUsed": "0x10"}]});
+        assert!(!clear_loss(&other), "another revert must be confirmed");
+        let halted = json!({"ok": true, "results": [{"success": false, "output": ip("0000000000000000000000000000000000000000000000000000000000000000"), "gasUsed": "0x10", "halt": "OutOfGas"}]});
+        assert!(!clear_loss(&halted));
+        let ok_call = json!({"ok": true, "results": [{"success": true, "output": "0x", "gasUsed": "0x10"}, {"success": false, "output": ip("0000000000000000000000000000000000000000000000000000000000000000"), "gasUsed": "0x10"}]});
+        assert!(!clear_loss(&ok_call), "every call must be the zero-profit revert");
+        let mut sized = loss.clone();
+        sized["sizes"] = json!([{"status": "loss"}, {"status": "loss"}]);
+        assert!(clear_loss(&sized));
+        sized["sizes"] = json!([{"status": "loss"}, {"status": "profit"}]);
+        assert!(!clear_loss(&sized), "a profitable size must be confirmed");
+        sized["sizes"] = json!([{"status": "unknown"}]);
+        assert!(!clear_loss(&sized));
+        assert!(!clear_loss(&json!({"ok": false, "unknown": "miss"})));
+        assert!(!clear_loss(&json!({"ok": true, "results": []})));
+        assert!(!clear_loss(&json!({"ok": true, "best": null, "tried": []})));
+    }
 
     #[test]
     fn same_but_gas_takes_the_higher_gas_and_nothing_else_may_differ() {

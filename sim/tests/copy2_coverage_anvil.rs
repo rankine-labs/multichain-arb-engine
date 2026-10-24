@@ -1148,6 +1148,9 @@ fn bot_v4_protocol_fee_counter_answers_with_the_higher_gas() {
 /// checks never need the full bound.
 #[test]
 fn bot_v4_route_bound_falls_back_to_the_full_bound() {
+    // This test counts the confirming runs (route-only / full bound),
+    // which LOSS FAST (server.rs) skips for zero-profit answers: off here.
+    std::env::set_var("ARBSIM_LOSS_FAST", "0");
     // The test pool holds only token0 (every position above the price): a
     // check whose V4 hop pays token0 out can drain it.
     let o = Opts { bot_shape: true, pm_bound: true, full_words: 8000, second_v4: true, one_sided: true, thin: true, ..Opts::default() };
