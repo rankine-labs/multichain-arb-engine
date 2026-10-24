@@ -135,6 +135,11 @@ export interface RawLogTap {
   dailyShare?(): number;
   // Copy 2 wants block headers too (newHeads). Missing / false = no headers.
   headers?(): boolean;
+  // Pools copy 2 still follows although they left the watch list (its drop
+  // grace, COPY2_DROP_GRACE_S): added to the subscriptions while the tap is
+  // wanted, so their events keep coming. The price path never uses them
+  // (apply() keeps only current watch-list pools). Missing = none.
+  extraTargets?(): { pools: string[]; ids: string[] };
   onLive(coverage: { pools: Set<string>; ids: Set<string>; transferPools: Set<string>; coins: Set<string> }): void;
   onDown(): void;
 }
@@ -630,6 +635,15 @@ export class WsBlockReader {
     for (const a of this.o.addresses() ?? []) if (a && a.length === 42) pools.add(a.toLowerCase());
     const ids = new Set<string>();
     for (const id of this.o.v4Ids() ?? []) if (id && id.length === 66) ids.add(id.toLowerCase());
+    // Copy 2's held pools (see RawLogTap.extraTargets), only while the tap
+    // is wanted and only next to a non-empty watch list (never on their own).
+    if (pools.size > 0 && this.tapWanted()) {
+      try {
+        const x = this.o.rawLogTap?.extraTargets?.();
+        for (const a of x?.pools ?? []) if (typeof a === 'string' && a.length === 42) pools.add(a.toLowerCase());
+        for (const id of x?.ids ?? []) if (typeof id === 'string' && id.length === 66) ids.add(id.toLowerCase());
+      } catch { /* tap problem: watch list only */ }
+    }
     return { pools: [...pools].sort(), ids: [...ids].sort() };
   }
   private listSig(): string {

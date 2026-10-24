@@ -223,6 +223,8 @@ pub fn handle_tm(ctx: &Ctx, req: &Value, tm: &mut Tm) -> Value {
             s["warmItems"] = json!(ctx.fills.warm_len());
             s["pinnedBlocks"] = json!(ctx.pinned.cached());
             if let Some(c) = &ctx.copy2 {
+                // The bot's "wanted" hint rides on its status poll (copy2-relist).
+                c.note_wanted(req.get("wanted"));
                 s["copy2"] = c.status_json(req.get("pools").and_then(|p| p.as_bool()).unwrap_or(false));
             }
             if let Value::Object(t) = crate::timing::status() {

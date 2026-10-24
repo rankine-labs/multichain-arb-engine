@@ -2925,3 +2925,73 @@ fn trig_entry_one_trip_equals_discover_then_call() {
     assert_eq!(bad["unknown"], json!("table_gen"), "{bad}");
     arbsim::check::entry::clear_table();
 }
+
+// ---------------------------------------------------------------------------
+// WANTED (copy2-relist): route pools the bot's checks found "loading" come
+// with its status poll; they load before every other waiting pool, even
+// one that had events more recently.
+// ---------------------------------------------------------------------------
+fn hex_addr(x: Address) -> String {
+    format!("0x{}", x.as_slice().iter().map(|b| format!("{b:02x}")).collect::<String>())
+}
+
+#[test]
+fn wanted_pools_load_first() {
+    // One loader, one pool per load: the order is visible.
+    let mut r = rig_with(C2Config { loaders: 1, load_batch: 1, ..C2Config::for_tests() });
+    let wanted = v2_pool();
+    let busy = TrackedPool { address: a(0xa3), ..v2_pool() };
+    let mut s = genesis();
+    let g = s[&a(V2P)].clone();
+    s.insert(a(0xa3), g);
+    for c in [COIN0, COIN1] {
+        let v = s[&a(c)][&map_slot(a(V2P), 0)];
+        s.get_mut(&a(c)).unwrap().insert(map_slot(a(0xa3), 0), v);
+    }
+    r.chain.set(100, s);
+    // The bot's checks wait for the quiet pool (status `wanted`).
+    r.h.note_wanted(Some(&json!([hex_addr(wanted.address), "not a pool", 7])));
+    assert_eq!(r.h.c2.wanted.lock().unwrap().len(), 1, "only the valid key is kept");
+    r.track(vec![wanted.clone(), busy.clone()]);
+    r.h.block(msg(100, 60, vec![lg(a(0xa3), vec![topics().v2_sync], data(&[u(1000), u(4000)]), 100, 0, 0)]));
+    let t0 = std::time::Instant::now();
+    loop {
+        r.intake.pump();
+        let (ws, bs) = (r.state(&wanted).0, r.state(&busy).0);
+        if ws == PoolState::Ready || bs == PoolState::Ready {
+            assert_eq!(ws, PoolState::Ready, "the wanted pool should be ready first");
+            break;
+        }
+        assert!(t0.elapsed().as_secs() < 10);
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    r.settle();
+    assert_eq!(r.state(&busy).0, PoolState::Ready);
+    let st = r.h.status_json(false);
+    assert!(st["counters"]["wanted_loads"].as_u64().unwrap() >= 1, "{st}");
+}
+
+#[test]
+fn wanted_hint_rides_on_the_status_request() {
+    let chain = Arc::new(FakeChain::new());
+    chain.set(100, genesis());
+    let ctx = arbsim::serve::build_with(Config::for_tests(), Some(chain as Arc<dyn NodeApi>), arbsim::serve::Source::PoolEvents);
+    let id = format!("0x{}", "ab".repeat(32));
+    let st = arbsim::server::handle(&ctx, &json!({"id": 2, "type": "status", "pools": true, "wanted": [hex_addr(a(V2P)), id]}));
+    assert_eq!(st["copy2"]["source"], json!("pool-events"));
+    let c2 = ctx.copy2.as_ref().unwrap();
+    {
+        let w = c2.c2.wanted.lock().unwrap();
+        assert_eq!((w.addrs.len(), w.ids.len()), (1, 1), "an address and a V4 pool id noted");
+        let now = std::time::Instant::now();
+        assert!(w.has(&v2_pool(), now));
+        assert!(!w.has(&sol_pool(), now));
+    }
+    // Bounded: a flood keeps at most 512.
+    let many: Vec<String> = (0..2000u32).map(|i| format!("0x{:040x}", i + 1)).collect();
+    arbsim::server::handle(&ctx, &json!({"id": 3, "type": "status", "wanted": many}));
+    assert!(c2.c2.wanted.lock().unwrap().len() <= 512);
+    // No hint: nothing changes, and an old bot (no field) is fine.
+    arbsim::server::handle(&ctx, &json!({"id": 4, "type": "status"}));
+    c2.stop();
+}

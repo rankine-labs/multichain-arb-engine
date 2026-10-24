@@ -815,3 +815,165 @@ fn deploy_restarting_both_loads_nothing() {
     assert_eq!(b2.c("loads"), 0, "no pool loaded: {:?}", b2.states());
     exact_vs_chain(&ch, &b2, "deploy: both restarted");
 }
+
+// ---------------------------------------------------------------------------
+// DROP GRACE (copy2-relist, live Oct 24: "pool listed again, not resumed:
+// the kept reports no longer reach back to when it was kept aside: loading
+// it"). The kept reports are capped in reports (ARBSIM_COPY2_MAX_KEEP_LOGS);
+// on a busy chain a pool parked for a few minutes fell behind that cap and
+// had to be loaded again (tens of seconds, routes through it unknown). With
+// ARBSIM_COPY2_DROP_GRACE_S the reports a parked pool needs are held past
+// that cap (up to ARBSIM_COPY2_DROP_GRACE_MAX_LOGS), so it resumes exactly.
+// ---------------------------------------------------------------------------
+
+/// The bot's reports for block `n`, only for the listed pools `which`.
+fn reports_of(ch: &Chain, n: u64, which: &[usize]) -> Vec<PoolLog> {
+    let side = |t: &B256| Address::from_slice(&t.as_slice()[12..]);
+    ch.reports(n)
+        .into_iter()
+        .filter(|l| {
+            which.iter().map(|i| &ch.pools[*i]).any(|p| {
+                if let Some(id) = p.v4_id {
+                    l.address == p.address && l.topics.get(1) == Some(&id)
+                } else {
+                    l.address == p.address || (l.topics.len() == 3 && (side(&l.topics[1]) == p.address || side(&l.topics[2]) == p.address))
+                }
+            })
+        })
+        .collect()
+}
+
+/// `blocks` blocks where EVERY pool trades, the bot sending only the
+/// reports of the listed pools (pool 0): its reports alone go past the
+/// report cap of these tests.
+fn trade_all_send_listed(ch: &mut Chain, c: &mut Copy, blocks: usize, last: &mut u64) {
+    for _ in 0..blocks {
+        let txs = vec![ch.swap_tx(0, 1_500, true), ch.swap_tx(1, 3_000, true), ch.swap_tx(2, 2_000, false)];
+        let n = ch.mine(&txs);
+        c.send(ch.msg(n, reports_of(ch, n, &[0]), Some(*last)));
+        *last = n;
+    }
+}
+
+/// Small buffers so the report cap (30) bites after a few blocks; the
+/// test's drop-grace settings on top.
+fn small_buffers(cfg: &mut C2Config, grace_s: u64, grace_max: usize, grace_logs: usize) {
+    cfg.keep_blocks = 16;
+    cfg.max_keep_logs = 30;
+    cfg.drop_grace_s = grace_s;
+    cfg.drop_grace_max = grace_max;
+    cfg.drop_grace_max_logs = grace_logs;
+}
+
+/// Follow all three pools to ready + walked, then the bot drops two of them.
+fn ready_then_drop_two(ch: &mut Chain, c: &mut Copy, last: &mut u64) -> u64 {
+    ch.connect(c);
+    run_blocks(ch, &mut [&mut *c], 1, last);
+    c.wait("every pool ready", |c| c.all_ready() && c.walked_all());
+    run_blocks(ch, &mut [&mut *c], 3, last);
+    c.settle();
+    let loads = c.c("loads");
+    ch.connect_with(c, &[0]);
+    assert_eq!(c.c("pools_parked"), 2, "{:?}", c.states());
+    loads
+}
+
+#[test]
+fn relisted_within_drop_grace_resumes_past_the_report_cap() {
+    let Some(mut ch) = Chain::start() else {
+        eprintln!("copy2 resume anvil test SKIPPED: no ~/.foundry/bin/anvil");
+        return;
+    };
+    let mut c = ch.copy(None, |cfg| small_buffers(cfg, 1800, 400, 1_000_000));
+    let mut last = 0;
+    let loads = ready_then_drop_two(&mut ch, &mut c, &mut last);
+    // 40 blocks away (~120 reports of the listed pool: 4x the report cap).
+    trade_all_send_listed(&mut ch, &mut c, 40, &mut last);
+    c.settle();
+    let kept = c.h.status_json(false);
+    eprintln!("drop grace: kept while parked {}", kept["resume"]);
+    ch.connect_with(&mut c, &[0, 1, 2]);
+    run_blocks(&mut ch, &mut [&mut c], 3, &mut last);
+    c.settle();
+    eprintln!("drop grace: {} resumed, {} loaded instead", c.c("parked_resumed"), c.c("parked_fallback"));
+    assert_eq!(c.c("parked_resumed"), 2, "listed again within the grace: resumed from its own reports {:?}", c.states());
+    assert_eq!(c.c("parked_fallback"), 0);
+    assert_eq!(c.c("loads"), loads, "no pool loaded again");
+    assert!(c.all_ready(), "{:?}", c.states());
+    exact_vs_chain(&ch, &c, "re-listed within the drop grace");
+}
+
+#[test]
+fn without_drop_grace_the_report_cap_means_a_normal_load() {
+    // The live failure, reproduced: grace off, the kept reports run out.
+    let Some(mut ch) = Chain::start() else {
+        eprintln!("copy2 resume anvil test SKIPPED: no ~/.foundry/bin/anvil");
+        return;
+    };
+    let mut c = ch.copy(None, |cfg| small_buffers(cfg, 0, 400, 1_000_000));
+    let mut last = 0;
+    let loads = ready_then_drop_two(&mut ch, &mut c, &mut last);
+    trade_all_send_listed(&mut ch, &mut c, 40, &mut last);
+    c.settle();
+    ch.connect_with(&mut c, &[0, 1, 2]);
+    run_blocks(&mut ch, &mut [&mut c], 2, &mut last);
+    c.settle();
+    // Dropped as unresumable before the relist (once a minute) or given
+    // up on when listed again: either way loaded from the node.
+    assert_eq!(c.c("parked_resumed"), 0, "{:?}", c.states());
+    assert!(c.c("loads") >= loads + 2, "both pools loaded again: {:?}", c.states());
+    c.wait("every pool ready again", |c| c.all_ready());
+    run_blocks(&mut ch, &mut [&mut c], 2, &mut last);
+    c.settle();
+    exact_vs_chain(&ch, &c, "loaded again without the grace");
+}
+
+#[test]
+fn drop_grace_is_bounded_in_reports_and_in_pools() {
+    let Some(mut ch) = Chain::start() else {
+        eprintln!("copy2 resume anvil test SKIPPED: no ~/.foundry/bin/anvil");
+        return;
+    };
+    // At most ONE parked pool, at most 60 reports in all: the oldest parked
+    // pool is given up at once; the other loses its reports to the cap.
+    let mut c = ch.copy(None, |cfg| small_buffers(cfg, 1800, 1, 60));
+    let mut last = 0;
+    let loads = ready_then_drop_two(&mut ch, &mut c, &mut last);
+    assert_eq!(c.c("parked_expired"), 1, "count bound: one of the two parked pools given up at once");
+    trade_all_send_listed(&mut ch, &mut c, 40, &mut last);
+    c.settle();
+    ch.connect_with(&mut c, &[0, 1, 2]);
+    run_blocks(&mut ch, &mut [&mut c], 2, &mut last);
+    c.settle();
+    assert_eq!(c.c("parked_resumed"), 0, "report bound: the kept reports no longer reach back {:?}", c.states());
+    assert!(c.c("loads") >= loads + 2, "both loaded normally: {:?}", c.states());
+    c.wait("every pool ready again", |c| c.all_ready());
+    run_blocks(&mut ch, &mut [&mut c], 2, &mut last);
+    c.settle();
+    exact_vs_chain(&ch, &c, "bounded drop grace");
+}
+
+#[test]
+fn relisted_after_drop_grace_loads_as_before() {
+    let Some(mut ch) = Chain::start() else {
+        eprintln!("copy2 resume anvil test SKIPPED: no ~/.foundry/bin/anvil");
+        return;
+    };
+    // A 1 s grace: once it has passed, the kept reports are no longer held
+    // for the parked pools and the report cap applies again.
+    let mut c = ch.copy(None, |cfg| small_buffers(cfg, 1, 400, 1_000_000));
+    let mut last = 0;
+    let loads = ready_then_drop_two(&mut ch, &mut c, &mut last);
+    std::thread::sleep(Duration::from_millis(1100));
+    trade_all_send_listed(&mut ch, &mut c, 40, &mut last);
+    c.settle();
+    ch.connect_with(&mut c, &[0, 1, 2]);
+    run_blocks(&mut ch, &mut [&mut c], 2, &mut last);
+    c.settle();
+    assert_eq!(c.c("parked_resumed"), 0, "{:?}", c.states());
+    assert!(c.c("loads") >= loads + 2, "after the grace: loaded normally {:?}", c.states());
+    c.wait("every pool ready again", |c| c.all_ready());
+    run_blocks(&mut ch, &mut [&mut c], 2, &mut last);
+    c.settle();
+    exact_vs_chain(&ch, &c, "re-listed after the drop grace");
+}
