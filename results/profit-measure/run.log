@@ -1,238 +1,45 @@
-[pm 0.0m] window: blocks 95392255-96220748 (24.002777777777776 h, 9.63 blocks/s); our sender nonce now 192
-[pm 1.0m] swaps: 19% read, 346182 swaps, 30188 multi-pool txs, rps 1.5
-[pm 2.0m] swaps: 44% read, 781668 swaps, 66602 multi-pool txs, rps 1.0
-[pm 3.1m] swaps: 68% read, 1179924 swaps, 100212 multi-pool txs, rps 1.4
-[pm 4.1m] swaps: 80% read, 1567143 swaps, 132375 multi-pool txs, rps 1.0
-[pm 5.1m] swaps: 99% read, 1963348 swaps, 170740 multi-pool txs, rps 1.4
-[pm 5.1m] swap scan done: 1989329 swaps on 16779 pools, 174255 multi-pool txs, 394 http requests
-[pm 5.8m] address pools identified: 5840/5861
-[pm 10.9m] V4 pools identified by id: 503/10918
-[pm 10.9m] coins: 4823, decimals known for 4823
-[pm 11.0m] price observations: 1360369; ETH at mid-window $2405
-[pm 11.0m] multi-pool txs: tier 1 (our-bot shape) 16794, tier 2 (rest) 157461
-[pm 12.0m] receipts: tier1 1260/16794, tier2 630/157461, arbitrage so far 837, rps 1.5, 429s 23
-[pm 13.0m] receipts: tier1 2520/16794, tier2 1170/157461, arbitrage so far 1600, rps 1.5, 429s 26
-[pm 14.0m] receipts: tier1 3690/16794, tier2 1800/157461, arbitrage so far 2385, rps 1.5, 429s 28
-[pm 16.3m] receipts: tier1 4230/16794, tier2 2070/157461, arbitrage so far 2743, rps 1.5, 429s 43
-[pm 17.3m] receipts: tier1 5490/16794, tier2 2700/157461, arbitrage so far 3589, rps 1.0, 429s 46
-[pm 18.4m] receipts: tier1 6660/16794, tier2 3240/157461, arbitrage so far 4332, rps 1.0, 429s 58
-[pm 19.4m] receipts: tier1 7020/16794, tier2 3510/157461, arbitrage so far 4616, rps 1.0, 429s 92
-[pm 20.5m] receipts: tier1 7650/16794, tier2 3780/157461, arbitrage so far 5002, rps 1.0, 429s 120
-[pm 21.7m] receipts: tier1 8190/16794, tier2 4050/157461, arbitrage so far 5361, rps 1.0, 429s 150
-[pm 22.7m] receipts: tier1 8730/16794, tier2 4320/157461, arbitrage so far 5728, rps 1.0, 429s 178
-[pm 23.8m] receipts: tier1 9180/16794, tier2 4590/157461, arbitrage so far 6054, rps 1.0, 429s 206
-[pm 24.8m] receipts: tier1 9720/16794, tier2 4770/157461, arbitrage so far 6375, rps 1.0, 429s 238
-[pm 25.9m] receipts: tier1 10260/16794, tier2 5040/157461, arbitrage so far 6739, rps 1.0, 429s 266
-[pm 27.0m] receipts: tier1 10800/16794, tier2 5310/157461, arbitrage so far 7115, rps 1.0, 429s 292
-[pm 28.0m] receipts: tier1 11340/16794, tier2 5580/157461, arbitrage so far 7491, rps 1.0, 429s 318
-[pm 29.1m] receipts: tier1 11880/16794, tier2 5850/157461, arbitrage so far 7847, rps 1.0, 429s 348
-[pm 30.2m] receipts: tier1 12420/16794, tier2 6120/157461, arbitrage so far 8219, rps 1.0, 429s 374
-[pm 31.3m] receipts: tier1 12960/16794, tier2 6390/157461, arbitrage so far 8574, rps 1.0, 429s 404
-[pm 32.4m] receipts: tier1 13500/16794, tier2 6660/157461, arbitrage so far 8911, rps 1.0, 429s 432
-[pm 33.5m] receipts: tier1 14040/16794, tier2 6930/157461, arbitrage so far 9257, rps 1.0, 429s 462
-[pm 34.5m] receipts: tier1 14490/16794, tier2 7200/157461, arbitrage so far 9571, rps 1.0, 429s 490
-[pm 35.6m] receipts: tier1 15030/16794, tier2 7470/157461, arbitrage so far 9937, rps 1.0, 429s 518
-[pm 36.7m] receipts: tier1 15570/16794, tier2 7740/157461, arbitrage so far 10266, rps 1.0, 429s 544
-[pm 37.8m] receipts: tier1 16110/16794, tier2 8010/157461, arbitrage so far 10634, rps 1.0, 429s 573
-[pm 38.8m] receipts: tier1 16650/16794, tier2 8280/157461, arbitrage so far 11008, rps 1.0, 429s 597
-[pm 39.8m] receipts: tier1 16794/16794, tier2 9180/157461, arbitrage so far 11448, rps 1.0, 429s 611
-[pm 40.8m] receipts: tier1 16794/16794, tier2 10260/157461, arbitrage so far 11862, rps 1.0, 429s 623
-[pm 41.8m] receipts: tier1 16794/16794, tier2 11340/157461, arbitrage so far 12282, rps 1.0, 429s 635
-[pm 42.9m] receipts: tier1 16794/16794, tier2 12150/157461, arbitrage so far 12588, rps 1.0, 429s 662
-[pm 44.0m] receipts: tier1 16794/16794, tier2 12780/157461, arbitrage so far 12823, rps 1.0, 429s 707
-[pm 45.1m] receipts: tier1 16794/16794, tier2 13410/157461, arbitrage so far 13083, rps 1.0, 429s 743
-[pm 46.1m] receipts: tier1 16794/16794, tier2 14130/157461, arbitrage so far 13355, rps 1.0, 429s 776
-[pm 47.2m] receipts: tier1 16794/16794, tier2 14850/157461, arbitrage so far 13627, rps 1.0, 429s 815
-[pm 48.3m] receipts: tier1 16794/16794, tier2 15660/157461, arbitrage so far 13934, rps 1.0, 429s 848
-[pm 49.3m] receipts: tier1 16794/16794, tier2 16290/157461, arbitrage so far 14185, rps 1.0, 429s 887
-[pm 50.4m] receipts: tier1 16794/16794, tier2 17100/157461, arbitrage so far 14489, rps 1.0, 429s 917
-[pm 51.4m] receipts: tier1 16794/16794, tier2 17820/157461, arbitrage so far 14772, rps 1.0, 429s 950
-[pm 52.4m] receipts: tier1 16794/16794, tier2 19710/157461, arbitrage so far 15517, rps 1.0, 429s 951
-[pm 53.5m] receipts: tier1 16794/16794, tier2 21600/157461, arbitrage so far 16213, rps 1.0, 429s 953
-[pm 54.5m] receipts: tier1 16794/16794, tier2 23490/157461, arbitrage so far 16906, rps 1.0, 429s 954
-[pm 55.5m] receipts: tier1 16794/16794, tier2 24300/157461, arbitrage so far 17229, rps 1.0, 429s 960
-[pm 56.5m] receipts: tier1 16794/16794, tier2 25380/157461, arbitrage so far 17650, rps 1.0, 429s 972
-[pm 57.5m] receipts: tier1 16794/16794, tier2 26460/157461, arbitrage so far 18056, rps 1.0, 429s 984
-[pm 58.5m] receipts: tier1 16794/16794, tier2 27540/157461, arbitrage so far 18462, rps 1.0, 429s 996
-[pm 59.6m] receipts: tier1 16794/16794, tier2 28620/157461, arbitrage so far 18854, rps 1.0, 429s 1008
-[pm 60.6m] receipts: tier1 16794/16794, tier2 29700/157461, arbitrage so far 19303, rps 1.0, 429s 1020
-[pm 61.6m] receipts: tier1 16794/16794, tier2 30690/157461, arbitrage so far 19689, rps 1.0, 429s 1039
-[pm 62.6m] receipts: tier1 16794/16794, tier2 31500/157461, arbitrage so far 20004, rps 1.0, 429s 1065
-[pm 63.7m] receipts: tier1 16794/16794, tier2 32580/157461, arbitrage so far 20437, rps 1.0, 429s 1077
-[pm 64.7m] receipts: tier1 16794/16794, tier2 33660/157461, arbitrage so far 20877, rps 1.0, 429s 1089
-[pm 65.7m] receipts: tier1 16794/16794, tier2 34740/157461, arbitrage so far 21294, rps 1.0, 429s 1101
-[pm 66.7m] receipts: tier1 16794/16794, tier2 35820/157461, arbitrage so far 21713, rps 1.0, 429s 1113
-[pm 67.7m] receipts: tier1 16794/16794, tier2 36900/157461, arbitrage so far 22104, rps 1.0, 429s 1125
-[pm 68.7m] receipts: tier1 16794/16794, tier2 37980/157461, arbitrage so far 22517, rps 1.0, 429s 1137
-[pm 69.7m] receipts: tier1 16794/16794, tier2 39060/157461, arbitrage so far 22973, rps 1.0, 429s 1149
-[pm 70.8m] receipts: tier1 16794/16794, tier2 40140/157461, arbitrage so far 23396, rps 1.0, 429s 1161
-[pm 71.8m] receipts: tier1 16794/16794, tier2 41220/157461, arbitrage so far 23807, rps 1.0, 429s 1173
-[pm 72.8m] receipts: tier1 16794/16794, tier2 42300/157461, arbitrage so far 24199, rps 1.0, 429s 1185
-[pm 73.8m] receipts: tier1 16794/16794, tier2 43380/157461, arbitrage so far 24612, rps 1.0, 429s 1197
-[pm 74.9m] receipts: tier1 16794/16794, tier2 44280/157461, arbitrage so far 24929, rps 1.0, 429s 1225
-[pm 75.9m] receipts: tier1 16794/16794, tier2 45000/157461, arbitrage so far 25205, rps 1.0, 429s 1256
-[pm 77.0m] receipts: tier1 16794/16794, tier2 45720/157461, arbitrage so far 25473, rps 1.0, 429s 1284
-[pm 78.0m] receipts: tier1 16794/16794, tier2 46440/157461, arbitrage so far 25753, rps 1.0, 429s 1312
-[pm 79.1m] receipts: tier1 16794/16794, tier2 47250/157461, arbitrage so far 26072, rps 1.0, 429s 1340
-[pm 80.1m] receipts: tier1 16794/16794, tier2 48060/157461, arbitrage so far 26400, rps 1.0, 429s 1366
-[pm 81.2m] receipts: tier1 16794/16794, tier2 48960/157461, arbitrage so far 26748, rps 1.0, 429s 1395
-[pm 82.4m] receipts: tier1 16794/16794, tier2 49590/157461, arbitrage so far 26982, rps 1.0, 429s 1437
-[pm 83.4m] receipts: tier1 16794/16794, tier2 50220/157461, arbitrage so far 27229, rps 1.0, 429s 1476
-[pm 84.6m] receipts: tier1 16794/16794, tier2 50940/157461, arbitrage so far 27517, rps 1.0, 429s 1518
-[pm 85.6m] receipts: tier1 16794/16794, tier2 51750/157461, arbitrage so far 27837, rps 1.0, 429s 1544
-[pm 86.6m] receipts: tier1 16794/16794, tier2 52830/157461, arbitrage so far 28277, rps 1.0, 429s 1556
-[pm 87.7m] receipts: tier1 16794/16794, tier2 53910/157461, arbitrage so far 28695, rps 1.0, 429s 1568
-[pm 88.7m] receipts: tier1 16794/16794, tier2 54990/157461, arbitrage so far 29140, rps 1.0, 429s 1579
-[pm 89.8m] receipts: tier1 16794/16794, tier2 55800/157461, arbitrage so far 29456, rps 1.0, 429s 1611
-[pm 90.8m] receipts: tier1 16794/16794, tier2 56520/157461, arbitrage so far 29731, rps 1.0, 429s 1647
-[pm 91.9m] receipts: tier1 16794/16794, tier2 57060/157461, arbitrage so far 29963, rps 1.0, 429s 1689
-[pm 92.9m] receipts: tier1 16794/16794, tier2 57690/157461, arbitrage so far 30208, rps 1.0, 429s 1728
-[pm 93.9m] receipts: tier1 16794/16794, tier2 58320/157461, arbitrage so far 30457, rps 1.0, 429s 1764
-[pm 94.9m] receipts: tier1 16794/16794, tier2 58860/157461, arbitrage so far 30685, rps 1.0, 429s 1806
-[pm 96.1m] receipts: tier1 16794/16794, tier2 59490/157461, arbitrage so far 30937, rps 1.0, 429s 1848
-[pm 97.2m] receipts: tier1 16794/16794, tier2 60120/157461, arbitrage so far 31180, rps 1.0, 429s 1890
-[pm 98.2m] receipts: tier1 16794/16794, tier2 60750/157461, arbitrage so far 31395, rps 1.0, 429s 1924
-[pm 99.2m] receipts: tier1 16794/16794, tier2 61560/157461, arbitrage so far 31716, rps 1.0, 429s 1950
-[pm 100.2m] receipts: tier1 16794/16794, tier2 62370/157461, arbitrage so far 32040, rps 1.0, 429s 1974
-[pm 101.2m] receipts: tier1 16794/16794, tier2 63090/157461, arbitrage so far 32343, rps 1.0, 429s 2002
-[pm 102.3m] receipts: tier1 16794/16794, tier2 63900/157461, arbitrage so far 32664, rps 1.0, 429s 2032
-[pm 103.5m] receipts: tier1 16794/16794, tier2 64800/157461, arbitrage so far 33026, rps 1.0, 429s 2058
-[pm 104.7m] receipts: tier1 16794/16794, tier2 65700/157461, arbitrage so far 33390, rps 1.0, 429s 2089
-[pm 105.7m] receipts: tier1 16794/16794, tier2 66510/157461, arbitrage so far 33733, rps 1.0, 429s 2118
-[pm 106.9m] receipts: tier1 16794/16794, tier2 67140/157461, arbitrage so far 33980, rps 1.0, 429s 2163
-[pm 108.0m] receipts: tier1 16794/16794, tier2 67950/157461, arbitrage so far 34272, rps 1.0, 429s 2199
-[pm 109.0m] receipts: tier1 16794/16794, tier2 68580/157461, arbitrage so far 34528, rps 1.0, 429s 2233
-[pm 110.0m] receipts: tier1 16794/16794, tier2 69480/157461, arbitrage so far 34865, rps 1.0, 429s 2255
-[pm 111.1m] receipts: tier1 16794/16794, tier2 70290/157461, arbitrage so far 35185, rps 1.0, 429s 2283
-[pm 112.2m] receipts: tier1 16794/16794, tier2 71100/157461, arbitrage so far 35503, rps 1.0, 429s 2311
-[pm 113.2m] receipts: tier1 16794/16794, tier2 71820/157461, arbitrage so far 35783, rps 1.0, 429s 2342
-[pm 114.2m] receipts: tier1 16794/16794, tier2 72450/157461, arbitrage so far 36028, rps 1.0, 429s 2381
-[pm 115.3m] receipts: tier1 16794/16794, tier2 73080/157461, arbitrage so far 36293, rps 1.0, 429s 2423
-[pm 116.4m] receipts: tier1 16794/16794, tier2 73710/157461, arbitrage so far 36528, rps 1.0, 429s 2459
-[pm 117.4m] receipts: tier1 16794/16794, tier2 74430/157461, arbitrage so far 36812, rps 1.0, 429s 2495
-[pm 118.5m] receipts: tier1 16794/16794, tier2 75060/157461, arbitrage so far 37065, rps 1.0, 429s 2531
-[pm 119.5m] receipts: tier1 16794/16794, tier2 75780/157461, arbitrage so far 37345, rps 1.0, 429s 2564
-[pm 120.6m] receipts: tier1 16794/16794, tier2 76410/157461, arbitrage so far 37582, rps 1.0, 429s 2603
-[pm 121.6m] receipts: tier1 16794/16794, tier2 77040/157461, arbitrage so far 37844, rps 1.0, 429s 2645
-[pm 122.7m] receipts: tier1 16794/16794, tier2 77760/157461, arbitrage so far 38116, rps 1.0, 429s 2681
-[pm 123.7m] receipts: tier1 16794/16794, tier2 78390/157461, arbitrage so far 38359, rps 1.0, 429s 2717
-[pm 124.8m] receipts: tier1 16794/16794, tier2 79110/157461, arbitrage so far 38624, rps 1.0, 429s 2751
-[pm 125.8m] receipts: tier1 16794/16794, tier2 79830/157461, arbitrage so far 38893, rps 1.0, 429s 2787
-[pm 126.9m] receipts: tier1 16794/16794, tier2 80640/157461, arbitrage so far 39193, rps 1.0, 429s 2817
-[pm 127.9m] receipts: tier1 16794/16794, tier2 81360/157461, arbitrage so far 39492, rps 1.0, 429s 2850
-[pm 129.1m] receipts: tier1 16794/16794, tier2 82170/157461, arbitrage so far 39795, rps 1.0, 429s 2887
-[pm 130.2m] receipts: tier1 16794/16794, tier2 82890/157461, arbitrage so far 40046, rps 1.0, 429s 2926
-[pm 131.2m] receipts: tier1 16794/16794, tier2 83430/157461, arbitrage so far 40252, rps 1.0, 429s 2965
-[pm 132.2m] receipts: tier1 16794/16794, tier2 84060/157461, arbitrage so far 40503, rps 1.0, 429s 3001
-[pm 133.3m] receipts: tier1 16794/16794, tier2 84780/157461, arbitrage so far 40803, rps 1.0, 429s 3040
-[pm 134.4m] receipts: tier1 16794/16794, tier2 85590/157461, arbitrage so far 41114, rps 1.0, 429s 3073
-[pm 135.5m] receipts: tier1 16794/16794, tier2 86310/157461, arbitrage so far 41389, rps 1.0, 429s 3109
-[pm 136.6m] receipts: tier1 16794/16794, tier2 87120/157461, arbitrage so far 41704, rps 1.0, 429s 3145
-[pm 137.7m] receipts: tier1 16794/16794, tier2 88020/157461, arbitrage so far 42056, rps 1.0, 429s 3174
-[pm 138.8m] receipts: tier1 16794/16794, tier2 88830/157461, arbitrage so far 42386, rps 1.0, 429s 3200
-[pm 139.8m] receipts: tier1 16794/16794, tier2 89640/157461, arbitrage so far 42704, rps 1.0, 429s 3224
-[pm 140.8m] receipts: tier1 16794/16794, tier2 90450/157461, arbitrage so far 43001, rps 1.0, 429s 3250
-[pm 142.0m] receipts: tier1 16794/16794, tier2 91260/157461, arbitrage so far 43330, rps 1.0, 429s 3281
-[pm 143.0m] receipts: tier1 16794/16794, tier2 92070/157461, arbitrage so far 43646, rps 1.0, 429s 3309
-[pm 144.2m] receipts: tier1 16794/16794, tier2 92880/157461, arbitrage so far 43978, rps 1.0, 429s 3339
-[pm 145.2m] receipts: tier1 16794/16794, tier2 93690/157461, arbitrage so far 44284, rps 1.0, 429s 3367
-[pm 146.3m] receipts: tier1 16794/16794, tier2 94500/157461, arbitrage so far 44596, rps 1.0, 429s 3393
-[pm 147.4m] receipts: tier1 16794/16794, tier2 95310/157461, arbitrage so far 44904, rps 1.0, 429s 3421
-[pm 148.4m] receipts: tier1 16794/16794, tier2 96120/157461, arbitrage so far 45228, rps 1.0, 429s 3445
-[pm 149.4m] receipts: tier1 16794/16794, tier2 96930/157461, arbitrage so far 45560, rps 1.0, 429s 3471
-[pm 150.4m] receipts: tier1 16794/16794, tier2 97650/157461, arbitrage so far 45833, rps 1.0, 429s 3499
-[pm 151.5m] receipts: tier1 16794/16794, tier2 98460/157461, arbitrage so far 46160, rps 1.0, 429s 3525
-[pm 152.6m] receipts: tier1 16794/16794, tier2 99270/157461, arbitrage so far 46489, rps 1.0, 429s 3553
-[pm 153.6m] receipts: tier1 16794/16794, tier2 100080/157461, arbitrage so far 46795, rps 1.0, 429s 3579
-[pm 154.7m] receipts: tier1 16794/16794, tier2 100890/157461, arbitrage so far 47123, rps 1.0, 429s 3607
-[pm 155.8m] receipts: tier1 16794/16794, tier2 101700/157461, arbitrage so far 47427, rps 1.0, 429s 3635
-[pm 156.9m] receipts: tier1 16794/16794, tier2 102600/157461, arbitrage so far 47759, rps 1.0, 429s 3661
-[pm 158.0m] receipts: tier1 16794/16794, tier2 103410/157461, arbitrage so far 48066, rps 1.0, 429s 3689
-[pm 159.1m] receipts: tier1 16794/16794, tier2 104130/157461, arbitrage so far 48332, rps 1.0, 429s 3729
-[pm 160.2m] receipts: tier1 16794/16794, tier2 104850/157461, arbitrage so far 48604, rps 1.0, 429s 3768
-[pm 161.3m] receipts: tier1 16794/16794, tier2 105570/157461, arbitrage so far 48864, rps 1.0, 429s 3807
-[pm 162.4m] receipts: tier1 16794/16794, tier2 106110/157461, arbitrage so far 49085, rps 1.0, 429s 3855
-[pm 163.5m] receipts: tier1 16794/16794, tier2 106920/157461, arbitrage so far 49415, rps 1.0, 429s 3878
-[pm 164.6m] receipts: tier1 16794/16794, tier2 107640/157461, arbitrage so far 49671, rps 1.0, 429s 3918
-[pm 165.7m] receipts: tier1 16794/16794, tier2 108450/157461, arbitrage so far 49991, rps 1.0, 429s 3953
-[pm 166.8m] receipts: tier1 16794/16794, tier2 109260/157461, arbitrage so far 50303, rps 1.0, 429s 3984
-[pm 167.9m] receipts: tier1 16794/16794, tier2 110250/157461, arbitrage so far 50668, rps 1.0, 429s 4009
-[pm 168.9m] receipts: tier1 16794/16794, tier2 110880/157461, arbitrage so far 50901, rps 1.0, 429s 4045
-[pm 170.0m] receipts: tier1 16794/16794, tier2 111600/157461, arbitrage so far 51177, rps 1.0, 429s 4075
-[pm 171.2m] receipts: tier1 16794/16794, tier2 112320/157461, arbitrage so far 51459, rps 1.0, 429s 4116
-[pm 172.2m] receipts: tier1 16794/16794, tier2 112950/157461, arbitrage so far 51687, rps 1.0, 429s 4155
-[pm 173.2m] receipts: tier1 16794/16794, tier2 113490/157461, arbitrage so far 51915, rps 1.0, 429s 4197
-[pm 174.3m] receipts: tier1 16794/16794, tier2 114120/157461, arbitrage so far 52170, rps 1.0, 429s 4239
-[pm 175.4m] receipts: tier1 16794/16794, tier2 114660/157461, arbitrage so far 52384, rps 1.0, 429s 4281
-[pm 176.5m] receipts: tier1 16794/16794, tier2 115470/157461, arbitrage so far 52719, rps 1.0, 429s 4311
-[pm 177.5m] receipts: tier1 16794/16794, tier2 116190/157461, arbitrage so far 52994, rps 1.0, 429s 4339
-[pm 178.6m] receipts: tier1 16794/16794, tier2 117000/157461, arbitrage so far 53318, rps 1.0, 429s 4367
-[pm 179.6m] receipts: tier1 16794/16794, tier2 117720/157461, arbitrage so far 53578, rps 1.0, 429s 4395
-[pm 180.7m] receipts: tier1 16794/16794, tier2 118620/157461, arbitrage so far 53946, rps 1.0, 429s 4419
-[pm 181.7m] receipts: tier1 16794/16794, tier2 119520/157461, arbitrage so far 54306, rps 1.0, 429s 4439
-[pm 182.7m] receipts: tier1 16794/16794, tier2 120240/157461, arbitrage so far 54573, rps 1.0, 429s 4469
-[pm 183.7m] receipts: tier1 16794/16794, tier2 120960/157461, arbitrage so far 54866, rps 1.0, 429s 4497
-[pm 184.8m] receipts: tier1 16794/16794, tier2 121680/157461, arbitrage so far 55138, rps 1.0, 429s 4532
-[pm 185.9m] receipts: tier1 16794/16794, tier2 122580/157461, arbitrage so far 55464, rps 1.0, 429s 4556
-[pm 187.0m] receipts: tier1 16794/16794, tier2 123390/157461, arbitrage so far 55778, rps 1.0, 429s 4584
-[pm 188.0m] receipts: tier1 16794/16794, tier2 124200/157461, arbitrage so far 56100, rps 1.0, 429s 4608
-[pm 189.1m] receipts: tier1 16794/16794, tier2 125010/157461, arbitrage so far 56414, rps 1.0, 429s 4638
-[pm 190.1m] receipts: tier1 16794/16794, tier2 125730/157461, arbitrage so far 56677, rps 1.0, 429s 4666
-[pm 191.2m] receipts: tier1 16794/16794, tier2 126360/157461, arbitrage so far 56922, rps 1.0, 429s 4705
-[pm 192.3m] receipts: tier1 16794/16794, tier2 127260/157461, arbitrage so far 57280, rps 1.0, 429s 4734
-[pm 193.4m] receipts: tier1 16794/16794, tier2 128160/157461, arbitrage so far 57638, rps 1.0, 429s 4761
-[pm 194.4m] receipts: tier1 16794/16794, tier2 128790/157461, arbitrage so far 57890, rps 1.0, 429s 4797
-[pm 195.5m] receipts: tier1 16794/16794, tier2 129510/157461, arbitrage so far 58184, rps 1.0, 429s 4836
-[pm 196.6m] receipts: tier1 16794/16794, tier2 130230/157461, arbitrage so far 58459, rps 1.0, 429s 4872
-[pm 197.7m] receipts: tier1 16794/16794, tier2 130950/157461, arbitrage so far 58746, rps 1.0, 429s 4911
-[pm 198.8m] receipts: tier1 16794/16794, tier2 131760/157461, arbitrage so far 59061, rps 1.0, 429s 4947
-[pm 199.8m] receipts: tier1 16794/16794, tier2 132390/157461, arbitrage so far 59277, rps 1.0, 429s 4983
-[pm 200.9m] receipts: tier1 16794/16794, tier2 133020/157461, arbitrage so far 59514, rps 1.0, 429s 5022
-[pm 201.0m] receipts done: tier1 16794/16794, tier2 133110/157461, arbitrage 59555
-[pm 207.8m] V4 second pass: 1280 new coins, 337 more V4 pools named (total 840/10918); re-checking 1715 arbitrage
-[pm 208.8m] re-check: 99 were not arbitrage after all; 59456 arbitrage remain
-[pm 208.9m] census: 16 blocks (96220765/96339717), 66 txs, failed 4, our txs 0, rps 1.5
-[pm 209.9m] census: 288 blocks (96221037/96339717), 2036 txs, failed 546, our txs 0, rps 1.6
-[pm 210.9m] census: 528 blocks (96221277/96339717), 3170 txs, failed 755, our txs 0, rps 1.5
-[pm 211.9m] census: 784 blocks (96221533/96339717), 4376 txs, failed 874, our txs 0, rps 1.5
-[pm 213.0m] census: 1056 blocks (96221805/96339717), 5950 txs, failed 1121, our txs 0, rps 1.0
-[pm 214.2m] census: 1136 blocks (96221885/96339717), 6397 txs, failed 1201, our txs 0, rps 1.0
-[pm 215.2m] census: 1216 blocks (96221965/96339717), 6944 txs, failed 1336, our txs 0, rps 1.0
-[pm 216.3m] census: 1376 blocks (96222125/96339717), 9215 txs, failed 2776, our txs 0, rps 1.0
-[pm 217.3m] census: 1552 blocks (96222301/96339717), 10166 txs, failed 2935, our txs 0, rps 1.0
-[pm 218.4m] census: 1712 blocks (96222461/96339717), 10952 txs, failed 3006, our txs 0, rps 1.0
-[pm 219.5m] census: 1888 blocks (96222637/96339717), 11742 txs, failed 3055, our txs 0, rps 1.0
-[pm 220.6m] census: 2064 blocks (96222813/96339717), 13137 txs, failed 3616, our txs 0, rps 1.0
-[pm 221.7m] census: 2240 blocks (96222989/96339717), 14091 txs, failed 3880, our txs 0, rps 1.0
-[pm 222.7m] census: 2416 blocks (96223165/96339717), 15118 txs, failed 4130, our txs 0, rps 1.0
-[pm 223.8m] census: 2576 blocks (96223325/96339717), 18664 txs, failed 5488, our txs 0, rps 1.0
-[pm 224.9m] census: 2752 blocks (96223501/96339717), 19825 txs, failed 5736, our txs 0, rps 1.0
-[pm 226.0m] census: 2928 blocks (96223677/96339717), 21009 txs, failed 6031, our txs 0, rps 1.0
-[pm 227.1m] census: 3104 blocks (96223853/96339717), 22096 txs, failed 6378, our txs 0, rps 1.0
-[pm 228.2m] census: 3264 blocks (96224013/96339717), 23537 txs, failed 6870, our txs 0, rps 1.0
-[pm 229.2m] census: 3440 blocks (96224189/96339717), 24289 txs, failed 6959, our txs 0, rps 1.0
-[pm 230.3m] census: 3600 blocks (96224349/96339717), 24933 txs, failed 7044, our txs 0, rps 1.0
-[pm 231.3m] census: 3760 blocks (96224509/96339717), 25721 txs, failed 7131, our txs 0, rps 1.0
-[pm 232.4m] census: 3936 blocks (96224685/96339717), 26465 txs, failed 7214, our txs 0, rps 1.0
-[pm 233.5m] census: 4096 blocks (96224845/96339717), 27172 txs, failed 7259, our txs 0, rps 1.0
-[pm 234.5m] census: 4272 blocks (96225021/96339717), 27964 txs, failed 7400, our txs 0, rps 1.0
-[pm 235.5m] census: 4432 blocks (96225181/96339717), 28543 txs, failed 7444, our txs 0, rps 1.0
-[pm 236.6m] census: 4592 blocks (96225341/96339717), 29553 txs, failed 7619, our txs 0, rps 1.0
-[pm 237.7m] census: 4768 blocks (96225517/96339717), 30250 txs, failed 7715, our txs 0, rps 1.0
-[pm 238.8m] census: 4944 blocks (96225693/96339717), 31174 txs, failed 7954, our txs 0, rps 1.0
-[pm 240.0m] census: 5120 blocks (96225869/96339717), 31797 txs, failed 7985, our txs 0, rps 1.0
-[pm 241.0m] census: 5296 blocks (96226045/96339717), 32499 txs, failed 8045, our txs 0, rps 1.0
-[pm 242.0m] census: 5456 blocks (96226205/96339717), 33147 txs, failed 8099, our txs 0, rps 1.0
-[pm 243.1m] census: 5616 blocks (96226365/96339717), 33803 txs, failed 8170, our txs 0, rps 1.0
-[pm 244.1m] census: 5792 blocks (96226541/96339717), 34446 txs, failed 8242, our txs 0, rps 1.0
-[pm 245.2m] census: 5968 blocks (96226717/96339717), 35543 txs, failed 8481, our txs 0, rps 1.0
-[pm 246.3m] census: 6128 blocks (96226877/96339717), 36713 txs, failed 8754, our txs 0, rps 1.0
-[pm 247.3m] census: 6288 blocks (96227037/96339717), 37447 txs, failed 8878, our txs 0, rps 1.0
-[pm 248.3m] census: 6448 blocks (96227197/96339717), 38236 txs, failed 9001, our txs 0, rps 1.0
-[pm 249.4m] census: 6624 blocks (96227373/96339717), 38888 txs, failed 9048, our txs 0, rps 1.0
-[pm 250.6m] census: 6800 blocks (96227549/96339717), 39585 txs, failed 9110, our txs 0, rps 1.0
-[pm 251.7m] census: 6976 blocks (96227725/96339717), 40414 txs, failed 9228, our txs 0, rps 1.0
-[pm 252.8m] census: 7152 blocks (96227901/96339717), 41273 txs, failed 9325, our txs 0, rps 1.0
-[pm 253.9m] census done: blocks 96220749-96228060 (7312), txs 42063, our txs 0; our nonce went 192 -> 205 by block 96339717
-[pm 253.9m] saved results to results/profit-measure
-report written
+[v4fix 0.0m] arbitrage through unnamed V4 pools: 39159
+[v4fix 0.0m] receipts 0/39159 (rps 3.0, 429s 0)
+[v4fix 0.6m] receipts 1000/39159 (rps 1.3, 429s 3)
+[v4fix 1.1m] receipts 2000/39159 (rps 1.6, 429s 3)
+[v4fix 1.7m] receipts 3000/39159 (rps 1.4, 429s 4)
+[v4fix 2.2m] receipts 4000/39159 (rps 1.3, 429s 5)
+[v4fix 2.8m] receipts 5000/39159 (rps 1.1, 429s 6)
+[v4fix 3.3m] receipts 6000/39159 (rps 1.4, 429s 6)
+[v4fix 3.9m] receipts 7000/39159 (rps 1.3, 429s 7)
+[v4fix 4.5m] receipts 8000/39159 (rps 1.1, 429s 8)
+[v4fix 6.9m] receipts 9000/39159 (rps 0.7, 429s 44)
+[v4fix 7.6m] receipts 10000/39159 (rps 1.3, 429s 44)
+[v4fix 8.4m] receipts 11000/39159 (rps 0.8, 429s 46)
+[v4fix 9.1m] receipts 12000/39159 (rps 1.1, 429s 47)
+[v4fix 9.9m] receipts 13000/39159 (rps 0.8, 429s 49)
+[v4fix 10.7m] receipts 14000/39159 (rps 1.0, 429s 50)
+[v4fix 11.5m] receipts 15000/39159 (rps 0.7, 429s 52)
+[v4fix 12.2m] receipts 16000/39159 (rps 1.0, 429s 53)
+[v4fix 13.0m] receipts 17000/39159 (rps 1.0, 429s 55)
+[v4fix 13.8m] receipts 18000/39159 (rps 1.0, 429s 56)
+[v4fix 14.6m] receipts 19000/39159 (rps 0.8, 429s 58)
+[v4fix 15.4m] receipts 20000/39159 (rps 0.8, 429s 59)
+[v4fix 16.1m] receipts 21000/39159 (rps 1.1, 429s 60)
+[v4fix 16.9m] receipts 22000/39159 (rps 0.7, 429s 62)
+[v4fix 17.7m] receipts 23000/39159 (rps 1.0, 429s 63)
+[v4fix 18.5m] receipts 24000/39159 (rps 0.7, 429s 65)
+[v4fix 19.2m] receipts 25000/39159 (rps 1.0, 429s 66)
+[v4fix 20.0m] receipts 26000/39159 (rps 1.0, 429s 68)
+[v4fix 20.8m] receipts 27000/39159 (rps 1.0, 429s 69)
+[v4fix 21.6m] receipts 28000/39159 (rps 1.0, 429s 71)
+[v4fix 22.3m] receipts 29000/39159 (rps 1.0, 429s 72)
+[v4fix 23.2m] receipts 30000/39159 (rps 1.0, 429s 74)
+[v4fix 23.9m] receipts 31000/39159 (rps 0.9, 429s 75)
+[v4fix 24.7m] receipts 32000/39159 (rps 0.8, 429s 77)
+[v4fix 25.5m] receipts 33000/39159 (rps 0.8, 429s 78)
+[v4fix 26.2m] receipts 34000/39159 (rps 1.1, 429s 79)
+[v4fix 27.1m] receipts 35000/39159 (rps 1.0, 429s 81)
+[v4fix 27.8m] receipts 36000/39159 (rps 0.7, 429s 83)
+[v4fix 28.6m] receipts 37000/39159 (rps 1.0, 429s 84)
+[v4fix 29.4m] receipts 38000/39159 (rps 1.0, 429s 85)
+[v4fix 30.2m] receipts 39000/39159 (rps 0.8, 429s 87)
+[v4fix 30.3m] receipts read: 39159/39159
+[v4fix 30.3m] unnamed V4 pools in these trades: 3457
+[v4fix 82.6m] solved by id (no hooks): 161/3457
+[v4fix] stopped: fetch failed
