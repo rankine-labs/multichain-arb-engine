@@ -125,20 +125,28 @@ async function main() {
   const deadline = Date.now() + INIT_MIN * 60_000;
   let viaInit = 0, initCalls = 0;
   let firstOk: string | null = null;
-  for (let i = 0; i < rest.length && Date.now() < deadline; i += 50) {
-    const ids = rest.slice(i, i + 50);
-    const stack: [number, number][] = [[0, head]];
-    while (stack.length && Date.now() < deadline) {
-      const [f, t] = stack.pop()!;
-      let j: any;
-      try { initCalls++; j = await post({ jsonrpc: '2.0', id: 1, method: 'eth_getLogs', params: [{ address: ROBINHOOD_V4.POOL_MANAGER, fromBlock: hex(f), toBlock: hex(t), topics: [V4_INITIALIZE, ids] }] }, 90_000); }
-      catch (e: any) { initErrors[String(e?.message ?? e).slice(0, 60)] = (initErrors[String(e?.message ?? e).slice(0, 60)] ?? 0) + 1; stack.push([f, t]); await sleep(2000); continue; }
+  // The public node allows at most 100,000 blocks per log query, so walk
+  // the whole history newest-first in 100k-block chunks, many ids per query.
+  let GROUP = Number(process.env.PM_INIT_GROUP ?? 800);
+  const CH = 100_000;
+  for (let i = 0; i < rest.length && Date.now() < deadline;) {
+    const ids = rest.slice(i, i + GROUP).filter((id) => !known.has(id));
+    if (!ids.length) { i += GROUP; continue; }
+    let refused = false;
+    for (let t = head; t >= 0 && Date.now() < deadline; t -= CH) {
+      const f = Math.max(0, t - CH + 1);
+      let j: any = null;
+      for (let a = 0; a < 6 && !j; a++) {
+        try { initCalls++; j = await post({ jsonrpc: '2.0', id: 1, method: 'eth_getLogs', params: [{ address: ROBINHOOD_V4.POOL_MANAGER, fromBlock: hex(f), toBlock: hex(t), topics: [V4_INITIALIZE, ids] }] }, 90_000); }
+        catch (e: any) { const m = String(e?.message ?? e).slice(0, 60); initErrors[m] = (initErrors[m] ?? 0) + 1; await sleep(2000); }
+      }
+      if (!j) continue;
       if (j.error) {
         const m = String(j.error.message ?? '').slice(0, 80); initErrors[m] = (initErrors[m] ?? 0) + 1;
-        if (t - f > 200_000) { const mid = Math.floor((f + t) / 2); stack.push([mid + 1, t], [f, mid]); }
+        if (GROUP > 50 && /topic|too many|limit|size|large/i.test(m)) { GROUP = Math.floor(GROUP / 2); refused = true; break; }
         continue;
       }
-      if (!firstOk) firstOk = `range ${f}-${t} ok, ${(j.result ?? []).length} logs`;
+      if (!firstOk) firstOk = `range ${f}-${t} ok, ${(j.result ?? []).length} logs, group ${ids.length}`;
       for (const l of j.result ?? []) {
         const id = lc(l.topics[1]);
         const d = (l.data as string).slice(2);
@@ -146,7 +154,10 @@ async function main() {
         const hooks = '0x' + d.slice(128 + 24, 192);
         if (!known.has(id)) { known.set(id, { t0: '0x' + l.topics[2].slice(26), t1: '0x' + l.topics[3].slice(26), fee, tickSpacing: ts, hooks: lc(hooks), dex: lc(hooks) === ZERO_ADDR ? 'uniswap-v4' : 'uniswap-v4-hooked', how: 'initialize' } as any); viaInit++; }
       }
+      if (ids.every((id) => known.has(id))) break;
+      if ((head - t) % (CH * 100) === 0) log(`Initialize search: ids ${i}-${i + ids.length}, down to block ${f}, named ${viaInit}, rps ${rps.toFixed(1)}`);
     }
+    if (!refused) i += GROUP;
   }
   log(`named via Initialize search: ${viaInit} (${initCalls} calls); errors: ${JSON.stringify(initErrors).slice(0, 400)}; first ok: ${firstOk}`);
   writeFileSync(`${OUT}/v4keys-init.json`, JSON.stringify(Object.fromEntries([...known].filter(([id]) => cand.has(id)))));

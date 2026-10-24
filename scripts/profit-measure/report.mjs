@@ -49,6 +49,7 @@ const cov = { 1: meta.tier1.read / Math.max(1, meta.tier1.total), 2: meta.tier2.
 const weightOf = (a) => 1 / Math.max(1e-9, cov[a.tier] ?? 1);
 
 // One arbitrage in dollars.
+let loopFixed = 0;
 function price(a) {
   const p = prices.get(a.hash);
   let gross = 0, unpriced = false, thin = false;
@@ -59,7 +60,18 @@ function price(a) {
     for (const [tt, px] of [...(p?.net ?? []), ...(p?.out ?? [])]) if (tt === t && px) return px;
     return null;
   };
-  a.net.forEach(([t, raw]) => {
+  // Closed loop with every hop's amounts known: profit = last coin out minus
+  // first coin in (same coin). This corrects a double count in the shared
+  // detector when a bot wraps plain ETH it got from a V4 pool (WETH mint
+  // shows as a Transfer from address 0 on this chain).
+  let netList = a.net;
+  const hp = a.hops;
+  if (hp.length >= 2 && hp.every((h) => h.tin && h.tout && h.ain && h.aout) && hp[0].tin === hp[hp.length - 1].tout && hp.every((h, i) => i === 0 || hp[i - 1].tout === h.tin)) {
+    const coin = hp[0].tin, cyc = BigInt(hp[hp.length - 1].aout) - BigInt(hp[0].ain);
+    const cur = a.net.find(([t]) => t === coin);
+    if (cyc > 0n && (!cur || BigInt(cur[1]) !== cyc)) { netList = [[coin, cyc.toString()], ...a.net.filter(([t]) => t !== coin)]; loopFixed++; }
+  }
+  netList.forEach(([t, raw]) => {
     const px = pxOf(t); const d = tokDec(t);
     if (!px || d === null) { unpriced = true; return; }
     if (t !== USDG && t !== WETH && px.vol < 1000) thin = true;
@@ -72,7 +84,7 @@ function price(a) {
   const gas = (Number(a.gasWei) / 1e18) * eth;
   const grossUsd = unpriced ? null : gross;
   const doubtful = thin || (grossUsd !== null && size !== null && size > 0 && grossUsd > 0.05 * size) || (grossUsd !== null && size === null && grossUsd > 50) || a.uncertain.includes('v4-native-leg-hidden') || a.uncertain.includes('v4-pool-unknown');
-  const coins = a.net.filter(([, v]) => BigInt(v) > 0n).map(([t]) => t);
+  const coins = netList.filter(([, v]) => BigInt(v) > 0n).map(([t]) => t);
   const profitCoin = coins.length === 1 ? sym(coins[0]) : coins.length ? 'mixed' : '?';
   const dexes = a.pools.map(dexOf);
   const allTradeable = dexes.every((d) => TRADEABLE.has(d));
@@ -126,7 +138,7 @@ const pairsOurs = byKey(ok.filter((x) => x.oursAny), (x) => [...new Set(x.pairs)
 const dexCombos = byKey(ok.filter((x) => x.baseCoin), (x) => [...new Set(x.dexes)].sort().join(' + '));
 const routeLen = byKey(ok.filter((x) => x.baseCoin), (x) => (x.a.pools.length >= 4 ? '4+ pools' : `${x.a.pools.length} pools`));
 const all = P;  // every arbitrage incl. doubtful/unpriced (counts only)
-const trustCounts = { ok: ok.length, doubtful: P.filter((x) => x.trust === 'doubtful').length, unpriced: P.filter((x) => x.trust === 'unpriced').length };
+const trustCounts = { loopCorrected: loopFixed, ok: ok.length, doubtful: P.filter((x) => x.trust === 'doubtful').length, unpriced: P.filter((x) => x.trust === 'unpriced').length };
 
 // Timing: blocks after the opening trade, position in block.
 function timingTable(xs) {
@@ -139,6 +151,8 @@ function timingTable(xs) {
 }
 const timingOurs = timingTable(ok.filter((x) => x.oursAny));
 const timingAll = timingTable(ok.filter((x) => x.baseCoin));
+const timingOursBig = timingTable(ok.filter((x) => x.oursAny && x.net >= MIN_NET));
+const named = Object.keys(RIVALS).map((k) => { const xs = P.filter((x) => x.bot.startsWith(k)); const t = ok.filter((x) => x.bot.startsWith(k) && x.baseCoin); return { rival: RIVALS[k], address: xs[0]?.bot ?? null, arbsAll: xs.length, trusted: t.length, ...agg(t), timing: timingTable(t), wallets: new Set(xs.map((x) => x.a.from)).size, routes: xs.reduce((m, x) => (m[x.a.pools.length] = (m[x.a.pools.length] ?? 0) + 1, m), {}) }; });
 const posTable = (xs) => { const m = {}; for (const x of xs) { const k = x.a.txIndex <= 1 ? '1 (first after system tx)' : x.a.txIndex <= 3 ? '2-3' : x.a.txIndex <= 10 ? '4-10' : '11+'; m[k] = (m[k] ?? 0) + 1; } return m; };
 const posOurs = posTable(ok.filter((x) => x.oursAny));
 const timingPerBot = botsOurs.slice(0, 8).map((b) => { const xs = ok.filter((x) => x.oursAny && x.bot === b.key); return { bot: b.key, ...timingTable(xs), medianBlocks: q(xs.map((x) => x.dBlocks).filter((v) => v !== null), 0.5) }; });
@@ -184,7 +198,7 @@ const V4_MAIN = Object.keys(meta.poolInfo).find((p) => p.startsWith('0x462958d20
 const summary = {
   window: meta.window, coverage: { tier1: meta.tier1, tier2: meta.tier2 }, trustCounts, arbsFound: P.length,
   totals, botsAll: botsAll.slice(0, 15), botsOurs: botsOurs.slice(0, 15), poolsOurs: poolsOurs.slice(0, 20), pairsOurs: pairsOurs.slice(0, 15),
-  dexCombos: dexCombos.slice(0, 12), routeLen, timingOurs, timingAll, timingPerBot, posOurs, v4MainPool: V4_MAIN ?? null,
+  dexCombos: dexCombos.slice(0, 12), routeLen, timingOurs, timingAll, timingOursBig, named, timingPerBot, posOurs, v4MainPool: V4_MAIN ?? null,
   ourBot: { inWindow: oursInWindow.map((x) => ({ hash: x.a.hash, net: x.net, trust: x.trust, block: x.a.block })), census: ourCensus, nonce: meta.ourSender, censusHours },
   census: census ? { fromBlock: census.fromBlock, toBlock: census.toBlock, blocks: census.blocks, hours: censusHours, txs: census.txs, failed: census.failed, summary: census.summary, bots: censusBots.slice(0, 20) } : null,
   scenarios: scen, rpc: meta.rpc, minutes: meta.minutes,
@@ -209,6 +223,8 @@ L.push('## Who takes it (routes on our exchanges, USDG/WETH profit)', '');
 tbl(['Bot contract', 'Trades', 'Kept (seen)', 'Est./day', 'Share', 'Median', 'Max'], botsOurs.slice(0, 12).map((b) => [name(b.key), b.trades, fmt(b.net), fmt(b.netPerDayEst), `${Math.round((100 * b.netEst) / Math.max(1e-9, totals.ours_any_route.netEst))}%`, fmt(b.median), fmt(b.max)]));
 L.push('## Who takes it (all USDG/WETH-profit arbitrage, any exchange)', '');
 tbl(['Bot contract', 'Trades', 'Kept (seen)', 'Est./day', 'Share'], botsAll.slice(0, 12).map((b) => [name(b.key), b.trades, fmt(b.net), fmt(b.netPerDayEst), `${Math.round((100 * b.netEst) / Math.max(1e-9, totals.base_coin_profit.netEst))}%`]));
+L.push('## The two rivals that beat us', '');
+tbl(['Rival', 'Arbitrage seen (any price)', 'Trusted USDG/WETH', 'Kept (trusted)', 'Est./day', 'Median', 'Max', 'Same block / +1 / +2', 'Wallets', 'Route lengths'], named.map((r) => [r.rival, r.arbsAll, r.trusted, fmt(r.net), fmt(r.netPerDayEst), fmt(r.median), fmt(r.max), `${r.timing['same block']} / ${r.timing['+1 block']} / ${r.timing['+2 blocks']}`, r.wallets, JSON.stringify(r.routes)]));
 L.push('## Which pools carry the money (our exchanges)', '');
 tbl(['Pool', 'Exchange', 'Pair', 'Trades', 'Est./day', 'Swaps in window'], poolsOurs.slice(0, 15).map((p) => [short(p.key) + (p.key === V4_MAIN ? ' (V4 WETH/USDG main)' : ''), dexOf(p.key), pairOf(p.key), p.trades, fmt(p.netPerDayEst), meta.poolSwaps[p.key] ?? '?']));
 L.push('## Pairs (our exchanges)', '');
@@ -218,7 +234,7 @@ tbl(['Route', 'Trades', 'Est./day'], routeLen.map((r) => [r.key, r.trades, fmt(r
 tbl(['Exchanges used', 'Trades', 'Est./day'], dexCombos.slice(0, 10).map((r) => [r.key, r.trades, fmt(r.netPerDayEst)]));
 L.push('## Speed: when did the winner land after the trade that opened the gap?', '');
 L.push(`One block is about ${msPerBlock.toFixed(0)} ms.`, '');
-tbl(['Delay', 'Our exchanges', 'All (USDG/WETH profit)'], Object.keys(timingOurs).map((k) => [k, timingOurs[k], timingAll[k]]));
+tbl(['Delay', 'Our exchanges', 'Our exchanges, net >= $0.25', 'All (USDG/WETH profit)'], Object.keys(timingOurs).map((k) => [k, timingOurs[k], timingOursBig[k], timingAll[k]]));
 tbl(['Bot', 'same block', '+1', '+2', '+3..10', '>10', 'none seen', 'median blocks'], timingPerBot.map((t) => [name(t.bot), t['same block'], t['+1 block'], t['+2 blocks'], t['+3..10'], t['>10 blocks'], t['no trade seen (within ~2000 blocks)'], t.medianBlocks ?? '?']));
 tbl(['Position in block', 'Trades (our exchanges)'], Object.entries(posOurs));
 if (census) {
