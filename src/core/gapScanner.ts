@@ -238,11 +238,15 @@ const samePrint = (a: PoolPrint, b: PoolPrint): boolean =>
 // One pair, worked out in full: the same maths, in the same order, as the
 // inner loop of findStandingGaps above, but keeping EVERY combination with
 // its profit before gas. Returns positions in `usable`.
-function workOutPair(
+// (Feed speed, Oct 24: written as steps too, a pause allowed after each buy
+// pool, so one coin pair with many pools (n pools = n x (n-1) combinations)
+// can't make one long bite. Same combinations, same order, same numbers.)
+function* workOutPair(
   usable: PoolState[], t0: string, d0: number, d1: number, base: string, quote: string, quoteUsd: number, opts: GapOptions,
-): PairMemo['cands'] {
+): Generator<void, PairMemo['cands'], void> {
   const cands: PairMemo['cands'] = [];
   for (let bi = 0; bi < usable.length; bi++) {
+    if (bi > 0 && (bi & 3) === 0) yield; // every 4 buy pools
     const buy = usable[bi];
     const dB0 = buy.tokenA.toLowerCase() === t0 ? d0 : d1, dB1 = buy.tokenA.toLowerCase() === t0 ? d1 : d0;
     const rb = capToRealBalance(poolReserves(buy, base, dB0, dB1), buy, base, 'base', base.toLowerCase() === buy.tokenA.toLowerCase() ? dB0 : dB1);
@@ -310,7 +314,7 @@ export function* findStandingGapsSteps(
       m.scan = scan;
       memo.reused++;
     } else {
-      cands = workOutPair(usable, t0, d0, d1, base, quote, quoteUsd, opts);
+      cands = yield* workOutPair(usable, t0, d0, d1, base, quote, quoteUsd, opts);
       if (!dup) memo.set(key, { t0, t1, quote, base, quoteUsd, d0, d1, prints, cands, scan });
       memo.worked++;
     }

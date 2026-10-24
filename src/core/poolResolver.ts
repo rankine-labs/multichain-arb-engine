@@ -1,3 +1,4 @@
+import { abiEncodeFast } from './abiLite';
 import { STANDARD_V4_TIERS, V4_LOOKUP_TIERS } from '../config/v4Tiers';
 import { ethers } from 'ethers';
 import { PoolState, ChainName } from './types';
@@ -514,9 +515,20 @@ const V4_STATE_VIEW_ABI = [
 export const STANDARD_V4_FEE_TIERS: [number, number][] = STANDARD_V4_TIERS.map(([f, t]) => [f, t]);
 
 // Pool id of a V4 pool: keccak256 of its key. hooks = 0 for every pool we trade.
+// Feed speed (Oct 24): abiEncodeFast = ethers' encode, same bytes, without
+// re-hashing every address for its checksum; ids remembered (bounded: 20,000;
+// a pair lookup asks ~40 of them, the same ones again at every re-check).
+const V4_ID_TYPES = ['address', 'address', 'uint24', 'int24', 'address'];
+const v4Ids = new Map<string, string>();
 export function v4PoolId(currency0: string, currency1: string, fee: number, tickSpacing: number, hooks = ethers.ZeroAddress): string {
-  return ethers.keccak256(ethers.AbiCoder.defaultAbiCoder().encode(
-    ['address', 'address', 'uint24', 'int24', 'address'], [currency0, currency1, fee, tickSpacing, hooks]));
+  const key = `${currency0}|${currency1}|${fee}|${tickSpacing}|${hooks}`;
+  let id = v4Ids.get(key);
+  if (id === undefined) {
+    id = ethers.keccak256(abiEncodeFast(V4_ID_TYPES, [currency0, currency1, fee, tickSpacing, hooks]));
+    if (v4Ids.size >= 20_000) v4Ids.clear();
+    v4Ids.set(key, id);
+  }
+  return id;
 }
 
 // Every HOOKLESS V4 pool for (tokenA, tokenB) with liquidity: every fee /

@@ -209,6 +209,20 @@ Oct 24 fix switches (same idea, each puts back one old behaviour):
 `RPC_LEAN_CALL=0` (bundled reads through provider.call again),
 `SCAN_LOAD_CHUNKED=0` (saved pool scan read in one go),
 `RIVAL_SLICED=0` (rival watch jobs all back to back again).
+Oct 24 feed speed switches (PR "feed trade speed"; each puts back one old
+behaviour, none changes what a trade decides):
+`FEED_TRADE_DEFER=0` (the decide part of every trade in a feed message runs
+back to back again, before the sidecar's answer can be read),
+`FEED_FAST_PARSE=0` (ethers finds the router function again: a hash per
+function, every call), `FEED_FAST_ABI=0` (ethers reads the call arguments
+again: ~16x slower per swap, ~10x more throw-away memory; also the ~200
+questions of a new pair's pool lookup), `PAIR_DISCOVERY_YIELD=0` (a new
+pair's lookup is built inside the feed trade that noticed it again; now it
+runs a moment later under its own name, `pair discovery`).
+`[feed-turns] 5 min: N trades decided one per loop pass · longest line L ·
+wait p50 / p90 / max ms` (every 5 min, next to `[stalls]`): how long trades
+waited for their turn. A wait p90 over ~20 ms or a longest line in the
+hundreds means the decide part itself is the bottleneck: send Claude the line.
 Profiler: `FREEZE_PROFILE=0` off; `FREEZE_PROFILE_MS` (200),
 `FREEZE_PROFILE_COUNT` (3), `FREEZE_PROFILE_WINDOW_S` (60),
 `FREEZE_PROFILE_SECONDS` (5), `FREEZE_PROFILE_EVERY_MIN` (30),
