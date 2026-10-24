@@ -203,6 +203,12 @@ Fix switches (only if Claude asks; each puts back the old behaviour of one
 Oct 23 fix): `FEED_TX_MEMO=0` (unpack each feed transaction again per
 reader), `FEED_SKIP_REPEATS=0` (unpack a reconnect's backlog again),
 `TRIG_ENTRY_TABLE_REUSE_MS=0` (rebuild every table route every time).
+Oct 24 fix switches (same idea, each puts back one old behaviour):
+`FEED_LIGHT_DECODE=0` (ethers unpacks every feed transaction again),
+`RPC_LEAN=0` (node requests / answers through ethers' slow text converters),
+`RPC_LEAN_CALL=0` (bundled reads through provider.call again),
+`SCAN_LOAD_CHUNKED=0` (saved pool scan read in one go),
+`RIVAL_SLICED=0` (rival watch jobs all back to back again).
 Profiler: `FREEZE_PROFILE=0` off; `FREEZE_PROFILE_MS` (200),
 `FREEZE_PROFILE_COUNT` (3), `FREEZE_PROFILE_WINDOW_S` (60),
 `FREEZE_PROFILE_SECONDS` (5), `FREEZE_PROFILE_EVERY_MIN` (30),

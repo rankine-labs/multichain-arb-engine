@@ -1,4 +1,5 @@
-import { open, rename, mkdir } from 'fs/promises';
+import { open, rename, mkdir, readFile } from 'fs/promises';
+import * as bufferMod from 'buffer';
 import { dirname } from 'path';
 import { stallFinder } from './stallFinder';
 
@@ -201,4 +202,193 @@ export function writeJsonChunkedQueued(file: string, value: unknown, name = 'jso
   const clear = () => { if (saving.get(file) === next) saving.delete(file); };
   next.then(clear, clear);
   return next;
+}
+
+// ---------------------------------------------------------------------------
+// JSON READ in pieces (freeze fix 2, Oct 24)
+//
+// Plain English: the saved pool scan (data/robinhood-universe.json, every
+// pool on the chain, tens of MB) was read with ONE JSON.parse after a
+// synchronous file read: live, "scan file load" froze the bot for ~880 ms
+// at every start (and inside the first pool scan). This reads it in ~5 ms
+// bites instead: the file is read without blocking, turned into text a
+// megabyte at a time, and big lists are parsed a couple of thousand items
+// at a time with JSON.parse itself (so text rules, numbers and escapes are
+// exactly JSON's). The result is exactly what JSON.parse gives (tested).
+//
+// Only a top-level object or list, whose values may be big lists of small
+// items, is read this way. Anything the reader is not sure about returns
+// null, and the caller then uses JSON.parse in one go (the old way), so an
+// unusual or broken file behaves exactly as before.
+// ---------------------------------------------------------------------------
+const WS_CODES = new Set([0x20, 0x09, 0x0a, 0x0d]); // JSON's only whitespace
+function skipWs(t: string, i: number): number {
+  while (i < t.length && WS_CODES.has(t.charCodeAt(i))) i++;
+  return i;
+}
+// Index of the closing quote of the string that starts at i (t[i] = '"'), or -1.
+function stringEnd(t: string, i: number): number {
+  let j = i + 1;
+  for (;;) {
+    const q = t.indexOf('"', j);
+    if (q < 0) return -1;
+    let bs = 0;
+    for (let k = q - 1; k > i && t.charCodeAt(k) === 0x5c; k--) bs++;
+    if (bs % 2 === 0) return q;   // not escaped
+    j = q + 1;
+  }
+}
+// Index just after the JSON value that starts at i, or -1. Only finds the
+// end; JSON.parse checks the value itself afterwards.
+function valueEnd(t: string, i: number): number {
+  const c = t.charCodeAt(i);
+  if (c === 0x22) { const e = stringEnd(t, i); return e < 0 ? -1 : e + 1; }
+  if (c === 0x5b || c === 0x7b) {
+    let d = 0;
+    for (let j = i; j < t.length; j++) {
+      const x = t.charCodeAt(j);
+      if (x === 0x22) { j = stringEnd(t, j); if (j < 0) return -1; }
+      else if (x === 0x5b || x === 0x7b) d++;
+      else if (x === 0x5d || x === 0x7d) { d--; if (d === 0) return j + 1; }
+    }
+    return -1;
+  }
+  // number / true / false / null: up to the next separator or whitespace
+  let j = i;
+  while (j < t.length) {
+    const x = t.charCodeAt(j);
+    if (x === 0x2c || x === 0x5d || x === 0x7d || WS_CODES.has(x)) break;
+    j++;
+  }
+  return j > i ? j : -1;
+}
+// The list that starts at i (t[i] = '['), parsed a batch of items at a time.
+// Returns [list, index after it] or null.
+function* arraySteps(t: string, i: number): Generator<void, [unknown[], number] | null, void> {
+  const out: unknown[] = [];
+  let p = skipWs(t, i + 1);
+  if (t.charCodeAt(p) === 0x5d) return [out, p + 1];
+  const BATCH = 1_000;
+  let from = p, count = 0, last = p;
+  const flush = (): boolean => {
+    if (!count) return true;
+    let part: unknown;
+    try { part = JSON.parse('[' + t.slice(from, last) + ']'); } catch { return false; }
+    if (!Array.isArray(part) || part.length !== count) return false;
+    for (const x of part) out.push(x);
+    count = 0;
+    return true;
+  };
+  for (;;) {
+    const e = valueEnd(t, p);
+    if (e < 0) return null;
+    count++; last = e;
+    const q = skipWs(t, e);
+    const sep = t.charCodeAt(q);
+    if (sep === 0x5d) { if (!flush()) return null; return [out, q + 1]; }
+    if (sep !== 0x2c) return null;
+    if (count >= BATCH) { if (!flush()) return null; from = skipWs(t, q + 1); }
+    p = skipWs(t, q + 1);
+    if ((count & 127) === 0) yield;
+  }
+}
+// A value at i: a list in batches, anything else with one JSON.parse.
+function* valueSteps(t: string, i: number): Generator<void, [unknown, number] | null, void> {
+  if (t.charCodeAt(i) === 0x5b) return yield* arraySteps(t, i);
+  const e = valueEnd(t, i);
+  if (e < 0) return null;
+  try { return [JSON.parse(t.slice(i, e)), e]; } catch { return null; }
+}
+export function* parseJsonSteps(t: string): Generator<void, { value: unknown } | null, void> {
+  let i = skipWs(t, 0);
+  let value: unknown;
+  if (t.charCodeAt(i) === 0x5b) {
+    const r = yield* arraySteps(t, i);
+    if (!r) return null;
+    [value, i] = r;
+  } else if (t.charCodeAt(i) === 0x7b) {
+    const obj: Record<string, unknown> = {};
+    i = skipWs(t, i + 1);
+    if (t.charCodeAt(i) === 0x7d) i++;
+    else {
+      for (;;) {
+        if (t.charCodeAt(i) !== 0x22) return null;
+        const ke = stringEnd(t, i);
+        if (ke < 0) return null;
+        let key: unknown;
+        try { key = JSON.parse(t.slice(i, ke + 1)); } catch { return null; }
+        if (typeof key !== 'string' || key === '__proto__') return null; // never guess on that one
+        i = skipWs(t, ke + 1);
+        if (t.charCodeAt(i) !== 0x3a) return null;
+        const r = yield* valueSteps(t, skipWs(t, i + 1));
+        if (!r) return null;
+        obj[key] = r[0];  // same as JSON.parse: a repeated key keeps its first place, last value
+        i = skipWs(t, r[1]);
+        const sep = t.charCodeAt(i);
+        if (sep === 0x7d) { i++; break; }
+        if (sep !== 0x2c) return null;
+        i = skipWs(t, i + 1);
+        yield;
+      }
+    }
+    value = obj;
+  } else return null;
+  if (skipWs(t, i) !== t.length) return null; // anything after the value: let JSON.parse decide
+  return { value };
+}
+
+// Read a JSON file without freezing the bot (see above). Same answer as
+// JSON.parse(readFileSync(file, 'utf8')), including its errors (thrown).
+// The odd-file fallback (one JSON.parse) is timed as `name` too.
+export async function readJsonChunked(file: string, name = 'json load', sliceMs = 5): Promise<unknown> {
+  const buf = await readFile(file);
+  // Bytes to text. Plain ASCII (the scan file): one byte = one character, a
+  // single native copy (~25 ms for 40 MB on a test machine). Anything else:
+  // UTF-8, exactly like readFileSync(file, 'utf8').
+  const isAscii = (bufferMod as { isAscii?: (b: Uint8Array) => boolean }).isAscii;
+  const text = stallFinder.run(name, () => (typeof isAscii === 'function' && isAscii(buf) ? buf.toString('latin1') : buf.toString('utf8')));
+  const r = await runSteps(parseJsonSteps(text), name, sliceMs);
+  if (r) return r.value;
+  return stallFinder.run(name, () => JSON.parse(text));
+}
+
+// ---------------------------------------------------------------------------
+// SLICED QUEUE (freeze fix 2, Oct 24): many small jobs, run in order, a few
+// ms at a time.
+//
+// Plain English: some per-transaction side jobs (the rival watch's look at
+// every feed transaction, which sometimes has to check a signature, 1-2 ms)
+// were each queued with setImmediate. Node runs ALL jobs queued that way in
+// one go, so a busy feed message queued 40 of them and they ran back to back:
+// "rival watch" freezes up to ~150 ms live. This queue runs the same jobs in
+// the same order, but stops after ~sliceMs and lets the rest of the bot run
+// (feed messages, node replies) before the next bite. Nothing is dropped.
+// ---------------------------------------------------------------------------
+export class SlicedQueue {
+  private q: Array<() => void> = [];
+  private head = 0;
+  private scheduled = false;
+  constructor(private readonly sliceMs = 5) {}
+  // Number of jobs still waiting (tests / reports).
+  size(): number { return this.q.length - this.head; }
+  push(job: () => void): void {
+    this.q.push(job);
+    if (!this.scheduled) { this.scheduled = true; setImmediate(() => this.run()); }
+  }
+  private run(): void {
+    this.scheduled = false;
+    const t0 = performance.now();
+    const bite = effectiveSliceMs(this.sliceMs);
+    while (this.head < this.q.length) {
+      const job = this.q[this.head];
+      this.q[this.head++] = undefined as unknown as () => void; // let it be cleaned up
+      try { job(); } catch { /* a job's problem never stops the others */ }
+      if (performance.now() - t0 >= bite) break;
+    }
+    if (this.head >= this.q.length) { this.q = []; this.head = 0; return; }
+    // Drop the finished part of the list now and then (not on every job).
+    if (this.head > 1_024) { this.q = this.q.slice(this.head); this.head = 0; }
+    this.scheduled = true;
+    setImmediate(() => this.run());
+  }
 }

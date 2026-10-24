@@ -1,4 +1,4 @@
-import { Transaction, keccak256 } from 'ethers';
+import { Transaction, keccak256, getAddress } from 'ethers';
 
 // ============================================================================
 // NITRO SEQUENCER FEED PARSER (Robinhood Chain = Arbitrum Orbit / Nitro)
@@ -121,6 +121,210 @@ export function decodeFeedTx(raw: string): Transaction | null {
   return tx;
 }
 
+// ----------------------------------------------------------------------------
+// LIGHT READ OF A FEED TRANSACTION (freeze fix 2, Oct 24)
+//
+// Plain English: the feed path only needs three things from most
+// transactions: who it goes to (`to`), the call data, and the ETH amount.
+// ethers' full unpack (Transaction.from) works them out too, but it turns
+// every byte into text and back several times: ~250 us and ~300 KB of
+// throw-away memory for a 1 KB swap (TEST numbers). On a busy feed that was
+// the biggest single piece of "feed tap" freezes and of the memory clean-up
+// (GC) work.
+//
+// peekFeedTx() reads the same three fields straight from the bytes, with
+// the SAME rules ethers uses to accept or refuse a transaction, for the
+// common kinds (legacy, type 1, type 2 with an empty access list):
+//   result object -> ethers would read it, and gives exactly these values
+//   null          -> ethers would refuse it too ("unreadable")
+//   undefined     -> not sure (type 3 / 4, a non-empty access list, odd
+//                    text): the caller asks ethers, exactly as before
+// A test compares it with ethers on thousands of real and broken
+// transactions (src/test/freezeFix2.test.ts).
+// The sender ("from") still comes from ethers, only when someone asks.
+//
+// Switch: FEED_LIGHT_DECODE=0 = always ethers (the old way).
+// ----------------------------------------------------------------------------
+export type FeedTxPeek = { to: string | null; data: string; value: bigint };
+function lightOn(): boolean { return process.env.FEED_LIGHT_DECODE !== '0'; }
+
+// Checksummed addresses already worked out (the same routers and pools come
+// up again and again; the checksum needs a hash). Capped, then cleared.
+const ADDR_MEMO_MAX = 8_192;
+const addrMemo = new Map<string, string>();
+function checksum(lower40: string): string {
+  let a = addrMemo.get(lower40);
+  if (a === undefined) {
+    a = getAddress('0x' + lower40);
+    if (addrMemo.size >= ADDR_MEMO_MAX) addrMemo.clear();
+    addrMemo.set(lower40, a);
+  }
+  return a;
+}
+
+// One RLP item, read with ethers' own (lenient) rules (utils/rlp-decode.js).
+// s..e = its content; next = where the following item starts; list = a list.
+// null = ethers' reader would throw here (too short / runs past the end).
+type RlpItem = { list: boolean; s: number; e: number; next: number };
+function rlpItem(b: Uint8Array, off: number): RlpItem | null {
+  const n = b.length;
+  if (off >= n) return null;
+  const p = b[off];
+  // Length-of-length forms: the length is a big-endian number of ll bytes
+  // (worked out like ethers: plain number maths).
+  const longLen = (ll: number): number => {
+    let len = 0;
+    for (let i = 0; i < ll; i++) len = len * 256 + b[off + 1 + i];
+    return len;
+  };
+  if (p >= 0xf8) {
+    const ll = p - 0xf7;
+    if (off + 1 + ll > n) return null;
+    const len = longLen(ll);
+    if (off + 1 + ll + len > n) return null;
+    return { list: true, s: off + 1 + ll, e: off + 1 + ll + len, next: off + 1 + ll + len };
+  }
+  if (p >= 0xc0) {
+    const len = p - 0xc0;
+    if (off + 1 + len > n) return null;
+    return { list: true, s: off + 1, e: off + 1 + len, next: off + 1 + len };
+  }
+  if (p >= 0xb8) {
+    const ll = p - 0xb7;
+    if (off + 1 + ll > n) return null;
+    const len = longLen(ll);
+    if (off + 1 + ll + len > n) return null;
+    return { list: false, s: off + 1 + ll, e: off + 1 + ll + len, next: off + 1 + ll + len };
+  }
+  if (p >= 0x80) {
+    const len = p - 0x80;
+    if (off + 1 + len > n) return null;
+    return { list: false, s: off + 1, e: off + 1 + len, next: off + 1 + len };
+  }
+  return { list: false, s: off, e: off + 1, next: off + 1 }; // a single byte is its own value
+}
+
+// The items inside a list (s..e). null = ethers' reader would throw (an
+// item runs past the list's end). The items' own insides are not read: a
+// nested list in a field that must be a plain value is refused anyway.
+function rlpChildren(b: Uint8Array, s: number, e: number): RlpItem[] | null {
+  const out: RlpItem[] = [];
+  let off = s;
+  while (off < e) {
+    const it = rlpItem(b, off);
+    if (!it || it.next > e) return null;
+    out.push(it);
+    off = it.next;
+  }
+  return out;
+}
+
+// Number of bytes once leading zero bytes are dropped.
+function sigLen(b: Uint8Array, it: RlpItem): number {
+  let s = it.s;
+  while (s < it.e && b[s] === 0) s++;
+  return it.e - s;
+}
+// A whole number field as ethers reads it: plain value, at most 32 bytes
+// once leading zeros are dropped (ethers handleUint).
+const okUint = (b: Uint8Array, it: RlpItem): boolean => !it.list && sigLen(b, it) <= 32;
+// A small number field (ethers handleNumber / getNumber): at most 2^53 - 1.
+function smallNum(b: Uint8Array, it: RlpItem): number | null {
+  if (it.list || sigLen(b, it) > 7) return null;
+  let v = 0;
+  for (let i = it.s; i < it.e; i++) v = v * 256 + b[i];
+  return v <= 0x1fffffffffffff ? v : null;
+}
+// The value as a bigint (exact for any size).
+function bigOf(buf: Buffer, it: RlpItem): bigint {
+  const len = it.e - it.s;
+  if (len === 0) return BigInt(0);
+  if (len <= 6) { let v = 0; for (let i = it.s; i < it.e; i++) v = v * 256 + buf[i]; return BigInt(v); }
+  return BigInt('0x' + buf.toString('hex', it.s, it.e));
+}
+// `to` as ethers gives it: empty = no recipient (null); 20 bytes = the
+// checksummed address; anything else = ethers refuses the transaction.
+function toOf(buf: Buffer, it: RlpItem): string | null | false {
+  if (it.list) return false;
+  const len = it.e - it.s;
+  if (len === 0) return null;
+  if (len !== 20) return false;
+  return checksum(buf.toString('hex', it.s, it.e));
+}
+
+const HEX_RE = /^0x(?:[0-9a-fA-F]{2})*$/;
+
+// See the block comment above. `bytes` = the same transaction as raw bytes
+// (saves the text-to-bytes step when the caller already has them).
+export function peekFeedTx(raw: string, bytes?: Uint8Array): FeedTxPeek | null | undefined {
+  try {
+    if (typeof raw !== 'string') return undefined;
+    let buf: Buffer;
+    if (bytes) buf = Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes.buffer, bytes.byteOffset, bytes.length);
+    else {
+      if (!HEX_RE.test(raw)) return undefined; // odd text: let ethers decide
+      buf = Buffer.from(raw.slice(2), 'hex');
+    }
+    if (buf.length === 0) return null; // ethers: "unsupported transaction type"
+    const t = buf[0];
+    if (t >= 0x7f) return peekLegacy(buf);
+    if (t === 1 || t === 2) return peekTyped(buf, t);
+    if (t === 3 || t === 4) return undefined; // blob / 7702: ethers reads these
+    return null; // any other type byte: ethers refuses it
+  } catch {
+    return undefined; // never guess: ethers decides
+  }
+}
+
+// Legacy: rlp([nonce, gasPrice, gasLimit, to, value, data(, v, r, s)]).
+function peekLegacy(buf: Buffer): FeedTxPeek | null {
+  const top = rlpItem(buf, 0);
+  if (!top || top.next !== buf.length || !top.list) return null;
+  const f = rlpChildren(buf, top.s, top.e);
+  if (!f || (f.length !== 6 && f.length !== 9)) return null;
+  if (smallNum(buf, f[0]) === null || !okUint(buf, f[1]) || !okUint(buf, f[2])) return null;
+  const to = toOf(buf, f[3]);
+  if (to === false || !okUint(buf, f[4]) || f[5].list) return null;
+  if (f.length === 9) {
+    if (!okUint(buf, f[6]) || !okUint(buf, f[7]) || !okUint(buf, f[8])) return null;
+    const v = bigOf(buf, f[6]), r = bigOf(buf, f[7]), s = bigOf(buf, f[8]);
+    if (!(r === BigInt(0) && s === BigInt(0))) {
+      // ethers: chainId = (v - 35) / 2 (never below 0); chain 0 needs v = 27 / 28;
+      // r and s are padded to 32 bytes (more raw bytes than that = refused).
+      let chainId = (v - BigInt(35)) / BigInt(2);
+      if (chainId < BigInt(0)) chainId = BigInt(0);
+      if (chainId === BigInt(0) && v !== BigInt(27) && v !== BigInt(28)) return null;
+      if (f[7].e - f[7].s > 32 || f[8].e - f[8].s > 32) return null;
+    }
+  }
+  return { to, data: '0x' + buf.toString('hex', f[5].s, f[5].e), value: bigOf(buf, f[4]) };
+}
+
+// Type 1: 0x01 || rlp([chainId, nonce, gasPrice, gasLimit, to, value, data, accessList(, yParity, r, s)])
+// Type 2: 0x02 || rlp([chainId, nonce, maxPriorityFee, maxFee, gasLimit, to, value, data, accessList(, yParity, r, s)])
+function peekTyped(buf: Buffer, type: 1 | 2): FeedTxPeek | null | undefined {
+  const top = rlpItem(buf, 1);
+  if (!top || top.next !== buf.length || !top.list) return null;
+  const f = rlpChildren(buf, top.s, top.e);
+  const base = type === 2 ? 9 : 8;
+  if (!f || (f.length !== base && f.length !== base + 3)) return null;
+  // Number fields before `to`: chainId (uint), nonce (small), then 2 or 3 uints.
+  if (!okUint(buf, f[0]) || smallNum(buf, f[1]) === null) return null;
+  const toAt = type === 2 ? 5 : 4;
+  for (let i = 2; i < toAt; i++) if (!okUint(buf, f[i])) return null;
+  const to = toOf(buf, f[toAt]);
+  if (to === false || !okUint(buf, f[toAt + 1]) || f[toAt + 2].list) return null;
+  const al = f[toAt + 3];
+  if (!al.list || al.e !== al.s) return undefined; // access list not empty: ethers checks it
+  if (f.length === base + 3) {
+    const y = smallNum(buf, f[base]);
+    if (y !== 0 && y !== 1) return null;                       // ethers: "invalid yParity"
+    const r = f[base + 1], s = f[base + 2];
+    if (r.list || s.list || r.e - r.s > 32 || s.e - s.s > 32) return null; // ethers: padded to 32 bytes
+  }
+  return { to, data: '0x' + buf.toString('hex', f[toAt + 2].s, f[toAt + 2].e), value: bigOf(buf, f[toAt + 1]) };
+}
+
 // Pulls every signed transaction (that calls a contract) out of one l2Msg.
 // Transactions plus their raw signed bytes (the raw bytes give the tx hash
 // directly, see parseFeedFrame).
@@ -160,6 +364,40 @@ function parseL2MessageRaw(bytes: Uint8Array, depth = 0): ParsedTx[] {
   }
 
   return [];
+}
+
+// The trade decoder's pass (parseFeedFrame): every signed transaction ethers
+// can read, with `to` / data / ETH amount from the light read (peekFeedTx);
+// ethers unpacks only the ones the light read is not sure about. Same list,
+// same order, same values as parseL2MessageRaw (tested). `body` = the raw
+// bytes (the hash is taken from them).
+type LightTx = { raw: string; body: Uint8Array; to: string | null; data: string; value: bigint };
+function parseL2MessageLight(bytes: Uint8Array, depth = 0, out: LightTx[] = []): LightTx[] {
+  if (bytes.length === 0 || depth > MAX_BATCH_DEPTH) return out;
+  const kind = bytes[0];
+  const body = bytes.subarray(1);
+  if (kind === L2_KIND_SIGNED_TX) {
+    try {
+      const raw = '0x' + Buffer.from(body.buffer, body.byteOffset, body.length).toString('hex');
+      const p = peekFeedTx(raw, body);
+      if (p) { out.push({ raw, body, to: p.to, data: p.data, value: p.value }); return out; }
+      if (p === null) return out; // ethers can't read it either: skipped, as before
+      const tx = decodeFeedTx(raw); // not sure: ethers decides (remembered)
+      if (tx) out.push({ raw, body, to: tx.to, data: tx.data, value: tx.value });
+    } catch { /* not a tx we can parse; skip, don't crash */ }
+    return out;
+  }
+  if (kind === L2_KIND_BATCH) {
+    let i = 0;
+    while (i + 8 <= body.length) {
+      const len = Number(Buffer.from(body.buffer, body.byteOffset + i, 8).readBigUInt64BE());
+      i += 8;
+      if (len <= 0 || i + len > body.length) break; // truncated / malformed
+      parseL2MessageLight(body.subarray(i, i + len), depth + 1, out);
+      i += len;
+    }
+  }
+  return out;
 }
 
 // Every signed transaction of one l2Msg, strictly: anything that isn't a
@@ -247,13 +485,22 @@ function lazySender(): boolean { return process.env.FEED_LAZY_SENDER !== '0'; }
 
 // Adds a `from` property that recovers the sender the first time it is read
 // and caches the answer. Enumerable, so it still shows up like a normal field.
-export function defineLazyFrom(target: { from?: string | null }, tx: Transaction): void {
+// `tx` may also be a function that unpacks the transaction only then (the
+// light read above did not need ethers' full unpack until now).
+export function defineLazyFrom(target: { from?: string | null }, tx: Transaction | (() => Transaction | null)): void {
   let done = false;
   let value: string | null = null;
   Object.defineProperty(target, 'from', {
     enumerable: true,
     configurable: true,
-    get() { if (!done) { value = safeFrom(tx); done = true; } return value; },
+    get() {
+      if (!done) {
+        const t = typeof tx === 'function' ? tx() : tx;
+        value = t ? safeFrom(t) : null;
+        done = true;
+      }
+      return value;
+    },
   });
 }
 
@@ -273,6 +520,24 @@ export function parseFeedFrame(frame: unknown): FeedTx[] {
     try {
       bytes = Buffer.from(inner.l2Msg, 'base64');
     } catch {
+      continue;
+    }
+
+    // Light read (FEED_LIGHT_DECODE, default on): to / data / amount from the
+    // bytes; ethers unpacks a transaction only for its sender, when asked.
+    if (lightOn()) {
+      let txIndex = -1;
+      for (const p of parseL2MessageLight(bytes)) {
+        txIndex++;
+        try {
+          if (!p.to || !p.data || p.data === '0x') continue; // plain transfers aren't swaps
+          const raw = p.raw;
+          const out = { sequenceNumber: seq, hash: feedTxHash(raw, p.body), to: p.to, data: p.data, value: p.value.toString(), raw, txIndex } as FeedTx;
+          if (lazySender()) defineLazyFrom(out, () => decodeFeedTx(raw));
+          else { const tx = decodeFeedTx(raw); out.from = tx ? safeFrom(tx) : null; }
+          txs.push(out);
+        } catch { /* malformed: skip this one, keep the rest of the frame */ }
+      }
       continue;
     }
 

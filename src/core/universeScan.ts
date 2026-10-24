@@ -1,7 +1,8 @@
 import { ethers } from 'ethers';
 import { v4AsksPaced, findV4Pools, V4_TIERS } from './v4Lookup';
 import { STANDARD_V4_TIERS } from '../config/v4Tiers';
-import { Steps, drainSteps, runSteps, yieldToLoop, Pacer } from './chunked';
+import { ethCall } from './leanRpc';
+import { Steps, drainSteps, runSteps, yieldToLoop, Pacer, readJsonChunked } from './chunked';
 import { timed } from './stallFinder';
 
 // ============================================================================
@@ -310,7 +311,8 @@ export async function makeCaller(provider: ethers.JsonRpcProvider): Promise<{ ca
   const rawCall = async (c: Call): Promise<string | null> => {
     let last: unknown;
     for (let i = 0; i < 2; i++) {
-      try { return await provider.call({ to: c.target, data: c.data }); }
+      // Freeze fix 2: same request and answer as provider.call, less throw-away memory (core/leanRpc.ts).
+      try { return await ethCall(provider, c.target, c.data); }
       catch (err) {
         if ((err as any)?.code === 'CALL_EXCEPTION') return null;
         last = err;
@@ -495,6 +497,18 @@ export interface ScanState {
 
 export function emptyScanState(): ScanState {
   return { version: 1, lastBlock: {}, tokens: [], pools: [], factories: [] };
+}
+
+// The saved scan state, read in ~5 ms bites (freeze fix 2, Oct 24: the
+// one-go read froze the bot ~880 ms live). Same answer as the old
+// JSON.parse(readFileSync(file)) loader: a missing, unreadable or
+// unexpected file gives an empty state.
+export async function loadScanStateFile(file: string, sliceMs = 5): Promise<ScanState> {
+  try {
+    const st = await readJsonChunked(file, 'scan file load', sliceMs) as ScanState | null;
+    if (st?.version === 1 && Array.isArray(st.pools)) return st;
+  } catch { /* missing or unreadable: start fresh */ }
+  return emptyScanState();
 }
 
 export function stateToPools(state: ScanState): ScannedPool[] {

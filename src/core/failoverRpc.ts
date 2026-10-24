@@ -2,6 +2,7 @@ import { ethers } from 'ethers';
 import { isRateLimited } from '../execution/simulator';
 import { endpointLabel } from './endpointLabel';
 import { budgetForUrl, callsInBody } from './nodeBudget';
+import { LeanJsonRpcProvider } from './leanRpc';
 
 // ============================================================================
 // FAST / HEAVY RPC SPLIT WITH FAILOVER
@@ -257,8 +258,10 @@ export function meter(req: ethers.FetchRequest, url: string): ethers.FetchReques
 }
 
 // A normal ethers provider (drop-in for JsonRpcProvider) that routes every
-// request through FailoverRouter.
-export class FailoverJsonRpcProvider extends ethers.JsonRpcProvider {
+// request through FailoverRouter. Every node it talks to uses the lean
+// request / answer handling (core/leanRpc.ts: same bytes, less throw-away
+// memory; RPC_LEAN=0 = ethers' own).
+export class FailoverJsonRpcProvider extends LeanJsonRpcProvider {
   readonly router: FailoverRouter;
   private readonly heavyProvider: ethers.JsonRpcProvider | null;
 
@@ -271,12 +274,12 @@ export class FailoverJsonRpcProvider extends ethers.JsonRpcProvider {
   constructor(fastUrl: string, heavyUrl: string | null, chainId: number, opts: { restMs?: number; fastTimeoutMs?: number; slowMs?: number; extraFastUrls?: string[]; backupUrls?: string[]; logTag?: string } = {}) {
     super(fastRequest(fastUrl, opts.fastTimeoutMs ?? 5_000, false), chainId, { staticNetwork: true });
     // HEAVY: metered too, and no long built-in retries (fail fast, switch).
-    this.heavyProvider = heavyUrl && heavyUrl !== fastUrl ? new ethers.JsonRpcProvider(fastRequest(heavyUrl, 10_000), chainId, { staticNetwork: true }) : null;
+    this.heavyProvider = heavyUrl && heavyUrl !== fastUrl ? new LeanJsonRpcProvider(fastRequest(heavyUrl, 10_000), chainId, { staticNetwork: true }) : null;
     const heavyProvider = this.heavyProvider;
     const extras = (opts.extraFastUrls ?? []).filter((u) => u && u !== fastUrl && u !== heavyUrl);
-    this.extraFast = extras.map((u) => new ethers.JsonRpcProvider(fastRequest(u, opts.fastTimeoutMs ?? 5_000, false), chainId, { staticNetwork: true }));
+    this.extraFast = extras.map((u) => new LeanJsonRpcProvider(fastRequest(u, opts.fastTimeoutMs ?? 5_000, false), chainId, { staticNetwork: true }));
     const backups = (opts.backupUrls ?? []).filter((u) => u && u !== fastUrl && u !== heavyUrl && !extras.includes(u));
-    this.backupProviders = backups.map((u) => new ethers.JsonRpcProvider(fastRequest(u, opts.fastTimeoutMs ?? 5_000, false), chainId, { staticNetwork: true }));
+    this.backupProviders = backups.map((u) => new LeanJsonRpcProvider(fastRequest(u, opts.fastTimeoutMs ?? 5_000, false), chainId, { staticNetwork: true }));
     this.router = new FailoverRouter(
       [
         { label: endpointLabel(fastUrl), send: (p) => super._send(p), wait: budgetWait(fastUrl) },
