@@ -125,6 +125,7 @@ export type TrigFirstSettings = {
   strict: boolean;                // TRIG_FIRST_STRICT [0] 1 = no assumptions at all (old strict rules)
   assume: string[];               // TRIG_FIRST_ASSUME [sender_funds,recent_fill,skip] allowed assumptions
   minConfidence: TrigConfidence;  // TRIG_FIRST_MIN_CONFIDENCE [medium] lowest confidence that may send (on mode)
+  feedStore: boolean;             // TRIG_FIRST_FEED_STORE [1] hand each feed message to the sidecar once and NAME messages in questions (0 = send them inline every time, as before)
 };
 
 export function trigFirstSettings(env: Record<string, string | undefined> = process.env): TrigFirstSettings {
@@ -145,6 +146,7 @@ export function trigFirstSettings(env: Record<string, string | undefined> = proc
     strict: (env.TRIG_FIRST_STRICT ?? '').trim() === '1',
     assume: (env.TRIG_FIRST_ASSUME ?? 'sender_funds,recent_fill,skip').split(',').map((x) => x.trim().toLowerCase()).filter((x) => x === 'sender_funds' || x === 'recent_fill' || x === 'skip'),
     minConfidence: minConfidenceOf(env.TRIG_FIRST_MIN_CONFIDENCE),
+    feedStore: (env.TRIG_FIRST_FEED_STORE ?? '1').trim() !== '0',
   };
 }
 
@@ -162,10 +164,13 @@ export class FeedOrderBuffer {
 
   constructor(private readonly keep = 600) {}
 
-  ingest(list: FeedMsg[], at: number): void {
+  // Returns the messages that were new (speed-3 feed store: handed on once).
+  ingest(list: FeedMsg[], at: number): FeedMsg[] {
+    const fresh: FeedMsg[] = [];
     for (const m of list) {
       if (!m || !Number.isSafeInteger(m.seq) || this.msgs.has(m.seq)) continue;
       this.msgs.set(m.seq, { ...m, at });
+      fresh.push(m);
       for (const t of m.txs) this.where.set(t.hash.toLowerCase(), m.seq);
       if (m.seq < this.lo) this.lo = m.seq;
       if (m.seq > this.hi) this.hi = m.seq;
@@ -180,6 +185,7 @@ export class FeedOrderBuffer {
       this.lo++;
     }
     if (!this.msgs.size) { this.lo = Infinity; this.hi = -1; }
+    return fresh;
   }
 
   // Feed sequence number of a transaction (undefined = not in the buffer).
@@ -434,6 +440,11 @@ export type TriggerFirstOptions = {
   now?: () => number;
 };
 
+// One feed message as a question carries it (and as `feed_put` hands it over).
+export function feedMsgWire(m: FeedMsg): Record<string, unknown> {
+  return { seq: m.seq, ts: m.ts, l1: m.l1, txs: m.txs.map((t) => t.raw), complete: m.complete, ...(m.why ? { why: m.why } : {}) };
+}
+
 export class TriggerFirst {
   readonly settings: TrigFirstSettings;
   readonly buffer: FeedOrderBuffer;
@@ -512,8 +523,127 @@ export class TriggerFirst {
 
   // Every feed message (robinhoodChain.ts setFeedMsgTap). Cheap.
   onFeedMsgs(msgs: FeedMsg[], at: number): void {
-    try { this.buffer.ingest(msgs, at); } catch { this.hour.errors++; }
+    let fresh: FeedMsg[] = [];
+    try { fresh = this.buffer.ingest(msgs, at); } catch { this.hour.errors++; }
+    if (fresh.length) this.putFeed(fresh);
   }
+
+  // ---- FEED STORE (speed-3, Oct 24) -----------------------------------------
+  // Plain English: every trigger-first question used to carry up to 48 feed
+  // messages with all their signed transactions (~0.5 MB of text), and every
+  // candidate check of a trigger carried them again. Turning that into text
+  // here, and back into bytes + hashes + senders in the sidecar, was most of
+  // the ~18 ms the sidecar spent per question (bench: ~14 ms -> ~1.4 ms).
+  // Now each feed message goes to the sidecar ONCE, when it arrives
+  // (`feed_put`, same socket, so it is there before any question naming it),
+  // and questions name the messages ([sequence number, transaction count]).
+  // Same answers: the sidecar rebuilds exactly these messages (tested); a
+  // question is sent the old way whenever any message in it was not handed
+  // over on THIS connection, or the sidecar does not have the store (an
+  // older sidecar), and again the old way if the sidecar says it lacks one
+  // ("feed_ref_missing", e.g. it restarted).
+  private storeEpoch = -1;            // connection the store answer is for
+  private storeOn = false;            // the sidecar on that connection has a store
+  private storeAsking = false;
+  private readonly putOk = new Map<number, { n: number; epoch: number }>();
+  readonly storeStats = { puts: 0, putFails: 0, refQs: 0, inlineQs: 0, missing: 0, resent: 0 };
+
+  // Is the store usable on the current connection? (Asks the sidecar once per connection.)
+  private storeReady(): boolean {
+    if (!this.settings.feedStore) return false;
+    const c = this.client as Partial<LocalSimClient>;
+    if (typeof c.connEpoch !== 'function' || typeof c.sendOneWay !== 'function' || !this.client.isConnected()) return false;
+    const ep = c.connEpoch();
+    if (ep !== this.storeEpoch) {
+      this.storeOn = false;
+      this.putOk.clear();
+      if (!this.storeAsking) {
+        this.storeAsking = true;
+        void this.client.request({ type: 'status' }, 2_000).then((a) => {
+          const fs = (a as { feedStore?: { cap?: unknown } }).feedStore;
+          this.storeEpoch = ep;
+          this.storeOn = a.ok === true && !!fs && typeof fs.cap === 'number' && fs.cap > 0;
+          this.log(`[trigger-first] feed store ${this.storeOn ? 'on: feed messages handed to the fast check once, questions name them' : 'not in this fast check: messages sent with every question'}`);
+        }, () => undefined).finally(() => { this.storeAsking = false; });
+      }
+      return false;
+    }
+    return this.storeOn;
+  }
+
+  private putFeed(fresh: FeedMsg[]): void {
+    try {
+      if (!this.storeReady()) return;
+      const ep = (this.client as LocalSimClient).connEpoch();
+      const msg = { type: 'feed_put', msgs: fresh.map((m) => feedMsgWire(m)) };
+      if ((this.client as LocalSimClient).sendOneWay(msg)) {
+        this.storeStats.puts += fresh.length;
+        for (const m of fresh) this.putOk.set(m.seq, { n: m.txs.length, epoch: ep });
+        // Bounded: forget messages the order buffer no longer holds.
+        const lo = this.buffer.oldest();
+        if (this.putOk.size > this.settings.bufferMsgs * 2) for (const k of this.putOk.keys()) if (k < lo) this.putOk.delete(k);
+      } else this.storeStats.putFails += fresh.length;
+    } catch { this.storeStats.putFails += fresh.length; }
+  }
+
+  // The `msgs` part of a feed, or `refs` naming them when every one was
+  // handed over on this connection.
+  private feedMsgsPart(msgs: FeedMsg[]): Record<string, unknown> {
+    if (msgs.length && this.storeReady()) {
+      const ep = (this.client as LocalSimClient).connEpoch();
+      if (msgs.every((m) => { const p = this.putOk.get(m.seq); return !!p && p.epoch === ep && p.n === m.txs.length; })) {
+        this.storeStats.refQs++;
+        return { refs: msgs.map((m) => [m.seq, m.txs.length]) };
+      }
+    }
+    this.storeStats.inlineQs++;
+    return { msgs: msgs.map((m) => feedMsgWire(m)) };
+  }
+
+  // A feed that names messages -> the same feed with the messages inline
+  // (from the order buffer). null = one is no longer held.
+  private inlineFeed(feed: Record<string, unknown>): Record<string, unknown> | null {
+    const refs = feed.refs as Array<[number, number]> | undefined;
+    if (!Array.isArray(refs)) return null;
+    const msgs: FeedMsg[] = [];
+    for (const [seq, n] of refs) {
+      const m = this.buffer.get(seq);
+      if (!m || m.txs.length !== n) return null;
+      msgs.push(m);
+    }
+    // Same fields in the same order, `msgs` where `refs` was.
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(feed)) {
+      if (k === 'refs') out.msgs = msgs.map((m) => feedMsgWire(m));
+      else out[k] = v;
+    }
+    return out;
+  }
+
+  // Send a question that carries a feed; if the sidecar lacks a named
+  // message, ask again with the messages inline (same question otherwise).
+  // Also used by the entry point (execution/trigEntry.ts).
+  async requestFeed(msg: Record<string, unknown>, timeoutMs: number): Promise<SidecarAnswer> {
+    const t0 = this.now();
+    const a = await this.client.request(msg, timeoutMs);
+    const feed = msg.feed as Record<string, unknown> | undefined;
+    const missing = (x: unknown) => !!x && typeof x === 'object' && (x as { unknown?: unknown }).unknown === 'feed_ref_missing';
+    if (!feed || !Array.isArray(feed.refs) || !(missing(a) || missing((a as { disc?: unknown }).disc))) return a;
+    this.storeStats.missing++;
+    this.putOk.clear(); // what we handed over is not all there: old way until new messages are handed over
+    const inline = this.inlineFeed(feed);
+    const left = timeoutMs - (this.now() - t0);
+    if (!inline || left < 1) return a;
+    this.storeStats.resent++;
+    return this.client.request({ ...msg, feed: inline }, left);
+  }
+
+  // The client the checks use: every question goes through requestFeed.
+  private readonly feedClient: LocalSimClient = ((self: TriggerFirst) => ({
+    request: (m: Record<string, unknown>, t?: number) => self.requestFeed(m, t ?? self.settings.timeoutMs),
+    isConnected: () => self.client.isConnected(),
+    get stats() { return self.client.stats; },
+  }))(this) as unknown as LocalSimClient;
 
   // ---- the check ------------------------------------------------------------
   // Ask the fast check now. Never throws; "unknown" on any doubt.
@@ -562,7 +692,8 @@ export class TriggerFirst {
     const msgs = this.buffer.range(from, newest);
     const feed = {
       trigger: h, triggerSeq: seq,
-      msgs: msgs.map((m) => ({ seq: m.seq, ts: m.ts, l1: m.l1, txs: m.txs.map((t) => t.raw), complete: m.complete, ...(m.why ? { why: m.why } : {}) })),
+      // The messages, or (feed store) their names: see requestFeed.
+      ...this.feedMsgsPart(msgs),
       // Best effort: our route (which feed transactions could matter) and
       // which assumptions are allowed (strict = none at all).
       route: keys.filter((k): k is string => typeof k === 'string' && /^0x[0-9a-fA-F]{40}([0-9a-fA-F]{24})?$/.test(k)).map((k) => k.toLowerCase()),
@@ -653,7 +784,7 @@ export class TriggerFirst {
         const a = canned.answer as Record<string, unknown>;
         return a.ok === true ? a : { ...a, ok: false, unknown: typeof a.unknown === 'string' ? a.unknown : 'sidecar_error' };
       },
-    } as unknown as LocalSimClient) : this.client;
+    } as unknown as LocalSimClient) : this.feedClient;
     const hop: NonNullable<TrigOutcome['hop']> = {};
     // Size ladder (entry point): amountIn is the 4th 32-byte word after the
     // 4-byte code of both executor calls (localSimHost.ts sizeSearch).

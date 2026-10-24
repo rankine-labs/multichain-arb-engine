@@ -78,71 +78,98 @@ pub fn moved_pools(changed: &[(Address, U256)], hashes: &[(U256, U256, U256)], p
     if changed.is_empty() {
         return Vec::new();
     }
-    // V4: (PoolManager, slot) -> (pool index, kind) for the fixed fields,
-    // and (PoolManager, mapping slot) -> (pool index, kind) for the mappings.
-    let mut direct: HashMap<(Address, U256), (usize, &'static str)> = HashMap::new();
-    let mut parent: HashMap<(Address, U256), (usize, &'static str)> = HashMap::new();
-    let mut by_addr: HashMap<Address, usize> = HashMap::new();
-    for (i, p) in pools.iter().enumerate() {
-        match p.v4_id {
-            Some(id) => {
-                let b = v4_base(id);
-                for (k, kind) in [(0u64, "slot0"), (1, "fees"), (2, "fees"), (3, "liquidity")] {
-                    direct.insert((p.address, b + U256::from(k)), (i, kind));
+    MovedIndex::build(pools).moved(changed, hashes)
+}
+
+/// The lookup tables `moved_pools` needs, built ONCE per copy-2 registry
+/// change (copy2/checkcore.rs, speed-3) instead of for every question
+/// (~650 pools, one hash per V4 pool each time). Same answers as
+/// `moved_pools` (it is now just "build, then look up").
+#[derive(Default)]
+pub struct MovedIndex {
+    /// V4: (PoolManager, slot) -> (pool index, kind) for the fixed fields,
+    direct: HashMap<(Address, U256), (usize, &'static str)>,
+    /// and (PoolManager, mapping slot) -> (pool index, kind) for the mappings.
+    parent: HashMap<(Address, U256), (usize, &'static str)>,
+    /// Other pools: contract address -> pool index.
+    by_addr: HashMap<Address, usize>,
+    /// Pool index -> the bot's key.
+    keys: Vec<String>,
+}
+
+impl MovedIndex {
+    pub fn build(pools: &[FollowedPool]) -> MovedIndex {
+        let mut x = MovedIndex { keys: pools.iter().map(|p| p.key.clone()).collect(), ..Default::default() };
+        for (i, p) in pools.iter().enumerate() {
+            match p.v4_id {
+                Some(id) => {
+                    let b = v4_base(id);
+                    for (k, kind) in [(0u64, "slot0"), (1, "fees"), (2, "fees"), (3, "liquidity")] {
+                        x.direct.insert((p.address, b + U256::from(k)), (i, kind));
+                    }
+                    for (k, kind) in [(4u64, "ticks"), (5, "bitmap"), (6, "positions")] {
+                        x.parent.insert((p.address, b + U256::from(k)), (i, kind));
+                    }
                 }
-                for (k, kind) in [(4u64, "ticks"), (5, "bitmap"), (6, "positions")] {
-                    parent.insert((p.address, b + U256::from(k)), (i, kind));
+                None => {
+                    x.by_addr.insert(p.address, i);
                 }
-            }
-            None => {
-                by_addr.insert(p.address, i);
             }
         }
+        x
     }
-    // Hash -> its mapping slot (second word), for the hashes the run made.
-    let pre: HashMap<U256, U256> = hashes.iter().map(|(h, _, slot)| (*h, *slot)).collect();
-    let mut hits: HashMap<usize, Vec<String>> = HashMap::new();
-    let mut note = |i: usize, kind: String| {
-        let v = hits.entry(i).or_default();
-        // (kept small: the pool counts anyway, the kinds are for the log)
-        if !v.contains(&kind) && v.len() < MAX_KINDS {
-            v.push(kind);
+
+    /// See `moved_pools`.
+    pub fn moved(&self, changed: &[(Address, U256)], hashes: &[(U256, U256, U256)]) -> Vec<MovedPool> {
+        if changed.is_empty() {
+            return Vec::new();
         }
-    };
-    for (a, s) in changed {
-        if let Some((i, kind)) = direct.get(&(*a, *s)) {
-            note(*i, (*kind).to_string());
-            continue;
-        }
-        // A mapping entry (or one of its struct fields) of a V4 pool.
-        let mut found = false;
-        for off in 0..ENTRY_FIELDS {
-            let Some(h) = s.checked_sub(U256::from(off)) else { break };
-            if let Some(slot) = pre.get(&h) {
-                if let Some((i, kind)) = parent.get(&(*a, *slot)) {
-                    note(*i, (*kind).to_string());
-                    found = true;
-                    break;
+        let (direct, parent, by_addr) = (&self.direct, &self.parent, &self.by_addr);
+        // Hash -> its mapping slot (second word), for the hashes the run made.
+        let pre: HashMap<U256, U256> = hashes.iter().map(|(h, _, slot)| (*h, *slot)).collect();
+        let mut hits: HashMap<usize, Vec<String>> = HashMap::new();
+        let mut note = |i: usize, kind: String| {
+            let v = hits.entry(i).or_default();
+            // (kept small: the pool counts anyway, the kinds are for the log)
+            if !v.contains(&kind) && v.len() < MAX_KINDS {
+                v.push(kind);
+            }
+        };
+        for (a, s) in changed {
+            if let Some((i, kind)) = direct.get(&(*a, *s)) {
+                note(*i, (*kind).to_string());
+                continue;
+            }
+            // A mapping entry (or one of its struct fields) of a V4 pool.
+            let mut found = false;
+            for off in 0..ENTRY_FIELDS {
+                let Some(h) = s.checked_sub(U256::from(off)) else { break };
+                if let Some(slot) = pre.get(&h) {
+                    if let Some((i, kind)) = parent.get(&(*a, *slot)) {
+                        note(*i, (*kind).to_string());
+                        found = true;
+                        break;
+                    }
+                }
+            }
+            if found {
+                continue;
+            }
+            // Another pool's own declared variable.
+            if let Some(i) = by_addr.get(a) {
+                if *s < U256::from(DECLARED_MAX) {
+                    note(*i, format!("s{}", s.to::<u64>()));
                 }
             }
         }
-        if found {
-            continue;
-        }
-        // Another pool's own declared variable.
-        if let Some(i) = by_addr.get(a) {
-            if *s < U256::from(DECLARED_MAX) {
-                note(*i, format!("s{}", s.to::<u64>()));
-            }
-        }
+        let mut out: Vec<MovedPool> = hits
+            .into_iter()
+            .map(|(i, mut kinds)| {
+                kinds.sort();
+                MovedPool { key: self.keys[i].clone(), kinds }
+            })
+            .collect();
+        out.sort_by(|x, y| x.key.cmp(&y.key));
+        out
     }
-    let mut out: Vec<MovedPool> = hits
-        .into_iter()
-        .map(|(i, mut kinds)| {
-            kinds.sort();
-            MovedPool { key: pools[i].key.clone(), kinds }
-        })
-        .collect();
-    out.sort_by(|x, y| x.key.cmp(&y.key));
-    out
 }

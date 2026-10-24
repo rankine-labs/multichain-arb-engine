@@ -428,9 +428,14 @@ impl Shared {
             match self.try_resolve(at) {
                 Err(e) if e.reason == "dirty" && Instant::now() < deadline => {
                     // Wait for the next publish (or the deadline).
+                    let t_wait = Instant::now();
                     let g = self.changed.0.lock().unwrap();
                     let left = deadline.saturating_duration_since(Instant::now());
                     let _ = self.changed.1.wait_timeout_while(g, left, |v| *v == seen).unwrap();
+                    // Trigger-first phase timing (speed-3): time spent waiting
+                    // for a block that had arrived but wasn't applied yet.
+                    crate::timing::ph_add("dirtyWait", t_wait.elapsed().as_micros() as u64);
+                    crate::timing::ph_count("dirtyWaits", 1);
                 }
                 r => return r,
             }

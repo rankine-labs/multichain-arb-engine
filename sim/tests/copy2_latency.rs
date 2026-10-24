@@ -30,6 +30,8 @@
 //   Skipped (passes with a note) when anvil isn't installed.
 // ============================================================================
 mod copy2_util;
+#[allow(dead_code)]
+mod check_util;
 
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
@@ -357,6 +359,13 @@ struct Client {
 }
 
 impl Client {
+    /// A one-way message (no answer), e.g. `feed_put`.
+    fn tell(&mut self, v: &Value) {
+        let body = serde_json::to_vec(v).unwrap();
+        self.s.write_all(&(body.len() as u32).to_be_bytes()).unwrap();
+        self.s.write_all(&body).unwrap();
+    }
+
     fn ask(&mut self, mut v: Value) -> Value {
         self.id += 1;
         v["id"] = json!(self.id);
@@ -603,6 +612,10 @@ fn bench(pairs: usize, checks: usize) -> Option<Results> {
         }
         std::thread::sleep(Duration::from_millis(gap_ms));
     }
+    // SPEED-3: the trigger-first "which pools does it move?" question on
+    // real pool contracts (COPY2_LAT_DISCOVER questions, 0 = skip).
+    let disc_n = env_n("COPY2_LAT_DISCOVER", 60) as usize;
+    let disc_report = if disc_n > 0 { discover_bench(&w, &mut cl, &sent, &a, disc_n) } else { String::new() };
     // copy2-q (live: 484 lock holds over 1 ms, up to 197 ms, and checks
     // waited): while the copy's thread holds the published versions or the
     // pool registry for 300 ms, checks still answer at once.
@@ -663,9 +676,134 @@ fn bench(pairs: usize, checks: usize) -> Option<Results> {
         c["pm_bound_checks"], c["pm_bound_same"], c["pm_bound_differ"], c["pm_bound_route_only"], c["pm_bound_full_retry"], c["protocol_fee_checks"], c["protocol_fee_same"], c["protocol_fee_differ"]
     );
     rep += &format!("  applyTiming (us) {}\n  lockHold (us) {}\n  walked slots {} rss {} MB", st["applyTiming"], st["lockHold"], st["copy2"]["poolCoverage"]["walkSlots"], st["rssMb"]);
+    rep += &disc_report;
     eprintln!("{rep}");
     r.report = rep;
     Some(r)
+}
+
+/// anvil / hardhat test accounts #0 (deployer, holds nothing the trigger
+/// uses) and #1 (filler transactions). Public test keys, no real funds.
+const KEY0: [u8; 32] = [
+    0xac, 0x09, 0x74, 0xbe, 0xc3, 0x9a, 0x17, 0xe3, 0x6b, 0xa4, 0xa6, 0xb4, 0xd2, 0x38, 0xff, 0x94, 0x4b, 0xac, 0xb4,
+    0x78, 0xcb, 0xed, 0x5e, 0xfc, 0xae, 0x78, 0x4d, 0x7b, 0xf4, 0xf2, 0xff, 0x80,
+];
+const KEY1: [u8; 32] = [
+    0x59, 0xc6, 0x99, 0x5e, 0x99, 0x8f, 0x97, 0xa5, 0xa0, 0x04, 0x49, 0x66, 0xf0, 0x94, 0x53, 0x89, 0xdc, 0x9e, 0x86,
+    0xda, 0xe8, 0x8c, 0x7a, 0x84, 0x12, 0xf4, 0x60, 0x3b, 0x6b, 0x78, 0x69, 0x0d,
+];
+
+/// SPEED-3 discover bench (TEST NUMBERS on the practice chain, not live):
+/// a feed transaction that swaps on one of our V4 / V3 pools (signed, like
+/// a user's), asked as the bot asks it: 48 feed messages of ~10 x ~1 KB
+/// transactions (the trigger near the end, the copy a few messages behind),
+/// first with the messages inline (the old way), then naming them
+/// (feed store). Prints the bot-side time, the sidecar's wall / CPU time and
+/// its phase list (EVM runs, rounds, ...). Misses are warmed like the bot's
+/// TrigWarmer does (`warm`), then asked again.
+fn discover_bench(w: &World, cl: &mut Client, sent: &AtomicU64, a: &Anvil, n_q: usize) -> String {
+    let mut rng = Rng::new(23);
+    let mut filler_nonce = 0u64;
+    let mut filler = |n: usize| -> Vec<String> {
+        (0..n)
+            .map(|_| {
+                filler_nonce += 1;
+                hb(&check_util::sign_typed(&KEY1, 2, &check_util::TestTx { nonce: filler_nonce, gas: 100_000, to: Some(Address::with_last_byte(0x77)), value: U256::ZERO, data: vec![0xab; 900], access_list: vec![] }, 4663))
+            })
+            .collect()
+    };
+    // Warm the traders' code and coin balances once (the bot's warmer would).
+    let mut slots = serde_json::Map::new();
+    let mut coins: Vec<Address> = w.pairs.iter().map(|p| p.coin).collect();
+    coins.push(w.usd);
+    for c in &coins {
+        slots.insert(ha(*c), json!([hx64(map_slot(U256::from_be_slice(w.vt.as_slice()), U256::ZERO)), hx64(map_slot(U256::from_be_slice(w.plain.as_slice()), U256::ZERO))]));
+    }
+    let _ = cl.ask(json!({"type": "warm", "accounts": [ha(w.vt), ha(w.plain)], "slots": slots}));
+    std::thread::sleep(Duration::from_millis(1500));
+    let mut seq_seen = 0u64;
+    let mut rows: Vec<(String, f64, f64, f64, Value)> = Vec::new(); // (way, bot ms, us, cpu, answer)
+    let mut why: HashMap<String, usize> = HashMap::new();
+    let (mut same, mut compared) = (0usize, 0usize);
+    let mut nonce0 = 1_000_000u64;
+    for q in 0..n_q {
+        let i = rng.int(0, w.pairs.len() as i64 - 1) as usize;
+        let v4 = rng.next() < 0.5;
+        let (to, data) = w.trade(i, v4, rng.next() < 0.5, 50.0 + rng.next() * 2000.0);
+        nonce0 += 1;
+        let trig = check_util::sign_typed(&KEY0, 2, &check_util::TestTx { nonce: nonce0, gas: 2_000_000, to: Some(to), value: U256::ZERO, data, access_list: vec![] }, 4663);
+        let th = hb(revm::primitives::keccak256(&trig).as_slice());
+        // Messages: the copy's block - 40 .. + 7 (48), the trigger in the last.
+        let n = sent.load(Ordering::Relaxed);
+        let ts0 = u64v(&a.ok("eth_getBlockByNumber", json!([format!("{n:#x}"), false]))["timestamp"]);
+        let mut msgs = Vec::new();
+        for s in (n - 40)..=(n + 7) {
+            let mut txs = filler(10);
+            if s == n + 7 {
+                txs[4] = hb(&trig);
+            }
+            msgs.push(json!({"seq": s, "ts": ts0 + s.saturating_sub(n), "l1": 9000, "txs": txs}));
+        }
+        // Hand the new messages to the store once (feed_put), like the bot.
+        let fresh: Vec<Value> = msgs.iter().filter(|m| m["seq"].as_u64().unwrap() > seq_seen || q == 0).cloned().collect();
+        seq_seen = n + 7;
+        cl.tell(&json!({"type": "feed_put", "msgs": fresh}));
+        let refs: Vec<Value> = msgs.iter().map(|m| json!([m["seq"].clone(), m["txs"].as_array().unwrap().len()])).collect();
+        let f_inline = json!({"trigger": th, "triggerSeq": n + 7, "msgs": msgs});
+        let f_refs = json!({"trigger": th, "triggerSeq": n + 7, "refs": refs});
+        let mut ans = Vec::new();
+        for (way, f) in [("refs", &f_refs), ("inline", &f_inline)] {
+            let t = Instant::now();
+            let d = cl.ask(json!({"type": "trig_discover", "at": {"after": "head"}, "feed": f}));
+            let ms = t.elapsed().as_secs_f64() * 1000.0;
+            // Misses: warmed (like the bot's warmer), not timed.
+            if d["unknown"] == json!("miss") {
+                let mut s2 = serde_json::Map::new();
+                let mut accts = Vec::new();
+                for m in d["missing"].as_array().cloned().unwrap_or_default() {
+                    match m.get("slot").and_then(|x| x.as_str()) {
+                        Some(sl) => s2.entry(m["account"].as_str().unwrap().to_string()).or_insert_with(|| json!([])).as_array_mut().unwrap().push(json!(sl)),
+                        None => accts.push(m["account"].clone()),
+                    }
+                }
+                let _ = cl.ask(json!({"type": "warm", "accounts": accts, "slots": s2}));
+            }
+            *why.entry(format!("{way} {}", d["unknown"].as_str().unwrap_or("ok"))).or_default() += 1;
+            rows.push((way.to_string(), ms, d["us"].as_f64().unwrap_or(0.0), d["cpu"].as_f64().unwrap_or(0.0), d.clone()));
+            ans.push(d);
+        }
+        if ans[0]["snapBlock"] == ans[1]["snapBlock"] && ans[0]["ok"] == json!(true) {
+            compared += 1;
+            let st = |v: &Value| {
+                let mut v = v.clone();
+                for k in ["us", "t", "id", "ph", "pn", "cpu"] {
+                    v.as_object_mut().unwrap().remove(k);
+                }
+                v
+            };
+            if st(&ans[0]) == st(&ans[1]) {
+                same += 1;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    // Only answered questions after the first third (warm-up) count.
+    let mut out = format!("\n[bench] trig_discover on real pools ({} questions, 48 msgs x 10 txs x ~1 KB): {why:?}; inline vs refs same answer {same}/{compared}\n", n_q);
+    for way in ["inline", "refs"] {
+        let sel: Vec<&(String, f64, f64, f64, Value)> = rows.iter().skip(rows.len() / 3).filter(|r| r.0 == way && r.4["ok"] == json!(true)).collect();
+        let mut bot: Vec<f64> = sel.iter().map(|r| r.1).collect();
+        let mut us: Vec<f64> = sel.iter().map(|r| r.2 / 1000.0).collect();
+        let mut cpu: Vec<f64> = sel.iter().map(|r| r.3 / 1000.0).collect();
+        let mut evm: Vec<f64> = sel.iter().map(|r| r.4["ph"]["evm"].as_f64().unwrap_or(0.0) / 1000.0).collect();
+        let mut plan: Vec<f64> = sel.iter().map(|r| r.4["ph"]["plan"].as_f64().unwrap_or(0.0) / 1000.0).collect();
+        let mut runs: Vec<f64> = sel.iter().map(|r| r.4["pn"]["runs"].as_f64().unwrap_or(0.0)).collect();
+        let mut rounds: Vec<f64> = sel.iter().map(|r| r.4["pn"]["rounds"].as_f64().unwrap_or(0.0)).collect();
+        out += &format!("  {way}:\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n", line("    bot-side ms", &mut bot), line("    sidecar wall ms", &mut us), line("    sidecar cpu ms", &mut cpu), line("    plan ms", &mut plan), line("    evm ms", &mut evm), line("    evm runs", &mut runs), line("    replay rounds", &mut rounds));
+        if let Some(r) = sel.last() {
+            out += &format!("    last answer phases (us) {} counts {} pools {}\n", r.4["ph"], r.4["pn"], r.4["pools"]);
+        }
+    }
+    out
 }
 
 #[test]

@@ -19,7 +19,7 @@ mod check_util;
 
 use arbsim::arb::BlockCtx;
 use arbsim::check::ordered::{
-    assumed_funds, build_plan, funds_error, run_ordered, run_ordered_with, AllExact, Assume, Assumed, OrderedOut, PlanInfo, Provenance, Route, WireFeed, WireFeedMsg,
+    assumed_funds, build_plan, build_plan_with, funds_error, run_ordered, run_ordered_with, AllExact, Assume, Assumed, OrderedOut, PlanInfo, Provenance, Route, WireFeed, WireFeedMsg,
 };
 use arbsim::check::{CallReq, CheckUnknown, Overrides, UnknownReason};
 use arbsim::state::mem::MemState;
@@ -117,7 +117,7 @@ fn msg(seq: u64, txs: &[Vec<u8>]) -> WireFeedMsg {
 }
 
 fn feed(trigger: &[u8], trigger_seq: u64, msgs: Vec<WireFeedMsg>) -> WireFeed {
-    WireFeed { trigger: hexs(keccak256(trigger).as_slice()), trigger_seq, msgs, route: vec![], strict: false, assume: None }
+    WireFeed { trigger: hexs(keccak256(trigger).as_slice()), trigger_seq, msgs, route: vec![], strict: false, assume: None, refs: None }
 }
 
 /// Our trade: any non-32-byte call to the pool (reverts with the price).
@@ -306,6 +306,99 @@ fn unsupported_tx_kinds_in_the_range_are_unknown() {
     let mut m = msg(11, &[trig.clone()]);
     m.txs.insert(0, "0x03c0".into()); // a blob transaction (type 3)
     assert_eq!(reason(run(&copy(), &feed(&trig, 11, vec![m]), 10, &Overrides::none())), UnknownReason::UnsupportedTx);
+}
+
+// FEED STORE (check/feedstore.rs, speed-3): a question naming messages the
+// sidecar already holds must give EXACTLY the plan (or the very same
+// unknown / bad request) that sending the messages inline gives.
+fn same_plan(f: &WireFeed, snap_seq: u64) {
+    let store = arbsim::check::feedstore::FeedStore::new(4096);
+    store.put(&f.msgs);
+    let refs: Vec<(u64, usize)> = f.msgs.iter().map(|m| (m.seq, m.txs.len())).collect();
+    let mut b = base();
+    b.l2_block_number = Some(snap_seq);
+    let inline = build_plan(f, snap_seq, 0, &b);
+    let mut fr = f.clone();
+    fr.msgs = vec![];
+    fr.refs = Some(refs.clone());
+    // (a message whose hex is broken is never matched by the bot's count:
+    // the bot then sends it inline and gets the inline answer)
+    let held = match store.resolve(&refs) {
+        Ok(h) => h,
+        Err(_) => {
+            assert!(f.msgs.iter().any(|m| m.txs.iter().any(|t| arbsim::check::hexutil::parse_bytes(t).is_err())), "only broken hex may miss");
+            return;
+        }
+    };
+    let stored = build_plan_with(&fr, Some(&held), snap_seq, 0, &b);
+    match (&inline, &stored) {
+        (Ok((p1, i1)), Ok((p2, i2))) => {
+            assert_eq!(i1, i2);
+            assert_eq!(format!("{p1:?}"), format!("{p2:?}"), "same plan");
+        }
+        (Err(e1), Err(e2)) => assert_eq!((e1.reason, &e1.detail, &e1.missing), (e2.reason, &e2.detail, &e2.missing)),
+        _ => panic!("inline {inline:?} vs stored {stored:?}"),
+    }
+    // And a second time (transactions now decoded in the store): the same.
+    let again = build_plan_with(&fr, Some(&held), snap_seq, 0, &b);
+    assert_eq!(format!("{stored:?}"), format!("{again:?}"));
+}
+
+#[test]
+fn feed_store_plans_equal_inline_plans() {
+    let trig = stx(&KEY_A, 0, pool(), w(5));
+    let other = stx(&KEY_B, 0, dep(), w(7));
+    let later = stx(&KEY_B, 1, pool(), w(1));
+    // Normal: messages before the copy (hashed only), the trigger, later ones.
+    same_plan(&feed(&trig, 12, vec![msg(9, &[other.clone()]), msg(10, &[]), msg(11, &[other.clone()]), msg(12, &[trig.clone(), later.clone()]), msg(13, &[later.clone()])]), 10);
+    // Trigger already in the copy.
+    same_plan(&feed(&trig, 10, vec![msg(10, &[trig.clone()]), msg(11, &[other.clone()])]), 10);
+    // Gap / order / trigger missing / trigger twice / not given.
+    same_plan(&feed(&trig, 13, vec![msg(13, &[trig.clone()])]), 10);
+    same_plan(&feed(&trig, 12, vec![msg(12, &[trig.clone()]), msg(11, &[other.clone()])]), 10);
+    same_plan(&feed(&trig, 11, vec![msg(11, &[other.clone()])]), 10);
+    same_plan(&feed(&trig, 11, vec![msg(11, &[trig.clone()]), msg(12, &[trig.clone()])]), 10);
+    same_plan(&feed(&trig, 12, vec![msg(11, &[other.clone()])]), 10);
+    // Not replayable / no time / unsupported kind / broken signature.
+    let mut m = msg(11, &[trig.clone()]);
+    m.complete = false;
+    m.why = Some("deposit".into());
+    same_plan(&feed(&trig, 11, vec![m]), 10);
+    let mut m = msg(11, &[trig.clone()]);
+    m.ts = 0;
+    same_plan(&feed(&trig, 11, vec![m]), 10);
+    let mut m = msg(11, &[trig.clone()]);
+    m.txs.insert(0, "0x03c0".into());
+    same_plan(&feed(&trig, 11, vec![m]), 10);
+    let mut m = msg(11, &[trig.clone()]);
+    m.txs.insert(0, "0x02c0".into());
+    same_plan(&feed(&trig, 11, vec![m]), 10);
+    // Broken hex (the store keeps it as broken; the bot's count never matches).
+    let mut m = msg(11, &[trig.clone()]);
+    m.txs.insert(0, "0xzz".into());
+    same_plan(&feed(&trig, 11, vec![m]), 10);
+    // Block number mismatch / bad trigger hash.
+    let f = feed(&trig, 11, vec![msg(11, &[trig.clone()])]);
+    let store = arbsim::check::feedstore::FeedStore::new(16);
+    store.put(&f.msgs);
+    let held = store.resolve(&[(11, 1)]).unwrap();
+    let mut b = base();
+    b.l2_block_number = Some(9);
+    assert_eq!(format!("{:?}", build_plan(&f, 10, 0, &b)), format!("{:?}", build_plan_with(&f, Some(&held), 10, 0, &b)));
+    let mut bad = f.clone();
+    bad.trigger = "0x12".into();
+    assert_eq!(format!("{:?}", build_plan(&bad, 10, 0, &base())), format!("{:?}", build_plan_with(&bad, Some(&held), 10, 0, &base())));
+    // A message the store doesn't hold, or with another count: missing.
+    assert!(store.resolve(&[(12, 1)]).is_err());
+    assert!(store.resolve(&[(11, 2)]).is_err());
+    // First copy of a sequence number wins (like the bot's order buffer).
+    store.put(&[msg(11, &[other.clone(), other.clone()])]);
+    assert!(store.resolve(&[(11, 1)]).is_ok());
+    // Bounded: the oldest are dropped.
+    let small = arbsim::check::feedstore::FeedStore::new(3);
+    small.put(&(20..30u64).map(|s| msg(s, &[])).collect::<Vec<_>>());
+    assert_eq!(small.len(), 3);
+    assert!(small.resolve(&[(26, 0)]).is_err() && small.resolve(&[(27, 0), (28, 0), (29, 0)]).is_ok());
 }
 
 /// Benchmark (TEST NUMBERS, tiny contracts on an in-memory state, not live

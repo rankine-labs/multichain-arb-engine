@@ -463,7 +463,7 @@ export type FrameTimes = { recv: number; parsed?: number; queued?: number };
 type TableMeta = { cand: EntryCandidate; sig?: string; fallback?: boolean };
 
 // Hourly per-hop names (ms): see takeHourLine.
-const HOP_NAMES = ['parse', 'start', 'sent', 'rtt', 'scQueue', 'scWork', 'other', 'build', 'check', 'decide', 'lag'] as const;
+const HOP_NAMES = ['parse', 'start', 'sent', 'rtt', 'scQueue', 'scWork', 'scCpu', 'scPlan', 'scEvm', 'scDirty', 'other', 'build', 'check', 'decide', 'lag'] as const;
 type HopName = (typeof HOP_NAMES)[number];
 
 export class TrigEntry {
@@ -590,7 +590,7 @@ export class TrigEntry {
       hops.dSent = rel(performance.now());
       let r: Record<string, unknown> | null = null;
       try {
-        r = await withDeadline(this.d.client.request({
+        r = await withDeadline(this.d.tf.requestFeed({
           type: 'trig_entry', at: { after: 'head' }, feed: built.feed, limit: s.maxCandidates, maxPools: s.maxPools,
           minConf: this.d.tf.settings.minConfidence, budgetUs: Math.max(1_000, Math.round((left - 10) * 1_000)), gen: this.tbl.ackGen,
         }, left), left + 20);
@@ -619,7 +619,7 @@ export class TrigEntry {
     if (!one) {
       hops.dSent = rel(performance.now());
       try {
-        a = await withDeadline(this.d.client.request({ type: 'trig_discover', at: { after: 'head' }, feed: built.feed }, s.discoverTimeoutMs), s.discoverTimeoutMs + 20);
+        a = await withDeadline(this.d.tf.requestFeed({ type: 'trig_discover', at: { after: 'head' }, feed: built.feed }, s.discoverTimeoutMs), s.discoverTimeoutMs + 20);
       } catch { a = null; }
       markStretch('trig entry');
       hops.dAns = rel(performance.now());
@@ -627,6 +627,15 @@ export class TrigEntry {
       const t = (a as { t?: { queue?: number } } | null)?.t;
       hops.scQ = typeof t?.queue === 'number' ? r2(t.queue / 1_000) : undefined;
       hops.scW = typeof a?.us === 'number' ? r2((a.us as number) / 1_000) : undefined;
+    }
+    // The sidecar's own phase split (speed-3): CPU time, building the replay
+    // plan (feed read / hashes / senders), EVM runs, waiting for a block
+    // being applied (ms). CPU much lower than work = it was waiting.
+    if (a) {
+      const ph = (a as { ph?: Record<string, unknown> }).ph;
+      const ms = (v: unknown) => (typeof v === 'number' ? r2(v / 1_000) : undefined);
+      hops.scC = ms((a as { cpu?: unknown }).cpu);
+      if (ph) { hops.scP = ms(ph.plan); hops.scE = ms(ph.evm); hops.scD = ms(ph.dirtyWait); }
     }
     const discoverMs = this.now() - seenMs;
     keep(h.discoverMs, discoverMs);
@@ -792,6 +801,10 @@ export class TrigEntry {
       add('rtt', rtt);
       add('scQueue', x.scQ);
       add('scWork', x.scW);
+      add('scCpu', x.scC);
+      add('scPlan', x.scP);
+      add('scEvm', x.scE);
+      add('scDirty', x.scD);
       if (rtt !== undefined && x.scW !== undefined) add('other', r2(rtt - (x.scQ ?? 0) - x.scW));
       if (x.built !== undefined && x.dAns !== undefined) add('build', r2(x.built - x.dAns));
       for (const c of x.checks ?? []) if (c[0] !== null && c[1] !== null) add('check', r2(c[1] - c[0]));
@@ -1317,6 +1330,11 @@ export class TrigEntry {
       if (this.oneTripOn()) parts.push(`one trip ${h.one.used}${Object.keys(h.one.why).length ? ` (two steps: ${top(h.one.why)})` : ''}; table ${this.tbl.pools.size} pools / ${this.tbl.lastRoutes} routes (${this.tbl.lastReused} reused unchanged), rebuilt in ${this.tbl.lastMs} ms`);
       const hp = HOP_NAMES.filter((k) => h.hops[k].length).map((k) => `${k} ${pctl(h.hops[k], 0.5)}/${pctl(h.hops[k], 0.9)}`);
       if (hp.length) parts.push(`hops p50/p90 ms: ${hp.join(', ')}`);
+      const fs = this.d.tf.storeStats;
+      if (fs && (fs.refQs || fs.inlineQs)) {
+        parts.push(`feed store: questions naming messages ${fs.refQs}, with messages ${fs.inlineQs}, messages handed over ${fs.puts}${fs.putFails ? ` (${fs.putFails} not)` : ''}${fs.missing ? `, sidecar lacked one ${fs.missing}x (asked again ${fs.resent})` : ''}`);
+        fs.refQs = 0; fs.inlineQs = 0; fs.puts = 0; fs.putFails = 0; fs.missing = 0; fs.resent = 0;
+      }
       if (lag) parts.push(`event-loop lag p50 ${lag.p50} ms, p90 ${lag.p90} ms, max ${lag.max} ms`);
       const line = `Trigger-first entry (${this.d.tf.decides() ? 'on' : this.d.tf.mode()}): ${parts.join('; ')}`;
       const whys = top(h.unknownWhy);
@@ -1346,6 +1364,10 @@ export type Hops = {
   scQ?: number;       // ...of which the sidecar waited for a worker (ms)
   scW?: number;       // ...and worked (ms; one trip: discovery + every check)
   dW?: number;        // one trip: discovery's share of that work (ms)
+  scC?: number;       // ...the sidecar thread's CPU time for it (ms; much lower than scW = waiting)
+  scP?: number;       // ...of which building the replay plan (feed read, hashes, senders) (ms)
+  scE?: number;       // ...of which EVM runs (ms)
+  scD?: number;       // ...of which waiting for a block that had arrived but wasn't applied (ms)
   built?: number;     // candidates ready
   checks?: Array<[number | null, number | null, number | null, number | null]>; // per check: sent, answered, sidecar queue, sidecar work (one trip: only work)
   dec?: number;       // decision made
