@@ -8,6 +8,8 @@ import { PoolCache } from './poolCache';
 import { currentHeadBlock } from './eventFees';
 import { makeCaller } from './universeScan';
 import { timed, markStretch } from './stallFinder';
+// encodeCallFast = Interface.encodeFunctionData, same text, without re-hashing (feed speed, Oct 24).
+import { encodeCallFast } from './abiLite';
 import {
   resolveAndFetchV2Pool, resolveAndFetchSolidlyV2Pool, resolveAllV3Pools, resolveAllV4Pools,
   refetchV2PoolPrice, refetchV3PoolPrice, refetchV4PoolPrice,
@@ -183,12 +185,12 @@ export async function discoverPairPoolsMulticall(
   const push = (target: string, data: string) => { calls.push({ target, data }); return calls.length - 1; };
 
   for (const v of venues) {
-    if (v.kind === 'v2') pend.push({ venue: v, kind: 'v2', idx: push(v.factory, iV2F.encodeFunctionData('getPair', [tokenA, tokenB])) });
-    else if (v.kind === 'solidly') pend.push({ venue: v, kind: 'solidly', idx: push(v.factory, iSolF.encodeFunctionData('getPair', [tokenA, tokenB, false])) });
-    else if (v.kind === 'v3-fee') for (const f of V3_FEE_TIERS_ALL) pend.push({ venue: v, kind: 'v3', feeKey: f, idx: push(v.factory, iV3F.encodeFunctionData('getPool', [tokenA, tokenB, f])) });
-    else if (v.kind === 'v3-spacing') for (const sp of V3_TICK_SPACINGS) pend.push({ venue: v, kind: 'v3', feeKey: sp, spacing: true, idx: push(v.factory, iV3S.encodeFunctionData('getPool', [tokenA, tokenB, sp])) });
-    else if (v.kind === 'algebra') pend.push({ venue: v, kind: 'algebra', idx: push(v.factory, iAlgF.encodeFunctionData('poolByPair', [tokenA, tokenB])) });
-    else if (v.kind === 'v4-registry' && v.registry && v.poolManager && v.weth) pend.push({ venue: v, kind: 'v4-registry', idx: push(v.registry, iReg.encodeFunctionData('activePools')) });
+    if (v.kind === 'v2') pend.push({ venue: v, kind: 'v2', idx: push(v.factory, encodeCallFast(iV2F, 'getPair', [tokenA, tokenB])) });
+    else if (v.kind === 'solidly') pend.push({ venue: v, kind: 'solidly', idx: push(v.factory, encodeCallFast(iSolF, 'getPair', [tokenA, tokenB, false])) });
+    else if (v.kind === 'v3-fee') for (const f of V3_FEE_TIERS_ALL) pend.push({ venue: v, kind: 'v3', feeKey: f, idx: push(v.factory, encodeCallFast(iV3F, 'getPool', [tokenA, tokenB, f])) });
+    else if (v.kind === 'v3-spacing') for (const sp of V3_TICK_SPACINGS) pend.push({ venue: v, kind: 'v3', feeKey: sp, spacing: true, idx: push(v.factory, encodeCallFast(iV3S, 'getPool', [tokenA, tokenB, sp])) });
+    else if (v.kind === 'algebra') pend.push({ venue: v, kind: 'algebra', idx: push(v.factory, encodeCallFast(iAlgF, 'poolByPair', [tokenA, tokenB])) });
+    else if (v.kind === 'v4-registry' && v.registry && v.poolManager && v.weth) pend.push({ venue: v, kind: 'v4-registry', idx: push(v.registry, encodeCallFast(iReg, 'activePools')) });
     else if (v.kind === 'v4-keys' && v.keys?.length && v.poolManager && v.weth) pend.push({ venue: v, kind: 'v4-keys' }); // list is local: nothing to ask in round 1
     else if (v.kind === 'v4' && v.poolManager && v.weth) {
       const a = tokenA.toLowerCase(), b = tokenB.toLowerCase(), w = v.weth.toLowerCase();
@@ -197,12 +199,12 @@ export async function discoverPairPoolsMulticall(
       for (const vr of variants) for (const [fee, tickSpacing] of V4_LOOKUP_TIERS) {
         const id = v4PoolId(vr.c0, vr.c1, fee, tickSpacing);
         pend.push({ venue: v, kind: 'v4', id, fee, tickSpacing, native: vr.native, c0: vr.c0, c1: vr.c1,
-          liqIdx: push(v.factory, iSV.encodeFunctionData('getLiquidity', [id])), slotIdx: push(v.factory, iSV.encodeFunctionData('getSlot0', [id])) });
+          liqIdx: push(v.factory, encodeCallFast(iSV, 'getLiquidity', [id])), slotIdx: push(v.factory, encodeCallFast(iSV, 'getSlot0', [id])) });
       }
     }
   }
   const metaIdx: Record<string, { sym: number; dec: number }> = {};
-  for (const t of metaFor) metaIdx[t.toLowerCase()] = { sym: push(t, iMeta.encodeFunctionData('symbol')), dec: push(t, iMeta.encodeFunctionData('decimals')) };
+  for (const t of metaFor) metaIdx[t.toLowerCase()] = { sym: push(t, encodeCallFast(iMeta, 'symbol')), dec: push(t, encodeCallFast(iMeta, 'decimals')) };
 
   const r1 = await callMany(calls); // throws on rate limit / network
 
@@ -236,7 +238,7 @@ export async function discoverPairPoolsMulticall(
         if (!((x0 === a && c1 === b) || (x0 === b && c1 === a))) continue;
         matched++;
         const base = calls2.length;
-        calls2.push({ target: v.factory, data: iSV.encodeFunctionData('getSlot0', [k.id]) }, { target: v.factory, data: iSV.encodeFunctionData('getLiquidity', [k.id]) });
+        calls2.push({ target: v.factory, data: encodeCallFast(iSV, 'getSlot0', [k.id]) }, { target: v.factory, data: encodeCallFast(iSV, 'getLiquidity', [k.id]) });
         hooked.push({ venue: v, id: k.id.toLowerCase(), fee: k.fee, tickSpacing: k.tickSpacing, native, c0, c1, hooks: k.hooks.toLowerCase(), base });
       }
       continue;
@@ -260,7 +262,7 @@ export async function discoverPairPoolsMulticall(
         if (!((x0 === a && c1 === b) || (x0 === b && c1 === a))) continue;
         matched++;
         const base = calls2.length;
-        calls2.push({ target: v.factory, data: iSV.encodeFunctionData('getSlot0', [e.id]) }, { target: v.factory, data: iSV.encodeFunctionData('getLiquidity', [e.id]) });
+        calls2.push({ target: v.factory, data: encodeCallFast(iSV, 'getSlot0', [e.id]) }, { target: v.factory, data: encodeCallFast(iSV, 'getLiquidity', [e.id]) });
         hooked.push({ venue: v, id: String(e.id), fee: Number(e.key.fee), tickSpacing: Number(e.key.tickSpacing), native, c0, c1, hooks: String(e.key.hooks), base });
       }
       continue;
@@ -282,17 +284,17 @@ export async function discoverPairPoolsMulticall(
     if (!addr) continue;
     const base = calls2.length;
     if (p.kind === 'v3') {
-      calls2.push({ target: addr, data: iV3P.encodeFunctionData('slot0') }, { target: addr, data: iV3P.encodeFunctionData('liquidity') },
-        { target: addr, data: iV3P.encodeFunctionData('token0') }, { target: addr, data: iV3P.encodeFunctionData('token1') });
-      if (p.spacing) calls2.push({ target: addr, data: iV3P.encodeFunctionData('fee') });
+      calls2.push({ target: addr, data: encodeCallFast(iV3P, 'slot0') }, { target: addr, data: encodeCallFast(iV3P, 'liquidity') },
+        { target: addr, data: encodeCallFast(iV3P, 'token0') }, { target: addr, data: encodeCallFast(iV3P, 'token1') });
+      if (p.spacing) calls2.push({ target: addr, data: encodeCallFast(iV3P, 'fee') });
     } else if (p.kind === 'algebra') {
       // globalState word 0 = sqrt price, word 2 = the fee right now (pips).
-      calls2.push({ target: addr, data: iAlgP.encodeFunctionData('globalState') }, { target: addr, data: iV3P.encodeFunctionData('liquidity') },
-        { target: addr, data: iV3P.encodeFunctionData('token0') }, { target: addr, data: iV3P.encodeFunctionData('token1') });
+      calls2.push({ target: addr, data: encodeCallFast(iAlgP, 'globalState') }, { target: addr, data: encodeCallFast(iV3P, 'liquidity') },
+        { target: addr, data: encodeCallFast(iV3P, 'token0') }, { target: addr, data: encodeCallFast(iV3P, 'token1') });
     } else {
-      calls2.push({ target: addr, data: iPair.encodeFunctionData('getReserves') }, { target: addr, data: iPair.encodeFunctionData('token0') },
-        { target: addr, data: iPair.encodeFunctionData('token1') });
-      if (p.kind === 'solidly' && p.venue.pairFee) calls2.push({ target: addr, data: iPairFee.encodeFunctionData('fee') });
+      calls2.push({ target: addr, data: encodeCallFast(iPair, 'getReserves') }, { target: addr, data: encodeCallFast(iPair, 'token0') },
+        { target: addr, data: encodeCallFast(iPair, 'token1') });
+      if (p.kind === 'solidly' && p.venue.pairFee) calls2.push({ target: addr, data: encodeCallFast(iPairFee, 'fee') });
     }
     found.push({ p: p as Pending & { kind: 'v2' | 'solidly' | 'v3' | 'algebra' }, addr, base });
   }
@@ -574,6 +576,11 @@ export class PairWatcher {
     }
     const metaFor = [a, b].filter((t) => !this.tokenMeta.has(t.toLowerCase()));
     this.discoveryCallMany ??= (await makeCaller(this.discoveryProvider)).callMany;
+    // Feed speed (Oct 24): the ~200 lookups are built on the next pass of
+    // the event loop, under their own name, not inside the feed trade that
+    // noticed the pair (live: ~20-40 ms in the "feed trade" step). Same
+    // lookups, a moment later. PAIR_DISCOVERY_YIELD=0 = old (build at once).
+    if (process.env.PAIR_DISCOVERY_YIELD !== '0') { await new Promise<void>((r) => setImmediate(r)); markStretch('pair discovery'); }
     const readStartedMs = Date.now(); // anything written to the cache after this is newer than this read
     const { pools, meta: gotMeta } = await discoverPairPoolsMulticall(this.discoveryCallMany, this.chain, this.venues, a, b, metaFor, { hookedFeeOf: this.hookedFeeOf });
     for (const [t, m] of Object.entries(gotMeta)) {

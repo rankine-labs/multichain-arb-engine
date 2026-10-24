@@ -1,6 +1,7 @@
 import { ethers } from 'ethers';
 import { ChainName, DecodedSwap, PoolState, RawChainEvent } from './types';
 import { computeAmountOut } from './dexMath';
+import { liteCoder } from './abiLite';
 
 // ============================================================================
 // ROUTER V4 FORMATS: reading Uniswap V4 swaps sent through a Universal Router
@@ -90,7 +91,9 @@ const CONTRACT_BALANCE = 1n << 255n;
 const MAX_UINT128 = (1n << 128n) - 1n;
 
 const ZERO = ethers.ZeroAddress.toLowerCase();
-const coder = ethers.AbiCoder.defaultAbiCoder();
+// Same decode / encode calls as ethers' AbiCoder; decode uses the fast reader
+// when it is sure (core/abiLite.ts, feed speed Oct 24).
+const coder = liteCoder;
 
 // Hook-using exchanges whose changing fee the bot already knows how to read
 // (shadowMain feeds the Fables fee predictor into pairWatcher.hookedFee, so
@@ -139,8 +142,17 @@ function noteNotReadable(reason: string) {
 // hooks)). Same formula as core/v4Lookup.ts v4Id and core/poolResolver.ts
 // v4PoolId, but with the real hook address (those two assume no hook).
 // Lowercase, like the pool list stores it.
+// Remembered (feed speed, Oct 24): same inputs, same id (bounded: 5,000 ids).
+const poolIds = new Map<string, string>();
 export function v4PoolIdOf(c0: string, c1: string, fee: number, tickSpacing: number, hooks: string): string {
-  return ethers.keccak256(coder.encode(['address', 'address', 'uint24', 'int24', 'address'], [c0, c1, fee, tickSpacing, hooks])).toLowerCase();
+  const key = `${c0}|${c1}|${fee}|${tickSpacing}|${hooks}`;
+  let id = poolIds.get(key);
+  if (id === undefined) {
+    id = ethers.keccak256(coder.encode(['address', 'address', 'uint24', 'int24', 'address'], [c0, c1, fee, tickSpacing, hooks])).toLowerCase();
+    if (poolIds.size >= 5_000) poolIds.clear();
+    poolIds.set(key, id);
+  }
+  return id;
 }
 
 // ABI layouts of the swap actions' parameters (v4-periphery IV4Router.sol).

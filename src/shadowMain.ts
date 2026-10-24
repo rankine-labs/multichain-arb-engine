@@ -225,7 +225,7 @@ import { trustFreshConfigFromEnv, wsTrustProblem, WsFacts } from './core/trustFr
 // Stall finder (Oct 14): which job froze the bot, plus chunked versions of the big jobs.
 import { stallFinder, timed, timedAsync, formatStallLine, formatStallDetail, markStretch, labelled } from './core/stallFinder';
 import { FreezeProfiler } from './core/freezeProfile';
-import { runSteps, drainSteps, writeJsonChunkedQueued, setSliceCap, SlicedQueue } from './core/chunked';
+import { runSteps, drainSteps, writeJsonChunkedQueued, setSliceCap, SlicedQueue, TurnQueue } from './core/chunked';
 // 4-HOUR REPORT (reporting only): 4-hour totals of the hourly numbers, and the 3-message formatter.
 import { FourHourStats, HourSample, LoopSample, loopSampleFrom, fourHourMark, zonedParts } from './report/fourHourStats';
 import { formatFourHourReport, FourHourSnapshot } from './report/fourHourReport';
@@ -3236,6 +3236,17 @@ if (chainOn('avalanche')) chainManager.register(new AvalancheAdapter());
 // Rival watch's per-transaction look, run in ~5 ms bites (see core/chunked.ts SlicedQueue).
 const RIVAL_SLICED = process.env.RIVAL_SLICED !== '0';
 const rivalQueue = new SlicedQueue(5);
+// FEED TRADE TURNS (feed speed, Oct 24; core/chunked.ts TurnQueue): the heavy
+// "decide" part of each Robinhood feed trade (plan the back-run against every
+// partner pool, logs, checks, send) waits for its turn: same order as before,
+// one trade per pass of the event loop, so the sidecar's answer for a
+// fire-first trigger (and the next feed message) is read in between instead
+// of after the whole message's trades. Everything before it (decode, pool
+// lookup, instant price tracking, partner pools, prices) still runs at once,
+// in feed order, exactly as before, and the decide part works on the pools
+// it picked up then. FEED_TRADE_DEFER=0 = old behaviour (no wait at all).
+const FEED_TRADE_DEFER = process.env.FEED_TRADE_DEFER !== '0';
+const feedTurns = new TurnQueue();
 const onFeedEvent = async (event: RawChainEvent) => {
 const t0 = Date.now();
 // Stage timers (measurement only): lap times from "feed received" onwards.
@@ -3435,6 +3446,33 @@ if (registerIfApproved('avalanche', entry.dex, resolved)) pool = resolved;
     if (inclusion.includes) tradeInclusionStats.included++; else if (inclusion.share !== null) tradeInclusionStats.notYet++;
     trace?.mark('prices');
 
+    // OUR start coin (Oct 16, owner approved). Robinhood: if the other trader
+    // sold a coin we don't hold (e.g. ORBIO) and the pair has USDG/WETH, our trade
+    // starts and ends in USDG/WETH: buy the coin they just made cheap, sell it
+    // where it's dear. Before, we started from THEIR coin (ORBIO), which live
+    // can never send (we hold no ORBIO). TRIGGER_START_HELD=0 = old behaviour.
+    // (Worked out from the trade alone; only moved up here so the start
+    // coin's price can be read before the turn below.)
+    const heldStart = swap.chain === 'robinhood' && process.env.TRIGGER_START_HELD !== '0'
+          ? new Set([ROBINHOOD_TOKENS.USDG.toLowerCase(), ROBINHOOD_TOKENS.WETH.toLowerCase()]) : null;
+    const flipStart = !!heldStart && !heldStart.has(swap.tokenIn.toLowerCase()) && heldStart.has(swap.tokenOut.toLowerCase());
+    const planIn = flipStart ? swap.tokenOut : swap.tokenIn;   // we start and end with this
+    const planOut = flipStart ? swap.tokenIn : swap.tokenOut;  // passes through in the middle
+
+    // Wait for this trade's turn (see FEED_TRADE_DEFER above). The time
+    // waited counts in the stage timers' "math" lap. Everything the decide
+    // part plans with is fixed BEFORE the wait: the pool and partner states
+    // picked up above, and the start coin's dollar price (read here, same
+    // moment as the pools; USDG is always $1). So trades queued behind this
+    // one, or a later feed message handled during the wait, can't change
+    // what this trade decides.
+    let usdAtTurn: number | null | undefined;
+    if (FEED_TRADE_DEFER && swap.chain === 'robinhood') {
+          usdAtTurn = priceOracle.getUsdPrice(swap.chain, planIn);
+          await feedTurns.turn();
+          markStretch('feed trade decide');
+    }
+
       // Record this real, genuine match for the hourly proof-of-activity
       // report -- happens for every real peer match found, independent
       // of whether it's profitable enough to alert on.
@@ -3471,17 +3509,8 @@ if (registerIfApproved('avalanche', entry.dex, resolved)) pool = resolved;
             }
       }
 
-// OUR start coin (Oct 16, owner approved). Robinhood: if the other trader
-// sold a coin we don't hold (e.g. ORBIO) and the pair has USDG/WETH, our trade
-// starts and ends in USDG/WETH: buy the coin they just made cheap, sell it
-// where it's dear. Before, we started from THEIR coin (ORBIO), which live
-// can never send (we hold no ORBIO). TRIGGER_START_HELD=0 = old behaviour.
-const heldStart = swap.chain === 'robinhood' && process.env.TRIGGER_START_HELD !== '0'
-      ? new Set([ROBINHOOD_TOKENS.USDG.toLowerCase(), ROBINHOOD_TOKENS.WETH.toLowerCase()]) : null;
-const flipStart = !!heldStart && !heldStart.has(swap.tokenIn.toLowerCase()) && heldStart.has(swap.tokenOut.toLowerCase());
-const planIn = flipStart ? swap.tokenOut : swap.tokenIn;   // we start and end with this
-const planOut = flipStart ? swap.tokenIn : swap.tokenOut;  // passes through in the middle
-const usdPerToken = priceOracle.getUsdPrice(swap.chain, planIn);
+// (Start coin chosen above, before the turn: see FEED_TRADE_DEFER.)
+const usdPerToken = usdAtTurn !== undefined ? usdAtTurn : priceOracle.getUsdPrice(swap.chain, planIn);
 if (usdPerToken === null) { if (swap.chain === 'robinhood') funnel.noUsdPrice++; return; }
 
 // Predict the price AFTER this pending swap lands, then size the arb
@@ -3850,7 +3879,7 @@ await chainManager.startAll();
             queueGapScan();
       };
       // Watched pairs' pools with real money near their price, built in steps
-      // (pauses every 32 pairs). Same list as the old one-go build below.
+      // (pauses every 8 pairs). Same list as the old one-go build below.
       const usdRhGap = (t: string) => priceOracle.getUsdPrice('robinhood', t);
       function* gapPairsSteps(): Generator<void, PoolState[][], void> {
             const list = robinhoodWatcher.watchedPairPools();
@@ -3859,7 +3888,7 @@ await chainManager.startAll();
                   const ps: PoolState[] = [];
                   for (const a of list[i]) { const p = cache.get('robinhood', a); if (p && deepEnough(p, decimalsOf, usdRhGap)) ps.push(p); }
                   out.push(ps);
-                  if ((i & 31) === 31) yield;
+                  if ((i & 7) === 7) yield; // a pause every 8 pairs (was 32; same list)
             }
             return out;
       }
@@ -5178,6 +5207,9 @@ for (let i = 0; i < resolved.length; i++) {
             const sf = stallFinder.take('fiveMin');
             // Plus how many gaps the fast scan skipped because prices moved during it.
             console.log(`[stalls] ${formatStallLine(sf)}${gapStaleSkips ? ` · gaps skipped (prices moved during the scan, rescanned): ${gapStaleSkips}` : ''}`);
+            // Feed trade turns (FEED_TRADE_DEFER): how many decide parts waited, the longest line, how long.
+            const ft = feedTurns.take();
+            if (FEED_TRADE_DEFER && ft.n) console.log(`[feed-turns] 5 min: ${ft.n} trades decided one per loop pass · longest line ${ft.maxDepth} · wait p50 ${ft.p50} / p90 ${ft.p90} / max ${ft.max} ms`);
             gapStaleSkips = 0;
             const sd = formatStallDetail(sf);
             if (sd) console.log(`[stalls] ${sd}`);

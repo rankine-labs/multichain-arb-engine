@@ -1,6 +1,7 @@
 import { ethers } from 'ethers';
 import { DecodedSwap, RawChainEvent, ChainName, PoolState } from './types';
 import { urV4DecodeOn, readUrV4Command } from './decoderV4Router';
+import { abiDecode, liteCoder, isHexData, fastAbiOn, getAddressFast } from './abiLite';
 
 // ----------------------------------------------------------------------------
 // Swap EVENT signatures (topic0), for chains that give us logs (Monad).
@@ -13,7 +14,8 @@ export const TOPIC_V3_SWAP = '0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fe
 // PancakeSwap V3 adds two protocol-fee fields at the end.
 export const TOPIC_PANCAKE_V3_SWAP = '0x19b47279256b2a23a1665c810c8d55a1758940ee09377d4f8d26497a3577dc83';
 
-const abi = ethers.AbiCoder.defaultAbiCoder();
+// Same decode calls as ethers' AbiCoder, read with the fast reader when it is sure (core/abiLite.ts).
+const abi = liteCoder;
 
 // Looks up a pool we already track (from the pool cache) by its address.
 export type PoolLookup = (chain: ChainName, poolAddress: string) => PoolState | undefined;
@@ -114,9 +116,19 @@ const V4_EXACT_IN = ['tuple(address currencyIn,tuple(address intermediateCurrenc
 const V4_EXACT_IN_V2 = ['tuple(address currencyIn,tuple(address intermediateCurrency,uint24 fee,int24 tickSpacing,address hooks,bytes hookData)[] path,uint256[] minHopPriceX36,uint128 amountIn,uint128 amountOutMinimum)'];
 
 // Pool id of a hookless V4 pool (same formula as core/poolResolver.ts v4PoolId).
+// Remembered (feed speed, Oct 24): the same few pools are traded all the
+// time and the id never changes for the same inputs (bounded: 5,000 ids).
+const v4Ids = new Map<string, string>();
 function v4Id(c0: string, c1: string, fee: number, spacing: number): string {
-  return ethers.keccak256(ethers.AbiCoder.defaultAbiCoder().encode(
-    ['address', 'address', 'uint24', 'int24', 'address'], [c0, c1, fee, spacing, ZERO]));
+  const key = `${c0}|${c1}|${fee}|${spacing}`;
+  let id = v4Ids.get(key);
+  if (id === undefined) {
+    id = ethers.keccak256(ethers.AbiCoder.defaultAbiCoder().encode(
+      ['address', 'address', 'uint24', 'int24', 'address'], [c0, c1, fee, spacing, ZERO]));
+    if (v4Ids.size >= 5_000) v4Ids.clear();
+    v4Ids.set(key, id);
+  }
+  return id;
 }
 // Universal Router "use the router's whole balance" placeholder amount;
 // the real amount isn't known from calldata, so those swaps are skipped.
@@ -127,10 +139,80 @@ function firstV3Hop(path: string): { tokenIn: string; tokenOut: string; fee: num
   const hex = path.startsWith('0x') ? path.slice(2) : path;
   if (hex.length < (20 + 3 + 20) * 2) return null;
   return {
-    tokenIn: ethers.getAddress('0x' + hex.slice(0, 40)),
+    // getAddressFast = ethers.getAddress, remembered (core/abiLite.ts).
+    tokenIn: getAddressFast('0x' + hex.slice(0, 40)),
     fee: parseInt(hex.slice(40, 46), 16),
-    tokenOut: ethers.getAddress('0x' + hex.slice(46, 86)),
+    tokenOut: getAddressFast('0x' + hex.slice(46, 86)),
   };
+}
+
+// ============================================================================
+// FAST CALL READER (feed speed, Oct 24)
+//
+// Plain English: to read a router call, ethers' parseTransaction first finds
+// which function the call is. It does that by working out the 4-byte id of
+// EVERY function on the router's list, one after the other, each time
+// (a hash per function, never remembered). For the SwapRouter02 list that is
+// ~10 hashes per call, plus 1-2 more for a multicall's inner calls: most of
+// the 200-600 us a swap took to read on the test machine.
+//
+// This reader works the ids out ONCE per list and keeps them in a table.
+// Then it reads the arguments with the fast ABI reader (core/abiLite.ts:
+// ethers' AbiCoder.decode, same answer, in one pass; ethers itself for any
+// odd data), so `name` and `args` are exactly what parseTransaction gives
+// (src/test/feedTradeSpeed.test.ts compares both on thousands of calls,
+// including broken ones). Same match rule as ethers: the first function on
+// the list (duplicates dropped the same way) whose id matches.
+// Together: ~16x faster per swap and ~10x less throw-away memory (test
+// machine), and the same swaps.
+//
+// Switches: FEED_FAST_PARSE=0 = ethers' parseTransaction (the old way);
+// FEED_FAST_ABI=0 = ethers' AbiCoder for the arguments (core/abiLite.ts).
+// ============================================================================
+export type ParsedCall = { name: string; args: ethers.Result };
+let FAST_PARSE = process.env.FEED_FAST_PARSE !== '0';
+// Tests only: switch the fast reader on/off (the bot reads FEED_FAST_PARSE once).
+export function setFastParse(on: boolean): void { FAST_PARSE = on; }
+// Tests only: the router function lists the decoder reads calls with.
+export function routerInterfaces(): Readonly<Record<string, ethers.Interface>> { return ROUTER_INTERFACES; }
+const selectorTables = new WeakMap<ethers.Interface, Map<string, ethers.FunctionFragment>>();
+// id -> function for one router list, built the way ethers builds its own:
+// fragments in order, an exact repeat of a signature skipped, and for each
+// id the FIRST function that has it.
+function selectorTable(iface: ethers.Interface): Map<string, ethers.FunctionFragment> {
+  let t = selectorTables.get(iface);
+  if (t) return t;
+  t = new Map();
+  const seen = new Set<string>();
+  for (const f of iface.fragments) {
+    if (f.type !== 'function') continue;
+    const sig = f.format();
+    if (seen.has(sig)) continue;
+    seen.add(sig);
+    const fn = f as ethers.FunctionFragment;
+    const sel = fn.selector.toLowerCase();
+    if (!t.has(sel)) t.set(sel, fn);
+  }
+  selectorTables.set(iface, t);
+  return t;
+}
+// Same answer as iface.parseTransaction({ data }) for `name` and `args`
+// (null when no function matches; throws where ethers throws, e.g. bad hex
+// or arguments that don't decode).
+export function fastParseCall(iface: ethers.Interface, data: string): ParsedCall | null {
+  // Fast ABI reader on (core/abiLite.ts): read the arguments straight from
+  // the hex text. A call shorter than 4 bytes has a shorter id that matches
+  // nothing, exactly like ethers. The arguments: abiDecode = the fast reader
+  // when the layout is standard, ethers' AbiCoder otherwise.
+  if (fastAbiOn() && isHexData(data)) {
+    const fn = selectorTable(iface).get(data.slice(0, 10).toLowerCase());
+    if (!fn) return null;
+    return { name: fn.name, args: abiDecode(fn.inputs, '0x' + data.slice(10)) };
+  }
+  const bytes = ethers.getBytes(data, 'tx.data');
+  const fn = selectorTable(iface).get(ethers.hexlify(bytes.slice(0, 4)));
+  if (!fn) return null;
+  return { name: fn.name, args: ethers.AbiCoder.defaultAbiCoder().decode(fn.inputs, bytes.slice(4)) };
 }
 
 export type RouterRegistry = Record<ChainName, Record<string /* router address, lowercase */, RouterRegistryEntry>>;
@@ -275,7 +357,7 @@ export class TransactionDecoder {
   // its watch list. Hooked pools and "use whatever balance" amounts (0 or
   // the contract-balance placeholder) are skipped: we can't size those.
   private decodeV4Swap(chain: ChainName, input: string, wrappedNative: string, event: RawChainEvent, txValue = 0n): DecodedSwap | null {
-    const coder = ethers.AbiCoder.defaultAbiCoder();
+    const coder = liteCoder; // = ethers' AbiCoder, faster (core/abiLite.ts)
     let actions: Uint8Array, params: string[];
     try {
       const [a, p] = coder.decode(['bytes', 'bytes[]'], input);
@@ -375,9 +457,9 @@ export class TransactionDecoder {
   ): DecodedSwap | null {
     if (depth > 2) return null;
     const iface = ROUTER_INTERFACES[entry.style];
-    let parsed: ethers.TransactionDescription | null;
+    let parsed: ParsedCall | null;
     try {
-      parsed = iface.parseTransaction({ data });
+      parsed = FAST_PARSE ? fastParseCall(iface, data) : iface.parseTransaction({ data });
     } catch {
       return null; // not a swap method we recognize on this router
     }
@@ -398,7 +480,7 @@ export class TransactionDecoder {
     if (entry.style === 'ur') {
       const commands = ethers.getBytes(a[0] as string);
       const inputs = a[1] as string[];
-      const coder = ethers.AbiCoder.defaultAbiCoder();
+      const coder = liteCoder; // = ethers' AbiCoder, faster (core/abiLite.ts)
       for (let i = 0; i < commands.length && i < inputs.length; i++) {
         const cmd = commands[i] & 0x3f;
         try {

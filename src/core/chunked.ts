@@ -392,3 +392,68 @@ export class SlicedQueue {
     setImmediate(() => this.run());
   }
 }
+
+// ---------------------------------------------------------------------------
+// TURN QUEUE (feed speed, Oct 24): "one at a time, with a break in between".
+//
+// Plain English: a busy feed message can hold 20-50 trades. The bot used to
+// do the heavy "decide" part of ALL of them (plan the back-run against every
+// partner pool, log, queue checks) in one go, before it looked at anything
+// else, so the sidecar's answer for a fire-first trigger sat waiting
+// (live: ~17 ms of event-loop lag at that moment, "feed trade" freezes up to
+// 405 ms when messages piled up).
+//
+// Each trade now asks for a turn (`await turns.turn()`) just before that
+// part. Turns are handed out in the order they were asked for (so trades
+// are decided in exactly the same order as before), ONE per pass of Node's
+// event loop: between two trades, Node reads the network (the sidecar's
+// answer, the next feed message) and runs due timers. Nothing is dropped
+// and no trade's maths changes; only WHEN each trade's decide part runs.
+//
+// Cost: one setImmediate per waiting trade (a few microseconds).
+// Numbers (take()): how many waited, the longest line, and how long the
+// turns took to come (p50 / p90 / max ms), for the 5-minute log line.
+// ---------------------------------------------------------------------------
+export class TurnQueue {
+  private q: Array<{ go: () => void; at: number }> = [];
+  private head = 0;
+  private scheduled = false;
+  private waits: number[] = [];
+  private maxDepth = 0;
+  private n = 0;
+  // Ask for a turn: resolves when every earlier caller has had its turn,
+  // on a later pass of the event loop.
+  turn(): Promise<void> {
+    return new Promise<void>((go) => {
+      this.q.push({ go, at: performance.now() });
+      const depth = this.q.length - this.head;
+      if (depth > this.maxDepth) this.maxDepth = depth;
+      if (!this.scheduled) { this.scheduled = true; setImmediate(() => this.next()); }
+    });
+  }
+  // Callers still waiting (tests / reports).
+  size(): number { return this.q.length - this.head; }
+  private next(): void {
+    this.scheduled = false;
+    if (this.head >= this.q.length) { this.q = []; this.head = 0; return; }
+    const w = this.q[this.head];
+    this.q[this.head++] = undefined as unknown as { go: () => void; at: number }; // let it be cleaned up
+    this.n++;
+    if (this.waits.length < 20_000) this.waits.push(performance.now() - w.at); // memory bound
+    // The next turn goes out on the NEXT pass of the event loop (a
+    // setImmediate made inside a setImmediate waits for the network read
+    // in between), after this caller's own code has run.
+    if (this.head < this.q.length) { this.scheduled = true; setImmediate(() => this.next()); }
+    else { this.q = []; this.head = 0; }
+    if (this.head > 1_024) { this.q = this.q.slice(this.head); this.head = 0; }
+    try { w.go(); } catch { /* resolving a promise never throws */ }
+  }
+  // This window's numbers, then a fresh window.
+  take(): { n: number; maxDepth: number; p50: number; p90: number; max: number } {
+    const a = this.waits.slice().sort((x, y) => x - y);
+    const at = (q: number) => (a.length ? Math.round(a[Math.min(a.length - 1, Math.floor(a.length * q))] * 10) / 10 : 0);
+    const out = { n: this.n, maxDepth: this.maxDepth, p50: at(0.5), p90: at(0.9), max: a.length ? Math.round(a[a.length - 1] * 10) / 10 : 0 };
+    this.waits = []; this.n = 0; this.maxDepth = this.size();
+    return out;
+  }
+}
