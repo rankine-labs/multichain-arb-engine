@@ -4,16 +4,16 @@ Window: 2026-10-22 20:34 UTC to 2026-10-23 20:34 UTC (24.0 h, blocks 95392255-96
 
 Swaps seen: 1,989,329 on 16779 pools. Multi-pool transactions: 174,255.
 Receipts read: our-bot-shape (tier 1) 16794/16794 (100%), rest (tier 2) 133110/157461 (85%). "Est." numbers scale the sample up by coverage.
-Arbitrage found: 59456 (trusted prices 11972, doubtful 35244, unpriced 12240). ETH ~$2,405.
+Arbitrage found: 59216 (trusted prices 15035, doubtful 32110, unpriced 12071). ETH ~$2,405.
 
 ## The money (trusted trades, after the gas they paid)
 
 | Group | Trades seen | Kept after gas (seen) | Est. per day | Est. trades/day | Median | p90 | Max | >$0.25 | >$1 | >$5 | Median size |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| all trusted | 11972 | $2,970 | $3,195 | 13250 | $0.01 | $0.08 | $385.60 | 693 | 289 | 56 | $53.33 |
-| base coin profit | 8988 | $1,397 | $1,564 | 9833 | $0.01 | $0.09 | $373.31 | 487 | 197 | 33 | $52.41 |
-| ours any route | 6198 | $863.17 | $932.07 | 6533 | $0.01 | $0.12 | $48.34 | 396 | 165 | 29 | $54.11 |
-| ours 2pool same pair | 2665 | $225.61 | $225.64 | 2667 | $0.01 | $0.06 | $11.70 | 96 | 46 | 11 | $61.81 |
+| all trusted | 15035 | $3,340 | $3,632 | 16873 | $0.01 | $0.08 | $385.60 | 779 | 324 | 72 | $62.27 |
+| base coin profit | 11123 | $1,699 | $1,920 | 12358 | $0.01 | $0.09 | $373.31 | 558 | 223 | 45 | $60.05 |
+| ours any route | 7700 | $1,128 | $1,246 | 8310 | $0.01 | $0.10 | $48.34 | 459 | 188 | 40 | $58.94 |
+| ours 2pool same pair | 2672 | $225.65 | $225.69 | 2675 | $0.01 | $0.06 | $11.70 | 96 | 46 | 11 | $61.81 |
 
 "ours" = every pool on an exchange our deployed contract can trade, profit taken in USDG or WETH. "2-pool same pair" = the bot's main route shape.
 
@@ -21,91 +21,91 @@ Arbitrage found: 59456 (trusted prices 11972, doubtful 35244, unpriced 12240). E
 
 | Bot contract | Trades | Kept (seen) | Est./day | Share | Median | Max |
 | --- | --- | --- | --- | --- | --- | --- |
-| 0x0005ea38..b5ef | 12 | $135.16 | $159.86 | 17% | $3.77 | $48.34 |
-| 0x24a4d86c..0da7 | 70 | $96.43 | $113.96 | 12% | -$0.01 | $46.93 |
-| 0x62fc8082..f4ca | 61 | $62.15 | $62.14 | 7% | $0.18 | $8.37 |
-| 0x7ddbd395..114a | 299 | $56.63 | $58.38 | 6% | $0.07 | $6.87 |
-| 0xaa41e6c3..2299 | 45 | $45.77 | $46.79 | 5% | $1.01 | $1.31 |
-| 0x36dc95f1..2bc2 | 2 | $33.01 | $39.04 | 4% | $29.80 | $29.80 |
-| 0xb92fe925..ff4f | 4 | $31.93 | $37.76 | 4% | $8.49 | $9.95 |
-| 0xb0550000..77bd | 155 | $32.89 | $34.24 | 4% | $0.04 | $7.70 |
-| 0x9c9f4ab6..09f8 | 20 | $28.62 | $28.62 | 3% | $0.69 | $6.76 |
-| 0x01eef8bb..ce62 | 28 | $27.36 | $28.31 | 3% | $0.99 | $1.33 |
-| 0x17970d75..f693 | 112 | $24.71 | $24.71 | 3% | $0.07 | $3.13 |
-| 0xc9a1dcff..7144 | 231 | $21.40 | $24.43 | 3% | $0.06 | $1.44 |
+| 0x24a4d86c..0da7 | 83 | $218.12 | $257.90 | 21% | -$0.01 | $48.05 |
+| 0x0005ea38..b5ef | 17 | $168.04 | $198.76 | 16% | $3.77 | $48.34 |
+| 0x7ddbd395..114a | 347 | $78.86 | $84.67 | 7% | $0.06 | $13.65 |
+| 0x62fc8082..f4ca | 73 | $66.57 | $67.38 | 5% | $0.15 | $8.37 |
+| 0xb92fe925..ff4f | 5 | $53.46 | $63.23 | 5% | $8.49 | $21.53 |
+| 0xaa41e6c3..2299 | 45 | $45.77 | $46.79 | 4% | $1.01 | $1.31 |
+| 0xb0550000..77bd | 183 | $40.51 | $43.25 | 3% | $0.05 | $7.70 |
+| 0x36dc95f1..2bc2 | 2 | $33.01 | $39.04 | 3% | $29.80 | $29.80 |
+| 0x9c9f4ab6..09f8 | 25 | $29.43 | $29.57 | 2% | $0.46 | $6.76 |
+| 0x01eef8bb..ce62 | 28 | $27.36 | $28.31 | 2% | $0.99 | $1.33 |
+| 0x17970d75..f693 | 129 | $26.80 | $27.18 | 2% | $0.07 | $3.13 |
+| 0xc9a1dcff..7144 | 231 | $21.40 | $24.43 | 2% | $0.06 | $1.44 |
 
 ## Who takes it (all USDG/WETH-profit arbitrage, any exchange)
 
 | Bot contract | Trades | Kept (seen) | Est./day | Share |
 | --- | --- | --- | --- | --- |
-| 0x46174dfb..f998 | 26 | $385.94 | $456.50 | 29% |
-| 0x0005ea38..b5ef | 13 | $137.05 | $162.11 | 10% |
-| 0x24a4d86c..0da7 | 79 | $96.71 | $114.29 | 7% |
-| 0x7ddbd395..114a | 373 | $80.63 | $86.77 | 6% |
-| 0x62fc8082..f4ca | 61 | $62.15 | $62.14 | 4% |
-| 0xaa41e6c3..2299 | 45 | $45.77 | $46.79 | 3% |
-| 0xb0550000..77bd | 221 | $39.36 | $41.89 | 3% |
+| 0x46174dfb..f998 | 26 | $385.94 | $456.50 | 24% |
+| 0x24a4d86c..0da7 | 92 | $218.40 | $258.23 | 13% |
+| 0x0005ea38..b5ef | 18 | $169.94 | $201.01 | 10% |
+| 0x7ddbd395..114a | 446 | $120.48 | $133.90 | 7% |
+| 0x62fc8082..f4ca | 73 | $66.57 | $67.38 | 4% |
+| 0xb92fe925..ff4f | 7 | $53.57 | $63.36 | 3% |
+| 0xb0550000..77bd | 274 | $49.75 | $54.18 | 3% |
+| 0xaa41e6c3..2299 | 45 | $45.77 | $46.79 | 2% |
+| 0x86b2a6ca..5315 | 1333 | $34.70 | $40.17 | 2% |
 | 0x36dc95f1..2bc2 | 2 | $33.01 | $39.04 | 2% |
-| 0xb92fe925..ff4f | 6 | $32.04 | $37.89 | 2% |
 | 0x47aff0bd..f5a0 | 7 | $30.21 | $33.23 | 2% |
-| 0x9c9f4ab6..09f8 | 21 | $28.75 | $28.77 | 2% |
-| 0x01eef8bb..ce62 | 28 | $27.36 | $28.31 | 2% |
+| 0x9c9f4ab6..09f8 | 26 | $29.56 | $29.73 | 2% |
 
 ## Which pools carry the money (our exchanges)
 
 | Pool | Exchange | Pair | Trades | Est./day | Swaps in window |
 | --- | --- | --- | --- | --- | --- |
-| 0x52e65b17..71ca | uniswap-v3 | WETH/USDG | 2370 | $228.42 | 159166 |
-| 0x54f78839..ba32 | uniswap-v4 | WETH/USDG | 21 | $99.92 | 8331 |
+| 0x52e65b17..71ca | uniswap-v3 | WETH/USDG | 2404 | $280.78 | 159166 |
+| 0x1649550a..7a2d | uniswap-v4 | WETH/TORCH | 10 | $157.49 | 2993 |
+| 0xfc54380c..361b | uniswap-v4 | TORCH/ODDS | 8 | $100.68 | 275 |
+| 0x54f78839..ba32 | uniswap-v4 | WETH/USDG | 23 | $99.96 | 8331 |
 | 0x896b693e..cf6e | uniswap-v4 | BOOMER/USDG | 10 | $99.02 | 1220 |
 | 0x8b46119c..d3d8 | uniswap-v4 | WETH/LYRO | 4 | $96.86 | 358 |
 | 0x10cc6bd3..26ba | uniswap-v3 | WETH/PONS | 99 | $95.72 | 1117 |
-| 0x51b6ca77..57a5 | ramses-v3 | WETH/PONS | 125 | $78.08 | 6845 |
-| 0x24107d15..379e | uniswap-v4 | WETH/USDG | 155 | $72.68 | 31911 |
-| 0x9cc8c4f6..e55f | uniswap-v3 | WETH/VIRTUAL | 86 | $61.07 | 3046 |
+| 0x51b6ca77..57a5 | ramses-v3 | WETH/PONS | 136 | $79.93 | 6845 |
+| 0x9cc8c4f6..e55f | uniswap-v3 | WETH/VIRTUAL | 87 | $74.85 | 3046 |
+| 0x24107d15..379e | uniswap-v4 | WETH/USDG | 195 | $74.52 | 31911 |
 | 0x9a537af9..b8fb | uniswap-v3 | ANTH/ANTHROPIC | 2 | $60.84 | 15 |
 | 0xca5e2b20..f768 | uniswap-v4 | WETH/ANTHROPIC | 2 | $60.84 | 67 |
-| 0xed50bdee..22ff | uniswap-v3 | WETH/PONS | 58 | $57.13 | 2559 |
+| 0xed50bdee..22ff | uniswap-v3 | WETH/PONS | 64 | $58.55 | 2559 |
+| 0xb94d8bf3..d7b8 | uniswap-v4 | TORCH/BURN | 1 | $56.83 | 11 |
 | 0x1eb56966..cc73 | uniswap-v2 | VIRTUAL/LLL | 3 | $55.49 | 249 |
-| 0x4a99b93a..756d | uniswap-v3 | WETH/HMY | 43 | $52.97 | 111 |
-| 0x6a913ab1..f417 | up-cl | WETH/HMY | 43 | $52.97 | 94 |
-| 0xdec74a2a..7185 | abyss-cl | WETH/ABYSS | 206 | $37.26 | 1400 |
 
 ## Pairs (our exchanges)
 
 | Pair | Trades | Est./day |
 | --- | --- | --- |
-| WETH/USDG | 3175 | $443.35 |
-| WETH/PONS | 268 | $100.25 |
+| WETH/USDG | 3263 | $499.83 |
+| WETH/TORCH | 10 | $157.49 |
+| WETH/PONS | 286 | $103.49 |
+| TORCH/ODDS | 8 | $100.68 |
 | BOOMER/USDG | 10 | $99.02 |
 | WETH/LYRO | 4 | $96.86 |
-| WETH/VIRTUAL | 99 | $61.67 |
+| WETH/VIRTUAL | 100 | $75.45 |
 | ANTH/ANTHROPIC | 2 | $60.84 |
 | WETH/ANTHROPIC | 2 | $60.84 |
-| VIRTUAL/LLL | 3 | $55.49 |
-| WETH/HMY | 43 | $52.97 |
-| USDG/microduck | 113 | $41.84 |
+| TORCH/BURN | 1 | $56.83 |
 
 ## Route length / exchange mix (USDG/WETH profit, any exchange)
 
 | Route | Trades | Est./day |
 | --- | --- | --- |
-| 3 pools | 1859 | $721.80 |
-| 2 pools | 6456 | $717.21 |
-| 4+ pools | 673 | $125.03 |
+| 2 pools | 7968 | $970.68 |
+| 3 pools | 2253 | $755.00 |
+| 4+ pools | 902 | $194.59 |
 
 | Exchanges used | Trades | Est./day |
 | --- | --- | --- |
-| factory:0xc63d7338 + uniswap-v3 + uniswap-v4 | 45 | $443.52 |
-| uniswap-v3 + uniswap-v4 | 595 | $186.93 |
-| uniswap-v4 | 266 | $180.95 |
+| factory:0xc63d7338 + uniswap-v3 + uniswap-v4 | 66 | $445.58 |
+| uniswap-v4 | 925 | $353.77 |
+| uniswap-v3 + uniswap-v4 | 779 | $237.64 |
 | uniswap-v3 | 1218 | $106.22 |
 | ramses-v3 + uniswap-v3 | 400 | $100.95 |
 | uniswap-v3 + up-cl | 272 | $97.99 |
-| uniswap-v2 + uniswap-v3 + uniswap-v4 | 10 | $56.43 |
+| uniswap-v2 + uniswap-v3 + uniswap-v4 | 13 | $70.22 |
 | factory:0xc63d7338 + uniswap-v3 | 440 | $52.95 |
-| ramses-v3 + uniswap-v4 | 177 | $27.27 |
-| abyss-cl + uniswap-v3 | 197 | $26.58 |
+| ramses-v3 + uniswap-v4 | 514 | $44.30 |
+| raphael-cl + uniswap-v4 | 93 | $34.69 |
 
 ## Speed: when did the winner land after the trade that opened the gap?
 
@@ -113,30 +113,30 @@ One block is about 104 ms.
 
 | Delay | Our exchanges | All (USDG/WETH profit) |
 | --- | --- | --- |
-| same block | 1206 | 1678 |
-| +1 block | 1524 | 2323 |
-| +2 blocks | 576 | 893 |
-| +3..10 | 920 | 1240 |
-| >10 blocks | 1686 | 2494 |
-| no trade seen (within ~2000 blocks) | 286 | 360 |
+| same block | 1316 | 1824 |
+| +1 block | 1651 | 2500 |
+| +2 blocks | 655 | 1028 |
+| +3..10 | 1149 | 1550 |
+| >10 blocks | 2580 | 3784 |
+| no trade seen (within ~2000 blocks) | 349 | 437 |
 
 | Bot | same block | +1 | +2 | +3..10 | >10 | none seen | median blocks |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| 0x0005ea38..b5ef | 0 | 0 | 0 | 1 | 9 | 2 | 66 |
-| 0x24a4d86c..0da7 | 0 | 1 | 3 | 26 | 34 | 6 | 14 |
-| 0x62fc8082..f4ca | 43 | 4 | 2 | 1 | 9 | 2 | 0 |
-| 0x7ddbd395..114a | 9 | 6 | 12 | 17 | 143 | 112 | 129 |
+| 0x24a4d86c..0da7 | 2 | 1 | 3 | 26 | 40 | 11 | 16 |
+| 0x0005ea38..b5ef | 0 | 0 | 0 | 1 | 14 | 2 | 66 |
+| 0x7ddbd395..114a | 11 | 14 | 15 | 22 | 170 | 115 | 117 |
+| 0x62fc8082..f4ca | 50 | 5 | 2 | 3 | 11 | 2 | 0 |
+| 0xb92fe925..ff4f | 0 | 0 | 0 | 0 | 5 | 0 | 462 |
 | 0xaa41e6c3..2299 | 0 | 0 | 0 | 12 | 32 | 1 | 16 |
+| 0xb0550000..77bd | 76 | 61 | 17 | 11 | 17 | 1 | 1 |
 | 0x36dc95f1..2bc2 | 0 | 0 | 0 | 0 | 2 | 0 | 284 |
-| 0xb92fe925..ff4f | 0 | 0 | 0 | 0 | 4 | 0 | 584 |
-| 0xb0550000..77bd | 66 | 52 | 15 | 10 | 12 | 0 | 1 |
 
 | Position in block | Trades (our exchanges) |
 | --- | --- |
-| 4-10 | 2072 |
-| 11+ | 2282 |
-| 1 (first after system tx) | 716 |
-| 2-3 | 1128 |
+| 4-10 | 2644 |
+| 11+ | 2728 |
+| 1 (first after system tx) | 881 |
+| 2-3 | 1447 |
 
 ## Census: EVERY transaction in 7,312 recent blocks (0.21 h, incl. failed ones)
 
@@ -180,14 +180,14 @@ Chances = trusted trades with net >= $0.25 on our exchanges. Win share X = fract
 | 2-pool same pair (today's main route) | 50% | no cap (flash loan) | 96 | $94.72 | $96.16 | $1.44 |
 | 2-pool same pair (today's main route) | 100% | $2000 own money | 96 | $180.62 | $180.62 | $0.00 |
 | 2-pool same pair (today's main route) | 100% | no cap (flash loan) | 96 | $192.33 | $192.33 | $0.00 |
-| any route on our exchanges (incl. loops) | 10% | $2000 own money | 412 | $69.88 | $81.00 | $11.12 |
-| any route on our exchanges (incl. loops) | 10% | no cap (flash loan) | 412 | $71.23 | $82.35 | $11.12 |
-| any route on our exchanges (incl. loops) | 25% | $2000 own money | 412 | $193.24 | $202.51 | $9.27 |
-| any route on our exchanges (incl. loops) | 25% | no cap (flash loan) | 412 | $196.61 | $205.87 | $9.27 |
-| any route on our exchanges (incl. loops) | 50% | $2000 own money | 412 | $398.85 | $405.02 | $6.18 |
-| any route on our exchanges (incl. loops) | 50% | no cap (flash loan) | 412 | $405.57 | $411.75 | $6.18 |
-| any route on our exchanges (incl. loops) | 100% | $2000 own money | 412 | $810.05 | $810.05 | $0.00 |
-| any route on our exchanges (incl. loops) | 100% | no cap (flash loan) | 412 | $823.49 | $823.49 | $0.00 |
+| any route on our exchanges (incl. loops) | 10% | $2000 own money | 486 | $95.41 | $108.54 | $13.13 |
+| any route on our exchanges (incl. loops) | 10% | no cap (flash loan) | 486 | $96.80 | $109.93 | $13.13 |
+| any route on our exchanges (incl. loops) | 25% | $2000 own money | 486 | $260.42 | $271.36 | $10.94 |
+| any route on our exchanges (incl. loops) | 25% | no cap (flash loan) | 486 | $263.88 | $274.82 | $10.94 |
+| any route on our exchanges (incl. loops) | 50% | $2000 own money | 486 | $535.42 | $542.72 | $7.30 |
+| any route on our exchanges (incl. loops) | 50% | no cap (flash loan) | 486 | $542.35 | $549.65 | $7.30 |
+| any route on our exchanges (incl. loops) | 100% | $2000 own money | 486 | $1,085 | $1,085 | $0.00 |
+| any route on our exchanges (incl. loops) | 100% | no cap (flash loan) | 486 | $1,099 | $1,099 | $0.00 |
 
 ## Caveats
 
