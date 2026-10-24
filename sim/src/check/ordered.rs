@@ -1224,6 +1224,10 @@ fn one_round(
     };
 
     // 1. The feed's transactions, in sequence order.
+    // Timing (measurement only, status "trigTiming"): replay vs our trade
+    // vs the size ladder, how many feed txs were replayed, how many rounds.
+    let t_replay = std::time::Instant::now();
+    crate::timing::ph_add("roundsN", 1);
     let mut replayed = Vec::with_capacity(plan.msgs.iter().map(|m| m.txs.len()).sum());
     evm.ctx.journaled_state.database.set_recording(true);
     evm.inspector.replaying = true;
@@ -1310,6 +1314,9 @@ fn one_round(
             return Err(stale_unknown(&bad, "a replayed transaction"));
         }
     }
+    crate::timing::ph_add("replay", t_replay.elapsed().as_micros() as u64);
+    crate::timing::ph_add("replayN", replayed.len() as u64);
+    let t_ours = std::time::Instant::now();
     // The copy right after the replay (size ladder: put back before each size).
     let after_replay = ladder.filter(|l| !l.amounts.is_empty() && calls.len() == 1).map(|_| evm.ctx.journaled_state.state.clone());
     // 3. Our calls, in the block of the last message replayed.
@@ -1348,6 +1355,8 @@ fn one_round(
     assumed.sender_funds |= l.sender_funds;
     assumed.recent_fill |= l.recent_fill;
     assumed.call_fill |= l.call_fill;
+    crate::timing::ph_add("ours", t_ours.elapsed().as_micros() as u64);
+    let t_ladder = std::time::Instant::now();
     let mut hashes: Vec<(U256, U256, U256)> = evm.inspector.hashes.take().map(|m| m.into_iter().map(|(h, (a, b))| (h, a, b)).collect()).unwrap_or_default();
     hashes.sort();
     // 4. Size ladder: the copy as it was right after the replay, our trade
@@ -1371,6 +1380,7 @@ fn one_round(
             rows.push(LadderRow { amount: *amount, outcome: r.ok().filter(|_| clean) });
         }
     }
+    crate::timing::ph_add("ladder", t_ladder.elapsed().as_micros() as u64);
     Ok(Next::Done(OrderedOut { replayed, results, assumed, changed, hashes, ladder: rows }))
 }
 
