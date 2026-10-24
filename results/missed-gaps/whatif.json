@@ -1,0 +1,82 @@
+{
+ "realLoopsOver025": {
+  "count": 155,
+  "perDay": 240.96,
+  "raceCount": 127,
+  "racePerDay": 194.39,
+  "slowCount": 28,
+  "slowPerDay": 46.57
+ },
+ "today (rules as on origin/main)": {
+  "count": 33,
+  "perDay": 48.97,
+  "raceCount": 22,
+  "racePerDay": 26.49,
+  "slowCount": 11,
+  "slowPerDay": 22.48,
+  "extraPerDay": 0.0
+ },
+ "depth bar $5k": {
+  "count": 44,
+  "perDay": 76.65,
+  "raceCount": 33,
+  "racePerDay": 54.18,
+  "slowCount": 11,
+  "slowPerDay": 22.48,
+  "extraPerDay": 27.68
+ },
+ "depth bar $2k": {
+  "count": 74,
+  "perDay": 112.33,
+  "raceCount": 59,
+  "racePerDay": 84.65,
+  "slowCount": 15,
+  "slowPerDay": 27.68,
+  "extraPerDay": 63.36
+ },
+ "depth bar $1k": {
+  "count": 81,
+  "perDay": 124.65,
+  "raceCount": 65,
+  "racePerDay": 96.63,
+  "slowCount": 16,
+  "slowPerDay": 28.02,
+  "extraPerDay": 75.68
+ },
+ "all V4 fee settings looked up": {
+  "count": 44,
+  "perDay": 75.52,
+  "raceCount": 31,
+  "racePerDay": 44.44,
+  "slowCount": 13,
+  "slowPerDay": 31.08,
+  "extraPerDay": 26.55
+ },
+ "live loops up to 4 pools": {
+  "count": 34,
+  "perDay": 49.23,
+  "raceCount": 23,
+  "racePerDay": 26.75,
+  "slowCount": 11,
+  "slowPerDay": 22.48,
+  "extraPerDay": 0.26
+ },
+ "live loops up to 5 pools": {
+  "count": 34,
+  "perDay": 49.23,
+  "raceCount": 23,
+  "racePerDay": 26.75,
+  "slowCount": 11,
+  "slowPerDay": 22.48,
+  "extraPerDay": 0.26
+ },
+ "all three ($2k, all V4, 5 pools)": {
+  "count": 109,
+  "perDay": 165.12,
+  "raceCount": 89,
+  "racePerDay": 125.0,
+  "slowCount": 20,
+  "slowPerDay": 40.12,
+  "extraPerDay": 116.15
+ }
+}

@@ -1,0 +1,162 @@
+{
+ "all": {
+  "not-arbitrage": {
+   "count": 2011,
+   "perDay": 565.3352678069998,
+   "slowCount": 927,
+   "slowPerDay": 360.8632611021934
+  },
+  "thin-pool": {
+   "count": 1200,
+   "perDay": 90.66606656788922,
+   "slowCount": 80,
+   "slowPerDay": 6.994145982654957
+  },
+  "hidden-leg": {
+   "count": 969,
+   "perDay": 78.75466493867717,
+   "slowCount": 503,
+   "slowPerDay": 35.69709810529049
+  },
+  "pool-emptied-since": {
+   "count": 50,
+   "perDay": 53.07501314834634,
+   "slowCount": 0,
+   "slowPerDay": 0.0
+  },
+  "v4-not-looked-up": {
+   "count": 261,
+   "perDay": 42.99237720961093,
+   "slowCount": 44,
+   "slowPerDay": 14.81235038470239
+  },
+  "route-4plus": {
+   "count": 295,
+   "perDay": 29.836765147147844,
+   "slowCount": 41,
+   "slowPerDay": 0.665885805563524
+  },
+  "passes-rules-race": {
+   "count": 22,
+   "perDay": 26.490986875626486,
+   "slowCount": 0,
+   "slowPerDay": 0.0
+  },
+  "passes-rules-slow": {
+   "count": 11,
+   "perDay": 22.47819773897725,
+   "slowCount": 8,
+   "slowPerDay": 18.263144913477927
+  },
+  "under-min": {
+   "count": 1362,
+   "perDay": 14.000648008364955,
+   "slowCount": 73,
+   "slowPerDay": 0.25046281815960114
+  },
+  "route-unreadable": {
+   "count": 15,
+   "perDay": 8.418725580713863,
+   "slowCount": 10,
+   "slowPerDay": 1.1912868932592362
+  },
+  "taxed-coin": {
+   "count": 2,
+   "perDay": 0.01971221283583708,
+   "slowCount": 0,
+   "slowPerDay": 0.0
+  }
+ },
+ "over025": {
+  "not-arbitrage": {
+   "count": 186,
+   "perDay": 529.5098086471362,
+   "slowCount": 105,
+   "slowPerDay": 342.87764722213234
+  },
+  "thin-pool": {
+   "count": 56,
+   "perDay": 81.33292560469359,
+   "slowCount": 6,
+   "slowPerDay": 6.095639851546628
+  },
+  "pool-emptied-since": {
+   "count": 21,
+   "perDay": 50.765429783315376,
+   "slowCount": 0,
+   "slowPerDay": 0.0
+  },
+  "hidden-leg": {
+   "count": 51,
+   "perDay": 45.45660561500325,
+   "slowCount": 23,
+   "slowPerDay": 20.92158277173521
+  },
+  "v4-not-looked-up": {
+   "count": 19,
+   "perDay": 38.84419265057843,
+   "slowCount": 6,
+   "slowPerDay": 14.264282445912318
+  },
+  "passes-rules-race": {
+   "count": 22,
+   "perDay": 26.490986875626486,
+   "slowCount": 0,
+   "slowPerDay": 0.0
+  },
+  "passes-rules-slow": {
+   "count": 11,
+   "perDay": 22.47819773897725,
+   "slowCount": 8,
+   "slowPerDay": 18.263144913477927
+  },
+  "route-4plus": {
+   "count": 26,
+   "perDay": 21.0530113739301,
+   "slowCount": 0,
+   "slowPerDay": 0.0
+  },
+  "route-unreadable": {
+   "count": 4,
+   "perDay": 7.562675729825881,
+   "slowCount": 2,
+   "slowPerDay": 0.7637046790034051
+  }
+ },
+ "everyRuleFailedOver025Loops": {
+  "route-4plus": {
+   "count": 26,
+   "perDay": 21.0530113739301
+  },
+  "thin-pool": {
+   "count": 87,
+   "perDay": 113.19600364270221
+  },
+  "v4-not-looked-up": {
+   "count": 21,
+   "perDay": 40.11619481605027
+  },
+  "pool-emptied-since": {
+   "count": 21,
+   "perDay": 50.765429783315376
+  },
+  "passes-rules-slow": {
+   "count": 11,
+   "perDay": 22.47819773897725
+  },
+  "passes-rules-race": {
+   "count": 22,
+   "perDay": 26.490986875626486
+  },
+  "taxed-coin": {
+   "count": 1,
+   "perDay": 0.40094039223328115
+  }
+ },
+ "totals": {
+  "all": 932.0684252351901,
+  "over025": 823.4938340190866
+ },
+ "chainStateBlock": 96428605,
+ "oldestStateBlock": 96422575
+}

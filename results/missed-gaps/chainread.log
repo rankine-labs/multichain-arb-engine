@@ -1,0 +1,5 @@
+head block 96428605, 499 pools, 1083 historical reads
+latest done (49 http, 0 limited)
+oldest block with state: ~96422575 (0.2 h back)
+history: 0 of 1083 reads were recent enough
+saved results/missed-gaps/chain-state.json (60 http, 0 limited)

@@ -30,7 +30,7 @@ def load_all():
     H = meta['window']['hours']
     toks, pinfo = meta['tokens'], meta['poolInfo']
     dec = lambda t: 18 if t == ZERO else (toks.get(t) or {}).get('d')
-    sym = lambda t: 'WETH' if t in (WETH, ZERO) else 'USDG' if t == USDG else (toks.get(t) or {}).get('s', t[:8])
+    sym = lambda t: 'WETH' if t in (WETH, ZERO) else 'USDG' if t == USDG else ((toks.get(t) or {}).get('s') or t[:8])
     def dex_of(p):
         i = pinfo.get(p)
         return i['dex'] if i else ('uniswap-v4(?)' if len(p) == 66 else 'unknown')
@@ -89,6 +89,7 @@ def load_all():
 #   real loop = every coin other than the profit coin comes back to ~zero
 #   (within 0.5%), and the profit coin is also one of the coins paid in.
 # Returns (verdict, detail): 'loop' | 'sale' (a coin came from outside) |
+# 'hidden' (a leg went through an exchange we can't read) |
 # 'unknown' (a hop's coins could not be read, e.g. unnamed V4 pool).
 # ----------------------------------------------------------------------------
 def round_trip(x):
@@ -110,4 +111,10 @@ def round_trip(x):
         if c in profit: continue
         if b < 0 and -b > 0.005 * flow[c]:
             return 'sale', f'coin {c[:10]} paid in from outside'
+    # A coin the seen pools paid out but no seen pool took back: one leg of the
+    # route went through an exchange whose swaps we cannot read (not ours).
+    for c, b in bal.items():
+        if c in profit: continue
+        if b > 0 and b > 0.005 * flow[c]:
+            return 'hidden', f'coin {c[:10]} left through a leg we cannot see'
     return 'loop', ''

@@ -1,0 +1,837 @@
+{
+ "0x24107d152f14a76d292123265ae3f3c71f863fc2f4ef7ba49d64e78d28ea379e": {
+  "fee": 100,
+  "tickSpacing": 1,
+  "botFinds": true
+ },
+ "0x881b4219078c86ac3a3930a6c229c2c846209fe9b4f0b8671772d42e2a799796": {
+  "fee": 8000,
+  "tickSpacing": 80,
+  "botFinds": true
+ },
+ "0x5fb97aef826b674c4bc76707563816f171043a3b1bf91431b7f82acd6381876b": {
+  "fee": 10000,
+  "tickSpacing": 200,
+  "botFinds": true
+ },
+ "0x0fef17ec9ef628d47aa90990e96aac90f355145cfa601b8b73c4e5d52b166237": {
+  "fee": 1800,
+  "tickSpacing": 18,
+  "botFinds": false
+ },
+ "0x6444a8e0b267406a15db74ca00c4a24bdfa81ed3180f5b6d0851f8ed6f4f29c5": {
+  "fee": 100,
+  "tickSpacing": 1,
+  "botFinds": true
+ },
+ "0x1d6b86ca25e01a320aa392d6b64e68c364245c2071a7315e80e3e0ccb7e87cc3": {
+  "fee": 50,
+  "tickSpacing": 1,
+  "botFinds": false
+ },
+ "0x647836c4965c512f0d82a2128abe7826eacf5a79d2dbed252a89ba5c591d1e87": {
+  "fee": 1000,
+  "tickSpacing": 2,
+  "botFinds": true
+ },
+ "0x0b118d2480ebdb11374d3ad2ea1b935e9458a9f704222004b3b8de07bc98f1eb": {
+  "fee": 5000,
+  "tickSpacing": 50,
+  "botFinds": true
+ },
+ "0x590dcb6a87828bf688b48089a62239b693378f1fb64d2286e6a399ed8c005fdf": {
+  "fee": 2500,
+  "tickSpacing": 25,
+  "botFinds": true
+ },
+ "0x84bd4e2d8be11aeb0afc1195b38f587b61e90068548f1063fdbe448fb8cad0b6": {
+  "fee": 200,
+  "tickSpacing": 4,
+  "botFinds": true
+ },
+ "0xfb5b2e3f28ae233984713db2501beea100310042a5de27df44b1d98403384698": {
+  "fee": 2500,
+  "tickSpacing": 25,
+  "botFinds": true
+ },
+ "0x94c62eebf6454231b2fcd0259ede448ae3c6ad8617718cd88dab20b30cfae48a": {
+  "fee": 1500,
+  "tickSpacing": 15,
+  "botFinds": true
+ },
+ "0x173188e586b2dddda5372065b6c8fc3fe1723f96f5cc3ee3818045cb4d691b68": {
+  "fee": 1000,
+  "tickSpacing": 10,
+  "botFinds": true
+ },
+ "0x5b1149ad99e1614b94149d6b4e954747b853e6d6ba1df5039c2fc6c00addba02": {
+  "fee": 1000,
+  "tickSpacing": 10,
+  "botFinds": true
+ },
+ "0x6ba18d461bfe3df70a80b50a4700e330e49efdaf597901b931f210554a5035d2": {
+  "fee": 450,
+  "tickSpacing": 9,
+  "botFinds": true
+ },
+ "0xba07c20c0a900a626ffdab053c218c2ff31c1a752a5c4fcfc1d1098f17a87d6c": {
+  "fee": 20000,
+  "tickSpacing": 200,
+  "botFinds": false
+ },
+ "0xea9f200e13055b82f175f44f592c4c13dd8c9d9320a66487d3c5cd90d68550ef": {
+  "fee": 8000,
+  "tickSpacing": 80,
+  "botFinds": true
+ },
+ "0xa92a3df27a00a276183ff7265fd8affa11df1fe8bb23ddfaf13f6c879a3f818b": {
+  "fee": 2690,
+  "tickSpacing": 54,
+  "botFinds": true
+ },
+ "0xacea8920877840033f0275c37f9b61550b5326917e948bcf8339714d96f9521a": {
+  "fee": null,
+  "tickSpacing": null,
+  "botFinds": false
+ },
+ "0x509c6c6826ef06e0e29f24f18d9389533c52358a3b385d99a67a2afbb07f23c6": {
+  "fee": 1000,
+  "tickSpacing": 10,
+  "botFinds": true
+ },
+ "0xe1ae6a4c6ccc9f037389a8d50a4f577bde1a9fe01d85d88ecbbd39955ce53288": {
+  "fee": 100,
+  "tickSpacing": 1,
+  "botFinds": true
+ },
+ "0xd313d79d9d6a714e7bdf02fc42a2c27ede7e51928ffd605126fe9e1192630cf8": {
+  "fee": 3000,
+  "tickSpacing": 60,
+  "botFinds": true
+ },
+ "0xfcfae8fa0bd6da961bcf5d990f27690932deac4f093e99bf3e871691c6586593": {
+  "fee": 500,
+  "tickSpacing": 10,
+  "botFinds": true
+ },
+ "0xa95732060867f07aa9b8ae9a4b7b8d737bc3374f1dfbb952759c5ed676e8737c": {
+  "fee": 3000,
+  "tickSpacing": 60,
+  "botFinds": true
+ },
+ "0x98f19386c3dabb78ddda7a0117a668dbb858ea3363c3b88aaf8f745f738a411e": {
+  "fee": null,
+  "tickSpacing": null,
+  "botFinds": false
+ },
+ "0x1f2ad5a274a776d8e1408292bde1d92d8fa7b6444acf14ad60b9c3e4e5b66420": {
+  "fee": 1200,
+  "tickSpacing": 15,
+  "botFinds": true
+ },
+ "0x06b9732431bd134599dd112a93c708fe80cadd2fb7dc750fe632e1cbf49fd8c0": {
+  "fee": 500,
+  "tickSpacing": 5,
+  "botFinds": true
+ },
+ "0x75b4c094fc280fdf7f4b887d0f5cd888c06d140ec09f077ded8232ed5d764d48": {
+  "fee": 9000,
+  "tickSpacing": 90,
+  "botFinds": true
+ },
+ "0x435ea42b2792a22de296bee4e8013f4fa102f0cc04983443ff79549f847db577": {
+  "fee": 19000,
+  "tickSpacing": 190,
+  "botFinds": true
+ },
+ "0x2d0dc8b915ca0a9b1fd85311005023e354502f215e39f9c360fc5e732f45cadb": {
+  "fee": 50000,
+  "tickSpacing": 1000,
+  "botFinds": false
+ },
+ "0xa3318d6ff46aa685b3dcee29cb09211d19a53b142fe503f8ff572258fd4c5aad": {
+  "fee": 7800,
+  "tickSpacing": 78,
+  "botFinds": false
+ },
+ "0x778a632fdd85577efe9cfce4a2c9ac91b9decdb24c351f9b56e25d38fbe587b4": {
+  "fee": 9000,
+  "tickSpacing": 90,
+  "botFinds": true
+ },
+ "0x7cf7a805185bce4766278dc4e4047fbc5d8e2bc8a33b3268270d43b86e10236b": {
+  "fee": 50000,
+  "tickSpacing": 1000,
+  "botFinds": false
+ },
+ "0xd85389e64f380f1f634d458dd32bc26ed7d36bf555ee144d798145b46c056f95": {
+  "fee": 2100,
+  "tickSpacing": 21,
+  "botFinds": false
+ },
+ "0x387bf619da4d3fb62bb276482693dba1b9b3520f573cabdfe033384a24125982": {
+  "fee": 500,
+  "tickSpacing": 10,
+  "botFinds": true
+ },
+ "0x4669f93ee59066abfe3a5234ed5d33f967ebd23d3f72ceb88fd6fbc99f16becc": {
+  "fee": 18000,
+  "tickSpacing": 180,
+  "botFinds": false
+ },
+ "0x497d52302ec9f8855ee4f084e7879c4c1d125a52d548c6a7b810bc3af769e800": {
+  "fee": 5000,
+  "tickSpacing": 50,
+  "botFinds": true
+ },
+ "0xc250650901b49785b18443a0b1bfee10b98f5c20f11988635252030e5283a288": {
+  "fee": 7100,
+  "tickSpacing": 71,
+  "botFinds": false
+ },
+ "0xb2481ea6e7875ef61358ec873aab2fb8f4defe390474351c29ab397072bae490": {
+  "fee": 20100,
+  "tickSpacing": 201,
+  "botFinds": false
+ },
+ "0x7499938c352d5b5b8f0c648722aca5ee964ef9b85c3a3041f1ec379726291d9d": {
+  "fee": 1000,
+  "tickSpacing": 10,
+  "botFinds": true
+ },
+ "0xb7b2dac83aef0f428dbd079fbe571a6146f97ca392c073a9b1cf61cd26dc0c3f": {
+  "fee": 2400,
+  "tickSpacing": 24,
+  "botFinds": true
+ },
+ "0xa1ac13f3ddc036a0de70a8154ddaecb86f237941e4971d5a57f4f8b37ca2cd46": {
+  "fee": 50000,
+  "tickSpacing": 500,
+  "botFinds": false
+ },
+ "0x0b362d89fcae933d150e735d28c70e13469a4e14d3b3a36ac05eb5a1a77f2474": {
+  "fee": 10000,
+  "tickSpacing": 100,
+  "botFinds": true
+ },
+ "0xe5923c8a8be481ec89a2ca784a2bbfa4235de6d88f92260fd66b660c4babf907": {
+  "fee": 500,
+  "tickSpacing": 5,
+  "botFinds": true
+ },
+ "0x84e2847d2fe2dab492ca065326efa51b6f7e0924f200f983b9939530834df815": {
+  "fee": null,
+  "tickSpacing": null,
+  "botFinds": false
+ },
+ "0x71f9660f9535e3e81d720696a58ea80274da8b2c6eb7c3acb22611d977439a5c": {
+  "fee": 500,
+  "tickSpacing": 10,
+  "botFinds": true
+ },
+ "0x54f7883914619af9105355bf83ed678bcf9f63560218ac61c9963b9503d0ba32": {
+  "fee": 460,
+  "tickSpacing": 9,
+  "botFinds": true
+ },
+ "0xacf58863b554692911e589452740fed469002d29381e40517fd8386c8eae91b8": {
+  "fee": 6700,
+  "tickSpacing": 67,
+  "botFinds": false
+ },
+ "0xd10f11e907c3322a26afda82b07ca7dee68697261f79fa3d28863f628efcf107": {
+  "fee": 5000,
+  "tickSpacing": 50,
+  "botFinds": true
+ },
+ "0x1bd266afaf99164a3913a959e4d27698c51fe51535bbe0af0718d7ae666c7e10": {
+  "fee": 2000,
+  "tickSpacing": 20,
+  "botFinds": true
+ },
+ "0x8dae3fd4176dc44ff6d85b90b5e532a5423d632f935ac0005d29daf70adfd447": {
+  "fee": 200,
+  "tickSpacing": 4,
+  "botFinds": true
+ },
+ "0x2a7bc60447a40db88c827461c992c4f2174c1f13eaf3b3c2695f00ebfca44a8c": {
+  "fee": 20500,
+  "tickSpacing": 205,
+  "botFinds": false
+ },
+ "0x88c0945437686257fff082f15b0fe39f72a29ddf8dcd9773c570ca468eef57e8": {
+  "fee": 10000,
+  "tickSpacing": 200,
+  "botFinds": true
+ },
+ "0x578d3e799e888723d7f4292dec70e0e2abe9dc7e3b337a1c53ea16757f18faf2": {
+  "fee": 9500,
+  "tickSpacing": 95,
+  "botFinds": false
+ },
+ "0x7aebd80541bfaaf23dbb6e99ce13d4d31c1a84c91414f971eadbff7db5f85995": {
+  "fee": 2300,
+  "tickSpacing": 23,
+  "botFinds": true
+ },
+ "0x97f48c8d9639b7940874b6c6a43b3d606d070a694920b545acff9c35926593a6": {
+  "fee": 10000,
+  "tickSpacing": 100,
+  "botFinds": true
+ },
+ "0x9fc198dc34217e98cd95d0fb93641810182ae002226d2d9701b57680d552374c": {
+  "fee": 5000,
+  "tickSpacing": 50,
+  "botFinds": true
+ },
+ "0xbe31b92e39df5df6803772f89d25f0a54e03a22704f7f5b1715b07c07cb2ced3": {
+  "fee": 1000,
+  "tickSpacing": 10,
+  "botFinds": true
+ },
+ "0x975edb3d8b61dd32c97fdba47526fb05690de46c63873b4113c61a4b7ef7ca2d": {
+  "fee": 15000,
+  "tickSpacing": 150,
+  "botFinds": false
+ },
+ "0x1fb919c02c59434fb4df11765786a75836facdd6cd1648004eaed9d989a9a910": {
+  "fee": 2500,
+  "tickSpacing": 25,
+  "botFinds": true
+ },
+ "0xc81633b5e47dbeaf6211d9c91447188f69a6268cccdbd775bba2b3b333e68869": {
+  "fee": 10000,
+  "tickSpacing": 200,
+  "botFinds": true
+ },
+ "0x30c574a6d9bdffbc4b170259d24f1ead2488fa8649f0444ac20e3b1be9a88875": {
+  "fee": 2500,
+  "tickSpacing": 25,
+  "botFinds": true
+ },
+ "0x8567e70dbf639a618ba5eaf9402743452b93ca45c9bf8b97462407f07d7b7448": {
+  "fee": 3000,
+  "tickSpacing": 60,
+  "botFinds": true
+ },
+ "0xb2ba12c61160274588b170853095eec3c6a5ffaa53f271ef24ce2b6ed3b356d0": {
+  "fee": 24500,
+  "tickSpacing": 245,
+  "botFinds": false
+ },
+ "0xcb6ffbcc84359535c2cc0a5688c0a76520ea6e0a4820fddd3ac8d7880e576370": {
+  "fee": 10000,
+  "tickSpacing": 200,
+  "botFinds": true
+ },
+ "0x8517f8071ae5b831b738052f12125e8e3d6c158b78728aa44ce3b25e5104d32e": {
+  "fee": 3000,
+  "tickSpacing": 60,
+  "botFinds": true
+ },
+ "0x751e89b1e830a959e282377cf53bacc046ff7d6b67c6209504c3db692992c3cd": {
+  "fee": 2500,
+  "tickSpacing": 25,
+  "botFinds": true
+ },
+ "0x1dae69f15c48eef452c79360cc8df58f5d5c3c1e6324ff8777d58c1feb053cdc": {
+  "fee": 2500,
+  "tickSpacing": 25,
+  "botFinds": true
+ },
+ "0x0a8fee78836c84e1a77be70ff6ce91279721100f9ff9ec37e75db78d531f975f": {
+  "fee": 2500,
+  "tickSpacing": 25,
+  "botFinds": true
+ },
+ "0x409ac82d4c7b520d464ded38ad3432cf444c8ca9c9287a64af168cedf64de161": {
+  "fee": 9000,
+  "tickSpacing": 90,
+  "botFinds": true
+ },
+ "0x542b99e239466ea45f8e1eb70a40e2aff9a92e4602e260d0e15fae8b9dfbf816": {
+  "fee": 4000,
+  "tickSpacing": 40,
+  "botFinds": false
+ },
+ "0x763c8aae41578a999666786aa3236a26b13c2021279dc70be358ac604c14ff9d": {
+  "fee": 10000,
+  "tickSpacing": 100,
+  "botFinds": true
+ },
+ "0xfcb3ac1562a590e0c96f24a0e664dbe9dcc2f98e05f3311be02eba6909af5c7d": {
+  "fee": 2500,
+  "tickSpacing": 25,
+  "botFinds": true
+ },
+ "0xda48bde4c58cb3364d522c1f3141376f8e20036d207bbb93191cb1fe65eaa95a": {
+  "fee": 9000,
+  "tickSpacing": 90,
+  "botFinds": true
+ },
+ "0xa97cff59a20a8d95518ad7f85584fb455f4dc8dee0f3921978ee51d0d5202e2e": {
+  "fee": 5000,
+  "tickSpacing": 50,
+  "botFinds": true
+ },
+ "0x0ff2e264ba5a85052e0ba970365fbce49a7bf426c78ee15fefc51077cd377355": {
+  "fee": 10000,
+  "tickSpacing": 200,
+  "botFinds": true
+ },
+ "0xfe2a80bb5618fd14984b92ca6d45bf5ba67443ddb1435e28b2e48df2fc1526cd": {
+  "fee": 3000,
+  "tickSpacing": 60,
+  "botFinds": true
+ },
+ "0x6edaf089b86a262e86caa0d40c693502e59de8781402de5f89d2de8e5a230070": {
+  "fee": 20000,
+  "tickSpacing": 200,
+  "botFinds": false
+ },
+ "0xf8832cd4ac35863d15b24403a5b79d9a265c9e497ea9af36b361e7f8e5994cc8": {
+  "fee": 50000,
+  "tickSpacing": 500,
+  "botFinds": false
+ },
+ "0x47673945b5a36501b8bcab425ecbe38e6005ced67234cd664b3b439ce8a605ad": {
+  "fee": 25000,
+  "tickSpacing": 250,
+  "botFinds": true
+ },
+ "0x399240fa1e7da95a3166f2cec0f0c7edb595d08a6b320c407489af98dfbc025d": {
+  "fee": 2800,
+  "tickSpacing": 28,
+  "botFinds": false
+ },
+ "0x6227421a758652f169fad09377c6994531c1d249c63daa31f7a437fd848c4e0d": {
+  "fee": 15000,
+  "tickSpacing": 150,
+  "botFinds": false
+ },
+ "0x20d317b609c9a9af863d0dd6cd95953f8c209f775cd148171e9566b86cc6bc7f": {
+  "fee": 21000,
+  "tickSpacing": 210,
+  "botFinds": false
+ },
+ "0xcd1e3de4922c5e69a7c21bb0b381e3aa31841a0470cebf196bc7d366f2c967bb": {
+  "fee": 9000,
+  "tickSpacing": 90,
+  "botFinds": true
+ },
+ "0xebd2fbb46948c5b21ca32dcd0be5ae851fed99362cfcf198d060a63a8689cd66": {
+  "fee": 19900,
+  "tickSpacing": 199,
+  "botFinds": false
+ },
+ "0x4be9657ec9002e528f4f17a5c43edc525a07f888f7b180c2afbf75e096c4f38a": {
+  "fee": 3000,
+  "tickSpacing": 60,
+  "botFinds": true
+ },
+ "0x39910df82a4009ea98d01e9df0b9f1b5b01583cc62ea5889c6c8a8e41fbef470": {
+  "fee": 10000,
+  "tickSpacing": 200,
+  "botFinds": true
+ },
+ "0xee53240450839ada47d40c6335135cbcd5cb924ad048ed6c2a5703970c880546": {
+  "fee": 1600,
+  "tickSpacing": 16,
+  "botFinds": false
+ },
+ "0x1252fbfc4f6530a025ca351494245797b2a147b7b5d2dc8af7893e4e1a2e9df3": {
+  "fee": 2900,
+  "tickSpacing": 29,
+  "botFinds": false
+ },
+ "0x873a93b801033f73b0e4a0c94c3db193d81c68043c78ada4ba671c663a30201d": {
+  "fee": 9000,
+  "tickSpacing": 90,
+  "botFinds": true
+ },
+ "0x1febcacf419db23787352f8b47b8405705e31df3171ae8dd8b25c01c6539aeac": {
+  "fee": 9000,
+  "tickSpacing": 90,
+  "botFinds": true
+ },
+ "0xefc94885c96b02696b9b45de43eeeb8ac53c0199cab42b4daae4911b96fb8825": {
+  "fee": 2400,
+  "tickSpacing": 24,
+  "botFinds": true
+ },
+ "0x6a41bdbdf82850998dd5f30588cde7a38447ba6334258ba91775e090155eb796": {
+  "fee": 10000,
+  "tickSpacing": 100,
+  "botFinds": true
+ },
+ "0x585fc59131ec4b433bbddf0ccb635b862b1c8e9301e0c41bbb9bedf44b08a269": {
+  "fee": 20000,
+  "tickSpacing": 200,
+  "botFinds": false
+ },
+ "0x0d8ec00512c7bb71e8ef702ffd9722fd06b0cea52d50d48065de8742d9db6dcf": {
+  "fee": 20000,
+  "tickSpacing": 200,
+  "botFinds": false
+ },
+ "0xfbbfa40a1d5655f5449d6a6a1a409f114ddf0e5ede479f4ca9213452fe1d83a8": {
+  "fee": 10000,
+  "tickSpacing": 100,
+  "botFinds": true
+ },
+ "0x0c548dfd6c49085c99eeeda90b7f3b0f37eae776c767c8ffbbe0e31b3bd83a21": {
+  "fee": 4000,
+  "tickSpacing": 40,
+  "botFinds": false
+ },
+ "0xabdbe454c42dbdf6e39c903960ab5391a7f9114f5cbba20e23aa6430da8a9f6d": {
+  "fee": 10000,
+  "tickSpacing": 100,
+  "botFinds": true
+ },
+ "0xd33c8fd38b06e989cdbd4dffdefab71c4bdd415b24964c8d69e38ff35b068f92": {
+  "fee": 10000,
+  "tickSpacing": 200,
+  "botFinds": true
+ },
+ "0x3be85a75a6476bcece001bb7455ce14e2ef1cfec889f5d8d207c99cf6057babc": {
+  "fee": 3000,
+  "tickSpacing": 30,
+  "botFinds": true
+ },
+ "0x77c25b9386d47de62e0155c393696e9f43f7e6d036c6ca52f66735ccbb8808a7": {
+  "fee": 3000,
+  "tickSpacing": 60,
+  "botFinds": true
+ },
+ "0xa7eb309aa1705b8b28e13b620158e08ebb66c3f6af03f0fc11d1fd89414b1c9d": {
+  "fee": 7500,
+  "tickSpacing": 75,
+  "botFinds": true
+ },
+ "0x541942afd092e6c18ccd56bb3d9205f80a2adce77edf260c464c5f9919f37168": {
+  "fee": 3000,
+  "tickSpacing": 30,
+  "botFinds": true
+ },
+ "0x319bac87e616a89e241c10aeb8afd4892a852cdd8b373cd9765ecddc40b87cfe": {
+  "fee": 2500,
+  "tickSpacing": 25,
+  "botFinds": true
+ },
+ "0xc105b8300ff65d750a0e4e63c7a879e20504069b770713464a5315e797735326": {
+  "fee": 2400,
+  "tickSpacing": 24,
+  "botFinds": true
+ },
+ "0x25779a6de9bc9f244211c4eeabca191966d4a18e97bbe690a4af91a29e65ec86": {
+  "fee": 30000,
+  "tickSpacing": 300,
+  "botFinds": false
+ },
+ "0xd32646872e6712af8cf778e34b6bbef1d2ae0bddd83764e1b07333518ad59333": {
+  "fee": 3000,
+  "tickSpacing": 60,
+  "botFinds": true
+ },
+ "0xc4cef7c8d86716db7c7f291a60128f08220ed8cabaac9fdcd910156b736f2272": {
+  "fee": 3000,
+  "tickSpacing": 60,
+  "botFinds": true
+ },
+ "0x6fa3ee0048e78bf0a513eb0ab56f482944a767c21db990fcf555605e69f05659": {
+  "fee": 10000,
+  "tickSpacing": 200,
+  "botFinds": true
+ },
+ "0xa4c8d013290b35533f181f31d71a83475bda4be411ef8d1089465f64fce31c8d": {
+  "fee": 9000,
+  "tickSpacing": 90,
+  "botFinds": true
+ },
+ "0xa0b6e70e8ef2bdcb592e03a7e22b90b2dcc5c91e937b57eb1c4eb782491efadd": {
+  "fee": 10000,
+  "tickSpacing": 200,
+  "botFinds": true
+ },
+ "0xa09564dc99500ea0e94cb4e9e8ba9d4054b1184a736b63480cac6130a6add6d7": {
+  "fee": 2700,
+  "tickSpacing": 27,
+  "botFinds": false
+ },
+ "0x6c22507c7110b857287cfd310b964ac71980e7ab2d7d04c3e5031db98f1b087d": {
+  "fee": 30000,
+  "tickSpacing": 300,
+  "botFinds": false
+ },
+ "0xf807376333cd408c36d48a11a96309b92c5bd2bca9ba9f0b21800636cb3a30da": {
+  "fee": 1000,
+  "tickSpacing": 10,
+  "botFinds": true
+ },
+ "0xe8dc17753ee2e0614e54a2963cfcf9743e0ef4dbfc939200a730733684e72a04": {
+  "fee": 20000,
+  "tickSpacing": 200,
+  "botFinds": false
+ },
+ "0x5fb00968834d782603b244e705a130058bf6cc4c0f53a1da98d5e392988db6aa": {
+  "fee": 7800,
+  "tickSpacing": 78,
+  "botFinds": false
+ },
+ "0x632d9bdccf26e13dbf23b185f29cba47e237371010e1abf7aceaeff653f66be4": {
+  "fee": 1500,
+  "tickSpacing": 15,
+  "botFinds": true
+ },
+ "0xde9f85fdd9e05a943a52f2c69ffafe3064a3287df03d02c9b431bc92d4781274": {
+  "fee": 10000,
+  "tickSpacing": 200,
+  "botFinds": true
+ },
+ "0xaee7f2e61946d4e2a096f44dc686c5b6ba8b2ce0857fa167f2e95c3d2eeb62b8": {
+  "fee": 20000,
+  "tickSpacing": 100,
+  "botFinds": false
+ },
+ "0x7c2985fd7623a5dcd88c7d51099931ca295875743b96bc64990e374f49e5f387": {
+  "fee": 2900,
+  "tickSpacing": 29,
+  "botFinds": false
+ },
+ "0x3bb34a44f1b2b5f32c034c38a53065a521a47b199700fa9bd19d60985ff24bf1": {
+  "fee": 3000,
+  "tickSpacing": 60,
+  "botFinds": true
+ },
+ "0x11375efc9bb84d5e93d2b0ee9eadd05a5cc3fe59813fdebfec079f703c8462b4": {
+  "fee": 50000,
+  "tickSpacing": 500,
+  "botFinds": false
+ },
+ "0xc9dad63b6fb9afe1fe888ebc7b023c587c58b9498f5bd17166226c0995dbc4eb": {
+  "fee": 8000,
+  "tickSpacing": 80,
+  "botFinds": true
+ },
+ "0x056dbf9e55b6480a8b8134a318c96e59424a6533c935e36ee04d8a6a751a91c1": {
+  "fee": 5500,
+  "tickSpacing": 55,
+  "botFinds": false
+ },
+ "0x09f9f97c04966c8ac9e99649599162e521aa1acaabfbd1cdf8910622534db11e": {
+  "fee": 5000,
+  "tickSpacing": 50,
+  "botFinds": true
+ },
+ "0x4b83b47e62e9a5986a7badf9d2369911034a01c079532ede3c2819f332ac830a": {
+  "fee": 50000,
+  "tickSpacing": 500,
+  "botFinds": false
+ },
+ "0xea83d1911a6c8d027650a79631aafd958e2880ab69a668c7781998523c2d5431": {
+  "fee": 1000,
+  "tickSpacing": 10,
+  "botFinds": true
+ },
+ "0xeb12e8de2b76d4861754de95d9386ed73e2f0b769f19da00495aae41caed2f18": {
+  "fee": 9000,
+  "tickSpacing": 90,
+  "botFinds": true
+ },
+ "0xdb639eb49d293499d9b3e73580b5705136d5aab5a4cf580ee9f3224cd1b0387e": {
+  "fee": 10000,
+  "tickSpacing": 200,
+  "botFinds": true
+ },
+ "0x0d662a58507a46cd6a22632228306dc0d9c26f5fce90c37ced3b8358db33deb3": {
+  "fee": 9000,
+  "tickSpacing": 90,
+  "botFinds": true
+ },
+ "0xdbe41dc9d12ae4ad528fd2f9b2bd5736ba5fb7eaf7ebb1fca86ff1646430a301": {
+  "fee": 32000,
+  "tickSpacing": 320,
+  "botFinds": true
+ },
+ "0xe2ece3c800a5304cd538658884905779465d54e1e0966ca3bcdd8b424e998740": {
+  "fee": 10000,
+  "tickSpacing": 200,
+  "botFinds": true
+ },
+ "0xe36581f0e051106aa63916f69d484f01f0b7ae374152964c34937efa32f1d28c": {
+  "fee": 20000,
+  "tickSpacing": 200,
+  "botFinds": false
+ },
+ "0x4230fc5845990dab0c400de4155776f45464367500384c1fe32c0325c4bdaf11": {
+  "fee": 3000,
+  "tickSpacing": 60,
+  "botFinds": true
+ },
+ "0x3cfd56783ecb18ea1838dd70095880aac3f5de2bc68fe2884f0796931809b74a": {
+  "fee": 20000,
+  "tickSpacing": 200,
+  "botFinds": false
+ },
+ "0xd250bed35cb53a2242120ad41fa43c160044418f9b75968b2a7edae4b2fca24e": {
+  "fee": 8000,
+  "tickSpacing": 80,
+  "botFinds": true
+ },
+ "0x2d6ec380a3dc18dc4a2067ba6884835b49455cd79c8afa1f7625b6b2f85670a6": {
+  "fee": 500,
+  "tickSpacing": 10,
+  "botFinds": true
+ },
+ "0xd1aeea40e4def63338b6ae30e541f9207329585d58ccd57b9e4228f82b872388": {
+  "fee": 2500,
+  "tickSpacing": 25,
+  "botFinds": true
+ },
+ "0xd3c27381f7d1ef4dcd8ec4ba66e74fe88d06ab5250c1393769d4dd0e996a8dc9": {
+  "fee": 2500,
+  "tickSpacing": 25,
+  "botFinds": true
+ },
+ "0xad167fe3a25d595357772e54059030128895a489183d6339c0d5594b938a0640": {
+  "fee": 30000,
+  "tickSpacing": 300,
+  "botFinds": false
+ },
+ "0x4ad1c182c7de2c7a88e25235ce7fba6b07b20081955591a436e980b7117b58fb": {
+  "fee": 400,
+  "tickSpacing": 8,
+  "botFinds": false
+ },
+ "0xec481672a94cfe42e2d8c996b7eaeee8a93093d56bd01c1714341971e3f406c1": {
+  "fee": 10000,
+  "tickSpacing": 200,
+  "botFinds": true
+ },
+ "0x95ad7c5cba41ba6167de890cbe3d1a4292b6f746336fa948b6e571f82fde68ff": {
+  "fee": 5100,
+  "tickSpacing": 51,
+  "botFinds": false
+ },
+ "0xcfe285750666dc3bb7e2b957bb71e548b1777f57cbedb0c765de090ef9f9bc09": {
+  "fee": 9000,
+  "tickSpacing": 90,
+  "botFinds": true
+ },
+ "0x9abbd82cb59741dc203c7d34862ab398a5707f0a42abc341c3c9e45503c67b34": {
+  "fee": 2500,
+  "tickSpacing": 25,
+  "botFinds": true
+ },
+ "0x04263541986025755033c507d2c02863354abe64236878f3455b7d72ad9cce27": {
+  "fee": 15000,
+  "tickSpacing": 150,
+  "botFinds": false
+ },
+ "0xb6e5b62e4846cda5371af674468e3ae3c3e9f794e2e2a85a1d3b364fae3bc55c": {
+  "fee": 3000,
+  "tickSpacing": 60,
+  "botFinds": true
+ },
+ "0x6f554141e4816210a8ef23d3bbbf64bbca6c7887e7ed17bd38e7d85b752a9dff": {
+  "fee": 100000,
+  "tickSpacing": 1000,
+  "botFinds": false
+ },
+ "0x5eb00cef4955bcb4bbb598db3ff401f2d2726d7ed27e06c0cb07a6b54a9f2b87": {
+  "fee": 9000,
+  "tickSpacing": 90,
+  "botFinds": true
+ },
+ "0x474f3efdf9e7e7111737893d84a4e41ad49265e68753dd0b25fb1329ae8c105d": {
+  "fee": 7000,
+  "tickSpacing": 70,
+  "botFinds": false
+ },
+ "0x592b43d2cca216f6b95b917a2a097464498c34816def99f3ccf2be7f88f45ef5": {
+  "fee": 30000,
+  "tickSpacing": 300,
+  "botFinds": false
+ },
+ "0x1f047a44c78245dcbd6bd63d0bf7547b94a8e0344787949698ae3eafc73f4eb6": {
+  "fee": 50000,
+  "tickSpacing": 1000,
+  "botFinds": false
+ },
+ "0xf0bd1330172e5940016ca9c2853fc8a8815dc0823f92855c406c5259734d8216": {
+  "fee": 9000,
+  "tickSpacing": 90,
+  "botFinds": true
+ },
+ "0x685818c6aa03ad808aa4a6b6087b91c8f070b3eb17739f9e5785ce6ec7bfcc1f": {
+  "fee": 2500,
+  "tickSpacing": 25,
+  "botFinds": true
+ },
+ "0x2b39fc6cea89031208206481d3c09a2a484eccd70a26f637c84ed80599637f70": {
+  "fee": 50000,
+  "tickSpacing": 500,
+  "botFinds": false
+ },
+ "0x74739c7ee5dda3695d01575c32371eff16e7b831e37517d1a99b568749143e7a": {
+  "fee": 3000,
+  "tickSpacing": 60,
+  "botFinds": true
+ },
+ "0x9be5367da3b51b6a08c98002586834291bc609f32476cf36fa8af0f2fb76b57f": {
+  "fee": 50000,
+  "tickSpacing": 1000,
+  "botFinds": false
+ },
+ "0x32be53c0e86965275e39cdd3083c62e290af4e3835673a725305e9034ff5e06b": {
+  "fee": 50000,
+  "tickSpacing": 500,
+  "botFinds": false
+ },
+ "0x14a57bcd7a217304641e556e84bf6ea485e608f3ce4c367e9fc616e4ac6f4013": {
+  "fee": 20000,
+  "tickSpacing": 200,
+  "botFinds": false
+ },
+ "0x35af9bf7e0d6e627a6d1c93003610a6c40fdddd3609f24623070e541fc3355a6": {
+  "fee": 100000,
+  "tickSpacing": 1000,
+  "botFinds": false
+ },
+ "0xef5672974ad552f1ce24f2873f3e4237e82d44780ef623b6a239db42b08a7d5c": {
+  "fee": 10000,
+  "tickSpacing": 200,
+  "botFinds": true
+ },
+ "0x131e6ebeeedb524a1e7590aa3eea3bc8782b5425a78d5128c0ca955190d0ea69": {
+  "fee": 10000,
+  "tickSpacing": 200,
+  "botFinds": true
+ },
+ "0x25890df358d340ce272c802526a164a18dfd679d3d71dcd23049f39c3e1c876b": {
+  "fee": 50000,
+  "tickSpacing": 500,
+  "botFinds": false
+ },
+ "0xc6c11062f6c06538b4bb99a1f5c4543f68262926bd4891848e10f2e374d21207": {
+  "fee": 50000,
+  "tickSpacing": 500,
+  "botFinds": false
+ },
+ "0x7d32bc830f40a330af8723b8bb50d4d6b0152297d659e9898e6a47b785686459": {
+  "fee": 10000,
+  "tickSpacing": 200,
+  "botFinds": true
+ },
+ "0x4ce1ef533e1535b04b47326514b3d214a13b48f0dc37a54e28ae2fc0bf85784d": {
+  "fee": 10000,
+  "tickSpacing": 200,
+  "botFinds": true
+ },
+ "0xee0d95c4644e0847eca78d5f5333abe1ab798b159fdd01712327258a755d4423": {
+  "fee": 5000,
+  "tickSpacing": 100,
+  "botFinds": false
+ }
+}
