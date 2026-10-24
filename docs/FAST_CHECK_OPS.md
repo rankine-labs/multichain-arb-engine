@@ -249,6 +249,7 @@ and nothing else. Node links are never printed, and never stored in pm2.
 | `ARBSIM_SOCKET` | `/tmp/arbsim.sock` | socket path (the bot reads the same setting; keep them equal) |
 | `ARBSIM_WORKERS` | 2 (1-16) | threads answering checks. Keep it at most the number of CPU cores (the live server has 2 vCPUs): more workers than cores only take turns on the same cores and do not make answers faster; the fast lane (`ARBSIM_PRIO_BURST`) is what lets entry work skip the line |
 | `ARBSIM_PRIO_BURST` | 4 (0-64) | trigger-entry questions (`trig_entry`, `trig_discover`, entry checks marked `prio`) skip the line; after this many in a row one waiting normal question goes first (0 = one plain first-come line) |
+| `ARBSIM_FEED_STORE_MSGS` | 2048 (0 = off) | speed-3 feed store: feed messages the bot hands over once (`feed_put`) and trigger-first questions then only name; oldest dropped first (~3.5 min). 0 = store off: the bot sees no store in `status` and sends messages inline with every question (old way). `status` → `feedStore` (held / handed over / named / missing) |
 | `ARBSIM_MAX_STALE_MS` | 3000 | feed quiet longer than this = "stale" |
 | `ARBSIM_WAIT_MS` | 30 | how long a check waits for the copy to catch up before "dirty" |
 | `ARBSIM_HISTORY` | 64 | recent versions kept |
@@ -284,6 +285,18 @@ and nothing else. Node links are never printed, and never stored in pm2.
 Not read by `serve`: `ARBSYS_GAS` (only the `check-fixture` test tool), and
 `CHAINSTACK_RPC_ROBINHOOD` is read by the program itself only as the fallback
 for `ARBSIM_NODE_URL` (the runner already sets that).
+
+Trigger-first speed (speed-3): every `trig_discover` / trigger-first `call`
+answer now carries `ph` (microseconds per step: `read` socket JSON, `feedRead`,
+`feedRefs`, `plan` (+ `planHash`, `decode`), `resolve` (+ `dirtyWait`), `prov`,
+`facts`, `evm`, `moved`), `pn` (counts: bytes, msgs, txs, decode hits / misses,
+runs, rounds, dirty waits) and `cpu` (the worker thread's CPU microseconds,
+next to the wall time `us`: much lower CPU = waiting for a lock or a CPU).
+`status` → `trigTiming` shows p50 / p90 / p99 / max per step over the last 1000
+questions. Bot side: `TRIG_FIRST_FEED_STORE=0` switches the feed store off
+(messages inline with every question, as before); the hourly `[trig-entry]`
+line shows the sidecar split (`scCpu`, `scPlan`, `scEvm`, `scDirty`) and the
+feed-store counters.
 
 After changing any of these: `bash deploy/arbsim-pm2.sh restart`.
 

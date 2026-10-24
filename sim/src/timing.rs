@@ -178,6 +178,8 @@ pub fn status() -> Value {
         },
         "applyTiming": pct(&mut applies),
         "lockHold": with_sites(pct(&mut holds), &r.sites),
+        // Trigger-first questions per phase (speed-3, see trig_status).
+        "trigTiming": trig_status(),
     })
 }
 
@@ -197,6 +199,133 @@ pub fn reset() {
         r.holds.clear();
         r.sites.clear();
     }
+    if let Ok(mut t) = TRIG_RING.lock() {
+        t.clear();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TRIGGER-FIRST PHASES (speed-3, Oct 24).
+//
+// Plain English: live, the "which pools does this feed transaction move?"
+// question (trig_discover) took ~18 ms of sidecar work while the bench said
+// ~0.01 ms. To see WHERE that time goes, every step of a trigger-first
+// question adds its microseconds to a small per-thread list (one worker
+// thread answers one question at a time, so the list belongs to that
+// question): reading the feed, hashing / unpacking its transactions,
+// picking the copy version (and how long it waited for a block being
+// applied), the copy's "which values are exact" list, each EVM run, the
+// moved-pool match, ... The answer carries the list as "ph" (microseconds)
+// plus a few counts ("pn": transactions, cache hits, runs, rounds), and
+// the thread's CPU time next to the wall time: CPU much lower than wall
+// means the thread was WAITING (a lock, or the 2 CPUs busy with other
+// work), not computing. `status` shows p50 / p90 / max per phase over the
+// last 1000 questions ("trigTiming"). Measurement only.
+// ---------------------------------------------------------------------------
+type PhList = Vec<(&'static str, u64)>;
+thread_local! {
+    static PH: std::cell::RefCell<(PhList, PhList)> = const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
+}
+
+/// Start a fresh phase list for this thread's next question.
+pub fn ph_reset() {
+    PH.with(|p| {
+        let mut p = p.borrow_mut();
+        p.0.clear();
+        p.1.clear();
+    });
+}
+
+/// Add `us` microseconds to phase `name` (summed if it repeats).
+pub fn ph_add(name: &'static str, us: u64) {
+    PH.with(|p| {
+        let mut p = p.borrow_mut();
+        match p.0.iter_mut().find(|(n, _)| *n == name) {
+            Some(e) => e.1 += us,
+            None => p.0.push((name, us)),
+        }
+    });
+}
+
+/// Add `n` to count `name` (e.g. transactions hashed, cache hits).
+pub fn ph_count(name: &'static str, n: u64) {
+    PH.with(|p| {
+        let mut p = p.borrow_mut();
+        match p.1.iter_mut().find(|(k, _)| *k == name) {
+            Some(e) => e.1 += n,
+            None => p.1.push((name, n)),
+        }
+    });
+}
+
+/// Time `f` as phase `name`.
+pub fn ph_time<R>(name: &'static str, f: impl FnOnce() -> R) -> R {
+    let t = Instant::now();
+    let r = f();
+    ph_add(name, t.elapsed().as_micros() as u64);
+    r
+}
+
+/// This thread's phases and counts so far, as JSON objects.
+pub fn ph_json() -> (Value, Value) {
+    PH.with(|p| {
+        let p = p.borrow();
+        let a: serde_json::Map<String, Value> = p.0.iter().map(|(k, v)| (k.to_string(), json!(v))).collect();
+        let b: serde_json::Map<String, Value> = p.1.iter().map(|(k, v)| (k.to_string(), json!(v))).collect();
+        (Value::Object(a), Value::Object(b))
+    })
+}
+
+/// CPU time this thread has used so far (microseconds; Linux / macOS).
+pub fn thread_cpu_us() -> u64 {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: plain libc call writing into a local struct.
+    let r = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
+    if r != 0 {
+        return 0;
+    }
+    (ts.tv_sec as u64) * 1_000_000 + (ts.tv_nsec as u64) / 1_000
+}
+
+/// The last 1000 trigger-first questions' phase lists (status "trigTiming").
+type TrigSample = (&'static str, PhList);
+static TRIG_RING: Mutex<VecDeque<TrigSample>> = Mutex::new(VecDeque::new());
+
+/// A finished trigger-first question of kind `kind` ("discover" / "call"):
+/// keep its phases (plus `extra`, e.g. "total", "cpu") for status.
+pub fn record_trig(kind: &'static str, extra: &[(&'static str, u64)]) {
+    let mut v: PhList = PH.with(|p| p.borrow().0.clone());
+    v.extend_from_slice(extra);
+    if let Ok(mut r) = TRIG_RING.lock() {
+        push(&mut r, (kind, v));
+    }
+}
+
+/// status "trigTiming": per kind, per phase p50 / p90 / p99 / max (us).
+pub fn trig_status() -> Value {
+    let r = match TRIG_RING.lock() {
+        Ok(r) => r,
+        Err(_) => return json!({}),
+    };
+    type ByPhase<'a> = std::collections::BTreeMap<&'a str, Vec<u64>>;
+    let mut by: std::collections::BTreeMap<&str, ByPhase> = Default::default();
+    let mut n: std::collections::BTreeMap<&str, usize> = Default::default();
+    for (kind, phs) in r.iter() {
+        *n.entry(kind).or_default() += 1;
+        for (k, v) in phs {
+            by.entry(kind).or_default().entry(k).or_default().push(*v);
+        }
+    }
+    let mut out = serde_json::Map::new();
+    for (kind, m) in by {
+        let mut o = serde_json::Map::new();
+        o.insert("n".into(), json!(n.get(kind).copied().unwrap_or(0)));
+        for (k, mut v) in m {
+            o.insert(k.to_string(), pct(&mut v));
+        }
+        out.insert(kind.to_string(), Value::Object(o));
+    }
+    Value::Object(out)
 }
 
 /// Something whose write lock TimedWrite can time (a plain RwLock, the

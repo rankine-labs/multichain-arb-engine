@@ -2616,6 +2616,255 @@ fn bench_entry_server_path_test_numbers_only() {
     println!("[bench, test numbers only] server path (copy 2 rig, 1 feed tx): trig_discover {disc} us, candidate check + 2-size ladder {chk} us ({} build)", if cfg!(debug_assertions) { "debug" } else { "release" });
 }
 
+// ---------------------------------------------------------------------------
+// SPEED-3 (Oct 24): feed store, lock-free exact-values list / moved pools,
+// per-phase timing. Every answer must be EXACTLY the old one.
+// ---------------------------------------------------------------------------
+
+/// Tests that use the process-wide feed store take turns (and start empty):
+/// sequence numbers are reused between tests.
+static FEED_STORE_TURN: Mutex<()> = Mutex::new(());
+
+/// An answer without its timing / id fields (those differ run to run).
+fn strip_timing(v: &Value) -> Value {
+    let mut v = v.clone();
+    if let Some(o) = v.as_object_mut() {
+        for k in ["us", "t", "id", "ph", "pn", "cpu"] {
+            o.remove(k);
+        }
+    }
+    v
+}
+
+/// The bot's feed (as sent inline) -> the same feed naming the messages,
+/// after handing them to the store (`feed_put`).
+fn feed_as_refs(feed: &Value) -> Value {
+    arbsim::check::feedstore::store().put_json(&json!({"type": "feed_put", "msgs": feed["msgs"].clone()}));
+    let refs: Vec<Value> = feed["msgs"].as_array().unwrap().iter().map(|m| json!([m["seq"].clone(), m["txs"].as_array().map_or(0, |t| t.len())])).collect();
+    let mut f = feed.clone();
+    f.as_object_mut().unwrap().remove("msgs");
+    f["refs"] = json!(refs);
+    f
+}
+
+#[test]
+fn feed_store_answers_equal_inline_answers_through_the_server() {
+    let _turn = FEED_STORE_TURN.lock().unwrap_or_else(|e| e.into_inner());
+    arbsim::check::feedstore::store().clear();
+    let code = vec![0x36, 0x60, 0x20, 0x14, 0x60, 0x12, 0x57, 0x60, 0x08, 0x54, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3, 0x5b, 0x60, 0x00, 0x35, 0x60, 0x08, 0x55, 0x00];
+    let (_r, ctx) = trig_world_code(code);
+    let mut word = vec![0u8; 32];
+    word[31] = 9;
+    let swap = signed(0, a(V2P), word);
+    let read = signed(1, a(V2P), vec![0x09, 0x02, 0xf1, 0xac]);
+    let nowhere = signed(2, a(0x77), vec![1]);
+    let pool = format!("{:#x}", a(V2P));
+    let mut data = vec![0x09, 0x02, 0xf1, 0xac];
+    data.extend([0u8; 31]);
+    data.push(9);
+    for (trig, seq, msgs) in [
+        (&swap, 102u64, json!([{"seq": 101, "ts": 62, "l1": 9000, "txs": [hexb(&read)]}, {"seq": 102, "ts": 63, "l1": 9000, "txs": [hexb(&read), hexb(&swap)]}, {"seq": 103, "ts": 64, "l1": 9000, "txs": [hexb(&read)]}])),
+        (&read, 102, json!([{"seq": 102, "ts": 63, "l1": 9000, "txs": [hexb(&read)]}])),
+        (&swap, 101, json!([{"seq": 101, "ts": 63, "l1": 9000, "txs": [hexb(&swap)]}])),
+        (&nowhere, 102, json!([{"seq": 102, "ts": 63, "l1": 9000, "txs": [hexb(&nowhere)]}])),
+        (&swap, 104, json!([{"seq": 104, "ts": 63, "l1": 9000, "txs": [hexb(&swap)]}])),
+    ] {
+        arbsim::check::feedstore::store().clear();
+        let feed = json!({"trigger": hexb(keccak256(trig).as_slice()), "triggerSeq": seq, "msgs": msgs, "route": [pool.clone()]});
+        let refs = feed_as_refs(&feed);
+        // Discover.
+        let d1 = arbsim::server::handle(&ctx, &json!({"id": 1, "type": "trig_discover", "at": {"after": "head"}, "feed": feed}));
+        let d2 = arbsim::server::handle(&ctx, &json!({"id": 1, "type": "trig_discover", "at": {"after": "head"}, "feed": refs}));
+        assert_eq!(strip_timing(&d1), strip_timing(&d2), "discover: inline vs refs");
+        assert!(d2.get("ph").is_some() && d2.get("cpu").is_some(), "phase timing in the answer: {d2}");
+        // A candidate check with a ladder.
+        let call = |f: &Value| {
+            arbsim::server::handle(&ctx, &json!({"id": 2, "type": "call", "at": {"after": "head"}, "feed": f, "prio": true,
+                "sizes": {"amountOffset": 0, "amounts": ["0x3", "0x5"]}, "overrides": {},
+                "calls": [{"from": format!("{}", a(0xe0)), "to": pool.clone(), "data": hexb(&data), "gas": "0x100000"}]}))
+        };
+        let (c1, c2) = (call(&feed), call(&refs));
+        assert_eq!(strip_timing(&c1), strip_timing(&c2), "call: inline vs refs");
+    }
+    // A message the sidecar doesn't hold: "feed_ref_missing" (the bot then sends it inline).
+    arbsim::check::feedstore::store().clear();
+    let miss = json!({"trigger": hexb(keccak256(&swap).as_slice()), "triggerSeq": 102, "refs": [[102, 1]]});
+    let d = arbsim::server::handle(&ctx, &json!({"id": 3, "type": "trig_discover", "at": {"after": "head"}, "feed": miss}));
+    assert_eq!(d["unknown"], json!("feed_ref_missing"), "{d}");
+    let c = arbsim::server::handle(&ctx, &json!({"id": 4, "type": "call", "at": {"after": "head"}, "feed": miss,
+        "calls": [{"from": format!("{}", a(0xe0)), "to": pool.clone(), "data": "0x0902f1ac", "gas": "0x100000"}]}));
+    assert_eq!(c["unknown"], json!("feed_ref_missing"), "{c}");
+    // Both at once: refused.
+    let both = json!({"trigger": hexb(keccak256(&swap).as_slice()), "triggerSeq": 102, "refs": [[102, 1]], "msgs": [{"seq": 102, "ts": 63, "l1": 9000, "txs": [hexb(&swap)]}]});
+    let d = arbsim::server::handle(&ctx, &json!({"id": 5, "type": "trig_discover", "at": {"after": "head"}, "feed": both}));
+    assert_eq!(d["unknown"], json!("bad_request"), "{d}");
+    // One trip: the discovery part names the same pools with refs.
+    arbsim::check::feedstore::store().clear();
+    let feed = json!({"trigger": hexb(keccak256(&swap).as_slice()), "triggerSeq": 102, "msgs": [{"seq": 102, "ts": 63, "l1": 9000, "txs": [hexb(&swap)]}]});
+    let refs = feed_as_refs(&feed);
+    let e1 = arbsim::server::handle(&ctx, &json!({"id": 6, "type": "trig_entry", "at": {"after": "head"}, "feed": feed, "limit": 6, "maxPools": 4, "minConf": "medium", "budgetUs": 5_000_000}));
+    let e2 = arbsim::server::handle(&ctx, &json!({"id": 6, "type": "trig_entry", "at": {"after": "head"}, "feed": refs, "limit": 6, "maxPools": 4, "minConf": "medium", "budgetUs": 5_000_000}));
+    assert_eq!(strip_timing(&e1["disc"]), strip_timing(&e2["disc"]), "{e1} vs {e2}");
+    // Status shows the store and the phase percentiles.
+    let st = arbsim::server::handle(&ctx, &json!({"id": 7, "type": "status"}));
+    assert!(st["feedStore"]["msgs"].as_u64().is_some(), "{}", st["feedStore"]);
+    assert!(st["trigTiming"]["discover"]["n"].as_u64().unwrap_or(0) > 0, "{}", st["trigTiming"]);
+    arbsim::check::feedstore::store().clear();
+}
+
+/// Copy 2 with `n` extra followed pools (half V4 pools inside one
+/// PoolManager, half contract pools with followed coin balances and an
+/// owned account each), in mixed states, written straight into the registry.
+fn add_pools(r: &Rig, n: usize) -> Address {
+    let pm = a(0x44);
+    let mut reg = r.h.c2.reg.write().unwrap();
+    let tmpl = reg.pools.values().next().unwrap().clone();
+    for i in 0..n {
+        let mut e = tmpl.clone();
+        let half = i % 2 == 0;
+        let (addr, id) = if half {
+            (pm, Some(B256::from(U256::from(1_000_000 + i as u64))))
+        } else {
+            (Address::from_word(B256::from(U256::from(0x5000_0000u64 + i as u64))), None)
+        };
+        e.pool = TrackedPool { address: addr, v4_id: id, kind: if half { PoolKind::V4 } else { PoolKind::V2 }, token0: a(COIN0), token1: a(COIN1), fee: 3000, tick_spacing: 60 };
+        e.items.clear();
+        // Mixed: most ready since different blocks, some loading.
+        e.state = if i % 7 == 3 { PoolState::Loading } else { PoolState::Ready };
+        e.ready_since = 95 + (i as u64 % 10);
+        e.owned = if !half && i % 3 == 0 { vec![Address::from_word(B256::from(U256::from(0x6000_0000u64 + i as u64)))] } else { vec![] };
+        reg.pools.insert((addr, id), e.clone());
+        reg.by_addr.entry(addr).or_default().push((addr, id));
+        for o in &e.owned {
+            reg.owner_of.insert(*o, (addr, id));
+        }
+        if !half {
+            reg.holders.entry(a(COIN0)).or_default().insert(addr);
+            reg.holders.entry(a(COIN1)).or_default().insert(addr);
+        }
+    }
+    pm
+}
+
+#[test]
+fn exact_values_and_moved_pools_from_the_summary_equal_the_registry_walk() {
+    let mut r = rig_with(C2Config { walks_inflight: 0, ..C2Config::for_tests() });
+    r.track(vec![v2_pool()]);
+    r.send(tick(100, 60));
+    let pm = add_pools(&r, 200);
+    let core = r.h.core_for(None);
+    let extra = [a(0xe7)];
+    for n in 90..110u64 {
+        for x in [&[][..], &extra[..]] {
+            let old = r.h.provenance_at(n, x);
+            let new = r.h.provenance_with(&core, n, x);
+            assert_eq!((&old.accts, &old.pms, &old.slots), (&new.accts, &new.pms, &new.slots), "block {n}");
+        }
+    }
+    // Moved pools: V4 slot0 of some ids, a contract pool's reserves, shared values.
+    let ids: Vec<B256> = (0..10u64).map(|i| B256::from(U256::from(1_000_000 + 2 * i))).collect();
+    let mut changed: Vec<(Address, U256)> = ids.iter().take(3).map(|id| (pm, arbsim::check::moved::v4_base(*id))).collect();
+    changed.push((Address::from_word(B256::from(U256::from(0x5000_0001u64))), u(8)));
+    changed.push((pm, u(7)));
+    changed.push((a(V2P), u(8)));
+    changed.sort();
+    assert_eq!(r.h.pools_changed(&changed, &[]), r.h.pools_changed_with(&core, &changed, &[]));
+    assert_eq!(r.h.pools_changed_with(&core, &changed, &[]).len(), 5);
+    assert!(r.h.pools_changed_with(&core, &[], &[]).is_empty());
+}
+
+/// Benchmark (TEST NUMBERS: a tiny trigger contract on the in-memory copy,
+/// not live numbers). The live question shape: 48 feed messages x 10
+/// transactions x ~1 KB, the trigger 3 messages after the copy's block,
+/// copy 2 following ~640 pools. Old way (messages inline) vs feed store
+/// (messages named), through the server, plus the socket thread's JSON
+/// read of each question, plus the exact-values list / moved-pool match.
+#[test]
+fn bench_discover_payload_and_registry_test_numbers_only() {
+    let _turn = FEED_STORE_TURN.lock().unwrap_or_else(|e| e.into_inner());
+    arbsim::check::feedstore::store().clear();
+    let code = vec![0x36, 0x60, 0x20, 0x14, 0x60, 0x12, 0x57, 0x60, 0x08, 0x54, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3, 0x5b, 0x60, 0x00, 0x35, 0x60, 0x08, 0x55, 0x00];
+    let (r, ctx) = trig_world_code(code);
+    add_pools(&r, 640);
+    let mut word = vec![0u8; 32];
+    word[31] = 9;
+    let swap = signed(0, a(V2P), word);
+    // 48 messages 57..104 (the copy is at 101): 10 filler transactions of
+    // ~1 KB each, the trigger in 104.
+    let mut nonce = 1u64;
+    let mut msgs = Vec::new();
+    for seq in 57..=104u64 {
+        let mut txs: Vec<String> = (0..10)
+            .map(|_| {
+                nonce += 1;
+                hexb(&signed(nonce, a(0x77), vec![0xab; 900]))
+            })
+            .collect();
+        if seq == 104 {
+            txs[5] = hexb(&swap);
+        }
+        msgs.push(json!({"seq": seq, "ts": 60 + seq, "l1": 9000, "txs": txs}));
+    }
+    let feed = json!({"trigger": hexb(keccak256(&swap).as_slice()), "triggerSeq": 104, "msgs": msgs});
+    let refs = feed_as_refs(&feed);
+    let q_inline = json!({"id": 1, "type": "trig_discover", "at": {"after": "head"}, "feed": feed});
+    let q_refs = json!({"id": 1, "type": "trig_discover", "at": {"after": "head"}, "feed": refs});
+    let (b_inline, b_refs) = (serde_json::to_vec(&q_inline).unwrap(), serde_json::to_vec(&q_refs).unwrap());
+    // Warm both (the first question decodes the new transactions).
+    let w1 = arbsim::server::handle(&ctx, &q_inline);
+    let w2 = arbsim::server::handle(&ctx, &q_refs);
+    assert_eq!(w1["ok"], json!(true), "{w1}");
+    assert_eq!(strip_timing(&w1), strip_timing(&w2));
+    let n = 100u128;
+    let time = |b: &[u8]| {
+        let (mut read, mut work) = (0u128, 0u128);
+        for _ in 0..n {
+            let t = std::time::Instant::now();
+            let q: Value = serde_json::from_slice(b).unwrap();
+            read += t.elapsed().as_micros();
+            let t = std::time::Instant::now();
+            let d = arbsim::server::handle(&ctx, &q);
+            work += t.elapsed().as_micros();
+            assert_eq!(d["ok"], json!(true));
+        }
+        (read / n, work / n)
+    };
+    let (ri, wi) = time(&b_inline);
+    let (rr, wr) = time(&b_refs);
+    arbsim::timing::ph_reset();
+    let last = arbsim::server::handle(&ctx, &q_refs);
+    arbsim::timing::ph_reset();
+    let last_inline = arbsim::server::handle(&ctx, &q_inline);
+    // Exact-values list + moved pools, old (registry walk under its lock) vs new (summary).
+    let core = r.h.core_for(None);
+    let changed = vec![(a(V2P), u(8))];
+    let t = std::time::Instant::now();
+    for _ in 0..n {
+        let _ = r.h.provenance_at(101, &[]);
+        let _ = r.h.pools_changed(&changed, &[]);
+    }
+    let old_reg = t.elapsed().as_micros() / n;
+    let t = std::time::Instant::now();
+    for i in 0..n {
+        // (a new block each time: the cached list is not reused)
+        let _ = r.h.provenance_with(&core, 101 + (i as u64 % 2) * 1000 + i as u64, &[]);
+        let _ = r.h.pools_changed_with(&core, &changed, &[]);
+    }
+    let new_reg = t.elapsed().as_micros() / n;
+    println!(
+        "[bench, test numbers only] trig_discover, 48 msgs x 10 txs x ~1 KB, copy 2 following {} pools ({} build):\n  old (messages inline): question {} KB, socket-thread JSON read {ri} us, worker {wi} us\n  new (feed store refs): question {} KB, socket-thread JSON read {rr} us, worker {wr} us\n  exact-values list + moved pools per question: registry walk {old_reg} us, summary {new_reg} us (new block each time; same block: cached)\n  phases (us) of one new-way question: {} counts {}\n  phases (us) of one old-way question: {} counts {}",
+        641,
+        if cfg!(debug_assertions) { "debug" } else { "release" },
+        b_inline.len() / 1024,
+        b_refs.len() / 1024,
+        last["ph"],
+        last["pn"],
+        last_inline["ph"],
+        last_inline["pn"]
+    );
+    arbsim::check::feedstore::store().clear();
+}
+
 // TRIGGER-ENTRY ONE TRIP (server.rs trig_entry + check/entry.rs): discovery
 // and the candidate checks in one question. Each candidate's answer must be
 // EXACTLY what the bot's own trigger-first `call` gets (same handler, same
@@ -2656,7 +2905,8 @@ fn trig_entry_one_trip_equals_discover_then_call() {
     assert_eq!(a1["found"], json!(3), "{a1}");
     // The one-trip discovery equals a plain trig_discover...
     let d = arbsim::server::handle(&ctx, &json!({"id": 3, "type": "trig_discover", "at": {"after": "head"}, "feed": feed}));
-    let strip = |v: &Value| { let mut v = v.clone(); for k in ["us", "t", "id"] { v.as_object_mut().unwrap().remove(k); } v };
+    // (timing fields differ run to run: us / t, and the speed-3 phase list ph / pn / cpu)
+    let strip = |v: &Value| { let mut v = v.clone(); for k in ["us", "t", "id", "ph", "pn", "cpu"] { v.as_object_mut().unwrap().remove(k); } v };
     assert_eq!(strip(&a1["disc"]), strip(&d), "discovery part");
     // ... and each candidate's answer equals the bot's own call.
     let mut f = feed.clone();

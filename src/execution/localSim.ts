@@ -138,6 +138,8 @@ export class LocalSimClient {
   private feedQueue: Buffer[] = [];
   private inbuf: Buffer = Buffer.alloc(0);
   private everConnected = false;
+  // Connections made so far (connEpoch, speed-3).
+  private epoch = 0;
 
   readonly stats: LocalSimStats = {
     sent: 0, answered: 0, unknown: 0, unknownByWhy: {}, timeouts: 0, fallbacks: 0,
@@ -160,6 +162,8 @@ export class LocalSimClient {
   }
 
   isConnected(): boolean { return this.connected; }
+  // Which connection this is (bumped on every (re)connect; 0 = never connected).
+  connEpoch(): number { return this.epoch; }
 
   // Ask the sidecar a question (`msg` without id). Always resolves: a sure
   // answer, or { ok:false, unknown:"<why>" } (timeout, disconnected, ...).
@@ -249,6 +253,9 @@ export class LocalSimClient {
     s.on('connect', () => {
       if (this.sock !== s) return;
       this.connected = true;
+      // A new connection: the sidecar may be a new process (speed-3 feed
+      // store: what we handed it before may be gone).
+      this.epoch++;
       this.stats.connected = true;
       this.backoff = this.backoffMinMs;
       if (this.everConnected) this.stats.reconnects++;

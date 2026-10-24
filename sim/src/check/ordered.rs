@@ -237,6 +237,13 @@ pub struct WireFeed {
     /// "skip"); missing = all of them.
     #[serde(default)]
     pub assume: Option<Vec<String>>,
+    /// FEED STORE (check/feedstore.rs, speed-3): instead of `msgs`, the
+    /// messages the bot already handed over (`feed_put`), named as
+    /// [sequence number, transaction count], oldest first. The server
+    /// looks them up (missing = "feed_ref_missing": the bot asks again with
+    /// `msgs`). Never both.
+    #[serde(default)]
+    pub refs: Option<Vec<(u64, usize)>>,
 }
 
 /// One feed message as the bot sends it.
@@ -266,7 +273,7 @@ pub struct WireFeedMsg {
 /// so decoded ones are kept by hash (the hash is of the exact signed bytes:
 /// same hash = same transaction). Bounded: emptied when full.
 const DECODE_CACHE_MAX: usize = 16_384;
-fn decode_cached(h: B256, raw: &[u8]) -> Result<DecodedTx, String> {
+pub(crate) fn decode_cached(h: B256, raw: &[u8]) -> Result<DecodedTx, String> {
     static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<B256, DecodedTx>>> = std::sync::OnceLock::new();
     let c = CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
     if let Some(t) = c.lock().unwrap_or_else(|e| e.into_inner()).get(&h) {
@@ -295,7 +302,19 @@ fn gap(detail: String) -> CheckUnknown {
 /// Work out what to replay on a snapshot at feed sequence `snap_seq`
 /// (block = snap_seq + `offset`), whose block details are `base`.
 /// Err = the answer is "unknown" (or a bad request), see the file header.
+/// (The messages come from `feed.msgs`; see `build_plan_with` for messages
+/// the server already holds, feed store.)
 pub fn build_plan(feed: &WireFeed, snap_seq: u64, offset: u64, base: &BlockCtx) -> Result<(OrderedPlan, PlanInfo), CheckUnknown> {
+    build_plan_with(feed, None, snap_seq, offset, base)
+}
+
+/// `build_plan` with the messages given ready to use (`held`: the feed
+/// store's copies of the messages `feed.refs` names, check/feedstore.rs),
+/// or None = read them from `feed.msgs` as always. Both give exactly the
+/// same plan and the same errors in the same order: the stored copies are
+/// the same messages, with the hex already turned into bytes and hashed,
+/// and each transaction decoded at most once.
+pub fn build_plan_with(feed: &WireFeed, held: Option<&[Arc<super::feedstore::BinMsg>]>, snap_seq: u64, offset: u64, base: &BlockCtx) -> Result<(OrderedPlan, PlanInfo), CheckUnknown> {
     let trigger = parse_bytes(&feed.trigger)
         .ok()
         .filter(|b| b.len() == 32)
@@ -308,27 +327,40 @@ pub fn build_plan(feed: &WireFeed, snap_seq: u64, offset: u64, base: &BlockCtx) 
             return Err(order(format!("copy block {b} doesn't match feed sequence {snap_seq} + offset {offset}")));
         }
     }
+    let seqs: Vec<u64> = match held {
+        Some(h) => h.iter().map(|m| m.seq).collect(),
+        None => feed.msgs.iter().map(|m| m.seq).collect(),
+    };
     // Oldest first, each message once.
-    for w in feed.msgs.windows(2) {
-        if w[1].seq <= w[0].seq {
-            return Err(order(format!("feed messages out of order or repeated ({} then {})", w[0].seq, w[1].seq)));
+    for w in seqs.windows(2) {
+        if w[1] <= w[0] {
+            return Err(order(format!("feed messages out of order or repeated ({} then {})", w[0], w[1])));
         }
     }
-    // Hash of every transaction the bot gave (decoding comes later, only
-    // for the messages we replay): the trigger must be exactly where the
-    // feed says, and nowhere else.
-    let mut hashes: Vec<Vec<(B256, Bytes)>> = Vec::with_capacity(feed.msgs.len());
-    for m in &feed.msgs {
-        let mut v = Vec::with_capacity(m.txs.len());
-        for (i, t) in m.txs.iter().enumerate() {
-            let raw = parse_bytes(t).map_err(|e| CheckUnknown::bad_request(format!("feed message {} tx {i}: {e}", m.seq)))?;
-            v.push((keccak256(&raw), raw));
+    // Every transaction the bot gave, as bytes with its hash (decoding comes
+    // later, only for the messages we replay): the trigger must be exactly
+    // where the feed says, and nowhere else. (Feed store: already done once,
+    // when the message arrived.)
+    let t_hash = std::time::Instant::now();
+    let owned: Vec<Arc<super::feedstore::BinMsg>>;
+    let msgs: &[Arc<super::feedstore::BinMsg>] = match held {
+        Some(h) => h,
+        None => {
+            owned = feed.msgs.iter().map(|m| Arc::new(super::feedstore::BinMsg::from_wire(m, false))).collect();
+            &owned
         }
-        hashes.push(v);
+    };
+    for m in msgs {
+        if let Some((i, e)) = &m.bad {
+            return Err(CheckUnknown::bad_request(format!("feed message {} tx {i}: {e}", m.seq)));
+        }
     }
+    crate::timing::ph_add("planHash", t_hash.elapsed().as_micros() as u64);
+    crate::timing::ph_count("msgs", msgs.len() as u64);
+    crate::timing::ph_count("txs", msgs.iter().map(|m| m.txs.len() as u64).sum());
     let mut seen = 0usize;
-    for (m, hs) in feed.msgs.iter().zip(&hashes) {
-        let here = hs.iter().filter(|(h, _)| *h == trigger).count();
+    for m in msgs {
+        let here = m.txs.iter().filter(|t| t.hash == trigger).count();
         if here > 0 && m.seq != feed.trigger_seq {
             return Err(order(format!("trigger found in feed message {} but said to be in {}", m.seq, feed.trigger_seq)));
         }
@@ -343,20 +375,20 @@ pub fn build_plan(feed: &WireFeed, snap_seq: u64, offset: u64, base: &BlockCtx) 
     let included = feed.trigger_seq <= snap_seq;
     // The messages after the snapshot: they must start right after it and
     // follow each other with no message missing.
-    let needed: Vec<usize> = (0..feed.msgs.len()).filter(|i| feed.msgs[*i].seq > snap_seq).collect();
+    let needed: Vec<usize> = (0..msgs.len()).filter(|i| msgs[*i].seq > snap_seq).collect();
     if let Some(first) = needed.first() {
-        let s = feed.msgs[*first].seq;
+        let s = msgs[*first].seq;
         if s != snap_seq + 1 {
             return Err(gap(format!("feed messages {}..{} missing (copy is at {snap_seq})", snap_seq + 1, s - 1)));
         }
     }
     for w in needed.windows(2) {
-        let (a, b) = (feed.msgs[w[0]].seq, feed.msgs[w[1]].seq);
+        let (a, b) = (msgs[w[0]].seq, msgs[w[1]].seq);
         if b != a + 1 {
             return Err(gap(format!("feed messages {}..{} missing", a + 1, b - 1)));
         }
     }
-    if !included && needed.last().is_none_or(|i| feed.msgs[*i].seq < feed.trigger_seq) {
+    if !included && needed.last().is_none_or(|i| msgs[*i].seq < feed.trigger_seq) {
         return Err(gap(format!("trigger's feed message {} not given (copy is at {snap_seq})", feed.trigger_seq)));
     }
     if needed.len() > MAX_PLAN_MSGS {
@@ -364,11 +396,11 @@ pub fn build_plan(feed: &WireFeed, snap_seq: u64, offset: u64, base: &BlockCtx) 
     }
     // Decode and lay out each message with its own block details. Nitro
     // never lets a block's time or parent-chain block go backwards.
-    let mut msgs = Vec::with_capacity(needed.len());
+    let mut out = Vec::with_capacity(needed.len());
     let mut prev = base.clone();
     let (mut txs, mut later, mut after_trigger) = (0usize, 0usize, included);
     for i in needed {
-        let m = &feed.msgs[i];
+        let m = &msgs[i];
         if !m.complete {
             return Err(CheckUnknown::new(
                 UnknownReason::FeedUnreplayable,
@@ -388,15 +420,15 @@ pub fn build_plan(feed: &WireFeed, snap_seq: u64, offset: u64, base: &BlockCtx) 
             prevrandao: prev.prevrandao,
         };
         let mut decoded = Vec::with_capacity(m.txs.len());
-        for (j, (h, raw)) in hashes[i].iter().enumerate() {
-            let t = decode_cached(*h, raw).map_err(|e| {
+        for (j, bt) in m.txs.iter().enumerate() {
+            let t = bt.decoded().map_err(|e| {
                 let reason = if e.starts_with(UNSUPPORTED_TX_PREFIX) { UnknownReason::UnsupportedTx } else { UnknownReason::FeedUnreplayable };
                 CheckUnknown::new(reason, format!("feed message {} tx {j}: {e}", m.seq))
             })?;
             if after_trigger {
                 later += 1;
             }
-            if *h == trigger {
+            if bt.hash == trigger {
                 after_trigger = true;
             }
             decoded.push(t);
@@ -406,11 +438,11 @@ pub fn build_plan(feed: &WireFeed, snap_seq: u64, offset: u64, base: &BlockCtx) 
             return Err(gap(format!("more than {MAX_PLAN_TXS} transactions to replay")));
         }
         prev = ctx.clone();
-        msgs.push(PlanMsg { seq: m.seq, ctx, txs: decoded });
+        out.push(PlanMsg { seq: m.seq, ctx, txs: decoded });
     }
-    let last_seq = msgs.last().map_or(snap_seq, |m| m.seq);
-    let info = PlanInfo { trigger, snap_seq, snap_block: snap_seq + offset, included, msgs: msgs.len(), txs, later, last_seq };
-    Ok((OrderedPlan { msgs, trigger, call_ctx: prev }, info))
+    let last_seq = out.last().map_or(snap_seq, |m| m.seq);
+    let info = PlanInfo { trigger, snap_seq, snap_block: snap_seq + offset, included, msgs: out.len(), txs, later, last_seq };
+    Ok((OrderedPlan { msgs: out, trigger, call_ctx: prev }, info))
 }
 
 // ---------------------------------------------------------------------------
@@ -1105,6 +1137,8 @@ pub fn run_ordered_sizes(
     let mut patched: Vec<(Address, U256)> = Vec::new();
     let mut skip: HashMap<(u64, usize), bool> = HashMap::new();
     for _ in 0..MAX_ROUNDS {
+        // Phase counts (timing.rs): each round re-runs the whole plan.
+        crate::timing::ph_count("rounds", 1);
         match one_round(view, plan, overrides, calls, prov, strict_call, assume, &patched, &skip, ladder)? {
             Next::Done(mut out) => {
                 out.assumed.sender_funds |= !patched.is_empty();

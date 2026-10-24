@@ -73,6 +73,10 @@ struct Job {
     out: Writer,
     /// When the socket thread read it (queue wait = until a worker takes it).
     queued: Instant,
+    /// Socket thread: microseconds to read the JSON, and its size (speed-3
+    /// phase timing: a question carrying the whole feed was ~0.5 MB).
+    read_us: u64,
+    bytes: u64,
 }
 
 /// Start the server (blocks forever, serving connections).
@@ -120,6 +124,10 @@ pub fn run(ctx: Arc<Ctx>, listener: UnixListener) -> std::io::Result<()> {
 fn worker(ctx: Arc<Ctx>, jobs: Arc<JobQueue<Job>>) {
     while let Some(job) = jobs.pop() {
         let mut tm = Tm { queue_us: job.queued.elapsed().as_micros() as u64, ..Tm::default() };
+        // Trigger-first phase timing (timing.rs): a fresh list per question.
+        crate::timing::ph_reset();
+        crate::timing::ph_add("read", job.read_us);
+        crate::timing::ph_count("bytes", job.bytes);
         let answer = handle_tm(&ctx, &job.req, &mut tm);
         let t_send = Instant::now();
         send(&job.out, &answer);
@@ -142,6 +150,7 @@ fn connection(ctx: Arc<Ctx>, stream: UnixStream, jobs: Arc<JobQueue<Job>>) -> st
     let out: Writer = Arc::new(Mutex::new(BufWriter::new(stream.try_clone()?)));
     let mut r = std::io::BufReader::new(stream);
     while let Some(body) = read_msg(&mut r)? {
+        let t_read = Instant::now();
         let req: Value = match serde_json::from_slice(&body) {
             Ok(v) => v,
             Err(_) => {
@@ -149,8 +158,16 @@ fn connection(ctx: Arc<Ctx>, stream: UnixStream, jobs: Arc<JobQueue<Job>>) -> st
                 continue;
             }
         };
+        let read_us = t_read.elapsed().as_micros() as u64;
         // Copy 2 block reports: straight to the copy-2 thread, no answer.
         let ty = req.get("type").and_then(|t| t.as_str());
+        // FEED STORE (check/feedstore.rs): a new feed message, sent once by
+        // the bot; kept here, no answer. Read before any later question on
+        // this connection, so a question naming it always finds it.
+        if ty == Some("feed_put") {
+            crate::check::feedstore::store().put_json(&req);
+            continue;
+        }
         if ty == Some("pool_logs") || ty == Some("block_tick") {
             if let Some(c) = &ctx.copy2 {
                 c.block_json(&req);
@@ -181,7 +198,7 @@ fn connection(ctx: Arc<Ctx>, stream: UnixStream, jobs: Arc<JobQueue<Job>>) -> st
         }
         // Trigger-entry work goes in the fast lane (jobq.rs).
         let fast = is_fast(&req);
-        if jobs.push(Job { req, out: out.clone(), queued: Instant::now() }, fast).is_err() {
+        if jobs.push(Job { req, out: out.clone(), queued: Instant::now(), read_us, bytes: body.len() as u64 }, fast).is_err() {
             send(&out, &unknown(&id, "not_ready", "sidecar busy", 0));
         }
     }
@@ -213,6 +230,7 @@ pub fn handle_tm(ctx: &Ctx, req: &Value, tm: &mut Tm) -> Value {
                     s[k] = v;
                 }
             }
+            s["feedStore"] = crate::check::feedstore::store().status_json();
             s
         }
         Some("warm") => match parse_warm(req) {
@@ -236,8 +254,10 @@ pub fn handle_tm(ctx: &Ctx, req: &Value, tm: &mut Tm) -> Value {
         },
         Some("call") => {
             warm_check_accounts(ctx, req);
-            let req = &caller_as_empty(ctx, req);
-            let r: CallRequest = match serde_json::from_value(req.clone()) {
+            let req = &*caller_as_empty(ctx, req);
+            // (read straight from the request: no copy of it, which for a
+            // trigger-first check used to include the whole feed)
+            let r: CallRequest = match serde::Deserialize::deserialize(req) {
                 Ok(r) => r,
                 Err(e) => return bad_request(&id, &format!("call: {e}")),
             };
@@ -251,8 +271,8 @@ pub fn handle_tm(ctx: &Ctx, req: &Value, tm: &mut Tm) -> Value {
         }
         Some("size_search") => {
             warm_check_accounts(ctx, req);
-            let req = &caller_as_empty(ctx, req);
-            let r: SizeSearchRequest = match serde_json::from_value(req.clone()) {
+            let req = &*caller_as_empty(ctx, req);
+            let r: SizeSearchRequest = match serde::Deserialize::deserialize(req) {
                 Ok(r) => r,
                 Err(e) => return bad_request(&id, &format!("size_search: {e}")),
             };
@@ -292,9 +312,11 @@ fn warm_check_accounts(ctx: &Ctx, req: &Value) {
 /// request doesn't override `from` itself and the copy doesn't know it).
 /// The answer is EXACTLY what the node gives for the same call with that
 /// override (the checker should pass it to the node too when comparing).
-fn caller_as_empty(ctx: &Ctx, req: &Value) -> Value {
-    let Some(_) = &ctx.copy2 else { return req.clone() };
-    let mut out = req.clone();
+fn caller_as_empty<'a>(ctx: &Ctx, req: &'a Value) -> std::borrow::Cow<'a, Value> {
+    let Some(_) = &ctx.copy2 else { return std::borrow::Cow::Borrowed(req) };
+    // Copied only if an override has to be added (speed-3: the request can
+    // be large; the answer is the same either way).
+    let mut out: Option<Value> = None;
     let mut froms: Vec<String> = Vec::new();
     if let Some(cs) = req.get("calls").and_then(|c| c.as_array()) {
         froms.extend(cs.iter().filter_map(|c| c.get("from").and_then(|f| f.as_str()).map(|s| s.to_string())));
@@ -312,12 +334,16 @@ fn caller_as_empty(ctx: &Ctx, req: &Value) -> Value {
         if known || has_ov {
             continue;
         }
-        if !out.get("overrides").is_some_and(|o| o.is_object()) {
-            out["overrides"] = json!({});
+        let o = out.get_or_insert_with(|| req.clone());
+        if !o.get("overrides").is_some_and(|o| o.is_object()) {
+            o["overrides"] = json!({});
         }
-        out["overrides"][format!("{a:#x}")] = json!({ "balance": "0x0", "nonce": "0x0", "code": "0x" });
+        o["overrides"][format!("{a:#x}")] = json!({ "balance": "0x0", "nonce": "0x0", "code": "0x" });
     }
-    out
+    match out {
+        Some(v) => std::borrow::Cow::Owned(v),
+        None => std::borrow::Cow::Borrowed(req),
+    }
 }
 
 /// Pick the state for `at`, run the check, learn from misses.
@@ -364,18 +390,64 @@ fn check_inner(ctx: &Ctx, id: &Value, at: &Value, t0: Instant, tm: &mut Tm, run:
 /// for trigger-first checks only happen through the bot's budgeted warming
 /// (execution/triggerFirst.ts TrigWarmer -> `warm`).
 fn trig_check(ctx: &Ctx, id: &Value, r: &CallRequest, feed_v: &Value, t0: Instant, tm: &mut Tm) -> Value {
+    let cpu0 = crate::timing::thread_cpu_us();
     let mut a = trig_inner(ctx, id, r, feed_v, t0, tm);
     let used = tm.prep_us + tm.resolve_us + tm.facts_us + tm.runs_us.iter().sum::<u64>();
     tm.post_us = (t0.elapsed().as_micros() as u64).saturating_sub(used);
     a["t"] = tm.json();
+    trig_phases(&mut a, "call", t0, cpu0, tm);
     a
+}
+
+/// TRIGGER-FIRST PHASES (timing.rs, speed-3): put this question's phase
+/// list into its answer ("ph" microseconds, "pn" counts, "cpu" = the
+/// worker thread's CPU microseconds for the question, next to "us" wall)
+/// and keep it for status "trigTiming". Measurement only.
+fn trig_phases(a: &mut Value, kind: &'static str, t0: Instant, cpu0: u64, tm: &Tm) {
+    let total = t0.elapsed().as_micros() as u64;
+    let cpu = crate::timing::thread_cpu_us().saturating_sub(cpu0);
+    crate::timing::ph_add("resolve", tm.resolve_us);
+    crate::timing::ph_add("facts", tm.facts_us);
+    crate::timing::ph_add("evm", tm.runs_us.iter().sum());
+    crate::timing::ph_count("runs", tm.runs_us.len() as u64);
+    let (ph, pn) = crate::timing::ph_json();
+    a["ph"] = ph;
+    a["pn"] = pn;
+    a["cpu"] = json!(cpu);
+    crate::timing::record_trig(kind, &[("total", total), ("cpu", cpu), ("queue", tm.queue_us)]);
+}
+
+/// A trigger-first request's `feed`: read straight from the request (no
+/// copy of it), and, when it names messages the bot already handed over
+/// (`refs`, check/feedstore.rs), those messages from the feed store.
+/// Err = the answer to give (bad request, or unknown "feed_ref_missing":
+/// the bot then asks again with the messages themselves).
+type HeldMsgs = Option<Vec<Arc<crate::check::feedstore::BinMsg>>>;
+fn feed_of(id: &Value, v: &Value) -> Result<(crate::check::ordered::WireFeed, HeldMsgs), Value> {
+    let t = Instant::now();
+    let feed: crate::check::ordered::WireFeed = match serde::Deserialize::deserialize(v) {
+        Ok(f) => f,
+        Err(e) => return Err(bad_request(id, &format!("feed: {e}"))),
+    };
+    crate::timing::ph_add("feedRead", t.elapsed().as_micros() as u64);
+    let Some(refs) = feed.refs.as_ref() else { return Ok((feed, None)) };
+    if !feed.msgs.is_empty() {
+        return Err(bad_request(id, "feed: refs and msgs can't be combined"));
+    }
+    let t = Instant::now();
+    let held = crate::check::feedstore::store().resolve(refs);
+    crate::timing::ph_add("feedRefs", t.elapsed().as_micros() as u64);
+    match held {
+        Ok(h) => Ok((feed, Some(h))),
+        Err(detail) => Err(json!({ "id": id, "ok": false, "unknown": "feed_ref_missing", "detail": detail })),
+    }
 }
 
 fn trig_inner(ctx: &Ctx, id: &Value, r: &CallRequest, feed_v: &Value, t0: Instant, tm: &mut Tm) -> Value {
     let sh = &ctx.shared;
-    let feed: crate::check::ordered::WireFeed = match serde_json::from_value(feed_v.clone()) {
-        Ok(f) => f,
-        Err(e) => return bad_request(id, &format!("feed: {e}")),
+    let (feed, held) = match feed_of(id, feed_v) {
+        Ok(x) => x,
+        Err(a) => return a,
     };
     // The plan sets every block detail itself; mixing in other ways of
     // changing the state or the block would make the order unclear.
@@ -400,25 +472,35 @@ fn trig_inner(ctx: &Ctx, id: &Value, r: &CallRequest, feed_v: &Value, t0: Instan
             return unknown(id, e.reason, &e.detail, t0.elapsed().as_micros() as u64);
         }
     };
-    let (plan, info) = match crate::check::ordered::build_plan(&feed, picked.seq, sh.cfg.l2_offset, &picked.ctx) {
+    let t_plan = Instant::now();
+    let built = crate::check::ordered::build_plan_with(&feed, held.as_deref(), picked.seq, sh.cfg.l2_offset, &picked.ctx);
+    crate::timing::ph_add("plan", t_plan.elapsed().as_micros() as u64);
+    let (plan, info) = match built {
         Ok(x) => x,
         Err(u) => {
             Stats::inc(&sh.stats.checks_unknown);
             return crate::check::proto_types::unknown_json(id, &u, t0.elapsed().as_micros());
         }
     };
+    // Copy 2: one registry summary for the whole check (checkcore.rs), also
+    // used for "which values are exact" (no registry lock, speed-3).
+    let t_core = Instant::now();
+    let core = ctx.copy2.as_ref().map(|c| c.core_for(picked.from.as_ref()));
+    tm.facts_us += t_core.elapsed().as_micros() as u64;
     // Which copy values are exact at the version's block (copy 2: only what
     // it follows from reports; copy 1 replays everything: all of them).
     let block = picked.seq + sh.cfg.l2_offset;
-    let prov: Box<dyn crate::check::ordered::Provenance> = match &ctx.copy2 {
-        Some(c) => Box::new(c.provenance_at(block, &override_code_accounts(&r.overrides))),
-        None => Box::new(crate::check::ordered::AllExact),
+    let t_prov = Instant::now();
+    let prov: Arc<dyn crate::check::ordered::Provenance + Send + Sync> = match (&ctx.copy2, &core) {
+        (Some(c), Some(k)) => c.provenance_with(k, block, &override_code_accounts(&r.overrides)),
+        _ => Arc::new(crate::check::ordered::AllExact),
     };
+    crate::timing::ph_add("prov", t_prov.elapsed().as_micros() as u64);
     // Best effort (check/ordered.rs BEST EFFORT): which assumptions this
     // check may make (this program's setting, then the bot's request).
     let (strict, assume) = trig_assume(trig_trust(), &feed, |keys| ctx.copy2.as_ref().and_then(|c| c.route_for(keys)));
     let run = |view: &dyn StateRead, _c: &BlockCtx| crate::check::proto_types::handle_trig_call_with(view, &plan, &info, r, prov.as_ref(), strict, &assume);
-    after_pick(ctx, picked, t0, tm, &run, false)
+    after_pick_with(ctx, picked, t0, tm, &run, false, core)
 }
 
 /// TRIGGER-FIRST ENTRY POINT: `{"type":"trig_discover", "at":{"after":"head"},
@@ -433,19 +515,21 @@ fn trig_inner(ctx: &Ctx, id: &Value, r: &CallRequest, feed_v: &Value, t0: Instan
 /// version answers unknown "already_in_copy" (its effect is already there,
 /// we can't see it any more). Nothing is queued for fetching here.
 fn trig_discover(ctx: &Ctx, id: &Value, req: &Value, t0: Instant, tm: &mut Tm) -> Value {
+    let cpu0 = crate::timing::thread_cpu_us();
     let mut a = trig_discover_inner(ctx, id, req, t0, tm);
     let used = tm.prep_us + tm.resolve_us + tm.facts_us + tm.runs_us.iter().sum::<u64>();
     tm.post_us = (t0.elapsed().as_micros() as u64).saturating_sub(used);
     a["t"] = tm.json();
+    trig_phases(&mut a, "discover", t0, cpu0, tm);
     a
 }
 
 fn trig_discover_inner(ctx: &Ctx, id: &Value, req: &Value, t0: Instant, tm: &mut Tm) -> Value {
     let sh = &ctx.shared;
     let Some(c2) = &ctx.copy2 else { return bad_request(id, "trig_discover needs ARBSIM_SOURCE=pool-events (copy 2)") };
-    let feed: crate::check::ordered::WireFeed = match req.get("feed").map(|f| serde_json::from_value(f.clone())) {
-        Some(Ok(f)) => f,
-        Some(Err(e)) => return bad_request(id, &format!("feed: {e}")),
+    let (feed, held) = match req.get("feed").map(|f| feed_of(id, f)) {
+        Some(Ok(x)) => x,
+        Some(Err(a)) => return a,
         None => return bad_request(id, "trig_discover needs feed"),
     };
     let at = match parse_at(req.get("at").unwrap_or(&Value::Null)) {
@@ -467,7 +551,10 @@ fn trig_discover_inner(ctx: &Ctx, id: &Value, req: &Value, t0: Instant, tm: &mut
             return unknown(id, e.reason, &e.detail, t0.elapsed().as_micros() as u64);
         }
     };
-    let (plan, info) = match crate::check::ordered::build_plan(&feed, picked.seq, sh.cfg.l2_offset, &picked.ctx) {
+    let t_plan = Instant::now();
+    let built = crate::check::ordered::build_plan_with(&feed, held.as_deref(), picked.seq, sh.cfg.l2_offset, &picked.ctx);
+    crate::timing::ph_add("plan", t_plan.elapsed().as_micros() as u64);
+    let (plan, info) = match built {
         Ok(x) => x,
         Err(u) => {
             Stats::inc(&sh.stats.checks_unknown);
@@ -479,7 +566,12 @@ fn trig_discover_inner(ctx: &Ctx, id: &Value, req: &Value, t0: Instant, tm: &mut
         return json!({ "id": id, "ok": false, "unknown": "already_in_copy", "detail": "the copy version already holds the trigger", "us": t0.elapsed().as_micros() as u64 });
     };
     let block = picked.seq + sh.cfg.l2_offset;
-    let prov = c2.provenance_at(block, &[]);
+    // One registry summary for the whole question (checkcore.rs): the exact
+    // values list and the moved-pool tables come from it, no registry lock.
+    let t_core = Instant::now();
+    let core = c2.core_for(picked.from.as_ref());
+    tm.facts_us += t_core.elapsed().as_micros() as u64;
+    let prov = crate::timing::ph_time("prov", || c2.provenance_with(&core, block, &[]));
     // Same assumptions as a trigger-first check (no skipping: only the
     // trigger runs, and the trigger is never skipped).
     let (strict, mut assume) = trig_assume(trig_trust(), &feed, |_| None);
@@ -487,7 +579,7 @@ fn trig_discover_inner(ctx: &Ctx, id: &Value, req: &Value, t0: Instant, tm: &mut
     assume.record_hashes = true;
     let snap_block = info.snap_block;
     let run = |view: &dyn StateRead, _c: &BlockCtx| -> Value {
-        match crate::check::ordered::run_ordered_with(view, &alone, &crate::check::Overrides::none(), &[], &prov, strict, &assume) {
+        match crate::check::ordered::run_ordered_with(view, &alone, &crate::check::Overrides::none(), &[], prov.as_ref(), strict, &assume) {
             Ok(out) => {
                 let mut labels = out.assumed.labels();
                 let mut conf = out.assumed.confidence();
@@ -498,7 +590,7 @@ fn trig_discover_inner(ctx: &Ctx, id: &Value, req: &Value, t0: Instant, tm: &mut
                     }
                 }
                 // Only the pools' OWN state counts (check/moved.rs).
-                let moved = c2.pools_changed(&out.changed, &out.hashes);
+                let moved = crate::timing::ph_time("moved", || c2.pools_changed_with(&core, &out.changed, &out.hashes));
                 json!({
                     "id": id, "ok": true,
                     "pools": moved.iter().map(|m| m.key.clone()).collect::<Vec<_>>(),
@@ -512,7 +604,7 @@ fn trig_discover_inner(ctx: &Ctx, id: &Value, req: &Value, t0: Instant, tm: &mut
             Err(u) => crate::check::proto_types::unknown_json(id, &u, 0),
         }
     };
-    let mut a = after_pick(ctx, picked, t0, tm, &run, false);
+    let mut a = after_pick_with(ctx, picked, t0, tm, &run, false, Some(core.clone()));
     a["us"] = json!(t0.elapsed().as_micros() as u64);
     a
 }
@@ -654,13 +746,34 @@ fn override_code_accounts(ov: &Value) -> Vec<revm::primitives::Address> {
 /// normal and trigger-first checks). `learn`: queue missing items for
 /// fetching and count them in copy 2's status (normal checks only).
 fn after_pick(ctx: &Ctx, picked: crate::state::mirror::Picked, t0: Instant, tm: &mut Tm, run: &impl Fn(&dyn StateRead, &BlockCtx) -> Value, learn: bool) -> Value {
+    after_pick_with(ctx, picked, t0, tm, run, learn, None)
+}
+
+/// `after_pick` with copy 2's registry summary already picked for this
+/// version (trigger-first checks pick it first: their exact-values list
+/// comes from it too). None = picked here, as always.
+fn after_pick_with(
+    ctx: &Ctx,
+    picked: crate::state::mirror::Picked,
+    t0: Instant,
+    tm: &mut Tm,
+    run: &impl Fn(&dyn StateRead, &BlockCtx) -> Value,
+    learn: bool,
+    pre: Option<Arc<crate::copy2::checkcore::CheckCore>>,
+) -> Value {
     let sh = &ctx.shared;
     let block = picked.seq + sh.cfg.l2_offset;
     // Copy 2: one registry summary for the whole check (checkcore.rs: no
     // waiting for the copy's thread while it is valid for this version).
-    let t_core = Instant::now();
-    let core = ctx.copy2.as_ref().map(|c| c.core_for(picked.from.as_ref()));
-    tm.facts_us = t_core.elapsed().as_micros() as u64;
+    let core = match pre {
+        Some(k) => Some(k),
+        None => {
+            let t_core = Instant::now();
+            let k = ctx.copy2.as_ref().map(|c| c.core_for(picked.from.as_ref()));
+            tm.facts_us = t_core.elapsed().as_micros() as u64;
+            k
+        }
+    };
     let view = View::new(picked.snap);
     let mut answer = match &ctx.copy2 {
         None => {

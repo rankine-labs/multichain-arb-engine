@@ -82,6 +82,28 @@ pub struct CheckCore {
     pub not_ready: HashMap<Address, String>,
     /// Coins with a known balance layout (check warm-up).
     pub layouts: Vec<(Address, BalanceLayout)>,
+    /// TRIGGER-FIRST (speed-3): "which copy values are exact at block N"
+    /// (intake.rs Copy2Prov) and "which pools did it move" (check/moved.rs),
+    /// worked out once per registry change here instead of walking every
+    /// pool under the registry's lock for every question.
+    pub prov: ProvIndex,
+    pub moved: crate::check::moved::MovedIndex,
+    /// The last few Copy2Prov built from this core: (block, extra holders, it).
+    pub prov_cache: Mutex<Vec<(u64, Vec<Address>, Arc<super::intake::Copy2Prov>)>>,
+}
+
+/// What Copy2Prov needs from the registry, block-independent (see
+/// intake.rs Copy2Handle::provenance_at for the rules it reproduces).
+#[derive(Default)]
+pub struct ProvIndex {
+    /// Pool contract / owned account -> exact from this block on (every
+    /// pool at it ready, the latest ready_since); not listed = never.
+    pub since: Vec<(Address, u64)>,
+    /// The V4 PoolManagers (always exact for this purpose).
+    pub pms: HashSet<Address>,
+    /// (holder, coin, balance slot) for every followed coin balance whose
+    /// holder is a pool contract / owned account / PoolManager.
+    pub holder_slots: Vec<(Address, Address, U256)>,
 }
 
 /// Far-zero merge cache: account -> (the per-pool lists, merged).
@@ -145,6 +167,21 @@ impl CheckCore {
             .unwrap_or(0);
         c.pending_min = c.v4.iter().filter(|i| i.ready).filter_map(|i| i.pending_from).min().unwrap_or(u64::MAX);
         c.common = Arc::new(c.sets_at(None, far_cache));
+        c.prov = ProvIndex::build(reg);
+        // The pools as the bot names them (same list intake.rs pools_changed made per question).
+        let followed: Vec<crate::check::moved::FollowedPool> = reg
+            .pools
+            .iter()
+            .map(|(pk, e)| crate::check::moved::FollowedPool {
+                key: match pk.1 {
+                    Some(id) => format!("{id:#x}"),
+                    None => format!("{:#x}", e.pool.address),
+                },
+                address: e.pool.address,
+                v4_id: pk.1,
+            })
+            .collect();
+        c.moved = crate::check::moved::MovedIndex::build(&followed);
         c
     }
 
@@ -216,6 +253,54 @@ impl CheckCore {
             return self.any_pending.iter().find(|x| x.2 <= block).copied();
         }
         touched.iter().find_map(|a| self.pending.get(a).and_then(|v| v.iter().find(|x| x.2 <= block).copied()))
+    }
+}
+
+impl ProvIndex {
+    /// From the registry (caller holds its read lock).
+    pub fn build(reg: &Registry) -> ProvIndex {
+        let mut x = ProvIndex::default();
+        let mut since: HashMap<Address, u64> = HashMap::new();
+        let mut owned: HashMap<Address, u64> = HashMap::new();
+        for (a, pks) in &reg.by_addr {
+            if reg.is_pm(a) {
+                x.pms.insert(*a);
+            } else if !pks.is_empty() {
+                // Every pool at it ready: exact from the latest ready_since.
+                let mut s = Some(0u64);
+                for pk in pks {
+                    s = match (s, reg.pools.get(pk)) {
+                        (Some(m), Some(e)) if e.state == PoolState::Ready => Some(m.max(e.ready_since)),
+                        _ => None,
+                    };
+                }
+                if let Some(s) = s {
+                    since.insert(*a, s);
+                }
+            }
+        }
+        for (a, pk) in &reg.owner_of {
+            if let Some(e) = reg.pools.get(pk).filter(|e| e.state == PoolState::Ready) {
+                owned.insert(*a, e.ready_since);
+            }
+        }
+        // An address can be both (a pool contract that is also listed as
+        // owned): exact once EITHER rule says so.
+        for (a, s) in owned {
+            let e = since.entry(a).or_insert(s);
+            *e = (*e).min(s);
+        }
+        for (coin, hs) in &reg.holders {
+            for h in hs {
+                if since.contains_key(h) || x.pms.contains(h) {
+                    if let Some(sl) = reg.bal_slot(*coin, *h) {
+                        x.holder_slots.push((*h, *coin, sl));
+                    }
+                }
+            }
+        }
+        x.since = since.into_iter().collect();
+        x
     }
 }
 

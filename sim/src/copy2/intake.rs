@@ -882,6 +882,49 @@ impl Copy2Handle {
         crate::check::moved::moved_pools(changed, hashes, &pools)
     }
 
+    /// `provenance_at` from a registry summary (copy2/checkcore.rs ProvIndex,
+    /// speed-3): no registry lock, no walk over every pool; the same values
+    /// for the same registry (tested). Kept per core for the last few blocks
+    /// (every question about the newest block shares one).
+    pub fn provenance_with(&self, core: &super::checkcore::CheckCore, n: u64, extra_holders: &[Address]) -> Arc<Copy2Prov> {
+        {
+            let c = core.prov_cache.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((_, _, p)) = c.iter().find(|(b, x, _)| *b == n && x.as_slice() == extra_holders) {
+                return p.clone();
+            }
+        }
+        let ix = &core.prov;
+        let mut p = Copy2Prov { pms: ix.pms.clone(), ..Default::default() };
+        for (a, since) in &ix.since {
+            if *since <= n {
+                p.accts.insert(*a);
+            }
+        }
+        for (h, coin, sl) in &ix.holder_slots {
+            if p.accts.contains(h) || p.pms.contains(h) {
+                p.slots.insert((*coin, *sl));
+            }
+        }
+        for (coin, l) in &core.layouts {
+            for h in p.pms.iter().chain(extra_holders.iter()) {
+                p.slots.insert((*coin, l.key(*h)));
+            }
+        }
+        let p = Arc::new(p);
+        let mut c = core.prov_cache.lock().unwrap_or_else(|e| e.into_inner());
+        if c.len() >= 4 {
+            c.remove(0);
+        }
+        c.push((n, extra_holders.to_vec(), p.clone()));
+        p
+    }
+
+    /// `pools_changed` from a registry summary (speed-3): no lock, the
+    /// lookup tables built once per registry change. Same answer.
+    pub fn pools_changed_with(&self, core: &super::checkcore::CheckCore, changed: &[(Address, U256)], hashes: &[(U256, U256, U256)]) -> Vec<crate::check::moved::MovedPool> {
+        core.moved.moved(changed, hashes)
+    }
+
     pub fn route_for(&self, keys: &[String]) -> Option<crate::check::ordered::Route> {
         let reg = self.c2.reg.read().unwrap_or_else(|e| e.into_inner());
         let mut r = crate::check::ordered::Route::default();

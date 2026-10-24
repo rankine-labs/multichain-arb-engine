@@ -38,6 +38,8 @@ use crate::state::MissItem;
 pub mod cli;
 pub mod db;
 pub mod entry;
+// Feed messages kept in the sidecar (sent once by the bot), speed-3.
+pub mod feedstore;
 pub mod fixture;
 pub mod hexutil;
 // Trigger-first: replay the feed's ordered transactions, then our calls.
