@@ -1,5 +1,4 @@
-import type { Transaction } from 'ethers';
-import { FeedMsg, decodeFeedTx } from '../chains/nitroFeed';
+import { FeedMsg, decodeFeedTx, peekFeedTx } from '../chains/nitroFeed';
 import { performance } from 'perf_hooks';
 import { LocalSimClient, SidecarAnswer } from './localSim';
 import { JsonlLog, LocalTrade, LocalSimOpts, reasonOf } from './localSimHost';
@@ -168,9 +167,14 @@ const NON_SWAP = new Set(['0x095ea7b3', '0xa9059cbb', '0x23b872dd', '0xd0e30db0'
 // Why a feed transaction needs no work at all (null = look at it).
 export function quickSkip(raw: string, hash: string, ours: { isOurTx: (h: string) => boolean; addresses: Set<string> }): string | null {
   if (ours.isOurTx(hash)) return 'ours';
-  // Unpacked once per transaction and shared with the trade decoder's
-  // pass over the same message (chains/nitroFeed.ts decodeFeedTx; freeze fix).
-  const tx: Transaction | null = decodeFeedTx(raw);
+  // Freeze fix 2 (Oct 24): the light read (chains/nitroFeed.ts peekFeedTx)
+  // gives `to` and the call data straight from the bytes, with ethers' own
+  // accept / refuse rules; ethers' full unpack (decodeFeedTx, ~250 us and
+  // ~300 KB of throw-away memory per swap) only when the light read is not
+  // sure, or with FEED_LIGHT_DECODE=0. Same answers (tested).
+  const p = process.env.FEED_LIGHT_DECODE !== '0' ? peekFeedTx(raw) : undefined;
+  if (p === null) return 'unreadable';
+  const tx: { to: string | null; data: string } | null = p ?? decodeFeedTx(raw);
   if (!tx) return 'unreadable';
   if (!tx.to) return 'create';
   if (ours.addresses.has(tx.to.toLowerCase())) return 'ours';

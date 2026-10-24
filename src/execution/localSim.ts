@@ -346,11 +346,15 @@ export function insideMs(a: { us?: unknown; t?: { queue?: unknown } } | null | u
 }
 
 // 4-byte big-endian length + UTF-8 JSON.
+// Freeze fix 2 (Oct 24): the text is written straight into the message
+// buffer (one copy instead of two; trigger-entry questions carry ~100-500 KB
+// of feed transactions each). Same bytes as before (tested).
 export function frame(msg: unknown): Buffer {
-  const body = Buffer.from(JSON.stringify(msg), 'utf8');
-  const out = Buffer.allocUnsafe(4 + body.length);
-  out.writeUInt32BE(body.length, 0);
-  body.copy(out, 4);
+  const text = JSON.stringify(msg);
+  const n = Buffer.byteLength(text, 'utf8');
+  const out = Buffer.allocUnsafe(4 + n);
+  out.writeUInt32BE(n, 0);
+  out.write(text, 4, n, 'utf8');
   return out;
 }
 

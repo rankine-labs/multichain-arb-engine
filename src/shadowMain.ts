@@ -85,7 +85,7 @@ import { AvalancheAdapter } from './chains/avalanche';
 import { RawChainEvent, PoolState, MIN_NET_PROFIT_USD } from './core/types';
 import { priceOf, spreadPct, deepEnough, POOL_MIN_DEPTH_USD, realBalanceOf } from './core/poolPrice';
 import { PairWatcher, Venue, refreshPoolState, refreshPoolsBatch } from './core/pairWatcher';
-import { scanUniverse, emptyScanState, ScanState, stateToPools, stateToPoolsSteps, scanPoolRefs, getLogsAdaptive, RawLog } from './core/universeScan';
+import { scanUniverse, emptyScanState, loadScanStateFile, ScanState, stateToPools, stateToPoolsSteps, scanPoolRefs, getLogsAdaptive, RawLog } from './core/universeScan';
 import { CrossQuoteMonitor, LoopMonitor, shouldScheduleFirstLoopReport } from './core/crossQuoteMonitor';
 import { NewPoolWatch } from './core/newPoolWatch';
 import { buildTokenGroups, loadTokenGroups, groupsStatusLine, TokenGroupsResult } from './core/tokenGroups';
@@ -191,6 +191,7 @@ import { MoneyLedgers, RealMoneyLedger, hourMoneyOf } from './report/ledgers';
 import { hourlyMessage, reportV2On, HourlyReportInput, FULL_HOUR_MIN_MS, overallVerdict, esc as escHtml } from './report/hourlyReport';
 import { liveLayoutOn, LiveTradeBook, WalletWatch, formatLiveTrade, formatLiveHourly, formatLive4h, gasLowSpec, walletChangedSpec } from './report/liveTelegram';
 import { FailoverJsonRpcProvider } from './core/failoverRpc';
+import { LeanJsonRpcProvider } from './core/leanRpc';
 import { makeCaller } from './core/universeScan';
 import { loadNodeUsage, saveNodeUsage, nodeUsageToday, NodeBudget, budgetForUrl, callsInBody } from './core/nodeBudget';
 import { endpointLabel } from './core/endpointLabel';
@@ -222,7 +223,7 @@ import { trustFreshConfigFromEnv, wsTrustProblem, WsFacts } from './core/trustFr
 // Stall finder (Oct 14): which job froze the bot, plus chunked versions of the big jobs.
 import { stallFinder, timed, timedAsync, formatStallLine, formatStallDetail, markStretch, labelled } from './core/stallFinder';
 import { FreezeProfiler } from './core/freezeProfile';
-import { runSteps, drainSteps, writeJsonChunkedQueued, setSliceCap } from './core/chunked';
+import { runSteps, drainSteps, writeJsonChunkedQueued, setSliceCap, SlicedQueue } from './core/chunked';
 // 4-HOUR REPORT (reporting only): 4-hour totals of the hourly numbers, and the 3-message formatter.
 import { FourHourStats, HourSample, LoopSample, loopSampleFrom, fourHourMark, zonedParts } from './report/fourHourStats';
 import { formatFourHourReport, FourHourSnapshot } from './report/fourHourReport';
@@ -354,7 +355,8 @@ const priceOracle = new PriceOracle(cache, (chain, token) => {
                   req.timeout = 30_000;
                   const shared = budgetForUrl(rhFastUrl);
                   req.preflightFunc = async (r) => { const n = callsInBody(r.body); await scanLane.take(n); await shared?.take(n); return r; };
-                  return new ethers.JsonRpcProvider(req, 4663, { staticNetwork: true, batchMaxCount: 1 });
+                  // Lean request / answer handling (core/leanRpc.ts): same bytes, less throw-away memory.
+                  return new LeanJsonRpcProvider(req, 4663, { staticNetwork: true, batchMaxCount: 1 });
             })();
 
       // Decoder gets the pool cache so it can decode Monad Swap logs (a log
@@ -3055,6 +3057,9 @@ if (chainOn('robinhood')) {
 if (chainOn('monad')) chainManager.register(new MonadAdapter());
 if (chainOn('avalanche')) chainManager.register(new AvalancheAdapter());
 
+// Rival watch's per-transaction look, run in ~5 ms bites (see core/chunked.ts SlicedQueue).
+const RIVAL_SLICED = process.env.RIVAL_SLICED !== '0';
+const rivalQueue = new SlicedQueue(5);
 const onFeedEvent = async (event: RawChainEvent) => {
 const t0 = Date.now();
 // Stage timers (measurement only): lap times from "feed received" onwards.
@@ -3077,7 +3082,13 @@ if (event.chain === 'robinhood') {
       // First 4 bytes of the call (cheap slice): coin transfers / approvals and
       // ETH sends with no call skip the sender check (only used in lazy mode).
       const sel = RIVAL_LAZY_SENDER && typeof raw?.data === 'string' ? raw.data.slice(0, 10) : undefined;
-      if (process.env.FEED_LAZY_SENDER !== '0') setImmediate(() => { try { timed('rival watch', () => rivalWatch.noteTx(raw?.to, raw?.hash, sender ?? raw?.from, raw?.value, sel)); } catch { /* never affects trading */ } });
+      // Freeze fix 2 (Oct 24): queued in a SlicedQueue (same jobs, same order,
+      // ~5 ms bites) instead of one setImmediate each, which Node ran all back
+      // to back ("rival watch" freezes up to ~150 ms). RIVAL_SLICED=0 = old way.
+      if (process.env.FEED_LAZY_SENDER !== '0') {
+            const job = () => { try { timed('rival watch', () => rivalWatch.noteTx(raw?.to, raw?.hash, sender ?? raw?.from, raw?.value, sel)); } catch { /* never affects trading */ } };
+            if (RIVAL_SLICED) rivalQueue.push(job); else setImmediate(job);
+      }
       else rivalWatch.noteTx(raw?.to, raw?.hash, sender ?? raw?.from, raw?.value, sel);
 }
 
@@ -4087,6 +4098,11 @@ await chainManager.startAll();
             } catch { /* missing or unreadable: start fresh */ }
             return emptyScanState();
       });
+      // Freeze fix 2 (Oct 24): the same file read in ~5 ms bites (the one-go
+      // read above froze the bot ~880 ms live). SCAN_LOAD_CHUNKED=0 = the old
+      // one-go read. Same state either way (core/universeScan.ts loadScanStateFile).
+      const SCAN_LOAD_CHUNKED = process.env.SCAN_LOAD_CHUNKED !== '0';
+      const loadScanStateAsync = async (): Promise<ScanState> => (SCAN_LOAD_CHUNKED ? loadScanStateFile(SCAN_STATE_FILE) : loadScanState());
       // The file holds every pool on the chain (~400k, tens of MB of text).
       // STALL_FIX_SAVES: written in ~5 ms bites with async writes (same bytes,
       // still temp file + rename). Off: the old one-go write.
@@ -4113,7 +4129,8 @@ await chainManager.startAll();
             scanRunning = true;
             try {
                   const t0 = Date.now();
-                  scanState ??= loadScanState();
+                  // (Read in bites; another job may have loaded it meanwhile: keep that one.)
+                  if (!scanState) { const st = await loadScanStateAsync(); scanState ??= st; }
                   // Scan on HEAVY (bursty: thousands of reads). If the paid
                   // node refuses (e.g. its plan limits log queries), try once
                   // on the fast node before waiting 15 min. Progress is saved
@@ -4179,7 +4196,7 @@ await chainManager.startAll();
       };
       const setupCrossQuote = async () => {
             try {
-                  const st = scanState ?? loadScanState();
+                  const st = scanState ?? await loadScanStateAsync();
                   const pools = STALL_FIX_SCAN_EXPAND ? await runSteps(stateToPoolsSteps(st), 'scan pool list') : timed('scan pool list', () => stateToPools(st));
                   const n = await timedAsync('cross-quote setup', () => crossQuote.setup(pools, Number(process.env.CROSS_QUOTE_TOKENS ?? 60), undefined, { paced: REBUILD_PACED }));
                   console.log(`[openwatch] watching ${n} tokens that trade against both USDG and ETH`);
@@ -4367,7 +4384,7 @@ await chainManager.startAll();
             if (groupsBusy) return;
             groupsBusy = true;
             try {
-                  const st = scanState ?? loadScanState();
+                  const st = scanState ?? await loadScanStateAsync();
                   const pools = STALL_FIX_SCAN_EXPAND ? await runSteps(stateToPoolsSteps(st), 'scan pool list') : timed('scan pool list', () => stateToPools(st));
                   if (!pools.length) { console.log('[groups] no pool scan yet; will try again later'); return; }
                   if (rebuildGroups || !tokenGroups) {
