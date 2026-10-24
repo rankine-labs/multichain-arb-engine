@@ -1,0 +1,8 @@
+source_commit=dad85e6a1e58699715231a046e476254052edeb5
+sim_tree=d8731ea47d200761d28de85221ab0d3bbd9e2e87
+source_ref=main
+built_at=2026-10-24T17:41:38Z
+glibc_max=2.34
+rustc=rustc 1.99.0 (b940084d7 2026-09-28)
+runner=Ubuntu 24.04.5 LTS
+workflow_run=https://github.com/rankine-labs/multichain-arb-engine/actions/runs/40116804521
