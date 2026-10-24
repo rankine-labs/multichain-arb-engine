@@ -48,6 +48,26 @@ const q = (xs, p) => { if (!xs.length) return null; const s = [...xs].sort((a, b
 const cov = { 1: meta.tier1.read / Math.max(1, meta.tier1.total), 2: meta.tier2.read / Math.max(1, meta.tier2.total) };
 const weightOf = (a) => 1 / Math.max(1e-9, cov[a.tier] ?? 1);
 
+// Same-coin-in-and-out check (port of round_trip() in scripts/missed-gaps/
+// load.py, branch analysis/missed-gaps): a real arbitrage pays the profit
+// coin in and gets more of it back; a one-way trade (meme sale, buying
+// programme, router fee) is not arbitrage even if the wallet ends up "up".
+function roundTrip(a, coins) {
+  const Z = '0x0000000000000000000000000000000000000000';
+  const bal = new Map(), flow = new Map();
+  for (const h of a.hops) {
+    if (!h.tin || !h.tout || h.ain == null || h.aout == null) return 'unknown';
+    const tin = h.tin === Z ? WETH : h.tin, tout = h.tout === Z ? WETH : h.tout;
+    bal.set(tin, (bal.get(tin) ?? 0n) - BigInt(h.ain)); flow.set(tin, (flow.get(tin) ?? 0n) + BigInt(h.ain));
+    bal.set(tout, (bal.get(tout) ?? 0n) + BigInt(h.aout)); flow.set(tout, (flow.get(tout) ?? 0n) + BigInt(h.aout));
+  }
+  const profit = new Set(coins);
+  const ins = new Set(a.hops.map((h) => (h.tin === Z ? WETH : h.tin)));
+  if (![...profit].some((c) => ins.has(c))) return 'sale';
+  for (const [c, b] of bal) if (!profit.has(c) && b < 0n && -b * 200n > flow.get(c)) return 'sale';
+  for (const [c, b] of bal) if (!profit.has(c) && b > 0n && b * 200n > flow.get(c)) return 'hidden';
+  return 'loop';
+}
 // One arbitrage in dollars.
 let loopFixed = 0;
 function price(a) {
@@ -92,7 +112,9 @@ function price(a) {
   const pairs = a.pools.map(pairOf);
   const twoSamePair = a.pools.length === 2 && pairs[0] === pairs[1] && pairs[0] !== '?';
   const tm = timing[a.hash] ?? {};
+  const rt = roundTrip(a, coins);
   return {
+    rt,
     a, gross: grossUsd, gas, net: grossUsd === null ? null : grossUsd - gas, size, trust: grossUsd === null ? 'unpriced' : doubtful ? 'doubtful' : 'ok',
     profitCoin, dexes, pairs, allTradeable, baseCoin, twoSamePair,
     ours2: twoSamePair && allTradeable && baseCoin, oursAny: allTradeable && baseCoin,
@@ -122,7 +144,12 @@ const groups = {
   base_coin_profit: ok.filter((x) => x.baseCoin),
   ours_any_route: ok.filter((x) => x.oursAny),
   ours_2pool_same_pair: ok.filter((x) => x.ours2),
+  ours_any_route_REAL_LOOPS: ok.filter((x) => x.oursAny && x.rt === 'loop'),
+  ours_2pool_REAL_LOOPS: ok.filter((x) => x.ours2 && x.rt === 'loop'),
+  base_coin_REAL_LOOPS: ok.filter((x) => x.baseCoin && x.rt === 'loop'),
 };
+const rtCounts = {}; for (const x of ok.filter((y) => y.oursAny)) rtCounts[x.rt] = (rtCounts[x.rt] ?? 0) + 1;
+const rtBig = {}; for (const x of ok.filter((y) => y.oursAny && y.net >= MIN_NET)) { const e = rtBig[x.rt] ?? (rtBig[x.rt] = { n: 0, net: 0 }); e.n++; e.net += x.net * x.w; }
 const totals = Object.fromEntries(Object.entries(groups).map(([k, v]) => [k, agg(v)]));
 
 // Who takes it (trusted, base-coin profit = what our bot would chase).
@@ -133,6 +160,8 @@ function byKey(xs, key) {
 }
 const botsAll = byKey(ok.filter((x) => x.baseCoin), (x) => x.bot);
 const botsOurs = byKey(ok.filter((x) => x.oursAny), (x) => x.bot);
+const botsLoops = byKey(ok.filter((x) => x.oursAny && x.rt === 'loop'), (x) => x.bot);
+const timingLoopsBig = (() => { const xs = ok.filter((x) => x.oursAny && x.rt === 'loop' && x.net >= MIN_NET); const b = { 'same block': 0, '+1 block': 0, '+2 blocks': 0, '+3..10': 0, '>10 blocks': 0, 'none': 0 }; for (const x of xs) { const d = x.dBlocks; if (d === null) b.none++; else if (d === 0) b['same block']++; else if (d === 1) b['+1 block']++; else if (d === 2) b['+2 blocks']++; else if (d <= 10) b['+3..10']++; else b['>10 blocks']++; } return b; })();
 const poolsOurs = byKey(ok.filter((x) => x.oursAny), (x) => [...new Set(x.a.pools)]);
 const pairsOurs = byKey(ok.filter((x) => x.oursAny), (x) => [...new Set(x.pairs)]);
 const dexCombos = byKey(ok.filter((x) => x.baseCoin), (x) => [...new Set(x.dexes)].sort().join(' + '));
@@ -190,14 +219,14 @@ function scenario(xs, share, capUsd) {
   return { chancesPerDay: perDay(n), profitPerDay: perDay(win - fails), grossWinsPerDay: perDay(win), failGasPerDay: perDay(fails) };
 }
 const scen = [];
-for (const [label, xs] of [['2-pool same pair (today\'s main route)', groups.ours_2pool_same_pair], ['any route on our exchanges (incl. loops)', groups.ours_any_route]]) {
+for (const [label, xs] of [['2-pool same pair, real round trips', groups.ours_2pool_REAL_LOOPS], ['any route on our exchanges, real round trips', groups.ours_any_route_REAL_LOOPS], ['any route on our exchanges (before round-trip check)', groups.ours_any_route]]) {
   for (const share of [0.1, 0.25, 0.5, 1]) for (const cap of [MAX_TRADE, null]) scen.push({ routes: label, share, cap: cap ? `$${cap} own money` : 'no cap (flash loan)', ...scenario(xs, share, cap) });
 }
 
 const V4_MAIN = Object.keys(meta.poolInfo).find((p) => p.startsWith('0x462958d20c'));
 const summary = {
   window: meta.window, coverage: { tier1: meta.tier1, tier2: meta.tier2 }, trustCounts, arbsFound: P.length,
-  totals, botsAll: botsAll.slice(0, 15), botsOurs: botsOurs.slice(0, 15), poolsOurs: poolsOurs.slice(0, 20), pairsOurs: pairsOurs.slice(0, 15),
+  totals, rtCounts, rtBig, botsLoops: botsLoops.slice(0, 15), timingLoopsBig, botsAll: botsAll.slice(0, 15), botsOurs: botsOurs.slice(0, 15), poolsOurs: poolsOurs.slice(0, 20), pairsOurs: pairsOurs.slice(0, 15),
   dexCombos: dexCombos.slice(0, 12), routeLen, timingOurs, timingAll, timingOursBig, named, timingPerBot, posOurs, v4MainPool: V4_MAIN ?? null,
   ourBot: { inWindow: oursInWindow.map((x) => ({ hash: x.a.hash, net: x.net, trust: x.trust, block: x.a.block })), census: ourCensus, nonce: meta.ourSender, censusHours },
   census: census ? { fromBlock: census.fromBlock, toBlock: census.toBlock, blocks: census.blocks, hours: censusHours, txs: census.txs, failed: census.failed, summary: census.summary, bots: censusBots.slice(0, 20) } : null,
@@ -219,7 +248,12 @@ L.push('## The money (trusted trades, after the gas they paid)', '');
 tbl(['Group', 'Trades seen', 'Kept after gas (seen)', 'Est. per day', 'Est. trades/day', 'Median', 'p90', 'Max', '>$0.25', '>$1', '>$5', 'Median size'],
   Object.entries(totals).map(([k, t]) => [k.replace(/_/g, ' '), t.trades, fmt(t.net), fmt(t.netPerDayEst), Math.round(t.tradesPerDayEst), fmt(t.median), fmt(t.p90), fmt(t.max), t.over025, t.over1, t.over5, fmt(t.medianSize)]));
 L.push('"ours" = every pool on an exchange our deployed contract can trade, profit taken in USDG or WETH. "2-pool same pair" = the bot\'s main route shape.', '');
-L.push('## Who takes it (routes on our exchanges, USDG/WETH profit)', '');
+L.push('## Round-trip check (same coin in and out)', '');
+L.push(`Trusted trades on our exchanges by shape: ${JSON.stringify(rtCounts)}. Over $0.25: ${Object.entries(rtBig).map(([k, v]) => `${k} ${v.n} (${fmt(perDay(v.net))}/day)`).join(', ')}. "sale" = one-way trade, "hidden" = a leg on an exchange we cannot read, "unknown" = hop amounts not readable.`, '');
+L.push('## Who takes the REAL round trips (our exchanges)', '');
+tbl(['Bot contract', 'Trades', 'Kept (seen)', 'Est./day', 'Share', 'Median', 'Max'], botsLoops.slice(0, 12).map((b) => [name(b.key), b.trades, fmt(b.net), fmt(b.netPerDayEst), `${Math.round((100 * b.netEst) / Math.max(1e-9, totals.ours_any_route_REAL_LOOPS.netEst))}%`, fmt(b.median), fmt(b.max)]));
+tbl(['Delay (real round trips >= $0.25, our exchanges)', 'Trades'], Object.entries(timingLoopsBig));
+L.push('## Who takes it (routes on our exchanges, USDG/WETH profit, before round-trip check)', '');
 tbl(['Bot contract', 'Trades', 'Kept (seen)', 'Est./day', 'Share', 'Median', 'Max'], botsOurs.slice(0, 12).map((b) => [name(b.key), b.trades, fmt(b.net), fmt(b.netPerDayEst), `${Math.round((100 * b.netEst) / Math.max(1e-9, totals.ours_any_route.netEst))}%`, fmt(b.median), fmt(b.max)]));
 L.push('## Who takes it (all USDG/WETH-profit arbitrage, any exchange)', '');
 tbl(['Bot contract', 'Trades', 'Kept (seen)', 'Est./day', 'Share'], botsAll.slice(0, 12).map((b) => [name(b.key), b.trades, fmt(b.net), fmt(b.netPerDayEst), `${Math.round((100 * b.netEst) / Math.max(1e-9, totals.base_coin_profit.netEst))}%`]));
