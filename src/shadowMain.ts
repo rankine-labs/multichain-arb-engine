@@ -651,6 +651,9 @@ const livePools = new Map<string, [string, string]>();
 // sent again and again, paying gas each time. After a live on-chain fail,
 // that pool pair is not sent live as a standing gap for
 // GAP_LIVE_FAIL_BLOCK_MIN minutes (default 30; 0 = off). Not saved to disk.
+// FIRE_FIRST_ONLY=1: only the trigger-first entry point sends real trades (see the send step).
+const FIRE_FIRST_ONLY = ['1', 'true', 'on', 'yes'].includes((process.env.FIRE_FIRST_ONLY ?? '').trim().toLowerCase());
+if (FIRE_FIRST_ONLY) console.log('[live] FIRE-FIRST ONLY (FIRE_FIRST_ONLY=1): older paths check but never send real trades');
 const GAP_LIVE_FAIL_BLOCK_MIN = Math.max(0, Number(process.env.GAP_LIVE_FAIL_BLOCK_MIN ?? 30) || 0);
 const gapFailBlocks = new LiveRouteBlock(GAP_LIVE_FAIL_BLOCK_MIN * 60_000);
 { const n = routeScores.load(ROUTE_FILE); if (n) console.log(`[sim] robinhood: restored scores for ${n} pool pairs`); }
@@ -2731,6 +2734,17 @@ const fireTrade = async (o: {
             if (robinhoodSender.live) {
                   const paused = scoreboard.pausedWhy(sendPath, trigConf, trigAssumed);
                   if (paused) { block(`scoreboard: ${sendPath} paused (its recent real sends lost money)`); console.log(`[scoreboard] not sent (${sendPath}): ${paused}`); return; }
+            }
+            // FIRE-FIRST ONLY (Oct 24, owner): FIRE_FIRST_ONLY=1 = only the
+            // trigger-first entry point (o.entry) may send real trades; the
+            // older paths (standing gaps, follow-a-trade, model guesses) keep
+            // running and checking but never send (today: 42 sent, 0 won, they
+            // react after the block that rivals already filled). Old loops are
+            // switched separately (LOOP_LIVE=0); fire-first loops are not
+            // affected (they send through the entry point's own loop sender).
+            if (robinhoodSender.live && FIRE_FIRST_ONLY && !o.entry) {
+                  block('fire-first only: older paths do not send (FIRE_FIRST_ONLY=1)');
+                  return;
             }
             // ONE SEND PER TRIGGER (trigEntry.claim, shared lock): the entry point
             // and the old path never both send for the same followed trade.
