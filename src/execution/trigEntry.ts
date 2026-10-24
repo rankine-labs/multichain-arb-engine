@@ -111,6 +111,20 @@ import { stallFinder, markStretch } from '../core/stallFinder';
 //             feed handler (TRIG_ENTRY_IMMEDIATE=1) and, while it is in
 //             flight, big background jobs take shorter bites
 //             (TRIG_ENTRY_YIELD_SLICE_MS, core/chunked.ts).
+//
+// 3-POOL LOOPS (Oct 23, owner: "maximise income"; TRIG_ENTRY_LOOPS=1, the
+// default; 0 = 2-pool only as before). A 24 h chain measurement showed 3-pool
+// loops earn about as much as 2-pool trades and are ~4x as frequent, but this
+// entry point only tried 2-pool routes. Now, for each moved pool, loops
+// start coin (USDG / WETH) -> A -> B -> start through that pool are extra
+// candidates (execution/trigEntryLoops.ts: precomputed per pool, same live
+// rules as live loops). Ranked by the same rule, capped separately
+// (TRIG_ENTRY_MAX_LOOPS, 4), checked exactly like 2-pool candidates (our
+// exact multi-hop call on the replayed feed, size ladder), and a send goes
+// through every safeguard above PLUS the loop ones (loopGate: loop loss cap,
+// loop size limit, a loop on the same pools in flight) and the host's loop
+// sender. Log: each `cv` entry says its kind (`k`: pair / loop); `fl` / `nl`
+// = loops found / built; hourly "by kind" split.
 // ============================================================================
 
 export type EntrySettings = {
@@ -132,6 +146,8 @@ export type EntrySettings = {
   agreeSamplePerHour: number;    // TRIG_ENTRY_AGREE_SAMPLE_PER_HOUR [120] at most this many of those per hour
   immediate: boolean;            // TRIG_ENTRY_IMMEDIATE [1] start entry work inside the feed handler (0 = after it, setImmediate)
   yieldSliceMs: number;          // TRIG_ENTRY_YIELD_SLICE_MS [2] big jobs' longest bite while entry work runs (0 = no change)
+  loops: boolean;                // TRIG_ENTRY_LOOPS [1] also try 3-pool loops through the moved pool (0 = 2-pool only, as before)
+  maxLoops: number;              // TRIG_ENTRY_MAX_LOOPS [4] loop candidates built and checked per trigger (on top of TRIG_ENTRY_MAX_CANDIDATES)
 };
 
 export function entrySettings(env: Record<string, string | undefined> = process.env, minNetUsd = 0.25): EntrySettings {
@@ -156,6 +172,8 @@ export function entrySettings(env: Record<string, string | undefined> = process.
     agreeSamplePerHour: Math.round(num('TRIG_ENTRY_AGREE_SAMPLE_PER_HOUR', 120, 0)),
     immediate: (env.TRIG_ENTRY_IMMEDIATE ?? '1').trim() !== '0',
     yieldSliceMs: num('TRIG_ENTRY_YIELD_SLICE_MS', 2, 0),
+    loops: (env.TRIG_ENTRY_LOOPS ?? '1').trim() !== '0',
+    maxLoops: Math.round(num('TRIG_ENTRY_MAX_LOOPS', 4, 0)),
   };
 }
 
@@ -198,6 +216,16 @@ export type EntryCandidate = {
   build: (sizeUsd: number) => { trade: LocalTrade; simOpts: LocalSimOpts } | null;
   usdOf: (units: bigint) => number;       // start-coin units -> $
   host?: unknown;                // host data for the send (pool objects, ...)
+  // 3-POOL LOOPS (execution/trigEntryLoops.ts): 'loop' candidates go through
+  // the loop safeguards too (loopGate) and the host's loop send. Not given = 'pair'.
+  kind?: 'pair' | 'loop';
+  // The two keys of its 30-min live-fail block (default [buyPool, sellPool];
+  // a loop uses [first pool, its loop id], so one loop's failure blocks that loop).
+  failKey?: [string, string];
+  // Ranking facts (a start coin we hold, the quick price check in $ before
+  // gas, a loop's extra gas already taken off): used to merge loops in among
+  // the 2-pool candidates in rank order. Not given = keeps its place.
+  rank?: { held: boolean; score: number | null };
 };
 
 // A route's id: "buy>sell:start" (lowercase). Two pools moved by one
@@ -259,6 +287,27 @@ export function rankRoutes<R>(routes: R[], held: (r: R) => boolean, score: (r: R
   const scored = routes.map((r, i) => { const s = score(r); return { r, i, h: held(r) ? 0 : 1, s: s !== null && Number.isFinite(s) ? s : -Infinity }; });
   scored.sort((a, b) => a.h - b.h || (b.s === a.s ? 0 : b.s > a.s ? 1 : -1) || a.i - b.i);
   return scored.slice(0, Math.max(0, limit)).map((x) => x.r);
+}
+
+// MERGE two candidate lists that are each already in rank order (2-pool
+// candidates and loop candidates) into one, by the same rule as rankRoutes:
+// a start coin we hold first, then the higher quick price check (unknown
+// last). Ties keep the first list's candidate first (2-pool before loop).
+// A candidate without ranking facts keeps its place in its own list.
+export function mergeRanked(a: EntryCandidate[], b: EntryCandidate[]): EntryCandidate[] {
+  if (!b.length) return a.slice();
+  if (!a.length) return b.slice();
+  const key = (c: EntryCandidate) => ({ h: c.rank ? (c.rank.held ? 0 : 1) : 0, s: c.rank && c.rank.score !== null && Number.isFinite(c.rank.score) ? c.rank.score : -Infinity });
+  const out: EntryCandidate[] = [];
+  let i = 0, j = 0;
+  while (i < a.length && j < b.length) {
+    const x = key(a[i]), y = key(b[j]);
+    // b goes first only when it is strictly better.
+    if (y.h < x.h || (y.h === x.h && y.s > x.s)) out.push(b[j++]); else out.push(a[i++]);
+  }
+  while (i < a.length) out.push(a[i++]);
+  while (j < b.length) out.push(b[j++]);
+  return out;
 }
 
 // The size ladder of one candidate (shared by the check and the one-trip
@@ -351,6 +400,15 @@ export type EntryDeps = {
   // ONE TRIP: every watched pool with its routes (enumerateRoutes for that
   // pool alone, in order). Not given = one trip off (two steps, as before).
   tableRoutes?: () => TablePool[];
+  // 3-POOL LOOPS (TRIG_ENTRY_LOOPS=1): loop candidates through the moved
+  // pools, ranked and capped at `limit` BEFORE anything is built (host:
+  // precomputed loop index, execution/trigEntryLoops.ts). Not given = none.
+  loopCandidatesFor?: (poolKeys: string[], limit: number) => { cands: EntryCandidate[]; found: number };
+  // Extra safeguards for a loop send (loop loss cap, loop size limit, a loop
+  // on these pools in flight, ...). null = fine. Not given = loops never sent.
+  loopGate?: (p: EntryPick) => string | null;
+  // One extra hourly text (the loop index / loop sends), optional.
+  loopHourText?: () => string | null;
   isOurTx: (hash: string) => boolean;
   ourAddresses: string[];                 // our executor contract(s), our bot wallet(s)
   // SAFEGUARDS (null = fine, else why not). See the file header.
@@ -366,6 +424,8 @@ export type EntryDeps = {
   lag?: () => number;                     // event-loop lag right now (ms); default core/loopLag.ts
 };
 
+// A candidate's kind (2-pool pair unless it says loop).
+const kindOf = (c: EntryCandidate): 'pair' | 'loop' => (c.kind === 'loop' ? 'loop' : 'pair');
 const pctl = (xs: number[], q: number): number | null => {
   if (!xs.length) return null;
   const a = [...xs].sort((x, y) => x - y);
@@ -433,6 +493,9 @@ export class TrigEntry {
       smp: { asked: 0, agree: 0, disagree: 0, missed: 0, notCompared: 0 },
       // one trip: used / why not
       one: { used: 0, why: {} as Record<string, number> },
+      // per candidate kind (2-pool pair / 3-pool loop): built, checked, best answer profitable, would send, sent
+      kind: { pair: { built: 0, checked: 0, profitable: 0, wouldSend: 0, sent: 0 }, loop: { built: 0, checked: 0, profitable: 0, wouldSend: 0, sent: 0 } },
+      loopErrors: 0,
       hops: Object.fromEntries(HOP_NAMES.map((n) => [n, [] as number[]])) as Record<HopName, number[]>,
     };
   }
@@ -611,6 +674,21 @@ export class TrigEntry {
       try { const r = this.d.candidatesFor(pools, s.maxCandidates); cands = r.cands.slice(0, s.maxCandidates); rec.found = r.found; } catch { h.errors++; }
     }
     if (oneWhy) { rec.one = oneWhy; h.one.why[oneWhy] = (h.one.why[oneWhy] ?? 0) + 1; }
+    // 3-POOL LOOPS (TRIG_ENTRY_LOOPS=1): their own cap (TRIG_ENTRY_MAX_LOOPS),
+    // from the precomputed loop index (no node). Two steps: merged in among
+    // the 2-pool candidates in rank order. One trip: the sidecar's table has
+    // 2-pool routes only, so loops go after them (checked the two-step way
+    // only if no 2-pool answer was good enough to send).
+    if (s.loops && s.maxLoops > 0 && this.d.loopCandidatesFor) {
+      try {
+        const lr = this.d.loopCandidatesFor(pools, s.maxLoops);
+        const lcs = lr.cands.slice(0, s.maxLoops).map((c) => (c.kind === 'loop' ? c : { ...c, kind: 'loop' as const }));
+        rec.foundLoops = lr.found;
+        rec.loops = lcs.length;
+        if (lcs.length) cands = oneTrip ? [...cands, ...lcs] : mergeRanked(cands, lcs);
+      } catch { h.loopErrors++; }
+    }
+    for (const c of cands) h.kind[kindOf(c)].built++;
     hops.built = rel(performance.now());
     rec.candidates = cands.length;
     if (!cands.length) { rec.unknown = 'no_candidates'; unknown('no_candidates'); this.finishHops(rec, T); this.finish(rec); return rec; }
@@ -627,8 +705,9 @@ export class TrigEntry {
     // Per-check hops: [sent, answered, sidecar queue, sidecar work] (ms).
     hops.checks = results.map((r) => [rel(r.out.hop?.s) ?? null, rel(r.out.hop?.a) ?? null, r.out.hop?.q ?? null, r.out.hop?.w ?? null]);
     // Every candidate's verdict (log), and the best one even when it loses.
+    for (const r of results) h.kind[kindOf(r.cand)].checked++;
     rec.cv = results.map((r) => ({
-      l: r.cand.label.slice(0, 40), v: r.out.sure ? r.out.verdict : 'unknown', n: r.view ? r2(r.view.netUsd) : undefined,
+      k: kindOf(r.cand), l: r.cand.label.slice(0, 40), v: r.out.sure ? r.out.verdict : 'unknown', n: r.view ? r2(r.view.netUsd) : undefined,
       s: r.view ? Math.round(r.view.sizeUsd) : undefined, r: r.out.sure ? (r.out.verdict === 'fail' ? reasonOf(r.out.sim)?.slice(0, 60) : undefined) : r.out.why,
       c: r.out.sure ? r.out.confidence : undefined,
     }));
@@ -647,7 +726,7 @@ export class TrigEntry {
     }
     const best = sure.map((r) => r.pick).filter((p): p is EntryPick => !!p).sort((x, y) => y.netUsd - x.netUsd)[0];
     if (best) {
-      rec.best = { label: best.cand.label, sizeUsd: best.sizeUsd, netUsd: best.netUsd, conf: best.out.confidence, as: best.out.assumptions };
+      rec.best = { label: best.cand.label, sizeUsd: best.sizeUsd, netUsd: best.netUsd, conf: best.out.confidence, as: best.out.assumptions, kind: kindOf(best.cand) };
     }
     // 4. DECIDE.
     hops.dec = rel(performance.now());
@@ -661,18 +740,21 @@ export class TrigEntry {
     }
     h.profitable++;
     h.profitUsd += best.netUsd;
+    const bk = h.kind[kindOf(best.cand)];
+    bk.profitable++;
     const held = this.gates(best);
     rec.held = held ?? undefined;
     if (held) { h.held++; const k = held.split(':')[0]; h.heldWhy[k] = (h.heldWhy[k] ?? 0) + 1; }
     const deciding = this.d.tf.decides();
-    if (!held && !deciding) { h.wouldSend++; rec.wouldSend = true; }
+    if (!held && !deciding) { h.wouldSend++; bk.wouldSend++; rec.wouldSend = true; }
     if (!held && deciding) {
       if (!this.claim(hash, 'entry')) { rec.held = 'already sent by the old path'; }
       else {
         rec.wouldSend = true;
+        bk.wouldSend++;
         try {
           const r = await this.d.send(best, { hash, seenMs });
-          if (r.signedMs !== undefined) { rec.submitMs = r.signedMs - seenMs; keep(h.submitMs, rec.submitMs); h.sent++; hops.sign = rec.submitMs; }
+          if (r.signedMs !== undefined) { rec.submitMs = r.signedMs - seenMs; keep(h.submitMs, rec.submitMs); h.sent++; bk.sent++; hops.sign = rec.submitMs; }
           else rec.held = `not sent: ${r.why ?? 'stopped by a safeguard'}`;
         } catch { h.errors++; rec.held = 'send error'; }
       }
@@ -818,12 +900,20 @@ export class TrigEntry {
     if (this.d.killed()) return 'kill switch on';
     if (!(p.netUsd >= this.settings.minNetUsd)) return `under the send minimum ($${this.settings.minNetUsd})`;
     if (!confidenceAtLeast(p.out.confidence, this.d.tf.settings.minConfidence)) return `confidence ${p.out.confidence} below ${this.d.tf.settings.minConfidence}`;
-    const fb = this.d.failBlocked(p.cand.buyPool, p.cand.sellPool);
-    if (fb) return `pair blocked 30 min: ${fb}`;
+    const [fa, fbk] = p.cand.failKey ?? [p.cand.buyPool, p.cand.sellPool];
+    const fb = this.d.failBlocked(fa, fbk);
+    if (fb) return `${kindOf(p.cand) === 'loop' ? 'loop' : 'pair'} blocked 30 min: ${fb}`;
     const sg = this.d.safety(p.sizeUsd, p.cand.tokens);
     if (sg) return `safety: ${sg}`;
     const pz = this.d.pausedWhy(p.out.confidence, p.out.assumptions);
     if (pz) return `scoreboard: ${pz}`;
+    // 3-pool loops: the loop safeguards too (loop loss cap, loop size limit, ...).
+    if (kindOf(p.cand) === 'loop') {
+      if (!this.d.loopGate) return 'loop: no loop sender';
+      let lg: string | null;
+      try { lg = this.d.loopGate(p); } catch (e) { lg = `loop check error: ${(e as Error).message}`; }
+      if (lg) return `loop: ${lg}`;
+    }
     return null;
   }
 
@@ -1160,6 +1250,8 @@ export class TrigEntry {
           mv: rec.moved?.length ? rec.moved : undefined,
           // candidates: routes found, built (best-ranked, capped), checked; stopped early?
           found: rec.found, cands: rec.candidates, tried: rec.tried, early: rec.early,
+          // 3-pool loops: found through the moved pools (before the cap), built; kind of the best
+          fl: rec.foundLoops, nl: rec.loops || undefined, bk: rec.best?.kind,
           // the best route, size, net after gas: the best PROFITABLE one if
           // any, else the best answer even when it loses (bv = its verdict;
           // nle = a loss answer only says "no profit": net is AT MOST this)
@@ -1219,6 +1311,9 @@ export class TrigEntry {
       if (n.over + n.small + n.slightLoss + n.loss) parts.push(`best net after gas: over $0.25 ${n.over}, $0-0.25 ${n.small}, -$0.10-0 ${n.slightLoss}, under -$0.10 ${n.loss}`);
       const S = h.smp;
       if (S.asked) parts.push(`not-profitable sample re-checked ${S.asked}: agree ${S.agree}/${S.agree + S.disagree}${S.notCompared ? `, not compared ${S.notCompared}` : ''}, missed chances (re-check profitable) ${S.missed}`);
+      const K = h.kind;
+      if (this.settings.loops || K.loop.built) parts.push(`by kind (built/checked/profitable/would send/sent): pair ${K.pair.built}/${K.pair.checked}/${K.pair.profitable}/${K.pair.wouldSend}/${K.pair.sent}, loop ${K.loop.built}/${K.loop.checked}/${K.loop.profitable}/${K.loop.wouldSend}/${K.loop.sent}${h.loopErrors ? ` (loop errors ${h.loopErrors})` : ''}`);
+      if (this.d.loopHourText) { try { const t = this.d.loopHourText(); if (t) parts.push(t); } catch { /* reporting only */ } }
       if (this.oneTripOn()) parts.push(`one trip ${h.one.used}${Object.keys(h.one.why).length ? ` (two steps: ${top(h.one.why)})` : ''}; table ${this.tbl.pools.size} pools / ${this.tbl.lastRoutes} routes (${this.tbl.lastReused} reused unchanged), rebuilt in ${this.tbl.lastMs} ms`);
       const hp = HOP_NAMES.filter((k) => h.hops[k].length).map((k) => `${k} ${pctl(h.hops[k], 0.5)}/${pctl(h.hops[k], 0.9)}`);
       if (hp.length) parts.push(`hops p50/p90 ms: ${hp.join(', ')}`);
@@ -1267,6 +1362,8 @@ export type EntryRecord = {
   poolCount: number;              // how many moved
   moved?: string[];               // debug: "<pool>:<kinds>" (first 4)
   found: number;                  // routes found before the cap
+  foundLoops?: number;            // 3-pool loops through the moved pools, before the cap
+  loops?: number;                 // loop candidates built (capped at TRIG_ENTRY_MAX_LOOPS)
   early?: boolean;                // stopped at the first good answer
   discoverMs: number;
   discConf?: string;
@@ -1276,10 +1373,10 @@ export type EntryRecord = {
   answerMs?: number;
   submitMs?: number;
   unknown?: string;
-  best?: { label: string; sizeUsd: number; netUsd: number; conf?: TrigConfidence; as?: string[] };
+  best?: { label: string; sizeUsd: number; netUsd: number; conf?: TrigConfidence; as?: string[]; kind?: 'pair' | 'loop' };
   // The best answer even when it loses (log): net after gas (le = at most).
   view?: { label: string; sizeUsd: number; netUsd: number; verdict: 'profit' | 'loss'; le?: boolean; conf?: TrigConfidence; as?: string[] };
-  cv?: Array<{ l: string; v: string; n?: number; s?: number; r?: string; c?: TrigConfidence }>;
+  cv?: Array<{ k: 'pair' | 'loop'; l: string; v: string; n?: number; s?: number; r?: string; c?: TrigConfidence }>;
   sampled?: boolean;              // a not-profitable answer picked for the re-check
   one?: 1 | string;               // one trip used (1), or why not
   oneRest?: number;               // candidates checked the old way after the one trip

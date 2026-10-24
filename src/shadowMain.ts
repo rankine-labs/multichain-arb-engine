@@ -78,7 +78,9 @@ import { RobinhoodChainAdapter } from './chains/robinhoodChain';
 import { createLocalSimHost, LocalSimHost, LocalCheck, LocalKind, LocalOutcome } from './execution/localSimHost';
 import { TriggerFirst, trigFirstSettings, TrigOutcome } from './execution/triggerFirst';
 import { Scoreboard, SendPath, Confidence as ScoreConfidence, standingGapFailBlock, entryFailBlock } from './report/scoreboard';
-import { TrigEntry, EntryCandidate, TablePool, entrySettings, enumerateRoutes, rankRoutes } from './execution/trigEntry';
+import { TrigEntry, EntryCandidate, EntryPick, TablePool, entrySettings, enumerateRoutes, rankRoutes } from './execution/trigEntry';
+import { EntryLoopIndex, EntryLoop, EntryLoopHost, EntryLoopSender, CoinTaxFileView, LoopScoreMemo, loopIndexSettings, loopQuoteUsd, pickLoops } from './execution/trigEntryLoops';
+import { hasExactMath } from './core/loopFinder';
 import { runCheckFirst } from './execution/checkFirstFlow';
 import { MonadAdapter } from './chains/monad';
 import { AvalancheAdapter } from './chains/avalanche';
@@ -94,7 +96,7 @@ import { ROBINHOOD_SCAN_FACTORIES } from './config/knownAddresses';
 // Uniswap V4 in the chain-wide scan, asked PER PAIR (core/v4Lookup.ts), not
 // from V4's history (that ran out of memory twice on Oct 9). RH_V4_SCAN=0 off.
 const RH_V4_SCAN = process.env.RH_V4_SCAN !== '0';
-import { buildExecuteCall, executionRequested, executorConfig, pickV3Lender, kindForPool } from './execution/executorCalldata';
+import { buildExecuteCall, executionRequested, executorConfig, pickV3Lender, kindForPool, v4KeyMatchesId, KIND_V4_HOOKED } from './execution/executorCalldata';
 import { GasModel, GasCalibration, gasSettingsFromEnv, routeKeyFor, twoPoolKey, defaultUnitsFor, costsLine, loopKey } from './core/gasModel';
 import { recordEventFee, eventFeeCounts, feeFromEventsOn, setHeadBlockSource, currentHeadBlock } from './core/eventFees';
 import { OwnMoneyBook, useOwnMoney, fitTradeToWallet } from './core/ownMoney';
@@ -203,7 +205,7 @@ import { ROBINHOOD_SEED_PAIRS } from './config/robinhoodSeedPairs';
 import { ResearchLane, researchConfigFromEnv, planShallowCandidate, findResearchGaps, gapCandidate, ResearchCandidate } from './core/researchLane';
 import { poolDepthUsd, setRealBalanceSource, thinPools, thinPoolsSteps } from './core/poolPrice';
 // Loop trader v1 (3-5 pool loops, practice only, off unless LOOP_TRADER=1).
-import { LoopTrader, loopConfigFromEnv, LoopCheckResult, LoopTrade } from './core/loopTrader';
+import { LoopTrader, loopConfigFromEnv, LoopCheckResult, LoopTrade, buildLoopTrade } from './core/loopTrader';
 // Which node loop practice checks run on (LOOP_CHECK_NODE, default the free public node).
 import { CoinTaxBook, coinTaxConfigFromEnv, testCoinTax } from './core/coinTax';
 import { LoopLiveSender, loopLiveConfigFromEnv, LoopLiveCandidate } from './execution/loopLive';
@@ -1674,6 +1676,8 @@ const scoreboard = new Scoreboard({
 // from the contract's Executed event, gas cost; losses feed the daily cap.
 // Set once live loops are created (further down); the tracker reports loop results to it.
 let loopLiveRef: LoopLiveSender | null = null;
+// Fire-first 3-pool loop sends (execution/trigEntryLoops.ts): their results (loop loss cap).
+let entryLoopSenderRef: EntryLoopSender | null = null;
 const liveTracker = new LiveTradeTracker({
       provider: robinhoodReadProvider,
       ethUsd: () => priceOracle.getUsdPrice('robinhood', ROBINHOOD_TOKENS.WETH) ?? 0,
@@ -1689,6 +1693,8 @@ const liveTracker = new LiveTradeTracker({
             liveTradeLog.result(r); alertHooks.onLiveResult(r); moneyLedgers.noteRealResult(r, robinhoodSender.live); sendLiveTradeMessage(r);
             // LIVE LOOPS: wins, and gas lost toward the loop loss cap.
             loopLiveRef?.noteResult(r);
+            // FIRE-FIRST LOOPS: gas lost toward the same loop loss cap.
+            entryLoopSenderRef?.noteResult(r);
             // Scoreboard: the send's path / confidence and its real result.
             const scored = scoreboard.noteResult(r);
             // A trigger-first ENTRY send that failed on chain: its pair waits 30 min (entry sends skip the 6 h list).
@@ -1767,8 +1773,10 @@ const loanUnits = (tradeSizeUsd: number, usdPerToken: number, decimals: number):
 const pickLender = (
       chain: 'avalanche' | 'monad' | 'robinhood', tokenIn: string, buyPool: any, sellPool: any,
       tradeSizeUsd: number, usdPerToken: number,
+      // More of the route's own pools a lender may not be (3-pool loops: the third pool).
+      extraExclude: string[] = [],
 ) => {
-      const exclude = [buyPool.poolAddress, sellPool.poolAddress];
+      const exclude = [buyPool.poolAddress, sellPool.poolAddress, ...extraExclude];
       if (chain !== 'robinhood') return pickV3Lender(lenderCandidates(chain), tokenIn, exclude);
       // Own money for trades up to OWN_MONEY_MAX_USD ($2,000); bigger trades
       // borrow from the cheapest lender (0.01% pool) so the big wins aren't
@@ -2980,7 +2988,8 @@ const entryCandidatesFor = (keys: string[], limit: number): { cands: EntryCandid
       const routes = entryRoutesOf(keys);
       const top = rankRoutes<EntryRouteT>(routes, entryHeld, entryScore, limit);
       const out: EntryCandidate[] = [];
-      for (const r of top) { const c = entryBuild(r); if (c) out.push(c); }
+      // Each carries its ranking facts, so 3-pool loops can be merged in by the same rule.
+      for (const r of top) { const c = entryBuild(r); if (c) { c.rank = { held: entryHeld(r), score: entryScore(r) }; out.push(c); } }
       return { cands: out, found: routes.length };
 };
 // ONE TRIP table (execution/trigEntry.ts refreshTable): every pool copy 2
@@ -2998,6 +3007,161 @@ const entryTableRoutes = (): TablePool[] => copy2PoolKeys().map((k) => ({
             inputs: [r.buy, r.buy?.observedFee, r.sell, r.sell?.observedFee, entryUsdOf(r.tokenIn), entryDecOf(r.tokenIn)],
       })),
 }));
+// FIRE-FIRST 3-POOL LOOPS (execution/trigEntryLoops.ts, TRIG_ENTRY_LOOPS=1,
+// the default). For each moved pool, loops start coin (USDG / WETH) -> A ->
+// B -> start through it, from a LOOP INDEX worked out ahead of time (every
+// TRIG_ENTRY_LOOP_INDEX_MS: rebuilt in ~2 ms bites when the pools copy 2
+// follows change, and at least once a minute), never per trigger. Rules,
+// the same as live loops (execution/loopLive.ts): exchange cleared for live
+// trading and not practice-only, live coin rule (liveBlocker), the contract
+// can run the pool, exact maths, deep enough (the loop finder's filter),
+// every coin on the allowed list, middle coins passed the coin tax test
+// (data/coin-tax.json), lender never one of the loop's pools, loop size
+// limit and loop loss cap (LOOP_LIVE_MAX_TRADE_USD / LOOP_LIVE_LOSS_CAP_USD).
+const entryLoopSettings = entrySettings(process.env, MIN_NET_PROFIT_USD);
+const entryLoopTax = new CoinTaxFileView('data/coin-tax.json');
+const entryLoopTaxOn = coinTaxConfigFromEnv(process.env).enabled;
+const entryLoopUsd = (t: string) => priceOracle.getUsdPrice('robinhood', t);
+const entryLoopPoolOk = (p: PoolState): boolean => {
+      if (!p || p.chain !== 'robinhood') return false;
+      if (liveBlocker(p, p)) return false;                      // venue / practice-only / live coin rule
+      const kind = kindForPool(p);
+      if (kind === null) return false;                          // the contract can't run this pool type
+      if (kind === KIND_V4_HOOKED && !v4KeyMatchesId(p)) return false;
+      if (!hasExactMath(p)) return false;                       // no quick price check possible
+      return deepEnough(p, decimalsOf, entryLoopUsd);           // same depth filter as the loop finder
+};
+const entryLoopIndex: EntryLoopIndex<PoolState> | null = entryLoopSettings.enabled && entryLoopSettings.loops && chainOn('robinhood')
+      ? new EntryLoopIndex<PoolState>(loopIndexSettings(process.env), {
+            pools: () => copy2PoolKeys().map((k) => cache.get('robinhood', k)).filter((p): p is PoolState => !!p),
+            startCoins: [ROBINHOOD_TOKENS.USDG, ROBINHOOD_TOKENS.WETH],
+            rules: () => {
+                  entryLoopTax.refresh(); // at most once a minute
+                  return {
+                        key: (p: PoolState) => p.poolAddress, tokens: (p: PoolState) => [p.tokenA, p.tokenB] as [string, string],
+                        poolOk: entryLoopPoolOk,
+                        coinOk: (t: string, isStart: boolean) => safetyGate.isAllowed(t) && (isStart || !entryLoopTaxOn || entryLoopTax.verdict(t) === 'ok'),
+                        depth: (p: PoolState) => poolDepthUsd(p, decimalsOf, entryLoopUsd) ?? 0,
+                  };
+            },
+            log: (m) => console.log(m),
+      })
+      : null;
+// Our gas for a 3-pool loop (calibrated loop estimate; a flash loan costs a bit more).
+const entryLoopGasUsd = (flash: boolean) => gasModel.loopUsd(3, 0.05) + (flash ? Math.max(0, rhGasUsd(0.05, true) - rhGasUsd(0.05, false)) : 0);
+const entryLoopStates = (l: EntryLoop): PoolState[] | null => {
+      const st = l.keys.map((k) => cache.get('robinhood', k));
+      return st.every((p) => !!p) ? (st as PoolState[]) : null;
+};
+// Ranking facts, same rule as 2-pool routes: a start coin we hold first, then
+// the quick price check at the smallest ladder size ($, before gas), minus
+// the loop's EXTRA gas over a 2-pool trade, so the two kinds compare fairly.
+// Remembered while the 3 pool states and the coin price are the same.
+const entryLoopMemo = new LoopScoreMemo();
+const entryLoopHeld = (l: EntryLoop) => entryHeld({ tokenIn: l.start });
+const entryLoopScore = (l: EntryLoop): number | null => {
+      const st = entryLoopStates(l);
+      if (!st) return null;
+      const px = entryUsdOf(l.start), d = entryDecOf(l.start);
+      if (d === undefined || !(px > 0)) return null;
+      const smallest = trigEntry?.settings.sizesUsd[0] ?? 50;
+      const q = entryLoopMemo.get(l.id, st, px, () => loopQuoteUsd(st, l.inIsA, smallest, px, d));
+      return q === null ? null : q - Math.max(0, entryLoopGasUsd(false) - rhGasUsd(0.05));
+};
+// Build one loop candidate (null = can't). Our exact contract call is built
+// by the loop trader's own code (buildLoopTrade, the same hops live loops
+// send); the lender (if the size needs one) is never one of the 3 pools.
+const entryLoopBuild = (l: EntryLoop): EntryCandidate | null => {
+      const st = entryLoopStates(l);
+      if (!st) return null;
+      const base = st[0].tokenA.toLowerCase() === l.start ? st[0].tokenA : st[0].tokenB; // the pool's own spelling
+      const usdPer = entryUsdOf(base), dec = entryDecOf(base);
+      if (!usdPer || dec === undefined) return null;
+      const coins = [...new Set(l.tokens)];
+      // Size caps: the loop limit ($10,000), own money (the wallet, live), auto-vetted coin limit.
+      let maxSizeUsd = loopLiveCfg.maxTradeUsd;
+      if (entryOwnOnly()) maxSizeUsd = Math.min(maxSizeUsd, OWN_MONEY_MAX_USD, robinhoodSender.live ? 0.98 * ownMoney.availableUsd(base, usdPer, dec) : OWN_MONEY_MAX_USD);
+      if (involvesAutoVetted(coins)) maxSizeUsd = Math.min(maxSizeUsd, AUTO_VET_MAX_TRADE_USD);
+      if (!(maxSizeUsd > 0)) return null;
+      const cycle = {
+            id: 0, sig: l.id, poolSet: [...l.keys].sort().join(','), base: l.start, tokens: [...l.tokens],
+            hops: l.keys.map((k, i) => ({ poolKey: k, tokenIn: l.tokens[i], tokenOut: l.tokens[(i + 1) % 3], inIsA: l.inIsA[i] })),
+      };
+      // (The index already applied the live rules, so no rule lookups here: no node.)
+      const tradeOf = (amountIn: bigint) => { const b = buildLoopTrade({ cycle, pools: st, amountIn }, () => true); return 'reason' in b ? null : b.trade; };
+      if (!tradeOf(1n)) return null;
+      const lenderAt = (usd: number) => pickLender('robinhood', base, st[0], st[1], usd, usdPer, [st[2].poolAddress]);
+      const sizes = trigEntry?.settings.sizesUsd ?? [50];
+      const mainLender = lenderAt(Math.min(sizes[sizes.length - 1], maxSizeUsd));
+      const host: EntryLoopHost = { kind: 'loop', loop: l, base, usdPer, dec, coins };
+      return {
+            kind: 'loop',
+            label: `loop ${[...l.tokens, l.start].map((t) => symbolOf('robinhood', t)).join('/')}`,
+            buyPool: st[0].poolAddress, sellPool: st[2].poolAddress, tokenIn: base, tokens: coins,
+            keys: [...st.map((p) => p.poolAddress), ...(mainLender ? [mainLender.poolAddress] : [])],
+            maxSizeUsd, gasUsd: entryLoopGasUsd(!!mainLender),
+            // Its own 30-min fail block: this exact loop (first pool + loop id).
+            failKey: [l.keys[0], l.id],
+            rank: { held: entryLoopHeld(l), score: entryLoopScore(l) },
+            build: (usd) => {
+                  const amountIn = loanUnits(usd, usdPer, dec);
+                  if (amountIn === null || amountIn <= 0n) return null;
+                  const t = tradeOf(amountIn);
+                  if (!t) return null;
+                  const lender = lenderAt(usd);
+                  return { trade: t, simOpts: { weth: ROBINHOOD_TOKENS.WETH, ...(lender ? { v3Lender: lender.poolAddress } : {}) } };
+            },
+            usdOf: (units) => (Number(units) / 10 ** dec) * usdPer,
+            host,
+      };
+};
+// Per trigger: the moved pools' loops (index lookup), ranked, capped, then built.
+const entryLoopCandidatesFor = (keys: string[], limit: number): { cands: EntryCandidate[]; found: number } => {
+      if (!entryLoopIndex) return { cands: [], found: 0 };
+      const idx = entryLoopIndex;
+      const r = pickLoops(keys, (k) => idx.loopsFor(k), entryLoopHeld, entryLoopScore, limit, rankRoutes);
+      const cands: EntryCandidate[] = [];
+      for (const l of r.loops) { const c = entryLoopBuild(l); if (c) cands.push(c); }
+      return { cands, found: r.found };
+};
+// The guarded loop send (same steps as a live loop after its check) and its loss cap.
+const entryLoopSender: EntryLoopSender | null = entryLoopIndex ? new EntryLoopSender(
+      { lossCapUsd: loopLiveCfg.lossCapUsd, maxTradeUsd: loopLiveCfg.maxTradeUsd, blockMs: Math.max(1, GAP_LIVE_FAIL_BLOCK_MIN) * 60_000 },
+      {
+            now: Date.now,
+            live: () => robinhoodSender.live,
+            // One shared loop loss cap with the live loop sender (LOOP_LIVE=1).
+            otherLossTodayUsd: () => loopLive?.lossTodayUsd() ?? 0,
+            otherPaused: () => loopLive?.pausedToday() ?? false,
+            gasUsd: (flash) => entryLoopGasUsd(flash),
+            isOutlier: (net, size) => isOutlier(net, size, OUTLIER_CFG),
+            safety: (sizeUsd, coins) => { const g = safetyGate.check({ tradeSizeUsd: sizeUsd, tokens: coins }); return g.ok ? null : ('reason' in g ? g.reason : 'blocked'); },
+            ready: () => (liveChecks.ok ? null : 'live checks not passed'),
+            deadline: () => robinhoodSender.deadlineBlock(),
+            executor: () => executorConfig('robinhood').executorAddress,
+            gasLimitOk: (units) => robinhoodSender.currentGasLimit - (robinhoodSender.l1GasNow * 3n) / 2n >= BigInt(Math.ceil(units * 1.2)),
+            ownCovers: (t, a) => ownMoney.covers(t, a),
+            lenderOk: (l, t, a) => !!lenderBalances.lastRefreshMs && lenderBalances.canLend(l, t, a, LENDER_HEADROOM),
+            lenderFeePips: (l) => { const p = cache.get('robinhood', l); return p ? (p.feePips ?? p.feeBps * 100) : 0; },
+            fire: (to, data) => robinhoodSender.fire(to, data),
+            afterSent: (hash, info) => {
+                  const funding: Funding = info.flash
+                        ? { kind: 'flash', feePct: info.flash.feePips / 10_000, feeUsd: info.sizeUsd * info.flash.feePips / 1_000_000 }
+                        : { kind: 'own' };
+                  fireStats.sent++;
+                  whyNotSent.sent();
+                  liveTradeLog.sent(hash, info.label, info.sizeUsd, info.netUsd, funding);
+                  setTimeout(() => { void refreshOwnMoney(); }, 3_000);
+                  safetyGate.reservePending(hash, 2 * info.gasUsd);
+                  liveTracker.track(hash, { expectedProfitUsd: info.netUsd, label: info.label, sizeUsd: info.sizeUsd, funding, routeKey: routeKeyFor(info.kinds, !!info.flash) });
+                  // Scoreboard: path "trig_first", src "entry-loop"; pools = its 30-min fail-block keys.
+                  if (robinhoodSender.live) scoreboard.noteSend({ hash, path: 'trig_first', confidence: info.pick.out.confidence as ScoreConfidence | undefined, assumptions: info.pick.out.assumptions, expectedUsd: info.netUsd, label: info.label, pools: info.failKey, src: 'entry-loop' });
+            },
+            log: (m) => console.log(m),
+            alert: (html) => { void sendTelegramMessage(html).catch(() => undefined); },
+      },
+) : null;
+entryLoopSenderRef = entryLoopSender;
 // TRIGGER-FIRST: needs the fast check's connection and copy 2 (LOCAL_SIM
 // shadow / on and LOCAL_SIM_TRIGGER_FIRST shadow / on).
 try {
@@ -3017,6 +3181,14 @@ try {
                         tf, client: host.client, shadowLog: host.shadowLog, settings: es,
                         candidatesFor: (keys, limit) => entryCandidatesFor(keys, limit),
                         tableRoutes: entryTableRoutes,
+                        // 3-POOL LOOPS (TRIG_ENTRY_LOOPS=1): candidates from the loop index,
+                        // the loop safeguards (loop loss cap, size limit, in flight; live:
+                        // the scoreboard's loop bucket too), and the hourly loop text.
+                        ...(entryLoopIndex && entryLoopSender ? {
+                              loopCandidatesFor: (keys: string[], limit: number) => entryLoopCandidatesFor(keys, limit),
+                              loopGate: (p: EntryPick) => entryLoopSender.gate(p) ?? (robinhoodSender.live ? scoreboard.pausedWhy('loop') : null),
+                              loopHourText: () => { const i = entryLoopIndex.info(); return `loop index ${i.loops} loops over ${i.pools} pools${i.capped ? ' (capped)' : ''}, rebuilt in ${i.lastMs} ms; ${entryLoopSender.hourLine()}`; },
+                        } : {}),
                         // Our own sends (seen again in the feed) and our contract: never triggers.
                         isOurTx: (h) => livePools.has(h) || livePools.has(h.toLowerCase()),
                         ourAddresses: [executorConfig('robinhood').executorAddress, robinhoodSender.live ? robinhoodSender.address : undefined].filter((a): a is string => typeof a === 'string'),
@@ -3025,6 +3197,8 @@ try {
                         failBlocked: (a, b) => (GAP_LIVE_FAIL_BLOCK_MIN > 0 ? gapFailBlocks.reason(a, b) ?? null : null),
                         pausedWhy: (conf, as) => scoreboard.pausedWhy('trig_first', conf as ScoreConfidence | undefined, as),
                         send: async (pick, trig) => {
+                              // 3-pool loop: its own guarded send (no 2-pool fireTrade).
+                              if (pick.cand.kind === 'loop') return entryLoopSender ? entryLoopSender.send(pick, trig) : { why: 'no loop sender' };
                               const h = pick.cand.host as EntryHost;
                               let signedMs: number | undefined; let why: string | undefined;
                               // The check already traded WITH the lender buildCheck picked: its fee is in the profit.
@@ -3039,6 +3213,8 @@ try {
                               return { signedMs, why };
                         },
                   });
+                  // The loop index starts building only when the entry point really works.
+                  if (trigEntry.active() && entryLoopIndex) { entryLoopIndex.start(); console.log(`[trig-entry] 3-pool loops ON (TRIG_ENTRY_LOOPS=1): up to ${es.maxLoops} loops per trigger, loop index rebuilt every ${entryLoopIndex.s.checkMs / 1000} s if the pools changed (at least every ${entryLoopIndex.s.rebuildMs / 1000} s), ${entryLoopIndex.s.perPool} loops per pool`); }
             }
       }
 } catch (e) { console.log(`[trigger-first] could not start (${(e as Error).message}); the existing paths decide`); trigFirst = null; trigEntry = null; }
