@@ -2545,14 +2545,22 @@ fn trig_discover_names_the_followed_pool_a_feed_tx_moves() {
     // 3. Already in the copy version: unknown already_in_copy.
     let ans = disc(&swap, 101);
     assert_eq!(ans["unknown"], json!("already_in_copy"), "{ans}");
-    // 4. Needs state we don't hold: unknown, and nothing goes to the node.
+    // 4. Needs state we don't hold: unknown "miss" (the answer never waits
+    //    for the node) ...
     let t2 = signed(0, a(0x77), vec![1]);
     let before = *r.chain.calls.lock().unwrap() + *r.chain.paid_calls.lock().unwrap();
     let ans = disc(&t2, 102);
     assert_eq!(ans["ok"], json!(false), "{ans}");
+    assert_eq!(ans["unknown"], json!("miss"), "{ans}");
     r.settle();
+    // ... but DISCOVER LEARNS (Oct 24): the few missing values are fetched
+    // once in the background, so the same kind of trade can be replayed
+    // next time (live: 69% of feed txs missed here and never got fetched).
     let after = *r.chain.calls.lock().unwrap() + *r.chain.paid_calls.lock().unwrap();
-    assert_eq!(before, after, "discover never reads the node");
+    assert!(after > before, "the missing values were fetched");
+    let ans = disc(&t2, 102);
+    assert_eq!(ans["ok"], json!(true), "after the fetch the trade is replayed: {ans}");
+    assert_eq!(ans["pools"], json!([]), "it moves none of our pools: {ans}");
 }
 
 // Entry point fix (Oct 23, live): PR #175 named ALL V4 pools for every V4
