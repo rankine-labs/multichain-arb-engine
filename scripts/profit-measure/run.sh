@@ -4,3 +4,4 @@
 set -u
 npx tsc -p tsconfig.pm.json
 PM_BATCH=25 PM_INIT_MIN=25 node --max-old-space-size=6000 .scripts-build/scripts/profit-measure/v4fix.js
+node scripts/profit-measure/report.mjs results/profit-measure > /dev/null && echo "report rebuilt with V4 fix-up"

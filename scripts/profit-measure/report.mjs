@@ -11,8 +11,16 @@ const lines = (f) => existsSync(`${DIR}/${f}`) ? readFileSync(`${DIR}/${f}`, 'ut
 const meta = rd('meta.json');
 const timing = rd('timing.json');
 const census = existsSync(`${DIR}/census.json`) ? rd('census.json') : null;
-const arbs = lines('arbs.jsonl');
+let arbs = lines('arbs.jsonl');
 const prices = new Map(lines('arb-prices.jsonl').map((p) => [p.hash, p]));
+// V4 fix-up pass (v4fix.ts): re-checked trades and newly named V4 pools.
+const fix = new Map(lines('v4fix/arbs-fixed.jsonl').map((x) => [x.hash, x]));
+const fixStats = existsSync(`${DIR}/v4fix/stats.json`) ? rd('v4fix/stats.json') : null;
+if (fix.size) {
+  arbs = arbs.map((a) => { const f = fix.get(a.hash); if (!f || f.status === 'no-receipt') return a; return f.status === 'arb' ? f.arb : null; }).filter(Boolean);
+  const keys = existsSync(`${DIR}/v4fix/v4keys.json`) ? rd('v4fix/v4keys.json') : {};
+  for (const [id, k] of Object.entries(keys)) meta.poolInfo[id] = { ...k, pair: null };
+}
 
 const WETH = '0x0bd7d308f8e1639fab988df18a8011f41eacad73';
 const USDG = '0x5fc5360d0400a0fd4f2af552add042d716f1d168';
@@ -31,7 +39,7 @@ const tokDec = (t) => (t === '0x0000000000000000000000000000000000000000' ? 18 :
 const sym = (t) => (t === WETH ? 'WETH' : t === USDG ? 'USDG' : meta.tokens[t]?.s ?? t.slice(0, 8));
 const pool = (p) => meta.poolInfo[p] ?? null;
 const dexOf = (p) => pool(p)?.dex ?? (p.length === 66 ? 'uniswap-v4(?)' : 'unknown');
-const pairOf = (p) => pool(p)?.pair ?? '?';
+const pairOf = (p) => { const i = pool(p); if (!i) return '?'; if (i.pair) return i.pair; const n = (t) => (t === '0x0000000000000000000000000000000000000000' ? 'WETH' : sym(t)); return [n(i.t0), n(i.t1)].join('/'); };
 const short = (a) => `${a.slice(0, 10)}..${a.slice(-4)}`;
 const fmt = (v) => (v === null || v === undefined || !isFinite(v) ? '?' : (v < 0 ? '-' : '') + '$' + (Math.abs(v) >= 1000 ? Math.round(Math.abs(v)).toLocaleString('en-US') : Math.abs(v).toFixed(2)));
 const q = (xs, p) => { if (!xs.length) return null; const s = [...xs].sort((a, b) => a - b); return s[Math.min(s.length - 1, Math.floor(p * s.length))]; };
@@ -44,15 +52,22 @@ const weightOf = (a) => 1 / Math.max(1e-9, cov[a.tier] ?? 1);
 function price(a) {
   const p = prices.get(a.hash);
   let gross = 0, unpriced = false, thin = false;
-  a.net.forEach(([t, raw], i) => {
-    const px = p?.net?.[i]?.[1]; const d = tokDec(t);
+  // Price per coin from the saved prices (USDG = $1, WETH = ETH price).
+  const pxOf = (t) => {
+    if (t === USDG) return { usd: 1, vol: Infinity };
+    if (t === WETH || t === '0x0000000000000000000000000000000000000000') return p?.eth ? { usd: p.eth, vol: Infinity } : (meta.ethMid ? { usd: meta.ethMid, vol: Infinity } : null);
+    for (const [tt, px] of [...(p?.net ?? []), ...(p?.out ?? [])]) if (tt === t && px) return px;
+    return null;
+  };
+  a.net.forEach(([t, raw]) => {
+    const px = pxOf(t); const d = tokDec(t);
     if (!px || d === null) { unpriced = true; return; }
     if (t !== USDG && t !== WETH && px.vol < 1000) thin = true;
     gross += (Number(raw) / 10 ** d) * px.usd;
   });
   let size = null;
   const h0 = a.hops[0];
-  if (h0?.tin && h0.ain && p?.hop0 && tokDec(h0.tin) !== null) size = (Number(h0.ain) / 10 ** tokDec(h0.tin)) * p.hop0.usd;
+  if (h0?.tin && h0.ain && tokDec(h0.tin) !== null) { const px0 = pxOf(h0.tin) ?? p?.hop0; if (px0) size = (Number(h0.ain) / 10 ** tokDec(h0.tin)) * px0.usd; }
   const eth = p?.eth ?? meta.ethMid;
   const gas = (Number(a.gasWei) / 1e18) * eth;
   const grossUsd = unpriced ? null : gross;

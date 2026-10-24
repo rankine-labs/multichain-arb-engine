@@ -114,33 +114,17 @@ async function main() {
   });
   log(`unnamed V4 pools in these trades: ${cand.size}`);
 
-  // 3a. Solve for hooks = 0 keys.
-  const extraTiers = V4_LOOKUP_TIERS.map(([f, t]) => [f, t] as [number, number]);
-  let solved = 0;
-  for (const [id, e] of cand) {
-    const coins = [...e.coins].sort((a, b) => (BigInt(a) < BigInt(b) ? -1 : 1));
-    const fees = [...e.fees];
-    let hit: any = null;
-    for (let i = 0; i < coins.length && !hit; i++) for (let j = i + 1; j < coins.length && !hit; j++) {
-      putAddr(0, coins[i]); putAddr(32, coins[j]); putAddr(128, ZERO_ADDR);
-      const tries: [number, number][] = [];
-      for (const f of fees) for (const t of TICKS) tries.push([f, t]);
-      for (const x of extraTiers) tries.push(x);
-      for (const [f, t] of tries) {
-        putUint(64, f); putUint(96, t);
-        if (toHex(keccak_256(buf)) === id) { hit = { t0: coins[i], t1: coins[j], fee: f, tickSpacing: t, hooks: ZERO_ADDR, dex: 'uniswap-v4', how: 'id-solve' }; break; }
-      }
-    }
-    if (hit) { known.set(id, hit); solved++; }
-  }
-  log(`solved by id (no hooks): ${solved}/${cand.size}`);
-
   // 3b. Pool-creation events for the rest (hooked pools), chunked search.
   const rest = [...cand.keys()].filter((id) => !known.has(id));
-  const head = parseInt((await post({ jsonrpc: '2.0', id: 1, method: 'eth_blockNumber', params: [] })).result, 16);
+  // Busiest pools first (most trades through them).
+  const uses = new Map<string, number>(); rs.forEach((r) => { for (const l of r?.logs ?? []) { const s2 = decodeSwapLog(l); if (s2?.kind === 'v4' && cand.has(s2.pool)) uses.set(s2.pool, (uses.get(s2.pool) ?? 0) + 1); } });
+  rest.sort((x, y) => (uses.get(y) ?? 0) - (uses.get(x) ?? 0));
+  let head = 0;
+  for (let a = 0; a < 10 && !head; a++) { try { head = parseInt((await post({ jsonrpc: '2.0', id: 1, method: 'eth_blockNumber', params: [] })).result, 16) || 0; } catch { await sleep(3000); } }
   const initErrors: Record<string, number> = {};
   const deadline = Date.now() + INIT_MIN * 60_000;
   let viaInit = 0, initCalls = 0;
+  let firstOk: string | null = null;
   for (let i = 0; i < rest.length && Date.now() < deadline; i += 50) {
     const ids = rest.slice(i, i + 50);
     const stack: [number, number][] = [[0, head]];
@@ -154,6 +138,7 @@ async function main() {
         if (t - f > 200_000) { const mid = Math.floor((f + t) / 2); stack.push([mid + 1, t], [f, mid]); }
         continue;
       }
+      if (!firstOk) firstOk = `range ${f}-${t} ok, ${(j.result ?? []).length} logs`;
       for (const l of j.result ?? []) {
         const id = lc(l.topics[1]);
         const d = (l.data as string).slice(2);
@@ -163,7 +148,31 @@ async function main() {
       }
     }
   }
-  log(`named via Initialize search: ${viaInit} (${initCalls} calls); errors: ${JSON.stringify(initErrors).slice(0, 400)}`);
+  log(`named via Initialize search: ${viaInit} (${initCalls} calls); errors: ${JSON.stringify(initErrors).slice(0, 400)}; first ok: ${firstOk}`);
+  writeFileSync(`${OUT}/v4keys-init.json`, JSON.stringify(Object.fromEntries([...known].filter(([id]) => cand.has(id)))));
+
+  // 3a. Solve for hooks = 0 keys.
+  const extraTiers = V4_LOOKUP_TIERS.map(([f, t]) => [f, t] as [number, number]);
+  let solved = 0;
+  for (const [id, e] of cand) {
+    if (known.has(id)) continue;
+    const coins = [...e.coins].slice(0, 10).sort((a, b) => (BigInt(a) < BigInt(b) ? -1 : 1));
+    const fees = [...e.fees];
+    let hit: any = null;
+    for (let i = 0; i < coins.length && !hit; i++) for (let j = i + 1; j < coins.length && !hit; j++) {
+      putAddr(0, coins[i]); putAddr(32, coins[j]); putAddr(128, ZERO_ADDR);
+      const tries: [number, number][] = [];
+      for (const f of fees) { for (let t = 1; t <= 200; t++) tries.push([f, t]); for (const t of [f / 100, f / 50, f / 200, f / 20].filter((x) => Number.isInteger(x) && x > 200)) tries.push([f, t]); }
+      for (const x of extraTiers) tries.push(x);
+      for (const [f, t] of tries) {
+        putUint(64, f); putUint(96, t);
+        if (toHex(keccak_256(buf)) === id) { hit = { t0: coins[i], t1: coins[j], fee: f, tickSpacing: t, hooks: ZERO_ADDR, dex: 'uniswap-v4', how: 'id-solve' }; break; }
+      }
+    }
+    if (hit) { known.set(id, hit); solved++; }
+  }
+  log(`solved by id (no hooks): ${solved}/${cand.size}`);
+  const solvedIds = solved;
 
   // 4. Re-check those trades with the new knowledge.
   const v4Currencies = (id: string) => { const i = known.get(id); return i ? { c0: i.t0, c1: i.t1 } : null; };
@@ -181,7 +190,7 @@ async function main() {
   for (const [id, i] of known) if (cand.has(id)) keysOut[id] = i;
   writeFileSync(`${OUT}/v4keys.json`, JSON.stringify(keysOut));
   writeFileSync(`${OUT}/arbs-fixed.jsonl`, fixed.map((x) => JSON.stringify(x)).join('\n') + '\n');
-  writeFileSync(`${OUT}/stats.json`, JSON.stringify({ todo: todo.length, unnamedPools: cand.size, solved, viaInit, initCalls, initErrors, kept, still, dropped, http, limited, minutes: (Date.now() - T0) / 60000 }, null, 1));
+  writeFileSync(`${OUT}/stats.json`, JSON.stringify({ todo: todo.length, unnamedPools: cand.size, solved, viaInit, initCalls, firstOk, initErrors, kept, still, dropped, http, limited, minutes: (Date.now() - T0) / 60000 }, null, 1));
   log('saved');
 }
 main().then(() => process.exit(0)).catch((e) => { console.error('[v4fix] stopped:', String(e?.message ?? e).replace(/https?:\/\/\S+/g, '<node>')); process.exit(1); });
