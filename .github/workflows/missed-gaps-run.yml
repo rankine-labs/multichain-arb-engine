@@ -1,0 +1,39 @@
+# ============================================================================
+# MISSED GAPS chain read (one-off, read-only). Reads pool states from the
+# PUBLIC Robinhood node for the missed-gaps analysis. Never touches the bot
+# server, never loads a key, never sends a transaction.
+# Triggered ONLY by a push to the throwaway branch missed-gaps-run.
+# ============================================================================
+name: Missed gaps chain read (one-off)
+
+on:
+  push:
+    branches: [missed-gaps-run]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: missed-gaps-run
+  cancel-in-progress: false
+
+jobs:
+  read:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install --no-audit --no-fund
+      - name: Read pool states (public node)
+        run: node scripts/missed-gaps/chainread.mjs results/missed-gaps/pools-in.json results/missed-gaps/chain-state.json 2>&1 | tee results/missed-gaps/chainread.log
+      - name: Commit results back to this branch
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -f results/missed-gaps
+          git commit -m "Missed gaps chain read ($(date -u +%Y-%m-%d\ %H:%M) UTC)" || exit 0
+          for i in 1 2 3; do git pull --rebase -q origin missed-gaps-run && git push origin HEAD:missed-gaps-run && break; sleep 5; done
