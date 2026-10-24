@@ -178,6 +178,17 @@ async function wantedTests() {
 }
 
 // ---------------------------------------------------------------------------
+// A hand-driven scheduler for the WebSocket reader (no real timers: the
+// test never depends on how fast the machine is).
+const manual = (() => {
+  let q: Array<{ fn: () => void; off: boolean }> = [];
+  return {
+    schedule: (fn: () => void, _ms: number) => { const j = { fn, off: false }; q.push(j); return () => { j.off = true; }; },
+    // Run everything due (the reader's event flush), including what it schedules.
+    runAll: () => { for (let i = 0; i < 100 && q.some((j) => !j.off); i++) { const now = q; q = []; for (const j of now) if (!j.off) { j.off = true; j.fn(); } } },
+  };
+})();
+
 class FakeSocket extends EventEmitter implements SocketLike {
   sent: any[] = [];
   closed = false;
@@ -204,7 +215,7 @@ function wsExtraTargetTests() {
       addresses: () => [P1, P2], v4Ids: () => new Set<string>(),
       onUpdates: (latest) => applied.push(latest),
       connect: () => { const s = new FakeSocket(); sockets.push(s); return s; },
-      schedule: (fn, ms) => { const h = setTimeout(fn, 0); void ms; return () => clearTimeout(h); }, now: () => t, autoTick: false, usage: new NodeUsageCounter(() => t), log: () => {},
+      schedule: manual.schedule, now: () => t, autoTick: false, usage: new NodeUsageCounter(() => t), log: () => {},
       rawLogTap: tap,
     });
     return { r, sockets, applied, got, liveOf: () => live };
@@ -240,17 +251,17 @@ async function wsHeldEventTest() {
     addresses: () => [P1], v4Ids: () => new Set<string>(),
     onUpdates: (latest) => applied.push(latest),
     connect: () => { const s = new FakeSocket(); sockets.push(s); return s; },
-    schedule: (fn) => { const h = setTimeout(fn, 0); return () => clearTimeout(h); }, now: () => 1_000, autoTick: false, usage: new NodeUsageCounter(() => 1_000), log: () => {},
+    schedule: manual.schedule, now: () => 1_000, autoTick: false, usage: new NodeUsageCounter(() => 1_000), log: () => {},
     rawLogTap: tap,
   });
   r.start(); sockets[0]!.open();
   sockets[0]!.reply(1, '0xs1'); sockets[0]!.reply(4, '0xs4'); sockets[0]!.reply(5, '0xs5');
   const sync = (a: string, b: number) => ({ address: a, topics: [SYNC_TOPIC], data: '0x' + '0'.repeat(63) + '1' + '0'.repeat(63) + '2', blockNumber: '0x' + b.toString(16), transactionIndex: '0x0', logIndex: '0x0', transactionHash: '0x' + 'ab'.repeat(32) });
   sockets[0]!.push('0xs1', sync(HELD, 70));
-  await new Promise((res) => setTimeout(res, 20));
+  manual.runAll();
   assert(got.length === 1 && applied.length === 0, 'held pool event: handed to copy 2, ignored by the price path');
   sockets[0]!.push('0xs1', sync(P1, 71));
-  await new Promise((res) => setTimeout(res, 20));
+  manual.runAll();
   assert(applied.length === 1, 'watched pool event still reaches the price path');
   r.stop();
 }
