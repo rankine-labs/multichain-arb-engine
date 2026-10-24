@@ -1004,10 +1004,19 @@ fn loss_fast_on() -> bool {
     std::env::var("ARBSIM_LOSS_FAST").map(|v| v.trim() != "0").unwrap_or(true)
 }
 
-/// A check answer that says "no profit at all": every call reverted with
-/// our contract's InsufficientProfit(got, wanted) with got = 0 (normal end,
-/// no halt), and every size of the size ladder (if any) is "loss".
-/// Anything else (a profit, another revert, a size not answered) = false.
+/// A check answer that says "no profit at all": every call reverted (normal
+/// end, no halt) with one of our contract's own no-profit answers:
+///   - InsufficientProfit(got, wanted) with got = 0, or
+///   - TransferFailed() (0x90b8ec18): our contract could not pay a coin it
+///     owed out of its own balance. With a flash loan this is the usual way
+///     a losing trade ends (the loan can't be repaid from the proceeds; live
+///     Oct 24: no InsufficientProfit(0) at all, the bot reads these as
+///     "loss"); without one the bot reads it as "fail". Never sent either
+///     way, and our contract's balance doesn't depend on the PoolManager
+///     balance / fee counter the confirming runs vary.
+/// and every size of the size ladder (if any) is a loss or that same
+/// TransferFailed. Anything else (a profit, another revert, a size not
+/// answered) = false.
 pub fn clear_loss(a: &Value) -> bool {
     if a.get("ok") != Some(&Value::Bool(true)) {
         return false;
@@ -1023,14 +1032,17 @@ pub fn clear_loss(a: &Value) -> bool {
         }
         let Some(out) = o.get("output").and_then(|x| x.as_str()) else { return false };
         let out = out.strip_prefix("0x").unwrap_or(out).to_ascii_lowercase();
-        out.len() == 136 && out.starts_with("4e88422a") && out[8..72].bytes().all(|c| c == b'0')
+        out == "90b8ec18" || (out.len() == 136 && out.starts_with("4e88422a") && out[8..72].bytes().all(|c| c == b'0'))
     };
     if !results.iter().all(zero_got) {
         return false;
     }
     match a.get("sizes") {
         None | Some(Value::Null) => true,
-        Some(Value::Array(rows)) => rows.iter().all(|r| r.get("status").and_then(|s| s.as_str()) == Some("loss")),
+        Some(Value::Array(rows)) => rows.iter().all(|r| {
+            let st = r.get("status").and_then(|s| s.as_str());
+            st == Some("loss") || (st == Some("fail") && r.get("reason").and_then(|x| x.as_str()).is_some_and(|x| x.eq_ignore_ascii_case("0x90b8ec18")))
+        }),
         Some(_) => false,
     }
 }
@@ -1278,6 +1290,16 @@ mod tests {
         assert!(!clear_loss(&json!({"ok": false, "unknown": "miss"})));
         assert!(!clear_loss(&json!({"ok": true, "results": []})));
         assert!(!clear_loss(&json!({"ok": true, "best": null, "tried": []})));
+        // Flash-loan loss: TransferFailed() (loan not repaid).
+        let tf = json!({"ok": true, "results": [{"success": false, "output": "0x90b8ec18", "gasUsed": "0x10"}]});
+        assert!(clear_loss(&tf));
+        let mut tfs = tf.clone();
+        tfs["sizes"] = json!([{"status": "fail", "reason": "0x90b8ec18"}, {"status": "loss"}]);
+        assert!(clear_loss(&tfs));
+        tfs["sizes"] = json!([{"status": "fail", "reason": "0x12345678"}]);
+        assert!(!clear_loss(&tfs), "another failing size must be confirmed");
+        let tf_long = json!({"ok": true, "results": [{"success": false, "output": "0x90b8ec1800", "gasUsed": "0x10"}]});
+        assert!(!clear_loss(&tf_long), "exactly the 4-byte error only");
     }
 
     #[test]
