@@ -129,7 +129,8 @@ import { stallFinder, markStretch } from '../core/stallFinder';
 
 export type EntrySettings = {
   enabled: boolean;              // TRIG_FIRST_ENTRY [1] (and LOCAL_SIM_TRIGGER_FIRST not off)
-  maxInFlight: number;           // TRIG_ENTRY_MAX_IN_FLIGHT [4] triggers worked on at once; more are dropped
+  maxInFlight: number;           // TRIG_ENTRY_MAX_IN_FLIGHT [4] triggers CHECKED at once (they move our pools); more are dropped
+  maxDiscover: number;           // TRIG_ENTRY_MAX_DISCOVER [24] triggers asked "which pools?" at once (cheap, ~4 ms); more are dropped
   maxCandidates: number;         // TRIG_ENTRY_MAX_CANDIDATES [6] candidate trades built and checked per trigger (best-ranked first)
   maxPools: number;              // TRIG_ENTRY_MAX_POOLS [4] more moved pools than this = suspicious answer, skipped ("too_many_pools")
   parallel: number;              // TRIG_ENTRY_PARALLEL [2] candidate checks of one trigger at once
@@ -156,6 +157,7 @@ export function entrySettings(env: Record<string, string | undefined> = process.
   return {
     enabled: (env.TRIG_FIRST_ENTRY ?? '1').trim() !== '0',
     maxInFlight: Math.round(num('TRIG_ENTRY_MAX_IN_FLIGHT', 4)),
+    maxDiscover: Math.round(num('TRIG_ENTRY_MAX_DISCOVER', 24)),
     maxCandidates: Math.round(num('TRIG_ENTRY_MAX_CANDIDATES', 6)),
     maxPools: Math.round(num('TRIG_ENTRY_MAX_POOLS', 4)),
     parallel: Math.round(num('TRIG_ENTRY_PARALLEL', 2)),
@@ -483,7 +485,7 @@ export class TrigEntry {
 
   private freshHour() {
     return {
-      feedTxs: 0, skipped: 0, dropped: 0, asked: 0, discovered: 0, touching: 0,
+      feedTxs: 0, skipped: 0, dropped: 0, droppedBusy: 0, asked: 0, discovered: 0, touching: 0,
       answered: 0, profitable: 0, profitUsd: 0, wouldSend: 0, sent: 0, held: 0, errors: 0,
       discoverMs: [] as number[], answerMs: [] as number[], submitMs: [] as number[],
       unknownWhy: {} as Record<string, number>, heldWhy: {} as Record<string, number>,
@@ -508,7 +510,7 @@ export class TrigEntry {
     this.lagNow = deps.lag ?? (() => loopLag.now());
     this.ours = { isOurTx: deps.isOurTx, addresses: new Set(deps.ourAddresses.map((a) => a.toLowerCase())) };
     const one = this.oneTripOn() ? `one trip (table every ${this.settings.tableMs} ms)` : 'two steps';
-    this.log(`[trig-entry] ${this.active() ? deps.tf.mode() : 'off'}: every feed transaction checked as a possible trigger (max ${this.settings.maxInFlight} at once, ${this.settings.maxCandidates} candidates each, sizes $${this.settings.sizesUsd.join('/$')}, ${one})`);
+    this.log(`[trig-entry] ${this.active() ? deps.tf.mode() : 'off'}: every feed transaction checked as a possible trigger (max ${this.settings.maxDiscover} asked "which pools?" and ${this.settings.maxInFlight} checked at once, ${this.settings.maxCandidates} candidates each, sizes $${this.settings.sizesUsd.join('/$')}, ${one})`);
     if (this.active()) {
       if (!deps.lag) loopLag.start();
       if (this.oneTripOn() && this.settings.tableMs > 0) {
@@ -553,8 +555,13 @@ export class TrigEntry {
         try {
           if (quickSkip(t.raw, t.hash, this.ours)) { this.hour.skipped++; continue; }
         } catch { this.hour.skipped++; continue; }
+        // NO DROP (Oct 24, live: 45% of feed txs were dropped here while 4
+        // triggers were being CHECKED, before we even knew if they moved our
+        // pools). The cheap "which pools?" question now has its own, bigger
+        // limit (TRIG_ENTRY_MAX_DISCOVER); only triggers that move our pools
+        // take one of the TRIG_ENTRY_MAX_IN_FLIGHT check places (process).
         // Overloaded: drop (counted), never queue up behind the feed.
-        if (this.inFlight >= this.settings.maxInFlight) { this.hour.dropped++; continue; }
+        if (this.inFlight >= Math.max(this.settings.maxDiscover, this.settings.maxInFlight)) { this.hour.dropped++; continue; }
         this.inFlight++;
         const hash = t.hash.toLowerCase();
         const times: FrameTimes = { recv, parsed: hr?.parsed, queued: performance.now() };
@@ -569,7 +576,18 @@ export class TrigEntry {
   inFlightNow(): number { return this.inFlight; }
 
   // ---- one trigger ------------------------------------------------------------
+  // Check places in use (triggers that move our pools, being sized and
+  // checked); at most TRIG_ENTRY_MAX_IN_FLIGHT.
+  private checking = 0;
+  checkingNow(): number { return this.checking; }
+
   async process(hash: string, seenMs: number, times?: FrameTimes): Promise<EntryRecord | null> {
+    const slot = { held: false };
+    try { return await this.processInner(hash, seenMs, times, slot); }
+    finally { if (slot.held) this.checking--; }
+  }
+
+  private async processInner(hash: string, seenMs: number, times: FrameTimes | undefined, slot: { held: boolean }): Promise<EntryRecord | null> {
     const s = this.settings;
     const h = this.hour;
     const deadlineAt = seenMs + s.deadlineMs;
@@ -645,6 +663,10 @@ export class TrigEntry {
     const pools = Array.isArray(a.pools) ? (a.pools as unknown[]).filter((x): x is string => typeof x === 'string').map((x) => x.toLowerCase()) : [];
     if (!pools.length) return null; // doesn't move any pool we follow: nothing to do
     h.touching++;
+    // A check place (NO DROP above): all taken = too busy for this one.
+    if (this.checking >= s.maxInFlight) { h.droppedBusy++; return unknown('busy_checking'); }
+    this.checking++;
+    slot.held = true;
     // Debug: per moved pool, which kinds of its values changed (sidecar, capped small).
     const moved = Array.isArray(a.moved) ? (a.moved as unknown[]).slice(0, 4).map((m) => (Array.isArray(m) ? `${String(m[0]).slice(0, 12)}:${Array.isArray(m[1]) ? (m[1] as unknown[]).slice(0, 4).join('+') : ''}` : '')).filter(Boolean) : undefined;
     const rec: EntryRecord = {
@@ -1312,7 +1334,7 @@ export class TrigEntry {
       const ms = (xs: number[]) => (xs.length ? `p50 ${pctl(xs, 0.5)} ms, p90 ${pctl(xs, 0.9)} ms` : 'n/a');
       const top = (m: Record<string, number>) => Object.entries(m).sort((a, b) => b[1] - a[1]).slice(0, 4).map(([k, n]) => `${k} ${n}`).join(', ');
       const parts = [
-        `${h.feedTxs} feed txs, ${h.asked} looked at (skipped ${h.skipped}, dropped ${h.dropped} overloaded)`,
+        `${h.feedTxs} feed txs, ${h.asked} looked at (skipped ${h.skipped}, dropped ${h.dropped} overloaded, ${h.droppedBusy} moving our pools but all ${this.settings.maxInFlight} check places busy)`,
         `moving our pools ${h.touching} (${pct(h.touching, h.discovered)} of ${h.discovered} answered)`,
         `answered ${h.answered} (${pct(h.answered, h.touching)})`,
         `profitable ${h.profitable} ($${h.profitUsd.toFixed(2)} after gas)`,
