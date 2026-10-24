@@ -61,8 +61,9 @@ export type ScoreSend = {
   pools?: string[];               // the pools traded (standing-gap fail block)
   sentMs?: number;
   // Trigger-first sends: "entry" = started by the entry point on the feed
-  // (execution/trigEntry.ts), not by the old model-guess hook.
-  src?: 'entry';
+  // (execution/trigEntry.ts), not by the old model-guess hook; "entry-loop" =
+  // a 3-pool loop sent by the entry point (pools = its 30-min fail-block keys).
+  src?: 'entry' | 'entry-loop';
 };
 
 // One settled send (= one line of data/scoreboard.jsonl).
@@ -155,8 +156,8 @@ export function standingGapFailBlock(rec: ScoreRecord | null, block: (buyPool: s
 // its exact pool pair for the same 30 min as a standing gap (entry sends
 // skip the 6 h list on purpose, see execution/trigEntry.ts). true = blocked.
 export function entryFailBlock(rec: ScoreRecord | null, block: (buyPool: string, sellPool: string, why: string) => void): boolean {
-  if (!rec || rec.path !== 'trig_first' || rec.src !== 'entry' || rec.status !== 'failed' || !rec.pools || rec.pools.length < 2) return false;
-  block(rec.pools[0], rec.pools[1], 'trigger-first entry: live trade failed on chain');
+  if (!rec || rec.path !== 'trig_first' || (rec.src !== 'entry' && rec.src !== 'entry-loop') || rec.status !== 'failed' || !rec.pools || rec.pools.length < 2) return false;
+  block(rec.pools[0], rec.pools[1], `trigger-first entry${rec.src === 'entry-loop' ? ' loop' : ''}: live trade failed on chain`);
   return true;
 }
 
