@@ -607,8 +607,48 @@ fn trig_discover_inner(ctx: &Ctx, id: &Value, req: &Value, t0: Instant, tm: &mut
         }
     };
     let mut a = after_pick_with(ctx, picked, t0, tm, &run, false, Some(core.clone()));
+    // DISCOVER LEARNS (Oct 24, live: 69% of looked-at feed transactions
+    // answered "miss" here, and a miss was never fetched, so every trade
+    // through a router / aggregator whose code or values copy 2 doesn't hold
+    // stayed invisible forever). A miss of a FEW items (a router's code, its
+    // own values) is now fetched once, like any check's miss, so the next
+    // trade through it can be replayed. Many items = probably not a swap at
+    // all (a game, a mint, an airdrop): not fetched. Paced so it can't crowd
+    // out pool loads: ARBSIM_DISCOVER_FILL_MAX_ITEMS (16) per miss,
+    // ARBSIM_DISCOVER_FILL_PER_S (60) items a second over all questions
+    // (0 = off, as before).
+    if a.get("unknown").and_then(|u| u.as_str()) == Some("miss") {
+        let missing = parse_missing(&a);
+        if !missing.is_empty() && missing.len() <= env_u64("ARBSIM_DISCOVER_FILL_MAX_ITEMS", 16) as usize && discover_fill_take(missing.len()) {
+            c2.note_misses(&missing);
+            crate::timing::ph_add("discFill", missing.len() as u64);
+            ctx.fill(missing);
+        }
+    }
     a["us"] = json!(t0.elapsed().as_micros() as u64);
     a
+}
+
+/// DISCOVER LEARNS pacing: a token bucket of ARBSIM_DISCOVER_FILL_PER_S
+/// items a second (bursts up to 2 s worth). true = these `n` items may be
+/// fetched now.
+fn discover_fill_take(n: usize) -> bool {
+    let per_s = env_u64("ARBSIM_DISCOVER_FILL_PER_S", 60) as f64;
+    if per_s <= 0.0 {
+        return false;
+    }
+    static B: std::sync::OnceLock<Mutex<(f64, Instant)>> = std::sync::OnceLock::new();
+    let b = B.get_or_init(|| Mutex::new((per_s * 2.0, Instant::now())));
+    let mut g = b.lock().unwrap();
+    let now = Instant::now();
+    g.0 = (g.0 + now.duration_since(g.1).as_secs_f64() * per_s).min(per_s * 2.0);
+    g.1 = now;
+    if g.0 >= n as f64 {
+        g.0 -= n as f64;
+        true
+    } else {
+        false
+    }
 }
 
 /// TRIGGER-ENTRY ONE TRIP (check/entry.rs): `{"type":"trig_entry", "at",

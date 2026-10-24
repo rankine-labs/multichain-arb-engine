@@ -278,7 +278,7 @@ async function main() {
 
   // ---- overload: bounded, dropped and counted, never blocks the feed ------------------------------
   {
-    const { tf, te } = setup({ mode: 'shadow', env: { TRIG_ENTRY_MAX_IN_FLIGHT: '1' } });
+    const { tf, te } = setup({ mode: 'shadow', env: { TRIG_ENTRY_MAX_IN_FLIGHT: '1', TRIG_ENTRY_MAX_DISCOVER: '1' } });
     const m3 = [msgOf(100, []), msgOf(101, [tSwap, tSwap2, tSwap3])];
     tf.onFeedMsgs(m3, Date.now());
     const t0 = Date.now();
@@ -288,6 +288,21 @@ async function main() {
     const hour = te.takeHourLine() ?? '';
     assert(/dropped 2 overloaded/.test(hour), `extra triggers dropped and counted: ${hour}`);
     assert(te.inFlightNow() === 0, 'work finished, nothing left in flight');
+  }
+
+  // ---- NO DROP: the cheap "which pools?" question has its own bigger limit -----------------------
+  {
+    const { tf, te } = setup({ mode: 'shadow', env: { TRIG_ENTRY_MAX_IN_FLIGHT: '1', TRIG_ENTRY_MAX_DISCOVER: '3' } });
+    const m3 = [msgOf(100, []), msgOf(101, [tSwap, tSwap2, tSwap3])];
+    tf.onFeedMsgs(m3, Date.now());
+    te.onFeedMsgs(m3, Date.now());
+    assert(te.inFlightNow() === 3, 'all 3 triggers asked "which pools?" (none dropped before we know if they move our pools)');
+    await sleep(100);
+    const hour = te.takeHourLine() ?? '';
+    assert(/dropped 0 overloaded/.test(hour), `nothing dropped unread: ${hour}`);
+    const m = /, (\d+) moving our pools but all 1 check places busy/.exec(hour);
+    assert(!!m && Number(m[1]) <= 2, `at most 1 checked at once, the others counted as busy: ${hour}`);
+    assert(te.inFlightNow() === 0 && te.checkingNow() === 0, 'work finished, no place left taken');
   }
 
   // ---- GUARD: too many moved pools = suspicious, skipped -------------------------------------------
