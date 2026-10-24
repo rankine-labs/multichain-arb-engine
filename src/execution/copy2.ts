@@ -1112,6 +1112,19 @@ export function parseCopy2Status(s: unknown): Copy2Status {
 //                                  BLOCK_READER_WSS_DAILY, so the price feed
 //                                  keeps its share (0 = no copy-2 limit)
 //   ARBSIM_L2_BLOCK_OFFSET   0     block number = feed sequence number + this
+//   COPY2_DROP_GRACE_S       1800  a pool that leaves the watch list (pair
+//                                  dropped as least recently traded, loop
+//                                  extra pool not re-picked) stays on copy
+//                                  2's follow list (and in the WebSocket
+//                                  subscription) this long, so it is still
+//                                  READY and exact when it comes back
+//                                  (0 = drop at once, the old behaviour;
+//                                  falls back to ARBSIM_COPY2_DROP_GRACE_S)
+//   COPY2_DROP_GRACE_MAX     300   at most this many such pools held at once
+//                                  (the most recently watched are kept)
+//   COPY2_WANTED_S           60    a route pool found "loading" is sent to
+//                                  the fast check as "wanted" this long, so
+//                                  it loads those first (0 = never sent)
 // ============================================================================
 export type Copy2Settings = {
   mode: 'auto' | 'off';
@@ -1128,6 +1141,9 @@ export type Copy2Settings = {
   timeReadsPerMin: number;
   wssMaxPct: number;
   l2Offset: number;
+  dropGraceMs: number;   // COPY2_DROP_GRACE_S in ms (0 = off)
+  dropGraceMax: number;  // COPY2_DROP_GRACE_MAX
+  wantedMs: number;      // COPY2_WANTED_S in ms (0 = off)
 };
 
 export function copy2Settings(env: Record<string, string | undefined> = process.env): Copy2Settings {
@@ -1148,6 +1164,13 @@ export function copy2Settings(env: Record<string, string | undefined> = process.
     timeReadsPerMin: num('COPY2_TIME_READS_PER_MIN', 30),
     wssMaxPct: Math.min(100, num('COPY2_WSS_MAX_PCT', 80)),
     l2Offset: num('ARBSIM_L2_BLOCK_OFFSET', 0),
+    // The bot's own name wins; else the fast check's name (one .env line
+    // then sets both sides); else 30 minutes.
+    dropGraceMs: 1000 * (env.COPY2_DROP_GRACE_S !== undefined && env.COPY2_DROP_GRACE_S !== ''
+      ? num('COPY2_DROP_GRACE_S', 1_800)
+      : num('ARBSIM_COPY2_DROP_GRACE_S', 1_800)),
+    dropGraceMax: Math.floor(num('COPY2_DROP_GRACE_MAX', 300)),
+    wantedMs: 1000 * num('COPY2_WANTED_S', 60),
   };
 }
 
@@ -1191,9 +1214,22 @@ export class Copy2Link {
   private index: Copy2Index = EMPTY_INDEX;
   private backfillRpc: ((method: string, params: unknown[]) => Promise<any>) | null = null;
   private loggedState = '';
+  // DROP GRACE (COPY2_DROP_GRACE_S): every pool ever on the watch-derived
+  // list -> its details and when it was last on it. A pool that left the
+  // watch list less than dropGraceMs ago stays on the follow list (held),
+  // so copy 2 keeps applying its reports and it is READY the moment the
+  // watch list takes it back (live Oct 24: 59 % of fire-first triggers hit
+  // a pool that had just come back and was reloading for ~30 s).
+  private lastWatched = new Map<string, { pool: Copy2Pool; at: number }>();
+  private follow: Copy2Pool[] = [];        // desired + held (rebuilt with desired)
+  private heldKeys = new Set<string>();    // keys of the held (not watched) pools in `follow`
+  // WANTED (COPY2_WANTED_S): route pools a check found "loading" -> when;
+  // sent with the status poll so the fast check loads them first.
+  private wanted = new Map<string, number>();
 
-  // Hourly counters (taken by hourText).
-  private hour = { fast: 0, notReady: {} as Record<string, number> };
+  // Hourly counters (taken by hourText). held: pools that came back to the
+  // watch list while still held (each one a reload avoided).
+  private hour = { fast: 0, notReady: {} as Record<string, number>, heldBack: 0 };
 
   constructor(o: Copy2LinkOptions) {
     this.o = o;
@@ -1221,7 +1257,10 @@ export class Copy2Link {
     // What the block reader's WebSocket calls (see core/blockReaderWs.ts RawLogTap).
     this.tap = {
       wanted: () => s.mode !== 'off' && this.sidecarOn,
-      transferFilter: () => transferFilterOf(this.desiredList()),
+      transferFilter: () => transferFilterOf(this.followList()),
+      // Held pools stay in the subscription too (they are no longer on the
+      // watch list the block reader subscribes from).
+      extraTargets: () => this.heldTargets(),
       onLogs: (logs) => this.forwarder.onLogs(logs),
       onHead: (h) => this.forwarder.onHead(h),
       dailyShare: () => s.wssMaxPct / 100,
@@ -1260,8 +1299,61 @@ export class Copy2Link {
         this.desiredSkipped = r.skipped;
       } catch { /* keep the last list */ }
       this.desiredAt = t;
+      this.rebuildFollow(t);
     }
     return this.desired;
+  }
+
+  // The pools copy 2 follows: the watch-derived list plus the held ones
+  // (left the watch list less than COPY2_DROP_GRACE_S ago). Same rebuild
+  // cadence as desiredList (the returned array is reused until then).
+  followList(): Copy2Pool[] {
+    this.desiredList();
+    return this.follow;
+  }
+
+  // Held pools only (not on the watch list), for the WebSocket subscription.
+  heldTargets(): { pools: string[]; ids: string[] } {
+    this.desiredList();
+    const pools: string[] = [], ids: string[] = [];
+    for (const p of this.follow) {
+      const k = copy2Key(p);
+      if (!this.heldKeys.has(k)) continue;
+      if (p.kind === 'V4') ids.push(k); else pools.push(k);
+    }
+    return { pools, ids };
+  }
+
+  heldCount(): number { this.desiredList(); return this.heldKeys.size; }
+
+  // Rebuild the follow list from the fresh desired list (see DROP GRACE).
+  private rebuildFollow(t: number): void {
+    const graceMs = this.o.settings.dropGraceMs;
+    const now = new Set<string>();
+    for (const p of this.desired) {
+      const k = copy2Key(p);
+      now.add(k);
+      // Came back while held: counted (a reload the grace avoided).
+      if (this.heldKeys.has(k)) this.hour.heldBack++;
+      this.lastWatched.set(k, { pool: p, at: t });
+    }
+    // Held: off the watch list, within the grace, most recently watched first,
+    // at most dropGraceMax. Everything older is forgotten (bounded memory).
+    const held: Array<{ k: string; pool: Copy2Pool; at: number }> = [];
+    for (const [k, v] of this.lastWatched) {
+      if (now.has(k)) continue;
+      if (graceMs <= 0 || t - v.at >= graceMs) { this.lastWatched.delete(k); continue; }
+      held.push({ k, pool: v.pool, at: v.at });
+    }
+    held.sort((a, b) => b.at - a.at || (a.k < b.k ? -1 : 1));
+    const max = Math.max(0, this.o.settings.dropGraceMax);
+    for (const h of held.slice(max)) this.lastWatched.delete(h.k);
+    const kept = held.slice(0, max);
+    this.heldKeys = new Set(kept.map((h) => h.k));
+    // Sorted like buildTrackList, so the track signature is stable.
+    this.follow = kept.length
+      ? [...this.desired, ...kept.map((h) => h.pool)].sort((x, y) => (copy2Key(x) < copy2Key(y) ? -1 : 1))
+      : this.desired;
   }
 
   // The fast check (re)connected: it may have restarted, so start over.
@@ -1276,7 +1368,10 @@ export class Copy2Link {
   async pollStatus(): Promise<void> {
     try {
       if (this.o.settings.mode === 'off' || !this.o.client.isConnected()) return;
-      const a: SidecarAnswer = await this.o.client.request({ type: 'status', pools: true }, 2_000);
+      // Route pools recent checks found loading ride along: the fast check
+      // loads those first (an older arbsim ignores the extra field).
+      const wanted = this.wantedKeys();
+      const a: SidecarAnswer = await this.o.client.request({ type: 'status', pools: true, ...(wanted.length ? { wanted } : {}) }, 2_000);
       if (a.ok !== true) return;
       this.applyStatus(a);
     } catch { /* next poll */ }
@@ -1306,7 +1401,7 @@ export class Copy2Link {
     if (this.trackBusy) return;
     try {
       if (!this.sidecarOn || !this.coverage || !this.o.client.isConnected()) return;
-      const list = coveredPools(this.desiredList(), this.coverage);
+      const list = coveredPools(this.followList(), this.coverage);
       const sig = list.map(copy2Key).join(',');
       if (!force && this.trackOk && sig === this.trackedSig) return;
       this.trackBusy = true;
@@ -1325,8 +1420,9 @@ export class Copy2Link {
       this.forwarder.setActive(true);
       if (changed) {
         const skipped = Object.entries(this.desiredSkipped).sort((x, y) => y[1] - x[1]).slice(0, 4).map(([w, n]) => `${w} ${n}`).join(', ');
-        const notCovered = this.desired.length - list.length;
-        this.log(`[copy2] following ${list.length} pools (${kindCounts(list) || 'none'})${notCovered ? `, ${notCovered} wait for the next WebSocket renewal` : ''}${skipped ? ` | not followed: ${skipped}` : ''}`);
+        const notCovered = this.follow.length - list.length;
+        const held = list.filter((p) => this.heldKeys.has(copy2Key(p))).length;
+        this.log(`[copy2] following ${list.length} pools (${kindCounts(list) || 'none'})${held ? `, ${held} of them left the watch list recently (kept, COPY2_DROP_GRACE_S)` : ''}${notCovered ? `, ${notCovered} wait for the next WebSocket renewal` : ''}${skipped ? ` | not followed: ${skipped}` : ''}`);
       }
     } catch {
       /* next try */
@@ -1346,17 +1442,43 @@ export class Copy2Link {
     if (t - this.statusAt > this.o.settings.maxStatusAgeMs) return 'readiness too old';
     if (this.statusAt <= this.forwarder.lastGapAt()) return 'reloading after a gap';
     if (!this.states) return 'readiness not reported';
+    // The first pool that is not ready decides the answer (as always); the
+    // rest of the route is still looked at so EVERY loading pool on it is
+    // noted as wanted (loaded first by the fast check).
     let any = false;
+    let first: string | null = null;
     for (const k of keys) {
       if (!k) continue;
       any = true;
       const key = k.toLowerCase();
       const isTracked = key.length === 66 ? this.index.ids.has(key) : this.index.pools.has(key);
-      if (!isTracked) return 'pool not followed';
+      if (!isTracked) {
+        if (first === null) return 'pool not followed';
+        continue;
+      }
       const s = this.states.get(key);
-      if (s !== 'ready') return s === 'loading' ? 'pool loading' : 'pool unsure';
+      if (s !== 'ready') {
+        if (s === 'loading') this.noteWanted(key);
+        first ??= s === 'loading' ? 'pool loading' : 'pool unsure';
+      }
     }
-    return any ? null : 'no pools given';
+    return first ?? (any ? null : 'no pools given');
+  }
+
+  // A route pool a check found loading: wanted for COPY2_WANTED_S (bounded).
+  private noteWanted(key: string): void {
+    const ms = this.o.settings.wantedMs;
+    if (ms <= 0) return;
+    this.wanted.delete(key);               // re-insert = newest last
+    this.wanted.set(key, this.now());
+    while (this.wanted.size > 256) this.wanted.delete(this.wanted.keys().next().value as string);
+  }
+
+  // The wanted keys still fresh, newest first (at most 64 per status poll).
+  wantedKeys(): string[] {
+    const ms = this.o.settings.wantedMs, t = this.now();
+    for (const [k, at] of this.wanted) if (t - at >= ms) this.wanted.delete(k);
+    return [...this.wanted.keys()].reverse().slice(0, 64);
   }
 
   // The route's `at` for the fast check (state right after the newest block
@@ -1389,15 +1511,17 @@ export class Copy2Link {
   //       to node 30 (pool unsure 20, readiness too old 10); pool reports live: 5321 blocks passed on"
   hourText(): string | null {
     const h = this.hour;
-    this.hour = { fast: 0, notReady: {} };
+    this.hour = { fast: 0, notReady: {}, heldBack: 0 };
     if (this.o.settings.mode === 'off') return null;
     if (!this.sidecarOn) return 'copy 2: not running (fast check not in pool-events mode)';
     const c = this.statusCounts;
     const f = this.forwarder.counts;
     const node = Object.values(h.notReady).reduce((x, y) => x + y, 0);
     const whys = Object.entries(h.notReady).sort((a, b) => b[1] - a[1]).slice(0, 3).map(([w, n]) => `${w} ${n}`).join(', ');
+    const held = this.heldKeys.size;
     return [
       c ? `copy 2: ${c.ready} ready, ${c.unsure} unsure, ${c.loading} loading of ${c.tracked} pools` : `copy 2: following ${this.tracked.length} pools (readiness not reported)`,
+      ...(held || h.heldBack ? [`kept after leaving the watch list ${held}, came back while kept ${h.heldBack}`] : []),
       `routed to fast check ${h.fast}, to node ${node}${whys ? ` (${whys})` : ''}`,
       `pool reports ${this.forwarder.modeText()}: ${f.blocksSent} blocks passed on${f.msgsDropped ? `, ${f.msgsDropped} DROPPED` : ''}${f.gaps ? `, ${f.gaps} gaps` : ''}${f.late ? `, ${f.late} late` : ''}${f.backfills ? `, ${f.backfills} outages filled in` : ''}${f.backfillFails ? `, ${f.backfillFails} not filled` : ''}${f.noTimestamp ? `, ${f.noTimestamp} skipped (time / header unknown)` : ''}${f.headersFetched ? `, ${f.headersFetched} headers read from the node` : ''}${f.timesRead ? `, ${f.timesRead} block times read from the node` : ''}`,
       `forced reloads ${this.forwarder.forcedReloads()}${this.forwarder.forcedReloads() ? ` (${this.reloadWhys()})` : ''}`,

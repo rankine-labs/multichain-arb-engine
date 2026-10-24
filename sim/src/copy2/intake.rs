@@ -621,6 +621,11 @@ c2counters!(
     // re-listed and caught up from that pool's logs / given up (normal load)
     // / dropped after ARBSIM_COPY2_RESUME_MAX_BLOCKS.
     pools_parked, parked_resumed, parked_fallback, parked_expired,
+    // ---- copy2-relist (live Oct 24: 59 % of fire-first triggers hit a
+    // route pool that was reloading after being listed again) ----
+    // Pools loaded ahead of the others because the bot's checks were
+    // waiting for them (status `wanted`).
+    wanted_loads,
 );
 
 fn inc(c: &AtomicU64) {
@@ -720,6 +725,64 @@ pub struct C2Shared {
     /// Warm restart (status `resume`): the saved file, the last save, the
     /// current / last catch-up.
     pub resume: Mutex<serde_json::Map<String, Value>>,
+    /// Route pools the bot's recent checks found "loading" (status
+    /// `wanted`, see Copy2Handle::note_wanted) -> when last named. Loads
+    /// pick these first (dispatch_loads). Bounded (WANTED_MAX), forgotten
+    /// after WANTED_FOR.
+    pub wanted: Mutex<Wanted>,
+}
+
+/// Wanted pools by contract address (V2 / V3 / Solidly / Algebra) or V4
+/// pool id, with when the bot last named them.
+#[derive(Default)]
+pub struct Wanted {
+    pub addrs: HashMap<Address, Instant>,
+    pub ids: HashMap<B256, Instant>,
+}
+
+/// A wanted hint counts this long after the bot last named the pool.
+const WANTED_FOR: Duration = Duration::from_secs(60);
+/// At most this many wanted pools are remembered.
+const WANTED_MAX: usize = 512;
+/// Load jobs for wanted pools may go this many above ARBSIM_COPY2_INFLIGHT.
+const WANTED_EXTRA_JOBS: usize = 2;
+
+impl Wanted {
+    /// Is this pool wanted right now?
+    pub fn has(&self, p: &TrackedPool, now: Instant) -> bool {
+        let fresh = |t: &Instant| now.saturating_duration_since(*t) < WANTED_FOR;
+        match p.v4_id {
+            Some(id) => self.ids.get(&id).is_some_and(fresh),
+            None => self.addrs.get(&p.address).is_some_and(fresh),
+        }
+    }
+    /// Forget stale hints; keep at most WANTED_MAX (newest).
+    fn trim(&mut self, now: Instant) {
+        self.addrs.retain(|_, t| now.saturating_duration_since(*t) < WANTED_FOR);
+        self.ids.retain(|_, t| now.saturating_duration_since(*t) < WANTED_FOR);
+        while self.addrs.len() + self.ids.len() > WANTED_MAX {
+            let oldest_a = self.addrs.iter().min_by_key(|x| *x.1).map(|(k, t)| (*k, *t));
+            let oldest_i = self.ids.iter().min_by_key(|x| *x.1).map(|(k, t)| (*k, *t));
+            match (oldest_a, oldest_i) {
+                (Some(a), Some(i)) if a.1 <= i.1 => {
+                    self.addrs.remove(&a.0);
+                }
+                (_, Some(i)) => {
+                    self.ids.remove(&i.0);
+                }
+                (Some(a), None) => {
+                    self.addrs.remove(&a.0);
+                }
+                (None, None) => break,
+            }
+        }
+    }
+    pub fn len(&self) -> usize {
+        self.addrs.len() + self.ids.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -990,6 +1053,29 @@ impl Copy2Handle {
             // message's prevBlock check reloads everything.
             inc(&self.c2.stats.dropped_msgs);
         }
+    }
+
+    /// The bot's `wanted` hint (sent with its status poll): route pools its
+    /// recent checks found "loading" (pool addresses, V4 pool ids). They
+    /// load before other waiting pools. Only an order hint: nothing about
+    /// how a pool is loaded or when it counts as ready changes.
+    pub fn note_wanted(&self, v: Option<&Value>) {
+        let Some(list) = v.and_then(|x| x.as_array()) else { return };
+        let now = Instant::now();
+        let mut w = self.c2.wanted.lock().unwrap();
+        for s in list.iter().filter_map(|x| x.as_str()).take(WANTED_MAX) {
+            let s = s.trim();
+            if s.len() == 66 {
+                if let Ok(id) = s.parse::<B256>() {
+                    w.ids.insert(id, now);
+                }
+            } else if s.len() == 42 {
+                if let Ok(a) = s.parse::<Address>() {
+                    w.addrs.insert(a, now);
+                }
+            }
+        }
+        w.trim(now);
     }
 
     /// `track` request -> answer.
@@ -1470,6 +1556,20 @@ pub struct C2Config {
     /// A catch-up not done after this long gives up (normal load / reload)
     /// [ARBSIM_COPY2_RESUME_TIMEOUT_S, 120].
     pub resume_timeout_s: u64,
+    /// DROP GRACE (copy2-relist). A ready pool the bot stops listing is
+    /// parked (kept aside, see "parking"); for this long it stays
+    /// resumable: the kept reports reaching back to it are held even past
+    /// ARBSIM_COPY2_MAX_KEEP_LOGS [ARBSIM_COPY2_DROP_GRACE_S, 1800; 0 = the
+    /// old limits]. Bounded: at most [ARBSIM_COPY2_DROP_GRACE_MAX, 400]
+    /// parked pools (oldest given up first) and at most
+    /// [ARBSIM_COPY2_DROP_GRACE_MAX_LOGS, 400000; ~190 bytes each = ~76 MB]
+    /// reports kept in all (past that the oldest blocks go and the parked
+    /// pools that needed them load normally when listed again).
+    /// (The bot side keeps such pools on its follow list for
+    /// COPY2_DROP_GRACE_S too, so normally they are never parked at all.)
+    pub drop_grace_s: u64,
+    pub drop_grace_max: usize,
+    pub drop_grace_max_logs: usize,
 }
 
 impl C2Config {
@@ -1501,10 +1601,13 @@ impl C2Config {
             resume_overlap: env_u64("ARBSIM_COPY2_RESUME_OVERLAP_BLOCKS", 64).max(1),
             resume_range: env_u64("ARBSIM_COPY2_RESUME_RANGE", 500).max(1),
             resume_timeout_s: env_u64("ARBSIM_COPY2_RESUME_TIMEOUT_S", 120).max(1),
+            drop_grace_s: env_u64("ARBSIM_COPY2_DROP_GRACE_S", 1800),
+            drop_grace_max: env_u64("ARBSIM_COPY2_DROP_GRACE_MAX", 400).min(100_000) as usize,
+            drop_grace_max_logs: env_u64("ARBSIM_COPY2_DROP_GRACE_MAX_LOGS", 400_000).max(1000) as usize,
         }
     }
     pub fn for_tests() -> Self {
-        C2Config { reload_ms: 0, reload_max_ms: 0, layout_retry_s: 3600, load_batch: 25, loaders: 2, keep_blocks: 400, max_keep_blocks: 4000, max_rounds: 40, tip_every_s: 0, catchup_max_blocks: 64, walk: WalkCfg::default(), walks_inflight: 2, walk_max_slots: 1_000_000, walk_max_rss_mb: 0, max_keep_logs: 1_000_000, pending_ms: 300, pm_bound: true, verify_every_s: 0, verify_max: 400, stall_s: 30, state_file: None, save_every_s: 3600, resume_max_blocks: 18_000, resume_overlap: 64, resume_range: 500, resume_timeout_s: 60 }
+        C2Config { reload_ms: 0, reload_max_ms: 0, layout_retry_s: 3600, load_batch: 25, loaders: 2, keep_blocks: 400, max_keep_blocks: 4000, max_rounds: 40, tip_every_s: 0, catchup_max_blocks: 64, walk: WalkCfg::default(), walks_inflight: 2, walk_max_slots: 1_000_000, walk_max_rss_mb: 0, max_keep_logs: 1_000_000, pending_ms: 300, pm_bound: true, verify_every_s: 0, verify_max: 400, stall_s: 30, state_file: None, save_every_s: 3600, resume_max_blocks: 18_000, resume_overlap: 64, resume_range: 500, resume_timeout_s: 60, drop_grace_s: 1800, drop_grace_max: 400, drop_grace_max_logs: 1_000_000 }
     }
 }
 
@@ -1791,6 +1894,7 @@ pub fn manual(sh: Arc<Shared>, fills: Arc<FillQueue>, cfg: C2Config) -> (Intake,
         core: Mutex::new(Arc::new(super::checkcore::CheckCore::default())),
         mirror: sh.clone(),
         resume: Mutex::new(serde_json::Map::new()),
+        wanted: Mutex::new(Wanted::default()),
     });
     let loaders = sh
         .node
@@ -2432,15 +2536,33 @@ impl Intake {
             self.buf.pop_front();
         }
         // Memory bound in reports (see C2Config::max_keep_logs): only blocks
-        // beyond the always-kept keep_blocks are dropped.
+        // beyond the always-kept keep_blocks are dropped. Drop grace: a
+        // block a parked pool (within ARBSIM_COPY2_DROP_GRACE_S) still needs
+        // to be resumed is kept up to the larger drop_grace_max_logs.
         if self.buf.len() > self.cfg.keep_blocks {
+            let grace_from = self.grace_from();
+            let hard = self.cfg.max_keep_logs.max(self.cfg.drop_grace_max_logs);
             let mut total: usize = self.buf.iter().map(|b| b.logs.len()).sum();
-            while total > self.cfg.max_keep_logs && self.buf.len() > self.cfg.keep_blocks {
+            while self.buf.len() > self.cfg.keep_blocks {
+                let pinned = self.buf.front().is_some_and(|b| b.block >= grace_from);
+                if !(total > hard || (total > self.cfg.max_keep_logs && !pinned)) {
+                    break;
+                }
                 if let Some(b) = self.buf.pop_front() {
                     total -= b.logs.len();
                 }
             }
         }
+    }
+
+    /// Oldest block a parked pool within the drop grace needs kept to be
+    /// resumed (u64::MAX: none, or drop grace off).
+    fn grace_from(&self) -> u64 {
+        if self.cfg.drop_grace_s == 0 {
+            return u64::MAX;
+        }
+        let grace = Duration::from_secs(self.cfg.drop_grace_s);
+        self.parked.values().chain(self.resuming.values()).filter(|p| p.since.elapsed() < grace).map(|p| p.from).min().unwrap_or(u64::MAX)
     }
 
     /// Reports for block `n` (already applied) that we may not have had.
@@ -3184,11 +3306,18 @@ impl Intake {
         }
         // Bulk work in flight at most ~2 s of copy 2's call budget (pools then
         // finish steadily instead of in late lumps), at least 2 jobs.
-        // At most one queued/running load job per worker.
+        // At most one queued/running load job per worker (wanted pools, see
+        // below, may use WANTED_EXTRA_JOBS more).
         let max_jobs = self.cfg.loaders;
-        if self.load_jobs_in_flight() >= max_jobs || self.refusing_now() {
+        if self.load_jobs_in_flight() >= max_jobs + WANTED_EXTRA_JOBS || self.refusing_now() {
             return;
         }
+        // Route pools the bot's checks are waiting for (status `wanted`).
+        let wanted = {
+            let mut w = self.c2.wanted.lock().unwrap();
+            w.trim(now);
+            std::mem::take(&mut *w)
+        };
         // "Not found" is asked again after a while (it may have been a bad moment).
         {
             let mut reg = crate::timing::TimedWrite::new(&self.c2.reg);
@@ -3223,7 +3352,8 @@ impl Intake {
         // Pools ready to load (both coins' balance places known); pools that
         // had events most recently first (they matter most), then by wait.
         let mut traces: Vec<(Address, Address)> = Vec::new();
-        let mut due: Vec<(std::cmp::Reverse<u64>, Instant, PoolKey)> = {
+        // (not wanted, most recent event first, waited longest, key)
+        let mut due: Vec<(bool, std::cmp::Reverse<u64>, Instant, PoolKey)> = {
             let mut reg = crate::timing::TimedWrite::new(&self.c2.reg);
             let layouts = reg.layouts.clone();
             let pairs = reg.pair_slots.clone();
@@ -3260,10 +3390,20 @@ impl Intake {
                     continue;
                 }
                 let active = self.touched_addr.get(&e.pool.address).copied().unwrap_or(0);
-                d.push((std::cmp::Reverse(active), e.retry_at, *k));
+                d.push((!wanted.has(&e.pool, now), std::cmp::Reverse(active), e.retry_at, *k));
             }
             d
         };
+        // Put the hints back (unless the bot sent newer ones meanwhile).
+        {
+            let mut w = self.c2.wanted.lock().unwrap();
+            for (a, t) in wanted.addrs {
+                w.addrs.entry(a).or_insert(t);
+            }
+            for (i, t) in wanted.ids {
+                w.ids.entry(i).or_insert(t);
+            }
+        }
         traces.sort();
         traces.dedup();
         for pair in traces {
@@ -3278,8 +3418,25 @@ impl Intake {
             let id = self.new_job(JobFor::Trace);
             self.loaders.as_ref().unwrap().send(Job::Trace { id, block: head.block, coin: pair.0, holder: pair.1 });
         }
+        // Wanted pools first (false < true), then pools that had events most
+        // recently, then by wait.
         due.sort();
-        let mut due = due.into_iter().map(|x| x.2).peekable();
+        // Wanted pools: their own small jobs on the urgent lane, allowed a
+        // little above the usual job limit, so a check waiting for one is
+        // not stuck behind a round of quiet pools.
+        let n_wanted = due.iter().take_while(|x| !x.0).count();
+        let mut due = due.into_iter().map(|x| x.3).peekable();
+        let mut left_wanted = n_wanted;
+        let per_wanted = self.cfg.load_batch.min(2);
+        while left_wanted > 0 && self.load_jobs_in_flight() < max_jobs + WANTED_EXTRA_JOBS {
+            let keys: Vec<PoolKey> = due.by_ref().take(per_wanted.min(left_wanted)).collect();
+            left_wanted -= keys.len();
+            add(&self.c2.stats.wanted_loads, keys.len() as u64);
+            self.send_load_lane(&keys, head.block, &head.snap, false);
+        }
+        if left_wanted > 0 {
+            return; // never let a quiet pool go before a wanted one
+        }
         // Small jobs (~2 s of copy 2's call budget, ~3 requests per pool) keep
         // the pacing smooth; never more than load_batch pools.
         let per_job = self.cfg.load_batch;
@@ -3293,6 +3450,12 @@ impl Intake {
     /// its swap reads (load_slots), what it held before, its coins' code and
     /// its balance of each coin (or a trace to find where that balance is).
     fn send_load(&mut self, keys: &[PoolKey], block: u64, head: &Snapshot) {
+        self.send_load_lane(keys, block, head, true)
+    }
+
+    /// send_load on a chosen loader lane (`bulk` false = the urgent lane,
+    /// for pools a check is waiting for).
+    fn send_load_lane(&mut self, keys: &[PoolKey], block: u64, head: &Snapshot, bulk: bool) {
         let mut items: Vec<MissItem> = Vec::new();
         let mut calls: Vec<(Address, Bytes)> = Vec::new();
         let mut reqs = Vec::new();
@@ -3378,7 +3541,7 @@ impl Intake {
         add(&self.c2.stats.loads, reqs.len() as u64);
         let id = self.new_job(JobFor::Load { pools: reqs, want: block });
         // At most `block`: the loader uses an older block if the node isn't there yet.
-        self.loaders.as_ref().unwrap().send(Job::Fetch { id, block, exact: false, bulk: true, items, calls });
+        self.loaders.as_ref().unwrap().send(Job::Fetch { id, block, exact: false, bulk, items, calls });
     }
 
     // ---- node answers ----
@@ -5692,6 +5855,9 @@ impl Intake {
         let from = self.overlap_from(at);
         self.parked.insert(k, Parked { entry: e.clone(), at, from, last_pos: self.last_pos.get(&k).copied(), slots, basics, late_seen: false, since: Instant::now(), retry: Instant::now() });
         self.last_pos.remove(&k);
+        let before = self.parked.len();
+        self.cap_parked();
+        add(&self.c2.stats.parked_expired, (before - self.parked.len()) as u64);
     }
 
     /// A report for block `n` (late) about a parked pool: its kept values
@@ -5711,14 +5877,48 @@ impl Intake {
         }
     }
 
-    /// Parked pools kept longer than the catch-up limit are dropped (they
-    /// load normally if listed again).
+    /// Parked pools kept longer than the catch-up limit, longer than the
+    /// drop grace, or whose kept reports no longer reach back to them (they
+    /// could not be resumed anyway) are dropped: they load normally if
+    /// listed again. At most ARBSIM_COPY2_DROP_GRACE_MAX stay (the most
+    /// recently parked).
     fn expire_parked(&mut self) {
         let Some(last) = self.last_block else { return };
         let max = self.cfg.resume_max_blocks;
+        let keep_for = if self.cfg.drop_grace_s > 0 { Duration::from_secs(self.cfg.drop_grace_s) } else { Duration::from_secs(6 * 3600) };
+        let front = self.buf.front().map(|b| b.block);
         let before = self.parked.len();
-        self.parked.retain(|_, p| last.saturating_sub(p.at) <= max && p.since.elapsed() < Duration::from_secs(6 * 3600));
+        self.parked.retain(|_, p| last.saturating_sub(p.at) <= max && p.since.elapsed() < keep_for && front.is_some_and(|f| f <= p.from));
+        self.cap_parked();
         add(&self.c2.stats.parked_expired, (before - self.parked.len()) as u64);
+        // Status `resume.parked` (once a minute): what is kept aside now.
+        let kept_reports: usize = self.buf.iter().map(|b| b.logs.len()).sum();
+        let wanted = self.c2.wanted.lock().unwrap().len();
+        self.set_resume(
+            "parked",
+            json!({
+                "pools": self.parked.len(),
+                "resuming": self.resuming.len(),
+                "dropGraceS": self.cfg.drop_grace_s,
+                "keptBlocks": self.buf.len(),
+                "keptReports": kept_reports,
+                "wantedHints": wanted,
+            }),
+        );
+    }
+
+    /// Count bound on parked pools (ARBSIM_COPY2_DROP_GRACE_MAX; drop grace
+    /// on): the longest parked are given up first.
+    fn cap_parked(&mut self) {
+        if self.cfg.drop_grace_s == 0 || self.parked.len() <= self.cfg.drop_grace_max {
+            return;
+        }
+        let mut by_age: Vec<(Instant, PoolKey)> = self.parked.iter().map(|(k, p)| (p.since, *k)).collect();
+        by_age.sort();
+        let extra = self.parked.len() - self.cfg.drop_grace_max;
+        for (_, k) in by_age.into_iter().take(extra) {
+            self.parked.remove(&k);
+        }
     }
 
     /// Send the log read for every parked pool listed again.

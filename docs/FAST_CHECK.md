@@ -142,7 +142,13 @@ headers off: wait for a block's time from the feed), `COPY2_TICK_MS` (250,
 headers off: quiet-block tick, 0 = none), `COPY2_HEADERLESS_MAX_MS` (1500,
 headers on), `COPY2_WSS_MAX_PCT` (80, 0 = no copy-2 limit), `COPY2_STATUS_MS` (2000),
 `COPY2_MAX_STATUS_AGE_MS` (10000), `COPY2_BACKFILL_MAX` (200),
-`ARBSIM_L2_BLOCK_OFFSET` (0 on Robinhood).
+`ARBSIM_L2_BLOCK_OFFSET` (0 on Robinhood), `COPY2_DROP_GRACE_S` (1800: a
+pool that leaves the watch list stays followed, and in the WebSocket
+subscription, this long, so it is still ready when it comes back; 0 = drop
+at once; falls back to `ARBSIM_COPY2_DROP_GRACE_S`), `COPY2_DROP_GRACE_MAX`
+(300 such pools at most), `COPY2_WANTED_S` (60: route pools a check found
+"loading" are sent with the status poll for this long, and the fast check
+loads them first; 0 = never).
 
 Log lines start with `[copy2]`; the `[blockreader]` line shows
 `copy 2 events live (N logs, M headers)` (M = 0 with headers off).
