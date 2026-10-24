@@ -90,6 +90,7 @@ import { PairWatcher, Venue, refreshPoolState, refreshPoolsBatch } from './core/
 import { scanUniverse, emptyScanState, loadScanStateFile, ScanState, stateToPools, stateToPoolsSteps, scanPoolRefs, getLogsAdaptive, RawLog } from './core/universeScan';
 import { CrossQuoteMonitor, LoopMonitor, shouldScheduleFirstLoopReport } from './core/crossQuoteMonitor';
 import { NewPoolWatch } from './core/newPoolWatch';
+import { V4EventDiscovery, V4PoolIndex, setV4EventIndex, makeV4InitGetLogs, countWatchedV4BySource, v4DiscoverConfig } from './core/v4EventDiscovery';
 import { buildTokenGroups, loadTokenGroups, groupsStatusLine, TokenGroupsResult } from './core/tokenGroups';
 import { readFileSync, writeFileSync, mkdirSync, renameSync, existsSync } from 'fs';
 import { ROBINHOOD_SCAN_FACTORIES } from './config/knownAddresses';
@@ -113,7 +114,7 @@ import type { ExecutorHop } from './execution/executorCalldata';
 import { RivalWatch } from './core/rivalWatch';
 import { V3BalanceBook, V3_BALANCES_FILE } from './core/v3BalanceBook';
 import { extraWatcherVenues, extraScanFactories, isExecutableVenue, canPracticeTestVenue, reportedVenueIds, venueShortName, setTestedVenuesLive } from './config/robinhoodVenues';
-import { practiceOnlyReason } from './config/v4Tiers';
+import { practiceOnlyReason, V4_LOOKUP_TIERS } from './config/v4Tiers';
 import { LiveCoinRule } from './core/liveCoins';
 import { checkDeployedContract } from './execution/contractMatch';
 import { VenueTally } from './core/venueTally';
@@ -1626,6 +1627,15 @@ const raceChecker = new RaceChecker((m, p) => robinhoodReadProvider.send(m, p as
 setInterval(labelled('race check', () => { void raceChecker.tick(); }), 5_000);
 // New pool counter (set up with the chain-wide scan further down; read by the reports).
 let newPoolWatchRef: NewPoolWatch | null = null;
+// V4 pools from Initialize events (core/v4EventDiscovery.ts); null when off.
+const v4DiscoverCfg = v4DiscoverConfig();
+let v4DiscoveryRef: V4EventDiscovery | null = null;
+// One status line: what the event reader knows, and how the watched V4 pools were found.
+const v4DiscoveryStatus = (): string | null => {
+      if (!v4DiscoveryRef) return null;
+      const pools = robinhoodWatcher.watchedPairPools().flat().map((k) => cache.get('robinhood', k)).filter((p): p is PoolState => !!p);
+      return v4DiscoveryRef.statusLine(countWatchedV4BySource(pools, V4_LOOKUP_TIERS));
+};
 
 // Live only: every real send and result goes to data/live-trades.jsonl (read
 // by the status page), and Telegram alerts fire when live sending pauses
@@ -4517,6 +4527,28 @@ await chainManager.startAll();
       setInterval(() => timed('new pool watch save', () => newPoolWatch.save(NEW_POOLS_FILE)), 10 * 60_000);
       newPoolWatchRef = newPoolWatch;
 
+      // UNISWAP V4 POOLS FROM EVENTS (core/v4EventDiscovery.ts, V4_DISCOVER_EVENTS,
+      // default on): every V4 pool's key from the PoolManager's Initialize
+      // events, so the pair watcher and the scan also find pools at fee
+      // settings the fee list doesn't have. History read once (saved, resumed
+      // after a restart), then one log request a minute. Free node, gentle
+      // scan lane only (never the price-read path or the paid node).
+      if (v4DiscoverCfg.enabled) {
+            const index = new V4PoolIndex(v4DiscoverCfg.maxPools);
+            const v4Discovery = new V4EventDiscovery({
+                  poolManager: ROBINHOOD_V4.POOL_MANAGER, index, file: 'data/v4-pools.json',
+                  fromBlock: v4DiscoverCfg.fromBlock, maxRange: v4DiscoverCfg.maxRange,
+                  getLogs: makeV4InitGetLogs((m, p) => robinhoodScanProvider.send(m, p as any[]), ROBINHOOD_V4.POOL_MANAGER),
+                  latestBlock: () => robinhoodScanProvider.getBlockNumber(),
+            });
+            setV4EventIndex(index, v4DiscoverCfg.maxPerPair);
+            v4DiscoveryRef = v4Discovery;
+            // First round (the history read) 90 s after start, then every minute.
+            setTimeout(() => { void timedAsync('v4 event discovery', () => v4Discovery.poll()); }, 90_000);
+            setInterval(() => { void timedAsync('v4 event discovery', () => v4Discovery.poll()); }, v4DiscoverCfg.pollMs);
+            setInterval(() => { void timedAsync('v4 event discovery save', () => v4Discovery.save()); }, 10 * 60_000);
+      }
+
       // COIN GROUPS (core/tokenGroups.ts): dollar coins, ETH, Bitcoin
       // versions, verified copies. Names only make a candidate; verified =
       // $10k+ pool against USDG/WETH and price within 2% of the group.
@@ -4605,6 +4637,8 @@ await chainManager.startAll();
             timed('loop monitor save', () => loopMonitor.save(LOOP_STATS_FILE));
             console.log(loopMonitor.statusLine());
             console.log(newPoolWatch.statusLine(newPoolWatch.summary(Date.now() - 3600_000)));
+            const v4Line = v4DiscoveryStatus();
+            if (v4Line) console.log(v4Line);
             if (tokenGroups) console.log(`[groups] ${groupsStatusLine(tokenGroups)}`);
       }, 15 * 60_000);
 
@@ -4948,6 +4982,9 @@ for (let i = 0; i < resolved.length; i++) {
                         // New pools this hour (core/newPoolWatch.ts), also one line for the status page.
                         const hourNewPools = newPoolWatchRef?.takeHour() ?? null;
                         if (hourNewPools && newPoolWatchRef) console.log(newPoolWatchRef.statusLine(hourNewPools));
+                        // V4 pools found by events vs by the fee list (core/v4EventDiscovery.ts).
+                        const v4HourLine = v4DiscoveryStatus();
+                        if (v4HourLine) console.log(v4HourLine);
                         // Loop numbers: from the loop worker by message when it runs (waits up to 3 s).
                         lastLoopSample = null; // filled by loopHourText when loop numbers arrive
                         const loopsHour = await loopHourText();

@@ -1,4 +1,5 @@
 import { V4_LOOKUP_TIERS } from '../config/v4Tiers';
+import { v4EventKeysFor } from './v4EventDiscovery';
 import { ethers } from 'ethers';
 import type { ScannedPool } from './universeScan';
 
@@ -93,7 +94,22 @@ export function v4Asks(pairs: { quote: string; other: string }[], weth: string, 
     const q = quote.toLowerCase(), o = other.toLowerCase();
     const variants: { c0: string; c1: string; native: boolean }[] = [q < o ? { c0: q, c1: o, native: false } : { c0: o, c1: q, native: false }];
     if (q === w) variants.push({ c0: ZERO, c1: o, native: true }); // most V4 ETH pools hold native ETH
-    for (const v of variants) for (const [fee, ts] of tiers) out.push({ quote: q, other: o, id: v4Id(v.c0, v.c1, fee, ts), c0: v.c0, c1: v.c1, fee, tickSpacing: ts, native: v.native });
+    const asked = new Set<string>();
+    for (const v of variants) for (const [fee, ts] of tiers) {
+      const id = v4Id(v.c0, v.c1, fee, ts);
+      asked.add(id);
+      out.push({ quote: q, other: o, id, c0: v.c0, c1: v.c1, fee, tickSpacing: ts, native: v.native });
+    }
+    // Plus the real pools found from V4's Initialize events at settings the
+    // list doesn't have (core/v4EventDiscovery.ts; empty when off). Every
+    // pair gets these: they are known pools, not guesses, so they cost one
+    // read each only where a pool really exists.
+    for (const k of v4EventKeysFor(q, o, w)) {
+      const id = v4Id(k.c0, k.c1, k.fee, k.tickSpacing);
+      if (asked.has(id)) continue;
+      asked.add(id);
+      out.push({ quote: q, other: o, id, c0: k.c0, c1: k.c1, fee: k.fee, tickSpacing: k.tickSpacing, native: k.native });
+    }
   }
   return out;
 }
