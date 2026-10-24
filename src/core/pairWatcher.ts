@@ -1,4 +1,5 @@
 import { V4_LOOKUP_TIERS } from '../config/v4Tiers';
+import { v4EventKeysFor } from './v4EventDiscovery';
 import type { V4ListedKey } from '../config/robinhoodHookedPools';
 import { readFileSync, writeFileSync, mkdirSync, renameSync } from 'fs';
 import { dirname } from 'path';
@@ -196,10 +197,25 @@ export async function discoverPairPoolsMulticall(
       const a = tokenA.toLowerCase(), b = tokenB.toLowerCase(), w = v.weth.toLowerCase();
       const variants: { c0: string; c1: string; native: boolean }[] = [a < b ? { c0: tokenA, c1: tokenB, native: false } : { c0: tokenB, c1: tokenA, native: false }];
       if (a === w || b === w) variants.push({ c0: ethers.ZeroAddress, c1: a === w ? tokenB : tokenA, native: true });
+      const asked = new Set<string>();
       for (const vr of variants) for (const [fee, tickSpacing] of V4_LOOKUP_TIERS) {
         const id = v4PoolId(vr.c0, vr.c1, fee, tickSpacing);
+        asked.add(id.toLowerCase());
         pend.push({ venue: v, kind: 'v4', id, fee, tickSpacing, native: vr.native, c0: vr.c0, c1: vr.c1,
           liqIdx: push(v.factory, encodeCallFast(iSV, 'getLiquidity', [id])), slotIdx: push(v.factory, encodeCallFast(iSV, 'getSlot0', [id])) });
+      }
+      // V4 pools found from the PoolManager's Initialize events
+      // (core/v4EventDiscovery.ts, V4_DISCOVER_EVENTS): settings the list
+      // above doesn't have. Asked the same way and read by the same code
+      // below, so they get the same filters as guessed pools. Ids already
+      // asked above are skipped (no duplicates). Empty when the feature is off.
+      for (const k of v4EventKeysFor(a, b, w)) {
+        const c0 = k.native ? ethers.ZeroAddress : ethers.getAddress(k.c0), c1 = ethers.getAddress(k.c1);
+        const id = v4PoolId(c0, c1, k.fee, k.tickSpacing);
+        if (asked.has(id.toLowerCase())) continue;
+        asked.add(id.toLowerCase());
+        pend.push({ venue: v, kind: 'v4', id, fee: k.fee, tickSpacing: k.tickSpacing, native: k.native, c0, c1,
+          liqIdx: push(v.factory, iSV.encodeFunctionData('getLiquidity', [id])), slotIdx: push(v.factory, iSV.encodeFunctionData('getSlot0', [id])) });
       }
     }
   }

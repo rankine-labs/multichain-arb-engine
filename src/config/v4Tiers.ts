@@ -23,6 +23,11 @@
 //   RH_V4_EXTRA_TIERS=0          look up only the 4 standard settings (old behaviour)
 //   RH_V4_MORE_TIERS=fee:ts,...  add more settings, e.g. "750:15,4000:80"
 //   RH_V4_EXTRA_LIVE=0           pools at the extra settings: practice only
+//   V4_EVENT_POOLS_LIVE=0        pools found ONLY from V4's Initialize events
+//                                (settings not in this file, core/v4EventDiscovery.ts):
+//                                practice only. Default: live, same rule as
+//                                the extra settings above (the contract's
+//                                hook-free V4 trade takes any fee / spacing).
 // ============================================================================
 
 export type V4Tier = [fee: number, tickSpacing: number];
@@ -76,6 +81,17 @@ export function parseTiers(raw: string | undefined): V4Tier[] {
   return out;
 }
 
+// Same as parseTiers but silent (used on every practice-only check).
+function parseTiersQuiet(raw: string | undefined): V4Tier[] {
+  if (!raw || !raw.trim()) return [];
+  const out: V4Tier[] = [];
+  for (const part of raw.split(',')) {
+    const m = part.trim().match(/^(\d+):(-?\d+)$/);
+    if (m) out.push([Number(m[1]), Number(m[2])]);
+  }
+  return out;
+}
+
 // The full list, standard first, no duplicates.
 export function buildLookupTiers(env: Record<string, string | undefined> = process.env): V4Tier[] {
   const list: V4Tier[] = [...STANDARD_V4_TIERS];
@@ -98,8 +114,15 @@ export function isStandardV4Tier(fee: number, tickSpacing: number): boolean {
 export function practiceOnlyReason(pool: { v4?: { fee: number; tickSpacing: number; hooks?: string } }, env: Record<string, string | undefined> = process.env): string | null {
   const v = pool.v4;
   if (!v) return null;
-  if (env.RH_V4_EXTRA_LIVE !== '0' && env.RH_V4_EXTRA_LIVE !== 'off') return null;
   const hookless = !v.hooks || /^0x0{40}$/i.test(v.hooks);
-  if (hookless && !isStandardV4Tier(v.fee, v.tickSpacing)) return `Uniswap V4 pool at a non-standard setting (${v.fee / 10_000}% / spacing ${v.tickSpacing}), practice only`;
+  if (!hookless) return null;
+  const off = (x: string | undefined) => x === '0' || x === 'off';
+  // Found only from Initialize events (a setting in neither list here nor
+  // RH_V4_MORE_TIERS): the owner can keep these practice only.
+  const listed = isStandardV4Tier(v.fee, v.tickSpacing) || EXTRA_V4_TIERS.some(([f, t]) => f === v.fee && t === v.tickSpacing)
+    || parseTiersQuiet(env.RH_V4_MORE_TIERS).some(([f, t]) => f === v.fee && t === v.tickSpacing);
+  if (!listed && off(env.V4_EVENT_POOLS_LIVE)) return `Uniswap V4 pool found from events at an unlisted setting (${v.fee / 10_000}% / spacing ${v.tickSpacing}), practice only (V4_EVENT_POOLS_LIVE=0)`;
+  if (!off(env.RH_V4_EXTRA_LIVE)) return null;
+  if (!isStandardV4Tier(v.fee, v.tickSpacing)) return `Uniswap V4 pool at a non-standard setting (${v.fee / 10_000}% / spacing ${v.tickSpacing}), practice only`;
   return null;
 }

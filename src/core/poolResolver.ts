@@ -1,5 +1,6 @@
 import { abiEncodeFast } from './abiLite';
 import { STANDARD_V4_TIERS, V4_LOOKUP_TIERS } from '../config/v4Tiers';
+import { v4EventKeysFor } from './v4EventDiscovery';
 import { ethers } from 'ethers';
 import { PoolState, ChainName } from './types';
 // Type-only (removed when compiled): the Kuru SDK and ethers v5 are only
@@ -550,25 +551,34 @@ export async function resolveAllV4Pools(
   variants.push(a < b ? { c0: tokenA, c1: tokenB, native: false } : { c0: tokenB, c1: tokenA, native: false });
   if (a === w || b === w) variants.push({ c0: ethers.ZeroAddress, c1: a === w ? tokenB : tokenA, native: true });
 
+  // Settings to ask about: the fee list for every variant, plus the pools
+  // found from Initialize events (core/v4EventDiscovery.ts; empty when off).
+  const asks: Array<{ v: { c0: string; c1: string; native: boolean }; fee: number; tickSpacing: number }> = [];
+  for (const v of variants) for (const [fee, tickSpacing] of V4_LOOKUP_TIERS) asks.push({ v, fee, tickSpacing });
+  const listed = new Set(asks.map((x) => `${x.v.native}|${x.fee}|${x.tickSpacing}`));
+  for (const k of v4EventKeysFor(tokenA, tokenB, weth)) {
+    if (listed.has(`${k.native}|${k.fee}|${k.tickSpacing}`)) continue;
+    const v = k.native ? variants.find((x) => x.native) : variants.find((x) => !x.native);
+    if (v) asks.push({ v, fee: k.fee, tickSpacing: k.tickSpacing });
+  }
+
   const out: PoolState[] = [];
-  for (const v of variants) {
-    for (const [fee, tickSpacing] of V4_LOOKUP_TIERS) {
-      try {
-        const id = v4PoolId(v.c0, v.c1, fee, tickSpacing);
-        const liquidity: bigint = await stateView.getLiquidity(id);
-        if (liquidity === 0n) continue;
-        const slot0 = await stateView.getSlot0(id);
-        out.push({
-          chain, dex, poolAddress: id, poolType: 'v3',
-          tokenA: v.native ? weth : v.c0, // currency0 side (WETH stands in for native ETH)
-          tokenB: v.c1,
-          sqrtPriceX96: slot0[0] as bigint, liquidity,
-          feeBps: Math.round(fee / 100), feePips: Number(fee),
-          lastUpdatedBlock: 0, lastUpdatedMs: Date.now(),
-          v4: { fee, tickSpacing, native: v.native, poolManager: ethers.getAddress(poolManager.toLowerCase()), stateView: ethers.getAddress(stateViewAddress.toLowerCase()) },
-        });
-      } catch { /* not readable: skip this one */ }
-    }
+  for (const { v, fee, tickSpacing } of asks) {
+    try {
+      const id = v4PoolId(v.c0, v.c1, fee, tickSpacing);
+      const liquidity: bigint = await stateView.getLiquidity(id);
+      if (liquidity === 0n) continue;
+      const slot0 = await stateView.getSlot0(id);
+      out.push({
+        chain, dex, poolAddress: id, poolType: 'v3',
+        tokenA: v.native ? weth : v.c0, // currency0 side (WETH stands in for native ETH)
+        tokenB: v.c1,
+        sqrtPriceX96: slot0[0] as bigint, liquidity,
+        feeBps: Math.round(fee / 100), feePips: Number(fee),
+        lastUpdatedBlock: 0, lastUpdatedMs: Date.now(),
+        v4: { fee, tickSpacing, native: v.native, poolManager: ethers.getAddress(poolManager.toLowerCase()), stateView: ethers.getAddress(stateViewAddress.toLowerCase()) },
+      });
+    } catch { /* not readable: skip this one */ }
   }
   return out;
 }
