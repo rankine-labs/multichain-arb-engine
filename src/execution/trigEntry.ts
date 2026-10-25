@@ -5,6 +5,46 @@ import { JsonlLog, LocalTrade, LocalSimOpts, reasonOf } from './localSimHost';
 import { TriggerFirst, TrigOutcome, TrigConfidence, TrigQuestion, CannedAnswer, CapturedCheck, checkSig, confidenceAtLeast } from './triggerFirst';
 import { loopLag } from '../core/loopLag';
 import { stallFinder, markStretch } from '../core/stallFinder';
+import * as fs from 'fs';
+
+// SEEN LOG (Oct 24, owner approved): one short line per feed transaction
+// fire-first looked at (or dropped): "<ms> <hash> <outcome>", outcome =
+// pools:<n> | no_pools | dropped | skipped is NOT written | <unknown reason>.
+// Lets us line up every rival win against what fire-first saw for the
+// trades before it in that block. TRIG_SEEN_LOG=<path> turns it on (e.g.
+// data/trig-seen.log); unset or 0 = off (tests never write it). Rotates at TRIG_SEEN_LOG_MB (100 MB, keeps
+// one .1 file). Buffered: written about once a second, never on the hot path.
+class SeenLog {
+  private buf: string[] = [];
+  private bytes = 0;
+  constructor(private readonly path: string, private readonly maxBytes: number) {
+    try { this.bytes = fs.statSync(path).size; } catch { this.bytes = 0; }
+    const t = setInterval(() => this.flush(), 1_000);
+    t.unref?.();
+  }
+  add(hash: string, outcome: string): void {
+    if (this.buf.length < 50_000) this.buf.push(`${Date.now()} ${hash} ${outcome}`);
+  }
+  private flush(): void {
+    if (!this.buf.length) return;
+    const text = this.buf.join('\n') + '\n';
+    this.buf = [];
+    try {
+      if (this.bytes + text.length > this.maxBytes) {
+        try { fs.renameSync(this.path, this.path + '.1'); } catch { /* first file */ }
+        this.bytes = 0;
+      }
+      fs.appendFile(this.path, text, () => { /* reporting only */ });
+      this.bytes += text.length;
+    } catch { /* reporting only */ }
+  }
+}
+function seenLogFromEnv(env: Record<string, string | undefined> = process.env): SeenLog | null {
+  const p = (env.TRIG_SEEN_LOG ?? '').trim();
+  if (!p || p === '0') return null;
+  const mb = Number(env.TRIG_SEEN_LOG_MB ?? 100);
+  return new SeenLog(p, (Number.isFinite(mb) && mb > 0 ? mb : 100) * 1_048_576);
+}
 
 // ============================================================================
 // TRIGGER-FIRST ENTRY POINT: every feed transaction is a possible trigger.
@@ -561,7 +601,7 @@ export class TrigEntry {
         // limit (TRIG_ENTRY_MAX_DISCOVER); only triggers that move our pools
         // take one of the TRIG_ENTRY_MAX_IN_FLIGHT check places (process).
         // Overloaded: drop (counted), never queue up behind the feed.
-        if (this.inFlight >= Math.max(this.settings.maxDiscover, this.settings.maxInFlight)) { this.hour.dropped++; continue; }
+        if (this.inFlight >= Math.max(this.settings.maxDiscover, this.settings.maxInFlight)) { this.hour.dropped++; this.seen?.add(t.hash.toLowerCase(), 'dropped'); continue; }
         this.inFlight++;
         const hash = t.hash.toLowerCase();
         const times: FrameTimes = { recv, parsed: hr?.parsed, queued: performance.now() };
@@ -581,13 +621,19 @@ export class TrigEntry {
   private checking = 0;
   checkingNow(): number { return this.checking; }
 
+  // SEEN LOG (see the top of the file): only with TRIG_SEEN_LOG set.
+  private readonly seen: SeenLog | null = seenLogFromEnv();
+
   async process(hash: string, seenMs: number, times?: FrameTimes): Promise<EntryRecord | null> {
-    const slot = { held: false };
+    const slot: { held: boolean; out?: string } = { held: false };
     try { return await this.processInner(hash, seenMs, times, slot); }
-    finally { if (slot.held) this.checking--; }
+    finally {
+      if (slot.held) this.checking--;
+      this.seen?.add(hash, slot.out ?? 'other');
+    }
   }
 
-  private async processInner(hash: string, seenMs: number, times: FrameTimes | undefined, slot: { held: boolean }): Promise<EntryRecord | null> {
+  private async processInner(hash: string, seenMs: number, times: FrameTimes | undefined, slot: { held: boolean; out?: string }): Promise<EntryRecord | null> {
     const s = this.settings;
     const h = this.hour;
     const deadlineAt = seenMs + s.deadlineMs;
@@ -595,7 +641,7 @@ export class TrigEntry {
     const rel = (x: number | undefined) => (x === undefined ? undefined : r2(x - T.recv));
     const hops: Hops = { parse: rel(T.parsed), queue: rel(T.queued), start: rel(performance.now()), lag: this.lagNow() };
     h.asked++;
-    const unknown = (why: string) => { h.unknownWhy[why] = (h.unknownWhy[why] ?? 0) + 1; return null; };
+    const unknown = (why: string) => { h.unknownWhy[why] = (h.unknownWhy[why] ?? 0) + 1; slot.out ??= why; return null; };
     // 1. DISCOVER: which of our pools does it move? (no node)
     const built = this.d.tf.buildFeed(hash, []);
     if ('why' in built) return unknown(`discover_${built.why}`);
@@ -661,7 +707,8 @@ export class TrigEntry {
     if (a.ok !== true) return unknown(`discover_${String(a.unknown ?? 'unknown')}`);
     h.discovered++;
     const pools = Array.isArray(a.pools) ? (a.pools as unknown[]).filter((x): x is string => typeof x === 'string').map((x) => x.toLowerCase()) : [];
-    if (!pools.length) return null; // doesn't move any pool we follow: nothing to do
+    if (!pools.length) { slot.out = 'no_pools'; return null; } // doesn't move any pool we follow: nothing to do
+    slot.out = `pools:${pools.length}`;
     h.touching++;
     // A check place (NO DROP above): all taken = too busy for this one.
     if (this.checking >= s.maxInFlight) { h.droppedBusy++; return unknown('busy_checking'); }
