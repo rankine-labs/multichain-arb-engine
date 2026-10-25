@@ -199,15 +199,22 @@ pub fn miss_json(m: &MissItem) -> Value {
 }
 
 /// Answer for "can't be sure".
+/// (Oct 25) `missingPre`: [[hash, word1, word2], ...] hex, only when the run
+/// recorded the inputs that name the missing slots (CheckUnknown.pre). The
+/// server reads it for copy 2 and takes it out before the bot sees the answer.
 pub fn unknown_json(id: &Value, u: &CheckUnknown, us: u128) -> Value {
-    serde_json::json!({
+    let mut v = serde_json::json!({
         "id": id,
         "ok": false,
         "unknown": u.reason.as_str(),
         "detail": u.detail,
         "missing": u.missing.iter().map(miss_json).collect::<Vec<_>>(),
         "us": us as u64,
-    })
+    });
+    if !u.pre.is_empty() {
+        v["missingPre"] = serde_json::json!(u.pre.iter().map(|(h, a, b)| [format!("{h:#x}"), format!("{a:#x}"), format!("{b:#x}")]).collect::<Vec<_>>());
+    }
+    v
 }
 
 /// Wire call -> CallReq (strict: bad hex = bad request).

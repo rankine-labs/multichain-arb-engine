@@ -39,7 +39,7 @@
 // ============================================================================
 use std::io::{Read, Write};
 
-use revm::primitives::B256;
+use revm::primitives::{B256, U256};
 use serde_json::{json, Value};
 
 pub use crate::check::proto_types::{CallRequest, SizeSearchRequest, WireCall, WireOutcome};
@@ -152,6 +152,22 @@ pub fn parse_missing(v: &Value) -> Vec<MissItem> {
             match m.get("slot").and_then(|x| x.as_str()).and_then(|s| parse_u256(s).ok()) {
                 Some(s) => out.push(MissItem::Slot(a, s)),
                 None => out.push(MissItem::Account(a)),
+            }
+        }
+    }
+    out
+}
+
+/// (Oct 25) The `missingPre` list of an unknown answer (check/proto_types.rs
+/// unknown_json): (hash, first input word, second input word). Bad entries
+/// are skipped; at most 256 read.
+pub fn parse_missing_pre(v: &Value) -> Vec<(U256, U256, U256)> {
+    let mut out = Vec::new();
+    if let Some(arr) = v.get("missingPre").and_then(|m| m.as_array()) {
+        for e in arr.iter().take(256) {
+            let w = |i: usize| e.get(i).and_then(|x| x.as_str()).and_then(|s| parse_u256(s).ok());
+            if let (Some(h), Some(a), Some(b)) = (w(0), w(1), w(2)) {
+                out.push((h, a, b));
             }
         }
     }

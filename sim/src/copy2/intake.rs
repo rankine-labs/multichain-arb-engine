@@ -626,6 +626,22 @@ c2counters!(
     // Pools loaded ahead of the others because the bot's checks were
     // waiting for them (status `wanted`).
     wanted_loads,
+    // ---- V4 blind spot (Oct 25, copy2/v4blind.rs) ----
+    // PoolManager values checks MISSED, by whose they are (one count per
+    // missed value per check): a tick / tick-map word of our pool beyond the
+    // walk (b) / a base field of our pool (loaded with it) / data of a V4
+    // pool we don't follow (a) / other PoolManager data (c) / not named
+    // (no hash inputs recorded: plain eth_call checks).
+    pm_miss_own_far, pm_miss_own_base, pm_miss_unfollowed, pm_miss_other, pm_miss_unknown,
+    // PoolManager slots newly named from checks' hash inputs.
+    pm_named,
+    // fill_refused_pm_slot split by the same classes (they add up to it).
+    pm_refused_own_far, pm_refused_unfollowed, pm_refused_other, pm_refused_unknown,
+    // Fix (b): far ticks / tick-map words of our ready V4 pools sent to the
+    // node / kept in the copy (followed with the pool from then on) / asked
+    // again (changed after the node's block) / dropped (pool no longer
+    // ready since the node's block).
+    pm_far_sent, pm_far_kept, pm_far_retry, pm_far_dropped,
 );
 
 fn inc(c: &AtomicU64) {
@@ -736,6 +752,10 @@ pub struct C2Shared {
     /// answer for a trigger that is ALREADY in the copy (live: those were
     /// given up as "already_in_copy" while rivals took the gap).
     pub recent_moves: Mutex<RecentMoves>,
+    /// V4 BLIND SPOT (Oct 25, copy2/v4blind.rs): whose PoolManager value each
+    /// missed slot is, the unfollowed V4 pools checks run into, and the
+    /// auto-follow list (status `v4Blind`). Lock order: after `reg`.
+    pub pm_book: Mutex<super::v4blind::PmBook>,
 }
 
 /// See C2Shared::recent_moves. Kept for the last RECENT_MOVES_BLOCKS blocks.
@@ -1274,6 +1294,78 @@ impl Copy2Handle {
         }
     }
 
+    /// V4 BLIND SPOT (Oct 25, copy2/v4blind.rs). A check missed these items;
+    /// `pre` = the recorded hash inputs that name the missing slots (empty
+    /// for checks that don't record them). For every missed PoolManager
+    /// slot: remember whose value it is (so the fill that follows can keep
+    /// a far tick of OUR pool), count it by class (status counters
+    /// pm_miss_*), and note V4 pools we don't follow (status
+    /// v4Blind.topUnfollowed; auto-follow list when that is on). Called for
+    /// every copy-2 check that missed something (all kinds), from the
+    /// check's own thread; never waits for the copy's thread (`core` is the
+    /// registry summary the check already used).
+    pub fn note_pm_pre(&self, core: &super::checkcore::CheckCore, missing: &[MissItem], pre: &[(U256, U256, U256)]) {
+        if core.pm_list.is_empty() || !missing.iter().any(|m| matches!(m, MissItem::Slot(a, _) if core.pm_list.contains(a))) {
+            return;
+        }
+        let pre_map: crate::check::moved::PreMap = pre.iter().map(|(h, a, b)| (*h, (*a, *b))).collect();
+        let st = &self.c2.stats;
+        let now = Instant::now();
+        let mut seen: Vec<B256> = Vec::new();
+        let mut book = self.c2.pm_book.lock().unwrap();
+        for m in missing {
+            let MissItem::Slot(a, s) = m else { continue };
+            if !core.pm_list.contains(a) {
+                continue;
+            }
+            let (owner, new) = book.learn(*a, *s, &pre_map);
+            if new {
+                inc(&st.pm_named);
+            }
+            let followed = |id: B256| core.v4.iter().any(|v| v.pool.address == *a && v.pool.v4_id == Some(id));
+            use super::v4blind::PmClass;
+            match super::v4blind::classify(owner, followed) {
+                PmClass::OwnFar(id) => {
+                    inc(&st.pm_miss_own_far);
+                    book.note_used(&id, now);
+                }
+                PmClass::OwnBase(id) => {
+                    inc(&st.pm_miss_own_base);
+                    // An auto-followed pool still loading is in use.
+                    book.note_used(&id, now);
+                }
+                PmClass::Unfollowed(id) => {
+                    inc(&st.pm_miss_unfollowed);
+                    // One count per pool per check.
+                    if !seen.contains(&id) {
+                        seen.push(id);
+                        book.note_unfollowed(*a, id, now);
+                    }
+                }
+                PmClass::Other => inc(&st.pm_miss_other),
+                PmClass::Unknown => inc(&st.pm_miss_unknown),
+            }
+        }
+    }
+
+    /// Trigger-first entry point (server.rs trig_discover): these followed
+    /// pools were moved by a feed transaction. An auto-followed one is in
+    /// use (stays on the auto-follow list, copy2/v4blind.rs).
+    pub fn note_moved(&self, keys: &[String]) {
+        if keys.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        let mut book = self.c2.pm_book.lock().unwrap();
+        for k in keys {
+            if k.len() == 66 {
+                if let Ok(id) = k.parse::<B256>() {
+                    book.note_used(&id, now);
+                }
+            }
+        }
+    }
+
     /// An unanswered check (server.rs): count its reason, and for a miss
     /// what it missed (one count per label per check; `only` when every
     /// missed value has the same label). Live Oct 22 the copy answered 4 of
@@ -1294,7 +1386,8 @@ impl Copy2Handle {
             // Status only: never wait for the copy's thread (see note_misses).
             let Ok(reg) = self.c2.reg.try_read() else { return };
             let checkers: Vec<Address> = self.c2.check_accounts.lock().unwrap().keys().copied().collect();
-            missing.iter().map(|m| miss_label(&reg, &checkers, &self.sh.volatile, m)).collect()
+            let book = self.c2.pm_book.lock().unwrap();
+            missing.iter().map(|m| miss_label(&reg, &checkers, &self.sh.volatile, Some(&book), m)).collect()
         };
         let mut b = self.c2.blocked_by.lock().unwrap();
         let only = labels.len() == 1;
@@ -1451,9 +1544,10 @@ impl Copy2Handle {
             let mut v: Vec<(&(String, Address, U256), &u64)> = ms.iter().collect();
             v.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
             let checkers: Vec<Address> = self.c2.check_accounts.lock().unwrap().keys().copied().collect();
+            let book = self.c2.pm_book.lock().unwrap();
             v.into_iter()
                 .take(20)
-                .map(|((c, a, sl), n)| json!([c, to_hex(a.as_slice()), format!("{sl:#x}"), n, describe_slot(&reg, &checkers, *a, *sl)]))
+                .map(|((c, a, sl), n)| json!([c, to_hex(a.as_slice()), format!("{sl:#x}"), n, describe_slot(&reg, &checkers, Some(&book), *a, *sl)]))
                 .collect()
         };
         let unfollowed_changed: Vec<Value> = {
@@ -1497,6 +1591,11 @@ impl Copy2Handle {
             // ARBSIM_COPY2_VERIFY_S: [account, slot, times the chain had
             // changed one] (should stay empty; anything here: tell Claude).
             "unfollowedChanged": unfollowed_changed,
+            // V4 BLIND SPOT (Oct 25, copy2/v4blind.rs): settings, the V4
+            // pools we don't follow that checks ran into most, and the
+            // auto-follow list the bot reads (autoFollow.ids). The counts
+            // per class are counters pm_miss_* / pm_refused_* / pm_far_*.
+            "v4Blind": self.c2.pm_book.lock().unwrap().status(Instant::now()),
             "outsideContracts": self.sh.volatile.whole_len(),
             // Warm restart (copy2/persist.rs): saved file, last save, catch-up.
             "resume": Value::Object(self.c2.resume.lock().unwrap().clone()),
@@ -1645,6 +1744,10 @@ pub struct C2Config {
     pub drop_grace_s: u64,
     pub drop_grace_max: usize,
     pub drop_grace_max_logs: usize,
+    /// V4 blind spot (Oct 25): far ticks of our V4 pools kept
+    /// [ARBSIM_V4_FAR_FILL, 1], auto-follow list [ARBSIM_V4_AUTOFOLLOW, 0]
+    /// and their limits (copy2/v4blind.rs header).
+    pub blind: super::v4blind::BlindCfg,
 }
 
 impl C2Config {
@@ -1679,10 +1782,11 @@ impl C2Config {
             drop_grace_s: env_u64("ARBSIM_COPY2_DROP_GRACE_S", 1800),
             drop_grace_max: env_u64("ARBSIM_COPY2_DROP_GRACE_MAX", 400).min(100_000) as usize,
             drop_grace_max_logs: env_u64("ARBSIM_COPY2_DROP_GRACE_MAX_LOGS", 400_000).max(1000) as usize,
+            blind: super::v4blind::BlindCfg::from_env(),
         }
     }
     pub fn for_tests() -> Self {
-        C2Config { reload_ms: 0, reload_max_ms: 0, layout_retry_s: 3600, load_batch: 25, loaders: 2, keep_blocks: 400, max_keep_blocks: 4000, max_rounds: 40, tip_every_s: 0, catchup_max_blocks: 64, walk: WalkCfg::default(), walks_inflight: 2, walk_max_slots: 1_000_000, walk_max_rss_mb: 0, max_keep_logs: 1_000_000, pending_ms: 300, pm_bound: true, verify_every_s: 0, verify_max: 400, stall_s: 30, state_file: None, save_every_s: 3600, resume_max_blocks: 18_000, resume_overlap: 64, resume_range: 500, resume_timeout_s: 60, drop_grace_s: 1800, drop_grace_max: 400, drop_grace_max_logs: 1_000_000 }
+        C2Config { reload_ms: 0, reload_max_ms: 0, layout_retry_s: 3600, load_batch: 25, loaders: 2, keep_blocks: 400, max_keep_blocks: 4000, max_rounds: 40, tip_every_s: 0, catchup_max_blocks: 64, walk: WalkCfg::default(), walks_inflight: 2, walk_max_slots: 1_000_000, walk_max_rss_mb: 0, max_keep_logs: 1_000_000, pending_ms: 300, pm_bound: true, verify_every_s: 0, verify_max: 400, stall_s: 30, state_file: None, save_every_s: 3600, resume_max_blocks: 18_000, resume_overlap: 64, resume_range: 500, resume_timeout_s: 60, drop_grace_s: 1800, drop_grace_max: 400, drop_grace_max_logs: 1_000_000, blind: super::v4blind::BlindCfg::for_tests() }
     }
 }
 
@@ -1971,6 +2075,7 @@ pub fn manual(sh: Arc<Shared>, fills: Arc<FillQueue>, cfg: C2Config) -> (Intake,
         resume: Mutex::new(serde_json::Map::new()),
         wanted: Mutex::new(Wanted::default()),
         recent_moves: Mutex::new(RecentMoves::default()),
+        pm_book: Mutex::new(super::v4blind::PmBook::new(cfg.blind.clone())),
     });
     let loaders = sh
         .node
@@ -4846,6 +4951,7 @@ impl Intake {
         let Some(head) = self.sh.head() else { return };
         let (ok, refused): (Vec<MissItem>, Vec<MissItem>) = {
             let reg = self.c2.reg.read().unwrap();
+            let book = self.c2.pm_book.lock().unwrap();
             let vol = &self.sh.volatile;
             let st = &self.c2.stats;
             items.into_iter().filter(|m| needs(&head.snap, m)).partition(|m| match m {
@@ -4861,9 +4967,34 @@ impl Intake {
                 // pools: another pool's data (or beyond our walk). The fill
                 // used to put it into the copy as if followed by ALL our V4
                 // pools: a stale value as soon as that pool traded.
+                // V4 BLIND SPOT (Oct 25, copy2/v4blind.rs): a check named
+                // whose value it is. A tick / tick-map word of ONE of our
+                // READY pools (beyond its walk) is fetched and kept with
+                // that pool (on_fill); everything else is still refused,
+                // counted by class.
                 MissItem::Slot(a, s) if reg.pm_bound && reg.is_pm(a) && !reg.is_pm_base_slot(*a, *s) => {
-                    inc(&st.fill_refused_pm_slot);
-                    false
+                    use super::v4blind::PmClass;
+                    let owner = book.owner(*a, *s);
+                    let class = super::v4blind::classify(owner, |id| reg.pools.contains_key(&(*a, Some(id))));
+                    let keep = match class {
+                        PmClass::OwnFar(id) => {
+                            let room = |e: &PoolEntry| e.items.iter().filter(|(x, _)| x == a).count() < book.cfg.far_max_per_pool;
+                            book.cfg.far_fill && reg.pools.get(&(*a, Some(id))).is_some_and(|e| e.state == PoolState::Ready && room(e))
+                        }
+                        _ => false,
+                    };
+                    if keep {
+                        inc(&st.pm_far_sent);
+                    } else {
+                        inc(&st.fill_refused_pm_slot);
+                        inc(match class {
+                            PmClass::OwnFar(_) | PmClass::OwnBase(_) => &st.pm_refused_own_far,
+                            PmClass::Unfollowed(_) => &st.pm_refused_unfollowed,
+                            PmClass::Other => &st.pm_refused_other,
+                            PmClass::Unknown => &st.pm_refused_unknown,
+                        });
+                    }
+                    keep
                 }
                 MissItem::Slot(a, s) => match Self::gate_of(&reg, *a, *s) {
                     Some(g) => reg.blocked_account(&g).is_none(),
@@ -4912,6 +5043,43 @@ impl Intake {
                     Err(_) => continue,
                 };
                 if let Fetched::Slot(a, s, v) = &f {
+                    // V4 BLIND SPOT fix (b) (Oct 25, copy2/v4blind.rs): a
+                    // tick / tick-map word of ONE of our V4 pools, beyond its
+                    // walk (dispatch_fills only sends these). Kept exactly
+                    // like a walked value: if that pool has been READY since
+                    // the node's block k, every one of its events after k is
+                    // in the copy, and none of them touched this value (a
+                    // replay that needs a value the copy doesn't hold asks
+                    // for it first, which takes the pool out of ready and
+                    // moves its ready block past k). From now on the pool's
+                    // events keep it current, and it is forgotten with the
+                    // pool's other values if the pool goes unsure.
+                    if reg.pm_bound && reg.is_pm(a) && !reg.is_pm_base_slot(*a, *s) {
+                        use crate::check::moved::V4Part;
+                        let owner = self.c2.pm_book.lock().unwrap().owner(*a, *s);
+                        let Some((id, V4Part::Tick | V4Part::Bitmap)) = owner else {
+                            inc(&self.c2.stats.pm_far_dropped);
+                            continue;
+                        };
+                        let pk: PoolKey = (*a, Some(id));
+                        if !reg.pools.get(&pk).is_some_and(|e| e.state == PoolState::Ready && e.ready_since <= k) {
+                            inc(&self.c2.stats.pm_far_dropped);
+                            continue; // refused: the pool isn't followed right now
+                        }
+                        if self.touched_slot.get(&(*a, *s)).is_some_and(|b| *b > k) {
+                            inc(&self.c2.stats.pm_far_retry);
+                            again.push(it);
+                            continue;
+                        }
+                        if let Some(e) = reg.pools.get_mut(&pk) {
+                            e.items.insert((*a, *s));
+                        }
+                        let lp = self.last_pos.entry(pk).or_insert((0, 0, 0));
+                        *lp = (*lp).max((k, END, END));
+                        inc(&self.c2.stats.pm_far_kept);
+                        good.push(f);
+                        continue;
+                    }
                     // A followed pool's coin balance (live Oct 22: WETH/USDG
                     // 0x52e65b17 trades every few blocks, so "nothing touched
                     // it since k" almost never held and its balance stayed
@@ -6501,7 +6669,7 @@ fn current_tick(p: &TrackedPool, s: &Snapshot) -> Option<i64> {
 /// Short label of a missed item for `checks.blockedBy`: the class (as
 /// missesByClass) and, for a slot, what it is (describe_slot), with long
 /// hex numbers cut to their first 10 characters (bounded, still telling).
-fn miss_label(reg: &Registry, checkers: &[Address], vol: &crate::state::snap::Volatile, m: &MissItem) -> String {
+fn miss_label(reg: &Registry, checkers: &[Address], vol: &crate::state::snap::Volatile, book: Option<&super::v4blind::PmBook>, m: &MissItem) -> String {
     let (a, what) = match m {
         MissItem::Account(a) => (*a, "basics"),
         MissItem::Slot(a, _) => (*a, "slot"),
@@ -6519,7 +6687,7 @@ fn miss_label(reg: &Registry, checkers: &[Address], vol: &crate::state::snap::Vo
         "other account"
     };
     let detail = match m {
-        MissItem::Slot(_, sl) => describe_slot(reg, checkers, a, *sl),
+        MissItem::Slot(_, sl) => describe_slot(reg, checkers, book, a, *sl),
         _ => String::new(),
     };
     let mut out = format!("{who} {what} {}", short_hex(&format!("{a:#x}")));
@@ -6553,7 +6721,7 @@ fn short_hex(t: &str) -> String {
 }
 
 /// What a missed value is, where we can tell (status missesTopSlots).
-fn describe_slot(reg: &Registry, checkers: &[Address], a: Address, sl: U256) -> String {
+fn describe_slot(reg: &Registry, checkers: &[Address], book: Option<&super::v4blind::PmBook>, a: Address, sl: U256) -> String {
     // A coin: whose balance?
     if reg.layouts.contains_key(&a) || reg.holders.contains_key(&a) {
         for pm in reg.pms() {
@@ -6611,6 +6779,15 @@ fn describe_slot(reg: &Registry, checkers: &[Address], a: Address, sl: U256) -> 
             if fields::map_slot(c, 1) == sl {
                 return format!("protocolFeesAccrued[{c}] (V4 protocol fee counter: swaps of every protocol-fee pool in that coin and fee collections, which leave no event, move it; not followed, fills refused; checks run with it 0 and not 0 and answer when only the gas differs, with the higher gas)");
             }
+        }
+        // V4 BLIND SPOT (Oct 25): named by a check's hash inputs (v4blind.rs).
+        if let Some(owner) = book.and_then(|b| b.owner(a, sl)) {
+            use super::v4blind::PmClass;
+            let class = super::v4blind::classify(Some(owner), |id| reg.pools.contains_key(&(a, Some(id))));
+            return match class {
+                PmClass::OwnFar(id) | PmClass::Unfollowed(id) | PmClass::OwnBase(id) => format!("{} {id}", class.label()),
+                _ => class.label().to_string(),
+            };
         }
         return "not a base slot / walked value of our V4 pools (another pool, a tick beyond our walk, claims ...)".into();
     }

@@ -45,6 +45,9 @@ pub mod persist;
 pub mod replay;
 // Tick walk: all the tick data a ready V3-style pool needs (one trace each).
 pub mod walk;
+// Whose PoolManager value a check missed; far ticks of our V4 pools kept;
+// V4 pools checks keep running into listed for auto-follow (Oct 25).
+pub mod v4blind;
 
 /// Which kind of pool (decides how its events are applied).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

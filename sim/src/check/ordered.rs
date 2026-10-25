@@ -526,6 +526,9 @@ pub struct Assume {
     /// down the inputs of every 64-byte hash the replayed transactions
     /// compute (keccak(key . slot): a mapping entry), so check/moved.rs can
     /// tell which pool a changed mapping value belongs to. Not an assumption.
+    /// (Oct 25) Also our own calls' hashes, and on a miss the inputs that
+    /// name the missing slots go out with the answer (CheckUnknown.pre,
+    /// "missingPre"): copy 2 then knows WHOSE PoolManager value it was.
     pub record_hashes: bool,
 }
 
@@ -705,8 +708,13 @@ struct Watch<'p> {
     tx_route_clean: bool,
     /// Labels made by the watch itself (balances / pretended senders).
     labels: Assumed,
-    /// record_hashes: hash -> its two input words (replayed transactions only).
-    hashes: Option<HashMap<U256, (U256, U256)>>,
+    /// record_hashes: hash -> its two input words. Kept OUTSIDE the EVM
+    /// (run_ordered_sizes owns it) so a round that stops with a miss still
+    /// leaves them readable: the miss answer carries the few that name the
+    /// missing slots (Oct 25, CheckUnknown.pre). Since Oct 25 our own
+    /// calls' hashes are written down too (a trade of ours can need a tick
+    /// beyond the walk just like a replayed one).
+    hashes: Option<&'p std::cell::RefCell<HashMap<U256, (U256, U256)>>>,
     /// The 64-byte KECCAK256 running now (its input words).
     pending_pre: Option<(U256, U256)>,
 }
@@ -820,7 +828,7 @@ impl<CTX> Inspector<CTX, EthInterpreter> for Watch<'_> {
             // KECCAK256(offset, size): note storage places computed from the sender.
             0x20 => {
                 // record_hashes: a 64-byte hash's input (a mapping entry's key and slot).
-                if self.replaying && self.hashes.is_some() {
+                if self.hashes.is_some() {
                     if let (Ok(off), Ok(len)) = (interp.stack.peek(0), interp.stack.peek(1)) {
                         if len == U256::from(64u8) && off < U256::from(u32::MAX) {
                             let off = off.to::<usize>();
@@ -883,8 +891,8 @@ impl<CTX> Inspector<CTX, EthInterpreter> for Watch<'_> {
 
     fn step_end(&mut self, interp: &mut Interpreter<EthInterpreter>, _ctx: &mut CTX) {
         if let Some(p) = self.pending_pre.take() {
-            if let (Ok(h), Some(m)) = (interp.stack.peek(0), self.hashes.as_mut()) {
-                m.insert(h, p);
+            if let (Ok(h), Some(m)) = (interp.stack.peek(0), self.hashes) {
+                m.borrow_mut().insert(h, p);
             }
         }
         // The KECCAK256 just ran: its result (top of the stack) is a place
@@ -1136,10 +1144,30 @@ pub fn run_ordered_sizes(
 ) -> Result<OrderedOut, CheckUnknown> {
     let mut patched: Vec<(Address, U256)> = Vec::new();
     let mut skip: HashMap<(u64, usize), bool> = HashMap::new();
+    // The hash inputs the runs write down (record_hashes), one round at a time.
+    let rec = std::cell::RefCell::new(HashMap::new());
+    let rec_ref = if assume.record_hashes { Some(&rec) } else { None };
     for _ in 0..MAX_ROUNDS {
         // Phase counts (timing.rs): each round re-runs the whole plan.
         crate::timing::ph_count("rounds", 1);
-        match one_round(view, plan, overrides, calls, prov, strict_call, assume, &patched, &skip, ladder)? {
+        rec.borrow_mut().clear();
+        let round = match one_round(view, plan, overrides, calls, prov, strict_call, assume, &patched, &skip, ladder, rec_ref) {
+            Ok(n) => n,
+            Err(mut u) => {
+                // A miss (Oct 25): add the recorded inputs that name the
+                // missing slots (check/moved.rs pre_for_slots), so copy 2
+                // can tell whose PoolManager value it was.
+                if u.reason == UnknownReason::Miss && rec_ref.is_some() {
+                    let slots = u.missing.iter().filter_map(|m| match m {
+                        MissItem::Slot(_, s) => Some(*s),
+                        _ => None,
+                    });
+                    u.pre = super::moved::pre_for_slots(slots, &rec.borrow());
+                }
+                return Err(u);
+            }
+        };
+        match round {
             Next::Done(mut out) => {
                 out.assumed.sender_funds |= !patched.is_empty();
                 out.assumed.skipped_related = skip.values().filter(|r| **r).count();
@@ -1178,6 +1206,7 @@ fn one_round(
     patched: &[(Address, U256)],
     skip: &HashMap<(u64, usize), bool>,
     ladder: Option<&Ladder>,
+    rec: Option<&std::cell::RefCell<HashMap<U256, (U256, U256)>>>,
 ) -> Result<Next, CheckUnknown> {
     let mut db = CheckDb::new(view, overrides, true);
     // Assumed sender values (sender_funds), served before anything else.
@@ -1206,7 +1235,7 @@ fn one_round(
         tx_miss_base: 0,
         tx_route_clean: false,
         labels: Assumed::default(),
-        hashes: if assume.record_hashes { Some(HashMap::new()) } else { None },
+        hashes: rec,
         pending_pre: None,
     };
     let mut evm = build_evm_with_inspector(db, first, &ArbConfig::default(), default_arbsys_gas(), true, watch);
@@ -1265,7 +1294,7 @@ fn one_round(
                 return judge_miss(&evm, plan, t, (m.seq, j), assume, new_misses);
             }
             let Some(outcome) = outcome else {
-                return Err(CheckUnknown { reason: UnknownReason::Miss, missing: evm.ctx.journaled_state.database.missing.clone(), detail: "too many missing items".into() });
+                return Err(CheckUnknown { reason: UnknownReason::Miss, missing: evm.ctx.journaled_state.database.missing.clone(), detail: "too many missing items".into(), pre: Vec::new() });
             };
             if let Some(u) = watch_problem(&mut evm) {
                 return Err(u);
@@ -1339,7 +1368,7 @@ fn one_round(
     }
     let m = &evm.ctx.journaled_state.database.missing;
     if !m.is_empty() {
-        return Err(CheckUnknown { reason: UnknownReason::Miss, missing: m.clone(), detail: format!("{} item(s) not in our copy", m.len()) });
+        return Err(CheckUnknown { reason: UnknownReason::Miss, missing: m.clone(), detail: format!("{} item(s) not in our copy", m.len()), pre: Vec::new() });
     }
     if strict_call {
         let bad = stale_slots(prov, &evm.ctx.journaled_state.database.reads.view_slots, &HashSet::new());
@@ -1357,7 +1386,7 @@ fn one_round(
     assumed.call_fill |= l.call_fill;
     crate::timing::ph_add("ours", t_ours.elapsed().as_micros() as u64);
     let t_ladder = std::time::Instant::now();
-    let mut hashes: Vec<(U256, U256, U256)> = evm.inspector.hashes.take().map(|m| m.into_iter().map(|(h, (a, b))| (h, a, b)).collect()).unwrap_or_default();
+    let mut hashes: Vec<(U256, U256, U256)> = evm.inspector.hashes.map(|m| m.borrow().iter().map(|(h, (a, b))| (*h, *a, *b)).collect()).unwrap_or_default();
     hashes.sort();
     // 4. Size ladder: the copy as it was right after the replay, our trade
     //    again at each size (the amount word + the trading-money slots,
@@ -1402,7 +1431,7 @@ fn judge_miss(evm: &WatchedEvm<'_>, plan: &OrderedPlan, t: &DecodedTx, at: (u64,
             .collect();
         return Ok(Next::Patch(p));
     }
-    let unknown = CheckUnknown { reason: UnknownReason::Miss, missing: all_missing(), detail: format!("{} item(s) not in our copy", evm.ctx.journaled_state.database.missing.len()) };
+    let unknown = CheckUnknown { reason: UnknownReason::Miss, missing: all_missing(), detail: format!("{} item(s) not in our copy", evm.ctx.journaled_state.database.missing.len()), pre: Vec::new() };
     judge_cant_run(evm, plan, t, at, assume, unknown)
 }
 

@@ -36,7 +36,7 @@ use crate::copy2::checkview::{fee_nonzero, high_offset, C2View};
 use crate::copy2::intake::Copy2Handle;
 use crate::jobq::{is_fast, JobQueue};
 use crate::node::env_u64;
-use crate::proto::{bad_request, parse_at, parse_missing, parse_warm, read_msg, unknown, write_msg};
+use crate::proto::{bad_request, parse_at, parse_missing, parse_missing_pre, parse_warm, read_msg, unknown, write_msg};
 use crate::state::fill::FillQueue;
 use crate::state::mirror::{At, Shared, Stats};
 use crate::state::pinned::{PinnedCache, PinnedErr};
@@ -500,7 +500,10 @@ fn trig_inner(ctx: &Ctx, id: &Value, r: &CallRequest, feed_v: &Value, t0: Instan
     crate::timing::ph_add("prov", t_prov.elapsed().as_micros() as u64);
     // Best effort (check/ordered.rs BEST EFFORT): which assumptions this
     // check may make (this program's setting, then the bot's request).
-    let (strict, assume) = trig_assume(trig_trust(), &feed, |keys| ctx.copy2.as_ref().and_then(|c| c.route_for(keys)));
+    let (strict, mut assume) = trig_assume(trig_trust(), &feed, |keys| ctx.copy2.as_ref().and_then(|c| c.route_for(keys)));
+    // V4 BLIND SPOT (Oct 25): write down hash inputs, so a miss can say
+    // WHOSE PoolManager value it was (copy2/v4blind.rs). Not an assumption.
+    assume.record_hashes = true;
     let run = |view: &dyn StateRead, _c: &BlockCtx| crate::check::proto_types::handle_trig_call_with(view, &plan, &info, r, prov.as_ref(), strict, &assume);
     after_pick_with(ctx, picked, t0, tm, &run, false, core)
 }
@@ -604,6 +607,8 @@ fn trig_discover_inner(ctx: &Ctx, id: &Value, req: &Value, t0: Instant, tm: &mut
                 }
                 // Only the pools' OWN state counts (check/moved.rs).
                 let moved = crate::timing::ph_time("moved", || c2.pools_changed_with(&core, &out.changed, &out.hashes));
+                // An auto-followed pool a feed transaction moves is in use (v4blind.rs).
+                c2.note_moved(&moved.iter().map(|m| m.key.clone()).collect::<Vec<_>>());
                 json!({
                     "id": id, "ok": true,
                     "pools": moved.iter().map(|m| m.key.clone()).collect::<Vec<_>>(),
@@ -857,6 +862,17 @@ fn after_pick_with(
     } else {
         Stats::inc(&sh.stats.checks_unknown);
         let missing = parse_missing(&answer);
+        // V4 BLIND SPOT (Oct 25, copy2/v4blind.rs): every copy-2 check that
+        // missed something (normal, trigger-first, discover) tells copy 2
+        // whose PoolManager values they were (from the hash inputs the run
+        // recorded, `missingPre`), then that list leaves the answer.
+        if let Some(pre) = answer.as_object_mut().and_then(|o| o.remove("missingPre")) {
+            if let (Some(c), Some(k)) = (&ctx.copy2, core.as_deref()) {
+                c.note_pm_pre(k, &missing, &parse_missing_pre(&json!({ "missingPre": pre })));
+            }
+        } else if let (Some(c), Some(k), false) = (&ctx.copy2, core.as_deref(), missing.is_empty()) {
+            c.note_pm_pre(k, &missing, &[]);
+        }
         if !missing.is_empty() {
             Stats::inc(&sh.stats.misses);
             if let (Some(c), true) = (&ctx.copy2, learn) {
