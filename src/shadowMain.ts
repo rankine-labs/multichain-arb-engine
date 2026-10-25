@@ -4242,6 +4242,8 @@ await chainManager.startAll();
                         httpRpc: readerRpc,
                         httpLabel: `${endpointLabel(READER_URL)} (block reader gap fills)`,
                         heads: process.env.BLOCK_READER_WSS_HEADS === '1',
+                        // SPLIT (Oct 25): long topic lists go in pieces (Chainstack: "exceed max topics").
+                        topicChunk: Number(process.env.BLOCK_READER_WSS_TOPIC_CHUNK) || 400,
                         // Only our pools' events (BLOCK_READER_WSS_FILTER=0 = every pool on the chain),
                         // and at most BLOCK_READER_WSS_DAILY pushed messages a UTC day (0 = no cap).
                         addressFilter: process.env.BLOCK_READER_WSS_FILTER !== '0',

@@ -1,5 +1,5 @@
 import { EventEmitter } from 'events';
-import { WsBlockReader, SocketLike, backfillRange, wsReason } from '../core/blockReaderWs';
+import { WsBlockReader, SocketLike, backfillRange, wsReason, topicChunks } from '../core/blockReaderWs';
 import { SYNC_TOPIC, V4_SWAP_TOPIC, HANDLED_TOPICS, RpcLog, PoolUpdate } from '../core/blockReader';
 import { NodeUsageCounter } from '../core/nodeUsage';
 
@@ -61,7 +61,7 @@ const v4Log = (id: string, block: number, idx: number): RpcLog =>
   ({ address: PM, topics: [V4_SWAP_TOPIC, id, '0x' + '00'.repeat(32)], data: data(1n, 2n, 3n, 4n, 5n, 6n), blockNumber: q(block), logIndex: q(idx) });
 
 // Build a reader wired to a fake socket factory.
-function setup(httpAnswers: { head?: number; logs?: RpcLog[]; fail?: boolean } = {}, extra: { addressFilter?: boolean; dailyMessageCap?: number; resubscribeMs?: number; addresses?: () => string[] } = {}) {
+function setup(httpAnswers: { head?: number; logs?: RpcLog[]; fail?: boolean } = {}, extra: { addressFilter?: boolean; dailyMessageCap?: number; resubscribeMs?: number; addresses?: () => string[]; v4Ids?: () => Set<string>; topicChunk?: number } = {}) {
   const sockets: FakeSocket[] = [];
   const applied: Array<{ latest: Map<string, PoolUpdate>; toBlock: number }> = [];
   const health: Array<{ healthy: boolean; last: number }> = [];
@@ -79,7 +79,8 @@ function setup(httpAnswers: { head?: number; logs?: RpcLog[]; fail?: boolean } =
     httpLabel: 'test HTTP',
     poolManager: PM,
     addresses: extra.addresses ?? (() => [A]),
-    v4Ids: () => new Set([ID]),
+    v4Ids: extra.v4Ids ?? (() => new Set([ID])),
+    topicChunk: extra.topicChunk,
     addressFilter: extra.addressFilter,
     dailyMessageCap: extra.dailyMessageCap,
     resubscribeMs: extra.resubscribeMs,
@@ -136,7 +137,45 @@ async function filterAndCapTests() {
   }
 }
 
+// SPLIT (Oct 25, live: Chainstack "exceed max topics" with 1,000+ V4 ids):
+// long V4 id lists go in pieces, every piece's events are used, and a
+// refused piece still falls back to polling as before.
+async function splitTests() {
+  assert(JSON.stringify(topicChunks([1, 2, 3, 4, 5], 2)) === '[[1,2],[3,4],[5]]', 'topicChunks: pieces of 2');
+  assert(topicChunks([], 400).length === 0, 'topicChunks: empty list -> no pieces');
+  const ids = [1, 2, 3, 4, 5].map((n) => '0x' + n.toString(16).padStart(64, '0'));
+  {
+    const { r, sockets, applied } = setup({ head: 0 }, { v4Ids: () => new Set(ids), topicChunk: 2 });
+    r.start(); sockets[0]!.open();
+    const v4 = sockets[0]!.sent.filter((m) => m.params[1]?.address === PM);
+    assert(v4.length === 3, '5 V4 ids, pieces of 2: 3 subscriptions');
+    assert(v4.every((m) => m.params[1].topics[1].length <= 2), 'no piece longer than the limit');
+    assert(JSON.stringify(v4.flatMap((m) => m.params[1].topics[1])) === JSON.stringify([...ids].sort()), 'all ids covered, once each');
+    assert(v4[0].id === 3 && v4[1].id >= 100 && v4[2].id >= 100, 'first piece keeps id 3, the rest get ids from 100');
+    sockets[0]!.reply(1, '0xp'); sockets[0]!.reply(3, '0xv0'); sockets[0]!.reply(v4[1].id, '0xv1'); sockets[0]!.reply(v4[2].id, '0xv2');
+    sockets[0]!.push('0xv2', v4Log(ids[4]!, 10, 0));
+    advance(1_000); await tick();
+    assert(applied.some((a) => a.latest.has(ids[4]!)), 'an event on the 3rd piece reaches the pool updates');
+    r.stop();
+  }
+  {
+    const { r, sockets, logs } = setup({ head: 0 }, { v4Ids: () => new Set(ids), topicChunk: 2 });
+    r.start(); sockets[0]!.open();
+    const extra = sockets[0]!.sent.filter((m) => m.params[1]?.address === PM)[1];
+    sockets[0]!.reply(1, '0xp'); sockets[0]!.replyError(extra.id, 'invalid argument 1: exceed max topics');
+    assert(sockets[0]!.closed && logs.some((l) => l.includes('subscription refused')), 'a refused extra piece: socket dropped, polling, logged');
+    r.stop();
+  }
+  {
+    const { r, sockets } = setup({ head: 0 }, { v4Ids: () => new Set(ids) });
+    r.start(); sockets[0]!.open();
+    assert(sockets[0]!.sent.filter((m) => m.params[1]?.address === PM).length === 1, 'default limit (400): 5 ids stay one subscription');
+    r.stop();
+  }
+}
+
 async function main() {
+  await splitTests();
   await filterAndCapTests();
   // ---- backfill range maths ----
   {
