@@ -224,7 +224,10 @@ export class FastSender {
     // saved). Any reply, even an error, keeps the connection alive.
     this.warmTimer = setInterval(() => {
       try { this.sendProvider.send('eth_chainId', []).catch(() => { /* fine */ }); } catch { /* fine */ }
-    }, 4_000);
+    }, Math.max(250, Number(process.env.SEND_WARM_MS ?? 1_000)));
+    // SEND_WARM_MS (Oct 25): every 1 s (was 4 s, right at the usual 4 s idle
+    // close of a kept-alive connection, so a trade could still pay a fresh
+    // TCP + TLS handshake: ~20-25 ms measured to the sequencer).
   }
   private warmTimer: NodeJS.Timeout | null = null;
 
