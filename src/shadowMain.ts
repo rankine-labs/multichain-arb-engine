@@ -1392,7 +1392,9 @@ const gapStats = { found: 0, bestUsd: 0, fake: 0, fail: 0 }; // standing gaps (n
 const robinhoodSender = new FastSender(
       robinhoodReadProvider, 4663,
       // Trades go straight to the sequencer (first come, first served).
-      new ethers.JsonRpcProvider(robinhoodSendRpc(), 4663, { staticNetwork: true }),
+      // batchMaxCount 1 (Oct 25): ethers holds every request ~10 ms
+      // (batchStallTime) to bundle it with others; a trade must leave at once.
+      new ethers.JsonRpcProvider(robinhoodSendRpc(), 4663, { staticNetwork: true, batchMaxCount: 1, batchStallTime: 0 }),
 );
 // Deploy lock: live trades in flight are counted in data/inflight.json so
 // auto-deploy never restarts the bot mid-trade (live only; deploy/auto-deploy.sh).
