@@ -26,3 +26,4 @@ deploy/.status-state.json
 DEPLOY_ALLOW_LIVE
 # Fast-check sidecar program, downloaded by deploy/arbsim-update.sh (server only)
 bin/
+.test-tmp/
