@@ -163,11 +163,17 @@ pub struct CheckUnknown {
     pub missing: Vec<MissItem>,
     /// Short human-readable detail for logs.
     pub detail: String,
+    /// (Oct 25) For misses: the recorded inputs of the hashes that name the
+    /// missing slots, (hash, first word, second word); see
+    /// check/moved.rs resolve_v4_slot. Lets copy 2 tell WHOSE PoolManager
+    /// value was missing (our pool beyond its walk / a pool we don't follow).
+    /// Empty when nothing was recorded.
+    pub pre: Vec<(revm::primitives::U256, revm::primitives::U256, revm::primitives::U256)>,
 }
 
 impl CheckUnknown {
     pub fn new(reason: UnknownReason, detail: impl Into<String>) -> Self {
-        CheckUnknown { reason, missing: Vec::new(), detail: detail.into() }
+        CheckUnknown { reason, missing: Vec::new(), detail: detail.into(), pre: Vec::new() }
     }
     pub fn bad_request(detail: impl Into<String>) -> Self {
         Self::new(UnknownReason::BadRequest, detail)

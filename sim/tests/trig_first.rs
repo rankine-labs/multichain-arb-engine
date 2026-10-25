@@ -1054,6 +1054,43 @@ fn moved_v4_swap_through_the_evm_names_one_pool_from_the_recorded_hashes() {
     assert!(out2.hashes.is_empty());
 }
 
+/// V4 BLIND SPOT (Oct 25): the same swap on a copy that lacks the tick
+/// (a tick beyond our walk). The run stops with a miss, and the miss now
+/// carries the recorded hash inputs that NAME the missing slot: pool 0xa,
+/// a tick (check/moved.rs resolve_v4_slot). Without record_hashes: nothing.
+#[test]
+fn miss_of_a_v4_tick_carries_the_hash_inputs_that_name_its_pool() {
+    use arbsim::check::moved::{resolve_v4_slot, PreMap, V4Part};
+    let pbase = v4_base(id(0xa));
+    let (tick, _) = entry(U256::from(60u64), pbase + U256::from(4u64));
+    // The tick field is NOT in the copy.
+    let mut c = state_with(&[(pm(), pm_code(), vec![(pbase, U256::ZERO), (U256::from(7u64), U256::ZERO)])], true);
+    add_eoa(&mut c, caller(), U256::ZERO);
+    let mut data = id(0xa).to_vec();
+    data.extend(w(60));
+    let trig = stx(&KEY_A, 0, pm(), data);
+    let mut b = base();
+    b.l2_block_number = Some(10);
+    let (plan, _) = build_plan(&feed(&trig, 11, vec![msg(11, &[trig.clone()])]), 10, 0, &b).unwrap();
+    let (alone, _) = trigger_only(&plan).unwrap();
+    let assume = Assume { record_hashes: true, ..best() };
+    let u = run_ordered_with(&c, &alone, &Overrides::none(), &[], &AllExact, true, &assume).unwrap_err();
+    assert_eq!(u.reason, arbsim::check::UnknownReason::Miss, "{u}");
+    let missed = tick + U256::from(1u64);
+    assert!(u.missing.contains(&arbsim::state::MissItem::Slot(pm(), missed)), "{:?}", u.missing);
+    assert_eq!(u.pre.len(), 2, "just the tick's hash and its pool's base: {:?}", u.pre);
+    let m: PreMap = u.pre.iter().map(|(h, a, b)| (*h, (*a, *b))).collect();
+    assert_eq!(resolve_v4_slot(missed, &m), Some((id(0xa), V4Part::Tick)));
+    // On the wire: `missingPre`, read back by the server.
+    let j = arbsim::check::proto_types::unknown_json(&json!(1), &u, 0);
+    assert_eq!(arbsim::proto::parse_missing_pre(&j), u.pre);
+    // Not recording: no inputs (the answer is otherwise the same).
+    let u2 = run_ordered_with(&c, &alone, &Overrides::none(), &[], &AllExact, true, &best()).unwrap_err();
+    assert!(u2.pre.is_empty());
+    assert_eq!(u2.missing, u.missing);
+    assert!(arbsim::check::proto_types::unknown_json(&json!(1), &u2, 0).get("missingPre").is_none());
+}
+
 /// Reverts InsufficientProfit(slot 5, MAX): "profit" = its slot 5 (think:
 /// the test contract's trading money), so a ladder size shows which amount
 /// the slot held for that run.

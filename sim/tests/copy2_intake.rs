@@ -3003,3 +3003,156 @@ fn wanted_hint_rides_on_the_status_request() {
     arbsim::server::handle(&ctx, &json!({"id": 4, "type": "status"}));
     c2.stop();
 }
+
+// ---------------------------------------------------------------------------
+// V4 BLIND SPOT (Oct 25, copy2/v4blind.rs). Live: 38,950 PoolManager values
+// refused with one vague reason. Now a check's hash inputs name each one:
+// a far tick of OUR ready pool is fetched and kept with that pool (fix b);
+// a value of a pool we don't follow stays refused but is counted and listed
+// (auto-follow list when on, fix a); anything unnamed stays refused.
+// ---------------------------------------------------------------------------
+fn h2(x: U256, y: U256) -> U256 {
+    let mut b = [0u8; 64];
+    b[..32].copy_from_slice(&x.to_be_bytes::<32>());
+    b[32..].copy_from_slice(&y.to_be_bytes::<32>());
+    U256::from_be_bytes(keccak256(b).0)
+}
+
+/// (hash inputs a check recorded, tick slot, bitmap-word slot) for pool `id`.
+fn v4_far(id: B256, tick: u64, word: u64) -> (Vec<(U256, U256, U256)>, U256, U256) {
+    let idw = U256::from_be_bytes(id.0);
+    let base = arbsim::check::moved::v4_base(id);
+    let t = h2(u(tick as u128), base + u(4));
+    let wd = h2(u(word as u128), base + u(5));
+    (vec![(base, idw, u(6)), (t, u(tick as u128), base + u(4)), (wd, u(word as u128), base + u(5))], t, wd)
+}
+
+/// A rig with one ready V4 pool of ours (id 0x01) at PoolManager 0x44.
+fn blind_rig(cfg: C2Config) -> (Rig, Address, B256) {
+    let mut r = rig_with(C2Config { walks_inflight: 0, ..cfg });
+    r.track(vec![v2_pool()]);
+    r.send(tick(100, 60));
+    let pm = a(0x44);
+    let ours = B256::with_last_byte(1);
+    {
+        let mut reg = r.h.c2.reg.write().unwrap();
+        let mut e = reg.pools.values().next().unwrap().clone();
+        e.pool = TrackedPool { address: pm, v4_id: Some(ours), kind: PoolKind::V4, token0: a(COIN0), token1: a(COIN1), fee: 3000, tick_spacing: 60 };
+        e.items.clear();
+        e.base_block = 100;
+        e.ready_since = 100;
+        reg.pools.insert((pm, Some(ours)), e);
+        reg.by_addr.entry(pm).or_default().push((pm, Some(ours)));
+    }
+    r.send(tick(101, 61));
+    (r, pm, ours)
+}
+
+#[test]
+fn v4_blind_far_tick_of_our_pool_is_kept_others_refused_by_class() {
+    let (mut r, pm, ours) = blind_rig(C2Config::for_tests());
+    let theirs = B256::with_last_byte(0x77);
+    let (mut pre, t_ours, w_ours) = v4_far(ours, 887_000, 3000);
+    let (pre_theirs, t_theirs, _) = v4_far(theirs, 5, 0);
+    pre.extend(pre_theirs);
+    let unnamed = u(0xabcdef);
+    // The chain's values (block 100 on).
+    let mut s = r.chain.at(100);
+    let m = s.entry(pm).or_default();
+    m.insert(t_ours, u(0x1234));
+    m.insert(w_ours, u(0x8000));
+    m.insert(t_theirs, u(0x99));
+    m.insert(unnamed, u(0x55));
+    r.chain.set(100, s);
+    let missing = vec![MissItem::Slot(pm, t_ours), MissItem::Slot(pm, w_ours), MissItem::Slot(pm, t_theirs), MissItem::Slot(pm, unnamed)];
+    // 1. The check that missed them names them (status counters by class).
+    let core = r.h.c2.check_core();
+    r.h.note_pm_pre(&core, &missing, &pre);
+    assert_eq!(counter(&r, "pm_miss_own_far"), 2);
+    assert_eq!(counter(&r, "pm_miss_unfollowed"), 1);
+    assert_eq!(counter(&r, "pm_miss_unknown"), 1);
+    assert_eq!(counter(&r, "pm_named"), 3);
+    let st = r.h.status_json(false);
+    assert_eq!(st["v4Blind"]["topUnfollowed"][0]["id"], json!(format!("{theirs:#x}")), "{}", st["v4Blind"]);
+    assert_eq!(st["v4Blind"]["autoFollow"]["ids"], json!([]), "auto-follow is off by default");
+    // 2. The fill: our pool's far tick + bitmap word fetched and KEPT;
+    //    the other pool's tick and the unnamed value refused, by class.
+    r.h.fill(missing);
+    r.settle();
+    assert_eq!(r.head_slot(pm, t_ours), Lookup::Known(u(0x1234)));
+    assert_eq!(r.head_slot(pm, w_ours), Lookup::Known(u(0x8000)));
+    assert_eq!(r.head_slot(pm, t_theirs), Lookup::Missing, "never held: nothing would keep it current");
+    assert_eq!(r.head_slot(pm, unnamed), Lookup::Missing);
+    assert_eq!(counter(&r, "pm_far_sent"), 2);
+    assert_eq!(counter(&r, "pm_far_kept"), 2);
+    assert_eq!(counter(&r, "fill_refused_pm_slot"), 2);
+    assert_eq!(counter(&r, "pm_refused_unfollowed"), 1);
+    assert_eq!(counter(&r, "pm_refused_unknown"), 1);
+    // Kept WITH our pool: followed by its events, forgotten with it.
+    {
+        let reg = r.h.c2.reg.read().unwrap();
+        let e = &reg.pools[&(pm, Some(ours))];
+        assert!(e.items.contains(&(pm, t_ours)) && e.items.contains(&(pm, w_ours)));
+    }
+    // 3. The pool goes unsure (the node takes back one of its reports):
+    //    the kept values are forgotten with its other values, from that
+    //    block on, never left behind with an old number.
+    let mut gone = lg(pm, vec![topic("Swap(bytes32,address,int128,int128,uint160,uint128,int24,uint24)"), ours], data(&[u(0); 6]), 101, 0, 0);
+    gone.removed = true;
+    r.intake.process(msg(102, 62, vec![gone]));
+    assert_ne!(r.state(&TrackedPool { address: pm, v4_id: Some(ours), kind: PoolKind::V4, token0: a(COIN0), token1: a(COIN1), fee: 3000, tick_spacing: 60 }).0, PoolState::Ready);
+    assert_eq!(r.head_slot(pm, t_ours), Lookup::Missing, "forgotten with the pool");
+    assert_eq!(r.head_slot(pm, w_ours), Lookup::Missing);
+}
+
+#[test]
+fn v4_blind_far_fill_off_or_pool_not_ready_refuses_as_before() {
+    // Setting off.
+    let mut cfg = C2Config::for_tests();
+    cfg.blind.far_fill = false;
+    let (mut r, pm, ours) = blind_rig(cfg);
+    let (pre, t_ours, _) = v4_far(ours, 600, 2);
+    let core = r.h.c2.check_core();
+    r.h.note_pm_pre(&core, &[MissItem::Slot(pm, t_ours)], &pre);
+    r.h.fill(vec![MissItem::Slot(pm, t_ours)]);
+    r.settle();
+    assert_eq!(r.head_slot(pm, t_ours), Lookup::Missing);
+    assert_eq!(counter(&r, "pm_refused_own_far"), 1);
+    assert_eq!(counter(&r, "pm_far_sent"), 0);
+    // On, but the pool isn't ready: refused (its load brings what it needs).
+    let (mut r, pm, ours) = blind_rig(C2Config::for_tests());
+    {
+        let mut reg = r.h.c2.reg.write().unwrap();
+        let e = reg.pools.get_mut(&(pm, Some(ours))).unwrap();
+        e.state = PoolState::Unsure;
+        e.retry_at = std::time::Instant::now() + std::time::Duration::from_secs(3600); // no reload during the test
+    }
+    let core = r.h.c2.check_core();
+    r.h.note_pm_pre(&core, &[MissItem::Slot(pm, t_ours)], &pre);
+    r.h.fill(vec![MissItem::Slot(pm, t_ours)]);
+    r.settle();
+    assert_eq!(r.head_slot(pm, t_ours), Lookup::Missing);
+    assert_eq!(counter(&r, "pm_refused_own_far"), 1);
+}
+
+#[test]
+fn v4_blind_autofollow_lists_a_pool_checks_keep_missing() {
+    let mut cfg = C2Config::for_tests();
+    cfg.blind.autofollow = true;
+    cfg.blind.af_min_misses = 3;
+    let (r, pm, _ours) = blind_rig(cfg);
+    let theirs = B256::with_last_byte(0x77);
+    let (pre, t, w) = v4_far(theirs, 5, 0);
+    let core = r.h.c2.check_core();
+    // Two values of the same pool in one check count once for that check.
+    r.h.note_pm_pre(&core, &[MissItem::Slot(pm, t), MissItem::Slot(pm, w)], &pre);
+    r.h.note_pm_pre(&core, &[MissItem::Slot(pm, t)], &pre);
+    assert_eq!(r.h.status_json(false)["v4Blind"]["autoFollow"]["ids"], json!([]), "2 checks < 3");
+    // Later checks without hash inputs (e.g. a plain eth_call check): the
+    // slot was named before, so they count too.
+    r.h.note_pm_pre(&core, &[MissItem::Slot(pm, t)], &[]);
+    let st = r.h.status_json(false);
+    assert_eq!(st["v4Blind"]["autoFollow"]["ids"], json!([format!("{theirs:#x}")]), "{}", st["v4Blind"]);
+    assert_eq!(st["v4Blind"]["topUnfollowed"][0]["misses"], json!(3));
+    assert_eq!(st["v4Blind"]["topUnfollowed"][0]["autoFollow"], json!(true));
+}

@@ -5,6 +5,8 @@ import { ROBINHOOD_VENUES } from '../config/robinhoodVenues';
 import type { LocalSimClient, SidecarAnswer } from './localSim';
 import type { RawLogTap } from '../core/blockReaderWs';
 import { BlockAssembler, BlockOut, Head, blockMessage, headFromNewHeads } from './copy2Blocks';
+import { AbiCoder, keccak256 } from 'ethers';
+import { decodeV4InitializeLog, V4_INITIALIZE_TOPIC, type V4InitEvent } from '../core/v4EventDiscovery';
 
 // ============================================================================
 // COPY 2, BOT SIDE (sim/COPY2_PLAN.md, workstream C)
@@ -123,6 +125,33 @@ const VENUE_MODEL_KIND: Record<string, Copy2Kind> = {
 // otherwise the pool address (lower case).
 export function copy2Key(p: { address: string; v4Id?: string }): string {
   return (p.v4Id ?? p.address).toLowerCase();
+}
+
+// ----------------------------------------------------------------------------
+// autoPoolOf (Oct 25, AUTO-FOLLOW): a V4 pool the fast check keeps missing,
+// from its Initialize event, as a pool copy 2 can follow, or why not. Same
+// rules as a watched V4 pool (copy2PoolOf): only plain pools (no hook), a
+// fixed fee, a sane tick spacing, on OUR PoolManager, and the key really
+// hashes to the pool id (never a guess).
+// ----------------------------------------------------------------------------
+export function autoPoolOf(e: V4InitEvent | null, poolManager: string): Copy2Pool | { skip: string } {
+  try {
+    if (!e) return { skip: 'no Initialize event' };
+    const id = String(e.id ?? '').toLowerCase();
+    if (!ID_RE.test(id)) return { skip: 'bad V4 pool id' };
+    const pm = String(poolManager ?? '').toLowerCase();
+    if (!ADDR_RE.test(pm)) return { skip: 'no PoolManager' };
+    if (String(e.hooks ?? '').toLowerCase() !== ZERO_ADDR) return { skip: 'V4 pool with a hook' };
+    if (!Number.isInteger(e.fee) || e.fee < 0 || e.fee >= 1_000_000) return { skip: 'V4 fee not a fixed fee' };
+    if (!Number.isInteger(e.tickSpacing) || e.tickSpacing <= 0) return { skip: 'bad V4 tick spacing' };
+    const t0 = String(e.currency0 ?? '').toLowerCase(), t1 = String(e.currency1 ?? '').toLowerCase();
+    if (!ADDR_RE.test(t0) || !ADDR_RE.test(t1) || t0 >= t1) return { skip: 'bad V4 coins' };
+    const h = keccak256(AbiCoder.defaultAbiCoder().encode(['address', 'address', 'uint24', 'int24', 'address'], [t0, t1, e.fee, e.tickSpacing, ZERO_ADDR]));
+    if (h.toLowerCase() !== id) return { skip: 'V4 key does not match the pool id' };
+    return { address: pm, v4Id: id, kind: 'V4', token0: t0, token1: t1, fee: e.fee, tickSpacing: e.tickSpacing };
+  } catch {
+    return { skip: 'unreadable Initialize event' };
+  }
 }
 
 // ----------------------------------------------------------------------------
@@ -1005,7 +1034,9 @@ export class Copy2Forwarder {
 // Anything not clearly "ready" counts as NOT ready (strict).
 // ----------------------------------------------------------------------------
 export type Copy2PoolState = 'ready' | 'loading' | 'unsure';
-export type Copy2Status = { active: boolean; states: Map<string, Copy2PoolState> | null; counts: { ready: number; loading: number; unsure: number; tracked: number } | null };
+// autoFollow (Oct 25): V4 pool ids the fast check asks the bot to follow
+// (copy2.v4Blind.autoFollow.ids; empty unless ARBSIM_V4_AUTOFOLLOW=1 there).
+export type Copy2Status = { active: boolean; states: Map<string, Copy2PoolState> | null; counts: { ready: number; loading: number; unsure: number; tracked: number } | null; autoFollow: string[] };
 
 function stateWord(v: unknown): Copy2PoolState {
   const s = String(typeof v === 'object' && v !== null ? (v as any).state ?? (v as any).status ?? '' : v ?? '').toLowerCase();
@@ -1015,7 +1046,7 @@ function stateWord(v: unknown): Copy2PoolState {
 }
 
 export function parseCopy2Status(s: unknown): Copy2Status {
-  const out: Copy2Status = { active: false, states: null, counts: null };
+  const out: Copy2Status = { active: false, states: null, counts: null, autoFollow: [] };
   try {
     if (!s || typeof s !== 'object') return out;
     const st = s as Record<string, any>;
@@ -1047,6 +1078,9 @@ export function parseCopy2Status(s: unknown): Copy2Status {
       }
     }
     if (seen) out.states = states;
+    // AUTO-FOLLOW list (Oct 25, sim/src/copy2/v4blind.rs).
+    const af = body.v4Blind?.autoFollow?.ids;
+    if (Array.isArray(af)) out.autoFollow = af.filter((x: unknown): x is string => typeof x === 'string' && ID_RE.test(x.toLowerCase())).map((x: string) => x.toLowerCase()).slice(0, 5_000);
     // Counts: from the per-pool list, else from plain numbers if given.
     if (seen) {
       const n = { ready: 0, loading: 0, unsure: 0, tracked: states.size };
@@ -1125,6 +1159,16 @@ export function parseCopy2Status(s: unknown): Copy2Status {
 //   COPY2_WANTED_S           60    a route pool found "loading" is sent to
 //                                  the fast check as "wanted" this long, so
 //                                  it loads those first (0 = never sent)
+//   AUTO-FOLLOW (Oct 25): the fast check lists V4 pools its checks keep
+//   missing (only when ARBSIM_V4_AUTOFOLLOW=1 on the fast check side; off by
+//   default). The bot looks up each one's key (its Initialize event on the
+//   PoolManager, one eth_getLogs on the HTTP node), and follows it like a
+//   watched pool (WebSocket subscription + track) if it is a plain pool.
+//   COPY2_AUTOFOLLOW_MAX     200   most auto-followed pools (0 = never follow)
+//   COPY2_AUTOFOLLOW_TTL_S   600   dropped this long after the fast check
+//                                  stopped listing it
+//   COPY2_AUTOFOLLOW_LOOKUPS_PER_MIN 6  Initialize lookups a minute at most
+//   V4_DISCOVER_FROM_BLOCK   0     first block those lookups search from
 // ============================================================================
 export type Copy2Settings = {
   mode: 'auto' | 'off';
@@ -1144,6 +1188,10 @@ export type Copy2Settings = {
   dropGraceMs: number;   // COPY2_DROP_GRACE_S in ms (0 = off)
   dropGraceMax: number;  // COPY2_DROP_GRACE_MAX
   wantedMs: number;      // COPY2_WANTED_S in ms (0 = off)
+  autoFollowMax: number;            // COPY2_AUTOFOLLOW_MAX (0 = off)
+  autoFollowTtlMs: number;          // COPY2_AUTOFOLLOW_TTL_S in ms
+  autoFollowLookupsPerMin: number;  // COPY2_AUTOFOLLOW_LOOKUPS_PER_MIN
+  autoFollowFromBlock: number;      // V4_DISCOVER_FROM_BLOCK
 };
 
 export function copy2Settings(env: Record<string, string | undefined> = process.env): Copy2Settings {
@@ -1171,6 +1219,10 @@ export function copy2Settings(env: Record<string, string | undefined> = process.
       : num('ARBSIM_COPY2_DROP_GRACE_S', 1_800)),
     dropGraceMax: Math.floor(num('COPY2_DROP_GRACE_MAX', 300)),
     wantedMs: 1000 * num('COPY2_WANTED_S', 60),
+    autoFollowMax: Math.floor(num('COPY2_AUTOFOLLOW_MAX', 200)),
+    autoFollowTtlMs: 1000 * num('COPY2_AUTOFOLLOW_TTL_S', 600),
+    autoFollowLookupsPerMin: Math.floor(num('COPY2_AUTOFOLLOW_LOOKUPS_PER_MIN', 6)),
+    autoFollowFromBlock: Math.floor(num('V4_DISCOVER_FROM_BLOCK', 0)),
   };
 }
 
@@ -1226,6 +1278,17 @@ export class Copy2Link {
   // WANTED (COPY2_WANTED_S): route pools a check found "loading" -> when;
   // sent with the status poll so the fast check loads them first.
   private wanted = new Map<string, number>();
+  // AUTO-FOLLOW (Oct 25): V4 pools the fast check asked us to follow (its
+  // checks keep missing them) -> details + when it last listed them. They
+  // join the follow list (and the WebSocket subscription, like held pools)
+  // until COPY2_AUTOFOLLOW_TTL_S after the fast check stops listing them.
+  private auto = new Map<string, { pool: Copy2Pool; at: number }>();
+  private autoKeys = new Set<string>();                         // keys of auto pools in `follow`
+  private autoKnown = new Map<string, Copy2Pool | { skip: string }>(); // looked-up keys (bounded cache)
+  private autoRetry = new Map<string, { next: number; tries: number }>();
+  private autoBusy = new Set<string>();
+  private autoLookupAt: number[] = [];
+  readonly autoCounts = { lookups: 0, followed: 0, notPlain: 0, notFound: 0, failed: 0, full: 0, expired: 0 };
 
   // Hourly counters (taken by hourText). held: pools that came back to the
   // watch list while still held (each one a reload avoided).
@@ -1318,7 +1381,7 @@ export class Copy2Link {
     const pools: string[] = [], ids: string[] = [];
     for (const p of this.follow) {
       const k = copy2Key(p);
-      if (!this.heldKeys.has(k)) continue;
+      if (!this.heldKeys.has(k) && !this.autoKeys.has(k)) continue;
       if (p.kind === 'V4') ids.push(k); else pools.push(k);
     }
     return { pools, ids };
@@ -1350,11 +1413,100 @@ export class Copy2Link {
     for (const h of held.slice(max)) this.lastWatched.delete(h.k);
     const kept = held.slice(0, max);
     this.heldKeys = new Set(kept.map((h) => h.k));
+    // AUTO-FOLLOW: pools the fast check listed recently, not already watched / held.
+    const ttl = this.o.settings.autoFollowTtlMs;
+    const autoPools: Copy2Pool[] = [];
+    this.autoKeys = new Set();
+    for (const [k, v] of this.auto) {
+      if (t - v.at >= ttl || this.o.settings.autoFollowMax <= 0) { this.auto.delete(k); this.autoCounts.expired++; continue; }
+      if (now.has(k) || this.heldKeys.has(k)) continue;
+      this.autoKeys.add(k);
+      autoPools.push(v.pool);
+    }
     // Sorted like buildTrackList, so the track signature is stable.
-    this.follow = kept.length
-      ? [...this.desired, ...kept.map((h) => h.pool)].sort((x, y) => (copy2Key(x) < copy2Key(y) ? -1 : 1))
+    this.follow = kept.length || autoPools.length
+      ? [...this.desired, ...kept.map((h) => h.pool), ...autoPools].sort((x, y) => (copy2Key(x) < copy2Key(y) ? -1 : 1))
       : this.desired;
   }
+
+  // ---- auto-follow (Oct 25) ---------------------------------------------------
+  // The fast check's auto-follow list (from its status): refresh the pools
+  // already followed, look up the new ones (bounded, see lookupAuto).
+  noteAutoFollow(ids: readonly string[]): void {
+    try {
+      const s = this.o.settings;
+      if (s.autoFollowMax <= 0 || !ids.length) return;
+      const t = this.now();
+      let watched: Set<string> | null = null;
+      for (const raw of ids.slice(0, 1_000)) {
+        const id = String(raw).toLowerCase();
+        if (!ID_RE.test(id)) continue;
+        const have = this.auto.get(id);
+        if (have) { have.at = t; continue; }
+        watched ??= new Set(this.desired.map(copy2Key));
+        if (watched.has(id)) continue;                 // the watch list follows it already
+        const known = this.autoKnown.get(id);
+        if (known) { this.addAuto(id, known); continue; }
+        void this.lookupAuto(id);
+      }
+    } catch { /* never throws into the bot */ }
+  }
+
+  // One pool's key from its Initialize event (one eth_getLogs on the HTTP
+  // node). At most COPY2_AUTOFOLLOW_LOOKUPS_PER_MIN a minute, one at a time
+  // per pool; a failed lookup waits 5 min (doubling, at most 1 h).
+  async lookupAuto(id: string): Promise<void> {
+    const s = this.o.settings;
+    const t = this.now();
+    if (this.autoBusy.has(id)) return;
+    const r = this.autoRetry.get(id);
+    if (r && t < r.next) return;
+    if (this.auto.size >= s.autoFollowMax) { this.autoCounts.full++; return; }
+    this.autoLookupAt = this.autoLookupAt.filter((x) => t - x < 60_000);
+    if (this.autoLookupAt.length >= s.autoFollowLookupsPerMin) return;
+    const rpc = this.backfillRpc;
+    const pm = (this.o.poolManager || '').toLowerCase();
+    if (!rpc || !ADDR_RE.test(pm)) return;
+    this.autoLookupAt.push(t);
+    this.autoBusy.add(id);
+    this.autoCounts.lookups++;
+    try {
+      const logs = await rpc('eth_getLogs', [{ address: pm, topics: [V4_INITIALIZE_TOPIC, id], fromBlock: hexBlock(Math.max(0, s.autoFollowFromBlock)), toBlock: 'latest' }]);
+      const ev = (Array.isArray(logs) ? logs : []).map((l: any) => decodeV4InitializeLog(l, pm)).find((e) => !!e && e.id === id) ?? null;
+      if (!ev) {
+        this.autoCounts.notFound++;
+        this.autoRetry.set(id, { next: this.now() + 3_600_000, tries: (r?.tries ?? 0) + 1 });
+        return;
+      }
+      const p = autoPoolOf(ev, pm);
+      if (this.autoKnown.size >= 2_000) this.autoKnown.delete(this.autoKnown.keys().next().value as string);
+      this.autoKnown.set(id, p);
+      this.addAuto(id, p);
+    } catch {
+      this.autoCounts.failed++;
+      const tries = (r?.tries ?? 0) + 1;
+      this.autoRetry.set(id, { next: this.now() + Math.min(3_600_000, 300_000 * 2 ** (tries - 1)), tries });
+    } finally {
+      this.autoBusy.delete(id);
+      if (this.autoRetry.size > 2_000) this.autoRetry.delete(this.autoRetry.keys().next().value as string);
+    }
+  }
+
+  private addAuto(id: string, p: Copy2Pool | { skip: string }): void {
+    if ('skip' in p) {
+      this.autoCounts.notPlain++;
+      this.autoRetry.set(id, { next: this.now() + 24 * 3_600_000, tries: 99 });
+      return;
+    }
+    if (this.auto.has(id)) return;
+    if (this.auto.size >= this.o.settings.autoFollowMax) { this.autoCounts.full++; return; }
+    this.auto.set(id, { pool: p, at: this.now() });
+    this.autoCounts.followed++;
+    this.desiredAt = -Infinity;                        // rebuild the follow list on next use
+    this.log(`[copy2] auto-follow: V4 pool ${id} (fee ${p.fee}, spacing ${p.tickSpacing}) keeps blocking the fast check's checks; following it (${this.auto.size} auto-followed, joins the WebSocket at its next renewal)`);
+  }
+
+  autoCount(): number { this.desiredList(); return this.autoKeys.size; }
 
   // The fast check (re)connected: it may have restarted, so start over.
   onClientConnect(): void {
@@ -1392,6 +1544,7 @@ export class Copy2Link {
     }
     if (!was) this.log('[copy2] the fast check follows our pools from their events (pool-events mode): asking the WebSocket for the extra events');
     if (!this.trackOk) void this.sendTrack(false);
+    if (st.autoFollow.length) this.noteAutoFollow(st.autoFollow);
   }
 
   // ---- track ----------------------------------------------------------------
@@ -1522,6 +1675,7 @@ export class Copy2Link {
     return [
       c ? `copy 2: ${c.ready} ready, ${c.unsure} unsure, ${c.loading} loading of ${c.tracked} pools` : `copy 2: following ${this.tracked.length} pools (readiness not reported)`,
       ...(held || h.heldBack ? [`kept after leaving the watch list ${held}, came back while kept ${h.heldBack}`] : []),
+      ...(this.auto.size || this.autoCounts.lookups ? [`auto-followed V4 pools ${this.auto.size} (looked up ${this.autoCounts.lookups}, followed ${this.autoCounts.followed}, not plain ${this.autoCounts.notPlain}, not found ${this.autoCounts.notFound}, lookup errors ${this.autoCounts.failed}, list full ${this.autoCounts.full}, expired ${this.autoCounts.expired})`] : []),
       `routed to fast check ${h.fast}, to node ${node}${whys ? ` (${whys})` : ''}`,
       `pool reports ${this.forwarder.modeText()}: ${f.blocksSent} blocks passed on${f.msgsDropped ? `, ${f.msgsDropped} DROPPED` : ''}${f.gaps ? `, ${f.gaps} gaps` : ''}${f.late ? `, ${f.late} late` : ''}${f.backfills ? `, ${f.backfills} outages filled in` : ''}${f.backfillFails ? `, ${f.backfillFails} not filled` : ''}${f.noTimestamp ? `, ${f.noTimestamp} skipped (time / header unknown)` : ''}${f.headersFetched ? `, ${f.headersFetched} headers read from the node` : ''}${f.timesRead ? `, ${f.timesRead} block times read from the node` : ''}`,
       `forced reloads ${this.forwarder.forcedReloads()}${this.forwarder.forcedReloads() ? ` (${this.reloadWhys()})` : ''}`,

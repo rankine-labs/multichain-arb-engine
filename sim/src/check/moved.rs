@@ -173,3 +173,168 @@ impl MovedIndex {
         out
     }
 }
+
+// ============================================================================
+// WHOSE POOLMANAGER VALUE IS THIS? (Oct 25, the "blind spot" fix)
+//
+// Plain English: live Oct 25 copy 2 refused ~39,000 PoolManager values that
+// checks needed ("not a base slot of one of our V4 pools"), and nothing told
+// us WHAT they were. A V4 storage place is a hash, so from the slot number
+// alone we can't tell whose it is. But the check that missed it computed
+// that hash a moment earlier, and the EVM run writes down the two input
+// words of every 64-byte hash (check/ordered.rs record_hashes). Following
+// those inputs backwards names the pool and the part:
+//
+//   slot = keccak(id . 6) + 0..3                  -> pool `id`, base field
+//   slot = keccak(tick . P) + 0..2,  P = base+4   -> pool `id`, a tick
+//   slot = keccak(word . P),         P = base+5   -> pool `id`, tick-map word
+//   slot = keccak(key  . P) + 0..2,  P = base+6   -> pool `id`, a position
+//   (base = keccak(id . 6), itself one of the recorded hashes)
+//
+// A hash value can only come from its own inputs, so this is never a guess:
+// either the chain of inputs is there (then it is that pool), or we say
+// "don't know".
+// ============================================================================
+
+/// Which part of a V4 pool's data a PoolManager slot is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum V4Part {
+    /// base + 0..3: slot0 / fee growth 0 / fee growth 1 / liquidity.
+    Base(u8),
+    /// A tick's info (3 slots per tick).
+    Tick,
+    /// A tick-map (bitmap) word.
+    Bitmap,
+    /// A liquidity position (not needed for swaps).
+    Position,
+}
+
+/// Hash -> its two input words (what the EVM run recorded).
+pub type PreMap = HashMap<U256, (U256, U256)>;
+
+/// Is `h` = keccak(id . 6), i.e. a V4 pool's base slot? Then the id.
+fn base_id(h: U256, pre: &PreMap) -> Option<B256> {
+    match pre.get(&h) {
+        Some((id, six)) if *six == U256::from(V4_POOLS_SLOT) => Some(B256::from(id.to_be_bytes::<32>())),
+        _ => None,
+    }
+}
+
+/// Name the V4 pool (and which part of it) a PoolManager `slot` belongs to,
+/// from the hash inputs a check recorded (see the section header). None =
+/// the inputs aren't there (or it is not a pool's data: coin deltas,
+/// ERC-6909 claims, settings, ...).
+pub fn resolve_v4_slot(slot: U256, pre: &PreMap) -> Option<(B256, V4Part)> {
+    // A mapping entry (tick / bitmap word / position) of some pool's base.
+    for off in 0..ENTRY_FIELDS {
+        let Some(h) = slot.checked_sub(U256::from(off)) else { break };
+        let Some((_, parent)) = pre.get(&h) else { continue };
+        for (k, part) in [(4u64, V4Part::Tick), (5, V4Part::Bitmap), (6, V4Part::Position)] {
+            // A bitmap word is one slot (no struct fields after it).
+            if part == V4Part::Bitmap && off != 0 {
+                continue;
+            }
+            let Some(b) = parent.checked_sub(U256::from(k)) else { continue };
+            if let Some(id) = base_id(b, pre) {
+                return Some((id, part));
+            }
+        }
+    }
+    // One of the 4 base fields.
+    for k in 0..4u8 {
+        let Some(b) = slot.checked_sub(U256::from(k)) else { break };
+        if let Some(id) = base_id(b, pre) {
+            return Some((id, V4Part::Base(k)));
+        }
+    }
+    None
+}
+
+/// The few recorded hash inputs needed to name `slots` (resolve_v4_slot):
+/// those for slot - 0..3 and their parents' bases. Sent with a check's miss
+/// answer (`missingPre`) so copy 2 can tell whose value it was, without
+/// sending every hash the run made.
+pub fn pre_for_slots(slots: impl IntoIterator<Item = U256>, pre: &PreMap) -> Vec<(U256, U256, U256)> {
+    let mut out: Vec<(U256, U256, U256)> = Vec::new();
+    let take = |h: U256, out: &mut Vec<(U256, U256, U256)>| -> Option<U256> {
+        let (a, b) = pre.get(&h)?;
+        if !out.iter().any(|x| x.0 == h) {
+            out.push((h, *a, *b));
+        }
+        Some(*b)
+    };
+    for s in slots {
+        for off in 0..4u64 {
+            let Some(h) = s.checked_sub(U256::from(off)) else { break };
+            if let Some(parent) = take(h, &mut out) {
+                for k in 4..=6u64 {
+                    if let Some(b) = parent.checked_sub(U256::from(k)) {
+                        take(b, &mut out);
+                    }
+                }
+            }
+        }
+        // Keep the answer small whatever happens.
+        if out.len() >= 256 {
+            break;
+        }
+    }
+    out.sort();
+    out
+}
+
+#[cfg(test)]
+mod v4_slot_tests {
+    use super::*;
+
+    fn h2(a: U256, b: U256) -> U256 {
+        let mut x = [0u8; 64];
+        x[..32].copy_from_slice(&a.to_be_bytes::<32>());
+        x[32..].copy_from_slice(&b.to_be_bytes::<32>());
+        U256::from_be_bytes(keccak256(x).0)
+    }
+
+    /// What a V4 swap's EVM run would record for pool `id`: its base hash,
+    /// one tick and one bitmap word.
+    fn recorded(id: B256, tick: U256, word: U256) -> (PreMap, U256, U256, U256) {
+        let idw = U256::from_be_bytes(id.0);
+        let base = h2(idw, U256::from(6u8));
+        assert_eq!(base, v4_base(id));
+        let tick_slot = h2(tick, base + U256::from(4u8));
+        let word_slot = h2(word, base + U256::from(5u8));
+        let mut pre = PreMap::new();
+        pre.insert(base, (idw, U256::from(6u8)));
+        pre.insert(tick_slot, (tick, base + U256::from(4u8)));
+        pre.insert(word_slot, (word, base + U256::from(5u8)));
+        (pre, base, tick_slot, word_slot)
+    }
+
+    #[test]
+    fn names_ticks_bitmap_words_and_base_fields() {
+        let id = B256::repeat_byte(0x42);
+        let (pre, base, tick_slot, word_slot) = recorded(id, U256::from(887_000u64), U256::from(3000u64));
+        assert_eq!(resolve_v4_slot(tick_slot, &pre), Some((id, V4Part::Tick)));
+        // The 2nd and 3rd field of the tick's struct are the same tick.
+        assert_eq!(resolve_v4_slot(tick_slot + U256::from(2u8), &pre), Some((id, V4Part::Tick)));
+        assert_eq!(resolve_v4_slot(word_slot, &pre), Some((id, V4Part::Bitmap)));
+        assert_eq!(resolve_v4_slot(base + U256::from(3u8), &pre), Some((id, V4Part::Base(3))));
+        // A slot whose inputs weren't recorded: "don't know", never a guess.
+        assert_eq!(resolve_v4_slot(U256::from(12345u64), &pre), None);
+        assert_eq!(resolve_v4_slot(word_slot + U256::from(1u8), &pre), None);
+    }
+
+    #[test]
+    fn pre_for_slots_keeps_only_what_names_them() {
+        let id = B256::repeat_byte(0x07);
+        let (mut pre, _base, tick_slot, word_slot) = recorded(id, U256::from(5u8), U256::from(1u8));
+        // Unrelated hashes the run also made (an ERC-20 balance, say).
+        for i in 0..50u64 {
+            pre.insert(h2(U256::from(i), U256::from(3u8)), (U256::from(i), U256::from(3u8)));
+        }
+        let small = pre_for_slots([tick_slot + U256::from(1u8)], &pre);
+        assert_eq!(small.len(), 2, "the tick's hash and its pool's base");
+        let m: PreMap = small.iter().map(|(h, a, b)| (*h, (*a, *b))).collect();
+        assert_eq!(resolve_v4_slot(tick_slot + U256::from(1u8), &m), Some((id, V4Part::Tick)));
+        assert_eq!(resolve_v4_slot(word_slot, &m), None, "not asked for");
+    }
+}
