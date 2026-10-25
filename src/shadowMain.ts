@@ -653,6 +653,9 @@ const livePools = new Map<string, [string, string]>();
 // GAP_LIVE_FAIL_BLOCK_MIN minutes (default 30; 0 = off). Not saved to disk.
 // FIRE_FIRST_ONLY=1: only the trigger-first entry point sends real trades (see the send step).
 const FIRE_FIRST_ONLY = ['1', 'true', 'on', 'yes'].includes((process.env.FIRE_FIRST_ONLY ?? '').trim().toLowerCase());
+// GAP_LIVE_WITH_FIRE_FIRST=1: with FIRE_FIRST_ONLY, standing gaps may send too (see the send step).
+const GAP_LIVE_WITH_FIRE_FIRST = ['1', 'true', 'on', 'yes'].includes((process.env.GAP_LIVE_WITH_FIRE_FIRST ?? '').trim().toLowerCase());
+if (FIRE_FIRST_ONLY && GAP_LIVE_WITH_FIRE_FIRST) console.log('[live] standing gaps may send too (GAP_LIVE_WITH_FIRE_FIRST=1)');
 if (FIRE_FIRST_ONLY) console.log('[live] FIRE-FIRST ONLY (FIRE_FIRST_ONLY=1): older paths check but never send real trades');
 const GAP_LIVE_FAIL_BLOCK_MIN = Math.max(0, Number(process.env.GAP_LIVE_FAIL_BLOCK_MIN ?? 30) || 0);
 const gapFailBlocks = new LiveRouteBlock(GAP_LIVE_FAIL_BLOCK_MIN * 60_000);
@@ -2742,7 +2745,10 @@ const fireTrade = async (o: {
             // react after the block that rivals already filled). Old loops are
             // switched separately (LOOP_LIVE=0); fire-first loops are not
             // affected (they send through the entry point's own loop sender).
-            if (robinhoodSender.live && FIRE_FIRST_ONLY && !o.entry) {
+            // FAST STANDING GAPS (Oct 25, owner): GAP_LIVE_WITH_FIRE_FIRST=1 lets
+            // standing gaps (source 'gap', each sent right after its own fresh
+            // check that passed) send too; follow-a-trade guesses stay off.
+            if (robinhoodSender.live && FIRE_FIRST_ONLY && !o.entry && !(o.source === 'gap' && GAP_LIVE_WITH_FIRE_FIRST)) {
                   block('fire-first only: older paths do not send (FIRE_FIRST_ONLY=1)');
                   return;
             }
@@ -3869,7 +3875,17 @@ await chainManager.startAll();
       // growth counts toward "would have made" (one gap, one trade). Reporting only.
       const gapCredit = new GapCredit();
       const poolSig = (p: PoolState) => `${p.sqrtPriceX96 ?? ''}:${p.liquidity ?? ''}:${p.reserveA ?? ''}:${p.reserveB ?? ''}`;
-      const GAP_FAKE_MUTE_MS = 30 * 60_000;
+      // FAST STANDING GAPS (Oct 25, owner): the limits below were set when every
+      // check cost node credits; the fast check on our own copy is free. All
+      // are settings now (defaults = before):
+      //   GAP_FAKE_MUTE_MS      a gap whose check said "not real" waits this long [30 min]
+      //   GAP_PAIR_COOLDOWN_MS  the same pair is checked again after this [30 s]
+      //   GAP_MAX_PER_SCAN      checks started per scan [2]
+      //   GAP_SCAN_DEBOUNCE_MS  wait after a price change before scanning [50 ms]
+      const GAP_FAKE_MUTE_MS = Number(process.env.GAP_FAKE_MUTE_MS ?? 30 * 60_000);
+      const GAP_PAIR_COOLDOWN_MS = Number(process.env.GAP_PAIR_COOLDOWN_MS ?? 30_000);
+      const GAP_MAX_PER_SCAN = Math.max(1, Number(process.env.GAP_MAX_PER_SCAN ?? 2));
+      const GAP_SCAN_DEBOUNCE_MS = Math.max(0, Number(process.env.GAP_SCAN_DEBOUNCE_MS ?? 50));
       const gapLastFired = new Map<string, number>();
       const gapMutedUntil = new Map<string, number>();
       // Pool state when a pair was muted: a big gap on a muted pair is
@@ -3896,7 +3912,7 @@ await chainManager.startAll();
       let gapAgain = false; // a scan was asked for while one was running
       const queueGapScan = () => {
             if (gapScanQueued) return;
-            gapScanQueued = setTimeout(() => { gapScanQueued = null; void timedAsync('gap scan', runGapScan); }, 50);
+            gapScanQueued = setTimeout(() => { gapScanQueued = null; void timedAsync('gap scan', runGapScan); }, GAP_SCAN_DEBOUNCE_MS);
       };
       requestGapScan = () => {
             requestLoopScan(); // loop trader (off unless LOOP_TRADER=1): same triggers
@@ -3963,7 +3979,7 @@ await chainManager.startAll();
                   stableTally.noteGaps(gaps.map((g) => ({ key: `${g.buyPool.poolAddress}>${g.sellPool.poolAddress}`, tokens: [g.base, g.quote] as [string, string], modelUsd: g.profitUsd })));
                   let fired = 0;
                   for (const g of gaps) {
-                        if (fired >= 2) break;
+                        if (fired >= GAP_MAX_PER_SCAN) break;
                         // Fast scan runs in bites: a pool may have got a new price
                         // during a break. Such a gap is skipped (no check budget used,
                         // pair not muted) and one more scan runs with fresh prices.
@@ -3980,7 +3996,7 @@ await chainManager.startAll();
                         // skips the 30 s cooldown and the 6-a-minute budget (own cap below),
                         // so small gaps can't use up the checks a big one needs.
                         const bigFresh = g.profitUsd >= BENCH_BYPASS_USD && gapLastSig.get(key) !== sig;
-                        if (!bigFresh && Date.now() - (gapLastFired.get(key) ?? 0) < 30_000) continue;
+                        if (!bigFresh && Date.now() - (gapLastFired.get(key) ?? 0) < GAP_PAIR_COOLDOWN_MS) continue;
                         if (gapConfirmedState.get(key) === sig) continue; // same gap we already counted
                         const wasConfirmed = gapConfirmedOpen.get(key);
                         if (wasConfirmed !== undefined && g.profitUsd < 2 * wasConfirmed) continue; // still the same open gap
