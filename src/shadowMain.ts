@@ -1287,6 +1287,7 @@ let requestGapScan: () => void = () => {};
 // Gaps skipped because a pool's price changed while the scan ran in bites
 // (fast gap scan). Shown on the 5-min [stalls] line, then reset.
 let gapStaleSkips = 0;
+let gapSamePoolSkips = 0; // ONE SEND PER GAP: routes skipped, a send just went out on one of their pools
 const robinhoodWatcher = new PairWatcher('robinhood', robinhoodReadProvider, ROBINHOOD_VENUES, cache,
       // Real decimals/symbols for every discovered token, read from the token itself.
       (addr, meta) => {
@@ -3888,6 +3889,18 @@ await chainManager.startAll();
       const GAP_PAIR_COOLDOWN_MS = Number(process.env.GAP_PAIR_COOLDOWN_MS ?? 30_000);
       const GAP_MAX_PER_SCAN = Math.max(1, Number(process.env.GAP_MAX_PER_SCAN ?? 2));
       const GAP_SCAN_DEBOUNCE_MS = Math.max(0, Number(process.env.GAP_SCAN_DEBOUNCE_MS ?? 50));
+      // ONE SEND PER GAP (Oct 25): pools a standing-gap send just went out on,
+      // held GAP_SENT_POOL_HOLD_MS (default 3 s) so another route over the same
+      // pool isn't sent too. Only after a CONFIRMED check (live or practice alike).
+      const GAP_SENT_POOL_HOLD_MS = Math.max(0, Number(process.env.GAP_SENT_POOL_HOLD_MS ?? 3_000));
+      const gapSentPools = new Map<string, number>();
+      function gapPoolHold(pool: string, now = Date.now()): void {
+            gapSentPools.set(pool.toLowerCase(), now + GAP_SENT_POOL_HOLD_MS);
+            if (gapSentPools.size > 500) for (const [k, v] of gapSentPools) if (v <= now) gapSentPools.delete(k);
+      }
+      function gapPoolBusy(pool: string, now = Date.now()): boolean {
+            return (gapSentPools.get(pool.toLowerCase()) ?? 0) > now;
+      }
       const gapLastFired = new Map<string, number>();
       const gapMutedUntil = new Map<string, number>();
       // Pool state when a pair was muted: a big gap on a muted pair is
@@ -3990,6 +4003,14 @@ await chainManager.startAll();
                               gapAgain = true;
                               continue;
                         }
+                        // ONE SEND PER GAP (Oct 25, live): one WETH/USDG gap was found
+                        // as 3 routes sharing a pool, all 3 confirmed and all 3 sent in
+                        // the same second; only one can win, the others only pay gas
+                        // (and queued the sends behind each other: 0.8-2.6 s). Gaps
+                        // come best first, so once a send went out on a pool, other
+                        // routes using that pool wait GAP_SENT_POOL_HOLD_MS (until the
+                        // first one has landed or failed). No check budget used.
+                        if (gapPoolBusy(g.buyPool.poolAddress) || gapPoolBusy(g.sellPool.poolAddress)) { gapSamePoolSkips++; continue; }
                         const key = `${g.buyPool.poolAddress}>${g.sellPool.poolAddress}`;
                         const sig = `${poolSig(g.buyPool)}|${poolSig(g.sellPool)}`;
                         const bigChanged = g.profitUsd >= BENCH_BYPASS_USD && gapMutedSig.get(key) !== sig;
@@ -4074,6 +4095,8 @@ await chainManager.startAll();
                         // Would we really have won it? (ready = after our check + ~2 ms to sign)
                         void raceChecker.record({ label: `${label} gap`, pools: [g.buyPool.poolAddress, g.sellPool.poolAddress], netUsd: simNet, source: 'gap', readyDelayMs: Date.now() - spottedAt + 2 });
                         console.log(`[gap] standing gap ${label} CONFIRMED: real ~$${simNet.toFixed(2)} (model $${g.profitUsd.toFixed(2)}) on $${Math.round(g.sizeUsd)} | ${route} | check ${checkMs}ms, ${Date.now() - spottedAt}ms since spotted`);
+                        // Hold both pools before the send starts (another scan may run meanwhile).
+                        gapPoolHold(g.buyPool.poolAddress); gapPoolHold(g.sellPool.poolAddress);
                         await fireTrade({
                               chain: 'robinhood', tokenIn: g.quote, tokenOut: g.base, buyPool: g.buyPool, sellPool: g.sellPool,
                               // Never trust the model over the simulation.
@@ -5279,11 +5302,12 @@ for (let i = 0; i < resolved.length; i++) {
             // Stall finder: freezes in the last 5 min and what caused them.
             const sf = stallFinder.take('fiveMin');
             // Plus how many gaps the fast scan skipped because prices moved during it.
-            console.log(`[stalls] ${formatStallLine(sf)}${gapStaleSkips ? ` · gaps skipped (prices moved during the scan, rescanned): ${gapStaleSkips}` : ''}`);
+            console.log(`[stalls] ${formatStallLine(sf)}${gapStaleSkips ? ` · gaps skipped (prices moved during the scan, rescanned): ${gapStaleSkips}` : ''}${gapSamePoolSkips ? ` · gap routes skipped (send just went out on the same pool): ${gapSamePoolSkips}` : ''}`);
             // Feed trade turns (FEED_TRADE_DEFER): how many decide parts waited, the longest line, how long.
             const ft = feedTurns.take();
             if (FEED_TRADE_DEFER && ft.n) console.log(`[feed-turns] 5 min: ${ft.n} trades decided one per loop pass · longest line ${ft.maxDepth} · wait p50 ${ft.p50} / p90 ${ft.p90} / max ${ft.max} ms`);
             gapStaleSkips = 0;
+            gapSamePoolSkips = 0;
             const sd = formatStallDetail(sf);
             if (sd) console.log(`[stalls] ${sd}`);
             // Rival watch sender look-ups (signature checks) done vs skipped, last 5 min.
