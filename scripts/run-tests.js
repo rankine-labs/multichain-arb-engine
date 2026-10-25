@@ -24,6 +24,18 @@ const files = all.filter(f => existsSync(join(srcDir, f.replace(/\.js$/, '.ts'))
 const stale = all.filter(f => !files.includes(f));
 if (stale.length) console.log(`Skipping ${stale.length} stale compiled test(s) with no source: ${stale.join(', ')}`);
 
+// SPEED-COMPARISON tests (Oct 25): they time "before vs after" on the
+// machine they run on. On the live server (busy running the bot, 2 cores)
+// they fail at random and blocked 5 deploys in 2 days. The server's
+// pre-deploy run sets SKIP_TIMING_TESTS=1 (deploy/auto-deploy.sh) and skips
+// only these; GitHub's checks still run them before every merge.
+const TIMING_TESTS = new Set(['freezeFix.test.js', 'freezeFix2.test.js', 'trigSpeed.test.js', 'feedTradeSpeed.test.js']);
+if (process.env.SKIP_TIMING_TESTS === '1') {
+  const skipped = files.filter(f => TIMING_TESTS.has(f));
+  for (const f of skipped) files.splice(files.indexOf(f), 1);
+  if (skipped.length) console.log(`Skipping ${skipped.length} speed-comparison test(s) on this machine (SKIP_TIMING_TESTS=1): ${skipped.join(', ')}`);
+}
+
 if (files.length === 0) {
   console.error('No test files found in', testDir);
   process.exit(1);

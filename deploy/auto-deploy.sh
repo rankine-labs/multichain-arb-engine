@@ -385,7 +385,9 @@ fi
 
 # --- 4. Must compile and pass every test before restarting -------------------
 npm run typecheck || rollback "code does not compile"
-npm test          || rollback "tests failed"
+# Speed-comparison tests are skipped here (busy live server: random fails);
+# GitHub's checks run them before every merge (scripts/run-tests.js).
+SKIP_TIMING_TESTS=1 npm test || rollback "tests failed"
 
 # --- 4b. Compile src/ into dist/ (what pm2 actually runs) --------------------
 # Without this step a restart just relaunches the previously built code.
