@@ -622,7 +622,10 @@ export class TrigEntry {
         // more places. Live: 3 of 13 gap-making swaps behind rival wins were
         // dropped here as "busy".
         const full = this.inFlight >= Math.max(this.settings.maxDiscover, this.settings.maxInFlight);
-        const to = full || this.hot.size ? toOf(t.raw) : null;
+        // Always read `to` (a few microseconds): it is how hot targets are
+        // learned in the first place (bug Oct 25: only read once some were
+        // known, so none ever were).
+        const to = toOf(t.raw);
         const isHot = !!to && this.hot.has(to);
         if (full && !(isHot && this.inFlight < Math.max(this.settings.maxDiscover, this.settings.maxInFlight) + this.settings.hotExtra)) { this.hour.dropped++; this.seen?.add(t.hash.toLowerCase(), 'dropped'); continue; }
         if (full) this.hour.hotKept++;
