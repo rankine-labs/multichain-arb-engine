@@ -2797,7 +2797,7 @@ const fireTrade = async (o: {
                   liveTracker.track(fired.txHash, { expectedProfitUsd: netProfitUsd, label: tradeLabel, sizeUsd: o.tradeSizeUsd, funding, routeKey: routeKeyFor(dry.hops.map((h) => h.kind), dry.funding === 'v3-flash') });
                   if (fired.live) scoreboard.noteSend({ hash: fired.txHash, path: sendPath, confidence: trigConf, assumptions: trigAssumed, expectedUsd: netProfitUsd, label: tradeLabel, pools: [o.buyPool.poolAddress, o.sellPool.poolAddress], ...(o.entry ? { src: 'entry' as const } : {}) });
             }
-            console.log(`[fire] robinhood ${fired.live ? 'LIVE' : 'DRY RUN'} (${o.source}) ready ${readyMs}ms after ${o.source === 'trade' ? 'the trigger' : 'the price update'} (sign ${fired.signMs.toFixed(1)}ms)` +
+            console.log(`[fire] robinhood ${fired.live ? 'LIVE' : 'DRY RUN'} (${o.source}) ready ${readyMs}ms after ${o.source === 'trade' ? 'the trigger' : 'the price update'} (sign ${fired.signMs.toFixed(1)}ms${fired.sendMs !== undefined ? `, send ${fired.sendMs.toFixed(1)}ms` : ''})` +
                   `${fired.txHash ? ` tx ${fired.txHash}` : ''}${fired.error ? ` error: ${fired.error}` : ''}`);
       } catch (err) {
             console.warn('[exec-dryrun] skipped:', (err as Error).message);
@@ -4014,7 +4014,9 @@ await chainManager.startAll();
                         const spottedAt = Date.now(); // for the race check: spotted -> ready time
                         // Fast check (LOCAL_SIM): same question on the newest state; shadow = compared
                         // only, on = a sure fast answer is used (unknown -> the node, as before).
+                        const checkStarted = Date.now(); // timing (Oct 25): how long the check itself takes
                         const check = await checkRoundTrip('robinhood', g.quote, g.buyPool, g.sellPool, g.sizeUsd, g.quoteUsd, localSim ? { kind: 'gap', label: `${label} gap` } : undefined);
+                        const checkMs = Date.now() - checkStarted;
                         // Stall finder: handling the practice check's answer.
                         markStretch('gap check result');
                         if (check.status === 'rate_limited') {
@@ -4069,7 +4071,7 @@ await chainManager.startAll();
                         if (gapNew < simNet) console.log(`[gap] ${label}: same open gap grew, counted only the extra $${gapNew.toFixed(2)} of $${simNet.toFixed(2)}`);
                         // Would we really have won it? (ready = after our check + ~2 ms to sign)
                         void raceChecker.record({ label: `${label} gap`, pools: [g.buyPool.poolAddress, g.sellPool.poolAddress], netUsd: simNet, source: 'gap', readyDelayMs: Date.now() - spottedAt + 2 });
-                        console.log(`[gap] standing gap ${label} CONFIRMED: real ~$${simNet.toFixed(2)} (model $${g.profitUsd.toFixed(2)}) on $${Math.round(g.sizeUsd)} | ${route}`);
+                        console.log(`[gap] standing gap ${label} CONFIRMED: real ~$${simNet.toFixed(2)} (model $${g.profitUsd.toFixed(2)}) on $${Math.round(g.sizeUsd)} | ${route} | check ${checkMs}ms, ${Date.now() - spottedAt}ms since spotted`);
                         await fireTrade({
                               chain: 'robinhood', tokenIn: g.quote, tokenOut: g.base, buyPool: g.buyPool, sellPool: g.sellPool,
                               // Never trust the model over the simulation.
