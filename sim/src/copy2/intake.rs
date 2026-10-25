@@ -730,6 +730,38 @@ pub struct C2Shared {
     /// pick these first (dispatch_loads). Bounded (WANTED_MAX), forgotten
     /// after WANTED_FOR.
     pub wanted: Mutex<Wanted>,
+    /// RECENT MOVES (Oct 24, gap fix 1): which followed pools each recent
+    /// transaction moved, from the pool reports copy 2 applied (tx hash ->
+    /// block, pool keys as the bot names them). Lets "which pools?" still
+    /// answer for a trigger that is ALREADY in the copy (live: those were
+    /// given up as "already_in_copy" while rivals took the gap).
+    pub recent_moves: Mutex<RecentMoves>,
+}
+
+/// See C2Shared::recent_moves. Kept for the last RECENT_MOVES_BLOCKS blocks.
+#[derive(Default)]
+pub struct RecentMoves {
+    pub by_tx: HashMap<B256, (u64, Vec<String>)>,
+}
+pub const RECENT_MOVES_BLOCKS: u64 = 600;
+
+impl RecentMoves {
+    pub fn note(&mut self, tx: B256, block: u64, key: String) {
+        if tx == B256::ZERO {
+            return;
+        }
+        let e = self.by_tx.entry(tx).or_insert_with(|| (block, Vec::new()));
+        if !e.1.contains(&key) {
+            e.1.push(key);
+        }
+        if self.by_tx.len() > 50_000 {
+            let keep_from = block.saturating_sub(RECENT_MOVES_BLOCKS);
+            self.by_tx.retain(|_, v| v.0 >= keep_from);
+        }
+    }
+    pub fn pools_of(&self, tx: &B256) -> Option<Vec<String>> {
+        self.by_tx.get(tx).map(|v| v.1.clone())
+    }
 }
 
 /// Wanted pools by contract address (V2 / V3 / Solidly / Algebra) or V4
@@ -1938,6 +1970,7 @@ pub fn manual(sh: Arc<Shared>, fills: Arc<FillQueue>, cfg: C2Config) -> (Intake,
         mirror: sh.clone(),
         resume: Mutex::new(serde_json::Map::new()),
         wanted: Mutex::new(Wanted::default()),
+        recent_moves: Mutex::new(RecentMoves::default()),
     });
     let loaders = sh
         .node
@@ -3007,6 +3040,16 @@ impl Intake {
             // Loading / unsure: the buffer keeps this report for its load.
             inc(&st.events_skipped_not_ready);
             return;
+        }
+        // RECENT MOVES: this transaction moved this pool (gap fix 1).
+        {
+            let key = match k.1 {
+                Some(id) => format!("{id:#x}"),
+                None => format!("{:#x}", pool.address),
+            };
+            if let Ok(mut rm) = self.c2.recent_moves.lock() {
+                rm.note(log.tx_hash, rctx.number, key);
+            }
         }
         let mut f = ov.fork();
         match apply_event(&mut f, &pool, log, rctx) {

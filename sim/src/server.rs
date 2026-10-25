@@ -564,6 +564,17 @@ fn trig_discover_inner(ctx: &Ctx, id: &Value, req: &Value, t0: Instant, tm: &mut
         }
     };
     let Some((alone, others)) = crate::check::ordered::trigger_only(&plan) else {
+        // GAP FIX 1 (Oct 24): the copy already holds the trigger, so the
+        // gap it opened is IN the copy right now. Its pool reports said
+        // which followed pools it moved (copy2 RECENT MOVES): answer those,
+        // so the bot checks our routes on the current copy at once instead
+        // of giving up (live: rivals took those gaps).
+        if let Some(pools) = c2.c2.recent_moves.lock().ok().and_then(|rm| rm.pools_of(&info.trigger)) {
+            return json!({
+                "id": id, "ok": true, "pools": pools, "inCopy": true, "conf": "high", "assumed": [],
+                "snapBlock": info.snap_block, "triggerOk": true, "us": t0.elapsed().as_micros() as u64,
+            });
+        }
         Stats::inc(&sh.stats.checks_unknown);
         return json!({ "id": id, "ok": false, "unknown": "already_in_copy", "detail": "the copy version already holds the trigger", "us": t0.elapsed().as_micros() as u64 });
     };

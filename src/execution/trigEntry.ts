@@ -171,6 +171,7 @@ export type EntrySettings = {
   enabled: boolean;              // TRIG_FIRST_ENTRY [1] (and LOCAL_SIM_TRIGGER_FIRST not off)
   maxInFlight: number;           // TRIG_ENTRY_MAX_IN_FLIGHT [4] triggers CHECKED at once (they move our pools); more are dropped
   maxDiscover: number;           // TRIG_ENTRY_MAX_DISCOVER [24] triggers asked "which pools?" at once (cheap, ~4 ms); more are dropped
+  hotExtra: number;              // TRIG_ENTRY_HOT_EXTRA [16] extra places for transactions sent to a hot target (never dropped first)
   maxCandidates: number;         // TRIG_ENTRY_MAX_CANDIDATES [6] candidate trades built and checked per trigger (best-ranked first)
   maxPools: number;              // TRIG_ENTRY_MAX_POOLS [4] more moved pools than this = suspicious answer, skipped ("too_many_pools")
   parallel: number;              // TRIG_ENTRY_PARALLEL [2] candidate checks of one trigger at once
@@ -198,6 +199,7 @@ export function entrySettings(env: Record<string, string | undefined> = process.
     enabled: (env.TRIG_FIRST_ENTRY ?? '1').trim() !== '0',
     maxInFlight: Math.round(num('TRIG_ENTRY_MAX_IN_FLIGHT', 4)),
     maxDiscover: Math.round(num('TRIG_ENTRY_MAX_DISCOVER', 24)),
+    hotExtra: Math.round(num('TRIG_ENTRY_HOT_EXTRA', 16, 0)),
     maxCandidates: Math.round(num('TRIG_ENTRY_MAX_CANDIDATES', 6)),
     maxPools: Math.round(num('TRIG_ENTRY_MAX_POOLS', 4)),
     parallel: Math.round(num('TRIG_ENTRY_PARALLEL', 2)),
@@ -223,6 +225,16 @@ export function entrySettings(env: Record<string, string | undefined> = process.
 // approve, transfer, transferFrom, WETH deposit / withdraw, permit,
 // setApprovalForAll. Sent straight to a coin, they can't open an arb.
 const NON_SWAP = new Set(['0x095ea7b3', '0xa9059cbb', '0x23b872dd', '0xd0e30db0', '0x2e1a7d4d', '0xd505accf', '0xa22cb465']);
+
+// The `to` address of a raw feed transaction (lower case), null if unreadable / create.
+export function toOf(raw: string): string | null {
+  try {
+    const p = process.env.FEED_LIGHT_DECODE !== '0' ? peekFeedTx(raw) : undefined;
+    if (p === null) return null;
+    const tx = p ?? decodeFeedTx(raw);
+    return tx?.to ? tx.to.toLowerCase() : null;
+  } catch { return null; }
+}
 
 // Why a feed transaction needs no work at all (null = look at it).
 export function quickSkip(raw: string, hash: string, ours: { isOurTx: (h: string) => boolean; addresses: Set<string> }): string | null {
@@ -525,7 +537,7 @@ export class TrigEntry {
 
   private freshHour() {
     return {
-      feedTxs: 0, skipped: 0, dropped: 0, droppedBusy: 0, asked: 0, discovered: 0, touching: 0,
+      feedTxs: 0, skipped: 0, dropped: 0, droppedBusy: 0, hotKept: 0, inCopy: 0, asked: 0, discovered: 0, touching: 0,
       answered: 0, profitable: 0, profitUsd: 0, wouldSend: 0, sent: 0, held: 0, errors: 0,
       discoverMs: [] as number[], answerMs: [] as number[], submitMs: [] as number[],
       unknownWhy: {} as Record<string, number>, heldWhy: {} as Record<string, number>,
@@ -593,15 +605,28 @@ export class TrigEntry {
       for (const t of m?.txs ?? []) {
         this.hour.feedTxs++;
         try {
-          if (quickSkip(t.raw, t.hash, this.ours)) { this.hour.skipped++; continue; }
-        } catch { this.hour.skipped++; continue; }
+          const sk = quickSkip(t.raw, t.hash, this.ours);
+          // GAP FIX 3 (Oct 24): skipped ones are logged too (with the reason),
+          // to find gap-making swaps that never reach "which pools?".
+          if (sk) { this.hour.skipped++; if (sk !== 'ours') this.seen?.add(t.hash.toLowerCase(), `skip_${sk}`); continue; }
+        } catch { this.hour.skipped++; this.seen?.add(t.hash.toLowerCase(), 'skip_error'); continue; }
         // NO DROP (Oct 24, live: 45% of feed txs were dropped here while 4
         // triggers were being CHECKED, before we even knew if they moved our
         // pools). The cheap "which pools?" question now has its own, bigger
         // limit (TRIG_ENTRY_MAX_DISCOVER); only triggers that move our pools
         // take one of the TRIG_ENTRY_MAX_IN_FLIGHT check places (process).
         // Overloaded: drop (counted), never queue up behind the feed.
-        if (this.inFlight >= Math.max(this.settings.maxDiscover, this.settings.maxInFlight)) { this.hour.dropped++; this.seen?.add(t.hash.toLowerCase(), 'dropped'); continue; }
+        // GAP FIX 2 (Oct 24): never drop a transaction sent to a contract
+        // whose transactions recently moved our pools (a router, a pool, a
+        // bot contract: learned below, "hot"); those get TRIG_ENTRY_HOT_EXTRA
+        // more places. Live: 3 of 13 gap-making swaps behind rival wins were
+        // dropped here as "busy".
+        const full = this.inFlight >= Math.max(this.settings.maxDiscover, this.settings.maxInFlight);
+        const to = full || this.hot.size ? toOf(t.raw) : null;
+        const isHot = !!to && this.hot.has(to);
+        if (full && !(isHot && this.inFlight < Math.max(this.settings.maxDiscover, this.settings.maxInFlight) + this.settings.hotExtra)) { this.hour.dropped++; this.seen?.add(t.hash.toLowerCase(), 'dropped'); continue; }
+        if (full) this.hour.hotKept++;
+        if (to) this.toByHash.set(t.hash.toLowerCase(), to);
         this.inFlight++;
         const hash = t.hash.toLowerCase();
         const times: FrameTimes = { recv, parsed: hr?.parsed, queued: performance.now() };
@@ -614,6 +639,17 @@ export class TrigEntry {
   }
 
   inFlightNow(): number { return this.inFlight; }
+
+  // ---- hot targets (GAP FIX 2) ---------------------------------------------------
+  // Contracts whose transactions moved our pools in the last ~30 min.
+  private readonly hot = new Map<string, number>();
+  private readonly toByHash = new Map<string, string>();
+  private noteHot(to: string): void {
+    const now = this.now();
+    this.hot.set(to, now);
+    if (this.hot.size > 2_000) for (const [k, v] of this.hot) if (now - v > 1_800_000) this.hot.delete(k);
+  }
+  hotCount(): number { return this.hot.size; }
 
   // ---- one trigger ------------------------------------------------------------
   // Check places in use (triggers that move our pools, being sized and
@@ -629,6 +665,8 @@ export class TrigEntry {
     try { return await this.processInner(hash, seenMs, times, slot); }
     finally {
       if (slot.held) this.checking--;
+      this.toByHash.delete(hash);
+      if (this.toByHash.size > 5_000) this.toByHash.clear();
       this.seen?.add(hash, slot.out ?? 'other');
     }
   }
@@ -709,6 +747,9 @@ export class TrigEntry {
     const pools = Array.isArray(a.pools) ? (a.pools as unknown[]).filter((x): x is string => typeof x === 'string').map((x) => x.toLowerCase()) : [];
     if (!pools.length) { slot.out = 'no_pools'; return null; } // doesn't move any pool we follow: nothing to do
     slot.out = `pools:${pools.length}`;
+    if (a.inCopy === true) { h.inCopy++; slot.out = `pools:${pools.length}:in_copy`; }
+    // GAP FIX 2: remember who this transaction was sent to (hot target).
+    { const to = this.toByHash.get(hash); if (to) this.noteHot(to); }
     h.touching++;
     // A check place (NO DROP above): all taken = too busy for this one.
     if (this.checking >= s.maxInFlight) { h.droppedBusy++; return unknown('busy_checking'); }
@@ -1382,7 +1423,7 @@ export class TrigEntry {
       const top = (m: Record<string, number>) => Object.entries(m).sort((a, b) => b[1] - a[1]).slice(0, 4).map(([k, n]) => `${k} ${n}`).join(', ');
       const parts = [
         `${h.feedTxs} feed txs, ${h.asked} looked at (skipped ${h.skipped}, dropped ${h.dropped} overloaded, ${h.droppedBusy} moving our pools but all ${this.settings.maxInFlight} check places busy)`,
-        `moving our pools ${h.touching} (${pct(h.touching, h.discovered)} of ${h.discovered} answered)`,
+        `moving our pools ${h.touching} (${pct(h.touching, h.discovered)} of ${h.discovered} answered; ${h.inCopy} already in our copy, checked on it; ${h.hotKept} hot kept instead of dropped, ${this.hot.size} hot targets)`,
         `answered ${h.answered} (${pct(h.answered, h.touching)})`,
         `profitable ${h.profitable} ($${h.profitUsd.toFixed(2)} after gas)`,
         `would send ${h.wouldSend}, sent ${h.sent}${h.held ? `, held back ${h.held} (${top(h.heldWhy)})` : ''}`,
