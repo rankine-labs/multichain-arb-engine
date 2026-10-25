@@ -73,6 +73,7 @@ export interface WsBlockReaderOptions {
   onHealthChange?: (healthy: boolean, lastBlock: number) => void;
   heads?: boolean;                                 // also subscribe to newHeads (extra messages; off by default)
   staleMs?: number;                                // default 10,000
+  topicChunk?: number;                             // most ids / pools in one subscription topic list (default 400; Chainstack refuses long lists)
   pingMs?: number;                                 // send a keep-alive ping after this much quiet (default 5,000)
   minBackoffMs?: number;                           // default 1,000
   maxBackoffMs?: number;                           // default 30,000
@@ -147,6 +148,15 @@ export interface RawLogTap {
 const TRANSFER_TOPIC = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
 const padTopic = (a: string): string => '0x' + '0'.repeat(24) + a.toLowerCase().slice(2);
 
+// SPLIT (Oct 25): a long topic list in pieces of at most `size` (never an
+// empty piece; an empty list gives no pieces, so nothing is subscribed).
+export function topicChunks<T>(list: T[], size: number): T[][] {
+  const n = Math.max(1, Math.floor(size));
+  const out: T[][] = [];
+  for (let i = 0; i < list.length; i += n) out.push(list.slice(i, i + n));
+  return out;
+}
+
 // Read a hex block number. null when missing / unreadable.
 function toNum(v: unknown): number | null {
   if (v === undefined || v === null) return null;
@@ -204,6 +214,7 @@ export class WsBlockReader {
   private readonly schedule: (fn: () => void, ms: number) => () => void;
   private readonly usage: NodeUsageCounter;
   private readonly staleMs: number;
+  private readonly topicChunk: number;     // most entries in one subscription's topic list (BLOCK_READER_WSS_TOPIC_CHUNK)
   private readonly pingMs: number;
   private readonly minBackoff: number;
   private readonly maxBackoff: number;
@@ -213,7 +224,12 @@ export class WsBlockReader {
   private gen = 0;                         // connection id: events from an old socket are ignored
   private logsSub: string | null = null;   // subscription id the node gave us for events
   private headsSub: string | null = null;
-  private v4Sub: string | null = null;     // second subscription: V4 swaps for OUR pool ids only (address filter mode)
+  // V4 swaps for OUR pool ids only (address filter mode). SPLIT (Oct 25):
+  // one subscription per piece of the id list (see topicChunks), so a set.
+  private v4Subs = new Set<string>();
+  // Request id -> which kind of subscription it asked for, for the pieces
+  // beyond the first (ids 3 / 4 / 5 stay the first piece of each kind).
+  private extraReq = new Map<number, 'v4' | 'tf'>();
   private subscribed = false;
   private hadData = false;                 // a real event arrived on this connection (resets the backoff)
   private lastMsgAt = 0;                   // last time ANYTHING arrived (message or pong)
@@ -257,6 +273,7 @@ export class WsBlockReader {
     this.schedule = o.schedule ?? realSchedule;
     this.usage = o.usage ?? nodeUsage;
     this.staleMs = o.staleMs ?? 10_000;
+    this.topicChunk = Math.max(1, Math.floor(o.topicChunk ?? 400));
     this.pingMs = o.pingMs ?? 5_000;
     this.minBackoff = o.minBackoffMs ?? 1_000;
     this.maxBackoff = o.maxBackoffMs ?? 30_000;
@@ -420,7 +437,7 @@ export class WsBlockReader {
     this.hadData = false;
     this.logsSub = null;
     this.headsSub = null;
-    this.v4Sub = null;
+    this.v4Subs = new Set(); this.extraReq = new Map();
     this.lastMsgAt = this.now();           // the stale check also covers a connect that never finishes
     let sock: SocketLike;
     try {
@@ -466,13 +483,34 @@ export class WsBlockReader {
           sock.send(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_subscribe', params: ['logs', this.tapOn ? { address: pools } : { address: pools, topics: [nonV4] }] }));
           const pm = (this.o.poolManager || '').toLowerCase();
           const v4 = !!pm && ids.length > 0;
-          if (v4) sock.send(JSON.stringify({ jsonrpc: '2.0', id: 3, method: 'eth_subscribe', params: ['logs', { address: pm, topics: this.tapOn ? [null, ids] : [[V4_SWAP_TOPIC], ids] }] }));
+          // SPLIT (Oct 25, live): Chainstack refuses a subscription whose
+          // topic list is too long ("exceed max topics"); with 1,000+ V4 pool
+          // ids that happened 278 times in a day and copy 2 went blind for
+          // up to 30 min each time. Long lists are now sent in pieces of at
+          // most topicChunk (BLOCK_READER_WSS_TOPIC_CHUNK, default 400): the
+          // first piece keeps request id 3 (V4) / 4+5 (transfers), the rest
+          // get ids from 100 up. Same events, just more subscriptions.
+          const waiting: number[] = [1];
+          let nextId = 100;
+          if (v4) {
+            topicChunks(ids, this.topicChunk).forEach((part, k) => {
+              const id = k === 0 ? 3 : nextId++;
+              if (k > 0) this.extraReq.set(id, 'v4');
+              waiting.push(id);
+              sock.send(JSON.stringify({ jsonrpc: '2.0', id, method: 'eth_subscribe', params: ['logs', { address: pm, topics: this.tapOn ? [null, part] : [[V4_SWAP_TOPIC], part] }] }));
+            });
+          }
           if (tf) {
-            const padded = tf.pools.map(padTopic);
-            sock.send(JSON.stringify({ jsonrpc: '2.0', id: 4, method: 'eth_subscribe', params: ['logs', { address: tf.coins, topics: [TRANSFER_TOPIC, padded] }] }));
-            sock.send(JSON.stringify({ jsonrpc: '2.0', id: 5, method: 'eth_subscribe', params: ['logs', { address: tf.coins, topics: [TRANSFER_TOPIC, null, padded] }] }));
+            topicChunks(tf.pools.map(padTopic), this.topicChunk).forEach((padded, k) => {
+              const a = k === 0 ? 4 : nextId++;
+              const b = k === 0 ? 5 : nextId++;
+              if (k > 0) { this.extraReq.set(a, 'tf'); this.extraReq.set(b, 'tf'); }
+              waiting.push(a, b);
+              sock.send(JSON.stringify({ jsonrpc: '2.0', id: a, method: 'eth_subscribe', params: ['logs', { address: tf.coins, topics: [TRANSFER_TOPIC, padded] }] }));
+              sock.send(JSON.stringify({ jsonrpc: '2.0', id: b, method: 'eth_subscribe', params: ['logs', { address: tf.coins, topics: [TRANSFER_TOPIC, null, padded] }] }));
+            });
             // (+ block headers, id 2 below, when asked for): live only once all are confirmed.
-            this.tapWaiting = new Set([1, ...(v4 ? [3] : []), 4, 5, ...(this.tapHeadsOn ? [2] : [])]);
+            this.tapWaiting = new Set([...waiting, ...(this.tapHeadsOn ? [2] : [])]);
             this.tapCoverage = { pools: new Set(pools), ids: new Set(v4 ? ids : []), transferPools: new Set(tf.pools), coins: new Set(tf.coins) };
           }
         } else {
@@ -508,7 +546,7 @@ export class WsBlockReader {
     this.subscribed = false;
     this.logsSub = null;
     this.headsSub = null;
-    this.v4Sub = null;
+    this.v4Subs = new Set(); this.extraReq = new Map();
     if (s) {
       try { s.terminate ? s.terminate() : s.close(); } catch { /* already closed */ }
     }
@@ -542,7 +580,7 @@ export class WsBlockReader {
 
       // Replies to the copy-2 transfer subscriptions (only sent when the tap is on),
       // and to the header subscription when the tap asked for it.
-      if ((m.id === 4 || m.id === 5 || (m.id === 2 && !this.o.heads && this.tapHeadsOn)) && this.tapOn) {
+      if ((m.id === 4 || m.id === 5 || this.extraReq.get(m.id) === 'tf' || (m.id === 2 && !this.o.heads && this.tapHeadsOn)) && this.tapOn) {
         if (m.error || typeof m.result !== 'string') {
           // Provider refuses this filter: copy 2 stays off on this reader
           // (the fast check falls back to the node), normal events continue.
@@ -558,7 +596,7 @@ export class WsBlockReader {
         return;
       }
       // Replies to our subscribe requests.
-      if (m.id === 1 || m.id === 2 || m.id === 3) {
+      if (m.id === 1 || m.id === 2 || m.id === 3 || this.extraReq.get(m.id) === 'v4') {
         if (m.error || typeof m.result !== 'string') {
           // e.g. the provider refuses an address-less log subscription.
           this.counts.subscribeErrors++;
@@ -577,9 +615,9 @@ export class WsBlockReader {
           // Gap fill: blocks we may have missed while disconnected.
           if (reconnect && this.lastBlock >= 0) void this.backfill(this.lastBlock, 'gap');
           this.tapReplied(1);
-        } else if (m.id === 3) {
-          this.v4Sub = m.result;
-          this.tapReplied(3);
+        } else if (m.id === 3 || this.extraReq.get(m.id) === 'v4') {
+          this.v4Subs.add(m.result);
+          this.tapReplied(m.id);
         } else {
           this.headsSub = m.result;
           this.tapReplied(2);
@@ -604,7 +642,7 @@ export class WsBlockReader {
           this.toTap(Array.isArray(r) ? r : [r]);
           return;
         }
-        if (sub && (sub === this.logsSub || sub === this.v4Sub) && r) {
+        if (sub && (sub === this.logsSub || this.v4Subs.has(sub)) && r) {
           this.markData();
           if (sub === this.logsSub) this.dataAt.pools = this.now(); else this.dataAt.v4 = this.now();
           const logs: RpcLog[] = Array.isArray(r) ? r : [r];
