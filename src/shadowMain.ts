@@ -1792,7 +1792,7 @@ const loanUnits = (tradeSizeUsd: number, usdPerToken: number, decimals: number):
 const pickLender = (
       chain: 'avalanche' | 'monad' | 'robinhood', tokenIn: string, buyPool: any, sellPool: any,
       tradeSizeUsd: number, usdPerToken: number,
-      // More of the route's own pools a lender may not be (3-pool loops: the third pool).
+      // More of the route's own pools a lender may not be (loops: every pool after the first two).
       extraExclude: string[] = [],
 ) => {
       const exclude = [buyPool.poolAddress, sellPool.poolAddress, ...extraExclude];
@@ -3080,8 +3080,10 @@ const entryLoopIndex: EntryLoopIndex<PoolState> | null = entryLoopSettings.enabl
             log: (m) => console.log(m),
       })
       : null;
-// Our gas for a 3-pool loop (calibrated loop estimate; a flash loan costs a bit more).
-const entryLoopGasUsd = (flash: boolean) => gasModel.loopUsd(3, 0.05) + (flash ? Math.max(0, rhGasUsd(0.05, true) - rhGasUsd(0.05, false)) : 0);
+// Our gas for a loop of `pools` pools (calibrated loop estimate; a flash loan
+// costs a bit more). Oct 25: 4-pool loops (TRIG_ENTRY_LOOP_POOLS_MAX=4) pass 4
+// here, so their higher gas (~635k vs ~507k units) is what they are judged on.
+const entryLoopGasUsd = (flash: boolean, pools = 3) => gasModel.loopUsd(pools, 0.05) + (flash ? Math.max(0, rhGasUsd(0.05, true) - rhGasUsd(0.05, false)) : 0);
 const entryLoopStates = (l: EntryLoop): PoolState[] | null => {
       const st = l.keys.map((k) => cache.get('robinhood', k));
       return st.every((p) => !!p) ? (st as PoolState[]) : null;
@@ -3089,7 +3091,7 @@ const entryLoopStates = (l: EntryLoop): PoolState[] | null => {
 // Ranking facts, same rule as 2-pool routes: a start coin we hold first, then
 // the quick price check at the smallest ladder size ($, before gas), minus
 // the loop's EXTRA gas over a 2-pool trade, so the two kinds compare fairly.
-// Remembered while the 3 pool states and the coin price are the same.
+// Remembered while the loop's pool states and the coin price are the same.
 const entryLoopMemo = new LoopScoreMemo();
 const entryLoopHeld = (l: EntryLoop) => entryHeld({ tokenIn: l.start });
 const entryLoopScore = (l: EntryLoop): number | null => {
@@ -3099,11 +3101,12 @@ const entryLoopScore = (l: EntryLoop): number | null => {
       if (d === undefined || !(px > 0)) return null;
       const smallest = trigEntry?.settings.sizesUsd[0] ?? 50;
       const q = entryLoopMemo.get(l.id, st, px, () => loopQuoteUsd(st, l.inIsA, smallest, px, d));
-      return q === null ? null : q - Math.max(0, entryLoopGasUsd(false) - rhGasUsd(0.05));
+      return q === null ? null : q - Math.max(0, entryLoopGasUsd(false, l.keys.length) - rhGasUsd(0.05));
 };
 // Build one loop candidate (null = can't). Our exact contract call is built
 // by the loop trader's own code (buildLoopTrade, the same hops live loops
-// send); the lender (if the size needs one) is never one of the 3 pools.
+// send); the lender (if the size needs one) is never one of the loop's pools
+// (3 or 4 of them: every pool after the first two is passed as "also not").
 const entryLoopBuild = (l: EntryLoop): EntryCandidate | null => {
       const st = entryLoopStates(l);
       if (!st) return null;
@@ -3118,21 +3121,21 @@ const entryLoopBuild = (l: EntryLoop): EntryCandidate | null => {
       if (!(maxSizeUsd > 0)) return null;
       const cycle = {
             id: 0, sig: l.id, poolSet: [...l.keys].sort().join(','), base: l.start, tokens: [...l.tokens],
-            hops: l.keys.map((k, i) => ({ poolKey: k, tokenIn: l.tokens[i], tokenOut: l.tokens[(i + 1) % 3], inIsA: l.inIsA[i] })),
+            hops: l.keys.map((k, i) => ({ poolKey: k, tokenIn: l.tokens[i], tokenOut: l.tokens[(i + 1) % l.keys.length], inIsA: l.inIsA[i] })),
       };
       // (The index already applied the live rules, so no rule lookups here: no node.)
       const tradeOf = (amountIn: bigint) => { const b = buildLoopTrade({ cycle, pools: st, amountIn }, () => true); return 'reason' in b ? null : b.trade; };
       if (!tradeOf(1n)) return null;
-      const lenderAt = (usd: number) => pickLender('robinhood', base, st[0], st[1], usd, usdPer, [st[2].poolAddress]);
+      const lenderAt = (usd: number) => pickLender('robinhood', base, st[0], st[1], usd, usdPer, st.slice(2).map((p) => p.poolAddress));
       const sizes = trigEntry?.settings.sizesUsd ?? [50];
       const mainLender = lenderAt(Math.min(sizes[sizes.length - 1], maxSizeUsd));
       const host: EntryLoopHost = { kind: 'loop', loop: l, base, usdPer, dec, coins };
       return {
             kind: 'loop',
             label: `loop ${[...l.tokens, l.start].map((t) => symbolOf('robinhood', t)).join('/')}`,
-            buyPool: st[0].poolAddress, sellPool: st[2].poolAddress, tokenIn: base, tokens: coins,
+            buyPool: st[0].poolAddress, sellPool: st[st.length - 1].poolAddress, tokenIn: base, tokens: coins,
             keys: [...st.map((p) => p.poolAddress), ...(mainLender ? [mainLender.poolAddress] : [])],
-            maxSizeUsd, gasUsd: entryLoopGasUsd(!!mainLender),
+            maxSizeUsd, gasUsd: entryLoopGasUsd(!!mainLender, l.keys.length),
             // Its own 30-min fail block: this exact loop (first pool + loop id).
             failKey: [l.keys[0], l.id],
             rank: { held: entryLoopHeld(l), score: entryLoopScore(l) },
@@ -3166,7 +3169,7 @@ const entryLoopSender: EntryLoopSender | null = entryLoopIndex ? new EntryLoopSe
             // One shared loop loss cap with the live loop sender (LOOP_LIVE=1).
             otherLossTodayUsd: () => loopLive?.lossTodayUsd() ?? 0,
             otherPaused: () => loopLive?.pausedToday() ?? false,
-            gasUsd: (flash) => entryLoopGasUsd(flash),
+            gasUsd: (flash, pools) => entryLoopGasUsd(flash, pools ?? 3),
             isOutlier: (net, size) => isOutlier(net, size, OUTLIER_CFG),
             safety: (sizeUsd, coins) => { const g = safetyGate.check({ tradeSizeUsd: sizeUsd, tokens: coins }); return g.ok ? null : ('reason' in g ? g.reason : 'blocked'); },
             ready: () => (liveChecks.ok ? null : 'live checks not passed'),
@@ -3220,7 +3223,7 @@ try {
                         ...(entryLoopIndex && entryLoopSender ? {
                               loopCandidatesFor: (keys: string[], limit: number) => entryLoopCandidatesFor(keys, limit),
                               loopGate: (p: EntryPick) => entryLoopSender.gate(p) ?? (robinhoodSender.live ? scoreboard.pausedWhy('loop') : null),
-                              loopHourText: () => { const i = entryLoopIndex.info(); return `loop index ${i.loops} loops over ${i.pools} pools${i.capped ? ' (capped)' : ''}, rebuilt in ${i.lastMs} ms; ${entryLoopSender.hourLine()}`; },
+                              loopHourText: () => { const i = entryLoopIndex.info(); return `loop index ${i.loops} loops${i.loops4 ? ` (${i.loops4} of them 4-pool)` : ''} over ${i.pools} pools${i.capped ? ' (capped)' : ''}, rebuilt in ${i.lastMs} ms; ${entryLoopSender.hourLine()}`; },
                         } : {}),
                         // Our own sends (seen again in the feed) and our contract: never triggers.
                         isOurTx: (h) => livePools.has(h) || livePools.has(h.toLowerCase()),
@@ -3247,7 +3250,7 @@ try {
                         },
                   });
                   // The loop index starts building only when the entry point really works.
-                  if (trigEntry.active() && entryLoopIndex) { entryLoopIndex.start(); console.log(`[trig-entry] 3-pool loops ON (TRIG_ENTRY_LOOPS=1): up to ${es.maxLoops} loops per trigger, loop index rebuilt every ${entryLoopIndex.s.checkMs / 1000} s if the pools changed (at least every ${entryLoopIndex.s.rebuildMs / 1000} s), ${entryLoopIndex.s.perPool} loops per pool`); }
+                  if (trigEntry.active() && entryLoopIndex) { entryLoopIndex.start(); console.log(`[trig-entry] 3-pool loops ON (TRIG_ENTRY_LOOPS=1): up to ${es.maxLoops} loops per trigger, loop index rebuilt every ${entryLoopIndex.s.checkMs / 1000} s if the pools changed (at least every ${entryLoopIndex.s.rebuildMs / 1000} s), ${entryLoopIndex.s.perPool} loops per pool${entryLoopIndex.s.poolsMax >= 4 ? `; 4-pool loops ON (TRIG_ENTRY_LOOP_POOLS_MAX=4): ${entryLoopIndex.s.perPool4} more per pool` : ''}`); }
             }
       }
 } catch (e) { console.log(`[trigger-first] could not start (${(e as Error).message}); the existing paths decide`); trigFirst = null; trigEntry = null; }

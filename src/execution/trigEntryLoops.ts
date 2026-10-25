@@ -45,6 +45,22 @@ import type { EntryPick } from './trigEntry';
 //       CAP (LOOP_LIVE_LOSS_CAP_USD, $2 of gas a day on failed loops, shared
 //       with the live loop sender) before every send.
 // ============================================================================
+//
+// 4-POOL LOOPS (Oct 25, TRIG_ENTRY_LOOP_POOLS_MAX=4; default 3 = off).
+//   Live today a rival bot earned ~$11-13 repeating the loop
+//   WETH -> PONS -> DJT -> USDG -> WETH (four Uniswap V3 pools). The index
+//   above only held 3-pool loops, so the bot never even looked at it. With
+//   the setting at 4, the index ALSO holds loops
+//     start -> coin A -> coin B -> coin C -> start
+//   through each pool, built under exactly the SAME RULES as 3-pool loops
+//   (same pool filter, same coin / tax filter, same lender, size and loss
+//   cap rules at send time: those don't care how many pools a loop has).
+//   They get their OWN share of each pool's list (TRIG_ENTRY_LOOPS4_PER_POOL,
+//   8) so they never push 3-pool loops out, and the whole index still keeps
+//   to TRIG_ENTRY_LOOP_INDEX_MAX (3-pool loops are counted first).
+//   Our contract runs any number of hops; the gas figure for 4 hops comes
+//   from loopGasUnits (core/loopTrader.ts: ~635k vs ~507k for 3 hops).
+// ============================================================================
 
 const lc = (x: string) => (x ?? '').toLowerCase();
 
@@ -55,6 +71,11 @@ export type LoopIndexSettings = {
   checkMs: number;     // TRIG_ENTRY_LOOP_INDEX_MS [10000] how often "did the pool set change?" is asked
   rebuildMs: number;   // TRIG_ENTRY_LOOP_REBUILD_MS [60000] rebuilt at least this often anyway
   sliceMs: number;     // a rebuild works at most this long before letting the bot run [2]
+  // 4-POOL LOOPS (Oct 25). poolsMax 3 = only 3-pool loops (as before).
+  poolsMax: number;    // TRIG_ENTRY_LOOP_POOLS_MAX [3] longest loop in the index (3 or 4)
+  perPool4: number;    // TRIG_ENTRY_LOOPS4_PER_POOL [8] 4-pool loops kept per pool, ON TOP of the 3-pool ones
+  perCoin4: number;    // TRIG_ENTRY_LOOPS4_PER_COIN [400] 4-pool loops looked at per (start coin, first middle coin)
+  maxSteps4: number;   // TRIG_ENTRY_LOOPS4_MAX_STEPS [3000000] work limit for the 4-pool search in one rebuild
 };
 export function loopIndexSettings(env: Record<string, string | undefined> = process.env): LoopIndexSettings {
   const num = (k: string, d: number, min: number) => { const v = Number(env[k]); return env[k] !== undefined && env[k]!.trim() !== '' && Number.isFinite(v) && v >= min ? v : d; };
@@ -64,18 +85,25 @@ export function loopIndexSettings(env: Record<string, string | undefined> = proc
     checkMs: num('TRIG_ENTRY_LOOP_INDEX_MS', 10_000, 500),
     rebuildMs: num('TRIG_ENTRY_LOOP_REBUILD_MS', 60_000, 1_000),
     sliceMs: 2,
+    // 3 or 4 only: anything above 4 means 4, anything below 3 means 3.
+    poolsMax: Math.min(4, Math.max(3, Math.round(num('TRIG_ENTRY_LOOP_POOLS_MAX', 3, 0)))),
+    perPool4: Math.round(num('TRIG_ENTRY_LOOPS4_PER_POOL', 8, 1)),
+    perCoin4: Math.round(num('TRIG_ENTRY_LOOPS4_PER_COIN', 400, 1)),
+    maxSteps4: Math.round(num('TRIG_ENTRY_LOOPS4_MAX_STEPS', 3_000_000, 1_000)),
   };
 }
 
 // ---- one loop ---------------------------------------------------------------
-// start -> tokens[1] -> tokens[2] -> start, through keys[0], keys[1], keys[2].
+// start -> tokens[1] -> tokens[2] (-> tokens[3]) -> start, through keys[0..].
+// 3 pools (3 coins) or, since Oct 25, 4 pools (4 coins): keys, tokens and
+// inIsA always have the same length (= the number of pools).
 // inIsA[i]: the coin going INTO pool i is that pool's tokenA (token0).
 export type EntryLoop = {
-  id: string;                          // "loop:<start>:<pool1>><pool2>><pool3>" (lower case)
+  id: string;                          // "loop:<start>:<pool1>><pool2>><pool3>[><pool4>]" (lower case)
   start: string;                       // lower case
-  keys: [string, string, string];      // pool keys (address, or V4 pool id), lower case
-  tokens: [string, string, string];    // coins in order, starting with `start` (lower case)
-  inIsA: [boolean, boolean, boolean];
+  keys: string[];                      // pool keys (address, or V4 pool id), lower case
+  tokens: string[];                    // coins in order, starting with `start` (lower case)
+  inIsA: boolean[];
   prio: number;                        // ordering inside a pool's list (higher = first): shallowest pool's depth
 };
 
@@ -90,7 +118,13 @@ export type LoopRules<P> = {
   depth?: (p: P) => number;                      // money near the price ($): deeper loops first
 };
 
-export type LoopIndexData = { byPool: Map<string, EntryLoop[]>; loops: number; pools: number; capped: boolean };
+// loops: all loops in the index (3- and 4-pool); loops4: of which 4-pool.
+// capped: some loops were left out because a limit was reached.
+export type LoopIndexData = { byPool: Map<string, EntryLoop[]>; loops: number; pools: number; capped: boolean; loops4?: number };
+
+// Options for one build. Only perPool / maxLoops are needed; without
+// poolsMax 4 the build is exactly the 3-pool one (as before Oct 25).
+export type LoopBuildOpts = { perPool: number; maxLoops: number; poolsMax?: number; perPool4?: number; perCoin4?: number; maxSteps4?: number };
 
 // ENUMERATION (pure, written as steps so it can run in small bites).
 // For each start coin S, each pool p1 with S (S -> X), each pool p2 with X
@@ -98,7 +132,7 @@ export type LoopIndexData = { byPool: Map<string, EntryLoop[]>; loops: number; p
 // S -p1-> X -p2-> Y -p3-> S. Both directions come out naturally (the
 // reverse is S -p3-> Y -p2-> X -p1-> S). Every loop is filed under each of
 // its 3 pools; each pool keeps its `perPool` best (deepest) loops.
-export function* buildLoopIndexSteps<P>(pools: P[], startCoins: string[], r: LoopRules<P>, o: { perPool: number; maxLoops: number }): Steps<LoopIndexData> {
+export function* buildLoopIndexSteps<P>(pools: P[], startCoins: string[], r: LoopRules<P>, o: LoopBuildOpts): Steps<LoopIndexData> {
   const starts = [...new Set(startCoins.map(lc))];
   const isStart = (t: string) => starts.includes(t);
   // Usable pools (rules), once each.
@@ -160,7 +194,126 @@ export function* buildLoopIndexSteps<P>(pools: P[], startCoins: string[], r: Loo
     x.sort((p, q) => q.prio - p.prio || (p.id < q.id ? -1 : p.id > q.id ? 1 : 0));
     if (x.length > o.perPool) byPool.set(k, x.slice(0, o.perPool));
   }
-  return { byPool, loops: all.length, pools: usable.length, capped };
+  // 4-POOL LOOPS (Oct 25): only when switched on, and only with room left
+  // under the whole-index limit (3-pool loops always come first).
+  if ((o.poolsMax ?? 3) < 4) return { byPool, loops: all.length, pools: usable.length, capped };
+  const room = Math.max(0, o.maxLoops - all.length);
+  const f = yield* buildLoops4Steps(usable, starts, {
+    perPool: o.perPool4 ?? 8, room, perCoin: o.perCoin4 ?? 400, maxSteps: o.maxSteps4 ?? 3_000_000,
+  });
+  // Each pool's list: its 3-pool loops first, then its own 4-pool share.
+  for (const [k, x] of f.byPool) {
+    if ((++n & 63) === 0) yield;
+    const three = byPool.get(k);
+    byPool.set(k, three ? three.concat(x) : x);
+  }
+  return { byPool, loops: all.length + f.loops, pools: usable.length, capped: capped || f.capped, loops4: f.loops };
+}
+
+// Same order everywhere: deeper (higher prio) first, then by id so a
+// rebuild with the same pools gives exactly the same lists.
+const byPrio = (p: EntryLoop, q: EntryLoop) => q.prio - p.prio || (p.id < q.id ? -1 : p.id > q.id ? 1 : 0);
+
+// 4-POOL SEARCH (Oct 25), on the pools that already passed every rule.
+//
+// Plain English: a 4-pool loop is S -> X -> Y -> Z -> S. Instead of trying
+// every chain of 4 pools (far too many with ~1,200 pools), it goes:
+//   for each start coin S, each coin X next to S, each coin Z next to S:
+//   the middle coin Y must be next to BOTH X and Z, so only the SHORTER of
+//   X's and Z's neighbour lists is walked, and the other is just asked
+//   "do you touch Y?". Small coins have few neighbours, so this is cheap.
+// Limits that keep it bounded (the bot never freezes; it yields every 256
+// steps, the rebuild runs in ~2 ms bites):
+//   - pools: only those that passed the rules (cleared exchange, contract
+//     can run it, exact maths, DEPTH filter, allowed and tax-tested coins);
+//   - per coin pair: only the 3 deepest pools (fee tiers) are used;
+//   - per (start coin, first middle coin): at most perCoin loops looked at,
+//     so one busy coin can't eat the whole search;
+//   - the whole search: at most maxSteps steps (then "capped" in the
+//     hourly line; the per-coin limit above is normal and not reported);
+//   - per pool: only the perPool deepest 4-pool loops are KEPT (memory),
+//     and the whole 4-pool part fits in `room` (TRIG_ENTRY_LOOP_INDEX_MAX
+//     minus the 3-pool loops).
+// Both directions come out naturally ((X, Z) and later (Z, X)), and the
+// same loop starting at the other coin we hold (USDG vs WETH) is a separate
+// loop, just like 3-pool loops.
+const PAIR_POOLS4 = 3;
+function* buildLoops4Steps(usable: Array<{ k: string; a: string; b: string; d: number }>, starts: string[],
+  o: { perPool: number; room: number; perCoin: number; maxSteps: number }): Steps<{ byPool: Map<string, EntryLoop[]>; loops: number; capped: boolean }> {
+  type U = { k: string; a: string; b: string; d: number };
+  const empty = { byPool: new Map<string, EntryLoop[]>(), loops: 0, capped: o.room <= 0 };
+  if (o.room <= 0 || o.perPool <= 0) return empty;
+  let n = 0;
+  // Neighbours: coin -> (next coin -> its pools, deepest first, top 3).
+  const nb = new Map<string, Map<string, U[]>>();
+  for (const u of usable) {
+    if ((++n & 255) === 0) yield;
+    for (const [x, y] of [[u.a, u.b], [u.b, u.a]] as const) {
+      let m = nb.get(x); if (!m) { m = new Map(); nb.set(x, m); }
+      const l = m.get(y); if (l) l.push(u); else m.set(y, [u]);
+    }
+  }
+  for (const m of nb.values()) for (const [y, l] of m) {
+    if ((++n & 255) === 0) yield;
+    l.sort((p, q) => q.d - p.d || (p.k < q.k ? -1 : p.k > q.k ? 1 : 0));
+    if (l.length > PAIR_POOLS4) m.set(y, l.slice(0, PAIR_POOLS4));
+  }
+  // Kept loops per pool, best first (at most perPool each).
+  const top = new Map<string, EntryLoop[]>();
+  const wouldKeep = (k: string, prio: number) => { const a = top.get(k); return !a || a.length < o.perPool || prio >= a[a.length - 1].prio; };
+  const keep = (l: EntryLoop) => {
+    for (const k of l.keys) {
+      let a = top.get(k); if (!a) { a = []; top.set(k, a); }
+      if (a.length >= o.perPool && byPrio(l, a[a.length - 1]) >= 0) continue; // not better than this pool's worst
+      let i = a.length; while (i > 0 && byPrio(l, a[i - 1]) < 0) i--;
+      a.splice(i, 0, l);
+      if (a.length > o.perPool) a.pop();
+    }
+  };
+  let capped = false, steps = 0;
+  outer:
+  for (const S of starts) {
+    const nS = nb.get(S);
+    if (!nS) continue;
+    // Coins next to S, deepest connection first (so limits drop the shallow ones).
+    const ends = [...nS.keys()].sort((x, y) => (nS.get(y)![0].d - nS.get(x)![0].d) || (x < y ? -1 : x > y ? 1 : 0));
+    for (const X of ends) {
+      const nX = nb.get(X)!;
+      let made = 0;
+      for (const Z of ends) {
+        if (++steps > o.maxSteps) { capped = true; break outer; }
+        if ((++n & 255) === 0) yield;
+        if (Z === X) continue;
+        const nZ = nb.get(Z)!;
+        const [small, big] = nX.size <= nZ.size ? [nX, nZ] : [nZ, nX];
+        for (const Y of small.keys()) {
+          if (++steps > o.maxSteps) { capped = true; break outer; }
+          if ((++n & 255) === 0) yield;
+          if (Y === S || Y === X || Y === Z || !big.has(Y)) continue;
+          // Four different coins = four different pairs = four different pools.
+          const p1s = nS.get(X)!, p2s = nX.get(Y)!, p3s = nb.get(Y)!.get(Z)!, p4s = nZ.get(S)!;
+          for (const u1 of p1s) for (const u2 of p2s) for (const u3 of p3s) for (const u4 of p4s) {
+            if (made >= o.perCoin) continue; // per-coin limit: a normal bound, not reported as "capped"
+            made++;
+            const prio = Math.min(u1.d, u2.d, u3.d, u4.d);
+            const keys = [u1.k, u2.k, u3.k, u4.k];
+            if (!keys.some((k) => wouldKeep(k, prio))) continue; // too shallow for every one of its pools
+            keep({ id: loopId(S, keys), start: S, keys, tokens: [S, X, Y, Z], inIsA: [u1.a === S, u2.a === X, u3.a === Y, u4.a === Z], prio });
+          }
+        }
+      }
+    }
+  }
+  // The loops kept by at least one pool; trimmed to `room` (shallowest out first).
+  const kept = new Set<EntryLoop>();
+  for (const a of top.values()) for (const l of a) kept.add(l);
+  if (kept.size > o.room) {
+    const best = [...kept].sort(byPrio).slice(0, o.room);
+    const ok = new Set(best);
+    for (const [k, a] of top) { const b = a.filter((l) => ok.has(l)); if (b.length) top.set(k, b); else top.delete(k); }
+    return { byPool: top, loops: best.length, capped: true };
+  }
+  return { byPool: top, loops: kept.size, capped };
 }
 
 // The LOOP INDEX: rebuilt in the background (bites), swapped in whole when
@@ -187,8 +340,8 @@ export class EntryLoopIndex<P> {
 
   // Loops through this pool (deepest first), or none.
   loopsFor(key: string): EntryLoop[] { return this.data.byPool.get(lc(key)) ?? []; }
-  info(): { loops: number; pools: number; capped: boolean; lastMs: number; builds: number; ageMs: number } {
-    return { loops: this.data.loops, pools: this.data.pools, capped: this.data.capped, lastMs: this.lastMs, builds: this.builds, ageMs: this.lastBuiltAt ? this.now() - this.lastBuiltAt : -1 };
+  info(): { loops: number; loops4: number; pools: number; capped: boolean; lastMs: number; builds: number; ageMs: number } {
+    return { loops: this.data.loops, loops4: this.data.loops4 ?? 0, pools: this.data.pools, capped: this.data.capped, lastMs: this.lastMs, builds: this.builds, ageMs: this.lastBuiltAt ? this.now() - this.lastBuiltAt : -1 };
   }
 
   // Rebuild if the pool set changed or the index is older than rebuildMs.
@@ -244,7 +397,7 @@ export function pickLoops(keys: string[], loopsFor: (key: string) => EntryLoop[]
 }
 
 // QUICK PRICE CHECK of one loop (the model's maths, no node): profit in $ of
-// a `usdSize` trade through the 3 pools' current states, before gas. null =
+// a `usdSize` trade through the loop's pools' current states (3 or 4), before gas. null =
 // can't price it. Same pool maths as the 2-pool quick check (roundTripQuote).
 export function loopQuoteUsd(pools: PoolState[], inIsA: boolean[], usdSize: number, usdPer: number, dec: number): number | null {
   if (!(usdSize > 0) || !(usdPer > 0) || pools.length !== inIsA.length) return null;
@@ -257,7 +410,7 @@ export function loopQuoteUsd(pools: PoolState[], inIsA: boolean[], usdSize: numb
   return (Number(amt) / scale) * usdPer - usdSize;
 }
 
-// Quick price checks remembered per loop while its 3 pool states (replaced,
+// Quick price checks remembered per loop while its pool states (replaced,
 // never edited, by the price cache) and the start coin's price are the same.
 export class LoopScoreMemo {
   private m = new Map<string, { s: unknown[]; px: number; v: number | null }>();
@@ -323,7 +476,8 @@ export interface EntryLoopSendDeps {
   // Live loops' own loss today and pause (execution/loopLive.ts): one shared cap.
   otherLossTodayUsd: () => number;
   otherPaused: () => boolean;
-  gasUsd: (flash: boolean) => number;                     // our gas for a 3-pool loop
+  // Our gas for a loop of `pools` pools (3 or 4; missing = 3, as before Oct 25).
+  gasUsd: (flash: boolean, pools?: number) => number;
   isOutlier: (netUsd: number, sizeUsd: number) => boolean;
   safety: (sizeUsd: number, coins: string[]) => string | null;
   ready: () => string | null;                             // live readiness checks
@@ -382,7 +536,7 @@ export class EntryLoopSender {
     const fl = this.held();
     if (fl.ids.has(h.loop.id) || h.loop.keys.some((k) => fl.pools.has(k))) return 'a loop on these pools is still in flight';
     const flash = !!p.q.simOpts?.v3Lender;
-    if (this.lossTodayUsd() + this.d.otherLossTodayUsd() + fl.usd + this.d.gasUsd(flash) > this.s.lossCapUsd) return 'loop loss cap (counting trades in flight)';
+    if (this.lossTodayUsd() + this.d.otherLossTodayUsd() + fl.usd + this.d.gasUsd(flash, h.loop.keys.length) > this.s.lossCapUsd) return 'loop loss cap (counting trades in flight)';
     return null;
   }
 
@@ -421,7 +575,7 @@ export class EntryLoopSender {
       const fired = await this.d.fire(to ?? '0x0000000000000000000000000000000000000000', data);
       if (!fired.live || !live) { this.hour.dry++; return { signedMs: fired.signedAtMs, why: fired.signedAtMs === undefined ? 'dry run' : undefined }; }
       if (!fired.txHash) { this.d.log(`[trig-entry] loop SEND FAILED ${p.cand.label}: ${fired.error ?? 'no hash'}`); return this.skip('node refused the send'); }
-      const gasUsd = this.d.gasUsd(!!lender);
+      const gasUsd = this.d.gasUsd(!!lender, h.loop.keys.length);
       this.inflight.set(lc(fired.txHash), { id: h.loop.id, pools: h.loop.keys.slice(), holdUsd: gasUsd, at: this.d.now() });
       if (this.inflight.size > 500) this.inflight.delete(this.inflight.keys().next().value as string);
       this.hour.sent++;
