@@ -8,7 +8,7 @@
 // Usage: npm test   (compiles TypeScript first, then runs this)
 // ============================================================================
 
-const { readdirSync } = require('fs');
+const { readdirSync, mkdirSync, rmSync } = require('fs');
 const { join } = require('path');
 const { spawnSync } = require('child_process');
 
@@ -41,15 +41,28 @@ if (files.length === 0) {
   process.exit(1);
 }
 
+// TEMP FILES (Oct 25, live): many tests make temporary folders (os.tmpdir())
+// and never remove them. On the server /tmp lives in MEMORY, and after a few
+// days of deploys ~1 GB of leftovers there made the server run out of memory
+// every few minutes (pm2 killed and restarted 14 times in one day). Every
+// test file now gets temp folders inside one folder ON DISK (.test-tmp/ next
+// to the build), which is emptied before and after the run.
+const tmpRoot = join(__dirname, '..', '.test-tmp');
+const cleanTmp = () => { try { rmSync(tmpRoot, { recursive: true, force: true }); } catch { /* best effort */ } };
+cleanTmp();
+mkdirSync(tmpRoot, { recursive: true });
+const childEnv = { ...process.env, TMPDIR: tmpRoot, TMP: tmpRoot, TEMP: tmpRoot };
+
 let failed = 0;
 for (const file of files) {
   console.log(`\n=== ${file}`);
-  const result = spawnSync(process.execPath, [join(testDir, file)], { stdio: 'inherit' });
+  const result = spawnSync(process.execPath, [join(testDir, file)], { stdio: 'inherit', env: childEnv });
   if (result.status !== 0) {
     failed++;
     console.error(`>>> ${file} FAILED (exit ${result.status})`);
   }
 }
 
+cleanTmp();
 console.log(`\n${files.length - failed}/${files.length} test files passed`);
 process.exit(failed > 0 ? 1 : 0);
