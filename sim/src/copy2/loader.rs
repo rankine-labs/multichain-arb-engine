@@ -35,7 +35,8 @@
 //       ARBSIM_NODE_RPS counting HTTP REQUESTS (a batch or a proof = 1); it
 //       makes a request wait for its token, it never refuses.
 //     - Status counts real HTTP requests (ceil(calls / ARBSIM_NODE_BATCH)).
-//     - Copy 2 only uses the paid node (no public fallback, no re-routing).
+//     - Copy 2's urgent work uses only the paid node. Background work
+//       (Class::Bulk) may use the free node first: ARBSIM_BG_PUBLIC (node.rs).
 
 //   ONE REQUEST PER ACCOUNT (dry run #8): every value a job needs is grouped
 //   by account into one eth_getProof(account, [slots], block). Its answer

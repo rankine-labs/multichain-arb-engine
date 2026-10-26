@@ -242,6 +242,8 @@ and nothing else. Node links are never printed, and never stored in pm2.
 | `ARBSIM_NODE_URL` | value of `CHAINSTACK_RPC_ROBINHOOD` | paid node 1 |
 | `ARBSIM_NODE_URL_2` | value of `QUICKNODE_RPC_ROBINHOOD` | paid node 2 (backup) |
 | `ARBSIM_PUBLIC_URL` | `https://rpc.mainnet.chain.robinhood.com` | free public node (most plain reads); `off` = don't use |
+| `ARBSIM_BG_PUBLIC` | `0` | `1` = copy 2's background work (first loads, coin probes, held-value re-reads) asks the free node first, as far as its speed limit has room; the rest and any error go to the paid node. Works with `ARBSIM_PUBLIC_URL=off` too (then the free node is used for background only, never for new blocks or the tip) |
+| `ARBSIM_NODE_BULK_RPS` | `0` (no cap) | most requests/s background work may use on the PAID node; urgent work keeps the full `ARBSIM_NODE_RPS` |
 
 **Node use limits**
 

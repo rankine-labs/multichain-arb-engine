@@ -35,6 +35,14 @@
 //             backup for plain reads. They share ONE daily allowance
 //             (ARBSIM_NODE_DAILY_CAP) and speed limit (ARBSIM_NODE_RPS).
 //
+//   Copy 2 (Oct 26): urgent work (new blocks, a check's missing values)
+//   uses ONLY the paid node. Background work (Class::Bulk: first loads,
+//   coin probes, held-value re-reads) with ARBSIM_BG_PUBLIC=1 asks the free
+//   node first while its speed limit has room right now, and anything it
+//   can't answer goes to the paid node. ARBSIM_NODE_BULK_RPS caps how fast
+//   background work may use the paid node, so it never pushes us into
+//   Chainstack's limit and slows the urgent work down with it.
+//
 //   Everything else talks to the node through the `NodeApi` trait, so tests
 //   can plug in a fake node (no network needed).
 // ============================================================================
@@ -181,6 +189,14 @@ pub struct Budget {
     pub max_queue: Duration,
     /// Lowest rate the adaptive limit may cut to [ARBSIM_NODE_MIN_RPS, 2].
     pub min_rps: f64,
+    /// BACKGROUND CAP (Oct 26): Class::Bulk (first loads, coin probes, the
+    /// held-value re-reads) may use at most this many requests per second of
+    /// THIS node [ARBSIM_NODE_BULK_RPS on the paid node, 0 = no extra cap].
+    /// So background work can never burst into Chainstack's limit and get
+    /// the urgent trade work (new blocks, check misses) slowed down with it.
+    pub bulk_rps: f64,
+    /// Tokens of the background cap, and when they were counted.
+    bulk_bucket: Mutex<(f64, Instant)>,
 }
 
 struct BudgetInner {
@@ -264,7 +280,7 @@ impl Budget {
         }
         let max_queue = Duration::from_millis(env_u64("ARBSIM_NODE_MAX_QUEUE_MS", 10_000).max(100));
         let min_rps = std::env::var("ARBSIM_NODE_MIN_RPS").ok().and_then(|s| s.parse::<f64>().ok()).unwrap_or(2.0).max(0.1).min(rps.max(0.1));
-        Budget { cap, rps: rps.max(0.1), burst: rps.max(1.0), file, inner: Mutex::new(b), max_queue, min_rps }
+        Budget { cap, rps: rps.max(0.1), burst: rps.max(1.0), file, inner: Mutex::new(b), max_queue, min_rps, bulk_rps: 0.0, bulk_bucket: Mutex::new((1.0, Instant::now())) }
     }
 
     /// The adaptive rate right now (brought up to date: recovers by 5 % of
@@ -325,7 +341,97 @@ impl Budget {
         let cap = env_u64("ARBSIM_NODE_DAILY_CAP", 6000);
         let rps = std::env::var("ARBSIM_NODE_RPS").ok().and_then(|s| s.parse().ok()).unwrap_or(8.0);
         let file = std::env::var("ARBSIM_BUDGET_FILE").unwrap_or_else(|_| "arbsim-node-budget.json".into());
-        Budget::new(cap, rps, if file.is_empty() { None } else { Some(file) })
+        let mut b = Budget::new(cap, rps, if file.is_empty() { None } else { Some(file) });
+        // Background cap on the paid node (0 = none, the old behaviour).
+        b.bulk_rps = std::env::var("ARBSIM_NODE_BULK_RPS").ok().and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0).max(0.0);
+        b
+    }
+
+    /// Count `n` requests for `class` against today's allowance (and save
+    /// the count now and then). Err = this class's share is used up.
+    fn count_use(&self, b: &mut BudgetInner, class: Class, n: u64) -> Result<(), NodeErr> {
+        let today = utc_day();
+        if today != b.day {
+            b.day = today;
+            b.used = 0;
+            b.per_class = [0; 6];
+            b.refused = 0;
+        }
+        let limit = (self.cap as u128 * class.share_pct() as u128 / 100).min(u64::MAX as u128) as u64;
+        if b.used + n > limit {
+            b.refused += n;
+            return Err(NodeErr::Budget(format!(
+                "daily allowance for {} used up ({}/{} today, share {}%)",
+                class.name(),
+                b.used,
+                self.cap,
+                class.share_pct()
+            )));
+        }
+        b.used += n;
+        b.per_class[class_idx(class)] += n;
+        b.unsaved += n;
+        if b.unsaved >= 25 || b.last_save.elapsed() > Duration::from_secs(30) {
+            b.unsaved = 0;
+            b.last_save = Instant::now();
+            self.save(b);
+        }
+        Ok(())
+    }
+
+    /// Bring the speed-limit bucket up to date; true (and the tokens taken)
+    /// if `need` tokens are there right now.
+    fn take_tokens_now(&self, b: &mut BudgetInner, need: f64) -> Result<(), Duration> {
+        let now = Instant::now();
+        let rate = self.rate_now(b, now);
+        let burst = (self.burst * rate / self.rps).max(1.0);
+        let el = now.duration_since(b.vt[0]).as_secs_f64();
+        b.vt[0] = now;
+        b.tokens = (b.tokens + el * rate).min(burst.max(need));
+        if b.tokens >= need {
+            b.tokens -= need;
+            return Ok(());
+        }
+        Err(Duration::from_secs_f64(((need - b.tokens) / rate).clamp(0.001, 1.0)))
+    }
+
+    /// Take `n` requests ONLY if the speed limit has room right now (never
+    /// waits). Ok(false) = no room now (nothing counted): the caller uses
+    /// another node instead. Used for background work on the free public
+    /// node: it takes what the free node can give, the rest goes elsewhere.
+    pub fn try_take(&self, class: Class, n: u64) -> Result<bool, NodeErr> {
+        let mut b = self.inner.lock().unwrap();
+        if self.take_tokens_now(&mut b, n as f64).is_err() {
+            return Ok(false); // no room right now: nothing counted
+        }
+        if let Err(e) = self.count_use(&mut b, class, n) {
+            b.tokens += n as f64; // not sent: give the tokens back
+            return Err(e);
+        }
+        Ok(true)
+    }
+
+    /// Background cap (bulk_rps): wait until Class::Bulk may send `n` more.
+    fn wait_bulk_cap(&self, n: u64) {
+        if self.bulk_rps <= 0.0 {
+            return;
+        }
+        let need = n as f64;
+        loop {
+            let wait = {
+                let mut g = self.bulk_bucket.lock().unwrap();
+                let now = Instant::now();
+                let el = now.duration_since(g.1).as_secs_f64();
+                g.1 = now;
+                g.0 = (g.0 + el * self.bulk_rps).min(self.bulk_rps.max(1.0).max(need));
+                if g.0 >= need {
+                    g.0 -= need;
+                    return;
+                }
+                Duration::from_secs_f64(((need - g.0) / self.bulk_rps).clamp(0.001, 1.0))
+            };
+            std::thread::sleep(wait);
+        }
     }
 
     /// Take `n` HTTP requests for `class`: waits for the speed limit (a plain
@@ -334,34 +440,13 @@ impl Budget {
     /// allowance share is used up. (NodeClient takes 1 per HTTP request, so
     /// a batch or an eth_getProof counts once, however many values it holds.)
     pub fn take(&self, class: Class, n: u64) -> Result<(), NodeErr> {
+        // Background work first waits for its own (smaller) share of speed.
+        if class == Class::Bulk {
+            self.wait_bulk_cap(n);
+        }
         {
             let mut b = self.inner.lock().unwrap();
-            let today = utc_day();
-            if today != b.day {
-                b.day = today;
-                b.used = 0;
-                b.per_class = [0; 6];
-                b.refused = 0;
-            }
-            let limit = (self.cap as u128 * class.share_pct() as u128 / 100).min(u64::MAX as u128) as u64;
-            if b.used + n > limit {
-                b.refused += n;
-                return Err(NodeErr::Budget(format!(
-                    "daily allowance for {} used up ({}/{} today, share {}%)",
-                    class.name(),
-                    b.used,
-                    self.cap,
-                    class.share_pct()
-                )));
-            }
-            b.used += n;
-            b.per_class[class_idx(class)] += n;
-            b.unsaved += n;
-            if b.unsaved >= 25 || b.last_save.elapsed() > Duration::from_secs(30) {
-                b.unsaved = 0;
-                b.last_save = Instant::now();
-                self.save(&b);
-            }
+            self.count_use(&mut b, class, n)?;
         }
         // Speed limit: wait for the tokens (at the adaptive rate; the burst
         // shrinks with it).
@@ -369,17 +454,10 @@ impl Budget {
         loop {
             let wait = {
                 let mut b = self.inner.lock().unwrap();
-                let now = Instant::now();
-                let rate = self.rate_now(&mut b, now);
-                let burst = (self.burst * rate / self.rps).max(1.0);
-                let el = now.duration_since(b.vt[0]).as_secs_f64();
-                b.vt[0] = now;
-                b.tokens = (b.tokens + el * rate).min(burst.max(need));
-                if b.tokens >= need {
-                    b.tokens -= need;
-                    return Ok(());
+                match self.take_tokens_now(&mut b, need) {
+                    Ok(()) => return Ok(()),
+                    Err(w) => w,
                 }
-                Duration::from_secs_f64(((need - b.tokens) / rate).clamp(0.001, 1.0))
             };
             std::thread::sleep(wait);
         }
@@ -404,7 +482,7 @@ impl Budget {
             per.insert(c.name().into(), Value::from(b.per_class[class_idx(c)]));
         }
         json!({ "usedToday": b.used, "cap": self.cap, "refusedToday": b.refused, "byClass": per, "utcDay": b.day,
-                "rps": self.rps, "rpsNow": (rate * 10.0).round() / 10.0, "tokens": (b.tokens * 10.0).round() / 10.0,
+                "rps": self.rps, "bulkRps": self.bulk_rps, "rpsNow": (rate * 10.0).round() / 10.0, "tokens": (b.tokens * 10.0).round() / 10.0,
                 "providerRefusals": b.provider_refusals, "rateCuts": b.cuts,
                 "secondsSinceRefusal": b.last_refusal.map(|t| t.elapsed().as_secs()) })
     }
@@ -433,6 +511,9 @@ struct Endpoint {
     debug: bool,
     /// Index into NodeClient::budgets.
     budget: usize,
+    /// Free node kept for copy 2's BACKGROUND work only (ARBSIM_PUBLIC_URL=off
+    /// with ARBSIM_BG_PUBLIC=1): everything else never uses it.
+    bg_only: bool,
 }
 
 /// JSON-RPC client for the real node(s).
@@ -443,6 +524,28 @@ pub struct NodeClient {
     budgets: Vec<Budget>,
     max_batch: usize,
     errors: Mutex<(u64, Option<Instant>)>,
+    /// BACKGROUND ON THE FREE NODE (Oct 26, ARBSIM_BG_PUBLIC=1): copy 2's
+    /// background work (Class::Bulk: first loads, coin probes, held-value
+    /// re-reads) asks the free public node first, as far as its speed limit
+    /// has room RIGHT NOW; the rest, and anything the free node can't answer
+    /// (behind, old state, an error), goes to the paid node as before.
+    /// Debug methods (traces, tick walks) always stay on the paid node.
+    bg_public: bool,
+    /// Background requests answered by the free node / sent to the paid node
+    /// because the free node had no room / re-asked on the paid node because
+    /// the free node failed (since start; status `background`).
+    bg_counts: Mutex<(u64, u64, u64)>,
+}
+
+/// How one chunk is routed (see send_chunk).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Route {
+    /// Free public node first, paid nodes for what it can't answer.
+    Normal,
+    /// Paid node(s) only (copy 2's urgent work).
+    PaidOnly,
+    /// Copy 2's background work: free node if it has room now, else / then paid.
+    Background,
 }
 
 /// Does this error mean "this node doesn't keep that (old) state"?
@@ -457,16 +560,21 @@ impl NodeClient {
     pub fn from_env() -> Option<Self> {
         let mut endpoints = Vec::new();
         let public = std::env::var("ARBSIM_PUBLIC_URL").unwrap_or_else(|_| ROBINHOOD_PUBLIC_RPC.to_string());
+        let bg_public = env_u64("ARBSIM_BG_PUBLIC", 0) == 1;
         if !public.trim().is_empty() && public.trim() != "off" {
-            endpoints.push(Endpoint { label: "public", url: public.trim().to_string(), debug: false, budget: 1 });
+            endpoints.push(Endpoint { label: "public", url: public.trim().to_string(), debug: false, budget: 1, bg_only: false });
+        } else if bg_public {
+            // Free node switched off for normal reads (new blocks, the tip:
+            // it is slower and a little behind) but wanted for background.
+            endpoints.push(Endpoint { label: "public", url: ROBINHOOD_PUBLIC_RPC.to_string(), debug: false, budget: 1, bg_only: true });
         }
         let first = std::env::var("ARBSIM_NODE_URL").ok().filter(|s| !s.trim().is_empty())
             .or_else(|| std::env::var("CHAINSTACK_RPC_ROBINHOOD").ok().filter(|s| !s.trim().is_empty()));
         if let Some(u) = first {
-            endpoints.push(Endpoint { label: "node1", url: u.trim().to_string(), debug: true, budget: 0 });
+            endpoints.push(Endpoint { label: "node1", url: u.trim().to_string(), debug: true, budget: 0, bg_only: false });
         }
         if let Some(u) = std::env::var("ARBSIM_NODE_URL_2").ok().filter(|s| !s.trim().is_empty()) {
-            endpoints.push(Endpoint { label: "node2", url: u.trim().to_string(), debug: true, budget: 0 });
+            endpoints.push(Endpoint { label: "node2", url: u.trim().to_string(), debug: true, budget: 0, bg_only: false });
         }
         if endpoints.is_empty() {
             return None;
@@ -492,7 +600,33 @@ impl NodeClient {
             budgets: vec![Budget::from_env(), public_budget],
             max_batch: env_u64("ARBSIM_NODE_BATCH", 25).clamp(1, 50) as usize, // Chainstack: <= 50
             errors: Mutex::new((0, None)),
+            bg_public,
+            bg_counts: Mutex::new((0, 0, 0)),
         })
+    }
+
+    /// Tests only: a free node and one paid node at these URLs.
+    #[cfg(test)]
+    fn for_test(public: &str, paid: &str, bg_public: bool, public_rps: f64, public_burst: f64) -> Self {
+        Self::for_test_opt(public, paid, bg_public, public_rps, public_burst, false)
+    }
+
+    #[cfg(test)]
+    fn for_test_opt(public: &str, paid: &str, bg_public: bool, public_rps: f64, public_burst: f64, bg_only: bool) -> Self {
+        let mut pb = Budget::new(u64::MAX / 4, public_rps, None);
+        pb.burst = public_burst;
+        NodeClient {
+            endpoints: vec![
+                Endpoint { label: "public", url: public.into(), debug: false, budget: 1, bg_only },
+                Endpoint { label: "node1", url: paid.into(), debug: true, budget: 0, bg_only: false },
+            ],
+            agent: ureq::Agent::new_with_defaults(),
+            budgets: vec![Budget::new(1_000_000, 1000.0, None), pb],
+            max_batch: 25,
+            errors: Mutex::new((0, None)),
+            bg_public,
+            bg_counts: Mutex::new((0, 0, 0)),
+        }
     }
 
     /// Labels of the configured nodes (for the startup log; never URLs).
@@ -546,14 +680,17 @@ impl NodeClient {
 
     // Send one chunk through the endpoints in order. Calls the cheap node
     // can't answer (old state, debug methods) move on to the next node.
-    fn send_chunk(&self, class: Class, chunk: &[(&str, Value)], paid_first: bool) -> Result<Vec<CallResult>, NodeErr> {
+    fn send_chunk(&self, class: Class, chunk: &[(&str, Value)], route: Route) -> Result<Vec<CallResult>, NodeErr> {
+        let paid_first = route == Route::PaidOnly;
+        let background = route == Route::Background;
         let needs_debug = chunk.iter().any(|(m, _)| m.starts_with("debug_"));
         let mut results: Vec<Option<CallResult>> = vec![None; chunk.len()];
         let mut todo: Vec<usize> = (0..chunk.len()).collect();
         let mut last = NodeErr::NoNode;
         // Normal order: cheap public node first. paid_first: paid nodes
         // (budget 0) first, the public node last (fallback).
-        let mut order: Vec<&Endpoint> = self.endpoints.iter().filter(|e| e.debug || !needs_debug).collect();
+        // Background: free node first (it is first in the list), then paid.
+        let mut order: Vec<&Endpoint> = self.endpoints.iter().filter(|e| (e.debug || !needs_debug) && (background || !e.bg_only)).collect();
         if paid_first {
             order.sort_by_key(|e| e.budget != 0);
         }
@@ -565,8 +702,19 @@ impl NodeClient {
             if paid_first && ep.budget != 0 {
                 continue;
             }
+            // Background on the free node: only if its speed limit has room
+            // NOW (never wait for it: the paid node takes the rest).
+            if background && ep.budget != 0 {
+                match self.budgets[ep.budget].try_take(class, 1) {
+                    Ok(true) => {}
+                    _ => {
+                        self.bg_counts.lock().unwrap().1 += 1;
+                        continue;
+                    }
+                }
+            }
             let t_wait = Instant::now();
-            let took = self.budgets[ep.budget].take(class, 1);
+            let took = if background && ep.budget != 0 { Ok(()) } else { self.budgets[ep.budget].take(class, 1) };
             LAST_WAIT.with(|c| c.set(t_wait.elapsed().as_secs_f64() * 1000.0));
             if let Err(e) = took {
                 // Copy 2 paces itself: a speed-limit refusal means "later",
@@ -593,26 +741,51 @@ impl NodeClient {
             };
             // The provider said "too fast": cut our rate (adaptive limit).
             self.budgets[ep.budget].observe(&answer);
-            if paid_first {
+            if paid_first || background {
                 log_http(ep.label, &todo.iter().map(|k| &chunk[*k]).collect::<Vec<_>>(), total_ms, &answer);
             }
+            let on_free_bg = background && ep.budget != 0;
             match answer {
                 Ok(rs) => {
                     let mut again = Vec::new();
+                    let mut answered = 0u64;
                     for (r, k) in rs.into_iter().zip(todo.iter().copied()) {
                         match &r {
+                            // Background on the free node: ANY item error
+                            // (behind, old state, refused) is asked again on
+                            // the paid node, so the copy gets the same answers
+                            // it got before. Only clean answers are kept.
+                            Err(_) if on_free_bg => {
+                                results[k] = Some(r);
+                                again.push(k);
+                            }
                             // Copy 2 reads old state the plain way itself
                             // (loader.rs): no re-routing to other nodes.
                             Err(e) if state_unavailable(e) && !paid_first => {
                                 results[k] = Some(r);
                                 again.push(k);
                             }
-                            _ => results[k] = Some(r),
+                            _ => {
+                                answered += 1;
+                                results[k] = Some(r);
+                            }
                         }
+                    }
+                    if on_free_bg {
+                        let mut g = self.bg_counts.lock().unwrap();
+                        g.0 += answered;
+                        g.2 += again.len() as u64;
                     }
                     todo = again;
                 }
                 Err(e) => {
+                    // The free node failed the whole request: background
+                    // work moves on to the paid node (not logged as an
+                    // engine node error: the free node is best effort).
+                    if on_free_bg {
+                        self.bg_counts.lock().unwrap().2 += todo.len() as u64;
+                        continue;
+                    }
                     self.note_error(&e);
                     last = e;
                 }
@@ -701,15 +874,18 @@ impl NodeApi for NodeClient {
     fn call_batch(&self, class: Class, calls: &[(&str, Value)]) -> Result<Vec<CallResult>, NodeErr> {
         let mut out: Vec<CallResult> = Vec::with_capacity(calls.len());
         for chunk in calls.chunks(self.max_batch) {
-            out.extend(self.send_chunk(class, chunk, false)?);
+            out.extend(self.send_chunk(class, chunk, Route::Normal)?);
         }
         Ok(out)
     }
 
     fn call_batch_paid(&self, class: Class, calls: &[(&str, Value)]) -> Result<Vec<CallResult>, NodeErr> {
+        // Copy 2's background work (Class::Bulk) may use the free node first.
+        let has_public = self.endpoints.iter().any(|e| e.budget != 0);
+        let route = if self.bg_public && has_public && class == Class::Bulk { Route::Background } else { Route::PaidOnly };
         let mut out: Vec<CallResult> = Vec::with_capacity(calls.len());
         for chunk in calls.chunks(self.max_batch) {
-            out.extend(self.send_chunk(class, chunk, true)?);
+            out.extend(self.send_chunk(class, chunk, route)?);
         }
         Ok(out)
     }
@@ -719,6 +895,8 @@ impl NodeApi for NodeClient {
         u["public"] = self.budgets[1].usage();
         u["nodes"] = json!(self.labels());
         u["errors"] = json!(self.errors.lock().unwrap().0);
+        let g = self.bg_counts.lock().unwrap();
+        u["background"] = json!({ "onFreeNode": self.bg_public, "freeNodeAnswered": g.0, "freeNodeNoRoom": g.1, "reaskedOnPaid": g.2 });
         u
     }
 }
@@ -1081,5 +1259,174 @@ mod tests {
         assert_eq!(h.number, 16);
         assert_eq!(h.base_fee, 10_000_000);
         assert_eq!(h.timestamp, 100);
+    }
+    // ---- background on the free node (Oct 26) ----
+
+    /// A tiny fake JSON-RPC node on 127.0.0.1: answers every batch item with
+    /// `answer(method)` (Ok = result, Err = error message) and counts the
+    /// HTTP requests it got.
+    fn fake_node(answer: fn(&str) -> Result<Value, String>) -> (String, Arc<std::sync::atomic::AtomicU64>) {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        let hits = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let h2 = hits.clone();
+        std::thread::spawn(move || {
+            for c in l.incoming() {
+                let Ok(mut c) = c else { continue };
+                let h3 = h2.clone();
+                std::thread::spawn(move || loop {
+                    // One keep-alive connection may carry several requests.
+                    let mut r = BufReader::new(c.try_clone().unwrap());
+                    let mut len = 0usize;
+                    let mut line = String::new();
+                    loop {
+                        line.clear();
+                        if r.read_line(&mut line).unwrap_or(0) == 0 {
+                            return;
+                        }
+                        if line == "\r\n" {
+                            break;
+                        }
+                        if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                            len = v.trim().parse().unwrap_or(0);
+                        }
+                    }
+                    let mut body = vec![0u8; len];
+                    if r.read_exact(&mut body).is_err() {
+                        return;
+                    }
+                    h3.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let req: Value = serde_json::from_slice(&body).unwrap();
+                    let out: Vec<Value> = req.as_array().unwrap().iter().map(|it| {
+                        let m = it["method"].as_str().unwrap_or("");
+                        match answer(m) {
+                            Ok(v) => json!({"jsonrpc":"2.0","id":it["id"],"result":v}),
+                            Err(e) => json!({"jsonrpc":"2.0","id":it["id"],"error":{"code":-32000,"message":e}}),
+                        }
+                    }).collect();
+                    let text = Value::Array(out).to_string();
+                    let _ = write!(c, "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}", text.len(), text);
+                });
+            }
+        });
+        (url, hits)
+    }
+
+    use std::sync::Arc;
+
+    #[test]
+    fn background_goes_to_the_free_node_and_urgent_stays_paid() {
+        let (pub_url, pub_hits) = fake_node(|_| Ok(json!("0x1")));
+        let (paid_url, paid_hits) = fake_node(|_| Ok(json!("0x1")));
+        let c = NodeClient::for_test(&pub_url, &paid_url, true, 100.0, 100.0);
+        // Background (Bulk): free node only.
+        let r = c.call_batch_paid(Class::Bulk, &[("eth_getBalance", json!(["0x00", "0x1"]))]).unwrap();
+        assert_eq!(r[0], Ok(json!("0x1")));
+        assert_eq!(pub_hits.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(paid_hits.load(std::sync::atomic::Ordering::Relaxed), 0);
+        // Urgent work (Fill, Critical): paid node only, never the free node.
+        c.call_batch_paid(Class::Fill, &[("eth_getBalance", json!(["0x00", "0x1"]))]).unwrap();
+        c.call_batch_paid(Class::Critical, &[("eth_getBalance", json!(["0x00", "0x1"]))]).unwrap();
+        assert_eq!(pub_hits.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(paid_hits.load(std::sync::atomic::Ordering::Relaxed), 2);
+        // Debug methods (traces / tick walks) stay on the paid node even when background.
+        c.call_batch_paid(Class::Bulk, &[("debug_traceCall", json!([]))]).unwrap();
+        assert_eq!(pub_hits.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(paid_hits.load(std::sync::atomic::Ordering::Relaxed), 3);
+        assert_eq!(c.usage()["background"]["freeNodeAnswered"], json!(1));
+    }
+
+    #[test]
+    fn free_node_kept_for_background_only_is_never_used_for_normal_reads() {
+        // ARBSIM_PUBLIC_URL=off + ARBSIM_BG_PUBLIC=1: new blocks / the tip
+        // (normal reads) stay on the paid node; background uses the free one.
+        let (pub_url, pub_hits) = fake_node(|_| Ok(json!("0x1")));
+        let (paid_url, paid_hits) = fake_node(|_| Ok(json!("0x1")));
+        let c = NodeClient::for_test_opt(&pub_url, &paid_url, true, 100.0, 100.0, true);
+        c.call_batch(Class::Header, &[("eth_blockNumber", json!([]))]).unwrap();
+        c.call_batch(Class::Critical, &[("eth_getLogs", json!([{}]))]).unwrap();
+        assert_eq!(pub_hits.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(paid_hits.load(std::sync::atomic::Ordering::Relaxed), 2);
+        c.call_batch_paid(Class::Bulk, &[("eth_getBalance", json!(["0x00", "0x1"]))]).unwrap();
+        assert_eq!(pub_hits.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(paid_hits.load(std::sync::atomic::Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn background_switch_off_keeps_everything_on_the_paid_node() {
+        let (pub_url, pub_hits) = fake_node(|_| Ok(json!("0x1")));
+        let (paid_url, paid_hits) = fake_node(|_| Ok(json!("0x1")));
+        let c = NodeClient::for_test(&pub_url, &paid_url, false, 100.0, 100.0);
+        c.call_batch_paid(Class::Bulk, &[("eth_getBalance", json!(["0x00", "0x1"]))]).unwrap();
+        assert_eq!(pub_hits.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(paid_hits.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn free_node_errors_are_reasked_on_the_paid_node() {
+        // The free node is behind: every item errors. The paid node answers.
+        let (pub_url, pub_hits) = fake_node(|_| Err("header not found".into()));
+        let (paid_url, paid_hits) = fake_node(|_| Ok(json!("0x7")));
+        let c = NodeClient::for_test(&pub_url, &paid_url, true, 100.0, 100.0);
+        let r = c.call_batch_paid(Class::Bulk, &[("eth_getStorageAt", json!(["0x00", "0x0", "0x1"])), ("eth_getCode", json!(["0x00", "0x1"]))]).unwrap();
+        assert_eq!(r, vec![Ok(json!("0x7")), Ok(json!("0x7"))], "the copy gets the paid node's answers, never the free node's errors");
+        assert_eq!(pub_hits.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(paid_hits.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(c.usage()["background"]["reaskedOnPaid"], json!(2));
+    }
+
+    #[test]
+    fn free_node_down_moves_background_to_the_paid_node() {
+        // Nothing listens at the free node's address.
+        let dead = { let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); format!("http://{}", l.local_addr().unwrap()) };
+        let (paid_url, paid_hits) = fake_node(|_| Ok(json!("0x2")));
+        let c = NodeClient::for_test(&dead, &paid_url, true, 100.0, 100.0);
+        let r = c.call_batch_paid(Class::Bulk, &[("eth_getBalance", json!(["0x00", "0x1"]))]).unwrap();
+        assert_eq!(r[0], Ok(json!("0x2")));
+        assert_eq!(paid_hits.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(c.errors.lock().unwrap().0, 0, "a free-node failure is not an engine node error");
+    }
+
+    #[test]
+    fn free_node_with_no_room_sends_the_rest_to_paid_without_waiting() {
+        // Free node: 0.1/s, starts with 1 token -> the first request goes there, the rest paid.
+        let (pub_url, pub_hits) = fake_node(|_| Ok(json!("0x1")));
+        let (paid_url, paid_hits) = fake_node(|_| Ok(json!("0x1")));
+        let c = NodeClient::for_test(&pub_url, &paid_url, true, 0.1, 2.0);
+        let t = Instant::now();
+        for _ in 0..5 {
+            c.call_batch_paid(Class::Bulk, &[("eth_getBalance", json!(["0x00", "0x1"]))]).unwrap();
+        }
+        assert!(t.elapsed() < Duration::from_secs(3), "never waits for the free node's speed limit");
+        assert_eq!(pub_hits.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(paid_hits.load(std::sync::atomic::Ordering::Relaxed), 4);
+        assert_eq!(c.usage()["background"]["freeNodeNoRoom"], json!(4));
+    }
+
+    #[test]
+    fn try_take_never_waits_and_counts_only_what_is_sent() {
+        let b = Budget::new(1000, 1.0, None); // bucket of 1, refills 1/s
+        assert_eq!(b.try_take(Class::Bulk, 1), Ok(true));
+        assert_eq!(b.try_take(Class::Bulk, 1), Ok(false), "no room now");
+        assert_eq!(b.used(), 1, "the refused try is not counted");
+    }
+
+    #[test]
+    fn bulk_cap_paces_background_but_not_urgent_work() {
+        // Paid node 1000/s, background capped at 5/s.
+        let mut b = Budget::new(1_000_000, 1000.0, None);
+        b.bulk_rps = 5.0;
+        let t = Instant::now();
+        for _ in 0..50 {
+            b.take(Class::Critical, 1).unwrap();
+        }
+        assert!(t.elapsed() < Duration::from_millis(300), "urgent work is not held back by the background cap");
+        let t = Instant::now();
+        for _ in 0..10 {
+            b.take(Class::Bulk, 1).unwrap(); // burst 5 at once, then 5 more at 5/s
+        }
+        let el = t.elapsed();
+        assert!(el >= Duration::from_millis(800) && el < Duration::from_millis(2000), "background paced at ~5/s, took {el:?}");
     }
 }
