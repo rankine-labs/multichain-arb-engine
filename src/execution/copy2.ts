@@ -3,7 +3,7 @@ import type { RpcLog } from '../core/blockReader';
 import { isHookedV4, v4KeyMatchesId, v4KeyOf } from './executorCalldata';
 import { ROBINHOOD_VENUES } from '../config/robinhoodVenues';
 import type { LocalSimClient, SidecarAnswer } from './localSim';
-import type { RawLogTap } from '../core/blockReaderWs';
+import { topicChunks, type RawLogTap } from '../core/blockReaderWs';
 import { BlockAssembler, BlockOut, Head, blockMessage, headFromNewHeads } from './copy2Blocks';
 import { AbiCoder, keccak256 } from 'ethers';
 import { decodeV4InitializeLog, V4_INITIALIZE_TOPIC, type V4InitEvent } from '../core/v4EventDiscovery';
@@ -392,6 +392,8 @@ export type Copy2ForwarderOptions = {
   maxBackfill?: number;      // most blocks filled in after an outage (default 200)
   fillWaitMs?: number;       // fill-in: wait at most this long for the HTTP node to catch up (default 3000)
   fillPollMs?: number;       // fill-in: ask the node's newest block again this often meanwhile (default 150)
+  topicChunk?: number;       // fill-in: most addresses / ids in one node request (default 400, BLOCK_READER_WSS_TOPIC_CHUNK, same as the WebSocket's)
+  fillParallel?: number;     // fill-in: node requests in flight at once (default 3, COPY2_FILL_PARALLEL; the node answers HTTP 429 to bursts)
   timeReadsPerMin?: number;  // headerless: block times read from the HTTP node, at most this many a minute (default 30, 0 = never)
   pumpMs?: number;           // how often held blocks are looked at (default 10, the checker's)
   now?: () => number;
@@ -958,21 +960,75 @@ export class Copy2Forwarder {
 
   // Every report of the followed pools in blocks from..to (HTTP node), or
   // null when any read failed.
+  //
+  // Plain English (Oct 26 fix): the node refuses a request whose address
+  // list or topic list is too long ("exceed max topics"). We follow about
+  // 1,270 pools and 830 V4 pool ids, so asking for all of them in one go
+  // always failed and every outage ended in a full reload. Now each long
+  // list is cut into pieces of at most topicChunk (default 400, the same
+  // setting the WebSocket subscriptions use, BLOCK_READER_WSS_TOPIC_CHUNK),
+  // one request per piece. Only fillParallel requests (default 3) run at the
+  // same time, so the node is never hit with a burst (it also answered HTTP
+  // 429 "too many requests"). The answers are joined back together, and the
+  // same report is never kept twice. If ANY piece fails the whole read
+  // gives null, exactly as before (the copy reloads; never a half answer).
   private async readLogs(rpc: (method: string, params: unknown[]) => Promise<any>, from: number, to: number): Promise<RpcLog[] | null> {
     const idx = this.o.index();
     const range = { fromBlock: hexBlock(from), toBlock: hexBlock(to) };
     const pools = [...idx.pools], ids = [...idx.ids], coins = [...idx.coins];
-    const padded = pools.map(padAddr);
-    const asks: Array<Promise<any>> = [];
-    if (pools.length) asks.push(rpc('eth_getLogs', [{ ...range, address: pools }]));
-    if (ids.length && idx.poolManager) asks.push(rpc('eth_getLogs', [{ ...range, address: idx.poolManager, topics: [null, ids] }]));
-    if (coins.length && padded.length) {
-      asks.push(rpc('eth_getLogs', [{ ...range, address: coins, topics: [TRANSFER_TOPIC, padded] }]));
-      asks.push(rpc('eth_getLogs', [{ ...range, address: coins, topics: [TRANSFER_TOPIC, null, padded] }]));
+    const size = Math.max(1, Math.floor(this.o.topicChunk ?? 400));
+    const poolParts = topicChunks(pools, size);
+    const idParts = topicChunks(ids, size);
+    const coinParts = topicChunks(coins, size);
+    const paddedParts = topicChunks(pools.map(padAddr), size);
+    // The list of requests to make (each one is short enough for the node).
+    const asks: Array<Record<string, unknown>> = [];
+    // 1. Reports from the pool contracts themselves.
+    for (const part of poolParts) asks.push({ ...range, address: part });
+    // 2. V4 reports: the PoolManager, filtered by pool id.
+    if (idx.poolManager) for (const part of idParts) asks.push({ ...range, address: idx.poolManager, topics: [null, part] });
+    // 3. Coin transfers out of / into a followed pool. Every coin piece is
+    //    paired with every pool piece, so nothing is missed.
+    for (const c of coinParts) {
+      for (const p of paddedParts) {
+        asks.push({ ...range, address: c, topics: [TRANSFER_TOPIC, p] });
+        asks.push({ ...range, address: c, topics: [TRANSFER_TOPIC, null, p] });
+      }
     }
-    const results = await Promise.all(asks);
+    // Run them a few at a time. A failed or odd answer stops the rest from
+    // being started (no point asking more; the result is null anyway).
+    const results: RpcLog[][] = new Array(asks.length);
+    let next = 0, failed = false;
+    const worker = async () => {
+      while (!failed && next < asks.length) {
+        const i = next++;
+        try {
+          const r = await rpc('eth_getLogs', [asks[i]]);
+          if (!Array.isArray(r)) { failed = true; return; }
+          results[i] = r;
+        } catch (e) {
+          failed = true;
+          throw e;   // the caller logs the reason (e.g. "exceed max topics", HTTP 429)
+        }
+      }
+    };
+    const lanes = Math.max(1, Math.min(asks.length, Math.floor(this.o.fillParallel ?? 3)));
+    const done = await Promise.allSettled(Array.from({ length: lanes }, worker));
+    const err = done.find((d): d is PromiseRejectedResult => d.status === 'rejected');
+    if (err) throw err.reason;
+    if (failed) return null;
+    // Join the answers. A transfer between two followed pools comes back
+    // twice (once as "from", once as "to"): keep it once.
+    const seen = new Set<string>();
     const all: RpcLog[] = [];
-    for (const r of results) { if (!Array.isArray(r)) return null; all.push(...r); }
+    for (const r of results) {
+      for (const l of r) {
+        const key = `${l?.blockNumber}:${l?.logIndex}:${String(l?.transactionHash ?? '').toLowerCase()}:${l?.removed ? 1 : 0}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        all.push(l);
+      }
+    }
     return all;
   }
 
@@ -1135,6 +1191,10 @@ export function parseCopy2Status(s: unknown): Copy2Status {
 //   COPY2_FILL_WAIT_MS       3000  fill-in after a renewal / outage: wait at
 //                                  most this long for the HTTP node to have
 //                                  every missed block (else the copy reloads)
+//   BLOCK_READER_WSS_TOPIC_CHUNK 400  fill-in: most pools / ids in one node
+//                                  request (shared with the WebSocket's
+//                                  subscriptions; the node refuses long lists)
+//   COPY2_FILL_PARALLEL      3     fill-in: node requests in flight at once
 //   COPY2_TIME_READS_PER_MIN 30    headerless: a block whose time neither the
 //                                  feed nor its reports gave is read from the
 //                                  HTTP node, at most this many a minute
@@ -1182,6 +1242,8 @@ export type Copy2Settings = {
   maxStatusAgeMs: number;
   maxBackfill: number;
   fillWaitMs: number;
+  topicChunk: number;    // BLOCK_READER_WSS_TOPIC_CHUNK: most addresses / ids per fill-in request
+  fillParallel: number;  // COPY2_FILL_PARALLEL: fill-in requests in flight at once
   timeReadsPerMin: number;
   wssMaxPct: number;
   l2Offset: number;
@@ -1209,6 +1271,8 @@ export function copy2Settings(env: Record<string, string | undefined> = process.
     maxStatusAgeMs: num('COPY2_MAX_STATUS_AGE_MS', 10_000, 500),
     maxBackfill: num('COPY2_BACKFILL_MAX', 200, 1),
     fillWaitMs: num('COPY2_FILL_WAIT_MS', 3_000),
+    topicChunk: Math.floor(num('BLOCK_READER_WSS_TOPIC_CHUNK', 400, 1)),
+    fillParallel: Math.floor(num('COPY2_FILL_PARALLEL', 3, 1)),
     timeReadsPerMin: num('COPY2_TIME_READS_PER_MIN', 30),
     wssMaxPct: Math.min(100, num('COPY2_WSS_MAX_PCT', 80)),
     l2Offset: num('ARBSIM_L2_BLOCK_OFFSET', 0),
@@ -1312,6 +1376,8 @@ export class Copy2Link {
       maxWaitMs: s.headerlessMaxMs,
       maxBackfill: s.maxBackfill,
       fillWaitMs: s.fillWaitMs,
+      topicChunk: s.topicChunk,
+      fillParallel: s.fillParallel,
       timeReadsPerMin: s.timeReadsPerMin,
       now: this.now,
       schedule: o.schedule,
