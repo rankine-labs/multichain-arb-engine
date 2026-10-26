@@ -4965,7 +4965,10 @@ impl Intake {
         // "for their turn" for 5 minutes while the copy answered nothing.
         // While any pool is due to load, fills wait (the checks that need
         // them ask again). ARBSIM_FILL_YIELD=0 = old behaviour.
-        if self.c2.pm_book.lock().unwrap().cfg.fill_yield && self.loads_waiting() {
+        // (Settings from our own config copy: no extra pm_book lock here;
+        // live Oct 25 an extra lock per loop pass made checks wait up to 0.3 s.)
+        let (fill_yield, far_gap, far_per_job) = (self.cfg.blind.fill_yield, self.cfg.blind.far_gap, self.cfg.blind.far_per_job);
+        if fill_yield && self.loads_waiting() {
             inc(&self.c2.stats.fills_yielded);
             return;
         }
@@ -4976,7 +4979,7 @@ impl Intake {
         let Some(head) = self.sh.head() else { return };
         // Far V4 ticks: at most far_per_job per fill job, and a job with far
         // ticks at most every far_gap (ARBSIM_V4_FAR_PER_JOB / _GAP_MS).
-        let far_open = self.last_far_job.is_none_or(|t| t.elapsed() >= self.c2.pm_book.lock().unwrap().cfg.far_gap);
+        let far_open = self.last_far_job.is_none_or(|t| t.elapsed() >= far_gap);
         let mut far_n = 0usize;
         let mut far_deferred = 0u64;
         let (ok, refused): (Vec<MissItem>, Vec<MissItem>) = {
@@ -5014,7 +5017,7 @@ impl Intake {
                         _ => false,
                     };
                     // Paced: over the cap or inside the gap -> not now (not a refusal).
-                    let paced = keep && (!far_open || far_n >= book.cfg.far_per_job);
+                    let paced = keep && (!far_open || far_n >= far_per_job);
                     if paced {
                         inc(&st.pm_far_deferred);
                         far_deferred += 1;
