@@ -279,6 +279,7 @@ impl LoaderStats {
             "requestsPerSecLastMin": (reqs as f64 / 60.0 * 10.0).round() / 10.0,
             "inFlight": self.busy.load(Ordering::Relaxed),
             "byKind": Value::Object(kinds),
+            "readWay": read_way_json(),
         })
     }
 }
@@ -955,8 +956,35 @@ fn trace_balance(node: &dyn NodeApi, block: u64, coin: Address, holder: Address)
 
 /// Most storage keys asked in one eth_getProof.
 const PROOF_SLOTS: u64 = 100;
-/// Accounts with more values than this are read with plain batches.
-const PROOF_MAX_SLOTS: usize = 12;
+
+/// BULK READS (Oct 26, Chainstack bill): accounts with more values than
+/// this are read with plain eth_getStorageAt, ONE REQUEST UNIT PER VALUE
+/// [ARBSIM_PROOF_MAX_SLOTS, default: no limit]. It used to be 12 (smaller
+/// answers), but every V4 pool lives in ONE contract (the PoolManager) and
+/// coins hold many pools' balances, so those accounts were always read one
+/// value per request: 5.0 of 7.7 million Chainstack requests a day (65%).
+/// Now they are read as eth_getProof of up to PROOF_SLOTS values each: the
+/// same values at the same block, ~100x fewer requests; answers are bigger.
+fn proof_max_slots() -> usize {
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("ARBSIM_PROOF_MAX_SLOTS").ok().and_then(|s| s.trim().parse().ok()).unwrap_or(usize::MAX))
+}
+
+/// How values were read (since start; status copy2.loader.readWay): in a
+/// proof, plain because the account has many values, plain because the node
+/// has no proof for that (older) block.
+static READ_PROOF: AtomicU64 = AtomicU64::new(0);
+static READ_PLAIN_MANY: AtomicU64 = AtomicU64::new(0);
+static READ_PLAIN_OLD: AtomicU64 = AtomicU64::new(0);
+
+/// Status: how values were read (see READ_PROOF).
+pub fn read_way_json() -> Value {
+    json!({
+        "proofValues": READ_PROOF.load(Ordering::Relaxed),
+        "plainManyValues": READ_PLAIN_MANY.load(Ordering::Relaxed),
+        "plainOldBlock": READ_PLAIN_OLD.load(Ordering::Relaxed),
+    })
+}
 /// Set when the node doesn't know eth_getProof: the plain way from then on.
 static NO_PROOF: AtomicBool = AtomicBool::new(false);
 
@@ -1034,7 +1062,8 @@ fn fetch_proof(node: &dyn NodeApi, class: Class, block: u64, items: &[MissItem],
         // Proofs are big (every value carries its proof path): accounts with
         // many values (coins holding balances of many pools) are read with
         // plain eth_getStorageAt batches instead.
-        if slots.len() > PROOF_MAX_SLOTS {
+        if slots.len() > proof_max_slots() {
+            READ_PLAIN_MANY.fetch_add(slots.len() as u64, Ordering::Relaxed);
             plain.push(*a);
             continue;
         }
@@ -1082,6 +1111,7 @@ fn fetch_proof(node: &dyn NodeApi, class: Class, block: u64, items: &[MissItem],
         })();
         match parsed {
             Ok((b, vals)) => {
+                READ_PROOF.fetch_add(keys.len() as u64, Ordering::Relaxed);
                 basics.insert(*a, Ok(b));
                 for (k, v) in keys.iter().zip(vals) {
                     slots.insert((*a, *k), Ok(v));
@@ -1099,6 +1129,7 @@ fn fetch_proof(node: &dyn NodeApi, class: Class, block: u64, items: &[MissItem],
                         if !plain.contains(a) {
                             plain.push(*a);
                         }
+                        READ_PLAIN_OLD.fetch_add(keys.len() as u64, Ordering::Relaxed);
                         continue;
                     }
                 }
@@ -1269,4 +1300,48 @@ pub fn out_word(r: &Result<Bytes, String>, w: usize) -> Result<U256, String> {
         return Err(format!("answer too short ({} bytes)", b.len()));
     }
     Ok(super::word(b, w))
+}
+
+#[cfg(test)]
+mod bulk_read_tests {
+    use super::*;
+    use std::sync::Mutex as M;
+
+    /// A fake node: answers eth_getProof with value 7 for every key, counts methods.
+    struct Fake {
+        seen: M<Vec<String>>,
+    }
+    impl NodeApi for Fake {
+        fn call_batch(&self, _c: Class, calls: &[(&str, Value)]) -> Result<Vec<CallResult>, NodeErr> {
+            Ok(calls
+                .iter()
+                .map(|(m, p)| {
+                    self.seen.lock().unwrap().push(m.to_string());
+                    match *m {
+                        "eth_getProof" => {
+                            let keys = p[1].as_array().unwrap();
+                            let sp: Vec<Value> = keys.iter().map(|k| json!({"key": k, "value": "0x7", "proof": []})).collect();
+                            Ok(json!({"balance": "0x0", "nonce": "0x1", "codeHash": format!("{:#x}", KECCAK_EMPTY), "storageProof": sp}))
+                        }
+                        "eth_getStorageAt" => Ok(json!("0x7")),
+                        _ => Ok(json!("0x0")),
+                    }
+                })
+                .collect())
+        }
+    }
+
+    #[test]
+    fn an_account_with_many_values_is_read_in_proofs_not_one_request_per_value() {
+        // 250 values of ONE contract (like the V4 PoolManager).
+        let a = Address::repeat_byte(0x44);
+        let items: Vec<MissItem> = (0..250u64).map(|i| MissItem::Slot(a, U256::from(i))).collect();
+        let f = Fake { seen: M::new(Vec::new()) };
+        let out = fetch(&f, Class::Fill, 100, &items, &[]).unwrap();
+        let seen = f.seen.lock().unwrap().clone();
+        assert_eq!(seen.iter().filter(|m| *m == "eth_getProof").count(), 3, "250 values = 3 proofs of up to 100");
+        assert_eq!(seen.iter().filter(|m| *m == "eth_getStorageAt").count(), 0, "no one-value-per-request reads");
+        assert_eq!(out.items.len(), 250);
+        assert!(out.items.iter().all(|(_, r)| matches!(r, Ok(Fetched::Slot(_, _, v)) if *v == U256::from(7))), "every value came back");
+    }
 }
