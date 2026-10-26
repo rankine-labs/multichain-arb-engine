@@ -511,7 +511,7 @@ export interface EntryLoopSendDeps {
   ownCovers: (token: string, amount: bigint) => boolean;  // the contract holds the whole amount (live)
   lenderOk: (lender: string, token: string, amount: bigint) => boolean; // still holds enough to lend
   lenderFeePips: (lender: string) => number;
-  fire: (to: string, data: string) => Promise<{ live: boolean; txHash?: string; error?: string; signedAtMs?: number }>;
+  fire: (to: string, data: string) => Promise<{ live: boolean; txHash?: string; error?: string; signedAtMs?: number; skipped?: string }>;
   // After a real send: the same bookkeeping as other live trades (trade file, tracker, pending gas, scoreboard).
   afterSent: (hash: string, info: { label: string; sizeUsd: number; netUsd: number; flash: { lender: string; feePips: number } | null; kinds: number[]; poolKeys: string[]; gasUsd: number; failKey: [string, string]; pick: EntryPick }) => void;
   log: (m: string) => void;
@@ -598,6 +598,7 @@ export class EntryLoopSender {
       const data = lender ? encodeExecuteV3FlashRaw(call, lender) : encodeExecuteRaw(call);
       const fired = await this.d.fire(to ?? '0x0000000000000000000000000000000000000000', data);
       if (!fired.live || !live) { this.hour.dry++; return { signedMs: fired.signedAtMs, why: fired.signedAtMs === undefined ? 'dry run' : undefined }; }
+      if (fired.skipped) { this.d.log(`[trig-entry] loop ${fired.skipped}: ${p.cand.label}`); return this.skip('rust is sender'); }
       if (!fired.txHash) { this.d.log(`[trig-entry] loop SEND FAILED ${p.cand.label}: ${fired.error ?? 'no hash'}`); return this.skip('node refused the send'); }
       const gasUsd = this.d.gasUsd(!!lender, h.loop.keys.length);
       this.inflight.set(lc(fired.txHash), { id: h.loop.id, pools: h.loop.keys.slice(), holdUsd: gasUsd, at: this.d.now() });

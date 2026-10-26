@@ -114,7 +114,7 @@ export interface LoopLiveDeps {
   ready: () => string | null;                            // live readiness checks (null = passed)
   gasLimitOk: (gasUnits: number) => boolean;             // the sender's gas limit covers this loop
   executor: () => string | undefined;
-  fire: (to: string, data: string) => Promise<{ live: boolean; txHash?: string; error?: string; signMs?: number }>;
+  fire: (to: string, data: string) => Promise<{ live: boolean; txHash?: string; error?: string; signMs?: number; skipped?: string }>;
   // After a real send: the same bookkeeping as 2-pool trades (trade file, tracker, pending gas).
   afterSent: (hash: string, info: { label: string; sizeUsd: number; netUsd: number; funding: LoopFunding; kinds: number[]; poolKeys: string[]; gasUsd: number }) => void;
   log: (m: string) => void;
@@ -259,6 +259,12 @@ export class LoopLiveSender {
     if (!fired.live || !live) {
       this.hour.dryRun++;
       this.d.log(`[loop-live] DRY RUN (bot not live) ${c.label}: would send for $${v.netUsd.toFixed(2)} after gas on $${Math.round(c.sizeUsd)} (${pay}), checked in ${ms} ms`);
+      return;
+    }
+    if (fired.skipped) {
+      // RUST_SENDER=on: decided and signed, never broadcast (Rust is the sender).
+      this.d.log(`[loop-live] ${fired.skipped}: ${c.label} ($${v.netUsd.toFixed(2)} after gas on $${Math.round(c.sizeUsd)})`);
+      this.skip('rust is sender');
       return;
     }
     if (!fired.txHash) {
