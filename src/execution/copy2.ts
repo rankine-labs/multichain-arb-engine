@@ -154,6 +154,18 @@ export function autoPoolOf(e: V4InitEvent | null, poolManager: string): Copy2Poo
   }
 }
 
+// Why an auto-follow key search failed, short and safe to log: URLs (they
+// can carry the node's access key) are masked, "timeout" for timeouts.
+export function autoLookupReason(e: unknown): string {
+  try {
+    const name = String((e as { name?: unknown })?.name ?? '');
+    let m = String((e as { message?: unknown })?.message ?? e ?? 'unknown error');
+    if (/timeout|timed out|aborted/i.test(name + ' ' + m)) return 'timeout';
+    m = m.replace(/\b(?:https?|wss?):\/\/[^\s"'<>]+/gi, '<url>').replace(/\s+/g, ' ').trim();
+    return (m || 'unknown error').slice(0, 100);
+  } catch { return 'unknown error'; }
+}
+
 // ----------------------------------------------------------------------------
 // copy2PoolOf: which copy type a watched pool is, or why it is not followed.
 // Conservative on purpose: unknown exchange names are never followed.
@@ -1092,7 +1104,24 @@ export class Copy2Forwarder {
 export type Copy2PoolState = 'ready' | 'loading' | 'unsure';
 // autoFollow (Oct 25): V4 pool ids the fast check asks the bot to follow
 // (copy2.v4Blind.autoFollow.ids; empty unless ARBSIM_V4_AUTOFOLLOW=1 there).
-export type Copy2Status = { active: boolean; states: Map<string, Copy2PoolState> | null; counts: { ready: number; loading: number; unsure: number; tracked: number } | null; autoFollow: string[] };
+// autoFollowKeys (Oct 26): the key of each listed pool the fast check
+// learned from its own runs (copy2.v4Blind.autoFollow.keys), so the bot can
+// follow it with no node request. Checked again here (autoPoolOf).
+export type Copy2Status = { active: boolean; states: Map<string, Copy2PoolState> | null; counts: { ready: number; loading: number; unsure: number; tracked: number } | null; autoFollow: string[]; autoFollowKeys: Map<string, V4InitEvent> };
+
+// One key from the fast check's status as an "Initialize-like" record
+// (what autoPoolOf checks), or null if it is not well formed.
+export function autoKeyOf(id: string, k: unknown): V4InitEvent | null {
+  try {
+    if (!k || typeof k !== 'object') return null;
+    const o = k as Record<string, unknown>;
+    const a = (x: unknown) => String(x ?? '').toLowerCase();
+    const c0 = a(o.currency0), c1 = a(o.currency1), hooks = a(o.hooks);
+    const fee = Number(o.fee), tickSpacing = Number(o.tickSpacing);
+    if (!ADDR_RE.test(c0) || !ADDR_RE.test(c1) || !ADDR_RE.test(hooks) || !Number.isInteger(fee) || !Number.isInteger(tickSpacing)) return null;
+    return { id: id.toLowerCase(), currency0: c0, currency1: c1, fee, tickSpacing, hooks, sqrtPriceX96: 0n, tick: 0, block: 0 };
+  } catch { return null; }
+}
 
 function stateWord(v: unknown): Copy2PoolState {
   const s = String(typeof v === 'object' && v !== null ? (v as any).state ?? (v as any).status ?? '' : v ?? '').toLowerCase();
@@ -1102,7 +1131,7 @@ function stateWord(v: unknown): Copy2PoolState {
 }
 
 export function parseCopy2Status(s: unknown): Copy2Status {
-  const out: Copy2Status = { active: false, states: null, counts: null, autoFollow: [] };
+  const out: Copy2Status = { active: false, states: null, counts: null, autoFollow: [], autoFollowKeys: new Map() };
   try {
     if (!s || typeof s !== 'object') return out;
     const st = s as Record<string, any>;
@@ -1137,6 +1166,16 @@ export function parseCopy2Status(s: unknown): Copy2Status {
     // AUTO-FOLLOW list (Oct 25, sim/src/copy2/v4blind.rs).
     const af = body.v4Blind?.autoFollow?.ids;
     if (Array.isArray(af)) out.autoFollow = af.filter((x: unknown): x is string => typeof x === 'string' && ID_RE.test(x.toLowerCase())).map((x: string) => x.toLowerCase()).slice(0, 5_000);
+    // Their keys, learned by the fast check from its own runs (Oct 26).
+    const ak = body.v4Blind?.autoFollow?.keys;
+    if (ak && typeof ak === 'object' && !Array.isArray(ak)) {
+      for (const [id, k] of Object.entries(ak).slice(0, 5_000)) {
+        const lid = id.toLowerCase();
+        if (!ID_RE.test(lid)) continue;
+        const e = autoKeyOf(lid, k);
+        if (e) out.autoFollowKeys.set(lid, e);
+      }
+    }
     // Counts: from the per-pool list, else from plain numbers if given.
     if (seen) {
       const n = { ready: 0, loading: 0, unsure: 0, tracked: states.size };
@@ -1219,16 +1258,32 @@ export function parseCopy2Status(s: unknown): Copy2Status {
 //   COPY2_WANTED_S           60    a route pool found "loading" is sent to
 //                                  the fast check as "wanted" this long, so
 //                                  it loads those first (0 = never sent)
-//   AUTO-FOLLOW (Oct 25): the fast check lists V4 pools its checks keep
-//   missing (only when ARBSIM_V4_AUTOFOLLOW=1 on the fast check side; off by
-//   default). The bot looks up each one's key (its Initialize event on the
-//   PoolManager, one eth_getLogs on the HTTP node), and follows it like a
-//   watched pool (WebSocket subscription + track) if it is a plain pool.
+//   AUTO-FOLLOW (Oct 25, rebuilt Oct 26): the fast check lists V4 pools its
+//   checks keep missing (only when ARBSIM_V4_AUTOFOLLOW=1 on the fast check
+//   side; off by default), and the bot follows each plain (no hook) one
+//   like a watched pool (WebSocket subscription + track). To follow a pool
+//   the bot needs its KEY (coins, fee, tick spacing, hook):
+//     1. Usually the fast check already sends it next to the id (it saw
+//        the PoolManager compute the id from the key while running the
+//        transaction; status autoFollow.keys). No node request at all.
+//     2. Fallback, only for a pool still without a key after
+//        COPY2_AUTOFOLLOW_KEY_WAIT_S: its Initialize event, searched in the
+//        last COPY2_AUTOFOLLOW_LOOKBACK_BLOCKS blocks only, newest first,
+//        in slices of V4_DISCOVER_MAX_RANGE blocks (halved for later
+//        searches when the node refuses or times out), within an hourly
+//        request budget. (Live Oct 25 the old version searched the WHOLE
+//        chain history in one request and all ~1,000 lookups failed.)
 //   COPY2_AUTOFOLLOW_MAX     200   most auto-followed pools (0 = never follow)
 //   COPY2_AUTOFOLLOW_TTL_S   600   dropped this long after the fast check
 //                                  stopped listing it
-//   COPY2_AUTOFOLLOW_LOOKUPS_PER_MIN 6  Initialize lookups a minute at most
-//   V4_DISCOVER_FROM_BLOCK   0     first block those lookups search from
+//   COPY2_AUTOFOLLOW_KEY_WAIT_S 120 wait this long for the fast check's key
+//                                  before the fallback search
+//   COPY2_AUTOFOLLOW_LOOKBACK_BLOCKS 2000000  fallback searches this many
+//                                  recent blocks (0 = no fallback search)
+//   COPY2_AUTOFOLLOW_LOOKUPS_PER_MIN 6  fallback searches started a minute
+//   COPY2_AUTOFOLLOW_REQUESTS_PER_HOUR 60  fallback node requests an hour
+//   V4_DISCOVER_MAX_RANGE    500000 blocks per fallback request (at first)
+//   V4_DISCOVER_FROM_BLOCK   0     never search below this block
 // ============================================================================
 export type Copy2Settings = {
   mode: 'auto' | 'off';
@@ -1254,6 +1309,10 @@ export type Copy2Settings = {
   autoFollowTtlMs: number;          // COPY2_AUTOFOLLOW_TTL_S in ms
   autoFollowLookupsPerMin: number;  // COPY2_AUTOFOLLOW_LOOKUPS_PER_MIN
   autoFollowFromBlock: number;      // V4_DISCOVER_FROM_BLOCK
+  autoFollowKeyWaitMs: number;      // COPY2_AUTOFOLLOW_KEY_WAIT_S in ms
+  autoFollowLookbackBlocks: number; // COPY2_AUTOFOLLOW_LOOKBACK_BLOCKS (0 = no fallback)
+  autoFollowRequestsPerHour: number; // COPY2_AUTOFOLLOW_REQUESTS_PER_HOUR
+  autoFollowRange: number;          // V4_DISCOVER_MAX_RANGE
 };
 
 export function copy2Settings(env: Record<string, string | undefined> = process.env): Copy2Settings {
@@ -1287,6 +1346,10 @@ export function copy2Settings(env: Record<string, string | undefined> = process.
     autoFollowTtlMs: 1000 * num('COPY2_AUTOFOLLOW_TTL_S', 600),
     autoFollowLookupsPerMin: Math.floor(num('COPY2_AUTOFOLLOW_LOOKUPS_PER_MIN', 6)),
     autoFollowFromBlock: Math.floor(num('V4_DISCOVER_FROM_BLOCK', 0)),
+    autoFollowKeyWaitMs: 1000 * num('COPY2_AUTOFOLLOW_KEY_WAIT_S', 120),
+    autoFollowLookbackBlocks: Math.floor(num('COPY2_AUTOFOLLOW_LOOKBACK_BLOCKS', 2_000_000)),
+    autoFollowRequestsPerHour: Math.floor(num('COPY2_AUTOFOLLOW_REQUESTS_PER_HOUR', 60)),
+    autoFollowRange: Math.floor(num('V4_DISCOVER_MAX_RANGE', 500_000, 500)),
   };
 }
 
@@ -1352,7 +1415,20 @@ export class Copy2Link {
   private autoRetry = new Map<string, { next: number; tries: number }>();
   private autoBusy = new Set<string>();
   private autoLookupAt: number[] = [];
-  readonly autoCounts = { lookups: 0, followed: 0, notPlain: 0, notFound: 0, failed: 0, full: 0, expired: 0 };
+  // Oct 26: when each id was first listed without a key (fallback waits
+  // COPY2_AUTOFOLLOW_KEY_WAIT_S), fallback node requests in the last hour,
+  // the current fallback slice size (halved on node refusals / timeouts).
+  private autoFirstListed = new Map<string, number>();
+  private autoReqAt: number[] = [];
+  private autoRange = 0;
+  // fromCalls: followed with the fast check's key (no node request);
+  // fromLookups: followed from a fallback search; keyBad: a fast-check key
+  // that did not hash to its id; requests: fallback node requests;
+  // budget: fallback searches postponed (hourly request budget used up).
+  readonly autoCounts = { lookups: 0, followed: 0, fromCalls: 0, fromLookups: 0, keyBad: 0, notPlain: 0, notFound: 0, failed: 0, requests: 0, budget: 0, full: 0, expired: 0 };
+  // Fallback lookup errors by reason (URLs masked), the first few logged.
+  readonly autoErrors: Record<string, number> = {};
+  private autoErrLogged = 0;
 
   // Hourly counters (taken by hourText). held: pools that came back to the
   // watch list while still held (each one a reload avoided).
@@ -1495,35 +1571,78 @@ export class Copy2Link {
       : this.desired;
   }
 
-  // ---- auto-follow (Oct 25) ---------------------------------------------------
-  // The fast check's auto-follow list (from its status): refresh the pools
-  // already followed, look up the new ones (bounded, see lookupAuto).
-  noteAutoFollow(ids: readonly string[]): void {
+  // ---- auto-follow (Oct 25, rebuilt Oct 26) -------------------------------------
+  // The fast check's auto-follow list (from its status) and the keys it
+  // learned for them: refresh the pools already followed; follow a new one
+  // from its key when the fast check sent it (no node request); otherwise,
+  // after COPY2_AUTOFOLLOW_KEY_WAIT_S, search for it (bounded, lookupAuto).
+  noteAutoFollow(ids: readonly string[], keys: ReadonlyMap<string, V4InitEvent> = new Map()): void {
     try {
       const s = this.o.settings;
       if (s.autoFollowMax <= 0 || !ids.length) return;
       const t = this.now();
       let watched: Set<string> | null = null;
+      const listed = new Set<string>();
       for (const raw of ids.slice(0, 1_000)) {
         const id = String(raw).toLowerCase();
         if (!ID_RE.test(id)) continue;
+        listed.add(id);
         const have = this.auto.get(id);
         if (have) { have.at = t; continue; }
         watched ??= new Set(this.desired.map(copy2Key));
         if (watched.has(id)) continue;                 // the watch list follows it already
         const known = this.autoKnown.get(id);
-        if (known) { this.addAuto(id, known); continue; }
+        if (known) { this.addAuto(id, known, 'kept'); continue; }
+        // 1. The fast check's key (checked here again: it must hash to the id).
+        const k = keys.get(id);
+        if (k) {
+          const p = autoPoolOf(k, this.o.poolManager);
+          if ('skip' in p && /does not match|bad V4 coins|bad V4 pool id/.test(p.skip)) {
+            this.autoCounts.keyBad++;                  // ignored: the fallback may still find it
+          } else {
+            this.remember(id, p);
+            this.addAuto(id, p, 'calls');
+            continue;
+          }
+        }
+        // 2. No key yet: wait a little for the fast check, then search.
+        const first = this.autoFirstListed.get(id);
+        if (first === undefined) { this.autoFirstListed.set(id, t); if (s.autoFollowKeyWaitMs > 0) continue; }
+        else if (t - first < s.autoFollowKeyWaitMs) continue;
         void this.lookupAuto(id);
       }
+      // Forget "first listed" times of ids no longer listed (bounded).
+      for (const id of this.autoFirstListed.keys()) if (!listed.has(id)) this.autoFirstListed.delete(id);
     } catch { /* never throws into the bot */ }
   }
 
-  // One pool's key from its Initialize event (one eth_getLogs on the HTTP
-  // node). At most COPY2_AUTOFOLLOW_LOOKUPS_PER_MIN a minute, one at a time
-  // per pool; a failed lookup waits 5 min (doubling, at most 1 h).
+  private remember(id: string, p: Copy2Pool | { skip: string }): void {
+    if (this.autoKnown.size >= 2_000) this.autoKnown.delete(this.autoKnown.keys().next().value as string);
+    this.autoKnown.set(id, p);
+  }
+
+  // A fallback node request may go now (hourly budget)? Counts it if so.
+  private takeAutoRequest(): boolean {
+    const t = this.now();
+    this.autoReqAt = this.autoReqAt.filter((x) => t - x < 3_600_000);
+    if (this.autoReqAt.length >= this.o.settings.autoFollowRequestsPerHour) return false;
+    this.autoReqAt.push(t);
+    this.autoCounts.requests++;
+    return true;
+  }
+
+  // FALLBACK: one pool's key from its Initialize event, searched only in the
+  // last COPY2_AUTOFOLLOW_LOOKBACK_BLOCKS blocks, newest slice first (slices
+  // of V4_DISCOVER_MAX_RANGE blocks, halved after a refusal / timeout, never
+  // below 2,000). At most COPY2_AUTOFOLLOW_LOOKUPS_PER_MIN searches a
+  // minute and COPY2_AUTOFOLLOW_REQUESTS_PER_HOUR node requests an hour; one
+  // at a time per pool; a failed search waits 5 min (doubling, at most 1 h),
+  // and its real error is counted by reason (the first few logged, URLs
+  // masked).
   async lookupAuto(id: string): Promise<void> {
     const s = this.o.settings;
     const t = this.now();
+    if (s.autoFollowLookbackBlocks <= 0) return;      // fallback off
     if (this.autoBusy.has(id)) return;
     const r = this.autoRetry.get(id);
     if (r && t < r.next) return;
@@ -1533,23 +1652,55 @@ export class Copy2Link {
     const rpc = this.backfillRpc;
     const pm = (this.o.poolManager || '').toLowerCase();
     if (!rpc || !ADDR_RE.test(pm)) return;
+    if (!this.takeAutoRequest()) { this.autoCounts.budget++; return; }
     this.autoLookupAt.push(t);
     this.autoBusy.add(id);
     this.autoCounts.lookups++;
+    if (this.autoRange <= 0) this.autoRange = Math.max(2_000, s.autoFollowRange);
+    let range = this.autoRange;
     try {
-      const logs = await rpc('eth_getLogs', [{ address: pm, topics: [V4_INITIALIZE_TOPIC, id], fromBlock: hexBlock(Math.max(0, s.autoFollowFromBlock)), toBlock: 'latest' }]);
-      const ev = (Array.isArray(logs) ? logs : []).map((l: any) => decodeV4InitializeLog(l, pm)).find((e) => !!e && e.id === id) ?? null;
+      // The newest block: from the pool reports when known (free), else asked.
+      let head = this.forwarder.newestBlock();
+      let firstUsed = false;
+      if (head < 0) {
+        firstUsed = true;
+        const h = await rpc('eth_blockNumber', []);
+        head = Number(BigInt(String(h)));
+        if (!Number.isFinite(head) || head < 0) throw new Error('eth_blockNumber gave no block number');
+      }
+      const floor = Math.max(0, s.autoFollowFromBlock, head - s.autoFollowLookbackBlocks + 1);
+      let ev: V4InitEvent | null = null;
+      for (let to = head; to >= floor && !ev; ) {
+        const from = Math.max(floor, to - range + 1);
+        if (firstUsed && !this.takeAutoRequest()) {
+          // Budget used up halfway: try again later (not an error).
+          this.autoCounts.budget++;
+          this.autoRetry.set(id, { next: this.now() + 300_000, tries: r?.tries ?? 0 });
+          return;
+        }
+        firstUsed = true;
+        const logs = await rpc('eth_getLogs', [{ address: pm, topics: [V4_INITIALIZE_TOPIC, id], fromBlock: hexBlock(from), toBlock: hexBlock(to) }]);
+        ev = (Array.isArray(logs) ? logs : []).map((l: any) => decodeV4InitializeLog(l, pm)).find((e) => !!e && e.id === id) ?? null;
+        to = from - 1;
+      }
       if (!ev) {
         this.autoCounts.notFound++;
         this.autoRetry.set(id, { next: this.now() + 3_600_000, tries: (r?.tries ?? 0) + 1 });
         return;
       }
       const p = autoPoolOf(ev, pm);
-      if (this.autoKnown.size >= 2_000) this.autoKnown.delete(this.autoKnown.keys().next().value as string);
-      this.autoKnown.set(id, p);
-      this.addAuto(id, p);
-    } catch {
+      this.remember(id, p);
+      this.addAuto(id, p, 'lookup');
+    } catch (e) {
       this.autoCounts.failed++;
+      const why = autoLookupReason(e);
+      if (Object.keys(this.autoErrors).length < 20 || this.autoErrors[why] !== undefined) this.autoErrors[why] = (this.autoErrors[why] ?? 0) + 1;
+      // A refusal / timeout: later searches use smaller slices.
+      if (/timeout|range|limit|too many|exceed|large/i.test(why) && range > 2_000) this.autoRange = Math.max(2_000, Math.floor(range / 2));
+      if (this.autoErrLogged < 5) {
+        this.autoErrLogged++;
+        this.log(`[copy2] auto-follow: key search for V4 pool ${id} failed: ${why} (next searches use ${this.autoRange.toLocaleString('en-US')}-block slices; only the first 5 errors are logged, all are counted in the hourly line)`);
+      }
       const tries = (r?.tries ?? 0) + 1;
       this.autoRetry.set(id, { next: this.now() + Math.min(3_600_000, 300_000 * 2 ** (tries - 1)), tries });
     } finally {
@@ -1558,18 +1709,22 @@ export class Copy2Link {
     }
   }
 
-  private addAuto(id: string, p: Copy2Pool | { skip: string }): void {
+  private addAuto(id: string, p: Copy2Pool | { skip: string }, from: 'calls' | 'lookup' | 'kept'): void {
     if ('skip' in p) {
-      this.autoCounts.notPlain++;
+      if (this.autoRetry.get(id)?.tries !== 99) this.autoCounts.notPlain++;
       this.autoRetry.set(id, { next: this.now() + 24 * 3_600_000, tries: 99 });
       return;
     }
     if (this.auto.has(id)) return;
     if (this.auto.size >= this.o.settings.autoFollowMax) { this.autoCounts.full++; return; }
     this.auto.set(id, { pool: p, at: this.now() });
+    this.autoFirstListed.delete(id);
     this.autoCounts.followed++;
+    if (from === 'calls') this.autoCounts.fromCalls++;
+    if (from === 'lookup') this.autoCounts.fromLookups++;
     this.desiredAt = -Infinity;                        // rebuild the follow list on next use
-    this.log(`[copy2] auto-follow: V4 pool ${id} (fee ${p.fee}, spacing ${p.tickSpacing}) keeps blocking the fast check's checks; following it (${this.auto.size} auto-followed, joins the WebSocket at its next renewal)`);
+    const how = from === 'calls' ? 'key seen in the transactions the fast check ran, no node request' : from === 'lookup' ? 'key from its Initialize event' : 'key kept from before';
+    this.log(`[copy2] auto-follow: V4 pool ${id} (fee ${p.fee}, spacing ${p.tickSpacing}; ${how}) keeps blocking the fast check's checks; following it (${this.auto.size} auto-followed, joins the WebSocket at its next renewal)`);
   }
 
   autoCount(): number { this.desiredList(); return this.autoKeys.size; }
@@ -1610,7 +1765,7 @@ export class Copy2Link {
     }
     if (!was) this.log('[copy2] the fast check follows our pools from their events (pool-events mode): asking the WebSocket for the extra events');
     if (!this.trackOk) void this.sendTrack(false);
-    if (st.autoFollow.length) this.noteAutoFollow(st.autoFollow);
+    if (st.autoFollow.length) this.noteAutoFollow(st.autoFollow, st.autoFollowKeys);
   }
 
   // ---- track ----------------------------------------------------------------
@@ -1741,11 +1896,19 @@ export class Copy2Link {
     return [
       c ? `copy 2: ${c.ready} ready, ${c.unsure} unsure, ${c.loading} loading of ${c.tracked} pools` : `copy 2: following ${this.tracked.length} pools (readiness not reported)`,
       ...(held || h.heldBack ? [`kept after leaving the watch list ${held}, came back while kept ${h.heldBack}`] : []),
-      ...(this.auto.size || this.autoCounts.lookups ? [`auto-followed V4 pools ${this.auto.size} (looked up ${this.autoCounts.lookups}, followed ${this.autoCounts.followed}, not plain ${this.autoCounts.notPlain}, not found ${this.autoCounts.notFound}, lookup errors ${this.autoCounts.failed}, list full ${this.autoCounts.full}, expired ${this.autoCounts.expired})`] : []),
+      ...(this.auto.size || this.autoCounts.lookups || this.autoCounts.followed ? [this.autoText()] : []),
       `routed to fast check ${h.fast}, to node ${node}${whys ? ` (${whys})` : ''}`,
       `pool reports ${this.forwarder.modeText()}: ${f.blocksSent} blocks passed on${f.msgsDropped ? `, ${f.msgsDropped} DROPPED` : ''}${f.gaps ? `, ${f.gaps} gaps` : ''}${f.late ? `, ${f.late} late` : ''}${f.backfills ? `, ${f.backfills} outages filled in` : ''}${f.backfillFails ? `, ${f.backfillFails} not filled` : ''}${f.noTimestamp ? `, ${f.noTimestamp} skipped (time / header unknown)` : ''}${f.headersFetched ? `, ${f.headersFetched} headers read from the node` : ''}${f.timesRead ? `, ${f.timesRead} block times read from the node` : ''}`,
       `forced reloads ${this.forwarder.forcedReloads()}${this.forwarder.forcedReloads() ? ` (${this.reloadWhys()})` : ''}`,
     ].join('; ');
+  }
+
+  // Auto-follow summary for the hourly line, e.g. "auto-followed V4 pools 12
+  // (followed 14: key from the fast check's runs 13, from a search 1; ...)".
+  autoText(): string {
+    const c = this.autoCounts;
+    const errs = Object.entries(this.autoErrors).sort((a, b) => b[1] - a[1]).slice(0, 3).map(([w, n]) => `${w} ${n}`).join(', ');
+    return `auto-followed V4 pools ${this.auto.size} (followed ${c.followed}: key from the fast check's runs ${c.fromCalls}, from a search ${c.fromLookups}; bad keys ${c.keyBad}, not plain ${c.notPlain}; searches ${c.lookups} using ${c.requests} node requests, not found ${c.notFound}, search errors ${c.failed}${errs ? ` (${errs})` : ''}, postponed by the hourly budget ${c.budget}; list full ${c.full}, expired ${c.expired})`;
   }
 
   // Forced reloads by reason, without the (re)start one.

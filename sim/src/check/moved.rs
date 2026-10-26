@@ -283,6 +283,57 @@ pub fn pre_for_slots(slots: impl IntoIterator<Item = U256>, pre: &PreMap) -> Vec
     out
 }
 
+/// Hash -> its 5 input words, for 160-byte hashes only (Oct 26). A V4
+/// pool's id is keccak of its 5-word key (currency0, currency1, fee,
+/// tickSpacing, hooks), and the PoolManager computes it at the start of
+/// every swap / liquidity change / donate / initialize. So a check run that
+/// went through a pool has that pool's key written down here.
+pub type KeyMap = HashMap<U256, [U256; 5]>;
+
+/// Most 160-byte hash inputs written down per check round (a normal trade
+/// computes a handful; this only stops a strange contract filling memory).
+pub const MAX_KEYS_RECORDED: usize = 4096;
+
+/// The keys of the V4 pools that `slots` belong to (named via `pre`, see
+/// resolve_v4_slot), when the run recorded them in `keys`. Sent with a
+/// check's miss answer (`missingKeys`) so copy 2 can give the bot a pool's
+/// key with no node request. Only entries whose hash really is the pool id
+/// are kept (the map is filled from the EVM's own KECCAK256 results, but it
+/// is checked again here: cheap, and never trusted blindly).
+pub fn keys_for_slots(slots: impl IntoIterator<Item = U256>, pre: &PreMap, keys: &KeyMap) -> Vec<(U256, [U256; 5])> {
+    let mut out: Vec<(U256, [U256; 5])> = Vec::new();
+    if keys.is_empty() {
+        return out;
+    }
+    for s in slots {
+        let Some((id, _)) = resolve_v4_slot(s, pre) else { continue };
+        let idw = U256::from_be_bytes(id.0);
+        if out.iter().any(|x| x.0 == idw) {
+            continue;
+        }
+        if let Some(words) = keys.get(&idw) {
+            if key_hash(words) == idw {
+                out.push((idw, *words));
+            }
+        }
+        // Keep the answer small whatever happens.
+        if out.len() >= 32 {
+            break;
+        }
+    }
+    out.sort();
+    out
+}
+
+/// keccak of the 5 key words (abi.encode of a PoolKey) = the V4 pool id.
+pub fn key_hash(words: &[U256; 5]) -> U256 {
+    let mut b = [0u8; 160];
+    for (i, w) in words.iter().enumerate() {
+        b[i * 32..(i + 1) * 32].copy_from_slice(&w.to_be_bytes::<32>());
+    }
+    U256::from_be_bytes(keccak256(b).0)
+}
+
 #[cfg(test)]
 mod v4_slot_tests {
     use super::*;

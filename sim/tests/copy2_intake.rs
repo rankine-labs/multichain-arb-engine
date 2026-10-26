@@ -3157,6 +3157,93 @@ fn v4_blind_autofollow_lists_a_pool_checks_keep_missing() {
     assert_eq!(st["v4Blind"]["topUnfollowed"][0]["autoFollow"], json!(true));
 }
 
+/// A V4 key (5 words) and the pool id it hashes to.
+fn v4_key(c1: u64, fee: u64, ts: u64, hooks: u64) -> ([U256; 5], B256) {
+    let words = [U256::ZERO, U256::from(c1), U256::from(fee), U256::from(ts), U256::from(hooks)];
+    (words, B256::from(arbsim::check::moved::key_hash(&words).to_be_bytes::<32>()))
+}
+
+/// AUTO-FOLLOW REBUILD (Oct 26): a check's miss carries the key of the
+/// unfollowed pool it ran into (`missingKeys`). Copy 2 checks it (hash ==
+/// id), keeps it, and puts it in status next to the listed id, so the bot
+/// follows the pool with no node request.
+#[test]
+fn v4_blind_autofollow_hands_the_bot_the_key_seen_in_our_runs() {
+    let mut cfg = C2Config::for_tests();
+    cfg.blind.autofollow = true;
+    cfg.blind.af_min_misses = 3;
+    let (r, pm, _ours) = blind_rig(cfg);
+    let (words, theirs) = v4_key(0xc2, 7800, 78, 0);
+    let (pre, t, _) = v4_far(theirs, 5, 0);
+    let core = r.h.c2.check_core();
+    let keys = vec![(U256::from_be_bytes(theirs.0), words)];
+    for _ in 0..3 {
+        r.h.note_pm_pre_keys(&core, &[MissItem::Slot(pm, t)], &pre, &keys);
+    }
+    let st = r.h.status_json(false);
+    let af = &st["v4Blind"]["autoFollow"];
+    let id = format!("{theirs:#x}");
+    assert_eq!(af["ids"], json!([id.clone()]), "{af}");
+    assert_eq!(af["keys"][&id]["fee"], json!(7800), "{af}");
+    assert_eq!(af["keys"][&id]["tickSpacing"], json!(78));
+    assert_eq!(af["keys"][&id]["currency1"], json!(format!("{:#x}", Address::with_last_byte(0xc2))));
+    assert_eq!(af["keys"][&id]["hooks"], json!(format!("{:#x}", Address::ZERO)));
+    assert_eq!(af["keysLearned"], json!(1));
+    assert_eq!(counter(&r, "pm_keys_learned"), 1, "learned once, not per check");
+    assert_eq!(counter(&r, "pm_keys_bad"), 0);
+}
+
+#[test]
+fn v4_blind_autofollow_refuses_a_key_that_does_not_hash_to_the_pool() {
+    let mut cfg = C2Config::for_tests();
+    cfg.blind.autofollow = true;
+    cfg.blind.af_min_misses = 1;
+    let (r, pm, _ours) = blind_rig(cfg);
+    let (mut words, theirs) = v4_key(0xc2, 7800, 78, 0);
+    words[2] = U256::from(3000u64); // not this pool's fee
+    let (pre, t, _) = v4_far(theirs, 5, 0);
+    let core = r.h.c2.check_core();
+    r.h.note_pm_pre_keys(&core, &[MissItem::Slot(pm, t)], &pre, &[(U256::from_be_bytes(theirs.0), words)]);
+    let st = r.h.status_json(false);
+    let af = &st["v4Blind"]["autoFollow"];
+    assert_eq!(af["ids"], json!([format!("{theirs:#x}")]), "still listed (the bot may find the key itself)");
+    assert_eq!(af["keys"], json!({}), "no key handed out");
+    assert_eq!(counter(&r, "pm_keys_bad"), 1);
+    assert_eq!(counter(&r, "pm_keys_learned"), 0);
+}
+
+#[test]
+fn v4_blind_autofollow_never_lists_a_pool_whose_key_has_a_hook() {
+    let mut cfg = C2Config::for_tests();
+    cfg.blind.autofollow = true;
+    cfg.blind.af_min_misses = 1;
+    let (r, pm, _ours) = blind_rig(cfg);
+    let (words, hooked) = v4_key(0xc2, 3000, 60, 0xbeef);
+    let (pre, t, _) = v4_far(hooked, 5, 0);
+    let core = r.h.c2.check_core();
+    for _ in 0..3 {
+        r.h.note_pm_pre_keys(&core, &[MissItem::Slot(pm, t)], &pre, &[(U256::from_be_bytes(hooked.0), words)]);
+    }
+    let st = r.h.status_json(false);
+    let af = &st["v4Blind"]["autoFollow"];
+    assert_eq!(af["ids"], json!([]), "a hooked pool can't be followed: not listed, {af}");
+    assert_eq!(af["hookedNotListed"], json!(1));
+    assert_eq!(st["v4Blind"]["topUnfollowed"][0]["misses"], json!(3), "still counted as a blind spot");
+}
+
+#[test]
+fn v4_blind_keys_not_learned_while_autofollow_is_off() {
+    let (r, pm, _ours) = blind_rig(C2Config::for_tests());
+    let (words, theirs) = v4_key(0xc2, 7800, 78, 0);
+    let (pre, t, _) = v4_far(theirs, 5, 0);
+    let core = r.h.c2.check_core();
+    r.h.note_pm_pre_keys(&core, &[MissItem::Slot(pm, t)], &pre, &[(U256::from_be_bytes(theirs.0), words)]);
+    let st = r.h.status_json(false);
+    assert_eq!(counter(&r, "pm_keys_learned"), 0);
+    assert_eq!(st["v4Blind"]["autoFollow"]["keysHeld"], json!(0));
+    assert_eq!(counter(&r, "pm_miss_unfollowed"), 1, "the blind-spot count is unchanged");
+}
+
 // PACED FAR FILLS (Oct 25, live): far-tick fills used the node budget and
 // starved pool loads after a restart. At most far_per_job far ticks per fill
 // job; the rest are deferred (not refused) and go in a later job.

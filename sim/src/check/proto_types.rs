@@ -214,6 +214,21 @@ pub fn unknown_json(id: &Value, u: &CheckUnknown, us: u128) -> Value {
     if !u.pre.is_empty() {
         v["missingPre"] = serde_json::json!(u.pre.iter().map(|(h, a, b)| [format!("{h:#x}"), format!("{a:#x}"), format!("{b:#x}")]).collect::<Vec<_>>());
     }
+    // (Oct 26) `missingKeys`: [[pool id, currency0, currency1, fee,
+    // tickSpacing, hooks], ...] hex words, the keys of the V4 pools named
+    // above when the run computed them (CheckUnknown.keys). Also read and
+    // removed by the server before the bot sees the answer.
+    if !u.keys.is_empty() {
+        v["missingKeys"] = serde_json::json!(u
+            .keys
+            .iter()
+            .map(|(id, k)| {
+                let mut row = vec![format!("{id:#x}")];
+                row.extend(k.iter().map(|w| format!("{w:#x}")));
+                row
+            })
+            .collect::<Vec<_>>());
+    }
     v
 }
 

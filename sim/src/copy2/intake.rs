@@ -635,6 +635,10 @@ c2counters!(
     pm_miss_own_far, pm_miss_own_base, pm_miss_unfollowed, pm_miss_other, pm_miss_unknown,
     // PoolManager slots newly named from checks' hash inputs.
     pm_named,
+    // (Oct 26) Auto-follow: V4 pool keys learned from our own check runs
+    // (no node request) / refused (key did not hash to the pool id, or
+    // was not a well-formed key).
+    pm_keys_learned, pm_keys_bad,
     // fill_refused_pm_slot split by the same classes (they add up to it).
     pm_refused_own_far, pm_refused_unfollowed, pm_refused_other, pm_refused_unknown,
     // Fix (b): far ticks / tick-map words of our ready V4 pools sent to the
@@ -1311,6 +1315,17 @@ impl Copy2Handle {
     /// check's own thread; never waits for the copy's thread (`core` is the
     /// registry summary the check already used).
     pub fn note_pm_pre(&self, core: &super::checkcore::CheckCore, missing: &[MissItem], pre: &[(U256, U256, U256)]) {
+        self.note_pm_pre_keys(core, missing, pre, &[]);
+    }
+
+    /// note_pm_pre plus (Oct 26, auto-follow rebuild) `keys`: the V4 pool
+    /// keys the check's run computed for the pools it named (`missingKeys`,
+    /// check/moved.rs keys_for_slots). Each is checked (keccak(key) == id,
+    /// copy2/v4blind.rs check_key) and kept for the auto-follow list, so the
+    /// bot needs no node request to follow the pool. Pools we already follow
+    /// are skipped. Counters pm_keys_learned / pm_keys_bad. Only while
+    /// ARBSIM_V4_AUTOFOLLOW is on.
+    pub fn note_pm_pre_keys(&self, core: &super::checkcore::CheckCore, missing: &[MissItem], pre: &[(U256, U256, U256)], keys: &[(U256, [U256; 5])]) {
         if core.pm_list.is_empty() || !missing.iter().any(|m| matches!(m, MissItem::Slot(a, _) if core.pm_list.contains(a))) {
             return;
         }
@@ -1319,6 +1334,18 @@ impl Copy2Handle {
         let now = Instant::now();
         let mut seen: Vec<B256> = Vec::new();
         let mut book = self.c2.pm_book.lock().unwrap();
+        // Keys first: a hooked pool's key keeps it off the list below.
+        for (id, words) in keys {
+            let id = B256::from(id.to_be_bytes::<32>());
+            if core.v4.iter().any(|v| v.pool.v4_id == Some(id)) {
+                continue;
+            }
+            match book.note_key(id, words) {
+                Some(true) => inc(&st.pm_keys_learned),
+                Some(false) => {}
+                None => inc(&st.pm_keys_bad),
+            }
+        }
         for m in missing {
             let MissItem::Slot(a, s) = m else { continue };
             if !core.pm_list.contains(a) {

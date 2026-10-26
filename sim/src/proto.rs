@@ -174,6 +174,23 @@ pub fn parse_missing_pre(v: &Value) -> Vec<(U256, U256, U256)> {
     out
 }
 
+/// (Oct 26) The `missingKeys` list of an unknown answer (check/proto_types.rs
+/// unknown_json): (V4 pool id, its 5 key words). Bad entries are skipped; at
+/// most 32 read. The id is NOT trusted here: copy2/v4blind.rs checks that
+/// keccak(key) == id before using it.
+pub fn parse_missing_keys(v: &Value) -> Vec<(U256, [U256; 5])> {
+    let mut out = Vec::new();
+    if let Some(arr) = v.get("missingKeys").and_then(|m| m.as_array()) {
+        for e in arr.iter().take(32) {
+            let w = |i: usize| e.get(i).and_then(|x| x.as_str()).and_then(|s| parse_u256(s).ok());
+            if let (Some(id), Some(a), Some(b), Some(c), Some(d), Some(f)) = (w(0), w(1), w(2), w(3), w(4), w(5)) {
+                out.push((id, [a, b, c, d, f]));
+            }
+        }
+    }
+    out
+}
+
 /// "Can't be sure" answer (live views).
 pub fn unknown(id: &Value, reason: &str, detail: &str, us: u64) -> Value {
     json!({ "id": id, "ok": false, "unknown": reason, "detail": detail, "missing": [], "us": us })

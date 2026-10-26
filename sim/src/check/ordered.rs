@@ -717,6 +717,14 @@ struct Watch<'p> {
     hashes: Option<&'p std::cell::RefCell<HashMap<U256, (U256, U256)>>>,
     /// The 64-byte KECCAK256 running now (its input words).
     pending_pre: Option<(U256, U256)>,
+    /// (Oct 26, auto-follow rebuild) record_hashes also writes down the
+    /// input of every 160-byte hash: a V4 PoolManager computes a pool's id
+    /// as keccak of its 5-word key at the start of every swap / liquidity
+    /// change, so this holds the KEY of each V4 pool the run went through
+    /// (check/moved.rs keys_for_slots). Same lifetime as `hashes`.
+    keys: Option<&'p std::cell::RefCell<super::moved::KeyMap>>,
+    /// The 160-byte KECCAK256 running now (its 5 input words).
+    pending_key: Option<[U256; 5]>,
 }
 
 impl Watch<'_> {
@@ -839,6 +847,24 @@ impl<CTX> Inspector<CTX, EthInterpreter> for Watch<'_> {
                         }
                     }
                 }
+                // record_hashes: a 160-byte hash's input (a V4 pool key ->
+                // its id, PoolKey.toId()). Only the length is compared for
+                // every other hash, so this costs next to nothing.
+                if self.keys.is_some() {
+                    if let (Ok(off), Ok(len)) = (interp.stack.peek(0), interp.stack.peek(1)) {
+                        if len == U256::from(160u8) && off < U256::from(u32::MAX) {
+                            let off = off.to::<usize>();
+                            if off + 160 <= interp.memory.size() {
+                                let m = interp.memory.slice(off..off + 160);
+                                let mut words = [U256::ZERO; 5];
+                                for (i, w) in words.iter_mut().enumerate() {
+                                    *w = U256::from_be_slice(&m[i * 32..(i + 1) * 32]);
+                                }
+                                self.pending_key = Some(words);
+                            }
+                        }
+                    }
+                }
                 if self.replaying && self.sender_funds {
                     if let (Ok(off), Ok(len)) = (interp.stack.peek(0), interp.stack.peek(1)) {
                         if len <= U256::from(MAX_HASH_INPUT) && off < U256::from(u32::MAX) {
@@ -893,6 +919,14 @@ impl<CTX> Inspector<CTX, EthInterpreter> for Watch<'_> {
         if let Some(p) = self.pending_pre.take() {
             if let (Ok(h), Some(m)) = (interp.stack.peek(0), self.hashes) {
                 m.borrow_mut().insert(h, p);
+            }
+        }
+        if let Some(k) = self.pending_key.take() {
+            if let (Ok(h), Some(m)) = (interp.stack.peek(0), self.keys) {
+                let mut m = m.borrow_mut();
+                if m.len() < super::moved::MAX_KEYS_RECORDED || m.contains_key(&h) {
+                    m.insert(h, k);
+                }
             }
         }
         // The KECCAK256 just ran: its result (top of the stack) is a place
@@ -1147,22 +1181,35 @@ pub fn run_ordered_sizes(
     // The hash inputs the runs write down (record_hashes), one round at a time.
     let rec = std::cell::RefCell::new(HashMap::new());
     let rec_ref = if assume.record_hashes { Some(&rec) } else { None };
+    // And the 160-byte ones (V4 pool keys, Oct 26), same rules.
+    let keys_rec = std::cell::RefCell::new(super::moved::KeyMap::new());
+    let keys_ref = if assume.record_hashes { Some(&keys_rec) } else { None };
     for _ in 0..MAX_ROUNDS {
         // Phase counts (timing.rs): each round re-runs the whole plan.
         crate::timing::ph_count("rounds", 1);
         rec.borrow_mut().clear();
-        let round = match one_round(view, plan, overrides, calls, prov, strict_call, assume, &patched, &skip, ladder, rec_ref) {
+        keys_rec.borrow_mut().clear();
+        let round = match one_round(view, plan, overrides, calls, prov, strict_call, assume, &patched, &skip, ladder, rec_ref, keys_ref) {
             Ok(n) => n,
             Err(mut u) => {
                 // A miss (Oct 25): add the recorded inputs that name the
                 // missing slots (check/moved.rs pre_for_slots), so copy 2
                 // can tell whose PoolManager value it was.
                 if u.reason == UnknownReason::Miss && rec_ref.is_some() {
-                    let slots = u.missing.iter().filter_map(|m| match m {
-                        MissItem::Slot(_, s) => Some(*s),
-                        _ => None,
-                    });
-                    u.pre = super::moved::pre_for_slots(slots, &rec.borrow());
+                    let slots: Vec<U256> = u
+                        .missing
+                        .iter()
+                        .filter_map(|m| match m {
+                            MissItem::Slot(_, s) => Some(*s),
+                            _ => None,
+                        })
+                        .collect();
+                    u.pre = super::moved::pre_for_slots(slots.iter().copied(), &rec.borrow());
+                    // (Oct 26) And the KEY of each V4 pool those slots
+                    // belong to, when the run computed it (auto-follow
+                    // learns keys this way, no node request).
+                    let named: super::moved::PreMap = u.pre.iter().map(|(h, a, b)| (*h, (*a, *b))).collect();
+                    u.keys = super::moved::keys_for_slots(slots, &named, &keys_rec.borrow());
                 }
                 return Err(u);
             }
@@ -1207,6 +1254,7 @@ fn one_round(
     skip: &HashMap<(u64, usize), bool>,
     ladder: Option<&Ladder>,
     rec: Option<&std::cell::RefCell<HashMap<U256, (U256, U256)>>>,
+    keys_rec: Option<&std::cell::RefCell<super::moved::KeyMap>>,
 ) -> Result<Next, CheckUnknown> {
     let mut db = CheckDb::new(view, overrides, true);
     // Assumed sender values (sender_funds), served before anything else.
@@ -1237,6 +1285,8 @@ fn one_round(
         labels: Assumed::default(),
         hashes: rec,
         pending_pre: None,
+        keys: keys_rec,
+        pending_key: None,
     };
     let mut evm = build_evm_with_inspector(db, first, &ArbConfig::default(), default_arbsys_gas(), true, watch);
     // eth_call rules: no gas fee charged or paid (see run.rs Session::new).
@@ -1294,7 +1344,7 @@ fn one_round(
                 return judge_miss(&evm, plan, t, (m.seq, j), assume, new_misses);
             }
             let Some(outcome) = outcome else {
-                return Err(CheckUnknown { reason: UnknownReason::Miss, missing: evm.ctx.journaled_state.database.missing.clone(), detail: "too many missing items".into(), pre: Vec::new() });
+                return Err(CheckUnknown { reason: UnknownReason::Miss, missing: evm.ctx.journaled_state.database.missing.clone(), detail: "too many missing items".into(), pre: Vec::new(), keys: Vec::new() });
             };
             if let Some(u) = watch_problem(&mut evm) {
                 return Err(u);
@@ -1368,7 +1418,7 @@ fn one_round(
     }
     let m = &evm.ctx.journaled_state.database.missing;
     if !m.is_empty() {
-        return Err(CheckUnknown { reason: UnknownReason::Miss, missing: m.clone(), detail: format!("{} item(s) not in our copy", m.len()), pre: Vec::new() });
+        return Err(CheckUnknown { reason: UnknownReason::Miss, missing: m.clone(), detail: format!("{} item(s) not in our copy", m.len()), pre: Vec::new(), keys: Vec::new() });
     }
     if strict_call {
         let bad = stale_slots(prov, &evm.ctx.journaled_state.database.reads.view_slots, &HashSet::new());
@@ -1431,7 +1481,7 @@ fn judge_miss(evm: &WatchedEvm<'_>, plan: &OrderedPlan, t: &DecodedTx, at: (u64,
             .collect();
         return Ok(Next::Patch(p));
     }
-    let unknown = CheckUnknown { reason: UnknownReason::Miss, missing: all_missing(), detail: format!("{} item(s) not in our copy", evm.ctx.journaled_state.database.missing.len()), pre: Vec::new() };
+    let unknown = CheckUnknown { reason: UnknownReason::Miss, missing: all_missing(), detail: format!("{} item(s) not in our copy", evm.ctx.journaled_state.database.missing.len()), pre: Vec::new(), keys: Vec::new() };
     judge_cant_run(evm, plan, t, at, assume, unknown)
 }
 
