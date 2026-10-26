@@ -174,7 +174,7 @@ import { setHookedFeeSource } from './core/pairWatcher';
 import { SimBucketTally, classifySimOutcome } from './core/failReasons';
 import { makeRpc, simulateRoundTrip, simulateWithRecheck, simRpcUrl, Rpc, makeFallbackRpc, loadBalanceSlots, wssToHttps, replayRpc, ReplayCall, SimResult } from './execution/simulator';
 import { FastSender, SafetyGate, safetyConfigFromEnv, RUST_IS_SENDER } from './execution/fastSender';
-import { fastlaneModeFromEnv, FastlaneStateWriter, FastlaneSendsFollower, pairRows, routePairs } from './execution/fastlaneBridge';
+import { fastlaneModeFromEnv, FastlaneStateWriter, FastlaneSendsFollower, RustSendStats, pairRows, routePairs } from './execution/fastlaneBridge';
 import { DEFAULT_FILTER_CONFIG } from './core/fastFilter';
 import { checkLiveReady } from './execution/liveReadiness';
 import { LiveTradeTracker, Funding, LiveResult } from './execution/liveTracker';
@@ -1704,6 +1704,8 @@ let loopLiveRef: LoopLiveSender | null = null;
 let entryLoopSenderRef: EntryLoopSender | null = null;
 // Rust fast lane: what to do with a Rust send's final result (set when FASTLANE is on).
 let fastlaneOnResult: ((r: LiveResult) => void) | null = null;
+// Rust fast lane: gas a receipt showed (the bridge keeps the most a Rust send used).
+let fastlaneOnGas: ((hash: string, gas: bigint) => void) | null = null;
 const liveTracker = new LiveTradeTracker({
       provider: robinhoodReadProvider,
       ethUsd: () => priceOracle.getUsdPrice('robinhood', ROBINHOOD_TOKENS.WETH) ?? 0,
@@ -1738,7 +1740,10 @@ const liveTracker = new LiveTradeTracker({
             // Rust fast lane sends: their own fail blocks / loop loss (set up with the fast lane bridge).
             try { fastlaneOnResult?.(r); } catch { /* never affects trading */ }
       },
-      noteGasUsed: (gas, info) => { robinhoodSender.noteGasUsed(gas); if (info?.routeKey) void noteReceiptGas(info.routeKey, info.hash, gas, info.success); },
+      noteGasUsed: (gas, info) => {
+            robinhoodSender.noteGasUsed(gas); if (info?.routeKey) void noteReceiptGas(info.routeKey, info.hash, gas, info.success);
+            if (info?.hash) { try { fastlaneOnGas?.(info.hash, gas); } catch { /* never affects trading */ } }
+      },
       notify: (html) => alertHooks.liveTrackerNotify(html),
       onSettled: (hash) => { safetyGate.releasePending(hash); robinhoodSender.settled(hash); },
       onDropped: () => { void robinhoodSender.resyncNonce(); },
@@ -3293,6 +3298,9 @@ if (FASTLANE_MODE !== 'off' && chainOn('robinhood')) {
       const rustLoopLoss = () => { if (rustLoop.day !== torontoDay()) { rustLoop.day = torontoDay(); rustLoop.lossUsd = 0; } return rustLoop.lossUsd; };
       // Live Rust sends waiting for their result: hash -> route pools / loop or not.
       const rustSends = new Map<string, { pools: string[]; loop: boolean }>();
+      // Drops seen and most gas used by Rust sends (state file; the gun reads them).
+      const rustStats = new RustSendStats();
+      fastlaneOnGas = (hash, gas) => { if (rustSends.has(hash.toLowerCase())) rustStats.noteGas(gas); };
       const follower = new FastlaneSendsFollower(process.env.FASTLANE_SENDS_FILE || 'data/fastlane-sends.jsonl', {
             log: (m) => console.log(m),
             onLiveSent: (r) => {
@@ -3330,6 +3338,8 @@ if (FASTLANE_MODE !== 'off' && chainOn('robinhood')) {
             const s = rustSends.get(r.hash.toLowerCase());
             if (!s) return;
             rustSends.delete(r.hash.toLowerCase());
+            // Never mined: the Rust gun's nonce may be off (it re-reads it when this goes up).
+            rustStats.noteResult(r.status);
             if (r.status !== 'reverted') return;
             if (GAP_LIVE_FAIL_BLOCK_MIN > 0) for (const [a, b] of routePairs(s.pools)) gapFailBlocks.block(a, b, 'rust fast lane: live trade failed on chain');
             if (s.loop) { rustLoopLoss(); rustLoop.lossUsd += Number.isFinite(r.gasUsd) ? r.gasUsd : 0; }
@@ -3358,7 +3368,11 @@ if (FASTLANE_MODE !== 'off' && chainOn('robinhood')) {
             approvedLenders: () => [...approvedLenders('robinhood')],
             ownMoney: () => { const age = ownMoney.lastReadAgeMs(); return { readMs: age === null ? 0 : Date.now() - age, balances: Object.fromEntries(OWN_MONEY_TOKENS.map((t) => [t, ownMoney.raw(t)])) }; },
             killed: () => killSwitchOn(process.env.KILL_SWITCH) || existsSync(killFile),
-            followedMs: () => follower.followedMs,
+            ackSeq: () => follower.ackSeq,
+            // OUR RUST_SENDER (H1): Rust broadcasts only if this says true too.
+            rustSender: () => robinhoodSender.rustIsSender,
+            dropsSeen: () => rustStats.dropsSeen,
+            maxGasUsed: () => rustStats.maxGasUsed,
       }, (m) => console.log(m));
       writer.start(Math.max(250, Number(process.env.FASTLANE_STATE_MS ?? 2_000) || 2_000));
       follower.start(250);

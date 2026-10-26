@@ -24,6 +24,12 @@
 //   GAP_SENT_POOL_HOLD_MS (one send per gap) and reserves 2x the trade's gas
 //   against the daily loss cap until Node has picked the send up from
 //   data/fastlane-sends.jsonl (then Node's own pending figure covers it).
+//   "Picked up" is decided by the record's sequence number (seq) and Node's
+//   ackSeq in the state file, never by time (many sends can share one ms).
+//
+//   One sender (H1): a live send also needs Node's OWN RUST_SENDER to be on
+//   (state file "rustSender": true). If Node's .env says the Node bot is the
+//   sender, or the field is missing, Rust does not broadcast.
 //
 //   Rules Node applies that are NOT checked here, on purpose:
 //     - the 6 h "pool pair blocked for live" list: Node skips it for
@@ -256,6 +262,9 @@ pub fn utc_day(ms: u64) -> String {
 /// One of our sends Node has not picked up yet (reserved against the caps).
 #[derive(Clone, Debug)]
 struct Reserved {
+    /// The send's record number in fastlane-sends.jsonl.
+    seq: u64,
+    /// When reserved (wall ms), only for the 10 min memory bound.
     t_ms: u64,
     usd: f64,
     is_loop: bool,
@@ -292,18 +301,25 @@ impl Safety {
         self.kill.on()
     }
 
-    /// May the gun broadcast for real right now? (FASTLANE=live AND
-    /// RUST_SENDER=on AND no kill switch.) Call right before sending.
+    /// May the gun broadcast for real right now? FASTLANE=live AND our
+    /// RUST_SENDER=on AND no kill switch AND Node's state file is usable and
+    /// says Node's own RUST_SENDER is on too (H1: both sides must agree).
+    /// Call right before sending (uses the state as last refreshed).
     pub fn may_broadcast(&self) -> bool {
-        self.mode.may_broadcast(self.killed())
+        self.mode.may_broadcast(self.killed()) && self.node_agrees_rust_sends()
+    }
+
+    /// Node's state is fresh and Node's own RUST_SENDER is on.
+    pub fn node_agrees_rust_sends(&self) -> bool {
+        self.state.usable((self.wall)()).map(|s| s.raw.rust_sender).unwrap_or(false)
     }
 
     /// Our reservations Node has not counted yet (drops the ones it has).
-    fn unpicked(&mut self, followed_ms: u64, now_ms: u64) -> (f64, f64) {
-        // Node counted everything at or before followed_ms; anything older
-        // than 10 min is dropped as a memory bound (a stale state file
-        // blocks everything long before that).
-        self.reserved.retain(|r| r.t_ms > followed_ms && now_ms.saturating_sub(r.t_ms) < 600_000);
+    fn unpicked(&mut self, ack_seq: u64, now_ms: u64) -> (f64, f64) {
+        // Node counted every record with seq <= ack_seq; anything older than
+        // 10 min is dropped as a memory bound (a stale state file blocks
+        // everything long before that).
+        self.reserved.retain(|r| r.seq > ack_seq && now_ms.saturating_sub(r.t_ms) < 600_000);
         let all = self.reserved.iter().map(|r| r.usd).sum();
         let loops = self.reserved.iter().filter(|r| r.is_loop).map(|r| r.usd).sum();
         (all, loops)
@@ -329,8 +345,8 @@ impl Safety {
         // 4. Node's shared state: missing / unreadable / older than 10 s = block (new, fail closed).
         self.state.refresh(now, false);
         let (unpicked_usd, unpicked_loop_usd) = {
-            let followed = self.state.usable(now_ms).map(|s| s.raw.followed_ms).unwrap_or(0);
-            self.unpicked(followed, now_ms)
+            let ack = self.state.usable(now_ms).map(|s| s.raw.ack_seq).unwrap_or(0);
+            self.unpicked(ack, now_ms)
         };
         let st: &SharedState = match self.state.usable(now_ms) {
             Ok(s) => s,
@@ -442,6 +458,11 @@ impl Safety {
         }
         // Live only from here: Node's practice mode skips these too.
         if self.mode.mode == Mode::Live {
+            // 19a. One sender (H1): Node's OWN RUST_SENDER must be on too, so a
+            //      .env mismatch can never make both programs broadcast.
+            if !st.raw.rust_sender {
+                return Err(BlockReason::new("node_is_sender", "Node's RUST_SENDER is off (state file rustSender false/missing): Node is the sender"));
+            }
             // 19. Live readiness checks passed (shadowMain.ts:2675).
             if !st.raw.live_ready {
                 return Err(BlockReason::new("not_ready", "live checks not passed"));
@@ -466,9 +487,12 @@ impl Safety {
         Ok(())
     }
 
-    /// Note a send (live) or "would send" (practice) at wall time `t_ms`
-    /// (the same t written in its fastlane-sends.jsonl record).
-    pub fn record_send(&mut self, o: &SafetyInput, now: Instant, t_ms: u64) {
+    /// Note a send (live) or "would send" (practice). `seq` is the record's
+    /// sequence number in fastlane-sends.jsonl (`SendsLog::next_seq`, then
+    /// write the record with that seq): its gas stays held until Node's
+    /// ackSeq reaches it.
+    pub fn record_send(&mut self, o: &SafetyInput, now: Instant, seq: u64) {
+        let t_ms = (self.wall)();
         self.send_times.push_back(now);
         while self.send_times.len() > MAX_TRACKED {
             self.send_times.pop_front();
@@ -484,7 +508,7 @@ impl Safety {
         // send (fastSender.ts reservePending, shadowMain.ts:2801). Practice
         // sends cost nothing and Node never counts them: not reserved.
         if self.mode.mode == Mode::Live {
-            self.reserved.push_back(Reserved { t_ms, usd: 2.0 * o.gas_usd.max(0.0), is_loop: o.kind == RouteKind::Loop });
+            self.reserved.push_back(Reserved { seq, t_ms, usd: 2.0 * o.gas_usd.max(0.0), is_loop: o.kind == RouteKind::Loop });
             while self.reserved.len() > MAX_TRACKED {
                 self.reserved.pop_front();
             }
@@ -532,6 +556,7 @@ mod tests {
             allowlist: vec!["0xweth".into(), "0xusdg".into(), "0xcoin".into()],
             live_pools: vec!["0xp1".into(), "0xp2".into(), "0xp3".into()],
             live_ready: true,
+            rust_sender: true,
             approved_lenders: vec!["0xlender".into()],
             own_money: OwnMoney { read_ms: NOW_MS, balances: [("0xusdg".to_string(), "1000000000".to_string())].into_iter().collect() },
             ..Default::default()
@@ -597,8 +622,36 @@ mod tests {
         let mut p = T::new(&[("FASTLANE", "practice"), ("RUST_SENDER", "off")], good_state());
         assert_eq!(p.code(&pair()), "ok");
         assert!(!p.s.may_broadcast());
-        let l = T::new(&[], good_state());
+        let mut l = T::new(&[], good_state());
+        assert!(!l.s.may_broadcast(), "state not read yet: no broadcast");
+        assert_eq!(l.code(&pair()), "ok");
         assert!(l.s.may_broadcast());
+    }
+
+    #[test]
+    fn one_sender_needs_both_sides() {
+        // Rust RUST_SENDER=on, Node's RUST_SENDER=off: Rust must not broadcast.
+        let mut a = T::new(&[], NodeState { rust_sender: false, ..good_state() });
+        assert_eq!(a.code(&pair()), "node_is_sender");
+        assert!(!a.s.may_broadcast());
+        // Missing field in an older Node's file = false = block.
+        let mut st = serde_json::to_value(good_state()).unwrap();
+        st.as_object_mut().unwrap().remove("rustSender");
+        let p = a.dir.join("state.json");
+        std::fs::write(&p, serde_json::to_vec(&st).unwrap()).unwrap();
+        assert_eq!(a.code(&pair()), "node_is_sender");
+        // Node's RUST_SENDER=on, Rust's off: still no broadcast (Rust's own switch).
+        let mut b = T::new(&[("RUST_SENDER", "off")], good_state());
+        assert_eq!(b.code(&pair()), "node_is_sender");
+        assert!(!b.s.may_broadcast());
+        // Both on: broadcast; a stale state file then stops it.
+        let mut c = T::new(&[], good_state());
+        assert_eq!(c.code(&pair()), "ok");
+        assert!(c.s.may_broadcast());
+        c.clock.store(NOW_MS + 10_001, Ordering::Relaxed);
+        assert!(!c.s.may_broadcast(), "stale state: no broadcast");
+        // Practice doesn't need Node's agreement (never broadcasts).
+        assert_eq!(T::new(&[("FASTLANE", "practice")], NodeState { rust_sender: false, ..good_state() }).code(&pair()), "ok");
     }
 
     #[test]
@@ -675,10 +728,29 @@ mod tests {
         let mut u = T::new(&[("MAX_SENDS_PER_MIN", "100"), ("GAP_SENT_POOL_HOLD_MS", "0")], NodeState { loss_usd: 24.0, ..good_state() });
         let o = SafetyInput { gas_usd: 0.6, ..pair() };
         assert_eq!(u.code(&o), "ok");
-        u.s.record_send(&o, o.found_at, NOW_MS);
+        u.s.record_send(&o, o.found_at, 1);
         assert_eq!(u.code(&o), "loss_cap");
-        u.put(&NodeState { loss_usd: 24.0, followed_ms: NOW_MS, ..good_state() });
+        u.put(&NodeState { loss_usd: 24.0, ack_seq: 1, ..good_state() });
         assert_eq!(u.code(&o), "ok", "Node picked it up (its pending covers it now)");
+    }
+
+    #[test]
+    fn held_gas_released_by_seq_not_time() {
+        // Three sends in the same millisecond (seq 1, 2, 3): $0.40 held each (2x gas).
+        let mut u = T::new(&[("MAX_SENDS_PER_MIN", "100"), ("GAP_SENT_POOL_HOLD_MS", "0")], NodeState { loss_usd: 24.0, ..good_state() });
+        let o = SafetyInput { gas_usd: 0.2, ..pair() };
+        for seq in 1..=3 {
+            u.s.record_send(&o, o.found_at, seq);
+        }
+        assert_eq!(u.code(&o), "loss_cap", "24 + 1.20 held >= 25");
+        // Node acked seq 2 only: seq 3 stays held (a time mark would have freed all three).
+        u.put(&NodeState { loss_usd: 24.6, ack_seq: 2, ..good_state() });
+        assert_eq!(u.code(&o), "loss_cap", "24.6 + 0.40 (seq 3) >= 25");
+        u.put(&NodeState { loss_usd: 24.6, ack_seq: 3, ..good_state() });
+        assert_eq!(u.code(&o), "ok", "all acked: Node's own figures cover them");
+        // Out of order: a later ack can never un-release (released entries are gone).
+        u.put(&NodeState { loss_usd: 24.6, ack_seq: 1, ..good_state() });
+        assert_eq!(u.code(&o), "ok");
     }
 
     #[test]
@@ -720,14 +792,14 @@ mod tests {
         let mut t = T::new(&[("MAX_SENDS_PER_MIN", "2")], good_state());
         let o = pair();
         assert_eq!(t.code(&o), "ok");
-        t.s.record_send(&o, o.found_at, NOW_MS);
+        t.s.record_send(&o, o.found_at, 1);
         assert_eq!(t.code(&o), "pool_busy");
         // Other pools, same minute: rate limit after 2.
         let mut t2 = T::new(&[("MAX_SENDS_PER_MIN", "2"), ("GAP_SENT_POOL_HOLD_MS", "0")], good_state());
         let o2 = pair();
-        t2.s.record_send(&o2, o2.found_at, NOW_MS);
+        t2.s.record_send(&o2, o2.found_at, 1);
         assert_eq!(t2.code(&o2), "ok");
-        t2.s.record_send(&o2, o2.found_at, NOW_MS);
+        t2.s.record_send(&o2, o2.found_at, 2);
         assert_eq!(t2.code(&o2), "rate");
     }
 

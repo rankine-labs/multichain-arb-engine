@@ -25,6 +25,14 @@
 //      never sees half a line from us. When the file passes
 //      FASTLANE_SENDS_MAX_BYTES (2 MB) it is renamed to .1 (replacing the
 //      older one) and a fresh file starts, like data/live-trades.jsonl.
+//      Every record carries "seq": a number that goes up by one per record
+//      and keeps going across rotations AND arbsim restarts (on start we
+//      continue after the highest seq found in the file, its .1, or the
+//      ackSeq Node last reported). Node tracks where it got to by file
+//      identity + byte offset (never by time: many records can share one
+//      millisecond) and reports back "ackSeq" = the highest seq it has
+//      handled. Rust keeps the gas of its own sends held against the loss
+//      caps until Node's ackSeq covers them (safety.rs).
 //
 //   3. Kill switch: data/KILL (KILL_FILE) or KILL_SWITCH=on. The file is
 //      looked at on EVERY check (one stat call, about a microsecond), so
@@ -35,7 +43,8 @@
 // ============================================================================
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -162,10 +171,21 @@ pub struct NodeState {
     pub own_money: OwnMoney,
     /// Node saw the kill switch on.
     pub killed: bool,
-    /// The newest fastlane-sends.jsonl record time ("t") Node has picked up
-    /// and now counts in pending_usd. Rust keeps holding its own sends newer
-    /// than this against the loss caps, so nothing is counted 0 or 2 times.
-    pub followed_ms: u64,
+    /// The highest fastlane-sends.jsonl "seq" Node has handled (and so now
+    /// counts in pending_usd). Rust keeps holding its own sends with a higher
+    /// seq against the loss caps, so nothing is counted 0 or 2 times.
+    pub ack_seq: u64,
+    /// Node's OWN RUST_SENDER setting. Rust broadcasts only when this is
+    /// true too (missing = false = block): the one-sender rule must not rest
+    /// on two .env files agreeing.
+    pub rust_sender: bool,
+    /// How many tracked Rust sends Node has found dropped / never mined
+    /// (since Node started; it can go back to 0 on a Node restart). When it
+    /// CHANGES, the gun should re-read its nonce from the node.
+    pub drops_seen: u64,
+    /// The most gas (units) any Rust send has used, as seen in receipts
+    /// (0 = none yet). For the gun's gas limit.
+    pub max_gas_used: u64,
 }
 
 /// The state file, turned into quick lookups.
@@ -237,6 +257,20 @@ impl std::fmt::Display for StateProblem {
     }
 }
 
+/// A file's identity (inode on Unix, 0 elsewhere).
+fn file_id(m: &fs::Metadata) -> u64 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        m.ino()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = m;
+        0
+    }
+}
+
 /// Reads data/fastlane-state.json when it changes.
 pub struct StateReader {
     pub path: PathBuf,
@@ -244,13 +278,16 @@ pub struct StateReader {
     last_look: Option<Instant>,
     last_mtime: Option<SystemTime>,
     last_len: u64,
+    /// File identity (inode on Unix): Node renames a new file into place,
+    /// so a new write is seen even with the same size and mtime tick.
+    last_id: u64,
     state: Option<SharedState>,
     problem: Option<StateProblem>,
 }
 
 impl StateReader {
     pub fn new(path: impl Into<PathBuf>, max_age_ms: u64) -> StateReader {
-        StateReader { path: path.into(), max_age_ms, last_look: None, last_mtime: None, last_len: 0, state: None, problem: Some(StateProblem::Missing) }
+        StateReader { path: path.into(), max_age_ms, last_look: None, last_mtime: None, last_len: 0, last_id: 0, state: None, problem: Some(StateProblem::Missing) }
     }
 
     pub fn from_lookup(get: &dyn Fn(&str) -> Option<String>) -> StateReader {
@@ -282,7 +319,8 @@ impl StateReader {
             }
         };
         let mtime = meta.modified().ok();
-        if self.state.is_some() && mtime.is_some() && mtime == self.last_mtime && meta.len() == self.last_len {
+        let id = file_id(&meta);
+        if self.state.is_some() && mtime.is_some() && mtime == self.last_mtime && meta.len() == self.last_len && id == self.last_id {
             return; // unchanged
         }
         match fs::read(&self.path).map_err(|e| e.to_string()).and_then(|b| serde_json::from_slice::<NodeState>(&b).map_err(|e| e.to_string())) {
@@ -290,6 +328,7 @@ impl StateReader {
                 self.state = Some(SharedState::from_raw(raw));
                 self.last_mtime = mtime;
                 self.last_len = meta.len();
+                self.last_id = id;
                 self.problem = None;
             }
             Err(e) => {
@@ -326,7 +365,12 @@ impl StateReader {
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct SendRecord {
-    /// When written (ms since 1970).
+    /// Sequence number: +1 per record, never repeats (kept across rotations
+    /// and restarts). Set by `SendsLog` (0 here = "give it the next one").
+    #[serde(default)]
+    pub seq: u64,
+    /// When written (ms since 1970). For people and reports only: Node
+    /// never uses it to decide what it has already read.
     pub t: u64,
     /// "live" or "practice".
     pub mode: String,
@@ -365,22 +409,41 @@ pub struct SendRecord {
     pub total_us: u64,
 }
 
-/// Appends send records, one line per call, rotating at max_bytes.
+/// Appends send records, one line per call, rotating at max_bytes, and
+/// numbers them (seq) so Node can follow them exactly.
 pub struct SendsLog {
     pub path: PathBuf,
     pub max_bytes: u64,
+    /// The last seq handed out (the next record gets one more).
+    last_seq: AtomicU64,
 }
 
+/// How much of the end of a sends file is read on start to find the last seq.
+const TAIL_BYTES: u64 = 256 * 1024;
+
 impl SendsLog {
+    /// Opens the log and continues numbering after the highest seq found in
+    /// the file or its rotated .1 (so a restart never reuses a number).
     pub fn new(path: impl Into<PathBuf>, max_bytes: u64) -> SendsLog {
-        SendsLog { path: path.into(), max_bytes }
+        let path = path.into();
+        let last = last_seq_in(&path).max(last_seq_in(&Self::rotated(&path)));
+        SendsLog { path, max_bytes, last_seq: AtomicU64::new(last) }
     }
 
     pub fn from_lookup(get: &dyn Fn(&str) -> Option<String>) -> SendsLog {
         let path = get("FASTLANE_SENDS_FILE").filter(|s| !s.trim().is_empty()).unwrap_or_else(|| "data/fastlane-sends.jsonl".into());
         let max = env_num(get, "FASTLANE_SENDS_MAX_BYTES", 2_000_000.0);
         let max = if max.is_finite() && max >= 10_000.0 { max as u64 } else { 2_000_000 };
-        SendsLog::new(path, max)
+        let log = SendsLog::new(path, max);
+        // If both files are gone, Node may still remember a higher ackSeq:
+        // never number below it (else Node's ack would wrongly cover new sends).
+        let state = get("FASTLANE_STATE_FILE").filter(|s| !s.trim().is_empty()).unwrap_or_else(|| "data/fastlane-state.json".into());
+        if let Ok(b) = fs::read(&state) {
+            if let Ok(st) = serde_json::from_slice::<NodeState>(&b) {
+                log.seed_at_least(st.ack_seq);
+            }
+        }
+        log
     }
 
     fn rotated(p: &Path) -> PathBuf {
@@ -389,9 +452,36 @@ impl SendsLog {
         PathBuf::from(s)
     }
 
-    /// Write one record. Err = the line was not written (trading goes on).
-    pub fn append(&self, rec: &SendRecord) -> Result<(), String> {
-        let mut line = serde_json::to_vec(rec).map_err(|e| e.to_string())?;
+    /// Make sure the next seq handed out is above `n`.
+    pub fn seed_at_least(&self, n: u64) {
+        self.last_seq.fetch_max(n, Ordering::SeqCst);
+    }
+
+    /// The last seq handed out (0 = none yet).
+    pub fn last_seq(&self) -> u64 {
+        self.last_seq.load(Ordering::SeqCst)
+    }
+
+    /// Hand out the next seq (use it for the record AND for
+    /// `Safety::record_send`, before or after the send itself).
+    pub fn next_seq(&self) -> u64 {
+        self.last_seq.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// Write one record. A record with seq 0 gets the next seq; the seq used
+    /// is returned. Err = the line was not written (trading goes on; the
+    /// seq stays used, so Safety simply keeps holding that send's gas).
+    pub fn append(&self, rec: &SendRecord) -> Result<u64, String> {
+        let seq = if rec.seq == 0 { self.next_seq() } else { rec.seq };
+        if rec.seq != 0 {
+            self.seed_at_least(rec.seq);
+        }
+        let mut line = if rec.seq == seq {
+            serde_json::to_vec(rec)
+        } else {
+            serde_json::to_vec(&SendRecord { seq, ..rec.clone() })
+        }
+        .map_err(|e| e.to_string())?;
         line.push(b'\n');
         if let Some(dir) = self.path.parent() {
             if !dir.as_os_str().is_empty() {
@@ -407,8 +497,31 @@ impl SendsLog {
         // One write call for the whole line (O_APPEND): a reader never sees
         // two of our lines mixed, and a partial last line only if the disk
         // is full (the Node reader skips lines that don't parse).
-        f.write_all(&line).map_err(|e| e.to_string())
+        f.write_all(&line).map_err(|e| e.to_string())?;
+        Ok(seq)
     }
+}
+
+/// The highest "seq" in the last TAIL_BYTES of a sends file (0 = none / no file).
+fn last_seq_in(p: &Path) -> u64 {
+    let Ok(mut f) = fs::File::open(p) else { return 0 };
+    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    let from = len.saturating_sub(TAIL_BYTES);
+    if f.seek(SeekFrom::Start(from)).is_err() {
+        return 0;
+    }
+    let mut buf = Vec::new();
+    if f.take(TAIL_BYTES).read_to_end(&mut buf).is_err() {
+        return 0;
+    }
+    #[derive(Deserialize)]
+    struct SeqOnly {
+        #[serde(default)]
+        seq: u64,
+    }
+    // Every complete line (the first may be cut by the tail read: it just
+    // doesn't parse). The max, not the last, in case of a hand-edited file.
+    buf.split(|b| *b == b'\n').filter_map(|l| serde_json::from_slice::<SeqOnly>(l).ok()).map(|r| r.seq).max().unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -502,7 +615,7 @@ mod tests {
         let lines: Vec<&str> = body.lines().collect();
         assert_eq!(lines.len(), 3);
         let back: SendRecord = serde_json::from_str(lines[0]).unwrap();
-        assert_eq!(back, rec);
+        assert_eq!(back, SendRecord { seq: 1, ..rec.clone() }, "first record gets seq 1");
         assert!(lines[0].contains("\"amountIn\":\"1000\"") && lines[0].contains("\"totalUs\":12000"), "camelCase for Node");
         // Grow past the cap: the next append rotates.
         let big = SendRecord { label: "x".repeat(11_000), ..rec.clone() };
@@ -510,6 +623,65 @@ mod tests {
         log.append(&rec).unwrap();
         assert!(d.join("sends.jsonl.1").exists());
         assert_eq!(fs::read_to_string(d.join("sends.jsonl")).unwrap().lines().count(), 1);
+    }
+
+    fn seqs(p: &Path) -> Vec<u64> {
+        fs::read_to_string(p).unwrap_or_default().lines().map(|l| serde_json::from_str::<SendRecord>(l).unwrap().seq).collect()
+    }
+
+    #[test]
+    fn seq_goes_up_by_one_even_in_the_same_ms_and_across_rotation() {
+        let d = tmpdir("seq");
+        let log = SendsLog::new(d.join("sends.jsonl"), 10_000);
+        // Six records with the SAME t (one millisecond): six different seqs.
+        let rec = SendRecord { t: 5, mode: "live".into(), label: "x".into(), amount_in: "1".into(), ..Default::default() };
+        for i in 1..=6u64 {
+            assert_eq!(log.append(&rec).unwrap(), i);
+        }
+        assert_eq!(seqs(&d.join("sends.jsonl")), vec![1, 2, 3, 4, 5, 6]);
+        // Rotation keeps counting.
+        log.append(&SendRecord { label: "y".repeat(11_000), ..rec.clone() }).unwrap();
+        assert_eq!(log.append(&rec).unwrap(), 8);
+        assert_eq!(seqs(&d.join("sends.jsonl")), vec![8]);
+        // A seq taken first (to reserve gas before the send) is the one written.
+        let n = log.next_seq();
+        assert_eq!(n, 9);
+        assert_eq!(log.append(&SendRecord { seq: n, ..rec.clone() }).unwrap(), 9);
+        assert_eq!(log.append(&rec).unwrap(), 10);
+    }
+
+    #[test]
+    fn seq_continues_after_a_restart() {
+        let d = tmpdir("seqrestart");
+        let p = d.join("sends.jsonl");
+        let rec = SendRecord { t: 5, mode: "live".into(), label: "x".into(), amount_in: "1".into(), ..Default::default() };
+        {
+            let log = SendsLog::new(&p, 10_000);
+            for _ in 0..3 {
+                log.append(&rec).unwrap();
+            }
+        }
+        // Restart: continue after 3.
+        assert_eq!(SendsLog::new(&p, 10_000).append(&rec).unwrap(), 4);
+        // Restart right after a rotation (new file empty / missing): the .1 file counts.
+        fs::rename(&p, d.join("sends.jsonl.1")).unwrap();
+        assert_eq!(SendsLog::new(&p, 10_000).append(&rec).unwrap(), 5);
+        // Both files gone but Node remembers ackSeq 40: start above it.
+        fs::remove_file(&p).unwrap();
+        fs::remove_file(d.join("sends.jsonl.1")).unwrap();
+        let st = d.join("state.json");
+        fs::write(&st, serde_json::to_vec(&NodeState { ack_seq: 40, ..Default::default() }).unwrap()).unwrap();
+        let m: HashMap<String, String> = [("FASTLANE_SENDS_FILE", p.to_string_lossy().to_string()), ("FASTLANE_STATE_FILE", st.to_string_lossy().to_string())].into_iter().map(|(k, v)| (k.to_string(), v)).collect();
+        let get = |k: &str| m.get(k).cloned();
+        assert_eq!(SendsLog::from_lookup(&get).append(&rec).unwrap(), 41);
+    }
+
+    #[test]
+    fn state_new_fields_parse_and_default_safe() {
+        let raw: NodeState = serde_json::from_str(r#"{"v":1,"writtenMs":5,"ackSeq":7,"rustSender":true,"dropsSeen":2,"maxGasUsed":900000}"#).unwrap();
+        assert_eq!((raw.ack_seq, raw.rust_sender, raw.drops_seen, raw.max_gas_used), (7, true, 2, 900_000));
+        let old: NodeState = serde_json::from_str(r#"{"v":1,"writtenMs":5}"#).unwrap();
+        assert!(!old.rust_sender, "missing rustSender = false (blocks broadcasting)");
     }
 
     #[test]
