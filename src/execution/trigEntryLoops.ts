@@ -72,10 +72,14 @@ export type LoopIndexSettings = {
   rebuildMs: number;   // TRIG_ENTRY_LOOP_REBUILD_MS [60000] rebuilt at least this often anyway
   sliceMs: number;     // a rebuild works at most this long before letting the bot run [2]
   // 4-POOL LOOPS (Oct 25). poolsMax 3 = only 3-pool loops (as before).
-  poolsMax: number;    // TRIG_ENTRY_LOOP_POOLS_MAX [3] longest loop in the index (3 or 4)
+  poolsMax: number;    // TRIG_ENTRY_LOOP_POOLS_MAX [3] longest loop in the index (3, 4 or, since Oct 26, 5)
   perPool4: number;    // TRIG_ENTRY_LOOPS4_PER_POOL [8] 4-pool loops kept per pool, ON TOP of the 3-pool ones
   perCoin4: number;    // TRIG_ENTRY_LOOPS4_PER_COIN [400] 4-pool loops looked at per (start coin, first middle coin)
   maxSteps4: number;   // TRIG_ENTRY_LOOPS4_MAX_STEPS [3000000] work limit for the 4-pool search in one rebuild
+  // 5-POOL LOOPS (Oct 26, owner). Only with poolsMax 5.
+  perPool5: number;    // TRIG_ENTRY_LOOPS5_PER_POOL [6] 5-pool loops kept per pool, ON TOP of the 3- and 4-pool ones
+  perCoin5: number;    // TRIG_ENTRY_LOOPS5_PER_COIN [300] 5-pool loops looked at per (start coin, first middle coin)
+  maxSteps5: number;   // TRIG_ENTRY_LOOPS5_MAX_STEPS [3000000] work limit for the 5-pool search in one rebuild
 };
 export function loopIndexSettings(env: Record<string, string | undefined> = process.env): LoopIndexSettings {
   const num = (k: string, d: number, min: number) => { const v = Number(env[k]); return env[k] !== undefined && env[k]!.trim() !== '' && Number.isFinite(v) && v >= min ? v : d; };
@@ -85,11 +89,14 @@ export function loopIndexSettings(env: Record<string, string | undefined> = proc
     checkMs: num('TRIG_ENTRY_LOOP_INDEX_MS', 10_000, 500),
     rebuildMs: num('TRIG_ENTRY_LOOP_REBUILD_MS', 60_000, 1_000),
     sliceMs: 2,
-    // 3 or 4 only: anything above 4 means 4, anything below 3 means 3.
-    poolsMax: Math.min(4, Math.max(3, Math.round(num('TRIG_ENTRY_LOOP_POOLS_MAX', 3, 0)))),
+    // 3, 4 or 5 only: anything above 5 means 5, anything below 3 means 3.
+    poolsMax: Math.min(5, Math.max(3, Math.round(num('TRIG_ENTRY_LOOP_POOLS_MAX', 3, 0)))),
     perPool4: Math.round(num('TRIG_ENTRY_LOOPS4_PER_POOL', 8, 1)),
     perCoin4: Math.round(num('TRIG_ENTRY_LOOPS4_PER_COIN', 400, 1)),
     maxSteps4: Math.round(num('TRIG_ENTRY_LOOPS4_MAX_STEPS', 3_000_000, 1_000)),
+    perPool5: Math.round(num('TRIG_ENTRY_LOOPS5_PER_POOL', 6, 1)),
+    perCoin5: Math.round(num('TRIG_ENTRY_LOOPS5_PER_COIN', 300, 1)),
+    maxSteps5: Math.round(num('TRIG_ENTRY_LOOPS5_MAX_STEPS', 3_000_000, 1_000)),
   };
 }
 
@@ -126,11 +133,12 @@ export type LoopRules<P> = {
 // loops: all loops in the index (3- and 4-pool); loops4: of which 4-pool.
 // capped: some loops were left out because a limit was reached.
 // seen: distinct pools offered; skipped: how many were turned away, by reason.
-export type LoopIndexData = { byPool: Map<string, EntryLoop[]>; loops: number; pools: number; capped: boolean; loops4?: number; seen?: number; skipped?: Record<string, number> };
+export type LoopIndexData = { byPool: Map<string, EntryLoop[]>; loops: number; pools: number; capped: boolean; loops4?: number; loops5?: number; seen?: number; skipped?: Record<string, number> };
 
 // Options for one build. Only perPool / maxLoops are needed; without
 // poolsMax 4 the build is exactly the 3-pool one (as before Oct 25).
-export type LoopBuildOpts = { perPool: number; maxLoops: number; poolsMax?: number; perPool4?: number; perCoin4?: number; maxSteps4?: number };
+export type LoopBuildOpts = { perPool: number; maxLoops: number; poolsMax?: number; perPool4?: number; perCoin4?: number; maxSteps4?: number;
+  perPool5?: number; perCoin5?: number; maxSteps5?: number };
 
 // ENUMERATION (pure, written as steps so it can run in small bites).
 // For each start coin S, each pool p1 with S (S -> X), each pool p2 with X
@@ -220,7 +228,19 @@ export function* buildLoopIndexSteps<P>(pools: P[], startCoins: string[], r: Loo
     const three = byPool.get(k);
     byPool.set(k, three ? three.concat(x) : x);
   }
-  return { byPool, loops: all.length + f.loops, pools: usable.length, capped: capped || f.capped, loops4: f.loops, seen: seenKeys.size, skipped };
+  if ((o.poolsMax ?? 3) < 5) return { byPool, loops: all.length + f.loops, pools: usable.length, capped: capped || f.capped, loops4: f.loops, seen: seenKeys.size, skipped };
+  // 5-POOL LOOPS (Oct 26): only with poolsMax 5, in what room is left after
+  // the 3- and 4-pool loops (shorter loops always come first).
+  const room5 = Math.max(0, o.maxLoops - all.length - f.loops);
+  const g = yield* buildLoops5Steps(usable, starts, {
+    perPool: o.perPool5 ?? 6, room: room5, perCoin: o.perCoin5 ?? 300, maxSteps: o.maxSteps5 ?? 3_000_000,
+  });
+  for (const [k, x] of g.byPool) {
+    if ((++n & 63) === 0) yield;
+    const before = byPool.get(k);
+    byPool.set(k, before ? before.concat(x) : x);
+  }
+  return { byPool, loops: all.length + f.loops + g.loops, pools: usable.length, capped: capped || f.capped || g.capped, loops4: f.loops, loops5: g.loops, seen: seenKeys.size, skipped };
 }
 
 // Same order everywhere: deeper (higher prio) first, then by id so a
@@ -329,6 +349,104 @@ function* buildLoops4Steps(usable: Array<{ k: string; a: string; b: string; d: n
   return { byPool: top, loops: kept.size, capped };
 }
 
+// 5-POOL SEARCH (Oct 26, owner: "up to 5 coin loops"). Same idea and same
+// limits as the 4-pool search above, one coin longer:
+//   S -> X -> Y -> W -> Z -> S, five different coins (so five different pools).
+// For each start coin S, each pair (X, Z) of coins next to S, and each coin Y
+// next to X: the 4th coin W must be next to BOTH Y and Z, so only the SHORTER
+// of Y's and Z's neighbour lists is walked (the other is just asked). Only the
+// PAIR_POOLS5 deepest pools per coin pair are used (2: keeps 2^5 = 32 pool
+// choices per coin path at most). Bounded by perCoin (per start coin and first
+// middle coin, normal, not reported), maxSteps (reported as "capped"), perPool
+// (kept per pool) and room (what is left under TRIG_ENTRY_LOOP_INDEX_MAX).
+// The contract runs 5 hops (fork-tested Oct 13: ~758k gas, which the loop gas
+// estimate already uses for 5 pools), so these loops are judged on that gas.
+const PAIR_POOLS5 = 2;
+function* buildLoops5Steps(usable: Array<{ k: string; a: string; b: string; d: number }>, starts: string[],
+  o: { perPool: number; room: number; perCoin: number; maxSteps: number }): Steps<{ byPool: Map<string, EntryLoop[]>; loops: number; capped: boolean }> {
+  type U = { k: string; a: string; b: string; d: number };
+  const empty = { byPool: new Map<string, EntryLoop[]>(), loops: 0, capped: o.room <= 0 };
+  if (o.room <= 0 || o.perPool <= 0) return empty;
+  let n = 0;
+  // Neighbours: coin -> (next coin -> its pools, deepest first, top PAIR_POOLS5).
+  const nb = new Map<string, Map<string, U[]>>();
+  for (const u of usable) {
+    if ((++n & 255) === 0) yield;
+    for (const [x, y] of [[u.a, u.b], [u.b, u.a]] as const) {
+      let m = nb.get(x); if (!m) { m = new Map(); nb.set(x, m); }
+      const l = m.get(y); if (l) l.push(u); else m.set(y, [u]);
+    }
+  }
+  for (const m of nb.values()) for (const [y, l] of m) {
+    if ((++n & 255) === 0) yield;
+    l.sort((p, q) => q.d - p.d || (p.k < q.k ? -1 : p.k > q.k ? 1 : 0));
+    if (l.length > PAIR_POOLS5) m.set(y, l.slice(0, PAIR_POOLS5));
+  }
+  // Kept loops per pool, best first (at most perPool each). Same as 4-pool.
+  const top = new Map<string, EntryLoop[]>();
+  const wouldKeep = (k: string, prio: number) => { const a = top.get(k); return !a || a.length < o.perPool || prio >= a[a.length - 1].prio; };
+  const keep = (l: EntryLoop) => {
+    for (const k of l.keys) {
+      let a = top.get(k); if (!a) { a = []; top.set(k, a); }
+      if (a.length >= o.perPool && byPrio(l, a[a.length - 1]) >= 0) continue;
+      let i = a.length; while (i > 0 && byPrio(l, a[i - 1]) < 0) i--;
+      a.splice(i, 0, l);
+      if (a.length > o.perPool) a.pop();
+    }
+  };
+  let capped = false, steps = 0;
+  outer:
+  for (const S of starts) {
+    const nS = nb.get(S);
+    if (!nS) continue;
+    const ends = [...nS.keys()].sort((x, y) => (nS.get(y)![0].d - nS.get(x)![0].d) || (x < y ? -1 : x > y ? 1 : 0));
+    for (const X of ends) {
+      const nX = nb.get(X)!;
+      let made = 0;
+      for (const Z of ends) {
+        if (made >= o.perCoin) break;
+        if (++steps > o.maxSteps) { capped = true; break outer; }
+        if ((++n & 255) === 0) yield;
+        if (Z === X) continue;
+        const nZ = nb.get(Z)!;
+        for (const Y of nX.keys()) {
+          if (made >= o.perCoin) break;
+          if (++steps > o.maxSteps) { capped = true; break outer; }
+          if ((++n & 255) === 0) yield;
+          if (Y === S || Y === X || Y === Z) continue;
+          const nY = nb.get(Y)!;
+          const [small, big] = nY.size <= nZ.size ? [nY, nZ] : [nZ, nY];
+          for (const W of small.keys()) {
+            if (++steps > o.maxSteps) { capped = true; break outer; }
+            if ((++n & 255) === 0) yield;
+            if (W === S || W === X || W === Y || W === Z || !big.has(W)) continue;
+            const p1s = nS.get(X)!, p2s = nX.get(Y)!, p3s = nY.get(W)!, p4s = nb.get(W)!.get(Z)!, p5s = nZ.get(S)!;
+            for (const u1 of p1s) for (const u2 of p2s) for (const u3 of p3s) for (const u4 of p4s) for (const u5 of p5s) {
+              if (made >= o.perCoin) continue; // per-coin limit: normal, not reported as "capped"
+              made++;
+              if ((++n & 63) === 0) yield; // up to 32 pool choices per coin path: let the bot run in between
+              const prio = Math.min(u1.d, u2.d, u3.d, u4.d, u5.d);
+              const keys = [u1.k, u2.k, u3.k, u4.k, u5.k];
+              if (!keys.some((k) => wouldKeep(k, prio))) continue;
+              keep({ id: loopId(S, keys), start: S, keys, tokens: [S, X, Y, W, Z],
+                inIsA: [u1.a === S, u2.a === X, u3.a === Y, u4.a === W, u5.a === Z], prio });
+            }
+          }
+        }
+      }
+    }
+  }
+  const kept = new Set<EntryLoop>();
+  for (const a of top.values()) for (const l of a) kept.add(l);
+  if (kept.size > o.room) {
+    const best = [...kept].sort(byPrio).slice(0, o.room);
+    const ok = new Set(best);
+    for (const [k, a] of top) { const b = a.filter((l) => ok.has(l)); if (b.length) top.set(k, b); else top.delete(k); }
+    return { byPool: top, loops: best.length, capped: true };
+  }
+  return { byPool: top, loops: kept.size, capped };
+}
+
 // The LOOP INDEX: rebuilt in the background (bites), swapped in whole when
 // done; a trigger only reads it. Never throws into the bot.
 export class EntryLoopIndex<P> {
@@ -353,8 +471,8 @@ export class EntryLoopIndex<P> {
 
   // Loops through this pool (deepest first), or none.
   loopsFor(key: string): EntryLoop[] { return this.data.byPool.get(lc(key)) ?? []; }
-  info(): { loops: number; loops4: number; pools: number; capped: boolean; lastMs: number; builds: number; ageMs: number; seen: number; skipped: Record<string, number> } {
-    return { loops: this.data.loops, loops4: this.data.loops4 ?? 0, pools: this.data.pools, capped: this.data.capped, lastMs: this.lastMs, builds: this.builds, ageMs: this.lastBuiltAt ? this.now() - this.lastBuiltAt : -1,
+  info(): { loops: number; loops4: number; loops5: number; pools: number; capped: boolean; lastMs: number; builds: number; ageMs: number; seen: number; skipped: Record<string, number> } {
+    return { loops: this.data.loops, loops4: this.data.loops4 ?? 0, loops5: this.data.loops5 ?? 0, pools: this.data.pools, capped: this.data.capped, lastMs: this.lastMs, builds: this.builds, ageMs: this.lastBuiltAt ? this.now() - this.lastBuiltAt : -1,
       seen: this.data.seen ?? 0, skipped: this.data.skipped ?? {} };
   }
 
