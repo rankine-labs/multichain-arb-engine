@@ -43,7 +43,7 @@ use arbsim::node::{CallResult, Class, NodeApi, NodeErr, RpcErr};
 use arbsim::state::fill::FillQueue;
 use arbsim::state::mirror::{Config, Shared};
 use arbsim::state::snap::Volatile;
-use arbsim::state::{Lookup, StateRead};
+use arbsim::state::{Lookup, MissItem, StateRead};
 use copy2_util::*;
 use revm::primitives::{Address, B256, U256};
 use serde_json::{json, Value};
@@ -976,4 +976,47 @@ fn relisted_after_drop_grace_loads_as_before() {
     run_blocks(&mut ch, &mut [&mut c], 2, &mut last);
     c.settle();
     exact_vs_chain(&ch, &c, "re-listed after the drop grace");
+}
+
+/// FAST RESTART (Oct 25, live: 222,528 held "nothing follows" values were
+/// re-read for 416 s after every restart while blocks waited). Above
+/// ARBSIM_COPY2_RESUME_VERIFY_MAX they are forgotten instead: the restart
+/// answers at once, nothing reloads, the copy stays exact, and a forgotten
+/// value is simply missing (a check's fill reads it again).
+#[test]
+fn big_held_set_is_forgotten_on_warm_restart_instead_of_reread() {
+    let Some(mut ch) = Chain::start() else {
+        eprintln!("copy2 resume anvil test SKIPPED: no ~/.foundry/bin/anvil");
+        return;
+    };
+    let path = state_path("forget");
+    let mut b = ch.copy(Some(&path), |_| {});
+    ch.connect(&mut b);
+    let mut last = 0u64;
+    run_blocks(&mut ch, &mut [&mut b], 1, &mut last);
+    b.wait("every pool ready", |c| c.all_ready() && c.walked_all());
+    run_blocks(&mut ch, &mut [&mut b], 3, &mut last);
+    b.settle();
+    // A value nothing follows (a coin's slot 2, e.g. its total supply), held after a fill.
+    let held = MissItem::Slot(ch.uu, U256::from(2u64));
+    b.h.fill(vec![held.clone()]);
+    b.settle();
+    assert!(matches!(b.sh.head().unwrap().snap.storage(ch.uu, U256::from(2u64)), Lookup::Known(_)), "held after the fill");
+    b.intake.save_now().expect("saved");
+    drop(b);
+    run_blocks(&mut ch, &mut [], 5, &mut last);
+    // Restart with the limit at 0: everything held is "too many".
+    let mut b2 = ch.copy(Some(&path), |c| c.resume_verify_max = 0);
+    ch.connect(&mut b2);
+    let txs = ch.random_txs();
+    let n = ch.mine(&txs);
+    let mut m = ch.msg(n, ch.reports(n), Some(n));
+    m.gap_reason = Some("start".into());
+    b2.send(m);
+    b2.settle();
+    assert_eq!(b2.c("catchups_done"), 1);
+    assert!(b2.c("resume_forgotten") >= 1, "the held value was forgotten, not re-read");
+    assert_eq!(b2.c("loads"), 0, "no pool loaded again: {:?}", b2.states());
+    assert_eq!(b2.sh.head().unwrap().snap.storage(ch.uu, U256::from(2u64)), Lookup::Missing, "forgotten: a check misses it and fills it again");
+    exact_vs_chain(&ch, &b2, "restarted (forgot held values)");
 }
