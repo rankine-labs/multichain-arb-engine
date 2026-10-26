@@ -132,6 +132,13 @@ async function timingMode() {
       row.cls = lastOk >= B0 ? 'rival first (after we sent)' : 'rival first (before we sent: our view was stale)';
       row.staleBlocks = lastOk >= B0 ? 0 : B0 - lastOk; row.rivals = t2.length; row.rival1 = t2[0]?.h?.slice(0, 12);
     }
+    // Was any of those 'rivals' actually one of OUR own transactions?
+    if (row.rivals) {
+      const firsts = (await touches(hops, (lastOk ?? L - 1) + 1, L)).filter((x) => x.b < L || x.i < idx).slice(0, 4);
+      let ours = 0; for (const f of firsts) { const ft = (await rpc('eth_getTransactionByHash', [f.h])).result; if (ft && ft.from.toLowerCase() === tx.from.toLowerCase()) ours++; }
+      row.oursAmongFirst4 = ours; row.firstRivalOurs = firsts.length ? undefined : null;
+      if (firsts.length) { const ft = (await rpc('eth_getTransactionByHash', [firsts[0].h])).result; row.firstRivalOurs = !!ft && ft.from.toLowerCase() === tx.from.toLowerCase(); }
+    }
     rows.push(row);
   }
   for (const r of rows) console.log(JSON.stringify(r));
