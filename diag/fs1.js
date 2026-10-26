@@ -69,7 +69,28 @@ function fireLines() {
   }
   return m;
 }
+async function timingMode() {
+  const lines = fs.readFileSync(path.join(APP, 'data/live-trades.jsonl'), 'utf8').trim().split('\n').map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+  const fl = fireLines();
+  const out = [];
+  for (const s of lines.filter((x) => x.kind === 'sent' && fl.has(x.hash))) {
+    const tm = fl.get(s.hash);
+    const rc = (await rpc('eth_getTransactionReceipt', [s.hash])).result; if (!rc) continue;
+    const L = Number(rc.blockNumber);
+    const startSec = Math.floor((s.t - (tm.sendMs || 0)) / 1000);
+    const B0 = await blockBefore(startSec, L);
+    out.push({ src: tm.src, readyMs: tm.readyMs, signMs: tm.signMs, sendMs: tm.sendMs, blocksToLand: L - B0, landMinusSendSec: (await ts(L)) - startSec, idx: Number(rc.transactionIndex) });
+  }
+  const q = (a, p) => { const v = a.filter((x) => x !== null && x !== undefined).sort((x, y) => x - y); return v.length ? v[Math.min(v.length - 1, Math.floor(p * v.length))] : null; };
+  const col = (k, f = () => true) => out.filter(f).map((o) => o[k]);
+  console.log('TIMING n', out.length, 'trade', out.filter((o) => o.src === 'trade').length, 'gap', out.filter((o) => o.src === 'gap').length);
+  for (const k of ['signMs', 'sendMs', 'blocksToLand', 'landMinusSendSec', 'idx']) console.log(k, 'p50', q(col(k), 0.5), 'p90', q(col(k), 0.9), 'max', q(col(k), 1));
+  console.log('readyMs(trade only) p50', q(col('readyMs', (o) => o.src === 'trade'), 0.5), 'p90', q(col('readyMs', (o) => o.src === 'trade'), 0.9), 'max', q(col('readyMs', (o) => o.src === 'trade'), 1));
+  console.log('sendMs over 1 s:', out.filter((o) => o.sendMs > 1000).length, 'over 250 ms:', out.filter((o) => o.sendMs > 250).length);
+  console.log('rpc calls', calls);
+}
 (async () => {
+  if (process.argv[3] === 'timing') return timingMode();
   const lines = fs.readFileSync(path.join(APP, 'data/live-trades.jsonl'), 'utf8').trim().split('\n').map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
   const sent = new Map(lines.filter((x) => x.kind === 'sent').map((x) => [x.hash, x]));
   const failed = lines.filter((x) => x.kind === 'result' && x.status !== 'profit').slice(-N);
@@ -86,7 +107,10 @@ function fireLines() {
     const hops = t ? [...t.hops].map((h) => ({ kind: h.kind, pool: h.pool, tokenIn: h.tokenIn, tokenOut: h.tokenOut, v4Fee: h.v4Fee, v4TickSpacing: h.v4TickSpacing })) : [];
     const tr = await rpc('debug_traceTransaction', [r.hash, { tracer: 'callTracer', tracerConfig: { onlyTopCall: true } }]);
     const reason = tr.result ? why(tr.result.output) : 'trace failed';
-    const sendSec = Math.floor((s.t || 0) / 1000);
+    // The trade log time is AFTER the node acknowledged the send; the send
+    // itself started sendMs earlier (and the decision a little before that).
+    const tm = fl.get(r.hash) || {};
+    const sendSec = Math.floor(((s.t || 0) - (tm.sendMs || 0)) / 1000);
     const B0 = s.t ? await blockBefore(sendSec, L) : L - 4;
     const landTs = await ts(L);
     const row = { hash: r.hash.slice(0, 12), label: r.label, src: (fl.get(r.hash) || {}).src, L, idx, behind: L - B0, landSec: landTs - sendSec, reason, maxBlock: t ? Number(t.maxBlock) : null, gasUsd: r.gasUsd, exp: s.expectedProfitUsd ?? r.expectedProfitUsd, fund: s.funding, timing: fl.get(r.hash) || null };
@@ -94,10 +118,11 @@ function fireLines() {
     if (!/^InsufficientProfit|^ZeroAmount/.test(reason)) { row.cls = /TransferFailed|FlashPool|BadRoute|TokenBalance|Unsupported|V4NotEnabled|Reentrancy|UnexpectedEth|Unauthorized|NotExecutor/.test(reason) ? 'funding/contract' : 'unknown'; rows.push(row); continue; }
     // Replay from 4 blocks before the send up to the block before ours.
     let lastOk = null, gone = false; const seq = [];
-    for (let b = B0 - 4; b <= L - 1; b++) { const x = await replay(tx, b); seq.push(x.ok === null ? '?' : x.ok ? '+' : '-'); if (x.ok === null) gone = true; if (x.ok) lastOk = b; }
-    row.replay = seq.join('');   // one char per block, B0-4 .. L-1 (+ works, - fails, ? state gone)
+    for (let b = B0 - 6; b <= L - 1; b++) { const x = await replay(tx, b); seq.push(x.ok === null ? '?' : x.ok ? '+' : '-'); if (x.ok === null) gone = true; if (x.ok) lastOk = b; }
+    row.replay = seq.join('');   // one char per block, B0-6 .. L-1 (+ works, - fails, ? state gone)
+    row.lastOkVsLand = lastOk === null ? null : lastOk - L; // -1 = worked right before our block
     if (gone && lastOk === null) { row.cls = 'unknown'; row.note = 'old state not available'; rows.push(row); continue; }
-    if (lastOk === null) { row.cls = 'incorrect predicted state'; row.note = 'never worked from 4 blocks before the send to landing'; }
+    if (lastOk === null) { row.cls = 'incorrect predicted state'; row.note = 'never worked from 6 blocks before the send started to landing'; }
     else if (lastOk === L - 1) {
       const t2 = (await touches(hops, L, L)).filter((x) => x.b === L && x.i < idx);
       row.cls = t2.length ? 'rival first (same block, ahead of us)' : 'unknown'; row.rivals = t2.length; row.rival1 = t2[0]?.h?.slice(0, 12);
