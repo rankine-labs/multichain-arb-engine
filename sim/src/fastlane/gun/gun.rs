@@ -27,18 +27,36 @@
 //                 (the same switches the Node sender needs)
 //               BOT_PRIVATE_KEY (the SAME executor wallet as Node: the
 //                 contract allows one executor) and ARB_EXECUTOR_ROBINHOOD
+//               a REAL safety gate (Gate::is_real; the do-nothing NoGate
+//                 is for practice and tests only and can never broadcast)
+//             and, at each fire, the gate says broadcasting is allowed right
+//             now (Gate::may_broadcast_now: kill switch, Node agrees, ...).
+//             `Gun::broadcasting()` is the ONE answer to "are we live right
+//             now": true only when every one of these holds.
 //   The key is read ONLY in live mode, ONLY from BOT_PRIVATE_KEY, never
 //   logged, and the env text is not kept (the Signer wipes its copy on drop).
 //
 // Same rules as the Node sender (src/execution/fastSender.ts + the loop
 // senders in trigEntryLoops.ts / loopLive.ts):
 //   type 2, chain 4663, value 0, tip 0, maxFee = 2 x base fee + 1,
-//   gas limit = tuned limit + 1.5 x posting gas, maxBlock = deadline
+//   gas limit = tuned limit + 1.5 x posting gas, maxBlock = the fast lane's
+//   deadline (FASTLANE_MAX_BLOCK_MARGIN blocks ahead, default 2; Node's
+//   MAX_BLOCK_MARGIN rule stays in gas.rs for compatibility)
 //   (live: refuses with "block info stale" when block info is > 10 s old;
 //   practice: the same estimate when known, else 0. The Node dry run always
 //   uses 0; practice uses the real estimate so its bytes look like live ones),
 //   minProfit = usdToTokenUnits(net after gas, price, decimals), refused if it
 //   rounds to zero, "no trade contract set" if live without an executor.
+//
+// Sending (send.rs): a signed trade that waits in the send queue longer than
+// FASTLANE_MAX_QUEUE_MS (default 80) is dropped unsent ("stale_in_queue"),
+// its nonce released for the next fire. A send that was written but got no
+// reply is "unknown" (not failed): its hash is still reported, so the
+// receipt tracker follows it, and its nonce counts as used.
+//
+// Integration note (M5, not done here): the safety check (D) and recording
+// the send (D's record_send) should happen under ONE lock around fire(), so
+// two fires can't both pass a limit that only one of them fits under.
 // ============================================================================
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
@@ -50,7 +68,7 @@ use super::calldata::{encode_for_funding, usd_to_token_units, CallErr, ExecutorH
 use super::gas::{spawn_refresher, Gas, GasConfig};
 use super::nonce::NonceTracker;
 use super::rpc::{pending_nonce, ReadRpc, UreqRpc};
-use super::send::{send_url_from_env, Job, SendOutcome, SendPool};
+use super::send::{send_url_from_env, Job, SendOutcome, SendPool, SendStatus};
 use super::tx::{Signer, TxFields};
 use crate::check::hexutil::to_hex;
 
@@ -162,14 +180,62 @@ pub struct CallPlan {
 /// Err(reason) = do not send.
 pub trait Gate: Send + Sync {
     fn allow(&self, c: &CallInput) -> Result<(), String>;
+    /// True only for a gate that really runs the safety checks (D's Safety).
+    /// No default on purpose: every gate must say. The gun never broadcasts
+    /// through a gate that answers false.
+    fn is_real(&self) -> bool;
+    /// May we broadcast right now (FASTLANE=live, both sides' RUST_SENDER,
+    /// no kill switch, Node's state fresh...)? Looked at by
+    /// `Gun::broadcasting()` and before every live send.
+    fn may_broadcast_now(&self) -> bool;
 }
 
-/// No extra checks (tests, benches). Live without D's gate is refused by
-/// Gun::from_env unless a gate is given.
+/// No checks at all: practice and tests only. NOT a real gate, so a gun
+/// built with it never broadcasts (fire refuses, from_env runs as practice).
 pub struct NoGate;
 impl Gate for NoGate {
     fn allow(&self, _c: &CallInput) -> Result<(), String> {
         Ok(())
+    }
+    fn is_real(&self) -> bool {
+        false
+    }
+    fn may_broadcast_now(&self) -> bool {
+        false
+    }
+}
+
+/// Why from_env's live mode can't broadcast (empty = it can). Pure, so the
+/// rules are testable without touching the process environment.
+pub fn live_blockers(get: &dyn Fn(&str) -> Option<String>, gate: &dyn Gate) -> Vec<&'static str> {
+    let is = |k: &str, want: &str| get(k).map(|v| v == want).unwrap_or(false);
+    let mut why = Vec::new();
+    if !matches!(get("RUST_SENDER").unwrap_or_default().trim().to_ascii_lowercase().as_str(), "on" | "true" | "1" | "yes") {
+        why.push("RUST_SENDER is not on");
+    }
+    if !is("EXECUTION_ENABLED", "true") {
+        why.push("EXECUTION_ENABLED is not true");
+    }
+    if !is("LIVE_SEND_CONFIRM", "yes-real-money") {
+        why.push("LIVE_SEND_CONFIRM is not yes-real-money");
+    }
+    if get("BOT_PRIVATE_KEY").map_or(true, |k| k.trim().is_empty()) {
+        why.push("BOT_PRIVATE_KEY is not set");
+    }
+    if get("ARB_EXECUTOR_ROBINHOOD").and_then(|s| crate::check::hexutil::parse_address(s.trim()).ok()).is_none() {
+        why.push("ARB_EXECUTOR_ROBINHOOD is not set");
+    }
+    if !gate.is_real() {
+        why.push("no real safety gate supplied");
+    }
+    why
+}
+
+/// FASTLANE_MAX_QUEUE_MS: whole ms, 1..=5000; unset / junk -> 80.
+pub fn max_queue_from(raw: Option<&str>) -> Duration {
+    match raw.map(|s| s.trim()).filter(|s| !s.is_empty()).and_then(|s| s.parse::<u64>().ok()) {
+        Some(v) if (1..=5_000).contains(&v) => Duration::from_millis(v),
+        _ => Duration::from_millis(80),
     }
 }
 
@@ -200,6 +266,10 @@ pub struct FireRecord {
     pub sign_us: u64,
     /// Fire start -> bytes written to the socket (live only).
     pub handed_us: Option<u64>,
+    /// Live send state at return: Unknown = written (or not confirmed in
+    /// time), final answer comes through the reply hook WITH the hash;
+    /// NotWritten / StaleInQueue = never left us. None = no send attempted.
+    pub send_status: Option<SendStatus>,
     /// found_at -> fire start (how long the trade waited for us).
     pub found_to_fire_us: u64,
 }
@@ -212,6 +282,9 @@ pub struct GunConfig {
     pub executor: Option<Address>,
     /// Max wait for "handed to socket".
     pub hand_timeout: Duration,
+    /// FASTLANE_MAX_QUEUE_MS [80]: a signed trade older than this when a
+    /// connection is free is dropped unsent (stale_in_queue).
+    pub max_queue: Duration,
 }
 
 /// The sender.
@@ -236,10 +309,6 @@ impl Drop for Gun {
     }
 }
 
-fn env_true(k: &str, want: &str) -> bool {
-    std::env::var(k).map(|v| v == want).unwrap_or(false)
-}
-
 impl Gun {
     /// Build from env. None when FASTLANE=off. `gate` = workstream D's safety
     /// gate; `on_reply` gets every live send's outcome (D's bridge).
@@ -249,24 +318,7 @@ impl Gun {
             return Ok(None);
         }
         let executor = std::env::var("ARB_EXECUTOR_ROBINHOOD").ok().and_then(|s| crate::check::hexutil::parse_address(s.trim()).ok());
-        let mut why_not_live = Vec::new();
-        if mode == Mode::Live {
-            if !rust_sender_on() {
-                why_not_live.push("RUST_SENDER is not on");
-            }
-            if !env_true("EXECUTION_ENABLED", "true") {
-                why_not_live.push("EXECUTION_ENABLED is not true");
-            }
-            if !env_true("LIVE_SEND_CONFIRM", "yes-real-money") {
-                why_not_live.push("LIVE_SEND_CONFIRM is not yes-real-money");
-            }
-            if std::env::var("BOT_PRIVATE_KEY").map_or(true, |k| k.trim().is_empty()) {
-                why_not_live.push("BOT_PRIVATE_KEY is not set");
-            }
-            if executor.is_none() {
-                why_not_live.push("ARB_EXECUTOR_ROBINHOOD is not set");
-            }
-        }
+        let why_not_live = if mode == Mode::Live { live_blockers(&|k: &str| std::env::var(k).ok(), gate.as_ref()) } else { Vec::new() };
         let broadcast = mode == Mode::Live && why_not_live.is_empty();
         if mode == Mode::Live && !broadcast {
             eprintln!("[fastlane] FASTLANE=live but NOT broadcasting ({}): running as practice", why_not_live.join(", "));
@@ -289,7 +341,13 @@ impl Gun {
         } else {
             None
         };
-        let cfg = GunConfig { mode: if broadcast { Mode::Live } else { Mode::Practice }, broadcast, executor, hand_timeout: Duration::from_millis(crate::node::env_u64("FASTLANE_SEND_TIMEOUT_MS", 5000)) };
+        let cfg = GunConfig {
+            mode: if broadcast { Mode::Live } else { Mode::Practice },
+            broadcast,
+            executor,
+            hand_timeout: Duration::from_millis(crate::node::env_u64("FASTLANE_SEND_TIMEOUT_MS", 5000)),
+            max_queue: max_queue_from(std::env::var("FASTLANE_MAX_QUEUE_MS").ok().as_deref()),
+        };
         let gun = Gun::with_parts(cfg, signer, Some(rpc), pool, gate, on_reply, GasConfig::from_env());
         gun.start_background();
         eprintln!(
@@ -347,8 +405,33 @@ impl Gun {
     pub fn mode(&self) -> Mode {
         self.cfg.mode
     }
+    /// THE answer to "is the gun live right now" (H3: the single source of
+    /// truth for the send record's mode). True only when ALL hold: built for
+    /// live with every switch set (cfg.broadcast, mode live), a send pool and
+    /// an executor exist, the gate is a real one, and the gate allows
+    /// broadcasting right now.
     pub fn broadcasting(&self) -> bool {
-        self.cfg.broadcast
+        self.why_not_broadcasting().is_none()
+    }
+
+    /// Why broadcasting() is false (None = it is true).
+    pub fn why_not_broadcasting(&self) -> Option<&'static str> {
+        if !(self.cfg.broadcast && self.cfg.mode == Mode::Live) {
+            return Some("not in live mode");
+        }
+        if self.pool.is_none() {
+            return Some("no send connection");
+        }
+        if self.cfg.executor.is_none() {
+            return Some("no trade contract set");
+        }
+        if !self.gate.is_real() {
+            return Some("no real safety gate (refusing to broadcast)");
+        }
+        if !self.gate.may_broadcast_now() {
+            return Some("safety gate: broadcasting not allowed right now");
+        }
+        None
     }
     pub fn gas(&self) -> &Arc<Gas> {
         &self.gas
@@ -376,7 +459,8 @@ impl Gun {
 
     /// Build the contract call (same steps as the Node loop senders).
     pub fn plan(&self, c: &CallInput, now: Instant) -> Result<CallPlan, String> {
-        let deadline = self.gas.deadline_block(now);
+        // The fast lane's own, tighter deadline (FASTLANE_MAX_BLOCK_MARGIN).
+        let deadline = self.gas.fast_deadline_block(now);
         let max_block = match (self.cfg.broadcast, deadline) {
             (true, None) => return Err("block info stale".into()),
             (_, d) => U256::from(d.unwrap_or(0)),
@@ -433,6 +517,12 @@ impl Gun {
         rec.min_profit = Some(plan.min_profit);
         rec.max_block = Some(plan.max_block);
         if self.cfg.broadcast {
+            // Built for live: every live condition must hold right now (no
+            // silent fallback to practice: the caller must see the refusal).
+            if let Some(w) = self.why_not_broadcasting() {
+                rec.why = Some(w.into());
+                return rec;
+            }
             if let Some(nr) = self.not_ready() {
                 rec.why = Some(nr.into());
                 return rec;
@@ -483,7 +573,20 @@ impl Gun {
         rec.hash = Some(hash.clone());
 
         // 4. Send (live) or log "would send" (practice).
-        let Some(pool) = self.pool.as_ref().filter(|_| self.cfg.broadcast) else {
+        // Live only if broadcasting() holds at this very moment (checked again
+        // after signing: the kill switch may have just been turned on).
+        let pool = match self.pool.as_ref() {
+            Some(p) if self.cfg.broadcast => {
+                if let Some(w) = self.why_not_broadcasting() {
+                    self.nonce.unused(nonce);
+                    rec.why = Some(w.into());
+                    return rec;
+                }
+                Some(p)
+            }
+            _ => None,
+        };
+        let Some(pool) = pool else {
             eprintln!(
                 "[fastlane] would send {} (block {}): net ${:.2} on ${:.0}, {} bytes, calldata {} us, gate {} us, sign {} us",
                 c.route_label,
@@ -504,11 +607,18 @@ impl Gun {
             nonce,
             hash,
             t0,
+            queued_at: Instant::now(),
+            max_queue: self.cfg.max_queue,
             handed: htx,
             done: Box::new(move |out: SendOutcome| {
-                match &out.result {
-                    Ok(_) => nonce_t.accepted(out.nonce),
-                    Err(e) => nonce_t.failed(out.nonce, e),
+                match (out.status, &out.result) {
+                    (SendStatus::Accepted, _) => nonce_t.accepted(out.nonce),
+                    // Written, no answer: may be on chain. Never re-sign it.
+                    (SendStatus::Unknown, _) => nonce_t.unknown(out.nonce),
+                    // Never left us: the number is free for the next fire.
+                    (SendStatus::StaleInQueue, _) => nonce_t.unused(out.nonce),
+                    (_, Err(e)) => nonce_t.failed(out.nonce, e),
+                    (_, Ok(_)) => nonce_t.accepted(out.nonce),
                 }
                 hook(&out);
                 // Re-sync right away when it is due (off the fire path).
@@ -520,15 +630,29 @@ impl Gun {
         if let Err(e) = pool.submit(job) {
             self.nonce.unused(nonce);
             rec.why = Some(e);
+            rec.send_status = Some(SendStatus::NotWritten);
             return rec;
         }
-        match hrx.recv_timeout(self.cfg.hand_timeout) {
+        // Wait for "handed to socket" no longer than the queue limit plus a
+        // little for the write itself (a reconnect can take a moment): the
+        // job then either goes out or is dropped stale, and the reply hook
+        // says which, with the hash.
+        let wait = self.cfg.hand_timeout.min(self.cfg.max_queue + Duration::from_millis(250));
+        match hrx.recv_timeout(wait) {
             Ok(Ok(h)) => {
                 rec.sent = true;
                 rec.handed_us = Some(h);
+                // Final answer (accepted / refused / unknown) comes through the hook.
+                rec.send_status = Some(SendStatus::Unknown);
             }
-            Ok(Err(e)) => rec.why = Some(e),
-            Err(_) => rec.why = Some("send not handed to socket in time".into()),
+            Ok(Err((st, e))) => {
+                rec.why = Some(e);
+                rec.send_status = Some(st);
+            }
+            Err(_) => {
+                rec.why = Some("send not confirmed handed in time (result comes through the reply hook)".into());
+                rec.send_status = Some(SendStatus::Unknown);
+            }
         }
         rec
     }

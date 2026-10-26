@@ -27,4 +27,5 @@ pub mod rpc;
 pub mod send;
 pub mod tx;
 
-pub use gun::{CallInput, CallPlan, FireRecord, Gate, Gun, GunConfig, Mode, NoGate};
+pub use gun::{live_blockers, max_queue_from, CallInput, CallPlan, FireRecord, Gate, Gun, GunConfig, Mode, NoGate};
+pub use send::SendStatus;

@@ -28,8 +28,22 @@
 //   closed it while idle), the same signed bytes are written once more on a
 //   fresh connection. Sending the same signed transaction twice is harmless
 //   (the second copy is "already known"). Once the request is written, there
-//   is no retry: a missing reply is reported as an error and the nonce
-//   tracker re-syncs from the chain.
+//   is no retry.
+//
+//   What a send can end as (SendStatus):
+//     Accepted      the node replied with the hash
+//     Refused       the node replied with a JSON-RPC error (nothing on chain)
+//     Unknown       the request WAS written but no usable reply came
+//                   (timeout, connection closed, not JSON, HTTP error page).
+//                   The sequencer may have it, so this is NOT a failure: the
+//                   hash is passed on so the receipt tracker can follow it,
+//                   and the nonce counts as used.
+//     NotWritten    writing failed twice (nothing left us)
+//     StaleInQueue  the signed trade waited in the queue longer than
+//                   FASTLANE_MAX_QUEUE_MS (default 80) because both
+//                   connections were busy: it is NOT sent (a standing gap
+//                   that old is gone; sending late only wastes gas). Its
+//                   nonce is released so the next fire re-uses it (no hole).
 // ============================================================================
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -312,12 +326,41 @@ fn parse_rpc_reply(status: u16, body: &[u8]) -> Result<Value, String> {
 // ---------------------------------------------------------------------------
 // The sender pool
 // ---------------------------------------------------------------------------
+/// How a send ended (see file header).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SendStatus {
+    Accepted,
+    Refused,
+    Unknown,
+    NotWritten,
+    StaleInQueue,
+}
+
+impl SendStatus {
+    /// Short name for records ("accepted", "refused", "unknown", ...).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SendStatus::Accepted => "accepted",
+            SendStatus::Refused => "refused",
+            SendStatus::Unknown => "unknown",
+            SendStatus::NotWritten => "not_written",
+            SendStatus::StaleInQueue => "stale_in_queue",
+        }
+    }
+    /// The bytes may have reached the sequencer: track the hash.
+    pub fn maybe_on_chain(self) -> bool {
+        matches!(self, SendStatus::Accepted | SendStatus::Unknown)
+    }
+}
+
 /// What came back for one send.
 #[derive(Clone, Debug)]
 pub struct SendOutcome {
     pub nonce: u64,
-    /// Our own hash (computed before sending).
+    /// Our own hash (computed before sending). Valid to track whenever
+    /// `status.maybe_on_chain()`.
     pub hash: String,
+    pub status: SendStatus,
     /// Ok(hash the node returned) or Err(node's / network's message).
     pub result: Result<String, String>,
     /// From fire start to reply (µs).
@@ -333,8 +376,13 @@ pub struct Job {
     pub hash: String,
     /// Fire start (for reply_us).
     pub t0: Instant,
-    /// Told "handed to socket" (Ok(µs since t0)) or the write error.
-    pub handed: SyncSender<Result<u64, String>>,
+    /// When the signed bytes were queued, and how long they may wait for a
+    /// free connection (FASTLANE_MAX_QUEUE_MS) before being dropped unsent.
+    pub queued_at: Instant,
+    pub max_queue: Duration,
+    /// Told "handed to socket" (Ok(µs since t0)) or why it never left us
+    /// (NotWritten / StaleInQueue + message).
+    pub handed: SyncSender<Result<u64, (SendStatus, String)>>,
     /// Called with the outcome once the reply arrives (on the sender thread).
     pub done: Box<dyn FnOnce(SendOutcome) + Send>,
 }
@@ -404,27 +452,60 @@ fn sender_loop(conn: &mut Conn, rx: &Mutex<Receiver<Job>>, warm: Duration) {
     }
 }
 
+/// Turn the reply to a written send into (status, result).
+fn classify_reply(reply: Result<(u16, Vec<u8>), String>) -> (SendStatus, Result<String, String>) {
+    let (st, body) = match reply {
+        Ok(r) => r,
+        // Written, then no reply: it may be on its way to the chain.
+        Err(e) => return (SendStatus::Unknown, Err(e)),
+    };
+    match serde_json::from_slice::<Value>(&body) {
+        Ok(v) if v.get("error").is_some_and(|e| !e.is_null()) => (SendStatus::Refused, Err(super::rpc::rpc_result(v).err().unwrap_or_default().chars().take(200).collect())),
+        Ok(v) => match v.get("result").and_then(|r| r.as_str()) {
+            Some(h) => (SendStatus::Accepted, Ok(h.to_string())),
+            None => (SendStatus::Unknown, Err("send endpoint: reply has no hash".into())),
+        },
+        // A proxy error page etc.: the request may still have been forwarded.
+        Err(_) if !(200..300).contains(&st) => (SendStatus::Unknown, Err(format!("send endpoint: HTTP {st}"))),
+        Err(_) => (SendStatus::Unknown, Err("send endpoint: reply not JSON".into())),
+    }
+}
+
 fn run_job(conn: &mut Conn, job: Job) {
+    // Waited too long for a free connection: don't send (see header).
+    let waited = job.queued_at.elapsed();
+    if waited > job.max_queue {
+        let msg = format!("stale_in_queue: waited {} ms for a connection (limit {} ms)", waited.as_millis(), job.max_queue.as_millis());
+        let _ = job.handed.try_send(Err((SendStatus::StaleInQueue, msg.clone())));
+        (job.done)(SendOutcome {
+            nonce: job.nonce,
+            hash: job.hash,
+            status: SendStatus::StaleInQueue,
+            result: Err(msg),
+            reply_us: job.t0.elapsed().as_micros() as u64,
+            wait_us: 0,
+        });
+        return;
+    }
     let body = format!(r#"{{"jsonrpc":"2.0","id":1,"method":"eth_sendRawTransaction","params":["{}"]}}"#, to_hex(&job.raw));
     let written = conn.write_with_retry(body.as_bytes());
     let handed_at = Instant::now();
     let handed_us = handed_at.duration_since(job.t0).as_micros() as u64;
-    let result = match written {
+    let (status, result) = match written {
         Ok(()) => {
             let _ = job.handed.try_send(Ok(handed_us));
-            conn.read_response().and_then(|(st, b)| parse_rpc_reply(st, &b)).and_then(|v| {
-                v.as_str().map(|s| s.to_string()).ok_or_else(|| "send endpoint: reply has no hash".to_string())
-            })
+            classify_reply(conn.read_response())
         }
         Err(e) => {
-            let _ = job.handed.try_send(Err(e.clone()));
-            Err(e)
+            let _ = job.handed.try_send(Err((SendStatus::NotWritten, e.clone())));
+            (SendStatus::NotWritten, Err(e))
         }
     };
     let now = Instant::now();
     (job.done)(SendOutcome {
         nonce: job.nonce,
         hash: job.hash,
+        status,
         result,
         reply_us: now.duration_since(job.t0).as_micros() as u64,
         wait_us: now.duration_since(handed_at).as_micros() as u64,
@@ -447,5 +528,18 @@ mod tests {
         // Errors never echo the URL.
         let e = parse_url("ftp://secret-key-here").unwrap_err();
         assert!(!e.contains("secret"));
+    }
+
+    #[test]
+    fn reply_classes() {
+        let ok = classify_reply(Ok((200, br#"{"jsonrpc":"2.0","id":1,"result":"0xabc"}"#.to_vec())));
+        assert_eq!(ok, (SendStatus::Accepted, Ok("0xabc".into())));
+        let refused = classify_reply(Ok((200, br#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"nonce too low"}}"#.to_vec())));
+        assert_eq!(refused.0, SendStatus::Refused);
+        assert!(refused.1.unwrap_err().contains("nonce too low"));
+        assert_eq!(classify_reply(Err("send endpoint: no reply (TimedOut)".into())).0, SendStatus::Unknown);
+        assert_eq!(classify_reply(Ok((502, b"<html>bad gateway</html>".to_vec()))).0, SendStatus::Unknown);
+        assert_eq!(classify_reply(Ok((200, br#"{"jsonrpc":"2.0","id":1,"result":null}"#.to_vec()))).0, SendStatus::Unknown);
+        assert!(SendStatus::Unknown.maybe_on_chain() && !SendStatus::StaleInQueue.maybe_on_chain() && !SendStatus::Refused.maybe_on_chain());
     }
 }

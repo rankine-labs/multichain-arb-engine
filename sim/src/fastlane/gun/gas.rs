@@ -19,7 +19,12 @@
 //       (note_gas_used: 1.5 x the most seen, never below half the default).
 //     - deadline (maxBlock) = estimated current block (last read + elapsed
 //       time / block time) + margin: MAX_BLOCK_MARGIN blocks if set, else
-//       MAX_BLOCK_MARGIN_MS (default 3000) worth of blocks.
+//       MAX_BLOCK_MARGIN_MS (default 3000) worth of blocks. That is Node's
+//       rule, kept for compatibility (deadline_block). The fast lane uses a
+//       tighter one (fast_deadline_block): FASTLANE_MAX_BLOCK_MARGIN blocks
+//       (default 2): a standing gap is only worth taking in the next block or
+//       two; later, the trade should fail cheaply on chain rather than land
+//       on a moved price.
 //   STALE GUARD: block info older than 10 s -> no deadline -> no send
 //   ("block info stale"), exactly like the Node sender. A failed read keeps
 //   the last values (and they age into the stale guard).
@@ -60,7 +65,18 @@ pub struct GasConfig {
     pub l1_bytes: usize,
     pub margin_blocks: Option<f64>,
     pub margin_ms: f64,
+    /// FASTLANE_MAX_BLOCK_MARGIN [2]: the fast lane's deadline margin in
+    /// blocks. None = use Node's rule (MAX_BLOCK_MARGIN / _MS).
+    pub fast_margin_blocks: Option<f64>,
     pub refresh: Duration,
+}
+
+/// FASTLANE_MAX_BLOCK_MARGIN: whole blocks, at least 1; unset / junk -> 2.
+pub fn fast_margin_from(raw: Option<&str>) -> f64 {
+    match raw.map(|s| s.trim()).filter(|s| !s.is_empty()).and_then(|s| s.parse::<f64>().ok()) {
+        Some(v) if v.is_finite() && v >= 1.0 && v <= 1_000.0 => v.floor(),
+        _ => 2.0,
+    }
 }
 
 impl GasConfig {
@@ -72,6 +88,7 @@ impl GasConfig {
             l1_bytes: if l1.fract() == 0.0 && (100.0..=20_000.0).contains(&l1) { l1 as usize } else { 800 },
             margin_blocks: std::env::var("MAX_BLOCK_MARGIN").ok().filter(|s| !s.is_empty()).map(|s| s.trim().parse::<f64>().unwrap_or(f64::NAN)),
             margin_ms: env_f("MAX_BLOCK_MARGIN_MS").unwrap_or(3000.0),
+            fast_margin_blocks: Some(fast_margin_from(std::env::var("FASTLANE_MAX_BLOCK_MARGIN").ok().as_deref())),
             refresh: Duration::from_millis(2000),
         }
     }
@@ -233,6 +250,23 @@ impl Gas {
         Some(est + margin.floor() as u64)
     }
 
+    /// The fast lane's deadline: estimated current block + FASTLANE_MAX_BLOCK_MARGIN
+    /// (default 2). None = block info stale (same 10 s rule).
+    pub fn fast_deadline_block(&self, now: Instant) -> Option<u64> {
+        let Some(m) = self.cfg.fast_margin_blocks else { return self.deadline_block(now) };
+        let s = self.st.lock().unwrap();
+        let at = s.latest_block_at?;
+        if s.latest_block == 0 {
+            return None;
+        }
+        let age_ms = now.saturating_duration_since(at).as_secs_f64() * 1000.0;
+        if age_ms > 10_000.0 {
+            return None;
+        }
+        let est = s.latest_block + (age_ms / s.block_ms).floor() as u64;
+        Some(est + (if m.is_finite() && m >= 1.0 { m.floor() as u64 } else { 2 }))
+    }
+
     /// Ready to sign: a gas price was read and block info is fresh.
     pub fn max_fee(&self) -> Option<u128> {
         self.st.lock().unwrap().max_fee_per_gas
@@ -275,6 +309,15 @@ pub fn spawn_refresher(gas: Arc<Gas>, rpc: Arc<dyn ReadRpc>, stop: Arc<AtomicBoo
 mod tests {
     use super::*;
 
+    #[test]
+    fn fast_margin_setting() {
+        assert_eq!(fast_margin_from(None), 2.0);
+        assert_eq!(fast_margin_from(Some("")), 2.0);
+        assert_eq!(fast_margin_from(Some("3")), 3.0);
+        assert_eq!(fast_margin_from(Some("0")), 2.0);
+        assert_eq!(fast_margin_from(Some("junk")), 2.0);
+    }
+
     struct Fake {
         block: Mutex<Value>,
         calls: Mutex<Vec<String>>,
@@ -292,7 +335,7 @@ mod tests {
     }
 
     fn cfg() -> GasConfig {
-        GasConfig { fire_gas_limit: 1_500_000, l1_bytes: 800, margin_blocks: None, margin_ms: 3000.0, refresh: Duration::from_millis(2000) }
+        GasConfig { fire_gas_limit: 1_500_000, l1_bytes: 800, margin_blocks: None, margin_ms: 3000.0, fast_margin_blocks: Some(2.0), refresh: Duration::from_millis(2000) }
     }
 
     #[test]
@@ -306,6 +349,9 @@ mod tests {
         assert_eq!(g.current_gas_limit(), 1_500_000 + 12_345 * 3 / 2);
         // 50 ms blocks, 3000 ms margin -> 60 blocks.
         assert_eq!(g.deadline_block(Instant::now()), Some(256 + 60));
+        // The fast lane's tighter deadline: 2 blocks.
+        assert_eq!(g.fast_deadline_block(Instant::now()), Some(256 + 2));
+        assert!(g.fast_deadline_block(Instant::now() + Duration::from_secs(11)).is_none());
         // Stale after 10 s.
         assert!(g.deadline_block(Instant::now() + Duration::from_secs(11)).is_none());
         // Gas used tuning.

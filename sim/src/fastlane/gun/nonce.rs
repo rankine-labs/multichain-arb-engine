@@ -20,8 +20,18 @@
 //         * the LOWEST failed number, if nothing says it is used (no hole);
 //         * else the highest of: chain's pending count, one past the highest
 //           accepted, one past any number reported as used.
+//     - unknown(n): the request was written but no reply came (timeout,
+//       connection closed). The sequencer MAY have it, so n is treated as
+//       used (never re-signed: a second trade with the same number could
+//       replace or clash with the first); new fires pause until the re-sync
+//       moves past it. If it really never arrived, the receipt tracker later
+//       reports it dropped and dropped() trusts the chain again.
 //     - dropped(): a sent trade was never mined (the receipt tracker says
 //       so): its number is free again; trust the chain's count.
+//     - A signed send dropped because it waited too long in the send queue
+//       (stale_in_queue) never reached the endpoint: unused(n), like a send
+//       that failed before writing. Its number is re-used by the next fire
+//       (no permanent hole; a later number already sent is skipped).
 //   resync() is called by the sender thread / gas thread, never on the fire
 //   path, so a fire never waits for the network.
 // ============================================================================
@@ -133,6 +143,15 @@ impl NonceTracker {
         } else {
             s.failed.insert(n);
         }
+        s.needs_resync = true;
+    }
+
+    /// Written, but no reply (timeout / closed): assume n is used.
+    pub fn unknown(&self, n: u64) {
+        let mut s = self.s.lock().unwrap();
+        s.in_flight.remove(&n);
+        s.max_accepted = Some(s.max_accepted.map_or(n, |m| m.max(n)));
+        s.accepted_ahead.insert(n);
         s.needs_resync = true;
     }
 
@@ -264,6 +283,34 @@ mod tests {
         // skip 1 (already accepted) and go on at 2.
         assert_eq!(t.take(), Ok(0));
         assert_eq!(t.take(), Ok(2));
+    }
+
+    #[test]
+    fn unknown_reply_is_never_resigned() {
+        let t = NonceTracker::new();
+        t.load(7);
+        let a = t.take().unwrap(); // 7
+        t.unknown(a);
+        assert_eq!(t.take(), Err(NonceErr::ResyncPending));
+        // Read node lags (still says 7): we still move past 7.
+        t.resync(Some(7)).unwrap();
+        assert_eq!(t.take(), Ok(8));
+    }
+
+    #[test]
+    fn stale_in_queue_hole_is_refilled() {
+        let t = NonceTracker::new();
+        t.load(0);
+        let a = t.take().unwrap(); // 0: sent
+        let b = t.take().unwrap(); // 1: dropped in the queue (never written)
+        let c = t.take().unwrap(); // 2: sent after it
+        t.accepted(a);
+        t.unused(b);
+        t.accepted(c);
+        t.resync(Some(1)).unwrap();
+        // The next fire fills the hole at 1, then skips 2 (already accepted).
+        assert_eq!(t.take(), Ok(1));
+        assert_eq!(t.take(), Ok(3));
     }
 
     #[test]
