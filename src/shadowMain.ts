@@ -79,7 +79,7 @@ import { createLocalSimHost, LocalSimHost, LocalCheck, LocalKind, LocalOutcome }
 import { TriggerFirst, trigFirstSettings, TrigOutcome } from './execution/triggerFirst';
 import { Scoreboard, SendPath, Confidence as ScoreConfidence, standingGapFailBlock, entryFailBlock } from './report/scoreboard';
 import { TrigEntry, EntryCandidate, EntryPick, TablePool, entrySettings, enumerateRoutes, rankRoutes } from './execution/trigEntry';
-import { EntryLoopIndex, EntryLoop, EntryLoopHost, EntryLoopSender, CoinTaxFileView, LoopScoreMemo, loopIndexSettings, loopQuoteUsd, pickLoops } from './execution/trigEntryLoops';
+import { EntryLoopIndex, EntryLoop, EntryLoopHost, EntryLoopSender, CoinTaxFileView, LoopScoreMemo, loopIndexSettings, loopQuoteUsd, pickLoops, loopSkipText } from './execution/trigEntryLoops';
 import { hasExactMath } from './core/loopFinder';
 import { runCheckFirst } from './execution/checkFirstFlow';
 import { MonadAdapter } from './chains/monad';
@@ -3059,15 +3059,21 @@ const entryLoopSettings = entrySettings(process.env, MIN_NET_PROFIT_USD);
 const entryLoopTax = new CoinTaxFileView('data/coin-tax.json');
 const entryLoopTaxOn = coinTaxConfigFromEnv(process.env).enabled;
 const entryLoopUsd = (t: string) => priceOracle.getUsdPrice('robinhood', t);
-const entryLoopPoolOk = (p: PoolState): boolean => {
-      if (!p || p.chain !== 'robinhood') return false;
-      if (liveBlocker(p, p)) return false;                      // venue / practice-only / live coin rule
+// Oct 26: the same rules, but saying WHICH one turned the pool away (null =
+// usable), so the hourly line can count reasons. Labels are short and carry
+// no addresses (the live blocker's own text is cut at its first detail).
+const entryLoopPoolWhy = (p: PoolState): string | null => {
+      if (!p || p.chain !== 'robinhood') return 'not robinhood';
+      const lb = liveBlocker(p, p);                             // venue / practice-only / live coin rule
+      if (lb) return 'live rule: ' + lb.split(/[(:]/)[0].replace(/0x[0-9a-fA-F]+/g, '').trim().slice(0, 50);
       const kind = kindForPool(p);
-      if (kind === null) return false;                          // the contract can't run this pool type
-      if (kind === KIND_V4_HOOKED && !v4KeyMatchesId(p)) return false;
-      if (!hasExactMath(p)) return false;                       // no quick price check possible
-      return deepEnough(p, decimalsOf, entryLoopUsd);           // same depth filter as the loop finder
+      if (kind === null) return 'contract cannot run pool type'; // the contract can't run this pool type
+      if (kind === KIND_V4_HOOKED && !v4KeyMatchesId(p)) return 'v4 key does not match';
+      if (!hasExactMath(p)) return 'no exact price maths';      // no quick price check possible
+      if (!deepEnough(p, decimalsOf, entryLoopUsd)) return 'too shallow'; // same depth filter as the loop finder
+      return null;
 };
+const entryLoopPoolOk = (p: PoolState): boolean => entryLoopPoolWhy(p) === null;
 const entryLoopIndex: EntryLoopIndex<PoolState> | null = entryLoopSettings.enabled && entryLoopSettings.loops && chainOn('robinhood')
       ? new EntryLoopIndex<PoolState>(loopIndexSettings(process.env), {
             pools: () => copy2PoolKeys().map((k) => cache.get('robinhood', k)).filter((p): p is PoolState => !!p),
@@ -3078,6 +3084,10 @@ const entryLoopIndex: EntryLoopIndex<PoolState> | null = entryLoopSettings.enabl
                         key: (p: PoolState) => p.poolAddress, tokens: (p: PoolState) => [p.tokenA, p.tokenB] as [string, string],
                         poolOk: entryLoopPoolOk,
                         coinOk: (t: string, isStart: boolean) => safetyGate.isAllowed(t) && (isStart || !entryLoopTaxOn || entryLoopTax.verdict(t) === 'ok'),
+                        // Same tests as poolOk / coinOk, with the reason (Oct 26, for counting only).
+                        poolWhy: entryLoopPoolWhy,
+                        coinWhy: (t: string, isStart: boolean) => !safetyGate.isAllowed(t) ? 'coin not on allowlist'
+                              : (!isStart && entryLoopTaxOn && entryLoopTax.verdict(t) !== 'ok') ? `coin tax test ${entryLoopTax.verdict(t) ?? 'not run'}` : null,
                         depth: (p: PoolState) => poolDepthUsd(p, decimalsOf, entryLoopUsd) ?? 0,
                   };
             },
@@ -3227,7 +3237,7 @@ try {
                         ...(entryLoopIndex && entryLoopSender ? {
                               loopCandidatesFor: (keys: string[], limit: number) => entryLoopCandidatesFor(keys, limit),
                               loopGate: (p: EntryPick) => entryLoopSender.gate(p) ?? (robinhoodSender.live ? scoreboard.pausedWhy('loop') : null),
-                              loopHourText: () => { const i = entryLoopIndex.info(); return `loop index ${i.loops} loops${i.loops4 ? ` (${i.loops4} of them 4-pool)` : ''} over ${i.pools} pools${i.capped ? ' (capped)' : ''}, rebuilt in ${i.lastMs} ms; ${entryLoopSender.hourLine()}`; },
+                              loopHourText: () => { const i = entryLoopIndex.info(); return `loop index ${i.loops} loops${i.loops4 ? ` (${i.loops4} of them 4-pool)` : ''} over ${i.pools} pools${i.capped ? ' (capped)' : ''}, rebuilt in ${i.lastMs} ms (${loopSkipText(i.seen, i.skipped)}); ${entryLoopSender.hourLine()}`; },
                         } : {}),
                         // Our own sends (seen again in the feed) and our contract: never triggers.
                         isOurTx: (h) => livePools.has(h) || livePools.has(h.toLowerCase()),

@@ -116,11 +116,17 @@ export type LoopRules<P> = {
   poolOk: (p: P) => boolean;                     // venue cleared live, contract can run it, exact maths, deep enough
   coinOk: (token: string, isStart: boolean) => boolean; // allowed list; middle coins: tax-tested
   depth?: (p: P) => number;                      // money near the price ($): deeper loops first
+  // Optional (Oct 26): same tests as poolOk / coinOk, but say WHICH rule
+  // turned the pool or coin away (null = fine). Used only to count reasons
+  // for the hourly line; when given, they decide instead of poolOk / coinOk.
+  poolWhy?: (p: P) => string | null;
+  coinWhy?: (token: string, isStart: boolean) => string | null;
 };
 
 // loops: all loops in the index (3- and 4-pool); loops4: of which 4-pool.
 // capped: some loops were left out because a limit was reached.
-export type LoopIndexData = { byPool: Map<string, EntryLoop[]>; loops: number; pools: number; capped: boolean; loops4?: number };
+// seen: distinct pools offered; skipped: how many were turned away, by reason.
+export type LoopIndexData = { byPool: Map<string, EntryLoop[]>; loops: number; pools: number; capped: boolean; loops4?: number; seen?: number; skipped?: Record<string, number> };
 
 // Options for one build. Only perPool / maxLoops are needed; without
 // poolsMax 4 the build is exactly the 3-pool one (as before Oct 25).
@@ -138,6 +144,7 @@ export function* buildLoopIndexSteps<P>(pools: P[], startCoins: string[], r: Loo
   // Usable pools (rules), once each.
   const usable: Array<{ p: P; k: string; a: string; b: string; d: number }> = [];
   const seenKeys = new Set<string>();
+  const skipped: Record<string, number> = {};
   let n = 0;
   for (const p of pools) {
     if ((++n & 63) === 0) yield;
@@ -145,9 +152,15 @@ export function* buildLoopIndexSteps<P>(pools: P[], startCoins: string[], r: Loo
     try { k = lc(r.key(p)); [a, b] = r.tokens(p).map(lc) as [string, string]; } catch { continue; }
     if (!k || !a || !b || a === b || seenKeys.has(k)) continue;
     seenKeys.add(k);
+    // First rule that says no (coin A, coin B, then the pool). Without the
+    // optional *Why helpers the old yes/no tests are used with plain labels.
+    let why: string | null;
     try {
-      if (!r.coinOk(a, isStart(a)) || !r.coinOk(b, isStart(b)) || !r.poolOk(p)) continue;
-    } catch { continue; }
+      const coinWhy = r.coinWhy ?? ((t: string, s: boolean) => (r.coinOk(t, s) ? null : s ? 'start coin not allowed' : 'middle coin not allowed'));
+      const poolWhy = r.poolWhy ?? ((q: P) => (r.poolOk(q) ? null : 'pool rule'));
+      why = coinWhy(a, isStart(a)) ?? coinWhy(b, isStart(b)) ?? poolWhy(p);
+    } catch { why = 'rule error'; }
+    if (why) { skipped[why] = (skipped[why] ?? 0) + 1; continue; }
     let d = 0;
     try { d = r.depth ? Number(r.depth(p)) || 0 : 0; } catch { d = 0; }
     usable.push({ p, k, a, b, d });
@@ -196,7 +209,7 @@ export function* buildLoopIndexSteps<P>(pools: P[], startCoins: string[], r: Loo
   }
   // 4-POOL LOOPS (Oct 25): only when switched on, and only with room left
   // under the whole-index limit (3-pool loops always come first).
-  if ((o.poolsMax ?? 3) < 4) return { byPool, loops: all.length, pools: usable.length, capped };
+  if ((o.poolsMax ?? 3) < 4) return { byPool, loops: all.length, pools: usable.length, capped, seen: seenKeys.size, skipped };
   const room = Math.max(0, o.maxLoops - all.length);
   const f = yield* buildLoops4Steps(usable, starts, {
     perPool: o.perPool4 ?? 8, room, perCoin: o.perCoin4 ?? 400, maxSteps: o.maxSteps4 ?? 3_000_000,
@@ -207,7 +220,7 @@ export function* buildLoopIndexSteps<P>(pools: P[], startCoins: string[], r: Loo
     const three = byPool.get(k);
     byPool.set(k, three ? three.concat(x) : x);
   }
-  return { byPool, loops: all.length + f.loops, pools: usable.length, capped: capped || f.capped, loops4: f.loops };
+  return { byPool, loops: all.length + f.loops, pools: usable.length, capped: capped || f.capped, loops4: f.loops, seen: seenKeys.size, skipped };
 }
 
 // Same order everywhere: deeper (higher prio) first, then by id so a
@@ -340,8 +353,9 @@ export class EntryLoopIndex<P> {
 
   // Loops through this pool (deepest first), or none.
   loopsFor(key: string): EntryLoop[] { return this.data.byPool.get(lc(key)) ?? []; }
-  info(): { loops: number; loops4: number; pools: number; capped: boolean; lastMs: number; builds: number; ageMs: number } {
-    return { loops: this.data.loops, loops4: this.data.loops4 ?? 0, pools: this.data.pools, capped: this.data.capped, lastMs: this.lastMs, builds: this.builds, ageMs: this.lastBuiltAt ? this.now() - this.lastBuiltAt : -1 };
+  info(): { loops: number; loops4: number; pools: number; capped: boolean; lastMs: number; builds: number; ageMs: number; seen: number; skipped: Record<string, number> } {
+    return { loops: this.data.loops, loops4: this.data.loops4 ?? 0, pools: this.data.pools, capped: this.data.capped, lastMs: this.lastMs, builds: this.builds, ageMs: this.lastBuiltAt ? this.now() - this.lastBuiltAt : -1,
+      seen: this.data.seen ?? 0, skipped: this.data.skipped ?? {} };
   }
 
   // Rebuild if the pool set changed or the index is older than rebuildMs.
@@ -381,6 +395,16 @@ export class EntryLoopIndex<P> {
     const t = setInterval(() => { void this.maybeRebuild(); }, this.s.checkMs);
     t.unref?.();
   }
+}
+
+// Hourly-line text for the reasons pools were left out of the loop index,
+// biggest first, e.g. "1766 pools offered, left out: venue not cleared 900, ...".
+export function loopSkipText(seen: number, skipped: Record<string, number>, top = 6): string {
+  const list = Object.entries(skipped).sort((x, y) => y[1] - x[1]);
+  if (!list.length) return `${seen} pools offered, none left out`;
+  const shown = list.slice(0, top).map(([k, v]) => `${k} ${v}`).join(', ');
+  const rest = list.slice(top).reduce((t, [, v]) => t + v, 0);
+  return `${seen} pools offered, left out: ${shown}${rest ? `, other ${rest}` : ''}`;
 }
 
 // ---- per trigger: the moved pools' loops, ranked and capped -------------------
