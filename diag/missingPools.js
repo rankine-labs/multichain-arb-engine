@@ -15,7 +15,9 @@ const facDex=new Map(ROBINHOOD_SCAN_FACTORIES.map(f=>[lc(f.factory),f.dex]));
 const call=async(to,sig)=>{const r=await rpc('eth_call',[{to,data:sig},'latest']);return r&&r!=='0x'?r:null;};
 const addr=w=>w?'0x'+w.slice(-40):null;
 const symCache=new Map();
-const sym=async(t)=>{if(!t)return '?';if(symCache.has(t))return symCache.get(t);let s='?';try{const r=await call(t,'0x95d89b41');if(r&&r.length>=194){const n=parseInt(r.slice(130,194),16);s=Buffer.from(r.slice(194,194+n*2),'hex').toString();}else if(r&&r.length===66)s=Buffer.from(r.slice(2),'hex').toString().replace(/\0/g,'');}catch{}symCache.set(t,s);return s;};
+const { ethers } = require(APP+'/node_modules/ethers');
+// Token symbol: try string first, then bytes32 (some old tokens), else '?'.
+const sym=async(t)=>{if(!t)return '?';if(symCache.has(t))return symCache.get(t);let s='?';try{const r=await call(t,'0x95d89b41');if(r){try{s=ethers.AbiCoder.defaultAbiCoder().decode(['string'],r)[0];}catch{s=ethers.decodeBytes32String(r.slice(0,66));}}}catch{}symCache.set(t,s||'?');return s||'?';};
 (async()=>{
   const rows=fs.readFileSync(H+'/rx/profitSlow/per-arb.jsonl','utf8').trim().split('\n').map(JSON.parse).filter(r=>r.ours&&r.ours.status==='not-ours'&&/watch list/.test(r.ours.why));
   const miss=new Map();
@@ -29,8 +31,8 @@ const sym=async(t)=>{if(!t)return '?';if(symCache.has(t))return symCache.get(t);
   for(const e of list){ if(e.kind==='v4'){e.dex='uniswap-v4 (pool id; key via auto-follow)';e.pair='?';continue;}
     const f=addr(await call(e.pool,'0xc45a0155')),t0=addr(await call(e.pool,'0x0dfe1681')),t1=addr(await call(e.pool,'0xd21220a7'));
     e.dex=facDex.get(lc(f))||('unknown factory '+(f||'?'));e.pair=(await sym(t0))+'/'+(await sym(t1));e.token0=t0;e.token1=t1;}
-  const out=['rank,pool,type,dex,pair,rival_arbs,rival_profit_trusted_usd,rival_profit_all_prices_usd'];
-  list.forEach((e,i)=>out.push([i+1,e.pool,e.kind,e.dex,e.pair,e.arbs,e.trustedUsd.toFixed(2),e.allUsd.toFixed(2)].join(',')));
+  const out=['rank,pool,type,dex,pair,token0,token1,rival_arbs,rival_profit_trusted_usd,rival_profit_all_prices_usd'];
+  list.forEach((e,i)=>out.push([i+1,e.pool,e.kind,e.dex,e.pair,e.token0||'',e.token1||'',e.arbs,e.trustedUsd.toFixed(2),e.allUsd.toFixed(2)].join(',')));
   fs.writeFileSync(H+'/rx/missing-pools.csv',out.join('\n')+'\n');
   console.log('rival arbs with unwatched pools',rows.length,'| missing pools',list.length,'| V4',list.filter(e=>e.kind==='v4').length,'| other',list.filter(e=>e.kind!=='v4').length);
   console.log(out.slice(0,26).join('\n'));
