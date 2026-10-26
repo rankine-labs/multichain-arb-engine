@@ -484,6 +484,40 @@ export class CoinTaxFileView {
   size(): number { return this.recs.size; }
 }
 
+// ---- asking for coin tax tests (Oct 26) ------------------------------------------
+// The loop list only uses a middle coin that passed the tax test in the last
+// 6 h. The tester used to belong to the old loop finder (LOOP_TRADER), which is
+// off, so every pass expired and the list emptied. This asks a tax book to test
+// the middle coins of the pools the loop list is offered: allowed coins only
+// (the safety gate is unchanged), start coins (USDG / WETH) never. The book
+// itself skips coins with a fresh result, caps its queue and its rate.
+// Returns how many coins were asked for.
+export function askLoopTaxTests<P>(
+  pools: P[],
+  r: { tokens: (p: P) => [string, string]; holder: (p: P) => string | null; allowed: (t: string) => boolean },
+  startCoins: string[],
+  book: { verdict: (t: string) => string | undefined; request: (t: string, holder: string) => void },
+): number {
+  const starts = new Set(startCoins.map(lc));
+  const asked = new Set<string>();
+  for (const p of pools) {
+    let tokens: [string, string], holder: string | null;
+    try { tokens = r.tokens(p); holder = r.holder(p); } catch { continue; }
+    if (!holder) continue;
+    for (const raw of tokens) {
+      const t = lc(raw);
+      if (!t || starts.has(t) || asked.has(t)) continue;
+      try { if (!r.allowed(t)) continue; } catch { continue; }
+      // Fresh pass or a known bad result: nothing to do (the book re-tests bad coins after 24 h itself).
+      const v = book.verdict(t);
+      if (v === 'ok') continue;
+      asked.add(t);
+      book.request(t, holder);
+    }
+  }
+  return asked.size;
+}
+
 // ---- the guarded loop send -------------------------------------------------------
 // What a loop candidate carries for its send (EntryCandidate.host).
 export type EntryLoopHost = { kind: 'loop'; loop: EntryLoop; base: string; usdPer: number; dec: number; coins: string[] };
