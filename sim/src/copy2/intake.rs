@@ -646,6 +646,8 @@ c2counters!(
     // budget and starved pool loads for 5 min after a restart): held back
     // while pools wait to load, over the per-job cap, or inside the gap.
     pm_far_deferred, fills_yielded,
+    // Held values forgotten (not re-read) on a big warm restart (ARBSIM_COPY2_RESUME_VERIFY_MAX).
+    resume_forgotten,
 );
 
 fn inc(c: &AtomicU64) {
@@ -1734,6 +1736,11 @@ pub struct C2Config {
     /// A catch-up not done after this long gives up (normal load / reload)
     /// [ARBSIM_COPY2_RESUME_TIMEOUT_S, 120].
     pub resume_timeout_s: u64,
+    /// FAST RESTART (Oct 25): at most this many held "nothing follows"
+    /// values are re-read before a warm restart answers again; more are
+    /// FORGOTTEN instead (read again when a check needs them)
+    /// [ARBSIM_COPY2_RESUME_VERIFY_MAX, 20000].
+    pub resume_verify_max: usize,
     /// DROP GRACE (copy2-relist). A ready pool the bot stops listing is
     /// parked (kept aside, see "parking"); for this long it stays
     /// resumable: the kept reports reaching back to it are held even past
@@ -1783,6 +1790,7 @@ impl C2Config {
             resume_overlap: env_u64("ARBSIM_COPY2_RESUME_OVERLAP_BLOCKS", 64).max(1),
             resume_range: env_u64("ARBSIM_COPY2_RESUME_RANGE", 500).max(1),
             resume_timeout_s: env_u64("ARBSIM_COPY2_RESUME_TIMEOUT_S", 120).max(1),
+            resume_verify_max: env_u64("ARBSIM_COPY2_RESUME_VERIFY_MAX", 20_000) as usize,
             drop_grace_s: env_u64("ARBSIM_COPY2_DROP_GRACE_S", 1800),
             drop_grace_max: env_u64("ARBSIM_COPY2_DROP_GRACE_MAX", 400).min(100_000) as usize,
             drop_grace_max_logs: env_u64("ARBSIM_COPY2_DROP_GRACE_MAX_LOGS", 400_000).max(1000) as usize,
@@ -1790,7 +1798,7 @@ impl C2Config {
         }
     }
     pub fn for_tests() -> Self {
-        C2Config { reload_ms: 0, reload_max_ms: 0, layout_retry_s: 3600, load_batch: 25, loaders: 2, keep_blocks: 400, max_keep_blocks: 4000, max_rounds: 40, tip_every_s: 0, catchup_max_blocks: 64, walk: WalkCfg::default(), walks_inflight: 2, walk_max_slots: 1_000_000, walk_max_rss_mb: 0, max_keep_logs: 1_000_000, pending_ms: 300, pm_bound: true, verify_every_s: 0, verify_max: 400, stall_s: 30, state_file: None, save_every_s: 3600, resume_max_blocks: 18_000, resume_overlap: 64, resume_range: 500, resume_timeout_s: 60, drop_grace_s: 1800, drop_grace_max: 400, drop_grace_max_logs: 1_000_000, blind: super::v4blind::BlindCfg::for_tests() }
+        C2Config { reload_ms: 0, reload_max_ms: 0, layout_retry_s: 3600, load_batch: 25, loaders: 2, keep_blocks: 400, max_keep_blocks: 4000, max_rounds: 40, tip_every_s: 0, catchup_max_blocks: 64, walk: WalkCfg::default(), walks_inflight: 2, walk_max_slots: 1_000_000, walk_max_rss_mb: 0, max_keep_logs: 1_000_000, pending_ms: 300, pm_bound: true, verify_every_s: 0, verify_max: 400, stall_s: 30, state_file: None, save_every_s: 3600, resume_max_blocks: 18_000, resume_overlap: 64, resume_range: 500, resume_timeout_s: 60, resume_verify_max: usize::MAX, drop_grace_s: 1800, drop_grace_max: 400, drop_grace_max_logs: 1_000_000, blind: super::v4blind::BlindCfg::for_tests() }
     }
 }
 
@@ -6001,6 +6009,33 @@ impl Intake {
         };
         let items = self.unfollowed_items(&head.snap);
         if items.is_empty() || self.loaders.is_none() {
+            self.finish_catchup();
+            return;
+        }
+        // FAST RESTART (Oct 25, live): the copy held 222,528 such values;
+        // re-reading them took 416 s at the node's speed limit, and blocks
+        // waited the whole time (the copy answered nothing for 7 minutes
+        // after every restart). Too many: forget them all instead. Forgetting
+        // is always safe: a check that needs one misses it and the fill
+        // reads it again at the newest block (34,214 of them had changed
+        // anyway, so a re-read would have replaced 15% of them).
+        if items.len() > self.cfg.resume_verify_max {
+            let n = items.len();
+            {
+                let mut p = crate::timing::TimedWrite::new(&self.sh.published);
+                rewrite_from(&mut p.versions, 0, |s| {
+                    for it in &items {
+                        if let MissItem::Slot(a, sl) = it {
+                            forget_slot(s, *a, *sl);
+                        }
+                    }
+                });
+            }
+            add(&self.c2.stats.resume_forgotten, n as u64);
+            eprintln!(
+                "[arbsim] copy2: warm restart: {n} held value(s) nothing follows FORGOTTEN instead of re-read (more than ARBSIM_COPY2_RESUME_VERIFY_MAX {}); checks read them again when needed",
+                self.cfg.resume_verify_max
+            );
             self.finish_catchup();
             return;
         }
