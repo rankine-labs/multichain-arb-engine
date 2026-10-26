@@ -328,3 +328,25 @@ export function* findStandingGapsSteps(
   memo.endScan(scan);
   return out.sort((a, b) => b.profitUsd - a.profitUsd);
 }
+
+// ---------------------------------------------------------------------------
+// MAIN-BOT DIET (Oct 26): should the standing-gap scan run at all?
+//
+// Plain English: the gap scan re-reads every watched pair after every price
+// change (plus every 5 s). Live CPU profiles (data/profiles, Oct 26) put it
+// at ~29% of the main bot's own work. Since Oct 25 the owner retired the old
+// gap path: with FIRE_FIRST_ONLY=1 and GAP_LIVE_WITH_FIRE_FIRST=0 its results
+// can never be sent, so the scan only slows fire-first down.
+//   GAP_SCAN=1  always scan (old behaviour)
+//   GAP_SCAN=0  never scan
+//   not set     scan only when gaps may send (not fire-first only, or
+//               GAP_LIVE_WITH_FIRE_FIRST=1)
+// ---------------------------------------------------------------------------
+export function gapScanEnabled(env: Record<string, string | undefined> = process.env): boolean {
+  const on = (v: string | undefined) => ['1', 'true', 'on', 'yes'].includes((v ?? '').trim().toLowerCase());
+  const off = (v: string | undefined) => ['0', 'false', 'off', 'no'].includes((v ?? '').trim().toLowerCase());
+  if (on(env.GAP_SCAN)) return true;
+  if (off(env.GAP_SCAN)) return false;
+  // Gaps can only send when NOT fire-first-only, or when explicitly allowed.
+  return !on(env.FIRE_FIRST_ONLY) || on(env.GAP_LIVE_WITH_FIRE_FIRST);
+}

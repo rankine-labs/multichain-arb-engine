@@ -181,7 +181,7 @@ import { LiveTradeLog } from './execution/liveTradeLog';
 import { SafetyAlerts } from './execution/safetyAlerts';
 import { AlertHooks } from './report/alertHooks';
 import { getHeapStatistics } from 'v8';
-import { findStandingGaps, findStandingGapsSteps, GapScanMemo } from './core/gapScanner';
+import { findStandingGaps, findStandingGapsSteps, GapScanMemo, gapScanEnabled } from './core/gapScanner';
 import { CompetitorTracker } from './core/competitorTracker';
 import { pickRobinhoodReadRpc, robinhoodSendRpc, redact, ROBINHOOD_PUBLIC_RPC } from './config/robinhoodEndpoints';
 import { loadStartPairs, saveStartPairs } from './core/seedPairs';
@@ -657,6 +657,10 @@ const FIRE_FIRST_ONLY = ['1', 'true', 'on', 'yes'].includes((process.env.FIRE_FI
 const GAP_LIVE_WITH_FIRE_FIRST = ['1', 'true', 'on', 'yes'].includes((process.env.GAP_LIVE_WITH_FIRE_FIRST ?? '').trim().toLowerCase());
 if (FIRE_FIRST_ONLY && GAP_LIVE_WITH_FIRE_FIRST) console.log('[live] standing gaps may send too (GAP_LIVE_WITH_FIRE_FIRST=1)');
 if (FIRE_FIRST_ONLY) console.log('[live] FIRE-FIRST ONLY (FIRE_FIRST_ONLY=1): older paths check but never send real trades');
+// MAIN-BOT DIET (Oct 26, core/gapScanner.ts gapScanEnabled): the gap scan
+// is ~29% of the main bot's work; it is skipped when gaps can't send.
+const GAP_SCAN_ON = gapScanEnabled();
+if (!GAP_SCAN_ON) console.log('[live] standing-gap scan OFF (gaps cannot send: FIRE_FIRST_ONLY=1, GAP_LIVE_WITH_FIRE_FIRST=0; GAP_SCAN=1 forces it on)');
 const GAP_LIVE_FAIL_BLOCK_MIN = Math.max(0, Number(process.env.GAP_LIVE_FAIL_BLOCK_MIN ?? 30) || 0);
 const gapFailBlocks = new LiveRouteBlock(GAP_LIVE_FAIL_BLOCK_MIN * 60_000);
 { const n = routeScores.load(ROUTE_FILE); if (n) console.log(`[sim] robinhood: restored scores for ${n} pool pairs`); }
@@ -3951,6 +3955,8 @@ await chainManager.startAll();
             return out;
       }
       const runGapScan = async () => {
+            // Diet: no scan while gaps can't send (GAP_SCAN_ON, see top).
+            if (!GAP_SCAN_ON) return;
             if (gapRunning) { if (GAP_SCAN_FAST) gapAgain = true; return; }
             gapRunning = true;
             try {
