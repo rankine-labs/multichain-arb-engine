@@ -190,10 +190,13 @@ dependencies = [
  "libc",
  "revm",
  "rustc-hash",
+ "rustls",
  "secp256k1",
  "serde",
  "serde_json",
  "ureq",
+ "webpki-roots",
+ "zeroize",
 ]
 
 [[package]]

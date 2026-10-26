@@ -1,0 +1,8 @@
+{
+  // Builds only the gun test-vector generator and the bot code it imports
+  // (src/execution/executorCalldata.ts). Output goes to .scripts-build/
+  // (git-ignored). See gen-calldata-vectors.ts for how to run it.
+  "extends": "../../../tsconfig.json",
+  "include": ["gen-calldata-vectors.ts"],
+  "compilerOptions": { "rootDir": "../../..", "outDir": "../../../.scripts-build", "sourceMap": false, "declaration": false, "declarationMap": false, "types": ["node"] }
+}
