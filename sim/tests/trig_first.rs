@@ -1091,6 +1091,82 @@ fn miss_of_a_v4_tick_carries_the_hash_inputs_that_name_its_pool() {
     assert!(arbsim::check::proto_types::unknown_json(&json!(1), &u2, 0).get("missingPre").is_none());
 }
 
+/// A miniature PoolManager swap entry (Oct 26, auto-follow rebuild): the
+/// calldata is a 5-word PoolKey. Like the real one it first computes the
+/// pool id = keccak(key) (160-byte hash, PoolKey.toId), then reads
+/// _pools[id].slot0 at keccak(id . 6).
+fn pm_key_code() -> Vec<u8> {
+    // CALLDATACOPY(0, 0, 160); id = KECCAK(0, 160); MSTORE(0, id);
+    // MSTORE(32, 6); SLOAD(KECCAK(0, 64)); POP; STOP
+    hex("60a0 6000 6000 37 60a0 6000 20 6000 52 6006 6020 52 6040 6000 20 54 50 00")
+}
+
+fn key_words() -> [U256; 5] {
+    // native ETH / coin 0x...c2, fee 0.78 %, spacing 78, no hook.
+    [U256::ZERO, U256::from(0xc2u64), U256::from(7800u64), U256::from(78u64), U256::ZERO]
+}
+
+/// AUTO-FOLLOW REBUILD (Oct 26): a feed transaction swaps in a V4 pool we
+/// don't follow. The run stops with a miss (that pool's slot0 isn't in our
+/// copy), and the miss now also carries the pool's KEY, taken from the
+/// PoolManager's own keccak(key) = id step. On the wire as `missingKeys`.
+/// Without record_hashes: no keys (answer otherwise the same).
+#[test]
+fn miss_of_an_unfollowed_v4_pool_carries_its_key_from_the_run() {
+    use arbsim::check::moved::key_hash;
+    let words = key_words();
+    let idw = key_hash(&words);
+    let pid = B256::from(idw.to_be_bytes::<32>());
+    let mut c = state_with(&[(pm(), pm_key_code(), vec![(U256::from(7u64), U256::ZERO)])], true);
+    add_eoa(&mut c, caller(), U256::ZERO);
+    let mut data = Vec::new();
+    for x in &words {
+        data.extend(x.to_be_bytes::<32>());
+    }
+    let trig = stx(&KEY_A, 0, pm(), data);
+    let mut b = base();
+    b.l2_block_number = Some(10);
+    let (plan, _) = build_plan(&feed(&trig, 11, vec![msg(11, &[trig.clone()])]), 10, 0, &b).unwrap();
+    let (alone, _) = trigger_only(&plan).unwrap();
+    let assume = Assume { record_hashes: true, ..best() };
+    let u = run_ordered_with(&c, &alone, &Overrides::none(), &[], &AllExact, true, &assume).unwrap_err();
+    assert_eq!(u.reason, arbsim::check::UnknownReason::Miss, "{u}");
+    assert!(u.missing.contains(&arbsim::state::MissItem::Slot(pm(), v4_base(pid))), "{:?}", u.missing);
+    assert_eq!(u.keys, vec![(idw, words)], "the pool's key, from the run itself");
+    // On the wire: `missingKeys`, read back by the server.
+    let j = arbsim::check::proto_types::unknown_json(&json!(1), &u, 0);
+    assert_eq!(arbsim::proto::parse_missing_keys(&j), u.keys);
+    // Not recording: no keys.
+    let u2 = run_ordered_with(&c, &alone, &Overrides::none(), &[], &AllExact, true, &best()).unwrap_err();
+    assert!(u2.keys.is_empty());
+    assert_eq!(u2.missing, u.missing);
+    assert!(arbsim::check::proto_types::unknown_json(&json!(1), &u2, 0).get("missingKeys").is_none());
+}
+
+/// A 160-byte hash that is NOT the missed pool's id (some other contract
+/// hashing 5 words) is never sent as that pool's key.
+#[test]
+fn keys_for_slots_only_sends_a_key_that_hashes_to_the_named_pool() {
+    use arbsim::check::moved::{key_hash, keys_for_slots, KeyMap, PreMap};
+    let words = key_words();
+    let idw = key_hash(&words);
+    let pid = B256::from(idw.to_be_bytes::<32>());
+    let base = v4_base(pid);
+    let mut pre = PreMap::new();
+    pre.insert(base, (idw, U256::from(6u8)));
+    let mut keys = KeyMap::new();
+    keys.insert(idw, words);
+    assert_eq!(keys_for_slots([base], &pre, &keys), vec![(idw, words)]);
+    // Wrong words recorded under the id (can't happen from the EVM, checked anyway).
+    let mut bad = KeyMap::new();
+    let mut w2 = words;
+    w2[2] = U256::from(3000u64);
+    bad.insert(idw, w2);
+    assert!(keys_for_slots([base], &pre, &bad).is_empty());
+    // A slot nobody named: nothing.
+    assert!(keys_for_slots([U256::from(12345u64)], &pre, &keys).is_empty());
+}
+
 /// Reverts InsufficientProfit(slot 5, MAX): "profit" = its slot 5 (think:
 /// the test contract's trading money), so a ladder size shows which amount
 /// the slot held for that run.

@@ -169,11 +169,19 @@ pub struct CheckUnknown {
     /// value was missing (our pool beyond its walk / a pool we don't follow).
     /// Empty when nothing was recorded.
     pub pre: Vec<(revm::primitives::U256, revm::primitives::U256, revm::primitives::U256)>,
+    /// (Oct 26, auto-follow rebuild) For misses: the full KEY of each V4
+    /// pool named by `pre`, when the run computed it: (pool id, the 5 key
+    /// words currency0, currency1, fee, tickSpacing, hooks). The PoolManager
+    /// computes id = keccak(key) at the start of every swap / liquidity
+    /// change, and the run writes that hash's input down (check/ordered.rs
+    /// Watch, 160-byte hashes). Lets copy 2 hand the bot a pool's key with
+    /// no node request (copy2/v4blind.rs). Empty when nothing was recorded.
+    pub keys: Vec<(revm::primitives::U256, [revm::primitives::U256; 5])>,
 }
 
 impl CheckUnknown {
     pub fn new(reason: UnknownReason, detail: impl Into<String>) -> Self {
-        CheckUnknown { reason, missing: Vec::new(), detail: detail.into(), pre: Vec::new() }
+        CheckUnknown { reason, missing: Vec::new(), detail: detail.into(), pre: Vec::new(), keys: Vec::new() }
     }
     pub fn bad_request(detail: impl Into<String>) -> Self {
         Self::new(UnknownReason::BadRequest, detail)

@@ -36,7 +36,7 @@ use crate::copy2::checkview::{fee_nonzero, high_offset, C2View};
 use crate::copy2::intake::Copy2Handle;
 use crate::jobq::{is_fast, JobQueue};
 use crate::node::env_u64;
-use crate::proto::{bad_request, parse_at, parse_missing, parse_missing_pre, parse_warm, read_msg, unknown, write_msg};
+use crate::proto::{bad_request, parse_at, parse_missing, parse_missing_keys, parse_missing_pre, parse_warm, read_msg, unknown, write_msg};
 use crate::state::fill::FillQueue;
 use crate::state::mirror::{At, Shared, Stats};
 use crate::state::pinned::{PinnedCache, PinnedErr};
@@ -866,9 +866,12 @@ fn after_pick_with(
         // missed something (normal, trigger-first, discover) tells copy 2
         // whose PoolManager values they were (from the hash inputs the run
         // recorded, `missingPre`), then that list leaves the answer.
+        // (Oct 26) `missingKeys` too: the V4 pool keys the run computed,
+        // so auto-follow learns a pool's key without a node request.
+        let keys = answer.as_object_mut().and_then(|o| o.remove("missingKeys")).map(|k| parse_missing_keys(&json!({ "missingKeys": k }))).unwrap_or_default();
         if let Some(pre) = answer.as_object_mut().and_then(|o| o.remove("missingPre")) {
             if let (Some(c), Some(k)) = (&ctx.copy2, core.as_deref()) {
-                c.note_pm_pre(k, &missing, &parse_missing_pre(&json!({ "missingPre": pre })));
+                c.note_pm_pre_keys(k, &missing, &parse_missing_pre(&json!({ "missingPre": pre })), &keys);
             }
         } else if let (Some(c), Some(k), false) = (&ctx.copy2, core.as_deref(), missing.is_empty()) {
             c.note_pm_pre(k, &missing, &[]);
