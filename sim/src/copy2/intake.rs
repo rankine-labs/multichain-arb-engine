@@ -642,6 +642,10 @@ c2counters!(
     // again (changed after the node's block) / dropped (pool no longer
     // ready since the node's block).
     pm_far_sent, pm_far_kept, pm_far_retry, pm_far_dropped,
+    // Far ticks NOT fetched this round (Oct 25 live: far fills used the node
+    // budget and starved pool loads for 5 min after a restart): held back
+    // while pools wait to load, over the per-job cap, or inside the gap.
+    pm_far_deferred, fills_yielded,
 );
 
 fn inc(c: &AtomicU64) {
@@ -2000,6 +2004,8 @@ pub struct Intake {
     refusing: Option<(Instant, u32, Instant)>,
     /// Fill items to ask again a little later (not in a tight loop).
     fill_later: Vec<(Instant, MissItem)>,
+    // When the last fill job with far V4 ticks went out (ARBSIM_V4_FAR_GAP_MS).
+    last_far_job: Option<Instant>,
     /// Blocks with pools whose reports may be missing: block -> (when
     /// noticed, pools). Settled from the node's logs (dispatch_settle).
     suspects: BTreeMap<u64, (Instant, HashSet<PoolKey>)>,
@@ -2126,6 +2132,7 @@ pub fn manual(sh: Arc<Shared>, fills: Arc<FillQueue>, cfg: C2Config) -> (Intake,
         round: None,
         refusing: None,
         fill_later: Vec::new(),
+        last_far_job: None,
         suspects: BTreeMap::new(),
         settle_retry: None,
         walk_off: false,
@@ -3929,6 +3936,14 @@ impl Intake {
         }
     }
 
+    /// LOADS FIRST: is any pool due to load (not ready, not being loaded,
+    /// its retry time reached)? Fills wait while so (dispatch_fills).
+    fn loads_waiting(&self) -> bool {
+        let now = Instant::now();
+        let reg = self.c2.reg.read().unwrap();
+        reg.pools.values().any(|e| e.state != PoolState::Ready && !e.busy && e.retry_at <= now)
+    }
+
     /// Is the node refusing us right now (no new bulk work)?
     fn refusing_now(&self) -> bool {
         self.refusing.is_some_and(|r| r.0 > Instant::now())
@@ -4944,11 +4959,29 @@ impl Intake {
         if self.loaders.is_none() || self.refusing_now() || self.jobs.values().any(|j| matches!(j, JobFor::Fill)) {
             return;
         }
+        // LOADS FIRST (Oct 25, live): after a restart ~130 pools must load
+        // (~6,000 node requests). Fills sent meanwhile used the same node
+        // budget; Chainstack refused, the rate was cut, and loads waited
+        // "for their turn" for 5 minutes while the copy answered nothing.
+        // While any pool is due to load, fills wait (the checks that need
+        // them ask again). ARBSIM_FILL_YIELD=0 = old behaviour.
+        // (Settings from our own config copy: no extra pm_book lock here;
+        // live Oct 25 an extra lock per loop pass made checks wait up to 0.3 s.)
+        let (fill_yield, far_gap, far_per_job) = (self.cfg.blind.fill_yield, self.cfg.blind.far_gap, self.cfg.blind.far_per_job);
+        if fill_yield && self.loads_waiting() {
+            inc(&self.c2.stats.fills_yielded);
+            return;
+        }
         let items = self.fills.take(100);
         if items.is_empty() {
             return;
         }
         let Some(head) = self.sh.head() else { return };
+        // Far V4 ticks: at most far_per_job per fill job, and a job with far
+        // ticks at most every far_gap (ARBSIM_V4_FAR_PER_JOB / _GAP_MS).
+        let far_open = self.last_far_job.is_none_or(|t| t.elapsed() >= far_gap);
+        let mut far_n = 0usize;
+        let mut far_deferred = 0u64;
         let (ok, refused): (Vec<MissItem>, Vec<MissItem>) = {
             let reg = self.c2.reg.read().unwrap();
             let book = self.c2.pm_book.lock().unwrap();
@@ -4983,7 +5016,15 @@ impl Intake {
                         }
                         _ => false,
                     };
+                    // Paced: over the cap or inside the gap -> not now (not a refusal).
+                    let paced = keep && (!far_open || far_n >= far_per_job);
+                    if paced {
+                        inc(&st.pm_far_deferred);
+                        far_deferred += 1;
+                        return false;
+                    }
                     if keep {
+                        far_n += 1;
                         inc(&st.pm_far_sent);
                     } else {
                         inc(&st.fill_refused_pm_slot);
@@ -5003,7 +5044,10 @@ impl Intake {
                 MissItem::Code(_) => false,
             })
         };
-        add(&self.c2.stats.fill_refused, refused.len() as u64);
+        add(&self.c2.stats.fill_refused, (refused.len() as u64).saturating_sub(far_deferred));
+        if far_n > 0 {
+            self.last_far_job = Some(Instant::now());
+        }
         if ok.is_empty() {
             return;
         }

@@ -57,6 +57,12 @@ use crate::node::env_u64;
 pub struct BlindCfg {
     pub far_fill: bool,
     pub far_max_per_pool: usize,
+    /// Most far ticks in one fill job [ARBSIM_V4_FAR_PER_JOB, 20].
+    pub far_per_job: usize,
+    /// Least time between fill jobs with far ticks [ARBSIM_V4_FAR_GAP_MS, 1000].
+    pub far_gap: Duration,
+    /// Fills wait while pools are due to load [ARBSIM_FILL_YIELD, 1].
+    pub fill_yield: bool,
     pub autofollow: bool,
     pub af_min_misses: usize,
     pub af_window: Duration,
@@ -69,6 +75,9 @@ impl BlindCfg {
         BlindCfg {
             far_fill: env_u64("ARBSIM_V4_FAR_FILL", 1) != 0,
             far_max_per_pool: env_u64("ARBSIM_V4_FAR_MAX", 2000).clamp(1, 1_000_000) as usize,
+            far_per_job: env_u64("ARBSIM_V4_FAR_PER_JOB", 20).clamp(1, 100) as usize,
+            far_gap: Duration::from_millis(env_u64("ARBSIM_V4_FAR_GAP_MS", 1000).min(60_000)),
+            fill_yield: env_u64("ARBSIM_FILL_YIELD", 1) != 0,
             autofollow: env_u64("ARBSIM_V4_AUTOFOLLOW", 0) != 0,
             af_min_misses: env_u64("ARBSIM_V4_AUTOFOLLOW_MIN_MISSES", 20).clamp(1, 1_000_000) as usize,
             af_window: Duration::from_secs(env_u64("ARBSIM_V4_AUTOFOLLOW_WINDOW_S", 600).clamp(10, 86_400)),
@@ -80,6 +89,9 @@ impl BlindCfg {
         BlindCfg {
             far_fill: true,
             far_max_per_pool: 2000,
+            far_per_job: 100,
+            far_gap: Duration::from_millis(0),
+            fill_yield: false,
             autofollow: false,
             af_min_misses: 3,
             af_window: Duration::from_secs(600),

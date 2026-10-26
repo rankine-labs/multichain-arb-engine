@@ -3156,3 +3156,35 @@ fn v4_blind_autofollow_lists_a_pool_checks_keep_missing() {
     assert_eq!(st["v4Blind"]["topUnfollowed"][0]["misses"], json!(3));
     assert_eq!(st["v4Blind"]["topUnfollowed"][0]["autoFollow"], json!(true));
 }
+
+// PACED FAR FILLS (Oct 25, live): far-tick fills used the node budget and
+// starved pool loads after a restart. At most far_per_job far ticks per fill
+// job; the rest are deferred (not refused) and go in a later job.
+#[test]
+fn v4_blind_far_fills_are_paced_per_job_and_deferred_not_refused() {
+    let mut cfg = C2Config::for_tests();
+    cfg.blind.far_per_job = 1;
+    let (mut r, pm, ours) = blind_rig(cfg);
+    let (pre, t_ours, w_ours) = v4_far(ours, 887_000, 3000);
+    let mut s = r.chain.at(100);
+    let m = s.entry(pm).or_default();
+    m.insert(t_ours, u(0x1234));
+    m.insert(w_ours, u(0x8000));
+    r.chain.set(100, s);
+    let missing = vec![MissItem::Slot(pm, t_ours), MissItem::Slot(pm, w_ours)];
+    let core = r.h.c2.check_core();
+    r.h.note_pm_pre(&core, &missing, &pre);
+    // First fill: one far tick sent, the other deferred (not counted refused).
+    r.h.fill(missing.clone());
+    r.settle();
+    assert_eq!(counter(&r, "pm_far_sent"), 1);
+    assert_eq!(counter(&r, "pm_far_deferred"), 1);
+    assert_eq!(counter(&r, "fill_refused_pm_slot"), 0);
+    assert_eq!(counter(&r, "fill_refused"), 0, "a deferred value is not a refusal");
+    // The check asks again: the other one goes now (gap 0 in tests).
+    r.h.fill(missing);
+    r.settle();
+    assert_eq!(r.head_slot(pm, t_ours), Lookup::Known(u(0x1234)));
+    assert_eq!(r.head_slot(pm, w_ours), Lookup::Known(u(0x8000)));
+    assert_eq!(counter(&r, "pm_far_kept"), 2);
+}
