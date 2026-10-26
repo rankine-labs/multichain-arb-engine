@@ -149,7 +149,7 @@ pub fn record_hold_at(us: u64, site: &'static std::panic::Location<'static>) {
     }
 }
 
-fn pct(v: &mut [u64]) -> Value {
+pub fn pct(v: &mut [u64]) -> Value {
     if v.is_empty() {
         return json!({ "n": 0 });
     }

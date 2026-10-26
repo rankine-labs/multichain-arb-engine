@@ -46,6 +46,11 @@ ureq = { version = "3", default-features = false, features = ["rustls"] }
 libc = "0.2"
 
 
+[features]
+# (fast lane, workstream B) compiles fastlane/convert.rs, which needs the
+# gun (C) and safety (D) modules: turned on at integration.
+fastlane_integration = []
+
 [dev-dependencies]
 # Tests only (workstream C): sign test transactions to check sender recovery.
 # Same version revm already builds, so nothing new is downloaded or compiled.
