@@ -75,3 +75,54 @@ pub fn to_safety_input(o: &Opportunity) -> Result<SafetyInput, String> {
         o.found_at,
     ))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fastlane::types::{Hop, ViewKind, KIND_V2, KIND_V4};
+    use revm::primitives::{Address, U256};
+    use std::time::Instant;
+
+    fn opp() -> Opportunity {
+        let a = Address::with_last_byte;
+        let check = crate::fastlane::scan::PreparedCheck {
+            call: Default::default(),
+            overrides: Default::default(),
+            amount_offset: 96,
+            amount_slots: vec![],
+            main_amount: U256::from(5u8),
+            sizes: vec![U256::from(5u8)],
+            trade: crate::fastlane::types::DecodedTrade { token: a(1), amount_in: U256::from(5u8), min_profit: U256::MAX, max_block: U256::MAX, hops: vec![], flash: FlashLender::Own },
+        };
+        Opportunity {
+            block: 9, view: ViewKind::Confirmed, route_label: "X/Y a>b".into(), rid: "a>b:1".into(),
+            token_in: a(1), token_in_decimals: 6, usd_per_token_in: 1.0, amount_in: U256::from(400_000_000u64), size_usd: 400.0,
+            hops: vec![
+                Hop { kind: KIND_V4, pool: a(0xa), token_in: a(1), token_out: a(2), fee_bps: 0, v4_fee: 3000, v4_tick_spacing: -60, v4_native: true },
+                Hop { kind: KIND_V2, pool: a(0xb), token_in: a(2), token_out: a(1), fee_bps: 30, v4_fee: 0, v4_tick_spacing: 0, v4_native: false },
+            ],
+            flash: FlashLender::V3Flash(a(0xe)), profit_units: U256::from(3u8), expected_net_usd: 1.5, gas_usd: 0.05, gas_used: 300_000,
+            loan_fee_usd: Some(0.2), pools: vec!["0xaa".into(), "0xbb".into()], keys: vec![], tokens: vec![a(1), a(2)],
+            found_at: Instant::now(), scan_us: 7, source: "changed", check: std::sync::Arc::new(check),
+        }
+    }
+
+    #[test]
+    fn call_input_and_safety_input_carry_every_field() {
+        let o = opp();
+        let c = to_call_input(&o);
+        assert_eq!((c.block, c.token_in, c.amount_in, c.net_usd, c.size_usd, c.gas_usd, c.token_in_decimals), (9, o.token_in, o.amount_in, 1.5, 400.0, 0.05, 6));
+        assert_eq!(c.funding, Funding::V3Flash(Address::with_last_byte(0xe)));
+        assert_eq!(c.hops.len(), 2);
+        assert_eq!((c.hops[0].kind, c.hops[0].v4_fee, c.hops[0].v4_tick_spacing, c.hops[0].v4_native), (3, 3000, -60, true));
+        assert_eq!((c.hops[1].kind, c.hops[1].fee_bps), (0, 30));
+        assert_eq!(c.lender(), Some(Address::with_last_byte(0xe)));
+        let s = to_safety_input(&o).unwrap();
+        assert_eq!(s.amount_in, 400_000_000);
+        assert_eq!(s.pools, vec!["0xaa", "0xbb"]);
+        assert_eq!(s.token_in, format!("{:#x}", Address::with_last_byte(1)));
+        assert_eq!(s.tokens.len(), 2);
+        assert_eq!(s.lender, Some(format!("{:#x}", Address::with_last_byte(0xe))));
+        assert_eq!((s.expected_net_usd, s.gas_usd, s.size_usd, s.block), (1.5, 0.05, 400.0, 9));
+    }
+}
