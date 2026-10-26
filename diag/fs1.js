@@ -73,7 +73,8 @@ async function timingMode() {
   const lines = fs.readFileSync(path.join(APP, 'data/live-trades.jsonl'), 'utf8').trim().split('\n').map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
   const fl = fireLines();
   const out = [];
-  for (const s of lines.filter((x) => x.kind === 'sent' && fl.has(x.hash))) {
+  const pick = lines.filter((x) => x.kind === 'sent' && fl.has(x.hash));
+  for (const s of (N > 0 ? pick.slice(-N) : pick)) {
     const tm = fl.get(s.hash);
     const rc = (await rpc('eth_getTransactionReceipt', [s.hash])).result; if (!rc) continue;
     const L = Number(rc.blockNumber);
