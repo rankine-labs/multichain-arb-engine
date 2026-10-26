@@ -219,6 +219,16 @@ again: ~16x slower per swap, ~10x more throw-away memory; also the ~200
 questions of a new pair's pool lookup), `PAIR_DISCOVERY_YIELD=0` (a new
 pair's lookup is built inside the feed trade that noticed it again; now it
 runs a moment later under its own name, `pair discovery`).
+Feed helper thread (Oct 26, `FEED_WORKER`, default OFF): `FEED_WORKER=1`
+moves the Robinhood feed websocket and the reading of every feed message
+(un-zip, JSON, unpacking transactions, hashes, light read) to a helper
+thread; the main thread only gets the finished lists and decides exactly as
+before. Look for `[robinhood] FEED_WORKER=1: the feed is read by a helper
+thread` at start. If the helper dies you see `feed helper thread ...
+starting a fresh one` and the feed reconnects on the next health check;
+if it can't start 3 times in a row the bot says so and reads the feed the
+old way until restarted. Remove the line (or `FEED_WORKER=0`) and restart
+to go back.
 `[feed-turns] 5 min: N trades decided one per loop pass · longest line L ·
 wait p50 / p90 / max ms` (every 5 min, next to `[stalls]`): how long trades
 waited for their turn. A wait p90 over ~20 ms or a longest line in the
