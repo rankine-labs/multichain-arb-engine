@@ -79,7 +79,7 @@ import { createLocalSimHost, LocalSimHost, LocalCheck, LocalKind, LocalOutcome }
 import { TriggerFirst, trigFirstSettings, TrigOutcome } from './execution/triggerFirst';
 import { Scoreboard, SendPath, Confidence as ScoreConfidence, standingGapFailBlock, entryFailBlock } from './report/scoreboard';
 import { TrigEntry, EntryCandidate, EntryPick, TablePool, entrySettings, enumerateRoutes, rankRoutes } from './execution/trigEntry';
-import { EntryLoopIndex, EntryLoop, EntryLoopHost, EntryLoopSender, CoinTaxFileView, LoopScoreMemo, loopIndexSettings, loopQuoteUsd, pickLoops, loopSkipText } from './execution/trigEntryLoops';
+import { EntryLoopIndex, EntryLoop, EntryLoopHost, EntryLoopSender, CoinTaxFileView, LoopScoreMemo, loopIndexSettings, loopQuoteUsd, pickLoops, loopSkipText, askLoopTaxTests } from './execution/trigEntryLoops';
 import { hasExactMath } from './core/loopFinder';
 import { runCheckFirst } from './execution/checkFirstFlow';
 import { MonadAdapter } from './chains/monad';
@@ -208,7 +208,7 @@ import { poolDepthUsd, setRealBalanceSource, thinPools, thinPoolsSteps } from '.
 // Loop trader v1 (3-5 pool loops, practice only, off unless LOOP_TRADER=1).
 import { LoopTrader, loopConfigFromEnv, LoopCheckResult, LoopTrade, buildLoopTrade } from './core/loopTrader';
 // Which node loop practice checks run on (LOOP_CHECK_NODE, default the free public node).
-import { CoinTaxBook, coinTaxConfigFromEnv, testCoinTax } from './core/coinTax';
+import { CoinTaxBook, coinTaxConfigFromEnv, testCoinTax, coinHolderOf } from './core/coinTax';
 import { LoopLiveSender, loopLiveConfigFromEnv, LoopLiveCandidate } from './execution/loopLive';
 import { loopNodeFromEnv, LoopNodeGuard, runLoopCheck, LoopCheckDeps, loopNodeText, LoopNodeThrottle, LoopNodeBusy, loopMaxRpsFromEnv } from './core/loopNode';
 // Loop fix phase 2: real (block-confirmed) prices, trigger replay, cheap scans (core/loopPrices.ts).
@@ -3094,6 +3094,56 @@ const entryLoopIndex: EntryLoopIndex<PoolState> | null = entryLoopSettings.enabl
             log: (m) => console.log(m),
       })
       : null;
+// LOOP LIST COIN TAX TESTS (Oct 26, owner approved). The tax tester belonged
+// to the old loop finder (LOOP_TRADER), which is off, so the loop list's coin
+// passes all expired (a pass counts for 6 h) and the list fell to 0 loops.
+// When the old loop finder is off, the loop list runs its own tester: same
+// test (core/coinTax.ts, a free simulation, NEVER sends), same file
+// (data/coin-tax.json, so passes are shared), on the FREE public node (no
+// paid-node use), LOOP_TAX_TESTS_PER_MIN (default 10) coins a minute. Only
+// coins already on the allowed list are tested (safety gate unchanged).
+// LOOP_TAX_TEST=0 turns it off.
+const entryLoopTaxBook: CoinTaxBook | null = entryLoopIndex && entryLoopTaxOn && !loopCfg.enabled
+      ? (() => {
+            const freeRpc = makeRpc('https://rpc.mainnet.chain.robinhood.com');
+            return new CoinTaxBook(coinTaxConfigFromEnv(process.env), (token, holder) => testCoinTax(freeRpc, token, holder), {
+                  file: 'data/coin-tax.json',
+                  log: (m) => console.log(m.replace('[loop]', '[trig-entry] loop')),
+                  symbolOf: (t) => symbolOf('robinhood', t),
+                  alwaysOk: [ROBINHOOD_TOKENS.WETH, ROBINHOOD_TOKENS.USDG],
+            });
+      })()
+      : null;
+if (entryLoopTaxBook) {
+      const book = entryLoopTaxBook;
+      const ask = () => {
+            try {
+                  const pools = copy2PoolKeys().map((k) => cache.get('robinhood', k)).filter((p): p is PoolState => !!p);
+                  askLoopTaxTests(pools, {
+                        tokens: (p: PoolState) => [p.tokenA, p.tokenB] as [string, string],
+                        holder: (p: PoolState) => coinHolderOf(p as any),
+                        allowed: (t: string) => safetyGate.isAllowed(t),
+                  }, [ROBINHOOD_TOKENS.USDG, ROBINHOOD_TOKENS.WETH], book);
+            } catch { /* next minute */ }
+      };
+      // Ask once a minute (first after 20 s, once the copy's pools are loaded);
+      // run one test at a time, the book keeps the per-minute limit.
+      setTimeout(ask, 20_000).unref?.();
+      setInterval(ask, 60_000).unref?.();
+      let testing = false;
+      setInterval(() => {
+            if (testing || !book.hasWork()) return;
+            testing = true;
+            void book.runNext().catch(() => false).finally(() => { testing = false; });
+      }, 1_000).unref?.();
+      setInterval(() => book.save(), 60_000).unref?.();
+      console.log(`[trig-entry] loop list coin tax tests ON (old loop finder off): free node, ${coinTaxConfigFromEnv(process.env).perMin} a minute, allowed coins only`);
+}
+const entryLoopTaxText = (): string => {
+      if (!entryLoopTaxBook) return '';
+      const s = entryLoopTaxBook.stats();
+      return `; coin tax tests: ${s.ok} ok, ${s.taxed} taxed, ${s.blocked} blocked, ${s.waiting} waiting, ${s.unclear} unclear`;
+};
 // Our gas for a loop of `pools` pools (calibrated loop estimate; a flash loan
 // costs a bit more). Oct 25: 4-pool loops (TRIG_ENTRY_LOOP_POOLS_MAX=4) pass 4
 // here, so their higher gas (~635k vs ~507k units) is what they are judged on.
@@ -3237,7 +3287,7 @@ try {
                         ...(entryLoopIndex && entryLoopSender ? {
                               loopCandidatesFor: (keys: string[], limit: number) => entryLoopCandidatesFor(keys, limit),
                               loopGate: (p: EntryPick) => entryLoopSender.gate(p) ?? (robinhoodSender.live ? scoreboard.pausedWhy('loop') : null),
-                              loopHourText: () => { const i = entryLoopIndex.info(); return `loop index ${i.loops} loops${i.loops4 ? ` (${i.loops4} of them 4-pool)` : ''} over ${i.pools} pools${i.capped ? ' (capped)' : ''}, rebuilt in ${i.lastMs} ms (${loopSkipText(i.seen, i.skipped)}); ${entryLoopSender.hourLine()}`; },
+                              loopHourText: () => { const i = entryLoopIndex.info(); return `loop index ${i.loops} loops${i.loops4 ? ` (${i.loops4} of them 4-pool)` : ''} over ${i.pools} pools${i.capped ? ' (capped)' : ''}, rebuilt in ${i.lastMs} ms (${loopSkipText(i.seen, i.skipped)}${entryLoopTaxText()}); ${entryLoopSender.hourLine()}`; },
                         } : {}),
                         // Our own sends (seen again in the feed) and our contract: never triggers.
                         isOurTx: (h) => livePools.has(h) || livePools.has(h.toLowerCase()),
