@@ -44,12 +44,21 @@ ureq = { version = "3", default-features = false, features = ["rustls"] }
 # (copy2-n, warm restart) catch SIGTERM / SIGINT so the copy is saved before
 # exiting. Already in the build (revm and others use it): nothing new downloaded.
 libc = "0.2"
+# (fast lane gun, workstream C) the Rust sender. All already in the build
+# (revm / ureq use the same versions): nothing new is downloaded.
+#   secp256k1: sign our trades (libsecp256k1, RFC 6979, like ethers)
+#   rustls + webpki-roots: our own kept-alive HTTPS connection to the send
+#     endpoint, so "bytes handed to the socket" can be timed apart from the reply
+#   zeroize: wipe key bytes after use
+secp256k1 = { version = "=0.31.1", features = ["recovery", "global-context"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+webpki-roots = "1"
+zeroize = "1"
 
 
 [dev-dependencies]
-# Tests only (workstream C): sign test transactions to check sender recovery.
-# Same version revm already builds, so nothing new is downloaded or compiled.
-secp256k1 = { version = "=0.31.1", features = ["recovery", "global-context"] }
+# (secp256k1, used by tests to sign test transactions, is now a normal
+# dependency above: the fast lane gun signs with it.)
 
 [profile.release]
 opt-level = 3
