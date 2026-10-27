@@ -268,4 +268,22 @@ mod tests {
         assert_eq!(read_msg(&mut r).unwrap().unwrap(), b"{\"a\":1}");
         assert!(read_msg(&mut r).unwrap().is_none());
     }
+
+    #[test]
+    fn an_oversize_message_is_skipped_and_the_next_one_lines_up() {
+        let mut buf = Vec::new();
+        let big = vec![b'x'; MAX_MESSAGE + 10];
+        write_msg(&mut buf, &big).unwrap();
+        write_msg(&mut buf, b"{\"b\":2}").unwrap();
+        let mut r = &buf[..];
+        assert_eq!(read_msg_keep(&mut r).unwrap(), Some(Incoming::TooLarge(MAX_MESSAGE + 10)));
+        assert_eq!(read_msg_keep(&mut r).unwrap(), Some(Incoming::Msg(b"{\"b\":2}".to_vec())));
+        assert_eq!(read_msg_keep(&mut r).unwrap(), None);
+        // The old reader (the live failure): an error, i.e. the connection closed.
+        let mut r = &buf[..];
+        assert!(read_msg(&mut r).is_err());
+        // Cut short inside a skipped message = closed, never misaligned.
+        let mut r = &buf[..1000];
+        assert_eq!(read_msg_keep(&mut r).unwrap(), None);
+    }
 }

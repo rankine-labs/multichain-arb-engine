@@ -786,10 +786,15 @@ mod tests {
 
     #[test]
     fn scoreboard_and_loop_limits() {
-        assert_eq!(T::new(&[], NodeState { paused: Paused { gap: Some("lost".into()), r#loop: None }, ..good_state() }).code(&pair()), "scoreboard");
+        assert_eq!(T::new(&[], NodeState { paused: Paused { gap: Some("lost".into()), r#loop: None, trig: None }, ..good_state() }).code(&pair()), "scoreboard");
+        // Fire-first from Rust (fastlane/trigger.rs): its own pause, not the gap one.
+        let trig = SafetyInput { trig: true, ..pair() };
+        assert_eq!(T::new(&[], NodeState { paused: Paused { gap: Some("lost".into()), r#loop: None, trig: None }, ..good_state() }).code(&trig), "ok", "a gap pause does not stop fire-first");
+        assert_eq!(T::new(&[], NodeState { paused: Paused { gap: None, r#loop: None, trig: Some("lost".into()) }, ..good_state() }).code(&trig), "scoreboard");
+        assert_eq!(T::new(&[], NodeState { paused: Paused { gap: None, r#loop: None, trig: Some("lost".into()) }, ..good_state() }).code(&pair()), "ok", "and the fire-first pause does not stop gaps");
         let lp = SafetyInput::new(1, "loop".into(), "0xusdg".into(), vec!["0xusdg".into(), "0xcoin".into(), "0xweth".into()], vec!["0xp1".into(), "0xp2".into(), "0xp3".into()], 1_000, 500.0, 1.0, 0.05, Some("0xlender".into()), Instant::now());
         assert_eq!(T::new(&[], good_state()).code(&lp), "ok");
-        assert_eq!(T::new(&[], NodeState { paused: Paused { gap: None, r#loop: Some("x".into()) }, ..good_state() }).code(&lp), "scoreboard");
+        assert_eq!(T::new(&[], NodeState { paused: Paused { gap: None, r#loop: Some("x".into()), trig: None }, ..good_state() }).code(&lp), "scoreboard");
         assert_eq!(T::new(&[], NodeState { loop_loss_usd: 1.96, ..good_state() }).code(&lp), "loop_loss_cap");
         assert_eq!(T::new(&[], NodeState { loop_paused: true, ..good_state() }).code(&lp), "loop_loss_cap");
         assert_eq!(T::new(&[("LOOP_LIVE_MAX_TRADE_USD", "400")], good_state()).code(&lp), "loop_max_trade");

@@ -184,6 +184,7 @@ export type EntrySettings = {
   oneTrip: boolean;              // TRIG_ENTRY_ONE_TRIP [1] discovery + checks in one sidecar question (0 = two steps, as before)
   tableMs: number;               // TRIG_ENTRY_TABLE_MS [1000] how often the candidate table is rebuilt (0 = only when asked)
   tableReuseMs: number;          // TRIG_ENTRY_TABLE_REUSE_MS [5000] a route whose pools did not change keeps its written-down question this long (0 = rebuild every route every time)
+  tableMaxBytes: number;         // TRIG_ENTRY_TABLE_MAX_BYTES [4000000] most bytes of one table message (a bigger table goes in several; arbsim refuses messages over 8 MB)
   agreeSample: number;           // TRIG_ENTRY_AGREE_SAMPLE [5] re-check 1 in N not-profitable answers (0 = none)
   agreeSamplePerHour: number;    // TRIG_ENTRY_AGREE_SAMPLE_PER_HOUR [120] at most this many of those per hour
   immediate: boolean;            // TRIG_ENTRY_IMMEDIATE [1] start entry work inside the feed handler (0 = after it, setImmediate)
@@ -213,6 +214,7 @@ export function entrySettings(env: Record<string, string | undefined> = process.
     oneTrip: (env.TRIG_ENTRY_ONE_TRIP ?? '1').trim() !== '0',
     tableMs: num('TRIG_ENTRY_TABLE_MS', 1_000, 0),
     tableReuseMs: num('TRIG_ENTRY_TABLE_REUSE_MS', 5_000, 0),
+    tableMaxBytes: Math.round(Math.min(num('TRIG_ENTRY_TABLE_MAX_BYTES', 4_000_000, 10_000), 7_500_000)),
     agreeSample: Math.round(num('TRIG_ENTRY_AGREE_SAMPLE', 5, 0)),
     agreeSamplePerHour: Math.round(num('TRIG_ENTRY_AGREE_SAMPLE_PER_HOUR', 120, 0)),
     immediate: (env.TRIG_ENTRY_IMMEDIATE ?? '1').trim() !== '0',
@@ -227,6 +229,30 @@ export function entrySettings(env: Record<string, string | undefined> = process.
 // approve, transfer, transferFrom, WETH deposit / withdraw, permit,
 // setApprovalForAll. Sent straight to a coin, they can't open an arb.
 const NON_SWAP = new Set(['0x095ea7b3', '0xa9059cbb', '0x23b872dd', '0xd0e30db0', '0x2e1a7d4d', '0xd505accf', '0xa22cb465']);
+
+// ZERO-ROUTES FIX (Oct 27): a table message's pools split into parts of at
+// most `maxBytes` of JSON each (the first part also carries the long-code
+// list; if the codes leave no room, the first part carries only them). A
+// pool's rows always stay together; a pool bigger than the limit on its own
+// goes alone. Order kept. Nothing to send = one empty part (the old single
+// message).
+export function splitTablePools(pools: Record<string, unknown>, codes: string[], maxBytes: number): Array<Record<string, unknown>> {
+  const parts: Array<Record<string, unknown>> = [];
+  let cur: Record<string, unknown> = {};
+  let n = 0;
+  const codesBytes = codes.reduce((a, c) => a + c.length + 3, 0);
+  let size = 200 + codesBytes; // the first part carries the codes
+  for (const [k, v] of Object.entries(pools)) {
+    const b = k.length + 4 + Buffer.byteLength(JSON.stringify(v ?? null), 'utf8');
+    const codesOnly = n === 0 && parts.length === 0 && codesBytes > 0;
+    if ((n > 0 || codesOnly) && size + b > maxBytes) { parts.push(cur); cur = {}; n = 0; size = 200; }
+    cur[k] = v;
+    n++;
+    size += b;
+  }
+  parts.push(cur);
+  return parts;
+}
 
 // The `to` address of a raw feed transaction (lower case), null if unreadable / create.
 export function toOf(raw: string): string | null {
@@ -1277,15 +1303,38 @@ export class TrigEntry {
       if (T.codes.length > CODES_SOFT_MAX) this.compactCodes();
       if (!Object.keys(changed).length && !T.needFull) return T.ackGen >= 0;
       const full = T.needFull || T.ackGen < 0;
-      const gen = T.gen + 1;
       const pools = full ? Object.fromEntries([...T.pools].map(([k, v]) => [k, v.rows])) : changed;
-      T.gen = gen;
-      T.sends++;
-      const a = await waitFor(this.d.client.request({ type: 'trig_table', gen, full, base: T.ackGen, codes: T.codes, pools }, 3_000));
-      if (a.ok === true) { T.ackGen = gen; T.needFull = false; return true; }
-      T.sendFails++;
-      T.needFull = true;
-      return false;
+      // ZERO-ROUTES FIX (Oct 27): arbsim refuses any socket message over
+      // 8 MB, and before this fix such a message silently closed the bot's
+      // one connection to it (pool reports and checks included). With
+      // ~1,800 pools followed, a full table can pass that. So the table goes
+      // in parts of at most TRIG_ENTRY_TABLE_MAX_BYTES: the first part as
+      // before (full or a change), the rest as changes on top of the part
+      // before (arbsim's own partial-table rule: base = the generation it
+      // holds). One part = exactly the old single message.
+      const parts = splitTablePools(pools, T.codes, this.settings.tableMaxBytes);
+      let base = T.ackGen;
+      for (let i = 0; i < parts.length; i++) {
+        const gen = T.gen + 1;
+        T.gen = gen;
+        T.sends++;
+        const first = i === 0;
+        // The long codes go once, with the first part (arbsim keeps its
+        // list when a partial part carries none).
+        const msg = { type: 'trig_table', gen, full: first ? full : false, base, codes: first ? T.codes : [], pools: parts[i] };
+        const a = await waitFor(this.d.client.request(msg, 3_000));
+        if (a.ok !== true) {
+          T.sendFails++;
+          T.needFull = true;
+          this.noteTableSend(false, gen, parts.length, String(a.unknown ?? 'refused'));
+          return false;
+        }
+        base = gen;
+      }
+      T.ackGen = base;
+      T.needFull = false;
+      this.noteTableSend(true, base, parts.length);
+      return true;
     } catch {
       this.hour.errors++;
       T.needFull = true;
@@ -1296,6 +1345,20 @@ export class TrigEntry {
       T.lastMs = r2(performance.now() - t0);
       T.lastBusyMs = r2(busy);
       T.building = false;
+    }
+  }
+
+  // First table taken / every refusal: said at once (not only in the
+  // hourly line), so a table that never reaches arbsim shows within seconds.
+  private tableLogged = { ok: false, fails: 0 };
+  private noteTableSend(ok: boolean, gen: number, parts: number, why?: string): void {
+    const T = this.tbl;
+    if (ok && !this.tableLogged.ok) {
+      this.tableLogged.ok = true;
+      this.log(`[trig-entry] candidate table taken by arbsim: ${T.pools.size} pools / ${T.lastRoutes} routes, generation ${gen}, ${parts} message${parts === 1 ? '' : 's'} (${this.oneTripOn() ? 'one trip' : 'fast lane'})`);
+    } else if (!ok) {
+      this.tableLogged.fails++;
+      if (this.tableLogged.fails === 1 || this.tableLogged.fails % 100 === 0) this.log(`[trig-entry] candidate table NOT taken by arbsim (${why}); ${this.tableLogged.fails} refusals so far, a full table is sent next time`);
     }
   }
 
