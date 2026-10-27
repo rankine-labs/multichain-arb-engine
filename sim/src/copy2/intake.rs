@@ -762,6 +762,9 @@ pub struct C2Shared {
     /// answer for a trigger that is ALREADY in the copy (live: those were
     /// given up as "already_in_copy" while rivals took the gap).
     pub recent_moves: Mutex<RecentMoves>,
+    /// (Oct 27) What discovery's misses fetched for this copy: each item
+    /// once per window, a hard hourly cap (server.rs DiscoverFillBook).
+    pub discover_fill: Mutex<crate::server::DiscoverFillBook>,
     /// V4 BLIND SPOT (Oct 25, copy2/v4blind.rs): whose PoolManager value each
     /// missed slot is, the unfollowed V4 pools checks run into, and the
     /// auto-follow list (status `v4Blind`). Lock order: after `reg`.
@@ -2132,6 +2135,7 @@ pub fn manual(sh: Arc<Shared>, fills: Arc<FillQueue>, cfg: C2Config) -> (Intake,
         resume: Mutex::new(serde_json::Map::new()),
         wanted: Mutex::new(Wanted::default()),
         recent_moves: Mutex::new(RecentMoves::default()),
+        discover_fill: Mutex::new(crate::server::DiscoverFillBook::from_env()),
         pm_book: Mutex::new(super::v4blind::PmBook::new(cfg.blind.clone())),
     });
     let loaders = sh

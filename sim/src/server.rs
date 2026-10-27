@@ -276,7 +276,9 @@ pub fn handle_tm(ctx: &Ctx, req: &Value, tm: &mut Tm) -> Value {
             }
             s["feedStore"] = crate::check::feedstore::store().status_json();
             // (Oct 27) What discovery's misses fetched (DiscoverFillBook).
-            s["discoverFill"] = discover_book().lock().map(|b| b.json()).unwrap_or(Value::Null);
+            if let Some(c) = &ctx.copy2 {
+                s["discoverFill"] = c.c2.discover_fill.lock().map(|b| b.json()).unwrap_or(Value::Null);
+            }
             // ZERO-ROUTES FIX (Oct 27): the candidate table as the sidecar
             // holds it, and over-size socket messages dropped.
             s["trigTable"] = crate::check::entry::status_json();
@@ -695,16 +697,17 @@ fn trig_discover_inner(ctx: &Ctx, id: &Value, req: &Value, t0: Instant, tm: &mut
     if a.get("unknown").and_then(|u| u.as_str()) == Some("miss") {
         let missing = parse_missing(&a);
         let max_items = env_u64("ARBSIM_DISCOVER_FILL_MAX_ITEMS", 16) as usize;
-        let fresh = discover_book().lock().map(|mut b| b.offer(&missing, max_items, Instant::now())).unwrap_or_default();
+        let book = &c2.c2.discover_fill;
+        let fresh = book.lock().map(|mut b| b.offer(&missing, max_items, Instant::now())).unwrap_or_default();
         if !fresh.is_empty() && discover_fill_take(fresh.len()) {
-            if let Ok(mut b) = discover_book().lock() {
+            if let Ok(mut b) = book.lock() {
                 b.taken(&fresh, Instant::now());
             }
             c2.note_misses(&fresh);
             crate::timing::ph_add("discFill", fresh.len() as u64);
             ctx.fill(fresh);
         } else if !fresh.is_empty() {
-            if let Ok(mut b) = discover_book().lock() {
+            if let Ok(mut b) = book.lock() {
                 b.paced += fresh.len() as u64;
             }
         }
@@ -713,7 +716,8 @@ fn trig_discover_inner(ctx: &Ctx, id: &Value, req: &Value, t0: Instant, tm: &mut
     a
 }
 
-/// DISCOVER LEARNS budget (Oct 27): what discovery's misses may fetch.
+/// DISCOVER LEARNS budget (Oct 27): what discovery's misses may fetch
+/// (one per copy 2, kept in its shared state: C2Shared.discover_fill).
 /// Plain English: a miss of a few items (a router's code, a coin's setting)
 /// is worth fetching once: the next trade through it can then be replayed.
 /// But the same item missed again and again is usually a value that keeps
@@ -750,6 +754,11 @@ impl DiscoverFillBook {
 
     pub fn new(per_hour: u64, repeat_s: u64) -> Self {
         DiscoverFillBook { per_hour, repeat_s, ..Default::default() }
+    }
+
+    /// With the settings from the environment (one per copy 2: copy2/intake.rs).
+    pub fn from_env() -> Self {
+        DiscoverFillBook::new(env_u64("ARBSIM_DISCOVER_FILL_PER_HOUR", 3600), env_u64("ARBSIM_DISCOVER_FILL_REPEAT_S", 600))
     }
 
     /// The items of one miss that may be fetched now (the rest counted).
@@ -801,11 +810,6 @@ impl DiscoverFillBook {
     }
 }
 
-/// The process-wide DISCOVER LEARNS budget.
-pub fn discover_book() -> &'static Mutex<DiscoverFillBook> {
-    static B: std::sync::OnceLock<Mutex<DiscoverFillBook>> = std::sync::OnceLock::new();
-    B.get_or_init(|| Mutex::new(DiscoverFillBook::new(env_u64("ARBSIM_DISCOVER_FILL_PER_HOUR", 3600), env_u64("ARBSIM_DISCOVER_FILL_REPEAT_S", 600))))
-}
 
 /// DISCOVER LEARNS pacing: a token bucket of ARBSIM_DISCOVER_FILL_PER_S
 /// items a second (bursts up to 2 s worth). true = these `n` items may be
@@ -1600,7 +1604,9 @@ mod tests {
     // hourly cap, too-big misses never fetched; all counted.
     #[test]
     fn discover_fill_book_fetches_each_item_once_within_the_hour_cap() {
+        use super::DiscoverFillBook;
         use crate::state::MissItem;
+        use std::time::{Duration, Instant};
         use revm::primitives::{Address, U256};
         let t0 = Instant::now();
         let mut b = DiscoverFillBook::new(3, 600);
