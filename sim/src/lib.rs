@@ -8,6 +8,7 @@ pub mod arb;
 pub mod bench_node;
 pub mod check;
 pub mod copy2;
+pub mod fastlane;
 pub mod feed;
 pub mod jobq;
 pub mod node;

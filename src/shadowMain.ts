@@ -173,10 +173,11 @@ import { FablesFeeBook, readFablesFees } from './core/fablesFee';
 import { setHookedFeeSource } from './core/pairWatcher';
 import { SimBucketTally, classifySimOutcome } from './core/failReasons';
 import { makeRpc, simulateRoundTrip, simulateWithRecheck, simRpcUrl, Rpc, makeFallbackRpc, loadBalanceSlots, wssToHttps, replayRpc, ReplayCall, SimResult } from './execution/simulator';
-import { FastSender, SafetyGate, safetyConfigFromEnv } from './execution/fastSender';
+import { FastSender, SafetyGate, safetyConfigFromEnv, RUST_IS_SENDER } from './execution/fastSender';
+import { fastlaneModeFromEnv, FastlaneStateWriter, FastlaneSendsFollower, RustSendStats, pairRows, routePairs } from './execution/fastlaneBridge';
 import { DEFAULT_FILTER_CONFIG } from './core/fastFilter';
 import { checkLiveReady } from './execution/liveReadiness';
-import { LiveTradeTracker, Funding } from './execution/liveTracker';
+import { LiveTradeTracker, Funding, LiveResult } from './execution/liveTracker';
 import { LiveTradeLog } from './execution/liveTradeLog';
 import { SafetyAlerts } from './execution/safetyAlerts';
 import { AlertHooks } from './report/alertHooks';
@@ -1701,6 +1702,10 @@ const scoreboard = new Scoreboard({
 let loopLiveRef: LoopLiveSender | null = null;
 // Fire-first 3-pool loop sends (execution/trigEntryLoops.ts): their results (loop loss cap).
 let entryLoopSenderRef: EntryLoopSender | null = null;
+// Rust fast lane: what to do with a Rust send's final result (set when FASTLANE is on).
+let fastlaneOnResult: ((r: LiveResult) => void) | null = null;
+// Rust fast lane: gas a receipt showed (the bridge keeps the most a Rust send used).
+let fastlaneOnGas: ((hash: string, gas: bigint) => void) | null = null;
 const liveTracker = new LiveTradeTracker({
       provider: robinhoodReadProvider,
       ethUsd: () => priceOracle.getUsdPrice('robinhood', ROBINHOOD_TOKENS.WETH) ?? 0,
@@ -1732,8 +1737,13 @@ const liveTracker = new LiveTradeTracker({
             const pools = livePools.get(r.hash);
             if (pools && r.status === 'reverted') { liveBlocks.block(pools[0], pools[1], 'live trade failed on chain'); console.log(`[live-block] ${r.label}: live trade failed, pool pair blocked 6 h`); }
             livePools.delete(r.hash);
+            // Rust fast lane sends: their own fail blocks / loop loss (set up with the fast lane bridge).
+            try { fastlaneOnResult?.(r); } catch { /* never affects trading */ }
       },
-      noteGasUsed: (gas, info) => { robinhoodSender.noteGasUsed(gas); if (info?.routeKey) void noteReceiptGas(info.routeKey, info.hash, gas, info.success); },
+      noteGasUsed: (gas, info) => {
+            robinhoodSender.noteGasUsed(gas); if (info?.routeKey) void noteReceiptGas(info.routeKey, info.hash, gas, info.success);
+            if (info?.hash) { try { fastlaneOnGas?.(info.hash, gas); } catch { /* never affects trading */ } }
+      },
       notify: (html) => alertHooks.liveTrackerNotify(html),
       onSettled: (hash) => { safetyGate.releasePending(hash); robinhoodSender.settled(hash); },
       onDropped: () => { void robinhoodSender.resyncNonce(); },
@@ -2783,9 +2793,12 @@ const fireTrade = async (o: {
             if (localSim && checkFirstDecidedBy && fired.signedAtMs) localSim.noteSigned(o.triggerHash, o.seenAtMs, fired.signedAtMs, checkFirstDecidedBy);
             // Trigger-first decided: feed -> signed, and later vs its block's reports.
             if (trigFirst && checkFirstDecidedBy === 'trig_first' && !o.entry && fired.signedAtMs) trigFirst.noteSubmitted(o.triggerHash, fired.signedAtMs);
-            if (o.entry && fired.signedAtMs) { try { o.entry.onSigned?.(fired.signedAtMs); } catch { /* reporting only */ } }
+            if (o.entry && fired.signedAtMs && !fired.skipped) { try { o.entry.onSigned?.(fired.signedAtMs); } catch { /* reporting only */ } }
+            if (o.entry && fired.skipped) { try { o.entry.onBlocked?.(fired.skipped); } catch { /* reporting only */ } }
             const tradeLabel = `${symbolOf(o.chain, o.tokenIn)}/${symbolOf(o.chain, o.tokenOut)} ${o.buyPool.dex}>${o.sellPool.dex}`;
-            if (fired.live && !fired.txHash && fired.error) { liveTradeLog.sendFailed(tradeLabel, o.tradeSizeUsd, fired.error); alertHooks.liveSendFailed(tradeLabel, fired.error); whyNotSent.blocked('node refused the send'); }
+            // RUST_SENDER=on: decided and signed, never broadcast (the Rust fast lane is the sender).
+            if (fired.skipped) { whyNotSent.blocked('rust is sender'); fireStats.blocked.set('rust is sender', (fireStats.blocked.get('rust is sender') ?? 0) + 1); }
+            else if (fired.live && !fired.txHash && fired.error) { liveTradeLog.sendFailed(tradeLabel, o.tradeSizeUsd, fired.error); alertHooks.liveSendFailed(tradeLabel, fired.error); whyNotSent.blocked('node refused the send'); }
             // How this trade is paid for (Oct 20): own money, or a flash loan and its fee.
             const lenderPips = lender ? (lender.feePips ?? lender.feeBps * 100) : 0;
             const funding: Funding = dry.funding === 'v3-flash'
@@ -3318,6 +3331,108 @@ try {
             }
       }
 } catch (e) { console.log(`[trigger-first] could not start (${(e as Error).message}); the existing paths decide`); trigFirst = null; trigEntry = null; }
+// FAST LANE BRIDGE (execution/fastlaneBridge.ts, Oct 26). Only when FASTLANE
+// is practice or live (default off: nothing here runs, nothing is written).
+//   - every 2 s: data/fastlane-state.json, what the Rust fast lane's safety
+//     checks need from this bot (loss today, blocked pairs, allowed coins...)
+//   - every 250 ms: new lines of data/fastlane-sends.jsonl. A live Rust send
+//     is tracked exactly like our own (receipt, gas, loss cap, pair blocks,
+//     Telegram, data/live-trades.jsonl with "src":"rust"); practice lines are
+//     only counted (hourly line).
+// RUST_SENDER=on (execution/fastSender.ts): this bot never broadcasts.
+const FASTLANE_MODE = fastlaneModeFromEnv();
+if (robinhoodSender.rustIsSender) console.log(`[fastlane] RUST_SENDER=on: this bot NEVER broadcasts (paths still decide and log "${RUST_IS_SENDER}")`);
+if (FASTLANE_MODE !== 'off' && chainOn('robinhood')) {
+      // Rust loop sends that failed on chain, today (Toronto day, like the loop loss cap).
+      const rustLoop = { day: torontoDay(), lossUsd: 0 };
+      const rustLoopLoss = () => { if (rustLoop.day !== torontoDay()) { rustLoop.day = torontoDay(); rustLoop.lossUsd = 0; } return rustLoop.lossUsd; };
+      // Live Rust sends waiting for their result: hash -> route pools / loop or not.
+      const rustSends = new Map<string, { pools: string[]; loop: boolean }>();
+      // Drops seen and most gas used by Rust sends (state file; the gun reads them).
+      const rustStats = new RustSendStats();
+      fastlaneOnGas = (hash, gas) => { if (rustSends.has(hash.toLowerCase())) rustStats.noteGas(gas); };
+      const follower = new FastlaneSendsFollower(process.env.FASTLANE_SENDS_FILE || 'data/fastlane-sends.jsonl', {
+            log: (m) => console.log(m),
+            onLiveSent: (r) => {
+                  const hash = r.hash as string;
+                  const loop = r.pools.length > 2;
+                  const funding: Funding = r.lender
+                        ? { kind: 'flash', feePct: (r.lenderFeePips ?? 0) / 10_000, feeUsd: r.sizeUsd * (r.lenderFeePips ?? 0) / 1_000_000 }
+                        : { kind: 'own' };
+                  const label = `rust ${r.label}`;
+                  fireStats.sent++;
+                  whyNotSent.sent();
+                  liveTradeLog.sent(hash, label, r.sizeUsd, r.expectedNetUsd, funding, 'rust');
+                  setTimeout(() => { void refreshOwnMoney(); }, 3_000);
+                  // Worst-case gas (2x) held against the daily loss cap until the receipt, like our own.
+                  safetyGate.reservePending(hash, 2 * (Number.isFinite(r.gasUsd) ? r.gasUsd : rhGasUsd(0.05)));
+                  robinhoodSender.noteInflight(hash);
+                  rustSends.set(hash.toLowerCase(), { pools: r.pools.map((p) => p.toLowerCase()), loop });
+                  if (rustSends.size > 500) rustSends.delete(rustSends.keys().next().value as string);
+                  // Our own trade seen again in the feed is never a trigger; 2 pools: 6 h block after a revert, like ours.
+                  if (r.pools.length >= 2) { livePools.set(hash, [r.pools[0], r.pools[1]]); if (livePools.size > 500) livePools.delete(livePools.keys().next().value as string); }
+                  liveTracker.track(hash, { expectedProfitUsd: r.expectedNetUsd, label, sizeUsd: r.sizeUsd, funding, routeKey: r.kinds?.length ? routeKeyFor(r.kinds, !!r.lender) : undefined });
+                  scoreboard.noteSend({ hash, path: loop ? 'loop' : 'gap', expectedUsd: r.expectedNetUsd, label, pools: r.pools.slice(0, 2) });
+                  console.log(`[fastlane] RUST SENT ${r.label}: ~$${r.expectedNetUsd.toFixed(2)} on $${Math.round(r.sizeUsd)}, block ${r.block}, feed -> sent ${(r.totalUs / 1000).toFixed(1)} ms, tx ${hash}`);
+            },
+            onLiveSendFailed: (r) => {
+                  const label = `rust ${r.label}`;
+                  liveTradeLog.sendFailed(label, r.sizeUsd, r.error ?? 'send failed', 'rust');
+                  alertHooks.liveSendFailed(label, r.error ?? 'send failed');
+                  whyNotSent.blocked('node refused the send');
+            },
+      });
+      // Results of Rust sends: a failed one blocks every pair of its route for
+      // GAP_LIVE_FAIL_BLOCK_MIN (Rust reads that list), loops count toward the loop loss cap.
+      fastlaneOnResult = (r) => {
+            const s = rustSends.get(r.hash.toLowerCase());
+            if (!s) return;
+            rustSends.delete(r.hash.toLowerCase());
+            // Never mined: the Rust gun's nonce may be off (it re-reads it when this goes up).
+            rustStats.noteResult(r.status);
+            if (r.status !== 'reverted') return;
+            if (GAP_LIVE_FAIL_BLOCK_MIN > 0) for (const [a, b] of routePairs(s.pools)) gapFailBlocks.block(a, b, 'rust fast lane: live trade failed on chain');
+            if (s.loop) { rustLoopLoss(); rustLoop.lossUsd += Number.isFinite(r.gasUsd) ? r.gasUsd : 0; }
+            console.log(`[live-block] ${r.label}: rust live trade failed, its pool pairs not sent for ${GAP_LIVE_FAIL_BLOCK_MIN} min`);
+      };
+      const killFile = process.env.KILL_FILE ?? 'data/KILL';
+      const writer = new FastlaneStateWriter(process.env.FASTLANE_STATE_FILE || 'data/fastlane-state.json', {
+            now: Date.now,
+            lossTodayUsd: () => safetyGate.lossTodayUsd(),
+            lossWithPendingUsd: () => safetyGate.lossTodayUsd(true),
+            limits: () => { const c = safetyConfigFromEnv(); return { maxTradeUsd: Math.min(c.maxTradeUsd, MAX_TRADE_USD), dailyLossCapUsd: c.dailyLossCapUsd, maxSendsPerMin: c.maxSendsPerMinute, minNetUsd: MIN_NET_PROFIT_USD, autoVetMaxTradeUsd: AUTO_VET_MAX_TRADE_USD, loopMaxTradeUsd: loopLiveCfg.maxTradeUsd, loopLossCapUsd: loopLiveCfg.lossCapUsd }; },
+            problems: () => safetyGate.problems,
+            allowlist: () => safetyGate.allowedTokens(),
+            autoVetted: () => autoVet.vettedList(),
+            liveBlocks: () => pairRows(liveBlocks.entries(), Date.now()),
+            failBlocks: () => pairRows(gapFailBlocks.entries(), Date.now()),
+            // Pools a real trade may use: exchange cleared, not practice-only,
+            // live coin rule (liveBlocker), and a pool type the contract can run.
+            livePools: () => copy2PoolKeys().filter((k) => { const p = cache.get('robinhood', k); return !!p && !liveBlocker(p, p) && kindForPool(p) !== null && (kindForPool(p) !== KIND_V4_HOOKED || v4KeyMatchesId(p)); }),
+            paused: () => ({ gap: scoreboard.pausedWhy('gap'), loop: scoreboard.pausedWhy('loop') }),
+            loopLossUsd: () => (loopLive?.lossTodayUsd() ?? 0) + (entryLoopSender?.lossTodayUsd() ?? 0) + rustLoopLoss(),
+            loopPaused: () => !!(loopLive?.pausedToday() || entryLoopSender?.pausedToday()),
+            // Not live here = not ready there (Rust needs this bot live to track its sends).
+            liveReady: () => robinhoodSender.live && liveChecks.ok,
+            liveProblems: () => liveChecks.problems,
+            approvedLenders: () => [...approvedLenders('robinhood')],
+            ownMoney: () => { const age = ownMoney.lastReadAgeMs(); return { readMs: age === null ? 0 : Date.now() - age, balances: Object.fromEntries(OWN_MONEY_TOKENS.map((t) => [t, ownMoney.raw(t)])) }; },
+            killed: () => killSwitchOn(process.env.KILL_SWITCH) || existsSync(killFile),
+            ackSeq: () => follower.ackSeq,
+            // OUR RUST_SENDER (H1): Rust broadcasts only if this says true too.
+            rustSender: () => robinhoodSender.rustIsSender,
+            dropsSeen: () => rustStats.dropsSeen,
+            maxGasUsed: () => rustStats.maxGasUsed,
+      }, (m) => console.log(m));
+      writer.start(Math.max(250, Number(process.env.FASTLANE_STATE_MS ?? 2_000) || 2_000));
+      follower.start(250);
+      setInterval(() => {
+            const line = follower.hourLine(true);
+            console.log(line);
+            if (process.env.FASTLANE_TELEGRAM !== '0') void sendTelegramMessage(escHtml(line)).catch(() => undefined);
+      }, 3600_000).unref?.();
+      console.log(`[fastlane] FASTLANE=${FASTLANE_MODE}: state file every ${Math.round(Number(process.env.FASTLANE_STATE_MS ?? 2_000) || 2_000)} ms, following the Rust send log${robinhoodSender.rustIsSender ? '' : ' (RUST_SENDER=off: Rust will not broadcast)'}`);
+}
 if (chainOn('robinhood')) {
       const rhAdapter = new RobinhoodChainAdapter();
       if (localSim) { const host = localSim; rhAdapter.setRawFrameTap((text) => host.forwardFeed(text)); }

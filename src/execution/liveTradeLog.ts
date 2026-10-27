@@ -45,6 +45,9 @@ export interface LiveTradeRecord {
   funding?: 'own' | 'flash';
   loanFeePct?: number;
   loanFeeUsd?: number;
+  // Who sent it (sent / send_failed / result): "rust" = the Rust fast lane
+  // (FASTLANE, Oct 26). Left out for the bot's own sends (unchanged lines).
+  src?: 'rust';
 }
 
 // The funding fields as they go into the file (nothing for unknown funding).
@@ -56,6 +59,8 @@ function fundingFields(f?: Funding): Pick<LiveTradeRecord, 'funding' | 'loanFeeP
 
 export class LiveTradeLog {
   private blocked = new Map<string, number>();
+  // Hashes sent by the Rust fast lane, so their result line says "src":"rust" too (bounded).
+  private rustHashes = new Set<string>();
   private lastFlush: number;
   private timer: NodeJS.Timeout | null = null;
 
@@ -89,13 +94,17 @@ export class LiveTradeLog {
   }
 
   // A real trade went out (we have a tx hash).
-  sent(hash: string, label: string, sizeUsd: number, expectedProfitUsd: number, funding?: Funding) {
-    this.append({ kind: 'sent', hash, label, sizeUsd: round(sizeUsd), expectedProfitUsd: round(expectedProfitUsd, 4), ...fundingFields(funding) });
+  sent(hash: string, label: string, sizeUsd: number, expectedProfitUsd: number, funding?: Funding, src?: 'rust') {
+    if (src === 'rust') {
+      this.rustHashes.add(hash.toLowerCase());
+      if (this.rustHashes.size > 2_000) this.rustHashes.delete(this.rustHashes.values().next().value as string);
+    }
+    this.append({ kind: 'sent', hash, label, sizeUsd: round(sizeUsd), expectedProfitUsd: round(expectedProfitUsd, 4), ...fundingFields(funding), ...(src ? { src } : {}) });
   }
 
   // The node refused the send: nothing reached the chain, no gas paid.
-  sendFailed(label: string, sizeUsd: number, error: string) {
-    this.append({ kind: 'send_failed', label, sizeUsd: round(sizeUsd), error: error.slice(0, 160) });
+  sendFailed(label: string, sizeUsd: number, error: string, src?: 'rust') {
+    this.append({ kind: 'send_failed', label, sizeUsd: round(sizeUsd), error: error.slice(0, 160), ...(src ? { src } : {}) });
   }
 
   // The receipt came back (or the trade was never mined).
@@ -107,6 +116,7 @@ export class LiveTradeLog {
       profitUsd: r.profitUsd === undefined ? (status === 'won' ? null : undefined) : round(r.profitUsd, 4),
       gasUsd: round(r.gasUsd, 4), netUsd: round(netUsd, 4), expectedProfitUsd: round(r.expectedProfitUsd, 4),
       ...fundingFields(r.funding),
+      ...(this.rustHashes.delete(r.hash.toLowerCase()) ? { src: 'rust' as const } : {}),
     });
   }
 
