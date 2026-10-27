@@ -409,3 +409,32 @@ fn predicted_equals_the_chains_own_replay_on_a_real_v2_pair() {
     // The block-1 accumulators really moved (proves the comparison bites).
     assert_ne!(truth.storage(pair, U256::from(9u8)), base.storage(pair, U256::from(9u8)));
 }
+
+/// TEST NUMBERS ONLY (this machine, toy contracts): microseconds to apply
+/// one feed message with 10 transactions, 2 of them on our pools.
+#[test]
+fn bench_apply_us_test_numbers_only() {
+    let mut a = ahead(32);
+    let mut nonce = 0u64;
+    let mut seq = 11u64;
+    for _ in 0..200 {
+        let mut txs = Vec::new();
+        for j in 0..10u64 {
+            let to = if j < 2 { pool() } else { dep() };
+            txs.push(stx(nonce, to, w(1)));
+            nonce += 1;
+        }
+        let m = msg(seq, &txs);
+        for t in &m.txs {
+            let _ = t.decoded(); // the feed store's background thread does this live
+        }
+        a.on_feed_message(m);
+        // Keep the copy close behind (normal live shape: 1-3 blocks).
+        let (s, d) = with_price(100, 7);
+        a.on_confirmed(confirmed(seq, s, d), &no_moves);
+        seq += 1;
+    }
+    let j = a.total.json();
+    eprintln!("[test numbers] apply us per message (10 txs, 2 ours): {}", j["applyUs"]);
+    assert!(j["applyUs"]["n"].as_u64().unwrap() >= 200);
+}
