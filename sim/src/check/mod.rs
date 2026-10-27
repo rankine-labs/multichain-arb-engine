@@ -133,6 +133,11 @@ pub enum UnknownReason {
     /// allowance) and then failed with a "not enough funds / bad
     /// signature / bad nonce" error: our guess may be what failed it.
     SenderFunds,
+    /// Fast lane (fastlane/c2runner.rs): copy 2 declined to vouch for the
+    /// answer (V4 PoolManager balance / protocol fee runs differ, a pool on
+    /// the route may still miss reports, a pool not ready). `detail` holds
+    /// the sidecar's own short reason ("pool_manager_balance", ...).
+    Copy2Unsure,
 }
 
 impl UnknownReason {
@@ -151,6 +156,7 @@ impl UnknownReason {
             UnknownReason::FundingOverlap => "funding_overlap",
             UnknownReason::StaleFill => "stale_fill",
             UnknownReason::SenderFunds => "sender_funds_revert",
+            UnknownReason::Copy2Unsure => "copy2_unsure",
         }
     }
 }

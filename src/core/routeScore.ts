@@ -118,6 +118,9 @@ export class LiveRouteBlock {
     return b && b.until > this.now() ? b.why : null;
   }
 
+  // Every block still running, keyed "buyPool>sellPool" (fast lane state file).
+  entries(): [string, { until: number; why: string }][] { const t = this.now(); return [...this.blocks].filter(([, b]) => b.until > t); }
+
   count(): number { const t = this.now(); let n = 0; for (const b of this.blocks.values()) if (b.until > t) n++; return n; }
 
   private prune() { const t = this.now(); for (const [k, b] of this.blocks) if (b.until <= t) this.blocks.delete(k); }

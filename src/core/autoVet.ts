@@ -48,6 +48,8 @@ export class AutoVet {
   ) {}
 
   isAutoVetted(token: string): boolean { return this.vetted.has(token.toLowerCase()); }
+  // Every auto-vetted coin (lowercase), for the fast lane's shared state file.
+  vettedList(): string[] { return [...this.vetted.keys()]; }
   isBlocked(token: string): boolean { return (this.blocked.get(token.toLowerCase()) ?? 0) > this.now(); }
   vettedTokens(): string[] { return [...this.vetted.keys()]; }
 

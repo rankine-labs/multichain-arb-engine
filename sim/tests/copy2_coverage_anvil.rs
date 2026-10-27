@@ -1290,3 +1290,90 @@ fn bot_v4_coin_counting_part_of_its_balance_word_never_gives_a_false_revert() {
     eprintln!("narrow coins, big supply: {a} answered, {u} unknown; runs {whats:#?}");
     assert!(u >= 1 && st["counters"]["pm_high_refused"].as_u64().unwrap() > 0, "{st}");
 }
+
+// ---------------------------------------------------------------------------
+// FAST LANE (integration item 4): the scanner's copy-2 runner on a REAL V4
+// pool must give exactly the answer the sidecar's own copy-2 check gives
+// (same V4 PoolManager bound runs, same protocol-fee runs), and never an
+// answer the chain disagrees with.
+// ---------------------------------------------------------------------------
+
+/// The bot's round trip as a scanner table check (ladder of sizes).
+fn fastlane_check(w: &World, usd: u64, test_first: bool) -> (arbsim::fastlane::scan::PreparedCheck, Value) {
+    let (call, ov) = w.round_trip(usd, test_first);
+    let amt = U256::from(usd) * q(6);
+    let c = json!({
+        "calls": [{ "from": ha(call.from), "to": ha(call.to.unwrap()), "data": hb(&call.data), "gas": format!("{:#x}", call.gas.unwrap()) }],
+        "overrides": ov,
+        "sizes": { "amountOffset": 96, "amounts": [format!("{:#x}", amt / U256::from(4u8)), format!("{:#x}", amt / U256::from(2u8))] },
+        "route": [ha(w.pools[0].address), ha(w.pools[1].address)],
+        "stop": "0x1", "amt": format!("{amt:#x}"),
+    });
+    (arbsim::fastlane::scan::PreparedCheck::from_row(&c, &[]).expect("prepared"), c)
+}
+
+#[test]
+fn fastlane_copy2_runner_matches_the_sidecar_on_v4() {
+    use arbsim::fastlane::c2runner::{result_json, run_on_copy2};
+    use arbsim::fastlane::scan::amounts_for;
+    let o = Opts { bot_shape: true, pm_bound: true, full_words: 8000, ..Opts::default() };
+    let Some(mut w) = World::start_with(K::V4, o) else {
+        eprintln!("copy2 coverage anvil test SKIPPED: no ~/.foundry/bin/anvil");
+        return;
+    };
+    w.go_live();
+    w.wait("tick walks", |w| w.walked());
+    w.settle();
+    trade_some(&mut w);
+    let n = w.block(&[]);
+    w.settle();
+    let (mut same, mut answered, mut unsure) = (0, 0, 0);
+    for usd in [1_000u64, 20_000, 150_000, 600_000] {
+        for dir in [true, false] {
+            // Warm (fills) through the sidecar first, as live.
+            for _ in 0..3 {
+                let _ = w.compare(n, usd, dir);
+                w.settle();
+            }
+            // The version as it is NOW (the warm-up's fills are folded into it).
+            let v = w.sh.published.read().unwrap().versions.iter().find(|v| v.block == n).cloned().expect("copy has block n");
+            let ctx = v.ctx.clone().unwrap();
+            let (pc, c) = fastlane_check(&w, usd, dir);
+            let amounts = amounts_for(&pc, 0);
+            // The scanner's runner (copy 2's rules) ...
+            let ours = run_on_copy2(&w.h, &v.snap, n, &ctx, &pc, &amounts);
+            // ... and the sidecar's own size_search on the same block.
+            let side = arbsim::server::handle(
+                &w.ctx,
+                &json!({"id": 1, "type": "size_search", "at": {"block": n}, "overrides": c["overrides"], "template": c["calls"][0], "amountOffset": 96,
+                        "amounts": pc.sizes.iter().map(|a| format!("{a:#x}")).collect::<Vec<_>>()}),
+            );
+            let mut ours_j = result_json(&ours);
+            let mut side_j = side.clone();
+            for j in [&mut ours_j, &mut side_j] {
+                if let Some(m) = j.as_object_mut() {
+                    for k in ["id", "us", "at", "t", "detail", "missing", "lossFast"] {
+                        m.remove(k);
+                    }
+                }
+            }
+            if side_j.get("ok") == Some(&json!(true)) {
+                answered += 1;
+                assert_eq!(ours_j, side_j, "{usd} USD dir {dir}: scanner runner vs sidecar");
+                same += 1;
+                // And the chain agrees at the main size (status + profit).
+                let (call, ov) = w.round_trip(usd, dir);
+                let (ts, to, _) = w.truth(n, &call, &ov);
+                let main = ours.as_ref().unwrap().tried.iter().find(|t| t.amount == U256::from(usd) * q(6)).cloned().unwrap();
+                let truth = arbsim::check::search::classify(U256::from(usd) * q(6), &arbsim::check::CallOutcome { success: ts, output: arbsim::check::hexutil::parse_bytes(&to).unwrap().into(), gas_used: main.gas_used, ..Default::default() });
+                assert_eq!((main.status, main.profit), (truth.status, truth.profit), "{usd} USD dir {dir}: chain truth");
+            } else {
+                unsure += 1;
+                assert!(ours.is_err(), "sidecar unsure ({side}) => scanner unsure too, never an answer: {ours_j}");
+            }
+        }
+    }
+    eprintln!("fast lane copy-2 runner vs sidecar on V4: {same} identical answers of {answered} answered, {unsure} unsure in both");
+    assert!(answered >= 4, "most V4 checks answered: {answered}");
+    w.h.stop();
+}

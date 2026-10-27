@@ -8,6 +8,8 @@ pub mod arb;
 pub mod bench_node;
 pub mod check;
 pub mod copy2;
+// Fast lane (Oct 26): off unless FASTLANE=practice|live.
+pub mod fastlane;
 pub mod feed;
 pub mod jobq;
 pub mod node;

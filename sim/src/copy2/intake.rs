@@ -1491,6 +1491,11 @@ impl Copy2Handle {
     /// A check's PoolManager balance bound: from the route's pools only
     /// (`full_retry` false) / that wasn't enough, run again with the full one.
     pub fn note_pm_bound_kind(&self, full_retry: bool) {
+        // Fast lane runs are counted on their own (fastlane/c2runner.rs), so
+        // copy 2's numbers stay the bot's own checks only.
+        if crate::fastlane::c2runner::note_if_fastlane(if full_retry { "pmBoundFullRetry" } else { "pmBoundRouteOnly" }) {
+            return;
+        }
         inc(if full_retry { &self.c2.stats.pm_bound_full_retry } else { &self.c2.stats.pm_bound_route_only });
     }
 
@@ -1498,10 +1503,16 @@ impl Copy2Handle {
     /// copy2-r: a high run used a narrower value for a coin (`narrow`), or
     /// a check went unknown because no value proves "above any balance".
     pub fn note_pm_high(&self, narrow: bool) {
+        if crate::fastlane::c2runner::note_if_fastlane(if narrow { "pmHighNarrow" } else { "pmHighRefused" }) {
+            return;
+        }
         inc(if narrow { &self.c2.stats.pm_high_narrow } else { &self.c2.stats.pm_high_refused });
     }
 
     pub fn note_pm_bound(&self, same: bool) {
+        if crate::fastlane::c2runner::note_if_fastlane(if same { "pmBoundSame" } else { "pmBoundDiffer" }) {
+            return;
+        }
         inc(&self.c2.stats.pm_bound_checks);
         inc(if same { &self.c2.stats.pm_bound_same } else { &self.c2.stats.pm_bound_differ });
     }
@@ -1509,6 +1520,9 @@ impl Copy2Handle {
     /// A check read an unheld protocolFeesAccrued counter and ran with it 0
     /// and not 0: same apart from gas (answered, higher gas) / different.
     pub fn note_protocol_fee(&self, same: bool) {
+        if crate::fastlane::c2runner::note_if_fastlane(if same { "protocolFeeSame" } else { "protocolFeeDiffer" }) {
+            return;
+        }
         inc(&self.c2.stats.protocol_fee_checks);
         inc(if same { &self.c2.stats.protocol_fee_same } else { &self.c2.stats.protocol_fee_differ });
     }
@@ -3109,6 +3123,9 @@ impl Intake {
         self.c2.last_block.store(block, Ordering::Relaxed);
         self.c2.head_block.store(block, Ordering::Relaxed);
         self.sh.notify();
+        // FAST LANE A (copy2/ahead.rs): rebase the predicted copy on this
+        // version. Does nothing unless FASTLANE is practice / live.
+        super::ahead::confirmed_hook();
     }
 
     /// Which followed pools a log is an event of.

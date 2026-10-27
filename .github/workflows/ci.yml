@@ -70,8 +70,21 @@ jobs:
       - name: Build (release)
         run: cargo build --release --locked
 
+      # Run every test (don't stop at the first failure). If any fail, also
+      # post the failing test names and panic messages as CI annotations, so
+      # they can be read from the PR page / API without opening the raw log.
       - name: Tests
-        run: cargo test --release --locked
+        shell: bash
+        run: |
+          set +e
+          cargo test --release --locked --no-fail-fast 2>&1 | tee /tmp/sim-test.log
+          code=${PIPESTATUS[0]}
+          if [ "$code" -ne 0 ]; then
+            grep -E "^test .* FAILED$|panicked at|^---- " -A3 /tmp/sim-test.log \
+              | grep -v '^--$' | head -45 \
+              | while IFS= read -r line; do echo "::error title=sim test failure::$line"; done
+          fi
+          exit "$code"
 
   # Solidity execution contract (contracts/). Separate job so a contract
   # problem never blocks the bot's own checks, and vice versa.

@@ -149,13 +149,19 @@ pub fn record_hold_at(us: u64, site: &'static std::panic::Location<'static>) {
     }
 }
 
-fn pct(v: &mut [u64]) -> Value {
+pub fn pct(v: &mut [u64]) -> Value {
     if v.is_empty() {
         return json!({ "n": 0 });
     }
     v.sort_unstable();
     let at = |p: f64| v[(((v.len() - 1) as f64) * p).round() as usize];
     json!({ "n": v.len(), "p50": at(0.5), "p90": at(0.9), "p99": at(0.99), "max": v[v.len() - 1] })
+}
+
+/// p50 / p90 / p99 / max of `v` (sorts it), for other files' status
+/// sections (fast lane, copy2/ahead.rs).
+pub fn pct_of(v: &mut [u64]) -> Value {
+    pct(v)
 }
 
 /// status: "checkTiming" (per step, microseconds), "applyTiming", "lockHold".
@@ -170,7 +176,7 @@ pub fn status() -> Value {
     };
     let mut applies: Vec<u64> = r.applies.iter().copied().collect();
     let mut holds: Vec<u64> = r.holds.iter().copied().collect();
-    json!({
+    let mut out = json!({
         "checkTiming": {
             "total": col(|s| s.total), "queue": col(|s| s.queue), "prep": col(|s| s.prep),
             "resolve": col(|s| s.resolve), "facts": col(|s| s.facts), "runSum": col(|s| s.run_sum),
@@ -180,7 +186,12 @@ pub fn status() -> Value {
         "lockHold": with_sites(pct(&mut holds), &r.sites),
         // Trigger-first questions per phase (speed-3, see trig_status).
         "trigTiming": trig_status(),
-    })
+    });
+    // Fast lane scanner (only once it has scanned something: FASTLANE on).
+    if crate::fastlane::scan::any_activity() {
+        out["fastlaneScan"] = crate::fastlane::scan::status_json();
+    }
+    out
 }
 
 fn with_sites(mut v: Value, sites: &std::collections::BTreeMap<String, (u64, u64, u64)>) -> Value {

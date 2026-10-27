@@ -190,6 +190,7 @@ export type EntrySettings = {
   yieldSliceMs: number;          // TRIG_ENTRY_YIELD_SLICE_MS [2] big jobs' longest bite while entry work runs (0 = no change)
   loops: boolean;                // TRIG_ENTRY_LOOPS [1] also try 3-pool loops through the moved pool (0 = 2-pool only, as before)
   maxLoops: number;              // TRIG_ENTRY_MAX_LOOPS [4] loop candidates built and checked per trigger (on top of TRIG_ENTRY_MAX_CANDIDATES)
+  fastlaneFacts: boolean;        // FASTLANE=practice|live: table rows also carry "f" facts for the Rust scanner (off = as before)
 };
 
 export function entrySettings(env: Record<string, string | undefined> = process.env, minNetUsd = 0.25): EntrySettings {
@@ -218,6 +219,7 @@ export function entrySettings(env: Record<string, string | undefined> = process.
     yieldSliceMs: num('TRIG_ENTRY_YIELD_SLICE_MS', 2, 0),
     loops: (env.TRIG_ENTRY_LOOPS ?? '1').trim() !== '0',
     maxLoops: Math.round(num('TRIG_ENTRY_MAX_LOOPS', 4, 0)),
+    fastlaneFacts: fastlaneFactsOn(env),
   };
 }
 
@@ -280,7 +282,36 @@ export type EntryCandidate = {
   // gas, a loop's extra gas already taken off): used to merge loops in among
   // the 2-pool candidates in rank order. Not given = keeps its place.
   rank?: { held: boolean; score: number | null };
+  // FAST LANE (Oct 26, sim/src/fastlane/scan.rs): the start coin's USD price
+  // and decimals and the lender's fee (pips, 0 = own money), so the Rust
+  // scanner can value a result exactly as usdOf / gasUsd do. Only sent to
+  // the sidecar when FASTLANE=practice|live. Not given = not sent.
+  fx?: { px: number; d: number; lp?: number };
 };
+
+// FASTLANE=practice|live (same words as sim/src/fastlane/mode.rs): the
+// candidate table also carries each route's facts ("f") for the Rust
+// standing-gap scanner. Off (default): the table is exactly as before.
+export function fastlaneFactsOn(env: Record<string, string | undefined> = process.env): boolean {
+  return ['practice', 'shadow', 'dry', 'live'].includes((env.FASTLANE ?? '').trim().toLowerCase());
+}
+
+// The facts row ("f") for one candidate, or null when it can't be valued.
+// px keeps 9 significant digits (the bot's own price is a float anyway).
+export function fastlaneFacts(c: EntryCandidate): Record<string, unknown> | null {
+  const fx = c.fx;
+  if (!fx || !(fx.px > 0) || !Number.isFinite(fx.px) || !Number.isInteger(fx.d) || fx.d < 0 || fx.d > 36 || !(c.gasUsd >= 0)) return null;
+  const f: Record<string, unknown> = { l: c.label.slice(0, 80), px: Number(fx.px.toPrecision(9)), d: fx.d, g: Number(c.gasUsd.toPrecision(9)) };
+  if (fx.lp !== undefined && Number.isFinite(fx.lp) && fx.lp >= 0) f.lp = Math.round(fx.lp);
+  return f;
+}
+
+// The facts as they count for "did this pool's rows change?" (review H2):
+// price to 3 and gas to 2 significant digits; label, decimals, loan pips as is.
+export function fastlaneFactsFp(f: Record<string, unknown>): string {
+  const r = (v: unknown, n: number) => (typeof v === 'number' && Number.isFinite(v) && v !== 0 ? Number(v.toPrecision(n)) : v);
+  return JSON.stringify([f.l, r(f.px, 3), f.d, r(f.g, 2), f.lp ?? null]);
+}
 
 // A route's id: "buy>sell:start" (lowercase). Two pools moved by one
 // trigger can list the same route; it is checked once.
@@ -1185,12 +1216,17 @@ export class TrigEntry {
               this.tblMemo.set(rid, { at: now, inputs: r.inputs.slice(), sameAs, codesEpoch: this.codesEpoch, c, cJson, sig: meta.sig, fallback: meta.fallback });
             } else this.tblMemo.delete(rid);
           }
-          rows.push({ rid, h: r.held, s: score, e: '', c });
+          // Fast lane only: the facts the Rust scanner values results with.
+          const fl = this.settings.fastlaneFacts && c ? fastlaneFacts(cand) : null;
+          rows.push(fl ? { rid, h: r.held, s: score, e: '', c, f: fl } : { rid, h: r.held, s: score, e: '', c });
           metas.push(meta);
           // Fingerprint: the route's small facts + its question's text (exactly
           // the same text as before for the same question, so "changed?" is the
           // same answer as when the whole list was turned into text).
-          fps.push(JSON.stringify([r.rid, r.held, score, cand.label, cand.gasUsd, cand.maxSizeUsd, !!meta.fallback]) + cJson);
+          // Fast lane facts go in ROUNDED (review H2, Oct 26): price to 3 and gas
+          // to 2 significant digits, so a tiny price move doesn't resend the
+          // pool's rows every refresh (the row itself still carries the exact facts).
+          fps.push(JSON.stringify([r.rid, r.held, score, cand.label, cand.gasUsd, cand.maxSizeUsd, !!meta.fallback]) + cJson + (fl ? fastlaneFactsFp(fl) : ''));
         }
         fresh.set(key, { fp: fps.join('\n'), rows, metas });
       }

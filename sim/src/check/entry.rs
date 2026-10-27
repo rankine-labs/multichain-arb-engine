@@ -60,6 +60,11 @@ pub struct Row {
     /// Our check: {calls, overrides, sizes, route, stop, amt}; None = the
     /// candidate has no check (no size fits): counted, nothing run.
     pub c: Option<Arc<Value>>,
+    /// (Fast lane, Oct 26) The bot's facts for valuing a result in USD:
+    /// {l: label, px: start coin USD, d: decimals, g: gas USD, lp: loan
+    /// pips}. Sent only when FASTLANE is on; read only by fastlane/scan.rs.
+    /// Never used by trigger picking or checks.
+    pub f: Option<Arc<Value>>,
 }
 
 /// The whole table.
@@ -108,6 +113,7 @@ pub fn parse_rows(v: &Value) -> Result<Vec<Row>, String> {
                 score: r.get("s").and_then(|x| x.as_f64()).filter(|x| x.is_finite()),
                 e: r.get("e").and_then(|x| x.as_str()).map(|s| s.to_string()),
                 c: r.get("c").filter(|c| c.is_object()).map(|c| Arc::new(c.clone())),
+                f: r.get("f").filter(|f| f.is_object()).map(|f| Arc::new(f.clone())),
             })
         })
         .collect()
@@ -257,7 +263,7 @@ mod tests {
     use super::*;
 
     fn row(rid: &str, held: bool, s: Option<f64>, e: Option<&str>) -> Row {
-        Row { rid: rid.into(), held, score: s, e: e.map(|x| x.into()), c: None }
+        Row { rid: rid.into(), held, score: s, e: e.map(|x| x.into()), c: None, f: None }
     }
 
     #[test]

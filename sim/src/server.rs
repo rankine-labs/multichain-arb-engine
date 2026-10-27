@@ -233,6 +233,14 @@ pub fn handle_tm(ctx: &Ctx, req: &Value, tm: &mut Tm) -> Value {
                 }
             }
             s["feedStore"] = crate::check::feedstore::store().status_json();
+            // FAST LANE A (copy2/ahead.rs): only when FASTLANE is on.
+            if let Some(a) = crate::copy2::ahead::status_json() {
+                s["fastlaneAhead"] = a;
+            }
+            // FAST LANE loop summary (ahead, scan, gun, safety, practice).
+            if let Some(f) = crate::fastlane::lane::status_json() {
+                s["fastlane"] = f;
+            }
             s
         }
         Some("warm") => match parse_warm(req) {

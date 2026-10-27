@@ -28,6 +28,15 @@ import { labelled, markStretch } from '../core/stallFinder';
 //     sends + any losses; once hit, no more sends until midnight UTC
 //   - max sends per minute (MAX_SENDS_PER_MIN, default 6)
 //   - token allowlist: only tokens from pairs we've vetted (scan's top pairs)
+//
+// ONE SENDER AT A TIME (fast lane, Oct 26, owner decision):
+//   The trade contract allows ONE executor wallet and the Rust fast lane uses
+//   the same wallet. RUST_SENDER=on makes Rust the only sender: this file
+//   then NEVER calls eth_sendRawTransaction (checked right here, at the one
+//   place every Node path sends through, so nothing can go around it). The
+//   bot's paths still decide, check and sign as usual, and the result says
+//   "skipped: rust is sender" (no hash, nonce not used up). Default off =
+//   exactly the old behaviour.
 // ============================================================================
 
 export interface SafetyConfig {
@@ -61,6 +70,11 @@ export function safetyConfigProblems(cfg: SafetyConfig): string[] {
 // KILL_SWITCH accepts on / true / 1 / yes in any case.
 export const killSwitchOn = (v: string | undefined) => /^(on|true|1|yes)$/i.test((v ?? '').trim());
 
+// RUST_SENDER: same values as KILL_SWITCH (on / true / 1 / yes). Same rule as
+// the Rust side (sim/src/fastlane/mode.rs parse_on).
+export const rustSenderOn = (env: Record<string, string | undefined> = process.env) => killSwitchOn(env.RUST_SENDER);
+export const RUST_IS_SENDER = 'skipped: rust is sender';
+
 export class SafetyGate {
   private allowed = new Set<string>();
   private sendTimes: number[] = [];
@@ -73,6 +87,8 @@ export class SafetyGate {
   }
 
   allowTokens(tokens: string[]) { for (const t of tokens) this.allowed.add(t.toLowerCase()); }
+  // Every allowed coin (lowercase), for the fast lane's shared state file.
+  allowedTokens(): string[] { return [...this.allowed]; }
   // Take coins off the allowlist (an auto-vetted coin that later failed like a trap coin).
   disallowTokens(tokens: string[]) { for (const t of tokens) this.allowed.delete(t.toLowerCase()); }
   isAllowed(token: string) { return this.allowed.has(token.toLowerCase()); }
@@ -166,6 +182,9 @@ export interface FireResult {
   nonce?: number;      // nonce used (live only)
   txHash?: string;
   error?: string;
+  // Live, but not broadcast because the Rust fast lane is the sender
+  // (RUST_SENDER=on). error is then RUST_IS_SENDER too.
+  skipped?: string;
 }
 
 // PARALLEL SEND (SPEED_PARALLEL_SEND). Default OFF: see FastSender.fire().
@@ -184,6 +203,8 @@ export class FastSender {
   private gasTimer: NodeJS.Timeout | null = null;
   readonly live: boolean;
   readonly parallel: boolean;
+  // RUST_SENDER=on: never broadcast (see "ONE SENDER AT A TIME" above).
+  readonly rustIsSender: boolean;
   private readonly log: (line: string) => void;
 
   constructor(
@@ -195,6 +216,7 @@ export class FastSender {
     opts: { parallel?: boolean; log?: (line: string) => void } = {},
   ) {
     this.parallel = opts.parallel ?? parallelSendFromEnv();
+    this.rustIsSender = rustSenderOn();
     this.log = opts.log ?? ((l) => console.log(l));
     this.gasLimitNow = gasLimit;
     const key = process.env.BOT_PRIVATE_KEY;
@@ -211,6 +233,8 @@ export class FastSender {
   private inflight: InflightMarker | null = null;
   trackInflight(file: string) { if (this.live) this.inflight = new InflightMarker(file); }
   settled(hash: string) { this.inflight?.remove(hash); }
+  // A live trade the Rust fast lane sent (same wallet): counted in flight too.
+  noteInflight(hash: string) { this.inflight?.add(hash); }
 
   // Pre-load nonce and gas, then keep gas fresh in the background.
   async start() {
@@ -389,6 +413,8 @@ export class FastSender {
     const signMs = performance.now() - t0;
     const signedAtMs = Date.now();
     if (!this.live) return { live: false, signMs, queueMs, signedAtMs };
+    // Rust is the sender: never broadcast; the nonce stays unused.
+    if (this.rustIsSender) return { live: true, signMs, queueMs, signedAtMs, skipped: RUST_IS_SENDER, error: RUST_IS_SENDER };
 
     // LIVE: one raw send; nonce advanced locally on success.
     const t1 = performance.now();
@@ -446,6 +472,16 @@ export class FastSender {
     if (!this.ready) return { live: this.live, signMs: 0, error: 'sender not ready' };
     const t0 = performance.now();
     const queueMs = t0 - calledAt;
+    // Rust is the sender: sign (same work, for timings) but take NO nonce and
+    // never broadcast.
+    if (this.live && this.rustIsSender) {
+      const tx: ethers.TransactionRequest = {
+        type: 2, chainId: this.chainId, nonce: this.nonce!, to, data, value: 0n,
+        gasLimit: this.currentGasLimit, maxFeePerGas: this.maxFeePerGas!, maxPriorityFeePerGas: 0n,
+      };
+      try { await this.wallet.signTransaction(tx); } catch { /* timing only */ }
+      return { live: true, signMs: performance.now() - t0, queueMs, signedAtMs: Date.now(), skipped: RUST_IS_SENDER, error: RUST_IS_SENDER };
+    }
     // Take the nonce NOW, synchronously, before any await: two fires can
     // never get the same one, and they get them in call order.
     let n = this.nonce!;
