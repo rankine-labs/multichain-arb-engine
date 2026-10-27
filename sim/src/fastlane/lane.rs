@@ -297,6 +297,8 @@ pub struct LaneHour {
     pub lane_us: Vec<u64>,
     pub drops_seen: u64,
     pub gas_notes: u64,
+    /// Copy-2 versions scanned (predicted copy off: standing gaps on copy 2).
+    pub confirmed: u64,
 }
 
 fn push_bounded(v: &mut Vec<u64>, x: u64) {
@@ -329,75 +331,53 @@ pub struct FireCore {
     pub safety: Safety,
 }
 
-pub struct Lane {
-    pub cfg: LaneCfg,
-    pub scanner: Scanner,
-    pub core: Mutex<FireCore>,
+/// What one fire did, for the caller's counting.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FiredWhat {
+    /// A safety gate said no (its code).
+    Blocked(&'static str),
+    /// Signed but never left us (live: stale in the queue / not written).
+    NotLeft,
+    /// The gun refused before signing / sending (why, first 60 characters).
+    GunRefused(String),
+    /// Sent (live) / would send (practice): its send-log seq and the time
+    /// from the feed message to the bytes handed over / ready (us).
+    Written { seq: u64, hand_us: u64 },
+}
+
+/// One fire's result (Firer::fire).
+#[derive(Clone, Debug)]
+pub struct Fired {
+    pub res: FireResult,
+    pub what: FiredWhat,
+    /// The send record could not be written (the trade itself went on).
+    pub log_error: bool,
+}
+
+/// THE ONE WAY TO FIRE (integration; fire-first from Rust, Oct 27): safety
+/// -> gun -> send log -> safety record, under ONE lock (review M5). The
+/// standing-gap lane (Lane::fire_one) and the fire-first trigger thread
+/// (fastlane/trigger.rs) both fire through clones of the same parts, so
+/// every gate, the rate limit, the pool hold, the one-sender rule and
+/// "practice never broadcasts" (Gun::broadcasting) hold for both alike.
+#[derive(Clone)]
+pub struct Firer {
+    pub core: Arc<Mutex<FireCore>>,
     pub gate: Arc<SafetyGate>,
     pub gun: Arc<Gun>,
     pub log: Arc<SendsLog>,
     pub book: Arc<ReplyBook>,
-    pub practice: Practice,
-    pub hour: LaneHour,
-    pub last_hour: Option<LaneHour>,
-    last_drops: Option<u64>,
-    last_gas: u64,
-    pub started: Instant,
 }
 
-impl Lane {
-    /// Assemble from parts (tests and `start`).
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(cfg: LaneCfg, scanner: Scanner, safety: Safety, gate: Arc<SafetyGate>, gun: Arc<Gun>, log: Arc<SendsLog>, book: Arc<ReplyBook>, practice: Practice) -> Lane {
-        Lane {
-            cfg,
-            scanner,
-            core: Mutex::new(FireCore { safety }),
-            gate,
-            gun,
-            log,
-            book,
-            practice,
-            hour: LaneHour::default(),
-            last_hour: None,
-            last_drops: None,
-            last_gas: 0,
-            started: Instant::now(),
-        }
-    }
-
-    /// One new predicted tip: scan, then fire the best (see file header).
-    pub fn on_tip(&mut self, tip: &AheadTip) -> Vec<FireResult> {
-        let t0 = Instant::now();
-        self.hour.tips += 1;
-        if tip.built_at.elapsed() > Duration::from_millis(self.cfg.tip_max_age_ms) {
-            self.hour.tips_old += 1;
-            return Vec::new();
-        }
-        let view = tip.view();
-        // The tip's own set (built once by the predicted copy, not per tip here).
-        let input = BlockInput { view: &view, ctx: &tip.ctx, block: tip.block, kind: ViewKind::Predicted, changed: &tip.changed_pools, unsure: &tip.unsure_set, snap: Some(&tip.snap) };
-        let rep = self.scanner.scan(&input);
-        self.hour.opps += rep.opps.len() as u64;
-        let mut out = Vec::new();
-        for o in rep.opps.iter().take(self.cfg.fires_per_block) {
-            out.push(self.fire_one(o, tip.feed_at, tip.apply_us));
-        }
-        let lane_us = t0.elapsed().as_micros() as u64;
-        push_bounded(&mut self.hour.block_us, tip.apply_us + lane_us);
-        push_bounded(&mut self.hour.lane_us, lane_us);
-        out
-    }
-
-    /// Safety -> fire -> log -> record, under ONE lock (review M5).
-    pub fn fire_one(&mut self, o: &Opportunity, feed_at: Instant, apply_us: u64) -> FireResult {
+impl Firer {
+    /// Safety -> fire -> log -> record (see the file header).
+    pub fn fire(&self, o: &Opportunity, feed_at: Instant, apply_us: u64) -> Fired {
         let mut res = FireResult { blocked: None, record: None, written: None, live: false };
         let inp = match to_safety_input(o) {
             Ok(x) => x,
             Err(_) => {
-                *self.hour.blocked.entry("bad_size").or_default() += 1;
                 res.blocked = Some("bad_size");
-                return res;
+                return Fired { res, what: FiredWhat::Blocked("bad_size"), log_error: false };
             }
         };
         let call = to_call_input(o);
@@ -409,9 +389,8 @@ impl Lane {
         core.safety.state.refresh(now, true);
         self.gate.sync_from(&core.safety);
         if let Err(r) = core.safety.check(&inp, now) {
-            *self.hour.blocked.entry(r.code).or_default() += 1;
             res.blocked = Some(r.code);
-            return res;
+            return Fired { res, what: FiredWhat::Blocked(r.code), log_error: false };
         }
         // H3: THE answer to "is this a real send" (checked again by fire()
         // right before the bytes go out; a flip then is a refusal, never a
@@ -422,7 +401,6 @@ impl Lane {
         let fire_at = Instant::now();
         let rec = self.gun.fire(&call);
         self.gate.reset();
-        self.hour.fired += 1;
         // Feed message -> handed to the socket (live) / would hand (practice:
         // the signed bytes are ready right at the end of fire()).
         let to_fire = fire_at.saturating_duration_since(feed_at).as_micros() as u64;
@@ -430,17 +408,12 @@ impl Lane {
         let on_chain_maybe = rec.send_status.is_some_and(|s| s.maybe_on_chain());
         let write = if live { on_chain_maybe && rec.hash.is_some() } else { rec.signed };
         if !write {
-            if rec.signed && live {
-                // Signed but never left us (stale in the queue / not written):
-                // nothing to track; the route may be handed out again (M4).
-                self.hour.not_left += 1;
-                self.scanner.forget(&o.rid);
-            } else {
-                *self.hour.gun_refused.entry(rec.why.clone().unwrap_or_else(|| "?".into()).chars().take(60).collect()).or_default() += 1;
-                self.scanner.forget(&o.rid);
-            }
+            // Signed but never left us (stale in the queue / not written), or
+            // refused by the gun: nothing to track; the route may be handed
+            // out again (M4).
+            let what = if rec.signed && live { FiredWhat::NotLeft } else { FiredWhat::GunRefused(rec.why.clone().unwrap_or_else(|| "?".into()).chars().take(60).collect()) };
             res.record = Some(rec);
-            return res;
+            return Fired { res, what, log_error: false };
         }
         let mut t = BTreeMap::new();
         t.insert("apply".to_string(), apply_us);
@@ -484,28 +457,176 @@ impl Lane {
         // never land before this record with a lower seq.
         let (seq, wrote) = self.log.append_new(&sr);
         sr.seq = seq;
-        if wrote.is_err() {
-            // Trading goes on (bridge.rs); the seq stays used, Safety keeps
-            // holding the gas until Node's ack passes it.
-            self.hour.log_errors += 1;
-        }
+        // Trading goes on if the record could not be written (bridge.rs); the
+        // seq stays used, Safety keeps holding the gas until Node's ack passes it.
+        let log_error = wrote.is_err();
         core.safety.record_send(&inp, now, seq);
         drop(core);
         if live {
-            self.hour.live_sent += 1;
             if let Some(h) = &rec.hash {
                 if let Some(early) = self.book.note(h, seq, &o.rid) {
                     write_reply(&self.log, &self.book, &early, seq, o.rid.clone());
                 }
             }
-        } else {
-            self.hour.would_send += 1;
-            self.practice.note_would_send(o, seq, hand_us);
         }
-        push_bounded(&mut self.hour.latency_us, hand_us);
         res.record = Some(rec);
         res.written = Some(sr);
-        res
+        Fired { res, what: FiredWhat::Written { seq, hand_us }, log_error }
+    }
+}
+
+pub struct Lane {
+    pub cfg: LaneCfg,
+    pub scanner: Scanner,
+    pub core: Arc<Mutex<FireCore>>,
+    pub gate: Arc<SafetyGate>,
+    pub gun: Arc<Gun>,
+    pub log: Arc<SendsLog>,
+    pub book: Arc<ReplyBook>,
+    pub practice: Practice,
+    pub hour: LaneHour,
+    pub last_hour: Option<LaneHour>,
+    last_drops: Option<u64>,
+    last_gas: u64,
+    /// Newest copy-2 block scanned (on_confirmed_version).
+    last_confirmed: Option<u64>,
+    pub started: Instant,
+}
+
+impl Lane {
+    /// Assemble from parts (tests and `start`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(cfg: LaneCfg, scanner: Scanner, safety: Safety, gate: Arc<SafetyGate>, gun: Arc<Gun>, log: Arc<SendsLog>, book: Arc<ReplyBook>, practice: Practice) -> Lane {
+        Lane {
+            cfg,
+            scanner,
+            core: Arc::new(Mutex::new(FireCore { safety })),
+            gate,
+            gun,
+            log,
+            book,
+            practice,
+            hour: LaneHour::default(),
+            last_hour: None,
+            last_drops: None,
+            last_gas: 0,
+            last_confirmed: None,
+            started: Instant::now(),
+        }
+    }
+
+    /// One new predicted tip: scan, then fire the best (see file header).
+    pub fn on_tip(&mut self, tip: &AheadTip) -> Vec<FireResult> {
+        let t0 = Instant::now();
+        self.hour.tips += 1;
+        if tip.built_at.elapsed() > Duration::from_millis(self.cfg.tip_max_age_ms) {
+            self.hour.tips_old += 1;
+            return Vec::new();
+        }
+        let view = tip.view();
+        // The tip's own set (built once by the predicted copy, not per tip here).
+        let input = BlockInput { view: &view, ctx: &tip.ctx, block: tip.block, kind: ViewKind::Predicted, changed: &tip.changed_pools, unsure: &tip.unsure_set, snap: Some(&tip.snap) };
+        let rep = self.scanner.scan(&input);
+        self.hour.opps += rep.opps.len() as u64;
+        let mut out = Vec::new();
+        for o in rep.opps.iter().take(self.cfg.fires_per_block) {
+            out.push(self.fire_one(o, tip.feed_at, tip.apply_us));
+        }
+        let lane_us = t0.elapsed().as_micros() as u64;
+        push_bounded(&mut self.hour.block_us, tip.apply_us + lane_us);
+        push_bounded(&mut self.hour.lane_us, lane_us);
+        out
+    }
+
+    /// STANDING GAPS ON COPY 2 (Oct 27, owner: "keep standing-gap scanning
+    /// (fixed routes) as complementary, on copy 2"; the predicted copy is
+    /// off by default). When copy 2 publishes a newer version, scan the
+    /// routes through the pools that block moved (plus the rolling sweep)
+    /// on that CONFIRMED state, then fire the best like a tip. Time is
+    /// counted from the moment copy 2 applied the block. Returns what fired.
+    pub fn on_confirmed_version(&mut self, c2: &crate::copy2::intake::Copy2Handle) -> Vec<FireResult> {
+        let pv = c2.sh.published.view();
+        let Some(head) = pv.head().cloned() else { return Vec::new() };
+        if self.last_confirmed.is_some_and(|b| head.block <= b) {
+            return Vec::new();
+        }
+        self.last_confirmed = Some(head.block);
+        let Some(ctx) = head.ctx.clone() else { return Vec::new() };
+        let t0 = Instant::now();
+        self.hour.confirmed += 1;
+        if head.applied.elapsed() > Duration::from_millis(self.cfg.tip_max_age_ms) {
+            self.hour.tips_old += 1;
+            return Vec::new();
+        }
+        let core = c2.core_for(Some(&pv));
+        let changed_slots: Vec<(revm::primitives::Address, revm::primitives::U256)> = head.diff.accounts.iter().flat_map(|(a, d)| d.storage.keys().map(move |s| (*a, *s))).collect();
+        let changed: Vec<String> = c2.pools_changed_with(&core, &changed_slots, &[]).into_iter().map(|m| m.key.to_ascii_lowercase()).collect();
+        let view = crate::state::snap::View::new(head.snap.clone());
+        let unsure = std::collections::HashSet::new();
+        let input = BlockInput { view: &view, ctx: &ctx, block: head.block, kind: ViewKind::Confirmed, changed: &changed, unsure: &unsure, snap: Some(&head.snap) };
+        let rep = self.scanner.scan(&input);
+        self.hour.opps += rep.opps.len() as u64;
+        let mut out = Vec::new();
+        for o in rep.opps.iter().take(self.cfg.fires_per_block) {
+            out.push(self.fire_one(o, head.applied, 0));
+        }
+        let lane_us = t0.elapsed().as_micros() as u64;
+        push_bounded(&mut self.hour.block_us, lane_us);
+        push_bounded(&mut self.hour.lane_us, lane_us);
+        out
+    }
+
+    /// Fire-first would-sends handed over by the trigger thread: scored by
+    /// practice like the lane's own (same re-check on confirmed blocks).
+    pub fn take_trigger_would_sends(&mut self) {
+        for (o, seq, hand_us) in trigger_inbox_drain() {
+            self.practice.note_would_send(&o, seq, hand_us);
+        }
+    }
+
+    /// Safety -> fire -> log -> record, under ONE lock (review M5), then
+    /// this lane's own counting (hour, scanner hand-out, practice scoring).
+    pub fn fire_one(&mut self, o: &Opportunity, feed_at: Instant, apply_us: u64) -> FireResult {
+        let d = self.firer().fire(o, feed_at, apply_us);
+        self.note_fire(o, &d);
+        d.res
+    }
+
+    /// The shared firing parts (the fast lane's trigger thread fires with
+    /// the very same ones: one fire lock, one gate, one gun, one send log).
+    pub fn firer(&self) -> Firer {
+        Firer { core: self.core.clone(), gate: self.gate.clone(), gun: self.gun.clone(), log: self.log.clone(), book: self.book.clone() }
+    }
+
+    /// This lane's counting after one fire (scanner routes handed out again,
+    /// practice scoring, hour counters). `d` from Firer::fire.
+    pub fn note_fire(&mut self, o: &Opportunity, d: &Fired) {
+        match &d.what {
+            FiredWhat::Blocked(code) => *self.hour.blocked.entry(code).or_default() += 1,
+            FiredWhat::NotLeft => {
+                self.hour.fired += 1;
+                self.hour.not_left += 1;
+                self.scanner.forget(&o.rid);
+            }
+            FiredWhat::GunRefused(why) => {
+                self.hour.fired += 1;
+                *self.hour.gun_refused.entry(why.clone()).or_default() += 1;
+                self.scanner.forget(&o.rid);
+            }
+            FiredWhat::Written { seq, hand_us } => {
+                self.hour.fired += 1;
+                if d.res.live {
+                    self.hour.live_sent += 1;
+                } else {
+                    self.hour.would_send += 1;
+                    self.practice.note_would_send(o, *seq, *hand_us);
+                }
+                if d.log_error {
+                    self.hour.log_errors += 1;
+                }
+                push_bounded(&mut self.hour.latency_us, *hand_us);
+            }
+        }
     }
 
     /// Between tips: Node's feedback (H4), routes to hand out again (M4),
@@ -590,7 +711,7 @@ impl Lane {
             },
             "safety": {"killed": killed, "state": state, "blockedThisHour": h.blocked},
             "lane": {
-                "tips": h.tips, "tipsOld": h.tips_old, "opps": h.opps, "fired": h.fired, "wouldSend": h.would_send, "liveSent": h.live_sent,
+                "tips": h.tips, "confirmedScanned": h.confirmed, "tipsOld": h.tips_old, "opps": h.opps, "fired": h.fired, "wouldSend": h.would_send, "liveSent": h.live_sent,
                 "notLeft": h.not_left, "gunRefused": h.gun_refused, "logErrors": h.log_errors, "dropsSeen": h.drops_seen,
                 "feedToHandUs": pctl(&h.latency_us), "blockUs": pctl(&h.block_us), "laneUs": pctl(&h.lane_us),
                 "blockUsNote": "blockUs = predicted-copy apply + lane; laneUs = lane only (scan + fire)",
@@ -643,13 +764,68 @@ pub fn live_block_reason() -> Option<&'static str> {
 struct Rt {
     status: Mutex<Value>,
     last_practice: Mutex<Value>,
+    /// The firing parts, for the fire-first trigger thread (fastlane/trigger.rs).
+    firer: Firer,
+    /// Copy 2's practice scoring needs the lane's view of the mode.
+    mode: Mode,
 }
 
 static RT: std::sync::OnceLock<Rt> = std::sync::OnceLock::new();
 static TIPS_SEEN: AtomicU64 = AtomicU64::new(0);
 
-/// Start the fast lane loop (copy 2 mode). Nothing when FASTLANE=off or the
-/// predicted copy is not running. Returns true when started.
+/// The running lane's firing parts (None = the fast lane is off).
+pub fn global_firer() -> Option<Firer> {
+    RT.get().map(|rt| rt.firer.clone())
+}
+
+/// The running fast lane's mode (None = off).
+pub fn global_mode() -> Option<Mode> {
+    RT.get().map(|rt| rt.mode)
+}
+
+// Copy 2 published a version: wakes the lane (standing gaps on copy 2).
+static CONFIRMED: (Mutex<u64>, std::sync::Condvar) = (Mutex::new(0), std::sync::Condvar::new());
+
+/// copy2/intake.rs: a version was published (cheap; nothing when off).
+pub fn confirmed_hook() {
+    if RT.get().is_none() {
+        return;
+    }
+    let mut g = CONFIRMED.0.lock().unwrap_or_else(|e| e.into_inner());
+    *g += 1;
+    CONFIRMED.1.notify_all();
+}
+
+/// Wait (at most `timeout`) for a copy-2 version newer than number `after`.
+fn wait_confirmed(after: u64, timeout: Duration) -> u64 {
+    let g = CONFIRMED.0.lock().unwrap_or_else(|e| e.into_inner());
+    let (g, _) = CONFIRMED.1.wait_timeout_while(g, timeout, |n| *n <= after).unwrap_or_else(|e| e.into_inner());
+    *g
+}
+
+// Fire-first would-sends (trigger thread) waiting for practice scoring.
+type Inbox = Mutex<Vec<(Opportunity, u64, u64)>>;
+static TRIG_INBOX: Inbox = Mutex::new(Vec::new());
+
+/// fastlane/trigger.rs: a fire-first would-send to score (bounded: 256).
+pub fn trigger_inbox_push(o: Opportunity, seq: u64, hand_us: u64) {
+    let mut g = TRIG_INBOX.lock().unwrap_or_else(|e| e.into_inner());
+    if g.len() < 256 {
+        g.push((o, seq, hand_us));
+    }
+}
+
+fn trigger_inbox_drain() -> Vec<(Opportunity, u64, u64)> {
+    std::mem::take(&mut *TRIG_INBOX.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
+/// Start the fast lane loop (copy 2 mode). Nothing when FASTLANE=off.
+/// Returns true when started. Fire-first from Rust (Oct 27): the lane no
+/// longer needs the predicted copy. With it (FASTLANE_AHEAD=on) the
+/// scanner runs on each predicted tip as before; without it (the default)
+/// the scanner runs on each new copy-2 version (standing gaps on copy 2),
+/// and the fire-first trigger thread (fastlane/trigger.rs, started by the
+/// server once its context exists) fires through this lane's parts.
 pub fn start(c2: crate::copy2::intake::Copy2Handle) -> bool {
     let fm = FastlaneMode::from_env();
     if fm.mode == Mode::Off || RT.get().is_some() {
@@ -676,28 +852,46 @@ pub fn start(c2: crate::copy2::intake::Copy2Handle) -> bool {
     let scanner = Scanner::new(ScanConfig::from_env(), Box::new(super::scan::TableSource::global()), Box::new(super::c2runner::Copy2Runner::new(c2.clone())));
     let practice = Practice::new(PracticeCfg::from_lookup(&get), c2.sh.cfg.l2_offset);
     let mut lane = Lane::new(LaneCfg::from_lookup(&get), scanner, safety, gate, gun, log, book, practice);
-    if RT.set(Rt { status: Mutex::new(json!({})), last_practice: Mutex::new(Value::Null) }).is_err() {
+    if RT.set(Rt { status: Mutex::new(json!({})), last_practice: Mutex::new(Value::Null), firer: lane.firer(), mode: fm.mode }).is_err() {
         return false;
     }
-    eprintln!("[fastlane] loop ON: {}; gun {} ({})", fm.describe(), lane.gun.mode().as_str(), lane.gun.why_not_broadcasting().unwrap_or("broadcasting"));
+    let ahead_on = crate::copy2::ahead::status_json().is_some();
+    eprintln!(
+        "[fastlane] loop ON: {}; gun {} ({}); standing gaps scanned on {}",
+        fm.describe(),
+        lane.gun.mode().as_str(),
+        lane.gun.why_not_broadcasting().unwrap_or("broadcasting"),
+        if ahead_on { "the predicted copy (FASTLANE_AHEAD=on)" } else { "copy 2's confirmed versions" }
+    );
     std::thread::Builder::new()
         .name("arbsim-fastlane".into())
         .spawn(move || {
             // H-1: lower CPU priority (FASTLANE_NICE, default 10).
             super::mode::lower_this_thread_from_env("arbsim-fastlane");
             let mut last = 0u64;
+            let mut seen_confirmed = 0u64;
             let mut hour = Instant::now();
             let mut status_at = Instant::now();
             loop {
-                if let Some((n, tip)) = crate::copy2::ahead::wait_tip(last, Duration::from_millis(250)) {
-                    if n > last + 1 && last > 0 {
-                        // Tips we never got to (the loop was busy): counted.
-                        lane.hour.tips_old += n - last - 1;
+                if ahead_on {
+                    if let Some((n, tip)) = crate::copy2::ahead::wait_tip(last, Duration::from_millis(250)) {
+                        if n > last + 1 && last > 0 {
+                            // Tips we never got to (the loop was busy): counted.
+                            lane.hour.tips_old += n - last - 1;
+                        }
+                        last = n;
+                        TIPS_SEEN.store(n, Ordering::Relaxed);
+                        lane.on_tip(&tip);
                     }
-                    last = n;
-                    TIPS_SEEN.store(n, Ordering::Relaxed);
-                    lane.on_tip(&tip);
+                } else {
+                    let n = wait_confirmed(seen_confirmed, Duration::from_millis(250));
+                    if n > seen_confirmed {
+                        seen_confirmed = n;
+                        TIPS_SEEN.store(n, Ordering::Relaxed);
+                        lane.on_confirmed_version(&c2);
+                    }
                 }
+                lane.take_trigger_would_sends();
                 lane.tick();
                 lane.score_confirmed(&c2);
                 if status_at.elapsed() >= Duration::from_secs(1) {
@@ -711,6 +905,7 @@ pub fn start(c2: crate::copy2::intake::Copy2Handle) -> bool {
                     for l in lane.take_hour() {
                         eprintln!("{l}");
                     }
+                    eprintln!("{}", super::trigger::take_hour());
                     if let Some(rt) = RT.get() {
                         *rt.last_practice.lock().unwrap_or_else(|e| e.into_inner()) = lane.practice.last_hour_json();
                     }
@@ -727,5 +922,7 @@ pub fn status_json() -> Option<Value> {
     let mut v = rt.status.lock().unwrap_or_else(|e| e.into_inner()).clone();
     v["lastHourPractice"] = rt.last_practice.lock().unwrap_or_else(|e| e.into_inner()).clone();
     v["tipsSeen"] = json!(TIPS_SEEN.load(Ordering::Relaxed));
+    // Fire-first from Rust (fastlane/trigger.rs): its own section.
+    v["trigger"] = super::trigger::status_json();
     Some(v)
 }

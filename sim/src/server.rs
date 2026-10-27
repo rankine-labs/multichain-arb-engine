@@ -36,7 +36,7 @@ use crate::copy2::checkview::{fee_nonzero, high_offset, C2View};
 use crate::copy2::intake::Copy2Handle;
 use crate::jobq::{is_fast, JobQueue};
 use crate::node::env_u64;
-use crate::proto::{bad_request, parse_at, parse_missing, parse_missing_keys, parse_missing_pre, parse_warm, read_msg, unknown, write_msg};
+use crate::proto::{bad_request, parse_at, parse_missing, parse_missing_keys, parse_missing_pre, parse_warm, read_msg_keep, unknown, write_msg, Incoming};
 use crate::state::fill::FillQueue;
 use crate::state::mirror::{At, Shared, Stats};
 use crate::state::pinned::{PinnedCache, PinnedErr};
@@ -96,6 +96,10 @@ pub fn bind(path: &str) -> std::io::Result<UnixListener> {
 
 /// Serve connections on an already-bound listener (tests use this).
 pub fn run(ctx: Arc<Ctx>, listener: UnixListener) -> std::io::Result<()> {
+    // FAST LANE TRIGGER (fastlane/trigger.rs): fire-first decided inside
+    // Rust. Starts only when the fast lane loop runs (FASTLANE practice /
+    // live) and FASTLANE_TRIGGER is not off; otherwise nothing happens.
+    crate::fastlane::trigger::start(ctx.clone());
     // Workers: more than the machine's CPU cores does not help (they only
     // take turns on the same cores); the default stays 2 (the live server
     // has 2 vCPUs). Trigger-entry work skips the line instead (jobq.rs).
@@ -115,7 +119,11 @@ pub fn run(ctx: Arc<Ctx>, listener: UnixListener) -> std::io::Result<()> {
         let ctx = ctx.clone();
         let jobs = jobs.clone();
         std::thread::Builder::new().name("arbsim-conn".into()).spawn(move || {
-            let _ = connection(ctx, stream, jobs);
+            // ZERO-ROUTES FIX (Oct 27): a connection that ends with an error
+            // is said out loud (it used to be dropped without a word).
+            if let Err(e) = connection(ctx, stream, jobs) {
+                eprintln!("[arbsim] socket: connection closed with an error: {e}");
+            }
         })?;
     }
     Ok(())
@@ -149,7 +157,17 @@ fn send(out: &Writer, v: &Value) {
 fn connection(ctx: Arc<Ctx>, stream: UnixStream, jobs: Arc<JobQueue<Job>>) -> std::io::Result<()> {
     let out: Writer = Arc::new(Mutex::new(BufWriter::new(stream.try_clone()?)));
     let mut r = std::io::BufReader::new(stream);
-    while let Some(body) = read_msg(&mut r)? {
+    loop {
+        let body = match read_msg_keep(&mut r)? {
+            None => break,
+            Some(Incoming::Msg(b)) => b,
+            Some(Incoming::TooLarge(n)) => {
+                // ZERO-ROUTES FIX (Oct 27): thrown away, counted, logged; the
+                // connection stays open for everything else.
+                note_too_large(n);
+                continue;
+            }
+        };
         let t_read = Instant::now();
         let req: Value = match serde_json::from_slice(&body) {
             Ok(v) => v,
@@ -193,6 +211,7 @@ fn connection(ctx: Arc<Ctx>, stream: UnixStream, jobs: Arc<JobQueue<Job>>) -> st
         // Trigger-entry candidate table (check/entry.rs): stored right here
         // (no worker needed, it only swaps the table), answered at once.
         if ty == Some("trig_table") {
+            crate::check::entry::note_table_bytes(body.len() as u64);
             send(&out, &crate::check::entry::apply_table(&id, &req));
             continue;
         }
@@ -203,6 +222,26 @@ fn connection(ctx: Arc<Ctx>, stream: UnixStream, jobs: Arc<JobQueue<Job>>) -> st
         }
     }
     Ok(())
+}
+
+/// Over-size messages thrown away (status "socket"); the newest size.
+static TOO_LARGE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static TOO_LARGE_LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn note_too_large(n: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let k = TOO_LARGE.fetch_add(1, Relaxed) + 1;
+    TOO_LARGE_LAST.store(n as u64, Relaxed);
+    // The first one and then every 100th: never floods the log.
+    if k == 1 || k % 100 == 0 {
+        eprintln!("[arbsim] socket: a message of {n} bytes is over the {} byte limit: dropped ({k} so far; the connection stays open)", crate::proto::MAX_MESSAGE);
+    }
+}
+
+/// Status "socket": over-size messages dropped so far.
+pub fn socket_status_json() -> Value {
+    use std::sync::atomic::Ordering::Relaxed;
+    json!({ "tooLarge": TOO_LARGE.load(Relaxed), "tooLargeLastBytes": TOO_LARGE_LAST.load(Relaxed), "maxBytes": crate::proto::MAX_MESSAGE })
 }
 
 /// Answer one question (also used directly by tests).
@@ -233,6 +272,10 @@ pub fn handle_tm(ctx: &Ctx, req: &Value, tm: &mut Tm) -> Value {
                 }
             }
             s["feedStore"] = crate::check::feedstore::store().status_json();
+            // ZERO-ROUTES FIX (Oct 27): the candidate table as the sidecar
+            // holds it, and over-size socket messages dropped.
+            s["trigTable"] = crate::check::entry::status_json();
+            s["socket"] = socket_status_json();
             // FAST LANE A (copy2/ahead.rs): only when FASTLANE is on.
             if let Some(a) = crate::copy2::ahead::status_json() {
                 s["fastlaneAhead"] = a;
@@ -691,8 +734,41 @@ fn discover_fill_take(n: usize) -> bool {
 /// cut, tableGen, us, t}. No table yet: `table:"none"` (the bot then checks
 /// the old way). Each check's `a` is the very answer a `call` gives.
 fn trig_entry(ctx: &Ctx, id: &Value, req: &Value, t0: Instant, tm: &mut Tm) -> Value {
+    trig_entry_run(ctx, id, req, t0, tm).0
+}
+
+/// One picked candidate of a trigger and its check's answer (fast lane:
+/// fastlane/trigger.rs turns the good one into a trade for the gun).
+#[derive(Clone, Debug)]
+pub struct CheckedRow {
+    pub row: crate::check::entry::Row,
+    /// The very answer a `call` gives for it (None = the row had no check).
+    pub answer: Option<Value>,
+    /// The bot would send on it (entry.rs good_enough at the floor asked).
+    pub good: bool,
+}
+
+/// What one `trig_entry` question did, besides its JSON answer.
+#[derive(Clone, Debug, Default)]
+pub struct EntryRun {
+    /// Moved pools discovery named (lowercase).
+    pub pools: Vec<String>,
+    /// The table generation and its long-code list (None = no table).
+    pub table: Option<(u64, Arc<Vec<String>>)>,
+    pub found: usize,
+    pub checked: Vec<CheckedRow>,
+    pub stopped: bool,
+    pub cut: bool,
+}
+
+/// TRIGGER-ENTRY ONE TRIP, also used by the fast lane's own trigger path
+/// (fastlane/trigger.rs: the very same discovery, picking and checks, run
+/// inside Rust the moment a feed message arrives). The JSON answer is
+/// exactly what `trig_entry` always answered; EntryRun (None when discovery
+/// gave nothing to check) carries the picked rows with their answers.
+pub fn trig_entry_run(ctx: &Ctx, id: &Value, req: &Value, t0: Instant, tm: &mut Tm) -> (Value, Option<EntryRun>) {
     let at = req.get("at").cloned().unwrap_or_else(|| json!({ "after": "head" }));
-    let Some(feed) = req.get("feed").filter(|f| f.is_object()) else { return bad_request(id, "trig_entry needs feed") };
+    let Some(feed) = req.get("feed").filter(|f| f.is_object()) else { return (bad_request(id, "trig_entry needs feed"), None) };
     // 1. Discover (its own timing; the queue wait is this job's).
     let mut dtm = Tm::default();
     let disc = trig_discover(ctx, id, &json!({ "id": id, "type": "trig_discover", "at": at, "feed": feed }), Instant::now(), &mut dtm);
@@ -704,20 +780,22 @@ fn trig_entry(ctx: &Ctx, id: &Value, req: &Value, t0: Instant, tm: &mut Tm) -> V
         o
     };
     if out["disc"].get("ok") != Some(&Value::Bool(true)) {
-        return finish(out, tm);
+        return (finish(out, tm), None);
     }
     let pools: Vec<String> = out["disc"].get("pools").and_then(|p| p.as_array()).map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_ascii_lowercase())).collect()).unwrap_or_default();
     let max_pools = req.get("maxPools").and_then(|m| m.as_u64()).unwrap_or(4) as usize;
     if pools.is_empty() || pools.len() > max_pools {
-        return finish(out, tm);
+        return (finish(out, tm), Some(EntryRun { pools, ..Default::default() }));
     }
     let limit = req.get("limit").and_then(|m| m.as_u64()).unwrap_or(6).min(32) as usize;
     let min_conf = req.get("minConf").and_then(|m| m.as_str()).unwrap_or("medium").to_string();
     let budget = req.get("budgetUs").and_then(|b| b.as_u64()).unwrap_or(200_000);
+    let mut run = EntryRun { pools: pools.clone(), ..Default::default() };
     let res = crate::check::entry::pick(&pools, limit).map(|(gen, codes, picked, found)| {
         let sel: Vec<Value> = picked.iter().map(|r| json!(r.e.clone())).collect();
         // 3. Check, best-ranked first.
         let (mut cands, mut stopped, mut cut) = (Vec::new(), false, false);
+        let mut checked = Vec::new();
         for (i, r) in picked.iter().enumerate() {
             if t0.elapsed().as_micros() as u64 >= budget {
                 cut = true;
@@ -725,6 +803,7 @@ fn trig_entry(ctx: &Ctx, id: &Value, req: &Value, t0: Instant, tm: &mut Tm) -> V
             }
             let Some(c) = &r.c else {
                 cands.push(json!({ "e": r.e, "a": null }));
+                checked.push(CheckedRow { row: r.clone(), answer: None, good: false });
                 continue;
             };
             let call = crate::check::entry::call_for(&codes, c, id, &at, feed, true);
@@ -732,25 +811,31 @@ fn trig_entry(ctx: &Ctx, id: &Value, req: &Value, t0: Instant, tm: &mut Tm) -> V
             let a = handle_tm(ctx, &call, &mut ctm);
             let good = crate::check::entry::good_enough(&a, c, &min_conf);
             cands.push(json!({ "e": r.e, "a": a }));
+            checked.push(CheckedRow { row: r.clone(), answer: Some(a), good });
             if good {
                 stopped = i + 1 < picked.len();
                 break;
             }
         }
-        (gen, found, sel, cands, stopped, cut)
+        (gen, codes, found, sel, cands, stopped, cut, checked)
     });
     match res {
         None => out["table"] = json!("none"),
-        Some((gen, found, sel, cands, stopped, cut)) => {
+        Some((gen, codes, found, sel, cands, stopped, cut, checked)) => {
             out["tableGen"] = json!(gen);
             out["found"] = json!(found);
             out["sel"] = json!(sel);
             out["cands"] = json!(cands);
             out["stopped"] = json!(stopped);
             out["cut"] = json!(cut);
+            run.table = Some((gen, codes));
+            run.found = found;
+            run.checked = checked;
+            run.stopped = stopped;
+            run.cut = cut;
         }
     }
-    finish(out, tm)
+    (finish(out, tm), Some(run))
 }
 
 /// How much a trigger-first check may assume (ARBSIM_TRIG_CALL_TRUST).

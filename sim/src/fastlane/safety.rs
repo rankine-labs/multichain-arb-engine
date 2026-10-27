@@ -84,6 +84,10 @@ pub struct SafetyInput {
     pub lender: Option<String>,
     /// When the opportunity was found (feed message applied + scan).
     pub found_at: Instant,
+    /// A fire-first trade (fastlane/trigger.rs): the scoreboard's
+    /// "trig_first" pause applies (Node's pausedWhy('trig_first')), not the
+    /// standing-gap one. false = as before.
+    pub trig: bool,
 }
 
 impl SafetyInput {
@@ -91,7 +95,7 @@ impl SafetyInput {
     #[allow(clippy::too_many_arguments)]
     pub fn new(block: u64, label: String, token_in: String, tokens: Vec<String>, pools: Vec<String>, amount_in: u128, size_usd: f64, expected_net_usd: f64, gas_usd: f64, lender: Option<String>, found_at: Instant) -> SafetyInput {
         let kind = if pools.len() > 2 { RouteKind::Loop } else { RouteKind::Pair };
-        SafetyInput { block, label, kind, token_in, tokens, pools, amount_in, size_usd, expected_net_usd, gas_usd, lender, found_at }
+        SafetyInput { block, label, kind, token_in, tokens, pools, amount_in, size_usd, expected_net_usd, gas_usd, lender, found_at, trig: false }
     }
 }
 
@@ -420,6 +424,13 @@ impl Safety {
         }
         // 15. Scoreboard pauses (shadowMain.ts:2745 pausedWhy; loops 2010).
         match o.kind {
+            // Fire-first pairs: the "trig_first" pause (Node's own fire-first
+            // sends check pausedWhy('trig_first'), trigEntry.ts gates).
+            RouteKind::Pair if o.trig => {
+                if let Some(p) = &st.raw.paused.trig {
+                    return Err(BlockReason::new("scoreboard", format!("scoreboard: fire-first paused ({p})")));
+                }
+            }
             RouteKind::Pair => {
                 if let Some(p) = &st.raw.paused.gap {
                     return Err(BlockReason::new("scoreboard", format!("scoreboard: gap paused ({p})")));

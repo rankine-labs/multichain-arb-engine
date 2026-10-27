@@ -244,6 +244,10 @@ impl FeedStore {
         // FAST LANE A (copy2/ahead.rs): the predicted copy applies each new
         // message. Does nothing unless FASTLANE is practice / live.
         crate::copy2::ahead::feed_hook(&added);
+        // FAST LANE TRIGGER (fastlane/trigger.rs): fire-first decided inside
+        // Rust the moment the message is here. Nothing unless FASTLANE is
+        // practice / live and the trigger path runs.
+        crate::fastlane::trigger::feed_hook(&added);
         // Decode (recover senders) in the background, so questions find
         // them ready. Bounded queue; when full, the question decodes itself.
         for b in &added {
@@ -300,6 +304,42 @@ impl FeedStore {
         }
         self.stats.resolved.fetch_add(1, Relaxed);
         Ok(out)
+    }
+
+    /// The newest sequence number held (None = empty).
+    pub fn newest(&self) -> Option<u64> {
+        self.msgs.read().unwrap_or_else(|e| e.into_inner()).keys().next_back().copied()
+    }
+
+    /// FAST LANE TRIGGER (fastlane/trigger.rs): the names ([sequence number,
+    /// transaction count]) of the held messages `from..=to`, oldest first,
+    /// the same names the bot's questions carry (`feed.refs`). Stops at the
+    /// first one not held (a gap): the plan then answers feed_gap itself if
+    /// it needed more, exactly as for the bot.
+    pub fn refs_range(&self, from: u64, to: u64) -> Vec<(u64, usize)> {
+        let g = self.msgs.read().unwrap_or_else(|e| e.into_inner());
+        let mut out = Vec::new();
+        let mut want = from;
+        for (seq, m) in g.range(from..=to) {
+            if *seq != want {
+                // A gap before `seq`: keep only the newest unbroken run.
+                out.clear();
+            }
+            if m.bad.is_some() {
+                // (never named: the bot would send it inline and get bad_request)
+                out.clear();
+                want = seq + 1;
+                continue;
+            }
+            out.push((*seq, m.txs.len()));
+            want = seq + 1;
+        }
+        out
+    }
+
+    /// One held message (None = not held).
+    pub fn get(&self, seq: u64) -> Option<Arc<BinMsg>> {
+        self.msgs.read().unwrap_or_else(|e| e.into_inner()).get(&seq).cloned()
     }
 
     pub fn len(&self) -> usize {

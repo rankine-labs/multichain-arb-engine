@@ -3142,6 +3142,9 @@ impl Intake {
         // FAST LANE A (copy2/ahead.rs): rebase the predicted copy on this
         // version. Does nothing unless FASTLANE is practice / live.
         super::ahead::confirmed_hook();
+        // FAST LANE standing-gap scan on copy 2 (fastlane/lane.rs, when the
+        // predicted copy is off): wake the lane for this version. No-op when off.
+        crate::fastlane::lane::confirmed_hook();
     }
 
     /// Which followed pools a log is an event of.

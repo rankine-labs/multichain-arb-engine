@@ -82,6 +82,73 @@ fn store() -> &'static RwLock<Option<Table>> {
     T.get_or_init(|| RwLock::new(None))
 }
 
+// ---------------------------------------------------------------------------
+// ZERO-ROUTES FIX (Oct 27): what the table looks like, visible in status.
+//
+// Plain English: live, the Rust scanner said "0 routes" and nothing showed
+// whether a table had ever arrived. Every `trig_table` message is now
+// counted here (taken / refused and why), with the rows it holds: rows the
+// scanner and the fast-lane trigger can use (an entry id AND a check), rows
+// with the bot's price facts, and the size of the last message. Status
+// "trigTable" (server.rs). Counting only: nothing decides on these numbers.
+// ---------------------------------------------------------------------------
+
+#[derive(Default)]
+struct TableStats {
+    taken: u64,
+    refused: u64,
+    last_refused: Option<String>,
+    last_bytes: u64,
+    last_at: Option<std::time::Instant>,
+    full: u64,
+    partial: u64,
+}
+
+fn stats() -> &'static std::sync::Mutex<TableStats> {
+    static S: OnceLock<std::sync::Mutex<TableStats>> = OnceLock::new();
+    S.get_or_init(|| std::sync::Mutex::new(TableStats::default()))
+}
+
+/// The socket reader saw a table message of `bytes` bytes (server.rs).
+pub fn note_table_bytes(bytes: u64) {
+    stats().lock().unwrap_or_else(|e| e.into_inner()).last_bytes = bytes;
+}
+
+/// Status "trigTable": did a table arrive, how many rows can be used.
+pub fn status_json() -> Value {
+    let (pools, rows, usable, facts, gen) = with_table(|t| match t {
+        None => (0usize, 0usize, 0usize, 0usize, None),
+        Some(t) => {
+            let rows: usize = t.pools.values().map(|r| r.len()).sum();
+            let usable = t.pools.values().flatten().filter(|r| r.e.is_some() && r.c.is_some()).count();
+            let facts = t.pools.values().flatten().filter(|r| r.e.is_some() && r.c.is_some() && r.f.is_some()).count();
+            (t.pools.len(), rows, usable, facts, Some(t.gen))
+        }
+    });
+    let s = stats().lock().unwrap_or_else(|e| e.into_inner());
+    json!({
+        "held": gen.is_some(), "gen": gen, "pools": pools, "rows": rows, "usableRows": usable, "factRows": facts,
+        "taken": s.taken, "full": s.full, "partial": s.partial, "refused": s.refused, "lastRefused": s.last_refused,
+        "lastBytes": s.last_bytes, "lastAgoMs": s.last_at.map(|a| a.elapsed().as_millis() as u64),
+    })
+}
+
+fn note_result(ok: bool, full: bool, why: Option<&str>) {
+    let mut s = stats().lock().unwrap_or_else(|e| e.into_inner());
+    if ok {
+        s.taken += 1;
+        if full {
+            s.full += 1;
+        } else {
+            s.partial += 1;
+        }
+        s.last_at = Some(std::time::Instant::now());
+    } else {
+        s.refused += 1;
+        s.last_refused = why.map(|w| w.chars().take(120).collect());
+    }
+}
+
 /// What a trigger needs from the table, copied out (so the table's lock is
 /// never held while checks run): generation, codes, picked rows, routes found.
 pub fn pick(moved: &[String], limit: usize) -> Option<(u64, Arc<Vec<String>>, Vec<Row>, usize)> {
@@ -153,6 +220,14 @@ pub fn parse_rows(v: &Value) -> Result<Vec<Row>, String> {
 /// merge into the table of generation `base` (a different one = refused:
 /// the bot then sends a full table). Answer {ok, gen, pools}.
 pub fn apply_table(id: &Value, req: &Value) -> Value {
+    let a = apply_table_inner(id, req);
+    let full = req.get("full").and_then(|f| f.as_bool()).unwrap_or(true);
+    let ok = a.get("ok") == Some(&Value::Bool(true));
+    note_result(ok, full, a.get("detail").and_then(|d| d.as_str()));
+    a
+}
+
+fn apply_table_inner(id: &Value, req: &Value) -> Value {
     let gen = req.get("gen").and_then(|g| g.as_u64()).unwrap_or(0);
     let full = req.get("full").and_then(|f| f.as_bool()).unwrap_or(true);
     let Some(pools) = req.get("pools").and_then(|p| p.as_object()) else {
@@ -287,9 +362,72 @@ pub fn good_enough(answer: &Value, c: &Value, min_conf: &str) -> bool {
     })
 }
 
+/// FAST LANE TRIGGER (fastlane/trigger.rs): the best size of an answer the
+/// stop rule accepted, read with EXACTLY good_enough's rules (main size from
+/// the contract's InsufficientProfit(profit, min) refusal, ladder sizes from
+/// "profit" rows; profit > 0 and not above the size). Returns (amount,
+/// profit, gas used) of the biggest profit (same coin, same gas estimate:
+/// the biggest profit is the best net), None = no profitable size.
+pub fn best_profit(answer: &Value, c: &Value) -> Option<(U256, U256, u64)> {
+    if answer.get("ok") != Some(&Value::Bool(true)) {
+        return None;
+    }
+    let ok_row = |amount: U256, profit: U256| !profit.is_zero() && profit <= amount;
+    let gas_of = |v: Option<&Value>| v.and_then(|g| g.as_str()).and_then(|g| parse_u256(g).ok()).map(|g| g.saturating_to::<u64>()).unwrap_or(0);
+    let mut best: Option<(U256, U256, u64)> = None;
+    let mut take = |a: U256, p: U256, g: u64| {
+        if ok_row(a, p) && best.as_ref().is_none_or(|b| p > b.1) {
+            best = Some((a, p, g));
+        }
+    };
+    if let (Some(r), Some(amt)) = (answer.get("results").and_then(|r| r.get(0)), c.get("amt").and_then(|a| a.as_str()).and_then(|a| parse_u256(a).ok())) {
+        let failed = r.get("success") == Some(&Value::Bool(false)) && r.get("halt").is_none_or(|h| h.is_null());
+        if failed {
+            if let Some(out) = r.get("output").and_then(|o| o.as_str()).and_then(|o| parse_bytes(o).ok()) {
+                if out.len() == 68 && out[..4] == INSUFFICIENT_PROFIT_SELECTOR {
+                    take(amt, U256::from_be_slice(&out[4..36]), gas_of(r.get("gasUsed")));
+                }
+            }
+        }
+    }
+    for row in answer.get("sizes").and_then(|s| s.as_array()).into_iter().flatten() {
+        if row.get("status").and_then(|s| s.as_str()) != Some("profit") {
+            continue;
+        }
+        if let (Some(a), Some(p)) = (row.get("amount").and_then(|a| a.as_str()).and_then(|a| parse_u256(a).ok()), row.get("profit").and_then(|p| p.as_str()).and_then(|p| parse_u256(p).ok())) {
+            take(a, p, gas_of(row.get("gasUsed")));
+        }
+    }
+    best
+}
+
+/// The answer's confidence ("high" when it says none, like good_enough).
+pub fn answer_conf(answer: &Value) -> &str {
+    answer.get("trig").and_then(|t| t.get("conf")).and_then(|x| x.as_str()).unwrap_or("high")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn best_profit_reads_like_the_stop_rule() {
+        let mut out = vec![0u8; 68];
+        out[..4].copy_from_slice(&INSUFFICIENT_PROFIT_SELECTOR);
+        out[35] = 50; // main size profit 50
+        let hex = |b: &[u8]| format!("0x{}", b.iter().map(|x| format!("{x:02x}")).collect::<String>());
+        let c = json!({"stop": "0x32", "amt": "0x3e8"});
+        let a = json!({"ok": true, "results": [{"success": false, "output": hex(&out), "gasUsed": "0x10"}],
+            "sizes": [{"amount": "0x64", "status": "profit", "profit": "0x40", "gasUsed": "0x20"}, {"amount": "0x10", "status": "profit", "profit": "0x40"}, {"amount": "0x200", "status": "loss", "profit": "0x0"}]});
+        // 0x40 (64) at 100 beats 50 at 1000; the row with profit above its size is bad data.
+        assert_eq!(best_profit(&a, &c), Some((U256::from(100u64), U256::from(64u64), 32)));
+        assert!(good_enough(&a, &c, "medium"));
+        assert_eq!(best_profit(&json!({"ok": false}), &c), None);
+        let only_main = json!({"ok": true, "results": [{"success": false, "output": hex(&out), "gasUsed": "0x10"}]});
+        assert_eq!(best_profit(&only_main, &c), Some((U256::from(1000u64), U256::from(50u64), 16)));
+        assert_eq!(answer_conf(&json!({"trig": {"conf": "low"}})), "low");
+        assert_eq!(answer_conf(&json!({})), "high");
+    }
 
     fn row(rid: &str, held: bool, s: Option<f64>, e: Option<&str>) -> Row {
         Row { rid: rid.into(), held, score: s, e: e.map(|x| x.into()), c: None, f: None }

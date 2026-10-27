@@ -14,6 +14,10 @@
 //     gun                   = C (calldata, signing, nonce, sending)
 //     lane, practice        = integration (the per-block loop that joins
 //                              them, and practice-mode scoring)
+//     trigger               = fire-first decided and fired inside Rust
+//                              (Oct 27): the bot's one-trip check run the
+//                              moment a feed message arrives, its good
+//                              answer straight to the same safety + gun
 //   FASTLANE=off (the default) runs none of it.
 // ============================================================================
 pub mod bridge;
@@ -25,4 +29,5 @@ pub mod mode;
 pub mod practice;
 pub mod safety;
 pub mod scan;
+pub mod trigger;
 pub mod types;

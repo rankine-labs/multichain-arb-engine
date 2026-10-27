@@ -59,7 +59,7 @@ pub fn to_call_input(o: &Opportunity) -> CallInput {
 pub fn to_safety_input(o: &Opportunity) -> Result<SafetyInput, String> {
     let lc = |a: &revm::primitives::Address| format!("{a:#x}");
     let amount_in = u128::try_from(o.amount_in).map_err(|_| "amount too big for the safety gate".to_string())?;
-    Ok(SafetyInput::new(
+    let mut s = SafetyInput::new(
         o.block,
         o.route_label.clone(),
         lc(&o.token_in),
@@ -71,7 +71,10 @@ pub fn to_safety_input(o: &Opportunity) -> Result<SafetyInput, String> {
         o.gas_usd,
         o.flash.lender().map(|a| lc(&a)),
         o.found_at,
-    ))
+    );
+    // Fire-first trades answer to the scoreboard's fire-first pause.
+    s.trig = o.view == super::types::ViewKind::Trigger;
+    Ok(s)
 }
 
 #[cfg(test)]

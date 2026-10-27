@@ -2205,7 +2205,20 @@ static RT: OnceLock<Runtime> = OnceLock::new();
 /// Start the predicted copy for this sidecar (copy 2 mode). Does nothing
 /// and returns false when FASTLANE is off (the default).
 pub fn start(c2: super::intake::Copy2Handle) -> bool {
+    // Oct 27 (owner: "predicted copy: do NOT expand it ... default it off"):
+    // 5.9% agreement on 300 real blocks, unsure on nearly every pool. It now
+    // runs only when asked for: FASTLANE_AHEAD=on (with FASTLANE practice /
+    // live). Off = no thread, no memory; the fast lane scans copy 2 instead.
+    if !ahead_wanted(std::env::var("FASTLANE_AHEAD").ok().as_deref()) {
+        return false;
+    }
     start_with(mode(), c2, AheadCfg::from_lookup(|k| std::env::var(k).ok(), 0))
+}
+
+/// FASTLANE_AHEAD: "on" / "1" / "true" = run the predicted copy; anything
+/// else (unset included) = off (the default since Oct 27).
+pub fn ahead_wanted(v: Option<&str>) -> bool {
+    matches!(v.map(|x| x.trim().to_ascii_lowercase()).as_deref(), Some("on" | "1" | "true" | "yes"))
 }
 
 /// `start` with the mode given (tests: Off must start nothing).
