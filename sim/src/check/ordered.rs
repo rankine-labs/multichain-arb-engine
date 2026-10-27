@@ -1135,8 +1135,9 @@ pub fn run_ordered(
 
 /// What one round asks for next.
 enum Next {
-    /// Finished: the answer.
-    Done(OrderedOut),
+    /// Finished: the answer (+ the replayed transactions' changes, when
+    /// asked for: `run_ordered_keep`).
+    Done(OrderedOut, Option<KeptDiff>),
     /// Start again, giving these missing sender values ASSUMED_FUNDS.
     Patch(Vec<(Address, U256)>),
     /// Start again without this transaction (message seq, index in it);
@@ -1176,6 +1177,50 @@ pub fn run_ordered_sizes(
     assume: &Assume,
     ladder: Option<&Ladder>,
 ) -> Result<OrderedOut, CheckUnknown> {
+    run_ordered_inner(view, plan, overrides, calls, prov, strict_call, assume, ladder, false).map(|(o, _)| o)
+}
+
+/// What the replayed feed transactions changed, as values (fast lane,
+/// copy2/ahead.rs: the predicted copy keeps these). Plain English:
+///   `diff`    every account / storage value they left changed (gas fees
+///             are not charged, so each sender's ETH balance is marked
+///             "not exact"; a sender we only pretended to know is
+///             forgotten, never stored)
+///   `forget`  values that were only ASSUMED (sender_funds: a sender's coin
+///             balance / allowance given a made-up large amount): whatever
+///             the run left there is not a real number, so the keeper must
+///             make them unknown again (never zero, never the made-up one)
+#[derive(Clone, Debug, Default)]
+pub struct KeptDiff {
+    pub diff: crate::state::StateDiff,
+    pub forget: Vec<(Address, U256)>,
+}
+
+/// `run_ordered_with` that also hands back what the replayed transactions
+/// changed (KeptDiff). Same rules, same answers; only for callers that keep
+/// the result (copy2/ahead.rs). Nothing is written to `view`.
+pub fn run_ordered_keep(
+    view: &dyn StateRead,
+    plan: &OrderedPlan,
+    prov: &dyn Provenance,
+    assume: &Assume,
+) -> Result<(OrderedOut, KeptDiff), CheckUnknown> {
+    let (o, k) = run_ordered_inner(view, plan, &Overrides::none(), &[], prov, true, assume, None, true)?;
+    Ok((o, k.unwrap_or_default()))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_ordered_inner(
+    view: &dyn StateRead,
+    plan: &OrderedPlan,
+    overrides: &Overrides,
+    calls: &[CallReq],
+    prov: &dyn Provenance,
+    strict_call: bool,
+    assume: &Assume,
+    ladder: Option<&Ladder>,
+    keep: bool,
+) -> Result<(OrderedOut, Option<KeptDiff>), CheckUnknown> {
     let mut patched: Vec<(Address, U256)> = Vec::new();
     let mut skip: HashMap<(u64, usize), bool> = HashMap::new();
     // The hash inputs the runs write down (record_hashes), one round at a time.
@@ -1189,7 +1234,7 @@ pub fn run_ordered_sizes(
         crate::timing::ph_count("rounds", 1);
         rec.borrow_mut().clear();
         keys_rec.borrow_mut().clear();
-        let round = match one_round(view, plan, overrides, calls, prov, strict_call, assume, &patched, &skip, ladder, rec_ref, keys_ref) {
+        let round = match one_round(view, plan, overrides, calls, prov, strict_call, assume, &patched, &skip, ladder, rec_ref, keys_ref, keep) {
             Ok(n) => n,
             Err(mut u) => {
                 // A miss (Oct 25): add the recorded inputs that name the
@@ -1215,11 +1260,11 @@ pub fn run_ordered_sizes(
             }
         };
         match round {
-            Next::Done(mut out) => {
+            Next::Done(mut out, kept) => {
                 out.assumed.sender_funds |= !patched.is_empty();
                 out.assumed.skipped_related = skip.values().filter(|r| **r).count();
                 out.assumed.skipped_unrelated = skip.len() - out.assumed.skipped_related;
-                return Ok(out);
+                return Ok((out, kept));
             }
             Next::Patch(more) => {
                 let before = patched.len();
@@ -1255,6 +1300,7 @@ fn one_round(
     ladder: Option<&Ladder>,
     rec: Option<&std::cell::RefCell<HashMap<U256, (U256, U256)>>>,
     keys_rec: Option<&std::cell::RefCell<super::moved::KeyMap>>,
+    keep: bool,
 ) -> Result<Next, CheckUnknown> {
     let mut db = CheckDb::new(view, overrides, true);
     // Assumed sender values (sender_funds), served before anything else.
@@ -1372,6 +1418,22 @@ fn one_round(
         .flat_map(|(a, acc)| acc.storage.iter().filter(|(_, v)| v.is_changed()).map(move |(k, _)| (*a, *k)))
         .collect();
     changed.sort();
+    // KEEP (copy2/ahead.rs): the replayed transactions' changes as values.
+    // Taken here, before our calls run (there are none for a keeper).
+    let kept = keep.then(|| {
+        let senders: Vec<Address> = evm.inspector.senders.iter().copied().collect();
+        let pretended: Vec<Address> = evm.inspector.pretended.iter().copied().collect();
+        let inexact: Vec<Address> = senders.iter().filter(|a| !pretended.contains(a)).copied().collect();
+        let mut diff = crate::state::diff::from_evm_state(&evm.ctx.journaled_state.state, &inexact, &pretended);
+        let mut forget: Vec<(Address, U256)> = patched.to_vec();
+        forget.sort();
+        for (a, s) in &forget {
+            if let Some(d) = diff.accounts.get_mut(a) {
+                d.storage.remove(s);
+            }
+        }
+        KeptDiff { diff, forget }
+    });
     // 2. Our pretend-state must not have changed how they ran, and every
     //    copy value they used must be exact at the snapshot's block (or,
     //    best effort, labelled: a sender's value = sender_funds, a fill =
@@ -1460,7 +1522,7 @@ fn one_round(
         }
     }
     crate::timing::ph_add("ladder", t_ladder.elapsed().as_micros() as u64);
-    Ok(Next::Done(OrderedOut { replayed, results, assumed, changed, hashes, ladder: rows }))
+    Ok(Next::Done(OrderedOut { replayed, results, assumed, changed, hashes, ladder: rows }, kept))
 }
 
 /// A replayed transaction needed values we don't hold: assume its sender's,

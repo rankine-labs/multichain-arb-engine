@@ -241,6 +241,9 @@ impl FeedStore {
             self.stats.puts.fetch_add(1, Relaxed);
             added.push(b);
         }
+        // FAST LANE A (copy2/ahead.rs): the predicted copy applies each new
+        // message. Does nothing unless FASTLANE is practice / live.
+        crate::copy2::ahead::feed_hook(&added);
         // Decode (recover senders) in the background, so questions find
         // them ready. Bounded queue; when full, the question decodes itself.
         for b in &added {

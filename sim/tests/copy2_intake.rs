@@ -3275,3 +3275,50 @@ fn v4_blind_far_fills_are_paced_per_job_and_deferred_not_refused() {
     assert_eq!(r.head_slot(pm, w_ours), Lookup::Known(u(0x8000)));
     assert_eq!(counter(&r, "pm_far_kept"), 2);
 }
+
+// ---------------------------------------------------------------------------
+// FAST LANE A (copy2/ahead.rs): the predicted copy against copy 2's real
+// intake. The feed message for block 102 (a "swap" writing the V2 pool's
+// reserves) is predicted from the confirmed version 101; then copy 2 gets
+// block 102's own reports and publishes 102. The prediction must agree,
+// value for value, and the rebase must leave nothing predicted behind.
+// ---------------------------------------------------------------------------
+#[test]
+fn fastlane_ahead_prediction_agrees_with_copy_2s_confirmed_block() {
+    use arbsim::copy2::ahead::{Ahead, AheadCfg, Confirmed, PoolSet};
+    // The V2 pool: 4-byte call = getter (slot 8); 32-byte call = "swap"
+    // (writes the word into slot 8, the reserves word).
+    let code = vec![0x36, 0x60, 0x20, 0x14, 0x60, 0x12, 0x57, 0x60, 0x08, 0x54, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3, 0x5b, 0x60, 0x00, 0x35, 0x60, 0x08, 0x55, 0x00];
+    let (mut r, _ctx) = trig_world_code(code);
+    let confirmed = |r: &Rig| {
+        let v = r.sh.head().unwrap();
+        let prov: Arc<dyn arbsim::check::ordered::Provenance + Send + Sync> = Arc::new(r.h.provenance_at(v.block, &[]));
+        Confirmed { seq: v.seq, snap: v.snap.clone(), ctx: v.ctx.clone(), diff: v.diff.clone(), prov }
+    };
+    let fp = arbsim::check::moved::FollowedPool { key: format!("{:#x}", a(V2P)), address: a(V2P), v4_id: None };
+    let mut ah = Ahead::new(AheadCfg::default());
+    ah.set_pools(Arc::new(PoolSet::build(&[(fp, a(COIN0), a(COIN1))], Default::default())));
+    ah.on_confirmed(confirmed(&r), &|_| None);
+    assert_eq!(ah.base_seq(), Some(101));
+    // Block 102 on the feed, same block time as 101 (62), so a V2 pair's
+    // price accumulators don't move (this stand-in pool has none): the
+    // swap leaves reserves 1200 / 3340.
+    let word = u(1200) | (u(3340) << 112usize) | (u(62) << 224usize);
+    let swap = signed(0, a(V2P), word.to_be_bytes::<32>().to_vec());
+    let wm = arbsim::check::ordered::WireFeedMsg { seq: 102, ts: 62, l1: 9000, txs: vec![hexb(&swap)], complete: true, why: None };
+    ah.on_feed_message(Arc::new(arbsim::check::feedstore::BinMsg::from_wire(&wm, true)));
+    let t = ah.tip().expect("predicted 102");
+    assert_eq!((t.block, t.changed_pools.clone()), (102, vec![format!("{:#x}", a(V2P))]));
+    assert_eq!(t.view().storage(a(V2P), u(8)), Lookup::Known(word), "predicted BEFORE the reports arrive");
+    // Now the block's reports (what the pool emitted) reach copy 2.
+    r.send(msg(102, 62, vec![
+        v2_sync(1200, 3340, 102, 1, 2),
+        transfer(a(COIN0), a(USER), a(V2P), 100, 102, 1, 0),
+        transfer(a(COIN1), a(V2P), a(USER), 300, 102, 1, 1),
+        lg(a(V2P), vec![topics().v2_swap, topic_of(a(USER)), topic_of(a(USER))], data(&[u(100), u(0), u(0), u(300)]), 102, 1, 3),
+    ]));
+    assert_eq!(r.head_slot(a(V2P), u(8)), Lookup::Known(word));
+    ah.on_confirmed(confirmed(&r), &|_| None);
+    assert_eq!((ah.total.agree, ah.total.disagree, ah.total.unsure), (1, 0, 0), "{}", ah.total.json());
+    assert_eq!((ah.base_seq(), ah.depth()), (Some(102), 0));
+}

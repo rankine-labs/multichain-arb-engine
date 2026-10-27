@@ -3109,6 +3109,9 @@ impl Intake {
         self.c2.last_block.store(block, Ordering::Relaxed);
         self.c2.head_block.store(block, Ordering::Relaxed);
         self.sh.notify();
+        // FAST LANE A (copy2/ahead.rs): rebase the predicted copy on this
+        // version. Does nothing unless FASTLANE is practice / live.
+        super::ahead::confirmed_hook();
     }
 
     /// Which followed pools a log is an event of.
