@@ -270,6 +270,45 @@ fn apply_table_inner(id: &Value, req: &Value) -> Value {
     json!({ "id": id, "ok": true, "gen": t.gen, "pools": t.pools.len() })
 }
 
+/// The table held right now as ONE full `trig_table` message (None = no
+/// table). Fast lane capture (copy2/ahead_capture.rs) writes it next to a
+/// capture so `arbsim trig-replay` can pick and check candidates offline.
+pub fn table_message() -> Option<Value> {
+    with_table(|t| {
+        let t = t?;
+        let row = |r: &Row| json!({ "rid": r.rid, "h": r.held, "s": r.score, "e": r.e, "c": r.c.as_deref(), "f": r.f.as_deref() });
+        let pools: serde_json::Map<String, Value> = t.pools.iter().map(|(k, rows)| (k.clone(), Value::Array(rows.iter().map(row).collect()))).collect();
+        Some(json!({ "type": "trig_table", "gen": t.gen, "full": true, "codes": &*t.codes, "pools": pools }))
+    })
+}
+
+/// A table built from `trig_table` messages in order (a full one first,
+/// then parts), without touching the process-wide one (offline replay).
+pub fn table_from_messages(msgs: &[Value]) -> Result<Table, String> {
+    let mut t: Option<Table> = None;
+    for (i, m) in msgs.iter().enumerate() {
+        let full = m.get("full").and_then(|f| f.as_bool()).unwrap_or(true);
+        let pools = m.get("pools").and_then(|p| p.as_object()).ok_or(format!("message {i}: no pools"))?;
+        if full || t.is_none() {
+            t = Some(Table::default());
+        }
+        let tb = t.as_mut().expect("set above");
+        tb.gen = m.get("gen").and_then(|g| g.as_u64()).unwrap_or(0);
+        let codes: Vec<String> = m.get("codes").and_then(|c| c.as_array()).map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect()).unwrap_or_default();
+        if !codes.is_empty() || full {
+            tb.codes = Arc::new(codes);
+        }
+        for (k, v) in pools {
+            if v.is_null() {
+                tb.pools.remove(&k.to_ascii_lowercase());
+            } else {
+                tb.pools.insert(k.to_ascii_lowercase(), parse_rows(v).map_err(|e| format!("message {i} pool {k}: {e}"))?);
+            }
+        }
+    }
+    t.ok_or_else(|| "no table message".to_string())
+}
+
 /// PICKING (see the file header). Returns the picked rows (best first, only
 /// buildable ones) and how many routes were found before the cap.
 pub fn select<'a>(t: &'a Table, moved: &[String], limit: usize) -> (Vec<&'a Row>, usize) {

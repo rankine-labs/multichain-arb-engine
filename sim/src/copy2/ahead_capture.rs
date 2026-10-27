@@ -1288,6 +1288,18 @@ impl LiveCapture {
                 if !ok {
                     self.stop(a, "could not hand the start over to the writer");
                 }
+                // Fire-first replay (fastlane/trig_replay.rs): the bot's
+                // candidate table as it is now, next to the capture
+                // (<file>.table.json), so `arbsim trig-replay` can pick and
+                // check candidates offline. No table = no file (the replay
+                // then measures discovery only).
+                if let Some(t) = crate::check::entry::table_message() {
+                    let p = format!("{}.table.json", self.cfg.path);
+                    match std::fs::write(&p, t.to_string()) {
+                        Ok(()) => eprintln!("[arbsim] fastlane capture: candidate table written to {p}"),
+                        Err(e) => eprintln!("[arbsim] fastlane capture: could not write the candidate table ({e})"),
+                    }
+                }
             }
             Err(e) => eprintln!("[arbsim] fastlane capture: could not create the file ({e}); no capture"),
         }

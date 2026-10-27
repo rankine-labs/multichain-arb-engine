@@ -29,5 +29,6 @@ pub mod mode;
 pub mod practice;
 pub mod safety;
 pub mod scan;
+pub mod trig_replay;
 pub mod trigger;
 pub mod types;

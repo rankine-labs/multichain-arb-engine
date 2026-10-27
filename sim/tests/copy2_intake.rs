@@ -3432,16 +3432,21 @@ fn fl_table_row() -> Value {
     })
 }
 
+/// V2P for the fast-lane tests: a 32-byte call STORES the word in slot 8
+/// (the "swap"); any other call reverts with InsufficientProfit(reserve0,
+/// MAX), reserve0 = the low 112 bits of slot 8 (our contract's answer, with
+/// the "profit" read from the pool's own reserves).
+fn fl_pool_code() -> Vec<u8> {
+    check_util::hex("36 6020 14 6033 57 634e88422a 60e0 1b 6000 52 6008 54 6dffffffffffffffffffffffffffff 16 6004 52 6000 19 6024 52 6044 6000 fd 5b 6000 35 6008 55 00")
+}
+
 #[test]
 fn fastlane_trigger_fires_from_rust_without_waiting_for_reports() {
     use arbsim::fastlane::lane::FiredWhat;
     use arbsim::fastlane::trigger::{TrigCfg, TrigOutcome, Trigger};
     let _turn = FEED_STORE_TURN.lock().unwrap_or_else(|e| e.into_inner());
     arbsim::check::feedstore::store().clear();
-    // V2P: a 32-byte call STORES the word in slot 8 (the "swap"); any other
-    // call reverts with InsufficientProfit(slot 8, MAX) (our contract's answer).
-    let code = check_util::hex("36 6020 14 6023 57 634e88422a 60e0 1b 6000 52 6008 54 6004 52 6000 19 6024 52 6044 6000 fd 5b 6000 35 6008 55 00");
-    let (r, ctx) = trig_world_code(code);
+    let (r, ctx) = trig_world_code(fl_pool_code());
     assert_eq!(r.sh.head().unwrap().block, 101);
     // The bot's candidate table (what `trig_table` carries), V2P's routes.
     let k = format!("{:#x}", a(V2P));
@@ -3513,4 +3518,100 @@ fn fastlane_trigger_fires_from_rust_without_waiting_for_reports() {
     assert_eq!(out, vec![TrigOutcome::Skipped("plain_transfer"), TrigOutcome::NoPools], "{}", t.hour.json());
     arbsim::check::entry::clear_table();
     arbsim::check::feedstore::store().clear();
+}
+
+// STANDING GAPS ON COPY 2 (Oct 27): with the predicted copy off (the new
+// default) the fast lane scans the routes through the pools each NEW copy-2
+// version moved, on that confirmed state, and fires the best through the same
+// safety + gun. Block 101: our route earns 1,100 units ($0.0011, under the
+// minimum): nothing. Block 102's reports leave reserve0 at 2,000,000 ($2):
+// one practice would-send, nothing broadcast. The same version again: nothing.
+#[test]
+fn fastlane_lane_scans_copy_2s_confirmed_versions_when_the_predicted_copy_is_off() {
+    use arbsim::fastlane::lane::{Lane, LaneCfg};
+    use arbsim::fastlane::practice::{Practice, PracticeCfg};
+    use arbsim::fastlane::scan::{ScanConfig, Scanner, TableSource};
+    let (mut r, _ctx) = trig_world_code(fl_pool_code());
+    let k = format!("{:#x}", a(V2P));
+    let mut t = arbsim::check::entry::Table { gen: 1, ..Default::default() };
+    t.pools.insert(k.clone(), arbsim::check::entry::parse_rows(&json!([fl_table_row()])).unwrap());
+    let (firer, dir, hits) = fl_firer("lane", &[("FASTLANE", "practice")], None);
+    let get = |key: &str| (key == "FASTLANE_PRACTICE_FILE").then(|| dir.join("practice.jsonl").to_string_lossy().to_string());
+    let scanner = Scanner::new(ScanConfig { budget_us: 1_000_000, ..ScanConfig::default() }, Box::new(TableSource::owned(Arc::new(Mutex::new(t)))), Box::new(arbsim::fastlane::c2runner::Copy2Runner::new(r.h.clone())));
+    let safety = std::sync::Arc::try_unwrap(firer.core).ok().unwrap().into_inner().unwrap().safety;
+    let mut lane = Lane::new(LaneCfg { tip_max_age_ms: 5_000, ..LaneCfg::default() }, scanner, safety, firer.gate, firer.gun, firer.log, firer.book, Practice::new(PracticeCfg::from_lookup(&get), 0));
+    let fired = lane.on_confirmed_version(&r.h);
+    assert!(fired.is_empty(), "block 101: under the minimum: {fired:?}");
+    assert_eq!(lane.hour.confirmed, 1);
+    r.send(msg(102, 63, vec![
+        v2_sync(2_000_000, 3340, 102, 1, 2),
+        lg(a(V2P), vec![topics().v2_swap, topic_of(a(USER)), topic_of(a(USER))], data(&[u(100), u(0), u(0), u(300)]), 102, 1, 3),
+    ]));
+    assert_eq!(r.sh.head().unwrap().block, 102);
+    let fired = lane.on_confirmed_version(&r.h);
+    assert_eq!(fired.len(), 1, "{:?}", lane.status_json());
+    let w = fired[0].written.as_ref().expect("written");
+    assert_eq!((w.mode.as_str(), w.block), ("practice", 102));
+    assert!(!fired[0].live);
+    assert_eq!((lane.hour.would_send, lane.hour.live_sent), (1, 0));
+    assert!(lane.on_confirmed_version(&r.h).is_empty(), "the same version is scanned once");
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0, "practice never connects to the send endpoint");
+}
+
+// FIRE-FIRST OFFLINE REPLAY (`arbsim trig-replay`, fastlane/trig_replay.rs):
+// a recording in arrival order (copy-2 version 101, then feed message 102
+// with the "swap", then copy 2's version 102 once its reports came) played
+// through the Rust fire-first decision with no future information:
+//   - message 102 is judged on version 101 (copy lag 1 block),
+//   - discovery names V2P, the bot's table row is checked, the stop rule
+//     accepts it: one trade would reach the gun,
+//   - when version 102 arrives (later in the recording) the trade is
+//     re-checked at the end of block 102: still profitable;
+//   - without a table: discovery only (no candidates), same coverage.
+#[test]
+fn fastlane_trig_replay_plays_a_recording_in_arrival_order() {
+    use arbsim::copy2::ahead::AheadCfg;
+    use arbsim::copy2::ahead_capture::{CapEv, CapFile, ProvSets};
+    use arbsim::fastlane::trig_replay::{print_report, trig_replay, TrigReplayOpts};
+    use arbsim::fastlane::trigger::TrigCfg;
+    let (mut r, _ctx) = trig_world_code(fl_pool_code());
+    let version = |r: &Rig| {
+        let v = r.sh.head().unwrap();
+        CapEv::Confirmed { seq: v.seq, ctx: v.ctx.clone(), snap: v.snap.clone() }
+    };
+    let prov = |r: &Rig, b: u64| CapEv::Prov(Arc::new(ProvSets::from_copy2(&r.h.provenance_at(b, &[]))));
+    let fp = arbsim::check::moved::FollowedPool { key: format!("{:#x}", a(V2P)), address: a(V2P), v4_id: None };
+    let swap = signed(0, a(V2P), u(2_000_000).to_be_bytes::<32>().to_vec());
+    let plain = signed(1, a(V2P), vec![]);
+    let wm = arbsim::check::ordered::WireFeedMsg { seq: 102, ts: 62, l1: 9000, txs: vec![hexb(&plain), hexb(&swap)], complete: true, why: None };
+    let mut events = vec![
+        CapEv::Header { cfg: AheadCfg::default(), l2_offset: 0, live: "{}".into() },
+        CapEv::Pools { list: vec![(fp, a(COIN0), a(COIN1))], not_ready: vec![] },
+        prov(&r, 101),
+        version(&r),
+        CapEv::Feed(Arc::new(arbsim::check::feedstore::BinMsg::from_wire(&wm, true))),
+    ];
+    r.send(msg(102, 62, vec![
+        v2_sync(2_000_000, 3340, 102, 1, 2),
+        lg(a(V2P), vec![topics().v2_swap, topic_of(a(USER)), topic_of(a(USER))], data(&[u(100), u(0), u(0), u(300)]), 102, 1, 3),
+    ]));
+    events.push(prov(&r, 102));
+    events.push(version(&r));
+    events.push(CapEv::End { live: "{}".into(), why: "done".into() });
+    let cap = CapFile { events, complete: true, cut: None };
+    let table = arbsim::check::entry::table_from_messages(&[json!({"type": "trig_table", "gen": 1, "full": true, "codes": [], "pools": {format!("{:#x}", a(V2P)): [fl_table_row()]}})]).unwrap();
+    let cfg = TrigCfg::default();
+    let rep = trig_replay(&cap, Some(&table), &cfg, &TrigReplayOpts::default()).unwrap();
+    println!("{}", print_report(&rep));
+    assert_eq!(rep["copyLag"]["histogram"]["1"], json!(1), "{}", rep["copyLag"]);
+    assert_eq!((rep["coverage"]["txs"].clone(), rep["coverage"]["skipped"]["plain_transfer"].clone(), rep["coverage"]["asked"].clone()), (json!(2), json!(1), json!(1)), "{}", rep["coverage"]);
+    assert_eq!(rep["coverage"]["discovery"]["movedOurPools"], json!(1), "{}", rep["coverage"]);
+    let k = &rep["candidates"];
+    assert_eq!((k["routesChecked"].clone(), k["good"].clone(), k["wouldReachGun"].clone()), (json!(1), json!(1), json!(1)), "{k}");
+    assert_eq!(k["recheckAtBlockEnd"]["stillProfitable"], json!(1), "{k}");
+    assert!((rep["wouldFireSamples"][0]["netUsd"].as_f64().unwrap() - 1.95).abs() < 1e-9);
+    // Without the table: discovery only.
+    let rep = trig_replay(&cap, None, &cfg, &TrigReplayOpts::default()).unwrap();
+    assert_eq!((rep["coverage"]["discovery"]["movedOurPools"].clone(), rep["candidates"]["routesChecked"].clone()), (json!(1), json!(0)));
 }
