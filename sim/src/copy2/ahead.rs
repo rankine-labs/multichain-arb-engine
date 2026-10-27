@@ -826,7 +826,14 @@ impl AheadStats {
     }
 
     pub fn json(&self) -> Value {
-        let mut t = self.apply_us.clone();
+        self.json_with(true)
+    }
+
+    /// `times` false = without the apply-time percentiles (no copy + sort of
+    /// up to 20,000 samples; the once-a-second status uses it for the
+    /// since-start totals, practice fixes).
+    pub fn json_with(&self, times: bool) -> Value {
+        let mut t = if times { self.apply_us.clone() } else { Vec::new() };
         json!({
             "msgs": self.msgs, "applied": self.applied, "lateMsgs": self.late_msgs,
             "txsRun": self.txs_run, "txsSkipped": self.txs_skipped, "txsFailed": self.txs_failed,
@@ -840,7 +847,7 @@ impl AheadStats {
             "missedFilter": self.missed_filter, "missedRan": self.missed_ran, "notFromTx": self.not_from_tx,
             "agreementPct": self.agreement_pct(),
             "stopped": self.stopped.iter().map(|(k, v)| (k.to_string(), json!(v))).collect::<serde_json::Map<String, Value>>(),
-            "applyUs": crate::timing::pct_of(&mut t),
+            "applyUs": if times { crate::timing::pct_of(&mut t) } else { Value::Null },
             "samples": self.samples,
         })
     }
@@ -1158,20 +1165,23 @@ impl Ahead {
         let mut all: Vec<&String> = conf_moved.iter().chain(e.changed_cum.iter()).collect();
         all.sort();
         all.dedup();
-        let mut res: Vec<(String, &'static str)> = Vec::new();
+        // (pool, kind, the transaction copy 2 says moved it, for samples)
+        let mut res: Vec<(String, &'static str, Option<B256>)> = Vec::new();
         for k in all {
             if e.unsure_cum.contains(k) {
-                res.push((k.clone(), "unsure"));
+                res.push((k.clone(), "unsure", None));
                 continue;
             }
             let Some(place) = pools.places.get(k) else { continue };
             let same = same_state(*place, &e.snap, &c.snap);
+            let mut tx = None;
             let kind = match (same, conf_moved.contains(k), e.changed_cum.contains(k)) {
                 (true, _, _) => "agree",
                 (false, true, false) => {
                     // Practice fixes: WHY did we miss it? Copy 2's reports
                     // say which transaction moved it; find it in this message.
                     let by = e.fates.iter().find(|(h, _)| moved_by_tx(h).is_some_and(|p| p.iter().any(|x| x.eq_ignore_ascii_case(k))));
+                    tx = by.map(|(h, _)| *h);
                     match by {
                         None => "notFromTx",
                         Some((_, Fate::Skipped)) => "missedFilter",
@@ -1181,10 +1191,10 @@ impl Ahead {
                 (false, false, true) => "phantom",
                 (false, _, _) => "value",
             };
-            res.push((k.clone(), kind));
+            res.push((k.clone(), kind, tx));
         }
         let block = c.seq + self.cfg.l2_offset;
-        for (k, kind) in res {
+        for (k, kind, tx) in res {
             match kind {
                 "agree" => self.count(|s| s.agree += 1),
                 "unsure" => self.count(|s| s.unsure += 1),
@@ -1208,7 +1218,11 @@ impl Ahead {
                         }
                     });
                     if self.hour.samples.len() < MAX_SAMPLES {
-                        self.hour.samples.push(json!({ "pool": k, "block": block, "kind": kind }));
+                        let mut sm = json!({ "pool": k, "block": block, "kind": kind });
+                        if let Some(h) = tx {
+                            sm["tx"] = json!(format!("{h:#x}"));
+                        }
+                        self.hour.samples.push(sm);
                     }
                 }
             }
@@ -1836,7 +1850,7 @@ fn status_of(a: &Ahead) -> Value {
         "tip": tip.as_ref().map(|t| json!({"seq": t.seq, "block": t.block, "changed": t.changed_pools.len(), "unsure": t.unsure_pools.len(), "applyUs": t.apply_us, "ageMs": t.built_at.elapsed().as_millis() as u64})),
         "stopped": a.stopped().map(|(s, w)| json!({"seq": s, "why": w})),
         "touchers": a.touchers.len(),
-        "hour": a.hour.json(), "total": a.total.json(),
+        "hour": a.hour.json(), "total": a.total.json_with(false),
     })
 }
 

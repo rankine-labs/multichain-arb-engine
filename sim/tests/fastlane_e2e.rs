@@ -752,3 +752,47 @@ fn practice_scoring_keeps_to_its_budget() {
     assert_eq!(est_gain("gone", false, 1.0, Some(-0.05), 0.05), -0.05);
     assert_eq!(est_gain("unsure", true, 1.0, None, 0.05), 0.0);
 }
+
+/// Practice fixes (Oct 27), task 2: with NO routes (the live symptom) the
+/// lane's own work per tip (scan, status bookkeeping, between-tips tick)
+/// stays far under 1 ms, also with ~1,800 followed pools and a big unsure
+/// list. Live "blockUs" p50 5.2 ms was the predicted copy's apply time added
+/// in; the lane now reports its own time apart ("laneUs").
+#[test]
+fn lane_per_tip_cost_with_no_routes_is_tiny() {
+    const N: u64 = 1_800;
+    let pa = |i: u64| addr(0x20_000 + i);
+    let mut s = Snapshot::default();
+    for i in 0..N {
+        put(&mut s, pa(i), pool_code(), &[(0, 0)]);
+    }
+    let fp: Vec<_> = (0..N).map(|i| (FollowedPool { key: key(pa(i)), address: pa(i), v4_id: None }, Address::ZERO, Address::ZERO)).collect();
+    // Half the pools "not ready" in copy 2: a 900-key unsure list on every tip.
+    let not_ready: HashSet<String> = (0..N / 2).map(|i| key(pa(i))).collect();
+    let mut a = Ahead::new(AheadCfg::default());
+    a.set_pools(Arc::new(PoolSet::build(&fp, not_ready)));
+    a.on_confirmed(Confirmed { seq: 10, snap: Arc::new(s), ctx: Some(ctx_at(10)), diff: Arc::new(StateDiff::default()), prov: Arc::new(AllExact) }, &|_| None);
+    let mut r = rig("notable", &[("FASTLANE", "practice")], Some(node_state(false)));
+    r.lane.scanner = Scanner::new(ScanConfig::default(), Box::new(TableSource::owned(Arc::new(Mutex::new(Table::default())))), Box::new(PlainRunner));
+    let mut lane_us = Vec::new();
+    for b in 0..300u64 {
+        a.on_feed_message(msg(11 + b, &[stx(b, pa(N - 1 - (b % 100)), 1)]));
+        let tip = a.tip().expect("tip");
+        assert!(tip.unsure_pools.len() >= 900);
+        let t0 = Instant::now();
+        r.lane.on_tip(&tip);
+        r.lane.tick();
+        lane_us.push(t0.elapsed().as_micros() as u64);
+        if b % 8 == 7 {
+            let snap = (*tip.snap).clone();
+            a.on_confirmed(Confirmed { seq: tip.seq, snap: Arc::new(snap), ctx: Some(tip.ctx.clone()), diff: Arc::new(StateDiff::default()), prov: Arc::new(AllExact) }, &|_| None);
+        }
+    }
+    lane_us.sort();
+    let (p50, p90, max) = (lane_us[lane_us.len() / 2], lane_us[lane_us.len() * 9 / 10], lane_us[lane_us.len() - 1]);
+    let st = r.lane.status_json();
+    eprintln!("TEST NUMBERS ONLY (this machine): lane per tip with no routes, {N} pools, 900 unsure: p50 {p50} us p90 {p90} us max {max} us; status laneUs {}", st["lane"]["laneUs"]);
+    assert_eq!(r.lane.scanner.routes(), 0);
+    assert!(st["lane"]["laneUs"]["p90"].as_u64().is_some(), "the lane's own time is reported apart");
+    assert!(p90 < 1_000, "lane per tip p90 {p90} us (target well under 1 ms)");
+}
