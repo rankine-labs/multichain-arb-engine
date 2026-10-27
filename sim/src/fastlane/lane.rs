@@ -570,7 +570,12 @@ impl Lane {
                 json!({"tip": a.get("tip"), "stopped": a.get("stopped"), "agreementPct": p.agreement_pct(), "unsurePct": p.unsure_pct(), "unpredictedPct": p.unpredicted_pct(), "stoppedPct": p.stopped_pct(), "overBudget": p.over_budget,
                     // Practice fixes: the counts behind the %s (agreementPct is per POOL
                     // compared, agree / (agree + disagree); null = nothing compared).
-                    "agree": p.agree, "disagree": p.disagree, "unsure": p.unsure, "compared": p.compared, "unpredicted": p.unpredicted})
+                    "agree": p.agree, "disagree": p.disagree, "unsure": p.unsure, "compared": p.compared, "unpredicted": p.unpredicted,
+                    // Accuracy fixes (Oct 27): this hour's disagreements by cause
+                    // and the newest samples (full ones: fastlaneAhead.hour / .total).
+                    "why": a.get("hour").map(|h| json!({"missedFilter": h["missedFilter"], "missedRan": h["missedRan"], "missedReverted": h["missedReverted"], "missedFailed": h["missedFailed"], "missedOffRoute": h["missedOffRoute"], "phantom": h["phantom"], "value": h["valueDiff"], "staleBase": h["staleBase"], "baseLate": h["baseLate"], "notFromTx": h["notFromTx"], "confGone": h["confGone"]})),
+                    "newestSamples": a.get("total").and_then(|t| t["samples"].as_array()).map(|v| v.iter().rev().take(3).cloned().collect::<Vec<_>>()),
+                    "capture": a.get("capture")})
             }),
             "copy2Runs": super::c2runner::stats_json(),
             "scan": {"routes": self.scanner.routes(), "hour": super::scan::status_json()},

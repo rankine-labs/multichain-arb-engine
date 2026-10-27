@@ -592,11 +592,11 @@ export class TrigEntry {
     this.log = deps.log ?? ((m) => console.log(m));
     this.lagNow = deps.lag ?? (() => loopLag.now());
     this.ours = { isOurTx: deps.isOurTx, addresses: new Set(deps.ourAddresses.map((a) => a.toLowerCase())) };
-    const one = this.oneTripOn() ? `one trip (table every ${this.settings.tableMs} ms)` : 'two steps';
+    const one = this.oneTripOn() ? `one trip (table every ${this.settings.tableMs} ms)` : this.tableOn() ? `two steps (table for the fast lane every ${this.settings.tableMs} ms)` : 'two steps';
     this.log(`[trig-entry] ${this.active() ? deps.tf.mode() : 'off'}: every feed transaction checked as a possible trigger (max ${this.settings.maxDiscover} asked "which pools?" and ${this.settings.maxInFlight} checked at once, ${this.settings.maxCandidates} candidates each, sizes $${this.settings.sizesUsd.join('/$')}, ${one})`);
     if (this.active()) {
       if (!deps.lag) loopLag.start();
-      if (this.oneTripOn() && this.settings.tableMs > 0) {
+      if (this.tableOn() && this.settings.tableMs > 0) {
         const t = setInterval(() => { void this.refreshTable(); }, this.settings.tableMs);
         t.unref?.();
       }
@@ -606,6 +606,15 @@ export class TrigEntry {
   // Working at all? (TRIG_FIRST_ENTRY=1 and trigger-first not off.)
   active(): boolean { return this.settings.enabled && this.d.tf.mode() !== 'off'; }
   oneTripOn(): boolean { return this.settings.oneTrip && !!this.d.tableRoutes; }
+  // FAST LANE TABLE IN TWO-STEP MODE (Oct 27, second practice run: the server
+  // runs TRIG_ENTRY_ONE_TRIP=0, so the candidate table was never sent and the
+  // Rust standing-gap scanner had 0 routes). The table is now kept in the
+  // sidecar whenever one trip is on OR the fast lane is on (FASTLANE=
+  // practice|live). It is only DATA for the sidecar: in two-step mode the bot
+  // still never asks the one-trip question (`trig_entry` stays gated by
+  // oneTripOn()), so its decisions, timing and questions are unchanged.
+  // FASTLANE off + two steps: no table at all, exactly as before.
+  tableOn(): boolean { return !!this.d.tableRoutes && (this.settings.oneTrip || this.settings.fastlaneFacts); }
   // Background jobs' longest bite right now (core/chunked.ts setSliceCap):
   // short while a trigger is being worked on, else no cap (0).
   sliceCapMs(): number { return this.inFlight > 0 ? this.settings.yieldSliceMs : 0; }
@@ -1125,11 +1134,11 @@ export class TrigEntry {
     meta: new Map<string, TableMeta>(),
     retired: new Map<string, number>(),
     codes: [] as string[],
-    seq: 0, lastMs: 0, lastRoutes: 0, lastReused: 0, sends: 0, sendFails: 0,
+    seq: 0, lastMs: 0, lastBusyMs: 0, lastRoutes: 0, lastReused: 0, sends: 0, sendFails: 0,
   };
 
-  tableInfo(): { ackGen: number; pools: number; entries: number; lastMs: number; routes: number; reused: number } {
-    return { ackGen: this.tbl.ackGen, pools: this.tbl.pools.size, entries: this.tbl.meta.size, lastMs: this.tbl.lastMs, routes: this.tbl.lastRoutes, reused: this.tbl.lastReused };
+  tableInfo(): { ackGen: number; pools: number; entries: number; lastMs: number; busyMs: number; routes: number; reused: number; sends: number } {
+    return { ackGen: this.tbl.ackGen, pools: this.tbl.pools.size, entries: this.tbl.meta.size, lastMs: this.tbl.lastMs, busyMs: this.tbl.lastBusyMs, routes: this.tbl.lastRoutes, reused: this.tbl.lastReused, sends: this.tbl.sends };
   }
 
   // Rebuild the table and send what changed. true = the sidecar holds it.
@@ -1151,15 +1160,20 @@ export class TrigEntry {
   //     instead of turning the whole question into text again every second.
   async refreshTable(): Promise<boolean> {
     const T = this.tbl;
-    if (T.building || !this.oneTripOn() || !this.active()) return false;
+    if (T.building || !this.tableOn() || !this.active()) return false;
     T.building = true;
     const t0 = performance.now();
     // Named stretches: `pause()` ends the current one, lets the bot run,
     // and starts a new one.
     let endStretch = stallFinder.begin('trig table');
     let slice = performance.now();
-    const pause = async () => { endStretch(); await yieldNow(); endStretch = stallFinder.begin('trig table'); slice = performance.now(); };
-    const waitFor = async <X>(p: Promise<X>): Promise<X> => { endStretch(); try { return await p; } finally { endStretch = stallFinder.begin('trig table'); } };
+    // Main-thread time only (fast lane, Oct 27): the table now also runs in
+    // two-step mode, so its cost on the bot's one thread is measured apart
+    // from the time spent waiting (yields, sidecar answers): T.lastBusyMs.
+    let busy = 0;
+    let busyAt = performance.now();
+    const pause = async () => { endStretch(); busy += performance.now() - busyAt; await yieldNow(); busyAt = performance.now(); endStretch = stallFinder.begin('trig table'); slice = performance.now(); };
+    const waitFor = async <X>(p: Promise<X>): Promise<X> => { endStretch(); busy += performance.now() - busyAt; try { return await p; } finally { busyAt = performance.now(); endStretch = stallFinder.begin('trig table'); } };
     try {
       const src = this.d.tableRoutes!();
       const now = this.now();
@@ -1278,7 +1292,9 @@ export class TrigEntry {
       return false;
     } finally {
       endStretch();
+      busy += performance.now() - busyAt;
       T.lastMs = r2(performance.now() - t0);
+      T.lastBusyMs = r2(busy);
       T.building = false;
     }
   }
@@ -1476,6 +1492,7 @@ export class TrigEntry {
       const K = h.kind;
       if (this.settings.loops || K.loop.built) parts.push(`by kind (built/checked/profitable/would send/sent): pair ${K.pair.built}/${K.pair.checked}/${K.pair.profitable}/${K.pair.wouldSend}/${K.pair.sent}, loop ${K.loop.built}/${K.loop.checked}/${K.loop.profitable}/${K.loop.wouldSend}/${K.loop.sent}${h.loopErrors ? ` (loop errors ${h.loopErrors})` : ''}`);
       if (this.d.loopHourText) { try { const t = this.d.loopHourText(); if (t) parts.push(t); } catch { /* reporting only */ } }
+      if (!this.oneTripOn() && this.tableOn()) parts.push(`two steps; fast lane table ${this.tbl.pools.size} pools / ${this.tbl.lastRoutes} routes (${this.tbl.lastReused} reused unchanged), rebuilt in ${this.tbl.lastMs} ms (bot thread busy ${this.tbl.lastBusyMs} ms), sent ${this.tbl.sends}x`);
       if (this.oneTripOn()) parts.push(`one trip ${h.one.used}${Object.keys(h.one.why).length ? ` (two steps: ${top(h.one.why)})` : ''}; table ${this.tbl.pools.size} pools / ${this.tbl.lastRoutes} routes (${this.tbl.lastReused} reused unchanged), rebuilt in ${this.tbl.lastMs} ms`);
       const hp = HOP_NAMES.filter((k) => h.hops[k].length).map((k) => `${k} ${pctl(h.hops[k], 0.5)}/${pctl(h.hops[k], 0.9)}`);
       if (hp.length) parts.push(`hops p50/p90 ms: ${hp.join(', ')}`);
