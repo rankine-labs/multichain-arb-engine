@@ -563,3 +563,47 @@ fn timing_samples_keep_the_newest() {
     assert!(a.hour.time_n >= 30);
     assert_eq!(a.hour.apply_us.len() as u64, a.hour.time_n.min(20_000));
 }
+
+/// Final review H-1: a feed message that runs past the per-message budget
+/// stops the prediction (counted), is NOT re-tried when an older block is
+/// confirmed, and prediction resumes once copy 2 has confirmed it. The
+/// shares next to agreement % (compared / unpredicted / stopped) count.
+#[test]
+fn a_message_over_its_time_budget_stops_prediction_until_confirmed() {
+    // Budget 0: any message with a second transaction is "too slow".
+    let mut a = Ahead::new(AheadCfg { msg_budget_us: 0, ..AheadCfg::default() });
+    a.set_pools(pools());
+    a.on_confirmed(confirmed(10, copy10(), StateDiff::default()), &no_moves);
+    a.on_feed_message(msg(11, &[stx(0, pool(), w(5))]));
+    assert_eq!(price(&a, pool()), known(105), "one transaction: always applied");
+    a.on_feed_message(msg(12, &[stx(1, pool(), w(1)), stx(2, pool(), w(1))]));
+    assert!(a.tip().is_none());
+    assert_eq!(a.stopped(), Some((12, "msg_budget")));
+    a.on_feed_message(msg(13, &[stx(3, pool2(), w(1))]));
+    assert_eq!((a.hour.over_budget, a.hour.msgs_stopped, a.hour.msgs), (1, 2, 3));
+    // Copy 2 confirms 11 (as predicted): 12 is NOT tried again.
+    let (s11, d11) = with_price(105, 7);
+    a.on_confirmed(confirmed(11, s11, d11), &no_moves);
+    assert!(a.tip().is_none() && a.stopped() == Some((12, "msg_budget")), "still stopped: {:?}", a.stopped());
+    assert_eq!(a.hour.over_budget, 1, "not re-tried, not counted again");
+    assert_eq!((a.hour.compared, a.hour.agree), (1, 1));
+    // Copy 2 confirms 12: prediction resumes with 13.
+    let (s12, d12) = with_price(107, 7);
+    a.on_confirmed(confirmed(12, s12, d12), &no_moves);
+    let t = a.tip().expect("resumed");
+    assert_eq!((t.seq, t.base_seq), (13, 12));
+    assert_eq!(price(&a, pool2()), known(8));
+    let c = a.hour.shares();
+    assert_eq!((c.compared, c.unpredicted), (1, 1), "block 12 had no prediction");
+    assert_eq!(c.unpredicted_pct(), Some(50.0));
+    assert!((c.stopped_pct().unwrap() - 200.0 / 3.0).abs() < 1e-9);
+    assert!(a.hour.line().contains("over budget 1"), "{}", a.hour.line());
+}
+
+#[test]
+fn message_budget_setting() {
+    let c = AheadCfg::from_lookup(|k| (k == "FASTLANE_AHEAD_MSG_BUDGET_MS").then(|| "25".to_string()), 0);
+    assert_eq!(c.msg_budget_us, 25_000);
+    assert_eq!(AheadCfg::default().msg_budget_us, 10_000);
+    assert_eq!(AheadCfg::from_lookup(|_| Some("0".into()), 0).msg_budget_us, 10_000, "0 / junk = default");
+}

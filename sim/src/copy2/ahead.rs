@@ -62,6 +62,14 @@
 //   no thread, no memory). Bounded: at most FASTLANE_AHEAD_MAX_BLOCKS
 //   predicted blocks (32); a confirmed copy further behind than that stops
 //   the prediction ("behind": no tip) until it catches up.
+//   CPU (final review H-1): the thread runs at a lower OS priority
+//   (FASTLANE_NICE, default 10), and one feed message may take at most
+//   FASTLANE_AHEAD_MSG_BUDGET_MS (default 10) to apply: a message that runs
+//   past it stops the prediction ("msg_budget", counted "over budget") until
+//   copy 2 has confirmed that message, so a heavy block is never re-tried.
+//   The hourly line also counts messages that arrived while stopped, so the
+//   practice line can show unsure / unpredicted / stopped shares next to
+//   the agreement %.
 //
 // API (scanner and integration):
 //   Ahead::on_feed_message(Arc<BinMsg>)            a new feed message
@@ -133,11 +141,17 @@ pub struct AheadCfg {
     /// pools it moved unsure (the real transaction may have failed). on =
     /// trust it (more pools stay usable; agreement stats show the cost).
     pub trust_sender_funds: bool,
+    /// FASTLANE_AHEAD_MSG_BUDGET_MS [10] (final review H-1, CPU): most time
+    /// one feed message may take to apply. A message that runs past it is
+    /// not finished: prediction STOPS (reason "msg_budget", counted) and
+    /// does not try again until copy 2 has confirmed that message (so one
+    /// heavy block can never eat a CPU over and over). 1..=1000 ms.
+    pub msg_budget_us: u64,
 }
 
 impl Default for AheadCfg {
     fn default() -> Self {
-        AheadCfg { max_blocks: 32, run_all: false, max_txs: 256, max_touchers: 4096, l2_offset: 0, trust_sender_funds: false }
+        AheadCfg { max_blocks: 32, run_all: false, max_txs: 256, max_touchers: 4096, l2_offset: 0, trust_sender_funds: false, msg_budget_us: 10_000 }
     }
 }
 
@@ -153,6 +167,7 @@ impl AheadCfg {
             max_touchers: d.max_touchers,
             l2_offset,
             trust_sender_funds: crate::fastlane::mode::parse_on(get("FASTLANE_AHEAD_TRUST_SENDER_FUNDS").as_deref()),
+            msg_budget_us: num("FASTLANE_AHEAD_MSG_BUDGET_MS").filter(|v| (1..=1000).contains(v)).map(|v| v as u64 * 1000).unwrap_or(d.msg_budget_us),
         }
     }
 }
@@ -486,6 +501,13 @@ pub struct AheadStats {
     pub unsure: u64,
     /// Confirmed blocks we had no prediction for.
     pub unpredicted: u64,
+    /// Confirmed blocks compared with our prediction (agreement ran).
+    pub compared: u64,
+    /// Feed messages that arrived while prediction was stopped (no tip).
+    pub msgs_stopped: u64,
+    /// H-1: messages that ran past FASTLANE_AHEAD_MSG_BUDGET_MS (prediction
+    /// stopped until copy 2 confirmed them).
+    pub over_budget: u64,
     /// Review H4: a transaction we ran failed and its probe found none of
     /// our pools: the pools its target moved before (or that share a coin
     /// it names) were marked unsure instead.
@@ -521,6 +543,7 @@ impl AheadStats {
             "rebases": self.rebases, "reapplied": self.reapplied,
             "agree": self.agree, "disagree": self.disagree, "missed": self.missed, "phantom": self.phantom,
             "valueDiff": self.value_diff, "unsure": self.unsure, "unpredicted": self.unpredicted,
+            "compared": self.compared, "msgsStopped": self.msgs_stopped, "overBudget": self.over_budget,
             "failedUnknown": self.failed_unknown, "assumedUnsure": self.assumed_unsure, "nativePicks": self.native_picks,
             "stopped": self.stopped.iter().map(|(k, v)| (k.to_string(), json!(v))).collect::<serde_json::Map<String, Value>>(),
             "applyUs": crate::timing::pct_of(&mut t),
@@ -536,10 +559,10 @@ impl AheadStats {
         let mut stops: Vec<String> = self.stopped.iter().map(|(k, v)| format!("{k}:{v}")).collect();
         stops.sort();
         format!(
-            "[arbsim] fastlane ahead (last hour): msgs {} applied {} late {} | txs run {} skipped {} failed {} (pools unsure {}, nothing found {}) filterMissed {} assumedUnsure {} nativePicks {} | apply us p50 {} p90 {} p99 {} max {} | rebases {} reapplied {} | agree {} disagree {} (missed {} phantom {} value {}) unsure {} unpredicted {} | stopped [{}]",
+            "[arbsim] fastlane ahead (last hour): msgs {} applied {} late {} | txs run {} skipped {} failed {} (pools unsure {}, nothing found {}) filterMissed {} assumedUnsure {} nativePicks {} | apply us p50 {} p90 {} p99 {} max {} | rebases {} reapplied {} | agree {} disagree {} (missed {} phantom {} value {}) unsure {} unpredicted {} | msgs while stopped {} over budget {} | stopped [{}]",
             self.msgs, self.applied, self.late_msgs, self.txs_run, self.txs_skipped, self.txs_failed, self.txs_marked, self.failed_unknown, self.filter_missed, self.assumed_unsure, self.native_picks,
             g("p50"), g("p90"), g("p99"), g("max"), self.rebases, self.reapplied,
-            self.agree, self.disagree, self.missed, self.phantom, self.value_diff, self.unsure, self.unpredicted, stops.join(" "),
+            self.agree, self.disagree, self.missed, self.phantom, self.value_diff, self.unsure, self.unpredicted, self.msgs_stopped, self.over_budget, stops.join(" "),
         )
     }
 
@@ -559,6 +582,58 @@ impl AheadStats {
     pub fn agreement_pct(&self) -> Option<f64> {
         let n = self.agree + self.disagree;
         (n > 0).then(|| 100.0 * self.agree as f64 / n as f64)
+    }
+
+    /// The numbers the practice line shows next to agreement % (final
+    /// review: agreement alone hides what was never compared).
+    pub fn shares(&self) -> PredictionCounts {
+        PredictionCounts {
+            agree: self.agree,
+            disagree: self.disagree,
+            unsure: self.unsure,
+            compared: self.compared,
+            unpredicted: self.unpredicted,
+            msgs: self.msgs,
+            msgs_stopped: self.msgs_stopped,
+            over_budget: self.over_budget,
+        }
+    }
+}
+
+/// Prediction counts for one hour (practice line, fastlane/practice.rs).
+///   agreement %   agree / (agree + disagree), per pool compared
+///   unsure %      pools we had marked unsure / all pools looked at
+///   unpredicted % confirmed blocks with no prediction to compare / all
+///                 confirmed blocks
+///   stopped %     feed messages that arrived while prediction was stopped
+///                 (no tip at all: nothing scanned) / all feed messages
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct PredictionCounts {
+    pub agree: u64,
+    pub disagree: u64,
+    pub unsure: u64,
+    pub compared: u64,
+    pub unpredicted: u64,
+    pub msgs: u64,
+    pub msgs_stopped: u64,
+    pub over_budget: u64,
+}
+
+impl PredictionCounts {
+    fn pct(a: u64, b: u64) -> Option<f64> {
+        (b > 0).then(|| 100.0 * a as f64 / b as f64)
+    }
+    pub fn agreement_pct(&self) -> Option<f64> {
+        Self::pct(self.agree, self.agree + self.disagree)
+    }
+    pub fn unsure_pct(&self) -> Option<f64> {
+        Self::pct(self.unsure, self.agree + self.disagree + self.unsure)
+    }
+    pub fn unpredicted_pct(&self) -> Option<f64> {
+        Self::pct(self.unpredicted, self.compared + self.unpredicted)
+    }
+    pub fn stopped_pct(&self) -> Option<f64> {
+        Self::pct(self.msgs_stopped, self.msgs)
     }
 }
 
@@ -583,6 +658,9 @@ pub struct Ahead {
     tip: Option<Arc<AheadTip>>,
     /// Feed arrival time per held message (bounded with `msgs`).
     arrived: BTreeMap<u64, Instant>,
+    /// H-1: the message that ran past the per-message budget. Prediction
+    /// stays stopped until copy 2 has confirmed it (never re-tried).
+    over_budget_seq: Option<u64>,
     pub hour: AheadStats,
     pub total: AheadStats,
 }
@@ -599,6 +677,7 @@ impl Ahead {
             touchers: HashMap::new(),
             tip: None,
             arrived: BTreeMap::new(),
+            over_budget_seq: None,
             hour: AheadStats::default(),
             total: AheadStats::default(),
         }
@@ -691,6 +770,10 @@ impl Ahead {
         self.msgs.entry(m.seq).or_insert(m);
         self.trim_msgs();
         self.extend();
+        if self.stop.is_some() {
+            // No tip for this message: counted for the "stopped %" share.
+            self.count(|s| s.msgs_stopped += 1);
+        }
     }
 
     /// Bounded: keep only the newest messages (2 x max_blocks).
@@ -733,6 +816,12 @@ impl Ahead {
         self.entries.clear();
         self.tip = None;
         self.stop = None;
+        // H-1: a message that ran past the budget is not tried again until
+        // this copy has confirmed it (the stop stays, not counted again).
+        match self.over_budget_seq {
+            Some(s) if s > seq => self.stop = Some(Stop { seq: s, why: "msg_budget" }),
+            _ => self.over_budget_seq = None,
+        }
         self.msgs = self.msgs.split_off(&(seq + 1));
         let before = self.hour.applied;
         self.extend();
@@ -758,6 +847,7 @@ impl Ahead {
             self.count(|s| s.unpredicted += 1);
             return;
         }
+        self.count(|s| s.compared += 1);
         let pools = self.pools.clone();
         let conf_moved: HashSet<String> = pools.moved_by_diff(&c.diff).into_iter().collect();
         let e = &self.entries[i];
@@ -838,6 +928,10 @@ impl Ahead {
                     self.entries.push_back(e);
                 }
                 Err(why) => {
+                    if why == "msg_budget" {
+                        self.count(|s| s.over_budget += 1);
+                        self.over_budget_seq = Some(next);
+                    }
                     self.halt(next, why);
                     return;
                 }
@@ -915,7 +1009,12 @@ impl Ahead {
         let assume = Assume { sender_funds: true, recent_fill: true, skip: None, record_hashes: true };
         let mut changed: Vec<String> = Vec::new();
         let mut skipped: Vec<(B256, Option<Address>)> = Vec::new();
-        for t in &txs {
+        for (i, t) in txs.iter().enumerate() {
+            // H-1: per-message time budget, looked at before every
+            // transaction after the first (one run is never cut in half).
+            if i > 0 && t0.elapsed().as_micros() as u64 > self.cfg.msg_budget_us {
+                return Err("msg_budget");
+            }
             let native = if self.cfg.run_all { Vec::new() } else { pools.named_native(t.value, &t.data) };
             let plain = self.cfg.run_all || pools.may_touch(t.to, &t.data) || t.to.is_some_and(|a| self.touchers.contains_key(&a));
             if !plain && !native.is_empty() {
@@ -1101,8 +1200,9 @@ struct Runtime {
     /// Woken on every new tip (no busy polling).
     tip_cv: std::sync::Condvar,
     status: Mutex<Value>,
-    /// Agreement counts this hour (agree, disagree), for the practice line.
-    agreement: Mutex<(u64, u64)>,
+    /// Prediction counts this hour (agreement and the shares around it),
+    /// for the practice line.
+    agreement: Mutex<PredictionCounts>,
     dropped: std::sync::atomic::AtomicU64,
 }
 
@@ -1121,7 +1221,7 @@ pub fn start_with(m: Mode, c2: super::intake::Copy2Handle, mut cfg: AheadCfg) ->
     }
     cfg.l2_offset = c2.sh.cfg.l2_offset;
     let (tx, rx) = std::sync::mpsc::sync_channel::<Ev>(4096);
-    if RT.set(Runtime { tx, tip: Mutex::new((0, None)), tip_cv: std::sync::Condvar::new(), status: Mutex::new(json!({})), agreement: Mutex::new((0, 0)), dropped: Default::default() }).is_err() {
+    if RT.set(Runtime { tx, tip: Mutex::new((0, None)), tip_cv: std::sync::Condvar::new(), status: Mutex::new(json!({})), agreement: Mutex::new(PredictionCounts::default()), dropped: Default::default() }).is_err() {
         return false;
     }
     eprintln!(
@@ -1130,7 +1230,15 @@ pub fn start_with(m: Mode, c2: super::intake::Copy2Handle, mut cfg: AheadCfg) ->
         cfg.max_blocks,
         if cfg.run_all { "all" } else { "smart" }
     );
-    std::thread::Builder::new().name("arbsim-ahead".into()).spawn(move || run_loop(c2, cfg, rx)).is_ok()
+    std::thread::Builder::new()
+        .name("arbsim-ahead".into())
+        .spawn(move || {
+            // H-1: lower CPU priority (FASTLANE_NICE, default 10): copy 2
+            // and the bot's own checks always come first on the 2 CPUs.
+            crate::fastlane::mode::lower_this_thread_from_env("arbsim-ahead");
+            run_loop(c2, cfg, rx)
+        })
+        .is_ok()
 }
 
 /// check/feedstore.rs: new feed messages stored (no-op when off).
@@ -1173,6 +1281,11 @@ pub fn wait_tip(after: u64, timeout: Duration) -> Option<(u64, Arc<AheadTip>)> {
 /// (agree, disagree) of the prediction so far this hour (practice line).
 /// None = off.
 pub fn agreement_counts() -> Option<(u64, u64)> {
+    prediction_counts().map(|c| (c.agree, c.disagree))
+}
+
+/// The prediction counts so far this hour (practice line). None = off.
+pub fn prediction_counts() -> Option<PredictionCounts> {
     RT.get().map(|rt| *rt.agreement.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
@@ -1289,7 +1402,7 @@ fn run_loop(c2: super::intake::Copy2Handle, cfg: AheadCfg, rx: Receiver<Ev>) {
                     rt.tip_cv.notify_all();
                 }
             }
-            *rt.agreement.lock().unwrap_or_else(|e| e.into_inner()) = (a.hour.agree, a.hour.disagree);
+            *rt.agreement.lock().unwrap_or_else(|e| e.into_inner()) = a.hour.shares();
             if last_status.elapsed() >= Duration::from_secs(1) {
                 last_status = Instant::now();
                 *rt.status.lock().unwrap_or_else(|e| e.into_inner()) = status_of(&a);

@@ -52,8 +52,9 @@ use arbsim::fastlane::gun::{Gate, Gun, NoGate};
 use arbsim::fastlane::lane::{reply_hook, Lane, LaneCfg, ReplyBook, SafetyGate};
 use arbsim::fastlane::mode::FastlaneMode;
 use arbsim::fastlane::practice::{ConfirmedBlock, Practice, PracticeCfg};
+use arbsim::copy2::ahead::PredictionCounts;
 use arbsim::fastlane::safety::{utc_day, Safety, SafetyConfig};
-use arbsim::fastlane::scan::{PlainRunner, ScanConfig, Scanner, TableSource};
+use arbsim::fastlane::scan::{CheckRunner, PlainRunner, ScanConfig, Scanner, TableSource};
 use arbsim::fastlane::types::*;
 use arbsim::state::snap::{Fact, Snapshot};
 use arbsim::state::{AccountDiff, StateDiff};
@@ -381,11 +382,25 @@ fn practice_runs_everything_and_never_broadcasts() {
     r.lane.practice.score(13, &blocks, &PlainRunner);
     let h = r.lane.practice.hour.clone();
     assert_eq!((h.would_send, h.scored, h.real, h.gone, h.taken), (2, 2, 1, 1, 1), "{h:?}");
-    assert!((h.est_usd - 0.95).abs() < 1e-9, "only the real, untouched one counts: ${}", h.est_usd);
-    let line = r.lane.practice.take_hour(Some(99.0));
-    assert!(line.contains("real 1 (50%)") && line.contains("agreement 99.0%") && line.contains("est. $0.95"), "{line}");
+    // Final review: est $ = min(expected, net at N) of the real untouched
+    // one MINUS the gas of the gone one (it would have reverted, gas paid).
     let pf = std::fs::read_to_string(r.dir.join("fastlane-practice.jsonl")).unwrap();
-    assert_eq!(pf.lines().filter(|l| l.contains("\"kind\":\"score\"")).count(), 2);
+    let scores: Vec<Value> = pf.lines().map(|l| serde_json::from_str::<Value>(l).unwrap()).filter(|v| v["kind"] == "score").collect();
+    assert_eq!(scores.len(), 2);
+    let real = scores.iter().find(|v| v["result"] == "real").unwrap();
+    let gone = scores.iter().find(|v| v["result"] == "gone").unwrap();
+    let gas = recs.iter().find(|x| x.seq == gone["seq"].as_u64().unwrap()).unwrap().gas_usd;
+    assert!(gas > 0.0);
+    let want = real["expectedNetUsd"].as_f64().unwrap().min(real["netAtNUsd"].as_f64().unwrap()) - gas;
+    assert!((h.est_usd - want).abs() < 1e-9, "est ${} want ${want}", h.est_usd);
+    assert!((h.lost_gas_usd - gas).abs() < 1e-9);
+    let pred = PredictionCounts { agree: 99, disagree: 1, unsure: 10, compared: 50, unpredicted: 50, msgs: 200, msgs_stopped: 20, over_budget: 3 };
+    let line = r.lane.practice.take_hour(Some(pred));
+    assert!(line.contains("real 1 (50%)") && line.contains("agreement 99.0% (unsure 9%, unpredicted 50%, stopped 10%, over budget 3)"), "{line}");
+    assert!(line.contains(&format!("est. ${want:.2}")) && line.contains("excludes the sequencer trip") && line.contains("upper bound"), "{line}");
+    let pf = std::fs::read_to_string(r.dir.join("fastlane-practice.jsonl")).unwrap();
+    let hour: Value = pf.lines().map(|l| serde_json::from_str::<Value>(l).unwrap()).find(|v| v["kind"] == "hour").unwrap();
+    assert_eq!((hour["unpredictedPct"].as_f64(), hour["stoppedPct"].as_f64()), (Some(50.0), Some(10.0)));
     assert!(pf.lines().any(|l| l.contains("\"kind\":\"hour\"")));
     // Status and hourly lines exist and say practice.
     let st = r.lane.status_json();
@@ -649,4 +664,91 @@ fn bench_per_block_test_numbers_only() {
 
 fn rss_kb() -> u64 {
     std::fs::read_to_string("/proc/self/status").ok().and_then(|s| s.lines().find(|l| l.starts_with("VmRSS:")).and_then(|l| l.split_whitespace().nth(1)?.parse().ok())).unwrap_or(0)
+}
+
+/// Final review blocker 3: Rust is live and broadcasting; Node restarts with
+/// RUST_SENDER off and its startup guard rewrites the state file with
+/// rustSender:false (the same shape fastlaneBridge.ts writeStartupSenderGuard
+/// writes). The VERY NEXT fire is refused (no 200 ms poll wait, no 10 s
+/// staleness wait) and nothing reaches the endpoint.
+#[test]
+fn node_startup_guard_stops_rust_at_the_next_fire() {
+    let env = [("FASTLANE", "live"), ("RUST_SENDER", "on"), ("EXECUTION_ENABLED", "true"), ("LIVE_SEND_CONFIRM", "yes-real-money"), ("BOT_PRIVATE_KEY", WALLET_KEY)];
+    let mut r = rig("startup-guard", &env, Some(node_state(true)));
+    r.lane.tick();
+    assert!(r.lane.gun.broadcasting(), "{:?}", r.lane.gun.why_not_broadcasting());
+    // Node's startup guard (exact JSON shape of the TS function).
+    let guard = serde_json::json!({"v": 1, "writtenMs": arbsim::fastlane::bridge::wall_ms(), "rustSender": false, "ackSeq": 0, "dropsSeen": 0, "maxGasUsed": 0, "startupGuard": true});
+    let tmp = r.dir.join("state.tmp");
+    std::fs::write(&tmp, guard.to_string()).unwrap();
+    std::fs::rename(&tmp, r.dir.join("fastlane-state.json")).unwrap();
+    let mut a = ahead_at(10, copy_at(0, 0));
+    a.on_feed_message(msg(11, &[stx(0, pool(), 1_000_000)]));
+    let out = r.lane.on_tip(&a.tip().unwrap());
+    // Blocked by the safety check (the guard file also allows no coin, so
+    // the first refusal is "allowlist"); either way never sent, and the gun
+    // itself no longer counts as broadcasting (Node says it is the sender).
+    assert!(out[0].blocked.is_some() && out[0].record.is_none(), "{:?}", out[0]);
+    assert!(!r.lane.gate.may_broadcast_now(), "Node's rustSender:false seen at once");
+    assert!(!r.lane.gun.broadcasting());
+    nothing_broadcast(&r);
+}
+
+/// Final review blocker 1: a reply line racing with send records never lands
+/// out of seq order, and its mode is "reply" (blocker 4).
+#[test]
+fn reply_lines_follow_their_send_in_seq_order() {
+    let env = [("FASTLANE", "live"), ("RUST_SENDER", "on"), ("EXECUTION_ENABLED", "true"), ("LIVE_SEND_CONFIRM", "yes-real-money"), ("BOT_PRIVATE_KEY", WALLET_KEY)];
+    let mut r = rig("reply-order", &env, Some(node_state(true)));
+    r.lane.tick();
+    let mut a = ahead_at(10, copy_at(0, 0));
+    a.on_feed_message(msg(11, &[stx(0, pool(), 1_000_000)]));
+    let out = r.lane.on_tip(&a.tip().unwrap());
+    assert!(out[0].live, "{:?}", out[0]);
+    let t = Instant::now();
+    while records(&r.sends).len() < 2 && t.elapsed() < Duration::from_secs(3) {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let recs = records(&r.sends);
+    assert!(recs.windows(2).all(|w| w[0].seq < w[1].seq), "file order = seq order");
+    let reply = recs.iter().find(|x| x.kind.as_deref() == Some("reply")).expect("reply line");
+    assert_eq!(reply.mode, "reply", "never \"live\": an older follower can't take it for a failed send");
+    assert!(reply.reply_to.unwrap() < reply.seq);
+    assert_eq!(r.lane.book.early_dropped(), 0);
+}
+
+/// Final review H-1: practice re-checks stay within FASTLANE_PRACTICE_BUDGET_MS
+/// per call (at least one each call; the rest wait, counted "deferred").
+/// And the est $ rule per scored would-send.
+#[test]
+fn practice_scoring_keeps_to_its_budget() {
+    use arbsim::fastlane::practice::est_gain;
+    struct Slow;
+    impl CheckRunner for Slow {
+        fn run(&self, v: &dyn arbsim::state::StateRead, c: &arbsim::arb::BlockCtx, p: &arbsim::fastlane::scan::PreparedCheck, a: &arbsim::check::search::SizeSearchAmounts) -> Result<arbsim::check::search::SizeSearchResult, arbsim::check::CheckUnknown> {
+            std::thread::sleep(Duration::from_millis(3));
+            PlainRunner.run(v, c, p, a)
+        }
+    }
+    let mut r = rig("practice-budget", &[("FASTLANE", "practice"), ("FASTLANE_PRACTICE_BUDGET_MS", "1")], Some(node_state(false)));
+    assert_eq!(r.lane.practice.cfg.budget_us, 1_000);
+    let mut a = ahead_at(10, copy_at(0, 0));
+    for n in 0..3u64 {
+        a.on_feed_message(msg(11 + n, &[stx(n, pool(), 1_000_000)]));
+        r.lane.on_tip(&a.tip().unwrap());
+    }
+    assert_eq!(r.lane.practice.waiting(), 3);
+    let blocks = |n: u64| -> Option<ConfirmedBlock> { Some(ConfirmedBlock { snap: Arc::new(copy_at(1_000_000 * (n - 10), 0)), ctx: ctx_at(n), moved: vec![] }) };
+    r.lane.practice.score(20, &blocks, &Slow);
+    assert_eq!((r.lane.practice.waiting(), r.lane.practice.hour.deferred), (2, 1), "one re-check, then the budget ran out");
+    r.lane.practice.score(20, &blocks, &Slow);
+    r.lane.practice.score(20, &blocks, &Slow);
+    assert_eq!((r.lane.practice.waiting(), r.lane.practice.hour.scored), (0, 3));
+    // est $ rule.
+    assert_eq!(est_gain("real", false, 1.0, Some(0.4), 0.05), 0.4, "never more than the confirmed state paid");
+    assert_eq!(est_gain("real", false, 1.0, Some(3.0), 0.05), 1.0, "never more than expected");
+    assert_eq!(est_gain("real", false, 1.0, None, 0.05), 1.0);
+    assert_eq!(est_gain("real", true, 1.0, Some(1.0), 0.05), -0.05, "taken: our trade reverts, gas paid");
+    assert_eq!(est_gain("gone", false, 1.0, Some(-0.05), 0.05), -0.05);
+    assert_eq!(est_gain("unsure", true, 1.0, None, 0.05), 0.0);
 }

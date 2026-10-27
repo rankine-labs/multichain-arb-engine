@@ -1,5 +1,6 @@
 import { closeSync, fstatSync, mkdirSync, openSync, readFileSync, readSync, renameSync, statSync, writeFileSync } from 'fs';
 import { dirname } from 'path';
+import type { PoolState } from '../core/types';
 
 // ============================================================================
 // FAST LANE BRIDGE (Node side): the two small files shared with the Rust
@@ -46,8 +47,22 @@ import { dirname } from 'path';
 //      sends found dropped / never mined; the gun re-reads its nonce when
 //      it goes up) and maxGasUsed (most gas any Rust send used).
 //
-//   Both only run when FASTLANE is practice or live. Default off = nothing
-//   new runs, nothing is written. Never throws into trading code.
+//   1 and 2 only run when FASTLANE is practice or live. Default off =
+//   nothing new runs. Never throws into trading code.
+//
+//   ONE EXCEPTION (final review blocker 3): STARTUP SENDER GUARD. At start,
+//   BEFORE this bot's sender can broadcast, and whatever FASTLANE says: if
+//   RUST_SENDER is off here (this bot is the sender), the state file is
+//   rewritten at once with rustSender:false (writeStartupSenderGuard). Rust
+//   re-reads the file the moment it changes, so a Rust gun still trusting a
+//   recent "rustSender: true" from before the switch stops broadcasting
+//   immediately, instead of up to 10 s later when that file would go stale.
+//   (Switching back to Node: set RUST_SENDER=off in BOTH .env files, restart
+//   arbsim first, then the bot; see the PR for the full procedure.)
+//
+//   Reply lines (blocker 4): Rust writes the sequencer's answer to a live
+//   send with "mode":"reply" (and "kind":"reply"). They are never a send:
+//   ignored for send tracking (only the release of a refused send's gas).
 // ============================================================================
 
 export type FastlaneMode = 'off' | 'practice' | 'live';
@@ -175,6 +190,57 @@ export function buildFastlaneState(s: StateSources): FastlaneState {
   };
 }
 
+// STARTUP SENDER GUARD (blocker 3, see the header). Call it at start,
+// before this bot's sender can broadcast. RUST_SENDER on here = nothing to
+// do (the normal writer says true). Otherwise the state file is replaced
+// right now by one that says rustSender:false (and allows nothing: empty
+// allowlist), keeping the ackSeq / dropsSeen already in it so Rust's send
+// numbering and gas holds stay right. Returns what it did (for the log);
+// never throws.
+export function writeStartupSenderGuard(file: string, rustIsSender: boolean, now = Date.now()): 'skipped' | 'written' | 'failed' {
+  if (rustIsSender) return 'skipped';
+  try {
+    let prev: Partial<FastlaneState> = {};
+    try { prev = JSON.parse(readFileSync(file, 'utf8')) as Partial<FastlaneState>; } catch { /* no file / unreadable: start clean */ }
+    const st = {
+      v: 1,
+      writtenMs: now,
+      rustSender: false,
+      ackSeq: Number.isFinite(prev.ackSeq) ? prev.ackSeq : 0,
+      dropsSeen: Number.isFinite(prev.dropsSeen) ? prev.dropsSeen : 0,
+      maxGasUsed: Number.isFinite(prev.maxGasUsed) ? prev.maxGasUsed : 0,
+      startupGuard: true,
+    };
+    mkdirSync(dirname(file), { recursive: true });
+    writeFileSync(file + '.tmp', JSON.stringify(st));
+    renameSync(file + '.tmp', file);
+    return 'written';
+  } catch { return 'failed'; }
+}
+
+// M-1 (final review): "does this V4 pool's key hash to its id?" costs an ABI
+// encode + keccak. The state writer asks it for every hooked V4 pool every
+// 2 s on the main thread; the answer only changes when the pool's key
+// fields change, so it is remembered per (pool id + key fields). Bounded.
+export class V4KeyCheckCache {
+  private readonly memo = new Map<string, boolean>();
+  hits = 0;
+  misses = 0;
+  constructor(private readonly check: (p: PoolState) => boolean, private readonly keyOf: (p: PoolState) => string, private readonly max = 5_000) {}
+  matches(p: PoolState): boolean {
+    let k: string;
+    try { k = this.keyOf(p); } catch { return this.check(p); }
+    const got = this.memo.get(k);
+    if (got !== undefined) { this.hits++; return got; }
+    this.misses++;
+    const v = this.check(p);
+    if (this.memo.size >= this.max) this.memo.delete(this.memo.keys().next().value as string);
+    this.memo.set(k, v);
+    return v;
+  }
+  get size() { return this.memo.size; }
+}
+
 // Pair-block entries ("a>b" -> until/why) as rows (LiveRouteBlock.entries()).
 export function pairRows(entries: Iterable<[string, { until: number; why: string }]>, now: number): PairBlockRow[] {
   const out: PairBlockRow[] = [];
@@ -224,7 +290,7 @@ export class FastlaneStateWriter {
 export interface RustSendRecord {
   seq?: number;             // +1 per record, never repeats (missing = older Rust)
   t: number;
-  mode: 'live' | 'practice' | string;
+  mode: 'live' | 'practice' | 'reply' | string;
   hash?: string;
   error?: string;
   label: string;
@@ -428,7 +494,7 @@ export class FastlaneSendsFollower {
     if (seq) { this.seenSeq.add(seq); if (this.seenSeq.size > SEEN_MAX) this.seenSeq.delete(this.seenSeq.values().next().value as number); }
     if (hashKey) { this.seenHash.add(hashKey); if (this.seenHash.size > SEEN_MAX) this.seenHash.delete(this.seenHash.values().next().value as string); }
     try {
-      if (rec.kind === 'reply') {
+      if (rec.kind === 'reply' || rec.mode === 'reply') {
         // Not a send: the answer to one (never tracked as a trade).
         if (rec.status === 'refused' || rec.status === 'stale_in_queue' || rec.status === 'not_written') this.hour.refused++;
         this.hooks.onLiveReply?.(rec);
@@ -539,8 +605,12 @@ export function practiceHourSummary(file: string, maxAgeMs = 2 * 3600_000, now =
       const num = (k: string) => (Number.isFinite(h[k] as number) ? (h[k] as number) : null);
       const pc = (k: string) => (num(k) === null ? '-' : `${(num(k) as number).toFixed(0)}%`);
       const ms = (k: string) => (num(k) === null ? '-' : `${((num(k) as number) / 1000).toFixed(1)} ms`);
-      return `scored ${num('scored') ?? 0}: real ${pc('realPct')}, taken by others ${pc('takenPct')}; feed -> would hand p50 ${ms('handP50Us')}, p90 ${ms('handP90Us')}; ` +
-        `prediction agreement ${pc('agreementPct')}; est. $${(num('estUsd') ?? 0).toFixed(2)} if sent`;
+      // Final review: the shares next to agreement %, and the two caveats
+      // (latency excludes the sequencer trip; "taken" is an upper bound).
+      const shares = num('unsurePct') !== null || num('unpredictedPct') !== null || num('stoppedPct') !== null
+        ? ` (unsure ${pc('unsurePct')}, unpredicted ${pc('unpredictedPct')}, stopped ${pc('stoppedPct')})` : '';
+      return `scored ${num('scored') ?? 0}: real ${pc('realPct')}, taken by others ${pc('takenPct')} (upper bound); feed -> would hand p50 ${ms('handP50Us')}, p90 ${ms('handP90Us')} (excl. sequencer trip); ` +
+        `prediction agreement ${pc('agreementPct')}${shares}; est. $${(num('estUsd') ?? 0).toFixed(2)} if sent`;
     }
     return '';
   } catch { return ''; } finally { if (fd >= 0) try { closeSync(fd); } catch { /* fine */ } }

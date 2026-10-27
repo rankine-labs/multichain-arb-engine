@@ -115,10 +115,95 @@ impl FastlaneMode {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Thread priority (final review H-1: CPU)
+// ---------------------------------------------------------------------------
+
+/// FASTLANE_NICE [10]: how much LOWER the operating system should rank the
+/// fast lane's own threads (arbsim-ahead and arbsim-fastlane) than the rest
+/// of arbsim. 0 = leave them as they are, 19 = lowest. Unset / junk /
+/// out of range = 10.
+///
+/// Plain English: the server has 2 CPUs. Copy 2 (the confirmed copy) and the
+/// bot's own checks must never wait behind the fast lane, so in a CPU
+/// squeeze the operating system serves them first. When the CPUs are idle
+/// (most of the time) the fast lane runs at full speed anyway.
+pub fn nice_from(raw: Option<&str>) -> i32 {
+    match raw.map(|s| s.trim()).filter(|s| !s.is_empty()).and_then(|s| s.parse::<i32>().ok()) {
+        Some(v) if (0..=19).contains(&v) => v,
+        _ => 10,
+    }
+}
+
+/// Lower the CALLING thread's priority by `nice` (Linux: setpriority on the
+/// thread's own id changes only this thread). 0 = nothing. Raising the nice
+/// value needs no special rights. Returns the thread's nice value after.
+pub fn lower_this_thread(nice: i32) -> Result<i32, String> {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: plain system calls on our own thread id, no pointers.
+        let tid = unsafe { libc::syscall(libc::SYS_gettid) } as libc::id_t;
+        if nice > 0 {
+            // Relative to what the thread has now (pm2 may already run arbsim
+            // niced): current + nice, at most 19. Never lowers the value
+            // (that would need special rights and is never what we want).
+            unsafe { *libc::__errno_location() = 0 };
+            let cur = unsafe { libc::getpriority(libc::PRIO_PROCESS, tid) };
+            let target = (cur + nice).clamp(cur, 19);
+            let r = unsafe { libc::setpriority(libc::PRIO_PROCESS, tid, target) };
+            if r != 0 {
+                return Err(std::io::Error::last_os_error().to_string());
+            }
+        }
+        // getpriority may return -1 as a real value: clear errno first.
+        unsafe { *libc::__errno_location() = 0 };
+        let now = unsafe { libc::getpriority(libc::PRIO_PROCESS, tid) };
+        Ok(now)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = nice;
+        Ok(0)
+    }
+}
+
+/// Called first thing on each fast lane thread: FASTLANE_NICE applied and
+/// one log line saying so (or why not).
+pub fn lower_this_thread_from_env(name: &str) {
+    let n = nice_from(std::env::var("FASTLANE_NICE").ok().as_deref());
+    if n == 0 {
+        return;
+    }
+    match lower_this_thread(n) {
+        Ok(v) => eprintln!("[fastlane] thread {name}: lower CPU priority (nice {v}; FASTLANE_NICE={n})"),
+        Err(e) => eprintln!("[fastlane] thread {name}: could not lower CPU priority ({e}); running at normal priority"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn nice_setting() {
+        assert_eq!(nice_from(None), 10);
+        assert_eq!(nice_from(Some("")), 10);
+        assert_eq!(nice_from(Some("0")), 0);
+        assert_eq!(nice_from(Some(" 15 ")), 15);
+        assert_eq!(nice_from(Some("20")), 10);
+        assert_eq!(nice_from(Some("-5")), 10, "never raises priority");
+        assert_eq!(nice_from(Some("junk")), 10);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn lowering_one_thread_leaves_the_others() {
+        let me_before = lower_this_thread(0).unwrap();
+        let got = std::thread::spawn(|| lower_this_thread(10).unwrap()).join().unwrap();
+        assert!(got >= 10, "the fast lane thread runs at nice {got}");
+        assert_eq!(lower_this_thread(0).unwrap(), me_before, "the calling thread is unchanged");
+    }
 
     fn fm(pairs: &[(&str, &str)]) -> FastlaneMode {
         let m: HashMap<String, String> = pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();

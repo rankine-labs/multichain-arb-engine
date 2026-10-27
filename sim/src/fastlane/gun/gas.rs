@@ -21,10 +21,10 @@
 //       time / block time) + margin: MAX_BLOCK_MARGIN blocks if set, else
 //       MAX_BLOCK_MARGIN_MS (default 3000) worth of blocks. That is Node's
 //       rule, kept for compatibility (deadline_block). The fast lane uses a
-//       tighter one (fast_deadline_block): FASTLANE_MAX_BLOCK_MARGIN blocks
-//       (default 2): a standing gap is only worth taking in the next block or
-//       two; later, the trade should fail cheaply on chain rather than land
-//       on a moved price.
+//       tighter one: the FEED TIP's own block + FASTLANE_MAX_BLOCK_MARGIN
+//       blocks (default 2; fast_margin, built in gun.rs plan): a standing
+//       gap is only worth taking in the next block or two; later, the trade
+//       should fail cheaply on chain rather than land on a moved price.
 //   STALE GUARD: block info older than 10 s -> no deadline -> no send
 //   ("block info stale"), exactly like the Node sender. A failed read keeps
 //   the last values (and they age into the stale guard).
@@ -250,8 +250,33 @@ impl Gas {
         Some(est + margin.floor() as u64)
     }
 
-    /// The fast lane's deadline: estimated current block + FASTLANE_MAX_BLOCK_MARGIN
-    /// (default 2). None = block info stale (same 10 s rule).
+    /// The fast lane's deadline margin in blocks (FASTLANE_MAX_BLOCK_MARGIN,
+    /// default 2). Final review blocker 2: the deadline is the FEED TIP's own
+    /// block + this (the block the trade was found on, straight from the
+    /// sequencer feed), never the block extrapolated from the public node's
+    /// last read (that read is up to 2 s old and its block-time guess can
+    /// drift, so the deadline could land too early or too late).
+    pub fn fast_margin(&self) -> u64 {
+        match self.cfg.fast_margin_blocks {
+            Some(m) if m.is_finite() && m >= 1.0 => m.floor() as u64,
+            _ => 2,
+        }
+    }
+
+    /// Block info / gas price read within the last 10 s (the same stale
+    /// guard as the Node sender: a live send needs a fresh gas price).
+    pub fn fresh(&self, now: Instant) -> bool {
+        let s = self.st.lock().unwrap();
+        match s.latest_block_at {
+            Some(at) if s.latest_block > 0 && s.max_fee_per_gas.is_some() => now.saturating_duration_since(at) <= Duration::from_secs(10),
+            _ => false,
+        }
+    }
+
+    /// The OLD fast lane deadline (estimated current block from the public
+    /// node + FASTLANE_MAX_BLOCK_MARGIN). No longer used to build trades
+    /// (see fast_margin); kept for status / comparison only.
+    /// None = block info stale (same 10 s rule).
     pub fn fast_deadline_block(&self, now: Instant) -> Option<u64> {
         let Some(m) = self.cfg.fast_margin_blocks else { return self.deadline_block(now) };
         let s = self.st.lock().unwrap();
@@ -351,6 +376,9 @@ mod tests {
         assert_eq!(g.deadline_block(Instant::now()), Some(256 + 60));
         // The fast lane's tighter deadline: 2 blocks.
         assert_eq!(g.fast_deadline_block(Instant::now()), Some(256 + 2));
+        assert_eq!(g.fast_margin(), 2);
+        assert!(g.fresh(Instant::now()));
+        assert!(!g.fresh(Instant::now() + Duration::from_secs(11)), "stale after 10 s");
         assert!(g.fast_deadline_block(Instant::now() + Duration::from_secs(11)).is_none());
         // Stale after 10 s.
         assert!(g.deadline_block(Instant::now() + Duration::from_secs(11)).is_none());

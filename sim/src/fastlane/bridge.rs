@@ -33,6 +33,14 @@
 //      millisecond) and reports back "ackSeq" = the highest seq it has
 //      handled. Rust keeps the gas of its own sends held against the loss
 //      caps until Node's ackSeq covers them (safety.rs).
+//      ONE WRITER AT A TIME (final review blocker 1): the fast lane thread
+//      writes send records and the sender thread writes "reply" lines. A
+//      lock covers handing out the seq, the rotation check and the write,
+//      so lines always appear in seq order and two writers can never both
+//      rotate (or write into a file that is being renamed).
+//      Reply lines carry "mode":"reply" (blocker 4), so a Node follower
+//      that predates the reply lines can never read one as a failed LIVE
+//      send; the current follower ignores them for send tracking.
 //
 //   3. Kill switch: data/KILL (KILL_FILE) or KILL_SWITCH=on. The file is
 //      looked at on EVERY check (one stat call, about a microsecond), so
@@ -45,6 +53,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -372,7 +381,8 @@ pub struct SendRecord {
     /// When written (ms since 1970). For people and reports only: Node
     /// never uses it to decide what it has already read.
     pub t: u64,
-    /// "live" or "practice".
+    /// "live", "practice", or "reply" (the sequencer's answer to an
+    /// earlier live send; never a send itself).
     pub mode: String,
     /// Transaction hash (live and accepted by the node). Practice: the hash
     /// of the throwaway-key transaction, if the gun gives one (never sent).
@@ -431,6 +441,8 @@ pub struct SendsLog {
     pub max_bytes: u64,
     /// The last seq handed out (the next record gets one more).
     last_seq: AtomicU64,
+    /// Blocker 1: held for seq + rotation + write (one writer at a time).
+    write_lock: Mutex<()>,
 }
 
 /// How much of the end of a sends file is read on start to find the last seq.
@@ -442,7 +454,7 @@ impl SendsLog {
     pub fn new(path: impl Into<PathBuf>, max_bytes: u64) -> SendsLog {
         let path = path.into();
         let last = last_seq_in(&path).max(last_seq_in(&Self::rotated(&path)));
-        SendsLog { path, max_bytes, last_seq: AtomicU64::new(last) }
+        SendsLog { path, max_bytes, last_seq: AtomicU64::new(last), write_lock: Mutex::new(()) }
     }
 
     pub fn from_lookup(get: &dyn Fn(&str) -> Option<String>) -> SendsLog {
@@ -486,11 +498,27 @@ impl SendsLog {
     /// Write one record. A record with seq 0 gets the next seq; the seq used
     /// is returned. Err = the line was not written (trading goes on; the
     /// seq stays used, so Safety simply keeps holding that send's gas).
+    /// Prefer `append_new` (seq handed out under the lock, so the file is
+    /// always in seq order).
     pub fn append(&self, rec: &SendRecord) -> Result<u64, String> {
+        let (seq, r) = self.append_new(rec);
+        r.map(|_| seq)
+    }
+
+    /// Write one record and return (its seq, written ok?). The seq is
+    /// handed out (seq 0) INSIDE the write lock, so lines can't land out of
+    /// seq order; it is returned even when the write failed (the seq stays
+    /// used: Safety keeps holding that send's gas until Node's ack passes it).
+    pub fn append_new(&self, rec: &SendRecord) -> (u64, Result<(), String>) {
+        let _g = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
         let seq = if rec.seq == 0 { self.next_seq() } else { rec.seq };
         if rec.seq != 0 {
             self.seed_at_least(rec.seq);
         }
+        (seq, self.write_locked(rec, seq))
+    }
+
+    fn write_locked(&self, rec: &SendRecord, seq: u64) -> Result<(), String> {
         let mut line = if rec.seq == seq {
             serde_json::to_vec(rec)
         } else {
@@ -513,7 +541,7 @@ impl SendsLog {
         // two of our lines mixed, and a partial last line only if the disk
         // is full (the Node reader skips lines that don't parse).
         f.write_all(&line).map_err(|e| e.to_string())?;
-        Ok(seq)
+        Ok(())
     }
 }
 
@@ -689,6 +717,42 @@ mod tests {
         let m: HashMap<String, String> = [("FASTLANE_SENDS_FILE", p.to_string_lossy().to_string()), ("FASTLANE_STATE_FILE", st.to_string_lossy().to_string())].into_iter().map(|(k, v)| (k.to_string(), v)).collect();
         let get = |k: &str| m.get(k).cloned();
         assert_eq!(SendsLog::from_lookup(&get).append(&rec).unwrap(), 41);
+    }
+
+    /// Blocker 1: two threads writing at once (sends + replies), with
+    /// rotation on: every line whole, seqs strictly in file order, each seq
+    /// once, nothing lost across the rotation.
+    #[test]
+    fn concurrent_writers_keep_seq_order_across_rotation() {
+        let d = tmpdir("conc");
+        let log = std::sync::Arc::new(SendsLog::new(d.join("sends.jsonl"), 20_000));
+        let mut hs = Vec::new();
+        for w in 0..4u8 {
+            let log = log.clone();
+            hs.push(std::thread::spawn(move || {
+                for i in 0..150u32 {
+                    let mode = if w % 2 == 0 { "live" } else { "reply" };
+                    let rec = SendRecord { t: 1, mode: mode.into(), label: format!("w{w}-{i}-{}", "x".repeat(60)), amount_in: "1".into(), ..Default::default() };
+                    let (_, r) = log.append_new(&rec);
+                    r.unwrap();
+                }
+            }));
+        }
+        for h in hs {
+            h.join().unwrap();
+        }
+        let mut all = seqs(&d.join("sends.jsonl.1"));
+        let cur = seqs(&d.join("sends.jsonl"));
+        // Within each file: strictly increasing (file order = seq order).
+        assert!(all.windows(2).all(|w| w[0] < w[1]), "rotated file in order");
+        assert!(cur.windows(2).all(|w| w[0] < w[1]), "current file in order");
+        assert!(all.last().copied().unwrap_or(0) < cur[0], "rotation never reorders");
+        all.extend(cur);
+        // The newest 600 seqs: the last one is 600 and none repeats.
+        assert_eq!(*all.last().unwrap(), 600);
+        let mut u = all.clone();
+        u.dedup();
+        assert_eq!(u.len(), all.len(), "no seq twice");
     }
 
     #[test]

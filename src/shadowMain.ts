@@ -97,7 +97,7 @@ import { ROBINHOOD_SCAN_FACTORIES } from './config/knownAddresses';
 // Uniswap V4 in the chain-wide scan, asked PER PAIR (core/v4Lookup.ts), not
 // from V4's history (that ran out of memory twice on Oct 9). RH_V4_SCAN=0 off.
 const RH_V4_SCAN = process.env.RH_V4_SCAN !== '0';
-import { buildExecuteCall, executionRequested, executorConfig, pickV3Lender, kindForPool, v4KeyMatchesId, KIND_V4_HOOKED } from './execution/executorCalldata';
+import { buildExecuteCall, executionRequested, executorConfig, pickV3Lender, kindForPool, v4KeyMatchesId, v4KeyOf, KIND_V4_HOOKED } from './execution/executorCalldata';
 import { GasModel, GasCalibration, gasSettingsFromEnv, routeKeyFor, twoPoolKey, defaultUnitsFor, costsLine, loopKey } from './core/gasModel';
 import { recordEventFee, eventFeeCounts, feeFromEventsOn, setHeadBlockSource, currentHeadBlock } from './core/eventFees';
 import { OwnMoneyBook, useOwnMoney, fitTradeToWallet } from './core/ownMoney';
@@ -174,7 +174,7 @@ import { setHookedFeeSource } from './core/pairWatcher';
 import { SimBucketTally, classifySimOutcome } from './core/failReasons';
 import { makeRpc, simulateRoundTrip, simulateWithRecheck, simRpcUrl, Rpc, makeFallbackRpc, loadBalanceSlots, wssToHttps, replayRpc, ReplayCall, SimResult } from './execution/simulator';
 import { FastSender, SafetyGate, safetyConfigFromEnv, RUST_IS_SENDER } from './execution/fastSender';
-import { fastlaneModeFromEnv, FastlaneStateWriter, FastlaneSendsFollower, RustSendStats, pairRows, practiceHourSummary, routePairs } from './execution/fastlaneBridge';
+import { fastlaneModeFromEnv, FastlaneStateWriter, FastlaneSendsFollower, RustSendStats, pairRows, practiceHourSummary, routePairs, writeStartupSenderGuard, V4KeyCheckCache } from './execution/fastlaneBridge';
 import { DEFAULT_FILTER_CONFIG } from './core/fastFilter';
 import { checkLiveReady } from './execution/liveReadiness';
 import { LiveTradeTracker, Funding, LiveResult } from './execution/liveTracker';
@@ -1402,6 +1402,16 @@ const robinhoodSender = new FastSender(
       // (batchStallTime) to bundle it with others; a trade must leave at once.
       new ethers.JsonRpcProvider(robinhoodSendRpc(), 4663, { staticNetwork: true, batchMaxCount: 1, batchStallTime: 0 }),
 );
+// STARTUP SENDER GUARD (fast lane, final review blocker 3): before this
+// bot's sender can broadcast anything, and whatever FASTLANE says, tell the
+// Rust fast lane "the Node bot is the sender" (state file rustSender:false)
+// when RUST_SENDER is off here, so a Rust gun that still trusted an older
+// "true" stops at once (execution/fastlaneBridge.ts writeStartupSenderGuard).
+{
+      const g = writeStartupSenderGuard(process.env.FASTLANE_STATE_FILE || 'data/fastlane-state.json', robinhoodSender.rustIsSender);
+      if (g === 'written') console.log('[fastlane] startup: state file says rustSender:false (this bot is the sender)');
+      else if (g === 'failed') console.log('[fastlane] startup: could not write the state file (Rust blocks every send once it is 10 s old)');
+}
 // Deploy lock: live trades in flight are counted in data/inflight.json so
 // auto-deploy never restarts the bot mid-trade (live only; deploy/auto-deploy.sh).
 robinhoodSender.trackInflight(process.env.INFLIGHT_FILE || 'data/inflight.json');
@@ -3407,6 +3417,8 @@ if (FASTLANE_MODE !== 'off' && chainOn('robinhood')) {
             console.log(`[live-block] ${r.label}: rust live trade failed, its pool pairs not sent for ${GAP_LIVE_FAIL_BLOCK_MIN} min`);
       };
       const killFile = process.env.KILL_FILE ?? 'data/KILL';
+      // M-1: the V4 key check (ABI encode + keccak) remembered per pool id + key fields.
+      const v4KeyCheck = new V4KeyCheckCache(v4KeyMatchesId, (p) => { const k = v4KeyOf(p); return `${p.poolAddress}|${k.currency0}|${k.currency1}|${k.fee}|${k.tickSpacing}|${k.hooks}`.toLowerCase(); });
       const writer = new FastlaneStateWriter(process.env.FASTLANE_STATE_FILE || 'data/fastlane-state.json', {
             now: Date.now,
             lossTodayUsd: () => safetyGate.lossTodayUsd(),
@@ -3419,7 +3431,7 @@ if (FASTLANE_MODE !== 'off' && chainOn('robinhood')) {
             failBlocks: () => pairRows(gapFailBlocks.entries(), Date.now()),
             // Pools a real trade may use: exchange cleared, not practice-only,
             // live coin rule (liveBlocker), and a pool type the contract can run.
-            livePools: () => copy2PoolKeys().filter((k) => { const p = cache.get('robinhood', k); return !!p && !liveBlocker(p, p) && kindForPool(p) !== null && (kindForPool(p) !== KIND_V4_HOOKED || v4KeyMatchesId(p)); }),
+            livePools: () => copy2PoolKeys().filter((k) => { const p = cache.get('robinhood', k); return !!p && !liveBlocker(p, p) && kindForPool(p) !== null && (kindForPool(p) !== KIND_V4_HOOKED || v4KeyCheck.matches(p)); }),
             paused: () => ({ gap: scoreboard.pausedWhy('gap'), loop: scoreboard.pausedWhy('loop') }),
             loopLossUsd: () => (loopLive?.lossTodayUsd() ?? 0) + (entryLoopSender?.lossTodayUsd() ?? 0) + rustLoopLoss(),
             loopPaused: () => !!(loopLive?.pausedToday() || entryLoopSender?.pausedToday()),

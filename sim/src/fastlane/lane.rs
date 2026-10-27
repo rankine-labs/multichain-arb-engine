@@ -22,6 +22,10 @@
 //          RECORD  Safety::record_send (rate limit, pool hold, gas held)
 //     3. PRACTICE scoring (fastlane/practice.rs): every would-send is
 //        remembered and labelled once copy 2 confirms the block.
+//   CPU (final review H-1): this thread runs at a lower OS priority
+//   (FASTLANE_NICE, default 10), the scan has a 5 ms budget per block
+//   (FASTLANE_SCAN_BUDGET_MS) and practice re-checks a 3 ms budget per call
+//   (FASTLANE_PRACTICE_BUDGET_MS).
 //   Between tips it also:
 //     - reads Node's feedback from the state file (review H4): dropsSeen
 //       changed -> the gun's nonce is re-read; maxGasUsed -> gas limit tuning,
@@ -162,6 +166,10 @@ struct BookInner {
     /// endpoint answers while the lane is still writing): held here and
     /// written right after the send record, so the log is always in order.
     early: HashMap<String, SendOutcome>,
+    /// Early replies that did not fit (more than 64 waiting): counted, not
+    /// silently lost (final review, low). Node then simply waits for the
+    /// receipt of that send (as if no reply had come).
+    early_dropped: u64,
 }
 
 #[derive(Default)]
@@ -200,8 +208,14 @@ impl ReplyBook {
         }
         if g.early.len() < 64 {
             g.early.insert(h, o.clone());
+        } else {
+            g.early_dropped += 1;
         }
         None
+    }
+    /// Early replies dropped because too many were waiting (status).
+    pub fn early_dropped(&self) -> u64 {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).early_dropped
     }
     fn forget_later(&self, rid: String) {
         let mut f = self.forget.lock().unwrap_or_else(|e| e.into_inner());
@@ -223,10 +237,13 @@ fn write_reply(log: &SendsLog, book: &ReplyBook, o: &SendOutcome, seq: u64, rid:
     let mut t = BTreeMap::new();
     t.insert("reply".to_string(), o.reply_us);
     t.insert("sequencer".to_string(), o.wait_us);
+    // Blocker 4: mode "reply" (never "live"): an older Node follower can't
+    // read it as a failed live send. seq 0 = handed out under the log's
+    // write lock (blocker 1), so it lands after its send in seq order.
     let rec = SendRecord {
         seq: 0,
         t: wall_ms(),
-        mode: "live".into(),
+        mode: "reply".into(),
         kind: Some("reply".into()),
         reply_to: Some(seq),
         reply_hash: Some(o.hash.clone()),
@@ -380,7 +397,10 @@ impl Lane {
         let call = to_call_input(o);
         let mut core = self.core.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
-        core.safety.state.refresh(now, false);
+        // Blocker 3: always look at the state file right before a fire (one
+        // stat; re-read only if it changed), so Node's startup guard
+        // ("rustSender": false) stops the very next fire, not up to 200 ms later.
+        core.safety.state.refresh(now, true);
         self.gate.sync_from(&core.safety);
         if let Err(r) = core.safety.check(&inp, now) {
             *self.hour.blocked.entry(r.code).or_default() += 1;
@@ -416,7 +436,6 @@ impl Lane {
             res.record = Some(rec);
             return res;
         }
-        let seq = self.log.next_seq();
         let mut t = BTreeMap::new();
         t.insert("apply".to_string(), apply_us);
         t.insert("scan".to_string(), o.scan_us);
@@ -431,8 +450,8 @@ impl Lane {
             (Some(_), Some(fee)) if o.size_usd > 0.0 => Some((fee / o.size_usd * 1_000_000.0).round() as u32),
             _ => None,
         };
-        let sr = SendRecord {
-            seq,
+        let mut sr = SendRecord {
+            seq: 0,
             t: wall_ms(),
             mode: if live { "live".into() } else { "practice".into() },
             hash: rec.hash.clone(),
@@ -454,7 +473,12 @@ impl Lane {
             status: rec.send_status.map(|s| s.as_str().to_string()),
             ..Default::default()
         };
-        if self.log.append(&sr).is_err() {
+        // Blocker 1: the seq is handed out under the log's write lock, so a
+        // reply line written by the sender thread at the same moment can
+        // never land before this record with a lower seq.
+        let (seq, wrote) = self.log.append_new(&sr);
+        sr.seq = seq;
+        if wrote.is_err() {
             // Trading goes on (bridge.rs); the seq stays used, Safety keeps
             // holding the gas until Node's ack passes it.
             self.hour.log_errors += 1;
@@ -535,7 +559,11 @@ impl Lane {
         json!({
             "mode": self.gun.mode().as_str(),
             "upS": self.started.elapsed().as_secs(),
-            "ahead": crate::copy2::ahead::status_json().map(|a| json!({"tip": a.get("tip"), "stopped": a.get("stopped"), "agreementPct": agreement_pct()})),
+            "ahead": crate::copy2::ahead::status_json().map(|a| {
+                let p = crate::copy2::ahead::prediction_counts().unwrap_or_default();
+                json!({"tip": a.get("tip"), "stopped": a.get("stopped"), "agreementPct": p.agreement_pct(), "unsurePct": p.unsure_pct(), "unpredictedPct": p.unpredicted_pct(), "stoppedPct": p.stopped_pct(), "overBudget": p.over_budget})
+            }),
+            "copy2Runs": super::c2runner::stats_json(),
             "scan": {"routes": self.scanner.routes(), "hour": super::scan::status_json()},
             "gun": {
                 "broadcasting": self.gun.broadcasting(),
@@ -544,6 +572,7 @@ impl Lane {
                 "fires": self.gun.fires.load(Ordering::Relaxed),
                 "nonceInFlight": self.gun.nonce().in_flight(),
                 "replies": *self.book.replies.lock().unwrap_or_else(|e| e.into_inner()),
+                "earlyRepliesDropped": self.book.early_dropped(),
             },
             "safety": {"killed": killed, "state": state, "blockedThisHour": h.blocked},
             "lane": {
@@ -571,7 +600,7 @@ impl Lane {
             h.drops_seen, h.gas_notes,
         );
         self.last_hour = Some(h);
-        let practice = self.practice.take_hour(agreement_pct());
+        let practice = self.practice.take_hour(crate::copy2::ahead::prediction_counts());
         vec![lane, super::scan::take_hour(), practice]
     }
 }
@@ -639,6 +668,8 @@ pub fn start(c2: crate::copy2::intake::Copy2Handle) -> bool {
     std::thread::Builder::new()
         .name("arbsim-fastlane".into())
         .spawn(move || {
+            // H-1: lower CPU priority (FASTLANE_NICE, default 10).
+            super::mode::lower_this_thread_from_env("arbsim-fastlane");
             let mut last = 0u64;
             let mut hour = Instant::now();
             let mut status_at = Instant::now();

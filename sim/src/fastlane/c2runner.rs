@@ -27,8 +27,15 @@
 //   Works on copy 2's confirmed versions AND on the predicted view (copy2/
 //   ahead.rs): the facts are taken for the view's block (pools ready since
 //   then), and pending reports of earlier blocks still block an answer.
+//
+//   Counted on their own (final review, low): copy 2's PoolManager-bound and
+//   protocol-fee counters (pm_bound_*, pm_high_*, protocol_fee_*) are about
+//   the BOT's checks. Runs made from here are counted in this file instead
+//   (status "fastlane" -> "copy2Runs"), so the fast lane can't blur them.
 // ============================================================================
-use std::sync::Arc;
+use std::cell::Cell;
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 
 use revm::primitives::U256;
 use serde_json::{json, Value};
@@ -42,6 +49,44 @@ use crate::check::{CheckUnknown, UnknownReason};
 use crate::copy2::intake::Copy2Handle;
 use crate::state::snap::View;
 use crate::state::StateRead;
+
+thread_local! {
+    /// True while this thread runs a fast lane check through copy 2's code.
+    static IN_FASTLANE: Cell<bool> = const { Cell::new(false) };
+}
+
+/// The fast lane's own copy-2 run counters (name -> count), process-wide.
+static RUN_STATS: Mutex<BTreeMap<&'static str, u64>> = Mutex::new(BTreeMap::new());
+
+/// copy2/intake.rs note_*: if this thread is running a fast lane check,
+/// count `what` here and return true (copy 2's own counter is skipped).
+pub fn note_if_fastlane(what: &'static str) -> bool {
+    if !IN_FASTLANE.with(|f| f.get()) {
+        return false;
+    }
+    *RUN_STATS.lock().unwrap_or_else(|e| e.into_inner()).entry(what).or_default() += 1;
+    true
+}
+
+/// The fast lane's copy-2 run counters since start (status).
+pub fn stats_json() -> Value {
+    let m = RUN_STATS.lock().unwrap_or_else(|e| e.into_inner());
+    Value::Object(m.iter().map(|(k, v)| (k.to_string(), json!(v))).collect())
+}
+
+/// Marks this thread as running a fast lane check until dropped.
+struct FastlaneRun(bool);
+impl FastlaneRun {
+    fn enter() -> FastlaneRun {
+        FastlaneRun(IN_FASTLANE.with(|f| f.replace(true)))
+    }
+}
+impl Drop for FastlaneRun {
+    fn drop(&mut self) {
+        let prev = self.0;
+        IN_FASTLANE.with(|f| f.set(prev));
+    }
+}
 
 /// The scanner's runner on copy 2 (see the file header).
 pub struct Copy2Runner {
@@ -160,7 +205,10 @@ pub fn run_on_copy2(c2: &Copy2Handle, snap: &Arc<crate::state::snap::Snapshot>, 
     };
     let run = |v: &dyn StateRead, b: &BlockCtx| result_json(&size_search_opts(v, b, overrides, &[], &template, amounts, CheckOptions::default()));
     let runs = std::cell::RefCell::new(crate::server::RunLog::default());
-    let mut answer = crate::server::copy2_runs(c2, &view, &facts, ctx, &runs, &run);
+    let mut answer = {
+        let _mark = FastlaneRun::enter();
+        crate::server::copy2_runs(c2, &view, &facts, ctx, &runs, &run)
+    };
     if answer.get("ok") == Some(&Value::Bool(true)) {
         // A pool on the route may still be missing reports of this block
         // (same rule as server.rs after_pick_with): never answer from it.
@@ -180,6 +228,21 @@ pub fn run_on_copy2(c2: &Copy2Handle, snap: &Arc<crate::state::snap::Snapshot>, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fastlane_runs_are_counted_apart() {
+        assert!(!note_if_fastlane("pmBoundSame"), "outside a fast lane run: copy 2's own counter");
+        {
+            let _m = FastlaneRun::enter();
+            assert!(note_if_fastlane("pmBoundSame"));
+            {
+                let _inner = FastlaneRun::enter();
+            }
+            assert!(note_if_fastlane("pmBoundSame"), "nested marks restore the outer one");
+        }
+        assert!(!note_if_fastlane("pmBoundSame"), "the mark ends with the run");
+        assert!(stats_json()["pmBoundSame"].as_u64().unwrap() >= 2);
+    }
 
     #[test]
     fn json_round_trip_keeps_every_field() {

@@ -440,7 +440,7 @@ fn settings_and_switch() {
     };
     assert_eq!(env(&[]), ScanConfig::default());
     assert_eq!(ScanConfig::default().min_net_usd, 0.25, "review L5: the bot's own default");
-    assert_eq!(ScanConfig::default().budget_us, 15_000);
+    assert_eq!(ScanConfig::default().budget_us, 5_000, "final review H-1: 5 ms per block");
     assert_eq!(env(&[("MIN_EXEC_NET_USD", "0.25")]).min_net_usd, 0.25);
     assert_eq!(env(&[("MIN_EXEC_NET_USD", "0.25"), ("FASTLANE_MIN_NET_USD", "0.5")]).min_net_usd, 0.5);
     assert_eq!(env(&[("FASTLANE_MIN_NET_USD", "-1")]).min_net_usd, 0.25);
@@ -448,7 +448,7 @@ fn settings_and_switch() {
     assert_eq!(env(&[("FASTLANE_DEDUPE_BLOCKS", "5")]).dedupe_blocks, 5);
     assert_eq!(env(&[("FASTLANE_ROUTE_MAX_US", "junk")]).route_max_us, 5_000);
     assert_eq!(env(&[("FASTLANE_SCAN_BUDGET_MS", "7.5")]).budget_us, 7_500);
-    assert_eq!(env(&[("FASTLANE_SCAN_BUDGET_MS", "junk")]).budget_us, 15_000);
+    assert_eq!(env(&[("FASTLANE_SCAN_BUDGET_MS", "junk")]).budget_us, 5_000);
     assert_eq!(env(&[("FASTLANE_SWEEP_PER_BLOCK", "3")]).sweep_per_block, 3);
     for (v, on) in [(None, false), (Some(""), false), (Some("off"), false), (Some("bogus"), false), (Some("practice"), true), (Some(" LIVE "), true), (Some("shadow"), true)] {
         assert_eq!(fastlane_on(v), on, "{v:?}");

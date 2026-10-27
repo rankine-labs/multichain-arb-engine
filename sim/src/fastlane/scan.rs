@@ -95,7 +95,9 @@ pub fn fastlane_on(raw: Option<&str>) -> bool {
 /// Scanner settings (env names in brackets with defaults).
 #[derive(Clone, Debug, PartialEq)]
 pub struct ScanConfig {
-    /// FASTLANE_SCAN_BUDGET_MS [15]: wall time one block's scan may use.
+    /// FASTLANE_SCAN_BUDGET_MS [5]: wall time one block's scan may use
+    /// (final review H-1: was 15; at ~10 blocks a second, 15 ms per block
+    /// could keep a whole CPU of the 2 busy).
     pub budget_us: u64,
     /// FASTLANE_SWEEP_PER_BLOCK [8]: rolling-sweep routes per block (at most).
     pub sweep_per_block: usize,
@@ -131,7 +133,7 @@ pub const BOT_MIN_NET_USD: f64 = 0.25;
 impl Default for ScanConfig {
     fn default() -> Self {
         ScanConfig {
-            budget_us: 15_000,
+            budget_us: 5_000,
             sweep_per_block: 8,
             sweep_reserve_pct: 25,
             max_changed: 64,

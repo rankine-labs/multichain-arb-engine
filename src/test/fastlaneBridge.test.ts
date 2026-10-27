@@ -4,7 +4,7 @@ import { tmpdir } from 'os';
 import { ethers } from 'ethers';
 import {
   fastlaneModeFromEnv, buildFastlaneState, FastlaneStateWriter, FastlaneSendsFollower, parseSendLine, pairRows, practiceHourSummary, routePairs,
-  StateSources, RustSendRecord, RustSendStats,
+  StateSources, RustSendRecord, RustSendStats, writeStartupSenderGuard, V4KeyCheckCache,
 } from '../execution/fastlaneBridge';
 import { FastSender, RUST_IS_SENDER, rustSenderOn, SafetyGate } from '../execution/fastSender';
 import { LiveTradeTracker } from '../execution/liveTracker';
@@ -316,12 +316,56 @@ function integration() {
   assert(fl.ackSeq >= (live[0].seq ?? 0), `ackSeq covers the live send (${fl.ackSeq})`);
   // Practice summary line from the practice file.
   const pf = join(d, 'fastlane-practice.jsonl');
-  writeFileSync(pf, JSON.stringify({ kind: 'score', t: now }) + '\n' + JSON.stringify({ kind: 'hour', t: now, scored: 10, realPct: 60, takenPct: 30, handP50Us: 4200, handP90Us: 9100, agreementPct: 97.5, estUsd: 3.25 }) + '\n');
+  writeFileSync(pf, JSON.stringify({ kind: 'score', t: now }) + '\n' + JSON.stringify({ kind: 'hour', t: now, scored: 10, realPct: 60, takenPct: 30, handP50Us: 4200, handP90Us: 9100, agreementPct: 97.5, unsurePct: 4, unpredictedPct: 12, stoppedPct: 3, estUsd: 3.25 }) + '\n');
   const ps = practiceHourSummary(pf, 7_200_000, now);
+  assert(ps.includes('(unsure 4%, unpredicted 12%, stopped 3%)') && ps.includes('upper bound') && ps.includes('excl. sequencer trip'), `practice summary shows the shares and caveats (${ps})`);
   assert(ps.includes('real 60%') && ps.includes('taken by others 30%') && ps.includes('p50 4.2 ms') && ps.includes('agreement 98%') && ps.includes('$3.25'), `practice summary line (${ps})`);
   assert(practiceHourSummary(pf, 1_000, now + 10_000) === '' && practiceHourSummary(join(d, 'none.jsonl')) === '', 'old or missing practice summary = nothing');
   rmSync(d, { recursive: true, force: true });
 }
 integration();
+
+// ---- final review fixes -------------------------------------------------------
+function finalReview() {
+  const d = mkdtempSync(join(tmpdir(), 'fastlane-final-'));
+  // Blocker 3: startup guard. An old file says rustSender:true (Rust was the
+  // sender); this bot starts with RUST_SENDER off: the file says false at once
+  // (fresh writtenMs, so Rust re-reads it now), keeping ackSeq / dropsSeen.
+  const sf = join(d, 'fastlane-state.json');
+  writeFileSync(sf, JSON.stringify({ v: 1, writtenMs: 5, rustSender: true, ackSeq: 41, dropsSeen: 2, maxGasUsed: 900_000, allowlist: ['0xaaa'] }));
+  assert(writeStartupSenderGuard(sf, false, 1_000) === 'written', 'startup guard writes when this bot is the sender');
+  const g = JSON.parse(readFileSync(sf, 'utf8'));
+  assert(g.rustSender === false && g.writtenMs === 1_000 && g.ackSeq === 41 && g.dropsSeen === 2 && !g.allowlist, `stale "true" replaced by rustSender:false, ack kept, nothing allowed (${JSON.stringify(g)})`);
+  writeFileSync(sf, JSON.stringify({ v: 1, writtenMs: 5, rustSender: true }));
+  assert(writeStartupSenderGuard(sf, true) === 'skipped' && JSON.parse(readFileSync(sf, 'utf8')).rustSender === true, 'RUST_SENDER on here: left alone (the writer says true)');
+  assert(writeStartupSenderGuard(join(d, 'new', 'state.json'), false) === 'written', 'no file yet: written (folder made)');
+  // Blocker 4: a reply line with mode "reply" is never a send (old or new shape).
+  const f = join(d, 'sends.jsonl');
+  const now = Date.now();
+  const base = { t: now, label: 'x', block: 1, tokenIn: '', amountIn: '', sizeUsd: 0, expectedNetUsd: 0, gasUsd: 0, pools: [], totalUs: 0 };
+  writeFileSync(f, [
+    { ...base, seq: 1, mode: 'live', hash: '0x' + '1'.repeat(64), pools: ['0xa', '0xb'] },
+    { ...base, seq: 2, mode: 'reply', kind: 'reply', replyTo: 1, replyHash: '0x' + '1'.repeat(64), status: 'refused', error: 'nonce too low' },
+    { ...base, seq: 3, mode: 'reply', replyTo: 1, replyHash: '0x' + '1'.repeat(64), status: 'accepted' },
+  ].map((r) => JSON.stringify(r)).join('\n') + '\n');
+  const live: RustSendRecord[] = []; const failed: RustSendRecord[] = []; const replies: RustSendRecord[] = []; const prac: RustSendRecord[] = [];
+  const fl = new FastlaneSendsFollower(f, { onLiveSent: (r) => live.push(r), onLiveSendFailed: (r) => failed.push(r), onLiveReply: (r) => replies.push(r), onPractice: (r) => prac.push(r) }, join(d, 'follow.json'));
+  fl.poll();
+  assert(live.length === 1 && failed.length === 0 && prac.length === 0 && replies.length === 2, `mode "reply" lines are replies only (live ${live.length}, failed ${failed.length}, practice ${prac.length}, replies ${replies.length})`);
+  assert(fl.ackSeq === 3, 'ackSeq still covers the reply lines');
+  // M-1: the V4 key check is remembered per pool id + key fields.
+  let calls = 0;
+  const pool = (fee: number) => ({ poolAddress: '0xID', fee } as unknown as import('../core/types').PoolState);
+  const c = new V4KeyCheckCache(() => { calls++; return true; }, (p) => `${p.poolAddress}|${(p as unknown as { fee: number }).fee}`);
+  for (let i = 0; i < 100; i++) c.matches(pool(3000));
+  assert(calls === 1 && c.hits === 99, `one real check for 100 asks of the same pool (${calls})`);
+  c.matches(pool(500));
+  assert(calls === 2, 'a changed key field is checked again');
+  const small = new V4KeyCheckCache(() => true, (p) => p.poolAddress, 3);
+  for (let i = 0; i < 10; i++) small.matches({ poolAddress: `0x${i}` } as unknown as import('../core/types').PoolState);
+  assert(small.size === 3, 'bounded');
+  rmSync(d, { recursive: true, force: true });
+}
+finalReview();
 
 main().catch((e) => { console.error(e); process.exitCode = 1; });

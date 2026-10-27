@@ -18,7 +18,10 @@
 //   off       nothing is created (Gun::from_env returns None).
 //   practice  everything, signing included, with a THROWAWAY random key;
 //             never broadcasts; logs "would send" with the timings. Never
-//             reads the real key and never talks to the send endpoint.
+//             reads the real key and makes NO network calls at all (final
+//             review M-2: no gas / nonce refresher thread; the gas price in
+//             a practice transaction is 0 until something sets it, the
+//             deadline comes from the feed's own block number).
 //   live      broadcasts only when ALL of these hold (otherwise it runs as
 //             practice and says why at start):
 //               FASTLANE=live and RUST_SENDER=on (one sender at a time: the
@@ -39,12 +42,14 @@
 // Same rules as the Node sender (src/execution/fastSender.ts + the loop
 // senders in trigEntryLoops.ts / loopLive.ts):
 //   type 2, chain 4663, value 0, tip 0, maxFee = 2 x base fee + 1,
-//   gas limit = tuned limit + 1.5 x posting gas, maxBlock = the fast lane's
-//   deadline (FASTLANE_MAX_BLOCK_MARGIN blocks ahead, default 2; Node's
-//   MAX_BLOCK_MARGIN rule stays in gas.rs for compatibility)
-//   (live: refuses with "block info stale" when block info is > 10 s old;
-//   practice: the same estimate when known, else 0. The Node dry run always
-//   uses 0; practice uses the real estimate so its bytes look like live ones),
+//   gas limit = tuned limit + 1.5 x posting gas, maxBlock = the block the
+//   trade was found on (the FEED TIP's own block number, CallInput.block) +
+//   FASTLANE_MAX_BLOCK_MARGIN (default 2) (final review blocker 2: never the
+//   block guessed from the public node's last read; Node's MAX_BLOCK_MARGIN
+//   rule stays in gas.rs for compatibility)
+//   (live: refuses with "block info stale" when the gas price / block info
+//   is > 10 s old, and "no block number" without a feed block; practice
+//   builds the same maxBlock, so its bytes look like live ones),
 //   minProfit = usdToTokenUnits(net after gas, price, decimals), refused if it
 //   rounds to zero, "no trade contract set" if live without an executor.
 //
@@ -317,12 +322,14 @@ impl Gun {
         } else {
             Signer::random()?
         };
-        let rpc: Arc<dyn ReadRpc> = match rpc {
-            Some(r) => r,
-            None => Arc::new(UreqRpc::new(
+        // M-2: practice never talks to a node (no read connection at all).
+        let rpc: Option<Arc<dyn ReadRpc>> = match rpc {
+            Some(r) => Some(r),
+            None if !broadcast => None,
+            None => Some(Arc::new(UreqRpc::new(
                 get("ROBINHOOD_FAST_RPC").filter(|s| !s.trim().is_empty()).unwrap_or_else(|| super::rpc::ROBINHOOD_PUBLIC_RPC.to_string()).trim(),
                 Duration::from_millis(num("FASTLANE_READ_TIMEOUT_MS", 4000)),
-            )),
+            ))),
         };
         let pool = if broadcast {
             let conns = num("FASTLANE_SEND_CONNS", 2) as usize;
@@ -340,7 +347,7 @@ impl Gun {
             hand_timeout: Duration::from_millis(num("FASTLANE_SEND_TIMEOUT_MS", 5000)),
             max_queue: max_queue_from(get("FASTLANE_MAX_QUEUE_MS").as_deref()),
         };
-        let gun = Gun::with_parts(cfg, signer, Some(rpc), pool, gate, on_reply, GasConfig::from_env());
+        let gun = Gun::with_parts(cfg, signer, rpc, pool, gate, on_reply, GasConfig::from_env());
         gun.start_background();
         eprintln!(
             "[fastlane] gun ready: mode {}, wallet {:#x}, {}",
@@ -378,10 +385,15 @@ impl Gun {
         }
     }
 
-    /// Start the gas refresher (every 2 s); in live mode it also loads /
-    /// re-syncs the nonce off the fire path.
-    pub fn start_background(&self) {
-        let Some(rpc) = self.rpc.clone() else { return };
+    /// Start the gas refresher (every 2 s); it also loads / re-syncs the
+    /// nonce off the fire path. LIVE ONLY (final review M-2): in practice
+    /// nothing is broadcast, so the gun makes no network calls at all.
+    /// Returns true when the refresher was started.
+    pub fn start_background(&self) -> bool {
+        if !self.cfg.broadcast {
+            return false;
+        }
+        let Some(rpc) = self.rpc.clone() else { return false };
         let also: Box<dyn Fn() + Send> = if self.cfg.broadcast {
             let (nonce, rpc2, who) = (self.nonce.clone(), rpc.clone(), self.signer.address());
             Box::new(move || resync_if_wanted(&nonce, rpc2.as_ref(), who))
@@ -389,6 +401,7 @@ impl Gun {
             Box::new(|| {})
         };
         spawn_refresher(self.gas.clone(), rpc, self.stop.clone(), also);
+        true
     }
 
     pub fn address(&self) -> Address {
@@ -438,8 +451,12 @@ impl Gun {
         self.nonce.dropped();
     }
 
-    /// Not ready to send live (None = ready).
+    /// Not ready to send live (None = ready). Practice needs nothing from
+    /// the network, so it is always ready.
     pub fn not_ready(&self) -> Option<&'static str> {
+        if !self.cfg.broadcast {
+            return None;
+        }
         if self.gas.max_fee().is_none() {
             return Some("gas price not read yet");
         }
@@ -451,12 +468,16 @@ impl Gun {
 
     /// Build the contract call (same steps as the Node loop senders).
     pub fn plan(&self, c: &CallInput, now: Instant) -> Result<CallPlan, String> {
-        // The fast lane's own, tighter deadline (FASTLANE_MAX_BLOCK_MARGIN).
-        let deadline = self.gas.fast_deadline_block(now);
-        let max_block = match (self.cfg.broadcast, deadline) {
-            (true, None) => return Err("block info stale".into()),
-            (_, d) => U256::from(d.unwrap_or(0)),
-        };
+        // Blocker 2: the deadline is the feed tip's OWN block (the block
+        // the trade was found on) + FASTLANE_MAX_BLOCK_MARGIN. Live still
+        // needs fresh block info (the gas price must be current).
+        if self.cfg.broadcast && !self.gas.fresh(now) {
+            return Err("block info stale".into());
+        }
+        if self.cfg.broadcast && c.block == 0 {
+            return Err("no block number".into());
+        }
+        let max_block = U256::from(c.block.saturating_add(self.gas.fast_margin()));
         let min_profit = match usd_to_token_units(c.net_usd, c.usd_per_token_in, c.token_in_decimals) {
             Units::Exact(v) if !v.is_zero() => v,
             Units::Exact(_) => return Err("profit floor rounds to zero".into()),

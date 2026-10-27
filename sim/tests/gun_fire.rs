@@ -625,3 +625,49 @@ fn tls_chain_id_on_real_sequencer() {
     assert_eq!(v2, json!("0x1237"));
     assert_eq!(c.opened, 1, "second call must reuse the connection");
 }
+
+/// Final review blocker 2: maxBlock = the FEED block the trade was found on
+/// + FASTLANE_MAX_BLOCK_MARGIN (2), never the block guessed from the public
+/// node (here 500, far behind the feed's 1000). Live without a block
+/// number is refused.
+#[test]
+fn deadline_is_the_feed_block_plus_margin() {
+    let read = Arc::new(FakeRead { nonce: AtomicU64::new(1), block: AtomicU64::new(500) });
+    // plan() needs no send connection.
+    let gun = Gun::with_parts(live_cfg(Some(addr(0xee))), Signer::random().unwrap(), Some(read.clone()), None, RealGate::on(), Arc::new(|_: &SendOutcome| {}), gas_cfg());
+    gun.gas().refresh(read.as_ref()).unwrap();
+    let c = input(2, Funding::Own);
+    assert_eq!(c.block, 1000);
+    let p = gun.plan(&c, Instant::now()).unwrap();
+    assert_eq!(p.max_block, U256::from(1002u64), "feed block 1000 + 2");
+    // A much later moment changes nothing (no extrapolation) until the gas
+    // info is stale, which refuses (live).
+    assert_eq!(gun.plan(&c, Instant::now() + Duration::from_secs(5)).unwrap().max_block, U256::from(1002u64));
+    assert_eq!(gun.plan(&c, Instant::now() + Duration::from_secs(11)).unwrap_err(), "block info stale");
+    let mut c0 = c.clone();
+    c0.block = 0;
+    assert_eq!(gun.plan(&c0, Instant::now()).unwrap_err(), "no block number");
+}
+
+/// Final review M-2: practice makes no network calls (no gas / nonce
+/// refresher), is ready at once, and still builds the same deadline.
+#[test]
+fn practice_makes_no_network_calls() {
+    struct Counting(AtomicU64);
+    impl ReadRpc for Counting {
+        fn call(&self, _m: &str, _p: Value) -> Result<Value, String> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Err("no".into())
+        }
+    }
+    let rpc = Arc::new(Counting(AtomicU64::new(0)));
+    let get = |k: &str| (k == "FASTLANE").then(|| "practice".to_string());
+    let gun = Gun::from_lookup(&get, Arc::new(NoGate), Arc::new(|_: &SendOutcome| {}), Some(rpc.clone())).unwrap().unwrap();
+    assert!(!gun.start_background(), "no refresher in practice");
+    assert_eq!(gun.not_ready(), None, "practice needs nothing from the network");
+    let r = gun.fire(&input(2, Funding::Own));
+    assert!(r.signed && !r.sent, "{r:?}");
+    assert_eq!(r.max_block, Some(U256::from(1002u64)));
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(rpc.0.load(Ordering::SeqCst), 0, "no read was made");
+}
