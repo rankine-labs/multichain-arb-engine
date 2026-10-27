@@ -11,11 +11,14 @@
 #        FAST LANE settings        -> the exact list in FASTLANE_PASS below
 #                                     (FASTLANE, RUST_SENDER, kill switch,
 #                                     safety limits, sender settings)
-#      Nothing else (Telegram, ...) is read or passed on. The WALLET KEY
-#      (BOT_PRIVATE_KEY) is deliberately NOT passed: the owner has not
-#      decided yet whether arbsim may hold it. Without it the fast lane runs
-#      in practice mode only and says so ("live blocked: no key passed to
-#      arbsim (owner decision pending)").
+#      Nothing else (Telegram, ...) is read or passed on.
+#      WALLET KEY (BOT_PRIVATE_KEY): owner approved on Oct 27, 2026 that
+#      arbsim may hold it, but it is passed ONLY when all three of these
+#      .env lines say so (anything else = key not passed, practice only):
+#        ARBSIM_PASS_WALLET_KEY=yes   the owner's standing permission
+#        FASTLANE=live                the fast lane is meant to send
+#        RUST_SENDER=on               Rust, not Node, is the sender
+#      So in practice mode the key never even enters the arbsim process.
 #      The node links are secrets: they are never printed, and because they
 #      are read here (not given to pm2), they never end up in pm2's saved
 #      process list either.
@@ -44,7 +47,7 @@ fi
 # through by NAME from .env (only these names; values are never printed).
 # FASTLANE unset / off = nothing new runs. Same names and meaning as the
 # Node bot's (one .env for both). NOT in this list on purpose:
-# BOT_PRIVATE_KEY (owner decision pending, see the header).
+# BOT_PRIVATE_KEY (handled separately below, see the header).
 FASTLANE_PASS=(
   FASTLANE RUST_SENDER KILL_SWITCH KILL_FILE
   EXECUTION_ENABLED LIVE_SEND_CONFIRM ARB_EXECUTOR_ROBINHOOD
@@ -70,8 +73,22 @@ if [ -f "$ENV_FILE" ]; then
     export "$key=$(env_file_value "$ENV_FILE" "$key")"
   done
 fi
-# Never hand the wallet key to arbsim (even if the environment had one).
+# Wallet key: never inherited from the environment; read from .env only when
+# the owner's permission AND live sending are both switched on (see header).
 unset BOT_PRIVATE_KEY
+KEY_STATE="wallet key not passed"
+if [ -f "$ENV_FILE" ] \
+   && [ "$(env_file_value "$ENV_FILE" ARBSIM_PASS_WALLET_KEY)" = "yes" ] \
+   && [ "${FASTLANE:-off}" = "live" ] && [ "${RUST_SENDER:-off}" = "on" ]; then
+  BOT_PRIVATE_KEY="$(env_file_value "$ENV_FILE" BOT_PRIVATE_KEY)"
+  if [ -n "$BOT_PRIVATE_KEY" ]; then
+    export BOT_PRIVATE_KEY
+    KEY_STATE="wallet key passed (live)"
+  else
+    unset BOT_PRIVATE_KEY
+    KEY_STATE="wallet key not passed (BOT_PRIVATE_KEY missing in .env)"
+  fi
+fi
 
 # Paid nodes: an explicit ARBSIM_NODE_URL / ARBSIM_NODE_URL_2 line in .env
 # wins; otherwise the bot's own saved Chainstack / QuickNode links are used.
@@ -109,7 +126,7 @@ SOCKET="${ARBSIM_SOCKET:-/tmp/arbsim.sock}"
 echo "[arbsim-run] starting $(info_value "$ARBSIM_INFO" source_commit | cut -c1-7) on $SOCKET;" \
      "node1 $([ -n "$ARBSIM_NODE_URL" ] && echo set || echo MISSING)," \
      "node2 $([ -n "$ARBSIM_NODE_URL_2" ] && echo set || echo 'not set');" \
-     "fast lane ${FASTLANE:-off}, RUST_SENDER ${RUST_SENDER:-off}, wallet key not passed"
+     "fast lane ${FASTLANE:-off}, RUST_SENDER ${RUST_SENDER:-off}, $KEY_STATE"
 
 # exec: arbsim takes over this process, so pm2 watches arbsim itself
 # (memory limit, restarts). nice 5 = lower priority than the bot.
