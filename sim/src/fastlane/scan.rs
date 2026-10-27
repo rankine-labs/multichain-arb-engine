@@ -40,8 +40,25 @@
 //   profit (start-coin units, the check's own number: pool fees and the
 //   flash-loan fee are already paid inside it) x the coin's price - the
 //   bot's gas estimate >= the minimum (FASTLANE_MIN_NET_USD, else
-//   MIN_EXEC_NET_USD, else $0.10). The same route is not handed out again
+//   MIN_EXEC_NET_USD, else $0.25, the bot's own default). The same route is not handed out again
 //   for the same result while none of its pools changed (dedupe).
+//
+//   Review fixes (integration, Oct 26):
+//     H1 the rolling sweep keeps its PLACE (route id order) when the table
+//        changes (it changes about every second); only the pass count restarts.
+//     H2 table sync: the code list is compared once per sync, parsed codes
+//        are cached by number, a row whose only change is its price facts
+//        keeps its parsed check, and the time budget starts AFTER the sync
+//        (the fast lane also syncs between blocks: Scanner::sync_now).
+//     M4 a handed-out route is handed out again after FASTLANE_DEDUPE_BLOCKS
+//        blocks, or at once when the sender reports it never left
+//        (Scanner::forget).
+//     M5 profit above MAX_PLAUSIBLE_PROFIT_SHARE of the size (bot default
+//        0.25) = broken data, never returned.
+//     M6 a route is started only if its last run time still fits the budget;
+//        a route slower than FASTLANE_ROUTE_MAX_US rests for 50 blocks.
+//        (One EVM run can't be stopped half way; this caps the overrun.)
+//     L5 the default minimum follows the bot: MIN_EXEC_NET_USD, else $0.25.
 //
 //   Output: Opportunity list, best first, plus microseconds per phase and
 //   per route, and hourly counters (status "fastlaneScan").
@@ -72,7 +89,7 @@ use crate::state::StateRead;
 /// FASTLANE: off (default) | practice | live. Same words as fastlane/mode.rs
 /// parse_mode (workstream D): unset / empty / unknown = off.
 pub fn fastlane_on(raw: Option<&str>) -> bool {
-    matches!(raw.map(|s| s.trim().to_ascii_lowercase()).as_deref(), Some("practice" | "shadow" | "dry" | "live"))
+    super::mode::Mode::parse(raw) != super::mode::Mode::Off
 }
 
 /// Scanner settings (env names in brackets with defaults).
@@ -87,7 +104,7 @@ pub struct ScanConfig {
     pub sweep_reserve_pct: u64,
     /// FASTLANE_MAX_CHANGED_ROUTES [64]: changed-pool routes per block (at most).
     pub max_changed: usize,
-    /// FASTLANE_MIN_NET_USD [MIN_EXEC_NET_USD, else 0.10]: minimum profit
+    /// FASTLANE_MIN_NET_USD [MIN_EXEC_NET_USD, else 0.25]: minimum profit
     /// after gas. (The safety gates apply the bot's own minimum again.)
     pub min_net_usd: f64,
     /// FASTLANE_SCAN_MAX_RESULTS [4]: opportunities returned per block.
@@ -97,11 +114,34 @@ pub struct ScanConfig {
     /// between the smallest ladder size and the biggest (finds a better size,
     /// costs ~N runs per route instead of ~3).
     pub refine_steps: usize,
+    /// MAX_PLAUSIBLE_PROFIT_SHARE [0.25] (review M5, the bot's setting):
+    /// net profit above this share of the trade size = broken data.
+    pub max_plausible_share: f64,
+    /// FASTLANE_DEDUPE_BLOCKS [20] (review M4): the same result is handed
+    /// out again after this many blocks even if no pool changed.
+    pub dedupe_blocks: u64,
+    /// FASTLANE_ROUTE_MAX_US [5000] (review M6): a route whose check took
+    /// longer rests for 50 blocks (counted "slow").
+    pub route_max_us: u64,
 }
+
+/// The bot's default send minimum (types.ts readMinExecNetUsd).
+pub const BOT_MIN_NET_USD: f64 = 0.25;
 
 impl Default for ScanConfig {
     fn default() -> Self {
-        ScanConfig { budget_us: 15_000, sweep_per_block: 8, sweep_reserve_pct: 25, max_changed: 64, min_net_usd: 0.10, max_results: 4, refine_steps: 0 }
+        ScanConfig {
+            budget_us: 15_000,
+            sweep_per_block: 8,
+            sweep_reserve_pct: 25,
+            max_changed: 64,
+            min_net_usd: BOT_MIN_NET_USD,
+            max_results: 4,
+            refine_steps: 0,
+            max_plausible_share: 0.25,
+            dedupe_blocks: 20,
+            route_max_us: 5_000,
+        }
     }
 }
 
@@ -120,6 +160,9 @@ impl ScanConfig {
             min_net_usd: min_net,
             max_results: num("FASTLANE_SCAN_MAX_RESULTS").filter(|v| *v >= 1.0 && *v <= 64.0).map(|v| v as usize).unwrap_or(d.max_results),
             refine_steps: num("FASTLANE_SCAN_REFINE_STEPS").filter(|v| *v >= 0.0 && *v <= 64.0).map(|v| v as usize).unwrap_or(d.refine_steps),
+            max_plausible_share: num("MAX_PLAUSIBLE_PROFIT_SHARE").filter(|v| *v > 0.0).unwrap_or(d.max_plausible_share),
+            dedupe_blocks: num("FASTLANE_DEDUPE_BLOCKS").filter(|v| *v >= 1.0 && *v <= 100_000.0).map(|v| v as u64).unwrap_or(d.dedupe_blocks),
+            route_max_us: num("FASTLANE_ROUTE_MAX_US").filter(|v| *v >= 100.0 && *v <= 1_000_000.0).map(|v| v as u64).unwrap_or(d.route_max_us),
         }
     }
     pub fn from_env() -> ScanConfig {
@@ -154,26 +197,55 @@ impl PreparedCheck {
     /// stop, amt}) and the table's long-code list. Err = can't use it
     /// (counted, never guessed).
     pub fn from_row(c: &Value, codes: &[String]) -> Result<PreparedCheck, String> {
+        Self::from_row_cached(c, codes, &mut HashMap::new())
+    }
+
+    /// `from_row` with parsed codes remembered by their number in the
+    /// table's code list (review H2: the same few contract codes are used by
+    /// hundreds of rows; hex-decoding + hashing each one per row was the
+    /// main cost of a table sync). `cache` must be cleared when the list changes.
+    pub fn from_row_cached(c: &Value, codes: &[String], cache: &mut HashMap<usize, (revm::primitives::B256, revm::bytecode::Bytecode)>) -> Result<PreparedCheck, String> {
         let calls = c.get("calls").and_then(|x| x.as_array()).ok_or("check without calls")?;
         if calls.len() != 1 {
             return Err(format!("{} calls (need exactly 1)", calls.len()));
         }
         let wc: WireCall = serde_json::from_value(calls[0].clone()).map_err(|e| format!("call: {e}"))?;
         let call = call_from_wire(&wc)?;
-        // "$code:<n>" -> the code itself (same as entry.rs call_for).
+        // "$code:<n>" -> the code itself (same as entry.rs call_for). The
+        // reference is taken out of the JSON and the parsed code (cached by
+        // n) put straight into the override: same result as parsing the text.
         let mut ov = c.get("overrides").cloned().unwrap_or_else(|| json!({}));
+        let mut by_ref: Vec<(String, usize)> = Vec::new();
         if let Some(o) = ov.as_object_mut() {
-            for (_, acct) in o.iter_mut() {
+            for (addr, acct) in o.iter_mut() {
                 if let Some(s) = acct.get("code").and_then(|x| x.as_str()) {
                     if let Some(n) = s.strip_prefix("$code:") {
                         let i: usize = n.parse().map_err(|_| format!("bad code ref {s}"))?;
-                        let code = codes.get(i).ok_or_else(|| format!("code ref {s} not in the table's list"))?;
-                        acct["code"] = json!(code);
+                        if i >= codes.len() {
+                            return Err(format!("code ref {s} not in the table's list"));
+                        }
+                        by_ref.push((addr.clone(), i));
+                        if let Some(m) = acct.as_object_mut() {
+                            m.remove("code");
+                        }
                     }
                 }
             }
         }
-        let overrides = Overrides::from_json(&ov)?;
+        let mut overrides = Overrides::from_json(&ov)?;
+        for (addr, i) in by_ref {
+            let a = crate::check::hexutil::parse_address(&addr)?;
+            let code = match cache.get(&i) {
+                Some(x) => x.clone(),
+                None => {
+                    let bytes = crate::check::hexutil::parse_bytes(&codes[i])?;
+                    let x = crate::check::overrides::analysed_code(&bytes);
+                    cache.insert(i, x.clone());
+                    x
+                }
+            };
+            overrides.accounts.entry(a).or_default().code = Some(code);
+        }
         let trade = decode_trade(&call.data)?;
         let amount_offset = c.get("sizes").and_then(|s| s.get("amountOffset")).and_then(|x| x.as_u64()).map(|x| x as usize).unwrap_or(96);
         let start = 4 + amount_offset;
@@ -282,8 +354,11 @@ pub struct TableSource {
     table_gen: Option<u64>,
     gen: u64,
     by_rid: HashMap<String, Arc<Route>>,
-    /// The raw row check each route was built from (to rebuild only changed ones).
-    built_from: HashMap<String, (Arc<Value>, Option<Arc<Value>>, Arc<Vec<String>>)>,
+    /// The raw row check + facts each route was built from (to rebuild only changed ones).
+    built_from: HashMap<String, (Arc<Value>, Option<Arc<Value>>)>,
+    /// The code list the routes were built with, and its parsed codes by number.
+    codes: Arc<Vec<String>>,
+    code_cache: HashMap<usize, (revm::primitives::B256, revm::bytecode::Bytecode)>,
     /// Per pool key: its rows (rid, held, score) in table order.
     per_pool: HashMap<String, Vec<(String, bool, Option<f64>)>>,
     all: Vec<Arc<Route>>,
@@ -302,7 +377,7 @@ impl TableSource {
         }))
     }
     fn with_reader(read: Box<dyn Fn(&mut dyn FnMut(Option<&Table>)) + Send>) -> TableSource {
-        TableSource { read, table_gen: None, gen: 0, by_rid: HashMap::new(), built_from: HashMap::new(), per_pool: HashMap::new(), all: Vec::new() }
+        TableSource { read, table_gen: None, gen: 0, by_rid: HashMap::new(), built_from: HashMap::new(), codes: Arc::new(Vec::new()), code_cache: HashMap::new(), per_pool: HashMap::new(), all: Vec::new() }
     }
 }
 
@@ -337,6 +412,8 @@ impl RouteSource for TableSource {
                 self.table_gen = None;
                 self.by_rid.clear();
                 self.built_from.clear();
+                self.code_cache.clear();
+                self.codes = Arc::new(Vec::new());
                 self.per_pool.clear();
                 self.all.clear();
                 self.gen += 1;
@@ -346,33 +423,46 @@ impl RouteSource for TableSource {
         let mut per_pool: HashMap<String, Vec<(String, bool, Option<f64>)>> = HashMap::new();
         let mut by_rid: HashMap<String, Arc<Route>> = HashMap::new();
         let mut built_from = HashMap::new();
+        // H2: the code list compared ONCE (the bot resends it with every
+        // table message); a different list = every check is re-parsed.
+        let codes_same = Arc::ptr_eq(&self.codes, &codes) || *self.codes == *codes;
+        if !codes_same {
+            self.codes = codes.clone();
+            self.code_cache.clear();
+        }
         // Keep the table's per-pool row order (rows are walked per pool).
         for (pool, rid, held, score, c, f) in rows {
             per_pool.entry(pool).or_default().push((rid.clone(), held, score));
             if by_rid.contains_key(&rid) {
                 continue;
             }
-            // Same check text, facts and code list as before: reuse.
-            if let (Some(old), Some((oc, of, ocodes))) = (self.by_rid.get(&rid), self.built_from.get(&rid)) {
-                let same_f = match (of, &f) {
-                    (None, None) => true,
-                    (Some(a), Some(b)) => Arc::ptr_eq(a, b) || a == b,
-                    _ => false,
-                };
-                if (Arc::ptr_eq(oc, &c) || **oc == *c) && same_f && (Arc::ptr_eq(ocodes, &codes) || **ocodes == *codes) {
-                    by_rid.insert(rid.clone(), old.clone());
-                    built_from.insert(rid, (c, f, codes.clone()));
+            // Same check text and code list as before: the parsed check is
+            // reused; only new facts (price / gas) make a new Route around it.
+            if let (Some(old), Some((oc, of))) = (self.by_rid.get(&rid), self.built_from.get(&rid)) {
+                if codes_same && (Arc::ptr_eq(oc, &c) || **oc == *c) {
+                    let same_f = match (of, &f) {
+                        (None, None) => true,
+                        (Some(a), Some(b)) => Arc::ptr_eq(a, b) || a == b,
+                        _ => false,
+                    };
+                    let r = if same_f && old.held == held && old.score == score {
+                        old.clone()
+                    } else {
+                        Arc::new(Route { rid: rid.clone(), held, score, keys: old.keys.clone(), pools: old.pools.clone(), check: old.check.clone(), facts: f.as_deref().and_then(Facts::from_json) })
+                    };
+                    by_rid.insert(rid.clone(), r);
+                    built_from.insert(rid, (c, f));
                     continue;
                 }
             }
-            match PreparedCheck::from_row(&c, &codes) {
+            match PreparedCheck::from_row_cached(&c, &codes, &mut self.code_cache) {
                 Ok(p) => {
                     let keys: Vec<String> = c.get("route").and_then(|r| r.as_array()).map(|a| a.iter().filter_map(|x| x.as_str()).map(|s| s.to_ascii_lowercase()).collect()).unwrap_or_default();
                     let lender = p.trade.flash.lender().map(|a| format!("{a:#x}"));
                     let pools: Vec<String> = keys.iter().filter(|k| Some(k.as_str()) != lender.as_deref()).cloned().collect();
                     let r = Arc::new(Route { rid: rid.clone(), held, score, keys, pools, check: Arc::new(p), facts: f.as_deref().and_then(Facts::from_json) });
                     by_rid.insert(rid.clone(), r);
-                    built_from.insert(rid, (c, f, codes.clone()));
+                    built_from.insert(rid, (c, f));
                 }
                 Err(e) => bad.push((rid, e)),
             }
@@ -429,6 +519,20 @@ impl RouteSource for TableSource {
 /// server.rs copy2_runs) without changing the scanner.
 pub trait CheckRunner: Send + Sync {
     fn run(&self, view: &dyn StateRead, ctx: &BlockCtx, c: &PreparedCheck, amounts: &SizeSearchAmounts) -> Result<SizeSearchResult, CheckUnknown>;
+    /// With the state's snapshot and block when the caller has them (copy
+    /// 2's runner needs both: fastlane/c2runner.rs). Default: `run`.
+    fn run_at(&self, at: &RunAt, c: &PreparedCheck, amounts: &SizeSearchAmounts) -> Result<SizeSearchResult, CheckUnknown> {
+        self.run(at.view, at.ctx, c, amounts)
+    }
+}
+
+/// Where one check runs: the strict view, its block details, its L2 block
+/// and (when it is a copy-2 snapshot, confirmed or predicted) the snapshot.
+pub struct RunAt<'a> {
+    pub view: &'a dyn StateRead,
+    pub ctx: &'a BlockCtx,
+    pub block: u64,
+    pub snap: Option<&'a Arc<crate::state::snap::Snapshot>>,
 }
 
 /// The plain size search (check/search.rs), eth_call rules, strict view.
@@ -464,6 +568,8 @@ pub struct BlockInput<'a> {
     pub changed: &'a [String],
     /// Pools the view can't vouch for: routes through them are skipped.
     pub unsure: &'a HashSet<String>,
+    /// The view's snapshot, when it is a copy-2 one (copy 2's runner).
+    pub snap: Option<&'a Arc<crate::state::snap::Snapshot>>,
 }
 
 /// What happened to one route this block.
@@ -516,6 +622,9 @@ pub struct ScanReport {
     pub sweep_total: usize,
     /// Completed a full sweep pass this block: how many blocks it took.
     pub full_sweep_blocks: Option<u64>,
+    /// M6: routes not started because they rest (slow) / didn't fit the budget left.
+    pub resting: usize,
+    pub cut_fit: usize,
 }
 
 /// The standing-gap scanner (one per state stream: confirmed / predicted).
@@ -523,12 +632,18 @@ pub struct Scanner {
     pub cfg: ScanConfig,
     src: Box<dyn RouteSource>,
     runner: Box<dyn CheckRunner>,
-    /// Rolling sweep: next position in src.all() and the source generation
-    /// it belongs to.
-    cursor: usize,
+    /// Rolling sweep (H1): the last route id the sweep visited (the next
+    /// block carries on after it in id order, whatever the table did), and
+    /// the source generation seen last.
+    last_rid: Option<String>,
     cursor_gen: u64,
     /// Blocks since the current sweep pass started.
     pass_blocks: u64,
+    /// The pass under way started at the beginning with an unchanged route
+    /// list (only such a pass is counted as "full sweep in N blocks").
+    pass_valid: bool,
+    /// M6: per route, its last check time (us) and the epoch it rests until.
+    route_us: HashMap<String, (u64, u64)>,
     /// Dedupe: route -> (amount, profit, pool epoch when returned).
     returned: HashMap<String, (U256, U256, u64)>,
     /// Pool key -> epoch (scan call number) it last changed.
@@ -538,7 +653,7 @@ pub struct Scanner {
 
 impl Scanner {
     pub fn new(cfg: ScanConfig, src: Box<dyn RouteSource>, runner: Box<dyn CheckRunner>) -> Scanner {
-        Scanner { cfg, src, runner, cursor: 0, cursor_gen: u64::MAX, pass_blocks: 0, returned: HashMap::new(), pool_epoch: HashMap::new(), epoch: 0 }
+        Scanner { cfg, src, runner, last_rid: None, cursor_gen: u64::MAX, pass_blocks: 0, pass_valid: true, route_us: HashMap::new(), returned: HashMap::new(), pool_epoch: HashMap::new(), epoch: 0 }
     }
 
     /// The live scanner: None unless FASTLANE=practice|live.
@@ -551,6 +666,25 @@ impl Scanner {
 
     pub fn runner(&self) -> &dyn CheckRunner {
         &*self.runner
+    }
+
+    /// Bring the route list up to date now (the fast lane calls this
+    /// between blocks, so a block's scan rarely pays for it). H2.
+    pub fn sync_now(&mut self) -> usize {
+        let bad = self.src.sync();
+        HOUR.with(|h| h.bad_rows += bad.len() as u64);
+        bad.len()
+    }
+
+    /// M4: hand this route out again at once (the sender reports its trade
+    /// never left: refused, stale in the queue, not written).
+    pub fn forget(&mut self, rid: &str) {
+        self.returned.remove(rid);
+    }
+
+    /// Routes known (status).
+    pub fn routes(&self) -> usize {
+        self.src.all().len()
     }
 
     /// Scan one block. See the file header.
@@ -568,9 +702,10 @@ impl Scanner {
         for k in b.changed {
             self.pool_epoch.insert(k.to_ascii_lowercase(), epoch);
         }
-        let bad = self.src.sync();
-        HOUR.with(|h| h.bad_rows += bad.len() as u64);
+        self.sync_now();
         rep.timing.sync_us = t0.elapsed().as_micros() as u64;
+        // H2: the time budget starts after the table sync.
+        let t0 = Instant::now();
         // Forget dedupe entries of routes that are gone.
         if self.returned.len() > self.src.all().len() * 2 + 64 {
             let live: HashSet<&str> = self.src.all().iter().map(|r| r.rid.as_str()).collect();
@@ -579,6 +714,10 @@ impl Scanner {
 
         let budget = self.cfg.budget_us;
         let changed_limit = budget.saturating_sub(budget * self.cfg.sweep_reserve_pct / 100);
+        // M6: bounded memory for per-route timings.
+        if self.route_us.len() > self.src.all().len() * 2 + 64 {
+            self.route_us.retain(|_, (_, until)| *until > epoch);
+        }
         let mut done: HashSet<String> = HashSet::new();
         let mut found: Vec<Opportunity> = Vec::new();
 
@@ -589,6 +728,9 @@ impl Scanner {
             if i >= self.cfg.max_changed || t0.elapsed().as_micros() as u64 >= changed_limit {
                 rep.cut_changed = ranked.len() - i;
                 break;
+            }
+            if !self.may_start(r, t0, changed_limit, epoch, &mut rep) {
+                continue;
             }
             done.insert(r.rid.clone());
             let c = self.check_route(r, b, "changed", t0, epoch, &mut found);
@@ -602,11 +744,18 @@ impl Scanner {
         let all: Vec<Arc<Route>> = self.src.all().to_vec();
         rep.sweep_total = all.len();
         if gen != self.cursor_gen {
-            // New route list: start a fresh pass (a partial pass isn't counted).
+            // H1: a new route list keeps the sweep's PLACE (route id order);
+            // only the pass in progress is no longer counted as a full pass.
+            if self.cursor_gen != u64::MAX && self.last_rid.is_some() {
+                self.pass_valid = false;
+            }
             self.cursor_gen = gen;
-            self.cursor = 0;
-            self.pass_blocks = 0;
         }
+        // Carry on after the last route visited (by id; `all` is sorted by id).
+        let mut cursor = match &self.last_rid {
+            Some(l) => all.partition_point(|r| r.rid.as_str() <= l.as_str()),
+            None => 0,
+        };
         if !all.is_empty() {
             if self.pass_blocks > 0 {
                 // The pass under way spans one more block.
@@ -619,27 +768,36 @@ impl Scanner {
             // (A route visited by the sweep but already checked in step 1
             // counts as covered without a second run.)
             while steps < all.len() && swept < self.cfg.sweep_per_block && (t0.elapsed().as_micros() as u64) < budget {
-                if self.cursor >= all.len() {
-                    self.cursor = 0;
+                if cursor >= all.len() {
+                    cursor = 0;
                 }
                 if self.pass_blocks == 0 {
                     // A new pass starts in this block: this block is its first.
                     self.pass_blocks = 1;
                 }
-                let r = &all[self.cursor];
-                self.cursor += 1;
+                let r = &all[cursor];
+                if !done.contains(&r.rid) && !self.may_start(r, t0, budget, epoch, &mut rep) {
+                    // Doesn't fit what is left of the budget: next block.
+                    break;
+                }
+                cursor += 1;
                 steps += 1;
+                self.last_rid = Some(r.rid.clone());
                 if !done.contains(&r.rid) {
                     done.insert(r.rid.clone());
                     let c = self.check_route(r, b, "sweep", t0, epoch, &mut found);
                     rep.checked.push(c);
                     swept += 1;
                 }
-                if self.cursor >= all.len() {
+                if cursor >= all.len() {
                     // A full pass is complete: every route visited once.
-                    rep.full_sweep_blocks = Some(self.pass_blocks);
+                    if self.pass_valid {
+                        rep.full_sweep_blocks = Some(self.pass_blocks);
+                    }
                     self.pass_blocks = 0;
-                    self.cursor = 0;
+                    self.pass_valid = true;
+                    cursor = 0;
+                    self.last_rid = None;
                 }
             }
         }
@@ -653,14 +811,42 @@ impl Scanner {
         rep
     }
 
+    /// M6: may route `r` start now? Not while it rests (it was slower than
+    /// FASTLANE_ROUTE_MAX_US), and only if its last run time still fits
+    /// before `limit` (us since t0). A route never timed always may.
+    fn may_start(&mut self, r: &Arc<Route>, t0: Instant, limit: u64, epoch: u64, rep: &mut ScanReport) -> bool {
+        let Some((us, until)) = self.route_us.get(&r.rid).copied() else { return true };
+        if until > epoch {
+            rep.resting += 1;
+            return false;
+        }
+        if (t0.elapsed().as_micros() as u64).saturating_add(us) > limit {
+            rep.cut_fit += 1;
+            return false;
+        }
+        true
+    }
+
     fn check_route(&mut self, r: &Arc<Route>, b: &BlockInput, source: &'static str, t0: Instant, epoch: u64, found: &mut Vec<Opportunity>) -> RouteCheck {
+        let c = self.check_route_inner(r, b, source, t0, epoch, found);
+        // M6: remember how long it took; a slow route rests 50 blocks.
+        let until = if c.us > self.cfg.route_max_us { epoch + 50 } else { 0 };
+        if until > 0 {
+            HOUR.with(|h| h.slow_routes += 1);
+        }
+        self.route_us.insert(r.rid.clone(), (c.us, until));
+        c
+    }
+
+    fn check_route_inner(&mut self, r: &Arc<Route>, b: &BlockInput, source: &'static str, t0: Instant, epoch: u64, found: &mut Vec<Opportunity>) -> RouteCheck {
         let tr = Instant::now();
         let fin = |outcome: Outcome| RouteCheck { rid: r.rid.clone(), source, outcome, us: tr.elapsed().as_micros() as u64 };
         if r.keys.iter().chain(r.pools.iter()).any(|k| b.unsure.contains(k)) {
             return fin(Outcome::SkippedUnsure);
         }
         let Some(f) = &r.facts else { return fin(Outcome::NoFacts) };
-        let res = match self.runner.run(b.view, b.ctx, &r.check, &amounts_for(&r.check, self.cfg.refine_steps)) {
+        let at = RunAt { view: b.view, ctx: b.ctx, block: b.block, snap: b.snap };
+        let res = match self.runner.run_at(&at, &r.check, &amounts_for(&r.check, self.cfg.refine_steps)) {
             Ok(x) => x,
             Err(u) => return fin(Outcome::Unknown(u.reason.as_str().to_string())),
         };
@@ -672,13 +858,18 @@ impl Scanner {
         if !net.is_finite() || net < self.cfg.min_net_usd {
             return fin(Outcome::BelowMin { amount: best.amount, profit: best.profit, net_usd: net });
         }
-        // Dedupe: same result, and no pool of the route changed since we
-        // last handed it out.
+        // M5: profit above the bot's plausible share of the size = broken data.
+        let size_usd = f.usd_of(best.amount);
+        if !(size_usd > 0.0) || net / size_usd > self.cfg.max_plausible_share {
+            return fin(Outcome::Implausible);
+        }
+        // Dedupe: same result, no pool of the route changed since we last
+        // handed it out, and not more than FASTLANE_DEDUPE_BLOCKS ago (M4).
         let last_change = r.keys.iter().filter_map(|k| self.pool_epoch.get(k)).copied().max().unwrap_or(0);
-        let dup = matches!(self.returned.get(&r.rid), Some((a, p, e)) if *a == best.amount && *p == best.profit && last_change <= *e);
+        let fresh = self.cfg.dedupe_blocks;
+        let dup = matches!(self.returned.get(&r.rid), Some((a, p, e)) if *a == best.amount && *p == best.profit && last_change <= *e && epoch.saturating_sub(*e) < fresh);
         if !dup {
             self.returned.insert(r.rid.clone(), (best.amount, best.profit, epoch));
-            let size_usd = f.usd_of(best.amount);
             let t = &r.check.trade;
             let mut tokens = vec![t.token];
             for h in &t.hops {
@@ -740,7 +931,12 @@ pub struct Evaluation {
 /// confirmed state of block N, and of N+1 = what our trade would have met).
 /// Same contract, same call, same pretend-state as when it was found.
 pub fn evaluate(opp: &Opportunity, runner: &dyn CheckRunner, view: &dyn StateRead, ctx: &BlockCtx, min_net_usd: f64) -> Evaluation {
-    let r = runner.run(view, ctx, &opp.check, &SizeSearchAmounts::List(vec![opp.amount_in]));
+    evaluate_at(opp, runner, &RunAt { view, ctx, block: 0, snap: None }, min_net_usd)
+}
+
+/// `evaluate` with the snapshot / block (copy 2's runner: fastlane/c2runner.rs).
+pub fn evaluate_at(opp: &Opportunity, runner: &dyn CheckRunner, at: &RunAt, min_net_usd: f64) -> Evaluation {
+    let r = runner.run_at(at, &opp.check, &SizeSearchAmounts::List(vec![opp.amount_in]));
     let ev = match r {
         Err(u) => Evaluation { at_size: Err(u.reason.as_str().to_string()), net_usd: None, real: None },
         Ok(res) => {
@@ -793,6 +989,11 @@ pub struct Hour {
     pub eval_real: u64,
     pub eval_gone: u64,
     pub eval_unknown: u64,
+    /// M6: route checks slower than FASTLANE_ROUTE_MAX_US (then rested).
+    pub slow_routes: u64,
+    /// M6: routes not started this hour (resting / didn't fit the budget left).
+    pub resting: u64,
+    pub cut_fit: u64,
 }
 
 struct HourCell {
@@ -812,12 +1013,15 @@ static HOUR: HourCell = HourCell { h: Mutex::new(Hour {
     blocks: 0, routes_checked: 0, changed_checked: 0, sweep_checked: 0, found: 0, found_dup: 0, below_min: 0, no_profit: 0, unknown: 0,
     skipped_unsure: 0, no_facts: 0, implausible: 0, cut_changed: 0, bad_rows: 0, best_net_usd: None, best_label: String::new(), time_us: 0,
     max_block_us: 0, full_sweeps: 0, last_full_sweep_blocks: None, max_full_sweep_blocks: 0, eval_real: 0, eval_gone: 0, eval_unknown: 0,
+    slow_routes: 0, resting: 0, cut_fit: 0,
 }), ring: Mutex::new(VecDeque::new()) };
 
 fn record_block(rep: &ScanReport) {
     HOUR.with(|h| {
         h.blocks += 1;
         h.cut_changed += rep.cut_changed as u64;
+        h.resting += rep.resting as u64;
+        h.cut_fit += rep.cut_fit as u64;
         h.time_us += rep.timing.total_us;
         h.max_block_us = h.max_block_us.max(rep.timing.total_us);
         for c in &rep.checked {
@@ -871,6 +1075,7 @@ pub fn status_json() -> Value {
         "bestNetUsd": h.best_net_usd, "bestLabel": h.best_label, "timeUs": h.time_us, "maxBlockUs": h.max_block_us,
         "fullSweeps": h.full_sweeps, "lastFullSweepBlocks": h.last_full_sweep_blocks, "maxFullSweepBlocks": h.max_full_sweep_blocks,
         "evalReal": h.eval_real, "evalGone": h.eval_gone, "evalUnknown": h.eval_unknown,
+        "slowRoutes": h.slow_routes, "resting": h.resting, "cutFit": h.cut_fit,
         "blockUs": crate::timing::pct(&mut ring),
     })
 }
@@ -887,6 +1092,7 @@ pub fn take_hour() -> String {
         h.last_full_sweep_blocks.map(|v| v.to_string()).unwrap_or_else(|| "-".into()), h.max_full_sweep_blocks, h.full_sweeps,
         if h.eval_real + h.eval_gone + h.eval_unknown > 0 { format!("; practice re-checks: {} real, {} gone, {} unsure", h.eval_real, h.eval_gone, h.eval_unknown) } else { String::new() },
     );
+    let line = if h.slow_routes + h.resting + h.cut_fit > 0 { format!("{line}; slow routes {} (rested {}, not fitting the budget left {})", h.slow_routes, h.resting, h.cut_fit) } else { line };
     line
 }
 

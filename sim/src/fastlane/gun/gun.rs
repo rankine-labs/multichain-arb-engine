@@ -75,39 +75,12 @@ use crate::check::hexutil::to_hex;
 /// Robinhood Chain id.
 pub const CHAIN_ID: u64 = 4663;
 
-/// FASTLANE setting.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Mode {
-    Off,
-    Practice,
-    Live,
-}
+/// FASTLANE setting: the one shared parser and type (fastlane/mode.rs).
+pub use crate::fastlane::mode::Mode;
 
-impl Mode {
-    /// FASTLANE env: off (default) | practice | live. Same words as
-    /// workstream D's mode.rs (practice also "shadow"/"dry"); unknown = off.
-    pub fn from_env() -> Mode {
-        Mode::parse(std::env::var("FASTLANE").ok().as_deref())
-    }
-    pub fn parse(raw: Option<&str>) -> Mode {
-        match raw.map(|s| s.trim().to_ascii_lowercase()).unwrap_or_default().as_str() {
-            "practice" | "shadow" | "dry" => Mode::Practice,
-            "live" => Mode::Live,
-            _ => Mode::Off,
-        }
-    }
-    pub fn name(self) -> &'static str {
-        match self {
-            Mode::Off => "off",
-            Mode::Practice => "practice",
-            Mode::Live => "live",
-        }
-    }
-}
-
-/// RUST_SENDER=on|true|1|yes (any case).
+/// RUST_SENDER=on|true|1|yes (any case): fastlane/mode.rs parse_on.
 pub fn rust_sender_on() -> bool {
-    matches!(std::env::var("RUST_SENDER").unwrap_or_default().trim().to_ascii_lowercase().as_str(), "on" | "true" | "1" | "yes")
+    crate::fastlane::mode::parse_on(std::env::var("RUST_SENDER").ok().as_deref())
 }
 
 /// What the gun needs to fire one trade (the fields the Node loop senders
@@ -210,7 +183,7 @@ impl Gate for NoGate {
 pub fn live_blockers(get: &dyn Fn(&str) -> Option<String>, gate: &dyn Gate) -> Vec<&'static str> {
     let is = |k: &str, want: &str| get(k).map(|v| v == want).unwrap_or(false);
     let mut why = Vec::new();
-    if !matches!(get("RUST_SENDER").unwrap_or_default().trim().to_ascii_lowercase().as_str(), "on" | "true" | "1" | "yes") {
+    if !crate::fastlane::mode::parse_on(get("RUST_SENDER").as_deref()) {
         why.push("RUST_SENDER is not on");
     }
     if !is("EXECUTION_ENABLED", "true") {

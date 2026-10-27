@@ -306,6 +306,13 @@ export function fastlaneFacts(c: EntryCandidate): Record<string, unknown> | null
   return f;
 }
 
+// The facts as they count for "did this pool's rows change?" (review H2):
+// price to 3 and gas to 2 significant digits; label, decimals, loan pips as is.
+export function fastlaneFactsFp(f: Record<string, unknown>): string {
+  const r = (v: unknown, n: number) => (typeof v === 'number' && Number.isFinite(v) && v !== 0 ? Number(v.toPrecision(n)) : v);
+  return JSON.stringify([f.l, r(f.px, 3), f.d, r(f.g, 2), f.lp ?? null]);
+}
+
 // A route's id: "buy>sell:start" (lowercase). Two pools moved by one
 // trigger can list the same route; it is checked once.
 export function routeId(buyAddr: string, sellAddr: string, start: string): string {
@@ -1216,7 +1223,10 @@ export class TrigEntry {
           // Fingerprint: the route's small facts + its question's text (exactly
           // the same text as before for the same question, so "changed?" is the
           // same answer as when the whole list was turned into text).
-          fps.push(JSON.stringify([r.rid, r.held, score, cand.label, cand.gasUsd, cand.maxSizeUsd, !!meta.fallback]) + cJson + (fl ? JSON.stringify(fl) : ''));
+          // Fast lane facts go in ROUNDED (review H2, Oct 26): price to 3 and gas
+          // to 2 significant digits, so a tiny price move doesn't resend the
+          // pool's rows every refresh (the row itself still carries the exact facts).
+          fps.push(JSON.stringify([r.rid, r.held, score, cand.label, cand.gasUsd, cand.maxSizeUsd, !!meta.fallback]) + cJson + (fl ? fastlaneFactsFp(fl) : ''));
         }
         fresh.set(key, { fp: fps.join('\n'), rows, metas });
       }

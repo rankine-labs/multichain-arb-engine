@@ -93,34 +93,20 @@ use crate::state::snap::{Snapshot, View};
 use crate::state::{Lookup, StateDiff, StatePosition, StateRead};
 
 // ---------------------------------------------------------------------------
-// The FASTLANE switch (same words as fastlane/mode.rs, workstream D; parsed
-// here too so this file never depends on that branch being merged).
+// The FASTLANE switch: the one shared parser (fastlane/mode.rs).
 // ---------------------------------------------------------------------------
 
-/// FASTLANE setting.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Mode {
-    /// Nothing new runs (default).
-    Off,
-    /// Everything runs, nothing is broadcast.
-    Practice,
-    /// Real sends may happen (decided elsewhere).
-    Live,
-}
+pub use crate::fastlane::mode::Mode;
 
-/// Parse FASTLANE. Unset / empty / unknown = off (the safe choice).
+/// Parse FASTLANE (fastlane/mode.rs rules: unset / empty / unknown = off).
 pub fn parse_mode(raw: Option<&str>) -> Mode {
-    match raw.map(|s| s.trim().to_ascii_lowercase()).unwrap_or_default().as_str() {
-        "practice" | "shadow" | "dry" => Mode::Practice,
-        "live" => Mode::Live,
-        _ => Mode::Off,
-    }
+    Mode::parse(raw)
 }
 
 /// FASTLANE of this process (read once).
 pub fn mode() -> Mode {
     static M: OnceLock<Mode> = OnceLock::new();
-    *M.get_or_init(|| parse_mode(std::env::var("FASTLANE").ok().as_deref()))
+    *M.get_or_init(Mode::from_env)
 }
 
 // ---------------------------------------------------------------------------
@@ -142,11 +128,16 @@ pub struct AheadCfg {
     pub max_touchers: usize,
     /// Feed sequence number + this = L2 block number (mirror Config.l2_offset).
     pub l2_offset: u64,
+    /// FASTLANE_AHEAD_TRUST_SENDER_FUNDS [off] (review M1): off = a run that
+    /// ASSUMED a sender's coin balance / allowance was enough marks the
+    /// pools it moved unsure (the real transaction may have failed). on =
+    /// trust it (more pools stay usable; agreement stats show the cost).
+    pub trust_sender_funds: bool,
 }
 
 impl Default for AheadCfg {
     fn default() -> Self {
-        AheadCfg { max_blocks: 32, run_all: false, max_txs: 256, max_touchers: 4096, l2_offset: 0 }
+        AheadCfg { max_blocks: 32, run_all: false, max_txs: 256, max_touchers: 4096, l2_offset: 0, trust_sender_funds: false }
     }
 }
 
@@ -161,6 +152,7 @@ impl AheadCfg {
             max_txs: num("FASTLANE_AHEAD_MAX_TXS").filter(|v| (1..=100_000).contains(v)).unwrap_or(d.max_txs),
             max_touchers: d.max_touchers,
             l2_offset,
+            trust_sender_funds: crate::fastlane::mode::parse_on(get("FASTLANE_AHEAD_TRUST_SENDER_FUNDS").as_deref()),
         }
     }
 }
@@ -202,6 +194,12 @@ pub struct PoolSet {
     by_id: HashMap<B256, String>,
     /// Coin pair -> keys of our pools with those two coins.
     by_pair: HashMap<(Address, Address), Vec<String>>,
+    /// Coin -> keys of our pools holding it (H4: "pools sharing a named coin").
+    by_coin: HashMap<Address, Vec<String>>,
+    /// Review M3: native-ETH pools (one coin is address zero, which can't be
+    /// looked for in call data): the OTHER coin -> keys. A transaction that
+    /// pays ETH (value > 0) and names that coin may trade such a pool.
+    native_by_coin: HashMap<Address, Vec<String>>,
     /// Pools copy 2 itself can't vouch for right now (loading / unsure):
     /// always listed unsure in the predicted tip.
     pub not_ready: HashSet<String>,
@@ -229,6 +227,21 @@ impl PoolSet {
                     s.by_contract.insert(p.address, p.key.clone());
                     s.route.accounts.insert(p.address);
                     s.route.names.push(p.address);
+                }
+            }
+            for c in [*t0, *t1] {
+                if !c.is_zero() {
+                    let v = s.by_coin.entry(c).or_default();
+                    if !v.contains(&p.key) {
+                        v.push(p.key.clone());
+                    }
+                }
+            }
+            if t0.is_zero() != t1.is_zero() {
+                let other = if t0.is_zero() { *t1 } else { *t0 };
+                let v = s.native_by_coin.entry(other).or_default();
+                if !v.contains(&p.key) {
+                    v.push(p.key.clone());
                 }
             }
             if !t0.is_zero() && !t1.is_zero() {
@@ -276,6 +289,44 @@ impl PoolSet {
         }
         for ((x, y), ks) in &self.by_pair {
             if has(x.as_slice()) && has(y.as_slice()) {
+                for k in ks {
+                    if !out.contains(k) {
+                        out.push(k.clone());
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Review M3: native-ETH pools a transaction may trade (it pays ETH and
+    /// names the pool's other coin).
+    fn named_native(&self, value: U256, data: &[u8]) -> Vec<String> {
+        if value.is_zero() || self.native_by_coin.is_empty() {
+            return Vec::new();
+        }
+        let has = |needle: &[u8]| data.len() >= needle.len() && data.windows(needle.len()).any(|w| w == needle);
+        let mut out: Vec<String> = Vec::new();
+        for (c, ks) in &self.native_by_coin {
+            if has(c.as_slice()) {
+                for k in ks {
+                    if !out.contains(k) {
+                        out.push(k.clone());
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Review H4: our pools holding ANY coin the data names (wider than
+    /// `named`: one coin is enough). Used only when a transaction we ran
+    /// failed and nothing narrower is known.
+    fn sharing_named_coins(&self, data: &[u8]) -> Vec<String> {
+        let has = |needle: &[u8]| data.len() >= needle.len() && data.windows(needle.len()).any(|w| w == needle);
+        let mut out: Vec<String> = Vec::new();
+        for (c, ks) in &self.by_coin {
+            if has(c.as_slice()) {
                 for k in ks {
                     if !out.contains(k) {
                         out.push(k.clone());
@@ -372,6 +423,9 @@ pub struct AheadTip {
     pub built_at: Instant,
     /// Microseconds spent applying THIS message.
     pub apply_us: u64,
+    /// When THIS feed message reached arbsim (the fast lane's latency
+    /// clock starts here: "feed message -> would hand to socket").
+    pub feed_at: Instant,
 }
 
 impl AheadTip {
@@ -397,6 +451,8 @@ struct Entry {
     skipped: Vec<(B256, Option<Address>)>,
     built_at: Instant,
     apply_us: u64,
+    /// When the feed message arrived (see AheadTip.feed_at).
+    feed_at: Instant,
 }
 
 /// Why prediction stopped (no tip until a rebase passes it).
@@ -430,6 +486,17 @@ pub struct AheadStats {
     pub unsure: u64,
     /// Confirmed blocks we had no prediction for.
     pub unpredicted: u64,
+    /// Review H4: a transaction we ran failed and its probe found none of
+    /// our pools: the pools its target moved before (or that share a coin
+    /// it names) were marked unsure instead.
+    pub failed_unknown: u64,
+    /// Review M1: runs that used an assumed value: pools they moved marked unsure.
+    pub assumed_unsure: u64,
+    /// Review M3: transactions picked because they pay ETH and name a
+    /// native-ETH pool's other coin.
+    pub native_picks: u64,
+    /// L2: apply_us samples seen (the ring below keeps the newest MAX_TIMES).
+    pub time_n: u64,
     pub stopped: HashMap<&'static str, u64>,
     pub apply_us: Vec<u64>,
     pub samples: Vec<Value>,
@@ -454,6 +521,7 @@ impl AheadStats {
             "rebases": self.rebases, "reapplied": self.reapplied,
             "agree": self.agree, "disagree": self.disagree, "missed": self.missed, "phantom": self.phantom,
             "valueDiff": self.value_diff, "unsure": self.unsure, "unpredicted": self.unpredicted,
+            "failedUnknown": self.failed_unknown, "assumedUnsure": self.assumed_unsure, "nativePicks": self.native_picks,
             "stopped": self.stopped.iter().map(|(k, v)| (k.to_string(), json!(v))).collect::<serde_json::Map<String, Value>>(),
             "applyUs": crate::timing::pct_of(&mut t),
             "samples": self.samples,
@@ -468,17 +536,29 @@ impl AheadStats {
         let mut stops: Vec<String> = self.stopped.iter().map(|(k, v)| format!("{k}:{v}")).collect();
         stops.sort();
         format!(
-            "[arbsim] fastlane ahead (last hour): msgs {} applied {} late {} | txs run {} skipped {} failed {} (pools unsure {}) filterMissed {} | apply us p50 {} p90 {} p99 {} max {} | rebases {} reapplied {} | agree {} disagree {} (missed {} phantom {} value {}) unsure {} unpredicted {} | stopped [{}]",
-            self.msgs, self.applied, self.late_msgs, self.txs_run, self.txs_skipped, self.txs_failed, self.txs_marked, self.filter_missed,
+            "[arbsim] fastlane ahead (last hour): msgs {} applied {} late {} | txs run {} skipped {} failed {} (pools unsure {}, nothing found {}) filterMissed {} assumedUnsure {} nativePicks {} | apply us p50 {} p90 {} p99 {} max {} | rebases {} reapplied {} | agree {} disagree {} (missed {} phantom {} value {}) unsure {} unpredicted {} | stopped [{}]",
+            self.msgs, self.applied, self.late_msgs, self.txs_run, self.txs_skipped, self.txs_failed, self.txs_marked, self.failed_unknown, self.filter_missed, self.assumed_unsure, self.native_picks,
             g("p50"), g("p90"), g("p99"), g("max"), self.rebases, self.reapplied,
             self.agree, self.disagree, self.missed, self.phantom, self.value_diff, self.unsure, self.unpredicted, stops.join(" "),
         )
     }
 
+    /// L2 (review): a ring of the newest MAX_TIMES samples, so the
+    /// percentiles keep moving after 20,000 messages in an hour.
     fn add_time(&mut self, us: u64) {
         if self.apply_us.len() < MAX_TIMES {
             self.apply_us.push(us);
+        } else {
+            let i = (self.time_n % MAX_TIMES as u64) as usize;
+            self.apply_us[i] = us;
         }
+        self.time_n += 1;
+    }
+
+    /// Prediction agreement % (agree / (agree + disagree)), None = no data.
+    pub fn agreement_pct(&self) -> Option<f64> {
+        let n = self.agree + self.disagree;
+        (n > 0).then(|| 100.0 * self.agree as f64 / n as f64)
     }
 }
 
@@ -498,8 +578,11 @@ pub struct Ahead {
     msgs: BTreeMap<u64, Arc<BinMsg>>,
     stop: Option<Stop>,
     /// Learned addresses whose transactions moved our pools (-> when).
-    touchers: HashMap<Address, Instant>,
+    /// -> (when, our pools it moved; H4 uses them when a run fails blind).
+    touchers: HashMap<Address, (Instant, Vec<String>)>,
     tip: Option<Arc<AheadTip>>,
+    /// Feed arrival time per held message (bounded with `msgs`).
+    arrived: BTreeMap<u64, Instant>,
     pub hour: AheadStats,
     pub total: AheadStats,
 }
@@ -515,6 +598,7 @@ impl Ahead {
             stop: None,
             touchers: HashMap::new(),
             tip: None,
+            arrived: BTreeMap::new(),
             hour: AheadStats::default(),
             total: AheadStats::default(),
         }
@@ -565,21 +649,38 @@ impl Ahead {
         f(&mut self.total);
     }
 
-    fn learn_toucher(&mut self, a: Address) {
+    fn learn_toucher(&mut self, a: Address, pools: &[String]) {
         if self.touchers.len() >= self.cfg.max_touchers && !self.touchers.contains_key(&a) {
             // Drop the oldest quarter (bounded memory, cheap).
-            let mut v: Vec<(Address, Instant)> = self.touchers.iter().map(|(a, t)| (*a, *t)).collect();
+            let mut v: Vec<(Address, Instant)> = self.touchers.iter().map(|(a, t)| (*a, t.0)).collect();
             v.sort_by_key(|x| x.1);
             for (x, _) in v.iter().take(self.cfg.max_touchers / 4 + 1) {
                 self.touchers.remove(x);
             }
         }
-        self.touchers.insert(a, Instant::now());
+        let e = self.touchers.entry(a).or_insert_with(|| (Instant::now(), Vec::new()));
+        e.0 = Instant::now();
+        for k in pools {
+            // Bounded: a router remembers at most 64 of our pools.
+            if !e.1.contains(k) && e.1.len() < 64 {
+                e.1.push(k.clone());
+            }
+        }
     }
 
     /// A new feed message (one L2 block).
     pub fn on_feed_message(&mut self, m: Arc<BinMsg>) {
+        self.on_feed_message_at(m, Instant::now());
+    }
+
+    /// `on_feed_message` with the time the message reached arbsim.
+    pub fn on_feed_message_at(&mut self, m: Arc<BinMsg>, at: Instant) {
         self.count(|s| s.msgs += 1);
+        if self.arrived.len() > self.cfg.max_blocks * 4 {
+            let cut = self.arrived.keys().nth(self.arrived.len() - self.cfg.max_blocks * 2).copied().unwrap_or(0);
+            self.arrived = self.arrived.split_off(&cut);
+        }
+        self.arrived.entry(m.seq).or_insert(at);
         if let Some(b) = &self.base {
             if m.seq <= b.seq {
                 // Copy 2 already confirmed it (the feed was slower this time).
@@ -615,6 +716,14 @@ impl Ahead {
         }
         // (The very first version has nothing to compare with.)
         let first_time = self.base.as_ref().is_some_and(|b| c.seq > b.seq);
+        // Review M3/L1: every predicted block this version covers (several
+        // may confirm at once): its skipped transactions are checked against
+        // copy 2's reports, not only the last one's.
+        let covered: Vec<usize> = (0..self.entries.len()).filter(|i| self.entries[*i].seq <= c.seq).collect();
+        for i in covered {
+            let skipped = std::mem::take(&mut self.entries[i].skipped);
+            self.learn_skipped(skipped, moved_by_tx);
+        }
         if first_time {
             self.agreement(&c, moved_by_tx);
         }
@@ -638,19 +747,19 @@ impl Ahead {
             self.count(|s| s.unpredicted += 1);
             return;
         };
+        let _ = moved_by_tx;
+        // L1 (review): only a version that is exactly ONE block after the
+        // previous confirmed one is compared. A jump of several blocks
+        // (copy 2 confirmed N-2..N at once and published only N) has a diff
+        // for block N alone, while our prediction moved pools across all of
+        // them: comparing would miscount. Those are counted "unpredicted".
+        // (The runtime hands every published version in order, so jumps are rare.)
+        if self.base.as_ref().is_some_and(|b| c.seq != b.seq + 1) {
+            self.count(|s| s.unpredicted += 1);
+            return;
+        }
         let pools = self.pools.clone();
         let conf_moved: HashSet<String> = pools.moved_by_diff(&c.diff).into_iter().collect();
-        // Skipped transactions copy 2's reports say moved our pools: the
-        // filter missed them. Learn their target for next time.
-        let skipped = std::mem::take(&mut self.entries[i].skipped);
-        for (h, to) in skipped {
-            if moved_by_tx(&h).is_some_and(|p| !p.is_empty()) {
-                self.count(|s| s.filter_missed += 1);
-                if let Some(t) = to {
-                    self.learn_toucher(t);
-                }
-            }
-        }
         let e = &self.entries[i];
         let mut all: Vec<&String> = conf_moved.iter().chain(e.changed_cum.iter()).collect();
         all.sort();
@@ -688,6 +797,19 @@ impl Ahead {
                     if self.hour.samples.len() < MAX_SAMPLES {
                         self.hour.samples.push(json!({ "pool": k, "block": block, "kind": kind }));
                     }
+                }
+            }
+        }
+    }
+
+    /// Skipped transactions copy 2's reports say moved our pools: the
+    /// filter missed them. Learn their target (and the pools) for next time.
+    fn learn_skipped(&mut self, skipped: Vec<(B256, Option<Address>)>, moved_by_tx: &dyn Fn(&B256) -> Option<Vec<String>>) {
+        for (h, to) in skipped {
+            if let Some(p) = moved_by_tx(&h).filter(|p| !p.is_empty()) {
+                self.count(|s| s.filter_missed += 1);
+                if let Some(t) = to {
+                    self.learn_toucher(t, &p);
                 }
             }
         }
@@ -749,6 +871,7 @@ impl Ahead {
             unsure_pools: unsure,
             built_at: e.built_at,
             apply_us: e.apply_us,
+            feed_at: e.feed_at,
         }
     }
 
@@ -793,7 +916,12 @@ impl Ahead {
         let mut changed: Vec<String> = Vec::new();
         let mut skipped: Vec<(B256, Option<Address>)> = Vec::new();
         for t in &txs {
-            let pick = self.cfg.run_all || pools.may_touch(t.to, &t.data) || t.to.is_some_and(|a| self.touchers.contains_key(&a));
+            let native = if self.cfg.run_all { Vec::new() } else { pools.named_native(t.value, &t.data) };
+            let plain = self.cfg.run_all || pools.may_touch(t.to, &t.data) || t.to.is_some_and(|a| self.touchers.contains_key(&a));
+            if !plain && !native.is_empty() {
+                self.count(|s| s.native_picks += 1);
+            }
+            let pick = plain || !native.is_empty();
             if !pick {
                 self.count(|s| s.txs_skipped += 1);
                 skipped.push((t.hash, t.to));
@@ -806,6 +934,11 @@ impl Ahead {
                     if !out.assumed.labels().is_empty() {
                         self.count(|s| s.assumed += 1);
                     }
+                    // Review M1: built on a value we only assumed (a fill
+                    // re-read every minute, or a sender's funds): what it
+                    // moved can't be vouched for. Its pools become unsure.
+                    let a = &out.assumed;
+                    let shaky = a.recent_fill || a.call_fill || (a.sender_funds && !self.cfg.trust_sender_funds);
                     ov.commit(&kept.diff);
                     for (a, s) in &kept.forget {
                         ov.forget_slot(*a, *s);
@@ -813,7 +946,16 @@ impl Ahead {
                     let moved: Vec<String> = pools.moved.moved(&out.changed, &out.hashes).into_iter().map(|x| x.key).collect();
                     if !moved.is_empty() {
                         if let Some(a) = t.to {
-                            self.learn_toucher(a);
+                            self.learn_toucher(a, &moved);
+                        }
+                    }
+                    if shaky && !moved.is_empty() {
+                        self.count(|s| s.assumed_unsure += 1);
+                        for k in &moved {
+                            if let Some(p) = pools.places.get(k) {
+                                forget_place(&mut ov, *p);
+                            }
+                            unsure_cum.insert(k.clone());
                         }
                     }
                     for k in moved {
@@ -830,15 +972,30 @@ impl Ahead {
                     // Which of our pools might it touch? What it reads in a
                     // collect run + what it names. Those become unsure.
                     let mut hit = probe_touched(&ov, &ctx, t, &pools);
-                    for k in pools.named(t.to, &t.data) {
+                    for k in pools.named(t.to, &t.data).into_iter().chain(native.iter().cloned()) {
                         if !hit.contains(&k) {
                             hit.push(k);
+                        }
+                    }
+                    if hit.is_empty() {
+                        // Review H4: it failed and nothing tells us what it
+                        // would touch (router code or state missing). Never
+                        // assume "nothing": the pools its target moved
+                        // before, else our pools sharing a coin it names;
+                        // if neither is known, stop until confirmed.
+                        self.count(|s| s.failed_unknown += 1);
+                        hit = t.to.and_then(|a| self.touchers.get(&a)).map(|x| x.1.clone()).unwrap_or_default();
+                        if hit.is_empty() {
+                            hit = pools.sharing_named_coins(&t.data);
+                        }
+                        if hit.is_empty() {
+                            return Err("failed_tx_unknown_effect");
                         }
                     }
                     if !hit.is_empty() {
                         self.count(|s| s.txs_marked += 1);
                         if let Some(a) = t.to {
-                            self.learn_toucher(a);
+                            self.learn_toucher(a, &hit);
                         }
                     }
                     for k in hit {
@@ -867,6 +1024,7 @@ impl Ahead {
             skipped,
             built_at: Instant::now(),
             apply_us: t0.elapsed().as_micros() as u64,
+            feed_at: self.arrived.get(&m.seq).copied().unwrap_or(t0),
         })
     }
 }
@@ -930,14 +1088,21 @@ fn probe_touched(view: &dyn StateRead, ctx: &BlockCtx, t: &DecodedTx, pools: &Po
 // ---------------------------------------------------------------------------
 
 enum Ev {
-    Feed(Arc<BinMsg>),
+    /// A feed message and when it reached arbsim.
+    Feed(Arc<BinMsg>, Instant),
     Confirmed,
 }
 
 struct Runtime {
     tx: SyncSender<Ev>,
-    tip: Mutex<Option<Arc<AheadTip>>>,
+    /// (tip number, tip): the number goes up by one per NEW tip, so a
+    /// waiter (the fast lane, fastlane/lane.rs) sees each tip once.
+    tip: Mutex<(u64, Option<Arc<AheadTip>>)>,
+    /// Woken on every new tip (no busy polling).
+    tip_cv: std::sync::Condvar,
     status: Mutex<Value>,
+    /// Agreement counts this hour (agree, disagree), for the practice line.
+    agreement: Mutex<(u64, u64)>,
     dropped: std::sync::atomic::AtomicU64,
 }
 
@@ -956,7 +1121,7 @@ pub fn start_with(m: Mode, c2: super::intake::Copy2Handle, mut cfg: AheadCfg) ->
     }
     cfg.l2_offset = c2.sh.cfg.l2_offset;
     let (tx, rx) = std::sync::mpsc::sync_channel::<Ev>(4096);
-    if RT.set(Runtime { tx, tip: Mutex::new(None), status: Mutex::new(json!({})), dropped: Default::default() }).is_err() {
+    if RT.set(Runtime { tx, tip: Mutex::new((0, None)), tip_cv: std::sync::Condvar::new(), status: Mutex::new(json!({})), agreement: Mutex::new((0, 0)), dropped: Default::default() }).is_err() {
         return false;
     }
     eprintln!(
@@ -971,8 +1136,9 @@ pub fn start_with(m: Mode, c2: super::intake::Copy2Handle, mut cfg: AheadCfg) ->
 /// check/feedstore.rs: new feed messages stored (no-op when off).
 pub fn feed_hook(added: &[Arc<BinMsg>]) {
     let Some(rt) = RT.get() else { return };
+    let at = Instant::now();
     for m in added {
-        if rt.tx.try_send(Ev::Feed(m.clone())).is_err() {
+        if rt.tx.try_send(Ev::Feed(m.clone(), at)).is_err() {
             rt.dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
@@ -987,7 +1153,27 @@ pub fn confirmed_hook() {
 
 /// The running sidecar's predicted tip (None when off / not ready).
 pub fn global_tip() -> Option<Arc<AheadTip>> {
-    RT.get().and_then(|rt| rt.tip.lock().unwrap_or_else(|e| e.into_inner()).clone())
+    RT.get().and_then(|rt| rt.tip.lock().unwrap_or_else(|e| e.into_inner()).1.clone())
+}
+
+/// Wait (at most `timeout`) for a tip newer than number `after`. Returns
+/// (its number, the tip). None = timed out / off. The fast lane's thread
+/// sleeps here between blocks: no busy polling.
+pub fn wait_tip(after: u64, timeout: Duration) -> Option<(u64, Arc<AheadTip>)> {
+    let rt = RT.get()?;
+    let g = rt.tip.lock().unwrap_or_else(|e| e.into_inner());
+    let (g, _) = rt.tip_cv.wait_timeout_while(g, timeout, |t| t.0 <= after || t.1.is_none()).unwrap_or_else(|e| e.into_inner());
+    if g.0 > after {
+        g.1.clone().map(|t| (g.0, t))
+    } else {
+        None
+    }
+}
+
+/// (agree, disagree) of the prediction so far this hour (practice line).
+/// None = off.
+pub fn agreement_counts() -> Option<(u64, u64)> {
+    RT.get().map(|rt| *rt.agreement.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
 /// status "fastlaneAhead" (None when off).
@@ -998,47 +1184,78 @@ pub fn status_json() -> Option<Value> {
     Some(v)
 }
 
-/// The pools copy 2 follows, from its registry.
-fn pool_set(c2: &super::intake::Copy2Handle) -> PoolSet {
+/// The pools copy 2 follows, from its registry: (pool, token0, token1)
+/// sorted by key, plus the keys not ready. Only COPIED under the registry's
+/// read lock (review M2); the lookup tables are built outside it, and only
+/// when this list changed.
+type PoolList = (Vec<(FollowedPool, Address, Address)>, Vec<String>);
+fn pool_list(c2: &super::intake::Copy2Handle) -> PoolList {
     let reg = c2.c2.reg.read().unwrap_or_else(|e| e.into_inner());
     let mut list = Vec::with_capacity(reg.pools.len());
-    let mut not_ready = HashSet::new();
+    let mut not_ready = Vec::new();
     for (pk, e) in &reg.pools {
         let key = match pk.1 {
             Some(id) => format!("{id:#x}"),
             None => format!("{:#x}", e.pool.address),
         };
         if e.state != super::intake::PoolState::Ready {
-            not_ready.insert(key.clone());
+            not_ready.push(key.clone());
         }
         list.push((FollowedPool { key, address: e.pool.address, v4_id: pk.1 }, e.pool.token0, e.pool.token1));
     }
     drop(reg);
-    PoolSet::build(&list, not_ready)
+    list.sort_by(|a, b| a.0.key.cmp(&b.0.key));
+    not_ready.sort();
+    (list, not_ready)
+}
+
+fn same_list(a: &PoolList, b: &PoolList) -> bool {
+    a.1 == b.1 && a.0.len() == b.0.len() && a.0.iter().zip(&b.0).all(|(x, y)| x.0.key == y.0.key && x.0.address == y.0.address && x.0.v4_id == y.0.v4_id && x.1 == y.1 && x.2 == y.2)
 }
 
 fn run_loop(c2: super::intake::Copy2Handle, cfg: AheadCfg, rx: Receiver<Ev>) {
     let mut a = Ahead::new(cfg);
     let mut reg_gen = u64::MAX;
+    let mut list: PoolList = (Vec::new(), Vec::new());
     let mut head: Option<Arc<crate::state::mirror::Version>> = None;
     let mut hour_start = Instant::now();
     let mut last_status = Instant::now();
     loop {
-        let ev = rx.recv_timeout(Duration::from_millis(25));
+        // Review M2: no idle polling. Woken by a feed message or a published
+        // version (confirmed_hook); the 1 s timeout only drives the status
+        // copy and the hourly line.
+        let ev = rx.recv_timeout(Duration::from_secs(1));
         if matches!(ev, Err(RecvTimeoutError::Disconnected)) {
             return;
         }
-        // Pools: rebuilt only when copy 2's registry changed.
+        // Pools: looked at only when copy 2's registry changed, and the
+        // lookup tables rebuilt only when the pool list / readiness changed.
         let g = c2.c2.reg.gen();
         if g != reg_gen {
             reg_gen = g;
-            a.set_pools(Arc::new(pool_set(&c2)));
+            let now = pool_list(&c2);
+            if !same_list(&now, &list) || a.pools().is_empty() {
+                list = now;
+                a.set_pools(Arc::new(PoolSet::build(&list.0, list.1.iter().cloned().collect())));
+            }
         }
         // Confirmed first (a new version may already cover a feed message).
-        if let Some(v) = c2.sh.head() {
-            if head.as_ref().is_none_or(|h| !Arc::ptr_eq(h, &v)) {
+        // Every version published since the last one, in order (review L1:
+        // agreement is per block; a jump would miscount).
+        let pv = c2.sh.published.view();
+        let newer: Vec<Arc<crate::state::mirror::Version>> = match &head {
+            None => pv.head().cloned().into_iter().collect(),
+            Some(h) if pv.head().is_some_and(|x| Arc::ptr_eq(x, h)) => Vec::new(),
+            Some(h) => pv.versions.iter().filter(|v| v.seq > h.seq).cloned().collect(),
+        };
+        if !newer.is_empty() {
+            // The registry summary for the readers' copy we just took (no
+            // rebuild while it is current; review M2: never `core_for(None)`).
+            let core = c2.core_for(Some(&pv));
+            for v in newer {
                 head = Some(v.clone());
-                let core = c2.core_for(None);
+                // Same cache key (head block, no extra holders) the head's
+                // own checks use, so this never pushes theirs out.
                 let prov = c2.provenance_with(&core, v.block, &[]);
                 let prov: Arc<dyn Provenance + Send + Sync> = prov;
                 let conf = Confirmed { seq: v.seq, snap: v.snap.clone(), ctx: v.ctx.clone(), diff: v.diff.clone(), prov };
@@ -1046,17 +1263,33 @@ fn run_loop(c2: super::intake::Copy2Handle, cfg: AheadCfg, rx: Receiver<Ev>) {
                 a.on_confirmed(conf, &|h| rm.lock().ok().and_then(|r| r.pools_of(h)));
             }
         }
-        if let Ok(Ev::Feed(m)) = ev {
-            a.on_feed_message(m);
+        if let Ok(Ev::Feed(m, at)) = ev {
+            a.on_feed_message_at(m, at);
             // Everything queued, in order (a burst after a reconnect).
             while let Ok(e) = rx.try_recv() {
-                if let Ev::Feed(m) = e {
-                    a.on_feed_message(m);
+                if let Ev::Feed(m, at) = e {
+                    a.on_feed_message_at(m, at);
                 }
             }
         }
         if let Some(rt) = RT.get() {
-            *rt.tip.lock().unwrap_or_else(|e| e.into_inner()) = a.tip();
+            {
+                let mut t = rt.tip.lock().unwrap_or_else(|e| e.into_inner());
+                let now = a.tip();
+                let new = match (&t.1, &now) {
+                    (Some(x), Some(y)) => !Arc::ptr_eq(x, y),
+                    (None, Some(_)) => true,
+                    _ => false,
+                };
+                if new {
+                    t.0 += 1;
+                }
+                t.1 = now;
+                if new {
+                    rt.tip_cv.notify_all();
+                }
+            }
+            *rt.agreement.lock().unwrap_or_else(|e| e.into_inner()) = (a.hour.agree, a.hour.disagree);
             if last_status.elapsed() >= Duration::from_secs(1) {
                 last_status = Instant::now();
                 *rt.status.lock().unwrap_or_else(|e| e.into_inner()) = status_of(&a);

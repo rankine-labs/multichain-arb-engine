@@ -17,6 +17,7 @@
 //   FASTLANE=off (the default) runs none of it.
 // ============================================================================
 pub mod bridge;
+pub mod c2runner;
 pub mod convert;
 pub mod gun;
 pub mod mode;

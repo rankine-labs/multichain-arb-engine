@@ -41,6 +41,19 @@ impl Mode {
             Mode::Live => "live",
         }
     }
+    /// Same as `as_str` (the gun's older name for it).
+    pub fn name(self) -> &'static str {
+        self.as_str()
+    }
+    /// Parse a FASTLANE value (unknown = Off). The ONE parser every fast
+    /// lane part uses (ahead, scan, gun, safety): see `parse_mode`.
+    pub fn parse(raw: Option<&str>) -> Mode {
+        parse_mode(raw).0
+    }
+    /// FASTLANE of this process (read every call: cheap, and tests can set it).
+    pub fn from_env() -> Mode {
+        Mode::parse(std::env::var("FASTLANE").ok().as_deref())
+    }
 }
 
 /// Both switches, read once at start.

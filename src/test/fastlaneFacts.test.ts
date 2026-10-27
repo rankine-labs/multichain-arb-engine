@@ -1,4 +1,4 @@
-import { fastlaneFacts, fastlaneFactsOn, entrySettings, EntryCandidate } from '../execution/trigEntry';
+import { fastlaneFacts, fastlaneFactsFp, fastlaneFactsOn, entrySettings, EntryCandidate } from '../execution/trigEntry';
 
 // FAST LANE FACTS (execution/trigEntry.ts): with FASTLANE=practice|live the
 // one-trip candidate table also carries, per route, what the Rust standing-gap
@@ -28,3 +28,10 @@ assert(fastlaneFacts(cand({ px: 0, d: 6 })) === null && fastlaneFacts(cand({ px:
 assert(fastlaneFacts(cand({ px: 1, d: 37 })) === null && fastlaneFacts(cand({ px: 1, d: 1.5 })) === null, 'bad decimals = none');
 assert(fastlaneFacts(cand({ px: 1, d: 6 }, NaN)) === null, 'bad gas = none');
 assert(!('lp' in fastlaneFacts(cand({ px: 1, d: 6 }))!), 'loan pips optional');
+
+// Review H2: tiny price / gas moves don't change the pool's fingerprint (no resend every refresh).
+const fpA = fastlaneFactsFp(fastlaneFacts(cand({ px: 3456.12, d: 18, lp: 500 }), )!);
+const fpB = fastlaneFactsFp(fastlaneFacts(cand({ px: 3457.9, d: 18, lp: 500 }, 0.0512))!);
+const fpC = fastlaneFactsFp(fastlaneFacts(cand({ px: 3600, d: 18, lp: 500 }))!);
+assert(fpA === fpB, 'price within 0.1% and gas within 2 digits: same fingerprint');
+assert(fpA !== fpC, 'a real price move changes the fingerprint');
