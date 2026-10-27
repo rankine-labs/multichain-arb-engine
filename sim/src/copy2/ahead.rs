@@ -1767,7 +1767,7 @@ impl Ahead {
         }
         let mut ov = Overlay::new((*prev_snap).clone());
         let pools = self.pools.clone();
-        let assume = Assume { sender_funds: true, recent_fill: true, skip: None, record_hashes: true };
+        let assume = Assume { sender_funds: true, recent_fill: true, skip: None, record_hashes: true, proven_skip: false };
         let mut changed: Vec<String> = Vec::new();
         let mut notes: Vec<TxNote> = Vec::with_capacity(txs.len());
         let note = |t: &DecodedTx, fate: Fate, ok: bool, why: Option<String>, pools: Vec<String>| TxNote { hash: t.hash, to: t.to, fate, ok, why, pools };
@@ -1827,7 +1827,7 @@ impl Ahead {
                 }
             }
             self.count(|s| s.txs_run += 1);
-            let plan = OrderedPlan { msgs: vec![PlanMsg { seq: m.seq, ctx: ctx.clone(), txs: vec![t.clone()] }], trigger: t.hash, call_ctx: ctx.clone() };
+            let plan = OrderedPlan { msgs: vec![PlanMsg { seq: m.seq, ctx: ctx.clone(), txs: vec![t.clone()] }], trigger: t.hash, call_ctx: ctx.clone(), unrunnable: Vec::new() };
             match run_ordered_keep(&ov, &plan, base.prov.as_ref(), &assume) {
                 Ok((out, kept)) => {
                     // Did OUR run finish normally? (A reverted run moves

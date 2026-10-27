@@ -1153,6 +1153,8 @@ impl Copy2Handle {
         // for the copy's thread: the bot's checks on the same connection
         // are read after it; copy2-q).
         self.sh.published.note_received(m.block.saturating_sub(self.sh.cfg.l2_offset));
+        // Copy-2 lag clock (copy2/lag.rs): when this block's report came.
+        super::lag::report_arrived(m.block.saturating_sub(self.sh.cfg.l2_offset));
         if self.tx.try_send(Input::Block(m)).is_err() {
             // Hopelessly behind: dropping a block breaks the copy; the next
             // message's prevBlock check reloads everything.
@@ -2414,6 +2416,7 @@ impl Intake {
             // applied after the blocks before them).
             while let Some((&b, _)) = self.pending.iter().next().filter(|_| self.catchup.is_none()) {
                 let m = self.pending.remove(&b).unwrap();
+                super::lag::intake_started(m.block.saturating_sub(self.sh.cfg.l2_offset));
                 self.process(m);
                 // Checks about this block find the registry summary ready
                 // (checkcore.rs; rebuilt only if the registry changed).
@@ -3139,6 +3142,8 @@ impl Intake {
         self.c2.last_block.store(block, Ordering::Relaxed);
         self.c2.head_block.store(block, Ordering::Relaxed);
         self.sh.notify();
+        // Copy-2 lag clock (copy2/lag.rs).
+        super::lag::published(block.saturating_sub(self.sh.cfg.l2_offset));
         // FAST LANE A (copy2/ahead.rs): rebase the predicted copy on this
         // version. Does nothing unless FASTLANE is practice / live.
         super::ahead::confirmed_hook();

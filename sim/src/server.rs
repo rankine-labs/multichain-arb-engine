@@ -265,6 +265,8 @@ pub fn handle_tm(ctx: &Ctx, req: &Value, tm: &mut Tm) -> Value {
                 // The bot's "wanted" hint rides on its status poll (copy2-relist).
                 c.note_wanted(req.get("wanted"));
                 s["copy2"] = c.status_json(req.get("pools").and_then(|p| p.as_bool()).unwrap_or(false));
+                // (Oct 27) Why copy 2 trails the feed (copy2/lag.rs).
+                s["copy2Lag"] = crate::copy2::lag::status_json();
             }
             if let Value::Object(t) = crate::timing::status() {
                 for (k, v) in t {
@@ -882,8 +884,12 @@ pub fn trig_assume(trust: TrigTrust, feed: &crate::check::ordered::WireFeed, rou
         return (false, Assume::default());
     }
     let allow = |k: &str| feed.assume.as_ref().is_none_or(|l| l.iter().any(|x| x.trim() == k));
-    let skip = if allow("skip") && !feed.route.is_empty() { route_of(&feed.route) } else { None };
-    (true, Assume { sender_funds: allow("sender_funds"), recent_fill: allow("recent_fill"), skip, record_hashes: false })
+    // (Oct 27) PROVEN SKIPPING: only when asked for by name (the fast lane's
+    // trigger path, FASTLANE_TRIG_SKIP=proven); the bot never sends it, so
+    // its questions are answered exactly as before. It replaces "skip".
+    let proven_skip = feed.assume.as_ref().is_some_and(|l| l.iter().any(|x| x.trim() == "skip_proven"));
+    let skip = if !proven_skip && allow("skip") && !feed.route.is_empty() { route_of(&feed.route) } else { None };
+    (true, Assume { sender_funds: allow("sender_funds"), recent_fill: allow("recent_fill"), skip, record_hashes: false, proven_skip })
 }
 
 /// Accounts a request gives contract code by override (the test contract).

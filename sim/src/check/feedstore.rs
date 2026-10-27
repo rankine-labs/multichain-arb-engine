@@ -239,6 +239,8 @@ impl FeedStore {
             }
             drop(g);
             self.stats.puts.fetch_add(1, Relaxed);
+            // Copy-2 lag clock (copy2/lag.rs): when this block's feed message came.
+            crate::copy2::lag::feed_arrived(m.seq);
             added.push(b);
         }
         // FAST LANE A (copy2/ahead.rs): the predicted copy applies each new

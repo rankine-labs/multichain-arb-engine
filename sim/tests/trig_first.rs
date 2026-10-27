@@ -655,7 +655,7 @@ fn route() -> Route {
 }
 
 fn best() -> Assume {
-    Assume { sender_funds: true, recent_fill: true, skip: Some(route()), record_hashes: false }
+    Assume { sender_funds: true, recent_fill: true, skip: Some(route()), record_hashes: false, proven_skip: false }
 }
 
 fn run_be(view: &MemState, f: &WireFeed, prov: &dyn Provenance, assume: &Assume) -> Result<OrderedOut, CheckUnknown> {

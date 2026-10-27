@@ -34,6 +34,8 @@ pub mod coins;
 pub mod fields;
 // The thread that applies each block's events and publishes versions (A).
 pub mod intake;
+// Why copy 2 trails the feed: feed -> report -> queue -> publish times (status copy2Lag).
+pub mod lag;
 // FAST LANE A: the predicted copy (copy 2 + the feed messages after it).
 // Runs only with FASTLANE=practice|live.
 pub mod ahead;

@@ -156,7 +156,7 @@ use super::hexutil::parse_bytes;
 use super::overrides::Overrides;
 use super::rawtx::{decode_signed_tx, DecodedTx, UNSUPPORTED_TX_PREFIX};
 use super::run::{db_unknown, default_arbsys_gas};
-use super::{CallOutcome, CallReq, CheckUnknown, UnknownReason, DEFAULT_CALL_GAS};
+use super::{CallOutcome, CallReq, CheckUnknown, TxAt, UnknownReason, DEFAULT_CALL_GAS};
 use crate::arb::{self, evm::build_evm_with_inspector, evm::ArbEvm, ArbConfig, BlockCtx};
 use crate::state::{Lookup, MissItem, StateRead};
 
@@ -190,6 +190,43 @@ pub struct OrderedPlan {
     /// snapshot's own, if none), the same convention as every copy-2 check
     /// ("state after block X, run in block X's details").
     pub call_ctx: BlockCtx,
+    /// (Oct 27) Feed transactions in these messages that we could not even
+    /// unpack (a kind we don't replay, broken bytes), never the trigger. Any
+    /// FULL replay of this plan answers "unknown" because of the first one
+    /// (exactly what building the plan used to answer); only the trigger-
+    /// alone run (`trigger_only`, discovery), which replays none of the other
+    /// transactions anyway, goes ahead without them. Before Oct 27 one such
+    /// transaction anywhere between copy 2's version and the newest message
+    /// failed EVERY trigger in that window (live capture: 24 unreadable
+    /// transactions -> 857 "unsupported_tx" discovery answers).
+    pub unrunnable: Vec<Unrunnable>,
+}
+
+/// A feed transaction of the plan that could not be unpacked (see
+/// OrderedPlan.unrunnable).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Unrunnable {
+    pub seq: u64,
+    /// Its position in its message.
+    pub idx: usize,
+    pub hash: B256,
+    /// UnsupportedTx (a kind we don't replay) or FeedUnreplayable (broken).
+    pub reason: UnknownReason,
+    /// The same detail building the plan used to answer.
+    pub detail: String,
+    /// Its first byte (the type of a typed transaction; >= 0xc0 = legacy).
+    pub first_byte: Option<u8>,
+    /// Sequenced before the trigger (false: after it, still before our trade).
+    pub before_trigger: bool,
+}
+
+impl Unrunnable {
+    /// The "unknown" a full replay answers because of it.
+    pub fn unknown(&self) -> CheckUnknown {
+        let mut u = CheckUnknown::new(self.reason, self.detail.clone());
+        u.at = Some(TxAt { seq: self.seq, hash: self.hash, to: None, from: None, tx_type: self.first_byte.filter(|b| *b < 0xc0), trigger: false });
+        u
+    }
 }
 
 /// What the plan says about the trigger and the snapshot (for the answer
@@ -399,6 +436,7 @@ pub fn build_plan_with(feed: &WireFeed, held: Option<&[Arc<super::feedstore::Bin
     let mut out = Vec::with_capacity(needed.len());
     let mut prev = base.clone();
     let (mut txs, mut later, mut after_trigger) = (0usize, 0usize, included);
+    let mut unrunnable: Vec<Unrunnable> = Vec::new();
     for i in needed {
         let m = &msgs[i];
         if !m.complete {
@@ -421,10 +459,20 @@ pub fn build_plan_with(feed: &WireFeed, held: Option<&[Arc<super::feedstore::Bin
         };
         let mut decoded = Vec::with_capacity(m.txs.len());
         for (j, bt) in m.txs.iter().enumerate() {
-            let t = bt.decoded().map_err(|e| {
-                let reason = if e.starts_with(UNSUPPORTED_TX_PREFIX) { UnknownReason::UnsupportedTx } else { UnknownReason::FeedUnreplayable };
-                CheckUnknown::new(reason, format!("feed message {} tx {j}: {e}", m.seq))
-            })?;
+            let t = match bt.decoded() {
+                Ok(t) => t,
+                Err(e) => {
+                    let reason = if e.starts_with(UNSUPPORTED_TX_PREFIX) { UnknownReason::UnsupportedTx } else { UnknownReason::FeedUnreplayable };
+                    let detail = format!("feed message {} tx {j}: {e}", m.seq);
+                    // The trigger itself must be unpacked: unknown, as always.
+                    if bt.hash == trigger {
+                        return Err(CheckUnknown::new(reason, detail));
+                    }
+                    // Any other one: written down (see OrderedPlan.unrunnable).
+                    unrunnable.push(Unrunnable { seq: m.seq, idx: j, hash: bt.hash, reason, detail, first_byte: bt.raw.first().copied(), before_trigger: !after_trigger });
+                    continue;
+                }
+            };
             if after_trigger {
                 later += 1;
             }
@@ -442,7 +490,7 @@ pub fn build_plan_with(feed: &WireFeed, held: Option<&[Arc<super::feedstore::Bin
     }
     let last_seq = out.last().map_or(snap_seq, |m| m.seq);
     let info = PlanInfo { trigger, snap_seq, snap_block: snap_seq + offset, included, msgs: out.len(), txs, later, last_seq };
-    Ok((OrderedPlan { msgs: out, trigger, call_ctx: prev }, info))
+    Ok((OrderedPlan { msgs: out, trigger, call_ctx: prev, unrunnable }, info))
 }
 
 // ---------------------------------------------------------------------------
@@ -530,6 +578,10 @@ pub struct Assume {
     /// name the missing slots go out with the answer (CheckUnknown.pre,
     /// "missingPre"): copy 2 then knows WHOSE PoolManager value it was.
     pub record_hashes: bool,
+    /// (Oct 27) PROVEN SKIPPING instead of `skip`'s best-effort rules (the
+    /// fast lane's own trigger path asks for it with "skip_proven"; see
+    /// PROVEN SKIPPING in the file header). When true, `skip` is ignored.
+    pub proven_skip: bool,
 }
 
 /// SIZE LADDER inside one replay (trigger-first entry point): after our
@@ -561,6 +613,10 @@ pub struct Assumed {
     pub call_fill: bool,
     pub skipped_unrelated: usize,
     pub skipped_related: usize,
+    /// PROVEN SKIPPING: feed transactions left out because they provably
+    /// can't change anything the rest of the run read (not an assumption:
+    /// confidence unchanged).
+    pub skipped_proven: usize,
 }
 
 impl Assumed {
@@ -581,6 +637,9 @@ impl Assumed {
         }
         if self.skipped_related > 0 {
             v.push(format!("skipped_related:{}", self.skipped_related));
+        }
+        if self.skipped_proven > 0 {
+            v.push(format!("skipped_proven:{}", self.skipped_proven));
         }
         v
     }
@@ -1010,7 +1069,9 @@ pub fn trigger_only(plan: &OrderedPlan) -> Option<(OrderedPlan, usize)> {
     }
     let m = found?;
     let call_ctx = m.ctx.clone();
-    Some((OrderedPlan { msgs: vec![m], trigger: plan.trigger, call_ctx }, others))
+    // (Transactions we couldn't unpack are left out like every other one.)
+    let others = others + plan.unrunnable.iter().filter(|u| u.before_trigger).count();
+    Some((OrderedPlan { msgs: vec![m], trigger: plan.trigger, call_ctx, unrunnable: Vec::new() }, others))
 }
 
 type WatchedEvm<'a> = ArbEvm<CheckDb<'a>, Watch<'a>>;
@@ -1049,7 +1110,19 @@ fn run_one(evm: &mut WatchedEvm<'_>, tx: TxEnv) -> Result<CallOutcome, CheckUnkn
 
 /// A replayed feed transaction with its real fields (gas price 0, like the
 /// node's own replay with validation off; see run.rs apply_decoded).
+/// Type 4 (EIP-7702) keeps its type and authorization list (signers
+/// already recovered); one_round only runs it when every signer is
+/// followed exactly.
 fn tx_env_of(t: &DecodedTx) -> TxEnv {
+    let mut e = tx_env_plain(t);
+    if t.tx_type == 4 {
+        e.tx_type = 4;
+        e.authorization_list = t.auth.iter().cloned().map(revm::context_interface::either::Either::Right).collect();
+    }
+    e
+}
+
+fn tx_env_plain(t: &DecodedTx) -> TxEnv {
     TxEnv {
         tx_type: if t.access_list.is_empty() { 0 } else { 1 },
         caller: t.from,
@@ -1143,6 +1216,21 @@ enum Next {
     /// Start again without this transaction (message seq, index in it);
     /// true = it may touch our route (skipped_related).
     Skip((u64, usize), bool),
+    /// PROVEN SKIPPING: start again without this transaction, on condition
+    /// that nothing in the finished run touches what it could have changed.
+    SkipProven((u64, usize), Proof),
+}
+
+/// What a provably skipped transaction could have changed (PROVEN
+/// SKIPPING): its target contract's storage / ETH balance and its sender's
+/// ETH balance / nonce. Checked against everything the finished run read.
+#[derive(Clone, Debug)]
+pub struct Proof {
+    pub hash: B256,
+    pub to: Address,
+    pub from: Address,
+    /// Why it couldn't be run (answered if the condition fails).
+    pub unknown: CheckUnknown,
 }
 
 /// `run_ordered` with best-effort assumptions (see BEST EFFORT in the file
@@ -1221,8 +1309,16 @@ fn run_ordered_inner(
     ladder: Option<&Ladder>,
     keep: bool,
 ) -> Result<(OrderedOut, Option<KeptDiff>), CheckUnknown> {
+    // A transaction we couldn't even unpack: no full replay (see
+    // OrderedPlan.unrunnable): the same answer building the plan gave.
+    if let Some(x) = plan.unrunnable.first() {
+        return Err(x.unknown());
+    }
     let mut patched: Vec<(Address, U256)> = Vec::new();
     let mut skip: HashMap<(u64, usize), bool> = HashMap::new();
+    let mut proofs: Vec<((u64, usize), Proof)> = Vec::new();
+    // The replayed transaction running when a round stopped (CheckUnknown.at).
+    let cur: std::cell::Cell<Option<TxAt>> = std::cell::Cell::new(None);
     // The hash inputs the runs write down (record_hashes), one round at a time.
     let rec = std::cell::RefCell::new(HashMap::new());
     let rec_ref = if assume.record_hashes { Some(&rec) } else { None };
@@ -1234,9 +1330,13 @@ fn run_ordered_inner(
         crate::timing::ph_count("rounds", 1);
         rec.borrow_mut().clear();
         keys_rec.borrow_mut().clear();
-        let round = match one_round(view, plan, overrides, calls, prov, strict_call, assume, &patched, &skip, ladder, rec_ref, keys_ref, keep) {
+        cur.set(None);
+        let round = match one_round(view, plan, overrides, calls, prov, strict_call, assume, &patched, &skip, &proofs, ladder, rec_ref, keys_ref, keep, &cur) {
             Ok(n) => n,
             Err(mut u) => {
+                if u.at.is_none() {
+                    u.at = cur.get();
+                }
                 // A miss (Oct 25): add the recorded inputs that name the
                 // missing slots (check/moved.rs pre_for_slots), so copy 2
                 // can tell whose PoolManager value it was.
@@ -1264,6 +1364,7 @@ fn run_ordered_inner(
                 out.assumed.sender_funds |= !patched.is_empty();
                 out.assumed.skipped_related = skip.values().filter(|r| **r).count();
                 out.assumed.skipped_unrelated = skip.len() - out.assumed.skipped_related;
+                out.assumed.skipped_proven = proofs.len();
                 return Ok((out, kept));
             }
             Next::Patch(more) => {
@@ -1281,6 +1382,9 @@ fn run_ordered_inner(
             Next::Skip(at, related) => {
                 skip.insert(at, related);
             }
+            Next::SkipProven(at, p) => {
+                proofs.push((at, p));
+            }
         }
     }
     Err(CheckUnknown::new(UnknownReason::Miss, format!("still not answerable after {MAX_ROUNDS} runs (assumed sender values / skipped transactions)")))
@@ -1297,10 +1401,12 @@ fn one_round(
     assume: &Assume,
     patched: &[(Address, U256)],
     skip: &HashMap<(u64, usize), bool>,
+    proofs: &[((u64, usize), Proof)],
     ladder: Option<&Ladder>,
     rec: Option<&std::cell::RefCell<HashMap<U256, (U256, U256)>>>,
     keys_rec: Option<&std::cell::RefCell<super::moved::KeyMap>>,
     keep: bool,
+    cur: &std::cell::Cell<Option<TxAt>>,
 ) -> Result<Next, CheckUnknown> {
     let mut db = CheckDb::new(view, overrides, true);
     // Assumed sender values (sender_funds), served before anything else.
@@ -1359,9 +1465,20 @@ fn one_round(
     for m in &plan.msgs {
         enter_block(&mut evm, &m.ctx);
         for (j, t) in m.txs.iter().enumerate() {
-            // Skipped (best effort): as if it weren't there at all.
-            if skip.contains_key(&(m.seq, j)) {
+            // Skipped (best effort / proven): as if it weren't there at all.
+            if skip.contains_key(&(m.seq, j)) || proofs.iter().any(|(k, _)| *k == (m.seq, j)) {
                 continue;
+            }
+            let is_trigger = t.hash == plan.trigger;
+            cur.set(Some(TxAt { seq: m.seq, hash: t.hash, to: t.to, from: Some(t.from), tx_type: Some(t.tx_type), trigger: is_trigger }));
+            // EIP-7702 (type 4): whether each authorization applies depends
+            // on its signer's nonce, which copy 2 never follows exactly (only
+            // an all-exact copy, tests / copy 1, has it): unknown otherwise.
+            if t.tx_type == 4 {
+                if let Some(a) = t.auth.iter().filter_map(|x| x.authority()).find(|a| matches!(view.account(*a), Lookup::Missing) || !prov.balance_exact(*a)) {
+                    let u = CheckUnknown::new(UnknownReason::UnsupportedTx, format!("EIP-7702 transaction {:#x}: authorization signer {a:#x} is not followed exactly by our copy (its nonce decides whether the authorization applies)", t.hash));
+                    return judge_cant_run(&evm, view, plan, t, (m.seq, j), assume, u);
+                }
             }
             // Unknown sender: pretend it (watched), see the file header.
             if matches!(view.account(t.from), Lookup::Missing) && overrides.get(&t.from).is_none() {
@@ -1378,36 +1495,53 @@ fn one_round(
                 Err(u) if u.reason == UnknownReason::Miss => None,
                 // A Nitro built-in we don't imitate: we can't run THIS
                 // transaction; it may be skipped by the same rules as a miss.
-                Err(u) if u.reason == UnknownReason::UnsupportedPrecompile => return judge_cant_run(&evm, plan, t, (m.seq, j), assume, u),
+                Err(u) if u.reason == UnknownReason::UnsupportedPrecompile => return judge_cant_run(&evm, view, plan, t, (m.seq, j), assume, u),
                 Err(u) => return Err(u),
             };
             if let Some(h) = evm.precompiles.unsupported() {
                 let u = CheckUnknown::new(UnknownReason::UnsupportedPrecompile, h.to_string());
-                return judge_cant_run(&evm, plan, t, (m.seq, j), assume, u);
+                return judge_cant_run(&evm, view, plan, t, (m.seq, j), assume, u);
             }
             let new_misses: Vec<MissItem> = evm.ctx.journaled_state.database.missing[miss_before..].to_vec();
             if !new_misses.is_empty() {
-                return judge_miss(&evm, plan, t, (m.seq, j), assume, new_misses);
+                return judge_miss(&evm, view, plan, t, (m.seq, j), assume, new_misses);
             }
             let Some(outcome) = outcome else {
-                return Err(CheckUnknown { reason: UnknownReason::Miss, missing: evm.ctx.journaled_state.database.missing.clone(), detail: "too many missing items".into(), pre: Vec::new(), keys: Vec::new() });
+                return Err(CheckUnknown { reason: UnknownReason::Miss, missing: evm.ctx.journaled_state.database.missing.clone(), detail: "too many missing items".into(), pre: Vec::new(), keys: Vec::new(), at: None });
             };
             if let Some(u) = watch_problem(&mut evm) {
+                // PROVEN SKIPPING: an earlier transaction's doubt is judged.
+                if assume.proven_skip && !is_trigger {
+                    return judge_proven(&evm, view, plan, t, (m.seq, j), u);
+                }
                 return Err(u);
             }
             // sender_funds: failed with a "not enough funds / bad nonce or
             // signature" error after reading a value we only assumed.
+            // (Oct 27) PROVEN mode: ANY revert after reading an assumed value
+            // (our made-up amount reads as "no" in a permission flag such as
+            // a bot's whitelist[sender], or any other check we can't see):
+            // our guess may be what failed it.
             if !outcome.success && evm.inspector.tx_sender_read {
-                if let Some(e) = funds_error(&outcome.output) {
-                    return Err(CheckUnknown::new(
+                let fe = funds_error(&outcome.output);
+                if fe.is_some() || assume.proven_skip {
+                    let u = CheckUnknown::new(
                         UnknownReason::SenderFunds,
-                        format!("a replayed transaction ({:#x}) reverted with \"{e}\" after reading its sender's coin balance / allowance, which we only assumed", t.hash),
-                    ));
+                        match fe {
+                            Some(e) => format!("a replayed transaction ({:#x}) reverted with \"{e}\" after reading its sender's coin balance / allowance, which we only assumed", t.hash),
+                            None => format!("a replayed transaction ({:#x}) reverted ({}) after reading a value of its sender we only assumed", t.hash, revert_text(&outcome)),
+                        },
+                    );
+                    if assume.proven_skip && !is_trigger {
+                        return judge_proven(&evm, view, plan, t, (m.seq, j), u);
+                    }
+                    return Err(u);
                 }
             }
             replayed.push(ReplayedTx { hash: t.hash, seq: m.seq, outcome });
         }
     }
+    cur.set(None);
     // What the replayed transactions left changed (the entry point's
     // "which pools did the trigger move?"; see OrderedOut.changed).
     let mut changed: Vec<(Address, U256)> = evm
@@ -1472,7 +1606,11 @@ fn one_round(
             return Err(u);
         }
     }
-    evm.ctx.journaled_state.database.set_recording(false);
+    // (PROVEN SKIPPING: keep writing reads down through the size ladder,
+    // whose sizes are checked against the skipped transactions too.)
+    if proofs.is_empty() {
+        evm.ctx.journaled_state.database.set_recording(false);
+    }
     // Final verdict, as run.rs Session::verdict (plus, strict: our calls'
     // copy values exact too, or best effort: labelled call_fill).
     if let Some(h) = evm.precompiles.unsupported() {
@@ -1480,7 +1618,7 @@ fn one_round(
     }
     let m = &evm.ctx.journaled_state.database.missing;
     if !m.is_empty() {
-        return Err(CheckUnknown { reason: UnknownReason::Miss, missing: m.clone(), detail: format!("{} item(s) not in our copy", m.len()), pre: Vec::new(), keys: Vec::new() });
+        return Err(CheckUnknown { reason: UnknownReason::Miss, missing: m.clone(), detail: format!("{} item(s) not in our copy", m.len()), pre: Vec::new(), keys: Vec::new(), at: None });
     }
     if strict_call {
         let bad = stale_slots(prov, &evm.ctx.journaled_state.database.reads.view_slots, &HashSet::new());
@@ -1522,12 +1660,29 @@ fn one_round(
         }
     }
     crate::timing::ph_add("ladder", t_ladder.elapsed().as_micros() as u64);
+    // PROVEN SKIPPING: the condition of every skipped transaction. Nothing
+    // the run read (replayed transactions, our calls, every ladder size) may
+    // be its target contract (storage, balance, code: any use loads the
+    // account first, recorded) or its sender (balance, nonce).
+    if !proofs.is_empty() {
+        let calls_read = &evm.ctx.journaled_state.database.reads;
+        let used = |a: Address| reads.accounts.contains(&a) || calls_read.accounts.contains(&a) || reads.slots.iter().any(|(x, _)| *x == a) || calls_read.slots.iter().any(|(x, _)| *x == a);
+        for (_, p) in proofs {
+            for (who, a) in [("its target", p.to), ("its sender", p.from)] {
+                if used(a) {
+                    let mut u = p.unknown.clone();
+                    u.detail = format!("feed transaction {:#x} couldn't be run and can't be left out: the run uses {who} {a:#x} ({})", p.hash, u.detail);
+                    return Err(u);
+                }
+            }
+        }
+    }
     Ok(Next::Done(OrderedOut { replayed, results, assumed, changed, hashes, ladder: rows }, kept))
 }
 
 /// A replayed transaction needed values we don't hold: assume its sender's,
 /// skip it, or answer unknown (see BEST EFFORT in the file header).
-fn judge_miss(evm: &WatchedEvm<'_>, plan: &OrderedPlan, t: &DecodedTx, at: (u64, usize), assume: &Assume, new_misses: Vec<MissItem>) -> Result<Next, CheckUnknown> {
+fn judge_miss(evm: &WatchedEvm<'_>, view: &dyn StateRead, plan: &OrderedPlan, t: &DecodedTx, at: (u64, usize), assume: &Assume, new_misses: Vec<MissItem>) -> Result<Next, CheckUnknown> {
     let w = &evm.inspector;
     let all_missing = || evm.ctx.journaled_state.database.missing.clone();
     let (senders, other): (Vec<MissItem>, Vec<MissItem>) =
@@ -1543,18 +1698,28 @@ fn judge_miss(evm: &WatchedEvm<'_>, plan: &OrderedPlan, t: &DecodedTx, at: (u64,
             .collect();
         return Ok(Next::Patch(p));
     }
-    let unknown = CheckUnknown { reason: UnknownReason::Miss, missing: all_missing(), detail: format!("{} item(s) not in our copy", evm.ctx.journaled_state.database.missing.len()), pre: Vec::new(), keys: Vec::new() };
-    judge_cant_run(evm, plan, t, at, assume, unknown)
+    let unknown = CheckUnknown { reason: UnknownReason::Miss, missing: all_missing(), detail: format!("{} item(s) not in our copy", evm.ctx.journaled_state.database.missing.len()), pre: Vec::new(), keys: Vec::new(), at: None };
+    judge_cant_run(evm, view, plan, t, at, assume, unknown)
 }
 
 /// A replayed transaction we can't run (it needs values we don't hold, or
 /// a Nitro built-in we don't imitate): skip it by the SKIPPING rules (file
 /// header), or answer `unknown` (with a clearer detail).
-fn judge_cant_run(evm: &WatchedEvm<'_>, plan: &OrderedPlan, t: &DecodedTx, at: (u64, usize), assume: &Assume, mut unknown: CheckUnknown) -> Result<Next, CheckUnknown> {
-    let Some(route) = &assume.skip else { return Err(unknown) };
+fn judge_cant_run(evm: &WatchedEvm<'_>, view: &dyn StateRead, plan: &OrderedPlan, t: &DecodedTx, at: (u64, usize), assume: &Assume, mut unknown: CheckUnknown) -> Result<Next, CheckUnknown> {
     // The trigger itself is never skipped: its effect on our pools must be computed.
     if t.hash == plan.trigger {
-        unknown.detail = format!("the trigger can't be run ({}; other than its sender's funds)", unknown.detail);
+        if assume.skip.is_some() || assume.proven_skip {
+            unknown.detail = format!("the trigger can't be run ({}; other than its sender's funds)", unknown.detail);
+        }
+        return Err(unknown);
+    }
+    if assume.proven_skip {
+        return judge_proven(evm, view, plan, t, at, unknown);
+    }
+    let Some(route) = &assume.skip else { return Err(unknown) };
+    // (Oct 27) A 7702 transaction is never skipped by the best-effort rules
+    // (before type 4 was unpacked, any check holding one was unknown).
+    if t.tx_type == 4 {
         return Err(unknown);
     }
     // 1. It used our route's state before it got stuck: it matters.
@@ -1564,4 +1729,131 @@ fn judge_cant_run(evm: &WatchedEvm<'_>, plan: &OrderedPlan, t: &DecodedTx, at: (
     }
     // 2. / 3. Skip it; "related" if it names our route.
     Ok(Next::Skip(at, route.named_by(t.to, &t.data)))
+}
+
+// ---------------------------------------------------------------------------
+// PROVEN SKIPPING (Oct 27, the fast lane's own trigger path).
+// ---------------------------------------------------------------------------
+
+/// Opcodes that let running code change state OUTSIDE its own contract:
+/// CREATE, CALL, CALLCODE, DELEGATECALL, CREATE2, SELFDESTRUCT. (STATICCALL
+/// is fine: nothing called that way can write anything; TSTORE is fine:
+/// cleared when the transaction ends.)
+const OUTWARD_OPS: [u8; 6] = [0xf0, 0xf1, 0xf2, 0xf4, 0xf5, 0xff];
+
+/// Contract code that can only ever change its OWN storage: no outward
+/// opcode anywhere it could run. Read the way the EVM reads it (PUSH data
+/// skipped): every byte that can run is an instruction start of this walk
+/// (a jump may only land on a JUMPDEST, itself an instruction start), so
+/// nothing is missed; data that merely looks like an outward opcode makes
+/// the answer "no" (cautious, never wrong). EIP-7702 delegation code
+/// (0xef0100 + address: another contract's code runs) is "no".
+pub fn writes_only_itself(code: &[u8]) -> bool {
+    if code.first() == Some(&0xef) {
+        return false;
+    }
+    let mut i = 0usize;
+    while i < code.len() {
+        let op = code[i];
+        if OUTWARD_OPS.contains(&op) {
+            return false;
+        }
+        i += 1;
+        if (0x60..=0x7f).contains(&op) {
+            i += (op - 0x5f) as usize;
+        }
+    }
+    true
+}
+
+/// Precompiles, Nitro built-ins and other system addresses (the first 18
+/// bytes zero): never "only itself" (a built-in has no code but changes
+/// chain state, e.g. ArbSys sending to the parent chain).
+fn system_address(a: Address) -> bool {
+    a.as_slice()[..18].iter().all(|b| *b == 0)
+}
+
+/// PROVEN SKIPPING: may this transaction (not the trigger), which we
+/// couldn't run with certainty, be left out?
+///
+///   On the chain it ran (or reverted) in full; we can't know how. EVM
+///   facts bound what it could have changed: an account's storage changes
+///   only while that account's own code runs, and code with no outward
+///   opcode (writes_only_itself) never runs anyone else's code with the
+///   power to write. So when its target is a contract whose code (from our
+///   copy, unchanged in this run) has no outward opcode, the transaction
+///   could only have changed: its target's storage and ETH balance, and its
+///   sender's ETH balance and nonce. If the rest of the run (every replayed
+///   transaction, our trade at every size) never uses those two accounts,
+///   leaving it out cannot change the answer: Next::SkipProven, checked at
+///   the end of the run (see one_round). Anything else -> unknown, never a
+///   guess: a router / bot / proxy (it calls out: it may trade on our
+///   pools, pay our pools' coins, run a V4 hook or the PoolManager), a
+///   contract whose code we don't hold, a 7702 transaction, a built-in.
+fn judge_proven(evm: &WatchedEvm<'_>, view: &dyn StateRead, plan: &OrderedPlan, t: &DecodedTx, at: (u64, usize), mut unknown: CheckUnknown) -> Result<Next, CheckUnknown> {
+    let why_not = |w: &str| format!("feed transaction {:#x} couldn't be run and can't be proven unrelated ({w}): {}", t.hash, unknown.detail);
+    if t.hash == plan.trigger {
+        unknown.detail = format!("the trigger can't be run ({})", unknown.detail);
+        return Err(unknown);
+    }
+    let Some(to) = t.to else {
+        unknown.detail = why_not("it creates a contract");
+        return Err(unknown);
+    };
+    if t.tx_type == 4 {
+        unknown.detail = why_not("EIP-7702: it changes wallets' code");
+        return Err(unknown);
+    }
+    if system_address(to) {
+        unknown.detail = why_not("its target is a built-in / precompile");
+        return Err(unknown);
+    }
+    let held = match view.account(to) {
+        Lookup::Known(Some(info)) => match info.code.clone() {
+            Some(c) if !c.is_empty() || info.code_hash == KECCAK_EMPTY => Some((info.code_hash, c)),
+            _ if info.code_hash == KECCAK_EMPTY => Some((info.code_hash, revm::bytecode::Bytecode::default())),
+            _ => match view.code_by_hash(info.code_hash) {
+                Lookup::Known(c) => Some((info.code_hash, c)),
+                Lookup::Missing => None,
+            },
+        },
+        // Known to be empty (no account at all): a plain wallet, no code.
+        Lookup::Known(None) => Some((KECCAK_EMPTY, revm::bytecode::Bytecode::default())),
+        Lookup::Missing => None,
+    };
+    let Some((hash, code)) = held else {
+        unknown.detail = why_not("our copy doesn't hold its target's code");
+        return Err(unknown);
+    };
+    // The code that would run must be the copy's: not created / replaced
+    // earlier in this run.
+    if let Some(acc) = evm.ctx.journaled_state.state.get(&to) {
+        if acc.is_created() || acc.info.code_hash != hash {
+            unknown.detail = why_not("its target's code changed earlier in this run");
+            return Err(unknown);
+        }
+    }
+    if !writes_only_itself(code.original_byte_slice()) {
+        unknown.detail = why_not("its target's code calls other contracts");
+        return Err(unknown);
+    }
+    Ok(Next::SkipProven(at, Proof { hash: t.hash, to, from: t.from, unknown }))
+}
+
+/// A replayed transaction's revert, in a few words (answers, logs,
+/// trig-replay).
+pub fn revert_text(o: &CallOutcome) -> String {
+    if let Some(h) = &o.halt {
+        return h.clone();
+    }
+    let b = &o.output;
+    // Error(string)
+    if b.len() >= 68 && b[..4] == [0x08, 0xc3, 0x79, 0xa0] {
+        let n = U256::from_be_slice(&b[36..68]).saturating_to::<usize>().min(b.len().saturating_sub(68)).min(64);
+        return format!("\"{}\"", String::from_utf8_lossy(&b[68..68 + n]));
+    }
+    if b.len() >= 4 {
+        return format!("error 0x{}", b[..4].iter().map(|x| format!("{x:02x}")).collect::<String>());
+    }
+    "no reason".into()
 }

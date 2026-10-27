@@ -31,7 +31,7 @@
 //   proto_types.rs      socket request/answer shapes + handle_call/handle_size_search
 //   fixture.rs, cli.rs  test files (fixtures) and the check-fixture/bench-fixture commands
 // ============================================================================
-use revm::primitives::{Address, Bytes, U256};
+use revm::primitives::{Address, Bytes, B256, U256};
 
 use crate::state::MissItem;
 
@@ -183,11 +183,45 @@ pub struct CheckUnknown {
     /// Watch, 160-byte hashes). Lets copy 2 hand the bot a pool's key with
     /// no node request (copy2/v4blind.rs). Empty when nothing was recorded.
     pub keys: Vec<(revm::primitives::U256, [revm::primitives::U256; 5])>,
+    /// (Oct 27, prediction coverage) Trigger-first: WHICH replayed feed
+    /// transaction the answer got stuck on (None = our own calls, or not a
+    /// trigger-first check). Lets the bot's status and `arbsim trig-replay`
+    /// tell "the trigger itself" from "a transaction replayed only because
+    /// copy 2 is behind the feed".
+    pub at: Option<TxAt>,
+}
+
+/// Trigger-first: one replayed feed transaction, as named in an "unknown"
+/// answer (CheckUnknown.at).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TxAt {
+    /// Its feed message (= block on Nitro).
+    pub seq: u64,
+    pub hash: B256,
+    /// Its target contract (None: a contract creation, or a transaction we
+    /// couldn't unpack at all).
+    pub to: Option<Address>,
+    /// Its sender (None: couldn't unpack it).
+    pub from: Option<Address>,
+    /// Its type byte (0 legacy, 1, 2, 4 = EIP-7702; None: couldn't unpack).
+    pub tx_type: Option<u8>,
+    /// It is the trigger itself.
+    pub trigger: bool,
+}
+
+impl TxAt {
+    /// As the answers carry it.
+    pub fn json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "seq": self.seq, "hash": format!("{:#x}", self.hash), "to": self.to.map(|a| format!("{a:#x}")),
+            "from": self.from.map(|a| format!("{a:#x}")), "type": self.tx_type, "trigger": self.trigger,
+        })
+    }
 }
 
 impl CheckUnknown {
     pub fn new(reason: UnknownReason, detail: impl Into<String>) -> Self {
-        CheckUnknown { reason, missing: Vec::new(), detail: detail.into(), pre: Vec::new(), keys: Vec::new() }
+        CheckUnknown { reason, missing: Vec::new(), detail: detail.into(), pre: Vec::new(), keys: Vec::new(), at: None }
     }
     pub fn bad_request(detail: impl Into<String>) -> Self {
         Self::new(UnknownReason::BadRequest, detail)

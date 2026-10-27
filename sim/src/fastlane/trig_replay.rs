@@ -114,7 +114,7 @@ pub fn trig_replay(cap: &CapFile, table: Option<&Table>, cfg: &TrigCfg, opts: &T
     let mut lag_ahead = 0u64; // messages the copy already held when they arrived
     let mut trig_us: Vec<u64> = Vec::new();
     let mut fires: Vec<Value> = Vec::new();
-    let assume = Assume { sender_funds: cfg.assume.iter().any(|a| a == "sender_funds") && !cfg.strict, recent_fill: cfg.assume.iter().any(|a| a == "recent_fill") && !cfg.strict, skip: None, record_hashes: true };
+    let assume = Assume { sender_funds: cfg.assume.iter().any(|a| a == "sender_funds") && !cfg.strict, recent_fill: cfg.assume.iter().any(|a| a == "recent_fill") && !cfg.strict, skip: None, record_hashes: true, proven_skip: false };
     for ev in &cap.events[1..] {
         match ev {
             CapEv::Pools { list, .. } => {
