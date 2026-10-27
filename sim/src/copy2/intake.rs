@@ -2893,6 +2893,22 @@ impl Intake {
                     self.make_unsure(k, "late report after a later one was applied", Some(&mut ov), n);
                     continue;
                 }
+                // RECENT MOVES for late reports too (fast lane accuracy
+                // fixes, Oct 27): "which transaction moved which pool" must
+                // not depend on whether its report came on time (the
+                // predicted copy learns routers and explains misses from it).
+                // Only with FASTLANE on: the trigger-first "already in the
+                // copy" answer (server.rs, GAP FIX 1) reads this list too,
+                // and must stay exactly as before when the fast lane is off.
+                if super::ahead::mode() != super::ahead::Mode::Off {
+                    let key = match k.1 {
+                        Some(id) => format!("{id:#x}"),
+                        None => format!("{:#x}", pool.address),
+                    };
+                    if let Ok(mut rm) = self.c2.recent_moves.lock() {
+                        rm.note(log.tx_hash, n, key);
+                    }
+                }
                 let mut f = ov.fork();
                 match apply_event(&mut f, &pool, log, &rctx) {
                     ApplyResult::Applied => {

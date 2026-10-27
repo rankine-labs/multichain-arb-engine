@@ -37,6 +37,9 @@ pub mod intake;
 // FAST LANE A: the predicted copy (copy 2 + the feed messages after it).
 // Runs only with FASTLANE=practice|live.
 pub mod ahead;
+// Capture of what the predicted copy saw + offline replay (`arbsim
+// ahead-replay`). Only with FASTLANE on and FASTLANE_CAPTURE_FILE set.
+pub mod ahead_capture;
 // Background threads that ask the node for copy 2 (never the intake thread).
 pub mod loader;
 // Working copy the events are applied to (workstream A; B runs revm on it).

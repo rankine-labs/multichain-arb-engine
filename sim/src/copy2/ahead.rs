@@ -101,6 +101,42 @@
 //        "missedRan" (we ran it, our run did not move the pool), with the
 //        transaction in the samples.
 //
+//   ACCURACY FIXES (Oct 27, second practice run: agree 16, disagree 933,
+//   all 933 "missed", 906 of them labelled "missedRan"):
+//     6. HONEST LABELS. "missedRan" also counted transactions we could NOT
+//        run (Fate::Failed): their pool was simply not among the ones marked
+//        unsure. Now split: missedRan (our run succeeded but did not move the
+//        pool), missedReverted (our run reverted / halted), missedFailed (we
+//        could not run it and did not mark that pool unsure: the dangerous
+//        one, a "sure" pool that was wrong). Every transaction's note keeps
+//        why it failed / reverted and the pools it moved / marked.
+//     7. LATE REPORTS. Copy 2 publishes block N ~30 ms after its header and
+//        writes reports that arrive later INTO the kept versions (it replaces
+//        them: same block, new snapshot; intake.rs on_late_at). The predicted
+//        copy only ever took versions of a NEWER block, so it kept building on
+//        the version without those reports, and agreement compared against
+//        the first, incomplete version. Now:
+//          - a replaced version of the base block = rebase on it ("rewrite"),
+//          - agreement for block N waits FASTLANE_AHEAD_COMPARE_DELAY_BLOCKS
+//            (5) more blocks and compares against the SETTLED versions N-1
+//            and N: "the confirmed block moved a pool" = its own values differ
+//            between settled N-1 and settled N (no longer the first diff),
+//          - a disagreement where the base we predicted on differs from the
+//            settled N-1 for that pool is labelled "staleBase", and pools
+//            whose base values were corrected later are counted ("baseLate").
+//     8. FAILED TRANSACTIONS, safer: also marked unsure (besides the old
+//        rules) are native-ETH pools of a named coin whatever the ETH value
+//        (a V4 "sell for ETH" pays none), and the target's learned pools of a
+//        named pair (split routes over sister pools), or all its learned
+//        pools when the data names no coin (opaque bot contracts). Routers
+//        are now learned from EVERY transaction copy 2 says moved our pools
+//        (before: only from ones the filter skipped).
+//     9. MEASURABLE: richer disagreement samples (base block, slots that
+//        differ, predicted vs confirmed values, our transactions on that pool,
+//        why the mover failed), the newest ones kept in status totals too, and
+//        a capture file + offline replay (copy2/ahead_capture.rs,
+//        `arbsim ahead-replay <file>`).
+//
 // API (scanner and integration):
 //   Ahead::on_feed_message(Arc<BinMsg>)            a new feed message
 //   Ahead::on_confirmed(Confirmed, moved_by_tx)     copy 2 published a version
@@ -186,13 +222,22 @@ pub struct AheadCfg {
     /// PoolManager, or naming any route pool still run. Until the bot's
     /// candidate table is in, everything picked runs. off = always run.
     pub routes_only: bool,
+    /// FASTLANE_AHEAD_COMPARE_DELAY_BLOCKS [5 from env; 0 = compare at once]
+    /// (accuracy fixes): agreement for block N runs this many blocks later,
+    /// against the SETTLED copy-2 versions N-1 and N (late reports written
+    /// in). 0 = compare the moment N is confirmed, with that version (tests).
+    /// The runtime drives the delayed compare (`due` / `compare_settled`).
+    pub compare_delay: u64,
 }
 
 impl Default for AheadCfg {
     fn default() -> Self {
-        AheadCfg { max_blocks: 32, run_all: false, max_txs: 256, max_touchers: 4096, l2_offset: 0, trust_sender_funds: false, msg_budget_us: 10_000, routes_only: true }
+        AheadCfg { max_blocks: 32, run_all: false, max_txs: 256, max_touchers: 4096, l2_offset: 0, trust_sender_funds: false, msg_budget_us: 10_000, routes_only: true, compare_delay: 0 }
     }
 }
+
+/// Default FASTLANE_AHEAD_COMPARE_DELAY_BLOCKS of the running sidecar.
+pub const COMPARE_DELAY_DEFAULT: u64 = 5;
 
 impl AheadCfg {
     /// From any key -> value lookup (tests pass a map).
@@ -216,6 +261,8 @@ impl AheadCfg {
             },
             msg_budget_us: num("FASTLANE_AHEAD_MSG_BUDGET_MS").filter(|v| (1..=1000).contains(v)).map(|v| v as u64 * 1000).unwrap_or(d.msg_budget_us),
             routes_only: get("FASTLANE_AHEAD_ROUTES_ONLY").is_none_or(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "off" | "0" | "false" | "no")),
+            // (0 is allowed here: compare at once, the old behaviour.)
+            compare_delay: get("FASTLANE_AHEAD_COMPARE_DELAY_BLOCKS").and_then(|v| v.trim().parse::<u64>().ok()).filter(|v| *v <= 30).unwrap_or(COMPARE_DELAY_DEFAULT),
         }
     }
 }
@@ -259,6 +306,10 @@ pub struct PoolSet {
     by_pair: HashMap<(Address, Address), Vec<String>>,
     /// Coin -> keys of our pools holding it (H4: "pools sharing a named coin").
     by_coin: HashMap<Address, Vec<String>>,
+    /// Key -> its two coins as listed (zero = native ETH), for the failed-
+    /// transaction rules (accuracy fixes: a router's learned pools of a
+    /// named pair).
+    coins_of: HashMap<String, (Address, Address)>,
     /// Key -> its coin pair (sorted; only pools with two non-zero coins).
     pair_of: HashMap<String, (Address, Address)>,
     /// Review M3: native-ETH pools (one coin is address zero, which can't be
@@ -387,6 +438,7 @@ impl PoolSet {
                     s.route.names.push(p.address);
                 }
             }
+            s.coins_of.insert(p.key.clone(), (*t0, *t1));
             for c in [*t0, *t1] {
                 if !c.is_zero() {
                     let v = s.by_coin.entry(c).or_default();
@@ -550,6 +602,43 @@ impl PoolSet {
         out
     }
 
+    /// Accuracy fixes: native-ETH pools whose other coin the data names,
+    /// WHATEVER the ETH value (a V4 "sell the coin for ETH" through a router
+    /// pays no ETH, so `named_native` misses it). Only for failed runs.
+    fn named_native_any(&self, n: &Named) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for c in self.idx.coins(n) {
+            for k in self.native_by_coin.get(c).into_iter().flatten() {
+                if !out.contains(k) {
+                    out.push(k.clone());
+                }
+            }
+        }
+        out
+    }
+
+    /// Accuracy fixes: of `learned` (a router's pools from its history), the
+    /// ones this transaction's data could be trading: both coins named, or
+    /// (native-ETH pool) its other coin named. Data naming NO coin at all
+    /// (an opaque bot contract): every learned pool.
+    fn learned_for(&self, learned: &[String], n: &Named) -> Vec<String> {
+        let named: Vec<&Address> = self.idx.coins(n).collect();
+        if named.is_empty() {
+            return learned.to_vec();
+        }
+        let has = |c: &Address| named.contains(&c);
+        learned
+            .iter()
+            .filter(|k| match self.coins_of.get(*k) {
+                Some((a, b)) if a.is_zero() => has(b),
+                Some((a, b)) if b.is_zero() => has(a),
+                Some((a, b)) => has(a) && has(b),
+                None => false,
+            })
+            .cloned()
+            .collect()
+    }
+
     /// Review H4: our pools holding ANY coin the data names (wider than
     /// `named`: one coin is enough). Used only when a transaction we ran
     /// failed and nothing narrower is known.
@@ -673,24 +762,6 @@ impl PoolSet {
         }
         out
     }
-
-    /// The pools a set of changed values moved (no hash inputs: a V4 pool
-    /// is named by its base values, which every swap changes).
-    fn moved_by_diff(&self, d: &StateDiff) -> Vec<String> {
-        let changed: Vec<(Address, U256)> = d.accounts.iter().flat_map(|(a, ad)| ad.storage.keys().map(move |s| (*a, *s))).collect();
-        let mut out: Vec<String> = self.moved.moved(&changed, &[]).into_iter().map(|m| m.key).collect();
-        // A contract pool that was dropped / recreated wholesale counts too.
-        for (a, ad) in &d.accounts {
-            if ad.forget || ad.storage_cleared {
-                if let Some(k) = self.by_contract.get(a) {
-                    if !out.contains(k) {
-                        out.push(k.clone());
-                    }
-                }
-            }
-        }
-        out
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -761,11 +832,10 @@ struct Entry {
     changed_cum: HashSet<String>,
     /// Pools unsure in this view (since the base).
     unsure_cum: HashSet<String>,
-    /// Transactions skipped by the filter: (hash, target).
-    skipped: Vec<(B256, Option<Address>)>,
     /// Every transaction of the message and what we did with it (agreement
-    /// tells a filter miss from a run that did not move the pool).
-    fates: Vec<(B256, Fate)>,
+    /// tells a filter miss from a run that did not move the pool; the
+    /// confirmed reports teach which targets move our pools).
+    notes: Vec<TxNote>,
     built_at: Instant,
     apply_us: u64,
     /// When the feed message arrived (see AheadTip.feed_at).
@@ -774,16 +844,88 @@ struct Entry {
 
 /// What the prediction did with one transaction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Fate {
+pub enum Fate {
     /// Not picked by the cheap filter.
     Skipped,
     /// Picked, but names only pools no route uses: not run (pools unsure).
     OffRoute,
-    /// Ran exactly (it may or may not have moved our pools).
+    /// Ran exactly (it may or may not have moved our pools; see TxNote.ok).
     Ran,
     /// Could not be run exactly (pools it may touch marked unsure).
     Failed,
 }
+
+impl Fate {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Fate::Skipped => "skipped",
+            Fate::OffRoute => "offRoute",
+            Fate::Ran => "ran",
+            Fate::Failed => "failed",
+        }
+    }
+}
+
+/// One transaction of a predicted block: what we did with it and why
+/// (accuracy fixes: the samples and the offline replay explain each miss).
+#[derive(Clone, Debug)]
+pub struct TxNote {
+    pub hash: B256,
+    pub to: Option<Address>,
+    pub fate: Fate,
+    /// Ran: our run finished normally (false = it reverted / halted).
+    pub ok: bool,
+    /// Failed / reverted: why, in a few words (groupable: addresses are
+    /// named by role, e.g. "miss: target code").
+    pub why: Option<String>,
+    /// Our pools it moved (ran), or marked unsure for it (failed / off-route).
+    pub pools: Vec<String>,
+}
+
+/// A predicted block waiting for its agreement (FASTLANE_AHEAD_COMPARE_DELAY_BLOCKS).
+struct Pending {
+    seq: u64,
+    /// The confirmed version the prediction was built on (block seq - 1,
+    /// as it was then: late reports may have corrected it since).
+    base_snap: Arc<Snapshot>,
+    /// The predicted state after block `seq`.
+    snap: Arc<Snapshot>,
+    changed_cum: HashSet<String>,
+    unsure_cum: HashSet<String>,
+    notes: Vec<TxNote>,
+    /// The pool set it was predicted with (places, copy 2's not-ready pools).
+    pools: Arc<PoolSet>,
+}
+
+/// One pool's own values in a confirmed version: a contract pool's declared
+/// variables (slots below 2^32) / a V4 pool's 4 base values, sorted by slot.
+/// None = the confirmed copy holds nothing for it (not loaded / forgotten).
+pub type PlaceVals = Option<Vec<(U256, U256)>>;
+
+/// What agreement needs from copy 2 about block `seq`, taken from the
+/// SETTLED versions seq - 1 and seq (late reports written in). Built by the
+/// runtime from copy 2's published versions, or read from a capture file
+/// (the offline replay): the same comparison either way.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Settled {
+    pub seq: u64,
+    /// Our pools whose own values differ between settled seq - 1 and seq
+    /// ("the confirmed block moved it"), sorted.
+    pub moved: Vec<String>,
+    /// Values at seq (moved pools + the extra pools asked for).
+    pub now: BTreeMap<String, PlaceVals>,
+    /// Values at seq - 1 (same pools).
+    pub prev: BTreeMap<String, PlaceVals>,
+    /// Pools whose values in the version the prediction was built on differ
+    /// from the settled seq - 1 (late reports corrected them after we used
+    /// them), sorted. Empty when that version is not known.
+    pub late: Vec<String>,
+}
+
+/// Most samples of disagreement slots kept per sample.
+const MAX_SLOT_DIFFS: usize = 4;
+/// Most predicted blocks waiting for their agreement (bounded memory).
+const MAX_PENDING: usize = 256;
 
 /// Why prediction stopped (no tip until a rebase passes it).
 #[derive(Clone, Debug)]
@@ -854,6 +996,32 @@ pub struct AheadStats {
     /// report filed under another block): not a prediction miss, so not
     /// counted in disagree; shown on its own.
     pub not_from_tx: u64,
+    /// Accuracy fixes: "missed" by what OUR side did with the transaction
+    /// copy 2 says moved the pool: missed_ran = our run succeeded but moved
+    /// nothing of it; missed_reverted = our run reverted / halted;
+    /// missed_failed = we could not run it and did not mark the pool unsure.
+    pub missed_reverted: u64,
+    pub missed_failed: u64,
+    /// Disagreements where the base we predicted on was later corrected for
+    /// that pool (late reports): the miss is the base's, not the run's.
+    pub stale_base: u64,
+    /// Pools whose base values were corrected after we predicted on them
+    /// (late reports), counted per compared block (not in agreement %).
+    pub base_late: u64,
+    /// Pools the prediction moved whose confirmed values were not available
+    /// for the comparison (offline replay of blocks live never compared).
+    pub not_captured: u64,
+    /// Pools the confirmed copy holds nothing for (copy 2 forgot / is
+    /// loading them): not comparable, counted apart (not in agreement %).
+    pub conf_gone: u64,
+    /// Rebases on a replaced version of the same block (late reports).
+    pub rebase_rewrites: u64,
+    /// Predicted blocks whose agreement could not run (copy 2 no longer
+    /// held the versions, or too many waiting).
+    pub settle_lost: u64,
+    /// Failed runs that marked more pools unsure under the accuracy-fix
+    /// rules (native-ETH pools of a named coin, the target's learned pools).
+    pub failed_widened: u64,
     /// L2: apply_us samples seen (the ring below keeps the newest MAX_TIMES).
     pub time_n: u64,
     pub stopped: HashMap<&'static str, u64>,
@@ -880,7 +1048,7 @@ impl AheadStats {
     /// since-start totals, practice fixes).
     pub fn json_with(&self, times: bool) -> Value {
         let mut t = if times { self.apply_us.clone() } else { Vec::new() };
-        json!({
+        let mut out = json!({
             "msgs": self.msgs, "applied": self.applied, "lateMsgs": self.late_msgs,
             "txsRun": self.txs_run, "txsSkipped": self.txs_skipped, "txsFailed": self.txs_failed,
             "txsMarkedUnsure": self.txs_marked, "filterMissed": self.filter_missed, "assumed": self.assumed,
@@ -895,7 +1063,16 @@ impl AheadStats {
             "stopped": self.stopped.iter().map(|(k, v)| (k.to_string(), json!(v))).collect::<serde_json::Map<String, Value>>(),
             "applyUs": if times { crate::timing::pct_of(&mut t) } else { Value::Null },
             "samples": self.samples,
-        })
+        });
+        // Accuracy fixes (a second object: one json! macro is limited in size).
+        let more = json!({
+            "missedReverted": self.missed_reverted, "missedFailed": self.missed_failed, "staleBase": self.stale_base, "baseLate": self.base_late,
+            "notCaptured": self.not_captured, "confGone": self.conf_gone, "rebaseRewrites": self.rebase_rewrites, "settleLost": self.settle_lost, "failedWidened": self.failed_widened,
+        });
+        if let (Value::Object(o), Value::Object(m)) = (&mut out, more) {
+            o.extend(m);
+        }
+        out
     }
 
     /// The hourly line (timing.rs / bot style: one line, the numbers that matter).
@@ -906,10 +1083,10 @@ impl AheadStats {
         let mut stops: Vec<String> = self.stopped.iter().map(|(k, v)| format!("{k}:{v}")).collect();
         stops.sort();
         format!(
-            "[arbsim] fastlane ahead (last hour): msgs {} applied {} late {} | txs run {} skipped {} off-route {} failed {} (pools unsure {}, nothing found {}, v4 only {}, probes skipped {}) filterMissed {} assumedUnsure {} nativePicks {} | apply us p50 {} p90 {} p99 {} max {} | rebases {} reapplied {} | agree {} disagree {} (missed {} [filter {} ran {} off-route {}] phantom {} value {}) unsure {} not from a tx {} unpredicted {} | msgs while stopped {} over budget {} | stopped [{}]",
-            self.msgs, self.applied, self.late_msgs, self.txs_run, self.txs_skipped, self.txs_off_route, self.txs_failed, self.txs_marked, self.failed_unknown, self.v4_fallback, self.probes_skipped, self.filter_missed, self.assumed_unsure, self.native_picks,
-            g("p50"), g("p90"), g("p99"), g("max"), self.rebases, self.reapplied,
-            self.agree, self.disagree, self.missed, self.missed_filter, self.missed_ran, self.missed_off_route, self.phantom, self.value_diff, self.unsure, self.not_from_tx, self.unpredicted, self.msgs_stopped, self.over_budget, stops.join(" "),
+            "[arbsim] fastlane ahead (last hour): msgs {} applied {} late {} | txs run {} skipped {} off-route {} failed {} (pools unsure {}, nothing found {}, v4 only {}, probes skipped {}, widened {}) filterMissed {} assumedUnsure {} nativePicks {} | apply us p50 {} p90 {} p99 {} max {} | rebases {} (rewrites {}) reapplied {} | agree {} disagree {} (missed {} [filter {} ran {} reverted {} failed {} off-route {}] phantom {} value {}; stale base {}) unsure {} not from a tx {} conf gone {} unpredicted {} base late {} | msgs while stopped {} over budget {} | stopped [{}]",
+            self.msgs, self.applied, self.late_msgs, self.txs_run, self.txs_skipped, self.txs_off_route, self.txs_failed, self.txs_marked, self.failed_unknown, self.v4_fallback, self.probes_skipped, self.failed_widened, self.filter_missed, self.assumed_unsure, self.native_picks,
+            g("p50"), g("p90"), g("p99"), g("max"), self.rebases, self.rebase_rewrites, self.reapplied,
+            self.agree, self.disagree, self.missed, self.missed_filter, self.missed_ran, self.missed_reverted, self.missed_failed, self.missed_off_route, self.phantom, self.value_diff, self.stale_base, self.unsure, self.not_from_tx, self.conf_gone, self.unpredicted, self.base_late, self.msgs_stopped, self.over_budget, stops.join(" "),
         )
     }
 
@@ -1012,6 +1189,11 @@ pub struct Ahead {
     /// scanner route uses (pools + lender), from the bot's candidate table.
     /// None = not known yet: every picked transaction runs.
     route_pools: Option<Arc<HashSet<String>>>,
+    /// Predicted blocks waiting for their (settled) agreement, oldest first.
+    pending: VecDeque<Pending>,
+    /// Offline replay only (copy2/ahead_capture.rs): EVERY disagreement
+    /// sample (unbounded there; None live).
+    pub collect_all: Option<Vec<Value>>,
     pub hour: AheadStats,
     pub total: AheadStats,
 }
@@ -1030,6 +1212,8 @@ impl Ahead {
             arrived: BTreeMap::new(),
             over_budget_seq: None,
             route_pools: None,
+            pending: VecDeque::new(),
+            collect_all: None,
             hour: AheadStats::default(),
             total: AheadStats::default(),
         }
@@ -1079,6 +1263,69 @@ impl Ahead {
     /// Learned toucher addresses (status / tests).
     pub fn is_toucher(&self, a: &Address) -> bool {
         self.touchers.contains_key(a)
+    }
+
+    /// Every learned toucher with its pools, sorted by address (capture start).
+    pub fn touchers_list(&self) -> Vec<(Address, Vec<String>)> {
+        let mut v: Vec<(Address, Vec<String>)> = self.touchers.iter().map(|(a, (_, p))| (*a, p.clone())).collect();
+        v.sort_by_key(|x| x.0);
+        v
+    }
+
+    /// Learn touchers in this order (capture replay start).
+    pub fn learn_touchers(&mut self, list: &[(Address, Vec<String>)]) {
+        for (a, p) in list {
+            self.learn_toucher(*a, p);
+        }
+    }
+
+    pub fn cfg(&self) -> &AheadCfg {
+        &self.cfg
+    }
+
+    /// Held feed messages, oldest first (capture start).
+    pub fn held(&self) -> Vec<Arc<BinMsg>> {
+        self.msgs.values().cloned().collect()
+    }
+
+    /// Predicted blocks waiting for agreement whose turn has come: confirmed
+    /// head `head_seq` is at least FASTLANE_AHEAD_COMPARE_DELAY_BLOCKS past them.
+    pub fn due(&self, head_seq: u64) -> Vec<u64> {
+        self.pending.iter().filter(|p| p.seq.saturating_add(self.cfg.compare_delay) <= head_seq).map(|p| p.seq).collect()
+    }
+
+    /// Is a predicted block waiting for agreement?
+    pub fn is_pending(&self, seq: u64) -> bool {
+        self.pending.iter().any(|p| p.seq == seq)
+    }
+
+    /// What `Settled::build` needs for a waiting block: the pool set it was
+    /// predicted with, the pools it moved (their confirmed values are
+    /// compared too) and the version it was built on.
+    pub fn pending_parts(&self, seq: u64) -> Option<(Arc<PoolSet>, Vec<String>, Arc<Snapshot>)> {
+        self.pending.iter().find(|p| p.seq == seq).map(|p| {
+            let mut k: Vec<String> = p.changed_cum.iter().cloned().collect();
+            k.sort();
+            (p.pools.clone(), k, p.base_snap.clone())
+        })
+    }
+
+    /// A waiting block whose versions copy 2 no longer holds: not compared.
+    pub fn drop_pending(&mut self, seq: u64) {
+        let before = self.pending.len();
+        self.pending.retain(|p| p.seq != seq);
+        if self.pending.len() < before {
+            self.count(|s| s.settle_lost += 1);
+        }
+    }
+
+    /// Run the agreement of a waiting block with copy 2's settled values.
+    /// false = no such block waiting (nothing done).
+    pub fn compare_settled(&mut self, st: &Settled, moved_by_tx: &dyn Fn(&B256) -> Option<Vec<String>>) -> bool {
+        let Some(i) = self.pending.iter().position(|p| p.seq == st.seq) else { return false };
+        let p = self.pending.remove(i).expect("index just found");
+        self.agreement(&p, st, moved_by_tx);
+        true
     }
 
     fn count(&mut self, f: impl Fn(&mut AheadStats)) {
@@ -1145,7 +1392,9 @@ impl Ahead {
 
     /// Copy 2 published a version (normally block N's reports applied).
     /// `moved_by_tx`: copy 2's RECENT MOVES (tx hash -> pools its reports
-    /// moved), to learn which skipped transactions we should have run.
+    /// moved), to learn which targets move our pools.
+    /// A version of the SAME block as the base but a different snapshot
+    /// (copy 2 wrote late reports into it) = rebase on it, no agreement.
     pub fn on_confirmed(&mut self, c: Confirmed, moved_by_tx: &dyn Fn(&B256) -> Option<Vec<String>>) {
         if let Some(b) = &self.base {
             if c.seq < b.seq {
@@ -1157,16 +1406,21 @@ impl Ahead {
         }
         // (The very first version has nothing to compare with.)
         let first_time = self.base.as_ref().is_some_and(|b| c.seq > b.seq);
-        // Review M3/L1: every predicted block this version covers (several
-        // may confirm at once): its skipped transactions are checked against
-        // copy 2's reports, not only the last one's.
+        if self.base.as_ref().is_some_and(|b| c.seq == b.seq) {
+            self.count(|s| s.rebase_rewrites += 1);
+        }
+        // Review M3/L1 + accuracy fixes: every predicted block this version
+        // covers (several may confirm at once): each transaction copy 2 says
+        // moved our pools teaches its target (skipped ones are also counted
+        // "filterMissed").
         let covered: Vec<usize> = (0..self.entries.len()).filter(|i| self.entries[*i].seq <= c.seq).collect();
         for i in covered {
-            let skipped = std::mem::take(&mut self.entries[i].skipped);
-            self.learn_skipped(skipped, moved_by_tx);
+            let notes = std::mem::take(&mut self.entries[i].notes);
+            self.learn_from(&notes, moved_by_tx);
+            self.entries[i].notes = notes;
         }
         if first_time {
-            self.agreement(&c, moved_by_tx);
+            self.queue_agreement(&c, moved_by_tx);
         }
         self.count(|s| s.rebases += 1);
         let seq = c.seq;
@@ -1187,106 +1441,198 @@ impl Ahead {
         self.count(|s| s.reapplied += n);
     }
 
-    /// AGREEMENT (see the file header): our prediction for block c.seq vs
-    /// the confirmed version, per pool that changed in either.
-    fn agreement(&mut self, c: &Confirmed, moved_by_tx: &dyn Fn(&B256) -> Option<Vec<String>>) {
+    /// AGREEMENT, first half: block c.seq was predicted on the previous
+    /// confirmed version: keep the prediction until its turn
+    /// (FASTLANE_AHEAD_COMPARE_DELAY_BLOCKS; 0 = compare now, with this
+    /// version and the previous one as they are).
+    fn queue_agreement(&mut self, c: &Confirmed, moved_by_tx: &dyn Fn(&B256) -> Option<Vec<String>>) {
         let Some(i) = self.entries.iter().position(|e| e.seq == c.seq) else {
             self.count(|s| s.unpredicted += 1);
             return;
         };
         // L1 (review): only a version that is exactly ONE block after the
         // previous confirmed one is compared. A jump of several blocks
-        // (copy 2 confirmed N-2..N at once and published only N) has a diff
-        // for block N alone, while our prediction moved pools across all of
-        // them: comparing would miscount. Those are counted "unpredicted".
-        // (The runtime hands every published version in order, so jumps are rare.)
-        if self.base.as_ref().is_some_and(|b| c.seq != b.seq + 1) {
+        // (copy 2 confirmed N-2..N at once and published only N) can't be
+        // matched to one predicted block: counted "unpredicted".
+        let Some(b) = self.base.as_ref().filter(|b| c.seq == b.seq + 1) else {
             self.count(|s| s.unpredicted += 1);
             return;
-        }
-        self.count(|s| s.compared += 1);
-        let pools = self.pools.clone();
-        let conf_moved: HashSet<String> = pools.moved_by_diff(&c.diff).into_iter().collect();
+        };
         let e = &self.entries[i];
-        let mut all: Vec<&String> = conf_moved.iter().chain(e.changed_cum.iter()).collect();
-        all.sort();
-        all.dedup();
-        // (pool, kind, the transaction copy 2 says moved it, for samples)
-        let mut res: Vec<(String, &'static str, Option<B256>)> = Vec::new();
-        for k in all {
-            if e.unsure_cum.contains(k) {
-                res.push((k.clone(), "unsure", None));
-                continue;
-            }
-            let Some(place) = pools.places.get(k) else { continue };
-            let same = same_state(*place, &e.snap, &c.snap);
-            let mut tx = None;
-            let kind = match (same, conf_moved.contains(k), e.changed_cum.contains(k)) {
-                (true, _, _) => "agree",
-                (false, true, false) => {
-                    // Practice fixes: WHY did we miss it? Copy 2's reports
-                    // say which transaction moved it; find it in this message.
-                    let by = e.fates.iter().find(|(h, _)| moved_by_tx(h).is_some_and(|p| p.iter().any(|x| x.eq_ignore_ascii_case(k))));
-                    tx = by.map(|(h, _)| *h);
-                    match by {
-                        None => "notFromTx",
-                        Some((_, Fate::Skipped)) => "missedFilter",
-                        Some((_, Fate::OffRoute)) => "missedOffRoute",
-                        Some(_) => "missedRan",
-                    }
-                }
-                (false, false, true) => "phantom",
-                (false, _, _) => "value",
-            };
-            res.push((k.clone(), kind, tx));
+        let p = Pending {
+            seq: e.seq,
+            base_snap: b.snap.clone(),
+            snap: e.snap.clone(),
+            changed_cum: e.changed_cum.clone(),
+            unsure_cum: e.unsure_cum.clone(),
+            notes: e.notes.clone(),
+            pools: self.pools.clone(),
+        };
+        if self.cfg.compare_delay == 0 {
+            let mut keys: Vec<&String> = p.changed_cum.iter().collect();
+            keys.sort();
+            let st = Settled::build(&p.pools, p.seq, &p.base_snap, &c.snap, keys.into_iter(), None);
+            self.agreement(&p, &st, moved_by_tx);
+            return;
         }
-        let block = c.seq + self.cfg.l2_offset;
-        for (k, kind, tx) in res {
-            match kind {
-                "agree" => self.count(|s| s.agree += 1),
-                "unsure" => self.count(|s| s.unsure += 1),
-                // Not a prediction miss (no transaction of this message moved
-                // it): counted on its own, never as a disagreement.
-                "notFromTx" => self.count(|s| s.not_from_tx += 1),
-                _ => {
-                    self.count(|s| {
-                        s.disagree += 1;
-                        match kind {
-                            "missedFilter" => {
-                                s.missed += 1;
-                                s.missed_filter += 1;
-                            }
-                            "missedRan" => {
-                                s.missed += 1;
-                                s.missed_ran += 1;
-                            }
-                            "missedOffRoute" => {
-                                s.missed += 1;
-                                s.missed_off_route += 1;
-                            }
-                            "phantom" => s.phantom += 1,
-                            _ => s.value_diff += 1,
-                        }
-                    });
-                    if self.hour.samples.len() < MAX_SAMPLES {
-                        let mut sm = json!({ "pool": k, "block": block, "kind": kind });
-                        if let Some(h) = tx {
-                            sm["tx"] = json!(format!("{h:#x}"));
-                        }
-                        self.hour.samples.push(sm);
-                    }
-                }
-            }
+        self.pending.retain(|x| x.seq != p.seq);
+        self.pending.push_back(p);
+        while self.pending.len() > MAX_PENDING {
+            self.pending.pop_front();
+            self.count(|s| s.settle_lost += 1);
         }
     }
 
-    /// Skipped transactions copy 2's reports say moved our pools: the
-    /// filter missed them. Learn their target (and the pools) for next time.
-    fn learn_skipped(&mut self, skipped: Vec<(B256, Option<Address>)>, moved_by_tx: &dyn Fn(&B256) -> Option<Vec<String>>) {
-        for (h, to) in skipped {
-            if let Some(p) = moved_by_tx(&h).filter(|p| !p.is_empty()) {
-                self.count(|s| s.filter_missed += 1);
-                if let Some(t) = to {
+    /// AGREEMENT (see the file header): our prediction for block p.seq vs
+    /// copy 2's settled versions, per pool that changed in either.
+    fn agreement(&mut self, p: &Pending, st: &Settled, moved_by_tx: &dyn Fn(&B256) -> Option<Vec<String>>) {
+        self.count(|s| s.compared += 1);
+        let pools = p.pools.clone();
+        let conf_moved: HashSet<&String> = st.moved.iter().collect();
+        let mut all: Vec<&String> = st.moved.iter().chain(p.changed_cum.iter()).collect();
+        all.sort();
+        all.dedup();
+        let unsure_of = |k: &String| p.unsure_cum.contains(k) || pools.not_ready.contains(k);
+        // Pools whose base values late reports corrected (still sure in our view).
+        let late = st.late.iter().filter(|k| !unsure_of(k)).count() as u64;
+        if late > 0 {
+            self.count(|s| s.base_late += late);
+        }
+        let block = p.seq + self.cfg.l2_offset;
+        for k in all {
+            if unsure_of(k) {
+                self.count(|s| s.unsure += 1);
+                continue;
+            }
+            let Some(place) = pools.places.get(k).copied() else { continue };
+            let conf = match st.now.get(k) {
+                None => {
+                    self.count(|s| s.not_captured += 1);
+                    continue;
+                }
+                Some(None) => {
+                    // Copy 2 holds nothing for it (forgot / loading): not comparable.
+                    self.count(|s| s.conf_gone += 1);
+                    continue;
+                }
+                Some(Some(v)) => v,
+            };
+            let diffs = place_diffs(place, &p.snap, conf);
+            if diffs.is_empty() {
+                self.count(|s| s.agree += 1);
+                continue;
+            }
+            // Why? Copy 2's reports say which transaction moved it; find it
+            // in this message and what we did with it.
+            let by = p.notes.iter().find(|n| moved_by_tx(&n.hash).is_some_and(|x| x.iter().any(|y| y.eq_ignore_ascii_case(k))));
+            let kind = match (conf_moved.contains(k), p.changed_cum.contains(k)) {
+                (true, false) => match by {
+                    None => "notFromTx",
+                    Some(n) => match (n.fate, n.ok) {
+                        (Fate::Skipped, _) => "missedFilter",
+                        (Fate::OffRoute, _) => "missedOffRoute",
+                        (Fate::Ran, true) => "missedRan",
+                        (Fate::Ran, false) => "missedReverted",
+                        (Fate::Failed, _) => "missedFailed",
+                    },
+                },
+                (false, true) => "phantom",
+                _ => "value",
+            };
+            if kind == "notFromTx" {
+                // Not a prediction miss (no transaction of this message moved
+                // it): counted on its own, never as a disagreement.
+                self.count(|s| s.not_from_tx += 1);
+                continue;
+            }
+            // The base we predicted on was corrected later for this pool:
+            // the base's miss (late reports), not the run's.
+            let stale = st.prev.get(k).is_some_and(|pv| place_vals(place, &p.base_snap) != *pv);
+            self.count(|s| {
+                s.disagree += 1;
+                if stale {
+                    s.stale_base += 1;
+                    return;
+                }
+                match kind {
+                    "missedFilter" => s.missed_filter += 1,
+                    "missedRan" => s.missed_ran += 1,
+                    "missedReverted" => s.missed_reverted += 1,
+                    "missedFailed" => s.missed_failed += 1,
+                    "missedOffRoute" => s.missed_off_route += 1,
+                    "phantom" => s.phantom += 1,
+                    _ => s.value_diff += 1,
+                }
+                if kind.starts_with("missed") {
+                    s.missed += 1;
+                }
+            });
+            let sm = self.sample(p, st, k, if stale { "staleBase" } else { kind }, kind, by, &diffs, block);
+            self.add_sample(sm);
+        }
+    }
+
+    /// One disagreement sample (bounded: a few slots, a few transactions).
+    #[allow(clippy::too_many_arguments)]
+    fn sample(&self, p: &Pending, st: &Settled, k: &str, kind: &str, cause: &str, by: Option<&TxNote>, diffs: &[(U256, Lookup<U256>, U256)], block: u64) -> Value {
+        let hx = |v: &U256| format!("{v:#x}");
+        let mut sm = json!({
+            "pool": k, "block": block, "baseBlock": block.saturating_sub(1), "kind": kind,
+            "slots": diffs.iter().take(MAX_SLOT_DIFFS).map(|(sl, pr, cf)| json!({"slot": hx(sl), "pred": match pr { Lookup::Known(v) => json!(hx(v)), Lookup::Missing => Value::Null }, "conf": hx(cf)})).collect::<Vec<_>>(),
+            "slotsDiffering": diffs.len(),
+            "confMoved": st.moved.iter().any(|x| x == k), "predMoved": p.changed_cum.contains(k),
+        });
+        if kind != cause {
+            sm["cause"] = json!(cause);
+        }
+        if let Some(n) = by {
+            sm["tx"] = json!(format!("{:#x}", n.hash));
+            sm["txFate"] = json!(n.fate.as_str());
+            if n.fate == Fate::Ran {
+                sm["txOk"] = json!(n.ok);
+            }
+            if let Some(w) = &n.why {
+                sm["txWhy"] = json!(w);
+            }
+            if let Some(t) = n.to {
+                sm["txTo"] = json!(format!("{t:#x}"));
+            }
+            if !n.pools.is_empty() {
+                sm["txPools"] = json!(n.pools.iter().take(4).collect::<Vec<_>>());
+            }
+        }
+        // Our transactions of this block that ran on / marked this pool.
+        let ours: Vec<String> = p.notes.iter().filter(|n| n.pools.iter().any(|x| x == k)).take(4).map(|n| format!("{:#x}:{}", n.hash, n.fate.as_str())).collect();
+        if !ours.is_empty() {
+            sm["ourTxs"] = json!(ours);
+        }
+        sm
+    }
+
+    /// Hour: the first MAX_SAMPLES; totals: the newest MAX_SAMPLES (status
+    /// always shows some, even after the hour's first ones).
+    fn add_sample(&mut self, sm: Value) {
+        if let Some(all) = &mut self.collect_all {
+            all.push(sm.clone());
+        }
+        if self.hour.samples.len() < MAX_SAMPLES {
+            self.hour.samples.push(sm.clone());
+        }
+        self.total.samples.push(sm);
+        if self.total.samples.len() > MAX_SAMPLES {
+            self.total.samples.remove(0);
+        }
+    }
+
+    /// Transactions copy 2's reports say moved our pools: learn their target
+    /// (and the pools) for next time. Skipped ones = the filter missed them.
+    fn learn_from(&mut self, notes: &[TxNote], moved_by_tx: &dyn Fn(&B256) -> Option<Vec<String>>) {
+        for n in notes {
+            if let Some(p) = moved_by_tx(&n.hash).filter(|p| !p.is_empty()) {
+                if n.fate == Fate::Skipped {
+                    self.count(|s| s.filter_missed += 1);
+                }
+                if let Some(t) = n.to {
                     self.learn_toucher(t, &p);
                 }
             }
@@ -1398,8 +1744,8 @@ impl Ahead {
         let pools = self.pools.clone();
         let assume = Assume { sender_funds: true, recent_fill: true, skip: None, record_hashes: true };
         let mut changed: Vec<String> = Vec::new();
-        let mut skipped: Vec<(B256, Option<Address>)> = Vec::new();
-        let mut fates: Vec<(B256, Fate)> = Vec::with_capacity(txs.len());
+        let mut notes: Vec<TxNote> = Vec::with_capacity(txs.len());
+        let note = |t: &DecodedTx, fate: Fate, ok: bool, why: Option<String>, pools: Vec<String>| TxNote { hash: t.hash, to: t.to, fate, ok, why, pools };
         // Marks pools unsure in this view: their values forgotten (reads
         // Missing), listed changed (the scanner looks again) and unsure.
         let mark_unsure = |ov: &mut Overlay, changed: &mut Vec<String>, changed_cum: &mut HashSet<String>, unsure_cum: &mut HashSet<String>, keys: &[String]| {
@@ -1431,8 +1777,7 @@ impl Ahead {
             let pick = plain || !native.is_empty();
             if !pick {
                 self.count(|s| s.txs_skipped += 1);
-                skipped.push((t.hash, t.to));
-                fates.push((t.hash, Fate::Skipped));
+                notes.push(note(t, Fate::Skipped, true, None, Vec::new()));
                 continue;
             }
             // FASTLANE_AHEAD_ROUTES_ONLY: picked only for naming pools no
@@ -1450,7 +1795,7 @@ impl Ahead {
                         if !named.is_empty() && named.iter().all(|k| !rp.contains(k)) {
                             self.count(|s| s.txs_off_route += 1);
                             mark_unsure(&mut ov, &mut changed, &mut changed_cum, &mut unsure_cum, &named);
-                            fates.push((t.hash, Fate::OffRoute));
+                            notes.push(note(t, Fate::OffRoute, true, None, named));
                             continue;
                         }
                     }
@@ -1460,7 +1805,12 @@ impl Ahead {
             let plan = OrderedPlan { msgs: vec![PlanMsg { seq: m.seq, ctx: ctx.clone(), txs: vec![t.clone()] }], trigger: t.hash, call_ctx: ctx.clone() };
             match run_ordered_keep(&ov, &plan, base.prov.as_ref(), &assume) {
                 Ok((out, kept)) => {
-                    fates.push((t.hash, Fate::Ran));
+                    // Did OUR run finish normally? (A reverted run moves
+                    // nothing: agreement tells it apart, accuracy fixes.)
+                    let (ok, why) = match out.replayed.first() {
+                        Some(r) if !r.outcome.success => (false, Some(revert_why(&r.outcome))),
+                        _ => (true, None),
+                    };
                     if !out.assumed.labels().is_empty() {
                         self.count(|s| s.assumed += 1);
                     }
@@ -1488,17 +1838,18 @@ impl Ahead {
                             unsure_cum.insert(k.clone());
                         }
                     }
-                    for k in moved {
+                    for k in &moved {
                         // Values forgotten earlier stay forgotten (a later
                         // exact write puts back only what it wrote).
-                        if !changed.contains(&k) {
+                        if !changed.contains(k) {
                             changed.push(k.clone());
                         }
-                        changed_cum.insert(k);
+                        changed_cum.insert(k.clone());
                     }
+                    notes.push(note(t, Fate::Ran, ok, why, moved));
                 }
-                Err(_) => {
-                    fates.push((t.hash, Fate::Failed));
+                Err(u) => {
+                    let why = failed_why(&u, t.to, &pools);
                     self.count(|s| s.txs_failed += 1);
                     // Which of our pools might it touch? What it reads in a
                     // collect run + what it names. Those become unsure.
@@ -1528,6 +1879,28 @@ impl Ahead {
                     for k in pools.named_by_pair_except(&named_now, &hit) {
                         if !hit.contains(&k) {
                             hit.push(k);
+                        }
+                    }
+                    // Accuracy fixes (second practice run: a sure pool was
+                    // wrong after a failed run that did not mark it):
+                    //   - native-ETH pools of a named coin, whatever the ETH
+                    //     value (a V4 "sell for ETH" through a router pays none),
+                    //   - the target's learned pools this data could be
+                    //     trading (a named pair, e.g. a split route over sister
+                    //     pools; all of them when it names no coin: an opaque
+                    //     bot contract).
+                    // Only when something narrower was already found (an
+                    // empty `hit` keeps the H4 fallback below, unchanged).
+                    if !hit.is_empty() {
+                        let before = hit.len();
+                        let learned = t.to.and_then(|a| self.touchers.get(&a)).map(|x| pools.learned_for(&x.1, &named_now)).unwrap_or_default();
+                        for k in pools.named_native_any(&named_now).into_iter().chain(learned) {
+                            if !hit.contains(&k) {
+                                hit.push(k);
+                            }
+                        }
+                        if hit.len() > before {
+                            self.count(|s| s.failed_widened += 1);
                         }
                     }
                     if hit.is_empty() {
@@ -1560,6 +1933,7 @@ impl Ahead {
                         self.learn_toucher(a, &hit);
                     }
                     mark_unsure(&mut ov, &mut changed, &mut changed_cum, &mut unsure_cum, &hit);
+                    notes.push(note(t, Fate::Failed, false, Some(why), hit));
                 }
             }
         }
@@ -1573,8 +1947,7 @@ impl Ahead {
             changed,
             changed_cum,
             unsure_cum,
-            skipped,
-            fates,
+            notes,
             built_at: Instant::now(),
             apply_us: t0.elapsed().as_micros() as u64,
             feed_at: self.arrived.get(&m.seq).copied().unwrap_or(t0),
@@ -1595,28 +1968,146 @@ fn forget_place(ov: &mut Overlay, p: Place) {
     }
 }
 
-/// Same state of one pool in both copies? Compared on the values the
-/// CONFIRMED copy holds (its own declared values / V4 base values). A value
-/// we hold differently, or don't hold, is a difference.
-fn same_state(p: Place, pred: &Snapshot, conf: &Snapshot) -> bool {
+/// One pool's own values in a snapshot (see PlaceVals): a contract pool's
+/// declared variables it holds, a V4 pool's base values it holds.
+fn place_vals(p: Place, snap: &Snapshot) -> PlaceVals {
     match p {
         Place::Contract(a) => {
-            let Some(acc) = conf.accounts.get(&a) else {
-                // Confirmed copy forgot it (unsure there): ours must too.
-                return pred.accounts.get(&a).is_none_or(|x| x.storage.is_empty());
-            };
-            acc.storage
-                .iter()
-                .filter(|(s, _)| **s < U256::from(DECLARED_MAX))
-                .all(|(s, v)| pred.storage(a, *s) == Lookup::Known(*v))
+            let acc = snap.accounts.get(&a)?;
+            let mut v: Vec<(U256, U256)> = acc.storage.iter().filter(|(s, _)| **s < U256::from(DECLARED_MAX)).map(|(s, x)| (*s, *x)).collect();
+            v.sort();
+            Some(v)
         }
-        Place::V4(pm, base) => (0..4u8).all(|k| {
-            let s = base + U256::from(k);
-            match conf.storage(pm, s) {
-                Lookup::Known(v) => pred.storage(pm, s) == Lookup::Known(v),
-                Lookup::Missing => true,
+        Place::V4(pm, base) => {
+            let v: Vec<(U256, U256)> = (0..4u8)
+                .filter_map(|k| {
+                    let s = base + U256::from(k);
+                    match snap.storage(pm, s) {
+                        Lookup::Known(x) => Some((s, x)),
+                        Lookup::Missing => None,
+                    }
+                })
+                .collect();
+            (!v.is_empty()).then_some(v)
+        }
+    }
+}
+
+/// Did this pool's own values change between two snapshots? Cheap first
+/// look: an untouched contract account keeps the very same storage map
+/// (persistent maps share it), so most pools are answered by one pointer
+/// compare.
+fn place_changed(p: Place, prev: &Snapshot, now: &Snapshot) -> bool {
+    if let Place::Contract(a) = p {
+        match (prev.accounts.get(&a), now.accounts.get(&a)) {
+            (None, None) => return false,
+            (Some(x), Some(y)) if x.storage.ptr_eq(&y.storage) => return false,
+            _ => {}
+        }
+    }
+    place_vals(p, prev) != place_vals(p, now)
+}
+
+/// The confirmed values `conf` our predicted copy does not hold the same:
+/// (slot, what we hold, confirmed value). Empty = agree. (Same rule as
+/// before: every value the CONFIRMED copy holds must be held equal by us.)
+fn place_diffs(p: Place, pred: &Snapshot, conf: &[(U256, U256)]) -> Vec<(U256, Lookup<U256>, U256)> {
+    let (acct, _) = match p {
+        Place::Contract(a) => (a, ()),
+        Place::V4(pm, _) => (pm, ()),
+    };
+    conf.iter()
+        .filter_map(|(s, v)| {
+            let ours = pred.storage(acct, *s);
+            (ours != Lookup::Known(*v)).then_some((*s, ours, *v))
+        })
+        .collect()
+}
+
+impl Settled {
+    /// From copy 2's versions `prev` (block seq - 1) and `now` (block seq):
+    /// every pool of ours whose own values differ between them, with the
+    /// values of those and of `extra` (the pools the prediction moved).
+    /// `base_used`: the version the prediction was built on, if known (its
+    /// pools that differ from `prev` = corrected later: `late`).
+    pub fn build<'a>(pools: &PoolSet, seq: u64, prev: &Snapshot, now: &Snapshot, extra: impl Iterator<Item = &'a String>, base_used: Option<&Snapshot>) -> Settled {
+        let mut st = Settled { seq, ..Default::default() };
+        let mut keys: Vec<&String> = pools.places.keys().collect();
+        keys.sort();
+        for k in keys {
+            let p = pools.places[k];
+            if place_changed(p, prev, now) {
+                st.moved.push(k.clone());
             }
-        }),
+            if let Some(b) = base_used {
+                if !std::ptr::eq(b, prev) && place_changed(p, b, prev) {
+                    st.late.push(k.clone());
+                }
+            }
+        }
+        let mut want: Vec<String> = st.moved.clone();
+        want.extend(extra.cloned());
+        st.fill_from(pools, want.iter(), prev, now);
+        st
+    }
+
+    /// Fill in values of `keys` not already here, from snapshots (the
+    /// offline replay: pools only it predicted moved).
+    pub fn fill_from<'a>(&mut self, pools: &PoolSet, keys: impl Iterator<Item = &'a String>, prev: &Snapshot, now: &Snapshot) {
+        for k in keys {
+            if self.now.contains_key(k) {
+                continue;
+            }
+            if let Some(p) = pools.places.get(k) {
+                self.now.insert(k.clone(), place_vals(*p, now));
+                self.prev.insert(k.clone(), place_vals(*p, prev));
+            }
+        }
+    }
+}
+
+/// Why our run of a feed transaction reverted / halted (short, groupable).
+fn revert_why(o: &crate::check::CallOutcome) -> String {
+    if let Some(h) = &o.halt {
+        return format!("halt: {}", h.chars().take(60).collect::<String>());
+    }
+    if o.output.len() >= 4 {
+        let sel = &o.output[..4];
+        // Error(string): show the text (often "STF", "Too little received").
+        if sel == [0x08, 0xc3, 0x79, 0xa0] && o.output.len() >= 68 {
+            let n = U256::from_be_slice(&o.output[36..68]).saturating_to::<usize>().min(48);
+            let txt: String = o.output.get(68..68 + n).map(|b| String::from_utf8_lossy(b).into_owned()).unwrap_or_default();
+            return format!("revert: {txt}");
+        }
+        return format!("revert 0x{}", sel.iter().map(|b| format!("{b:02x}")).collect::<String>());
+    }
+    "revert (no data)".into()
+}
+
+/// Why a feed transaction could not be run exactly (short, groupable:
+/// addresses named by role, never printed).
+fn failed_why(u: &crate::check::CheckUnknown, to: Option<Address>, pools: &PoolSet) -> String {
+    let role = |a: &Address| {
+        if Some(*a) == to {
+            "target"
+        } else if pools.by_contract.contains_key(a) {
+            "a pool"
+        } else if pools.idx.pms.contains(a) {
+            "the V4 PoolManager"
+        } else if pools.idx.role(a) & ROLE_COIN != 0 {
+            "a coin"
+        } else {
+            "another contract"
+        }
+    };
+    let first = u.missing.first().map(|m| match m {
+        crate::state::MissItem::Account(a) => format!("{} account", role(a)),
+        crate::state::MissItem::Slot(a, _) => format!("a value of {}", role(a)),
+        crate::state::MissItem::Code(_) => "contract code".to_string(),
+    });
+    match first {
+        Some(f) => format!("{}: {f}", u.reason.as_str()),
+        None => format!("{}: {}", u.reason.as_str(), u.detail.chars().take(60).collect::<String>()),
     }
 }
 
@@ -1791,6 +2282,16 @@ fn same_list(a: &PoolList, b: &PoolList) -> bool {
     a.1 == b.1 && a.0.len() == b.0.len() && a.0.iter().zip(&b.0).all(|(x, y)| x.0.key == y.0.key && x.0.address == y.0.address && x.0.v4_id == y.0.v4_id && x.1 == y.1 && x.2 == y.2)
 }
 
+/// The settled values of block `seq` from copy 2's published versions
+/// (seq - 1 and seq, as they are NOW: late reports written in). `extra`:
+/// pools whose values are wanted too; `base_used`: the version the
+/// prediction was built on. None = copy 2 no longer holds both versions.
+fn settled_from(pv: &crate::state::mirror::PubView, pools: &PoolSet, seq: u64, extra: &[String], base_used: Option<&Snapshot>) -> Option<Settled> {
+    let find = |n: u64| pv.versions.iter().find(|v| v.seq == n);
+    let (prev, now) = (find(seq.checked_sub(1)?)?, find(seq)?);
+    Some(Settled::build(pools, seq, &prev.snap, &now.snap, extra.iter(), base_used))
+}
+
 fn run_loop(c2: super::intake::Copy2Handle, cfg: AheadCfg, rx: Receiver<Ev>) {
     let mut a = Ahead::new(cfg);
     let mut reg_gen = u64::MAX;
@@ -1807,12 +2308,18 @@ fn run_loop(c2: super::intake::Copy2Handle, cfg: AheadCfg, rx: Receiver<Ev>) {
     // The route pools (FASTLANE_AHEAD_ROUTES_ONLY), rebuilt when the bot's
     // candidate table changes (about once a second at most).
     let mut table_gen: Option<u64> = None;
+    let mut routes_now: Option<Vec<String>> = None;
+    // Accuracy fixes: the capture (FASTLANE_CAPTURE_FILE; None = off).
+    let mut cap = super::ahead_capture::CapCfg::from_lookup(|k| std::env::var(k).ok()).map(super::ahead_capture::LiveCapture::new);
     loop {
         // Review M2: no idle polling. Woken by a feed message or a published
         // version (confirmed_hook); the 1 s timeout only drives the status
         // copy and the hourly line.
         let ev = rx.recv_timeout(Duration::from_secs(1));
         if matches!(ev, Err(RecvTimeoutError::Disconnected)) {
+            if let Some(c) = &mut cap {
+                c.stop(&a, "arbsim stopping");
+            }
             return;
         }
         // Pools: looked at only when copy 2's registry changed, and the
@@ -1825,21 +2332,42 @@ fn run_loop(c2: super::intake::Copy2Handle, cfg: AheadCfg, rx: Receiver<Ev>) {
             if !same_list(&now, &list) || a.pools().is_empty() {
                 list = now;
                 a.set_pools(Arc::new(PoolSet::build(&list.0, list.1.iter().cloned().collect())));
+                if let Some(c) = cap.as_mut().filter(|c| c.on()) {
+                    c.send(&a, super::ahead_capture::CapEv::Pools { list: list.0.clone(), not_ready: list.1.clone() });
+                }
             }
         }
         let tg = crate::check::entry::table_gen();
         if tg != table_gen {
             table_gen = tg;
-            a.set_route_pools(crate::check::entry::route_keys().map(|(_, k)| Arc::new(k)).filter(|k| !k.is_empty()));
+            let keys = crate::check::entry::route_keys().map(|(_, k)| k).filter(|k| !k.is_empty());
+            routes_now = keys.as_ref().map(|k| {
+                let mut v: Vec<String> = k.iter().cloned().collect();
+                v.sort();
+                v
+            });
+            a.set_route_pools(keys.map(Arc::new));
+            if let Some(c) = cap.as_mut().filter(|c| c.on()) {
+                c.send(&a, super::ahead_capture::CapEv::Routes(routes_now.clone()));
+            }
         }
         // Confirmed first (a new version may already cover a feed message).
         // Every version published since the last one, in order (review L1:
-        // agreement is per block; a jump would miscount).
+        // agreement is per block; a jump would miscount). Accuracy fixes:
+        // the SAME block's version replaced (copy 2 wrote late reports into
+        // it) is handed too: the prediction rebases on the corrected copy.
         let pv = c2.sh.published.view();
         let newer: Vec<Arc<crate::state::mirror::Version>> = match &head {
             None => pv.head().cloned().into_iter().collect(),
             Some(h) if pv.head().is_some_and(|x| Arc::ptr_eq(x, h)) => Vec::new(),
-            Some(h) => pv.versions.iter().filter(|v| v.seq > h.seq).cloned().collect(),
+            Some(h) => {
+                let v: Vec<_> = pv.versions.iter().filter(|v| v.seq > h.seq).cloned().collect();
+                if v.is_empty() {
+                    pv.head().filter(|x| x.seq == h.seq).cloned().into_iter().collect()
+                } else {
+                    v
+                }
+            }
         };
         if !newer.is_empty() {
             // The registry summary for the readers' copy we just took (no
@@ -1847,21 +2375,89 @@ fn run_loop(c2: super::intake::Copy2Handle, cfg: AheadCfg, rx: Receiver<Ev>) {
             let core = c2.core_for(Some(&pv));
             for v in newer {
                 head = Some(v.clone());
+                if cap.as_ref().is_some_and(|c| c.should_start()) {
+                    let c = cap.as_mut().expect("checked");
+                    c.begin(&a, &list.0, &list.1, routes_now.clone());
+                }
                 // Same cache key (head block, no extra holders) the head's
                 // own checks use, so this never pushes theirs out.
                 let prov = c2.provenance_with(&core, v.block, &[]);
+                if let Some(c) = cap.as_mut().filter(|c| c.on()) {
+                    c.prov(&a, &prov);
+                }
                 let prov: Arc<dyn Provenance + Send + Sync> = prov;
                 let conf = Confirmed { seq: v.seq, snap: v.snap.clone(), ctx: v.ctx.clone(), diff: v.diff.clone(), prov };
                 let rm = &c2.c2.recent_moves;
-                a.on_confirmed(conf, &|h| rm.lock().ok().and_then(|r| r.pools_of(h)));
+                // The "who moved what" answers used, for the capture.
+                let asked: std::cell::RefCell<Vec<(B256, Option<Vec<String>>)>> = Default::default();
+                let capturing = cap.as_ref().is_some_and(|c| c.on());
+                a.on_confirmed(conf, &|h| {
+                    let r = rm.lock().ok().and_then(|r| r.pools_of(h));
+                    if capturing {
+                        asked.borrow_mut().push((*h, r.clone()));
+                    }
+                    r
+                });
+                if let Some(c) = cap.as_mut().filter(|c| c.on()) {
+                    c.confirmed(&a, asked.into_inner(), v.seq, v.ctx.clone(), v.snap.clone());
+                }
+            }
+        }
+        // AGREEMENT (accuracy fixes): blocks whose turn has come
+        // (FASTLANE_AHEAD_COMPARE_DELAY_BLOCKS past them), against copy 2's
+        // settled versions.
+        if let Some(h) = &head {
+            for seq in a.due(h.seq) {
+                let Some((pools, keys, base)) = a.pending_parts(seq) else { continue };
+                let Some(st) = settled_from(&pv, &pools, seq, &keys, Some(&base)) else {
+                    a.drop_pending(seq);
+                    continue;
+                };
+                let rm = &c2.c2.recent_moves;
+                let asked: std::cell::RefCell<Vec<(B256, Option<Vec<String>>)>> = Default::default();
+                let capturing = cap.as_ref().is_some_and(|c| c.on());
+                a.compare_settled(&st, &|h| {
+                    let r = rm.lock().ok().and_then(|r| r.pools_of(h));
+                    if capturing {
+                        asked.borrow_mut().push((*h, r.clone()));
+                    }
+                    r
+                });
+                if let Some(c) = cap.as_mut().filter(|c| c.on()) {
+                    c.send(&a, super::ahead_capture::CapEv::Moves(asked.into_inner()));
+                    c.send(&a, super::ahead_capture::CapEv::Settled(st));
+                    c.written.insert(seq);
+                }
+            }
+            // Capture: EVERY captured block gets its settled values (also
+            // blocks the live prediction did not compare), for the replay.
+            if let Some(c) = cap.as_mut().filter(|c| c.on()) {
+                let delay = a.cfg().compare_delay;
+                while c.to_settle.front().is_some_and(|s| s.saturating_add(delay) <= h.seq) {
+                    let seq = c.to_settle.pop_front().expect("checked");
+                    // Already written when the predicted copy compared it.
+                    if c.written.remove(&seq) {
+                        continue;
+                    }
+                    let pools = a.pools.clone();
+                    if let Some(st) = settled_from(&pv, &pools, seq, &[], None) {
+                        c.send(&a, super::ahead_capture::CapEv::Settled(st));
+                    }
+                }
             }
         }
         if let Ok(Ev::Feed(m, at)) = ev {
-            a.on_feed_message_at(m, at);
+            a.on_feed_message_at(m.clone(), at);
+            if let Some(c) = cap.as_mut().filter(|c| c.on()) {
+                c.send(&a, super::ahead_capture::CapEv::Feed(m));
+            }
             // Everything queued, in order (a burst after a reconnect).
             while let Ok(e) = rx.try_recv() {
                 if let Ev::Feed(m, at) = e {
-                    a.on_feed_message_at(m, at);
+                    a.on_feed_message_at(m.clone(), at);
+                    if let Some(c) = cap.as_mut().filter(|c| c.on()) {
+                        c.send(&a, super::ahead_capture::CapEv::Feed(m));
+                    }
                 }
             }
         }
@@ -1885,7 +2481,11 @@ fn run_loop(c2: super::intake::Copy2Handle, cfg: AheadCfg, rx: Receiver<Ev>) {
             *rt.agreement.lock().unwrap_or_else(|e| e.into_inner()) = a.hour.shares();
             if last_status.elapsed() >= Duration::from_secs(1) {
                 last_status = Instant::now();
-                *rt.status.lock().unwrap_or_else(|e| e.into_inner()) = status_of(&a);
+                let mut st = status_of(&a);
+                if let Some(c) = &cap {
+                    st["capture"] = json!({"file": c.cfg.path, "on": c.on(), "bytes": c.cap.as_ref().map(|x| x.bytes.load(std::sync::atomic::Ordering::Relaxed))});
+                }
+                *rt.status.lock().unwrap_or_else(|e| e.into_inner()) = st;
             }
         }
         if hour_start.elapsed() >= Duration::from_secs(3600) {

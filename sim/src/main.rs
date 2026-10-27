@@ -4,6 +4,7 @@
 //   check-fixture   run one test file and compare with the node (C)
 //   bench-fixture   speed test on one test file (C)
 //   node-bench      time node requests through our node client (A, read only)
+//   ahead-replay    replay a fast lane prediction capture offline (fast lane A)
 // ============================================================================
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -12,8 +13,9 @@ fn main() {
         Some("check-fixture") => arbsim::check::cli::check_fixture(&args),
         Some("bench-fixture") => arbsim::check::cli::bench_fixture(&args),
         Some("node-bench") => arbsim::bench_node::node_bench(&args),
+        Some("ahead-replay") => arbsim::copy2::ahead_capture::replay_main(&args),
         _ => {
-            eprintln!("usage: arbsim serve | check-fixture <file> | bench-fixture <file> | node-bench [--url-env NAME] [--n 50] [--parallel 16]");
+            eprintln!("usage: arbsim serve | check-fixture <file> | bench-fixture <file> | node-bench [--url-env NAME] [--n 50] [--parallel 16] | ahead-replay <capture file> [--json] [--samples N] [--budget-ms N] [--partial]");
             std::process::exit(2);
         }
     }
