@@ -314,13 +314,14 @@ impl NameIndex {
     fn coins<'a>(&'a self, n: &'a Named) -> impl Iterator<Item = &'a Address> + 'a {
         n.addrs.iter().filter(move |a| self.role(a) & ROLE_COIN != 0)
     }
-    /// Pairs (x < y) whose BOTH coins are in `n`.
+    /// Pairs (x <= y) whose BOTH coins are in `n`.
     fn pairs_found(&self, n: &Named) -> Vec<(Address, Address)> {
         let mut out = Vec::new();
         for x in self.coins(n) {
             if let Some(ps) = self.partners.get(x) {
                 for y in ps {
-                    if x < y && n.addrs.contains(y) {
+                    // (x == y: a degenerate "pair" of one coin, matched like the old search.)
+                    if x <= y && n.addrs.contains(y) && !out.contains(&(*x, *y)) {
                         out.push((*x, *y));
                     }
                 }
@@ -1817,6 +1818,123 @@ mod tests {
         }
     }
 
+    /// Tiny deterministic random numbers (no extra crate).
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            self.0 >> 11
+        }
+        fn addr(&mut self) -> Address {
+            let mut b = [0u8; 20];
+            for x in b.iter_mut() {
+                *x = self.next() as u8;
+            }
+            Address::from(b)
+        }
+    }
+
+    fn sorted(mut v: Vec<String>) -> Vec<String> {
+        v.sort();
+        v
+    }
+
+    /// Practice fixes: the one-pass name index gives EXACTLY the answers of
+    /// the old per-pool search (route.named_by and the three "named"
+    /// helpers), on random data with our addresses / ids / coins planted at
+    /// random byte offsets (aligned or not), plus addresses sharing the
+    /// index's 4-byte prefixes.
+    #[test]
+    fn name_index_matches_the_old_search_exactly() {
+        let mut r = Lcg(42);
+        let coins: Vec<Address> = (0..40).map(|_| r.addr()).collect();
+        let pm = r.addr();
+        let mut list = Vec::new();
+        for i in 0..400u64 {
+            let t0 = if i % 17 == 0 { Address::ZERO } else { coins[(r.next() % 40) as usize] };
+            let t1 = coins[(r.next() % 40) as usize];
+            if i % 5 == 0 {
+                let mut id = [0u8; 32];
+                for x in id.iter_mut() {
+                    *x = r.next() as u8;
+                }
+                let id = B256::from(id);
+                list.push((FollowedPool { key: format!("{id:#x}"), address: pm, v4_id: Some(id) }, t0, t1));
+            } else {
+                let a = r.addr();
+                list.push((FollowedPool { key: format!("{a:#x}"), address: a, v4_id: None }, t0, t1));
+            }
+        }
+        let set = PoolSet::build(&list, HashSet::new());
+        let needles: Vec<Vec<u8>> = list
+            .iter()
+            .flat_map(|(p, a, b)| {
+                let mut v = vec![p.address.to_vec(), a.to_vec(), b.to_vec()];
+                if let Some(id) = p.v4_id {
+                    v.push(id.to_vec());
+                }
+                v
+            })
+            .collect();
+        let mut hits = 0;
+        for case in 0..3000 {
+            let len = (r.next() % 700) as usize;
+            let mut data: Vec<u8> = (0..len).map(|_| r.next() as u8).collect();
+            for _ in 0..(r.next() % 4) {
+                let n = &needles[(r.next() as usize) % needles.len()];
+                if data.len() >= n.len() {
+                    let at = (r.next() as usize) % (data.len() - n.len() + 1);
+                    // Every 3rd: only the first 4 bytes (a prefix false alarm).
+                    let k = if case % 3 == 0 { 4 } else { n.len() };
+                    data[at..at + k].copy_from_slice(&n[..k]);
+                }
+            }
+            let to = match r.next() % 4 {
+                0 => Some(list[(r.next() as usize) % list.len()].0.address),
+                1 => None,
+                _ => Some(r.addr()),
+            };
+            let value = if r.next() % 2 == 0 { U256::ZERO } else { U256::from(1u8) };
+            let n = set.scan(&data);
+            assert_eq!(set.may_touch(to, &n), set.may_touch_slow(to, &data), "case {case}: to {to:?} found {n:?} named {:?}", set.named_slow(to, &data));
+            assert_eq!(sorted(set.named(to, &n)), sorted(set.named_slow(to, &data)), "case {case}");
+            assert_eq!(sorted(set.named_native(value, &n)), sorted(set.named_native_slow(value, &data)), "case {case}");
+            assert_eq!(sorted(set.sharing_named_coins(&n)), sorted(set.sharing_named_coins_slow(&data)), "case {case}");
+            if set.may_touch(to, &n) {
+                hits += 1;
+            }
+        }
+        assert!(hits > 500, "the random cases really hit our pools ({hits})");
+    }
+
+    /// Practice fixes: a failed transaction naming a V4 PoolManager and a
+    /// coin marks only that PoolManager's pools holding the coin, never the
+    /// V2 / V3 pools of the same coin.
+    #[test]
+    fn v4_fallback_names_only_v4_pools_of_that_manager() {
+        let usdg = Address::from([0x11; 20]);
+        let meme = Address::from([0x33; 20]);
+        let pm = Address::from([0x44; 20]);
+        let other_pm = Address::from([0x55; 20]);
+        let v2 = Address::from([0x66; 20]);
+        let id = |b: u8| B256::from([b; 32]);
+        let fp = |a: Address, id: Option<B256>| FollowedPool { key: id.map(|i| format!("{i:#x}")).unwrap_or_else(|| format!("{a:#x}")), address: a, v4_id: id };
+        let set = PoolSet::build(
+            &[(fp(v2, None), usdg, meme), (fp(pm, Some(id(1))), Address::ZERO, usdg), (fp(pm, Some(id(2))), meme, Address::from([0x77; 20])), (fp(other_pm, Some(id(3))), Address::ZERO, usdg)],
+            HashSet::new(),
+        );
+        let mut data = vec![0u8; 12];
+        data.extend_from_slice(pm.as_slice());
+        data.extend_from_slice(&[0u8; 12]);
+        data.extend_from_slice(usdg.as_slice());
+        let n = set.scan(&data);
+        assert!(set.names_pm(None, &n));
+        assert_eq!(set.v4_sharing_named_coins(None, &n), vec![format!("{:#x}", id(1))], "only the USDG pool in THAT PoolManager");
+        let mut wide = set.sharing_named_coins(&n);
+        wide.sort();
+        assert_eq!(wide.len(), 3, "the old fallback: every USDG pool of any kind ({wide:?})");
+    }
+
     #[test]
     fn settings_from_env_words() {
         let m: HashMap<&str, &str> = [("FASTLANE_AHEAD_MAX_BLOCKS", "8"), ("FASTLANE_AHEAD_FILTER", "ALL")].into_iter().collect();
@@ -1824,5 +1942,16 @@ mod tests {
         assert_eq!((c.max_blocks, c.run_all, c.max_txs, c.l2_offset), (8, true, 256, 5));
         let c = AheadCfg::from_lookup(|_| Some("0".into()), 0);
         assert_eq!((c.max_blocks, c.run_all), (32, false), "nonsense falls back to the defaults");
+        // Practice fixes: sender funds trusted by default in practice only;
+        // routes-only on by default.
+        let get = |m: Vec<(&'static str, &'static str)>| {
+            let m: HashMap<&str, &str> = m.into_iter().collect();
+            AheadCfg::from_lookup(move |k| m.get(k).map(|s| s.to_string()), 0)
+        };
+        assert!(get(vec![("FASTLANE", "practice")]).trust_sender_funds);
+        assert!(!get(vec![("FASTLANE", "live")]).trust_sender_funds, "live: not trusted unless set");
+        assert!(!get(vec![("FASTLANE", "practice"), ("FASTLANE_AHEAD_TRUST_SENDER_FUNDS", "off")]).trust_sender_funds, "an explicit off wins");
+        assert!(get(vec![("FASTLANE", "live"), ("FASTLANE_AHEAD_TRUST_SENDER_FUNDS", "on")]).trust_sender_funds);
+        assert!(get(vec![]).routes_only && !get(vec![("FASTLANE_AHEAD_ROUTES_ONLY", "off")]).routes_only);
     }
 }

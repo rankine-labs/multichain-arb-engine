@@ -809,6 +809,8 @@ impl Scanner {
         found.truncate(self.cfg.max_results);
         rep.opps = found;
         rep.timing.total_us = t0.elapsed().as_micros() as u64;
+        let held = self.src.all().len() as u64;
+        HOUR.with(|h| h.routes = held);
         record_block(&rep);
         rep
     }
@@ -844,6 +846,9 @@ impl Scanner {
         let tr = Instant::now();
         let fin = |outcome: Outcome| RouteCheck { rid: r.rid.clone(), source, outcome, us: tr.elapsed().as_micros() as u64 };
         if r.keys.iter().chain(r.pools.iter()).any(|k| b.unsure.contains(k)) {
+            if !r.pools.iter().any(|k| b.unsure.contains(k)) {
+                HOUR.with(|h| h.skipped_unsure_lender += 1);
+            }
             return fin(Outcome::SkippedUnsure);
         }
         let Some(f) = &r.facts else { return fin(Outcome::NoFacts) };
@@ -996,6 +1001,12 @@ pub struct Hour {
     /// M6: routes not started this hour (resting / didn't fit the budget left).
     pub resting: u64,
     pub cut_fit: u64,
+    /// Practice fixes (Oct 27): routes the scanner holds right now (from the
+    /// bot's candidate table); 0 = no table / nothing usable.
+    pub routes: u64,
+    /// Routes skipped as unsure because of their LENDER key (the pools
+    /// themselves were fine), apart from pools.
+    pub skipped_unsure_lender: u64,
 }
 
 struct HourCell {
@@ -1015,7 +1026,7 @@ static HOUR: HourCell = HourCell { h: Mutex::new(Hour {
     blocks: 0, routes_checked: 0, changed_checked: 0, sweep_checked: 0, found: 0, found_dup: 0, below_min: 0, no_profit: 0, unknown: 0,
     skipped_unsure: 0, no_facts: 0, implausible: 0, cut_changed: 0, bad_rows: 0, best_net_usd: None, best_label: String::new(), time_us: 0,
     max_block_us: 0, full_sweeps: 0, last_full_sweep_blocks: None, max_full_sweep_blocks: 0, eval_real: 0, eval_gone: 0, eval_unknown: 0,
-    slow_routes: 0, resting: 0, cut_fit: 0,
+    slow_routes: 0, resting: 0, cut_fit: 0, routes: 0, skipped_unsure_lender: 0,
 }), ring: Mutex::new(VecDeque::new()) };
 
 fn record_block(rep: &ScanReport) {
@@ -1078,6 +1089,7 @@ pub fn status_json() -> Value {
         "fullSweeps": h.full_sweeps, "lastFullSweepBlocks": h.last_full_sweep_blocks, "maxFullSweepBlocks": h.max_full_sweep_blocks,
         "evalReal": h.eval_real, "evalGone": h.eval_gone, "evalUnknown": h.eval_unknown,
         "slowRoutes": h.slow_routes, "resting": h.resting, "cutFit": h.cut_fit,
+        "routes": h.routes, "skippedUnsureLender": h.skipped_unsure_lender,
         "blockUs": crate::timing::pct(&mut ring),
     })
 }
@@ -1086,8 +1098,8 @@ pub fn status_json() -> Value {
 pub fn take_hour() -> String {
     let h = std::mem::take(&mut *HOUR.h.lock().unwrap_or_else(|e| e.into_inner()));
     let line = format!(
-        "[fastlane scan] {} blocks, {} routes checked ({} changed-pool, {} sweep), {} found (+{} repeats), {} below minimum, {} no profit, {} unsure answers, {} skipped (unsure pool), {} without price facts; best ${}{}; time {} ms (worst block {} ms); full sweep every {} blocks (worst {}, {} passes){}",
-        h.blocks, h.routes_checked, h.changed_checked, h.sweep_checked, h.found, h.found_dup, h.below_min, h.no_profit, h.unknown, h.skipped_unsure, h.no_facts,
+        "[fastlane scan] {} blocks, {} routes held, {} routes checked ({} changed-pool, {} sweep), {} found (+{} repeats), {} below minimum, {} no profit, {} unsure answers, {} skipped (unsure pool; {} only for the lender), {} without price facts; best ${}{}; time {} ms (worst block {} ms); full sweep every {} blocks (worst {}, {} passes){}",
+        h.blocks, h.routes, h.routes_checked, h.changed_checked, h.sweep_checked, h.found, h.found_dup, h.below_min, h.no_profit, h.unknown, h.skipped_unsure, h.skipped_unsure_lender, h.no_facts,
         h.best_net_usd.map(|v| format!("{v:.2}")).unwrap_or_else(|| "-".into()),
         if h.best_label.is_empty() { String::new() } else { format!(" ({})", h.best_label) },
         h.time_us / 1000, h.max_block_us / 1000,
