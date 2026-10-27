@@ -85,6 +85,8 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use rustc_hash::{FxHashMap, FxHashSet};
+
 use revm::primitives::{Address, B256, KECCAK_EMPTY, U256};
 use revm::state::AccountInfo;
 use serde_json::{json, Value};
@@ -147,11 +149,18 @@ pub struct AheadCfg {
     /// does not try again until copy 2 has confirmed that message (so one
     /// heavy block can never eat a CPU over and over). 1..=1000 ms.
     pub msg_budget_us: u64,
+    /// FASTLANE_AHEAD_ROUTES_ONLY [on] (practice fixes, Oct 27): a
+    /// transaction that names ONLY pools no scanner route uses is not run;
+    /// those pools are marked unsure instead (the scanner never reads them).
+    /// Transactions to learned routers ("touchers"), naming a V4
+    /// PoolManager, or naming any route pool still run. Until the bot's
+    /// candidate table is in, everything picked runs. off = always run.
+    pub routes_only: bool,
 }
 
 impl Default for AheadCfg {
     fn default() -> Self {
-        AheadCfg { max_blocks: 32, run_all: false, max_txs: 256, max_touchers: 4096, l2_offset: 0, trust_sender_funds: false, msg_budget_us: 10_000 }
+        AheadCfg { max_blocks: 32, run_all: false, max_txs: 256, max_touchers: 4096, l2_offset: 0, trust_sender_funds: false, msg_budget_us: 10_000, routes_only: true }
     }
 }
 
@@ -166,8 +175,17 @@ impl AheadCfg {
             max_txs: num("FASTLANE_AHEAD_MAX_TXS").filter(|v| (1..=100_000).contains(v)).unwrap_or(d.max_txs),
             max_touchers: d.max_touchers,
             l2_offset,
-            trust_sender_funds: crate::fastlane::mode::parse_on(get("FASTLANE_AHEAD_TRUST_SENDER_FUNDS").as_deref()),
+            // Practice fixes (Oct 27): unset = TRUSTED in practice mode (no
+            // trade is ever sent there, and with it off nearly every swap's
+            // pools were unsure: the scanner and the agreement count had
+            // nothing to work with; the practice "real / gone" scores now
+            // measure what trusting costs). Live: off unless set to on.
+            trust_sender_funds: match get("FASTLANE_AHEAD_TRUST_SENDER_FUNDS").filter(|v| !v.trim().is_empty()) {
+                Some(v) => crate::fastlane::mode::parse_on(Some(&v)),
+                None => Mode::parse(get("FASTLANE").as_deref()) == Mode::Practice,
+            },
             msg_budget_us: num("FASTLANE_AHEAD_MSG_BUDGET_MS").filter(|v| (1..=1000).contains(v)).map(|v| v as u64 * 1000).unwrap_or(d.msg_budget_us),
+            routes_only: get("FASTLANE_AHEAD_ROUTES_ONLY").is_none_or(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "off" | "0" | "false" | "no")),
         }
     }
 }
@@ -218,6 +236,98 @@ pub struct PoolSet {
     /// Pools copy 2 itself can't vouch for right now (loading / unsure):
     /// always listed unsure in the predicted tip.
     pub not_ready: HashSet<String>,
+    /// FAST NAME INDEX (practice fixes, Oct 27): every address / V4 pool id
+    /// the cheap filter looks for, so ONE pass over a transaction's data
+    /// finds them all. Before, each of ~1,800 pools (+ coins + V4 ids) was
+    /// looked for separately across the whole data: millions of byte
+    /// compares per transaction, most of the 10 ms budget per feed message.
+    idx: NameIndex,
+}
+
+/// Roles of an indexed address (bit flags).
+const ROLE_POOL: u8 = 1;
+const ROLE_PM: u8 = 2;
+const ROLE_COIN: u8 = 4;
+
+/// The fast name index (see PoolSet.idx). Lookups are by the first 4 bytes
+/// first (a tiny hash set), then the full address / id.
+#[derive(Default)]
+struct NameIndex {
+    pre20: FxHashSet<u32>,
+    addrs: FxHashMap<Address, u8>,
+    pre32: FxHashSet<u32>,
+    ids: FxHashSet<B256>,
+    /// Non-zero coin -> the non-zero coins it forms one of our pairs with.
+    partners: FxHashMap<Address, Vec<Address>>,
+    /// Our V4 PoolManagers.
+    pms: FxHashSet<Address>,
+}
+
+/// What one transaction's data names (indexed items only), found in one pass.
+#[derive(Default, Debug)]
+pub struct Named {
+    addrs: FxHashSet<Address>,
+    ids: Vec<B256>,
+}
+
+impl NameIndex {
+    fn add_addr(&mut self, a: Address, role: u8) {
+        if a.is_zero() {
+            return;
+        }
+        self.pre20.insert(u32::from_be_bytes([a[0], a[1], a[2], a[3]]));
+        *self.addrs.entry(a).or_default() |= role;
+    }
+    fn add_id(&mut self, id: B256) {
+        self.pre32.insert(u32::from_be_bytes([id[0], id[1], id[2], id[3]]));
+        self.ids.insert(id);
+    }
+    /// Every indexed address and V4 id inside `data` (each byte offset).
+    fn scan(&self, data: &[u8]) -> Named {
+        let mut out = Named::default();
+        if data.len() >= 20 && !self.pre20.is_empty() {
+            for i in 0..=data.len() - 20 {
+                if self.pre20.contains(&u32::from_be_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]])) {
+                    let a = Address::from_slice(&data[i..i + 20]);
+                    if self.addrs.contains_key(&a) {
+                        out.addrs.insert(a);
+                    }
+                }
+            }
+        }
+        if data.len() >= 32 && !self.pre32.is_empty() {
+            for i in 0..=data.len() - 32 {
+                if self.pre32.contains(&u32::from_be_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]])) {
+                    let id = B256::from_slice(&data[i..i + 32]);
+                    if self.ids.contains(&id) && !out.ids.contains(&id) {
+                        out.ids.push(id);
+                    }
+                }
+            }
+        }
+        out
+    }
+    fn role(&self, a: &Address) -> u8 {
+        self.addrs.get(a).copied().unwrap_or(0)
+    }
+    /// Coins found in `n` (non-zero).
+    fn coins<'a>(&'a self, n: &'a Named) -> impl Iterator<Item = &'a Address> + 'a {
+        n.addrs.iter().filter(move |a| self.role(a) & ROLE_COIN != 0)
+    }
+    /// Pairs (x < y) whose BOTH coins are in `n`.
+    fn pairs_found(&self, n: &Named) -> Vec<(Address, Address)> {
+        let mut out = Vec::new();
+        for x in self.coins(n) {
+            if let Some(ps) = self.partners.get(x) {
+                for y in ps {
+                    if x < y && n.addrs.contains(y) {
+                        out.push((*x, *y));
+                    }
+                }
+            }
+        }
+        out
+    }
 }
 
 impl PoolSet {
@@ -271,8 +381,53 @@ impl PoolSet {
             }
         }
         // A V4 PoolManager as a target = may touch our V4 pools.
-        s.route.names.extend(pms);
+        s.route.names.extend(pms.iter().copied());
+        // The fast name index: the same things the filter looks for.
+        for a in s.by_contract.keys() {
+            s.idx.add_addr(*a, ROLE_POOL);
+        }
+        for pm in &pms {
+            s.idx.add_addr(*pm, ROLE_PM);
+            s.idx.pms.insert(*pm);
+        }
+        for id in s.by_id.keys() {
+            s.idx.add_id(*id);
+        }
+        for c in s.by_coin.keys().chain(s.native_by_coin.keys()) {
+            s.idx.add_addr(*c, ROLE_COIN);
+        }
+        for (x, y) in s.by_pair.keys() {
+            s.idx.partners.entry(*x).or_default().push(*y);
+            s.idx.partners.entry(*y).or_default().push(*x);
+        }
         s
+    }
+
+    /// One pass over a transaction's data: what of ours it names.
+    pub fn scan(&self, data: &[u8]) -> Named {
+        self.idx.scan(data)
+    }
+
+    /// Does it name a V4 PoolManager of ours (target or data)?
+    fn names_pm(&self, to: Option<Address>, n: &Named) -> bool {
+        to.is_some_and(|t| self.idx.pms.contains(&t)) || n.addrs.iter().any(|a| self.idx.role(a) & ROLE_PM != 0)
+    }
+
+    /// Practice fixes: a failed transaction that names a V4 PoolManager and
+    /// nothing narrower: our V4 pools IN that PoolManager holding a coin it
+    /// names (before: every pool of ANY kind holding such a coin, i.e. all
+    /// WETH / USDG pools, so every route was skipped as unsure).
+    fn v4_sharing_named_coins(&self, to: Option<Address>, n: &Named) -> Vec<String> {
+        let pms: Vec<Address> = to.into_iter().chain(n.addrs.iter().copied()).filter(|a| self.idx.pms.contains(a)).collect();
+        let mut out: Vec<String> = Vec::new();
+        for c in self.idx.coins(n) {
+            for k in self.by_coin.get(c).into_iter().chain(self.native_by_coin.get(c)).flatten() {
+                if matches!(self.places.get(k), Some(Place::V4(pm, _)) if pms.contains(pm)) && !out.contains(k) {
+                    out.push(k.clone());
+                }
+            }
+        }
+        out
     }
 
     pub fn len(&self) -> usize {
@@ -284,7 +439,80 @@ impl PoolSet {
     }
 
     /// Our pools a transaction NAMES (target or data), without running it.
-    fn named(&self, to: Option<Address>, data: &[u8]) -> Vec<String> {
+    /// `n` = PoolSet::scan of its data (one pass, see NameIndex).
+    fn named(&self, to: Option<Address>, n: &Named) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let mut push = |k: &String| {
+            if !out.contains(k) {
+                out.push(k.clone());
+            }
+        };
+        if let Some(k) = to.and_then(|t| self.by_contract.get(&t)) {
+            push(k);
+        }
+        for a in &n.addrs {
+            if let Some(k) = self.by_contract.get(a) {
+                push(k);
+            }
+        }
+        for id in &n.ids {
+            if let Some(k) = self.by_id.get(id) {
+                push(k);
+            }
+        }
+        for p in self.idx.pairs_found(n) {
+            for k in self.by_pair.get(&p).into_iter().flatten() {
+                push(k);
+            }
+        }
+        out
+    }
+
+    /// Review M3: native-ETH pools a transaction may trade (it pays ETH and
+    /// names the pool's other coin).
+    fn named_native(&self, value: U256, n: &Named) -> Vec<String> {
+        if value.is_zero() || self.native_by_coin.is_empty() {
+            return Vec::new();
+        }
+        let mut out: Vec<String> = Vec::new();
+        for c in self.idx.coins(n) {
+            for k in self.native_by_coin.get(c).into_iter().flatten() {
+                if !out.contains(k) {
+                    out.push(k.clone());
+                }
+            }
+        }
+        out
+    }
+
+    /// Review H4: our pools holding ANY coin the data names (wider than
+    /// `named`: one coin is enough). Used only when a transaction we ran
+    /// failed and nothing narrower is known.
+    fn sharing_named_coins(&self, n: &Named) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for c in self.idx.coins(n) {
+            for k in self.by_coin.get(c).into_iter().flatten() {
+                if !out.contains(k) {
+                    out.push(k.clone());
+                }
+            }
+        }
+        out
+    }
+
+    /// Cheap filter, first part: could this transaction touch our pools?
+    /// Same answer as check/ordered.rs Route::named_by on `self.route`
+    /// (tested), from the one-pass scan.
+    fn may_touch(&self, to: Option<Address>, n: &Named) -> bool {
+        if to.is_some_and(|t| self.by_contract.contains_key(&t) || self.idx.pms.contains(&t)) {
+            return true;
+        }
+        n.addrs.iter().any(|a| self.idx.role(a) & (ROLE_POOL | ROLE_PM) != 0) || !n.ids.is_empty() || !self.idx.pairs_found(n).is_empty()
+    }
+
+    /// Our pools a transaction NAMES (target or data), without running it.
+    #[cfg(test)]
+    fn named_slow(&self, to: Option<Address>, data: &[u8]) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
         let has = |needle: &[u8]| !needle.is_empty() && data.len() >= needle.len() && data.windows(needle.len()).any(|w| w == needle);
         if let Some(t) = to {
@@ -316,7 +544,8 @@ impl PoolSet {
 
     /// Review M3: native-ETH pools a transaction may trade (it pays ETH and
     /// names the pool's other coin).
-    fn named_native(&self, value: U256, data: &[u8]) -> Vec<String> {
+    #[cfg(test)]
+    fn named_native_slow(&self, value: U256, data: &[u8]) -> Vec<String> {
         if value.is_zero() || self.native_by_coin.is_empty() {
             return Vec::new();
         }
@@ -337,7 +566,8 @@ impl PoolSet {
     /// Review H4: our pools holding ANY coin the data names (wider than
     /// `named`: one coin is enough). Used only when a transaction we ran
     /// failed and nothing narrower is known.
-    fn sharing_named_coins(&self, data: &[u8]) -> Vec<String> {
+    #[cfg(test)]
+    fn sharing_named_coins_slow(&self, data: &[u8]) -> Vec<String> {
         let has = |needle: &[u8]| data.len() >= needle.len() && data.windows(needle.len()).any(|w| w == needle);
         let mut out: Vec<String> = Vec::new();
         for (c, ks) in &self.by_coin {
@@ -353,7 +583,8 @@ impl PoolSet {
     }
 
     /// Cheap filter, first part: could this transaction touch our pools?
-    fn may_touch(&self, to: Option<Address>, data: &[u8]) -> bool {
+    #[cfg(test)]
+    fn may_touch_slow(&self, to: Option<Address>, data: &[u8]) -> bool {
         self.route.named_by(to, data)
     }
 
@@ -434,6 +665,9 @@ pub struct AheadTip {
     /// by any message since the confirmed version, plus copy 2's own not
     /// ready pools). Their values are forgotten here (reads are Missing).
     pub unsure_pools: Vec<String>,
+    /// The same as a set, built once per tip (the fast lane looks every
+    /// route up in it; it used to rebuild it on every tip).
+    pub unsure_set: Arc<HashSet<String>>,
     /// When this tip was built.
     pub built_at: Instant,
     /// Microseconds spent applying THIS message.
@@ -464,10 +698,26 @@ struct Entry {
     unsure_cum: HashSet<String>,
     /// Transactions skipped by the filter: (hash, target).
     skipped: Vec<(B256, Option<Address>)>,
+    /// Every transaction of the message and what we did with it (agreement
+    /// tells a filter miss from a run that did not move the pool).
+    fates: Vec<(B256, Fate)>,
     built_at: Instant,
     apply_us: u64,
     /// When the feed message arrived (see AheadTip.feed_at).
     feed_at: Instant,
+}
+
+/// What the prediction did with one transaction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Fate {
+    /// Not picked by the cheap filter.
+    Skipped,
+    /// Picked, but names only pools no route uses: not run (pools unsure).
+    OffRoute,
+    /// Ran exactly (it may or may not have moved our pools).
+    Ran,
+    /// Could not be run exactly (pools it may touch marked unsure).
+    Failed,
 }
 
 /// Why prediction stopped (no tip until a rebase passes it).
@@ -517,6 +767,25 @@ pub struct AheadStats {
     /// Review M3: transactions picked because they pay ETH and name a
     /// native-ETH pool's other coin.
     pub native_picks: u64,
+    /// Practice fixes (Oct 27): transactions not run because they name only
+    /// pools no scanner route uses (those pools marked unsure instead).
+    pub txs_off_route: u64,
+    /// Failed runs whose second "collect" run was skipped: its target has no
+    /// code in our copy, so that run could not read anything of ours.
+    pub probes_skipped: u64,
+    /// A failed transaction naming a V4 PoolManager and nothing narrower:
+    /// only V4 pools of that PoolManager sharing a named coin marked unsure.
+    pub v4_fallback: u64,
+    /// "missed" split by cause (from copy 2's reports: which transaction of
+    /// the block moved the pool): the filter skipped it / we ran it and our
+    /// run did not move the pool.
+    pub missed_filter: u64,
+    pub missed_ran: u64,
+    /// The confirmed block changed one of our pools but NO transaction of
+    /// that feed message did (copy 2 loading / re-reading a pool, or a
+    /// report filed under another block): not a prediction miss, so not
+    /// counted in disagree; shown on its own.
+    pub not_from_tx: u64,
     /// L2: apply_us samples seen (the ring below keeps the newest MAX_TIMES).
     pub time_n: u64,
     pub stopped: HashMap<&'static str, u64>,
@@ -545,6 +814,9 @@ impl AheadStats {
             "valueDiff": self.value_diff, "unsure": self.unsure, "unpredicted": self.unpredicted,
             "compared": self.compared, "msgsStopped": self.msgs_stopped, "overBudget": self.over_budget,
             "failedUnknown": self.failed_unknown, "assumedUnsure": self.assumed_unsure, "nativePicks": self.native_picks,
+            "txsOffRoute": self.txs_off_route, "probesSkipped": self.probes_skipped, "v4Fallback": self.v4_fallback,
+            "missedFilter": self.missed_filter, "missedRan": self.missed_ran, "notFromTx": self.not_from_tx,
+            "agreementPct": self.agreement_pct(),
             "stopped": self.stopped.iter().map(|(k, v)| (k.to_string(), json!(v))).collect::<serde_json::Map<String, Value>>(),
             "applyUs": crate::timing::pct_of(&mut t),
             "samples": self.samples,
@@ -559,10 +831,10 @@ impl AheadStats {
         let mut stops: Vec<String> = self.stopped.iter().map(|(k, v)| format!("{k}:{v}")).collect();
         stops.sort();
         format!(
-            "[arbsim] fastlane ahead (last hour): msgs {} applied {} late {} | txs run {} skipped {} failed {} (pools unsure {}, nothing found {}) filterMissed {} assumedUnsure {} nativePicks {} | apply us p50 {} p90 {} p99 {} max {} | rebases {} reapplied {} | agree {} disagree {} (missed {} phantom {} value {}) unsure {} unpredicted {} | msgs while stopped {} over budget {} | stopped [{}]",
-            self.msgs, self.applied, self.late_msgs, self.txs_run, self.txs_skipped, self.txs_failed, self.txs_marked, self.failed_unknown, self.filter_missed, self.assumed_unsure, self.native_picks,
+            "[arbsim] fastlane ahead (last hour): msgs {} applied {} late {} | txs run {} skipped {} off-route {} failed {} (pools unsure {}, nothing found {}, v4 only {}, probes skipped {}) filterMissed {} assumedUnsure {} nativePicks {} | apply us p50 {} p90 {} p99 {} max {} | rebases {} reapplied {} | agree {} disagree {} (missed {} [filter {} ran {}] phantom {} value {}) unsure {} not from a tx {} unpredicted {} | msgs while stopped {} over budget {} | stopped [{}]",
+            self.msgs, self.applied, self.late_msgs, self.txs_run, self.txs_skipped, self.txs_off_route, self.txs_failed, self.txs_marked, self.failed_unknown, self.v4_fallback, self.probes_skipped, self.filter_missed, self.assumed_unsure, self.native_picks,
             g("p50"), g("p90"), g("p99"), g("max"), self.rebases, self.reapplied,
-            self.agree, self.disagree, self.missed, self.phantom, self.value_diff, self.unsure, self.unpredicted, self.msgs_stopped, self.over_budget, stops.join(" "),
+            self.agree, self.disagree, self.missed, self.missed_filter, self.missed_ran, self.phantom, self.value_diff, self.unsure, self.not_from_tx, self.unpredicted, self.msgs_stopped, self.over_budget, stops.join(" "),
         )
     }
 
@@ -661,6 +933,10 @@ pub struct Ahead {
     /// H-1: the message that ran past the per-message budget. Prediction
     /// stays stopped until copy 2 has confirmed it (never re-tried).
     over_budget_seq: Option<u64>,
+    /// Practice fixes (FASTLANE_AHEAD_ROUTES_ONLY): every pool key some
+    /// scanner route uses (pools + lender), from the bot's candidate table.
+    /// None = not known yet: every picked transaction runs.
+    route_pools: Option<Arc<HashSet<String>>>,
     pub hour: AheadStats,
     pub total: AheadStats,
 }
@@ -678,6 +954,7 @@ impl Ahead {
             tip: None,
             arrived: BTreeMap::new(),
             over_budget_seq: None,
+            route_pools: None,
             hour: AheadStats::default(),
             total: AheadStats::default(),
         }
@@ -690,6 +967,12 @@ impl Ahead {
 
     pub fn pools(&self) -> &PoolSet {
         &self.pools
+    }
+
+    /// The pools the scanner's routes use (FASTLANE_AHEAD_ROUTES_ONLY);
+    /// None = unknown (everything picked runs).
+    pub fn set_route_pools(&mut self, p: Option<Arc<HashSet<String>>>) {
+        self.route_pools = p;
     }
 
     /// The predicted tip: state after the NEWEST feed message held, or None
@@ -836,7 +1119,6 @@ impl Ahead {
             self.count(|s| s.unpredicted += 1);
             return;
         };
-        let _ = moved_by_tx;
         // L1 (review): only a version that is exactly ONE block after the
         // previous confirmed one is compared. A jump of several blocks
         // (copy 2 confirmed N-2..N at once and published only N) has a diff
@@ -864,7 +1146,16 @@ impl Ahead {
             let same = same_state(*place, &e.snap, &c.snap);
             let kind = match (same, conf_moved.contains(k), e.changed_cum.contains(k)) {
                 (true, _, _) => "agree",
-                (false, true, false) => "missed",
+                (false, true, false) => {
+                    // Practice fixes: WHY did we miss it? Copy 2's reports
+                    // say which transaction moved it; find it in this message.
+                    let by = e.fates.iter().find(|(h, _)| moved_by_tx(h).is_some_and(|p| p.iter().any(|x| x.eq_ignore_ascii_case(k))));
+                    match by {
+                        None => "notFromTx",
+                        Some((_, Fate::Skipped)) => "missedFilter",
+                        Some(_) => "missedRan",
+                    }
+                }
                 (false, false, true) => "phantom",
                 (false, _, _) => "value",
             };
@@ -875,11 +1166,21 @@ impl Ahead {
             match kind {
                 "agree" => self.count(|s| s.agree += 1),
                 "unsure" => self.count(|s| s.unsure += 1),
+                // Not a prediction miss (no transaction of this message moved
+                // it): counted on its own, never as a disagreement.
+                "notFromTx" => self.count(|s| s.not_from_tx += 1),
                 _ => {
                     self.count(|s| {
                         s.disagree += 1;
                         match kind {
-                            "missed" => s.missed += 1,
+                            "missedFilter" => {
+                                s.missed += 1;
+                                s.missed_filter += 1;
+                            }
+                            "missedRan" => {
+                                s.missed += 1;
+                                s.missed_ran += 1;
+                            }
                             "phantom" => s.phantom += 1,
                             _ => s.value_diff += 1,
                         }
@@ -955,6 +1256,7 @@ impl Ahead {
         let mut unsure: Vec<String> = e.unsure_cum.iter().chain(self.pools.not_ready.iter()).cloned().collect();
         unsure.sort();
         unsure.dedup();
+        let unsure_set = Arc::new(unsure.iter().cloned().collect());
         AheadTip {
             seq: e.seq,
             block: e.seq + self.cfg.l2_offset,
@@ -963,6 +1265,7 @@ impl Ahead {
             ctx: e.ctx.clone(),
             changed_pools: e.changed.clone(),
             unsure_pools: unsure,
+            unsure_set,
             built_at: e.built_at,
             apply_us: e.apply_us,
             feed_at: e.feed_at,
@@ -1009,14 +1312,32 @@ impl Ahead {
         let assume = Assume { sender_funds: true, recent_fill: true, skip: None, record_hashes: true };
         let mut changed: Vec<String> = Vec::new();
         let mut skipped: Vec<(B256, Option<Address>)> = Vec::new();
+        let mut fates: Vec<(B256, Fate)> = Vec::with_capacity(txs.len());
+        // Marks pools unsure in this view: their values forgotten (reads
+        // Missing), listed changed (the scanner looks again) and unsure.
+        let mark_unsure = |ov: &mut Overlay, changed: &mut Vec<String>, changed_cum: &mut HashSet<String>, unsure_cum: &mut HashSet<String>, keys: &[String]| {
+            for k in keys {
+                if let Some(p) = pools.places.get(k) {
+                    forget_place(ov, *p);
+                }
+                if !changed.contains(k) {
+                    changed.push(k.clone());
+                }
+                changed_cum.insert(k.clone());
+                unsure_cum.insert(k.clone());
+            }
+        };
         for (i, t) in txs.iter().enumerate() {
             // H-1: per-message time budget, looked at before every
             // transaction after the first (one run is never cut in half).
             if i > 0 && t0.elapsed().as_micros() as u64 > self.cfg.msg_budget_us {
                 return Err("msg_budget");
             }
-            let native = if self.cfg.run_all { Vec::new() } else { pools.named_native(t.value, &t.data) };
-            let plain = self.cfg.run_all || pools.may_touch(t.to, &t.data) || t.to.is_some_and(|a| self.touchers.contains_key(&a));
+            // One pass over the data finds everything of ours it names.
+            let named_now = if self.cfg.run_all { Named::default() } else { pools.scan(&t.data) };
+            let native = if self.cfg.run_all { Vec::new() } else { pools.named_native(t.value, &named_now) };
+            let toucher = t.to.is_some_and(|a| self.touchers.contains_key(&a));
+            let plain = self.cfg.run_all || pools.may_touch(t.to, &named_now) || toucher;
             if !plain && !native.is_empty() {
                 self.count(|s| s.native_picks += 1);
             }
@@ -1024,12 +1345,35 @@ impl Ahead {
             if !pick {
                 self.count(|s| s.txs_skipped += 1);
                 skipped.push((t.hash, t.to));
+                fates.push((t.hash, Fate::Skipped));
                 continue;
+            }
+            // FASTLANE_AHEAD_ROUTES_ONLY: picked only for naming pools no
+            // route uses (not a learned router, no V4 PoolManager): not run,
+            // those pools marked unsure (the scanner never reads them).
+            if self.cfg.routes_only && !self.cfg.run_all && !toucher {
+                if let Some(rp) = &self.route_pools {
+                    if !pools.names_pm(t.to, &named_now) {
+                        let mut named = pools.named(t.to, &named_now);
+                        for k in &native {
+                            if !named.contains(k) {
+                                named.push(k.clone());
+                            }
+                        }
+                        if !named.is_empty() && named.iter().all(|k| !rp.contains(k)) {
+                            self.count(|s| s.txs_off_route += 1);
+                            mark_unsure(&mut ov, &mut changed, &mut changed_cum, &mut unsure_cum, &named);
+                            fates.push((t.hash, Fate::OffRoute));
+                            continue;
+                        }
+                    }
+                }
             }
             self.count(|s| s.txs_run += 1);
             let plan = OrderedPlan { msgs: vec![PlanMsg { seq: m.seq, ctx: ctx.clone(), txs: vec![t.clone()] }], trigger: t.hash, call_ctx: ctx.clone() };
             match run_ordered_keep(&ov, &plan, base.prov.as_ref(), &assume) {
                 Ok((out, kept)) => {
+                    fates.push((t.hash, Fate::Ran));
                     if !out.assumed.labels().is_empty() {
                         self.count(|s| s.assumed += 1);
                     }
@@ -1067,11 +1411,20 @@ impl Ahead {
                     }
                 }
                 Err(_) => {
+                    fates.push((t.hash, Fate::Failed));
                     self.count(|s| s.txs_failed += 1);
                     // Which of our pools might it touch? What it reads in a
                     // collect run + what it names. Those become unsure.
-                    let mut hit = probe_touched(&ov, &ctx, t, &pools);
-                    for k in pools.named(t.to, &t.data).into_iter().chain(native.iter().cloned()) {
+                    // Practice fixes: the collect run is skipped when the
+                    // target has no code in our copy (it could only read
+                    // zero there and stop: nothing of ours, same answer).
+                    let mut hit = if target_has_no_code(&ov, t.to) {
+                        self.count(|s| s.probes_skipped += 1);
+                        Vec::new()
+                    } else {
+                        probe_touched(&ov, &ctx, t, &pools)
+                    };
+                    for k in pools.named(t.to, &named_now).into_iter().chain(native.iter().cloned()) {
                         if !hit.contains(&k) {
                             hit.push(k);
                         }
@@ -1080,33 +1433,32 @@ impl Ahead {
                         // Review H4: it failed and nothing tells us what it
                         // would touch (router code or state missing). Never
                         // assume "nothing": the pools its target moved
-                        // before, else our pools sharing a coin it names;
-                        // if neither is known, stop until confirmed.
+                        // before; else (practice fixes) when it names a V4
+                        // PoolManager, that PoolManager's pools of ours
+                        // sharing a coin it names (before: every pool of any
+                        // kind sharing a coin, i.e. all WETH / USDG pools);
+                        // else our pools sharing a coin it names; if none of
+                        // that is known, stop until confirmed.
                         self.count(|s| s.failed_unknown += 1);
                         hit = t.to.and_then(|a| self.touchers.get(&a)).map(|x| x.1.clone()).unwrap_or_default();
+                        if hit.is_empty() && pools.names_pm(t.to, &named_now) {
+                            hit = pools.v4_sharing_named_coins(t.to, &named_now);
+                            if !hit.is_empty() {
+                                self.count(|s| s.v4_fallback += 1);
+                            }
+                        }
                         if hit.is_empty() {
-                            hit = pools.sharing_named_coins(&t.data);
+                            hit = pools.sharing_named_coins(&named_now);
                         }
                         if hit.is_empty() {
                             return Err("failed_tx_unknown_effect");
                         }
                     }
-                    if !hit.is_empty() {
-                        self.count(|s| s.txs_marked += 1);
-                        if let Some(a) = t.to {
-                            self.learn_toucher(a, &hit);
-                        }
+                    self.count(|s| s.txs_marked += 1);
+                    if let Some(a) = t.to {
+                        self.learn_toucher(a, &hit);
                     }
-                    for k in hit {
-                        if let Some(p) = pools.places.get(&k) {
-                            forget_place(&mut ov, *p);
-                        }
-                        if !changed.contains(&k) {
-                            changed.push(k.clone());
-                        }
-                        changed_cum.insert(k.clone());
-                        unsure_cum.insert(k);
-                    }
+                    mark_unsure(&mut ov, &mut changed, &mut changed_cum, &mut unsure_cum, &hit);
                 }
             }
         }
@@ -1121,6 +1473,7 @@ impl Ahead {
             changed_cum,
             unsure_cum,
             skipped,
+            fates,
             built_at: Instant::now(),
             apply_us: t0.elapsed().as_micros() as u64,
             feed_at: self.arrived.get(&m.seq).copied().unwrap_or(t0),
@@ -1163,6 +1516,17 @@ fn same_state(p: Place, pred: &Snapshot, conf: &Snapshot) -> bool {
                 Lookup::Missing => true,
             }
         }),
+    }
+}
+
+/// No code at the target in our copy (missing, empty or a plain account):
+/// a collect run would read zero there and stop, touching nothing of ours.
+/// A contract creation (no target) runs its own code: never skipped.
+fn target_has_no_code(view: &dyn StateRead, to: Option<Address>) -> bool {
+    let Some(a) = to else { return false };
+    match view.account(a) {
+        Lookup::Missing | Lookup::Known(None) => true,
+        Lookup::Known(Some(info)) => info.code_hash == KECCAK_EMPTY || info.code_hash == B256::ZERO,
     }
 }
 
@@ -1333,6 +1697,15 @@ fn run_loop(c2: super::intake::Copy2Handle, cfg: AheadCfg, rx: Receiver<Ev>) {
     let mut head: Option<Arc<crate::state::mirror::Version>> = None;
     let mut hour_start = Instant::now();
     let mut last_status = Instant::now();
+    // Practice fixes: copy 2's registry changes on EVERY applied pool report
+    // (its counters live there), so the pool list was copied (~1,800 keys)
+    // on every wake-up. Now at most once a second. (Safe: a pool copy 2
+    // marks unsure in between still gets "unknown" from every check run
+    // with copy 2's rules, fastlane/c2runner.rs.)
+    let mut pools_at: Option<Instant> = None;
+    // The route pools (FASTLANE_AHEAD_ROUTES_ONLY), rebuilt when the bot's
+    // candidate table changes (about once a second at most).
+    let mut table_gen: Option<u64> = None;
     loop {
         // Review M2: no idle polling. Woken by a feed message or a published
         // version (confirmed_hook); the 1 s timeout only drives the status
@@ -1344,13 +1717,19 @@ fn run_loop(c2: super::intake::Copy2Handle, cfg: AheadCfg, rx: Receiver<Ev>) {
         // Pools: looked at only when copy 2's registry changed, and the
         // lookup tables rebuilt only when the pool list / readiness changed.
         let g = c2.c2.reg.gen();
-        if g != reg_gen {
+        if g != reg_gen && pools_at.is_none_or(|t| t.elapsed() >= Duration::from_secs(1)) {
             reg_gen = g;
+            pools_at = Some(Instant::now());
             let now = pool_list(&c2);
             if !same_list(&now, &list) || a.pools().is_empty() {
                 list = now;
                 a.set_pools(Arc::new(PoolSet::build(&list.0, list.1.iter().cloned().collect())));
             }
+        }
+        let tg = crate::check::entry::table_gen();
+        if tg != table_gen {
+            table_gen = tg;
+            a.set_route_pools(crate::check::entry::route_keys().map(|(_, k)| Arc::new(k)).filter(|k| !k.is_empty()));
         }
         // Confirmed first (a new version may already cover a feed message).
         // Every version published since the last one, in order (review L1:
