@@ -613,7 +613,8 @@ impl Ahead {
                 return;
             }
         }
-        let first_time = self.base.as_ref().is_none_or(|b| c.seq > b.seq);
+        // (The very first version has nothing to compare with.)
+        let first_time = self.base.as_ref().is_some_and(|b| c.seq > b.seq);
         if first_time {
             self.agreement(&c, moved_by_tx);
         }
