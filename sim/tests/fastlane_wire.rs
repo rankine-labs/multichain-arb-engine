@@ -161,6 +161,9 @@ fn an_oversize_message_no_longer_closes_the_socket_and_a_table_in_parts_arrives_
     let text = std::fs::read_to_string(fixture_path("fastlane_bot_table_parts")).expect("fixture (src/test/fastlaneTableWire.test.ts writes it)");
     let parts: Vec<Value> = serde_json::from_str(&text).unwrap();
     assert!(parts.len() > 1, "the fixture is a split table");
+    // (the counters are process-wide: compare with what they were before)
+    let before = ask(json!({"id": 9, "type": "status"}))["trigTable"].clone();
+    let n = |v: &Value, k: &str| v[k].as_u64().unwrap_or(0);
     let mut want_rids = HashSet::new();
     let mut rows = 0;
     for (i, p) in parts.iter().enumerate() {
@@ -176,7 +179,7 @@ fn an_oversize_message_no_longer_closes_the_socket_and_a_table_in_parts_arrives_
     let st = ask(json!({"id": 99, "type": "status"}));
     let t = &st["trigTable"];
     assert_eq!((t["held"].clone(), t["rows"].clone(), t["usableRows"].clone(), t["factRows"].clone()), (json!(true), json!(rows), json!(rows), json!(rows)), "{t}");
-    assert_eq!((t["full"].clone(), t["partial"].clone(), t["refused"].clone()), (json!(1), json!(parts.len() - 1), json!(0)), "{t}");
+    assert_eq!((n(t, "full") - n(&before, "full"), n(t, "partial") - n(&before, "partial"), n(t, "refused") - n(&before, "refused")), (1, parts.len() as u64 - 1, 0), "{t}");
     // The scanner's live route source (what fastlane/lane.rs uses).
     let mut sc = Scanner::new(ScanConfig::default(), Box::new(TableSource::global()), Box::new(PlainRunner));
     assert_eq!(sc.sync_now(), 0, "no row refused");

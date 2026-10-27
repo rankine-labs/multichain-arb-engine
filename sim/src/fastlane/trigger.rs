@@ -636,6 +636,7 @@ pub fn start(ctx: Arc<Ctx>) -> bool {
         "[fastlane] trigger ON: fire-first decided in Rust ({} candidates, {} pools max, confidence >= {}, {} txs / {} ms per message); fires through the fast lane's safety + gun",
         cfg.max_candidates, cfg.max_pools, cfg.min_conf, cfg.max_txs, cfg.budget_us / 1000
     );
+    eprintln!("[fastlane] trigger: NOT in Rust (Node keeps them): 3/4/5-pool loops (trigEntryLoops.ts, coin tax test), routes newer than the bot's last table refresh (~1 s), hot-target extra places, the later same-block agreement re-check");
     std::thread::Builder::new()
         .name("arbsim-fl-trigger".into())
         .spawn(move || {

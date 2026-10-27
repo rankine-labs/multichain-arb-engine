@@ -92,6 +92,9 @@ pub fn trig_replay(cap: &CapFile, table: Option<&Table>, cfg: &TrigCfg, opts: &T
     let mut prov: Arc<dyn Provenance + Send + Sync> = Arc::new(ProvSets::all_exact());
     let mut index = MovedIndex::build(&[]);
     let mut pools_n = 0usize;
+    // The scanner's route pools, newest seen in the capture (None = arbsim held
+    // NO candidate table then: the zero-routes symptom).
+    let mut route_pools: Option<usize> = None;
     // The newest confirmed version received so far (seq, ctx, snapshot).
     let mut copy: Option<(u64, BlockCtx, Arc<Snapshot>)> = None;
     // Feed messages received so far, by sequence number (bounded).
@@ -120,6 +123,7 @@ pub fn trig_replay(cap: &CapFile, table: Option<&Table>, cfg: &TrigCfg, opts: &T
                 index = MovedIndex::build(&fps);
             }
             CapEv::Prov(p) => prov = p.clone(),
+            CapEv::Routes(r) => route_pools = r.as_ref().map(|v| v.len()),
             CapEv::Confirmed { seq, ctx, snap } => {
                 let Some(ctx) = ctx.clone() else { continue };
                 copy = Some((*seq, ctx.clone(), snap.clone()));
@@ -268,7 +272,7 @@ pub fn trig_replay(cap: &CapFile, table: Option<&Table>, cfg: &TrigCfg, opts: &T
     let lag_over = |n: u64| lag_blocks.iter().filter(|x| **x > n).count() as u64;
     let lag_hist = json!({"0 (copy already had it)": lag_ahead, "1": lag_blocks.iter().filter(|x| **x == 1).count(), "2": lag_blocks.iter().filter(|x| **x == 2).count(), "3": lag_blocks.iter().filter(|x| **x == 3).count(), "more than 3": lag_over(3)});
     Ok(json!({
-        "capture": {"complete": cap.complete, "cut": cap.cut, "events": cap.events.len(), "pools": pools_n, "l2Offset": l2_offset, "table": table.map(|t| json!({"pools": t.pools.len(), "rows": t.pools.values().map(|r| r.len()).sum::<usize>()}))},
+        "capture": {"complete": cap.complete, "cut": cap.cut, "events": cap.events.len(), "pools": pools_n, "routePools": route_pools, "l2Offset": l2_offset, "table": table.map(|t| json!({"pools": t.pools.len(), "rows": t.pools.values().map(|r| r.len()).sum::<usize>()}))},
         "copyLag": {"blocksBehindAtArrival": pct(&mut lag_blocks.clone()), "histogram": lag_hist, "note": "how far copy 2's newest confirmed version was behind each feed message when it arrived (blocks)"},
         "coverage": {"msgs": msgs, "msgsBeforeAnyCopy": msgs_no_copy, "txs": txs, "skipped": skipped, "repeats": repeats, "asked": asked,
             "discovery": {"movedOurPools": moved, "noPools": no_pools, "tooManyPools": too_many, "alreadyInCopy": in_copy, "unknown": disc_unknown}},
@@ -327,6 +331,7 @@ pub fn print_report(r: &Value) -> String {
     let mut o = String::new();
     let c = &r["capture"];
     o += &format!("FIRE-FIRST REPLAY (offline, no future information): {} events, {} pools followed, table {}\n", c["events"], c["pools"], if c["table"].is_null() { "NONE (discovery only; capture with FASTLANE_CAPTURE_FILE writes <file>.table.json)".to_string() } else { c["table"].to_string() });
+    o += &format!("ROUTE POOLS arbsim held (newest seen in the capture): {} (null = no candidate table had arrived: the zero-routes symptom)\n", c["routePools"]);
     o += &format!("COPY LAG at each feed message (blocks behind): {}  histogram {}\n", r["copyLag"]["blocksBehindAtArrival"], r["copyLag"]["histogram"]);
     let v = &r["coverage"];
     o += &format!("COVERAGE: feed msgs {} (before any copy {}), txs {}, skipped {}, repeats {}, asked {}\n", v["msgs"], v["msgsBeforeAnyCopy"], v["txs"], v["skipped"], v["repeats"], v["asked"]);
