@@ -203,9 +203,6 @@ fn bench_apply_on_real_v3_v4_pools_test_numbers_only() {
     assert_eq!(me, a.me, "anvil account #0 is our test key");
     let other = key_address(&KEY1);
     let m = setup(&a);
-    if std::env::var("AHEAD_DEBUG").is_ok() {
-        eprintln!("[bench] usd {} weth {} trader {} v4trader {} v3 {} pm {}", m.usd, m.weth, m.trader, m.v4trader, m.v3, m.pm);
-    }
     let n_msgs: usize = std::env::var("FASTLANE_BENCH_MSGS").ok().and_then(|v| v.parse().ok()).filter(|n| (1..=30).contains(n)).unwrap_or(24);
     let mut rng = Rng::new(11);
     // The rival bot: a contract our copy doesn't know (never in our copy).
@@ -377,9 +374,6 @@ fn bench_apply_on_real_v3_v4_pools_test_numbers_only() {
         let bm = Arc::new(BinMsg::from_wire(&wm, true));
         for t in &bm.txs {
             let _ = t.decoded(); // the feed store's thread does this live
-        }
-        if std::env::var("AHEAD_DEBUG").is_ok() {
-            eprintln!("[bench] message {i} (seq {seq})");
         }
         ah.on_feed_message(bm);
         match ah.tip() {

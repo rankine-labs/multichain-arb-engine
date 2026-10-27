@@ -71,6 +71,36 @@
 //   practice line can show unsure / unpredicted / stopped shares next to
 //   the agreement %.
 //
+//   PRACTICE FIXES (Oct 27, after the first 30 live minutes: apply p90 17 ms,
+//   70% of messages stopped over budget, agreement 0%, scanner 0 routes):
+//     1. SPEED: the cheap filter looked for each of ~1,800 pools (and every
+//        coin pair / V4 id) separately across a transaction's whole data:
+//        millions of byte compares per transaction. Now ONE pass over the
+//        data with an index (NameIndex), same answers (tested against the
+//        old search). Test bench on real V3 + V4 pool code (tests/
+//        fastlane_ahead_bench_anvil.rs): p90 ~38 ms -> under 1 ms.
+//     2. A failed run's second "collect" run is skipped when the target has
+//        no code in our copy (it could read nothing of ours).
+//     3. UNSURE NARROWED (it hid every route from the scanner):
+//          - a failed run: pools named only by their coin PAIR (every
+//            exchange's pool of that pair) are marked unsure only for pairs
+//            no pool it was found to use already stands for (before: one
+//            failed swap naming WETH and USDG made every WETH / USDG pool
+//            unsure: both sides of every such route),
+//          - a failed transaction naming a V4 PoolManager and nothing
+//            narrower marks only that PoolManager's pools sharing a named
+//            coin (before: every pool of any kind sharing a coin),
+//          - FASTLANE_AHEAD_TRUST_SENDER_FUNDS now defaults to ON in practice
+//            mode (nothing is sent there; with it off nearly every swap's
+//            pools were unsure). Live: off unless set.
+//     4. FASTLANE_AHEAD_ROUTES_ONLY [on]: a transaction naming only pools no
+//        scanner route uses is not run (those pools marked unsure).
+//     5. AGREEMENT, honest: a confirmed change NO transaction of the message
+//        made (copy 2 loading / re-reading a pool) is "notFromTx", not a
+//        miss; misses are split "missedFilter" (skipped by the filter) /
+//        "missedRan" (we ran it, our run did not move the pool), with the
+//        transaction in the samples.
+//
 // API (scanner and integration):
 //   Ahead::on_feed_message(Arc<BinMsg>)            a new feed message
 //   Ahead::on_confirmed(Confirmed, moved_by_tx)     copy 2 published a version
@@ -229,6 +259,8 @@ pub struct PoolSet {
     by_pair: HashMap<(Address, Address), Vec<String>>,
     /// Coin -> keys of our pools holding it (H4: "pools sharing a named coin").
     by_coin: HashMap<Address, Vec<String>>,
+    /// Key -> its coin pair (sorted; only pools with two non-zero coins).
+    pair_of: HashMap<String, (Address, Address)>,
     /// Review M3: native-ETH pools (one coin is address zero, which can't be
     /// looked for in call data): the OTHER coin -> keys. A transaction that
     /// pays ETH (value > 0) and names that coin may trade such a pool.
@@ -372,6 +404,7 @@ impl PoolSet {
             }
             if !t0.is_zero() && !t1.is_zero() {
                 let k = if t0 < t1 { (*t0, *t1) } else { (*t1, *t0) };
+                s.pair_of.insert(p.key.clone(), k);
                 let v = s.by_pair.entry(k).or_default();
                 if !v.contains(&p.key) {
                     v.push(p.key.clone());
@@ -479,8 +512,18 @@ impl PoolSet {
     /// Our pools whose BOTH coins the data names (every exchange's pool of
     /// that pair: a router path names coins, not pools).
     fn named_by_pair(&self, n: &Named) -> Vec<String> {
+        self.named_by_pair_except(n, &[])
+    }
+
+    /// `named_by_pair`, leaving out the pairs of the pools in `known` (a
+    /// failed run already found the pool it trades for that pair).
+    fn named_by_pair_except(&self, n: &Named, known: &[String]) -> Vec<String> {
+        let skip: Vec<(Address, Address)> = known.iter().filter_map(|k| self.pair_of.get(k).copied()).collect();
         let mut out: Vec<String> = Vec::new();
         for p in self.idx.pairs_found(n) {
+            if skip.contains(&p) {
+                continue;
+            }
             for k in self.by_pair.get(&p).into_iter().flatten() {
                 if !out.contains(k) {
                     out.push(k.clone());
@@ -803,6 +846,9 @@ pub struct AheadStats {
     /// run did not move the pool.
     pub missed_filter: u64,
     pub missed_ran: u64,
+    /// ... / it was not run because it named only off-route pools
+    /// (FASTLANE_AHEAD_ROUTES_ONLY) yet moved this one.
+    pub missed_off_route: u64,
     /// The confirmed block changed one of our pools but NO transaction of
     /// that feed message did (copy 2 loading / re-reading a pool, or a
     /// report filed under another block): not a prediction miss, so not
@@ -844,7 +890,7 @@ impl AheadStats {
             "compared": self.compared, "msgsStopped": self.msgs_stopped, "overBudget": self.over_budget,
             "failedUnknown": self.failed_unknown, "assumedUnsure": self.assumed_unsure, "nativePicks": self.native_picks,
             "txsOffRoute": self.txs_off_route, "probesSkipped": self.probes_skipped, "v4Fallback": self.v4_fallback,
-            "missedFilter": self.missed_filter, "missedRan": self.missed_ran, "notFromTx": self.not_from_tx,
+            "missedFilter": self.missed_filter, "missedRan": self.missed_ran, "missedOffRoute": self.missed_off_route, "notFromTx": self.not_from_tx,
             "agreementPct": self.agreement_pct(),
             "stopped": self.stopped.iter().map(|(k, v)| (k.to_string(), json!(v))).collect::<serde_json::Map<String, Value>>(),
             "applyUs": if times { crate::timing::pct_of(&mut t) } else { Value::Null },
@@ -860,10 +906,10 @@ impl AheadStats {
         let mut stops: Vec<String> = self.stopped.iter().map(|(k, v)| format!("{k}:{v}")).collect();
         stops.sort();
         format!(
-            "[arbsim] fastlane ahead (last hour): msgs {} applied {} late {} | txs run {} skipped {} off-route {} failed {} (pools unsure {}, nothing found {}, v4 only {}, probes skipped {}) filterMissed {} assumedUnsure {} nativePicks {} | apply us p50 {} p90 {} p99 {} max {} | rebases {} reapplied {} | agree {} disagree {} (missed {} [filter {} ran {}] phantom {} value {}) unsure {} not from a tx {} unpredicted {} | msgs while stopped {} over budget {} | stopped [{}]",
+            "[arbsim] fastlane ahead (last hour): msgs {} applied {} late {} | txs run {} skipped {} off-route {} failed {} (pools unsure {}, nothing found {}, v4 only {}, probes skipped {}) filterMissed {} assumedUnsure {} nativePicks {} | apply us p50 {} p90 {} p99 {} max {} | rebases {} reapplied {} | agree {} disagree {} (missed {} [filter {} ran {} off-route {}] phantom {} value {}) unsure {} not from a tx {} unpredicted {} | msgs while stopped {} over budget {} | stopped [{}]",
             self.msgs, self.applied, self.late_msgs, self.txs_run, self.txs_skipped, self.txs_off_route, self.txs_failed, self.txs_marked, self.failed_unknown, self.v4_fallback, self.probes_skipped, self.filter_missed, self.assumed_unsure, self.native_picks,
             g("p50"), g("p90"), g("p99"), g("max"), self.rebases, self.reapplied,
-            self.agree, self.disagree, self.missed, self.missed_filter, self.missed_ran, self.phantom, self.value_diff, self.unsure, self.not_from_tx, self.unpredicted, self.msgs_stopped, self.over_budget, stops.join(" "),
+            self.agree, self.disagree, self.missed, self.missed_filter, self.missed_ran, self.missed_off_route, self.phantom, self.value_diff, self.unsure, self.not_from_tx, self.unpredicted, self.msgs_stopped, self.over_budget, stops.join(" "),
         )
     }
 
@@ -1185,6 +1231,7 @@ impl Ahead {
                     match by {
                         None => "notFromTx",
                         Some((_, Fate::Skipped)) => "missedFilter",
+                        Some((_, Fate::OffRoute)) => "missedOffRoute",
                         Some(_) => "missedRan",
                     }
                 }
@@ -1212,6 +1259,10 @@ impl Ahead {
                             "missedRan" => {
                                 s.missed += 1;
                                 s.missed_ran += 1;
+                            }
+                            "missedOffRoute" => {
+                                s.missed += 1;
+                                s.missed_off_route += 1;
                             }
                             "phantom" => s.phantom += 1,
                             _ => s.value_diff += 1,
@@ -1466,16 +1517,18 @@ impl Ahead {
                         }
                     }
                     // Practice fixes: pools named only by their coin PAIR
-                    // (every exchange's pool of that pair) are added only when
-                    // nothing narrower is known. Before, they were always
-                    // added: one failed swap naming WETH and USDG made every
-                    // WETH / USDG pool unsure, i.e. BOTH sides of every
-                    // WETH / USDG route, and each later swap on those pools
-                    // then failed too (their values forgotten) until copy 2
-                    // confirmed the block. The collect run above follows the
-                    // transaction's own path (it reads the pools it uses).
-                    if hit.is_empty() {
-                        hit = pools.named_by_pair(&named_now);
+                    // (every exchange's pool of that pair) are added only for
+                    // pairs no pool found above already stands for. Before,
+                    // they were always added: one failed swap naming WETH and
+                    // USDG made every WETH / USDG pool unsure, i.e. BOTH
+                    // sides of every WETH / USDG route, and each later swap
+                    // on those pools then failed too (their values forgotten)
+                    // until copy 2 confirmed the block. A multi-hop path's
+                    // OTHER pairs (B/C after A/B) are still all added.
+                    for k in pools.named_by_pair_except(&named_now, &hit) {
+                        if !hit.contains(&k) {
+                            hit.push(k);
+                        }
                     }
                     if hit.is_empty() {
                         // Review H4: it failed and nothing tells us what it
@@ -1980,6 +2033,28 @@ mod tests {
         let mut wide = set.sharing_named_coins(&n);
         wide.sort();
         assert_eq!(wide.len(), 3, "the old fallback: every USDG pool of any kind ({wide:?})");
+    }
+
+    /// Practice fixes: a failed run that was found to trade pool P1 (pair
+    /// A/B) no longer marks P1's sister pools of A/B (other exchanges), but
+    /// a path's OTHER pairs named in the data (B/C) still count.
+    #[test]
+    fn pair_named_pools_skip_pairs_already_found() {
+        let (ca, cb, cc) = (Address::from([0x0a; 20]), Address::from([0x0b; 20]), Address::from([0x0c; 20]));
+        let fp = |b: u8| {
+            let a = Address::from([b; 20]);
+            FollowedPool { key: format!("{a:#x}"), address: a, v4_id: None }
+        };
+        let set = PoolSet::build(&[(fp(1), ca, cb), (fp(2), cb, ca), (fp(3), cb, cc)], HashSet::new());
+        let mut data = Vec::new();
+        for c in [ca, cb, cc] {
+            data.extend_from_slice(&[0u8; 12]);
+            data.extend_from_slice(c.as_slice());
+        }
+        let n = set.scan(&data);
+        let k = |b: u8| format!("{:#x}", Address::from([b; 20]));
+        assert_eq!(sorted(set.named_by_pair(&n)), sorted(vec![k(1), k(2), k(3)]), "old rule: every pool of every named pair");
+        assert_eq!(set.named_by_pair_except(&n, &[k(1)]), vec![k(3)], "P1 found: its sister P2 is left out, B/C still counts");
     }
 
     #[test]

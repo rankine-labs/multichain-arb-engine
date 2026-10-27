@@ -127,6 +127,11 @@ async function main() {
   assert(rows.every((r) => r.f && r.f.px > 0 && Number.isInteger(r.f.d) && r.f.g > 0), 'FASTLANE=practice: every row carries the scanner\'s facts (price, decimals, gas)');
   assert(rows.filter((r) => r.f.lp === 500).length === 4 && rows.filter((r) => r.c.route.includes(LENDER)).length === 4, 'flash routes: loan fee and the lender key');
 
+  // CPU (task 5): with nothing changed, the next refresh sends nothing
+  // (the facts don't make the table go out again every second).
+  await A.te.refreshTable();
+  assert(A.tables.length === 1, 'nothing changed: no table message re-sent with FASTLANE=practice');
+
   // FASTLANE off: exactly the old table (no facts).
   const B = entryWith({ ...env, FASTLANE: 'off' });
   await B.te.refreshTable();
