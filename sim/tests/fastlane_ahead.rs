@@ -438,3 +438,128 @@ fn bench_apply_us_test_numbers_only() {
     eprintln!("[test numbers] apply us per message (10 txs, 2 ours): {}", j["applyUs"]);
     assert!(j["applyUs"]["n"].as_u64().unwrap() >= 200);
 }
+
+// ---------------------------------------------------------------------------
+// Review fixes (integration)
+// ---------------------------------------------------------------------------
+
+/// H4: a picked transaction that FAILS and whose probe finds none of our
+/// pools (here: the router's code is unknown in our copy) must not leave
+/// the pools looking exact. Known router: the pools it moved before become
+/// unsure. Unknown target, nothing named: prediction stops until confirmed.
+#[test]
+fn a_failing_tx_with_unknown_effect_never_leaves_pools_looking_exact() {
+    // ROUTER learned as a toucher of POOL (block 11 confirmed it moved POOL).
+    let mut a = ahead(32);
+    let r1 = stx(0, router(), w(3));
+    a.on_feed_message(msg(11, &[r1.clone()]));
+    let (s11, d11) = with_price(106, 7);
+    let h = keccak256(&r1);
+    a.on_confirmed(confirmed(11, s11.clone(), d11), &move |x: &B256| (*x == h).then(|| vec![key(pool())]));
+    assert!(a.is_toucher(&router()));
+    // Now the router's CODE is unknown in copy 2 (a value we don't hold):
+    // the run fails, the probe reads nothing of ours.
+    let mut s12 = s11.clone();
+    s12.apply_fact(&Fact::Forget(router()));
+    a.on_confirmed(confirmed(12, s12, StateDiff::default()), &no_moves);
+    a.on_feed_message(msg(13, &[stx(1, router(), w(4))]));
+    let t = a.tip().expect("tip");
+    assert_eq!(t.unsure_pools, vec![key(pool())], "the pools this router moved before");
+    assert_eq!(t.view().storage(pool(), U256::ZERO), Lookup::Missing);
+    assert_eq!(a.total.failed_unknown, 1);
+    // An address never seen, naming nothing of ours, failing: stop.
+    let stranger = addr(0x7777);
+    a.on_feed_message(msg(14, &[stx(2, stranger, w(1))]));
+    // (A transaction to an EMPTY account just succeeds: nothing to do. Make
+    // it fail instead: our copy doesn't know the stranger at all.)
+    let mut b = Ahead::new(AheadCfg { run_all: true, ..AheadCfg::default() });
+    b.set_pools(pools());
+    let mut s = copy10();
+    s.apply_fact(&Fact::Forget(stranger));
+    b.on_confirmed(confirmed(10, s, StateDiff::default()), &no_moves);
+    b.on_feed_message(msg(11, &[stx(0, stranger, w(1))]));
+    assert!(b.tip().is_none(), "unknown effect: no prediction until confirmed");
+    assert_eq!(b.stopped(), Some((11, "failed_tx_unknown_effect")));
+}
+
+/// M1: a run that used a value copy 2 only holds as a FILL (re-read every
+/// minute, not followed exactly: labelled recent_fill) or an assumed
+/// sender's funds: the pools it moved are unsure in the predicted view.
+struct DepIsAFill;
+impl arbsim::check::ordered::Provenance for DepIsAFill {
+    fn slot_exact(&self, a: Address, _s: U256) -> bool {
+        a != dep()
+    }
+    fn balance_exact(&self, _a: Address) -> bool {
+        true
+    }
+}
+
+#[test]
+fn results_built_on_assumed_values_are_unsure() {
+    let cfg = AheadCfg::from_lookup(|k| (k == "FASTLANE_AHEAD_TRUST_SENDER_FUNDS").then(|| "on".to_string()), 0);
+    assert!(cfg.trust_sender_funds);
+    assert!(!AheadCfg::default().trust_sender_funds, "default: not trusted");
+    let mut a = Ahead::new(AheadCfg { run_all: true, ..AheadCfg::default() });
+    a.set_pools(pools());
+    a.on_confirmed(Confirmed { seq: 10, snap: Arc::new(copy10()), ctx: Some(ctx_at(10)), diff: Arc::new(StateDiff::default()), prov: Arc::new(DepIsAFill) }, &no_moves);
+    // The router reads DEP (a fill) and moves POOL with it.
+    a.on_feed_message(msg(11, &[stx(0, router(), w(3)), stx(1, pool2(), w(2))]));
+    let t = a.tip().unwrap();
+    assert!(a.total.assumed >= 1 && a.total.assumed_unsure == 1, "assumed {} assumedUnsure {}", a.total.assumed, a.total.assumed_unsure);
+    assert_eq!(t.unsure_pools, vec![key(pool())], "built on a fill: unsure, never exact");
+    assert_eq!(t.view().storage(pool(), U256::ZERO), Lookup::Missing);
+    assert_eq!(t.view().storage(pool2(), U256::ZERO), known(9), "a pool moved exactly stays exact");
+}
+
+/// M3: a native-ETH pool (one coin = address zero) traded by a router that
+/// pays ETH and names only the other coin is picked by the filter.
+#[test]
+fn native_eth_router_trades_are_picked() {
+    let coin = addr(0x5555);
+    let fp = |a: Address, t0: Address, t1: Address| (FollowedPool { key: key(a), address: a, v4_id: None }, t0, t1);
+    let set = Arc::new(PoolSet::build(&[fp(pool(), Address::ZERO, coin), fp(pool2(), Address::ZERO, Address::ZERO)], HashSet::new()));
+    let mut a = Ahead::new(AheadCfg::default());
+    a.set_pools(set);
+    a.on_confirmed(confirmed(10, copy10(), StateDiff::default()), &no_moves);
+    // Router call: pays 1 wei of ETH, data names the coin (not the pool).
+    let mut data = vec![0u8; 12];
+    data.extend_from_slice(coin.as_slice());
+    let tx = sign_typed(&KEY, 2, &TestTx { nonce: 0, gas: 300_000, to: Some(dep()), value: U256::from(1u8), data, access_list: vec![] }, 4663);
+    a.on_feed_message(msg(11, &[tx]));
+    assert_eq!(a.total.native_picks, 1, "picked for the native pool");
+    assert_eq!(a.total.txs_skipped, 0);
+}
+
+/// L1: several blocks confirmed at once: every predicted block's skipped
+/// list is still checked (learned), and agreement is not miscounted.
+#[test]
+fn several_blocks_confirmed_at_once_learn_every_skipped_tx() {
+    let mut a = ahead(32);
+    let r1 = stx(0, router(), w(3));
+    a.on_feed_message(msg(11, &[r1.clone()]));
+    a.on_feed_message(msg(12, &[stx(1, dep(), w(5))]));
+    let (s12, d12) = with_price(106, 7);
+    let h = keccak256(&r1);
+    // Copy 2 publishes block 12 only (11 and 12 confirmed together).
+    a.on_confirmed(confirmed(12, s12, d12), &move |x: &B256| (*x == h).then(|| vec![key(pool())]));
+    assert!(a.is_toucher(&router()), "block 11's skipped router learned too");
+    assert_eq!(a.total.filter_missed, 1);
+    assert_eq!((a.total.agree, a.total.disagree), (0, 0), "a 2-block jump is not compared");
+    assert_eq!(a.total.unpredicted, 1);
+}
+
+/// L2: timing samples keep moving after the per-hour cap (a ring).
+#[test]
+fn timing_samples_keep_the_newest() {
+    let mut a = ahead(32);
+    for i in 0..30u64 {
+        a.on_feed_message(msg(11 + i, &[]));
+        if i % 8 == 7 {
+            let (s, _) = with_price(100, 7);
+            a.on_confirmed(confirmed(11 + i, s, StateDiff::default()), &no_moves);
+        }
+    }
+    assert!(a.hour.time_n >= 30);
+    assert_eq!(a.hour.apply_us.len() as u64, a.hour.time_n.min(20_000));
+}

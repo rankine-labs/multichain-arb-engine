@@ -241,6 +241,14 @@ export interface RustSendRecord {
   nonce?: number;
   timingsUs?: Record<string, number>;
   totalUs: number;
+  // (integration) "reply" = the sequencer's answer to an earlier live send:
+  // replyTo = that send's seq, replyHash its hash, status accepted / refused /
+  // unknown / stale_in_queue / not_written, error the node's message.
+  // A send record's status is the send state when it was written.
+  kind?: string;
+  replyTo?: number;
+  replyHash?: string;
+  status?: string;
 }
 
 export interface FollowerHooks {
@@ -250,6 +258,9 @@ export interface FollowerHooks {
   onLiveSendFailed: (r: RustSendRecord) => void;
   // Practice "would send" (counted only).
   onPractice?: (r: RustSendRecord) => void;
+  // The sequencer's answer to a live Rust send ("reply" line). A refused one
+  // never reaches the chain: release what was held for it.
+  onLiveReply?: (r: RustSendRecord) => void;
   log?: (m: string) => void;
 }
 
@@ -297,7 +308,7 @@ export class FastlaneSendsFollower {
   private seenSeq = new Set<number>();
   private seenHash = new Set<string>();
   private timer: NodeJS.Timeout | null = null;
-  readonly hour = { practice: 0, live: 0, failed: 0, bad: 0, dup: 0, totalUs: [] as number[], signUs: [] as number[] };
+  readonly hour = { practice: 0, live: 0, failed: 0, bad: 0, dup: 0, refused: 0, totalUs: [] as number[], signUs: [] as number[] };
 
   constructor(
     readonly file: string,
@@ -417,7 +428,11 @@ export class FastlaneSendsFollower {
     if (seq) { this.seenSeq.add(seq); if (this.seenSeq.size > SEEN_MAX) this.seenSeq.delete(this.seenSeq.values().next().value as number); }
     if (hashKey) { this.seenHash.add(hashKey); if (this.seenHash.size > SEEN_MAX) this.seenHash.delete(this.seenHash.values().next().value as string); }
     try {
-      if (rec.mode === 'live') {
+      if (rec.kind === 'reply') {
+        // Not a send: the answer to one (never tracked as a trade).
+        if (rec.status === 'refused' || rec.status === 'stale_in_queue' || rec.status === 'not_written') this.hour.refused++;
+        this.hooks.onLiveReply?.(rec);
+      } else if (rec.mode === 'live') {
         if (rec.hash) { this.hour.live++; this.hooks.onLiveSent(rec); } else { this.hour.failed++; this.hooks.onLiveSendFailed(rec); }
       } else {
         this.hour.practice++;
@@ -490,8 +505,8 @@ export class FastlaneSendsFollower {
     const ms = (us: number) => (us / 1000).toFixed(1);
     const line = `[fastlane] hour: practice would send ${h.practice}` +
       (h.totalUs.length ? ` (feed -> send p50 ${ms(pctl(h.totalUs, 0.5))} ms, p90 ${ms(pctl(h.totalUs, 0.9))} ms` + (h.signUs.length ? `; sign p50 ${ms(pctl(h.signUs, 0.5))} ms` : '') + ')' : '') +
-      `, live sent ${h.live}${h.failed ? `, node refused ${h.failed}` : ''}${h.bad ? `, unreadable lines ${h.bad}` : ''}${h.dup ? `, duplicates skipped ${h.dup}` : ''}`;
-    if (reset) Object.assign(this.hour, { practice: 0, live: 0, failed: 0, bad: 0, dup: 0, totalUs: [], signUs: [] });
+      `, live sent ${h.live}${h.failed ? `, node refused ${h.failed}` : ''}${h.refused ? `, sequencer refused / never sent ${h.refused}` : ''}${h.bad ? `, unreadable lines ${h.bad}` : ''}${h.dup ? `, duplicates skipped ${h.dup}` : ''}`;
+    if (reset) Object.assign(this.hour, { practice: 0, live: 0, failed: 0, bad: 0, dup: 0, refused: 0, totalUs: [], signUs: [] });
     return line;
   }
 
@@ -501,6 +516,34 @@ export class FastlaneSendsFollower {
     this.timer.unref?.();
   }
   stop() { if (this.timer) clearInterval(this.timer); this.timer = null; }
+}
+
+// The practice scoring of the last full hour, from arbsim's
+// data/fastlane-practice.jsonl (its newest {"kind":"hour"} line), as text for
+// the hourly practice line: real %, taken %, feed -> would-hand latency,
+// prediction agreement and the estimated dollars if sent. '' = none yet.
+export function practiceHourSummary(file: string, maxAgeMs = 2 * 3600_000, now = Date.now()): string {
+  let fd = -1;
+  try {
+    fd = openSync(file, 'r');
+    const size = fstatSync(fd).size;
+    const n = Math.min(size, 64 * 1024);
+    const buf = Buffer.alloc(n);
+    readSync(fd, buf, 0, n, size - n);
+    const lines = buf.toString('utf8').split('\n').reverse();
+    for (const l of lines) {
+      if (!l.includes('"kind":"hour"')) continue;
+      let h: Record<string, unknown>;
+      try { h = JSON.parse(l); } catch { continue; }
+      if (!Number.isFinite(h.t) || now - (h.t as number) > maxAgeMs) return '';
+      const num = (k: string) => (Number.isFinite(h[k] as number) ? (h[k] as number) : null);
+      const pc = (k: string) => (num(k) === null ? '-' : `${(num(k) as number).toFixed(0)}%`);
+      const ms = (k: string) => (num(k) === null ? '-' : `${((num(k) as number) / 1000).toFixed(1)} ms`);
+      return `scored ${num('scored') ?? 0}: real ${pc('realPct')}, taken by others ${pc('takenPct')}; feed -> would hand p50 ${ms('handP50Us')}, p90 ${ms('handP90Us')}; ` +
+        `prediction agreement ${pc('agreementPct')}; est. $${(num('estUsd') ?? 0).toFixed(2)} if sent`;
+    }
+    return '';
+  } catch { return ''; } finally { if (fd >= 0) try { closeSync(fd); } catch { /* fine */ } }
 }
 
 // Counters about Rust's own sends, for the state file (H4 prep: the gun

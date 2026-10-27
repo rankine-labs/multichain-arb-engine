@@ -96,11 +96,13 @@ fn scanner(t: Arc<Mutex<Table>>, cfg: ScanConfig) -> Scanner {
 }
 
 fn input<'a>(view: &'a dyn StateRead, ctx: &'a BlockCtx, block: u64, changed: &'a [String], unsure: &'a HashSet<String>) -> BlockInput<'a> {
-    BlockInput { view, ctx, block, kind: ViewKind::Confirmed, changed, unsure }
+    BlockInput { view, ctx, block, kind: ViewKind::Confirmed, changed, unsure, snap: None }
 }
 
+/// Test settings: big budget, and the $0.10 minimum these tests' numbers
+/// were written for (the default now follows the bot's $0.25, review L5).
 fn cfg() -> ScanConfig {
-    ScanConfig { budget_us: 1_000_000, ..ScanConfig::default() }
+    ScanConfig { budget_us: 1_000_000, min_net_usd: 0.10, ..ScanConfig::default() }
 }
 
 #[test]
@@ -420,7 +422,7 @@ fn matches_the_existing_check_on_real_fixtures() {
         // profit); valued at $1 per 1e18 units it is far below $0.10.
         let mut sc = Scanner::new(cfg(), Box::new(src), Box::new(PlainRunner));
         let ch = vec![pool];
-        let rep = sc.scan(&BlockInput { view: &fx.state, ctx: &fx.ctx, block: 1, kind: ViewKind::Confirmed, changed: &ch, unsure: &HashSet::new() });
+        let rep = sc.scan(&BlockInput { view: &fx.state, ctx: &fx.ctx, block: 1, kind: ViewKind::Confirmed, changed: &ch, unsure: &HashSet::new(), snap: None });
         match (&rep.checked[0].outcome, &direct.best) {
             (Outcome::BelowMin { amount, profit, .. }, Some(b)) => assert_eq!((*amount, *profit), (b.amount, b.profit), "{name}"),
             (Outcome::NoProfit, None) => {}
@@ -437,11 +439,14 @@ fn settings_and_switch() {
         ScanConfig::from_lookup(move |k| m.get(k).cloned())
     };
     assert_eq!(env(&[]), ScanConfig::default());
-    assert_eq!(ScanConfig::default().min_net_usd, 0.10);
+    assert_eq!(ScanConfig::default().min_net_usd, 0.25, "review L5: the bot's own default");
     assert_eq!(ScanConfig::default().budget_us, 15_000);
     assert_eq!(env(&[("MIN_EXEC_NET_USD", "0.25")]).min_net_usd, 0.25);
     assert_eq!(env(&[("MIN_EXEC_NET_USD", "0.25"), ("FASTLANE_MIN_NET_USD", "0.5")]).min_net_usd, 0.5);
-    assert_eq!(env(&[("FASTLANE_MIN_NET_USD", "-1")]).min_net_usd, 0.10);
+    assert_eq!(env(&[("FASTLANE_MIN_NET_USD", "-1")]).min_net_usd, 0.25);
+    assert_eq!(env(&[("MAX_PLAUSIBLE_PROFIT_SHARE", "0.1")]).max_plausible_share, 0.1);
+    assert_eq!(env(&[("FASTLANE_DEDUPE_BLOCKS", "5")]).dedupe_blocks, 5);
+    assert_eq!(env(&[("FASTLANE_ROUTE_MAX_US", "junk")]).route_max_us, 5_000);
     assert_eq!(env(&[("FASTLANE_SCAN_BUDGET_MS", "7.5")]).budget_us, 7_500);
     assert_eq!(env(&[("FASTLANE_SCAN_BUDGET_MS", "junk")]).budget_us, 15_000);
     assert_eq!(env(&[("FASTLANE_SWEEP_PER_BLOCK", "3")]).sweep_per_block, 3);
@@ -466,4 +471,83 @@ fn hourly_counters() {
     let line = take_hour();
     assert!(line.starts_with("[fastlane scan] "), "{line}");
     assert!(line.contains("full sweep every"));
+}
+
+// ---------------------------------------------------------------------------
+// Review fixes (integration)
+// ---------------------------------------------------------------------------
+
+/// H1: the table changes every block (live: every ~1 s); the sweep must
+/// still reach EVERY route, carrying on from where it stopped.
+#[test]
+fn sweep_reaches_every_route_when_the_table_changes_every_block() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let r = SlowRunner { us: 0, runs: Default::default(), seen: seen.clone() };
+    let t = many(40);
+    let mut sc = Scanner::new(ScanConfig { sweep_per_block: 5, ..cfg() }, Box::new(TableSource::owned(t.clone())), Box::new(r));
+    let s = hill_state(1);
+    let none = HashSet::new();
+    for b in 0..10u64 {
+        // A new table generation every block, one row's gas changed.
+        {
+            let mut g = t.lock().unwrap();
+            g.gen += 1;
+            let k = key(0x100 + (b % 40));
+            let rows = g.pools.get_mut(&k).unwrap();
+            rows[0] = row(&format!("r{:03}", b % 40), 0x100 + (b % 40), 0x900, true, None, 0.05 + b as f64 * 0.001);
+        }
+        sc.scan(&input(&s, &ctx(), b, &[], &none));
+    }
+    let set: HashSet<_> = seen.lock().unwrap().iter().cloned().collect();
+    assert_eq!(set.len(), 40, "8 blocks x 5 = 40: every route swept once despite the table changing each block");
+}
+
+/// M5: a profit above MAX_PLAUSIBLE_PROFIT_SHARE of the size is broken data.
+#[test]
+fn implausible_share_is_never_returned() {
+    let s = hill_state(2_000_000_000);
+    let t = table(vec![(0xa, row("a>b:1", 0xa, 0xb, true, None, 0.05))]);
+    let none = HashSet::new();
+    let ch = vec![key(0xa)];
+    // $3.15 on $400 = 0.79 %: fine at 0.25, implausible at 0.005.
+    assert_eq!(scanner(t.clone(), cfg()).scan(&input(&s, &ctx(), 1, &ch, &none)).opps.len(), 1);
+    let rep = scanner(t, ScanConfig { max_plausible_share: 0.005, ..cfg() }).scan(&input(&s, &ctx(), 1, &ch, &none));
+    assert!(rep.opps.is_empty());
+    assert_eq!(rep.checked[0].outcome, Outcome::Implausible);
+}
+
+/// M4: the same result is handed out again after FASTLANE_DEDUPE_BLOCKS,
+/// and at once after `forget` (the sender says it never left).
+#[test]
+fn dedupe_expires_and_can_be_forgotten() {
+    let s = hill_state(2_000_000_000);
+    let t = table(vec![(0xa, row("a>b:1", 0xa, 0xb, true, None, 0.05))]);
+    let mut sc = scanner(t, ScanConfig { dedupe_blocks: 3, ..cfg() });
+    let none = HashSet::new();
+    let a = vec![key(0xa)];
+    let other = vec![key(0xc)];
+    assert_eq!(sc.scan(&input(&s, &ctx(), 1, &a, &none)).opps.len(), 1);
+    assert!(sc.scan(&input(&s, &ctx(), 2, &other, &none)).opps.is_empty());
+    assert!(sc.scan(&input(&s, &ctx(), 3, &other, &none)).opps.is_empty());
+    assert_eq!(sc.scan(&input(&s, &ctx(), 4, &other, &none)).opps.len(), 1, "3 blocks later: handed out again");
+    assert!(sc.scan(&input(&s, &ctx(), 5, &other, &none)).opps.is_empty());
+    sc.forget("a>b:1");
+    assert_eq!(sc.scan(&input(&s, &ctx(), 6, &other, &none)).opps.len(), 1, "forgotten: handed out at once");
+}
+
+/// M6: a slow route rests; a route whose last time doesn't fit the budget
+/// left is not started (the overrun is bounded).
+#[test]
+fn slow_routes_rest_and_the_budget_is_not_overrun() {
+    let runs = Arc::new(AtomicUsize::new(0));
+    let r = SlowRunner { us: 3_000, runs: runs.clone(), seen: Default::default() };
+    let mut sc = Scanner::new(ScanConfig { budget_us: 10_000, sweep_per_block: 50, route_max_us: 2_000, ..cfg() }, Box::new(TableSource::owned(many(6))), Box::new(r));
+    let s = hill_state(1);
+    let none = HashSet::new();
+    let rep = sc.scan(&input(&s, &ctx(), 1, &[], &none));
+    let first = runs.load(Ordering::Relaxed);
+    assert!(first >= 1 && rep.timing.total_us < 10_000 + 3_000 + 1_500, "ran {first}, took {}", rep.timing.total_us);
+    // Every route checked so far took 3 ms > 2 ms: they rest now.
+    let rep = sc.scan(&input(&s, &ctx(), 2, &[], &none));
+    assert!(rep.resting >= 1, "{:?}", rep.resting);
 }

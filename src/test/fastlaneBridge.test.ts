@@ -3,7 +3,7 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 import { ethers } from 'ethers';
 import {
-  fastlaneModeFromEnv, buildFastlaneState, FastlaneStateWriter, FastlaneSendsFollower, parseSendLine, pairRows, routePairs,
+  fastlaneModeFromEnv, buildFastlaneState, FastlaneStateWriter, FastlaneSendsFollower, parseSendLine, pairRows, practiceHourSummary, routePairs,
   StateSources, RustSendRecord, RustSendStats,
 } from '../execution/fastlaneBridge';
 import { FastSender, RUST_IS_SENDER, rustSenderOn, SafetyGate } from '../execution/fastSender';
@@ -293,5 +293,35 @@ async function followerEdgeCases() {
   }
   rmSync(d, { recursive: true, force: true });
 }
+
+// ---- integration: the Rust send log as the fast lane writes it ----------------
+// sim/tests/fixtures/fastlane-sends-e2e.jsonl is written by the Rust end-to-end
+// test (sim/tests/fastlane_e2e.rs, practice + live against a fake endpoint):
+// a practice would-send, a live send with its hash, and the sequencer's reply.
+function integration() {
+  const fx = join(__dirname, '..', '..', 'sim', 'tests', 'fixtures', 'fastlane-sends-e2e.jsonl');
+  if (!existsSync(fx)) { assert(false, 'Rust e2e send log fixture present (run cargo test --release --test fastlane_e2e)'); return; }
+  const d = mkdtempSync(join(tmpdir(), 'fastlane-e2e-'));
+  const f = join(d, 'fastlane-sends.jsonl');
+  // Re-stamp times to "now" (first start skips lines older than 90 s).
+  const now = Date.now();
+  writeFileSync(f, readFileSync(fx, 'utf8').split('\n').filter(Boolean).map((l) => JSON.stringify({ ...JSON.parse(l), t: now })).join('\n') + '\n');
+  const live: RustSendRecord[] = []; const prac: RustSendRecord[] = []; const replies: RustSendRecord[] = []; const failed: RustSendRecord[] = [];
+  const fl = new FastlaneSendsFollower(f, { onLiveSent: (r) => live.push(r), onLiveSendFailed: (r) => failed.push(r), onPractice: (r) => prac.push(r), onLiveReply: (r) => replies.push(r) }, join(d, 'follow.json'));
+  fl.poll();
+  assert(prac.length >= 1 && prac.every((r) => r.mode === 'practice' && (r.seq ?? 0) > 0 && typeof r.hash === 'string'), `practice would-send picked up with seq + hash (${prac.length})`);
+  assert(live.length === 1 && /^0x[0-9a-f]{64}$/.test(live[0].hash ?? '') && (live[0].seq ?? 0) > 0 && live[0].pools.length === 2, 'live Rust send picked up once, with hash, seq and pools (tracked like our own)');
+  assert(failed.length === 0, 'a reply line is never read as a failed send');
+  assert(replies.length === 1 && replies[0].replyTo === live[0].seq && (replies[0].replyHash ?? '').toLowerCase() === (live[0].hash ?? '').toLowerCase(), 'the sequencer reply points at the live send (seq + hash)');
+  assert(fl.ackSeq >= (live[0].seq ?? 0), `ackSeq covers the live send (${fl.ackSeq})`);
+  // Practice summary line from the practice file.
+  const pf = join(d, 'fastlane-practice.jsonl');
+  writeFileSync(pf, JSON.stringify({ kind: 'score', t: now }) + '\n' + JSON.stringify({ kind: 'hour', t: now, scored: 10, realPct: 60, takenPct: 30, handP50Us: 4200, handP90Us: 9100, agreementPct: 97.5, estUsd: 3.25 }) + '\n');
+  const ps = practiceHourSummary(pf, 7_200_000, now);
+  assert(ps.includes('real 60%') && ps.includes('taken by others 30%') && ps.includes('p50 4.2 ms') && ps.includes('agreement 98%') && ps.includes('$3.25'), `practice summary line (${ps})`);
+  assert(practiceHourSummary(pf, 1_000, now + 10_000) === '' && practiceHourSummary(join(d, 'none.jsonl')) === '', 'old or missing practice summary = nothing');
+  rmSync(d, { recursive: true, force: true });
+}
+integration();
 
 main().catch((e) => { console.error(e); process.exitCode = 1; });

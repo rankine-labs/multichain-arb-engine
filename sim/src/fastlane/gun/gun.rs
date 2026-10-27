@@ -68,7 +68,7 @@ use super::calldata::{encode_for_funding, usd_to_token_units, CallErr, ExecutorH
 use super::gas::{spawn_refresher, Gas, GasConfig};
 use super::nonce::NonceTracker;
 use super::rpc::{pending_nonce, ReadRpc, UreqRpc};
-use super::send::{send_url_from_env, Job, SendOutcome, SendPool, SendStatus};
+use super::send::{Job, SendOutcome, SendPool, SendStatus};
 use super::tx::{Signer, TxFields};
 use crate::check::hexutil::to_hex;
 
@@ -286,31 +286,50 @@ impl Gun {
     /// Build from env. None when FASTLANE=off. `gate` = workstream D's safety
     /// gate; `on_reply` gets every live send's outcome (D's bridge).
     pub fn from_env(gate: Arc<dyn Gate>, on_reply: Arc<dyn Fn(&SendOutcome) + Send + Sync>) -> Result<Option<Gun>, String> {
-        let mode = Mode::from_env();
+        Self::from_lookup(&|k: &str| std::env::var(k).ok(), gate, on_reply, None)
+    }
+
+    /// `from_env` from any key -> value lookup (tests: a map, so "live but
+    /// no key" can be proven without touching the process environment).
+    /// `rpc`: the read node (None = ROBINHOOD_FAST_RPC / the public node).
+    pub fn from_lookup(get: &dyn Fn(&str) -> Option<String>, gate: Arc<dyn Gate>, on_reply: Arc<dyn Fn(&SendOutcome) + Send + Sync>, rpc: Option<Arc<dyn ReadRpc>>) -> Result<Option<Gun>, String> {
+        let mode = Mode::parse(get("FASTLANE").as_deref());
         if mode == Mode::Off {
             return Ok(None);
         }
-        let executor = std::env::var("ARB_EXECUTOR_ROBINHOOD").ok().and_then(|s| crate::check::hexutil::parse_address(s.trim()).ok());
-        let why_not_live = if mode == Mode::Live { live_blockers(&|k: &str| std::env::var(k).ok(), gate.as_ref()) } else { Vec::new() };
+        let num = |k: &str, d: u64| get(k).and_then(|s| s.trim().parse::<u64>().ok()).unwrap_or(d);
+        let executor = get("ARB_EXECUTOR_ROBINHOOD").and_then(|s| crate::check::hexutil::parse_address(s.trim()).ok());
+        let why_not_live = if mode == Mode::Live { live_blockers(get, gate.as_ref()) } else { Vec::new() };
         let broadcast = mode == Mode::Live && why_not_live.is_empty();
         if mode == Mode::Live && !broadcast {
             eprintln!("[fastlane] FASTLANE=live but NOT broadcasting ({}): running as practice", why_not_live.join(", "));
+            if why_not_live.contains(&"BOT_PRIVATE_KEY is not set") {
+                // deploy/arbsim-run.sh does not pass the wallet key to arbsim.
+                eprintln!("[fastlane] live blocked: no key passed to arbsim (owner decision pending)");
+            }
         }
         let signer = if broadcast {
             // The ONLY place the real key is read.
-            let mut text = std::env::var("BOT_PRIVATE_KEY").unwrap_or_default();
+            let mut text = get("BOT_PRIVATE_KEY").unwrap_or_default();
             let s = Signer::from_hex(&text);
             zeroize::Zeroize::zeroize(&mut text);
             s.map_err(|e| format!("BOT_PRIVATE_KEY: {e}"))?
         } else {
             Signer::random()?
         };
-        let rpc: Arc<dyn ReadRpc> = Arc::new(UreqRpc::from_env());
+        let rpc: Arc<dyn ReadRpc> = match rpc {
+            Some(r) => r,
+            None => Arc::new(UreqRpc::new(
+                get("ROBINHOOD_FAST_RPC").filter(|s| !s.trim().is_empty()).unwrap_or_else(|| super::rpc::ROBINHOOD_PUBLIC_RPC.to_string()).trim(),
+                Duration::from_millis(num("FASTLANE_READ_TIMEOUT_MS", 4000)),
+            )),
+        };
         let pool = if broadcast {
-            let conns = crate::node::env_u64("FASTLANE_SEND_CONNS", 2) as usize;
-            let timeout = Duration::from_millis(crate::node::env_u64("FASTLANE_SEND_TIMEOUT_MS", 5000));
-            let warm = Duration::from_millis(crate::node::env_u64("SEND_WARM_MS", 1000).max(250));
-            Some(SendPool::start(&send_url_from_env(), conns, timeout, warm)?)
+            let conns = num("FASTLANE_SEND_CONNS", 2) as usize;
+            let timeout = Duration::from_millis(num("FASTLANE_SEND_TIMEOUT_MS", 5000));
+            let warm = Duration::from_millis(num("SEND_WARM_MS", 1000).max(250));
+            let url = get("ROBINHOOD_SEND_RPC").map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).unwrap_or_else(|| super::send::ROBINHOOD_SEQUENCER_RPC.to_string());
+            Some(SendPool::start(&url, conns, timeout, warm)?)
         } else {
             None
         };
@@ -318,8 +337,8 @@ impl Gun {
             mode: if broadcast { Mode::Live } else { Mode::Practice },
             broadcast,
             executor,
-            hand_timeout: Duration::from_millis(crate::node::env_u64("FASTLANE_SEND_TIMEOUT_MS", 5000)),
-            max_queue: max_queue_from(std::env::var("FASTLANE_MAX_QUEUE_MS").ok().as_deref()),
+            hand_timeout: Duration::from_millis(num("FASTLANE_SEND_TIMEOUT_MS", 5000)),
+            max_queue: max_queue_from(get("FASTLANE_MAX_QUEUE_MS").as_deref()),
         };
         let gun = Gun::with_parts(cfg, signer, Some(rpc), pool, gate, on_reply, GasConfig::from_env());
         gun.start_background();

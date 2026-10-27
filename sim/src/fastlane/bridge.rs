@@ -406,7 +406,22 @@ pub struct SendRecord {
     #[serde(default)]
     pub timings_us: std::collections::BTreeMap<String, u64>,
     /// Feed message seen -> send call returned (microseconds), the headline number.
+    #[serde(default)]
     pub total_us: u64,
+    /// (integration) None = a send / would-send record. "reply" = the
+    /// sequencer's answer to an earlier live send (`reply_to` = its seq,
+    /// `reply_hash` its hash, `status` accepted / refused / unknown /
+    /// stale_in_queue / not_written, `error` the node's message).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_hash: Option<String>,
+    /// Send status when the record was written (live: "unknown" = handed to
+    /// the socket, answer still to come; the reply line follows).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
 }
 
 /// Appends send records, one line per call, rotating at max_bytes, and

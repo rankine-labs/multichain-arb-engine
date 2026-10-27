@@ -237,6 +237,10 @@ pub fn handle_tm(ctx: &Ctx, req: &Value, tm: &mut Tm) -> Value {
             if let Some(a) = crate::copy2::ahead::status_json() {
                 s["fastlaneAhead"] = a;
             }
+            // FAST LANE loop summary (ahead, scan, gun, safety, practice).
+            if let Some(f) = crate::fastlane::lane::status_json() {
+                s["fastlane"] = f;
+            }
             s
         }
         Some("warm") => match parse_warm(req) {

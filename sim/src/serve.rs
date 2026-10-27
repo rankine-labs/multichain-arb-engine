@@ -77,7 +77,11 @@ pub fn build_with(cfg: Config, node: Option<Arc<dyn NodeApi>>, source: Source) -
             let c2 = crate::copy2::intake::spawn(shared.clone(), fills.clone(), c2cfg);
             // FAST LANE A: the predicted copy (only FASTLANE=practice|live;
             // off = nothing started, no thread, no memory).
-            crate::copy2::ahead::start(c2.clone());
+            // FAST LANE loop (fastlane/lane.rs): scanner -> safety -> gun on
+            // every new predicted tip. Only with the predicted copy running.
+            if crate::copy2::ahead::start(c2.clone()) {
+                crate::fastlane::lane::start(c2.clone());
+            }
             Arc::new(Ctx { shared, updater, fills, pinned: PinnedCache::new(pin_cache), copy2: Some(c2) })
         }
     }

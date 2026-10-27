@@ -174,7 +174,7 @@ import { setHookedFeeSource } from './core/pairWatcher';
 import { SimBucketTally, classifySimOutcome } from './core/failReasons';
 import { makeRpc, simulateRoundTrip, simulateWithRecheck, simRpcUrl, Rpc, makeFallbackRpc, loadBalanceSlots, wssToHttps, replayRpc, ReplayCall, SimResult } from './execution/simulator';
 import { FastSender, SafetyGate, safetyConfigFromEnv, RUST_IS_SENDER } from './execution/fastSender';
-import { fastlaneModeFromEnv, FastlaneStateWriter, FastlaneSendsFollower, RustSendStats, pairRows, routePairs } from './execution/fastlaneBridge';
+import { fastlaneModeFromEnv, FastlaneStateWriter, FastlaneSendsFollower, RustSendStats, pairRows, practiceHourSummary, routePairs } from './execution/fastlaneBridge';
 import { DEFAULT_FILTER_CONFIG } from './core/fastFilter';
 import { checkLiveReady } from './execution/liveReadiness';
 import { LiveTradeTracker, Funding, LiveResult } from './execution/liveTracker';
@@ -3383,6 +3383,15 @@ if (FASTLANE_MODE !== 'off' && chainOn('robinhood')) {
                   alertHooks.liveSendFailed(label, r.error ?? 'send failed');
                   whyNotSent.blocked('node refused the send');
             },
+            // The sequencer's answer to a live Rust send. Refused / never sent:
+            // nothing reached the chain, so the gas held against the daily loss
+            // cap is released now (the receipt watch then ends as "dropped", no cost).
+            onLiveReply: (r) => {
+                  const hash = (r.replyHash ?? '').toLowerCase();
+                  if (!hash || !(r.status === 'refused' || r.status === 'stale_in_queue' || r.status === 'not_written')) return;
+                  safetyGate.releasePending(hash);
+                  console.log(`[fastlane] rust send ${hash.slice(0, 10)} not taken by the sequencer (${r.status}${r.error ? `: ${r.error.slice(0, 120)}` : ''})`);
+            },
       });
       // Results of Rust sends: a failed one blocks every pair of its route for
       // GAP_LIVE_FAIL_BLOCK_MIN (Rust reads that list), loops count toward the loop loss cap.
@@ -3429,7 +3438,10 @@ if (FASTLANE_MODE !== 'off' && chainOn('robinhood')) {
       writer.start(Math.max(250, Number(process.env.FASTLANE_STATE_MS ?? 2_000) || 2_000));
       follower.start(250);
       setInterval(() => {
-            const line = follower.hourLine(true);
+            // Practice scoring from arbsim (data/fastlane-practice.jsonl): real %,
+            // taken %, latency, prediction agreement, est. $ if sent.
+            const ps = practiceHourSummary(process.env.FASTLANE_PRACTICE_FILE || 'data/fastlane-practice.jsonl');
+            const line = follower.hourLine(true) + (ps ? ` | practice ${ps}` : '');
             console.log(line);
             if (process.env.FASTLANE_TELEGRAM !== '0') void sendTelegramMessage(escHtml(line)).catch(() => undefined);
       }, 3600_000).unref?.();
