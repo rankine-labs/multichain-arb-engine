@@ -50,6 +50,49 @@ use crate::state::MissItem;
 /// Biggest message accepted (a feed frame is a few KB; a call a few KB).
 pub const MAX_MESSAGE: usize = 8 * 1024 * 1024;
 
+/// Most bytes of an over-size message read and thrown away to keep the
+/// connection usable (see `read_msg_keep`); bigger = the connection closes.
+pub const MAX_SKIP: usize = 256 * 1024 * 1024;
+
+/// One read from the socket (`read_msg_keep`).
+#[derive(Debug, PartialEq, Eq)]
+pub enum Incoming {
+    /// A whole message.
+    Msg(Vec<u8>),
+    /// A message bigger than MAX_MESSAGE: its bytes were read and thrown
+    /// away (the next message lines up again); `n` = its size.
+    TooLarge(usize),
+}
+
+/// ZERO-ROUTES FIX (Oct 27). Like `read_msg`, but a message over
+/// MAX_MESSAGE no longer kills the connection: its bytes are read and
+/// dropped (counted and logged by the caller), so the bot's OTHER questions
+/// on the same socket (copy 2's pool reports, trigger checks) keep working.
+/// Before, one over-size `trig_table` closed the bot's only connection
+/// without a word (server.rs ignored the error). Ok(None) = closed.
+pub fn read_msg_keep(r: &mut impl Read) -> std::io::Result<Option<Incoming>> {
+    let mut len = [0u8; 4];
+    match r.read_exact(&mut len) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(e),
+    }
+    let n = u32::from_be_bytes(len) as usize;
+    if n > MAX_MESSAGE {
+        if n > MAX_SKIP {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("message too large to skip ({n} bytes)")));
+        }
+        let skipped = std::io::copy(&mut r.take(n as u64), &mut std::io::sink())?;
+        if skipped as usize != n {
+            return Ok(None);
+        }
+        return Ok(Some(Incoming::TooLarge(n)));
+    }
+    let mut buf = vec![0u8; n];
+    r.read_exact(&mut buf)?;
+    Ok(Some(Incoming::Msg(buf)))
+}
+
 /// Read one length-prefixed message. Ok(None) = the other side closed.
 pub fn read_msg(r: &mut impl Read) -> std::io::Result<Option<Vec<u8>>> {
     let mut len = [0u8; 4];
@@ -224,5 +267,23 @@ mod tests {
         let mut r = &buf[..];
         assert_eq!(read_msg(&mut r).unwrap().unwrap(), b"{\"a\":1}");
         assert!(read_msg(&mut r).unwrap().is_none());
+    }
+
+    #[test]
+    fn an_oversize_message_is_skipped_and_the_next_one_lines_up() {
+        let mut buf = Vec::new();
+        let big = vec![b'x'; MAX_MESSAGE + 10];
+        write_msg(&mut buf, &big).unwrap();
+        write_msg(&mut buf, b"{\"b\":2}").unwrap();
+        let mut r = &buf[..];
+        assert_eq!(read_msg_keep(&mut r).unwrap(), Some(Incoming::TooLarge(MAX_MESSAGE + 10)));
+        assert_eq!(read_msg_keep(&mut r).unwrap(), Some(Incoming::Msg(b"{\"b\":2}".to_vec())));
+        assert_eq!(read_msg_keep(&mut r).unwrap(), None);
+        // The old reader (the live failure): an error, i.e. the connection closed.
+        let mut r = &buf[..];
+        assert!(read_msg(&mut r).is_err());
+        // Cut short inside a skipped message = closed, never misaligned.
+        let mut r = &buf[..1000];
+        assert_eq!(read_msg_keep(&mut r).unwrap(), None);
     }
 }

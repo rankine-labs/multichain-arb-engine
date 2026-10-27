@@ -138,6 +138,10 @@ pub struct Paused {
     pub gap: Option<String>,
     /// Scoreboard pause for loops (path "loop"), or null.
     pub r#loop: Option<String>,
+    /// Scoreboard pause for fire-first trades (path "trig_first"), or null
+    /// (fastlane/trigger.rs: Rust's own fire-first sends). An older Node bot
+    /// that does not write it = null, like the two above.
+    pub trig: Option<String>,
 }
 
 /// The state file as Node writes it. Every field has a default, and the

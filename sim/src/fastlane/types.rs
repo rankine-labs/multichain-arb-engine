@@ -86,6 +86,10 @@ pub enum ViewKind {
     Confirmed,
     /// Predicted state (copy 2 moved forward by feed messages, workstream A).
     Predicted,
+    /// Fire-first (fastlane/trigger.rs): copy 2's newest confirmed version
+    /// + the feed up to and including ONE trigger transaction, replayed by
+    /// the trigger-first rules (check/ordered.rs), then our trade.
+    Trigger,
 }
 
 impl ViewKind {
@@ -93,6 +97,7 @@ impl ViewKind {
         match self {
             ViewKind::Confirmed => "confirmed",
             ViewKind::Predicted => "predicted",
+            ViewKind::Trigger => "trigger",
         }
     }
 }

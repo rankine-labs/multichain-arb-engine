@@ -3432,7 +3432,7 @@ if (FASTLANE_MODE !== 'off' && chainOn('robinhood')) {
             // Pools a real trade may use: exchange cleared, not practice-only,
             // live coin rule (liveBlocker), and a pool type the contract can run.
             livePools: () => copy2PoolKeys().filter((k) => { const p = cache.get('robinhood', k); return !!p && !liveBlocker(p, p) && kindForPool(p) !== null && (kindForPool(p) !== KIND_V4_HOOKED || v4KeyCheck.matches(p)); }),
-            paused: () => ({ gap: scoreboard.pausedWhy('gap'), loop: scoreboard.pausedWhy('loop') }),
+            paused: () => ({ gap: scoreboard.pausedWhy('gap'), loop: scoreboard.pausedWhy('loop'), trig: scoreboard.pausedWhy('trig_first') }),
             loopLossUsd: () => (loopLive?.lossTodayUsd() ?? 0) + (entryLoopSender?.lossTodayUsd() ?? 0) + rustLoopLoss(),
             loopPaused: () => !!(loopLive?.pausedToday() || entryLoopSender?.pausedToday()),
             // Not live here = not ready there (Rust needs this bot live to track its sends).

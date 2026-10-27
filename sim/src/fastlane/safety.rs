@@ -84,6 +84,10 @@ pub struct SafetyInput {
     pub lender: Option<String>,
     /// When the opportunity was found (feed message applied + scan).
     pub found_at: Instant,
+    /// A fire-first trade (fastlane/trigger.rs): the scoreboard's
+    /// "trig_first" pause applies (Node's pausedWhy('trig_first')), not the
+    /// standing-gap one. false = as before.
+    pub trig: bool,
 }
 
 impl SafetyInput {
@@ -91,7 +95,7 @@ impl SafetyInput {
     #[allow(clippy::too_many_arguments)]
     pub fn new(block: u64, label: String, token_in: String, tokens: Vec<String>, pools: Vec<String>, amount_in: u128, size_usd: f64, expected_net_usd: f64, gas_usd: f64, lender: Option<String>, found_at: Instant) -> SafetyInput {
         let kind = if pools.len() > 2 { RouteKind::Loop } else { RouteKind::Pair };
-        SafetyInput { block, label, kind, token_in, tokens, pools, amount_in, size_usd, expected_net_usd, gas_usd, lender, found_at }
+        SafetyInput { block, label, kind, token_in, tokens, pools, amount_in, size_usd, expected_net_usd, gas_usd, lender, found_at, trig: false }
     }
 }
 
@@ -420,6 +424,13 @@ impl Safety {
         }
         // 15. Scoreboard pauses (shadowMain.ts:2745 pausedWhy; loops 2010).
         match o.kind {
+            // Fire-first pairs: the "trig_first" pause (Node's own fire-first
+            // sends check pausedWhy('trig_first'), trigEntry.ts gates).
+            RouteKind::Pair if o.trig => {
+                if let Some(p) = &st.raw.paused.trig {
+                    return Err(BlockReason::new("scoreboard", format!("scoreboard: fire-first paused ({p})")));
+                }
+            }
             RouteKind::Pair => {
                 if let Some(p) = &st.raw.paused.gap {
                     return Err(BlockReason::new("scoreboard", format!("scoreboard: gap paused ({p})")));
@@ -775,10 +786,15 @@ mod tests {
 
     #[test]
     fn scoreboard_and_loop_limits() {
-        assert_eq!(T::new(&[], NodeState { paused: Paused { gap: Some("lost".into()), r#loop: None }, ..good_state() }).code(&pair()), "scoreboard");
+        assert_eq!(T::new(&[], NodeState { paused: Paused { gap: Some("lost".into()), r#loop: None, trig: None }, ..good_state() }).code(&pair()), "scoreboard");
+        // Fire-first from Rust (fastlane/trigger.rs): its own pause, not the gap one.
+        let trig = SafetyInput { trig: true, ..pair() };
+        assert_eq!(T::new(&[], NodeState { paused: Paused { gap: Some("lost".into()), r#loop: None, trig: None }, ..good_state() }).code(&trig), "ok", "a gap pause does not stop fire-first");
+        assert_eq!(T::new(&[], NodeState { paused: Paused { gap: None, r#loop: None, trig: Some("lost".into()) }, ..good_state() }).code(&trig), "scoreboard");
+        assert_eq!(T::new(&[], NodeState { paused: Paused { gap: None, r#loop: None, trig: Some("lost".into()) }, ..good_state() }).code(&pair()), "ok", "and the fire-first pause does not stop gaps");
         let lp = SafetyInput::new(1, "loop".into(), "0xusdg".into(), vec!["0xusdg".into(), "0xcoin".into(), "0xweth".into()], vec!["0xp1".into(), "0xp2".into(), "0xp3".into()], 1_000, 500.0, 1.0, 0.05, Some("0xlender".into()), Instant::now());
         assert_eq!(T::new(&[], good_state()).code(&lp), "ok");
-        assert_eq!(T::new(&[], NodeState { paused: Paused { gap: None, r#loop: Some("x".into()) }, ..good_state() }).code(&lp), "scoreboard");
+        assert_eq!(T::new(&[], NodeState { paused: Paused { gap: None, r#loop: Some("x".into()), trig: None }, ..good_state() }).code(&lp), "scoreboard");
         assert_eq!(T::new(&[], NodeState { loop_loss_usd: 1.96, ..good_state() }).code(&lp), "loop_loss_cap");
         assert_eq!(T::new(&[], NodeState { loop_paused: true, ..good_state() }).code(&lp), "loop_loss_cap");
         assert_eq!(T::new(&[("LOOP_LIVE_MAX_TRADE_USD", "400")], good_state()).code(&lp), "loop_max_trade");

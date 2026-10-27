@@ -2,7 +2,7 @@ import { mkdtempSync, readFileSync, writeFileSync, existsSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { TriggerFirst, TrigCopy2, trigFirstSettings } from '../execution/triggerFirst';
-import { TrigEntry, EntryCandidate, TablePool, TableRoute, entrySettings } from '../execution/trigEntry';
+import { TrigEntry, EntryCandidate, TablePool, TableRoute, entrySettings, splitTablePools } from '../execution/trigEntry';
 import { JsonlLog } from '../execution/localSimHost';
 import { LocalSimClient } from '../execution/localSim';
 import { KIND_V2, KIND_V3 } from '../execution/executorCalldata';
@@ -35,6 +35,10 @@ function assert(cond: boolean, msg: string) {
 }
 
 const FIXTURE = join(__dirname, '..', '..', 'sim', 'tests', 'fixtures', 'fastlane_bot_table.json');
+// ZERO-ROUTES FIX (Oct 27): the live settings (two steps, fast lane on) with a
+// table bigger than one message may carry: the parts, in order (Rust side:
+// sim/tests/fastlane_wire.rs sends them over a real socket).
+const PARTS_FIXTURE = join(__dirname, '..', '..', 'sim', 'tests', 'fixtures', 'fastlane_bot_table_parts.json');
 const USDG = '0x' + '11'.repeat(20);
 const WETH = '0x' + '22'.repeat(20);
 const MEME = '0x' + '33'.repeat(20);
@@ -67,8 +71,8 @@ const copy2: TrigCopy2 = { running: () => true, notReadyWhy: () => null, waitFor
 // 4 watched pools (MEME/USDG and MEME/WETH on two exchanges each); each pool's
 // routes: buy here / sell on the peer and the other way, from the coin we
 // hold. USDG routes use our own money, WETH routes a V3 flash loan.
-function universe() {
-  const pools = [0, 1, 2, 3].map((i) => ({ addr: poolAddr(i), start: i < 2 ? USDG : WETH, kind: i % 2 ? KIND_V3 : KIND_V2 }));
+function universe(pairs = 2) {
+  const pools = Array.from({ length: 2 * pairs }, (_, i) => ({ addr: poolAddr(i), start: (i >> 1) % 2 === 0 ? USDG : WETH, kind: i % 2 ? KIND_V3 : KIND_V2 }));
   const peerOf = (i: number) => pools[i ^ 1];
   const candOf = (buy: typeof pools[0], sell: typeof pools[0]): EntryCandidate => {
     const usdg = buy.start === USDG;
@@ -94,13 +98,13 @@ function universe() {
   return { table: (): TablePool[] => pools.map((p, i) => ({ pool: p.addr, routes: () => routesOf(i) })) };
 }
 
-function entryWith(env: Record<string, string>) {
+function entryWith(env: Record<string, string>, pairs = 2) {
   const { client, tables } = fakeClient();
   const log = new JsonlLog(join(mkdtempSync(join(tmpdir(), 'flwire-')), 'x.jsonl'), 1_000_000, 0);
   const tf = new TriggerFirst({ client, settings: trigFirstSettings(env), copy2: () => copy2, shadowLog: log, hostOn: () => true, log: () => {} });
   const te = new TrigEntry({
     tf, client, shadowLog: log, settings: entrySettings(env, 0.1),
-    candidatesFor: () => ({ cands: [], found: 0 }), tableRoutes: universe().table,
+    candidatesFor: () => ({ cands: [], found: 0 }), tableRoutes: universe(pairs).table,
     isOurTx: () => false, ourAddresses: [], killed: () => false, safety: () => null, failBlocked: () => null, pausedWhy: () => null,
     send: async () => ({}), log: () => {}, lag: () => 0,
   });
@@ -143,6 +147,44 @@ async function main() {
     writeFileSync(FIXTURE, JSON.stringify(m, null, 1) + '\n');
     console.log(`wrote ${FIXTURE}`);
   }
+  // ZERO-ROUTES FIX (Oct 27). Live: TRIG_ENTRY_ONE_TRIP=0 + FASTLANE=practice,
+  // ~1,800 pools. Each row is ~2.5 KB, so a full table of a few thousand rows
+  // passes arbsim's 8 MB message limit, and such a message used to close the
+  // bot's ONLY connection to arbsim without a word (pool reports and checks
+  // with it). The table now goes in parts of at most TRIG_ENTRY_TABLE_MAX_BYTES.
+  const rowBytes = Buffer.byteLength(JSON.stringify(rows[0]), 'utf8');
+  console.log(`(test numbers) one table row ~${rowBytes} bytes: a single message passes 8 MB at ~${Math.round(8 * 1024 * 1024 / rowBytes)} rows`);
+  const live = { LOCAL_SIM_TRIGGER_FIRST: 'on', TRIG_ENTRY_TABLE_MS: '0', TRIG_ENTRY_ONE_TRIP: '0', FASTLANE: 'practice', TRIG_ENTRY_TABLE_MAX_BYTES: '40000' };
+  const L = entryWith(live, 8);
+  assert(!L.te.oneTripOn() && L.te.tableOn(), 'live settings: two steps, the table is kept for the fast lane');
+  assert(await L.te.refreshTable(), 'the table is taken (every part acknowledged)');
+  const sizes = L.tables.map((t) => Buffer.byteLength(JSON.stringify(t), 'utf8'));
+  assert(L.tables.length > 1 && sizes.every((b) => b <= 40000 + 3000), `split in ${L.tables.length} messages, each within the limit (${sizes.join(', ')} bytes)`);
+  assert(L.tables[0].full === true && L.tables.slice(1).every((t, i) => t.full === false && t.base === L.tables[i].gen && t.gen === L.tables[i].gen + 1), 'first part full, each next part builds on the one before (arbsim\'s partial rule)');
+  // What arbsim ends up holding (its merge rule): the same as one message would carry.
+  const merged: Record<string, unknown> = {};
+  for (const t of L.tables) for (const [k, v] of Object.entries(t.pools as Record<string, unknown>)) merged[k] = v;
+  const one = splitTablePools(merged, L.tables[0].codes, 1e12);
+  assert(one.length === 1 && Object.keys(merged).length === 16 && Object.values(merged).flat().length === 32, 'the parts together = the whole table (16 pools, 32 rows)');
+  assert(L.tables.slice(1).every((t) => Array.isArray(t.codes) && t.codes.length === 0) && L.tables[0].codes.length > 0, 'the long codes go once, in the first part');
+  // An unchanged refresh still sends nothing; a single pool change goes alone.
+  const n0 = L.tables.length;
+  await L.te.refreshTable();
+  assert(L.tables.length === n0, 'nothing changed: nothing re-sent');
+  // splitTablePools itself: order kept, a pool never split, tiny limit = one pool per part.
+  const sp = splitTablePools({ a: [1], b: [2, 3], c: null }, [], 10);
+  assert(sp.length === 3 && JSON.stringify(sp) === JSON.stringify([{ a: [1] }, { b: [2, 3] }, { c: null }]), 'splitter: one pool per part when the limit is tiny, in order, removals kept');
+  assert(JSON.stringify(splitTablePools({}, [], 100)) === JSON.stringify([{}]), 'splitter: nothing = one empty message (as before)');
+  if (process.env.WRITE_FASTLANE_FIXTURE === '1') {
+    writeFileSync(PARTS_FIXTURE, JSON.stringify(L.tables, null, 1) + '\n');
+    console.log(`wrote ${PARTS_FIXTURE}`);
+  }
+  assert(existsSync(PARTS_FIXTURE), 'the Rust side\'s parts fixture exists');
+  if (existsSync(PARTS_FIXTURE)) {
+    const fx = JSON.parse(readFileSync(PARTS_FIXTURE, 'utf8')) as Array<Record<string, any>>;
+    assert(fx.length === L.tables.length && fx.every((m, i) => canonical(m) === canonical(L.tables[i])), 'the Rust parts fixture is exactly what the bot sends today (WRITE_FASTLANE_FIXTURE=1 to rewrite)');
+  }
+
   assert(existsSync(FIXTURE), 'the Rust side\'s fixture exists');
   if (existsSync(FIXTURE)) {
     const fx = JSON.parse(readFileSync(FIXTURE, 'utf8'));

@@ -99,7 +99,9 @@ export interface FastlaneState {
   liveBlocks: PairBlockRow[];
   failBlocks: PairBlockRow[];
   livePools: string[];
-  paused: { gap: string | null; loop: string | null };
+  // trig: the scoreboard's fire-first pause (Rust's own fire-first sends,
+  // sim/src/fastlane/trigger.rs; null = not paused).
+  paused: { gap: string | null; loop: string | null; trig?: string | null };
   loopLossUsd: number;
   loopPaused: boolean;
   liveReady: boolean;
@@ -174,7 +176,7 @@ export function buildFastlaneState(s: StateSources): FastlaneState {
     liveBlocks: safe(s.liveBlocks, []),
     failBlocks: safe(s.failBlocks, []),
     livePools: lowerAll(safe(s.livePools, [])),
-    paused: safe(s.paused, { gap: 'state source error', loop: 'state source error' }),
+    paused: safe(s.paused, { gap: 'state source error', loop: 'state source error', trig: 'state source error' }),
     loopLossUsd: loopOk ? Math.max(0, loopRaw) : 1e9,
     loopPaused: !loopOk || safe(s.loopPaused, true),
     liveReady: safe(s.liveReady, false),

@@ -3322,3 +3322,296 @@ fn fastlane_ahead_prediction_agrees_with_copy_2s_confirmed_block() {
     assert_eq!((ah.total.agree, ah.total.disagree, ah.total.unsure), (1, 0, 0), "{}", ah.total.json());
     assert_eq!((ah.base_seq(), ah.depth()), (Some(102), 0));
 }
+
+// ---------------------------------------------------------------------------
+// FIRE-FIRST FROM RUST (Oct 27, fastlane/trigger.rs): a feed message reaches
+// arbsim; Rust replays the trigger on copy 2's newest CONFIRMED version
+// (block 101: block 102's pool reports never arrive in this test), picks the
+// bot's table row for the moved pool, checks our trade, and hands the good
+// answer straight to the fast lane's safety gates + gun. Proven here:
+//   1. the would-send is signed and logged with the trigger's block, with
+//      NO report for that block, NO receipt and NO request to copy 2's node;
+//   2. practice NEVER broadcasts (a local send endpoint sees nothing);
+//   3. live without RUST_SENDER: blocked by the one-sender rule, nothing sent;
+//   4. a trigger is decided once (a repeat of the same tx is not re-fired);
+//   5. the scoreboard's fire-first pause (Node's state "paused.trig") blocks it.
+// ---------------------------------------------------------------------------
+
+/// A local "send endpoint": counts every connection made to it (nothing may
+/// ever connect in practice).
+fn fl_endpoint() -> (String, Arc<std::sync::atomic::AtomicU64>) {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", l.local_addr().unwrap());
+    let n = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let n2 = n.clone();
+    std::thread::spawn(move || {
+        for s in l.incoming() {
+            if s.is_ok() {
+                n2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+    });
+    (url, n)
+}
+
+struct FlRead;
+impl arbsim::fastlane::gun::rpc::ReadRpc for FlRead {
+    fn call(&self, method: &str, _p: Value) -> Result<Value, String> {
+        match method {
+            "eth_getBlockByNumber" => Ok(json!({"number": "0x1f4", "baseFeePerGas": "0x989680"})),
+            "eth_getTransactionCount" => Ok(json!("0x7")),
+            "eth_call" => Ok(json!(format!("0x{:064x}{:064x}{:064x}", 20_000u64, 0, 0))),
+            _ => Err("unsupported".into()),
+        }
+    }
+}
+
+/// Firing parts (the fast lane's) in a temp folder: `env` = FASTLANE etc.,
+/// `paused_trig` = the scoreboard's fire-first pause in Node's state file.
+fn fl_firer(tag: &str, env: &[(&str, &str)], paused_trig: Option<&str>) -> (arbsim::fastlane::lane::Firer, std::path::PathBuf, Arc<std::sync::atomic::AtomicU64>) {
+    use arbsim::fastlane::bridge::{wall_ms, KillSwitch, NodeState, OwnMoney, SendsLog, StateReader};
+    use arbsim::fastlane::lane::{reply_hook, FireCore, Firer, ReplyBook, SafetyGate};
+    use arbsim::fastlane::safety::{utc_day, Safety, SafetyConfig};
+    let dir = std::env::temp_dir().join(format!("fl-trig-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let (url, hits) = fl_endpoint();
+    let mut m: HashMap<String, String> = env.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+    m.insert("KILL_FILE".into(), dir.join("KILL").to_string_lossy().into());
+    m.insert("FASTLANE_STATE_FILE".into(), dir.join("fastlane-state.json").to_string_lossy().into());
+    m.insert("FASTLANE_SENDS_FILE".into(), dir.join("fastlane-sends.jsonl").to_string_lossy().into());
+    m.insert("ROBINHOOD_SEND_RPC".into(), url);
+    m.insert("ARB_EXECUTOR_ROBINHOOD".into(), "0x00000000000000000000000000000000000000ee".into());
+    m.insert("GAP_SENT_POOL_HOLD_MS".into(), "0".into());
+    m.insert("FASTLANE_MAX_OPP_AGE_MS".into(), "5000".into());
+    let now = wall_ms();
+    let k = |x: Address| format!("{x:#x}");
+    let mut st = NodeState {
+        v: 1, written_ms: now, loss_day: utc_day(now),
+        allowlist: vec![k(check_util::addr(1)), k(check_util::addr(2))],
+        live_pools: vec![k(a(V2P)), k(check_util::addr(0x1002))],
+        live_ready: true, rust_sender: false,
+        approved_lenders: vec![k(check_util::addr(0x1e0))],
+        own_money: OwnMoney { read_ms: now, balances: Default::default() },
+        ..Default::default()
+    };
+    st.paused.trig = paused_trig.map(|s| s.to_string());
+    std::fs::write(dir.join("fastlane-state.json"), serde_json::to_vec(&st).unwrap()).unwrap();
+    let get = |key: &str| m.get(key).cloned();
+    let safety = Safety::new(SafetyConfig::from_lookup(&get), arbsim::fastlane::mode::FastlaneMode::from_lookup(get), KillSwitch::from_lookup(&get), StateReader::from_lookup(&get));
+    let gate = Arc::new(SafetyGate::new(&safety));
+    let log = Arc::new(SendsLog::from_lookup(&get));
+    let book = Arc::new(ReplyBook::default());
+    let gun = Arc::new(arbsim::fastlane::gun::Gun::from_lookup(&get, gate.clone(), reply_hook(log.clone(), book.clone()), Some(Arc::new(FlRead))).unwrap().expect("FASTLANE on"));
+    let t = std::time::Instant::now();
+    while gun.not_ready().is_some() && t.elapsed() < std::time::Duration::from_secs(5) {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    (Firer { core: Arc::new(Mutex::new(FireCore { safety })), gate, gun, log, book }, dir, hits)
+}
+
+/// The bot's table row for "buy on V2P, sell on 0x1002" (flash loan from
+/// 0x1e0, start coin addr(1), 6 decimals at $1): its check calls V2P itself,
+/// whose code answers InsufficientProfit(slot 8) like our contract does.
+fn fl_table_row() -> Value {
+    use arbsim::fastlane::types::{encode_trade, DecodedTrade, FlashLender, Hop, KIND_V3};
+    let ad = check_util::addr;
+    let hop = |p: Address, i: u64, o: u64| Hop { kind: KIND_V3, pool: p, token_in: ad(i), token_out: ad(o), fee_bps: 0, v4_fee: 0, v4_tick_spacing: 0, v4_native: false };
+    let data = encode_trade(&DecodedTrade { token: ad(1), amount_in: U256::from(400_000_000u64), min_profit: U256::MAX, max_block: U256::MAX, hops: vec![hop(a(V2P), 1, 2), hop(ad(0x1002), 2, 1)], flash: FlashLender::V3Flash(ad(0x1e0)) });
+    let k = |x: Address| format!("{x:#x}");
+    json!({
+        "rid": format!("{}>{}:{}", k(a(V2P)), k(ad(0x1002)), k(ad(1))), "h": true, "s": 1.0, "e": "1.1",
+        "c": {
+            "calls": [{ "from": k(ad(0xb0751)), "to": k(a(V2P)), "gas": "0x7a1200", "data": hexb(&data) }],
+            "overrides": {},
+            "sizes": { "amountOffset": 96, "amounts": ["0x2faf080", "0x8f0d180"] },
+            "route": [k(a(V2P)), k(ad(0x1002)), k(ad(0x1e0))],
+            "stop": "0x30d40", "amt": "0x17d78400",
+        },
+        "f": { "l": "COIN/USDG test", "px": 1.0, "d": 6, "g": 0.05, "lp": 500 },
+    })
+}
+
+/// V2P for the fast-lane tests: a 32-byte call STORES the word in slot 8
+/// (the "swap"); any other call reverts with InsufficientProfit(reserve0,
+/// MAX), reserve0 = the low 112 bits of slot 8 (our contract's answer, with
+/// the "profit" read from the pool's own reserves).
+fn fl_pool_code() -> Vec<u8> {
+    check_util::hex("36 6020 14 6033 57 634e88422a 60e0 1b 6000 52 6008 54 6dffffffffffffffffffffffffffff 16 6004 52 6000 19 6024 52 6044 6000 fd 5b 6000 35 6008 55 00")
+}
+
+#[test]
+fn fastlane_trigger_fires_from_rust_without_waiting_for_reports() {
+    use arbsim::fastlane::lane::FiredWhat;
+    use arbsim::fastlane::trigger::{TrigCfg, TrigOutcome, Trigger};
+    let _turn = FEED_STORE_TURN.lock().unwrap_or_else(|e| e.into_inner());
+    arbsim::check::feedstore::store().clear();
+    let (r, ctx) = trig_world_code(fl_pool_code());
+    assert_eq!(r.sh.head().unwrap().block, 101);
+    // The bot's candidate table (what `trig_table` carries), V2P's routes.
+    let k = format!("{:#x}", a(V2P));
+    let ans = arbsim::check::entry::apply_table(&json!(1), &json!({"type": "trig_table", "gen": 1, "full": true, "codes": [], "pools": {k.clone(): [fl_table_row()]}}));
+    assert_eq!(ans["ok"], json!(true), "{ans}");
+    // The trigger: someone's "swap" leaves 2 USDG (2,000,000 units) of profit for our route.
+    let swap = signed(0, a(V2P), u(2_000_000).to_be_bytes::<32>().to_vec());
+    let put = |seq: u64, txs: &[&Vec<u8>]| {
+        let m = json!({"seq": seq, "ts": 63, "l1": 9000, "txs": txs.iter().map(|t| hexb(t)).collect::<Vec<_>>()});
+        arbsim::check::feedstore::store().put_json(&json!({"type": "feed_put", "msgs": [m]}));
+        arbsim::check::feedstore::store().get(seq).unwrap()
+    };
+    let m102 = put(102, &[&swap]);
+    let cfg = TrigCfg { max_lag_ms: 60_000, ..TrigCfg::default() };
+
+    // 1 + 2. Practice: decided and signed in Rust; nothing broadcast.
+    let (firer, dir, hits) = fl_firer("practice", &[("FASTLANE", "practice")], None);
+    let mut t = Trigger::new(cfg.clone(), firer);
+    t.to_practice = false;
+    let node_before = *r.chain.calls.lock().unwrap() + *r.chain.paid_calls.lock().unwrap();
+    let arrived = std::time::Instant::now();
+    let out = t.on_message(&ctx, &m102, arrived);
+    let node_after = *r.chain.calls.lock().unwrap() + *r.chain.paid_calls.lock().unwrap();
+    assert_eq!(out.len(), 1, "{out:?}");
+    let TrigOutcome::Fired(FiredWhat::Written { seq, hand_us }) = &out[0] else { panic!("{out:?} {}", t.hour.json()) };
+    assert_eq!(node_before, node_after, "no node request on the way to the gun");
+    assert_eq!(r.sh.head().unwrap().block, 101, "block 102's reports never came: copy 2 is still at 101");
+    assert_eq!((t.hour.would_send, t.hour.live_sent, t.hour.routes_checked, t.hour.moved), (1, 0, 1, 1), "{}", t.hour.json());
+    let rec: Value = serde_json::from_str(std::fs::read_to_string(dir.join("fastlane-sends.jsonl")).unwrap().lines().next().unwrap()).unwrap();
+    assert_eq!((rec["mode"].clone(), rec["seq"].clone(), rec["block"].clone()), (json!("practice"), json!(*seq), json!(102)), "{rec}");
+    assert_eq!(rec["amountIn"], json!("400000000"), "the answer's best size: {rec}");
+    assert!((rec["expectedNetUsd"].as_f64().unwrap() - 1.95).abs() < 1e-9, "2 USDG profit - $0.05 gas: {rec}");
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0, "practice never connects to the send endpoint");
+    println!("[test numbers only] feed message in arbsim -> signed bytes ready: {hand_us} us (decision {} us)", t.hour.decide_us[0]);
+
+    // 4. The same trigger again (a reconnect's repeat): decided once.
+    let out = t.on_message(&ctx, &m102, std::time::Instant::now());
+    assert_eq!(out, vec![TrigOutcome::Repeat]);
+
+    // 3. Live without RUST_SENDER: the one-sender rule blocks it; nothing sent.
+    let (firer, _d, hits) = fl_firer("live-no-rs", &[("FASTLANE", "live"), ("EXECUTION_ENABLED", "true"), ("LIVE_SEND_CONFIRM", "yes-real-money")], None);
+    let mut t = Trigger::new(cfg.clone(), firer);
+    t.to_practice = false;
+    let out = t.on_message(&ctx, &m102, std::time::Instant::now());
+    assert_eq!(out, vec![TrigOutcome::Fired(FiredWhat::Blocked("node_is_sender"))], "{}", t.hour.json());
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+    // 5. Scoreboard paused fire-first (Node's state): blocked.
+    let (firer, _d, _h) = fl_firer("paused", &[("FASTLANE", "practice")], Some("bucket trig_first paused (test)"));
+    let mut t = Trigger::new(cfg.clone(), firer);
+    t.to_practice = false;
+    let out = t.on_message(&ctx, &m102, std::time::Instant::now());
+    assert_eq!(out, vec![TrigOutcome::Fired(FiredWhat::Blocked("scoreboard"))], "{}", t.hour.json());
+
+    // A swap leaving too little profit: checked, not good (no fire).
+    let small = signed(1, a(V2P), u(1_000).to_be_bytes::<32>().to_vec());
+    let m103 = put(103, &[&small]);
+    let (firer, _d, _h) = fl_firer("small", &[("FASTLANE", "practice")], None);
+    let mut t = Trigger::new(cfg.clone(), firer);
+    let out = t.on_message(&ctx, &m103, std::time::Instant::now());
+    assert_eq!(out, vec![TrigOutcome::NotGood], "{}", t.hour.json());
+    // A plain transfer is skipped by the bot's quick test; a read moves nothing.
+    let read = signed(2, a(V2P), vec![0x09, 0x02, 0xf1, 0xac]);
+    let plain = signed(3, a(V2P), vec![]);
+    let m104 = put(104, &[&plain, &read]);
+    let out = t.on_message(&ctx, &m104, std::time::Instant::now());
+    assert_eq!(out, vec![TrigOutcome::Skipped("plain_transfer"), TrigOutcome::NoPools], "{}", t.hour.json());
+    arbsim::check::entry::clear_table();
+    arbsim::check::feedstore::store().clear();
+}
+
+// STANDING GAPS ON COPY 2 (Oct 27): with the predicted copy off (the new
+// default) the fast lane scans the routes through the pools each NEW copy-2
+// version moved, on that confirmed state, and fires the best through the same
+// safety + gun. Block 101: our route earns 1,100 units ($0.0011, under the
+// minimum): nothing. Block 102's reports leave reserve0 at 2,000,000 ($2):
+// one practice would-send, nothing broadcast. The same version again: nothing.
+#[test]
+fn fastlane_lane_scans_copy_2s_confirmed_versions_when_the_predicted_copy_is_off() {
+    use arbsim::fastlane::lane::{Lane, LaneCfg};
+    use arbsim::fastlane::practice::{Practice, PracticeCfg};
+    use arbsim::fastlane::scan::{ScanConfig, Scanner, TableSource};
+    let (mut r, _ctx) = trig_world_code(fl_pool_code());
+    let k = format!("{:#x}", a(V2P));
+    let mut t = arbsim::check::entry::Table { gen: 1, ..Default::default() };
+    t.pools.insert(k.clone(), arbsim::check::entry::parse_rows(&json!([fl_table_row()])).unwrap());
+    let (firer, dir, hits) = fl_firer("lane", &[("FASTLANE", "practice")], None);
+    let get = |key: &str| (key == "FASTLANE_PRACTICE_FILE").then(|| dir.join("practice.jsonl").to_string_lossy().to_string());
+    let scanner = Scanner::new(ScanConfig { budget_us: 1_000_000, ..ScanConfig::default() }, Box::new(TableSource::owned(Arc::new(Mutex::new(t)))), Box::new(arbsim::fastlane::c2runner::Copy2Runner::new(r.h.clone())));
+    let safety = std::sync::Arc::try_unwrap(firer.core).ok().unwrap().into_inner().unwrap().safety;
+    let mut lane = Lane::new(LaneCfg { tip_max_age_ms: 5_000, ..LaneCfg::default() }, scanner, safety, firer.gate, firer.gun, firer.log, firer.book, Practice::new(PracticeCfg::from_lookup(&get), 0));
+    let fired = lane.on_confirmed_version(&r.h);
+    assert!(fired.is_empty(), "block 101: under the minimum: {fired:?}");
+    assert_eq!(lane.hour.confirmed, 1);
+    r.send(msg(102, 63, vec![
+        v2_sync(2_000_000, 3340, 102, 1, 2),
+        lg(a(V2P), vec![topics().v2_swap, topic_of(a(USER)), topic_of(a(USER))], data(&[u(100), u(0), u(0), u(300)]), 102, 1, 3),
+    ]));
+    assert_eq!(r.sh.head().unwrap().block, 102);
+    let fired = lane.on_confirmed_version(&r.h);
+    assert_eq!(fired.len(), 1, "{:?}", lane.status_json());
+    let w = fired[0].written.as_ref().expect("written");
+    assert_eq!((w.mode.as_str(), w.block), ("practice", 102));
+    assert!(!fired[0].live);
+    assert_eq!((lane.hour.would_send, lane.hour.live_sent), (1, 0));
+    assert!(lane.on_confirmed_version(&r.h).is_empty(), "the same version is scanned once");
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0, "practice never connects to the send endpoint");
+}
+
+// FIRE-FIRST OFFLINE REPLAY (`arbsim trig-replay`, fastlane/trig_replay.rs):
+// a recording in arrival order (copy-2 version 101, then feed message 102
+// with the "swap", then copy 2's version 102 once its reports came) played
+// through the Rust fire-first decision with no future information:
+//   - message 102 is judged on version 101 (copy lag 1 block),
+//   - discovery names V2P, the bot's table row is checked, the stop rule
+//     accepts it: one trade would reach the gun,
+//   - when version 102 arrives (later in the recording) the trade is
+//     re-checked at the end of block 102: still profitable;
+//   - without a table: discovery only (no candidates), same coverage.
+#[test]
+fn fastlane_trig_replay_plays_a_recording_in_arrival_order() {
+    use arbsim::copy2::ahead::AheadCfg;
+    use arbsim::copy2::ahead_capture::{CapEv, CapFile, ProvSets};
+    use arbsim::fastlane::trig_replay::{print_report, trig_replay, TrigReplayOpts};
+    use arbsim::fastlane::trigger::TrigCfg;
+    let (mut r, _ctx) = trig_world_code(fl_pool_code());
+    let version = |r: &Rig| {
+        let v = r.sh.head().unwrap();
+        CapEv::Confirmed { seq: v.seq, ctx: v.ctx.clone(), snap: v.snap.clone() }
+    };
+    let prov = |r: &Rig, b: u64| CapEv::Prov(Arc::new(ProvSets::from_copy2(&r.h.provenance_at(b, &[]))));
+    let fp = arbsim::check::moved::FollowedPool { key: format!("{:#x}", a(V2P)), address: a(V2P), v4_id: None };
+    let swap = signed(0, a(V2P), u(2_000_000).to_be_bytes::<32>().to_vec());
+    let plain = signed(1, a(V2P), vec![]);
+    let wm = arbsim::check::ordered::WireFeedMsg { seq: 102, ts: 62, l1: 9000, txs: vec![hexb(&plain), hexb(&swap)], complete: true, why: None };
+    let mut events = vec![
+        CapEv::Header { cfg: AheadCfg::default(), l2_offset: 0, live: "{}".into() },
+        CapEv::Pools { list: vec![(fp, a(COIN0), a(COIN1))], not_ready: vec![] },
+        prov(&r, 101),
+        version(&r),
+        CapEv::Feed(Arc::new(arbsim::check::feedstore::BinMsg::from_wire(&wm, true))),
+    ];
+    r.send(msg(102, 62, vec![
+        v2_sync(2_000_000, 3340, 102, 1, 2),
+        lg(a(V2P), vec![topics().v2_swap, topic_of(a(USER)), topic_of(a(USER))], data(&[u(100), u(0), u(0), u(300)]), 102, 1, 3),
+    ]));
+    events.push(prov(&r, 102));
+    events.push(version(&r));
+    events.push(CapEv::End { live: "{}".into(), why: "done".into() });
+    let cap = CapFile { events, complete: true, cut: None };
+    let table = arbsim::check::entry::table_from_messages(&[json!({"type": "trig_table", "gen": 1, "full": true, "codes": [], "pools": {format!("{:#x}", a(V2P)): [fl_table_row()]}})]).unwrap();
+    let cfg = TrigCfg::default();
+    let rep = trig_replay(&cap, Some(&table), &cfg, &TrigReplayOpts::default()).unwrap();
+    println!("{}", print_report(&rep));
+    assert_eq!(rep["copyLag"]["histogram"]["1"], json!(1), "{}", rep["copyLag"]);
+    assert_eq!((rep["coverage"]["txs"].clone(), rep["coverage"]["skipped"]["plain_transfer"].clone(), rep["coverage"]["asked"].clone()), (json!(2), json!(1), json!(1)), "{}", rep["coverage"]);
+    assert_eq!(rep["coverage"]["discovery"]["movedOurPools"], json!(1), "{}", rep["coverage"]);
+    let k = &rep["candidates"];
+    assert_eq!((k["routesChecked"].clone(), k["good"].clone(), k["wouldReachGun"].clone()), (json!(1), json!(1), json!(1)), "{k}");
+    assert_eq!(k["recheckAtBlockEnd"]["stillProfitable"], json!(1), "{k}");
+    assert!((rep["wouldFireSamples"][0]["netUsd"].as_f64().unwrap() - 1.95).abs() < 1e-9);
+    // Without the table: discovery only.
+    let rep = trig_replay(&cap, None, &cfg, &TrigReplayOpts::default()).unwrap();
+    assert_eq!((rep["coverage"]["discovery"]["movedOurPools"].clone(), rep["candidates"]["routesChecked"].clone()), (json!(1), json!(0)));
+}
