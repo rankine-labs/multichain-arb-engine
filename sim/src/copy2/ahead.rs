@@ -1524,20 +1524,26 @@ impl Ahead {
             }
             // Why? Copy 2's reports say which transaction moved it; find it
             // in this message and what we did with it.
-            let by = p.notes.iter().find(|n| moved_by_tx(&n.hash).is_some_and(|x| x.iter().any(|y| y.eq_ignore_ascii_case(k))));
+            // The mover we got wrong: the first transaction copy 2 says moved
+            // it that our prediction did NOT run to a move of this pool
+            // (skipped, not run, failed, reverted, or ran without moving it).
+            let movers: Vec<&TxNote> = p.notes.iter().filter(|n| moved_by_tx(&n.hash).is_some_and(|x| x.iter().any(|y| y.eq_ignore_ascii_case(k)))).collect();
+            let culprit = movers.iter().find(|n| !(n.fate == Fate::Ran && n.ok && n.pools.iter().any(|x| x == k))).copied();
+            let by = culprit.or(movers.first().copied());
+            let miss_kind = |n: &TxNote| match (n.fate, n.ok) {
+                (Fate::Skipped, _) => "missedFilter",
+                (Fate::OffRoute, _) => "missedOffRoute",
+                (Fate::Ran, true) => "missedRan",
+                (Fate::Ran, false) => "missedReverted",
+                (Fate::Failed, _) => "missedFailed",
+            };
             let kind = match (conf_moved.contains(k), p.changed_cum.contains(k)) {
-                (true, false) => match by {
-                    None => "notFromTx",
-                    Some(n) => match (n.fate, n.ok) {
-                        (Fate::Skipped, _) => "missedFilter",
-                        (Fate::OffRoute, _) => "missedOffRoute",
-                        (Fate::Ran, true) => "missedRan",
-                        (Fate::Ran, false) => "missedReverted",
-                        (Fate::Failed, _) => "missedFailed",
-                    },
-                },
+                (true, false) => by.map_or("notFromTx", miss_kind),
                 (false, true) => "phantom",
-                _ => "value",
+                // Both moved it to different values: if one of its movers was
+                // missed (e.g. a second swap the filter skipped), that is the
+                // cause; "value" only when we ran every mover and still differ.
+                _ => culprit.map_or("value", miss_kind),
             };
             if kind == "notFromTx" {
                 // Not a prediction miss (no transaction of this message moved
