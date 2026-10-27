@@ -154,26 +154,54 @@ impl Gate for SafetyGate {
 // ---------------------------------------------------------------------------
 
 #[derive(Default)]
+struct BookInner {
+    /// hash -> (seq, route id) of live sends written to the log.
+    by_hash: HashMap<String, (u64, String)>,
+    order: VecDeque<String>,
+    /// Replies that arrived BEFORE their send record was written (a fast
+    /// endpoint answers while the lane is still writing): held here and
+    /// written right after the send record, so the log is always in order.
+    early: HashMap<String, SendOutcome>,
+}
+
+#[derive(Default)]
 pub struct ReplyBook {
-    by_hash: Mutex<(HashMap<String, (u64, String)>, VecDeque<String>)>,
+    inner: Mutex<BookInner>,
     /// Routes to hand out again (sent trade never left / refused): M4.
     forget: Mutex<Vec<String>>,
     pub replies: Mutex<BTreeMap<&'static str, u64>>,
 }
 
 impl ReplyBook {
-    fn note(&self, hash: &str, seq: u64, rid: &str) {
-        let mut g = self.by_hash.lock().unwrap_or_else(|e| e.into_inner());
-        g.0.insert(hash.to_ascii_lowercase(), (seq, rid.to_string()));
-        g.1.push_back(hash.to_ascii_lowercase());
-        while g.1.len() > 512 {
-            if let Some(h) = g.1.pop_front() {
-                g.0.remove(&h);
+    /// The send record of `hash` is written (seq): returns its reply if it
+    /// already came (to be written now).
+    fn note(&self, hash: &str, seq: u64, rid: &str) -> Option<SendOutcome> {
+        let h = hash.to_ascii_lowercase();
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(o) = g.early.remove(&h) {
+            return Some(o);
+        }
+        g.by_hash.insert(h.clone(), (seq, rid.to_string()));
+        g.order.push_back(h);
+        while g.order.len() > 512 {
+            if let Some(x) = g.order.pop_front() {
+                g.by_hash.remove(&x);
             }
         }
+        None
     }
-    fn take(&self, hash: &str) -> Option<(u64, String)> {
-        self.by_hash.lock().unwrap_or_else(|e| e.into_inner()).0.remove(&hash.to_ascii_lowercase())
+    /// A reply: its send's (seq, route), or None = its record is not written
+    /// yet (the reply is kept for `note`).
+    fn take_or_hold(&self, o: &SendOutcome) -> Option<(u64, String)> {
+        let h = o.hash.to_ascii_lowercase();
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(x) = g.by_hash.remove(&h) {
+            return Some(x);
+        }
+        if g.early.len() < 64 {
+            g.early.insert(h, o.clone());
+        }
+        None
     }
     fn forget_later(&self, rid: String) {
         let mut f = self.forget.lock().unwrap_or_else(|e| e.into_inner());
@@ -186,34 +214,40 @@ impl ReplyBook {
     }
 }
 
+/// Write one "reply" line for send `seq` (route `rid`).
+fn write_reply(log: &SendsLog, book: &ReplyBook, o: &SendOutcome, seq: u64, rid: String) {
+    *book.replies.lock().unwrap_or_else(|e| e.into_inner()).entry(o.status.as_str()).or_default() += 1;
+    if matches!(o.status, SendStatus::Refused | SendStatus::StaleInQueue | SendStatus::NotWritten) && !rid.is_empty() {
+        book.forget_later(rid.clone());
+    }
+    let mut t = BTreeMap::new();
+    t.insert("reply".to_string(), o.reply_us);
+    t.insert("sequencer".to_string(), o.wait_us);
+    let rec = SendRecord {
+        seq: 0,
+        t: wall_ms(),
+        mode: "live".into(),
+        kind: Some("reply".into()),
+        reply_to: Some(seq),
+        reply_hash: Some(o.hash.clone()),
+        status: Some(o.status.as_str().into()),
+        error: o.result.as_ref().err().map(|e| e.chars().take(200).collect()),
+        label: rid,
+        timings_us: t,
+        ..Default::default()
+    };
+    let _ = log.append(&rec);
+}
+
 /// The reply hook the gun calls on its sender thread (live only): one
-/// "reply" line in the send log (Node: a refused send is released at once,
-/// not left waiting for a receipt), and a route whose trade never got in
-/// may be handed out again.
+/// "reply" line in the send log, always AFTER its send record (Node: a
+/// refused send is released at once, not left waiting for a receipt), and
+/// a route whose trade never got in may be handed out again.
 pub fn reply_hook(log: Arc<SendsLog>, book: Arc<ReplyBook>) -> Arc<dyn Fn(&SendOutcome) + Send + Sync> {
     Arc::new(move |o: &SendOutcome| {
-        *book.replies.lock().unwrap_or_else(|e| e.into_inner()).entry(o.status.as_str()).or_default() += 1;
-        let (seq, rid) = book.take(&o.hash).unwrap_or((0, String::new()));
-        if matches!(o.status, SendStatus::Refused | SendStatus::StaleInQueue | SendStatus::NotWritten) && !rid.is_empty() {
-            book.forget_later(rid.clone());
+        if let Some((seq, rid)) = book.take_or_hold(o) {
+            write_reply(&log, &book, o, seq, rid);
         }
-        let mut t = BTreeMap::new();
-        t.insert("reply".to_string(), o.reply_us);
-        t.insert("sequencer".to_string(), o.wait_us);
-        let rec = SendRecord {
-            seq: 0,
-            t: wall_ms(),
-            mode: "live".into(),
-            kind: Some("reply".into()),
-            reply_to: Some(seq),
-            reply_hash: Some(o.hash.clone()),
-            status: Some(o.status.as_str().into()),
-            error: o.result.as_ref().err().map(|e| e.chars().take(200).collect()),
-            label: rid,
-            timings_us: t,
-            ..Default::default()
-        };
-        let _ = log.append(&rec);
     })
 }
 
@@ -430,7 +464,9 @@ impl Lane {
         if live {
             self.hour.live_sent += 1;
             if let Some(h) = &rec.hash {
-                self.book.note(h, seq, &o.rid);
+                if let Some(early) = self.book.note(h, seq, &o.rid) {
+                    write_reply(&self.log, &self.book, &early, seq, o.rid.clone());
+                }
             }
         } else {
             self.hour.would_send += 1;

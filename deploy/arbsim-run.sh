@@ -8,7 +8,14 @@
 #        QUICKNODE_RPC_ROBINHOOD   -> paid node 2 (backup)
 #        ARBSIM_*                  -> optional sidecar settings (see
 #                                     docs/FAST_CHECK_OPS.md for the list)
-#      Nothing else (wallet keys, Telegram, ...) is read or passed on.
+#        FAST LANE settings        -> the exact list in FASTLANE_PASS below
+#                                     (FASTLANE, RUST_SENDER, kill switch,
+#                                     safety limits, sender settings)
+#      Nothing else (Telegram, ...) is read or passed on. The WALLET KEY
+#      (BOT_PRIVATE_KEY) is deliberately NOT passed: the owner has not
+#      decided yet whether arbsim may hold it. Without it the fast lane runs
+#      in practice mode only and says so ("live blocked: no key passed to
+#      arbsim (owner decision pending)").
 #      The node links are secrets: they are never printed, and because they
 #      are read here (not given to pm2), they never end up in pm2's saved
 #      process list either.
@@ -32,6 +39,38 @@ if [ -f "$ENV_FILE" ]; then
   done < <(grep -oE '^[[:space:]]*(export[[:space:]]+)?ARBSIM_[A-Z0-9_]+[[:space:]]*=' "$ENV_FILE" \
              | sed -E -e 's/^[[:space:]]*(export[[:space:]]+)?//' -e 's/[[:space:]]*=$//' | sort -u)
 fi
+
+# FAST LANE (sim/src/fastlane, Oct 26): the settings it reads, passed
+# through by NAME from .env (only these names; values are never printed).
+# FASTLANE unset / off = nothing new runs. Same names and meaning as the
+# Node bot's (one .env for both). NOT in this list on purpose:
+# BOT_PRIVATE_KEY (owner decision pending, see the header).
+FASTLANE_PASS=(
+  FASTLANE RUST_SENDER KILL_SWITCH KILL_FILE
+  EXECUTION_ENABLED LIVE_SEND_CONFIRM ARB_EXECUTOR_ROBINHOOD
+  MAX_TRADE_USD DAILY_LOSS_CAP_USD MAX_SENDS_PER_MIN MIN_EXEC_NET_USD AUTO_VET_MAX_TRADE_USD
+  LOOP_LIVE_MAX_TRADE_USD LOOP_LIVE_LOSS_CAP_USD
+  OUTLIER_GUARD OUTLIER_MAX_USD OUTLIER_MAX_PCT OUTLIER_MIN_USD MAX_PLAUSIBLE_PROFIT_SHARE
+  GAP_SENT_POOL_HOLD_MS
+  FIRE_GAS_LIMIT FIRE_L1_CALLDATA_BYTES MAX_BLOCK_MARGIN MAX_BLOCK_MARGIN_MS SEND_WARM_MS
+  ROBINHOOD_FAST_RPC ROBINHOOD_SEND_RPC
+  FASTLANE_STATE_FILE FASTLANE_STATE_MAX_AGE_MS FASTLANE_SENDS_FILE FASTLANE_SENDS_MAX_BYTES
+  FASTLANE_MAX_OPP_AGE_MS FASTLANE_LIVE_BLOCKS
+  FASTLANE_AHEAD_MAX_BLOCKS FASTLANE_AHEAD_FILTER FASTLANE_AHEAD_MAX_TXS FASTLANE_AHEAD_TRUST_SENDER_FUNDS
+  FASTLANE_SCAN_BUDGET_MS FASTLANE_SWEEP_PER_BLOCK FASTLANE_SWEEP_RESERVE_PCT FASTLANE_MAX_CHANGED_ROUTES
+  FASTLANE_MIN_NET_USD FASTLANE_SCAN_MAX_RESULTS FASTLANE_SCAN_REFINE_STEPS FASTLANE_DEDUPE_BLOCKS FASTLANE_ROUTE_MAX_US
+  FASTLANE_MAX_QUEUE_MS FASTLANE_MAX_BLOCK_MARGIN FASTLANE_SEND_CONNS FASTLANE_SEND_TIMEOUT_MS FASTLANE_READ_TIMEOUT_MS
+  FASTLANE_FIRES_PER_BLOCK FASTLANE_TIP_MAX_AGE_MS FASTLANE_PRACTICE_FILE FASTLANE_PRACTICE_MAX_BYTES
+)
+if [ -f "$ENV_FILE" ]; then
+  for key in "${FASTLANE_PASS[@]}"; do
+    # Only names set in .env (an unset name keeps arbsim's default).
+    grep -qE "^[[:space:]]*(export[[:space:]]+)?${key}[[:space:]]*=" "$ENV_FILE" || continue
+    export "$key=$(env_file_value "$ENV_FILE" "$key")"
+  done
+fi
+# Never hand the wallet key to arbsim (even if the environment had one).
+unset BOT_PRIVATE_KEY
 
 # Paid nodes: an explicit ARBSIM_NODE_URL / ARBSIM_NODE_URL_2 line in .env
 # wins; otherwise the bot's own saved Chainstack / QuickNode links are used.
@@ -68,7 +107,8 @@ SOCKET="${ARBSIM_SOCKET:-/tmp/arbsim.sock}"
 # Say which nodes are set (yes/no only, never the links).
 echo "[arbsim-run] starting $(info_value "$ARBSIM_INFO" source_commit | cut -c1-7) on $SOCKET;" \
      "node1 $([ -n "$ARBSIM_NODE_URL" ] && echo set || echo MISSING)," \
-     "node2 $([ -n "$ARBSIM_NODE_URL_2" ] && echo set || echo 'not set')"
+     "node2 $([ -n "$ARBSIM_NODE_URL_2" ] && echo set || echo 'not set');" \
+     "fast lane ${FASTLANE:-off}, RUST_SENDER ${RUST_SENDER:-off}, wallet key not passed"
 
 # exec: arbsim takes over this process, so pm2 watches arbsim itself
 # (memory limit, restarts). nice 5 = lower priority than the bot.

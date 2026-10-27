@@ -15,7 +15,10 @@
 //       gas is kept, so profit is never over-stated),
 //     - far, empty tick-map words of V4 pools it walked are known zero,
 //     - a pool that may still be missing reports of the block ("pending")
-//       or that is not ready gives "unknown", never an answer.
+//       or that is not ready gives "unknown", never an answer,
+//     - the check's CALLER (the bot's sim caller, a plain wallet copy 2
+//       never follows) is treated as an empty account, exactly as the
+//       sidecar does for every copy-2 check (server.rs caller_as_empty).
 //   This runner does exactly that, by calling the SAME code the sidecar
 //   uses (server::copy2_runs, the same C2View facts, the same pending /
 //   unsure rules), with the size search as the run. So a fast-lane answer
@@ -138,7 +141,24 @@ pub fn run_on_copy2(c2: &Copy2Handle, snap: &Arc<crate::state::snap::Snapshot>, 
     let facts = c2.check_facts_with(&core, block);
     let view = View::new(snap.clone());
     let template = c.template();
-    let run = |v: &dyn StateRead, b: &BlockCtx| result_json(&size_search_opts(v, b, &c.overrides, &[], &template, amounts, CheckOptions::default()));
+    // server.rs caller_as_empty: an unknown caller without an override of
+    // its own = {balance 0, nonce 0, no code} (the same answer the node
+    // gives for the call with that override).
+    let from = c.call.from;
+    let caller_empty = !c.overrides.accounts.contains_key(&from) && matches!(view.account(from), crate::state::Lookup::Missing);
+    let ov_owned;
+    let overrides = if caller_empty {
+        let mut o = c.overrides.clone();
+        o.accounts.insert(
+            from,
+            crate::check::overrides::AccountOverride { balance: Some(U256::ZERO), nonce: Some(0), code: Some(crate::check::overrides::analysed_code(&[])), ..Default::default() },
+        );
+        ov_owned = o;
+        &ov_owned
+    } else {
+        &c.overrides
+    };
+    let run = |v: &dyn StateRead, b: &BlockCtx| result_json(&size_search_opts(v, b, overrides, &[], &template, amounts, CheckOptions::default()));
     let runs = std::cell::RefCell::new(crate::server::RunLog::default());
     let mut answer = crate::server::copy2_runs(c2, &view, &facts, ctx, &runs, &run);
     if answer.get("ok") == Some(&Value::Bool(true)) {
