@@ -587,6 +587,15 @@ fn capture_and_replay_on_real_v3_v4_pools() {
         publish(&mut ah, &mut cap, ls + k, Arc::new(lsnap.clone()), lts + k);
     }
     let live = ah.total.clone();
+    // TEST numbers: one settled compare's lookup work (1,803 pools scanned).
+    let set = PoolSet::build(&w.list, HashSet::new());
+    let (s1, s2) = (Arc::new(versions[4].1.clone()), Arc::new(versions[5].1.clone()));
+    let t = std::time::Instant::now();
+    for _ in 0..50 {
+        let st = Settled::build(&set, 1, &s1, &s2, std::iter::empty(), Some(&s1));
+        assert!(!st.moved.is_empty());
+    }
+    eprintln!("[bench, TEST numbers] Settled::build over 1,803 pools: {} us each", t.elapsed().as_micros() / 50);
     let sum = cap.finish(ah.total.json_with(false).to_string(), "done");
     assert!(sum.complete, "{sum:?}");
     eprintln!("[capture test] {} records, {} KB, {} blocks", sum.records, sum.bytes / 1024, sum.blocks);
