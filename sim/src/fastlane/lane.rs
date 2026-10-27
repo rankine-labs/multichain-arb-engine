@@ -43,7 +43,7 @@
 //   decision pending), ARB_EXECUTOR_ROBINHOOD, no kill switch, fresh Node
 //   state. Anything missing = practice, and the start-up line says why.
 // ============================================================================
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -291,6 +291,10 @@ pub struct LaneHour {
     pub latency_us: Vec<u64>,
     /// Per block: ahead apply + scan + fire (us), newest 5,000.
     pub block_us: Vec<u64>,
+    /// Practice fixes (Oct 27): per block, the LANE's own time only (scan +
+    /// fire, no ahead apply), newest 5,000. Live, "blockUs" looked like a
+    /// 5-17 ms lane cost; it was the predicted copy's apply time added in.
+    pub lane_us: Vec<u64>,
     pub drops_seen: u64,
     pub gas_notes: u64,
 }
@@ -371,15 +375,17 @@ impl Lane {
             return Vec::new();
         }
         let view = tip.view();
-        let unsure: HashSet<String> = tip.unsure_pools.iter().cloned().collect();
-        let input = BlockInput { view: &view, ctx: &tip.ctx, block: tip.block, kind: ViewKind::Predicted, changed: &tip.changed_pools, unsure: &unsure, snap: Some(&tip.snap) };
+        // The tip's own set (built once by the predicted copy, not per tip here).
+        let input = BlockInput { view: &view, ctx: &tip.ctx, block: tip.block, kind: ViewKind::Predicted, changed: &tip.changed_pools, unsure: &tip.unsure_set, snap: Some(&tip.snap) };
         let rep = self.scanner.scan(&input);
         self.hour.opps += rep.opps.len() as u64;
         let mut out = Vec::new();
         for o in rep.opps.iter().take(self.cfg.fires_per_block) {
             out.push(self.fire_one(o, tip.feed_at, tip.apply_us));
         }
-        push_bounded(&mut self.hour.block_us, tip.apply_us + t0.elapsed().as_micros() as u64);
+        let lane_us = t0.elapsed().as_micros() as u64;
+        push_bounded(&mut self.hour.block_us, tip.apply_us + lane_us);
+        push_bounded(&mut self.hour.lane_us, lane_us);
         out
     }
 
@@ -561,7 +567,10 @@ impl Lane {
             "upS": self.started.elapsed().as_secs(),
             "ahead": crate::copy2::ahead::status_json().map(|a| {
                 let p = crate::copy2::ahead::prediction_counts().unwrap_or_default();
-                json!({"tip": a.get("tip"), "stopped": a.get("stopped"), "agreementPct": p.agreement_pct(), "unsurePct": p.unsure_pct(), "unpredictedPct": p.unpredicted_pct(), "stoppedPct": p.stopped_pct(), "overBudget": p.over_budget})
+                json!({"tip": a.get("tip"), "stopped": a.get("stopped"), "agreementPct": p.agreement_pct(), "unsurePct": p.unsure_pct(), "unpredictedPct": p.unpredicted_pct(), "stoppedPct": p.stopped_pct(), "overBudget": p.over_budget,
+                    // Practice fixes: the counts behind the %s (agreementPct is per POOL
+                    // compared, agree / (agree + disagree); null = nothing compared).
+                    "agree": p.agree, "disagree": p.disagree, "unsure": p.unsure, "compared": p.compared, "unpredicted": p.unpredicted})
             }),
             "copy2Runs": super::c2runner::stats_json(),
             "scan": {"routes": self.scanner.routes(), "hour": super::scan::status_json()},
@@ -578,7 +587,8 @@ impl Lane {
             "lane": {
                 "tips": h.tips, "tipsOld": h.tips_old, "opps": h.opps, "fired": h.fired, "wouldSend": h.would_send, "liveSent": h.live_sent,
                 "notLeft": h.not_left, "gunRefused": h.gun_refused, "logErrors": h.log_errors, "dropsSeen": h.drops_seen,
-                "feedToHandUs": pctl(&h.latency_us), "blockUs": pctl(&h.block_us),
+                "feedToHandUs": pctl(&h.latency_us), "blockUs": pctl(&h.block_us), "laneUs": pctl(&h.lane_us),
+                "blockUsNote": "blockUs = predicted-copy apply + lane; laneUs = lane only (scan + fire)",
             },
             "practice": self.practice.status_json(),
         })
@@ -591,12 +601,12 @@ impl Lane {
         let mut blocked: Vec<String> = h.blocked.iter().map(|(k, v)| format!("{k}:{v}")).collect();
         blocked.sort();
         let lane = format!(
-            "[arbsim] fastlane (last hour): mode {} ({}) | tips {} (too old {}) | opportunities {} | safety blocked [{}] | fired {}: would send {}, live sent {}, never left {}, gun refused {} | feed -> hand us p50 {} p90 {} | per block us p50 {} p90 {} max {} | drops seen {} gas notes {}",
+            "[arbsim] fastlane (last hour): mode {} ({}) | tips {} (too old {}) | opportunities {} | safety blocked [{}] | fired {}: would send {}, live sent {}, never left {}, gun refused {} | feed -> hand us p50 {} p90 {} | per block us (apply + lane) p50 {} p90 {} max {}, lane only p50 {} p90 {} | drops seen {} gas notes {}",
             self.gun.mode().as_str(),
             self.gun.why_not_broadcasting().unwrap_or("broadcasting"),
             h.tips, h.tips_old, h.opps, blocked.join(" "), h.fired, h.would_send, h.live_sent, h.not_left,
             h.gun_refused.values().sum::<u64>(),
-            l(&h.latency_us, "p50"), l(&h.latency_us, "p90"), l(&h.block_us, "p50"), l(&h.block_us, "p90"), l(&h.block_us, "max"),
+            l(&h.latency_us, "p50"), l(&h.latency_us, "p90"), l(&h.block_us, "p50"), l(&h.block_us, "p90"), l(&h.block_us, "max"), l(&h.lane_us, "p50"), l(&h.lane_us, "p90"),
             h.drops_seen, h.gas_notes,
         );
         self.last_hour = Some(h);

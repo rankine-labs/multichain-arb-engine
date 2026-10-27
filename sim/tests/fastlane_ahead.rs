@@ -607,3 +607,79 @@ fn message_budget_setting() {
     assert_eq!(AheadCfg::default().msg_budget_us, 10_000);
     assert_eq!(AheadCfg::from_lookup(|_| Some("0".into()), 0).msg_budget_us, 10_000, "0 / junk = default");
 }
+
+// ---------------------------------------------------------------------------
+// Practice fixes (Oct 27)
+// ---------------------------------------------------------------------------
+
+/// FASTLANE_AHEAD_ROUTES_ONLY: with the scanner's route pools known, a
+/// transaction naming only pools no route uses is NOT run; those pools are
+/// marked unsure (forgotten, never a stale value). Route pools still run.
+/// Unknown route pools (no table yet) = everything runs, as before.
+#[test]
+fn transactions_naming_only_off_route_pools_are_not_run() {
+    let mut a = ahead(32);
+    a.set_route_pools(Some(Arc::new([key(pool2())].into_iter().collect())));
+    a.on_feed_message(msg(11, &[stx(0, pool(), w(5)), stx(1, pool2(), w(2))]));
+    let t = a.tip().unwrap();
+    assert_eq!(a.total.txs_off_route, 1, "the POOL swap is not run");
+    assert_eq!(a.total.txs_run, 1, "the POOL2 swap (a route pool) runs");
+    assert_eq!(t.unsure_pools, vec![key(pool())]);
+    assert_eq!(t.view().storage(pool(), U256::ZERO), Lookup::Missing, "forgotten, never the old value");
+    assert_eq!(t.view().storage(pool2(), U256::ZERO), known(9));
+    // Agreement: POOL counts unsure, not a miss.
+    let (mut s11, mut d11) = with_price(105, 9);
+    s11.apply_fact(&Fact::Slot(pool2(), U256::ZERO, U256::from(9u8)));
+    d11.accounts.insert(pool2(), AccountDiff { storage: [(U256::ZERO, U256::from(9u8))].into_iter().collect(), ..Default::default() });
+    a.on_confirmed(confirmed(11, s11, d11), &no_moves);
+    assert_eq!((a.total.unsure, a.total.agree, a.total.disagree), (1, 1, 0));
+    // No route list: runs again.
+    let mut b = ahead(32);
+    b.set_route_pools(None);
+    b.on_feed_message(msg(11, &[stx(0, pool(), w(5))]));
+    assert_eq!((b.total.txs_off_route, b.total.txs_run), (0, 1));
+}
+
+/// "missed" split by cause, from copy 2's reports (which transaction moved
+/// the pool): we ran it and our run did not move the pool -> missedRan; no
+/// transaction of the message moved it (copy 2 changed it on its own, e.g. a
+/// pool load / re-read) -> notFromTx, NOT a disagreement.
+#[test]
+fn misses_are_split_by_cause_and_non_transaction_changes_are_not_misses() {
+    let mut a = Ahead::new(AheadCfg { run_all: true, ..AheadCfg::default() });
+    a.set_pools(pools());
+    a.on_confirmed(confirmed(10, copy10(), StateDiff::default()), &no_moves);
+    // A transaction we run that moves nothing of ours (DEP only).
+    let t1 = stx(0, dep(), w(3));
+    a.on_feed_message(msg(11, &[t1.clone()]));
+    // Copy 2 says: that transaction moved POOL (our run disagreed), and POOL2
+    // changed too with no transaction of this block behind it.
+    let (s11, mut d11) = with_price(106, 8);
+    d11.accounts.insert(pool2(), AccountDiff { storage: [(U256::ZERO, U256::from(8u8))].into_iter().collect(), ..Default::default() });
+    let h = keccak256(&t1);
+    a.on_confirmed(confirmed(11, s11, d11), &move |x: &B256| (*x == h).then(|| vec![key(pool())]));
+    assert_eq!((a.total.missed, a.total.missed_ran, a.total.missed_filter), (1, 1, 0));
+    assert_eq!(a.total.not_from_tx, 1, "POOL2: copy 2's own change");
+    assert_eq!(a.total.disagree, 1, "only the real miss counts");
+    let kinds: Vec<String> = a.hour.samples.iter().map(|s| s["kind"].as_str().unwrap().to_string()).collect();
+    assert_eq!(kinds, vec!["missedRan".to_string()]);
+}
+
+/// A failed run whose target has no code in our copy: the second
+/// ("collect") run is skipped (it could not read anything of ours); the
+/// pools are still found from the data / the router's history.
+#[test]
+fn the_collect_run_is_skipped_when_the_target_has_no_code() {
+    let mut a = ahead(32);
+    let r1 = stx(0, router(), w(3));
+    a.on_feed_message(msg(11, &[r1.clone()]));
+    let (s11, d11) = with_price(106, 7);
+    let h = keccak256(&r1);
+    a.on_confirmed(confirmed(11, s11.clone(), d11), &move |x: &B256| (*x == h).then(|| vec![key(pool())]));
+    let mut s12 = s11.clone();
+    s12.apply_fact(&Fact::Forget(router()));
+    a.on_confirmed(confirmed(12, s12, StateDiff::default()), &no_moves);
+    a.on_feed_message(msg(13, &[stx(1, router(), w(4))]));
+    assert_eq!((a.total.txs_failed, a.total.probes_skipped), (1, 1));
+    assert_eq!(a.tip().unwrap().unsure_pools, vec![key(pool())]);
+}

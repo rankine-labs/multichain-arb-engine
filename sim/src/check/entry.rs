@@ -98,6 +98,35 @@ pub fn with_table<R>(f: impl FnOnce(Option<&Table>) -> R) -> R {
     f(g.as_ref())
 }
 
+/// (Fast lane, practice fixes Oct 27) Every pool key the table's usable
+/// routes depend on (each row's check "route": its pools and lender),
+/// lowercase, with the table's generation. None = no table yet. The
+/// predicted copy runs only transactions that can move these (copy2/ahead.rs
+/// FASTLANE_AHEAD_ROUTES_ONLY). Rows the bot could not build (no entry id or
+/// no check) are left out: the scanner never checks them either.
+pub fn route_keys() -> Option<(u64, HashSet<String>)> {
+    with_table(|t| {
+        let t = t?;
+        let mut keys: HashSet<String> = HashSet::new();
+        for rows in t.pools.values() {
+            for r in rows {
+                let (Some(_), Some(c)) = (&r.e, &r.c) else { continue };
+                for k in c.get("route").and_then(|x| x.as_array()).into_iter().flatten() {
+                    if let Some(k) = k.as_str() {
+                        keys.insert(k.to_ascii_lowercase());
+                    }
+                }
+            }
+        }
+        Some((t.gen, keys))
+    })
+}
+
+/// The table's generation only (cheap; None = no table yet).
+pub fn table_gen() -> Option<u64> {
+    with_table(|t| t.map(|t| t.gen))
+}
+
 /// Forget the table (tests).
 pub fn clear_table() {
     *store().write().unwrap_or_else(|e| e.into_inner()) = None;
