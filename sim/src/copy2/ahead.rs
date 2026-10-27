@@ -442,6 +442,18 @@ impl PoolSet {
     /// Our pools a transaction NAMES (target or data), without running it.
     /// `n` = PoolSet::scan of its data (one pass, see NameIndex).
     fn named(&self, to: Option<Address>, n: &Named) -> Vec<String> {
+        let mut out = self.named_direct(to, n);
+        for k in self.named_by_pair(n) {
+            if !out.contains(&k) {
+                out.push(k);
+            }
+        }
+        out
+    }
+
+    /// Our pools a transaction names DIRECTLY: its target, a pool contract
+    /// address or a V4 pool id inside its data.
+    fn named_direct(&self, to: Option<Address>, n: &Named) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
         let mut push = |k: &String| {
             if !out.contains(k) {
@@ -461,9 +473,18 @@ impl PoolSet {
                 push(k);
             }
         }
+        out
+    }
+
+    /// Our pools whose BOTH coins the data names (every exchange's pool of
+    /// that pair: a router path names coins, not pools).
+    fn named_by_pair(&self, n: &Named) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
         for p in self.idx.pairs_found(n) {
             for k in self.by_pair.get(&p).into_iter().flatten() {
-                push(k);
+                if !out.contains(k) {
+                    out.push(k.clone());
+                }
             }
         }
         out
@@ -1425,10 +1446,22 @@ impl Ahead {
                     } else {
                         probe_touched(&ov, &ctx, t, &pools)
                     };
-                    for k in pools.named(t.to, &named_now).into_iter().chain(native.iter().cloned()) {
+                    for k in pools.named_direct(t.to, &named_now).into_iter().chain(native.iter().cloned()) {
                         if !hit.contains(&k) {
                             hit.push(k);
                         }
+                    }
+                    // Practice fixes: pools named only by their coin PAIR
+                    // (every exchange's pool of that pair) are added only when
+                    // nothing narrower is known. Before, they were always
+                    // added: one failed swap naming WETH and USDG made every
+                    // WETH / USDG pool unsure, i.e. BOTH sides of every
+                    // WETH / USDG route, and each later swap on those pools
+                    // then failed too (their values forgotten) until copy 2
+                    // confirmed the block. The collect run above follows the
+                    // transaction's own path (it reads the pools it uses).
+                    if hit.is_empty() {
+                        hit = pools.named_by_pair(&named_now);
                     }
                     if hit.is_empty() {
                         // Review H4: it failed and nothing tells us what it
