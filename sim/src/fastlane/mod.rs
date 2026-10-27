@@ -9,11 +9,17 @@
 //     copy2/ahead.rs        = A (predicted copy, lives with copy 2)
 //     mode, safety, bridge  = D (switches, every Node safety gate, the files
 //                              shared with the Node bot)
-//     types, scan, convert  = B (Opportunity, standing-gap scanner)
+//     types, scan, convert  = B (Opportunity, standing-gap scanner, and the
+//                              Opportunity -> gun / safety copy)
 //     gun                   = C (calldata, signing, nonce, sending)
+//     lane, practice        = integration (the per-block loop that joins
+//                              them, and practice-mode scoring)
 //   FASTLANE=off (the default) runs none of it.
 // ============================================================================
 pub mod bridge;
+pub mod convert;
 pub mod gun;
 pub mod mode;
 pub mod safety;
+pub mod scan;
+pub mod types;

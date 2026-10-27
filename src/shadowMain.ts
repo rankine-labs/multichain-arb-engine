@@ -3031,6 +3031,8 @@ const entryBuild = ({ buy, sell, tokenIn, tokenOut }: EntryRouteT): EntryCandida
             build: (usd) => { const b = buildCheck('robinhood', tokenIn, buy, sell, usd, usdPer); return 'skip' in b ? null : { trade: b.trade, simOpts: b.simOpts }; },
             usdOf: (units) => (Number(units) / 10 ** dec) * usdPer,
             host,
+            // Fast lane facts (only sent when FASTLANE=practice|live): price, decimals, loan fee pips.
+            fx: { px: usdPer, d: dec, lp: lender ? (lender.feePips ?? lender.feeBps * 100) : 0 },
       };
 };
 // Two steps: routes for the moved pools, ranked and capped BEFORE building.
