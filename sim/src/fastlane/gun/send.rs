@@ -167,12 +167,30 @@ impl Conn {
     }
 
     fn connect(&mut self) -> Result<(), String> {
-        let addr = (self.target.host.as_str(), self.target.port)
+        // A host name can resolve to several addresses (e.g. IPv6 first, then
+        // IPv4). Try each in turn, like std's TcpStream::connect does, so one
+        // unreachable address family doesn't make the whole endpoint fail.
+        // (Found on GitHub CI: "localhost" resolved to ::1 first while the
+        // test server listened on 127.0.0.1 only.)
+        let addrs: Vec<_> = (self.target.host.as_str(), self.target.port)
             .to_socket_addrs()
             .map_err(|_| "send endpoint: host not found".to_string())?
-            .next()
-            .ok_or("send endpoint: host not found")?;
-        let tcp = TcpStream::connect_timeout(&addr, self.timeout).map_err(|e| format!("send endpoint: connect failed ({:?})", e.kind()))?;
+            .collect();
+        if addrs.is_empty() {
+            return Err("send endpoint: host not found".to_string());
+        }
+        let mut last_err = None;
+        let mut tcp = None;
+        for addr in &addrs {
+            match TcpStream::connect_timeout(addr, self.timeout) {
+                Ok(t) => {
+                    tcp = Some(t);
+                    break;
+                }
+                Err(e) => last_err = Some(e.kind()),
+            }
+        }
+        let tcp = tcp.ok_or_else(|| format!("send endpoint: connect failed ({:?})", last_err.unwrap_or(std::io::ErrorKind::Other)))?;
         let _ = tcp.set_nodelay(true);
         let _ = tcp.set_read_timeout(Some(self.timeout));
         let _ = tcp.set_write_timeout(Some(self.timeout));
