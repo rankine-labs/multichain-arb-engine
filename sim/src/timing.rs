@@ -158,6 +158,12 @@ fn pct(v: &mut [u64]) -> Value {
     json!({ "n": v.len(), "p50": at(0.5), "p90": at(0.9), "p99": at(0.99), "max": v[v.len() - 1] })
 }
 
+/// p50 / p90 / p99 / max of `v` (sorts it), for other files' status
+/// sections (fast lane, copy2/ahead.rs).
+pub fn pct_of(v: &mut [u64]) -> Value {
+    pct(v)
+}
+
 /// status: "checkTiming" (per step, microseconds), "applyTiming", "lockHold".
 pub fn status() -> Value {
     let r = match RINGS.lock() {
