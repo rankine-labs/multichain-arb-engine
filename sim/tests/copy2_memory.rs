@@ -465,9 +465,16 @@ fn walked_slots_memory_through_the_real_intake() {
     let first = samples.first().unwrap().1;
     let last = samples.last().unwrap().1;
     assert!(last <= first * 1.05 + 2.0, "heap grew over {blocks} blocks: {first:.1} -> {last:.1} MB");
-    // Budget: <= 400 bytes of heap per walked slot (all of copy 2 included).
+    // Budget: <= 512 bytes of heap per walked slot (all of copy 2 included).
+    // Was 400: GitHub's runners measure 404-484 for the very same code (the
+    // heap counter sees allocator / hash-table growth steps that differ by
+    // machine; this one blocked an engine release on Oct 27), local runs
+    // under 400. 512 keeps ~6% over the worst seen; what this guards
+    // against (dry run #18: every kept version with its own copy of each
+    // walked pool) costs many KB per slot and still fails loudly. At 512 B
+    // the bench's 75,000 walked slots are ~37 MB of the 1.3 GB budget.
     let per_slot = copy_mb * 1_048_576.0 / walk_slots.max(1.0);
-    let limit = env_usize("COPY2_MEM_MAX_BYTES_PER_SLOT", 400) as f64;
+    let limit = env_usize("COPY2_MEM_MAX_BYTES_PER_SLOT", 512) as f64;
     assert!(per_slot <= limit, "copy 2 uses {per_slot:.0} bytes per walked slot (limit {limit})");
     // No big passing bulge while walks are taken in (dry run #18: every
     // kept version got its own copy of each walked pool).

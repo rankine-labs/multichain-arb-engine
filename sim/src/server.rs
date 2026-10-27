@@ -25,6 +25,7 @@
 // ============================================================================
 use std::io::BufWriter;
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -274,6 +275,8 @@ pub fn handle_tm(ctx: &Ctx, req: &Value, tm: &mut Tm) -> Value {
                 }
             }
             s["feedStore"] = crate::check::feedstore::store().status_json();
+            // (Oct 27) What discovery's misses fetched (DiscoverFillBook).
+            s["discoverFill"] = discover_book().lock().map(|b| b.json()).unwrap_or(Value::Null);
             // ZERO-ROUTES FIX (Oct 27): the candidate table as the sidecar
             // holds it, and over-size socket messages dropped.
             s["trigTable"] = crate::check::entry::status_json();
@@ -686,16 +689,122 @@ fn trig_discover_inner(ctx: &Ctx, id: &Value, req: &Value, t0: Instant, tm: &mut
     // out pool loads: ARBSIM_DISCOVER_FILL_MAX_ITEMS (16) per miss,
     // ARBSIM_DISCOVER_FILL_PER_S (60) items a second over all questions
     // (0 = off, as before).
+    // (Oct 27) Each item at most once per ARBSIM_DISCOVER_FILL_REPEAT_S and
+    // at most ARBSIM_DISCOVER_FILL_PER_HOUR items an hour (DiscoverFillBook),
+    // counted in status "discoverFill".
     if a.get("unknown").and_then(|u| u.as_str()) == Some("miss") {
         let missing = parse_missing(&a);
-        if !missing.is_empty() && missing.len() <= env_u64("ARBSIM_DISCOVER_FILL_MAX_ITEMS", 16) as usize && discover_fill_take(missing.len()) {
-            c2.note_misses(&missing);
-            crate::timing::ph_add("discFill", missing.len() as u64);
-            ctx.fill(missing);
+        let max_items = env_u64("ARBSIM_DISCOVER_FILL_MAX_ITEMS", 16) as usize;
+        let fresh = discover_book().lock().map(|mut b| b.offer(&missing, max_items, Instant::now())).unwrap_or_default();
+        if !fresh.is_empty() && discover_fill_take(fresh.len()) {
+            if let Ok(mut b) = discover_book().lock() {
+                b.taken(&fresh, Instant::now());
+            }
+            c2.note_misses(&fresh);
+            crate::timing::ph_add("discFill", fresh.len() as u64);
+            ctx.fill(fresh);
+        } else if !fresh.is_empty() {
+            if let Ok(mut b) = discover_book().lock() {
+                b.paced += fresh.len() as u64;
+            }
         }
     }
     a["us"] = json!(t0.elapsed().as_micros() as u64);
     a
+}
+
+/// DISCOVER LEARNS budget (Oct 27): what discovery's misses may fetch.
+/// Plain English: a miss of a few items (a router's code, a coin's setting)
+/// is worth fetching once: the next trade through it can then be replayed.
+/// But the same item missed again and again is usually a value that keeps
+/// changing (a bot's own counters / balances: copy 2 forgets a changed
+/// fill), and fetching it each time costs a node request per trigger for
+/// nothing. So:
+///   - an item is fetched at most once per ARBSIM_DISCOVER_FILL_REPEAT_S
+///     [600] (remembered: at most REMEMBER items, oldest forgotten first);
+///   - at most ARBSIM_DISCOVER_FILL_PER_HOUR [3600] items an hour, a hard
+///     cap (0 = no fetching at all), on top of the per-second pace below;
+///   - more than ARBSIM_DISCOVER_FILL_MAX_ITEMS [16] items in one miss:
+///     probably not a swap at all, nothing fetched (as before).
+/// Counted (status "discoverFill"): offered, fetched, refused as repeats /
+/// over the hour cap / too many / paced. One item = about one node request
+/// (an account's code + basics, or one value); see copy2 nodeRequests.
+#[derive(Default)]
+pub struct DiscoverFillBook {
+    pub per_hour: u64,
+    pub repeat_s: u64,
+    hour_start: Option<Instant>,
+    pub hour_used: u64,
+    sent: HashMap<crate::state::MissItem, Instant>,
+    order: std::collections::VecDeque<crate::state::MissItem>,
+    pub offered: u64,
+    pub fetched: u64,
+    pub repeats: u64,
+    pub over_cap: u64,
+    pub too_many: u64,
+    pub paced: u64,
+}
+
+impl DiscoverFillBook {
+    pub const REMEMBER: usize = 20_000;
+
+    pub fn new(per_hour: u64, repeat_s: u64) -> Self {
+        DiscoverFillBook { per_hour, repeat_s, ..Default::default() }
+    }
+
+    /// The items of one miss that may be fetched now (the rest counted).
+    pub fn offer(&mut self, items: &[crate::state::MissItem], max_items: usize, now: Instant) -> Vec<crate::state::MissItem> {
+        if items.is_empty() {
+            return Vec::new();
+        }
+        self.offered += items.len() as u64;
+        if items.len() > max_items {
+            self.too_many += items.len() as u64;
+            return Vec::new();
+        }
+        if self.hour_start.is_none_or(|h| now.saturating_duration_since(h) >= std::time::Duration::from_secs(3600)) {
+            self.hour_start = Some(now);
+            self.hour_used = 0;
+        }
+        let wait = std::time::Duration::from_secs(self.repeat_s);
+        let fresh: Vec<crate::state::MissItem> = items.iter().filter(|m| self.sent.get(*m).is_none_or(|t| now.saturating_duration_since(*t) >= wait)).cloned().collect();
+        self.repeats += (items.len() - fresh.len()) as u64;
+        if fresh.is_empty() {
+            return fresh;
+        }
+        if self.hour_used + fresh.len() as u64 > self.per_hour {
+            self.over_cap += fresh.len() as u64;
+            return Vec::new();
+        }
+        fresh
+    }
+
+    /// These items were handed to the fetcher.
+    pub fn taken(&mut self, items: &[crate::state::MissItem], now: Instant) {
+        self.hour_used += items.len() as u64;
+        self.fetched += items.len() as u64;
+        for m in items {
+            if self.sent.insert(m.clone(), now).is_none() {
+                self.order.push_back(m.clone());
+            }
+        }
+        while self.order.len() > Self::REMEMBER {
+            if let Some(old) = self.order.pop_front() {
+                self.sent.remove(&old);
+            }
+        }
+    }
+
+    pub fn json(&self) -> Value {
+        json!({"perHour": self.per_hour, "repeatS": self.repeat_s, "hourUsed": self.hour_used, "offered": self.offered, "fetched": self.fetched,
+            "refusedRepeat": self.repeats, "refusedHourCap": self.over_cap, "refusedTooMany": self.too_many, "paced": self.paced, "remembered": self.sent.len()})
+    }
+}
+
+/// The process-wide DISCOVER LEARNS budget.
+pub fn discover_book() -> &'static Mutex<DiscoverFillBook> {
+    static B: std::sync::OnceLock<Mutex<DiscoverFillBook>> = std::sync::OnceLock::new();
+    B.get_or_init(|| Mutex::new(DiscoverFillBook::new(env_u64("ARBSIM_DISCOVER_FILL_PER_HOUR", 3600), env_u64("ARBSIM_DISCOVER_FILL_REPEAT_S", 600))))
 }
 
 /// DISCOVER LEARNS pacing: a token bucket of ARBSIM_DISCOVER_FILL_PER_S
@@ -1485,5 +1594,40 @@ mod tests {
         assert_eq!(same_but_gas(&s1, &s2).unwrap(), s1);
         let s3 = json!({"ok": true, "best": null, "tried": []});
         assert!(same_but_gas(&s1, &s3).is_none());
+    }
+
+    // DISCOVER LEARNS budget: one fetch per item per repeat window, a hard
+    // hourly cap, too-big misses never fetched; all counted.
+    #[test]
+    fn discover_fill_book_fetches_each_item_once_within_the_hour_cap() {
+        use crate::state::MissItem;
+        use revm::primitives::{Address, U256};
+        let t0 = Instant::now();
+        let mut b = DiscoverFillBook::new(3, 600);
+        let a = Address::with_last_byte(1);
+        let one = vec![MissItem::Account(a), MissItem::Slot(a, U256::from(1u8))];
+        let got = b.offer(&one, 16, t0);
+        assert_eq!(got, one);
+        b.taken(&got, t0);
+        // The same items again within 10 minutes: refused as repeats.
+        assert!(b.offer(&one, 16, t0 + Duration::from_secs(60)).is_empty());
+        assert_eq!(b.repeats, 2);
+        // Two new items would make 4 > 3 this hour: refused (hard cap).
+        let two = vec![MissItem::Slot(a, U256::from(2u8)), MissItem::Slot(a, U256::from(3u8))];
+        assert!(b.offer(&two, 16, t0 + Duration::from_secs(61)).is_empty());
+        assert_eq!(b.over_cap, 2);
+        // Too many in one miss: never fetched.
+        let many: Vec<MissItem> = (0..17u8).map(|i| MissItem::Slot(a, U256::from(i))).collect();
+        assert!(b.offer(&many, 16, t0).is_empty());
+        assert_eq!(b.too_many, 17);
+        // A new hour, and past the repeat window: allowed again.
+        let later = t0 + Duration::from_secs(3_601);
+        assert_eq!(b.offer(&one, 16, later), one);
+        assert_eq!(b.offer(&two, 16, later), two);
+        let j = b.json();
+        assert_eq!((j["fetched"].clone(), j["offered"].clone()), (json!(2), json!(27)), "{j}");
+        // 0 an hour = nothing fetched.
+        let mut off = DiscoverFillBook::new(0, 600);
+        assert!(off.offer(&one, 16, t0).is_empty());
     }
 }

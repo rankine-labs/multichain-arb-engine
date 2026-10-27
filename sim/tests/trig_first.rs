@@ -1239,3 +1239,252 @@ fn bench_entry_candidate_check_test_numbers_only() {
     let disc = t.elapsed().as_micros() / n;
     println!("[bench, test numbers only] entry candidate check, 20 feed txs + 3 sizes: one replay + ladder {one} us vs 3 full replays {three} us; discover (trigger alone) {disc} us ({} build)", if cfg!(debug_assertions) { "debug" } else { "release" });
 }
+
+// ---------------------------------------------------------------------------
+// PREDICTION COVERAGE (Oct 27): proven skipping, transactions we can't
+// unpack, EIP-7702, and "which transaction was it" (CheckUnknown.at).
+//
+// Contracts (all hand-written, like the ones above):
+//   SELF_COIN / SELF_HOOK  "self-only" code (no outward opcode): with no
+//          call data it returns its slot 0 (a coin's balance of our pool, a
+//          V4 hook's fee); with a word x it reads slot x (a holder's balance
+//          our copy doesn't hold: a miss) and writes slot 0.
+//   READS_COIN / READS_HOOK  a router: STATICCALL the self-only contract (a
+//          pool reading its coin balance / the PoolManager asking its hook),
+//          then swap x on POOL.
+//   HIDDEN_ROUTER  first calls an account we don't hold (miss), THEN swaps x
+//          on POOL; its call data never names the pool (the Oct 21 study:
+//          most bots can't be read from their data).
+//   PM_LIKE  a PoolManager-like contract: calls a hook we don't hold.
+// ---------------------------------------------------------------------------
+
+fn self_coin() -> Address {
+    addr(0x3001)
+}
+fn self_hook() -> Address {
+    addr(0x3002)
+}
+fn reads_coin() -> Address {
+    addr(0x3003)
+}
+fn reads_hook() -> Address {
+    addr(0x3004)
+}
+fn hidden_router() -> Address {
+    addr(0x3005)
+}
+fn pm_like() -> Address {
+    addr(0x3006)
+}
+
+fn self_only_code() -> Vec<u8> {
+    hex("36 15 6010 57 6000 35 54 50 6007 6000 55 00 5b 6000 54 6000 52 6020 6000 f3")
+}
+
+fn reads_then_swaps(what: Address) -> Vec<u8> {
+    let mut c = hex("6020 6040 6000 6000 73");
+    c.extend_from_slice(what.as_slice());
+    c.extend(hex("5a fa 50 6000 35 6000 52"));
+    call_to(&mut c, pool(), 0x20);
+    c.extend(hex("50 00"));
+    c
+}
+
+fn hidden_router_code() -> Vec<u8> {
+    let mut c = hex("6000 35 6000 52");
+    call_to(&mut c, addr(0xbad2), 0);
+    c.push(0x50);
+    call_to(&mut c, pool(), 0x20);
+    c.extend(hex("50 00"));
+    c
+}
+
+fn pm_like_code() -> Vec<u8> {
+    let mut c = Vec::new();
+    call_to(&mut c, addr(0xbad3), 0);
+    c.extend(hex("50 6001 6000 55 00"));
+    c
+}
+
+fn copy_pc() -> MemState {
+    let mut s = copy_be(None);
+    add_contract(&mut s, self_coin(), self_only_code(), &[(U256::ZERO, U256::from(5u64))]);
+    add_contract(&mut s, self_hook(), self_only_code(), &[(U256::ZERO, U256::from(30u64))]);
+    add_contract(&mut s, reads_coin(), reads_then_swaps(self_coin()), &[]);
+    add_contract(&mut s, reads_hook(), reads_then_swaps(self_hook()), &[]);
+    add_contract(&mut s, hidden_router(), hidden_router_code(), &[]);
+    add_contract(&mut s, pm_like(), pm_like_code(), &[]);
+    s
+}
+
+fn proven() -> Assume {
+    Assume { skip: None, proven_skip: true, ..best() }
+}
+
+#[test]
+fn writes_only_itself_reads_code_like_the_evm() {
+    use arbsim::check::ordered::writes_only_itself;
+    assert!(writes_only_itself(&self_only_code()));
+    assert!(writes_only_itself(&[]), "no code: a plain wallet");
+    assert!(writes_only_itself(&hex("60f1 50 00")), "0xf1 inside PUSH data is not a CALL");
+    assert!(writes_only_itself(&hex("6000 6000 6000 6000 6000 5a fa")), "STATICCALL can't write anything");
+    for op in [0xf0u8, 0xf1, 0xf2, 0xf4, 0xf5, 0xff] {
+        assert!(!writes_only_itself(&[0x60, 0x00, op]), "{op:#x}");
+    }
+    assert!(!writes_only_itself(&hidden_router_code()));
+    assert!(!writes_only_itself(&hex("ef0100 1111111111111111111111111111111111111111")), "7702 delegation runs someone else's code");
+}
+
+// A profitable trigger with an UNRELATED transaction before it that we can't
+// run (a coin transfer whose holder balance our copy doesn't hold): with no
+// skipping the route is unknown; proven skipping leaves it out (the coin's
+// code can only change the coin, and nothing after it uses the coin) and the
+// answer stays exact (high), the same as without that transaction.
+#[test]
+fn proven_skipping_leaves_out_an_unrelated_transaction_we_cant_run() {
+    let trig = stx(&KEY_A, 0, pool(), w(5));
+    let unrelated = stx(&KEY_B, 0, self_coin(), w(77));
+    let f = feed(&trig, 12, vec![msg(11, &[unrelated]), msg(12, &[trig.clone()])]);
+    let u = run_be(&copy_pc(), &f, &AllExact, &Assume { skip: None, ..best() }).expect_err("no skipping");
+    assert_eq!(u.reason, UnknownReason::Miss);
+    let at = u.at.expect("names the transaction");
+    assert_eq!((at.seq, at.trigger, at.to), (11, false, Some(self_coin())), "lag-replayed, not the trigger");
+    let out = run_be(&copy_pc(), &f, &AllExact, &proven()).unwrap();
+    assert_eq!(price_seen(&out), 105);
+    assert_eq!(out.replayed.len(), 1, "only the trigger was replayed");
+    assert_eq!(out.assumed.skipped_proven, 1);
+    assert_eq!(out.assumed.labels(), vec!["skipped_proven:1".to_string()]);
+    assert_eq!(out.assumed.confidence(), "high", "proven, not assumed");
+    let alone = run_be(&copy_pc(), &feed(&trig, 12, vec![msg(11, &[]), msg(12, &[trig.clone()])]), &AllExact, &proven()).unwrap();
+    assert_eq!(price_seen(&alone), price_seen(&out), "same answer as if it weren't there");
+}
+
+// The dangers proven skipping must never fall for (each one: unknown).
+#[test]
+fn proven_skipping_never_skips_what_could_matter() {
+    let swap5 = stx(&KEY_A, 0, pool(), w(5));
+    // 1. A router that calls out (miss) and then swaps on OUR pool, its data
+    //    not naming the pool: the best-effort rules call it "unrelated"
+    //    (medium) and skip it; with the account it missed held, it would
+    //    have moved our price. Proven: unknown.
+    let hidden = stx(&KEY_B, 0, hidden_router(), w(3));
+    let f = feed(&swap5, 12, vec![msg(11, &[hidden.clone()]), msg(12, &[swap5.clone()])]);
+    let bot = run_be(&copy_pc(), &f, &AllExact, &best()).unwrap();
+    assert_eq!((price_seen(&bot), bot.assumed.skipped_unrelated, bot.assumed.confidence()), (105, 1, "medium"), "the old rule guesses");
+    let mut with_bad2 = copy_pc();
+    add_eoa(&mut with_bad2, addr(0xbad2), U256::ZERO);
+    assert_eq!(price_seen(&run_be(&with_bad2, &f, &AllExact, &proven()).unwrap()), 108, "the truth: it moved our pool by 3");
+    let u = run_be(&copy_pc(), &f, &AllExact, &proven()).expect_err("proven: unknown");
+    assert_eq!(u.reason, UnknownReason::Miss);
+    assert!(u.detail.contains("calls other contracts"), "{}", u.detail);
+    assert_eq!(u.at.map(|a| (a.seq, a.trigger)), Some((11, false)));
+    // 2. Shared coin balance: an unrelated-looking coin transfer we can't
+    //    run, but the trigger's route reads that coin (a pool's balance).
+    let trig = stx(&KEY_A, 0, reads_coin(), w(5));
+    let coin_tx = stx(&KEY_B, 0, self_coin(), w(77));
+    let u = run_be(&copy_pc(), &feed(&trig, 12, vec![msg(11, &[coin_tx]), msg(12, &[trig.clone()])]), &AllExact, &proven()).expect_err("coin is read");
+    assert!(u.detail.contains("its target"), "{}", u.detail);
+    // 3. V4 hook: a transaction to a hook we can't run, and the swap after
+    //    it asks that hook (through the PoolManager).
+    let trig = stx(&KEY_A, 0, reads_hook(), w(5));
+    let hook_tx = stx(&KEY_B, 0, self_hook(), w(78));
+    let u = run_be(&copy_pc(), &feed(&trig, 12, vec![msg(11, &[hook_tx]), msg(12, &[trig.clone()])]), &AllExact, &proven()).expect_err("hook is read");
+    assert!(u.detail.contains("its target"), "{}", u.detail);
+    // 4. The PoolManager (or any router): calls out -> unknown.
+    let pm_tx = stx(&KEY_B, 0, pm_like(), vec![]);
+    let u = run_be(&copy_pc(), &feed(&swap5, 12, vec![msg(11, &[pm_tx]), msg(12, &[swap5.clone()])]), &AllExact, &proven()).expect_err("calls out");
+    assert!(u.detail.contains("calls other contracts"), "{}", u.detail);
+    // 5. Same sender as a later transaction (its nonce / balance): unknown.
+    let coin_a = stx(&KEY_A, 0, self_coin(), w(77));
+    let trig_a = stx(&KEY_A, 1, pool(), w(5));
+    let u = run_be(&copy_pc(), &feed(&trig_a, 12, vec![msg(11, &[coin_a]), msg(12, &[trig_a.clone()])]), &AllExact, &proven()).expect_err("sender reused");
+    assert!(u.detail.contains("its sender"), "{}", u.detail);
+    // 6. A target whose code our copy doesn't hold: unknown.
+    let unknown_bot = stx(&KEY_B, 0, addr(0x7bad), w(1));
+    let u = run_be(&copy_pc(), &feed(&swap5, 12, vec![msg(11, &[unknown_bot]), msg(12, &[swap5.clone()])]), &AllExact, &proven()).expect_err("no code");
+    assert!(u.detail.contains("doesn't hold its target's code"), "{}", u.detail);
+    // 7. The trigger itself: never skipped.
+    let t = stx(&KEY_A, 0, self_coin(), w(77));
+    let u = run_be(&copy_pc(), &feed(&t, 11, vec![msg(11, &[t.clone()])]), &AllExact, &proven()).expect_err("trigger");
+    assert!(u.detail.contains("trigger"), "{}", u.detail);
+    assert!(u.at.unwrap().trigger);
+}
+
+// Proven mode: ANY revert after reading an assumed sender value is unknown
+// (our made-up amount may be what failed it), not a computed "it reverted".
+#[test]
+fn proven_mode_any_revert_after_an_assumed_sender_value_is_unknown() {
+    let trig = stx(&KEY_A, 0, router_f(), xl(5, 102));
+    let f = feed(&trig, 11, vec![msg(11, &[trig.clone()])]);
+    let out = run_be(&copy_be(None), &f, &AllExact, &best()).unwrap();
+    assert!(!out.replayed[0].outcome.success, "the bot's rules: a computed revert");
+    let u = run_be(&copy_be(None), &f, &AllExact, &proven()).expect_err("proven: unknown");
+    assert_eq!(u.reason, UnknownReason::SenderFunds);
+    assert!(u.detail.contains("SLIP"), "the revert is named: {}", u.detail);
+    // Held exactly (nothing assumed): still a computed revert.
+    let trig = stx(&KEY_A, 0, router_f(), xl(5, 1_000));
+    let out = run_be(&copy_be(Some(1)), &feed(&trig, 11, vec![msg(11, &[trig.clone()])]), &AllExact, &proven()).unwrap();
+    assert!(!out.replayed[0].outcome.success);
+}
+
+// A transaction we can't even unpack (blob type 3 here; live: 24 of them
+// failed 857 triggers) no longer fails the trigger-alone run (discovery);
+// any FULL replay through it answers exactly what it used to, now naming it.
+#[test]
+fn a_transaction_we_cant_unpack_no_longer_fails_discovery() {
+    use arbsim::check::ordered::trigger_only;
+    let trig = stx(&KEY_A, 0, pool(), w(5));
+    let blob = vec![0x03u8, 0xc0];
+    let f = feed(&trig, 12, vec![msg(11, &[blob.clone()]), msg(12, &[trig.clone()])]);
+    let mut b = base();
+    b.l2_block_number = Some(10);
+    let (plan, info) = build_plan(&f, 10, 0, &b).expect("the plan is built");
+    assert_eq!(plan.unrunnable.len(), 1);
+    assert_eq!((plan.unrunnable[0].seq, plan.unrunnable[0].first_byte, plan.unrunnable[0].reason), (11, Some(0x03), UnknownReason::UnsupportedTx));
+    assert_eq!(info.txs, 1, "only what can be replayed");
+    let (alone, others) = trigger_only(&plan).unwrap();
+    assert_eq!(others, 1, "left out like every other one (alone:1)");
+    let out = run_ordered_with(&copy(), &alone, &Overrides::none(), &[our_trade()], &AllExact, true, &best()).unwrap();
+    assert_eq!(price_seen(&out), 105);
+    for a in [Assume::default(), best(), proven()] {
+        let u = run_ordered_with(&copy(), &plan, &Overrides::none(), &[our_trade()], &AllExact, true, &a).expect_err("full replay");
+        assert_eq!(u.reason, UnknownReason::UnsupportedTx);
+        assert!(u.detail.starts_with("feed message 11 tx 0: unsupported tx type 0x3"), "same detail as before: {}", u.detail);
+        assert_eq!(u.at.map(|x| (x.seq, x.trigger, x.tx_type)), Some((11, false, Some(3))), "its type byte is named");
+    }
+    // The trigger itself unreadable: unknown at once, as always.
+    let f = feed(&blob, 11, vec![msg(11, &[blob.clone()])]);
+    assert_eq!(build_plan(&f, 10, 0, &b).expect_err("trigger").reason, UnknownReason::UnsupportedTx);
+}
+
+// EIP-7702: replayed only when every authorization's signer is followed
+// exactly (its nonce decides whether the entry applies). Then the chain's
+// rules run: the signer's wallet gets the delegate's code. Otherwise
+// unknown, and never skipped by the best-effort rules.
+#[test]
+fn eip7702_runs_only_on_exactly_followed_signers() {
+    // Signer KEY_B delegates to POOL's code for one transaction from KEY_A
+    // that then calls KEY_B's wallet: it runs POOL's code in KEY_B's
+    // storage (a 32-byte call adds to slot 0 there): our pool is untouched.
+    let wallet_b = key_address(&KEY_B);
+    let t = sign_set_code(&KEY_A, &TestTx { nonce: 0, gas: 300_000, to: Some(wallet_b), value: U256::ZERO, data: w(5), access_list: vec![] }, 4663, &[(&KEY_B, 4663, pool(), 0)]);
+    let f = feed(&t, 11, vec![msg(11, &[t.clone()])]);
+    let mut s = copy();
+    add_eoa(&mut s, wallet_b, U256::ZERO);
+    s.storage.entry(wallet_b).or_default().insert(U256::ZERO, U256::ZERO);
+    let out = run_be(&s, &f, &AllExact, &best()).unwrap();
+    assert!(out.replayed[0].outcome.success, "{:?}", out.replayed[0]);
+    assert!(out.changed.contains(&(wallet_b, U256::ZERO)), "the delegate's code ran in the signer's wallet: {:?}", out.changed);
+    assert_eq!(price_seen(&out), 100, "our pool untouched");
+    // Copy 2 never follows a wallet's nonce exactly: unknown.
+    let followed = Followed(vec![pool()]);
+    let u = run_be(&s, &f, &followed, &best()).expect_err("not exact");
+    assert_eq!(u.reason, UnknownReason::UnsupportedTx, "{u:?}");
+    assert!(u.detail.contains("EIP-7702"), "{}", u.detail);
+    // ...and as an earlier transaction: not skipped (bot rules or proven).
+    let trig = stx(&KEY_A, 1, pool(), w(5));
+    let f = feed(&trig, 12, vec![msg(11, &[t.clone()]), msg(12, &[trig.clone()])]);
+    for a in [best(), proven()] {
+        assert_eq!(run_be(&s, &f, &followed, &a).expect_err("not skipped").reason, UnknownReason::UnsupportedTx);
+    }
+}

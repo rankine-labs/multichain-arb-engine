@@ -266,6 +266,34 @@ pub fn sign_typed(key: &[u8; 32], ty: u8, t: &TestTx, chain_id: u64) -> Vec<u8> 
     out
 }
 
+/// Signed type-4 (EIP-7702) tx. `auth`: (signer key, chain id, delegate
+/// address, nonce) per authorization, each signed over
+/// keccak(0x05 || rlp([chainId, address, nonce])).
+#[allow(dead_code)]
+pub fn sign_set_code(key: &[u8; 32], t: &TestTx, chain_id: u64, auth: &[(&[u8; 32], u64, Address, u64)]) -> Vec<u8> {
+    let items: Vec<Vec<u8>> = auth
+        .iter()
+        .map(|(k, c, a, n)| {
+            let body = vec![rlp_u64(*c), rlp_bytes(a.as_slice()), rlp_u64(*n)];
+            let mut pre = vec![0x05];
+            pre.extend(rlp_list(&body));
+            let (p, r, s) = sign(k, keccak256(&pre));
+            let mut f = body;
+            f.extend([rlp_u64(p as u64), rlp_uint(r), rlp_uint(s)]);
+            rlp_list(&f)
+        })
+        .collect();
+    let mut f = vec![rlp_u64(chain_id), rlp_u64(t.nonce), rlp_u64(1), rlp_u64(1_000_000_000)];
+    f.extend([rlp_u64(t.gas), to_field(t.to), rlp_uint(t.value), rlp_bytes(&t.data), access_list_rlp(&t.access_list), rlp_list(&items)]);
+    let mut pre = vec![4u8];
+    pre.extend(rlp_list(&f));
+    let (p, r, s) = sign(key, keccak256(&pre));
+    f.extend([rlp_u64(p as u64), rlp_uint(r), rlp_uint(s)]);
+    let mut out = vec![4u8];
+    out.extend(rlp_list(&f));
+    out
+}
+
 pub fn bytes(v: Vec<u8>) -> Bytes {
     Bytes::from(v)
 }

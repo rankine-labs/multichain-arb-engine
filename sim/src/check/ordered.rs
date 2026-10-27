@@ -130,6 +130,44 @@
 //   With no assumptions allowed (`Assume::default()`, the strict setting),
 //   every rule above is the old strict "unknown".
 //
+//   PROVEN SKIPPING (Oct 27; the fast lane's own trigger path asks for it,
+//   "skip_proven", FASTLANE_TRIG_SKIP=proven, the default there; the bot's
+//   questions keep the rules above). The best-effort rule 3 is a guess: a
+//   bot contract whose data doesn't name our pool can still trade on it
+//   (Oct 21: two thirds of the trades on our pools can't be read from
+//   their data). Proven skipping only leaves out a transaction (never the
+//   trigger) that we couldn't run when it is PROVEN that it can't change
+//   anything the rest of the run reads:
+//     - its target is a contract whose code our copy holds (unchanged in
+//       this run) and that code has no outward opcode (CALL, CALLCODE,
+//       DELEGATECALL, CREATE, CREATE2, SELFDESTRUCT; see writes_only_itself),
+//       so on the chain it could only have changed its target's storage
+//       and ETH balance and its sender's ETH balance and nonce, whatever
+//       values it read and whether it reverted or not;
+//     - and the finished run (every other replayed transaction, our trade
+//       at every ladder size) never used either account (any use of an
+//       account loads it first, and every load is written down).
+//   Anything else is unknown: routers, bots, proxies, the V4 PoolManager
+//   (they call out: they may trade on our pools, pay our pools' coins, run
+//   a hook), a contract whose code we don't hold, a 7702 transaction, a
+//   built-in. A coin we trade, a hook our pool asks, a pool on our route
+//   are all USED by the rest of the run, so a transaction on them is never
+//   left out. Not an assumption: the answer's confidence is unchanged;
+//   labelled skipped_proven:N. In this mode a replayed transaction that
+//   reverts (with ANY reason) after reading a value of its sender we only
+//   ASSUMED is unknown too (sender_funds_revert): our made-up amount reads
+//   as "no" in a permission flag (a bot's whitelist[sender]), so the revert
+//   may be ours, not the chain's. Not modelled, for every replayed
+//   transaction alike: Nitro's own gas accounting state (ArbOS L2 / L1
+//   pricing), which no check reads.
+//
+//   CAN'T UNPACK (Oct 27): a feed transaction we can't even unpack (not
+//   the trigger) no longer stops the plan: it is written down
+//   (OrderedPlan.unrunnable); a full replay through it is unknown exactly
+//   as before, but the trigger-alone run (discovery) goes ahead without it.
+//   Every unknown also names the replayed transaction it got stuck on
+//   (CheckUnknown.at): the trigger, or one replayed because copy 2 lags.
+//
 //   Still "unknown" (we truly can't run it): unsupported transaction kinds,
 //   messages we can't unpack, sequence gaps / a copy too far behind, missing
 //   code / state of our route or of the trigger's own path (other than its
@@ -1766,11 +1804,14 @@ pub fn writes_only_itself(code: &[u8]) -> bool {
     true
 }
 
-/// Precompiles, Nitro built-ins and other system addresses (the first 18
-/// bytes zero): never "only itself" (a built-in has no code but changes
-/// chain state, e.g. ArbSys sending to the parent chain).
+/// Precompiles and Nitro built-ins (every one is at or below 0x100: the
+/// Ethereum ones 0x01..0x11 and 0x100, Nitro's 0x64..0xff; anything below
+/// 0x1000 is treated the same, with room): never "only itself" (a built-in
+/// has no code but changes chain state, e.g. ArbSys sending to the parent
+/// chain).
 fn system_address(a: Address) -> bool {
-    a.as_slice()[..18].iter().all(|b| *b == 0)
+    let b = a.as_slice();
+    b[..18].iter().all(|x| *x == 0) && u16::from_be_bytes([b[18], b[19]]) < 0x1000
 }
 
 /// PROVEN SKIPPING: may this transaction (not the trigger), which we
@@ -1851,6 +1892,10 @@ pub fn revert_text(o: &CallOutcome) -> String {
     if b.len() >= 68 && b[..4] == [0x08, 0xc3, 0x79, 0xa0] {
         let n = U256::from_be_slice(&b[36..68]).saturating_to::<usize>().min(b.len().saturating_sub(68)).min(64);
         return format!("\"{}\"", String::from_utf8_lossy(&b[68..68 + n]));
+    }
+    // A short plain-text reason (some contracts revert with raw text).
+    if !b.is_empty() && b.len() <= 32 && b.iter().all(|c| (0x20..0x7f).contains(c)) {
+        return format!("\"{}\"", String::from_utf8_lossy(b));
     }
     if b.len() >= 4 {
         return format!("error 0x{}", b[..4].iter().map(|x| format!("{x:02x}")).collect::<String>());

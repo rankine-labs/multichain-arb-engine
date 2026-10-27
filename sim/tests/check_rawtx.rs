@@ -80,8 +80,10 @@ fn tampered_or_unsupported_refused() {
     let mut long = raw.clone();
     long.push(0);
     assert!(decode_signed_tx(&long).is_err());
-    // Blob (3), 7702 (4), Arbitrum system (0x6a) = unsupported.
-    for t in [0x03u8, 0x04, 0x6a] {
+    // Blob (3), Arbitrum system (0x6a) = unsupported. (7702, type 4, is
+    // unpacked since Oct 27: a broken one is refused as broken.)
+    assert!(decode_signed_tx(&[0x04, 0xc0]).unwrap_err().contains("type 4 tx needs 13 fields"));
+    for t in [0x03u8, 0x6a] {
         assert!(decode_signed_tx(&[t, 0xc0]).unwrap_err().starts_with("unsupported tx type"));
     }
 }
@@ -110,4 +112,42 @@ fn raw_tx_applied_before_calls() {
     // Garbage raw tx = bad request (not a miss, not a verdict).
     let e = run_calls(&s, &ctx(), &Overrides::none(), &[Bytes::from(vec![0x02, 0x01])], &[]).unwrap_err();
     assert_eq!(e.reason, UnknownReason::BadRequest);
+}
+
+// EIP-7702 (type 4, Oct 27): the live feed carries kinds we used to refuse
+// outright, and ONE such transaction anywhere in a check's window made every
+// trigger there unknown. Type 4 is now unpacked: sender, target, data, and
+// each authorization's signer (a bad signature = an Invalid signer, which
+// the chain skips). A creation or an empty list is refused like the chain does.
+#[test]
+fn eip7702_set_code_is_unpacked_with_its_signers() {
+    use revm::context_interface::transaction::RecoveredAuthority;
+    const KEY_B: [u8; 32] = [
+        0x59, 0xc6, 0x99, 0x5e, 0x99, 0x8f, 0x97, 0xa5, 0xa0, 0x04, 0x49, 0x66, 0xf0, 0x94, 0x53, 0x89, 0xdc, 0x9e, 0x86,
+        0xda, 0xe8, 0x8c, 0x7a, 0x84, 0x12, 0xf4, 0x60, 0x3b, 0x6b, 0x78, 0x69, 0x0d,
+    ];
+    let raw = sign_set_code(&KEY, &tx(vec![9, 9]), 4663, &[(&KEY, 4663, addr(0xde1e), 8), (&KEY_B, 0, addr(0xde1f), 0)]);
+    let d = decode_signed_tx(&raw).unwrap();
+    assert_eq!((d.tx_type, d.from, d.to, d.nonce, d.gas, d.value, d.chain_id), (4, key_address(&KEY), Some(addr(0xc0de)), 7, 90_000, U256::from(3u64), Some(4663)));
+    assert_eq!(d.data, Bytes::from(vec![9u8, 9]));
+    assert_eq!(d.hash, keccak256(&raw));
+    assert_eq!(d.auth.len(), 2);
+    assert_eq!(d.auth[0].authority(), Some(key_address(&KEY)), "signer recovered");
+    assert_eq!((d.auth[0].address, d.auth[0].nonce), (addr(0xde1e), 8));
+    assert_eq!(d.auth[1].authority(), Some(key_address(&KEY_B)));
+    assert_eq!(*d.auth[1].chain_id(), U256::ZERO, "chain id 0 = any chain");
+    // A tampered authorization: the transaction still unpacks (its own
+    // signature is over the tampered bytes too, so re-sign), the entry's
+    // signer is just someone else / invalid - never the original key.
+    let mut bad = raw.clone();
+    let pos = bad.windows(20).position(|w| w == addr(0xde1f).as_slice()).unwrap();
+    bad[pos + 19] ^= 1;
+    if let Ok(d2) = decode_signed_tx(&bad) {
+        assert!(d2.auth[1].authority() != Some(key_address(&KEY_B)) || matches!(d2.auth[1].clone().into_parts().1, RecoveredAuthority::Invalid));
+    }
+    // Creation / empty list: refused.
+    let mut t = tx(vec![]);
+    t.to = None;
+    assert!(decode_signed_tx(&sign_set_code(&KEY, &t, 4663, &[(&KEY, 4663, addr(1), 0)])).is_err());
+    assert!(decode_signed_tx(&sign_set_code(&KEY, &tx(vec![]), 4663, &[])).unwrap_err().contains("empty authorization list"));
 }

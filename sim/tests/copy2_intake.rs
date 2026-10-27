@@ -3615,3 +3615,155 @@ fn fastlane_trig_replay_plays_a_recording_in_arrival_order() {
     let rep = trig_replay(&cap, None, &cfg, &TrigReplayOpts::default()).unwrap();
     assert_eq!((rep["coverage"]["discovery"]["movedOurPools"].clone(), rep["candidates"]["routesChecked"].clone()), (json!(1), json!(0)));
 }
+
+// ---------------------------------------------------------------------------
+// PREDICTION COVERAGE (Oct 27) through the fast lane's own trigger path.
+// ---------------------------------------------------------------------------
+
+/// anvil / hardhat test account #1 (public test key, no funds).
+const TEST_KEY_B: [u8; 32] = [
+    0x59, 0xc6, 0x99, 0x5e, 0x99, 0x8f, 0x97, 0xa5, 0xa0, 0x04, 0x49, 0x66, 0xf0, 0x94, 0x53, 0x89, 0xdc, 0x9e, 0x86,
+    0xda, 0xe8, 0x8c, 0x7a, 0x84, 0x12, 0xf4, 0x60, 0x3b, 0x6b, 0x78, 0x69, 0x0d,
+];
+
+fn signed_b(nonce: u64, to: Address, data: Vec<u8>) -> Vec<u8> {
+    check_util::sign_typed(&TEST_KEY_B, 2, &check_util::TestTx { nonce, gas: 200_000, to: Some(to), value: U256::ZERO, data, access_list: vec![] }, 4663)
+}
+
+// Copy 2 at block H. Feed: H+1 = someone's transfer on a coin-like contract
+// that only ever writes its own storage (its holder's balance: not in our
+// copy), H+2 = a swap leaving 2 USDG for our route. The trigger arrives
+// while copy 2 is 2 blocks behind, so the check must replay H+1 first:
+//   - proven skipping (FASTLANE_TRIG_SKIP default): H+1 is left out
+//     (provably unrelated) and the trade reaches the gun (practice: signed,
+//     never sent), answer "high";
+//   - H+3 = a transaction to a contract our copy doesn't hold, H+4 = another
+//     swap: that one could be anything (a bot trading on our pool) -> the
+//     check is unknown, counted "check|lag|miss" with its target.
+#[test]
+fn fastlane_trigger_proven_skipping_through_the_server() {
+    use arbsim::fastlane::lane::FiredWhat;
+    use arbsim::fastlane::trigger::{TrigCfg, TrigOutcome, Trigger};
+    let _turn = FEED_STORE_TURN.lock().unwrap_or_else(|e| e.into_inner());
+    arbsim::check::feedstore::store().clear();
+    let (mut r, ctx) = trig_world_code(fl_pool_code());
+    let coin = check_util::addr(0x5ca1);
+    r.chain.codes.lock().unwrap().insert(coin, check_util::hex("36 15 6010 57 6000 35 54 50 6007 6000 55 00 5b 6000 54 6000 52 6020 6000 f3"));
+    // Copy 2 learns the coin's code the usual way: a check misses it, it is filled.
+    let mut held = false;
+    for _ in 0..20 {
+        let ans = arbsim::server::handle(&ctx, &json!({"id": 3, "type": "call", "calls": [{"from": format!("{}", a(0xe0)), "to": format!("{coin:#x}"), "data": "0x", "gas": "0x100000"}]}));
+        if ans["ok"] == json!(true) {
+            held = true;
+            break;
+        }
+        r.settle();
+        r.send(tick(r.sh.head().unwrap().block + 1, 70));
+    }
+    assert!(held, "the fill never arrived");
+    let h = r.sh.head().unwrap().block;
+    let k = format!("{:#x}", a(V2P));
+    let ans = arbsim::check::entry::apply_table(&json!(1), &json!({"type": "trig_table", "gen": 1, "full": true, "codes": [], "pools": {k.clone(): [fl_table_row()]}}));
+    assert_eq!(ans["ok"], json!(true), "{ans}");
+    let put = |seq: u64, txs: &[&Vec<u8>]| {
+        let m = json!({"seq": seq, "ts": 90 + seq, "l1": 9000, "txs": txs.iter().map(|t| hexb(t)).collect::<Vec<_>>()});
+        arbsim::check::feedstore::store().put_json(&json!({"type": "feed_put", "msgs": [m]}));
+        arbsim::check::feedstore::store().get(seq).unwrap()
+    };
+    let unrelated = signed_b(0, coin, u(77).to_be_bytes::<32>().to_vec());
+    let swap = signed(0, a(V2P), u(2_000_000).to_be_bytes::<32>().to_vec());
+    put(h + 1, &[&unrelated]);
+    let m2 = put(h + 2, &[&swap]);
+    let cfg = TrigCfg { max_lag_ms: 60_000, ..TrigCfg::default() };
+    assert!(cfg.proven_skip, "proven is the default");
+    assert_eq!(cfg.feed_assume(), vec!["sender_funds".to_string(), "recent_fill".into(), "skip_proven".into()]);
+    let (firer, _dir, hits) = fl_firer("proven", &[("FASTLANE", "practice")], None);
+    let mut t = Trigger::new(cfg.clone(), firer);
+    t.to_practice = false;
+    let out = t.on_message(&ctx, &m2, std::time::Instant::now());
+    assert!(matches!(out.as_slice(), [TrigOutcome::Fired(FiredWhat::Written { .. })]), "{out:?} {}", t.hour.json());
+    assert_eq!((t.hour.answers_sure, t.hour.would_send), (1, 1), "{}", t.hour.json());
+    // A transaction to a contract we don't hold, then another swap.
+    let unknown_bot = signed_b(1, check_util::addr(0x7bad), u(1).to_be_bytes::<32>().to_vec());
+    let swap2 = signed(1, a(V2P), u(2_000_000).to_be_bytes::<32>().to_vec());
+    put(h + 3, &[&unknown_bot]);
+    let m4 = put(h + 4, &[&swap2]);
+    let out = t.on_message(&ctx, &m4, std::time::Instant::now());
+    assert_eq!(out, vec![TrigOutcome::NotGood], "{}", t.hour.json());
+    let st = t.hour.json();
+    assert_eq!(st["unknownWhere"]["check|lag|miss"], json!(1), "{st}");
+    let top = st["unknownTop"].to_string();
+    assert!(top.contains("0x0000000000000000000000000000000000007bad"), "the blamed target is named: {top}");
+    // FASTLANE_TRIG_SKIP=bot: the question asks for the bot's rules again
+    // (their guess on such a transaction: tests/trig_first.rs
+    // proven_skipping_never_skips_what_could_matter).
+    let bot = TrigCfg::from_lookup(&|k| (k == "FASTLANE_TRIG_SKIP").then(|| "bot".to_string()));
+    assert_eq!(bot.feed_assume(), vec!["sender_funds".to_string(), "recent_fill".into(), "skip".into()]);
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0, "practice never connects to the send endpoint");
+    arbsim::check::entry::clear_table();
+    arbsim::check::feedstore::store().clear();
+}
+
+// `arbsim trig-replay` COVERAGE DIAGNOSIS on a recording in arrival order:
+// copy 2 at 101; feed 102 holds a transaction we can't unpack (blob type
+// 3) and arrives before its reports; feed 103 holds the swap (copy 2 is 2
+// blocks behind); copy 2's version 102 arrives later (with the chain's
+// answer: the swap moved V2P). Asserted:
+//   - discovery still names V2P (before Oct 27 the unreadable transaction
+//     failed it: "unsupported_tx"), counted as one the old rule failed;
+//   - the full replay a candidate check needs is unknown, blamed on a
+//     LAG-replayed transaction of type 3 (and the candidate check too);
+//   - "moved our pools" agrees with the chain; WITH NO LAG (on version
+//     102) the answer is the same.
+#[test]
+fn fastlane_trig_replay_diagnoses_coverage() {
+    use arbsim::copy2::ahead::AheadCfg;
+    use arbsim::copy2::ahead_capture::{CapEv, CapFile, ProvSets};
+    use arbsim::fastlane::trig_replay::{print_report, trig_replay, TrigReplayOpts};
+    use arbsim::fastlane::trigger::TrigCfg;
+    let (mut r, _ctx) = trig_world_code(fl_pool_code());
+    let version = |r: &Rig| {
+        let v = r.sh.head().unwrap();
+        CapEv::Confirmed { seq: v.seq, ctx: v.ctx.clone(), snap: v.snap.clone() }
+    };
+    let prov = |r: &Rig, b: u64| CapEv::Prov(Arc::new(ProvSets::from_copy2(&r.h.provenance_at(b, &[]))));
+    let fp = arbsim::check::moved::FollowedPool { key: format!("{:#x}", a(V2P)), address: a(V2P), v4_id: None };
+    let swap = signed(0, a(V2P), u(2_000_000).to_be_bytes::<32>().to_vec());
+    let blob = vec![0x03u8, 0xc0];
+    let wm = |seq: u64, txs: &[&Vec<u8>]| arbsim::check::ordered::WireFeedMsg { seq, ts: 60 + seq, l1: 9000, txs: txs.iter().map(|t| hexb(t)).collect(), complete: true, why: None };
+    let mut events = vec![
+        CapEv::Header { cfg: AheadCfg::default(), l2_offset: 0, live: "{}".into() },
+        CapEv::Pools { list: vec![(fp, a(COIN0), a(COIN1))], not_ready: vec![] },
+        prov(&r, 101),
+        version(&r),
+        CapEv::Feed(Arc::new(arbsim::check::feedstore::BinMsg::from_wire(&wm(102, &[&blob]), true))),
+        CapEv::Feed(Arc::new(arbsim::check::feedstore::BinMsg::from_wire(&wm(103, &[&swap]), true))),
+    ];
+    r.send(msg(102, 62, vec![v2_sync(1100, 3640, 102, 0, 0)]));
+    events.push(CapEv::Moves(vec![(keccak256(&swap), Some(vec![format!("{:#x}", a(V2P))])), (keccak256(&blob), None)]));
+    events.push(prov(&r, 102));
+    events.push(version(&r));
+    events.push(CapEv::End { live: "{}".into(), why: "done".into() });
+    let cap = CapFile { events, complete: true, cut: None };
+    let table = arbsim::check::entry::table_from_messages(&[json!({"type": "trig_table", "gen": 1, "full": true, "codes": [], "pools": {format!("{:#x}", a(V2P)): [fl_table_row()]}})]).unwrap();
+    let rep = trig_replay(&cap, Some(&table), &TrigCfg::default(), &TrigReplayOpts::default()).unwrap();
+    println!("{}", print_report(&rep));
+    assert_eq!((rep["copyLag"]["histogram"]["1"].clone(), rep["copyLag"]["histogram"]["2"].clone()), (json!(1), json!(1)), "{}", rep["copyLag"]);
+    assert_eq!(rep["copyLag"]["lagReplayedTxsPerTrigger"]["max"], json!(1));
+    assert_eq!((rep["coverage"]["skipped"]["unreadable"].clone(), rep["coverage"]["asked"].clone()), (json!(1), json!(1)), "{}", rep["coverage"]);
+    assert_eq!(rep["coverage"]["discovery"]["movedOurPools"], json!(1), "{}", rep["coverage"]);
+    let g = &rep["diagnosis"];
+    assert_eq!(g["unreadable"]["distinctTxs"], json!(1), "{g}");
+    assert!(g["unreadable"]["byKind"].to_string().contains("first byte 0x03"), "{}", g["unreadable"]);
+    assert_eq!(g["unreadable"]["triggersTheOldPlanRuleFailed"], json!(1));
+    assert_eq!(g["movedOurPools"]["vsChain"]["chain: same pools"], json!(1), "{}", g["movedOurPools"]);
+    let f = &g["fullReplay"];
+    assert_eq!((f["asked"].clone(), f["noSkipping"]["answerable"].clone(), f["provenSkipping"]["answerable"].clone()), (json!(1), json!(0), json!(0)), "{f}");
+    assert_eq!(f["noSkipping"]["unknown"]["where"]["lag|unsupported_tx"], json!(1), "{f}");
+    assert_eq!(f["noSkipping"]["unknown"]["chainSaysBlamedTx"]["chain: moved none"], json!(1), "the blob moved none of our pools: {f}");
+    assert_eq!(g["candidateUnknownWhere"]["lag|unsupported_tx|to -"], json!(1), "{g}");
+    assert_eq!(rep["candidates"]["wouldReachGun"], json!(0));
+    assert_eq!(g["withNoLag"]["compared"], json!(1), "{}", g["withNoLag"]);
+    assert_eq!(g["withNoLag"]["outcome"]["same answer"], json!(1), "{}", g["withNoLag"]);
+}
