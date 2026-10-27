@@ -126,11 +126,17 @@
 //            whose base values were corrected later are counted ("baseLate").
 //     8. FAILED TRANSACTIONS, safer: also marked unsure (besides the old
 //        rules) are native-ETH pools of a named coin whatever the ETH value
-//        (a V4 "sell for ETH" pays none), and the target's learned pools of a
-//        named pair (split routes over sister pools), or all its learned
-//        pools when the data names no coin (opaque bot contracts). Routers
-//        are now learned from EVERY transaction copy 2 says moved our pools
-//        (before: only from ones the filter skipped).
+//        (a V4 "sell for ETH" pays none), and the target's learned pools this
+//        data could be trading (a named pair, e.g. a split route over sister
+//        pools; with one coin named, its pools holding it; with none named,
+//        an opaque bot contract, all of them). Routers are now learned from
+//        EVERY transaction copy 2 says moved our pools (before: only from
+//        ones the filter skipped), a router's list keeps its 64 MOST RECENT
+//        pools (before: the first 64, forever), and a failed run's guessed
+//        pools are no longer learned as if the router had moved them.
+//        "missed" also counts a block where both sides moved the pool but one
+//        of its movers was missed (e.g. a second swap the filter skipped):
+//        "value" is left for "we ran every mover and still differ".
 //     9. MEASURABLE: richer disagreement samples (base block, slots that
 //        differ, predicted vs confirmed values, our transactions on that pool,
 //        why the mover failed), the newest ones kept in status totals too, and
@@ -619,19 +625,24 @@ impl PoolSet {
 
     /// Accuracy fixes: of `learned` (a router's pools from its history), the
     /// ones this transaction's data could be trading: both coins named, or
-    /// (native-ETH pool) its other coin named. Data naming NO coin at all
-    /// (an opaque bot contract): every learned pool.
+    /// (native-ETH pool) its other coin named, or (only one coin named) the
+    /// ones holding it. Data naming NO coin at all (an opaque bot
+    /// contract): every learned pool.
     fn learned_for(&self, learned: &[String], n: &Named) -> Vec<String> {
         let named: Vec<&Address> = self.idx.coins(n).collect();
         if named.is_empty() {
             return learned.to_vec();
         }
         let has = |c: &Address| named.contains(&c);
+        // One coin named (the other side is implied, e.g. ETH or the
+        // router's own path): its pools holding that coin.
+        let one = named.len() == 1;
         learned
             .iter()
             .filter(|k| match self.coins_of.get(*k) {
                 Some((a, b)) if a.is_zero() => has(b),
                 Some((a, b)) if b.is_zero() => has(a),
+                Some((a, b)) if one => has(a) || has(b),
                 Some((a, b)) => has(a) && has(b),
                 None => false,
             })
@@ -1345,8 +1356,16 @@ impl Ahead {
         let e = self.touchers.entry(a).or_insert_with(|| (Instant::now(), Vec::new()));
         e.0 = Instant::now();
         for k in pools {
-            // Bounded: a router remembers at most 64 of our pools.
-            if !e.1.contains(k) && e.1.len() < 64 {
+            // Bounded: a router remembers its 64 most recent pools of ours
+            // (accuracy fixes: a full list used to never learn a new pool,
+            // so a busy router's new pools were never marked).
+            if let Some(i) = e.1.iter().position(|x| x == k) {
+                let x = e.1.remove(i);
+                e.1.push(x);
+            } else {
+                if e.1.len() >= 64 {
+                    e.1.remove(0);
+                }
                 e.1.push(k.clone());
             }
         }
@@ -1920,7 +1939,15 @@ impl Ahead {
                         // else our pools sharing a coin it names; if none of
                         // that is known, stop until confirmed.
                         self.count(|s| s.failed_unknown += 1);
-                        hit = t.to.and_then(|a| self.touchers.get(&a)).map(|x| x.1.clone()).unwrap_or_default();
+                        // Accuracy fixes: of its learned pools, the ones this
+                        // data could be trading (all of them when it names no
+                        // coin), plus native-ETH pools of a named coin.
+                        hit = t.to.and_then(|a| self.touchers.get(&a)).map(|x| pools.learned_for(&x.1, &named_now)).unwrap_or_default();
+                        for k in pools.named_native_any(&named_now) {
+                            if !hit.contains(&k) {
+                                hit.push(k);
+                            }
+                        }
                         if hit.is_empty() && pools.names_pm(t.to, &named_now) {
                             hit = pools.v4_sharing_named_coins(t.to, &named_now);
                             if !hit.is_empty() {
@@ -1935,8 +1962,13 @@ impl Ahead {
                         }
                     }
                     self.count(|s| s.txs_marked += 1);
+                    // Its target is remembered (its next calls are picked),
+                    // but NOT these pools: they are our guesses, and a
+                    // router's list must hold only pools it really moved
+                    // (copy 2's reports, our exact runs), or the guesses
+                    // crowd them out (accuracy fixes).
                     if let Some(a) = t.to {
-                        self.learn_toucher(a, &hit);
+                        self.learn_toucher(a, &[]);
                     }
                     mark_unsure(&mut ov, &mut changed, &mut changed_cum, &mut unsure_cum, &hit);
                     notes.push(note(t, Fate::Failed, false, Some(why), hit));

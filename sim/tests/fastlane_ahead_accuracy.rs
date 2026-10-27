@@ -485,3 +485,45 @@ fn routers_are_learned_from_transactions_we_ran_too() {
     un.sort();
     assert_eq!(un, vec![key(pool()), key(pool2())]);
 }
+
+/// A failed call to a router whose effect can't be traced (its code is not
+/// in our copy) naming ONE coin T and paying no ETH (a V4 "sell T for ETH"):
+/// the ETH / T pool is marked unsure (it used to stay sure: only the
+/// router's 64 first-learned pools were marked). The router's learned pools
+/// not holding T stay sure. And a busy router keeps learning: its list holds
+/// its 64 most RECENT pools.
+#[test]
+fn a_failed_sell_for_eth_marks_the_native_pool_and_busy_routers_keep_learning() {
+    let tok = addr(0x7070);
+    let other = addr(0x8080);
+    let native = addr(0x6001);
+    let ur = addr(0x9999);
+    let fp = |a: Address, t0: Address, t1: Address| (FollowedPool { key: key(a), address: a, v4_id: None }, t0, t1);
+    // 70 pools of OTHER / i (the router traded them all, oldest first) + the native pool.
+    let many: Vec<Address> = (0..70u64).map(|i| addr(0x4000 + i)).collect();
+    let mut list: Vec<_> = many.iter().enumerate().map(|(i, a)| fp(*a, other, addr(0x3000 + i as u64))).collect();
+    list.push(fp(native, Address::ZERO, tok));
+    let mut s = copy_at(100, 7);
+    s.apply_fact(&Fact::Forget(ur));
+    let mut a = Ahead::new(AheadCfg::default());
+    a.set_pools(Arc::new(PoolSet::build(&list, HashSet::new())));
+    a.on_confirmed(confirmed(10, Arc::new(s.clone())), &no_moves);
+    // Block 11: 70 router calls, copy 2 says each moved one of the 70 pools.
+    let txs: Vec<Vec<u8>> = (0..70u64).map(|i| stx(i, ur, w(i))).collect();
+    a.on_feed_message(msg(11, &txs));
+    let hs: Vec<B256> = txs.iter().map(keccak256).collect();
+    let many2 = many.clone();
+    a.on_confirmed(confirmed(11, Arc::new(s.clone())), &move |x: &B256| hs.iter().position(|h| h == x).map(|i| vec![key(many2[i])]));
+    // Block 12: the router sells T for ETH (names T only, no ETH paid).
+    let mut data = vec![0u8; 12];
+    data.extend_from_slice(tok.as_slice());
+    a.on_feed_message(msg(12, &[stx(70, ur, data)]));
+    let un = a.tip().unwrap().unsure_pools.clone();
+    assert_eq!(un, vec![key(native)], "only the ETH / T pool: the router's 70 OTHER pools hold no T");
+    // Block 13: an opaque call (names no coin): the router's 64 most recent pools.
+    a.on_confirmed(confirmed(12, Arc::new(s.clone())), &no_moves);
+    a.on_feed_message(msg(13, &[stx(71, ur, w(1))]));
+    let un: HashSet<String> = a.tip().unwrap().unsure_pools.iter().cloned().collect();
+    assert_eq!(un.len(), 64);
+    assert!(un.contains(&key(many[69])) && !un.contains(&key(many[0])), "the newest kept, the oldest dropped");
+}

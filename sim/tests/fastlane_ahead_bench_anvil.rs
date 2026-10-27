@@ -193,17 +193,24 @@ fn pct(v: &mut [u64]) -> (u64, u64, u64, u64) {
     (p(0.5), p(0.9), p(0.99), *v.last().unwrap())
 }
 
-#[test]
-fn bench_apply_on_real_v3_v4_pools_test_numbers_only() {
-    let Some(a) = Anvil::start() else {
-        eprintln!("[bench] anvil not installed: skipped");
-        return;
-    };
+/// Everything a test needs from the practice chain: the market, the feed
+/// messages (block time, signed transactions), our copy before the first
+/// one (prestate), each block's changes (diff traces) and our pool list.
+struct World {
+    m: Market,
+    msgs: Vec<(u64, Vec<Vec<u8>>)>,
+    snap: Snapshot,
+    posts: Vec<Vec<(B256, Value)>>,
+    list: Vec<(FollowedPool, Address, Address)>,
+    base_block: u64,
+    t_base: u64,
+}
+
+fn build_world(a: &Anvil, n_msgs: usize) -> World {
     let me = key_address(&KEY0);
     assert_eq!(me, a.me, "anvil account #0 is our test key");
     let other = key_address(&KEY1);
-    let m = setup(&a);
-    let n_msgs: usize = std::env::var("FASTLANE_BENCH_MSGS").ok().and_then(|v| v.parse().ok()).filter(|n| (1..=30).contains(n)).unwrap_or(24);
+    let m = setup(a);
     let mut rng = Rng::new(11);
     // The rival bot: a contract our copy doesn't know (never in our copy).
     let rival = Address::from([0x7a; 20]);
@@ -302,6 +309,17 @@ fn bench_apply_on_real_v3_v4_pools_test_numbers_only() {
             list.push((FollowedPool { key: ha(addr), address: addr, v4_id: None }, c0, c1));
         }
     }
+    World { m, msgs, snap, posts, list, base_block, t_base }
+}
+
+#[test]
+fn bench_apply_on_real_v3_v4_pools_test_numbers_only() {
+    let Some(a) = Anvil::start() else {
+        eprintln!("[bench] anvil not installed: skipped");
+        return;
+    };
+    let n_msgs: usize = std::env::var("FASTLANE_BENCH_MSGS").ok().and_then(|v| v.parse().ok()).filter(|n| (1..=30).contains(n)).unwrap_or(24);
+    let World { m, msgs, snap, posts, list, base_block, t_base } = build_world(&a, n_msgs);
     let set = Arc::new(PoolSet::build(&list, HashSet::new()));
     let ctx_of = |n: u64, ts: u64| BlockCtx { l1_block_number: 500, l2_block_number: Some(n), timestamp: ts, basefee: 0, coinbase: Address::ZERO, gas_limit: 1_000_000_000, prevrandao: B256::ZERO };
     // No per-message budget here: every message is applied and timed (the
@@ -417,4 +435,173 @@ fn bench_apply_on_real_v3_v4_pools_test_numbers_only() {
         unsure_counts.get(unsure_counts.len() / 2).copied().unwrap_or(0), unsure_counts.last().copied().unwrap_or(0),
     );
     assert!(checked > 0, "some predictions were sure and checked");
+}
+
+// ---------------------------------------------------------------------------
+// Accuracy fixes (Oct 27): capture + offline replay on REAL pool code.
+// ---------------------------------------------------------------------------
+
+/// Copy 2's confirmed version of every block (the chain's own diff traces
+/// applied to the prestate copy) and "which transaction moved which of our
+/// pools" (copy 2's RECENT MOVES), as the bench above builds them.
+fn confirmed_versions(w: &World) -> (Vec<(u64, Snapshot, u64)>, std::collections::HashMap<B256, Vec<String>>) {
+    let m = &w.m;
+    let v3_key = ha(m.v3);
+    let v4_keys: Vec<String> = m.v4.iter().map(|p| format!("{:#x}", p.v4_id.unwrap())).collect();
+    let mut truth = w.snap.clone();
+    let mut out = Vec::new();
+    let mut moves = std::collections::HashMap::new();
+    for (i, (ts, _)) in w.msgs.iter().enumerate() {
+        let seq = w.base_block + 1 + i as u64;
+        for (h, post) in &w.posts[i] {
+            let mut pools = Vec::new();
+            for (k, v) in post.as_object().into_iter().flatten() {
+                let acct: Address = k.parse().unwrap();
+                let slots: Vec<U256> = v.get("storage").and_then(|x| x.as_object()).into_iter().flatten().map(|(s, _)| parse_u256(s).unwrap()).collect();
+                if acct == m.v3 && !slots.is_empty() {
+                    pools.push(v3_key.clone());
+                }
+                if acct == m.pm {
+                    for (p, key) in m.v4.iter().zip(&v4_keys) {
+                        let base = map_slot(U256::from_be_bytes(p.v4_id.unwrap().0), U256::from(6));
+                        if slots.iter().any(|s| *s >= base && *s < base + U256::from(4u8)) {
+                            pools.push(key.clone());
+                        }
+                    }
+                }
+                let old = truth.accounts.get(&acct).and_then(|x| match &x.basics {
+                    arbsim::state::snap::Basics::Known(Some(i)) => Some(i.clone()),
+                    _ => None,
+                });
+                if v.get("balance").is_some() || v.get("nonce").is_some() {
+                    let mut info = old.unwrap_or_default();
+                    if let Some(b) = v.get("balance") {
+                        info.balance = uv(b);
+                    }
+                    if let Some(n) = v.get("nonce").and_then(|n| n.as_u64()) {
+                        info.nonce = n;
+                    }
+                    if info.code_hash == B256::ZERO {
+                        info.code_hash = KECCAK_EMPTY;
+                    }
+                    truth.apply_fact(&Fact::Basics { addr: acct, info: Some(info), code: None });
+                }
+                for (sk, sv) in v.get("storage").and_then(|x| x.as_object()).into_iter().flatten() {
+                    truth.apply_fact(&Fact::Slot(acct, parse_u256(sk).unwrap(), uv(sv)));
+                }
+            }
+            if !pools.is_empty() {
+                moves.insert(*h, pools);
+            }
+        }
+        out.push((seq, truth.clone(), *ts));
+    }
+    (out, moves)
+}
+
+/// The capture written while driving the predicted copy the way the
+/// sidecar's thread does, on REAL V3 + V4 pool code (+ 1,800 followed
+/// pools), read back and replayed offline: the SAME counts. And with copy 2
+/// publishing every 3rd block BEFORE its reports (a first version equal to
+/// the block before, then the corrected one), the settled agreement is
+/// still 100% for the pools we were sure of (each real swap runs exactly;
+/// the rival bot's pools are unsure), and the predicted copy rebased on
+/// every corrected version.
+#[test]
+fn capture_and_replay_on_real_v3_v4_pools() {
+    use arbsim::copy2::ahead::Settled;
+    use arbsim::copy2::ahead_capture::{print_report, read_capture, replay, CapEv, Capture, ProvSets, ReplayOpts};
+    let Some(a) = Anvil::start() else {
+        eprintln!("[capture test] anvil not installed: skipped");
+        return;
+    };
+    let w = build_world(&a, 12);
+    let (versions, moves) = confirmed_versions(&w);
+    let ctx_of = |n: u64, ts: u64| BlockCtx { l1_block_number: 500, l2_block_number: Some(n), timestamp: ts, basefee: 0, coinbase: Address::ZERO, gas_limit: 1_000_000_000, prevrandao: B256::ZERO };
+    let dir = std::env::temp_dir().join(format!("arbsim-cap-anvil-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("cap.bin").to_string_lossy().to_string();
+    let mut ah = Ahead::new(AheadCfg { max_blocks: 32, msg_budget_us: 1_000_000, compare_delay: 2, ..AheadCfg::default() });
+    ah.set_pools(Arc::new(PoolSet::build(&w.list, HashSet::new())));
+    let mut cap = Capture::start(&path, 256 << 20).unwrap();
+    assert!(cap.send(CapEv::Header { cfg: ah.cfg().clone(), l2_offset: 0, live: ah.total.json_with(false).to_string() }));
+    assert!(cap.send(CapEv::Pools { list: w.list.clone(), not_ready: vec![] }));
+    assert!(cap.send(CapEv::Routes(None)));
+    assert!(cap.send(CapEv::Touchers(vec![])));
+    assert!(cap.send(CapEv::Prov(Arc::new(ProvSets::all_exact()))));
+    let mut published: Vec<(u64, Arc<Snapshot>)> = Vec::new();
+    let mut publish = |ah: &mut Ahead, cap: &mut Capture, seq: u64, snap: Arc<Snapshot>, ts: u64| {
+        published.retain(|x| x.0 != seq);
+        published.push((seq, snap.clone()));
+        let asked = std::cell::RefCell::new(Vec::new());
+        ah.on_confirmed(Confirmed { seq, snap: snap.clone(), ctx: Some(ctx_of(seq, ts)), diff: Arc::new(StateDiff::default()), prov: Arc::new(AllExact) }, &|h| {
+            let r = moves.get(h).cloned();
+            asked.borrow_mut().push((*h, r.clone()));
+            r
+        });
+        assert!(cap.send(CapEv::Moves(asked.into_inner())));
+        assert!(cap.send(CapEv::Confirmed { seq, ctx: Some(ctx_of(seq, ts)), snap }));
+        let head = published.iter().map(|x| x.0).max().unwrap();
+        for s in ah.due(head) {
+            let (pools, keys, base) = ah.pending_parts(s).unwrap();
+            let get = |n: u64| published.iter().find(|x| x.0 == n).map(|x| x.1.clone());
+            let (Some(prev), Some(now)) = (get(s - 1), get(s)) else {
+                ah.drop_pending(s);
+                continue;
+            };
+            let st = Settled::build(&pools, s, &prev, &now, keys.iter(), Some(&base));
+            let asked = std::cell::RefCell::new(Vec::new());
+            ah.compare_settled(&st, &|h| {
+                let r = moves.get(h).cloned();
+                asked.borrow_mut().push((*h, r.clone()));
+                r
+            });
+            assert!(cap.send(CapEv::Moves(asked.into_inner())));
+            assert!(cap.send(CapEv::Settled(st)));
+        }
+    };
+    publish(&mut ah, &mut cap, w.base_block, Arc::new(w.snap.clone()), w.t_base - 1);
+    let mut rewrites = 0;
+    for (i, (ts, txs)) in w.msgs.iter().enumerate() {
+        let seq = w.base_block + 1 + i as u64;
+        let wm = WireFeedMsg { seq, ts: *ts, l1: 500, txs: txs.iter().map(|t| hb(t)).collect(), complete: true, why: None };
+        let bm = Arc::new(BinMsg::from_wire(&wm, true));
+        ah.on_feed_message(bm.clone());
+        assert!(cap.send(CapEv::Feed(bm)));
+        // Copy 2 confirms the PREVIOUS block now (one behind, like live);
+        // every 3rd one first WITHOUT its reports, then corrected.
+        if i >= 1 {
+            let (cs, csnap, cts) = &versions[i - 1];
+            if i % 3 == 0 {
+                let before = if i >= 2 { versions[i - 2].1.clone() } else { w.snap.clone() };
+                publish(&mut ah, &mut cap, *cs, Arc::new(before), *cts);
+                rewrites += 1;
+            }
+            publish(&mut ah, &mut cap, *cs, Arc::new(csnap.clone()), *cts);
+        }
+    }
+    // The rest confirmed (a few extra empty blocks so every block is compared).
+    let (ls, lsnap, lts) = versions.last().unwrap().clone();
+    publish(&mut ah, &mut cap, ls, Arc::new(lsnap.clone()), lts);
+    for k in 1..=3u64 {
+        publish(&mut ah, &mut cap, ls + k, Arc::new(lsnap.clone()), lts + k);
+    }
+    let live = ah.total.clone();
+    let sum = cap.finish(ah.total.json_with(false).to_string(), "done");
+    assert!(sum.complete, "{sum:?}");
+    eprintln!("[capture test] {} records, {} KB, {} blocks", sum.records, sum.bytes / 1024, sum.blocks);
+    assert_eq!(live.rebase_rewrites, rewrites, "rebased on every corrected version");
+    assert!(live.agree >= 8, "real swaps predicted and compared: agree {}", live.agree);
+    assert_eq!(live.disagree, 0, "every pool we were sure of agrees with the chain (settled): {}", live.json());
+    let capf = read_capture(&path).unwrap();
+    let t = std::time::Instant::now();
+    let r = replay(&capf, &ReplayOpts::default()).unwrap();
+    eprintln!("{}", print_report(&r, 2));
+    assert!(t.elapsed().as_secs() < 30, "quick");
+    let g = &r["agreement"];
+    assert_eq!((g["agree"].as_u64(), g["disagree"].as_u64(), g["unsure"].as_u64(), g["compared"].as_u64()), (Some(live.agree), Some(live.disagree), Some(live.unsure), Some(live.compared)), "replay == live");
+    assert_eq!(r["prediction"]["txsRun"].as_u64(), Some(live.txs_run));
+    assert_eq!(r["prediction"]["txsFailed"].as_u64(), Some(live.txs_failed));
+    assert_eq!(r["agreement"]["pct"].as_f64(), Some(100.0));
+    let _ = std::fs::remove_dir_all(&dir);
 }
