@@ -189,6 +189,14 @@ pub struct CheckUnknown {
     /// tell "the trigger itself" from "a transaction replayed only because
     /// copy 2 is behind the feed".
     pub at: Option<TxAt>,
+    /// (Oct 27, trig-replay --fetch) sender_funds_revert: the values we only
+    /// ASSUMED for the reverting transaction's sender (its coin balances /
+    /// allowances / flags given a made-up amount = Slot, a sender our copy
+    /// didn't know = Account). Fetching these real values and asking again
+    /// shows whether our guess caused the revert. Empty otherwise. Never
+    /// sent in answers and never filled live (the answer's "missing" is
+    /// unchanged).
+    pub assumed: Vec<MissItem>,
 }
 
 /// Trigger-first: one replayed feed transaction, as named in an "unknown"
@@ -221,7 +229,7 @@ impl TxAt {
 
 impl CheckUnknown {
     pub fn new(reason: UnknownReason, detail: impl Into<String>) -> Self {
-        CheckUnknown { reason, missing: Vec::new(), detail: detail.into(), pre: Vec::new(), keys: Vec::new(), at: None }
+        CheckUnknown { reason, missing: Vec::new(), detail: detail.into(), pre: Vec::new(), keys: Vec::new(), at: None, assumed: Vec::new() }
     }
     pub fn bad_request(detail: impl Into<String>) -> Self {
         Self::new(UnknownReason::BadRequest, detail)

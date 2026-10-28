@@ -30,6 +30,7 @@ pub mod practice;
 pub mod safety;
 pub mod scan;
 pub mod coverage;
+pub mod replay_fetch;
 pub mod trig_replay;
 pub mod trigger;
 pub mod types;

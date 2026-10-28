@@ -1545,7 +1545,7 @@ fn one_round(
                 return judge_miss(&evm, view, plan, t, (m.seq, j), assume, new_misses);
             }
             let Some(outcome) = outcome else {
-                return Err(CheckUnknown { reason: UnknownReason::Miss, missing: evm.ctx.journaled_state.database.missing.clone(), detail: "too many missing items".into(), pre: Vec::new(), keys: Vec::new(), at: None });
+                return Err(CheckUnknown { reason: UnknownReason::Miss, missing: evm.ctx.journaled_state.database.missing.clone(), detail: "too many missing items".into(), pre: Vec::new(), keys: Vec::new(), at: None, assumed: Vec::new() });
             };
             if let Some(u) = watch_problem(&mut evm) {
                 // PROVEN SKIPPING: an earlier transaction's doubt is judged.
@@ -1563,13 +1563,18 @@ fn one_round(
             if !outcome.success && evm.inspector.tx_sender_read {
                 let fe = funds_error(&outcome.output);
                 if fe.is_some() || assume.proven_skip {
-                    let u = CheckUnknown::new(
+                    let mut u = CheckUnknown::new(
                         UnknownReason::SenderFunds,
                         match fe {
                             Some(e) => format!("a replayed transaction ({:#x}) reverted with \"{e}\" after reading its sender's coin balance / allowance, which we only assumed", t.hash),
                             None => format!("a replayed transaction ({:#x}) reverted ({}) after reading a value of its sender we only assumed", t.hash, revert_text(&outcome)),
                         },
                     );
+                    // What we made up (trig-replay --fetch replaces these
+                    // with the real values and asks again).
+                    u.assumed = evm.inspector.patched.iter().map(|(a, sl)| MissItem::Slot(*a, *sl)).collect();
+                    u.assumed.extend(evm.inspector.pretended.iter().map(|a| MissItem::Account(*a)));
+                    u.assumed.sort_by_key(|m| format!("{m:?}"));
                     if assume.proven_skip && !is_trigger {
                         return judge_proven(&evm, view, plan, t, (m.seq, j), u);
                     }
@@ -1656,7 +1661,7 @@ fn one_round(
     }
     let m = &evm.ctx.journaled_state.database.missing;
     if !m.is_empty() {
-        return Err(CheckUnknown { reason: UnknownReason::Miss, missing: m.clone(), detail: format!("{} item(s) not in our copy", m.len()), pre: Vec::new(), keys: Vec::new(), at: None });
+        return Err(CheckUnknown { reason: UnknownReason::Miss, missing: m.clone(), detail: format!("{} item(s) not in our copy", m.len()), pre: Vec::new(), keys: Vec::new(), at: None, assumed: Vec::new() });
     }
     if strict_call {
         let bad = stale_slots(prov, &evm.ctx.journaled_state.database.reads.view_slots, &HashSet::new());
@@ -1736,7 +1741,7 @@ fn judge_miss(evm: &WatchedEvm<'_>, view: &dyn StateRead, plan: &OrderedPlan, t:
             .collect();
         return Ok(Next::Patch(p));
     }
-    let unknown = CheckUnknown { reason: UnknownReason::Miss, missing: all_missing(), detail: format!("{} item(s) not in our copy", evm.ctx.journaled_state.database.missing.len()), pre: Vec::new(), keys: Vec::new(), at: None };
+    let unknown = CheckUnknown { reason: UnknownReason::Miss, missing: all_missing(), detail: format!("{} item(s) not in our copy", evm.ctx.journaled_state.database.missing.len()), pre: Vec::new(), keys: Vec::new(), at: None, assumed: Vec::new() };
     judge_cant_run(evm, view, plan, t, at, assume, unknown)
 }
 
@@ -1809,7 +1814,7 @@ pub fn writes_only_itself(code: &[u8]) -> bool {
 /// 0x1000 is treated the same, with room): never "only itself" (a built-in
 /// has no code but changes chain state, e.g. ArbSys sending to the parent
 /// chain).
-fn system_address(a: Address) -> bool {
+pub(crate) fn system_address(a: Address) -> bool {
     let b = a.as_slice();
     b[..18].iter().all(|x| *x == 0) && u16::from_be_bytes([b[18], b[19]]) < 0x1000
 }

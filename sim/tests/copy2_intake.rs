@@ -3767,3 +3767,192 @@ fn fastlane_trig_replay_diagnoses_coverage() {
     assert_eq!(g["withNoLag"]["compared"], json!(1), "{}", g["withNoLag"]);
     assert_eq!(g["withNoLag"]["outcome"]["same answer"], json!(1), "{}", g["withNoLag"]);
 }
+
+// `arbsim trig-replay --fetch` (fastlane/replay_fetch.rs): values the
+// recording didn't hold are fetched (a fake node here) at the block of the
+// copy version the question was asked on, and discovery asks again.
+// Copy 2 at 101; feed 102 (lag 1) holds three transactions, none of whose
+// target contracts copy 2 holds:
+//   S  a self-only contract (only writes its own storage),
+//   R  a router that forwards its data to our pool V2P (the chain says it
+//      moved V2P),
+//   W  a bot-style contract that reverts unless whitelist[sender] (a bool:
+//      only the lowest byte counts) is set; our made-up "sender funds"
+//      value reads as "no", the real one (1) says yes.
+// Asserted: without fetching all three are unknown; with it R is "known:
+// same pools", W "moved none (trigger ran)" with the real sender value, S
+// "moved none"; nothing wrong; the free node answered everything (the paid
+// node is never asked). With a cap of 3 calls only S's account is fetched:
+// S stays unknown but its code is now known to be self-only, so the
+// "doesn't touch us" rule would answer it (chain: moved none), and the
+// other two are "not tried: cap reached".
+#[test]
+fn fastlane_trig_replay_fetch_asks_again_with_fetched_values() {
+    use arbsim::copy2::ahead::AheadCfg;
+    use arbsim::copy2::ahead_capture::{CapEv, CapFile, ProvSets};
+    use arbsim::fastlane::replay_fetch::{FetchOpts, ReplayFetcher};
+    use arbsim::fastlane::trig_replay::{print_report, trig_replay, trig_replay_with, TrigReplayOpts};
+    use arbsim::fastlane::trigger::TrigCfg;
+    let (r, _ctx) = trig_world_code(fl_pool_code());
+    let v = r.sh.head().unwrap();
+    let base_block = v.seq;
+    let s_addr = check_util::addr(0x5e1f);
+    let r_addr = check_util::addr(0x4077);
+    let w_addr = check_util::addr(0x3b17);
+    let s_code = check_util::hex("6001 6000 55 00");
+    let mut r_code = check_util::hex("36 6000 6000 37 6000 6000 36 6000 6000 73");
+    r_code.extend_from_slice(a(V2P).as_slice());
+    r_code.extend(check_util::hex("5a f1 50 00"));
+    let w_code = check_util::hex("33 6000 52 6000 6020 52 6040 6000 20 54 60ff 16 6019 57 6000 80 fd 5b 6001 6005 55 00");
+    let sender_b = check_util::key_address(&TEST_KEY_B);
+    let mut wl = [0u8; 64];
+    wl[12..32].copy_from_slice(sender_b.as_slice());
+    let wl_slot = U256::from_be_bytes(keccak256(wl).0);
+    // The fake node: the three contracts' code, whitelist[sender] = 1,
+    // everything else empty / zero. Counts calls; remembers the blocks asked.
+    struct Fake {
+        codes: HashMap<Address, Vec<u8>>,
+        slots: HashMap<(Address, U256), U256>,
+        calls: Mutex<(u64, Vec<String>)>,
+    }
+    impl NodeApi for Fake {
+        fn call_batch(&self, _c: Class, calls: &[(&str, Value)]) -> Result<Vec<CallResult>, NodeErr> {
+            let mut g = self.calls.lock().unwrap();
+            g.0 += calls.len() as u64;
+            Ok(calls
+                .iter()
+                .map(|(m, p)| {
+                    let addr = parse_address(p[0].as_str().unwrap()).unwrap();
+                    let tag = p.as_array().unwrap().last().unwrap().as_str().unwrap().to_string();
+                    if !g.1.contains(&tag) {
+                        g.1.push(tag);
+                    }
+                    Ok(match *m {
+                        "eth_getStorageAt" => {
+                            let s = parse_u256(p[1].as_str().unwrap()).unwrap();
+                            json!(format!("{:#x}", self.slots.get(&(addr, s)).copied().unwrap_or_default()))
+                        }
+                        "eth_getBalance" => json!("0x0"),
+                        "eth_getTransactionCount" => json!(if self.codes.contains_key(&addr) { "0x1" } else { "0x0" }),
+                        "eth_getCode" => json!(arbsim::check::hexutil::to_hex(self.codes.get(&addr).map(|c| c.as_slice()).unwrap_or(&[]))),
+                        _ => return Err(RpcErr { code: -32601, message: "method not found".into() }),
+                    })
+                })
+                .collect())
+        }
+    }
+    let fake = || Fake {
+        codes: [(s_addr, s_code.clone()), (r_addr, r_code.clone()), (w_addr, w_code.clone())].into_iter().collect(),
+        slots: [((w_addr, wl_slot), U256::from(1u8))].into_iter().collect(),
+        calls: Mutex::new((0, Vec::new())),
+    };
+    let fp = arbsim::check::moved::FollowedPool { key: format!("{:#x}", a(V2P)), address: a(V2P), v4_id: None };
+    let tx_s = signed_b(5, s_addr, vec![0xde, 0xad, 0xbe, 0xef]);
+    let tx_r = signed(0, r_addr, u(2_000_000).to_be_bytes::<32>().to_vec());
+    let tx_w = signed_b(6, w_addr, vec![0x12, 0x34, 0x56, 0x78]);
+    let wm = |seq: u64, txs: &[&Vec<u8>]| arbsim::check::ordered::WireFeedMsg { seq, ts: 60 + seq, l1: 9000, txs: txs.iter().map(|t| hexb(t)).collect(), complete: true, why: None };
+    let events = vec![
+        CapEv::Header { cfg: AheadCfg::default(), l2_offset: 0, live: "{}".into() },
+        CapEv::Pools { list: vec![(fp, a(COIN0), a(COIN1))], not_ready: vec![] },
+        CapEv::Prov(Arc::new(ProvSets::from_copy2(&r.h.provenance_at(base_block, &[])))),
+        CapEv::Confirmed { seq: v.seq, ctx: v.ctx.clone(), snap: v.snap.clone() },
+        CapEv::Feed(Arc::new(arbsim::check::feedstore::BinMsg::from_wire(&wm(base_block + 1, &[&tx_s, &tx_r, &tx_w]), true))),
+        CapEv::Moves(vec![(keccak256(&tx_r), Some(vec![format!("{:#x}", a(V2P))])), (keccak256(&tx_s), None), (keccak256(&tx_w), None)]),
+        CapEv::End { live: "{}".into(), why: "done".into() },
+    ];
+    let cap = CapFile { events, complete: true, cut: None };
+    let cfg = TrigCfg::default();
+    let opts = TrigReplayOpts { no_full: true, ..Default::default() };
+    // Without fetching: all three unknown.
+    let rep = trig_replay(&cap, None, &cfg, &opts).unwrap();
+    assert_eq!(rep["coverage"]["asked"], json!(3), "{}", rep["coverage"]);
+    assert_eq!(rep["coverage"]["discovery"]["unknown"]["miss"], json!(3), "{}", rep["coverage"]);
+    assert!(rep["fetch"].is_null());
+    // With fetching (free node only; the paid node would be a second fake).
+    let paid = Box::new(fake());
+    let mut f = ReplayFetcher::new(Some(Box::new(fake())), Some(paid), FetchOpts::default());
+    let rep = trig_replay_with(&cap, None, &cfg, &opts, Some(&mut f)).unwrap();
+    println!("{}", print_report(&rep));
+    let x = &rep["fetch"];
+    assert_eq!(x["tried"], json!(3), "{x}");
+    assert_eq!(x["chainSaysMovedOurPools"]["known: same pools"], json!(1), "{x}");
+    assert_eq!(x["chainSaysMovedNone"]["we say moved none"], json!(2), "{x}");
+    assert!(x["wrongSamples"].as_array().unwrap().is_empty(), "{x}");
+    assert_eq!(x["senderFundsRevertsWithRealValues"]["moved none (trigger ran)"], json!(1), "the real whitelist value lets W run: {x}");
+    assert_eq!(x["beforeToAfter"]["unknown miss -> moved none (trigger ran)"], json!(2), "{x}");
+    assert_eq!((x["requests"]["callsPaidNode"].clone(), x["stillUnknown"]["n"].clone()), (json!(0), json!(0)), "{x}");
+    assert!(x["requests"]["callsFreeNode"].as_u64().unwrap() >= 9, "{x}");
+    // Every value was asked at the copy version's block, never "latest".
+    let asked = f.json();
+    assert_eq!(asked["valuesFailed"], json!(0), "{asked}");
+    // A cap of 3 calls: only S's account (the first question).
+    let mut g = ReplayFetcher::new(Some(Box::new(fake())), None, FetchOpts { max_calls: 3, max_paid: 0, ..Default::default() });
+    let rep = trig_replay_with(&cap, None, &cfg, &opts, Some(&mut g)).unwrap();
+    let x = &rep["fetch"];
+    assert_eq!((x["tried"].clone(), x["notTriedCapReached"].clone()), (json!(1), json!(2)), "{x}");
+    let so = &x["stillUnknownSelfOnly"];
+    assert_eq!((so["ruleWouldAnswerMovedNone"].clone(), so["ofWhichChainSaysMoved"].clone()), (json!(1), json!(0)), "{so}");
+    assert_eq!(rep["diagnosis"]["selfOnlyTargets"]["unknownTriggersByTargetCode"]["code not held"], json!(3), "{}", rep["diagnosis"]["selfOnlyTargets"]);
+}
+
+// DISCOVERY'S SELF-ONLY PROOF (ARBSIM_DISCOVER_SELF_ONLY=1, server.rs):
+// a feed transaction to a contract whose code only writes its own storage
+// provably moves none of our pools, whatever values we lack. Copy 2 holds
+// the contract's code (fetched after the first miss) but not its storage:
+// the question is "unknown: miss" with the proof off, "moved none"
+// (conf high, "proven_no_touch") with it on. A contract that calls out
+// (a router) stays unknown either way. The fill budget learns targets.
+#[test]
+fn trig_discover_self_only_target_proof() {
+    let _turn = FEED_STORE_TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let (mut r, ctx) = trig_world_code(fl_pool_code());
+    let s_addr = check_util::addr(0x5e1f);
+    let r_addr = check_util::addr(0x4077);
+    r.chain.codes.lock().unwrap().insert(s_addr, check_util::hex("6001 6000 55 00"));
+    let mut rc = check_util::hex("36 6000 6000 37 6000 6000 36 6000 6000 73");
+    rc.extend_from_slice(a(V2P).as_slice());
+    rc.extend(check_util::hex("5a f1 50 00"));
+    r.chain.codes.lock().unwrap().insert(r_addr, rc);
+    let disc = |trig: &[u8], seq: u64| {
+        arbsim::server::handle(&ctx, &json!({"id": 12, "type": "trig_discover", "at": {"after": "head"},
+            "feed": {"trigger": hexb(keccak256(trig).as_slice()), "triggerSeq": seq, "msgs": [{"seq": seq, "ts": 63, "l1": 9000, "txs": [hexb(trig)]}]}}))
+    };
+    let h = r.sh.head().unwrap().block;
+    let tx_s = signed_b(0, s_addr, vec![0xde, 0xad, 0xbe, 0xef]);
+    let tx_r = signed_b(1, r_addr, u(5).to_be_bytes::<32>().to_vec());
+    arbsim::server::set_discover_self_only(false);
+    // First: the code itself is missing; DISCOVER LEARNS fetches it.
+    for t in [&tx_s, &tx_r] {
+        let ans = disc(t, h + 1);
+        assert_eq!(ans["unknown"], json!("miss"), "{ans}");
+    }
+    r.settle();
+    // With the proof on, ask until answered: once the code is held the
+    // proof answers (storage is never missed, so never fetched: the first
+    // answer is the proof's, with no race against a fill).
+    arbsim::server::set_discover_self_only(true);
+    let mut ans = Value::Null;
+    for _ in 0..20 {
+        ans = disc(&tx_s, h + 1);
+        if ans["ok"] == json!(true) {
+            break;
+        }
+        assert_eq!(ans["unknown"], json!("miss"), "{ans}");
+        r.settle();
+    }
+    assert_eq!((ans["ok"].clone(), ans["pools"].clone(), ans["conf"].clone()), (json!(true), json!([]), json!("high")), "{ans}");
+    assert_eq!(ans["assumed"], json!(["proven_no_touch"]), "{ans}");
+    // With it off, the same question is a storage miss.
+    arbsim::server::set_discover_self_only(false);
+    let ans = disc(&tx_s, h + 1);
+    assert_eq!(ans["unknown"], json!("miss"), "{ans}");
+    assert!(ans["missing"].to_string().contains(&format!("{s_addr:#x}")), "{ans}");
+    // The router: never proven, whatever the setting.
+    arbsim::server::set_discover_self_only(true);
+    let ans = disc(&tx_r, h + 1);
+    assert!(ans["assumed"] != json!(["proven_no_touch"]), "a contract that calls out is never proven: {ans}");
+    arbsim::server::set_discover_self_only(false);
+    let st = arbsim::server::handle(&ctx, &json!({"id": 14, "type": "status"}));
+    let d = &st["discoverFill"];
+    assert!(d["targets"].as_u64().unwrap() >= 2, "{d}");
+}

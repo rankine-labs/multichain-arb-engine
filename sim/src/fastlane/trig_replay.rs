@@ -64,9 +64,27 @@
 //   are not available (a check that needs them answers unknown), the bot's
 //   best-effort skipping (FASTLANE_TRIG_SKIP=bot) needs copy 2's route
 //   facts and is not applied (proven skipping, the default, needs none),
-//   no fills are fetched (a miss stays a miss: live fetches some, see WHAT
-//   TO WARM), and the safety gates are not applied (a "would reach the gun"
+//   no fills are fetched without --fetch (a miss stays a miss: live
+//   fetches some, see WHAT TO WARM), and the safety gates are not applied (a "would reach the gun"
 //   count). Nothing is signed or sent. Times are this machine's.
+//
+//   --fetch (Oct 27, round 2; fastlane/replay_fetch.rs): discovery
+//   answers "unknown: miss" / "sender_funds_revert" are asked AGAIN after
+//   fetching the missing (or only assumed) values from a node, at the block
+//   of the copy version the question was asked on (exact there), free
+//   public node first, the paid node only for what it can't give, hard
+//   caps on calls. The FETCH section reports every asked trigger's answer
+//   after the fetch, what we say about the triggers the chain says moved
+//   our pools (known / WRONG / still unknown), the sender-funds reverts with
+//   real values, the requests used, and what is still unknown. Every other
+//   section stays the recording alone. SELF-ONLY TARGETS (always): unknown
+//   triggers whose target contract's code can't reach any other contract
+//   (provably "moves none of our pools").
+//     --fetch-max N [3000]  calls in total; --fetch-paid on|off [on];
+//     --fetch-paid-max N [= --fetch-max]; --fetch-scope all|moved [all]
+//     (moved = only triggers the chain says moved our pools: the prize
+//     first); --fetch-rounds N [6]; --fetch-url-env NAME (the setting that
+//     holds the free node's URL, e.g. ROBINHOOD_RPC_HTTP; ./.env is read).
 //
 //   `--json` prints the whole result; `--ours <addr,addr>` lists our
 //   contract / wallet (skipped like live); `--table <file>` a table message
@@ -82,6 +100,7 @@ use revm::primitives::{Address, B256};
 use serde_json::{json, Value};
 
 use super::coverage::{miss_role, origin, Tally};
+use super::replay_fetch::{proven_untouching, target_code, Overlay, OverlayProv, ReplayFetcher, TargetCode};
 use super::scan::{evaluate, CheckRunner, PreparedCheck};
 use super::trigger::{opportunity, quick_skip, TrigCfg};
 use super::types::Opportunity;
@@ -90,7 +109,7 @@ use crate::check::entry::{call_for, good_enough, select, Table};
 use crate::check::feedstore::BinMsg;
 use crate::check::moved::{FollowedPool, MovedIndex};
 use crate::check::ordered::{build_plan_with, revert_text, run_ordered_with, trigger_only, Assume, OrderedOut, OrderedPlan, Provenance, WireFeed};
-use crate::check::{CheckUnknown, TxAt};
+use crate::check::{CheckUnknown, TxAt, UnknownReason};
 use crate::copy2::ahead_capture::{CapEv, CapFile, ProvSets};
 use crate::server::CheckedRow;
 use crate::state::snap::{Snapshot, View};
@@ -247,9 +266,89 @@ struct NoLag {
     before: String,
 }
 
+/// One discovery answer, as (kind, pools) for the --fetch comparison.
+fn fx_class(r: &Result<(OrderedOut, Vec<String>), CheckUnknown>) -> (String, Vec<String>) {
+    match r {
+        Ok((_, p)) if !p.is_empty() => ("moved our pools".into(), p.clone()),
+        Ok((o, _)) if o.replayed.first().is_some_and(|x| !x.outcome.success) => ("moved none (trigger reverted)".into(), Vec::new()),
+        Ok(_) => ("moved none (trigger ran)".into(), Vec::new()),
+        Err(u) => (format!("unknown {}", u.reason.as_str()), Vec::new()),
+    }
+}
+
+/// SELF-ONLY TARGETS (replay_fetch.rs): unknown triggers whose target's
+/// code can't reach another contract.
+#[derive(Default)]
+struct SelfOnly {
+    /// Unknown triggers by their target's code kind.
+    kinds: Tally,
+    /// ...of which the rule "self-only target, not ours" would answer
+    /// "moved none", and how many of those the chain says moved our pools
+    /// (must be 0: the rule is a proof).
+    rule: u64,
+    rule_chain_moved: u64,
+    /// target -> (kind, unknown triggers, chain moved).
+    targets: HashMap<String, (TargetCode, u64, u64)>,
+}
+
+impl SelfOnly {
+    fn add(&mut self, view: &View, dec: &crate::check::rawtx::DecodedTx, moved: bool, is_ours: &dyn Fn(Address) -> bool) {
+        let kind = match dec.to {
+            Some(t) => target_code(view, t),
+            None => return,
+        };
+        self.kinds.add(kind.as_str());
+        if proven_untouching(view, dec, is_ours) {
+            self.rule += 1;
+            self.rule_chain_moved += moved as u64;
+        }
+        let e = self.targets.entry(format!("{:#x}", dec.to.unwrap_or_default())).or_insert((kind, 0, 0));
+        e.0 = kind;
+        e.1 += 1;
+        e.2 += moved as u64;
+    }
+
+    fn json(&self) -> Value {
+        let mut rows: Vec<(&String, &(TargetCode, u64, u64))> = self.targets.iter().collect();
+        rows.sort_by(|a, b| b.1 .1.cmp(&a.1 .1).then(a.0.cmp(b.0)));
+        json!({"unknownTriggersByTargetCode": self.kinds.json(8), "ruleWouldAnswerMovedNone": self.rule, "ofWhichChainSaysMoved": self.rule_chain_moved,
+            "topTargets": rows.iter().take(20).map(|(t, (k, n, m))| json!({"target": t, "code": k.as_str(), "n": n, "chainMovedOurPools": m})).collect::<Vec<_>>(),
+            "note": "rule = the trigger's target contract has no opcode that can reach another contract and isn't one of our pools / their coins: it provably can't move our pools (any storage). ofWhichChainSaysMoved must be 0"})
+    }
+}
+
+/// --fetch results (see replay_fetch.rs).
+#[derive(Default)]
+struct FetchReport {
+    /// Unknown discovery answers (miss / sender funds) the fetch was tried on.
+    tried: u64,
+    skipped_scope: u64,
+    skipped_cap: u64,
+    rounds: Vec<u64>,
+    /// Every asked trigger's final answer (fetched where tried).
+    after: Tally,
+    /// Tried: "before -> after".
+    change: Tally,
+    /// Triggers the chain says moved our pools: what we say after the fetch.
+    chain_moved: Tally,
+    /// Triggers the chain says moved none of our pools: what we say.
+    chain_none: Tally,
+    /// Sender-funds reverts: what the real sender values give.
+    sender: Tally,
+    wrong: Vec<Value>,
+    blame: Blame,
+    self_only: SelfOnly,
+}
+
 /// Replay the capture (see the file header). `table`: the bot's table
 /// messages (None = discovery only).
 pub fn trig_replay(cap: &CapFile, table: Option<&Table>, cfg: &TrigCfg, opts: &TrigReplayOpts) -> Result<Value, String> {
+    trig_replay_with(cap, table, cfg, opts, None)
+}
+
+/// trig_replay, with --fetch (`fetcher`: values the recording didn't hold
+/// are fetched at the copy version's block and the question asked again).
+pub fn trig_replay_with(cap: &CapFile, table: Option<&Table>, cfg: &TrigCfg, opts: &TrigReplayOpts, mut fetcher: Option<&mut ReplayFetcher>) -> Result<Value, String> {
     let t_all = Instant::now();
     let Some(CapEv::Header { l2_offset, .. }) = cap.events.first().cloned() else {
         return Err("the capture does not start with its settings".into());
@@ -316,6 +415,10 @@ pub fn trig_replay(cap: &CapFile, table: Option<&Table>, cfg: &TrigCfg, opts: &T
     let mut no_lag_out = Tally::default();
     let mut no_lag_missing = 0u64;
     let mut cand_where = Tally::default();
+    // SELF-ONLY TARGETS on the recording alone (no fetch), and --fetch.
+    let mut self_only_base = SelfOnly::default();
+    let mut fxr = FetchReport::default();
+    let mut overlay: Option<Overlay> = None;
     let sender_funds = cfg.assume.iter().any(|a| a == "sender_funds") && !cfg.strict;
     let recent_fill = cfg.assume.iter().any(|a| a == "recent_fill") && !cfg.strict;
     let skip_allowed = cfg.assume.iter().any(|a| a == "skip") && !cfg.strict;
@@ -445,6 +548,7 @@ pub fn trig_replay(cap: &CapFile, table: Option<&Table>, cfg: &TrigCfg, opts: &T
                     let (plan, info) = match build_plan_with(&feed, Some(&list), cseq, l2_offset, &cctx) {
                         Ok(x) => x,
                         Err(u) => {
+                            fxr.after.add(format!("unknown {}", u.reason.as_str()));
                             bump(&mut disc_unknown, u.reason.as_str().to_string());
                             disc_blame.add(&u, m.seq, &me, &truth, &pool_addrs, &coin_addrs);
                             continue;
@@ -456,11 +560,106 @@ pub fn trig_replay(cap: &CapFile, table: Option<&Table>, cfg: &TrigCfg, opts: &T
                     lag_txs.push(plan.msgs.iter().filter(|x| x.seq < m.seq).map(|x| x.txs.len() as u64).sum::<u64>() + plan.unrunnable.iter().filter(|x| x.seq < m.seq).count() as u64);
                     let Some((alone, _others)) = trigger_only(&plan) else {
                         in_copy += 1;
+                        fxr.after.add("already in copy");
                         // Live answers the pools copy 2's reports say it moved (server.rs GAP FIX 1).
                         in_copy_chain.add(chain_says(&truth, &t.hash));
                         continue;
                     };
                     let r = discover(&view, &alone, prov.as_ref(), &index);
+                    let is_ours = |a: Address| pool_addrs.contains(&a) || coin_addrs.contains(&a);
+                    let chain_did = chain_moved(&truth, &t.hash);
+                    if r.is_err() {
+                        self_only_base.add(&view, &dec, chain_did, &is_ours);
+                    }
+                    // --fetch: fetch what was missing (or only assumed) at this
+                    // version's block, ask again (see replay_fetch.rs).
+                    let mut after: Option<Result<(OrderedOut, Vec<String>), CheckUnknown>> = None;
+                    if let Some(f) = fetcher.as_deref_mut() {
+                        if let Err(u) = &r {
+                            if matches!(u.reason, UnknownReason::Miss | UnknownReason::SenderFunds) {
+                                if f.opts.moved_only && !chain_did {
+                                    fxr.skipped_scope += 1;
+                                } else if f.capped() {
+                                    fxr.skipped_cap += 1;
+                                } else {
+                                    fxr.tried += 1;
+                                    if overlay.as_ref().is_none_or(|o| o.seq != cseq) {
+                                        overlay = Some(Overlay::new(cseq, csnap.clone()));
+                                    }
+                                    let o = overlay.as_mut().expect("just set");
+                                    let block = cseq + l2_offset;
+                                    let ask = |o: &Overlay| discover(&View::new(o.snap.clone()), &alone, &OverlayProv { inner: prov.as_ref(), o }, &index);
+                                    let mut cur = ask(o);
+                                    let mut rounds = 0u64;
+                                    // Did any round revert after reading a made-up sender value?
+                                    let mut saw_sender = u.reason == UnknownReason::SenderFunds;
+                                    while (rounds as usize) < f.opts.rounds {
+                                        saw_sender |= matches!(&cur, Err(x) if x.reason == UnknownReason::SenderFunds);
+                                        let items = match &cur {
+                                            Err(u) if u.reason == UnknownReason::Miss => u.missing.clone(),
+                                            Err(u) if u.reason == UnknownReason::SenderFunds => u.assumed.clone(),
+                                            _ => break,
+                                        };
+                                        if items.is_empty() {
+                                            break;
+                                        }
+                                        let got = f.fetch(block, &items, &o.snap);
+                                        if got.is_empty() {
+                                            break;
+                                        }
+                                        o.add(&got);
+                                        cur = ask(o);
+                                        rounds += 1;
+                                    }
+                                    fxr.rounds.push(rounds);
+                                    let (b, _) = fx_class(&r);
+                                    let (a, _) = fx_class(&cur);
+                                    fxr.change.add(format!("{b} -> {a}"));
+                                    saw_sender |= matches!(&cur, Err(x) if x.reason == UnknownReason::SenderFunds);
+                                    if saw_sender {
+                                        fxr.sender.add(a);
+                                    }
+                                    after = Some(cur);
+                                }
+                            }
+                        }
+                        let fin = after.as_ref().unwrap_or(&r);
+                        let (kind, pools) = fx_class(fin);
+                        fxr.after.add(kind.clone());
+                        let chain_pools: Vec<String> = truth.get(&t.hash).cloned().flatten().unwrap_or_default().iter().map(|p| p.to_ascii_lowercase()).collect();
+                        let verdict = if kind.starts_with("unknown") {
+                            format!("still {kind}")
+                        } else if !pools.is_empty() {
+                            if chain_pools.is_empty() {
+                                "we say moved".to_string()
+                            } else if pools.iter().all(|p| chain_pools.contains(p)) && chain_pools.iter().all(|p| pools.contains(p)) {
+                                "known: same pools".to_string()
+                            } else {
+                                "known: other pools".to_string()
+                            }
+                        } else {
+                            "we say moved none".to_string()
+                        };
+                        if chain_did {
+                            let v = if verdict == "we say moved none" { "WRONG: we say moved none".to_string() } else { verdict.clone() };
+                            fxr.chain_moved.add(v.clone());
+                            if v.starts_with("WRONG") && fxr.wrong.len() < 20 {
+                                fxr.wrong.push(json!({"trigger": format!("{:#x}", t.hash), "to": dec.to.map(|a| format!("{a:#x}")), "we": kind, "chainPools": chain_pools, "fetched": after.is_some()}));
+                            }
+                        } else if truth.contains_key(&t.hash) {
+                            fxr.chain_none.add(verdict.clone());
+                            if verdict == "we say moved" && fxr.wrong.len() < 20 {
+                                fxr.wrong.push(json!({"trigger": format!("{:#x}", t.hash), "to": dec.to.map(|a| format!("{a:#x}")), "we": format!("moved {}", pools.join(",")), "chain": "moved none of our pools", "fetched": after.is_some()}));
+                            }
+                        } else {
+                            fxr.chain_none.add(format!("(chain not recorded) {verdict}"));
+                        }
+                        if let Err(u) = fin {
+                            fxr.blame.add(u, m.seq, &me, &truth, &pool_addrs, &coin_addrs);
+                            let v = overlay.as_ref().filter(|o| o.seq == cseq).map(|o| View::new(o.snap.clone()));
+                            fxr.self_only.add(v.as_ref().unwrap_or(&view), &dec, chain_did, &is_ours);
+                        }
+                    }
                     // WITH NO LAG: asked again on the version right before its block.
                     if m.seq > cseq + 1 {
                         no_lag.entry(m.seq - 1).or_default().push(NoLag { msg: m.clone(), hash: t.hash, before: outcome_key(&r) });
@@ -610,13 +809,31 @@ pub fn trig_replay(cap: &CapFile, table: Option<&Table>, cfg: &TrigCfg, opts: &T
                 "note": "every trigger whose own run worked: the replay a candidate check needs (copy 2's version -> trigger -> rest of its block), no calls"},
             "withNoLag": {"compared": no_lag_out.total(), "noExactVersionInCapture": no_lag_missing, "outcome": no_lag_out.json(10), "note": "hindsight: the same trigger on the version right before its block"},
             "candidateUnknownWhere": cand_where.json(20),
+            "selfOnlyTargets": self_only_base.json(),
             "whatToWarm": {"recurringFirstMissingItems": recurring.len(), "unknownsTheyBlocked": blocked_by_recurring, "seenOnce": once, "estimatedNodeRequestsOnce": warm_cost, "top": recurring.iter().take(30).map(|(k, c)| json!([k, c])).collect::<Vec<_>>(), "note": "first missing items of discovery + full-replay unknowns seen 2+ times; one fetch each (accounts + whole-account items); a slot whose value keeps changing needs re-reads"},
         },
         "candidates": {"noCandidates": no_cands, "routesChecked": routes_checked, "sure": sure, "unknown": answer_unknown, "good": good, "notTrade": not_trade, "wouldReachGun": would_fire,
             "recheckAtBlockEnd": {"stillProfitable": real, "gone": gone, "unknown": recheck_unknown, "neverConfirmedInCapture": waiting.len()}},
+        "fetch": match fetcher.as_deref() {
+            None => Value::Null,
+            Some(f) => json!({
+                "requests": f.json(),
+                "tried": fxr.tried, "notTriedOutOfScope": fxr.skipped_scope, "notTriedCapReached": fxr.skipped_cap, "roundsPerTried": pct(&mut fxr.rounds.clone()),
+                "everyAskedTriggerAfter": fxr.after.json(12),
+                "beforeToAfter": fxr.change.json(16),
+                "chainSaysMovedOurPools": fxr.chain_moved.json(12),
+                "chainSaysMovedNone": fxr.chain_none.json(12),
+                "senderFundsRevertsWithRealValues": fxr.sender.json(8),
+                "senderFundsNote": "questions that answered sender_funds_revert (before, or in a fetch round once the contract's code was there): the answer once the made-up sender values were replaced by the real ones",
+                "wrongSamples": fxr.wrong,
+                "stillUnknown": fxr.blame.json(20),
+                "stillUnknownSelfOnly": fxr.self_only.json(),
+                "note": "values fetched at the block of the copy version each question was asked on (exact there), free node first; 'known' = same pools as the chain; WRONG = we say moved none, the chain says it moved our pools",
+            }),
+        },
         "timeUsThisMachine": {"perTrigger": pct(&mut trig_us.clone())},
         "wouldFireSamples": fires,
-        "offlineNote": "no copy-2 double runs / reports-pending rule, no best-effort (bot) skipping, no fills fetched, no safety gates: more cautious than live; nothing signed or sent",
+        "offlineNote": if fetcher.is_some() { "no copy-2 double runs / reports-pending rule, no best-effort (bot) skipping, no safety gates; --fetch: values fetched for DISCOVERY only (the FETCH section; every other section is the recording alone); nothing signed or sent" } else { "no copy-2 double runs / reports-pending rule, no best-effort (bot) skipping, no fills fetched, no safety gates: more cautious than live; nothing signed or sent" },
         "tookMs": t_all.elapsed().as_millis() as u64,
     }))
 }
@@ -677,6 +894,15 @@ fn print_blame(o: &mut String, title: &str, b: &Value) {
     }
 }
 
+/// The SELF-ONLY TARGETS part, printed.
+fn print_self_only(o: &mut String, title: &str, s: &Value) {
+    *o += &format!("  {title}: unknown triggers by target code {}\n", s["unknownTriggersByTargetCode"]);
+    *o += &format!("    rule (self-only target, not ours) would answer moved none: {} (chain says moved: {}, must be 0)\n", s["ruleWouldAnswerMovedNone"], s["ofWhichChainSaysMoved"]);
+    for t in s["topTargets"].as_array().into_iter().flatten().take(12) {
+        *o += &format!("    {} {} n {} chainMoved {}\n", t["target"].as_str().unwrap_or("?"), t["code"].as_str().unwrap_or("?"), t["n"], t["chainMovedOurPools"]);
+    }
+}
+
 /// Plain-English report.
 pub fn print_report(r: &Value) -> String {
     let mut o = String::new();
@@ -706,11 +932,27 @@ pub fn print_report(r: &Value) -> String {
         print_blame(&mut o, "FULL REPLAY, proven skipping", &f["provenSkipping"]["unknown"]);
         o += &format!("  WITH NO LAG (hindsight): {}\n", g["withNoLag"]);
         o += &format!("  CANDIDATE UNKNOWN where|why|target: {}\n", g["candidateUnknownWhere"]);
+        print_self_only(&mut o, "SELF-ONLY TARGETS (recording alone)", &g["selfOnlyTargets"]);
         let w = &g["whatToWarm"];
         o += &format!("  WHAT TO WARM: {} recurring first-missing items blocked {} unknowns ({} seen once); ~{} node requests to fetch once\n", w["recurringFirstMissingItems"], w["unknownsTheyBlocked"], w["seenOnce"], w["estimatedNodeRequestsOnce"]);
         for x in w["top"].as_array().into_iter().flatten().take(30) {
             o += &format!("    {x}\n");
         }
+    }
+    let x = &r["fetch"];
+    if !x.is_null() {
+        o += &format!("FETCH (discovery asked again with values fetched at the copy version's block):\n  requests {}\n", x["requests"]);
+        o += &format!("  tried {} unknown answers (miss / sender funds), not tried: out of scope {}, cap reached {}; rounds per tried {}\n", x["tried"], x["notTriedOutOfScope"], x["notTriedCapReached"], x["roundsPerTried"]);
+        o += &format!("  EVERY ASKED TRIGGER, after: {}\n", x["everyAskedTriggerAfter"]);
+        o += &format!("  before -> after: {}\n", x["beforeToAfter"]);
+        o += &format!("  CHAIN SAYS MOVED OUR POOLS, we say: {}\n", x["chainSaysMovedOurPools"]);
+        o += &format!("  chain says moved none, we say: {}\n", x["chainSaysMovedNone"]);
+        o += &format!("  SENDER-FUNDS REVERTS with the real sender values: {}\n", x["senderFundsRevertsWithRealValues"]);
+        for w in x["wrongSamples"].as_array().into_iter().flatten() {
+            o += &format!("    wrong: {w}\n");
+        }
+        print_blame(&mut o, "STILL UNKNOWN after fetch", &x["stillUnknown"]);
+        print_self_only(&mut o, "STILL UNKNOWN, SELF-ONLY TARGETS", &x["stillUnknownSelfOnly"]);
     }
     let k = &r["candidates"];
     o += &format!("CANDIDATES: no candidates {}, routes checked {}, sure {}, unknown {}, good {}, not a trade {}, WOULD REACH THE GUN {}\n", k["noCandidates"], k["routesChecked"], k["sure"], k["unknown"], k["good"], k["notTrade"], k["wouldReachGun"]);
@@ -729,7 +971,7 @@ pub fn print_report(r: &Value) -> String {
 /// `arbsim trig-replay <capture file> [--table <file>] [--ours a,b] [--json] [--samples N] [--partial] [--no-full]`
 pub fn replay_main(args: &[String]) {
     let Some(path) = args.get(2).filter(|a| !a.starts_with("--")) else {
-        eprintln!("usage: arbsim trig-replay <capture file> [--table <file>] [--ours 0x..,0x..] [--json] [--samples N] [--partial] [--no-full]");
+        eprintln!("usage: arbsim trig-replay <capture file> [--table <file>] [--ours 0x..,0x..] [--json] [--samples N] [--partial] [--no-full] [--fetch [--fetch-max 3000] [--fetch-paid on|off] [--fetch-paid-max N] [--fetch-scope all|moved] [--fetch-rounds 6] [--fetch-url-env NAME]]");
         std::process::exit(2);
     };
     let val = |f: &str| args.iter().position(|a| a == f).and_then(|i| args.get(i + 1)).cloned();
@@ -768,7 +1010,27 @@ pub fn replay_main(args: &[String]) {
     let ours: Vec<Address> = val("--ours").map(|s| s.split(',').filter_map(|x| crate::check::hexutil::parse_address(x.trim()).ok()).collect()).unwrap_or_default();
     let cfg = TrigCfg::from_lookup(&|k| std::env::var(k).ok());
     let opts = TrigReplayOpts { ours, samples: val("--samples").and_then(|s| s.parse().ok()).unwrap_or(10), no_full: args.iter().any(|a| a == "--no-full") };
-    match trig_replay(&cap, table.as_ref(), &cfg, &opts) {
+    // --fetch (replay_fetch.rs): fetch what the recording didn't hold.
+    let mut fetcher = None;
+    if args.iter().any(|a| a == "--fetch") {
+        let num = |f: &str, d: u64| val(f).and_then(|s| s.parse::<u64>().ok()).unwrap_or(d);
+        let max_calls = num("--fetch-max", 3000);
+        let paid_on = val("--fetch-paid").is_none_or(|v| v != "off");
+        let fo = super::replay_fetch::FetchOpts {
+            max_calls,
+            max_paid: if paid_on { num("--fetch-paid-max", max_calls) } else { 0 },
+            rounds: num("--fetch-rounds", 6).clamp(1, 20) as usize,
+            moved_only: val("--fetch-scope").is_some_and(|v| v == "moved"),
+        };
+        match ReplayFetcher::from_env(val("--fetch-url-env").as_deref(), fo) {
+            Ok(f) => fetcher = Some(f),
+            Err(e) => {
+                eprintln!("arbsim trig-replay: {e}");
+                std::process::exit(2);
+            }
+        }
+    }
+    match trig_replay_with(&cap, table.as_ref(), &cfg, &opts, fetcher.as_mut()) {
         Ok(r) => {
             if args.iter().any(|a| a == "--json") {
                 println!("{r}");

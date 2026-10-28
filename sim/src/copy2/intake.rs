@@ -1049,6 +1049,17 @@ impl Copy2Handle {
 
     /// `pools_changed` from a registry summary (speed-3): no lock, the
     /// lookup tables built once per registry change. Same answer.
+    /// Is this address one of ours: a followed pool, a PoolManager, or a
+    /// coin of a followed pool? (Discovery's self-only proof: such a
+    /// contract is never "unrelated".) Reads the registry.
+    pub fn followed_or_coin(&self, core: &super::checkcore::CheckCore, a: Address) -> bool {
+        if core.pm_list.contains(&a) {
+            return true;
+        }
+        let reg = self.c2.reg.read().unwrap_or_else(|e| e.into_inner());
+        reg.by_addr.contains_key(&a) || reg.pools.values().any(|e| e.pool.token0 == a || e.pool.token1 == a || e.pool.address == a)
+    }
+
     pub fn pools_changed_with(&self, core: &super::checkcore::CheckCore, changed: &[(Address, U256)], hashes: &[(U256, U256, U256)]) -> Vec<crate::check::moved::MovedPool> {
         core.moved.moved(changed, hashes)
     }

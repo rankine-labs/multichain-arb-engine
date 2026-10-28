@@ -236,7 +236,7 @@ impl<'a> Session<'a> {
         }
         let m = self.missing();
         if !m.is_empty() {
-            return Err(CheckUnknown { reason: UnknownReason::Miss, missing: m.to_vec(), detail: format!("{} item(s) not in our copy", m.len()), pre: Vec::new(), keys: Vec::new(), at: None });
+            return Err(CheckUnknown { reason: UnknownReason::Miss, missing: m.to_vec(), detail: format!("{} item(s) not in our copy", m.len()), pre: Vec::new(), keys: Vec::new(), at: None, assumed: Vec::new() });
         }
         Ok(())
     }
@@ -280,6 +280,7 @@ pub(crate) fn db_unknown(e: DbErr, missing: &[MissItem]) -> CheckUnknown {
             pre: Vec::new(),
             keys: Vec::new(),
             at: None,
+            assumed: Vec::new(),
         },
         DbErr::UnsupportedBuiltin(a) => {
             CheckUnknown::new(UnknownReason::UnsupportedPrecompile, format!("Arbitrum built-in {a} is not imitated"))
