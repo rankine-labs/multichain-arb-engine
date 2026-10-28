@@ -111,13 +111,17 @@ impl LaneCfg {
 pub struct SafetyGate {
     mode: FastlaneMode,
     kill: super::bridge::KillSwitch,
+    /// Practice + FASTLANE_PRACTICE_SCORE_PAUSED: the kill switch does not
+    /// stop a would-send here either (Safety::kill_blocks_practice). Live:
+    /// always false, so the kill switch stops the gun exactly as before.
+    practice_ignores_kill: bool,
     node_agrees: AtomicBool,
     cleared: Mutex<Option<(u64, String, revm::primitives::U256)>>,
 }
 
 impl SafetyGate {
     pub fn new(s: &Safety) -> SafetyGate {
-        SafetyGate { mode: s.mode, kill: s.kill.clone(), node_agrees: AtomicBool::new(s.node_agrees_rust_sends()), cleared: Mutex::new(None) }
+        SafetyGate { mode: s.mode, kill: s.kill.clone(), practice_ignores_kill: !s.kill_blocks_practice(), node_agrees: AtomicBool::new(s.node_agrees_rust_sends()), cleared: Mutex::new(None) }
     }
     /// Refresh "Node agrees Rust sends" from the Safety (fire lock held).
     pub fn sync_from(&self, s: &Safety) {
@@ -137,7 +141,7 @@ impl Gate for SafetyGate {
         match &*g {
             Some((b, l, a)) if *b == c.block && *l == c.route_label && *a == c.amount_in => {
                 // A kill switch turned on since the check: stop here too.
-                if self.kill.on() {
+                if self.kill.on() && !self.practice_ignores_kill {
                     return Err("kill switch on".into());
                 }
                 Ok(())
@@ -682,6 +686,8 @@ impl Lane {
             Err(p) => json!({"usable": false, "why": p.to_string()}),
         };
         let killed = core.safety.killed();
+        let paused_passes = core.safety.paused_passes;
+        let score_paused = !core.safety.kill_blocks_practice();
         drop(core);
         json!({
             "mode": self.gun.mode().as_str(),
@@ -709,7 +715,10 @@ impl Lane {
                 "replies": *self.book.replies.lock().unwrap_or_else(|e| e.into_inner()),
                 "earlyRepliesDropped": self.book.early_dropped(),
             },
-            "safety": {"killed": killed, "state": state, "blockedThisHour": h.blocked},
+            "safety": {"killed": killed, "state": state, "blockedThisHour": h.blocked,
+                // Practice while the bot is paused (FASTLANE_PRACTICE_SCORE_PAUSED):
+                // would-sends that passed with the kill switch on (never broadcast).
+                "practiceScoresWhilePaused": score_paused, "passedWhilePaused": paused_passes},
             "lane": {
                 "tips": h.tips, "confirmedScanned": h.confirmed, "tipsOld": h.tips_old, "opps": h.opps, "fired": h.fired, "wouldSend": h.would_send, "liveSent": h.live_sent,
                 "notLeft": h.not_left, "gunRefused": h.gun_refused, "logErrors": h.log_errors, "dropsSeen": h.drops_seen,

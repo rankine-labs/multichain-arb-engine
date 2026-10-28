@@ -84,6 +84,12 @@ pub fn parse_on(raw: Option<&str>) -> bool {
     matches!(raw.map(|s| s.trim().to_ascii_lowercase()).as_deref(), Some("on" | "true" | "1" | "yes"))
 }
 
+/// "off" / "false" / "0" / "no" (any case) = off; anything else, or not
+/// set, = on. For settings that are on by default.
+pub fn parse_off(raw: Option<&str>) -> bool {
+    matches!(raw.map(|s| s.trim().to_ascii_lowercase()).as_deref(), Some("off" | "false" | "0" | "no"))
+}
+
 impl FastlaneMode {
     /// Read from any key -> value lookup (tests pass a map; the program
     /// passes the real environment via `from_env`).

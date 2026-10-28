@@ -158,6 +158,14 @@ pub struct SafetyConfig {
     pub max_opp_age_ms: u64,
     /// FASTLANE_LIVE_BLOCKS [off] (new): also honour Node's 6 h live block list.
     pub honour_live_blocks: bool,
+    /// FASTLANE_PRACTICE_SCORE_PAUSED [on] (Oct 28, owner: "I want to score
+    /// trades"): in PRACTICE mode only, the pause / kill switch (data/KILL,
+    /// KILL_SWITCH=on, or Node's state saying killed) does not stop a
+    /// "would send", so practice can score what it would have done while
+    /// the Node bot is paused. Practice never broadcasts (Gun::broadcasting
+    /// needs FASTLANE=live), and in LIVE mode the kill switch blocks exactly
+    /// as before. "off" = practice obeys the kill switch too (old behaviour).
+    pub practice_score_paused: bool,
     /// Settings that are not positive numbers (any = block every send).
     pub problems: Vec<String>,
 }
@@ -210,6 +218,7 @@ impl SafetyConfig {
             pool_hold_ms: if hold.is_finite() && hold >= 0.0 { hold as u64 } else { 3_000 },
             max_opp_age_ms: if age.is_finite() && age > 0.0 { age as u64 } else { 150 },
             honour_live_blocks: crate::fastlane::mode::parse_on(get("FASTLANE_LIVE_BLOCKS").as_deref()),
+            practice_score_paused: !crate::fastlane::mode::parse_off(get("FASTLANE_PRACTICE_SCORE_PAUSED").as_deref()),
             problems,
         }
     }
@@ -284,6 +293,9 @@ pub struct Safety {
     send_times: VecDeque<Instant>,
     pool_hold: HashMap<String, Instant>,
     reserved: VecDeque<Reserved>,
+    /// Practice checks that passed although the kill switch was on
+    /// (FASTLANE_PRACTICE_SCORE_PAUSED), for the status page.
+    pub paused_passes: u64,
 }
 
 /// At most this many reservations / pool holds are remembered (memory bound).
@@ -291,7 +303,7 @@ const MAX_TRACKED: usize = 1_000;
 
 impl Safety {
     pub fn new(cfg: SafetyConfig, mode: FastlaneMode, kill: KillSwitch, state: StateReader) -> Safety {
-        Safety { cfg, mode, kill, state, wall: Box::new(wall_ms), send_times: VecDeque::new(), pool_hold: HashMap::new(), reserved: VecDeque::new() }
+        Safety { cfg, mode, kill, state, wall: Box::new(wall_ms), send_times: VecDeque::new(), pool_hold: HashMap::new(), reserved: VecDeque::new(), paused_passes: 0 }
     }
 
     /// Everything from the environment (the program's real settings).
@@ -303,6 +315,12 @@ impl Safety {
     /// Kill switch right now (file looked at every call: no caching).
     pub fn killed(&self) -> bool {
         self.kill.on()
+    }
+
+    /// Does the kill switch stop this check? Always in live mode; in
+    /// practice mode only when FASTLANE_PRACTICE_SCORE_PAUSED=off.
+    pub fn kill_blocks_practice(&self) -> bool {
+        !(self.mode.mode == Mode::Practice && self.cfg.practice_score_paused)
     }
 
     /// May the gun broadcast for real right now? FASTLANE=live AND our
@@ -339,8 +357,14 @@ impl Safety {
             _ => {}
         }
         // 2. Kill switch: data/KILL or KILL_SWITCH=on (fastSender.ts:104, trigEntry.ts:1026).
+        // Practice + FASTLANE_PRACTICE_SCORE_PAUSED: noted, not blocked
+        // (practice never broadcasts; see the setting).
+        let mut paused = false;
         if self.killed() {
-            return Err(BlockReason::new("kill", "kill switch on"));
+            if self.kill_blocks_practice() {
+                return Err(BlockReason::new("kill", "kill switch on"));
+            }
+            paused = true;
         }
         // 3. Bad settings, ours (fastSender.ts:105 safetyConfigProblems).
         if !self.cfg.problems.is_empty() {
@@ -358,7 +382,10 @@ impl Safety {
         };
         let lim = &st.raw.limits;
         if st.raw.killed {
-            return Err(BlockReason::new("kill", "kill switch on (seen by the Node bot)"));
+            if self.kill_blocks_practice() {
+                return Err(BlockReason::new("kill", "kill switch on (seen by the Node bot)"));
+            }
+            paused = true;
         }
         if !st.raw.problems.is_empty() {
             return Err(BlockReason::new("bad_setting", format!("bad safety setting (Node): {}", st.raw.problems.join(", "))));
@@ -494,6 +521,9 @@ impl Safety {
                     }
                 }
             }
+        }
+        if paused {
+            self.paused_passes += 1;
         }
         Ok(())
     }
@@ -675,6 +705,37 @@ mod tests {
         assert_eq!(t.code(&pair()), "ok");
         assert_eq!(T::new(&[("KILL_SWITCH", "on")], good_state()).code(&pair()), "kill");
         assert_eq!(T::new(&[], NodeState { killed: true, ..good_state() }).code(&pair()), "kill");
+    }
+
+    // Oct 28 (owner: "I want to score trades"): practice scores while the
+    // Node bot is paused; live is unchanged; the setting can turn it off.
+    #[test]
+    fn practice_scores_while_paused_live_does_not() {
+        let pr = [("FASTLANE", "practice"), ("RUST_SENDER", "off")];
+        // Kill file on: practice passes (and counts it), never may broadcast.
+        let mut t = T::new(&pr, good_state());
+        std::fs::write(t.dir.join("KILL"), b"").unwrap();
+        assert_eq!(t.code(&pair()), "ok");
+        assert_eq!(t.s.paused_passes, 1);
+        assert!(!t.s.may_broadcast(), "practice never broadcasts, kill or not");
+        // KILL_SWITCH=on and Node's state saying killed: same.
+        assert_eq!(T::new(&[pr[0], pr[1], ("KILL_SWITCH", "on")], good_state()).code(&pair()), "ok");
+        assert_eq!(T::new(&pr, NodeState { killed: true, ..good_state() }).code(&pair()), "ok");
+        // Not paused: passes without counting.
+        let mut n = T::new(&pr, good_state());
+        assert_eq!(n.code(&pair()), "ok");
+        assert_eq!(n.s.paused_passes, 0);
+        // Setting off: practice obeys the kill switch again (old behaviour).
+        let mut o = T::new(&[pr[0], pr[1], ("FASTLANE_PRACTICE_SCORE_PAUSED", "off")], good_state());
+        std::fs::write(o.dir.join("KILL"), b"").unwrap();
+        assert_eq!(o.code(&pair()), "kill");
+        // LIVE: the setting changes nothing; the kill switch always blocks.
+        let mut l = T::new(&[("FASTLANE_PRACTICE_SCORE_PAUSED", "on")], good_state());
+        std::fs::write(l.dir.join("KILL"), b"").unwrap();
+        assert_eq!(l.code(&pair()), "kill");
+        assert!(!l.s.may_broadcast());
+        assert_eq!(T::new(&[("FASTLANE_PRACTICE_SCORE_PAUSED", "on")], NodeState { killed: true, ..good_state() }).code(&pair()), "kill");
+        assert!(l.s.kill_blocks_practice(), "live: kill always blocks");
     }
 
     #[test]
