@@ -551,3 +551,74 @@ fn slow_routes_rest_and_the_budget_is_not_overrun() {
     let rep = sc.scan(&input(&s, &ctx(), 2, &[], &none));
     assert!(rep.resting >= 1, "{:?}", rep.resting);
 }
+
+// SPEED FIX (Oct 28): the scanner brings its route list up to date by
+// touching only the pools whose rows changed (live: re-copying all ~38,700
+// rows on every table message cost ~30 ms per block). The result must be
+// exactly what a fresh full copy of the same table gives.
+fn msg_rows(rows: &[Row]) -> Value {
+    Value::Array(rows.iter().map(|r| json!({ "rid": r.rid, "h": r.held, "s": r.score, "e": r.e, "c": r.c.as_deref(), "f": r.f.as_deref() })).collect())
+}
+
+fn route_ids(src: &TableSource) -> Vec<(String, bool, Option<f64>, String)> {
+    src.all().iter().map(|r| (r.rid.clone(), r.held, r.score, r.facts.as_ref().map(|f| format!("{:.4}", f.gas_usd)).unwrap_or_default())).collect()
+}
+
+#[test]
+fn delta_sync_matches_full_sync() {
+    use arbsim::check::entry::table_from_messages;
+    // Full table: 6 pools, route r2 listed under two pools.
+    let rows_of = |n: u64, gas: f64| vec![row(&format!("r{n}"), 0x100 + n, 0x900, n % 2 == 0, Some(n as f64), gas)];
+    let mut pools = serde_json::Map::new();
+    for n in 0..6u64 {
+        pools.insert(key(0x100 + n), msg_rows(&rows_of(n, 0.05)));
+    }
+    pools.insert(key(0x200), msg_rows(&rows_of(2, 0.05)));
+    let full = json!({ "type": "trig_table", "gen": 1, "full": true, "codes": [], "pools": Value::Object(pools) });
+    let shared = Arc::new(Mutex::new(table_from_messages(std::slice::from_ref(&full)).unwrap()));
+    let mut live = TableSource::owned(shared.clone());
+    assert!(live.sync().is_empty());
+    assert_eq!(live.all().len(), 6);
+    assert_eq!((live.full_syncs, live.delta_syncs), (1, 0));
+    let before: Vec<_> = live.all().to_vec();
+
+    // Partial updates, applied the way arbsim applies them (set_pool):
+    //   gen 2: pool 1 new facts (gas), pool 3 removed, a new pool 7
+    //   gen 3: pool 0x200 (2nd listing of r2) removed: r2 stays (pool 2 still lists it)
+    //   gen 4: pool 2 removed: r2 now gone
+    let parts = vec![
+        json!({ "type": "trig_table", "gen": 2, "full": false, "base": 1, "codes": [], "pools": { key(0x101): msg_rows(&rows_of(1, 0.09)), key(0x103): null, key(0x107): msg_rows(&rows_of(7, 0.05)) } }),
+        json!({ "type": "trig_table", "gen": 3, "full": false, "base": 2, "codes": [], "pools": { key(0x200): null } }),
+        json!({ "type": "trig_table", "gen": 4, "full": false, "base": 3, "codes": [], "pools": { key(0x102): null } }),
+    ];
+    let mut msgs = vec![full.clone()];
+    for (i, p) in parts.iter().enumerate() {
+        msgs.push(p.clone());
+        // Bring the shared table to this generation (same steps as apply_table).
+        {
+            let mut g = shared.lock().unwrap();
+            *g = table_from_messages(&msgs).unwrap();
+        }
+        assert!(live.sync().is_empty());
+        let mut fresh = TableSource::owned(Arc::new(Mutex::new(table_from_messages(&msgs).unwrap())));
+        fresh.sync();
+        assert_eq!(route_ids(&live), route_ids(&fresh), "after part {} the delta-updated list equals a fresh full copy", i + 1);
+        assert_eq!(live.ranked_for(&[key(0x101), key(0x107)]).len(), fresh.ranked_for(&[key(0x101), key(0x107)]).len());
+    }
+    assert_eq!(live.full_syncs, 1, "only the first sync copied the whole table");
+    assert_eq!(live.delta_syncs, 3);
+    // r2 survived gen 3 (still listed by pool 2) and went at gen 4; r3 went at gen 2.
+    let ids: Vec<String> = live.all().iter().map(|r| r.rid.clone()).collect();
+    assert_eq!(ids, vec!["r0", "r1", "r4", "r5", "r7"]);
+    // Untouched routes keep the very same Route (no rebuild).
+    let r0_before = before.iter().find(|r| r.rid == "r0").unwrap();
+    let r0_now = live.all().iter().find(|r| r.rid == "r0").unwrap();
+    assert!(Arc::ptr_eq(r0_before, r0_now));
+    // A new FULL table: copied whole again.
+    let mut m2 = msgs.clone();
+    m2.push(json!({ "type": "trig_table", "gen": 9, "full": true, "codes": [], "pools": { key(0x100): msg_rows(&rows_of(0, 0.05)) } }));
+    *shared.lock().unwrap() = table_from_messages(&m2).unwrap();
+    live.sync();
+    assert_eq!(live.full_syncs, 2);
+    assert_eq!(live.all().iter().map(|r| r.rid.clone()).collect::<Vec<_>>(), vec!["r0"]);
+}

@@ -192,6 +192,7 @@ export type EntrySettings = {
   loops: boolean;                // TRIG_ENTRY_LOOPS [1] also try 3-pool loops through the moved pool (0 = 2-pool only, as before)
   maxLoops: number;              // TRIG_ENTRY_MAX_LOOPS [4] loop candidates built and checked per trigger (on top of TRIG_ENTRY_MAX_CANDIDATES)
   fastlaneFacts: boolean;        // FASTLANE=practice|live: table rows also carry "f" facts for the Rust scanner (off = as before)
+  nodeAsks: boolean;             // TRIG_ENTRY_NODE_ASKS [on; off by default when the Rust fast lane decides] the bot asks arbsim about feed triggers itself (see nodeAsksOn)
 };
 
 export function entrySettings(env: Record<string, string | undefined> = process.env, minNetUsd = 0.25): EntrySettings {
@@ -222,7 +223,26 @@ export function entrySettings(env: Record<string, string | undefined> = process.
     loops: (env.TRIG_ENTRY_LOOPS ?? '1').trim() !== '0',
     maxLoops: Math.round(num('TRIG_ENTRY_MAX_LOOPS', 4, 0)),
     fastlaneFacts: fastlaneFactsOn(env),
+    nodeAsks: nodeAsksOn(env),
   };
+}
+
+// SPEED FIX (Oct 28, live measurement): with the Rust fast lane deciding,
+// the bot's own trigger questions (~9,000 an hour) are duplicate work: they
+// queue in front of arbsim's checks (p50 33 ms waiting for a worker) and
+// take CPU from the Rust lane on the same 2 cores. TRIG_ENTRY_NODE_ASKS:
+//   on / 1   the bot asks as before
+//   off / 0  the bot stops asking; it still builds and sends the candidate
+//            table (the Rust scanner and trigger need it)
+//   not set  off when the Rust fast lane is the sender (FASTLANE=live and
+//            RUST_SENDER=on: Node never sends fire-first trades then),
+//            on otherwise (Node is the fire-first sender: unchanged).
+export function nodeAsksOn(env: Record<string, string | undefined> = process.env): boolean {
+  const v = (env.TRIG_ENTRY_NODE_ASKS ?? '').trim().toLowerCase();
+  if (['0', 'off', 'false', 'no'].includes(v)) return false;
+  if (['1', 'on', 'true', 'yes'].includes(v)) return true;
+  const rustSends = (env.FASTLANE ?? '').trim().toLowerCase() === 'live' && ['1', 'on', 'true', 'yes'].includes((env.RUST_SENDER ?? '').trim().toLowerCase());
+  return !rustSends;
 }
 
 // Calls that never move a pool by themselves (the coin's own functions):
@@ -619,6 +639,7 @@ export class TrigEntry {
     this.lagNow = deps.lag ?? (() => loopLag.now());
     this.ours = { isOurTx: deps.isOurTx, addresses: new Set(deps.ourAddresses.map((a) => a.toLowerCase())) };
     const one = this.oneTripOn() ? `one trip (table every ${this.settings.tableMs} ms)` : this.tableOn() ? `two steps (table for the fast lane every ${this.settings.tableMs} ms)` : 'two steps';
+    if (this.active() && !this.settings.nodeAsks) this.log('[trig-entry] the bot does not ask about feed triggers itself (TRIG_ENTRY_NODE_ASKS off / Rust fast lane decides); candidate table still sent');
     this.log(`[trig-entry] ${this.active() ? deps.tf.mode() : 'off'}: every feed transaction checked as a possible trigger (max ${this.settings.maxDiscover} asked "which pools?" and ${this.settings.maxInFlight} checked at once, ${this.settings.maxCandidates} candidates each, sizes $${this.settings.sizesUsd.join('/$')}, ${one})`);
     if (this.active()) {
       if (!deps.lag) loopLag.start();
@@ -665,7 +686,7 @@ export class TrigEntry {
   // before the rest of the bot handles this frame) or right after
   // (setImmediate).
   onFeedMsgs(msgs: FeedMsg[], at: number, hr?: { recv: number; parsed?: number }): void {
-    if (!this.active()) return;
+    if (!this.active() || !this.settings.nodeAsks) return;
     const recv = hr?.recv ?? performance.now();
     for (const m of msgs) {
       for (const t of m?.txs ?? []) {

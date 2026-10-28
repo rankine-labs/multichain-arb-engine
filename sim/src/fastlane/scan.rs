@@ -65,7 +65,7 @@
 //   Off unless FASTLANE=practice|live (same words as fastlane/mode.rs).
 //   Nothing here sends anything; nothing here changes existing paths.
 // ============================================================================
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -355,7 +355,9 @@ pub struct TableSource {
     read: Box<dyn Fn(&mut dyn FnMut(Option<&Table>)) + Send>,
     table_gen: Option<u64>,
     gen: u64,
-    by_rid: HashMap<String, Arc<Route>>,
+    /// Sorted by route id, so the full list (`all`) comes out in route-id
+    /// order without a sort (SPEED FIX, Oct 28).
+    by_rid: BTreeMap<String, Arc<Route>>,
     /// The raw row check + facts each route was built from (to rebuild only changed ones).
     built_from: HashMap<String, (Arc<Value>, Option<Arc<Value>>)>,
     /// The code list the routes were built with, and its parsed codes by number.
@@ -363,7 +365,13 @@ pub struct TableSource {
     code_cache: HashMap<usize, (revm::primitives::B256, revm::bytecode::Bytecode)>,
     /// Per pool key: its rows (rid, held, score) in table order.
     per_pool: HashMap<String, Vec<(String, bool, Option<f64>)>>,
+    /// How many pools list each route (a route through 2 pools is in both
+    /// pools' rows); 0 = the route is gone.
+    rid_refs: HashMap<String, usize>,
     all: Vec<Arc<Route>>,
+    /// Syncs done by copying the whole table vs only the changed pools.
+    pub full_syncs: u64,
+    pub delta_syncs: u64,
 }
 
 impl TableSource {
@@ -379,52 +387,70 @@ impl TableSource {
         }))
     }
     fn with_reader(read: Box<dyn Fn(&mut dyn FnMut(Option<&Table>)) + Send>) -> TableSource {
-        TableSource { read, table_gen: None, gen: 0, by_rid: HashMap::new(), built_from: HashMap::new(), codes: Arc::new(Vec::new()), code_cache: HashMap::new(), per_pool: HashMap::new(), all: Vec::new() }
+        TableSource {
+            read, table_gen: None, gen: 0, by_rid: BTreeMap::new(), built_from: HashMap::new(), codes: Arc::new(Vec::new()), code_cache: HashMap::new(),
+            per_pool: HashMap::new(), rid_refs: HashMap::new(), all: Vec::new(), full_syncs: 0, delta_syncs: 0,
+        }
     }
 }
 
 type RowCopy = (String, String, bool, Option<f64>, Arc<Value>, Option<Arc<Value>>);
+/// One pool's usable rows: (rid, held, score, check, facts).
+type PoolRows = Vec<(String, bool, Option<f64>, Arc<Value>, Option<Arc<Value>>)>;
 
-impl RouteSource for TableSource {
-    fn sync(&mut self) -> Vec<(String, String)> {
-        // Copy what we need out of the table (its lock is held only for that).
-        let mut snap: Option<(u64, Arc<Vec<String>>, Vec<RowCopy>)> = None;
-        let mut gen_now: Option<u64> = None;
-        let have = self.table_gen;
-        (self.read)(&mut |t: Option<&Table>| {
-            let Some(t) = t else { return };
-            gen_now = Some(t.gen);
-            if have == Some(t.gen) {
-                return;
-            }
-            let mut rows = Vec::new();
-            for (pool, rs) in &t.pools {
-                for r in rs {
-                    if let (Some(_), Some(c)) = (&r.e, &r.c) {
-                        rows.push((pool.clone(), r.rid.clone(), r.held, r.score, c.clone(), r.f.clone()));
-                    }
-                }
-            }
-            snap = Some((t.gen, t.codes.clone(), rows));
-        });
+/// What one sync copied out of the table (its lock is held only for this).
+enum TableSnap {
+    /// Every row (first table, a new FULL table, or a changed code list).
+    Full(u64, Arc<Vec<String>>, Vec<RowCopy>),
+    /// SPEED FIX (Oct 28): only the pools changed since the generation we
+    /// hold: Some(rows) = replaced, None = removed.
+    Delta(u64, Vec<(String, Option<PoolRows>)>),
+}
+
+fn usable_rows(rs: &[crate::check::entry::Row]) -> PoolRows {
+    rs.iter().filter_map(|r| match (&r.e, &r.c) { (Some(_), Some(c)) => Some((r.rid.clone(), r.held, r.score, c.clone(), r.f.clone())), _ => None }).collect()
+}
+
+/// One route from its row: the old Route reused when its check text (and
+/// code list) did not change (only new facts / rank make a new Route around
+/// the same parsed check); else the check is parsed. Ok(None) = unchanged
+/// (the very same Route can stay).
+#[allow(clippy::too_many_arguments)]
+fn route_from_row(
+    old: Option<&Arc<Route>>, old_from: Option<&(Arc<Value>, Option<Arc<Value>>)>, codes_same: bool,
+    rid: &str, held: bool, score: Option<f64>, c: &Arc<Value>, f: &Option<Arc<Value>>,
+    codes: &[String], code_cache: &mut HashMap<usize, (revm::primitives::B256, revm::bytecode::Bytecode)>,
+) -> Result<Arc<Route>, String> {
+    if let (Some(old), Some((oc, of))) = (old, old_from) {
+        if codes_same && (Arc::ptr_eq(oc, c) || **oc == **c) {
+            let same_f = match (of, f) {
+                (None, None) => true,
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b) || a == b,
+                _ => false,
+            };
+            return Ok(if same_f && old.held == held && old.score == score {
+                old.clone()
+            } else {
+                Arc::new(Route { rid: rid.to_string(), held, score, keys: old.keys.clone(), pools: old.pools.clone(), check: old.check.clone(), facts: f.as_deref().and_then(Facts::from_json) })
+            });
+        }
+    }
+    let p = PreparedCheck::from_row_cached(c, codes, code_cache)?;
+    let keys: Vec<String> = c.get("route").and_then(|r| r.as_array()).map(|a| a.iter().filter_map(|x| x.as_str()).map(|s| s.to_ascii_lowercase()).collect()).unwrap_or_default();
+    let lender = p.trade.flash.lender().map(|a| format!("{a:#x}"));
+    let pools: Vec<String> = keys.iter().filter(|k| Some(k.as_str()) != lender.as_deref()).cloned().collect();
+    Ok(Arc::new(Route { rid: rid.to_string(), held, score, keys, pools, check: Arc::new(p), facts: f.as_deref().and_then(Facts::from_json) }))
+}
+
+impl TableSource {
+    /// Every row copied and every route rebuilt (reusing parsed checks).
+    fn sync_full(&mut self, tgen: u64, codes: Arc<Vec<String>>, rows: Vec<RowCopy>) -> Vec<(String, String)> {
+        self.full_syncs += 1;
         let mut bad = Vec::new();
-        let Some((tgen, codes, rows)) = snap else {
-            if gen_now.is_none() && self.table_gen.is_some() {
-                // Table gone (tests / restart): forget the routes.
-                self.table_gen = None;
-                self.by_rid.clear();
-                self.built_from.clear();
-                self.code_cache.clear();
-                self.codes = Arc::new(Vec::new());
-                self.per_pool.clear();
-                self.all.clear();
-                self.gen += 1;
-            }
-            return bad;
-        };
         let mut per_pool: HashMap<String, Vec<(String, bool, Option<f64>)>> = HashMap::new();
-        let mut by_rid: HashMap<String, Arc<Route>> = HashMap::new();
+        let mut by_rid: BTreeMap<String, Arc<Route>> = BTreeMap::new();
         let mut built_from = HashMap::new();
+        let mut rid_refs: HashMap<String, usize> = HashMap::new();
         // H2: the code list compared ONCE (the bot resends it with every
         // table message); a different list = every check is re-parsed.
         let codes_same = Arc::ptr_eq(&self.codes, &codes) || *self.codes == *codes;
@@ -435,52 +461,155 @@ impl RouteSource for TableSource {
         // Keep the table's per-pool row order (rows are walked per pool).
         for (pool, rid, held, score, c, f) in rows {
             per_pool.entry(pool).or_default().push((rid.clone(), held, score));
+            *rid_refs.entry(rid.clone()).or_default() += 1;
             if by_rid.contains_key(&rid) {
                 continue;
             }
-            // Same check text and code list as before: the parsed check is
-            // reused; only new facts (price / gas) make a new Route around it.
-            if let (Some(old), Some((oc, of))) = (self.by_rid.get(&rid), self.built_from.get(&rid)) {
-                if codes_same && (Arc::ptr_eq(oc, &c) || **oc == *c) {
-                    let same_f = match (of, &f) {
-                        (None, None) => true,
-                        (Some(a), Some(b)) => Arc::ptr_eq(a, b) || a == b,
-                        _ => false,
-                    };
-                    let r = if same_f && old.held == held && old.score == score {
-                        old.clone()
-                    } else {
-                        Arc::new(Route { rid: rid.clone(), held, score, keys: old.keys.clone(), pools: old.pools.clone(), check: old.check.clone(), facts: f.as_deref().and_then(Facts::from_json) })
-                    };
-                    by_rid.insert(rid.clone(), r);
-                    built_from.insert(rid, (c, f));
-                    continue;
-                }
-            }
-            match PreparedCheck::from_row_cached(&c, &codes, &mut self.code_cache) {
-                Ok(p) => {
-                    let keys: Vec<String> = c.get("route").and_then(|r| r.as_array()).map(|a| a.iter().filter_map(|x| x.as_str()).map(|s| s.to_ascii_lowercase()).collect()).unwrap_or_default();
-                    let lender = p.trade.flash.lender().map(|a| format!("{a:#x}"));
-                    let pools: Vec<String> = keys.iter().filter(|k| Some(k.as_str()) != lender.as_deref()).cloned().collect();
-                    let r = Arc::new(Route { rid: rid.clone(), held, score, keys, pools, check: Arc::new(p), facts: f.as_deref().and_then(Facts::from_json) });
+            match route_from_row(self.by_rid.get(&rid), self.built_from.get(&rid), codes_same, &rid, held, score, &c, &f, &codes, &mut self.code_cache) {
+                Ok(r) => {
                     by_rid.insert(rid.clone(), r);
                     built_from.insert(rid, (c, f));
                 }
                 Err(e) => bad.push((rid, e)),
             }
         }
-        let mut all: Vec<Arc<Route>> = by_rid.values().cloned().collect();
-        all.sort_by(|a, b| a.rid.cmp(&b.rid));
+        let all: Vec<Arc<Route>> = by_rid.values().cloned().collect();
         let changed = all.len() != self.all.len() || all.iter().zip(&self.all).any(|(a, b)| !Arc::ptr_eq(a, b));
         self.table_gen = Some(tgen);
         self.per_pool = per_pool;
         self.by_rid = by_rid;
         self.built_from = built_from;
+        self.rid_refs = rid_refs;
         if changed {
             self.all = all;
             self.gen += 1;
         }
         bad
+    }
+
+    /// SPEED FIX (Oct 28): only the pools that changed since the generation
+    /// we hold. Same routes as a full sync of the same table (test:
+    /// delta_sync_matches_full_sync), at a fraction of the work.
+    fn sync_delta(&mut self, tgen: u64, pools: Vec<(String, Option<PoolRows>)>) -> Vec<(String, String)> {
+        self.delta_syncs += 1;
+        let mut bad = Vec::new();
+        let mut maybe_gone: Vec<String> = Vec::new();
+        let mut changed = false;
+        let codes = self.codes.clone();
+        for (pool, rows) in pools {
+            if let Some(old) = self.per_pool.remove(&pool) {
+                for (rid, _, _) in old {
+                    if let Some(n) = self.rid_refs.get_mut(&rid) {
+                        *n = n.saturating_sub(1);
+                        if *n == 0 {
+                            maybe_gone.push(rid);
+                        }
+                    }
+                }
+            }
+            let Some(rows) = rows else { continue };
+            let mut list = Vec::with_capacity(rows.len());
+            for (rid, held, score, c, f) in rows {
+                list.push((rid.clone(), held, score));
+                *self.rid_refs.entry(rid.clone()).or_default() += 1;
+                match route_from_row(self.by_rid.get(&rid), self.built_from.get(&rid), true, &rid, held, score, &c, &f, &codes, &mut self.code_cache) {
+                    Ok(r) => {
+                        if !self.by_rid.get(&rid).is_some_and(|o| Arc::ptr_eq(o, &r)) {
+                            changed = true;
+                        }
+                        self.by_rid.insert(rid.clone(), r);
+                        self.built_from.insert(rid, (c, f));
+                    }
+                    Err(e) => {
+                        // Unusable now: not scanned (as a full sync would leave it out).
+                        if self.by_rid.remove(&rid).is_some() {
+                            changed = true;
+                        }
+                        self.built_from.remove(&rid);
+                        bad.push((rid, e));
+                    }
+                }
+            }
+            self.per_pool.insert(pool, list);
+        }
+        for rid in maybe_gone {
+            if self.rid_refs.get(&rid).copied().unwrap_or(0) == 0 {
+                self.rid_refs.remove(&rid);
+                self.built_from.remove(&rid);
+                if self.by_rid.remove(&rid).is_some() {
+                    changed = true;
+                }
+            }
+        }
+        self.table_gen = Some(tgen);
+        if changed {
+            self.all = self.by_rid.values().cloned().collect();
+            self.gen += 1;
+        }
+        bad
+    }
+}
+
+impl RouteSource for TableSource {
+    fn sync(&mut self) -> Vec<(String, String)> {
+        // Copy what we need out of the table (its lock is held only for that).
+        let mut snap: Option<TableSnap> = None;
+        let mut gen_now: Option<u64> = None;
+        let have = self.table_gen;
+        let my_codes = self.codes.clone();
+        (self.read)(&mut |t: Option<&Table>| {
+            let Some(t) = t else { return };
+            gen_now = Some(t.gen);
+            if have == Some(t.gen) {
+                return;
+            }
+            let same_codes = Arc::ptr_eq(&my_codes, &t.codes) || *my_codes == *t.codes;
+            match have {
+                // Only the pools changed since `h` (same code list, no new full table).
+                Some(h) if t.tracked && t.full_gen <= h && t.gen > h && same_codes => {
+                    let mut pools: Vec<(String, Option<PoolRows>)> = Vec::new();
+                    for (k, g) in &t.pool_gen {
+                        if *g > h {
+                            pools.push((k.clone(), Some(t.pools.get(k).map(|rs| usable_rows(rs)).unwrap_or_default())));
+                        }
+                    }
+                    for (k, g) in &t.removed {
+                        if *g > h && !t.pools.contains_key(k) {
+                            pools.push((k.clone(), None));
+                        }
+                    }
+                    snap = Some(TableSnap::Delta(t.gen, pools));
+                }
+                _ => {
+                    let mut rows = Vec::new();
+                    for (pool, rs) in &t.pools {
+                        for (rid, held, score, c, f) in usable_rows(rs) {
+                            rows.push((pool.clone(), rid, held, score, c, f));
+                        }
+                    }
+                    snap = Some(TableSnap::Full(t.gen, t.codes.clone(), rows));
+                }
+            }
+        });
+        match snap {
+            Some(TableSnap::Full(tgen, codes, rows)) => self.sync_full(tgen, codes, rows),
+            Some(TableSnap::Delta(tgen, pools)) => self.sync_delta(tgen, pools),
+            None => {
+                if gen_now.is_none() && self.table_gen.is_some() {
+                    // Table gone (tests / restart): forget the routes.
+                    self.table_gen = None;
+                    self.by_rid.clear();
+                    self.built_from.clear();
+                    self.code_cache.clear();
+                    self.codes = Arc::new(Vec::new());
+                    self.per_pool.clear();
+                    self.rid_refs.clear();
+                    self.all.clear();
+                    self.gen += 1;
+                }
+                Vec::new()
+            }
+        }
     }
 
     /// entry.rs `select` picking (moved pools in order, each pool's rows in
@@ -1075,7 +1204,17 @@ fn record_block(rep: &ScanReport) {
         r.pop_front();
     }
     r.push_back(rep.timing.total_us);
+    drop(r);
+    // SPEED FIX (Oct 28): the route-list update before each scan, timed
+    // apart ("blockUs" starts after it), last 1000 blocks.
+    let mut q = SYNC_RING.lock().unwrap_or_else(|e| e.into_inner());
+    if q.len() >= 1000 {
+        q.pop_front();
+    }
+    q.push_back(rep.timing.sync_us);
 }
+
+static SYNC_RING: Mutex<VecDeque<u64>> = Mutex::new(VecDeque::new());
 
 /// Counters so far this hour, as JSON (status "fastlaneScan").
 pub fn status_json() -> Value {
@@ -1091,6 +1230,7 @@ pub fn status_json() -> Value {
         "slowRoutes": h.slow_routes, "resting": h.resting, "cutFit": h.cut_fit,
         "routes": h.routes, "skippedUnsureLender": h.skipped_unsure_lender,
         "blockUs": crate::timing::pct(&mut ring),
+        "syncUs": crate::timing::pct(&mut SYNC_RING.lock().unwrap_or_else(|e| e.into_inner()).iter().copied().collect::<Vec<u64>>()),
     })
 }
 
