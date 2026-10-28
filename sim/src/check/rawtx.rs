@@ -9,14 +9,20 @@
 //   can be replayed first, exactly as the chain would run it.
 //
 //   Supported kinds: legacy (type 0, with or without chain id), 2930 (type 1)
-//   and 1559 (type 2) - what users and routers send on Robinhood Chain.
-//   Anything else (blob, 7702, Arbitrum system/retryable types) is refused,
+//   and 1559 (type 2) - what users and routers send on Robinhood Chain -
+//   and (Oct 27) 7702 (type 4, "set code": a wallet lets a contract's code
+//   run as its own; Nitro runs these since ArbOS 40). Type 4 is unpacked
+//   with every authorization's signer recovered, so it can be named and
+//   judged like any transaction; check/ordered.rs only RUNS one when every
+//   signer's account is followed exactly (its nonce decides whether the
+//   authorization applies), otherwise the answer is "unknown".
+//   Anything else (blob, Arbitrum system/retryable types) is refused,
 //   and the check answers "unknown" instead of guessing.
 //
 //   The decoder is deliberately small and strict (RLP = Ethereum's packing
 //   format): any malformed input is an error, never a guess.
 // ============================================================================
-use revm::context_interface::transaction::AccessListItem;
+use revm::context_interface::transaction::{AccessListItem, Authorization, RecoveredAuthority, RecoveredAuthorization};
 use revm::primitives::{alloy_primitives::B512, keccak256, Address, Bytes, B256, U256};
 
 /// A decoded, sender-recovered transaction (what we need to replay it).
@@ -32,6 +38,10 @@ pub struct DecodedTx {
     pub nonce: u64,
     pub chain_id: Option<u64>,
     pub access_list: Vec<AccessListItem>,
+    /// Type 4 (EIP-7702) only: the authorization list, each with its signer
+    /// recovered (Invalid = a signature that recovers to no one; the chain
+    /// skips such an entry, and so does the replay). Empty otherwise.
+    pub auth: Vec<RecoveredAuthorization>,
 }
 
 // ---------------------------------------------------------------------------
@@ -208,6 +218,7 @@ pub fn decode_signed_tx(raw: &[u8]) -> Result<DecodedTx, String> {
     }
     match first {
         0x01 | 0x02 => decode_typed(first, &raw[1..], hash),
+        0x04 => decode_set_code(&raw[1..], hash),
         t => Err(format!("{UNSUPPORTED_TX_PREFIX} 0x{t:x}")),
     }
 }
@@ -243,7 +254,7 @@ fn decode_legacy(raw: &[u8], hash: B256) -> Result<DecodedTx, String> {
     let mut enc = list_header(payload.len());
     enc.extend(payload);
     let from = recover(&keccak256(&enc), r, s, parity)?;
-    Ok(DecodedTx { tx_type: 0, hash, from, to, value, data, gas, nonce, chain_id, access_list: Vec::new() })
+    Ok(DecodedTx { tx_type: 0, hash, from, to, value, data, gas, nonce, chain_id, access_list: Vec::new(), auth: Vec::new() })
 }
 
 fn decode_typed(ty: u8, body: &[u8], hash: B256) -> Result<DecodedTx, String> {
@@ -278,5 +289,87 @@ fn decode_typed(ty: u8, body: &[u8], hash: B256) -> Result<DecodedTx, String> {
     enc.extend(list_header(payload.len()));
     enc.extend(payload);
     let from = recover(&keccak256(&enc), r, s, y as u8)?;
-    Ok(DecodedTx { tx_type: ty, hash, from, to, value, data, gas, nonce, chain_id: Some(chain_id), access_list })
+    Ok(DecodedTx { tx_type: ty, hash, from, to, value, data, gas, nonce, chain_id: Some(chain_id), access_list, auth: Vec::new() })
+}
+
+/// secp256k1 curve order / 2: a signature with a larger `s` is refused
+/// (EIP-2), for EIP-7702 authorizations too.
+fn secp_half_n() -> U256 {
+    U256::from_be_slice(&[
+        0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x5d, 0x57, 0x6e, 0x73, 0x57, 0xa4, 0x50, 0x1d, 0xdf, 0xe9, 0x2f, 0x46,
+        0x68, 0x1b, 0x20, 0xa0,
+    ])
+}
+
+/// One EIP-7702 authorization [chainId, address, nonce, yParity, r, s] with
+/// its signer recovered: keccak(0x05 || rlp([chainId, address, nonce])).
+/// A signature that doesn't recover (or a high `s`, or yParity > 1) gives
+/// an Invalid signer: the chain skips such an entry, the replay too.
+fn decode_authorization(it: &Item<'_>) -> Result<RecoveredAuthorization, String> {
+    let Item::List(p) = it else { return Err("rlp: authorization should be a list".into()) };
+    let f = list_items(p)?;
+    if f.len() != 6 {
+        return Err(format!("authorization needs 6 fields, got {}", f.len()));
+    }
+    let chain_id = as_u256(&f[0].0, "auth chainId")?;
+    let a = as_str(&f[1].0, "auth address")?;
+    if a.len() != 20 {
+        return Err("rlp: auth address must be 20 bytes".into());
+    }
+    let address = Address::from_slice(a);
+    let nonce = as_u64(&f[2].0, "auth nonce")?;
+    let y = as_u64(&f[3].0, "auth yParity")?;
+    let r = as_u256(&f[4].0, "auth r")?;
+    let s = as_u256(&f[5].0, "auth s")?;
+    let payload: Vec<u8> = f[..3].iter().flat_map(|(_, raw)| raw.iter().copied()).collect();
+    let mut enc = vec![0x05];
+    enc.extend(list_header(payload.len()));
+    enc.extend(payload);
+    let authority = if y > 1 || s > secp_half_n() {
+        RecoveredAuthority::Invalid
+    } else {
+        match recover(&keccak256(&enc), r, s, y as u8) {
+            Ok(a) => RecoveredAuthority::Valid(a),
+            Err(_) => RecoveredAuthority::Invalid,
+        }
+    };
+    Ok(RecoveredAuthorization::new_unchecked(Authorization { chain_id, address, nonce }, authority))
+}
+
+/// Type 4 (EIP-7702): chainId, nonce, maxPrio, maxFee, gas, to, value, data,
+/// accessList, authorizationList, yParity, r, s. `to` must be a contract
+/// call (never a creation) and the list must not be empty (EIP-7702).
+fn decode_set_code(body: &[u8], hash: B256) -> Result<DecodedTx, String> {
+    let (Item::List(p), _, rest) = read_item(body)? else { return Err("typed tx must be a list".into()) };
+    if !rest.is_empty() {
+        return Err("trailing bytes after transaction".into());
+    }
+    let f = list_items(p)?;
+    if f.len() != 13 {
+        return Err(format!("type 4 tx needs 13 fields, got {}", f.len()));
+    }
+    let chain_id = as_u64(&f[0].0, "chainId")?;
+    let nonce = as_u64(&f[1].0, "nonce")?;
+    let gas = as_u64(&f[4].0, "gas")?;
+    let to = as_to(&f[5].0)?.ok_or("type 4 tx can't create a contract")?;
+    let value = as_u256(&f[6].0, "value")?;
+    let data = Bytes::copy_from_slice(as_str(&f[7].0, "data")?);
+    let access_list = as_access_list(&f[8].0)?;
+    let Item::List(al) = f[9].0 else { return Err("rlp: authorization list should be a list".into()) };
+    let auth = list_items(al)?.iter().map(|(it, _)| decode_authorization(it)).collect::<Result<Vec<_>, _>>()?;
+    if auth.is_empty() {
+        return Err("type 4 tx with an empty authorization list".into());
+    }
+    let y = as_u64(&f[10].0, "yParity")?;
+    let r = as_u256(&f[11].0, "r")?;
+    let s = as_u256(&f[12].0, "s")?;
+    if y > 1 {
+        return Err("bad yParity".into());
+    }
+    let payload: Vec<u8> = f[..10].iter().flat_map(|(_, raw)| raw.iter().copied()).collect();
+    let mut enc = vec![0x04];
+    enc.extend(list_header(payload.len()));
+    enc.extend(payload);
+    let from = recover(&keccak256(&enc), r, s, y as u8)?;
+    Ok(DecodedTx { tx_type: 4, hash, from, to: Some(to), value, data, gas, nonce, chain_id: Some(chain_id), access_list, auth })
 }

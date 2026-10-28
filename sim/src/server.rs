@@ -25,9 +25,11 @@
 // ============================================================================
 use std::io::BufWriter;
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use revm::primitives::{Address, B256};
 use serde_json::{json, Value};
 
 use crate::arb::BlockCtx;
@@ -265,6 +267,8 @@ pub fn handle_tm(ctx: &Ctx, req: &Value, tm: &mut Tm) -> Value {
                 // The bot's "wanted" hint rides on its status poll (copy2-relist).
                 c.note_wanted(req.get("wanted"));
                 s["copy2"] = c.status_json(req.get("pools").and_then(|p| p.as_bool()).unwrap_or(false));
+                // (Oct 27) Why copy 2 trails the feed (copy2/lag.rs).
+                s["copy2Lag"] = crate::copy2::lag::status_json();
             }
             if let Value::Object(t) = crate::timing::status() {
                 for (k, v) in t {
@@ -272,6 +276,10 @@ pub fn handle_tm(ctx: &Ctx, req: &Value, tm: &mut Tm) -> Value {
                 }
             }
             s["feedStore"] = crate::check::feedstore::store().status_json();
+            // (Oct 27) What discovery's misses fetched (DiscoverFillBook).
+            if let Some(c) = &ctx.copy2 {
+                s["discoverFill"] = c.c2.discover_fill.lock().map(|b| b.json()).unwrap_or(Value::Null);
+            }
             // ZERO-ROUTES FIX (Oct 27): the candidate table as the sidecar
             // holds it, and over-size socket messages dropped.
             s["trigTable"] = crate::check::entry::status_json();
@@ -555,8 +563,65 @@ fn trig_inner(ctx: &Ctx, id: &Value, r: &CallRequest, feed_v: &Value, t0: Instan
     // V4 BLIND SPOT (Oct 25): write down hash inputs, so a miss can say
     // WHOSE PoolManager value it was (copy2/v4blind.rs). Not an assumption.
     assume.record_hashes = true;
+    // WARM HOT TARGETS (copy2/warm.rs): values copy 2 doesn't hold, from memory.
+    let (picked, prov, warm_used) = warm_apply(ctx, picked, prov, &plan);
     let run = |view: &dyn StateRead, _c: &BlockCtx| crate::check::proto_types::handle_trig_call_with(view, &plan, &info, r, prov.as_ref(), strict, &assume);
-    after_pick_with(ctx, picked, t0, tm, &run, false, core)
+    let a = after_pick_with(ctx, picked, t0, tm, &run, false, core);
+    warm_learn(ctx, &a, warm_used);
+    a
+}
+
+/// WARM HOT TARGETS (copy2/warm.rs, only when FASTLANE is not off): the
+/// question's copy version with the warm values added where copy 2 holds
+/// nothing, and the provenance that marks them not exact ("recent fill").
+/// A value whose contract a transaction BEFORE the trigger goes to is left
+/// out (unless stable). Never waits for the node.
+fn warm_apply(
+    ctx: &Ctx,
+    mut picked: crate::state::mirror::Picked,
+    prov: Arc<dyn crate::check::ordered::Provenance + Send + Sync>,
+    plan: &crate::check::ordered::OrderedPlan,
+) -> (crate::state::mirror::Picked, Arc<dyn crate::check::ordered::Provenance + Send + Sync>, bool) {
+    let Some(c) = &ctx.copy2 else { return (picked, prov, false) };
+    let mut w = c.c2.warm.lock().unwrap_or_else(|e| e.into_inner());
+    if !w.on() {
+        return (picked, prov, false);
+    }
+    let before: Vec<(u64, Option<Address>)> = plan
+        .msgs
+        .iter()
+        .flat_map(|m| m.txs.iter().map(move |t| (m.seq, t.to, t.hash)))
+        .take_while(|x| x.2 != plan.trigger)
+        .map(|(sq, to, _)| (sq, to))
+        .collect();
+    let trig_seq = plan.msgs.iter().find(|m| m.txs.iter().any(|t| t.hash == plan.trigger)).map_or(u64::MAX, |m| m.seq);
+    match w.layer(&picked.snap, c.c2.warm_now(), ctx.shared.cfg.l2_offset, trig_seq, &before) {
+        Some(l) => {
+            picked.snap = l.snap.clone();
+            (picked, Arc::new(crate::copy2::warm::WarmProv { inner: prov, layer: l }), true)
+        }
+        None => (picked, prov, false),
+    }
+}
+
+/// WARM HOT TARGETS: a fire-first miss teaches the recipe of the
+/// transaction it got stuck on (its target); an answer that used warm
+/// values is counted.
+fn warm_learn(ctx: &Ctx, a: &Value, used: bool) {
+    let Some(c) = &ctx.copy2 else { return };
+    let mut w = c.c2.warm.lock().unwrap_or_else(|e| e.into_inner());
+    if !w.on() {
+        return;
+    }
+    if used && a.get("ok") == Some(&Value::Bool(true)) {
+        w.stats.questions_used += 1;
+    }
+    if a.get("unknown").and_then(|u| u.as_str()) == Some("miss") {
+        let target = a.get("at").and_then(|x| x.get("to")).and_then(|t| t.as_str()).and_then(|t| crate::check::hexutil::parse_address(t).ok());
+        if let Some(t) = target {
+            w.learn(t, &parse_missing(a));
+        }
+    }
 }
 
 /// TRIGGER-FIRST ENTRY POINT: `{"type":"trig_discover", "at":{"after":"head"},
@@ -633,12 +698,17 @@ fn trig_discover_inner(ctx: &Ctx, id: &Value, req: &Value, t0: Instant, tm: &mut
         return json!({ "id": id, "ok": false, "unknown": "already_in_copy", "detail": "the copy version already holds the trigger", "us": t0.elapsed().as_micros() as u64 });
     };
     let block = picked.seq + sh.cfg.l2_offset;
+    // The trigger itself (its target: what the fill budget learns about,
+    // and what the self-only proof looks at).
+    let trig_dec: Option<crate::check::rawtx::DecodedTx> = alone.msgs.iter().flat_map(|m| m.txs.iter()).find(|t| t.hash == alone.trigger).cloned();
     // One registry summary for the whole question (checkcore.rs): the exact
     // values list and the moved-pool tables come from it, no registry lock.
     let t_core = Instant::now();
     let core = c2.core_for(picked.from.as_ref());
     tm.facts_us += t_core.elapsed().as_micros() as u64;
     let prov = crate::timing::ph_time("prov", || c2.provenance_with(&core, block, &[]));
+    // WARM HOT TARGETS (copy2/warm.rs): values copy 2 doesn't hold, from memory.
+    let (picked, prov, warm_used) = warm_apply(ctx, picked, prov, &plan);
     // Same assumptions as a trigger-first check (no skipping: only the
     // trigger runs, and the trigger is never skipped).
     let (strict, mut assume) = trig_assume(trig_trust(), &feed, |_| None);
@@ -670,10 +740,45 @@ fn trig_discover_inner(ctx: &Ctx, id: &Value, req: &Value, t0: Instant, tm: &mut
                     "conf": conf, "assumed": labels, "snapBlock": snap_block,
                 })
             }
-            Err(u) => crate::check::proto_types::unknown_json(id, &u, 0),
+            Err(u) => {
+                // (Oct 27, ARBSIM_DISCOVER_SELF_ONLY=1, off by default) SELF-
+                // ONLY TARGET PROOF (fastlane/replay_fetch.rs): the trigger
+                // calls a contract whose code can't reach any other contract
+                // and that isn't one of our pools / their coins / a
+                // PoolManager: it provably moves none of our pools, whatever
+                // values we lack. Only turns an "unknown" into "moved none".
+                if discover_self_only() {
+                    if let Some(d) = &trig_dec {
+                        if crate::fastlane::replay_fetch::proven_untouching(view, d, &|x| c2.followed_or_coin(&core, x)) {
+                            return json!({
+                                "id": id, "ok": true, "pools": [], "moved": [], "changed": 0, "triggerOk": null,
+                                "conf": "high", "assumed": ["proven_no_touch"], "provenNoTouch": true, "snapBlock": snap_block,
+                            });
+                        }
+                    }
+                }
+                crate::check::proto_types::unknown_json(id, &u, 0)
+            }
         }
     };
     let mut a = after_pick_with(ctx, picked, t0, tm, &run, false, Some(core.clone()));
+    warm_learn(ctx, &a, warm_used);
+    // (Oct 27) The fill budget learns which targets move our pools (copy 2's
+    // reports tell for the unknown ones, a few seconds later).
+    let trig_target = trig_dec.as_ref().and_then(|d| d.to);
+    if let Some(t) = trig_target {
+        let moved = (a.get("ok") == Some(&Value::Bool(true))).then(|| a["pools"].as_array().is_some_and(|p| !p.is_empty()));
+        let now = Instant::now();
+        if let Ok(mut b) = c2.c2.discover_fill.lock() {
+            if a.get("provenNoTouch").is_some() {
+                b.self_only_answers += 1;
+            }
+            b.note_answer(t, alone.trigger, moved, now);
+            if let Ok(rm) = c2.c2.recent_moves.lock() {
+                b.resolve(now, |h| rm.pools_of(h).is_some_and(|p| !p.is_empty()));
+            }
+        }
+    }
     // DISCOVER LEARNS (Oct 24, live: 69% of looked-at feed transactions
     // answered "miss" here, and a miss was never fetched, so every trade
     // through a router / aggregator whose code or values copy 2 doesn't hold
@@ -684,17 +789,259 @@ fn trig_discover_inner(ctx: &Ctx, id: &Value, req: &Value, t0: Instant, tm: &mut
     // out pool loads: ARBSIM_DISCOVER_FILL_MAX_ITEMS (16) per miss,
     // ARBSIM_DISCOVER_FILL_PER_S (60) items a second over all questions
     // (0 = off, as before).
-    if a.get("unknown").and_then(|u| u.as_str()) == Some("miss") {
+    // (Oct 27) Each item at most once per ARBSIM_DISCOVER_FILL_REPEAT_S and
+    // at most ARBSIM_DISCOVER_FILL_PER_HOUR items an hour (DiscoverFillBook),
+    // counted in status "discoverFill".
+    // A hot target the warm keeper handles (copy2/warm.rs) is not fetched here too.
+    let warm_hot = trig_target.is_some_and(|t| c2.c2.warm.lock().map(|w| w.on() && w.is_hot(&t)).unwrap_or(false));
+    if !warm_hot && a.get("unknown").and_then(|u| u.as_str()) == Some("miss") {
         let missing = parse_missing(&a);
-        if !missing.is_empty() && missing.len() <= env_u64("ARBSIM_DISCOVER_FILL_MAX_ITEMS", 16) as usize && discover_fill_take(missing.len()) {
-            c2.note_misses(&missing);
-            crate::timing::ph_add("discFill", missing.len() as u64);
-            ctx.fill(missing);
+        let max_items = env_u64("ARBSIM_DISCOVER_FILL_MAX_ITEMS", 16) as usize;
+        let book = &c2.c2.discover_fill;
+        let fresh = book.lock().map(|mut b| b.offer_for(trig_target, &missing, max_items, Instant::now())).unwrap_or_default();
+        if !fresh.is_empty() && discover_fill_take(fresh.len()) {
+            if let Ok(mut b) = book.lock() {
+                b.taken(&fresh, Instant::now());
+            }
+            c2.note_misses(&fresh);
+            crate::timing::ph_add("discFill", fresh.len() as u64);
+            ctx.fill(fresh);
+        } else if !fresh.is_empty() {
+            if let Ok(mut b) = book.lock() {
+                b.paced += fresh.len() as u64;
+            }
         }
     }
     a["us"] = json!(t0.elapsed().as_micros() as u64);
     a
 }
+
+/// ARBSIM_DISCOVER_SELF_ONLY=1: discovery's self-only target proof (see
+/// trig_discover_inner). Off by default until a server replay
+/// (`arbsim trig-replay`, SELF-ONLY TARGETS) shows it is worth it.
+fn discover_self_only() -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    // 0 = not read yet, 1 = off, 2 = on.
+    match DISCOVER_SELF_ONLY.load(Relaxed) {
+        0 => {
+            let on = env_u64("ARBSIM_DISCOVER_SELF_ONLY", 0) == 1;
+            DISCOVER_SELF_ONLY.store(if on { 2 } else { 1 }, Relaxed);
+            on
+        }
+        v => v == 2,
+    }
+}
+static DISCOVER_SELF_ONLY: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Tests: switch the self-only proof on / off (overrides the setting).
+pub fn set_discover_self_only(on: bool) {
+    DISCOVER_SELF_ONLY.store(if on { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// DISCOVER LEARNS budget (Oct 27): what discovery's misses may fetch
+/// (one per copy 2, kept in its shared state: C2Shared.discover_fill).
+/// Plain English: a miss of a few items (a router's code, a coin's setting)
+/// is worth fetching once: the next trade through it can then be replayed.
+/// But the same item missed again and again is usually a value that keeps
+/// changing (a bot's own counters / balances: copy 2 forgets a changed
+/// fill), and fetching it each time costs a node request per trigger for
+/// nothing. So:
+///   - an item is fetched at most once per ARBSIM_DISCOVER_FILL_REPEAT_S
+///     [600] (remembered: at most REMEMBER items, oldest forgotten first);
+///   - at most ARBSIM_DISCOVER_FILL_PER_HOUR [3600] items an hour, a hard
+///     cap (0 = no fetching at all), on top of the per-second pace below;
+///   - more than ARBSIM_DISCOVER_FILL_MAX_ITEMS [16] items in one miss:
+///     probably not a swap at all, nothing fetched (as before).
+///   - (Oct 27, round 2) TARGETS THAT MOVE OUR POOLS FIRST. The book learns,
+///     per target contract, how many of its feed transactions discovery
+///     was asked about and how many copy 2's own pool reports later showed
+///     moving one of our pools ("hot"). A hot target's misses may use the
+///     whole hourly cap. Any other target's ("cold") may use only
+///     ARBSIM_DISCOVER_FILL_COLD_PCT [50] % of it, and once a cold target
+///     has been asked about ARBSIM_DISCOVER_FILL_COLD_AFTER [20] times
+///     without ever moving our pools, its misses aren't fetched at all
+///     (until a report shows it moving one: then it is hot). This only
+///     decides what is FETCHED; it never changes an answer.
+/// Counted (status "discoverFill"): offered, fetched, refused as repeats /
+/// over the hour cap / too many / paced / cold. One item = about one node request
+/// (an account's code + basics, or one value); see copy2 nodeRequests.
+#[derive(Default)]
+pub struct DiscoverFillBook {
+    pub per_hour: u64,
+    pub repeat_s: u64,
+    hour_start: Option<Instant>,
+    pub hour_used: u64,
+    sent: HashMap<crate::state::MissItem, Instant>,
+    order: std::collections::VecDeque<crate::state::MissItem>,
+    pub offered: u64,
+    pub fetched: u64,
+    pub repeats: u64,
+    pub over_cap: u64,
+    pub too_many: u64,
+    pub paced: u64,
+    /// Share of the hourly cap a cold target may use (percent).
+    pub cold_pct: u64,
+    /// Asked this many times with no move: a cold target's misses aren't fetched.
+    pub cold_after: u64,
+    /// Target contract -> (asked, moved our pools, last seen).
+    targets: HashMap<Address, (u64, u64, Instant)>,
+    /// Misses waiting for copy 2's reports: (trigger hash, target, when).
+    pending: std::collections::VecDeque<(B256, Address, Instant)>,
+    pub refused_cold: u64,
+    pub over_cap_cold: u64,
+    /// (ARBSIM_DISCOVER_SELF_ONLY) unknowns answered "moved none" by the
+    /// self-only target proof (fastlane/replay_fetch.rs proven_untouching).
+    pub self_only_answers: u64,
+}
+
+impl DiscoverFillBook {
+    pub const REMEMBER: usize = 20_000;
+    /// Targets remembered (least recently seen forgotten first).
+    pub const TARGETS: usize = 20_000;
+    /// A miss's trigger is looked up in copy 2's reports after this long...
+    pub const REPORT_AFTER: std::time::Duration = std::time::Duration::from_secs(3);
+    /// ...and given up on (counted as "moved none") after this long.
+    pub const REPORT_GIVE_UP: std::time::Duration = std::time::Duration::from_secs(60);
+
+    pub fn new(per_hour: u64, repeat_s: u64) -> Self {
+        DiscoverFillBook { per_hour, repeat_s, cold_pct: 50, cold_after: 20, ..Default::default() }
+    }
+
+    /// The hot targets, most moves first (at most `n`): copy2/warm.rs keeps
+    /// their values warm.
+    pub fn hot_list(&self, n: usize) -> Vec<Address> {
+        let mut v: Vec<(&Address, &(u64, u64, Instant))> = self.targets.iter().filter(|(_, x)| x.1 > 0).collect();
+        v.sort_by(|a, b| b.1 .1.cmp(&a.1 .1).then(a.0.cmp(b.0)));
+        v.into_iter().take(n).map(|(a, _)| *a).collect()
+    }
+
+    /// A target is "hot": a report showed one of its transactions moving our pools.
+    pub fn hot(&self, t: &Address) -> bool {
+        self.targets.get(t).is_some_and(|x| x.1 > 0)
+    }
+
+    /// Discovery answered about a transaction to `target`: `moved` Some(true)
+    /// = it moved our pools (answered), Some(false) = moved none (answered),
+    /// None = unknown (copy 2's reports will tell, see resolve).
+    pub fn note_answer(&mut self, target: Address, trigger: B256, moved: Option<bool>, now: Instant) {
+        let e = self.targets.entry(target).or_insert((0, 0, now));
+        e.0 += 1;
+        e.2 = now;
+        match moved {
+            Some(true) => e.1 += 1,
+            Some(false) => {}
+            None => {
+                self.pending.push_back((trigger, target, now));
+                while self.pending.len() > 4096 {
+                    self.pending.pop_front();
+                }
+            }
+        }
+        if self.targets.len() > Self::TARGETS {
+            if let Some(old) = self.targets.iter().min_by_key(|(_, v)| v.2).map(|(k, _)| *k) {
+                self.targets.remove(&old);
+            }
+        }
+    }
+
+    /// Look the waiting misses up in copy 2's reports (`moved_of`: did the
+    /// report of that transaction show one of our pools moving?).
+    pub fn resolve(&mut self, now: Instant, moved_of: impl Fn(&B256) -> bool) {
+        while let Some((h, t, at)) = self.pending.front().copied() {
+            let age = now.saturating_duration_since(at);
+            if age < Self::REPORT_AFTER {
+                break;
+            }
+            if moved_of(&h) {
+                if let Some(e) = self.targets.get_mut(&t) {
+                    e.1 += 1;
+                }
+            } else if age < Self::REPORT_GIVE_UP {
+                break;
+            }
+            self.pending.pop_front();
+        }
+    }
+
+    /// With the settings from the environment (one per copy 2: copy2/intake.rs).
+    pub fn from_env() -> Self {
+        let mut b = DiscoverFillBook::new(env_u64("ARBSIM_DISCOVER_FILL_PER_HOUR", 3600), env_u64("ARBSIM_DISCOVER_FILL_REPEAT_S", 600));
+        b.cold_pct = env_u64("ARBSIM_DISCOVER_FILL_COLD_PCT", 50).min(100);
+        b.cold_after = env_u64("ARBSIM_DISCOVER_FILL_COLD_AFTER", 20).max(1);
+        b
+    }
+
+    /// The items of one miss that may be fetched now (the rest counted).
+    /// `target`: the transaction's target contract (None = unknown: cold).
+    pub fn offer(&mut self, items: &[crate::state::MissItem], max_items: usize, now: Instant) -> Vec<crate::state::MissItem> {
+        self.offer_for(None, items, max_items, now)
+    }
+
+    pub fn offer_for(&mut self, target: Option<Address>, items: &[crate::state::MissItem], max_items: usize, now: Instant) -> Vec<crate::state::MissItem> {
+        if items.is_empty() {
+            return Vec::new();
+        }
+        self.offered += items.len() as u64;
+        if items.len() > max_items {
+            self.too_many += items.len() as u64;
+            return Vec::new();
+        }
+        if self.hour_start.is_none_or(|h| now.saturating_duration_since(h) >= std::time::Duration::from_secs(3600)) {
+            self.hour_start = Some(now);
+            self.hour_used = 0;
+        }
+        let wait = std::time::Duration::from_secs(self.repeat_s);
+        let fresh: Vec<crate::state::MissItem> = items.iter().filter(|m| self.sent.get(*m).is_none_or(|t| now.saturating_duration_since(*t) >= wait)).cloned().collect();
+        self.repeats += (items.len() - fresh.len()) as u64;
+        if fresh.is_empty() {
+            return fresh;
+        }
+        if self.hour_used + fresh.len() as u64 > self.per_hour {
+            self.over_cap += fresh.len() as u64;
+            return Vec::new();
+        }
+        // TARGETS THAT MOVE OUR POOLS FIRST (see above).
+        if !target.is_some_and(|t| self.hot(&t)) {
+            if target.and_then(|t| self.targets.get(&t)).is_some_and(|x| x.1 == 0 && x.0 >= self.cold_after) {
+                self.refused_cold += fresh.len() as u64;
+                return Vec::new();
+            }
+            if (self.hour_used + fresh.len() as u64) * 100 > self.per_hour * self.cold_pct {
+                self.over_cap_cold += fresh.len() as u64;
+                return Vec::new();
+            }
+        }
+        fresh
+    }
+
+    /// These items were handed to the fetcher.
+    pub fn taken(&mut self, items: &[crate::state::MissItem], now: Instant) {
+        self.hour_used += items.len() as u64;
+        self.fetched += items.len() as u64;
+        for m in items {
+            if self.sent.insert(m.clone(), now).is_none() {
+                self.order.push_back(m.clone());
+            }
+        }
+        while self.order.len() > Self::REMEMBER {
+            if let Some(old) = self.order.pop_front() {
+                self.sent.remove(&old);
+            }
+        }
+    }
+
+    pub fn json(&self) -> Value {
+        let mut hot: Vec<(&Address, &(u64, u64, Instant))> = self.targets.iter().filter(|(_, v)| v.1 > 0).collect();
+        hot.sort_by(|a, b| b.1 .1.cmp(&a.1 .1).then(a.0.cmp(b.0)));
+        let cold_closed = self.targets.values().filter(|v| v.1 == 0 && v.0 >= self.cold_after).count();
+        json!({"perHour": self.per_hour, "repeatS": self.repeat_s, "hourUsed": self.hour_used, "offered": self.offered, "fetched": self.fetched,
+            "refusedRepeat": self.repeats, "refusedHourCap": self.over_cap, "refusedTooMany": self.too_many, "paced": self.paced, "remembered": self.sent.len(),
+            "coldPct": self.cold_pct, "coldAfter": self.cold_after, "targets": self.targets.len(), "hotTargets": hot.len(), "coldClosedTargets": cold_closed,
+            "refusedCold": self.refused_cold, "refusedColdShare": self.over_cap_cold, "waitingForReports": self.pending.len(), "selfOnlyAnswers": self.self_only_answers,
+            "topHot": hot.iter().take(5).map(|(a, v)| json!([format!("{a:#x}"), v.0, v.1])).collect::<Vec<_>>()})
+    }
+}
+
 
 /// DISCOVER LEARNS pacing: a token bucket of ARBSIM_DISCOVER_FILL_PER_S
 /// items a second (bursts up to 2 s worth). true = these `n` items may be
@@ -882,8 +1229,12 @@ pub fn trig_assume(trust: TrigTrust, feed: &crate::check::ordered::WireFeed, rou
         return (false, Assume::default());
     }
     let allow = |k: &str| feed.assume.as_ref().is_none_or(|l| l.iter().any(|x| x.trim() == k));
-    let skip = if allow("skip") && !feed.route.is_empty() { route_of(&feed.route) } else { None };
-    (true, Assume { sender_funds: allow("sender_funds"), recent_fill: allow("recent_fill"), skip, record_hashes: false })
+    // (Oct 27) PROVEN SKIPPING: only when asked for by name (the fast lane's
+    // trigger path, FASTLANE_TRIG_SKIP=proven); the bot never sends it, so
+    // its questions are answered exactly as before. It replaces "skip".
+    let proven_skip = feed.assume.as_ref().is_some_and(|l| l.iter().any(|x| x.trim() == "skip_proven"));
+    let skip = if !proven_skip && allow("skip") && !feed.route.is_empty() { route_of(&feed.route) } else { None };
+    (true, Assume { sender_funds: allow("sender_funds"), recent_fill: allow("recent_fill"), skip, record_hashes: false, proven_skip })
 }
 
 /// Accounts a request gives contract code by override (the test contract).
@@ -1479,5 +1830,89 @@ mod tests {
         assert_eq!(same_but_gas(&s1, &s2).unwrap(), s1);
         let s3 = json!({"ok": true, "best": null, "tried": []});
         assert!(same_but_gas(&s1, &s3).is_none());
+    }
+
+    // DISCOVER LEARNS budget: one fetch per item per repeat window, a hard
+    // hourly cap, too-big misses never fetched; all counted.
+    #[test]
+    fn discover_fill_book_fetches_each_item_once_within_the_hour_cap() {
+        use super::DiscoverFillBook;
+        use crate::state::MissItem;
+        use std::time::{Duration, Instant};
+        use revm::primitives::{Address, U256};
+        let t0 = Instant::now();
+        let mut b = DiscoverFillBook::new(3, 600);
+        b.cold_pct = 100; // the hot / cold split: next test
+        let a = Address::with_last_byte(1);
+        let one = vec![MissItem::Account(a), MissItem::Slot(a, U256::from(1u8))];
+        let got = b.offer(&one, 16, t0);
+        assert_eq!(got, one);
+        b.taken(&got, t0);
+        // The same items again within 10 minutes: refused as repeats.
+        assert!(b.offer(&one, 16, t0 + Duration::from_secs(60)).is_empty());
+        assert_eq!(b.repeats, 2);
+        // Two new items would make 4 > 3 this hour: refused (hard cap).
+        let two = vec![MissItem::Slot(a, U256::from(2u8)), MissItem::Slot(a, U256::from(3u8))];
+        assert!(b.offer(&two, 16, t0 + Duration::from_secs(61)).is_empty());
+        assert_eq!(b.over_cap, 2);
+        // Too many in one miss: never fetched.
+        let many: Vec<MissItem> = (0..17u8).map(|i| MissItem::Slot(a, U256::from(i))).collect();
+        assert!(b.offer(&many, 16, t0).is_empty());
+        assert_eq!(b.too_many, 17);
+        // A new hour, and past the repeat window: allowed again.
+        let later = t0 + Duration::from_secs(3_601);
+        assert_eq!(b.offer(&one, 16, later), one);
+        assert_eq!(b.offer(&two, 16, later), two);
+        let j = b.json();
+        assert_eq!((j["fetched"].clone(), j["offered"].clone()), (json!(2), json!(27)), "{j}");
+        // 0 an hour = nothing fetched.
+        let mut off = DiscoverFillBook::new(0, 600);
+        assert!(off.offer(&one, 16, t0).is_empty());
+    }
+
+    // TARGETS THAT MOVE OUR POOLS FIRST: a cold target gets half the hourly
+    // cap and is closed after COLD_AFTER asks with no move; a target whose
+    // transaction copy 2's reports later show moving our pools is hot and
+    // gets the whole cap.
+    #[test]
+    fn discover_fill_book_prefers_targets_that_moved_our_pools() {
+        use super::DiscoverFillBook;
+        use crate::state::MissItem;
+        use revm::primitives::{Address, B256, U256};
+        use std::time::{Duration, Instant};
+        let t0 = Instant::now();
+        let mut b = DiscoverFillBook::new(10, 600);
+        b.cold_after = 3;
+        let (hot, cold) = (Address::with_last_byte(0xa), Address::with_last_byte(0xb));
+        let item = |i: u8| MissItem::Slot(Address::with_last_byte(0xc), U256::from(i));
+        // A miss on `hot`'s transaction h1; the report (3+ s later) shows it moved our pools.
+        let h1 = B256::with_last_byte(1);
+        b.note_answer(hot, h1, None, t0);
+        b.resolve(t0 + Duration::from_secs(1), |h| *h == h1);
+        assert!(!b.hot(&hot), "too early to look");
+        b.resolve(t0 + Duration::from_secs(4), |h| *h == h1);
+        assert!(b.hot(&hot));
+        // Cold: at most 50% of 10 = 5 items an hour.
+        b.note_answer(cold, B256::with_last_byte(2), None, t0);
+        let got = b.offer_for(Some(cold), &[item(1), item(2), item(3), item(4), item(5)], 16, t0);
+        assert_eq!(got.len(), 5);
+        b.taken(&got, t0);
+        assert!(b.offer_for(Some(cold), &[item(6)], 16, t0).is_empty());
+        assert_eq!(b.over_cap_cold, 1);
+        // Hot: the rest of the cap.
+        let got = b.offer_for(Some(hot), &[item(7), item(8), item(9)], 16, t0);
+        assert_eq!(got.len(), 3);
+        b.taken(&got, t0);
+        // A report never shows `cold` moving our pools: after 60 s its misses
+        // count as "moved none"; at COLD_AFTER asks it is closed.
+        b.note_answer(cold, B256::with_last_byte(3), Some(false), t0);
+        b.note_answer(cold, B256::with_last_byte(4), None, t0);
+        b.resolve(t0 + Duration::from_secs(61), |_| false);
+        let later = t0 + Duration::from_secs(3_601);
+        assert!(b.offer_for(Some(cold), &[item(20)], 16, later).is_empty());
+        assert_eq!(b.refused_cold, 1);
+        assert!(!b.offer_for(Some(hot), &[item(21)], 16, later).is_empty(), "hot is never closed");
+        let j = b.json();
+        assert_eq!((j["hotTargets"].clone(), j["coldClosedTargets"].clone(), j["waitingForReports"].clone()), (json!(1), json!(1), json!(0)), "{j}");
     }
 }

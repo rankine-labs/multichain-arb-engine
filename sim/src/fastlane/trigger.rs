@@ -68,6 +68,19 @@
 //     TRIG_FIRST_MAX_MSGS [48], TRIG_FIRST_STRICT [0],
 //     TRIG_FIRST_ASSUME [sender_funds,recent_fill,skip],
 //     FASTLANE_MIN_NET_USD / MIN_EXEC_NET_USD [0.25], MAX_PLAUSIBLE_PROFIT_SHARE [0.25]
+//     FASTLANE_TRIG_SKIP        [proven] how feed transactions we can't run
+//                               are treated when TRIG_FIRST_ASSUME allows
+//                               "skip": proven = left out ONLY when provably
+//                               unrelated (check/ordered.rs PROVEN SKIPPING;
+//                               otherwise the route is unknown, and any revert
+//                               after reading an assumed sender value is
+//                               unknown too); bot = the bot's best-effort
+//                               rules (skipped_unrelated / skipped_related)
+//   (Oct 27) Every "unknown" is also counted by WHERE it came from (the
+//   trigger, a transaction replayed only because copy 2 lags, the
+//   trigger's own block, a later one) and by target contract + the role of
+//   the first missing item (fastlane/coverage.rs): status
+//   "fastlane.trigger.unknownWhere" / "unknownTop".
 //   Only when FASTLANE is practice / live (nothing runs when off). One
 //   thread, lower CPU priority (FASTLANE_NICE, default 10), a bounded queue
 //   of 64 messages (newest kept: an old message is useless).
@@ -103,6 +116,9 @@ pub struct TrigCfg {
     pub max_msgs: u64,
     pub strict: bool,
     pub assume: Vec<String>,
+    /// FASTLANE_TRIG_SKIP: true = proven skipping (default), false = the
+    /// bot's best-effort skipping rules.
+    pub proven_skip: bool,
     pub min_net_usd: f64,
     pub max_plausible_share: f64,
     pub l2_offset: u64,
@@ -125,6 +141,7 @@ impl Default for TrigCfg {
             max_msgs: 48,
             strict: false,
             assume: vec!["sender_funds".into(), "recent_fill".into(), "skip".into()],
+            proven_skip: true,
             min_net_usd: BOT_MIN_NET_USD,
             max_plausible_share: 0.25,
             l2_offset: 0,
@@ -134,6 +151,13 @@ impl Default for TrigCfg {
 }
 
 impl TrigCfg {
+    /// The assumptions a question names (`feed.assume`): the bot's list,
+    /// with "skip" turned into "skip_proven" in proven mode (server.rs
+    /// trig_assume: proven skipping, the best-effort rules off).
+    pub fn feed_assume(&self) -> Vec<String> {
+        self.assume.iter().map(|a| if a == "skip" && self.proven_skip { "skip_proven".to_string() } else { a.clone() }).collect()
+    }
+
     /// From any key -> value lookup. Bad values fall back to the default.
     pub fn from_lookup(get: &dyn Fn(&str) -> Option<String>) -> TrigCfg {
         let d = TrigCfg::default();
@@ -163,6 +187,7 @@ impl TrigCfg {
             max_msgs: num("TRIG_FIRST_MAX_MSGS").filter(|v| *v >= 2.0).map(|v| v.round() as u64).unwrap_or(d.max_msgs),
             strict,
             assume: if strict { Vec::new() } else { assume },
+            proven_skip: !matches!(get("FASTLANE_TRIG_SKIP").map(|v| v.trim().to_ascii_lowercase()).as_deref(), Some("bot" | "best" | "heuristic")),
             min_net_usd: min_net,
             max_plausible_share: num("MAX_PLAUSIBLE_PROFIT_SHARE").filter(|v| *v > 0.0).unwrap_or(d.max_plausible_share),
             l2_offset: num("ARBSIM_L2_BLOCK_OFFSET").filter(|v| *v >= 0.0).map(|v| v as u64).unwrap_or(0),
@@ -317,6 +342,11 @@ pub struct TrigHour {
     pub ready_us: Vec<u64>,
     /// Per feed message, all of its work (us).
     pub msg_us: Vec<u64>,
+    /// (Oct 27) Every unknown (discovery and candidate checks) by
+    /// "where|reason" and by "reason|where|target|first missing item"
+    /// (fastlane/coverage.rs). Bounded.
+    pub unknown_where: super::coverage::Tally,
+    pub unknown_top: super::coverage::Tally,
 }
 
 fn push(v: &mut Vec<u64>, x: u64) {
@@ -348,6 +378,7 @@ impl TrigHour {
             "fired": self.fired, "wouldSend": self.would_send, "liveSent": self.live_sent, "blocked": self.blocked,
             "gunRefused": self.gun_refused, "notLeft": self.not_left, "repeats": self.repeats,
             "queueUs": pctl(&self.queue_us), "decideUs": pctl(&self.decide_us), "readyUs": pctl(&self.ready_us), "msgUs": pctl(&self.msg_us),
+            "unknownWhere": self.unknown_where.json(24), "unknownTop": self.unknown_top.json(20),
             "timesNote": "inside arbsim, from the moment the feed message reached it; excludes sequencer -> bot -> arbsim delivery and block inclusion",
         })
     }
@@ -355,8 +386,9 @@ impl TrigHour {
     pub fn line(&self) -> String {
         let p = |v: &[u64], k: &str| pctl(v).get(k).and_then(|x| x.as_u64()).map(|x| x.to_string()).unwrap_or_else(|| "-".into());
         format!(
-            "[fastlane trigger] (last hour) feed msgs {} (late {}, no copy {}, queue full {}) | txs {} skipped [{}] cut {} | asked {}: moved our pools {}, none {}, too many {}, unknown [{}] | no table {} no candidates {} | routes checked {}: sure {}, unknown [{}], good {} (not a trade [{}]) | fired {}: would send {}, live sent {}, safety blocked [{}], gun refused {}, never left {} | repeats {} | us inside arbsim: queue p50 {} p90 {} | decision p50 {} p90 {} p99 {} | ready-to-send p50 {} p90 {} p99 {}",
+            "[fastlane trigger] (last hour) feed msgs {} (late {}, no copy {}, queue full {}) | txs {} skipped [{}] cut {} | asked {}: moved our pools {}, none {}, too many {}, unknown [{}] (where [{}]) | no table {} no candidates {} | routes checked {}: sure {}, unknown [{}], good {} (not a trade [{}]) | fired {}: would send {}, live sent {}, safety blocked [{}], gun refused {}, never left {} | repeats {} | us inside arbsim: queue p50 {} p90 {} | decision p50 {} p90 {} p99 {} | ready-to-send p50 {} p90 {} p99 {}",
             self.msgs, self.msgs_late, self.msgs_no_copy, self.queue_dropped, self.txs, top(&self.skipped, 5), self.cut, self.asked, self.moved, self.no_pools, self.too_many_pools, top(&self.disc_unknown, 5),
+            self.unknown_where.top(6).into_iter().map(|(k, c)| format!("{k}:{c}")).collect::<Vec<_>>().join(" "),
             self.no_table, self.no_candidates, self.routes_checked, self.answers_sure, top(&self.answer_unknown, 5), self.good, top(&self.not_trade, 4),
             self.fired, self.would_send, self.live_sent, top(&self.blocked, 5), self.gun_refused.values().sum::<u64>(), self.not_left, self.repeats,
             p(&self.queue_us, "p50"), p(&self.queue_us, "p90"), p(&self.decide_us, "p50"), p(&self.decide_us, "p90"), p(&self.decide_us, "p99"),
@@ -480,7 +512,7 @@ impl Trigger {
         let refs = crate::check::feedstore::store().refs_range(from, newest);
         let feed = json!({
             "trigger": format!("{hash:#x}"), "triggerSeq": seq, "refs": refs,
-            "route": [], "strict": self.cfg.strict, "assume": self.cfg.assume,
+            "route": [], "strict": self.cfg.strict, "assume": self.cfg.feed_assume(),
         });
         let req = json!({
             "type": "trig_entry", "at": {"after": "head"}, "feed": feed, "limit": self.cfg.max_candidates,
@@ -491,6 +523,14 @@ impl Trigger {
         self.decide(&ans, run, seq, arrived)
     }
 
+    /// Count one unknown answer by where it came from and what it missed
+    /// (fastlane/coverage.rs). `stage`: discover / check.
+    fn attribute(&mut self, stage: &str, a: &Value, trigger_seq: u64) {
+        let (reason, place, to, first) = super::coverage::attribute_json(a, trigger_seq);
+        self.hour.unknown_where.add(format!("{stage}|{place}|{reason}"));
+        self.hour.unknown_top.add(format!("{reason}|{place}|to {}|{}", to.as_deref().unwrap_or("-"), first.as_deref().unwrap_or("-")));
+    }
+
     /// From the one-trip answer to a fire (separate so tests can hand it an
     /// answer). Counts everything.
     pub fn decide(&mut self, ans: &Value, run: Option<EntryRun>, seq: u64, arrived: Instant) -> TrigOutcome {
@@ -498,6 +538,7 @@ impl Trigger {
         if disc.get("ok") != Some(&Value::Bool(true)) {
             let why = disc.get("unknown").and_then(|u| u.as_str()).or_else(|| ans.get("unknown").and_then(|u| u.as_str())).unwrap_or("error").to_string();
             *self.hour.disc_unknown.entry(why.clone()).or_default() += 1;
+            self.attribute("discover", disc, seq);
             return TrigOutcome::DiscoverUnknown(why);
         }
         let Some(run) = run else {
@@ -535,6 +576,7 @@ impl Trigger {
             } else {
                 let why = a.get("unknown").and_then(|u| u.as_str()).unwrap_or("error").to_string();
                 *self.hour.answer_unknown.entry(why).or_default() += 1;
+                self.attribute("check", a, seq);
             }
             if c.good && good.is_none() {
                 good = Some(c);
@@ -721,7 +763,7 @@ mod tests {
     fn quick_skip_is_the_bots() {
         use crate::check::rawtx::DecodedTx;
         use revm::primitives::U256;
-        let tx = |to: Option<Address>, data: &[u8], from: Address| DecodedTx { tx_type: 2, hash: Default::default(), from, to, value: U256::ZERO, data: data.to_vec().into(), gas: 1, nonce: 0, chain_id: None, access_list: vec![] };
+        let tx = |to: Option<Address>, data: &[u8], from: Address| DecodedTx { tx_type: 2, hash: Default::default(), from, to, value: U256::ZERO, data: data.to_vec().into(), gas: 1, nonce: 0, chain_id: None, access_list: vec![], auth: vec![] };
         let me = Address::with_last_byte(1);
         let router = Address::with_last_byte(2);
         assert_eq!(quick_skip(&tx(None, &[1, 2, 3, 4], Address::ZERO), &[me]), Some("create"));

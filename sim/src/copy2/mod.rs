@@ -34,6 +34,8 @@ pub mod coins;
 pub mod fields;
 // The thread that applies each block's events and publishes versions (A).
 pub mod intake;
+// Why copy 2 trails the feed: feed -> report -> queue -> publish times (status copy2Lag).
+pub mod lag;
 // FAST LANE A: the predicted copy (copy 2 + the feed messages after it).
 // Runs only with FASTLANE=practice|live.
 pub mod ahead;
@@ -54,6 +56,7 @@ pub mod walk;
 // Whose PoolManager value a check missed; far ticks of our V4 pools kept;
 // V4 pools checks keep running into listed for auto-follow (Oct 25).
 pub mod v4blind;
+pub mod warm;
 
 /// Which kind of pool (decides how its events are applied).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

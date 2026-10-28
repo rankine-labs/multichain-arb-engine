@@ -34,7 +34,7 @@ fn arg(args: &[String], name: &str) -> Option<String> {
 }
 
 /// Read KEY=VALUE lines of ./.env for keys not already set.
-fn load_dotenv() {
+pub(crate) fn load_dotenv() {
     let Ok(t) = std::fs::read_to_string(".env") else { return };
     for l in t.lines() {
         let l = l.trim().trim_start_matches("export ").trim();

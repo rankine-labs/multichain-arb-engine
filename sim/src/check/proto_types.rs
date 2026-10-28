@@ -211,6 +211,11 @@ pub fn unknown_json(id: &Value, u: &CheckUnknown, us: u128) -> Value {
         "missing": u.missing.iter().map(miss_json).collect::<Vec<_>>(),
         "us": us as u64,
     });
+    // (Oct 27) Trigger-first: the replayed feed transaction it got stuck on
+    // (status / trig-replay tell the trigger from a lag-replayed one).
+    if let Some(at) = &u.at {
+        v["at"] = at.json();
+    }
     if !u.pre.is_empty() {
         v["missingPre"] = serde_json::json!(u.pre.iter().map(|(h, a, b)| [format!("{h:#x}"), format!("{a:#x}"), format!("{b:#x}")]).collect::<Vec<_>>());
     }
