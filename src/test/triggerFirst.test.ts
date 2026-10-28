@@ -237,7 +237,14 @@ async function main() {
       assert(rpcCalls.length === 0, `no RPC provider / network request at all (${rpcCalls.join(', ') || 'none'})`);
       // The log line: written after the answer, with timing and the later
       // same-block re-check (report-based copy 2, no feed).
-      await sleep(80);
+      // The same-block re-check runs in the background. Wait for its answer
+      // (up to 3 s) instead of a fixed 80 ms: on the busy live server the
+      // fixed wait was too short and this test blocked a deploy (Oct 28).
+      for (let waited = 0; waited < 3_000; waited += 20) {
+        const r = (tf as any).recs?.get(q.triggerHash.toLowerCase());
+        if (r && r.agree !== undefined) break;
+        await sleep(20);
+      }
       tf.finish(q.triggerHash.toLowerCase());
       await log.flush();
       const lines = existsSync(file) ? readFileSync(file, 'utf8').trim().split('\n').map((l) => JSON.parse(l)) : [];
