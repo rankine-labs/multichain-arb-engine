@@ -56,6 +56,7 @@ pub mod walk;
 // Whose PoolManager value a check missed; far ticks of our V4 pools kept;
 // V4 pools checks keep running into listed for auto-follow (Oct 25).
 pub mod v4blind;
+pub mod warm;
 
 /// Which kind of pool (decides how its events are applied).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

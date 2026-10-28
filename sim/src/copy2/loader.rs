@@ -901,7 +901,7 @@ pub fn catch_up(node: &dyn NodeApi, from: u64, to: u64, filters: &[Value], range
     Ok(out)
 }
 
-fn count_calls(items: &[MissItem], calls: &[(Address, Bytes)]) -> u64 {
+pub(crate) fn count_calls(items: &[MissItem], calls: &[(Address, Bytes)]) -> u64 {
     if NO_PROOF.load(Ordering::Relaxed) {
         let i: u64 = items
             .iter()

@@ -4042,3 +4042,212 @@ fn fastlane_trig_replay_fetch_explains_wrong_by_own_position() {
     // couldn't have held it with no fetch.
     assert_eq!(wc["curve"][0]["noFetchAtDecisionPct"]["strict"], json!(0.0), "{wc}");
 }
+
+// ---------------------------------------------------------------------------
+// WARM HOT TARGETS (Oct 27, copy2/warm.rs) through the server.
+// ---------------------------------------------------------------------------
+
+/// A router that forwards its call data to our pool V2P only when its own
+/// flag (slot 0) is set; on the chain the flag is 1. Copy 2 holds nothing
+/// of it. Returns (rig, ctx, router, current block).
+fn warm_world(cfg: Option<arbsim::copy2::warm::WarmCfg>) -> (Rig, arbsim::server::Ctx, Address, u64) {
+    let (mut r, ctx) = trig_world_code(fl_pool_code());
+    let r2 = check_util::addr(0x4079);
+    let mut code = check_util::hex("6000 54 6007 57 00 5b 36 6000 6000 37 6000 6000 36 6000 6000 73");
+    code.extend_from_slice(a(V2P).as_slice());
+    code.extend(check_util::hex("5a f1 50 00"));
+    r.chain.codes.lock().unwrap().insert(r2, code);
+    let h = r.sh.head().unwrap().block;
+    let mut st = r.chain.at(h);
+    st.entry(r2).or_default().insert(u(0), u(1));
+    r.chain.set(h, st);
+    if let Some(c) = cfg {
+        *r.h.c2.warm.lock().unwrap() = arbsim::copy2::warm::WarmState::new(c);
+    }
+    r.settle();
+    (r, ctx, r2, h)
+}
+
+fn warm_disc(ctx: &arbsim::server::Ctx, msgs: &[(u64, Vec<&Vec<u8>>)], trig: &[u8]) -> Value {
+    let seq = msgs.last().unwrap().0;
+    let m: Vec<Value> = msgs.iter().map(|(s, txs)| json!({"seq": s, "ts": 63, "l1": 9000, "txs": txs.iter().map(|t| hexb(t)).collect::<Vec<_>>()})).collect();
+    arbsim::server::handle(ctx, &json!({"id": 21, "type": "trig_discover", "at": {"after": "head"}, "feed": {"trigger": hexb(keccak256(trig).as_slice()), "triggerSeq": seq, "msgs": m}}))
+}
+
+fn node_calls(r: &Rig) -> usize {
+    *r.chain.calls.lock().unwrap() + *r.chain.paid_calls.lock().unwrap()
+}
+
+// Learned from the first misses, fetched once in the background, then the
+// hot router's trades are answered from memory: NO node call at decision
+// time, "recent_fill" (never exact). A transaction to the router BEFORE
+// the trigger in the same question leaves its values out (unknown); the
+// keeper re-reads them after a feed transaction to it. Past
+// ARBSIM_WARM_MAX_AGE_S a value counts as missing.
+#[test]
+fn warm_hot_target_answered_from_memory_refreshed_on_touch_never_stale() {
+    use arbsim::copy2::warm::WarmCfg;
+    let _turn = FEED_STORE_TURN.lock().unwrap_or_else(|e| e.into_inner());
+    arbsim::check::feedstore::store().clear();
+    let (mut r, ctx, r2, h) = warm_world(Some(WarmCfg { per_hour: 1000, ..WarmCfg::default() }));
+    // The router is HOT: a report showed one of its trades moving our pools.
+    r.h.c2.discover_fill.lock().unwrap().note_answer(r2, B256::ZERO, Some(true), std::time::Instant::now());
+    r.settle();
+    let trig = signed(0, r2, u(2_000_000).to_be_bytes::<32>().to_vec());
+    let mut ans = Value::Null;
+    for _ in 0..8 {
+        ans = warm_disc(&ctx, &[(h + 1, vec![&trig])], &trig);
+        if ans["ok"] == json!(true) {
+            break;
+        }
+        assert_eq!(ans["unknown"], json!("miss"), "{ans}");
+        r.settle();
+    }
+    assert_eq!(ans["pools"], json!([format!("{:#x}", a(V2P))]), "{ans}");
+    // From memory: copy 2 itself still holds nothing of the router.
+    assert!(matches!(r.sh.head().unwrap().snap.account(r2), Lookup::Missing), "the copy never took it in");
+    let before = node_calls(&r);
+    let ans = warm_disc(&ctx, &[(h + 1, vec![&trig])], &trig);
+    assert_eq!((ans["ok"].clone(), ans["pools"].clone()), (json!(true), json!([format!("{:#x}", a(V2P))])), "{ans}");
+    assert!(ans["assumed"].to_string().contains("recent_fill"), "never exact: {ans}");
+    assert_eq!(node_calls(&r), before, "no node call at decision time");
+    let st = arbsim::server::handle(&ctx, &json!({"id": 22, "type": "status"}));
+    let w = &st["copy2"]["warm"];
+    assert!(w["questionsUsedWarm"].as_u64().unwrap() >= 1 && w["fetchedOnce"].as_u64().unwrap() >= 2, "{w}");
+    assert_eq!(w["on"], json!(true));
+    // A transaction to the router BEFORE the trigger (same question): its
+    // values (not stable yet) are left out.
+    let toucher = signed_b(0, r2, vec![0x12, 0x34, 0x56, 0x78]);
+    let ans = warm_disc(&ctx, &[(h + 1, vec![&toucher, &trig])], &trig);
+    assert_eq!(ans["unknown"], json!("miss"), "{ans}");
+    // The keeper sees that feed transaction and re-reads the router's values.
+    arbsim::check::feedstore::store().put_json(&json!({"type": "feed_put", "msgs": [{"seq": h + 1, "ts": 63, "l1": 9000, "txs": [hexb(&toucher)]}]}));
+    let calls0 = node_calls(&r);
+    // The chain moves on to h+1 (the toucher's block); copy 2 follows.
+    r.send(tick(h + 1, 64));
+    r.settle();
+    let w = r.h.c2.warm.lock().unwrap().json(r.h.c2.warm_now(), 0);
+    assert!(w["refreshTouch"].as_u64().unwrap() >= 1, "{w}");
+    assert!(node_calls(&r) > calls0, "re-read from the node");
+    let ans = warm_disc(&ctx, &[(h + 2, vec![&trig])], &trig);
+    assert_eq!(ans["ok"], json!(true), "after the re-read: {ans}");
+    // Stale: past the window (shrunk for the test) it counts as missing.
+    r.h.c2.warm.lock().unwrap().cfg.max_age_s = 0.05;
+    std::thread::sleep(std::time::Duration::from_millis(120));
+    let ans = warm_disc(&ctx, &[(h + 2, vec![&trig])], &trig);
+    assert_eq!(ans["unknown"], json!("miss"), "never used stale: {ans}");
+    arbsim::check::feedstore::store().clear();
+}
+
+// The hourly cap is hard: a fetch that doesn't fit is not sent and the
+// values stay missing (unknown answers), never kept on trust.
+#[test]
+fn warm_cap_fails_closed() {
+    use arbsim::copy2::warm::WarmCfg;
+    let (mut r, ctx, r2, h) = warm_world(Some(WarmCfg { per_hour: 0, ..WarmCfg::default() }));
+    r.h.c2.discover_fill.lock().unwrap().note_answer(r2, B256::ZERO, Some(true), std::time::Instant::now());
+    r.settle();
+    let trig = signed(0, r2, u(2_000_000).to_be_bytes::<32>().to_vec());
+    let before = node_calls(&r);
+    for _ in 0..3 {
+        let ans = warm_disc(&ctx, &[(h + 1, vec![&trig])], &trig);
+        assert_eq!(ans["unknown"], json!("miss"), "{ans}");
+        r.settle();
+    }
+    assert_eq!(node_calls(&r), before, "nothing fetched over the cap (and the hot target isn't fetched by discovery's own fill either)");
+    let w = r.h.c2.warm.lock().unwrap().json(r.h.c2.warm_now(), 0);
+    assert!(w["capDropped"].as_u64().unwrap() >= 1 && w["calls"] == json!(0) && w["held"] == json!(0), "{w}");
+}
+
+// FASTLANE off (the tests' environment): nothing is learned, fetched or
+// used; discovery behaves exactly as before (its own fill fetches the miss).
+#[test]
+fn warm_off_with_fastlane_off_changes_nothing() {
+    let (mut r, ctx, r2, h) = warm_world(None);
+    assert!(!r.h.c2.warm.lock().unwrap().on(), "FASTLANE is not set in tests");
+    r.h.c2.discover_fill.lock().unwrap().note_answer(r2, B256::ZERO, Some(true), std::time::Instant::now());
+    r.settle();
+    let trig = signed(0, r2, u(2_000_000).to_be_bytes::<32>().to_vec());
+    let ans = warm_disc(&ctx, &[(h + 1, vec![&trig])], &trig);
+    assert_eq!(ans["unknown"], json!("miss"), "{ans}");
+    let before = node_calls(&r);
+    r.settle();
+    assert!(node_calls(&r) > before, "discovery's own fill, as before");
+    let w = r.h.c2.warm.lock().unwrap().json(r.h.c2.warm_now(), 0);
+    assert_eq!((w["on"].clone(), w["learned"].clone(), w["values"].clone(), w["calls"].clone()), (json!(false), json!(0), json!(0), json!(0)), "{w}");
+}
+
+// `arbsim trig-replay --warm-sim N` (copy2/warm.rs over a recording): four
+// trades through a router (the chain says each moved V2P). Trade 1 makes
+// the router hot (after it); trade 2 misses (nothing learned yet) and
+// teaches its recipe; the keeper fetches it at the next copy version;
+// trades 3 and 4 are answered from warm values only, with the right pools,
+// although each is itself a feed transaction to the router.
+#[test]
+fn fastlane_trig_replay_warm_sim() {
+    use arbsim::copy2::ahead::AheadCfg;
+    use arbsim::copy2::ahead_capture::{CapEv, CapFile, ProvSets};
+    use arbsim::fastlane::replay_fetch::{FetchOpts, ReplayFetcher};
+    use arbsim::fastlane::trig_replay::{print_report, trig_replay_with, TrigReplayOpts};
+    use arbsim::fastlane::trigger::TrigCfg;
+    let (mut r, _ctx) = trig_world_code(fl_pool_code());
+    let v = r.sh.head().unwrap();
+    let h = v.seq;
+    let ro = check_util::addr(0x407a);
+    let mut code = check_util::hex("36 6000 6000 37 6000 6000 36 6000 6000 73");
+    code.extend_from_slice(a(V2P).as_slice());
+    code.extend(check_util::hex("5a f1 50 00"));
+    struct Fake {
+        code: Vec<u8>,
+        at: Address,
+    }
+    impl NodeApi for Fake {
+        fn call_batch(&self, _c: Class, calls: &[(&str, Value)]) -> Result<Vec<CallResult>, NodeErr> {
+            Ok(calls
+                .iter()
+                .map(|(m, p)| {
+                    let addr = parse_address(p[0].as_str().unwrap()).unwrap();
+                    Ok(match *m {
+                        "eth_getStorageAt" | "eth_getBalance" => json!("0x0"),
+                        "eth_getTransactionCount" => json!(if addr == self.at { "0x1" } else { "0x0" }),
+                        "eth_getCode" => json!(arbsim::check::hexutil::to_hex(if addr == self.at { &self.code } else { &[] })),
+                        _ => return Err(RpcErr { code: -32601, message: "method not found".into() }),
+                    })
+                })
+                .collect())
+        }
+    }
+    let fp = arbsim::check::moved::FollowedPool { key: format!("{:#x}", a(V2P)), address: a(V2P), v4_id: None };
+    let wm = |seq: u64, txs: &[&Vec<u8>]| arbsim::check::ordered::WireFeedMsg { seq, ts: 60 + seq, l1: 9000, txs: txs.iter().map(|t| hexb(t)).collect(), complete: true, why: None };
+    let mut events = vec![
+        CapEv::Header { cfg: AheadCfg::default(), l2_offset: 0, live: "{}".into() },
+        CapEv::Pools { list: vec![(fp, a(COIN0), a(COIN1))], not_ready: vec![] },
+        CapEv::Prov(Arc::new(ProvSets::from_copy2(&r.h.provenance_at(h, &[])))),
+        CapEv::Confirmed { seq: h, ctx: v.ctx.clone(), snap: v.snap.clone() },
+    ];
+    for i in 1..=4u64 {
+        let t = signed(i - 1, ro, u(2_000_000).to_be_bytes::<32>().to_vec());
+        events.push(CapEv::Feed(Arc::new(arbsim::check::feedstore::BinMsg::from_wire(&wm(h + i, &[&t]), true))));
+        events.push(CapEv::Moves(vec![(keccak256(&t), Some(vec![format!("{:#x}", a(V2P))]))]));
+        r.send(tick(h + i, 70 + i));
+        let vi = r.sh.head().unwrap();
+        assert_eq!(vi.seq, h + i);
+        events.push(CapEv::Confirmed { seq: vi.seq, ctx: vi.ctx.clone(), snap: vi.snap.clone() });
+    }
+    events.push(CapEv::End { live: "{}".into(), why: "done".into() });
+    let cap = CapFile { events, complete: true, cut: None };
+    let mut f = ReplayFetcher::new(Some(Box::new(Fake { code, at: ro })), None, FetchOpts { max_paid: 0, moved_only: true, ..Default::default() });
+    let opts = TrigReplayOpts { no_full: true, warm_sim: Some(5), ..Default::default() };
+    let rep = trig_replay_with(&cap, None, &TrigCfg::default(), &opts, Some(&mut f)).unwrap();
+    println!("{}", print_report(&rep));
+    let w = &rep["warmSim"];
+    assert_eq!((w["triggersToHotTargets"].clone(), w["answeredWithNoFetch"].clone()), (json!(3), json!(2)), "{w}");
+    assert_eq!(w["chainSaysMovedOurPools"]["known: same pools"], json!(2), "{w}");
+    assert_eq!(w["chainSaysMovedOurPools"]["still unknown miss"], json!(1), "{w}");
+    assert!(w["wrongSamples"].as_array().unwrap().is_empty(), "{w}");
+    // One eth_getProof once, then one after each later trade TO the router
+    // (its values aren't proven stable yet: re-read after every touch).
+    assert_eq!((w["nodeRequests"].clone(), w["keeper"]["fetchedOnce"].clone(), w["keeper"]["refreshTouch"].clone()), (json!(3), json!(1), json!(2)), "{w}");
+    // Without --fetch: refused.
+    assert!(arbsim::fastlane::trig_replay::trig_replay(&cap, None, &TrigCfg::default(), &opts).is_err());
+}

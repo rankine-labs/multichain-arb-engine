@@ -122,6 +122,23 @@ pub struct TrigReplayOpts {
     pub samples: usize,
     /// Skip the FULL REPLAY part (see the file header).
     pub no_full: bool,
+    /// --warm-sim N: simulate keeping the top N hot targets warm
+    /// (copy2/warm.rs) over the capture (needs --fetch).
+    pub warm_sim: Option<usize>,
+    /// --warm-per-hour: the simulated hourly cap (default 25000).
+    pub warm_per_hour: Option<u64>,
+}
+
+/// --warm-sim results.
+#[derive(Default)]
+struct WarmSimReport {
+    asked_hot: u64,
+    answered: u64,
+    chain_moved: Tally,
+    chain_none: Tally,
+    wrong: Vec<Value>,
+    plain_calls: u64,
+    moved_by_target: HashMap<Address, u64>,
 }
 
 fn pct(v: &mut [u64]) -> Value {
@@ -565,6 +582,15 @@ pub fn trig_replay_with(cap: &CapFile, table: Option<&Table>, cfg: &TrigCfg, opt
     let mut self_only_base = SelfOnly::default();
     let mut fxr = FetchReport::default();
     let mut overlay: Option<Overlay> = None;
+    // --warm-sim (copy2/warm.rs over the capture).
+    let mut ws: Option<crate::copy2::warm::WarmState> = match (opts.warm_sim, fetcher.is_some()) {
+        (Some(n), true) => Some(crate::copy2::warm::WarmState::new(crate::copy2::warm::WarmCfg { on: true, targets: n, per_hour: opts.warm_per_hour.unwrap_or(25_000), ..Default::default() })),
+        (Some(_), false) => return Err("--warm-sim needs --fetch (the values come from the node)".into()),
+        _ => None,
+    };
+    let mut wsr = WarmSimReport::default();
+    let mut sim_now = 0.0f64;
+    let mut ts_first: Option<u64> = None;
     // Feed transactions to each contract (seq), and the capture's time span.
     let mut touches: HashMap<Address, Vec<u64>> = HashMap::new();
     let (mut ts_min, mut ts_max) = (u64::MAX, 0u64);
@@ -598,6 +624,24 @@ pub fn trig_replay_with(cap: &CapFile, table: Option<&Table>, cfg: &TrigCfg, opt
             CapEv::Confirmed { seq, ctx, snap } => {
                 let Some(ctx) = ctx.clone() else { continue };
                 copy = Some((*seq, ctx.clone(), snap.clone()));
+                // --warm-sim: the keeper's turn (fetch at this version's block).
+                if let (Some(w), Some(f)) = (ws.as_mut(), fetcher.as_deref_mut()) {
+                    w.sweep(sim_now);
+                    let due: Vec<MissItem> = w.due(sim_now, l2_offset).into_iter().filter(|m| crate::copy2::warm::owner(m).is_none_or(|o| !pool_addrs.contains(&o))).collect();
+                    if !due.is_empty() {
+                        let calls = crate::copy2::loader::count_calls(&due, &[]);
+                        let (req, plain) = crate::copy2::warm::job_cost(&due);
+                        if w.charge(calls, req, sim_now) {
+                            wsr.plain_calls += plain;
+                            let block = *seq + l2_offset;
+                            let got = f.fetch(block, &due, snap);
+                            let res: Vec<(MissItem, Option<crate::node::Fetched>)> = due.iter().map(|m| (m.clone(), got.iter().find(|g| item_of(g) == *m).cloned())).collect();
+                            w.store(block, sim_now, &res);
+                        } else {
+                            w.cap_hit(&due, sim_now);
+                        }
+                    }
+                }
                 // Would-fires whose block is now confirmed: re-checked at its end.
                 let block = *seq + l2_offset;
                 let view = View::new(snap.clone());
@@ -639,10 +683,15 @@ pub fn trig_replay_with(cap: &CapFile, table: Option<&Table>, cfg: &TrigCfg, opt
                 msgs += 1;
                 ts_min = ts_min.min(m.ts);
                 ts_max = ts_max.max(m.ts);
+                let t0s = *ts_first.get_or_insert(m.ts);
+                sim_now = sim_now.max(m.ts.saturating_sub(t0s) as f64);
                 for t in &m.txs {
                     if let Ok(d) = t.decoded() {
                         if let Some(to) = d.to {
                             touches.entry(to).or_default().push(m.seq);
+                            if let Some(w) = ws.as_mut() {
+                                w.touch(to, m.seq);
+                            }
                         }
                     }
                 }
@@ -726,6 +775,64 @@ pub fn trig_replay_with(cap: &CapFile, table: Option<&Table>, cfg: &TrigCfg, opt
                     let r = discover(&view, &alone, prov.as_ref(), &index);
                     let is_ours = |a: Address| pool_addrs.contains(&a) || coin_addrs.contains(&a);
                     let chain_did = chain_moved(&truth, &t.hash);
+                    // --warm-sim: a hot target's trigger, answered from the warm
+                    // values only (no fetch at decision time).
+                    if let (Some(w), Some(to)) = (ws.as_mut(), dec.to) {
+                        if w.is_hot(&to) {
+                            wsr.asked_hot += 1;
+                            let before: Vec<(u64, Option<Address>)> = plan.msgs.iter().flat_map(|x| x.txs.iter().map(move |y| (x.seq, y.to, y.hash))).take_while(|x| x.2 != t.hash).map(|(a, b, _)| (a, b)).collect();
+                            let rw = match w.layer(&csnap, sim_now, l2_offset, m.seq, &before) {
+                                Some(l) => {
+                                    let pv = crate::copy2::warm::WarmProv { inner: prov.clone(), layer: l.clone() };
+                                    discover(&View::new(l.snap.clone()), &alone, &pv, &index)
+                                }
+                                None => discover(&view, &alone, prov.as_ref(), &index),
+                            };
+                            if let Err(u) = &rw {
+                                if u.reason == UnknownReason::Miss {
+                                    w.learn(to, &u.missing);
+                                }
+                            }
+                            let (kind, pools) = fx_class(&rw);
+                            let chain_pools: Vec<String> = truth.get(&t.hash).cloned().flatten().unwrap_or_default().iter().map(|p| p.to_ascii_lowercase()).collect();
+                            let unknown = kind.starts_with("unknown");
+                            if !unknown {
+                                wsr.answered += 1;
+                            }
+                            let v = if unknown {
+                                format!("still {kind}")
+                            } else if pools.is_empty() {
+                                "we say moved none".into()
+                            } else if chain_pools.is_empty() {
+                                "we say moved".into()
+                            } else if pools.iter().all(|p| chain_pools.contains(p)) && chain_pools.iter().all(|p| pools.contains(p)) {
+                                "known: same pools".into()
+                            } else {
+                                "known: other pools".into()
+                            };
+                            if chain_did {
+                                let v = if v == "we say moved none" { "WRONG: we say moved none".to_string() } else { v };
+                                if v.starts_with("WRONG") && wsr.wrong.len() < 10 {
+                                    wsr.wrong.push(json!({"trigger": format!("{:#x}", t.hash), "to": format!("{to:#x}"), "chainPools": chain_pools, "copyLagBlocks": m.seq.saturating_sub(cseq)}));
+                                }
+                                wsr.chain_moved.add(v);
+                            } else if truth.contains_key(&t.hash) {
+                                if v == "we say moved" && wsr.wrong.len() < 10 {
+                                    wsr.wrong.push(json!({"trigger": format!("{:#x}", t.hash), "to": format!("{to:#x}"), "we": pools, "chain": "moved none of our pools"}));
+                                }
+                                wsr.chain_none.add(v);
+                            }
+                        }
+                        // Hot = the chain showed its transactions moving our pools
+                        // (known after the block: counted after the decision).
+                        if chain_did {
+                            *wsr.moved_by_target.entry(to).or_default() += 1;
+                            let mut v: Vec<(&Address, &u64)> = wsr.moved_by_target.iter().collect();
+                            v.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+                            let list: Vec<Address> = v.into_iter().map(|x| *x.0).collect();
+                            w.set_hot(&list);
+                        }
+                    }
                     if r.is_err() {
                         self_only_base.add(&view, &dec, chain_did, &is_ours);
                     }
@@ -1065,6 +1172,22 @@ pub fn trig_replay_with(cap: &CapFile, table: Option<&Table>, cfg: &TrigCfg, opt
                 "note": "values fetched at the block of the copy version each question was asked on (exact there), free node first; 'known' = same pools as the chain; WRONG = we say moved none, the chain says it moved our pools",
             }),
         },
+        "warmSim": match &ws {
+            None => Value::Null,
+            Some(w) => {
+                let secs = if ts_max > ts_min { (ts_max - ts_min) as f64 } else { 1.0 };
+                let per_h = |n: u64| (n as f64 * 3600.0 / secs).round() as u64;
+                json!({
+                    "topTargets": w.cfg.targets, "perHourCap": w.cfg.per_hour, "captureSeconds": secs,
+                    "triggersToHotTargets": wsr.asked_hot, "answeredWithNoFetch": wsr.answered,
+                    "chainSaysMovedOurPools": wsr.chain_moved.json(10), "chainSaysMovedNone": wsr.chain_none.json(10), "wrongSamples": wsr.wrong,
+                    "nodeRequests": w.stats.requests, "nodeRequestsPerHour": per_h(w.stats.requests), "callsAsCapped": w.stats.calls, "callsAsCappedPerHour": per_h(w.stats.calls),
+                    "plainCallsOneEach": wsr.plain_calls, "plainCallsPerHour": per_h(wsr.plain_calls),
+                    "keeper": w.json(sim_now, l2_offset),
+                    "note": "copy2/warm.rs run over the capture: a target is hot once the chain showed one of its transactions moving our pools (after that one); recipes learned from misses; values fetched at each copy version's block by the keeper (once, after a feed transaction to the contract unless stable, every 60 s), within the hourly cap (fail closed); each decision reads warm values only (no fetch). nodeRequests = one eth_getProof per account per job (what the live loader sends); plainCalls = one call per slot, three per account",
+                })
+            }
+        },
         "timeUsThisMachine": {"perTrigger": pct(&mut trig_us.clone())},
         "wouldFireSamples": fires,
         "offlineNote": if fetcher.is_some() { "no copy-2 double runs / reports-pending rule, no best-effort (bot) skipping, no safety gates; --fetch: values fetched for DISCOVERY only (the FETCH section; every other section is the recording alone); nothing signed or sent" } else { "no copy-2 double runs / reports-pending rule, no best-effort (bot) skipping, no fills fetched, no safety gates: more cautious than live; nothing signed or sent" },
@@ -1198,6 +1321,16 @@ pub fn print_report(r: &Value) -> String {
         print_blame(&mut o, "STILL UNKNOWN after fetch", &x["stillUnknown"]);
         print_self_only(&mut o, "STILL UNKNOWN, SELF-ONLY TARGETS", &x["stillUnknownSelfOnly"]);
     }
+    let ws = &r["warmSim"];
+    if !ws.is_null() {
+        o += &format!("WARM SIM (top {} hot targets, cap {}/h, capture {} s): triggers to hot targets {}, ANSWERED WITH NO FETCH {}\n", ws["topTargets"], ws["perHourCap"], ws["captureSeconds"], ws["triggersToHotTargets"], ws["answeredWithNoFetch"]);
+        o += &format!("  chain says moved our pools, we say: {}\n  chain says moved none, we say: {}\n", ws["chainSaysMovedOurPools"], ws["chainSaysMovedNone"]);
+        o += &format!("  node requests {} (= {}/h; eth_getProof per account), as capped {} (= {}/h), plain calls {} (= {}/h)\n", ws["nodeRequests"], ws["nodeRequestsPerHour"], ws["callsAsCapped"], ws["callsAsCappedPerHour"], ws["plainCallsOneEach"], ws["plainCallsPerHour"]);
+        o += &format!("  keeper {}\n", ws["keeper"]);
+        for w in ws["wrongSamples"].as_array().into_iter().flatten() {
+            o += &format!("    wrong: {w}\n");
+        }
+    }
     let k = &r["candidates"];
     o += &format!("CANDIDATES: no candidates {}, routes checked {}, sure {}, unknown {}, good {}, not a trade {}, WOULD REACH THE GUN {}\n", k["noCandidates"], k["routesChecked"], k["sure"], k["unknown"], k["good"], k["notTrade"], k["wouldReachGun"]);
     o += &format!("RE-CHECK at the trigger block's end (copy 2 confirmed): {}\n", k["recheckAtBlockEnd"]);
@@ -1215,7 +1348,7 @@ pub fn print_report(r: &Value) -> String {
 /// `arbsim trig-replay <capture file> [--table <file>] [--ours a,b] [--json] [--samples N] [--partial] [--no-full]`
 pub fn replay_main(args: &[String]) {
     let Some(path) = args.get(2).filter(|a| !a.starts_with("--")) else {
-        eprintln!("usage: arbsim trig-replay <capture file> [--table <file>] [--ours 0x..,0x..] [--json] [--samples N] [--partial] [--no-full] [--fetch [--fetch-max 3000] [--fetch-paid on|off] [--fetch-paid-max N] [--fetch-scope all|moved] [--fetch-rounds 6] [--fetch-own-control 10] [--fetch-url-env NAME]]");
+        eprintln!("usage: arbsim trig-replay <capture file> [--table <file>] [--ours 0x..,0x..] [--json] [--samples N] [--partial] [--no-full] [--fetch [--fetch-max 3000] [--fetch-paid on|off] [--fetch-paid-max N] [--fetch-scope all|moved] [--fetch-rounds 6] [--fetch-own-control 10] [--fetch-url-env NAME]] [--warm-sim N [--warm-per-hour 25000]]");
         std::process::exit(2);
     };
     let val = |f: &str| args.iter().position(|a| a == f).and_then(|i| args.get(i + 1)).cloned();
@@ -1253,7 +1386,13 @@ pub fn replay_main(args: &[String]) {
     };
     let ours: Vec<Address> = val("--ours").map(|s| s.split(',').filter_map(|x| crate::check::hexutil::parse_address(x.trim()).ok()).collect()).unwrap_or_default();
     let cfg = TrigCfg::from_lookup(&|k| std::env::var(k).ok());
-    let opts = TrigReplayOpts { ours, samples: val("--samples").and_then(|s| s.parse().ok()).unwrap_or(10), no_full: args.iter().any(|a| a == "--no-full") };
+    let opts = TrigReplayOpts {
+        ours,
+        samples: val("--samples").and_then(|s| s.parse().ok()).unwrap_or(10),
+        no_full: args.iter().any(|a| a == "--no-full"),
+        warm_sim: val("--warm-sim").and_then(|s| s.parse().ok()),
+        warm_per_hour: val("--warm-per-hour").and_then(|s| s.parse().ok()),
+    };
     // --fetch (replay_fetch.rs): fetch what the recording didn't hold.
     let mut fetcher = None;
     if args.iter().any(|a| a == "--fetch") {

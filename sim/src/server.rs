@@ -563,8 +563,65 @@ fn trig_inner(ctx: &Ctx, id: &Value, r: &CallRequest, feed_v: &Value, t0: Instan
     // V4 BLIND SPOT (Oct 25): write down hash inputs, so a miss can say
     // WHOSE PoolManager value it was (copy2/v4blind.rs). Not an assumption.
     assume.record_hashes = true;
+    // WARM HOT TARGETS (copy2/warm.rs): values copy 2 doesn't hold, from memory.
+    let (picked, prov, warm_used) = warm_apply(ctx, picked, prov, &plan);
     let run = |view: &dyn StateRead, _c: &BlockCtx| crate::check::proto_types::handle_trig_call_with(view, &plan, &info, r, prov.as_ref(), strict, &assume);
-    after_pick_with(ctx, picked, t0, tm, &run, false, core)
+    let a = after_pick_with(ctx, picked, t0, tm, &run, false, core);
+    warm_learn(ctx, &a, warm_used);
+    a
+}
+
+/// WARM HOT TARGETS (copy2/warm.rs, only when FASTLANE is not off): the
+/// question's copy version with the warm values added where copy 2 holds
+/// nothing, and the provenance that marks them not exact ("recent fill").
+/// A value whose contract a transaction BEFORE the trigger goes to is left
+/// out (unless stable). Never waits for the node.
+fn warm_apply(
+    ctx: &Ctx,
+    mut picked: crate::state::mirror::Picked,
+    prov: Arc<dyn crate::check::ordered::Provenance + Send + Sync>,
+    plan: &crate::check::ordered::OrderedPlan,
+) -> (crate::state::mirror::Picked, Arc<dyn crate::check::ordered::Provenance + Send + Sync>, bool) {
+    let Some(c) = &ctx.copy2 else { return (picked, prov, false) };
+    let mut w = c.c2.warm.lock().unwrap_or_else(|e| e.into_inner());
+    if !w.on() {
+        return (picked, prov, false);
+    }
+    let before: Vec<(u64, Option<Address>)> = plan
+        .msgs
+        .iter()
+        .flat_map(|m| m.txs.iter().map(move |t| (m.seq, t.to, t.hash)))
+        .take_while(|x| x.2 != plan.trigger)
+        .map(|(sq, to, _)| (sq, to))
+        .collect();
+    let trig_seq = plan.msgs.iter().find(|m| m.txs.iter().any(|t| t.hash == plan.trigger)).map_or(u64::MAX, |m| m.seq);
+    match w.layer(&picked.snap, c.c2.warm_now(), ctx.shared.cfg.l2_offset, trig_seq, &before) {
+        Some(l) => {
+            picked.snap = l.snap.clone();
+            (picked, Arc::new(crate::copy2::warm::WarmProv { inner: prov, layer: l }), true)
+        }
+        None => (picked, prov, false),
+    }
+}
+
+/// WARM HOT TARGETS: a fire-first miss teaches the recipe of the
+/// transaction it got stuck on (its target); an answer that used warm
+/// values is counted.
+fn warm_learn(ctx: &Ctx, a: &Value, used: bool) {
+    let Some(c) = &ctx.copy2 else { return };
+    let mut w = c.c2.warm.lock().unwrap_or_else(|e| e.into_inner());
+    if !w.on() {
+        return;
+    }
+    if used && a.get("ok") == Some(&Value::Bool(true)) {
+        w.stats.questions_used += 1;
+    }
+    if a.get("unknown").and_then(|u| u.as_str()) == Some("miss") {
+        let target = a.get("at").and_then(|x| x.get("to")).and_then(|t| t.as_str()).and_then(|t| crate::check::hexutil::parse_address(t).ok());
+        if let Some(t) = target {
+            w.learn(t, &parse_missing(a));
+        }
+    }
 }
 
 /// TRIGGER-FIRST ENTRY POINT: `{"type":"trig_discover", "at":{"after":"head"},
@@ -650,6 +707,8 @@ fn trig_discover_inner(ctx: &Ctx, id: &Value, req: &Value, t0: Instant, tm: &mut
     let core = c2.core_for(picked.from.as_ref());
     tm.facts_us += t_core.elapsed().as_micros() as u64;
     let prov = crate::timing::ph_time("prov", || c2.provenance_with(&core, block, &[]));
+    // WARM HOT TARGETS (copy2/warm.rs): values copy 2 doesn't hold, from memory.
+    let (picked, prov, warm_used) = warm_apply(ctx, picked, prov, &plan);
     // Same assumptions as a trigger-first check (no skipping: only the
     // trigger runs, and the trigger is never skipped).
     let (strict, mut assume) = trig_assume(trig_trust(), &feed, |_| None);
@@ -703,6 +762,7 @@ fn trig_discover_inner(ctx: &Ctx, id: &Value, req: &Value, t0: Instant, tm: &mut
         }
     };
     let mut a = after_pick_with(ctx, picked, t0, tm, &run, false, Some(core.clone()));
+    warm_learn(ctx, &a, warm_used);
     // (Oct 27) The fill budget learns which targets move our pools (copy 2's
     // reports tell for the unknown ones, a few seconds later).
     let trig_target = trig_dec.as_ref().and_then(|d| d.to);
@@ -732,7 +792,9 @@ fn trig_discover_inner(ctx: &Ctx, id: &Value, req: &Value, t0: Instant, tm: &mut
     // (Oct 27) Each item at most once per ARBSIM_DISCOVER_FILL_REPEAT_S and
     // at most ARBSIM_DISCOVER_FILL_PER_HOUR items an hour (DiscoverFillBook),
     // counted in status "discoverFill".
-    if a.get("unknown").and_then(|u| u.as_str()) == Some("miss") {
+    // A hot target the warm keeper handles (copy2/warm.rs) is not fetched here too.
+    let warm_hot = trig_target.is_some_and(|t| c2.c2.warm.lock().map(|w| w.on() && w.is_hot(&t)).unwrap_or(false));
+    if !warm_hot && a.get("unknown").and_then(|u| u.as_str()) == Some("miss") {
         let missing = parse_missing(&a);
         let max_items = env_u64("ARBSIM_DISCOVER_FILL_MAX_ITEMS", 16) as usize;
         let book = &c2.c2.discover_fill;
@@ -843,6 +905,14 @@ impl DiscoverFillBook {
 
     pub fn new(per_hour: u64, repeat_s: u64) -> Self {
         DiscoverFillBook { per_hour, repeat_s, cold_pct: 50, cold_after: 20, ..Default::default() }
+    }
+
+    /// The hot targets, most moves first (at most `n`): copy2/warm.rs keeps
+    /// their values warm.
+    pub fn hot_list(&self, n: usize) -> Vec<Address> {
+        let mut v: Vec<(&Address, &(u64, u64, Instant))> = self.targets.iter().filter(|(_, x)| x.1 > 0).collect();
+        v.sort_by(|a, b| b.1 .1.cmp(&a.1 .1).then(a.0.cmp(b.0)));
+        v.into_iter().take(n).map(|(a, _)| *a).collect()
     }
 
     /// A target is "hot": a report showed one of its transactions moving our pools.

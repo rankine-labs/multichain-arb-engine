@@ -91,6 +91,11 @@
 //      and the mark is cleared.
 //  11. Outside contracts a V3 / Pancake pool calls (a PancakeSwap farm):
 //      stand-ins in replays, VOLATILE for checks (see replay.rs).
+//  12. (Oct 27) WARM HOT TARGETS (copy2/warm.rs, only when FASTLANE is not
+//      off): the values the fire-first questions about hot targets' trades
+//      lack are fetched once and re-read only when they may have changed
+//      (dispatch_warm, loader Fetch jobs within ARBSIM_WARM_PER_HOUR); the
+//      questions read them from memory, never as exact. Status "warm".
 //
 // Strict, always: a value we don't hold is MISSING (never zero); a pool we
 // can't follow exactly is unsure. Node reads use the daily allowance
@@ -765,6 +770,10 @@ pub struct C2Shared {
     /// (Oct 27) What discovery's misses fetched for this copy: each item
     /// once per window, a hard hourly cap (server.rs DiscoverFillBook).
     pub discover_fill: Mutex<crate::server::DiscoverFillBook>,
+    /// (Oct 27) WARM HOT TARGETS (copy2/warm.rs): only when FASTLANE is not off.
+    pub warm: Mutex<super::warm::WarmState>,
+    /// The warm values' clock (seconds since this start).
+    pub warm_t0: Instant,
     /// V4 BLIND SPOT (Oct 25, copy2/v4blind.rs): whose PoolManager value each
     /// missed slot is, the unfollowed V4 pools checks run into, and the
     /// auto-follow list (status `v4Blind`). Lock order: after `reg`.
@@ -1105,6 +1114,13 @@ impl Copy2Handle {
     }
 }
 
+
+impl C2Shared {
+    /// The warm values' clock (copy2/warm.rs): seconds since this start.
+    pub fn warm_now(&self) -> f64 {
+        self.warm_t0.elapsed().as_secs_f64()
+    }
+}
 
 impl C2Shared {
     /// What checks need from the registry (checkcore.rs), current: the
@@ -1659,6 +1675,8 @@ impl Copy2Handle {
             // auto-follow list the bot reads (autoFollow.ids). The counts
             // per class are counters pm_miss_* / pm_refused_* / pm_far_*.
             "v4Blind": self.c2.pm_book.lock().unwrap().status(Instant::now()),
+            // WARM HOT TARGETS (copy2/warm.rs): values, refreshes, calls an hour.
+            "warm": self.c2.warm.lock().unwrap().json(self.c2.warm_now(), self.sh.cfg.l2_offset),
             "outsideContracts": self.sh.volatile.whole_len(),
             // Warm restart (copy2/persist.rs): saved file, last save, catch-up.
             "resume": Value::Object(self.c2.resume.lock().unwrap().clone()),
@@ -1923,6 +1941,8 @@ enum JobFor {
     ResumeVerify,
     /// A parked pool listed again: its own reports since it was parked.
     PoolCatchUp { key: PoolKey, gen: u64 },
+    /// Warm hot targets' values (copy2/warm.rs).
+    Warm { items: Vec<MissItem> },
 }
 
 /// A ready pool the bot stopped listing (see on_track "parking"): what the
@@ -2147,6 +2167,8 @@ pub fn manual(sh: Arc<Shared>, fills: Arc<FillQueue>, cfg: C2Config) -> (Intake,
         wanted: Mutex::new(Wanted::default()),
         recent_moves: Mutex::new(RecentMoves::default()),
         discover_fill: Mutex::new(crate::server::DiscoverFillBook::from_env()),
+        warm: Mutex::new(super::warm::WarmState::new(super::warm::WarmCfg::from_env())),
+        warm_t0: Instant::now(),
         pm_book: Mutex::new(super::v4blind::PmBook::new(cfg.blind.clone())),
     });
     let loaders = sh
@@ -2462,6 +2484,7 @@ impl Intake {
             self.dispatch_walks();
             self.dispatch_settle();
             self.dispatch_verify();
+            self.dispatch_warm();
             self.maybe_save();
         }
         self.note_round();
@@ -3883,6 +3906,7 @@ impl Intake {
             (JobFor::CatchUp, Done::CatchUp { id, res }) => self.on_catchup(id, res),
             (JobFor::ResumeVerify, Done::Fetch { id, block, res }) => self.on_resume_verify(id, block, res),
             (JobFor::PoolCatchUp { key, gen }, Done::CatchUp { res, .. }) => self.on_pool_catchup(key, gen, res),
+            (JobFor::Warm { items }, Done::Fetch { block, res, .. }) => self.on_warm(items, block, res),
             _ => {}
         }
     }
@@ -5426,6 +5450,93 @@ impl Intake {
         }
         out.sort_by(|x, y| format!("{x:?}").cmp(&format!("{y:?}")));
         out
+    }
+
+    // ---- warm hot targets (copy2/warm.rs) ----
+    /// Hot targets from the discover fill book, feed "touches" from the feed
+    /// store, then one fetch job with what is due (within the hourly cap;
+    /// what doesn't fit is dropped: fail closed).
+    fn dispatch_warm(&mut self) {
+        let now = self.c2.warm_now();
+        if !self.c2.warm.lock().unwrap().on() {
+            return;
+        }
+        // Hot targets (copy 2's reports showed their transactions moving our pools).
+        let n = self.c2.warm.lock().unwrap().cfg.targets;
+        let hot = self.c2.discover_fill.lock().map(|b| b.hot_list(n)).unwrap_or_default();
+        // Feed transactions since the last look: which contracts they went to.
+        let store = crate::check::feedstore::store();
+        let newest = store.newest().unwrap_or(0);
+        {
+            let mut w = self.c2.warm.lock().unwrap();
+            w.set_hot(&hot);
+            w.sweep(now);
+            let from = w.last_feed_seq.max(newest.saturating_sub(256)) + 1;
+            for seq in from..=newest {
+                if let Some(m) = store.get(seq) {
+                    for t in &m.txs {
+                        if let Ok(d) = t.decoded() {
+                            if let Some(to) = d.to {
+                                w.touch(to, seq);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if self.loaders.is_none() || self.refusing_now() || self.jobs.values().any(|j| matches!(j, JobFor::Warm { .. })) || self.loads_waiting() {
+            return;
+        }
+        let Some(head) = self.sh.head() else { return };
+        let l2 = self.sh.cfg.l2_offset;
+        let due = self.c2.warm.lock().unwrap().due(now, l2);
+        if due.is_empty() {
+            return;
+        }
+        // Values copy 2 follows itself are never warmed.
+        let (ok, refused): (Vec<MissItem>, Vec<MissItem>) = {
+            let reg = self.c2.reg.read().unwrap();
+            let vol = &self.sh.volatile;
+            due.into_iter().partition(|m| match m {
+                MissItem::Account(a) => !(vol.is_whole(a) || reg.by_addr.contains_key(a) || reg.owner_of.contains_key(a)),
+                MissItem::Slot(a, sl) => {
+                    !(vol.is_whole(a) || Self::gate_of(&reg, *a, *sl).is_some() || (reg.pm_bound && reg.is_pm_balance(*a, *sl)) || (reg.is_pm(a) && reg.is_pm_base_slot(*a, *sl)))
+                }
+                MissItem::Code(_) => false,
+            })
+        };
+        let mut w = self.c2.warm.lock().unwrap();
+        w.refuse(&refused);
+        if ok.is_empty() {
+            return;
+        }
+        let (requests, plain) = super::warm::job_cost(&ok);
+        let calls = super::loader::count_calls(&ok, &[]);
+        let _ = plain;
+        if !w.charge(calls, requests, now) {
+            // FAIL CLOSED: over ARBSIM_WARM_PER_HOUR: not fetched, dropped.
+            w.cap_hit(&ok, now);
+            return;
+        }
+        drop(w);
+        let id = self.new_job(JobFor::Warm { items: ok.clone() });
+        self.loaders.as_ref().unwrap().send(Job::Fetch { id, block: head.block, exact: false, bulk: true, items: ok, calls: vec![] });
+    }
+
+    fn on_warm(&mut self, items: Vec<MissItem>, block: u64, res: Result<FetchOut, crate::node::NodeErr>) {
+        let now = self.c2.warm_now();
+        let mut w = self.c2.warm.lock().unwrap();
+        match res {
+            Ok(out) => {
+                let r: Vec<(MissItem, Option<Fetched>)> = out.items.into_iter().map(|(m, f)| (m, f.ok())).collect();
+                w.store(block, now, &r);
+            }
+            Err(e) => {
+                w.unsend(&items);
+                drop(w);
+                self.note_node_error(&e.to_string());
+            }
+        }
     }
 
     /// Every ARBSIM_COPY2_VERIFY_S: re-read (one fetch job, at the node's
