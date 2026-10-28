@@ -303,6 +303,10 @@ pub struct LaneHour {
     pub gas_notes: u64,
     /// Copy-2 versions scanned (predicted copy off: standing gaps on copy 2).
     pub confirmed: u64,
+    /// SPEED FIX (Oct 28): copy 2 applied a block -> the lane started on it
+    /// (us), newest 5,000. Live: the lane was often still busy with the
+    /// previous block.
+    pub wait_us: Vec<u64>,
 }
 
 fn push_bounded(v: &mut Vec<u64>, x: u64) {
@@ -558,6 +562,7 @@ impl Lane {
         let Some(ctx) = head.ctx.clone() else { return Vec::new() };
         let t0 = Instant::now();
         self.hour.confirmed += 1;
+        push_bounded(&mut self.hour.wait_us, t0.saturating_duration_since(head.applied).as_micros() as u64);
         if head.applied.elapsed() > Duration::from_millis(self.cfg.tip_max_age_ms) {
             self.hour.tips_old += 1;
             return Vec::new();
@@ -722,7 +727,7 @@ impl Lane {
             "lane": {
                 "tips": h.tips, "confirmedScanned": h.confirmed, "tipsOld": h.tips_old, "opps": h.opps, "fired": h.fired, "wouldSend": h.would_send, "liveSent": h.live_sent,
                 "notLeft": h.not_left, "gunRefused": h.gun_refused, "logErrors": h.log_errors, "dropsSeen": h.drops_seen,
-                "feedToHandUs": pctl(&h.latency_us), "blockUs": pctl(&h.block_us), "laneUs": pctl(&h.lane_us),
+                "feedToHandUs": pctl(&h.latency_us), "blockUs": pctl(&h.block_us), "laneUs": pctl(&h.lane_us), "waitUs": pctl(&h.wait_us),
                 "blockUsNote": "blockUs = predicted-copy apply + lane; laneUs = lane only (scan + fire)",
             },
             "practice": self.practice.status_json(),

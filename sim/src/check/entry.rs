@@ -75,6 +75,47 @@ pub struct Table {
     /// "$code:<n>" in their overrides.
     pub codes: Arc<Vec<String>>,
     pub pools: HashMap<String, Vec<Row>>,
+    /// SPEED FIX (Oct 28): the generation at which each pool's rows were
+    /// last replaced, pools removed since the last full table (pool -> the
+    /// generation it went), and the generation of the last FULL table. The
+    /// fast-lane scanner (fastlane/scan.rs TableSource) uses them to bring
+    /// its route list up to date by touching only the pools that changed,
+    /// instead of re-copying every row (~38,700) on every table message
+    /// (measured live: ~30 ms per block). Bookkeeping only: picking and
+    /// checks never read these.
+    pub pool_gen: HashMap<String, u64>,
+    pub removed: HashMap<String, u64>,
+    pub full_gen: u64,
+    /// True only for tables built from `trig_table` messages (every change
+    /// goes through `set_pool`, so the bookkeeping above is complete). A
+    /// table filled by hand (tests) is false: readers then always copy it all.
+    pub tracked: bool,
+}
+
+/// Most removed-pool records kept between full tables; past it the table
+/// says "full" so readers copy everything once (memory bound).
+const MAX_REMOVED: usize = 50_000;
+
+impl Table {
+    /// One pool's rows replaced (Some) or removed (None) at generation `gen`.
+    pub fn set_pool(&mut self, key: String, rows: Option<Vec<Row>>, gen: u64) {
+        match rows {
+            Some(r) => {
+                self.removed.remove(&key);
+                self.pool_gen.insert(key.clone(), gen);
+                self.pools.insert(key, r);
+            }
+            None => {
+                self.pools.remove(&key);
+                self.pool_gen.remove(&key);
+                self.removed.insert(key, gen);
+                if self.removed.len() > MAX_REMOVED {
+                    self.removed.clear();
+                    self.full_gen = gen;
+                }
+            }
+        }
+    }
 }
 
 fn store() -> &'static RwLock<Option<Table>> {
@@ -254,18 +295,15 @@ fn apply_table_inner(id: &Value, req: &Value) -> Value {
     }
     let t = if full { g.insert(Table::default()) } else { g.as_mut().expect("checked above") };
     t.gen = gen;
+    t.tracked = true;
+    if full {
+        t.full_gen = gen;
+    }
     if !codes.is_empty() || full {
         t.codes = Arc::new(codes);
     }
     for (k, rows) in parsed {
-        match rows {
-            Some(r) => {
-                t.pools.insert(k, r);
-            }
-            None => {
-                t.pools.remove(&k);
-            }
-        }
+        t.set_pool(k, rows, gen);
     }
     json!({ "id": id, "ok": true, "gen": t.gen, "pools": t.pools.len() })
 }
@@ -294,15 +332,20 @@ pub fn table_from_messages(msgs: &[Value]) -> Result<Table, String> {
         }
         let tb = t.as_mut().expect("set above");
         tb.gen = m.get("gen").and_then(|g| g.as_u64()).unwrap_or(0);
+        tb.tracked = true;
+        if full {
+            tb.full_gen = tb.gen;
+        }
         let codes: Vec<String> = m.get("codes").and_then(|c| c.as_array()).map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect()).unwrap_or_default();
         if !codes.is_empty() || full {
             tb.codes = Arc::new(codes);
         }
+        let g = tb.gen;
         for (k, v) in pools {
             if v.is_null() {
-                tb.pools.remove(&k.to_ascii_lowercase());
+                tb.set_pool(k.to_ascii_lowercase(), None, g);
             } else {
-                tb.pools.insert(k.to_ascii_lowercase(), parse_rows(v).map_err(|e| format!("message {i} pool {k}: {e}"))?);
+                tb.set_pool(k.to_ascii_lowercase(), Some(parse_rows(v).map_err(|e| format!("message {i} pool {k}: {e}"))?), g);
             }
         }
     }

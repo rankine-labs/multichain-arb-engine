@@ -4,7 +4,7 @@ import { tmpdir } from 'os';
 import { join } from 'path';
 import { FeedMsg } from '../chains/nitroFeed';
 import { TriggerFirst, TrigCopy2, trigFirstSettings } from '../execution/triggerFirst';
-import { TrigEntry, EntryCandidate, TablePool, TableRoute, entrySettings } from '../execution/trigEntry';
+import { TrigEntry, EntryCandidate, TablePool, TableRoute, entrySettings, nodeAsksOn } from '../execution/trigEntry';
 import { JsonlLog } from '../execution/localSimHost';
 import { LocalSimClient } from '../execution/localSim';
 import { SIM_EXECUTOR_ADDRESS } from '../execution/simulator';
@@ -183,6 +183,24 @@ async function main() {
   assert(sentAfter === sentBefore, 'unchanged refresh: nothing sent to the sidecar');
   assert(B.u.builds() - buildsBefore === 600, 'unchanged refresh: only the host\'s cheap route list is walked');
   assert(again.busyMs <= again.lastMs + 0.01, 'busy time is measured apart from waiting');
+
+  // ---- 5. SPEED FIX (Oct 28): the bot stops asking when Rust decides -------------------
+  // Default rules: Node asks unless the Rust fast lane is the sender; the setting wins.
+  assert(nodeAsksOn({}) === true, 'no fast lane: the bot asks (unchanged)');
+  assert(nodeAsksOn({ FASTLANE: 'practice', RUST_SENDER: 'off' }) === true, 'practice with Node as sender: the bot still asks (its fire-first is the live path)');
+  assert(nodeAsksOn({ FASTLANE: 'live', RUST_SENDER: 'on' }) === false, 'Rust is the sender: the bot stops asking by default');
+  assert(nodeAsksOn({ FASTLANE: 'live', RUST_SENDER: 'on', TRIG_ENTRY_NODE_ASKS: 'on' }) === true, 'TRIG_ENTRY_NODE_ASKS=on wins');
+  assert(nodeAsksOn({ FASTLANE: 'practice', TRIG_ENTRY_NODE_ASKS: 'off' }) === false, 'TRIG_ENTRY_NODE_ASKS=off wins');
+  // Asking off: a feed trigger asks nothing, but the table still goes to the sidecar.
+  const N = setup({ ...base, FASTLANE: 'practice', TRIG_ENTRY_NODE_ASKS: 'off' });
+  const tn = await trigger();
+  N.tf.onFeedMsgs(tn.msgs, Date.now());
+  N.te.onFeedMsgs(tn.msgs, Date.now());
+  await new Promise((r) => setTimeout(r, 50));
+  assert(!N.sc.asked.some((m) => m.type === 'trig_discover' || m.type === 'trig_entry'), 'asking off: no trigger question sent for a feed trigger');
+  await N.te.refreshTable();
+  assert(N.sc.asked.some((m) => m.type === 'trig_table'), 'asking off: the candidate table is still sent (Rust needs it)');
+  assert(N.spies.sends === 0, 'asking off: nothing sent');
 }
 
 main().catch((e) => { console.error(e); process.exitCode = 1; });
