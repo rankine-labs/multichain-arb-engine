@@ -64,11 +64,14 @@ pub struct FetchOpts {
     /// Only questions about transactions the chain says moved our pools
     /// (spends the cap on "the prize" first).
     pub moved_only: bool,
+    /// AT ITS OWN POSITION (trig_replay.rs): besides every WRONG answer, this
+    /// many correct ones are asked again that way too (a control).
+    pub own_control: usize,
 }
 
 impl Default for FetchOpts {
     fn default() -> Self {
-        FetchOpts { max_calls: 3000, max_paid: 3000, rounds: 6, moved_only: false }
+        FetchOpts { max_calls: 3000, max_paid: 3000, rounds: 6, moved_only: false, own_control: 10 }
     }
 }
 
@@ -169,6 +172,11 @@ impl ReplayFetcher {
             return Err("--fetch: no node (free node switched off and no paid node set)".into());
         }
         Ok(Self::new(public, paid, opts))
+    }
+
+    /// A value already fetched at `block` (None = not fetched / failed).
+    pub fn cached(&self, block: u64, item: &MissItem) -> Option<&Fetched> {
+        self.cache.get(&(block, item.clone())).and_then(|x| x.as_ref())
     }
 
     pub fn calls(&self) -> u64 {
@@ -567,4 +575,34 @@ mod tests {
         d.to = Some(caller);
         assert!(!proven_untouching(&view, &d, &|_| false));
     }
+}
+
+/// The item a fetched value answers.
+pub fn item_of(f: &Fetched) -> MissItem {
+    match f {
+        Fetched::Slot(a, s, _) => MissItem::Slot(*a, *s),
+        Fetched::Account(a, _) => MissItem::Account(*a),
+    }
+}
+
+/// The contract an item belongs to.
+pub fn owner_of(m: &MissItem) -> Option<Address> {
+    match m {
+        MissItem::Slot(a, _) | MissItem::Account(a) => Some(*a),
+        MissItem::Code(_) => None,
+    }
+}
+
+/// A fetched value, as text (equal text = equal value).
+pub fn value_text(f: &Fetched) -> String {
+    match f {
+        Fetched::Slot(_, _, v) => format!("{v:#x}"),
+        Fetched::Account(_, None) => "empty".into(),
+        Fetched::Account(_, Some(a)) => format!("bal {:#x} nonce {} code {:#x}", a.balance, a.nonce, revm::primitives::keccak256(&a.code)),
+    }
+}
+
+/// The calls one item costs (see calls_for).
+pub fn item_calls(m: &MissItem) -> u64 {
+    calls_for(m)
 }

@@ -3842,7 +3842,7 @@ fn fastlane_trig_replay_fetch_asks_again_with_fetched_values() {
         }
     }
     let fake = || Fake {
-        codes: [(s_addr, s_code.clone()), (r_addr, r_code.clone()), (w_addr, w_code.clone())].into_iter().collect(),
+        codes: [(s_addr, s_code.clone()), (r_addr, r_code.clone()), (w_addr, w_code.clone()), (a(V2P), fl_pool_code())].into_iter().collect(),
         slots: [((w_addr, wl_slot), U256::from(1u8))].into_iter().collect(),
         calls: Mutex::new((0, Vec::new())),
     };
@@ -3882,6 +3882,8 @@ fn fastlane_trig_replay_fetch_asks_again_with_fetched_values() {
     assert_eq!(x["beforeToAfter"]["unknown miss -> moved none (trigger ran)"], json!(2), "{x}");
     assert_eq!((x["requests"]["callsPaidNode"].clone(), x["stillUnknown"]["n"].clone()), (json!(0), json!(0)), "{x}");
     assert!(x["requests"]["callsFreeNode"].as_u64().unwrap() >= 9, "{x}");
+    // The control (R, answered right) asked AT ITS OWN POSITION agrees.
+    assert_eq!(x["controlAtItsOwnPosition"]["same pools as the chain"], json!(1), "{x}");
     // Every value was asked at the copy version's block, never "latest".
     let asked = f.json();
     assert_eq!(asked["valuesFailed"], json!(0), "{asked}");
@@ -3955,4 +3957,88 @@ fn trig_discover_self_only_target_proof() {
     let st = arbsim::server::handle(&ctx, &json!({"id": 14, "type": "status"}));
     let d = &st["discoverFill"];
     assert!(d["targets"].as_u64().unwrap() >= 2, "{d}");
+}
+
+// trig-replay --fetch, round 3: a WRONG answer explained, and WARM COST.
+// Copy 2 at H; the trigger (block H+2, copy 2 blocks behind) calls a router
+// that forwards to our pool V2P only when its own flag (slot 0) is set. The
+// flag is 0 at H and 1 at H+1 (a transaction in between set it: the copy
+// lag). Fetched at the copy version's block (H) our answer is "moved none",
+// the chain says it moved V2P: WRONG. Asked AT ITS OWN POSITION (every value
+// fetched at the end of H+1) it moves V2P: same pools as the chain, and the
+// flag is named as the value that differs. WARM COST counts the flag as a
+// value that changes, and the router as a feed transaction's target.
+#[test]
+fn fastlane_trig_replay_fetch_explains_wrong_by_own_position() {
+    use arbsim::copy2::ahead::AheadCfg;
+    use arbsim::copy2::ahead_capture::{CapEv, CapFile, ProvSets};
+    use arbsim::fastlane::replay_fetch::{FetchOpts, ReplayFetcher};
+    use arbsim::fastlane::trig_replay::{print_report, trig_replay_with, TrigReplayOpts};
+    use arbsim::fastlane::trigger::TrigCfg;
+    let (r, _ctx) = trig_world_code(fl_pool_code());
+    let v = r.sh.head().unwrap();
+    let h = v.seq;
+    let r2 = check_util::addr(0x4078);
+    let mut code = check_util::hex("6000 54 6007 57 00 5b 36 6000 6000 37 6000 6000 36 6000 6000 73");
+    code.extend_from_slice(a(V2P).as_slice());
+    code.extend(check_util::hex("5a f1 50 00"));
+    struct Fake {
+        codes: HashMap<Address, Vec<u8>>,
+        flag_from: String,
+        flag_at: Address,
+    }
+    impl NodeApi for Fake {
+        fn call_batch(&self, _c: Class, calls: &[(&str, Value)]) -> Result<Vec<CallResult>, NodeErr> {
+            Ok(calls
+                .iter()
+                .map(|(m, p)| {
+                    let addr = parse_address(p[0].as_str().unwrap()).unwrap();
+                    let tag = p.as_array().unwrap().last().unwrap().as_str().unwrap().to_string();
+                    Ok(match *m {
+                        "eth_getStorageAt" => {
+                            let s = parse_u256(p[1].as_str().unwrap()).unwrap();
+                            let set = addr == self.flag_at && s.is_zero() && tag == self.flag_from;
+                            json!(if set { "0x1" } else { "0x0" })
+                        }
+                        "eth_getBalance" => json!("0x0"),
+                        "eth_getTransactionCount" => json!(if self.codes.contains_key(&addr) { "0x1" } else { "0x0" }),
+                        "eth_getCode" => json!(arbsim::check::hexutil::to_hex(self.codes.get(&addr).map(|c| c.as_slice()).unwrap_or(&[]))),
+                        _ => return Err(RpcErr { code: -32601, message: "method not found".into() }),
+                    })
+                })
+                .collect())
+        }
+    }
+    let fake = Fake { codes: [(r2, code), (a(V2P), fl_pool_code())].into_iter().collect(), flag_from: format!("{:#x}", h + 1), flag_at: r2 };
+    let fp = arbsim::check::moved::FollowedPool { key: format!("{:#x}", a(V2P)), address: a(V2P), v4_id: None };
+    let trig = signed(0, r2, u(2_000_000).to_be_bytes::<32>().to_vec());
+    let wm = |seq: u64, txs: &[&Vec<u8>]| arbsim::check::ordered::WireFeedMsg { seq, ts: 60 + seq, l1: 9000, txs: txs.iter().map(|t| hexb(t)).collect(), complete: true, why: None };
+    let setter = signed_b(0, r2, vec![0x12, 0x34, 0x56, 0x78]);
+    let events = vec![
+        CapEv::Header { cfg: AheadCfg::default(), l2_offset: 0, live: "{}".into() },
+        CapEv::Pools { list: vec![(fp, a(COIN0), a(COIN1))], not_ready: vec![] },
+        CapEv::Prov(Arc::new(ProvSets::from_copy2(&r.h.provenance_at(h, &[])))),
+        CapEv::Confirmed { seq: v.seq, ctx: v.ctx.clone(), snap: v.snap.clone() },
+        CapEv::Feed(Arc::new(arbsim::check::feedstore::BinMsg::from_wire(&wm(h + 1, &[&setter]), true))),
+        CapEv::Feed(Arc::new(arbsim::check::feedstore::BinMsg::from_wire(&wm(h + 2, &[&trig]), true))),
+        CapEv::Moves(vec![(keccak256(&trig), Some(vec![format!("{:#x}", a(V2P))]))]),
+        CapEv::End { live: "{}".into(), why: "done".into() },
+    ];
+    let cap = CapFile { events, complete: true, cut: None };
+    let mut f = ReplayFetcher::new(Some(Box::new(fake)), None, FetchOpts { max_paid: 0, moved_only: true, ..Default::default() });
+    let rep = trig_replay_with(&cap, None, &TrigCfg::default(), &TrigReplayOpts { no_full: true, ..Default::default() }, Some(&mut f)).unwrap();
+    println!("{}", print_report(&rep));
+    let x = &rep["fetch"];
+    assert_eq!(x["chainSaysMovedOurPools"]["WRONG: we say moved none"], json!(1), "{x}");
+    assert_eq!(x["wrongAtItsOwnPosition"]["same pools as the chain"], json!(1), "{x}");
+    let w = &x["wrongSamples"][0];
+    assert_eq!((w["copyLagBlocks"].clone(), w["earlierTxsInItsBlock"].clone()), (json!(2), json!(0)), "{w}");
+    assert!(w["valuesDifferentAtItsOwnPosition"].to_string().contains("0x0 -> 0x1"), "the flag is named: {w}");
+    let wc = &x["warmCost"];
+    assert_eq!(wc["itemsThatChange"], json!(1), "{wc}");
+    assert!(wc["topContracts"].to_string().contains("\"feedTxsToIt\":2"), "the setter and the trigger: {wc}");
+    assert_eq!(wc["curve"][0]["triggersCovered"], json!(1), "{wc}");
+    // The one covered trigger's flag had no earlier value: a warm copy
+    // couldn't have held it with no fetch.
+    assert_eq!(wc["curve"][0]["noFetchAtDecisionPct"]["strict"], json!(0.0), "{wc}");
 }

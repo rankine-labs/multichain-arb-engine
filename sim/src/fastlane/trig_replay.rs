@@ -100,7 +100,7 @@ use revm::primitives::{Address, B256};
 use serde_json::{json, Value};
 
 use super::coverage::{miss_role, origin, Tally};
-use super::replay_fetch::{proven_untouching, target_code, Overlay, OverlayProv, ReplayFetcher, TargetCode};
+use super::replay_fetch::{item_calls, item_of, owner_of, proven_untouching, target_code, value_text, Overlay, OverlayProv, ReplayFetcher, TargetCode};
 use super::scan::{evaluate, CheckRunner, PreparedCheck};
 use super::trigger::{opportunity, quick_skip, TrigCfg};
 use super::types::Opportunity;
@@ -317,9 +317,155 @@ impl SelfOnly {
     }
 }
 
+/// WARM COST (--fetch, Oct 27 round 3): what keeping the needed values
+/// warm would cost. Per item: every value fetched for it (block, value).
+/// Per asked-again trigger: its target and the values it needed.
+#[derive(Default)]
+struct Warm {
+    hist: HashMap<MissItem, Vec<(u64, String)>>,
+    trigs: Vec<WarmTrig>,
+}
+
+struct WarmTrig {
+    target: Option<Address>,
+    /// Block of the copy version its values were fetched at.
+    block: u64,
+    items: Vec<(MissItem, String)>,
+    /// Answered (moved / moved none) after the fetch.
+    covered: bool,
+    chain_moved: bool,
+}
+
+impl Warm {
+    fn note(&mut self, item: &MissItem, block: u64, v: &str) {
+        let h = self.hist.entry(item.clone()).or_default();
+        if !h.iter().any(|(b, _)| *b == block) {
+            h.push((block, v.to_string()));
+            h.sort_by_key(|x| x.0);
+        }
+    }
+
+    fn changing(&self, item: &MissItem) -> bool {
+        self.hist.get(item).is_some_and(|h| h.iter().any(|(_, v)| *v != h[0].1))
+    }
+
+    /// Would a warm copy have held this trigger's values with NO fetch at
+    /// decision time? (strict: the newest earlier value is the same, or the
+    /// value never changes in the capture; touch: also when it changed but a
+    /// feed transaction to its contract came in between, so a refresh on
+    /// that evidence would have caught it.)
+    fn no_fetch(&self, t: &WarmTrig, l2: u64, touches: &HashMap<Address, Vec<u64>>) -> (bool, bool) {
+        let (mut strict, mut touch) = (true, true);
+        for (it, v) in &t.items {
+            let Some(h) = self.hist.get(it) else { continue };
+            if !h.iter().any(|(_, x)| x != v) {
+                continue; // never changes in the capture
+            }
+            let prev = h.iter().rev().find(|(b, _)| *b < t.block);
+            match prev {
+                Some((_, pv)) if pv == v => {}
+                Some((pb, _)) => {
+                    strict = false;
+                    let (from, to) = (pb.saturating_sub(l2), t.block.saturating_sub(l2));
+                    let seen = owner_of(it).and_then(|o| touches.get(&o)).is_some_and(|ts| ts.iter().any(|s| *s > from && *s <= to));
+                    if !seen {
+                        touch = false;
+                    }
+                }
+                None => {
+                    strict = false;
+                    touch = false;
+                }
+            }
+        }
+        (strict, touch)
+    }
+
+    fn json(&self, l2: u64, touches: &HashMap<Address, Vec<u64>>, dur_s: f64, calls_now: u64) -> Value {
+        let h = (dur_s / 3600.0).max(1e-9);
+        let kind = |m: &MissItem| match m {
+            MissItem::Slot(..) => "slot",
+            MissItem::Account(_) => "account (balance, nonce, code)",
+            MissItem::Code(_) => "code",
+        };
+        let mut kinds = Tally::default();
+        let (mut once, mut steady, mut changing) = (0u64, 0u64, 0u64);
+        let mut by_owner: HashMap<Address, (u64, u64)> = HashMap::new();
+        for (it, hist) in &self.hist {
+            kinds.add(kind(it));
+            let ch = self.changing(it);
+            if hist.len() == 1 {
+                once += 1;
+            } else if ch {
+                changing += 1;
+            } else {
+                steady += 1;
+            }
+            if let Some(o) = owner_of(it) {
+                let e = by_owner.entry(o).or_default();
+                e.0 += 1;
+                e.1 += ch as u64;
+            }
+        }
+        let mut owners: Vec<(Address, (u64, u64))> = by_owner.into_iter().collect();
+        owners.sort_by(|a, b| b.1 .0.cmp(&a.1 .0).then(a.0.cmp(&b.0)));
+        // Targets ranked by triggers the fetch made answerable.
+        let mut per: HashMap<Address, (u64, u64)> = HashMap::new();
+        for t in self.trigs.iter().filter(|t| t.covered) {
+            if let Some(a) = t.target {
+                let e = per.entry(a).or_default();
+                e.0 += 1;
+                e.1 += t.chain_moved as u64;
+            }
+        }
+        let mut rank: Vec<(Address, (u64, u64))> = per.into_iter().collect();
+        rank.sort_by(|a, b| b.1 .1.cmp(&a.1 .1).then(b.1 .0.cmp(&a.1 .0)).then(a.0.cmp(&b.0)));
+        let mut curve = Vec::new();
+        for n in [1usize, 3, 5, 10, 20, usize::MAX] {
+            let top: HashSet<Address> = rank.iter().take(n).map(|x| x.0).collect();
+            if n != usize::MAX && n > rank.len() && n != 1 {
+                continue;
+            }
+            let trigs: Vec<&WarmTrig> = self.trigs.iter().filter(|t| t.covered && t.target.is_some_and(|a| top.contains(&a))).collect();
+            let mut items: HashSet<&MissItem> = HashSet::new();
+            for t in &trigs {
+                items.extend(t.items.iter().map(|(i, _)| i));
+            }
+            let once_calls: u64 = items.iter().map(|i| item_calls(i)).sum();
+            let ch: Vec<&&MissItem> = items.iter().filter(|i| self.changing(i)).collect();
+            let ch_calls: u64 = ch.iter().map(|i| item_calls(i)).sum();
+            let touch_calls: f64 = ch.iter().map(|i| owner_of(i).and_then(|o| touches.get(&o)).map_or(0, |v| v.len()) as f64 * item_calls(i) as f64).sum();
+            let nf: Vec<(bool, bool)> = trigs.iter().map(|t| self.no_fetch(t, l2, touches)).collect();
+            let share = |k: usize| if nf.is_empty() { 0.0 } else { (nf.iter().filter(|x| if k == 0 { x.0 } else { x.1 }).count() as f64 / nf.len() as f64 * 1000.0).round() / 10.0 };
+            curve.push(json!({
+                "topTargets": if n == usize::MAX { json!("all") } else { json!(n) },
+                "triggersCovered": trigs.len(), "ofWhichChainMovedOurPools": trigs.iter().filter(|t| t.chain_moved).count(),
+                "distinctItems": items.len(), "oneTimeCalls": once_calls, "itemsThatChange": ch.len(),
+                "refreshOnTouchCallsPerHour": (touch_calls / h).round() as u64, "timer1sCallsPerHour": ch_calls * 3600, "timer10sCallsPerHour": ch_calls * 360,
+                "noFetchAtDecisionPct": {"strict": share(0), "withRefreshOnTouch": share(1)},
+            }));
+        }
+        json!({
+            "captureSeconds": dur_s, "fetchOnDemandCallsPerHour": (calls_now as f64 / h).round() as u64,
+            "distinctItems": self.hist.len(), "byKind": kinds.json(4),
+            "itemsSeenAtOneBlockOnly": once, "itemsSameAtEveryBlock": steady, "itemsThatChange": changing,
+            "topContracts": owners.iter().take(12).map(|(a, (n, c))| json!({"contract": format!("{a:#x}"), "items": n, "change": c, "feedTxsToIt": touches.get(a).map_or(0, |v| v.len())})).collect::<Vec<_>>(),
+            "topTargets": rank.iter().take(20).map(|(a, (n, m))| json!([format!("{a:#x}"), n, m])).collect::<Vec<_>>(),
+            "curve": curve,
+            "note": "items = values the asked-again triggers needed (fetched at their copy version's block); 'change' = two different values at two blocks of the capture (an item seen at one block only counts as unchanging: optimistic); refresh on touch = re-read a changing item after every feed transaction TO its contract (misses changes made by calls from elsewhere, e.g. a coin balance moved through a router); timer = re-read every changing item every 1 s / 10 s; values fetched for the AT ITS OWN POSITION runs count as observations too; noFetchAtDecision = covered triggers whose every value a warm copy would already have held",
+        })
+    }
+}
+
 /// --fetch results (see replay_fetch.rs).
 #[derive(Default)]
 struct FetchReport {
+    warm: Warm,
+    /// AT ITS OWN POSITION: WRONG answers / correct ones (control) asked
+    /// again on values fetched at the end of the block before the trigger.
+    own_wrong: Tally,
+    own_control: Tally,
+    own_control_n: usize,
     /// Unknown discovery answers (miss / sender funds) the fetch was tried on.
     tried: u64,
     skipped_scope: u64,
@@ -419,6 +565,9 @@ pub fn trig_replay_with(cap: &CapFile, table: Option<&Table>, cfg: &TrigCfg, opt
     let mut self_only_base = SelfOnly::default();
     let mut fxr = FetchReport::default();
     let mut overlay: Option<Overlay> = None;
+    // Feed transactions to each contract (seq), and the capture's time span.
+    let mut touches: HashMap<Address, Vec<u64>> = HashMap::new();
+    let (mut ts_min, mut ts_max) = (u64::MAX, 0u64);
     let sender_funds = cfg.assume.iter().any(|a| a == "sender_funds") && !cfg.strict;
     let recent_fill = cfg.assume.iter().any(|a| a == "recent_fill") && !cfg.strict;
     let skip_allowed = cfg.assume.iter().any(|a| a == "skip") && !cfg.strict;
@@ -488,6 +637,15 @@ pub fn trig_replay_with(cap: &CapFile, table: Option<&Table>, cfg: &TrigCfg, opt
             }
             CapEv::Feed(m) => {
                 msgs += 1;
+                ts_min = ts_min.min(m.ts);
+                ts_max = ts_max.max(m.ts);
+                for t in &m.txs {
+                    if let Ok(d) = t.decoded() {
+                        if let Some(to) = d.to {
+                            touches.entry(to).or_default().push(m.seq);
+                        }
+                    }
+                }
                 held.insert(m.seq, m.clone());
                 while held.len() > 256 {
                     let k = *held.keys().next().expect("non-empty");
@@ -574,6 +732,7 @@ pub fn trig_replay_with(cap: &CapFile, table: Option<&Table>, cfg: &TrigCfg, opt
                     // --fetch: fetch what was missing (or only assumed) at this
                     // version's block, ask again (see replay_fetch.rs).
                     let mut after: Option<Result<(OrderedOut, Vec<String>), CheckUnknown>> = None;
+                    let mut needed: Vec<(MissItem, String)> = Vec::new();
                     if let Some(f) = fetcher.as_deref_mut() {
                         if let Err(u) = &r {
                             if matches!(u.reason, UnknownReason::Miss | UnknownReason::SenderFunds) {
@@ -583,10 +742,10 @@ pub fn trig_replay_with(cap: &CapFile, table: Option<&Table>, cfg: &TrigCfg, opt
                                     fxr.skipped_cap += 1;
                                 } else {
                                     fxr.tried += 1;
-                                    if overlay.as_ref().is_none_or(|o| o.seq != cseq) {
-                                        overlay = Some(Overlay::new(cseq, csnap.clone()));
-                                    }
-                                    let o = overlay.as_mut().expect("just set");
+                                    // A fresh overlay per question (the cache keeps repeats
+                                    // free), so every value it needed is known (WARM COST).
+                                    let mut ov = Overlay::new(cseq, csnap.clone());
+                                    let o = &mut ov;
                                     let block = cseq + l2_offset;
                                     let ask = |o: &Overlay| discover(&View::new(o.snap.clone()), &alone, &OverlayProv { inner: prov.as_ref(), o }, &index);
                                     let mut cur = ask(o);
@@ -607,10 +766,18 @@ pub fn trig_replay_with(cap: &CapFile, table: Option<&Table>, cfg: &TrigCfg, opt
                                         if got.is_empty() {
                                             break;
                                         }
+                                        for g in &got {
+                                            let (k, v) = (item_of(g), value_text(g));
+                                            fxr.warm.note(&k, block, &v);
+                                            if !needed.iter().any(|(x, _)| *x == k) {
+                                                needed.push((k, v));
+                                            }
+                                        }
                                         o.add(&got);
                                         cur = ask(o);
                                         rounds += 1;
                                     }
+                                    overlay = Some(ov);
                                     fxr.rounds.push(rounds);
                                     let (b, _) = fx_class(&r);
                                     let (a, _) = fx_class(&cur);
@@ -640,11 +807,74 @@ pub fn trig_replay_with(cap: &CapFile, table: Option<&Table>, cfg: &TrigCfg, opt
                         } else {
                             "we say moved none".to_string()
                         };
+                        if after.is_some() {
+                            fxr.warm.trigs.push(WarmTrig { target: dec.to, block: cseq + l2_offset, items: needed.clone(), covered: !kind.starts_with("unknown"), chain_moved: chain_did });
+                        }
                         if chain_did {
                             let v = if verdict == "we say moved none" { "WRONG: we say moved none".to_string() } else { verdict.clone() };
                             fxr.chain_moved.add(v.clone());
-                            if v.starts_with("WRONG") && fxr.wrong.len() < 20 {
-                                fxr.wrong.push(json!({"trigger": format!("{:#x}", t.hash), "to": dec.to.map(|a| format!("{a:#x}")), "we": kind, "chainPools": chain_pools, "fetched": after.is_some()}));
+                            let wrong = v.starts_with("WRONG");
+                            let control = verdict == "known: same pools" && after.is_some() && fxr.own_control_n < f.opts.own_control;
+                            if wrong || control {
+                                // AT ITS OWN POSITION: every value fetched at the end
+                                // of the block before the trigger (no copy-2 values at
+                                // all), the trigger run alone there (earlier
+                                // transactions of its own block are not replayed:
+                                // counted as earlierTxsInItsBlock).
+                                let own_block = (m.seq + l2_offset).saturating_sub(1);
+                                let mut o2 = Overlay::new(m.seq.saturating_sub(1), Arc::new(Snapshot::default()));
+                                let allx = crate::check::ordered::AllExact;
+                                let ask2 = |o: &Overlay| discover(&View::new(o.snap.clone()), &alone, &OverlayProv { inner: &allx, o }, &index);
+                                let mut c2r = ask2(&o2);
+                                let mut n2 = 0;
+                                while n2 < 20 {
+                                    let items = match &c2r {
+                                        Err(u) if u.reason == UnknownReason::Miss => u.missing.clone(),
+                                        Err(u) if u.reason == UnknownReason::SenderFunds => u.assumed.clone(),
+                                        _ => break,
+                                    };
+                                    let got = f.fetch(own_block, &items, &o2.snap);
+                                    if items.is_empty() || got.is_empty() {
+                                        break;
+                                    }
+                                    for g in &got {
+                                        fxr.warm.note(&item_of(g), own_block, &value_text(g));
+                                    }
+                                    o2.add(&got);
+                                    c2r = ask2(&o2);
+                                    n2 += 1;
+                                }
+                                let (k2, p2) = fx_class(&c2r);
+                                let own = if k2 == "moved our pools" {
+                                    if p2.iter().all(|p| chain_pools.contains(p)) && chain_pools.iter().all(|p| p2.contains(p)) { "same pools as the chain".to_string() } else { "other pools".to_string() }
+                                } else {
+                                    k2.clone()
+                                };
+                                if wrong {
+                                    fxr.own_wrong.add(own.clone());
+                                    let ours = match fin {
+                                        Ok((o, _)) => o.replayed.first().map(|x| if x.outcome.success { "trigger ran, changed none of our pools".to_string() } else { format!("trigger reverted: {}", short_detail(&revert_text(&x.outcome))) }).unwrap_or_default(),
+                                        Err(_) => String::new(),
+                                    };
+                                    let role = |it: &MissItem| miss_role(it, Some(&me), &|a| pool_addrs.contains(&a), &|a| coin_addrs.contains(&a));
+                                    let diffs: Vec<String> = needed
+                                        .iter()
+                                        .filter_map(|(it, v)| f.cached(own_block, it).map(value_text).filter(|v2| v2 != v).map(|v2| format!("{} {}: {} -> {}", role(it), item_text(it), v.chars().take(40).collect::<String>(), v2.chars().take(40).collect::<String>())))
+                                        .take(4)
+                                        .collect();
+                                    if fxr.wrong.len() < 25 {
+                                        fxr.wrong.push(json!({
+                                            "trigger": format!("{:#x}", t.hash), "to": dec.to.map(|a| format!("{a:#x}")), "chainPools": chain_pools,
+                                            "ourRun": ours, "copyLagBlocks": m.seq.saturating_sub(cseq),
+                                            "earlierTxsInItsBlock": m.txs.iter().position(|x| x.hash == t.hash).unwrap_or(0),
+                                            "atItsOwnPosition": own, "ownPositionRounds": n2,
+                                            "valuesDifferentAtItsOwnPosition": diffs,
+                                        }));
+                                    }
+                                } else {
+                                    fxr.own_control_n += 1;
+                                    fxr.own_control.add(own);
+                                }
                             }
                         } else if truth.contains_key(&t.hash) {
                             fxr.chain_none.add(verdict.clone());
@@ -826,6 +1056,10 @@ pub fn trig_replay_with(cap: &CapFile, table: Option<&Table>, cfg: &TrigCfg, opt
                 "senderFundsRevertsWithRealValues": fxr.sender.json(8),
                 "senderFundsNote": "questions that answered sender_funds_revert (before, or in a fetch round once the contract's code was there): the answer once the made-up sender values were replaced by the real ones",
                 "wrongSamples": fxr.wrong,
+                "wrongAtItsOwnPosition": fxr.own_wrong.json(8),
+                "controlAtItsOwnPosition": fxr.own_control.json(8),
+                "ownPositionNote": "every value fetched at the end of the block BEFORE the trigger (none from copy 2), the trigger run alone there; earlier transactions of its own block are not replayed. control = triggers we already answered right, asked the same way",
+                "warmCost": fxr.warm.json(l2_offset, &touches, if ts_max > ts_min { (ts_max - ts_min) as f64 } else { 1.0 }, f.calls()),
                 "stillUnknown": fxr.blame.json(20),
                 "stillUnknownSelfOnly": fxr.self_only.json(),
                 "note": "values fetched at the block of the copy version each question was asked on (exact there), free node first; 'known' = same pools as the chain; WRONG = we say moved none, the chain says it moved our pools",
@@ -951,6 +1185,16 @@ pub fn print_report(r: &Value) -> String {
         for w in x["wrongSamples"].as_array().into_iter().flatten() {
             o += &format!("    wrong: {w}\n");
         }
+        o += &format!("  WRONG asked AT ITS OWN POSITION: {}   control (answered right before): {}\n", x["wrongAtItsOwnPosition"], x["controlAtItsOwnPosition"]);
+        let wc = &x["warmCost"];
+        o += &format!("  WARM COST (capture {} s; fetching on demand = {} calls/hour): {} distinct items {}; seen at one block only {}, same at every block {}, CHANGE {}\n", wc["captureSeconds"], wc["fetchOnDemandCallsPerHour"], wc["distinctItems"], wc["byKind"], wc["itemsSeenAtOneBlockOnly"], wc["itemsSameAtEveryBlock"], wc["itemsThatChange"]);
+        for c in wc["topContracts"].as_array().into_iter().flatten() {
+            o += &format!("    contract {c}\n");
+        }
+        o += &format!("    targets (target, triggers covered, of which chain moved): {}\n", wc["topTargets"]);
+        for c in wc["curve"].as_array().into_iter().flatten() {
+            o += &format!("    curve {c}\n");
+        }
         print_blame(&mut o, "STILL UNKNOWN after fetch", &x["stillUnknown"]);
         print_self_only(&mut o, "STILL UNKNOWN, SELF-ONLY TARGETS", &x["stillUnknownSelfOnly"]);
     }
@@ -971,7 +1215,7 @@ pub fn print_report(r: &Value) -> String {
 /// `arbsim trig-replay <capture file> [--table <file>] [--ours a,b] [--json] [--samples N] [--partial] [--no-full]`
 pub fn replay_main(args: &[String]) {
     let Some(path) = args.get(2).filter(|a| !a.starts_with("--")) else {
-        eprintln!("usage: arbsim trig-replay <capture file> [--table <file>] [--ours 0x..,0x..] [--json] [--samples N] [--partial] [--no-full] [--fetch [--fetch-max 3000] [--fetch-paid on|off] [--fetch-paid-max N] [--fetch-scope all|moved] [--fetch-rounds 6] [--fetch-url-env NAME]]");
+        eprintln!("usage: arbsim trig-replay <capture file> [--table <file>] [--ours 0x..,0x..] [--json] [--samples N] [--partial] [--no-full] [--fetch [--fetch-max 3000] [--fetch-paid on|off] [--fetch-paid-max N] [--fetch-scope all|moved] [--fetch-rounds 6] [--fetch-own-control 10] [--fetch-url-env NAME]]");
         std::process::exit(2);
     };
     let val = |f: &str| args.iter().position(|a| a == f).and_then(|i| args.get(i + 1)).cloned();
@@ -1021,6 +1265,7 @@ pub fn replay_main(args: &[String]) {
             max_paid: if paid_on { num("--fetch-paid-max", max_calls) } else { 0 },
             rounds: num("--fetch-rounds", 6).clamp(1, 20) as usize,
             moved_only: val("--fetch-scope").is_some_and(|v| v == "moved"),
+            own_control: num("--fetch-own-control", 10) as usize,
         };
         match ReplayFetcher::from_env(val("--fetch-url-env").as_deref(), fo) {
             Ok(f) => fetcher = Some(f),
