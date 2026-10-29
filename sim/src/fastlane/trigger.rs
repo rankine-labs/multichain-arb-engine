@@ -355,6 +355,13 @@ pub struct TrigHour {
     pub entry_us: Vec<u64>,
     pub disc_us: Vec<u64>,
     pub checks_us: Vec<u64>,
+    /// LINE TIMER (Oct 29): for triggers that moved our pools, the time from
+    /// the feed message reaching arbsim to THIS trigger's own work starting
+    /// (us), i.e. how long it waited in line behind the message's earlier
+    /// transactions. decideUs = lineUs + this trigger's own work.
+    pub line_us: Vec<u64>,
+    /// Same triggers: their place in the message (0 = first transaction).
+    pub line_pos: Vec<u64>,
     /// (Oct 27) Every unknown (discovery and candidate checks) by
     /// "where|reason" and by "reason|where|target|first missing item"
     /// (fastlane/coverage.rs). Bounded.
@@ -392,6 +399,7 @@ impl TrigHour {
             "gunRefused": self.gun_refused, "notLeft": self.not_left, "repeats": self.repeats,
             "queueUs": pctl(&self.queue_us), "decideUs": pctl(&self.decide_us), "readyUs": pctl(&self.ready_us), "msgUs": pctl(&self.msg_us),
             "entryUs": pctl(&self.entry_us), "discUs": pctl(&self.disc_us), "checksUs": pctl(&self.checks_us),
+            "lineUs": pctl(&self.line_us), "linePos": pctl(&self.line_pos),
             "unknownWhere": self.unknown_where.json(24), "unknownTop": self.unknown_top.json(20),
             "timesNote": "inside arbsim, from the moment the feed message reached it; excludes sequencer -> bot -> arbsim delivery and block inclusion",
         })
@@ -507,7 +515,14 @@ impl Trigger {
                 continue;
             }
             let left = self.cfg.budget_us.saturating_sub(start.elapsed().as_micros() as u64).max(1_000);
-            out.push(self.one_trigger(ctx, m.seq, head.seq, newest, tx.hash, arrived, left));
+            let started = Instant::now();
+            let o = self.one_trigger(ctx, m.seq, head.seq, newest, tx.hash, arrived, left);
+            if !matches!(o, TrigOutcome::DiscoverUnknown(_) | TrigOutcome::NoPools | TrigOutcome::TooManyPools | TrigOutcome::Skipped(_) | TrigOutcome::Repeat) {
+                // Moved our pools: how long it waited in line, and where.
+                push(&mut self.hour.line_us, started.saturating_duration_since(arrived).as_micros() as u64);
+                push(&mut self.hour.line_pos, i as u64);
+            }
+            out.push(o);
         }
         push(&mut self.hour.msg_us, start.elapsed().as_micros() as u64);
         out
