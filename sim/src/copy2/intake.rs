@@ -899,6 +899,28 @@ pub struct Copy2Prov {
     pub slots: HashSet<(Address, U256)>,
 }
 
+/// Copy2Prov at block `n` from a core's block-independent index (see
+/// provenance_with). Same sets as provenance_at.
+pub fn prov_from(ix: &super::checkcore::ProvIndex, layouts: &[(Address, BalanceLayout)], n: u64, extra_holders: &[Address]) -> Copy2Prov {
+    let mut p = Copy2Prov { pms: ix.pms.clone(), ..Default::default() };
+    for (a, since) in &ix.since {
+        if *since <= n {
+            p.accts.insert(*a);
+        }
+    }
+    for (h, coin, sl) in &ix.holder_slots {
+        if p.accts.contains(h) || p.pms.contains(h) {
+            p.slots.insert((*coin, *sl));
+        }
+    }
+    for (coin, l) in layouts {
+        for h in p.pms.iter().chain(extra_holders.iter()) {
+            p.slots.insert((*coin, l.key(*h)));
+        }
+    }
+    p
+}
+
 impl crate::check::ordered::Provenance for Copy2Prov {
     fn slot_exact(&self, a: Address, slot: U256) -> bool {
         self.accts.contains(&a) || self.pms.contains(&a) || self.slots.contains(&(a, slot))
@@ -1030,24 +1052,18 @@ impl Copy2Handle {
                 return p.clone();
             }
         }
-        let ix = &core.prov;
-        let mut p = Copy2Prov { pms: ix.pms.clone(), ..Default::default() };
-        for (a, since) in &ix.since {
-            if *since <= n {
-                p.accts.insert(*a);
+        // SPEED (Oct 29): the usual question (no extra holders, a block at
+        // or after every pool's "exact since") gets the set built once with
+        // the core, on the copy's own thread (live: building it here was the
+        // biggest step of slow discoveries, p50 2.6 ms / p90 8 ms).
+        if extra_holders.is_empty() {
+            if let Some((max_since, full)) = &core.prov_full {
+                if n >= *max_since {
+                    return full.clone();
+                }
             }
         }
-        for (h, coin, sl) in &ix.holder_slots {
-            if p.accts.contains(h) || p.pms.contains(h) {
-                p.slots.insert((*coin, *sl));
-            }
-        }
-        for (coin, l) in &core.layouts {
-            for h in p.pms.iter().chain(extra_holders.iter()) {
-                p.slots.insert((*coin, l.key(*h)));
-            }
-        }
-        let p = Arc::new(p);
+        let p = Arc::new(prov_from(&core.prov, &core.layouts, n, extra_holders));
         let mut c = core.prov_cache.lock().unwrap_or_else(|e| e.into_inner());
         if c.len() >= 4 {
             c.remove(0);
@@ -1056,11 +1072,6 @@ impl Copy2Handle {
         p
     }
 
-    /// `pools_changed` from a registry summary (speed-3): no lock, the
-    /// lookup tables built once per registry change. Same answer.
-    /// Is this address one of ours: a followed pool, a PoolManager, or a
-    /// coin of a followed pool? (Discovery's self-only proof: such a
-    /// contract is never "unrelated".) Reads the registry.
     /// FAST LANE SAFETY (Oct 29): the first pool of `pools` (route keys: a
     /// pool address, or a V4 pool id) that copy 2 does NOT follow and hold
     /// as ready, with why. None = every pool is followed and ready.
@@ -1090,6 +1101,11 @@ impl Copy2Handle {
         None
     }
 
+    /// `pools_changed` from a registry summary (speed-3): no lock, the
+    /// lookup tables built once per registry change. Same answer.
+    /// Is this address one of ours: a followed pool, a PoolManager, or a
+    /// coin of a followed pool? (Discovery's self-only proof: such a
+    /// contract is never "unrelated".) Reads the registry.
     pub fn followed_or_coin(&self, core: &super::checkcore::CheckCore, a: Address) -> bool {
         if core.pm_list.contains(&a) {
             return true;
