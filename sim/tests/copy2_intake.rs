@@ -3520,6 +3520,43 @@ fn fastlane_trigger_fires_from_rust_without_waiting_for_reports() {
     arbsim::check::feedstore::store().clear();
 }
 
+// DISCOVER FIRST (Oct 29): a message [a read that moves nothing, our
+// pool's swap, a plain transfer]: the same outcomes, in message order, with
+// discover-first on (default) and off; the swap's place in the message is
+// recorded (linePos) and its wait in line is counted once.
+#[test]
+fn fastlane_trigger_discover_first_gives_the_same_outcomes_in_order() {
+    use arbsim::fastlane::lane::FiredWhat;
+    use arbsim::fastlane::trigger::{TrigCfg, TrigOutcome, Trigger};
+    let _turn = FEED_STORE_TURN.lock().unwrap_or_else(|e| e.into_inner());
+    arbsim::check::feedstore::store().clear();
+    let (_r, ctx) = trig_world_code(fl_pool_code());
+    let k = format!("{:#x}", a(V2P));
+    let ans = arbsim::check::entry::apply_table(&json!(1), &json!({"type": "trig_table", "gen": 1, "full": true, "codes": [], "pools": {k.clone(): [fl_table_row()]}}));
+    assert_eq!(ans["ok"], json!(true), "{ans}");
+    let read = signed(0, a(V2P), vec![0x09, 0x02, 0xf1, 0xac]);
+    let swap = signed(1, a(V2P), u(2_000_000).to_be_bytes::<32>().to_vec());
+    let plain = signed(2, a(V2P), vec![]);
+    let m = json!({"seq": 102, "ts": 63, "l1": 9000, "txs": [hexb(&read), hexb(&swap), hexb(&plain)]});
+    arbsim::check::feedstore::store().put_json(&json!({"type": "feed_put", "msgs": [m]}));
+    let m102 = arbsim::check::feedstore::store().get(102).unwrap();
+    for first in [true, false] {
+        let cfg = TrigCfg { max_lag_ms: 60_000, discover_first: first, ..TrigCfg::default() };
+        let (firer, _d, _h) = fl_firer(if first { "df-on" } else { "df-off" }, &[("FASTLANE", "practice")], None);
+        let mut t = Trigger::new(cfg, firer);
+        t.to_practice = false;
+        let out = t.on_message(&ctx, &m102, std::time::Instant::now());
+        assert_eq!(out.len(), 3, "{out:?}");
+        assert_eq!(out[0], TrigOutcome::NoPools, "discover_first {first}: {out:?}");
+        assert!(matches!(out[1], TrigOutcome::Fired(FiredWhat::Written { .. })), "discover_first {first}: {out:?} {}", t.hour.json());
+        assert_eq!(out[2], TrigOutcome::Skipped("plain_transfer"), "discover_first {first}: {out:?}");
+        assert_eq!((t.hour.asked, t.hour.moved, t.hour.would_send), (2, 1, 1), "discover_first {first}: {}", t.hour.json());
+        assert_eq!((t.hour.line_pos.clone(), t.hour.line_us.len(), t.hour.decide_us.len()), (vec![1], 1, 1), "discover_first {first}: {}", t.hour.json());
+    }
+    arbsim::check::entry::clear_table();
+    arbsim::check::feedstore::store().clear();
+}
+
 // STANDING GAPS ON COPY 2 (Oct 27): with the predicted copy off (the new
 // default) the fast lane scans the routes through the pools each NEW copy-2
 // version moved, on that confirmed state, and fires the best through the same

@@ -131,6 +131,14 @@ pub struct TrigCfg {
     /// has arrived but isn't replayed yet, as before. Live: the wait was
     /// ~30 ms on most questions (disc p90 30.1 ms, checks p50 28 ms).
     pub wait_for_copy: bool,
+    /// SPEED FIX 4 (Oct 29), FASTLANE_TRIG_DISCOVER_FIRST [on]: on = for a
+    /// feed message, first run the cheap "which of our pools does it move?"
+    /// discovery for EVERY transaction, then the slow candidate checks only
+    /// for the ones that moved our pools. off = each transaction fully (its
+    /// checks too) before the next, as before. Live before: a pool-moving
+    /// trigger waited behind the whole work of the transactions ahead of it
+    /// (decide p50 ~30-35 ms while its own checks were ~9 ms).
+    pub discover_first: bool,
 }
 
 impl Default for TrigCfg {
@@ -153,6 +161,7 @@ impl Default for TrigCfg {
             l2_offset: 0,
             ours: Vec::new(),
             wait_for_copy: false,
+            discover_first: true,
         }
     }
 }
@@ -200,6 +209,7 @@ impl TrigCfg {
             l2_offset: num("ARBSIM_L2_BLOCK_OFFSET").filter(|v| *v >= 0.0).map(|v| v as u64).unwrap_or(0),
             ours,
             wait_for_copy: crate::fastlane::mode::parse_on(get("FASTLANE_TRIG_WAIT").as_deref()),
+            discover_first: !crate::fastlane::mode::parse_off(get("FASTLANE_TRIG_DISCOVER_FIRST").as_deref()),
         }
     }
 }
@@ -423,6 +433,21 @@ impl TrigHour {
 // The worker
 // ---------------------------------------------------------------------------
 
+/// Did this outcome come from a trigger that moved our pools?
+fn moved_outcome(o: &TrigOutcome) -> bool {
+    !matches!(o, TrigOutcome::DiscoverUnknown(_) | TrigOutcome::NoPools | TrigOutcome::TooManyPools | TrigOutcome::Skipped(_) | TrigOutcome::Repeat)
+}
+
+/// Discovery answered and named 1..=max_pools of our pools (the cases
+/// trig_entry goes on to check; decide() treats the rest without checks).
+pub fn moves_ours(disc: &Value, max_pools: usize) -> bool {
+    if disc.get("ok") != Some(&Value::Bool(true)) {
+        return false;
+    }
+    let n = disc.get("pools").and_then(|p| p.as_array()).map(|a| a.len()).unwrap_or(0);
+    n > 0 && n <= max_pools
+}
+
 /// What happened to one trigger (tests and the per-message loop).
 #[derive(Clone, Debug, PartialEq)]
 pub enum TrigOutcome {
@@ -494,6 +519,9 @@ impl Trigger {
             return out;
         };
         let newest = crate::check::feedstore::store().newest().unwrap_or(m.seq).max(m.seq);
+        // DISCOVER FIRST: (place in `out`, place in message, question,
+        // discovery answer, discovery time us) of triggers that moved ours.
+        let mut later: Vec<(usize, usize, Value, Value, u64)> = Vec::new();
         for (i, tx) in m.txs.iter().enumerate() {
             if i >= self.cfg.max_txs || start.elapsed().as_micros() as u64 >= self.cfg.budget_us {
                 self.hour.cut += (m.txs.len() - i) as u64;
@@ -516,23 +544,56 @@ impl Trigger {
             }
             let left = self.cfg.budget_us.saturating_sub(start.elapsed().as_micros() as u64).max(1_000);
             let started = Instant::now();
-            let o = self.one_trigger(ctx, m.seq, head.seq, newest, tx.hash, arrived, left);
-            if !matches!(o, TrigOutcome::DiscoverUnknown(_) | TrigOutcome::NoPools | TrigOutcome::TooManyPools | TrigOutcome::Skipped(_) | TrigOutcome::Repeat) {
-                // Moved our pools: how long it waited in line, and where.
-                push(&mut self.hour.line_us, started.saturating_duration_since(arrived).as_micros() as u64);
-                push(&mut self.hour.line_pos, i as u64);
+            if !self.cfg.discover_first {
+                let o = self.one_trigger(ctx, m.seq, head.seq, newest, tx.hash, arrived, left);
+                if moved_outcome(&o) {
+                    // Moved our pools: how long it waited in line, and where.
+                    push(&mut self.hour.line_us, started.saturating_duration_since(arrived).as_micros() as u64);
+                    push(&mut self.hour.line_pos, i as u64);
+                }
+                out.push(o);
+                continue;
             }
-            out.push(o);
+            // DISCOVER FIRST: the cheap step now; the checks of a trigger
+            // that moved our pools wait until every transaction of the
+            // message has been through discovery.
+            self.hour.asked += 1;
+            let req = self.trigger_req(m.seq, head.seq, newest, tx.hash, left);
+            let Some(disc) = crate::server::trig_entry_discover(ctx, &json!(0), &req) else {
+                out.push(TrigOutcome::DiscoverUnknown("error".into()));
+                continue;
+            };
+            let disc_us = started.elapsed().as_micros() as u64;
+            if moves_ours(&disc, self.cfg.max_pools) {
+                out.push(TrigOutcome::Repeat); // placeholder, replaced below
+                later.push((out.len() - 1, i, req, disc, disc_us));
+            } else {
+                // Nothing of ours to check: finish it now (counts as before).
+                let mut tm = crate::timing::Tm::default();
+                let (mut ans, run) = crate::server::trig_entry_checks(ctx, &json!(0), &req, disc, started, &mut tm);
+                ans["us"] = json!(started.elapsed().as_micros() as u64);
+                out.push(self.after_entry(ans, run, m.seq, arrived));
+            }
+        }
+        // Checks of the triggers that moved our pools, in message order.
+        for (slot, i, mut req, disc, disc_us) in later {
+            let t = Instant::now();
+            push(&mut self.hour.line_us, t.saturating_duration_since(arrived).as_micros() as u64);
+            push(&mut self.hour.line_pos, i as u64);
+            let left = self.cfg.budget_us.saturating_sub(start.elapsed().as_micros() as u64).max(1_000);
+            req["budgetUs"] = json!(left);
+            let mut tm = crate::timing::Tm::default();
+            let (mut ans, run) = crate::server::trig_entry_checks(ctx, &json!(0), &req, disc, t, &mut tm);
+            // `us` = this trigger's own work: its discovery + its checks.
+            ans["us"] = json!(disc_us + t.elapsed().as_micros() as u64);
+            out[slot] = self.after_entry(ans, run, m.seq, arrived);
         }
         push(&mut self.hour.msg_us, start.elapsed().as_micros() as u64);
         out
     }
 
-    /// The bot's one-trip question for one trigger, answered by the server's
-    /// own code, then (good answer) the trade straight to safety + gun.
-    #[allow(clippy::too_many_arguments)]
-    pub fn one_trigger(&mut self, ctx: &Ctx, seq: u64, copy_seq: u64, newest: u64, hash: revm::primitives::B256, arrived: Instant, budget_us: u64) -> TrigOutcome {
-        self.hour.asked += 1;
+    /// The trig_entry question the bot would ask for one trigger.
+    fn trigger_req(&self, seq: u64, copy_seq: u64, newest: u64, hash: revm::primitives::B256, budget_us: u64) -> Value {
         // The feed messages a bot question would name (triggerFirst.ts
         // buildFeed): from a little before the copy's newest block (or the
         // trigger, if older) up to the newest message held.
@@ -543,12 +604,14 @@ impl Trigger {
             "trigger": format!("{hash:#x}"), "triggerSeq": seq, "refs": refs,
             "route": [], "strict": self.cfg.strict, "assume": self.cfg.feed_assume(),
         });
-        let req = json!({
+        json!({
             "type": "trig_entry", "at": {"after": if self.cfg.wait_for_copy { "head" } else { "headNow" }}, "feed": feed, "limit": self.cfg.max_candidates,
             "maxPools": self.cfg.max_pools, "minConf": self.cfg.min_conf, "budgetUs": budget_us,
-        });
-        let mut tm = crate::timing::Tm::default();
-        let (ans, run) = crate::server::trig_entry_run(ctx, &json!(0), &req, Instant::now(), &mut tm);
+        })
+    }
+
+    /// Count a trig_entry answer's step times, then decide on it.
+    fn after_entry(&mut self, ans: Value, run: Option<EntryRun>, seq: u64, arrived: Instant) -> TrigOutcome {
         if let Some(u) = ans.get("us").and_then(|v| v.as_u64()) {
             push(&mut self.hour.entry_us, u);
         }
@@ -559,6 +622,17 @@ impl Trigger {
             push(&mut self.hour.checks_us, c.iter().filter_map(|x| x.get("a").and_then(|a| a.get("us")).and_then(|v| v.as_u64())).sum());
         }
         self.decide(&ans, run, seq, arrived)
+    }
+
+    /// The bot's one-trip question for one trigger, answered by the server's
+    /// own code, then (good answer) the trade straight to safety + gun.
+    #[allow(clippy::too_many_arguments)]
+    pub fn one_trigger(&mut self, ctx: &Ctx, seq: u64, copy_seq: u64, newest: u64, hash: revm::primitives::B256, arrived: Instant, budget_us: u64) -> TrigOutcome {
+        self.hour.asked += 1;
+        let req = self.trigger_req(seq, copy_seq, newest, hash, budget_us);
+        let mut tm = crate::timing::Tm::default();
+        let (ans, run) = crate::server::trig_entry_run(ctx, &json!(0), &req, Instant::now(), &mut tm);
+        self.after_entry(ans, run, seq, arrived)
     }
 
     /// Count one unknown answer by where it came from and what it missed
