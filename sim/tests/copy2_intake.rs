@@ -3520,6 +3520,23 @@ fn fastlane_trigger_fires_from_rust_without_waiting_for_reports() {
     arbsim::check::feedstore::store().clear();
 }
 
+// FAST LANE SAFETY (Oct 29): a trade may only use pools copy 2 follows and
+// holds ready (a pool it doesn't follow may hold an old one-time fill).
+#[test]
+fn fastlane_only_followed_ready_pools_may_fire() {
+    let _turn = FEED_STORE_TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let (_r, ctx) = trig_world_code(fl_pool_code());
+    let c2 = ctx.copy2.as_ref().unwrap();
+    let ours = format!("{:#x}", a(V2P));
+    assert_eq!(c2.unfollowed_pool(&[ours.clone()]), None, "the followed, ready pool");
+    let other = "0xfae65eaa11943f45e83d5b45dc7a7c801c51bfb0".to_string();
+    let why = c2.unfollowed_pool(&[ours.clone(), other]).expect("a pool copy 2 doesn't follow");
+    assert!(why.contains("not followed"), "{why}");
+    let id = format!("{:#066x}", 7u64);
+    assert!(c2.unfollowed_pool(&[id]).is_some(), "an unknown V4 id");
+    assert!(c2.unfollowed_pool(&["junk".into()]).is_some());
+}
+
 // DISCOVER FIRST (Oct 29): a message [a read that moves nothing, our
 // pool's swap, a plain transfer]: the same outcomes, in message order, with
 // discover-first on (default) and off; the swap's place in the message is

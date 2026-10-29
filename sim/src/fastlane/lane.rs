@@ -384,10 +384,30 @@ pub struct Firer {
     pub book: Arc<ReplyBook>,
 }
 
+/// FAST LANE SAFETY (Oct 29): copy 2, for "is every pool of this trade
+/// followed and ready?" (set by start(); unset = no check, e.g. tests that
+/// build a Firer by hand). FASTLANE_REQUIRE_FOLLOWED=off turns it off.
+static FOLLOW: std::sync::OnceLock<crate::copy2::intake::Copy2Handle> = std::sync::OnceLock::new();
+
+/// Why this trade's pools can't be trusted (a pool copy 2 doesn't follow
+/// and hold ready: its values may be an old one-time fill), or None.
+pub fn follow_block(pools: &[String]) -> Option<String> {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| !crate::fastlane::mode::parse_off(std::env::var("FASTLANE_REQUIRE_FOLLOWED").ok().as_deref())) {
+        return None;
+    }
+    FOLLOW.get().and_then(|c| c.unfollowed_pool(pools))
+}
+
 impl Firer {
     /// Safety -> fire -> log -> record (see the file header).
     pub fn fire(&self, o: &Opportunity, feed_at: Instant, apply_us: u64) -> Fired {
         let mut res = FireResult { blocked: None, record: None, written: None, live: false };
+        if let Some(why) = follow_block(&o.pools) {
+            let _ = why;
+            res.blocked = Some("pool_not_followed");
+            return Fired { res, what: FiredWhat::Blocked("pool_not_followed"), log_error: false };
+        }
         let inp = match to_safety_input(o) {
             Ok(x) => x,
             Err(_) => {
@@ -880,6 +900,7 @@ pub fn start(c2: crate::copy2::intake::Copy2Handle) -> bool {
             return false;
         }
     };
+    let _ = FOLLOW.set(c2.clone());
     let scanner = Scanner::new(ScanConfig::from_env(), Box::new(super::scan::TableSource::global()), Box::new(super::c2runner::Copy2Runner::new(c2.clone())));
     let practice = Practice::new(PracticeCfg::from_lookup(&get), c2.sh.cfg.l2_offset);
     let mut lane = Lane::new(LaneCfg::from_lookup(&get), scanner, safety, gate, gun, log, book, practice);

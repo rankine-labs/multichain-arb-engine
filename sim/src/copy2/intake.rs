@@ -1061,6 +1061,35 @@ impl Copy2Handle {
     /// Is this address one of ours: a followed pool, a PoolManager, or a
     /// coin of a followed pool? (Discovery's self-only proof: such a
     /// contract is never "unrelated".) Reads the registry.
+    /// FAST LANE SAFETY (Oct 29): the first pool of `pools` (route keys: a
+    /// pool address, or a V4 pool id) that copy 2 does NOT follow and hold
+    /// as ready, with why. None = every pool is followed and ready.
+    /// Live finding: Ramses V3 and the Slipstream copies (up-cl, raphael-cl,
+    /// topaz-cl) are not followed at all (no copy-2 kind for them), yet
+    /// routes through them were checked on values filled once from the node
+    /// and never refreshed: 52 of their pools were 0.1-1% off the chain, and
+    /// every "$13" practice win was such a stale price.
+    pub fn unfollowed_pool(&self, pools: &[String]) -> Option<String> {
+        let reg = self.c2.reg.read().unwrap_or_else(|e| e.into_inner());
+        for k in pools {
+            let s = k.trim().to_ascii_lowercase();
+            let ok = match s.len() {
+                42 => crate::check::hexutil::parse_address(&s).ok().and_then(|a| reg.by_addr.get(&a)).is_some_and(|keys| {
+                    keys.iter().any(|pk| pk.1.is_none() && reg.pools.get(pk).is_some_and(|e| e.state == PoolState::Ready))
+                }),
+                66 => crate::check::hexutil::parse_u256(&s).ok().map(|v| B256::from(v.to_be_bytes::<32>())).is_some_and(|id| {
+                    reg.pools.iter().any(|(pk, e)| pk.1 == Some(id) && e.state == PoolState::Ready)
+                }),
+                _ => false,
+            };
+            if !ok {
+                let why = if s.len() == 42 && crate::check::hexutil::parse_address(&s).ok().is_some_and(|a| reg.by_addr.contains_key(&a)) { "not ready" } else { "not followed" };
+                return Some(format!("{} {why}", &s[..s.len().min(12)]));
+            }
+        }
+        None
+    }
+
     pub fn followed_or_coin(&self, core: &super::checkcore::CheckCore, a: Address) -> bool {
         if core.pm_list.contains(&a) {
             return true;
