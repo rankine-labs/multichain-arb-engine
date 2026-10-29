@@ -122,6 +122,9 @@ pub struct CheckCore {
     pub moved: crate::check::moved::MovedIndex,
     /// The last few Copy2Prov built from this core: (block, extra holders, it).
     pub prov_cache: Mutex<Vec<(u64, Vec<Address>, Arc<super::intake::Copy2Prov>)>>,
+    /// (SPEED, Oct 29) Copy2Prov for every block at or after the latest
+    /// "exact since" (no extra holders), built with the core: (that block, it).
+    pub prov_full: Option<(u64, Arc<super::intake::Copy2Prov>)>,
 }
 
 /// What Copy2Prov needs from the registry, block-independent (see
@@ -200,6 +203,8 @@ impl CheckCore {
         c.pending_min = c.v4.iter().filter(|i| i.ready).filter_map(|i| i.pending_from).min().unwrap_or(u64::MAX);
         c.common = Arc::new(c.sets_at(None, far_cache));
         c.prov = ProvIndex::build(reg);
+        let max_since = c.prov.since.iter().map(|x| x.1).max().unwrap_or(0);
+        c.prov_full = Some((max_since, Arc::new(super::intake::prov_from(&c.prov, &c.layouts, u64::MAX, &[]))));
         // The pools as the bot names them (same list intake.rs pools_changed made per question).
         let followed: Vec<crate::check::moved::FollowedPool> = reg
             .pools
