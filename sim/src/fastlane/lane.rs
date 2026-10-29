@@ -575,7 +575,8 @@ impl Lane {
             return Vec::new();
         }
         let ts = Instant::now();
-        let core = c2.core_for(Some(&pv));
+        // Only `moved` is used here: a core up to 1 s old is fine (SPEED FIX 2).
+        let core = c2.recent_core(Duration::from_millis(1_000), Some(&pv));
         push_bounded(&mut self.hour.core_us, ts.elapsed().as_micros() as u64);
         let ts = Instant::now();
         let changed_slots: Vec<(revm::primitives::Address, revm::primitives::U256)> = head.diff.accounts.iter().flat_map(|(a, d)| d.storage.keys().map(move |s| (*a, *s))).collect();

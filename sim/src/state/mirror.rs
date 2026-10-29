@@ -357,6 +357,14 @@ impl NotSure {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum At {
     Head,
+    /// SPEED FIX 3 (Oct 29): the newest replayed block NOW, without waiting
+    /// for a block that has arrived but isn't replayed yet ("dirty"). Only
+    /// for callers that replay the feed messages after the version
+    /// themselves (fast-lane fire-first: its plan runs every message after
+    /// the picked version, so a version a block older is just one more
+    /// message to replay). Live: "head" waited up to ARBSIM_WAIT_MS (30 ms)
+    /// on most fast-lane questions.
+    HeadNow,
     AfterSeq(u64),
     AfterTx(B256),
     Block(u64),
@@ -478,6 +486,12 @@ impl Shared {
                 }
                 if received > head.seq {
                     return Err(NotSure::new("dirty", format!("{} newer block(s) not replayed yet", received - head.seq)));
+                }
+                pick(head, head.snap.clone())
+            }
+            At::HeadNow => {
+                if !fresh {
+                    return Err(NotSure::new("stale", "no feed frame recently"));
                 }
                 pick(head, head.snap.clone())
             }

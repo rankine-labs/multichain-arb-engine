@@ -1510,6 +1510,20 @@ impl Copy2Handle {
         self.c2.check_core_for(from)
     }
 
+    /// SPEED FIX 2 (Oct 29): the newest check core if it was built within
+    /// `max_age`, without rebuilding or waiting on the registry; else a
+    /// current one (core_for). Only for uses that need the followed pool
+    /// list (`moved`), which a moment-old core has unless pools were added
+    /// or dropped in that moment (the fast lane's changed-pool ranking; a
+    /// pool added a moment ago is still reached by the lane's sweep).
+    pub fn recent_core(&self, max_age: std::time::Duration, from: Option<&Arc<crate::state::mirror::PubView>>) -> Arc<super::checkcore::CheckCore> {
+        let cur = self.c2.core.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if cur.built.is_some_and(|t| t.elapsed() <= max_age) {
+            return cur;
+        }
+        self.c2.check_core_for(from)
+    }
+
     pub fn check_facts_with(&self, core: &super::checkcore::CheckCore, block: u64) -> super::checkview::C2Facts {
         // From the registry summary (checkcore.rs): no lock while it is
         // current, and the sets for the newest blocks are shared.
