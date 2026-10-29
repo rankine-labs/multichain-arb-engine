@@ -82,6 +82,13 @@ pub struct V4Info {
 pub struct CheckCore {
     /// The registry's change count it was built from.
     pub gen: u64,
+    /// SPEED FIX 2 (Oct 29): when it was built (None = never / tests). The
+    /// fast lane's "which pools changed this block" only needs `moved` (the
+    /// followed pool list), which changes only when pools are added or
+    /// dropped; it may use a core a moment old instead of rebuilding one
+    /// (live: rebuilt ~7 times a second, p50 6.7 ms, and the lane waited
+    /// p50 13.7 ms per block for it). Checks are unchanged.
+    pub built: Option<std::time::Instant>,
     /// The readers' copy of the published versions that was current when
     /// it was built (taken BEFORE reading the registry). A check that
     /// picked its version from this very copy may use this core even if
@@ -138,7 +145,7 @@ impl CheckCore {
     /// Build from the registry (caller holds its read lock; `gen` read
     /// under that lock).
     pub fn build(reg: &Registry, gen: u64, view: Option<Arc<crate::state::mirror::PubView>>, far_cache: &FarCache) -> CheckCore {
-        let mut c = CheckCore { gen, view, pm_bound: reg.pm_bound, ..Default::default() };
+        let mut c = CheckCore { gen, view, pm_bound: reg.pm_bound, built: Some(std::time::Instant::now()), ..Default::default() };
         let mut pms: HashSet<Address> = HashSet::new();
         for e in reg.pools.values() {
             // Pending / not ready, per account a check may touch.

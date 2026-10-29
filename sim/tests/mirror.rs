@@ -245,11 +245,24 @@ fn node_down_means_dirty_never_wrong_then_recovers() {
     // Nothing replayed: head is only the empty start point, block 10 pending.
     let e = sh.resolve(&At::Head).err().unwrap();
     assert_eq!(e.reason, "dirty");
+    // SPEED FIX 3 (Oct 29): "headNow" never waits for the pending block; it
+    // picks the newest replayed version as it is (the caller replays the
+    // feed after it), here the start point before block 10.
+    // (Here that start point has no block details, so it answers not_ready
+    // at once: the point is that it never says "dirty" and never waits.)
+    let t = std::time::Instant::now();
+    match sh.resolve(&At::HeadNow) {
+        Ok(p) => assert!(p.seq < 10, "the pending block 10 is not in it (seq {})", p.seq),
+        Err(e) => assert_ne!(e.reason, "dirty", "headNow never answers dirty"),
+    }
+    assert!(t.elapsed() < Duration::from_millis(20), "headNow did not wait");
     *node.down.lock().unwrap() = false;
     std::thread::sleep(Duration::from_millis(250)); // past the retry back-off
     pump_until(&mut u, || sh.head().is_some_and(|v| v.seq == 10));
     assert_eq!(head_slot(&sh), Lookup::Known(U256::from(6)));
     assert!(sh.resolve(&At::Head).is_ok());
+    // Caught up: headNow gives the very same version as head.
+    assert_eq!(sh.resolve(&At::HeadNow).unwrap().seq, sh.resolve(&At::Head).unwrap().seq);
     assert!(sh.status_json()["dirty_ms_total"].as_u64().unwrap() > 0);
 }
 

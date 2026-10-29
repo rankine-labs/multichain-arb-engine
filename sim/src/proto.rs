@@ -26,6 +26,8 @@
 //
 //   `at` (which state a call / size_search is about):
 //     {"after":"head"}          newest replayed block (default)
+//     {"after":"headNow"}       the same, but never waits for an arrived,
+//                               not-yet-replayed block (fast-lane fire-first)
 //     {"afterSeq":N}            right after feed message N
 //     {"afterTx":"0xhash"}      right after that transaction (in its block)
 //     {"block":"0xN"}           right after L2 block N
@@ -135,7 +137,9 @@ pub fn parse_at(v: &Value) -> Result<At, String> {
     if let Some(a) = m.get("after") {
         return match a.as_str() {
             Some("head") => Ok(At::Head),
-            _ => Err("at.after: only 'head' is supported".into()),
+            // Fast-lane fire-first: newest replayed block without waiting (mirror.rs At::HeadNow).
+            Some("headNow") => Ok(At::HeadNow),
+            _ => Err("at.after: only 'head' / 'headNow' are supported".into()),
         };
     }
     if let Some(s) = m.get("afterSeq") {
@@ -252,6 +256,7 @@ mod tests {
     fn at_forms() {
         assert_eq!(parse_at(&Value::Null).unwrap(), At::Head);
         assert_eq!(parse_at(&json!({"after":"head"})).unwrap(), At::Head);
+        assert_eq!(parse_at(&json!({"after":"headNow"})).unwrap(), At::HeadNow);
         assert_eq!(parse_at(&json!({"afterSeq": 12})).unwrap(), At::AfterSeq(12));
         assert_eq!(parse_at(&json!({"block": "0x10"})).unwrap(), At::Block(16));
         assert_eq!(parse_at(&json!({"pinned": "0x10", "env": "next"})).unwrap(), At::Pinned { block: 16, next: true });

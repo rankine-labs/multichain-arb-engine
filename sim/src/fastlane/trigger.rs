@@ -125,6 +125,12 @@ pub struct TrigCfg {
     /// Addresses whose transactions are ours (never triggers): our
     /// contract (ARB_EXECUTOR_ROBINHOOD) and our wallet (the gun's).
     pub ours: Vec<Address>,
+    /// SPEED FIX 3 (Oct 29), FASTLANE_TRIG_WAIT [off]: off = questions use
+    /// copy 2's newest replayed block NOW ("headNow") and replay the feed
+    /// messages after it; on = wait (up to ARBSIM_WAIT_MS) for a block that
+    /// has arrived but isn't replayed yet, as before. Live: the wait was
+    /// ~30 ms on most questions (disc p90 30.1 ms, checks p50 28 ms).
+    pub wait_for_copy: bool,
 }
 
 impl Default for TrigCfg {
@@ -146,6 +152,7 @@ impl Default for TrigCfg {
             max_plausible_share: 0.25,
             l2_offset: 0,
             ours: Vec::new(),
+            wait_for_copy: false,
         }
     }
 }
@@ -192,6 +199,7 @@ impl TrigCfg {
             max_plausible_share: num("MAX_PLAUSIBLE_PROFIT_SHARE").filter(|v| *v > 0.0).unwrap_or(d.max_plausible_share),
             l2_offset: num("ARBSIM_L2_BLOCK_OFFSET").filter(|v| *v >= 0.0).map(|v| v as u64).unwrap_or(0),
             ours,
+            wait_for_copy: crate::fastlane::mode::parse_on(get("FASTLANE_TRIG_WAIT").as_deref()),
         }
     }
 }
@@ -521,7 +529,7 @@ impl Trigger {
             "route": [], "strict": self.cfg.strict, "assume": self.cfg.feed_assume(),
         });
         let req = json!({
-            "type": "trig_entry", "at": {"after": "head"}, "feed": feed, "limit": self.cfg.max_candidates,
+            "type": "trig_entry", "at": {"after": if self.cfg.wait_for_copy { "head" } else { "headNow" }}, "feed": feed, "limit": self.cfg.max_candidates,
             "maxPools": self.cfg.max_pools, "minConf": self.cfg.min_conf, "budgetUs": budget_us,
         });
         let mut tm = crate::timing::Tm::default();
