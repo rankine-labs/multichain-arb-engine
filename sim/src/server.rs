@@ -1114,11 +1114,29 @@ pub struct EntryRun {
 /// exactly what `trig_entry` always answered; EntryRun (None when discovery
 /// gave nothing to check) carries the picked rows with their answers.
 pub fn trig_entry_run(ctx: &Ctx, id: &Value, req: &Value, t0: Instant, tm: &mut Tm) -> (Value, Option<EntryRun>) {
+    let Some(disc) = trig_entry_discover(ctx, id, req) else { return (bad_request(id, "trig_entry needs feed"), None) };
+    trig_entry_checks(ctx, id, req, disc, t0, tm)
+}
+
+/// Step 1 of trig_entry_run alone: discovery of the moved pools (exactly
+/// trig_discover). None = the request has no feed. FAST LANE (Oct 29,
+/// fastlane/trigger.rs DISCOVER FIRST): the trigger thread runs this for
+/// every transaction of a feed message first (cheap), then the checks only
+/// for the ones that moved our pools.
+pub fn trig_entry_discover(ctx: &Ctx, id: &Value, req: &Value) -> Option<Value> {
+    let at = req.get("at").cloned().unwrap_or_else(|| json!({ "after": "head" }));
+    let feed = req.get("feed").filter(|f| f.is_object())?;
+    let mut dtm = Tm::default();
+    Some(trig_discover(ctx, id, &json!({ "id": id, "type": "trig_discover", "at": at, "feed": feed }), Instant::now(), &mut dtm))
+}
+
+/// Steps 2-3 of trig_entry_run, given step 1's discovery answer `disc`:
+/// pick the candidates and check them (the answer and EntryRun are exactly
+/// trig_entry_run's). `t0`: when the question started (the budget and `us`
+/// count from it).
+pub fn trig_entry_checks(ctx: &Ctx, id: &Value, req: &Value, disc: Value, t0: Instant, tm: &mut Tm) -> (Value, Option<EntryRun>) {
     let at = req.get("at").cloned().unwrap_or_else(|| json!({ "after": "head" }));
     let Some(feed) = req.get("feed").filter(|f| f.is_object()) else { return (bad_request(id, "trig_entry needs feed"), None) };
-    // 1. Discover (its own timing; the queue wait is this job's).
-    let mut dtm = Tm::default();
-    let disc = trig_discover(ctx, id, &json!({ "id": id, "type": "trig_discover", "at": at, "feed": feed }), Instant::now(), &mut dtm);
     let mut out = json!({ "id": id, "ok": true, "disc": disc });
     let finish = |mut o: Value, tm: &mut Tm| {
         o["us"] = json!(t0.elapsed().as_micros() as u64);
