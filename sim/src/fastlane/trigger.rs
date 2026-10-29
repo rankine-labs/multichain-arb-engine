@@ -372,11 +372,33 @@ pub struct TrigHour {
     pub line_us: Vec<u64>,
     /// Same triggers: their place in the message (0 = first transaction).
     pub line_pos: Vec<u64>,
+    /// DISCOVERY PHASES (Oct 29): per discovery, each phase's time (us), for
+    /// all discoveries and for the slow ones (over 2 ms) apart, plus the
+    /// thread's CPU time. Discovery is p50 ~0.2 ms but p90 4+ ms and is
+    /// most of the wait in line: this shows which step makes it slow.
+    pub disc_ph: BTreeMap<String, Vec<u64>>,
+    pub disc_ph_slow: BTreeMap<String, Vec<u64>>,
+    pub disc_cpu: Vec<u64>,
+    pub disc_slow: u64,
     /// (Oct 27) Every unknown (discovery and candidate checks) by
     /// "where|reason" and by "reason|where|target|first missing item"
     /// (fastlane/coverage.rs). Bounded.
     pub unknown_where: super::coverage::Tally,
     pub unknown_top: super::coverage::Tally,
+}
+
+impl TrigHour {
+    /// Discovery phase times as {phase: percentiles (+ n, sum)}.
+    fn disc_ph_json(&self, slow: bool) -> Value {
+        let m = if slow { &self.disc_ph_slow } else { &self.disc_ph };
+        let mut out = serde_json::Map::new();
+        for (k, v) in m {
+            let mut p = pctl(v);
+            p["sum"] = json!(v.iter().sum::<u64>());
+            out.insert(k.clone(), p);
+        }
+        Value::Object(out)
+    }
 }
 
 fn push(v: &mut Vec<u64>, x: u64) {
@@ -399,7 +421,7 @@ fn top<K: std::fmt::Display>(m: &BTreeMap<K, u64>, n: usize) -> String {
 
 impl TrigHour {
     pub fn json(&self) -> Value {
-        json!({
+        let mut j = json!({
             "msgs": self.msgs, "msgsLate": self.msgs_late, "msgsNoCopy": self.msgs_no_copy, "queueDropped": self.queue_dropped,
             "txs": self.txs, "skipped": self.skipped, "cut": self.cut, "asked": self.asked,
             "discUnknown": self.disc_unknown, "noPools": self.no_pools, "tooManyPools": self.too_many_pools, "moved": self.moved,
@@ -412,7 +434,12 @@ impl TrigHour {
             "lineUs": pctl(&self.line_us), "linePos": pctl(&self.line_pos),
             "unknownWhere": self.unknown_where.json(24), "unknownTop": self.unknown_top.json(20),
             "timesNote": "inside arbsim, from the moment the feed message reached it; excludes sequencer -> bot -> arbsim delivery and block inclusion",
-        })
+        });
+        j["discCpuUs"] = pctl(&self.disc_cpu);
+        j["discSlow"] = json!(self.disc_slow);
+        j["discPh"] = self.disc_ph_json(false);
+        j["discPhSlow"] = self.disc_ph_json(true);
+        j
     }
 
     pub fn line(&self) -> String {
@@ -559,6 +586,7 @@ impl Trigger {
             // message has been through discovery.
             self.hour.asked += 1;
             let req = self.trigger_req(m.seq, head.seq, newest, tx.hash, left);
+            crate::timing::ph_reset();
             let Some(disc) = crate::server::trig_entry_discover(ctx, &json!(0), &req) else {
                 out.push(TrigOutcome::DiscoverUnknown("error".into()));
                 continue;
@@ -617,6 +645,28 @@ impl Trigger {
         }
         if let Some(u) = ans.get("disc").and_then(|d| d.get("us")).and_then(|v| v.as_u64()) {
             push(&mut self.hour.disc_us, u);
+            let slow = u > 2_000;
+            if slow {
+                self.hour.disc_slow += 1;
+            }
+            if let Some(c) = ans["disc"].get("cpu").and_then(|v| v.as_u64()) {
+                push(&mut self.hour.disc_cpu, c);
+            }
+            if let Some(ph) = ans["disc"].get("ph").and_then(|p| p.as_object()) {
+                for (k, v) in ph {
+                    let Some(x) = v.as_u64() else { continue };
+                    push(self.hour.disc_ph.entry(k.clone()).or_default(), x);
+                    if slow {
+                        push(self.hour.disc_ph_slow.entry(k.clone()).or_default(), x);
+                    }
+                }
+                // the rest of the time: not inside any named phase
+                let named: u64 = ph.values().filter_map(|v| v.as_u64()).sum();
+                push(self.hour.disc_ph.entry("other".into()).or_default(), u.saturating_sub(named));
+                if slow {
+                    push(self.hour.disc_ph_slow.entry("other".into()).or_default(), u.saturating_sub(named));
+                }
+            }
         }
         if let Some(c) = ans.get("cands").and_then(|c| c.as_array()) {
             push(&mut self.hour.checks_us, c.iter().filter_map(|x| x.get("a").and_then(|a| a.get("us")).and_then(|v| v.as_u64())).sum());
@@ -631,6 +681,7 @@ impl Trigger {
         self.hour.asked += 1;
         let req = self.trigger_req(seq, copy_seq, newest, hash, budget_us);
         let mut tm = crate::timing::Tm::default();
+        crate::timing::ph_reset();
         let (ans, run) = crate::server::trig_entry_run(ctx, &json!(0), &req, Instant::now(), &mut tm);
         self.after_entry(ans, run, seq, arrived)
     }
