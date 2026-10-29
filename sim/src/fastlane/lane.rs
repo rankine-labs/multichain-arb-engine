@@ -307,6 +307,13 @@ pub struct LaneHour {
     /// (us), newest 5,000. Live: the lane was often still busy with the
     /// previous block.
     pub wait_us: Vec<u64>,
+    /// SPEED STEPS (Oct 28): per block, the lane's steps (us), newest 5,000:
+    /// copy 2's check core, which pools changed, the scan (incl. route-list
+    /// update), firing.
+    pub core_us: Vec<u64>,
+    pub changed_us: Vec<u64>,
+    pub scan_us: Vec<u64>,
+    pub fire_us: Vec<u64>,
 }
 
 fn push_bounded(v: &mut Vec<u64>, x: u64) {
@@ -567,18 +574,26 @@ impl Lane {
             self.hour.tips_old += 1;
             return Vec::new();
         }
+        let ts = Instant::now();
         let core = c2.core_for(Some(&pv));
+        push_bounded(&mut self.hour.core_us, ts.elapsed().as_micros() as u64);
+        let ts = Instant::now();
         let changed_slots: Vec<(revm::primitives::Address, revm::primitives::U256)> = head.diff.accounts.iter().flat_map(|(a, d)| d.storage.keys().map(move |s| (*a, *s))).collect();
         let changed: Vec<String> = c2.pools_changed_with(&core, &changed_slots, &[]).into_iter().map(|m| m.key.to_ascii_lowercase()).collect();
+        push_bounded(&mut self.hour.changed_us, ts.elapsed().as_micros() as u64);
+        let ts = Instant::now();
         let view = crate::state::snap::View::new(head.snap.clone());
         let unsure = std::collections::HashSet::new();
         let input = BlockInput { view: &view, ctx: &ctx, block: head.block, kind: ViewKind::Confirmed, changed: &changed, unsure: &unsure, snap: Some(&head.snap) };
         let rep = self.scanner.scan(&input);
+        push_bounded(&mut self.hour.scan_us, ts.elapsed().as_micros() as u64);
         self.hour.opps += rep.opps.len() as u64;
+        let ts = Instant::now();
         let mut out = Vec::new();
         for o in rep.opps.iter().take(self.cfg.fires_per_block) {
             out.push(self.fire_one(o, head.applied, 0));
         }
+        push_bounded(&mut self.hour.fire_us, ts.elapsed().as_micros() as u64);
         let lane_us = t0.elapsed().as_micros() as u64;
         push_bounded(&mut self.hour.block_us, lane_us);
         push_bounded(&mut self.hour.lane_us, lane_us);
@@ -728,6 +743,7 @@ impl Lane {
                 "tips": h.tips, "confirmedScanned": h.confirmed, "tipsOld": h.tips_old, "opps": h.opps, "fired": h.fired, "wouldSend": h.would_send, "liveSent": h.live_sent,
                 "notLeft": h.not_left, "gunRefused": h.gun_refused, "logErrors": h.log_errors, "dropsSeen": h.drops_seen,
                 "feedToHandUs": pctl(&h.latency_us), "blockUs": pctl(&h.block_us), "laneUs": pctl(&h.lane_us), "waitUs": pctl(&h.wait_us),
+                "steps": {"coreUs": pctl(&h.core_us), "changedUs": pctl(&h.changed_us), "scanUs": pctl(&h.scan_us), "fireUs": pctl(&h.fire_us), "coreBuild": crate::copy2::checkcore::build_stats_json()},
                 "blockUsNote": "blockUs = predicted-copy apply + lane; laneUs = lane only (scan + fire)",
             },
             "practice": self.practice.status_json(),

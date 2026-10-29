@@ -342,6 +342,11 @@ pub struct TrigHour {
     pub ready_us: Vec<u64>,
     /// Per feed message, all of its work (us).
     pub msg_us: Vec<u64>,
+    /// SPEED STEPS (Oct 28): per asked trigger, the whole one-trip run, its
+    /// "which pools?" discovery, and the candidate checks (us).
+    pub entry_us: Vec<u64>,
+    pub disc_us: Vec<u64>,
+    pub checks_us: Vec<u64>,
     /// (Oct 27) Every unknown (discovery and candidate checks) by
     /// "where|reason" and by "reason|where|target|first missing item"
     /// (fastlane/coverage.rs). Bounded.
@@ -378,6 +383,7 @@ impl TrigHour {
             "fired": self.fired, "wouldSend": self.would_send, "liveSent": self.live_sent, "blocked": self.blocked,
             "gunRefused": self.gun_refused, "notLeft": self.not_left, "repeats": self.repeats,
             "queueUs": pctl(&self.queue_us), "decideUs": pctl(&self.decide_us), "readyUs": pctl(&self.ready_us), "msgUs": pctl(&self.msg_us),
+            "entryUs": pctl(&self.entry_us), "discUs": pctl(&self.disc_us), "checksUs": pctl(&self.checks_us),
             "unknownWhere": self.unknown_where.json(24), "unknownTop": self.unknown_top.json(20),
             "timesNote": "inside arbsim, from the moment the feed message reached it; excludes sequencer -> bot -> arbsim delivery and block inclusion",
         })
@@ -520,6 +526,15 @@ impl Trigger {
         });
         let mut tm = crate::timing::Tm::default();
         let (ans, run) = crate::server::trig_entry_run(ctx, &json!(0), &req, Instant::now(), &mut tm);
+        if let Some(u) = ans.get("us").and_then(|v| v.as_u64()) {
+            push(&mut self.hour.entry_us, u);
+        }
+        if let Some(u) = ans.get("disc").and_then(|d| d.get("us")).and_then(|v| v.as_u64()) {
+            push(&mut self.hour.disc_us, u);
+        }
+        if let Some(c) = ans.get("cands").and_then(|c| c.as_array()) {
+            push(&mut self.hour.checks_us, c.iter().filter_map(|x| x.get("a").and_then(|a| a.get("us")).and_then(|v| v.as_u64())).sum());
+        }
         self.decide(&ans, run, seq, arrived)
     }
 

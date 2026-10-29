@@ -1154,7 +1154,9 @@ impl C2Shared {
                 return cur;
             }
         }
+        let tb = std::time::Instant::now();
         let c = Arc::new(super::checkcore::CheckCore::build(&reg, gen, view, &self.far_cache));
+        super::checkcore::note_build_us(tb.elapsed().as_micros() as u64);
         drop(reg);
         let mut g = self.core.lock().unwrap_or_else(|e| e.into_inner());
         if g.gen < gen {
