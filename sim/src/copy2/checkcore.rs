@@ -36,6 +36,31 @@ use std::sync::{Arc, Mutex};
 
 use revm::primitives::{Address, U256};
 
+// ---------------------------------------------------------------------------
+// SPEED STEPS (Oct 28): how often the check core is rebuilt and how long a
+// rebuild takes. It is rebuilt whenever copy 2's pool registry changed; the
+// fast lane asks for it on every block and the trigger thread per question.
+// Status: fastlane.steps.coreBuild. Counting only.
+// ---------------------------------------------------------------------------
+static BUILD_RING: Mutex<std::collections::VecDeque<u64>> = Mutex::new(std::collections::VecDeque::new());
+static BUILDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Note one rebuild (microseconds).
+pub fn note_build_us(us: u64) {
+    BUILDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut r = BUILD_RING.lock().unwrap_or_else(|e| e.into_inner());
+    if r.len() >= 1000 {
+        r.pop_front();
+    }
+    r.push_back(us);
+}
+
+/// {"builds": total since start, "us": p50/p90/p99/max of the last 1000}.
+pub fn build_stats_json() -> serde_json::Value {
+    let mut v: Vec<u64> = BUILD_RING.lock().unwrap_or_else(|e| e.into_inner()).iter().copied().collect();
+    serde_json::json!({ "builds": BUILDS.load(std::sync::atomic::Ordering::Relaxed), "us": crate::timing::pct(&mut v) })
+}
+
 use super::checkview::{memo_slot, merge_lists, protocol_fee_slot, FactSets};
 use super::coins::BalanceLayout;
 use super::intake::{kind_name, state_name, PoolState, Registry};
