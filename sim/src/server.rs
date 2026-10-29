@@ -708,7 +708,7 @@ fn trig_discover_inner(ctx: &Ctx, id: &Value, req: &Value, t0: Instant, tm: &mut
     tm.facts_us += t_core.elapsed().as_micros() as u64;
     let prov = crate::timing::ph_time("prov", || c2.provenance_with(&core, block, &[]));
     // WARM HOT TARGETS (copy2/warm.rs): values copy 2 doesn't hold, from memory.
-    let (picked, prov, warm_used) = warm_apply(ctx, picked, prov, &plan);
+    let (picked, prov, warm_used) = crate::timing::ph_time("warm", || warm_apply(ctx, picked, prov, &plan));
     // Same assumptions as a trigger-first check (no skipping: only the
     // trigger runs, and the trigger is never skipped).
     let (strict, mut assume) = trig_assume(trig_trust(), &feed, |_| None);
@@ -761,10 +761,11 @@ fn trig_discover_inner(ctx: &Ctx, id: &Value, req: &Value, t0: Instant, tm: &mut
             }
         }
     };
-    let mut a = after_pick_with(ctx, picked, t0, tm, &run, false, Some(core.clone()));
-    warm_learn(ctx, &a, warm_used);
+    let mut a = crate::timing::ph_time("pick", || after_pick_with(ctx, picked, t0, tm, &run, false, Some(core.clone())));
+    crate::timing::ph_time("warmLearn", || warm_learn(ctx, &a, warm_used));
     // (Oct 27) The fill budget learns which targets move our pools (copy 2's
     // reports tell for the unknown ones, a few seconds later).
+    let t_learn = Instant::now();
     let trig_target = trig_dec.as_ref().and_then(|d| d.to);
     if let Some(t) = trig_target {
         let moved = (a.get("ok") == Some(&Value::Bool(true))).then(|| a["pools"].as_array().is_some_and(|p| !p.is_empty()));
@@ -812,6 +813,7 @@ fn trig_discover_inner(ctx: &Ctx, id: &Value, req: &Value, t0: Instant, tm: &mut
             }
         }
     }
+    crate::timing::ph_add("learn", t_learn.elapsed().as_micros() as u64);
     a["us"] = json!(t0.elapsed().as_micros() as u64);
     a
 }
