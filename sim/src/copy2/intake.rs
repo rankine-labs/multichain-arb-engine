@@ -6929,15 +6929,41 @@ fn settle_filters(reg: &Registry, keys: &HashSet<PoolKey>) -> Vec<Value> {
     pads.dedup();
     coins.sort();
     coins.dedup();
+    build_settle_filters(&addrs, &pads, &coins, &v4)
+}
+
+/// Most entries in one list of one log filter (addresses, or one topic
+/// position). FIX (Oct 29): the node refuses a filter with more than 1,000
+/// topics ("exceed maximum topic limit 1000"). Copy 2 now follows 1,185
+/// Uniswap V4 pools, all on one PoolManager, so the single V4 filter had
+/// 1,185 pool ids and every catch-up and settle read failed: after any
+/// restart copy 2 could not catch up and fell minutes behind. Each list is
+/// now cut into pieces of at most this many (same logs, more filters).
+pub const FILTER_LIST_MAX: usize = 500;
+
+/// The log filters for settle_filters' lists, every list at most
+/// FILTER_LIST_MAX long:
+///   - pool reports: the pool addresses;
+///   - coin Transfers from / to a pool: coins x pool (padded) addresses;
+///   - V4: per PoolManager, its pool ids.
+fn build_settle_filters(addrs: &[String], pads: &[String], coins: &[String], v4: &BTreeMap<Address, Vec<String>>) -> Vec<Value> {
     let transfer = format!("{}", keccak256("Transfer(address,address,uint256)".as_bytes()));
     let mut f = Vec::new();
     if !addrs.is_empty() {
-        f.push(json!({ "address": addrs }));
-        f.push(json!({ "address": coins, "topics": [transfer, pads] }));
-        f.push(json!({ "address": coins, "topics": [transfer, Value::Null, pads] }));
+        for a in addrs.chunks(FILTER_LIST_MAX) {
+            f.push(json!({ "address": a }));
+        }
+        for c in coins.chunks(FILTER_LIST_MAX) {
+            for p in pads.chunks(FILTER_LIST_MAX) {
+                f.push(json!({ "address": c, "topics": [transfer, p] }));
+                f.push(json!({ "address": c, "topics": [transfer, Value::Null, p] }));
+            }
+        }
     }
     for (pm, ids) in v4 {
-        f.push(json!({ "address": format!("{pm:#x}"), "topics": [Value::Null, ids] }));
+        for part in ids.chunks(FILTER_LIST_MAX) {
+            f.push(json!({ "address": format!("{pm:#x}"), "topics": [Value::Null, part] }));
+        }
     }
     f
 }
@@ -7440,6 +7466,55 @@ fn verify_layout(p: &TrackedPool, vals: &HashMap<(Address, U256), U256>, g: impl
         _ => {}
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod settle_filter_tests {
+    use super::*;
+
+    /// No list in any filter is longer than FILTER_LIST_MAX, and together
+    /// the pieces still name every pool id / address exactly once.
+    #[test]
+    fn long_lists_are_cut_under_the_node_limit() {
+        let pm = Address::repeat_byte(0x44);
+        let ids: Vec<String> = (0..1185).map(|i| format!("{i:#066x}")).collect();
+        let addrs: Vec<String> = (0..1201).map(|i| format!("{:#042x}", i + 1)).collect();
+        let pads: Vec<String> = (0..1201).map(|i| format!("{:#066x}", i + 1)).collect();
+        let coins: Vec<String> = (0..30).map(|i| format!("{:#042x}", 0x9000 + i)).collect();
+        let v4: BTreeMap<Address, Vec<String>> = [(pm, ids.clone())].into_iter().collect();
+        let f = build_settle_filters(&addrs, &pads, &coins, &v4);
+        let mut seen_ids = Vec::new();
+        let mut seen_addrs = Vec::new();
+        for x in &f {
+            if let Some(a) = x["address"].as_array() {
+                assert!(a.len() <= FILTER_LIST_MAX, "address list {}", a.len());
+            }
+            if let Some(t) = x["topics"].as_array() {
+                for pos in t {
+                    if let Some(l) = pos.as_array() {
+                        assert!(l.len() <= FILTER_LIST_MAX, "topic list {}", l.len());
+                    }
+                }
+            }
+            if x["address"].is_string() {
+                seen_ids.extend(x["topics"][1].as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_string()));
+            } else if x.get("topics").is_none() {
+                seen_addrs.extend(x["address"].as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_string()));
+            }
+        }
+        assert_eq!(seen_ids, ids);
+        assert_eq!(seen_addrs, addrs);
+        // Transfers: 1 coin piece x 3 pad pieces x (from, to).
+        assert_eq!(f.iter().filter(|x| x["topics"][0].is_string()).count(), 6);
+    }
+
+    /// Small lists: the same three + one filters as before the fix.
+    #[test]
+    fn small_lists_are_unchanged() {
+        let v4: BTreeMap<Address, Vec<String>> = [(Address::repeat_byte(1), vec!["0x01".to_string()])].into_iter().collect();
+        let f = build_settle_filters(&["0xaa".into()], &["0xbb".into()], &["0xcc".into()], &v4);
+        assert_eq!(f.len(), 4);
+    }
 }
 
 #[cfg(test)]
