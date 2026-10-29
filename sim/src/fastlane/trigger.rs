@@ -131,13 +131,17 @@ pub struct TrigCfg {
     /// has arrived but isn't replayed yet, as before. Live: the wait was
     /// ~30 ms on most questions (disc p90 30.1 ms, checks p50 28 ms).
     pub wait_for_copy: bool,
-    /// SPEED FIX 4 (Oct 29), FASTLANE_TRIG_DISCOVER_FIRST [on]: on = for a
+    /// SPEED FIX 4 (Oct 29), FASTLANE_TRIG_DISCOVER_FIRST [off]: on = for a
     /// feed message, first run the cheap "which of our pools does it move?"
     /// discovery for EVERY transaction, then the slow candidate checks only
     /// for the ones that moved our pools. off = each transaction fully (its
     /// checks too) before the next, as before. Live before: a pool-moving
     /// trigger waited behind the whole work of the transactions ahead of it
     /// (decide p50 ~30-35 ms while its own checks were ~9 ms).
+    /// MEASURED SLOWER live (Oct 29 22:40-22:55): the wait came mostly from
+    /// the discoveries ahead, not from checks, and discover-first made each
+    /// pool-moving trigger wait for EVERY discovery of the message (line p50
+    /// 10 -> 23 ms, decide 27 -> 40 ms). Off by default.
     pub discover_first: bool,
 }
 
@@ -161,7 +165,7 @@ impl Default for TrigCfg {
             l2_offset: 0,
             ours: Vec::new(),
             wait_for_copy: false,
-            discover_first: true,
+            discover_first: false,
         }
     }
 }
@@ -209,7 +213,7 @@ impl TrigCfg {
             l2_offset: num("ARBSIM_L2_BLOCK_OFFSET").filter(|v| *v >= 0.0).map(|v| v as u64).unwrap_or(0),
             ours,
             wait_for_copy: crate::fastlane::mode::parse_on(get("FASTLANE_TRIG_WAIT").as_deref()),
-            discover_first: !crate::fastlane::mode::parse_off(get("FASTLANE_TRIG_DISCOVER_FIRST").as_deref()),
+            discover_first: crate::fastlane::mode::parse_on(get("FASTLANE_TRIG_DISCOVER_FIRST").as_deref()),
         }
     }
 }
