@@ -116,7 +116,8 @@ async function main() {
     const d = loopIndexSettings({});
     assert(d.poolsMax === 3 && d.perPool4 === 8 && d.perPool === 24 && d.maxLoops === 20_000, 'defaults: TRIG_ENTRY_LOOP_POOLS_MAX 3 (4-pool loops off), TRIG_ENTRY_LOOPS4_PER_POOL 8, 3-pool settings unchanged');
     assert(loopIndexSettings({ TRIG_ENTRY_LOOP_POOLS_MAX: '4' }).poolsMax === 4, 'TRIG_ENTRY_LOOP_POOLS_MAX=4 switches 4-pool loops on');
-    assert(loopIndexSettings({ TRIG_ENTRY_LOOP_POOLS_MAX: '9' }).poolsMax === 4 && loopIndexSettings({ TRIG_ENTRY_LOOP_POOLS_MAX: '2' }).poolsMax === 3 && loopIndexSettings({ TRIG_ENTRY_LOOP_POOLS_MAX: 'x' }).poolsMax === 3, 'only 3 or 4: higher means 4, lower or not a number means 3');
+    // Oct 26: 5-pool loops added, so the top is now 5 (see trigEntryLoops5.test.ts).
+    assert(loopIndexSettings({ TRIG_ENTRY_LOOP_POOLS_MAX: '9' }).poolsMax === 5 && loopIndexSettings({ TRIG_ENTRY_LOOP_POOLS_MAX: '2' }).poolsMax === 3 && loopIndexSettings({ TRIG_ENTRY_LOOP_POOLS_MAX: 'x' }).poolsMax === 3, 'only 3, 4 or 5: higher means 5, lower or not a number means 3');
     assert(loopIndexSettings({ TRIG_ENTRY_LOOPS4_PER_POOL: '3' }).perPool4 === 3, 'TRIG_ENTRY_LOOPS4_PER_POOL read');
   }
 

@@ -3312,7 +3312,7 @@ try {
                         ...(entryLoopIndex && entryLoopSender ? {
                               loopCandidatesFor: (keys: string[], limit: number) => entryLoopCandidatesFor(keys, limit),
                               loopGate: (p: EntryPick) => entryLoopSender.gate(p) ?? (robinhoodSender.live ? scoreboard.pausedWhy('loop') : null),
-                              loopHourText: () => { const i = entryLoopIndex.info(); return `loop index ${i.loops} loops${i.loops4 ? ` (${i.loops4} of them 4-pool)` : ''} over ${i.pools} pools${i.capped ? ' (capped)' : ''}, rebuilt in ${i.lastMs} ms (${loopSkipText(i.seen, i.skipped)}${entryLoopTaxText()}); ${entryLoopSender.hourLine()}`; },
+                              loopHourText: () => { const i = entryLoopIndex.info(); return `loop index ${i.loops} loops${i.loops4 || i.loops5 ? ` (${i.loops4} of them 4-pool, ${i.loops5} 5-pool)` : ''} over ${i.pools} pools${i.capped ? ' (capped)' : ''}, rebuilt in ${i.lastMs} ms (${loopSkipText(i.seen, i.skipped)}${entryLoopTaxText()}); ${entryLoopSender.hourLine()}`; },
                         } : {}),
                         // Our own sends (seen again in the feed) and our contract: never triggers.
                         isOurTx: (h) => livePools.has(h) || livePools.has(h.toLowerCase()),
@@ -3339,7 +3339,7 @@ try {
                         },
                   });
                   // The loop index starts building only when the entry point really works.
-                  if (trigEntry.active() && entryLoopIndex) { entryLoopIndex.start(); console.log(`[trig-entry] 3-pool loops ON (TRIG_ENTRY_LOOPS=1): up to ${es.maxLoops} loops per trigger, loop index rebuilt every ${entryLoopIndex.s.checkMs / 1000} s if the pools changed (at least every ${entryLoopIndex.s.rebuildMs / 1000} s), ${entryLoopIndex.s.perPool} loops per pool${entryLoopIndex.s.poolsMax >= 4 ? `; 4-pool loops ON (TRIG_ENTRY_LOOP_POOLS_MAX=4): ${entryLoopIndex.s.perPool4} more per pool` : ''}`); }
+                  if (trigEntry.active() && entryLoopIndex) { entryLoopIndex.start(); console.log(`[trig-entry] 3-pool loops ON (TRIG_ENTRY_LOOPS=1): up to ${es.maxLoops} loops per trigger, loop index rebuilt every ${entryLoopIndex.s.checkMs / 1000} s if the pools changed (at least every ${entryLoopIndex.s.rebuildMs / 1000} s), ${entryLoopIndex.s.perPool} loops per pool${entryLoopIndex.s.poolsMax >= 4 ? `; 4-pool loops ON (TRIG_ENTRY_LOOP_POOLS_MAX>=4): ${entryLoopIndex.s.perPool4} more per pool` : ''}${entryLoopIndex.s.poolsMax >= 5 ? `; 5-pool loops ON (TRIG_ENTRY_LOOP_POOLS_MAX=5): ${entryLoopIndex.s.perPool5} more per pool` : ''}`); }
             }
       }
 } catch (e) { console.log(`[trigger-first] could not start (${(e as Error).message}); the existing paths decide`); trigFirst = null; trigEntry = null; }
