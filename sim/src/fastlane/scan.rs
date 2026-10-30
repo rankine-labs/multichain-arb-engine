@@ -60,6 +60,19 @@
 //        (One EVM run can't be stopped half way; this caps the overrun.)
 //     L5 the default minimum follows the bot: MIN_EXEC_NET_USD, else $0.25.
 //
+//   Unban fixes (Oct 30, live: sweepChecked 0, fullSweeps 0, cutFit 822k/h):
+//     - a route's remembered check time is forgotten after
+//       FASTLANE_ROUTE_TIME_TTL_BLOCKS blocks, and a route that is not
+//       resting may always run as the FIRST check of a block; before, a
+//       route whose last time was over the budget was never tried again
+//       (its time was only updated by running it).
+//     - the rolling sweep passes OVER a route it can't start (resting, or
+//       too slow for the sweep's share) instead of stopping there for good;
+//       a route that only misses what is LEFT after other sweep checks
+//       still waits for the next block. Passed-over routes are counted
+//       (resting / cutFit) and count as visited for the full pass.
+//     - "unknown" answers are counted by reason (unknownWhy).
+//
 //   Output: Opportunity list, best first, plus microseconds per phase and
 //   per route, and hourly counters (status "fastlaneScan").
 //   Off unless FASTLANE=practice|live (same words as fastlane/mode.rs).
@@ -125,6 +138,11 @@ pub struct ScanConfig {
     /// FASTLANE_ROUTE_MAX_US [5000] (review M6): a route whose check took
     /// longer rests for 50 blocks (counted "slow").
     pub route_max_us: u64,
+    /// FASTLANE_ROUTE_TIME_TTL_BLOCKS [100] (Oct 30): a route's remembered
+    /// check time is forgotten this many blocks after it was measured, so
+    /// one slow run can't keep the route out for good (live Oct 30: routes
+    /// whose last time was over the budget were never tried again).
+    pub route_time_ttl_blocks: u64,
 }
 
 /// The bot's default send minimum (types.ts readMinExecNetUsd).
@@ -143,6 +161,7 @@ impl Default for ScanConfig {
             max_plausible_share: 0.25,
             dedupe_blocks: 20,
             route_max_us: 5_000,
+            route_time_ttl_blocks: 100,
         }
     }
 }
@@ -165,6 +184,7 @@ impl ScanConfig {
             max_plausible_share: num("MAX_PLAUSIBLE_PROFIT_SHARE").filter(|v| *v > 0.0).unwrap_or(d.max_plausible_share),
             dedupe_blocks: num("FASTLANE_DEDUPE_BLOCKS").filter(|v| *v >= 1.0 && *v <= 100_000.0).map(|v| v as u64).unwrap_or(d.dedupe_blocks),
             route_max_us: num("FASTLANE_ROUTE_MAX_US").filter(|v| *v >= 100.0 && *v <= 1_000_000.0).map(|v| v as u64).unwrap_or(d.route_max_us),
+            route_time_ttl_blocks: num("FASTLANE_ROUTE_TIME_TTL_BLOCKS").filter(|v| *v >= 1.0 && *v <= 1_000_000.0).map(|v| v as u64).unwrap_or(d.route_time_ttl_blocks),
         }
     }
     pub fn from_env() -> ScanConfig {
@@ -760,6 +780,28 @@ pub struct ScanReport {
     pub cut_fit: usize,
 }
 
+/// M6: one route's last check time (all epochs are scan call numbers).
+#[derive(Clone, Copy, Debug)]
+struct RouteTime {
+    /// How long its last check took (us).
+    us: u64,
+    /// It rests (is not started) while the epoch is below this (slow route).
+    rest_until: u64,
+    /// (Oct 30) The epoch it was measured in: after
+    /// FASTLANE_ROUTE_TIME_TTL_BLOCKS more the time is forgotten.
+    at: u64,
+}
+
+/// M6: may a route start now, and if not, why.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Start {
+    Go,
+    /// Slow last time: resting (counted "resting").
+    Resting,
+    /// Its last time doesn't fit before the limit (counted "cutFit").
+    NoFit,
+}
+
 /// The standing-gap scanner (one per state stream: confirmed / predicted).
 pub struct Scanner {
     pub cfg: ScanConfig,
@@ -775,8 +817,9 @@ pub struct Scanner {
     /// The pass under way started at the beginning with an unchanged route
     /// list (only such a pass is counted as "full sweep in N blocks").
     pass_valid: bool,
-    /// M6: per route, its last check time (us) and the epoch it rests until.
-    route_us: HashMap<String, (u64, u64)>,
+    /// M6: per route, its last check time, when it rests until, and (Oct 30)
+    /// when it was measured (so the time can expire).
+    route_us: HashMap<String, RouteTime>,
     /// Dedupe: route -> (amount, profit, pool epoch when returned).
     returned: HashMap<String, (U256, U256, u64)>,
     /// Pool key -> epoch (scan call number) it last changed.
@@ -847,9 +890,11 @@ impl Scanner {
 
         let budget = self.cfg.budget_us;
         let changed_limit = budget.saturating_sub(budget * self.cfg.sweep_reserve_pct / 100);
-        // M6: bounded memory for per-route timings.
+        // M6: bounded memory for per-route timings (Oct 30: expired times
+        // go too; they would be forgotten on their next look anyway).
         if self.route_us.len() > self.src.all().len() * 2 + 64 {
-            self.route_us.retain(|_, (_, until)| *until > epoch);
+            let ttl = self.cfg.route_time_ttl_blocks;
+            self.route_us.retain(|_, t| t.rest_until > epoch || epoch < t.at.saturating_add(ttl));
         }
         let mut done: HashSet<String> = HashSet::new();
         let mut found: Vec<Opportunity> = Vec::new();
@@ -870,7 +915,7 @@ impl Scanner {
                 rep.unfollowed += 1;
                 continue;
             }
-            if !self.may_start(r, t0, changed_limit, epoch, &mut rep) {
+            if self.may_start(r, t0, changed_limit, epoch, &mut rep) != Start::Go {
                 continue;
             }
             tried += 1;
@@ -918,39 +963,46 @@ impl Scanner {
                     self.pass_blocks = 1;
                 }
                 let r = &all[cursor];
-                if !done.contains(&r.rid) && crate::fastlane::lane::follow_block(&r.pools).is_some() {
-                    // Never sendable (see step 1): passed over, counted.
-                    rep.unfollowed += 1;
-                    done.insert(r.rid.clone());
-                    cursor += 1;
-                    steps += 1;
-                    self.last_rid = Some(r.rid.clone());
-                    if cursor >= all.len() {
-                        if self.pass_valid {
-                            rep.full_sweep_blocks = Some(self.pass_blocks);
+                // Passed over without a check (still counts as visited).
+                let mut pass_over = false;
+                if !done.contains(&r.rid) {
+                    if crate::fastlane::lane::follow_block(&r.pools).is_some() {
+                        // Never sendable (see step 1): passed over, counted.
+                        rep.unfollowed += 1;
+                        pass_over = true;
+                    } else {
+                        match self.may_start(r, t0, budget, epoch, &mut rep) {
+                            Start::Go => {}
+                            // (Oct 30) A route that only misses what is LEFT
+                            // after this block's other sweep checks: it gets
+                            // the next block's share (the sweep stops here).
+                            Start::NoFit if swept > 0 => break,
+                            // (Oct 30) Resting, or too slow even for the
+                            // sweep's whole share this block: pass over it
+                            // (counted) instead of stopping here. Before, the
+                            // sweep stopped at such a route EVERY block, so it
+                            // never moved again (live: 0 sweep checks/hour).
+                            // It is tried again once its time expires
+                            // (FASTLANE_ROUTE_TIME_TTL_BLOCKS) or as a block's
+                            // first check (may_start).
+                            Start::NoFit | Start::Resting => pass_over = true,
                         }
-                        self.pass_blocks = 0;
-                        self.pass_valid = true;
-                        cursor = 0;
-                        self.last_rid = None;
                     }
-                    continue;
-                }
-                if !done.contains(&r.rid) && !self.may_start(r, t0, budget, epoch, &mut rep) {
-                    // Doesn't fit what is left of the budget: next block.
-                    break;
                 }
                 cursor += 1;
                 steps += 1;
                 self.last_rid = Some(r.rid.clone());
-                if !done.contains(&r.rid) {
+                if pass_over {
+                    done.insert(r.rid.clone());
+                } else if !done.contains(&r.rid) {
                     done.insert(r.rid.clone());
                     let c = self.check_route(r, b, "sweep", t0, epoch, &mut found);
                     rep.checked.push(c);
                     swept += 1;
                 }
                 if cursor >= all.len() {
-                    // A full pass is complete: every route visited once.
+                    // A full pass is complete: every route visited once
+                    // (checked, or passed over and counted).
                     if self.pass_valid {
                         rep.full_sweep_blocks = Some(self.pass_blocks);
                     }
@@ -976,17 +1028,30 @@ impl Scanner {
     /// M6: may route `r` start now? Not while it rests (it was slower than
     /// FASTLANE_ROUTE_MAX_US), and only if its last run time still fits
     /// before `limit` (us since t0). A route never timed always may.
-    fn may_start(&mut self, r: &Arc<Route>, t0: Instant, limit: u64, epoch: u64, rep: &mut ScanReport) -> bool {
-        let Some((us, until)) = self.route_us.get(&r.rid).copied() else { return true };
-        if until > epoch {
+    /// (Oct 30) Two ways back in, so a recorded time can't ban a route for
+    /// good: its time is forgotten FASTLANE_ROUTE_TIME_TTL_BLOCKS blocks
+    /// after it was measured (then it may start like a new route and is
+    /// timed again), and a route that is not resting may always be the
+    /// FIRST check of a block (nothing else has used the budget yet; a
+    /// really slow one then rests 50 blocks again, so this is rare).
+    fn may_start(&mut self, r: &Arc<Route>, t0: Instant, limit: u64, epoch: u64, rep: &mut ScanReport) -> Start {
+        let Some(t) = self.route_us.get(&r.rid).copied() else { return Start::Go };
+        if t.rest_until > epoch {
             rep.resting += 1;
-            return false;
+            return Start::Resting;
         }
-        if (t0.elapsed().as_micros() as u64).saturating_add(us) > limit {
+        if epoch >= t.at.saturating_add(self.cfg.route_time_ttl_blocks) {
+            self.route_us.remove(&r.rid);
+            return Start::Go;
+        }
+        if rep.checked.is_empty() {
+            return Start::Go;
+        }
+        if (t0.elapsed().as_micros() as u64).saturating_add(t.us) > limit {
             rep.cut_fit += 1;
-            return false;
+            return Start::NoFit;
         }
-        true
+        Start::Go
     }
 
     fn check_route(&mut self, r: &Arc<Route>, b: &BlockInput, source: &'static str, t0: Instant, epoch: u64, found: &mut Vec<Opportunity>) -> RouteCheck {
@@ -996,7 +1061,7 @@ impl Scanner {
         if until > 0 {
             HOUR.with(|h| h.slow_routes += 1);
         }
-        self.route_us.insert(r.rid.clone(), (c.us, until));
+        self.route_us.insert(r.rid.clone(), RouteTime { us: c.us, rest_until: until, at: epoch });
         c
     }
 
