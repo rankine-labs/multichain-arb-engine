@@ -143,6 +143,13 @@ pub struct TrigCfg {
     /// pool-moving trigger wait for EVERY discovery of the message (line p50
     /// 10 -> 23 ms, decide 27 -> 40 ms). Off by default.
     pub discover_first: bool,
+    /// SPEED (Oct 29), FASTLANE_TRIG_COLD_SKIP [observe]: a transaction to a
+    /// contract asked about FASTLANE_TRIG_COLD_AFTER (50) times that never
+    /// moved our pools. off = no check; observe = still run it, count what
+    /// skipping would save and how often it would have been wrong; on =
+    /// skip it ("cold_target").
+    pub cold_skip: String,
+    pub cold_after: u64,
 }
 
 impl Default for TrigCfg {
@@ -166,6 +173,8 @@ impl Default for TrigCfg {
             ours: Vec::new(),
             wait_for_copy: false,
             discover_first: false,
+            cold_skip: "observe".into(),
+            cold_after: 50,
         }
     }
 }
@@ -214,6 +223,12 @@ impl TrigCfg {
             ours,
             wait_for_copy: crate::fastlane::mode::parse_on(get("FASTLANE_TRIG_WAIT").as_deref()),
             discover_first: crate::fastlane::mode::parse_on(get("FASTLANE_TRIG_DISCOVER_FIRST").as_deref()),
+            cold_skip: match get("FASTLANE_TRIG_COLD_SKIP").map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+                Some("on") => "on".into(),
+                Some("off") => "off".into(),
+                _ => d.cold_skip.clone(),
+            },
+            cold_after: num("FASTLANE_TRIG_COLD_AFTER").filter(|v| *v >= 1.0).map(|v| v.round() as u64).unwrap_or(d.cold_after),
         }
     }
 }
@@ -384,6 +399,11 @@ pub struct TrigHour {
     pub disc_ph_slow: BTreeMap<String, Vec<u64>>,
     pub disc_cpu: Vec<u64>,
     pub disc_slow: u64,
+    /// COLD TARGETS: transactions to a cold target (skipped when on), their
+    /// work time (us, observe), and how many of them moved our pools anyway.
+    pub cold: u64,
+    pub cold_us: u64,
+    pub cold_moved: u64,
     /// (Oct 27) Every unknown (discovery and candidate checks) by
     /// "where|reason" and by "reason|where|target|first missing item"
     /// (fastlane/coverage.rs). Bounded.
@@ -441,6 +461,7 @@ impl TrigHour {
         });
         j["discCpuUs"] = pctl(&self.disc_cpu);
         j["discSlow"] = json!(self.disc_slow);
+        j["cold"] = json!({"n": self.cold, "us": self.cold_us, "movedAnyway": self.cold_moved});
         j["discPh"] = self.disc_ph_json(false);
         j["discPhSlow"] = self.disc_ph_json(true);
         j
@@ -559,10 +580,23 @@ impl Trigger {
                 break;
             }
             self.hour.txs += 1;
+            let mut cold = false;
             let skip = match tx.decoded() {
-                Ok(d) => quick_skip(&d, &self.cfg.ours),
+                Ok(d) => {
+                    let q = quick_skip(&d, &self.cfg.ours);
+                    if q.is_none() && self.cfg.cold_skip != "off" {
+                        cold = d.to.is_some_and(|t| ctx.copy2.as_ref().is_some_and(|c| c.c2.discover_fill.lock().map(|b| b.cold(&t, self.cfg.cold_after)).unwrap_or(false)));
+                    }
+                    q
+                }
                 Err(_) => Some("unreadable"),
             };
+            if cold {
+                self.hour.cold += 1;
+            }
+            // (on: every 20th still runs, so a target that starts moving our
+            // pools is learned again)
+            let skip = if cold && self.cfg.cold_skip == "on" && !self.hour.cold.is_multiple_of(20) { skip.or(Some("cold_target")) } else { skip };
             if let Some(why) = skip {
                 *self.hour.skipped.entry(why).or_default() += 1;
                 out.push(TrigOutcome::Skipped(why));
@@ -577,6 +611,12 @@ impl Trigger {
             let started = Instant::now();
             if !self.cfg.discover_first {
                 let o = self.one_trigger(ctx, m.seq, head.seq, newest, tx.hash, arrived, left);
+                if cold {
+                    self.hour.cold_us += started.elapsed().as_micros() as u64;
+                    if moved_outcome(&o) {
+                        self.hour.cold_moved += 1;
+                    }
+                }
                 if moved_outcome(&o) {
                     // Moved our pools: how long it waited in line, and where.
                     push(&mut self.hour.line_us, started.saturating_duration_since(arrived).as_micros() as u64);
