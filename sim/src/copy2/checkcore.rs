@@ -112,6 +112,11 @@ pub struct CheckCore {
     pub any_pending: Vec<(PoolKind, Address, u64)>,
     /// Account -> why a pool at it isn't ready (first such pool).
     pub not_ready: HashMap<Address, String>,
+    /// (Oct 30) Every pool that isn't ready, as the bot names it in routes
+    /// (V4: its pool id; others: its address; 0x lowercase). The fast lane
+    /// skips routes through these on copy 2's confirmed versions instead of
+    /// running each one to an "unsure_pool" answer every block.
+    pub unsure_keys: HashSet<String>,
     /// Coins with a known balance layout (check warm-up).
     pub layouts: Vec<(Address, BalanceLayout)>,
     /// TRIGGER-FIRST (speed-3): "which copy values are exact at block N"
@@ -144,6 +149,16 @@ pub struct ProvIndex {
 /// Far-zero merge cache: account -> (the per-pool lists, merged).
 pub type FarCache = Mutex<HashMap<Address, (Vec<Arc<Vec<U256>>>, Arc<Vec<U256>>)>>;
 
+/// (Oct 30) A pool's key as the bot names it in routes and "changed pools"
+/// (same as the followed-pool list below: V4 id, else address; lowercase).
+pub fn route_key(p: &TrackedPool) -> String {
+    match p.v4_id {
+        Some(id) => format!("{id:#x}"),
+        None => format!("{:#x}", p.address),
+    }
+    .to_ascii_lowercase()
+}
+
 impl CheckCore {
     /// Build from the registry (caller holds its read lock; `gen` read
     /// under that lock).
@@ -161,6 +176,7 @@ impl CheckCore {
                 }
             }
             if e.state != PoolState::Ready {
+                c.unsure_keys.insert(route_key(&e.pool));
                 let why = format!("{} pool {} is {}: {}", kind_name(e.pool.kind), e.pool.address, state_name(e.state), e.reason);
                 for a in &accts {
                     c.not_ready.entry(*a).or_insert_with(|| why.clone());
@@ -424,5 +440,29 @@ mod tests {
         assert!(c.pending_reason(&[Address::with_last_byte(9)], 150, false).is_some());
         assert!(c.pending_reason(&[], 150, true).is_some());
         assert_eq!(c.layouts.len(), 1);
+        assert!(c.unsure_keys.is_empty(), "every pool ready");
+    }
+
+    /// (Oct 30) Pools not ready are listed by their route key (V4: pool id,
+    /// others: address), lowercase, for the fast lane's skip list.
+    #[test]
+    fn unsure_keys_name_the_pools_that_are_not_ready_as_routes_do() {
+        let mut reg = Registry { pm_bound: true, ..Default::default() };
+        let ready = v4(2);
+        let mut e = entry(ready.clone());
+        e.state = PoolState::Ready;
+        reg.pools.insert((ready.address, ready.v4_id), e);
+        let unsure_v4 = v4(3);
+        let mut e = entry(unsure_v4.clone());
+        e.state = PoolState::Unsure;
+        reg.pools.insert((unsure_v4.address, unsure_v4.v4_id), e);
+        let v3 = TrackedPool { address: Address::repeat_byte(0xAB), v4_id: None, kind: PoolKind::V3, token0: Address::with_last_byte(1), token1: Address::with_last_byte(2), fee: 500, tick_spacing: 10 };
+        reg.pools.insert((v3.address, None), entry(v3.clone())); // loading
+        let fc: FarCache = Mutex::new(HashMap::new());
+        let c = CheckCore::build(&reg, 1, None, &fc);
+        let mut keys: Vec<String> = c.unsure_keys.iter().cloned().collect();
+        keys.sort();
+        assert_eq!(keys, vec![format!("{:#x}", B256::with_last_byte(3)), "0xabababababababababababababababababababab".to_string()]);
+        assert!(!c.unsure_keys.contains(&route_key(&ready)));
     }
 }

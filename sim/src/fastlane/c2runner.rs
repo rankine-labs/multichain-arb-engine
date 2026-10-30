@@ -42,14 +42,38 @@
 //   is what the sidecar accepts for any check: checkcore.rs header). Outside
 //   a scan (practice re-checks) each check still asks for its own.
 //
+//   FAST LANE FILLS (Oct 30): a check that answers "miss" names the values
+//   copy 2 doesn't hold. The bot's own sidecar checks always asked copy 2
+//   to fetch those (server.rs after_pick_with -> fill); the fast lane never
+//   did. So a value only fast-lane routes need stayed missing for good, and
+//   the same route answered "unknown" every block. Live Oct 30 20:00-20:16:
+//   USDG (0x5fc5..) 3,657 misses, the blocklist contract 0xe10b.. 367: e.g.
+//   USDG keeps a per-address flag (mapping slot 6) it reads for BOTH sides
+//   of every transfer; copy 2 follows balances, not flags, so flag[pool]
+//   is held only once some check fetched it. Now the fast lane asks too,
+//   paced by FastFillBook (each value at most once per
+//   ARBSIM_FASTLANE_FILL_REPEAT_S [120] seconds, at most
+//   ARBSIM_FASTLANE_FILL_PER_HOUR [3600] values an hour, the first
+//   ARBSIM_FASTLANE_FILL_MAX_ITEMS [8] items of one answer;
+//   ARBSIM_FASTLANE_FILL=0 turns it off). A fill is copy 2's ordinary fill:
+//   the node's value at a block, placed and refreshed by copy 2's own rules
+//   (it refuses what it can't hold exactly). Nothing is guessed: until the
+//   value is held, the check keeps answering "unknown".
+//   Status fastlane.copy2Runs: fillOffered / fillSent / fillRepeat /
+//   fillOverCap / fillNotQueued / fillAskedAgain; values fetched for the
+//   fast lane are re-read by their own verify round (copy2/intake.rs
+//   dispatch_fast_verify, ARBSIM_COPY2_FAST_VERIFY_S [60]); fastlane.copy2Unknown: WHICH value each "miss" stopped on
+//   (account + slot) and WHICH pool each "unsure_pool" named (top 10).
+//
 //   Counted on their own (final review, low): copy 2's PoolManager-bound and
 //   protocol-fee counters (pm_bound_*, pm_high_*, protocol_fee_*) are about
 //   the BOT's checks. Runs made from here are counted in this file instead
 //   (status "fastlane" -> "copy2Runs"), so the fast lane can't blur them.
 // ============================================================================
 use std::cell::Cell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use revm::primitives::U256;
 use serde_json::{json, Value};
@@ -62,7 +86,7 @@ use crate::check::search::{size_search_opts, SizeSearchAmounts, SizeSearchBest, 
 use crate::check::{CheckUnknown, UnknownReason};
 use crate::copy2::intake::Copy2Handle;
 use crate::state::snap::View;
-use crate::state::StateRead;
+use crate::state::{MissItem, StateRead};
 
 thread_local! {
     /// True while this thread runs a fast lane check through copy 2's code.
@@ -86,6 +110,164 @@ pub fn note_if_fastlane(what: &'static str) -> bool {
 pub fn stats_json() -> Value {
     let m = RUN_STATS.lock().unwrap_or_else(|e| e.into_inner());
     Value::Object(m.iter().map(|(k, v)| (k.to_string(), json!(v))).collect())
+}
+
+/// Add `n` to one of the fast lane's copy-2 counters (status copy2Runs).
+fn bump(what: &'static str, n: u64) {
+    if n > 0 {
+        *RUN_STATS.lock().unwrap_or_else(|e| e.into_inner()).entry(what).or_default() += n;
+    }
+}
+
+/// (Oct 30) What the fast lane's "unknown" answers stopped on (status
+/// fastlane.copy2Unknown): miss -> "account slot", unsure_pool -> the pool
+/// copy 2 named. Bounded (coverage.rs Tally).
+static UNKNOWN_DETAIL: Mutex<Option<(super::coverage::Tally, super::coverage::Tally)>> = Mutex::new(None);
+
+fn note_unknown_detail(miss: Option<String>, unsure: Option<String>) {
+    let mut g = UNKNOWN_DETAIL.lock().unwrap_or_else(|e| e.into_inner());
+    let (m, u) = g.get_or_insert_with(Default::default);
+    if let Some(k) = miss {
+        m.add(k);
+    }
+    if let Some(k) = unsure {
+        u.add(k);
+    }
+}
+
+/// Status: the top 10 missed values and unsure pools since start.
+pub fn unknown_detail_json() -> Value {
+    let g = UNKNOWN_DETAIL.lock().unwrap_or_else(|e| e.into_inner());
+    match g.as_ref() {
+        Some((m, u)) => json!({ "missTop": m.json(10), "unsurePoolTop": u.json(10) }),
+        None => json!({ "missTop": {}, "unsurePoolTop": {} }),
+    }
+}
+
+/// The value a "miss" stopped on, as status text ("0xaccount 0xslot").
+fn miss_key(m: &MissItem) -> String {
+    match m {
+        MissItem::Slot(a, s) => format!("{a:#x} {s:#x}"),
+        MissItem::Account(a) => format!("{a:#x} basics"),
+        MissItem::Code(h) => format!("code {h:#x}"),
+    }
+}
+
+/// The pool named in an "unsure_pool" detail ("v3 pool 0x.. is unsure:
+/// why" -> "v3 pool 0x.. is unsure: why", cut to 100 characters).
+fn unsure_key(detail: &str) -> String {
+    detail.chars().take(100).collect()
+}
+
+/// (Oct 30) FAST LANE FILLS: which missed values the fast lane asked copy 2
+/// to fetch (see the file header). One per copy (Copy2Handle).
+///
+/// Review (Oct 30): an item counts as asked only if copy 2 actually took the
+/// request (its input can be full); and a value asked again and again (copy
+/// 2 refuses it, e.g. some PoolManager slots, or it never stays held) waits
+/// twice as long each time (up to an hour), so it can't use up the hourly
+/// allowance.
+#[derive(Debug)]
+pub struct FastFillBook {
+    pub on: bool,
+    /// The same value is asked again at most once per this long (the first
+    /// time; doubled for each further ask, at most BACKOFF_MAX).
+    pub repeat: Duration,
+    /// At most this many values an hour (all routes together).
+    pub per_hour: u64,
+    /// At most this many items of one answer.
+    pub max_items: usize,
+    /// Value -> (last asked, times asked).
+    sent: HashMap<MissItem, (Instant, u32)>,
+    order: VecDeque<(MissItem, Instant)>,
+    hour_start: Option<Instant>,
+    pub hour_used: u64,
+}
+
+impl FastFillBook {
+    /// Values remembered for the repeat rule (oldest forgotten first).
+    pub const REMEMBER: usize = 20_000;
+    /// Longest wait between two asks for the same value.
+    pub const BACKOFF_MAX: Duration = Duration::from_secs(3600);
+
+    pub fn new(on: bool, repeat: Duration, per_hour: u64, max_items: usize) -> FastFillBook {
+        FastFillBook { on, repeat, per_hour, max_items, sent: HashMap::new(), order: VecDeque::new(), hour_start: None, hour_used: 0 }
+    }
+
+    /// Settings from the environment (file header).
+    pub fn from_env() -> FastFillBook {
+        let num = |k: &str, d: u64| std::env::var(k).ok().and_then(|s| s.trim().parse::<u64>().ok()).unwrap_or(d);
+        let on = std::env::var("ARBSIM_FASTLANE_FILL").map(|s| s.trim() != "0").unwrap_or(true);
+        FastFillBook::new(on, Duration::from_secs(num("ARBSIM_FASTLANE_FILL_REPEAT_S", 120)), num("ARBSIM_FASTLANE_FILL_PER_HOUR", 3600), num("ARBSIM_FASTLANE_FILL_MAX_ITEMS", 8) as usize)
+    }
+
+    /// How long after the `times`-th ask the value may be asked again.
+    fn wait_after(&self, times: u32) -> Duration {
+        let f = 1u32 << times.saturating_sub(1).min(16);
+        self.repeat.saturating_mul(f).min(Self::BACKOFF_MAX.max(self.repeat))
+    }
+
+    /// A "miss" answer named these values: pick the ones to fetch now, hand
+    /// them to `send` (true = copy 2 queued them), and only then count them
+    /// as asked (status copy2Runs). Code items are left out (copy 2 fetches
+    /// code with the account's basics). Returns what was queued.
+    pub fn offer(&mut self, missing: &[MissItem], now: Instant, send: impl FnOnce(Vec<MissItem>) -> bool) -> Vec<MissItem> {
+        if !self.on || missing.is_empty() {
+            return Vec::new();
+        }
+        if self.hour_start.is_none_or(|t| now.saturating_duration_since(t) >= Duration::from_secs(3600)) {
+            self.hour_start = Some(now);
+            self.hour_used = 0;
+        }
+        let mut pick: Vec<MissItem> = Vec::new();
+        let (mut offered, mut repeat, mut over) = (0u64, 0u64, 0u64);
+        for m in missing.iter().filter(|m| !matches!(m, MissItem::Code(_))).take(self.max_items) {
+            offered += 1;
+            if pick.contains(m) {
+                continue;
+            }
+            if let Some((t, n)) = self.sent.get(m) {
+                if now.saturating_duration_since(*t) < self.wait_after(*n) {
+                    repeat += 1;
+                    continue;
+                }
+            }
+            if self.hour_used + pick.len() as u64 >= self.per_hour {
+                over += 1;
+                continue;
+            }
+            pick.push(m.clone());
+        }
+        bump("fillOffered", offered);
+        bump("fillRepeat", repeat);
+        bump("fillOverCap", over);
+        if pick.is_empty() {
+            return pick;
+        }
+        if !send(pick.clone()) {
+            // Copy 2's input was full: nothing asked, nothing recorded.
+            bump("fillNotQueued", pick.len() as u64);
+            return Vec::new();
+        }
+        for m in &pick {
+            let n = self.sent.get(m).map_or(0, |x| x.1);
+            if n >= 1 {
+                bump("fillAskedAgain", 1);
+            }
+            self.sent.insert(m.clone(), (now, n.saturating_add(1)));
+            self.order.push_back((m.clone(), now));
+        }
+        self.hour_used += pick.len() as u64;
+        while self.order.len() > Self::REMEMBER {
+            if let Some((m, t)) = self.order.pop_front() {
+                if self.sent.get(&m).is_some_and(|x| x.0 == t) {
+                    self.sent.remove(&m);
+                }
+            }
+        }
+        bump("fillSent", pick.len() as u64);
+        pick
+    }
 }
 
 /// Marks this thread as running a fast lane check until dropped.
@@ -289,7 +471,14 @@ pub fn run_on_copy2_with(
     } else {
         let missing = crate::proto::parse_missing(&answer);
         if let Some(why) = c2.unsure_reason_with(core, &missing) {
+            note_unknown_detail(None, Some(unsure_key(&why)));
             answer = json!({ "ok": false, "unknown": "unsure_pool", "detail": why });
+        } else if answer.get("unknown").and_then(|u| u.as_str()) == Some("miss") {
+            // (Oct 30) FAST LANE FILLS (file header): ask copy 2 to fetch
+            // what this check missed, paced. The answer stays "unknown".
+            note_unknown_detail(missing.first().map(miss_key), None);
+            // Only what copy 2 actually queued is counted as asked (review).
+            let _ = c2.c2.fastlane_fill.lock().map(|mut b| b.offer(&missing, Instant::now(), |items| c2.fast_fill(items)));
         }
     }
     result_from_json(&answer)
@@ -312,6 +501,34 @@ mod tests {
         }
         assert!(!note_if_fastlane("pmBoundSame"), "the mark ends with the run");
         assert!(stats_json()["pmBoundSame"].as_u64().unwrap() >= 2);
+    }
+
+    /// (Oct 30) The fast lane's fill pacing: each value once per window,
+    /// at most `max_items` of one answer, a hard hourly cap, code skipped,
+    /// off = nothing asked.
+    #[test]
+    fn fast_fill_book_paces_what_the_fast_lane_asks_for() {
+        use revm::primitives::{Address, B256};
+        let a = Address::with_last_byte(5);
+        let item = |n: u8| MissItem::Slot(a, U256::from(n));
+        let ok = |_: Vec<MissItem>| true;
+        let t0 = Instant::now();
+        let s = |x: u64| t0 + Duration::from_secs(x);
+        let mut b = FastFillBook::new(true, Duration::from_secs(120), 5, 2);
+        assert_eq!(b.offer(&[MissItem::Code(B256::ZERO), item(1), item(2), item(3)], t0, ok), vec![item(1), item(2)], "code skipped, 2 items per answer");
+        assert!(b.offer(&[item(1), item(2)], s(5), ok).is_empty(), "same values within the window: not again");
+        // Copy 2's input full: nothing recorded, the next answer asks again.
+        assert!(b.offer(&[item(3)], s(6), |_| false).is_empty());
+        assert_eq!(b.hour_used, 2, "a refused send uses none of the allowance");
+        assert_eq!(b.offer(&[item(3)], s(7), ok), vec![item(3)]);
+        // Asked again after the window; then the wait doubles (240 s).
+        assert_eq!(b.offer(&[item(1)], s(121), ok), vec![item(1)]);
+        assert!(b.offer(&[item(1)], s(121 + 239), ok).is_empty(), "second ask: waits 240 s");
+        assert_eq!(b.offer(&[item(1)], s(121 + 240), ok), vec![item(1)]);
+        assert!(b.offer(&[item(4)], s(400), ok).is_empty(), "hourly cap (5) reached");
+        assert_eq!(b.offer(&[item(4)], s(3700), ok), vec![item(4)], "a new hour");
+        let mut off = FastFillBook::new(false, Duration::from_secs(120), 4, 2);
+        assert!(off.offer(&[item(1)], t0, ok).is_empty());
     }
 
     #[test]

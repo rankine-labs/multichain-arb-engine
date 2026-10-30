@@ -61,7 +61,9 @@ impl Ctx {
     /// Items a check missed: to whichever thread keeps the copy.
     fn fill(&self, items: Vec<crate::state::MissItem>) {
         match &self.copy2 {
-            Some(c) => c.fill(items),
+            Some(c) => {
+                c.fill(items);
+            }
             None => self.updater.fill(items),
         }
     }
@@ -298,7 +300,9 @@ pub fn handle_tm(ctx: &Ctx, req: &Value, tm: &mut Tm) -> Value {
             Ok(items) => {
                 let n = items.len();
                 match &ctx.copy2 {
-                    Some(c) => c.fill(items),
+                    Some(c) => {
+                        c.fill(items);
+                    }
                     None => ctx.updater.warm(items),
                 }
                 json!({ "id": id, "ok": true, "queued": n })
