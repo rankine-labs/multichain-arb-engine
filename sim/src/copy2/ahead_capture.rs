@@ -102,7 +102,8 @@ impl ProvSets {
         ProvSets { all: true, ..Default::default() }
     }
     pub fn from_copy2(p: &super::intake::Copy2Prov) -> ProvSets {
-        ProvSets { all: false, accts: p.accts.clone(), pms: p.pms.clone(), slots: p.slots.clone() }
+        let (accts, pms, slots) = p.flat();
+        ProvSets { all: false, accts, pms, slots }
     }
 }
 

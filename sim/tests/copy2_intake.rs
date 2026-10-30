@@ -2766,7 +2766,7 @@ fn exact_values_and_moved_pools_from_the_summary_equal_the_registry_walk() {
         for x in [&[][..], &extra[..]] {
             let old = r.h.provenance_at(n, x);
             let new = r.h.provenance_with(&core, n, x);
-            assert_eq!((&old.accts, &old.pms, &old.slots), (&new.accts, &new.pms, &new.slots), "block {n}");
+            assert_eq!(old.flat(), new.flat(), "block {n}");
         }
     }
     // Moved pools: V4 slot0 of some ids, a contract pool's reserves, shared values.
