@@ -749,6 +749,8 @@ pub struct ScanReport {
     pub timing: ScanTiming,
     /// Changed-pool routes left unchecked because the budget ran out.
     pub cut_changed: usize,
+    /// Routes passed over: a pool not followed and ready in copy 2.
+    pub unfollowed: usize,
     /// Routes in the sweep list.
     pub sweep_total: usize,
     /// Completed a full sweep pass this block: how many blocks it took.
@@ -855,14 +857,23 @@ impl Scanner {
         // 1. Routes through pools changed in this block.
         let tc = Instant::now();
         let ranked = if b.changed.is_empty() { Vec::new() } else { self.src.ranked_for(b.changed) };
+        let mut tried = 0usize;
         for (i, r) in ranked.iter().enumerate() {
-            if i >= self.cfg.max_changed || t0.elapsed().as_micros() as u64 >= changed_limit {
+            if tried >= self.cfg.max_changed || t0.elapsed().as_micros() as u64 >= changed_limit {
                 rep.cut_changed = ranked.len() - i;
                 break;
+            }
+            // (Oct 30) A route through a pool copy 2 doesn't follow and hold
+            // ready can never be sent (lane.rs follow_block): don't spend
+            // the block's budget on it (live: ~1 in 3 "found" were such).
+            if crate::fastlane::lane::follow_block(&r.pools).is_some() {
+                rep.unfollowed += 1;
+                continue;
             }
             if !self.may_start(r, t0, changed_limit, epoch, &mut rep) {
                 continue;
             }
+            tried += 1;
             done.insert(r.rid.clone());
             let c = self.check_route(r, b, "changed", t0, epoch, &mut found);
             rep.checked.push(c);
@@ -907,6 +918,24 @@ impl Scanner {
                     self.pass_blocks = 1;
                 }
                 let r = &all[cursor];
+                if !done.contains(&r.rid) && crate::fastlane::lane::follow_block(&r.pools).is_some() {
+                    // Never sendable (see step 1): passed over, counted.
+                    rep.unfollowed += 1;
+                    done.insert(r.rid.clone());
+                    cursor += 1;
+                    steps += 1;
+                    self.last_rid = Some(r.rid.clone());
+                    if cursor >= all.len() {
+                        if self.pass_valid {
+                            rep.full_sweep_blocks = Some(self.pass_blocks);
+                        }
+                        self.pass_blocks = 0;
+                        self.pass_valid = true;
+                        cursor = 0;
+                        self.last_rid = None;
+                    }
+                    continue;
+                }
                 if !done.contains(&r.rid) && !self.may_start(r, t0, budget, epoch, &mut rep) {
                     // Doesn't fit what is left of the budget: next block.
                     break;
@@ -1114,6 +1143,7 @@ pub struct Hour {
     pub no_facts: u64,
     pub implausible: u64,
     pub cut_changed: u64,
+    pub unfollowed: u64,
     pub bad_rows: u64,
     pub best_net_usd: Option<f64>,
     pub best_label: String,
@@ -1153,7 +1183,7 @@ impl HourCell {
 
 static HOUR: HourCell = HourCell { h: Mutex::new(Hour {
     blocks: 0, routes_checked: 0, changed_checked: 0, sweep_checked: 0, found: 0, found_dup: 0, below_min: 0, no_profit: 0, unknown: 0,
-    skipped_unsure: 0, no_facts: 0, implausible: 0, cut_changed: 0, bad_rows: 0, best_net_usd: None, best_label: String::new(), time_us: 0,
+    skipped_unsure: 0, no_facts: 0, implausible: 0, cut_changed: 0, unfollowed: 0, bad_rows: 0, best_net_usd: None, best_label: String::new(), time_us: 0,
     max_block_us: 0, full_sweeps: 0, last_full_sweep_blocks: None, max_full_sweep_blocks: 0, eval_real: 0, eval_gone: 0, eval_unknown: 0,
     slow_routes: 0, resting: 0, cut_fit: 0, routes: 0, skipped_unsure_lender: 0,
 }), ring: Mutex::new(VecDeque::new()) };
@@ -1162,6 +1192,7 @@ fn record_block(rep: &ScanReport) {
     HOUR.with(|h| {
         h.blocks += 1;
         h.cut_changed += rep.cut_changed as u64;
+        h.unfollowed += rep.unfollowed as u64;
         h.resting += rep.resting as u64;
         h.cut_fit += rep.cut_fit as u64;
         h.time_us += rep.timing.total_us;
@@ -1223,7 +1254,7 @@ pub fn status_json() -> Value {
     json!({
         "blocks": h.blocks, "routesChecked": h.routes_checked, "changedChecked": h.changed_checked, "sweepChecked": h.sweep_checked,
         "found": h.found, "foundDup": h.found_dup, "belowMin": h.below_min, "noProfit": h.no_profit, "unknown": h.unknown,
-        "skippedUnsure": h.skipped_unsure, "noFacts": h.no_facts, "implausible": h.implausible, "cutChanged": h.cut_changed, "badRows": h.bad_rows,
+        "skippedUnsure": h.skipped_unsure, "noFacts": h.no_facts, "implausible": h.implausible, "cutChanged": h.cut_changed, "unfollowed": h.unfollowed, "badRows": h.bad_rows,
         "bestNetUsd": h.best_net_usd, "bestLabel": h.best_label, "timeUs": h.time_us, "maxBlockUs": h.max_block_us,
         "fullSweeps": h.full_sweeps, "lastFullSweepBlocks": h.last_full_sweep_blocks, "maxFullSweepBlocks": h.max_full_sweep_blocks,
         "evalReal": h.eval_real, "evalGone": h.eval_gone, "evalUnknown": h.eval_unknown,
