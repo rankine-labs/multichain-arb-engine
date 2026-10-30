@@ -897,6 +897,25 @@ pub struct Copy2Prov {
     pub accts: HashSet<Address>,
     pub pms: HashSet<Address>,
     pub slots: HashSet<(Address, U256)>,
+    /// (SPEED, Oct 30) Everything in `base` counts too: a check with extra
+    /// holders (our test contract) gets the core's prebuilt set plus only
+    /// the extra holders' coin-balance slots, instead of a full rebuild
+    /// (live: rebuilt for every candidate, the biggest part of a check).
+    pub base: Option<Arc<Copy2Prov>>,
+}
+
+impl Copy2Prov {
+    /// The three sets with `base` merged in (tests, the predicted copy).
+    pub fn flat(&self) -> (HashSet<Address>, HashSet<Address>, HashSet<(Address, U256)>) {
+        let (mut a, mut p, mut s) = match &self.base {
+            Some(b) => b.flat(),
+            None => Default::default(),
+        };
+        a.extend(self.accts.iter().copied());
+        p.extend(self.pms.iter().copied());
+        s.extend(self.slots.iter().copied());
+        (a, p, s)
+    }
 }
 
 /// Copy2Prov at block `n` from a core's block-independent index (see
@@ -923,10 +942,10 @@ pub fn prov_from(ix: &super::checkcore::ProvIndex, layouts: &[(Address, BalanceL
 
 impl crate::check::ordered::Provenance for Copy2Prov {
     fn slot_exact(&self, a: Address, slot: U256) -> bool {
-        self.accts.contains(&a) || self.pms.contains(&a) || self.slots.contains(&(a, slot))
+        self.accts.contains(&a) || self.pms.contains(&a) || self.slots.contains(&(a, slot)) || self.base.as_ref().is_some_and(|b| b.slot_exact(a, slot))
     }
     fn balance_exact(&self, a: Address) -> bool {
-        self.pms.contains(&a)
+        self.pms.contains(&a) || self.base.as_ref().is_some_and(|b| b.balance_exact(a))
     }
 }
 
@@ -1056,14 +1075,22 @@ impl Copy2Handle {
         // or after every pool's "exact since") gets the set built once with
         // the core, on the copy's own thread (live: building it here was the
         // biggest step of slow discoveries, p50 2.6 ms / p90 8 ms).
-        if extra_holders.is_empty() {
-            if let Some((max_since, full)) = &core.prov_full {
-                if n >= *max_since {
+        let p = match &core.prov_full {
+            Some((max_since, full)) if n >= *max_since => {
+                if extra_holders.is_empty() {
                     return full.clone();
                 }
+                // The prebuilt set + the extra holders' balance slots only.
+                let mut extra = Copy2Prov { base: Some(full.clone()), ..Default::default() };
+                for (coin, l) in &core.layouts {
+                    for h in extra_holders {
+                        extra.slots.insert((*coin, l.key(*h)));
+                    }
+                }
+                Arc::new(extra)
             }
-        }
-        let p = Arc::new(prov_from(&core.prov, &core.layouts, n, extra_holders));
+            _ => Arc::new(prov_from(&core.prov, &core.layouts, n, extra_holders)),
+        };
         let mut c = core.prov_cache.lock().unwrap_or_else(|e| e.into_inner());
         if c.len() >= 4 {
             c.remove(0);
