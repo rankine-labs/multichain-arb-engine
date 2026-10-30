@@ -43,7 +43,7 @@
 //   decision pending), ARB_EXECUTOR_ROBINHOOD, no kill switch, fresh Node
 //   state. Anything missing = practice, and the start-up line says why.
 // ============================================================================
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -396,7 +396,22 @@ pub fn follow_block(pools: &[String]) -> Option<String> {
     if !*ON.get_or_init(|| !crate::fastlane::mode::parse_off(std::env::var("FASTLANE_REQUIRE_FOLLOWED").ok().as_deref())) {
         return None;
     }
-    FOLLOW.get().and_then(|c| c.unfollowed_pool(pools))
+    let c = FOLLOW.get()?;
+    // A copy of the ready set, refreshed at most once a second: no
+    // registry lock per route (the copy's thread may hold it for a while).
+    static READY: Mutex<Option<(Instant, Arc<HashSet<String>>)>> = Mutex::new(None);
+    let ready = {
+        let mut g = READY.lock().unwrap_or_else(|e| e.into_inner());
+        match g.as_ref() {
+            Some((t, set)) if t.elapsed() < std::time::Duration::from_secs(1) => set.clone(),
+            _ => {
+                let set = Arc::new(c.ready_keys());
+                *g = Some((Instant::now(), set.clone()));
+                set
+            }
+        }
+    };
+    pools.iter().find(|k| !ready.contains(&k.trim().to_ascii_lowercase())).map(|k| format!("{} not followed and ready", &k[..k.len().min(12)]))
 }
 
 impl Firer {

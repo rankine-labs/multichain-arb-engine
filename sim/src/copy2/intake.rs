@@ -1107,6 +1107,21 @@ impl Copy2Handle {
     /// routes through them were checked on values filled once from the node
     /// and never refreshed: 52 of their pools were 0.1-1% off the chain, and
     /// every "$13" practice win was such a stale price.
+    /// Every followed pool that is ready, as route keys (lowercase pool
+    /// address, or V4 pool id as 0x + 64 hex). (fastlane/lane.rs keeps a
+    /// copy refreshed once a second, so per-route checks take no lock.)
+    pub fn ready_keys(&self) -> HashSet<String> {
+        let reg = self.c2.reg.read().unwrap_or_else(|e| e.into_inner());
+        reg.pools
+            .iter()
+            .filter(|(_, e)| e.state == PoolState::Ready)
+            .map(|(k, _)| match k.1 {
+                Some(id) => format!("{id:#x}"),
+                None => format!("{:#x}", k.0),
+            })
+            .collect()
+    }
+
     pub fn unfollowed_pool(&self, pools: &[String]) -> Option<String> {
         let reg = self.c2.reg.read().unwrap_or_else(|e| e.into_inner());
         for k in pools {
