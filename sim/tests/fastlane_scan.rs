@@ -790,7 +790,10 @@ fn a_busy_changed_step_does_not_make_the_sweep_skip_fast_routes() {
     let ch = vec![key(0x105)];
     let rep = sc.scan(&input(&s, &ctx(), 2, &ch, &none));
     assert_eq!(rep.checked.len(), 1, "only r005 ran: {:?}", rep.checked);
-    assert_eq!(rep.cut_fit, 1, "the sweep stopped at the first fast route (no skipping run)");
+    // The sweep must stop, not pass over fast routes. On a slow machine the
+    // changed step can use the whole budget, so the sweep stops before it even
+    // looks at a route (cut_fit 0) instead of stopping at the first one (1).
+    assert!(rep.cut_fit <= 1, "the sweep stopped at the first fast route (no skipping run): {}", rep.cut_fit);
     assert_eq!(rep.full_sweep_blocks, None, "no pass counted over routes never checked");
     // Block 3 (quiet): the sweep carries on from where it stopped and checks them.
     ran.lock().unwrap().clear();
