@@ -930,6 +930,12 @@ impl DiscoverFillBook {
         self.targets.get(t).is_some_and(|x| x.1 > 0)
     }
 
+    /// FAST LANE (Oct 29): asked about at least `after` times and never moved
+    /// our pools (answered, or told later by copy 2's reports).
+    pub fn cold(&self, target: &Address, after: u64) -> bool {
+        self.targets.get(target).is_some_and(|e| e.0 >= after && e.1 == 0)
+    }
+
     /// Discovery answered about a transaction to `target`: `moved` Some(true)
     /// = it moved our pools (answered), Some(false) = moved none (answered),
     /// None = unknown (copy 2's reports will tell, see resolve).
