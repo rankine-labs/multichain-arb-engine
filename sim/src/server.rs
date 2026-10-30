@@ -1172,7 +1172,11 @@ pub fn trig_entry_checks(ctx: &Ctx, id: &Value, req: &Value, disc: Value, t0: In
     let min_conf = req.get("minConf").and_then(|m| m.as_str()).unwrap_or("medium").to_string();
     let budget = req.get("budgetUs").and_then(|b| b.as_u64()).unwrap_or(200_000);
     let mut run = EntryRun { pools: pools.clone(), ..Default::default() };
-    let res = crate::check::entry::pick(&pools, limit).map(|(gen, codes, picked, found)| {
+    let t_pick = Instant::now();
+    let picked_res = crate::check::entry::pick(&pools, limit);
+    out["pickUs"] = json!(t_pick.elapsed().as_micros() as u64);
+    let t_checks = Instant::now();
+    let res = picked_res.map(|(gen, codes, picked, found)| {
         let sel: Vec<Value> = picked.iter().map(|r| json!(r.e.clone())).collect();
         // 3. Check, best-ranked first.
         let (mut cands, mut stopped, mut cut) = (Vec::new(), false, false);
@@ -1187,9 +1191,15 @@ pub fn trig_entry_checks(ctx: &Ctx, id: &Value, req: &Value, disc: Value, t0: In
                 checked.push(CheckedRow { row: r.clone(), answer: None, good: false });
                 continue;
             };
+            let t_call = Instant::now();
             let call = crate::check::entry::call_for(&codes, c, id, &at, feed, true);
+            let build_us = t_call.elapsed().as_micros() as u64;
             let mut ctm = Tm::default();
-            let a = handle_tm(ctx, &call, &mut ctm);
+            let mut a = handle_tm(ctx, &call, &mut ctm);
+            // ENTRY STEPS (Oct 29): building the question, and the whole
+            // check as the caller saw it (wall), next to the check's own `us`.
+            a["buildUs"] = json!(build_us);
+            a["wallUs"] = json!(t_call.elapsed().as_micros() as u64);
             let good = crate::check::entry::good_enough(&a, c, &min_conf);
             cands.push(json!({ "e": r.e, "a": a }));
             checked.push(CheckedRow { row: r.clone(), answer: Some(a), good });
@@ -1200,6 +1210,7 @@ pub fn trig_entry_checks(ctx: &Ctx, id: &Value, req: &Value, disc: Value, t0: In
         }
         (gen, codes, found, sel, cands, stopped, cut, checked)
     });
+    out["checksWallUs"] = json!(t_checks.elapsed().as_micros() as u64);
     match res {
         None => out["table"] = json!("none"),
         Some((gen, codes, found, sel, cands, stopped, cut, checked)) => {

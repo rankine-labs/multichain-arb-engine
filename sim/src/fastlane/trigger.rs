@@ -404,6 +404,15 @@ pub struct TrigHour {
     pub cold: u64,
     pub cold_us: u64,
     pub cold_moved: u64,
+    /// ENTRY STEPS (Oct 29), triggers that moved our pools only (us): the
+    /// whole one-trip question, its route picking, its checks as the caller
+    /// saw them (wall), the checks' own `us` sum, and the question building.
+    pub mv_entry: Vec<u64>,
+    pub mv_pick: Vec<u64>,
+    pub mv_checks_wall: Vec<u64>,
+    pub mv_checks_own: Vec<u64>,
+    pub mv_build: Vec<u64>,
+    pub mv_disc: Vec<u64>,
     /// (Oct 27) Every unknown (discovery and candidate checks) by
     /// "where|reason" and by "reason|where|target|first missing item"
     /// (fastlane/coverage.rs). Bounded.
@@ -462,6 +471,10 @@ impl TrigHour {
         j["discCpuUs"] = pctl(&self.disc_cpu);
         j["discSlow"] = json!(self.disc_slow);
         j["cold"] = json!({"n": self.cold, "us": self.cold_us, "movedAnyway": self.cold_moved});
+        j["movedSteps"] = json!({
+            "entry": pctl(&self.mv_entry), "disc": pctl(&self.mv_disc), "pick": pctl(&self.mv_pick),
+            "checksWall": pctl(&self.mv_checks_wall), "checksOwn": pctl(&self.mv_checks_own), "build": pctl(&self.mv_build),
+        });
         j["discPh"] = self.disc_ph_json(false);
         j["discPhSlow"] = self.disc_ph_json(true);
         j
@@ -684,6 +697,16 @@ impl Trigger {
 
     /// Count a trig_entry answer's step times, then decide on it.
     fn after_entry(&mut self, ans: Value, run: Option<EntryRun>, seq: u64, arrived: Instant) -> TrigOutcome {
+        if run.as_ref().is_some_and(|r| !r.pools.is_empty() && r.pools.len() <= self.cfg.max_pools) {
+            let g = |v: &Value| v.as_u64().unwrap_or(0);
+            push(&mut self.hour.mv_entry, g(&ans["us"]));
+            push(&mut self.hour.mv_disc, g(&ans["disc"]["us"]));
+            push(&mut self.hour.mv_pick, g(&ans["pickUs"]));
+            push(&mut self.hour.mv_checks_wall, g(&ans["checksWallUs"]));
+            let cands = ans.get("cands").and_then(|c| c.as_array());
+            push(&mut self.hour.mv_checks_own, cands.map(|c| c.iter().map(|x| g(&x["a"]["us"])).sum()).unwrap_or(0));
+            push(&mut self.hour.mv_build, cands.map(|c| c.iter().map(|x| g(&x["a"]["buildUs"])).sum()).unwrap_or(0));
+        }
         if let Some(u) = ans.get("us").and_then(|v| v.as_u64()) {
             push(&mut self.hour.entry_us, u);
         }
