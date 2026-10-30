@@ -691,6 +691,29 @@ pub struct RunAt<'a> {
     pub snap: Option<&'a Arc<crate::state::snap::Snapshot>>,
 }
 
+/// (Oct 30) A short word for why a check could not answer (scanner
+/// "unknown" counted by it, status fastlane.scan.hour.unknownWhy):
+///   miss                 our copy lacks a value the check read
+///   unsure_pool          that value belongs to a pool copy 2 has not ready
+///   pending_reports      a pool on it may still be missing reports of the block
+///   pool_manager_balance the answer depends on a V4 PoolManager balance
+///   protocol_fee         ... on a V4 protocol-fee counter copy 2 never holds
+///   engine_error         something went wrong inside the engine
+///   other                anything else (copy 2's other words)
+/// Other engine reasons keep their own word (e.g. unsupported_precompile).
+pub fn unknown_key(u: &CheckUnknown) -> &'static str {
+    use crate::check::UnknownReason as R;
+    match u.reason {
+        // c2runner.rs result_from_json keeps copy 2's word first in the
+        // detail ("<word>: <detail>").
+        R::Copy2Unsure => {
+            let word = u.detail.split(':').next().unwrap_or("").trim();
+            ["unsure_pool", "pending_reports", "pool_manager_balance", "protocol_fee"].into_iter().find(|w| *w == word).unwrap_or("other")
+        }
+        r => r.as_str(),
+    }
+}
+
 /// The plain size search (check/search.rs), eth_call rules, strict view.
 pub struct PlainRunner;
 
@@ -1087,7 +1110,18 @@ impl Scanner {
         let at = RunAt { view: b.view, ctx: b.ctx, block: b.block, snap: b.snap };
         let res = match self.runner.run_at(&at, &r.check, &amounts_for(&r.check, self.cfg.refine_steps)) {
             Ok(x) => x,
-            Err(u) => return fin(Outcome::Unknown(u.reason.as_str().to_string())),
+            Err(u) => {
+                // (Oct 30) Counted by reason (status unknownWhy); for a miss,
+                // also which contract it missed (unknownMissTop).
+                if let Some(m) = u.missing.first() {
+                    let at = match m {
+                        crate::state::MissItem::Account(a) | crate::state::MissItem::Slot(a, _) => format!("{a:#x}"),
+                        crate::state::MissItem::Code(_) => "code".to_string(),
+                    };
+                    HOUR.with(|h| h.unknown_miss_at.add(at));
+                }
+                return fin(Outcome::Unknown(unknown_key(&u).to_string()));
+            }
         };
         let Some(best) = res.best else { return fin(Outcome::NoProfit) };
         if best.profit > best.amount {
@@ -1240,6 +1274,10 @@ pub struct Hour {
     /// Routes skipped as unsure because of their LENDER key (the pools
     /// themselves were fine), apart from pools.
     pub skipped_unsure_lender: u64,
+    /// (Oct 30) "unknown" answers by reason (unknown_key), and for misses
+    /// the contract the first missing value belonged to.
+    pub unknown_why: super::coverage::Tally,
+    pub unknown_miss_at: super::coverage::Tally,
 }
 
 struct HourCell {
@@ -1260,6 +1298,7 @@ static HOUR: HourCell = HourCell { h: Mutex::new(Hour {
     skipped_unsure: 0, no_facts: 0, implausible: 0, cut_changed: 0, unfollowed: 0, bad_rows: 0, best_net_usd: None, best_label: String::new(), time_us: 0,
     max_block_us: 0, full_sweeps: 0, last_full_sweep_blocks: None, max_full_sweep_blocks: 0, eval_real: 0, eval_gone: 0, eval_unknown: 0,
     slow_routes: 0, resting: 0, cut_fit: 0, routes: 0, skipped_unsure_lender: 0,
+    unknown_why: super::coverage::Tally { map: BTreeMap::new(), other: 0 }, unknown_miss_at: super::coverage::Tally { map: BTreeMap::new(), other: 0 },
 }), ring: Mutex::new(VecDeque::new()) };
 
 fn record_block(rep: &ScanReport) {
@@ -1286,7 +1325,10 @@ fn record_block(rep: &ScanReport) {
                 Outcome::Found { dup: true, .. } => h.found_dup += 1,
                 Outcome::BelowMin { .. } => h.below_min += 1,
                 Outcome::NoProfit => h.no_profit += 1,
-                Outcome::Unknown(_) => h.unknown += 1,
+                Outcome::Unknown(why) => {
+                    h.unknown += 1;
+                    h.unknown_why.add(why.as_str());
+                }
                 Outcome::SkippedUnsure => h.skipped_unsure += 1,
                 Outcome::NoFacts => h.no_facts += 1,
                 Outcome::Implausible => h.implausible += 1,
@@ -1334,6 +1376,7 @@ pub fn status_json() -> Value {
         "evalReal": h.eval_real, "evalGone": h.eval_gone, "evalUnknown": h.eval_unknown,
         "slowRoutes": h.slow_routes, "resting": h.resting, "cutFit": h.cut_fit,
         "routes": h.routes, "skippedUnsureLender": h.skipped_unsure_lender,
+        "unknownWhy": h.unknown_why.json(16), "unknownMissTop": h.unknown_miss_at.json(5),
         "blockUs": crate::timing::pct(&mut ring),
         "syncUs": crate::timing::pct(&mut SYNC_RING.lock().unwrap_or_else(|e| e.into_inner()).iter().copied().collect::<Vec<u64>>()),
     })
@@ -1351,6 +1394,14 @@ pub fn take_hour() -> String {
         h.last_full_sweep_blocks.map(|v| v.to_string()).unwrap_or_else(|| "-".into()), h.max_full_sweep_blocks, h.full_sweeps,
         if h.eval_real + h.eval_gone + h.eval_unknown > 0 { format!("; practice re-checks: {} real, {} gone, {} unsure", h.eval_real, h.eval_gone, h.eval_unknown) } else { String::new() },
     );
+    // (Oct 30) Why the checks could not answer, biggest first.
+    let line = if h.unknown > 0 {
+        let why = h.unknown_why.top(6).into_iter().map(|(k, c)| format!("{k}:{c}")).collect::<Vec<_>>().join(" ");
+        let miss = h.unknown_miss_at.top(3).into_iter().map(|(k, c)| format!("{}:{c}", &k[..k.len().min(12)])).collect::<Vec<_>>().join(" ");
+        format!("{line}; unsure answers by reason: {why}{}", if miss.is_empty() { String::new() } else { format!(" (missed at {miss})") })
+    } else {
+        line
+    };
     let line = if h.slow_routes + h.resting + h.cut_fit > 0 { format!("{line}; slow routes {} (rested {}, not fitting the budget left {})", h.slow_routes, h.resting, h.cut_fit) } else { line };
     line
 }

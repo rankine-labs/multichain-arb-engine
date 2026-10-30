@@ -201,6 +201,25 @@ fn missing_state_is_unknown_never_a_guess() {
     let rep = scanner(t, cfg()).scan(&input(&s, &ctx(), 1, &ch, &HashSet::new()));
     assert_eq!(rep.checked[0].outcome, Outcome::Unknown("miss".into()));
     assert!(rep.opps.is_empty());
+    // (Oct 30) Counted by reason, with where it missed (status JSON; the
+    // counters are process-wide and tests run in parallel: at least).
+    let j = status_json();
+    assert!(j["unknownWhy"]["miss"].as_u64().unwrap_or(0) >= 1, "{j}");
+    assert!(j["unknownMissTop"].as_object().is_some_and(|o| !o.is_empty()), "{j}");
+}
+
+/// (Oct 30) Unknown answers are counted by a short reason word.
+#[test]
+fn unknown_answers_are_counted_by_reason() {
+    use arbsim::check::UnknownReason;
+    let u = |r: UnknownReason, d: &str| CheckUnknown::new(r, d);
+    assert_eq!(unknown_key(&u(UnknownReason::Miss, "x")), "miss");
+    assert_eq!(unknown_key(&u(UnknownReason::Engine, "x")), "engine_error");
+    assert_eq!(unknown_key(&u(UnknownReason::Copy2Unsure, "unsure_pool: V3 pool 0x.. is walking")), "unsure_pool");
+    assert_eq!(unknown_key(&u(UnknownReason::Copy2Unsure, "pending_reports: settling")), "pending_reports");
+    assert_eq!(unknown_key(&u(UnknownReason::Copy2Unsure, "pool_manager_balance: differ")), "pool_manager_balance");
+    assert_eq!(unknown_key(&u(UnknownReason::Copy2Unsure, "protocol_fee: differ")), "protocol_fee");
+    assert_eq!(unknown_key(&u(UnknownReason::Copy2Unsure, "something_new: x")), "other");
 }
 
 #[test]
