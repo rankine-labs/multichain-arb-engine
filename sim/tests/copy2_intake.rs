@@ -2914,7 +2914,8 @@ fn trig_entry_one_trip_equals_discover_then_call() {
     // The one-trip discovery equals a plain trig_discover...
     let d = arbsim::server::handle(&ctx, &json!({"id": 3, "type": "trig_discover", "at": {"after": "head"}, "feed": feed}));
     // (timing fields differ run to run: us / t, and the speed-3 phase list ph / pn / cpu)
-    let strip = |v: &Value| { let mut v = v.clone(); for k in ["us", "t", "id", "ph", "pn", "cpu"] { v.as_object_mut().unwrap().remove(k); } v };
+    // (and the entry-step timings, Oct 29: buildUs / wallUs)
+    let strip = |v: &Value| { let mut v = v.clone(); for k in ["us", "t", "id", "ph", "pn", "cpu", "buildUs", "wallUs"] { v.as_object_mut().unwrap().remove(k); } v };
     assert_eq!(strip(&a1["disc"]), strip(&d), "discovery part");
     // ... and each candidate's answer equals the bot's own call.
     let mut f = feed.clone();
