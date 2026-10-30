@@ -3781,6 +3781,129 @@ fn fastlane_fills_are_reread_by_their_own_verify_round() {
     assert!(c("unfollowed_changed") >= 1, "the change is counted");
 }
 
+// FAST VALUES' AGE LIMIT (Oct 30, review 2): the node stops answering (a
+// node outage: every re-read fails). A watched fast-lane value whose last
+// GOOD read is older than fast_max_age_ms is forgotten (checks answer
+// "unknown" again) even though no round succeeds; counted.
+#[test]
+fn fastlane_values_are_forgotten_when_not_reread_in_time() {
+    let cfg = C2Config { fast_verify_ms: 30, fast_verify_max: 10, fast_max_age_ms: 150, ..C2Config::for_tests() };
+    let (mut r, _ctx) = trig_world_code_cfg(fl_pool_code(), cfg);
+    assert!(r.h.fast_fill(vec![MissItem::Slot(a(OUTSIDE), u(5))]));
+    r.settle();
+    r.send(tick(r.sh.head().unwrap().block + 1, 70));
+    assert_eq!(r.head_slot(a(OUTSIDE), u(5)), Lookup::Known(u(42)), "fetched and watched");
+    // Outage: the node answers no block (every read fails).
+    *r.chain.tip.lock().unwrap() = 0;
+    let stats = r.h.c2.clone();
+    let mut gone = false;
+    for i in 0..40 {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        r.send(tick(r.sh.head().unwrap().block + 1, 71 + i));
+        if r.head_slot(a(OUTSIDE), u(5)) == Lookup::Missing {
+            gone = true;
+            break;
+        }
+    }
+    assert!(gone, "never forgotten: {:?}", stats.stats.json());
+    assert!(stats.stats.json()["fast_value_expired"].as_u64().unwrap() >= 1);
+    assert!(matches!(r.head_slot(a(V2P), u(8)), Lookup::Known(_)), "followed values are untouched");
+}
+
+// A FAST FILL THAT LANDS LATE (Oct 30, review 2): the node is slow, so a
+// fast-lane fill leaves the watch list before its answer comes. When it
+// lands it is put back on the list (re-watched) if there is room, and NOT
+// put in the copy if the list is full meanwhile (fail closed).
+#[test]
+fn fastlane_fills_that_land_after_leaving_the_watch_list() {
+    let cfg = C2Config { fast_verify_ms: 1, fast_verify_max: 1, fast_max_age_ms: 100, ..C2Config::for_tests() };
+    let (mut r, _ctx) = trig_world_code_cfg(fl_pool_code(), cfg);
+    let a5 = MissItem::Slot(a(OUTSIDE), u(5));
+    let b6 = MissItem::Slot(a(OUTSIDE), u(6));
+    *r.chain.delay_ms.lock().unwrap() = 300;
+    assert!(r.h.fast_fill(vec![a5]));
+    let t0 = std::time::Instant::now();
+    let mut asked_b = false;
+    while t0.elapsed() < std::time::Duration::from_secs(3) {
+        r.intake.pump();
+        // A's fill is out (slow node, 300 ms) and A left the list (after
+        // 200 ms): B takes the only place on it (until B leaves at ~430 ms).
+        if !asked_b && t0.elapsed() > std::time::Duration::from_millis(230) {
+            assert!(r.h.fast_fill(vec![b6.clone()]));
+            asked_b = true;
+        }
+        if asked_b && r.intake.outstanding() == 0 && t0.elapsed() > std::time::Duration::from_millis(800) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    *r.chain.delay_ms.lock().unwrap() = 0;
+    r.send(tick(r.sh.head().unwrap().block + 1, 70));
+    let st = r.h.c2.stats.json();
+    assert_eq!(r.head_slot(a(OUTSIDE), u(5)), Lookup::Missing, "A landed while the list was full: not put in ({st:?})");
+    assert!(st["fast_fill_not_watched"].as_u64().unwrap() >= 1, "{st:?}");
+    // B landed after leaving the list too: put back on it. (Its read time
+    // is when its fill was sent, 300 ms before it landed: past this test's
+    // 100 ms age limit, so it may already be forgotten again - also right.)
+    assert!(st["fast_fill_rewatched"].as_u64().unwrap() >= 1, "{st:?}");
+    assert!(r.head_slot(a(OUTSIDE), u(6)) == Lookup::Known(U256::ZERO) || st["fast_value_expired"].as_u64().unwrap() >= 1, "{st:?}");
+}
+
+// ASKED AGAIN IS NOT READ AGAIN (Oct 30, review 2): the fast lane asking
+// for a watched value again (its new fill can't be read: node outage) must
+// not count as a fresh read; the value is forgotten on its ORIGINAL age.
+#[test]
+fn fastlane_asking_again_keeps_the_last_good_read_time() {
+    let cfg = C2Config { fast_verify_ms: 60_000, fast_verify_max: 10, fast_max_age_ms: 150, ..C2Config::for_tests() };
+    let (mut r, _ctx) = trig_world_code_cfg(fl_pool_code(), cfg);
+    assert!(r.h.fast_fill(vec![MissItem::Slot(a(OUTSIDE), u(5))]));
+    r.settle();
+    r.send(tick(r.sh.head().unwrap().block + 1, 70));
+    let landed = std::time::Instant::now();
+    assert_eq!(r.head_slot(a(OUTSIDE), u(5)), Lookup::Known(u(42)));
+    *r.chain.tip.lock().unwrap() = 0; // outage: the new fill can't be read
+    std::thread::sleep(std::time::Duration::from_millis(90));
+    assert!(r.h.fast_fill(vec![MissItem::Slot(a(OUTSIDE), u(5))]), "asked again");
+    while landed.elapsed() < std::time::Duration::from_millis(230) {
+        r.intake.pump();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    // A reset at the second ask would keep it until ~240 ms.
+    assert_eq!(r.head_slot(a(OUTSIDE), u(5)), Lookup::Missing, "forgotten on its first read's age");
+}
+
+// FAST VALUES AND A WARM RESTART (Oct 30, review 2): the fast lane's
+// values are listed next to the saved copy and forgotten when it is read
+// back (never used from a save without their re-read round).
+#[test]
+fn fastlane_values_are_not_carried_over_a_warm_restart() {
+    let dir = std::env::temp_dir().join(format!("arbsim-fastvalues-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("copy2.bin").to_string_lossy().to_string();
+    let cfg = C2Config { fast_verify_ms: 60_000, state_file: Some(path.clone()), ..C2Config::for_tests() };
+    let (mut r, _ctx) = trig_world_code_cfg(fl_pool_code(), cfg.clone());
+    assert!(r.h.fast_fill(vec![MissItem::Slot(a(OUTSIDE), u(5))]));
+    // A bot-check fill of another outside value: carried over as before.
+    r.h.fill(vec![MissItem::Slot(a(COIN0), u(5))]);
+    r.settle();
+    r.send(tick(r.sh.head().unwrap().block + 1, 70));
+    assert_eq!(r.head_slot(a(OUTSIDE), u(5)), Lookup::Known(u(42)));
+    r.intake.save_now().expect("saved");
+    let side = std::fs::read_to_string(format!("{path}.fastvalues")).unwrap();
+    assert!(side.contains(&format!("{:#x} 0x5", a(OUTSIDE))), "{side}");
+    // Start again from the file.
+    let node: Arc<dyn NodeApi> = r.chain.clone();
+    let sh = Shared::new(Config::for_tests(), Some(node), Arc::new(Volatile::default()));
+    let (i2, h2) = manual(sh.clone(), Arc::new(FillQueue::new(1000, 100)), cfg);
+    let head = sh.head().expect("restored");
+    assert_eq!(head.snap.storage(a(OUTSIDE), u(5)), Lookup::Missing, "the fast lane's value is not carried over");
+    assert!(matches!(head.snap.storage(a(COIN0), u(5)), Lookup::Known(_)), "other values are");
+    assert_eq!(h2.c2.stats.json()["fast_values_dropped_on_restart"], json!(1));
+    drop(i2);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // FAST VERIFY WATCH LIST FULL (Oct 30, review): a fast-lane fill that does
 // not fit the watch list is NOT fetched (fail closed: the check stays
 // "unknown"), and counted.
