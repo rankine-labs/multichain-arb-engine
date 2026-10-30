@@ -28,6 +28,20 @@
 //   ahead.rs): the facts are taken for the view's block (pools ready since
 //   then), and pending reports of earlier blocks still block an answer.
 //
+//   ONE CHECK CORE PER BLOCK (Oct 30): every check needs copy 2's "check
+//   core" (copy2/checkcore.rs: pending / not-ready pools and the facts).
+//   Each route's check used to ask for it (core_for), which REBUILDS it
+//   whenever copy 2's pool registry changed since the last build: live
+//   ~20 rebuilds a second at ~11 ms each (lane.steps.coreBuild), paid
+//   inside route checks, so most routes "didn't fit" the scan budget. Now
+//   the scanner says when a block's scan starts and ends (begin_block /
+//   end_block): the first check of the block gets a current core, and the
+//   block's other checks on the SAME state reuse it. Same rule as before:
+//   a core read after the block's version was picked (here: at the first
+//   check, so the block's checks all count as made at that moment, which
+//   is what the sidecar accepts for any check: checkcore.rs header). Outside
+//   a scan (practice re-checks) each check still asks for its own.
+//
 //   Counted on their own (final review, low): copy 2's PoolManager-bound and
 //   protocol-fee counters (pm_bound_*, pm_high_*, protocol_fee_*) are about
 //   the BOT's checks. Runs made from here are counted in this file instead
@@ -91,11 +105,49 @@ impl Drop for FastlaneRun {
 /// The scanner's runner on copy 2 (see the file header).
 pub struct Copy2Runner {
     pub c2: Copy2Handle,
+    /// (Oct 30) Inside one block's scan: Some(the core shared by that
+    /// block's checks, once the first check got it, with the snapshot and
+    /// block it is for). None = not inside a scan (each check gets its own).
+    block_core: Mutex<Option<Option<BlockCore>>>,
+    /// Times a check asked copy 2 for a core (tests / counting).
+    core_asks: std::sync::atomic::AtomicU64,
+}
+
+/// One block's shared check core (Copy2Runner::block_core).
+/// (Held only until the block's scan ends.)
+struct BlockCore {
+    snap: Arc<crate::state::snap::Snapshot>,
+    block: u64,
+    core: Arc<crate::copy2::checkcore::CheckCore>,
 }
 
 impl Copy2Runner {
     pub fn new(c2: Copy2Handle) -> Copy2Runner {
-        Copy2Runner { c2 }
+        Copy2Runner { c2, block_core: Mutex::new(None), core_asks: std::sync::atomic::AtomicU64::new(0) }
+    }
+
+    /// How many times this runner asked copy 2 for a check core.
+    pub fn core_asks(&self) -> u64 {
+        self.core_asks.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The check core for a check on `snap` (block `block`): inside a
+    /// block's scan the one its first check got (same snapshot and block),
+    /// else a current one (file header: ONE CHECK CORE PER BLOCK).
+    fn core_for_check(&self, snap: &Arc<crate::state::snap::Snapshot>, block: u64) -> Arc<crate::copy2::checkcore::CheckCore> {
+        let mut g = self.block_core.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(Some(bc)) = g.as_ref() {
+            if Arc::ptr_eq(&bc.snap, snap) && bc.block == block {
+                return bc.core.clone();
+            }
+        }
+        self.core_asks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let pv = self.c2.sh.published.view();
+        let core = self.c2.core_for(Some(&pv));
+        if let Some(slot) = g.as_mut() {
+            *slot = Some(BlockCore { snap: snap.clone(), block, core: core.clone() });
+        }
+        core
     }
 }
 
@@ -175,7 +227,16 @@ impl CheckRunner for Copy2Runner {
 
     fn run_at(&self, at: &RunAt, c: &PreparedCheck, amounts: &SizeSearchAmounts) -> Result<SizeSearchResult, CheckUnknown> {
         let Some(snap) = at.snap else { return self.run(at.view, at.ctx, c, amounts) };
-        run_on_copy2(&self.c2, snap, at.block, at.ctx, c, amounts)
+        let core = self.core_for_check(snap, at.block);
+        run_on_copy2_with(&self.c2, &core, snap, at.block, at.ctx, c, amounts)
+    }
+
+    fn begin_block(&self) {
+        *self.block_core.lock().unwrap_or_else(|e| e.into_inner()) = Some(None);
+    }
+
+    fn end_block(&self) {
+        *self.block_core.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 }
 
@@ -183,7 +244,16 @@ impl CheckRunner for Copy2Runner {
 pub fn run_on_copy2(c2: &Copy2Handle, snap: &Arc<crate::state::snap::Snapshot>, block: u64, ctx: &BlockCtx, c: &PreparedCheck, amounts: &SizeSearchAmounts) -> Result<SizeSearchResult, CheckUnknown> {
     let pv = c2.sh.published.view();
     let core = c2.core_for(Some(&pv));
-    let facts = c2.check_facts_with(&core, block);
+    run_on_copy2_with(c2, &core, snap, block, ctx, c, amounts)
+}
+
+/// `run_on_copy2` with a check core the caller already has (one per block
+/// in a scan: file header). The core must have been read AFTER the version
+/// `snap` belongs to was published (core_for at or after that moment).
+pub fn run_on_copy2_with(
+    c2: &Copy2Handle, core: &crate::copy2::checkcore::CheckCore, snap: &Arc<crate::state::snap::Snapshot>, block: u64, ctx: &BlockCtx, c: &PreparedCheck, amounts: &SizeSearchAmounts,
+) -> Result<SizeSearchResult, CheckUnknown> {
+    let facts = c2.check_facts_with(core, block);
     let view = View::new(snap.clone());
     let template = c.template();
     // server.rs caller_as_empty: an unknown caller without an override of
@@ -213,12 +283,12 @@ pub fn run_on_copy2(c2: &Copy2Handle, snap: &Arc<crate::state::snap::Snapshot>, 
         // A pool on the route may still be missing reports of this block
         // (same rule as server.rs after_pick_with): never answer from it.
         let touched = view.take_touched();
-        if let Some(why) = c2.pending_reason_with(&core, &touched, block, view.touched_overflow()) {
+        if let Some(why) = c2.pending_reason_with(core, &touched, block, view.touched_overflow()) {
             answer = json!({ "ok": false, "unknown": "pending_reports", "detail": why });
         }
     } else {
         let missing = crate::proto::parse_missing(&answer);
-        if let Some(why) = c2.unsure_reason_with(&core, &missing) {
+        if let Some(why) = c2.unsure_reason_with(core, &missing) {
             answer = json!({ "ok": false, "unknown": "unsure_pool", "detail": why });
         }
     }

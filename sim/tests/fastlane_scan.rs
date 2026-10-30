@@ -201,6 +201,25 @@ fn missing_state_is_unknown_never_a_guess() {
     let rep = scanner(t, cfg()).scan(&input(&s, &ctx(), 1, &ch, &HashSet::new()));
     assert_eq!(rep.checked[0].outcome, Outcome::Unknown("miss".into()));
     assert!(rep.opps.is_empty());
+    // (Oct 30) Counted by reason, with where it missed (status JSON; the
+    // counters are process-wide and tests run in parallel: at least).
+    let j = status_json();
+    assert!(j["unknownWhy"]["miss"].as_u64().unwrap_or(0) >= 1, "{j}");
+    assert!(j["unknownMissTop"].as_object().is_some_and(|o| !o.is_empty()), "{j}");
+}
+
+/// (Oct 30) Unknown answers are counted by a short reason word.
+#[test]
+fn unknown_answers_are_counted_by_reason() {
+    use arbsim::check::UnknownReason;
+    let u = |r: UnknownReason, d: &str| CheckUnknown::new(r, d);
+    assert_eq!(unknown_key(&u(UnknownReason::Miss, "x")), "miss");
+    assert_eq!(unknown_key(&u(UnknownReason::Engine, "x")), "engine_error");
+    assert_eq!(unknown_key(&u(UnknownReason::Copy2Unsure, "unsure_pool: V3 pool 0x.. is walking")), "unsure_pool");
+    assert_eq!(unknown_key(&u(UnknownReason::Copy2Unsure, "pending_reports: settling")), "pending_reports");
+    assert_eq!(unknown_key(&u(UnknownReason::Copy2Unsure, "pool_manager_balance: differ")), "pool_manager_balance");
+    assert_eq!(unknown_key(&u(UnknownReason::Copy2Unsure, "protocol_fee: differ")), "protocol_fee");
+    assert_eq!(unknown_key(&u(UnknownReason::Copy2Unsure, "something_new: x")), "other");
 }
 
 #[test]
@@ -450,6 +469,9 @@ fn settings_and_switch() {
     assert_eq!(env(&[("FASTLANE_SCAN_BUDGET_MS", "7.5")]).budget_us, 7_500);
     assert_eq!(env(&[("FASTLANE_SCAN_BUDGET_MS", "junk")]).budget_us, 5_000);
     assert_eq!(env(&[("FASTLANE_SWEEP_PER_BLOCK", "3")]).sweep_per_block, 3);
+    assert_eq!(ScanConfig::default().route_time_ttl_blocks, 100);
+    assert_eq!(env(&[("FASTLANE_ROUTE_TIME_TTL_BLOCKS", "30")]).route_time_ttl_blocks, 30);
+    assert_eq!(env(&[("FASTLANE_ROUTE_TIME_TTL_BLOCKS", "0")]).route_time_ttl_blocks, 100);
     for (v, on) in [(None, false), (Some(""), false), (Some("off"), false), (Some("bogus"), false), (Some("practice"), true), (Some(" LIVE "), true), (Some("shadow"), true)] {
         assert_eq!(fastlane_on(v), on, "{v:?}");
     }
@@ -621,4 +643,182 @@ fn delta_sync_matches_full_sync() {
     live.sync();
     assert_eq!(live.full_syncs, 2);
     assert_eq!(live.all().iter().map(|r| r.rid.clone()).collect::<Vec<_>>(), vec!["r0"]);
+}
+
+// ---------------------------------------------------------------------------
+// Unban fixes (Oct 30). Live: a route whose last check took longer than the
+// budget was never tried again (its time only changed by running it), and
+// the rolling sweep stopped at such a route every block (0 sweep checks and
+// 0 full passes an hour).
+// ---------------------------------------------------------------------------
+
+/// Takes `first_us` on a route's FIRST run (by its first pool), then 0;
+/// remembers which routes ran, in order.
+struct OnceSlowRunner {
+    first_us: HashMap<U256, u64>,
+    ran: Arc<Mutex<Vec<U256>>>,
+}
+impl CheckRunner for OnceSlowRunner {
+    fn run(&self, _v: &dyn StateRead, _c: &BlockCtx, p: &PreparedCheck, _a: &SizeSearchAmounts) -> Result<SizeSearchResult, CheckUnknown> {
+        let pool = U256::from_be_slice(&p.call.data[4 + 32 * 9 + 12..4 + 32 * 10]);
+        let first = !self.ran.lock().unwrap().contains(&pool);
+        let us = if first { self.first_us.get(&pool).copied().unwrap_or(0) } else { 0 };
+        let t = std::time::Instant::now();
+        while (t.elapsed().as_micros() as u64) < us {
+            std::hint::spin_loop();
+        }
+        self.ran.lock().unwrap().push(pool);
+        Ok(SizeSearchResult { best: None, tried: vec![] })
+    }
+}
+
+/// A route whose recorded time is over the whole budget is tried again:
+/// as the first check of a block, and anywhere once its time has expired
+/// (FASTLANE_ROUTE_TIME_TTL_BLOCKS).
+#[test]
+fn a_route_over_the_budget_is_not_banned_for_good() {
+    let p0 = U256::from(0x100u64);
+    let count = |ran: &Arc<Mutex<Vec<U256>>>| ran.lock().unwrap().iter().filter(|p| **p == p0).count();
+    let none = HashSet::new();
+    let s = hill_state(1);
+    // (1) Alone: 12 ms once (budget 10 ms), then it runs as the block's first check.
+    let ran = Arc::new(Mutex::new(Vec::new()));
+    let r = OnceSlowRunner { first_us: HashMap::from([(p0, 12_000)]), ran: ran.clone() };
+    let c = ScanConfig { budget_us: 10_000, sweep_per_block: 50, route_max_us: 1_000_000, ..cfg() };
+    let mut sc = Scanner::new(c.clone(), Box::new(TableSource::owned(many(1))), Box::new(r));
+    sc.scan(&input(&s, &ctx(), 1, &[], &none));
+    let rep = sc.scan(&input(&s, &ctx(), 2, &[], &none));
+    assert_eq!(count(&ran), 2, "first check of the block: tried again");
+    assert_eq!(rep.cut_fit, 0);
+    // (2) With another route checked first every block: passed over (counted)
+    // until its time expires (TTL 4 blocks), then checked again.
+    let ran = Arc::new(Mutex::new(Vec::new()));
+    let r = OnceSlowRunner { first_us: HashMap::from([(p0, 12_000)]), ran: ran.clone() };
+    let mut sc = Scanner::new(ScanConfig { route_time_ttl_blocks: 4, ..c }, Box::new(TableSource::owned(many(3))), Box::new(r));
+    sc.scan(&input(&s, &ctx(), 1, &[], &none));
+    assert_eq!(count(&ran), 1, "block 1: r000 ran (12 ms)");
+    let ch = vec![key(0x101)];
+    let mut again = None;
+    let mut cut = 0;
+    for epoch in 2..=8u64 {
+        let rep = sc.scan(&input(&s, &ctx(), epoch, &ch, &none));
+        cut += rep.cut_fit;
+        if again.is_none() && count(&ran) == 2 {
+            again = Some(epoch);
+        }
+    }
+    assert!(cut >= 1, "passed over while its 12 ms time is remembered");
+    assert_eq!(again, Some(5), "measured at epoch 1, TTL 4: checked again at epoch 5");
+    // Re-measured fast: it fits again (no more "not fitting" for it).
+    let rep = sc.scan(&input(&s, &ctx(), 9, &ch, &none));
+    assert_eq!(rep.cut_fit, 0);
+}
+
+/// The rolling sweep passes over a route it can't fit instead of stopping
+/// there for good: full passes keep completing.
+#[test]
+fn the_sweep_passes_over_a_route_that_does_not_fit() {
+    let p2 = U256::from(0x102u64);
+    let ran = Arc::new(Mutex::new(Vec::new()));
+    let r = OnceSlowRunner { first_us: HashMap::from([(p2, 12_000)]), ran: ran.clone() };
+    // No expiry in this test (TTL 1000 blocks): only the pass-over helps.
+    let c = ScanConfig { budget_us: 10_000, sweep_per_block: 50, route_max_us: 1_000_000, route_time_ttl_blocks: 1_000, ..cfg() };
+    let mut sc = Scanner::new(c, Box::new(TableSource::owned(many(6))), Box::new(r));
+    let s = hill_state(1);
+    let none = HashSet::new();
+    // Block 1: r000, r001, then r002 takes 12 ms (budget gone).
+    sc.scan(&input(&s, &ctx(), 1, &[], &none));
+    // Then a changed-pool route (r005) runs first every block, so r002
+    // (12 ms remembered) never fits.
+    let ch = vec![key(0x105)];
+    let mut passes = Vec::new();
+    let mut cut = 0;
+    for b in 2..=8u64 {
+        let rep = sc.scan(&input(&s, &ctx(), b, &ch, &none));
+        assert!(rep.checked.iter().any(|c| c.source == "sweep"), "block {b}: the sweep keeps moving");
+        cut += rep.cut_fit;
+        if let Some(n) = rep.full_sweep_blocks {
+            passes.push(n);
+        }
+    }
+    assert!(passes.len() >= 5, "a full pass (nearly) every block: {passes:?}");
+    assert!(passes.iter().all(|n| *n <= 2), "{passes:?}");
+    assert!(cut >= 5, "r002 counted as not fitting each time it is passed over: {cut}");
+    assert_eq!(ran.lock().unwrap().iter().filter(|p| **p == p2).count(), 1, "r002 not run again (no expiry here)");
+    for i in [0u64, 1, 3, 4] {
+        let n = ran.lock().unwrap().iter().filter(|p| **p == U256::from(0x100 + i)).count();
+        assert!(n >= 5, "r00{i} checked {n} times");
+    }
+}
+
+/// Takes a fixed time per route (by its first pool), every run.
+struct FixedRunner {
+    us: HashMap<U256, u64>,
+    ran: Arc<Mutex<Vec<U256>>>,
+}
+impl CheckRunner for FixedRunner {
+    fn run(&self, _v: &dyn StateRead, _c: &BlockCtx, p: &PreparedCheck, _a: &SizeSearchAmounts) -> Result<SizeSearchResult, CheckUnknown> {
+        let pool = U256::from_be_slice(&p.call.data[4 + 32 * 9 + 12..4 + 32 * 10]);
+        let us = self.us.get(&pool).copied().unwrap_or(0);
+        let t = std::time::Instant::now();
+        while (t.elapsed().as_micros() as u64) < us {
+            std::hint::spin_loop();
+        }
+        self.ran.lock().unwrap().push(pool);
+        Ok(SizeSearchResult { best: None, tried: vec![] })
+    }
+}
+
+/// (Review, Oct 30) The changed-pool step used ~90% of the budget: FAST
+/// timed sweep routes (1.5 ms, inside the sweep's own 2.5 ms share) must
+/// NOT be passed over (marked visited without a check); the sweep waits for
+/// the next block and carries on from them.
+#[test]
+fn a_busy_changed_step_does_not_make_the_sweep_skip_fast_routes() {
+    let ran = Arc::new(Mutex::new(Vec::new()));
+    let mut us: HashMap<U256, u64> = (0..5u64).map(|i| (U256::from(0x100 + i), 1_500)).collect();
+    us.insert(U256::from(0x105u64), 8_800);
+    let r = FixedRunner { us, ran: ran.clone() };
+    let c = ScanConfig { budget_us: 10_000, sweep_per_block: 50, route_max_us: 1_000_000, route_time_ttl_blocks: 1_000, ..cfg() };
+    let mut sc = Scanner::new(c, Box::new(TableSource::owned(many(6))), Box::new(r));
+    let s = hill_state(1);
+    let none = HashSet::new();
+    // Block 1: every route timed (r000..r004 1.5 ms each, r005 8.8 ms).
+    sc.scan(&input(&s, &ctx(), 1, &[], &none));
+    assert_eq!(ran.lock().unwrap().len(), 6);
+    // Block 2: r005's pool changed: 8.8 ms of the 10 ms used before the sweep.
+    let ch = vec![key(0x105)];
+    let rep = sc.scan(&input(&s, &ctx(), 2, &ch, &none));
+    assert_eq!(rep.checked.len(), 1, "only r005 ran: {:?}", rep.checked);
+    assert_eq!(rep.cut_fit, 1, "the sweep stopped at the first fast route (no skipping run)");
+    assert_eq!(rep.full_sweep_blocks, None, "no pass counted over routes never checked");
+    // Block 3 (quiet): the sweep carries on from where it stopped and checks them.
+    ran.lock().unwrap().clear();
+    let rep = sc.scan(&input(&s, &ctx(), 3, &[], &none));
+    let order = ran.lock().unwrap().clone();
+    assert_eq!(order.first(), Some(&U256::from(0x100u64)), "{order:?}");
+    assert!(rep.checked.iter().filter(|c| c.source == "sweep").count() >= 5, "{:?}", rep.checked);
+}
+
+/// (Review, Oct 30) A quick answer (route on an unsure pool) is not "the
+/// block's first check": a route timed over the budget may still start.
+#[test]
+fn a_quick_unsure_answer_does_not_end_the_first_check_exception() {
+    let p0 = U256::from(0x100u64);
+    let ran = Arc::new(Mutex::new(Vec::new()));
+    let r = OnceSlowRunner { first_us: HashMap::from([(p0, 12_000)]), ran: ran.clone() };
+    let c = ScanConfig { budget_us: 10_000, sweep_per_block: 50, route_max_us: 1_000_000, ..cfg() };
+    // r000 (pool 0x100) and r001 (pool 0x101).
+    let mut sc = Scanner::new(c, Box::new(TableSource::owned(many(2))), Box::new(r));
+    let s = hill_state(1);
+    let none = HashSet::new();
+    sc.scan(&input(&s, &ctx(), 1, &[], &none));
+    // Block 2: r001's pool is unsure and changed: answered "skipped" at once
+    // (no engine run); r000 (12 ms remembered) still counts as first.
+    let unsure: HashSet<String> = [key(0x101)].into_iter().collect();
+    let ch = vec![key(0x101)];
+    let rep = sc.scan(&input(&s, &ctx(), 2, &ch, &unsure));
+    assert_eq!(rep.checked[0].outcome, Outcome::SkippedUnsure);
+    assert_eq!(rep.cut_fit, 0, "{:?}", rep.checked);
+    assert_eq!(ran.lock().unwrap().iter().filter(|p| **p == p0).count(), 2, "r000 ran again");
 }

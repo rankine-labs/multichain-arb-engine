@@ -3614,6 +3614,58 @@ fn fastlane_lane_scans_copy_2s_confirmed_versions_when_the_predicted_copy_is_off
     assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0, "practice never connects to the send endpoint");
 }
 
+// ONE CHECK CORE PER BLOCK (Oct 30, fastlane/c2runner.rs): inside one
+// block's scan the copy-2 runner asks copy 2 for its check core ONCE and
+// every check of that block on the same state reuses it (live: ~20 core
+// rebuilds a second, ~11 ms each, paid inside route checks). Same answers
+// as a check that gets its own core; outside a scan each check asks again.
+#[test]
+fn fastlane_copy2_runner_shares_one_check_core_per_block() {
+    use arbsim::fastlane::c2runner::{run_on_copy2, Copy2Runner};
+    use arbsim::fastlane::scan::{amounts_for, CheckRunner, PreparedCheck, RunAt};
+    let (r, _ctx) = trig_world_code(fl_pool_code());
+    let head = r.sh.head().unwrap();
+    let bctx = head.ctx.clone().unwrap();
+    let pc = PreparedCheck::from_row(&fl_table_row()["c"], &[]).unwrap();
+    let amounts = amounts_for(&pc, 0);
+    let view = arbsim::state::snap::View::new(head.snap.clone());
+    let at = RunAt { view: &view, ctx: &bctx, block: head.block, snap: Some(&head.snap) };
+    let runner = Copy2Runner::new(r.h.clone());
+    let own = run_on_copy2(&r.h, &head.snap, head.block, &bctx, &pc, &amounts);
+    runner.begin_block();
+    let a = runner.run_at(&at, &pc, &amounts);
+    let b = runner.run_at(&at, &pc, &amounts);
+    runner.end_block();
+    assert_eq!(runner.core_asks(), 1, "one core for the block's checks");
+    assert_eq!(a, own, "same answer as a check with its own core");
+    assert_eq!(b, own);
+    // Outside a scan: each check asks for its own (as before).
+    let c = runner.run_at(&at, &pc, &amounts);
+    assert_eq!(runner.core_asks(), 2);
+    assert_eq!(c, own);
+    // (Review) Inside one scan, a check on ANOTHER snapshot, or on the same
+    // snapshot for another block, gets a new core (never the shared one).
+    let snap2 = Arc::new((*head.snap).clone());
+    let view2 = arbsim::state::snap::View::new(snap2.clone());
+    let at2 = RunAt { view: &view2, ctx: &bctx, block: head.block, snap: Some(&snap2) };
+    let at3 = RunAt { view: &view, ctx: &bctx, block: head.block + 1, snap: Some(&head.snap) };
+    runner.begin_block();
+    let _ = runner.run_at(&at, &pc, &amounts);
+    assert_eq!(runner.core_asks(), 3);
+    let _ = runner.run_at(&at2, &pc, &amounts);
+    assert_eq!(runner.core_asks(), 4, "another snapshot: a new core");
+    let _ = runner.run_at(&at3, &pc, &amounts);
+    assert_eq!(runner.core_asks(), 5, "another block: a new core");
+    // A scan that never said end_block: the next begin_block starts afresh
+    // (no core carried over from the earlier block).
+    runner.begin_block();
+    let _ = runner.run_at(&at, &pc, &amounts);
+    assert_eq!(runner.core_asks(), 6, "begin_block forgets the last block's core");
+    let _ = runner.run_at(&at, &pc, &amounts);
+    assert_eq!(runner.core_asks(), 6, "then shared again within the block");
+    runner.end_block();
+}
+
 // FIRE-FIRST OFFLINE REPLAY (`arbsim trig-replay`, fastlane/trig_replay.rs):
 // a recording in arrival order (copy-2 version 101, then feed message 102
 // with the "swap", then copy 2's version 102 once its reports came) played

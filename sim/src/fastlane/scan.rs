@@ -60,6 +60,20 @@
 //        (One EVM run can't be stopped half way; this caps the overrun.)
 //     L5 the default minimum follows the bot: MIN_EXEC_NET_USD, else $0.25.
 //
+//   Unban fixes (Oct 30, live: sweepChecked 0, fullSweeps 0, cutFit 822k/h):
+//     - a route's remembered check time is forgotten after
+//       FASTLANE_ROUTE_TIME_TTL_BLOCKS blocks, and a route that is not
+//       resting may always run as the FIRST check of a block; before, a
+//       route whose last time was over the budget was never tried again
+//       (its time was only updated by running it).
+//     - the rolling sweep passes OVER a route it can't start (resting, or
+//       slower than the sweep's own share) instead of stopping there for
+//       good; a route that fits that share but not what is LEFT this block
+//       makes the sweep wait for the next block (once in a row per route).
+//       Passed-over routes are counted (resting / cutFit) and count as
+//       visited for the full pass.
+//     - "unknown" answers are counted by reason (unknownWhy).
+//
 //   Output: Opportunity list, best first, plus microseconds per phase and
 //   per route, and hourly counters (status "fastlaneScan").
 //   Off unless FASTLANE=practice|live (same words as fastlane/mode.rs).
@@ -125,6 +139,15 @@ pub struct ScanConfig {
     /// FASTLANE_ROUTE_MAX_US [5000] (review M6): a route whose check took
     /// longer rests for 50 blocks (counted "slow").
     pub route_max_us: u64,
+    /// FASTLANE_ROUTE_TIME_TTL_BLOCKS [100] (Oct 30): a route's remembered
+    /// check time is forgotten this many blocks after it was measured, so
+    /// one slow run can't keep the route out for good (live Oct 30: routes
+    /// whose last time was over the budget were never tried again).
+    /// "Blocks" here means SCAN CALLS (one per new confirmed copy-2 version
+    /// or predicted tip), not chain blocks: if copy 2 skips blocks, or a
+    /// version is too old to scan, the time lasts longer in chain blocks.
+    /// (The 50-block rest and FASTLANE_DEDUPE_BLOCKS count the same way.)
+    pub route_time_ttl_blocks: u64,
 }
 
 /// The bot's default send minimum (types.ts readMinExecNetUsd).
@@ -143,6 +166,7 @@ impl Default for ScanConfig {
             max_plausible_share: 0.25,
             dedupe_blocks: 20,
             route_max_us: 5_000,
+            route_time_ttl_blocks: 100,
         }
     }
 }
@@ -165,6 +189,7 @@ impl ScanConfig {
             max_plausible_share: num("MAX_PLAUSIBLE_PROFIT_SHARE").filter(|v| *v > 0.0).unwrap_or(d.max_plausible_share),
             dedupe_blocks: num("FASTLANE_DEDUPE_BLOCKS").filter(|v| *v >= 1.0 && *v <= 100_000.0).map(|v| v as u64).unwrap_or(d.dedupe_blocks),
             route_max_us: num("FASTLANE_ROUTE_MAX_US").filter(|v| *v >= 100.0 && *v <= 1_000_000.0).map(|v| v as u64).unwrap_or(d.route_max_us),
+            route_time_ttl_blocks: num("FASTLANE_ROUTE_TIME_TTL_BLOCKS").filter(|v| *v >= 1.0 && *v <= 1_000_000.0).map(|v| v as u64).unwrap_or(d.route_time_ttl_blocks),
         }
     }
     pub fn from_env() -> ScanConfig {
@@ -655,6 +680,11 @@ pub trait CheckRunner: Send + Sync {
     fn run_at(&self, at: &RunAt, c: &PreparedCheck, amounts: &SizeSearchAmounts) -> Result<SizeSearchResult, CheckUnknown> {
         self.run(at.view, at.ctx, c, amounts)
     }
+    /// (Oct 30) One block's scan starts / ends: a runner may share work
+    /// between that block's checks (copy 2's runner: one check core per
+    /// block instead of one per route). Default: nothing.
+    fn begin_block(&self) {}
+    fn end_block(&self) {}
 }
 
 /// Where one check runs: the strict view, its block details, its L2 block
@@ -664,6 +694,29 @@ pub struct RunAt<'a> {
     pub ctx: &'a BlockCtx,
     pub block: u64,
     pub snap: Option<&'a Arc<crate::state::snap::Snapshot>>,
+}
+
+/// (Oct 30) A short word for why a check could not answer (scanner
+/// "unknown" counted by it, status fastlane.scan.hour.unknownWhy):
+///   miss                 our copy lacks a value the check read
+///   unsure_pool          that value belongs to a pool copy 2 has not ready
+///   pending_reports      a pool on it may still be missing reports of the block
+///   pool_manager_balance the answer depends on a V4 PoolManager balance
+///   protocol_fee         ... on a V4 protocol-fee counter copy 2 never holds
+///   engine_error         something went wrong inside the engine
+///   other                anything else (copy 2's other words)
+/// Other engine reasons keep their own word (e.g. unsupported_precompile).
+pub fn unknown_key(u: &CheckUnknown) -> &'static str {
+    use crate::check::UnknownReason as R;
+    match u.reason {
+        // c2runner.rs result_from_json keeps copy 2's word first in the
+        // detail ("<word>: <detail>").
+        R::Copy2Unsure => {
+            let word = u.detail.split(':').next().unwrap_or("").trim();
+            ["unsure_pool", "pending_reports", "pool_manager_balance", "protocol_fee"].into_iter().find(|w| *w == word).unwrap_or("other")
+        }
+        r => r.as_str(),
+    }
 }
 
 /// The plain size search (check/search.rs), eth_call rules, strict view.
@@ -760,6 +813,28 @@ pub struct ScanReport {
     pub cut_fit: usize,
 }
 
+/// M6: one route's last check time (all epochs are scan call numbers).
+#[derive(Clone, Copy, Debug)]
+struct RouteTime {
+    /// How long its last check took (us).
+    us: u64,
+    /// It rests (is not started) while the epoch is below this (slow route).
+    rest_until: u64,
+    /// (Oct 30) The epoch it was measured in: after
+    /// FASTLANE_ROUTE_TIME_TTL_BLOCKS more the time is forgotten.
+    at: u64,
+}
+
+/// M6: may a route start now, and if not, why.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Start {
+    Go,
+    /// Slow last time: resting (counted "resting").
+    Resting,
+    /// Its last time (us, carried) doesn't fit before the limit (counted "cutFit").
+    NoFit(u64),
+}
+
 /// The standing-gap scanner (one per state stream: confirmed / predicted).
 pub struct Scanner {
     pub cfg: ScanConfig,
@@ -775,18 +850,26 @@ pub struct Scanner {
     /// The pass under way started at the beginning with an unchanged route
     /// list (only such a pass is counted as "full sweep in N blocks").
     pass_valid: bool,
-    /// M6: per route, its last check time (us) and the epoch it rests until.
-    route_us: HashMap<String, (u64, u64)>,
+    /// M6: per route, its last check time, when it rests until, and (Oct 30)
+    /// when it was measured (so the time can expire).
+    route_us: HashMap<String, RouteTime>,
     /// Dedupe: route -> (amount, profit, pool epoch when returned).
     returned: HashMap<String, (U256, U256, u64)>,
     /// Pool key -> epoch (scan call number) it last changed.
     pool_epoch: HashMap<String, u64>,
     epoch: u64,
+    /// (Oct 30, review) A check has run the engine in this block's scan
+    /// (quick answers like "unsure pool" don't count): until then a timed
+    /// route may start whatever its time (may_start).
+    ran_engine: bool,
+    /// (Oct 30, review) The route that stopped the sweep last time (it fit
+    /// the sweep's share but not what was left); next time it is passed over.
+    sweep_stalled_on: Option<String>,
 }
 
 impl Scanner {
     pub fn new(cfg: ScanConfig, src: Box<dyn RouteSource>, runner: Box<dyn CheckRunner>) -> Scanner {
-        Scanner { cfg, src, runner, last_rid: None, cursor_gen: u64::MAX, pass_blocks: 0, pass_valid: true, route_us: HashMap::new(), returned: HashMap::new(), pool_epoch: HashMap::new(), epoch: 0 }
+        Scanner { cfg, src, runner, last_rid: None, cursor_gen: u64::MAX, pass_blocks: 0, pass_valid: true, route_us: HashMap::new(), returned: HashMap::new(), pool_epoch: HashMap::new(), epoch: 0, ran_engine: false, sweep_stalled_on: None }
     }
 
     /// The live scanner: None unless FASTLANE=practice|live.
@@ -847,12 +930,22 @@ impl Scanner {
 
         let budget = self.cfg.budget_us;
         let changed_limit = budget.saturating_sub(budget * self.cfg.sweep_reserve_pct / 100);
-        // M6: bounded memory for per-route timings.
+        // (Oct 30, review) The sweep's own share of the budget (what is kept
+        // for it; the whole budget when nothing is kept): a route whose time
+        // fits it waits for the next block instead of being passed over.
+        let sweep_share = if budget > changed_limit { budget - changed_limit } else { budget };
+        self.ran_engine = false;
+        // M6: bounded memory for per-route timings (Oct 30: expired times
+        // go too; they would be forgotten on their next look anyway).
         if self.route_us.len() > self.src.all().len() * 2 + 64 {
-            self.route_us.retain(|_, (_, until)| *until > epoch);
+            let ttl = self.cfg.route_time_ttl_blocks;
+            self.route_us.retain(|_, t| t.rest_until > epoch || epoch < t.at.saturating_add(ttl));
         }
         let mut done: HashSet<String> = HashSet::new();
         let mut found: Vec<Opportunity> = Vec::new();
+        // (Oct 30) Every check of this block may share the runner's
+        // per-block work (c2runner.rs: one check core per block).
+        self.runner.begin_block();
 
         // 1. Routes through pools changed in this block.
         let tc = Instant::now();
@@ -870,7 +963,7 @@ impl Scanner {
                 rep.unfollowed += 1;
                 continue;
             }
-            if !self.may_start(r, t0, changed_limit, epoch, &mut rep) {
+            if self.may_start(r, t0, changed_limit, epoch, &mut rep) != Start::Go {
                 continue;
             }
             tried += 1;
@@ -918,39 +1011,54 @@ impl Scanner {
                     self.pass_blocks = 1;
                 }
                 let r = &all[cursor];
-                if !done.contains(&r.rid) && crate::fastlane::lane::follow_block(&r.pools).is_some() {
-                    // Never sendable (see step 1): passed over, counted.
-                    rep.unfollowed += 1;
-                    done.insert(r.rid.clone());
-                    cursor += 1;
-                    steps += 1;
-                    self.last_rid = Some(r.rid.clone());
-                    if cursor >= all.len() {
-                        if self.pass_valid {
-                            rep.full_sweep_blocks = Some(self.pass_blocks);
+                // Passed over without a check (still counts as visited).
+                let mut pass_over = false;
+                if !done.contains(&r.rid) {
+                    if crate::fastlane::lane::follow_block(&r.pools).is_some() {
+                        // Never sendable (see step 1): passed over, counted.
+                        rep.unfollowed += 1;
+                        pass_over = true;
+                    } else {
+                        match self.may_start(r, t0, budget, epoch, &mut rep) {
+                            Start::Go => {}
+                            // (Oct 30, review) A route whose time fits the
+                            // sweep's own share but not what is LEFT this
+                            // block (changed-pool routes or earlier sweep
+                            // checks used it): the sweep stops here and it
+                            // gets the next block's share. Only once in a row
+                            // for the same route, so a block after block of
+                            // busy changed-pool steps can't park the sweep.
+                            Start::NoFit(us) if us <= sweep_share && self.sweep_stalled_on.as_deref() != Some(r.rid.as_str()) => {
+                                self.sweep_stalled_on = Some(r.rid.clone());
+                                break;
+                            }
+                            // (Oct 30) Resting, or too slow for the sweep's
+                            // whole share (or it already stopped the sweep
+                            // last block): pass over it (counted) instead of
+                            // stopping here. Before, the sweep stopped at such
+                            // a route EVERY block, so it never moved again
+                            // (live: 0 sweep checks/hour). It is tried again
+                            // once its time expires
+                            // (FASTLANE_ROUTE_TIME_TTL_BLOCKS) or as a block's
+                            // first check (may_start).
+                            Start::NoFit(_) | Start::Resting => pass_over = true,
                         }
-                        self.pass_blocks = 0;
-                        self.pass_valid = true;
-                        cursor = 0;
-                        self.last_rid = None;
                     }
-                    continue;
-                }
-                if !done.contains(&r.rid) && !self.may_start(r, t0, budget, epoch, &mut rep) {
-                    // Doesn't fit what is left of the budget: next block.
-                    break;
                 }
                 cursor += 1;
                 steps += 1;
                 self.last_rid = Some(r.rid.clone());
-                if !done.contains(&r.rid) {
+                if pass_over {
+                    done.insert(r.rid.clone());
+                } else if !done.contains(&r.rid) {
                     done.insert(r.rid.clone());
                     let c = self.check_route(r, b, "sweep", t0, epoch, &mut found);
                     rep.checked.push(c);
                     swept += 1;
                 }
                 if cursor >= all.len() {
-                    // A full pass is complete: every route visited once.
+                    // A full pass is complete: every route visited once
+                    // (checked, or passed over and counted).
                     if self.pass_valid {
                         rep.full_sweep_blocks = Some(self.pass_blocks);
                     }
@@ -962,6 +1070,7 @@ impl Scanner {
             }
         }
         rep.timing.sweep_us = ts.elapsed().as_micros() as u64;
+        self.runner.end_block();
 
         found.sort_by(|a, b| b.expected_net_usd.total_cmp(&a.expected_net_usd));
         found.truncate(self.cfg.max_results);
@@ -976,17 +1085,32 @@ impl Scanner {
     /// M6: may route `r` start now? Not while it rests (it was slower than
     /// FASTLANE_ROUTE_MAX_US), and only if its last run time still fits
     /// before `limit` (us since t0). A route never timed always may.
-    fn may_start(&mut self, r: &Arc<Route>, t0: Instant, limit: u64, epoch: u64, rep: &mut ScanReport) -> bool {
-        let Some((us, until)) = self.route_us.get(&r.rid).copied() else { return true };
-        if until > epoch {
+    /// (Oct 30) Two ways back in, so a recorded time can't ban a route for
+    /// good: its time is forgotten FASTLANE_ROUTE_TIME_TTL_BLOCKS blocks
+    /// after it was measured (then it may start like a new route and is
+    /// timed again), and a route that is not resting may always be the
+    /// FIRST check of a block (no check has run the engine yet this block;
+    /// a really slow one then rests 50 blocks again, so this is rare).
+    fn may_start(&mut self, r: &Arc<Route>, t0: Instant, limit: u64, epoch: u64, rep: &mut ScanReport) -> Start {
+        let Some(t) = self.route_us.get(&r.rid).copied() else { return Start::Go };
+        if t.rest_until > epoch {
             rep.resting += 1;
-            return false;
+            return Start::Resting;
         }
-        if (t0.elapsed().as_micros() as u64).saturating_add(us) > limit {
+        if epoch >= t.at.saturating_add(self.cfg.route_time_ttl_blocks) {
+            self.route_us.remove(&r.rid);
+            return Start::Go;
+        }
+        // (review) Quick answers (unsure pool, no price facts) don't use
+        // the budget: only a check that ran the engine ends "first".
+        if !self.ran_engine {
+            return Start::Go;
+        }
+        if (t0.elapsed().as_micros() as u64).saturating_add(t.us) > limit {
             rep.cut_fit += 1;
-            return false;
+            return Start::NoFit(t.us);
         }
-        true
+        Start::Go
     }
 
     fn check_route(&mut self, r: &Arc<Route>, b: &BlockInput, source: &'static str, t0: Instant, epoch: u64, found: &mut Vec<Opportunity>) -> RouteCheck {
@@ -996,7 +1120,7 @@ impl Scanner {
         if until > 0 {
             HOUR.with(|h| h.slow_routes += 1);
         }
-        self.route_us.insert(r.rid.clone(), (c.us, until));
+        self.route_us.insert(r.rid.clone(), RouteTime { us: c.us, rest_until: until, at: epoch });
         c
     }
 
@@ -1011,9 +1135,21 @@ impl Scanner {
         }
         let Some(f) = &r.facts else { return fin(Outcome::NoFacts) };
         let at = RunAt { view: b.view, ctx: b.ctx, block: b.block, snap: b.snap };
+        self.ran_engine = true;
         let res = match self.runner.run_at(&at, &r.check, &amounts_for(&r.check, self.cfg.refine_steps)) {
             Ok(x) => x,
-            Err(u) => return fin(Outcome::Unknown(u.reason.as_str().to_string())),
+            Err(u) => {
+                // (Oct 30) Counted by reason (status unknownWhy); for a miss,
+                // also which contract it missed (unknownMissTop).
+                if let Some(m) = u.missing.first() {
+                    let at = match m {
+                        crate::state::MissItem::Account(a) | crate::state::MissItem::Slot(a, _) => format!("{a:#x}"),
+                        crate::state::MissItem::Code(_) => "code".to_string(),
+                    };
+                    HOUR.with(|h| h.unknown_miss_at.add(at));
+                }
+                return fin(Outcome::Unknown(unknown_key(&u).to_string()));
+            }
         };
         let Some(best) = res.best else { return fin(Outcome::NoProfit) };
         if best.profit > best.amount {
@@ -1166,6 +1302,10 @@ pub struct Hour {
     /// Routes skipped as unsure because of their LENDER key (the pools
     /// themselves were fine), apart from pools.
     pub skipped_unsure_lender: u64,
+    /// (Oct 30) "unknown" answers by reason (unknown_key), and for misses
+    /// the contract the first missing value belonged to.
+    pub unknown_why: super::coverage::Tally,
+    pub unknown_miss_at: super::coverage::Tally,
 }
 
 struct HourCell {
@@ -1186,6 +1326,7 @@ static HOUR: HourCell = HourCell { h: Mutex::new(Hour {
     skipped_unsure: 0, no_facts: 0, implausible: 0, cut_changed: 0, unfollowed: 0, bad_rows: 0, best_net_usd: None, best_label: String::new(), time_us: 0,
     max_block_us: 0, full_sweeps: 0, last_full_sweep_blocks: None, max_full_sweep_blocks: 0, eval_real: 0, eval_gone: 0, eval_unknown: 0,
     slow_routes: 0, resting: 0, cut_fit: 0, routes: 0, skipped_unsure_lender: 0,
+    unknown_why: super::coverage::Tally { map: BTreeMap::new(), other: 0 }, unknown_miss_at: super::coverage::Tally { map: BTreeMap::new(), other: 0 },
 }), ring: Mutex::new(VecDeque::new()) };
 
 fn record_block(rep: &ScanReport) {
@@ -1212,7 +1353,10 @@ fn record_block(rep: &ScanReport) {
                 Outcome::Found { dup: true, .. } => h.found_dup += 1,
                 Outcome::BelowMin { .. } => h.below_min += 1,
                 Outcome::NoProfit => h.no_profit += 1,
-                Outcome::Unknown(_) => h.unknown += 1,
+                Outcome::Unknown(why) => {
+                    h.unknown += 1;
+                    h.unknown_why.add(why.as_str());
+                }
                 Outcome::SkippedUnsure => h.skipped_unsure += 1,
                 Outcome::NoFacts => h.no_facts += 1,
                 Outcome::Implausible => h.implausible += 1,
@@ -1260,6 +1404,7 @@ pub fn status_json() -> Value {
         "evalReal": h.eval_real, "evalGone": h.eval_gone, "evalUnknown": h.eval_unknown,
         "slowRoutes": h.slow_routes, "resting": h.resting, "cutFit": h.cut_fit,
         "routes": h.routes, "skippedUnsureLender": h.skipped_unsure_lender,
+        "unknownWhy": h.unknown_why.json(16), "unknownMissTop": h.unknown_miss_at.json(5),
         "blockUs": crate::timing::pct(&mut ring),
         "syncUs": crate::timing::pct(&mut SYNC_RING.lock().unwrap_or_else(|e| e.into_inner()).iter().copied().collect::<Vec<u64>>()),
     })
@@ -1277,6 +1422,14 @@ pub fn take_hour() -> String {
         h.last_full_sweep_blocks.map(|v| v.to_string()).unwrap_or_else(|| "-".into()), h.max_full_sweep_blocks, h.full_sweeps,
         if h.eval_real + h.eval_gone + h.eval_unknown > 0 { format!("; practice re-checks: {} real, {} gone, {} unsure", h.eval_real, h.eval_gone, h.eval_unknown) } else { String::new() },
     );
+    // (Oct 30) Why the checks could not answer, biggest first.
+    let line = if h.unknown > 0 {
+        let why = h.unknown_why.top(6).into_iter().map(|(k, c)| format!("{k}:{c}")).collect::<Vec<_>>().join(" ");
+        let miss = h.unknown_miss_at.top(3).into_iter().map(|(k, c)| format!("{}:{c}", &k[..k.len().min(12)])).collect::<Vec<_>>().join(" ");
+        format!("{line}; unsure answers by reason: {why}{}", if miss.is_empty() { String::new() } else { format!(" (missed at {miss})") })
+    } else {
+        line
+    };
     let line = if h.slow_routes + h.resting + h.cut_fit > 0 { format!("{line}; slow routes {} (rested {}, not fitting the budget left {})", h.slow_routes, h.resting, h.cut_fit) } else { line };
     line
 }
