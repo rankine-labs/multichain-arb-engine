@@ -703,8 +703,16 @@ fn trig_discover_inner(ctx: &Ctx, id: &Value, req: &Value, t0: Instant, tm: &mut
     let trig_dec: Option<crate::check::rawtx::DecodedTx> = alone.msgs.iter().flat_map(|m| m.txs.iter()).find(|t| t.hash == alone.trigger).cloned();
     // One registry summary for the whole question (checkcore.rs): the exact
     // values list and the moved-pool tables come from it, no registry lock.
+    // SPEED (Oct 29): a check core built within the last second, without
+    // waiting for the registry (live: getting a current core was the biggest
+    // step of slow discoveries, p90 21 ms, mostly waiting while the copy's
+    // thread wrote the registry). Discovery only names the moved pools; the
+    // candidate checks that follow still use a current core. A pool that
+    // went unsure in that second has its values forgotten (a miss, never a
+    // wrong answer). ARBSIM_DISC_CORE_MAX_AGE_MS (1000; 0 = always current).
     let t_core = Instant::now();
-    let core = c2.core_for(picked.from.as_ref());
+    let max_age = env_u64("ARBSIM_DISC_CORE_MAX_AGE_MS", 1000);
+    let core = if max_age == 0 { c2.core_for(picked.from.as_ref()) } else { c2.recent_core(std::time::Duration::from_millis(max_age), picked.from.as_ref()) };
     tm.facts_us += t_core.elapsed().as_micros() as u64;
     let prov = crate::timing::ph_time("prov", || c2.provenance_with(&core, block, &[]));
     // WARM HOT TARGETS (copy2/warm.rs): values copy 2 doesn't hold, from memory.
