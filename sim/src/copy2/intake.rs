@@ -571,6 +571,12 @@ c2counters!(
     verify_rounds, verify_items, unfollowed_changed,
     // How many such values the copy held at the last round (a level).
     unfollowed_held,
+    // (Oct 30, review) The fast lane's fills' own verify round
+    // (ARBSIM_COPY2_FAST_VERIFY_S): rounds, values re-read, values watched
+    // (a level), the oldest watched value's age in seconds at the last
+    // round (a level), and fast-lane fills NOT fetched because the watch
+    // list was full (fail closed: those checks stay unknown).
+    fast_verify_rounds, fast_verify_items, fast_verify_watched, fast_verify_oldest_s, fast_fill_not_watched,
     // ---- copy2-m (live Oct 22, 13:34 restart) ----
     // Checks that read a V4 protocolFeesAccrued counter (never held) and ran
     // with it 0 and not 0: answered (same apart from gas; the higher gas is
@@ -870,6 +876,9 @@ pub enum Input {
     Track(Vec<TrackedPool>, Vec<(Address, BalanceLayout)>),
     Block(BlockMsg),
     Fill(Vec<MissItem>),
+    /// (Oct 30) A fill the fast lane asked for: also watched by the fast
+    /// verify round (C2Config fast_verify_ms).
+    FastFill(Vec<MissItem>),
     /// Coin balance places the bot already knows (`coin_slots` / `track`).
     Layouts(Vec<(Address, BalanceLayout)>),
     /// An answer from a loader thread.
@@ -1321,10 +1330,17 @@ impl Copy2Handle {
         }
     }
 
-    pub fn fill(&self, items: Vec<MissItem>) {
-        if !items.is_empty() {
-            let _ = self.tx.try_send(Input::Fill(items));
-        }
+    /// Ask copy 2 to fetch these. False = not queued (the copy's input is
+    /// full right now): nothing will be fetched (review, Oct 30).
+    pub fn fill(&self, items: Vec<MissItem>) -> bool {
+        items.is_empty() || self.tx.try_send(Input::Fill(items)).is_ok()
+    }
+
+    /// (Oct 30) The fast lane's fills: like `fill`, and the values it gets
+    /// are re-read by their own verify round (C2Config fast_verify_ms).
+    /// False = not queued.
+    pub fn fast_fill(&self, items: Vec<MissItem>) -> bool {
+        items.is_empty() || self.tx.try_send(Input::FastFill(items)).is_ok()
     }
 
     /// Accounts a check gave contract code by override (the bot's simulated
@@ -1891,6 +1907,15 @@ pub struct C2Config {
     /// [ARBSIM_COPY2_VERIFY_MAX, 400] values a round.
     pub verify_every_s: u64,
     pub verify_max: usize,
+    /// (Oct 30, review) FAST LANE FILLS' OWN VERIFY ROUND: values copy 2
+    /// fetched because the fast lane asked (and that nothing follows) are
+    /// re-read every [ARBSIM_COPY2_FAST_VERIFY_S, 60; 0 = off] seconds, ALL
+    /// of them each round, so none is used more than about two rounds after
+    /// the chain last confirmed it. At most [ARBSIM_COPY2_FAST_VERIFY_MAX,
+    /// 1000] are watched; a fast-lane fill that doesn't fit is not fetched
+    /// (its check stays "unknown": fail closed). Milliseconds here (tests).
+    pub fast_verify_ms: u64,
+    pub fast_verify_max: usize,
     /// A pool "loading" with no node job, no working copy and no answer
     /// waiting for this long is rescheduled (logged with its reason)
     /// [ARBSIM_COPY2_STALL_S, 30].
@@ -1965,6 +1990,8 @@ impl C2Config {
             pm_bound: env_u64("ARBSIM_COPY2_PM_BOUND", 1) != 0,
             verify_every_s: env_u64("ARBSIM_COPY2_VERIFY_S", 60),
             verify_max: env_u64("ARBSIM_COPY2_VERIFY_MAX", 400).clamp(1, 10_000) as usize,
+            fast_verify_ms: env_u64("ARBSIM_COPY2_FAST_VERIFY_S", 60).saturating_mul(1000),
+            fast_verify_max: env_u64("ARBSIM_COPY2_FAST_VERIFY_MAX", 1000).clamp(1, 10_000) as usize,
             stall_s: env_u64("ARBSIM_COPY2_STALL_S", 30),
             state_file: std::env::var("ARBSIM_COPY2_STATE_FILE").ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
             save_every_s: env_u64("ARBSIM_COPY2_SAVE_S", 60).max(1),
@@ -1980,7 +2007,7 @@ impl C2Config {
         }
     }
     pub fn for_tests() -> Self {
-        C2Config { reload_ms: 0, reload_max_ms: 0, layout_retry_s: 3600, load_batch: 25, loaders: 2, keep_blocks: 400, max_keep_blocks: 4000, max_rounds: 40, tip_every_s: 0, catchup_max_blocks: 64, walk: WalkCfg::default(), walks_inflight: 2, walk_max_slots: 1_000_000, walk_max_rss_mb: 0, max_keep_logs: 1_000_000, pending_ms: 300, pm_bound: true, verify_every_s: 0, verify_max: 400, stall_s: 30, state_file: None, save_every_s: 3600, resume_max_blocks: 18_000, resume_overlap: 64, resume_range: 500, resume_timeout_s: 60, resume_verify_max: usize::MAX, drop_grace_s: 1800, drop_grace_max: 400, drop_grace_max_logs: 1_000_000, blind: super::v4blind::BlindCfg::for_tests() }
+        C2Config { reload_ms: 0, reload_max_ms: 0, layout_retry_s: 3600, load_batch: 25, loaders: 2, keep_blocks: 400, max_keep_blocks: 4000, max_rounds: 40, tip_every_s: 0, catchup_max_blocks: 64, walk: WalkCfg::default(), walks_inflight: 2, walk_max_slots: 1_000_000, walk_max_rss_mb: 0, max_keep_logs: 1_000_000, pending_ms: 300, pm_bound: true, verify_every_s: 0, verify_max: 400, fast_verify_ms: 0, fast_verify_max: 1000, stall_s: 30, state_file: None, save_every_s: 3600, resume_max_blocks: 18_000, resume_overlap: 64, resume_range: 500, resume_timeout_s: 60, resume_verify_max: usize::MAX, drop_grace_s: 1800, drop_grace_max: 400, drop_grace_max_logs: 1_000_000, blind: super::v4blind::BlindCfg::for_tests() }
     }
 }
 
@@ -2042,6 +2069,8 @@ enum JobFor {
     Logs { from: u64, to: u64 },
     /// Re-reading values nothing follows (dispatch_verify).
     Verify,
+    /// (Oct 30) Re-reading the fast lane's fills (dispatch_fast_verify).
+    FastVerify,
     /// Warm restart / gap: the reports of a block range (copy2/loader.rs catch_up).
     CatchUp,
     /// Warm restart, stage 2: re-reading every value nothing follows.
@@ -2211,6 +2240,12 @@ pub struct Intake {
     last_stall_log: Option<Instant>,
     /// Last round of re-reading the values nothing follows.
     last_verify: Instant,
+    /// (Oct 30) The fast lane's filled values (slots) -> (when asked,
+    /// when last read from the node: the fill, then each fast verify round).
+    fast_watch: HashMap<(Address, U256), (Instant, Instant)>,
+    last_fast_verify: Instant,
+    /// When the fast verify job in flight was sent.
+    fast_sent_at: Instant,
     /// Process memory (MB) and when it was read (the walk guard reads it at
     /// most once a second).
     rss: std::cell::Cell<(f64, Option<Instant>)>,
@@ -2336,6 +2371,9 @@ pub fn manual(sh: Arc<Shared>, fills: Arc<FillQueue>, cfg: C2Config) -> (Intake,
         last_stall_check: Instant::now(),
         last_stall_log: None,
         last_verify: Instant::now(),
+        fast_watch: HashMap::new(),
+        last_fast_verify: Instant::now(),
+        fast_sent_at: Instant::now(),
         rss: std::cell::Cell::new((0.0, None)),
         catchup: None,
         last_ctx: None,
@@ -2546,6 +2584,14 @@ impl Intake {
             Input::Fill(items) => {
                 self.fills.push(items);
             }
+            Input::FastFill(items) => {
+                // Watched by the fast verify round; what doesn't fit the
+                // watch list is not fetched at all (fail closed).
+                let items = self.watch_fast_fill(items);
+                if !items.is_empty() {
+                    self.fills.push(items);
+                }
+            }
             Input::Layouts(l) => self.on_layouts(l),
             Input::Done(d) => self.done.push_back(d),
             Input::Stop => {}
@@ -2592,6 +2638,7 @@ impl Intake {
             self.dispatch_walks();
             self.dispatch_settle();
             self.dispatch_verify();
+            self.dispatch_fast_verify();
             self.dispatch_warm();
             self.maybe_save();
         }
@@ -4011,6 +4058,7 @@ impl Intake {
             (JobFor::Walk { key, gen }, Done::Walk { block, res, .. }) => self.on_walk(key, gen, block, res),
             (JobFor::Logs { from, to }, Done::Logs { res, .. }) => self.on_settle(from, to, res),
             (JobFor::Verify, Done::Fetch { block, res, .. }) => self.on_verify(block, res),
+            (JobFor::FastVerify, Done::Fetch { block, res, .. }) => self.on_fast_verify(block, res),
             (JobFor::CatchUp, Done::CatchUp { id, res }) => self.on_catchup(id, res),
             (JobFor::ResumeVerify, Done::Fetch { id, block, res }) => self.on_resume_verify(id, block, res),
             (JobFor::PoolCatchUp { key, gen }, Done::CatchUp { res, .. }) => self.on_pool_catchup(key, gen, res),
@@ -5675,6 +5723,101 @@ impl Intake {
         add(&self.c2.stats.verify_items, items.len() as u64);
         let id = self.new_job(JobFor::Verify);
         self.loaders.as_ref().unwrap().send(Job::Fetch { id, block: head.block, exact: false, bulk: true, items, calls: vec![] });
+    }
+
+    /// (Oct 30, review) A fill the fast lane asked for: its storage values
+    /// join the fast verify watch list. Returns what to fetch: everything
+    /// when the round is off (fast_verify_ms 0, as before), else only what
+    /// fits the list (the rest is dropped and counted: those checks stay
+    /// "unknown" rather than use a value nobody re-reads soon).
+    fn watch_fast_fill(&mut self, items: Vec<MissItem>) -> Vec<MissItem> {
+        if self.cfg.fast_verify_ms == 0 {
+            return items;
+        }
+        let now = Instant::now();
+        let mut out = Vec::with_capacity(items.len());
+        for it in items {
+            match &it {
+                MissItem::Slot(a, sl) => {
+                    let k = (*a, *sl);
+                    if !self.fast_watch.contains_key(&k) && self.fast_watch.len() >= self.cfg.fast_verify_max {
+                        inc(&self.c2.stats.fast_fill_not_watched);
+                        continue;
+                    }
+                    self.fast_watch.insert(k, (now, now));
+                    out.push(it);
+                }
+                // Account basics / code: checks rarely read an unfollowed
+                // account's basics; fetched as any fill.
+                _ => out.push(it),
+            }
+        }
+        self.c2.stats.fast_verify_watched.store(self.fast_watch.len() as u64, Ordering::Relaxed);
+        out
+    }
+
+    /// (Oct 30, review) Every fast_verify_ms: re-read EVERY watched value
+    /// the copy still holds and nothing follows (one fetch job at the node's
+    /// block; answers handled like dispatch_verify's: a changed value is
+    /// forgotten in every version and the chain's value put in). Values no
+    /// longer held, or now followed by a pool, leave the list.
+    fn dispatch_fast_verify(&mut self) {
+        if self.cfg.fast_verify_ms == 0 || self.fast_watch.is_empty() || self.last_fast_verify.elapsed() < Duration::from_millis(self.cfg.fast_verify_ms) {
+            return;
+        }
+        if self.loaders.is_none() || self.refusing_now() || self.jobs.values().any(|j| matches!(j, JobFor::FastVerify)) {
+            return;
+        }
+        let Some(head) = self.sh.head() else { return };
+        self.last_fast_verify = Instant::now();
+        {
+            let reg = self.c2.reg.read().unwrap();
+            let followed = |a: &Address, sl: &U256| {
+                reg.by_addr.contains_key(a)
+                    || reg.owner_of.contains_key(a)
+                    || reg.is_pm(a)
+                    || self.sh.volatile.is_whole(a)
+                    || reg.holders.get(a).is_some_and(|h| h.iter().any(|x| reg.bal_slot(*a, *x) == Some(*sl)))
+            };
+            // A fill still on its way (asked under 5 minutes ago) stays
+            // listed; it is re-read once the copy holds it.
+            self.fast_watch.retain(|(a, sl), (asked, _)| !followed(a, sl) && (matches!(head.snap.storage(*a, *sl), Lookup::Known(_)) || asked.elapsed() < Duration::from_secs(300)));
+        }
+        self.c2.stats.fast_verify_watched.store(self.fast_watch.len() as u64, Ordering::Relaxed);
+        if self.fast_watch.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        let held: Vec<(Address, U256)> = self.fast_watch.keys().filter(|(a, sl)| matches!(head.snap.storage(*a, *sl), Lookup::Known(_))).copied().collect();
+        if held.is_empty() {
+            return;
+        }
+        let oldest = held.iter().filter_map(|k| self.fast_watch.get(k)).map(|(_, t)| now.saturating_duration_since(*t).as_secs()).max().unwrap_or(0);
+        self.c2.stats.fast_verify_oldest_s.store(oldest, Ordering::Relaxed);
+        self.fast_sent_at = now;
+        let items: Vec<MissItem> = held.into_iter().map(|(a, sl)| MissItem::Slot(a, sl)).collect();
+        inc(&self.c2.stats.fast_verify_rounds);
+        add(&self.c2.stats.fast_verify_items, items.len() as u64);
+        let id = self.new_job(JobFor::FastVerify);
+        self.loaders.as_ref().unwrap().send(Job::Fetch { id, block: head.block, exact: false, bulk: true, items, calls: vec![] });
+    }
+
+    /// (Oct 30) Fast verify answers: each value the node gave counts as read
+    /// at the moment the round was sent (an error leaves its old time, so
+    /// fast_verify_oldest_s never looks better than it is); then the same
+    /// handling as the general round (on_verify).
+    fn on_fast_verify(&mut self, k: u64, res: Result<FetchOut, crate::node::NodeErr>) {
+        if let Ok(out) = &res {
+            let at = self.fast_sent_at;
+            for (_, f) in &out.items {
+                if let Ok(Fetched::Slot(a, sl, _)) = f {
+                    if let Some(e) = self.fast_watch.get_mut(&(*a, *sl)) {
+                        e.1 = at;
+                    }
+                }
+            }
+        }
+        self.on_verify(k, res);
     }
 
     /// Verify answers (values at block k): a held value that differs from

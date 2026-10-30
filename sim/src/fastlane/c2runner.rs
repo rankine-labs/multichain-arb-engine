@@ -60,7 +60,9 @@
 //   (it refuses what it can't hold exactly). Nothing is guessed: until the
 //   value is held, the check keeps answering "unknown".
 //   Status fastlane.copy2Runs: fillOffered / fillSent / fillRepeat /
-//   fillOverCap; fastlane.copy2Unknown: WHICH value each "miss" stopped on
+//   fillOverCap / fillNotQueued / fillAskedAgain; values fetched for the
+//   fast lane are re-read by their own verify round (copy2/intake.rs
+//   dispatch_fast_verify, ARBSIM_COPY2_FAST_VERIFY_S [60]); fastlane.copy2Unknown: WHICH value each "miss" stopped on
 //   (account + slot) and WHICH pool each "unsure_pool" named (top 10).
 //
 //   Counted on their own (final review, low): copy 2's PoolManager-bound and
@@ -159,16 +161,24 @@ fn unsure_key(detail: &str) -> String {
 
 /// (Oct 30) FAST LANE FILLS: which missed values the fast lane asked copy 2
 /// to fetch (see the file header). One per copy (Copy2Handle).
+///
+/// Review (Oct 30): an item counts as asked only if copy 2 actually took the
+/// request (its input can be full); and a value asked again and again (copy
+/// 2 refuses it, e.g. some PoolManager slots, or it never stays held) waits
+/// twice as long each time (up to an hour), so it can't use up the hourly
+/// allowance.
 #[derive(Debug)]
 pub struct FastFillBook {
     pub on: bool,
-    /// The same value is asked again at most once per this long.
+    /// The same value is asked again at most once per this long (the first
+    /// time; doubled for each further ask, at most BACKOFF_MAX).
     pub repeat: Duration,
     /// At most this many values an hour (all routes together).
     pub per_hour: u64,
     /// At most this many items of one answer.
     pub max_items: usize,
-    sent: HashMap<MissItem, Instant>,
+    /// Value -> (last asked, times asked).
+    sent: HashMap<MissItem, (Instant, u32)>,
     order: VecDeque<(MissItem, Instant)>,
     hour_start: Option<Instant>,
     pub hour_used: u64,
@@ -177,6 +187,8 @@ pub struct FastFillBook {
 impl FastFillBook {
     /// Values remembered for the repeat rule (oldest forgotten first).
     pub const REMEMBER: usize = 20_000;
+    /// Longest wait between two asks for the same value.
+    pub const BACKOFF_MAX: Duration = Duration::from_secs(3600);
 
     pub fn new(on: bool, repeat: Duration, per_hour: u64, max_items: usize) -> FastFillBook {
         FastFillBook { on, repeat, per_hour, max_items, sent: HashMap::new(), order: VecDeque::new(), hour_start: None, hour_used: 0 }
@@ -189,10 +201,17 @@ impl FastFillBook {
         FastFillBook::new(on, Duration::from_secs(num("ARBSIM_FASTLANE_FILL_REPEAT_S", 120)), num("ARBSIM_FASTLANE_FILL_PER_HOUR", 3600), num("ARBSIM_FASTLANE_FILL_MAX_ITEMS", 8) as usize)
     }
 
-    /// A "miss" answer named these values: the ones to fetch now (counted
-    /// in status copy2Runs). Code items are left out (copy 2 fetches code
-    /// with the account's basics).
-    pub fn offer(&mut self, missing: &[MissItem], now: Instant) -> Vec<MissItem> {
+    /// How long after the `times`-th ask the value may be asked again.
+    fn wait_after(&self, times: u32) -> Duration {
+        let f = 1u32 << times.saturating_sub(1).min(16);
+        self.repeat.saturating_mul(f).min(Self::BACKOFF_MAX.max(self.repeat))
+    }
+
+    /// A "miss" answer named these values: pick the ones to fetch now, hand
+    /// them to `send` (true = copy 2 queued them), and only then count them
+    /// as asked (status copy2Runs). Code items are left out (copy 2 fetches
+    /// code with the account's basics). Returns what was queued.
+    pub fn offer(&mut self, missing: &[MissItem], now: Instant, send: impl FnOnce(Vec<MissItem>) -> bool) -> Vec<MissItem> {
         if !self.on || missing.is_empty() {
             return Vec::new();
         }
@@ -200,38 +219,54 @@ impl FastFillBook {
             self.hour_start = Some(now);
             self.hour_used = 0;
         }
-        let mut out = Vec::new();
+        let mut pick: Vec<MissItem> = Vec::new();
         let (mut offered, mut repeat, mut over) = (0u64, 0u64, 0u64);
         for m in missing.iter().filter(|m| !matches!(m, MissItem::Code(_))).take(self.max_items) {
             offered += 1;
-            if out.contains(m) {
+            if pick.contains(m) {
                 continue;
             }
-            if self.sent.get(m).is_some_and(|t| now.saturating_duration_since(*t) < self.repeat) {
-                repeat += 1;
-                continue;
+            if let Some((t, n)) = self.sent.get(m) {
+                if now.saturating_duration_since(*t) < self.wait_after(*n) {
+                    repeat += 1;
+                    continue;
+                }
             }
-            if self.hour_used >= self.per_hour {
+            if self.hour_used + pick.len() as u64 >= self.per_hour {
                 over += 1;
                 continue;
             }
-            self.hour_used += 1;
-            self.sent.insert(m.clone(), now);
-            self.order.push_back((m.clone(), now));
-            out.push(m.clone());
+            pick.push(m.clone());
         }
+        bump("fillOffered", offered);
+        bump("fillRepeat", repeat);
+        bump("fillOverCap", over);
+        if pick.is_empty() {
+            return pick;
+        }
+        if !send(pick.clone()) {
+            // Copy 2's input was full: nothing asked, nothing recorded.
+            bump("fillNotQueued", pick.len() as u64);
+            return Vec::new();
+        }
+        for m in &pick {
+            let n = self.sent.get(m).map_or(0, |x| x.1);
+            if n >= 1 {
+                bump("fillAskedAgain", 1);
+            }
+            self.sent.insert(m.clone(), (now, n.saturating_add(1)));
+            self.order.push_back((m.clone(), now));
+        }
+        self.hour_used += pick.len() as u64;
         while self.order.len() > Self::REMEMBER {
             if let Some((m, t)) = self.order.pop_front() {
-                if self.sent.get(&m) == Some(&t) {
+                if self.sent.get(&m).is_some_and(|x| x.0 == t) {
                     self.sent.remove(&m);
                 }
             }
         }
-        bump("fillOffered", offered);
-        bump("fillSent", out.len() as u64);
-        bump("fillRepeat", repeat);
-        bump("fillOverCap", over);
-        out
+        bump("fillSent", pick.len() as u64);
+        pick
     }
 }
 
@@ -442,8 +477,8 @@ pub fn run_on_copy2_with(
             // (Oct 30) FAST LANE FILLS (file header): ask copy 2 to fetch
             // what this check missed, paced. The answer stays "unknown".
             note_unknown_detail(missing.first().map(miss_key), None);
-            let fresh = c2.c2.fastlane_fill.lock().map(|mut b| b.offer(&missing, Instant::now())).unwrap_or_default();
-            c2.fill(fresh);
+            // Only what copy 2 actually queued is counted as asked (review).
+            let _ = c2.c2.fastlane_fill.lock().map(|mut b| b.offer(&missing, Instant::now(), |items| c2.fast_fill(items)));
         }
     }
     result_from_json(&answer)
@@ -476,15 +511,24 @@ mod tests {
         use revm::primitives::{Address, B256};
         let a = Address::with_last_byte(5);
         let item = |n: u8| MissItem::Slot(a, U256::from(n));
+        let ok = |_: Vec<MissItem>| true;
         let t0 = Instant::now();
-        let mut b = FastFillBook::new(true, Duration::from_secs(120), 4, 2);
-        assert_eq!(b.offer(&[MissItem::Code(B256::ZERO), item(1), item(2), item(3)], t0), vec![item(1), item(2)], "code skipped, 2 items per answer");
-        assert!(b.offer(&[item(1), item(2)], t0 + Duration::from_secs(5)).is_empty(), "same values within the window: not again");
-        assert_eq!(b.offer(&[item(1), item(3)], t0 + Duration::from_secs(121)), vec![item(1), item(3)], "after the window: again");
-        assert!(b.offer(&[item(4)], t0 + Duration::from_secs(122)).is_empty(), "hourly cap (4) reached");
-        assert_eq!(b.offer(&[item(4)], t0 + Duration::from_secs(3700)), vec![item(4)], "a new hour");
+        let s = |x: u64| t0 + Duration::from_secs(x);
+        let mut b = FastFillBook::new(true, Duration::from_secs(120), 5, 2);
+        assert_eq!(b.offer(&[MissItem::Code(B256::ZERO), item(1), item(2), item(3)], t0, ok), vec![item(1), item(2)], "code skipped, 2 items per answer");
+        assert!(b.offer(&[item(1), item(2)], s(5), ok).is_empty(), "same values within the window: not again");
+        // Copy 2's input full: nothing recorded, the next answer asks again.
+        assert!(b.offer(&[item(3)], s(6), |_| false).is_empty());
+        assert_eq!(b.hour_used, 2, "a refused send uses none of the allowance");
+        assert_eq!(b.offer(&[item(3)], s(7), ok), vec![item(3)]);
+        // Asked again after the window; then the wait doubles (240 s).
+        assert_eq!(b.offer(&[item(1)], s(121), ok), vec![item(1)]);
+        assert!(b.offer(&[item(1)], s(121 + 239), ok).is_empty(), "second ask: waits 240 s");
+        assert_eq!(b.offer(&[item(1)], s(121 + 240), ok), vec![item(1)]);
+        assert!(b.offer(&[item(4)], s(400), ok).is_empty(), "hourly cap (5) reached");
+        assert_eq!(b.offer(&[item(4)], s(3700), ok), vec![item(4)], "a new hour");
         let mut off = FastFillBook::new(false, Duration::from_secs(120), 4, 2);
-        assert!(off.offer(&[item(1)], t0).is_empty());
+        assert!(off.offer(&[item(1)], t0, ok).is_empty());
     }
 
     #[test]
