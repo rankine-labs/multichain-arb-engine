@@ -3643,6 +3643,27 @@ fn fastlane_copy2_runner_shares_one_check_core_per_block() {
     let c = runner.run_at(&at, &pc, &amounts);
     assert_eq!(runner.core_asks(), 2);
     assert_eq!(c, own);
+    // (Review) Inside one scan, a check on ANOTHER snapshot, or on the same
+    // snapshot for another block, gets a new core (never the shared one).
+    let snap2 = Arc::new((*head.snap).clone());
+    let view2 = arbsim::state::snap::View::new(snap2.clone());
+    let at2 = RunAt { view: &view2, ctx: &bctx, block: head.block, snap: Some(&snap2) };
+    let at3 = RunAt { view: &view, ctx: &bctx, block: head.block + 1, snap: Some(&head.snap) };
+    runner.begin_block();
+    let _ = runner.run_at(&at, &pc, &amounts);
+    assert_eq!(runner.core_asks(), 3);
+    let _ = runner.run_at(&at2, &pc, &amounts);
+    assert_eq!(runner.core_asks(), 4, "another snapshot: a new core");
+    let _ = runner.run_at(&at3, &pc, &amounts);
+    assert_eq!(runner.core_asks(), 5, "another block: a new core");
+    // A scan that never said end_block: the next begin_block starts afresh
+    // (no core carried over from the earlier block).
+    runner.begin_block();
+    let _ = runner.run_at(&at, &pc, &amounts);
+    assert_eq!(runner.core_asks(), 6, "begin_block forgets the last block's core");
+    let _ = runner.run_at(&at, &pc, &amounts);
+    assert_eq!(runner.core_asks(), 6, "then shared again within the block");
+    runner.end_block();
 }
 
 // FIRE-FIRST OFFLINE REPLAY (`arbsim trig-replay`, fastlane/trig_replay.rs):

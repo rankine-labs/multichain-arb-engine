@@ -67,10 +67,11 @@
 //       route whose last time was over the budget was never tried again
 //       (its time was only updated by running it).
 //     - the rolling sweep passes OVER a route it can't start (resting, or
-//       too slow for the sweep's share) instead of stopping there for good;
-//       a route that only misses what is LEFT after other sweep checks
-//       still waits for the next block. Passed-over routes are counted
-//       (resting / cutFit) and count as visited for the full pass.
+//       slower than the sweep's own share) instead of stopping there for
+//       good; a route that fits that share but not what is LEFT this block
+//       makes the sweep wait for the next block (once in a row per route).
+//       Passed-over routes are counted (resting / cutFit) and count as
+//       visited for the full pass.
 //     - "unknown" answers are counted by reason (unknownWhy).
 //
 //   Output: Opportunity list, best first, plus microseconds per phase and
@@ -142,6 +143,10 @@ pub struct ScanConfig {
     /// check time is forgotten this many blocks after it was measured, so
     /// one slow run can't keep the route out for good (live Oct 30: routes
     /// whose last time was over the budget were never tried again).
+    /// "Blocks" here means SCAN CALLS (one per new confirmed copy-2 version
+    /// or predicted tip), not chain blocks: if copy 2 skips blocks, or a
+    /// version is too old to scan, the time lasts longer in chain blocks.
+    /// (The 50-block rest and FASTLANE_DEDUPE_BLOCKS count the same way.)
     pub route_time_ttl_blocks: u64,
 }
 
@@ -826,8 +831,8 @@ enum Start {
     Go,
     /// Slow last time: resting (counted "resting").
     Resting,
-    /// Its last time doesn't fit before the limit (counted "cutFit").
-    NoFit,
+    /// Its last time (us, carried) doesn't fit before the limit (counted "cutFit").
+    NoFit(u64),
 }
 
 /// The standing-gap scanner (one per state stream: confirmed / predicted).
@@ -853,11 +858,18 @@ pub struct Scanner {
     /// Pool key -> epoch (scan call number) it last changed.
     pool_epoch: HashMap<String, u64>,
     epoch: u64,
+    /// (Oct 30, review) A check has run the engine in this block's scan
+    /// (quick answers like "unsure pool" don't count): until then a timed
+    /// route may start whatever its time (may_start).
+    ran_engine: bool,
+    /// (Oct 30, review) The route that stopped the sweep last time (it fit
+    /// the sweep's share but not what was left); next time it is passed over.
+    sweep_stalled_on: Option<String>,
 }
 
 impl Scanner {
     pub fn new(cfg: ScanConfig, src: Box<dyn RouteSource>, runner: Box<dyn CheckRunner>) -> Scanner {
-        Scanner { cfg, src, runner, last_rid: None, cursor_gen: u64::MAX, pass_blocks: 0, pass_valid: true, route_us: HashMap::new(), returned: HashMap::new(), pool_epoch: HashMap::new(), epoch: 0 }
+        Scanner { cfg, src, runner, last_rid: None, cursor_gen: u64::MAX, pass_blocks: 0, pass_valid: true, route_us: HashMap::new(), returned: HashMap::new(), pool_epoch: HashMap::new(), epoch: 0, ran_engine: false, sweep_stalled_on: None }
     }
 
     /// The live scanner: None unless FASTLANE=practice|live.
@@ -918,6 +930,11 @@ impl Scanner {
 
         let budget = self.cfg.budget_us;
         let changed_limit = budget.saturating_sub(budget * self.cfg.sweep_reserve_pct / 100);
+        // (Oct 30, review) The sweep's own share of the budget (what is kept
+        // for it; the whole budget when nothing is kept): a route whose time
+        // fits it waits for the next block instead of being passed over.
+        let sweep_share = if budget > changed_limit { budget - changed_limit } else { budget };
+        self.ran_engine = false;
         // M6: bounded memory for per-route timings (Oct 30: expired times
         // go too; they would be forgotten on their next look anyway).
         if self.route_us.len() > self.src.all().len() * 2 + 64 {
@@ -1004,19 +1021,27 @@ impl Scanner {
                     } else {
                         match self.may_start(r, t0, budget, epoch, &mut rep) {
                             Start::Go => {}
-                            // (Oct 30) A route that only misses what is LEFT
-                            // after this block's other sweep checks: it gets
-                            // the next block's share (the sweep stops here).
-                            Start::NoFit if swept > 0 => break,
-                            // (Oct 30) Resting, or too slow even for the
-                            // sweep's whole share this block: pass over it
-                            // (counted) instead of stopping here. Before, the
-                            // sweep stopped at such a route EVERY block, so it
-                            // never moved again (live: 0 sweep checks/hour).
-                            // It is tried again once its time expires
+                            // (Oct 30, review) A route whose time fits the
+                            // sweep's own share but not what is LEFT this
+                            // block (changed-pool routes or earlier sweep
+                            // checks used it): the sweep stops here and it
+                            // gets the next block's share. Only once in a row
+                            // for the same route, so a block after block of
+                            // busy changed-pool steps can't park the sweep.
+                            Start::NoFit(us) if us <= sweep_share && self.sweep_stalled_on.as_deref() != Some(r.rid.as_str()) => {
+                                self.sweep_stalled_on = Some(r.rid.clone());
+                                break;
+                            }
+                            // (Oct 30) Resting, or too slow for the sweep's
+                            // whole share (or it already stopped the sweep
+                            // last block): pass over it (counted) instead of
+                            // stopping here. Before, the sweep stopped at such
+                            // a route EVERY block, so it never moved again
+                            // (live: 0 sweep checks/hour). It is tried again
+                            // once its time expires
                             // (FASTLANE_ROUTE_TIME_TTL_BLOCKS) or as a block's
                             // first check (may_start).
-                            Start::NoFit | Start::Resting => pass_over = true,
+                            Start::NoFit(_) | Start::Resting => pass_over = true,
                         }
                     }
                 }
@@ -1064,8 +1089,8 @@ impl Scanner {
     /// good: its time is forgotten FASTLANE_ROUTE_TIME_TTL_BLOCKS blocks
     /// after it was measured (then it may start like a new route and is
     /// timed again), and a route that is not resting may always be the
-    /// FIRST check of a block (nothing else has used the budget yet; a
-    /// really slow one then rests 50 blocks again, so this is rare).
+    /// FIRST check of a block (no check has run the engine yet this block;
+    /// a really slow one then rests 50 blocks again, so this is rare).
     fn may_start(&mut self, r: &Arc<Route>, t0: Instant, limit: u64, epoch: u64, rep: &mut ScanReport) -> Start {
         let Some(t) = self.route_us.get(&r.rid).copied() else { return Start::Go };
         if t.rest_until > epoch {
@@ -1076,12 +1101,14 @@ impl Scanner {
             self.route_us.remove(&r.rid);
             return Start::Go;
         }
-        if rep.checked.is_empty() {
+        // (review) Quick answers (unsure pool, no price facts) don't use
+        // the budget: only a check that ran the engine ends "first".
+        if !self.ran_engine {
             return Start::Go;
         }
         if (t0.elapsed().as_micros() as u64).saturating_add(t.us) > limit {
             rep.cut_fit += 1;
-            return Start::NoFit;
+            return Start::NoFit(t.us);
         }
         Start::Go
     }
@@ -1108,6 +1135,7 @@ impl Scanner {
         }
         let Some(f) = &r.facts else { return fin(Outcome::NoFacts) };
         let at = RunAt { view: b.view, ctx: b.ctx, block: b.block, snap: b.snap };
+        self.ran_engine = true;
         let res = match self.runner.run_at(&at, &r.check, &amounts_for(&r.check, self.cfg.refine_steps)) {
             Ok(x) => x,
             Err(u) => {
