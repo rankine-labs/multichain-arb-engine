@@ -675,6 +675,11 @@ pub trait CheckRunner: Send + Sync {
     fn run_at(&self, at: &RunAt, c: &PreparedCheck, amounts: &SizeSearchAmounts) -> Result<SizeSearchResult, CheckUnknown> {
         self.run(at.view, at.ctx, c, amounts)
     }
+    /// (Oct 30) One block's scan starts / ends: a runner may share work
+    /// between that block's checks (copy 2's runner: one check core per
+    /// block instead of one per route). Default: nothing.
+    fn begin_block(&self) {}
+    fn end_block(&self) {}
 }
 
 /// Where one check runs: the strict view, its block details, its L2 block
@@ -898,6 +903,9 @@ impl Scanner {
         }
         let mut done: HashSet<String> = HashSet::new();
         let mut found: Vec<Opportunity> = Vec::new();
+        // (Oct 30) Every check of this block may share the runner's
+        // per-block work (c2runner.rs: one check core per block).
+        self.runner.begin_block();
 
         // 1. Routes through pools changed in this block.
         let tc = Instant::now();
@@ -1014,6 +1022,7 @@ impl Scanner {
             }
         }
         rep.timing.sweep_us = ts.elapsed().as_micros() as u64;
+        self.runner.end_block();
 
         found.sort_by(|a, b| b.expected_net_usd.total_cmp(&a.expected_net_usd));
         found.truncate(self.cfg.max_results);
