@@ -413,6 +413,10 @@ pub struct TrigHour {
     pub mv_checks_own: Vec<u64>,
     pub mv_build: Vec<u64>,
     pub mv_disc: Vec<u64>,
+    /// Same triggers: candidates checked, and each check phase summed over
+    /// its candidates (us; counts like rounds as numbers).
+    pub mv_cands: Vec<u64>,
+    pub mv_check_ph: BTreeMap<String, Vec<u64>>,
     /// (Oct 27) Every unknown (discovery and candidate checks) by
     /// "where|reason" and by "reason|where|target|first missing item"
     /// (fastlane/coverage.rs). Bounded.
@@ -471,6 +475,12 @@ impl TrigHour {
         j["discCpuUs"] = pctl(&self.disc_cpu);
         j["discSlow"] = json!(self.disc_slow);
         j["cold"] = json!({"n": self.cold, "us": self.cold_us, "movedAnyway": self.cold_moved});
+        let mut ph = serde_json::Map::new();
+        for (k, v) in &self.mv_check_ph {
+            ph.insert(k.clone(), pctl(v));
+        }
+        j["movedCheckPh"] = Value::Object(ph);
+        j["movedCands"] = pctl(&self.mv_cands);
         j["movedSteps"] = json!({
             "entry": pctl(&self.mv_entry), "disc": pctl(&self.mv_disc), "pick": pctl(&self.mv_pick),
             "checksWall": pctl(&self.mv_checks_wall), "checksOwn": pctl(&self.mv_checks_own), "build": pctl(&self.mv_build),
@@ -706,6 +716,20 @@ impl Trigger {
             let cands = ans.get("cands").and_then(|c| c.as_array());
             push(&mut self.hour.mv_checks_own, cands.map(|c| c.iter().map(|x| g(&x["a"]["us"])).sum()).unwrap_or(0));
             push(&mut self.hour.mv_build, cands.map(|c| c.iter().map(|x| g(&x["a"]["buildUs"])).sum()).unwrap_or(0));
+            push(&mut self.hour.mv_cands, cands.map(|c| c.len() as u64).unwrap_or(0));
+            let mut sums: BTreeMap<String, u64> = BTreeMap::new();
+            for x in cands.into_iter().flatten() {
+                for key in ["ph", "pn"] {
+                    if let Some(o) = x["a"].get(key).and_then(|p| p.as_object()) {
+                        for (k, v) in o {
+                            *sums.entry(if key == "pn" { format!("n:{k}") } else { k.clone() }).or_default() += v.as_u64().unwrap_or(0);
+                        }
+                    }
+                }
+            }
+            for (k, v) in sums {
+                push(self.hour.mv_check_ph.entry(k).or_default(), v);
+            }
         }
         if let Some(u) = ans.get("us").and_then(|v| v.as_u64()) {
             push(&mut self.hour.entry_us, u);
