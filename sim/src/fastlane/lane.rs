@@ -619,8 +619,17 @@ impl Lane {
         push_bounded(&mut self.hour.changed_us, ts.elapsed().as_micros() as u64);
         let ts = Instant::now();
         let view = crate::state::snap::View::new(head.snap.clone());
-        let unsure = std::collections::HashSet::new();
-        let input = BlockInput { view: &view, ctx: &ctx, block: head.block, kind: ViewKind::Confirmed, changed: &changed, unsure: &unsure, snap: Some(&head.snap) };
+        // (Oct 30) Routes through a pool copy 2 has not ready are skipped
+        // ("skippedUnsure"), as on the predicted view. They used to be run
+        // to the end every block and answer "unsure_pool" (live Oct 30:
+        // 4,088 of 8,700 unknowns in 16 minutes; 37 pools unsure, 27 of
+        // them Solidly-like pools whose getters revert). The list comes
+        // from a core up to 1 s old: a pool that just became ready is
+        // skipped one block more; one that just became unsure is still
+        // checked and answers "unsure_pool" as before. Never an answer
+        // from a pool that isn't ready either way.
+        let unsure = &core.unsure_keys;
+        let input = BlockInput { view: &view, ctx: &ctx, block: head.block, kind: ViewKind::Confirmed, changed: &changed, unsure, snap: Some(&head.snap) };
         let rep = self.scanner.scan(&input);
         push_bounded(&mut self.hour.scan_us, ts.elapsed().as_micros() as u64);
         self.hour.opps += rep.opps.len() as u64;
@@ -761,6 +770,8 @@ impl Lane {
                     "capture": a.get("capture")})
             }),
             "copy2Runs": super::c2runner::stats_json(),
+            // (Oct 30) What "unknown" answers stopped on (c2runner.rs).
+            "copy2Unknown": super::c2runner::unknown_detail_json(),
             "scan": {"routes": self.scanner.routes(), "hour": super::scan::status_json()},
             "gun": {
                 "broadcasting": self.gun.broadcasting(),

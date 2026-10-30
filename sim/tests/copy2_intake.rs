@@ -3666,6 +3666,58 @@ fn fastlane_copy2_runner_shares_one_check_core_per_block() {
     runner.end_block();
 }
 
+// FAST LANE FILLS (Oct 30, fastlane/c2runner.rs): a fast-lane check that
+// misses a value copy 2 doesn't hold (here: a value of an outside contract;
+// live: USDG's per-address flag, slot 6, of a pool only fast-lane routes
+// use) asks copy 2 to fetch it, once per window. Until it is held the check
+// answers "unknown" (never a guess); after the fill the same check runs
+// through. The same miss right away is not asked again (repeat rule).
+#[test]
+fn fastlane_misses_ask_copy_2_to_fetch_the_value_once() {
+    use arbsim::fastlane::c2runner::run_on_copy2;
+    use arbsim::fastlane::scan::{amounts_for, PreparedCheck};
+    let (mut r, _ctx) = trig_world_code(fl_pool_code());
+    // The route's call goes to the outside contract (code: return
+    // sload(first call-data word)): it reads a value nobody follows.
+    let mut row = fl_table_row();
+    row["c"]["calls"][0]["to"] = json!(format!("{:#x}", a(OUTSIDE)));
+    let pc = PreparedCheck::from_row(&row["c"], &[]).unwrap();
+    let amounts = amounts_for(&pc, 0);
+    let first_word = U256::from_be_slice(&pc.call.data[..32]);
+    let run = |r: &Rig| {
+        let head = r.sh.head().unwrap();
+        run_on_copy2(&r.h, &head.snap, head.block, &head.ctx.clone().unwrap(), &pc, &amounts)
+    };
+    let asked = |r: &Rig| r.h.c2.fastlane_fill.lock().unwrap().hour_used;
+    assert_eq!(asked(&r), 0);
+    let e = run(&r).expect_err("not held yet: unknown");
+    assert_eq!(e.reason, arbsim::check::UnknownReason::Miss, "{e:?}");
+    let n1 = asked(&r);
+    assert!(n1 >= 1, "asked copy 2 to fetch what it missed");
+    // The same miss again before the fill arrived: not asked twice.
+    let _ = run(&r).expect_err("still not held");
+    assert_eq!(asked(&r), n1, "repeat rule: the same values are not asked again");
+    // Copy 2 fetches (its own fill rules); later versions hold the values.
+    let mut through = false;
+    for _ in 0..10 {
+        r.settle();
+        r.send(tick(r.sh.head().unwrap().block + 1, 70));
+        match run(&r) {
+            Err(e) if e.reason == arbsim::check::UnknownReason::Miss => continue,
+            other => {
+                assert!(other.is_ok(), "{other:?}");
+                through = true;
+                break;
+            }
+        }
+    }
+    assert!(through, "the fast lane's own fills never arrived");
+    assert_eq!(r.head_slot(a(OUTSIDE), first_word), Lookup::Known(U256::ZERO), "the slot it read is held (the node's 0)");
+    // What a miss stopped on is named in status (copy2Unknown.missTop).
+    let top = arbsim::fastlane::c2runner::unknown_detail_json();
+    assert!(top["missTop"].as_object().unwrap().keys().any(|k| k.starts_with(&format!("{:#x}", a(OUTSIDE)))), "{top}");
+}
+
 // FIRE-FIRST OFFLINE REPLAY (`arbsim trig-replay`, fastlane/trig_replay.rs):
 // a recording in arrival order (copy-2 version 101, then feed message 102
 // with the "swap", then copy 2's version 102 once its reports came) played

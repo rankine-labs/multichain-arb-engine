@@ -976,6 +976,14 @@ fn proof_max_slots() -> usize {
 static READ_PROOF: AtomicU64 = AtomicU64::new(0);
 static READ_PLAIN_MANY: AtomicU64 = AtomicU64::new(0);
 static READ_PLAIN_OLD: AtomicU64 = AtomicU64::new(0);
+/// (Oct 30) Values read plain because their proof's answer was too big.
+static READ_PLAIN_BIG: AtomicU64 = AtomicU64::new(0);
+
+/// (Oct 30) Does this node error (lowercase) mean "the proof's answer is
+/// too big to send"? Then the values are read the plain way (fetch_proof).
+fn proof_too_big(l: &str) -> bool {
+    l.contains("response too large") || l.contains("response size") || l.contains("too large") && l.contains("response")
+}
 
 /// Status: how values were read (see READ_PROOF).
 pub fn read_way_json() -> Value {
@@ -983,6 +991,7 @@ pub fn read_way_json() -> Value {
         "proofValues": READ_PROOF.load(Ordering::Relaxed),
         "plainManyValues": READ_PLAIN_MANY.load(Ordering::Relaxed),
         "plainOldBlock": READ_PLAIN_OLD.load(Ordering::Relaxed),
+        "plainBigProof": READ_PLAIN_BIG.load(Ordering::Relaxed),
     })
 }
 /// Set when the node doesn't know eth_getProof: the plain way from then on.
@@ -1130,6 +1139,17 @@ fn fetch_proof(node: &dyn NodeApi, class: Class, block: u64, items: &[MissItem],
                             plain.push(*a);
                         }
                         READ_PLAIN_OLD.fetch_add(keys.len() as u64, Ordering::Relaxed);
+                        continue;
+                    }
+                    // (Oct 30) The proof's answer is too big for the node
+                    // ("response too large", code -32003; live: the busiest
+                    // pool 0x52e65b17's tick values, asked again and again
+                    // and never read). Same values the plain way, same block.
+                    if proof_too_big(&l) {
+                        if !plain.contains(a) {
+                            plain.push(*a);
+                        }
+                        READ_PLAIN_BIG.fetch_add(keys.len() as u64, Ordering::Relaxed);
                         continue;
                     }
                 }
@@ -1343,5 +1363,58 @@ mod bulk_read_tests {
         assert_eq!(seen.iter().filter(|m| *m == "eth_getStorageAt").count(), 0, "no one-value-per-request reads");
         assert_eq!(out.items.len(), 250);
         assert!(out.items.iter().all(|(_, r)| matches!(r, Ok(Fetched::Slot(_, _, v)) if *v == U256::from(7))), "every value came back");
+    }
+
+    /// (Oct 30) A node that refuses one account's proof as "response too
+    /// large" (live: pool 0x52e65b17): that account's values come back the
+    /// plain way at the same block, exact; other accounts still by proof.
+    struct TooBig {
+        big: Address,
+        seen: M<Vec<(String, String)>>,
+    }
+    impl NodeApi for TooBig {
+        fn call_batch(&self, _c: Class, calls: &[(&str, Value)]) -> Result<Vec<CallResult>, NodeErr> {
+            Ok(calls
+                .iter()
+                .map(|(m, p)| {
+                    self.seen.lock().unwrap().push((m.to_string(), p[p.as_array().unwrap().len() - 1].to_string()));
+                    let acct = crate::check::hexutil::parse_address(p[0].as_str().unwrap()).unwrap();
+                    match *m {
+                        "eth_getProof" if acct == self.big => Err(crate::node::RpcErr { code: -32003, message: "response too large".into() }),
+                        "eth_getProof" => {
+                            let keys = p[1].as_array().unwrap();
+                            let sp: Vec<Value> = keys.iter().map(|k| json!({"key": k, "value": "0x7", "proof": []})).collect();
+                            Ok(json!({"balance": "0x0", "nonce": "0x1", "codeHash": format!("{:#x}", KECCAK_EMPTY), "storageProof": sp}))
+                        }
+                        // The slot number as its value: shows each value is the one asked.
+                        "eth_getStorageAt" => Ok(json!(p[1].as_str().unwrap())),
+                        _ => Ok(json!("0x0")),
+                    }
+                })
+                .collect())
+        }
+    }
+
+    #[test]
+    fn a_proof_too_large_for_the_node_is_read_the_plain_way_at_the_same_block() {
+        let big = Address::repeat_byte(0x52);
+        let other = Address::repeat_byte(0x11);
+        let mut items: Vec<MissItem> = (0..30u64).map(|i| MissItem::Slot(big, U256::from(1000 + i))).collect();
+        items.push(MissItem::Slot(other, U256::from(3u8)));
+        let f = TooBig { big, seen: M::new(Vec::new()) };
+        let before = READ_PLAIN_BIG.load(Ordering::Relaxed);
+        let out = fetch(&f, Class::Fill, 123, &items, &[]).unwrap();
+        for (it, r) in &out.items {
+            match it {
+                MissItem::Slot(a, sl) if *a == big => assert!(matches!(r, Ok(Fetched::Slot(_, s2, v)) if s2 == sl && v == sl), "{it:?} -> {r:?}"),
+                _ => assert!(matches!(r, Ok(Fetched::Slot(_, _, v)) if *v == U256::from(7)), "{it:?} -> {r:?}"),
+            }
+        }
+        let seen = f.seen.lock().unwrap().clone();
+        assert_eq!(seen.iter().filter(|(m, _)| m == "eth_getStorageAt").count(), 30, "the refused account's 30 values, one read each");
+        assert!(seen.iter().all(|(_, b)| *b == tag(123).to_string()), "every read at the same block: {seen:?}");
+        assert!(READ_PLAIN_BIG.load(Ordering::Relaxed) >= before + 30);
+        assert!(proof_too_big("eth_getproof: response too large (code -32003)"));
+        assert!(!proof_too_big("execution reverted"));
     }
 }

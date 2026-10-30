@@ -778,6 +778,10 @@ pub struct C2Shared {
     /// missed slot is, the unfollowed V4 pools checks run into, and the
     /// auto-follow list (status `v4Blind`). Lock order: after `reg`.
     pub pm_book: Mutex<super::v4blind::PmBook>,
+    /// (Oct 30) FAST LANE FILLS (fastlane/c2runner.rs FastFillBook): what
+    /// the fast lane's own "miss" answers asked copy 2 to fetch (each value
+    /// at most once per window, a hard hourly cap).
+    pub fastlane_fill: Mutex<crate::fastlane::c2runner::FastFillBook>,
 }
 
 /// See C2Shared::recent_moves. Kept for the last RECENT_MOVES_BLOCKS blocks.
@@ -2273,6 +2277,7 @@ pub fn manual(sh: Arc<Shared>, fills: Arc<FillQueue>, cfg: C2Config) -> (Intake,
         warm: Mutex::new(super::warm::WarmState::new(super::warm::WarmCfg::from_env())),
         warm_t0: Instant::now(),
         pm_book: Mutex::new(super::v4blind::PmBook::new(cfg.blind.clone())),
+        fastlane_fill: Mutex::new(crate::fastlane::c2runner::FastFillBook::from_env()),
     });
     let loaders = sh
         .node
