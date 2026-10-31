@@ -279,11 +279,16 @@ pub struct AheadCfg {
     /// its runs lacked. Default: on with FASTLANE_AHEAD=observe, off with
     /// FASTLANE_AHEAD=on (unchanged), unless set.
     pub keeper: bool,
+    /// FASTLANE_AHEAD_KEEP_PICK [on] (ahead3, Oct 31; only with the keeper
+    /// and FASTLANE_AHEAD_UNKNOWN_CONTINUE): also run feed transactions
+    /// whose target is a contract the keeper holds, so the kept values
+    /// they change stay current inside the prediction.
+    pub keep_pick: bool,
 }
 
 impl Default for AheadCfg {
     fn default() -> Self {
-        AheadCfg { max_blocks: 32, run_all: false, max_txs: 256, max_touchers: 4096, l2_offset: 0, trust_sender_funds: false, msg_budget_us: 10_000, routes_only: true, compare_delay: 0, revert_unsure: true, unknown_continue: false, keeper: false }
+        AheadCfg { max_blocks: 32, run_all: false, max_txs: 256, max_touchers: 4096, l2_offset: 0, trust_sender_funds: false, msg_budget_us: 10_000, routes_only: true, compare_delay: 0, revert_unsure: true, unknown_continue: false, keeper: false, keep_pick: true }
     }
 }
 
@@ -365,6 +370,7 @@ impl AheadCfg {
             // decision); FASTLANE_AHEAD=on keeps the old rule unless set.
             unknown_continue: on_off(get("FASTLANE_AHEAD_UNKNOWN_CONTINUE").as_deref()).unwrap_or(observe),
             keeper: on_off(get("FASTLANE_AHEAD_KEEPER").as_deref()).unwrap_or(observe),
+            keep_pick: on_off(get("FASTLANE_AHEAD_KEEP_PICK").as_deref()).unwrap_or(d.keep_pick),
         }
     }
 }
@@ -994,6 +1000,17 @@ pub struct TxNote {
     pub pools: Vec<String>,
 }
 
+impl TxNote {
+    /// The fate in one word, "reverted" for a run that reverted.
+    pub fn fate_str(&self) -> &'static str {
+        if self.fate == Fate::Ran && !self.ok {
+            "reverted"
+        } else {
+            self.fate.as_str()
+        }
+    }
+}
+
 /// A predicted block waiting for its agreement (FASTLANE_AHEAD_COMPARE_DELAY_BLOCKS).
 struct Pending {
     seq: u64,
@@ -1097,6 +1114,9 @@ pub struct AheadStats {
     /// Review M3: transactions picked because they pay ETH and name a
     /// native-ETH pool's other coin.
     pub native_picks: u64,
+    /// KEEPER (ahead3): transactions picked because their target is a
+    /// contract the keeper holds.
+    pub kept_picks: u64,
     /// Practice fixes (Oct 27): transactions not run because they name only
     /// pools no scanner route uses (those pools marked unsure instead).
     pub txs_off_route: u64,
@@ -1208,7 +1228,7 @@ impl AheadStats {
             "agree": self.agree, "disagree": self.disagree, "missed": self.missed, "phantom": self.phantom,
             "valueDiff": self.value_diff, "unsure": self.unsure, "unpredicted": self.unpredicted,
             "compared": self.compared, "msgsStopped": self.msgs_stopped, "overBudget": self.over_budget,
-            "failedUnknown": self.failed_unknown, "assumedUnsure": self.assumed_unsure, "nativePicks": self.native_picks,
+            "failedUnknown": self.failed_unknown, "assumedUnsure": self.assumed_unsure, "nativePicks": self.native_picks, "keptPicks": self.kept_picks,
             "txsOffRoute": self.txs_off_route, "probesSkipped": self.probes_skipped, "v4Fallback": self.v4_fallback,
             "revertsMarked": self.reverts_marked, "revertsKept": self.reverts_kept,
             "missedFilter": self.missed_filter, "missedRan": self.missed_ran, "missedOffRoute": self.missed_off_route, "notFromTx": self.not_from_tx,
@@ -1381,6 +1401,10 @@ pub struct Ahead {
     /// keeper: whether it held the missing value's contract) and what made
     /// each compared pool unsure (cause -> count). None live.
     pub diag: Option<(BTreeMap<String, u64>, BTreeMap<String, u64>)>,
+    /// Offline replay only (`ahead-replay --oracle`): explains each reverted
+    /// run against the chain's exact starting state (copy2/keeper_replay.rs
+    /// Oracle). None live.
+    pub oracle: Option<super::keeper_replay::Oracle>,
     pub hour: AheadStats,
     pub total: AheadStats,
 }
@@ -1406,6 +1430,7 @@ impl Ahead {
             last_probe: None,
             collect_all: None,
             diag: None,
+            oracle: None,
             hour: AheadStats::default(),
             total: AheadStats::default(),
         }
@@ -1490,7 +1515,7 @@ impl Ahead {
     }
 
     /// KEEPER: lay the keeper's version of the base block over the base
-    /// (copy2/keeper.rs merge_base: copy 2's exact values always win).
+    /// (copy2/keeper.rs merge_base: the keeper's exact values win).
     /// Returns whether the merged base changed.
     fn remerge(&mut self) -> bool {
         let Some(base) = &self.base else { return false };
@@ -1553,14 +1578,22 @@ impl Ahead {
 
     /// KEEPER learning: what one run lacked / read approximately. Only
     /// with the keeper on; bounded (the runtime empties it every wake-up).
-    fn learn_from_run(&mut self, missing: &[crate::state::MissItem], view: &dyn StateRead, prov: &dyn Provenance, sender: Address) {
+    fn learn_from_run(&mut self, missing: &[crate::state::MissItem], view: &dyn StateRead, prov: &dyn Provenance, sender: Address, reverted: bool) {
         if !self.cfg.keeper || self.learned.len() >= 4096 {
             return;
         }
         let probe = self.last_probe.take();
         let pools = self.pools.clone();
         let skip = |a: &Address| pools.by_contract.contains_key(a);
-        let items = super::keeper::wanted_items(missing, probe.as_ref().map(|r| (&r.accounts, &r.slots)), view, prov, sender, &skip);
+        let mut items = super::keeper::wanted_items(missing, probe.as_ref().map(|r| (&r.accounts, &r.slots)), view, prov, sender, &skip);
+        // A REVERTED run whose sender's balance copy 2 holds only
+        // approximately (copy 2 never charges gas): the keeper learns the
+        // sender's exact basics too (ahead3, Oct 31: the commonest reason a
+        // run reverted while the real one succeeded was "OutOfFunds" on a
+        // stale sender balance).
+        if reverted && !prov.balance_exact(sender) && !matches!(view.account(sender), Lookup::Missing) {
+            items.push(crate::state::MissItem::Account(sender));
+        }
         self.count(|s| s.learned += items.len() as u64);
         self.learned.extend(items);
     }
@@ -2212,7 +2245,16 @@ impl Ahead {
             let named_now = if self.cfg.run_all { Named::default() } else { pools.scan(&t.data) };
             let native = if self.cfg.run_all { Vec::new() } else { pools.named_native(t.value, &named_now) };
             let toucher = t.to.is_some_and(|a| self.touchers.contains_key(&a));
-            let plain = self.cfg.run_all || pools.may_touch(t.to, &named_now) || toucher;
+            // KEEPER (ahead3): a transaction to a contract the keeper holds
+            // changes values the later runs read (a rival bot's own state):
+            // run it so they stay current. Only when an unrunnable one can be
+            // predicted past (FASTLANE_AHEAD_UNKNOWN_CONTINUE), so it never
+            // adds stops.
+            let kept_target = self.cfg.keep_pick && self.cfg.unknown_continue && t.to.is_some_and(|a| self.merged.as_ref().is_some_and(|m| m.kept.accounts.contains_key(&a)));
+            if kept_target && !toucher {
+                self.count(|s| s.kept_picks += 1);
+            }
+            let plain = self.cfg.run_all || pools.may_touch(t.to, &named_now) || toucher || kept_target;
             if !plain && !native.is_empty() {
                 self.count(|s| s.native_picks += 1);
             }
@@ -2266,6 +2308,25 @@ impl Ahead {
                     // (see AheadCfg). Worked out on the copy BEFORE its
                     // (gas / nonce only) changes are kept, like a failed run.
                     let revert_hit = if !ok && self.cfg.revert_unsure { Some(self.guess_touched(&ov, &ctx, t, &pools, &named_now, &native, false)) } else { None };
+                    // ORACLE (offline replay only): why did it revert / did
+                    // it move what the exact run moves?
+                    if self.oracle.is_some() {
+                        let merged = &self.merged;
+                        let role = |a: &Address| role_name(&pools, t.to, a);
+                        let src = |a: &Address, s: Option<&U256>| oracle_src(merged, base_prov.as_ref(), a, s);
+                        let moved_of = |o: &crate::check::ordered::OrderedOut| pools.moved.moved(&o.changed, &o.hashes).into_iter().map(|x| x.key).collect::<Vec<String>>();
+                        let c = super::keeper_replay::OracleCtx { ov: &ov, plan: &plan, prov: base_prov.as_ref(), assume: &assume, t, base_block: base.seq + self.cfg.l2_offset, role: &role, src: &src, moved: &moved_of };
+                        if let Some(o) = self.oracle.as_mut() {
+                            for n in &notes {
+                                o.fates.insert(n.hash, n.fate_str());
+                            }
+                            if ok {
+                                o.ran_check(&c, &moved_of(&out));
+                            } else {
+                                o.revert_cause(&c, why.as_deref().unwrap_or(""), &out.assumed.labels().join(","), revert_hit.as_ref().map_or(0, |h| h.len() as u64));
+                            }
+                        }
+                    }
                     // KEEPER: a reverted run often read a value copy 2 only
                     // holds approximately (a bot's settings, a coin balance):
                     // the keeper learns what its collect run read.
@@ -2273,7 +2334,7 @@ impl Ahead {
                         if revert_hit.is_none() && self.cfg.keeper {
                             self.last_probe = probe_reads(&ov, &ctx, t);
                         }
-                        self.learn_from_run(&[], &ov, base_prov.as_ref(), t.from);
+                        self.learn_from_run(&[], &ov, base_prov.as_ref(), t.from, true);
                     }
                     ov.commit(&kept.diff);
                     for (a, s) in &kept.forget {
@@ -2338,7 +2399,8 @@ impl Ahead {
                             (Some(_), Some(_)) => " [keeper does not hold it]",
                             _ => "",
                         };
-                        let k = format!("{why}{kept}");
+                        let detail = u.missing.first().map(|m| miss_detail(&ov, &pools, m)).unwrap_or("");
+                        let k = format!("{why}{kept}{detail}");
                         if let Some(d) = self.diag.as_mut() {
                             *d.0.entry(k).or_default() += 1;
                         }
@@ -2349,9 +2411,21 @@ impl Ahead {
                     // target has no code in our copy (it could only read
                     // zero there and stop: nothing of ours, same answer).
                     let hit = self.guess_touched(&ov, &ctx, t, &pools, &named_now, &native, true);
+                    // ORACLE (offline replay only): did the guess cover what
+                    // the real transaction moved?
+                    if self.oracle.is_some() {
+                        let merged = &self.merged;
+                        let role = |a: &Address| role_name(&pools, t.to, a);
+                        let src = |a: &Address, s: Option<&U256>| oracle_src(merged, base_prov.as_ref(), a, s);
+                        let moved_of = |o: &crate::check::ordered::OrderedOut| pools.moved.moved(&o.changed, &o.hashes).into_iter().map(|x| x.key).collect::<Vec<String>>();
+                        let c = super::keeper_replay::OracleCtx { ov: &ov, plan: &plan, prov: base_prov.as_ref(), assume: &assume, t, base_block: base.seq + self.cfg.l2_offset, role: &role, src: &src, moved: &moved_of };
+                        if let Some(o) = self.oracle.as_mut() {
+                            o.failed_check(&c, &why, &hit);
+                        }
+                    }
                     // KEEPER: the values it lacked (and what its collect run
                     // read that we don't hold exactly) are learned.
-                    self.learn_from_run(&u.missing, &ov, base_prov.as_ref(), t.from);
+                    self.learn_from_run(&u.missing, &ov, base_prov.as_ref(), t.from, false);
                     if hit.is_empty() {
                         if !self.cfg.unknown_continue {
                             return Err("failed_tx_unknown_effect");
@@ -2382,6 +2456,11 @@ impl Ahead {
                     mark_unsure(&mut ov, &mut changed, &mut changed_cum, &mut unsure_cum, &hit);
                     notes.push(note(t, Fate::Failed, false, Some(why), hit));
                 }
+            }
+        }
+        if let Some(o) = self.oracle.as_mut() {
+            for n in &notes {
+                o.fates.insert(n.hash, n.fate_str());
             }
         }
         changed.sort();
@@ -2513,6 +2592,11 @@ impl Settled {
     }
 }
 
+/// A run's revert reason in short words (replay diagnostics).
+pub fn revert_text(o: &crate::check::CallOutcome) -> String {
+    revert_why(o)
+}
+
 /// Why our run of a feed transaction reverted / halted (short, groupable).
 fn revert_why(o: &crate::check::CallOutcome) -> String {
     if let Some(h) = &o.halt {
@@ -2534,19 +2618,7 @@ fn revert_why(o: &crate::check::CallOutcome) -> String {
 /// Why a feed transaction could not be run exactly (short, groupable:
 /// addresses named by role, never printed).
 fn failed_why(u: &crate::check::CheckUnknown, to: Option<Address>, pools: &PoolSet) -> String {
-    let role = |a: &Address| {
-        if Some(*a) == to {
-            "target"
-        } else if pools.by_contract.contains_key(a) {
-            "a pool"
-        } else if pools.idx.pms.contains(a) {
-            "the V4 PoolManager"
-        } else if pools.idx.role(a) & ROLE_COIN != 0 {
-            "a coin"
-        } else {
-            "another contract"
-        }
-    };
+    let role = |a: &Address| role_name(pools, to, a);
     let first = u.missing.first().map(|m| match m {
         crate::state::MissItem::Account(a) => format!("{} account", role(a)),
         crate::state::MissItem::Slot(a, _) => format!("a value of {}", role(a)),
@@ -2555,6 +2627,60 @@ fn failed_why(u: &crate::check::CheckUnknown, to: Option<Address>, pools: &PoolS
     match first {
         Some(f) => format!("{}: {f}", u.reason.as_str()),
         None => format!("{}: {}", u.reason.as_str(), u.detail.chars().take(60).collect::<String>()),
+    }
+}
+
+/// Replay diagnostics: was the missing value one the prediction itself
+/// forgot earlier (a pool marked unsure), and is it one of our V4 pools'
+/// own values?
+fn miss_detail(ov: &Overlay, pools: &PoolSet, m: &crate::state::MissItem) -> &'static str {
+    match m {
+        crate::state::MissItem::Slot(a, s) => {
+            let ours_v4 = pools.idx.pms.contains(a) && (0..4u64).any(|k| s.checked_sub(U256::from(k)).is_some_and(|b| pools.v4_slot0.contains_key(&(*a, b))));
+            let forgot = ov.forgotten().contains(&(*a, *s)) || ov.changes().accounts.get(a).is_some_and(|d| d.forget);
+            match (ours_v4, forgot) {
+                (true, true) => " {our V4 pool, forgotten earlier}",
+                (true, false) => " {our V4 pool}",
+                (false, true) => " {forgotten earlier}",
+                (false, false) if pools.idx.pms.contains(a) => " {another V4 pool's value}",
+                _ => "",
+            }
+        }
+        crate::state::MissItem::Account(a) => {
+            if ov.changes().accounts.get(a).is_some_and(|d| d.forget) {
+                " {forgotten earlier}"
+            } else {
+                ""
+            }
+        }
+        crate::state::MissItem::Code(_) => "",
+    }
+}
+
+/// ORACLE: where the prediction's base value of (a, s) came from (s None =
+/// the account's basics).
+fn oracle_src(merged: &Option<Merged>, prov: &dyn Provenance, a: &Address, s: Option<&U256>) -> &'static str {
+    match (merged, s) {
+        (Some(m), Some(s)) if m.kept.holds_slot(a, s) => "keeper",
+        (Some(m), None) if m.kept.holds_basics(a) => "keeper",
+        (_, Some(s)) if prov.slot_exact(*a, *s) => "copy 2 exact",
+        (_, None) if prov.balance_exact(*a) => "copy 2 exact",
+        _ => "copy 2 approximate",
+    }
+}
+
+/// An address named by its role for a transaction to `to` (groupable).
+fn role_name(pools: &PoolSet, to: Option<Address>, a: &Address) -> &'static str {
+    if Some(*a) == to {
+        "target"
+    } else if pools.by_contract.contains_key(a) {
+        "a pool"
+    } else if pools.idx.pms.contains(a) {
+        "the V4 PoolManager"
+    } else if pools.idx.role(a) & ROLE_COIN != 0 {
+        "a coin"
+    } else {
+        "another contract"
     }
 }
 
@@ -3219,5 +3345,7 @@ mod tests {
         assert!(!get(vec![("FASTLANE", "practice"), ("FASTLANE_AHEAD_TRUST_SENDER_FUNDS", "off")]).trust_sender_funds, "an explicit off wins");
         assert!(get(vec![("FASTLANE", "live"), ("FASTLANE_AHEAD_TRUST_SENDER_FUNDS", "on")]).trust_sender_funds);
         assert!(get(vec![]).routes_only && !get(vec![("FASTLANE_AHEAD_ROUTES_ONLY", "off")]).routes_only);
+        // ahead3: picking keeper-held targets is on unless switched off.
+        assert!(get(vec![]).keep_pick && !get(vec![("FASTLANE_AHEAD_KEEP_PICK", "off")]).keep_pick);
     }
 }

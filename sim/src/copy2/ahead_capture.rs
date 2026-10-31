@@ -45,7 +45,7 @@
 //   and says so (an incomplete file is refused by the replay unless asked).
 //
 //   REPLAY: `arbsim ahead-replay <capture file> [--json] [--samples N]
-//   [--budget-ms N] [--partial] [--revert-sure] [--sender-funds trusted|strict] [--unknown-continue] [--keeper <truth file> [--keeper-warm [--keeper-warm-passes N]] [--keep-contracts N] [--keep-seeds-per-h N]]`
+//   [--budget-ms N] [--partial] [--revert-sure] [--sender-funds trusted|strict] [--unknown-continue] [--keeper <truth file> [--keeper-warm [--keeper-warm-passes N]] [--keep-contracts N] [--keep-seeds-per-h N] [--oracle]] [--filter-all] [--no-keep-pick]`
 //     Builds a fresh predicted copy, feeds it the capture event by event and
 //     prints: agreement % (agree / (agree + disagree), per pool compared),
 //     the disagreement breakdown by cause (missedFilter / missedRan /
@@ -429,6 +429,8 @@ fn dec_cfg(d: &mut Dec) -> Res<AheadCfg> {
         unknown_continue: false,
         // Not in the file: `--keeper <truth file>` (Oct 31).
         keeper: false,
+        // Not in the file: `--no-keep-pick` turns it off (ahead3).
+        keep_pick: true,
     })
 }
 
@@ -987,6 +989,14 @@ pub struct ReplayOpts {
     /// FASTLANE_AHEAD_UNKNOWN_CONTINUE for this replay (`--unknown-continue`;
     /// off = stop the prediction, the rule the capture ran with).
     pub unknown_continue: bool,
+    /// `--oracle` (needs `--keeper <truth>`): explain every reverted run
+    /// against the chain's exact starting state (keeper_replay.rs Oracle).
+    pub oracle: bool,
+    /// `--filter-all`: run EVERY feed transaction (FASTLANE_AHEAD_FILTER=all),
+    /// not only the ones the cheap filter picks.
+    pub filter_all: bool,
+    /// `--no-keep-pick`: FASTLANE_AHEAD_KEEP_PICK=off for this replay.
+    pub no_keep_pick: bool,
 }
 
 /// Replay a capture through a fresh predicted copy. Returns the report
@@ -1024,6 +1034,20 @@ pub fn replay_keeper(cap: &CapFile, opts: &ReplayOpts, truth: Arc<super::keeper_
     Ok(r)
 }
 
+/// What `passes` predicted-copy passes with the keeper learn over the
+/// capture (each pass starting with the earlier ones' learning): the warm
+/// start for `trig-replay --keeper` (fastlane/trig_replay.rs).
+pub fn keeper_learned(cap: &CapFile, truth: Arc<super::keeper_replay::Truth>, cfg: super::keeper::KeeperCfg, passes: usize) -> Result<Vec<Vec<crate::state::MissItem>>, String> {
+    let opts = ReplayOpts { unknown_continue: true, ..Default::default() };
+    let mut acc: Vec<Vec<crate::state::MissItem>> = Vec::new();
+    for _ in 0..passes {
+        let warm = if acc.is_empty() { None } else { Some(acc.clone()) };
+        let (_, rk) = replay_with(cap, &opts, Some(KeeperOpts { truth: truth.clone(), cfg: cfg.clone(), warm }))?;
+        acc.extend(rk.map(|k| k.learned_all).unwrap_or_default());
+    }
+    Ok(acc)
+}
+
 fn replay_with(cap: &CapFile, opts: &ReplayOpts, keeper: Option<KeeperOpts>) -> Result<(Value, Option<super::keeper_replay::ReplayKeeper>), String> {
     let t0 = Instant::now();
     let Some(CapEv::Header { cfg, l2_offset, live: live_start }) = cap.events.first().cloned() else {
@@ -1040,10 +1064,21 @@ fn replay_with(cap: &CapFile, opts: &ReplayOpts, keeper: Option<KeeperOpts>) -> 
         cfg.trust_sender_funds = v;
     }
     cfg.unknown_continue = opts.unknown_continue;
+    if opts.filter_all {
+        cfg.run_all = true;
+    }
+    if opts.no_keep_pick {
+        cfg.keep_pick = false;
+    }
     cfg.keeper = keeper.is_some();
     let l2 = cfg.l2_offset;
     let mut a = Ahead::new(cfg);
     a.diag = Some(Default::default());
+    if opts.oracle {
+        if let Some(k) = &keeper {
+            a.oracle = Some(super::keeper_replay::Oracle::new(k.truth.clone()));
+        }
+    }
     // KEEPER (--keeper): the real keeper core on the recorded block diffs.
     let mut rk = keeper.map(|k| {
         let mut r = super::keeper_replay::ReplayKeeper::new(k.truth, k.cfg);
@@ -1139,6 +1174,9 @@ fn replay_with(cap: &CapFile, opts: &ReplayOpts, keeper: Option<KeeperOpts>) -> 
             v.into_iter().take(12).map(|(k, n)| json!({"what": k, "n": n})).collect::<Vec<_>>()
         };
         r["diag"] = json!({"failedRuns": top(fails), "unsurePools": top(unsure)});
+    }
+    if let Some(o) = &a.oracle {
+        r["oracle"] = o.report();
     }
     let rk = rk.map(|x| x.0);
     if let Some(k) = &rk {
@@ -1338,6 +1376,18 @@ pub fn print_report(r: &Value, samples: usize) -> String {
             }
         }
     }
+    if let Some(v) = r["oracle"]["revertCauses"].as_array().filter(|v| !v.is_empty()) {
+        o += "ORACLE: our runs vs the chain's exact starting state (distinct txs / runs / pools):\n";
+        for x in v {
+            o += &format!("  {:>4} {:>5} {:>6}  {}\n", x["txs"], x["runs"], x["pools"], x["what"].as_str().unwrap_or(""));
+        }
+        if let Some(v) = r["oracle"]["revertSplit"].as_array() {
+            o += "ORACLE: reverted runs by what we knew (distinct txs):\n";
+            for x in v.iter().take(30) {
+                o += &format!("  {:>4}  {}\n", x["txs"], x["what"].as_str().unwrap_or(""));
+            }
+        }
+    }
     if r["liveSameStretch"].is_object() {
         let l = &r["liveSameStretch"];
         o += &format!(
@@ -1356,10 +1406,10 @@ pub fn print_report(r: &Value, samples: usize) -> String {
     o
 }
 
-/// `arbsim ahead-replay <capture file> [--json] [--samples N] [--budget-ms N] [--partial] [--revert-sure] [--sender-funds trusted|strict] [--unknown-continue] [--keeper <truth file> [--keeper-warm [--keeper-warm-passes N]] [--keep-contracts N] [--keep-seeds-per-h N]]`
+/// `arbsim ahead-replay <capture file> [--json] [--samples N] [--budget-ms N] [--partial] [--revert-sure] [--sender-funds trusted|strict] [--unknown-continue] [--keeper <truth file> [--keeper-warm [--keeper-warm-passes N]] [--keep-contracts N] [--keep-seeds-per-h N] [--oracle]] [--filter-all] [--no-keep-pick]`
 pub fn replay_main(args: &[String]) {
     let Some(path) = args.get(2).filter(|a| !a.starts_with("--")) else {
-        eprintln!("usage: arbsim ahead-replay <capture file> [--json] [--samples N] [--budget-ms N] [--partial] [--revert-sure] [--sender-funds trusted|strict] [--unknown-continue] [--keeper <truth file> [--keeper-warm [--keeper-warm-passes N]] [--keep-contracts N] [--keep-seeds-per-h N]]");
+        eprintln!("usage: arbsim ahead-replay <capture file> [--json] [--samples N] [--budget-ms N] [--partial] [--revert-sure] [--sender-funds trusted|strict] [--unknown-continue] [--keeper <truth file> [--keeper-warm [--keeper-warm-passes N]] [--keep-contracts N] [--keep-seeds-per-h N] [--oracle]] [--filter-all] [--no-keep-pick]");
         std::process::exit(2);
     };
     let arg = |f: &str| args.iter().position(|a| a == f).and_then(|i| args.get(i + 1)).and_then(|v| v.parse::<u64>().ok());
@@ -1389,6 +1439,9 @@ pub fn replay_main(args: &[String]) {
         revert_unsure: args.iter().any(|a| a == "--revert-sure").then_some(false),
         trust_sender_funds,
         unknown_continue: args.iter().any(|a| a == "--unknown-continue"),
+        oracle: args.iter().any(|a| a == "--oracle"),
+        filter_all: args.iter().any(|a| a == "--filter-all"),
+        no_keep_pick: args.iter().any(|a| a == "--no-keep-pick"),
     };
     // KEEPER (Oct 31): --keeper <truth file> [--keeper-warm [--keeper-warm-passes N]] [--keep-contracts N]
     // [--keep-seeds-per-h N]: the hot-contract keeper on recorded block diffs.

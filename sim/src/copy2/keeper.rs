@@ -29,8 +29,12 @@
 //        hold is exact at the keeper's block or not served at all.
 //     5. SERVE. The predicted copy asks for the keeper's version of its
 //        base block (exactly that block, never another one) and lays the
-//        held values over copy 2's (copy 2's own exact values always win),
-//        marking them exact (KeptProv).
+//        held values over copy 2's (the keeper's exact value wins where the
+//        two differ, ahead3), marking them exact (KeptProv).
+//     6. ADOPT (ahead3, FASTLANE_AHEAD_KEEP_ADOPT [on]): a value a block
+//        writes in a kept contract becomes kept too (exact from the diff,
+//        no node call); a contract created at a kept address is seeded
+//        again with its code (diffs come without code).
 //
 //   SAFETY (fail closed):
 //     - Bounded memory: at most FASTLANE_AHEAD_KEEP_CONTRACTS contracts,
@@ -87,8 +91,14 @@ pub struct KeeperCfg {
     pub max_contracts: usize,
     /// FASTLANE_AHEAD_KEEP_SLOTS [2000]: most values kept per contract.
     pub max_slots_per: usize,
-    /// FASTLANE_AHEAD_KEEP_MAX_SLOTS [60000]: most values kept in all.
+    /// FASTLANE_AHEAD_KEEP_MAX_SLOTS [200000]: most values kept in all.
     pub max_slots_total: usize,
+    /// FASTLANE_AHEAD_KEEP_ADOPT [on]: a value a block WRITES in a contract
+    /// we keep becomes kept too (its new value is in the block's changes,
+    /// exact, at no node cost). So the busy contracts' (the V4 PoolManager:
+    /// every tick a swap crosses) values fill in by themselves. Up to 10x
+    /// FASTLANE_AHEAD_KEEP_SLOTS per contract, within the overall limit.
+    pub adopt_writes: bool,
     /// Block versions kept for the predicted copy (and block changes kept
     /// for seeds that come back a few blocks late).
     pub versions: usize,
@@ -113,7 +123,8 @@ impl Default for KeeperCfg {
             on: false,
             max_contracts: 50,
             max_slots_per: 2000,
-            max_slots_total: 60_000,
+            max_slots_total: 200_000,
+            adopt_writes: true,
             versions: 64,
             seeds_per_hour: 0,
             audit_s: 60,
@@ -136,6 +147,7 @@ impl KeeperCfg {
             max_contracts: num("FASTLANE_AHEAD_KEEP_CONTRACTS", d.max_contracts as u64, 1, 1000) as usize,
             max_slots_per: num("FASTLANE_AHEAD_KEEP_SLOTS", d.max_slots_per as u64, 1, 100_000) as usize,
             max_slots_total: num("FASTLANE_AHEAD_KEEP_MAX_SLOTS", d.max_slots_total as u64, 1, 2_000_000) as usize,
+            adopt_writes: super::ahead::on_off(get("FASTLANE_AHEAD_KEEP_ADOPT").as_deref()).unwrap_or(d.adopt_writes),
             versions: d.versions,
             seeds_per_hour: d.seeds_per_hour,
             audit_s: num("FASTLANE_AHEAD_KEEP_AUDIT_S", d.audit_s, 0, 86_400),
@@ -197,12 +209,19 @@ pub struct MergeCounts {
     pub slots: usize,
     pub basics: usize,
     pub codes: usize,
+    /// Copy-2 accounts held as "every slot known" but with approximate
+    /// basics, replaced whole by the keeper's exact account.
+    pub replaced: usize,
+    /// Values copy 2 called exact that the keeper's (exact) value replaced.
+    pub overrode: usize,
 }
 
 /// Copy 2's snapshot of block N with the keeper's values of block N laid
-/// over it. Copy 2's EXACT values always win (they come from our pools'
-/// own reports); where copy 2 holds nothing, or only an approximate value
-/// (a fill re-read now and then), the keeper's exact value is used.
+/// over it. Where the keeper holds a value it is used (ahead3, Oct 31: the
+/// keeper's values are the node's own of exactly block N, audited; copy 2's
+/// "exact" values could lag a late report, and copy 2 counts outside
+/// contracts' ETH balances as exact while it never replays their other
+/// transactions). Everything else stays copy 2's.
 /// Never-trusted ("volatile") accounts are left alone (always Missing).
 pub fn merge_base(base: &Snapshot, prov: &dyn Provenance, kv: &KeptVersion) -> (Snapshot, MergeCounts) {
     let mut out = base.clone();
@@ -219,20 +238,47 @@ pub fn merge_base(base: &Snapshot, prov: &dyn Provenance, kv: &KeptVersion) -> (
                 out.accounts.insert(*a, k.clone());
             }
             // Copy 2 knows every slot of it (created in front of us / does
-            // not exist): nothing to add.
-            Some(c) if c.storage_complete => {}
+            // not exist): nothing to add, UNLESS copy 2's basics are only
+            // approximate and the keeper's are exact (ahead3, Oct 31): copy 2
+            // still held new launch tokens as "does not exist" (an old
+            // look), while the keeper's exact values say they exist. Then
+            // the keeper's account replaces copy 2's whole (a value the
+            // keeper doesn't hold reads as missing, never as zero).
+            Some(c) if c.storage_complete => {
+                let kb = matches!(k.basics, Basics::Known(_));
+                let c_exact = matches!(c.basics, Basics::Known(_)) && c.balance_exact && prov.balance_exact(*a) && c.basics == k.basics;
+                if kb && !c_exact {
+                    n.accounts += 1;
+                    n.slots += k.storage.len();
+                    n.basics += 1;
+                    n.replaced += 1;
+                    out.accounts.insert(*a, k.clone());
+                }
+            }
             Some(c) => {
                 let mut m = c.clone();
                 let mut added = 0;
                 for (s, v) in k.storage.iter() {
-                    if c.storage.contains_key(s) && prov.slot_exact(*a, *s) {
+                    // KEEPER WINS (ahead3, Oct 31): the keeper's value is the
+                    // node's own, of exactly this block (audited: 0 wrong in
+                    // millions of checks). Copy 2's "exact" can lag (a late
+                    // report, a value it re-derives): when the two differ,
+                    // the keeper's is used.
+                    if c.storage.get(s) == Some(v) {
                         continue;
+                    }
+                    if c.storage.contains_key(s) && prov.slot_exact(*a, *s) {
+                        n.overrode += 1;
                     }
                     m.storage.insert(*s, *v);
                     added += 1;
                 }
                 let kb = matches!(k.basics, Basics::Known(_));
-                let c_exact = matches!(c.basics, Basics::Known(_)) && c.balance_exact && prov.balance_exact(*a);
+                // Copy 2 counts a contract's ETH balance as exact, but it
+                // never replays the transactions of pools it doesn't follow
+                // (the V4 PoolManager's ETH moves with every native swap):
+                // the keeper's basics win whenever it holds them.
+                let c_exact = matches!(c.basics, Basics::Known(_)) && c.balance_exact && prov.balance_exact(*a) && c.basics == k.basics;
                 if kb && !c_exact {
                     m.basics = k.basics.clone();
                     m.balance_exact = true;
@@ -301,6 +347,11 @@ pub struct KeeperStats {
     pub seed_values: u64,
     pub seeds_dropped: u64,
     pub evicted: u64,
+    /// Held accounts a block CREATED (a contract deployed at an address we
+    /// held as empty): dropped and seeded again, with their code.
+    pub recreated: u64,
+    /// Values adopted because a block wrote them (FASTLANE_AHEAD_KEEP_ADOPT).
+    pub adopted: u64,
     pub refused_full: u64,
     pub audits: u64,
     pub audit_values: u64,
@@ -325,7 +376,7 @@ impl KeeperStats {
         json!({
             "blocks": self.blocks, "heldTouched": self.held_touched, "valuesUpdated": self.values_updated,
             "learned": self.learned, "seedsSent": self.seeds_sent, "seedValues": self.seed_values, "seedsDropped": self.seeds_dropped,
-            "evicted": self.evicted, "refusedFull": self.refused_full,
+            "evicted": self.evicted, "recreated": self.recreated, "adopted": self.adopted, "refusedFull": self.refused_full,
             "audits": self.audits, "auditValues": self.audit_values, "auditMismatch": self.audit_mismatch,
             "resets": self.resets.iter().map(|(k, v)| (k.to_string(), json!(v))).collect::<serde_json::Map<String, Value>>(),
             "applyUs": crate::timing::pct_of(&mut t),
@@ -669,13 +720,45 @@ impl KeeperCore {
         }
         let mut touched = 0u64;
         let mut updated = 0u64;
+        let mut recreate: Vec<Address> = Vec::new();
+        // ADOPT (FASTLANE_AHEAD_KEEP_ADOPT): room left for written values.
+        let mut total = if self.cfg.adopt_writes { self.cur.slots() } else { 0 };
+        let adopt_per = self.cfg.max_slots_per.saturating_mul(10);
         for (a, ad) in &merged.accounts {
             let Some(cur) = self.cur.accounts.get(a) else { continue };
-            let keys: HashSet<U256> = cur.storage.keys().copied().collect();
+            // A contract CREATED at an address we hold (ahead3 fix): the
+            // block diffs come without code, so its new code is unknown
+            // here. Never hold it code-less: drop it, seed it again (with
+            // its code).
+            if ad.storage_cleared && matches!(&ad.info, Some(Some(i)) if i.code_hash.is_zero() || i.code_hash != KECCAK_EMPTY && ad.code.is_none() && !self.cur.codes.contains_key(&i.code_hash)) {
+                recreate.push(*a);
+                continue;
+            }
+            let mut keys: HashSet<U256> = cur.storage.keys().copied().collect();
+            if self.cfg.adopt_writes && !cur.storage_complete {
+                for s in ad.storage.keys() {
+                    if keys.len() >= adopt_per || total >= self.cfg.max_slots_total {
+                        break;
+                    }
+                    if keys.insert(*s) {
+                        total += 1;
+                        self.stats.adopted += 1;
+                    }
+                }
+            }
             let next = apply_held(*a, cur, ad, &keys);
             touched += 1;
             updated += ad.storage.keys().filter(|s| keys.contains(s)).count() as u64;
             self.cur.accounts.insert(*a, next);
+        }
+        for a in recreate {
+            self.cur.accounts.remove(&a);
+            self.pending.retain(|(x, _)| *x != a);
+            self.seeds.retain(|j| j.addr != a);
+            self.stats.recreated += 1;
+            // Everything it needed, and always its basics + code.
+            let slots: Vec<U256> = self.cands.get(&a).map(|c| c.slots.iter().copied().collect()).unwrap_or_default();
+            self.queue(a, slots, true);
         }
         self.recent.push_back((block, Arc::new(merged)));
         while self.recent.len() > self.cfg.versions {
@@ -823,7 +906,13 @@ pub fn wanted_items(
     }
     if let Some((accts, slots)) = reads {
         for a in accts {
-            if ok(a) && matches!(view.account(*a), crate::state::Lookup::Missing) {
+            // Missing, or held only approximately (ahead3, Oct 31): copy 2
+            // doesn't follow the balance / nonce of outside accounts (a
+            // launch factory's nonce decides the address its next token
+            // gets; a token copy 2 last saw before it existed reads as
+            // "none"). The keeper's exact basics fix both.
+            let approx = !prov.balance_exact(*a);
+            if ok(a) && (matches!(view.account(*a), crate::state::Lookup::Missing) || approx) {
                 push(MissItem::Account(*a));
             }
         }
@@ -836,8 +925,9 @@ pub fn wanted_items(
     out
 }
 
-/// ArbOS's own state account (0xA4B05FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF).
-fn arbos_state() -> Address {
+/// ArbOS's own state account (0xA4B05FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF),
+/// written by every transaction (gas pricing).
+pub(crate) fn arbos_state() -> Address {
     let mut b = [0xffu8; 20];
     b[0] = 0xa4;
     b[1] = 0xb0;
@@ -1182,7 +1272,9 @@ mod tests {
     /// value the block touched but we never held stays unknown.
     #[test]
     fn held_values_follow_the_blocks_and_unheld_ones_stay_unknown() {
-        let mut k = core(10);
+        // (FASTLANE_AHEAD_KEEP_ADOPT off: with it on, a written value of a
+        // kept contract is adopted; see written_values_of_kept_contracts_are_adopted.)
+        let mut k = KeeperCore::new(KeeperCfg { on: true, max_contracts: 10, adopt_writes: false, ..KeeperCfg::default() });
         k.start_at(100);
         k.learn(&[MissItem::Slot(a(1), u(1)), MissItem::Slot(a(1), u(2))]);
         seed(&mut k, 100);
@@ -1293,10 +1385,10 @@ mod tests {
         assert!(k.take_job().is_some(), "asked again");
     }
 
-    /// Merge: copy 2's exact values win; the keeper fills what copy 2
-    /// lacks or holds only approximately; KeptProv marks them exact.
+    /// Merge: the keeper's values win (also over copy 2's lagging "exact"
+    /// ones and a stale "does not exist"); KeptProv marks them exact.
     #[test]
-    fn merge_keeps_copy2_exact_values_and_adds_the_keepers() {
+    fn merge_prefers_the_keepers_exact_values() {
         struct P;
         impl Provenance for P {
             fn slot_exact(&self, _a: Address, s: U256) -> bool {
@@ -1316,17 +1408,68 @@ mod tests {
         acct.storage.insert(u(3), u(3));
         acct.basics = Basics::Known(Some(AccountInfo { balance: u(7), nonce: 1, code_hash: KECCAK_EMPTY, ..Default::default() }));
         kv.accounts.insert(a(1), acct.clone());
-        kv.accounts.insert(a(2), acct);
+        kv.accounts.insert(a(2), acct.clone());
+        // ahead3: copy 2 holds a(3) as "does not exist, every slot known",
+        // but only approximately (an old look); the keeper says it exists.
+        base.accounts.insert(a(3), Acct { basics: Basics::Known(None), balance_exact: false, storage: PMap::default(), storage_complete: true });
+        kv.accounts.insert(a(3), acct);
         let (m, n) = merge_base(&base, &P, &kv);
         use crate::state::StateRead;
-        assert_eq!(m.storage(a(1), u(1)), crate::state::Lookup::Known(u(111)), "copy 2's exact value wins");
+        assert_eq!(m.storage(a(1), u(1)), crate::state::Lookup::Known(u(1)), "the keeper's exact value wins over copy 2's lagging 'exact' one");
+        assert_eq!(n.overrode, 1);
         assert_eq!(m.storage(a(1), u(2)), crate::state::Lookup::Known(u(2)), "copy 2's approximate value replaced");
         assert_eq!(m.storage(a(1), u(3)), crate::state::Lookup::Known(u(3)));
         assert_eq!(m.storage(a(2), u(3)), crate::state::Lookup::Known(u(3)));
-        assert_eq!(n.accounts, 2);
+        assert!(matches!(m.account(a(3)), crate::state::Lookup::Known(Some(i)) if i.nonce == 1), "a stale 'does not exist' is replaced");
+        assert_eq!(m.storage(a(3), u(9)), crate::state::Lookup::Missing, "and a value the keeper doesn't hold reads missing, not zero");
+        assert_eq!((n.accounts, n.replaced), (3, 1));
         let kp = KeptProv { inner: Arc::new(P), kept: Arc::new(kv) };
         assert!(kp.slot_exact(a(1), u(2)) && kp.slot_exact(a(2), u(3)) && !kp.slot_exact(a(2), u(9)));
         assert!(kp.balance_exact(a(1)));
+    }
+
+    /// ahead3: a block that CREATES a contract at an address we hold (its
+    /// code is not in the block diffs) drops it and seeds it again, code
+    /// and all; it is never held code-less.
+    #[test]
+    fn a_contract_created_at_a_held_address_is_seeded_again() {
+        let mut k = core(10);
+        k.start_at(100);
+        k.learn(&[MissItem::Account(a(7)), MissItem::Slot(a(7), u(1))]);
+        // Seeded while it did not exist yet.
+        while let Some(j) = k.take_job() {
+            let ans = SeedAnswer { addr: j.addr, at: 100, basics: j.basics.then_some(None), code: None, slots: j.slots.iter().map(|s| (*s, U256::ZERO)).collect() };
+            k.on_seed(&j, Some(ans));
+        }
+        assert!(matches!(k.account(&a(7)).unwrap().basics, Basics::Known(None)));
+        // Block 101 deploys it (diff mode, no code: code hash not given).
+        let mut d = StateDiff::default();
+        d.accounts.insert(a(7), AccountDiff { info: Some(Some(AccountInfo { balance: U256::ZERO, nonce: 1, code_hash: B256::ZERO, ..Default::default() })), storage: [(u(1), u(5))].into_iter().collect(), storage_cleared: true, ..Default::default() });
+        k.apply_block(101, &[d]).unwrap();
+        assert!(k.account(&a(7)).is_none(), "dropped, not held code-less");
+        assert_eq!(k.stats.recreated, 1);
+        let j = k.take_job().expect("seeded again");
+        assert!(j.basics && j.slots.contains(&u(1)), "basics (and so its code) asked again");
+    }
+
+    /// ahead3 (FASTLANE_AHEAD_KEEP_ADOPT): a value a block writes in a kept
+    /// contract becomes kept with its exact new value; off = old behaviour.
+    #[test]
+    fn written_values_of_kept_contracts_are_adopted() {
+        for adopt in [true, false] {
+            let mut k = KeeperCore::new(KeeperCfg { on: true, adopt_writes: adopt, ..KeeperCfg::default() });
+            k.start_at(100);
+            k.learn(&[MissItem::Slot(a(1), u(1))]);
+            seed(&mut k, 100);
+            k.apply_block(101, &[slot_diff(a(1), &[(1, 77), (3, 99)]), slot_diff(a(2), &[(4, 4)])]).unwrap();
+            let acct = k.account(&a(1)).unwrap();
+            assert_eq!(acct.storage.get(&u(1)), Some(&u(77)));
+            assert_eq!(acct.storage.get(&u(3)).copied(), adopt.then(|| u(99)), "adopt = {adopt}");
+            assert!(k.account(&a(2)).is_none(), "never a contract we don't keep");
+            // Adopted values follow the next blocks like any other.
+            k.apply_block(102, &[slot_diff(a(1), &[(3, 100)])]).unwrap();
+            assert_eq!(k.account(&a(1)).unwrap().storage.get(&u(3)).copied(), adopt.then(|| u(100)));
+        }
     }
 
     /// Settings: on by default only in observe; numbers are bounded; no
@@ -1351,6 +1494,8 @@ mod tests {
         assert!(!cfg(Some("observe"), Some("off")).on);
         assert_eq!(cfg(Some("observe"), None).max_contracts, 7);
         assert_eq!(cfg(Some("observe"), None).seeds_per_hour, 0, "no self-imposed seed limit live");
+        assert!(cfg(Some("observe"), None).adopt_writes, "adopting written values: on by default");
+        assert!(!KeeperCfg::from_lookup(|k| (k == "FASTLANE_AHEAD_KEEP_ADOPT").then(|| "off".to_string())).adopt_writes);
     }
 
     #[test]
@@ -1393,5 +1538,22 @@ mod tests {
         assert!(has(MissItem::Slot(a(0x20000), u(2))), "only approximate in copy 2");
         assert!(has(MissItem::Slot(a(0x20000), u(3))), "missing");
         assert!(!has(MissItem::Slot(a(0x40000), u(1))), "copy 2 follows it (our pool)");
+        // ahead3: an account copy 2 holds with only approximate basics (a
+        // launch factory's nonce, a token copy 2 saw before it existed).
+        struct Approx;
+        impl Provenance for Approx {
+            fn slot_exact(&self, _a: Address, _s: U256) -> bool {
+                true
+            }
+            fn balance_exact(&self, a: Address) -> bool {
+                a != Address::from_word(B256::from(U256::from(0x70000u64).to_be_bytes::<32>()))
+            }
+        }
+        snap.apply_fact(&crate::state::snap::Fact::Basics { addr: a(0x70000), info: None, code: None });
+        snap.apply_fact(&crate::state::snap::Fact::Basics { addr: a(0x80000), info: None, code: None });
+        let accts: HashSet<Address> = [a(0x70000), a(0x80000)].into_iter().collect();
+        let out = wanted_items(&[], Some((&accts, &HashSet::new())), &snap, &Approx, a(0x60000), &|_| false);
+        assert!(out.contains(&MissItem::Account(a(0x70000))), "approximate basics are learned");
+        assert!(!out.contains(&MissItem::Account(a(0x80000))), "exact ones are not");
     }
 }
