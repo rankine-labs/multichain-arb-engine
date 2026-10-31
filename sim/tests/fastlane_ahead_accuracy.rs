@@ -589,3 +589,91 @@ fn a_failed_sell_for_eth_marks_the_native_pool_and_busy_routers_keep_learning() 
     assert_eq!(un.len(), 64);
     assert!(un.contains(&key(many[69])) && !un.contains(&key(many[0])), "the newest kept, the oldest dropped");
 }
+
+// ---------------------------------------------------------------------------
+// Observe-mode build (Oct 31): FASTLANE_AHEAD=observe and
+// FASTLANE_AHEAD_UNKNOWN_CONTINUE.
+// ---------------------------------------------------------------------------
+
+/// A picked transaction we can't run and that nothing ties to our pools
+/// (its target has no code in our copy, it names nothing of ours): by
+/// default the whole prediction stops (the old rule). With
+/// FASTLANE_AHEAD_UNKNOWN_CONTINUE it goes on, nothing is marked, and a pool
+/// that transaction really moved is counted "missedUnknown".
+#[test]
+fn an_unknown_effect_transaction_stops_by_default_and_is_predicted_past_when_asked() {
+    let ghost = addr(0x1077); // no code in our copy
+    // Default: stops.
+    let mut a = ahead_on(AheadCfg { run_all: true, ..AheadCfg::default() }, copy_at(100, 7));
+    a.on_feed_message(msg(11, &[stx(0, ghost, w(1))]));
+    assert!(a.tip().is_none());
+    assert_eq!(a.stopped().map(|s| s.1), Some("failed_tx_unknown_effect"));
+    // Continue: a tip, nothing unsure, the next transaction runs exactly.
+    let mut a = ahead_on(AheadCfg { run_all: true, unknown_continue: true, ..AheadCfg::default() }, copy_at(100, 7));
+    let g = stx(0, ghost, w(1));
+    a.on_feed_message(msg(11, &[g.clone(), stx(1, pool(), w(5))]));
+    let tip = a.tip().expect("predicted past the unknown-effect transaction");
+    assert!(tip.unsure_pools.is_empty(), "{:?}", tip.unsure_pools);
+    assert_eq!(tip.view().storage(pool(), U256::ZERO), known(105));
+    assert_eq!(a.total.unknown_continued, 1);
+    // On chain the ghost transaction moved POOL2: a sure-but-wrong pool,
+    // counted on its own so the rule is measured.
+    let hg = keccak256(&g);
+    let mut s11 = copy_at(105, 9);
+    s11.apply_fact(&Fact::Slot(pool2(), U256::ZERO, U256::from(9u64)));
+    a.on_confirmed(confirmed(11, Arc::new(s11)), &move |x: &B256| (*x == hg).then(|| vec![key(pool2())]));
+    assert_eq!((a.total.missed_unknown, a.total.missed_failed, a.total.disagree), (1, 0, 1), "{}", a.total.json_with(false));
+    assert_eq!(a.total.samples.last().unwrap()["kind"], "missedUnknown");
+    assert_eq!(a.total.agree, 1, "POOL (moved by the exact run) agrees");
+}
+
+/// FASTLANE_AHEAD words and the per-mode default of
+/// FASTLANE_AHEAD_UNKNOWN_CONTINUE: on in observe (nothing decides on it),
+/// off with on (unchanged semantics), an explicit word always wins.
+#[test]
+fn ahead_mode_words_and_unknown_continue_defaults() {
+    use arbsim::copy2::ahead::{ahead_wanted, AheadMode};
+    assert_eq!(AheadMode::parse(None), AheadMode::Off);
+    assert_eq!(AheadMode::parse(Some("")), AheadMode::Off);
+    assert_eq!(AheadMode::parse(Some("junk")), AheadMode::Off);
+    assert_eq!(AheadMode::parse(Some("off")), AheadMode::Off);
+    for w in ["on", "ON", "1", "true", "yes"] {
+        assert_eq!(AheadMode::parse(Some(w)), AheadMode::On, "{w}");
+    }
+    for w in ["observe", " Observe ", "watch", "measure"] {
+        assert_eq!(AheadMode::parse(Some(w)), AheadMode::Observe, "{w}");
+    }
+    assert!(ahead_wanted(Some("observe")) && ahead_wanted(Some("on")) && !ahead_wanted(None));
+    let cfg = |ahead: Option<&str>, cont: Option<&str>| {
+        AheadCfg::from_lookup(
+            |k| match k {
+                "FASTLANE_AHEAD" => ahead.map(String::from),
+                "FASTLANE_AHEAD_UNKNOWN_CONTINUE" => cont.map(String::from),
+                _ => None,
+            },
+            0,
+        )
+        .unknown_continue
+    };
+    assert!(!cfg(None, None));
+    assert!(!cfg(Some("on"), None), "on keeps the old rule");
+    assert!(cfg(Some("observe"), None), "observe measures the new rule");
+    assert!(!cfg(Some("observe"), Some("off")));
+    assert!(cfg(Some("on"), Some("on")));
+    assert!(!AheadCfg::default().unknown_continue);
+}
+
+/// The "blocks fresher" gain: per feed message, how many blocks the tip is
+/// ahead of copy 2's confirmed version (0 = no tip).
+#[test]
+fn blocks_ahead_are_counted_per_message() {
+    let mut a = ahead_on(AheadCfg::default(), copy_at(100, 7));
+    a.on_feed_message(msg(11, &[stx(0, pool(), w(1))]));
+    a.on_feed_message(msg(12, &[stx(1, pool(), w(1))]));
+    a.on_feed_message(msg(14, &[stx(3, pool(), w(1))])); // 13 missing: no tip
+    assert_eq!(a.total.ahead_blocks, vec![1, 2, 0]);
+    assert_eq!(a.total.tips, 2);
+    let j = a.hour.json();
+    assert_eq!(j["aheadBlocks"]["max"], 2, "{j}");
+    assert!(a.hour.line().contains("blocks ahead p50"), "{}", a.hour.line());
+}
