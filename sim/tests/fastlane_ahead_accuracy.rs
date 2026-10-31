@@ -677,3 +677,61 @@ fn blocks_ahead_are_counted_per_message() {
     assert_eq!(j["aheadBlocks"]["max"], 2, "{j}");
     assert!(a.hour.line().contains("blocks ahead p50"), "{}", a.hour.line());
 }
+
+// ---------------------------------------------------------------------------
+// The hot-contract keeper (Oct 31, copy2/keeper.rs): the predicted copy
+// lays the keeper's exact values of its base block over copy 2's.
+// ---------------------------------------------------------------------------
+
+/// ROUTER reads DEP, which copy 2 does not hold: the run fails, POOL is
+/// marked unsure and DEP's value is handed to the keeper to learn. When the
+/// keeper's version of the base block (with DEP) arrives, the prediction is
+/// rebuilt on it: the run is exact and POOL is sure, with the right value.
+/// A keeper version of ANOTHER block is never used.
+#[test]
+fn the_keepers_values_make_a_failed_run_exact() {
+    use arbsim::copy2::keeper::KeptVersion;
+    use arbsim::state::MissItem;
+    let mut base = copy_at(100, 7);
+    base.apply_fact(&Fact::Forget(dep()));
+    let mut a = ahead_on(AheadCfg { run_all: true, keeper: true, ..AheadCfg::default() }, base);
+    a.on_feed_message(msg(11, &[stx(0, router(), w(3))]));
+    let tip = a.tip().expect("a failed run marks its pools, it does not stop");
+    assert!(tip.unsure_pools.contains(&key(pool())), "{:?}", tip.unsure_pools);
+    assert!(a.learned.iter().any(|m| matches!(m, MissItem::Account(x) | MissItem::Slot(x, _) if *x == dep())), "DEP learned: {:?}", a.learned);
+    assert!(!a.learned.iter().any(|m| matches!(m, MissItem::Slot(x, _) | MissItem::Account(x) if *x == pool())), "our pools are copy 2's, never the keeper's");
+    // The keeper's DEP at block 10 (the base block).
+    let mut k = Snapshot::default();
+    put(&mut k, dep(), dep_code(), &[(0, 2)]);
+    let kept = |block: u64| Arc::new(KeptVersion { block, accounts: k.accounts.clone(), codes: k.codes.clone() });
+    a.on_kept(kept(9));
+    assert_eq!(a.total.kept_rebases, 0, "another block's version is never used");
+    a.on_kept(kept(10));
+    assert_eq!(a.total.kept_rebases, 1);
+    let tip = a.tip().unwrap();
+    assert!(tip.unsure_pools.is_empty(), "{:?}", tip.unsure_pools);
+    assert_eq!(tip.view().storage(pool(), U256::ZERO), known(106), "100 + 3 x DEP (2)");
+    // The next confirmed block without a keeper version: the plain base again.
+    a.on_confirmed(confirmed(11, Arc::new(copy_at(106, 7))), &no_moves);
+    assert_eq!((a.total.kept_bases, a.total.kept_missing), (1, 0), "base 10 was merged");
+    a.on_confirmed(confirmed(12, Arc::new(copy_at(106, 7))), &no_moves);
+    assert_eq!(a.total.kept_missing, 1, "base 11 had no keeper version");
+}
+
+/// FASTLANE_AHEAD_KEEPER per-mode default: on in observe, off with on.
+#[test]
+fn keeper_setting_defaults() {
+    let cfg = |ahead: Option<&str>, k: Option<&str>| {
+        AheadCfg::from_lookup(
+            |key| match key {
+                "FASTLANE_AHEAD" => ahead.map(String::from),
+                "FASTLANE_AHEAD_KEEPER" => k.map(String::from),
+                _ => None,
+            },
+            0,
+        )
+        .keeper
+    };
+    assert!(!cfg(None, None) && !cfg(Some("on"), None) && cfg(Some("observe"), None));
+    assert!(cfg(Some("on"), Some("on")) && !cfg(Some("observe"), Some("off")));
+}

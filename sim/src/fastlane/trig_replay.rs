@@ -127,6 +127,25 @@ pub struct TrigReplayOpts {
     pub warm_sim: Option<usize>,
     /// --warm-per-hour: the simulated hourly cap (default 25000).
     pub warm_per_hour: Option<u64>,
+    /// --keeper <truth file> (ahead3, Oct 31): the hot-contract keeper's
+    /// exact values of each copy-2 version's block are laid over it before
+    /// any check (copy2/keeper.rs merge_base), like the predicted copy does.
+    pub keeper: Option<TrigKeeper>,
+}
+
+/// The keeper side of a trig-replay (see TrigReplayOpts.keeper).
+#[derive(Clone)]
+pub struct TrigKeeper {
+    pub truth: Arc<crate::copy2::keeper_replay::Truth>,
+    pub cfg: crate::copy2::keeper::KeeperCfg,
+    /// Learned batches seeded at the start (a keeper that has been running).
+    pub warm: Vec<Vec<MissItem>>,
+}
+
+impl std::fmt::Debug for TrigKeeper {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "TrigKeeper {{ contracts: {}, warm batches: {} }}", self.cfg.max_contracts, self.warm.len())
+    }
 }
 
 /// --warm-sim results.
@@ -533,6 +552,18 @@ pub fn trig_replay_with(cap: &CapFile, table: Option<&Table>, cfg: &TrigCfg, opt
         }
     }
     let mut prov: Arc<dyn Provenance + Send + Sync> = Arc::new(ProvSets::all_exact());
+    // --keeper: copy 2's own provenance (prov is then the merged one).
+    let mut base_prov: Arc<dyn Provenance + Send + Sync> = prov.clone();
+    let mut rk = opts.keeper.as_ref().map(|k| {
+        let mut r = crate::copy2::keeper_replay::ReplayKeeper::new(k.truth.clone(), k.cfg.clone());
+        for b in &k.warm {
+            r.core.learn(b);
+        }
+        r
+    });
+    let mut keeper_warm_first = rk.is_some();
+    let mut keeper_learn: Vec<MissItem> = Vec::new();
+    let (mut kept_merged, mut kept_missing) = (0u64, 0u64);
     let mut index = MovedIndex::build(&[]);
     let mut pools_n = 0usize;
     let (mut pool_addrs, mut coin_addrs): (HashSet<Address>, HashSet<Address>) = (HashSet::new(), HashSet::new());
@@ -619,11 +650,33 @@ pub fn trig_replay_with(cap: &CapFile, table: Option<&Table>, cfg: &TrigCfg, opt
                 pool_addrs = list.iter().map(|(p, _, _)| p.address).collect();
                 coin_addrs = list.iter().flat_map(|(_, a, b)| [*a, *b]).collect();
             }
-            CapEv::Prov(p) => prov = p.clone(),
+            CapEv::Prov(p) => {
+                base_prov = p.clone();
+                prov = p.clone();
+            }
             CapEv::Routes(r) => route_pools = r.as_ref().map(|v| v.len()),
             CapEv::Confirmed { seq, ctx, snap } => {
                 let Some(ctx) = ctx.clone() else { continue };
                 copy = Some((*seq, ctx.clone(), snap.clone()));
+                // --keeper: the keeper's exact values of this very block over
+                // copy 2's version (copy2/keeper.rs merge_base), and what the
+                // checks since the last version lacked, learned.
+                if let Some(k) = rk.as_mut() {
+                    let learn = std::mem::take(&mut keeper_learn);
+                    match k.advance_to(*seq + l2_offset, &learn, keeper_warm_first) {
+                        Some(kv) => {
+                            let (merged, _) = crate::copy2::keeper::merge_base(snap, base_prov.as_ref(), &kv);
+                            copy = Some((*seq, ctx.clone(), Arc::new(merged)));
+                            prov = Arc::new(crate::copy2::keeper::KeptProv { inner: base_prov.clone(), kept: kv });
+                            kept_merged += 1;
+                        }
+                        None => {
+                            prov = base_prov.clone();
+                            kept_missing += 1;
+                        }
+                    }
+                    keeper_warm_first = false;
+                }
                 // --warm-sim: the keeper's turn (fetch at this version's block).
                 if let (Some(w), Some(f)) = (ws.as_mut(), fetcher.as_deref_mut()) {
                     w.sweep(sim_now);
@@ -773,6 +826,14 @@ pub fn trig_replay_with(cap: &CapFile, table: Option<&Table>, cfg: &TrigCfg, opt
                         continue;
                     };
                     let r = discover(&view, &alone, prov.as_ref(), &index);
+                    // --keeper: what discovery lacked (outside our pools) is learned.
+                    if rk.is_some() {
+                        if let Err(u) = &r {
+                            if u.reason == UnknownReason::Miss && keeper_learn.len() < 4096 {
+                                keeper_learn.extend(u.missing.iter().filter(|m| owner_of(m).is_none_or(|o| !pool_addrs.contains(&o))).cloned());
+                            }
+                        }
+                    }
                     let is_ours = |a: Address| pool_addrs.contains(&a) || coin_addrs.contains(&a);
                     let chain_did = chain_moved(&truth, &t.hash);
                     // --warm-sim: a hot target's trigger, answered from the warm
@@ -1130,7 +1191,7 @@ pub fn trig_replay_with(cap: &CapFile, table: Option<&Table>, cfg: &TrigCfg, opt
     let rec_whole = recurring.iter().filter(|(k, _)| !k.starts_with("slot")).count();
     let warm_cost = rec_accounts.len() + rec_whole;
     let blocked_by_recurring: u64 = recurring.iter().map(|(_, c)| *c).sum();
-    Ok(json!({
+    let mut out = json!({
         "capture": {"complete": cap.complete, "cut": cap.cut, "events": cap.events.len(), "pools": pools_n, "routePools": route_pools, "l2Offset": l2_offset, "table": table.map(|t| json!({"pools": t.pools.len(), "rows": t.pools.values().map(|r| r.len()).sum::<usize>()})), "chainAnswers": truth.len()},
         "copyLag": {"blocksBehindAtArrival": pct(&mut lag_blocks.clone()), "histogram": lag_hist, "lagReplayedTxsPerTrigger": pct(&mut lag_txs.clone()), "note": "how far copy 2's newest confirmed version was behind each feed message when it arrived (blocks); lagReplayedTxs = feed transactions in EARLIER blocks a check must replay before the trigger"},
         "coverage": {"msgs": msgs, "msgsBeforeAnyCopy": msgs_no_copy, "txs": txs, "skipped": skipped, "repeats": repeats, "asked": asked,
@@ -1192,7 +1253,14 @@ pub fn trig_replay_with(cap: &CapFile, table: Option<&Table>, cfg: &TrigCfg, opt
         "wouldFireSamples": fires,
         "offlineNote": if fetcher.is_some() { "no copy-2 double runs / reports-pending rule, no best-effort (bot) skipping, no safety gates; --fetch: values fetched for DISCOVERY only (the FETCH section; every other section is the recording alone); nothing signed or sent" } else { "no copy-2 double runs / reports-pending rule, no best-effort (bot) skipping, no fills fetched, no safety gates: more cautious than live; nothing signed or sent" },
         "tookMs": t_all.elapsed().as_millis() as u64,
-    }))
+    });
+    if let Some(k) = &rk {
+        let mut kr = k.report();
+        kr["versionsMerged"] = json!(kept_merged);
+        kr["versionsWithoutKeeper"] = json!(kept_missing);
+        out["keeper"] = kr;
+    }
+    Ok(out)
 }
 
 /// The re-check's runner: the plain size search with the server's
@@ -1392,7 +1460,36 @@ pub fn replay_main(args: &[String]) {
         no_full: args.iter().any(|a| a == "--no-full"),
         warm_sim: val("--warm-sim").and_then(|s| s.parse().ok()),
         warm_per_hour: val("--warm-per-hour").and_then(|s| s.parse().ok()),
+        keeper: None,
     };
+    // --keeper <truth file> [--keeper-warm-passes N] [--keep-contracts N]
+    // (ahead3): the hot-contract keeper on the recorded block diffs. Its
+    // hot contracts are first learned by N predicted-copy passes over the
+    // same capture (a keeper that has been running a while), then it also
+    // learns what discovery lacks as it goes.
+    let mut opts = opts;
+    if let Some(f) = val("--keeper") {
+        let truth = match crate::copy2::keeper_replay::Truth::load(&f) {
+            Ok(t) => Arc::new(t),
+            Err(e) => {
+                eprintln!("arbsim trig-replay: --keeper {e}");
+                std::process::exit(2);
+            }
+        };
+        let mut kc = crate::copy2::keeper::KeeperCfg { on: true, ..Default::default() };
+        if let Some(n) = val("--keep-contracts").and_then(|s| s.parse::<usize>().ok()) {
+            kc.max_contracts = n.clamp(1, 1000);
+        }
+        let passes = val("--keeper-warm-passes").and_then(|s| s.parse::<usize>().ok()).unwrap_or(1).min(10);
+        let warm = match crate::copy2::ahead_capture::keeper_learned(&cap, truth.clone(), kc.clone(), passes) {
+            Ok(w) => w,
+            Err(e) => {
+                eprintln!("arbsim trig-replay: --keeper: {e}");
+                std::process::exit(2);
+            }
+        };
+        opts.keeper = Some(TrigKeeper { truth, cfg: kc, warm });
+    }
     // --fetch (replay_fetch.rs): fetch what the recording didn't hold.
     let mut fetcher = None;
     if args.iter().any(|a| a == "--fetch") {

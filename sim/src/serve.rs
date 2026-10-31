@@ -82,6 +82,11 @@ pub fn build_with(cfg: Config, node: Option<Arc<dyn NodeApi>>, source: Source) -
             // on every new copy-2 version. The fire-first trigger thread
             // (fastlane/trigger.rs) starts with the server (it needs Ctx).
             crate::copy2::ahead::start(c2.clone());
+            // Its hot-contract keeper (Oct 31): only with the predicted copy
+            // running and FASTLANE_AHEAD_KEEPER on (default: observe only).
+            if crate::copy2::ahead::status_json().is_some() {
+                crate::copy2::keeper::start(c2.clone());
+            }
             crate::fastlane::lane::start(c2.clone());
             Arc::new(Ctx { shared, updater, fills, pinned: PinnedCache::new(pin_cache), copy2: Some(c2) })
         }
