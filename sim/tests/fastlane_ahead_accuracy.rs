@@ -188,9 +188,11 @@ fn a_transaction_we_could_not_run_is_missed_failed_not_missed_ran() {
 }
 
 /// Our run REVERTED (it succeeded on chain): missedReverted, with the error.
+/// (The old rule, FASTLANE_AHEAD_REVERT_UNSURE=off: a reverted run moved
+/// nothing and its pools stayed sure.)
 #[test]
 fn a_run_that_reverted_is_missed_reverted() {
-    let mut a = ahead_on(AheadCfg::default(), copy_at(100, 7));
+    let mut a = ahead_on(AheadCfg { revert_unsure: false, ..AheadCfg::default() }, copy_at(100, 7));
     // A 4-byte call: POOL reverts with its custom error in OUR run.
     let t = stx(0, pool(), vec![0xde, 0xad, 0xbe, 0xef]);
     a.on_feed_message(msg(11, &[t.clone()]));
@@ -202,6 +204,54 @@ fn a_run_that_reverted_is_missed_reverted() {
     let sm = a.total.samples.last().unwrap();
     assert_eq!(sm["txOk"], false);
     assert_eq!(sm["txWhy"], "revert 0x4e88422a", "{sm}");
+}
+
+/// FASTLANE_AHEAD_REVERT_UNSURE (default on, Oct 31): the same reverted
+/// run now marks the pool it names unsure. The confirmed block moved it:
+/// counted "unsure", never a sure-but-wrong "missedReverted".
+#[test]
+fn a_reverted_run_marks_its_pools_unsure_by_default() {
+    assert!(AheadCfg::default().revert_unsure, "default on");
+    let mut a = ahead_on(AheadCfg::default(), copy_at(100, 7));
+    let t = stx(0, pool(), vec![0xde, 0xad, 0xbe, 0xef]);
+    a.on_feed_message(msg(11, &[t.clone()]));
+    assert_eq!(a.total.txs_run, 1);
+    assert_eq!((a.total.reverts_marked, a.total.reverts_kept), (1, 0));
+    let tip = a.tip().expect("prediction goes on (a revert never stops it)");
+    assert!(tip.unsure_pools.contains(&key(pool())), "{:?}", tip.unsure_pools);
+    assert!(matches!(tip.view().storage(pool(), U256::ZERO), Lookup::Missing), "its values are forgotten, never vouched for");
+    let h = keccak256(&t);
+    a.on_confirmed(confirmed(11, Arc::new(copy_at(150, 7))), &move |x: &B256| (*x == h).then(|| vec![key(pool())]));
+    assert_eq!((a.total.missed_reverted, a.total.disagree), (0, 0));
+    assert!(a.total.unsure >= 1);
+}
+
+/// A reverted run that names none of our pools (nothing narrows down what
+/// it may touch): pools left as they were, prediction NOT stopped.
+#[test]
+fn a_reverted_run_naming_nothing_of_ours_keeps_the_prediction_going() {
+    // OTHER: not a pool of ours, same code as POOL (a 4-byte call reverts).
+    let other = addr(0x1009);
+    let mut base = copy_at(100, 7);
+    put(&mut base, other, pool_code(), &[(0, 1)]);
+    let mut a = ahead_on(AheadCfg { run_all: true, ..AheadCfg::default() }, base);
+    let t = stx(0, other, vec![0xde, 0xad, 0xbe, 0xef]);
+    a.on_feed_message(msg(11, &[t]));
+    assert_eq!((a.total.reverts_marked, a.total.reverts_kept), (0, 1), "{}", a.total.json_with(false));
+    let tip = a.tip().expect("not stopped");
+    assert!(tip.unsure_pools.is_empty(), "{:?}", tip.unsure_pools);
+    assert_eq!(tip.view().storage(pool(), U256::ZERO), known(100));
+}
+
+/// The setting: unset = on, off / 0 / false / no = off.
+#[test]
+fn revert_unsure_setting() {
+    let get = |v: Option<&str>| AheadCfg::from_lookup(|k| if k == "FASTLANE_AHEAD_REVERT_UNSURE" { v.map(String::from) } else { None }, 0).revert_unsure;
+    assert!(get(None));
+    assert!(get(Some("on")));
+    for off in ["off", "0", "false", "NO"] {
+        assert!(!get(Some(off)), "{off}");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -418,7 +468,11 @@ fn capture_then_offline_replay_gives_the_same_counts() {
     let s = d.cap.finish(d.a.total.json_with(false).to_string(), "done");
     assert!(s.complete, "{s:?}");
     assert!(live.compared >= 3, "compared {}", live.compared);
-    assert!(live.agree >= 3 && live.disagree >= 2, "agree {} disagree {}", live.agree, live.disagree);
+    // (FASTLANE_AHEAD_REVERT_UNSURE, default on: the reverted run on POOL2
+    // in 13 now marks POOL2 unsure instead of a sure-but-wrong miss.)
+    assert!(live.agree >= 3 && live.disagree >= 1, "agree {} disagree {}", live.agree, live.disagree);
+    assert_eq!(live.missed_reverted, 0);
+    assert!(live.reverts_marked >= 1);
     // Read back + replay.
     let cap = read_capture(&path).unwrap();
     assert!(cap.complete && cap.cut.is_none());
@@ -440,8 +494,16 @@ fn capture_then_offline_replay_gives_the_same_counts() {
     assert_eq!(strip(r1.clone()), strip(r2));
     // The live counters of the same stretch are carried along.
     assert_eq!(r1["liveSameStretch"]["agree"].as_u64(), Some(live.agree));
-    let text = print_report(&r1, 3);
+    // Before / after on the same capture: `--revert-sure` (the old rule)
+    // turns that unsure pool back into a sure-but-wrong missedReverted.
+    let old_rule = replay(&cap, &ReplayOpts { revert_unsure: Some(false), ..Default::default() }).unwrap();
+    assert_eq!(old_rule["disagreements"]["byKind"]["missedReverted"].as_u64(), Some(1), "{old_rule}");
+    assert_eq!(old_rule["agreement"]["disagree"].as_u64(), Some(live.disagree + 1));
+    assert_eq!(old_rule["prediction"]["revertsMarked"].as_u64(), Some(0));
+    let text = print_report(&old_rule, 3);
     assert!(text.contains("AGREEMENT") && text.contains("missedReverted"), "{text}");
+    let text = print_report(&r1, 3);
+    assert!(text.contains("reverted runs marked unsure"), "{text}");
     eprintln!("{text}");
     // A cut-off file is read as far as it goes, and says so.
     let buf = std::fs::read(&path).unwrap();

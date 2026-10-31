@@ -234,11 +234,24 @@ pub struct AheadCfg {
     /// in). 0 = compare the moment N is confirmed, with that version (tests).
     /// The runtime drives the delayed compare (`due` / `compare_settled`).
     pub compare_delay: u64,
+    /// FASTLANE_AHEAD_REVERT_UNSURE [on] (Oct 31, measured on the Oct 27
+    /// capture: 27 of the 32 "sure but wrong" pools came from a run of OURS
+    /// that reverted while the real transaction succeeded). A picked
+    /// transaction (it may move our pools) whose run REVERTS no longer
+    /// counts as "moved nothing, sure": the pools it may touch are marked
+    /// unsure with the same rules as a transaction we could not run. A
+    /// revert usually means our copy already differs from the chain (an
+    /// earlier transaction in the block, a value we hold wrong) or the real
+    /// one reverted too; we can't tell which, so we never vouch for it.
+    /// When nothing narrows down what it may touch, the pools stay as they
+    /// are (prediction is NOT stopped, counted "revertsKept"). off = the
+    /// old rule (a reverted run moves nothing and its pools stay sure).
+    pub revert_unsure: bool,
 }
 
 impl Default for AheadCfg {
     fn default() -> Self {
-        AheadCfg { max_blocks: 32, run_all: false, max_txs: 256, max_touchers: 4096, l2_offset: 0, trust_sender_funds: false, msg_budget_us: 10_000, routes_only: true, compare_delay: 0 }
+        AheadCfg { max_blocks: 32, run_all: false, max_txs: 256, max_touchers: 4096, l2_offset: 0, trust_sender_funds: false, msg_budget_us: 10_000, routes_only: true, compare_delay: 0, revert_unsure: true }
     }
 }
 
@@ -269,6 +282,8 @@ impl AheadCfg {
             routes_only: get("FASTLANE_AHEAD_ROUTES_ONLY").is_none_or(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "off" | "0" | "false" | "no")),
             // (0 is allowed here: compare at once, the old behaviour.)
             compare_delay: get("FASTLANE_AHEAD_COMPARE_DELAY_BLOCKS").and_then(|v| v.trim().parse::<u64>().ok()).filter(|v| *v <= 30).unwrap_or(COMPARE_DELAY_DEFAULT),
+            // Unset = on; only an explicit off / 0 / false / no turns it off.
+            revert_unsure: get("FASTLANE_AHEAD_REVERT_UNSURE").is_none_or(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "off" | "0" | "false" | "no")),
         }
     }
 }
@@ -988,6 +1003,12 @@ pub struct AheadStats {
     /// Practice fixes (Oct 27): transactions not run because they name only
     /// pools no scanner route uses (those pools marked unsure instead).
     pub txs_off_route: u64,
+    /// FASTLANE_AHEAD_REVERT_UNSURE (Oct 31): picked transactions whose run
+    /// reverted; their possible pools were marked unsure.
+    pub reverts_marked: u64,
+    /// ...and reverted runs where nothing narrowed down what they may touch
+    /// (pools left as they were, prediction not stopped).
+    pub reverts_kept: u64,
     /// Failed runs whose second "collect" run was skipped: its target has no
     /// code in our copy, so that run could not read anything of ours.
     pub probes_skipped: u64,
@@ -1069,6 +1090,7 @@ impl AheadStats {
             "compared": self.compared, "msgsStopped": self.msgs_stopped, "overBudget": self.over_budget,
             "failedUnknown": self.failed_unknown, "assumedUnsure": self.assumed_unsure, "nativePicks": self.native_picks,
             "txsOffRoute": self.txs_off_route, "probesSkipped": self.probes_skipped, "v4Fallback": self.v4_fallback,
+            "revertsMarked": self.reverts_marked, "revertsKept": self.reverts_kept,
             "missedFilter": self.missed_filter, "missedRan": self.missed_ran, "missedOffRoute": self.missed_off_route, "notFromTx": self.not_from_tx,
             "agreementPct": self.agreement_pct(),
             "stopped": self.stopped.iter().map(|(k, v)| (k.to_string(), json!(v))).collect::<serde_json::Map<String, Value>>(),
@@ -1704,6 +1726,100 @@ impl Ahead {
         };
     }
 
+    /// Which of our pools a transaction we can't vouch for may touch (one we
+    /// could not run exactly, or, FASTLANE_AHEAD_REVERT_UNSURE, one whose run
+    /// reverted). What a collect run reads + what it names + the fallbacks
+    /// below. Empty = nothing tells us (the caller decides: a failed run
+    /// stops the prediction, a reverted one leaves the pools as they were).
+    /// `failed`: count it in the failed-run counters (probes skipped,
+    /// widened, nothing found, V4 only); a reverted run has its own.
+    fn guess_touched(&mut self, ov: &Overlay, ctx: &BlockCtx, t: &DecodedTx, pools: &PoolSet, named_now: &Named, native: &[String], failed: bool) -> Vec<String> {
+        let mut hit = if target_has_no_code(ov, t.to) {
+            if failed {
+                self.count(|s| s.probes_skipped += 1);
+            }
+            Vec::new()
+        } else {
+            probe_touched(ov, ctx, t, pools)
+        };
+        for k in pools.named_direct(t.to, named_now).into_iter().chain(native.iter().cloned()) {
+            if !hit.contains(&k) {
+                hit.push(k);
+            }
+        }
+        // Practice fixes: pools named only by their coin PAIR
+        // (every exchange's pool of that pair) are added only for
+        // pairs no pool found above already stands for. Before,
+        // they were always added: one failed swap naming WETH and
+        // USDG made every WETH / USDG pool unsure, i.e. BOTH
+        // sides of every WETH / USDG route, and each later swap
+        // on those pools then failed too (their values forgotten)
+        // until copy 2 confirmed the block. A multi-hop path's
+        // OTHER pairs (B/C after A/B) are still all added.
+        for k in pools.named_by_pair_except(named_now, &hit) {
+            if !hit.contains(&k) {
+                hit.push(k);
+            }
+        }
+        // Accuracy fixes (second practice run: a sure pool was
+        // wrong after a failed run that did not mark it):
+        //   - native-ETH pools of a named coin, whatever the ETH
+        //     value (a V4 "sell for ETH" through a router pays none),
+        //   - the target's learned pools this data could be
+        //     trading (a named pair, e.g. a split route over sister
+        //     pools; all of them when it names no coin: an opaque
+        //     bot contract).
+        // Only when something narrower was already found (an
+        // empty `hit` keeps the H4 fallback below, unchanged).
+        if !hit.is_empty() {
+            let before = hit.len();
+            let learned = t.to.and_then(|a| self.touchers.get(&a)).map(|x| pools.learned_for(&x.1, named_now)).unwrap_or_default();
+            for k in pools.named_native_any(named_now).into_iter().chain(learned) {
+                if !hit.contains(&k) {
+                    hit.push(k);
+                }
+            }
+            if hit.len() > before {
+                if failed {
+                    self.count(|s| s.failed_widened += 1);
+                }
+            }
+        }
+        if hit.is_empty() {
+            // Review H4: it failed and nothing tells us what it
+            // would touch (router code or state missing). Never
+            // assume "nothing": the pools its target moved
+            // before; else (practice fixes) when it names a V4
+            // PoolManager, that PoolManager's pools of ours
+            // sharing a coin it names (before: every pool of any
+            // kind sharing a coin, i.e. all WETH / USDG pools);
+            // else our pools sharing a coin it names; if none of
+            // that is known, empty (the caller decides).
+            if failed {
+                self.count(|s| s.failed_unknown += 1);
+            }
+            // Accuracy fixes: of its learned pools, the ones this
+            // data could be trading (all of them when it names no
+            // coin), plus native-ETH pools of a named coin.
+            hit = t.to.and_then(|a| self.touchers.get(&a)).map(|x| pools.learned_for(&x.1, named_now)).unwrap_or_default();
+            for k in pools.named_native_any(named_now) {
+                if !hit.contains(&k) {
+                    hit.push(k);
+                }
+            }
+            if hit.is_empty() && pools.names_pm(t.to, named_now) {
+                hit = pools.v4_sharing_named_coins(t.to, named_now);
+                if !hit.is_empty() && failed {
+                    self.count(|s| s.v4_fallback += 1);
+                }
+            }
+            if hit.is_empty() {
+                hit = pools.sharing_named_coins(named_now);
+            }
+        }
+        hit
+    }
+
     fn halt(&mut self, seq: u64, why: &'static str) {
         self.count(|s| s.stop(why));
         self.stop = Some(Stop { seq, why });
@@ -1844,6 +1960,11 @@ impl Ahead {
                     // moved can't be vouched for. Its pools become unsure.
                     let a = &out.assumed;
                     let shaky = a.recent_fill || a.call_fill || (a.sender_funds && !self.cfg.trust_sender_funds);
+                    // FASTLANE_AHEAD_REVERT_UNSURE (Oct 31): a picked
+                    // transaction whose run reverted can't be vouched for
+                    // (see AheadCfg). Worked out on the copy BEFORE its
+                    // (gas / nonce only) changes are kept, like a failed run.
+                    let revert_hit = if !ok && self.cfg.revert_unsure { Some(self.guess_touched(&ov, &ctx, t, &pools, &named_now, &native, false)) } else { None };
                     ov.commit(&kept.diff);
                     for (a, s) in &kept.forget {
                         ov.forget_slot(*a, *s);
@@ -1871,7 +1992,26 @@ impl Ahead {
                         }
                         changed_cum.insert(k.clone());
                     }
-                    notes.push(note(t, Fate::Ran, ok, why, moved));
+                    match revert_hit {
+                        Some(hit) if !hit.is_empty() => {
+                            self.count(|s| s.reverts_marked += 1);
+                            mark_unsure(&mut ov, &mut changed, &mut changed_cum, &mut unsure_cum, &hit);
+                            // The note lists the pools marked (a reverted run
+                            // moves nothing of ours: `moved` is empty).
+                            let mut pools_noted = moved;
+                            for k in hit {
+                                if !pools_noted.contains(&k) {
+                                    pools_noted.push(k);
+                                }
+                            }
+                            notes.push(note(t, Fate::Ran, ok, why, pools_noted));
+                        }
+                        Some(_) => {
+                            self.count(|s| s.reverts_kept += 1);
+                            notes.push(note(t, Fate::Ran, ok, why, moved));
+                        }
+                        None => notes.push(note(t, Fate::Ran, ok, why, moved)),
+                    }
                 }
                 Err(u) => {
                     let why = failed_why(&u, t.to, &pools);
@@ -1881,85 +2021,9 @@ impl Ahead {
                     // Practice fixes: the collect run is skipped when the
                     // target has no code in our copy (it could only read
                     // zero there and stop: nothing of ours, same answer).
-                    let mut hit = if target_has_no_code(&ov, t.to) {
-                        self.count(|s| s.probes_skipped += 1);
-                        Vec::new()
-                    } else {
-                        probe_touched(&ov, &ctx, t, &pools)
-                    };
-                    for k in pools.named_direct(t.to, &named_now).into_iter().chain(native.iter().cloned()) {
-                        if !hit.contains(&k) {
-                            hit.push(k);
-                        }
-                    }
-                    // Practice fixes: pools named only by their coin PAIR
-                    // (every exchange's pool of that pair) are added only for
-                    // pairs no pool found above already stands for. Before,
-                    // they were always added: one failed swap naming WETH and
-                    // USDG made every WETH / USDG pool unsure, i.e. BOTH
-                    // sides of every WETH / USDG route, and each later swap
-                    // on those pools then failed too (their values forgotten)
-                    // until copy 2 confirmed the block. A multi-hop path's
-                    // OTHER pairs (B/C after A/B) are still all added.
-                    for k in pools.named_by_pair_except(&named_now, &hit) {
-                        if !hit.contains(&k) {
-                            hit.push(k);
-                        }
-                    }
-                    // Accuracy fixes (second practice run: a sure pool was
-                    // wrong after a failed run that did not mark it):
-                    //   - native-ETH pools of a named coin, whatever the ETH
-                    //     value (a V4 "sell for ETH" through a router pays none),
-                    //   - the target's learned pools this data could be
-                    //     trading (a named pair, e.g. a split route over sister
-                    //     pools; all of them when it names no coin: an opaque
-                    //     bot contract).
-                    // Only when something narrower was already found (an
-                    // empty `hit` keeps the H4 fallback below, unchanged).
-                    if !hit.is_empty() {
-                        let before = hit.len();
-                        let learned = t.to.and_then(|a| self.touchers.get(&a)).map(|x| pools.learned_for(&x.1, &named_now)).unwrap_or_default();
-                        for k in pools.named_native_any(&named_now).into_iter().chain(learned) {
-                            if !hit.contains(&k) {
-                                hit.push(k);
-                            }
-                        }
-                        if hit.len() > before {
-                            self.count(|s| s.failed_widened += 1);
-                        }
-                    }
+                    let hit = self.guess_touched(&ov, &ctx, t, &pools, &named_now, &native, true);
                     if hit.is_empty() {
-                        // Review H4: it failed and nothing tells us what it
-                        // would touch (router code or state missing). Never
-                        // assume "nothing": the pools its target moved
-                        // before; else (practice fixes) when it names a V4
-                        // PoolManager, that PoolManager's pools of ours
-                        // sharing a coin it names (before: every pool of any
-                        // kind sharing a coin, i.e. all WETH / USDG pools);
-                        // else our pools sharing a coin it names; if none of
-                        // that is known, stop until confirmed.
-                        self.count(|s| s.failed_unknown += 1);
-                        // Accuracy fixes: of its learned pools, the ones this
-                        // data could be trading (all of them when it names no
-                        // coin), plus native-ETH pools of a named coin.
-                        hit = t.to.and_then(|a| self.touchers.get(&a)).map(|x| pools.learned_for(&x.1, &named_now)).unwrap_or_default();
-                        for k in pools.named_native_any(&named_now) {
-                            if !hit.contains(&k) {
-                                hit.push(k);
-                            }
-                        }
-                        if hit.is_empty() && pools.names_pm(t.to, &named_now) {
-                            hit = pools.v4_sharing_named_coins(t.to, &named_now);
-                            if !hit.is_empty() {
-                                self.count(|s| s.v4_fallback += 1);
-                            }
-                        }
-                        if hit.is_empty() {
-                            hit = pools.sharing_named_coins(&named_now);
-                        }
-                        if hit.is_empty() {
-                            return Err("failed_tx_unknown_effect");
-                        }
+                        return Err("failed_tx_unknown_effect");
                     }
                     self.count(|s| s.txs_marked += 1);
                     // Its target is remembered (its next calls are picked),
