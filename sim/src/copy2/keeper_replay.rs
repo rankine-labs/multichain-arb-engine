@@ -32,8 +32,9 @@
 //     - after every block, EVERY value the keeper holds is checked against
 //       the truth (the live audit, on everything): this proves the diff
 //       apply on real chain data.
-//   Seeds are limited per hour like live (FASTLANE_AHEAD_KEEP_SEEDS_PER_H,
-//   scaled to the capture's length), so a cold start is cold. `--keeper-warm`
+//   Seeds are paced like live (no limit there: about 2 per block, the time
+//   left between block diffs; `--keep-seeds-per-h N` models an hourly
+//   limit instead), so a cold start is cold. `--keeper-warm`
 //   first runs the capture once to learn which contracts are hot, then
 //   starts the measured run with those already seeded (a keeper that has
 //   been running for a while; an upper bound, said so in the report).
@@ -231,8 +232,8 @@ pub struct ReplayKeeper {
     pub audit_samples: Vec<Value>,
     pub first_block: Option<u64>,
     pub last_block: u64,
-    /// Seed calls allowed so far (FASTLANE_AHEAD_KEEP_SEEDS_PER_H scaled to
-    /// the capture's blocks; `blocks_per_s` from the feed's timestamps).
+    /// Seed calls allowed so far (live pace, or `--keep-seeds-per-h` scaled
+    /// to the capture's blocks; `blocks_per_s` from the feed's timestamps).
     pub blocks_per_s: f64,
     pub apply_us: Vec<u64>,
     /// Every batch learned in this run, in order (the warm start replays
@@ -266,6 +267,13 @@ impl ReplayKeeper {
         let span = self.last_block.saturating_sub(self.first_block.unwrap_or(self.last_block)) as f64 / self.blocks_per_s.max(0.1);
         // At least one hour's worth at the start would be live's first hour:
         // the limit grows with time, never all at once.
+        if self.core.cfg.seeds_per_hour == 0 {
+            // No limit (live): seeds are paced only by the node's answer
+            // time while the keeper is caught up. One block every ~107 ms,
+            // its diff takes ~31 ms, a seed ~35 ms: about 2 seeds a block.
+            let blocks = self.last_block.saturating_sub(self.first_block.unwrap_or(self.last_block));
+            return 2 * blocks + 2;
+        }
         ((self.core.cfg.seeds_per_hour as f64) * (span / 3600.0)).ceil() as u64 + 1
     }
 
