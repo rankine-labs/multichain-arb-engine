@@ -143,6 +143,21 @@
 //        a capture file + offline replay (copy2/ahead_capture.rs,
 //        `arbsim ahead-replay <file>`).
 //
+//   OBSERVE MODE (Oct 31, owner-approved "real fix", part 1):
+//    10. FASTLANE_AHEAD=observe runs the predicted copy and measures it live
+//        (the same agreement check: per pool and block, exact / wrong /
+//        unsure once copy 2 has the real block; plus how many blocks ahead
+//        of copy 2 each tip was), but its tips are NEVER handed out:
+//        wait_tip / global_tip answer None, so the lane, scanner and trigger
+//        decide exactly as with it off. Status "fastlaneAhead.accuracy".
+//        FASTLANE_AHEAD=on keeps its old meaning.
+//    11. FASTLANE_AHEAD_UNKNOWN_CONTINUE: a transaction we could not run and
+//        that NOTHING ties to our pools used to stop the whole prediction
+//        (76 stops on the Oct 27 capture). With it on (default in observe
+//        only) the prediction goes on past it (Fate::Unknown, nothing
+//        marked) and any pool it really moved is counted "missedUnknown",
+//        so whether the rule is safe is measured, not assumed.
+//
 // API (scanner and integration):
 //   Ahead::on_feed_message(Arc<BinMsg>)            a new feed message
 //   Ahead::on_confirmed(Confirmed, moved_by_tx)     copy 2 published a version
@@ -247,22 +262,77 @@ pub struct AheadCfg {
     /// are (prediction is NOT stopped, counted "revertsKept"). off = the
     /// old rule (a reverted run moves nothing and its pools stay sure).
     pub revert_unsure: bool,
+    /// FASTLANE_AHEAD_UNKNOWN_CONTINUE (Oct 31, observe-mode build). A
+    /// picked transaction we could not run AND that nothing ties to any of
+    /// our pools (no pool it reads in a collect run, names, or moved before;
+    /// no coin of ours it names; no V4 PoolManager) used to STOP the whole
+    /// prediction until copy 2 confirmed that block ("failed_tx_unknown_
+    /// effect", 76 stops on the Oct 27 capture). on = keep predicting: the
+    /// transaction is noted "unknown" (Fate::Unknown) and the agreement
+    /// check counts any pool it really moved as "missedUnknown", so the
+    /// rule is MEASURED. Default: on with FASTLANE_AHEAD=observe (nothing
+    /// is decided on it), off with FASTLANE_AHEAD=on (unchanged), unless set.
+    pub unknown_continue: bool,
 }
 
 impl Default for AheadCfg {
     fn default() -> Self {
-        AheadCfg { max_blocks: 32, run_all: false, max_txs: 256, max_touchers: 4096, l2_offset: 0, trust_sender_funds: false, msg_budget_us: 10_000, routes_only: true, compare_delay: 0, revert_unsure: true }
+        AheadCfg { max_blocks: 32, run_all: false, max_txs: 256, max_touchers: 4096, l2_offset: 0, trust_sender_funds: false, msg_budget_us: 10_000, routes_only: true, compare_delay: 0, revert_unsure: true, unknown_continue: false }
     }
 }
 
 /// Default FASTLANE_AHEAD_COMPARE_DELAY_BLOCKS of the running sidecar.
 pub const COMPARE_DELAY_DEFAULT: u64 = 5;
 
+/// An on / off word: Some(true) for on / 1 / true / yes, Some(false) for
+/// off / 0 / false / no, None for unset, empty or anything else (= default).
+pub fn on_off(v: Option<&str>) -> Option<bool> {
+    match v.map(|x| x.trim().to_ascii_lowercase()).as_deref() {
+        Some("on" | "1" | "true" | "yes") => Some(true),
+        Some("off" | "0" | "false" | "no") => Some(false),
+        _ => None,
+    }
+}
+
+/// FASTLANE_AHEAD: what the predicted copy is for.
+///   off      (unset, the default) nothing runs
+///   on       it runs AND the fast lane scans on its tips (Oct 26 meaning,
+///            unchanged)
+///   observe  (Oct 31) it runs and measures itself live (agreement with
+///            copy 2 once the real block arrives, how many blocks ahead it
+///            is), but NOTHING reads its tips: the lane, scanner and trigger
+///            decide exactly as with off (they scan copy 2's confirmed
+///            versions). The safe way to measure it live.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AheadMode {
+    Off,
+    On,
+    Observe,
+}
+
+impl AheadMode {
+    pub fn parse(v: Option<&str>) -> AheadMode {
+        match v.map(|x| x.trim().to_ascii_lowercase()).as_deref() {
+            Some("on" | "1" | "true" | "yes") => AheadMode::On,
+            Some("observe" | "watch" | "measure") => AheadMode::Observe,
+            _ => AheadMode::Off,
+        }
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AheadMode::Off => "off",
+            AheadMode::On => "on",
+            AheadMode::Observe => "observe",
+        }
+    }
+}
+
 impl AheadCfg {
     /// From any key -> value lookup (tests pass a map).
     pub fn from_lookup(get: impl Fn(&str) -> Option<String>, l2_offset: u64) -> AheadCfg {
         let d = AheadCfg::default();
         let num = |k: &str| get(k).and_then(|v| v.trim().parse::<usize>().ok());
+        let observe = AheadMode::parse(get("FASTLANE_AHEAD").as_deref()) == AheadMode::Observe;
         AheadCfg {
             max_blocks: num("FASTLANE_AHEAD_MAX_BLOCKS").filter(|v| (1..=1024).contains(v)).unwrap_or(d.max_blocks),
             run_all: get("FASTLANE_AHEAD_FILTER").is_some_and(|v| v.trim().eq_ignore_ascii_case("all")),
@@ -284,6 +354,10 @@ impl AheadCfg {
             compare_delay: get("FASTLANE_AHEAD_COMPARE_DELAY_BLOCKS").and_then(|v| v.trim().parse::<u64>().ok()).filter(|v| *v <= 30).unwrap_or(COMPARE_DELAY_DEFAULT),
             // Unset = on; only an explicit off / 0 / false / no turns it off.
             revert_unsure: get("FASTLANE_AHEAD_REVERT_UNSURE").is_none_or(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "off" | "0" | "false" | "no")),
+            // Observe-mode build (Oct 31): unset = on only when the predicted
+            // copy only OBSERVES (FASTLANE_AHEAD=observe: it feeds no
+            // decision); FASTLANE_AHEAD=on keeps the old rule unless set.
+            unknown_continue: on_off(get("FASTLANE_AHEAD_UNKNOWN_CONTINUE").as_deref()).unwrap_or(observe),
         }
     }
 }
@@ -879,6 +953,10 @@ pub enum Fate {
     Ran,
     /// Could not be run exactly (pools it may touch marked unsure).
     Failed,
+    /// Could not be run exactly and NOTHING ties it to our pools: with
+    /// FASTLANE_AHEAD_UNKNOWN_CONTINUE the prediction went on past it
+    /// (nothing marked). A pool it really moved = "missedUnknown".
+    Unknown,
 }
 
 impl Fate {
@@ -888,6 +966,7 @@ impl Fate {
             Fate::OffRoute => "offRoute",
             Fate::Ran => "ran",
             Fate::Failed => "failed",
+            Fate::Unknown => "unknown",
         }
     }
 }
@@ -1054,6 +1133,19 @@ pub struct AheadStats {
     /// Failed runs that marked more pools unsure under the accuracy-fix
     /// rules (native-ETH pools of a named coin, the target's learned pools).
     pub failed_widened: u64,
+    /// FASTLANE_AHEAD_UNKNOWN_CONTINUE: transactions we could not run and
+    /// that nothing tied to our pools, which we predicted PAST (no stop).
+    pub unknown_continued: u64,
+    /// ...and pools such a transaction really moved (a sure pool that was
+    /// wrong because of the rule: the measure of whether it is safe).
+    pub missed_unknown: u64,
+    /// Observe-mode build: per feed message, how many blocks the predicted
+    /// tip was ahead of copy 2's confirmed version (0 = no tip: stopped or
+    /// waiting). The "blocks fresher" gain. Ring of the newest MAX_TIMES.
+    pub ahead_blocks: Vec<u64>,
+    pub ahead_n: u64,
+    /// Feed messages that left a tip (the rest: no prediction to use).
+    pub tips: u64,
     /// L2: apply_us samples seen (the ring below keeps the newest MAX_TIMES).
     pub time_n: u64,
     pub stopped: HashMap<&'static str, u64>,
@@ -1101,6 +1193,9 @@ impl AheadStats {
         let more = json!({
             "missedReverted": self.missed_reverted, "missedFailed": self.missed_failed, "staleBase": self.stale_base, "baseLate": self.base_late,
             "notCaptured": self.not_captured, "confGone": self.conf_gone, "rebaseRewrites": self.rebase_rewrites, "settleLost": self.settle_lost, "failedWidened": self.failed_widened,
+            "unknownContinued": self.unknown_continued, "missedUnknown": self.missed_unknown, "tips": self.tips,
+            // How many blocks the tip was ahead of copy 2 (per feed message, 0 = no tip).
+            "aheadBlocks": if times { let mut b = self.ahead_blocks.clone(); crate::timing::pct_of(&mut b) } else { Value::Null },
         });
         if let (Value::Object(o), Value::Object(m)) = (&mut out, more) {
             o.extend(m);
@@ -1113,14 +1208,30 @@ impl AheadStats {
         let mut t = self.apply_us.clone();
         let p = crate::timing::pct_of(&mut t);
         let g = |k: &str| p.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
+        let mut b = self.ahead_blocks.clone();
+        let pb = crate::timing::pct_of(&mut b);
+        let ab = |k: &str| pb.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
         let mut stops: Vec<String> = self.stopped.iter().map(|(k, v)| format!("{k}:{v}")).collect();
         stops.sort();
         format!(
-            "[arbsim] fastlane ahead (last hour): msgs {} applied {} late {} | txs run {} skipped {} off-route {} failed {} (pools unsure {}, nothing found {}, v4 only {}, probes skipped {}, widened {}) filterMissed {} assumedUnsure {} nativePicks {} | apply us p50 {} p90 {} p99 {} max {} | rebases {} (rewrites {}) reapplied {} | agree {} disagree {} (missed {} [filter {} ran {} reverted {} failed {} off-route {}] phantom {} value {}; stale base {}) unsure {} not from a tx {} conf gone {} unpredicted {} base late {} | msgs while stopped {} over budget {} | stopped [{}]",
+            "[arbsim] fastlane ahead (last hour): msgs {} applied {} late {} | txs run {} skipped {} off-route {} failed {} (pools unsure {}, nothing found {}, v4 only {}, probes skipped {}, widened {}) filterMissed {} assumedUnsure {} nativePicks {} | apply us p50 {} p90 {} p99 {} max {} | rebases {} (rewrites {}) reapplied {} | agree {} disagree {} (missed {} [filter {} ran {} reverted {} failed {} off-route {}] phantom {} value {}; stale base {}) unsure {} not from a tx {} conf gone {} unpredicted {} base late {} | msgs while stopped {} over budget {} | stopped [{}] | unknown continued {} (missed {}) | tips {} blocks ahead p50 {} p90 {}",
             self.msgs, self.applied, self.late_msgs, self.txs_run, self.txs_skipped, self.txs_off_route, self.txs_failed, self.txs_marked, self.failed_unknown, self.v4_fallback, self.probes_skipped, self.failed_widened, self.filter_missed, self.assumed_unsure, self.native_picks,
             g("p50"), g("p90"), g("p99"), g("max"), self.rebases, self.rebase_rewrites, self.reapplied,
             self.agree, self.disagree, self.missed, self.missed_filter, self.missed_ran, self.missed_reverted, self.missed_failed, self.missed_off_route, self.phantom, self.value_diff, self.stale_base, self.unsure, self.not_from_tx, self.conf_gone, self.unpredicted, self.base_late, self.msgs_stopped, self.over_budget, stops.join(" "),
+            self.unknown_continued, self.missed_unknown, self.tips, ab("p50"), ab("p90"),
         )
+    }
+
+    /// Observe-mode build: one "blocks ahead of copy 2" sample (ring, like
+    /// apply_us).
+    fn add_ahead(&mut self, blocks: u64) {
+        if self.ahead_blocks.len() < MAX_TIMES {
+            self.ahead_blocks.push(blocks);
+        } else {
+            let i = (self.ahead_n % MAX_TIMES as u64) as usize;
+            self.ahead_blocks[i] = blocks;
+        }
+        self.ahead_n += 1;
     }
 
     /// L2 (review): a ring of the newest MAX_TIMES samples, so the
@@ -1420,6 +1531,19 @@ impl Ahead {
             // No tip for this message: counted for the "stopped %" share.
             self.count(|s| s.msgs_stopped += 1);
         }
+        // Observe-mode build: the "blocks fresher" gain right now = how many
+        // blocks the predicted tip is ahead of copy 2's confirmed version
+        // (0 = no tip: nothing a scan could have used).
+        let gain = match (&self.tip, &self.base) {
+            (Some(t), Some(b)) => t.seq.saturating_sub(b.seq),
+            _ => 0,
+        };
+        self.count(|s| {
+            if gain > 0 {
+                s.tips += 1;
+            }
+            s.add_ahead(gain);
+        });
     }
 
     /// Bounded: keep only the newest messages (2 x max_blocks).
@@ -1577,6 +1701,7 @@ impl Ahead {
                 (Fate::Ran, true) => "missedRan",
                 (Fate::Ran, false) => "missedReverted",
                 (Fate::Failed, _) => "missedFailed",
+                (Fate::Unknown, _) => "missedUnknown",
             };
             let kind = match (conf_moved.contains(k), p.changed_cum.contains(k)) {
                 (true, false) => by.map_or("notFromTx", miss_kind),
@@ -1607,6 +1732,7 @@ impl Ahead {
                     "missedReverted" => s.missed_reverted += 1,
                     "missedFailed" => s.missed_failed += 1,
                     "missedOffRoute" => s.missed_off_route += 1,
+                    "missedUnknown" => s.missed_unknown += 1,
                     "phantom" => s.phantom += 1,
                     _ => s.value_diff += 1,
                 }
@@ -2023,7 +2149,22 @@ impl Ahead {
                     // zero there and stop: nothing of ours, same answer).
                     let hit = self.guess_touched(&ov, &ctx, t, &pools, &named_now, &native, true);
                     if hit.is_empty() {
-                        return Err("failed_tx_unknown_effect");
+                        if !self.cfg.unknown_continue {
+                            return Err("failed_tx_unknown_effect");
+                        }
+                        // FASTLANE_AHEAD_UNKNOWN_CONTINUE: nothing ties it to
+                        // our pools (no pool it reads, names or moved before,
+                        // no coin of ours, no PoolManager): predict past it,
+                        // marking nothing. It is noted "unknown" so a pool it
+                        // DID move is counted "missedUnknown" (measured, not
+                        // trusted blindly). Its target is remembered, like any
+                        // failed run's, and taught real pools by copy 2.
+                        self.count(|s| s.unknown_continued += 1);
+                        if let Some(a) = t.to {
+                            self.learn_toucher(a, &[]);
+                        }
+                        notes.push(note(t, Fate::Unknown, false, Some(why), Vec::new()));
+                        continue;
                     }
                     self.count(|s| s.txs_marked += 1);
                     // Its target is remembered (its next calls are picked),
@@ -2262,6 +2403,10 @@ struct Runtime {
     /// for the practice line.
     agreement: Mutex<PredictionCounts>,
     dropped: std::sync::atomic::AtomicU64,
+    /// FASTLANE_AHEAD=on: the fast lane scans the tips. observe: false, the
+    /// tips are never handed out (wait_tip / global_tip answer None), so no
+    /// lane, scanner or trigger decision can ever read them.
+    feeds: bool,
 }
 
 static RT: OnceLock<Runtime> = OnceLock::new();
@@ -2273,33 +2418,57 @@ pub fn start(c2: super::intake::Copy2Handle) -> bool {
     // 5.9% agreement on 300 real blocks, unsure on nearly every pool. It now
     // runs only when asked for: FASTLANE_AHEAD=on (with FASTLANE practice /
     // live). Off = no thread, no memory; the fast lane scans copy 2 instead.
-    if !ahead_wanted(std::env::var("FASTLANE_AHEAD").ok().as_deref()) {
+    // Oct 31: FASTLANE_AHEAD=observe runs it WITHOUT feeding the lane.
+    let am = AheadMode::parse(std::env::var("FASTLANE_AHEAD").ok().as_deref());
+    if am == AheadMode::Off {
         return false;
     }
-    start_with(mode(), c2, AheadCfg::from_lookup(|k| std::env::var(k).ok(), 0))
+    start_as(mode(), am, c2, AheadCfg::from_lookup(|k| std::env::var(k).ok(), 0))
 }
 
-/// FASTLANE_AHEAD: "on" / "1" / "true" = run the predicted copy; anything
-/// else (unset included) = off (the default since Oct 27).
+/// FASTLANE_AHEAD: "on" / "1" / "true" = run the predicted copy and scan on
+/// it; "observe" = run it and measure only (Oct 31); anything else (unset
+/// included) = off (the default since Oct 27).
 pub fn ahead_wanted(v: Option<&str>) -> bool {
-    matches!(v.map(|x| x.trim().to_ascii_lowercase()).as_deref(), Some("on" | "1" | "true" | "yes"))
+    AheadMode::parse(v) != AheadMode::Off
 }
 
-/// `start` with the mode given (tests: Off must start nothing).
-pub fn start_with(m: Mode, c2: super::intake::Copy2Handle, mut cfg: AheadCfg) -> bool {
-    if m == Mode::Off || RT.get().is_some() {
+/// Is the predicted copy running AND meant to feed the fast lane
+/// (FASTLANE_AHEAD=on)? false when off or observe: the lane then scans copy
+/// 2's confirmed versions, exactly as with the predicted copy off.
+pub fn feeds_lane() -> bool {
+    RT.get().is_some_and(|rt| rt.feeds)
+}
+
+/// Is the predicted copy running in observe mode (measuring only)?
+pub fn observing() -> bool {
+    RT.get().is_some_and(|rt| !rt.feeds)
+}
+
+/// `start` with the mode given (tests: Off must start nothing), as "on".
+pub fn start_with(m: Mode, c2: super::intake::Copy2Handle, cfg: AheadCfg) -> bool {
+    start_as(m, AheadMode::On, c2, cfg)
+}
+
+/// `start` with both switches given. `am` Off starts nothing; Observe runs
+/// the predicted copy but never hands its tips out (see AheadMode).
+pub fn start_as(m: Mode, am: AheadMode, c2: super::intake::Copy2Handle, mut cfg: AheadCfg) -> bool {
+    if m == Mode::Off || am == AheadMode::Off || RT.get().is_some() {
         return false;
     }
+    let feeds = am == AheadMode::On;
     cfg.l2_offset = c2.sh.cfg.l2_offset;
     let (tx, rx) = std::sync::mpsc::sync_channel::<Ev>(4096);
-    if RT.set(Runtime { tx, tip: Mutex::new((0, None)), tip_cv: std::sync::Condvar::new(), status: Mutex::new(json!({})), agreement: Mutex::new(PredictionCounts::default()), dropped: Default::default() }).is_err() {
+    if RT.set(Runtime { tx, tip: Mutex::new((0, None)), tip_cv: std::sync::Condvar::new(), status: Mutex::new(json!({})), agreement: Mutex::new(PredictionCounts::default()), dropped: Default::default(), feeds }).is_err() {
         return false;
     }
     eprintln!(
-        "[arbsim] fastlane ahead: predicted copy ON (FASTLANE={}); max {} blocks, filter {}, zero node reads",
+        "[arbsim] fastlane ahead: predicted copy {} (FASTLANE={}); max {} blocks, filter {}, unknown-effect txs {}",
+        if feeds { "ON (the fast lane scans its tips)" } else { "OBSERVE ONLY (measures itself; the fast lane never reads it)" },
         if m == Mode::Live { "live" } else { "practice" },
         cfg.max_blocks,
-        if cfg.run_all { "all" } else { "smart" }
+        if cfg.run_all { "all" } else { "smart" },
+        if cfg.unknown_continue { "predicted past (FASTLANE_AHEAD_UNKNOWN_CONTINUE)" } else { "stop the prediction" },
     );
     std::thread::Builder::new()
         .name("arbsim-ahead".into())
@@ -2332,14 +2501,16 @@ pub fn confirmed_hook() {
 
 /// The running sidecar's predicted tip (None when off / not ready).
 pub fn global_tip() -> Option<Arc<AheadTip>> {
-    RT.get().and_then(|rt| rt.tip.lock().unwrap_or_else(|e| e.into_inner()).1.clone())
+    // Observe mode: never handed out (nothing may decide on it).
+    RT.get().filter(|rt| rt.feeds).and_then(|rt| rt.tip.lock().unwrap_or_else(|e| e.into_inner()).1.clone())
 }
 
 /// Wait (at most `timeout`) for a tip newer than number `after`. Returns
 /// (its number, the tip). None = timed out / off. The fast lane's thread
 /// sleeps here between blocks: no busy polling.
 pub fn wait_tip(after: u64, timeout: Duration) -> Option<(u64, Arc<AheadTip>)> {
-    let rt = RT.get()?;
+    // Observe mode: never handed out (nothing may decide on it).
+    let rt = RT.get().filter(|rt| rt.feeds)?;
     let g = rt.tip.lock().unwrap_or_else(|e| e.into_inner());
     let (g, _) = rt.tip_cv.wait_timeout_while(g, timeout, |t| t.0 <= after || t.1.is_none()).unwrap_or_else(|e| e.into_inner());
     if g.0 > after {
@@ -2365,6 +2536,7 @@ pub fn status_json() -> Option<Value> {
     let rt = RT.get()?;
     let mut v = rt.status.lock().unwrap_or_else(|e| e.into_inner()).clone();
     v["dropped"] = json!(rt.dropped.load(std::sync::atomic::Ordering::Relaxed));
+    v["mode"] = json!(if rt.feeds { "on" } else { "observe" });
     Some(v)
 }
 
@@ -2618,7 +2790,28 @@ fn status_of(a: &Ahead) -> Value {
         "tip": tip.as_ref().map(|t| json!({"seq": t.seq, "block": t.block, "changed": t.changed_pools.len(), "unsure": t.unsure_pools.len(), "applyUs": t.apply_us, "ageMs": t.built_at.elapsed().as_millis() as u64})),
         "stopped": a.stopped().map(|(s, w)| json!({"seq": s, "why": w})),
         "touchers": a.touchers.len(),
+        // Observe-mode build (Oct 31): the live accuracy at a glance, per
+        // (pool, block) compared once the real block arrived: exact = same
+        // values, wrong = we were sure and differ, unsure = we had said so.
+        // blocksAhead = per feed message, how many blocks the tip was ahead
+        // of copy 2 (0 = no tip). Hour and since start.
+        "accuracy": {"hour": accuracy_json(&a.hour, true), "total": accuracy_json(&a.total, false)},
         "hour": a.hour.json(), "total": a.total.json_with(false),
+    })
+}
+
+/// The accuracy summary (status "fastlaneAhead.accuracy"). `times` false =
+/// no blocks-ahead percentiles (no copy + sort of the since-start ring).
+fn accuracy_json(s: &AheadStats, times: bool) -> Value {
+    let pct = |a: u64, b: u64| (b > 0).then(|| (1000.0 * a as f64 / b as f64).round() / 10.0);
+    json!({
+        "exact": s.agree, "wrong": s.disagree, "unsure": s.unsure,
+        "exactPctOfSure": pct(s.agree, s.agree + s.disagree),
+        "surePct": pct(s.agree + s.disagree, s.agree + s.disagree + s.unsure),
+        "blocksCompared": s.compared, "blocksUnpredicted": s.unpredicted,
+        "tipSharePct": pct(s.tips, s.msgs),
+        "blocksAhead": if times { let mut b = s.ahead_blocks.clone(); crate::timing::pct_of(&mut b) } else { Value::Null },
+        "unknownContinued": s.unknown_continued, "missedUnknown": s.missed_unknown,
     })
 }
 

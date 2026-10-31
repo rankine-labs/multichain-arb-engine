@@ -45,7 +45,7 @@
 //   and says so (an incomplete file is refused by the replay unless asked).
 //
 //   REPLAY: `arbsim ahead-replay <capture file> [--json] [--samples N]
-//   [--budget-ms N] [--partial] [--revert-sure] [--sender-funds trusted|strict]`
+//   [--budget-ms N] [--partial] [--revert-sure] [--sender-funds trusted|strict] [--unknown-continue]`
 //     Builds a fresh predicted copy, feeds it the capture event by event and
 //     prints: agreement % (agree / (agree + disagree), per pool compared),
 //     the disagreement breakdown by cause (missedFilter / missedRan /
@@ -425,6 +425,8 @@ fn dec_cfg(d: &mut Dec) -> Res<AheadCfg> {
         // Not in the file (format 1): the replay's own setting
         // (`--revert-sure` = off, the old rule).
         revert_unsure: true,
+        // Not in the file either: `--unknown-continue` (Oct 31).
+        unknown_continue: false,
     })
 }
 
@@ -980,6 +982,9 @@ pub struct ReplayOpts {
     /// Override FASTLANE_AHEAD_TRUST_SENDER_FUNDS as captured:
     /// `--sender-funds trusted|strict` (live runs strict unless set).
     pub trust_sender_funds: Option<bool>,
+    /// FASTLANE_AHEAD_UNKNOWN_CONTINUE for this replay (`--unknown-continue`;
+    /// off = stop the prediction, the rule the capture ran with).
+    pub unknown_continue: bool,
 }
 
 /// Replay a capture through a fresh predicted copy. Returns the report
@@ -999,6 +1004,7 @@ pub fn replay(cap: &CapFile, opts: &ReplayOpts) -> Result<Value, String> {
     if let Some(v) = opts.trust_sender_funds {
         cfg.trust_sender_funds = v;
     }
+    cfg.unknown_continue = opts.unknown_continue;
     let mut a = Ahead::new(cfg);
     a.collect_all = Some(Vec::new());
     let mut prov: Arc<dyn Provenance + Send + Sync> = Arc::new(ProvSets::all_exact());
@@ -1096,7 +1102,7 @@ fn top(it: impl Iterator<Item = String>, n: usize) -> Vec<Value> {
 
 fn report(a: &Ahead, all: &[Value], i: ReportInfo) -> Value {
     let t = &a.total;
-    let kinds = ["missedFilter", "missedRan", "missedReverted", "missedFailed", "missedOffRoute", "phantom", "value", "staleBase"];
+    let kinds = ["missedFilter", "missedRan", "missedReverted", "missedFailed", "missedUnknown", "missedOffRoute", "phantom", "value", "staleBase"];
     let by_kind: serde_json::Map<String, Value> = kinds.iter().map(|k| (k.to_string(), json!(all.iter().filter(|s| s["kind"] == *k).count()))).collect();
     let pct = |x: u64, n: u64| if n > 0 { json!((1000.0 * x as f64 / n as f64).round() / 10.0) } else { Value::Null };
     let why_of = |kind: &str| top(all.iter().filter(|s| s["kind"] == kind).map(|s| s["txWhy"].as_str().unwrap_or("(no reason recorded)").to_string()), 10);
@@ -1110,6 +1116,13 @@ fn report(a: &Ahead, all: &[Value], i: ReportInfo) -> Value {
         _ => Value::Null,
     };
     let mut times = t.apply_us.clone();
+    let ahead_blocks = {
+        let mut b = t.ahead_blocks.clone();
+        let mean = if b.is_empty() { 0.0 } else { b.iter().sum::<u64>() as f64 / b.len() as f64 };
+        let mut v = crate::timing::pct_of(&mut b);
+        v["mean"] = json!((mean * 100.0).round() / 100.0);
+        v
+    };
     json!({
         "capture": {
             "complete": i.complete, "cut": i.cut, "feedMessages": i.n_feed, "versions": i.n_conf, "settledRecords": i.n_settled,
@@ -1137,6 +1150,10 @@ fn report(a: &Ahead, all: &[Value], i: ReportInfo) -> Value {
             "msgs": t.msgs, "applied": t.applied, "txsRun": t.txs_run, "txsSkipped": t.txs_skipped, "txsFailed": t.txs_failed,
             "txsOffRoute": t.txs_off_route, "failedUnknown": t.failed_unknown, "failedWidened": t.failed_widened, "probesSkipped": t.probes_skipped, "revertsMarked": t.reverts_marked, "revertsKept": t.reverts_kept, "revertUnsure": a.cfg().revert_unsure, "trustSenderFunds": a.cfg().trust_sender_funds,
             "filterMissed": t.filter_missed, "rebases": t.rebases, "rebaseRewrites": t.rebase_rewrites,
+            "unknownContinue": a.cfg().unknown_continue, "unknownContinued": t.unknown_continued, "missedUnknown": t.missed_unknown,
+            // How many blocks the tip was ahead of copy 2, per feed message
+            // (0 = no tip), and the messages that left a tip.
+            "tips": t.tips, "aheadBlocks": ahead_blocks,
             "stopped": t.stopped.iter().map(|(k, v)| (k.to_string(), json!(v))).collect::<serde_json::Map<String, Value>>(),
         },
         "liveSameStretch": live,
@@ -1175,6 +1192,7 @@ pub fn print_report(r: &Value, samples: usize) -> String {
         ("missedRan", "we ran it, our run succeeded but did not move this pool"),
         ("missedReverted", "we ran it, our run REVERTED (it succeeded on chain)"),
         ("missedFailed", "we could not run it and did not mark this pool unsure"),
+        ("missedUnknown", "we could not run it, nothing tied it to our pools, we predicted past it: it moved this one"),
         ("missedOffRoute", "not run (named only off-route pools) yet it moved this one"),
         ("phantom", "we moved it, the chain did not"),
         ("value", "both moved it, to different values"),
@@ -1206,6 +1224,12 @@ pub fn print_report(r: &Value, samples: usize) -> String {
         if p["trustSenderFunds"].as_bool() == Some(true) { "trusted" } else { "strict" },
         p["msgs"], p["applied"], p["txsRun"], p["txsSkipped"], p["txsFailed"], p["txsOffRoute"], p["failedUnknown"], p["failedWidened"], p["revertsMarked"], p["revertsKept"], p["filterMissed"], p["rebases"], p["rebaseRewrites"], p["stopped"]
     );
+    o += &format!(
+        "unknown-effect txs (could not run, nothing ties them to our pools): {} ({} predicted past, {} pools they moved = missedUnknown) | tips {} of {} messages; blocks ahead of copy 2 per message p50 {} p90 {} mean {}\n",
+        if p["unknownContinue"].as_bool() == Some(true) { "predicted past" } else { "stop the prediction" },
+        p["unknownContinued"], p["missedUnknown"], p["tips"], p["msgs"],
+        p["aheadBlocks"]["p50"], p["aheadBlocks"]["p90"], p["aheadBlocks"]["mean"]
+    );
     if r["liveSameStretch"].is_object() {
         let l = &r["liveSameStretch"];
         o += &format!(
@@ -1224,10 +1248,10 @@ pub fn print_report(r: &Value, samples: usize) -> String {
     o
 }
 
-/// `arbsim ahead-replay <capture file> [--json] [--samples N] [--budget-ms N] [--partial] [--revert-sure] [--sender-funds trusted|strict]`
+/// `arbsim ahead-replay <capture file> [--json] [--samples N] [--budget-ms N] [--partial] [--revert-sure] [--sender-funds trusted|strict] [--unknown-continue]`
 pub fn replay_main(args: &[String]) {
     let Some(path) = args.get(2).filter(|a| !a.starts_with("--")) else {
-        eprintln!("usage: arbsim ahead-replay <capture file> [--json] [--samples N] [--budget-ms N] [--partial] [--revert-sure] [--sender-funds trusted|strict]");
+        eprintln!("usage: arbsim ahead-replay <capture file> [--json] [--samples N] [--budget-ms N] [--partial] [--revert-sure] [--sender-funds trusted|strict] [--unknown-continue]");
         std::process::exit(2);
     };
     let arg = |f: &str| args.iter().position(|a| a == f).and_then(|i| args.get(i + 1)).and_then(|v| v.parse::<u64>().ok());
@@ -1252,7 +1276,12 @@ pub fn replay_main(args: &[String]) {
             std::process::exit(2);
         }
     };
-    let opts = ReplayOpts { budget_ms: arg("--budget-ms"), revert_unsure: args.iter().any(|a| a == "--revert-sure").then_some(false), trust_sender_funds };
+    let opts = ReplayOpts {
+        budget_ms: arg("--budget-ms"),
+        revert_unsure: args.iter().any(|a| a == "--revert-sure").then_some(false),
+        trust_sender_funds,
+        unknown_continue: args.iter().any(|a| a == "--unknown-continue"),
+    };
     match replay(&cap, &opts) {
         Ok(r) => {
             if args.iter().any(|a| a == "--json") {
