@@ -45,7 +45,7 @@
 //   and says so (an incomplete file is refused by the replay unless asked).
 //
 //   REPLAY: `arbsim ahead-replay <capture file> [--json] [--samples N]
-//   [--budget-ms N] [--partial] [--revert-sure] [--sender-funds trusted|strict] [--unknown-continue]`
+//   [--budget-ms N] [--partial] [--revert-sure] [--sender-funds trusted|strict] [--unknown-continue] [--keeper <truth file> [--keeper-warm [--keeper-warm-passes N]] [--keep-contracts N] [--keep-seeds-per-h N]]`
 //     Builds a fresh predicted copy, feeds it the capture event by event and
 //     prints: agreement % (agree / (agree + disagree), per pool compared),
 //     the disagreement breakdown by cause (missedFilter / missedRan /
@@ -427,6 +427,8 @@ fn dec_cfg(d: &mut Dec) -> Res<AheadCfg> {
         revert_unsure: true,
         // Not in the file either: `--unknown-continue` (Oct 31).
         unknown_continue: false,
+        // Not in the file: `--keeper <truth file>` (Oct 31).
+        keeper: false,
     })
 }
 
@@ -990,6 +992,39 @@ pub struct ReplayOpts {
 /// Replay a capture through a fresh predicted copy. Returns the report
 /// (JSON; see `print_report`).
 pub fn replay(cap: &CapFile, opts: &ReplayOpts) -> Result<Value, String> {
+    replay_with(cap, opts, None).map(|x| x.0)
+}
+
+/// The keeper side of a replay (`--keeper <truth file>`, copy2/keeper_replay.rs).
+pub struct KeeperOpts {
+    pub truth: Arc<super::keeper_replay::Truth>,
+    pub cfg: super::keeper::KeeperCfg,
+    /// Learned batches to have seeded at the start (the warm start), if any.
+    pub warm: Option<Vec<Vec<crate::state::MissItem>>>,
+}
+
+/// Replay with the hot-contract keeper next to the predicted copy (see
+/// copy2/keeper_replay.rs). `warm`: run the capture once to learn the hot
+/// contracts, then measure a run that starts with them seeded.
+pub fn replay_keeper(cap: &CapFile, opts: &ReplayOpts, truth: Arc<super::keeper_replay::Truth>, cfg: super::keeper::KeeperCfg, warm_passes: usize) -> Result<Value, String> {
+    let warm = warm_passes > 0;
+    let mut first_pass: Option<Vec<Vec<crate::state::MissItem>>> = None;
+    // Each learning pass starts with what the passes before it learned (a
+    // run that gets further needs values the earlier one never reached).
+    for _ in 0..warm_passes {
+        let (_, rk) = replay_with(cap, opts, Some(KeeperOpts { truth: truth.clone(), cfg: cfg.clone(), warm: first_pass.clone() }))?;
+        let mut acc = first_pass.take().unwrap_or_default();
+        acc.extend(rk.map(|k| k.learned_all).unwrap_or_default());
+        first_pass = Some(acc);
+    }
+    let n_warm = first_pass.as_ref().map(|v| v.iter().map(|b| b.len()).sum::<usize>());
+    let (mut r, _) = replay_with(cap, opts, Some(KeeperOpts { truth, cfg, warm: first_pass }))?;
+    r["keeper"]["warmStart"] = json!(warm);
+    r["keeper"]["warmValues"] = json!(n_warm);
+    Ok(r)
+}
+
+fn replay_with(cap: &CapFile, opts: &ReplayOpts, keeper: Option<KeeperOpts>) -> Result<(Value, Option<super::keeper_replay::ReplayKeeper>), String> {
     let t0 = Instant::now();
     let Some(CapEv::Header { cfg, l2_offset, live: live_start }) = cap.events.first().cloned() else {
         return Err("the capture does not start with its settings".into());
@@ -1005,7 +1040,29 @@ pub fn replay(cap: &CapFile, opts: &ReplayOpts) -> Result<Value, String> {
         cfg.trust_sender_funds = v;
     }
     cfg.unknown_continue = opts.unknown_continue;
+    cfg.keeper = keeper.is_some();
+    let l2 = cfg.l2_offset;
     let mut a = Ahead::new(cfg);
+    a.diag = Some(Default::default());
+    // KEEPER (--keeper): the real keeper core on the recorded block diffs.
+    let mut rk = keeper.map(|k| {
+        let mut r = super::keeper_replay::ReplayKeeper::new(k.truth, k.cfg);
+        // Blocks a second, from the feed's own timestamps (seeds per hour).
+        let ts: Vec<(u64, u64)> = cap.events.iter().filter_map(|e| if let CapEv::Feed(m) = e { Some((m.seq, m.ts)) } else { None }).collect();
+        if let (Some(f), Some(l)) = (ts.first(), ts.last()) {
+            if l.1 > f.1 && l.0 > f.0 {
+                r.blocks_per_s = (l.0 - f.0) as f64 / (l.1 - f.1) as f64;
+            }
+        }
+        if let Some(w) = k.warm {
+            for b in &w {
+                r.core.learn(b);
+            }
+        }
+        let w = k_warm_flag(&r);
+        (r, w)
+    });
+    let mut warm_pending = rk.as_ref().is_some_and(|x| x.1);
     a.collect_all = Some(Vec::new());
     let mut prov: Arc<dyn Provenance + Send + Sync> = Arc::new(ProvSets::all_exact());
     let mut moves: HashMap<B256, Option<Vec<String>>> = HashMap::new();
@@ -1045,6 +1102,12 @@ pub fn replay(cap: &CapFile, opts: &ReplayOpts) -> Result<Value, String> {
                     let k = *snaps.keys().next().unwrap();
                     snaps.remove(&k);
                 }
+                if let Some((k, _)) = rk.as_mut() {
+                    // The keeper first (its version of this block), then
+                    // copy 2's version: the rebase merges both at once.
+                    k.advance(*seq + l2, &mut a, warm_pending);
+                    warm_pending = false;
+                }
                 let c = Confirmed { seq: *seq, snap: snap.clone(), ctx: ctx.clone(), diff: Arc::new(StateDiff::default()), prov: prov.clone() };
                 a.on_confirmed(c, &|h| moves.get(h).cloned().flatten());
             }
@@ -1068,7 +1131,28 @@ pub fn replay(cap: &CapFile, opts: &ReplayOpts) -> Result<Value, String> {
     }
     let took_ms = t0.elapsed().as_millis() as u64;
     let all = a.collect_all.take().unwrap_or_default();
-    Ok(report(&a, &all, ReportInfo { n_feed, n_conf, n_settled, settled_used, filled, first_block, last_block, took_ms, complete: cap.complete, cut: cap.cut.clone(), live_start, live_end, l2_offset, budget_ms: opts.budget_ms }))
+    let mut r = report(&a, &all, ReportInfo { n_feed, n_conf, n_settled, settled_used, filled, first_block, last_block, took_ms, complete: cap.complete, cut: cap.cut.clone(), live_start, live_end, l2_offset, budget_ms: opts.budget_ms });
+    if let Some((fails, unsure)) = &a.diag {
+        let top = |m: &BTreeMap<String, u64>| {
+            let mut v: Vec<(&String, &u64)> = m.iter().collect();
+            v.sort_by(|x, y| y.1.cmp(x.1));
+            v.into_iter().take(12).map(|(k, n)| json!({"what": k, "n": n})).collect::<Vec<_>>()
+        };
+        r["diag"] = json!({"failedRuns": top(fails), "unsurePools": top(unsure)});
+    }
+    let rk = rk.map(|x| x.0);
+    if let Some(k) = &rk {
+        let t = &a.total;
+        let mut kr = k.report();
+        kr["bases"] = json!({"merged": t.kept_bases, "notMerged": t.kept_missing, "valuesAdded": t.kept_values, "keeperRebases": t.kept_rebases, "learned": t.learned});
+        r["keeper"] = kr;
+    }
+    Ok((r, rk))
+}
+
+/// Whether the replay keeper starts warm (it was given values to learn first).
+fn k_warm_flag(r: &super::keeper_replay::ReplayKeeper) -> bool {
+    r.core.seeds_waiting() > 0 || r.core.held_counts().0 > 0
 }
 
 struct ReportInfo {
@@ -1230,6 +1314,30 @@ pub fn print_report(r: &Value, samples: usize) -> String {
         p["unknownContinued"], p["missedUnknown"], p["tips"], p["msgs"],
         p["aheadBlocks"]["p50"], p["aheadBlocks"]["p90"], p["aheadBlocks"]["mean"]
     );
+    if r["keeper"].is_object() {
+        let k = &r["keeper"];
+        o += &format!(
+            "KEEPER ({}): blocks followed {} (missing {}) | node calls: diffs {} seeds {} = {}/s (diffs {}/s) | held now: {} contracts, {} values | audit of every held value vs the chain: ok {} WRONG {} unknown {} | bases merged {} not merged {} (values added {}) keeper rebases {} learned {} | seed values unknown {} | apply us p50 {} p90 {} max {} (this machine)\n",
+            if k["warmStart"].as_bool() == Some(true) { format!("warm start: {} learned values from a first pass seeded at the start", k["warmValues"]) } else { "cold start".to_string() },
+            k["blocksFollowed"], k["missingBlocks"], k["calls"]["diffs"], k["calls"]["seeds"], k["calls"]["perS"], k["calls"]["diffsPerS"],
+            k["held"]["contracts"], k["held"]["values"], k["audit"]["ok"], k["audit"]["bad"], k["audit"]["unknown"],
+            k["bases"]["merged"], k["bases"]["notMerged"], k["bases"]["valuesAdded"], k["bases"]["keeperRebases"], k["bases"]["learned"],
+            k["seedValuesUnknown"], k["applyUsThisMachine"]["p50"], k["applyUsThisMachine"]["p90"], k["applyUsThisMachine"]["max"]
+        );
+        if let Some(v) = k["audit"]["samples"].as_array().filter(|v| !v.is_empty()) {
+            for x in v.iter().take(5) {
+                o += &format!("  audit WRONG: {x}\n");
+            }
+        }
+    }
+    for (k, title) in [("failedRuns", "why runs failed (all of them)"), ("unsurePools", "what made compared pools unsure")] {
+        if let Some(v) = r["diag"][k].as_array().filter(|v| !v.is_empty()) {
+            o += &format!("{title}:\n");
+            for x in v {
+                o += &format!("  {:>6}  {}\n", x["n"], x["what"].as_str().unwrap_or(""));
+            }
+        }
+    }
     if r["liveSameStretch"].is_object() {
         let l = &r["liveSameStretch"];
         o += &format!(
@@ -1248,10 +1356,10 @@ pub fn print_report(r: &Value, samples: usize) -> String {
     o
 }
 
-/// `arbsim ahead-replay <capture file> [--json] [--samples N] [--budget-ms N] [--partial] [--revert-sure] [--sender-funds trusted|strict] [--unknown-continue]`
+/// `arbsim ahead-replay <capture file> [--json] [--samples N] [--budget-ms N] [--partial] [--revert-sure] [--sender-funds trusted|strict] [--unknown-continue] [--keeper <truth file> [--keeper-warm [--keeper-warm-passes N]] [--keep-contracts N] [--keep-seeds-per-h N]]`
 pub fn replay_main(args: &[String]) {
     let Some(path) = args.get(2).filter(|a| !a.starts_with("--")) else {
-        eprintln!("usage: arbsim ahead-replay <capture file> [--json] [--samples N] [--budget-ms N] [--partial] [--revert-sure] [--sender-funds trusted|strict] [--unknown-continue]");
+        eprintln!("usage: arbsim ahead-replay <capture file> [--json] [--samples N] [--budget-ms N] [--partial] [--revert-sure] [--sender-funds trusted|strict] [--unknown-continue] [--keeper <truth file> [--keeper-warm [--keeper-warm-passes N]] [--keep-contracts N] [--keep-seeds-per-h N]]");
         std::process::exit(2);
     };
     let arg = |f: &str| args.iter().position(|a| a == f).and_then(|i| args.get(i + 1)).and_then(|v| v.parse::<u64>().ok());
@@ -1282,7 +1390,31 @@ pub fn replay_main(args: &[String]) {
         trust_sender_funds,
         unknown_continue: args.iter().any(|a| a == "--unknown-continue"),
     };
-    match replay(&cap, &opts) {
+    // KEEPER (Oct 31): --keeper <truth file> [--keeper-warm [--keeper-warm-passes N]] [--keep-contracts N]
+    // [--keep-seeds-per-h N]: the hot-contract keeper on recorded block diffs.
+    let keeper_file = args.iter().position(|a| a == "--keeper").and_then(|i| args.get(i + 1)).cloned();
+    let result = match keeper_file {
+        None => replay(&cap, &opts),
+        Some(f) => {
+            let truth = match super::keeper_replay::Truth::load(&f) {
+                Ok(t) => Arc::new(t),
+                Err(e) => {
+                    eprintln!("arbsim ahead-replay: --keeper {e}");
+                    std::process::exit(2);
+                }
+            };
+            let mut kc = super::keeper::KeeperCfg { on: true, ..Default::default() };
+            if let Some(n) = arg("--keep-contracts") {
+                kc.max_contracts = n.clamp(1, 1000) as usize;
+            }
+            if let Some(n) = arg("--keep-seeds-per-h") {
+                kc.seeds_per_hour = n;
+            }
+            let passes = if args.iter().any(|a| a == "--keeper-warm") { arg("--keeper-warm-passes").unwrap_or(1).clamp(1, 10) as usize } else { 0 };
+            replay_keeper(&cap, &opts, truth, kc, passes)
+        }
+    };
+    match result {
         Ok(r) => {
             if args.iter().any(|a| a == "--json") {
                 println!("{r}");

@@ -273,11 +273,17 @@ pub struct AheadCfg {
     /// rule is MEASURED. Default: on with FASTLANE_AHEAD=observe (nothing
     /// is decided on it), off with FASTLANE_AHEAD=on (unchanged), unless set.
     pub unknown_continue: bool,
+    /// FASTLANE_AHEAD_KEEPER (Oct 31, copy2/keeper.rs): use the hot-contract
+    /// keeper. The predicted copy lays the keeper's exact values of its
+    /// base block over copy 2's, and tells the keeper which outside values
+    /// its runs lacked. Default: on with FASTLANE_AHEAD=observe, off with
+    /// FASTLANE_AHEAD=on (unchanged), unless set.
+    pub keeper: bool,
 }
 
 impl Default for AheadCfg {
     fn default() -> Self {
-        AheadCfg { max_blocks: 32, run_all: false, max_txs: 256, max_touchers: 4096, l2_offset: 0, trust_sender_funds: false, msg_budget_us: 10_000, routes_only: true, compare_delay: 0, revert_unsure: true, unknown_continue: false }
+        AheadCfg { max_blocks: 32, run_all: false, max_txs: 256, max_touchers: 4096, l2_offset: 0, trust_sender_funds: false, msg_budget_us: 10_000, routes_only: true, compare_delay: 0, revert_unsure: true, unknown_continue: false, keeper: false }
     }
 }
 
@@ -358,6 +364,7 @@ impl AheadCfg {
             // copy only OBSERVES (FASTLANE_AHEAD=observe: it feeds no
             // decision); FASTLANE_AHEAD=on keeps the old rule unless set.
             unknown_continue: on_off(get("FASTLANE_AHEAD_UNKNOWN_CONTINUE").as_deref()).unwrap_or(observe),
+            keeper: on_off(get("FASTLANE_AHEAD_KEEPER").as_deref()).unwrap_or(observe),
         }
     }
 }
@@ -1032,6 +1039,17 @@ const MAX_SLOT_DIFFS: usize = 4;
 /// Most predicted blocks waiting for their agreement (bounded memory).
 const MAX_PENDING: usize = 256;
 
+/// The base with the keeper's values laid over it (see Ahead.merged).
+struct Merged {
+    /// Base sequence number it was made for, and the very base snapshot.
+    seq: u64,
+    base_snap: Arc<Snapshot>,
+    /// The keeper version used (pointer: a re-published version = re-merge).
+    kept: Arc<super::keeper::KeptVersion>,
+    snap: Arc<Snapshot>,
+    prov: Arc<dyn Provenance + Send + Sync>,
+}
+
 /// Why prediction stopped (no tip until a rebase passes it).
 #[derive(Clone, Debug)]
 struct Stop {
@@ -1146,6 +1164,16 @@ pub struct AheadStats {
     pub ahead_n: u64,
     /// Feed messages that left a tip (the rest: no prediction to use).
     pub tips: u64,
+    /// KEEPER (copy2/keeper.rs): bases laid over with the keeper's version
+    /// of that block / bases with no keeper version of exactly that block /
+    /// values the keeper added to them / predictions rebuilt because the
+    /// keeper's version arrived after copy 2's / values handed to the
+    /// keeper to learn.
+    pub kept_bases: u64,
+    pub kept_missing: u64,
+    pub kept_values: u64,
+    pub kept_rebases: u64,
+    pub learned: u64,
     /// L2: apply_us samples seen (the ring below keeps the newest MAX_TIMES).
     pub time_n: u64,
     pub stopped: HashMap<&'static str, u64>,
@@ -1194,6 +1222,7 @@ impl AheadStats {
             "missedReverted": self.missed_reverted, "missedFailed": self.missed_failed, "staleBase": self.stale_base, "baseLate": self.base_late,
             "notCaptured": self.not_captured, "confGone": self.conf_gone, "rebaseRewrites": self.rebase_rewrites, "settleLost": self.settle_lost, "failedWidened": self.failed_widened,
             "unknownContinued": self.unknown_continued, "missedUnknown": self.missed_unknown, "tips": self.tips,
+            "keptBases": self.kept_bases, "keptMissing": self.kept_missing, "keptValues": self.kept_values, "keptRebases": self.kept_rebases, "learned": self.learned,
             // How many blocks the tip was ahead of copy 2 (per feed message, 0 = no tip).
             "aheadBlocks": if times { let mut b = self.ahead_blocks.clone(); crate::timing::pct_of(&mut b) } else { Value::Null },
         });
@@ -1335,9 +1364,23 @@ pub struct Ahead {
     route_pools: Option<Arc<HashSet<String>>>,
     /// Predicted blocks waiting for their (settled) agreement, oldest first.
     pending: VecDeque<Pending>,
+    /// KEEPER: the keeper's recent versions (by L2 block, newest last).
+    kept: VecDeque<Arc<super::keeper::KeptVersion>>,
+    /// KEEPER: the base with the keeper's values of the same block laid
+    /// over it (None = the plain base: no keeper version of that block).
+    merged: Option<Merged>,
+    /// KEEPER: values our runs lacked or read only approximately, for the
+    /// keeper to learn (the runtime / replay hands them over and empties it).
+    pub learned: Vec<crate::state::MissItem>,
+    /// The collect run's reads of the last guess_touched (for learning).
+    last_probe: Option<crate::check::db::ReadLog>,
     /// Offline replay only (copy2/ahead_capture.rs): EVERY disagreement
     /// sample (unbounded there; None live).
     pub collect_all: Option<Vec<Value>>,
+    /// Offline replay only: why each run failed (reason -> count; with the
+    /// keeper: whether it held the missing value's contract) and what made
+    /// each compared pool unsure (cause -> count). None live.
+    pub diag: Option<(BTreeMap<String, u64>, BTreeMap<String, u64>)>,
     pub hour: AheadStats,
     pub total: AheadStats,
 }
@@ -1357,7 +1400,12 @@ impl Ahead {
             over_budget_seq: None,
             route_pools: None,
             pending: VecDeque::new(),
+            kept: VecDeque::new(),
+            merged: None,
+            learned: Vec::new(),
+            last_probe: None,
             collect_all: None,
+            diag: None,
             hour: AheadStats::default(),
             total: AheadStats::default(),
         }
@@ -1425,6 +1473,96 @@ impl Ahead {
 
     pub fn cfg(&self) -> &AheadCfg {
         &self.cfg
+    }
+
+    /// L2 block number of the confirmed base (None before the first one).
+    pub fn base_block(&self) -> Option<u64> {
+        self.base.as_ref().map(|b| b.seq + self.cfg.l2_offset)
+    }
+
+    /// The base the prediction runs on: copy 2's version, with the keeper's
+    /// values of exactly that block laid over it when there is one.
+    fn base_parts(&self, base: &Confirmed) -> (Arc<Snapshot>, Arc<dyn Provenance + Send + Sync>) {
+        match &self.merged {
+            Some(m) if m.seq == base.seq && Arc::ptr_eq(&m.base_snap, &base.snap) => (m.snap.clone(), m.prov.clone()),
+            _ => (base.snap.clone(), base.prov.clone()),
+        }
+    }
+
+    /// KEEPER: lay the keeper's version of the base block over the base
+    /// (copy2/keeper.rs merge_base: copy 2's exact values always win).
+    /// Returns whether the merged base changed.
+    fn remerge(&mut self) -> bool {
+        let Some(base) = &self.base else { return false };
+        if !self.cfg.keeper {
+            return false;
+        }
+        let block = base.seq + self.cfg.l2_offset;
+        let Some(kv) = self.kept.iter().rev().find(|v| v.block == block).cloned() else {
+            return self.merged.take().is_some();
+        };
+        if self.merged.as_ref().is_some_and(|m| m.seq == base.seq && Arc::ptr_eq(&m.base_snap, &base.snap) && Arc::ptr_eq(&m.kept, &kv)) {
+            return false;
+        }
+        let (snap, n) = super::keeper::merge_base(&base.snap, base.prov.as_ref(), &kv);
+        let prov: Arc<dyn Provenance + Send + Sync> = Arc::new(super::keeper::KeptProv { inner: base.prov.clone(), kept: kv.clone() });
+        self.merged = Some(Merged { seq: base.seq, base_snap: base.snap.clone(), kept: kv, snap: Arc::new(snap), prov });
+        self.count(|s| s.kept_values += n.slots as u64);
+        true
+    }
+
+    /// KEEPER: a keeper version (live: its thread published one; replay:
+    /// the replayed keeper moved on). Kept (bounded); when it is the version
+    /// of our base block and the prediction ran without it, the prediction
+    /// is rebuilt on the merged base (a "keeper rebase").
+    pub fn on_kept(&mut self, v: Arc<super::keeper::KeptVersion>) {
+        if !self.cfg.keeper {
+            return;
+        }
+        if self.kept.back().is_some_and(|x| Arc::ptr_eq(x, &v)) {
+            return;
+        }
+        // Same block re-published (a seed came back): replace it.
+        self.kept.retain(|x| x.block != v.block);
+        self.kept.push_back(v.clone());
+        while self.kept.len() > 64 {
+            self.kept.pop_front();
+        }
+        if self.base_block() == Some(v.block) && self.remerge() {
+            self.count(|s| s.kept_rebases += 1);
+            self.rebuild();
+        }
+    }
+
+    /// Re-apply every held message on the (new) base, like a rebase without
+    /// a new confirmed version.
+    fn rebuild(&mut self) {
+        let Some(seq) = self.base.as_ref().map(|b| b.seq) else { return };
+        self.entries.clear();
+        self.tip = None;
+        self.stop = None;
+        match self.over_budget_seq {
+            Some(s) if s > seq => self.stop = Some(Stop { seq: s, why: "msg_budget" }),
+            _ => self.over_budget_seq = None,
+        }
+        let before = self.hour.applied;
+        self.extend();
+        let n = self.hour.applied - before;
+        self.count(|s| s.reapplied += n);
+    }
+
+    /// KEEPER learning: what one run lacked / read approximately. Only
+    /// with the keeper on; bounded (the runtime empties it every wake-up).
+    fn learn_from_run(&mut self, missing: &[crate::state::MissItem], view: &dyn StateRead, prov: &dyn Provenance, sender: Address) {
+        if !self.cfg.keeper || self.learned.len() >= 4096 {
+            return;
+        }
+        let probe = self.last_probe.take();
+        let pools = self.pools.clone();
+        let skip = |a: &Address| pools.by_contract.contains_key(a);
+        let items = super::keeper::wanted_items(missing, probe.as_ref().map(|r| (&r.accounts, &r.slots)), view, prov, sender, &skip);
+        self.count(|s| s.learned += items.len() as u64);
+        self.learned.extend(items);
     }
 
     /// Held feed messages, oldest first (capture start).
@@ -1589,7 +1727,17 @@ impl Ahead {
         }
         self.count(|s| s.rebases += 1);
         let seq = c.seq;
+        // KEEPER: was the base we leave behind laid over with the keeper's
+        // values (by now)? Counted once per base.
+        if self.cfg.keeper {
+            if let Some(old) = &self.base {
+                let merged = self.merged.as_ref().is_some_and(|m| m.seq == old.seq && Arc::ptr_eq(&m.base_snap, &old.snap));
+                self.count(|s| if merged { s.kept_bases += 1 } else { s.kept_missing += 1 });
+            }
+        }
         self.base = Some(c);
+        // KEEPER: the keeper's values of this very block, if it has them.
+        self.remerge();
         self.entries.clear();
         self.tip = None;
         self.stop = None;
@@ -1667,6 +1815,23 @@ impl Ahead {
         for k in all {
             if unsure_of(k) {
                 self.count(|s| s.unsure += 1);
+                if let Some(d) = self.diag.as_mut() {
+                    // Replay diagnostics: what made it unsure (the first of
+                    // our transactions that marked it, else copy 2 / an
+                    // assumed value).
+                    let by = p.notes.iter().find(|n| n.pools.iter().any(|x| x == k) && !(n.fate == Fate::Ran && n.ok));
+                    let cause = if pools.not_ready.contains(k) {
+                        "copy 2: pool not ready".to_string()
+                    } else {
+                        match by {
+                            Some(n) if n.fate == Fate::Ran => "our run reverted".to_string(),
+                            Some(n) if n.fate == Fate::Failed => format!("could not run: {}", n.why.as_deref().unwrap_or("?")),
+                            Some(n) => n.fate.as_str().to_string(),
+                            None => "a run built on an assumed value (fill / sender funds)".to_string(),
+                        }
+                    };
+                    *d.1.entry(cause).or_default() += 1;
+                }
                 continue;
             }
             let Some(place) = pools.places.get(k).copied() else { continue };
@@ -1860,13 +2025,20 @@ impl Ahead {
     /// `failed`: count it in the failed-run counters (probes skipped,
     /// widened, nothing found, V4 only); a reverted run has its own.
     fn guess_touched(&mut self, ov: &Overlay, ctx: &BlockCtx, t: &DecodedTx, pools: &PoolSet, named_now: &Named, native: &[String], failed: bool) -> Vec<String> {
+        self.last_probe = None;
         let mut hit = if target_has_no_code(ov, t.to) {
             if failed {
                 self.count(|s| s.probes_skipped += 1);
             }
             Vec::new()
         } else {
-            probe_touched(ov, ctx, t, pools)
+            let reads = probe_reads(ov, ctx, t).unwrap_or_default();
+            let hit = pools.touched_by(&reads.accounts, &reads.slots);
+            // KEEPER: what the collect run read (learning only).
+            if self.cfg.keeper {
+                self.last_probe = Some(reads);
+            }
+            hit
         };
         for k in pools.named_direct(t.to, named_now).into_iter().chain(native.iter().cloned()) {
             if !hit.contains(&k) {
@@ -1975,9 +2147,12 @@ impl Ahead {
     /// Apply one message on top of the predicted tip (or the base).
     fn apply(&mut self, base: &Confirmed, m: &BinMsg) -> Result<Entry, &'static str> {
         let t0 = Instant::now();
+        // KEEPER: the base with the keeper's exact values of the same block
+        // (and the provenance that says so); the plain base otherwise.
+        let (base_snap, base_prov) = self.base_parts(base);
         let (prev_snap, prev_ctx, mut changed_cum, mut unsure_cum) = match self.entries.back() {
             Some(e) => (e.snap.clone(), e.ctx.clone(), e.changed_cum.clone(), e.unsure_cum.clone()),
-            None => (base.snap.clone(), base.ctx.clone().ok_or("no_block_details")?, HashSet::new(), HashSet::new()),
+            None => (base_snap, base.ctx.clone().ok_or("no_block_details")?, HashSet::new(), HashSet::new()),
         };
         // Deposits / retryables / anything we can't unpack: we can't know
         // what it does to our pools. Never guessed: stop until confirmed.
@@ -2070,7 +2245,7 @@ impl Ahead {
             }
             self.count(|s| s.txs_run += 1);
             let plan = OrderedPlan { msgs: vec![PlanMsg { seq: m.seq, ctx: ctx.clone(), txs: vec![t.clone()] }], trigger: t.hash, call_ctx: ctx.clone(), unrunnable: Vec::new() };
-            match run_ordered_keep(&ov, &plan, base.prov.as_ref(), &assume) {
+            match run_ordered_keep(&ov, &plan, base_prov.as_ref(), &assume) {
                 Ok((out, kept)) => {
                     // Did OUR run finish normally? (A reverted run moves
                     // nothing: agreement tells it apart, accuracy fixes.)
@@ -2091,6 +2266,15 @@ impl Ahead {
                     // (see AheadCfg). Worked out on the copy BEFORE its
                     // (gas / nonce only) changes are kept, like a failed run.
                     let revert_hit = if !ok && self.cfg.revert_unsure { Some(self.guess_touched(&ov, &ctx, t, &pools, &named_now, &native, false)) } else { None };
+                    // KEEPER: a reverted run often read a value copy 2 only
+                    // holds approximately (a bot's settings, a coin balance):
+                    // the keeper learns what its collect run read.
+                    if !ok {
+                        if revert_hit.is_none() && self.cfg.keeper {
+                            self.last_probe = probe_reads(&ov, &ctx, t);
+                        }
+                        self.learn_from_run(&[], &ov, base_prov.as_ref(), t.from);
+                    }
                     ov.commit(&kept.diff);
                     for (a, s) in &kept.forget {
                         ov.forget_slot(*a, *s);
@@ -2142,12 +2326,32 @@ impl Ahead {
                 Err(u) => {
                     let why = failed_why(&u, t.to, &pools);
                     self.count(|s| s.txs_failed += 1);
+                    if self.diag.is_some() {
+                        // Replay diagnostics: the reason, and (keeper) whether
+                        // the missing value's contract is kept.
+                        let owner = u.missing.first().and_then(|m| match m {
+                            crate::state::MissItem::Slot(a, _) | crate::state::MissItem::Account(a) => Some(*a),
+                            crate::state::MissItem::Code(_) => None,
+                        });
+                        let kept = match (&self.merged, owner) {
+                            (Some(m), Some(a)) if m.kept.accounts.contains_key(&a) => " [keeper holds that contract]",
+                            (Some(_), Some(_)) => " [keeper does not hold it]",
+                            _ => "",
+                        };
+                        let k = format!("{why}{kept}");
+                        if let Some(d) = self.diag.as_mut() {
+                            *d.0.entry(k).or_default() += 1;
+                        }
+                    }
                     // Which of our pools might it touch? What it reads in a
                     // collect run + what it names. Those become unsure.
                     // Practice fixes: the collect run is skipped when the
                     // target has no code in our copy (it could only read
                     // zero there and stop: nothing of ours, same answer).
                     let hit = self.guess_touched(&ov, &ctx, t, &pools, &named_now, &native, true);
+                    // KEEPER: the values it lacked (and what its collect run
+                    // read that we don't hold exactly) are learned.
+                    self.learn_from_run(&u.missing, &ov, base_prov.as_ref(), t.from);
                     if hit.is_empty() {
                         if !self.cfg.unknown_continue {
                             return Err("failed_tx_unknown_effect");
@@ -2369,7 +2573,7 @@ fn target_has_no_code(view: &dyn StateRead, to: Option<Address>) -> bool {
 /// (a missing value reads as zero just to keep going; NOTHING of this run
 /// is kept) and write down every account / value it read. Our pools among
 /// them are the ones it may touch. Never asks the node.
-fn probe_touched(view: &dyn StateRead, ctx: &BlockCtx, t: &DecodedTx, pools: &PoolSet) -> Vec<String> {
+fn probe_reads(view: &dyn StateRead, ctx: &BlockCtx, t: &DecodedTx) -> Option<crate::check::db::ReadLog> {
     let ov = Overrides::none();
     let mut s = Session::new(view, ctx, &ov, CheckOptions::default());
     s.db().set_recording(true);
@@ -2377,8 +2581,7 @@ fn probe_touched(view: &dyn StateRead, ctx: &BlockCtx, t: &DecodedTx, pools: &Po
         s.db().add_pretend(t.from, AccountInfo { balance: t.value, nonce: t.nonce, code_hash: KECCAK_EMPTY, ..Default::default() });
     }
     let _ = s.apply_decoded(t);
-    let reads = std::mem::take(&mut s.db().reads);
-    pools.touched_by(&reads.accounts, &reads.slots)
+    Some(std::mem::take(&mut s.db().reads))
 }
 
 // ---------------------------------------------------------------------------
@@ -2389,6 +2592,8 @@ enum Ev {
     /// A feed message and when it reached arbsim.
     Feed(Arc<BinMsg>, Instant),
     Confirmed,
+    /// The keeper (copy2/keeper.rs) published a version.
+    Kept,
 }
 
 struct Runtime {
@@ -2496,6 +2701,13 @@ pub fn feed_hook(added: &[Arc<BinMsg>]) {
 pub fn confirmed_hook() {
     if let Some(rt) = RT.get() {
         let _ = rt.tx.try_send(Ev::Confirmed);
+    }
+}
+
+/// copy2/keeper.rs: the keeper published a version (no-op when off).
+pub fn kept_hook() {
+    if let Some(rt) = RT.get() {
+        let _ = rt.tx.try_send(Ev::Kept);
     }
 }
 
@@ -2673,6 +2885,13 @@ fn run_loop(c2: super::intake::Copy2Handle, cfg: AheadCfg, rx: Receiver<Ev>) {
                     c.prov(&a, &prov);
                 }
                 let prov: Arc<dyn Provenance + Send + Sync> = prov;
+                // KEEPER: its version of this very block first (if it is
+                // already there), so the rebase below merges it at once.
+                if a.cfg().keeper {
+                    if let Some(kv) = super::keeper::version_at(v.block) {
+                        a.on_kept(kv);
+                    }
+                }
                 let conf = Confirmed { seq: v.seq, snap: v.snap.clone(), ctx: v.ctx.clone(), diff: v.diff.clone(), prov };
                 let rm = &c2.c2.recent_moves;
                 // The "who moved what" answers used, for the capture.
@@ -2748,6 +2967,18 @@ fn run_loop(c2: super::intake::Copy2Handle, cfg: AheadCfg, rx: Receiver<Ev>) {
                 }
             }
         }
+        // KEEPER: the keeper's version of our base block, if it came after
+        // copy 2's (a keeper rebase); and what our runs asked it to learn.
+        if a.cfg().keeper {
+            if let Some(b) = a.base_block() {
+                if let Some(kv) = super::keeper::version_at(b) {
+                    a.on_kept(kv);
+                }
+            }
+            if !a.learned.is_empty() {
+                super::keeper::learn_hook(std::mem::take(&mut a.learned));
+            }
+        }
         if let Some(rt) = RT.get() {
             {
                 let mut t = rt.tip.lock().unwrap_or_else(|e| e.into_inner());
@@ -2796,6 +3027,10 @@ fn status_of(a: &Ahead) -> Value {
         // blocksAhead = per feed message, how many blocks the tip was ahead
         // of copy 2 (0 = no tip). Hour and since start.
         "accuracy": {"hour": accuracy_json(&a.hour, true), "total": accuracy_json(&a.total, false)},
+        // KEEPER (copy2/keeper.rs): is the base laid over with the keeper's
+        // values of the same block right now; its own section: fastlaneKeeper.
+        "keeper": {"on": a.cfg.keeper, "baseMerged": a.merged.as_ref().is_some_and(|m| Some(m.seq) == a.base.as_ref().map(|b| b.seq)),
+            "keptBases": a.hour.kept_bases, "keptMissing": a.hour.kept_missing, "keptRebases": a.hour.kept_rebases, "learned": a.hour.learned},
         "hour": a.hour.json(), "total": a.total.json_with(false),
     })
 }
@@ -2812,6 +3047,7 @@ fn accuracy_json(s: &AheadStats, times: bool) -> Value {
         "tipSharePct": pct(s.tips, s.msgs),
         "blocksAhead": if times { let mut b = s.ahead_blocks.clone(); crate::timing::pct_of(&mut b) } else { Value::Null },
         "unknownContinued": s.unknown_continued, "missedUnknown": s.missed_unknown,
+        "keptBasesPct": pct(s.kept_bases, s.kept_bases + s.kept_missing),
     })
 }
 
