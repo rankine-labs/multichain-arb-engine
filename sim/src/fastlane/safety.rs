@@ -156,6 +156,21 @@ pub struct SafetyConfig {
     /// FASTLANE_MAX_OPP_AGE_MS [150] (new): an opportunity older than this
     /// is not sent (the next block has most likely come already).
     pub max_opp_age_ms: u64,
+    /// FASTLANE_MAX_BLOCKS_BEHIND [1] (Oct 31): a trade decided on a block
+    /// more than this many blocks behind the newest block the sequencer feed
+    /// has shown us is not sent (code "behind_tip"). Its deadline is the
+    /// decided block + FASTLANE_MAX_BLOCK_MARGIN (2), so a decision 2+ blocks
+    /// behind the chain can only land too late and revert Expired() (live,
+    /// Oct 31: both copy-2 scanner sends were decided 7-9 blocks behind).
+    /// "off" = no such gate (None). Needs the feed tip to be wired in
+    /// (Safety::feed_tip, set by the running lane; tests leave it unset).
+    pub max_blocks_behind: Option<u64>,
+    /// FASTLANE_FEED_TIP_MAX_AGE_MS [1000] (Oct 31): with the gate above on,
+    /// a feed tip older than this (the feed stalled: ~10 blocks missed) is
+    /// not trusted and the trade is not sent ("feed_tip_stale"); no feed
+    /// message seen at all = "no_feed_tip". Fail closed: we can't tell how
+    /// far behind the decision is.
+    pub feed_tip_max_age_ms: u64,
     /// FASTLANE_LIVE_BLOCKS [off] (new): also honour Node's 6 h live block list.
     pub honour_live_blocks: bool,
     /// FASTLANE_PRACTICE_SCORE_PAUSED [on] (Oct 28, owner: "I want to score
@@ -202,6 +217,15 @@ impl SafetyConfig {
         }
         let hold = env_num(get, "GAP_SENT_POOL_HOLD_MS", 3_000.0);
         let age = env_num(get, "FASTLANE_MAX_OPP_AGE_MS", 150.0);
+        // FASTLANE_MAX_BLOCKS_BEHIND: "off" / "false" / "no" -> None (gate
+        // off); a whole number 0..=1000 -> it (0 = only the feed's newest
+        // block itself); unset / empty / junk -> 1 (the safe default for live).
+        let max_blocks_behind = match get("FASTLANE_MAX_BLOCKS_BEHIND").map(|v| v.trim().to_ascii_lowercase()) {
+            Some(v) if matches!(v.as_str(), "off" | "false" | "no") => None,
+            Some(v) => Some(v.parse::<u64>().ok().filter(|n| *n <= 1_000).unwrap_or(1)),
+            None => Some(1),
+        };
+        let tip_age = env_num(get, "FASTLANE_FEED_TIP_MAX_AGE_MS", 1_000.0);
         SafetyConfig {
             max_trade_usd,
             daily_loss_cap_usd,
@@ -217,6 +241,8 @@ impl SafetyConfig {
             max_plausible_share: outlier_num(get, "MAX_PLAUSIBLE_PROFIT_SHARE", 0.25),
             pool_hold_ms: if hold.is_finite() && hold >= 0.0 { hold as u64 } else { 3_000 },
             max_opp_age_ms: if age.is_finite() && age > 0.0 { age as u64 } else { 150 },
+            max_blocks_behind,
+            feed_tip_max_age_ms: if tip_age.is_finite() && tip_age > 0.0 { tip_age as u64 } else { 1_000 },
             honour_live_blocks: crate::fastlane::mode::parse_on(get("FASTLANE_LIVE_BLOCKS").as_deref()),
             practice_score_paused: !crate::fastlane::mode::parse_off(get("FASTLANE_PRACTICE_SCORE_PAUSED").as_deref()),
             problems,
@@ -296,6 +322,14 @@ pub struct Safety {
     /// Practice checks that passed although the kill switch was on
     /// (FASTLANE_PRACTICE_SCORE_PAUSED), for the status page.
     pub paused_passes: u64,
+    /// (Oct 31) The newest BLOCK NUMBER the sequencer feed has shown us and
+    /// how long ago it arrived (None inside = no feed message yet). Read
+    /// under the fire lock right before signing, for FASTLANE_MAX_BLOCKS_BEHIND.
+    /// None = not wired (tests, hand-built Firers): that gate is skipped.
+    pub feed_tip: Option<Box<dyn Fn() -> Option<(u64, Duration)> + Send>>,
+    /// (Oct 31) How many blocks behind the feed tip each checked trade was
+    /// decided (newest 2,000; status "behindTipBlocks").
+    pub behind_samples: VecDeque<u64>,
 }
 
 /// At most this many reservations / pool holds are remembered (memory bound).
@@ -303,7 +337,7 @@ const MAX_TRACKED: usize = 1_000;
 
 impl Safety {
     pub fn new(cfg: SafetyConfig, mode: FastlaneMode, kill: KillSwitch, state: StateReader) -> Safety {
-        Safety { cfg, mode, kill, state, wall: Box::new(wall_ms), send_times: VecDeque::new(), pool_hold: HashMap::new(), reserved: VecDeque::new(), paused_passes: 0 }
+        Safety { cfg, mode, kill, state, wall: Box::new(wall_ms), send_times: VecDeque::new(), pool_hold: HashMap::new(), reserved: VecDeque::new(), paused_passes: 0, feed_tip: None, behind_samples: VecDeque::new() }
     }
 
     /// Everything from the environment (the program's real settings).
@@ -347,6 +381,32 @@ impl Safety {
         (all, loops)
     }
 
+    /// FASTLANE_MAX_BLOCKS_BEHIND (gate 5b). Refuses when
+    /// decision_block < feed_tip_block - max_behind (i.e. decision + max
+    /// < tip; with the default 1 the decision may be the tip itself or the
+    /// block right before it). Fail closed on no / stale feed tip. Skipped
+    /// when the gate is off or the feed tip is not wired in.
+    pub fn behind_tip_gate(&mut self, decision_block: u64) -> Result<(), BlockReason> {
+        let (Some(max_behind), Some(tip_fn)) = (self.cfg.max_blocks_behind, self.feed_tip.as_ref()) else {
+            return Ok(());
+        };
+        let Some((tip, age)) = tip_fn() else {
+            return Err(BlockReason::new("no_feed_tip", "no sequencer feed message seen yet: can't tell how old the decided block is"));
+        };
+        if age > Duration::from_millis(self.cfg.feed_tip_max_age_ms) {
+            return Err(BlockReason::new("feed_tip_stale", format!("newest feed block {tip} arrived {} ms ago (limit {} ms): feed stalled", age.as_millis(), self.cfg.feed_tip_max_age_ms)));
+        }
+        let behind = tip.saturating_sub(decision_block);
+        if self.behind_samples.len() >= 2_000 {
+            self.behind_samples.pop_front();
+        }
+        self.behind_samples.push_back(behind);
+        if decision_block.saturating_add(max_behind) < tip {
+            return Err(BlockReason::new("behind_tip", format!("decided on block {decision_block}, {behind} block(s) behind the feed's newest block {tip} (limit {max_behind}): its deadline would pass before it lands")));
+        }
+        Ok(())
+    }
+
     /// Run every gate. Ok = may send (live) / would send (practice).
     pub fn check(&mut self, o: &SafetyInput, now: Instant) -> Result<(), BlockReason> {
         let now_ms = (self.wall)();
@@ -370,6 +430,9 @@ impl Safety {
         if !self.cfg.problems.is_empty() {
             return Err(BlockReason::new("bad_setting", format!("bad safety setting: {}", self.cfg.problems.join(", "))));
         }
+        // (5b, worked out here, applied below: it records a sample, so it
+        // runs before the shared state is borrowed for the rest of the checks.)
+        let behind_tip = self.behind_tip_gate(o.block);
         // 4. Node's shared state: missing / unreadable / older than 10 s = block (new, fail closed).
         self.state.refresh(now, false);
         let (unpicked_usd, unpicked_loop_usd) = {
@@ -395,6 +458,13 @@ impl Safety {
         if age > Duration::from_millis(self.cfg.max_opp_age_ms) {
             return Err(BlockReason::new("stale", format!("opportunity {} ms old (limit {} ms)", age.as_millis(), self.cfg.max_opp_age_ms)));
         }
+        // 5b. (Oct 31) Decided on a block the chain already left behind?
+        //     The "stale" gate above times the opportunity from when copy 2
+        //     APPLIED its block, not from when the chain made it, so a copy
+        //     running ~0.5 s behind the feed passed it. Here the decided
+        //     block is compared with the feed's newest block, read now
+        //     (under the fire lock, right before signing).
+        behind_tip?;
         // 6. Size (fastSender.ts:106-107; stricter of ours and Node's).
         if !(o.size_usd > 0.0) || !o.size_usd.is_finite() || o.amount_in == 0 {
             return Err(BlockReason::new("no_size", "no trade size"));
@@ -578,7 +648,7 @@ mod tests {
     use std::collections::HashMap as Map;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     const NOW_MS: u64 = 1_793_000_000_000; // 2026-10-26-ish
 
@@ -647,6 +717,56 @@ mod tests {
 
     fn pair() -> SafetyInput {
         SafetyInput::new(100, "USDG/COIN a>b".into(), "0xUSDG".into(), vec!["0xusdg".into(), "0xcoin".into()], vec!["0xP1".into(), "0xP2".into()], 1_000_000, 500.0, 1.0, 0.02, None, Instant::now())
+    }
+
+    /// (Oct 31) FASTLANE_MAX_BLOCKS_BEHIND: the decided block vs the feed's
+    /// newest block, with every boundary.
+    #[test]
+    fn behind_tip_gate_boundaries() {
+        let tip = Arc::new(Mutex::new(Some((100u64, Duration::from_millis(5)))));
+        let wire = |t: &mut T, tip: &Arc<Mutex<Option<(u64, Duration)>>>| {
+            let tip = tip.clone();
+            t.s.feed_tip = Some(Box::new(move || *tip.lock().unwrap()));
+        };
+        let at = |b: u64| {
+            let mut o = pair();
+            o.block = b;
+            o
+        };
+        // Default 1: the tip itself and the block before it pass; 2+ behind is refused.
+        let mut t = T::new(&[], good_state());
+        assert_eq!(t.s.cfg.max_blocks_behind, Some(1));
+        assert_eq!(t.code(&at(10)), "ok", "not wired (tests / hand-built firers): no gate");
+        wire(&mut t, &tip);
+        assert_eq!(t.code(&at(100)), "ok", "decided on the tip");
+        assert_eq!(t.code(&at(101)), "ok", "decided ahead of the feed (predicted copy)");
+        assert_eq!(t.code(&at(99)), "ok", "1 behind = allowed");
+        assert_eq!(t.code(&at(98)), "behind_tip", "2 behind = refused");
+        // The live case (Oct 31, send 19): decided 102412551, chain ~559.
+        *tip.lock().unwrap() = Some((102_412_559, Duration::from_millis(20)));
+        let r = t.check(&at(102_412_551)).unwrap_err();
+        assert_eq!(r.code, "behind_tip");
+        assert!(r.detail.contains("8 block(s) behind"), "{}", r.detail);
+        // Fail closed: stalled feed, no feed yet.
+        *tip.lock().unwrap() = Some((100, Duration::from_millis(1_001)));
+        assert_eq!(t.code(&at(100)), "feed_tip_stale");
+        *tip.lock().unwrap() = None;
+        assert_eq!(t.code(&at(100)), "no_feed_tip");
+        assert!(t.s.behind_samples.contains(&8), "behind distance recorded for status");
+        // 0 = only the tip itself.
+        let mut t = T::new(&[("FASTLANE_MAX_BLOCKS_BEHIND", "0")], good_state());
+        *tip.lock().unwrap() = Some((100, Duration::ZERO));
+        wire(&mut t, &tip);
+        assert_eq!(t.code(&at(100)), "ok");
+        assert_eq!(t.code(&at(99)), "behind_tip");
+        // off = no gate, even wired and far behind.
+        let mut t = T::new(&[("FASTLANE_MAX_BLOCKS_BEHIND", "off")], good_state());
+        assert_eq!(t.s.cfg.max_blocks_behind, None);
+        wire(&mut t, &tip);
+        assert_eq!(t.code(&at(1)), "ok");
+        // Junk = the safe default 1; custom feed-tip age.
+        let t = T::new(&[("FASTLANE_MAX_BLOCKS_BEHIND", "lots"), ("FASTLANE_FEED_TIP_MAX_AGE_MS", "250")], good_state());
+        assert_eq!((t.s.cfg.max_blocks_behind, t.s.cfg.feed_tip_max_age_ms), (Some(1), 250));
     }
 
     #[test]

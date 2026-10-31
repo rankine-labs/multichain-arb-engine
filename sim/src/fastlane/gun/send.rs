@@ -9,8 +9,19 @@
 //
 //   Speed:
 //     - The connection (TCP + TLS) is opened in advance and kept warm with a
-//       tiny eth_chainId every SEND_WARM_MS (default 1000, same as Node), so
+//       tiny request every SEND_WARM_MS (default 1000, same as Node), so
 //       a trade never pays a fresh handshake (~20-25 ms to the sequencer).
+//       (Oct 31) The request's method is FASTLANE_SEND_WARM_METHOD (default
+//       eth_chainId). Robinhood's sequencer offers NONE of the read methods
+//       (measured from the server Oct 31: eth_chainId, eth_blockNumber,
+//       net_version, web3_clientVersion and eth_gasPrice all answer -32601
+//       "does not exist", HTTP 200, connection kept open; 94 ms first call,
+//       6-11 ms on the kept connection). Such an answer still proves the
+//       connection is alive and keeps it open, so it counts as a GOOD
+//       warm-up (said once at start, not logged every minute as a failure).
+//       Only no answer / a broken connection / a non-JSON reply is a failed
+//       warm-up, logged at most once per FASTLANE_SEND_WARM_LOG_MIN minutes
+//       (default 10) for the whole process, with the count in between.
 //     - The caller does NOT wait for the reply. The sequencer's reply takes
 //       ~115 ms, mostly it queueing us; what matters for winning is when our
 //       bytes LEFT. So a small pool of sender threads (FASTLANE_SEND_CONNS,
@@ -324,6 +335,23 @@ impl Conn {
         }
     }
 
+    /// Warm-up request (see the file header): Ok(None) = answered with a
+    /// result, Ok(Some(error)) = answered with a JSON-RPC error (the method
+    /// isn't offered; the connection is alive all the same), Err = no usable
+    /// answer (connection broken / timed out / not JSON / HTTP error page).
+    pub fn warm(&mut self, method: &str) -> Result<Option<String>, String> {
+        let body = json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": []}).to_string();
+        self.write_with_retry(body.as_bytes())?;
+        let (status, b) = self.read_response()?;
+        match serde_json::from_slice::<Value>(&b) {
+            Ok(v) if v.get("error").is_some_and(|e| !e.is_null()) => Ok(Some(super::rpc::rpc_result(v).err().unwrap_or_default().chars().take(120).collect())),
+            Ok(v) if v.get("result").is_some() => Ok(None),
+            Ok(_) => Err("send endpoint: warm-up reply has neither result nor error".into()),
+            Err(_) if !(200..300).contains(&status) => Err(format!("send endpoint: HTTP {status}")),
+            Err(_) => Err("send endpoint: reply not JSON".into()),
+        }
+    }
+
     /// Blocking JSON-RPC call (warm-ups, tests).
     pub fn call(&mut self, method: &str, params: Value) -> Result<Value, String> {
         let body = json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).to_string();
@@ -405,6 +433,91 @@ pub struct Job {
     pub done: Box<dyn FnOnce(SendOutcome) + Send>,
 }
 
+/// How the kept-alive connections are warmed (see the file header).
+#[derive(Clone, Debug, PartialEq)]
+pub struct WarmCfg {
+    /// FASTLANE_SEND_WARM_METHOD [eth_chainId]: the JSON-RPC method sent to
+    /// keep a connection warm (no parameters). Letters, digits and "_" only;
+    /// never a send method (eth_send*): anything else -> the default.
+    pub method: String,
+    /// FASTLANE_SEND_WARM_LOG_MIN [10]: a failed warm-up is logged at most
+    /// once per this many minutes (whole process, all sender threads).
+    pub log_every: Duration,
+}
+
+impl Default for WarmCfg {
+    fn default() -> Self {
+        WarmCfg { method: "eth_chainId".into(), log_every: Duration::from_secs(600) }
+    }
+}
+
+impl WarmCfg {
+    pub fn from_lookup(get: &dyn Fn(&str) -> Option<String>) -> WarmCfg {
+        let d = WarmCfg::default();
+        let method = get("FASTLANE_SEND_WARM_METHOD")
+            .map(|m| m.trim().to_string())
+            .filter(|m| !m.is_empty() && m.len() <= 64 && m.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+            // Never a method that could put something on chain.
+            .filter(|m| !m.to_ascii_lowercase().starts_with("eth_send"))
+            .unwrap_or(d.method);
+        let mins = get("FASTLANE_SEND_WARM_LOG_MIN").and_then(|v| v.trim().parse::<f64>().ok()).filter(|v| v.is_finite() && *v > 0.0 && *v <= 1_440.0);
+        WarmCfg { method, log_every: mins.map(|m| Duration::from_secs_f64(m * 60.0)).unwrap_or(d.log_every) }
+    }
+    pub fn from_env() -> WarmCfg {
+        WarmCfg::from_lookup(&|k: &str| std::env::var(k).ok())
+    }
+}
+
+/// Warm-up bookkeeping shared by every sender thread (one log line per
+/// FASTLANE_SEND_WARM_LOG_MIN for the whole process, not per thread).
+#[derive(Default)]
+struct WarmLog {
+    /// When a failure was last logged.
+    last_logged: Option<Instant>,
+    /// Failures since then (not logged one by one).
+    since: u64,
+    /// "Method not offered" was already said (once per process).
+    said_refused: bool,
+}
+
+/// What to print for one warm-up answer (None = nothing). `now` is passed
+/// in so tests can drive the clock.
+fn warm_log_line(log: &mut WarmLog, cfg: &WarmCfg, res: &Result<Option<String>, String>, now: Instant) -> Option<String> {
+    match res {
+        Ok(None) => None,
+        Ok(Some(e)) => {
+            if log.said_refused {
+                return None;
+            }
+            log.said_refused = true;
+            Some(format!("[fastlane] send endpoint does not offer {} ({e}); its answer still keeps the connection warm (FASTLANE_SEND_WARM_METHOD changes the method). Said once.", cfg.method))
+        }
+        Err(e) => {
+            log.since += 1;
+            if log.last_logged.is_some_and(|t| now.saturating_duration_since(t) < cfg.log_every) {
+                return None;
+            }
+            let n = std::mem::take(&mut log.since);
+            log.last_logged = Some(now);
+            Some(format!("[fastlane] send endpoint warm-up failed: {e} ({n} failure(s) since the last such line; next line in {} min at the earliest)", cfg.log_every.as_secs() / 60))
+        }
+    }
+}
+
+fn warm_log() -> &'static Mutex<WarmLog> {
+    static L: OnceLock<Mutex<WarmLog>> = OnceLock::new();
+    L.get_or_init(|| Mutex::new(WarmLog::default()))
+}
+
+/// One warm-up on `conn`, logged by the shared rules.
+fn warm_once(conn: &mut Conn, cfg: &WarmCfg) {
+    let res = conn.warm(&cfg.method);
+    let line = warm_log_line(&mut warm_log().lock().unwrap_or_else(|e| e.into_inner()), cfg, &res, Instant::now());
+    if let Some(l) = line {
+        eprintln!("{l}");
+    }
+}
+
 /// The pool: a bounded queue and N threads, each with its own connection.
 pub struct SendPool {
     tx: SyncSender<Job>,
@@ -412,17 +525,23 @@ pub struct SendPool {
 
 impl SendPool {
     /// Start `conns` sender threads to `url`. Each opens its connection now
-    /// and keeps it warm every `warm` (eth_chainId).
+    /// and keeps it warm every `warm` (FASTLANE_SEND_WARM_METHOD, see WarmCfg).
     pub fn start(url: &str, conns: usize, timeout: Duration, warm: Duration) -> Result<SendPool, String> {
+        SendPool::start_with(url, conns, timeout, warm, WarmCfg::from_env())
+    }
+
+    /// `start` with the warm-up settings given (tests).
+    pub fn start_with(url: &str, conns: usize, timeout: Duration, warm: Duration, wcfg: WarmCfg) -> Result<SendPool, String> {
         parse_url(url)?;
         let (tx, rx) = mpsc::sync_channel::<Job>(64);
         let rx = Arc::new(Mutex::new(rx));
         for i in 0..conns.clamp(1, 4) {
             let mut conn = Conn::new(url, timeout)?;
             let rx = rx.clone();
+            let wcfg = wcfg.clone();
             std::thread::Builder::new()
                 .name(format!("fastlane-send-{i}"))
-                .spawn(move || sender_loop(&mut conn, &rx, warm))
+                .spawn(move || sender_loop(&mut conn, &rx, warm, &wcfg))
                 .map_err(|e| format!("spawn sender: {e}"))?;
         }
         Ok(SendPool { tx })
@@ -437,11 +556,10 @@ impl SendPool {
     }
 }
 
-fn sender_loop(conn: &mut Conn, rx: &Mutex<Receiver<Job>>, warm: Duration) {
+fn sender_loop(conn: &mut Conn, rx: &Mutex<Receiver<Job>>, warm: Duration, wcfg: &WarmCfg) {
     // Open the connection right away (warm before the first trade).
-    let _ = conn.call("eth_chainId", json!([]));
+    warm_once(conn, wcfg);
     let mut last_used = Instant::now();
-    let mut warn_at: Option<Instant> = None;
     loop {
         // Only one thread waits on the queue at a time; others wait for the lock.
         let got = {
@@ -455,13 +573,9 @@ fn sender_loop(conn: &mut Conn, rx: &Mutex<Receiver<Job>>, warm: Duration) {
             }
             Err(RecvTimeoutError::Timeout) => {
                 if last_used.elapsed() >= warm {
-                    // Any reply, even an error, keeps the connection alive.
-                    if let Err(e) = conn.call("eth_chainId", json!([])) {
-                        if warn_at.map_or(true, |t| t.elapsed() > Duration::from_secs(60)) {
-                            warn_at = Some(Instant::now());
-                            eprintln!("[fastlane] send endpoint warm-up failed: {e}");
-                        }
-                    }
+                    // Any JSON-RPC answer, even "method not offered", keeps
+                    // the connection alive (see the file header).
+                    warm_once(conn, wcfg);
                     last_used = Instant::now();
                 }
             }
@@ -559,5 +673,92 @@ mod tests {
         assert_eq!(classify_reply(Ok((502, b"<html>bad gateway</html>".to_vec()))).0, SendStatus::Unknown);
         assert_eq!(classify_reply(Ok((200, br#"{"jsonrpc":"2.0","id":1,"result":null}"#.to_vec()))).0, SendStatus::Unknown);
         assert!(SendStatus::Unknown.maybe_on_chain() && !SendStatus::StaleInQueue.maybe_on_chain() && !SendStatus::Refused.maybe_on_chain());
+    }
+
+    /// (Oct 31) The live sequencer answers every read method with -32601
+    /// (HTTP 200, connection kept). A warm-up must read that as "alive" and
+    /// keep using the SAME connection (no new handshake per warm-up).
+    #[test]
+    fn warm_reads_method_not_offered_as_alive_and_keeps_the_connection() {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for s in l.incoming() {
+                let Ok(s) = s else { return };
+                std::thread::spawn(move || {
+                    let mut rd = BufReader::new(s.try_clone().unwrap());
+                    let mut w = s;
+                    loop {
+                        // Headers, then the body (Content-Length).
+                        let mut len = 0usize;
+                        loop {
+                            let mut line = String::new();
+                            if rd.read_line(&mut line).unwrap_or(0) == 0 {
+                                return;
+                            }
+                            if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                                len = v.trim().parse().unwrap();
+                            }
+                            if line == "\r\n" {
+                                break;
+                            }
+                        }
+                        let mut body = vec![0u8; len];
+                        rd.read_exact(&mut body).unwrap();
+                        let b = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"the method eth_chainId does not exist/is not available"}}"#;
+                        let msg = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", b.len(), b);
+                        if w.write_all(msg.as_bytes()).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        let mut c = Conn::new(&format!("http://127.0.0.1:{port}"), Duration::from_secs(3)).unwrap();
+        for _ in 0..3 {
+            let r = c.warm("eth_chainId").unwrap();
+            assert!(r.unwrap().contains("does not exist"));
+        }
+        assert_eq!(c.opened, 1, "one connection for every warm-up");
+        // A dead endpoint is a real failure.
+        let mut dead = Conn::new("http://127.0.0.1:1", Duration::from_millis(500)).unwrap();
+        assert!(dead.warm("eth_chainId").is_err());
+    }
+
+    /// (Oct 31) Warm-up settings and logging rules.
+    #[test]
+    fn warm_settings_and_log_rules() {
+        let cfg = |pairs: &[(&str, &str)]| {
+            let m: std::collections::HashMap<String, String> = pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+            WarmCfg::from_lookup(&|k: &str| m.get(k).cloned())
+        };
+        assert_eq!(cfg(&[]), WarmCfg::default());
+        assert_eq!(cfg(&[("FASTLANE_SEND_WARM_METHOD", " net_version ")]).method, "net_version");
+        // Never a send method; junk -> the default.
+        assert_eq!(cfg(&[("FASTLANE_SEND_WARM_METHOD", "eth_sendRawTransaction")]).method, "eth_chainId");
+        assert_eq!(cfg(&[("FASTLANE_SEND_WARM_METHOD", "a\"b")]).method, "eth_chainId");
+        assert_eq!(cfg(&[("FASTLANE_SEND_WARM_LOG_MIN", "2")]).log_every, Duration::from_secs(120));
+        assert_eq!(cfg(&[("FASTLANE_SEND_WARM_LOG_MIN", "-1")]).log_every, Duration::from_secs(600));
+
+        let c = WarmCfg::default();
+        let mut log = WarmLog::default();
+        let t = Instant::now();
+        // A result: nothing to say.
+        assert!(warm_log_line(&mut log, &c, &Ok(None), t).is_none());
+        // "Method not offered" (the live sequencer): said ONCE, never as a failure.
+        let refused: Result<Option<String>, String> = Ok(Some("the method eth_chainId does not exist/is not available".into()));
+        let l = warm_log_line(&mut log, &c, &refused, t).unwrap();
+        assert!(l.contains("does not offer eth_chainId") && !l.contains("failed"), "{l}");
+        for _ in 0..100 {
+            assert!(warm_log_line(&mut log, &c, &refused, t).is_none());
+        }
+        // A real failure: logged, then quiet for 10 minutes, then logged with the count.
+        let bad: Result<Option<String>, String> = Err("send endpoint: no reply (TimedOut)".into());
+        assert!(warm_log_line(&mut log, &c, &bad, t).unwrap().contains("1 failure(s)"));
+        for s in 1..600 {
+            assert!(warm_log_line(&mut log, &c, &bad, t + Duration::from_secs(s)).is_none(), "quiet at {s} s");
+        }
+        let l = warm_log_line(&mut log, &c, &bad, t + Duration::from_secs(600)).unwrap();
+        assert!(l.contains("600 failure(s)"), "{l}");
     }
 }
