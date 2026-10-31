@@ -533,7 +533,7 @@ c2counters!(
     coin_slot_mismatch, other_side_forgotten, logs_ignored, duplicate_blocks, reorgs, gaps, loads, load_ok,
     load_failed, unsure_marked, need_item_rounds, node_errors, fills, fill_items, fill_refused, fill_retry,
     probes, probe_not_found, probe_errors, track_msgs, dropped_msgs, carried_events, carry_too_old, merges, apply_us_max,
-    late_reports_applied, late_reports_unsure, coin_slot_msgs, throttled, layouts_guessed, coin_traces, coin_trace_found, coin_trace_not_found,
+    late_reports_applied, late_reports_unsure, late_reports_fetched, walks_hot, coin_slot_msgs, throttled, layouts_guessed, coin_traces, coin_trace_found, coin_trace_not_found,
     coin_balance_disagree, duplicate_logs, late_transfers_to_loading, node_refusals, need_refusal_retries,
     walks, walks_done, walks_partial, walk_errors, walks_refused, walk_slots, pending_marked, pending_settles,
     pending_found, pending_checks, pending_errors, blooms,
@@ -1901,9 +1901,35 @@ pub struct C2Config {
     pub walk_max_slots: usize,
     /// Memory guard: no new walks while the process uses more than this
     /// [ARBSIM_COPY2_WALK_MAX_RSS_MB, 550; 0 = no guard] (pm2 restarts the
-    /// sidecar at 400 MB, deploy/arbsim-pm2.sh). Status
+    /// sidecar at 1,300 MB today, deploy/arbsim-pm2.sh). Status
     /// poolCoverage.walkPaused says why walks wait.
     pub walk_max_rss_mb: u64,
+    /// (Oct 31) HOT WALKS. The memory guard above pauses ALL new walks; live
+    /// Oct 31 the sidecar sat at ~1,120 MB (over the old 550 MB guard), so
+    /// for hours no pool got a walk: the busiest pool and approved flash
+    /// lender WETH/USDG 0x52e65b17 had no tick data at all, kept needing
+    /// values it didn't hold and kept dropping out of "ready" (lender skips).
+    /// Now the [ARBSIM_COPY2_WALK_HOT, 16; 0 = off] busiest ready pools
+    /// (most events) plus every pool the fast lane uses as a flash lender
+    /// (walk::note_priority) may still be walked while the guard pauses the
+    /// rest, as long as the process stays under
+    /// [ARBSIM_COPY2_WALK_HOT_MAX_RSS_MB, 1200; 0 = no limit] (pm2 restarts
+    /// the sidecar at 1,300 MB, deploy/arbsim-pm2.sh). Size: one V3 walk is
+    /// at most ~13k values (512 words + 3,000 ticks + 1,024 history), live
+    /// average ~90; 16 pools x 13k x ~280 bytes = ~60 MB worst case.
+    /// ARBSIM_COPY2_WALK_MAX_SLOTS still caps every walk.
+    pub walk_hot: usize,
+    pub walk_hot_max_rss_mb: u64,
+    /// (Oct 31) LATE REPORT FETCH [ARBSIM_COPY2_LATE_FETCH, 1; 0 = the old
+    /// rule]. A late report (a block's report that came after the block was
+    /// applied) whose replay needs values the copy doesn't hold made the
+    /// pool UNSURE (with a strike: values forgotten, reload after 2 s,
+    /// doubling). Now it is handled exactly like the same report on time
+    /// (apply_ready_event): the pool loads in the background from that
+    /// report (the missing values are read at the block before it, the
+    /// report and everything after it are carried, then the pool is ready
+    /// again). See on_late_at for why this is exact.
+    pub late_fetch: bool,
     /// Reports kept for carrying loads forward, in reports (not blocks): past
     /// keep_blocks, old blocks are dropped once more than this many reports
     /// are kept [ARBSIM_COPY2_MAX_KEEP_LOGS, 150000; ~190 bytes each = ~30
@@ -2008,6 +2034,9 @@ impl C2Config {
             walks_inflight: env_u64("ARBSIM_COPY2_WALKS", 2).min(16) as usize,
             walk_max_slots: env_u64("ARBSIM_COPY2_WALK_MAX_SLOTS", 600_000) as usize,
             walk_max_rss_mb: env_u64("ARBSIM_COPY2_WALK_MAX_RSS_MB", 550),
+            walk_hot: env_u64("ARBSIM_COPY2_WALK_HOT", 16).min(1000) as usize,
+            walk_hot_max_rss_mb: env_u64("ARBSIM_COPY2_WALK_HOT_MAX_RSS_MB", 1200),
+            late_fetch: env_u64("ARBSIM_COPY2_LATE_FETCH", 1) != 0,
             max_keep_logs: env_u64("ARBSIM_COPY2_MAX_KEEP_LOGS", 150_000).max(1000) as usize,
             pending_ms: env_u64("ARBSIM_COPY2_PENDING_MS", 1500),
             pm_bound: env_u64("ARBSIM_COPY2_PM_BOUND", 1) != 0,
@@ -2031,7 +2060,7 @@ impl C2Config {
         }
     }
     pub fn for_tests() -> Self {
-        C2Config { reload_ms: 0, reload_max_ms: 0, layout_retry_s: 3600, load_batch: 25, loaders: 2, keep_blocks: 400, max_keep_blocks: 4000, max_rounds: 40, tip_every_s: 0, catchup_max_blocks: 64, walk: WalkCfg::default(), walks_inflight: 2, walk_max_slots: 1_000_000, walk_max_rss_mb: 0, max_keep_logs: 1_000_000, pending_ms: 300, pm_bound: true, verify_every_s: 0, verify_max: 400, fast_verify_ms: 0, fast_verify_max: 1000, fast_max_age_ms: 150_000, stall_s: 30, state_file: None, save_every_s: 3600, resume_max_blocks: 18_000, resume_overlap: 64, resume_range: 500, resume_timeout_s: 60, resume_verify_max: usize::MAX, drop_grace_s: 1800, drop_grace_max: 400, drop_grace_max_logs: 1_000_000, blind: super::v4blind::BlindCfg::for_tests() }
+        C2Config { reload_ms: 0, reload_max_ms: 0, layout_retry_s: 3600, load_batch: 25, loaders: 2, keep_blocks: 400, max_keep_blocks: 4000, max_rounds: 40, tip_every_s: 0, catchup_max_blocks: 64, walk: WalkCfg::default(), walks_inflight: 2, walk_max_slots: 1_000_000, walk_max_rss_mb: 0, walk_hot: 16, walk_hot_max_rss_mb: 0, late_fetch: true, max_keep_logs: 1_000_000, pending_ms: 300, pm_bound: true, verify_every_s: 0, verify_max: 400, fast_verify_ms: 0, fast_verify_max: 1000, fast_max_age_ms: 150_000, stall_s: 30, state_file: None, save_every_s: 3600, resume_max_blocks: 18_000, resume_overlap: 64, resume_range: 500, resume_timeout_s: 60, resume_verify_max: usize::MAX, drop_grace_s: 1800, drop_grace_max: 400, drop_grace_max_logs: 1_000_000, blind: super::v4blind::BlindCfg::for_tests() }
     }
 }
 
@@ -2260,6 +2289,10 @@ pub struct Intake {
     settle_retry: Option<(Instant, u32)>,
     /// The node can't do the walk's debug_traceCall: walks off.
     walk_off: bool,
+    /// HOT WALKS (C2Config::walk_hot): the pools last chosen and when (the
+    /// choice sorts every pool by its events: worked out at most every 5 s,
+    /// not on every pump while walks are paused).
+    hot_cache: Option<(Instant, HashSet<PoolKey>)>,
     /// Loading pools seen with nothing working for them: since when.
     orphan_since: HashMap<PoolKey, Instant>,
     last_stall_check: Instant,
@@ -2397,6 +2430,7 @@ pub fn manual(sh: Arc<Shared>, fills: Arc<FillQueue>, cfg: C2Config) -> (Intake,
         suspects: BTreeMap::new(),
         settle_retry: None,
         walk_off: false,
+        hot_cache: None,
         orphan_since: HashMap::new(),
         last_stall_check: Instant::now(),
         last_stall_log: None,
@@ -3148,6 +3182,37 @@ impl Intake {
                         inc(&st.late_reports_unsure);
                         self.log_unsure(k, log, n, &format!("late report: {why}"));
                         self.make_unsure(k, &format!("late report: {why}"), Some(&mut ov), n);
+                    }
+                    ApplyResult::NeedItems(items) if self.cfg.late_fetch => {
+                        // (Oct 31) LATE REPORT FETCH (C2Config::late_fetch):
+                        // load in the background from this report, exactly
+                        // as apply_ready_event does for the same report on
+                        // time, instead of making the pool unsure. Exact:
+                        //   - `ov` is the newest version. This pool had no
+                        //     report after `pos` (last_pos < pos, checked
+                        //     above; Algebra excluded), so its own values in
+                        //     `ov` are its values right before this report:
+                        //     the working copy starts from them;
+                        //   - the values it lacks are read at block n-1
+                        //     (send_need_job): the copy never held them, so
+                        //     no report it applied since its load changed
+                        //     them (a replay can't write a value it doesn't
+                        //     hold without asking for it first), i.e. the
+                        //     node's value before block n is the value right
+                        //     before this report;
+                        //   - the working copy is carried from `pos` through
+                        //     the kept reports (this report is added to block
+                        //     n's kept reports below, before any fetch can
+                        //     come back: the intake is one thread), then put
+                        //     back (merge, pool READY);
+                        //   - the pool's values are forgotten in every
+                        //     version from n on (start_partial_in_block
+                        //     forgets them in `ov`; `forgot` below), so no
+                        //     check uses a value without this report.
+                        // Same pool state as an on-time need: "loading"
+                        // for one node round trip, no strike, values kept.
+                        inc(&st.late_reports_fetched);
+                        self.start_partial_in_block(&mut ov, k, pos, items);
                     }
                     ApplyResult::NeedItems(_) => {
                         inc(&st.late_reports_unsure);
@@ -4876,10 +4941,31 @@ impl Intake {
         let now = Instant::now();
         let half = (self.cfg.walk.window_ticks / 2) as i64;
         let held: usize = self.c2.reg.read().unwrap().pools.values().map(|e| e.walked.len()).sum();
+        // Flash lenders the fast lane's routes borrow from (walk::note_priority).
+        let prio = super::walk::priority_set();
+        // `hot`: Some(pools) = only these may be walked now (HOT WALKS,
+        // C2Config::walk_hot): the memory guard pauses the rest.
+        let mut hot: Option<HashSet<PoolKey>> = None;
         let paused = if held >= self.cfg.walk_max_slots {
+            // The walked-values cap is a hard bound: no exception.
             Some(format!("walked values {held} >= ARBSIM_COPY2_WALK_MAX_SLOTS {}", self.cfg.walk_max_slots))
         } else if self.cfg.walk_max_rss_mb > 0 && self.rss_mb_cached() >= self.cfg.walk_max_rss_mb as f64 {
-            Some(format!("memory {:.0} MB >= ARBSIM_COPY2_WALK_MAX_RSS_MB {}", self.rss_mb_cached(), self.cfg.walk_max_rss_mb))
+            let rss = self.rss_mb_cached();
+            let base = format!("memory {rss:.0} MB >= ARBSIM_COPY2_WALK_MAX_RSS_MB {}", self.cfg.walk_max_rss_mb);
+            let hot_room = self.cfg.walk_hot_max_rss_mb == 0 || rss < self.cfg.walk_hot_max_rss_mb as f64;
+            if (self.cfg.walk_hot > 0 || !prio.is_empty()) && hot_room {
+                let fresh = self.hot_cache.as_ref().is_some_and(|(t, _)| t.elapsed() < Duration::from_secs(5));
+                if !fresh {
+                    let h = self.hot_walk_pools(&prio);
+                    self.hot_cache = Some((Instant::now(), h));
+                }
+                hot = self.hot_cache.as_ref().map(|(_, h)| h.clone());
+                Some(format!("{base}; only the {} busiest pools and {} flash lender(s) are walked (ARBSIM_COPY2_WALK_HOT)", self.cfg.walk_hot, prio.len()))
+            } else if !hot_room {
+                Some(format!("{base}; hot walks too: memory >= ARBSIM_COPY2_WALK_HOT_MAX_RSS_MB {}", self.cfg.walk_hot_max_rss_mb))
+            } else {
+                Some(base)
+            }
         } else {
             None
         };
@@ -4890,14 +4976,16 @@ impl Intake {
             }
             *p = paused.clone();
         }
-        if paused.is_some() {
+        if paused.is_some() && hot.is_none() {
             return;
         }
-        let mut due: Vec<(bool, std::cmp::Reverse<u64>, PoolKey)> = {
+        // (bool, bool, ..): pools never walked first, then flash lenders,
+        // then the most recently moved.
+        let mut due: Vec<(bool, bool, std::cmp::Reverse<u64>, PoolKey)> = {
             let reg = self.c2.reg.read().unwrap();
             reg.pools
                 .iter()
-                .filter(|(_, e)| e.state == PoolState::Ready && walks(e.pool.kind) && !e.walk_busy && e.walk_retry_at <= now)
+                .filter(|(k, e)| e.state == PoolState::Ready && walks(e.pool.kind) && !e.walk_busy && e.walk_retry_at <= now && hot.as_ref().is_none_or(|h| h.contains(*k)))
                 .filter(|(_, e)| match &e.walk {
                     None => true,
                     Some(w) if !w.done => true,
@@ -4905,11 +4993,14 @@ impl Intake {
                     Some(_) if e.pool.kind == PoolKind::Algebra => false,
                     Some(w) => current_tick(&e.pool, &head.snap).is_some_and(|t| (t - w.center).abs() > half),
                 })
-                .map(|(k, e)| (e.walk.is_some(), std::cmp::Reverse(self.touched_addr.get(&e.pool.address).copied().unwrap_or(0)), *k))
+                .map(|(k, e)| (e.walk.is_some(), !(e.pool.kind != PoolKind::V4 && prio.contains(&e.pool.address)), std::cmp::Reverse(self.touched_addr.get(&e.pool.address).copied().unwrap_or(0)), *k))
                 .collect()
         };
         due.sort();
-        for (_, _, k) in due.into_iter().take(self.cfg.walks_inflight - running) {
+        for (_, _, _, k) in due.into_iter().take(self.cfg.walks_inflight - running) {
+            if hot.is_some() {
+                inc(&self.c2.stats.walks_hot);
+            }
             let (pool, gen) = {
                 let mut reg = crate::timing::TimedWrite::new(&self.c2.reg);
                 let Some(e) = reg.pools.get_mut(&k) else { continue };
@@ -4920,6 +5011,27 @@ impl Intake {
             let id = self.new_job(JobFor::Walk { key: k, gen });
             self.loaders.as_ref().unwrap().send(Job::Walk { id, block: head.block, pool, cfg: self.cfg.walk.clone() });
         }
+    }
+
+    /// HOT WALKS (C2Config::walk_hot): the pools that may still be walked
+    /// while the memory guard pauses walks: the `walk_hot` ready walkable
+    /// pools with the most events (busiest first) plus every ready pool at a
+    /// flash lender's address (`prio`; V4 pools live at the shared
+    /// PoolManager address, so they count only through their events).
+    fn hot_walk_pools(&self, prio: &HashSet<Address>) -> HashSet<PoolKey> {
+        let reg = self.c2.reg.read().unwrap();
+        let mut by_events: Vec<(u64, PoolKey)> = reg.pools.iter().filter(|(_, e)| e.state == PoolState::Ready && walks(e.pool.kind)).map(|(k, e)| (e.events, *k)).collect();
+        // Busiest first; ties by key so the choice is stable between calls.
+        by_events.sort_unstable_by(|x, y| y.0.cmp(&x.0).then(x.1.cmp(&y.1)));
+        let mut out: HashSet<PoolKey> = by_events.into_iter().take(self.cfg.walk_hot).map(|(_, k)| k).collect();
+        for a in prio {
+            for k in reg.by_addr.get(a).into_iter().flatten() {
+                if reg.pools.get(k).is_some_and(|e| e.pool.kind != PoolKind::V4 && walks(e.pool.kind)) {
+                    out.insert(*k);
+                }
+            }
+        }
+        out
     }
 
     /// A walk came back (exact at block k): take the pool's own values in
