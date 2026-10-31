@@ -953,13 +953,22 @@ pub fn start(c2: crate::copy2::intake::Copy2Handle) -> bool {
     if RT.set(Rt { status: Mutex::new(json!({})), last_practice: Mutex::new(Value::Null), firer: lane.firer(), mode: fm.mode }).is_err() {
         return false;
     }
-    let ahead_on = crate::copy2::ahead::status_json().is_some();
+    // Oct 31: only FASTLANE_AHEAD=on feeds the lane; observe (measure only)
+    // leaves the lane on copy 2's confirmed versions, exactly as off.
+    let ahead_on = crate::copy2::ahead::feeds_lane();
+    let ahead_observing = crate::copy2::ahead::observing();
     eprintln!(
         "[fastlane] loop ON: {}; gun {} ({}); standing gaps scanned on {}",
         fm.describe(),
         lane.gun.mode().as_str(),
         lane.gun.why_not_broadcasting().unwrap_or("broadcasting"),
-        if ahead_on { "the predicted copy (FASTLANE_AHEAD=on)" } else { "copy 2's confirmed versions" }
+        if ahead_on {
+            "the predicted copy (FASTLANE_AHEAD=on)"
+        } else if ahead_observing {
+            "copy 2's confirmed versions (predicted copy only observing: FASTLANE_AHEAD=observe)"
+        } else {
+            "copy 2's confirmed versions"
+        }
     );
     std::thread::Builder::new()
         .name("arbsim-fastlane".into())
