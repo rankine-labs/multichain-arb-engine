@@ -148,11 +148,13 @@ struct Opts {
     /// 64 bits of its balance word (live USDG), WETH the low 128, and each
     /// trader gets this many USD base units (WETH: 1e30).
     narrow_usd_mint: Option<u64>,
+    /// (Oct 31) Last word on copy 2's settings (applied after the above).
+    cfg: Option<fn(&mut C2Config)>,
 }
 
 impl Default for Opts {
     fn default() -> Self {
-        Opts { walks: true, lm_credit: None, bot_shape: false, pm_bound: true, full_words: arbsim::copy2::walk::WalkCfg::default().full_words, one_sided: false, second_v4: false, thin: false, narrow_usd_mint: None }
+        Opts { walks: true, lm_credit: None, bot_shape: false, pm_bound: true, full_words: arbsim::copy2::walk::WalkCfg::default().full_words, one_sided: false, second_v4: false, thin: false, narrow_usd_mint: None, cfg: None }
     }
 }
 
@@ -291,6 +293,9 @@ impl World {
         }
         cfg.pm_bound = o.pm_bound;
         cfg.walk.full_words = o.full_words;
+        if let Some(f) = o.cfg {
+            f(&mut cfg);
+        }
         let fills = Arc::new(FillQueue::new(1000, 100));
         let (intake, h) = manual(sh.clone(), fills.clone(), cfg);
         let (_u, updater) = arbsim::state::updater::manual(sh.clone(), fills.clone());
@@ -855,6 +860,199 @@ fn late_swap_and_transfers_with_bloom_answer_unknown_until_settled() {
 #[test]
 fn late_swap_without_bloom_is_noticed_from_its_coin_transfers() {
     late_case(false, true, false);
+}
+
+// ---------------------------------------------------------------------------
+// (Oct 31) LATE REPORT FETCH. Live: the approved flash lender WETH/USDG
+// 0x52e65b17 (no tick data: walks paused) dropped out of "ready" with "late
+// report needs values we don't hold" (a strike, a reload). Now such a late
+// report loads the pool in the background from that report, like the same
+// report on time. Before (late_fetch off): unsure. After: loading -> ready,
+// and exact.
+// ---------------------------------------------------------------------------
+fn late_need_case(late_fetch: bool) {
+    let cfg: fn(&mut C2Config) = if late_fetch { |c| c.late_fetch = true } else { |c| c.late_fetch = false };
+    // No tick walks (like live while the memory guard pauses them): the
+    // pool holds only what its load and earlier replays fetched.
+    let Some(mut w) = World::start_with(K::V3, Opts { walks: false, cfg: Some(cfg), ..Opts::default() }) else { return };
+    w.go_live();
+    trade_some(&mut w);
+    let p = w.pools[0].clone();
+    let zfo = w.uu < w.ww;
+    let counter = |w: &World, k: &str| w.h.status_json(false)["counters"][k].as_u64().unwrap_or(0);
+    let (unsure0, fetched0) = (counter(&w, "late_reports_unsure"), counter(&w, "late_reports_fetched"));
+    // Block n: a big swap far past the ticks the copy holds. Its reports
+    // don't come with the block (a quiet message, no bloom) ...
+    let n = w.mine(&[(w.plain_trader(), calldata("swapV3(address,bool,int256,uint160)", &[Arg::A(p.address), Arg::B(!zfo), Arg::W(U256::from(150u64) * q(18)), Arg::W(U256::ZERO)]))]);
+    let all = w.reports(n);
+    assert!(all.iter().any(|l| l.address == p.address), "test setup: the swap reported");
+    let m = w.msg(n, vec![], false);
+    w.send(m);
+    // ... the next block comes on time ...
+    w.block(&[]);
+    w.settle();
+    assert_eq!(w.state(0), PoolState::Ready);
+    // ... then block n's reports arrive late.
+    let m = w.msg(n, all, false);
+    w.send(m);
+    let (st, why) = {
+        let reg = w.h.c2.reg.read().unwrap();
+        let e = &reg.pools[&(p.address, None)];
+        (e.state, e.reason.clone())
+    };
+    let (unsure1, fetched1) = (counter(&w, "late_reports_unsure"), counter(&w, "late_reports_fetched"));
+    if late_fetch {
+        assert_eq!(fetched1 - fetched0, 1, "the late swap needed values the copy didn't hold (test setup) and was fetched: {}", w.h.status_json(true));
+        assert_eq!(unsure1, unsure0, "never unsure");
+        assert_eq!(st, PoolState::Loading, "{why}");
+        assert!(why.starts_with("loading: fetching"), "{why}");
+    } else {
+        assert_eq!(unsure1 - unsure0, 1, "{}", w.h.status_json(true));
+        assert_eq!(fetched1, fetched0);
+        // Made unsure (values forgotten); with the tests' reload wait of 0
+        // it may already be reloading.
+        assert_ne!(st, PoolState::Ready, "{why}");
+        assert!(counter(&w, "unsure_marked") >= 1);
+    }
+    // Back to ready (after: one fetch round + carry; before: a reload),
+    // and exact: the pool's own values and checks of every size.
+    w.wait("pool ready again", |w| w.state(0) == PoolState::Ready);
+    w.settle();
+    let n2 = w.block(&[]);
+    w.settle();
+    let head = w.sh.head().unwrap();
+    for s in 0..5u64 {
+        let truth = u(&w.a.ok("eth_getStorageAt", json!([ha(p.address), hx64(U256::from(s)), format!("{n2:#x}")])));
+        assert_eq!(head.snap.storage(p.address, U256::from(s)), Lookup::Known(truth), "pool slot {s} (late_fetch {late_fetch})");
+    }
+    let mut answered = 0;
+    for usd in SIZES {
+        for dir in [true, false] {
+            // A miss is filled and asked again (up to 3 times).
+            for _ in 0..3 {
+                let r = w.compare(n2, usd, dir);
+                w.settle();
+                if let (Some(same), d) = r {
+                    assert!(same, "copy answer DIFFERS ({usd} USD, late_fetch {late_fetch}): {d}");
+                    answered += 1;
+                    break;
+                }
+            }
+        }
+    }
+    // Every value the copy holds for the pool equals the chain's.
+    let held: Vec<(U256, U256)> = head.snap.accounts.get(&p.address).map(|acc| acc.storage.iter().map(|(k, v)| (*k, *v)).collect()).unwrap_or_default();
+    assert!(held.len() > 20, "the pool holds its values again ({})", held.len());
+    for (slot, v) in &held {
+        let truth = u(&w.a.ok("eth_getStorageAt", json!([ha(p.address), hx64(*slot), format!("{n2:#x}")])));
+        assert_eq!(*v, truth, "held pool value {slot:#x} (late_fetch {late_fetch})");
+    }
+    eprintln!("late need (late_fetch {late_fetch}): {} held pool values all equal the chain", held.len());
+    let st = w.h.status_json(false);
+    eprintln!(
+        "late need (late_fetch {late_fetch}): {answered} of {} checks answered (all exact); unsure_marked {}, need_item_rounds {}",
+        SIZES.len() * 2,
+        st["counters"]["unsure_marked"],
+        st["counters"]["need_item_rounds"]
+    );
+    w.h.stop();
+}
+
+#[test]
+fn late_report_needing_values_loads_in_background_and_stays_exact() {
+    late_need_case(true);
+}
+
+#[test]
+fn late_report_needing_values_old_rule_makes_the_pool_unsure() {
+    late_need_case(false);
+}
+
+/// (Oct 31) HOT WALKS: while the memory guard pauses walks, the busiest
+/// pools (ARBSIM_COPY2_WALK_HOT) and the fast lane's flash lenders
+/// (walk::note_priority) are still walked; nothing else is.
+#[test]
+fn memory_pause_still_walks_flash_lenders() {
+    // Guard always tripped (1 MB), no "busiest" exception: only lenders.
+    let cfg: fn(&mut C2Config) = |c| {
+        c.walk_max_rss_mb = 1;
+        c.walk_hot = 0;
+        c.walk_hot_max_rss_mb = 0;
+    };
+    let Some(mut w) = World::start_with(K::V3, Opts { cfg: Some(cfg), ..Opts::default() }) else { return };
+    w.go_live();
+    trade_some(&mut w);
+    for _ in 0..20 {
+        w.block(&[]);
+        w.settle();
+    }
+    let walks = |w: &World| w.h.status_json(false)["counters"]["walks"].as_u64().unwrap_or(0);
+    assert_eq!(walks(&w), 0, "paused: no walk at all");
+    assert!(w.h.status_json(false)["poolCoverage"]["walkPaused"].as_str().unwrap_or("").contains("ARBSIM_COPY2_WALK_MAX_RSS_MB"));
+    // The fast lane names the test pool as a flash lender.
+    arbsim::copy2::walk::note_priority(w.pools[0].address);
+    w.wait("lender walked", |w| {
+        let reg = w.h.c2.reg.read().unwrap();
+        reg.pools[&(w.pools[0].address, None)].walk.as_ref().is_some_and(|x| x.done)
+    });
+    w.settle();
+    for _ in 0..5 {
+        w.block(&[]);
+        w.settle();
+    }
+    let reg_walk = |w: &World, i: usize| w.h.c2.reg.read().unwrap().pools[&(w.pools[i].address, None)].walk.is_some();
+    assert!(!reg_walk(&w, 1), "the other pool is not walked while paused");
+    let st = w.h.status_json(false);
+    assert!(st["counters"]["walks_hot"].as_u64().unwrap_or(0) >= 1, "{}", st["counters"]);
+    assert!(st["poolCoverage"]["walkPaused"].as_str().unwrap_or("").contains("flash lender"), "{}", st["poolCoverage"]);
+    // Walked while paused and still exact.
+    let n = w.block(&[]);
+    w.settle();
+    for usd in SIZES {
+        for dir in [true, false] {
+            if let (Some(same), d) = w.compare(n, usd, dir) {
+                assert!(same, "copy answer DIFFERS ({usd} USD): {d}");
+            }
+            w.settle();
+        }
+    }
+    w.h.stop();
+}
+
+/// HOT WALKS by business: with ARBSIM_COPY2_WALK_HOT = 1 the busiest pool is
+/// walked while the memory guard pauses walks.
+#[test]
+fn memory_pause_still_walks_the_busiest_pool() {
+    let cfg: fn(&mut C2Config) = |c| {
+        c.walk_max_rss_mb = 1;
+        c.walk_hot = 1;
+        c.walk_hot_max_rss_mb = 0;
+    };
+    let Some(mut w) = World::start_with(K::V3, Opts { cfg: Some(cfg), ..Opts::default() }) else { return };
+    w.go_live();
+    trade_some(&mut w);
+    w.wait("busiest pool walked", |w| {
+        let reg = w.h.c2.reg.read().unwrap();
+        reg.pools[&(w.pools[0].address, None)].walk.as_ref().is_some_and(|x| x.done)
+    });
+    // And the hot ceiling: with it below the process size, nothing at all.
+    let cfg2: fn(&mut C2Config) = |c| {
+        c.walk_max_rss_mb = 1;
+        c.walk_hot = 8;
+        c.walk_hot_max_rss_mb = 1;
+    };
+    w.h.stop();
+    let Some(mut w) = World::start_with(K::V3, Opts { cfg: Some(cfg2), ..Opts::default() }) else { return };
+    w.go_live();
+    trade_some(&mut w);
+    for _ in 0..10 {
+        w.block(&[]);
+        w.settle();
+    }
+    let st = w.h.status_json(false);
+    assert_eq!(st["counters"]["walks"], json!(0), "{}", st["poolCoverage"]);
+    assert!(st["poolCoverage"]["walkPaused"].as_str().unwrap_or("").contains("ARBSIM_COPY2_WALK_HOT_MAX_RSS_MB"), "{}", st["poolCoverage"]);
+    w.h.stop();
 }
 
 // ---------------------------------------------------------------------------

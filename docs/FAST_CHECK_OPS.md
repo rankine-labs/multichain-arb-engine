@@ -288,7 +288,10 @@ and nothing else. Node links are never printed, and never stored in pm2.
 | `ARBSIM_MAX_ACCOUNTS` | 50000 | memory cap: accounts |
 | `ARBSIM_MAX_SLOTS` | 250000 | memory cap: storage values (copy 2: not counting our pools / coins, which are always kept) |
 | `ARBSIM_COPY2_WALK_MAX_SLOTS` | 600000 | copy 2: most tick-walked values in total (~2x all ~800 pools) |
-| `ARBSIM_COPY2_WALK_MAX_RSS_MB` | 300 (0 = off) | copy 2: no new tick walks while the program uses more memory than this |
+| `ARBSIM_COPY2_WALK_MAX_RSS_MB` | 550 (0 = off) | copy 2: no new tick walks while the program uses more memory than this (except hot walks, below) |
+| `ARBSIM_COPY2_WALK_HOT` | 16 (0 = off) | copy 2 (Oct 31): while the memory guard pauses walks, the 16 busiest pools and every flash lender the fast lane borrows from are still walked |
+| `ARBSIM_COPY2_WALK_HOT_MAX_RSS_MB` | 1200 (0 = no limit) | copy 2 (Oct 31): no hot walks either above this memory (pm2 restarts the sidecar at 1300 MB) |
+| `ARBSIM_COPY2_LATE_FETCH` | 1 (0 = old rule) | copy 2 (Oct 31): a late report that needs values the copy doesn't hold loads the pool in the background from that report (like the same report on time) instead of making the pool unsure |
 | `ARBSIM_COPY2_WALK_FULL_WORDS` | 8000 (0 = off) | copy 2: a V4 pool's tick walk reads its WHOLE tick map when it has at most this many words (8000 = every tick spacing), so checks that run the price to its limit (thin pools, "ZeroAmount") are answered |
 | `ARBSIM_COPY2_PM_BOUND` | 1 | copy 2: never hold the V4 PoolManager's coin / ETH balances (nobody reports them to us); checks that read them run at a proven lower bound and far above it and answer only when both agree. 0 = old behaviour (tests only: a stale balance) |
 | `ARBSIM_COPY2_MAX_KEEP_LOGS` | 150000 | copy 2: most pool reports kept for slow loads (beyond the 10 minutes always kept) |
