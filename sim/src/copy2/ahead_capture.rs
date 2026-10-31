@@ -45,7 +45,7 @@
 //   and says so (an incomplete file is refused by the replay unless asked).
 //
 //   REPLAY: `arbsim ahead-replay <capture file> [--json] [--samples N]
-//   [--budget-ms N] [--partial]`
+//   [--budget-ms N] [--partial] [--revert-sure] [--sender-funds trusted|strict]`
 //     Builds a fresh predicted copy, feeds it the capture event by event and
 //     prints: agreement % (agree / (agree + disagree), per pool compared),
 //     the disagreement breakdown by cause (missedFilter / missedRan /
@@ -422,6 +422,9 @@ fn dec_cfg(d: &mut Dec) -> Res<AheadCfg> {
         msg_budget_us: d.u64()?,
         routes_only: d.bool()?,
         compare_delay: d.u64()?,
+        // Not in the file (format 1): the replay's own setting
+        // (`--revert-sure` = off, the old rule).
+        revert_unsure: true,
     })
 }
 
@@ -971,6 +974,12 @@ pub fn decode_capture(buf: &[u8]) -> Result<CapFile, String> {
 pub struct ReplayOpts {
     /// Per-message time budget in ms (None = off: deterministic).
     pub budget_ms: Option<u64>,
+    /// Override FASTLANE_AHEAD_REVERT_UNSURE (None = on, the default):
+    /// `--revert-sure` = Some(false), the old rule, for before / after.
+    pub revert_unsure: Option<bool>,
+    /// Override FASTLANE_AHEAD_TRUST_SENDER_FUNDS as captured:
+    /// `--sender-funds trusted|strict` (live runs strict unless set).
+    pub trust_sender_funds: Option<bool>,
 }
 
 /// Replay a capture through a fresh predicted copy. Returns the report
@@ -986,6 +995,10 @@ pub fn replay(cap: &CapFile, opts: &ReplayOpts) -> Result<Value, String> {
     // records), never by itself.
     cfg.compare_delay = u64::MAX / 4;
     cfg.msg_budget_us = opts.budget_ms.map(|m| m.clamp(1, 1000) * 1000).unwrap_or(u64::MAX / 4);
+    cfg.revert_unsure = opts.revert_unsure.unwrap_or(true);
+    if let Some(v) = opts.trust_sender_funds {
+        cfg.trust_sender_funds = v;
+    }
     let mut a = Ahead::new(cfg);
     a.collect_all = Some(Vec::new());
     let mut prov: Arc<dyn Provenance + Send + Sync> = Arc::new(ProvSets::all_exact());
@@ -1122,7 +1135,7 @@ fn report(a: &Ahead, all: &[Value], i: ReportInfo) -> Value {
         },
         "prediction": {
             "msgs": t.msgs, "applied": t.applied, "txsRun": t.txs_run, "txsSkipped": t.txs_skipped, "txsFailed": t.txs_failed,
-            "txsOffRoute": t.txs_off_route, "failedUnknown": t.failed_unknown, "failedWidened": t.failed_widened, "probesSkipped": t.probes_skipped,
+            "txsOffRoute": t.txs_off_route, "failedUnknown": t.failed_unknown, "failedWidened": t.failed_widened, "probesSkipped": t.probes_skipped, "revertsMarked": t.reverts_marked, "revertsKept": t.reverts_kept, "revertUnsure": a.cfg().revert_unsure, "trustSenderFunds": a.cfg().trust_sender_funds,
             "filterMissed": t.filter_missed, "rebases": t.rebases, "rebaseRewrites": t.rebase_rewrites,
             "stopped": t.stopped.iter().map(|(k, v)| (k.to_string(), json!(v))).collect::<serde_json::Map<String, Value>>(),
         },
@@ -1188,8 +1201,10 @@ pub fn print_report(r: &Value, samples: usize) -> String {
         }
     }
     o += &format!(
-        "prediction: messages {} applied {} | txs run {} skipped {} failed {} off-route {} (nothing found {}, widened {}) | routers missed by the filter {} | rebases {} (on late reports {}) | stopped {}\n",
-        p["msgs"], p["applied"], p["txsRun"], p["txsSkipped"], p["txsFailed"], p["txsOffRoute"], p["failedUnknown"], p["failedWidened"], p["filterMissed"], p["rebases"], p["rebaseRewrites"], p["stopped"]
+        "prediction (revert unsure {}, sender funds {}): messages {} applied {} | txs run {} skipped {} failed {} off-route {} (nothing found {}, widened {}) | reverted runs marked unsure {} kept {} | routers missed by the filter {} | rebases {} (on late reports {}) | stopped {}\n",
+        if p["revertUnsure"].as_bool() == Some(false) { "off" } else { "on" },
+        if p["trustSenderFunds"].as_bool() == Some(true) { "trusted" } else { "strict" },
+        p["msgs"], p["applied"], p["txsRun"], p["txsSkipped"], p["txsFailed"], p["txsOffRoute"], p["failedUnknown"], p["failedWidened"], p["revertsMarked"], p["revertsKept"], p["filterMissed"], p["rebases"], p["rebaseRewrites"], p["stopped"]
     );
     if r["liveSameStretch"].is_object() {
         let l = &r["liveSameStretch"];
@@ -1209,10 +1224,10 @@ pub fn print_report(r: &Value, samples: usize) -> String {
     o
 }
 
-/// `arbsim ahead-replay <capture file> [--json] [--samples N] [--budget-ms N] [--partial]`
+/// `arbsim ahead-replay <capture file> [--json] [--samples N] [--budget-ms N] [--partial] [--revert-sure] [--sender-funds trusted|strict]`
 pub fn replay_main(args: &[String]) {
     let Some(path) = args.get(2).filter(|a| !a.starts_with("--")) else {
-        eprintln!("usage: arbsim ahead-replay <capture file> [--json] [--samples N] [--budget-ms N] [--partial]");
+        eprintln!("usage: arbsim ahead-replay <capture file> [--json] [--samples N] [--budget-ms N] [--partial] [--revert-sure] [--sender-funds trusted|strict]");
         std::process::exit(2);
     };
     let arg = |f: &str| args.iter().position(|a| a == f).and_then(|i| args.get(i + 1)).and_then(|v| v.parse::<u64>().ok());
@@ -1227,7 +1242,17 @@ pub fn replay_main(args: &[String]) {
         eprintln!("arbsim ahead-replay: the capture is incomplete ({}); add --partial to replay what is there", cap.cut.as_deref().unwrap_or("no end record"));
         std::process::exit(2);
     }
-    let opts = ReplayOpts { budget_ms: arg("--budget-ms") };
+    let sender_funds = args.iter().position(|a| a == "--sender-funds").and_then(|i| args.get(i + 1)).map(|v| v.as_str());
+    let trust_sender_funds = match sender_funds {
+        None => None,
+        Some("trusted") => Some(true),
+        Some("strict") => Some(false),
+        Some(v) => {
+            eprintln!("arbsim ahead-replay: --sender-funds takes trusted or strict, not {v}");
+            std::process::exit(2);
+        }
+    };
+    let opts = ReplayOpts { budget_ms: arg("--budget-ms"), revert_unsure: args.iter().any(|a| a == "--revert-sure").then_some(false), trust_sender_funds };
     match replay(&cap, &opts) {
         Ok(r) => {
             if args.iter().any(|a| a == "--json") {
