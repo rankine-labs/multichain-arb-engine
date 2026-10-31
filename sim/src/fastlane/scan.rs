@@ -462,6 +462,12 @@ fn route_from_row(
     }
     let p = PreparedCheck::from_row_cached(c, codes, code_cache)?;
     let keys: Vec<String> = c.get("route").and_then(|r| r.as_array()).map(|a| a.iter().filter_map(|x| x.as_str()).map(|s| s.to_ascii_lowercase()).collect()).unwrap_or_default();
+    // (Oct 31) Tell copy 2 which pools are flash lenders: it walks their
+    // tick data first, even while its memory guard pauses other walks
+    // (copy2/walk.rs note_priority), so a lender rarely drops out of ready.
+    if let Some(a) = p.trade.flash.lender() {
+        crate::copy2::walk::note_priority(a);
+    }
     let lender = p.trade.flash.lender().map(|a| format!("{a:#x}"));
     let pools: Vec<String> = keys.iter().filter(|k| Some(k.as_str()) != lender.as_deref()).cloned().collect();
     Ok(Arc::new(Route { rid: rid.to_string(), held, score, keys, pools, check: Arc::new(p), facts: f.as_deref().and_then(Facts::from_json) }))

@@ -115,6 +115,36 @@ impl Default for WalkCfg {
     }
 }
 
+// ---------------------------------------------------------------------------
+// (Oct 31) PRIORITY POOLS: the flash lenders the fast lane's routes borrow
+// from. The scanner names them when it builds its routes (fastlane/scan.rs);
+// copy 2 walks them first and even while the memory guard pauses other walks
+// (C2Config::walk_hot). A lender that is not "ready" makes every route that
+// borrows from it skip (scan.rs skippedUnsureLender); live Oct 31 the
+// approved lender WETH/USDG 0x52e65b17 had no tick data, kept needing values
+// it didn't hold and dropped out of ready again and again.
+// Bounded: at most MAX_PRIORITY addresses (more are ignored).
+// ---------------------------------------------------------------------------
+const MAX_PRIORITY: usize = 64;
+
+fn priority_cell() -> &'static std::sync::Mutex<HashSet<Address>> {
+    static P: OnceLock<std::sync::Mutex<HashSet<Address>>> = OnceLock::new();
+    P.get_or_init(|| std::sync::Mutex::new(HashSet::new()))
+}
+
+/// Name a pool address as a priority (flash lender). Idempotent, cheap.
+pub fn note_priority(a: Address) {
+    let mut p = priority_cell().lock().unwrap_or_else(|e| e.into_inner());
+    if p.len() < MAX_PRIORITY || p.contains(&a) {
+        p.insert(a);
+    }
+}
+
+/// The priority addresses named so far (a copy).
+pub fn priority_set() -> HashSet<Address> {
+    priority_cell().lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
 /// Does this kind of pool get a walk? (V2 / Solidly: no ticks.)
 pub fn walks(kind: PoolKind) -> bool {
     matches!(kind, PoolKind::V3 | PoolKind::PancakeV3 | PoolKind::Algebra | PoolKind::V4)
