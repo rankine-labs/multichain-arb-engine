@@ -753,6 +753,11 @@ impl Lane {
         let killed = core.safety.killed();
         let paused_passes = core.safety.paused_passes;
         let score_paused = !core.safety.kill_blocks_practice();
+        // (Oct 31) How far behind the feed's newest block trades were decided.
+        let behind_tip = {
+            let mut v: Vec<u64> = core.safety.behind_samples.iter().copied().collect();
+            crate::timing::pct_of(&mut v)
+        };
         drop(core);
         json!({
             "mode": self.gun.mode().as_str(),
@@ -785,7 +790,11 @@ impl Lane {
             "safety": {"killed": killed, "state": state, "blockedThisHour": h.blocked,
                 // Practice while the bot is paused (FASTLANE_PRACTICE_SCORE_PAUSED):
                 // would-sends that passed with the kill switch on (never broadcast).
-                "practiceScoresWhilePaused": score_paused, "passedWhilePaused": paused_passes},
+                "practiceScoresWhilePaused": score_paused, "passedWhilePaused": paused_passes,
+                // (Oct 31) Blocks between the feed's newest block and the
+                // decided block, per checked trade (scanner + fire-first);
+                // over FASTLANE_MAX_BLOCKS_BEHIND = blocked "behind_tip".
+                "behindTipBlocks": behind_tip},
             "lane": {
                 "tips": h.tips, "confirmedScanned": h.confirmed, "tipsOld": h.tips_old, "opps": h.opps, "fired": h.fired, "wouldSend": h.would_send, "liveSent": h.live_sent,
                 "notLeft": h.not_left, "gunRefused": h.gun_refused, "logErrors": h.log_errors, "dropsSeen": h.drops_seen,
@@ -909,7 +918,18 @@ pub fn start(c2: crate::copy2::intake::Copy2Handle) -> bool {
         return false;
     }
     let get = |k: &str| std::env::var(k).ok();
-    let safety = Safety::from_env();
+    let mut safety = Safety::from_env();
+    // (Oct 31) FASTLANE_MAX_BLOCKS_BEHIND: the feed's newest BLOCK (sequence
+    // number + the chain's L2 offset, same numbering as every decided block)
+    // and its age, read under the fire lock right before each signing. Both
+    // fire paths (this lane's scanner and the fire-first trigger thread)
+    // share this Safety, so the gate covers both.
+    let l2_offset = c2.sh.cfg.l2_offset;
+    safety.feed_tip = Some(Box::new(move || crate::check::feedstore::feed_tip().map(|(seq, age)| (seq.saturating_add(l2_offset), age))));
+    match safety.cfg.max_blocks_behind {
+        Some(n) => eprintln!("[fastlane] behind-tip gate ON: no send decided more than {n} block(s) behind the feed's newest block (FASTLANE_MAX_BLOCKS_BEHIND); feed tip trusted for {} ms (FASTLANE_FEED_TIP_MAX_AGE_MS)", safety.cfg.feed_tip_max_age_ms),
+        None => eprintln!("[fastlane] behind-tip gate OFF (FASTLANE_MAX_BLOCKS_BEHIND=off)"),
+    }
     let gate = Arc::new(SafetyGate::new(&safety));
     let log = Arc::new(SendsLog::from_lookup(&get));
     let book = Arc::new(ReplyBook::default());

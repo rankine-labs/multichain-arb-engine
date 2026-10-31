@@ -609,21 +609,22 @@ fn tls_send_path_with_local_server() {
     assert!(e.contains("TLS"), "{e}");
 }
 
-/// Real TLS to the public sequencer, read-only eth_chainId (no transaction).
+/// Real TLS to the public sequencer, read-only warm-up (no transaction).
 /// Ignored by default (needs internet): cargo test --release --test gun_fire -- --ignored
+/// (Oct 31: the sequencer no longer offers eth_chainId, it answers -32601
+/// on a kept connection; the warm-up reads any JSON-RPC answer as "alive".)
 #[test]
 #[ignore]
-fn tls_chain_id_on_real_sequencer() {
+fn tls_warm_on_real_sequencer() {
     let mut c = arbsim::fastlane::gun::send::Conn::new(arbsim::fastlane::gun::send::ROBINHOOD_SEQUENCER_RPC, Duration::from_secs(5)).unwrap();
     let t = Instant::now();
-    let v = c.call("eth_chainId", json!([])).unwrap();
+    let v = c.warm("eth_chainId");
     let first = t.elapsed();
     let t = Instant::now();
-    let v2 = c.call("eth_chainId", json!([])).unwrap();
-    eprintln!("TEST NUMBERS (this machine): first call incl. TLS handshake {:?}, kept-alive call {:?}, fresh connections {}", first, t.elapsed(), c.opened);
-    assert_eq!(v, json!("0x1237"));
-    assert_eq!(v2, json!("0x1237"));
-    assert_eq!(c.opened, 1, "second call must reuse the connection");
+    let v2 = c.warm("eth_chainId");
+    eprintln!("TEST NUMBERS (this machine): first warm-up incl. TLS handshake {:?} ({v:?}), kept-alive {:?} ({v2:?}), fresh connections {}", first, t.elapsed(), c.opened);
+    assert!(v.is_ok() && v2.is_ok(), "any JSON-RPC answer = alive");
+    assert_eq!(c.opened, 1, "second warm-up must reuse the connection");
 }
 
 /// Final review blocker 2: maxBlock = the FEED block the trade was found on

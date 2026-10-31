@@ -167,6 +167,39 @@ pub struct StoreStats {
     pub missing: std::sync::atomic::AtomicU64,
 }
 
+// ---------------------------------------------------------------------------
+// FEED TIP (Oct 31): the newest block the sequencer feed has told us about.
+//
+// Plain English: the fast lane's "is this decision about an old block?"
+// gate (fastlane/safety.rs, FASTLANE_MAX_BLOCKS_BEHIND) needs the newest
+// block the CHAIN is at. The feed is our fastest view of that (one message
+// = one finished block, ~100 ms each). This keeps the newest sequence number
+// ever handed to us and WHEN it first arrived, so the gate can also tell a
+// stalled feed (old tip) from a live one. Kept apart from the store itself:
+// it works even with the store off (ARBSIM_FEED_STORE_MSGS=0) and is never
+// lowered by a reconnect's backlog repeats (only a NEWER number moves it).
+// ---------------------------------------------------------------------------
+static FEED_TIP: std::sync::Mutex<Option<(u64, Instant)>> = std::sync::Mutex::new(None);
+
+/// A feed message with sequence number `seq` reached us: the tip moves if
+/// it is newer than any seen so far (its arrival time is kept).
+pub fn note_feed_tip(seq: u64) {
+    note_feed_tip_at(seq, Instant::now());
+}
+
+fn note_feed_tip_at(seq: u64, now: Instant) {
+    let mut g = FEED_TIP.lock().unwrap_or_else(|e| e.into_inner());
+    if g.map_or(true, |(s, _)| seq > s) {
+        *g = Some((seq, now));
+    }
+}
+
+/// The newest feed sequence number and how long ago it arrived (None = no
+/// feed message seen yet). Block number = sequence number + L2 offset.
+pub fn feed_tip() -> Option<(u64, std::time::Duration)> {
+    FEED_TIP.lock().unwrap_or_else(|e| e.into_inner()).map(|(s, at)| (s, at.elapsed()))
+}
+
 /// Messages kept [ARBSIM_FEED_STORE_MSGS, 2048; 0 = store off: every
 /// question naming messages answers feed_ref_missing, i.e. the old way].
 pub fn store_cap() -> usize {
@@ -210,6 +243,10 @@ impl FeedStore {
 
     pub fn put(&self, list: &[WireFeedMsg]) -> usize {
         use std::sync::atomic::Ordering::Relaxed;
+        // FEED TIP (see above): noted for every message, store on or off.
+        for m in list {
+            note_feed_tip(m.seq);
+        }
         if self.cap == 0 {
             return 0;
         }
@@ -366,5 +403,33 @@ impl FeedStore {
             "puts": self.stats.puts.load(Relaxed), "repeats": self.stats.repeats.load(Relaxed),
             "resolved": self.stats.resolved.load(Relaxed), "missing": self.stats.missing.load(Relaxed),
         })
+    }
+}
+
+#[cfg(test)]
+mod feed_tip_tests {
+    use super::*;
+
+    #[test]
+    fn feed_tip_only_moves_forward_and_ages() {
+        // Huge numbers so other tests' feed messages (small sequence
+        // numbers) running at the same time can't move this tip.
+        let base = u64::MAX / 2;
+        let t0 = Instant::now() - std::time::Duration::from_millis(500);
+        note_feed_tip_at(base + 10, t0);
+        let (s, age) = feed_tip().unwrap();
+        assert_eq!(s, base + 10);
+        assert!(age >= std::time::Duration::from_millis(500), "age is counted from the first arrival");
+        // A reconnect's backlog repeat (older number) never lowers it.
+        note_feed_tip(base + 3);
+        assert_eq!(feed_tip().unwrap().0, base + 10);
+        // The same number again keeps the first arrival time.
+        note_feed_tip(base + 10);
+        assert!(feed_tip().unwrap().1 >= std::time::Duration::from_millis(500));
+        // A newer one moves it, with a fresh time.
+        note_feed_tip(base + 11);
+        let (s, age) = feed_tip().unwrap();
+        assert_eq!(s, base + 11);
+        assert!(age < std::time::Duration::from_millis(400));
     }
 }
