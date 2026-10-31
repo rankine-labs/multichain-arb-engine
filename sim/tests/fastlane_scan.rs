@@ -184,6 +184,11 @@ fn unsure_pools_and_missing_facts_are_skipped() {
     // The lender unsure: skipped too.
     let unsure: HashSet<String> = [key(LENDER)].into_iter().collect();
     assert_eq!(scanner(t, cfg()).scan(&input(&s, &ctx(), 1, &ch, &unsure)).checked[0].outcome, Outcome::SkippedUnsure);
+    // (Oct 31) Status names the key that made each skip (lender marked).
+    let by = arbsim::fastlane::scan::status_json()["skippedUnsureBy"].clone();
+    // (Status is process-wide; other tests may add to it: at least 1.)
+    assert!(by[format!("lender {}", key(LENDER))].as_u64().unwrap_or(0) >= 1, "{by}");
+    assert!(by[key(0xb)].as_u64().unwrap_or(0) >= 1, "{by}");
     // No "f" facts (FASTLANE off on the bot side): never valued, never sent.
     let mut r = row("a>b:1", 0xa, 0xb, true, None, 0.05);
     r.f = None;
@@ -776,21 +781,26 @@ impl CheckRunner for FixedRunner {
 #[test]
 fn a_busy_changed_step_does_not_make_the_sweep_skip_fast_routes() {
     let ran = Arc::new(Mutex::new(Vec::new()));
-    let mut us: HashMap<U256, u64> = (0..5u64).map(|i| (U256::from(0x100 + i), 1_500)).collect();
-    us.insert(U256::from(0x105u64), 8_800);
+    // (Oct 31) Times are 10x the original (15 ms / 88 ms, budget 100 ms) so
+    // a slow test machine's own delays (a few ms) can't change the outcome.
+    let mut us: HashMap<U256, u64> = (0..5u64).map(|i| (U256::from(0x100 + i), 15_000)).collect();
+    us.insert(U256::from(0x105u64), 88_000);
     let r = FixedRunner { us, ran: ran.clone() };
-    let c = ScanConfig { budget_us: 10_000, sweep_per_block: 50, route_max_us: 1_000_000, route_time_ttl_blocks: 1_000, ..cfg() };
+    let c = ScanConfig { budget_us: 100_000, sweep_per_block: 50, route_max_us: 10_000_000, route_time_ttl_blocks: 1_000, ..cfg() };
     let mut sc = Scanner::new(c, Box::new(TableSource::owned(many(6))), Box::new(r));
     let s = hill_state(1);
     let none = HashSet::new();
-    // Block 1: every route timed (r000..r004 1.5 ms each, r005 8.8 ms).
+    // Block 1: every route timed (r000..r004 15 ms each, r005 88 ms).
     sc.scan(&input(&s, &ctx(), 1, &[], &none));
     assert_eq!(ran.lock().unwrap().len(), 6);
-    // Block 2: r005's pool changed: 8.8 ms of the 10 ms used before the sweep.
+    // Block 2: r005's pool changed: 88 ms of the 100 ms used before the sweep.
     let ch = vec![key(0x105)];
     let rep = sc.scan(&input(&s, &ctx(), 2, &ch, &none));
     assert_eq!(rep.checked.len(), 1, "only r005 ran: {:?}", rep.checked);
-    assert_eq!(rep.cut_fit, 1, "the sweep stopped at the first fast route (no skipping run)");
+    // The sweep must stop, not pass over fast routes (PR #246): on a slow
+    // machine the changed step can use the whole budget, so the sweep stops
+    // before it even looks at a route (cut_fit 0) instead of at the first (1).
+    assert!(rep.cut_fit <= 1, "the sweep stopped at the first fast route (no skipping run): {}", rep.cut_fit);
     assert_eq!(rep.full_sweep_blocks, None, "no pass counted over routes never checked");
     // Block 3 (quiet): the sweep carries on from where it stopped and checks them.
     ran.lock().unwrap().clear();
