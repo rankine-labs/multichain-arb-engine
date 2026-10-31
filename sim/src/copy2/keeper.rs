@@ -44,11 +44,15 @@
 //       dropped (all unknown) and seeded again. The audit re-reads one kept
 //       contract's values from the node every FASTLANE_AHEAD_KEEP_AUDIT_S
 //       [60] seconds and compares them with ours.
-//     - Its own node allowance: FASTLANE_AHEAD_KEEP_DAILY_CAP [1,200,000]
-//       calls a day and FASTLANE_AHEAD_KEEP_RPS [20] a second (separate
-//       from copy 2's, so it can never starve copy 2). Seeds at most
-//       FASTLANE_AHEAD_KEEP_SEEDS_PER_H [3,600] calls an hour. When the day's
-//       allowance is used up, the keeper drops everything and waits.
+//     - NO self-imposed node caps (owner rule, Oct 31: no daily allowance,
+//       no own speed limit on Chainstack). The keeper's pace is set by the
+//       work itself: one block diff per block, seeds only while it is
+//       caught up. Its calls go through its own NodeClient (so copy 2's
+//       pacing and counters stay copy 2's), which keeps only the shared
+//       provider handling every node user has: when Chainstack answers
+//       "too fast" (-32005 / 429) the rate is halved and recovers by itself
+//       (node.rs), and the keeper waits and retries the same block (never
+//       counted as a node error, never a reset by itself).
 //     - Only runs with FASTLANE_AHEAD=on|observe AND FASTLANE_AHEAD_KEEPER
 //       on (default: on in observe, off with on). Otherwise no thread, no
 //       node call, no memory.
@@ -88,18 +92,15 @@ pub struct KeeperCfg {
     /// Block versions kept for the predicted copy (and block changes kept
     /// for seeds that come back a few blocks late).
     pub versions: usize,
-    /// FASTLANE_AHEAD_KEEP_SEEDS_PER_H [3600]: most seed calls an hour.
+    /// Seed calls allowed an hour. 0 = no limit (live: always 0, no
+    /// self-imposed cap). Only the offline replay sets it
+    /// (`--keep-seeds-per-h`) to model a slower cold start.
     pub seeds_per_hour: u64,
     /// FASTLANE_AHEAD_KEEP_AUDIT_S [60]: seconds between audits (0 = none).
     pub audit_s: u64,
     /// FASTLANE_AHEAD_KEEP_MAX_BEHIND [64]: blocks behind copy 2 before the
     /// keeper starts again from copy 2's block.
     pub max_behind: u64,
-    /// FASTLANE_AHEAD_KEEP_DAILY_CAP [1200000]: its own node calls a day
-    /// (~9.9 block diffs a second = ~850k a day, plus seeds and audits).
-    pub daily_cap: u64,
-    /// FASTLANE_AHEAD_KEEP_RPS [20]: its own node speed limit.
-    pub rps: f64,
     /// Most values one seed call asks for (one contract).
     pub seed_batch: usize,
     /// Most learned (not kept) candidate contracts remembered.
@@ -114,11 +115,9 @@ impl Default for KeeperCfg {
             max_slots_per: 2000,
             max_slots_total: 60_000,
             versions: 64,
-            seeds_per_hour: 3600,
+            seeds_per_hour: 0,
             audit_s: 60,
             max_behind: 64,
-            daily_cap: 1_200_000,
-            rps: 20.0,
             seed_batch: 100,
             max_candidates: 4096,
         }
@@ -138,11 +137,9 @@ impl KeeperCfg {
             max_slots_per: num("FASTLANE_AHEAD_KEEP_SLOTS", d.max_slots_per as u64, 1, 100_000) as usize,
             max_slots_total: num("FASTLANE_AHEAD_KEEP_MAX_SLOTS", d.max_slots_total as u64, 1, 2_000_000) as usize,
             versions: d.versions,
-            seeds_per_hour: num("FASTLANE_AHEAD_KEEP_SEEDS_PER_H", d.seeds_per_hour, 0, 1_000_000),
+            seeds_per_hour: d.seeds_per_hour,
             audit_s: num("FASTLANE_AHEAD_KEEP_AUDIT_S", d.audit_s, 0, 86_400),
             max_behind: num("FASTLANE_AHEAD_KEEP_MAX_BEHIND", d.max_behind, 2, 10_000),
-            daily_cap: num("FASTLANE_AHEAD_KEEP_DAILY_CAP", d.daily_cap, 1, 100_000_000),
-            rps: get("FASTLANE_AHEAD_KEEP_RPS").and_then(|v| v.trim().parse::<f64>().ok()).filter(|v| *v >= 1.0 && *v <= 500.0).unwrap_or(d.rps),
             seed_batch: d.seed_batch,
             max_candidates: d.max_candidates,
         }
@@ -938,9 +935,9 @@ pub fn start(c2: super::intake::Copy2Handle) -> bool {
     if !cfg.on || super::ahead::mode() == super::ahead::Mode::Off || RT.get().is_some() {
         return false;
     }
-    let file = std::env::var("FASTLANE_AHEAD_KEEP_BUDGET_FILE").unwrap_or_else(|_| "arbsim-keeper-budget.json".into());
-    let budget = crate::node::Budget::new(cfg.daily_cap, cfg.rps, if file.trim().is_empty() { None } else { Some(file) });
-    let Some(node) = crate::node::NodeClient::from_env_with_paid_budget(budget) else {
+    // No daily allowance and no own speed limit (owner rule): only the
+    // shared provider handling (node.rs halves the rate on "too fast").
+    let Some(node) = crate::node::NodeClient::from_env_with_paid_budget(crate::node::Budget::no_caps()) else {
         eprintln!("[arbsim] fastlane keeper: no node configured: OFF");
         return false;
     };
@@ -949,8 +946,8 @@ pub fn start(c2: super::intake::Copy2Handle) -> bool {
         return false;
     }
     eprintln!(
-        "[arbsim] fastlane keeper ON: keeps up to {} hot contracts exact (one block diff per block, own node allowance {}/day, {} calls/s)",
-        cfg.max_contracts, cfg.daily_cap, cfg.rps
+        "[arbsim] fastlane keeper ON: keeps up to {} hot contracts exact (one block diff per block; no daily allowance or own speed limit)",
+        cfg.max_contracts
     );
     std::thread::Builder::new()
         .name("arbsim-keeper".into())
@@ -1015,7 +1012,10 @@ fn run_loop(c2: super::intake::Copy2Handle, node: crate::node::NodeClient, cfg: 
     let mut status_at = Instant::now();
     let mut calls = 0u64;
     let mut calls_hour_start = Instant::now();
-    let mut paused_until: Option<Instant> = None;
+    // Provider said "too fast": wait this long before the next call
+    // (doubles while it keeps refusing, 100 ms .. 5 s; back to 0 on success).
+    let mut rate_wait = Duration::ZERO;
+    let mut rate_refusals = 0u64;
     let publish = |k: &KeeperCore| {
         if let Some(v) = k.latest() {
             let mut g = rt.versions.lock().unwrap_or_else(|e| e.into_inner());
@@ -1048,12 +1048,9 @@ fn run_loop(c2: super::intake::Copy2Handle, node: crate::node::NodeClient, cfg: 
             st["callsPerS"] = json!((calls as f64 / el * 100.0).round() / 100.0);
             st["calls"] = json!(calls);
             st["node"] = crate::node::NodeApi::usage(&node);
-            st["paused"] = json!(paused_until.is_some_and(|t| t > Instant::now()));
+            st["rateRefusals"] = json!(rate_refusals);
+            st["rateWaitMs"] = json!(rate_wait.as_millis() as u64);
             *rt.status.lock().unwrap_or_else(|e| e.into_inner()) = st;
-        }
-        if paused_until.is_some_and(|t| t > Instant::now()) {
-            std::thread::sleep(Duration::from_millis(500));
-            continue;
         }
         let Some(target) = copy2_head(&c2) else {
             std::thread::sleep(Duration::from_millis(50));
@@ -1084,6 +1081,7 @@ fn run_loop(c2: super::intake::Copy2Handle, node: crate::node::NodeClient, cfg: 
             match fetch_block(&node, head + 1) {
                 Ok(Some(txs)) => {
                     errors = 0;
+                    rate_wait = Duration::ZERO;
                     if k.apply_block(head + 1, &txs).is_err() {
                         k.reset(target, "gap");
                     }
@@ -1091,13 +1089,18 @@ fn run_loop(c2: super::intake::Copy2Handle, node: crate::node::NodeClient, cfg: 
                 }
                 Ok(None) => std::thread::sleep(Duration::from_millis(20)),
                 Err(e) => {
+                    if crate::node::is_rate_refusal(0, &e) {
+                        // The provider said "too fast" (shared handling:
+                        // node.rs already halved the rate). Not an error:
+                        // wait a little longer each time, retry the same
+                        // block. Falling too far behind still restarts it.
+                        rate_refusals += 1;
+                        rate_wait = (rate_wait * 2).clamp(Duration::from_millis(100), Duration::from_secs(5));
+                        std::thread::sleep(rate_wait);
+                        continue;
+                    }
                     errors += 1;
-                    if e.contains("allowance") || e.contains("Budget") {
-                        // The day's allowance is used up: drop everything, wait.
-                        k.reset(target, "daily_cap");
-                        publish(&k);
-                        paused_until = Some(Instant::now() + Duration::from_secs(300));
-                    } else if errors >= 20 {
+                    if errors >= 20 {
                         k.reset(target, "node_errors");
                         publish(&k);
                         errors = 0;
@@ -1110,7 +1113,8 @@ fn run_loop(c2: super::intake::Copy2Handle, node: crate::node::NodeClient, cfg: 
             continue;
         }
         // Caught up: one seed (within the hourly limit), then maybe an audit.
-        if seeds_hour < cfg.seeds_per_hour {
+        // (seeds_per_hour is 0 = no limit live; see KeeperCfg.)
+        if cfg.seeds_per_hour == 0 || seeds_hour < cfg.seeds_per_hour {
             if let Some(job) = k.take_job() {
                 seeds_hour += 1;
                 calls += 1;
@@ -1325,7 +1329,8 @@ mod tests {
         assert!(kp.balance_exact(a(1)));
     }
 
-    /// Settings: on by default only in observe; numbers are bounded.
+    /// Settings: on by default only in observe; numbers are bounded; no
+    /// node caps (the old cap settings are ignored).
     #[test]
     fn settings() {
         let cfg = |ahead: Option<&str>, keeper: Option<&str>| {
@@ -1333,7 +1338,8 @@ mod tests {
                 "FASTLANE_AHEAD" => ahead.map(String::from),
                 "FASTLANE_AHEAD_KEEPER" => keeper.map(String::from),
                 "FASTLANE_AHEAD_KEEP_CONTRACTS" => Some("7".into()),
-                "FASTLANE_AHEAD_KEEP_RPS" => Some("0".into()),
+                // Old cap names (removed, owner rule): ignored.
+                "FASTLANE_AHEAD_KEEP_RPS" | "FASTLANE_AHEAD_KEEP_DAILY_CAP" | "FASTLANE_AHEAD_KEEP_SEEDS_PER_H" => Some("1".into()),
                 _ => None,
             })
         };
@@ -1344,7 +1350,7 @@ mod tests {
         assert!(cfg(Some("on"), Some("on")).on);
         assert!(!cfg(Some("observe"), Some("off")).on);
         assert_eq!(cfg(Some("observe"), None).max_contracts, 7);
-        assert_eq!(cfg(Some("observe"), None).rps, 20.0, "out of range = default");
+        assert_eq!(cfg(Some("observe"), None).seeds_per_hour, 0, "no self-imposed seed limit live");
     }
 
     #[test]

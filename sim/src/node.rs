@@ -335,6 +335,18 @@ impl Budget {
         self.rate_now(&mut b, Instant::now())
     }
 
+    /// No daily allowance and no own speed limit (copy2/keeper.rs, owner
+    /// rule "no self-imposed Chainstack caps"). The token bucket's rate is
+    /// only a starting point far above what the keeper uses (~10-55 calls a
+    /// second), so the one thing that slows it is the shared provider
+    /// handling: on "too fast" (-32005 / 429) the rate is halved (at most
+    /// once a second, down to ARBSIM_NODE_MIN_RPS) and recovers by itself.
+    /// Nothing is counted to a file.
+    pub fn no_caps() -> Self {
+        // (min_rps comes from ARBSIM_NODE_MIN_RPS inside `new`, like copy 2's.)
+        Budget::new(u64::MAX / 4, 500.0, None)
+    }
+
     /// From env: ARBSIM_NODE_DAILY_CAP (6000), ARBSIM_NODE_RPS (8),
     /// ARBSIM_BUDGET_FILE (default ./arbsim-node-budget.json).
     pub fn from_env() -> Self {
