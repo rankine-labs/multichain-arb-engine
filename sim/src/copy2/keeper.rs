@@ -1,0 +1,1391 @@
+// ============================================================================
+// FAST LANE A: THE HOT-CONTRACT KEEPER (Oct 31, owner-approved "real fix"
+// for the predicted copy, part 2).
+//
+// Plain English:
+//   The predicted copy (copy2/ahead.rs) re-runs the feed's transactions on
+//   copy 2. Copy 2 only holds OUR pools exactly. Roughly 9 in 10 of the
+//   other bots' transactions that touch our pools could not be re-run
+//   exactly: they read values of contracts copy 2 doesn't follow (the rival
+//   bot's own settings, a router, a coin's balances, other V4 pools in the
+//   PoolManager): "a value of target" / "account of target" misses.
+//
+//   The keeper holds THOSE values exactly, for the few contracts that keep
+//   coming up ("hot" contracts):
+//     1. LEARN. Every run of the predicted copy that missed a value, or
+//        read one copy 2 only holds approximately, names it (the contract
+//        and the slot). Each contract gets a score; the top
+//        FASTLANE_AHEAD_KEEP_CONTRACTS [50] are kept.
+//     2. SEED. For a kept contract, the values it needed are read ONCE from
+//        the paid node at the keeper's block (eth_getProof: one call for
+//        many values of one contract; its code once with eth_getCode).
+//     3. KEEP EXACT. After every block (copy 2's newest block tells us the
+//        node has it), the node's own list of what the block changed is
+//        fetched (debug_traceBlockByNumber, prestate tracer, diff mode,
+//        without code: ~12-34 KB, ~31 ms) and applied to the values we
+//        hold. One call per block: ~9 calls a second.
+//     4. NEVER GUESS. A value a block's changes touch but that we never
+//        held stays unknown (only held values are updated). A value we
+//        hold is exact at the keeper's block or not served at all.
+//     5. SERVE. The predicted copy asks for the keeper's version of its
+//        base block (exactly that block, never another one) and lays the
+//        held values over copy 2's (copy 2's own exact values always win),
+//        marking them exact (KeptProv).
+//
+//   SAFETY (fail closed):
+//     - Bounded memory: at most FASTLANE_AHEAD_KEEP_CONTRACTS contracts,
+//       FASTLANE_AHEAD_KEEP_SLOTS values each, FASTLANE_AHEAD_KEEP_MAX_SLOTS
+//       in all, 64 block versions (persistent maps: a version is a pointer
+//       copy plus what changed). Cold contracts lose their place (scores
+//       halve every hour, a newcomer must clearly beat the coldest kept one).
+//     - A missing block, a node error streak, the copy falling more than
+//       FASTLANE_AHEAD_KEEP_MAX_BEHIND blocks behind copy 2, copy 2 going
+//       BACKWARDS (a reorg) or an AUDIT mismatch = everything held is
+//       dropped (all unknown) and seeded again. The audit re-reads one kept
+//       contract's values from the node every FASTLANE_AHEAD_KEEP_AUDIT_S
+//       [60] seconds and compares them with ours.
+//     - Its own node allowance: FASTLANE_AHEAD_KEEP_DAILY_CAP [1,200,000]
+//       calls a day and FASTLANE_AHEAD_KEEP_RPS [20] a second (separate
+//       from copy 2's, so it can never starve copy 2). Seeds at most
+//       FASTLANE_AHEAD_KEEP_SEEDS_PER_H [3,600] calls an hour. When the day's
+//       allowance is used up, the keeper drops everything and waits.
+//     - Only runs with FASTLANE_AHEAD=on|observe AND FASTLANE_AHEAD_KEEPER
+//       on (default: on in observe, off with on). Otherwise no thread, no
+//       node call, no memory.
+//
+//   The core (`KeeperCore`) does no I/O, so the offline replay
+//   (`arbsim ahead-replay --keeper <truth file>`) runs the very same code
+//   on recorded block diffs.
+// ============================================================================
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+use revm::primitives::{Address, B256, KECCAK_EMPTY, U256};
+use revm::state::{AccountInfo, Bytecode};
+use serde_json::{json, Value};
+
+use crate::check::ordered::Provenance;
+use crate::state::snap::{normalize, Acct, Basics, PMap, Snapshot};
+use crate::state::{AccountDiff, MissItem, StateDiff};
+
+// ---------------------------------------------------------------------------
+// Settings
+// ---------------------------------------------------------------------------
+
+/// FASTLANE_AHEAD_KEEP* settings (see the file header).
+#[derive(Clone, Debug)]
+pub struct KeeperCfg {
+    /// FASTLANE_AHEAD_KEEPER: keep hot contracts exact (on / off). Default:
+    /// on with FASTLANE_AHEAD=observe, off with FASTLANE_AHEAD=on.
+    pub on: bool,
+    /// FASTLANE_AHEAD_KEEP_CONTRACTS [50]: most contracts kept.
+    pub max_contracts: usize,
+    /// FASTLANE_AHEAD_KEEP_SLOTS [2000]: most values kept per contract.
+    pub max_slots_per: usize,
+    /// FASTLANE_AHEAD_KEEP_MAX_SLOTS [60000]: most values kept in all.
+    pub max_slots_total: usize,
+    /// Block versions kept for the predicted copy (and block changes kept
+    /// for seeds that come back a few blocks late).
+    pub versions: usize,
+    /// FASTLANE_AHEAD_KEEP_SEEDS_PER_H [3600]: most seed calls an hour.
+    pub seeds_per_hour: u64,
+    /// FASTLANE_AHEAD_KEEP_AUDIT_S [60]: seconds between audits (0 = none).
+    pub audit_s: u64,
+    /// FASTLANE_AHEAD_KEEP_MAX_BEHIND [64]: blocks behind copy 2 before the
+    /// keeper starts again from copy 2's block.
+    pub max_behind: u64,
+    /// FASTLANE_AHEAD_KEEP_DAILY_CAP [1200000]: its own node calls a day
+    /// (~9.9 block diffs a second = ~850k a day, plus seeds and audits).
+    pub daily_cap: u64,
+    /// FASTLANE_AHEAD_KEEP_RPS [20]: its own node speed limit.
+    pub rps: f64,
+    /// Most values one seed call asks for (one contract).
+    pub seed_batch: usize,
+    /// Most learned (not kept) candidate contracts remembered.
+    pub max_candidates: usize,
+}
+
+impl Default for KeeperCfg {
+    fn default() -> Self {
+        KeeperCfg {
+            on: false,
+            max_contracts: 50,
+            max_slots_per: 2000,
+            max_slots_total: 60_000,
+            versions: 64,
+            seeds_per_hour: 3600,
+            audit_s: 60,
+            max_behind: 64,
+            daily_cap: 1_200_000,
+            rps: 20.0,
+            seed_batch: 100,
+            max_candidates: 4096,
+        }
+    }
+}
+
+impl KeeperCfg {
+    /// From any key -> value lookup (tests pass a map).
+    pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> KeeperCfg {
+        let d = KeeperCfg::default();
+        let num = |k: &str, dv: u64, lo: u64, hi: u64| get(k).and_then(|v| v.trim().parse::<u64>().ok()).filter(|v| (lo..=hi).contains(v)).unwrap_or(dv);
+        let am = super::ahead::AheadMode::parse(get("FASTLANE_AHEAD").as_deref());
+        let on = am != super::ahead::AheadMode::Off && super::ahead::on_off(get("FASTLANE_AHEAD_KEEPER").as_deref()).unwrap_or(am == super::ahead::AheadMode::Observe);
+        KeeperCfg {
+            on,
+            max_contracts: num("FASTLANE_AHEAD_KEEP_CONTRACTS", d.max_contracts as u64, 1, 1000) as usize,
+            max_slots_per: num("FASTLANE_AHEAD_KEEP_SLOTS", d.max_slots_per as u64, 1, 100_000) as usize,
+            max_slots_total: num("FASTLANE_AHEAD_KEEP_MAX_SLOTS", d.max_slots_total as u64, 1, 2_000_000) as usize,
+            versions: d.versions,
+            seeds_per_hour: num("FASTLANE_AHEAD_KEEP_SEEDS_PER_H", d.seeds_per_hour, 0, 1_000_000),
+            audit_s: num("FASTLANE_AHEAD_KEEP_AUDIT_S", d.audit_s, 0, 86_400),
+            max_behind: num("FASTLANE_AHEAD_KEEP_MAX_BEHIND", d.max_behind, 2, 10_000),
+            daily_cap: num("FASTLANE_AHEAD_KEEP_DAILY_CAP", d.daily_cap, 1, 100_000_000),
+            rps: get("FASTLANE_AHEAD_KEEP_RPS").and_then(|v| v.trim().parse::<f64>().ok()).filter(|v| *v >= 1.0 && *v <= 500.0).unwrap_or(d.rps),
+            seed_batch: d.seed_batch,
+            max_candidates: d.max_candidates,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// One version of the kept values (what the predicted copy reads)
+// ---------------------------------------------------------------------------
+
+/// The kept values, exact after block `block` (persistent maps: cheap to copy).
+#[derive(Clone, Debug, Default)]
+pub struct KeptVersion {
+    pub block: u64,
+    pub accounts: PMap<Address, Acct>,
+    pub codes: PMap<B256, Bytecode>,
+}
+
+impl KeptVersion {
+    /// Do we hold this value exactly?
+    pub fn holds_slot(&self, a: &Address, s: &U256) -> bool {
+        self.accounts.get(a).is_some_and(|x| x.storage_complete || x.storage.contains_key(s))
+    }
+    /// Do we hold this account's basics (balance, nonce, code hash) exactly?
+    pub fn holds_basics(&self, a: &Address) -> bool {
+        self.accounts.get(a).is_some_and(|x| matches!(x.basics, Basics::Known(_)))
+    }
+    /// Values held in all.
+    pub fn slots(&self) -> usize {
+        self.accounts.values().map(|a| a.storage.len()).sum()
+    }
+}
+
+/// Copy 2's "which values are exact" plus the keeper's: a value the keeper
+/// holds is exact at its block (the predicted copy only merges a keeper
+/// version of EXACTLY its base block).
+pub struct KeptProv {
+    pub inner: Arc<dyn Provenance + Send + Sync>,
+    pub kept: Arc<KeptVersion>,
+}
+
+impl Provenance for KeptProv {
+    fn slot_exact(&self, a: Address, slot: U256) -> bool {
+        self.inner.slot_exact(a, slot) || self.kept.holds_slot(&a, &slot)
+    }
+    fn balance_exact(&self, a: Address) -> bool {
+        self.inner.balance_exact(a) || self.kept.holds_basics(&a)
+    }
+}
+
+/// What a merge added (status / replay report).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MergeCounts {
+    pub accounts: usize,
+    pub slots: usize,
+    pub basics: usize,
+    pub codes: usize,
+}
+
+/// Copy 2's snapshot of block N with the keeper's values of block N laid
+/// over it. Copy 2's EXACT values always win (they come from our pools'
+/// own reports); where copy 2 holds nothing, or only an approximate value
+/// (a fill re-read now and then), the keeper's exact value is used.
+/// Never-trusted ("volatile") accounts are left alone (always Missing).
+pub fn merge_base(base: &Snapshot, prov: &dyn Provenance, kv: &KeptVersion) -> (Snapshot, MergeCounts) {
+    let mut out = base.clone();
+    let mut n = MergeCounts::default();
+    for (a, k) in kv.accounts.iter() {
+        if base.volatile.is_whole(a) {
+            continue;
+        }
+        match base.accounts.get(a) {
+            None => {
+                n.accounts += 1;
+                n.slots += k.storage.len();
+                n.basics += usize::from(matches!(k.basics, Basics::Known(_)));
+                out.accounts.insert(*a, k.clone());
+            }
+            // Copy 2 knows every slot of it (created in front of us / does
+            // not exist): nothing to add.
+            Some(c) if c.storage_complete => {}
+            Some(c) => {
+                let mut m = c.clone();
+                let mut added = 0;
+                for (s, v) in k.storage.iter() {
+                    if c.storage.contains_key(s) && prov.slot_exact(*a, *s) {
+                        continue;
+                    }
+                    m.storage.insert(*s, *v);
+                    added += 1;
+                }
+                let kb = matches!(k.basics, Basics::Known(_));
+                let c_exact = matches!(c.basics, Basics::Known(_)) && c.balance_exact && prov.balance_exact(*a);
+                if kb && !c_exact {
+                    m.basics = k.basics.clone();
+                    m.balance_exact = true;
+                    n.basics += 1;
+                }
+                if added > 0 || (kb && !c_exact) {
+                    n.accounts += 1;
+                    n.slots += added;
+                    out.accounts.insert(*a, m);
+                }
+            }
+        }
+    }
+    for (h, c) in kv.codes.iter() {
+        if !out.codes.contains_key(h) {
+            out.put_code(*h, c.clone());
+            n.codes += 1;
+        }
+    }
+    (out, n)
+}
+
+// ---------------------------------------------------------------------------
+// The core (no I/O)
+// ---------------------------------------------------------------------------
+
+/// A learned contract (kept or not yet).
+#[derive(Clone, Debug, Default)]
+struct Cand {
+    score: f64,
+    /// Values its runs needed (bounded by max_slots_per).
+    slots: HashSet<U256>,
+    /// Its basics (balance / nonce / code) were needed.
+    basics: bool,
+}
+
+/// One seed call to make: these values of one contract, at the keeper's block.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SeedJob {
+    pub addr: Address,
+    pub slots: Vec<U256>,
+    /// Ask for its basics (and its code when we don't have it).
+    pub basics: bool,
+}
+
+/// What a seed call brought back (exact at block `at`).
+#[derive(Clone, Debug)]
+pub struct SeedAnswer {
+    pub addr: Address,
+    pub at: u64,
+    /// Some(None) = the account does not exist; None = basics not asked.
+    pub basics: Option<Option<AccountInfo>>,
+    /// Its code (only when asked and not held).
+    pub code: Option<Bytecode>,
+    pub slots: Vec<(U256, U256)>,
+}
+
+/// Counters (since start; the runtime also keeps an hour).
+#[derive(Clone, Debug, Default)]
+pub struct KeeperStats {
+    pub blocks: u64,
+    pub held_touched: u64,
+    pub values_updated: u64,
+    pub learned: u64,
+    pub seeds_sent: u64,
+    pub seed_values: u64,
+    pub seeds_dropped: u64,
+    pub evicted: u64,
+    pub refused_full: u64,
+    pub audits: u64,
+    pub audit_values: u64,
+    pub audit_mismatch: u64,
+    pub resets: HashMap<&'static str, u64>,
+    pub apply_us: Vec<u64>,
+    pub samples: Vec<Value>,
+}
+
+impl KeeperStats {
+    /// A ring of the newest 20,000 apply times.
+    fn add_time(&mut self, us: u64) {
+        if self.apply_us.len() < 20_000 {
+            self.apply_us.push(us);
+        } else {
+            let i = (self.blocks % 20_000) as usize;
+            self.apply_us[i] = us;
+        }
+    }
+    pub fn json(&self) -> Value {
+        let mut t = self.apply_us.clone();
+        json!({
+            "blocks": self.blocks, "heldTouched": self.held_touched, "valuesUpdated": self.values_updated,
+            "learned": self.learned, "seedsSent": self.seeds_sent, "seedValues": self.seed_values, "seedsDropped": self.seeds_dropped,
+            "evicted": self.evicted, "refusedFull": self.refused_full,
+            "audits": self.audits, "auditValues": self.audit_values, "auditMismatch": self.audit_mismatch,
+            "resets": self.resets.iter().map(|(k, v)| (k.to_string(), json!(v))).collect::<serde_json::Map<String, Value>>(),
+            "applyUs": crate::timing::pct_of(&mut t),
+            "samples": self.samples,
+        })
+    }
+}
+
+/// The keeper's state machine (see the file header). Single-threaded.
+pub struct KeeperCore {
+    pub cfg: KeeperCfg,
+    /// Block whose post-state `cur` holds (None = not started).
+    head: Option<u64>,
+    cur: KeptVersion,
+    versions: VecDeque<Arc<KeptVersion>>,
+    /// Recent blocks' changes (all accounts), for seeds that come back
+    /// after the keeper moved on.
+    recent: VecDeque<(u64, Arc<StateDiff>)>,
+    cands: HashMap<Address, Cand>,
+    /// Contracts chosen to be kept (may still be waiting for their seed).
+    held: HashSet<Address>,
+    seeds: VecDeque<SeedJob>,
+    /// Values asked for and not answered yet (never asked twice at once).
+    pending: HashSet<(Address, Option<U256>)>,
+    audit_next: usize,
+    pub stats: KeeperStats,
+}
+
+
+impl KeeperCore {
+    pub fn new(cfg: KeeperCfg) -> Self {
+        KeeperCore {
+            cfg,
+            head: None,
+            cur: KeptVersion::default(),
+            versions: VecDeque::new(),
+            recent: VecDeque::new(),
+            cands: HashMap::new(),
+            held: HashSet::new(),
+            seeds: VecDeque::new(),
+            pending: HashSet::new(),
+            audit_next: 0,
+            stats: KeeperStats::default(),
+        }
+    }
+
+    pub fn head(&self) -> Option<u64> {
+        self.head
+    }
+
+    /// The newest version (None before the start).
+    pub fn latest(&self) -> Option<Arc<KeptVersion>> {
+        self.versions.back().cloned()
+    }
+
+    /// The version of exactly `block` (None = not held).
+    pub fn version_at(&self, block: u64) -> Option<Arc<KeptVersion>> {
+        self.versions.iter().rev().find(|v| v.block == block).cloned()
+    }
+
+    /// Contracts kept / values held right now.
+    pub fn held_counts(&self) -> (usize, usize, usize) {
+        (self.held.len(), self.cur.accounts.len(), self.cur.slots())
+    }
+
+    /// Seed calls waiting.
+    pub fn seeds_waiting(&self) -> usize {
+        self.seeds.len()
+    }
+
+    fn publish(&mut self, replace_same_block: bool) {
+        let v = Arc::new(self.cur.clone());
+        if replace_same_block && self.versions.back().is_some_and(|x| x.block == v.block) {
+            self.versions.pop_back();
+        }
+        self.versions.push_back(v);
+        while self.versions.len() > self.cfg.versions {
+            self.versions.pop_front();
+        }
+    }
+
+    /// Start (or start again) at `block`: nothing held yet; every kept
+    /// contract's values are asked for again (at this block).
+    pub fn start_at(&mut self, block: u64) {
+        self.head = Some(block);
+        self.cur = KeptVersion { block, accounts: PMap::default(), codes: std::mem::take(&mut self.cur.codes) };
+        self.versions.clear();
+        self.recent.clear();
+        self.seeds.clear();
+        self.pending.clear();
+        let held: Vec<Address> = self.held.iter().copied().collect();
+        for a in held {
+            self.queue_all(a);
+        }
+        self.publish(false);
+    }
+
+    /// Drop everything held (fail closed) and start again at `block`.
+    pub fn reset(&mut self, block: u64, why: &'static str) {
+        *self.stats.resets.entry(why).or_default() += 1;
+        self.start_at(block);
+    }
+
+    /// Queue a seed of every value a kept contract needs.
+    fn queue_all(&mut self, a: Address) {
+        let Some(c) = self.cands.get(&a) else { return };
+        let mut slots: Vec<U256> = c.slots.iter().copied().collect();
+        slots.sort();
+        let basics = c.basics;
+        self.queue(a, slots, basics);
+    }
+
+    /// Queue seeds for values not held and not already asked for.
+    fn queue(&mut self, a: Address, slots: Vec<U256>, basics: bool) {
+        let held = self.cur.accounts.get(&a);
+        let need_basics = basics && !held.is_some_and(|x| matches!(x.basics, Basics::Known(_))) && !self.pending.contains(&(a, None));
+        let mut need: Vec<U256> = slots
+            .into_iter()
+            .filter(|s| !held.is_some_and(|x| x.storage_complete || x.storage.contains_key(s)) && !self.pending.contains(&(a, Some(*s))))
+            .collect();
+        need.sort();
+        need.dedup();
+        // Bounded in all: what is held + what is asked for.
+        let room = self.cfg.max_slots_total.saturating_sub(self.cur.slots() + self.pending.len());
+        if need.len() > room {
+            self.stats.refused_full += (need.len() - room) as u64;
+            need.truncate(room);
+        }
+        if need.is_empty() && !need_basics {
+            return;
+        }
+        if need_basics {
+            self.pending.insert((a, None));
+        }
+        for s in &need {
+            self.pending.insert((a, Some(*s)));
+        }
+        // One job per seed_batch values (the first one also asks for basics).
+        let mut first = true;
+        let mut chunks: Vec<Vec<U256>> = need.chunks(self.cfg.seed_batch.max(1)).map(|c| c.to_vec()).collect();
+        if chunks.is_empty() {
+            chunks.push(Vec::new());
+        }
+        for c in chunks {
+            self.seeds.push_back(SeedJob { addr: a, slots: c, basics: first && need_basics });
+            first = false;
+        }
+    }
+
+    /// LEARN: values the predicted copy's runs lacked (or read only
+    /// approximately). Each contract named scores one point per call.
+    pub fn learn(&mut self, items: &[MissItem]) {
+        let mut by: HashMap<Address, (Vec<U256>, bool)> = HashMap::new();
+        for it in items {
+            match it {
+                MissItem::Slot(a, s) => by.entry(*a).or_default().0.push(*s),
+                MissItem::Account(a) => by.entry(*a).or_default().1 = true,
+                MissItem::Code(_) => {}
+            }
+        }
+        if by.is_empty() {
+            return;
+        }
+        self.stats.learned += items.len() as u64;
+        let total_held: usize = self.cur.slots();
+        let mut grew: Vec<Address> = Vec::new();
+        for (a, (slots, basics)) in by {
+            let per = self.cfg.max_slots_per;
+            let c = self.cands.entry(a).or_default();
+            c.score += 1.0;
+            c.basics |= basics;
+            for s in slots {
+                if c.slots.len() >= per {
+                    self.stats.refused_full += 1;
+                    break;
+                }
+                c.slots.insert(s);
+            }
+            // Every kept contract named gets its missing values asked for
+            // (a seed that failed or came back too late is asked again).
+            grew.push(a);
+        }
+        // Bounded: forget the weakest candidates that are not kept.
+        if self.cands.len() > self.cfg.max_candidates {
+            let mut v: Vec<(f64, Address)> = self.cands.iter().filter(|(a, _)| !self.held.contains(*a)).map(|(a, c)| (c.score, *a)).collect();
+            v.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap_or(std::cmp::Ordering::Equal));
+            let extra = self.cands.len() - self.cfg.max_candidates;
+            for (_, a) in v.into_iter().take(extra) {
+                self.cands.remove(&a);
+            }
+        }
+        self.choose();
+        // Values of kept contracts not held yet: seed them (bounded in all).
+        for a in grew {
+            if self.held.contains(&a) {
+                if total_held >= self.cfg.max_slots_total {
+                    self.stats.refused_full += 1;
+                    continue;
+                }
+                self.queue_all(a);
+            }
+        }
+    }
+
+    /// Pick the kept contracts: the top scores, with a 2x margin for a
+    /// newcomer over the coldest kept one (no churn).
+    fn choose(&mut self) {
+        let mut order: Vec<(f64, Address)> = self.cands.iter().map(|(a, c)| (if self.held.contains(a) { c.score * 2.0 } else { c.score }, *a)).collect();
+        order.sort_by(|x, y| y.0.partial_cmp(&x.0).unwrap_or(std::cmp::Ordering::Equal).then(x.1.cmp(&y.1)));
+        let want: HashSet<Address> = order.iter().take(self.cfg.max_contracts).map(|x| x.1).collect();
+        let drop: Vec<Address> = self.held.iter().filter(|a| !want.contains(*a)).copied().collect();
+        for a in drop {
+            self.evict(a);
+        }
+        let add: Vec<Address> = want.into_iter().filter(|a| !self.held.contains(a)).collect();
+        for a in add {
+            self.held.insert(a);
+            if self.head.is_some() {
+                self.queue_all(a);
+            }
+        }
+    }
+
+    fn evict(&mut self, a: Address) {
+        self.held.remove(&a);
+        if self.cur.accounts.remove(&a).is_some() {
+            self.stats.evicted += 1;
+        }
+        self.pending.retain(|(x, _)| *x != a);
+        self.seeds.retain(|j| j.addr != a);
+    }
+
+    /// Scores halve (once an hour): contracts that stopped coming up lose
+    /// their place to new ones. Dead candidates are forgotten.
+    pub fn decay(&mut self) {
+        for c in self.cands.values_mut() {
+            c.score *= 0.5;
+        }
+        let held = &self.held;
+        self.cands.retain(|a, c| c.score >= 0.1 || held.contains(a));
+        self.choose();
+    }
+
+    /// The next seed to send (the caller enforces the hourly limit).
+    pub fn take_job(&mut self) -> Option<SeedJob> {
+        while let Some(j) = self.seeds.pop_front() {
+            if self.held.contains(&j.addr) {
+                self.stats.seeds_sent += 1;
+                return Some(j);
+            }
+        }
+        None
+    }
+
+    /// A seed came back (or failed: `ans` None): the values become held,
+    /// carried forward through the blocks applied since `at`.
+    pub fn on_seed(&mut self, job: &SeedJob, ans: Option<SeedAnswer>) {
+        // Not pending any more, whatever happened (a failure may be asked again later).
+        self.pending.remove(&(job.addr, None));
+        for s in &job.slots {
+            self.pending.remove(&(job.addr, Some(*s)));
+        }
+        let Some(ans) = ans else {
+            self.stats.seeds_dropped += 1;
+            return;
+        };
+        let Some(head) = self.head else { return };
+        if !self.held.contains(&ans.addr) || ans.at > head {
+            self.stats.seeds_dropped += 1;
+            return;
+        }
+        // The blocks since `at` must all still be here to carry it forward.
+        let need: Vec<&(u64, Arc<StateDiff>)> = self.recent.iter().filter(|(b, _)| *b > ans.at && *b <= head).collect();
+        if need.len() as u64 != head - ans.at {
+            self.stats.seeds_dropped += 1;
+            return;
+        }
+        // The seeded values as an account at `at` (basics only if asked).
+        let mut acct = Acct::default();
+        if let Some(b) = &ans.basics {
+            acct.basics = Basics::Known(normalize(b.clone()));
+            if b.is_none() {
+                acct.storage_complete = true;
+            }
+        }
+        for (s, v) in &ans.slots {
+            acct.storage.insert(*s, *v);
+        }
+        let keys: HashSet<U256> = ans.slots.iter().map(|x| x.0).collect();
+        for (_, d) in need {
+            if let Some(ad) = d.accounts.get(&ans.addr) {
+                acct = apply_held(ans.addr, &acct, ad, &keys);
+            }
+        }
+        if let (Some(Some(i)), Some(c)) = (&ans.basics, &ans.code) {
+            if i.code_hash != KECCAK_EMPTY && !i.code_hash.is_zero() && !self.cur.codes.contains_key(&i.code_hash) {
+                self.cur.codes.insert(i.code_hash, c.clone());
+            }
+        }
+        // Into what we hold now (held values are already current; the seed
+        // only adds what was missing).
+        let mut held = self.cur.accounts.get(&ans.addr).cloned().unwrap_or_default();
+        if ans.basics.is_some() && !matches!(held.basics, Basics::Known(_)) {
+            held.basics = acct.basics.clone();
+            held.balance_exact = true;
+            held.storage_complete |= acct.storage_complete;
+        }
+        let mut added = 0u64;
+        for (s, v) in acct.storage.iter() {
+            if !held.storage.contains_key(s) {
+                held.storage.insert(*s, *v);
+                added += 1;
+            }
+        }
+        self.stats.seed_values += added;
+        self.cur.accounts.insert(ans.addr, held);
+        self.publish(true);
+    }
+
+    /// Codes the keeper holds (a seed asks for a contract's code only when
+    /// neither copy 2 nor the keeper has it).
+    pub fn has_code(&self, h: &B256) -> bool {
+        self.cur.codes.contains_key(h)
+    }
+
+    /// KEEP EXACT: block `block`'s changes (the node's per-transaction
+    /// diffs, in order). Only values we hold are updated. Err = not the
+    /// next block (the caller starts again: never a gap).
+    pub fn apply_block(&mut self, block: u64, txs: &[StateDiff]) -> Result<(), &'static str> {
+        let t0 = Instant::now();
+        let Some(head) = self.head else { return Err("not_started") };
+        if block <= head {
+            return Ok(()); // already applied
+        }
+        if block != head + 1 {
+            return Err("gap");
+        }
+        let mut merged = StateDiff::default();
+        for d in txs {
+            crate::state::diff::merge(&mut merged, d);
+        }
+        let mut touched = 0u64;
+        let mut updated = 0u64;
+        for (a, ad) in &merged.accounts {
+            let Some(cur) = self.cur.accounts.get(a) else { continue };
+            let keys: HashSet<U256> = cur.storage.keys().copied().collect();
+            let next = apply_held(*a, cur, ad, &keys);
+            touched += 1;
+            updated += ad.storage.keys().filter(|s| keys.contains(s)).count() as u64;
+            self.cur.accounts.insert(*a, next);
+        }
+        self.recent.push_back((block, Arc::new(merged)));
+        while self.recent.len() > self.cfg.versions {
+            self.recent.pop_front();
+        }
+        self.head = Some(block);
+        self.cur.block = block;
+        self.publish(false);
+        self.stats.blocks += 1;
+        self.stats.held_touched += touched;
+        self.stats.values_updated += updated;
+        self.stats.add_time(t0.elapsed().as_micros() as u64);
+        Ok(())
+    }
+
+    /// AUDIT, part 1: the next kept contract to re-read (round robin) and
+    /// up to `max` of its values.
+    pub fn audit_pick(&mut self, max: usize) -> Option<(Address, Vec<U256>)> {
+        let mut addrs: Vec<Address> = self.cur.accounts.keys().copied().collect();
+        if addrs.is_empty() {
+            return None;
+        }
+        addrs.sort();
+        let a = addrs[self.audit_next % addrs.len()];
+        self.audit_next = self.audit_next.wrapping_add(1);
+        let mut slots: Vec<U256> = self.cur.accounts.get(&a).map(|x| x.storage.keys().copied().collect()).unwrap_or_default();
+        slots.sort();
+        slots.truncate(max);
+        Some((a, slots))
+    }
+
+    /// AUDIT, part 2: the node's values of `addr` at `at` (= our head)
+    /// against ours. A mismatch drops everything (fail closed). Returns
+    /// the number of values that differ.
+    pub fn audit_check(&mut self, at: u64, addr: Address, basics: Option<Option<AccountInfo>>, slots: &[(U256, U256)]) -> usize {
+        if self.head != Some(at) {
+            return 0; // moved on meanwhile: not comparable
+        }
+        let Some(held) = self.cur.accounts.get(&addr).cloned() else { return 0 };
+        self.stats.audits += 1;
+        let mut bad: Vec<String> = Vec::new();
+        for (s, v) in slots {
+            if let Some(h) = held.storage.get(s) {
+                self.stats.audit_values += 1;
+                if h != v {
+                    bad.push(format!("slot {s:#x}: ours {h:#x} node {v:#x}"));
+                }
+            }
+        }
+        if let (Some(nb), Basics::Known(hb)) = (basics, &held.basics) {
+            self.stats.audit_values += 1;
+            let nb = normalize(nb);
+            let same = match (&nb, hb) {
+                (None, None) => true,
+                (Some(x), Some(y)) => x.balance == y.balance && x.nonce == y.nonce && (x.code_hash == y.code_hash || x.code_hash.is_zero() || y.code_hash.is_zero()),
+                _ => false,
+            };
+            if !same {
+                bad.push("basics differ".into());
+            }
+        }
+        if !bad.is_empty() {
+            self.stats.audit_mismatch += bad.len() as u64;
+            if self.stats.samples.len() < 20 {
+                self.stats.samples.push(json!({"block": at, "contract": format!("{addr:#x}"), "differ": bad.iter().take(4).collect::<Vec<_>>()}));
+            }
+            self.reset(at, "audit_mismatch");
+        }
+        bad.len()
+    }
+
+    /// The current version's account (tests / replay audit).
+    pub fn account(&self, a: &Address) -> Option<&Acct> {
+        self.cur.accounts.get(a)
+    }
+
+    /// Kept contract addresses (status).
+    pub fn held_list(&self) -> Vec<Address> {
+        let mut v: Vec<Address> = self.held.iter().copied().collect();
+        v.sort();
+        v
+    }
+
+    pub fn status_json(&self) -> Value {
+        let (held, accts, slots) = self.held_counts();
+        json!({
+            "head": self.head, "contracts": held, "accounts": accts, "values": slots, "codes": self.cur.codes.len(),
+            "candidates": self.cands.len(), "seedsWaiting": self.seeds.len(), "versions": self.versions.len(),
+            "stats": self.stats.json(),
+        })
+    }
+}
+
+/// Apply one account's block change to a held account, keeping only the
+/// values held before (`keys`): a value the change touches that we never
+/// held stays unknown. Basics follow the node (the code hash is kept when
+/// the trace leaves code out). An account the block created or destroyed
+/// becomes "complete" (every other value zero), as the node says.
+fn apply_held(a: Address, cur: &Acct, ad: &AccountDiff, keys: &HashSet<U256>) -> Acct {
+    let mut tmp = Snapshot::default();
+    tmp.accounts.insert(a, cur.clone());
+    tmp.apply_account_diff(a, ad);
+    let mut out = tmp.accounts.get(&a).cloned().unwrap_or_default();
+    if !out.storage_complete {
+        let drop: Vec<U256> = out.storage.keys().filter(|s| !keys.contains(s)).copied().collect();
+        for s in drop {
+            out.storage.remove(&s);
+        }
+    }
+    out
+}
+
+/// What the predicted copy should learn from one run: the values it lacked
+/// (`missing`) and the ones it read that copy 2 only holds approximately
+/// (`reads` against `exact`). Leaves out what copy 2 follows itself
+/// (`skip`: our pools), the transaction's sender, never-trusted accounts and
+/// Nitro's built-in addresses (below 0x1000, and ArbOS's own account).
+pub fn wanted_items(
+    missing: &[MissItem],
+    reads: Option<(&HashSet<Address>, &HashSet<(Address, U256)>)>,
+    view: &dyn crate::state::StateRead,
+    prov: &dyn Provenance,
+    sender: Address,
+    skip: &dyn Fn(&Address) -> bool,
+) -> Vec<MissItem> {
+    let builtin = |a: &Address| {
+        let w = U256::from_be_slice(a.as_slice());
+        // Ethereum's (0x01..) and Nitro's (ArbSys 0x64 .. ArbDebug 0xff,
+        // P256 0x100) built-ins all sit below 0x1000.
+        w < U256::from(0x1000u64) || *a == arbos_state()
+    };
+    let ok = |a: &Address| *a != sender && !builtin(a) && !skip(a) && !view.volatile().is_some_and(|v| v.is_whole(a));
+    let mut out: Vec<MissItem> = Vec::new();
+    let mut seen: HashSet<MissItem> = HashSet::new();
+    let mut push = |m: MissItem| {
+        if seen.insert(m.clone()) {
+            out.push(m);
+        }
+    };
+    for m in missing {
+        match m {
+            MissItem::Slot(a, _) | MissItem::Account(a) if ok(a) => push(m.clone()),
+            _ => {}
+        }
+    }
+    if let Some((accts, slots)) = reads {
+        for a in accts {
+            if ok(a) && matches!(view.account(*a), crate::state::Lookup::Missing) {
+                push(MissItem::Account(*a));
+            }
+        }
+        for (a, s) in slots {
+            if ok(a) && (matches!(view.storage(*a, *s), crate::state::Lookup::Missing) || !prov.slot_exact(*a, *s)) {
+                push(MissItem::Slot(*a, *s));
+            }
+        }
+    }
+    out
+}
+
+/// ArbOS's own state account (0xA4B05FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF).
+fn arbos_state() -> Address {
+    let mut b = [0xffu8; 20];
+    b[0] = 0xa4;
+    b[1] = 0xb0;
+    b[2] = 0x5f;
+    Address::from(b)
+}
+
+// ---------------------------------------------------------------------------
+// Node answers (live keeper)
+// ---------------------------------------------------------------------------
+
+/// Parse an eth_getProof answer into (basics, slots).
+pub fn parse_proof(v: &Value) -> Result<(Option<AccountInfo>, Vec<(U256, U256)>), String> {
+    use crate::check::hexutil::{parse_u256, parse_u64};
+    let s = |k: &str| v.get(k).and_then(|x| x.as_str()).ok_or_else(|| format!("proof field {k} missing"));
+    let balance = parse_u256(s("balance")?)?;
+    let nonce = parse_u64(s("nonce")?)?;
+    let ch = parse_u256(s("codeHash")?)?;
+    let code_hash = if ch.is_zero() { KECCAK_EMPTY } else { B256::from(ch.to_be_bytes::<32>()) };
+    let info = normalize(Some(AccountInfo { balance, nonce, code_hash, ..Default::default() }));
+    let mut slots = Vec::new();
+    for e in v.get("storageProof").and_then(|x| x.as_array()).ok_or("storageProof missing")? {
+        let k = parse_u256(e.get("key").and_then(|x| x.as_str()).ok_or("key missing")?)?;
+        let val = parse_u256(e.get("value").and_then(|x| x.as_str()).ok_or("value missing")?)?;
+        slots.push((k, val));
+    }
+    Ok((info, slots))
+}
+
+/// One block's changes from the node (prestate tracer, diff mode, no code).
+/// Ok(None) = the node doesn't have the block yet.
+fn fetch_block(node: &dyn crate::node::NodeApi, block: u64) -> Result<Option<Vec<StateDiff>>, String> {
+    let params = json!([crate::node::tag(block), { "tracer": "prestateTracer", "tracerConfig": { "diffMode": true, "disableCode": true } }]);
+    let r = node.call_batch_paid(crate::node::Class::Critical, &[("debug_traceBlockByNumber", params)]).map_err(|e| format!("{e:?}").chars().take(120).collect::<String>())?;
+    match r.into_iter().next() {
+        Some(Ok(Value::Null)) | None => Ok(None),
+        Some(Ok(v)) => crate::state::diff::parse_block_trace(&v).map(|t| Some(t.into_iter().map(|d| d.diff).collect())),
+        Some(Err(e)) if e.is_block_unavailable() => Ok(None),
+        Some(Err(e)) => Err(format!("trace: {}", e.message.chars().take(120).collect::<String>())),
+    }
+}
+
+/// One seed (or audit) read: eth_getProof of `addr`'s `slots` at `block`,
+/// plus its code when asked. Ok((basics, code, slots)).
+type ProofAnswer = (Option<AccountInfo>, Option<Bytecode>, Vec<(U256, U256)>);
+fn fetch_proof(node: &dyn crate::node::NodeApi, addr: Address, slots: &[U256], block: u64, with_code: bool) -> Result<ProofAnswer, String> {
+    use crate::check::hexutil::to_hex;
+    let keys: Vec<String> = slots.iter().map(|s| format!("{s:#066x}")).collect();
+    let mut calls: Vec<(&str, Value)> = vec![("eth_getProof", json!([to_hex(addr.as_slice()), keys, crate::node::tag(block)]))];
+    if with_code {
+        calls.push(("eth_getCode", json!([to_hex(addr.as_slice()), crate::node::tag(block)])));
+    }
+    let r = node.call_batch_paid(crate::node::Class::Critical, &calls).map_err(|e| format!("{e:?}").chars().take(120).collect::<String>())?;
+    let mut it = r.into_iter();
+    let p = match it.next() {
+        Some(Ok(v)) if !v.is_null() => v,
+        Some(Err(e)) => return Err(format!("proof: {}", e.message.chars().take(100).collect::<String>())),
+        _ => return Err("proof: no answer".into()),
+    };
+    let (info, vals) = parse_proof(&p)?;
+    let code = match (with_code, it.next()) {
+        (true, Some(Ok(Value::String(s)))) => {
+            let b = crate::check::hexutil::parse_bytes(&s)?;
+            (!b.is_empty()).then(|| Bytecode::new_raw(b))
+        }
+        (true, _) => return Err("code: no answer".into()),
+        (false, _) => None,
+    };
+    // The code must be the one the proof names (never a mismatched pair).
+    if let (Some(i), Some(c)) = (&info, &code) {
+        if revm::primitives::keccak256(c.original_byte_slice()) != i.code_hash {
+            return Err("code does not match the proof's code hash".into());
+        }
+    }
+    Ok((info, code, vals))
+}
+
+// ---------------------------------------------------------------------------
+// Runtime: one thread in the running sidecar
+// ---------------------------------------------------------------------------
+
+struct Rt {
+    learn: std::sync::mpsc::SyncSender<Vec<MissItem>>,
+    versions: Mutex<VecDeque<Arc<KeptVersion>>>,
+    status: Mutex<Value>,
+    dropped: std::sync::atomic::AtomicU64,
+}
+
+static RT: OnceLock<Rt> = OnceLock::new();
+
+/// Start the keeper (only with FASTLANE_AHEAD=on|observe and the keeper on;
+/// see KeeperCfg). Returns whether it started.
+pub fn start(c2: super::intake::Copy2Handle) -> bool {
+    let cfg = KeeperCfg::from_lookup(|k| std::env::var(k).ok());
+    if !cfg.on || super::ahead::mode() == super::ahead::Mode::Off || RT.get().is_some() {
+        return false;
+    }
+    let file = std::env::var("FASTLANE_AHEAD_KEEP_BUDGET_FILE").unwrap_or_else(|_| "arbsim-keeper-budget.json".into());
+    let budget = crate::node::Budget::new(cfg.daily_cap, cfg.rps, if file.trim().is_empty() { None } else { Some(file) });
+    let Some(node) = crate::node::NodeClient::from_env_with_paid_budget(budget) else {
+        eprintln!("[arbsim] fastlane keeper: no node configured: OFF");
+        return false;
+    };
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<MissItem>>(1024);
+    if RT.set(Rt { learn: tx, versions: Mutex::new(VecDeque::new()), status: Mutex::new(json!({})), dropped: Default::default() }).is_err() {
+        return false;
+    }
+    eprintln!(
+        "[arbsim] fastlane keeper ON: keeps up to {} hot contracts exact (one block diff per block, own node allowance {}/day, {} calls/s)",
+        cfg.max_contracts, cfg.daily_cap, cfg.rps
+    );
+    std::thread::Builder::new()
+        .name("arbsim-keeper".into())
+        .spawn(move || {
+            crate::fastlane::mode::lower_this_thread_from_env("arbsim-keeper");
+            run_loop(c2, node, cfg, rx)
+        })
+        .is_ok()
+}
+
+/// The predicted copy's runs: values to learn (no-op when the keeper is off).
+pub fn learn_hook(items: Vec<MissItem>) {
+    let Some(rt) = RT.get() else { return };
+    if items.is_empty() {
+        return;
+    }
+    if rt.learn.try_send(items).is_err() {
+        rt.dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Is the keeper running?
+pub fn running() -> bool {
+    RT.get().is_some()
+}
+
+/// The keeper's version of exactly `block` (None = off / not held).
+pub fn version_at(block: u64) -> Option<Arc<KeptVersion>> {
+    let rt = RT.get()?;
+    let v = rt.versions.lock().unwrap_or_else(|e| e.into_inner());
+    v.iter().rev().find(|x| x.block == block).cloned()
+}
+
+/// The keeper's newest version (None = off / not started).
+pub fn latest() -> Option<Arc<KeptVersion>> {
+    let rt = RT.get()?;
+    let v = rt.versions.lock().unwrap_or_else(|e| e.into_inner());
+    v.back().cloned()
+}
+
+/// status "fastlaneKeeper" (None when off).
+pub fn status_json() -> Option<Value> {
+    let rt = RT.get()?;
+    let mut v = rt.status.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    v["learnDropped"] = json!(rt.dropped.load(std::sync::atomic::Ordering::Relaxed));
+    Some(v)
+}
+
+/// Copy 2's newest block (the node has it: its reports came from the node).
+fn copy2_head(c2: &super::intake::Copy2Handle) -> Option<u64> {
+    c2.sh.published.view().head().map(|v| v.block)
+}
+
+fn run_loop(c2: super::intake::Copy2Handle, node: crate::node::NodeClient, cfg: KeeperCfg, rx: std::sync::mpsc::Receiver<Vec<MissItem>>) {
+    let Some(rt) = RT.get() else { return };
+    let mut k = KeeperCore::new(cfg.clone());
+    let mut errors = 0u32;
+    let mut last_seen: Option<u64> = None;
+    let mut hour = Instant::now();
+    let mut seeds_hour = 0u64;
+    let mut audit_at = Instant::now();
+    let mut status_at = Instant::now();
+    let mut calls = 0u64;
+    let mut calls_hour_start = Instant::now();
+    let mut paused_until: Option<Instant> = None;
+    let publish = |k: &KeeperCore| {
+        if let Some(v) = k.latest() {
+            let mut g = rt.versions.lock().unwrap_or_else(|e| e.into_inner());
+            if g.back().is_some_and(|x| x.block == v.block) {
+                g.pop_back();
+            }
+            g.push_back(v.clone());
+            while g.len() > cfg.versions {
+                g.pop_front();
+            }
+            drop(g);
+            super::ahead::kept_hook();
+        }
+    };
+    loop {
+        // Learned values from the predicted copy (all queued).
+        while let Ok(items) = rx.try_recv() {
+            k.learn(&items);
+        }
+        if hour.elapsed() >= Duration::from_secs(3600) {
+            hour = Instant::now();
+            seeds_hour = 0;
+            k.decay();
+            eprintln!("[arbsim] fastlane keeper (last hour): {}", k.status_json());
+        }
+        if status_at.elapsed() >= Duration::from_secs(1) {
+            status_at = Instant::now();
+            let mut st = k.status_json();
+            let el = calls_hour_start.elapsed().as_secs_f64().max(1.0);
+            st["callsPerS"] = json!((calls as f64 / el * 100.0).round() / 100.0);
+            st["calls"] = json!(calls);
+            st["node"] = crate::node::NodeApi::usage(&node);
+            st["paused"] = json!(paused_until.is_some_and(|t| t > Instant::now()));
+            *rt.status.lock().unwrap_or_else(|e| e.into_inner()) = st;
+        }
+        if paused_until.is_some_and(|t| t > Instant::now()) {
+            std::thread::sleep(Duration::from_millis(500));
+            continue;
+        }
+        let Some(target) = copy2_head(&c2) else {
+            std::thread::sleep(Duration::from_millis(50));
+            continue;
+        };
+        // Copy 2 went backwards (a reorg / restart): start again there.
+        if last_seen.is_some_and(|l| target < l) {
+            k.reset(target, "copy2_backwards");
+            publish(&k);
+        }
+        last_seen = Some(target);
+        let head = match k.head() {
+            None => {
+                k.start_at(target);
+                publish(&k);
+                target
+            }
+            Some(h) if target > h + cfg.max_behind => {
+                k.reset(target, "behind");
+                publish(&k);
+                target
+            }
+            Some(h) => h,
+        };
+        if head < target {
+            // KEEP EXACT: the next block's changes.
+            calls += 1;
+            match fetch_block(&node, head + 1) {
+                Ok(Some(txs)) => {
+                    errors = 0;
+                    if k.apply_block(head + 1, &txs).is_err() {
+                        k.reset(target, "gap");
+                    }
+                    publish(&k);
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+                Err(e) => {
+                    errors += 1;
+                    if e.contains("allowance") || e.contains("Budget") {
+                        // The day's allowance is used up: drop everything, wait.
+                        k.reset(target, "daily_cap");
+                        publish(&k);
+                        paused_until = Some(Instant::now() + Duration::from_secs(300));
+                    } else if errors >= 20 {
+                        k.reset(target, "node_errors");
+                        publish(&k);
+                        errors = 0;
+                        std::thread::sleep(Duration::from_millis(500));
+                    } else {
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                }
+            }
+            continue;
+        }
+        // Caught up: one seed (within the hourly limit), then maybe an audit.
+        if seeds_hour < cfg.seeds_per_hour {
+            if let Some(job) = k.take_job() {
+                seeds_hour += 1;
+                calls += 1;
+                let need_code = job.basics;
+                let ans = match fetch_proof(&node, job.addr, &job.slots, head, need_code) {
+                    Ok((info, code, slots)) => {
+                        let code = code.filter(|_| need_code);
+                        Some(SeedAnswer { addr: job.addr, at: head, basics: job.basics.then_some(info), code, slots })
+                    }
+                    Err(_) => None,
+                };
+                k.on_seed(&job, ans);
+                publish(&k);
+                continue;
+            }
+        }
+        if cfg.audit_s > 0 && audit_at.elapsed() >= Duration::from_secs(cfg.audit_s) {
+            audit_at = Instant::now();
+            if let Some((a, slots)) = k.audit_pick(50) {
+                calls += 1;
+                if let Ok((info, _, vals)) = fetch_proof(&node, a, &slots, head, false) {
+                    if k.audit_check(head, a, Some(info), &vals) > 0 {
+                        publish(&k);
+                    }
+                }
+            }
+            continue;
+        }
+        if calls_hour_start.elapsed() >= Duration::from_secs(3600) {
+            calls_hour_start = Instant::now();
+            calls = 0;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn a(n: u64) -> Address {
+        Address::from_word(B256::from(U256::from(n).to_be_bytes::<32>()))
+    }
+    fn u(n: u64) -> U256 {
+        U256::from(n)
+    }
+    fn slot_diff(addr: Address, writes: &[(u64, u64)]) -> StateDiff {
+        let mut d = StateDiff::default();
+        d.accounts.insert(addr, AccountDiff { storage: writes.iter().map(|(s, v)| (u(*s), u(*v))).collect(), ..Default::default() });
+        d
+    }
+    fn core(n: usize) -> KeeperCore {
+        KeeperCore::new(KeeperCfg { on: true, max_contracts: n, ..KeeperCfg::default() })
+    }
+    fn seed(k: &mut KeeperCore, at: u64) {
+        while let Some(j) = k.take_job() {
+            let slots = j.slots.iter().map(|s| (*s, *s * u(10))).collect();
+            let basics = j.basics.then(|| Some(AccountInfo { balance: u(5), nonce: 1, code_hash: KECCAK_EMPTY, ..Default::default() }));
+            let ans = SeedAnswer { addr: j.addr, at, basics, code: None, slots };
+            k.on_seed(&j, Some(ans));
+        }
+    }
+
+    /// Learn -> seed -> every later block keeps the held values exact; a
+    /// value the block touched but we never held stays unknown.
+    #[test]
+    fn held_values_follow_the_blocks_and_unheld_ones_stay_unknown() {
+        let mut k = core(10);
+        k.start_at(100);
+        k.learn(&[MissItem::Slot(a(1), u(1)), MissItem::Slot(a(1), u(2))]);
+        seed(&mut k, 100);
+        assert_eq!(k.account(&a(1)).unwrap().storage.get(&u(1)), Some(&u(10)));
+        k.apply_block(101, &[slot_diff(a(1), &[(1, 77), (3, 99)])]).unwrap();
+        let acct = k.account(&a(1)).unwrap();
+        assert_eq!(acct.storage.get(&u(1)), Some(&u(77)), "held value updated");
+        assert_eq!(acct.storage.get(&u(2)), Some(&u(20)), "untouched held value kept");
+        assert_eq!(acct.storage.get(&u(3)), None, "touched but never held: unknown");
+        let v = k.version_at(101).unwrap();
+        assert!(v.holds_slot(&a(1), &u(1)) && !v.holds_slot(&a(1), &u(3)));
+        assert_eq!(k.version_at(100).unwrap().accounts.get(&a(1)).unwrap().storage.get(&u(1)), Some(&u(10)), "older version unchanged");
+    }
+
+    /// A seed answered at an older block is carried forward through the
+    /// blocks applied since; one older than the kept changes is dropped.
+    #[test]
+    fn a_late_seed_is_carried_forward_or_dropped() {
+        let mut k = core(10);
+        k.start_at(100);
+        k.learn(&[MissItem::Slot(a(1), u(1))]);
+        let j = k.take_job().unwrap();
+        k.apply_block(101, &[slot_diff(a(1), &[(1, 5)])]).unwrap();
+        k.apply_block(102, &[slot_diff(a(2), &[(1, 6)])]).unwrap();
+        k.on_seed(&j, Some(SeedAnswer { addr: a(1), at: 100, basics: None, code: None, slots: vec![(u(1), u(1))] }));
+        assert_eq!(k.account(&a(1)).unwrap().storage.get(&u(1)), Some(&u(5)), "the value at 100 + block 101's change");
+        assert_eq!(k.version_at(102).unwrap().accounts.get(&a(1)).unwrap().storage.get(&u(1)), Some(&u(5)), "republished at the head");
+        // A seed older than the kept changes can't be carried: dropped.
+        let mut k = KeeperCore::new(KeeperCfg { on: true, versions: 2, ..KeeperCfg::default() });
+        k.start_at(100);
+        k.learn(&[MissItem::Slot(a(1), u(1))]);
+        let j = k.take_job().unwrap();
+        for b in 101..=104 {
+            k.apply_block(b, &[]).unwrap();
+        }
+        k.on_seed(&j, Some(SeedAnswer { addr: a(1), at: 100, basics: None, code: None, slots: vec![(u(1), u(1))] }));
+        assert!(k.account(&a(1)).is_none());
+        assert_eq!(k.stats.seeds_dropped, 1);
+        // ...and it can be asked again.
+        k.learn(&[MissItem::Slot(a(1), u(1))]);
+        assert!(k.take_job().is_some());
+    }
+
+    /// Never a gap: a block that is not the next one is refused.
+    #[test]
+    fn blocks_must_come_in_order() {
+        let mut k = core(10);
+        k.start_at(100);
+        assert_eq!(k.apply_block(102, &[]), Err("gap"));
+        assert_eq!(k.apply_block(100, &[]), Ok(()), "old block: ignored");
+        assert_eq!(k.head(), Some(100));
+        k.apply_block(101, &[]).unwrap();
+        assert_eq!(k.head(), Some(101));
+    }
+
+    /// Bounded: only the top contracts are kept; a newcomer must clearly
+    /// beat the coldest kept one; cold ones are evicted after decay.
+    #[test]
+    fn only_the_hottest_contracts_are_kept() {
+        let mut k = core(2);
+        k.start_at(1);
+        for _ in 0..3 {
+            k.learn(&[MissItem::Slot(a(1), u(1))]);
+            k.learn(&[MissItem::Slot(a(2), u(1))]);
+        }
+        k.learn(&[MissItem::Slot(a(3), u(1))]);
+        seed(&mut k, 1);
+        assert_eq!(k.held_list(), vec![a(1), a(2)]);
+        assert!(k.account(&a(3)).is_none());
+        // a(3) becomes much hotter; a(1) / a(2) go cold.
+        for _ in 0..40 {
+            k.learn(&[MissItem::Slot(a(3), u(1))]);
+        }
+        for _ in 0..4 {
+            k.decay();
+        }
+        k.learn(&[MissItem::Slot(a(3), u(1))]);
+        assert!(k.held_list().contains(&a(3)), "{:?}", k.held_list());
+        assert_eq!(k.held_list().len(), 2);
+        assert!(k.stats.evicted >= 1);
+    }
+
+    /// Per-contract value cap.
+    #[test]
+    fn values_per_contract_are_capped() {
+        let mut k = KeeperCore::new(KeeperCfg { on: true, max_slots_per: 3, ..KeeperCfg::default() });
+        k.start_at(1);
+        let items: Vec<MissItem> = (0..10).map(|s| MissItem::Slot(a(1), u(s))).collect();
+        k.learn(&items);
+        seed(&mut k, 1);
+        assert_eq!(k.account(&a(1)).unwrap().storage.len(), 3);
+        assert!(k.stats.refused_full > 0);
+    }
+
+    /// An audit mismatch drops everything (fail closed) and asks again.
+    #[test]
+    fn an_audit_mismatch_drops_everything() {
+        let mut k = core(10);
+        k.start_at(5);
+        k.learn(&[MissItem::Slot(a(1), u(1))]);
+        seed(&mut k, 5);
+        let (addr, slots) = k.audit_pick(10).unwrap();
+        assert_eq!((addr, slots.clone()), (a(1), vec![u(1)]));
+        assert_eq!(k.audit_check(5, addr, None, &[(u(1), u(10))]), 0, "same value");
+        assert_eq!(k.audit_check(5, addr, None, &[(u(1), u(11))]), 1);
+        assert!(k.account(&a(1)).is_none(), "dropped");
+        assert_eq!(k.stats.resets.get("audit_mismatch"), Some(&1));
+        assert!(k.take_job().is_some(), "asked again");
+    }
+
+    /// Merge: copy 2's exact values win; the keeper fills what copy 2
+    /// lacks or holds only approximately; KeptProv marks them exact.
+    #[test]
+    fn merge_keeps_copy2_exact_values_and_adds_the_keepers() {
+        struct P;
+        impl Provenance for P {
+            fn slot_exact(&self, _a: Address, s: U256) -> bool {
+                s == U256::from(1u64)
+            }
+            fn balance_exact(&self, _a: Address) -> bool {
+                false
+            }
+        }
+        let mut base = Snapshot::default();
+        base.apply_fact(&crate::state::snap::Fact::Slot(a(1), u(1), u(111)));
+        base.apply_fact(&crate::state::snap::Fact::Slot(a(1), u(2), u(222)));
+        let mut kv = KeptVersion { block: 9, ..Default::default() };
+        let mut acct = Acct::default();
+        acct.storage.insert(u(1), u(1));
+        acct.storage.insert(u(2), u(2));
+        acct.storage.insert(u(3), u(3));
+        acct.basics = Basics::Known(Some(AccountInfo { balance: u(7), nonce: 1, code_hash: KECCAK_EMPTY, ..Default::default() }));
+        kv.accounts.insert(a(1), acct.clone());
+        kv.accounts.insert(a(2), acct);
+        let (m, n) = merge_base(&base, &P, &kv);
+        use crate::state::StateRead;
+        assert_eq!(m.storage(a(1), u(1)), crate::state::Lookup::Known(u(111)), "copy 2's exact value wins");
+        assert_eq!(m.storage(a(1), u(2)), crate::state::Lookup::Known(u(2)), "copy 2's approximate value replaced");
+        assert_eq!(m.storage(a(1), u(3)), crate::state::Lookup::Known(u(3)));
+        assert_eq!(m.storage(a(2), u(3)), crate::state::Lookup::Known(u(3)));
+        assert_eq!(n.accounts, 2);
+        let kp = KeptProv { inner: Arc::new(P), kept: Arc::new(kv) };
+        assert!(kp.slot_exact(a(1), u(2)) && kp.slot_exact(a(2), u(3)) && !kp.slot_exact(a(2), u(9)));
+        assert!(kp.balance_exact(a(1)));
+    }
+
+    /// Settings: on by default only in observe; numbers are bounded.
+    #[test]
+    fn settings() {
+        let cfg = |ahead: Option<&str>, keeper: Option<&str>| {
+            KeeperCfg::from_lookup(|k| match k {
+                "FASTLANE_AHEAD" => ahead.map(String::from),
+                "FASTLANE_AHEAD_KEEPER" => keeper.map(String::from),
+                "FASTLANE_AHEAD_KEEP_CONTRACTS" => Some("7".into()),
+                "FASTLANE_AHEAD_KEEP_RPS" => Some("0".into()),
+                _ => None,
+            })
+        };
+        assert!(!cfg(None, None).on, "FASTLANE_AHEAD off: never");
+        assert!(!cfg(None, Some("on")).on, "FASTLANE_AHEAD off: never, even if asked");
+        assert!(cfg(Some("observe"), None).on);
+        assert!(!cfg(Some("on"), None).on, "on keeps the old behaviour");
+        assert!(cfg(Some("on"), Some("on")).on);
+        assert!(!cfg(Some("observe"), Some("off")).on);
+        assert_eq!(cfg(Some("observe"), None).max_contracts, 7);
+        assert_eq!(cfg(Some("observe"), None).rps, 20.0, "out of range = default");
+    }
+
+    #[test]
+    fn proof_answers_parse() {
+        let v = json!({"balance": "0x5", "nonce": "0x1", "codeHash": format!("{KECCAK_EMPTY:#x}"),
+            "storageProof": [{"key": "0x1", "value": "0x2a", "proof": []}]});
+        let (info, slots) = parse_proof(&v).unwrap();
+        assert_eq!(info.unwrap().balance, u(5));
+        assert_eq!(slots, vec![(u(1), u(42))]);
+        let empty = json!({"balance": "0x0", "nonce": "0x0", "codeHash": "0x0", "storageProof": []});
+        assert!(parse_proof(&empty).unwrap().0.is_none(), "an empty account does not exist");
+    }
+
+    /// Learning leaves out the sender, Nitro's built-ins and what copy 2
+    /// holds exactly; it keeps what was missing or only approximate.
+    #[test]
+    fn wanted_items_filter() {
+        struct P;
+        impl Provenance for P {
+            fn slot_exact(&self, _a: Address, s: U256) -> bool {
+                s == U256::from(1u64)
+            }
+            fn balance_exact(&self, _a: Address) -> bool {
+                true
+            }
+        }
+        let mut snap = Snapshot::default();
+        snap.apply_fact(&crate::state::snap::Fact::Slot(a(0x20000), u(1), u(1)));
+        snap.apply_fact(&crate::state::snap::Fact::Slot(a(0x20000), u(2), u(2)));
+        let accts: HashSet<Address> = [a(0x20000), a(0x30000), a(5)].into_iter().collect();
+        let slots: HashSet<(Address, U256)> = [(a(0x20000), u(1)), (a(0x20000), u(2)), (a(0x20000), u(3)), (a(0x40000), u(1))].into_iter().collect();
+        let missing = [MissItem::Slot(a(0x50000), u(9)), MissItem::Account(a(0x60000))];
+        let out = wanted_items(&missing, Some((&accts, &slots)), &snap, &P, a(0x60000), &|x| *x == a(0x40000));
+        let has = |m: MissItem| out.contains(&m);
+        assert!(has(MissItem::Slot(a(0x50000), u(9))));
+        assert!(!has(MissItem::Account(a(0x60000))), "the sender");
+        assert!(has(MissItem::Account(a(0x20000))) && has(MissItem::Account(a(0x30000))), "accounts copy 2 lacks");
+        assert!(!has(MissItem::Account(a(5))), "built-in");
+        assert!(!has(MissItem::Slot(a(0x20000), u(1))), "exact in copy 2");
+        assert!(has(MissItem::Slot(a(0x20000), u(2))), "only approximate in copy 2");
+        assert!(has(MissItem::Slot(a(0x20000), u(3))), "missing");
+        assert!(!has(MissItem::Slot(a(0x40000), u(1))), "copy 2 follows it (our pool)");
+    }
+}

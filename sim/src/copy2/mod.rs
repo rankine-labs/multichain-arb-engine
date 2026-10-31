@@ -42,6 +42,11 @@ pub mod ahead;
 // Capture of what the predicted copy saw + offline replay (`arbsim
 // ahead-replay`). Only with FASTLANE on and FASTLANE_CAPTURE_FILE set.
 pub mod ahead_capture;
+// FAST LANE A: the hot-contract keeper (Oct 31): other bots' / routers'
+// values the predicted copy needs, kept exact from the node's block diffs.
+pub mod keeper;
+// ...and its offline replay on recorded block diffs (`ahead-replay --keeper`).
+pub mod keeper_replay;
 // Background threads that ask the node for copy 2 (never the intake thread).
 pub mod loader;
 // Working copy the events are applied to (workstream A; B runs revm on it).

@@ -605,6 +605,15 @@ impl NodeClient {
         })
     }
 
+    /// The same nodes as `from_env`, but the PAID nodes with their own
+    /// allowance and speed limit `paid` (copy2/keeper.rs: the hot-contract
+    /// keeper's ~9 calls a second must never use up copy 2's allowance).
+    pub fn from_env_with_paid_budget(paid: Budget) -> Option<Self> {
+        let mut c = Self::from_env()?;
+        c.budgets[0] = paid;
+        Some(c)
+    }
+
     /// Tests only: a free node and one paid node at these URLs.
     #[cfg(test)]
     fn for_test(public: &str, paid: &str, bg_public: bool, public_rps: f64, public_burst: f64) -> Self {
