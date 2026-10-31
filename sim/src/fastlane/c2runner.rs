@@ -53,7 +53,8 @@
 //   is held only once some check fetched it. Now the fast lane asks too,
 //   paced by FastFillBook (each value at most once per
 //   ARBSIM_FASTLANE_FILL_REPEAT_S [120] seconds, at most
-//   ARBSIM_FASTLANE_FILL_PER_HOUR [3600] values an hour, the first
+//   ARBSIM_FASTLANE_FILL_PER_HOUR [12000; was 3600, used up within 22
+//   minutes live Oct 31] values an hour, the first
 //   ARBSIM_FASTLANE_FILL_MAX_ITEMS [8] items of one answer;
 //   ARBSIM_FASTLANE_FILL=0 turns it off). A fill is copy 2's ordinary fill:
 //   the node's value at a block, placed and refreshed by copy 2's own rules
@@ -64,6 +65,22 @@
 //   fast lane are re-read by their own verify round (copy2/intake.rs
 //   dispatch_fast_verify, ARBSIM_COPY2_FAST_VERIFY_S [60]); fastlane.copy2Unknown: WHICH value each "miss" stopped on
 //   (account + slot) and WHICH pool each "unsure_pool" named (top 10).
+//
+//   V4 POOLMANAGER VALUES (Oct 31): a fast-lane check that misses a value
+//   of the V4 PoolManager (one contract holding EVERY V4 pool) used to get
+//   it refused for good: copy 2 only keeps such a value when it knows WHOSE
+//   it is (a tick / tick-map word of one of OUR ready V4 pools beyond its
+//   walk, copy2/v4blind.rs fix (b), kept exact by that pool's own events),
+//   and it learns that from hash inputs only trigger-first checks record.
+//   Now the fast lane names them itself (name_pm_misses): for each V4 pool
+//   on the route it works out where its tick-map words and ticks live and
+//   compares hashes. A name is only kept when the hash matches exactly, so
+//   it is never a guess; what copy 2 then does with the value is unchanged.
+//   Also (Oct 31): a PoolManager miss is no longer labelled "unsure_pool"
+//   just because SOME other V4 pool is loading (one of ~1,270 usually is):
+//   only when the missed value is named and belongs to a pool not ready
+//   (intake.rs unsure_reason_with). Otherwise it is a plain miss and is
+//   fetched like any other.
 //
 //   Counted on their own (final review, low): copy 2's PoolManager-bound and
 //   protocol-fee counters (pm_bound_*, pm_high_*, protocol_fee_*) are about
@@ -198,7 +215,7 @@ impl FastFillBook {
     pub fn from_env() -> FastFillBook {
         let num = |k: &str, d: u64| std::env::var(k).ok().and_then(|s| s.trim().parse::<u64>().ok()).unwrap_or(d);
         let on = std::env::var("ARBSIM_FASTLANE_FILL").map(|s| s.trim() != "0").unwrap_or(true);
-        FastFillBook::new(on, Duration::from_secs(num("ARBSIM_FASTLANE_FILL_REPEAT_S", 120)), num("ARBSIM_FASTLANE_FILL_PER_HOUR", 3600), num("ARBSIM_FASTLANE_FILL_MAX_ITEMS", 8) as usize)
+        FastFillBook::new(on, Duration::from_secs(num("ARBSIM_FASTLANE_FILL_REPEAT_S", 120)), num("ARBSIM_FASTLANE_FILL_PER_HOUR", 12_000), num("ARBSIM_FASTLANE_FILL_MAX_ITEMS", 8) as usize)
     }
 
     /// How long after the `times`-th ask the value may be asked again.
@@ -268,6 +285,157 @@ impl FastFillBook {
         bump("fillSent", pick.len() as u64);
         pick
     }
+}
+
+// ---------------------------------------------------------------------------
+// (Oct 31) Naming the PoolManager values a fast-lane check missed.
+// ---------------------------------------------------------------------------
+
+/// Two's-complement 256-bit word of a signed number (how Solidity hashes an
+/// int16 / int24 mapping key).
+fn signed_word(v: i64) -> U256 {
+    if v >= 0 {
+        U256::from(v as u64)
+    } else {
+        U256::MAX - U256::from((-(v + 1)) as u64)
+    }
+}
+
+/// keccak(a . b) of two words, as a word.
+fn hash2(a: U256, b: U256) -> U256 {
+    let mut buf = [0u8; 64];
+    buf[..32].copy_from_slice(&a.to_be_bytes::<32>());
+    buf[32..].copy_from_slice(&b.to_be_bytes::<32>());
+    U256::from_be_bytes(revm::primitives::keccak256(buf).0)
+}
+
+/// Uniswap V4 tick range.
+const MAX_TICK: i64 = 887_272;
+
+/// Per V4 pool (id): its base slot and every tick-map word's slot -> word
+/// number. Fixed for a pool (only its id and tick spacing decide them), so
+/// worked out once and kept (at most 512 pools; then started afresh).
+type WordIndex = Arc<(U256, HashMap<U256, i64>)>;
+static WORD_INDEX: Mutex<Option<HashMap<revm::primitives::B256, WordIndex>>> = Mutex::new(None);
+
+fn word_index(id: revm::primitives::B256, spacing: i32) -> WordIndex {
+    let mut g = WORD_INDEX.lock().unwrap_or_else(|e| e.into_inner());
+    let m = g.get_or_insert_with(HashMap::new);
+    if let Some(x) = m.get(&id) {
+        return x.clone();
+    }
+    let sp = (spacing.max(1)) as i64;
+    let base = hash2(U256::from_be_bytes(id.0), U256::from(crate::check::moved::V4_POOLS_SLOT));
+    let bitmap_root = base + U256::from(5u8);
+    // compressed tick = floor(tick / spacing); word = compressed >> 8.
+    let lo = (-MAX_TICK).div_euclid(sp) >> 8;
+    let hi = MAX_TICK.div_euclid(sp) >> 8;
+    let mut words = HashMap::with_capacity((hi - lo + 1) as usize);
+    for w in lo..=hi {
+        words.insert(hash2(signed_word(w), bitmap_root), w);
+    }
+    let x = Arc::new((base, words));
+    if m.len() >= 512 {
+        m.clear();
+    }
+    m.insert(id, x.clone());
+    x
+}
+
+/// The route's V4 pools copy 2 follows (by key fields; the hash check below
+/// makes a wrong candidate harmless): (PoolManager, id, tick spacing).
+fn route_v4_pools(core: &crate::copy2::checkcore::CheckCore, c: &PreparedCheck) -> Vec<(revm::primitives::Address, revm::primitives::B256, i32)> {
+    use revm::primitives::Address;
+    let mut out = Vec::new();
+    for h in c.trade.hops.iter().filter(|h| h.kind == super::types::KIND_V4) {
+        let side_ok = |t: Address| t == h.token_in || t == h.token_out || (h.v4_native && t == Address::ZERO);
+        for i in &core.v4 {
+            let p = &i.pool;
+            if p.address == h.pool && p.fee == h.v4_fee && p.tick_spacing == h.v4_tick_spacing && side_ok(p.token0) && side_ok(p.token1) {
+                if let Some(id) = p.v4_id {
+                    if !out.iter().any(|x: &(Address, revm::primitives::B256, i32)| x.1 == id) {
+                        out.push((p.address, id, p.tick_spacing));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The hash inputs (as a check would have recorded them: hash, word 1,
+/// word 2) that name each missed PoolManager value of the route's V4
+/// pools: a tick-map word (any of the pool's words), or a tick (one of the
+/// ticks the tick-map words copy 2 holds mark as used, 3 slots each). Only
+/// values whose hash matches exactly are named. Empty = nothing named.
+pub fn name_pm_misses(core: &crate::copy2::checkcore::CheckCore, snap: &crate::state::snap::Snapshot, c: &PreparedCheck, missing: &[MissItem]) -> Vec<(U256, U256, U256)> {
+    let pm_slots: Vec<(revm::primitives::Address, U256)> = missing
+        .iter()
+        .filter_map(|m| match m {
+            MissItem::Slot(a, s) if core.pm_list.contains(a) => Some((*a, *s)),
+            _ => None,
+        })
+        .collect();
+    if pm_slots.is_empty() {
+        return Vec::new();
+    }
+    let mut pre: Vec<(U256, U256, U256)> = Vec::new();
+    let add = |pre: &mut Vec<(U256, U256, U256)>, x: (U256, U256, U256)| {
+        if !pre.iter().any(|y| y.0 == x.0) {
+            pre.push(x);
+        }
+    };
+    for (pm, id, spacing) in route_v4_pools(core, c) {
+        let wanted: Vec<U256> = pm_slots.iter().filter(|x| x.0 == pm).map(|x| x.1).collect();
+        if wanted.is_empty() {
+            continue;
+        }
+        let idx = word_index(id, spacing);
+        let (base, words) = (&idx.0, &idx.1);
+        let base_entry = (*base, U256::from_be_bytes(id.0), U256::from(crate::check::moved::V4_POOLS_SLOT));
+        let mut named = false;
+        // Tick-map words: one slot each.
+        for s in &wanted {
+            if let Some(w) = words.get(s) {
+                add(&mut pre, (*s, signed_word(*w), *base + U256::from(5u8)));
+                named = true;
+            }
+        }
+        // Ticks: the used ticks in the tick-map words copy 2 holds.
+        let still: Vec<U256> = wanted.iter().filter(|s| !words.contains_key(s)).copied().collect();
+        if !still.is_empty() {
+            let tick_root = *base + U256::from(4u8);
+            'words: for (slot, w) in words.iter() {
+                let crate::state::Lookup::Known(bits) = snap.storage(pm, *slot) else { continue };
+                if bits.is_zero() {
+                    continue;
+                }
+                for bit in 0..256usize {
+                    if !bits.bit(bit) {
+                        continue;
+                    }
+                    let tick = ((*w << 8) + bit as i64) * (spacing.max(1) as i64);
+                    let h = hash2(signed_word(tick), tick_root);
+                    for off in 0..3u8 {
+                        if still.contains(&(h + U256::from(off))) {
+                            add(&mut pre, (h, signed_word(tick), tick_root));
+                            named = true;
+                            if still.iter().all(|s| pre.iter().any(|p| *s >= p.0 && *s < p.0 + U256::from(3u8))) {
+                                break 'words;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if named {
+            add(&mut pre, base_entry);
+        }
+    }
+    if !pre.is_empty() {
+        bump("pmNamed", 1);
+    }
+    pre
 }
 
 /// Marks this thread as running a fast lane check until dropped.
@@ -470,6 +638,12 @@ pub fn run_on_copy2_with(
         }
     } else {
         let missing = crate::proto::parse_missing(&answer);
+        // (Oct 31) Name the PoolManager values it missed (see the file
+        // header), so copy 2 can keep the ones of our ready V4 pools.
+        let pre = name_pm_misses(core, snap, c, &missing);
+        if !pre.is_empty() {
+            c2.note_pm_pre_keys(core, &missing, &pre, &[]);
+        }
         if let Some(why) = c2.unsure_reason_with(core, &missing) {
             note_unknown_detail(None, Some(unsure_key(&why)));
             answer = json!({ "ok": false, "unknown": "unsure_pool", "detail": why });
@@ -529,6 +703,54 @@ mod tests {
         assert_eq!(b.offer(&[item(4)], s(3700), ok), vec![item(4)], "a new hour");
         let mut off = FastFillBook::new(false, Duration::from_secs(120), 4, 2);
         assert!(off.offer(&[item(1)], t0, ok).is_empty());
+    }
+
+    /// (Oct 31) The fast lane names the PoolManager values its route's V4
+    /// pool missed: a far tick-map word, and a tick marked used in a word
+    /// copy 2 holds (any of its 3 slots). The names resolve exactly as a
+    /// recorded check's would (check/moved.rs resolve_v4_slot); a value of
+    /// another pool, or a tick not marked used, stays unnamed.
+    #[test]
+    fn pm_misses_of_the_route_pools_are_named_exactly() {
+        use crate::check::moved::{resolve_v4_slot, PreMap, V4Part};
+        use crate::copy2::checkcore::{CheckCore, V4Info};
+        use crate::copy2::{PoolKind, TrackedPool};
+        use crate::fastlane::types::{DecodedTrade, FlashLender, Hop, KIND_V4};
+        use revm::primitives::{Address, B256};
+        let pm = Address::with_last_byte(0x83);
+        let (t0, t1) = (Address::with_last_byte(1), Address::with_last_byte(2));
+        let id = B256::with_last_byte(0x77);
+        let pool = TrackedPool { address: pm, v4_id: Some(id), kind: PoolKind::V4, token0: t0, token1: t1, fee: 500, tick_spacing: 10 };
+        let core = CheckCore { pm_list: vec![pm], v4: vec![V4Info { pool, ready: true, ready_since: 1, pending_from: None, far: None }], ..Default::default() };
+        let check = |fee: u32| PreparedCheck {
+            call: Default::default(), overrides: Default::default(), amount_offset: 96, amount_slots: vec![], main_amount: U256::from(5u8), sizes: vec![U256::from(5u8)],
+            trade: DecodedTrade {
+                token: t1, amount_in: U256::from(5u8), min_profit: U256::MAX, max_block: U256::MAX, flash: FlashLender::Own,
+                hops: vec![Hop { kind: KIND_V4, pool: pm, token_in: t1, token_out: t0, fee_bps: 0, v4_fee: fee, v4_tick_spacing: 10, v4_native: false }],
+            },
+        };
+        let c = check(500);
+        let base = hash2(U256::from_be_bytes(id.0), U256::from(6u8));
+        let word_slot = |w: i64| hash2(signed_word(w), base + U256::from(5u8));
+        let tick_slot = |t: i64| hash2(signed_word(t), base + U256::from(4u8));
+        // Copy 2 holds word -3: bit 7 set -> tick ((-3 * 256) + 7) * 10 = -7610.
+        let mut snap = crate::state::snap::Snapshot::default();
+        snap.apply_fact(&crate::state::snap::Fact::Slot(pm, word_slot(-3), U256::from(1u8) << 7usize));
+        let far_word = word_slot(-40);
+        let tick2 = tick_slot(-7610) + U256::from(2u8);
+        let unused_tick = tick_slot(-7600);
+        let other = hash2(U256::from(9u8), U256::from(9u8));
+        let missing = vec![MissItem::Slot(pm, far_word), MissItem::Slot(pm, tick2), MissItem::Slot(pm, unused_tick), MissItem::Slot(pm, other)];
+        let pre = name_pm_misses(&core, &snap, &c, &missing);
+        let map: PreMap = pre.iter().map(|(h, a, b)| (*h, (*a, *b))).collect();
+        assert_eq!(resolve_v4_slot(far_word, &map), Some((id, V4Part::Bitmap)));
+        assert_eq!(resolve_v4_slot(tick2, &map), Some((id, V4Part::Tick)));
+        assert_eq!(resolve_v4_slot(unused_tick, &map), None, "a tick not marked used is not named");
+        assert_eq!(resolve_v4_slot(other, &map), None);
+        // A route without that pool names nothing.
+        assert!(name_pm_misses(&core, &snap, &check(3000), &missing).is_empty());
+        assert_eq!(signed_word(-1), U256::MAX);
+        assert_eq!(signed_word(5), U256::from(5u8));
     }
 
     #[test]

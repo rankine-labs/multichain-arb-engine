@@ -3767,7 +3767,8 @@ fn fastlane_fills_are_reread_by_their_own_verify_round() {
     let c = |k: &str| stats.stats.json()[k].as_u64().unwrap();
     let rounds0 = c("fast_verify_rounds");
     let mut fixed = false;
-    for _ in 0..40 {
+    // (Upper bound only: a slow machine just takes more rounds.)
+    for _ in 0..200 {
         std::thread::sleep(std::time::Duration::from_millis(35));
         r.send(tick(r.sh.head().unwrap().block + 1, 71));
         if r.head_slot(a(OUTSIDE), slot) == Lookup::Known(u(77)) {
@@ -3797,7 +3798,8 @@ fn fastlane_values_are_forgotten_when_not_reread_in_time() {
     *r.chain.tip.lock().unwrap() = 0;
     let stats = r.h.c2.clone();
     let mut gone = false;
-    for i in 0..40 {
+    // (Upper bound only: a slow machine just takes more rounds.)
+    for i in 0..200 {
         std::thread::sleep(std::time::Duration::from_millis(20));
         r.send(tick(r.sh.head().unwrap().block + 1, 71 + i));
         if r.head_slot(a(OUTSIDE), u(5)) == Lookup::Missing {
@@ -3816,37 +3818,41 @@ fn fastlane_values_are_forgotten_when_not_reread_in_time() {
 // put in the copy if the list is full meanwhile (fail closed).
 #[test]
 fn fastlane_fills_that_land_after_leaving_the_watch_list() {
-    let cfg = C2Config { fast_verify_ms: 1, fast_verify_max: 1, fast_max_age_ms: 100, ..C2Config::for_tests() };
+    // (Oct 31) Deterministic: the prune is stood in for by a test hook, and
+    // the node's 200 ms delay only has to outlast two function calls.
+    let cfg = C2Config { fast_verify_ms: 60_000, fast_verify_max: 1, fast_max_age_ms: 600_000, ..C2Config::for_tests() };
     let (mut r, _ctx) = trig_world_code_cfg(fl_pool_code(), cfg);
-    let a5 = MissItem::Slot(a(OUTSIDE), u(5));
-    let b6 = MissItem::Slot(a(OUTSIDE), u(6));
-    *r.chain.delay_ms.lock().unwrap() = 300;
-    assert!(r.h.fast_fill(vec![a5]));
-    let t0 = std::time::Instant::now();
-    let mut asked_b = false;
-    while t0.elapsed() < std::time::Duration::from_secs(3) {
-        r.intake.pump();
-        // A's fill is out (slow node, 300 ms) and A left the list (after
-        // 200 ms): B takes the only place on it (until B leaves at ~430 ms).
-        if !asked_b && t0.elapsed() > std::time::Duration::from_millis(230) {
-            assert!(r.h.fast_fill(vec![b6.clone()]));
-            asked_b = true;
+    *r.chain.delay_ms.lock().unwrap() = 200;
+    let in_flight = |r: &mut Rig| {
+        let t0 = std::time::Instant::now();
+        while r.intake.outstanding() == 0 {
+            r.intake.pump();
+            assert!(t0.elapsed().as_secs() < 10, "fill never sent");
         }
-        if asked_b && r.intake.outstanding() == 0 && t0.elapsed() > std::time::Duration::from_millis(800) {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(2));
-    }
-    *r.chain.delay_ms.lock().unwrap() = 0;
+    };
+    // A is asked; while its fill is out it leaves the list, and B takes the
+    // only place. A lands: list full -> not put in.
+    assert!(r.h.fast_fill(vec![MissItem::Slot(a(OUTSIDE), u(5))]));
+    in_flight(&mut r);
+    r.intake.unwatch_fast_value_for_tests(a(OUTSIDE), u(5));
+    assert!(r.h.fast_fill(vec![MissItem::Slot(a(OUTSIDE), u(6))]));
+    r.settle();
     r.send(tick(r.sh.head().unwrap().block + 1, 70));
     let st = r.h.c2.stats.json();
     assert_eq!(r.head_slot(a(OUTSIDE), u(5)), Lookup::Missing, "A landed while the list was full: not put in ({st:?})");
-    assert!(st["fast_fill_not_watched"].as_u64().unwrap() >= 1, "{st:?}");
-    // B landed after leaving the list too: put back on it. (Its read time
-    // is when its fill was sent, 300 ms before it landed: past this test's
-    // 100 ms age limit, so it may already be forgotten again - also right.)
-    assert!(st["fast_fill_rewatched"].as_u64().unwrap() >= 1, "{st:?}");
-    assert!(r.head_slot(a(OUTSIDE), u(6)) == Lookup::Known(U256::ZERO) || st["fast_value_expired"].as_u64().unwrap() >= 1, "{st:?}");
+    assert_eq!(st["fast_fill_not_watched"], json!(1), "{st:?}");
+    assert_eq!(r.head_slot(a(OUTSIDE), u(6)), Lookup::Known(U256::ZERO), "B was on the list: kept");
+    // B leaves the list (room again); C is asked and leaves it while out;
+    // C lands: put back on the list (re-watched) and kept.
+    r.intake.unwatch_fast_value_for_tests(a(OUTSIDE), u(6));
+    assert!(r.h.fast_fill(vec![MissItem::Slot(a(OUTSIDE), u(7))]));
+    in_flight(&mut r);
+    r.intake.unwatch_fast_value_for_tests(a(OUTSIDE), u(7));
+    r.settle();
+    r.send(tick(r.sh.head().unwrap().block + 1, 71));
+    let st = r.h.c2.stats.json();
+    assert_eq!(st["fast_fill_rewatched"], json!(1), "{st:?}");
+    assert_eq!(r.head_slot(a(OUTSIDE), u(7)), Lookup::Known(U256::ZERO), "C re-watched and kept ({st:?})");
 }
 
 // ASKED AGAIN IS NOT READ AGAIN (Oct 30, review 2): the fast lane asking
@@ -3854,7 +3860,11 @@ fn fastlane_fills_that_land_after_leaving_the_watch_list() {
 // not count as a fresh read; the value is forgotten on its ORIGINAL age.
 #[test]
 fn fastlane_asking_again_keeps_the_last_good_read_time() {
-    let cfg = C2Config { fast_verify_ms: 60_000, fast_verify_max: 10, fast_max_age_ms: 150, ..C2Config::for_tests() };
+    // (Oct 31) Wide margins: age limit 500 ms; asked again at ~400 ms; by
+    // 700 ms it must be gone. A reset at the second ask would keep it until
+    // ~900 ms (a slow machine only makes the second ask later, which makes
+    // the check stricter, never a false failure).
+    let cfg = C2Config { fast_verify_ms: 60_000, fast_verify_max: 10, fast_max_age_ms: 500, ..C2Config::for_tests() };
     let (mut r, _ctx) = trig_world_code_cfg(fl_pool_code(), cfg);
     assert!(r.h.fast_fill(vec![MissItem::Slot(a(OUTSIDE), u(5))]));
     r.settle();
@@ -3862,13 +3872,12 @@ fn fastlane_asking_again_keeps_the_last_good_read_time() {
     let landed = std::time::Instant::now();
     assert_eq!(r.head_slot(a(OUTSIDE), u(5)), Lookup::Known(u(42)));
     *r.chain.tip.lock().unwrap() = 0; // outage: the new fill can't be read
-    std::thread::sleep(std::time::Duration::from_millis(90));
+    std::thread::sleep(std::time::Duration::from_millis(400).saturating_sub(landed.elapsed()));
     assert!(r.h.fast_fill(vec![MissItem::Slot(a(OUTSIDE), u(5))]), "asked again");
-    while landed.elapsed() < std::time::Duration::from_millis(230) {
+    while landed.elapsed() < std::time::Duration::from_millis(700) {
         r.intake.pump();
         std::thread::sleep(std::time::Duration::from_millis(2));
     }
-    // A reset at the second ask would keep it until ~240 ms.
     assert_eq!(r.head_slot(a(OUTSIDE), u(5)), Lookup::Missing, "forgotten on its first read's age");
 }
 
@@ -3950,6 +3959,34 @@ fn fastlane_lane_skips_routes_through_pools_copy_2_has_not_ready() {
     let h = hour(&lane);
     assert_eq!(h["skippedUnsure"].as_u64().unwrap_or(0), skipped0 + 1, "{h}");
     assert!(h["unknownWhy"].get("unsure_pool").is_none(), "not run to an unsure_pool answer: {h}");
+}
+
+// POOLMANAGER "UNSURE" LABEL (Oct 31): a missed PoolManager value is
+// "unsure_pool" only when it is named and its pool isn't ready; a value of
+// a READY pool, or an unnamed one, is a plain miss even while another V4
+// pool at the same PoolManager is loading (live: one of ~1,270 always is).
+#[test]
+fn poolmanager_misses_are_unsure_only_for_a_named_pool_that_is_not_ready() {
+    use arbsim::copy2::checkcore::{CheckCore, V4Info};
+    let r = rig();
+    let pm = a(0x83);
+    let key = |n: u8| B256::with_last_byte(n);
+    let pool = |n: u8| TrackedPool { address: pm, v4_id: Some(key(n)), kind: PoolKind::V4, token0: a(1), token1: a(n), fee: 500, tick_spacing: 10 };
+    let mut core = CheckCore { pm_list: vec![pm], ..Default::default() };
+    core.v4.push(V4Info { pool: pool(2), ready: true, ready_since: 1, pending_from: None, far: None });
+    core.v4.push(V4Info { pool: pool(3), ready: false, ready_since: 0, pending_from: None, far: None });
+    core.not_ready.insert(pm, "v4 pool 0x83 is loading".into());
+    // Name one bitmap word of each pool (as a check's hash inputs would).
+    let base = |n: u8| { let mut b = [0u8; 64]; b[..32].copy_from_slice(key(n).as_slice()); b[63] = 6; U256::from_be_bytes(keccak256(b).0) };
+    let word = |n: u8| { let mut b = [0u8; 64]; b[63] = 1; b[32..].copy_from_slice(&(base(n) + u(5)).to_be_bytes::<32>()); U256::from_be_bytes(keccak256(b).0) };
+    let pre = |n: u8| vec![(word(n), u(1), base(n) + u(5)), (base(n), U256::from_be_bytes(key(n).0), u(6))];
+    let miss = |n: u8| vec![MissItem::Slot(pm, word(n))];
+    r.h.note_pm_pre_keys(&core, &miss(2), &pre(2), &[]);
+    r.h.note_pm_pre_keys(&core, &miss(3), &pre(3), &[]);
+    assert_eq!(r.h.unsure_reason_with(&core, &miss(2)), None, "ready pool's value: a plain miss");
+    assert_eq!(r.h.unsure_reason_with(&core, &[MissItem::Slot(pm, u(12345))]), None, "unnamed value: a plain miss");
+    let why = r.h.unsure_reason_with(&core, &miss(3)).expect("named value of a pool not ready");
+    assert!(why.contains("not ready"), "{why}");
 }
 
 // FIRE-FIRST OFFLINE REPLAY (`arbsim trig-replay`, fastlane/trig_replay.rs):

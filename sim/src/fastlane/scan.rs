@@ -1127,10 +1127,19 @@ impl Scanner {
     fn check_route_inner(&mut self, r: &Arc<Route>, b: &BlockInput, source: &'static str, t0: Instant, epoch: u64, found: &mut Vec<Opportunity>) -> RouteCheck {
         let tr = Instant::now();
         let fin = |outcome: Outcome| RouteCheck { rid: r.rid.clone(), source, outcome, us: tr.elapsed().as_micros() as u64 };
-        if r.keys.iter().chain(r.pools.iter()).any(|k| b.unsure.contains(k)) {
-            if !r.pools.iter().any(|k| b.unsure.contains(k)) {
-                HOUR.with(|h| h.skipped_unsure_lender += 1);
-            }
+        if let Some(k) = r.keys.iter().chain(r.pools.iter()).find(|k| b.unsure.contains(*k)) {
+            let lender = !r.pools.iter().any(|k| b.unsure.contains(k));
+            // (Oct 31) Which key made it skip (status skippedUnsureBy, top
+            // 10; "lender " = the route's flash lender). Live Oct 31 the
+            // lender skips were the approved lender 0x52e65b17 itself while
+            // it reloaded (status copy2Unknown.unsurePoolTop), not a key
+            // mismatch.
+            HOUR.with(|h| {
+                if lender {
+                    h.skipped_unsure_lender += 1;
+                }
+                h.skipped_unsure_by.add(if lender { format!("lender {k}") } else { k.clone() });
+            });
             return fin(Outcome::SkippedUnsure);
         }
         let Some(f) = &r.facts else { return fin(Outcome::NoFacts) };
@@ -1306,6 +1315,8 @@ pub struct Hour {
     /// the contract the first missing value belonged to.
     pub unknown_why: super::coverage::Tally,
     pub unknown_miss_at: super::coverage::Tally,
+    /// (Oct 31) Skipped routes by the not-ready key that made them skip.
+    pub skipped_unsure_by: super::coverage::Tally,
 }
 
 struct HourCell {
@@ -1327,6 +1338,7 @@ static HOUR: HourCell = HourCell { h: Mutex::new(Hour {
     max_block_us: 0, full_sweeps: 0, last_full_sweep_blocks: None, max_full_sweep_blocks: 0, eval_real: 0, eval_gone: 0, eval_unknown: 0,
     slow_routes: 0, resting: 0, cut_fit: 0, routes: 0, skipped_unsure_lender: 0,
     unknown_why: super::coverage::Tally { map: BTreeMap::new(), other: 0 }, unknown_miss_at: super::coverage::Tally { map: BTreeMap::new(), other: 0 },
+    skipped_unsure_by: super::coverage::Tally { map: BTreeMap::new(), other: 0 },
 }), ring: Mutex::new(VecDeque::new()) };
 
 fn record_block(rep: &ScanReport) {
@@ -1404,7 +1416,7 @@ pub fn status_json() -> Value {
         "evalReal": h.eval_real, "evalGone": h.eval_gone, "evalUnknown": h.eval_unknown,
         "slowRoutes": h.slow_routes, "resting": h.resting, "cutFit": h.cut_fit,
         "routes": h.routes, "skippedUnsureLender": h.skipped_unsure_lender,
-        "unknownWhy": h.unknown_why.json(16), "unknownMissTop": h.unknown_miss_at.json(5),
+        "unknownWhy": h.unknown_why.json(16), "unknownMissTop": h.unknown_miss_at.json(5), "skippedUnsureBy": h.skipped_unsure_by.json(10),
         "blockUs": crate::timing::pct(&mut ring),
         "syncUs": crate::timing::pct(&mut SYNC_RING.lock().unwrap_or_else(|e| e.into_inner()).iter().copied().collect::<Vec<u64>>()),
     })

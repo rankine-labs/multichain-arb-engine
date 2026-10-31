@@ -1603,6 +1603,19 @@ impl Copy2Handle {
 
     pub fn unsure_reason_with(&self, core: &super::checkcore::CheckCore, missing: &[MissItem]) -> Option<String> {
         missing.iter().find_map(|m| match m {
+            // (Oct 31) A V4 PoolManager holds EVERY V4 pool (~1,270 live), so
+            // "some pool at this address isn't ready" is nearly always true
+            // there (live Oct 31: 1,571 of 1,920 fast-lane "unsure_pool"
+            // answers named a loading V4 pool at the PoolManager, whatever
+            // value was missed). A PoolManager value counts as a not-ready
+            // pool's only when it is NAMED (copy2/v4blind.rs) and that pool
+            // isn't ready; otherwise it is a plain miss (fetched as usual).
+            MissItem::Slot(a, s) if core.pm_list.contains(a) => {
+                let (id, _) = self.c2.pm_book.lock().unwrap_or_else(|e| e.into_inner()).owner(*a, *s)?;
+                core.v4.iter().find(|i| i.pool.address == *a && i.pool.v4_id == Some(id) && !i.ready).map(|i| {
+                    format!("v4 pool {id:#x} at {} is {}", i.pool.address, if i.ready { "ready" } else { "not ready" })
+                })
+            }
             MissItem::Account(a) | MissItem::Slot(a, _) => core.not_ready.get(a).cloned(),
             MissItem::Code(_) => None,
         })
@@ -5773,6 +5786,10 @@ impl Intake {
         let mut out = Vec::with_capacity(items.len());
         for it in items {
             match &it {
+                // (Oct 31) A pool's own / a PoolManager's value is followed
+                // by that pool's events (or refused by copy 2's fill rules):
+                // not a value "nothing follows", so not watched.
+                MissItem::Slot(a, _) if { let reg = self.c2.reg.read().unwrap(); reg.is_pm(a) || reg.by_addr.contains_key(a) || reg.owner_of.contains_key(a) } => out.push(it),
                 MissItem::Slot(a, sl) => {
                     let k = (*a, *sl);
                     if !self.fast_watch.contains_key(&k) && self.fast_watch.len() >= self.cfg.fast_verify_max {
@@ -5847,6 +5864,14 @@ impl Intake {
         add(&self.c2.stats.fast_verify_items, items.len() as u64);
         let id = self.new_job(JobFor::FastVerify);
         self.loaders.as_ref().unwrap().send(Job::Fetch { id, block: head.block, exact: false, bulk: true, items, calls: vec![] });
+    }
+
+    /// Tests only: take a value off the fast watch list as if it had been
+    /// pruned while its fill was still on its way (deterministic stand-in
+    /// for the time-based prune).
+    #[doc(hidden)]
+    pub fn unwatch_fast_value_for_tests(&mut self, a: Address, slot: U256) {
+        self.fast_watch.remove(&(a, slot));
     }
 
     /// (Oct 30, review 2) Forget, in every kept version, each watched value
