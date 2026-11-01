@@ -160,6 +160,64 @@ impl Default for Snapshot {
     }
 }
 
+// ---------------------------------------------------------------------------
+// CODE PRUNING (memory fix, Nov 1)
+//
+// Plain English:
+//   Contract code is stored once per code hash in `codes` and was never
+//   dropped ("code never changes for a hash"). But accounts DO get dropped
+//   (the memory caps, pools we stop following), and their code stayed
+//   behind for good. CodeAging remembers since when each code has had no
+//   account pointing at it; a code nobody has used for `grace` seconds is
+//   dropped. Safe: an account whose code is missing reads as MISSING (see
+//   lookup_account), so a later check simply fetches it again.
+// ---------------------------------------------------------------------------
+
+/// Since when each code has been unused (no account's basics name it).
+#[derive(Debug, Default)]
+pub struct CodeAging {
+    unused_since: rustc_hash::FxHashMap<B256, u64>,
+    /// Codes dropped in all / by the last sweep (status).
+    pub pruned_total: u64,
+    pub pruned_last: u64,
+    /// Codes held / in use at the last sweep (status).
+    pub last_codes: usize,
+    pub last_used: usize,
+}
+
+impl CodeAging {
+    /// One sweep at time `now_s` (seconds, any clock): returns the codes
+    /// unused for at least `grace_s` (to remove from the snapshot). A code
+    /// used again is forgotten from the list (its clock starts over).
+    pub fn sweep(&mut self, snap: &Snapshot, now_s: u64, grace_s: u64) -> Vec<B256> {
+        let used = snap.used_codes();
+        self.unused_since.retain(|h, _| snap.codes.contains_key(h) && !used.contains(h));
+        let mut drop = Vec::new();
+        for h in snap.codes.keys() {
+            if *h == KECCAK_EMPTY || used.contains(h) {
+                continue;
+            }
+            let since = *self.unused_since.entry(*h).or_insert(now_s);
+            if now_s.saturating_sub(since) >= grace_s {
+                drop.push(*h);
+            }
+        }
+        for h in &drop {
+            self.unused_since.remove(h);
+        }
+        self.pruned_last = drop.len() as u64;
+        self.pruned_total += drop.len() as u64;
+        self.last_codes = snap.codes.len() - drop.len();
+        self.last_used = used.len();
+        drop
+    }
+
+    /// Codes waiting out their grace time (status).
+    pub fn waiting(&self) -> usize {
+        self.unused_since.len()
+    }
+}
+
 /// Is this "empty" in the EIP-161 sense (no balance, nonce or code)?
 fn info_is_empty(i: &AccountInfo) -> bool {
     i.balance.is_zero() && i.nonce == 0 && (i.code_hash == KECCAK_EMPTY || i.code_hash == B256::ZERO)
@@ -328,6 +386,17 @@ impl Snapshot {
             dropped += 1;
         }
         dropped
+    }
+
+    /// Code hashes some account's basics name (status / code pruning).
+    pub fn used_codes(&self) -> FxHashSet<B256> {
+        self.accounts
+            .values()
+            .filter_map(|x| match &x.basics {
+                Basics::Known(Some(i)) => Some(i.code_hash),
+                _ => None,
+            })
+            .collect()
     }
 
     // ---- lookups shared by both read modes ----
@@ -578,5 +647,87 @@ mod tests {
         assert!(dropped >= 5);
         assert!(s.holds(&a(1))); // kept (warm) although oldest
         assert!(s.holds(&a(10))); // newest
+    }
+
+    // ---- CODE PRUNING (CodeAging, memory fix Nov 1) ----
+
+    fn code(b: u8) -> (B256, Bytecode) {
+        let c = Bytecode::new_raw(revm::primitives::Bytes::from(vec![0x60, b]));
+        (c.hash_slow(), c)
+    }
+    fn with_code(s: &mut Snapshot, addr: Address, b: u8) -> B256 {
+        let (h, c) = code(b);
+        s.apply_fact(&Fact::Basics { addr, info: Some(AccountInfo { code_hash: h, nonce: 1, ..Default::default() }), code: Some(c) });
+        h
+    }
+
+    /// A code whose account was evicted is dropped only after the grace
+    /// time; a code in use is never dropped; the account then reads as
+    /// MISSING (fetched again), never as a code-less contract.
+    #[test]
+    fn unused_codes_go_after_the_grace_time() {
+        let mut s = Snapshot::default();
+        let h1 = with_code(&mut s, a(1), 1);
+        let h2 = with_code(&mut s, a(2), 2);
+        let mut ag = CodeAging::default();
+        assert!(ag.sweep(&s, 0, 600).is_empty(), "both in use");
+        // The memory cap evicts account 2: its code is left behind.
+        s.accounts.remove(&a(2));
+        assert!(ag.sweep(&s, 60, 600).is_empty(), "unused, but only since t=60");
+        assert_eq!(ag.waiting(), 1);
+        assert!(ag.sweep(&s, 600, 600).is_empty(), "540 s < 600 s");
+        let drop = ag.sweep(&s, 660, 600);
+        assert_eq!(drop, vec![h2]);
+        for h in &drop {
+            s.codes.remove(h);
+        }
+        assert!(s.codes.contains_key(&h1) && !s.codes.contains_key(&h2));
+        assert_eq!((ag.pruned_total, ag.waiting(), ag.last_used), (1, 0, 1));
+        // Account 2 comes back WITHOUT its code (e.g. basics from a diff):
+        // it reads as missing, so a fill fetches it with its code.
+        s.accounts.insert(a(2), Acct { basics: Basics::Known(Some(AccountInfo { code_hash: h2, nonce: 1, ..Default::default() })), ..Default::default() });
+        assert_eq!(s.account(a(2)), Lookup::Missing);
+    }
+
+    /// A code used again before its grace time ends starts over.
+    #[test]
+    fn a_code_used_again_starts_over() {
+        let mut s = Snapshot::default();
+        let h = with_code(&mut s, a(1), 1);
+        let acct = s.accounts.get(&a(1)).unwrap().clone();
+        let mut ag = CodeAging::default();
+        s.accounts.remove(&a(1));
+        ag.sweep(&s, 0, 100);
+        s.accounts.insert(a(1), acct.clone());
+        ag.sweep(&s, 50, 100);
+        assert_eq!(ag.waiting(), 0, "in use again: forgotten");
+        s.accounts.remove(&a(1));
+        assert!(ag.sweep(&s, 120, 100).is_empty(), "the clock started over at 120");
+        assert_eq!(ag.sweep(&s, 220, 100), vec![h]);
+    }
+
+    /// Bounded: after the sweeps, codes held = codes in use + the ones still
+    /// in their grace time (here 1,000 evicted contracts -> 0 left).
+    #[test]
+    fn many_evicted_contracts_leave_no_codes_behind() {
+        let mut s = Snapshot::default();
+        for i in 0..1000u32 {
+            let (h, c) = {
+                let c = Bytecode::new_raw(revm::primitives::Bytes::from(i.to_be_bytes().to_vec()));
+                (c.hash_slow(), c)
+            };
+            let addr = Address::from_word(B256::from(U256::from(i + 10)));
+            s.apply_fact(&Fact::Basics { addr, info: Some(AccountInfo { code_hash: h, nonce: 1, ..Default::default() }), code: Some(c) });
+        }
+        let keep = Address::from_word(B256::from(U256::from(10u32)));
+        let n = s.evict(1, 1_000_000, |_| 0, |x| *x == keep);
+        assert_eq!(n, 999);
+        assert_eq!(s.codes.len(), 1000, "before: every code stays behind");
+        let mut ag = CodeAging::default();
+        ag.sweep(&s, 0, 10);
+        for h in ag.sweep(&s, 10, 10) {
+            s.codes.remove(&h);
+        }
+        assert_eq!(s.codes.len(), 1, "after: only the one still in use");
     }
 }

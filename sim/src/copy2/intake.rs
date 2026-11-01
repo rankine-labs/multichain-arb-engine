@@ -745,6 +745,8 @@ pub struct C2Shared {
     /// Why new tick walks are not sent right now (None = they are): the
     /// slot cap or the memory guard (status poolCoverage.walkPaused).
     pub walk_paused: Mutex<Option<String>>,
+    /// CODE PRUNING (status `copy2.codePrune`): the last sweep's figures.
+    pub code_prune: Mutex<Value>,
     /// Lost-message reloads by the bot's reason (status `gapReasons`).
     pub gap_reasons: Mutex<HashMap<String, u64>>,
     /// Unanswered checks by their reason (status `checks.unknownBy`: miss,
@@ -1819,6 +1821,9 @@ impl Copy2Handle {
             // WARM HOT TARGETS (copy2/warm.rs): values, refreshes, calls an hour.
             "warm": self.c2.warm.lock().unwrap().json(self.c2.warm_now(), self.sh.cfg.l2_offset),
             "outsideContracts": self.sh.volatile.whole_len(),
+            // CODE PRUNING (memory fix, Nov 1): codes held / in use, codes
+            // waiting out their unused time, dropped so far.
+            "codePrune": self.c2.code_prune.lock().unwrap().clone(),
             // Warm restart (copy2/persist.rs): saved file, last save, catch-up.
             "resume": Value::Object(self.c2.resume.lock().unwrap().clone()),
             // The node client's adaptive speed limit (dry run #16): the rate
@@ -2015,6 +2020,11 @@ pub struct C2Config {
     /// [ARBSIM_V4_FAR_FILL, 1], auto-follow list [ARBSIM_V4_AUTOFOLLOW, 0]
     /// and their limits (copy2/v4blind.rs header).
     pub blind: super::v4blind::BlindCfg,
+    /// CODE PRUNING (memory fix, Nov 1; state/snap.rs CodeAging): contract
+    /// code no account in the copy uses any more is dropped after this many
+    /// seconds unused [ARBSIM_COPY2_CODE_PRUNE_S, 600; 0 = off = the old
+    /// "keep every code forever"]. Checked with the 60 s memory caps.
+    pub code_prune_s: u64,
 }
 
 impl C2Config {
@@ -2057,10 +2067,11 @@ impl C2Config {
             drop_grace_max: env_u64("ARBSIM_COPY2_DROP_GRACE_MAX", 400).min(100_000) as usize,
             drop_grace_max_logs: env_u64("ARBSIM_COPY2_DROP_GRACE_MAX_LOGS", 400_000).max(1000) as usize,
             blind: super::v4blind::BlindCfg::from_env(),
+            code_prune_s: env_u64("ARBSIM_COPY2_CODE_PRUNE_S", 600),
         }
     }
     pub fn for_tests() -> Self {
-        C2Config { reload_ms: 0, reload_max_ms: 0, layout_retry_s: 3600, load_batch: 25, loaders: 2, keep_blocks: 400, max_keep_blocks: 4000, max_rounds: 40, tip_every_s: 0, catchup_max_blocks: 64, walk: WalkCfg::default(), walks_inflight: 2, walk_max_slots: 1_000_000, walk_max_rss_mb: 0, walk_hot: 16, walk_hot_max_rss_mb: 0, late_fetch: true, max_keep_logs: 1_000_000, pending_ms: 300, pm_bound: true, verify_every_s: 0, verify_max: 400, fast_verify_ms: 0, fast_verify_max: 1000, fast_max_age_ms: 150_000, stall_s: 30, state_file: None, save_every_s: 3600, resume_max_blocks: 18_000, resume_overlap: 64, resume_range: 500, resume_timeout_s: 60, resume_verify_max: usize::MAX, drop_grace_s: 1800, drop_grace_max: 400, drop_grace_max_logs: 1_000_000, blind: super::v4blind::BlindCfg::for_tests() }
+        C2Config { reload_ms: 0, reload_max_ms: 0, layout_retry_s: 3600, load_batch: 25, loaders: 2, keep_blocks: 400, max_keep_blocks: 4000, max_rounds: 40, tip_every_s: 0, catchup_max_blocks: 64, walk: WalkCfg::default(), walks_inflight: 2, walk_max_slots: 1_000_000, walk_max_rss_mb: 0, walk_hot: 16, walk_hot_max_rss_mb: 0, late_fetch: true, max_keep_logs: 1_000_000, pending_ms: 300, pm_bound: true, verify_every_s: 0, verify_max: 400, fast_verify_ms: 0, fast_verify_max: 1000, fast_max_age_ms: 150_000, stall_s: 30, state_file: None, save_every_s: 3600, resume_max_blocks: 18_000, resume_overlap: 64, resume_range: 500, resume_timeout_s: 60, resume_verify_max: usize::MAX, drop_grace_s: 1800, drop_grace_max: 400, drop_grace_max_logs: 1_000_000, blind: super::v4blind::BlindCfg::for_tests(), code_prune_s: 0 }
     }
 }
 
@@ -2270,6 +2281,8 @@ pub struct Intake {
     basefee: u64,
     last_tip: Option<Instant>,
     last_evict: Instant,
+    /// CODE PRUNING (C2Config::code_prune_s): since when each code is unused.
+    code_aging: crate::state::snap::CodeAging,
     /// Current load round: (started, requests before, pools).
     round: Option<(Instant, u64, usize)>,
     /// The node refused us for going too fast ("exceeded the RPS limit"):
@@ -2361,6 +2374,7 @@ pub fn manual(sh: Arc<Shared>, fills: Arc<FillQueue>, cfg: C2Config) -> (Intake,
         miss_slots: Mutex::new(HashMap::new()),
         check_accounts: Mutex::new(HashMap::new()),
         walk_paused: Mutex::new(None),
+        code_prune: Mutex::new(Value::Null),
         gap_reasons: Mutex::new(HashMap::new()),
         unknown_by: Mutex::new(HashMap::new()),
         blocked_by: Mutex::new(HashMap::new()),
@@ -2423,6 +2437,7 @@ pub fn manual(sh: Arc<Shared>, fills: Arc<FillQueue>, cfg: C2Config) -> (Intake,
         basefee: 0,
         last_tip: None,
         last_evict: Instant::now(),
+        code_aging: crate::state::snap::CodeAging::default(),
         round: None,
         refusing: None,
         fill_later: Vec::new(),
@@ -2714,6 +2729,7 @@ impl Intake {
         if self.last_evict.elapsed() > Duration::from_secs(60) {
             self.last_evict = Instant::now();
             self.evict();
+            self.prune_codes(self.started.elapsed().as_secs());
             self.prune_touched();
             self.expire_parked();
         }
@@ -7268,6 +7284,40 @@ impl Intake {
         let keep_from = oldest.min(self.sh.published.read().unwrap().versions.front().map(|v| v.block).unwrap_or(0));
         self.touched_addr.retain(|_, b| *b >= keep_from);
         self.touched_slot.retain(|_, b| *b >= keep_from);
+    }
+
+    /// CODE PRUNING (memory fix, Nov 1): drop contract code no account in
+    /// the newest version has used for ARBSIM_COPY2_CODE_PRUNE_S seconds
+    /// (`now_s`: seconds on any steady clock; tests pass their own). Only the
+    /// newest version changes (older ones keep theirs until they age out).
+    /// Returns the number of codes dropped. Public for tests.
+    pub fn prune_codes(&mut self, now_s: u64) -> usize {
+        let grace = self.cfg.code_prune_s;
+        if grace == 0 {
+            *self.c2.code_prune.lock().unwrap() = json!({ "on": false });
+            return 0;
+        }
+        let Some(h) = self.sh.head() else { return 0 };
+        let drop = self.code_aging.sweep(&h.snap, now_s, grace);
+        if !drop.is_empty() {
+            let ok = self.into_head(h.block, |snap| {
+                for c in &drop {
+                    snap.codes.remove(c);
+                }
+            });
+            if !ok {
+                // A newer version came out meanwhile: the next sweep (60 s)
+                // finds the same codes again (still unused) and drops them.
+                self.code_aging.pruned_total -= drop.len() as u64;
+                self.code_aging.pruned_last = 0;
+            }
+        }
+        let a = &self.code_aging;
+        *self.c2.code_prune.lock().unwrap() = json!({
+            "on": true, "graceS": grace, "codes": a.last_codes, "used": a.last_used,
+            "waiting": a.waiting(), "prunedLast": a.pruned_last, "prunedTotal": a.pruned_total,
+        });
+        a.pruned_last as usize
     }
 
     /// Memory cap: drop accounts that aren't our pools / coins / owned.
