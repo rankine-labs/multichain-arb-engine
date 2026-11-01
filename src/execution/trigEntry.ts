@@ -195,6 +195,9 @@ export type EntrySettings = {
   fastlaneFacts: boolean;        // FASTLANE=practice|live: table rows also carry "f" facts for the Rust scanner (off = as before)
   nodeAsks: boolean;             // TRIG_ENTRY_NODE_ASKS [on; off by default when the Rust fast lane decides] the bot asks arbsim about feed triggers itself (see nodeAsksOn)
   tableLean: boolean;            // TRIG_ENTRY_TABLE_LEAN [1] lean table: caches sized to the table, short fingerprints, no answer look-ups kept when the bot never asks (0 = exactly as before; see LEAN TABLE)
+  tableFast: boolean;            // TRIG_TABLE_FAST [1] fast table rebuild (see FAST TABLE; needs the lean table; 0 = exactly as before)
+  tableReuseMaxMs: number;       // TRIG_TABLE_REUSE_MAX_MS [30000] fast table: a kept question is re-derived somewhere between TRIG_ENTRY_TABLE_REUSE_MS and this (spread per route)
+  tableDriftMs: number;          // TRIG_TABLE_DRIFT_MS [10000] fast table: a pool whose rows changed ONLY because the gas cost or the start coin's price moved is re-sent at most this often (0 = at once, as before)
 };
 
 export function entrySettings(env: Record<string, string | undefined> = process.env, minNetUsd = 0.25): EntrySettings {
@@ -227,7 +230,130 @@ export function entrySettings(env: Record<string, string | undefined> = process.
     fastlaneFacts: fastlaneFactsOn(env),
     nodeAsks: nodeAsksOn(env),
     tableLean: (env.TRIG_ENTRY_TABLE_LEAN ?? '1').trim() !== '0',
+    tableFast: tableFastOn(env),
+    tableReuseMaxMs: num('TRIG_TABLE_REUSE_MAX_MS', 30_000, 0),
+    tableDriftMs: num('TRIG_TABLE_DRIFT_MS', 10_000, 0),
   };
+}
+
+// ----------------------------------------------------------------------------
+// FAST TABLE (Nov 1, TRIG_TABLE_FAST, default on; 0 = exactly as before)
+//
+// Plain English: after the lean table (#256) the offline soak rebuilt the
+// table in ~0.5 s, but live it still took ~70 s (bot busy ~54 s). The soak
+// had left out three things the live bot has:
+//   1. Every route's trade was built with the contract's calldata encoder
+//      (buildExecuteCall, ~0.5 ms, more on the server), and that calldata was
+//      thrown away (the check question is encoded again from the trade).
+//      Now the trade is planned without it (executorCalldata planExecuteCall).
+//   2. A kept question was only kept while its two pool STATE OBJECTS stayed
+//      the same. Live, every trade, block and the 5 s watch-list re-read
+//      gives pools new objects, and the gas cost in $ moves every few
+//      seconds (it was part of the "same route?" key). And a kept question
+//      was only good for 5 s. A full pass takes longer than 5 s, so by the
+//      next pass nothing was reusable: live reused 6,000 to 8,000 of ~37,000
+//      routes per pass (only routes listed twice in the same pass), so
+//      every pass rebuilt everything, which kept the pass slow. Now:
+//        - the host says what a question is really made of (the pools'
+//          trading details, not their prices: the question does not contain
+//          any pool price; see shadowMain entryTableRoutes),
+//        - a gas move only works out the stop amount again (the one part of
+//          the question that uses gas), and
+//        - a kept question is re-derived somewhere between
+//          TRIG_ENTRY_TABLE_REUSE_MS and TRIG_TABLE_REUSE_MAX_MS after it was
+//          written (spread per route), so the re-derivations don't all land
+//          in the same pass.
+//      Every row is still exactly what a fresh build gives (tests compare).
+//   3. Gas and the WETH price move every few seconds, and each move changes
+//      every row's stop amount, so every pool was re-sent each pass. With a
+//      ~1 s pass that would be the whole table (~25 to 90 MB of text) every
+//      second into arbsim. Now a pool whose rows changed ONLY that way (same
+//      routes, same pool prices, same held flags) is re-sent at most every
+//      TRIG_TABLE_DRIFT_MS (10 s; today it is ~70 s). A real change (a pool
+//      price moved, a route came or went) still goes at once.
+// Plus: the end of a pass (what changed, splitting into messages, the
+// retired-id tidy-up) now also runs in ~2 ms bites.
+// ----------------------------------------------------------------------------
+export function tableFastOn(env: Record<string, string | undefined> = process.env): boolean {
+  return (env.TRIG_TABLE_FAST ?? '1').trim() !== '0' && (env.TRIG_ENTRY_TABLE_LEAN ?? '1').trim() !== '0';
+}
+
+// FAST TABLE 2: a pool's TRADING details: everything about a pool that the
+// check question (contract calldata, pretend state) is made from: which
+// contract kind, which address or V4 key, which coins, the V2 fee. No price,
+// liquidity or reserves: the question carries none of them (the quick price
+// check `score` is worked out fresh every pass, outside the memo). Worked out
+// fresh every call (no caching: some pool fields are changed in place).
+// (One shared copy per distinct key, so ~37,000 kept questions don't each
+// keep their own copy of the same text. Bounded.)
+const shapeKeys = new Map<string, string>();
+export function poolShapeKey(p: any): string {
+  if (!p) return '';
+  const v = p.v4;
+  const k = `${p.chain}|${p.dex}|${p.poolAddress}|${p.poolType}|${p.variant ?? ''}|${p.tokenA}|${p.tokenB}|${p.feeBps}|${p.feePips ?? ''}` +
+    (v ? `|v4:${v.fee}:${v.tickSpacing}:${v.native ? 1 : 0}:${v.poolManager}:${v.hooks ?? ''}` : '');
+  const hit = shapeKeys.get(k);
+  if (hit !== undefined) return hit;
+  if (shapeKeys.size > 50_000) shapeKeys.clear();
+  shapeKeys.set(k, k);
+  return k;
+}
+// FAST TABLE 3: a pool's PRICE facts (what the quick price check reads). Its
+// seen-fee record is passed next to it by identity (it is replaced in place).
+const priceKeys = new WeakMap<object, string>();
+export function poolPriceKey(p: any): string {
+  if (!p) return '';
+  // Remembered per state object (price fields are never changed in place;
+  // the seen-fee record, which is, goes next to it by identity).
+  const hit = priceKeys.get(p);
+  if (hit !== undefined) return hit;
+  const k = priceKeyOf(p);
+  priceKeys.set(p, k);
+  return k;
+}
+function priceKeyOf(p: any): string {
+  return `${p.reserveA ?? ''}|${p.reserveB ?? ''}|${p.sqrtPriceX96 ?? ''}|${p.liquidity ?? ''}|${p.tick ?? ''}|${p.feeBps}|${p.feePips ?? ''}|${p.feeReadBlock ?? ''}|${p.feeReadMs ?? ''}`;
+}
+
+// A route's spread for FAST TABLE 2 (0..span-1), from its id: stable, so a
+// route's re-derivation time doesn't jump around between passes.
+export function routeSpread(rid: string, span: number): number {
+  if (!(span > 0)) return 0;
+  let h = 0x811c9dc5;
+  for (let i = 0; i < rid.length; i++) { h ^= rid.charCodeAt(i); h = Math.imul(h, 0x01000193); }
+  return (h >>> 0) % Math.floor(span);
+}
+
+// The same pool split as splitTablePools, worked out in bites (FAST TABLE):
+// `pause` is called between pools when the caller's time slice is used up.
+// `texts` (optional): filled with each part's pools as UTF-8 JSON pieces
+// (`"key":value` per pool, comma-separated, in order), for client.requestBytes.
+const COMMA = Buffer.from(',', 'utf8');
+const CLOSE_BRACE = Buffer.from('}', 'utf8');
+export async function splitTablePoolsSliced(pools: Record<string, unknown>, codes: string[], maxBytes: number, pause: () => Promise<void> | null, texts?: Buffer[][]): Promise<Array<Record<string, unknown>>> {
+  const parts: Array<Record<string, unknown>> = [];
+  let cur: Record<string, unknown> = {};
+  let curT: Buffer[] = [];
+  let n = 0;
+  const codesBytes = codes.reduce((a, c) => a + c.length + 3, 0);
+  let size = 200 + codesBytes;
+  for (const [k, v] of Object.entries(pools)) {
+    const p = pause();
+    if (p) await p;
+    const j = JSON.stringify(v ?? null);
+    const jb = texts ? Buffer.from(j, 'utf8') : null;
+    const b = k.length + 4 + (jb ? jb.length : Buffer.byteLength(j, 'utf8'));
+    const codesOnly = n === 0 && parts.length === 0 && codesBytes > 0;
+    if ((n > 0 || codesOnly) && size + b > maxBytes) { parts.push(cur); texts?.push(curT); cur = {}; curT = []; n = 0; size = 200; }
+    cur[k] = v;
+    // (JSON.stringify of the whole object leaves `undefined` members out.)
+    if (jb && v !== undefined) { if (curT.length) curT.push(COMMA); curT.push(Buffer.from(`${JSON.stringify(k)}:`, 'utf8'), jb); }
+    n++;
+    size += b;
+  }
+  parts.push(cur);
+  texts?.push(curT);
+  return parts;
 }
 
 // ----------------------------------------------------------------------------
@@ -503,9 +629,20 @@ export function ladderPlan(c: EntryCandidate, sizesUsd: number[]): { main: numbe
 // The smallest profit (start-coin units) that clears the send minimum
 // after gas, by the candidate's OWN money conversion (so the sidecar's stop
 // rule "profit >= this" is exactly the bot's "net >= minimum"). null = none.
-export function stopUnits(c: EntryCandidate, minNetUsd: number): bigint | null {
+export function stopUnits(c: EntryCandidate, minNetUsd: number, guess = false): bigint | null {
   const ok = (u: bigint) => { const n = c.usdOf(u) - c.gasUsd; return Number.isFinite(n) && n >= minNetUsd; };
   if (ok(1n)) return 1n;
+  // FAST TABLE: try the answer worked out directly from the coin's price
+  // and decimals first. `ok` only ever flips from no to yes as u grows, so
+  // if guess passes and guess - 1 does not, guess IS the smallest amount the
+  // search below finds. Anything else: the search, exactly as before.
+  if (guess && c.fx && c.fx.px > 0 && Number.isInteger(c.fx.d) && c.fx.d >= 0 && c.fx.d <= 36) {
+    const g = ((minNetUsd + c.gasUsd) / c.fx.px) * 10 ** c.fx.d;
+    if (Number.isFinite(g) && g > 1 && g < 1e60) {
+      const u = BigInt(Math.ceil(g));
+      for (const v of [u, u + 1n, u - 1n, u + 2n]) if (v > 1n && ok(v) && !ok(v - 1n)) return v;
+    }
+  }
   let hi = 2n;
   while (!ok(hi)) { hi *= 2n; if (hi > 1n << 240n) return null; }
   let lo = hi / 2n;
@@ -555,11 +692,24 @@ export type EntryPick = {
 // coin's price and decimals. Same things (===) as last time = the question
 // written last time is reused (up to TRIG_ENTRY_TABLE_REUSE_MS old) instead
 // of being built again (~1 ms each). Not given = always rebuilt.
-export type TableRoute = { rid: string; held: boolean; score: number | null; build: () => EntryCandidate | null; inputs?: unknown[] };
+// `live` (FAST TABLE 3, optional): things whose change must reach arbsim at
+// once (the two pools' prices). A pool whose rows changed while every
+// route's `live` (and its id, held flag, can-build) stayed the same changed
+// only through gas / coin-price drift and is re-sent at most every
+// TRIG_TABLE_DRIFT_MS. Not given = every change goes at once.
+// `inputs` may also be a function (FAST TABLE): then it is only worked out
+// when the route is actually rebuilt.
+export type TableRoute = { rid: string; held: boolean; score: number | null; build: () => EntryCandidate | null; inputs?: unknown[] | (() => unknown[]); live?: unknown[] };
+const inputsOf = (r: TableRoute): unknown[] | undefined => (typeof r.inputs === 'function' ? r.inputs() : r.inputs);
 // `routes` may be a function (freeze fix): then a pool's routes are listed
 // only when the table builder reaches that pool, in small bites, instead
 // of every pool's routes in one go before building starts.
-export type TablePool = { pool: string; routes: TableRoute[] | (() => TableRoute[]) };
+// `ver` (FAST TABLE 4, optional): cheap facts that change whenever any of
+// this pool's routes could change for real (its own and its partner pools'
+// prices, wallet reads, ...), compared one by one (===). Same as at the
+// pool's last build = its routes are not even listed this pass (re-listed
+// at least every 0.5 to 1 x TRIG_TABLE_DRIFT_MS all the same).
+export type TablePool = { pool: string; routes: TableRoute[] | (() => TableRoute[]); ver?: () => unknown[] };
 
 export type EntryDeps = {
   tf: TriggerFirst;
@@ -623,6 +773,53 @@ function withDeadline<T>(p: Promise<T>, ms: number): Promise<T | null> {
 const yieldNow = (): Promise<void> => new Promise((r) => setImmediate(r));
 // The long-code list is tidied once it grows past this many (see compactCodes).
 const CODES_SOFT_MAX = 8;
+// captureFor's route-shape key. FAST TABLE: the same text without the
+// replacer function (several times faster); only when something in it is a
+// bigint (never, for today's trades) the replacer is needed, and used.
+function capKeyOf(o: Record<string, unknown>, fast: boolean): string {
+  const slow = () => JSON.stringify(o, (_k, v) => (typeof v === 'bigint' ? v.toString() : v));
+  if (!fast) return slow();
+  try { return JSON.stringify(o); } catch { return slow(); }
+}
+
+// FAST TABLE: a question's parts that don't depend on the gas cost, and the
+// question put together from them, in exactly the old key order.
+type QParts = { calls: unknown[]; overrides: Record<string, unknown>; sizes?: unknown; route: string[]; amt: string };
+function assembleQuestion(p: QParts, stop: bigint): Record<string, unknown> {
+  return { calls: p.calls, overrides: p.overrides, ...(p.sizes ? { sizes: p.sizes } : {}), route: p.route, stop: hex(stop), amt: p.amt };
+}
+const NULL_DIGEST = 'null';
+// FAST TABLE 3: what about a route must reach arbsim at once when it
+// changes (id, held flag, can it be built / checked, size cap, route keys,
+// the host's `live` things: the pools' prices). Objects count by identity.
+const objIds = new WeakMap<object, number>();
+let objSeq = 0;
+function liveItem(x: unknown): string {
+  if (x !== null && (typeof x === 'object' || typeof x === 'function')) {
+    let id = objIds.get(x as object);
+    if (id === undefined) { id = ++objSeq; objIds.set(x as object, id); }
+    return `#${id}`;
+  }
+  return typeof x === 'bigint' ? `${x}n` : String(x);
+}
+// FAST TABLE 4: a pool's routes as far as a real change goes (ids, held
+// flags, the host's live facts). A route without live facts makes it unique.
+function poolSigOf(rs: TableRoute[]): string {
+  let k = `${rs.length}`;
+  for (const r of rs) {
+    k += `\n${r.rid}|${r.held ? 1 : 0}`;
+    if (r.live) for (const x of r.live) k += `|${liveItem(x)}`;
+    else k += `|#${++objSeq}`;
+  }
+  return k;
+}
+function liveKey(r: TableRoute, state: string, cand?: EntryCandidate): string {
+  let k = `${r.rid}|${r.held ? 1 : 0}|${state}`;
+  if (cand) k += `|${cand.maxSizeUsd}|${cand.keys.join(',')}|${cand.label}`;
+  if (r.live) for (const x of r.live) k += `|${liveItem(x)}`;
+  else k += `|#${++objSeq}`; // no live facts given: never counts as drift
+  return k;
+}
 // Same things, one by one (===), same count.
 function sameItems(a: unknown[], b: unknown[]): boolean {
   if (a.length !== b.length) return false;
@@ -1221,11 +1418,13 @@ export class TrigEntry {
   // known for 30 s, so answers already on their way can still be read.
   private readonly tbl = {
     gen: 0, ackGen: -1, needFull: true, building: false,
-    pools: new Map<string, { fp: string; rows: unknown[]; ids: string[] }>(),
+    pools: new Map<string, { fp: string; rows: unknown[]; ids: string[]; liveFp?: string; sentAt?: number }>(),
     meta: new Map<string, TableMeta>(),
     retired: new Map<string, number>(),
     codes: [] as string[],
     seq: 0, lastMs: 0, lastBusyMs: 0, lastRoutes: 0, lastReused: 0, sends: 0, sendFails: 0,
+    // FAST TABLE: passes so far, pools held back as drift-only last pass, gas-only re-derivations last pass.
+    passes: 0, lastHeld: 0, lastRestop: 0, lastSkipped: 0,
   };
 
   tableInfo(): { ackGen: number; pools: number; entries: number; lastMs: number; busyMs: number; routes: number; reused: number; sends: number } {
@@ -1270,7 +1469,7 @@ export class TrigEntry {
       const now = this.now();
       const reuseMs = this.settings.tableReuseMs;
       const sizesKey = this.settings.sizesUsd.join(',');
-      const fresh = new Map<string, { fp: string; rows: Array<Record<string, unknown>>; metas: Array<TableMeta | null> }>();
+      const fresh = new Map<string, { fp: string; rows: Array<Record<string, unknown>>; metas: Array<TableMeta | null>; liveFp?: string }>();
       let routes = 0, reused = 0;
       // LEAN TABLE (see the note at entrySettings): digests instead of
       // question text, cache limits that follow the table, and answer
@@ -1279,15 +1478,53 @@ export class TrigEntry {
       const lean = this.settings.tableLean;
       const keepMeta = !lean || (this.oneTripOn() && this.settings.nodeAsks);
       const memoMax = () => (lean ? cacheMaxFor(20_000, Math.max(T.lastRoutes, routes)) : 20_000);
+      // FAST TABLE (see tableFastOn): only on top of the lean table.
+      const fast = lean && this.settings.tableFast;
+      const spreadSpan = Math.max(0, this.settings.tableReuseMaxMs - reuseMs);
+      const sliceUp = () => (performance.now() - slice > 2 ? pause() : null);
+      let restop = 0, skipped = 0;
+      const driftMs = fast ? this.settings.tableDriftMs : 0;
+      T.passes++;
       for (const tp of src) {
         const key = (tp.pool ?? '').toLowerCase();
         if (!key || fresh.has(key)) continue;
         if (performance.now() - slice > 2) await pause();
+        // FAST TABLE 4: nothing this pool's routes are made of moved since
+        // its last build (host `ver`): last build's rows, not even listed.
+        let ver: unknown[] | undefined;
+        if (fast && driftMs > 0 && tp.ver) {
+          try { ver = tp.ver(); } catch { ver = undefined; }
+          const prev = this.poolPass.get(key);
+          if (ver && prev && prev.ver && sameItems(prev.ver, ver) && prev.codesEpoch === this.codesEpoch && prev.sizesKey === sizesKey && now - prev.at < prev.ttl) {
+            fresh.set(key, prev.f);
+            routes += prev.n; reused += prev.n; skipped++;
+            this.routesSeen = Math.max(this.routesSeen, routes);
+            continue;
+          }
+        }
         let rs: TableRoute[];
         try { rs = typeof tp.routes === 'function' ? tp.routes() : tp.routes; } catch { rs = []; }
+        // FAST TABLE 4: a pool whose routes, held flags and pool prices are
+        // all as at its last build is not rebuilt: only gas / coin-price
+        // drift could have changed its rows, and those are only re-sent
+        // every driftMs anyway. It is rebuilt at least every 0.5 to 1 x
+        // driftMs (spread per pool), so drift still goes out on time.
+        let sig: string | undefined;
+        if (fast && driftMs > 0) {
+          sig = textDigest(poolSigOf(rs)); // (kept as a short digest)
+          const prev = this.poolPass.get(key);
+          if (prev && prev.sig === sig && prev.codesEpoch === this.codesEpoch && prev.sizesKey === sizesKey && now - prev.at < prev.ttl) {
+            fresh.set(key, prev.f);
+            if (ver) prev.ver = ver; // (same routes and prices: the new facts describe the same build)
+            routes += rs.length; reused += rs.length; skipped++;
+            this.routesSeen = Math.max(this.routesSeen, routes);
+            continue;
+          }
+        }
         const rows: Array<Record<string, unknown>> = [];
         const metas: Array<TableMeta | null> = [];
         const fps: string[] = [];
+        const lives: string[] = [];
         for (const r of rs) {
           routes++;
           this.routesSeen = Math.max(this.routesSeen, routes); // capCache limit (captureFor)
@@ -1295,42 +1532,58 @@ export class TrigEntry {
           let cand: EntryCandidate | null = null;
           try { cand = r.build(); } catch { cand = null; }
           const score = r.score !== null && Number.isFinite(r.score) ? r.score : null;
-          if (!cand) { rows.push({ rid: r.rid.toLowerCase(), h: r.held, s: score, e: null }); metas.push(null); fps.push(JSON.stringify([r.rid, r.held, score, null])); continue; }
+          if (!cand) {
+            rows.push({ rid: r.rid.toLowerCase(), h: r.held, s: score, e: null }); metas.push(null); fps.push(JSON.stringify([r.rid, r.held, score, null]));
+            if (fast) lives.push(liveKey(r, 'x'));
+            continue;
+          }
           const meta: TableMeta = { cand };
           // Reuse last time's written-down question when nothing it is made of changed.
           const rid = r.rid.toLowerCase();
-          const sameAs = this.memoKey(cand, sizesKey);
-          const memo = reuseMs > 0 && r.inputs ? this.tblMemo.get(rid) : undefined;
           let c: Record<string, unknown> | null = null;
           let cJson: string;
-          if (memo && now - memo.at <= reuseMs && memo.codesEpoch === this.codesEpoch && memo.sameAs === sameAs && sameItems(memo.inputs, r.inputs!)) {
-            c = memo.c; cJson = memo.cJson;
-            if (memo.sig !== undefined) meta.sig = memo.sig;
-            if (memo.fallback) meta.fallback = true;
-            reused++;
+          if (fast) {
+            // FAST TABLE 2: same question as a fresh build, from the memo when
+            // only the gas cost moved (the stop amount is worked out again).
+            const got = await this.fastQuestion(r, rid, cand, sizesKey, now, reuseMs, spreadSpan, memoMax, keepMeta, waitFor);
+            c = got.c; cJson = got.cJson;
+            if (got.sig !== undefined) meta.sig = got.sig;
+            if (got.fallback) meta.fallback = true;
+            if (got.reused) reused++;
+            if (got.restop) restop++;
           } else {
-            const plan = ladderPlan(cand, this.settings.sizesUsd);
-            if (plan) {
-              const cap = await this.captureForTimed(cand, plan, waitFor);
-              const stop = stopUnits(cand, this.settings.minNetUsd);
-              if (cap && stop !== null) {
-                c = {
-                  calls: cap.calls, overrides: this.codeRefs(cap.overrides), ...(cap.sizes ? { sizes: cap.sizes } : {}),
-                  route: cand.keys.filter((k): k is string => typeof k === 'string' && VALID_KEY.test(k)).map((k) => k.toLowerCase()),
-                  stop: hex(stop), amt: hex(plan.b.trade.amountIn),
-                };
-                // The answer look-up's hash: only needed when it can be read (LEAN TABLE 3).
-                if (keepMeta) meta.sig = checkSig(cap.data, cap.overrides, cap.sizes);
-              } else meta.fallback = true;
+            const sameAs = this.memoKey(cand, sizesKey);
+            const rInputs = inputsOf(r);
+            const memo = reuseMs > 0 && rInputs ? this.tblMemo.get(rid) : undefined;
+            if (memo && now - memo.at <= reuseMs && memo.codesEpoch === this.codesEpoch && memo.sameAs === sameAs && sameItems(memo.inputs, rInputs!)) {
+              c = memo.c; cJson = memo.cJson;
+              if (memo.sig !== undefined) meta.sig = memo.sig;
+              if (memo.fallback) meta.fallback = true;
+              reused++;
+            } else {
+              const plan = ladderPlan(cand, this.settings.sizesUsd);
+              if (plan) {
+                const cap = await this.captureForTimed(cand, plan, waitFor);
+                const stop = stopUnits(cand, this.settings.minNetUsd);
+                if (cap && stop !== null) {
+                  c = {
+                    calls: cap.calls, overrides: this.codeRefs(cap.overrides), ...(cap.sizes ? { sizes: cap.sizes } : {}),
+                    route: cand.keys.filter((k): k is string => typeof k === 'string' && VALID_KEY.test(k)).map((k) => k.toLowerCase()),
+                    stop: hex(stop), amt: hex(plan.b.trade.amountIn),
+                  };
+                  // The answer look-up's hash: only needed when it can be read (LEAN TABLE 3).
+                  if (keepMeta) meta.sig = checkSig(cap.data, cap.overrides, cap.sizes);
+                } else meta.fallback = true;
+              }
+              cJson = c === null ? 'null' : JSON.stringify(c);
+              // LEAN TABLE 2: keep (and compare) a short digest, not the text.
+              if (lean) cJson = textDigest(cJson);
+              if (reuseMs > 0 && rInputs) {
+                if (this.tblMemo.size > memoMax()) this.tblMemo.clear(); // memory bound
+                // (Numbers only change in compactCodes, after the build: codesEpoch then moves on.)
+                this.tblMemo.set(rid, { at: now, inputs: rInputs.slice(), sameAs, codesEpoch: this.codesEpoch, c, cJson, sig: meta.sig, fallback: meta.fallback });
+              } else this.tblMemo.delete(rid);
             }
-            cJson = c === null ? 'null' : JSON.stringify(c);
-            // LEAN TABLE 2: keep (and compare) a short digest, not the text.
-            if (lean) cJson = textDigest(cJson);
-            if (reuseMs > 0 && r.inputs) {
-              if (this.tblMemo.size > memoMax()) this.tblMemo.clear(); // memory bound
-              // (Numbers only change in compactCodes, after the build: codesEpoch then moves on.)
-              this.tblMemo.set(rid, { at: now, inputs: r.inputs.slice(), sameAs, codesEpoch: this.codesEpoch, c, cJson, sig: meta.sig, fallback: meta.fallback });
-            } else this.tblMemo.delete(rid);
           }
           // Fast lane only: the facts the Rust scanner values results with.
           const fl = this.settings.fastlaneFacts && c ? fastlaneFacts(cand) : null;
@@ -1342,17 +1595,38 @@ export class TrigEntry {
           // Fast lane facts go in ROUNDED (review H2, Oct 26): price to 3 and gas
           // to 2 significant digits, so a tiny price move doesn't resend the
           // pool's rows every refresh (the row itself still carries the exact facts).
-          fps.push(JSON.stringify([r.rid, r.held, score, cand.label, cand.gasUsd, cand.maxSizeUsd, !!meta.fallback]) + cJson + (fl ? fastlaneFactsFp(fl) : ''));
+          // (FAST TABLE: the same facts joined without JSON: same "changed?" answer, cheaper.)
+          fps.push((fast ? `${r.rid}\u0001${r.held}\u0001${score}\u0001${cand.label}\u0001${cand.gasUsd}\u0001${cand.maxSizeUsd}\u0001${!!meta.fallback}\u0002` : JSON.stringify([r.rid, r.held, score, cand.label, cand.gasUsd, cand.maxSizeUsd, !!meta.fallback])) + cJson + (fl ? fastlaneFactsFp(fl) : ''));
+          if (fast) lives.push(liveKey(r, c === null ? 'n' : meta.fallback ? 'f' : 'c', cand));
         }
-        fresh.set(key, { fp: fps.join('\n'), rows, metas });
+        const fe = fast ? { fp: fps.join('\n'), rows, metas, liveFp: textDigest(lives.join('\n')) } : { fp: fps.join('\n'), rows, metas };
+        fresh.set(key, fe);
+        if (sig !== undefined) {
+          if (this.poolPass.size > 20_000) this.poolPass.clear(); // memory bound (pools, not routes)
+          // (The answer look-ups, which hold each candidate and its pool
+          // states, are only kept when they can be read: LEAN TABLE 3.)
+          this.poolPass.set(key, { sig, ver, n: rs.length, f: keepMeta ? fe : { ...fe, metas: [] }, at: now, ttl: driftMs * (0.5 + routeSpread(key, 1_000) / 2_000), codesEpoch: this.codesEpoch, sizesKey });
+        }
       }
       // Memo entries of routes that are gone: forgotten once old.
-      if (this.tblMemo.size) for (const [k, m] of this.tblMemo) if (now - m.at > Math.max(reuseMs, 1_000) * 3) this.tblMemo.delete(k);
+      if (this.tblMemo.size) {
+        const keepMs = Math.max(fast ? this.settings.tableReuseMaxMs : 0, reuseMs, 1_000) * 3;
+        let i = 0;
+        for (const [k, m] of this.tblMemo) {
+          if (now - m.at > keepMs) this.tblMemo.delete(k);
+          if (fast && (++i & 1023) === 0) { const p = sliceUp(); if (p) await p; }
+        }
+      }
       // What changed since the last table (new ids only for changed pools).
       const changed: Record<string, unknown[] | null> = {};
+      let heldBack = 0;
       for (const [key, f] of fresh) {
         const old = T.pools.get(key);
         if (old && old.fp === f.fp) continue;
+        // FAST TABLE 3: changed only by gas / coin-price drift (same routes,
+        // same pool prices, same held flags): re-sent at most every driftMs.
+        if (driftMs > 0 && old && !T.needFull && T.ackGen >= 0 && f.liveFp !== undefined && old.liveFp === f.liveFp && now - (old.sentAt ?? 0) < driftMs) { heldBack++; continue; }
+        if (fast) { const p = sliceUp(); if (p) await p; }
         if (old) for (const id of old.ids) T.retired.set(id, now);
         const ids: string[] = [];
         f.rows.forEach((row, i) => {
@@ -1362,9 +1636,10 @@ export class TrigEntry {
           ids.push(id);
           if (keepMeta) T.meta.set(id, f.metas[i]!);
         });
-        T.pools.set(key, { fp: f.fp, rows: f.rows, ids });
+        T.pools.set(key, fast ? { fp: f.fp, rows: f.rows, ids, liveFp: f.liveFp, sentAt: now } : { fp: f.fp, rows: f.rows, ids });
         changed[key] = f.rows;
       }
+      if (this.poolPass.size > fresh.size) for (const k of [...this.poolPass.keys()]) if (!fresh.has(k)) this.poolPass.delete(k);
       for (const [key, old] of [...T.pools]) {
         if (fresh.has(key)) continue;
         for (const id of old.ids) T.retired.set(id, now);
@@ -1372,9 +1647,21 @@ export class TrigEntry {
         changed[key] = null;
       }
       // Forget entries retired more than 30 s ago.
-      for (const [id, at] of [...T.retired]) if (now - at > 30_000) { T.retired.delete(id); T.meta.delete(id); }
+      if (fast) {
+        // Same result, without copying the whole list: ids are retired in
+        // time order, so the old ones are all at the front.
+        let i = 0;
+        for (const [id, at] of T.retired) {
+          if (now - at <= 30_000) break;
+          T.retired.delete(id); T.meta.delete(id);
+          if ((++i & 1023) === 0) { const p = sliceUp(); if (p) await p; }
+        }
+      } else for (const [id, at] of [...T.retired]) if (now - at > 30_000) { T.retired.delete(id); T.meta.delete(id); }
       T.lastRoutes = routes;
       T.lastReused = reused;
+      T.lastHeld = heldBack;
+      T.lastRestop = restop;
+      T.lastSkipped = skipped;
       // Long-code list tidy-up, once the whole table is built (see compactCodes).
       if (T.codes.length > CODES_SOFT_MAX) this.compactCodes();
       if (!Object.keys(changed).length && !T.needFull) return T.ackGen >= 0;
@@ -1388,7 +1675,11 @@ export class TrigEntry {
       // before (full or a change), the rest as changes on top of the part
       // before (arbsim's own partial-table rule: base = the generation it
       // holds). One part = exactly the old single message.
-      const parts = splitTablePools(pools, T.codes, this.settings.tableMaxBytes);
+      // FAST TABLE: split in bites, keeping each pool's text, so the message
+      // is not turned into text again (client.requestText, same bytes).
+      const texts: Buffer[][] = [];
+      const canText = fast && typeof (this.d.client as { requestBytes?: unknown }).requestBytes === 'function';
+      const parts = fast ? await splitTablePoolsSliced(pools, T.codes, this.settings.tableMaxBytes, sliceUp, canText ? texts : undefined) : splitTablePools(pools, T.codes, this.settings.tableMaxBytes);
       let base = T.ackGen;
       for (let i = 0; i < parts.length; i++) {
         const gen = T.gen + 1;
@@ -1398,7 +1689,10 @@ export class TrigEntry {
         // The long codes go once, with the first part (arbsim keeps its
         // list when a partial part carries none).
         const msg = { type: 'trig_table', gen, full: first ? full : false, base, codes: first ? T.codes : [], pools: parts[i] };
-        const a = await waitFor(this.d.client.request(msg, 3_000));
+        // (Same bytes as JSON.stringify(msg) + id: `{"type":...,"pools":{<pools>}` then `,"id":n}`.)
+        const a = await waitFor(canText
+          ? this.d.client.requestBytes([Buffer.from(`{"type":"trig_table","gen":${gen},"full":${msg.full},"base":${base},"codes":${JSON.stringify(msg.codes)},"pools":{`, 'utf8'), ...texts[i], CLOSE_BRACE], 3_000)
+          : this.d.client.request(msg, 3_000));
         if (a.ok !== true) {
           T.sendFails++;
           T.needFull = true;
@@ -1440,14 +1734,86 @@ export class TrigEntry {
 
   // Reuse memory of the one-trip table (see refreshTable): route id ->
   // what its question was made of, and the question as written.
-  private readonly tblMemo = new Map<string, { at: number; inputs: unknown[]; sameAs: string; codesEpoch: number; c: Record<string, unknown> | null; cJson: string; sig?: string; fallback?: boolean }>();
+  // FAST TABLE entries also keep the question's gas-free parts (`parts`, and
+  // their digest `base`), the gas cost it was made with, the answer
+  // look-up hash for when it has a stop amount (`sigAll`) and the route's
+  // spread (ms added to the reuse window).
+  private readonly tblMemo = new Map<string, { at: number; inputs: unknown[]; sameAs: string; codesEpoch: number; c: Record<string, unknown> | null; cJson: string; sig?: string; fallback?: boolean;
+    fast?: true; parts?: QParts; base?: string; gasUsd?: number; sigAll?: string; spread?: number }>();
   // Bumped whenever the long-code list is renumbered (compactCodes): questions
   // written before that point at old list positions and are never reused.
   private codesEpoch = 0;
+  // FAST TABLE 4: each pool's last build (what it was built from, the result).
+  private readonly poolPass = new Map<string, { sig: string; ver?: unknown[]; n: number; f: { fp: string; rows: Array<Record<string, unknown>>; metas: Array<TableMeta | null>; liveFp?: string }; at: number; ttl: number; codesEpoch: number; sizesKey: string }>();
   // The candidate's own facts that its question depends on (besides `inputs`).
   private memoKey(c: EntryCandidate, sizesKey: string): string {
     return JSON.stringify([c.label, c.buyPool, c.sellPool, c.tokenIn, c.maxSizeUsd, c.gasUsd, c.keys, sizesKey, this.settings.minNetUsd]);
   }
+  // FAST TABLE 2: the memo key without the gas cost (gas only changes the
+  // stop amount, which fastQuestion works out again).
+  private memoKeyFast(c: EntryCandidate, sizesKey: string): string {
+    return JSON.stringify([c.label, c.buyPool, c.sellPool, c.tokenIn, c.maxSizeUsd, c.keys, sizesKey, this.settings.minNetUsd]);
+  }
+
+  // FAST TABLE 2: one route's question, exactly as the old code builds it
+  // (same object, same key order), reusing the memo when what it is made of
+  // (host `inputs`, memoKeyFast, code numbering) is the same and it is not
+  // too old. A gas-only change works out just the stop amount again.
+  private async fastQuestion(
+    r: TableRoute, rid: string, cand: EntryCandidate, sizesKey: string, now: number, reuseMs: number, spreadSpan: number,
+    memoMax: () => number, keepMeta: boolean, waitFor: <X>(p: Promise<X>) => Promise<X>,
+  ): Promise<{ c: Record<string, unknown> | null; cJson: string; sig?: string; fallback?: boolean; reused?: boolean; restop?: boolean }> {
+    const sameAs = this.memoKeyFast(cand, sizesKey);
+    const rInputs = inputsOf(r);
+    const memo = reuseMs > 0 && rInputs ? this.tblMemo.get(rid) : undefined;
+    if (memo && memo.fast && memo.codesEpoch === this.codesEpoch && memo.sameAs === sameAs && sameItems(memo.inputs, rInputs!)
+      && now - memo.at <= reuseMs + (memo.parts ? memo.spread ?? 0 : 0)) {
+      if (!memo.parts || memo.gasUsd === cand.gasUsd) return { c: memo.c, cJson: memo.cJson, sig: memo.sig, fallback: memo.fallback, reused: true };
+      // Only the gas cost moved: the stop amount again (as stopUnits always does).
+      const stop = stopUnits(cand, this.settings.minNetUsd, true);
+      const c = stop === null ? null : assembleQuestion(memo.parts, stop);
+      const cJson = stop === null ? NULL_DIGEST : `${memo.base}:${hex(stop)}`;
+      memo.c = c; memo.cJson = cJson; memo.gasUsd = cand.gasUsd;
+      memo.sig = c ? memo.sigAll : undefined;
+      memo.fallback = stop === null ? true : undefined;
+      return { c, cJson, sig: memo.sig, fallback: memo.fallback, reused: true, restop: true };
+    }
+    let c: Record<string, unknown> | null = null;
+    let parts: QParts | undefined;
+    let sigAll: string | undefined;
+    let fallback: boolean | undefined;
+    let capRef: CapturedCheck | null = null;
+    const plan = ladderPlan(cand, this.settings.sizesUsd);
+    if (plan) {
+      const cap = await this.captureForTimed(cand, plan, waitFor);
+      capRef = cap;
+      const stop = stopUnits(cand, this.settings.minNetUsd, true);
+      if (cap) {
+        parts = {
+          calls: cap.calls, overrides: this.codeRefs(cap.overrides), sizes: cap.sizes,
+          route: cand.keys.filter((k): k is string => typeof k === 'string' && VALID_KEY.test(k)).map((k) => k.toLowerCase()),
+          amt: hex(plan.b.trade.amountIn),
+        };
+        if (keepMeta) sigAll = checkSig(cap.data, cap.overrides, cap.sizes);
+      }
+      if (parts && stop !== null) c = assembleQuestion(parts, stop);
+      else fallback = true;
+    }
+    // "Did it change?" digest of the gas-free parts: the captured template's
+    // number + its amounts + route + code numbering (a patched question is
+    // fully set by those), else the text's digest.
+    const capId = capRef ? this.capWeak.get(capRef) : undefined;
+    const base = !parts ? '' : capId !== undefined ? `t${capId}|${parts.route.join(',')}|${this.codesEpoch}` : textDigest(JSON.stringify([parts.calls, parts.overrides, parts.sizes ?? null, parts.route, parts.amt]));
+    const cJson = c === null ? NULL_DIGEST : `${base}:${c.stop as string}`;
+    const sig = c ? sigAll : undefined;
+    if (reuseMs > 0 && rInputs) {
+      if (this.tblMemo.size > memoMax()) this.tblMemo.clear(); // memory bound
+      this.tblMemo.set(rid, { at: now, inputs: rInputs.slice(), sameAs, codesEpoch: this.codesEpoch, c, cJson, sig, fallback,
+        fast: true, parts, base, gasUsd: cand.gasUsd, sigAll, spread: routeSpread(rid, spreadSpan) });
+    } else this.tblMemo.delete(rid);
+    return { c, cJson, sig, fallback };
+  }
+
   private captureForTimed(cand: EntryCandidate, plan: NonNullable<ReturnType<typeof ladderPlan>>, waitFor: <X>(p: Promise<X>) => Promise<X>): Promise<CapturedCheck | null> {
     return waitFor(this.captureFor(cand, plan));
   }
@@ -1459,14 +1825,23 @@ export class TrigEntry {
   // contract's pretend balance, exactly what the sidecar's size ladder
   // changes too). If that ever differs from a fresh build, the answer is
   // simply not recognised and that candidate is checked the old way.
-  private readonly capCache = new Map<string, { cap: CapturedCheck; amount: bigint }>();
+  private readonly capCache = new Map<string, { cap: CapturedCheck; amount: bigint; gen: number }>();
+  // FAST TABLE: each captured question template gets a number, and the
+  // patched question is remembered as "template n + these amounts", so a
+  // question's "did it change?" digest needs no text (see fastQuestion).
+  private capGen = 0;
+  private capWeak = new WeakMap<CapturedCheck, string>();
   // Most routes the table has listed (any rebuild): sizes capCache (LEAN TABLE 1).
   private routesSeen = 0;
   private async captureFor(cand: EntryCandidate, plan: NonNullable<ReturnType<typeof ladderPlan>>): Promise<CapturedCheck | null> {
     const t = plan.b.trade;
-    const key = JSON.stringify({ token: t.token, hops: t.hops, o: plan.b.simOpts, n: plan.others.length }, (_k, v) => (typeof v === 'bigint' ? v.toString() : v));
+    const key = capKeyOf({ token: t.token, hops: t.hops, o: plan.b.simOpts, n: plan.others.length }, this.settings.tableLean && this.settings.tableFast);
     const hit = this.capCache.get(key);
-    if (hit) return patchAmounts(hit.cap, hit.amount, t.amountIn, plan.others);
+    if (hit) {
+      const out = patchAmounts(hit.cap, hit.amount, t.amountIn, plan.others);
+      this.capWeak.set(out, `${hit.gen}|${t.amountIn}|${plan.others.join(',')}`);
+      return out;
+    }
     const q: TrigQuestion = { trade: t, simOpts: plan.b.simOpts, triggerHash: '', seenMs: 0, keys: cand.keys, label: cand.label };
     const cap = await this.d.tf.capture(q, plan.others);
     if (!cap) return null;
@@ -1474,7 +1849,9 @@ export class TrigEntry {
     // follows the table (2,000 was ~1 in 18 routes at live size: wiped
     // many times per rebuild, so nearly every route was written again).
     if (this.capCache.size > (this.settings.tableLean ? cacheMaxFor(2_000, this.routesSeen) : 2_000)) this.capCache.clear();
-    this.capCache.set(key, { cap, amount: t.amountIn });
+    const gen = ++this.capGen;
+    this.capCache.set(key, { cap, amount: t.amountIn, gen });
+    this.capWeak.set(cap, `${gen}|${t.amountIn}|${plan.others.join(',')}`);
     return cap;
   }
 
@@ -1636,7 +2013,7 @@ export class TrigEntry {
       const K = h.kind;
       if (this.settings.loops || K.loop.built) parts.push(`by kind (built/checked/profitable/would send/sent): pair ${K.pair.built}/${K.pair.checked}/${K.pair.profitable}/${K.pair.wouldSend}/${K.pair.sent}, loop ${K.loop.built}/${K.loop.checked}/${K.loop.profitable}/${K.loop.wouldSend}/${K.loop.sent}${h.loopErrors ? ` (loop errors ${h.loopErrors})` : ''}`);
       if (this.d.loopHourText) { try { const t = this.d.loopHourText(); if (t) parts.push(t); } catch { /* reporting only */ } }
-      if (!this.oneTripOn() && this.tableOn()) parts.push(`two steps; fast lane table ${this.tbl.pools.size} pools / ${this.tbl.lastRoutes} routes (${this.tbl.lastReused} reused unchanged), rebuilt in ${this.tbl.lastMs} ms (bot thread busy ${this.tbl.lastBusyMs} ms), sent ${this.tbl.sends}x`);
+      if (!this.oneTripOn() && this.tableOn()) parts.push(`two steps; fast lane table ${this.tbl.pools.size} pools / ${this.tbl.lastRoutes} routes (${this.tbl.lastReused} reused unchanged), rebuilt in ${this.tbl.lastMs} ms (bot thread busy ${this.tbl.lastBusyMs} ms), sent ${this.tbl.sends}x${this.settings.tableFast && this.settings.tableLean ? ` (fast table: last pass ${this.tbl.lastSkipped} pools not rebuilt, ${this.tbl.lastHeld} with only gas / coin-price changes waiting, ${this.tbl.lastRestop} stop amounts redone for gas)` : ''}`);
       if (this.oneTripOn()) parts.push(`one trip ${h.one.used}${Object.keys(h.one.why).length ? ` (two steps: ${top(h.one.why)})` : ''}; table ${this.tbl.pools.size} pools / ${this.tbl.lastRoutes} routes (${this.tbl.lastReused} reused unchanged), rebuilt in ${this.tbl.lastMs} ms`);
       const hp = HOP_NAMES.filter((k) => h.hops[k].length).map((k) => `${k} ${pctl(h.hops[k], 0.5)}/${pctl(h.hops[k], 0.9)}`);
       if (hp.length) parts.push(`hops p50/p90 ms: ${hp.join(', ')}`);
