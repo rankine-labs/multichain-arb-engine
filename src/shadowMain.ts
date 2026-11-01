@@ -78,8 +78,8 @@ import { RobinhoodChainAdapter } from './chains/robinhoodChain';
 import { createLocalSimHost, LocalSimHost, LocalCheck, LocalKind, LocalOutcome } from './execution/localSimHost';
 import { TriggerFirst, trigFirstSettings, TrigOutcome } from './execution/triggerFirst';
 import { Scoreboard, SendPath, Confidence as ScoreConfidence, standingGapFailBlock, entryFailBlock } from './report/scoreboard';
-import { TrigEntry, EntryCandidate, EntryPick, TablePool, entrySettings, enumerateRoutes, rankRoutes } from './execution/trigEntry';
-import { EntryLoopIndex, EntryLoop, EntryLoopHost, EntryLoopSender, CoinTaxFileView, LoopScoreMemo, loopIndexSettings, loopQuoteUsd, pickLoops, loopSkipText, askLoopTaxTests } from './execution/trigEntryLoops';
+import { TrigEntry, EntryCandidate, EntryPick, TablePool, entrySettings, enumerateRoutes, rankRoutes, nodeAsksOn } from './execution/trigEntry';
+import { EntryLoopIndex, EntryLoop, EntryLoopHost, EntryLoopSender, CoinTaxFileView, LoopScoreMemo, loopIndexSettings, loopQuoteUsd, pickLoops, loopSkipText, askLoopTaxTests, loopIndexNeeded } from './execution/trigEntryLoops';
 import { hasExactMath } from './core/loopFinder';
 import { runCheckFirst } from './execution/checkFirstFlow';
 import { MonadAdapter } from './chains/monad';
@@ -3128,7 +3128,14 @@ const entryLoopIndex: EntryLoopIndex<PoolState> | null = entryLoopSettings.enabl
 // paid-node use), LOOP_TAX_TESTS_PER_MIN (default 10) coins a minute. Only
 // coins already on the allowed list are tested (safety gate unchanged).
 // LOOP_TAX_TEST=0 turns it off.
-const entryLoopTaxBook: CoinTaxBook | null = entryLoopIndex && entryLoopTaxOn && !loopCfg.enabled
+// LOOP INDEX ONLY WHEN USED (Nov 1, TRIG_ENTRY_LOOP_INDEX; see
+// execution/trigEntryLoops.ts loopIndexNeeded): the index and its coin tax
+// tests are only read when this bot asks arbsim about triggers itself. With
+// the Rust fast lane deciding (TRIG_ENTRY_NODE_ASKS off) neither runs.
+// The loop sender and the loop loss numbers stay exactly as they are.
+const entryLoopIndexOn = !!entryLoopIndex && loopIndexNeeded(process.env, nodeAsksOn(process.env));
+if (entryLoopIndex && !entryLoopIndexOn) console.log('[trig-entry] loop index and its coin tax tests OFF: only read when the bot asks about triggers itself (TRIG_ENTRY_NODE_ASKS off); TRIG_ENTRY_LOOP_INDEX=1 forces them on');
+const entryLoopTaxBook: CoinTaxBook | null = entryLoopIndexOn && entryLoopTaxOn && !loopCfg.enabled
       ? (() => {
             const freeRpc = makeRpc('https://rpc.mainnet.chain.robinhood.com');
             return new CoinTaxBook(coinTaxConfigFromEnv(process.env), (token, holder) => testCoinTax(freeRpc, token, holder), {
@@ -3339,7 +3346,7 @@ try {
                         },
                   });
                   // The loop index starts building only when the entry point really works.
-                  if (trigEntry.active() && entryLoopIndex) { entryLoopIndex.start(); console.log(`[trig-entry] 3-pool loops ON (TRIG_ENTRY_LOOPS=1): up to ${es.maxLoops} loops per trigger, loop index rebuilt every ${entryLoopIndex.s.checkMs / 1000} s if the pools changed (at least every ${entryLoopIndex.s.rebuildMs / 1000} s), ${entryLoopIndex.s.perPool} loops per pool${entryLoopIndex.s.poolsMax >= 4 ? `; 4-pool loops ON (TRIG_ENTRY_LOOP_POOLS_MAX=4): ${entryLoopIndex.s.perPool4} more per pool` : ''}`); }
+                  if (trigEntry.active() && entryLoopIndex && entryLoopIndexOn) { entryLoopIndex.start(); console.log(`[trig-entry] 3-pool loops ON (TRIG_ENTRY_LOOPS=1): up to ${es.maxLoops} loops per trigger, loop index rebuilt every ${entryLoopIndex.s.checkMs / 1000} s if the pools changed (at least every ${entryLoopIndex.s.rebuildMs / 1000} s), ${entryLoopIndex.s.perPool} loops per pool${entryLoopIndex.s.poolsMax >= 4 ? `; 4-pool loops ON (TRIG_ENTRY_LOOP_POOLS_MAX=4): ${entryLoopIndex.s.perPool4} more per pool` : ''}`); }
             }
       }
 } catch (e) { console.log(`[trigger-first] could not start (${(e as Error).message}); the existing paths decide`); trigFirst = null; trigEntry = null; }

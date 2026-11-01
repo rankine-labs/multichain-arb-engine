@@ -533,6 +533,59 @@ export class PairWatcher {
     return [a.toLowerCase(), b.toLowerCase()].sort().join('/');
   }
 
+  // DISCOVERY BACKOFF (Nov 1, PAIR_DISCOVERY_BACKOFF, default on; 0 = old).
+  // Plain English: when a pair's pool lookup failed (live: almost always the
+  // free node refusing a burst, "exceeded maximum retry limit"), the next
+  // trade on that pair asked again at once, and the log printed one warning
+  // per try ("robinhood discovery failed" spam). Now a failed pair waits
+  // 30 s before it is tried again, doubling each time up to 15 min; one
+  // success clears it. Warnings are grouped: the first of each kind at once,
+  // then one summary line every 5 minutes with the counts.
+  // Pairs that never failed are untouched (same lookups, same order).
+  private failWait = new Map<string, { until: number; n: number }>();
+  private failLog = new Map<string, number>(); // short reason -> count since the last summary
+  private failLogAt = 0;
+  private failSkipped = 0;                       // trades that did not retry a waiting pair
+  private backoffOn(): boolean { return process.env.PAIR_DISCOVERY_BACKOFF !== '0'; }
+  static FAIL_BASE_MS = 30_000;
+  static FAIL_MAX_MS = 15 * 60_000;
+  static FAIL_LOG_MS = 5 * 60_000;
+
+  // How long a pair waits after its n-th failure in a row (30 s, 60 s, ... 15 min).
+  static failWaitMs(n: number): number {
+    return Math.min(PairWatcher.FAIL_MAX_MS, PairWatcher.FAIL_BASE_MS * 2 ** Math.max(0, Math.min(10, n - 1)));
+  }
+
+  // One failed lookup: remember the wait, write the grouped warning.
+  private noteDiscoveryFail(k: string, err: unknown, now = Date.now()): void {
+    const msg = String((err as Error)?.message ?? err);
+    if (!this.backoffOn()) { console.warn(`[pairs] ${this.chain} discovery failed:`, msg); return; }
+    const n = (this.failWait.get(k)?.n ?? 0) + 1;
+    this.failWait.set(k, { until: now + PairWatcher.failWaitMs(n), n });
+    if (this.failWait.size > 5_000) for (const [x, v] of this.failWait) if (v.until < now) this.failWait.delete(x);
+    // Short reason (no node URL, no request details): the text before the first "(".
+    const why = msg.split('(')[0].replace(/https?:\/\/\S+/g, '<node>').trim().slice(0, 80) || 'unknown error';
+    const first = !this.failLog.has(why);
+    this.failLog.set(why, (this.failLog.get(why) ?? 0) + 1);
+    if (first) console.warn(`[pairs] ${this.chain} discovery failed: ${why} (that pair waits ${Math.round(PairWatcher.failWaitMs(n) / 1000)} s before the next try; repeats are counted, summary every ${PairWatcher.FAIL_LOG_MS / 60_000} min)`);
+    this.flushFailLog(now);
+  }
+  // The 5-minute summary of grouped discovery warnings (nothing when quiet).
+  private flushFailLog(now = Date.now()): void {
+    if (!this.failLogAt) { this.failLogAt = now; return; }
+    if (now - this.failLogAt < PairWatcher.FAIL_LOG_MS) return;
+    const total = [...this.failLog.values()].reduce((s, x) => s + x, 0);
+    if (total > 0) {
+      const parts = [...this.failLog].sort((x, y) => y[1] - x[1]).map(([w, c]) => `${w} ${c}x`).join(', ');
+      console.warn(`[pairs] ${this.chain} discovery failed ${total}x in the last ${Math.round((now - this.failLogAt) / 60_000)} min (${parts}); ${this.failWait.size} pair(s) waiting to retry, ${this.failSkipped} trade(s) did not retry a waiting pair`);
+    }
+    this.failLog.clear();
+    this.failSkipped = 0;
+    this.failLogAt = now;
+  }
+  // For tests / status: pairs currently waiting after a failure.
+  failWaitCount(now = Date.now()): number { let n = 0; for (const v of this.failWait.values()) if (v.until > now) n++; return n; }
+
   // Note a trade on (a, b). Starts discovery if the pair is new or stale.
   // Never throws, never blocks the caller.
   touch(a: string, b: string): void {
@@ -541,6 +594,9 @@ export class PairWatcher {
     const entry = this.pairs.get(k);
     if (entry) entry.lastSeen = now;
     if (this.inFlight.has(k)) return;
+    // DISCOVERY BACKOFF: a pair whose last lookup failed waits its turn.
+    const fw = this.backoffOn() ? this.failWait.get(k) : undefined;
+    if (fw && now < fw.until) { this.failSkipped++; return; }
     if (entry && now - entry.discoveredAt < this.rediscoverMs) return;
     const single = this.singlePool.get(k);
     if (single !== undefined && now - single < this.singlePoolRecheckMs) return;
@@ -559,8 +615,9 @@ export class PairWatcher {
         const { a, b } = this.queue.shift()!;
         try {
           await this.discover(a, b);
+          this.failWait.delete(this.key(a, b)); // a lookup that worked clears the wait
         } catch (err) {
-          console.warn(`[pairs] ${this.chain} discovery failed:`, (err as Error).message);
+          this.noteDiscoveryFail(this.key(a, b), err);
         } finally {
           this.inFlight.delete(this.key(a, b));
         }

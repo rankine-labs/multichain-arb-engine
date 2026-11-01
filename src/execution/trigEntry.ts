@@ -6,6 +6,7 @@ import { TriggerFirst, TrigOutcome, TrigConfidence, TrigQuestion, CannedAnswer, 
 import { loopLag } from '../core/loopLag';
 import { stallFinder, markStretch } from '../core/stallFinder';
 import * as fs from 'fs';
+import { createHash } from 'crypto';
 
 // SEEN LOG (Oct 24, owner approved): one short line per feed transaction
 // fire-first looked at (or dropped): "<ms> <hash> <outcome>", outcome =
@@ -193,6 +194,7 @@ export type EntrySettings = {
   maxLoops: number;              // TRIG_ENTRY_MAX_LOOPS [4] loop candidates built and checked per trigger (on top of TRIG_ENTRY_MAX_CANDIDATES)
   fastlaneFacts: boolean;        // FASTLANE=practice|live: table rows also carry "f" facts for the Rust scanner (off = as before)
   nodeAsks: boolean;             // TRIG_ENTRY_NODE_ASKS [on; off by default when the Rust fast lane decides] the bot asks arbsim about feed triggers itself (see nodeAsksOn)
+  tableLean: boolean;            // TRIG_ENTRY_TABLE_LEAN [1] lean table: caches sized to the table, short fingerprints, no answer look-ups kept when the bot never asks (0 = exactly as before; see LEAN TABLE)
 };
 
 export function entrySettings(env: Record<string, string | undefined> = process.env, minNetUsd = 0.25): EntrySettings {
@@ -224,7 +226,49 @@ export function entrySettings(env: Record<string, string | undefined> = process.
     maxLoops: Math.round(num('TRIG_ENTRY_MAX_LOOPS', 4, 0)),
     fastlaneFacts: fastlaneFactsOn(env),
     nodeAsks: nodeAsksOn(env),
+    tableLean: (env.TRIG_ENTRY_TABLE_LEAN ?? '1').trim() !== '0',
   };
+}
+
+// ----------------------------------------------------------------------------
+// LEAN TABLE (Nov 1, TRIG_ENTRY_TABLE_LEAN, default on; 0 = exactly as before)
+//
+// Plain English: the fast-lane table grew from ~800 to ~1,700 pools (~37,000
+// routes), and three things in its rebuild (once a second) did not grow
+// with it:
+//   1. The "written-down question" cache (capCache) kept 2,000 entries and
+//      the reuse memory (tblMemo) 20,000. With 37,000 routes both filled up
+//      and were wiped many times per rebuild, so nearly every route wrote its
+//      check question again from scratch (ABI encoding + hashing, the most
+//      expensive step). Offline soak (scripts/soak-trig-table.ts, 1,700
+//      pools): ~7 s of main-thread work per rebuild, i.e. the table never
+//      stopped building. Now both limits follow the table's own size
+//      (cacheMaxFor): still bounded, never smaller than before.
+//   2. Every route's question was kept twice more as text: once in the
+//      reuse memory (cJson) and once inside its pool's "did it change?"
+//      fingerprint, rebuilt every second (~100 MB of text a second). Now
+//      each question's text is turned into a short digest once (sha1, when
+//      the question is written) and only the digests are kept and compared.
+//      Same "changed?" answer (a sha1 clash is not a practical risk).
+//   3. Each row's answer look-up (`meta`: the candidate with its pools, plus
+//      a hash of the question) was kept for 30 s after the row was replaced.
+//      It is only ever read when the BOT asks arbsim about a trigger in one
+//      trip; live the bot does not ask (TRIG_ENTRY_NODE_ASKS off, Rust
+//      decides), so nothing read it. Now it is kept only when it can be read.
+// What goes to arbsim (rows, ids, questions, codes, order) is unchanged:
+// tests compare every message byte for byte with the lean table on and off.
+// ----------------------------------------------------------------------------
+
+// Cache limit for a table of `routes` routes: the old fixed limit, or 1.25x
+// the table (room for routes coming and going), whichever is bigger. Hard
+// cap 200,000 so a broken route list can never grow it without end.
+export function cacheMaxFor(oldMax: number, routes: number): number {
+  return Math.min(200_000, Math.max(oldMax, Math.ceil(routes * 1.25)));
+}
+
+// Short fingerprint of a question's text (see LEAN TABLE 2).
+export function textDigest(s: string): string {
+  return createHash('sha1').update(s).digest('base64');
 }
 
 // SPEED FIX (Oct 28, live measurement): with the Rust fast lane deciding,
@@ -1228,6 +1272,13 @@ export class TrigEntry {
       const sizesKey = this.settings.sizesUsd.join(',');
       const fresh = new Map<string, { fp: string; rows: Array<Record<string, unknown>>; metas: Array<TableMeta | null> }>();
       let routes = 0, reused = 0;
+      // LEAN TABLE (see the note at entrySettings): digests instead of
+      // question text, cache limits that follow the table, and answer
+      // look-ups (meta, sig) only when the bot itself may read them (it asks
+      // arbsim in one trip). Off = exactly the old behaviour.
+      const lean = this.settings.tableLean;
+      const keepMeta = !lean || (this.oneTripOn() && this.settings.nodeAsks);
+      const memoMax = () => (lean ? cacheMaxFor(20_000, Math.max(T.lastRoutes, routes)) : 20_000);
       for (const tp of src) {
         const key = (tp.pool ?? '').toLowerCase();
         if (!key || fresh.has(key)) continue;
@@ -1239,6 +1290,7 @@ export class TrigEntry {
         const fps: string[] = [];
         for (const r of rs) {
           routes++;
+          this.routesSeen = Math.max(this.routesSeen, routes); // capCache limit (captureFor)
           if (performance.now() - slice > 2) await pause();
           let cand: EntryCandidate | null = null;
           try { cand = r.build(); } catch { cand = null; }
@@ -1267,12 +1319,15 @@ export class TrigEntry {
                   route: cand.keys.filter((k): k is string => typeof k === 'string' && VALID_KEY.test(k)).map((k) => k.toLowerCase()),
                   stop: hex(stop), amt: hex(plan.b.trade.amountIn),
                 };
-                meta.sig = checkSig(cap.data, cap.overrides, cap.sizes);
+                // The answer look-up's hash: only needed when it can be read (LEAN TABLE 3).
+                if (keepMeta) meta.sig = checkSig(cap.data, cap.overrides, cap.sizes);
               } else meta.fallback = true;
             }
             cJson = c === null ? 'null' : JSON.stringify(c);
+            // LEAN TABLE 2: keep (and compare) a short digest, not the text.
+            if (lean) cJson = textDigest(cJson);
             if (reuseMs > 0 && r.inputs) {
-              if (this.tblMemo.size > 20_000) this.tblMemo.clear(); // memory bound
+              if (this.tblMemo.size > memoMax()) this.tblMemo.clear(); // memory bound
               // (Numbers only change in compactCodes, after the build: codesEpoch then moves on.)
               this.tblMemo.set(rid, { at: now, inputs: r.inputs.slice(), sameAs, codesEpoch: this.codesEpoch, c, cJson, sig: meta.sig, fallback: meta.fallback });
             } else this.tblMemo.delete(rid);
@@ -1305,7 +1360,7 @@ export class TrigEntry {
           const id = `${T.gen + 1}.${++T.seq}`;
           row.e = id;
           ids.push(id);
-          T.meta.set(id, f.metas[i]!);
+          if (keepMeta) T.meta.set(id, f.metas[i]!);
         });
         T.pools.set(key, { fp: f.fp, rows: f.rows, ids });
         changed[key] = f.rows;
@@ -1405,6 +1460,8 @@ export class TrigEntry {
   // changes too). If that ever differs from a fresh build, the answer is
   // simply not recognised and that candidate is checked the old way.
   private readonly capCache = new Map<string, { cap: CapturedCheck; amount: bigint }>();
+  // Most routes the table has listed (any rebuild): sizes capCache (LEAN TABLE 1).
+  private routesSeen = 0;
   private async captureFor(cand: EntryCandidate, plan: NonNullable<ReturnType<typeof ladderPlan>>): Promise<CapturedCheck | null> {
     const t = plan.b.trade;
     const key = JSON.stringify({ token: t.token, hops: t.hops, o: plan.b.simOpts, n: plan.others.length }, (_k, v) => (typeof v === 'bigint' ? v.toString() : v));
@@ -1413,7 +1470,10 @@ export class TrigEntry {
     const q: TrigQuestion = { trade: t, simOpts: plan.b.simOpts, triggerHash: '', seenMs: 0, keys: cand.keys, label: cand.label };
     const cap = await this.d.tf.capture(q, plan.others);
     if (!cap) return null;
-    if (this.capCache.size > 2_000) this.capCache.clear(); // memory bound
+    // Memory bound. LEAN TABLE 1: one entry per route shape, so the limit
+    // follows the table (2,000 was ~1 in 18 routes at live size: wiped
+    // many times per rebuild, so nearly every route was written again).
+    if (this.capCache.size > (this.settings.tableLean ? cacheMaxFor(2_000, this.routesSeen) : 2_000)) this.capCache.clear();
     this.capCache.set(key, { cap, amount: t.amountIn });
     return cap;
   }

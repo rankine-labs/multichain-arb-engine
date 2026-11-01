@@ -29,6 +29,17 @@ const Q96 = 1n << 96n;
 // ----------------------------------------------------------------------------
 const PIPS = 1_000_000n; // 100% in pips
 
+// ZERO GUARD (Nov 1). Plain English: a pool with no price yet (sqrtPriceX96 0)
+// or no money at the current price (liquidity 0, or an empty V2 side) made
+// the pool maths divide by zero. JavaScript then throws "Division by zero"
+// (its own BigInt error), which the bot caught as an "unhandled rejection" a
+// few times a day, dropping that feed trade's work. With the guard such a
+// pool simply has no quote / no prediction, the same answer as any other
+// pool the maths can't price. MATH_ZERO_GUARD=0 turns the guard off (old).
+export function mathZeroGuardOn(env: Record<string, string | undefined> = process.env): boolean {
+  return env.MATH_ZERO_GUARD !== '0';
+}
+
 // zeroForOne (optional): the trade's direction (true = tokenA/token0 in).
 // Only matters for fees seen in swap events, which are kept per direction;
 // left out = the safe choice for either direction.
@@ -71,6 +82,7 @@ export function computeAmountOut(pool: PoolState, tokenInIsA: boolean, amountIn:
 
   if (pool.poolType === 'v3') {
     if (pool.sqrtPriceX96 === undefined || pool.liquidity === undefined) return null;
+    if (mathZeroGuardOn() && pool.sqrtPriceX96 <= 0n) return null; // ZERO GUARD: no price yet
 
     // Virtual reserves at the current price within the active tick's
     // liquidity: see predictPostTradeState in poolCache.ts for the same
