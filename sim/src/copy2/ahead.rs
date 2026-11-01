@@ -158,6 +158,25 @@
 //        marked) and any pool it really moved is counted "missedUnknown",
 //        so whether the rule is safe is measured, not assumed.
 //
+//   LIVE SPEED (Oct 31 night; first observe hour live: no tip for 51% of
+//   feed messages, 4,231 "too slow" stops, each message applied 4.2 times,
+//   sure right 61 / wrong 82). All four default ON only with
+//   FASTLANE_AHEAD=observe; FASTLANE_AHEAD=on is unchanged unless set:
+//    12. FASTLANE_AHEAD_BUDGET_CLOCK=cpu: the 10 ms budget counts the CPU
+//        time this thread used, not time spent waiting for a CPU (this
+//        thread runs at a lower priority on a 2-CPU box where the bot's own
+//        process uses a whole CPU).
+//    13. FASTLANE_AHEAD_LAZY_REBASE: a new copy-2 / keeper version marks the
+//        prediction for a rebuild; it is rebuilt once, at the next feed
+//        message (a block an agreement needs is built first).
+//    14. FASTLANE_AHEAD_KEPT_REBUILD=once: a keeper re-publish of the same
+//        block (a seed came back) no longer rebuilds everything.
+//    15. FASTLANE_AHEAD_NEED_KEEPER: with the keeper on, no prediction on a
+//        base without the keeper's values of that block ("keeper_behind").
+//        Measured with live timing: those predictions were 1 right / 6
+//        wrong of the 10 sure answers. Sure answers are now also counted by
+//        base (status accuracy.keptBase / plainBase).
+//
 // API (scanner and integration):
 //   Ahead::on_feed_message(Arc<BinMsg>)            a new feed message
 //   Ahead::on_confirmed(Confirmed, moved_by_tx)     copy 2 published a version
@@ -284,12 +303,53 @@ pub struct AheadCfg {
     /// whose target is a contract the keeper holds, so the kept values
     /// they change stay current inside the prediction.
     pub keep_pick: bool,
+    /// FASTLANE_AHEAD_BUDGET_CLOCK [cpu with FASTLANE_AHEAD=observe, wall
+    /// otherwise] (live speed, Oct 31 night): what the per-message budget
+    /// (FASTLANE_AHEAD_MSG_BUDGET_MS) counts. "wall" = time on the clock,
+    /// including the time the OS gave the CPU to others: on the 2-CPU server
+    /// the bot's own process uses a whole CPU and this thread runs at a lower
+    /// priority, so most "too slow" stops were waiting, not work (live:
+    /// apply p50 0.85 ms but max 176 ms; 4,231 stops in the first hour).
+    /// "cpu" = the CPU time this thread really spent on the message.
+    pub budget_cpu: bool,
+    /// FASTLANE_AHEAD_LAZY_REBASE [on in observe, off otherwise]: a new
+    /// copy-2 version (or a keeper version) no longer re-applies every held
+    /// feed message at once; that happens when the next feed message comes
+    /// (one rebuild for several versions in between). The block a coming
+    /// agreement needs is still built first. Live: each message was applied
+    /// 4.2 times on average (143,401 applies for 34,543 messages).
+    pub lazy_rebase: bool,
+    /// FASTLANE_AHEAD_KEPT_REBUILD [once in observe, every otherwise]: when
+    /// the keeper re-publishes the SAME block (a seed came back), rebuild
+    /// the prediction only if that base had no keeper values yet. "every" =
+    /// the old rule (6,541 rebuilds in 23 minutes live). New values are used
+    /// from the next base on (~0.1 s later).
+    pub kept_rebuild_once: bool,
+    /// FASTLANE_AHEAD_NEED_KEEPER [on in observe with the keeper, off
+    /// otherwise]: with the keeper on, predict only on a base laid over with
+    /// the keeper's values of that very block. A base without them (keeper
+    /// behind) is the old "no keeper" prediction, measured offline at 1
+    /// right / 8 wrong: no tip ("keeper_behind") until the keeper's version
+    /// arrives (a keeper rebase), so it never counts as sure.
+    pub need_keeper: bool,
 }
 
 impl Default for AheadCfg {
     fn default() -> Self {
-        AheadCfg { max_blocks: 32, run_all: false, max_txs: 256, max_touchers: 4096, l2_offset: 0, trust_sender_funds: false, msg_budget_us: 10_000, routes_only: true, compare_delay: 0, revert_unsure: true, unknown_continue: false, keeper: false, keep_pick: true }
+        AheadCfg { max_blocks: 32, run_all: false, max_txs: 256, max_touchers: 4096, l2_offset: 0, trust_sender_funds: false, msg_budget_us: 10_000, routes_only: true, compare_delay: 0, revert_unsure: true, unknown_continue: false, keeper: false, keep_pick: true, budget_cpu: false, lazy_rebase: false, kept_rebuild_once: false, need_keeper: false }
     }
+}
+
+/// CPU time this thread has used, in microseconds (FASTLANE_AHEAD_BUDGET_
+/// CLOCK=cpu). 0 if the OS can't tell (then the budget never trips on it).
+pub fn thread_cpu_us() -> u64 {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: clock_gettime only writes the timespec we pass.
+    let r = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
+    if r != 0 {
+        return 0;
+    }
+    ts.tv_sec as u64 * 1_000_000 + ts.tv_nsec as u64 / 1000
 }
 
 /// Default FASTLANE_AHEAD_COMPARE_DELAY_BLOCKS of the running sidecar.
@@ -371,6 +431,20 @@ impl AheadCfg {
             unknown_continue: on_off(get("FASTLANE_AHEAD_UNKNOWN_CONTINUE").as_deref()).unwrap_or(observe),
             keeper: on_off(get("FASTLANE_AHEAD_KEEPER").as_deref()).unwrap_or(observe),
             keep_pick: on_off(get("FASTLANE_AHEAD_KEEP_PICK").as_deref()).unwrap_or(d.keep_pick),
+            // Live-speed settings (Oct 31 night): new way by default only in
+            // observe mode (it decides nothing); FASTLANE_AHEAD=on unchanged.
+            budget_cpu: match get("FASTLANE_AHEAD_BUDGET_CLOCK").map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+                Some("cpu") => true,
+                Some("wall") => false,
+                _ => observe,
+            },
+            lazy_rebase: on_off(get("FASTLANE_AHEAD_LAZY_REBASE").as_deref()).unwrap_or(observe),
+            kept_rebuild_once: match get("FASTLANE_AHEAD_KEPT_REBUILD").map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+                Some("once") => true,
+                Some("every") => false,
+                _ => observe,
+            },
+            need_keeper: on_off(get("FASTLANE_AHEAD_NEED_KEEPER").as_deref()).unwrap_or(observe),
         }
     }
 }
@@ -953,6 +1027,10 @@ struct Entry {
     apply_us: u64,
     /// When the feed message arrived (see AheadTip.feed_at).
     feed_at: Instant,
+    /// Was its base laid over with the keeper's values of that block?
+    base_kept: bool,
+    /// CPU time this thread spent applying it (microseconds).
+    cpu_us: u64,
 }
 
 /// What the prediction did with one transaction.
@@ -1024,6 +1102,8 @@ struct Pending {
     notes: Vec<TxNote>,
     /// The pool set it was predicted with (places, copy 2's not-ready pools).
     pools: Arc<PoolSet>,
+    /// Its base had the keeper's values of that block (live classification).
+    base_kept: bool,
 }
 
 /// One pool's own values in a confirmed version: a contract pool's declared
@@ -1194,6 +1274,17 @@ pub struct AheadStats {
     pub kept_values: u64,
     pub kept_rebases: u64,
     pub learned: u64,
+    /// Live classification (Oct 31 night): sure pools right / wrong, split
+    /// by whether the prediction's base had the keeper's values.
+    pub right_kept: u64,
+    pub wrong_kept: u64,
+    pub right_plain: u64,
+    pub wrong_plain: u64,
+    /// Keeper re-publishes of the base block NOT rebuilt (KEPT_REBUILD=once).
+    pub kept_skipped: u64,
+    /// CPU microseconds per applied message (ring, like apply_us).
+    pub cpu_us: Vec<u64>,
+    pub cpu_n: u64,
     /// L2: apply_us samples seen (the ring below keeps the newest MAX_TIMES).
     pub time_n: u64,
     pub stopped: HashMap<&'static str, u64>,
@@ -1243,6 +1334,8 @@ impl AheadStats {
             "notCaptured": self.not_captured, "confGone": self.conf_gone, "rebaseRewrites": self.rebase_rewrites, "settleLost": self.settle_lost, "failedWidened": self.failed_widened,
             "unknownContinued": self.unknown_continued, "missedUnknown": self.missed_unknown, "tips": self.tips,
             "keptBases": self.kept_bases, "keptMissing": self.kept_missing, "keptValues": self.kept_values, "keptRebases": self.kept_rebases, "learned": self.learned,
+            "rightKeptBase": self.right_kept, "wrongKeptBase": self.wrong_kept, "rightPlainBase": self.right_plain, "wrongPlainBase": self.wrong_plain, "keptSkipped": self.kept_skipped,
+            "applyCpuUs": if times { let mut c = self.cpu_us.clone(); crate::timing::pct_of(&mut c) } else { Value::Null },
             // How many blocks the tip was ahead of copy 2 (per feed message, 0 = no tip).
             "aheadBlocks": if times { let mut b = self.ahead_blocks.clone(); crate::timing::pct_of(&mut b) } else { Value::Null },
         });
@@ -1260,14 +1353,18 @@ impl AheadStats {
         let mut b = self.ahead_blocks.clone();
         let pb = crate::timing::pct_of(&mut b);
         let ab = |k: &str| pb.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
+        let mut c = self.cpu_us.clone();
+        let pc = crate::timing::pct_of(&mut c);
+        let cp = |k: &str| pc.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
         let mut stops: Vec<String> = self.stopped.iter().map(|(k, v)| format!("{k}:{v}")).collect();
         stops.sort();
         format!(
-            "[arbsim] fastlane ahead (last hour): msgs {} applied {} late {} | txs run {} skipped {} off-route {} failed {} (pools unsure {}, nothing found {}, v4 only {}, probes skipped {}, widened {}) filterMissed {} assumedUnsure {} nativePicks {} | apply us p50 {} p90 {} p99 {} max {} | rebases {} (rewrites {}) reapplied {} | agree {} disagree {} (missed {} [filter {} ran {} reverted {} failed {} off-route {}] phantom {} value {}; stale base {}) unsure {} not from a tx {} conf gone {} unpredicted {} base late {} | msgs while stopped {} over budget {} | stopped [{}] | unknown continued {} (missed {}) | tips {} blocks ahead p50 {} p90 {}",
+            "[arbsim] fastlane ahead (last hour): msgs {} applied {} late {} | txs run {} skipped {} off-route {} failed {} (pools unsure {}, nothing found {}, v4 only {}, probes skipped {}, widened {}) filterMissed {} assumedUnsure {} nativePicks {} | apply us p50 {} p90 {} p99 {} max {} | rebases {} (rewrites {}) reapplied {} | agree {} disagree {} (missed {} [filter {} ran {} reverted {} failed {} off-route {}] phantom {} value {}; stale base {}) unsure {} not from a tx {} conf gone {} unpredicted {} base late {} | msgs while stopped {} over budget {} | stopped [{}] | unknown continued {} (missed {}) | tips {} blocks ahead p50 {} p90 {} | sure on keeper base right {} wrong {}, on plain base right {} wrong {} | apply cpu us p50 {} p90 {}",
             self.msgs, self.applied, self.late_msgs, self.txs_run, self.txs_skipped, self.txs_off_route, self.txs_failed, self.txs_marked, self.failed_unknown, self.v4_fallback, self.probes_skipped, self.failed_widened, self.filter_missed, self.assumed_unsure, self.native_picks,
             g("p50"), g("p90"), g("p99"), g("max"), self.rebases, self.rebase_rewrites, self.reapplied,
             self.agree, self.disagree, self.missed, self.missed_filter, self.missed_ran, self.missed_reverted, self.missed_failed, self.missed_off_route, self.phantom, self.value_diff, self.stale_base, self.unsure, self.not_from_tx, self.conf_gone, self.unpredicted, self.base_late, self.msgs_stopped, self.over_budget, stops.join(" "),
             self.unknown_continued, self.missed_unknown, self.tips, ab("p50"), ab("p90"),
+            self.right_kept, self.wrong_kept, self.right_plain, self.wrong_plain, cp("p50"), cp("p90"),
         )
     }
 
@@ -1281,6 +1378,17 @@ impl AheadStats {
             self.ahead_blocks[i] = blocks;
         }
         self.ahead_n += 1;
+    }
+
+    /// CPU time of one applied message (ring of the newest MAX_TIMES).
+    fn add_cpu(&mut self, us: u64) {
+        if self.cpu_us.len() < MAX_TIMES {
+            self.cpu_us.push(us);
+        } else {
+            let i = (self.cpu_n % MAX_TIMES as u64) as usize;
+            self.cpu_us[i] = us;
+        }
+        self.cpu_n += 1;
     }
 
     /// L2 (review): a ring of the newest MAX_TIMES samples, so the
@@ -1514,6 +1622,11 @@ impl Ahead {
         }
     }
 
+    /// Is `base` laid over with the keeper's values of exactly its block?
+    fn merged_for_base(&self, base: &Confirmed) -> bool {
+        self.merged.as_ref().is_some_and(|m| m.seq == base.seq && Arc::ptr_eq(&m.base_snap, &base.snap))
+    }
+
     /// KEEPER: lay the keeper's version of the base block over the base
     /// (copy2/keeper.rs merge_base: the keeper's exact values win).
     /// Returns whether the merged base changed.
@@ -1553,6 +1666,13 @@ impl Ahead {
         while self.kept.len() > 64 {
             self.kept.pop_front();
         }
+        // FASTLANE_AHEAD_KEPT_REBUILD=once: the base already has the
+        // keeper's values of its block; a re-publish (a seed came back) is
+        // used from the next base on, not by rebuilding everything now.
+        if self.cfg.kept_rebuild_once && self.base_block() == Some(v.block) && self.base.as_ref().is_some_and(|b| self.merged_for_base(b)) {
+            self.count(|s| s.kept_skipped += 1);
+            return;
+        }
         if self.base_block() == Some(v.block) && self.remerge() {
             self.count(|s| s.kept_rebases += 1);
             self.rebuild();
@@ -1569,6 +1689,11 @@ impl Ahead {
         match self.over_budget_seq {
             Some(s) if s > seq => self.stop = Some(Stop { seq: s, why: "msg_budget" }),
             _ => self.over_budget_seq = None,
+        }
+        if self.cfg.lazy_rebase {
+            // FASTLANE_AHEAD_LAZY_REBASE: rebuilt when the next feed message
+            // comes (or an agreement needs a block).
+            return;
         }
         let before = self.hour.applied;
         self.extend();
@@ -1756,6 +1881,15 @@ impl Ahead {
             self.entries[i].notes = notes;
         }
         if first_time {
+            // FASTLANE_AHEAD_LAZY_REBASE: the predicted block this version
+            // is compared with may not be built yet (several versions came
+            // in a row): build up to it on the CURRENT base first.
+            if self.cfg.lazy_rebase && !self.entries.iter().any(|e| e.seq == c.seq) {
+                let before = self.hour.applied;
+                self.extend_to(Some(c.seq));
+                let n = self.hour.applied - before;
+                self.count(|s| s.reapplied += n);
+            }
             self.queue_agreement(&c, moved_by_tx);
         }
         self.count(|s| s.rebases += 1);
@@ -1781,6 +1915,10 @@ impl Ahead {
             _ => self.over_budget_seq = None,
         }
         self.msgs = self.msgs.split_off(&(seq + 1));
+        if self.cfg.lazy_rebase {
+            // Re-applied when the next feed message comes (see rebuild).
+            return;
+        }
         let before = self.hour.applied;
         self.extend();
         let n = self.hour.applied - before;
@@ -1813,6 +1951,7 @@ impl Ahead {
             unsure_cum: e.unsure_cum.clone(),
             notes: e.notes.clone(),
             pools: self.pools.clone(),
+            base_kept: e.base_kept,
         };
         if self.cfg.compare_delay == 0 {
             let mut keys: Vec<&String> = p.changed_cum.iter().collect();
@@ -1881,8 +2020,16 @@ impl Ahead {
                 Some(Some(v)) => v,
             };
             let diffs = place_diffs(place, &p.snap, conf);
+            let kept = p.base_kept;
             if diffs.is_empty() {
-                self.count(|s| s.agree += 1);
+                self.count(|s| {
+                    s.agree += 1;
+                    if kept {
+                        s.right_kept += 1;
+                    } else {
+                        s.right_plain += 1;
+                    }
+                });
                 continue;
             }
             // Why? Copy 2's reports say which transaction moved it; find it
@@ -1920,6 +2067,11 @@ impl Ahead {
             let stale = st.prev.get(k).is_some_and(|pv| place_vals(place, &p.base_snap) != *pv);
             self.count(|s| {
                 s.disagree += 1;
+                if kept {
+                    s.wrong_kept += 1;
+                } else {
+                    s.wrong_plain += 1;
+                }
                 if stale {
                     s.stale_base += 1;
                     return;
@@ -1952,6 +2104,7 @@ impl Ahead {
             "slots": diffs.iter().take(MAX_SLOT_DIFFS).map(|(sl, pr, cf)| json!({"slot": hx(sl), "pred": match pr { Lookup::Known(v) => json!(hx(v)), Lookup::Missing => Value::Null }, "conf": hx(cf)})).collect::<Vec<_>>(),
             "slotsDiffering": diffs.len(),
             "confMoved": st.moved.iter().any(|x| x == k), "predMoved": p.changed_cum.contains(k),
+            "baseKept": p.base_kept,
         });
         if kind != cause {
             sm["cause"] = json!(cause);
@@ -2012,13 +2165,30 @@ impl Ahead {
 
     /// Apply every held message that follows the predicted tip.
     fn extend(&mut self) {
+        self.extend_to(None);
+    }
+
+    /// `extend`, but only up to message `limit` (None = all held).
+    fn extend_to(&mut self, limit: Option<u64>) {
         let Some(base) = self.base.clone() else { return };
         if self.stop.is_some() {
+            return;
+        }
+        // FASTLANE_AHEAD_NEED_KEEPER: no prediction on a base without the
+        // keeper's values of that block (the keeper is behind): it would be
+        // the old "no keeper" prediction. Waits for the keeper's version
+        // (on_kept rebuilds and clears this stop).
+        if self.cfg.keeper && self.cfg.need_keeper && !self.merged_for_base(&base) && self.msgs.contains_key(&(base.seq + 1)) {
+            self.halt(base.seq + 1, "keeper_behind");
             return;
         }
         loop {
             let tip_seq = self.entries.back().map_or(base.seq, |e| e.seq);
             let next = tip_seq + 1;
+            if limit.is_some_and(|l| next > l) {
+                // Built far enough for now: no tip change.
+                return;
+            }
             let Some(m) = self.msgs.get(&next).cloned() else { break };
             if self.entries.len() >= self.cfg.max_blocks {
                 // The confirmed copy is too far behind: stop (no tip).
@@ -2029,7 +2199,11 @@ impl Ahead {
                 Ok(e) => {
                     self.count(|s| s.applied += 1);
                     let us = e.apply_us;
-                    self.count(|s| s.add_time(us));
+                    let cpu = e.cpu_us;
+                    self.count(|s| {
+                        s.add_time(us);
+                        s.add_cpu(cpu);
+                    });
                     self.entries.push_back(e);
                 }
                 Err(why) => {
@@ -2180,6 +2354,8 @@ impl Ahead {
     /// Apply one message on top of the predicted tip (or the base).
     fn apply(&mut self, base: &Confirmed, m: &BinMsg) -> Result<Entry, &'static str> {
         let t0 = Instant::now();
+        let c0 = thread_cpu_us();
+        let base_kept = self.merged_for_base(base);
         // KEEPER: the base with the keeper's exact values of the same block
         // (and the provenance that says so); the plain base otherwise.
         let (base_snap, base_prov) = self.base_parts(base);
@@ -2238,7 +2414,10 @@ impl Ahead {
         for (i, t) in txs.iter().enumerate() {
             // H-1: per-message time budget, looked at before every
             // transaction after the first (one run is never cut in half).
-            if i > 0 && t0.elapsed().as_micros() as u64 > self.cfg.msg_budget_us {
+            // FASTLANE_AHEAD_BUDGET_CLOCK: wall time, or (cpu) only the CPU
+            // time this thread really used (waiting for a CPU is not work).
+            let spent = if self.cfg.budget_cpu { thread_cpu_us().saturating_sub(c0) } else { t0.elapsed().as_micros() as u64 };
+            if i > 0 && spent > self.cfg.msg_budget_us {
                 return Err("msg_budget");
             }
             // One pass over the data finds everything of ours it names.
@@ -2477,6 +2656,8 @@ impl Ahead {
             built_at: Instant::now(),
             apply_us: t0.elapsed().as_micros() as u64,
             feed_at: self.arrived.get(&m.seq).copied().unwrap_or(t0),
+            base_kept,
+            cpu_us: thread_cpu_us().saturating_sub(c0),
         })
     }
 }
@@ -3174,6 +3355,9 @@ fn accuracy_json(s: &AheadStats, times: bool) -> Value {
         "blocksAhead": if times { let mut b = s.ahead_blocks.clone(); crate::timing::pct_of(&mut b) } else { Value::Null },
         "unknownContinued": s.unknown_continued, "missedUnknown": s.missed_unknown,
         "keptBasesPct": pct(s.kept_bases, s.kept_bases + s.kept_missing),
+        // Live classification: sure pools by whether the base had the
+        // keeper's values (right / wrong).
+        "keptBase": {"right": s.right_kept, "wrong": s.wrong_kept}, "plainBase": {"right": s.right_plain, "wrong": s.wrong_plain},
     })
 }
 

@@ -61,6 +61,20 @@
 //       on (default: on in observe, off with on). Otherwise no thread, no
 //       node call, no memory.
 //
+//   LIVE SPEED (Oct 31 night; live: 19 restarts in 23 minutes for falling
+//   64+ blocks behind, its version matched only half of the bases): the
+//   runtime is now pipelined (`drive_pipelined`): several block diffs out at
+//   once (FASTLANE_AHEAD_KEEP_FETCH_PAR), seeds and audits on their own lane
+//   (FASTLANE_AHEAD_KEEP_SEED_PAR), reading up to the feed's newest block
+//   (FASTLANE_AHEAD_KEEP_LEAD) so its version is ready before copy 2's; a
+//   block apply only touches the values we hold (no copy of every held key);
+//   learned values are taken as one batch; a full candidate list keeps its
+//   newcomers and candidates remember fewer values
+//   (FASTLANE_AHEAD_KEEP_CAND_SLOTS). New way by default only with
+//   FASTLANE_AHEAD=observe. The runtime talks to the world through
+//   `KeeperIo`, so `ahead-replay --live-timing` runs the very same code
+//   against a node model in real time.
+//
 //   The core (`KeeperCore`) does no I/O, so the offline replay
 //   (`arbsim ahead-replay --keeper <truth file>`) runs the very same code
 //   on recorded block diffs.
@@ -76,6 +90,8 @@ use serde_json::{json, Value};
 use crate::check::ordered::Provenance;
 use crate::state::snap::{normalize, Acct, Basics, PMap, Snapshot};
 use crate::state::{AccountDiff, MissItem, StateDiff};
+#[allow(unused_imports)]
+use std::collections::BTreeMap;
 
 // ---------------------------------------------------------------------------
 // Settings
@@ -115,6 +131,30 @@ pub struct KeeperCfg {
     pub seed_batch: usize,
     /// Most learned (not kept) candidate contracts remembered.
     pub max_candidates: usize,
+    /// FASTLANE_AHEAD_KEEP_FETCH_PAR (live speed, Oct 31 night): block
+    /// diffs asked for at the same time (a pipeline: answers are applied
+    /// strictly in block order, never with a gap). 1 = the old one-at-a-time
+    /// loop. Default: 4 with FASTLANE_AHEAD=observe, 1 otherwise. 1..=16.
+    pub fetch_par: usize,
+    /// FASTLANE_AHEAD_KEEP_SEED_PAR: seed (and audit) reads in flight at once,
+    /// on their own lane, so they never hold up the block diffs. 0 = the old
+    /// rule (one seed at a time, only while caught up, on the same thread).
+    /// Default: 2 with FASTLANE_AHEAD=observe, 0 otherwise. 0..=8.
+    pub seed_par: usize,
+    /// FASTLANE_AHEAD_KEEP_LEAD: fetch block diffs up to the newest block the
+    /// FEED has announced, not only up to copy 2's (copy 2 is ~0.5 s / ~5
+    /// blocks behind the feed, the node is not). So the keeper's version of a
+    /// block is usually ready BEFORE copy 2 publishes it, and the predicted
+    /// copy merges it at once (no second rebuild). A block the node does not
+    /// have yet is simply asked again. The "too far behind" restart still
+    /// measures against copy 2. Default: on with FASTLANE_AHEAD=observe.
+    pub lead_feed: bool,
+    /// FASTLANE_AHEAD_KEEP_CAND_SLOTS: most values remembered per contract
+    /// that is only a CANDIDATE (not kept). Kept contracts still use
+    /// FASTLANE_AHEAD_KEEP_SLOTS. Bounds the memory of the 4,096 candidates
+    /// (before: up to 2,000 values each). Default: 256 with
+    /// FASTLANE_AHEAD=observe, else = FASTLANE_AHEAD_KEEP_SLOTS (old).
+    pub cand_slots: usize,
 }
 
 impl Default for KeeperCfg {
@@ -131,6 +171,10 @@ impl Default for KeeperCfg {
             max_behind: 64,
             seed_batch: 100,
             max_candidates: 4096,
+            fetch_par: 1,
+            seed_par: 0,
+            lead_feed: false,
+            cand_slots: 2000,
         }
     }
 }
@@ -141,11 +185,20 @@ impl KeeperCfg {
         let d = KeeperCfg::default();
         let num = |k: &str, dv: u64, lo: u64, hi: u64| get(k).and_then(|v| v.trim().parse::<u64>().ok()).filter(|v| (lo..=hi).contains(v)).unwrap_or(dv);
         let am = super::ahead::AheadMode::parse(get("FASTLANE_AHEAD").as_deref());
-        let on = am != super::ahead::AheadMode::Off && super::ahead::on_off(get("FASTLANE_AHEAD_KEEPER").as_deref()).unwrap_or(am == super::ahead::AheadMode::Observe);
+        let observe = am == super::ahead::AheadMode::Observe;
+        let on = am != super::ahead::AheadMode::Off && super::ahead::on_off(get("FASTLANE_AHEAD_KEEPER").as_deref()).unwrap_or(observe);
+        let max_slots_per = num("FASTLANE_AHEAD_KEEP_SLOTS", d.max_slots_per as u64, 1, 100_000) as usize;
+        // Live-speed settings (Oct 31 night): the new way is the default only
+        // when the predicted copy just OBSERVES (it decides nothing); with
+        // FASTLANE_AHEAD=on everything stays as before unless set.
         KeeperCfg {
+            fetch_par: num("FASTLANE_AHEAD_KEEP_FETCH_PAR", if observe { 4 } else { 1 }, 1, 16) as usize,
+            seed_par: num("FASTLANE_AHEAD_KEEP_SEED_PAR", if observe { 2 } else { 0 }, 0, 8) as usize,
+            lead_feed: super::ahead::on_off(get("FASTLANE_AHEAD_KEEP_LEAD").as_deref()).unwrap_or(observe),
+            cand_slots: num("FASTLANE_AHEAD_KEEP_CAND_SLOTS", if observe { 256 } else { max_slots_per as u64 }, 1, 100_000) as usize,
             on,
             max_contracts: num("FASTLANE_AHEAD_KEEP_CONTRACTS", d.max_contracts as u64, 1, 1000) as usize,
-            max_slots_per: num("FASTLANE_AHEAD_KEEP_SLOTS", d.max_slots_per as u64, 1, 100_000) as usize,
+            max_slots_per,
             max_slots_total: num("FASTLANE_AHEAD_KEEP_MAX_SLOTS", d.max_slots_total as u64, 1, 2_000_000) as usize,
             adopt_writes: super::ahead::on_off(get("FASTLANE_AHEAD_KEEP_ADOPT").as_deref()).unwrap_or(d.adopt_writes),
             versions: d.versions,
@@ -353,6 +406,8 @@ pub struct KeeperStats {
     /// Values adopted because a block wrote them (FASTLANE_AHEAD_KEEP_ADOPT).
     pub adopted: u64,
     pub refused_full: u64,
+    /// Candidates forgotten because the list was full (weakest first).
+    pub cands_dropped: u64,
     pub audits: u64,
     pub audit_values: u64,
     pub audit_mismatch: u64,
@@ -376,7 +431,7 @@ impl KeeperStats {
         json!({
             "blocks": self.blocks, "heldTouched": self.held_touched, "valuesUpdated": self.values_updated,
             "learned": self.learned, "seedsSent": self.seeds_sent, "seedValues": self.seed_values, "seedsDropped": self.seeds_dropped,
-            "evicted": self.evicted, "recreated": self.recreated, "adopted": self.adopted, "refusedFull": self.refused_full,
+            "evicted": self.evicted, "recreated": self.recreated, "adopted": self.adopted, "refusedFull": self.refused_full, "candsDropped": self.cands_dropped,
             "audits": self.audits, "auditValues": self.audit_values, "auditMismatch": self.audit_mismatch,
             "resets": self.resets.iter().map(|(k, v)| (k.to_string(), json!(v))).collect::<serde_json::Map<String, Value>>(),
             "applyUs": crate::timing::pct_of(&mut t),
@@ -544,7 +599,10 @@ impl KeeperCore {
         let total_held: usize = self.cur.slots();
         let mut grew: Vec<Address> = Vec::new();
         for (a, (slots, basics)) in by {
-            let per = self.cfg.max_slots_per;
+            // A kept contract may hold FASTLANE_AHEAD_KEEP_SLOTS values; a
+            // mere candidate remembers at most FASTLANE_AHEAD_KEEP_CAND_SLOTS
+            // (bounded memory: 4,096 candidates x 2,000 values was possible).
+            let per = if self.held.contains(&a) { self.cfg.max_slots_per } else { self.cfg.cand_slots.min(self.cfg.max_slots_per) };
             let c = self.cands.entry(a).or_default();
             c.score += 1.0;
             c.basics |= basics;
@@ -559,13 +617,22 @@ impl KeeperCore {
             // (a seed that failed or came back too late is asked again).
             grew.push(a);
         }
-        // Bounded: forget the weakest candidates that are not kept.
+        // Bounded: forget the weakest candidates that are not kept. Live
+        // fix (Oct 31 night): never the ones named in THIS batch. Before, a
+        // full list (4,096) dropped every newcomer at once (score 1 = the
+        // lowest), so a new hot contract could never build up a score
+        // until the hourly halving.
         if self.cands.len() > self.cfg.max_candidates {
-            let mut v: Vec<(f64, Address)> = self.cands.iter().filter(|(a, _)| !self.held.contains(*a)).map(|(a, c)| (c.score, *a)).collect();
-            v.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap_or(std::cmp::Ordering::Equal));
-            let extra = self.cands.len() - self.cfg.max_candidates;
+            let fresh: HashSet<Address> = grew.iter().copied().collect();
+            let mut v: Vec<(f64, Address)> = self.cands.iter().filter(|(a, _)| !self.held.contains(*a) && !fresh.contains(*a)).map(|(a, c)| (c.score, *a)).collect();
+            let extra = (self.cands.len() - self.cfg.max_candidates).min(v.len());
+            if extra > 0 && extra < v.len() {
+                // Only the `extra` weakest are needed: a partial sort.
+                v.select_nth_unstable_by(extra - 1, |x, y| x.0.partial_cmp(&y.0).unwrap_or(std::cmp::Ordering::Equal).then(x.1.cmp(&y.1)));
+            }
             for (_, a) in v.into_iter().take(extra) {
                 self.cands.remove(&a);
+                self.stats.cands_dropped += 1;
             }
         }
         self.choose();
@@ -734,21 +801,46 @@ impl KeeperCore {
                 recreate.push(*a);
                 continue;
             }
-            let mut keys: HashSet<U256> = cur.storage.keys().copied().collect();
-            if self.cfg.adopt_writes && !cur.storage_complete {
-                for s in ad.storage.keys() {
-                    if keys.len() >= adopt_per || total >= self.cfg.max_slots_total {
-                        break;
+            // Live speed (Oct 31 night): only the written values we hold (or
+            // adopt) are applied. Before, every block copied the keys of
+            // EVERY value held for each touched contract (the V4 PoolManager:
+            // up to 20,000) and then dropped the unheld writes again: keeper
+            // apply p90 14 ms, max 316 ms live. Same result, see the test
+            // `filtered_apply_matches_the_old_one`.
+            let next = if ad.storage_cleared || cur.storage_complete || matches!(ad.info, Some(None)) || ad.forget {
+                // Created / destroyed / removed / every value known: the old
+                // path (rare; the account may become "every value known").
+                let mut keys: HashSet<U256> = cur.storage.keys().copied().collect();
+                if self.cfg.adopt_writes && !cur.storage_complete {
+                    for s in ad.storage.keys() {
+                        if keys.len() >= adopt_per || total >= self.cfg.max_slots_total {
+                            break;
+                        }
+                        if keys.insert(*s) {
+                            total += 1;
+                            self.stats.adopted += 1;
+                        }
                     }
-                    if keys.insert(*s) {
+                }
+                updated += ad.storage.keys().filter(|s| keys.contains(s)).count() as u64;
+                apply_held(*a, cur, ad, &keys)
+            } else {
+                let mut held_n = cur.storage.len();
+                let mut f = AccountDiff { info: ad.info.clone(), code: ad.code.clone(), storage: HashMap::new(), storage_cleared: false, balance_inexact: ad.balance_inexact, forget: ad.forget };
+                for (s, v) in &ad.storage {
+                    if cur.storage.contains_key(s) {
+                        f.storage.insert(*s, *v);
+                    } else if self.cfg.adopt_writes && held_n < adopt_per && total < self.cfg.max_slots_total {
+                        f.storage.insert(*s, *v);
+                        held_n += 1;
                         total += 1;
                         self.stats.adopted += 1;
                     }
                 }
-            }
-            let next = apply_held(*a, cur, ad, &keys);
+                updated += f.storage.len() as u64;
+                apply_filtered(*a, cur, &f)
+            };
             touched += 1;
-            updated += ad.storage.keys().filter(|s| keys.contains(s)).count() as u64;
             self.cur.accounts.insert(*a, next);
         }
         for a in recreate {
@@ -794,10 +886,15 @@ impl KeeperCore {
     /// against ours. A mismatch drops everything (fail closed). Returns
     /// the number of values that differ.
     pub fn audit_check(&mut self, at: u64, addr: Address, basics: Option<Option<AccountInfo>>, slots: &[(U256, U256)]) -> usize {
-        if self.head != Some(at) {
-            return 0; // moved on meanwhile: not comparable
-        }
-        let Some(held) = self.cur.accounts.get(&addr).cloned() else { return 0 };
+        // The values we held at block `at`: the current ones, or (pipelined
+        // keeper: it moved on while the audit read was out) that block's
+        // kept version. Gone = not comparable.
+        let held = if self.head == Some(at) {
+            self.cur.accounts.get(&addr).cloned()
+        } else {
+            self.version_at(at).and_then(|v| v.accounts.get(&addr).cloned())
+        };
+        let Some(held) = held else { return 0 };
         self.stats.audits += 1;
         let mut bad: Vec<String> = Vec::new();
         for (s, v) in slots {
@@ -825,7 +922,8 @@ impl KeeperCore {
             if self.stats.samples.len() < 20 {
                 self.stats.samples.push(json!({"block": at, "contract": format!("{addr:#x}"), "differ": bad.iter().take(4).collect::<Vec<_>>()}));
             }
-            self.reset(at, "audit_mismatch");
+            let h = self.head.unwrap_or(at).max(at);
+            self.reset(h, "audit_mismatch");
         }
         bad.len()
     }
@@ -846,7 +944,7 @@ impl KeeperCore {
         let (held, accts, slots) = self.held_counts();
         json!({
             "head": self.head, "contracts": held, "accounts": accts, "values": slots, "codes": self.cur.codes.len(),
-            "candidates": self.cands.len(), "seedsWaiting": self.seeds.len(), "versions": self.versions.len(),
+            "candidates": self.cands.len(), "candidateValues": self.cands.values().map(|c| c.slots.len()).sum::<usize>(), "seedsWaiting": self.seeds.len(), "versions": self.versions.len(),
             "stats": self.stats.json(),
         })
     }
@@ -869,6 +967,15 @@ fn apply_held(a: Address, cur: &Acct, ad: &AccountDiff, keys: &HashSet<U256>) ->
         }
     }
     out
+}
+
+/// `apply_held` for a change already narrowed to the values we hold (or
+/// adopt), on an account that is not "every value known": nothing to drop.
+fn apply_filtered(a: Address, cur: &Acct, ad: &AccountDiff) -> Acct {
+    let mut tmp = Snapshot::default();
+    tmp.accounts.insert(a, cur.clone());
+    tmp.apply_account_diff(a, ad);
+    tmp.accounts.get(&a).cloned().unwrap_or_default()
 }
 
 /// What the predicted copy should learn from one run: the values it lacked
@@ -972,7 +1079,7 @@ fn fetch_block(node: &dyn crate::node::NodeApi, block: u64) -> Result<Option<Vec
 
 /// One seed (or audit) read: eth_getProof of `addr`'s `slots` at `block`,
 /// plus its code when asked. Ok((basics, code, slots)).
-type ProofAnswer = (Option<AccountInfo>, Option<Bytecode>, Vec<(U256, U256)>);
+pub type ProofAnswer = (Option<AccountInfo>, Option<Bytecode>, Vec<(U256, U256)>);
 fn fetch_proof(node: &dyn crate::node::NodeApi, addr: Address, slots: &[U256], block: u64, with_code: bool) -> Result<ProofAnswer, String> {
     use crate::check::hexutil::to_hex;
     let keys: Vec<String> = slots.iter().map(|s| format!("{s:#066x}")).collect();
@@ -1009,10 +1116,99 @@ fn fetch_proof(node: &dyn crate::node::NodeApi, addr: Address, slots: &[U256], b
 // Runtime: one thread in the running sidecar
 // ---------------------------------------------------------------------------
 
+/// What the keeper's runtime needs from the outside world: the node's
+/// answers and how far copy 2 / the feed are. Live: `LiveIo` (the paid
+/// node, copy 2's published head, the feed tip). Offline: the
+/// `ahead-replay --live-timing` node model over recorded block diffs
+/// (copy2/keeper_replay.rs `TruthIo`), so the SAME driver code is measured.
+pub trait KeeperIo: Send + Sync {
+    /// One block's changes. Ok(None) = the node does not have it yet.
+    fn block(&self, b: u64) -> Result<Option<Vec<StateDiff>>, String>;
+    /// eth_getProof of `slots` of `addr` at block `at` (+ its code if asked).
+    fn proof(&self, addr: Address, slots: &[U256], at: u64, code: bool) -> Result<ProofAnswer, String>;
+    /// Copy 2's newest published block (None = not started).
+    fn copy2_head(&self) -> Option<u64>;
+    /// The newest block the feed has announced (None = unknown).
+    fn feed_head(&self) -> Option<u64>;
+    /// Node usage counters for status.
+    fn usage(&self) -> Value {
+        Value::Null
+    }
+}
+
+/// The live keeper's node and heads.
+struct LiveIo {
+    node: crate::node::NodeClient,
+    c2: super::intake::Copy2Handle,
+    l2_offset: u64,
+}
+
+impl KeeperIo for LiveIo {
+    fn block(&self, b: u64) -> Result<Option<Vec<StateDiff>>, String> {
+        fetch_block(&self.node, b)
+    }
+    fn proof(&self, addr: Address, slots: &[U256], at: u64, code: bool) -> Result<ProofAnswer, String> {
+        fetch_proof(&self.node, addr, slots, at, code)
+    }
+    fn copy2_head(&self) -> Option<u64> {
+        self.c2.sh.published.view().head().map(|v| v.block)
+    }
+    fn feed_head(&self) -> Option<u64> {
+        crate::check::feedstore::feed_tip().map(|(s, _)| s + self.l2_offset)
+    }
+    fn usage(&self) -> Value {
+        crate::node::NodeApi::usage(&self.node)
+    }
+}
+
+/// Where the keeper's runtime hands its results (live: the process-wide
+/// RT; replay: its own).
+#[derive(Clone)]
+pub struct Sink {
+    pub versions: Arc<Mutex<VecDeque<Arc<KeptVersion>>>>,
+    pub status: Arc<Mutex<Value>>,
+    /// Called after every new version (live: wakes the predicted copy).
+    pub on_publish: Arc<dyn Fn() + Send + Sync>,
+    /// Set = the runtime returns (replay end; never set live).
+    pub stop: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Sink {
+    pub fn new(on_publish: Arc<dyn Fn() + Send + Sync>) -> Sink {
+        Sink { versions: Default::default(), status: Arc::new(Mutex::new(json!({}))), on_publish, stop: Default::default() }
+    }
+    /// The version of exactly `block` (None = not held).
+    pub fn version_at(&self, block: u64) -> Option<Arc<KeptVersion>> {
+        let v = self.versions.lock().unwrap_or_else(|e| e.into_inner());
+        v.iter().rev().find(|x| x.block == block).cloned()
+    }
+    fn publish(&self, k: &KeeperCore, keep: usize) {
+        if let Some(v) = k.latest() {
+            let mut g = self.versions.lock().unwrap_or_else(|e| e.into_inner());
+            if g.back().is_some_and(|x| x.block == v.block) {
+                g.pop_back();
+            }
+            // A restart can go back to an older block: never keep versions
+            // of blocks after the new one (they belong to the old run).
+            while g.back().is_some_and(|x| x.block > v.block) {
+                g.pop_back();
+            }
+            g.push_back(v.clone());
+            while g.len() > keep {
+                g.pop_front();
+            }
+            drop(g);
+            (self.on_publish)();
+        }
+    }
+    fn stopped(&self) -> bool {
+        self.stop.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
 struct Rt {
     learn: std::sync::mpsc::SyncSender<Vec<MissItem>>,
-    versions: Mutex<VecDeque<Arc<KeptVersion>>>,
-    status: Mutex<Value>,
+    sink: Sink,
     dropped: std::sync::atomic::AtomicU64,
 }
 
@@ -1032,18 +1228,24 @@ pub fn start(c2: super::intake::Copy2Handle) -> bool {
         return false;
     };
     let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<MissItem>>(1024);
-    if RT.set(Rt { learn: tx, versions: Mutex::new(VecDeque::new()), status: Mutex::new(json!({})), dropped: Default::default() }).is_err() {
+    let sink = Sink::new(Arc::new(super::ahead::kept_hook));
+    if RT.set(Rt { learn: tx, sink: sink.clone(), dropped: Default::default() }).is_err() {
         return false;
     }
     eprintln!(
-        "[arbsim] fastlane keeper ON: keeps up to {} hot contracts exact (one block diff per block; no daily allowance or own speed limit)",
-        cfg.max_contracts
+        "[arbsim] fastlane keeper ON: keeps up to {} hot contracts exact (block diffs {} at a time{}, seeds {}; no daily allowance or own speed limit)",
+        cfg.max_contracts,
+        cfg.fetch_par,
+        if cfg.lead_feed { ", up to the feed's newest block" } else { "" },
+        if cfg.seed_par == 0 { "only while caught up".to_string() } else { format!("{} at a time on their own lane", cfg.seed_par) },
     );
+    let l2_offset = c2.sh.cfg.l2_offset;
+    let io: Arc<dyn KeeperIo> = Arc::new(LiveIo { node, c2, l2_offset });
     std::thread::Builder::new()
         .name("arbsim-keeper".into())
         .spawn(move || {
             crate::fastlane::mode::lower_this_thread_from_env("arbsim-keeper");
-            run_loop(c2, node, cfg, rx)
+            drive(io, cfg, rx, sink)
         })
         .is_ok()
 }
@@ -1066,33 +1268,89 @@ pub fn running() -> bool {
 
 /// The keeper's version of exactly `block` (None = off / not held).
 pub fn version_at(block: u64) -> Option<Arc<KeptVersion>> {
-    let rt = RT.get()?;
-    let v = rt.versions.lock().unwrap_or_else(|e| e.into_inner());
-    v.iter().rev().find(|x| x.block == block).cloned()
+    RT.get()?.sink.version_at(block)
 }
 
 /// The keeper's newest version (None = off / not started).
 pub fn latest() -> Option<Arc<KeptVersion>> {
     let rt = RT.get()?;
-    let v = rt.versions.lock().unwrap_or_else(|e| e.into_inner());
+    let v = rt.sink.versions.lock().unwrap_or_else(|e| e.into_inner());
     v.back().cloned()
 }
 
 /// status "fastlaneKeeper" (None when off).
 pub fn status_json() -> Option<Value> {
     let rt = RT.get()?;
-    let mut v = rt.status.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let mut v = rt.sink.status.lock().unwrap_or_else(|e| e.into_inner()).clone();
     v["learnDropped"] = json!(rt.dropped.load(std::sync::atomic::Ordering::Relaxed));
     Some(v)
 }
 
-/// Copy 2's newest block (the node has it: its reports came from the node).
-fn copy2_head(c2: &super::intake::Copy2Handle) -> Option<u64> {
-    c2.sh.published.view().head().map(|v| v.block)
+/// Everything learned since the last look, as ONE batch (live speed, Oct 31
+/// night: `learn` picks the kept contracts again each call, a sort of up to
+/// 4,096 candidates; it used to run once per batch the predicted copy sent).
+fn learn_all(k: &mut KeeperCore, rx: &std::sync::mpsc::Receiver<Vec<MissItem>>) {
+    let mut all: Vec<MissItem> = Vec::new();
+    while let Ok(items) = rx.try_recv() {
+        all.extend(items);
+    }
+    if !all.is_empty() {
+        k.learn(&all);
+    }
 }
 
-fn run_loop(c2: super::intake::Copy2Handle, node: crate::node::NodeClient, cfg: KeeperCfg, rx: std::sync::mpsc::Receiver<Vec<MissItem>>) {
-    let Some(rt) = RT.get() else { return };
+/// The keeper's runtime: the old one-at-a-time loop, or (any of the live
+/// speed settings on) the pipelined one. Returns when `sink.stop` is set.
+pub fn drive(io: Arc<dyn KeeperIo>, cfg: KeeperCfg, rx: std::sync::mpsc::Receiver<Vec<MissItem>>, sink: Sink) {
+    if cfg.fetch_par <= 1 && cfg.seed_par == 0 && !cfg.lead_feed {
+        drive_serial(io, cfg, rx, sink)
+    } else {
+        drive_pipelined(io, cfg, rx, sink)
+    }
+}
+
+/// Status of the runtime (once a second): the core's, plus calls and node.
+struct Meter {
+    calls: u64,
+    not_yet: u64,
+    since: Instant,
+    rate_refusals: u64,
+}
+
+impl Meter {
+    fn new() -> Meter {
+        Meter { calls: 0, not_yet: 0, since: Instant::now(), rate_refusals: 0 }
+    }
+    fn status(&mut self, k: &KeeperCore, io: &dyn KeeperIo, rate_wait: Duration, extra: Value) -> Value {
+        let mut st = k.status_json();
+        let el = self.since.elapsed().as_secs_f64().max(1.0);
+        st["callsPerS"] = json!((self.calls as f64 / el * 100.0).round() / 100.0);
+        st["calls"] = json!(self.calls);
+        st["notYet"] = json!(self.not_yet);
+        st["node"] = io.usage();
+        st["rateRefusals"] = json!(self.rate_refusals);
+        st["rateWaitMs"] = json!(rate_wait.as_millis() as u64);
+        st["copy2Head"] = json!(io.copy2_head());
+        st["feedHead"] = json!(io.feed_head());
+        // Blocks the keeper is behind copy 2 (negative = ahead of it).
+        st["behindCopy2"] = json!(match (io.copy2_head(), k.head()) {
+            (Some(c), Some(h)) => c as i64 - h as i64,
+            _ => 0,
+        });
+        st["pipeline"] = extra;
+        if self.since.elapsed() >= Duration::from_secs(3600) {
+            self.since = Instant::now();
+            self.calls = 0;
+            self.not_yet = 0;
+        }
+        st
+    }
+}
+
+/// The original runtime (Oct 31): one block diff at a time; seeds and audits
+/// only while caught up, on the same thread. Kept as is (FASTLANE_AHEAD_KEEP_
+/// FETCH_PAR=1, _SEED_PAR=0, _LEAD=off) for before / after.
+fn drive_serial(io: Arc<dyn KeeperIo>, cfg: KeeperCfg, rx: std::sync::mpsc::Receiver<Vec<MissItem>>, sink: Sink) {
     let mut k = KeeperCore::new(cfg.clone());
     let mut errors = 0u32;
     let mut last_seen: Option<u64> = None;
@@ -1100,28 +1358,13 @@ fn run_loop(c2: super::intake::Copy2Handle, node: crate::node::NodeClient, cfg: 
     let mut seeds_hour = 0u64;
     let mut audit_at = Instant::now();
     let mut status_at = Instant::now();
-    let mut calls = 0u64;
-    let mut calls_hour_start = Instant::now();
+    let mut m = Meter::new();
     // Provider said "too fast": wait this long before the next call
     // (doubles while it keeps refusing, 100 ms .. 5 s; back to 0 on success).
     let mut rate_wait = Duration::ZERO;
-    let mut rate_refusals = 0u64;
-    let publish = |k: &KeeperCore| {
-        if let Some(v) = k.latest() {
-            let mut g = rt.versions.lock().unwrap_or_else(|e| e.into_inner());
-            if g.back().is_some_and(|x| x.block == v.block) {
-                g.pop_back();
-            }
-            g.push_back(v.clone());
-            while g.len() > cfg.versions {
-                g.pop_front();
-            }
-            drop(g);
-            super::ahead::kept_hook();
-        }
-    };
-    loop {
-        // Learned values from the predicted copy (all queued).
+    while !sink.stopped() {
+        // Learned values from the predicted copy (all queued; the old loop
+        // handed them over one batch at a time).
         while let Ok(items) = rx.try_recv() {
             k.learn(&items);
         }
@@ -1133,58 +1376,54 @@ fn run_loop(c2: super::intake::Copy2Handle, node: crate::node::NodeClient, cfg: 
         }
         if status_at.elapsed() >= Duration::from_secs(1) {
             status_at = Instant::now();
-            let mut st = k.status_json();
-            let el = calls_hour_start.elapsed().as_secs_f64().max(1.0);
-            st["callsPerS"] = json!((calls as f64 / el * 100.0).round() / 100.0);
-            st["calls"] = json!(calls);
-            st["node"] = crate::node::NodeApi::usage(&node);
-            st["rateRefusals"] = json!(rate_refusals);
-            st["rateWaitMs"] = json!(rate_wait.as_millis() as u64);
-            *rt.status.lock().unwrap_or_else(|e| e.into_inner()) = st;
+            *sink.status.lock().unwrap_or_else(|e| e.into_inner()) = m.status(&k, io.as_ref(), rate_wait, json!({"mode": "serial"}));
         }
-        let Some(target) = copy2_head(&c2) else {
+        let Some(target) = io.copy2_head() else {
             std::thread::sleep(Duration::from_millis(50));
             continue;
         };
         // Copy 2 went backwards (a reorg / restart): start again there.
         if last_seen.is_some_and(|l| target < l) {
             k.reset(target, "copy2_backwards");
-            publish(&k);
+            sink.publish(&k, cfg.versions);
         }
         last_seen = Some(target);
         let head = match k.head() {
             None => {
                 k.start_at(target);
-                publish(&k);
+                sink.publish(&k, cfg.versions);
                 target
             }
             Some(h) if target > h + cfg.max_behind => {
                 k.reset(target, "behind");
-                publish(&k);
+                sink.publish(&k, cfg.versions);
                 target
             }
             Some(h) => h,
         };
         if head < target {
             // KEEP EXACT: the next block's changes.
-            calls += 1;
-            match fetch_block(&node, head + 1) {
+            m.calls += 1;
+            match io.block(head + 1) {
                 Ok(Some(txs)) => {
                     errors = 0;
                     rate_wait = Duration::ZERO;
                     if k.apply_block(head + 1, &txs).is_err() {
                         k.reset(target, "gap");
                     }
-                    publish(&k);
+                    sink.publish(&k, cfg.versions);
                 }
-                Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+                Ok(None) => {
+                    m.not_yet += 1;
+                    std::thread::sleep(Duration::from_millis(20))
+                }
                 Err(e) => {
                     if crate::node::is_rate_refusal(0, &e) {
                         // The provider said "too fast" (shared handling:
                         // node.rs already halved the rate). Not an error:
                         // wait a little longer each time, retry the same
                         // block. Falling too far behind still restarts it.
-                        rate_refusals += 1;
+                        m.rate_refusals += 1;
                         rate_wait = (rate_wait * 2).clamp(Duration::from_millis(100), Duration::from_secs(5));
                         std::thread::sleep(rate_wait);
                         continue;
@@ -1192,7 +1431,7 @@ fn run_loop(c2: super::intake::Copy2Handle, node: crate::node::NodeClient, cfg: 
                     errors += 1;
                     if errors >= 20 {
                         k.reset(target, "node_errors");
-                        publish(&k);
+                        sink.publish(&k, cfg.versions);
                         errors = 0;
                         std::thread::sleep(Duration::from_millis(500));
                     } else {
@@ -1207,9 +1446,9 @@ fn run_loop(c2: super::intake::Copy2Handle, node: crate::node::NodeClient, cfg: 
         if cfg.seeds_per_hour == 0 || seeds_hour < cfg.seeds_per_hour {
             if let Some(job) = k.take_job() {
                 seeds_hour += 1;
-                calls += 1;
+                m.calls += 1;
                 let need_code = job.basics;
-                let ans = match fetch_proof(&node, job.addr, &job.slots, head, need_code) {
+                let ans = match io.proof(job.addr, &job.slots, head, need_code) {
                     Ok((info, code, slots)) => {
                         let code = code.filter(|_| need_code);
                         Some(SeedAnswer { addr: job.addr, at: head, basics: job.basics.then_some(info), code, slots })
@@ -1217,27 +1456,294 @@ fn run_loop(c2: super::intake::Copy2Handle, node: crate::node::NodeClient, cfg: 
                     Err(_) => None,
                 };
                 k.on_seed(&job, ans);
-                publish(&k);
+                sink.publish(&k, cfg.versions);
                 continue;
             }
         }
         if cfg.audit_s > 0 && audit_at.elapsed() >= Duration::from_secs(cfg.audit_s) {
             audit_at = Instant::now();
             if let Some((a, slots)) = k.audit_pick(50) {
-                calls += 1;
-                if let Ok((info, _, vals)) = fetch_proof(&node, a, &slots, head, false) {
+                m.calls += 1;
+                if let Ok((info, _, vals)) = io.proof(a, &slots, head, false) {
                     if k.audit_check(head, a, Some(info), &vals) > 0 {
-                        publish(&k);
+                        sink.publish(&k, cfg.versions);
                     }
                 }
             }
             continue;
         }
-        if calls_hour_start.elapsed() >= Duration::from_secs(3600) {
-            calls_hour_start = Instant::now();
-            calls = 0;
-        }
         std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Work for the pipelined runtime's helper threads.
+enum Job {
+    Block(u64, u64),
+    Seed(u64, SeedJob, u64),
+    Audit(u64, Address, Vec<U256>, u64),
+}
+
+/// ... and what comes back (with the run number `gen`: answers of a run
+/// that was restarted meanwhile are thrown away).
+enum Done {
+    Block(u64, u64, Result<Option<Vec<StateDiff>>, String>),
+    Seed(u64, SeedJob, u64, Result<ProofAnswer, String>),
+    Audit(u64, Address, u64, Result<ProofAnswer, String>),
+}
+
+/// Helper threads: each takes the next job of its lane and answers it.
+fn spawn_lane(n: usize, name: &str, io: &Arc<dyn KeeperIo>, done: &std::sync::mpsc::Sender<Done>) -> Option<std::sync::mpsc::Sender<Job>> {
+    if n == 0 {
+        return None;
+    }
+    let (tx, rx) = std::sync::mpsc::channel::<Job>();
+    let rx = Arc::new(Mutex::new(rx));
+    for i in 0..n {
+        let (rx, io, done) = (rx.clone(), io.clone(), done.clone());
+        let _ = std::thread::Builder::new().name(format!("{name}-{i}")).spawn(move || {
+            crate::fastlane::mode::lower_this_thread_from_env("arbsim-keeper");
+            loop {
+                let job = {
+                    let g = rx.lock().unwrap_or_else(|e| e.into_inner());
+                    g.recv()
+                };
+                let Ok(job) = job else { return };
+                let out = match job {
+                    Job::Block(g, b) => Done::Block(g, b, io.block(b)),
+                    Job::Seed(g, j, at) => {
+                        let r = io.proof(j.addr, &j.slots, at, j.basics);
+                        Done::Seed(g, j, at, r)
+                    }
+                    Job::Audit(g, a, slots, at) => Done::Audit(g, a, at, io.proof(a, &slots, at, false)),
+                };
+                if done.send(out).is_err() {
+                    return;
+                }
+            }
+        });
+    }
+    Some(tx)
+}
+
+/// THE PIPELINED RUNTIME (live speed, Oct 31 night). Live, the old loop made
+/// ~13.5 calls a second one after the other while blocks come ~10 a second:
+/// every slow answer, slow apply or seed (it waited for each one) put it
+/// further behind, and past 64 blocks it dropped everything and started
+/// again (19 restarts in 23 minutes; its version matched only half of the
+/// predicted copy's bases). Now:
+///   - up to FASTLANE_AHEAD_KEEP_FETCH_PAR block diffs are out at once; the
+///     answers are applied strictly in block order (never a gap: a block
+///     that is not there yet is asked again);
+///   - seeds and audits have their own lane (FASTLANE_AHEAD_KEEP_SEED_PAR),
+///     read at the keeper's block when sent and carried forward through the
+///     blocks applied meanwhile (`on_seed`, as before);
+///   - with FASTLANE_AHEAD_KEEP_LEAD it reads up to the feed's newest block,
+///     so its version is ready before copy 2 publishes the same block;
+///   - learned values are taken as one batch per round.
+/// Same safety: a restart (behind / gap / node errors / copy 2 backwards /
+/// audit) drops everything, and answers of the old run are thrown away.
+fn drive_pipelined(io: Arc<dyn KeeperIo>, cfg: KeeperCfg, rx: std::sync::mpsc::Receiver<Vec<MissItem>>, sink: Sink) {
+    let mut k = KeeperCore::new(cfg.clone());
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<Done>();
+    let blocks = spawn_lane(cfg.fetch_par.max(1), "arbsim-keeper-blk", &io, &done_tx);
+    let seeds = spawn_lane(cfg.seed_par, "arbsim-keeper-seed", &io, &done_tx);
+    drop(done_tx);
+    let Some(blocks) = blocks else { return };
+    let mut gen = 0u64;
+    let mut inflight: HashSet<u64> = HashSet::new();
+    let mut ready: std::collections::BTreeMap<u64, Vec<StateDiff>> = Default::default();
+    let mut retry: HashMap<u64, Instant> = HashMap::new();
+    let mut seeds_out = 0usize;
+    let mut errors = 0u32;
+    let mut last_seen: Option<u64> = None;
+    let mut hour = Instant::now();
+    let mut audit_at = Instant::now();
+    let mut status_at = Instant::now();
+    let mut m = Meter::new();
+    let mut rate_wait = Duration::ZERO;
+    let mut rate_until: Option<Instant> = None;
+    let mut ahead_max = 0i64;
+    // Restart: everything held dropped (KeeperCore::reset) and every answer
+    // still out belongs to the old run.
+    macro_rules! restart {
+        ($at:expr, $why:expr) => {{
+            k.reset($at, $why);
+            gen += 1;
+            inflight.clear();
+            ready.clear();
+            retry.clear();
+            sink.publish(&k, cfg.versions);
+        }};
+    }
+    while !sink.stopped() {
+        learn_all(&mut k, &rx);
+        if hour.elapsed() >= Duration::from_secs(3600) {
+            hour = Instant::now();
+            k.decay();
+            eprintln!("[arbsim] fastlane keeper (last hour): {}", k.status_json());
+        }
+        if status_at.elapsed() >= Duration::from_secs(1) {
+            status_at = Instant::now();
+            let extra = json!({"mode": "pipelined", "fetchPar": cfg.fetch_par, "seedPar": cfg.seed_par, "lead": cfg.lead_feed, "inFlight": inflight.len(), "ready": ready.len(), "seedsOut": seeds_out, "aheadOfCopy2Max": ahead_max});
+            *sink.status.lock().unwrap_or_else(|e| e.into_inner()) = m.status(&k, io.as_ref(), rate_wait, extra);
+        }
+        let Some(c2) = io.copy2_head() else {
+            std::thread::sleep(Duration::from_millis(20));
+            continue;
+        };
+        if last_seen.is_some_and(|l| c2 < l) {
+            restart!(c2, "copy2_backwards");
+        }
+        last_seen = Some(c2);
+        let head = match k.head() {
+            None => {
+                k.start_at(c2);
+                sink.publish(&k, cfg.versions);
+                c2
+            }
+            Some(h) if c2 > h + cfg.max_behind => {
+                restart!(c2, "behind");
+                c2
+            }
+            Some(h) => h,
+        };
+        let target = if cfg.lead_feed { c2.max(io.feed_head().unwrap_or(0)) } else { c2 };
+        let now = Instant::now();
+        let paused = rate_until.is_some_and(|t| now < t);
+        // Ask for the next blocks (at most fetch_par out at once).
+        if !paused {
+            let mut b = head + 1;
+            while b <= target && inflight.len() < cfg.fetch_par.max(1) && b <= head + 4 * cfg.fetch_par.max(1) as u64 {
+                if !inflight.contains(&b) && !ready.contains_key(&b) && retry.get(&b).is_none_or(|t| *t <= now) {
+                    if blocks.send(Job::Block(gen, b)).is_err() {
+                        return;
+                    }
+                    m.calls += 1;
+                    inflight.insert(b);
+                }
+                b += 1;
+            }
+        }
+        // Seeds / audits on their own lane (read at the keeper's block now).
+        if let Some(sl) = &seeds {
+            while !paused && seeds_out < cfg.seed_par {
+                let Some(job) = k.take_job() else { break };
+                m.calls += 1;
+                seeds_out += 1;
+                if sl.send(Job::Seed(gen, job, head)).is_err() {
+                    return;
+                }
+            }
+            if !paused && seeds_out < cfg.seed_par && cfg.audit_s > 0 && audit_at.elapsed() >= Duration::from_secs(cfg.audit_s) {
+                audit_at = Instant::now();
+                if let Some((a, slots)) = k.audit_pick(50) {
+                    m.calls += 1;
+                    seeds_out += 1;
+                    if sl.send(Job::Audit(gen, a, slots, head)).is_err() {
+                        return;
+                    }
+                }
+            }
+        } else if head >= c2 && inflight.is_empty() && ready.is_empty() && !paused {
+            // FASTLANE_AHEAD_KEEP_SEED_PAR=0: the old rule (one seed at a
+            // time, only while caught up, on this thread).
+            if let Some(job) = k.take_job() {
+                m.calls += 1;
+                let ans = io.proof(job.addr, &job.slots, head, job.basics).ok().map(|(info, code, slots)| SeedAnswer { addr: job.addr, at: head, basics: job.basics.then_some(info), code: code.filter(|_| job.basics), slots });
+                k.on_seed(&job, ans);
+                sink.publish(&k, cfg.versions);
+            }
+        }
+        // Answers (wait a little for the first one: no busy loop).
+        let mut got: Vec<Done> = Vec::new();
+        match done_rx.recv_timeout(Duration::from_millis(5)) {
+            Ok(d) => got.push(d),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+            Err(_) => {}
+        }
+        while let Ok(d) = done_rx.try_recv() {
+            got.push(d);
+        }
+        let now = Instant::now();
+        let mut changed = false;
+        for d in got {
+            match d {
+                Done::Block(g, b, r) => {
+                    if g != gen {
+                        continue;
+                    }
+                    inflight.remove(&b);
+                    match r {
+                        Ok(Some(t)) => {
+                            errors = 0;
+                            rate_wait = Duration::ZERO;
+                            retry.remove(&b);
+                            ready.insert(b, t);
+                        }
+                        Ok(None) => {
+                            // The node does not have it yet (we lead copy 2).
+                            m.not_yet += 1;
+                            retry.insert(b, now + Duration::from_millis(50));
+                        }
+                        Err(e) if crate::node::is_rate_refusal(0, &e) => {
+                            m.rate_refusals += 1;
+                            rate_wait = (rate_wait * 2).clamp(Duration::from_millis(100), Duration::from_secs(5));
+                            rate_until = Some(now + rate_wait);
+                            retry.insert(b, now + rate_wait);
+                        }
+                        Err(_) => {
+                            errors += 1;
+                            if errors >= 20 {
+                                errors = 0;
+                                restart!(c2, "node_errors");
+                            } else {
+                                retry.insert(b, now + Duration::from_millis(50));
+                            }
+                        }
+                    }
+                }
+                Done::Seed(g, job, at, r) => {
+                    seeds_out = seeds_out.saturating_sub(1);
+                    if g != gen {
+                        continue;
+                    }
+                    let ans = r.ok().map(|(info, code, slots)| SeedAnswer { addr: job.addr, at, basics: job.basics.then_some(info), code: code.filter(|_| job.basics), slots });
+                    k.on_seed(&job, ans);
+                    changed = true;
+                }
+                Done::Audit(g, a, at, r) => {
+                    seeds_out = seeds_out.saturating_sub(1);
+                    if g != gen {
+                        continue;
+                    }
+                    if let Ok((info, _, vals)) = r {
+                        if k.audit_check(at, a, Some(info), &vals) > 0 {
+                            // Everything was dropped: answers out are stale.
+                            gen += 1;
+                            inflight.clear();
+                            ready.clear();
+                            retry.clear();
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+        // Apply in block order, never past a gap.
+        while let Some(h) = k.head() {
+            let Some(t) = ready.remove(&(h + 1)) else { break };
+            if k.apply_block(h + 1, &t).is_err() {
+                restart!(c2, "gap");
+                break;
+            }
+            changed = true;
+        }
+        if let Some(h) = k.head() {
+            ahead_max = ahead_max.max(h as i64 - c2 as i64);
+        }
+        if changed {
+            sink.publish(&k, cfg.versions);
+        }
     }
 }
 
@@ -1496,6 +2002,186 @@ mod tests {
         assert_eq!(cfg(Some("observe"), None).seeds_per_hour, 0, "no self-imposed seed limit live");
         assert!(cfg(Some("observe"), None).adopt_writes, "adopting written values: on by default");
         assert!(!KeeperCfg::from_lookup(|k| (k == "FASTLANE_AHEAD_KEEP_ADOPT").then(|| "off".to_string())).adopt_writes);
+    }
+
+    // -----------------------------------------------------------------
+    // Live speed (Oct 31 night)
+    // -----------------------------------------------------------------
+
+    /// The new block apply (only held / adopted writes) gives exactly what
+    /// the old one did (apply everything, then drop what we don't hold).
+    #[test]
+    fn filtered_apply_matches_the_old_one() {
+        let x = a(7);
+        let mut cur = Acct { basics: Basics::Known(Some(AccountInfo { balance: u(5), nonce: 1, code_hash: KECCAK_EMPTY, ..Default::default() })), balance_exact: true, ..Default::default() };
+        for s in 0..50u64 {
+            cur.storage.insert(u(s * 3), u(s));
+        }
+        // Writes to held slots (multiples of 3), to unheld ones, and new basics.
+        let mut ad = AccountDiff { info: Some(Some(AccountInfo { balance: u(9), nonce: 2, code_hash: KECCAK_EMPTY, ..Default::default() })), ..Default::default() };
+        for s in 0..120u64 {
+            ad.storage.insert(u(s), u(1000 + s));
+        }
+        let keys: HashSet<U256> = cur.storage.keys().copied().collect();
+        let old = apply_held(x, &cur, &ad, &keys);
+        let mut f = AccountDiff { info: ad.info.clone(), ..Default::default() };
+        for (s, v) in &ad.storage {
+            if cur.storage.contains_key(s) {
+                f.storage.insert(*s, *v);
+            }
+        }
+        let new = apply_filtered(x, &cur, &f);
+        assert_eq!(old.basics, new.basics);
+        let pairs = |a: &Acct| {
+            let mut v: Vec<(U256, U256)> = a.storage.iter().map(|(k, v)| (*k, *v)).collect();
+            v.sort();
+            v
+        };
+        assert_eq!(pairs(&old), pairs(&new));
+        assert_eq!(new.storage.len(), 50, "no unheld value appears");
+        // And through apply_block (adopt off: the same values held).
+        let mut k = KeeperCore::new(KeeperCfg { on: true, adopt_writes: false, ..KeeperCfg::default() });
+        k.start_at(10);
+        k.cur.accounts.insert(x, cur.clone());
+        let mut d = StateDiff::default();
+        d.accounts.insert(x, ad);
+        k.apply_block(11, &[d]).unwrap();
+        assert_eq!(pairs(k.account(&x).unwrap()), pairs(&old));
+    }
+
+    /// A full candidate list (4,096 live) no longer drops every newcomer at
+    /// once: the ones named in this batch stay, the weakest others go.
+    #[test]
+    fn a_full_candidate_list_keeps_newcomers() {
+        let mut k = KeeperCore::new(KeeperCfg { on: true, max_contracts: 1, max_candidates: 4, ..KeeperCfg::default() });
+        for n in 1..=4u64 {
+            for _ in 0..n * 3 {
+                k.learn(&[MissItem::Slot(a(n), u(1))]);
+            }
+        }
+        assert_eq!(k.cands.len(), 4);
+        k.learn(&[MissItem::Slot(a(99), u(1))]);
+        assert!(k.cands.contains_key(&a(99)), "the newcomer stays");
+        assert_eq!(k.cands.len(), 4);
+        assert!(!k.cands.contains_key(&a(1)), "the weakest other one went");
+        assert_eq!(k.stats.cands_dropped, 1);
+    }
+
+    /// A mere candidate remembers at most FASTLANE_AHEAD_KEEP_CAND_SLOTS
+    /// values; a kept contract up to FASTLANE_AHEAD_KEEP_SLOTS.
+    #[test]
+    fn candidate_values_are_bounded() {
+        let mut k = KeeperCore::new(KeeperCfg { on: true, max_contracts: 1, cand_slots: 3, max_slots_per: 10, ..KeeperCfg::default() });
+        // a(1) becomes the kept one (first, highest score).
+        for _ in 0..5 {
+            k.learn(&[MissItem::Slot(a(1), u(0))]);
+        }
+        let many: Vec<MissItem> = (0..20).map(|s| MissItem::Slot(a(2), u(s))).collect();
+        k.learn(&many);
+        assert_eq!(k.cands[&a(2)].slots.len(), 3, "candidate: 3");
+        let many1: Vec<MissItem> = (0..20).map(|s| MissItem::Slot(a(1), u(s))).collect();
+        k.learn(&many1);
+        assert_eq!(k.cands[&a(1)].slots.len(), 10, "kept: 10");
+    }
+
+    /// Pipelined keeper: an audit read at a block it has already moved past
+    /// is compared with that block's version (before: never compared).
+    #[test]
+    fn an_audit_is_compared_with_its_own_blocks_version() {
+        let mut k = core(1);
+        k.learn(&[MissItem::Slot(a(1), u(1))]);
+        k.start_at(10);
+        seed(&mut k, 10);
+        k.apply_block(11, &[slot_diff(a(1), &[(1, 77)])]).unwrap();
+        k.apply_block(12, &[]).unwrap();
+        // Audit read at 11 (value 77): right.
+        assert_eq!(k.audit_check(11, a(1), None, &[(u(1), u(77))]), 0);
+        assert_eq!(k.stats.audits, 1);
+        // A wrong value at 11: everything dropped, restarted at the head.
+        assert_eq!(k.audit_check(11, a(1), None, &[(u(1), u(78))]), 1);
+        assert_eq!(k.head(), Some(12));
+        assert!(k.account(&a(1)).is_none());
+    }
+
+    /// A node model: blocks 1.. appear every `pace`, answers take `lat`.
+    struct FakeIo {
+        start: Instant,
+        pace: Duration,
+        lat: Duration,
+        calls: std::sync::atomic::AtomicU64,
+    }
+    impl FakeIo {
+        fn tip(&self) -> u64 {
+            100 + (self.start.elapsed().as_micros() / self.pace.as_micros().max(1)) as u64
+        }
+    }
+    impl KeeperIo for FakeIo {
+        fn block(&self, b: u64) -> Result<Option<Vec<StateDiff>>, String> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            std::thread::sleep(self.lat);
+            Ok((b <= self.tip()).then(|| vec![slot_diff(a(1), &[(1, b)])]))
+        }
+        fn proof(&self, _addr: Address, slots: &[U256], _at: u64, _code: bool) -> Result<ProofAnswer, String> {
+            std::thread::sleep(self.lat);
+            Ok((None, None, slots.iter().map(|s| (*s, U256::ZERO)).collect()))
+        }
+        fn copy2_head(&self) -> Option<u64> {
+            Some(self.tip())
+        }
+        fn feed_head(&self) -> Option<u64> {
+            Some(self.tip())
+        }
+    }
+
+    /// Run the real runtime for `run` against FakeIo; (resets, blocks behind at the end).
+    fn drive_for(cfg: KeeperCfg, pace: Duration, lat: Duration, run: Duration) -> (u64, i64) {
+        let io = Arc::new(FakeIo { start: Instant::now(), pace, lat, calls: Default::default() });
+        let sink = Sink::new(Arc::new(|| {}));
+        let (_tx, rx) = std::sync::mpsc::sync_channel::<Vec<MissItem>>(16);
+        let (s2, io2) = (sink.clone(), io.clone());
+        let t = std::thread::spawn(move || drive(io2, cfg, rx, s2));
+        std::thread::sleep(run);
+        let head = sink.versions.lock().unwrap().back().map(|v| v.block).unwrap_or(0);
+        let behind = io.tip() as i64 - head as i64;
+        std::thread::sleep(Duration::from_millis(1100));
+        let st = sink.status.lock().unwrap().clone();
+        sink.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        t.join().unwrap();
+        let resets = st["stats"]["resets"].as_object().map(|m| m.values().filter_map(|v| v.as_u64()).sum()).unwrap_or(0);
+        (resets, behind)
+    }
+
+    /// Blocks faster than one answer time: the old one-at-a-time loop falls
+    /// behind and restarts; the pipelined one keeps up (same node, same pace).
+    #[test]
+    fn the_pipelined_keeper_keeps_up_where_the_serial_one_falls_behind() {
+        let pace = Duration::from_millis(5);
+        let lat = Duration::from_millis(25);
+        let base = KeeperCfg { on: true, max_behind: 40, ..KeeperCfg::default() };
+        let (serial_resets, _) = drive_for(KeeperCfg { fetch_par: 1, seed_par: 0, lead_feed: false, ..base.clone() }, pace, lat, Duration::from_millis(1500));
+        assert!(serial_resets >= 1, "serial: 40 blocks/s against 200/s must fall behind ({serial_resets})");
+        let (resets, behind) = drive_for(KeeperCfg { fetch_par: 16, seed_par: 1, lead_feed: true, ..base }, pace, lat, Duration::from_millis(1500));
+        assert_eq!(resets, 0, "pipelined: no restart");
+        assert!(behind < 40, "pipelined: at the tip ({behind} behind)");
+    }
+
+    #[test]
+    fn live_speed_settings() {
+        let cfg = |ahead: &str, extra: Option<(&str, &str)>| {
+            KeeperCfg::from_lookup(|k| match k {
+                "FASTLANE_AHEAD" => Some(ahead.to_string()),
+                "FASTLANE_AHEAD_KEEPER" => Some("on".into()),
+                _ => extra.filter(|e| e.0 == k).map(|e| e.1.to_string()),
+            })
+        };
+        let o = cfg("observe", None);
+        assert_eq!((o.fetch_par, o.seed_par, o.lead_feed, o.cand_slots), (4, 2, true, 256), "observe: the new way");
+        let n = cfg("on", None);
+        assert_eq!((n.fetch_par, n.seed_par, n.lead_feed, n.cand_slots), (1, 0, false, 2000), "on: unchanged");
+        assert_eq!(cfg("observe", Some(("FASTLANE_AHEAD_KEEP_FETCH_PAR", "1"))).fetch_par, 1);
+        assert_eq!(cfg("observe", Some(("FASTLANE_AHEAD_KEEP_FETCH_PAR", "99"))).fetch_par, 4, "out of range: default");
+        assert!(!cfg("observe", Some(("FASTLANE_AHEAD_KEEP_LEAD", "off"))).lead_feed);
+        assert_eq!(cfg("observe", Some(("FASTLANE_AHEAD_KEEP_SEED_PAR", "0"))).seed_par, 0);
     }
 
     #[test]
