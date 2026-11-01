@@ -177,13 +177,13 @@ function universe(nPools: number, buildMs: number) {
     bump, builds: () => builds,
   };
 }
-function entryWith(u: ReturnType<typeof universe>, lazy: boolean, reuseMs: number) {
+function entryWith(u: ReturnType<typeof universe>, lazy: boolean, reuseMs: number, extra: Partial<ReturnType<typeof entrySettings>> = {}) {
   const { client, tables } = fakeClient();
   const env = { LOCAL_SIM_TRIGGER_FIRST: 'shadow', TRIG_ENTRY_TABLE_MS: '0' };
   const log = new JsonlLog(join(mkdtempSync(join(tmpdir(), 'freezefix-')), 'x.jsonl'), 1_000_000, 0);
   const tf = new TriggerFirst({ client, settings: trigFirstSettings(env), copy2: () => copy2, shadowLog: log, hostOn: () => true, log: () => {} });
   const te = new TrigEntry({
-    tf, client, shadowLog: log, settings: { ...entrySettings(env, 0.25), tableReuseMs: reuseMs },
+    tf, client, shadowLog: log, settings: { ...entrySettings(env, 0.25), tableReuseMs: reuseMs, ...extra },
     candidatesFor: () => ({ cands: [], found: 0 }), tableRoutes: lazy ? u.tableLazy : u.tableArray,
     isOurTx: () => false, ourAddresses: [], killed: () => false, safety: () => null, failBlocked: () => null, pausedWhy: () => null,
     send: async () => ({}), log: () => {}, lag: () => 0,
@@ -220,11 +220,18 @@ async function tableTests() {
   assert(uA.builds() - b1 === 8 && A.te.tableInfo().reused === 40, `two pools moved: only their 8 routes built again (built ${uA.builds() - b1})`);
   assert(heldTable(A.tables) === heldTable(B.tables), 'after the change: the sidecar holds exactly the old builder\'s table');
   assert(A.tables.length === 2 && Object.keys(A.tables[1].pools).length === 2, 'only the 2 changed pools were sent');
-  // Reuse expires: everything rebuilt after TRIG_ENTRY_TABLE_REUSE_MS.
-  const C = entryWith(universe(3, 0), true, 1);
+  // Reuse expires: everything rebuilt after TRIG_ENTRY_TABLE_REUSE_MS
+  // (fast table off: the old rule exactly).
+  const C = entryWith(universe(3, 0), true, 1, { tableFast: false });
   await C.te.refreshTable(); await new Promise((r) => setTimeout(r, 5));
   await C.te.refreshTable();
   assert(C.te.tableInfo().reused === 0, 'older than TRIG_ENTRY_TABLE_REUSE_MS: built again');
+  // Fast table (Nov 1): kept up to TRIG_TABLE_REUSE_MAX_MS (spread per
+  // route between the two), then built again.
+  const C2 = entryWith(universe(3, 0), true, 1, { tableReuseMaxMs: 3 });
+  await C2.te.refreshTable(); await new Promise((r) => setTimeout(r, 8));
+  await C2.te.refreshTable();
+  assert(C2.te.tableInfo().reused === 0, 'fast table: older than TRIG_TABLE_REUSE_MAX_MS: built again');
   assert(entrySettings({}, 0.25).tableReuseMs === 5_000 && entrySettings({ TRIG_ENTRY_TABLE_REUSE_MS: '0' }, 0.25).tableReuseMs === 0, 'TRIG_ENTRY_TABLE_REUSE_MS: default 5000, 0 = off');
 
   // BENCH (TEST numbers): 150 pools x 4 routes, each build ~0.5 ms (like buildCheck), 10 pools move per second.

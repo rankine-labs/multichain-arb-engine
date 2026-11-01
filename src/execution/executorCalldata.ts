@@ -227,6 +227,30 @@ export function usdToTokenUnits(usd: number, usdPerToken: number, decimals: numb
 }
 
 export function buildExecuteCall(input: BuildInput): BuildResult {
+  const p = planExecuteCall(input);
+  if (p.ok === false) return { ok: false, reason: p.reason };
+  // 4. The contract call itself (ABI encoding: the costly step, ~0.5 ms).
+  const trade = { token: input.tokenIn, amountIn: p.amountIn, minProfit: p.minProfit, maxBlock: input.maxBlock, hops: p.hops.map(fullHop) };
+  const data = p.funding === 'v3-flash'
+    ? iface.encodeFunctionData('executeWithV3Flash', [trade, p.flashPool])
+    : iface.encodeFunctionData('execute', [trade, p.flashPool]);
+  // Same fields in the same order as before the split.
+  return { ok: true, to: p.to, data, amountIn: p.amountIn, minProfit: p.minProfit, flashPool: p.flashPool, funding: p.funding, hops: p.hops };
+}
+
+// CHECK BUILD WITHOUT CALLDATA (Nov 1, TRIG_TABLE_FAST): everything
+// buildExecuteCall works out (same checks, same refusals, same amounts, hops
+// and lender), WITHOUT the ABI-encoded call (`data`). shadowMain's
+// buildCheck only ever keeps amountIn and the hops; the check question is
+// encoded again later from exactly those (simulateRoundTrip), so the
+// encoding here was thrown away. It cost ~0.5 ms per call and the fast-lane
+// table calls it for every route it rebuilds (~37,000), which was most of the
+// table's live rebuild time. Field order of the result is the same as
+// buildExecuteCall's, minus `data`.
+export type PlanResult =
+  | { ok: true; to: string | undefined; amountIn: bigint; minProfit: bigint; flashPool: string; funding: Funding; hops: ExecutorHop[] }
+  | { ok: false; reason: string };
+export function planExecuteCall(input: BuildInput): PlanResult {
   const { buyPool, sellPool } = input;
 
   // 1. Both pools must be tradeable by the contract.
@@ -236,7 +260,7 @@ export function buildExecuteCall(input: BuildInput): BuildResult {
   if (sellKind === null) return { ok: false, reason: `sell pool not supported by contract (${sellPool.dex}/${sellPool.poolType})` };
   // Hooked V4 pools: the key we send must be exactly the pool's own key.
   for (const [k, p, side] of [[buyKind, buyPool, 'buy'], [sellKind, sellPool, 'sell']] as const) {
-    if (k === KIND_V4_HOOKED && !v4KeyMatchesId(p)) {
+    if (k === KIND_V4_HOOKED && !(checkBuildEncodeOn() ? v4KeyMatchesId(p) : v4KeyMatchesIdMemo(p))) {
       return { ok: false, reason: `${side} pool: hooked V4 key (tokens, fee ${p.v4?.fee}, tick spacing ${p.v4?.tickSpacing}, hook) does not match its pool id` };
     }
   }
@@ -260,19 +284,53 @@ export function buildExecuteCall(input: BuildInput): BuildResult {
     hopFor(sellKind, sellPool, mid, input.tokenIn),
   ];
 
-  const trade = { token: input.tokenIn, amountIn, minProfit, maxBlock: input.maxBlock, hops: hops.map(fullHop) };
   // Prefer a V3 pool flash loan, then Aave, then own capital.
   if (input.v3Lender) {
     if (hops.some((h) => h.pool.toLowerCase() === input.v3Lender!.toLowerCase())) {
       return { ok: false, reason: 'lender pool is also a trade pool' };
     }
-    const data = iface.encodeFunctionData('executeWithV3Flash', [trade, input.v3Lender]);
-    return { ok: true, to: input.executorAddress, data, amountIn, minProfit, flashPool: input.v3Lender, funding: 'v3-flash', hops };
+    return { ok: true, to: input.executorAddress, amountIn, minProfit, flashPool: input.v3Lender, funding: 'v3-flash', hops };
   }
   const flashPool = input.flashPool ?? ZERO_ADDRESS;
-  const data = iface.encodeFunctionData('execute', [trade, flashPool]);
   const funding: Funding = flashPool === ZERO_ADDRESS ? 'own' : 'aave';
-  return { ok: true, to: input.executorAddress, data, amountIn, minProfit, flashPool, funding, hops };
+  return { ok: true, to: input.executorAddress, amountIn, minProfit, flashPool, funding, hops };
+}
+
+// TRIG_TABLE_FAST (default on): buildCheck plans without the calldata
+// (planExecuteCall). 0 = encode it as before (exactly the old code path).
+export function checkBuildEncodeOn(env: Record<string, string | undefined> = process.env): boolean {
+  return (env.TRIG_TABLE_FAST ?? '').trim() === '0';
+}
+
+// v4KeyMatchesId remembered per pool key (a keccak + ABI encoding, ~60 us,
+// done for every hooked V4 hop of every build). The answer depends only on
+// the pool id and its key fields, all part of the memo key. Bounded.
+const v4MatchMemo = new Map<string, boolean>();
+function v4KeyMatchesIdMemo(pool: PoolState): boolean {
+  const v4 = pool.v4;
+  if (!v4) return false;
+  const key = `${pool.poolAddress}|${pool.tokenA}|${pool.tokenB}|${v4.native ? 1 : 0}|${v4.fee}|${v4.tickSpacing}|${v4.hooks ?? ''}`;
+  const hit = v4MatchMemo.get(key);
+  if (hit !== undefined) return hit;
+  const ok = v4KeyMatchesId(pool);
+  if (v4MatchMemo.size > 20_000) v4MatchMemo.clear();
+  v4MatchMemo.set(key, ok);
+  return ok;
+}
+
+// getAddress (checksum spelling, a keccak hash each time), remembered per
+// address with TRIG_TABLE_FAST on: V4 hops name the same few PoolManager /
+// hook addresses over and over. Same answer (a bad address still throws:
+// nothing is remembered for it). Bounded.
+const checksumMemo = new Map<string, string>();
+function checksum(lower: string): string {
+  if (checkBuildEncodeOn()) return getAddress(lower);
+  const hit = checksumMemo.get(lower);
+  if (hit !== undefined) return hit;
+  const out = getAddress(lower);
+  if (checksumMemo.size > 20_000) checksumMemo.clear();
+  checksumMemo.set(lower, out);
+  return out;
 }
 
 // One hop of the route in the contract's format.
@@ -283,7 +341,7 @@ export function hopFor(kind: number, pool: PoolState, tokenIn: string, tokenOut:
     return {
       // getAddress(lowercase): accept any capitalisation (a stored address with
       // a wrong checksum would otherwise make the encoder throw).
-      kind, pool: getAddress(pool.v4!.poolManager.toLowerCase()), tokenIn, tokenOut, feeBps: 0,
+      kind, pool: checksum(pool.v4!.poolManager.toLowerCase()), tokenIn, tokenOut, feeBps: 0,
       v4Fee: pool.v4!.fee, v4TickSpacing: pool.v4!.tickSpacing, v4Native: pool.v4!.native,
     };
   }
@@ -292,9 +350,9 @@ export function hopFor(kind: number, pool: PoolState, tokenIn: string, tokenOut:
     // (dynamic-fee flag included). The PoolManager rides along for the
     // simulator only; the contract uses its own setV4 setting.
     return {
-      kind, pool: getAddress(pool.v4!.hooks!.toLowerCase()), tokenIn, tokenOut, feeBps: 0,
+      kind, pool: checksum(pool.v4!.hooks!.toLowerCase()), tokenIn, tokenOut, feeBps: 0,
       v4Fee: pool.v4!.fee, v4TickSpacing: pool.v4!.tickSpacing, v4Native: pool.v4!.native,
-      v4PoolManager: getAddress(pool.v4!.poolManager.toLowerCase()),
+      v4PoolManager: checksum(pool.v4!.poolManager.toLowerCase()),
     };
   }
   return {

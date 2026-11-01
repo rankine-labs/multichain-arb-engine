@@ -168,6 +168,19 @@ export class LocalSimClient {
   // Ask the sidecar a question (`msg` without id). Always resolves: a sure
   // answer, or { ok:false, unknown:"<why>" } (timeout, disconnected, ...).
   request(msg: Record<string, unknown>, timeoutMs = this.timeoutMs): Promise<SidecarAnswer> {
+    return this.requestWith((id) => frame({ ...msg, id }), timeoutMs);
+  }
+
+  // The same question, already written as JSON (UTF-8 bytes) WITHOUT its
+  // closing brace, in pieces (FAST TABLE: the big table messages are written
+  // in bites as they are split, so they are never turned into text in one
+  // long go here). The bytes sent are exactly what request() sends for the
+  // same message: `<pieces>,"id":<n>}`.
+  requestBytes(open: Buffer[], timeoutMs = this.timeoutMs): Promise<SidecarAnswer> {
+    return this.requestWith((id) => framePieces(open, `,"id":${id}}`), timeoutMs);
+  }
+
+  private requestWith(make: (id: number) => Buffer, timeoutMs: number): Promise<SidecarAnswer> {
     return new Promise((resolve) => {
       try {
         if (!this.connected || !this.sock) { resolve(this.noteUnknown({ ok: false, unknown: 'disconnected' })); return; }
@@ -184,7 +197,7 @@ export class LocalSimClient {
         timer.unref?.();
         this.pending.set(id, { resolve, timer, sentMs });
         this.stats.sent++;
-        this.sock.write(frame({ ...msg, id }));
+        this.sock.write(make(id));
       } catch (e) {
         resolve(this.noteUnknown({ ok: false, unknown: 'client_error', detail: (e as Error).message }));
       }
@@ -357,7 +370,22 @@ export function insideMs(a: { us?: unknown; t?: { queue?: unknown } } | null | u
 // buffer (one copy instead of two; trigger-entry questions carry ~100-500 KB
 // of feed transactions each). Same bytes as before (tested).
 export function frame(msg: unknown): Buffer {
-  const text = JSON.stringify(msg);
+  return frameText(JSON.stringify(msg));
+}
+// Same framing for JSON already in UTF-8 pieces, plus a closing text.
+export function framePieces(pieces: Buffer[], tail: string): Buffer {
+  const t = Buffer.from(tail, 'utf8');
+  let n = t.length;
+  for (const p of pieces) n += p.length;
+  const out = Buffer.allocUnsafe(4 + n);
+  out.writeUInt32BE(n, 0);
+  let at = 4;
+  for (const p of pieces) at += p.copy(out, at);
+  t.copy(out, at);
+  return out;
+}
+// Same framing for text that is already JSON.
+export function frameText(text: string): Buffer {
   const n = Buffer.byteLength(text, 'utf8');
   const out = Buffer.allocUnsafe(4 + n);
   out.writeUInt32BE(n, 0);

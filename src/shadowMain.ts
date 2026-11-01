@@ -78,7 +78,7 @@ import { RobinhoodChainAdapter } from './chains/robinhoodChain';
 import { createLocalSimHost, LocalSimHost, LocalCheck, LocalKind, LocalOutcome } from './execution/localSimHost';
 import { TriggerFirst, trigFirstSettings, TrigOutcome } from './execution/triggerFirst';
 import { Scoreboard, SendPath, Confidence as ScoreConfidence, standingGapFailBlock, entryFailBlock } from './report/scoreboard';
-import { TrigEntry, EntryCandidate, EntryPick, TablePool, entrySettings, enumerateRoutes, rankRoutes, nodeAsksOn } from './execution/trigEntry';
+import { TrigEntry, EntryCandidate, EntryPick, TablePool, entrySettings, enumerateRoutes, rankRoutes, nodeAsksOn, tableFastOn, poolShapeKey, poolPriceKey } from './execution/trigEntry';
 import { EntryLoopIndex, EntryLoop, EntryLoopHost, EntryLoopSender, CoinTaxFileView, LoopScoreMemo, loopIndexSettings, loopQuoteUsd, pickLoops, loopSkipText, askLoopTaxTests, loopIndexNeeded } from './execution/trigEntryLoops';
 import { hasExactMath } from './core/loopFinder';
 import { runCheckFirst } from './execution/checkFirstFlow';
@@ -97,10 +97,10 @@ import { ROBINHOOD_SCAN_FACTORIES } from './config/knownAddresses';
 // Uniswap V4 in the chain-wide scan, asked PER PAIR (core/v4Lookup.ts), not
 // from V4's history (that ran out of memory twice on Oct 9). RH_V4_SCAN=0 off.
 const RH_V4_SCAN = process.env.RH_V4_SCAN !== '0';
-import { buildExecuteCall, executionRequested, executorConfig, pickV3Lender, kindForPool, v4KeyMatchesId, v4KeyOf, KIND_V4_HOOKED } from './execution/executorCalldata';
+import { buildExecuteCall, planExecuteCall, checkBuildEncodeOn, executionRequested, executorConfig, pickV3Lender, kindForPool, v4KeyMatchesId, v4KeyOf, KIND_V4_HOOKED } from './execution/executorCalldata';
 import { GasModel, GasCalibration, gasSettingsFromEnv, routeKeyFor, twoPoolKey, defaultUnitsFor, costsLine, loopKey } from './core/gasModel';
 import { recordEventFee, eventFeeCounts, feeFromEventsOn, setHeadBlockSource, currentHeadBlock } from './core/eventFees';
-import { OwnMoneyBook, useOwnMoney, fitTradeToWallet } from './core/ownMoney';
+import { OwnMoneyBook, useOwnMoney, fitTradeToWallet, OWN_MONEY_MAX_AGE_MS } from './core/ownMoney';
 import { readIncludesTrade } from './core/tradeInclusion';
 import { checkFirstOn, waitForTrade, decideCheckFirst, checkLoanPips, extraLoanFeeUsd } from './core/checkFirst';
 import { WhyNotSent, formatWhyNotSent } from './report/whyNotSent';
@@ -797,6 +797,8 @@ type BuiltCheck = {
       trade: { token: string; amountIn: bigint; hops: ExecutorHop[] };
       simOpts: { v3Lender?: string; weth?: string };
 };
+// TRIG_TABLE_FAST=0: buildCheck encodes the calldata as before (read once at start).
+const checkBuildEncodes = checkBuildEncodeOn();
 const buildCheck = (
       chain: 'avalanche' | 'monad' | 'robinhood', tokenIn: string,
       buyPool: any, sellPool: any, tradeSizeUsd: number, usdPerToken: number,
@@ -806,11 +808,14 @@ const buildCheck = (
       // Same lender choice as a live trade (approved FLASH_LENDERS only), so a
       // "confirmed" profit is priced with the loan fee a real trade would pay.
       const lender = pickLender(chain, tokenIn, buyPool, sellPool, tradeSizeUsd, usdPerToken);
-      const built = buildExecuteCall({
+      // TRIG_TABLE_FAST (default): the same plan without the contract calldata,
+      // which nothing here reads (the check encodes the trade again itself).
+      const input = {
             chain, tokenIn, buyPool, sellPool, tradeSizeUsd, netProfitUsd: 1,
             usdPerTokenIn: usdPerToken, tokenInDecimals: decimals, maxBlock: 0n,
             v3Lender: lender?.poolAddress,
-      });
+      };
+      const built = checkBuildEncodes ? buildExecuteCall(input) : planExecuteCall(input);
       if ('reason' in built) return { skip: built.reason };
       return {
             decimals, lender, trade: { token: tokenIn, amountIn: built.amountIn, hops: built.hops },
@@ -3062,11 +3067,45 @@ const entryCandidatesFor = (keys: string[], limit: number): { cands: EntryCandid
 // question is made of (`inputs`: both pool states, their seen-fee records,
 // the start coin's price and decimals), so an unchanged route is not built
 // again (TRIG_ENTRY_TABLE_REUSE_MS). Same routes, same order as before.
+// FAST TABLE (Nov 1, TRIG_TABLE_FAST, default on; execution/trigEntry.ts):
+// `inputs` = what the question is REALLY made of: the two pools' trading
+// details (not their prices: the question holds none), the coin's price and
+// decimals, and everything the lender choice reads (own-money balance,
+// lender balance reads, the practice balance-slot rule). `live` = the two
+// pools' prices (and seen fees): a change there reaches arbsim at once.
+// TRIG_TABLE_FAST=0: exactly the old inputs (pool state objects).
+const entryTableFast = tableFastOn();
+const entryTableInputs = (r: EntryRouteT): unknown[] => {
+      const px = entryUsdOf(r.tokenIn), dec = entryDecOf(r.tokenIn);
+      if (!entryTableFast) return [r.buy, r.buy?.observedFee, r.sell, r.sell?.observedFee, px, dec];
+      const own = dec !== undefined && px > 0 ? ownMoney.availableUsd(r.tokenIn, px, dec) : null;
+      const noSlot = !robinhoodSender.live && noBalanceSlot.has((r.tokenIn ?? '').toLowerCase());
+      return [poolShapeKey(r.buy), poolShapeKey(r.sell), px, dec, own, lenderBalances.lastRefreshMs, noSlot];
+};
+// FAST TABLE 4: cheap facts that move whenever this pool's routes could
+// change for real: its own and its partner pools' prices (and seen fees),
+// which partners there are, and what the "held" flag reads (live sender,
+// own-money mode, wallet balances, whether the wallet read is fresh). Same
+// as at the pool's last build = not even listed this pass. Anything else
+// (coin allowlist, venue rules, lender reads) is picked up when the pool is
+// re-listed anyway, at most 5 to 10 s later (TRIG_TABLE_DRIFT_MS).
+const entryPoolVer = (k: string): unknown[] => {
+      const age = ownMoney.lastReadAgeMs();
+      const v: unknown[] = [robinhoodSender.live, entryOwnOnly(), ownMoney.raw(ROBINHOOD_TOKENS.USDG), ownMoney.raw(ROBINHOOD_TOKENS.WETH), age !== null && age <= OWN_MONEY_MAX_AGE_MS];
+      const p = cache.get('robinhood', k);
+      if (!p) return v;
+      v.push(poolPriceKey(p), p.observedFee);
+      for (const q of cache.findPeerPools('robinhood', p.tokenA, p.tokenB, p.poolAddress)) v.push(q.poolAddress, poolPriceKey(q), q.observedFee);
+      return v;
+};
 const entryTableRoutes = (): TablePool[] => copy2PoolKeys().map((k) => ({
       pool: k,
+      ...(entryTableFast ? { ver: () => entryPoolVer(k) } : {}),
       routes: () => entryRoutesOf([k]).map((r) => ({
             rid: r.id, held: entryHeld(r), score: entryScore(r), build: () => entryBuild(r),
-            inputs: [r.buy, r.buy?.observedFee, r.sell, r.sell?.observedFee, entryUsdOf(r.tokenIn), entryDecOf(r.tokenIn)],
+            // (FAST TABLE: worked out only when the route is rebuilt.)
+            inputs: entryTableFast ? () => entryTableInputs(r) : entryTableInputs(r),
+            ...(entryTableFast ? { live: [poolPriceKey(r.buy), r.buy?.observedFee, poolPriceKey(r.sell), r.sell?.observedFee] } : {}),
       })),
 }));
 // FIRE-FIRST 3-POOL LOOPS (execution/trigEntryLoops.ts, TRIG_ENTRY_LOOPS=1,
