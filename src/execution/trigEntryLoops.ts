@@ -93,6 +93,25 @@ export function loopIndexSettings(env: Record<string, string | undefined> = proc
   };
 }
 
+// ---- is the loop index needed at all? (Nov 1) --------------------------------
+// Plain English: the loop index (and its coin tax tests, one free-node
+// simulation every few seconds) is read in ONE place only: when the bot itself
+// asks arbsim about a feed trigger (TrigEntry.processInner, loop candidates).
+// With the Rust fast lane deciding (TRIG_ENTRY_NODE_ASKS off), the bot never
+// asks, so the index was rebuilt every minute (4-pool search: up to 3,000,000
+// steps, ~1-2 s of main-thread work offline) for nothing. Rust keeps its own
+// routes; nothing of this index is sent to it.
+// TRIG_ENTRY_LOOP_INDEX:
+//   1 / on    always build it (old behaviour)
+//   0 / off   never build it
+//   not set   only when the bot asks about triggers itself (nodeAsks)
+export function loopIndexNeeded(env: Record<string, string | undefined>, nodeAsks: boolean): boolean {
+  const v = (env.TRIG_ENTRY_LOOP_INDEX ?? '').trim().toLowerCase();
+  if (['1', 'on', 'true', 'yes'].includes(v)) return true;
+  if (['0', 'off', 'false', 'no'].includes(v)) return false;
+  return nodeAsks;
+}
+
 // ---- one loop ---------------------------------------------------------------
 // start -> tokens[1] -> tokens[2] (-> tokens[3]) -> start, through keys[0..].
 // 3 pools (3 coins) or, since Oct 25, 4 pools (4 coins): keys, tokens and

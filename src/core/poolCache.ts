@@ -1,5 +1,5 @@
 import { PoolState, ChainName } from './types';
-import { amountInAfterFee } from './dexMath';
+import { amountInAfterFee, mathZeroGuardOn } from './dexMath';
 
 // ============================================================================
 // POOL CACHE
@@ -401,6 +401,10 @@ export class PoolCache {
                                                                                                                                           predictPostTradeState(pool: PoolState, tokenInIsA: boolean, amountIn: bigint): PoolState {
                                                                                                                                               if (pool.poolType === 'v2') {
                                                                                                                                                     if (pool.reserveA === undefined || pool.reserveB === undefined) return pool;
+    // ZERO GUARD (Nov 1, MATH_ZERO_GUARD, default on; 0 = old): an empty side
+    // made the division below throw "Division by zero" (a BigInt error the bot
+    // caught as an unhandled rejection a few times a day). No prediction instead.
+    if (mathZeroGuardOn() && (pool.reserveA <= 0n || pool.reserveB <= 0n)) return pool;
                                                                                                                                                     
                                                                                                                                                           // Same fee maths as the sizing code (dexMath.ts), so prediction and sizing agree.
                                                                                                                                                                 const amountInWithFee = amountInAfterFee(pool, amountIn, tokenInIsA);
@@ -418,6 +422,11 @@ export class PoolCache {
                                                                                                                                                                                                                                       
                                                                                                                                                                                                                                           if (pool.poolType === 'v3') {
                                                                                                                                                                                                                                                 if (pool.sqrtPriceX96 === undefined || pool.liquidity === undefined) return pool;
+    // ZERO GUARD (Nov 1): price 0 (pool not started) threw "Division by zero";
+    // liquidity 0 (price outside every position) threw for tiny trades and, for
+    // bigger ones, wrote a predicted price of 0 into the cache. No prediction
+    // instead (the block reader brings the real state). MATH_ZERO_GUARD=0 = old.
+    if (mathZeroGuardOn() && (pool.sqrtPriceX96 <= 0n || pool.liquidity <= 0n)) return pool;
                                                                                                                                                                                                                                                 
                                                                                                                                                                                                                                                       const Q96 = 1n << 96n;
                                                                                                                                                                                                                                                             // Virtual reserves at the current price, within the active tick's
@@ -430,7 +439,9 @@ export class PoolCache {
                                                                                                                                                                                                                                                                                           
                                                                                                                                                                                                                                                                                                 // Same constant-product relationship (virtualX * virtualY = k) applied
                                                                                                                                                                                                                                                                                                       // to the virtual reserves, then converted back into a new sqrtPriceX96.
-                                                                                                                                                                                                                                                                                                            let newVirtualX: bigint;
+                                                                                                                                                                                                                                                                                                            // ZERO GUARD: a side rounded down to 0 plus a trade that rounds to 0 after fees.
+    if (mathZeroGuardOn() && (tokenInIsA ? virtualX + amountInWithFee : virtualY + amountInWithFee) <= 0n) return pool;
+    let newVirtualX: bigint;
                                                                                                                                                                                                                                                                                                                   let newVirtualY: bigint;
                                                                                                                                                                                                                                                                                                                   
                                                                                                                                                                                                                                                                                                                         if (tokenInIsA) {
@@ -446,7 +457,10 @@ export class PoolCache {
                                                                                                                                                                                                                                                                                                                                                                                 // sqrtP = sqrt(y/x) — reconstruct via the identity newSqrtP = L*Q96/newVirtualX
                                                                                                                                                                                                                                                                                                                                                                                       const newSqrtPriceX96 = (pool.liquidity * Q96) / newVirtualX;
                                                                                                                                                                                                                                                                                                                                                                                       
-                                                                                                                                                                                                                                                                                                                                                                                            return { ...pool, sqrtPriceX96: newSqrtPriceX96 };
+                                                                                                                                                                                                                                                                                                                                                                                            // ZERO GUARD: a dust-sized pool can round the new price down to 0; that is
+    // never a real price (and divides by zero later): no prediction instead.
+    if (mathZeroGuardOn() && newSqrtPriceX96 <= 0n) return pool;
+    return { ...pool, sqrtPriceX96: newSqrtPriceX96 };
                                                                                                                                                                                                                                                                                                                                                                                                 }
                                                                                                                                                                                                                                                                                                                                                                                                 
                                                                                                                                                                                                                                                                                                                                                                                                     // orderbook / stable pool math not implemented yet — return unchanged
