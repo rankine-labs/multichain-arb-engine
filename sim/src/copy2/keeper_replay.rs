@@ -40,8 +40,8 @@
 //   been running for a while; an upper bound, said so in the report).
 // ============================================================================
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::Arc;
-use std::time::Instant;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use revm::primitives::{keccak256, Address, B256, KECCAK_EMPTY, U256};
 use revm::state::{AccountInfo, Bytecode};
@@ -905,5 +905,110 @@ mod tests {
         assert!(!t.wrote(&h(2)), "ArbOS's own writes don't count");
         assert_eq!(t.tx_pos(&h(2)), Some((21, 0)));
         let _ = std::fs::remove_file(&dir);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LIVE-TIMING NODE MODEL (`ahead-replay --live-timing`, Oct 31 night)
+// ---------------------------------------------------------------------------
+
+/// The node as the live keeper sees it, built from the recorded truth:
+///   - every answer takes a real wait (latency drawn around a median and a
+///     90th percentile, like the paid node's measured answer times),
+///   - a block exists on the node only once the feed has announced it and
+///     `node_lag` has passed (a block asked for earlier is "not there yet"),
+///   - seeds / audits answer the recorded values at the asked block
+///     (unknown recorded basics = an error, never a guess),
+///   - copy 2's head and the feed's head are set by the replay as it goes.
+/// So the keeper's REAL runtime (`keeper::drive`) runs against it in real
+/// time, with the same threads and the same pacing as live.
+pub struct TruthIo {
+    pub truth: Arc<Truth>,
+    /// Median / 90th percentile answer time.
+    pub p50: Duration,
+    pub p90: Duration,
+    /// How long after the feed announced a block the node has it.
+    pub node_lag: Duration,
+    copy2: std::sync::atomic::AtomicU64,
+    feed: std::sync::atomic::AtomicU64,
+    announced: Mutex<HashMap<u64, Instant>>,
+    rng: Mutex<u64>,
+    /// Calls answered (blocks, proofs) and "not there yet".
+    pub calls: std::sync::atomic::AtomicU64,
+    pub not_yet: std::sync::atomic::AtomicU64,
+}
+
+impl TruthIo {
+    pub fn new(truth: Arc<Truth>, p50: Duration, p90: Duration, node_lag: Duration) -> TruthIo {
+        TruthIo { truth, p50, p90, node_lag, copy2: Default::default(), feed: Default::default(), announced: Default::default(), rng: Mutex::new(0x9e37_79b9_7f4a_7c15), calls: Default::default(), not_yet: Default::default() }
+    }
+    /// The feed announced block `b` now.
+    pub fn announce(&self, b: u64) {
+        self.announced.lock().unwrap_or_else(|e| e.into_inner()).entry(b).or_insert_with(Instant::now);
+        self.feed.fetch_max(b, std::sync::atomic::Ordering::Relaxed);
+    }
+    /// Copy 2 published block `b`.
+    pub fn set_copy2(&self, b: u64) {
+        self.copy2.store(b, std::sync::atomic::Ordering::Relaxed);
+    }
+    /// One answer time: log-normal through (p50, p90), capped at 10 x p90.
+    fn wait(&self) {
+        let u = {
+            let mut g = self.rng.lock().unwrap_or_else(|e| e.into_inner());
+            // xorshift64*: deterministic, no extra crate.
+            let mut x = *g;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            *g = x;
+            let a = (x.wrapping_mul(0x2545_f491_4f6c_dd1d) >> 11) as f64 / (1u64 << 53) as f64;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *g = x;
+            let b = (x >> 11) as f64 / (1u64 << 53) as f64;
+            (a.max(1e-12), b)
+        };
+        // Box-Muller normal, then log-normal with the given p50 / p90.
+        let z = (-2.0 * u.0.ln()).sqrt() * (2.0 * std::f64::consts::PI * u.1).cos();
+        let p50 = self.p50.as_secs_f64().max(1e-6);
+        let sigma = (self.p90.as_secs_f64().max(p50) / p50).ln() / 1.2816;
+        let t = (p50 * (sigma * z).exp()).min(self.p90.as_secs_f64() * 10.0);
+        std::thread::sleep(Duration::from_secs_f64(t));
+    }
+}
+
+impl super::keeper::KeeperIo for TruthIo {
+    fn block(&self, b: u64) -> Result<Option<Vec<StateDiff>>, String> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.wait();
+        let have = self.announced.lock().unwrap_or_else(|e| e.into_inner()).get(&b).is_some_and(|t| t.elapsed() >= self.node_lag);
+        if !have {
+            self.not_yet.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Ok(None);
+        }
+        match self.truth.blocks.get(&b) {
+            Some(t) => Ok(Some(t.clone())),
+            // Past the recorded blocks: "not there" (the replay ends soon).
+            None => Ok(None),
+        }
+    }
+    fn proof(&self, addr: Address, slots: &[U256], at: u64, code: bool) -> Result<super::keeper::ProofAnswer, String> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.wait();
+        let vals: Vec<(U256, U256)> = slots.iter().filter_map(|s| self.truth.slot_at(&addr, s, at).map(|v| (*s, v))).collect();
+        let info = match self.truth.basics_at(&addr, at) {
+            Some(i) => i,
+            None if code => return Err("basics not recorded".into()),
+            None => None,
+        };
+        let c = if code { info.as_ref().and_then(|i| self.truth.code(&i.code_hash)) } else { None };
+        Ok((info, c, vals))
+    }
+    fn copy2_head(&self) -> Option<u64> {
+        Some(self.copy2.load(std::sync::atomic::Ordering::Relaxed)).filter(|b| *b > 0)
+    }
+    fn feed_head(&self) -> Option<u64> {
+        Some(self.feed.load(std::sync::atomic::Ordering::Relaxed)).filter(|b| *b > 0)
     }
 }

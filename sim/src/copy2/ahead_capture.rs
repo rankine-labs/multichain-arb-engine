@@ -431,6 +431,12 @@ fn dec_cfg(d: &mut Dec) -> Res<AheadCfg> {
         keeper: false,
         // Not in the file: `--no-keep-pick` turns it off (ahead3).
         keep_pick: true,
+        // Not in the file: the live-speed settings (Oct 31 night). Off =
+        // the old behaviour; `--live-timing --new` turns them on.
+        budget_cpu: false,
+        lazy_rebase: false,
+        kept_rebuild_once: false,
+        need_keeper: false,
     })
 }
 
@@ -1188,6 +1194,362 @@ fn replay_with(cap: &CapFile, opts: &ReplayOpts, keeper: Option<KeeperOpts>) -> 
     Ok((r, rk))
 }
 
+// ---------------------------------------------------------------------------
+// LIVE-TIMING REPLAY (`--live-timing`, Oct 31 night)
+// ---------------------------------------------------------------------------
+
+/// How `ahead-replay --live-timing` paces a capture (see `replay_live`).
+#[derive(Clone, Debug)]
+pub struct LiveTiming {
+    /// Feed pace: one message every this many ms (default: the capture's
+    /// own block rate from the feed timestamps).
+    pub block_ms: Option<f64>,
+    /// Node answer time: median and 90th percentile (ms).
+    pub node_p50_ms: u64,
+    pub node_p90_ms: u64,
+    /// The node has a block this long after the feed announced it (ms).
+    pub node_lag_ms: u64,
+    /// Settings as `KEY=VALUE` (FASTLANE_AHEAD=observe = the new defaults;
+    /// FASTLANE_AHEAD=on + FASTLANE_AHEAD_KEEPER=on = the old ones), plus
+    /// any FASTLANE_AHEAD_* override, read like the live process reads env.
+    pub env: HashMap<String, String>,
+    /// Seconds the keeper may spend seeding before the feed starts (both
+    /// runtimes start warm: the learned contracts' values are read first).
+    pub preroll_s: u64,
+    /// Learning passes for the warm start (offline, before the timed run).
+    pub warm_passes: usize,
+    /// Copy 2 publishes block N only once the feed is at least this many
+    /// blocks past it (live Oct 31: p50 5, p90 6 blocks behind the feed; the
+    /// Oct 27 capture had p50 0). None = the capture's own order.
+    pub copy2_delay_blocks: Option<u64>,
+}
+
+/// Peak and current resident memory of this process (kB), from /proc.
+fn rss_kb() -> (u64, u64) {
+    let txt = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let f = |k: &str| txt.lines().find(|l| l.starts_with(k)).and_then(|l| l.split_whitespace().nth(1)).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+    (f("VmHWM:"), f("VmRSS:"))
+}
+
+/// CPU seconds this whole process has used (all threads).
+fn process_cpu_s() -> f64 {
+    let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+    // SAFETY: getrusage only writes the struct we pass.
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) } != 0 {
+        return 0.0;
+    }
+    let t = |v: libc::timeval| v.tv_sec as f64 + v.tv_usec as f64 / 1e6;
+    t(ru.ru_utime) + t(ru.ru_stime)
+}
+
+/// LIVE-TIMING REPLAY: the capture in REAL time, like live, instead of as
+/// fast as possible with every wait taken away.
+///   - Feed messages arrive at the live block pace (one per `block_ms`);
+///     copy 2's versions and settled records come where the capture had
+///     them between the feed messages (the order live saw them).
+///   - The predicted copy runs on this thread with the live settings:
+///     the 10 ms per-message budget is ON (`--budget-ms`, default 10).
+///   - The keeper is the REAL runtime (`keeper::drive`: the old serial loop
+///     or the pipelined one, by the settings), on its own threads, against
+///     a node model over the recorded block diffs with real answer times
+///     (copy2/keeper_replay.rs TruthIo).
+///   - It starts warm (contracts learned in offline passes, seeded during
+///     a pre-roll), so the measured stretch is the steady state.
+/// Run it on the server at low priority next to the live bot: the CPU it
+/// gets is then like (or worse than) the live predicted copy's.
+pub fn replay_live(cap: &CapFile, opts: &ReplayOpts, truth: Arc<super::keeper_replay::Truth>, lt: &LiveTiming) -> Result<Value, String> {
+    use super::keeper::KeeperIo;
+    use std::sync::atomic::Ordering::Relaxed;
+    let Some(CapEv::Header { cfg, l2_offset, .. }) = cap.events.first().cloned() else {
+        return Err("the capture does not start with its settings".into());
+    };
+    let get = |k: &str| lt.env.get(k).cloned();
+    let fresh = AheadCfg::from_lookup(get, l2_offset);
+    let mut kcfg = super::keeper::KeeperCfg::from_lookup(get);
+    kcfg.on = true;
+    let mut cfg = cfg;
+    cfg.l2_offset = l2_offset;
+    cfg.compare_delay = u64::MAX / 4;
+    cfg.msg_budget_us = opts.budget_ms.unwrap_or(10).clamp(1, 1000) * 1000;
+    cfg.revert_unsure = opts.revert_unsure.unwrap_or(true);
+    if let Some(v) = opts.trust_sender_funds {
+        cfg.trust_sender_funds = v;
+    }
+    cfg.unknown_continue = true;
+    cfg.keeper = true;
+    cfg.keep_pick = !opts.no_keep_pick;
+    cfg.budget_cpu = fresh.budget_cpu;
+    cfg.lazy_rebase = fresh.lazy_rebase;
+    cfg.kept_rebuild_once = fresh.kept_rebuild_once;
+    cfg.need_keeper = fresh.need_keeper;
+    let settings = json!({
+        "budgetMs": cfg.msg_budget_us / 1000, "budgetClock": if cfg.budget_cpu { "cpu" } else { "wall" }, "lazyRebase": cfg.lazy_rebase,
+        "keptRebuild": if cfg.kept_rebuild_once { "once" } else { "every" }, "needKeeper": cfg.need_keeper,
+        "keepContracts": kcfg.max_contracts, "fetchPar": kcfg.fetch_par, "seedPar": kcfg.seed_par, "leadFeed": kcfg.lead_feed, "candSlots": kcfg.cand_slots,
+    });
+    // Warm start: what offline passes learn (contracts and values).
+    let warm = if lt.warm_passes > 0 { keeper_learned(cap, truth.clone(), kcfg.clone(), lt.warm_passes)? } else { Vec::new() };
+    let (rss0, _) = rss_kb();
+    let cpu0 = process_cpu_s();
+    let ts: Vec<(u64, u64)> = cap.events.iter().filter_map(|e| if let CapEv::Feed(m) = e { Some((m.seq, m.ts)) } else { None }).collect();
+    let block_ms = lt.block_ms.unwrap_or_else(|| match (ts.first(), ts.last()) {
+        (Some(f), Some(l)) if l.1 > f.1 && l.0 > f.0 => 1000.0 * (l.1 - f.1) as f64 / (l.0 - f.0) as f64,
+        _ => 107.0,
+    });
+    // The keeper's world: node model + the real runtime on its own threads.
+    let io = Arc::new(super::keeper_replay::TruthIo::new(truth.clone(), Duration::from_millis(lt.node_p50_ms), Duration::from_millis(lt.node_p90_ms), Duration::from_millis(lt.node_lag_ms)));
+    let published = Arc::new(AtomicU64::new(0));
+    let pubc = published.clone();
+    let sink = super::keeper::Sink::new(Arc::new(move || {
+        pubc.fetch_add(1, Relaxed);
+    }));
+    let (ltx, lrx) = std::sync::mpsc::sync_channel::<Vec<crate::state::MissItem>>(1024);
+    let first_conf = cap.events.iter().find_map(|e| if let CapEv::Confirmed { seq, .. } = e { Some(*seq) } else { None }).ok_or("no copy-2 version in the capture")?;
+    io.announce(first_conf + l2_offset);
+    io.set_copy2(first_conf + l2_offset);
+    let warm_all: Vec<crate::state::MissItem> = warm.into_iter().flatten().collect();
+    let n_warm = warm_all.len();
+    if !warm_all.is_empty() {
+        let _ = ltx.try_send(warm_all);
+    }
+    let kio: Arc<dyn super::keeper::KeeperIo> = io.clone();
+    let ksink = sink.clone();
+    let kc = kcfg.clone();
+    let kt = std::thread::Builder::new().name("replay-keeper".into()).spawn(move || super::keeper::drive(kio, kc, lrx, ksink)).map_err(|e| e.to_string())?;
+    // Pre-roll: the keeper seeds what it learned (copy 2 stays at the first block).
+    let pre0 = Instant::now();
+    let mut seeded_after_s = None;
+    while pre0.elapsed() < Duration::from_secs(lt.preroll_s) {
+        std::thread::sleep(Duration::from_millis(200));
+        let st = sink.status.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let waiting = st["seedsWaiting"].as_u64().unwrap_or(1) + st["pipeline"]["seedsOut"].as_u64().unwrap_or(0);
+        if st["head"].as_u64().is_some() && waiting == 0 && pre0.elapsed() > Duration::from_secs(2) {
+            seeded_after_s = Some(pre0.elapsed().as_secs_f64());
+            break;
+        }
+    }
+    let status_pre = sink.status.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let resets_pre = status_pre["stats"]["resets"].clone();
+    let calls_pre = io.calls.load(Relaxed);
+    // The predicted copy, on this thread (like live's arbsim-ahead thread).
+    let mut a = Ahead::new(cfg);
+    a.diag = Some(Default::default());
+    a.collect_all = Some(Vec::new());
+    let mut prov: Arc<dyn Provenance + Send + Sync> = Arc::new(ProvSets::all_exact());
+    let mut moves: HashMap<B256, Option<Vec<String>>> = HashMap::new();
+    let mut snaps: BTreeMap<u64, Arc<Snapshot>> = BTreeMap::new();
+    let (mut n_feed, mut n_conf, mut n_settled, mut settled_used, mut filled) = (0u64, 0u64, 0u64, 0u64, 0u64);
+    let (mut first_block, mut last_block) = (None, 0u64);
+    let mut last_feed_seq = 0u64;
+    let mut late_feed_ms: Vec<u64> = Vec::new();
+    let mut c2_lag: Vec<u64> = Vec::new();
+    let mut keeper_vs_c2: Vec<i64> = Vec::new();
+    let mut seen_pub = published.load(Relaxed);
+    let t0 = Instant::now();
+    let cpu_run0 = process_cpu_s();
+    // Memory during the timed run (resident, sampled every 10 feed messages).
+    let rss_run0 = rss_kb().1;
+    let mut rss_run_max = rss_run0;
+    // Like live's run loop after each wake-up: the keeper's version of the
+    // base block (a keeper rebase if it came late), and what to learn.
+    let keeper_turn = |a: &mut Ahead, seen: &mut u64| {
+        let p = published.load(Relaxed);
+        if p != *seen {
+            *seen = p;
+            if let Some(b) = a.base_block() {
+                if let Some(kv) = sink.version_at(b) {
+                    a.on_kept(kv);
+                }
+            }
+        }
+        if !a.learned.is_empty() {
+            let _ = ltx.try_send(std::mem::take(&mut a.learned));
+        }
+    };
+    for ev in live_order(&cap.events[1..], lt.copy2_delay_blocks) {
+        match ev {
+            CapEv::Header { .. } => return Err("two settings records".into()),
+            CapEv::Pools { list, not_ready } => a.set_pools(Arc::new(PoolSet::build(list, not_ready.iter().cloned().collect()))),
+            CapEv::Routes(r) => a.set_route_pools(r.as_ref().map(|v| Arc::new(v.iter().cloned().collect()))),
+            CapEv::Touchers(v) => a.learn_touchers(v),
+            CapEv::Prov(p) => prov = p.clone(),
+            CapEv::Feed(m) => {
+                // Wait for its live arrival time; meanwhile react to the
+                // keeper like the live thread does (it wakes on kept_hook).
+                let due = t0 + Duration::from_secs_f64(n_feed as f64 * block_ms / 1000.0);
+                loop {
+                    let now = Instant::now();
+                    if now >= due {
+                        break;
+                    }
+                    std::thread::sleep((due - now).min(Duration::from_millis(2)));
+                    keeper_turn(&mut a, &mut seen_pub);
+                }
+                late_feed_ms.push(Instant::now().saturating_duration_since(due).as_millis() as u64);
+                if n_feed % 10 == 0 {
+                    rss_run_max = rss_run_max.max(rss_kb().1);
+                }
+                n_feed += 1;
+                last_feed_seq = m.seq;
+                io.announce(m.seq + l2_offset);
+                for t in &m.txs {
+                    let _ = t.decoded();
+                }
+                a.on_feed_message_at(m.clone(), due);
+                if let (Some(v), Some(b)) = (sink.versions.lock().unwrap_or_else(|e| e.into_inner()).back().map(|v| v.block), io.copy2_head()) {
+                    keeper_vs_c2.push(v as i64 - b as i64);
+                }
+            }
+            CapEv::Moves(v) => {
+                for (h, p) in v {
+                    moves.insert(*h, p.clone());
+                }
+            }
+            CapEv::Confirmed { seq, ctx, snap } => {
+                n_conf += 1;
+                first_block.get_or_insert(*seq);
+                last_block = last_block.max(*seq);
+                c2_lag.push(last_feed_seq.saturating_sub(*seq));
+                snaps.insert(*seq, snap.clone());
+                while snaps.len() > 128 {
+                    let k = *snaps.keys().next().unwrap();
+                    snaps.remove(&k);
+                }
+                io.set_copy2(*seq + l2_offset);
+                // Live order: the keeper's version of this block first (if
+                // it is already there), then copy 2's version.
+                if let Some(kv) = sink.version_at(*seq + l2_offset) {
+                    a.on_kept(kv);
+                }
+                let c = Confirmed { seq: *seq, snap: snap.clone(), ctx: ctx.clone(), diff: Arc::new(StateDiff::default()), prov: prov.clone() };
+                a.on_confirmed(c, &|h| moves.get(h).cloned().flatten());
+            }
+            CapEv::Settled(st) => {
+                n_settled += 1;
+                let Some((pools, keys, _)) = a.pending_parts(st.seq) else { continue };
+                let mut st = st.clone();
+                let before = st.now.len();
+                if let (Some(prev), Some(now)) = (snaps.get(&(st.seq.wrapping_sub(1))), snaps.get(&st.seq)) {
+                    st.fill_from(&pools, keys.iter(), prev, now);
+                }
+                filled += (st.now.len() - before) as u64;
+                if a.compare_settled(&st, &|h| moves.get(h).cloned().flatten()) {
+                    settled_used += 1;
+                }
+            }
+            CapEv::End { .. } => {}
+        }
+        keeper_turn(&mut a, &mut seen_pub);
+    }
+    let took_ms = t0.elapsed().as_millis() as u64;
+    let run_s = t0.elapsed().as_secs_f64().max(0.001);
+    let cpu_run = process_cpu_s() - cpu_run0;
+    let kst = sink.status.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    sink.stop.store(true, Relaxed);
+    let _ = kt.join();
+    let (rss_peak, rss_now) = rss_kb();
+    let all = a.collect_all.take().unwrap_or_default();
+    let mut r = report(&a, &all, ReportInfo { n_feed, n_conf, n_settled, settled_used, filled, first_block, last_block, took_ms, complete: cap.complete, cut: cap.cut.clone(), live_start: "null".into(), live_end: None, l2_offset, budget_ms: Some(cfg_budget_ms(&a)) });
+    if let Some((fails, unsure)) = &a.diag {
+        let top = |m: &BTreeMap<String, u64>| {
+            let mut v: Vec<(&String, &u64)> = m.iter().collect();
+            v.sort_by(|x, y| y.1.cmp(x.1));
+            v.into_iter().take(12).map(|(k, n)| json!({"what": k, "n": n})).collect::<Vec<_>>()
+        };
+        r["diag"] = json!({"failedRuns": top(fails), "unsurePools": top(unsure)});
+    }
+    let t = &a.total;
+    let mut cpu = t.cpu_us.clone();
+    let mut wall = t.apply_us.clone();
+    let mut lf = late_feed_ms.clone();
+    let mut lag = c2_lag.clone();
+    let mut kv: Vec<u64> = keeper_vs_c2.iter().map(|x| (*x + 1000).max(0) as u64).collect();
+    let kv_p = crate::timing::pct_of(&mut kv);
+    let shift = |v: &Value| v.as_i64().map(|x| x - 1000);
+    let calls_run = io.calls.load(Relaxed) - calls_pre;
+    r["liveTiming"] = json!({
+        "settings": settings,
+        "blockMs": (block_ms * 10.0).round() / 10.0, "nodeMs": {"p50": lt.node_p50_ms, "p90": lt.node_p90_ms}, "nodeLagMs": lt.node_lag_ms,
+        "warmValuesLearned": n_warm, "prerollSeededAfterS": seeded_after_s,
+        "runSeconds": (run_s * 10.0).round() / 10.0,
+        // The predicted copy kept up with the feed? (how late each feed
+        // message was handled vs its live arrival time)
+        "feedHandledLateMs": crate::timing::pct_of(&mut lf),
+        "copy2BehindFeedBlocks": crate::timing::pct_of(&mut lag),
+        "applyWallUs": crate::timing::pct_of(&mut wall), "applyCpuUs": crate::timing::pct_of(&mut cpu),
+        "msgs": t.msgs, "applied": t.applied, "appliedPerMsg": if t.msgs > 0 { (100.0 * t.applied as f64 / t.msgs as f64).round() / 100.0 } else { 0.0 },
+        "msgsStopped": t.msgs_stopped, "overBudget": t.over_budget, "tips": t.tips, "tipSharePct": if t.msgs > 0 { (1000.0 * t.tips as f64 / t.msgs as f64).round() / 10.0 } else { 0.0 },
+        "keptBases": t.kept_bases, "keptMissing": t.kept_missing, "keptBasesPct": if t.kept_bases + t.kept_missing > 0 { (1000.0 * t.kept_bases as f64 / (t.kept_bases + t.kept_missing) as f64).round() / 10.0 } else { 0.0 },
+        "keptRebases": t.kept_rebases, "keptSkipped": t.kept_skipped,
+        "sure": {"right": t.agree, "wrong": t.disagree, "unsure": t.unsure, "rightKeptBase": t.right_kept, "wrongKeptBase": t.wrong_kept, "rightPlainBase": t.right_plain, "wrongPlainBase": t.wrong_plain},
+        "blocksCompared": t.compared, "blocksUnpredicted": t.unpredicted,
+        "keeper": {
+            "resetsBeforeRun": resets_pre, "resetsEnd": kst["stats"]["resets"].clone(),
+            "callsPerS": (calls_run as f64 / run_s * 10.0).round() / 10.0, "notYetTotal": io.not_yet.load(Relaxed),
+            "aheadOfCopy2Blocks": {"p10": shift(&kv_p["p10"]), "p50": shift(&kv_p["p50"]), "p90": shift(&kv_p["p90"]), "min": shift(&kv_p["min"]), "n": kv_p["n"].clone()},
+            "contracts": kst["contracts"].clone(), "accounts": kst["accounts"].clone(), "values": kst["values"].clone(), "candidates": kst["candidates"].clone(), "candidateValues": kst["candidateValues"].clone(),
+            "seedsWaiting": kst["seedsWaiting"].clone(), "applyUs": kst["stats"]["applyUs"].clone(), "seedsSent": kst["stats"]["seedsSent"].clone(), "seedsDropped": kst["stats"]["seedsDropped"].clone(),
+        },
+        "cpuSecondsPerSecond": (cpu_run / run_s * 100.0).round() / 100.0,
+        "memoryKb": {"beforeRun": rss0, "peak": rss_peak, "end": rss_now, "growthPeak": rss_peak.saturating_sub(rss0)},
+        "cpuSecondsWarmAndPreroll": ((cpu_run0 - cpu0) * 10.0).round() / 10.0,
+    });
+    r["liveTiming"]["copy2DelayBlocks"] = json!(lt.copy2_delay_blocks);
+    r["liveTiming"]["memoryRunKb"] = json!({"atStart": rss_run0, "maxDuringRun": rss_run_max, "growth": rss_run_max.saturating_sub(rss_run0)});
+    Ok(r)
+}
+
+/// The capture's events in the order a live run with copy 2 `delay`
+/// blocks behind the feed would see them: feed messages keep their order
+/// and pace; everything else keeps its order too, but a copy-2 version of
+/// block N (and whatever came after it) waits until the feed has reached
+/// N + delay. None = the capture's own order.
+pub fn live_order(evs: &[CapEv], delay: Option<u64>) -> Vec<&CapEv> {
+    let Some(delay) = delay else { return evs.iter().collect() };
+    let mut feeds: Vec<&CapEv> = Vec::new();
+    // Other events with the feed sequence number they must wait for.
+    let mut others: Vec<(u64, &CapEv)> = Vec::new();
+    let mut need = 0u64;
+    let mut last_feed = 0u64;
+    for e in evs {
+        match e {
+            CapEv::Feed(m) => {
+                last_feed = m.seq;
+                feeds.push(e);
+            }
+            _ => {
+                // Never earlier than in the capture; a version waits for
+                // the feed to be `delay` past it; later ones wait behind it.
+                need = need.max(last_feed);
+                if let CapEv::Confirmed { seq, .. } = e {
+                    need = need.max(seq + delay);
+                }
+                others.push((need, e));
+            }
+        }
+    }
+    let mut out: Vec<&CapEv> = Vec::with_capacity(evs.len());
+    let (mut fi, mut oi) = (0usize, 0usize);
+    let mut fed = 0u64;
+    while fi < feeds.len() || oi < others.len() {
+        if oi < others.len() && (others[oi].0 <= fed || fi >= feeds.len()) {
+            out.push(others[oi].1);
+            oi += 1;
+        } else {
+            if let CapEv::Feed(m) = feeds[fi] {
+                fed = m.seq;
+            }
+            out.push(feeds[fi]);
+            fi += 1;
+        }
+    }
+    out
+}
+
+fn cfg_budget_ms(a: &Ahead) -> u64 {
+    a.cfg().msg_budget_us / 1000
+}
+
 /// Whether the replay keeper starts warm (it was given values to learn first).
 fn k_warm_flag(r: &super::keeper_replay::ReplayKeeper) -> bool {
     r.core.seeds_waiting() > 0 || r.core.held_counts().0 > 0
@@ -1446,6 +1808,65 @@ pub fn replay_main(args: &[String]) {
     // KEEPER (Oct 31): --keeper <truth file> [--keeper-warm [--keeper-warm-passes N]] [--keep-contracts N]
     // [--keep-seeds-per-h N]: the hot-contract keeper on recorded block diffs.
     let keeper_file = args.iter().position(|a| a == "--keeper").and_then(|i| args.get(i + 1)).cloned();
+    // LIVE TIMING (Oct 31 night): --live-timing [--new] [--env K=V ...]
+    // [--block-ms N] [--node-ms P50,P90] [--node-lag-ms N] [--preroll-s N]
+    // [--keeper-warm-passes N] [--keep-contracts N] (needs --keeper).
+    if args.iter().any(|a| a == "--live-timing") {
+        let Some(f) = keeper_file.clone() else {
+            eprintln!("arbsim ahead-replay: --live-timing needs --keeper <truth file>");
+            std::process::exit(2);
+        };
+        let truth = match super::keeper_replay::Truth::load(&f) {
+            Ok(t) => Arc::new(t),
+            Err(e) => {
+                eprintln!("arbsim ahead-replay: --keeper {e}");
+                std::process::exit(2);
+            }
+        };
+        let mut env: HashMap<String, String> = HashMap::new();
+        if args.iter().any(|a| a == "--new") {
+            env.insert("FASTLANE_AHEAD".into(), "observe".into());
+        } else {
+            // The old runtime: every live-speed setting at its old value.
+            for (k, v) in [("FASTLANE_AHEAD", "observe"), ("FASTLANE_AHEAD_KEEP_FETCH_PAR", "1"), ("FASTLANE_AHEAD_KEEP_SEED_PAR", "0"), ("FASTLANE_AHEAD_KEEP_LEAD", "off"), ("FASTLANE_AHEAD_KEEP_CAND_SLOTS", "2000"), ("FASTLANE_AHEAD_BUDGET_CLOCK", "wall"), ("FASTLANE_AHEAD_LAZY_REBASE", "off"), ("FASTLANE_AHEAD_KEPT_REBUILD", "every"), ("FASTLANE_AHEAD_NEED_KEEPER", "off")] {
+                env.insert(k.into(), v.into());
+            }
+        }
+        env.insert("FASTLANE_AHEAD_KEEP_CONTRACTS".into(), arg("--keep-contracts").unwrap_or(300).to_string());
+        for (i, a) in args.iter().enumerate() {
+            if a == "--env" {
+                if let Some((k, v)) = args.get(i + 1).and_then(|x| x.split_once('=')) {
+                    env.insert(k.to_string(), v.to_string());
+                }
+            }
+        }
+        let node = args.iter().position(|a| a == "--node-ms").and_then(|i| args.get(i + 1)).and_then(|v| v.split_once(',')).and_then(|(a, b)| Some((a.parse::<u64>().ok()?, b.parse::<u64>().ok()?))).unwrap_or((31, 60));
+        let lt = LiveTiming {
+            block_ms: args.iter().position(|a| a == "--block-ms").and_then(|i| args.get(i + 1)).and_then(|v| v.parse::<f64>().ok()),
+            node_p50_ms: node.0,
+            node_p90_ms: node.1,
+            node_lag_ms: arg("--node-lag-ms").unwrap_or(100),
+            env,
+            preroll_s: arg("--preroll-s").unwrap_or(60),
+            warm_passes: arg("--keeper-warm-passes").unwrap_or(2).clamp(0, 10) as usize,
+            copy2_delay_blocks: arg("--copy2-delay-blocks"),
+        };
+        match replay_live(&cap, &opts, truth, &lt) {
+            Ok(r) => {
+                if args.iter().any(|a| a == "--json") {
+                    println!("{r}");
+                } else {
+                    println!("{}", serde_json::to_string_pretty(&r["liveTiming"]).unwrap_or_default());
+                    print!("{}", print_report(&r, arg("--samples").unwrap_or(5) as usize));
+                }
+            }
+            Err(e) => {
+                eprintln!("arbsim ahead-replay: {e}");
+                std::process::exit(2);
+            }
+        }
+        return;
+    }
     let result = match keeper_file {
         None => replay(&cap, &opts),
         Some(f) => {
