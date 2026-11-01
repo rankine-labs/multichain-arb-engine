@@ -10,7 +10,7 @@
 //
 //   So the parts that are only MEASURING (the predicted copy and its
 //   keeper) now step back before that line. Trading never does:
-//     - at ARBSIM_AHEAD_MEM_PAUSE_MB [1200] the predicted copy drops what it
+//     - at ARBSIM_AHEAD_MEM_PAUSE_MB [1350] the predicted copy drops what it
 //       holds (predicted blocks, waiting agreements, its merged base) and
 //       predicts nothing ("stopped: memory" in status), and the keeper stops
 //       growing (no new seeds, no new learned or adopted values; it keeps
@@ -23,7 +23,12 @@
 //       a fragmented 592 MB heap went to 189 MB in 55 ms; glibc holds its
 //       locks meanwhile, so other threads' allocations can wait that long.
 //       This only happens when arbsim would otherwise be killed soon;
-//     - below ARBSIM_AHEAD_MEM_RESUME_MB [1140] both carry on.
+//     - below ARBSIM_AHEAD_MEM_RESUME_MB [1290] both carry on.
+//   Raised Nov 1 2026 (owner OK) from 1200 / 1140 to 1350 / 1290: arbsim's
+//   normal size is ~1,000-1,250 MB, so the old 1200 line paused seeing-ahead
+//   in normal running (959 s paused in 74 min). pm2's kill line moved from
+//   1500 to 1800 MB at the same time (deploy/arbsim-pm2.sh), keeping ~450 MB
+//   between this pause line and the kill line. Server: 7,775 MB RAM.
 //   ARBSIM_AHEAD_MEM_PAUSE_MB=0 turns the guard off. The guard is only ever
 //   asked by the predicted copy and the keeper: with FASTLANE_AHEAD unset
 //   nothing calls it (and it costs nothing).
@@ -46,9 +51,9 @@ use serde_json::{json, Value};
 /// Guard settings (ARBSIM_AHEAD_MEM_*).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GuardCfg {
-    /// ARBSIM_AHEAD_MEM_PAUSE_MB [1200]: pause at or above (0 = guard off).
+    /// ARBSIM_AHEAD_MEM_PAUSE_MB [1350]: pause at or above (0 = guard off).
     pub pause_mb: u64,
-    /// ARBSIM_AHEAD_MEM_RESUME_MB [1140]: carry on below (kept below pause).
+    /// ARBSIM_AHEAD_MEM_RESUME_MB [1290]: carry on below (kept below pause).
     pub resume_mb: u64,
     /// ARBSIM_AHEAD_MEM_TRIM [on]: hand freed memory back while paused.
     pub trim: bool,
@@ -57,8 +62,8 @@ pub struct GuardCfg {
 impl GuardCfg {
     pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> GuardCfg {
         let num = |k: &str, d: u64| get(k).and_then(|v| v.trim().parse::<u64>().ok()).filter(|v| *v <= 1_000_000).unwrap_or(d);
-        let pause_mb = num("ARBSIM_AHEAD_MEM_PAUSE_MB", 1200);
-        let resume_mb = num("ARBSIM_AHEAD_MEM_RESUME_MB", 1140);
+        let pause_mb = num("ARBSIM_AHEAD_MEM_PAUSE_MB", 1350);
+        let resume_mb = num("ARBSIM_AHEAD_MEM_RESUME_MB", 1290);
         // A resume line at or above the pause line would flap: keep a gap.
         let resume_mb = if pause_mb > 0 && resume_mb >= pause_mb { pause_mb.saturating_sub(pause_mb / 20).max(1) } else { resume_mb };
         let trim = crate::copy2::ahead::on_off(get("ARBSIM_AHEAD_MEM_TRIM").as_deref()).unwrap_or(true);
@@ -323,27 +328,29 @@ mod tests {
 
     #[test]
     fn settings_and_defaults() {
-        assert_eq!(cfg(&[]), GuardCfg { pause_mb: 1200, resume_mb: 1140, trim: true });
+        assert_eq!(cfg(&[]), GuardCfg { pause_mb: 1350, resume_mb: 1290, trim: true });
         assert_eq!(cfg(&[("ARBSIM_AHEAD_MEM_PAUSE_MB", "0")]).pause_mb, 0);
         assert_eq!(cfg(&[("ARBSIM_AHEAD_MEM_TRIM", "off")]).trim, false);
         // A resume line at / above the pause line is pulled 5% below it.
         assert_eq!(cfg(&[("ARBSIM_AHEAD_MEM_PAUSE_MB", "1000"), ("ARBSIM_AHEAD_MEM_RESUME_MB", "1000")]).resume_mb, 950);
-        assert_eq!(cfg(&[("ARBSIM_AHEAD_MEM_PAUSE_MB", "junk")]).pause_mb, 1200);
+        assert_eq!(cfg(&[("ARBSIM_AHEAD_MEM_PAUSE_MB", "junk")]).pause_mb, 1350);
     }
 
     #[test]
     fn pauses_at_the_line_and_resumes_below_the_lower_one() {
         let c = cfg(&[]);
         let mut g = Guard::default();
-        assert_eq!(g.look(&c, 1100.0), Step::Same);
-        assert_eq!(g.look(&c, 1199.9), Step::Same);
-        assert_eq!(g.look(&c, 1200.0), Step::Paused);
+        // Default lines: pause at 1350 MB, carry on below 1290 MB. The old
+        // 1200 MB line is now normal running and must not pause.
+        assert_eq!(g.look(&c, 1200.0), Step::Same);
+        assert_eq!(g.look(&c, 1349.9), Step::Same);
+        assert_eq!(g.look(&c, 1350.0), Step::Paused);
         // In between the two lines: stays paused (no flapping).
-        assert_eq!(g.look(&c, 1170.0), Step::Same);
+        assert_eq!(g.look(&c, 1320.0), Step::Same);
         assert!(g.paused);
-        assert_eq!(g.look(&c, 1139.0), Step::Resumed);
+        assert_eq!(g.look(&c, 1289.0), Step::Resumed);
         assert!(!g.paused);
-        assert_eq!(g.look(&c, 1170.0), Step::Same, "not paused again until the pause line");
+        assert_eq!(g.look(&c, 1320.0), Step::Same, "not paused again until the pause line");
         assert_eq!((g.pauses, g.resumes), (1, 1));
         // Off: never pauses.
         let off = cfg(&[("ARBSIM_AHEAD_MEM_PAUSE_MB", "0")]);
@@ -359,7 +366,7 @@ mod tests {
         // The library's tests run on glibc (no `alloc::Chosen` here).
         assert_eq!(s["allocator"], json!("system"));
         assert!(s["malloc"]["inUseMb"].is_number());
-        assert_eq!(s["aheadGuard"]["pauseMb"], json!(1200));
+        assert_eq!(s["aheadGuard"]["pauseMb"], json!(1350));
     }
 
     /// Offline measurement (run by hand): what malloc_trim and mallinfo2
