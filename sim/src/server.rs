@@ -286,6 +286,9 @@ pub fn handle_tm(ctx: &Ctx, req: &Value, tm: &mut Tm) -> Value {
             // holds it, and over-size socket messages dropped.
             s["trigTable"] = crate::check::entry::status_json();
             s["socket"] = socket_status_json();
+            // (Nov 1) Memory breakdown: process size, peak, allocator
+            // figures (cached 30 s) and the seeing-ahead memory guard.
+            s["memory"] = crate::memguard::status_json();
             // FAST LANE A (copy2/ahead.rs): only when FASTLANE is on.
             if let Some(a) = crate::copy2::ahead::status_json() {
                 s["fastlaneAhead"] = a;

@@ -12,6 +12,7 @@ pub mod copy2;
 pub mod fastlane;
 pub mod feed;
 pub mod jobq;
+pub mod memguard;
 pub mod node;
 pub mod proto;
 pub mod server;
