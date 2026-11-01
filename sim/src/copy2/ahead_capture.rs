@@ -437,6 +437,8 @@ fn dec_cfg(d: &mut Dec) -> Res<AheadCfg> {
         lazy_rebase: false,
         kept_rebuild_once: false,
         need_keeper: false,
+        // Not in the file: memory fix (Nov 1); same answers either way.
+        thin_pending: true,
     })
 }
 

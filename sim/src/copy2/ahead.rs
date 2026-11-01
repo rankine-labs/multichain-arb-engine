@@ -205,7 +205,7 @@ use crate::check::ordered::{run_ordered_keep, Assume, OrderedPlan, PlanMsg, Prov
 use crate::check::rawtx::DecodedTx;
 use crate::check::run::{CheckOptions, Session};
 use crate::check::Overrides;
-use crate::state::snap::{Snapshot, View};
+use crate::state::snap::{Acct, PMap, Snapshot, View};
 use crate::state::{Lookup, StateDiff, StatePosition, StateRead};
 
 // ---------------------------------------------------------------------------
@@ -332,11 +332,21 @@ pub struct AheadCfg {
     /// right / 8 wrong: no tip ("keeper_behind") until the keeper's version
     /// arrives (a keeper rebase), so it never counts as sure.
     pub need_keeper: bool,
+    /// FASTLANE_AHEAD_THIN_PENDING [on] (memory fix, Nov 1): a predicted
+    /// block waiting for its agreement (FASTLANE_AHEAD_COMPARE_DELAY_BLOCKS,
+    /// ~6 at a time) keeps only what agreement reads: our pool contracts'
+    /// accounts and, in each V4 PoolManager, our V4 pools' 4 base values.
+    /// Before, each one kept its WHOLE predicted copy, and with the keeper
+    /// each of those holds its own merged PoolManager (copy 2's values with
+    /// the keeper's laid over them: 3-20 MB each, measured in
+    /// tests/ahead_memory.rs). Agreement answers are exactly the same (it
+    /// only reads those values). off = keep the whole copy (old rule).
+    pub thin_pending: bool,
 }
 
 impl Default for AheadCfg {
     fn default() -> Self {
-        AheadCfg { max_blocks: 32, run_all: false, max_txs: 256, max_touchers: 4096, l2_offset: 0, trust_sender_funds: false, msg_budget_us: 10_000, routes_only: true, compare_delay: 0, revert_unsure: true, unknown_continue: false, keeper: false, keep_pick: true, budget_cpu: false, lazy_rebase: false, kept_rebuild_once: false, need_keeper: false }
+        AheadCfg { max_blocks: 32, run_all: false, max_txs: 256, max_touchers: 4096, l2_offset: 0, trust_sender_funds: false, msg_budget_us: 10_000, routes_only: true, compare_delay: 0, revert_unsure: true, unknown_continue: false, keeper: false, keep_pick: true, budget_cpu: false, lazy_rebase: false, kept_rebuild_once: false, need_keeper: false, thin_pending: true }
     }
 }
 
@@ -445,6 +455,9 @@ impl AheadCfg {
                 _ => observe,
             },
             need_keeper: on_off(get("FASTLANE_AHEAD_NEED_KEEPER").as_deref()).unwrap_or(observe),
+            // Memory fix (Nov 1): on in every mode (agreement only measures;
+            // its answers are the same either way).
+            thin_pending: on_off(get("FASTLANE_AHEAD_THIN_PENDING").as_deref()).unwrap_or(d.thin_pending),
         }
     }
 }
@@ -1248,6 +1261,10 @@ pub struct AheadStats {
     /// Predicted blocks whose agreement could not run (copy 2 no longer
     /// held the versions, or too many waiting).
     pub settle_lost: u64,
+    /// Memory guard (memguard.rs): times the prediction was paused, and
+    /// confirmed blocks that passed while it was.
+    pub memory_pauses: u64,
+    pub memory_blocks: u64,
     /// Failed runs that marked more pools unsure under the accuracy-fix
     /// rules (native-ETH pools of a named coin, the target's learned pools).
     pub failed_widened: u64,
@@ -1331,7 +1348,7 @@ impl AheadStats {
         // Accuracy fixes (a second object: one json! macro is limited in size).
         let more = json!({
             "missedReverted": self.missed_reverted, "missedFailed": self.missed_failed, "staleBase": self.stale_base, "baseLate": self.base_late,
-            "notCaptured": self.not_captured, "confGone": self.conf_gone, "rebaseRewrites": self.rebase_rewrites, "settleLost": self.settle_lost, "failedWidened": self.failed_widened,
+            "notCaptured": self.not_captured, "confGone": self.conf_gone, "rebaseRewrites": self.rebase_rewrites, "settleLost": self.settle_lost, "memoryPauses": self.memory_pauses, "memoryBlocks": self.memory_blocks, "failedWidened": self.failed_widened,
             "unknownContinued": self.unknown_continued, "missedUnknown": self.missed_unknown, "tips": self.tips,
             "keptBases": self.kept_bases, "keptMissing": self.kept_missing, "keptValues": self.kept_values, "keptRebases": self.kept_rebases, "learned": self.learned,
             "rightKeptBase": self.right_kept, "wrongKeptBase": self.wrong_kept, "rightPlainBase": self.right_plain, "wrongPlainBase": self.wrong_plain, "keptSkipped": self.kept_skipped,
@@ -1515,6 +1532,16 @@ pub struct Ahead {
     pub oracle: Option<super::keeper_replay::Oracle>,
     pub hour: AheadStats,
     pub total: AheadStats,
+    /// FASTLANE_AHEAD_THIN_PENDING: the newest thin view and the pool set
+    /// it was built for (the next one is built on it: shared entries).
+    thin_prev: Option<(Arc<PoolSet>, Arc<Snapshot>)>,
+    /// Memory guard (memguard.rs, ARBSIM_AHEAD_MEM_PAUSE_MB): paused = holds
+    /// nothing predicted and predicts nothing until the guard lets go.
+    mem_pause: bool,
+    /// Merges made (keeper values laid over a base), and the last one's
+    /// values added + time (status "memory": each merged base is a copy).
+    merges: u64,
+    merge_last: (usize, u64),
 }
 
 impl Ahead {
@@ -1541,6 +1568,10 @@ impl Ahead {
             oracle: None,
             hour: AheadStats::default(),
             total: AheadStats::default(),
+            thin_prev: None,
+            mem_pause: false,
+            merges: 0,
+            merge_last: (0, 0),
         }
     }
 
@@ -1642,7 +1673,10 @@ impl Ahead {
         if self.merged.as_ref().is_some_and(|m| m.seq == base.seq && Arc::ptr_eq(&m.base_snap, &base.snap) && Arc::ptr_eq(&m.kept, &kv)) {
             return false;
         }
+        let t_merge = Instant::now();
         let (snap, n) = super::keeper::merge_base(&base.snap, base.prov.as_ref(), &kv);
+        self.merges += 1;
+        self.merge_last = (n.slots, t_merge.elapsed().as_micros() as u64);
         let prov: Arc<dyn Provenance + Send + Sync> = Arc::new(super::keeper::KeptProv { inner: base.prov.clone(), kept: kv.clone() });
         self.merged = Some(Merged { seq: base.seq, base_snap: base.snap.clone(), kept: kv, snap: Arc::new(snap), prov });
         self.count(|s| s.kept_values += n.slots as u64);
@@ -1654,7 +1688,7 @@ impl Ahead {
     /// of our base block and the prediction ran without it, the prediction
     /// is rebuilt on the merged base (a "keeper rebase").
     pub fn on_kept(&mut self, v: Arc<super::keeper::KeptVersion>) {
-        if !self.cfg.keeper {
+        if !self.cfg.keeper || self.mem_pause {
             return;
         }
         if self.kept.back().is_some_and(|x| Arc::ptr_eq(x, &v)) {
@@ -1805,6 +1839,50 @@ impl Ahead {
         self.on_feed_message_at(m, Instant::now());
     }
 
+    /// MEMORY GUARD (memguard.rs): `on` = arbsim is near pm2's memory
+    /// limit. Everything predicted is dropped (predicted blocks, the tip,
+    /// waiting agreements, the merged base, the keeper versions held here)
+    /// and nothing is predicted ("stopped: memory") until `off`, when the
+    /// prediction is rebuilt on the newest base. Trading never depends on
+    /// this copy in observe mode; with FASTLANE_AHEAD=on the lane simply has
+    /// no predicted tip meanwhile (it then scans copy 2, as when stopped).
+    /// Returns whether anything changed.
+    pub fn memory_pause(&mut self, on: bool) -> bool {
+        if on == self.mem_pause {
+            return false;
+        }
+        self.mem_pause = on;
+        if on {
+            let waiting = self.pending.len() as u64;
+            self.entries.clear();
+            self.pending.clear();
+            self.merged = None;
+            self.thin_prev = None;
+            self.kept.clear();
+            self.last_probe = None;
+            self.learned.clear();
+            self.count(|s| {
+                s.settle_lost += waiting;
+                s.memory_pauses += 1;
+            });
+            self.halt(u64::MAX, "memory");
+        } else {
+            if self.stop.as_ref().is_some_and(|s| s.why == "memory") {
+                self.stop = None;
+            }
+            if self.base.is_some() {
+                self.remerge();
+                self.rebuild();
+            }
+        }
+        true
+    }
+
+    /// Is the memory guard holding the prediction back?
+    pub fn memory_paused(&self) -> bool {
+        self.mem_pause
+    }
+
     /// `on_feed_message` with the time the message reached arbsim.
     pub fn on_feed_message_at(&mut self, m: Arc<BinMsg>, at: Instant) {
         self.count(|s| s.msgs += 1);
@@ -1880,7 +1958,9 @@ impl Ahead {
             self.learn_from(&notes, moved_by_tx);
             self.entries[i].notes = notes;
         }
-        if first_time {
+        if first_time && self.mem_pause {
+            self.count(|s| s.memory_blocks += 1);
+        } else if first_time {
             // FASTLANE_AHEAD_LAZY_REBASE: the predicted block this version
             // is compared with may not be built yet (several versions came
             // in a row): build up to it on the CURRENT base first.
@@ -1903,8 +1983,11 @@ impl Ahead {
             }
         }
         self.base = Some(c);
-        // KEEPER: the keeper's values of this very block, if it has them.
-        self.remerge();
+        // KEEPER: the keeper's values of this very block, if it has them
+        // (not while the memory guard holds the prediction back).
+        if !self.mem_pause {
+            self.remerge();
+        }
         self.entries.clear();
         self.tip = None;
         self.stop = None;
@@ -1913,6 +1996,10 @@ impl Ahead {
         match self.over_budget_seq {
             Some(s) if s > seq => self.stop = Some(Stop { seq: s, why: "msg_budget" }),
             _ => self.over_budget_seq = None,
+        }
+        if self.mem_pause {
+            // Memory guard: still nothing predicted (not counted again).
+            self.stop = Some(Stop { seq: u64::MAX, why: "memory" });
         }
         self.msgs = self.msgs.split_off(&(seq + 1));
         if self.cfg.lazy_rebase {
@@ -1942,11 +2029,21 @@ impl Ahead {
             self.count(|s| s.unpredicted += 1);
             return;
         };
+        // Memory fix (FASTLANE_AHEAD_THIN_PENDING): when the agreement waits
+        // for settled versions, keep only what it will read.
+        let snap = if self.cfg.thin_pending && self.cfg.compare_delay > 0 {
+            let prev = self.thin_prev.as_ref().filter(|(p, _)| Arc::ptr_eq(p, &self.pools)).map(|(_, s)| s.as_ref());
+            let t = Arc::new(thin_for_agreement_from(&self.entries[i].snap, &self.pools, prev));
+            self.thin_prev = Some((self.pools.clone(), t.clone()));
+            t
+        } else {
+            self.entries[i].snap.clone()
+        };
         let e = &self.entries[i];
         let p = Pending {
             seq: e.seq,
             base_snap: b.snap.clone(),
-            snap: e.snap.clone(),
+            snap,
             changed_cum: e.changed_cum.clone(),
             unsure_cum: e.unsure_cum.clone(),
             notes: e.notes.clone(),
@@ -2731,6 +2828,70 @@ fn place_diffs(p: Place, pred: &Snapshot, conf: &[(U256, U256)]) -> Vec<(U256, L
         .collect()
 }
 
+/// The part of a predicted copy that agreement reads (memory fix, Nov 1,
+/// FASTLANE_AHEAD_THIN_PENDING): `place_diffs` only looks up values of our
+/// pools' places: a pool contract's own account (its declared values) and,
+/// in a V4 PoolManager, a V4 pool's 4 base values. Those accounts / values
+/// are carried over as they are (persistent maps: a pointer copy), with
+/// the same "every value known" flag and the same never-trusted list, so
+/// every lookup agreement can make answers exactly as on the whole copy.
+/// Everything else (above all the big merged PoolManager map and every
+/// kept outside contract) is left out, so a waiting block no longer pins
+/// its own merged copy.
+pub fn thin_for_agreement(pred: &Snapshot, pools: &PoolSet) -> Snapshot {
+    thin_for_agreement_from(pred, pools, None)
+}
+
+/// `thin_for_agreement`, built on the previous thin view when there is one
+/// (same pool set): an unchanged pool account is kept as the very same
+/// entry, so the waiting blocks share one account map instead of one
+/// 1,800-entry map each. Same answers as a fresh build (tested).
+pub fn thin_for_agreement_from(pred: &Snapshot, pools: &PoolSet, prev: Option<&Snapshot>) -> Snapshot {
+    let mut out = match prev {
+        Some(p) => Snapshot { accounts: p.accounts.clone(), codes: PMap::default(), pos: pred.pos, volatile: pred.volatile.clone() },
+        None => Snapshot { accounts: PMap::default(), codes: PMap::default(), pos: pred.pos, volatile: pred.volatile.clone() },
+    };
+    let same = |x: &Acct, y: &Acct| x.storage.ptr_eq(&y.storage) && x.basics == y.basics && x.balance_exact == y.balance_exact && x.storage_complete == y.storage_complete;
+    // PoolManagers are rebuilt fresh (only our V4 pools' 4 base values).
+    let mut pms: HashMap<Address, Acct> = HashMap::new();
+    for place in pools.places.values() {
+        match *place {
+            Place::Contract(a) => match pred.accounts.get(&a) {
+                Some(acc) => {
+                    if !out.accounts.get(&a).is_some_and(|t| same(t, acc)) {
+                        out.accounts.insert(a, acc.clone());
+                    }
+                }
+                None => {
+                    out.accounts.remove(&a);
+                }
+            },
+            Place::V4(pm, base) => {
+                let Some(full) = pred.accounts.get(&pm) else { continue };
+                let thin = pms.entry(pm).or_insert_with(|| Acct { basics: full.basics.clone(), balance_exact: full.balance_exact, storage: PMap::default(), storage_complete: full.storage_complete });
+                for k in 0..4u8 {
+                    let s = base + U256::from(k);
+                    if let Some(v) = full.storage.get(&s) {
+                        thin.storage.insert(s, *v);
+                    }
+                }
+            }
+        }
+    }
+    // A PoolManager the previous view had but this copy doesn't hold.
+    for place in pools.places.values() {
+        if let Place::V4(pm, _) = *place {
+            if !pms.contains_key(&pm) {
+                out.accounts.remove(&pm);
+            }
+        }
+    }
+    for (pm, a) in pms {
+        out.accounts.insert(pm, a);
+    }
+    out
+}
+
 impl Settled {
     /// From copy 2's versions `prev` (block seq - 1) and `now` (block seq):
     /// every pool of ours whose own values differ between them, with the
@@ -3157,6 +3318,14 @@ fn run_loop(c2: super::intake::Copy2Handle, cfg: AheadCfg, rx: Receiver<Ev>) {
                 c.send(&a, super::ahead_capture::CapEv::Routes(routes_now.clone()));
             }
         }
+        // MEMORY GUARD (memguard.rs, Nov 1): near pm2's memory limit the
+        // prediction drops what it holds and waits (trading unchanged).
+        let mp = crate::memguard::pressure();
+        if a.memory_pause(mp) && mp {
+            if let Some(c) = cap.as_mut().filter(|c| c.on()) {
+                c.stop(&a, "memory guard");
+            }
+        }
         // Confirmed first (a new version may already cover a feed message).
         // Every version published since the last one, in order (review L1:
         // agreement is per block; a jump would miscount). Accuracy fixes:
@@ -3339,6 +3508,14 @@ fn status_of(a: &Ahead) -> Value {
         "keeper": {"on": a.cfg.keeper, "baseMerged": a.merged.as_ref().is_some_and(|m| Some(m.seq) == a.base.as_ref().map(|b| b.seq)),
             "keptBases": a.hour.kept_bases, "keptMissing": a.hour.kept_missing, "keptRebases": a.hour.kept_rebases, "learned": a.hour.learned},
         "hour": a.hour.json(), "total": a.total.json_with(false),
+        // (Nov 1) What the predicted copy holds: waiting agreements (thin =
+        // only our pools' values; whole = each pins its own merged base),
+        // keeper versions held here, merges (each merged base is a copy of
+        // copy 2's maps the keeper's values were written into: the last
+        // one's values added and time), and the memory guard.
+        "memory": {"paused": a.mem_pause, "waitingAgreements": a.pending.len(), "thinPending": a.cfg.thin_pending,
+            "keeperVersionsHeld": a.kept.len(), "mergedBase": a.merged.is_some(), "merges": a.merges,
+            "mergeLastValues": a.merge_last.0, "mergeLastUs": a.merge_last.1},
     })
 }
 

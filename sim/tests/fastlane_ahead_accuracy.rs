@@ -735,3 +735,72 @@ fn keeper_setting_defaults() {
     assert!(!cfg(None, None) && !cfg(Some("on"), None) && cfg(Some("observe"), None));
     assert!(cfg(Some("on"), Some("on")) && !cfg(Some("observe"), Some("off")));
 }
+
+// ---------------------------------------------------------------------------
+// Memory fixes (Nov 1): thin waiting agreements, memory guard pause
+// ---------------------------------------------------------------------------
+
+/// FASTLANE_AHEAD_THIN_PENDING: a waiting agreement keeps only what it reads.
+/// The same scenarios (agree after a late report; staleBase on a corrected
+/// base; a phantom) give exactly the same counts and samples thin or whole.
+#[test]
+fn thin_waiting_agreements_give_the_same_answers() {
+    let run = |thin: bool| {
+        let cfg = AheadCfg { compare_delay: 2, thin_pending: thin, ..AheadCfg::default() };
+        let s10 = Arc::new(copy_at(100, 7));
+        let mut a = ahead_on(cfg, (*s10).clone());
+        // 11: our swap on POOL (+5); settled with the late report written in.
+        a.on_feed_message(msg(11, &[stx(0, pool(), w(5))]));
+        a.on_confirmed(confirmed(11, Arc::new(copy_at(100, 7))), &no_moves);
+        // 12: a swap on POOL2 (+3); the settled block says +4 (value differs).
+        a.on_feed_message(msg(12, &[stx(1, pool2(), w(3))]));
+        a.on_confirmed(confirmed(12, Arc::new(copy_at(105, 10))), &no_moves);
+        // 13: nothing predicted moves; the chain moved POOL (missed).
+        a.on_feed_message(msg(13, &[]));
+        a.on_confirmed(confirmed(13, Arc::new(copy_at(109, 11))), &no_moves);
+        let settle = |a: &mut Ahead, seq: u64, prev: &Snapshot, now: &Snapshot| {
+            let (pools, keys, base) = a.pending_parts(seq).unwrap();
+            let st = Settled::build(&pools, seq, prev, now, keys.iter(), Some(&base));
+            assert!(a.compare_settled(&st, &no_moves));
+        };
+        settle(&mut a, 11, &s10, &copy_at(105, 7));
+        settle(&mut a, 12, &copy_at(105, 7), &copy_at(105, 11));
+        settle(&mut a, 13, &copy_at(105, 11), &copy_at(109, 11));
+        let t = &a.total;
+        (t.agree, t.disagree, t.missed, t.phantom, t.value_diff, t.stale_base, t.unsure, t.compared, serde_json::to_string(&t.samples).unwrap())
+    };
+    let (whole, thin) = (run(false), run(true));
+    assert_eq!(whole, thin, "thin waiting agreements answer exactly like whole copies");
+    assert!(whole.0 >= 1 && whole.1 >= 1, "the scenario has both agreements and disagreements: {whole:?}");
+}
+
+/// Memory guard (memguard.rs): a pause drops everything predicted (tip,
+/// predicted blocks, waiting agreements) and predicts nothing ("stopped:
+/// memory") while copy 2's versions keep coming; on resume the prediction
+/// is rebuilt on the newest base and runs as before.
+#[test]
+fn memory_pause_drops_the_prediction_and_resumes() {
+    let mut a = ahead_on(AheadCfg { compare_delay: 2, ..AheadCfg::default() }, copy_at(100, 7));
+    a.on_feed_message(msg(11, &[stx(0, pool(), w(5))]));
+    a.on_confirmed(confirmed(11, Arc::new(copy_at(105, 7))), &no_moves);
+    a.on_feed_message(msg(12, &[stx(1, pool(), w(1))]));
+    assert!(a.tip().is_some() && a.is_pending(11));
+    assert!(a.memory_pause(true), "pause");
+    assert!(!a.memory_pause(true), "already paused");
+    assert!(a.tip().is_none() && a.depth() == 0 && !a.is_pending(11), "everything predicted dropped");
+    assert_eq!(a.stopped().map(|s| s.1), Some("memory"));
+    assert_eq!((a.total.memory_pauses, a.total.settle_lost), (1, 1));
+    // Copy 2 moves on, feed messages come: nothing predicted, nothing queued.
+    a.on_confirmed(confirmed(12, Arc::new(copy_at(106, 7))), &no_moves);
+    a.on_feed_message(msg(13, &[stx(2, pool(), w(2))]));
+    assert!(a.tip().is_none() && a.depth() == 0 && !a.is_pending(12));
+    assert_eq!(a.stopped().map(|s| s.1), Some("memory"));
+    assert_eq!(a.total.memory_blocks, 1);
+    assert_eq!(a.total.stopped.get("memory"), Some(&1), "counted once per pause");
+    // Resume: rebuilt on block 12's version (106) with message 13 (+2).
+    assert!(a.memory_pause(false));
+    assert!(a.stopped().is_none());
+    let t = a.tip().expect("predicting again");
+    assert_eq!((t.seq, t.base_seq), (13, 12));
+    assert_eq!(t.view().storage(pool(), U256::ZERO), known(108));
+}

@@ -358,12 +358,38 @@ pub fn merge_base(base: &Snapshot, prov: &dyn Provenance, kv: &KeptVersion) -> (
 // The core (no I/O)
 // ---------------------------------------------------------------------------
 
+/// A set of storage slots kept as a sorted list (memory fix, Nov 1): the
+/// same answers as a HashSet, at about half the memory (a hash set of 256
+/// values reserves room for 512; measured: 4,096 candidates x 256 values =
+/// 66 MB as hash sets, see tests/ahead_memory.rs).
+#[derive(Clone, Debug, Default)]
+struct SlotSet(Vec<U256>);
+
+impl SlotSet {
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+    /// true = it was not there yet.
+    fn insert(&mut self, s: U256) -> bool {
+        match self.0.binary_search(&s) {
+            Ok(_) => false,
+            Err(i) => {
+                self.0.insert(i, s);
+                true
+            }
+        }
+    }
+    fn iter(&self) -> std::slice::Iter<'_, U256> {
+        self.0.iter()
+    }
+}
+
 /// A learned contract (kept or not yet).
 #[derive(Clone, Debug, Default)]
 struct Cand {
     score: f64,
     /// Values its runs needed (bounded by max_slots_per).
-    slots: HashSet<U256>,
+    slots: SlotSet,
     /// Its basics (balance / nonce / code) were needed.
     basics: bool,
 }
@@ -408,6 +434,8 @@ pub struct KeeperStats {
     pub refused_full: u64,
     /// Candidates forgotten because the list was full (weakest first).
     pub cands_dropped: u64,
+    /// Memory guard: learned batches ignored / seeds held back while paused.
+    pub mem_learn_skipped: u64,
     pub audits: u64,
     pub audit_values: u64,
     pub audit_mismatch: u64,
@@ -432,7 +460,7 @@ impl KeeperStats {
             "blocks": self.blocks, "heldTouched": self.held_touched, "valuesUpdated": self.values_updated,
             "learned": self.learned, "seedsSent": self.seeds_sent, "seedValues": self.seed_values, "seedsDropped": self.seeds_dropped,
             "evicted": self.evicted, "recreated": self.recreated, "adopted": self.adopted, "refusedFull": self.refused_full, "candsDropped": self.cands_dropped,
-            "audits": self.audits, "auditValues": self.audit_values, "auditMismatch": self.audit_mismatch,
+            "memLearnSkipped": self.mem_learn_skipped, "audits": self.audits, "auditValues": self.audit_values, "auditMismatch": self.audit_mismatch,
             "resets": self.resets.iter().map(|(k, v)| (k.to_string(), json!(v))).collect::<serde_json::Map<String, Value>>(),
             "applyUs": crate::timing::pct_of(&mut t),
             "samples": self.samples,
@@ -458,6 +486,11 @@ pub struct KeeperCore {
     pending: HashSet<(Address, Option<U256>)>,
     audit_next: usize,
     pub stats: KeeperStats,
+    /// Memory guard (memguard.rs, ARBSIM_AHEAD_MEM_PAUSE_MB): while set the
+    /// keeper does not grow: no seeds sent, nothing learned or adopted. It
+    /// still applies every block to the values it holds (they stay exact,
+    /// so nothing must be seeded again afterwards). Set by the runtime.
+    pub mem_pause: bool,
 }
 
 
@@ -475,6 +508,7 @@ impl KeeperCore {
             pending: HashSet::new(),
             audit_next: 0,
             stats: KeeperStats::default(),
+            mem_pause: false,
         }
     }
 
@@ -595,6 +629,10 @@ impl KeeperCore {
         if by.is_empty() {
             return;
         }
+        if self.mem_pause {
+            self.stats.mem_learn_skipped += 1;
+            return;
+        }
         self.stats.learned += items.len() as u64;
         let total_held: usize = self.cur.slots();
         let mut grew: Vec<Address> = Vec::new();
@@ -689,6 +727,10 @@ impl KeeperCore {
 
     /// The next seed to send (the caller enforces the hourly limit).
     pub fn take_job(&mut self) -> Option<SeedJob> {
+        if self.mem_pause {
+            // Memory guard: the queue waits (nothing dropped).
+            return None;
+        }
         while let Some(j) = self.seeds.pop_front() {
             if self.held.contains(&j.addr) {
                 self.stats.seeds_sent += 1;
@@ -789,7 +831,9 @@ impl KeeperCore {
         let mut updated = 0u64;
         let mut recreate: Vec<Address> = Vec::new();
         // ADOPT (FASTLANE_AHEAD_KEEP_ADOPT): room left for written values.
-        let mut total = if self.cfg.adopt_writes { self.cur.slots() } else { 0 };
+        // (Memory guard: nothing adopted while paused.)
+        let adopt = self.cfg.adopt_writes && !self.mem_pause;
+        let mut total = if adopt { self.cur.slots() } else { 0 };
         let adopt_per = self.cfg.max_slots_per.saturating_mul(10);
         for (a, ad) in &merged.accounts {
             let Some(cur) = self.cur.accounts.get(a) else { continue };
@@ -811,7 +855,7 @@ impl KeeperCore {
                 // Created / destroyed / removed / every value known: the old
                 // path (rare; the account may become "every value known").
                 let mut keys: HashSet<U256> = cur.storage.keys().copied().collect();
-                if self.cfg.adopt_writes && !cur.storage_complete {
+                if adopt && !cur.storage_complete {
                     for s in ad.storage.keys() {
                         if keys.len() >= adopt_per || total >= self.cfg.max_slots_total {
                             break;
@@ -830,7 +874,7 @@ impl KeeperCore {
                 for (s, v) in &ad.storage {
                     if cur.storage.contains_key(s) {
                         f.storage.insert(*s, *v);
-                    } else if self.cfg.adopt_writes && held_n < adopt_per && total < self.cfg.max_slots_total {
+                    } else if adopt && held_n < adopt_per && total < self.cfg.max_slots_total {
                         f.storage.insert(*s, *v);
                         held_n += 1;
                         total += 1;
@@ -945,6 +989,7 @@ impl KeeperCore {
         json!({
             "head": self.head, "contracts": held, "accounts": accts, "values": slots, "codes": self.cur.codes.len(),
             "candidates": self.cands.len(), "candidateValues": self.cands.values().map(|c| c.slots.len()).sum::<usize>(), "seedsWaiting": self.seeds.len(), "versions": self.versions.len(),
+            "recentDiffs": self.recent.len(), "memPaused": self.mem_pause,
             "stats": self.stats.json(),
         })
     }
@@ -1363,6 +1408,8 @@ fn drive_serial(io: Arc<dyn KeeperIo>, cfg: KeeperCfg, rx: std::sync::mpsc::Rece
     // (doubles while it keeps refusing, 100 ms .. 5 s; back to 0 on success).
     let mut rate_wait = Duration::ZERO;
     while !sink.stopped() {
+        // Memory guard (memguard.rs): stop growing near pm2's limit.
+        k.mem_pause = crate::memguard::pressure();
         // Learned values from the predicted copy (all queued; the old loop
         // handed them over one batch at a time).
         while let Ok(items) = rx.try_recv() {
@@ -1576,6 +1623,8 @@ fn drive_pipelined(io: Arc<dyn KeeperIo>, cfg: KeeperCfg, rx: std::sync::mpsc::R
         }};
     }
     while !sink.stopped() {
+        // Memory guard (memguard.rs): stop growing near pm2's limit.
+        k.mem_pause = crate::memguard::pressure();
         learn_all(&mut k, &rx);
         if hour.elapsed() >= Duration::from_secs(3600) {
             hour = Instant::now();
