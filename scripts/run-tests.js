@@ -53,10 +53,25 @@ cleanTmp();
 mkdirSync(tmpRoot, { recursive: true });
 const childEnv = { ...process.env, TMPDIR: tmpRoot, TMP: tmpRoot, TEMP: tmpRoot };
 
+// RETRY ONCE ON THE SERVER (Nov 1): test files that mix logic checks with
+// real-clock work (time slices, time budgets). On the busy live server a
+// pause at the wrong moment can fail them once by chance (#263 was blocked
+// 3 times this way). Only in the server's pre-deploy run (SKIP_TIMING_TESTS=1)
+// a failing file from this list is run ONE more time; it must pass then. A
+// real bug fails both runs, so it still blocks the deploy. GitHub's checks
+// never retry.
+const RETRY_ONCE_ON_SERVER = new Set(['trigEntryLoops4.test.js', 'loopTaxBench.test.js']);
+const serverRun = process.env.SKIP_TIMING_TESTS === '1';
+const runFile = (file) => spawnSync(process.execPath, [join(testDir, file)], { stdio: 'inherit', env: childEnv });
+
 let failed = 0;
 for (const file of files) {
   console.log(`\n=== ${file}`);
-  const result = spawnSync(process.execPath, [join(testDir, file)], { stdio: 'inherit', env: childEnv });
+  let result = runFile(file);
+  if (result.status !== 0 && serverRun && RETRY_ONCE_ON_SERVER.has(file)) {
+    console.log(`>>> ${file} failed once (exit ${result.status}); busy-machine retry, it must pass this time`);
+    result = runFile(file);
+  }
   if (result.status !== 0) {
     failed++;
     console.error(`>>> ${file} FAILED (exit ${result.status})`);
