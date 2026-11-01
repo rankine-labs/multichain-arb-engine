@@ -12,7 +12,7 @@
 #   like before the sidecar existed.
 #
 #   pm2 settings: name "arbsim", low priority (nice 5), restarted if it uses
-#   more than 1300 MB, waits longer and longer between crash restarts (1 s up
+#   more than 1500 MB, waits longer and longer between crash restarts (1 s up
 #   to 15 s) so a broken sidecar can't hog the server, timestamps in the
 #   logs. Log files are rotated by pm2-logrotate (already installed).
 #
@@ -31,6 +31,11 @@
 #   ~800 MB, right ON the old line, so pm2 restarted it in normal running
 #   (fire-first blind ~16% of an hour). 1300 MB = steady size + ~60% room;
 #   the server has ~1.5 GB available next to the bot (~0.9-1.2 GB).
+#   Raised to 1500 MB (Nov 1 2026, owner OK): seeing-ahead's memory guard
+#   (ARBSIM_AHEAD_MEM_PAUSE_MB=1200, resume 1140, PR #257) pauses only the
+#   predicted copy and keeper growth; 1500 MB leaves ~300 MB between that
+#   pause line and this kill line. The server is now 7.7 GB with ~3.5 GB
+#   available next to both apps (free -m, Nov 1), so +200 MB is safe.
 #   A changed limit applies when pm2 (re)creates the app: on the next
 #   program update, or `bash deploy/arbsim-pm2.sh restart` after a stop.
 #
@@ -62,7 +67,7 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/arbsim-lib.sh"
 
 PM2_STATE_FILE="$BIN_DIR/.arbsim-pm2-state"
 # pm2 restarts the sidecar above this much memory (MB); see the header.
-ARBSIM_MEM_LIMIT_MB=1300
+ARBSIM_MEM_LIMIT_MB=1500
 # pm2 waits this long (ms) after the stop signal before killing (final save).
 ARBSIM_KILL_TIMEOUT_MS=30000
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [arbsim] $*"; }
