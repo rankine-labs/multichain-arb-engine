@@ -78,7 +78,7 @@ import { RobinhoodChainAdapter } from './chains/robinhoodChain';
 import { createLocalSimHost, LocalSimHost, LocalCheck, LocalKind, LocalOutcome } from './execution/localSimHost';
 import { TriggerFirst, trigFirstSettings, TrigOutcome } from './execution/triggerFirst';
 import { Scoreboard, SendPath, Confidence as ScoreConfidence, standingGapFailBlock, entryFailBlock } from './report/scoreboard';
-import { TrigEntry, EntryCandidate, EntryPick, TablePool, entrySettings, enumerateRoutes, rankRoutes, nodeAsksOn, tableFastOn, poolShapeKey, poolPriceKey } from './execution/trigEntry';
+import { TrigEntry, EntryCandidate, EntryPick, TablePool, entrySettings, enumerateRoutes, rankRoutes, nodeAsksOn, tableFastOn, tableQuietOn, poolShapeKey, poolPriceKey } from './execution/trigEntry';
 import { EntryLoopIndex, EntryLoop, EntryLoopHost, EntryLoopSender, CoinTaxFileView, LoopScoreMemo, loopIndexSettings, loopQuoteUsd, pickLoops, loopSkipText, askLoopTaxTests, loopIndexNeeded } from './execution/trigEntryLoops';
 import { hasExactMath } from './core/loopFinder';
 import { runCheckFirst } from './execution/checkFirstFlow';
@@ -3075,6 +3075,12 @@ const entryCandidatesFor = (keys: string[], limit: number): { cands: EntryCandid
 // pools' prices (and seen fees): a change there reaches arbsim at once.
 // TRIG_TABLE_FAST=0: exactly the old inputs (pool state objects).
 const entryTableFast = tableFastOn();
+// QUIET SKIP (Nov 1, TRIG_TABLE_QUIET, default on; execution/trigEntry.ts):
+// pool price facts without the "fee read at" stamps (a new stamp on every
+// re-read of an Algebra / hooked V4 pool made 811 of 1,693 pools look
+// changed every 5 s). 0 = #260's price facts.
+const entryTableQuiet = tableQuietOn();
+const entryPriceKey = (p: any): string => poolPriceKey(p, entryTableQuiet);
 const entryTableInputs = (r: EntryRouteT): unknown[] => {
       const px = entryUsdOf(r.tokenIn), dec = entryDecOf(r.tokenIn);
       if (!entryTableFast) return [r.buy, r.buy?.observedFee, r.sell, r.sell?.observedFee, px, dec];
@@ -3094,8 +3100,15 @@ const entryPoolVer = (k: string): unknown[] => {
       const v: unknown[] = [robinhoodSender.live, entryOwnOnly(), ownMoney.raw(ROBINHOOD_TOKENS.USDG), ownMoney.raw(ROBINHOOD_TOKENS.WETH), age !== null && age <= OWN_MONEY_MAX_AGE_MS];
       const p = cache.get('robinhood', k);
       if (!p) return v;
-      v.push(poolPriceKey(p), p.observedFee);
-      for (const q of cache.findPeerPools('robinhood', p.tokenA, p.tokenB, p.poolAddress)) v.push(q.poolAddress, poolPriceKey(q), q.observedFee);
+      // QUIET SKIP: a quiet pool can now wait minutes for its turn, so the
+      // two rules that can drop its routes without any price moving are
+      // checked here every pass: the coin allow-list and the live venue /
+      // coin rule. Every route of this pool trades the pool's own two coins,
+      // and the venue part of the rule is fixed per pool, so these 3 cheap
+      // checks cover all of its routes.
+      if (entryTableQuiet) v.push(safetyGate.isAllowed(p.tokenA), safetyGate.isAllowed(p.tokenB), liveBlocker(p, p));
+      v.push(entryPriceKey(p), p.observedFee);
+      for (const q of cache.findPeerPools('robinhood', p.tokenA, p.tokenB, p.poolAddress)) v.push(q.poolAddress, entryPriceKey(q), q.observedFee);
       return v;
 };
 const entryTableRoutes = (): TablePool[] => copy2PoolKeys().map((k) => ({
@@ -3105,7 +3118,7 @@ const entryTableRoutes = (): TablePool[] => copy2PoolKeys().map((k) => ({
             rid: r.id, held: entryHeld(r), score: entryScore(r), build: () => entryBuild(r),
             // (FAST TABLE: worked out only when the route is rebuilt.)
             inputs: entryTableFast ? () => entryTableInputs(r) : entryTableInputs(r),
-            ...(entryTableFast ? { live: [poolPriceKey(r.buy), r.buy?.observedFee, poolPriceKey(r.sell), r.sell?.observedFee] } : {}),
+            ...(entryTableFast ? { live: [entryPriceKey(r.buy), r.buy?.observedFee, entryPriceKey(r.sell), r.sell?.observedFee] } : {}),
       })),
 }));
 // FIRE-FIRST 3-POOL LOOPS (execution/trigEntryLoops.ts, TRIG_ENTRY_LOOPS=1,

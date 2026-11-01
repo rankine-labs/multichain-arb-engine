@@ -228,10 +228,17 @@ async function tableTests() {
   assert(C.te.tableInfo().reused === 0, 'older than TRIG_ENTRY_TABLE_REUSE_MS: built again');
   // Fast table (Nov 1): kept up to TRIG_TABLE_REUSE_MAX_MS (spread per
   // route between the two), then built again.
-  const C2 = entryWith(universe(3, 0), true, 1, { tableReuseMaxMs: 3 });
+  // (#260's limit exactly: the QUIET SKIP, on by default, adds
+  // 2 x TRIG_TABLE_QUIET_MS on purpose, checked just below.)
+  const C2 = entryWith(universe(3, 0), true, 1, { tableReuseMaxMs: 3, tableQuiet: false });
   await C2.te.refreshTable(); await new Promise((r) => setTimeout(r, 8));
   await C2.te.refreshTable();
   assert(C2.te.tableInfo().reused === 0, 'fast table: older than TRIG_TABLE_REUSE_MAX_MS: built again');
+  // QUIET SKIP (Nov 1): kept up to TRIG_TABLE_REUSE_MAX_MS + 2 x TRIG_TABLE_QUIET_MS, then built again.
+  const C3 = entryWith(universe(3, 0), true, 1, { tableReuseMaxMs: 3, tableQuiet: true, tableQuietMs: 2 });
+  await C3.te.refreshTable(); await new Promise((r) => setTimeout(r, 15));
+  await C3.te.refreshTable();
+  assert(C3.te.tableInfo().reused === 0, 'quiet skip: older than TRIG_TABLE_REUSE_MAX_MS + 2 x TRIG_TABLE_QUIET_MS: built again');
   assert(entrySettings({}, 0.25).tableReuseMs === 5_000 && entrySettings({ TRIG_ENTRY_TABLE_REUSE_MS: '0' }, 0.25).tableReuseMs === 0, 'TRIG_ENTRY_TABLE_REUSE_MS: default 5000, 0 = off');
 
   // BENCH (TEST numbers): 150 pools x 4 routes, each build ~0.5 ms (like buildCheck), 10 pools move per second.
