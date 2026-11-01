@@ -4,6 +4,7 @@
 // arb = B, check = C. Shared contracts: state::{StateRead, Lookup, MissItem,
 // StateDiff}, arb::{BlockCtx, block_env, configure_cfg, ArbPrecompiles}.
 // ============================================================================
+pub mod alloc;
 pub mod arb;
 pub mod bench_node;
 pub mod check;
