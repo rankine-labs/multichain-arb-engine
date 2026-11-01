@@ -163,12 +163,25 @@ function fakeNode(o: { bal: bigint; taxPct?: number; outOk?: boolean; backOk?: b
   }
   const mk = (over: Record<string, string>, checks: LoopTrade[], gate: CoinTaxGate | undefined, result: () => SimResult) => {
     const cfg = loopConfigFromEnv({ LOOP_TRADER: '1', ...over });
-    return new LoopTrader(cfg, {
+    const trader = new LoopTrader(cfg, {
       env, bases: [W], symbolOf: (t) => (t === W ? 'WETH' : 'T' + parseInt(t.slice(-4), 16)), decimalsOf: () => 18,
       canPracticeTest: () => true, canCheckNow: () => true,
       runCheck: async (t) => { checks.push(t); return result(); },
       ...(gate ? { coinTax: gate } : {}),
     });
+    // BUSY-MACHINE FIX (Nov 1): these checks are about the tax gate and route
+    // memory, not speed. The loop finder builds its loop list in 5 ms slices
+    // and prices loops within a 12 ms budget (real clock). A 3-pool map
+    // normally fits in the first slice, so the loop shows up on the very
+    // first update. On the busy live server (CPU 93%) the process can be
+    // paused for more than 5 ms mid-build: the list then finishes in the
+    // background, the first update sees no loop, and "hour line: 1 loop
+    // waiting for a coin test" failed 3 deploys in a row. Giving this test's
+    // finder a 60 s slice and budget makes the outcome the same on any
+    // machine; the slicing itself is tested in loopFinder's own tests.
+    trader.finder.cfg.sliceMs = 60_000;
+    trader.finder.cfg.updateBudgetMs = 60_000;
+    return trader;
   };
   const loop = (base: number, t1: number, t2: number) => [v2(base, W, A(t1), 1_000, 2_000), v2(base + 1, A(t1), A(t2), 2_000, 2_000), v2(base + 2, A(t2), W, 1_000, 1_300)];
 
