@@ -53,6 +53,20 @@
 //                     1,693 pools; 811 share a pair with one)
 //   --prof FILE       write a CPU profile of the steady rounds only (after
 //                     the from-scratch builds) to FILE (.cpuprofile)
+//   --wallet-cap      (TRUE DELTA, Nov 1) like live, each route's size cap is
+//                     0.98 x the wallet's value of the start coin (0.5 WETH,
+//                     $1,500 USDG), so WETH routes' cap moves with the WETH
+//                     price, and own money is part of what a question is made of
+//   --predicted       (TRUE DELTA) like live, every trade is seen twice: the
+//                     feed's predicted price, then the block's real one (a
+//                     little off) on the next round
+//   --old-arbsim      (TRUE DELTA) the fake arbsim does not say it reads
+//                     patches (as an arbsim from before TRUE DELTA)
+// Live-shaped TRUE DELTA comparison (Nov 1, measured: ~1.5% of pools move
+// per pass, ~8.5 pools per coin pair, a pass every 10 to 20 s):
+//   --live --stamped --wallet-cap --predicted --peers 9 --churn 0.015
+//   --resync 1 --table-ms 10000 --slow 20 --rounds 80
+//   --env TRIG_ENTRY_TABLE_REUSE_MS=30000[,TRIG_TABLE_DELTA=0]
 // ============================================================================
 import { mkdtempSync } from 'fs';
 import { tmpdir } from 'os';
@@ -80,6 +94,9 @@ const noTable = args.includes('--no-table'); // baseline: same pools, no table (
 const LIVE = args.includes('--live');
 const TRACE = args.includes('--trace'); // one line per round on stderr
 const STAMPED = args.includes('--stamped');
+const WALLET_CAP = args.includes('--wallet-cap');
+const PREDICTED = args.includes('--predicted');
+const OLD_ARBSIM = args.includes('--old-arbsim');
 const PROF = (() => { const i = args.indexOf('--prof'); return i >= 0 ? String(args[i + 1] ?? '') : ''; })();
 // Steady-state CPU profile (inspector, same process).
 const prof = PROF ? new Session() : null;
@@ -101,13 +118,15 @@ const QUIET = tableQuietOn(env);
 const poolPriceKey = (p: any) => poolPriceKeyOf(p, QUIET);
 
 // ---- the fake sidecar (answers the coin balance-slot lookups, takes tables) ----
-let tableMsgs = 0, tableBytes = 0;
+let tableMsgs = 0, tableBytes = 0, patchPools = 0, msgsWithPatch = 0;
+// TRUE DELTA: count pools sent as a patch (an object instead of a row list).
+const notePatches = (text: string) => { const n = (text.match(/":\{"(?:r|s)":/g) ?? []).length; patchPools += n; if (n) msgsWithPatch++; };
 const client = {
   isConnected: () => true,
   stats: { fallbacks: 0 },
   request: async (m: Record<string, any>) => {
     // The real client turns every message into one framed buffer (as here).
-    if (m.type === 'trig_table') { tableMsgs++; tableBytes += frame({ ...m, id: 1 }).length; return { ok: true, gen: m.gen }; }
+    if (m.type === 'trig_table') { tableMsgs++; const f = frame({ ...m, id: 1 }); tableBytes += f.length; notePatches(f.toString('utf8')); return { ok: true, gen: m.gen, ...(OLD_ARBSIM ? {} : { patch: true }) }; }
     if (m.type === 'call' && m.calls?.[0]?.data?.startsWith('0x70a08231')) {
       const sd = m.overrides?.[m.calls[0].to]?.stateDiff ?? {};
       const v = Object.values(sd)[0] as string | undefined;
@@ -116,7 +135,7 @@ const client = {
     return { id: m.id, ok: false, unknown: 'bad_request' };
   },
   // The real client's pre-written path (table messages only): same text + id.
-  requestBytes: async (open: Buffer[]) => { tableMsgs++; tableBytes += framePieces(open, ',"id":1}').length; return { ok: true }; },
+  requestBytes: async (open: Buffer[]) => { tableMsgs++; const f = framePieces(open, ',"id":1}'); tableBytes += f.length; notePatches(f.toString('utf8')); return { ok: true, ...(OLD_ARBSIM ? {} : { patch: true }) }; },
 } as unknown as LocalSimClient;
 const copy2: TrigCopy2 = { running: () => true, notReadyWhy: () => null, waitForTx: async () => 1, forwarder: { newestBlock: () => 1, txBlockOf: () => null } };
 
@@ -165,6 +184,8 @@ let simNow = Date.now();
 const simStart = simNow;
 let firstBytes = 0, firstMsgs = 0;
 const pxOf = (start: string) => (start === USDG ? 1 : wethPx);
+// --wallet-cap: shadowMain entryBuild's own-money cap (0.98 x the wallet's value), else 400.
+const capOf = (usdg: boolean) => (WALLET_CAP ? Math.min(2_000, 0.98 * (usdg ? 1_500 : 0.5 * wethPx)) : 400);
 
 // A candidate the way shadowMain's entryBuild makes one (new object each
 // call, holding both pool states).
@@ -193,7 +214,7 @@ function candOf(bi: number, si: number): EntryCandidate {
     });
   return {
     label: `MEME${buy.group}/${usdg ? 'USDG' : 'WETH'} ${buy.addr.slice(-4)}>${sell.addr.slice(-4)}`, buyPool: buy.addr, sellPool: sell.addr, tokenIn: buy.start, tokens: [buy.start, buy.mid],
-    keys: usdg ? [buy.addr, sell.addr] : [buy.addr, sell.addr, LENDER], maxSizeUsd: 400, gasUsd,
+    keys: usdg ? [buy.addr, sell.addr] : [buy.addr, sell.addr, LENDER], maxSizeUsd: capOf(usdg), gasUsd,
     build,
     usdOf: (u) => Number(u) / 10 ** dec * px,
     host,
@@ -219,7 +240,7 @@ const tableRoutes = (): TablePool[] => pools.map((p, i) => ({
       // live, so Infinity; no lender balance read; no balance-slot rule).
       const px = pxOf(pools[b].start), dec = usdg ? 6 : 18;
       out.push({ rid, held: true, score, build: () => candOf(b, s),
-        inputs: FAST ? () => [poolShapeKey(states[b]), poolShapeKey(states[s]), px, dec, Infinity, 0, false] : [states[b], states[b].observedFee, states[s], states[s].observedFee, px, dec],
+        inputs: FAST ? () => [poolShapeKey(states[b]), poolShapeKey(states[s]), px, dec, WALLET_CAP ? capOf(usdg) : Infinity, 0, false] : [states[b], states[b].observedFee, states[s], states[s].observedFee, px, dec],
         ...(FAST ? { live: [poolPriceKey(states[b]), states[b].observedFee, poolPriceKey(states[s]), states[s].observedFee] } : {}) });
     }
     return out;
@@ -255,6 +276,7 @@ async function main() {
   const busy: number[] = [], wall: number[] = [], gcPer: number[] = [], reusedPer: number[] = [];
   const skipStretch = Math.min(3, Math.max(0, ROUNDS - 1));
   let changedPools = 0;
+  let landNow: number[] = [], nextLand: number[] = [];
   for (let r = 0; r < ROUNDS; r++) {
     // Prices move: a share of pools each second, all of them on the re-read.
     const all = r > 0 && r % RESYNC === 0;
@@ -269,8 +291,11 @@ async function main() {
       // hooked V4 pools)
       if (all) { states[i] = { ...states[i], lastUpdatedMs: Date.now(), ...(STAMPED && i % PEERS === 0 && pools[i].group % 2 === 0 ? { feeReadMs: simNow, feeReadBlock: r } : {}) } as State; }
       // (trades still happen on a re-read round)
-      if (r > 0 && Math.random() < CHURN) { states[i] = fresh(pools[i], i, states[i].v + 1); changedPools++; }
+      if (r > 0 && Math.random() < CHURN) { states[i] = fresh(pools[i], i, states[i].v + 1); changedPools++; if (PREDICTED) nextLand.push(i); }
     }
+    // --predicted: last round's trades land with the block's real price (a little off the prediction).
+    for (const i of landNow) { const st = fresh(pools[i], i, states[i].v); states[i] = { ...st, sqrtPriceX96: st.sqrtPriceX96 + 3n, reserveB: (st.reserveB ?? 0n) + 3n }; }
+    landNow = nextLand; nextLand = [];
     if (noTable) { await new Promise((res) => setImmediate(res)); continue; }
     if (r === skipStretch) {
       tblMaxMs = 0; tblOver50 = 0; tblStretches = 0; // steady state only (after the from-scratch builds)
@@ -308,6 +333,11 @@ async function main() {
     simSeconds: Math.round((simNow - simStart) / 1_000),
     // Table messages to arbsim per pretend minute, after the first (full) table.
     msgsPerMin: Math.round(((tableMsgs - firstMsgs) / Math.max(1, (simNow - simStart) / 60_000)) * 10) / 10,
+    // Per pretend minute, after the first (full) table (TRUE DELTA comparison).
+    mbPerMin: Math.round(((tableBytes - firstBytes) / MB / Math.max(1, (simNow - simStart) / 60_000)) * 10) / 10,
+    firstTableMB: Math.round((firstBytes / MB) * 10) / 10,
+    patchPools, msgsWithPatch, walletCap: WALLET_CAP, predicted: PREDICTED, oldArbsim: OLD_ARBSIM,
+    delta: (te as any).settings?.tableDelta, lastDelta: (te as any).tbl?.delta,
     tableMs: TABLE_MS, slow: SLOW,
   }, null, 1));
 }

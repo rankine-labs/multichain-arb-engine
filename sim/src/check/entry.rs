@@ -257,9 +257,19 @@ pub fn parse_rows(v: &Value) -> Result<Vec<Row>, String> {
 }
 
 /// `{"type":"trig_table","gen":N,"full":true|false,"base":M,"codes":[..],
-///   "pools":{"<key>":[rows] | null}}`. full = replace everything; else
-/// merge into the table of generation `base` (a different one = refused:
-/// the bot then sends a full table). Answer {ok, gen, pools}.
+///   "pools":{"<key>":[rows] | null | {patch}}}`. full = replace everything;
+/// else merge into the table of generation `base` (a different one =
+/// refused: the bot then sends a full table). Answer {ok, gen, pools, patch}.
+///
+/// TRUE DELTA (Nov 1): a pool's value may also be a PATCH object
+/// `{"r":[rows], "s":{"<rid>": score | null}}` (partial tables only):
+/// `r` = whole rows that replace the rows with the same route id (same
+/// place in the list), `s` = new quick-price scores for routes by id (the
+/// rest of each row stays). Every route named must already be in that
+/// pool, else the whole message is refused and nothing changes (the bot
+/// then sends a full table). The answer says `"patch": true` so the bot
+/// knows this arbsim understands patches; an older arbsim refuses a patch
+/// ("pool rows must be a list"), which also ends in a full table.
 pub fn apply_table(id: &Value, req: &Value) -> Value {
     let a = apply_table_inner(id, req);
     let full = req.get("full").and_then(|f| f.as_bool()).unwrap_or(true);
@@ -268,20 +278,102 @@ pub fn apply_table(id: &Value, req: &Value) -> Value {
     a
 }
 
+/// One pool's change in a table message.
+enum PoolChange {
+    Remove,
+    Replace(Vec<Row>),
+    /// TRUE DELTA: rows replaced by route id, scores set by route id.
+    Patch { rows: Vec<Row>, scores: Vec<(String, Option<f64>)> },
+}
+
+/// A pool's value in a table message: null, a list of rows, or a patch.
+fn parse_change(v: &Value) -> Result<PoolChange, String> {
+    if v.is_null() {
+        return Ok(PoolChange::Remove);
+    }
+    if v.is_array() {
+        return parse_rows(v).map(PoolChange::Replace);
+    }
+    let Some(o) = v.as_object() else { return Err("pool rows must be a list".into()) };
+    let rows = match o.get("r") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(r) => parse_rows(r)?,
+    };
+    let mut scores = Vec::new();
+    if let Some(s) = o.get("s").filter(|s| !s.is_null()) {
+        let m = s.as_object().ok_or("patch scores must be an object")?;
+        for (rid, x) in m {
+            if !(x.is_null() || x.is_number()) {
+                return Err(format!("patch score for {rid} must be a number or null"));
+            }
+            scores.push((rid.to_ascii_lowercase(), x.as_f64().filter(|x| x.is_finite())));
+        }
+    }
+    Ok(PoolChange::Patch { rows, scores })
+}
+
+/// A pool's rows after a patch (a new list; the held one is not touched).
+/// Err = a route the pool does not hold (the message is then refused).
+fn patched(old: &[Row], rows: Vec<Row>, scores: &[(String, Option<f64>)]) -> Result<Vec<Row>, String> {
+    let mut out = old.to_vec();
+    let mut at: HashMap<&str, usize> = HashMap::with_capacity(old.len());
+    for (i, r) in old.iter().enumerate() {
+        at.entry(r.rid.as_str()).or_insert(i);
+    }
+    let mut put: Vec<(usize, Row)> = Vec::with_capacity(rows.len());
+    for r in rows {
+        let Some(&i) = at.get(r.rid.as_str()) else { return Err(format!("patch names route {} the pool does not hold", r.rid)) };
+        put.push((i, r));
+    }
+    for (rid, s) in scores {
+        let Some(&i) = at.get(rid.as_str()) else { return Err(format!("patch names route {rid} the pool does not hold")) };
+        out[i].score = *s;
+    }
+    // (Whole rows after scores: a row sent whole carries its own score.)
+    for (i, r) in put {
+        out[i] = r;
+    }
+    Ok(out)
+}
+
+/// Every pool change of one message, worked out against `t` (the table
+/// held, None for a full table) BEFORE anything is changed, so a refused
+/// message leaves the table exactly as it was.
+fn resolve(t: Option<&Table>, parsed: Vec<(String, PoolChange)>) -> Result<Vec<(String, Option<Vec<Row>>)>, String> {
+    let mut out = Vec::with_capacity(parsed.len());
+    for (k, ch) in parsed {
+        match ch {
+            PoolChange::Remove => out.push((k, None)),
+            PoolChange::Replace(r) => out.push((k, Some(r))),
+            PoolChange::Patch { rows, scores } => {
+                // (A pool named twice in one message: patch the newer list.)
+                let held = out.iter().rev().find(|(key, _)| *key == k).map(|(_, r)| r.clone());
+                let base: Vec<Row> = match held {
+                    Some(Some(r)) => r,
+                    Some(None) => return Err(format!("patch for pool {k} removed in the same message")),
+                    None => match t.and_then(|t| t.pools.get(&k)) {
+                        Some(r) => r.clone(),
+                        None => return Err(format!("patch for pool {k} we don't hold")),
+                    },
+                };
+                out.push((k, Some(patched(&base, rows, &scores)?)));
+            }
+        }
+    }
+    Ok(out)
+}
+
 fn apply_table_inner(id: &Value, req: &Value) -> Value {
     let gen = req.get("gen").and_then(|g| g.as_u64()).unwrap_or(0);
     let full = req.get("full").and_then(|f| f.as_bool()).unwrap_or(true);
     let Some(pools) = req.get("pools").and_then(|p| p.as_object()) else {
         return json!({ "id": id, "ok": false, "unknown": "bad_request", "detail": "trig_table needs pools" });
     };
-    let mut parsed: Vec<(String, Option<Vec<Row>>)> = Vec::with_capacity(pools.len());
+    let mut parsed: Vec<(String, PoolChange)> = Vec::with_capacity(pools.len());
     for (k, v) in pools {
-        if v.is_null() {
-            parsed.push((k.to_ascii_lowercase(), None));
-            continue;
-        }
-        match parse_rows(v) {
-            Ok(r) => parsed.push((k.to_ascii_lowercase(), Some(r))),
+        match parse_change(v) {
+            Ok(PoolChange::Patch { .. }) if full => return json!({ "id": id, "ok": false, "unknown": "bad_request", "detail": format!("pool {k}: a patch in a full table") }),
+            Ok(ch) => parsed.push((k.to_ascii_lowercase(), ch)),
             Err(e) => return json!({ "id": id, "ok": false, "unknown": "bad_request", "detail": format!("pool {k}: {e}") }),
         }
     }
@@ -293,6 +385,11 @@ fn apply_table_inner(id: &Value, req: &Value) -> Value {
             return json!({ "id": id, "ok": false, "unknown": "table_gen", "detail": "partial table for a generation we don't hold: send a full one" });
         }
     }
+    // Patches are checked against the table held before anything changes.
+    let changes = match resolve(if full { None } else { g.as_ref() }, parsed) {
+        Ok(c) => c,
+        Err(e) => return json!({ "id": id, "ok": false, "unknown": "patch_miss", "detail": e }),
+    };
     let t = if full { g.insert(Table::default()) } else { g.as_mut().expect("checked above") };
     t.gen = gen;
     t.tracked = true;
@@ -302,10 +399,10 @@ fn apply_table_inner(id: &Value, req: &Value) -> Value {
     if !codes.is_empty() || full {
         t.codes = Arc::new(codes);
     }
-    for (k, rows) in parsed {
+    for (k, rows) in changes {
         t.set_pool(k, rows, gen);
     }
-    json!({ "id": id, "ok": true, "gen": t.gen, "pools": t.pools.len() })
+    json!({ "id": id, "ok": true, "gen": t.gen, "pools": t.pools.len(), "patch": true })
 }
 
 /// The table held right now as ONE full `trig_table` message (None = no
@@ -341,12 +438,13 @@ pub fn table_from_messages(msgs: &[Value]) -> Result<Table, String> {
             tb.codes = Arc::new(codes);
         }
         let g = tb.gen;
+        // (TRUE DELTA patches are applied exactly as apply_table does.)
+        let mut parsed = Vec::with_capacity(pools.len());
         for (k, v) in pools {
-            if v.is_null() {
-                tb.set_pool(k.to_ascii_lowercase(), None, g);
-            } else {
-                tb.set_pool(k.to_ascii_lowercase(), Some(parse_rows(v).map_err(|e| format!("message {i} pool {k}: {e}"))?), g);
-            }
+            parsed.push((k.to_ascii_lowercase(), parse_change(v).map_err(|e| format!("message {i} pool {k}: {e}"))?));
+        }
+        for (k, rows) in resolve(Some(&*tb), parsed).map_err(|e| format!("message {i}: {e}"))? {
+            tb.set_pool(k, rows, g);
         }
     }
     t.ok_or_else(|| "no table message".to_string())
@@ -492,6 +590,9 @@ pub fn answer_conf(answer: &Value) -> &str {
 mod tests {
     use super::*;
 
+    // Tests that use the process-wide table take this first.
+    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn best_profit_reads_like_the_stop_rule() {
         let mut out = vec![0u8; 68];
@@ -531,6 +632,68 @@ mod tests {
         t2.pools.insert("b".into(), vec![row("2", true, None, Some("q"))]);
         let (p, _) = select(&t2, &["b".into(), "a".into()], 6);
         assert_eq!(p.iter().map(|r| r.e.clone().unwrap()).collect::<Vec<_>>(), vec!["q", "p"]);
+    }
+
+    // TRUE DELTA (Nov 1): patches replace rows / scores by route id, keep
+    // the rest of the pool (same order), and a patch naming a route the pool
+    // does not hold refuses the whole message without changing anything.
+    #[test]
+    fn patches_replace_by_route_id_and_refuse_unknown_routes() {
+        let rows = |v: Vec<(&str, f64, &str)>| Value::Array(v.into_iter().map(|(rid, s, e)| json!({"rid": rid, "h": true, "s": s, "e": e, "c": {"stop": "0x1"}})).collect());
+        let full = json!({"type": "trig_table", "gen": 1, "full": true, "codes": [], "pools": {"p": rows(vec![("a", 1.0, "1.1"), ("b", 2.0, "1.2"), ("c", 3.0, "1.3")]), "q": rows(vec![("x", 9.0, "1.4")])}});
+        // Scores for a and c, row b replaced whole (new entry id, new check).
+        let part = json!({"type": "trig_table", "gen": 2, "full": false, "base": 1, "codes": [], "pools": {"p": {"s": {"A": 5.0, "c": null}, "r": [{"rid": "b", "h": false, "s": 7.0, "e": "2.9", "c": {"stop": "0x2"}}]}}});
+        let t = table_from_messages(&[full.clone(), part.clone()]).unwrap();
+        let p = &t.pools["p"];
+        assert_eq!(p.iter().map(|r| (r.rid.as_str(), r.score, r.e.as_deref(), r.held)).collect::<Vec<_>>(),
+            vec![("a", Some(5.0), Some("1.1"), true), ("b", Some(7.0), Some("2.9"), false), ("c", None, Some("1.3"), true)]);
+        assert_eq!(p[1].c.as_deref().unwrap()["stop"], "0x2");
+        assert_eq!(p[0].c.as_deref().unwrap()["stop"], "0x1", "a score patch keeps the rest of the row");
+        assert_eq!(t.pools["q"].len(), 1, "pools not named are untouched");
+        assert_eq!(t.pool_gen["p"], 2, "a patched pool counts as changed (fast-lane scanner bookkeeping)");
+        // Same result as sending the pool whole.
+        let whole = json!({"type": "trig_table", "gen": 2, "full": false, "base": 1, "codes": [], "pools": {"p": [
+            {"rid": "a", "h": true, "s": 5.0, "e": "1.1", "c": {"stop": "0x1"}}, {"rid": "b", "h": false, "s": 7.0, "e": "2.9", "c": {"stop": "0x2"}}, {"rid": "c", "h": true, "s": null, "e": "1.3", "c": {"stop": "0x1"}}]}});
+        let w = table_from_messages(&[full.clone(), whole]).unwrap();
+        let view = |rs: &Vec<Row>| rs.iter().map(|r| format!("{}|{}|{:?}|{:?}|{}", r.rid, r.held, r.score, r.e, r.c.as_deref().map(|c| c.to_string()).unwrap_or_default())).collect::<Vec<_>>();
+        assert_eq!(view(p), view(&w.pools["p"]));
+        // A route the pool does not hold / a pool we don't hold: refused.
+        let miss = json!({"type": "trig_table", "gen": 2, "full": false, "base": 1, "codes": [], "pools": {"p": {"s": {"zz": 1.0}}}});
+        assert!(table_from_messages(&[full.clone(), miss]).unwrap_err().contains("does not hold"));
+        let nopool = json!({"type": "trig_table", "gen": 2, "full": false, "base": 1, "codes": [], "pools": {"nope": {"s": {"a": 1.0}}}});
+        assert!(table_from_messages(&[full.clone(), nopool]).unwrap_err().contains("don't hold"));
+        // Not a list / patch / null: refused as before.
+        assert!(parse_change(&json!(5)).is_err());
+        assert!(parse_change(&json!({"s": {"a": "x"}})).is_err());
+        // Patch on a pool replaced earlier in the same message: patches the new list.
+        let both = vec![("p".to_string(), parse_change(&rows(vec![("k", 1.0, "3.1")])).unwrap()), ("p".to_string(), parse_change(&json!({"s": {"k": 4.0}})).unwrap())];
+        let out = resolve(None, both).unwrap();
+        assert_eq!(out[1].1.as_ref().unwrap()[0].score, Some(4.0));
+    }
+
+    // The process-wide table: a refused patch changes nothing, the answer
+    // says patches are understood. (Own pool keys, so other tests using the
+    // process-wide table are not disturbed; the generation is read first.)
+    #[test]
+    fn apply_table_patch_answer_and_refusal_leave_table_intact() {
+        let _l = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let full = json!({"type": "trig_table", "gen": 41, "full": true, "codes": [], "pools": {"0xpp": [{"rid": "a", "h": true, "s": 1.0, "e": "41.1"}]}});
+        let a = apply_table(&json!(1), &full);
+        assert_eq!(a["ok"], true);
+        assert_eq!(a["patch"], true, "the answer tells the bot patches are understood");
+        let bad = json!({"type": "trig_table", "gen": 42, "full": false, "base": 41, "codes": [], "pools": {"0xpp": {"s": {"nope": 2.0}}}});
+        let b = apply_table(&json!(2), &bad);
+        assert_eq!(b["ok"], false);
+        assert_eq!(b["unknown"], "patch_miss");
+        assert_eq!(table_gen(), Some(41), "refused: generation unchanged");
+        with_table(|t| assert_eq!(t.unwrap().pools["0xpp"][0].score, Some(1.0)));
+        let good = json!({"type": "trig_table", "gen": 42, "full": false, "base": 41, "codes": [], "pools": {"0xpp": {"s": {"a": 2.0}}}});
+        assert_eq!(apply_table(&json!(3), &good)["ok"], true);
+        with_table(|t| assert_eq!(t.unwrap().pools["0xpp"][0].score, Some(2.0)));
+        // A patch inside a FULL table is refused (a full table must list every row).
+        let pf = json!({"type": "trig_table", "gen": 43, "full": true, "codes": [], "pools": {"0xpp": {"s": {"a": 2.0}}}});
+        assert_eq!(apply_table(&json!(4), &pf)["ok"], false);
+        assert_eq!(table_gen(), Some(42));
     }
 
     #[test]

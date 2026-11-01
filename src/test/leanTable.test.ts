@@ -140,7 +140,10 @@ async function main() {
   for (const [name, extra] of [['live settings (two steps, bot does not ask)', {}], ['one trip, bot asks', { TRIG_ENTRY_ONE_TRIP: '1', TRIG_ENTRY_NODE_ASKS: 'on' }], ['fast lane off (one trip, the old table)', { FASTLANE: 'off', TRIG_ENTRY_ONE_TRIP: '1', TRIG_ENTRY_NODE_ASKS: 'on' }]] as const) {
     const uOld = universe(6, 4), uNew = universe(6, 4);
     const O = entryWith({ ...live, ...extra, TRIG_ENTRY_TABLE_LEAN: '0' }, uOld);
-    const N = entryWith({ ...live, ...extra }, uNew);
+    // (TRUE DELTA off: it sends the long-code list only when it changed, so
+    // its messages are packed differently on purpose; trueDelta.test.ts
+    // checks it. This compares the lean table alone, as before.)
+    const N = entryWith({ ...live, ...extra, TRIG_TABLE_DELTA: '0' }, uNew);
     for (let r = 0; r < 12; r++) {
       uOld.tick(r); uNew.tick(r);
       await O.te.refreshTable(); await N.te.refreshTable();

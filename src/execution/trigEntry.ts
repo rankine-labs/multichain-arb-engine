@@ -201,6 +201,8 @@ export type EntrySettings = {
   tableDriftMs: number;          // TRIG_TABLE_DRIFT_MS [10000] fast table: a pool whose rows changed ONLY because the gas cost or the start coin's price moved is re-sent at most this often (0 = at once, as before)
   tableQuiet: boolean;           // TRIG_TABLE_QUIET [1] quiet-pool skip that works at the live pace (see QUIET SKIP; needs the fast table; 0 = exactly the #260 fast table)
   tableQuietMs: number;          // TRIG_TABLE_QUIET_MS [600000] quiet skip: a pool where nothing moved is still rebuilt about this often (spread 50 to 100% per pool)
+  tableDelta: boolean;           // TRIG_TABLE_DELTA [1] true delta: arbsim gets only rows that really changed (see TRUE DELTA; needs the quiet skip; 0 = exactly the #262 table)
+  tableDeltaDriftMs: number;     // TRIG_TABLE_DELTA_DRIFT_MS [TRIG_TABLE_QUIET_MS, 600000] true delta: rows changed ONLY by gas / coin-price drift reach arbsim at most this often per pool (spread 50 to 100%)
 };
 
 export function entrySettings(env: Record<string, string | undefined> = process.env, minNetUsd = 0.25): EntrySettings {
@@ -238,6 +240,9 @@ export function entrySettings(env: Record<string, string | undefined> = process.
     tableDriftMs: num('TRIG_TABLE_DRIFT_MS', 10_000, 0),
     tableQuiet: tableQuietOn(env),
     tableQuietMs: num('TRIG_TABLE_QUIET_MS', 600_000, 1_000),
+    tableDelta: tableDeltaOn(env),
+    // (Default: the quiet window, so drift keeps the same 5 to 10 min rhythm as quiet turns.)
+    tableDeltaDriftMs: num('TRIG_TABLE_DELTA_DRIFT_MS', num('TRIG_TABLE_QUIET_MS', 600_000, 1_000), 1_000),
   };
 }
 
@@ -323,6 +328,81 @@ export function tableQuietOn(env: Record<string, string | undefined> = process.e
 // At most 1 in this many pools is rebuilt per pass only because its quiet
 // turn came (QUIET SKIP 1). Pools with real changes don't count.
 export const QUIET_TURN_DIV = 16;
+
+// ----------------------------------------------------------------------------
+// TRUE DELTA (Nov 1, TRIG_TABLE_DELTA, default on; 0 = exactly the #262 table)
+//
+// Plain English: #262 made the table passes fast (a pass every 10 to 20 s
+// instead of every 55 to 65 s), but live the bot then sent arbsim MORE, not
+// less: 54 table messages a minute (~190 MB) instead of 28 (~56 MB).
+// Measured on the server (Nov 1, read only):
+//   - arbsim took 4,216 table messages since its start: 3 full tables (the
+//     bot restarts), 4,213 "changes", 0 refused. So nothing asked for a
+//     resync and no full table was re-sent: the "changes" themselves were
+//     huge (~13 parts of up to 4 MB per pass; a full table is 28 parts).
+//   - Re-reading every watched pool on the chain, 13 to 15 s apart (about
+//     one live pass): 22 to 32 pools changed price each time, 0 changed
+//     only their fee. The pools that share a coin pair with them (183 to
+//     242 of 1,690, ~8.5 pools per pair) all count as "changed".
+//   - The bot's hourly lines: "0 with only gas / coin-price changes
+//     waiting": the 10 s drift hold never held anything back.
+// Why that adds up to most of the table every pass:
+//   1. One price move re-sends whole pools: a trade on pool P changes the
+//      2 routes through P in each partner pool, but every partner pool was
+//      re-sent with ALL its ~22 rows. And a price move only changes a row's
+//      quick-price score `s`: the check question `c` holds no pool price.
+//   2. Every row of a rebuilt pool also differs by gas / WETH-price drift
+//      (stop amount, trade amount for WETH routes, the size cap, which
+//      follows the wallet's WETH value, and the facts). The drift hold
+//      (TRIG_TABLE_DRIFT_MS, 10 s) is shorter than the time between passes,
+//      so it never held, and the size cap counted as a REAL change anyway.
+//   3. Faster passes = each price move sent on its own: the old 60 s pass
+//      merged several moves of a pool into one send, a 10 s pass sends each.
+//   4. Quiet-turn rebuilds (up to 1 in 16 pools per pass) re-sent whole
+//      pools for drift alone.
+// Fix: the bot remembers, for every row arbsim holds, what that row is made
+// of, split three ways (route id, held flag, can-build, route keys, label,
+// size step, the check question's template (contract codes, route shape) =
+// STRUCTURE; the route's pool prices = PRICE; the row as sent without its
+// score = CONTENT), and per row:
+//   - content AND structure changed: the row goes at once (a patch row);
+//   - only the score changed AND the prices moved: just the new score goes
+//     at once (a few bytes per route);
+//   - content or score changed but structure / prices did not (gas or coin
+//     price drift): it waits, and the pool's drift goes all at once on the
+//     pool's quiet turn (about every TRIG_TABLE_QUIET_MS, 10 min, as #262)
+//     or after TRIG_TABLE_DELTA_DRIFT_MS (default the quiet window; spread
+//     50 to 100% per pool), so arbsim then holds exactly the fresh build;
+//   - nothing changed: nothing goes. A pass with no real change sends no
+//     message at all.
+// Rows go to arbsim as a PATCH of the pool (`{"r":[rows],"s":{rid:score}}`,
+// check/entry.rs apply_table) when arbsim's answers say it understands
+// patches (`patch: true`), else as the whole pool (still only pools with a
+// real change or due drift). A route list that changed (a route came, went
+// or moved) always sends the whole pool. What arbsim holds is tracked row
+// by row (the exact row objects sent), so a refused message still falls
+// back to a full table of exactly that, as before.
+// Sends now follow price moves and the clock, not the number of passes: a
+// faster pass rate sends the same real changes (as scores) and the same
+// drift (by the clock).
+// ----------------------------------------------------------------------------
+export function tableDeltaOn(env: Record<string, string | undefined> = process.env): boolean {
+  return (env.TRIG_TABLE_DELTA ?? '1').trim() !== '0' && tableQuietOn(env);
+}
+// TRUE DELTA: a row's three keys (see above), as short digests.
+type RowD = { cf: string; sk: string; pk: string };
+// A pool's rows' keys, in row order.
+type PoolD = { cfs: string[]; sks: string[]; pks: string[] };
+// A pool's patch as arbsim reads it (check/entry.rs apply_table): whole
+// rows replacing the rows with the same route id, and scores by route id.
+export type TablePatch = { r?: unknown[]; s?: Record<string, number | null> };
+// The size cap as far as it is STRUCTURE: which ladder sizes fit, and its
+// size in half-doublings. Small moves (the WETH price moving the wallet's
+// value) stay drift; the wallet halving or doubling is a real change.
+export function sizeStep(maxSizeUsd: number, sizesUsd: number[]): string {
+  if (!(maxSizeUsd > 0) || !Number.isFinite(maxSizeUsd)) return String(maxSizeUsd);
+  return `${sizesUsd.filter((x) => x <= maxSizeUsd).length}:${Math.floor(Math.log2(maxSizeUsd) * 2)}`;
+}
 
 // FAST TABLE 2: a pool's TRADING details: everything about a pool that the
 // check question (contract calldata, pretend state) is made from: which
@@ -877,7 +957,7 @@ function poolSigOf(rs: TableRoute[]): string {
 // QUIET SKIP 4: one route's last result inside its pool's build, and what
 // it was built from as far as a real change goes (id, held flag, the host's
 // live facts = both pools' prices and seen fees).
-type RouteKept = { pre: string; row: Record<string, unknown>; meta: TableMeta | null; fp: string; live: string };
+type RouteKept = { pre: string; row: Record<string, unknown>; meta: TableMeta | null; fp: string; live: string; d?: RowD };
 function routePreKey(r: TableRoute): string {
   let k = `${r.rid}|${r.held ? 1 : 0}`;
   for (const x of r.live!) k += `|${liveItem(x)}`;
@@ -1488,7 +1568,7 @@ export class TrigEntry {
   // known for 30 s, so answers already on their way can still be read.
   private readonly tbl = {
     gen: 0, ackGen: -1, needFull: true, building: false,
-    pools: new Map<string, { fp: string; rows: unknown[]; ids: string[]; liveFp?: string; sentAt?: number }>(),
+    pools: new Map<string, { fp: string; rows: unknown[]; ids: string[]; liveFp?: string; sentAt?: number; d?: PoolD; syncAt?: number }>(),
     meta: new Map<string, TableMeta>(),
     retired: new Map<string, number>(),
     codes: [] as string[],
@@ -1497,6 +1577,12 @@ export class TrigEntry {
     passes: 0, lastHeld: 0, lastRestop: 0, lastSkipped: 0,
     // QUIET SKIP: last pass, quiet pools rebuilt because their turn came / kept past their window (waiting for a turn).
     lastTurns: 0, lastWaiting: 0, lastKeptRoutes: 0, turnFrom: 0,
+    // TRUE DELTA: does arbsim read patches (its last answer said so)? Last
+    // pass's counts; messages / bytes / full tables sent so far (all modes).
+    patchOk: false, codesAcked: { epoch: -1, n: -1 }, delta: { whole: 0, rows: 0, scores: 0, driftRows: 0, waiting: 0 }, msgs: 0, bytes: 0, fulls: 0,
+    // 5-minute table line: totals at its last print.
+    tot: { whole: 0, rows: 0, scores: 0, driftRows: 0 },
+    win: { at: 0, passes: 0, msgs: 0, bytes: 0, fulls: 0, whole: 0, rows: 0, scores: 0, driftRows: 0 },
   };
 
   tableInfo(): { ackGen: number; pools: number; entries: number; lastMs: number; busyMs: number; routes: number; reused: number; sends: number } {
@@ -1541,7 +1627,7 @@ export class TrigEntry {
       const now = this.now();
       const reuseMs = this.settings.tableReuseMs;
       const sizesKey = this.settings.sizesUsd.join(',');
-      const fresh = new Map<string, { fp: string; rows: Array<Record<string, unknown>>; metas: Array<TableMeta | null>; liveFp?: string }>();
+      const fresh = new Map<string, { fp: string; rows: Array<Record<string, unknown>>; metas: Array<TableMeta | null>; liveFp?: string; d?: PoolD }>();
       let routes = 0, reused = 0;
       // LEAN TABLE (see the note at entrySettings): digests instead of
       // question text, cache limits that follow the table, and answer
@@ -1560,9 +1646,24 @@ export class TrigEntry {
       // most 1 in QUIET_TURN_DIV of the pools per pass is rebuilt only
       // because its turn came, and kept questions last longer.
       const quiet = fast && driftMs > 0 && this.settings.tableQuiet;
+      // TRUE DELTA (see tableDeltaOn): every row's content / structure /
+      // price keys are kept, and only real changes go to arbsim.
+      const delta = quiet && this.settings.tableDelta;
+      // A row's three keys (TRUE DELTA). `st` = n / f / c / x as in liveKey.
+      const rowD = (r: TableRoute, st: string, cf: string, cand?: EntryCandidate, more = ''): RowD => {
+        let pk = '';
+        if (r.live) for (const x of r.live) pk += `|${liveItem(x)}`;
+        else pk = `#${++objSeq}`; // no price facts given: always counts as moved
+        let sk = cand ? `${r.rid}|${r.held ? 1 : 0}|${st}|${cand.keys.join(',')}|${cand.label}|${sizeStep(cand.maxSizeUsd, this.settings.sizesUsd)}|${more}` : `${r.rid}|${r.held ? 1 : 0}|${st}`;
+        // (No price facts given: nothing can be called drift, every change is real, as liveKey.)
+        if (!r.live) sk += `|#${objSeq}`;
+        return { cf: textDigest(cf), sk: textDigest(sk), pk: textDigest(pk) };
+      };
       const turnCap = quiet ? Math.max(1, Math.ceil(Math.max(this.poolPass.size, T.pools.size) / QUIET_TURN_DIV)) : Infinity;
       const memoExtraMs = quiet ? 2 * this.settings.tableQuietMs : 0;
       let turns = 0, waiting = 0;
+      // TRUE DELTA: pools that got their quiet turn this pass (their drift goes with it).
+      const turned = new Set<string>();
       // Turns go round-robin: when last pass ran out of turns at pool number
       // T.turnFrom, this pass hands turns out from there first (pools before
       // it wait one more pass), so no pool is starved when more are due than
@@ -1589,7 +1690,7 @@ export class TrigEntry {
         const takeTurn = (): boolean => {
           if (turnAsked === undefined) {
             turnAsked = idx >= turnFrom && turns < turnCap;
-            if (turnAsked) turns++;
+            if (turnAsked) { turns++; if (delta) turned.add(key); }
             else {
               waiting++;
               // First pool turned away because the cap ran out: next pass starts here.
@@ -1633,6 +1734,8 @@ export class TrigEntry {
         const metas: Array<TableMeta | null> = [];
         const fps: string[] = [];
         const lives: string[] = [];
+        // TRUE DELTA: each row's keys, in row order.
+        const ds: RowD[] = [];
         // QUIET SKIP 4: this pool IS rebuilt (something moved), but most of
         // its routes usually did not change: when one partner pool in a coin
         // pair trades, every pool of that pair is re-listed, yet only the 2
@@ -1653,8 +1756,9 @@ export class TrigEntry {
           const pre = newPer && r.live ? textDigest(routePreKey(r)) : undefined;
           if (per && pre !== undefined) {
             const old = per.get(r.rid);
-            if (old && old.pre === pre) {
+            if (old && old.pre === pre && (!delta || old.d)) {
               rows.push(old.row); metas.push(old.meta); fps.push(old.fp); lives.push(old.live);
+              if (delta) ds.push(old.d!);
               newPer!.set(r.rid, old);
               reused++; keptRoutes++;
               continue;
@@ -1666,7 +1770,9 @@ export class TrigEntry {
           if (!cand) {
             rows.push({ rid: r.rid.toLowerCase(), h: r.held, s: score, e: null }); metas.push(null); fps.push(JSON.stringify([r.rid, r.held, score, null]));
             if (fast) lives.push(quiet ? textDigest(liveKey(r, 'x')) : liveKey(r, 'x'));
-            if (pre !== undefined) newPer!.set(r.rid, { pre, row: rows[rows.length - 1], meta: null, fp: fps[fps.length - 1], live: lives[lives.length - 1] });
+            // (TRUE DELTA: what arbsim gets for this row besides its score: id, held, "not buildable".)
+            if (delta) ds.push(rowD(r, 'x', `x\u0001${r.rid.toLowerCase()}\u0001${r.held}`));
+            if (pre !== undefined) newPer!.set(r.rid, { pre, row: rows[rows.length - 1], meta: null, fp: fps[fps.length - 1], live: lives[lives.length - 1], ...(delta ? { d: ds[ds.length - 1] } : {}) });
             continue;
           }
           const meta: TableMeta = { cand };
@@ -1674,11 +1780,12 @@ export class TrigEntry {
           const rid = r.rid.toLowerCase();
           let c: Record<string, unknown> | null = null;
           let cJson: string;
+          let tpl = ''; // (TRUE DELTA: the question's template, see fastQuestion)
           if (fast) {
             // FAST TABLE 2: same question as a fresh build, from the memo when
             // only the gas cost moved (the stop amount is worked out again).
             const got = await this.fastQuestion(r, rid, cand, sizesKey, now, reuseMs, spreadSpan, memoMax, keepMeta, waitFor, memoExtraMs);
-            c = got.c; cJson = got.cJson;
+            c = got.c; cJson = got.cJson; tpl = got.tpl ?? cJson;
             if (got.sig !== undefined) meta.sig = got.sig;
             if (got.fallback) meta.fallback = true;
             if (got.reused) reused++;
@@ -1730,11 +1837,19 @@ export class TrigEntry {
           // (FAST TABLE: the same facts joined without JSON: same "changed?" answer, cheaper.)
           fps.push((fast ? `${r.rid}\u0001${r.held}\u0001${score}\u0001${cand.label}\u0001${cand.gasUsd}\u0001${cand.maxSizeUsd}\u0001${!!meta.fallback}\u0002` : JSON.stringify([r.rid, r.held, score, cand.label, cand.gasUsd, cand.maxSizeUsd, !!meta.fallback])) + cJson + (fl ? fastlaneFactsFp(fl) : ''));
           if (fast) { const lk = liveKey(r, c === null ? 'n' : meta.fallback ? 'f' : 'c', cand); lives.push(quiet ? textDigest(lk) : lk); }
+          // TRUE DELTA: the row as arbsim gets it, without its score (and
+          // without the entry id, which is given when it is sent): id, held,
+          // the question (cJson: the same question = the same text) and the
+          // fast-lane facts (rounded, as the fingerprint above).
+          // Its STRUCTURE also holds the question's template and the facts
+          // drift never moves (decimals, loan fee): a new contract code or
+          // route shape goes at once, only amounts / stop / prices wait.
+          if (delta) ds.push(rowD(r, c === null ? 'n' : meta.fallback ? 'f' : 'c', `c\u0001${rid}\u0001${r.held}\u0002${cJson}${fl ? fastlaneFactsFp(fl) : ''}`, cand, `${tpl}|${fl ? `${fl.d}|${fl.lp ?? ''}` : ''}`));
           // (The answer look-up, which holds the candidate and its pool
           // states, is only kept when it can be read: LEAN TABLE 3.)
-          if (pre !== undefined) newPer!.set(r.rid, { pre, row: rows[rows.length - 1], meta: keepMeta ? meta : null, fp: fps[fps.length - 1], live: lives[lives.length - 1] });
+          if (pre !== undefined) newPer!.set(r.rid, { pre, row: rows[rows.length - 1], meta: keepMeta ? meta : null, fp: fps[fps.length - 1], live: lives[lives.length - 1], ...(delta ? { d: ds[ds.length - 1] } : {}) });
         }
-        const fe = fast ? { fp: fps.join('\n'), rows, metas, liveFp: textDigest(lives.join('\n')) } : { fp: fps.join('\n'), rows, metas };
+        const fe = fast ? { fp: fps.join('\n'), rows, metas, liveFp: textDigest(lives.join('\n')), ...(delta ? { d: { cfs: ds.map((x) => x.cf), sks: ds.map((x) => x.sk), pks: ds.map((x) => x.pk) } } : {}) } : { fp: fps.join('\n'), rows, metas };
         fresh.set(key, fe);
         if (sig !== undefined) {
           if (this.poolPass.size > 20_000) this.poolPass.clear(); // memory bound (pools, not routes)
@@ -1761,9 +1876,22 @@ export class TrigEntry {
         }
       }
       // What changed since the last table (new ids only for changed pools).
-      const changed: Record<string, unknown[] | null> = {};
+      const changed: Record<string, unknown[] | null | TablePatch> = {};
       let heldBack = 0;
-      for (const [key, f] of fresh) {
+      // TRUE DELTA: row by row (see tableDeltaOn and deltaPool below).
+      if (delta) {
+        const ds = { whole: 0, rows: 0, scores: 0, driftRows: 0, waiting: 0 };
+        let n = 0;
+        for (const [key, f] of fresh) {
+          if ((++n & 127) === 0) { const p = sliceUp(); if (p) await p; } // (in ~2 ms bites, as the rest of the pass)
+          const ch = this.deltaPool(key, f, now, keepMeta, ds, turned.has(key));
+          if (ch !== undefined) changed[key] = ch;
+        }
+        heldBack = ds.waiting;
+        T.delta = ds;
+        T.tot.whole += ds.whole; T.tot.rows += ds.rows; T.tot.scores += ds.scores; T.tot.driftRows += ds.driftRows;
+      }
+      for (const [key, f] of delta ? [] : fresh) {
         const old = T.pools.get(key);
         if (old && old.fp === f.fp) continue;
         // FAST TABLE 3: changed only by gas / coin-price drift (same routes,
@@ -1812,7 +1940,7 @@ export class TrigEntry {
       if (T.codes.length > CODES_SOFT_MAX) this.compactCodes();
       if (!Object.keys(changed).length && !T.needFull) return T.ackGen >= 0;
       const full = T.needFull || T.ackGen < 0;
-      const pools = full ? Object.fromEntries([...T.pools].map(([k, v]) => [k, v.rows])) : changed;
+      const pools: Record<string, unknown> = full ? Object.fromEntries([...T.pools].map(([k, v]) => [k, v.rows])) : changed;
       // ZERO-ROUTES FIX (Oct 27): arbsim refuses any socket message over
       // 8 MB, and before this fix such a message silently closed the bot's
       // one connection to it (pool reports and checks included). With
@@ -1825,7 +1953,13 @@ export class TrigEntry {
       // is not turned into text again (client.requestText, same bytes).
       const texts: Buffer[][] = [];
       const canText = fast && typeof (this.d.client as { requestBytes?: unknown }).requestBytes === 'function';
-      const parts = fast ? await splitTablePoolsSliced(pools, T.codes, this.settings.tableMaxBytes, sliceUp, canText ? texts : undefined) : splitTablePools(pools, T.codes, this.settings.tableMaxBytes);
+      // TRUE DELTA: the long contract codes only when arbsim does not have
+      // this exact list yet (a full table, a new code, a renumbering): every
+      // change message used to carry all of them again (tens of KB each),
+      // even a few-bytes score patch. arbsim keeps its list when a partial
+      // message carries none (check/entry.rs apply_table).
+      const codesNow = full || !delta || T.codesAcked.epoch !== this.codesEpoch || T.codesAcked.n !== T.codes.length ? T.codes : [];
+      const parts = fast ? await splitTablePoolsSliced(pools, codesNow, this.settings.tableMaxBytes, sliceUp, canText ? texts : undefined) : splitTablePools(pools, codesNow, this.settings.tableMaxBytes);
       let base = T.ackGen;
       for (let i = 0; i < parts.length; i++) {
         const gen = T.gen + 1;
@@ -1834,22 +1968,31 @@ export class TrigEntry {
         const first = i === 0;
         // The long codes go once, with the first part (arbsim keeps its
         // list when a partial part carries none).
-        const msg = { type: 'trig_table', gen, full: first ? full : false, base, codes: first ? T.codes : [], pools: parts[i] };
+        const msg = { type: 'trig_table', gen, full: first ? full : false, base, codes: first ? codesNow : [], pools: parts[i] };
         // (Same bytes as JSON.stringify(msg) + id: `{"type":...,"pools":{<pools>}` then `,"id":n}`.)
         const a = await waitFor(canText
           ? this.d.client.requestBytes([Buffer.from(`{"type":"trig_table","gen":${gen},"full":${msg.full},"base":${base},"codes":${JSON.stringify(msg.codes)},"pools":{`, 'utf8'), ...texts[i], CLOSE_BRACE], 3_000)
           : this.d.client.request(msg, 3_000));
+        // (TRUE DELTA: bytes sent, for the 5-minute table line.)
+        T.bytes += canText ? texts[i].reduce((n, b) => n + b.length, 0) + 120 : JSON.stringify(parts[i]).length + 120;
+        T.msgs++;
         if (a.ok !== true) {
           T.sendFails++;
           T.needFull = true;
           this.noteTableSend(false, gen, parts.length, String(a.unknown ?? 'refused'));
           return false;
         }
+        // TRUE DELTA: patches only to an arbsim that says it reads them
+        // (every answer says it; an older arbsim never does).
+        T.patchOk = (a as { patch?: unknown }).patch === true;
         base = gen;
       }
       T.ackGen = base;
       T.needFull = false;
+      // (arbsim now holds this code list: later changes need not carry it.)
+      T.codesAcked = { epoch: this.codesEpoch, n: T.codes.length };
       this.noteTableSend(true, base, parts.length);
+      if (full) T.fulls++;
       return true;
     } catch {
       this.hour.errors++;
@@ -1861,7 +2004,120 @@ export class TrigEntry {
       T.lastMs = r2(performance.now() - t0);
       T.lastBusyMs = r2(busy);
       T.building = false;
+      this.tableWindowLine();
     }
+  }
+
+  // TRUE DELTA: every 5 minutes, one line saying what the table cost arbsim
+  // (all modes, so before / after can be compared on the server):
+  //   [trig-entry] table 5 min: 28 passes, 7 messages (0 full), 2.1 MB;
+  //   true delta on (patches on): rows 40, scores 3,900, whole pools 3,
+  //   drift rows 1,200 sent / 2,900 waiting
+  private tableWindowLine(): void {
+    const T = this.tbl, W = T.win;
+    const now = Date.now();
+    if (!W.at) { W.at = now; W.passes = T.passes; return; }
+    if (now - W.at < 300_000) return;
+    const mb = Math.round(((T.bytes - W.bytes) / 1_048_576) * 10) / 10;
+    const n = (x: number) => x.toLocaleString('en-US');
+    const d = this.settings.tableDelta && this.settings.tableQuiet && this.settings.tableFast && this.settings.tableLean;
+    this.log(`[trig-entry] table 5 min: ${n(T.passes - W.passes)} passes, ${n(T.msgs - W.msgs)} messages (${n(T.fulls - W.fulls)} full), ${mb} MB` +
+      (d ? `; true delta on (patches ${T.patchOk ? 'on' : 'off: arbsim does not say it reads them, whole pools instead'}): rows ${n(T.tot.rows - W.rows)}, scores ${n(T.tot.scores - W.scores)}, whole pools ${n(T.tot.whole - W.whole)}, drift rows ${n(T.tot.driftRows - W.driftRows)} sent / ${n(T.delta.waiting)} waiting`
+        : '; true delta off (TRIG_TABLE_DELTA=0 or the quiet skip is off)'));
+    Object.assign(W, { at: now, passes: T.passes, msgs: T.msgs, bytes: T.bytes, fulls: T.fulls, whole: T.tot.whole, rows: T.tot.rows, scores: T.tot.scores, driftRows: T.tot.driftRows });
+  }
+
+  // TRUE DELTA: one pool's change for arbsim (see tableDeltaOn), and the
+  // record of what arbsim then holds (T.pools: the exact rows sent, and each
+  // row's keys). undefined = nothing to send for this pool.
+  private deltaPool(key: string, f: { rows: Array<Record<string, unknown>>; metas: Array<TableMeta | null>; d?: PoolD }, now: number, keepMeta: boolean,
+    ds: { whole: number; rows: number; scores: number; driftRows: number; waiting: number }, turn = false): unknown[] | TablePatch | undefined {
+    const T = this.tbl;
+    const old = T.pools.get(key);
+    const newId = () => `${T.gen + 1}.${++T.seq}`;
+    // The whole pool, as now built (also every row's drift): new pool, a
+    // route came / went / moved, or arbsim does not read patches.
+    const whole = (): unknown[] => {
+      if (old) for (const id of old.ids) T.retired.set(id, now);
+      const ids: string[] = [];
+      // (New row objects: the built rows may be kept for later passes.)
+      const rows = f.rows.map((row, i) => {
+        if (row.e === null) return row;
+        const id = newId();
+        ids.push(id);
+        if (keepMeta) T.meta.set(id, f.metas[i]!);
+        return { ...row, e: id };
+      });
+      T.pools.set(key, { fp: '', rows, ids, d: f.d ? { cfs: f.d.cfs.slice(), sks: f.d.sks.slice(), pks: f.d.pks.slice() } : undefined, syncAt: now });
+      ds.whole++;
+      return rows;
+    };
+    if (!old || !old.d || !f.d || old.rows.length !== f.rows.length) return whole();
+    const held = old.rows as Array<Record<string, unknown>>;
+    for (let i = 0; i < f.rows.length; i++) if (held[i].rid !== f.rows[i].rid) return whole();
+    const od = old.d, nd = f.d;
+    const rowsNow: number[] = [], scoresNow: number[] = [], driftRows: number[] = [], driftScores: number[] = [];
+    for (let i = 0; i < f.rows.length; i++) {
+      const cfSame = od.cfs[i] === nd.cfs[i];
+      const sSame = (held[i].s ?? null) === (f.rows[i].s ?? null);
+      // Structure changed (held flag, can-build, route keys, label, size
+      // step) and the row with it: the whole row, now.
+      if (!cfSame && od.sks[i] !== nd.sks[i]) { rowsNow.push(i); continue; }
+      // Score: now when the route's pool prices moved, else drift.
+      if (!sSame) (od.pks[i] !== nd.pks[i] ? scoresNow : driftScores).push(i);
+      // Rest of the row changed by gas / coin-price drift only: waits.
+      if (!cfSame) driftRows.push(i);
+      // The very row arbsim holds: remember the newest facts it stands for.
+      if (cfSame && sSame) { od.sks[i] = nd.sks[i]; od.pks[i] = nd.pks[i]; }
+    }
+    // Drift goes all at once per pool: on the pool's quiet turn (QUIET SKIP:
+    // about every TRIG_TABLE_QUIET_MS, as #262 did), or when it has waited
+    // TRIG_TABLE_DELTA_DRIFT_MS (spread 50 to 100% per pool, so pools don't
+    // all go together). Both follow the clock, not the number of passes.
+    const drifting = driftRows.length + driftScores.length;
+    const due = drifting > 0 && (turn || now - (old.syncAt ?? 0) >= this.settings.tableDeltaDriftMs * (0.5 + routeSpread(key, 1_000) / 2_000));
+    if (due) { rowsNow.push(...driftRows); scoresNow.push(...driftScores); }
+    if (!rowsNow.length && !scoresNow.length) { ds.waiting += drifting; return undefined; }
+    // Older arbsim (no patches), or most of the pool anyway: the whole pool.
+    if (!T.patchOk || rowsNow.length * 2 > f.rows.length) {
+      ds.driftRows += drifting; // (any drift goes now, with the whole pool)
+      return whole();
+    }
+    const rows = held.slice();
+    const whole1 = new Set(rowsNow);
+    const pr: unknown[] = [];
+    for (const i of rowsNow) {
+      const oldId = held[i].e;
+      if (typeof oldId === 'string' && oldId) T.retired.set(oldId, now);
+      let nr = f.rows[i];
+      if (nr.e !== null) {
+        const id = newId();
+        nr = { ...nr, e: id };
+        if (keepMeta) T.meta.set(id, f.metas[i]!);
+      }
+      rows[i] = nr;
+      pr.push(nr);
+      od.cfs[i] = nd.cfs[i]; od.sks[i] = nd.sks[i]; od.pks[i] = nd.pks[i];
+    }
+    const ps: Record<string, number | null> = {};
+    let nScores = 0;
+    for (const i of scoresNow) {
+      if (whole1.has(i)) continue; // (the whole row carries its score)
+      const sc = (f.rows[i].s ?? null) as number | null;
+      rows[i] = { ...held[i], s: sc };
+      ps[String(f.rows[i].rid)] = sc;
+      nScores++;
+      od.pks[i] = nd.pks[i];
+      // (Same entry id: the question did not change. The answer look-up
+      // gets the newest candidate when it is kept.)
+      if (keepMeta && typeof rows[i].e === 'string' && f.metas[i]) T.meta.set(rows[i].e as string, f.metas[i]!);
+    }
+    const ids = rows.map((r) => r.e).filter((e): e is string => typeof e === 'string' && !!e);
+    T.pools.set(key, { fp: '', rows, ids, d: od, syncAt: due ? now : old.syncAt });
+    ds.rows += rowsNow.length - (due ? driftRows.length : 0);
+    ds.scores += nScores;
+    if (due) ds.driftRows += drifting;
+    return { ...(pr.length ? { r: pr } : {}), ...(nScores ? { s: ps } : {}) };
   }
 
   // First table taken / every refusal: said at once (not only in the
@@ -1885,13 +2141,13 @@ export class TrigEntry {
   // look-up hash for when it has a stop amount (`sigAll`) and the route's
   // spread (ms added to the reuse window).
   private readonly tblMemo = new Map<string, { at: number; inputs: unknown[]; sameAs: string; codesEpoch: number; c: Record<string, unknown> | null; cJson: string; sig?: string; fallback?: boolean;
-    fast?: true; parts?: QParts; base?: string; gasUsd?: number; sigAll?: string; spread?: number }>();
+    fast?: true; parts?: QParts; base?: string; gasUsd?: number; sigAll?: string; spread?: number; tpl?: string }>();
   // Bumped whenever the long-code list is renumbered (compactCodes): questions
   // written before that point at old list positions and are never reused.
   private codesEpoch = 0;
   // FAST TABLE 4: each pool's last build (what it was built from, the result).
   // (QUIET SKIP 4: `per` = each route's last result, by route id.)
-  private readonly poolPass = new Map<string, { sig: string; ver?: unknown[]; n: number; f: { fp: string; rows: Array<Record<string, unknown>>; metas: Array<TableMeta | null>; liveFp?: string }; at: number; ttl: number; codesEpoch: number; sizesKey: string; per?: Map<string, RouteKept> }>();
+  private readonly poolPass = new Map<string, { sig: string; ver?: unknown[]; n: number; f: { fp: string; rows: Array<Record<string, unknown>>; metas: Array<TableMeta | null>; liveFp?: string; d?: PoolD }; at: number; ttl: number; codesEpoch: number; sizesKey: string; per?: Map<string, RouteKept> }>();
   // The candidate's own facts that its question depends on (besides `inputs`).
   private memoKey(c: EntryCandidate, sizesKey: string): string {
     return JSON.stringify([c.label, c.buyPool, c.sellPool, c.tokenIn, c.maxSizeUsd, c.gasUsd, c.keys, sizesKey, this.settings.minNetUsd]);
@@ -1911,13 +2167,13 @@ export class TrigEntry {
     memoMax: () => number, keepMeta: boolean, waitFor: <X>(p: Promise<X>) => Promise<X>,
     // QUIET SKIP 2: extra ms a kept question may be reused (0 = #260 window).
     memoExtraMs = 0,
-  ): Promise<{ c: Record<string, unknown> | null; cJson: string; sig?: string; fallback?: boolean; reused?: boolean; restop?: boolean }> {
+  ): Promise<{ c: Record<string, unknown> | null; cJson: string; sig?: string; fallback?: boolean; reused?: boolean; restop?: boolean; tpl?: string }> {
     const sameAs = this.memoKeyFast(cand, sizesKey);
     const rInputs = inputsOf(r);
     const memo = reuseMs > 0 && rInputs ? this.tblMemo.get(rid) : undefined;
     if (memo && memo.fast && memo.codesEpoch === this.codesEpoch && memo.sameAs === sameAs && sameItems(memo.inputs, rInputs!)
       && now - memo.at <= reuseMs + (memo.parts ? memo.spread ?? 0 : 0) + memoExtraMs) {
-      if (!memo.parts || memo.gasUsd === cand.gasUsd) return { c: memo.c, cJson: memo.cJson, sig: memo.sig, fallback: memo.fallback, reused: true };
+      if (!memo.parts || memo.gasUsd === cand.gasUsd) return { c: memo.c, cJson: memo.cJson, sig: memo.sig, fallback: memo.fallback, reused: true, tpl: memo.tpl };
       // Only the gas cost moved: the stop amount again (as stopUnits always does).
       const stop = stopUnits(cand, this.settings.minNetUsd, true);
       const c = stop === null ? null : assembleQuestion(memo.parts, stop);
@@ -1925,7 +2181,7 @@ export class TrigEntry {
       memo.c = c; memo.cJson = cJson; memo.gasUsd = cand.gasUsd;
       memo.sig = c ? memo.sigAll : undefined;
       memo.fallback = stop === null ? true : undefined;
-      return { c, cJson, sig: memo.sig, fallback: memo.fallback, reused: true, restop: true };
+      return { c, cJson, sig: memo.sig, fallback: memo.fallback, reused: true, restop: true, tpl: memo.tpl };
     }
     let c: Record<string, unknown> | null = null;
     let parts: QParts | undefined;
@@ -1955,12 +2211,18 @@ export class TrigEntry {
     const base = !parts ? '' : capId !== undefined ? `t${capId}|${parts.route.join(',')}|${this.codesEpoch}` : textDigest(JSON.stringify([parts.calls, parts.overrides, parts.sizes ?? null, parts.route, parts.amt]));
     const cJson = c === null ? NULL_DIGEST : `${base}:${c.stop as string}`;
     const sig = c ? sigAll : undefined;
+    // TRUE DELTA: the question's TEMPLATE: what it is, apart from the
+    // amounts and the stop (which gas / coin-price drift move): the captured
+    // template's number (a new contract code, a new route shape = a new
+    // capture), the route and the code numbering. Without a template number
+    // the whole question counts, so any change is real.
+    const tpl = !parts ? 'none' : capId !== undefined ? `t${capId.split('|')[0]}|${parts.route.join(',')}|${this.codesEpoch}` : base;
     if (reuseMs > 0 && rInputs) {
       if (this.tblMemo.size > memoMax()) this.tblMemo.clear(); // memory bound
       this.tblMemo.set(rid, { at: now, inputs: rInputs.slice(), sameAs, codesEpoch: this.codesEpoch, c, cJson, sig, fallback,
-        fast: true, parts, base, gasUsd: cand.gasUsd, sigAll, spread: routeSpread(rid, spreadSpan) });
+        fast: true, parts, base, gasUsd: cand.gasUsd, sigAll, spread: routeSpread(rid, spreadSpan), tpl });
     } else this.tblMemo.delete(rid);
-    return { c, cJson, sig, fallback };
+    return { c, cJson, sig, fallback, tpl };
   }
 
   private captureForTimed(cand: EntryCandidate, plan: NonNullable<ReturnType<typeof ladderPlan>>, waitFor: <X>(p: Promise<X>) => Promise<X>): Promise<CapturedCheck | null> {
@@ -2162,7 +2424,7 @@ export class TrigEntry {
       const K = h.kind;
       if (this.settings.loops || K.loop.built) parts.push(`by kind (built/checked/profitable/would send/sent): pair ${K.pair.built}/${K.pair.checked}/${K.pair.profitable}/${K.pair.wouldSend}/${K.pair.sent}, loop ${K.loop.built}/${K.loop.checked}/${K.loop.profitable}/${K.loop.wouldSend}/${K.loop.sent}${h.loopErrors ? ` (loop errors ${h.loopErrors})` : ''}`);
       if (this.d.loopHourText) { try { const t = this.d.loopHourText(); if (t) parts.push(t); } catch { /* reporting only */ } }
-      if (!this.oneTripOn() && this.tableOn()) parts.push(`two steps; fast lane table ${this.tbl.pools.size} pools / ${this.tbl.lastRoutes} routes (${this.tbl.lastReused} reused unchanged), rebuilt in ${this.tbl.lastMs} ms (bot thread busy ${this.tbl.lastBusyMs} ms), sent ${this.tbl.sends}x${this.settings.tableFast && this.settings.tableLean ? ` (fast table: last pass ${this.tbl.lastSkipped} pools not rebuilt, ${this.tbl.lastHeld} with only gas / coin-price changes waiting, ${this.tbl.lastRestop} stop amounts redone for gas${this.settings.tableQuiet ? `, ${this.tbl.lastTurns} quiet pools' turn, ${this.tbl.lastWaiting} waiting a turn, ${this.tbl.lastKeptRoutes} routes kept inside rebuilt pools` : ''})` : ''}`);
+      if (!this.oneTripOn() && this.tableOn()) parts.push(`two steps; fast lane table ${this.tbl.pools.size} pools / ${this.tbl.lastRoutes} routes (${this.tbl.lastReused} reused unchanged), rebuilt in ${this.tbl.lastMs} ms (bot thread busy ${this.tbl.lastBusyMs} ms), sent ${this.tbl.sends}x${this.settings.tableFast && this.settings.tableLean ? ` (fast table: last pass ${this.tbl.lastSkipped} pools not rebuilt, ${this.tbl.lastHeld} with only gas / coin-price changes waiting, ${this.tbl.lastRestop} stop amounts redone for gas${this.settings.tableQuiet ? `, ${this.tbl.lastTurns} quiet pools' turn, ${this.tbl.lastWaiting} waiting a turn, ${this.tbl.lastKeptRoutes} routes kept inside rebuilt pools` : ''}${this.settings.tableQuiet && this.settings.tableDelta ? `; true delta last pass: rows ${this.tbl.delta.rows}, scores ${this.tbl.delta.scores}, whole pools ${this.tbl.delta.whole}, drift rows ${this.tbl.delta.driftRows} sent (the "waiting" count above is rows), patches ${this.tbl.patchOk ? 'on' : 'off'}; ${this.tbl.msgs} messages / ${Math.round(this.tbl.bytes / 1_048_576)} MB to arbsim since start` : ''})` : ''}`);
       if (this.oneTripOn()) parts.push(`one trip ${h.one.used}${Object.keys(h.one.why).length ? ` (two steps: ${top(h.one.why)})` : ''}; table ${this.tbl.pools.size} pools / ${this.tbl.lastRoutes} routes (${this.tbl.lastReused} reused unchanged), rebuilt in ${this.tbl.lastMs} ms`);
       const hp = HOP_NAMES.filter((k) => h.hops[k].length).map((k) => `${k} ${pctl(h.hops[k], 0.5)}/${pctl(h.hops[k], 0.9)}`);
       if (hp.length) parts.push(`hops p50/p90 ms: ${hp.join(', ')}`);

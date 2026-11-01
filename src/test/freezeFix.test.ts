@@ -196,7 +196,8 @@ function heldTable(tables: Array<Record<string, any>>): string {
   let codes: string[] = [];
   for (const t of tables) {
     if (t.full) for (const k of Object.keys(pools)) delete pools[k];
-    codes = t.codes;
+    // (arbsim's rule: a message replaces the code list when it carries one or is full; TRUE DELTA sends it only when it changed.)
+    if (t.full || (t.codes ?? []).length) codes = t.codes;
     for (const [k, v] of Object.entries(t.pools as Record<string, any>)) { if (v === null) delete pools[k]; else pools[k] = v; }
   }
   const norm = Object.keys(pools).sort().map((k) => [k, pools[k].map((r: any) => ({ ...r, e: r.e === null ? null : 'id', c: r.c ? JSON.parse(JSON.stringify(r.c).replace(/"\$code:(\d+)"/g, (_m, i) => JSON.stringify(codes[Number(i)]))) : r.c }))]);
