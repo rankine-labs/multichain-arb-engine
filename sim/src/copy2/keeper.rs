@@ -155,6 +155,19 @@ pub struct KeeperCfg {
     /// (before: up to 2,000 values each). Default: 256 with
     /// FASTLANE_AHEAD=observe, else = FASTLANE_AHEAD_KEEP_SLOTS (old).
     pub cand_slots: usize,
+    /// FASTLANE_AHEAD_KEEP_PRUNE_BLOCKS (memory fix, Nov 1): every this many
+    /// blocks the keeper forgets the values of its kept contracts that
+    /// (a) no predicted run ever asked for (not "learned") AND (b) no block
+    /// wrote in the last two such windows. Those are values it ADOPTED
+    /// because a block once wrote them (FASTLANE_AHEAD_KEEP_ADOPT): live
+    /// they piled up ~10,000 an hour toward the 200,000 cap and never went
+    /// away. Codes no kept account uses any more go too. 0 = off (old:
+    /// keep everything until the cap). Default 18,000 blocks (~31 min at
+    /// the ~9.7 blocks/s measured live Nov 1: 34,840 blocks an hour), so a
+    /// value is only dropped after 30-60 min of nobody writing it. Safe: a dropped value is just "not held"; a run that
+    /// needs it again misses it once, which makes it learned (kept for
+    /// good) and seeded again from the node.
+    pub prune_blocks: u64,
 }
 
 impl Default for KeeperCfg {
@@ -175,6 +188,9 @@ impl Default for KeeperCfg {
             seed_par: 0,
             lead_feed: false,
             cand_slots: 2000,
+            // Off for the core's own defaults (tests, replay) unless asked;
+            // the live setting (from_lookup) defaults to on.
+            prune_blocks: 0,
         }
     }
 }
@@ -196,6 +212,8 @@ impl KeeperCfg {
             seed_par: num("FASTLANE_AHEAD_KEEP_SEED_PAR", if observe { 2 } else { 0 }, 0, 8) as usize,
             lead_feed: super::ahead::on_off(get("FASTLANE_AHEAD_KEEP_LEAD").as_deref()).unwrap_or(observe),
             cand_slots: num("FASTLANE_AHEAD_KEEP_CAND_SLOTS", if observe { 256 } else { max_slots_per as u64 }, 1, 100_000) as usize,
+            // Memory fix (Nov 1): 0 = off; anything else at least 100 blocks.
+            prune_blocks: get("FASTLANE_AHEAD_KEEP_PRUNE_BLOCKS").and_then(|v| v.trim().parse::<u64>().ok()).map(|v| if v == 0 { 0 } else { v.clamp(100, 10_000_000) }).unwrap_or(18_000),
             on,
             max_contracts: num("FASTLANE_AHEAD_KEEP_CONTRACTS", d.max_contracts as u64, 1, 1000) as usize,
             max_slots_per,
@@ -382,6 +400,10 @@ impl SlotSet {
     fn iter(&self) -> std::slice::Iter<'_, U256> {
         self.0.iter()
     }
+    /// Is this value in the set? (sorted list: binary search)
+    fn contains(&self, s: &U256) -> bool {
+        self.0.binary_search(s).is_ok()
+    }
 }
 
 /// A learned contract (kept or not yet).
@@ -436,6 +458,12 @@ pub struct KeeperStats {
     pub cands_dropped: u64,
     /// Memory guard: learned batches ignored / seeds held back while paused.
     pub mem_learn_skipped: u64,
+    /// PRUNE (FASTLANE_AHEAD_KEEP_PRUNE_BLOCKS): rounds run, values and
+    /// codes dropped in all, values dropped by the last round.
+    pub prunes: u64,
+    pub pruned_values: u64,
+    pub pruned_codes: u64,
+    pub prune_last_values: u64,
     pub audits: u64,
     pub audit_values: u64,
     pub audit_mismatch: u64,
@@ -460,7 +488,8 @@ impl KeeperStats {
             "blocks": self.blocks, "heldTouched": self.held_touched, "valuesUpdated": self.values_updated,
             "learned": self.learned, "seedsSent": self.seeds_sent, "seedValues": self.seed_values, "seedsDropped": self.seeds_dropped,
             "evicted": self.evicted, "recreated": self.recreated, "adopted": self.adopted, "refusedFull": self.refused_full, "candsDropped": self.cands_dropped,
-            "memLearnSkipped": self.mem_learn_skipped, "audits": self.audits, "auditValues": self.audit_values, "auditMismatch": self.audit_mismatch,
+            "memLearnSkipped": self.mem_learn_skipped,
+            "prunes": self.prunes, "prunedValues": self.pruned_values, "prunedCodes": self.pruned_codes, "pruneLastValues": self.prune_last_values, "audits": self.audits, "auditValues": self.audit_values, "auditMismatch": self.audit_mismatch,
             "resets": self.resets.iter().map(|(k, v)| (k.to_string(), json!(v))).collect::<serde_json::Map<String, Value>>(),
             "applyUs": crate::timing::pct_of(&mut t),
             "samples": self.samples,
@@ -491,6 +520,15 @@ pub struct KeeperCore {
     /// still applies every block to the values it holds (they stay exact,
     /// so nothing must be seeded again afterwards). Set by the runtime.
     pub mem_pause: bool,
+    /// PRUNE (FASTLANE_AHEAD_KEEP_PRUNE_BLOCKS): values of kept contracts
+    /// a block wrote in this window / the one before (only kept accounts'
+    /// values, so bounded by what is held), and the block the window began.
+    /// Kept as 8-byte fingerprints (`written_key`), not the 52-byte
+    /// (contract, slot): a fingerprint shared by chance only keeps a value
+    /// one more round (never drops one that was written).
+    written_now: HashSet<u64>,
+    written_prev: HashSet<u64>,
+    prune_from: Option<u64>,
 }
 
 
@@ -509,6 +547,9 @@ impl KeeperCore {
             audit_next: 0,
             stats: KeeperStats::default(),
             mem_pause: false,
+            written_now: HashSet::new(),
+            written_prev: HashSet::new(),
+            prune_from: None,
         }
     }
 
@@ -707,6 +748,8 @@ impl KeeperCore {
 
     fn evict(&mut self, a: Address) {
         self.held.remove(&a);
+        // (PRUNE bookkeeping: its write fingerprints simply age out within
+        // two rounds; nothing to do here.)
         if self.cur.accounts.remove(&a).is_some() {
             self.stats.evicted += 1;
         }
@@ -885,6 +928,15 @@ impl KeeperCore {
                 apply_filtered(*a, cur, &f)
             };
             touched += 1;
+            // PRUNE: remember which held values this block wrote (they are
+            // in use; only those survive a prune besides learned ones).
+            if self.cfg.prune_blocks > 0 {
+                for s in ad.storage.keys() {
+                    if next.storage.contains_key(s) {
+                        self.written_now.insert(written_key(a, s));
+                    }
+                }
+            }
             self.cur.accounts.insert(*a, next);
         }
         for a in recreate {
@@ -902,12 +954,82 @@ impl KeeperCore {
         }
         self.head = Some(block);
         self.cur.block = block;
+        // PRUNE: once per window, before this block's version goes out.
+        if self.cfg.prune_blocks > 0 {
+            match self.prune_from {
+                None => self.prune_from = Some(block),
+                Some(f) if block.saturating_sub(f) >= self.cfg.prune_blocks => {
+                    self.prune();
+                    self.prune_from = Some(block);
+                }
+                Some(_) => {}
+            }
+        }
         self.publish(false);
         self.stats.blocks += 1;
         self.stats.held_touched += touched;
         self.stats.values_updated += updated;
         self.stats.add_time(t0.elapsed().as_micros() as u64);
         Ok(())
+    }
+
+    /// PRUNE (FASTLANE_AHEAD_KEEP_PRUNE_BLOCKS, memory fix Nov 1): drop the
+    /// held values nobody needs any more. A value stays when
+    ///   - a predicted run asked for it (it is in the contract's learned
+    ///     list), or
+    ///   - a block wrote it in this window or the one before.
+    /// Accounts held as "every value known" (created / empty) are left
+    /// whole: removing one of their values would make it read as ZERO, not
+    /// as unknown. Codes no held account uses any more are dropped too.
+    /// Only `cur` changes; versions already published keep what they had
+    /// (they are exact for their block and age out on their own).
+    /// Returns the number of values dropped.
+    pub fn prune(&mut self) -> usize {
+        let mut dropped = 0usize;
+        let addrs: Vec<Address> = self.cur.accounts.keys().copied().collect();
+        for a in addrs {
+            let Some(acct) = self.cur.accounts.get(&a) else { continue };
+            if acct.storage_complete || acct.storage.is_empty() {
+                continue;
+            }
+            let need = self.cands.get(&a).map(|c| &c.slots);
+            let gone: Vec<U256> = acct
+                .storage
+                .keys()
+                .filter(|s| !need.is_some_and(|n| n.contains(s)) && !self.written_now.contains(&written_key(&a, s)) && !self.written_prev.contains(&written_key(&a, s)))
+                .copied()
+                .collect();
+            if gone.is_empty() {
+                continue;
+            }
+            let mut m = acct.clone();
+            for s in &gone {
+                m.storage.remove(s);
+            }
+            dropped += gone.len();
+            self.cur.accounts.insert(a, m);
+        }
+        // Codes: keep the ones a held account's basics name.
+        let used: HashSet<B256> = self
+            .cur
+            .accounts
+            .values()
+            .filter_map(|x| match &x.basics {
+                Basics::Known(Some(i)) => Some(i.code_hash),
+                _ => None,
+            })
+            .collect();
+        let old_codes: Vec<B256> = self.cur.codes.keys().filter(|h| !used.contains(*h)).copied().collect();
+        for h in &old_codes {
+            self.cur.codes.remove(h);
+        }
+        // The window moves on: this window's writes become "the one before".
+        self.written_prev = std::mem::take(&mut self.written_now);
+        self.stats.prunes += 1;
+        self.stats.pruned_values += dropped as u64;
+        self.stats.pruned_codes += old_codes.len() as u64;
+        self.stats.prune_last_values = dropped as u64;
+        dropped
     }
 
     /// AUDIT, part 1: the next kept contract to re-read (round robin) and
@@ -990,9 +1112,19 @@ impl KeeperCore {
             "head": self.head, "contracts": held, "accounts": accts, "values": slots, "codes": self.cur.codes.len(),
             "candidates": self.cands.len(), "candidateValues": self.cands.values().map(|c| c.slots.len()).sum::<usize>(), "seedsWaiting": self.seeds.len(), "versions": self.versions.len(),
             "recentDiffs": self.recent.len(), "memPaused": self.mem_pause,
+            "prune": {"everyBlocks": self.cfg.prune_blocks, "writtenTracked": self.written_now.len() + self.written_prev.len(), "nextAt": self.prune_from.map(|f| f + self.cfg.prune_blocks)},
             "stats": self.stats.json(),
         })
     }
+}
+
+/// PRUNE: the 8-byte fingerprint of one held value (contract, slot).
+fn written_key(a: &Address, s: &U256) -> u64 {
+    use std::hash::{BuildHasher, Hash, Hasher};
+    let mut h = rustc_hash::FxBuildHasher.build_hasher();
+    a.hash(&mut h);
+    s.hash(&mut h);
+    h.finish()
 }
 
 /// Apply one account's block change to a held account, keeping only the
@@ -2290,5 +2422,169 @@ mod tests {
         let out = wanted_items(&[], Some((&accts, &HashSet::new())), &snap, &Approx, a(0x60000), &|_| false);
         assert!(out.contains(&MissItem::Account(a(0x70000))), "approximate basics are learned");
         assert!(!out.contains(&MissItem::Account(a(0x80000))), "exact ones are not");
+    }
+
+    // -----------------------------------------------------------------
+    // PRUNE (FASTLANE_AHEAD_KEEP_PRUNE_BLOCKS, memory fix Nov 1)
+    // -----------------------------------------------------------------
+
+    fn prune_core(every: u64) -> KeeperCore {
+        KeeperCore::new(KeeperCfg { on: true, max_contracts: 10, prune_blocks: every, ..KeeperCfg::default() })
+    }
+
+    /// Adopted values nobody asked for and no block wrote for two windows
+    /// are dropped; learned ones and recently written ones stay, exact.
+    #[test]
+    fn prune_drops_only_stale_adopted_values() {
+        let mut k = prune_core(10);
+        k.start_at(100);
+        // Learned (a run needed it): slot 1. Seeded.
+        k.learn(&[MissItem::Slot(a(1), u(1))]);
+        seed(&mut k, 100);
+        // Block 101 writes slots 2..=5: adopted (nobody asked for them).
+        k.apply_block(101, &[slot_diff(a(1), &[(2, 2), (3, 3), (4, 4), (5, 5)])]).unwrap();
+        assert_eq!(k.account(&a(1)).unwrap().storage.len(), 5);
+        // Window 1 (101..111): slot 5 is written again near its end.
+        for b in 102..=111 {
+            let d = if b == 110 { vec![slot_diff(a(1), &[(5, 55)])] } else { vec![] };
+            k.apply_block(b, &d).unwrap();
+        }
+        // First prune ran at 111: everything written in window 1 (2..=5)
+        // survives (written in "this window").
+        assert_eq!(k.stats.prunes, 1);
+        assert_eq!(k.account(&a(1)).unwrap().storage.len(), 5, "first round: all written recently");
+        // Window 2 (112..121): only slot 4 is written.
+        for b in 112..=121 {
+            let d = if b == 115 { vec![slot_diff(a(1), &[(4, 44)])] } else { vec![] };
+            k.apply_block(b, &d).unwrap();
+        }
+        // Second prune at 121: 2, 3, 5 were last written in window 1 (now
+        // "the one before"): kept one more round. Nothing dropped yet.
+        assert_eq!(k.stats.prunes, 2);
+        assert_eq!(k.account(&a(1)).unwrap().storage.len(), 5);
+        // Window 3: nothing written. Third prune: 2, 3, 5 have not been
+        // written for two windows -> dropped. 1 (learned) and 4 (written in
+        // window 2) stay, with their exact values.
+        for b in 122..=131 {
+            k.apply_block(b, &[]).unwrap();
+        }
+        assert_eq!(k.stats.prunes, 3);
+        let acct = k.account(&a(1)).unwrap();
+        assert_eq!(acct.storage.get(&u(1)), Some(&u(10)), "learned value kept");
+        assert_eq!(acct.storage.get(&u(4)), Some(&u(44)), "recently written value kept");
+        assert!(acct.storage.get(&u(2)).is_none() && acct.storage.get(&u(3)).is_none() && acct.storage.get(&u(5)).is_none(), "stale adopted values dropped");
+        assert_eq!(k.stats.pruned_values, 3);
+        assert_eq!(k.stats.prune_last_values, 3);
+        // A dropped value is UNKNOWN (never a stale guess): not held.
+        assert!(!k.latest().unwrap().holds_slot(&a(1), &u(2)));
+        // An older published version still holds it (exact for its block).
+        assert!(k.version_at(125).unwrap().holds_slot(&a(1), &u(2)));
+    }
+
+    /// Off (0, the core's default): nothing is ever dropped, no writes tracked.
+    #[test]
+    fn prune_off_keeps_everything() {
+        let mut k = prune_core(0);
+        k.start_at(100);
+        k.learn(&[MissItem::Slot(a(1), u(1))]);
+        seed(&mut k, 100);
+        k.apply_block(101, &[slot_diff(a(1), &[(2, 2), (3, 3)])]).unwrap();
+        for b in 102..=200 {
+            k.apply_block(b, &[]).unwrap();
+        }
+        assert_eq!(k.account(&a(1)).unwrap().storage.len(), 3);
+        assert_eq!(k.stats.prunes, 0);
+        assert!(k.written_now.is_empty() && k.written_prev.is_empty());
+    }
+
+    /// A dropped value that a run needs again is learned, seeded again and
+    /// from then on kept for good (self-healing; that is why the prune is
+    /// safe for accuracy).
+    #[test]
+    fn a_pruned_value_needed_again_comes_back_and_stays() {
+        let mut k = prune_core(10);
+        k.start_at(100);
+        k.learn(&[MissItem::Slot(a(1), u(1))]);
+        seed(&mut k, 100);
+        k.apply_block(101, &[slot_diff(a(1), &[(7, 70)])]).unwrap();
+        for b in 102..=131 {
+            k.apply_block(b, &[]).unwrap();
+        }
+        assert!(k.account(&a(1)).unwrap().storage.get(&u(7)).is_none(), "dropped after two quiet windows");
+        // A run misses it: learned + seeded at the head (exact again).
+        k.learn(&[MissItem::Slot(a(1), u(7))]);
+        seed(&mut k, 131);
+        assert_eq!(k.account(&a(1)).unwrap().storage.get(&u(7)), Some(&u(70)));
+        for b in 132..=200 {
+            k.apply_block(b, &[]).unwrap();
+        }
+        assert_eq!(k.account(&a(1)).unwrap().storage.get(&u(7)), Some(&u(70)), "learned now: never dropped");
+    }
+
+    /// "Every value known" accounts (created / empty) are never pruned:
+    /// dropping a listed value there would read as ZERO, not unknown.
+    #[test]
+    fn prune_leaves_every_value_known_accounts_alone() {
+        let mut k = prune_core(10);
+        k.start_at(100);
+        k.learn(&[MissItem::Account(a(1))]);
+        // The seed says the account does not exist: every value known (zero).
+        while let Some(j) = k.take_job() {
+            k.on_seed(&j, Some(SeedAnswer { addr: j.addr, at: 100, basics: Some(None), code: None, slots: vec![] }));
+        }
+        assert!(k.account(&a(1)).unwrap().storage_complete);
+        // A block creates it and writes a value (storage_cleared path).
+        let mut d = StateDiff::default();
+        d.accounts.insert(a(1), AccountDiff { info: Some(Some(AccountInfo { balance: u(1), nonce: 1, code_hash: KECCAK_EMPTY, ..Default::default() })), storage: [(u(3), u(33))].into_iter().collect(), storage_cleared: true, ..Default::default() });
+        k.apply_block(101, &[d]).unwrap();
+        let before = k.account(&a(1)).unwrap().clone();
+        for b in 102..=140 {
+            k.apply_block(b, &[]).unwrap();
+        }
+        let after = k.account(&a(1)).unwrap();
+        assert_eq!(after.storage_complete, before.storage_complete);
+        assert_eq!(after.storage.len(), before.storage.len(), "nothing dropped from an every-value-known account");
+    }
+
+    /// Codes no held account uses any more are dropped at the prune.
+    #[test]
+    fn prune_drops_unused_codes() {
+        let mut k = prune_core(10);
+        k.start_at(100);
+        k.learn(&[MissItem::Account(a(1))]);
+        let code = Bytecode::new_raw(revm::primitives::Bytes::from_static(&[0x60, 0x00]));
+        let h = code.hash_slow();
+        while let Some(j) = k.take_job() {
+            let info = AccountInfo { balance: u(1), nonce: 1, code_hash: h, ..Default::default() };
+            k.on_seed(&j, Some(SeedAnswer { addr: j.addr, at: 100, basics: Some(Some(info)), code: Some(code.clone()), slots: vec![] }));
+        }
+        // A code nobody uses (as left behind by an evicted contract).
+        let stale = Bytecode::new_raw(revm::primitives::Bytes::from_static(&[0x60, 0x01]));
+        k.cur.codes.insert(stale.hash_slow(), stale);
+        assert_eq!(k.cur.codes.len(), 2);
+        for b in 101..=111 {
+            k.apply_block(b, &[]).unwrap();
+        }
+        assert_eq!(k.stats.prunes, 1);
+        assert_eq!(k.cur.codes.len(), 1, "the unused code is gone");
+        assert!(k.has_code(&h), "the code a held contract uses stays");
+        assert_eq!(k.stats.pruned_codes, 1);
+    }
+
+    /// The live setting: on by default (18,000 blocks), 0 = off, small
+    /// values raised to 100.
+    #[test]
+    fn prune_setting() {
+        let get = |v: Option<&'static str>| KeeperCfg::from_lookup(move |k| match k {
+            "FASTLANE_AHEAD" => Some("observe".into()),
+            "FASTLANE_AHEAD_KEEP_PRUNE_BLOCKS" => v.map(|x| x.to_string()),
+            _ => None,
+        });
+        assert_eq!(get(None).prune_blocks, 18_000);
+        assert_eq!(get(Some("0")).prune_blocks, 0);
+        assert_eq!(get(Some("5")).prune_blocks, 100);
+        assert_eq!(get(Some("36000")).prune_blocks, 36_000);
+        assert_eq!(get(Some("junk")).prune_blocks, 18_000);
+        assert_eq!(KeeperCfg::default().prune_blocks, 0, "the core's own default (tests, replay): off");
     }
 }

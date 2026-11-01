@@ -248,6 +248,24 @@ pub fn socket_status_json() -> Value {
     json!({ "tooLarge": TOO_LARGE.load(Relaxed), "tooLargeLastBytes": TOO_LARGE_LAST.load(Relaxed), "maxBytes": crate::proto::MAX_MESSAGE })
 }
 
+/// Status `memory.sizes` (Nov 1 memory fix): the sizes of the parts that
+/// grew while running, gathered from the rest of the status answer `s`
+/// (nothing is counted twice; null where a part does not run).
+pub fn memory_sizes(s: &Value) -> Value {
+    let k = &s["fastlaneKeeper"];
+    let kp = &k["stats"];
+    let cp = &s["copy2"]["codePrune"];
+    json!({
+        "copyAccounts": s["accounts"], "copyValues": s["slots"], "copyCodes": s["codes"],
+        "copyCodesUsed": cp["used"], "copyCodesWaiting": cp["waiting"], "copyCodesPruned": cp["prunedTotal"],
+        "keeperContracts": k["contracts"], "keeperValues": k["values"], "keeperCodes": k["codes"],
+        "keeperCandidates": k["candidates"], "keeperCandidateValues": k["candidateValues"],
+        "keeperValuesPruned": kp["prunedValues"], "keeperCodesPruned": kp["prunedCodes"],
+        "keeperWrittenTracked": k["prune"]["writtenTracked"],
+        "aheadWaitingAgreements": s["fastlaneAhead"]["memory"]["waitingAgreements"],
+    })
+}
+
 /// Answer one question (also used directly by tests).
 pub fn handle(ctx: &Ctx, req: &Value) -> Value {
     handle_tm(ctx, req, &mut Tm::default())
@@ -300,6 +318,14 @@ pub fn handle_tm(ctx: &Ctx, req: &Value, tm: &mut Tm) -> Value {
             // FAST LANE loop summary (ahead, scan, gun, safety, practice).
             if let Some(f) = crate::fastlane::lane::status_json() {
                 s["fastlane"] = f;
+            }
+            // (Nov 1, memory fix) The sizes of the parts that used to keep
+            // growing, next to the memory figures: copy 2's accounts /
+            // values / codes (and the code pruning), the keeper's values,
+            // codes, candidates and its pruning. Read from the figures above.
+            let sizes = memory_sizes(&s);
+            if let Value::Object(m) = &mut s["memory"] {
+                m.insert("sizes".into(), sizes);
             }
             s
         }
