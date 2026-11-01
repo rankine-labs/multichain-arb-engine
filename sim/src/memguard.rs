@@ -157,10 +157,15 @@ pub fn peak_rss_mb() -> f64 {
         .unwrap_or(0.0)
 }
 
-/// Hand freed memory back to the system (glibc malloc_trim). Returns the
-/// time it took (ms). No-op elsewhere.
+/// Hand freed memory back to the system: glibc malloc_trim, or with
+/// mimalloc (src/alloc.rs, the default) mi_collect. Returns the time it
+/// took (ms). No-op elsewhere.
 pub fn trim_now() -> f64 {
     let t = Instant::now();
+    if crate::alloc::is_mimalloc() {
+        crate::alloc::mimalloc_collect();
+        return t.elapsed().as_secs_f64() * 1000.0;
+    }
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     // SAFETY: malloc_trim only walks glibc's own free lists.
     unsafe {
@@ -235,8 +240,12 @@ pub fn paused_now() -> bool {
 }
 
 /// glibc's own figures (bytes): (in use, free inside the allocator, mapped
-/// on their own). None elsewhere.
+/// on their own). None elsewhere, and None when mimalloc runs (glibc then
+/// holds almost nothing; see mimalloc_json).
 pub fn malloc_figures() -> Option<(u64, u64, u64)> {
+    if crate::alloc::is_mimalloc() {
+        return None;
+    }
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     {
         // SAFETY: mallinfo2 only reads glibc's own bookkeeping.
@@ -261,12 +270,19 @@ pub fn status_json() -> Value {
             Some((t, v)) if t.elapsed().as_secs() < 30 => v.clone(),
             _ => {
                 let t0 = Instant::now();
-                let v = match malloc_figures() {
-                    Some((u, f, m)) => {
-                        let mbf = |b: u64| (b as f64 / 1_048_576.0 * 10.0).round() / 10.0;
+                let mbf = |b: u64| (b as f64 / 1_048_576.0 * 10.0).round() / 10.0;
+                let v = match (malloc_figures(), crate::alloc::mimalloc_figures()) {
+                    (Some((u, f, m)), _) => {
                         json!({"inUseMb": mbf(u), "freeHeldMb": mbf(f), "bigBlocksMb": mbf(m), "tookMs": (t0.elapsed().as_secs_f64() * 1000.0 * 100.0).round() / 100.0, "ageS": 0})
                     }
-                    None => Value::Null,
+                    // mimalloc: bytes the program holds (counted by
+                    // src/alloc.rs) and the rest of the process size. It
+                    // hands empty pages back by itself, so there is no
+                    // separate "freed but held" pile to report.
+                    // The rest of the process size is the allocator's own
+                    // (pages not handed back yet) plus code and stacks.
+                    (None, Some((held, rss))) => json!({"inUseMb": mbf(held), "notInUseMb": mbf(rss.saturating_sub(held)), "tookMs": (t0.elapsed().as_secs_f64() * 1000.0 * 100.0).round() / 100.0, "ageS": 0}),
+                    (None, None) => Value::Null,
                 };
                 *c = Some((Instant::now(), v.clone()));
                 v
@@ -283,6 +299,7 @@ pub fn status_json() -> Value {
     json!({
         "rssMb": rss_mb(),
         "peakRssMb": peak_rss_mb(),
+        "allocator": crate::alloc::name(),
         "malloc": alloc,
         "mallocArenaMax": std::env::var("MALLOC_ARENA_MAX").ok(),
         "aheadGuard": {
@@ -339,6 +356,8 @@ mod tests {
         let s = status_json();
         assert!(s["rssMb"].as_f64().unwrap() > 0.0);
         assert!(s["peakRssMb"].as_f64().unwrap() >= s["rssMb"].as_f64().unwrap() - 1.0);
+        // The library's tests run on glibc (no `alloc::Chosen` here).
+        assert_eq!(s["allocator"], json!("system"));
         assert!(s["malloc"]["inUseMb"].is_number());
         assert_eq!(s["aheadGuard"]["pauseMb"], json!(1200));
     }

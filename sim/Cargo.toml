@@ -54,6 +54,14 @@ secp256k1 = { version = "=0.31.1", features = ["recovery", "global-context"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 webpki-roots = "1"
 zeroize = "1"
+# (Nov 1, memory) mimalloc: the allocator arbsim runs on by default
+# (src/alloc.rs, ARBSIM_ALLOC=system = glibc as before). glibc kept freed
+# memory and grew ~3 MB a minute live while what the program held stayed
+# flat; mimalloc hands empty pages back by itself. Built from C by `cc`
+# (already in the build). Pinned: mimalloc 0.1.48 / libmimalloc-sys 0.1.44
+# (Aug 2025, mimalloc 2.x).
+mimalloc = { version = "=0.1.48", default-features = false, features = ["extended"] }
+libmimalloc-sys = { version = "=0.1.44", features = ["extended"] }
 
 
 [dev-dependencies]

@@ -7,6 +7,10 @@
 //   ahead-replay    replay a fast lane prediction capture offline (fast lane A)
 //   trig-replay     replay a capture through the fire-first decision Rust makes (fastlane/trig_replay.rs)
 // ============================================================================
+// The allocator: mimalloc unless ARBSIM_ALLOC=system (src/alloc.rs).
+#[global_allocator]
+static ALLOC: arbsim::alloc::Chosen = arbsim::alloc::Chosen;
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(|s| s.as_str()) {
