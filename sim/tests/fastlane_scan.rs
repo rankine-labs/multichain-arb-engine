@@ -650,6 +650,40 @@ fn delta_sync_matches_full_sync() {
     assert_eq!(live.all().iter().map(|r| r.rid.clone()).collect::<Vec<_>>(), vec!["r0"]);
 }
 
+// TRUE DELTA (Nov 1): a pool sent as a PATCH (scores by route id, whole rows
+// by route id) reaches the fast-lane scanner exactly like the same pool sent
+// whole: the delta-synced route list equals a fresh full copy.
+#[test]
+fn patched_pools_sync_like_whole_pools() {
+    use arbsim::check::entry::table_from_messages;
+    let rows_of = |n: u64| vec![row(&format!("r{n}a"), 0x100 + n, 0x900, true, Some(1.0), 0.05), row(&format!("r{n}b"), 0x900, 0x100 + n, true, Some(2.0), 0.05)];
+    let mut pools = serde_json::Map::new();
+    for n in 0..4u64 {
+        pools.insert(key(0x100 + n), msg_rows(&rows_of(n)));
+    }
+    let full = json!({ "type": "trig_table", "gen": 1, "full": true, "codes": [], "pools": Value::Object(pools) });
+    let shared = Arc::new(Mutex::new(table_from_messages(std::slice::from_ref(&full)).unwrap()));
+    let mut live = TableSource::owned(shared.clone());
+    live.sync();
+    // gen 2: pool 1 gets a new score for r1a; pool 2's r2b is replaced whole (new gas facts, score 7).
+    let new_b = msg_rows(&[row("r2b", 0x900, 0x102, false, Some(7.0), 0.09)]);
+    let part = json!({ "type": "trig_table", "gen": 2, "full": false, "base": 1, "codes": [], "pools": {
+        key(0x101): { "s": { "r1a": 5.5 } },
+        key(0x102): { "r": new_b },
+    } });
+    let msgs = vec![full, part];
+    *shared.lock().unwrap() = table_from_messages(&msgs).unwrap();
+    assert!(live.sync().is_empty());
+    let mut fresh = TableSource::owned(Arc::new(Mutex::new(table_from_messages(&msgs).unwrap())));
+    fresh.sync();
+    assert_eq!(route_ids(&live), route_ids(&fresh), "patched pools: the delta-updated list equals a fresh full copy");
+    assert_eq!(live.full_syncs, 1, "a patch is a change, not a full copy");
+    let by = |rid: &str| live.all().iter().find(|r| r.rid == rid).map(|r| (r.held, r.score, r.facts.as_ref().map(|f| f.gas_usd))).unwrap();
+    assert_eq!(by("r1a"), (true, Some(5.5), Some(0.05)), "score patch: new score, rest of the row kept");
+    assert_eq!(by("r2b"), (false, Some(7.0), Some(0.09)), "row patch: the whole new row");
+    assert_eq!(by("r1b"), (true, Some(2.0), Some(0.05)), "routes not named are untouched");
+}
+
 // ---------------------------------------------------------------------------
 // Unban fixes (Oct 30). Live: a route whose last check took longer than the
 // budget was never tried again (its time only changed by running it), and
