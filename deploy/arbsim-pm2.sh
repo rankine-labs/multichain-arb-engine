@@ -12,7 +12,7 @@
 #   like before the sidecar existed.
 #
 #   pm2 settings: name "arbsim", low priority (nice 5), restarted if it uses
-#   more than 1500 MB, waits longer and longer between crash restarts (1 s up
+#   more than 1800 MB, waits longer and longer between crash restarts (1 s up
 #   to 15 s) so a broken sidecar can't hog the server, timestamps in the
 #   logs. Log files are rotated by pm2-logrotate (already installed).
 #
@@ -36,6 +36,13 @@
 #   predicted copy and keeper growth; 1500 MB leaves ~300 MB between that
 #   pause line and this kill line. The server is now 7.7 GB with ~3.5 GB
 #   available next to both apps (free -m, Nov 1), so +200 MB is safe.
+#   Raised to 1800 MB (Nov 1 2026, owner OK): arbsim's normal size is
+#   ~1,000-1,250 MB and pm2 killed it twice at ~1,560 MB, so 1500 was too
+#   tight. The seeing-ahead guard moved to pause 1350 / resume 1290 MB at
+#   the same time (sim/src/memguard.rs), keeping ~450 MB between the pause
+#   line and this kill line. 7,775 MB server, 2 CPUs: +300 MB is safe.
+#   From 1500 the app is re-created automatically on the next "ensure"
+#   (1500 is below 90% of 1800, see the re-create check below).
 #   A changed limit applies when pm2 (re)creates the app: on the next
 #   program update, or `bash deploy/arbsim-pm2.sh restart` after a stop.
 #
@@ -67,7 +74,7 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/arbsim-lib.sh"
 
 PM2_STATE_FILE="$BIN_DIR/.arbsim-pm2-state"
 # pm2 restarts the sidecar above this much memory (MB); see the header.
-ARBSIM_MEM_LIMIT_MB=1500
+ARBSIM_MEM_LIMIT_MB=1800
 # pm2 waits this long (ms) after the stop signal before killing (final save).
 ARBSIM_KILL_TIMEOUT_MS=30000
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [arbsim] $*"; }
