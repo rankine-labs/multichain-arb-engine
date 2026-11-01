@@ -7,6 +7,7 @@ import { loopLag } from '../core/loopLag';
 import { stallFinder, markStretch } from '../core/stallFinder';
 import * as fs from 'fs';
 import { createHash } from 'crypto';
+import { eventFeePips } from '../core/eventFees';
 
 // SEEN LOG (Oct 24, owner approved): one short line per feed transaction
 // fire-first looked at (or dropped): "<ms> <hash> <outcome>", outcome =
@@ -198,6 +199,8 @@ export type EntrySettings = {
   tableFast: boolean;            // TRIG_TABLE_FAST [1] fast table rebuild (see FAST TABLE; needs the lean table; 0 = exactly as before)
   tableReuseMaxMs: number;       // TRIG_TABLE_REUSE_MAX_MS [30000] fast table: a kept question is re-derived somewhere between TRIG_ENTRY_TABLE_REUSE_MS and this (spread per route)
   tableDriftMs: number;          // TRIG_TABLE_DRIFT_MS [10000] fast table: a pool whose rows changed ONLY because the gas cost or the start coin's price moved is re-sent at most this often (0 = at once, as before)
+  tableQuiet: boolean;           // TRIG_TABLE_QUIET [1] quiet-pool skip that works at the live pace (see QUIET SKIP; needs the fast table; 0 = exactly the #260 fast table)
+  tableQuietMs: number;          // TRIG_TABLE_QUIET_MS [600000] quiet skip: a pool where nothing moved is still rebuilt about this often (spread 50 to 100% per pool)
 };
 
 export function entrySettings(env: Record<string, string | undefined> = process.env, minNetUsd = 0.25): EntrySettings {
@@ -233,6 +236,8 @@ export function entrySettings(env: Record<string, string | undefined> = process.
     tableFast: tableFastOn(env),
     tableReuseMaxMs: num('TRIG_TABLE_REUSE_MAX_MS', 30_000, 0),
     tableDriftMs: num('TRIG_TABLE_DRIFT_MS', 10_000, 0),
+    tableQuiet: tableQuietOn(env),
+    tableQuietMs: num('TRIG_TABLE_QUIET_MS', 600_000, 1_000),
   };
 }
 
@@ -278,6 +283,47 @@ export function tableFastOn(env: Record<string, string | undefined> = process.en
   return (env.TRIG_TABLE_FAST ?? '1').trim() !== '0' && (env.TRIG_ENTRY_TABLE_LEAN ?? '1').trim() !== '0';
 }
 
+// ----------------------------------------------------------------------------
+// QUIET SKIP (Nov 1, TRIG_TABLE_QUIET, default on; 0 = exactly the #260 fast table)
+//
+// Plain English: #260's "skip quiet pools" never fired live ("pools not
+// rebuilt" stayed 0) for two reasons, both measured on the server:
+//   1. Every "still good" window was shorter than the gap between two
+//      passes. Live, a pass starts every 10 s (TRIG_ENTRY_TABLE_MS=10000)
+//      and, while nothing is skipped, one pass takes 52 to 65 s. A skipped
+//      pool counted as "good" for only 5 to 10 s, a kept question for
+//      30 s, a drift hold for 10 s. So by the next pass every window had
+//      run out: nothing skipped, nothing held, questions only reused
+//      inside the same pass, so the pass stayed slow (a loop that locks
+//      itself). The offline soak ran 1 s passes on a fast machine, so it
+//      never saw this.
+//   2. 92 of the 1,693 live pools (Algebra and hooked V4) get a new
+//      "fee read at" time stamp on every 5 s re-read, even when nothing
+//      moved. The stamp was part of the pool's price facts, so those pools
+//      and every pool sharing a coin pair with them (811 of 1,693) looked
+//      changed on every re-read: never skipped, and re-sent to arbsim at
+//      once as a "real" change.
+// Fix (all behind TRIG_TABLE_QUIET):
+//   1. A quiet pool (nothing its routes are made of moved) is kept until
+//      its turn comes: about every TRIG_TABLE_QUIET_MS (10 min, spread 50 to
+//      100% per pool), and never more than 1 in QUIET_TURN_DIV of the pools
+//      per pass just because their turn came (so one slow pass can't make
+//      the next pass rebuild everything). A pool whose prices really moved
+//      is rebuilt at once, as before.
+//   2. A kept question may be reused up to 2 x TRIG_TABLE_QUIET_MS (on top
+//      of #260's window): it is still checked against everything it is
+//      made of (inputs), so it is the same question a fresh build gives.
+//   3. The price facts leave out the "fee read at" stamps and instead carry
+//      the fee the maths actually uses (eventFeePips), which is the only
+//      thing those stamps change.
+// ----------------------------------------------------------------------------
+export function tableQuietOn(env: Record<string, string | undefined> = process.env): boolean {
+  return (env.TRIG_TABLE_QUIET ?? '1').trim() !== '0' && tableFastOn(env);
+}
+// At most 1 in this many pools is rebuilt per pass only because its quiet
+// turn came (QUIET SKIP 1). Pools with real changes don't count.
+export const QUIET_TURN_DIV = 16;
+
 // FAST TABLE 2: a pool's TRADING details: everything about a pool that the
 // check question (contract calldata, pretend state) is made from: which
 // contract kind, which address or V4 key, which coins, the V2 fee. No price,
@@ -301,18 +347,32 @@ export function poolShapeKey(p: any): string {
 // FAST TABLE 3: a pool's PRICE facts (what the quick price check reads). Its
 // seen-fee record is passed next to it by identity (it is replaced in place).
 const priceKeys = new WeakMap<object, string>();
-export function poolPriceKey(p: any): string {
+const quietPriceKeys = new WeakMap<object, string>();
+// `stampFree` (QUIET SKIP 3): leave out the "fee read at" stamps (a new
+// stamp comes with every re-read of an Algebra / hooked V4 pool, even when
+// nothing moved) and add the event fee the maths would use right now. The
+// stamps only decide whether a fee seen in a swap event still counts
+// (core/eventFees usable), so with no event fee they change nothing, and
+// with one, its effect is in eventFeePips.
+export function poolPriceKey(p: any, stampFree = false): string {
   if (!p) return '';
   // Remembered per state object (price fields are never changed in place;
   // the seen-fee record, which is, goes next to it by identity).
-  const hit = priceKeys.get(p);
-  if (hit !== undefined) return hit;
-  const k = priceKeyOf(p);
-  priceKeys.set(p, k);
+  const memo = stampFree ? quietPriceKeys : priceKeys;
+  let k = memo.get(p);
+  if (k === undefined) {
+    k = stampFree ? quietKeyOf(p) : priceKeyOf(p);
+    memo.set(p, k);
+  }
+  // (Worked out fresh every call: it depends on the clock and the record.)
+  if (stampFree && p.observedFee) k += `|e${eventFeePips(p, undefined, true) ?? ''}:${eventFeePips(p, undefined, false) ?? ''}`;
   return k;
 }
 function priceKeyOf(p: any): string {
   return `${p.reserveA ?? ''}|${p.reserveB ?? ''}|${p.sqrtPriceX96 ?? ''}|${p.liquidity ?? ''}|${p.tick ?? ''}|${p.feeBps}|${p.feePips ?? ''}|${p.feeReadBlock ?? ''}|${p.feeReadMs ?? ''}`;
+}
+function quietKeyOf(p: any): string {
+  return `${p.reserveA ?? ''}|${p.reserveB ?? ''}|${p.sqrtPriceX96 ?? ''}|${p.liquidity ?? ''}|${p.tick ?? ''}|${p.feeBps}|${p.feePips ?? ''}`;
 }
 
 // A route's spread for FAST TABLE 2 (0..span-1), from its id: stable, so a
@@ -708,7 +768,8 @@ const inputsOf = (r: TableRoute): unknown[] | undefined => (typeof r.inputs === 
 // this pool's routes could change for real (its own and its partner pools'
 // prices, wallet reads, ...), compared one by one (===). Same as at the
 // pool's last build = its routes are not even listed this pass (re-listed
-// at least every 0.5 to 1 x TRIG_TABLE_DRIFT_MS all the same).
+// at least every 0.5 to 1 x TRIG_TABLE_DRIFT_MS all the same; with the
+// QUIET SKIP on: 0.5 to 1 x TRIG_TABLE_QUIET_MS, capped per pass).
 export type TablePool = { pool: string; routes: TableRoute[] | (() => TableRoute[]); ver?: () => unknown[] };
 
 export type EntryDeps = {
@@ -811,6 +872,15 @@ function poolSigOf(rs: TableRoute[]): string {
     if (r.live) for (const x of r.live) k += `|${liveItem(x)}`;
     else k += `|#${++objSeq}`;
   }
+  return k;
+}
+// QUIET SKIP 4: one route's last result inside its pool's build, and what
+// it was built from as far as a real change goes (id, held flag, the host's
+// live facts = both pools' prices and seen fees).
+type RouteKept = { pre: string; row: Record<string, unknown>; meta: TableMeta | null; fp: string; live: string };
+function routePreKey(r: TableRoute): string {
+  let k = `${r.rid}|${r.held ? 1 : 0}`;
+  for (const x of r.live!) k += `|${liveItem(x)}`;
   return k;
 }
 function liveKey(r: TableRoute, state: string, cand?: EntryCandidate): string {
@@ -1425,6 +1495,8 @@ export class TrigEntry {
     seq: 0, lastMs: 0, lastBusyMs: 0, lastRoutes: 0, lastReused: 0, sends: 0, sendFails: 0,
     // FAST TABLE: passes so far, pools held back as drift-only last pass, gas-only re-derivations last pass.
     passes: 0, lastHeld: 0, lastRestop: 0, lastSkipped: 0,
+    // QUIET SKIP: last pass, quiet pools rebuilt because their turn came / kept past their window (waiting for a turn).
+    lastTurns: 0, lastWaiting: 0, lastKeptRoutes: 0, turnFrom: 0,
   };
 
   tableInfo(): { ackGen: number; pools: number; entries: number; lastMs: number; busyMs: number; routes: number; reused: number; sends: number } {
@@ -1484,18 +1556,55 @@ export class TrigEntry {
       const sliceUp = () => (performance.now() - slice > 2 ? pause() : null);
       let restop = 0, skipped = 0;
       const driftMs = fast ? this.settings.tableDriftMs : 0;
+      // QUIET SKIP (see tableQuietOn): quiet pools wait for their turn, at
+      // most 1 in QUIET_TURN_DIV of the pools per pass is rebuilt only
+      // because its turn came, and kept questions last longer.
+      const quiet = fast && driftMs > 0 && this.settings.tableQuiet;
+      const turnCap = quiet ? Math.max(1, Math.ceil(Math.max(this.poolPass.size, T.pools.size) / QUIET_TURN_DIV)) : Infinity;
+      const memoExtraMs = quiet ? 2 * this.settings.tableQuietMs : 0;
+      let turns = 0, waiting = 0;
+      // Turns go round-robin: when last pass ran out of turns at pool number
+      // T.turnFrom, this pass hands turns out from there first (pools before
+      // it wait one more pass), so no pool is starved when more are due than
+      // the cap allows (e.g. passes far slower than expected).
+      const turnFrom = quiet ? T.turnFrom : 0;
+      let nextTurnFrom = 0, poolIdx = -1;
+      T.lastKeptRoutes = 0;
       T.passes++;
       for (const tp of src) {
         const key = (tp.pool ?? '').toLowerCase();
         if (!key || fresh.has(key)) continue;
+        poolIdx++;
+        const idx = poolIdx;
         if (performance.now() - slice > 2) await pause();
+        // Keep last build's rows for a pool where nothing moved? Yes while
+        // its window (ttl) runs. QUIET SKIP: after that too, unless it gets
+        // one of this pass's turns (asked once per pool, so the two checks
+        // below agree and a turn is only counted once).
+        const prev = fast && driftMs > 0 ? this.poolPass.get(key) : undefined;
+        const prevOk = !!prev && prev.codesEpoch === this.codesEpoch && prev.sizesKey === sizesKey;
+        const due = !!prev && now - prev.at >= prev.ttl;
+        let turnAsked: boolean | undefined;
+        // QUIET SKIP: does this due pool get one of this pass's turns?
+        const takeTurn = (): boolean => {
+          if (turnAsked === undefined) {
+            turnAsked = idx >= turnFrom && turns < turnCap;
+            if (turnAsked) turns++;
+            else {
+              waiting++;
+              // First pool turned away because the cap ran out: next pass starts here.
+              if (idx >= turnFrom && nextTurnFrom === 0) nextTurnFrom = idx;
+            }
+          }
+          return turnAsked;
+        };
+        const keepOld = (): boolean => !due || (quiet && !takeTurn());
         // FAST TABLE 4: nothing this pool's routes are made of moved since
         // its last build (host `ver`): last build's rows, not even listed.
         let ver: unknown[] | undefined;
         if (fast && driftMs > 0 && tp.ver) {
           try { ver = tp.ver(); } catch { ver = undefined; }
-          const prev = this.poolPass.get(key);
-          if (ver && prev && prev.ver && sameItems(prev.ver, ver) && prev.codesEpoch === this.codesEpoch && prev.sizesKey === sizesKey && now - prev.at < prev.ttl) {
+          if (ver && prev && prevOk && prev.ver && sameItems(prev.ver, ver) && keepOld()) {
             fresh.set(key, prev.f);
             routes += prev.n; reused += prev.n; skipped++;
             this.routesSeen = Math.max(this.routesSeen, routes);
@@ -1512,8 +1621,7 @@ export class TrigEntry {
         let sig: string | undefined;
         if (fast && driftMs > 0) {
           sig = textDigest(poolSigOf(rs)); // (kept as a short digest)
-          const prev = this.poolPass.get(key);
-          if (prev && prev.sig === sig && prev.codesEpoch === this.codesEpoch && prev.sizesKey === sizesKey && now - prev.at < prev.ttl) {
+          if (prev && prevOk && prev.sig === sig && keepOld()) {
             fresh.set(key, prev.f);
             if (ver) prev.ver = ver; // (same routes and prices: the new facts describe the same build)
             routes += rs.length; reused += rs.length; skipped++;
@@ -1525,16 +1633,40 @@ export class TrigEntry {
         const metas: Array<TableMeta | null> = [];
         const fps: string[] = [];
         const lives: string[] = [];
+        // QUIET SKIP 4: this pool IS rebuilt (something moved), but most of
+        // its routes usually did not change: when one partner pool in a coin
+        // pair trades, every pool of that pair is re-listed, yet only the 2
+        // routes through the pool that traded have new prices. A route whose
+        // id, held flag and both pools' price facts (`live`) are as at the
+        // pool's last build keeps that build's row (same as a skipped pool
+        // keeps all its rows). Not when this rebuild is the pool's quiet
+        // turn: then every route is built fresh (picks up gas / coin-price
+        // drift and anything not in the price facts).
+        const per = quiet && prev && prevOk && prev.per && !(due && takeTurn()) ? prev.per : undefined;
+        const newPer = quiet ? new Map<string, RouteKept>() : undefined;
+        let keptRoutes = 0;
         for (const r of rs) {
           routes++;
           this.routesSeen = Math.max(this.routesSeen, routes); // capCache limit (captureFor)
           if (performance.now() - slice > 2) await pause();
+          // (Kept as short digests: ~37,000 routes' text would cost tens of MB.)
+          const pre = newPer && r.live ? textDigest(routePreKey(r)) : undefined;
+          if (per && pre !== undefined) {
+            const old = per.get(r.rid);
+            if (old && old.pre === pre) {
+              rows.push(old.row); metas.push(old.meta); fps.push(old.fp); lives.push(old.live);
+              newPer!.set(r.rid, old);
+              reused++; keptRoutes++;
+              continue;
+            }
+          }
           let cand: EntryCandidate | null = null;
           try { cand = r.build(); } catch { cand = null; }
           const score = r.score !== null && Number.isFinite(r.score) ? r.score : null;
           if (!cand) {
             rows.push({ rid: r.rid.toLowerCase(), h: r.held, s: score, e: null }); metas.push(null); fps.push(JSON.stringify([r.rid, r.held, score, null]));
-            if (fast) lives.push(liveKey(r, 'x'));
+            if (fast) lives.push(quiet ? textDigest(liveKey(r, 'x')) : liveKey(r, 'x'));
+            if (pre !== undefined) newPer!.set(r.rid, { pre, row: rows[rows.length - 1], meta: null, fp: fps[fps.length - 1], live: lives[lives.length - 1] });
             continue;
           }
           const meta: TableMeta = { cand };
@@ -1545,7 +1677,7 @@ export class TrigEntry {
           if (fast) {
             // FAST TABLE 2: same question as a fresh build, from the memo when
             // only the gas cost moved (the stop amount is worked out again).
-            const got = await this.fastQuestion(r, rid, cand, sizesKey, now, reuseMs, spreadSpan, memoMax, keepMeta, waitFor);
+            const got = await this.fastQuestion(r, rid, cand, sizesKey, now, reuseMs, spreadSpan, memoMax, keepMeta, waitFor, memoExtraMs);
             c = got.c; cJson = got.cJson;
             if (got.sig !== undefined) meta.sig = got.sig;
             if (got.fallback) meta.fallback = true;
@@ -1597,7 +1729,10 @@ export class TrigEntry {
           // pool's rows every refresh (the row itself still carries the exact facts).
           // (FAST TABLE: the same facts joined without JSON: same "changed?" answer, cheaper.)
           fps.push((fast ? `${r.rid}\u0001${r.held}\u0001${score}\u0001${cand.label}\u0001${cand.gasUsd}\u0001${cand.maxSizeUsd}\u0001${!!meta.fallback}\u0002` : JSON.stringify([r.rid, r.held, score, cand.label, cand.gasUsd, cand.maxSizeUsd, !!meta.fallback])) + cJson + (fl ? fastlaneFactsFp(fl) : ''));
-          if (fast) lives.push(liveKey(r, c === null ? 'n' : meta.fallback ? 'f' : 'c', cand));
+          if (fast) { const lk = liveKey(r, c === null ? 'n' : meta.fallback ? 'f' : 'c', cand); lives.push(quiet ? textDigest(lk) : lk); }
+          // (The answer look-up, which holds the candidate and its pool
+          // states, is only kept when it can be read: LEAN TABLE 3.)
+          if (pre !== undefined) newPer!.set(r.rid, { pre, row: rows[rows.length - 1], meta: keepMeta ? meta : null, fp: fps[fps.length - 1], live: lives[lives.length - 1] });
         }
         const fe = fast ? { fp: fps.join('\n'), rows, metas, liveFp: textDigest(lives.join('\n')) } : { fp: fps.join('\n'), rows, metas };
         fresh.set(key, fe);
@@ -1605,12 +1740,20 @@ export class TrigEntry {
           if (this.poolPass.size > 20_000) this.poolPass.clear(); // memory bound (pools, not routes)
           // (The answer look-ups, which hold each candidate and its pool
           // states, are only kept when they can be read: LEAN TABLE 3.)
-          this.poolPass.set(key, { sig, ver, n: rs.length, f: keepMeta ? fe : { ...fe, metas: [] }, at: now, ttl: driftMs * (0.5 + routeSpread(key, 1_000) / 2_000), codesEpoch: this.codesEpoch, sizesKey });
+          // Rebuilt again (if nothing moves) after 50 to 100% of the window,
+          // spread per pool: driftMs (#260), or TRIG_TABLE_QUIET_MS (QUIET SKIP).
+          const windowMs = quiet ? this.settings.tableQuietMs : driftMs;
+          // QUIET SKIP 4: rows kept from an older build keep that build's turn
+          // clock, so a pool that keeps trading still gets its full rebuild.
+          const keepClock = keptRoutes > 0 && prev && prevOk;
+          this.poolPass.set(key, { sig, ver, n: rs.length, f: keepMeta ? fe : { ...fe, metas: [] }, at: keepClock ? prev!.at : now, ttl: keepClock ? prev!.ttl : windowMs * (0.5 + routeSpread(key, 1_000) / 2_000), codesEpoch: this.codesEpoch, sizesKey, per: newPer });
+          T.lastKeptRoutes += keptRoutes;
         }
       }
       // Memo entries of routes that are gone: forgotten once old.
       if (this.tblMemo.size) {
-        const keepMs = Math.max(fast ? this.settings.tableReuseMaxMs : 0, reuseMs, 1_000) * 3;
+        // (QUIET SKIP 2: kept questions may be reused memoExtraMs longer.)
+        const keepMs = Math.max(fast ? this.settings.tableReuseMaxMs : 0, reuseMs, 1_000) * 3 + memoExtraMs;
         let i = 0;
         for (const [k, m] of this.tblMemo) {
           if (now - m.at > keepMs) this.tblMemo.delete(k);
@@ -1662,6 +1805,9 @@ export class TrigEntry {
       T.lastHeld = heldBack;
       T.lastRestop = restop;
       T.lastSkipped = skipped;
+      T.lastTurns = turns;
+      T.turnFrom = nextTurnFrom;
+      T.lastWaiting = waiting;
       // Long-code list tidy-up, once the whole table is built (see compactCodes).
       if (T.codes.length > CODES_SOFT_MAX) this.compactCodes();
       if (!Object.keys(changed).length && !T.needFull) return T.ackGen >= 0;
@@ -1744,7 +1890,8 @@ export class TrigEntry {
   // written before that point at old list positions and are never reused.
   private codesEpoch = 0;
   // FAST TABLE 4: each pool's last build (what it was built from, the result).
-  private readonly poolPass = new Map<string, { sig: string; ver?: unknown[]; n: number; f: { fp: string; rows: Array<Record<string, unknown>>; metas: Array<TableMeta | null>; liveFp?: string }; at: number; ttl: number; codesEpoch: number; sizesKey: string }>();
+  // (QUIET SKIP 4: `per` = each route's last result, by route id.)
+  private readonly poolPass = new Map<string, { sig: string; ver?: unknown[]; n: number; f: { fp: string; rows: Array<Record<string, unknown>>; metas: Array<TableMeta | null>; liveFp?: string }; at: number; ttl: number; codesEpoch: number; sizesKey: string; per?: Map<string, RouteKept> }>();
   // The candidate's own facts that its question depends on (besides `inputs`).
   private memoKey(c: EntryCandidate, sizesKey: string): string {
     return JSON.stringify([c.label, c.buyPool, c.sellPool, c.tokenIn, c.maxSizeUsd, c.gasUsd, c.keys, sizesKey, this.settings.minNetUsd]);
@@ -1762,12 +1909,14 @@ export class TrigEntry {
   private async fastQuestion(
     r: TableRoute, rid: string, cand: EntryCandidate, sizesKey: string, now: number, reuseMs: number, spreadSpan: number,
     memoMax: () => number, keepMeta: boolean, waitFor: <X>(p: Promise<X>) => Promise<X>,
+    // QUIET SKIP 2: extra ms a kept question may be reused (0 = #260 window).
+    memoExtraMs = 0,
   ): Promise<{ c: Record<string, unknown> | null; cJson: string; sig?: string; fallback?: boolean; reused?: boolean; restop?: boolean }> {
     const sameAs = this.memoKeyFast(cand, sizesKey);
     const rInputs = inputsOf(r);
     const memo = reuseMs > 0 && rInputs ? this.tblMemo.get(rid) : undefined;
     if (memo && memo.fast && memo.codesEpoch === this.codesEpoch && memo.sameAs === sameAs && sameItems(memo.inputs, rInputs!)
-      && now - memo.at <= reuseMs + (memo.parts ? memo.spread ?? 0 : 0)) {
+      && now - memo.at <= reuseMs + (memo.parts ? memo.spread ?? 0 : 0) + memoExtraMs) {
       if (!memo.parts || memo.gasUsd === cand.gasUsd) return { c: memo.c, cJson: memo.cJson, sig: memo.sig, fallback: memo.fallback, reused: true };
       // Only the gas cost moved: the stop amount again (as stopUnits always does).
       const stop = stopUnits(cand, this.settings.minNetUsd, true);
@@ -2013,7 +2162,7 @@ export class TrigEntry {
       const K = h.kind;
       if (this.settings.loops || K.loop.built) parts.push(`by kind (built/checked/profitable/would send/sent): pair ${K.pair.built}/${K.pair.checked}/${K.pair.profitable}/${K.pair.wouldSend}/${K.pair.sent}, loop ${K.loop.built}/${K.loop.checked}/${K.loop.profitable}/${K.loop.wouldSend}/${K.loop.sent}${h.loopErrors ? ` (loop errors ${h.loopErrors})` : ''}`);
       if (this.d.loopHourText) { try { const t = this.d.loopHourText(); if (t) parts.push(t); } catch { /* reporting only */ } }
-      if (!this.oneTripOn() && this.tableOn()) parts.push(`two steps; fast lane table ${this.tbl.pools.size} pools / ${this.tbl.lastRoutes} routes (${this.tbl.lastReused} reused unchanged), rebuilt in ${this.tbl.lastMs} ms (bot thread busy ${this.tbl.lastBusyMs} ms), sent ${this.tbl.sends}x${this.settings.tableFast && this.settings.tableLean ? ` (fast table: last pass ${this.tbl.lastSkipped} pools not rebuilt, ${this.tbl.lastHeld} with only gas / coin-price changes waiting, ${this.tbl.lastRestop} stop amounts redone for gas)` : ''}`);
+      if (!this.oneTripOn() && this.tableOn()) parts.push(`two steps; fast lane table ${this.tbl.pools.size} pools / ${this.tbl.lastRoutes} routes (${this.tbl.lastReused} reused unchanged), rebuilt in ${this.tbl.lastMs} ms (bot thread busy ${this.tbl.lastBusyMs} ms), sent ${this.tbl.sends}x${this.settings.tableFast && this.settings.tableLean ? ` (fast table: last pass ${this.tbl.lastSkipped} pools not rebuilt, ${this.tbl.lastHeld} with only gas / coin-price changes waiting, ${this.tbl.lastRestop} stop amounts redone for gas${this.settings.tableQuiet ? `, ${this.tbl.lastTurns} quiet pools' turn, ${this.tbl.lastWaiting} waiting a turn, ${this.tbl.lastKeptRoutes} routes kept inside rebuilt pools` : ''})` : ''}`);
       if (this.oneTripOn()) parts.push(`one trip ${h.one.used}${Object.keys(h.one.why).length ? ` (two steps: ${top(h.one.why)})` : ''}; table ${this.tbl.pools.size} pools / ${this.tbl.lastRoutes} routes (${this.tbl.lastReused} reused unchanged), rebuilt in ${this.tbl.lastMs} ms`);
       const hp = HOP_NAMES.filter((k) => h.hops[k].length).map((k) => `${k} ${pctl(h.hops[k], 0.5)}/${pctl(h.hops[k], 0.9)}`);
       if (hp.length) parts.push(`hops p50/p90 ms: ${hp.join(', ')}`);

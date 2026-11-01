@@ -287,10 +287,13 @@ async function main() {
   }
 
   // ---- 3. drift waits, real changes go at once, arbsim ends with the fresh table ----
+  // (#260's 10 s drift rule. With the QUIET SKIP on, drift of a pool that
+  // did not trade waits for its quiet turn instead: checked in
+  // quietSkip.test.ts. So this check runs with it off.)
   {
     const u = universe(6, 4), uRef = universe(6, 4);
     const c = { t: 1_000_000 }, cRef = { t: 1_000_000 };
-    const env = { ...live }, envRef = { ...live, TRIG_TABLE_FAST: '0' };
+    const env = { ...live, TRIG_TABLE_QUIET: '0' }, envRef = { ...live, TRIG_TABLE_FAST: '0' };
     const N = entryWith(env, u.table(true, false), c);
     const R = entryWith(envRef, uRef.table(false, false), cRef);
     await pass(N, env); await pass(R, envRef);
@@ -311,10 +314,13 @@ async function main() {
   }
 
   // ---- 4. pools whose facts did not move are not listed ----
+  // (#260's own re-list rule: every pool again within the drift time. The
+  // QUIET SKIP, on by default, keeps quiet pools minutes longer on purpose:
+  // checked in quietSkip.test.ts. So this check runs with it off.)
   {
     const u = universe(10, 4);
     const c = { t: 1_000_000 };
-    const env = { ...live };
+    const env = { ...live, TRIG_TABLE_QUIET: '0' };
     const N = entryWith(env, u.table(true, true), c);
     await pass(N, env);
     const l0 = u.listed();

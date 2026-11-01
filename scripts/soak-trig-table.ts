@@ -41,6 +41,16 @@
 //                     time if that was longer (live: a pass starts every
 //                     second, a slow one delays the next), so time-based
 //                     rules (reuse windows, drift re-sends) act as live.
+//   --table-ms 1000   (--live) a pass starts this often on the pretend clock
+//                     (live: TRIG_ENTRY_TABLE_MS; the server has 10000)
+//   --slow 1          (--live) the pretend clock counts each pass's real
+//                     time x this (the server is ~3.5 to 5x slower than a
+//                     dev box), so a pass that takes 52 s live also takes
+//                     52 s on the pretend clock here (QUIET SKIP, Nov 1)
+//   --stamped         (QUIET SKIP, Nov 1) like live, one pool in every
+//                     other coin pair is an Algebra / hooked V4 pool whose
+//                     re-read brings a new "fee read at" stamp (live: 92 of
+//                     1,693 pools; 811 share a pair with one)
 //   --prof FILE       write a CPU profile of the steady rounds only (after
 //                     the from-scratch builds) to FILE (.cpuprofile)
 // ============================================================================
@@ -49,7 +59,7 @@ import { tmpdir } from 'os';
 import { join } from 'path';
 import { PerformanceObserver } from 'perf_hooks';
 import { TriggerFirst, TrigCopy2, trigFirstSettings } from '../src/execution/triggerFirst';
-import { TrigEntry, EntryCandidate, TablePool, TableRoute, entrySettings, tableFastOn, poolShapeKey, poolPriceKey } from '../src/execution/trigEntry';
+import { TrigEntry, EntryCandidate, TablePool, TableRoute, entrySettings, tableFastOn, tableQuietOn, poolShapeKey, poolPriceKey as poolPriceKeyOf } from '../src/execution/trigEntry';
 import { JsonlLog } from '../src/execution/localSimHost';
 import { LocalSimClient, frame, framePieces } from '../src/execution/localSim';
 import { KIND_V2, KIND_V3, KIND_V4, KIND_V4_HOOKED, buildExecuteCall, planExecuteCall, checkBuildEncodeOn } from '../src/execution/executorCalldata';
@@ -64,8 +74,12 @@ const args = process.argv.slice(2);
 const opt = (name: string, d: number): number => { const i = args.indexOf(`--${name}`); const v = i >= 0 ? Number(args[i + 1]) : NaN; return Number.isFinite(v) ? v : d; };
 const envArg = (() => { const i = args.indexOf('--env'); return i >= 0 ? String(args[i + 1] ?? '') : ''; })();
 const POOLS = opt('pools', 1700), PEERS = Math.max(2, opt('peers', 12)), ROUNDS = opt('rounds', 40), CHURN = opt('churn', 0.10), RESYNC = Math.max(1, opt('resync', 5));
+// QUIET SKIP (Nov 1): live pass interval and server slowness on the pretend clock.
+const TABLE_MS = Math.max(1, opt('table-ms', 1_000)), SLOW = Math.max(1, opt('slow', 1));
 const noTable = args.includes('--no-table'); // baseline: same pools, no table (memory reference)
 const LIVE = args.includes('--live');
+const TRACE = args.includes('--trace'); // one line per round on stderr
+const STAMPED = args.includes('--stamped');
 const PROF = (() => { const i = args.indexOf('--prof'); return i >= 0 ? String(args[i + 1] ?? '') : ''; })();
 // Steady-state CPU profile (inspector, same process).
 const prof = PROF ? new Session() : null;
@@ -82,6 +96,9 @@ const env: Record<string, string> = {
 for (const kv of envArg.split(',').filter(Boolean)) { const [k, ...v] = kv.split('='); env[k.trim()] = v.join('=').trim(); }
 for (const [k, v] of Object.entries(env)) process.env[k] = v; // settings read from process.env by shared helpers
 const FAST = tableFastOn(env);
+// QUIET SKIP: the price facts shadowMain hands over (stamp-free when on).
+const QUIET = tableQuietOn(env);
+const poolPriceKey = (p: any) => poolPriceKeyOf(p, QUIET);
 
 // ---- the fake sidecar (answers the coin balance-slot lookups, takes tables) ----
 let tableMsgs = 0, tableBytes = 0;
@@ -146,7 +163,7 @@ const peersOf = (i: number) => { const g = pools[i].group; const out: number[] =
 // Pretend clock (--live): 1 s per round.
 let simNow = Date.now();
 const simStart = simNow;
-let firstBytes = 0;
+let firstBytes = 0, firstMsgs = 0;
 const pxOf = (start: string) => (start === USDG ? 1 : wethPx);
 
 // A candidate the way shadowMain's entryBuild makes one (new object each
@@ -241,12 +258,17 @@ async function main() {
   for (let r = 0; r < ROUNDS; r++) {
     // Prices move: a share of pools each second, all of them on the re-read.
     const all = r > 0 && r % RESYNC === 0;
-    // (a pass starts every second; one that took longer delays the next, as live)
-    if (r > 0) simNow += Math.max(1_000, Math.round(wall[wall.length - 1] ?? 0));
+    // (a pass starts every TABLE_MS; one that took longer delays the next, as
+    // live; its time counts SLOW x, so the clock moves as the server's would)
+    if (r > 0) simNow += Math.max(TABLE_MS, Math.round((wall[wall.length - 1] ?? 0) * SLOW));
     if (r > 0 && GAS_EVERY && r % GAS_EVERY === 0) gasUsd *= 1 + (Math.random() - 0.5) * 0.004;
     if (r > 0 && PX_EVERY && r % PX_EVERY === 0) wethPx *= 1 + (Math.random() - 0.5) * 0.0004;
     for (let i = 0; i < POOLS; i++) {
-      if (all) { states[i] = { ...states[i], lastUpdatedMs: Date.now() }; continue; } // same prices, new object
+      // (same prices, new object; --stamped: a new "fee read at" stamp for the
+      // first pool of every other coin pair, as live re-reads give Algebra /
+      // hooked V4 pools)
+      if (all) { states[i] = { ...states[i], lastUpdatedMs: Date.now(), ...(STAMPED && i % PEERS === 0 && pools[i].group % 2 === 0 ? { feeReadMs: simNow, feeReadBlock: r } : {}) } as State; }
+      // (trades still happen on a re-read round)
       if (r > 0 && Math.random() < CHURN) { states[i] = fresh(pools[i], i, states[i].v + 1); changedPools++; }
     }
     if (noTable) { await new Promise((res) => setImmediate(res)); continue; }
@@ -260,7 +282,8 @@ async function main() {
     busy.push(te.tableInfo().busyMs);
     gcPer.push(gcMs - g0);
     reusedPer.push(te.tableInfo().reused);
-    if (r === 0) firstBytes = tableBytes;
+    if (r === 0) { firstBytes = tableBytes; firstMsgs = tableMsgs; }
+    if (TRACE) console.error(`round ${r} t=${Math.round((simNow - simStart) / 1000)}s busy=${Math.round(busy[busy.length - 1])}ms wall=${Math.round(wall[wall.length - 1])}ms skipped=${(te as any).tbl?.lastSkipped} held=${(te as any).tbl?.lastHeld} kept=${(te as any).tbl?.lastKeptRoutes} turns=${(te as any).tbl?.lastTurns} reused=${te.tableInfo().reused} msgs=${tableMsgs} MB=${Math.round(tableBytes / MB)}`);
   }
   if (prof) { const { profile } = await post('Profiler.stop'); writeFileSync(PROF, JSON.stringify(profile)); prof.disconnect(); }
   gc!(); gc!();
@@ -283,6 +306,9 @@ async function main() {
     // Sent to arbsim per pretend second, after the first (full) table.
     sentMBperSec: Math.round(((tableBytes - firstBytes) / MB / Math.max(1, (simNow - simStart) / 1_000)) * 10) / 10,
     simSeconds: Math.round((simNow - simStart) / 1_000),
+    // Table messages to arbsim per pretend minute, after the first (full) table.
+    msgsPerMin: Math.round(((tableMsgs - firstMsgs) / Math.max(1, (simNow - simStart) / 60_000)) * 10) / 10,
+    tableMs: TABLE_MS, slow: SLOW,
   }, null, 1));
 }
 
