@@ -254,6 +254,80 @@ fn revert_unsure_setting() {
     }
 }
 
+/// FASTLANE_AHEAD_EXACT_REVERT_SURE (Nov 2, ahead5): with it on, a run that
+/// reverted with revert data and assumed nothing is EXACT: its pools stay
+/// sure (nothing marked, nothing forgotten), counted "revertsExact".
+#[test]
+fn an_exact_revert_keeps_its_pools_sure_when_on() {
+    let mut a = ahead_on(AheadCfg { exact_revert_sure: true, ..AheadCfg::default() }, copy_at(100, 7));
+    let t = stx(0, pool(), vec![0xde, 0xad, 0xbe, 0xef]);
+    a.on_feed_message(msg(11, &[t]));
+    assert_eq!(a.total.txs_run, 1);
+    assert_eq!((a.total.reverts_exact, a.total.reverts_marked, a.total.reverts_kept), (1, 0, 0), "{}", a.total.json_with(false));
+    let tip = a.tip().expect("not stopped");
+    assert!(tip.unsure_pools.is_empty(), "{:?}", tip.unsure_pools);
+    assert_eq!(tip.view().storage(pool(), U256::ZERO), known(100), "still vouched for");
+    // The chain did not move it either: nothing compared, nothing unsure.
+    a.on_confirmed(confirmed(11, Arc::new(copy_at(100, 7))), &no_moves);
+    assert_eq!((a.total.unsure, a.total.unsure_moved, a.total.disagree), (0, 0, 0));
+    assert_eq!(a.total.json_with(false)["revertsExact"], 1);
+}
+
+/// ...and when the real transaction DID move the pool (our copy was wrong
+/// somewhere), the rule's cost is measured: a sure-but-wrong "missedReverted".
+#[test]
+fn an_exact_revert_that_was_wrong_is_counted_missed_reverted() {
+    let mut a = ahead_on(AheadCfg { exact_revert_sure: true, ..AheadCfg::default() }, copy_at(100, 7));
+    let t = stx(0, pool(), vec![0xde, 0xad, 0xbe, 0xef]);
+    a.on_feed_message(msg(11, &[t.clone()]));
+    let h = keccak256(&t);
+    a.on_confirmed(confirmed(11, Arc::new(copy_at(150, 7))), &move |x: &B256| (*x == h).then(|| vec![key(pool())]));
+    assert_eq!((a.total.missed_reverted, a.total.disagree, a.total.unsure), (1, 1, 0));
+}
+
+/// Default (off): the Oct 31 rule is unchanged, and an unsure pool the
+/// confirmed block really moved is counted "unsureMoved".
+#[test]
+fn exact_revert_sure_is_off_by_default_and_unsure_moved_is_counted() {
+    assert!(!AheadCfg::default().exact_revert_sure, "default off");
+    let mut a = ahead_on(AheadCfg::default(), copy_at(100, 7));
+    let t = stx(0, pool(), vec![0xde, 0xad, 0xbe, 0xef]);
+    a.on_feed_message(msg(11, &[t.clone()]));
+    assert_eq!((a.total.reverts_exact, a.total.reverts_marked), (0, 1));
+    let h = keccak256(&t);
+    a.on_confirmed(confirmed(11, Arc::new(copy_at(150, 7))), &move |x: &B256| (*x == h).then(|| vec![key(pool())]));
+    assert_eq!((a.total.unsure, a.total.unsure_moved), (1, 1));
+    // A marked pool the chain did NOT move: unsure, but not "moved".
+    let mut b = ahead_on(AheadCfg::default(), copy_at(100, 7));
+    b.on_feed_message(msg(11, &[stx(0, pool(), vec![0xde, 0xad, 0xbe, 0xef])]));
+    b.on_confirmed(confirmed(11, Arc::new(copy_at(100, 7))), &no_moves);
+    assert_eq!((b.total.unsure, b.total.unsure_moved), (1, 0));
+}
+
+/// What counts as an exact revert: revert data (>= 4 bytes), no halt.
+#[test]
+fn exact_revert_outcome_rules() {
+    use arbsim::check::CallOutcome;
+    use arbsim::copy2::ahead::exact_revert_outcome;
+    let r = |output: Vec<u8>, halt: Option<&str>| CallOutcome { success: false, output: output.into(), gas_used: 1, halt: halt.map(String::from) };
+    assert!(exact_revert_outcome(&r(vec![0x4e, 0x88, 0x42, 0x2a], None)), "custom error");
+    assert!(!exact_revert_outcome(&r(vec![], None)), "empty revert: no reason");
+    assert!(!exact_revert_outcome(&r(vec![1, 2, 3], None)), "under 4 bytes");
+    assert!(!exact_revert_outcome(&r(vec![], Some("OutOfFunds"))), "halt (sender funds are approximate)");
+    assert!(!exact_revert_outcome(&CallOutcome { success: true, output: vec![0u8; 32].into(), ..Default::default() }), "success is not a revert");
+}
+
+/// The setting: unset = off, on / 1 / true / yes = on.
+#[test]
+fn exact_revert_sure_setting() {
+    let get = |v: Option<&str>| AheadCfg::from_lookup(|k| if k == "FASTLANE_AHEAD_EXACT_REVERT_SURE" { v.map(String::from) } else { None }, 0).exact_revert_sure;
+    assert!(!get(None));
+    assert!(!get(Some("off")));
+    for on in ["on", "1", "true", "YES"] {
+        assert!(get(Some(on)), "{on}");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 7. Late reports: rebase on a replaced version, settled agreement
 // ---------------------------------------------------------------------------
