@@ -4,7 +4,7 @@ import { endpointLabel, isPublicEndpoint } from '../core/endpointLabel';
 import { budgetForUrl } from '../core/nodeBudget';
 import { ethers } from 'ethers';
 import { ARB_EXECUTOR_RUNTIME_CODE, EXECUTOR_STORAGE_SLOT, FLASH_POOLS_STORAGE_SLOT, V4_POOL_MANAGER_STORAGE_SLOT, WETH_STORAGE_SLOT } from './arbExecutorBytecode';
-import { ExecutorHop, encodeExecuteRaw, encodeExecuteV3FlashRaw, KIND_V4, KIND_V4_HOOKED } from './executorCalldata';
+import { ExecutorHop, encodeExecuteRaw, encodeExecuteV3FlashRaw, KIND_V4, KIND_V4_HOOKED, calldataLeanOn } from './executorCalldata';
 import { SimBucket, classifySimOutcome, SampleLimiter } from '../core/failReasons';
 
 // ============================================================================
@@ -544,6 +544,22 @@ export async function simulateWithRecheck(
   return r2;
 }
 
+// The lender's allow-list storage key (a keccak hash of the lender and the
+// slot). LEAN CALLDATA (freeze fix 9b): remembered per lender spelling, the
+// same few approved lenders come back for every check. Same text; an
+// address ethers refuses still throws (nothing is remembered for it). Bounded.
+const allowKeyMemo = new Map<string, string>();
+function flashAllowKey(lender: string): string {
+  const make = () => ethers.keccak256(abi.encode(['address', 'uint256'], [lender, FLASH_POOLS_STORAGE_SLOT]));
+  if (!calldataLeanOn()) return make();
+  const hit = allowKeyMemo.get(lender);
+  if (hit !== undefined) return hit;
+  const k = make();
+  if (allowKeyMemo.size > 1_000) allowKeyMemo.clear();
+  allowKeyMemo.set(lender, k);
+  return k;
+}
+
 async function simulateInner(
   rpc: Rpc,
   chain: string,
@@ -598,7 +614,7 @@ async function simulateInner(
     executorDiff[pad32(ethers.toBeHex(WETH_STORAGE_SLOT))] = pad32(opts.weth);
   }
   if (flash) {
-    const allowKey = ethers.keccak256(abi.encode(['address', 'uint256'], [opts.v3Lender, FLASH_POOLS_STORAGE_SLOT]));
+    const allowKey = flashAllowKey(opts.v3Lender!);
     executorDiff[allowKey] = pad32(1n);
   }
   const overrides: Record<string, unknown> = {

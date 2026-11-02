@@ -361,12 +361,96 @@ export function hopFor(kind: number, pool: PoolState, tokenIn: string, tokenOut:
   };
 }
 
+// ----------------------------------------------------------------------------
+// LEAN CALLDATA (Nov 1, freeze fix 9b). Plain English:
+//   The route table "writes down" the contract call for every route it
+//   checks (thousands a minute). ethers' general-purpose encoder does that
+//   slowly: it re-checks every address with a keccak hash (checksum
+//   spelling), copies the bytes several times and builds many small
+//   objects. A live CPU profile (Nov 2, 01:40) showed this encoding at about
+//   2.8 s of a 5.6 s profile, all inside the bot's freezes, plus GC work.
+//
+//   This writes the same bytes directly as hex text: the call has a fixed
+//   layout (selector, the trade tuple's place, the second address, then the
+//   trade: coin, 3 numbers, the hop list's place, the hop count and 8 words
+//   per hop). Exactly the same text as ethers (tested on thousands of random
+//   calls, src/test/leanCalldata.test.ts). Anything unusual (not a bigint,
+//   a number out of range, an address that is not plain 0x + 40 hex, a
+//   mixed-case address whose checksum ethers would refuse) goes to ethers
+//   itself, so even the errors are ethers' own.
+//
+// Switch: CALLDATA_LEAN=0 = always ethers (read once at start).
+// ----------------------------------------------------------------------------
+const CALLDATA_LEAN = (process.env.CALLDATA_LEAN ?? '').trim() !== '0';
+export function calldataLeanOn(): boolean { return CALLDATA_LEAN; }
+const SEL_EXECUTE = iface.getFunction('execute')!.selector.slice(2);
+const SEL_EXECUTE_V3 = iface.getFunction('executeWithV3Flash')!.selector.slice(2);
+const TWO_256 = 1n << 256n;
+const ADDR_RE = /^0x[0-9a-fA-F]{40}$/;
+// Mixed-case spellings ethers accepted (valid checksum), remembered: the same
+// few hundred pool / coin addresses come back all the time. Bounded.
+const mixedOk = new Map<string, boolean>();
+// One address as a 64-hex word, or null = let ethers handle it.
+function addrWord(a: unknown): string | null {
+  if (typeof a !== 'string' || !ADDR_RE.test(a)) return null;
+  const body = a.slice(2);
+  const lower = body.toLowerCase();
+  // ethers accepts all-lower and all-upper spellings as they are; a mixed
+  // spelling must match the checksum (getAddress throws otherwise).
+  if (body !== lower && body !== body.toUpperCase()) {
+    let ok = mixedOk.get(a);
+    if (ok === undefined) {
+      try { ok = getAddress(a) === a; } catch { ok = false; }
+      if (mixedOk.size > 20_000) mixedOk.clear();
+      mixedOk.set(a, ok);
+    }
+    if (!ok) return null;
+  }
+  return '000000000000000000000000' + lower;
+}
+// An unsigned number of `bits` bits as a word (bigint, or a safe whole number), or null.
+function uintWord(v: unknown, bits: number): string | null {
+  let b: bigint;
+  if (typeof v === 'bigint') b = v;
+  else if (typeof v === 'number' && Number.isSafeInteger(v)) b = BigInt(v);
+  else return null;
+  if (b < 0n || b >= (1n << BigInt(bits))) return null;
+  return b.toString(16).padStart(64, '0');
+}
+// A signed number of `bits` bits (two's complement word), or null.
+function intWord(v: unknown, bits: number): string | null {
+  if (typeof v !== 'number' || !Number.isSafeInteger(v)) return null;
+  const b = BigInt(v), lim = 1n << BigInt(bits - 1);
+  if (b < -lim || b >= lim) return null;
+  return (b < 0n ? TWO_256 + b : b).toString(16).padStart(64, '0');
+}
+const word = (n: number) => n.toString(16).padStart(64, '0');
+// The whole call, or null = use ethers.
+function leanEncode(sel: string, trade: { token: string; amountIn: bigint; minProfit: bigint; maxBlock: bigint; hops: ExecutorHop[] }, second: string): string | null {
+  if (!trade || !Array.isArray(trade.hops)) return null;
+  const parts: string[] = [sel, word(0x40)];
+  const a2 = addrWord(second); if (a2 === null) return null; parts.push(a2);
+  const tok = addrWord(trade.token); if (tok === null) return null; parts.push(tok);
+  for (const v of [trade.amountIn, trade.minProfit, trade.maxBlock]) { const w = uintWord(v, 256); if (w === null) return null; parts.push(w); }
+  parts.push(word(0xa0), word(trade.hops.length));
+  for (const h0 of trade.hops) {
+    if (!h0 || typeof h0 !== 'object') return null;
+    const h = fullHop(h0);
+    if (typeof h.v4Native !== 'boolean') return null;
+    const ws = [uintWord(h.kind, 8), addrWord(h.pool), addrWord(h.tokenIn), addrWord(h.tokenOut),
+      uintWord(h.feeBps, 16), uintWord(h.v4Fee, 24), intWord(h.v4TickSpacing, 24), word(h.v4Native ? 1 : 0)];
+    for (const w of ws) { if (w === null) return null; parts.push(w); }
+  }
+  return '0x' + parts.join('');
+}
+
 // Encodes execute() from explicit values (used by the simulator, which sets
 // its own minProfit / maxBlock). buildExecuteCall() is the normal path.
 export function encodeExecuteRaw(
   trade: { token: string; amountIn: bigint; minProfit: bigint; maxBlock: bigint; hops: ExecutorHop[] },
   flashPool: string = ZERO_ADDRESS,
 ): string {
+  if (CALLDATA_LEAN) { const lean = leanEncode(SEL_EXECUTE, trade, flashPool); if (lean !== null) return lean; }
   return iface.encodeFunctionData('execute', [{ ...trade, hops: trade.hops.map(fullHop) }, flashPool]);
 }
 
@@ -375,6 +459,15 @@ export function encodeExecuteV3FlashRaw(
   trade: { token: string; amountIn: bigint; minProfit: bigint; maxBlock: bigint; hops: ExecutorHop[] },
   lendPool: string,
 ): string {
+  if (CALLDATA_LEAN) { const lean = leanEncode(SEL_EXECUTE_V3, trade, lendPool); if (lean !== null) return lean; }
+  return iface.encodeFunctionData('executeWithV3Flash', [{ ...trade, hops: trade.hops.map(fullHop) }, lendPool]);
+}
+
+// The ethers-only versions (reference for tests; same as CALLDATA_LEAN=0).
+export function encodeExecuteRawEthers(trade: { token: string; amountIn: bigint; minProfit: bigint; maxBlock: bigint; hops: ExecutorHop[] }, flashPool: string = ZERO_ADDRESS): string {
+  return iface.encodeFunctionData('execute', [{ ...trade, hops: trade.hops.map(fullHop) }, flashPool]);
+}
+export function encodeExecuteV3FlashRawEthers(trade: { token: string; amountIn: bigint; minProfit: bigint; maxBlock: bigint; hops: ExecutorHop[] }, lendPool: string): string {
   return iface.encodeFunctionData('executeWithV3Flash', [{ ...trade, hops: trade.hops.map(fullHop) }, lendPool]);
 }
 
