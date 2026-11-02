@@ -28,7 +28,7 @@ async function scanLog() {
   for await (const line of rl) {
     if (!line.startsWith('[sim] robinhood ')) continue;
     const m = re.exec(line); if (!m) continue;
-    if (!PAIRS.includes(m[1])) continue;
+    { const [x, y] = m[1].split('/'); if (!PAIRS.includes(m[1]) && !PAIRS.includes(y + '/' + x)) continue; }
     const k = `${m[1]} ${m[2]}@${m[3]}>${m[4]}@${m[5]}`;
     const r = out.routes[k] ??= { n: 0, res: {}, gross: [], size: [], why: {} };
     r.n++; const res = m[6] || 'PROFIT'; r.res[res] = (r.res[res] || 0) + 1;
@@ -65,7 +65,7 @@ async function readPool(st, meta, B) {
     if (isV4) {
       const s0 = await call(STATE_VIEW, ethers.id('getSlot0(bytes32)').slice(0, 10) + id.slice(2), bt);
       const lq = await call(STATE_VIEW, ethers.id('getLiquidity(bytes32)').slice(0, 10) + id.slice(2), bt);
-      if (!s0.startsWith('0x') || !lq.startsWith('0x')) return { err: s0 + ' ' + lq };
+      if (!s0.startsWith('0x') || !lq.startsWith('0x') || s0.length < 258) return { err: 'bad:' + s0.slice(0, 40) + ' ' + lq.slice(0, 40) };
       const [sq, tick, pf, lpf] = ac.decode(['uint160', 'int24', 'uint24', 'uint24'], s0);
       return { sqrtP: sq, tick: Number(tick), protocolFee: Number(pf), lpFee: Number(lpf), L: ac.decode(['uint128'], lq)[0] };
     }
@@ -73,7 +73,7 @@ async function readPool(st, meta, B) {
     if (!s0.startsWith('0x') || !lq.startsWith('0x')) return { err: s0 + ' ' + lq };
     return { sqrtP: BigInt(s0.slice(0, 66)), tick: Number(BigInt.asIntN(24, BigInt('0x' + s0.slice(66, 130)))), L: BigInt(lq.slice(0, 66)), lpFee: fe.startsWith('0x') ? Number(BigInt(fe)) : fe };
   };
-  p.chainAtBotBlock = await readState(st.lastUpdatedBlock);
+  p.chainAtBotBlock = st.lastUpdatedBlock > 0 ? await readState(st.lastUpdatedBlock) : { err: 'bot block unknown (0)' };
   p.chainNow = await readState(B);
   if (isV4) {
     ts = st.v4?.tickSpacing; p.hooks = st.v4?.hooks ?? '0x0000000000000000000000000000000000000000';
