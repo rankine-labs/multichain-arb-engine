@@ -73,6 +73,22 @@
 //   once a minute, always from the predicted copy's or the keeper's thread,
 //   never trading's. All three trims share the same `trim_now`.
 //
+//   FIX 13c (Nov 2): GUARD ON MEMORY REALLY IN USE (ARBSIM_AHEAD_MEM_BASIS
+//   = rss [default, as before] | inuse). Measured live after fix 13: trims
+//   brought the process back to ~1,200-1,300 MB, but glibc keeps ~300 MB of
+//   holes no trim can hand back, so short bursts of real work (copy 2's
+//   catch-ups / load rounds: +200 to +500 MB for seconds) still crossed the
+//   1350 line and paused seeing-ahead, while pm2's restart line is 1,800.
+//   With `inuse` the guard pauses when what the program really holds
+//   (counted by src/alloc.rs: cheap, live, no glibc locks) reaches
+//   ARBSIM_AHEAD_MEM_INUSE_PAUSE_MB [1200] (carry on below
+//   ARBSIM_AHEAD_MEM_INUSE_RESUME_MB [1140]), OR the process itself reaches
+//   ARBSIM_AHEAD_MEM_RSS_HARD_MB [1600] (carry on below
+//   ARBSIM_AHEAD_MEM_RSS_HARD_RESUME_MB [1500]): still 200 MB below pm2's
+//   1,800 restart line, so being killed stays as unlikely as before.
+//   Trim first then applies at the hard line. If the counter is not
+//   available (0: a binary without `alloc::Chosen`), it falls back to rss.
+//
 //   BREAKDOWN (status "memory"): process size now and its peak, and what
 //   glibc's allocator says: in use by the program, held free inside the
 //   allocator (freed but not handed back: fragmentation), and big blocks
@@ -114,6 +130,16 @@ pub struct GuardCfg {
     /// ARBSIM_AHEAD_MEM_TRIM_FIRST_GAP_S [20] (fix 13): no trim-first try
     /// within this many seconds of any trim (5..=600 s).
     pub trim_first_gap_s: u64,
+    /// ARBSIM_AHEAD_MEM_BASIS [rss] (fix 13c): `inuse` = pause on memory
+    /// really in use (below) plus a hard process-size line.
+    pub basis_inuse: bool,
+    /// ARBSIM_AHEAD_MEM_INUSE_PAUSE_MB [1200] / _RESUME_MB [1140] (fix 13c).
+    pub inuse_pause_mb: u64,
+    pub inuse_resume_mb: u64,
+    /// ARBSIM_AHEAD_MEM_RSS_HARD_MB [1600] / _RESUME_MB [1500] (fix 13c):
+    /// with `inuse`, the process size that still pauses (pm2 restarts 1,800).
+    pub rss_hard_mb: u64,
+    pub rss_hard_resume_mb: u64,
 }
 
 impl GuardCfg {
@@ -132,7 +158,29 @@ impl GuardCfg {
         let regrow_trim_min_s = num("ARBSIM_MEM_REGROW_TRIM_MIN_S", 60).clamp(30, 3_600);
         let trim_first = crate::copy2::ahead::on_off(get("ARBSIM_AHEAD_MEM_TRIM_FIRST").as_deref()).unwrap_or(true);
         let trim_first_gap_s = num("ARBSIM_AHEAD_MEM_TRIM_FIRST_GAP_S", 20).clamp(5, 600);
-        GuardCfg { pause_mb, resume_mb, trim, soft_trim_mb, soft_trim_every_s, regrow_trim_mb, regrow_trim_min_s, trim_first, trim_first_gap_s }
+        // Fix 13c (Nov 2): guard on memory really in use (see the header).
+        let basis_inuse = get("ARBSIM_AHEAD_MEM_BASIS").is_some_and(|v| v.trim().eq_ignore_ascii_case("inuse"));
+        let gap = |pause: u64, resume: u64| if resume >= pause { pause.saturating_sub(pause / 20).max(1) } else { resume };
+        let inuse_pause_mb = num("ARBSIM_AHEAD_MEM_INUSE_PAUSE_MB", 1200).max(1);
+        let inuse_resume_mb = gap(inuse_pause_mb, num("ARBSIM_AHEAD_MEM_INUSE_RESUME_MB", 1140));
+        let rss_hard_mb = num("ARBSIM_AHEAD_MEM_RSS_HARD_MB", 1600).max(1);
+        let rss_hard_resume_mb = gap(rss_hard_mb, num("ARBSIM_AHEAD_MEM_RSS_HARD_RESUME_MB", 1500));
+        GuardCfg {
+            pause_mb,
+            resume_mb,
+            trim,
+            soft_trim_mb,
+            soft_trim_every_s,
+            regrow_trim_mb,
+            regrow_trim_min_s,
+            trim_first,
+            trim_first_gap_s,
+            basis_inuse,
+            inuse_pause_mb,
+            inuse_resume_mb,
+            rss_hard_mb,
+            rss_hard_resume_mb,
+        }
     }
 }
 
@@ -177,6 +225,37 @@ impl Guard {
     }
 }
 
+impl Guard {
+    /// Fix 13c: one look with both figures. `inuse_mb` None (or the `rss`
+    /// basis) = exactly `look(rss)`. With `inuse`: pause when in use reaches
+    /// its pause line OR the process reaches the hard line; carry on only
+    /// when both are below their resume lines.
+    pub fn look_mem(&mut self, cfg: &GuardCfg, rss_mb: f64, inuse_mb: Option<f64>) -> Step {
+        let Some(inuse) = inuse_mb.filter(|_| cfg.basis_inuse && cfg.pause_mb > 0) else {
+            return self.look(cfg, rss_mb);
+        };
+        let over = inuse >= cfg.inuse_pause_mb as f64 || rss_mb >= cfg.rss_hard_mb as f64;
+        let under = inuse < cfg.inuse_resume_mb as f64 && rss_mb < cfg.rss_hard_resume_mb as f64;
+        if !self.paused && over {
+            self.paused = true;
+            self.pauses += 1;
+            Step::Paused
+        } else if self.paused && under {
+            self.paused = false;
+            self.resumes += 1;
+            Step::Resumed
+        } else {
+            Step::Same
+        }
+    }
+}
+
+/// Fix 13c: the process-size line that pauses (and so where trim-first
+/// acts): the hard line with the `inuse` basis, else the pause line.
+pub fn rss_pause_line(cfg: &GuardCfg, inuse_known: bool) -> u64 {
+    if cfg.basis_inuse && inuse_known { cfg.rss_hard_mb } else { cfg.pause_mb }
+}
+
 /// SOFT TRIM (Nov 2): is an early hand-back due? Not while paused (the
 /// pause has its own trims), only at or above the soft line, and at most
 /// once every `soft_trim_every_s` (`since_last_s` None = never trimmed).
@@ -201,7 +280,12 @@ pub fn regrow_trim_due(cfg: &GuardCfg, paused: bool, rss_mb: f64, since_last_s: 
 /// line)? Then hand back freed memory first, unless any trim ran within
 /// `trim_first_gap_s` (`since_any_trim_s` None = never trimmed).
 pub fn trim_first_due(cfg: &GuardCfg, paused: bool, rss_mb: f64, since_any_trim_s: Option<u64>) -> bool {
-    cfg.pause_mb > 0 && cfg.trim_first && !paused && rss_mb >= cfg.pause_mb as f64 && since_any_trim_s.is_none_or(|s| s >= cfg.trim_first_gap_s)
+    trim_first_due_at(cfg, cfg.pause_mb, paused, rss_mb, since_any_trim_s)
+}
+
+/// Same, at a given process-size line (fix 13c: the hard line with `inuse`).
+pub fn trim_first_due_at(cfg: &GuardCfg, line_mb: u64, paused: bool, rss_mb: f64, since_any_trim_s: Option<u64>) -> bool {
+    cfg.pause_mb > 0 && cfg.trim_first && !paused && rss_mb >= line_mb as f64 && since_any_trim_s.is_none_or(|s| s >= cfg.trim_first_gap_s)
 }
 
 struct Rt {
@@ -241,6 +325,8 @@ struct Inner {
     trim_first_saved: u64,
     trim_first_freed_total_mb: f64,
     trim_first_last_ms: f64,
+    /// Fix 13c: memory in use at the last look (counted), MB.
+    last_inuse_mb: Option<f64>,
 }
 
 fn rt() -> &'static Rt {
@@ -309,9 +395,14 @@ pub fn pressure() -> bool {
     g.last_rss_mb = rss;
     g.max_rss_seen_mb = g.max_rss_seen_mb.max(rss);
     let cfg = r.cfg.clone();
+    // Fix 13c: what the program really holds (0 = counter not available).
+    let held = crate::alloc::held_bytes();
+    let inuse = (held > 0).then(|| held as f64 / 1_048_576.0);
+    g.last_inuse_mb = inuse.map(|v| (v * 10.0).round() / 10.0);
+    let line = rss_pause_line(&cfg, inuse.is_some());
     // TRIM FIRST (fix 13): at the pause line, hand back what glibc merely
     // keeps, then decide on the size after the trim.
-    if trim_first_due(&cfg, g.guard.paused, rss, g.last_any_trim.map(|t| t.elapsed().as_secs())) {
+    if trim_first_due_at(&cfg, line, g.guard.paused, rss, g.last_any_trim.map(|t| t.elapsed().as_secs())) {
         g.last_any_trim = Some(Instant::now());
         drop(g);
         let ms = trim_now();
@@ -321,26 +412,35 @@ pub fn pressure() -> bool {
         g.trim_first_last_ms = (ms * 10.0).round() / 10.0;
         g.trim_first_freed_total_mb += ((rss - after).max(0.0) * 10.0).round() / 10.0;
         g.after_last_trim_mb = Some(after);
-        if after < cfg.pause_mb as f64 {
+        if after < line as f64 {
             g.trim_first_saved += 1;
         }
         if g.trim_first_tries <= 3 || g.trim_first_tries % 20 == 0 {
             eprintln!(
                 "[arbsim] memory trim-first #{}: {rss:.0} -> {after:.0} MB in {ms:.0} ms ({})",
                 g.trim_first_tries,
-                if after < cfg.pause_mb as f64 { "no pause needed" } else { "still over the pause line" }
+                if after < line as f64 { "no pause needed" } else { "still over the pause line" }
             );
         }
         rss = after;
         g.last_rss_mb = rss;
     }
-    match g.guard.look(&cfg, rss) {
+    match g.guard.look_mem(&cfg, rss, inuse) {
         Step::Paused => {
             g.paused_since = Some(Instant::now());
-            eprintln!(
-                "[arbsim] memory {rss:.0} MB >= ARBSIM_AHEAD_MEM_PAUSE_MB {}: the predicted copy and its keeper pause (trading unchanged) until below {} MB",
-                cfg.pause_mb, cfg.resume_mb
-            );
+            if cfg.basis_inuse && inuse.is_some() {
+                eprintln!(
+                    "[arbsim] memory in use {:.0} MB (line {}) / process {rss:.0} MB (line {}): the predicted copy and its keeper pause (trading unchanged)",
+                    inuse.unwrap_or(0.0),
+                    cfg.inuse_pause_mb,
+                    cfg.rss_hard_mb
+                );
+            } else {
+                eprintln!(
+                    "[arbsim] memory {rss:.0} MB >= ARBSIM_AHEAD_MEM_PAUSE_MB {}: the predicted copy and its keeper pause (trading unchanged) until below {} MB",
+                    cfg.pause_mb, cfg.resume_mb
+                );
+            }
         }
         Step::Resumed => {
             if let Some(t) = g.paused_since.take() {
@@ -477,6 +577,9 @@ pub fn status_json() -> Value {
         "mallocArenaMax": std::env::var("MALLOC_ARENA_MAX").ok(),
         "aheadGuard": {
             "pauseMb": r.cfg.pause_mb, "resumeMb": r.cfg.resume_mb, "trim": r.cfg.trim,
+            // Fix 13c: which figure pauses, its lines, and in use at the last look.
+            "basis": if r.cfg.basis_inuse { "inuse" } else { "rss" }, "inusePauseMb": r.cfg.inuse_pause_mb, "inuseResumeMb": r.cfg.inuse_resume_mb,
+            "rssHardMb": r.cfg.rss_hard_mb, "rssHardResumeMb": r.cfg.rss_hard_resume_mb, "lastLookInUseMb": g.last_inuse_mb,
             "paused": g.guard.paused, "pauses": g.guard.pauses, "resumes": g.guard.resumes, "pausedS": paused_ms / 1000,
             "lastLookMb": g.last_rss_mb, "maxSeenMb": g.max_rss_seen_mb,
             "trims": g.trims, "trimLastMs": g.trim_last_ms, "trimLastFreedMb": g.trim_last_freed_mb, "trimFreedTotalMb": (g.trim_freed_total_mb * 10.0).round() / 10.0,
@@ -524,9 +627,21 @@ mod tests {
                 regrow_trim_mb: 80,
                 regrow_trim_min_s: 60,
                 trim_first: true,
-                trim_first_gap_s: 20
+                trim_first_gap_s: 20,
+                basis_inuse: false,
+                inuse_pause_mb: 1200,
+                inuse_resume_mb: 1140,
+                rss_hard_mb: 1600,
+                rss_hard_resume_mb: 1500
             }
         );
+        // Fix 13c switches.
+        assert!(cfg(&[("ARBSIM_AHEAD_MEM_BASIS", "inuse")]).basis_inuse);
+        assert!(cfg(&[("ARBSIM_AHEAD_MEM_BASIS", " InUse ")]).basis_inuse);
+        assert!(!cfg(&[("ARBSIM_AHEAD_MEM_BASIS", "rss")]).basis_inuse);
+        assert!(!cfg(&[("ARBSIM_AHEAD_MEM_BASIS", "junk")]).basis_inuse, "anything else = rss, as before");
+        let flap = cfg(&[("ARBSIM_AHEAD_MEM_RSS_HARD_MB", "1600"), ("ARBSIM_AHEAD_MEM_RSS_HARD_RESUME_MB", "1700")]);
+        assert_eq!(flap.rss_hard_resume_mb, 1520, "resume at/above the line is pulled 5% below it");
         // Fix 13 switches and their limits.
         assert_eq!(cfg(&[("ARBSIM_MEM_REGROW_TRIM_MB", "0")]).regrow_trim_mb, 0);
         assert_eq!(cfg(&[("ARBSIM_MEM_REGROW_TRIM_MIN_S", "5")]).regrow_trim_min_s, 30, "never more often than every 30 s");
@@ -670,6 +785,40 @@ mod tests {
         assert!(trims <= 120, "at most one trim a minute: {trims}");
     }
 
+    /// Fix 13c: the `inuse` basis. The live pattern after fix 13: in use
+    /// ~850-1,000 MB, process ~1,250-1,380 MB (glibc holes) with bursts:
+    /// no pause; real growth of what is held, or the process at the hard
+    /// line: pause; carry on only when both are below their resume lines.
+    #[test]
+    fn inuse_basis_pauses_on_real_memory_or_the_hard_line() {
+        let c = cfg(&[("ARBSIM_AHEAD_MEM_BASIS", "inuse")]);
+        let mut g = Guard::default();
+        assert_eq!(g.look_mem(&c, 1380.0, Some(950.0)), Step::Same, "rss over 1350 but in use normal: no pause");
+        assert_eq!(g.look_mem(&c, 1599.0, Some(1100.0)), Step::Same, "burst below the hard line: no pause");
+        assert_eq!(g.look_mem(&c, 1600.0, Some(1000.0)), Step::Paused, "hard line: pause");
+        assert_eq!(g.look_mem(&c, 1450.0, Some(1150.0)), Step::Same, "in use still above its resume line: stay paused");
+        assert_eq!(g.look_mem(&c, 1450.0, Some(1100.0)), Step::Resumed, "both below their resume lines: carry on");
+        assert_eq!(g.look_mem(&c, 1300.0, Some(1200.0)), Step::Paused, "in use at its line: pause");
+        assert_eq!(g.look_mem(&c, 1510.0, Some(900.0)), Step::Same, "process above its resume line: stay paused");
+        assert_eq!(g.look_mem(&c, 1490.0, Some(900.0)), Step::Resumed);
+        // No counter (None) or the rss basis: exactly the old guard.
+        let mut g = Guard::default();
+        assert_eq!(g.look_mem(&c, 1350.0, None), Step::Paused, "no counter: rss rules");
+        let rss = cfg(&[]);
+        let mut g = Guard::default();
+        assert_eq!(g.look_mem(&rss, 1350.0, Some(500.0)), Step::Paused, "rss basis ignores in use");
+        // Trim first acts at the hard line with `inuse`, the pause line otherwise.
+        assert_eq!(rss_pause_line(&c, true), 1600);
+        assert_eq!(rss_pause_line(&c, false), 1350);
+        assert_eq!(rss_pause_line(&rss, true), 1350);
+        assert!(!trim_first_due_at(&c, rss_pause_line(&c, true), false, 1400.0, None));
+        assert!(trim_first_due_at(&c, rss_pause_line(&c, true), false, 1600.0, None));
+        // Off switch still wins.
+        let off = cfg(&[("ARBSIM_AHEAD_MEM_BASIS", "inuse"), ("ARBSIM_AHEAD_MEM_PAUSE_MB", "0")]);
+        let mut g = Guard::default();
+        assert_eq!(g.look_mem(&off, 5000.0, Some(5000.0)), Step::Same, "guard off");
+    }
+
     #[test]
     fn breakdown_has_the_fields() {
         let s = status_json();
@@ -682,6 +831,8 @@ mod tests {
         assert_eq!(s["softTrim"]["mb"], json!(1150));
         assert_eq!(s["softTrim"]["regrowMb"], json!(80));
         assert_eq!(s["trimFirst"]["on"], json!(true));
+        assert_eq!(s["aheadGuard"]["basis"], json!("rss"));
+        assert_eq!(s["aheadGuard"]["rssHardMb"], json!(1600));
         assert!(s["countedInUseMb"].is_number());
     }
 
