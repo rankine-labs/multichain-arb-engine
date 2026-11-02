@@ -162,13 +162,29 @@ pub struct KeeperCfg {
     /// because a block once wrote them (FASTLANE_AHEAD_KEEP_ADOPT): live
     /// they piled up ~10,000 an hour toward the 200,000 cap and never went
     /// away. Codes no kept account uses any more go too. 0 = off (old:
-    /// keep everything until the cap). Default 18,000 blocks (~31 min at
-    /// the ~9.7 blocks/s measured live Nov 1: 34,840 blocks an hour), so a
-    /// value is only dropped after 30-60 min of nobody writing it. Safe: a dropped value is just "not held"; a run that
-    /// needs it again misses it once, which makes it learned (kept for
-    /// good) and seeded again from the node.
+    /// keep everything until the cap). Safe: a dropped value is just "not
+    /// held"; a run that needs it again misses it once, which makes it
+    /// learned (kept for good) and seeded again from the node.
+    ///
+    /// Default 3,000 blocks (~5 min at the ~9.7 blocks/s measured live), so
+    /// an adopted value nobody writes leaves after 10-15 min.
+    /// WHY NOT 18,000 (the first default, PR #263): live Nov 1-2 its
+    /// prune removed 0 values while the keeper grew 10,000 -> 95,000
+    /// values in 57 min. By design the FIRST prune can never drop
+    /// anything: every adopted value was adopted because a block wrote it,
+    /// so it was "written in this window", and every seeded value is
+    /// learned. The first drop can only come at the THIRD prune
+    /// (3 x 18,000 blocks = ~93 min), and arbsim was restarted (deploys)
+    /// every 45-62 min, so it never came. Replayed with the oracle
+    /// (ahead-replay, Nov 2) even a prune every 100 blocks (30x more
+    /// often than this default) dropped 28% of the held values with the
+    /// same agreement (31 / 7 vs 30 / 7 with it off) and 0 wrong values.
     pub prune_blocks: u64,
 }
+
+/// FASTLANE_AHEAD_KEEP_PRUNE_BLOCKS default (memory fix 2, Nov 2): ~5 min
+/// of blocks live. See `KeeperCfg::prune_blocks` for why not 18,000.
+pub const PRUNE_BLOCKS_DEFAULT: u64 = 3_000;
 
 impl Default for KeeperCfg {
     fn default() -> Self {
@@ -213,7 +229,8 @@ impl KeeperCfg {
             lead_feed: super::ahead::on_off(get("FASTLANE_AHEAD_KEEP_LEAD").as_deref()).unwrap_or(observe),
             cand_slots: num("FASTLANE_AHEAD_KEEP_CAND_SLOTS", if observe { 256 } else { max_slots_per as u64 }, 1, 100_000) as usize,
             // Memory fix (Nov 1): 0 = off; anything else at least 100 blocks.
-            prune_blocks: get("FASTLANE_AHEAD_KEEP_PRUNE_BLOCKS").and_then(|v| v.trim().parse::<u64>().ok()).map(|v| if v == 0 { 0 } else { v.clamp(100, 10_000_000) }).unwrap_or(18_000),
+            // Default 3,000 (memory fix 2, Nov 2; was 18,000: see above).
+            prune_blocks: get("FASTLANE_AHEAD_KEEP_PRUNE_BLOCKS").and_then(|v| v.trim().parse::<u64>().ok()).map(|v| if v == 0 { 0 } else { v.clamp(100, 10_000_000) }).unwrap_or(PRUNE_BLOCKS_DEFAULT),
             on,
             max_contracts: num("FASTLANE_AHEAD_KEEP_CONTRACTS", d.max_contracts as u64, 1, 1000) as usize,
             max_slots_per,
@@ -2497,6 +2514,60 @@ mod tests {
         assert!(k.written_now.is_empty() && k.written_prev.is_empty());
     }
 
+    /// THE LIVE PATTERN (Nov 1-2) at block scale: arbsim lives ~26,000
+    /// blocks (~45 min) between restarts; every block rewrites a few hot
+    /// values and the keeper adopts ~1.5 brand-new values nobody asked for
+    /// (live: 50,000 adopted an hour at 9.7 blocks/s). With the old
+    /// 18,000-block window the one prune in that life drops NOTHING (all
+    /// adopted values were written in its window) and the values only
+    /// grow, as seen live. With the new 3,000-block default they level off
+    /// at what was written in the last 2-3 windows, and the learned and
+    /// hot values are never dropped.
+    #[test]
+    fn live_pattern_old_window_drops_nothing_new_window_levels_off() {
+        let run = |every: u64| -> (KeeperCore, Vec<usize>) {
+            let mut k = KeeperCore::new(KeeperCfg { on: true, max_contracts: 10, prune_blocks: every, max_slots_per: 100_000, max_slots_total: 2_000_000, ..KeeperCfg::default() });
+            k.start_at(100);
+            k.learn(&[MissItem::Slot(a(1), u(1))]);
+            seed(&mut k, 100);
+            let mut sizes = Vec::new();
+            let mut fresh = 1_000u64;
+            for b in 101..=26_100u64 {
+                // 3 hot values every block + 1 or 2 new ones (1.5 a block).
+                let mut w: Vec<(u64, u64)> = vec![(2, b), (3, b), (4, b)];
+                for _ in 0..(1 + b % 2) {
+                    fresh += 1;
+                    w.push((fresh, b));
+                }
+                k.apply_block(b, &[slot_diff(a(1), &w)]).unwrap();
+                if b % 2_600 == 0 {
+                    sizes.push(k.account(&a(1)).unwrap().storage.len());
+                }
+            }
+            (k, sizes)
+        };
+        // Old default: one prune in the whole life, 0 values dropped, and
+        // the held values grow the whole time (live: 10,021 -> 94,735).
+        let (old, old_sizes) = run(18_000);
+        assert_eq!(old.stats.prunes, 1);
+        assert_eq!(old.stats.pruned_values, 0, "the live symptom: the first prune can never drop anything");
+        assert!(old_sizes.windows(2).all(|w| w[1] > w[0]), "grows all the time: {old_sizes:?}");
+        assert!(old_sizes.last().copied().unwrap() > 38_000, "{old_sizes:?}");
+        // New default: drops start at the third prune and the size levels off.
+        let (new, new_sizes) = run(PRUNE_BLOCKS_DEFAULT);
+        assert_eq!(new.stats.prunes, 8);
+        assert!(new.stats.pruned_values > 25_000, "dropped {}", new.stats.pruned_values);
+        let last = *new_sizes.last().unwrap();
+        assert!(last <= 3 * 3_000 * 3 / 2 + 10, "bounded by ~3 windows of new values: {last} ({new_sizes:?})");
+        let tail = &new_sizes[new_sizes.len() - 5..];
+        let (lo, hi) = (*tail.iter().min().unwrap(), *tail.iter().max().unwrap());
+        assert!(hi - lo <= 4_600, "level, not climbing: {tail:?}");
+        // Learned and hot values always stay, exact.
+        let acct = new.account(&a(1)).unwrap();
+        assert_eq!(acct.storage.get(&u(1)), Some(&u(10)), "learned value kept");
+        assert_eq!(acct.storage.get(&u(2)), Some(&u(26_100)), "hot value kept, exact");
+    }
+
     /// A dropped value that a run needs again is learned, seeded again and
     /// from then on kept for good (self-healing; that is why the prune is
     /// safe for accuracy).
@@ -2580,11 +2651,12 @@ mod tests {
             "FASTLANE_AHEAD_KEEP_PRUNE_BLOCKS" => v.map(|x| x.to_string()),
             _ => None,
         });
-        assert_eq!(get(None).prune_blocks, 18_000);
+        assert_eq!(get(None).prune_blocks, 3_000, "memory fix 2 (Nov 2): was 18,000");
         assert_eq!(get(Some("0")).prune_blocks, 0);
         assert_eq!(get(Some("5")).prune_blocks, 100);
         assert_eq!(get(Some("36000")).prune_blocks, 36_000);
-        assert_eq!(get(Some("junk")).prune_blocks, 18_000);
+        assert_eq!(get(Some("junk")).prune_blocks, 3_000);
+        assert_eq!(get(Some("18000")).prune_blocks, 18_000, "the old window is still one setting away");
         assert_eq!(KeeperCfg::default().prune_blocks, 0, "the core's own default (tests, replay): off");
     }
 }
