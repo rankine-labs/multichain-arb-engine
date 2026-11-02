@@ -36,6 +36,21 @@
 //   Cost: one read of /proc/self/statm (a few microseconds) at most every
 //   250 ms, by whichever of the two threads asks first.
 //
+//   SOFT TRIM (Nov 2, memory fix 2, ARBSIM_MEM_SOFT_TRIM_MB [1150] /
+//   ARBSIM_MEM_SOFT_TRIM_EVERY_S [300]): measured live Nov 1-2, arbsim's
+//   process size climbed ~1,000 -> ~1,340 MB in 45 minutes after every
+//   restart while the memory the program actually USED stayed ~900-970 MB:
+//   the climb was glibc keeping freed memory ("freeHeldMb" 112 -> 551 MB),
+//   not data. glibc only hands that back on malloc_trim, which until now ran
+//   only once the pause line (1350) was crossed, i.e. after seeing-ahead had
+//   already stopped. Now, when the process is at or above the soft line and
+//   NOT paused, freed memory is handed back at most once every
+//   ARBSIM_MEM_SOFT_TRIM_EVERY_S seconds (from the predicted copy's or the
+//   keeper's thread, never trading's). So the process stays well below the
+//   pause line and seeing-ahead keeps running. ARBSIM_MEM_SOFT_TRIM_MB=0 =
+//   off (old behaviour). Like the guard, it is only asked by the predicted
+//   copy and the keeper (and off when the guard is off).
+//
 //   BREAKDOWN (status "memory"): process size now and its peak, and what
 //   glibc's allocator says: in use by the program, held free inside the
 //   allocator (freed but not handed back: fragmentation), and big blocks
@@ -57,6 +72,13 @@ pub struct GuardCfg {
     pub resume_mb: u64,
     /// ARBSIM_AHEAD_MEM_TRIM [on]: hand freed memory back while paused.
     pub trim: bool,
+    /// ARBSIM_MEM_SOFT_TRIM_MB [1150] (memory fix 2, Nov 2): at or above
+    /// this process size (and not paused) hand freed memory back early, so
+    /// the pause line is not reached by memory glibc merely keeps. 0 = off.
+    pub soft_trim_mb: u64,
+    /// ARBSIM_MEM_SOFT_TRIM_EVERY_S [300]: at most one soft trim this often
+    /// (30..=86400 s): each trim holds glibc's locks for ~50-100 ms.
+    pub soft_trim_every_s: u64,
 }
 
 impl GuardCfg {
@@ -67,7 +89,10 @@ impl GuardCfg {
         // A resume line at or above the pause line would flap: keep a gap.
         let resume_mb = if pause_mb > 0 && resume_mb >= pause_mb { pause_mb.saturating_sub(pause_mb / 20).max(1) } else { resume_mb };
         let trim = crate::copy2::ahead::on_off(get("ARBSIM_AHEAD_MEM_TRIM").as_deref()).unwrap_or(true);
-        GuardCfg { pause_mb, resume_mb, trim }
+        // Soft trim (Nov 2): 0 = off; the gap to the pause line is what it buys.
+        let soft_trim_mb = num("ARBSIM_MEM_SOFT_TRIM_MB", 1150);
+        let soft_trim_every_s = num("ARBSIM_MEM_SOFT_TRIM_EVERY_S", 300).clamp(30, 86_400);
+        GuardCfg { pause_mb, resume_mb, trim, soft_trim_mb, soft_trim_every_s }
     }
 }
 
@@ -112,6 +137,13 @@ impl Guard {
     }
 }
 
+/// SOFT TRIM (Nov 2): is an early hand-back due? Not while paused (the
+/// pause has its own trims), only at or above the soft line, and at most
+/// once every `soft_trim_every_s` (`since_last_s` None = never trimmed).
+pub fn soft_trim_due(cfg: &GuardCfg, paused: bool, rss_mb: f64, since_last_s: Option<u64>) -> bool {
+    cfg.soft_trim_mb > 0 && !paused && rss_mb >= cfg.soft_trim_mb as f64 && since_last_s.is_none_or(|s| s >= cfg.soft_trim_every_s)
+}
+
 struct Rt {
     cfg: GuardCfg,
     started: Instant,
@@ -133,6 +165,12 @@ struct Inner {
     trim_last_ms: f64,
     trim_last_freed_mb: f64,
     trim_freed_total_mb: f64,
+    /// Soft trims (Nov 2): last one, count, last time / freed, total freed.
+    last_soft_trim: Option<Instant>,
+    soft_trims: u64,
+    soft_trim_last_ms: f64,
+    soft_trim_last_freed_mb: f64,
+    soft_trim_freed_total_mb: f64,
 }
 
 fn rt() -> &'static Rt {
@@ -235,6 +273,25 @@ pub fn pressure() -> bool {
         g.trim_last_freed_mb = ((rss - after).max(0.0) * 10.0).round() / 10.0;
         g.trim_freed_total_mb += g.trim_last_freed_mb;
         g.last_rss_mb = after;
+        return paused;
+    }
+    // SOFT TRIM (Nov 2): not paused but above the soft line: hand back
+    // what glibc keeps before it pushes the process to the pause line.
+    let soft_due = soft_trim_due(&cfg, paused, rss, g.last_soft_trim.map(|t| t.elapsed().as_secs()));
+    if soft_due {
+        g.last_soft_trim = Some(Instant::now());
+        drop(g);
+        let ms = trim_now();
+        let after = rss_mb();
+        let mut g = r.inner.lock().unwrap_or_else(|e| e.into_inner());
+        g.soft_trims += 1;
+        g.soft_trim_last_ms = (ms * 10.0).round() / 10.0;
+        g.soft_trim_last_freed_mb = ((rss - after).max(0.0) * 10.0).round() / 10.0;
+        g.soft_trim_freed_total_mb += g.soft_trim_last_freed_mb;
+        g.last_rss_mb = after;
+        if g.soft_trims <= 3 || g.soft_trims % 12 == 0 {
+            eprintln!("[arbsim] memory soft trim #{}: {rss:.0} -> {after:.0} MB in {ms:.0} ms (ARBSIM_MEM_SOFT_TRIM_MB {})", g.soft_trims, cfg.soft_trim_mb);
+        }
     }
     paused
 }
@@ -313,6 +370,12 @@ pub fn status_json() -> Value {
             "lastLookMb": g.last_rss_mb, "maxSeenMb": g.max_rss_seen_mb,
             "trims": g.trims, "trimLastMs": g.trim_last_ms, "trimLastFreedMb": g.trim_last_freed_mb, "trimFreedTotalMb": (g.trim_freed_total_mb * 10.0).round() / 10.0,
         },
+        // Soft trim (Nov 2): early hand-backs below the pause line.
+        "softTrim": {
+            "mb": r.cfg.soft_trim_mb, "everyS": r.cfg.soft_trim_every_s, "trims": g.soft_trims, "lastMs": g.soft_trim_last_ms,
+            "lastFreedMb": g.soft_trim_last_freed_mb, "freedTotalMb": (g.soft_trim_freed_total_mb * 10.0).round() / 10.0,
+            "lastAgoS": g.last_soft_trim.map(|t| t.elapsed().as_secs()),
+        },
     })
 }
 
@@ -328,7 +391,9 @@ mod tests {
 
     #[test]
     fn settings_and_defaults() {
-        assert_eq!(cfg(&[]), GuardCfg { pause_mb: 1350, resume_mb: 1290, trim: true });
+        assert_eq!(cfg(&[]), GuardCfg { pause_mb: 1350, resume_mb: 1290, trim: true, soft_trim_mb: 1150, soft_trim_every_s: 300 });
+        assert_eq!(cfg(&[("ARBSIM_MEM_SOFT_TRIM_MB", "0")]).soft_trim_mb, 0);
+        assert_eq!(cfg(&[("ARBSIM_MEM_SOFT_TRIM_EVERY_S", "1")]).soft_trim_every_s, 30, "never more often than every 30 s");
         assert_eq!(cfg(&[("ARBSIM_AHEAD_MEM_PAUSE_MB", "0")]).pause_mb, 0);
         assert_eq!(cfg(&[("ARBSIM_AHEAD_MEM_TRIM", "off")]).trim, false);
         // A resume line at / above the pause line is pulled 5% below it.
@@ -358,6 +423,38 @@ mod tests {
         assert_eq!(g.look(&off, 5000.0), Step::Same);
     }
 
+    /// SOFT TRIM (Nov 2): the live pattern. In use flat ~950 MB, glibc's kept
+    /// free memory pushes the process from 1,000 to 1,340 MB in 45 min. The
+    /// soft trim fires at the soft line, not again within the interval, not
+    /// while paused (the pause has its own trims), and never when off.
+    #[test]
+    fn soft_trim_fires_above_the_soft_line_at_most_every_interval() {
+        let c = cfg(&[]);
+        assert!(!soft_trim_due(&c, false, 1100.0, None), "below the soft line: nothing");
+        assert!(soft_trim_due(&c, false, 1150.0, None), "at the soft line: first trim");
+        assert!(!soft_trim_due(&c, false, 1250.0, Some(299)), "not again within 300 s");
+        assert!(soft_trim_due(&c, false, 1250.0, Some(300)), "again after 300 s");
+        assert!(!soft_trim_due(&c, true, 1400.0, None), "paused: the pause's own trims");
+        let off = cfg(&[("ARBSIM_MEM_SOFT_TRIM_MB", "0")]);
+        assert!(!soft_trim_due(&off, false, 1700.0, None), "off: never");
+        // Simulated 60 min at the live slope (+7.5 MB/min of kept free
+        // memory) with a trim handing back what glibc kept: the process
+        // never reaches the 1350 pause line.
+        let (mut rss, mut last, mut max, mut trims) = (1000.0f64, None::<u64>, 0.0f64, 0);
+        for min in 0..60u64 {
+            rss += 7.5;
+            let since = last.map(|l| (min - l) * 60);
+            if soft_trim_due(&c, false, rss, since) {
+                rss = 960.0; // back to what is in use
+                last = Some(min);
+                trims += 1;
+            }
+            max = f64::max(max, rss);
+        }
+        assert!(max < c.pause_mb as f64, "max {max}");
+        assert!((2..=12).contains(&trims), "trims {trims}");
+    }
+
     #[test]
     fn breakdown_has_the_fields() {
         let s = status_json();
@@ -367,6 +464,7 @@ mod tests {
         assert_eq!(s["allocator"], json!("system"));
         assert!(s["malloc"]["inUseMb"].is_number());
         assert_eq!(s["aheadGuard"]["pauseMb"], json!(1350));
+        assert_eq!(s["softTrim"]["mb"], json!(1150));
     }
 
     /// Offline measurement (run by hand): what malloc_trim and mallinfo2
