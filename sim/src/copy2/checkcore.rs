@@ -205,6 +205,14 @@ impl CheckCore {
             };
             c.v4.push(V4Info { pool: e.pool.clone(), ready: e.state == PoolState::Ready, ready_since: e.ready_since, pending_from: e.pending_from, far });
         }
+        // (Nov 2) Watched accounts (a hook, a Slipstream factory / fee
+        // module) with an event not yet checked against the node: checks
+        // touching them at that block or later answer unknown.
+        for (a, b) in &reg.watch_pending {
+            let kind = reg.watched.get(a).and_then(|ks| ks.iter().find_map(|k| reg.pools.get(k))).map(|e| e.pool.kind).unwrap_or_default();
+            c.pending.entry(*a).or_default().push((kind, *a, *b));
+            c.any_pending.push((kind, *a, *b));
+        }
         c.pm_list = pms.into_iter().collect();
         c.layouts = reg.layouts.iter().filter_map(|(a, l)| l.map(|l| (*a, l))).collect();
         // The range where every pool's rule answers like "all ready pools
@@ -337,6 +345,16 @@ impl ProvIndex {
                 owned.insert(*a, e.ready_since);
             }
         }
+        // (Nov 2) A watched account: its held values are exact (followed by
+        // its own events, see intake.rs on_outside_log) while a pool that
+        // watches it is ready: from the earliest such pool's ready block.
+        // (Pending events are handled by `pending`, not here.)
+        for (a, pks) in &reg.watched {
+            if let Some(s) = pks.iter().filter_map(|pk| reg.pools.get(pk)).filter(|e| e.state == PoolState::Ready).map(|e| e.ready_since).min() {
+                let e = owned.entry(*a).or_insert(s);
+                *e = (*e).min(s);
+            }
+        }
         // An address can be both (a pool contract that is also listed as
         // owned): exact once EITHER rule says so.
         for (a, s) in owned {
@@ -396,7 +414,7 @@ mod tests {
     }
 
     fn v4(n: u8) -> TrackedPool {
-        let mut p = TrackedPool { address: Address::with_last_byte(9), v4_id: None, kind: PoolKind::V4, token0: Address::with_last_byte(1), token1: Address::with_last_byte(n), fee: 3000, tick_spacing: 60 };
+        let mut p = TrackedPool { address: Address::with_last_byte(9), v4_id: None, kind: PoolKind::V4, token0: Address::with_last_byte(1), token1: Address::with_last_byte(n), fee: 3000, tick_spacing: 60, ..Default::default() };
         p.v4_id = Some(B256::with_last_byte(n));
         p
     }
@@ -456,7 +474,7 @@ mod tests {
         let mut e = entry(unsure_v4.clone());
         e.state = PoolState::Unsure;
         reg.pools.insert((unsure_v4.address, unsure_v4.v4_id), e);
-        let v3 = TrackedPool { address: Address::repeat_byte(0xAB), v4_id: None, kind: PoolKind::V3, token0: Address::with_last_byte(1), token1: Address::with_last_byte(2), fee: 500, tick_spacing: 10 };
+        let v3 = TrackedPool { address: Address::repeat_byte(0xAB), v4_id: None, kind: PoolKind::V3, token0: Address::with_last_byte(1), token1: Address::with_last_byte(2), fee: 500, tick_spacing: 10, ..Default::default() };
         reg.pools.insert((v3.address, None), entry(v3.clone())); // loading
         let fc: FarCache = Mutex::new(HashMap::new());
         let c = CheckCore::build(&reg, 1, None, &fc);

@@ -720,7 +720,7 @@ mod tests {
         let pm = Address::with_last_byte(0x83);
         let (t0, t1) = (Address::with_last_byte(1), Address::with_last_byte(2));
         let id = B256::with_last_byte(0x77);
-        let pool = TrackedPool { address: pm, v4_id: Some(id), kind: PoolKind::V4, token0: t0, token1: t1, fee: 500, tick_spacing: 10 };
+        let pool = TrackedPool { address: pm, v4_id: Some(id), kind: PoolKind::V4, token0: t0, token1: t1, fee: 500, tick_spacing: 10, ..Default::default() };
         let core = CheckCore { pm_list: vec![pm], v4: vec![V4Info { pool, ready: true, ready_since: 1, pending_from: None, far: None }], ..Default::default() };
         let check = |fee: u32| PreparedCheck {
             call: Default::default(), overrides: Default::default(), amount_offset: 96, amount_slots: vec![], main_amount: U256::from(5u8), sizes: vec![U256::from(5u8)],

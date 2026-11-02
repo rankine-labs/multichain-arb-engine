@@ -172,10 +172,10 @@ impl Chain {
         let pa = v3pool(100, 2500.0);
         a.send_ok(pa, &calldata("increaseObservationCardinalityNext(uint16)", &[Arg::W(U256::from(30))]));
         let pb = v3pool(500, 2520.0);
-        let mut v4 = TrackedPool { address: pm, v4_id: None, kind: PoolKind::V4, token0: t0, token1: t1, fee: 500, tick_spacing: 10 };
+        let mut v4 = TrackedPool { address: pm, v4_id: None, kind: PoolKind::V4, token0: t0, token1: t1, fee: 500, tick_spacing: 10, ..Default::default() };
         v4.v4_id = Some(arbsim::copy2::replay::v4_pool_id(&v4));
         a.send_ok(pm, &calldata("initialize((address,address,uint24,int24,address),uint160)", &[Arg::A(t0), Arg::A(t1), Arg::W(U256::from(500)), Arg::I(10), Arg::A(Address::ZERO), Arg::W(sqrt_price_for(2510.0, uu, ww))]));
-        let tr = |p: Address, fee: u32, sp: i32| TrackedPool { address: p, v4_id: None, kind: PoolKind::V3, token0: t0, token1: t1, fee, tick_spacing: sp };
+        let tr = |p: Address, fee: u32, sp: i32| TrackedPool { address: p, v4_id: None, kind: PoolKind::V3, token0: t0, token1: t1, fee, tick_spacing: sp, ..Default::default() };
         let mut c = Chain { a: a.clone(), pools: vec![tr(pa, 100, 1), tr(pb, 500, 10), v4], plain, vt, uu, ww, ts: 0, rng: Rng::new(7), positions: Vec::new() };
         // Liquidity in every pool (several ranges).
         for i in 0..3 {

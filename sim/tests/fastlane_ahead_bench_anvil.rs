@@ -116,7 +116,7 @@ fn setup(a: &Anvil) -> Market {
     }
     let mut v4 = Vec::new();
     for (fee, spacing) in [(3000u32, 60i32), (500, 10)] {
-        let mut p = TrackedPool { address: pm, v4_id: None, kind: PoolKind::V4, token0: t0, token1: t1, fee, tick_spacing: spacing };
+        let mut p = TrackedPool { address: pm, v4_id: None, kind: PoolKind::V4, token0: t0, token1: t1, fee, tick_spacing: spacing, ..Default::default() };
         p.v4_id = Some(arbsim::copy2::replay::v4_pool_id(&p));
         let mut args = key_args(&p);
         args.push(Arg::W(sqrt_price_for(2500.0, usd, weth)));

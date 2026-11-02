@@ -169,7 +169,7 @@ fn setup_base(a: &Anvil, arts: &Value) -> (Address, Address, Address, Address, V
 }
 
 fn tracked(address: Address, kind: PoolKind, t0: Address, t1: Address) -> TrackedPool {
-    TrackedPool { address, v4_id: None, kind, token0: t0, token1: t1, fee: 0, tick_spacing: 0 }
+    TrackedPool { address, v4_id: None, kind, token0: t0, token1: t1, fee: 0, tick_spacing: 0, ..Default::default() }
 }
 
 fn setup(a: &Anvil, kind: K, rng: &mut Rng) -> Sc {
@@ -233,7 +233,7 @@ fn setup(a: &Anvil, kind: K, rng: &mut Rng) -> Sc {
             sc.trader = vt;
             // Two pools in one PoolManager, both traded (the copy must keep them apart).
             for (fee, spacing) in [(3000u32, 60i32), (500, 10)] {
-                let mut p = TrackedPool { address: pm, v4_id: None, kind: PoolKind::V4, token0: t0, token1: t1, fee, tick_spacing: spacing };
+                let mut p = TrackedPool { address: pm, v4_id: None, kind: PoolKind::V4, token0: t0, token1: t1, fee, tick_spacing: spacing, ..Default::default() };
                 p.v4_id = Some(arbsim::copy2::replay::v4_pool_id(&p));
                 sc.pools.push(p);
                 sc.spacing.push(spacing as i64);

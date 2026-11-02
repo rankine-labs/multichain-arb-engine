@@ -270,10 +270,10 @@ const SOLP: u8 = 0xb5;
 const USER: u8 = 0x77;
 
 fn v2_pool() -> TrackedPool {
-    TrackedPool { address: a(V2P), v4_id: None, kind: PoolKind::V2, token0: a(COIN0), token1: a(COIN1), fee: 0, tick_spacing: 0 }
+    TrackedPool { address: a(V2P), v4_id: None, kind: PoolKind::V2, token0: a(COIN0), token1: a(COIN1), fee: 0, tick_spacing: 0, ..Default::default() }
 }
 fn sol_pool() -> TrackedPool {
-    TrackedPool { address: a(SOLP), v4_id: None, kind: PoolKind::Solidly, token0: a(COIN0), token1: a(COIN1), fee: 0, tick_spacing: 0 }
+    TrackedPool { address: a(SOLP), v4_id: None, kind: PoolKind::Solidly, token0: a(COIN0), token1: a(COIN1), fee: 0, tick_spacing: 0, ..Default::default() }
 }
 
 fn addr_word(x: Address) -> U256 {
@@ -367,9 +367,12 @@ impl Rig {
             .iter()
             .map(|p| {
                 json!({
-                    "address": format!("{}", p.address), "kind": match p.kind { PoolKind::V2 => "v2", PoolKind::Solidly => "solidly", PoolKind::V3 => "v3", _ => "v4" },
+                    "address": format!("{}", p.address), "kind": match p.kind { PoolKind::V2 => "v2", PoolKind::Solidly => "solidly", PoolKind::V3 => "v3", PoolKind::Slipstream => "slipstream", _ => "v4" },
                     "token0": format!("{}", p.token0), "token1": format!("{}", p.token1), "fee": p.fee, "tickSpacing": p.tick_spacing,
                     "v4Id": p.v4_id.map(|i| format!("{i}")),
+                    // (Nov 2) watched / reload accounts (empty lists = none)
+                    "watch": p.watch.iter().map(|x| format!("{x}")).collect::<Vec<_>>(),
+                    "reloadOn": p.reload_on.iter().map(|x| format!("{x}")).collect::<Vec<_>>(),
                 })
             })
             .collect();
@@ -2052,7 +2055,7 @@ fn late_pool_manager_report_touches_only_its_own_pool() {
         let tmpl = reg.pools.values().next().unwrap().clone();
         for id in &ids {
             let mut e = tmpl.clone();
-            e.pool = TrackedPool { address: pm, v4_id: Some(*id), kind: PoolKind::V4, token0: a(COIN0), token1: a(COIN1), fee: 3000, tick_spacing: 60 };
+            e.pool = TrackedPool { address: pm, v4_id: Some(*id), kind: PoolKind::V4, token0: a(COIN0), token1: a(COIN1), fee: 3000, tick_spacing: 60, ..Default::default() };
             e.items.clear();
             e.base_block = 100;
             e.ready_since = 100;
@@ -2583,7 +2586,7 @@ fn pools_changed_ignores_shared_pool_manager_values() {
         let tmpl = reg.pools.values().next().unwrap().clone();
         for id in &ids {
             let mut e = tmpl.clone();
-            e.pool = TrackedPool { address: pm, v4_id: Some(*id), kind: PoolKind::V4, token0: a(COIN0), token1: a(COIN1), fee: 3000, tick_spacing: 60 };
+            e.pool = TrackedPool { address: pm, v4_id: Some(*id), kind: PoolKind::V4, token0: a(COIN0), token1: a(COIN1), fee: 3000, tick_spacing: 60, ..Default::default() };
             e.items.clear();
             e.items.insert((pm, u(7))); // the shared value, like live
             reg.pools.insert((pm, Some(*id)), e);
@@ -2739,7 +2742,7 @@ fn add_pools(r: &Rig, n: usize) -> Address {
         } else {
             (Address::from_word(B256::from(U256::from(0x5000_0000u64 + i as u64))), None)
         };
-        e.pool = TrackedPool { address: addr, v4_id: id, kind: if half { PoolKind::V4 } else { PoolKind::V2 }, token0: a(COIN0), token1: a(COIN1), fee: 3000, tick_spacing: 60 };
+        e.pool = TrackedPool { address: addr, v4_id: id, kind: if half { PoolKind::V4 } else { PoolKind::V2 }, token0: a(COIN0), token1: a(COIN1), fee: 3000, tick_spacing: 60, ..Default::default() };
         e.items.clear();
         // Mixed: most ready since different blocks, some loading.
         e.state = if i % 7 == 3 { PoolState::Loading } else { PoolState::Ready };
@@ -3042,7 +3045,7 @@ fn blind_rig(cfg: C2Config) -> (Rig, Address, B256) {
     {
         let mut reg = r.h.c2.reg.write().unwrap();
         let mut e = reg.pools.values().next().unwrap().clone();
-        e.pool = TrackedPool { address: pm, v4_id: Some(ours), kind: PoolKind::V4, token0: a(COIN0), token1: a(COIN1), fee: 3000, tick_spacing: 60 };
+        e.pool = TrackedPool { address: pm, v4_id: Some(ours), kind: PoolKind::V4, token0: a(COIN0), token1: a(COIN1), fee: 3000, tick_spacing: 60, ..Default::default() };
         e.items.clear();
         e.base_block = 100;
         e.ready_since = 100;
@@ -3105,7 +3108,7 @@ fn v4_blind_far_tick_of_our_pool_is_kept_others_refused_by_class() {
     let mut gone = lg(pm, vec![topic("Swap(bytes32,address,int128,int128,uint160,uint128,int24,uint24)"), ours], data(&[u(0); 6]), 101, 0, 0);
     gone.removed = true;
     r.intake.process(msg(102, 62, vec![gone]));
-    assert_ne!(r.state(&TrackedPool { address: pm, v4_id: Some(ours), kind: PoolKind::V4, token0: a(COIN0), token1: a(COIN1), fee: 3000, tick_spacing: 60 }).0, PoolState::Ready);
+    assert_ne!(r.state(&TrackedPool { address: pm, v4_id: Some(ours), kind: PoolKind::V4, token0: a(COIN0), token1: a(COIN1), fee: 3000, tick_spacing: 60, ..Default::default() }).0, PoolState::Ready);
     assert_eq!(r.head_slot(pm, t_ours), Lookup::Missing, "forgotten with the pool");
     assert_eq!(r.head_slot(pm, w_ours), Lookup::Missing);
 }
@@ -3971,7 +3974,7 @@ fn poolmanager_misses_are_unsure_only_for_a_named_pool_that_is_not_ready() {
     let r = rig();
     let pm = a(0x83);
     let key = |n: u8| B256::with_last_byte(n);
-    let pool = |n: u8| TrackedPool { address: pm, v4_id: Some(key(n)), kind: PoolKind::V4, token0: a(1), token1: a(n), fee: 500, tick_spacing: 10 };
+    let pool = |n: u8| TrackedPool { address: pm, v4_id: Some(key(n)), kind: PoolKind::V4, token0: a(1), token1: a(n), fee: 500, tick_spacing: 10, ..Default::default() };
     let mut core = CheckCore { pm_list: vec![pm], ..Default::default() };
     core.v4.push(V4Info { pool: pool(2), ready: true, ready_since: 1, pending_from: None, far: None });
     core.v4.push(V4Info { pool: pool(3), ready: false, ready_since: 0, pending_from: None, far: None });
@@ -4680,4 +4683,139 @@ fn fastlane_trig_replay_warm_sim() {
     assert_eq!((w["nodeRequests"].clone(), w["keeper"]["fetchedOnce"].clone(), w["keeper"]["refreshTouch"].clone()), (json!(3), json!(1), json!(2)), "{w}");
     // Without --fetch: refused.
     assert!(arbsim::fastlane::trig_replay::trig_replay(&cap, None, &TrigCfg::default(), &opts).is_err());
+}
+
+
+// ---------------------------------------------------------------------------
+// (Nov 2) WATCHED ACCOUNTS and RELOAD ACCOUNTS (hooked V4 / Slipstream).
+// A V2 pool stands in for "a pool whose swap reads another contract": the
+// mechanism is the same for every kind.
+// ---------------------------------------------------------------------------
+const WATCHED: u8 = 0xd1;
+const GAUGE: u8 = 0xd2;
+
+fn watching_pool() -> TrackedPool {
+    TrackedPool { watch: vec![a(WATCHED)], ..v2_pool() }
+}
+
+/// An event of a watched account: its held value is checked against the
+/// node at that block; a changed value is replaced from that block on, and
+/// until the check is done checks touching it answer "unknown" (pending).
+#[test]
+fn watched_account_event_rechecks_its_values_exactly() {
+    let mut r = rig();
+    let mut g = genesis();
+    g.entry(a(WATCHED)).or_default().insert(u(7), u(111));
+    r.chain.set(100, g.clone());
+    r.track(vec![watching_pool()]);
+    r.send(tick(100, 60));
+    assert_eq!(r.state(&watching_pool()).0, PoolState::Ready);
+    // A check needed the watched value: filled at block 100.
+    assert!(r.h.fill(vec![MissItem::Slot(a(WATCHED), u(7))]));
+    r.settle();
+    r.send(tick(100, 60));
+    assert_eq!(r.head_slot(a(WATCHED), u(7)), Lookup::Known(u(111)), "watched value filled");
+    // Block 101: its owner changes it (an event of the watched account, no
+    // pool event). The node is still at block 100: the re-read must wait.
+    g.get_mut(&a(WATCHED)).unwrap().insert(u(7), u(222));
+    r.chain.set(101, g.clone());
+    *r.chain.tip.lock().unwrap() = 100;
+    let ev = lg(a(WATCHED), vec![B256::with_last_byte(0x55)], data(&[u(1)]), 101, 1, 0);
+    r.send(msg(101, 62, vec![ev]));
+    assert_eq!(r.h.c2.stats.watch_events.load(std::sync::atomic::Ordering::Relaxed), 1);
+    assert!(r.h.c2.reg.read().unwrap().watch_pending.get(&a(WATCHED)) == Some(&101), "pending from its event's block");
+    let core = r.h.c2.check_core();
+    assert!(core.pending_reason(&[a(WATCHED)], 101, false).is_some(), "a check touching it at 101 answers unknown");
+    assert!(core.pending_reason(&[a(WATCHED)], 100, false).is_none(), "older blocks are not affected");
+    // The node reaches 101: re-read, the change is found and put in.
+    *r.chain.tip.lock().unwrap() = 1_000_000;
+    std::thread::sleep(std::time::Duration::from_millis(350));
+    r.send(tick(101, 62));
+    r.settle();
+    assert_eq!(r.head_slot(a(WATCHED), u(7)), Lookup::Known(u(222)), "the copy holds the chain's new value");
+    assert!(r.h.c2.reg.read().unwrap().watch_pending.is_empty(), "pending lifted");
+    assert_eq!(r.h.c2.stats.watch_changed.load(std::sync::atomic::Ordering::Relaxed), 1, "one changed value counted");
+    assert!(r.h.c2.check_core().pending_reason(&[a(WATCHED)], 101, false).is_none());
+    // An event that changes nothing: re-read, nothing replaced.
+    r.chain.set(102, g.clone());
+    let ev = lg(a(WATCHED), vec![B256::with_last_byte(0x56)], data(&[u(2)]), 102, 1, 0);
+    r.send(msg(102, 64, vec![ev]));
+    r.settle();
+    assert_eq!(r.h.c2.stats.watch_changed.load(std::sync::atomic::Ordering::Relaxed), 1, "unchanged value: nothing replaced");
+    assert_eq!(r.head_slot(a(WATCHED), u(7)), Lookup::Known(u(222)));
+    assert!(r.h.c2.reg.read().unwrap().watch_pending.is_empty());
+    // The pool itself stayed ready throughout (its own values are unaffected).
+    assert_eq!(r.state(&watching_pool()).0, PoolState::Ready);
+}
+
+/// A pool event AFTER an event of its watched account in the same block:
+/// the values it would need are mid-block ones: the pool reloads instead.
+#[test]
+fn watched_change_then_pool_event_in_one_block_reloads_the_pool() {
+    let mut r = rig();
+    r.track(vec![watching_pool()]);
+    r.send(tick(100, 60));
+    assert_eq!(r.state(&watching_pool()).0, PoolState::Ready);
+    let ev = lg(a(WATCHED), vec![B256::with_last_byte(0x55)], data(&[u(1)]), 101, 1, 0);
+    let logs = vec![ev, transfer(a(COIN0), a(USER), a(V2P), 100, 101, 3, 0), v2_sync(1100, 3640, 101, 3, 2)];
+    r.h.block(msg(101, 62, logs));
+    r.intake.pump();
+    assert_eq!(r.h.c2.stats.watch_same_block_unsure.load(std::sync::atomic::Ordering::Relaxed), 1);
+    assert_ne!(r.state(&watching_pool()).0, PoolState::Ready, "not ready right after: {:?}", r.state(&watching_pool()));
+    // (Its reason is already "loading" again: test reloads come quickly.)
+}
+
+/// Any event of a pool's reload account (a Slipstream gauge) makes the pool
+/// unsure from that block (it reloads, no strike).
+#[test]
+fn gauge_event_reloads_the_pool() {
+    let mut r = rig();
+    let p = TrackedPool { reload_on: vec![a(GAUGE)], ..v2_pool() };
+    r.track(vec![p.clone()]);
+    r.send(tick(100, 60));
+    assert_eq!(r.state(&p).0, PoolState::Ready);
+    let ev = lg(a(GAUGE), vec![B256::with_last_byte(0x77)], data(&[u(1)]), 101, 1, 0);
+    r.h.block(msg(101, 62, vec![ev]));
+    r.intake.pump();
+    assert_eq!(r.h.c2.stats.watch_reloads.load(std::sync::atomic::Ordering::Relaxed), 1);
+    assert_ne!(r.state(&p).0, PoolState::Ready);
+    // It reloads by itself (no strike: the normal short wait).
+    std::thread::sleep(std::time::Duration::from_millis(1200));
+    r.send(tick(102, 64));
+    r.settle();
+    r.send(tick(103, 66));
+    r.settle();
+    assert_eq!(r.state(&p).0, PoolState::Ready, "{:?}", r.state(&p));
+}
+
+/// The new kinds are refused while their flag is off (the second lock next
+/// to the bot's own flags), and a hooked pool must watch its hook.
+#[test]
+fn new_kinds_need_their_flags() {
+    use arbsim::copy2::intake::parse_track;
+    let slip = json!({ "pools": [{ "address": format!("{}", a(0x31)), "kind": "slipstream", "token0": format!("{}", a(1)), "token1": format!("{}", a(2)),
+        "watch": [format!("{}", a(0x41))], "reloadOn": [format!("{}", a(0x42))] }] });
+    let hooked = |watch: bool| json!({ "pools": [{ "address": format!("{}", a(0x44)), "kind": "v4", "v4Id": format!("{}", B256::with_last_byte(9)), "token0": format!("{}", Address::ZERO), "token1": format!("{}", a(2)),
+        "fee": 8388608, "tickSpacing": 200, "hooks": format!("{}", a(0x45)), "watch": if watch { vec![format!("{}", a(0x45))] } else { vec![] } }] });
+    // Flags are process-wide: this test alone sets them.
+    std::env::remove_var("ARBSIM_COPY2_FOLLOW_UPCL");
+    std::env::remove_var("ARBSIM_COPY2_FOLLOW_RAPHAEL");
+    std::env::remove_var("ARBSIM_COPY2_FOLLOW_HOOKED_V4");
+    let (p, _, skipped) = parse_track(&slip).unwrap();
+    assert!(p.is_empty() && skipped[0].contains("ARBSIM_COPY2_FOLLOW_UPCL"), "{skipped:?}");
+    let (p, _, skipped) = parse_track(&hooked(true)).unwrap();
+    assert!(p.is_empty() && skipped[0].contains("HOOKED_V4"), "{skipped:?}");
+    std::env::set_var("ARBSIM_COPY2_FOLLOW_UPCL", "on");
+    std::env::set_var("ARBSIM_COPY2_FOLLOW_HOOKED_V4", "1");
+    let (p, _, _) = parse_track(&slip).unwrap();
+    assert_eq!(p.len(), 1);
+    assert_eq!(p[0].kind, PoolKind::Slipstream);
+    assert_eq!(p[0].watch, vec![a(0x41)]);
+    assert_eq!(p[0].reload_on, vec![a(0x42)]);
+    let (p, _, _) = parse_track(&hooked(true)).unwrap();
+    assert!(p.len() == 1 && p[0].is_hooked_v4() && p[0].fee == 8388608);
+    let (p, _, skipped) = parse_track(&hooked(false)).unwrap();
+    assert!(p.is_empty() && skipped[0].contains("must watch its hook"), "{skipped:?}");
+    std::env::remove_var("ARBSIM_COPY2_FOLLOW_UPCL");
+    std::env::remove_var("ARBSIM_COPY2_FOLLOW_HOOKED_V4");
 }
