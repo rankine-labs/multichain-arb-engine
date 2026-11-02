@@ -26,7 +26,7 @@ done
 SHORT=${NEW:0:7}
 echo "main is now $NEW; touching DEPLOY_ALLOW_LIVE $(date -u +%T)" >> $S
 LOGSTART=${LOGSTART_OVERRIDE:-$(stat -c %s $APP/deploy/auto-deploy.log)}
-touch $APP/DEPLOY_ALLOW_LIVE
+[ "${2:-}" = "nowait" ] || touch $APP/DEPLOY_ALLOW_LIVE
 for i in $(seq 1 150); do
   NEWLOG=$(tail -c +$((LOGSTART + 1)) $APP/deploy/auto-deploy.log)
   if echo "$NEWLOG" | grep -q "DEPLOYED.*$SHORT"; then
