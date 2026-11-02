@@ -8,7 +8,7 @@ const url = process.env.ROBINHOOD_RPC_HTTP || process.env.CHAINSTACK_RPC_ROBINHO
 const prov = new ethers.JsonRpcProvider(url, 4663, { staticNetwork: true, batchMaxCount: 1 });
 const ac = ethers.AbiCoder.defaultAbiCoder();
 const d = JSON.parse(fs.readFileSync(OUT + '/diag1.json', 'utf8'));
-const B = d.block; const PICK = (process.argv[2] || '0x6d65849d,0xfa29c8b2,0x553e9a45,0x357c92ce,0x2707cb88').split(',');
+const TRIM = Number(process.argv[3] || 800); const B = d.block; const PICK = (process.argv[2] || '0x6d65849d,0xfa29c8b2,0x553e9a45,0x357c92ce,0x2707cb88').split(',');
 const call = async (to, data) => { try { return await prov.call({ to, data, blockTag: B }); } catch (e) { return 'ERR:' + String(e.shortMessage || e.message).slice(0, 80); } };
 (async () => {
   const fx = [];
@@ -16,7 +16,7 @@ const call = async (to, data) => { try { return await prov.call({ to, data, bloc
     const p = d.pools[k]; const c = p.chainNow;
     const sqrtP = BigInt(c.sqrtP), L = BigInt(c.L);
     // trim the window to +-800 ticks around the price so the fixture stays small
-    const lo = Math.max(p.window.lo, c.tick - 800), hi = Math.min(p.window.hi, c.tick + 800);
+    const lo = Math.max(p.window.lo, c.tick - TRIM), hi = Math.min(p.window.hi, c.tick + TRIM);
     const ticks = p.window.ticks.filter((t) => t.tick >= lo && t.tick <= hi).map((t) => ({ tick: t.tick, liquidityNet: BigInt(t.liquidityNet) }));
     const win = { lo, hi, ticks, block: B, ms: 0 };
     const usdgIsA = p.tokenA.toLowerCase() === '0x5fc5360d0400a0fd4f2af552add042d716f1d168';
@@ -35,6 +35,6 @@ const call = async (to, data) => { try { return await prov.call({ to, data, bloc
     fx.push({ k, label: p.symA + '/' + p.symB, dex: p.dex, decA: p.decA_chain, decB: p.decB_chain, sqrtP: c.sqrtP, L: c.L, tick: c.tick, lpFee: c.lpFee, protocolFee: c.protocolFee ?? 0, ts: p.tickSpacing,
       win: { lo, hi, ticks: ticks.map((t) => [t.tick, t.liquidityNet.toString()]) }, cases });
   }
-  fs.writeFileSync(OUT + '/fixtures.json', JSON.stringify({ block: B, fx }));
+  fs.writeFileSync(OUT + '/fixtures-' + (process.argv[4] || 'a') + '.json', JSON.stringify({ block: B, fx }));
   for (const f of fx) console.log(f.k, f.label, f.cases.map((x) => (x.zeroForOne ? 'z' : 'o') + ':' + (x.exact ? 'EXACT' : x.quoter === 'revert' ? 'rev/' + (x.left ? 'LEFT' : 'in') + '/' + x.tick : 'q' + x.quoter + '/t' + x.tick)).join(' '));
 })();
