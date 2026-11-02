@@ -222,6 +222,7 @@ import { liveLayoutOn, LiveTradeBook, WalletWatch, formatLiveTrade, formatLiveHo
 import { FailoverJsonRpcProvider } from './core/failoverRpc';
 import { LeanJsonRpcProvider } from './core/leanRpc';
 import { makeCaller } from './core/universeScan';
+import { tickBook, stockTickMathOn } from './core/tickWindow';
 import { loadNodeUsage, saveNodeUsage, nodeUsageToday, NodeBudget, budgetForUrl, callsInBody } from './core/nodeBudget';
 import { endpointLabel } from './core/endpointLabel';
 // Any-provider node settings (off unless set in .env, see docs/NODE_PROVIDERS.md).
@@ -2946,6 +2947,29 @@ setInterval(labelled('fables fee read', async () => {
             fablesFees.applyRead(read, Date.now());
       } catch { /* node busy: keep the last fees, try again in 5 s */ }
 }), 5_000);
+// TICK WINDOWS (core/tickWindow.ts, Nov 2, STOCK_TICK_MATH, default on):
+// the price ranges next to each Robinhood V3/V4 pool's price, read in the
+// background (bundled, read-only) so the quick guess walks a trade range by
+// range like the pool does, instead of pretending the current range never
+// ends (the "phantom gap" stock pools: MRNA, BE, GOOGL, RIVN, SNDK, HIMS).
+// Every 30 s every watched pool is checked for a missing / old window; every
+// 2 s up to 60 waiting pools are read. STOCK_TICK_MATH=0 = old maths, no reads.
+if (stockTickMathOn()) {
+      setInterval(labelled('tick window want', () => { for (const p of cache.forChain('robinhood')) tickBook.windowFor(p); }), 30_000);
+      setInterval(labelled('tick window read', async () => {
+            if (!tickBook.pendingCount()) return;
+            try {
+                  rhDecisionCallMany ??= (await makeCaller(robinhoodReadProvider)).callMany;
+                  await tickBook.loadPending(rhDecisionCallMany);
+                  markStretch('tick window read');
+            } catch { /* node busy: try again in 2 s */ }
+      }), 2_000);
+      setInterval(() => {
+            const st = tickBook.stats;
+            console.log(`[tick-math] windows ${tickBook.size()} (waiting ${tickBook.pendingCount()}) | loads ${st.loads}, failed ${st.loadFails}, requests ${st.requests} | guesses walked ${st.used} (ran past window ${st.leftWindow}), fell back ${st.fellBack}`);
+      }, 10 * 60_000);
+      console.log('[tick-math] ON: V3/V4 guesses walk real price ranges + V4 protocol fee (STOCK_TICK_MATH=0 to turn off)');
+} else console.log('[tick-math] OFF (STOCK_TICK_MATH=0): old single-range V3/V4 guess');
 const pricesAtDecisionRobinhood = async (traded: PoolState, peers: PoolState[]): Promise<[PoolState, PoolState[]]> => {
       const all = [traded, ...peers];
       let wsTrusted = 0;
