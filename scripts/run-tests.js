@@ -29,7 +29,7 @@ if (stale.length) console.log(`Skipping ${stale.length} stale compiled test(s) w
 // they fail at random and blocked 5 deploys in 2 days. The server's
 // pre-deploy run sets SKIP_TIMING_TESTS=1 (deploy/auto-deploy.sh) and skips
 // only these; GitHub's checks still run them before every merge.
-const TIMING_TESTS = new Set(['freezeFix.test.js', 'freezeFix2.test.js', 'trigSpeed.test.js', 'feedTradeSpeed.test.js']);
+const TIMING_TESTS = new Set(['freezeFix.test.js', 'freezeFix2.test.js', 'trigSpeed.test.js', 'feedTradeSpeed.test.js', 'fix10Speed.test.js']);
 if (process.env.SKIP_TIMING_TESTS === '1') {
   const skipped = files.filter(f => TIMING_TESTS.has(f));
   for (const f of skipped) files.splice(files.indexOf(f), 1);

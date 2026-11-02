@@ -203,6 +203,7 @@ export type EntrySettings = {
   tableQuietMs: number;          // TRIG_TABLE_QUIET_MS [600000] quiet skip: a pool where nothing moved is still rebuilt about this often (spread 50 to 100% per pool)
   tableDelta: boolean;           // TRIG_TABLE_DELTA [1] true delta: arbsim gets only rows that really changed (see TRUE DELTA; needs the quiet skip; 0 = exactly the #262 table)
   tableDeltaDriftMs: number;     // TRIG_TABLE_DELTA_DRIFT_MS [TRIG_TABLE_QUIET_MS, 600000] true delta: rows changed ONLY by gas / coin-price drift reach arbsim at most this often per pool (spread 50 to 100%)
+  tableRowUpd: boolean;          // TRIG_TABLE_ROW_UPDATE [1] row updates: drift rows go as only their changed parts when arbsim says it reads them (see ROW UPDATES; needs true delta; 0 = exactly the true delta table)
 };
 
 export function entrySettings(env: Record<string, string | undefined> = process.env, minNetUsd = 0.25): EntrySettings {
@@ -243,6 +244,7 @@ export function entrySettings(env: Record<string, string | undefined> = process.
     tableDelta: tableDeltaOn(env),
     // (Default: the quiet window, so drift keeps the same 5 to 10 min rhythm as quiet turns.)
     tableDeltaDriftMs: num('TRIG_TABLE_DELTA_DRIFT_MS', num('TRIG_TABLE_QUIET_MS', 600_000, 1_000), 1_000),
+    tableRowUpd: tableRowUpdOn(env),
   };
 }
 
@@ -389,13 +391,80 @@ export const QUIET_TURN_DIV = 16;
 export function tableDeltaOn(env: Record<string, string | undefined> = process.env): boolean {
   return (env.TRIG_TABLE_DELTA ?? '1').trim() !== '0' && tableQuietOn(env);
 }
+
+// ----------------------------------------------------------------------------
+// ROW UPDATES (Nov 2, fix 10, TRIG_TABLE_ROW_UPDATE, default on; 0 = exactly
+// the true delta table above)
+//
+// Plain English: with true delta live, arbsim still got 34 to 40 table
+// messages of 2 to 3.6 MB every 5 minutes (80 to 99 MB). The bot's own
+// 5-minute lines (Nov 2, 4 windows) said where it went: rows 0, scores
+// 59,000 to 132,000 (a few bytes each), but 813 to 992 WHOLE pools and
+// 28,800 to 34,100 drift rows. Patches were on. Why: when a pool's drift
+// falls due (every 5 to 10 min per pool), nearly every row of it has
+// drifted (the gas cost moves every row's stop amount), so "most of the
+// pool changed" sent the whole pool, every row with its contract calls and
+// overrides (2 to 4 KB a row), though only the stop amount, the amount and
+// the fast-lane facts had moved. 1,648 pools every ~7.5 min = ~1,100 whole
+// pools per 5 min, as seen.
+// Fix: such a row goes as only its changed parts, by route id
+// (`{"u":[{rid, e, c:{changed keys}, f, s, h}]}`, check/entry.rs apply_table):
+// arbsim merges them into the row it holds, which then equals the fresh
+// row EXACTLY (same check keys, every changed value sent). A row that can't
+// be expressed that way (no check on either side, the check's keys
+// differ, an unknown row field) still goes whole. Sent only when arbsim's
+// answers say `upd: true` (an older arbsim never does: whole pools / rows
+// as before). Same timing as before: what goes, and when, is unchanged;
+// only how many bytes it takes.
+// ----------------------------------------------------------------------------
+export function tableRowUpdOn(env: Record<string, string | undefined> = process.env): boolean {
+  return (env.TRIG_TABLE_ROW_UPDATE ?? '1').trim() !== '0' && tableDeltaOn(env);
+}
+// The row fields arbsim reads (check/entry.rs parse_rows); any other field
+// makes the row go whole (the update could not carry it).
+const ROW_FIELDS = new Set(['rid', 'h', 's', 'e', 'c', 'f']);
+const isPlainObj = (x: unknown): x is Record<string, unknown> => x !== null && typeof x === 'object' && !Array.isArray(x);
+// Keys JSON keeps (an `undefined` value is left out of the text arbsim reads).
+const jsonKeys = (o: Record<string, unknown>): string[] => Object.keys(o).filter((k) => o[k] !== undefined);
+// Same value as arbsim would read it: same object, else the same JSON text.
+// (Different key order = "changed": the new value is then sent, still exact.)
+const sameJson = (a: unknown, b: unknown): boolean => a === b || (typeof a === 'object' && typeof b === 'object' && a !== null && b !== null && JSON.stringify(a) === JSON.stringify(b));
+// ROW UPDATES: the changed parts of `held` (the row arbsim holds) that make
+// it the fresh row `now`, without the entry id (the caller adds the new
+// one). null = can't be done as an update: the row goes whole.
+export function rowUpdateOf(held: Record<string, unknown>, now: Record<string, unknown>): Record<string, unknown> | null {
+  // Both buildable (arbsim holds an entry id; the fresh row gets a new one).
+  if (typeof held.e !== 'string' || !held.e || now.e !== '') return null;
+  if (String(held.rid) !== String(now.rid)) return null;
+  for (const k of jsonKeys(held)) if (!ROW_FIELDS.has(k)) return null;
+  for (const k of jsonKeys(now)) if (!ROW_FIELDS.has(k)) return null;
+  // The check is merged key by key: both must be objects with the same keys.
+  const hc = held.c, nc = now.c;
+  if (!isPlainObj(hc) || !isPlainObj(nc)) return null;
+  const hk = jsonKeys(hc), nk = jsonKeys(nc);
+  if (hk.length !== nk.length || nk.some((k) => hc[k] === undefined)) return null;
+  const u: Record<string, unknown> = { rid: now.rid };
+  if (typeof now.h !== 'boolean') return null;
+  if (held.h !== now.h) u.h = now.h;
+  const hs = typeof held.s === 'number' && Number.isFinite(held.s) ? held.s : null;
+  const ns = typeof now.s === 'number' && Number.isFinite(now.s) ? now.s : null;
+  if (hs !== ns) u.s = ns;
+  // Facts: arbsim keeps an object, anything else = none.
+  const hf = isPlainObj(held.f) ? held.f : null, nf = isPlainObj(now.f) ? now.f : null;
+  if (!sameJson(hf, nf)) u.f = nf;
+  const cu: Record<string, unknown> = {};
+  let nc2 = 0;
+  for (const k of nk) if (!sameJson(hc[k], nc[k])) { cu[k] = nc[k]; nc2++; }
+  if (nc2) u.c = cu;
+  return u;
+}
 // TRUE DELTA: a row's three keys (see above), as short digests.
 type RowD = { cf: string; sk: string; pk: string };
 // A pool's rows' keys, in row order.
 type PoolD = { cfs: string[]; sks: string[]; pks: string[] };
 // A pool's patch as arbsim reads it (check/entry.rs apply_table): whole
 // rows replacing the rows with the same route id, and scores by route id.
-export type TablePatch = { r?: unknown[]; s?: Record<string, number | null> };
+export type TablePatch = { r?: unknown[]; s?: Record<string, number | null>; u?: unknown[] };
 // The size cap as far as it is STRUCTURE: which ladder sizes fit, and its
 // size in half-doublings. Small moves (the WETH price moving the wallet's
 // value) stay drift; the wallet halving or doubling is a real change.
@@ -1579,10 +1648,12 @@ export class TrigEntry {
     lastTurns: 0, lastWaiting: 0, lastKeptRoutes: 0, turnFrom: 0,
     // TRUE DELTA: does arbsim read patches (its last answer said so)? Last
     // pass's counts; messages / bytes / full tables sent so far (all modes).
-    patchOk: false, codesAcked: { epoch: -1, n: -1 }, delta: { whole: 0, rows: 0, scores: 0, driftRows: 0, waiting: 0 }, msgs: 0, bytes: 0, fulls: 0,
+    patchOk: false, codesAcked: { epoch: -1, n: -1 }, delta: { whole: 0, rows: 0, scores: 0, driftRows: 0, waiting: 0, upd: 0 }, msgs: 0, bytes: 0, fulls: 0,
+    // ROW UPDATES: does arbsim read row updates (its last answer said so)?
+    updOk: false,
     // 5-minute table line: totals at its last print.
-    tot: { whole: 0, rows: 0, scores: 0, driftRows: 0 },
-    win: { at: 0, passes: 0, msgs: 0, bytes: 0, fulls: 0, whole: 0, rows: 0, scores: 0, driftRows: 0 },
+    tot: { whole: 0, rows: 0, scores: 0, driftRows: 0, upd: 0 },
+    win: { at: 0, passes: 0, msgs: 0, bytes: 0, fulls: 0, whole: 0, rows: 0, scores: 0, driftRows: 0, upd: 0 },
   };
 
   tableInfo(): { ackGen: number; pools: number; entries: number; lastMs: number; busyMs: number; routes: number; reused: number; sends: number } {
@@ -1880,7 +1951,7 @@ export class TrigEntry {
       let heldBack = 0;
       // TRUE DELTA: row by row (see tableDeltaOn and deltaPool below).
       if (delta) {
-        const ds = { whole: 0, rows: 0, scores: 0, driftRows: 0, waiting: 0 };
+        const ds = { whole: 0, rows: 0, scores: 0, driftRows: 0, waiting: 0, upd: 0 };
         let n = 0;
         for (const [key, f] of fresh) {
           if ((++n & 127) === 0) { const p = sliceUp(); if (p) await p; } // (in ~2 ms bites, as the rest of the pass)
@@ -1889,7 +1960,7 @@ export class TrigEntry {
         }
         heldBack = ds.waiting;
         T.delta = ds;
-        T.tot.whole += ds.whole; T.tot.rows += ds.rows; T.tot.scores += ds.scores; T.tot.driftRows += ds.driftRows;
+        T.tot.whole += ds.whole; T.tot.rows += ds.rows; T.tot.scores += ds.scores; T.tot.driftRows += ds.driftRows; T.tot.upd += ds.upd;
       }
       for (const [key, f] of delta ? [] : fresh) {
         const old = T.pools.get(key);
@@ -1985,6 +2056,8 @@ export class TrigEntry {
         // TRUE DELTA: patches only to an arbsim that says it reads them
         // (every answer says it; an older arbsim never does).
         T.patchOk = (a as { patch?: unknown }).patch === true;
+        // ROW UPDATES: only to an arbsim that says it reads them.
+        T.updOk = (a as { upd?: unknown }).upd === true;
         base = gen;
       }
       T.ackGen = base;
@@ -2022,16 +2095,18 @@ export class TrigEntry {
     const n = (x: number) => x.toLocaleString('en-US');
     const d = this.settings.tableDelta && this.settings.tableQuiet && this.settings.tableFast && this.settings.tableLean;
     this.log(`[trig-entry] table 5 min: ${n(T.passes - W.passes)} passes, ${n(T.msgs - W.msgs)} messages (${n(T.fulls - W.fulls)} full), ${mb} MB` +
-      (d ? `; true delta on (patches ${T.patchOk ? 'on' : 'off: arbsim does not say it reads them, whole pools instead'}): rows ${n(T.tot.rows - W.rows)}, scores ${n(T.tot.scores - W.scores)}, whole pools ${n(T.tot.whole - W.whole)}, drift rows ${n(T.tot.driftRows - W.driftRows)} sent / ${n(T.delta.waiting)} waiting`
+      (d ? `; true delta on (patches ${T.patchOk ? 'on' : 'off: arbsim does not say it reads them, whole pools instead'}): rows ${n(T.tot.rows - W.rows)}, scores ${n(T.tot.scores - W.scores)}, whole pools ${n(T.tot.whole - W.whole)}, drift rows ${n(T.tot.driftRows - W.driftRows)} sent / ${n(T.delta.waiting)} waiting` +
+        // ROW UPDATES: drift rows sent as only their changed parts.
+        `; row updates ${this.settings.tableRowUpd ? (T.updOk ? `on: ${n(T.tot.upd - W.upd)} rows` : 'off: arbsim does not say it reads them') : 'off (TRIG_TABLE_ROW_UPDATE=0)'}`
         : '; true delta off (TRIG_TABLE_DELTA=0 or the quiet skip is off)'));
-    Object.assign(W, { at: now, passes: T.passes, msgs: T.msgs, bytes: T.bytes, fulls: T.fulls, whole: T.tot.whole, rows: T.tot.rows, scores: T.tot.scores, driftRows: T.tot.driftRows });
+    Object.assign(W, { at: now, passes: T.passes, msgs: T.msgs, bytes: T.bytes, fulls: T.fulls, whole: T.tot.whole, rows: T.tot.rows, scores: T.tot.scores, driftRows: T.tot.driftRows, upd: T.tot.upd });
   }
 
   // TRUE DELTA: one pool's change for arbsim (see tableDeltaOn), and the
   // record of what arbsim then holds (T.pools: the exact rows sent, and each
   // row's keys). undefined = nothing to send for this pool.
   private deltaPool(key: string, f: { rows: Array<Record<string, unknown>>; metas: Array<TableMeta | null>; d?: PoolD }, now: number, keepMeta: boolean,
-    ds: { whole: number; rows: number; scores: number; driftRows: number; waiting: number }, turn = false): unknown[] | TablePatch | undefined {
+    ds: { whole: number; rows: number; scores: number; driftRows: number; waiting: number; upd: number }, turn = false): unknown[] | TablePatch | undefined {
     const T = this.tbl;
     const old = T.pools.get(key);
     const newId = () => `${T.gen + 1}.${++T.seq}`;
@@ -2076,8 +2151,18 @@ export class TrigEntry {
     // all go together). Both follow the clock, not the number of passes.
     const drifting = driftRows.length + driftScores.length;
     const due = drifting > 0 && (turn || now - (old.syncAt ?? 0) >= this.settings.tableDeltaDriftMs * (0.5 + routeSpread(key, 1_000) / 2_000));
-    if (due) { rowsNow.push(...driftRows); scoresNow.push(...driftScores); }
-    if (!rowsNow.length && !scoresNow.length) { ds.waiting += drifting; return undefined; }
+    // (Rows that go because their structure changed; drift rows are counted apart.)
+    const structRows = rowsNow.length;
+    // ROW UPDATES (see tableRowUpdOn): a due drift row goes as only its
+    // changed parts when arbsim reads them; one that can't goes whole, as before.
+    const updNow: Array<[number, Record<string, unknown>]> = [];
+    if (due) {
+      if (T.patchOk && T.updOk && this.settings.tableRowUpd) {
+        for (const i of driftRows) { const u = rowUpdateOf(held[i], f.rows[i]); if (u) updNow.push([i, u]); else rowsNow.push(i); }
+      } else rowsNow.push(...driftRows);
+      scoresNow.push(...driftScores);
+    }
+    if (!rowsNow.length && !scoresNow.length && !updNow.length) { ds.waiting += drifting; return undefined; }
     // Older arbsim (no patches), or most of the pool anyway: the whole pool.
     if (!T.patchOk || rowsNow.length * 2 > f.rows.length) {
       ds.driftRows += drifting; // (any drift goes now, with the whole pool)
@@ -2085,6 +2170,8 @@ export class TrigEntry {
     }
     const rows = held.slice();
     const whole1 = new Set(rowsNow);
+    // (A row sent as an update carries its own score.)
+    for (const [i] of updNow) whole1.add(i);
     const pr: unknown[] = [];
     for (const i of rowsNow) {
       const oldId = held[i].e;
@@ -2112,12 +2199,26 @@ export class TrigEntry {
       // gets the newest candidate when it is kept.)
       if (keepMeta && typeof rows[i].e === 'string' && f.metas[i]) T.meta.set(rows[i].e as string, f.metas[i]!);
     }
+    // ROW UPDATES: each gets a new entry id (its check changed), and the bot's
+    // record becomes the fresh row, which is what arbsim holds after the merge.
+    const pu: unknown[] = [];
+    for (const [i, u] of updNow) {
+      const oldId = held[i].e;
+      if (typeof oldId === 'string' && oldId) T.retired.set(oldId, now);
+      const id = newId();
+      u.e = id;
+      if (keepMeta) T.meta.set(id, f.metas[i]!);
+      rows[i] = { ...f.rows[i], e: id };
+      pu.push(u);
+      od.cfs[i] = nd.cfs[i]; od.sks[i] = nd.sks[i]; od.pks[i] = nd.pks[i];
+    }
     const ids = rows.map((r) => r.e).filter((e): e is string => typeof e === 'string' && !!e);
     T.pools.set(key, { fp: '', rows, ids, d: od, syncAt: due ? now : old.syncAt });
-    ds.rows += rowsNow.length - (due ? driftRows.length : 0);
+    ds.rows += structRows;
     ds.scores += nScores;
+    ds.upd += pu.length;
     if (due) ds.driftRows += drifting;
-    return { ...(pr.length ? { r: pr } : {}), ...(nScores ? { s: ps } : {}) };
+    return { ...(pr.length ? { r: pr } : {}), ...(nScores ? { s: ps } : {}), ...(pu.length ? { u: pu } : {}) };
   }
 
   // First table taken / every refusal: said at once (not only in the
