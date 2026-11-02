@@ -228,6 +228,7 @@ import { trustFreshConfigFromEnv, wsTrustProblem, WsFacts } from './core/trustFr
 import { stallFinder, timed, timedAsync, formatStallLine, formatStallDetail, markStretch, labelled } from './core/stallFinder';
 import { FreezeProfiler } from './core/freezeProfile';
 import { FreezeNamer } from './core/freezeNamer';
+import { HeapSampler } from './core/heapSampler';
 import { groupsStartupPlan } from './core/groupsStartup';
 import { lenderFastOn, parseApprovedLenders, lenderCandidatesOld, lenderCandidatesFor } from './core/lenderPick';
 import { runSteps, drainSteps, writeJsonChunkedQueued, setSliceCap, SlicedQueue, TurnQueue } from './core/chunked';
@@ -288,6 +289,12 @@ if (!freezeNamer.running) {
             console.log(`[freeze-profile] on: a ${fp.s.seconds} s CPU profile after ${fp.s.count} freezes over ${fp.s.freezeMs} ms within ${fp.s.windowMs / 1000} s (at most every ${fp.s.everyMs / 60_000} min, newest ${fp.s.keep} kept in ${fp.s.dir})`);
       }
 }
+// HEAP SAMPLER (core/heapSampler.ts, Nov 2): idle until someone creates
+// data/heap-sample.request on the server; then samples which code makes the
+// most throwaway memory for 90 s (or the seconds written in the file) and
+// logs one "[heap-sampled]" line. HEAP_SAMPLER=0 = off. Measurement only.
+const heapSampler = new HeapSampler();
+if (heapSampler.start()) console.log(`[heap-sampled] ready: create ${heapSampler.s.requestFile} to sample allocations (HEAP_SAMPLER=0 turns it off)`);
 const cache = new PoolCache();
 const shadowLogger = new ShadowLogger();
 // Memory line every 5 min (core/memReport.ts; MEM_LOG=0 turns it off). Measurement only.
