@@ -130,8 +130,56 @@ export function buildLookupTiers(env: Record<string, string | undefined> = proce
 export const V4_LOOKUP_TIERS: V4Tier[] = buildLookupTiers();
 
 export function isStandardV4Tier(fee: number, tickSpacing: number): boolean {
+  if (ALLOC_LEAN_V4) return tierListed(STANDARD_V4_TIERS, fee, tickSpacing);
   return STANDARD_V4_TIERS.some(([f, t]) => f === fee && t === tickSpacing);
 }
+
+// ----------------------------------------------------------------------------
+// LEAN PRACTICE-ONLY CHECK (Nov 2, fix 12, ALLOC_LEAN, default on).
+//
+// Plain English:
+//   practiceOnlyReason is asked for every route of every pool on every
+//   candidate-table pass (tens of thousands of times a minute). The bot's
+//   own allocation sampler (core/heapSampler.ts) showed it making ~4.4 MB of
+//   throwaway memory every second, the most of any single function, which
+//   the clean-up (GC) then has to sweep. The memory came from three things
+//   that look free but are not:
+//     1. reading process.env (each read builds a brand-new text copy of the
+//        setting): 3 reads per call,
+//     2. the hook pattern written inside the function (a new pattern object
+//        every call),
+//     3. the small helper functions handed to .some() (a new one per call).
+//   Now: the 3 settings are read ONCE (the first time it is asked; the bot
+//   never changes them while running), the pattern is made once, and the
+//   lists are walked with a plain loop. Same answers for every pool (the
+//   test src/test/fix12Alloc.test.ts compares old and new on every case).
+//   Only the bot's own settings (process.env) are remembered; a settings
+//   object handed in (tests) is read every time, as before.
+//
+// Switch: ALLOC_LEAN=0 (read once at start) = exactly the old code.
+// ----------------------------------------------------------------------------
+export const ALLOC_LEAN_V4 = allocLeanOn(process.env);
+export function allocLeanOn(env: Record<string, string | undefined>): boolean {
+  const v = (env.ALLOC_LEAN ?? '1').trim().toLowerCase();
+  return v !== '0' && v !== 'off';
+}
+const HOOKLESS = /^0x0{40}$/i;   // (no g flag: .test() keeps no state between calls)
+function tierListed(list: readonly V4Tier[], fee: number, tickSpacing: number): boolean {
+  for (let i = 0; i < list.length; i++) { const x = list[i]; if (x[0] === fee && x[1] === tickSpacing) return true; }
+  return false;
+}
+// The bot's own 3 settings, read the first time they are needed.
+let envSnap: { eventsLive: string | undefined; extraLive: string | undefined; more: V4Tier[] } | null = null;
+function leanEnv(): { eventsLive: string | undefined; extraLive: string | undefined; more: V4Tier[] } {
+  if (envSnap === null) {
+    const e = process.env;
+    envSnap = { eventsLive: e.V4_EVENT_POOLS_LIVE, extraLive: e.RH_V4_EXTRA_LIVE, more: moreTiers(e) };
+  }
+  return envSnap;
+}
+// Tests only: forget the remembered settings.
+export function resetV4EnvSnapshot(): void { envSnap = null; }
+const offSetting = (x: string | undefined) => x === '0' || x === 'off';
 
 // Live send refuses these pools (practice only). Returns the reason, or null.
 // Hook-free V4 pools at a non-standard setting are live-tradable since the
@@ -140,6 +188,17 @@ export function isStandardV4Tier(fee: number, tickSpacing: number): boolean {
 export function practiceOnlyReason(pool: { v4?: { fee: number; tickSpacing: number; hooks?: string } }, env: Record<string, string | undefined> = process.env): string | null {
   const v = pool.v4;
   if (!v) return null;
+  if (ALLOC_LEAN_V4 && env === process.env) {
+    // LEAN (see above): same rules, same order, same texts.
+    if (!(!v.hooks || HOOKLESS.test(v.hooks))) return null;
+    const snap = leanEnv();
+    const listed = tierListed(STANDARD_V4_TIERS, v.fee, v.tickSpacing) || tierListed(EXTRA_V4_TIERS, v.fee, v.tickSpacing)
+      || tierListed(snap.more, v.fee, v.tickSpacing);
+    if (!listed && offSetting(snap.eventsLive)) return `Uniswap V4 pool found from events at an unlisted setting (${v.fee / 10_000}% / spacing ${v.tickSpacing}), practice only (V4_EVENT_POOLS_LIVE=0)`;
+    if (!offSetting(snap.extraLive)) return null;
+    if (!tierListed(STANDARD_V4_TIERS, v.fee, v.tickSpacing)) return `Uniswap V4 pool at a non-standard setting (${v.fee / 10_000}% / spacing ${v.tickSpacing}), practice only`;
+    return null;
+  }
   const hookless = !v.hooks || /^0x0{40}$/i.test(v.hooks);
   if (!hookless) return null;
   const off = (x: string | undefined) => x === '0' || x === 'off';

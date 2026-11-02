@@ -7,6 +7,7 @@ import { loopLag } from '../core/loopLag';
 import { stallFinder, markStretch } from '../core/stallFinder';
 import * as fs from 'fs';
 import { createHash } from 'crypto';
+import { allocLeanOn } from '../config/v4Tiers';
 import { eventFeePips } from '../core/eventFees';
 
 // SEEN LOG (Oct 24, owner approved): one short line per feed transaction
@@ -759,7 +760,8 @@ export type RouteRules<P> = {
   venueBlocked: (buy: P, sell: P) => string | null; // exchange not cleared for trading
 };
 export type EntryRoute<P> = { buy: P; sell: P; tokenIn: string; tokenOut: string; id: string };
-export function enumerateRoutes<P>(keys: string[], r: RouteRules<P>): Array<EntryRoute<P>> {
+export function enumerateRoutes<P>(keys: string[], r: RouteRules<P>, lean: boolean = ALLOC_LEAN_ROUTES): Array<EntryRoute<P>> {
+  if (lean) return enumerateRoutesLean(keys, r);
   const out: Array<EntryRoute<P>> = [];
   const seen = new Set<string>();
   const lc = (x: string) => (x ?? '').toLowerCase();
@@ -777,6 +779,52 @@ export function enumerateRoutes<P>(keys: string[], r: RouteRules<P>): Array<Entr
         const tokenOut = tokenIn === a ? b : a;
         for (const [buy, sell] of [[p, peer], [peer, p]] as Array<[P, P]>) {
           const id = routeId(r.addr(buy), r.addr(sell), start);
+          if (seen.has(id)) continue;
+          seen.add(id);
+          if (r.venueBlocked(buy, sell)) continue;
+          out.push({ buy, sell, tokenIn, tokenOut, id });
+        }
+      }
+    }
+  }
+  return out;
+}
+
+// LEAN ROUTE LIST (Nov 2, fix 12, ALLOC_LEAN, default on). Same routes, same
+// order, same ids as the loop above (the test src/test/fix12Alloc.test.ts
+// compares the two). It runs for every pool on every candidate-table pass;
+// the allocation sampler showed it making ~1.6 MB/s of throwaway memory. The
+// old loop lower-cased the same addresses and coins again for every partner
+// pool and start coin (a new text each time for a mixed-case address) and
+// made 3 small lists per partner pool and start coin just to walk the two
+// directions. Here each address / coin is lower-cased once per pool and the
+// two directions are a plain 0 / 1 loop. The route id is the same text
+// routeId() makes (both addresses and the start coin lower-cased).
+// ALLOC_LEAN=0 = the old loop.
+export const ALLOC_LEAN_ROUTES = allocLeanOn(process.env);
+function enumerateRoutesLean<P>(keys: string[], r: RouteRules<P>): Array<EntryRoute<P>> {
+  const out: Array<EntryRoute<P>> = [];
+  const seen = new Set<string>();
+  const lc = (x: string) => (x ?? '').toLowerCase();
+  const starts = r.startCoins.map(lc);
+  for (const k of keys) {
+    const p = r.pool(k);
+    if (!p) continue;
+    const ab = r.tokens(p);
+    const a = ab[0], b = ab[1];
+    if (!a || !b || !r.coinAllowed(a) || !r.coinAllowed(b)) continue;
+    const la = lc(a), lb = lc(b);
+    const pAddr = lc(r.addr(p));
+    for (const peer of r.peers(p)) {
+      const peerAddr = lc(r.addr(peer));
+      if (peerAddr === pAddr) continue;
+      for (const start of starts) {
+        if (la !== start && lb !== start) continue;
+        const tokenIn = la === start ? a : b;
+        const tokenOut = tokenIn === a ? b : a;
+        for (let dir = 0; dir < 2; dir++) {
+          const buy = dir === 0 ? p : peer, sell = dir === 0 ? peer : p;
+          const id = dir === 0 ? `${pAddr}>${peerAddr}:${start}` : `${peerAddr}>${pAddr}:${start}`;
           if (seen.has(id)) continue;
           seen.add(id);
           if (r.venueBlocked(buy, sell)) continue;

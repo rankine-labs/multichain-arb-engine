@@ -114,8 +114,8 @@ import type { ExecutorHop } from './execution/executorCalldata';
 import { RivalWatch } from './core/rivalWatch';
 import { V3BalanceBook, V3_BALANCES_FILE } from './core/v3BalanceBook';
 import { extraWatcherVenues, extraScanFactories, isExecutableVenue, canPracticeTestVenue, reportedVenueIds, venueShortName, setTestedVenuesLive } from './config/robinhoodVenues';
-import { practiceOnlyReason, V4_LOOKUP_TIERS } from './config/v4Tiers';
-import { LiveCoinRule } from './core/liveCoins';
+import { practiceOnlyReason, V4_LOOKUP_TIERS, ALLOC_LEAN_V4 } from './config/v4Tiers';
+import { LiveCoinRule, liveCoinBlockerLean } from './core/liveCoins';
 import { checkDeployedContract } from './execution/contractMatch';
 import { VenueTally } from './core/venueTally';
 // Practice-test a pool: exchanges we trade, plus extra venues that passed the
@@ -130,9 +130,34 @@ const canPracticeTest = (dex: string) => canPracticeTestVenue(dex);
 // Oct 17: plus the live coin rule (core/liveCoins.ts, no meme coins) for
 // Robinhood trades.
 let liveCoins: LiveCoinRule | null = null; // set once the Robinhood read node exists
+// LEAN LIVE RULE (Nov 2, fix 12, ALLOC_LEAN, default on). liveBlocker runs
+// for every route on every candidate-table pass and for every pool each
+// pass; the allocation sampler showed it (with practiceOnlyReason under it)
+// making ~7 MB/s of throwaway memory. The old body made, per call: two
+// empty objects ("buy ?? {}"), a list of the 4 coins, a filtered copy, a
+// lower-cased copy, a Set and a list from that Set. This does the same
+// checks in the same order without any of them:
+//   - practice-only pools: same function, same order (buy first, then sell),
+//   - live coin rule: each coin lower-cased, repeats skipped, asked in the
+//     same order (buy A, buy B, sell A, sell B) and stopping at the same
+//     first refused / unknown coin with the same text (so the background
+//     coin look-ups it starts are the same too),
+//   - rule switched off (LIVE_COIN_RULE not on): every coin is "allowed", so
+//     the answer is null without looking at the coins at all.
+// ALLOC_LEAN=0 = the old body (above).
+const NO_POOL: { v4?: undefined } = {};
+const liveBlockerLean = (buy: { v4?: any; chain?: string; tokenA?: string; tokenB?: string } | undefined,
+      sell: { v4?: any; chain?: string; tokenA?: string; tokenB?: string } | undefined): string | null => {
+      const po = practiceOnlyReason(buy ?? NO_POOL) ?? practiceOnlyReason(sell ?? NO_POOL);
+      if (po) return po;
+      return liveCoinBlockerLean(liveCoins, buy, sell);
+};
 const liveBlocker = (buy: { dex?: string; v4?: any; chain?: string; tokenA?: string; tokenB?: string } | undefined,
       sell: { dex?: string; v4?: any; chain?: string; tokenA?: string; tokenB?: string } | undefined): string | null => {
       if (!isExecutableVenue(buy?.dex ?? '') || !isExecutableVenue(sell?.dex ?? '')) return `exchange not cleared for trading (${buy?.dex} / ${sell?.dex})`;
+      // LEAN (fix 12, ALLOC_LEAN; see liveBlockerLean above): same answers,
+      // without the throwaway objects / lists / sets made on every call.
+      if (ALLOC_LEAN_V4) return liveBlockerLean(buy, sell);
       const po = practiceOnlyReason(buy ?? {}) ?? practiceOnlyReason(sell ?? {});
       if (po) return po;
       if (liveCoins && (buy?.chain === 'robinhood' || sell?.chain === 'robinhood')) {
@@ -229,6 +254,7 @@ import { stallFinder, timed, timedAsync, formatStallLine, formatStallDetail, mar
 import { FreezeProfiler } from './core/freezeProfile';
 import { FreezeNamer } from './core/freezeNamer';
 import { HeapSampler } from './core/heapSampler';
+import { takeSenderCacheStats } from './chains/nitroFeed';
 import { groupsStartupPlan } from './core/groupsStartup';
 import { lenderFastOn, parseApprovedLenders, lenderCandidatesOld, lenderCandidatesFor } from './core/lenderPick';
 import { runSteps, drainSteps, writeJsonChunkedQueued, setSliceCap, SlicedQueue, TurnQueue } from './core/chunked';
@@ -1856,8 +1882,10 @@ const pickLender = (
       // More of the route's own pools a lender may not be (loops: every pool after the first two).
       extraExclude: string[] = [],
 ) => {
-      const exclude = [buyPool.poolAddress, sellPool.poolAddress, ...extraExclude];
-      if (chain !== 'robinhood') return pickV3Lender(lenderCandidatesTok(chain, tokenIn), tokenIn, exclude);
+      // (fix 12: the list of pools a lender may not be is made only where a
+      // lender is really looked for; own-money trades return before needing
+      // it. Same list, same contents.)
+      if (chain !== 'robinhood') return pickV3Lender(lenderCandidatesTok(chain, tokenIn), tokenIn, [buyPool.poolAddress, sellPool.poolAddress, ...extraExclude]);
       // Own money for trades up to OWN_MONEY_MAX_USD ($2,000); bigger trades
       // borrow from the cheapest lender (0.01% pool) so the big wins aren't
       // limited by our own pot (~$1,000 USDG + $300 WETH planned).
@@ -1876,7 +1904,7 @@ const pickLender = (
       const amount = dec === undefined ? null : loanUnits(tradeSizeUsd, usdPerToken, dec);
       // Unknown amount or no balances read yet: no lender (own-capital check instead).
       if (amount === null || !lenderBalances.lastRefreshMs) return null;
-      return pickV3Lender(lenderCandidatesTok(chain, tokenIn), tokenIn, exclude, (pool, token) => lenderBalances.canLend(pool, token, amount, LENDER_HEADROOM));
+      return pickV3Lender(lenderCandidatesTok(chain, tokenIn), tokenIn, [buyPool.poolAddress, sellPool.poolAddress, ...extraExclude], (pool, token) => lenderBalances.canLend(pool, token, amount, LENDER_HEADROOM));
 };
 
 // Loan fee (bps) the Robinhood check would pay for tokenIn: the cheapest
@@ -5631,7 +5659,7 @@ for (let i = 0; i < resolved.length; i++) {
             void freezeNamer.report('5 min').catch(() => undefined);
             // Rival watch sender look-ups (signature checks) done vs skipped, last 5 min.
             const rs = rivalWatch.takeSenderStats();
-            console.log(`[rivalwatch] sender checks (5 min): ${rs.looked} done · skipped: ${rs.knownBot} known bot, ${rs.noOwners} no bot wallets known, ${rs.neverBot} router/pool/coin, ${rs.coinMove} coin transfer/approval, ${rs.dupOrFull} already queued, ${rs.overCap} over the ${process.env.RIVAL_SENDER_MAX_PER_SEC ?? 40}/s limit`);
+            console.log(`[rivalwatch] sender checks (5 min): ${rs.looked} done · skipped: ${rs.knownBot} known bot, ${rs.noOwners} no bot wallets known, ${rs.neverBot} router/pool/coin, ${rs.coinMove} coin transfer/approval, ${rs.dupOrFull} already queued, ${rs.overCap} over the ${process.env.RIVAL_SENDER_MAX_PER_SEC ?? 40}/s limit${(() => { const sc = takeSenderCacheStats(); return sc.on ? ` · senders worked out ${sc.recovered}, from memory ${sc.hits}` : ''; })()}`);
       }), 5 * 60_000);
       // Watch list size every 15 min (shown on the GitHub status page).
       setInterval(labelled('watch list log', () => {
