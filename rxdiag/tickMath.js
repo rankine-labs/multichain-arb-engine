@@ -37,6 +37,7 @@ exports.compressTick = compressTick;
 exports.wordOf = wordOf;
 exports.ticksInWord = ticksInWord;
 exports.wordsRange = wordsRange;
+exports.v4SwapFeePips = v4SwapFeePips;
 exports.MIN_TICK = -887272;
 exports.MAX_TICK = 887272;
 exports.MIN_SQRT_RATIO = 4295128739n;
@@ -241,4 +242,19 @@ function wordsRange(firstWord, lastWord, tickSpacing) {
         lo: Math.max(exports.MIN_TICK, firstWord * 256 * tickSpacing),
         hi: Math.min(exports.MAX_TICK, ((lastWord + 1) * 256 - 1) * tickSpacing),
     };
+}
+// V4 PROTOCOL FEE (Nov 2 finding). Plain English: Uniswap V4 can charge a
+// small extra "protocol" fee on top of the pool's own (LP) fee. On Robinhood
+// Chain it is switched on for the V4 pools we checked: 0.05% to 0.10% per
+// trade (StateView getSlot0 shows it as protocolFee). The bot only charged
+// the LP fee, so every V4 guess was 0.05-0.10% too high per pool hop.
+// protocolFee packs both directions in 12 bits each: the low 12 bits for
+// token0-in trades, the high 12 bits for token1-in trades. The total fee is
+// Uniswap's ProtocolFeeLibrary.calculateSwapFee:
+//   protocol + lp - protocol * lp / 1,000,000 (rounded down).
+function v4SwapFeePips(lpFee, protocolFee, zeroForOne) {
+    const pf = zeroForOne ? protocolFee & 0xfff : (protocolFee >> 12) & 0xfff;
+    if (pf === 0)
+        return lpFee;
+    return pf + lpFee - Math.floor((pf * lpFee) / 1000000);
 }
