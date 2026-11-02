@@ -15,7 +15,7 @@ import { basename, join } from 'path';
 //   freezes.
 //
 //   This file keeps Node's built-in CPU profiler running in short pieces
-//   (FREEZE_NAMER_CHUNK_S, default 10 s; the profiler itself is never
+//   (FREEZE_NAMER_CHUNK_S, default 4 s; the profiler itself is never
 //   stopped in between, see start()). Every piece is cut out of the
 //   profiler, and ONLY the samples that fall inside a freeze the stall
 //   finder saw are kept. Everything outside a freeze is thrown away. So the
@@ -42,7 +42,7 @@ import { basename, join } from 'path';
 //   freezes (data/profiles/freeze-named-<time>.json, newest 48 kept).
 //
 // Cost: the profiler samples the stack ~1,000 times a second (a few % of
-// one core); cutting a piece every 10 s takes about 1 ms (timed by the stall
+// one core); cutting a piece every 4 s takes about 1 ms (timed by the stall
 // finder as "freeze namer cut", so if it ever causes a freeze, it is named
 // too). It stops by itself after FREEZE_NAMER_MINUTES (default 120) so it
 // never runs forever. Measurement only: it never changes a trade.
@@ -53,7 +53,7 @@ import { basename, join } from 'path';
 
 export type FreezeNamerSettings = {
   enabled: boolean;     // FREEZE_NAMER [1]
-  chunkMs: number;      // FREEZE_NAMER_CHUNK_S [10] profiler is cut and restarted this often
+  chunkMs: number;      // FREEZE_NAMER_CHUNK_S [4] profiler is cut and restarted this often
   intervalUs: number;   // FREEZE_NAMER_INTERVAL_US [1000] how often the profiler looks (microseconds)
   minutes: number;      // FREEZE_NAMER_MINUTES [120] stop by itself after this long (0 = never)
   minFreezeMs: number;  // FREEZE_NAMER_MS [50] freezes shorter than this are ignored
@@ -71,7 +71,9 @@ export function freezeNamerSettings(env: Record<string, string | undefined> = pr
   const sw = (env.FREEZE_NAMER ?? '1').trim().toLowerCase();
   return {
     enabled: sw !== '0' && sw !== 'off' && sw !== 'false',
-    chunkMs: num('FREEZE_NAMER_CHUNK_S', 10, 2, 120) * 1_000,
+    // 4 s (was 10 s): on the bot, reading one 10 s piece itself took up to
+    // 172 ms (7 small freezes in 35 min, Nov 2); smaller pieces = shorter reads.
+    chunkMs: num('FREEZE_NAMER_CHUNK_S', 4, 2, 120) * 1_000,
     intervalUs: Math.round(num('FREEZE_NAMER_INTERVAL_US', 1_000, 100, 20_000)),
     minutes: num('FREEZE_NAMER_MINUTES', 120, 0, 7 * 24 * 60),
     minFreezeMs: num('FREEZE_NAMER_MS', 50, 1, 60_000),

@@ -270,7 +270,7 @@ stallFinder.start();
 // FREEZE PROFILE (core/freezeProfile.ts, Oct 23): after repeated long
 // freezes, a 5 s CPU profile is recorded (at most every 30 min) and its top
 // 10 functions logged as one "[freeze-profile]" line. FREEZE_PROFILE=0 = off.
-// FREEZE NAMER (core/freezeNamer.ts, Nov 2): the profiler runs in 10 s
+// FREEZE NAMER (core/freezeNamer.ts, Nov 2): the profiler runs in 4 s
 // pieces and only the samples inside each freeze are kept, so every freeze
 // gets a name (step + function), even the ones listed as "other". One
 // "[freeze-named]" line every 5 min. Stops by itself after 120 min
