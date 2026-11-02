@@ -164,6 +164,7 @@ pub fn parse_kind(s: &str) -> Option<PoolKind> {
         "pancake-v3" | "pancakev3" | "pancake" => PoolKind::PancakeV3,
         "algebra" | "algebra-integral" => PoolKind::Algebra,
         "v4" | "uniswap-v4" | "univ4" => PoolKind::V4,
+        "slipstream" | "velodrome-cl" | "aerodrome-cl" => PoolKind::Slipstream,
         _ => return None,
     })
 }
@@ -176,7 +177,49 @@ pub fn kind_name(k: PoolKind) -> &'static str {
         PoolKind::PancakeV3 => "pancake-v3",
         PoolKind::Algebra => "algebra",
         PoolKind::V4 => "v4",
+        PoolKind::Slipstream => "slipstream",
     }
+}
+
+/// (Nov 2) Is this copy-2 follow flag on? ("1", "on", "true", "yes").
+/// Read from the environment every time (cheap; a track message is rare),
+/// so a flag set in .env takes effect at the next restart, and tests can
+/// set it per test.
+pub fn follow_flag(name: &str) -> bool {
+    std::env::var(name).map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "on" | "true" | "yes")).unwrap_or(false)
+}
+
+/// (Nov 2) Why the copy refuses this pool kind right now (its flag is off),
+/// or None when it may be followed. The bot only sends these kinds when the
+/// same flags are on in .env (one .env for both); this is the second lock.
+///   - V4 with a hook: ARBSIM_COPY2_FOLLOW_HOOKED_V4
+///   - Slipstream (UP CL / Raphael): ARBSIM_COPY2_FOLLOW_UPCL or _RAPHAEL
+pub fn kind_refused(p: &TrackedPool) -> Option<&'static str> {
+    if p.is_hooked_v4() && !follow_flag("ARBSIM_COPY2_FOLLOW_HOOKED_V4") {
+        return Some("V4 pool with a hook (ARBSIM_COPY2_FOLLOW_HOOKED_V4 off)");
+    }
+    if p.kind == PoolKind::Slipstream && !(follow_flag("ARBSIM_COPY2_FOLLOW_UPCL") || follow_flag("ARBSIM_COPY2_FOLLOW_RAPHAEL")) {
+        return Some("Slipstream pool (ARBSIM_COPY2_FOLLOW_UPCL / _RAPHAEL off)");
+    }
+    None
+}
+
+/// A list of addresses from a track field (absent = empty). At most 8
+/// (a pool watches a hook, or a factory + 2 fee modules + a gauge).
+fn addr_list(p: &Value, k: &str) -> Result<Vec<Address>, String> {
+    let Some(v) = p.get(k) else { return Ok(Vec::new()) };
+    let arr = v.as_array().ok_or(format!("{k} must be a list"))?;
+    if arr.len() > 8 {
+        return Err(format!("{k}: too many addresses"));
+    }
+    let mut out = Vec::new();
+    for x in arr {
+        let a = parse_address(x.as_str().ok_or(format!("{k}: address expected"))?)?;
+        if a != Address::ZERO && !out.contains(&a) {
+            out.push(a);
+        }
+    }
+    Ok(out)
 }
 
 fn num(v: Option<&Value>) -> Option<u64> {
@@ -209,7 +252,15 @@ pub fn parse_track(v: &Value) -> Result<(Vec<TrackedPool>, Vec<(Address, Balance
             if (kind == PoolKind::V4) != v4_id.is_some() {
                 return Err("v4Id must be given for (and only for) kind v4".into());
             }
-            Ok(TrackedPool {
+            // (Nov 2) hooked V4 / Slipstream extras (absent = the old kinds).
+            let hooks = match p.get("hooks").and_then(|x| x.as_str()) {
+                Some(h) => parse_address(h)?,
+                None => Address::ZERO,
+            };
+            if hooks != Address::ZERO && kind != PoolKind::V4 {
+                return Err("hooks only for kind v4".into());
+            }
+            let tp = TrackedPool {
                 address: parse_address(s("address")?)?,
                 v4_id,
                 kind,
@@ -217,7 +268,22 @@ pub fn parse_track(v: &Value) -> Result<(Vec<TrackedPool>, Vec<(Address, Balance
                 token1: parse_address(s("token1")?)?,
                 fee: num(p.get("fee")).unwrap_or(0) as u32,
                 tick_spacing: p.get("tickSpacing").and_then(|x| x.as_i64()).unwrap_or(0) as i32,
-            })
+                hooks,
+                watch: addr_list(p, "watch")?,
+                reload_on: addr_list(p, "reloadOn")?,
+            };
+            // A hooked pool must watch its hook (its storage is read by
+            // every swap; never held without following its events).
+            if tp.is_hooked_v4() && !tp.watch.contains(&hooks) {
+                return Err("a hooked V4 pool must watch its hook".into());
+            }
+            if tp.watch.contains(&tp.address) || tp.reload_on.contains(&tp.address) {
+                return Err("a pool can't watch itself".into());
+            }
+            if let Some(why) = kind_refused(&tp) {
+                return Err(why.into());
+            }
+            Ok(tp)
         })();
         match one {
             Ok(tp) => out.push(tp),
@@ -298,6 +364,19 @@ pub type PoolKey = (Address, Option<B256>);
 
 pub fn key_of(p: &TrackedPool) -> PoolKey {
     (p.address, p.v4_id)
+}
+
+/// Same pool details (a pool whose details changed is treated as new).
+/// (Nov 2) The hook and the watched / reload accounts count too.
+fn same_pool(o: &TrackedPool, p: &TrackedPool) -> bool {
+    o.kind == p.kind
+        && o.token0 == p.token0
+        && o.token1 == p.token1
+        && o.fee == p.fee
+        && o.tick_spacing == p.tick_spacing
+        && o.hooks == p.hooks
+        && o.watch == p.watch
+        && o.reload_on == p.reload_on
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -413,6 +492,18 @@ pub struct Registry {
     /// false = the old behaviour: loaded with each V4 pool and changed only
     /// by transfers that also involve another followed pool = stale).
     pub pm_bound: bool,
+    /// (Nov 2) WATCHED account -> the pools that watch it (TrackedPool::
+    /// watch: a V4 hook, a Slipstream factory / fee module). Rebuilt with
+    /// the index.
+    pub watched: HashMap<Address, Vec<PoolKey>>,
+    /// (Nov 2) Account whose events reload pools -> those pools
+    /// (TrackedPool::reload_on: a Slipstream gauge).
+    pub reloaders: HashMap<Address, Vec<PoolKey>>,
+    /// (Nov 2) Watched accounts with an event not yet checked against the
+    /// node: account -> first block of the unchecked event(s). Checks
+    /// touching the account at that block or later answer "unknown"
+    /// (checkcore pending) until the check (watch verify) is done.
+    pub watch_pending: HashMap<Address, u64>,
 }
 
 impl Registry {
@@ -420,8 +511,16 @@ impl Registry {
         self.by_addr.clear();
         self.holders.clear();
         self.owner_of.clear();
+        self.watched.clear();
+        self.reloaders.clear();
         for (k, e) in &self.pools {
             self.by_addr.entry(k.0).or_default().push(*k);
+            for w in &e.pool.watch {
+                self.watched.entry(*w).or_default().push(*k);
+            }
+            for w in &e.pool.reload_on {
+                self.reloaders.entry(*w).or_default().push(*k);
+            }
             // A V4 PoolManager's coin balances are moved by every V4 pool on
             // the chain: never followed (see C2Config.pm_bound).
             let follows_coins = !(self.pm_bound && e.pool.kind == PoolKind::V4);
@@ -442,6 +541,11 @@ impl Registry {
             Some(Some(l)) => Some(l.key(holder)),
             _ => self.pair_slots.get(&(coin, holder)).copied(),
         }
+    }
+
+    /// (Nov 2) Is `a` a watched account (see `watched`)?
+    pub fn is_watched(&self, a: &Address) -> bool {
+        self.watched.contains_key(a)
     }
 
     /// Is `a` a V4 PoolManager we follow pools in?
@@ -668,6 +772,17 @@ c2counters!(
     pm_far_deferred, fills_yielded,
     // Held values forgotten (not re-read) on a big warm restart (ARBSIM_COPY2_RESUME_VERIFY_MAX).
     resume_forgotten,
+    // ---- (Nov 2) hooked V4 / Slipstream: watched accounts ----
+    // Accounts newly watched (their earlier values forgotten); events of
+    // watched accounts seen (live + late); checks of a watched account's
+    // held values against the node after its events (verify jobs sent,
+    // values read, values that had CHANGED and were replaced); values of a
+    // watched account a fill / walk brought that were older than its last
+    // event (dropped, read again); pools reloaded because an account in
+    // their reload list (a Slipstream gauge) had an event; pools made unsure
+    // because a watched account changed earlier in the same block.
+    watch_accounts_added, watch_events, watch_verifies, watch_verify_items, watch_changed,
+    watch_stale_dropped, watch_reloads, watch_same_block_unsure,
 );
 
 fn inc(c: &AtomicU64) {
@@ -1777,6 +1892,22 @@ impl Copy2Handle {
             v.sort_by(|x, y| y.1.cmp(&x.1).then(x.0.cmp(&y.0)));
             v.into_iter().take(20).map(|((a, sl), n)| json!([to_hex(a.as_slice()), format!("{sl:#x}"), n])).collect()
         };
+        // (Nov 2) Followed pools per kind ("v4-hooked" = V4 with a hook):
+        // [followed, ready, loading, unsure].
+        let by_kind: Value = {
+            let mut m: BTreeMap<String, [u64; 4]> = BTreeMap::new();
+            for e in reg.pools.values() {
+                let k = if e.pool.is_hooked_v4() { "v4-hooked".to_string() } else { kind_name(e.pool.kind).to_string() };
+                let c = m.entry(k).or_default();
+                c[0] += 1;
+                match e.state {
+                    PoolState::Ready => c[1] += 1,
+                    PoolState::Loading => c[2] += 1,
+                    PoolState::Unsure => c[3] += 1,
+                }
+            }
+            json!(m)
+        };
         let mut out = json!({
             "source": "pool-events",
             "pools": reg.pools.len(),
@@ -1806,6 +1937,11 @@ impl Copy2Handle {
             "checks": checks_v,
             "poolCoverage": coverage_v,
             "pendingPools": reg.pools.values().filter(|e| e.pending_from.is_some()).count(),
+            // (Nov 2) Followed pools per kind ("v4-hooked" = V4 with a hook):
+            // [followed, ready, loading, unsure]; and the watched accounts
+            // (hooks / Slipstream factory + fee modules) and gauges.
+            "byKind": by_kind,
+            "watched": { "accounts": reg.watched.len(), "pending": reg.watch_pending.len(), "reloadAccounts": reg.reloaders.len() },
             // The 20 accounts with the most missed items (class, account, count).
             "missesTop": misses_top,
             "missesTopSlots": misses_top_slots,
@@ -2145,6 +2281,8 @@ enum JobFor {
     PoolCatchUp { key: PoolKey, gen: u64 },
     /// Warm hot targets' values (copy2/warm.rs).
     Warm { items: Vec<MissItem> },
+    /// (Nov 2) A watched account's held values read again after its event(s).
+    WatchVerify { addr: Address },
 }
 
 /// A ready pool the bot stopped listing (see on_track "parking"): what the
@@ -2278,6 +2416,18 @@ pub struct Intake {
     touched_addr: HashMap<Address, u64>,
     /// Last block a coin transfer changed this (coin, slot).
     touched_slot: HashMap<(Address, U256), u64>,
+    /// (Nov 2) WATCHED ACCOUNTS (TrackedPool::watch). Last block with an
+    /// event of each (values of it read from the node at an older block
+    /// are dropped, see on_fill), ...
+    watch_last_event: HashMap<Address, u64>,
+    /// ... the accounts whose verify job is out (one at a time each), ...
+    watch_busy: HashSet<Address>,
+    /// ... when an account's verify may be sent again after a node error, ...
+    watch_retry_at: HashMap<Address, Instant>,
+    /// ... and the watched accounts with an event in the block being applied
+    /// (a pool event after it in the same block makes that pool unsure:
+    /// the values it would need are those in the middle of the block).
+    watch_in_block: HashSet<Address>,
     basefee: u64,
     last_tip: Option<Instant>,
     last_evict: Instant,
@@ -2434,6 +2584,10 @@ pub fn manual(sh: Arc<Shared>, fills: Arc<FillQueue>, cfg: C2Config) -> (Intake,
         coin_ok: HashSet::new(),
         touched_addr: HashMap::new(),
         touched_slot: HashMap::new(),
+        watch_last_event: HashMap::new(),
+        watch_busy: HashSet::new(),
+        watch_retry_at: HashMap::new(),
+        watch_in_block: HashSet::new(),
         basefee: 0,
         last_tip: None,
         last_evict: Instant::now(),
@@ -2718,6 +2872,7 @@ impl Intake {
             self.dispatch_walks();
             self.dispatch_settle();
             self.dispatch_verify();
+            self.dispatch_watch_verify();
             self.dispatch_fast_verify();
             self.dispatch_warm();
             self.maybe_save();
@@ -2757,10 +2912,7 @@ impl Intake {
             // Dropped pools, or pools whose details changed (treated as new).
             let old_keys: Vec<PoolKey> = reg.pools.keys().copied().collect();
             for k in old_keys {
-                let same = new.get(&k).is_some_and(|p| {
-                    let o = &reg.pools[&k].pool;
-                    o.kind == p.kind && o.token0 == p.token0 && o.token1 == p.token1 && o.fee == p.fee && o.tick_spacing == p.tick_spacing
-                });
+                let same = new.get(&k).is_some_and(|p| same_pool(&reg.pools[&k].pool, p));
                 if !same {
                     gone.push(reg.pools.remove(&k).unwrap());
                 }
@@ -2772,9 +2924,11 @@ impl Intake {
                 // Listed again after being parked: catch it up from its own
                 // reports instead of loading it (see park / resume below).
                 if let Some(pk) = self.parked.remove(&k) {
-                    let o = &pk.entry.pool;
-                    let same = o.kind == p.kind && o.token0 == p.token0 && o.token1 == p.token1 && o.fee == p.fee && o.tick_spacing == p.tick_spacing;
-                    if same && !pk.late_seen {
+                    let same = same_pool(&pk.entry.pool, &p);
+                    // (Nov 2) Hooked V4 / Slipstream pools are never resumed
+                    // from parking: their watched accounts' values were not
+                    // followed while parked. They load normally.
+                    if same && !pk.late_seen && !p.is_new_kind() {
                         let mut e = pk.entry.clone();
                         e.state = PoolState::Loading;
                         e.busy = true;
@@ -2820,7 +2974,30 @@ impl Intake {
                     },
                 );
             }
+            let watched_before: HashSet<Address> = reg.watched.keys().copied().collect();
             reg.rebuild_index();
+            // (Nov 2) Newly watched accounts: whatever the copy held of them
+            // before (a check's fill, re-read only about once a minute) was
+            // not followed: forget it, so every value held from now on was
+            // read while its events are followed. Accounts no longer watched
+            // lose their pending mark (their values become ordinary fills).
+            let fresh: Vec<Address> = reg.watched.keys().filter(|a| !watched_before.contains(*a)).copied().collect();
+            let still: HashSet<Address> = reg.watched.keys().copied().collect();
+            reg.watch_pending.retain(|a, _| still.contains(a));
+            self.watch_last_event.retain(|a, _| still.contains(a));
+            drop(reg);
+            if !fresh.is_empty() {
+                add(&self.c2.stats.watch_accounts_added, fresh.len() as u64);
+                let mut p = crate::timing::TimedWrite::new(&self.sh.published);
+                rewrite_from(&mut p.versions, 0, |s| {
+                    for a in &fresh {
+                        let slots: Vec<U256> = s.accounts.get(a).map(|x| x.storage.keys().copied().collect()).unwrap_or_default();
+                        for sl in slots {
+                            forget_slot(s, *a, sl);
+                        }
+                    }
+                });
+            }
         }
         if added > 0 && self.round.is_none() {
             self.outcomes = Outcomes::default();
@@ -2983,12 +3160,30 @@ impl Intake {
         ov.set_position(StatePosition { base_block: m.block, after_seq: None });
         add(&st.logs, logs.len() as u64);
         let mut touched: Vec<PoolKey> = Vec::new();
+        self.watch_in_block.clear();
         for log in &logs {
             let mut used = false;
+            // (Nov 2) An event of a watched account (a hook, a Slipstream
+            // factory / fee module) or of a reload account (a gauge).
+            if self.on_outside_log(Some(&mut ov), log, m.block) {
+                used = true;
+            }
             for k in self.pool_keys_for(log) {
                 used = true;
                 touched.push(k);
                 self.touched_addr.insert(log.address, m.block);
+                // (Nov 2) A watched account of this pool changed earlier in
+                // this same block: the values its replay would read are the
+                // ones in the middle of the block (no node can give those).
+                // The pool reloads at a later block instead (never a guess).
+                if !self.watch_in_block.is_empty() {
+                    let hit = self.c2.reg.read().unwrap().pools.get(&k).is_some_and(|e| e.state == PoolState::Ready && e.pool.watch.iter().any(|w| self.watch_in_block.contains(w)));
+                    if hit {
+                        inc(&self.c2.stats.watch_same_block_unsure);
+                        self.make_unsure_with(k, "a contract it reads (hook / fee module) changed earlier in the same block", Some(&mut ov), m.block, false);
+                        continue;
+                    }
+                }
                 self.apply_ready_event(&mut ov, k, log, &rctx);
             }
             if self.apply_coin_transfer(&mut ov, log, (m.block, log.tx_index, log.log_index), false) {
@@ -3143,6 +3338,19 @@ impl Intake {
         let mut touched: Vec<PoolKey> = Vec::new();
         for log in &added {
             let pos: Pos = (n, log.tx_index, log.log_index);
+            // (Nov 2) A late event of a watched / reload account: pending
+            // from block n (watched) or reload from n (gauge). A watcher
+            // still loading may have carried past n with older values of
+            // it: that load starts over.
+            if self.on_outside_log(None, log, n) {
+                let loading: Vec<PoolKey> = {
+                    let reg = self.c2.reg.read().unwrap();
+                    reg.watched.get(&log.address).map(|ks| ks.iter().filter(|k| self.partials.contains_key(*k)).copied().collect()).unwrap_or_default()
+                };
+                for k in loading {
+                    self.make_unsure_with(k, "a contract it reads changed in a block its load had passed (late report)", None, n, false);
+                }
+            }
             for k in self.pool_keys_for(log) {
                 touched.push(k);
                 let t = self.touched_addr.entry(log.address).or_insert(0);
@@ -4175,6 +4383,7 @@ impl Intake {
             (JobFor::ResumeVerify, Done::Fetch { id, block, res }) => self.on_resume_verify(id, block, res),
             (JobFor::PoolCatchUp { key, gen }, Done::CatchUp { res, .. }) => self.on_pool_catchup(key, gen, res),
             (JobFor::Warm { items }, Done::Fetch { block, res, .. }) => self.on_warm(items, block, res),
+            (JobFor::WatchVerify { addr }, Done::Fetch { block, res, .. }) => self.on_watch_verify(addr, block, res),
             _ => {}
         }
     }
@@ -4711,10 +4920,36 @@ impl Intake {
         let blocks: Vec<(u64, ReplayCtx, Arc<Vec<PoolLog>>)> = self.buf.iter().skip(start).map(|b| (b.block, b.rctx, b.logs.clone())).collect();
         for (block, rctx, logs) in blocks {
             part.ov.set_position(StatePosition { base_block: block, after_seq: None });
+            // (Nov 2) A watched account changed in this block (see
+            // on_outside_log): the pool's own event after it in the SAME
+            // block would need mid-block values: start the load over.
+            let mut watched_here = false;
             for log in logs.iter() {
                 let pos = (block, log.tx_index, log.log_index);
                 if pos < part.cursor {
                     continue;
+                }
+                // (Nov 2) Its gauge (reload account) changed the pool after
+                // the values were read: start over from a newer block.
+                if pool.reload_on.contains(&log.address) {
+                    self.retry_later(key, part.gen, "its gauge changed the pool while it was loading");
+                    return;
+                }
+                // (Nov 2) A watched account changed after its values were
+                // read: what the working copy holds of it is older than the
+                // change. Forget it (read again when needed, at a later
+                // block).
+                if pool.watch.contains(&log.address) {
+                    let held: Vec<U256> = part.ov.snapshot().accounts.get(&log.address).map(|x| x.storage.keys().copied().collect()).unwrap_or_default();
+                    for sl in held {
+                        part.ov.forget_slot(log.address, sl);
+                    }
+                    watched_here = true;
+                    continue;
+                }
+                if watched_here && is_pool_event(&pool, log) {
+                    self.retry_later(key, part.gen, "a contract it reads changed earlier in the same block while it was loading");
+                    return;
                 }
                 if is_pool_event(&pool, log) {
                     inc(&self.c2.stats.carried_events);
@@ -5233,7 +5468,7 @@ impl Intake {
                     continue;
                 }
                 for k in reg.by_addr.get(holder).cloned().unwrap_or_default() {
-                    if reg.pools.get(&k).is_some_and(|e| matches!(e.pool.kind, PoolKind::V3 | PoolKind::PancakeV3 | PoolKind::Algebra)) {
+                    if reg.pools.get(&k).is_some_and(|e| matches!(e.pool.kind, PoolKind::V3 | PoolKind::PancakeV3 | PoolKind::Algebra | PoolKind::Slipstream)) {
                         sus.insert(k);
                     }
                 }
@@ -5533,6 +5768,22 @@ impl Intake {
                         }
                     }
                 }
+                if let Fetched::Slot(a, _, _) = &f {
+                    // (Nov 2) A watched account's value read at block k: only
+                    // if no event of it came after k and none is unchecked
+                    // (else it may be older than the change): asked again.
+                    // Otherwise kept like any fill; from now on its events
+                    // keep it exact (see on_outside_log).
+                    if reg.is_watched(a) {
+                        if reg.watch_pending.contains_key(a) || self.watch_last_event.get(a).is_some_and(|b| *b > k) {
+                            inc(&self.c2.stats.watch_stale_dropped);
+                            again.push(it);
+                            continue;
+                        }
+                        good.push(f);
+                        continue;
+                    }
+                }
                 if let Fetched::Slot(a, s, v) = &f {
                     // V4 BLIND SPOT fix (b) (Oct 25, copy2/v4blind.rs): a
                     // tick / tick-map word of ONE of our V4 pools, beyond its
@@ -5770,7 +6021,8 @@ impl Intake {
         // Our own made-up accounts (Algebra replay notes): not on the chain.
         let notes: HashSet<Address> = reg.pools.values().map(|e| super::replay::notes_address(e.pool.address)).collect();
         for (a, acct) in head.accounts.iter() {
-            if reg.by_addr.contains_key(a) || reg.owner_of.contains_key(a) || reg.is_pm(a) || self.sh.volatile.is_whole(a) || notes.contains(a) {
+            // (Nov 2) Watched accounts are followed by their own events.
+            if reg.by_addr.contains_key(a) || reg.owner_of.contains_key(a) || reg.is_pm(a) || reg.is_watched(a) || self.sh.volatile.is_whole(a) || notes.contains(a) {
                 continue;
             }
             let ours: HashSet<U256> = reg.holders.get(a).map(|h| h.iter().filter_map(|x| reg.bal_slot(*a, *x)).collect()).unwrap_or_default();
@@ -6081,6 +6333,169 @@ impl Intake {
     /// of each value). E.g. WETH's totalSupply (slot 0x35) moves with every
     /// wrap / unwrap on the chain and is refreshed each round; a stock
     /// coin's settings should never show up here.
+    // ---- (Nov 2) watched accounts and reload accounts ----
+    //
+    // Plain English:
+    //   A hooked V4 pool's swap asks its HOOK for the fee; a Slipstream
+    //   pool's swap asks its FACTORY and fee modules. Those contracts are
+    //   changed by their owners' transactions, which emit THEIR events but
+    //   no pool event. Probe (Nov 2, scripts/copy2/probe-follow-events.cjs,
+    //   600k blocks): every change of the hook values a Fables swap reads
+    //   came with an event of the hook in the same block range (7 of 7 and
+    //   2 of 2, none without), and swaps never write them (0 of 20).
+    //   So the bot subscribes to every event of these "watched" accounts and
+    //   passes them on with the pool reports. On such an event at block b:
+    //     1. the account is PENDING from b: every check touching it at b or
+    //        later answers "unknown" (checkcore pending, never a guess);
+    //     2. the values the copy holds of it are read again from the node AT
+    //        the newest such block (one eth_getProof, exact block);
+    //     3. a value that changed is forgotten from b on and the node's value
+    //        put in from that block (carried forward like any fill); then the
+    //        mark is lifted (or moved past the read block if newer events
+    //        came meanwhile).
+    //   A Slipstream GAUGE is different: staking / reward payouts change the
+    //   POOL's own storage without a pool event, so any gauge event makes
+    //   that pool unsure from its block (it reloads, no strike).
+
+    /// Handle one event of a watched / reload account (see above). `ov`:
+    /// the block being applied (live), None for a late report. Returns
+    /// true if the log was such an event.
+    fn on_outside_log(&mut self, mut ov: Option<&mut Overlay>, log: &PoolLog, block: u64) -> bool {
+        let (watched, reload): (bool, Vec<PoolKey>) = {
+            let reg = self.c2.reg.read().unwrap();
+            (reg.watched.contains_key(&log.address), reg.reloaders.get(&log.address).cloned().unwrap_or_default())
+        };
+        if !watched && reload.is_empty() {
+            return false;
+        }
+        if watched {
+            inc(&self.c2.stats.watch_events);
+            let e = self.watch_last_event.entry(log.address).or_insert(0);
+            *e = (*e).max(block);
+            if ov.is_some() {
+                self.watch_in_block.insert(log.address);
+            }
+            let mut reg = crate::timing::TimedWrite::new(&self.c2.reg);
+            let p = reg.watch_pending.entry(log.address).or_insert(block);
+            *p = (*p).min(block);
+        }
+        for k in reload {
+            let unsure = self.c2.reg.read().unwrap().pools.get(&k).is_none_or(|e| e.state == PoolState::Unsure);
+            if unsure {
+                continue;
+            }
+            inc(&self.c2.stats.watch_reloads);
+            self.make_unsure_with(k, "its gauge changed the pool without a pool event (stake / unstake / rewards): reloading", ov.as_deref_mut(), block, false);
+        }
+        true
+    }
+
+    /// Send the re-read of every watched account with an unchecked event
+    /// (one job per account at a time; at the newest event block, exactly).
+    fn dispatch_watch_verify(&mut self) {
+        if self.loaders.is_none() {
+            return;
+        }
+        let pending: Vec<(Address, u64)> = self.c2.reg.read().unwrap().watch_pending.iter().map(|(a, b)| (*a, *b)).collect();
+        if pending.is_empty() {
+            return;
+        }
+        let Some(head) = self.sh.head() else { return };
+        let now = Instant::now();
+        for (a, first) in pending {
+            if self.watch_busy.contains(&a) || self.watch_retry_at.get(&a).is_some_and(|t| *t > now) {
+                continue;
+            }
+            // Read at the newest event block (never past the copy's head).
+            let at = self.watch_last_event.get(&a).copied().unwrap_or(first).max(first).min(head.block);
+            let slots: Vec<U256> = head.snap.accounts.get(&a).map(|x| x.storage.keys().copied().collect()).unwrap_or_default();
+            if slots.is_empty() {
+                // Nothing held: nothing can be stale. Values read from now
+                // on are newer than the event (on_fill drops older ones).
+                self.c2.reg.write().unwrap().watch_pending.remove(&a);
+                continue;
+            }
+            let items: Vec<MissItem> = slots.into_iter().map(|s| MissItem::Slot(a, s)).collect();
+            inc(&self.c2.stats.watch_verifies);
+            add(&self.c2.stats.watch_verify_items, items.len() as u64);
+            self.watch_busy.insert(a);
+            let id = self.new_job(JobFor::WatchVerify { addr: a });
+            self.loaders.as_ref().unwrap().send(Job::Fetch { id, block: at, exact: true, bulk: false, items, calls: vec![] });
+        }
+    }
+
+    /// A watched account's values read again at block `k` (see above).
+    fn on_watch_verify(&mut self, a: Address, k: u64, res: Result<FetchOut, crate::node::NodeErr>) {
+        self.watch_busy.remove(&a);
+        let first = match self.c2.reg.read().unwrap().watch_pending.get(&a).copied() {
+            Some(b) => b,
+            None => return, // no longer watched / nothing pending
+        };
+        let out = match res {
+            Ok(o) => o,
+            Err(e) => {
+                self.note_node_error(&e.to_string());
+                self.watch_retry_at.insert(a, Instant::now() + Duration::from_millis(500));
+                return;
+            }
+        };
+        let mut fresh: Vec<Fetched> = Vec::new();
+        for (_, f) in out.items {
+            match f {
+                Ok(f @ Fetched::Slot(..)) => fresh.push(f),
+                // Not there yet (the node trails the reports) or an error:
+                // keep it pending and ask again shortly.
+                _ => {
+                    self.watch_retry_at.insert(a, Instant::now() + Duration::from_millis(300));
+                    return;
+                }
+            }
+        }
+        // Compare with what the copy holds at block k.
+        let changed: Vec<Fetched> = {
+            let p = self.sh.published.read().unwrap();
+            let Some(v) = p.versions.iter().rev().find(|v| v.block <= k) else {
+                self.watch_retry_at.insert(a, Instant::now() + Duration::from_millis(300));
+                return;
+            };
+            fresh
+                .into_iter()
+                .filter(|f| match f {
+                    Fetched::Slot(acc, sl, val) => !matches!(v.snap.storage(*acc, *sl), Lookup::Known(h) if h == *val),
+                    _ => false,
+                })
+                .collect()
+        };
+        if !changed.is_empty() {
+            add(&self.c2.stats.watch_changed, changed.len() as u64);
+            let n = self.c2.stats.watch_changed.load(Ordering::Relaxed);
+            if n <= 20 {
+                eprintln!("[arbsim] copy2: watched contract {a} changed {} held value(s) by block {k} (event at {first}): replaced from block {first} on", changed.len());
+            }
+            let mut p = crate::timing::TimedWrite::new(&self.sh.published);
+            rewrite_from(&mut p.versions, first, |s| {
+                for f in &changed {
+                    if let Fetched::Slot(acc, sl, _) = f {
+                        forget_slot(s, *acc, *sl);
+                    }
+                }
+            });
+            let at = place_block(&p.versions, k);
+            reconcile(&mut p.versions, at, &changed);
+        }
+        // Newer events since k stay pending (from k + 1); else done.
+        let last = self.watch_last_event.get(&a).copied().unwrap_or(0);
+        {
+            let mut reg = self.c2.reg.write().unwrap();
+            if last > k {
+                reg.watch_pending.insert(a, k + 1);
+            } else {
+                reg.watch_pending.remove(&a);
+            }
+        }
+        self.sh.notify();
+    }
+
     fn on_verify(&mut self, k: u64, res: Result<FetchOut, crate::node::NodeErr>) {
         let Ok(out) = res else { return };
         let mut changed: Vec<(Address, U256, U256, U256)> = Vec::new();
@@ -6389,7 +6804,10 @@ impl Intake {
         for (k, e) in reg.pools.iter() {
             // Ready, nothing working on it, and any report it may still lack
             // is inside the overlap the catch-up reads again.
+            // (Nov 2) Hooked V4 / Slipstream pools are not saved (the file
+            // format stays as it is): they load normally after a restart.
             let ok = e.state == PoolState::Ready
+                && !e.pool.is_new_kind()
                 && !e.busy
                 && !self.partials.contains_key(k)
                 && e.ready_since <= block
@@ -7327,6 +7745,8 @@ impl Intake {
             let mut k: HashSet<Address> = reg.by_addr.keys().copied().collect();
             k.extend(reg.holders.keys().copied());
             k.extend(reg.owner_of.keys().copied());
+            // (Nov 2) Watched accounts (a few slots each, read by every swap).
+            k.extend(reg.watched.keys().copied());
             k
         };
         let Some(h) = self.sh.head() else { return };
@@ -7382,6 +7802,10 @@ fn load_slots(p: &TrackedPool) -> Vec<(Address, U256)> {
             None => vec![],
         },
         PoolKind::Algebra => vec![],
+        // (Nov 2) Slipstream: layout differs from Uniswap V3 (slot0 is not
+        // slot 0); like Algebra, everything is read when a replay or the
+        // tick walk needs it (the pool's own code decides which slots).
+        PoolKind::Slipstream => vec![],
     }
 }
 
@@ -7415,7 +7839,7 @@ fn coins_moved(p: &TrackedPool, l: &PoolLog) -> Vec<Address> {
         }
     };
     match p.kind {
-        PoolKind::V3 | PoolKind::PancakeV3 | PoolKind::Algebra => {
+        PoolKind::V3 | PoolKind::PancakeV3 | PoolKind::Algebra | PoolKind::Slipstream => {
             if t0 == sig("Swap(address,address,int256,int256,uint160,uint128,int24)") || t0 == sig("Swap(address,address,int256,int256,uint160,uint128,int24,uint128,uint128)") {
                 push(p.token0, nz(0));
                 push(p.token1, nz(1));
@@ -7510,6 +7934,11 @@ fn build_settle_filters(addrs: &[String], pads: &[String], coins: &[String], v4:
 fn current_tick(p: &TrackedPool, s: &Snapshot) -> Option<i64> {
     let w = match (p.kind, p.v4_id) {
         (PoolKind::V3 | PoolKind::PancakeV3, _) => s.storage(p.address, U256::ZERO),
+        // (Nov 2) Slipstream: slot0 is storage slot 6 (factory, token0,
+        // token1, gauge, nft, factoryRegistry first; checked on the live
+        // UP CL WETH/AI pool: tick 106273 in slot 6 = slot0().tick). Only
+        // used to decide when to walk the ticks again.
+        (PoolKind::Slipstream, _) => s.storage(p.address, U256::from(6u8)),
         (PoolKind::V4, Some(id)) => s.storage(p.address, map_slot_id(id)),
         _ => return None,
     };

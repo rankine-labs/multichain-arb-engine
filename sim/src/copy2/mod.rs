@@ -53,6 +53,9 @@ pub mod loader;
 pub mod overlay;
 // Warm restart: the copy saved to a file and read back at start.
 pub mod persist;
+// (Nov 2) `arbsim copy2-replay-check`: the replay run on recorded chain
+// state, event by event (proof for new pool kinds).
+pub mod replay_check;
 // Replay of V3 / PancakeV3 / Algebra / V4 events (workstream B; placeholder
 // answering Unsure until B's file replaces it).
 pub mod replay;
@@ -64,9 +67,10 @@ pub mod v4blind;
 pub mod warm;
 
 /// Which kind of pool (decides how its events are applied).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 pub enum PoolKind {
     /// Uniswap V2 copy (Sync / Transfer / Mint / Burn / Swap).
+    #[default]
     V2,
     /// Solidly / Velodrome V2 (Sync / Fees / Claim / Transfer).
     Solidly,
@@ -76,12 +80,23 @@ pub enum PoolKind {
     PancakeV3,
     /// Algebra Integral (+ plugin: its beforeSwap must be replayed too).
     Algebra,
-    /// Uniswap V4, hook-free, inside the PoolManager.
+    /// Uniswap V4 inside the PoolManager. Hook-free, or (Nov 2, flag
+    /// ARBSIM_COPY2_FOLLOW_HOOKED_V4) with a hook (`TrackedPool::hooks`):
+    /// the hook's own code then runs in every replay and check, and its
+    /// storage is followed as a WATCHED account (see `TrackedPool::watch`).
     V4,
+    /// (Nov 2) Velodrome Slipstream copies (UP CL, Raphael; flags
+    /// ARBSIM_COPY2_FOLLOW_UPCL / ARBSIM_COPY2_FOLLOW_RAPHAEL): Uniswap V3
+    /// events and callbacks, but a different storage layout (slot0 is not
+    /// slot 0), the fee asked from the factory's fee modules on every swap,
+    /// and a "gauge" that stakes liquidity in the pool WITHOUT a pool event.
+    /// Replayed like V3 with the pool's own code (the factory and fee
+    /// modules are watched accounts, the gauge reloads the pool).
+    Slipstream,
 }
 
 /// One pool we follow.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct TrackedPool {
     /// Pool contract address; for V4 the PoolManager address.
     pub address: Address,
@@ -91,8 +106,36 @@ pub struct TrackedPool {
     pub token0: Address,
     pub token1: Address,
     /// V4 key details (fee in pips, tick spacing); 0 for other kinds.
+    /// (A hooked V4 pool may have the dynamic-fee flag 0x800000 here.)
     pub fee: u32,
     pub tick_spacing: i32,
+    /// (Nov 2) V4 only: the pool key's hook contract (zero = no hook).
+    pub hooks: Address,
+    /// (Nov 2) WATCHED accounts: outside contracts every swap of this pool
+    /// READS but never writes (a V4 hook, a Slipstream factory and its fee
+    /// modules). Their values are held exact the same way for every pool
+    /// that watches them: any event of a watched account makes its held
+    /// values "pending" (checks touching it answer unknown) until they are
+    /// read again from the node at that block (changed ones replaced). The
+    /// bot subscribes to all their events. Empty for the older kinds.
+    pub watch: Vec<Address>,
+    /// (Nov 2) Accounts whose events change THIS POOL's storage without a
+    /// pool event (a Slipstream gauge staking liquidity): any of their
+    /// events makes the pool unsure from that block (it reloads).
+    pub reload_on: Vec<Address>,
+}
+
+impl TrackedPool {
+    /// A V4 pool with a hook (followed only with ARBSIM_COPY2_FOLLOW_HOOKED_V4).
+    pub fn is_hooked_v4(&self) -> bool {
+        self.kind == PoolKind::V4 && self.hooks != Address::ZERO
+    }
+    /// Kinds added on Nov 2 (hooked V4, Slipstream): never saved to the
+    /// warm-restart file (copy2/persist.rs keeps its format; they simply
+    /// load normally after a restart).
+    pub fn is_new_kind(&self) -> bool {
+        self.kind == PoolKind::Slipstream || self.is_hooked_v4()
+    }
 }
 
 /// One raw event, as the node reported it.

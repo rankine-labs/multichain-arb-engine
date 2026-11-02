@@ -413,6 +413,7 @@ mod tests {
             token1: Address::with_last_byte(2),
             fee: 0,
             tick_spacing: 0,
+         ..Default::default()
         }
     }
     fn words(ws: &[U256]) -> Bytes {

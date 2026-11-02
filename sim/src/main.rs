@@ -19,6 +19,7 @@ fn main() {
         Some("bench-fixture") => arbsim::check::cli::bench_fixture(&args),
         Some("node-bench") => arbsim::bench_node::node_bench(&args),
         Some("ahead-replay") => arbsim::copy2::ahead_capture::replay_main(&args),
+        Some("copy2-replay-check") => arbsim::copy2::replay_check::main(&args),
         Some("trig-replay") => arbsim::fastlane::trig_replay::replay_main(&args),
         _ => {
             eprintln!("usage: arbsim serve | check-fixture <file> | bench-fixture <file> | node-bench [--url-env NAME] [--n 50] [--parallel 16] | ahead-replay <capture file> [--json] [--samples N] [--budget-ms N] [--partial] [--revert-sure] [--sender-funds trusted|strict] | trig-replay <capture file> [--table <file>] [--ours 0x..] [--json] [--samples N] [--partial] [--no-full] [--fetch [--fetch-max N] [--fetch-paid on|off] [--fetch-scope all|moved] [--fetch-url-env NAME]]");

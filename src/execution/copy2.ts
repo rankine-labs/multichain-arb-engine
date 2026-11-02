@@ -25,9 +25,17 @@ import { decodeV4InitializeLog, V4_INITIALIZE_TOPIC, type V4InitEvent } from '..
 //          PancakeV3  PancakeSwap V3 and its copies (GIGA CL, SwapHood)
 //          Algebra    Algebra Integral (Alandale, KittenSwap)
 //          V4         Uniswap V4 pools WITHOUT a hook
-//        Not followed (the node keeps checking them, as today): V4 pools
-//        with a hook (Fables etc.), Ramses V3, Slipstream copies, order
-//        books, bins, oracle pools, anything unknown.
+//          V4 + hook  (Nov 2, ARBSIM_COPY2_FOLLOW_HOOKED_V4=on) V4 pools WITH
+//                     a hook (Fables, the listed hooked pools): sent with
+//                     their hook, which copy 2 WATCHES (all its events)
+//          Slipstream (Nov 2, ARBSIM_COPY2_FOLLOW_UPCL / _RAPHAEL=on) UP CL /
+//                     Raphael pools: sent with the contracts their swap
+//                     reads (factory, fee modules, voter: WATCHED) and their
+//                     gauge (any gauge event reloads the pool), looked up
+//                     once from the node (SlipstreamLookup below)
+//        Not followed (the node keeps checking them, as today): Ramses V3,
+//        other Slipstream copies, order books, bins, oracle pools, anything
+//        unknown, and the two kinds above while their flag is off.
 //
 //     2. EVERY report of those pools, block by block, in order
 //        ("pool_logs"): the pools' own events (swap, mint, burn, sync, LP
@@ -85,7 +93,7 @@ import { decodeV4InitializeLog, V4_INITIALIZE_TOPIC, type V4InitEvent } from '..
 // Read only. No keys, no transactions. Never throws into the bot.
 // ============================================================================
 
-export type Copy2Kind = 'V2' | 'Solidly' | 'V3' | 'PancakeV3' | 'Algebra' | 'V4';
+export type Copy2Kind = 'V2' | 'Solidly' | 'V3' | 'PancakeV3' | 'Algebra' | 'V4' | 'Slipstream';
 
 // One pool for the "track" message (field names as in the plan / Rust side).
 export interface Copy2Pool {
@@ -94,9 +102,33 @@ export interface Copy2Pool {
   kind: Copy2Kind;
   token0: string;        // the pool's token0 (V4: currency0, 0x000..0 = native ETH)
   token1: string;
-  fee: number;           // V4 only (pips); 0 for other kinds
+  fee: number;           // V4 only (pips; a hooked pool may carry the dynamic-fee flag 0x800000); 0 for other kinds
   tickSpacing: number;   // V4 only; 0 for other kinds
+  hooks?: string;        // (Nov 2) V4 with a hook: the hook contract
+  watch?: string[];      // (Nov 2) contracts the swap READS (hook; Slipstream factory / fee modules / voter): all their events followed
+  reloadOn?: string[];   // (Nov 2) contracts that change the pool without a pool event (Slipstream gauge): any event reloads it
 }
+
+// (Nov 2) The copy-2 follow flags (one .env for the bot and arbsim; arbsim
+// checks the same names, so a pool is followed only when both agree).
+// "1" / "on" / "true" / "yes" = on. Default OFF. Rollback = set to off and
+// restart both.
+export function followFlag(name: string): boolean {
+  return /^(1|on|true|yes)$/i.test(String(process.env[name] ?? '').trim());
+}
+// Slipstream exchanges copy 2 may follow, and the flag of each.
+export const SLIPSTREAM_FLAGS: Record<string, string> = {
+  'up-cl': 'ARBSIM_COPY2_FOLLOW_UPCL',
+  'raphael-cl': 'ARBSIM_COPY2_FOLLOW_RAPHAEL',
+};
+// V4 dynamic-fee flag in a pool key's fee field.
+const V4_DYNAMIC_FEE = 0x800000;
+
+// (Nov 2) What a Slipstream pool's follow needs besides its coins, looked up
+// from the node (SlipstreamLookup): the contracts its swap reads (watched)
+// and its gauge (reloads it). null = not looked up yet.
+export interface SlipExtras { watch: string[]; reloadOn: string[]; bad?: string }
+export type SlipExtrasOf = (pool: string, dex: string) => SlipExtras | null;
 
 export const ZERO_ADDR = '0x0000000000000000000000000000000000000000';
 // ERC-20 Transfer(address indexed from, address indexed to, uint256 value).
@@ -170,7 +202,7 @@ export function autoLookupReason(e: unknown): string {
 // copy2PoolOf: which copy type a watched pool is, or why it is not followed.
 // Conservative on purpose: unknown exchange names are never followed.
 // ----------------------------------------------------------------------------
-export function copy2PoolOf(pool: PoolState, poolManager: string, skipDexes: ReadonlySet<string> = new Set()): Copy2Pool | { skip: string } {
+export function copy2PoolOf(pool: PoolState, poolManager: string, skipDexes: ReadonlySet<string> = new Set(), slipExtras?: SlipExtrasOf): Copy2Pool | { skip: string } {
   try {
     if (pool.chain !== 'robinhood') return { skip: 'not robinhood' };
     const dex = String(pool.dex ?? '').toLowerCase();
@@ -178,10 +210,14 @@ export function copy2PoolOf(pool: PoolState, poolManager: string, skipDexes: Rea
     const a = String(pool.tokenA ?? '').toLowerCase();
     const b = String(pool.tokenB ?? '').toLowerCase();
     const addr = String(pool.poolAddress ?? '').toLowerCase();
-    // Uniswap V4: only pools without a hook, whose key really gives this pool id.
+    // Uniswap V4: pools without a hook, whose key really gives this pool id.
+    // (Nov 2) With ARBSIM_COPY2_FOLLOW_HOOKED_V4 on, also pools WITH a hook
+    // (Fables, the listed hooked pools, under any exchange name): the hook
+    // is part of the key (checked against the id) and copy 2 watches it.
     if (pool.v4) {
-      if (dex !== 'uniswap-v4') return { skip: 'V4 pool under another exchange name' };
-      if (isHookedV4(pool)) return { skip: 'V4 pool with a hook' };
+      const hooked = isHookedV4(pool);
+      if (hooked && !followFlag('ARBSIM_COPY2_FOLLOW_HOOKED_V4')) return { skip: dex !== 'uniswap-v4' ? 'V4 pool under another exchange name' : 'V4 pool with a hook' };
+      if (!hooked && dex !== 'uniswap-v4') return { skip: 'V4 pool under another exchange name' };
       if (!ID_RE.test(addr)) return { skip: 'bad V4 pool id' };
       // FIX 11 (Nov 2): the answer is remembered per pool key (same answer,
       // see v4KeyMatchesIdMemo), since this runs for every watched V4 pool
@@ -192,10 +228,18 @@ export function copy2PoolOf(pool: PoolState, poolManager: string, skipDexes: Rea
       if (!ADDR_RE.test(pm) || (poolManager && pm !== poolManager.toLowerCase())) return { skip: 'V4 pool on another PoolManager' };
       const k = v4KeyOf(pool);
       const fee = Number(k.fee), ts = Number(k.tickSpacing);
-      if (!Number.isInteger(fee) || fee < 0 || fee >= 1_000_000) return { skip: 'V4 fee not a fixed fee' };
+      // A hooked pool may use the dynamic-fee flag (its hook picks the fee
+      // per swap; copy 2 runs the hook's own code, so that is exact).
+      const dynamicOk = hooked && fee === V4_DYNAMIC_FEE;
+      if (!dynamicOk && (!Number.isInteger(fee) || fee < 0 || fee >= 1_000_000)) return { skip: 'V4 fee not a fixed fee' };
       if (!Number.isInteger(ts) || ts <= 0) return { skip: 'bad V4 tick spacing' };
       const t0 = k.currency0.toLowerCase(), t1 = k.currency1.toLowerCase();
       if (!ADDR_RE.test(t0) || !ADDR_RE.test(t1)) return { skip: 'bad V4 coins' };
+      if (hooked) {
+        const h = String(k.hooks).toLowerCase();
+        if (!ADDR_RE.test(h) || h === ZERO_ADDR) return { skip: 'bad V4 hook' };
+        return { address: pm, v4Id: addr, kind: 'V4', token0: t0, token1: t1, fee, tickSpacing: ts, hooks: h, watch: [h] };
+      }
       return { address: pm, v4Id: addr, kind: 'V4', token0: t0, token1: t1, fee, tickSpacing: ts };
     }
     if (dex === 'uniswap-v4') return { skip: 'V4 pool without its details' };
@@ -205,6 +249,8 @@ export function copy2PoolOf(pool: PoolState, poolManager: string, skipDexes: Rea
     if (!kind) {
       const venue = ROBINHOOD_VENUES.find((v) => v.id === dex);
       kind = venue ? VENUE_MODEL_KIND[venue.model] : undefined;
+      // (Nov 2) Slipstream copies, each behind its own flag.
+      if (!kind && venue?.model === 'slipstream' && SLIPSTREAM_FLAGS[dex] && followFlag(SLIPSTREAM_FLAGS[dex])) kind = 'Slipstream';
     }
     if (!kind) return { skip: `exchange type not followed (${dex || 'unknown'})` };
     // The pool's own shape must agree with its exchange type.
@@ -217,6 +263,13 @@ export function copy2PoolOf(pool: PoolState, poolManager: string, skipDexes: Rea
     }
     // token0 is always the smaller address (V2, Solidly, V3 and Algebra all sort).
     const [token0, token1] = a < b ? [a, b] : [b, a];
+    if (kind === 'Slipstream') {
+      // Needs the contracts its swap reads and its gauge (looked up once).
+      const x = slipExtras?.(addr, dex) ?? null;
+      if (!x) return { skip: 'Slipstream pool waiting for its factory / gauge lookup' };
+      if (x.bad) return { skip: x.bad };
+      return { address: addr, kind, token0, token1, fee: 0, tickSpacing: 0, watch: [...x.watch], reloadOn: [...x.reloadOn] };
+    }
     return { address: addr, kind, token0, token1, fee: 0, tickSpacing: 0 };
   } catch {
     return { skip: 'unreadable pool' };
@@ -227,12 +280,12 @@ const isPool = (x: Copy2Pool | { skip: string }): x is Copy2Pool => !('skip' in 
 
 // The whole track list from the watched pools (no duplicates), plus how many
 // were left out and why (for the log).
-export function buildTrackList(pools: Iterable<PoolState | undefined>, poolManager: string, skipDexes: ReadonlySet<string> = new Set()): { pools: Copy2Pool[]; skipped: Record<string, number> } {
+export function buildTrackList(pools: Iterable<PoolState | undefined>, poolManager: string, skipDexes: ReadonlySet<string> = new Set(), slipExtras?: SlipExtrasOf): { pools: Copy2Pool[]; skipped: Record<string, number> } {
   const out = new Map<string, Copy2Pool>();
   const skipped: Record<string, number> = {};
   for (const p of pools) {
     if (!p) continue;
-    const r = copy2PoolOf(p, poolManager, skipDexes);
+    const r = copy2PoolOf(p, poolManager, skipDexes, slipExtras);
     if (isPool(r)) out.set(copy2Key(r), r);
     else skipped[r.skip] = (skipped[r.skip] ?? 0) + 1;
   }
@@ -254,6 +307,14 @@ export function transferFilterOf(pools: readonly Copy2Pool[]): { coins: string[]
   return { coins: [...coins].sort(), pools: [...addrs].sort() };
 }
 
+// (Nov 2) The outside contracts of these pools (watched + reload): every
+// event of each is subscribed to and passed on with the pool reports.
+export function outsideAddrsOf(pools: readonly Copy2Pool[]): string[] {
+  const s = new Set<string>();
+  for (const p of pools) for (const a of [...(p.watch ?? []), ...(p.reloadOn ?? [])]) if (ADDR_RE.test(a.toLowerCase())) s.add(a.toLowerCase());
+  return [...s].sort();
+}
+
 // What a live WebSocket subscription really covers (handed over by the block
 // reader when it goes live). A pool is only tracked if ALL its events come in.
 export interface Copy2Coverage {
@@ -265,6 +326,8 @@ export interface Copy2Coverage {
 
 export function coveredPools(pools: readonly Copy2Pool[], cov: Copy2Coverage): Copy2Pool[] {
   return pools.filter((p) => {
+    // (Nov 2) Every event of its watched / reload contracts must come in too.
+    if (![...(p.watch ?? []), ...(p.reloadOn ?? [])].every((a) => cov.pools.has(a.toLowerCase()))) return false;
     if (p.kind === 'V4') return !!p.v4Id && cov.ids.has(p.v4Id.toLowerCase());
     const a = p.address.toLowerCase();
     if (!cov.pools.has(a) || !cov.transferPools.has(a)) return false;
@@ -1374,6 +1437,92 @@ export type Copy2Route = { at: { block: string }; block: number };
 
 const EMPTY_INDEX: Copy2Index = { pools: new Set(), ids: new Set(), poolManager: '', coins: new Set() };
 
+// ----------------------------------------------------------------------------
+// SlipstreamLookup (Nov 2): for each followed Slipstream pool (UP CL /
+// Raphael), the contracts its swap READS and its gauge, read from the node
+// (eth_call, a few per pool, cached).
+//
+// Plain English:
+//   A Slipstream swap asks the pool's FACTORY for the fee, which asks its
+//   swap-fee MODULE, the VOTER (is the pool's gauge alive?) and the
+//   unstaked-fee MODULE. Their owners can change those answers with their
+//   own transactions (no pool event), so copy 2 must see all their events
+//   ("watch"). The pool's GAUGE stakes / unstakes liquidity in the pool and
+//   pays rewards, which changes the pool's own storage without a pool event:
+//   any gauge event makes copy 2 reload that pool ("reloadOn").
+//   Looked up: factory() of the pool (must be the exchange's known factory),
+//   gauge() of the pool; swapFeeModule(), unstakedFeeModule(), voter() of
+//   the factory (once per factory). Fresh for 10 minutes; a pool WITHOUT a
+//   gauge is looked at again every minute (a gauge created later would
+//   otherwise go unseen for a while). A failed lookup is simply asked again
+//   (the pool is not followed meanwhile: never a guess).
+// ----------------------------------------------------------------------------
+const SEL = (sig: string) => keccak256(new TextEncoder().encode(sig)).slice(0, 10);
+export class SlipstreamLookup {
+  private pools = new Map<string, { at: number; x: SlipExtras }>();
+  private factories = new Map<string, { at: number; watch: string[] }>();
+  private busy = new Set<string>();
+  private inFlight = 0;
+  readonly counts = { lookups: 0, failed: 0, noGauge: 0, otherFactory: 0 };
+  constructor(private readonly rpc: () => ((method: string, params: unknown[]) => Promise<any>) | null, private readonly now: () => number = Date.now, private readonly maxParallel = 4) {}
+
+  // The extras of one pool (null = not known yet: a lookup is started).
+  get(pool: string, dex: string): SlipExtras | null {
+    const a = pool.toLowerCase();
+    const e = this.pools.get(a);
+    const t = this.now();
+    const fresh = e && t - e.at < (e.x.reloadOn.length ? 600_000 : 60_000);
+    if (!fresh) void this.lookup(a, dex);
+    return e ? e.x : null;
+  }
+
+  private async call(to: string, sig: string): Promise<string | null> {
+    const rpc = this.rpc();
+    if (!rpc) return null;
+    const r = await rpc('eth_call', [{ to, data: SEL(sig) }, 'latest']);
+    if (typeof r !== 'string' || r.length < 66) return null;
+    return ('0x' + r.slice(26, 66)).toLowerCase();
+  }
+
+  private async lookup(pool: string, dex: string): Promise<void> {
+    if (this.busy.has(pool) || this.inFlight >= this.maxParallel || !this.rpc()) return;
+    this.busy.add(pool);
+    this.inFlight++;
+    try {
+      this.counts.lookups++;
+      const venue = ROBINHOOD_VENUES.find((v) => v.id === dex);
+      const known = venue?.contracts.find((c) => c.role === 'factory')?.address.toLowerCase();
+      const factory = await this.call(pool, 'factory()');
+      const gauge = await this.call(pool, 'gauge()');
+      if (!factory || gauge === null) { this.counts.failed++; return; }
+      if (!known || factory !== known) {
+        this.counts.otherFactory++;
+        this.pools.set(pool, { at: this.now(), x: { watch: [], reloadOn: [], bad: 'Slipstream pool from another factory' } });
+        return;
+      }
+      let f = this.factories.get(factory);
+      if (!f || this.now() - f.at >= 600_000) {
+        const mods: string[] = [];
+        for (const sig of ['swapFeeModule()', 'unstakedFeeModule()', 'voter()']) {
+          const m = await this.call(factory, sig);
+          if (m === null) { this.counts.failed++; return; }
+          if (m !== ZERO_ADDR) mods.push(m);
+        }
+        f = { at: this.now(), watch: [factory, ...mods] };
+        this.factories.set(factory, f);
+      }
+      const hasGauge = gauge !== ZERO_ADDR;
+      if (!hasGauge) this.counts.noGauge++;
+      this.pools.set(pool, { at: this.now(), x: { watch: [...f.watch], reloadOn: hasGauge ? [gauge] : [] } });
+    } catch {
+      this.counts.failed++;
+    } finally {
+      this.busy.delete(pool);
+      this.inFlight--;
+    }
+  }
+}
+
 export class Copy2Link {
   readonly forwarder: Copy2Forwarder;
   readonly times: FeedBlockTimes;
@@ -1405,6 +1554,8 @@ export class Copy2Link {
   // a pool that had just come back and was reloading for ~30 s).
   private lastWatched = new Map<string, { pool: Copy2Pool; at: number }>();
   private follow: Copy2Pool[] = [];        // desired + held (rebuilt with desired)
+  // (Nov 2) Slipstream pools' watched contracts and gauges (node lookups).
+  readonly slip = new SlipstreamLookup(() => this.backfillRpc, () => this.now());
   private heldKeys = new Set<string>();    // keys of the held (not watched) pools in `follow`
   // WANTED (COPY2_WANTED_S): route pools a check found "loading" -> when;
   // sent with the status poll so the fast check loads them first.
@@ -1503,7 +1654,7 @@ export class Copy2Link {
     const t = this.now();
     if (t - this.desiredAt >= 5_000) {
       try {
-        const r = buildTrackList(this.o.pools(), this.o.poolManager, this.o.settings.skipDexes);
+        const r = buildTrackList(this.o.pools(), this.o.poolManager, this.o.settings.skipDexes, (a, d) => this.slip.get(a, d));
         this.desired = r.pools;
         this.desiredSkipped = r.skipped;
       } catch { /* keep the last list */ }
@@ -1522,6 +1673,8 @@ export class Copy2Link {
   }
 
   // Held pools only (not on the watch list), for the WebSocket subscription.
+  // (Nov 2) Plus the outside contracts (watched / reload) of EVERY followed
+  // pool: all their events are subscribed to.
   heldTargets(): { pools: string[]; ids: string[] } {
     this.desiredList();
     const pools: string[] = [], ids: string[] = [];
@@ -1530,6 +1683,7 @@ export class Copy2Link {
       if (!this.heldKeys.has(k) && !this.autoKeys.has(k)) continue;
       if (p.kind === 'V4') ids.push(k); else pools.push(k);
     }
+    pools.push(...outsideAddrsOf(this.follow));
     return { pools, ids };
   }
 
@@ -1944,6 +2098,10 @@ export class Copy2Link {
 function indexOf(list: readonly Copy2Pool[], poolManager: string): Copy2Index {
   const pools = new Set<string>(), ids = new Set<string>(), coins = new Set<string>();
   const poolCoins = new Map<string, string[]>();
+  // (Nov 2) Outside contracts (watched / reload): every event of them is a
+  // report too (passed on, read back after an outage); they hold no coins
+  // of their own here (empty list: their coin transfers are not ours).
+  for (const a of outsideAddrsOf(list)) { pools.add(a); poolCoins.set(a, []); }
   for (const p of list) {
     if (p.kind === 'V4') { if (p.v4Id) ids.add(p.v4Id.toLowerCase()); continue; }
     const a = p.address.toLowerCase();
@@ -1957,6 +2115,6 @@ function indexOf(list: readonly Copy2Pool[], poolManager: string): Copy2Index {
 
 function kindCounts(list: readonly Copy2Pool[]): string {
   const n: Record<string, number> = {};
-  for (const p of list) n[p.kind] = (n[p.kind] ?? 0) + 1;
+  for (const p of list) { const k = p.kind === 'V4' && p.hooks ? 'V4 hooked' : p.kind; n[k] = (n[k] ?? 0) + 1; }
   return Object.entries(n).map(([k, v]) => `${k} ${v}`).join(', ');
 }

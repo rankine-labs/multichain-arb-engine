@@ -159,7 +159,7 @@ impl Default for Opts {
 }
 
 fn tracked(address: Address, kind: PoolKind, t0: Address, t1: Address) -> TrackedPool {
-    TrackedPool { address, v4_id: None, kind, token0: t0, token1: t1, fee: 0, tick_spacing: 0 }
+    TrackedPool { address, v4_id: None, kind, token0: t0, token1: t1, fee: 0, tick_spacing: 0, ..Default::default() }
 }
 
 fn kind_str(k: PoolKind) -> &'static str {
@@ -170,6 +170,7 @@ fn kind_str(k: PoolKind) -> &'static str {
         PoolKind::V4 => "v4",
         PoolKind::V2 => "v2",
         PoolKind::Solidly => "solidly",
+        PoolKind::Slipstream => "slipstream",
     }
 }
 
@@ -260,7 +261,7 @@ impl World {
                     a.send_ok(t, &calldata("mint(address,uint256)", &[Arg::A(vt), Arg::W(big(t))]));
                 }
                 trader = vt;
-                let mut p = TrackedPool { address: pm, v4_id: None, kind: PoolKind::V4, token0: t0, token1: t1, fee: 500, tick_spacing: 10 };
+                let mut p = TrackedPool { address: pm, v4_id: None, kind: PoolKind::V4, token0: t0, token1: t1, fee: 500, tick_spacing: 10, ..Default::default() };
                 p.v4_id = Some(arbsim::copy2::replay::v4_pool_id(&p));
                 a.send_ok(pm, &calldata("initialize((address,address,uint24,int24,address),uint160)", &[Arg::A(t0), Arg::A(t1), Arg::W(U256::from(500)), Arg::I(10), Arg::A(Address::ZERO), Arg::W(sqrt_price_for(2500.0, uu, ww))]));
                 (p, 10)
@@ -269,7 +270,7 @@ impl World {
         let mut pools = vec![test, tracked(refp, PoolKind::V3, t0, t1)];
         if o.second_v4 && kind == K::V4 {
             let pm = pools[0].address;
-            let mut p2 = TrackedPool { address: pm, v4_id: None, kind: PoolKind::V4, token0: t0, token1: t1, fee: 3000, tick_spacing: 60 };
+            let mut p2 = TrackedPool { address: pm, v4_id: None, kind: PoolKind::V4, token0: t0, token1: t1, fee: 3000, tick_spacing: 60, ..Default::default() };
             p2.v4_id = Some(arbsim::copy2::replay::v4_pool_id(&p2));
             a.send_ok(pm, &calldata("initialize((address,address,uint24,int24,address),uint160)", &[Arg::A(t0), Arg::A(t1), Arg::W(U256::from(3000)), Arg::I(60), Arg::A(Address::ZERO), Arg::W(sqrt_price_for(2500.0, uu, ww))]));
             let s0 = u(&a.ok("eth_getStorageAt", json!([ha(pm), hx64(map_slot(U256::from_be_bytes(p2.v4_id.unwrap().0), U256::from(6))), "latest"])));

@@ -906,7 +906,7 @@ mod tests {
     #[test]
     fn route_bound_counts_the_touched_pools_then_everything() {
         let l: u128 = 1_000_000_000_000_000_000;
-        let mk = |n: u8| TrackedPool { address: Address::with_last_byte(4), v4_id: Some(B256::with_last_byte(n)), kind: super::super::PoolKind::V4, token0: Address::with_last_byte(1), token1: Address::with_last_byte(2), fee: 3000, tick_spacing: 60 };
+        let mk = |n: u8| TrackedPool { address: Address::with_last_byte(4), v4_id: Some(B256::with_last_byte(n)), kind: super::super::PoolKind::V4, token0: Address::with_last_byte(1), token1: Address::with_last_byte(2), fee: 3000, tick_spacing: 60, ..Default::default() };
         let (p1, p2) = (mk(7), mk(8));
         let pm = p1.address;
         let mut m: HashMap<U256, U256> = HashMap::new();
@@ -995,7 +995,7 @@ mod tests {
     }
 
     fn pool(sp: i32) -> TrackedPool {
-        TrackedPool { address: Address::with_last_byte(4), v4_id: Some(B256::with_last_byte(7)), kind: super::super::PoolKind::V4, token0: Address::with_last_byte(1), token1: Address::with_last_byte(2), fee: 3000, tick_spacing: sp }
+        TrackedPool { address: Address::with_last_byte(4), v4_id: Some(B256::with_last_byte(7)), kind: super::super::PoolKind::V4, token0: Address::with_last_byte(1), token1: Address::with_last_byte(2), fee: 3000, tick_spacing: sp, ..Default::default() }
     }
 
     /// One position [-600, 600) around price 1 (tick 0): the bound equals

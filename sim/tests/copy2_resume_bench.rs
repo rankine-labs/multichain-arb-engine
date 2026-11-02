@@ -81,7 +81,7 @@ fn sizes() -> Sizes {
 }
 
 fn v2_pool(i: u64) -> TrackedPool {
-    TrackedPool { address: addr(0xa2, i), v4_id: None, kind: PoolKind::V2, token0: addr(0xc0, i % 30), token1: addr(0xc0, 30 + i % 30), fee: 0, tick_spacing: 0 }
+    TrackedPool { address: addr(0xa2, i), v4_id: None, kind: PoolKind::V2, token0: addr(0xc0, i % 30), token1: addr(0xc0, 30 + i % 30), fee: 0, tick_spacing: 0, ..Default::default() }
 }
 
 fn entry(p: TrackedPool, items: HashSet<(Address, U256)>, walked: Vec<(Address, U256)>, far: Option<FarZero>) -> PoolEntry {
@@ -134,10 +134,10 @@ fn state(z: &Sizes) -> persist::State {
         let v4 = i % 2 == 1;
         let (acct, p) = if v4 {
             let id = B256::from(h("id", i).to_be_bytes::<32>());
-            (addr(PM, 0), TrackedPool { address: addr(PM, 0), v4_id: Some(id), kind: PoolKind::V4, token0: addr(0xc0, i % 60), token1: addr(0xc0, (i + 7) % 60), fee: 500, tick_spacing: 10 })
+            (addr(PM, 0), TrackedPool { address: addr(PM, 0), v4_id: Some(id), kind: PoolKind::V4, token0: addr(0xc0, i % 60), token1: addr(0xc0, (i + 7) % 60), fee: 500, tick_spacing: 10, ..Default::default() })
         } else {
             put_contract(&mut s, addr(0xa3, i), 3);
-            (addr(0xa3, i), TrackedPool { address: addr(0xa3, i), v4_id: None, kind: PoolKind::V3, token0: addr(0xc0, i % 60), token1: addr(0xc0, (i + 7) % 60), fee: 3000, tick_spacing: 60 })
+            (addr(0xa3, i), TrackedPool { address: addr(0xa3, i), v4_id: None, kind: PoolKind::V3, token0: addr(0xc0, i % 60), token1: addr(0xc0, (i + 7) % 60), fee: 3000, tick_spacing: 60, ..Default::default() })
         };
         let mut items = HashSet::new();
         for k in 0..20 {

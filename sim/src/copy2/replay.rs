@@ -147,6 +147,8 @@ struct Topics {
     set_lm_pool: B256,
     // Algebra Integral 1.2 side events
     excess_tokens: B256,
+    // (Nov 2) Slipstream only: the gauge took the staked LPs' fees.
+    collect_fees: B256,
     // Uniswap V4 PoolManager
     v4_swap: B256,
     v4_modify: B256,
@@ -174,6 +176,7 @@ fn topics() -> &'static Topics {
         fee_protocol_pancake: topic("SetFeeProtocol(uint32,uint32,uint32,uint32)"),
         set_lm_pool: topic("SetLmPoolEvent(address)"),
         excess_tokens: topic("ExcessTokens(uint256,uint256)"),
+        collect_fees: topic("CollectFees(address,uint128,uint128)"),
         v4_swap: topic("Swap(bytes32,address,int128,int128,uint160,uint128,int24,uint24)"),
         v4_modify: topic("ModifyLiquidity(bytes32,address,int24,int24,int256,bytes32)"),
         v4_donate: topic("Donate(bytes32,address,uint256,uint256)"),
@@ -693,7 +696,9 @@ pub fn apply_replay(db: &mut Overlay, pool: &TrackedPool, log: &PoolLog, ctx: &B
         return ApplyResult::Unsure("event without topics".into());
     }
     let r = match pool.kind {
-        PoolKind::V3 | PoolKind::PancakeV3 => v3_family(db, pool, log, ctx),
+        // (Nov 2) Slipstream: the same events, callbacks and actions as
+        // Uniswap V3 (see v3_family for its differences).
+        PoolKind::V3 | PoolKind::PancakeV3 | PoolKind::Slipstream => v3_family(db, pool, log, ctx),
         PoolKind::Algebra => algebra(db, pool, log, ctx),
         PoolKind::V4 => v4(db, pool, log, ctx),
         PoolKind::V2 | PoolKind::Solidly => Err(Stop::Unsure("V2 / Solidly pools are applied from event fields, not replay".into())),
@@ -836,6 +841,15 @@ fn v3_family(db: &mut Overlay, pool: &TrackedPool, log: &PoolLog, ctx: &BlockCtx
     let t0 = log.topics[0];
     let d = &log.data[..];
     let pancake = pool.kind == PoolKind::PancakeV3;
+    // (Nov 2) Velodrome Slipstream (UP CL, Raphael). Differences that matter
+    // here: slot0 is NOT storage slot 0 (factory, coins, gauge, ... come
+    // first), so the price before a 0/0 swap is read with slot0(); the fee
+    // comes from the factory's fee modules (real code runs: they are the
+    // pool's watched accounts, NOT stand-ins, so outside_ok stays off);
+    // there are no owner fee settings; the gauge can take the staked LPs'
+    // fees (CollectFees). The gauge's staking itself emits no pool event:
+    // any gauge event reloads the pool (intake.rs on_outside_log).
+    let slip = pool.kind == PoolKind::Slipstream;
     let is_swap = t0 == t.swap || (pancake && t0 == t.swap_pancake);
     if (pancake && t0 == t.swap) || (!pancake && t0 == t.swap_pancake) {
         return Err(Stop::Unsure("Swap event of the other V3 flavour (check the pool kind)".into()));
@@ -853,8 +867,16 @@ fn v3_family(db: &mut Overlay, pool: &TrackedPool, log: &PoolLog, ctx: &BlockCtx
         need_topics(3)?;
         let (sender, recipient) = (topic_addr(&log.topics[1]), topic_addr(&log.topics[2]));
         let (a0, a1, sqrt) = (word(d, 0), word(d, 1), word(d, 2));
-        // slot0 is slot 0 in both layouts; price = its low 160 bits.
-        let zfo = v3_direction(a0, a1, sqrt, || Ok(slot(view, pa, U256::ZERO)? & ((U256::from(1u8) << 160) - U256::from(1u8))))?;
+        // slot0 is slot 0 in both V3 layouts; price = its low 160 bits.
+        // Slipstream: ask the pool (slot0() word 0), its layout differs.
+        let zfo = if slip {
+            v3_direction(a0, a1, sqrt, || match view_call(view, ctx, pa, call("slot0()", &[]))? {
+                Some(o) if o.len() >= 32 => Ok(word(&o, 0)),
+                _ => Err(Stop::Unsure("slot0() of the Slipstream pool did not answer".into())),
+            })?
+        } else {
+            v3_direction(a0, a1, sqrt, || Ok(slot(view, pa, U256::ZERO)? & ((U256::from(1u8) << 160) - U256::from(1u8))))?
+        };
         let p = v3_pretend(view, pool, ctx, vec![sender], vec![])?;
         (p, v3_swap_candidates(pa, sender, recipient, zfo, a0, a1, sqrt))
     } else if t0 == t.mint {
@@ -893,7 +915,16 @@ fn v3_family(db: &mut Overlay, pool: &TrackedPool, log: &PoolLog, ctx: &BlockCtx
         let p = v3_pretend(view, pool, ctx, vec![], vec![])?;
         let data = call("initialize(uint160)", &[word(d, 0)]);
         (p, vec![("initialize", vec![Call { from: REPLAY_CALLER, to: pa, data }])])
-    } else if (!pancake && t0 == t.fee_protocol_v3) || (pancake && t0 == t.fee_protocol_pancake) || t0 == t.collect_protocol || (pancake && t0 == t.set_lm_pool) {
+    } else if slip && t0 == t.collect_fees {
+        // (Nov 2) Slipstream: the gauge collected the staked LPs' fees. Run
+        // collectFees() as the pool's gauge (only it may).
+        let gauge = view_addr(view, ctx, pa, "gauge()")?;
+        if gauge == Address::ZERO {
+            return Err(Stop::Unsure("CollectFees from a Slipstream pool without a gauge".into()));
+        }
+        let p = v3_pretend(view, pool, ctx, vec![], vec![gauge])?;
+        (p, vec![("collectFees", vec![Call { from: gauge, to: pa, data: call("collectFees()", &[]) }])])
+    } else if !slip && ((!pancake && t0 == t.fee_protocol_v3) || (pancake && t0 == t.fee_protocol_pancake) || t0 == t.collect_protocol || (pancake && t0 == t.set_lm_pool)) {
         // Owner-only settings: run them as the address allowed to (Uniswap:
         // the factory's owner; PancakeSwap: the factory itself).
         let factory = view_addr(view, ctx, pa, "factory()")?;
@@ -915,8 +946,10 @@ fn v3_family(db: &mut Overlay, pool: &TrackedPool, log: &PoolLog, ctx: &BlockCtx
     };
 
     // Pool actions (not owner settings): outside contracts get stand-ins.
+    // (Nov 2) Not for Slipstream: its pool is a small proxy (the shared code
+    // must run) and its swap USES the fee modules' answers.
     let mut pretend = pretend;
-    if is_swap || t0 == t.mint || t0 == t.burn || t0 == t.collect || t0 == t.flash {
+    if !slip && (is_swap || t0 == t.mint || t0 == t.burn || t0 == t.collect || t0 == t.flash) {
         pretend.outside_ok = Some(pa);
     }
     match try_runs(view, &pretend, ctx, &candidates, &accept)? {
@@ -1237,9 +1270,10 @@ fn algebra(db: &mut Overlay, pool: &TrackedPool, log: &PoolLog, ctx: &BlockCtx) 
 // Uniswap V4 (hook-free) inside the PoolManager.
 // ---------------------------------------------------------------------------
 
-/// The 5 words of a V4 PoolKey (currency0, currency1, fee, tickSpacing, hooks=0).
+/// The 5 words of a V4 PoolKey (currency0, currency1, fee, tickSpacing,
+/// hooks). (Nov 2) hooks = the pool's hook (zero for hook-free pools).
 fn v4_key_words(pool: &TrackedPool) -> [U256; 5] {
-    [addr_word(pool.token0), addr_word(pool.token1), U256::from(pool.fee), int_word(pool.tick_spacing as i128), U256::ZERO]
+    [addr_word(pool.token0), addr_word(pool.token1), U256::from(pool.fee), int_word(pool.tick_spacing as i128), addr_word(pool.hooks)]
 }
 
 /// V4 pool id = keccak256(abi.encode(PoolKey)).
@@ -1356,7 +1390,17 @@ fn v4(db: &mut Overlay, pool: &TrackedPool, log: &PoolLog, ctx: &BlockCtx) -> Re
     };
     let accept = exactly_the_event(pm, log);
     match try_runs(view, &pretend, ctx, &candidates, &accept)? {
-        Tried::Hit(diff, _) => Ok(diff),
+        Tried::Hit(diff, _) => {
+            // (Nov 2) A hook that WRITES its own storage during a pool action
+            // can't be followed exactly: the same hook's writes for other
+            // pools (or by swaps we don't see) would go unnoticed. Fables
+            // hooks only read (probe: 0 writes in 20 swaps). Such a hook =
+            // unsure (never a guess); the pool reloads and stays unsure.
+            if pool.hooks != Address::ZERO && diff.accounts.get(&pool.hooks).is_some_and(|d| !d.storage.is_empty()) {
+                return Err(Stop::Unsure(format!("hook {} writes its own storage during pool actions (not followed)", pool.hooks)));
+            }
+            Ok(diff)
+        }
         Tried::Miss(why) => Err(Stop::Unsure(format!("replay did not reproduce the event: {why}"))),
     }
 }
@@ -1379,6 +1423,7 @@ mod tests {
             token1: Address::with_last_byte(2),
             fee: 0,
             tick_spacing: 0,
+         ..Default::default()
         }
     }
     fn ctx() -> BlockCtx {
@@ -1409,6 +1454,26 @@ mod tests {
             assert!(code.windows(4).any(|w| w == s4), "selector of {s} not in ReplayHelper code");
         }
         assert!(!stub_code().1.original_bytes().is_empty());
+    }
+
+    /// (Nov 2) A hooked V4 pool's id includes its hook: the real Fables
+    /// ETH/AI pool (dynamic-fee flag, spacing 200) on Robinhood Chain.
+    #[test]
+    fn hooked_v4_pool_id_includes_the_hook() {
+        let p = TrackedPool {
+            address: Address::with_last_byte(4),
+            kind: PoolKind::V4,
+            token0: Address::ZERO,
+            token1: "0x2e8c31162b855a2ffa90f6f8634643ad6f111e18".parse().unwrap(),
+            fee: 0x800000,
+            tick_spacing: 200,
+            hooks: "0x594e8e6281edf2d363a0293a50004cf868e7a080".parse().unwrap(),
+            ..Default::default()
+        };
+        let want: B256 = "0xe85f633a1374ee279140fa997b547d6a2ccd94fc5eae0e98f7d15ce0e3ddfa93".parse().unwrap();
+        assert_eq!(v4_pool_id(&p), want);
+        // Without the hook it is another pool.
+        assert_ne!(v4_pool_id(&TrackedPool { hooks: Address::ZERO, ..p }), want);
     }
 
     #[test]

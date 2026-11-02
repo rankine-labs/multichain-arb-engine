@@ -121,6 +121,7 @@ fn kind_str(k: PoolKind) -> &'static str {
         PoolKind::V4 => "v4",
         PoolKind::V2 => "v2",
         PoolKind::Solidly => "solidly",
+        PoolKind::Slipstream => "slipstream",
     }
 }
 
@@ -227,8 +228,8 @@ fn build_world(pairs: usize) -> Option<World> {
         // V4: pair 0 like the live USDG / WETH pool (0.05 %, spacing 10),
         // stock pools 0.3 % / spacing 60.
         let (fee, spacing) = if i == 0 { (500u32, 10i32) } else { (3000, 60) };
-        let v3 = TrackedPool { address: v3a, v4_id: None, kind: PoolKind::V3, token0: t0, token1: t1, fee: 3000, tick_spacing: 60 };
-        let mut v4 = TrackedPool { address: pm, v4_id: None, kind: PoolKind::V4, token0: t0, token1: t1, fee, tick_spacing: spacing };
+        let v3 = TrackedPool { address: v3a, v4_id: None, kind: PoolKind::V3, token0: t0, token1: t1, fee: 3000, tick_spacing: 60, ..Default::default() };
+        let mut v4 = TrackedPool { address: pm, v4_id: None, kind: PoolKind::V4, token0: t0, token1: t1, fee, tick_spacing: spacing, ..Default::default() };
         v4.v4_id = Some(arbsim::copy2::replay::v4_pool_id(&v4));
         inits.push((v3a, calldata("initialize(uint160)", &[Arg::W(sp)])));
         // Long price history: the walk reads it (live pools hold ~400 walked values each).

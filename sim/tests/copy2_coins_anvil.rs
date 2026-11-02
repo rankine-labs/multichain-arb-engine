@@ -159,7 +159,7 @@ impl World {
             a.send_ok(trader, &calldata("mintV3(address,int24,int24,uint128)", &[Arg::A(pool), Arg::I((b - 60 * k * 6) as i128), Arg::I((b + 60 * k * 5) as i128), Arg::W(q(16) * U256::from(2u8))]));
         }
         let (t0, t1) = if uu < ww { (uu, ww) } else { (ww, uu) };
-        let tp = TrackedPool { address: pool, v4_id: None, kind: PoolKind::V3, token0: t0, token1: t1, fee: 3000, tick_spacing: 60 };
+        let tp = TrackedPool { address: pool, v4_id: None, kind: PoolKind::V3, token0: t0, token1: t1, fee: 3000, tick_spacing: 60, ..Default::default() };
         a.ok("evm_setAutomine", json!([false]));
         let ts = u64v(&a.ok("eth_getBlockByNumber", json!(["latest", false]))["timestamp"]);
         let gate = Arc::new(Gate {

@@ -263,6 +263,9 @@ fn kind_code(k: PoolKind) -> u8 {
         PoolKind::PancakeV3 => 3,
         PoolKind::Algebra => 4,
         PoolKind::V4 => 5,
+        // (Nov 2) Never written: save_state leaves Slipstream (and hooked
+        // V4) pools out, so the format is unchanged; kind_of refuses 6.
+        PoolKind::Slipstream => 6,
     }
 }
 
@@ -670,7 +673,7 @@ pub fn decode(buf: &[u8], volatile: Arc<crate::state::snap::Volatile>) -> Result
         let lp = r.opt_pos()?;
         let now = Instant::now();
         let e = PoolEntry {
-            pool: TrackedPool { address, v4_id, kind, token0, token1, fee, tick_spacing },
+            pool: TrackedPool { address, v4_id, kind, token0, token1, fee, tick_spacing, ..Default::default() },
             state: PoolState::Ready,
             reason: String::new(),
             events,
@@ -858,7 +861,7 @@ mod tests {
         s.apply_fact(&crate::state::snap::Fact::Slot(a(3), U256::from(9), U256::from(99)));
         let now = Instant::now();
         let e = PoolEntry {
-            pool: TrackedPool { address: a(1), v4_id: None, kind: PoolKind::V3, token0: a(10), token1: a(11), fee: 3000, tick_spacing: 60 },
+            pool: TrackedPool { address: a(1), v4_id: None, kind: PoolKind::V3, token0: a(10), token1: a(11), fee: 3000, tick_spacing: 60, ..Default::default() },
             state: PoolState::Ready,
             reason: String::new(),
             events: 12,

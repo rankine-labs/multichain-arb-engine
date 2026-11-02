@@ -147,12 +147,17 @@ pub fn priority_set() -> HashSet<Address> {
 
 /// Does this kind of pool get a walk? (V2 / Solidly: no ticks.)
 pub fn walks(kind: PoolKind) -> bool {
-    matches!(kind, PoolKind::V3 | PoolKind::PancakeV3 | PoolKind::Algebra | PoolKind::V4)
+    matches!(kind, PoolKind::V3 | PoolKind::PancakeV3 | PoolKind::Algebra | PoolKind::V4 | PoolKind::Slipstream)
 }
 
 fn kind_code(k: PoolKind) -> u64 {
     match k {
-        PoolKind::V3 => 1,
+        // (Nov 2) Slipstream answers the same read functions as Uniswap V3
+        // (slot0() words 0-4 in the same order, tickSpacing(), ticks(),
+        // tickBitmap(), observations(); protocolFees() simply fails and is
+        // skipped), so the lens's V3 path walks it; the pool's own code
+        // decides which slots are read (no layout assumed).
+        PoolKind::V3 | PoolKind::Slipstream => 1,
         PoolKind::PancakeV3 => 2,
         PoolKind::Algebra => 3,
         PoolKind::V4 => 4,
@@ -372,7 +377,7 @@ mod tests {
     #[test]
     fn lens_code_is_present_and_params_are_well_formed() {
         assert!(lens_code().len() > 1000);
-        let p = TrackedPool { address: Address::with_last_byte(9), v4_id: None, kind: PoolKind::V3, token0: Address::ZERO, token1: Address::ZERO, fee: 0, tick_spacing: 0 };
+        let p = TrackedPool { address: Address::with_last_byte(9), v4_id: None, kind: PoolKind::V3, token0: Address::ZERO, token1: Address::ZERO, fee: 0, tick_spacing: 0, ..Default::default() };
         let v = trace_params(&p, &WalkCfg::default(), &json!("0x10"));
         assert_eq!(v[2]["tracer"], "prestateTracer");
         assert_eq!(v[0]["data"].as_str().unwrap().len(), 2 + 8 + 10 * 64);
@@ -382,7 +387,7 @@ mod tests {
     fn only_the_pools_own_storage_and_the_marker_are_read() {
         let pool = Address::with_last_byte(9);
         let coin = Address::with_last_byte(7);
-        let p = TrackedPool { address: pool, v4_id: None, kind: PoolKind::V3, token0: coin, token1: Address::ZERO, fee: 0, tick_spacing: 0 };
+        let p = TrackedPool { address: pool, v4_id: None, kind: PoolKind::V3, token0: coin, token1: Address::ZERO, fee: 0, tick_spacing: 0, ..Default::default() };
         // lo = -3 (0xfffd), hi = 4, center = -100, 5 ticks, 8 words
         let low: u128 = 0xfffd | (4 << 16) | ((((-100i64) as u64 & 0xff_ffff) as u128) << 32) | (5 << 56) | (8 << 80);
         let marker = done_base() | U256::from(low);
@@ -401,7 +406,7 @@ mod tests {
     fn v4_keeps_only_this_pools_entries() {
         let pm = Address::with_last_byte(4);
         let id = B256::with_last_byte(0x42);
-        let p = TrackedPool { address: pm, v4_id: Some(id), kind: PoolKind::V4, token0: Address::ZERO, token1: Address::ZERO, fee: 500, tick_spacing: 10 };
+        let p = TrackedPool { address: pm, v4_id: Some(id), kind: PoolKind::V4, token0: Address::ZERO, token1: Address::ZERO, fee: 500, tick_spacing: 10, ..Default::default() };
         let base = map_slot(U256::from_be_bytes(id.0), U256::from(6u8));
         let word0 = map_slot(U256::ZERO, base + U256::from(5u8));
         // bit 3 of word 0 = tick 30
@@ -424,7 +429,7 @@ mod tests {
     #[test]
     fn unfinished_walk_says_so() {
         let pool = Address::with_last_byte(9);
-        let p = TrackedPool { address: pool, v4_id: None, kind: PoolKind::Algebra, token0: Address::ZERO, token1: Address::ZERO, fee: 0, tick_spacing: 0 };
+        let p = TrackedPool { address: pool, v4_id: None, kind: PoolKind::Algebra, token0: Address::ZERO, token1: Address::ZERO, fee: 0, tick_spacing: 0, ..Default::default() };
         let mut tr = serde_json::Map::new();
         tr.insert(format!("{pool:#x}"), json!({"storage": { w(U256::from(1)): w(U256::from(2)) }}));
         let o = read_walk(&Value::Object(tr), &p, &[]);
