@@ -1,6 +1,6 @@
 import type { PoolState } from '../core/types';
 import type { RpcLog } from '../core/blockReader';
-import { isHookedV4, v4KeyMatchesId, v4KeyOf } from './executorCalldata';
+import { isHookedV4, v4KeyMatchesId, v4KeyMatchesIdMemo, v4KeyOf } from './executorCalldata';
 import { ROBINHOOD_VENUES } from '../config/robinhoodVenues';
 import type { LocalSimClient, SidecarAnswer } from './localSim';
 import { topicChunks, type RawLogTap } from '../core/blockReaderWs';
@@ -183,7 +183,11 @@ export function copy2PoolOf(pool: PoolState, poolManager: string, skipDexes: Rea
       if (dex !== 'uniswap-v4') return { skip: 'V4 pool under another exchange name' };
       if (isHookedV4(pool)) return { skip: 'V4 pool with a hook' };
       if (!ID_RE.test(addr)) return { skip: 'bad V4 pool id' };
-      if (!v4KeyMatchesId(pool)) return { skip: 'V4 key does not match the pool id' };
+      // FIX 11 (Nov 2): the answer is remembered per pool key (same answer,
+      // see v4KeyMatchesIdMemo), since this runs for every watched V4 pool
+      // every 5 s. COPY2_V4_KEY_MEMO=0 = work it out every time (old way).
+      const keyOk = process.env.COPY2_V4_KEY_MEMO === '0' ? v4KeyMatchesId(pool) : v4KeyMatchesIdMemo(pool);
+      if (!keyOk) return { skip: 'V4 key does not match the pool id' };
       const pm = String(pool.v4.poolManager ?? '').toLowerCase();
       if (!ADDR_RE.test(pm) || (poolManager && pm !== poolManager.toLowerCase())) return { skip: 'V4 pool on another PoolManager' };
       const k = v4KeyOf(pool);

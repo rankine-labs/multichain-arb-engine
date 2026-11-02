@@ -305,15 +305,23 @@ export function checkBuildEncodeOn(env: Record<string, string | undefined> = pro
 // v4KeyMatchesId remembered per pool key (a keccak + ABI encoding, ~60 us,
 // done for every hooked V4 hop of every build). The answer depends only on
 // the pool id and its key fields, all part of the memo key. Bounded.
+//
+// (Nov 2, fix 11) Exported and also used by copy 2's track list
+// (copy2PoolOf): that list is rebuilt from EVERY watched pool every 5 s, and
+// the uncached check (ethers ABI encode + keccak, with its garbage) was the
+// biggest named freeze: 3.6 s of freezes in 10 min, up to 242 ms in one go
+// (freeze namer, Nov 2). The bound was raised from 20,000 to 60,000 keys
+// so a big watch list never clears the memo on every rebuild (about 200
+// bytes a key, so at most ~12 MB).
 const v4MatchMemo = new Map<string, boolean>();
-function v4KeyMatchesIdMemo(pool: PoolState): boolean {
+export function v4KeyMatchesIdMemo(pool: PoolState): boolean {
   const v4 = pool.v4;
   if (!v4) return false;
   const key = `${pool.poolAddress}|${pool.tokenA}|${pool.tokenB}|${v4.native ? 1 : 0}|${v4.fee}|${v4.tickSpacing}|${v4.hooks ?? ''}`;
   const hit = v4MatchMemo.get(key);
   if (hit !== undefined) return hit;
   const ok = v4KeyMatchesId(pool);
-  if (v4MatchMemo.size > 20_000) v4MatchMemo.clear();
+  if (v4MatchMemo.size > 60_000) v4MatchMemo.clear();
   v4MatchMemo.set(key, ok);
   return ok;
 }

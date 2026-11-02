@@ -171,6 +171,42 @@ function decodeSymbol(hex: string | null): string | null {
 
 export type MetaResult = { symbol: string; decimals: number } | 'not-a-token';
 
+// ---------------------------------------------------------------------------
+// FIX 11 (Nov 2): the hooked-V4 registry list, decoded once per answer.
+// Every pair lookup asks the registry for ALL its pools (activePools) and
+// decoded the whole answer with ethers, which turns the hex text into bytes
+// one character pair at a time and checksums every address. The freeze
+// namer showed this as the 3rd biggest freeze cause: 3.2 s of freezes in
+// 15 min, up to 473 ms in one go ("discoverPairPoolsMulticall").
+// The registry's answer rarely changes, so the decoded list is remembered
+// per registry and reused while the answer text is EXACTLY the same (same
+// text = same list, so the result is identical). A new answer is decoded
+// as before. Only the fields the lookup reads are kept, with the same
+// values the old code computed (String / Number / toLowerCase of the
+// ethers result). PAIR_REGISTRY_MEMO=0 = decode every time (old way).
+// ---------------------------------------------------------------------------
+export type RegistryEntry = { active: boolean; c0: string; c1: string; id: string; fee: number; tickSpacing: number; hooks: string };
+const registryMemo = new Map<string, { hex: string; list: RegistryEntry[] }>();
+export function registryList(registry: string, hex: string): RegistryEntry[] {
+  const on = process.env.PAIR_REGISTRY_MEMO !== '0';
+  const key = registry.toLowerCase();
+  if (on) {
+    const hit = registryMemo.get(key);
+    if (hit && hit.hex === hex) return hit.list;
+  }
+  const raw = iReg.decodeFunctionResult('activePools', hex)[0] as any[];
+  const list: RegistryEntry[] = raw.map((e) => ({
+    active: !!e.active,
+    c0: String(e.key.currency0).toLowerCase(), c1: String(e.key.currency1).toLowerCase(),
+    id: String(e.id), fee: Number(e.key.fee), tickSpacing: Number(e.key.tickSpacing), hooks: String(e.key.hooks),
+  }));
+  if (on) {
+    if (registryMemo.size > 16) registryMemo.clear();   // a handful of registries at most
+    registryMemo.set(key, { hex, list });
+  }
+  return list;
+}
+
 export async function discoverPairPoolsMulticall(
   callMany: CallManyFn, chain: ChainName, venues: Venue[], tokenA: string, tokenB: string,
   metaFor: string[] = [],
@@ -261,8 +297,8 @@ export async function discoverPairPoolsMulticall(
     }
     if (p.kind === 'v4-registry') {
       const v = p.venue;
-      let list: any[] = [];
-      try { list = r1[p.idx] ? (iReg.decodeFunctionResult('activePools', r1[p.idx]!)[0] as any[]) : []; } catch { list = []; }
+      let list: RegistryEntry[] = [];
+      try { list = r1[p.idx] ? registryList(v.registry!, r1[p.idx]!) : []; } catch { list = []; }
       const a = tokenA.toLowerCase(), b = tokenB.toLowerCase(), w = v.weth!.toLowerCase();
       // Memory/request guard: Fables lists ~65 pools today. Only the first
       // MAX_REGISTRY_POOLS entries are looked at and at most
@@ -272,14 +308,14 @@ export async function discoverPairPoolsMulticall(
       for (const e of list.slice(0, MAX_REGISTRY_POOLS)) {
         if (matched >= MAX_HOOKED_POOLS_PER_PAIR) break;
         if (!e.active) continue;
-        const c0 = String(e.key.currency0).toLowerCase(), c1 = String(e.key.currency1).toLowerCase();
+        const c0 = e.c0, c1 = e.c1;
         const native = c0 === ethers.ZeroAddress;
         const x0 = native ? w : c0;
         if (!((x0 === a && c1 === b) || (x0 === b && c1 === a))) continue;
         matched++;
         const base = calls2.length;
         calls2.push({ target: v.factory, data: encodeCallFast(iSV, 'getSlot0', [e.id]) }, { target: v.factory, data: encodeCallFast(iSV, 'getLiquidity', [e.id]) });
-        hooked.push({ venue: v, id: String(e.id), fee: Number(e.key.fee), tickSpacing: Number(e.key.tickSpacing), native, c0, c1, hooks: String(e.key.hooks), base });
+        hooked.push({ venue: v, id: e.id, fee: e.fee, tickSpacing: e.tickSpacing, native, c0, c1, hooks: e.hooks, base });
       }
       continue;
     }
