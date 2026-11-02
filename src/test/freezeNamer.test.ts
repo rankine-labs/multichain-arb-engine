@@ -41,9 +41,9 @@ function fakeProfile(t0: number, ids: number[]): NamerProfile {
 
 function settingsTests() {
   const d = freezeNamerSettings({});
-  assert(d.enabled && d.chunkMs === 10_000 && d.intervalUs === 1_000 && d.minutes === 120 && d.minFreezeMs === 50, 'defaults: on, 10 s pieces, 1 ms sampling, 120 min, freezes over 50 ms');
+  assert(d.enabled && d.chunkMs === 4_000 && d.intervalUs === 1_000 && d.minutes === 120 && d.minFreezeMs === 50, 'defaults: on, 4 s pieces, 1 ms sampling, 120 min, freezes over 50 ms');
   assert(!freezeNamerSettings({ FREEZE_NAMER: '0' }).enabled && !freezeNamerSettings({ FREEZE_NAMER: 'off' }).enabled, 'FREEZE_NAMER=0 / off turns it off');
-  assert(freezeNamerSettings({ FREEZE_NAMER_CHUNK_S: '9999' }).chunkMs === 10_000, 'out-of-range setting falls back to the default');
+  assert(freezeNamerSettings({ FREEZE_NAMER_CHUNK_S: '9999' }).chunkMs === 4_000, 'out-of-range setting falls back to the default');
 }
 
 function fakeTests() {
