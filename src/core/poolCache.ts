@@ -87,6 +87,12 @@ export class PoolCache {
   private byToken = new Map<string, Set<string>>();
   // Lower-cased tokens a pool was indexed under (to unindex it exactly).
   private indexedAs = new Map<string, { chain: string; a: string; b: string }>();
+  // LENDER FAST (Nov 1, freeze fix 9): the place of each key in its chain's
+  // list (byChain), as a rising number. A key gets a new, higher number
+  // exactly when it is (re-)added to byChain, so sorting keys by this number
+  // gives allForChain's order without walking the whole list (atAddresses).
+  private chainSeq = new Map<string, number>();
+  private chainSeqN = 0;
   readonly indexed: boolean;
   // Confirmed view (see above). Empty and unused when switched off.
   private confirmed = new Map<string, Confirmed>();
@@ -122,6 +128,7 @@ export class PoolCache {
         const ent = { chain: pool.chain as string, a: pool.tokenA.toLowerCase(), b: pool.tokenB.toLowerCase() };
         this.indexedAs.set(k, ent);
         addTo(this.byChain, ent.chain, k);
+        this.chainSeq.set(k, ++this.chainSeqN); // (re-)added at the end of byChain
         addTo(this.byToken, `${ent.chain}:${ent.a}`, k);
         addTo(this.byToken, `${ent.chain}:${ent.b}`, k);
       }
@@ -131,6 +138,7 @@ export class PoolCache {
 
   private unindex(k: string, ent: { chain: string; a: string; b: string }): void {
     removeFrom(this.byChain, ent.chain, k);
+    this.chainSeq.delete(k);
     removeFrom(this.byToken, `${ent.chain}:${ent.a}`, k);
     removeFrom(this.byToken, `${ent.chain}:${ent.b}`, k);
     this.indexedAs.delete(k);
@@ -350,6 +358,31 @@ export class PoolCache {
     }
                                                                                                     return [...this.pools.values()].filter(p => p.chain === chain);
                                                                                                       }
+
+  // LENDER FAST (Nov 1, freeze fix 9). Plain English: the bot asked "which
+  // of the few approved lender pools are in the cache?" by copying the
+  // WHOLE pool list (tens of thousands of pools) and filtering it, several
+  // times for every route it built, which froze the bot and made lots of
+  // throw-away memory. This answers the same question by looking up just
+  // the given addresses.
+  //
+  // Returns EXACTLY allForChain(chain).filter((p) => lowerAddrs has
+  // p.poolAddress.toLowerCase()), same pools, same order (every key is
+  // `${chain}:${poolAddress lower-case}`, and chainSeq follows byChain's
+  // order). Only with the index on; null otherwise (caller uses the old way).
+  atAddresses(chain: ChainName, lowerAddrs: Iterable<string>): PoolState[] | null {
+    if (!this.indexed) return null;
+    const found: Array<{ s: number; p: PoolState }> = [];
+    for (const a of lowerAddrs) {
+      const k = `${chain}:${a}`;
+      const p = this.pools.get(k);
+      const s = this.chainSeq.get(k);
+      // (The key spelling check keeps it exact even for an odd address string.)
+      if (p && s !== undefined && p.chain === chain && p.poolAddress.toLowerCase() === a) found.push({ s, p });
+    }
+    if (found.length > 1) found.sort((x, y) => x.s - y.s);
+    return found.map((f) => f.p);
+  }
 
   // Walk one chain's pools WITHOUT making a copy of the list (for loops
   // that only read). Don't add or remove pools while walking.

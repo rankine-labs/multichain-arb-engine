@@ -227,6 +227,8 @@ import { trustFreshConfigFromEnv, wsTrustProblem, WsFacts } from './core/trustFr
 // Stall finder (Oct 14): which job froze the bot, plus chunked versions of the big jobs.
 import { stallFinder, timed, timedAsync, formatStallLine, formatStallDetail, markStretch, labelled } from './core/stallFinder';
 import { FreezeProfiler } from './core/freezeProfile';
+import { groupsStartupPlan } from './core/groupsStartup';
+import { lenderFastOn, parseApprovedLenders, lenderCandidatesOld, lenderCandidatesFor } from './core/lenderPick';
 import { runSteps, drainSteps, writeJsonChunkedQueued, setSliceCap, SlicedQueue, TurnQueue } from './core/chunked';
 // 4-HOUR REPORT (reporting only): 4-hour totals of the hourly numbers, and the 3-message formatter.
 import { FourHourStats, HourSample, LoopSample, loopSampleFrom, fourHourMark, zonedParts } from './report/fourHourStats';
@@ -1768,15 +1770,26 @@ const liveTracker = new LiveTradeTracker({
 // pools approved on the contract (same list given to the deploy script).
 // Set: only those. Not set: any pool (fine for dry runs; live trades are
 // refused above unless they use an approved lender).
-const approvedLenders = (chain: string) => new Set(
-      (process.env[`FLASH_LENDERS_${chain.toUpperCase()}`] ?? '').split(',').map((a) => a.trim().toLowerCase()).filter(Boolean),
-);
-const lenderCandidates = (chain: 'avalanche' | 'monad' | 'robinhood') => {
-      const ok = approvedLenders(chain);
-      const all = cache.allForChain(chain);
-      if (ok.size) return all.filter((p) => ok.has(p.poolAddress.toLowerCase()));
-      return robinhoodSender.live && chain === 'robinhood' ? [] : all;
+// LENDER FAST (core/lenderPick.ts, Nov 1, freeze fix 9; LENDER_FAST=0 = old
+// way): the list is read from .env once per chain (it never changes while
+// the bot runs) instead of being re-parsed on every route build, and the
+// lender pick looks only at pools that could be the answer instead of a copy
+// of every cached pool. Same lender every time (src/test/lenderFast.test.ts).
+const LENDER_FAST = lenderFastOn();
+const approvedLendersMemo = new Map<string, Set<string>>();
+const approvedLenders = (chain: string): Set<string> => {
+      if (!LENDER_FAST) return parseApprovedLenders(process.env, chain);
+      let s = approvedLendersMemo.get(chain);
+      if (!s) { s = parseApprovedLenders(process.env, chain); approvedLendersMemo.set(chain, s); }
+      return s;
 };
+// Every possible lender pool (the old full list; still used for the 5-minute
+// lender balance read, which needs them all).
+const lenderCandidates = (chain: 'avalanche' | 'monad' | 'robinhood') =>
+      lenderCandidatesOld(cache, chain, approvedLenders(chain), robinhoodSender.live && chain === 'robinhood');
+// The pools that could lend `token` (for pickV3Lender; same pick as lenderCandidates).
+const lenderCandidatesTok = (chain: 'avalanche' | 'monad' | 'robinhood', token: string) =>
+      LENDER_FAST ? lenderCandidatesFor(cache, chain, token, approvedLenders(chain), robinhoodSender.live && chain === 'robinhood') : lenderCandidates(chain);
 
 // Robinhood: real coin balances of every possible lender pool, refreshed
 // every LENDER_REFRESH_MS in one bundled read (see core/lenderBalances.ts).
@@ -1825,7 +1838,7 @@ const pickLender = (
       extraExclude: string[] = [],
 ) => {
       const exclude = [buyPool.poolAddress, sellPool.poolAddress, ...extraExclude];
-      if (chain !== 'robinhood') return pickV3Lender(lenderCandidates(chain), tokenIn, exclude);
+      if (chain !== 'robinhood') return pickV3Lender(lenderCandidatesTok(chain, tokenIn), tokenIn, exclude);
       // Own money for trades up to OWN_MONEY_MAX_USD ($2,000); bigger trades
       // borrow from the cheapest lender (0.01% pool) so the big wins aren't
       // limited by our own pot (~$1,000 USDG + $300 WETH planned).
@@ -1844,7 +1857,7 @@ const pickLender = (
       const amount = dec === undefined ? null : loanUnits(tradeSizeUsd, usdPerToken, dec);
       // Unknown amount or no balances read yet: no lender (own-capital check instead).
       if (amount === null || !lenderBalances.lastRefreshMs) return null;
-      return pickV3Lender(lenderCandidates(chain), tokenIn, exclude, (pool, token) => lenderBalances.canLend(pool, token, amount, LENDER_HEADROOM));
+      return pickV3Lender(lenderCandidatesTok(chain, tokenIn), tokenIn, exclude, (pool, token) => lenderBalances.canLend(pool, token, amount, LENDER_HEADROOM));
 };
 
 // Loan fee (bps) the Robinhood check would pay for tokenIn: the cheapest
@@ -1853,7 +1866,7 @@ const pickLender = (
 // check uses own money, so plan with no loan fee.
 const rhLoanFeeBps = (tokenIn: string, buyPool: PoolState, sellPool: PoolState): number | null => {
       if (RH_OWN_MONEY) return null; // own money: no loan fee
-      const l = pickV3Lender(lenderCandidates('robinhood'), tokenIn, [buyPool.poolAddress, sellPool.poolAddress]);
+      const l = pickV3Lender(lenderCandidatesTok('robinhood', tokenIn), tokenIn, [buyPool.poolAddress, sellPool.poolAddress]);
       if (!l) return null;
       return (l.feePips ?? l.feeBps * 100) / 100;
 };
@@ -2012,7 +2025,7 @@ const loopLive: LoopLiveSender | null = loopCfg.enabled && loopLiveCfg.enabled ?
             // Otherwise a flash loan: approved lender, not one of the loop's pools, holds enough.
             if (!lenderBalances.lastRefreshMs) return null;
             const exclude = c.poolKeys.map((k) => cache.get('robinhood', k)?.poolAddress ?? k);
-            const l = pickV3Lender(lenderCandidates('robinhood'), c.base, exclude, (pool, token) => lenderBalances.canLend(pool, token, c.amountIn, LENDER_HEADROOM));
+            const l = pickV3Lender(lenderCandidatesTok('robinhood', c.base), c.base, exclude, (pool, token) => lenderBalances.canLend(pool, token, c.amountIn, LENDER_HEADROOM));
             return l ? { kind: 'flash', lender: l.poolAddress, feePips: l.feePips ?? l.feeBps * 100 } : null;
       },
       // Same node and polling as 2-pool check-first. COPY 2 on: the trade's
@@ -4979,8 +4992,24 @@ await chainManager.startAll();
       // (Only rebuild straight away when we started from a saved list; a
       // fresh build just ran, so a second one would only repeat it.)
       const groupsFromDisk = !!tokenGroups;
-      setTimeout(() => { void setupLoops(false).then(() => (groupsFromDisk ? setupLoops(true) : undefined)); }, 3 * 60_000);
-      setInterval(labelled('loop monitor setup', () => { void setupLoops(true); }), 6 * 60 * 60_000);
+      const GROUPS_EVERY_MS = 6 * 60 * 60_000;
+      // GROUPS FRESH SKIP (Nov 1, freeze fix 9; GROUPS_FRESH_SKIP=0 = old way).
+      // Plain English: after EVERY restart the bot rebuilt the coin groups
+      // straight away, even when the saved list was only minutes old. That
+      // rebuild checks the money in ~545,000 pools and ran for ~26 minutes
+      // after each start (34 restarts on Nov 1), with big bundled reads and
+      // their decoding, and every freeze in that window was reported as
+      // "other (during coin groups build, pool scan)". Now a saved list
+      // younger than 6 h is kept (it IS the result of the last build), and
+      // the rebuild is booked for when that list turns 6 h old, so groups
+      // are never older than with the normal 6-hourly rebuild.
+      const groupsSkip = groupsFromDisk ? groupsStartupPlan(tokenGroups!.updatedAt, Date.now(), GROUPS_EVERY_MS, process.env) : { rebuildNow: true, laterMs: 0 };
+      if (groupsFromDisk && !groupsSkip.rebuildNow) console.log(`[groups] saved list is ${Math.round((Date.now() - tokenGroups!.updatedAt) / 60_000)} min old: kept, rebuild in ${Math.round(groupsSkip.laterMs / 60_000)} min (GROUPS_FRESH_SKIP)`);
+      setTimeout(() => {
+            void setupLoops(false).then(() => (groupsFromDisk && groupsSkip.rebuildNow ? setupLoops(true) : undefined));
+      }, 3 * 60_000);
+      if (groupsFromDisk && !groupsSkip.rebuildNow) setTimeout(labelled('loop monitor setup', () => { void setupLoops(true); }), groupsSkip.laterMs);
+      setInterval(labelled('loop monitor setup', () => { void setupLoops(true); }), GROUPS_EVERY_MS);
       let loopBusy = false;
       let loopErrors = 0;
       setInterval(async () => {
