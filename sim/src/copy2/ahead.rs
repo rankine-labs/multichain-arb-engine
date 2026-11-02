@@ -281,7 +281,8 @@ pub struct AheadCfg {
     /// are (prediction is NOT stopped, counted "revertsKept"). off = the
     /// old rule (a reverted run moves nothing and its pools stay sure).
     pub revert_unsure: bool,
-    /// FASTLANE_AHEAD_EXACT_REVERT_SURE [off] (Nov 2, ahead5 study). Only
+    /// FASTLANE_AHEAD_EXACT_REVERT_SURE [on with FASTLANE_AHEAD=observe, off
+    /// otherwise] (Nov 2, ahead5 study). Only
     /// matters with FASTLANE_AHEAD_REVERT_UNSURE on. A reverted run is kept
     /// SURE ("moved nothing", the pools it may touch are NOT marked) when
     /// all of these hold, i.e. when our run was exact:
@@ -453,8 +454,11 @@ impl AheadCfg {
             compare_delay: get("FASTLANE_AHEAD_COMPARE_DELAY_BLOCKS").and_then(|v| v.trim().parse::<u64>().ok()).filter(|v| *v <= 30).unwrap_or(COMPARE_DELAY_DEFAULT),
             // Unset = on; only an explicit off / 0 / false / no turns it off.
             revert_unsure: get("FASTLANE_AHEAD_REVERT_UNSURE").is_none_or(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "off" | "0" | "false" | "no")),
-            // Nov 2 (ahead5): off unless set, in every mode.
-            exact_revert_sure: on_off(get("FASTLANE_AHEAD_EXACT_REVERT_SURE").as_deref()).unwrap_or(false),
+            // Nov 2 (ahead5): unset = on only when the predicted copy only
+            // OBSERVES (it feeds no decision; replay of the Oct 31 capture
+            // with the oracle: unsure 3,740 -> 3,060, sure-but-wrong 6 -> 6);
+            // FASTLANE_AHEAD=on keeps the old rule unless set.
+            exact_revert_sure: on_off(get("FASTLANE_AHEAD_EXACT_REVERT_SURE").as_deref()).unwrap_or(observe),
             // Observe-mode build (Oct 31): unset = on only when the predicted
             // copy only OBSERVES (FASTLANE_AHEAD=observe: it feeds no
             // decision); FASTLANE_AHEAD=on keeps the old rule unless set.
