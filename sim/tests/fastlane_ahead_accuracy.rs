@@ -326,6 +326,18 @@ fn exact_revert_sure_setting() {
     for on in ["on", "1", "true", "YES"] {
         assert!(get(Some(on)), "{on}");
     }
+    // Unset: on only in observe mode (nothing decides on the prediction).
+    let mode = |m: &str, v: Option<&str>| {
+        AheadCfg::from_lookup(|k| match k {
+            "FASTLANE_AHEAD" => Some(m.to_string()),
+            "FASTLANE_AHEAD_EXACT_REVERT_SURE" => v.map(String::from),
+            _ => None,
+        }, 0).exact_revert_sure
+    };
+    assert!(mode("observe", None));
+    assert!(!mode("observe", Some("off")));
+    assert!(!mode("on", None), "FASTLANE_AHEAD=on: old rule unless set");
+    assert!(mode("on", Some("on")));
 }
 
 // ---------------------------------------------------------------------------
