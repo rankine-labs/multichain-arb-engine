@@ -5,9 +5,15 @@
 # 3) touch DEPLOY_ALLOW_LIVE  4) wait for "DEPLOYED <sha>" (or a failure) in the deploy log.
 S=~/rx/stockpx/deploy.status; APP=/home/ubuntu/multichain-arb-engine; OLD_MAIN="$1"
 echo "waiting for lock $(date -u +%T)" > $S
-exec 8>~/rx/deploy.lock
-flock -w 5400 8 || { echo "LOCK TIMEOUT $(date -u +%T)" >> $S; exit 1; }
-echo "stockpx-pr278 $(date -u +%FT%T)" >&8
+# Same convention as the other helpers: the lock is held while the file
+# exists (created with noclobber, so only one helper can create it).
+GOT=0
+for i in $(seq 1 1080); do
+  if ( set -o noclobber; echo "stockpx PR278 tick maths $(date -u +%FT%TZ)" > ~/rx/deploy.lock ) 2>/dev/null; then GOT=1; break; fi
+  sleep 10
+done
+[ "$GOT" = 1 ] || { echo "LOCK TIMEOUT $(date -u +%T)" >> $S; exit 1; }
+trap 'rm -f ~/rx/deploy.lock' EXIT
 echo "LOCKED $(date -u +%T)" >> $S
 NEW=""
 for i in $(seq 1 180); do
