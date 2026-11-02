@@ -1,5 +1,6 @@
 import { PoolState } from './types';
 import { eventFeePips } from './eventFees';
+import { tickAwareAmountOut } from './tickWindow';
 
 // ============================================================================
 // DEX MATH: universal getAmountOut()
@@ -83,6 +84,13 @@ export function computeAmountOut(pool: PoolState, tokenInIsA: boolean, amountIn:
   if (pool.poolType === 'v3') {
     if (pool.sqrtPriceX96 === undefined || pool.liquidity === undefined) return null;
     if (mathZeroGuardOn() && pool.sqrtPriceX96 <= 0n) return null; // ZERO GUARD: no price yet
+
+    // TICK-AWARE GUESS (Nov 2, STOCK_TICK_MATH, core/tickWindow.ts): when
+    // this pool's nearby ranges are loaded, walk the trade range by range
+    // like the pool does (and charge the V4 protocol fee). Not loaded yet /
+    // switched off: the old single-range maths below.
+    const tickOut = tickAwareAmountOut(pool, tokenInIsA, amountIn, feePipsOf(pool, tokenInIsA));
+    if (tickOut !== undefined) return tickOut;
 
     // Virtual reserves at the current price within the active tick's
     // liquidity: see predictPostTradeState in poolCache.ts for the same
