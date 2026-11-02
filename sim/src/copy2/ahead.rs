@@ -281,6 +281,24 @@ pub struct AheadCfg {
     /// are (prediction is NOT stopped, counted "revertsKept"). off = the
     /// old rule (a reverted run moves nothing and its pools stay sure).
     pub revert_unsure: bool,
+    /// FASTLANE_AHEAD_EXACT_REVERT_SURE [off] (Nov 2, ahead5 study). Only
+    /// matters with FASTLANE_AHEAD_REVERT_UNSURE on. A reverted run is kept
+    /// SURE ("moved nothing", the pools it may touch are NOT marked) when
+    /// all of these hold, i.e. when our run was exact:
+    ///   - it assumed nothing (no fill, no sender funds: `assumed` empty;
+    ///     every other value it read was one copy 2 / the keeper vouches for,
+    ///     anything else would have made it fail, not revert),
+    ///   - it is a real REVERT with revert data (a contract said no: "TF",
+    ///     "STF", a custom error), not a halt (out of funds / gas: the
+    ///     sender's ETH balance is only approximate in our copy) and not an
+    ///     empty revert.
+    /// Measured on the Oct 31 capture with the oracle (chain's exact state):
+    /// of the reverted runs that marked pools, 260 txs also reverted on the
+    /// chain (12,835 pool marks for nothing); the reverted runs whose real
+    /// transaction succeeded were halts (OutOfFunds, sender balance), empty
+    /// reverts, or runs built on an assumed value. Counted "revertsExact".
+    /// Off = the Oct 31 rule (every reverted run marks its pools unsure).
+    pub exact_revert_sure: bool,
     /// FASTLANE_AHEAD_UNKNOWN_CONTINUE (Oct 31, observe-mode build). A
     /// picked transaction we could not run AND that nothing ties to any of
     /// our pools (no pool it reads in a collect run, names, or moved before;
@@ -346,7 +364,7 @@ pub struct AheadCfg {
 
 impl Default for AheadCfg {
     fn default() -> Self {
-        AheadCfg { max_blocks: 32, run_all: false, max_txs: 256, max_touchers: 4096, l2_offset: 0, trust_sender_funds: false, msg_budget_us: 10_000, routes_only: true, compare_delay: 0, revert_unsure: true, unknown_continue: false, keeper: false, keep_pick: true, budget_cpu: false, lazy_rebase: false, kept_rebuild_once: false, need_keeper: false, thin_pending: true }
+        AheadCfg { max_blocks: 32, run_all: false, max_txs: 256, max_touchers: 4096, l2_offset: 0, trust_sender_funds: false, msg_budget_us: 10_000, routes_only: true, compare_delay: 0, revert_unsure: true, exact_revert_sure: false, unknown_continue: false, keeper: false, keep_pick: true, budget_cpu: false, lazy_rebase: false, kept_rebuild_once: false, need_keeper: false, thin_pending: true }
     }
 }
 
@@ -435,6 +453,8 @@ impl AheadCfg {
             compare_delay: get("FASTLANE_AHEAD_COMPARE_DELAY_BLOCKS").and_then(|v| v.trim().parse::<u64>().ok()).filter(|v| *v <= 30).unwrap_or(COMPARE_DELAY_DEFAULT),
             // Unset = on; only an explicit off / 0 / false / no turns it off.
             revert_unsure: get("FASTLANE_AHEAD_REVERT_UNSURE").is_none_or(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "off" | "0" | "false" | "no")),
+            // Nov 2 (ahead5): off unless set, in every mode.
+            exact_revert_sure: on_off(get("FASTLANE_AHEAD_EXACT_REVERT_SURE").as_deref()).unwrap_or(false),
             // Observe-mode build (Oct 31): unset = on only when the predicted
             // copy only OBSERVES (FASTLANE_AHEAD=observe: it feeds no
             // decision); FASTLANE_AHEAD=on keeps the old rule unless set.
@@ -1269,6 +1289,14 @@ pub struct AheadStats {
     /// confirmed blocks that passed while it was.
     pub memory_pauses: u64,
     pub memory_blocks: u64,
+    /// FASTLANE_AHEAD_EXACT_REVERT_SURE: reverted runs kept sure (exact
+    /// revert with revert data, nothing assumed) instead of marking pools.
+    pub reverts_exact: u64,
+    /// Agreement (Nov 2, ahead5): of the compared pools we had marked
+    /// unsure, how many the confirmed block REALLY moved. The rest
+    /// (unsure - unsureMoved) were marked for nothing: false alarms that
+    /// hide a route from the scanner although its pool did not change.
+    pub unsure_moved: u64,
     /// Failed runs that marked more pools unsure under the accuracy-fix
     /// rules (native-ETH pools of a named coin, the target's learned pools).
     pub failed_widened: u64,
@@ -1354,6 +1382,7 @@ impl AheadStats {
             "missedReverted": self.missed_reverted, "missedFailed": self.missed_failed, "staleBase": self.stale_base, "baseLate": self.base_late,
             "notCaptured": self.not_captured, "confGone": self.conf_gone, "rebaseRewrites": self.rebase_rewrites, "settleLost": self.settle_lost, "memoryPauses": self.memory_pauses, "memoryBlocks": self.memory_blocks, "failedWidened": self.failed_widened,
             "unknownContinued": self.unknown_continued, "missedUnknown": self.missed_unknown, "tips": self.tips,
+            "revertsExact": self.reverts_exact, "unsureMoved": self.unsure_moved,
             "keptBases": self.kept_bases, "keptMissing": self.kept_missing, "keptValues": self.kept_values, "keptRebases": self.kept_rebases, "learned": self.learned,
             "rightKeptBase": self.right_kept, "wrongKeptBase": self.wrong_kept, "rightPlainBase": self.right_plain, "wrongPlainBase": self.wrong_plain, "keptSkipped": self.kept_skipped,
             "applyCpuUs": if times { let mut c = self.cpu_us.clone(); crate::timing::pct_of(&mut c) } else { Value::Null },
@@ -2118,7 +2147,13 @@ impl Ahead {
         let block = p.seq + self.cfg.l2_offset;
         for k in all {
             if unsure_of(k) {
-                self.count(|s| s.unsure += 1);
+                let moved = conf_moved.contains(k);
+                self.count(|s| {
+                    s.unsure += 1;
+                    if moved {
+                        s.unsure_moved += 1;
+                    }
+                });
                 if let Some(d) = self.diag.as_mut() {
                     // Replay diagnostics: what made it unsure (the first of
                     // our transactions that marked it, else copy 2 / an
@@ -2618,7 +2653,13 @@ impl Ahead {
                     // transaction whose run reverted can't be vouched for
                     // (see AheadCfg). Worked out on the copy BEFORE its
                     // (gas / nonce only) changes are kept, like a failed run.
-                    let revert_hit = if !ok && self.cfg.revert_unsure { Some(self.guess_touched(&ov, &ctx, t, &pools, &named_now, &native, false)) } else { None };
+                    // FASTLANE_AHEAD_EXACT_REVERT_SURE (Nov 2): an EXACT
+                    // revert (revert data, nothing assumed) is kept sure.
+                    let exact_revert = !ok && self.cfg.exact_revert_sure && out.assumed.labels().is_empty() && out.replayed.first().is_some_and(|r| exact_revert_outcome(&r.outcome));
+                    if exact_revert {
+                        self.count(|s| s.reverts_exact += 1);
+                    }
+                    let revert_hit = if !ok && self.cfg.revert_unsure && !exact_revert { Some(self.guess_touched(&ov, &ctx, t, &pools, &named_now, &native, false)) } else { None };
                     // ORACLE (offline replay only): why did it revert / did
                     // it move what the exact run moves?
                     if self.oracle.is_some() {
@@ -2977,6 +3018,14 @@ pub fn revert_text(o: &crate::check::CallOutcome) -> String {
 }
 
 /// Why our run of a feed transaction reverted / halted (short, groupable).
+/// FASTLANE_AHEAD_EXACT_REVERT_SURE: a revert a contract chose to make,
+/// with revert data (an error string / custom error): not a halt (out of
+/// funds / gas, which an approximate sender balance can cause) and not an
+/// empty revert (no reason: too little to go on).
+pub fn exact_revert_outcome(o: &crate::check::CallOutcome) -> bool {
+    !o.success && o.halt.is_none() && o.output.len() >= 4
+}
+
 fn revert_why(o: &crate::check::CallOutcome) -> String {
     if let Some(h) = &o.halt {
         return format!("halt: {}", h.chars().take(60).collect::<String>());

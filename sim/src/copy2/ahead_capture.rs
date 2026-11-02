@@ -45,7 +45,7 @@
 //   and says so (an incomplete file is refused by the replay unless asked).
 //
 //   REPLAY: `arbsim ahead-replay <capture file> [--json] [--samples N]
-//   [--budget-ms N] [--partial] [--revert-sure] [--sender-funds trusted|strict] [--unknown-continue] [--keeper <truth file> [--keeper-warm [--keeper-warm-passes N]] [--keep-contracts N] [--keep-seeds-per-h N] [--keep-prune-blocks N [--keep-prune-learned]] [--oracle]] [--filter-all] [--no-keep-pick]`
+//   [--budget-ms N] [--partial] [--revert-sure] [--exact-revert-sure] [--sender-funds trusted|strict] [--unknown-continue] [--keeper <truth file> [--keeper-warm [--keeper-warm-passes N]] [--keep-contracts N] [--keep-seeds-per-h N] [--keep-prune-blocks N [--keep-prune-learned]] [--oracle]] [--filter-all] [--no-keep-pick]`
 //     Builds a fresh predicted copy, feeds it the capture event by event and
 //     prints: agreement % (agree / (agree + disagree), per pool compared),
 //     the disagreement breakdown by cause (missedFilter / missedRan /
@@ -425,6 +425,8 @@ fn dec_cfg(d: &mut Dec) -> Res<AheadCfg> {
         // Not in the file (format 1): the replay's own setting
         // (`--revert-sure` = off, the old rule).
         revert_unsure: true,
+        // Not in the file: `--exact-revert-sure` (Nov 2).
+        exact_revert_sure: false,
         // Not in the file either: `--unknown-continue` (Oct 31).
         unknown_continue: false,
         // Not in the file: `--keeper <truth file>` (Oct 31).
@@ -991,6 +993,9 @@ pub struct ReplayOpts {
     /// Override FASTLANE_AHEAD_REVERT_UNSURE (None = on, the default):
     /// `--revert-sure` = Some(false), the old rule, for before / after.
     pub revert_unsure: Option<bool>,
+    /// `--exact-revert-sure`: FASTLANE_AHEAD_EXACT_REVERT_SURE=on for this
+    /// replay (an exact revert keeps its pools sure; see AheadCfg).
+    pub exact_revert_sure: bool,
     /// Override FASTLANE_AHEAD_TRUST_SENDER_FUNDS as captured:
     /// `--sender-funds trusted|strict` (live runs strict unless set).
     pub trust_sender_funds: Option<bool>,
@@ -1068,6 +1073,7 @@ fn replay_with(cap: &CapFile, opts: &ReplayOpts, keeper: Option<KeeperOpts>) -> 
     cfg.compare_delay = u64::MAX / 4;
     cfg.msg_budget_us = opts.budget_ms.map(|m| m.clamp(1, 1000) * 1000).unwrap_or(u64::MAX / 4);
     cfg.revert_unsure = opts.revert_unsure.unwrap_or(true);
+    cfg.exact_revert_sure = opts.exact_revert_sure;
     if let Some(v) = opts.trust_sender_funds {
         cfg.trust_sender_funds = v;
     }
@@ -1274,6 +1280,7 @@ pub fn replay_live(cap: &CapFile, opts: &ReplayOpts, truth: Arc<super::keeper_re
     cfg.compare_delay = u64::MAX / 4;
     cfg.msg_budget_us = opts.budget_ms.unwrap_or(10).clamp(1, 1000) * 1000;
     cfg.revert_unsure = opts.revert_unsure.unwrap_or(true);
+    cfg.exact_revert_sure = opts.exact_revert_sure;
     if let Some(v) = opts.trust_sender_funds {
         cfg.trust_sender_funds = v;
     }
@@ -1624,7 +1631,7 @@ fn report(a: &Ahead, all: &[Value], i: ReportInfo) -> Value {
         },
         "agreement": {
             "pct": t.agreement_pct().map(|p| (p * 10.0).round() / 10.0), "agree": t.agree, "disagree": t.disagree,
-            "unsure": t.unsure, "notFromTx": t.not_from_tx, "confGone": t.conf_gone, "notCaptured": t.not_captured,
+            "unsure": t.unsure, "unsureMoved": t.unsure_moved, "notFromTx": t.not_from_tx, "confGone": t.conf_gone, "notCaptured": t.not_captured,
             "compared": t.compared, "unpredicted": t.unpredicted, "baseLate": t.base_late,
         },
         "disagreements": {
@@ -1637,7 +1644,7 @@ fn report(a: &Ahead, all: &[Value], i: ReportInfo) -> Value {
         },
         "prediction": {
             "msgs": t.msgs, "applied": t.applied, "txsRun": t.txs_run, "txsSkipped": t.txs_skipped, "txsFailed": t.txs_failed,
-            "txsOffRoute": t.txs_off_route, "failedUnknown": t.failed_unknown, "failedWidened": t.failed_widened, "probesSkipped": t.probes_skipped, "revertsMarked": t.reverts_marked, "revertsKept": t.reverts_kept, "revertUnsure": a.cfg().revert_unsure, "trustSenderFunds": a.cfg().trust_sender_funds,
+            "txsOffRoute": t.txs_off_route, "failedUnknown": t.failed_unknown, "failedWidened": t.failed_widened, "probesSkipped": t.probes_skipped, "revertsMarked": t.reverts_marked, "revertsKept": t.reverts_kept, "revertsExact": t.reverts_exact, "exactRevertSure": a.cfg().exact_revert_sure, "revertUnsure": a.cfg().revert_unsure, "trustSenderFunds": a.cfg().trust_sender_funds,
             "filterMissed": t.filter_missed, "rebases": t.rebases, "rebaseRewrites": t.rebase_rewrites,
             "unknownContinue": a.cfg().unknown_continue, "unknownContinued": t.unknown_continued, "missedUnknown": t.missed_unknown,
             // How many blocks the tip was ahead of copy 2, per feed message
@@ -1674,6 +1681,16 @@ pub fn print_report(r: &Value, samples: usize) -> String {
         "AGREEMENT (pools we were sure of): {}%  agree {}  disagree {}   | unsure {}  not from a tx {}  copy 2 holds nothing {}  not captured {}  blocks unpredicted {}  base corrected later {}\n",
         g["pct"].as_f64().map(|x| format!("{x:.1}")).unwrap_or_else(|| "n/a".into()),
         g["agree"], g["disagree"], g["unsure"], g["notFromTx"], g["confGone"], g["notCaptured"], g["unpredicted"], g["baseLate"]
+    );
+    // Nov 2 (ahead5): of the unsure pools, how many the block really moved
+    // (the rest were marked for nothing), and exact reverts kept sure.
+    o += &format!(
+        "UNSURE SPLIT: really moved {}  not moved (false alarm) {} | sure share {}% | exact reverts kept sure {} (FASTLANE_AHEAD_EXACT_REVERT_SURE {})\n",
+        n(&g["unsureMoved"]),
+        n(&g["unsure"]).saturating_sub(n(&g["unsureMoved"])),
+        { let sure = n(&g["agree"]) + n(&g["disagree"]); let all = sure + n(&g["unsure"]); if all == 0 { "n/a".to_string() } else { format!("{:.1}", sure as f64 * 100.0 / all as f64) } },
+        n(&p["revertsExact"]),
+        if p["exactRevertSure"].as_bool() == Some(true) { "on" } else { "off" }
     );
     o += "disagreements by cause:\n";
     let expl = [
@@ -1773,10 +1790,10 @@ pub fn print_report(r: &Value, samples: usize) -> String {
     o
 }
 
-/// `arbsim ahead-replay <capture file> [--json] [--samples N] [--budget-ms N] [--partial] [--revert-sure] [--sender-funds trusted|strict] [--unknown-continue] [--keeper <truth file> [--keeper-warm [--keeper-warm-passes N]] [--keep-contracts N] [--keep-seeds-per-h N] [--keep-prune-blocks N [--keep-prune-learned]] [--oracle]] [--filter-all] [--no-keep-pick]`
+/// `arbsim ahead-replay <capture file> [--json] [--samples N] [--budget-ms N] [--partial] [--revert-sure] [--exact-revert-sure] [--sender-funds trusted|strict] [--unknown-continue] [--keeper <truth file> [--keeper-warm [--keeper-warm-passes N]] [--keep-contracts N] [--keep-seeds-per-h N] [--keep-prune-blocks N [--keep-prune-learned]] [--oracle]] [--filter-all] [--no-keep-pick]`
 pub fn replay_main(args: &[String]) {
     let Some(path) = args.get(2).filter(|a| !a.starts_with("--")) else {
-        eprintln!("usage: arbsim ahead-replay <capture file> [--json] [--samples N] [--budget-ms N] [--partial] [--revert-sure] [--sender-funds trusted|strict] [--unknown-continue] [--keeper <truth file> [--keeper-warm [--keeper-warm-passes N]] [--keep-contracts N] [--keep-seeds-per-h N] [--keep-prune-blocks N [--keep-prune-learned]] [--oracle]] [--filter-all] [--no-keep-pick]");
+        eprintln!("usage: arbsim ahead-replay <capture file> [--json] [--samples N] [--budget-ms N] [--partial] [--revert-sure] [--exact-revert-sure] [--sender-funds trusted|strict] [--unknown-continue] [--keeper <truth file> [--keeper-warm [--keeper-warm-passes N]] [--keep-contracts N] [--keep-seeds-per-h N] [--keep-prune-blocks N [--keep-prune-learned]] [--oracle]] [--filter-all] [--no-keep-pick]");
         std::process::exit(2);
     };
     let arg = |f: &str| args.iter().position(|a| a == f).and_then(|i| args.get(i + 1)).and_then(|v| v.parse::<u64>().ok());
@@ -1804,6 +1821,7 @@ pub fn replay_main(args: &[String]) {
     let opts = ReplayOpts {
         budget_ms: arg("--budget-ms"),
         revert_unsure: args.iter().any(|a| a == "--revert-sure").then_some(false),
+        exact_revert_sure: args.iter().any(|a| a == "--exact-revert-sure"),
         trust_sender_funds,
         unknown_continue: args.iter().any(|a| a == "--unknown-continue"),
         oracle: args.iter().any(|a| a == "--oracle"),
