@@ -180,6 +180,19 @@ pub struct KeeperCfg {
     /// often than this default) dropped 28% of the held values with the
     /// same agreement (31 / 7 vs 30 / 7 with it off) and 0 wrong values.
     pub prune_blocks: u64,
+    /// FASTLANE_AHEAD_KEEP_PRUNE_LEARNED (memory fix 2, Nov 2) [on live; off
+    /// in the core's own default]: the prune also drops LEARNED values that
+    /// no run READ and no block wrote for two windows (and forgets them in
+    /// the learned list, so they are not seeded again). Live, with adopted
+    /// values pruned, the learned ones still grew ~45,000 an hour (mostly
+    /// one-off balances a single run once lacked), so the keeper never
+    /// levelled off. The predicted copy now reports every keeper value its
+    /// runs read (`mark_used`), and a learned value counts as touched in
+    /// the window it is learned, so a value runs keep using is never
+    /// dropped. A value dropped and needed again: one miss, learned and
+    /// seeded again (self-healing). off = learned values kept for good (as
+    /// before). Only matters with FASTLANE_AHEAD_KEEP_PRUNE_BLOCKS > 0.
+    pub prune_learned: bool,
 }
 
 /// FASTLANE_AHEAD_KEEP_PRUNE_BLOCKS default (memory fix 2, Nov 2): ~5 min
@@ -207,6 +220,8 @@ impl Default for KeeperCfg {
             // Off for the core's own defaults (tests, replay) unless asked;
             // the live setting (from_lookup) defaults to on.
             prune_blocks: 0,
+            // Off in the core's default (tests, replay unless asked); on live.
+            prune_learned: false,
         }
     }
 }
@@ -231,6 +246,7 @@ impl KeeperCfg {
             // Memory fix (Nov 1): 0 = off; anything else at least 100 blocks.
             // Default 3,000 (memory fix 2, Nov 2; was 18,000: see above).
             prune_blocks: get("FASTLANE_AHEAD_KEEP_PRUNE_BLOCKS").and_then(|v| v.trim().parse::<u64>().ok()).map(|v| if v == 0 { 0 } else { v.clamp(100, 10_000_000) }).unwrap_or(PRUNE_BLOCKS_DEFAULT),
+            prune_learned: super::ahead::on_off(get("FASTLANE_AHEAD_KEEP_PRUNE_LEARNED").as_deref()).unwrap_or(true),
             on,
             max_contracts: num("FASTLANE_AHEAD_KEEP_CONTRACTS", d.max_contracts as u64, 1, 1000) as usize,
             max_slots_per,
@@ -421,6 +437,14 @@ impl SlotSet {
     fn contains(&self, s: &U256) -> bool {
         self.0.binary_search(s).is_ok()
     }
+    /// (Nov 2, PRUNE_LEARNED) Take these values out; returns how many were in.
+    fn remove_all(&mut self, gone: &[U256]) -> usize {
+        let mut g = gone.to_vec();
+        g.sort();
+        let before = self.0.len();
+        self.0.retain(|x| g.binary_search(x).is_err());
+        before - self.0.len()
+    }
 }
 
 /// A learned contract (kept or not yet).
@@ -481,6 +505,10 @@ pub struct KeeperStats {
     pub pruned_values: u64,
     pub pruned_codes: u64,
     pub prune_last_values: u64,
+    /// (Nov 2) Learned values the prune dropped (included in pruned_values),
+    /// and "a run read this kept value" marks received.
+    pub pruned_learned: u64,
+    pub used_marks: u64,
     pub audits: u64,
     pub audit_values: u64,
     pub audit_mismatch: u64,
@@ -506,7 +534,7 @@ impl KeeperStats {
             "learned": self.learned, "seedsSent": self.seeds_sent, "seedValues": self.seed_values, "seedsDropped": self.seeds_dropped,
             "evicted": self.evicted, "recreated": self.recreated, "adopted": self.adopted, "refusedFull": self.refused_full, "candsDropped": self.cands_dropped,
             "memLearnSkipped": self.mem_learn_skipped,
-            "prunes": self.prunes, "prunedValues": self.pruned_values, "prunedCodes": self.pruned_codes, "pruneLastValues": self.prune_last_values, "audits": self.audits, "auditValues": self.audit_values, "auditMismatch": self.audit_mismatch,
+            "prunes": self.prunes, "prunedValues": self.pruned_values, "prunedCodes": self.pruned_codes, "pruneLastValues": self.prune_last_values, "prunedLearned": self.pruned_learned, "usedMarks": self.used_marks, "audits": self.audits, "auditValues": self.audit_values, "auditMismatch": self.audit_mismatch,
             "resets": self.resets.iter().map(|(k, v)| (k.to_string(), json!(v))).collect::<serde_json::Map<String, Value>>(),
             "applyUs": crate::timing::pct_of(&mut t),
             "samples": self.samples,
@@ -692,6 +720,15 @@ impl KeeperCore {
             return;
         }
         self.stats.learned += items.len() as u64;
+        // PRUNE_LEARNED (Nov 2): a value learned now is touched now (its
+        // seed may still be on the way; it must survive the next prune).
+        if self.cfg.prune_blocks > 0 && self.cfg.prune_learned {
+            for it in items {
+                if let MissItem::Slot(a, sl) = it {
+                    self.written_now.insert(written_key(a, sl));
+                }
+            }
+        }
         let total_held: usize = self.cur.slots();
         let mut grew: Vec<Address> = Vec::new();
         for (a, (slots, basics)) in by {
@@ -990,6 +1027,19 @@ impl KeeperCore {
         Ok(())
     }
 
+    /// PRUNE_LEARNED (Nov 2): kept values the predicted copy's runs READ.
+    /// They count as touched in this window, like a block's write, so the
+    /// prune keeps them. Only with the prune and PRUNE_LEARNED on.
+    pub fn mark_used(&mut self, reads: &[(Address, U256)]) {
+        if self.cfg.prune_blocks == 0 || !self.cfg.prune_learned {
+            return;
+        }
+        self.stats.used_marks += reads.len() as u64;
+        for (a, sl) in reads {
+            self.written_now.insert(written_key(a, sl));
+        }
+    }
+
     /// PRUNE (FASTLANE_AHEAD_KEEP_PRUNE_BLOCKS, memory fix Nov 1): drop the
     /// held values nobody needs any more. A value stays when
     ///   - a predicted run asked for it (it is in the contract's learned
@@ -1009,7 +1059,11 @@ impl KeeperCore {
             if acct.storage_complete || acct.storage.is_empty() {
                 continue;
             }
-            let need = self.cands.get(&a).map(|c| &c.slots);
+            // PRUNE_LEARNED (Nov 2): learned values are no longer kept for
+            // good; like adopted ones they stay only while runs read them
+            // or blocks write them (both mark `written_*`).
+            let learned_too = self.cfg.prune_learned;
+            let need = if learned_too { None } else { self.cands.get(&a).map(|c| &c.slots) };
             let gone: Vec<U256> = acct
                 .storage
                 .keys()
@@ -1018,6 +1072,13 @@ impl KeeperCore {
                 .collect();
             if gone.is_empty() {
                 continue;
+            }
+            if learned_too {
+                // Forget them in the learned list too, or the next learn /
+                // restart of this contract would seed them straight back.
+                if let Some(c) = self.cands.get_mut(&a) {
+                    self.stats.pruned_learned += c.slots.remove_all(&gone) as u64;
+                }
             }
             let mut m = acct.clone();
             for s in &gone {
@@ -1129,7 +1190,7 @@ impl KeeperCore {
             "head": self.head, "contracts": held, "accounts": accts, "values": slots, "codes": self.cur.codes.len(),
             "candidates": self.cands.len(), "candidateValues": self.cands.values().map(|c| c.slots.len()).sum::<usize>(), "seedsWaiting": self.seeds.len(), "versions": self.versions.len(),
             "recentDiffs": self.recent.len(), "memPaused": self.mem_pause,
-            "prune": {"everyBlocks": self.cfg.prune_blocks, "writtenTracked": self.written_now.len() + self.written_prev.len(), "nextAt": self.prune_from.map(|f| f + self.cfg.prune_blocks)},
+            "prune": {"everyBlocks": self.cfg.prune_blocks, "learnedToo": self.cfg.prune_learned, "writtenTracked": self.written_now.len() + self.written_prev.len(), "nextAt": self.prune_from.map(|f| f + self.cfg.prune_blocks)},
             "stats": self.stats.json(),
         })
     }
@@ -1455,6 +1516,33 @@ pub fn learn_hook(items: Vec<MissItem>) {
     }
 }
 
+/// PRUNE_LEARNED (Nov 2): the keeper values the predicted copy's runs read,
+/// waiting for the keeper thread (it takes them every loop). Bounded: past
+/// USED_MAX waiting entries new ones are dropped (counted) - a dropped mark
+/// can at worst let a used value be pruned once (then missed, learned and
+/// seeded again).
+const USED_MAX: usize = 262_144;
+static USED: Mutex<Vec<(Address, U256)>> = Mutex::new(Vec::new());
+static USED_DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The predicted copy's runs: keeper values they read (no-op when nobody takes them).
+pub fn used_hook(items: Vec<(Address, U256)>) {
+    let mut u = USED.lock().unwrap_or_else(|e| e.into_inner());
+    let room = USED_MAX.saturating_sub(u.len());
+    if items.len() > room {
+        USED_DROPPED.fetch_add((items.len() - room) as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+    u.extend(items.into_iter().take(room));
+}
+
+/// The keeper thread: take the waiting "used" marks.
+fn drain_used(k: &mut KeeperCore) {
+    let items = std::mem::take(&mut *USED.lock().unwrap_or_else(|e| e.into_inner()));
+    if !items.is_empty() {
+        k.mark_used(&items);
+    }
+}
+
 /// Is the keeper running?
 pub fn running() -> bool {
     RT.get().is_some()
@@ -1477,6 +1565,7 @@ pub fn status_json() -> Option<Value> {
     let rt = RT.get()?;
     let mut v = rt.sink.status.lock().unwrap_or_else(|e| e.into_inner()).clone();
     v["learnDropped"] = json!(rt.dropped.load(std::sync::atomic::Ordering::Relaxed));
+    v["usedDropped"] = json!(USED_DROPPED.load(std::sync::atomic::Ordering::Relaxed));
     Some(v)
 }
 
@@ -1559,6 +1648,8 @@ fn drive_serial(io: Arc<dyn KeeperIo>, cfg: KeeperCfg, rx: std::sync::mpsc::Rece
     while !sink.stopped() {
         // Memory guard (memguard.rs): stop growing near pm2's limit.
         k.mem_pause = crate::memguard::pressure();
+        // (Nov 2) Kept values the predicted copy's runs read (prune marks).
+        drain_used(&mut k);
         // Learned values from the predicted copy (all queued; the old loop
         // handed them over one batch at a time).
         while let Ok(items) = rx.try_recv() {
@@ -1774,6 +1865,8 @@ fn drive_pipelined(io: Arc<dyn KeeperIo>, cfg: KeeperCfg, rx: std::sync::mpsc::R
     while !sink.stopped() {
         // Memory guard (memguard.rs): stop growing near pm2's limit.
         k.mem_pause = crate::memguard::pressure();
+        // (Nov 2) Kept values the predicted copy's runs read (prune marks).
+        drain_used(&mut k);
         learn_all(&mut k, &rx);
         if hour.elapsed() >= Duration::from_secs(3600) {
             hour = Instant::now();
@@ -2568,6 +2661,86 @@ mod tests {
         assert_eq!(acct.storage.get(&u(2)), Some(&u(26_100)), "hot value kept, exact");
     }
 
+    /// PRUNE_LEARNED (Nov 2), the second live pattern: with adopted values
+    /// pruned, LEARNED values still grew (~45,000 an hour live: one-off
+    /// values a single run once lacked). With FASTLANE_AHEAD_KEEP_PRUNE_LEARNED
+    /// a learned value stays only while runs READ it (mark_used) or blocks
+    /// write it; one nobody reads goes, and is forgotten in the learned
+    /// list (not seeded straight back). Off: learned values stay for good.
+    #[test]
+    fn learned_values_stay_while_read_and_go_when_nobody_reads_them() {
+        let run = |learned_too: bool| -> KeeperCore {
+            let mut k = KeeperCore::new(KeeperCfg { on: true, max_contracts: 10, prune_blocks: 10, prune_learned: learned_too, ..KeeperCfg::default() });
+            k.start_at(100);
+            // Slot 1: a setting every run reads. Slot 2: a one-off value.
+            k.learn(&[MissItem::Slot(a(1), u(1)), MissItem::Slot(a(1), u(2))]);
+            seed(&mut k, 100);
+            for b in 101..=140 {
+                k.mark_used(&[(a(1), u(1))]);
+                k.apply_block(b, &[]).unwrap();
+            }
+            k
+        };
+        let k = run(true);
+        assert_eq!(k.stats.prunes, 3);
+        let acct = k.account(&a(1)).unwrap();
+        assert_eq!(acct.storage.get(&u(1)), Some(&u(10)), "read every block: kept, exact");
+        assert!(acct.storage.get(&u(2)).is_none(), "nobody read it for two windows: dropped");
+        assert_eq!(k.stats.pruned_learned, 1);
+        assert!(k.stats.used_marks >= 40);
+        // Forgotten in the learned list: learning ANOTHER value of the same
+        // contract seeds only that one, not the dropped one again.
+        let mut k = k;
+        k.learn(&[MissItem::Slot(a(1), u(3))]);
+        let mut asked: Vec<U256> = Vec::new();
+        while let Some(j) = k.take_job() {
+            asked.extend(j.slots.iter().copied());
+        }
+        assert_eq!(asked, vec![u(3)]);
+        // Needed again: one miss -> learned -> seeded again (self-healing).
+        k.learn(&[MissItem::Slot(a(1), u(2))]);
+        seed(&mut k, 140);
+        assert_eq!(k.account(&a(1)).unwrap().storage.get(&u(2)), Some(&u(20)));
+        // Off: the learned one-off value stays.
+        let off = run(false);
+        assert_eq!(off.account(&a(1)).unwrap().storage.get(&u(2)), Some(&u(20)));
+        assert_eq!(off.stats.pruned_learned, 0);
+        assert_eq!(off.stats.used_marks, 0, "off: marks ignored");
+    }
+
+    /// The live growth with both prunes: every block a run learns one
+    /// brand-new value (seeded) that is never read again, 3 settings are
+    /// read every block. Learned-too keeps the size level; old rule grows.
+    #[test]
+    fn live_pattern_learned_values_level_off_with_prune_learned() {
+        let run = |learned_too: bool| -> (KeeperCore, Vec<usize>) {
+            let mut k = KeeperCore::new(KeeperCfg { on: true, max_contracts: 10, prune_blocks: 300, prune_learned: learned_too, max_slots_per: 100_000, max_slots_total: 2_000_000, ..KeeperCfg::default() });
+            k.start_at(100);
+            k.learn(&[MissItem::Slot(a(1), u(1)), MissItem::Slot(a(1), u(2)), MissItem::Slot(a(1), u(3))]);
+            seed(&mut k, 100);
+            let mut sizes = Vec::new();
+            for b in 101..=3_100u64 {
+                k.learn(&[MissItem::Slot(a(1), u(1_000 + b))]);
+                seed(&mut k, b - 1);
+                k.mark_used(&[(a(1), u(1)), (a(1), u(2)), (a(1), u(3))]);
+                k.apply_block(b, &[]).unwrap();
+                if b % 300 == 0 {
+                    sizes.push(k.account(&a(1)).unwrap().storage.len());
+                }
+            }
+            (k, sizes)
+        };
+        let (old, old_sizes) = run(false);
+        assert!(old_sizes.windows(2).all(|w| w[1] > w[0]), "old rule grows: {old_sizes:?}");
+        let (new, new_sizes) = run(true);
+        let tail = &new_sizes[new_sizes.len() - 4..];
+        assert!(tail.iter().all(|n| *n <= 3 * 300 + 3), "bounded by ~3 windows: {new_sizes:?}");
+        assert!(old.account(&a(1)).unwrap().storage.len() > 2_900);
+        for sl in 1..=3u64 {
+            assert_eq!(new.account(&a(1)).unwrap().storage.get(&u(sl)), Some(&u(sl * 10)), "read settings kept");
+        }
+    }
+
     /// A dropped value that a run needs again is learned, seeded again and
     /// from then on kept for good (self-healing; that is why the prune is
     /// safe for accuracy).
@@ -2657,6 +2830,8 @@ mod tests {
         assert_eq!(get(Some("36000")).prune_blocks, 36_000);
         assert_eq!(get(Some("junk")).prune_blocks, 3_000);
         assert_eq!(get(Some("18000")).prune_blocks, 18_000, "the old window is still one setting away");
+        assert!(get(None).prune_learned, "live default: learned values pruned too");
+        assert!(!KeeperCfg::default().prune_learned, "core default: off");
         assert_eq!(KeeperCfg::default().prune_blocks, 0, "the core's own default (tests, replay): off");
     }
 }

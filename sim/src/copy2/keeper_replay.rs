@@ -715,6 +715,9 @@ impl ReplayKeeper {
     /// answers every seed at once (the warm start).
     pub fn advance(&mut self, block: u64, a: &mut Ahead, unlimited: bool) {
         let learned = std::mem::take(&mut a.learned);
+        // (Nov 2) Kept values the runs read: the prune keeps them.
+        let used = std::mem::take(&mut a.used);
+        self.core.mark_used(&used);
         if let Some(v) = self.advance_to(block, &learned, unlimited) {
             a.on_kept(v);
         }
