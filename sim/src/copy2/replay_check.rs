@@ -99,7 +99,8 @@ fn pool_logs(node: &dyn NodeApi, p: &TrackedPool, from: u64, to: u64, max: usize
     let mut out = Vec::new();
     let mut a = from;
     while a <= to && out.len() < max {
-        let b = (a + 49_999).min(to);
+        // The node refuses log ranges over 10,000 blocks.
+        let b = (a + 9_999).min(to);
         let mut f = json!({ "fromBlock": format!("{a:#x}"), "toBlock": format!("{b:#x}"), "address": to_hex(p.address.as_slice()) });
         if let Some(id) = p.v4_id {
             f["topics"] = json!([Value::Null, format!("{id:#x}")]);
