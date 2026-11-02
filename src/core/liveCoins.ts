@@ -82,10 +82,17 @@ export class LiveCoinRule {
   // Why a set of coins can't be traded live, or null if all are allowed.
   blocker(tokens: string[]): string | null {
     for (const t of tokens) {
-      const v = this.verdict(t);
-      if (v === 'refused') return `coin ${t.slice(0, 10)} is not on the live coin list (not USDG/WETH, not an official Robinhood stock token, not in LIVE_EXTRA_COINS)`;
-      if (v === 'unknown') return `coin ${t.slice(0, 10)} not checked yet for the live coin list`;
+      const why = this.blockerOne(t);
+      if (why !== null) return why;
     }
+    return null;
+  }
+
+  // One coin of blocker() (fix 12: lets the caller skip building a list).
+  blockerOne(t: string): string | null {
+    const v = this.verdict(t);
+    if (v === 'refused') return `coin ${t.slice(0, 10)} is not on the live coin list (not USDG/WETH, not an official Robinhood stock token, not in LIVE_EXTRA_COINS)`;
+    if (v === 'unknown') return `coin ${t.slice(0, 10)} not checked yet for the live coin list`;
     return null;
   }
 
@@ -112,4 +119,44 @@ export class LiveCoinRule {
     for (const v of this.known.values()) if (v.ok) allowed++;
     return { checked: this.known.size, allowed };
   }
+}
+
+// LEAN LIVE COIN CHECK (Nov 2, fix 12, ALLOC_LEAN; used by shadowMain's
+// liveBlocker). The same answer as the old code there:
+//   if (rule && (buy.chain === 'robinhood' || sell.chain === 'robinhood'))
+//     return rule.blocker([...new Set([buy.tokenA, buy.tokenB, sell.tokenA,
+//       sell.tokenB].filter(Boolean).map(lower-case))]);
+//   return null;
+// but without making the 4 small lists and the Set on every call (it runs
+// for every route on every candidate-table pass):
+//   - each coin is lower-cased, repeats skipped, asked in the same order and
+//     it stops at the same first refused / unknown coin with the same text
+//     (so the background coin look-ups it starts are the same too),
+//   - rule switched off (LIVE_COIN_RULE not on): every coin is "allowed",
+//     so the answer is null without looking at the coins.
+type CoinSide = { chain?: string; tokenA?: string; tokenB?: string } | undefined;
+export function liveCoinBlockerLean(rule: LiveCoinRule | null, buy: CoinSide, sell: CoinSide): string | null {
+  if (!rule || !(buy?.chain === 'robinhood' || sell?.chain === 'robinhood')) return null;
+  if (!rule.on) return null; // (blocker() would call every coin "allowed")
+  // Up to 4 coins; the first 3 distinct ones are remembered for the repeat check.
+  let c0: string | undefined, c1: string | undefined, c2: string | undefined;
+  for (let i = 0; i < 4; i++) {
+    const raw = i === 0 ? buy?.tokenA : i === 1 ? buy?.tokenB : i === 2 ? sell?.tokenA : sell?.tokenB;
+    if (!raw) continue;
+    const t = raw.toLowerCase();
+    if (t === c0 || t === c1 || t === c2) continue;
+    if (c0 === undefined) c0 = t; else if (c1 === undefined) c1 = t; else if (c2 === undefined) c2 = t;
+    const why = rule.blockerOne(t);
+    if (why !== null) return why;
+  }
+  return null;
+}
+
+// The old code, kept for ALLOC_LEAN=0 and for the equivalence test.
+export function liveCoinBlockerOld(rule: LiveCoinRule | null, buy: CoinSide, sell: CoinSide): string | null {
+  if (rule && (buy?.chain === 'robinhood' || sell?.chain === 'robinhood')) {
+    const coins = [buy?.tokenA, buy?.tokenB, sell?.tokenA, sell?.tokenB].filter((t): t is string => !!t);
+    return rule.blocker([...new Set(coins.map((t) => t.toLowerCase()))]);
+  }
+  return null;
 }

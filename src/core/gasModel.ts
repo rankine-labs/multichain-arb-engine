@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from '
 import { timed } from './stallFinder';
 import { dirname } from 'path';
 import { loopGasUsd, loopGasUnits } from './loopTrader';
+import { allocLeanOn } from '../config/v4Tiers';
 
 // ============================================================================
 // GAS MODEL -- what one trade's gas costs, from measured numbers (Oct 13)
@@ -144,6 +145,7 @@ export class GasCalibration {
       if (list.length > this.maxPerKey) list.splice(0, list.length - this.maxPerKey);
       this.samples.set(k, list);
     };
+    this.medMemo.clear(); // (samples change: medians worked out again)
     push(key);
     // 2-pool samples also feed the funding-wide "any mix" key.
     const m = /^2p:[^:]+:(own|loan)$/.exec(key);
@@ -154,7 +156,23 @@ export class GasCalibration {
   }
 
   count(key: string): number { return this.samples.get(key)?.length ?? 0; }
-  median(key: string): number | null { return median(this.samples.get(key) ?? []); }
+  // MEDIAN MEMO (Nov 2, fix 12, ALLOC_LEAN, default on): the median was
+  // worked out again (a sorted copy of up to 50 samples) for every gas
+  // estimate, i.e. for every candidate built on every table pass (~1.1 MB/s
+  // of throwaway memory in the allocation sampler). The samples only change
+  // in add() / load(), which forget the remembered medians, so the answer
+  // is always the same as working it out. ALLOC_LEAN=0 = no memo.
+  private medMemo = new Map<string, number | null>();
+  private readonly medLean = allocLeanOn(process.env);
+  median(key: string): number | null {
+    if (!this.medLean) return median(this.samples.get(key) ?? []);
+    const hit = this.medMemo.get(key);
+    if (hit !== undefined || this.medMemo.has(key)) return hit ?? null;
+    const m = median(this.samples.get(key) ?? []);
+    if (this.medMemo.size > 1_000) this.medMemo.clear(); // (a few dozen kinds of trade at most)
+    this.medMemo.set(key, m);
+    return m;
+  }
 
   // Units to use: the median once there are enough samples, else the default.
   // Review fix (Oct 13): never below CALIBRATION_FLOOR (75%) of the
@@ -174,6 +192,7 @@ export class GasCalibration {
   }
 
   load(): void {
+    this.medMemo.clear();
     if (!this.file || !existsSync(this.file)) return;
     try {
       const raw = JSON.parse(readFileSync(this.file, 'utf8'));
