@@ -170,6 +170,7 @@ fn kind_str(k: PoolKind) -> &'static str {
         PoolKind::V4 => "v4",
         PoolKind::V2 => "v2",
         PoolKind::Solidly => "solidly",
+        PoolKind::Slipstream => "slipstream",
     }
 }
 
