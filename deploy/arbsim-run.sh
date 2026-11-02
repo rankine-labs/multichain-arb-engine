@@ -8,6 +8,7 @@
 #        QUICKNODE_RPC_ROBINHOOD   -> paid node 2 (backup)
 #        ARBSIM_*                  -> optional sidecar settings (see
 #                                     docs/FAST_CHECK_OPS.md for the list)
+#        MALLOC_* (4 names)        -> glibc malloc tuning (MALLOC_PASS below)
 #        FAST LANE settings        -> the exact list in FASTLANE_PASS below
 #                                     (FASTLANE, RUST_SENDER, kill switch,
 #                                     safety limits, sender settings)
@@ -122,6 +123,27 @@ export ARBSIM_BUDGET_FILE="${ARBSIM_BUDGET_FILE:-$APP_DIR/data/arbsim-node-budge
 # wins; "off" there = never saved / read.
 export ARBSIM_COPY2_STATE_FILE="${ARBSIM_COPY2_STATE_FILE:-$APP_DIR/data/arbsim-copy2-state.bin}"
 [ "$ARBSIM_COPY2_STATE_FILE" = "off" ] && export ARBSIM_COPY2_STATE_FILE=""
+
+# glibc malloc tuning (fix 13, Nov 2): these exact names are passed through
+# from .env when set there (only these names; plain numbers only). Until now
+# only ARBSIM_* lines reached arbsim, so a MALLOC_* line in .env did nothing.
+#   MALLOC_ARENA_MAX        number of malloc heaps (default 2, set below)
+#   MALLOC_MMAP_THRESHOLD_  blocks this big or bigger get their own mapping,
+#                           handed back to the system the moment they are
+#                           freed (setting it also stops glibc raising it)
+#   MALLOC_TRIM_THRESHOLD_  free memory at the heap top above this is handed
+#                           back by itself
+#   MALLOC_TOP_PAD_         extra kept at the heap top on each grow / trim
+# A value that is not a plain number is ignored (glibc would ignore it too).
+MALLOC_PASS=(MALLOC_ARENA_MAX MALLOC_MMAP_THRESHOLD_ MALLOC_TRIM_THRESHOLD_ MALLOC_TOP_PAD_)
+if [ -f "$ENV_FILE" ]; then
+  for key in "${MALLOC_PASS[@]}"; do
+    grep -qE "^[[:space:]]*(export[[:space:]]+)?${key}[[:space:]]*=" "$ENV_FILE" || continue
+    val="$(env_file_value "$ENV_FILE" "$key")"
+    [[ "$val" =~ ^[0-9]+$ ]] || continue
+    export "$key=$val"
+  done
+fi
 
 # Memory: at most 2 malloc "arenas" (glibc's default is 8 per CPU core).
 # The sidecar runs ~20 threads (16 node workers parse big JSON answers);
