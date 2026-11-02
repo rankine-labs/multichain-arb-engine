@@ -51,6 +51,28 @@
 //   off (old behaviour). Like the guard, it is only asked by the predicted
 //   copy and the keeper (and off when the guard is off).
 //
+//   FIX 13 (Nov 2): two more ways to hand freed memory back BEFORE the
+//   pause line stops seeing-ahead. Measured live Nov 2 (soft trim every
+//   300 s): the program really used ~1,035-1,060 MB, but the process sat at
+//   1,350-1,410 MB, because glibc grew its kept free memory again by ~200 MB
+//   between two soft trims (each trim handed back ~210 MB in ~30 ms). In one
+//   hour the guard held back 13,681 blocks (80% of messages unpredicted).
+//     - REGROW TRIM (ARBSIM_MEM_REGROW_TRIM_MB [80] /
+//       ARBSIM_MEM_REGROW_TRIM_MIN_S [60]): above the soft line, also trim
+//       as soon as the process has grown 80 MB since the last trim ended
+//       (at most once every 60 s). Real data growth just moves the baseline
+//       up (the next trim needs another 80 MB), so it never trims in a loop.
+//       0 = off (only the every-300 s soft trim, as before).
+//     - TRIM FIRST (ARBSIM_AHEAD_MEM_TRIM_FIRST [on]): when the process
+//       reaches the pause line, hand freed memory back first and pause only
+//       if it is STILL at or above the line afterwards. So the pause only
+//       happens when the program really holds that much, not when glibc
+//       merely keeps it. At most one such try every
+//       ARBSIM_AHEAD_MEM_TRIM_FIRST_GAP_S [20] s (counted from any trim).
+//   Cost: one malloc_trim (~30 ms, glibc locks held; measured live) at most
+//   once a minute, always from the predicted copy's or the keeper's thread,
+//   never trading's. All three trims share the same `trim_now`.
+//
 //   BREAKDOWN (status "memory"): process size now and its peak, and what
 //   glibc's allocator says: in use by the program, held free inside the
 //   allocator (freed but not handed back: fragmentation), and big blocks
@@ -79,6 +101,19 @@ pub struct GuardCfg {
     /// ARBSIM_MEM_SOFT_TRIM_EVERY_S [300]: at most one soft trim this often
     /// (30..=86400 s): each trim holds glibc's locks for ~50-100 ms.
     pub soft_trim_every_s: u64,
+    /// ARBSIM_MEM_REGROW_TRIM_MB [80] (fix 13): above the soft line, trim
+    /// again once the process grew this much since the last trim ended.
+    /// 0 = off.
+    pub regrow_trim_mb: u64,
+    /// ARBSIM_MEM_REGROW_TRIM_MIN_S [60] (fix 13): never two regrow trims
+    /// closer than this (30..=3600 s).
+    pub regrow_trim_min_s: u64,
+    /// ARBSIM_AHEAD_MEM_TRIM_FIRST [on] (fix 13): at the pause line, trim
+    /// first and pause only if still over the line afterwards.
+    pub trim_first: bool,
+    /// ARBSIM_AHEAD_MEM_TRIM_FIRST_GAP_S [20] (fix 13): no trim-first try
+    /// within this many seconds of any trim (5..=600 s).
+    pub trim_first_gap_s: u64,
 }
 
 impl GuardCfg {
@@ -92,7 +127,12 @@ impl GuardCfg {
         // Soft trim (Nov 2): 0 = off; the gap to the pause line is what it buys.
         let soft_trim_mb = num("ARBSIM_MEM_SOFT_TRIM_MB", 1150);
         let soft_trim_every_s = num("ARBSIM_MEM_SOFT_TRIM_EVERY_S", 300).clamp(30, 86_400);
-        GuardCfg { pause_mb, resume_mb, trim, soft_trim_mb, soft_trim_every_s }
+        // Fix 13 (Nov 2): regrow trim and trim-first (see the header).
+        let regrow_trim_mb = num("ARBSIM_MEM_REGROW_TRIM_MB", 80);
+        let regrow_trim_min_s = num("ARBSIM_MEM_REGROW_TRIM_MIN_S", 60).clamp(30, 3_600);
+        let trim_first = crate::copy2::ahead::on_off(get("ARBSIM_AHEAD_MEM_TRIM_FIRST").as_deref()).unwrap_or(true);
+        let trim_first_gap_s = num("ARBSIM_AHEAD_MEM_TRIM_FIRST_GAP_S", 20).clamp(5, 600);
+        GuardCfg { pause_mb, resume_mb, trim, soft_trim_mb, soft_trim_every_s, regrow_trim_mb, regrow_trim_min_s, trim_first, trim_first_gap_s }
     }
 }
 
@@ -144,6 +184,26 @@ pub fn soft_trim_due(cfg: &GuardCfg, paused: bool, rss_mb: f64, since_last_s: Op
     cfg.soft_trim_mb > 0 && !paused && rss_mb >= cfg.soft_trim_mb as f64 && since_last_s.is_none_or(|s| s >= cfg.soft_trim_every_s)
 }
 
+/// REGROW TRIM (fix 13): above the soft line and not paused, has the
+/// process grown `regrow_trim_mb` since the last trim ended (`after_last_mb`)
+/// and is the last soft/regrow trim at least `regrow_trim_min_s` ago?
+/// Before any trim (`after_last_mb` None) the plain soft trim decides.
+pub fn regrow_trim_due(cfg: &GuardCfg, paused: bool, rss_mb: f64, since_last_s: Option<u64>, after_last_mb: Option<f64>) -> bool {
+    cfg.soft_trim_mb > 0
+        && cfg.regrow_trim_mb > 0
+        && !paused
+        && rss_mb >= cfg.soft_trim_mb as f64
+        && since_last_s.is_some_and(|s| s >= cfg.regrow_trim_min_s)
+        && after_last_mb.is_some_and(|a| rss_mb >= a + cfg.regrow_trim_mb as f64)
+}
+
+/// TRIM FIRST (fix 13): about to pause (not paused, at or over the pause
+/// line)? Then hand back freed memory first, unless any trim ran within
+/// `trim_first_gap_s` (`since_any_trim_s` None = never trimmed).
+pub fn trim_first_due(cfg: &GuardCfg, paused: bool, rss_mb: f64, since_any_trim_s: Option<u64>) -> bool {
+    cfg.pause_mb > 0 && cfg.trim_first && !paused && rss_mb >= cfg.pause_mb as f64 && since_any_trim_s.is_none_or(|s| s >= cfg.trim_first_gap_s)
+}
+
 struct Rt {
     cfg: GuardCfg,
     started: Instant,
@@ -171,6 +231,16 @@ struct Inner {
     soft_trim_last_ms: f64,
     soft_trim_last_freed_mb: f64,
     soft_trim_freed_total_mb: f64,
+    /// Fix 13: process size right after the last trim of any kind (the
+    /// regrow trim's baseline), when the last trim of any kind ran, how many
+    /// soft trims were regrow-triggered, trim-first tries / pauses avoided.
+    after_last_trim_mb: Option<f64>,
+    last_any_trim: Option<Instant>,
+    regrow_trims: u64,
+    trim_first_tries: u64,
+    trim_first_saved: u64,
+    trim_first_freed_total_mb: f64,
+    trim_first_last_ms: f64,
 }
 
 fn rt() -> &'static Rt {
@@ -234,11 +304,36 @@ pub fn pressure() -> bool {
     if r.last_look_ms.compare_exchange(last, now_ms, Ordering::AcqRel, Ordering::Relaxed).is_err() {
         return r.paused.load(Ordering::Relaxed);
     }
-    let rss = rss_mb();
+    let mut rss = rss_mb();
     let mut g = r.inner.lock().unwrap_or_else(|e| e.into_inner());
     g.last_rss_mb = rss;
     g.max_rss_seen_mb = g.max_rss_seen_mb.max(rss);
     let cfg = r.cfg.clone();
+    // TRIM FIRST (fix 13): at the pause line, hand back what glibc merely
+    // keeps, then decide on the size after the trim.
+    if trim_first_due(&cfg, g.guard.paused, rss, g.last_any_trim.map(|t| t.elapsed().as_secs())) {
+        g.last_any_trim = Some(Instant::now());
+        drop(g);
+        let ms = trim_now();
+        let after = rss_mb();
+        g = r.inner.lock().unwrap_or_else(|e| e.into_inner());
+        g.trim_first_tries += 1;
+        g.trim_first_last_ms = (ms * 10.0).round() / 10.0;
+        g.trim_first_freed_total_mb += ((rss - after).max(0.0) * 10.0).round() / 10.0;
+        g.after_last_trim_mb = Some(after);
+        if after < cfg.pause_mb as f64 {
+            g.trim_first_saved += 1;
+        }
+        if g.trim_first_tries <= 3 || g.trim_first_tries % 20 == 0 {
+            eprintln!(
+                "[arbsim] memory trim-first #{}: {rss:.0} -> {after:.0} MB in {ms:.0} ms ({})",
+                g.trim_first_tries,
+                if after < cfg.pause_mb as f64 { "no pause needed" } else { "still over the pause line" }
+            );
+        }
+        rss = after;
+        g.last_rss_mb = rss;
+    }
     match g.guard.look(&cfg, rss) {
         Step::Paused => {
             g.paused_since = Some(Instant::now());
@@ -273,12 +368,21 @@ pub fn pressure() -> bool {
         g.trim_last_freed_mb = ((rss - after).max(0.0) * 10.0).round() / 10.0;
         g.trim_freed_total_mb += g.trim_last_freed_mb;
         g.last_rss_mb = after;
+        g.after_last_trim_mb = Some(after);
+        g.last_any_trim = Some(Instant::now());
         return paused;
     }
     // SOFT TRIM (Nov 2): not paused but above the soft line: hand back
     // what glibc keeps before it pushes the process to the pause line.
-    let soft_due = soft_trim_due(&cfg, paused, rss, g.last_soft_trim.map(|t| t.elapsed().as_secs()));
-    if soft_due {
+    let since_soft = g.last_soft_trim.map(|t| t.elapsed().as_secs());
+    let soft_due = soft_trim_due(&cfg, paused, rss, since_soft);
+    // REGROW TRIM (fix 13): sooner than the soft interval once the process
+    // grew `regrow_trim_mb` since the last trim ended.
+    let regrow_due = !soft_due && regrow_trim_due(&cfg, paused, rss, since_soft, g.after_last_trim_mb);
+    if soft_due || regrow_due {
+        if regrow_due {
+            g.regrow_trims += 1;
+        }
         g.last_soft_trim = Some(Instant::now());
         drop(g);
         let ms = trim_now();
@@ -289,8 +393,15 @@ pub fn pressure() -> bool {
         g.soft_trim_last_freed_mb = ((rss - after).max(0.0) * 10.0).round() / 10.0;
         g.soft_trim_freed_total_mb += g.soft_trim_last_freed_mb;
         g.last_rss_mb = after;
-        if g.soft_trims <= 3 || g.soft_trims % 12 == 0 {
-            eprintln!("[arbsim] memory soft trim #{}: {rss:.0} -> {after:.0} MB in {ms:.0} ms (ARBSIM_MEM_SOFT_TRIM_MB {})", g.soft_trims, cfg.soft_trim_mb);
+        g.after_last_trim_mb = Some(after);
+        g.last_any_trim = Some(Instant::now());
+        if g.soft_trims <= 3 || g.soft_trims % 60 == 0 {
+            eprintln!(
+                "[arbsim] memory soft trim #{} ({}): {rss:.0} -> {after:.0} MB in {ms:.0} ms (ARBSIM_MEM_SOFT_TRIM_MB {})",
+                g.soft_trims,
+                if regrow_due { "regrow" } else { "interval" },
+                cfg.soft_trim_mb
+            );
         }
     }
     paused
@@ -375,7 +486,18 @@ pub fn status_json() -> Value {
             "mb": r.cfg.soft_trim_mb, "everyS": r.cfg.soft_trim_every_s, "trims": g.soft_trims, "lastMs": g.soft_trim_last_ms,
             "lastFreedMb": g.soft_trim_last_freed_mb, "freedTotalMb": (g.soft_trim_freed_total_mb * 10.0).round() / 10.0,
             "lastAgoS": g.last_soft_trim.map(|t| t.elapsed().as_secs()),
+            // Fix 13: how many of `trims` were regrow-triggered.
+            "regrowMb": r.cfg.regrow_trim_mb, "regrowMinS": r.cfg.regrow_trim_min_s, "regrowTrims": g.regrow_trims,
+            "afterLastTrimMb": g.after_last_trim_mb,
         },
+        // Fix 13: trims at the pause line before pausing (saved = no pause needed).
+        "trimFirst": {
+            "on": r.cfg.trim_first, "gapS": r.cfg.trim_first_gap_s, "tries": g.trim_first_tries, "saved": g.trim_first_saved,
+            "freedTotalMb": (g.trim_first_freed_total_mb * 10.0).round() / 10.0, "lastMs": g.trim_first_last_ms,
+        },
+        // Fix 13: bytes the program holds, counted by src/alloc.rs (cheap,
+        // live, no glibc locks; 0 when `alloc::Chosen` is not the allocator).
+        "countedInUseMb": (crate::alloc::held_bytes() as f64 / 1_048_576.0 * 10.0).round() / 10.0,
     })
 }
 
@@ -391,7 +513,25 @@ mod tests {
 
     #[test]
     fn settings_and_defaults() {
-        assert_eq!(cfg(&[]), GuardCfg { pause_mb: 1350, resume_mb: 1290, trim: true, soft_trim_mb: 1150, soft_trim_every_s: 300 });
+        assert_eq!(
+            cfg(&[]),
+            GuardCfg {
+                pause_mb: 1350,
+                resume_mb: 1290,
+                trim: true,
+                soft_trim_mb: 1150,
+                soft_trim_every_s: 300,
+                regrow_trim_mb: 80,
+                regrow_trim_min_s: 60,
+                trim_first: true,
+                trim_first_gap_s: 20
+            }
+        );
+        // Fix 13 switches and their limits.
+        assert_eq!(cfg(&[("ARBSIM_MEM_REGROW_TRIM_MB", "0")]).regrow_trim_mb, 0);
+        assert_eq!(cfg(&[("ARBSIM_MEM_REGROW_TRIM_MIN_S", "5")]).regrow_trim_min_s, 30, "never more often than every 30 s");
+        assert_eq!(cfg(&[("ARBSIM_AHEAD_MEM_TRIM_FIRST", "off")]).trim_first, false);
+        assert_eq!(cfg(&[("ARBSIM_AHEAD_MEM_TRIM_FIRST_GAP_S", "0")]).trim_first_gap_s, 5);
         assert_eq!(cfg(&[("ARBSIM_MEM_SOFT_TRIM_MB", "0")]).soft_trim_mb, 0);
         assert_eq!(cfg(&[("ARBSIM_MEM_SOFT_TRIM_EVERY_S", "1")]).soft_trim_every_s, 30, "never more often than every 30 s");
         assert_eq!(cfg(&[("ARBSIM_AHEAD_MEM_PAUSE_MB", "0")]).pause_mb, 0);
@@ -455,6 +595,81 @@ mod tests {
         assert!((2..=12).contains(&trims), "trims {trims}");
     }
 
+    /// REGROW TRIM (fix 13): fires above the soft line once the process grew
+    /// 80 MB since the last trim ended, not within 60 s of the last soft trim,
+    /// not while paused, not before a first trim, and never when off.
+    #[test]
+    fn regrow_trim_fires_on_growth_since_the_last_trim() {
+        let c = cfg(&[]);
+        assert!(!regrow_trim_due(&c, false, 1300.0, Some(120), None), "no trim yet: the plain soft trim decides");
+        assert!(!regrow_trim_due(&c, false, 1200.0, Some(120), Some(1150.0)), "+50 MB: not yet");
+        assert!(regrow_trim_due(&c, false, 1230.0, Some(120), Some(1150.0)), "+80 MB: trim");
+        assert!(!regrow_trim_due(&c, false, 1230.0, Some(59), Some(1150.0)), "within 60 s: not yet");
+        assert!(!regrow_trim_due(&c, true, 1400.0, Some(120), Some(1150.0)), "paused: the pause's own trims");
+        assert!(!regrow_trim_due(&c, false, 1100.0, Some(120), Some(1000.0)), "below the soft line: nothing");
+        let off = cfg(&[("ARBSIM_MEM_REGROW_TRIM_MB", "0")]);
+        assert!(!regrow_trim_due(&off, false, 1400.0, Some(999), Some(1000.0)), "off: never");
+        let soft_off = cfg(&[("ARBSIM_MEM_SOFT_TRIM_MB", "0")]);
+        assert!(!regrow_trim_due(&soft_off, false, 1400.0, Some(999), Some(1000.0)), "soft trim off: regrow off too");
+    }
+
+    /// TRIM FIRST (fix 13): only when about to pause, and not right after a trim.
+    #[test]
+    fn trim_first_only_at_the_pause_line() {
+        let c = cfg(&[]);
+        assert!(!trim_first_due(&c, false, 1349.0, None), "below the pause line: nothing");
+        assert!(trim_first_due(&c, false, 1350.0, None), "at the line, never trimmed: trim first");
+        assert!(trim_first_due(&c, false, 1400.0, Some(20)), "last trim 20 s ago: trim first");
+        assert!(!trim_first_due(&c, false, 1400.0, Some(19)), "trimmed 19 s ago: pause as before");
+        assert!(!trim_first_due(&c, true, 1400.0, None), "already paused: the pause's own trims");
+        assert!(!trim_first_due(&cfg(&[("ARBSIM_AHEAD_MEM_TRIM_FIRST", "off")]), false, 1400.0, None), "off");
+        assert!(!trim_first_due(&cfg(&[("ARBSIM_AHEAD_MEM_PAUSE_MB", "0")]), false, 9000.0, None), "guard off");
+    }
+
+    /// The live Nov 2 pattern, minute by minute for 2 hours: in use flat
+    /// ~1,050 MB, glibc's kept free memory regrows ~40 MB a minute (~200 MB
+    /// between two 300 s soft trims, as measured), a trim brings the process
+    /// back to in use + 110 MB (live: ~1,150-1,200 MB after a trim). Old rules (soft trim every 300 s only): the
+    /// process crosses the 1350 pause line. Fix 13 (regrow + trim first): it
+    /// never pauses, and trims at most once a minute.
+    #[test]
+    fn live_pattern_no_pause_with_fix13() {
+        fn run(c: &GuardCfg) -> (u64, f64, u64) {
+            let (in_use, regrow_per_min, after_trim) = (1050.0f64, 40.0f64, 1160.0f64);
+            let mut rss = 1150.0f64;
+            let (mut g, mut last_soft, mut after_last, mut last_any) = (Guard::default(), None::<u64>, None::<f64>, None::<u64>);
+            let (mut max, mut trims) = (0.0f64, 0u64);
+            for min in 0..120u64 {
+                rss += regrow_per_min;
+                let s = |t: Option<u64>| t.map(|l| (min - l) * 60);
+                if trim_first_due(c, g.paused, rss, s(last_any)) {
+                    rss = after_trim;
+                    after_last = Some(rss);
+                    last_any = Some(min);
+                    trims += 1;
+                }
+                g.look(c, rss);
+                if soft_trim_due(c, g.paused, rss, s(last_soft)) || regrow_trim_due(c, g.paused, rss, s(last_soft), after_last) {
+                    rss = after_trim;
+                    after_last = Some(rss);
+                    last_soft = Some(min);
+                    last_any = Some(min);
+                    trims += 1;
+                }
+                max = max.max(rss);
+                assert!(rss >= in_use);
+            }
+            (g.pauses, max, trims)
+        }
+        let old = cfg(&[("ARBSIM_MEM_REGROW_TRIM_MB", "0"), ("ARBSIM_AHEAD_MEM_TRIM_FIRST", "off")]);
+        let (old_pauses, old_max, _) = run(&old);
+        assert!(old_pauses > 0 && old_max >= 1350.0, "old rules pause: {old_pauses} pauses, max {old_max}");
+        let (pauses, max, trims) = run(&cfg(&[]));
+        assert_eq!(pauses, 0, "fix 13: no pause (max {max})");
+        assert!(max < 1300.0, "fix 13 max {max}");
+        assert!(trims <= 120, "at most one trim a minute: {trims}");
+    }
+
     #[test]
     fn breakdown_has_the_fields() {
         let s = status_json();
@@ -465,6 +680,9 @@ mod tests {
         assert!(s["malloc"]["inUseMb"].is_number());
         assert_eq!(s["aheadGuard"]["pauseMb"], json!(1350));
         assert_eq!(s["softTrim"]["mb"], json!(1150));
+        assert_eq!(s["softTrim"]["regrowMb"], json!(80));
+        assert_eq!(s["trimFirst"]["on"], json!(true));
+        assert!(s["countedInUseMb"].is_number());
     }
 
     /// Offline measurement (run by hand): what malloc_trim and mallinfo2
