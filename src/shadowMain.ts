@@ -227,6 +227,7 @@ import { trustFreshConfigFromEnv, wsTrustProblem, WsFacts } from './core/trustFr
 // Stall finder (Oct 14): which job froze the bot, plus chunked versions of the big jobs.
 import { stallFinder, timed, timedAsync, formatStallLine, formatStallDetail, markStretch, labelled } from './core/stallFinder';
 import { FreezeProfiler } from './core/freezeProfile';
+import { FreezeNamer } from './core/freezeNamer';
 import { groupsStartupPlan } from './core/groupsStartup';
 import { lenderFastOn, parseApprovedLenders, lenderCandidatesOld, lenderCandidatesFor } from './core/lenderPick';
 import { runSteps, drainSteps, writeJsonChunkedQueued, setSliceCap, SlicedQueue, TurnQueue } from './core/chunked';
@@ -269,7 +270,18 @@ stallFinder.start();
 // FREEZE PROFILE (core/freezeProfile.ts, Oct 23): after repeated long
 // freezes, a 5 s CPU profile is recorded (at most every 30 min) and its top
 // 10 functions logged as one "[freeze-profile]" line. FREEZE_PROFILE=0 = off.
-{
+// FREEZE NAMER (core/freezeNamer.ts, Nov 2): the profiler runs in 10 s
+// pieces and only the samples inside each freeze are kept, so every freeze
+// gets a name (step + function), even the ones listed as "other". One
+// "[freeze-named]" line every 5 min. Stops by itself after 120 min
+// (FREEZE_NAMER_MINUTES). FREEZE_NAMER=0 = off (the old 5 s profile runs
+// instead: both can't share the profiler).
+const freezeNamer = new FreezeNamer({ time: (name) => stallFinder.begin(name) });
+if (freezeNamer.s.enabled && stallFinder.enabled && freezeNamer.start()) {
+      stallFinder.onStallWindow((start, end, ms, job) => freezeNamer.noteFreeze(start, end, ms, job));
+      console.log(`[freeze-named] on: CPU profiler in ${freezeNamer.s.chunkMs / 1000} s pieces at ${freezeNamer.s.intervalUs} us, only samples inside freezes over ${freezeNamer.s.minFreezeMs} ms are kept; off by itself after ${freezeNamer.s.minutes} min (FREEZE_NAMER=0 turns it off)`);
+}
+if (!freezeNamer.running) {
       const fp = new FreezeProfiler();
       if (fp.s.enabled && stallFinder.enabled) {
             stallFinder.onStall((ms) => { try { fp.noteFreeze(ms); } catch { /* measurement only */ } });
@@ -5608,6 +5620,8 @@ for (let i = 0; i < resolved.length; i++) {
             gapSamePoolSkips = 0;
             const sd = formatStallDetail(sf);
             if (sd) console.log(`[stalls] ${sd}`);
+            // Freeze namer: what the CPU profile saw inside this window's freezes.
+            void freezeNamer.report('5 min').catch(() => undefined);
             // Rival watch sender look-ups (signature checks) done vs skipped, last 5 min.
             const rs = rivalWatch.takeSenderStats();
             console.log(`[rivalwatch] sender checks (5 min): ${rs.looked} done · skipped: ${rs.knownBot} known bot, ${rs.noOwners} no bot wallets known, ${rs.neverBot} router/pool/coin, ${rs.coinMove} coin transfer/approval, ${rs.dupOrFull} already queued, ${rs.overCap} over the ${process.env.RIVAL_SENDER_MAX_PER_SEC ?? 40}/s limit`);
