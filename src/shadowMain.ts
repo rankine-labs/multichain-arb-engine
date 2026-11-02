@@ -2952,10 +2952,10 @@ setInterval(labelled('fables fee read', async () => {
 // background (bundled, read-only) so the quick guess walks a trade range by
 // range like the pool does, instead of pretending the current range never
 // ends (the "phantom gap" stock pools: MRNA, BE, GOOGL, RIVN, SNDK, HIMS).
-// Every 30 s every watched pool is checked for a missing / old window; every
-// 2 s up to 60 waiting pools are read. STOCK_TICK_MATH=0 = old maths, no reads.
+// Every 30 s watched pools with no window yet are queued (old windows are
+// re-read only when a guess uses them); every 2 s up to 60 waiting pools are read. STOCK_TICK_MATH=0 = old maths, no reads.
 if (stockTickMathOn()) {
-      setInterval(labelled('tick window want', () => { for (const p of cache.forChain('robinhood')) tickBook.windowFor(p); }), 30_000);
+      setInterval(labelled('tick window want', () => { for (const p of cache.forChain('robinhood')) tickBook.wantIfMissing(p); }), 30_000);
       setInterval(labelled('tick window read', async () => {
             if (!tickBook.pendingCount()) return;
             try {

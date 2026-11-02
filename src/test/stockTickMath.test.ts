@@ -1,5 +1,5 @@
 import { getSqrtRatioAtTick, getTickAtSqrtRatio, swapExactInTicks, v4SwapFeePips, MIN_TICK, MAX_TICK, MIN_SQRT_RATIO, MAX_SQRT_RATIO, TickWindow } from '../core/tickMath';
-import { TickWindowBook, tickBook, tickAwareAmountOut } from '../core/tickWindow';
+import { TickWindowBook, tickBook, tickAwareAmountOut, encInt } from '../core/tickWindow';
 import { computeAmountOut } from '../core/dexMath';
 import { PoolState } from '../core/types';
 import { RECORDED, RecordedPool } from './stockTickMath.fixtures';
@@ -120,6 +120,23 @@ t = 500; const mid = tickAwareAmountOut(sndkDeep, true, usdg1100, 10000, book3);
 assert(mid === 991518088464827990n && book3.pendingCount() === 1, 'window older than the refresh time: still used, re-read queued');
 t = 2_000; assert(tickAwareAmountOut(sndkDeep, true, usdg1100, 10000, book3) === undefined, 'window older than the max age: not trusted (old maths)');
 
+// --- 5b. Hand encoder = ethers' encoder (freeze fix) --------------------------
+{
+  const coder = ethers.AbiCoder.defaultAbiCoder();
+  let same = true;
+  for (const v of [0, 1, -1, 255, -256, 32767, -32768, 204120, -219300, 887272, -887272]) {
+    if (encInt(v) !== coder.encode(['int24'], [Math.max(-8388608, Math.min(8388607, v))]).slice(2)) same = false;
+  }
+  for (const v of [0, 5, -5, 32767, -32768]) if (encInt(v) !== coder.encode(['int16'], [v]).slice(2)) same = false;
+  assert(same, 'hand encoding of tick / word numbers = ethers encoding exactly');
+  const N = 20_000, t0 = process.hrtime.bigint();
+  for (let i = 0; i < N; i++) encInt(-219300 + i);
+  const t1 = process.hrtime.bigint();
+  for (let i = 0; i < N; i++) coder.encode(['int24'], [-219300 + i]);
+  const t2 = process.hrtime.bigint();
+  console.log(`  encode 20k ticks: hand ${(Number(t1 - t0) / 1e6).toFixed(1)} ms, ethers ${(Number(t2 - t1) / 1e6).toFixed(1)} ms`);
+}
+
 // --- 6. Price exactly on a range edge: the more careful reading is used -------
 {
   const r = R('0xfa29c8b2');
@@ -176,3 +193,16 @@ t = 2_000; assert(tickAwareAmountOut(sndkDeep, true, usdg1100, 10000, book3) ===
   console.log(`  speed: old ${(Number(usOld) / 1000).toFixed(2)} us per guess, new ${(Number(usNew) / 1000).toFixed(2)} us per guess`);
   assert(Number(usNew) / 1000 < 150, 'new guess stays well under 150 microseconds');
 })();
+
+// --- 9. Bitmap word reader: same ticks as a plain bit-by-bit read ----------------
+{
+  const { ticksInWord } = require('../core/tickMath');
+  let same = true;
+  for (const bm of [1n, 1n << 255n, (1n << 256n) - 1n, 0x8000000000000000000000000000000000000000000000000000000000000001n, 0x10204080n]) {
+    for (const [w, ts] of [[0, 1], [-3, 60], [12, 200]] as [number, number][]) {
+      const slow: number[] = []; for (let b = 0; b < 256; b++) if ((bm >> BigInt(b)) & 1n) slow.push((w * 256 + b) * ts);
+      if (JSON.stringify(slow) !== JSON.stringify(ticksInWord(w, bm, ts))) same = false;
+    }
+  }
+  assert(same, 'bitmap word reader finds exactly the same ticks as a bit-by-bit read');
+}

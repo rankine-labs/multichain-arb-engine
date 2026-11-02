@@ -45,7 +45,6 @@ export function stockTickMathOn(env: Record<string, string | undefined> = proces
 
 type CallMany = (calls: { target: string; data: string }[]) => Promise<(string | null)[]>;
 
-const coder = ethers.AbiCoder.defaultAbiCoder();
 // V3 pool reads
 const SEL_V3_SLOT0 = '0x3850c7bd';        // slot0()
 const SEL_V3_TS = '0xd0c93a7c';           // tickSpacing()
@@ -56,8 +55,17 @@ const SEL_V4_SLOT0 = ethers.id('getSlot0(bytes32)').slice(0, 10);
 const SEL_V4_BITMAP = ethers.id('getTickBitmap(bytes32,int16)').slice(0, 10);
 const SEL_V4_TICKLIQ = ethers.id('getTickLiquidity(bytes32,int24)').slice(0, 10);
 
-const enc16 = (w: number) => coder.encode(['int16'], [w]).slice(2);
-const enc24 = (t: number) => coder.encode(['int24'], [t]).slice(2);
+// FREEZE FIX (Nov 2, after deploy): ethers' general encoder took ~1 s per
+// 5 min of the main thread here (freeze log: loadPending > enc24), because a
+// refresh round encodes thousands of tick numbers. Hand encoding gives the
+// exact same 32-byte two's-complement word (test: stockTickMath.test.ts).
+const TWO256 = 1n << 256n;
+export function encInt(v: number): string {
+  if (v >= 0) return v.toString(16).padStart(64, '0');
+  return (TWO256 + BigInt(v)).toString(16);
+}
+const enc16 = encInt;
+const enc24 = encInt;
 const word = (hex: string | null, i: number): bigint | null => (hex && hex.length >= 2 + 64 * (i + 1) ? BigInt('0x' + hex.slice(2 + 64 * i, 2 + 64 * (i + 1))) : null);
 const int24 = (v: bigint) => Number(BigInt.asIntN(24, v));
 const int128 = (v: bigint) => BigInt.asIntN(128, v);
@@ -130,6 +138,13 @@ export class TickWindowBook {
   }
 
   protocolFee(p: PoolState): number { return this.book.get(this.key(p))?.protocolFee ?? 0; }
+
+  // The 30 s sweep over all watched pools: only pools with NO window yet are
+  // queued (old windows are refreshed when a guess actually uses them, in
+  // windowFor), so pools nobody prices don't cost reads or main-thread time.
+  wantIfMissing(p: PoolState) {
+    if (!this.book.has(this.key(p))) this.want(p);
+  }
 
   want(p: PoolState) {
     if (!tickEligible(p)) return;
