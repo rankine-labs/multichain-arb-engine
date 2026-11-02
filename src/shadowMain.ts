@@ -254,6 +254,7 @@ import { stallFinder, timed, timedAsync, formatStallLine, formatStallDetail, mar
 import { FreezeProfiler } from './core/freezeProfile';
 import { FreezeNamer } from './core/freezeNamer';
 import { HeapSampler } from './core/heapSampler';
+import { takeSenderCacheStats } from './chains/nitroFeed';
 import { groupsStartupPlan } from './core/groupsStartup';
 import { lenderFastOn, parseApprovedLenders, lenderCandidatesOld, lenderCandidatesFor } from './core/lenderPick';
 import { runSteps, drainSteps, writeJsonChunkedQueued, setSliceCap, SlicedQueue, TurnQueue } from './core/chunked';
@@ -5658,7 +5659,7 @@ for (let i = 0; i < resolved.length; i++) {
             void freezeNamer.report('5 min').catch(() => undefined);
             // Rival watch sender look-ups (signature checks) done vs skipped, last 5 min.
             const rs = rivalWatch.takeSenderStats();
-            console.log(`[rivalwatch] sender checks (5 min): ${rs.looked} done · skipped: ${rs.knownBot} known bot, ${rs.noOwners} no bot wallets known, ${rs.neverBot} router/pool/coin, ${rs.coinMove} coin transfer/approval, ${rs.dupOrFull} already queued, ${rs.overCap} over the ${process.env.RIVAL_SENDER_MAX_PER_SEC ?? 40}/s limit`);
+            console.log(`[rivalwatch] sender checks (5 min): ${rs.looked} done · skipped: ${rs.knownBot} known bot, ${rs.noOwners} no bot wallets known, ${rs.neverBot} router/pool/coin, ${rs.coinMove} coin transfer/approval, ${rs.dupOrFull} already queued, ${rs.overCap} over the ${process.env.RIVAL_SENDER_MAX_PER_SEC ?? 40}/s limit${(() => { const sc = takeSenderCacheStats(); return sc.on ? ` · senders worked out ${sc.recovered}, from memory ${sc.hits}` : ''; })()}`);
       }), 5 * 60_000);
       // Watch list size every 15 min (shown on the GitHub status page).
       setInterval(labelled('watch list log', () => {

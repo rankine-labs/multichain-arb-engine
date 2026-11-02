@@ -3,6 +3,7 @@ import { practiceOnlyReason, resetV4EnvSnapshot, ALLOC_LEAN_V4, allocLeanOn, EXT
 import { enumerateRoutes, RouteRules, ALLOC_LEAN_ROUTES } from '../execution/trigEntry';
 import { LiveCoinRule, liveCoinBlockerLean, liveCoinBlockerOld, ROBINHOOD_TOKEN_BEACON } from '../core/liveCoins';
 import { GasCalibration, median } from '../core/gasModel';
+import { defineLazyFrom, takeSenderCacheStats } from '../chains/nitroFeed';
 
 // ============================================================================
 // FIX 12 (Nov 2): less throwaway memory, SAME answers. Proves, old vs new:
@@ -134,7 +135,25 @@ function testGasMedian() {
   assert(ok, 'gas median memo: same median as working it out, after every new sample');
 }
 
+function testSenderMemory() {
+  takeSenderCacheStats();
+  let checks = 0;
+  const tx = (who: string) => () => { checks++; return { get from() { return who; } } as any; };
+  const a: any = { hash: '0xh1' }, b: any = { hash: '0xh1' }, c: any = { hash: '0xh2' }, d: any = {};
+  defineLazyFrom(a, tx('0xAlice')); defineLazyFrom(b, tx('0xAlice')); defineLazyFrom(c, tx('0xBob')); defineLazyFrom(d, tx('0xCarol'));
+  assert(checks === 0, 'sender still worked out only when read');
+  const got = [a.from, b.from, c.from, d.from, a.from];
+  assert(got.join(',') === '0xAlice,0xAlice,0xBob,0xCarol,0xAlice', 'same senders as working each one out');
+  assert(checks === 3, `same hash seen again: signature check skipped (${checks} checks for 4 transactions)`);
+  const bad: any = { hash: '0xh3' }, bad2: any = { hash: '0xh3' };
+  defineLazyFrom(bad, () => ({ get from(): string { throw new Error('bad signature'); } }) as any); defineLazyFrom(bad2, tx('0xNever'));
+  assert(bad.from === null && bad2.from === null, 'an unreadable sender stays null for that hash (same bytes = same answer)');
+  const st = takeSenderCacheStats();
+  assert(st.on && st.recovered === 4 && st.hits === 2, `counts: ${st.recovered} worked out, ${st.hits} from memory`);
+}
+
 async function main() {
+  testSenderMemory();
   testPracticeOnly();
   testRoutes();
   await testCoins();

@@ -487,7 +487,7 @@ function lazySender(): boolean { return process.env.FEED_LAZY_SENDER !== '0'; }
 // and caches the answer. Enumerable, so it still shows up like a normal field.
 // `tx` may also be a function that unpacks the transaction only then (the
 // light read above did not need ethers' full unpack until now).
-export function defineLazyFrom(target: { from?: string | null }, tx: Transaction | (() => Transaction | null)): void {
+export function defineLazyFrom(target: { from?: string | null; hash?: string }, tx: Transaction | (() => Transaction | null)): void {
   let done = false;
   let value: string | null = null;
   Object.defineProperty(target, 'from', {
@@ -495,13 +495,44 @@ export function defineLazyFrom(target: { from?: string | null }, tx: Transaction
     configurable: true,
     get() {
       if (!done) {
-        const t = typeof tx === 'function' ? tx() : tx;
-        value = t ? safeFrom(t) : null;
+        // SENDER MEMORY (fix 12): the same transaction (same hash = same
+        // signed bytes = same sender) seen again gets its sender from memory.
+        const h = SENDER_CACHE_ON && typeof target.hash === 'string' ? target.hash : undefined;
+        const known = h !== undefined ? senderCache.get(h) : undefined;
+        if (known !== undefined) { value = known; senderStats.hits++; }
+        else {
+          const t = typeof tx === 'function' ? tx() : tx;
+          value = t ? safeFrom(t) : null;
+          senderStats.recovered++;
+          if (h !== undefined) {
+            if (senderCache.size >= SENDER_CACHE_MAX) senderCache.clear(); // memory bound
+            senderCache.set(h, value);
+          }
+        }
         done = true;
       }
       return value;
     },
   });
+}
+
+// SENDER MEMORY (Nov 2, fix 12, FEED_SENDER_CACHE, default on; 0 = off).
+// Working out a transaction's sender is a signature check (~1-2 ms in
+// JavaScript; "safeFrom" in the freeze namer, 736 ms of freezes in 35 min).
+// A sender depends only on the signed bytes, and the hash is made from those
+// same bytes, so the answer for a hash never changes: it is remembered for
+// the newest SENDER_CACHE_MAX hashes and a transaction seen again (another
+// parse of the same message, a confirmed copy of a feed trade) skips the
+// check. Counts (recovered vs from memory) go in the 5-min [rivalwatch] line.
+const SENDER_CACHE_ON = process.env.FEED_SENDER_CACHE !== '0';
+const SENDER_CACHE_MAX = 20_000;
+const senderCache = new Map<string, string | null>();
+const senderStats = { recovered: 0, hits: 0 };
+// Counts since the last call, then reset (status log).
+export function takeSenderCacheStats(): { recovered: number; hits: number; on: boolean } {
+  const out = { ...senderStats, on: SENDER_CACHE_ON };
+  senderStats.recovered = 0; senderStats.hits = 0;
+  return out;
 }
 
 // Parses one websocket frame into the transactions it contains.
