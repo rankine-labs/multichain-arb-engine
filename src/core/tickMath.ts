@@ -249,7 +249,14 @@ export function wordOf(tick: number, tickSpacing: number): number { return compr
 export function ticksInWord(word: number, bitmap: bigint, tickSpacing: number): number[] {
   const out: number[] = [];
   if (bitmap === 0n) return out;
-  for (let bit = 0; bit < 256; bit++) if ((bitmap >> BigInt(bit)) & 1n) out.push((word * 256 + bit) * tickSpacing);
+  // Walk the hex digits (4 bits each) instead of 256 big-number shifts:
+  // most words are almost empty, so this is far cheaper on the main thread.
+  const hex = bitmap.toString(16);
+  for (let i = hex.length - 1, nib = 0; i >= 0; i--, nib++) {
+    const d = parseInt(hex[i], 16);
+    if (!d) continue;
+    for (let b = 0; b < 4; b++) if (d & (1 << b)) out.push((word * 256 + nib * 4 + b) * tickSpacing);
+  }
   return out;
 }
 // The tick range a block of words covers.
