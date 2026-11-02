@@ -1149,6 +1149,10 @@ const MAX_SLOT_DIFFS: usize = 4;
 /// Most predicted blocks waiting for their agreement (bounded memory).
 const MAX_PENDING: usize = 256;
 
+/// KEEPER used-values buffer bound (Nov 2): handed over every wake-up, so
+/// this is only reached if the keeper side stops taking them.
+const MAX_USED: usize = 65_536;
+
 /// The base with the keeper's values laid over it (see Ahead.merged).
 struct Merged {
     /// Base sequence number it was made for, and the very base snapshot.
@@ -1517,6 +1521,12 @@ pub struct Ahead {
     /// KEEPER: values our runs lacked or read only approximately, for the
     /// keeper to learn (the runtime / replay hands them over and empties it).
     pub learned: Vec<crate::state::MissItem>,
+    /// KEEPER (Nov 2, memory fix 2): values of the KEEPER our runs read
+    /// (exact, served from its version). The keeper's prune keeps every
+    /// value read or written recently and drops the rest (learned ones
+    /// too), so this is what keeps a value runs still need from being
+    /// dropped. Bounded (MAX_USED); the runtime / replay hands it over.
+    pub used: Vec<(Address, U256)>,
     /// The collect run's reads of the last guess_touched (for learning).
     last_probe: Option<crate::check::db::ReadLog>,
     /// Offline replay only (copy2/ahead_capture.rs): EVERY disagreement
@@ -1562,6 +1572,7 @@ impl Ahead {
             kept: VecDeque::new(),
             merged: None,
             learned: Vec::new(),
+            used: Vec::new(),
             last_probe: None,
             collect_all: None,
             diag: None,
@@ -1735,6 +1746,24 @@ impl Ahead {
         self.count(|s| s.reapplied += n);
     }
 
+    /// KEEPER (Nov 2): of the values a run read, the ones the keeper's
+    /// merged version holds are "used" (see `used`). Only with the keeper
+    /// on and a merged base; bounded.
+    fn note_used(&mut self, reads: &[(Address, U256)]) {
+        if !self.cfg.keeper || self.used.len() >= MAX_USED {
+            return;
+        }
+        let Some(m) = &self.merged else { return };
+        for (a, sl) in reads {
+            if m.kept.holds_slot(a, sl) {
+                self.used.push((*a, *sl));
+                if self.used.len() >= MAX_USED {
+                    break;
+                }
+            }
+        }
+    }
+
     /// KEEPER learning: what one run lacked / read approximately. Only
     /// with the keeper on; bounded (the runtime empties it every wake-up).
     fn learn_from_run(&mut self, missing: &[crate::state::MissItem], view: &dyn StateRead, prov: &dyn Provenance, sender: Address, reverted: bool) {
@@ -1742,6 +1771,11 @@ impl Ahead {
             return;
         }
         let probe = self.last_probe.take();
+        // A collect run's reads of the keeper's values count as used too.
+        if let Some(r) = &probe {
+            let slots: Vec<(Address, U256)> = r.slots.iter().copied().collect();
+            self.note_used(&slots);
+        }
         let pools = self.pools.clone();
         let skip = |a: &Address| pools.by_contract.contains_key(a);
         let mut items = super::keeper::wanted_items(missing, probe.as_ref().map(|r| (&r.accounts, &r.slots)), view, prov, sender, &skip);
@@ -1861,6 +1895,7 @@ impl Ahead {
             self.kept.clear();
             self.last_probe = None;
             self.learned.clear();
+            self.used.clear();
             self.count(|s| {
                 s.settle_lost += waiting;
                 s.memory_pauses += 1;
@@ -2612,6 +2647,8 @@ impl Ahead {
                         }
                         self.learn_from_run(&[], &ov, base_prov.as_ref(), t.from, true);
                     }
+                    // KEEPER (Nov 2): the keeper's values this run read are in use.
+                    self.note_used(&kept.reads);
                     ov.commit(&kept.diff);
                     for (a, s) in &kept.forget {
                         ov.forget_slot(*a, *s);
@@ -3453,6 +3490,9 @@ fn run_loop(c2: super::intake::Copy2Handle, cfg: AheadCfg, rx: Receiver<Ev>) {
             }
             if !a.learned.is_empty() {
                 super::keeper::learn_hook(std::mem::take(&mut a.learned));
+            }
+            if !a.used.is_empty() {
+                super::keeper::used_hook(std::mem::take(&mut a.used));
             }
         }
         if let Some(rt) = RT.get() {

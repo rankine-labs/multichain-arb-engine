@@ -45,7 +45,7 @@
 //   and says so (an incomplete file is refused by the replay unless asked).
 //
 //   REPLAY: `arbsim ahead-replay <capture file> [--json] [--samples N]
-//   [--budget-ms N] [--partial] [--revert-sure] [--sender-funds trusted|strict] [--unknown-continue] [--keeper <truth file> [--keeper-warm [--keeper-warm-passes N]] [--keep-contracts N] [--keep-seeds-per-h N] [--keep-prune-blocks N] [--oracle]] [--filter-all] [--no-keep-pick]`
+//   [--budget-ms N] [--partial] [--revert-sure] [--sender-funds trusted|strict] [--unknown-continue] [--keeper <truth file> [--keeper-warm [--keeper-warm-passes N]] [--keep-contracts N] [--keep-seeds-per-h N] [--keep-prune-blocks N [--keep-prune-learned]] [--oracle]] [--filter-all] [--no-keep-pick]`
 //     Builds a fresh predicted copy, feeds it the capture event by event and
 //     prints: agreement % (agree / (agree + disagree), per pool compared),
 //     the disagreement breakdown by cause (missedFilter / missedRan /
@@ -1367,6 +1367,9 @@ pub fn replay_live(cap: &CapFile, opts: &ReplayOpts, truth: Arc<super::keeper_re
         if !a.learned.is_empty() {
             let _ = ltx.try_send(std::mem::take(&mut a.learned));
         }
+        if !a.used.is_empty() {
+            super::keeper::used_hook(std::mem::take(&mut a.used));
+        }
     };
     for ev in live_order(&cap.events[1..], lt.copy2_delay_blocks) {
         match ev {
@@ -1770,10 +1773,10 @@ pub fn print_report(r: &Value, samples: usize) -> String {
     o
 }
 
-/// `arbsim ahead-replay <capture file> [--json] [--samples N] [--budget-ms N] [--partial] [--revert-sure] [--sender-funds trusted|strict] [--unknown-continue] [--keeper <truth file> [--keeper-warm [--keeper-warm-passes N]] [--keep-contracts N] [--keep-seeds-per-h N] [--keep-prune-blocks N] [--oracle]] [--filter-all] [--no-keep-pick]`
+/// `arbsim ahead-replay <capture file> [--json] [--samples N] [--budget-ms N] [--partial] [--revert-sure] [--sender-funds trusted|strict] [--unknown-continue] [--keeper <truth file> [--keeper-warm [--keeper-warm-passes N]] [--keep-contracts N] [--keep-seeds-per-h N] [--keep-prune-blocks N [--keep-prune-learned]] [--oracle]] [--filter-all] [--no-keep-pick]`
 pub fn replay_main(args: &[String]) {
     let Some(path) = args.get(2).filter(|a| !a.starts_with("--")) else {
-        eprintln!("usage: arbsim ahead-replay <capture file> [--json] [--samples N] [--budget-ms N] [--partial] [--revert-sure] [--sender-funds trusted|strict] [--unknown-continue] [--keeper <truth file> [--keeper-warm [--keeper-warm-passes N]] [--keep-contracts N] [--keep-seeds-per-h N] [--keep-prune-blocks N] [--oracle]] [--filter-all] [--no-keep-pick]");
+        eprintln!("usage: arbsim ahead-replay <capture file> [--json] [--samples N] [--budget-ms N] [--partial] [--revert-sure] [--sender-funds trusted|strict] [--unknown-continue] [--keeper <truth file> [--keeper-warm [--keeper-warm-passes N]] [--keep-contracts N] [--keep-seeds-per-h N] [--keep-prune-blocks N [--keep-prune-learned]] [--oracle]] [--filter-all] [--no-keep-pick]");
         std::process::exit(2);
     };
     let arg = |f: &str| args.iter().position(|a| a == f).and_then(|i| args.get(i + 1)).and_then(|v| v.parse::<u64>().ok());
@@ -1892,6 +1895,8 @@ pub fn replay_main(args: &[String]) {
             if let Some(n) = arg("--keep-prune-blocks") {
                 kc.prune_blocks = n;
             }
+            // (Nov 2) --keep-prune-learned: learned values pruned too (live default).
+            kc.prune_learned = args.iter().any(|a| a == "--keep-prune-learned");
             let passes = if args.iter().any(|a| a == "--keeper-warm") { arg("--keeper-warm-passes").unwrap_or(1).clamp(1, 10) as usize } else { 0 };
             replay_keeper(&cap, &opts, truth, kc, passes)
         }

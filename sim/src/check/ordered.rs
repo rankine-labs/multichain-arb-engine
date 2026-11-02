@@ -1320,6 +1320,12 @@ pub fn run_ordered_sizes(
 pub struct KeptDiff {
     pub diff: crate::state::StateDiff,
     pub forget: Vec<(Address, U256)>,
+    /// (Nov 2, keeper memory fix 2) The values of OUR COPY the replayed
+    /// transactions read (the run's `view_slots`, moved here, no copy of the
+    /// values). The predicted copy tells the keeper which of ITS values were
+    /// used, so a value that runs keep reading is never pruned. Only in
+    /// keep mode (copy2/ahead.rs); trading's checks never build a KeptDiff.
+    pub reads: Vec<(Address, U256)>,
 }
 
 /// `run_ordered_with` that also hands back what the replayed transactions
@@ -1609,7 +1615,7 @@ fn one_round(
                 d.storage.remove(s);
             }
         }
-        KeptDiff { diff, forget }
+        KeptDiff { diff, forget, reads: Vec::new() }
     });
     // 2. Our pretend-state must not have changed how they ran, and every
     //    copy value they used must be exact at the snapshot's block (or,
@@ -1720,6 +1726,11 @@ fn one_round(
             }
         }
     }
+    // Keep mode only: hand the replay's copy reads to the caller (see KeptDiff.reads).
+    let kept = kept.map(|mut k| {
+        k.reads = reads.view_slots.into_iter().collect();
+        k
+    });
     Ok(Next::Done(OrderedOut { replayed, results, assumed, changed, hashes, ladder: rows }, kept))
 }
 
