@@ -4749,20 +4749,22 @@ fn watched_account_event_rechecks_its_values_exactly() {
 }
 
 /// A pool event AFTER an event of its watched account in the same block:
-/// the values it would need are mid-block ones: the pool reloads instead.
+/// (v2) the pool stays ready (its replay is checked against its own event,
+/// which shows any change that matters); the occurrence is counted and the
+/// watched account's values are re-checked (pending until then).
 #[test]
-fn watched_change_then_pool_event_in_one_block_reloads_the_pool() {
+fn watched_change_then_pool_event_in_one_block_keeps_the_pool() {
     let mut r = rig();
     r.track(vec![watching_pool()]);
     r.send(tick(100, 60));
     assert_eq!(r.state(&watching_pool()).0, PoolState::Ready);
     let ev = lg(a(WATCHED), vec![B256::with_last_byte(0x55)], data(&[u(1)]), 101, 1, 0);
     let logs = vec![ev, transfer(a(COIN0), a(USER), a(V2P), 100, 101, 3, 0), v2_sync(1100, 3640, 101, 3, 2)];
-    r.h.block(msg(101, 62, logs));
-    r.intake.pump();
+    r.send(msg(101, 62, logs));
     assert_eq!(r.h.c2.stats.watch_same_block_unsure.load(std::sync::atomic::Ordering::Relaxed), 1);
-    assert_ne!(r.state(&watching_pool()).0, PoolState::Ready, "not ready right after: {:?}", r.state(&watching_pool()));
-    // (Its reason is already "loading" again: test reloads come quickly.)
+    assert_eq!(r.state(&watching_pool()).0, PoolState::Ready, "{:?}", r.state(&watching_pool()));
+    // The pool's own event was applied exactly.
+    assert_eq!(r.head_slot(a(COIN0), map_slot(a(V2P), 0)), Lookup::Known(u(1100)));
 }
 
 /// Any event of a pool's reload account (a Slipstream gauge) makes the pool

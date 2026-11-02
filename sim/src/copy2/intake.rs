@@ -779,8 +779,9 @@ c2counters!(
     // values read, values that had CHANGED and were replaced); values of a
     // watched account a fill / walk brought that were older than its last
     // event (dropped, read again); pools reloaded because an account in
-    // their reload list (a Slipstream gauge) had an event; pools made unsure
-    // because a watched account changed earlier in the same block.
+    // their reload list (a Slipstream gauge) had an event; pool events that
+    // came after a watched account's change in the same block (v2: counted
+    // only, the replay's exact event check decides; v1 reloaded the pool).
     watch_accounts_added, watch_events, watch_verifies, watch_verify_items, watch_changed,
     watch_stale_dropped, watch_reloads, watch_same_block_unsure,
 );
@@ -2251,6 +2252,12 @@ struct Partial {
     /// a catch-up carries a working copy across many blocks at once, one
     /// round per new tick a mint touches; 40 per whole carry was too few).
     need_at: Pos,
+    /// (Nov 2) The oldest block any of its values were read from the node
+    /// at (u64::MAX = none yet). A watched account (hook / fee module) with
+    /// an event AFTER this block may have changed since: its values in this
+    /// working copy are not put into the copy at the merge (read again when
+    /// needed, at a newer block).
+    fetched_min: u64,
 }
 
 /// What a node job was for.
@@ -3172,16 +3179,22 @@ impl Intake {
                 used = true;
                 touched.push(k);
                 self.touched_addr.insert(log.address, m.block);
-                // (Nov 2) A watched account of this pool changed earlier in
-                // this same block: the values its replay would read are the
-                // ones in the middle of the block (no node can give those).
-                // The pool reloads at a later block instead (never a guess).
+                // (Nov 2, v2) A watched account of this pool changed earlier
+                // in this same block (live: Fables pokes its hook and rival
+                // bots trade right after, in the same block). The replay
+                // runs with the values from before that change. That stays
+                // EXACT: a change that matters shows in the pool's own event
+                // (a V4 swap reports its fee; a Slipstream swap its amounts),
+                // which must match byte for byte, else the pool goes unsure.
+                // The held values themselves are re-read at the block's end
+                // (pending until then), and a load's values older than the
+                // change are not kept (merge, fetched_min). v1 reloaded the
+                // pool here: live 73 reloads in 45 min, the pools were
+                // "loading" exactly when the trades came. Counted only.
                 if !self.watch_in_block.is_empty() {
                     let hit = self.c2.reg.read().unwrap().pools.get(&k).is_some_and(|e| e.state == PoolState::Ready && e.pool.watch.iter().any(|w| self.watch_in_block.contains(w)));
                     if hit {
                         inc(&self.c2.stats.watch_same_block_unsure);
-                        self.make_unsure_with(k, "a contract it reads (hook / fee module) changed earlier in the same block", Some(&mut ov), m.block, false);
-                        continue;
                     }
                 }
                 self.apply_ready_event(&mut ov, k, log, &rctx);
@@ -4709,7 +4722,7 @@ impl Intake {
         for f in &facts {
             ov.learn(f);
         }
-        self.continue_partial(r.key, Partial { ov, cursor: (block + 1, 0, 0), gen: r.gen, errors: 0, hard_errors: 0, refusals: 0, base: (block, END, END), need_at: (0, 0, 0) });
+        self.continue_partial(r.key, Partial { ov, cursor: (block + 1, 0, 0), gen: r.gen, errors: 0, hard_errors: 0, refusals: 0, base: (block, END, END), need_at: (0, 0, 0), fetched_min: block });
     }
 
     fn on_need(&mut self, key: PoolKey, gen: u64, items: Vec<MissItem>, block: u64, res: Result<FetchOut, crate::node::NodeErr>) {
@@ -4811,9 +4824,10 @@ impl Intake {
     }
 
     /// Send the fetch for a working copy (exactly at the block before its cursor).
-    fn send_need_job(&mut self, key: PoolKey, part: Partial, items: Vec<MissItem>) {
+    fn send_need_job(&mut self, key: PoolKey, mut part: Partial, items: Vec<MissItem>) {
         let gen = part.gen;
         let at = part.cursor.0.saturating_sub(1);
+        part.fetched_min = part.fetched_min.min(at);
         // An old block is a slower read on this node: start the load over at
         // the newest block instead (it then carries only a few blocks). Not
         // while the node refuses us for going too fast (a restart asks for
@@ -4878,7 +4892,7 @@ impl Intake {
         for (a, s) in &owned_items {
             ov.forget_slot(*a, *s);
         }
-        self.send_need(k, Partial { ov: part, cursor, gen, errors: 0, hard_errors: 0, refusals: 0, base: (0, 0, 0), need_at: (0, 0, 0) }, items);
+        self.send_need(k, Partial { ov: part, cursor, gen, errors: 0, hard_errors: 0, refusals: 0, base: (0, 0, 0), need_at: (0, 0, 0), fetched_min: u64::MAX }, items);
     }
 
     /// Carry a working copy forward through the buffered reports up to the
@@ -4920,10 +4934,6 @@ impl Intake {
         let blocks: Vec<(u64, ReplayCtx, Arc<Vec<PoolLog>>)> = self.buf.iter().skip(start).map(|b| (b.block, b.rctx, b.logs.clone())).collect();
         for (block, rctx, logs) in blocks {
             part.ov.set_position(StatePosition { base_block: block, after_seq: None });
-            // (Nov 2) A watched account changed in this block (see
-            // on_outside_log): the pool's own event after it in the SAME
-            // block would need mid-block values: start the load over.
-            let mut watched_here = false;
             for log in logs.iter() {
                 let pos = (block, log.tx_index, log.log_index);
                 if pos < part.cursor {
@@ -4944,12 +4954,7 @@ impl Intake {
                     for sl in held {
                         part.ov.forget_slot(log.address, sl);
                     }
-                    watched_here = true;
                     continue;
-                }
-                if watched_here && is_pool_event(&pool, log) {
-                    self.retry_later(key, part.gen, "a contract it reads changed earlier in the same block while it was loading");
-                    return;
                 }
                 if is_pool_event(&pool, log) {
                     inc(&self.c2.stats.carried_events);
@@ -5074,6 +5079,17 @@ impl Intake {
                 owned.push(*a);
             }
         }
+        // (Nov 2) Watched accounts whose last event came after the oldest
+        // block this working copy read from the node: their values here may
+        // predate that change. Not put into the copy (read again when needed).
+        let stale_watched: HashSet<Address> = {
+            let reg = self.c2.reg.read().unwrap();
+            pool.watch
+                .iter()
+                .filter(|a| reg.is_watched(a) && self.watch_last_event.get(*a).is_some_and(|b| *b > part.fetched_min.min(if part.base.0 > 0 { part.base.0 } else { u64::MAX })))
+                .copied()
+                .collect()
+        };
         let mut facts: Vec<Fact> = Vec::new();
         let mut items: HashSet<(Address, U256)> = HashSet::new();
         let mut accounts: HashSet<Address> = HashSet::new();
@@ -5093,6 +5109,10 @@ impl Intake {
                     items.insert((*addr, *s));
                 }
                 if disagree.contains(&(*addr, *s)) {
+                    continue;
+                }
+                if stale_watched.contains(addr) {
+                    inc(&self.c2.stats.watch_stale_dropped);
                     continue;
                 }
                 facts.push(Fact::Slot(*addr, *s, *v));
@@ -7527,7 +7547,7 @@ impl Intake {
         }
         inc(&self.c2.stats.parked_resumed);
         let base = pk.entry.base_block;
-        self.continue_partial(k, Partial { ov, cursor: (at + 1, 0, 0), gen, errors: 0, hard_errors: 0, refusals: 0, base: (base, END, END), need_at: (0, 0, 0) });
+        self.continue_partial(k, Partial { ov, cursor: (at + 1, 0, 0), gen, errors: 0, hard_errors: 0, refusals: 0, base: (base, END, END), need_at: (0, 0, 0), fetched_min: base });
     }
 
     /// Ask again for a parked pool's reports a little later.
