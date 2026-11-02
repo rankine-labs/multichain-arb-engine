@@ -62,6 +62,8 @@
 //                     little off) on the next round
 //   --old-arbsim      (TRUE DELTA) the fake arbsim does not say it reads
 //                     patches (as an arbsim from before TRUE DELTA)
+//                     (otherwise it also says it reads ROW UPDATES, fix 10;
+//                     --env TRIG_TABLE_ROW_UPDATE=0 for the table before them)
 // Live-shaped TRUE DELTA comparison (Nov 1, measured: ~1.5% of pools move
 // per pass, ~8.5 pools per coin pair, a pass every 10 to 20 s):
 //   --live --stamped --wallet-cap --predicted --peers 9 --churn 0.015
@@ -126,7 +128,7 @@ const client = {
   stats: { fallbacks: 0 },
   request: async (m: Record<string, any>) => {
     // The real client turns every message into one framed buffer (as here).
-    if (m.type === 'trig_table') { tableMsgs++; const f = frame({ ...m, id: 1 }); tableBytes += f.length; notePatches(f.toString('utf8')); return { ok: true, gen: m.gen, ...(OLD_ARBSIM ? {} : { patch: true }) }; }
+    if (m.type === 'trig_table') { tableMsgs++; const f = frame({ ...m, id: 1 }); tableBytes += f.length; notePatches(f.toString('utf8')); return { ok: true, gen: m.gen, ...(OLD_ARBSIM ? {} : { patch: true, upd: true }) }; }
     if (m.type === 'call' && m.calls?.[0]?.data?.startsWith('0x70a08231')) {
       const sd = m.overrides?.[m.calls[0].to]?.stateDiff ?? {};
       const v = Object.values(sd)[0] as string | undefined;
@@ -135,7 +137,7 @@ const client = {
     return { id: m.id, ok: false, unknown: 'bad_request' };
   },
   // The real client's pre-written path (table messages only): same text + id.
-  requestBytes: async (open: Buffer[]) => { tableMsgs++; const f = framePieces(open, ',"id":1}'); tableBytes += f.length; notePatches(f.toString('utf8')); return { ok: true, ...(OLD_ARBSIM ? {} : { patch: true }) }; },
+  requestBytes: async (open: Buffer[]) => { tableMsgs++; const f = framePieces(open, ',"id":1}'); tableBytes += f.length; notePatches(f.toString('utf8')); return { ok: true, ...(OLD_ARBSIM ? {} : { patch: true, upd: true }) }; },
 } as unknown as LocalSimClient;
 const copy2: TrigCopy2 = { running: () => true, notReadyWhy: () => null, waitForTx: async () => 1, forwarder: { newestBlock: () => 1, txBlockOf: () => null } };
 

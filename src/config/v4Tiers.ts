@@ -82,7 +82,7 @@ export function parseTiers(raw: string | undefined): V4Tier[] {
 }
 
 // Same as parseTiers but silent (used on every practice-only check).
-function parseTiersQuiet(raw: string | undefined): V4Tier[] {
+export function parseTiersQuiet(raw: string | undefined): V4Tier[] {
   if (!raw || !raw.trim()) return [];
   const out: V4Tier[] = [];
   for (const part of raw.split(',')) {
@@ -90,6 +90,32 @@ function parseTiersQuiet(raw: string | undefined): V4Tier[] {
     if (m) out.push([Number(m[1]), Number(m[2])]);
   }
   return out;
+}
+
+// TIERS CACHE (Nov 2, freeze fix 10, V4_TIERS_CACHE, default on; 0 = parse
+// every time, exactly as before).
+// Plain English: practiceOnlyReason runs for every route the table lists
+// (the live-trading rule, twice per route) and for every pool on every
+// table pass, and each time it re-read RH_V4_MORE_TIERS from its text
+// (split + a pattern per entry). In the bot's own CPU profiles (Nov 2,
+// 5 profiles saved after long freezes) that re-reading was the biggest
+// named piece of work after the clean-up (GC): parseTiersQuiet 36 to 106 ms
+// and practiceOnlyReason 18 to 54 ms of every ~6 s profile, and inside the
+// 16 longest freezes found in them 339 ms of practiceOnlyReason (206 ms of
+// it the re-reading). Now the list is read once per distinct text and kept
+// (the same text always gives the same list, so the answers are the same;
+// a changed setting is a new text, read again).
+let tiersMemo: { raw: string | undefined; tiers: V4Tier[] } | null = null;
+export function tiersCacheOn(env: Record<string, string | undefined> = process.env): boolean {
+  return (env.V4_TIERS_CACHE ?? '1').trim() !== '0';
+}
+// (The live setting is read once at start: reading process.env is not free.)
+const TIERS_CACHE_LIVE = tiersCacheOn(process.env);
+function moreTiers(env: Record<string, string | undefined>): V4Tier[] {
+  const raw = env.RH_V4_MORE_TIERS;
+  if (!(env === process.env ? TIERS_CACHE_LIVE : tiersCacheOn(env))) return parseTiersQuiet(raw);
+  if (tiersMemo === null || tiersMemo.raw !== raw) tiersMemo = { raw, tiers: parseTiersQuiet(raw) };
+  return tiersMemo.tiers;
 }
 
 // The full list, standard first, no duplicates.
@@ -120,7 +146,7 @@ export function practiceOnlyReason(pool: { v4?: { fee: number; tickSpacing: numb
   // Found only from Initialize events (a setting in neither list here nor
   // RH_V4_MORE_TIERS): the owner can keep these practice only.
   const listed = isStandardV4Tier(v.fee, v.tickSpacing) || EXTRA_V4_TIERS.some(([f, t]) => f === v.fee && t === v.tickSpacing)
-    || parseTiersQuiet(env.RH_V4_MORE_TIERS).some(([f, t]) => f === v.fee && t === v.tickSpacing);
+    || moreTiers(env).some(([f, t]) => f === v.fee && t === v.tickSpacing);
   if (!listed && off(env.V4_EVENT_POOLS_LIVE)) return `Uniswap V4 pool found from events at an unlisted setting (${v.fee / 10_000}% / spacing ${v.tickSpacing}), practice only (V4_EVENT_POOLS_LIVE=0)`;
   if (!off(env.RH_V4_EXTRA_LIVE)) return null;
   if (!isStandardV4Tier(v.fee, v.tickSpacing)) return `Uniswap V4 pool at a non-standard setting (${v.fee / 10_000}% / spacing ${v.tickSpacing}), practice only`;
