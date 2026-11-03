@@ -305,7 +305,9 @@ and nothing else. Node links are never printed, and never stored in pm2.
 | `ARBSIM_COPY2_RESUME_MAX_BLOCKS` | 18000 (~30 min; 0 = off) | copy 2: catch up at most this many blocks from the node's logs (after a restart, or when the bot missed blocks); more = normal full load / reload |
 | `ARBSIM_COPY2_RESUME_OVERLAP_BLOCKS` | 64 | copy 2: blocks before the saved one whose reports are read again (late reports the copy may never have got) |
 | `ARBSIM_COPY2_RESUME_RANGE` | 500 | copy 2: blocks per eth_getLogs request (halved by itself when the node says too big) |
-| `ARBSIM_COPY2_RESUME_TIMEOUT_S` | 120 | copy 2: a catch-up without a complete answer for this long gives up (normal load / reload) |
+| `ARBSIM_COPY2_RESUME_TIMEOUT_S` | 120 | copy 2: a catch-up without a complete answer for this long gives up (normal load / reload); with slices, counted per slice |
+| `ARBSIM_COPY2_CATCHUP_SLICE_BLOCKS` | 500 (0 = old: all at once) | copy 2: a catch-up reads and applies at most this many blocks at a time, so a big gap (e.g. after a 7 min stop) never holds every report in memory together (Nov 2, 23:14: ~2.9 GB, pm2 restart). Same node requests |
+| `ARBSIM_COPY2_CATCHUP_TRIM_MB` | 1100 (0 = never) | copy 2: between two catch-up slices, hand freed memory back to the system when the process is at or above this size |
 | `ARBSIM_COPY2_DROP_GRACE_S` | 1800 (0 = off) | copy 2: a ready pool the bot stops listing stays resumable this long (the reports needed to bring it forward are kept past `ARBSIM_COPY2_MAX_KEEP_LOGS`), so listed again it comes back from its own reports instead of a full load. The bot reads the same line as its `COPY2_DROP_GRACE_S` fallback |
 | `ARBSIM_COPY2_DROP_GRACE_MAX` | 400 | copy 2: most pools kept aside at once (the longest kept aside are given up first) |
 | `ARBSIM_COPY2_DROP_GRACE_MAX_LOGS` | 400000 (~76 MB) | copy 2: hard cap on kept reports while pools are kept aside; past it the oldest go and those pools load normally if listed again |

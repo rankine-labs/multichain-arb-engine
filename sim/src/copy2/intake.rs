@@ -2134,6 +2134,22 @@ pub struct C2Config {
     /// A catch-up not done after this long gives up (normal load / reload)
     /// [ARBSIM_COPY2_RESUME_TIMEOUT_S, 120].
     pub resume_timeout_s: u64,
+    /// CATCH-UP IN SLICES (Nov 3, memory-safe catch-up): a catch-up reads
+    /// and applies at most this many blocks at a time, then lets the
+    /// intake thread breathe (other work, old versions dropped) before
+    /// the next slice [ARBSIM_COPY2_CATCHUP_SLICE_BLOCKS, 500; 0 = the old
+    /// way: the whole gap read and applied in one go]. Why: on Nov 2 at
+    /// 23:14 UTC arbsim came back after a ~7 min stop and caught up a few
+    /// thousand blocks in one go: every report of the gap was held at once
+    /// (raw node answers + parsed copies) and the process went to ~2.9 GB,
+    /// past pm2's 1,800 MB restart line. Same node requests either way
+    /// (one eth_getLogs range per ARBSIM_COPY2_RESUME_RANGE blocks); the
+    /// time limit ARBSIM_COPY2_RESUME_TIMEOUT_S counts per slice.
+    pub catchup_slice_blocks: u64,
+    /// Between two slices, when the process is at or above this size (MB),
+    /// freed memory is handed back to the system first (memguard::trim_now,
+    /// ~30 ms) [ARBSIM_COPY2_CATCHUP_TRIM_MB, 1100; 0 = never].
+    pub catchup_trim_mb: u64,
     /// FAST RESTART (Oct 25): at most this many held "nothing follows"
     /// values are re-read before a warm restart answers again; more are
     /// FORGOTTEN instead (read again when a check needs them)
@@ -2199,6 +2215,8 @@ impl C2Config {
             resume_overlap: env_u64("ARBSIM_COPY2_RESUME_OVERLAP_BLOCKS", 64).max(1),
             resume_range: env_u64("ARBSIM_COPY2_RESUME_RANGE", 500).max(1),
             resume_timeout_s: env_u64("ARBSIM_COPY2_RESUME_TIMEOUT_S", 120).max(1),
+            catchup_slice_blocks: env_u64("ARBSIM_COPY2_CATCHUP_SLICE_BLOCKS", 500),
+            catchup_trim_mb: env_u64("ARBSIM_COPY2_CATCHUP_TRIM_MB", 1100),
             resume_verify_max: env_u64("ARBSIM_COPY2_RESUME_VERIFY_MAX", 20_000) as usize,
             drop_grace_s: env_u64("ARBSIM_COPY2_DROP_GRACE_S", 1800),
             drop_grace_max: env_u64("ARBSIM_COPY2_DROP_GRACE_MAX", 400).min(100_000) as usize,
@@ -2208,7 +2226,7 @@ impl C2Config {
         }
     }
     pub fn for_tests() -> Self {
-        C2Config { reload_ms: 0, reload_max_ms: 0, layout_retry_s: 3600, load_batch: 25, loaders: 2, keep_blocks: 400, max_keep_blocks: 4000, max_rounds: 40, tip_every_s: 0, catchup_max_blocks: 64, walk: WalkCfg::default(), walks_inflight: 2, walk_max_slots: 1_000_000, walk_max_rss_mb: 0, walk_hot: 16, walk_hot_max_rss_mb: 0, late_fetch: true, max_keep_logs: 1_000_000, pending_ms: 300, pm_bound: true, verify_every_s: 0, verify_max: 400, fast_verify_ms: 0, fast_verify_max: 1000, fast_max_age_ms: 150_000, stall_s: 30, state_file: None, save_every_s: 3600, resume_max_blocks: 18_000, resume_overlap: 64, resume_range: 500, resume_timeout_s: 60, resume_verify_max: usize::MAX, drop_grace_s: 1800, drop_grace_max: 400, drop_grace_max_logs: 1_000_000, blind: super::v4blind::BlindCfg::for_tests(), code_prune_s: 0 }
+        C2Config { reload_ms: 0, reload_max_ms: 0, layout_retry_s: 3600, load_batch: 25, loaders: 2, keep_blocks: 400, max_keep_blocks: 4000, max_rounds: 40, tip_every_s: 0, catchup_max_blocks: 64, walk: WalkCfg::default(), walks_inflight: 2, walk_max_slots: 1_000_000, walk_max_rss_mb: 0, walk_hot: 16, walk_hot_max_rss_mb: 0, late_fetch: true, max_keep_logs: 1_000_000, pending_ms: 300, pm_bound: true, verify_every_s: 0, verify_max: 400, fast_verify_ms: 0, fast_verify_max: 1000, fast_max_age_ms: 150_000, stall_s: 30, state_file: None, save_every_s: 3600, resume_max_blocks: 18_000, resume_overlap: 64, resume_range: 500, resume_timeout_s: 60, catchup_slice_blocks: 0, catchup_trim_mb: 0, resume_verify_max: usize::MAX, drop_grace_s: 1800, drop_grace_max: 400, drop_grace_max_logs: 1_000_000, blind: super::v4blind::BlindCfg::for_tests(), code_prune_s: 0 }
     }
 }
 
@@ -2339,6 +2357,39 @@ struct CatchUp {
     started: Instant,
     /// Node requests before it started (cost, for the log).
     req0: u64,
+    /// (slices) Newest block the copy had when the catch-up began (for the
+    /// final log / status; `applied` moves forward slice by slice).
+    applied0: u64,
+    /// (slices) Last block of the whole catch-up as last computed (the
+    /// slice in flight ends at `to`, which may be before it).
+    end: u64,
+    /// (slices) Totals over the slices done so far.
+    tot: SliceTotals,
+}
+
+/// What the slices of one catch-up did, added up (for the final log line).
+#[derive(Default, Clone, Copy)]
+struct SliceTotals {
+    slices: u64,
+    logs: u64,
+    blocks: u64,
+    late: u64,
+    public: u64,
+    paid: u64,
+    headers: u64,
+    splits: u64,
+    trims: u64,
+}
+
+/// CATCH-UP IN SLICES: last block the next slice reads, when the copy has
+/// applied up to `applied` and the catch-up goes up to `to`. `slice` 0 =
+/// the old way (everything up to `to` in one go).
+pub fn catchup_slice_to(applied: u64, to: u64, slice: u64) -> u64 {
+    if slice == 0 {
+        to
+    } else {
+        to.min(applied.saturating_add(slice))
+    }
 }
 
 /// One pool's part of a load job.
@@ -6746,6 +6797,9 @@ impl Intake {
             why: "restart".into(),
             started: Instant::now(),
             req0: self.c2.node_requests.load(Ordering::Relaxed),
+            applied0: block,
+            end: block,
+            tot: SliceTotals::default(),
         });
     }
 
@@ -6974,6 +7028,9 @@ impl Intake {
             why: why.to_string(),
             started: Instant::now(),
             req0: self.c2.node_requests.load(Ordering::Relaxed),
+            applied0: last,
+            end: to,
+            tot: SliceTotals::default(),
         });
         self.set_resume("state", json!(format!("catching up blocks {}..{to} ({why})", last + 1)));
         true
@@ -7021,12 +7078,20 @@ impl Intake {
             settle_filters(&reg, &keys)
         };
         let from = cu.from;
+        // CATCH-UP IN SLICES: at most ARBSIM_COPY2_CATCHUP_SLICE_BLOCKS now.
+        let end = to;
+        let to = catchup_slice_to(applied, end, self.cfg.catchup_slice_blocks);
         let id = self.new_job(JobFor::CatchUp);
         let cu = self.catchup.as_mut().unwrap();
         cu.job = Some(id);
         cu.to = to;
+        cu.end = end;
         cu.since.get_or_insert_with(Instant::now);
-        let state = format!("reading the reports of blocks {from}..{to} from the node ({})", cu.why);
+        let state = if to < end {
+            format!("reading the reports of blocks {from}..{to} from the node (slice {} of a catch-up to block {end}; {})", cu.tot.slices + 1, cu.why)
+        } else {
+            format!("reading the reports of blocks {from}..{to} from the node ({})", cu.why)
+        };
         self.set_resume("state", json!(state));
         if filters.is_empty() {
             // No pool to read reports for: nothing to catch up.
@@ -7058,7 +7123,7 @@ impl Intake {
                 return;
             }
         };
-        let (from, to, applied, restored) = (cu.from, cu.to, cu.applied, cu.restored);
+        let (from, to, applied, restored, end) = (cu.from, cu.to, cu.applied, cu.restored, cu.end);
         let t0 = Instant::now();
         // Our pools' reports only (the filters can match more), by block.
         let mut logs: Vec<PoolLog> = Vec::new();
@@ -7112,10 +7177,56 @@ impl Intake {
         if to > self.last_msg_block.unwrap_or(0) {
             self.last_msg_block = Some(to);
         }
-        self.gap_filled_until = Some(to);
         add(&self.c2.stats.catchup_blocks, blocks);
         add(&self.c2.stats.catchup_logs, n_logs as u64);
         add(&self.c2.stats.catchup_late_found, late as u64);
+        // The raw node answers are not needed any more: free them now,
+        // before the next slice (or the stage-2 re-read) is asked.
+        let (o_pub, o_paid, o_hdr, o_split) = (out.public_requests, out.paid_requests, out.headers, out.splits);
+        drop(out);
+        drop(groups);
+        // A block a slice applied may have failed the catch-up (process ->
+        // reload): then there is nothing more to do here.
+        let Some(cu) = self.catchup.as_mut() else { return };
+        cu.tot.slices += 1;
+        cu.tot.logs += n_logs as u64;
+        cu.tot.blocks += blocks;
+        cu.tot.late += late as u64;
+        cu.tot.public += o_pub;
+        cu.tot.paid += o_paid;
+        cu.tot.headers += o_hdr;
+        cu.tot.splits += o_split;
+        // CATCH-UP IN SLICES: more to go. The copy is now at `to`; the next
+        // slice reads from `to + 1` (no overlap: those blocks were just
+        // read) on the next round of the intake loop, with its own time
+        // limit. Blocks the bot sends meanwhile keep waiting, as before.
+        let more = match cu.target {
+            Some(t) => to < t,
+            // Warm restart: up to the block before the bot's first new one.
+            None => to < end,
+        };
+        if more {
+            cu.applied = to;
+            cu.from = to + 1;
+            cu.since = None;
+            cu.tries = 0;
+            let n = cu.tot.slices;
+            let trim_mb = self.cfg.catchup_trim_mb;
+            let mb = crate::memguard::rss_mb();
+            if trim_mb > 0 && mb >= trim_mb as f64 {
+                let ms = crate::memguard::trim_now();
+                if let Some(cu) = self.catchup.as_mut() {
+                    cu.tot.trims += 1;
+                }
+                eprintln!("[arbsim] copy2: catch-up slice {n} done (copy at block {to} of {end}); process {mb:.0} MB >= {trim_mb} MB: freed memory handed back ({ms:.0} ms, now {:.0} MB)", crate::memguard::rss_mb());
+            }
+            self.set_resume("state", json!(format!("catching up: copy at block {to} of {end} (slice {n} done)")));
+            return;
+        }
+        self.gap_filled_until = Some(to);
+        let tot = cu.tot;
+        let applied = cu.applied0;
+        let (n_logs, blocks, late) = (tot.logs as usize, tot.blocks, tot.late as usize);
         let (ready, unsure, loading) = {
             let reg = self.c2.reg.read().unwrap();
             let (l, r, u) = reg.counts();
@@ -7127,20 +7238,25 @@ impl Intake {
         let why = cu.why.clone();
         let reqs = self.c2.node_requests.load(Ordering::Relaxed) - cu.req0;
         eprintln!(
-            "[arbsim] copy2: caught up {} from the node's logs ({}): {n_logs} reports (blocks {from}..{to}) applied in {} ms, {blocks} blocks with reports, {late} late report(s) for blocks the copy had; {} requests ({} public, {} paid, {} headers{}); now {ready} ready, {loading} loading, {unsure} unsure; {secs:.1} s since start",
+            "[arbsim] copy2: caught up {} from the node's logs ({}): {n_logs} reports applied (last slice blocks {from}..{to} in {} ms), {blocks} blocks with reports, {late} late report(s) for blocks the copy had; {} slice(s){}; {} requests ({} public, {} paid, {} headers{}); process {:.0} MB (peak {:.0} MB); now {ready} ready, {loading} loading, {unsure} unsure; {secs:.1} s since start",
             if to > applied { format!("blocks {}..{to}", applied + 1) } else { "no missing block".to_string() },
             why,
             t0.elapsed().as_millis(),
+            tot.slices,
+            if tot.trims > 0 { format!(" ({} memory hand-back(s) between slices)", tot.trims) } else { String::new() },
             reqs,
-            out.public_requests,
-            out.paid_requests,
-            out.headers,
-            if out.splits > 0 { format!(", {} ranges split", out.splits) } else { String::new() },
+            tot.public,
+            tot.paid,
+            tot.headers,
+            if tot.splits > 0 { format!(", {} ranges split", tot.splits) } else { String::new() },
+            crate::memguard::rss_mb(),
+            crate::memguard::peak_rss_mb(),
         );
         self.set_resume(
             "lastCatchUp",
             json!({ "why": why, "fromBlock": applied + 1, "toBlock": to, "blocks": blocks, "reports": n_logs, "lateReports": late,
-                    "requests": reqs, "publicRequests": out.public_requests, "paidRequests": out.paid_requests, "headers": out.headers,
+                    "requests": reqs, "publicRequests": tot.public, "paidRequests": tot.paid, "headers": tot.headers,
+                    "slices": tot.slices, "trims": tot.trims, "rssMb": crate::memguard::rss_mb().round(), "peakRssMb": crate::memguard::peak_rss_mb().round(),
                     "seconds": (secs * 10.0).round() / 10.0, "ready": ready, "unsure": unsure, "loading": loading }),
         );
         if restored {

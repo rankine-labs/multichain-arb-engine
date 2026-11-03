@@ -1020,3 +1020,110 @@ fn big_held_set_is_forgotten_on_warm_restart_instead_of_reread() {
     assert_eq!(b2.sh.head().unwrap().snap.storage(ch.uu, U256::from(2u64)), Lookup::Missing, "forgotten: a check misses it and fills it again");
     exact_vs_chain(&ch, &b2, "restarted (forgot held values)");
 }
+
+// ----------------------------------------------------------------------------
+// CATCH-UP IN SLICES (Nov 3, ARBSIM_COPY2_CATCHUP_SLICE_BLOCKS).
+//
+// Plain English: the same two catch-ups as above (after a restart, and after
+// a gap while running), but read and applied a few blocks at a time instead
+// of all at once (so a big gap never holds every report in memory together).
+// The copy must end EXACTLY like the chain and like a copy that never
+// stopped, with no pool loaded again and none unsure, in several slices.
+// ----------------------------------------------------------------------------
+
+#[test]
+fn warm_restart_catches_up_exactly_in_slices() {
+    let Some(mut ch) = Chain::start() else {
+        eprintln!("copy2 resume anvil test SKIPPED: no ~/.foundry/bin/anvil");
+        return;
+    };
+    // A: never stops. B: saves, goes down for 25 blocks, comes back.
+    let mut a = ch.copy(None, |_| {});
+    ch.connect(&mut a);
+    let mut last = 0u64;
+    run_blocks(&mut ch, &mut [&mut a], 1, &mut last);
+    a.wait("every pool ready and walked", |c| c.all_ready() && c.walked_all());
+    a.settle();
+    let path = saved_copy(&mut ch, "slices", &mut last);
+    // (A missed B's blocks: catch it up the normal way first.)
+    run_blocks(&mut ch, &mut [&mut a], 1, &mut last);
+    a.settle();
+    run_blocks(&mut ch, &mut [&mut a], 25, &mut last);
+    a.settle();
+    // B comes back with slices of 4 blocks (and the memory hand-back on
+    // every slice: line 1 MB, so the hand-back path runs too).
+    let mut b2 = ch.copy(Some(&path), |c| {
+        c.catchup_slice_blocks = 4;
+        c.catchup_trim_mb = 1;
+    });
+    assert!(b2.all_ready(), "restored pools are ready: {:?}", b2.states());
+    ch.connect(&mut b2);
+    let txs = ch.random_txs();
+    let n = ch.mine(&txs);
+    let logs = ch.reports(n);
+    a.send(ch.msg(n, logs.clone(), Some(last)));
+    let mut m = ch.msg(n, logs, Some(n));
+    m.gap_reason = Some("start".into());
+    b2.send(m);
+    last = n;
+    b2.settle();
+    a.settle();
+    let st = b2.h.status_json(true);
+    eprintln!("resume status (slices): {}", st["resume"]);
+    assert_eq!(b2.c("catchups_done"), 1, "{}", st["resume"]);
+    assert_eq!(b2.c("catchups_failed"), 0, "{}", st["resume"]);
+    let slices = st["resume"]["lastCatchUp"]["slices"].as_u64().unwrap_or(0);
+    assert!(slices >= 6, "about 27 blocks in slices of 4: {slices} slice(s); {}", st["resume"]);
+    assert_eq!(st["resume"]["lastCatchUp"]["toBlock"], json!(n - 1), "{}", st["resume"]);
+    assert_eq!(b2.c("loads"), 0, "no pool was loaded again: {:?}", b2.states());
+    assert_eq!(b2.c("unsure_marked"), 0, "no pool went unsure: {:?}", b2.states());
+    let k = exact_vs_chain(&ch, &b2, "restarted, caught up in slices");
+    assert!(k > 100, "compared {k} values");
+    same_as(&a, &b2, "after the catch-up in slices");
+    run_blocks(&mut ch, &mut [&mut a, &mut b2], 5, &mut last);
+    a.settle();
+    b2.settle();
+    exact_vs_chain(&ch, &b2, "slices, 5 blocks later");
+    same_as(&a, &b2, "slices, 5 blocks later");
+}
+
+#[test]
+fn running_gap_is_filled_exactly_in_slices() {
+    let Some(mut ch) = Chain::start() else {
+        eprintln!("copy2 resume anvil test SKIPPED: no ~/.foundry/bin/anvil");
+        return;
+    };
+    let mut c = ch.copy(None, |c| c.catchup_slice_blocks = 4);
+    ch.connect(&mut c);
+    let mut last = 0;
+    run_blocks(&mut ch, &mut [&mut c], 1, &mut last);
+    c.wait("every pool ready", |c| c.all_ready() && c.walked_all());
+    run_blocks(&mut ch, &mut [&mut c], 5, &mut last);
+    c.settle();
+    let loads = c.c("loads");
+    let unsure = c.c("unsure_marked");
+    // 18 blocks the copy never gets (the bot restarted), with trades in them.
+    let mut nothing: [&mut Copy; 0] = [];
+    run_blocks(&mut ch, &mut nothing, 18, &mut last);
+    ch.connect(&mut c);
+    let txs = ch.random_txs();
+    let n = ch.mine(&txs);
+    let logs = ch.reports(n);
+    let mut m = ch.msg(n, logs, Some(n));
+    m.gap_reason = Some("start".into());
+    c.send(m);
+    last = n;
+    c.settle();
+    let st = c.h.status_json(false);
+    eprintln!("running gap (slices): {}", st["resume"]);
+    assert_eq!(c.c("catchups_done"), 1, "{}", st["resume"]);
+    let slices = st["resume"]["lastCatchUp"]["slices"].as_u64().unwrap_or(0);
+    assert!(slices >= 4, "18 blocks in slices of 4: {slices} slice(s); {}", st["resume"]);
+    assert_eq!(st["resume"]["lastCatchUp"]["toBlock"], json!(n - 1), "{}", st["resume"]);
+    assert_eq!(c.c("loads"), loads, "no pool loaded again");
+    assert_eq!(c.c("unsure_marked"), unsure, "no pool went unsure");
+    exact_vs_chain(&ch, &c, "gap filled in slices");
+    run_blocks(&mut ch, &mut [&mut c], 5, &mut last);
+    c.settle();
+    exact_vs_chain(&ch, &c, "gap filled in slices, 5 blocks later");
+}

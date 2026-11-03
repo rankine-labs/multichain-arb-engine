@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use arbsim::copy2::coins::BalanceLayout;
-use arbsim::copy2::intake::{manual, BlockMsg, C2Config, Copy2Handle, FarZero, Intake, PoolEntry, PoolState, WalkInfo};
+use arbsim::copy2::intake::{catchup_slice_to, manual, BlockMsg, C2Config, Copy2Handle, FarZero, Intake, PoolEntry, PoolState, WalkInfo};
 use arbsim::copy2::persist;
 use arbsim::copy2::{BlockCtx as ReplayCtx, PoolKind, PoolLog, TrackedPool};
 use arbsim::node::{CallResult, Class, NodeApi, NodeErr};
@@ -343,9 +343,14 @@ fn fake(tip: u64, n_v2: u64) -> Arc<FakeNode> {
 }
 
 fn copy(node: Arc<FakeNode>, file: Option<String>, save_every_s: u64) -> (Arc<Shared>, Intake, Copy2Handle) {
+    copy_sliced(node, file, save_every_s, 0)
+}
+
+/// Same, catching up in slices of `slice` blocks (0 = all at once).
+fn copy_sliced(node: Arc<FakeNode>, file: Option<String>, save_every_s: u64, slice: u64) -> (Arc<Shared>, Intake, Copy2Handle) {
     let nd: Arc<dyn NodeApi> = node;
     let sh = Shared::new(Config { history: 64, ..Config::for_tests() }, Some(nd), Arc::new(Volatile::default()));
-    let cfg = C2Config { state_file: file, save_every_s, walks_inflight: 0, keep_blocks: 2400, ..C2Config::for_tests() };
+    let cfg = C2Config { state_file: file, save_every_s, walks_inflight: 0, keep_blocks: 2400, catchup_slice_blocks: slice, ..C2Config::for_tests() };
     let (i, hd) = manual(sh.clone(), Arc::new(FillQueue::new(1000, 100)), cfg);
     (sh, i, hd)
 }
@@ -484,5 +489,63 @@ fn warm_restart_sizes_and_times() {
         // Requests: one per 500-block range + a few header rounds.
         assert!(pubr + paid <= gap / 500 * 2 + 40, "{label}: {pubr} + {paid} requests");
     }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ----------------------------------------------------------------------------
+// CATCH-UP IN SLICES (Nov 3, ARBSIM_COPY2_CATCHUP_SLICE_BLOCKS).
+// ----------------------------------------------------------------------------
+
+#[test]
+fn slice_end_rule() {
+    // 0 = the old way: everything in one go.
+    assert_eq!(catchup_slice_to(100, 5000, 0), 5000);
+    // Slices: at most `slice` blocks past the copy's block.
+    assert_eq!(catchup_slice_to(100, 5000, 500), 600);
+    assert_eq!(catchup_slice_to(4600, 5000, 500), 5000);
+    assert_eq!(catchup_slice_to(5000, 5000, 500), 5000);
+    // Never overflows.
+    assert_eq!(catchup_slice_to(u64::MAX - 1, u64::MAX, 500), u64::MAX);
+}
+
+/// The same 3,000-block gap caught up all at once and in slices of 500:
+/// the same copy at the end (same block, same values, nothing unsure), the
+/// sliced one in 6 slices with about the same node requests.
+#[test]
+fn catch_up_in_slices_gives_the_same_copy() {
+    let z = sizes();
+    let dir = std::env::temp_dir().join(format!("arbsim-resume-slices-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path0 = dir.join("made-up.bin").to_str().unwrap().to_string();
+    persist::save(&state(&z), &path0).unwrap();
+    let gap = 3000u64;
+    let first = S + gap + 1;
+    let mut results = Vec::new();
+    for slice in [0u64, 500] {
+        let p = dir.join(format!("s{slice}.bin")).to_str().unwrap().to_string();
+        std::fs::copy(&path0, &p).unwrap();
+        let node = fake(first, z.v2);
+        let (sh, mut intake, hd) = copy_sliced(node.clone(), Some(p), 3600, slice);
+        let took = catch_up(&mut intake, &hd, first, z.v2);
+        let r = hd.status_json(false)["resume"].clone();
+        assert_eq!(counter(&hd, "catchups_done"), 1, "slice {slice}: {r}");
+        assert_eq!(counter(&hd, "catchups_failed"), 0, "slice {slice}: {r}");
+        assert_eq!(counter(&hd, "unsure_marked"), 0, "slice {slice}: no pool unsure");
+        assert_eq!(counter(&hd, "loads"), 0, "slice {slice}: no pool loaded again");
+        let head = sh.head().unwrap();
+        assert_eq!(head.block, first, "slice {slice}: at the bot's block");
+        let requests = node.public.load(Ordering::Relaxed) + node.paid.load(Ordering::Relaxed);
+        eprintln!("CATCH-UP {gap} blocks, slice {slice}: {:.2} s, {requests} requests, {} slice(s), {} blocks with reports", took.as_secs_f64(), r["lastCatchUp"]["slices"], r["lastCatchUp"]["blocks"]);
+        results.push((head.snap.counts(), counter(&hd, "catchup_blocks"), counter(&hd, "catchup_logs"), r["lastCatchUp"]["slices"].as_u64().unwrap_or(0), r["lastCatchUp"]["fromBlock"].clone(), requests));
+    }
+    let (a, b) = (&results[0], &results[1]);
+    assert_eq!(a.0, b.0, "same accounts / values in the copy");
+    assert_eq!(a.1, b.1, "same blocks applied");
+    assert_eq!(a.2, b.2, "same reports applied");
+    assert_eq!(a.3, 1, "all at once = one slice");
+    assert_eq!(b.3, 6, "3,000 blocks in slices of 500");
+    assert_eq!(a.4, b.4, "the final status names the whole range");
+    assert!(b.5 <= a.5 + 12, "about the same node requests: {} vs {}", b.5, a.5);
     let _ = std::fs::remove_dir_all(&dir);
 }
