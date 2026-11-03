@@ -4,7 +4,7 @@ import { tmpdir } from 'os';
 import { ethers } from 'ethers';
 import {
   fastlaneModeFromEnv, buildFastlaneState, FastlaneStateWriter, FastlaneSendsFollower, parseSendLine, pairRows, practiceHourSummary, routePairs,
-  StateSources, RustSendRecord, RustSendStats, writeStartupSenderGuard, V4KeyCheckCache,
+  StateSources, RustSendRecord, RustSendStats, writeStartupSenderGuard, V4KeyCheckCache, sendBlockKindOf, rustSendPath,
 } from '../execution/fastlaneBridge';
 import { FastSender, RUST_IS_SENDER, rustSenderOn, SafetyGate } from '../execution/fastSender';
 import { LiveTradeTracker } from '../execution/liveTracker';
@@ -365,6 +365,21 @@ function finalReview() {
   for (let i = 0; i < 10; i++) small.matches({ poolAddress: `0x${i}` } as unknown as import('../core/types').PoolState);
   assert(small.size === 3, 'bounded');
   rmSync(d, { recursive: true, force: true });
+}
+// ---- (Nov 3) send-block kinds and the Rust send's scoreboard path ---------------
+{
+  assert(sendBlockKindOf('up-cl', false) === 'upcl' && sendBlockKindOf('RAPHAEL-CL', false) === 'raphael' && sendBlockKindOf('topaz-cl', false) === 'topaz', 'Slipstream copies: upcl / raphael / topaz');
+  assert(sendBlockKindOf('fables', true) === 'hookedv4' && sendBlockKindOf('uniswap-v4', true) === 'hookedv4', 'any hooked V4 pool: hookedv4');
+  assert(sendBlockKindOf('uniswap-v4', false) === null && sendBlockKindOf('uniswap-v3', false) === null && sendBlockKindOf(undefined, false) === null, 'other pools: no kind (never blocked)');
+  const st = buildFastlaneState(sources({ poolKinds: () => ({ '0xAbC': 'UPCL' }) }));
+  assert(st.poolKinds['0xabc'] === 'upcl' && Object.keys(st.poolKinds).length === 1, 'state file poolKinds, lowercased');
+  assert(JSON.stringify(buildFastlaneState(sources()).poolKinds) === '{}', 'no source: empty poolKinds');
+  assert(JSON.stringify(buildFastlaneState(sources({ poolKinds: () => { throw new Error('x'); } })).poolKinds) === '{}', 'a throwing source: empty (Rust still blocks hooked V4 from the hops)');
+  assert(rustSendPath({ pools: ['a', 'b'], view: 'trigger' }) === 'trig_first', "fire-first send: path trig_first (Rust's fire-first pause)");
+  assert(rustSendPath({ pools: ['a', 'b'], view: 'confirmed' }) === 'gap' && rustSendPath({ pools: ['a', 'b'], view: 'predicted' }) === 'gap' && rustSendPath({ pools: ['a', 'b'] }) === 'gap', 'gap scan / older record: path gap');
+  assert(rustSendPath({ pools: ['a', 'b', 'c'], view: 'trigger' }) === 'loop', '3+ pools: loop (Rust loops read the loop pause)');
+  const rec = parseSendLine(JSON.stringify({ t: 1, mode: 'live', label: 'x', pools: ['a', 'b'], view: 'trigger' }));
+  assert(rec?.view === 'trigger', 'the view field is read from the send log');
 }
 finalReview();
 

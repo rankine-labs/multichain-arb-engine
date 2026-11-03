@@ -113,6 +113,9 @@ export interface FastlaneState {
   rustSender: boolean;      // OUR RUST_SENDER: Rust broadcasts only if this is true too
   dropsSeen: number;        // tracked Rust sends found dropped / never mined (since start)
   maxGasUsed: number;       // most gas units any Rust send used (0 = none yet)
+  // (Nov 3) pool key (lowercase) -> kind, for Rust's FASTLANE_SEND_BLOCK_KINDS
+  // (upcl / raphael / topaz / hookedv4). Pools of other kinds are not listed.
+  poolKinds: Record<string, string>;
 }
 
 // Everything the writer reads from the bot (closures set up in shadowMain).
@@ -139,6 +142,30 @@ export interface StateSources {
   rustSender: () => boolean;
   dropsSeen: () => number;
   maxGasUsed: () => number;
+  // (Nov 3) Optional: pool key -> send-block kind (see sendBlockKindOf). Not given = {}.
+  poolKinds?: () => Record<string, string>;
+}
+
+// (Nov 3) A pool's kind for Rust's FASTLANE_SEND_BLOCK_KINDS (sim/src/fastlane/
+// safety.rs), from the bot's exchange id and whether it is a V4 pool with a
+// hook: 'up-cl' -> upcl, 'raphael-cl' -> raphael, 'topaz-cl' -> topaz, any
+// hooked V4 pool (Fables etc.) -> hookedv4. Others -> null (never blocked).
+export function sendBlockKindOf(dex: string | undefined, hookedV4: boolean): string | null {
+  if (hookedV4) return 'hookedv4';
+  switch ((dex ?? '').toLowerCase()) {
+    case 'up-cl': return 'upcl';
+    case 'raphael-cl': return 'raphael';
+    case 'topaz-cl': return 'topaz';
+    default: return null;
+  }
+}
+
+// (Nov 3) The scoreboard path of a live Rust send: 3+ pools = 'loop';
+// fire-first (record view "trigger") = 'trig_first', the pause Rust's
+// fire-first gate reads (state file paused.trig); else 'gap' (paused.gap).
+export function rustSendPath(r: Pick<RustSendRecord, 'pools' | 'view'>): 'loop' | 'trig_first' | 'gap' {
+  if ((r.pools?.length ?? 0) > 2) return 'loop';
+  return r.view === 'trigger' ? 'trig_first' : 'gap';
 }
 
 const lowerAll = (xs: string[]) => [...new Set(xs.map((x) => String(x).toLowerCase()))];
@@ -189,6 +216,7 @@ export function buildFastlaneState(s: StateSources): FastlaneState {
     rustSender: safe(s.rustSender, false) === true,
     dropsSeen: finite(safe(s.dropsSeen, 0)),
     maxGasUsed: finite(safe(s.maxGasUsed, 0)),
+    poolKinds: Object.fromEntries(Object.entries(safe(s.poolKinds ?? (() => ({})), {} as Record<string, string>)).map(([k, v]) => [k.toLowerCase(), String(v).toLowerCase()])),
   };
 }
 
@@ -317,6 +345,8 @@ export interface RustSendRecord {
   replyTo?: number;
   replyHash?: string;
   status?: string;
+  // (Nov 3) "confirmed" / "predicted" (gap scan) or "trigger" (fire-first). Missing = older Rust.
+  view?: string;
 }
 
 export interface FollowerHooks {

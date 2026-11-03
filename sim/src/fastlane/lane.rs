@@ -500,6 +500,7 @@ impl Firer {
             timings_us: t,
             total_us: hand_us,
             status: rec.send_status.map(|s| s.as_str().to_string()),
+            view: Some(o.view.as_str().to_string()),
             ..Default::default()
         };
         // Blocker 1: the seq is handed out under the log's write lock, so a
@@ -753,6 +754,7 @@ impl Lane {
         let killed = core.safety.killed();
         let paused_passes = core.safety.paused_passes;
         let score_paused = !core.safety.kill_blocks_practice();
+        let send_block = json!({"kinds": core.safety.cfg.send_block_kinds, "allowPools": core.safety.cfg.send_allow_pools.len(), "blocked": core.safety.kind_blocks});
         // (Oct 31) How far behind the feed's newest block trades were decided.
         let behind_tip = {
             let mut v: Vec<u64> = core.safety.behind_samples.iter().copied().collect();
@@ -794,7 +796,11 @@ impl Lane {
                 // (Oct 31) Blocks between the feed's newest block and the
                 // decided block, per checked trade (scanner + fire-first);
                 // over FASTLANE_MAX_BLOCKS_BEHIND = blocked "behind_tip".
-                "behindTipBlocks": behind_tip},
+                "behindTipBlocks": behind_tip,
+                // (Nov 3) FASTLANE_SEND_BLOCK_KINDS: kinds not sent live, the
+                // allow-listed pools, and live sends stopped per kind since start
+                // (scanner + fire-first; this hour's are "kind" in blockedThisHour).
+                "sendBlock": send_block},
             "lane": {
                 "tips": h.tips, "confirmedScanned": h.confirmed, "tipsOld": h.tips_old, "opps": h.opps, "fired": h.fired, "wouldSend": h.would_send, "liveSent": h.live_sent,
                 "notLeft": h.not_left, "gunRefused": h.gun_refused, "logErrors": h.log_errors, "dropsSeen": h.drops_seen,
