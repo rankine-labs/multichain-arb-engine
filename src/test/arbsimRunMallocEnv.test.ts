@@ -19,7 +19,9 @@ const DEPLOY = join(__dirname, '..', '..', 'deploy');
 const tmp = mkdtempSync(join(tmpdir(), 'arbsimrun-'));
 
 // Prints the MALLOC_* / ARBSIM_ALLOC values the fake program got, one per line.
-const NAMES = ['MALLOC_ARENA_MAX', 'MALLOC_MMAP_THRESHOLD_', 'MALLOC_TRIM_THRESHOLD_', 'MALLOC_TOP_PAD_', 'MALLOC_PERTURB_', 'ARBSIM_ALLOC'];
+const NAMES = ['MALLOC_ARENA_MAX', 'MALLOC_MMAP_THRESHOLD_', 'MALLOC_TRIM_THRESHOLD_', 'MALLOC_TOP_PAD_', 'MALLOC_PERTURB_', 'ARBSIM_ALLOC',
+  // Keeper thrift (Nov 3): its switches must reach arbsim too.
+  'FASTLANE_AHEAD_KEEP_THRIFT', 'FASTLANE_AHEAD_KEEP_UNITS_DAY', 'FASTLANE_AHEAD_KEEP_SEED_GATHER_MS'];
 
 function run(env: string, inherited: Record<string, string> = {}): Record<string, string> {
   const app = mkdtempSync(join(tmp, 'app-'));
@@ -68,6 +70,12 @@ try {
   assert(bad.MALLOC_MMAP_THRESHOLD_ === '<unset>', 'non-number MALLOC_MMAP_THRESHOLD_ ignored');
   assert(bad.MALLOC_ARENA_MAX === '2', 'non-number MALLOC_ARENA_MAX ignored (default 2 kept)');
   assert(bad.MALLOC_PERTURB_ === '<unset>', 'names outside the list are never passed');
+
+  // Keeper thrift switches (Nov 3) pass like the other keeper settings.
+  const th = run('FASTLANE_AHEAD_KEEP_THRIFT=on\nFASTLANE_AHEAD_KEEP_UNITS_DAY=800000\n');
+  assert(th.FASTLANE_AHEAD_KEEP_THRIFT === 'on', `FASTLANE_AHEAD_KEEP_THRIFT passed (got ${th.FASTLANE_AHEAD_KEEP_THRIFT})`);
+  assert(th.FASTLANE_AHEAD_KEEP_UNITS_DAY === '800000', `FASTLANE_AHEAD_KEEP_UNITS_DAY passed (got ${th.FASTLANE_AHEAD_KEEP_UNITS_DAY})`);
+  assert(th.FASTLANE_AHEAD_KEEP_SEED_GATHER_MS === '<unset>', 'a keeper name not in .env stays unset');
 
   // A value already in the environment is replaced only by a .env line.
   const inh = run('', { MALLOC_ARENA_MAX: '4' });
