@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use arbsim::copy2::coins::BalanceLayout;
-use arbsim::copy2::intake::{manual, BlockMsg, C2Config, Copy2Handle, FarZero, Intake, PoolEntry, PoolState, WalkInfo};
+use arbsim::copy2::intake::{catchup_slice_to, manual, BlockMsg, C2Config, Copy2Handle, FarZero, Intake, PoolEntry, PoolState, WalkInfo};
 use arbsim::copy2::persist;
 use arbsim::copy2::{BlockCtx as ReplayCtx, PoolKind, PoolLog, TrackedPool};
 use arbsim::node::{CallResult, Class, NodeApi, NodeErr};
@@ -343,9 +343,14 @@ fn fake(tip: u64, n_v2: u64) -> Arc<FakeNode> {
 }
 
 fn copy(node: Arc<FakeNode>, file: Option<String>, save_every_s: u64) -> (Arc<Shared>, Intake, Copy2Handle) {
+    copy_sliced(node, file, save_every_s, 0)
+}
+
+/// Same, catching up in slices of `slice` blocks (0 = all at once).
+fn copy_sliced(node: Arc<FakeNode>, file: Option<String>, save_every_s: u64, slice: u64) -> (Arc<Shared>, Intake, Copy2Handle) {
     let nd: Arc<dyn NodeApi> = node;
     let sh = Shared::new(Config { history: 64, ..Config::for_tests() }, Some(nd), Arc::new(Volatile::default()));
-    let cfg = C2Config { state_file: file, save_every_s, walks_inflight: 0, keep_blocks: 2400, ..C2Config::for_tests() };
+    let cfg = C2Config { state_file: file, save_every_s, walks_inflight: 0, keep_blocks: 2400, catchup_slice_blocks: slice, ..C2Config::for_tests() };
     let (i, hd) = manual(sh.clone(), Arc::new(FillQueue::new(1000, 100)), cfg);
     (sh, i, hd)
 }
@@ -484,5 +489,132 @@ fn warm_restart_sizes_and_times() {
         // Requests: one per 500-block range + a few header rounds.
         assert!(pubr + paid <= gap / 500 * 2 + 40, "{label}: {pubr} + {paid} requests");
     }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ----------------------------------------------------------------------------
+// CATCH-UP IN SLICES (Nov 3, ARBSIM_COPY2_CATCHUP_SLICE_BLOCKS).
+// ----------------------------------------------------------------------------
+
+#[test]
+fn slice_end_rule() {
+    // 0 = the old way: everything in one go.
+    assert_eq!(catchup_slice_to(100, 5000, 0), 5000);
+    // Slices: at most `slice` blocks past the copy's block.
+    assert_eq!(catchup_slice_to(100, 5000, 500), 600);
+    assert_eq!(catchup_slice_to(4600, 5000, 500), 5000);
+    assert_eq!(catchup_slice_to(5000, 5000, 500), 5000);
+    // Never overflows.
+    assert_eq!(catchup_slice_to(u64::MAX - 1, u64::MAX, 500), u64::MAX);
+}
+
+/// The same 3,000-block gap caught up all at once and in slices of 500:
+/// the same copy at the end (same block, same values, nothing unsure), the
+/// sliced one in 6 slices with about the same node requests.
+#[test]
+fn catch_up_in_slices_gives_the_same_copy() {
+    let z = sizes();
+    let dir = std::env::temp_dir().join(format!("arbsim-resume-slices-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path0 = dir.join("made-up.bin").to_str().unwrap().to_string();
+    persist::save(&state(&z), &path0).unwrap();
+    let gap = 3000u64;
+    let first = S + gap + 1;
+    let mut results = Vec::new();
+    for slice in [0u64, 500] {
+        let p = dir.join(format!("s{slice}.bin")).to_str().unwrap().to_string();
+        std::fs::copy(&path0, &p).unwrap();
+        let node = fake(first, z.v2);
+        let (sh, mut intake, hd) = copy_sliced(node.clone(), Some(p), 3600, slice);
+        let took = catch_up(&mut intake, &hd, first, z.v2);
+        let r = hd.status_json(false)["resume"].clone();
+        assert_eq!(counter(&hd, "catchups_done"), 1, "slice {slice}: {r}");
+        assert_eq!(counter(&hd, "catchups_failed"), 0, "slice {slice}: {r}");
+        assert_eq!(counter(&hd, "unsure_marked"), 0, "slice {slice}: no pool unsure");
+        assert_eq!(counter(&hd, "loads"), 0, "slice {slice}: no pool loaded again");
+        let head = sh.head().unwrap();
+        assert_eq!(head.block, first, "slice {slice}: at the bot's block");
+        let requests = node.public.load(Ordering::Relaxed) + node.paid.load(Ordering::Relaxed);
+        eprintln!("CATCH-UP {gap} blocks, slice {slice}: {:.2} s, {requests} requests, {} slice(s), {} blocks with reports", took.as_secs_f64(), r["lastCatchUp"]["slices"], r["lastCatchUp"]["blocks"]);
+        results.push((head.snap.counts(), counter(&hd, "catchup_blocks"), counter(&hd, "catchup_logs"), r["lastCatchUp"]["slices"].as_u64().unwrap_or(0), r["lastCatchUp"]["fromBlock"].clone(), requests, node.headers.load(Ordering::Relaxed), node.paid.load(Ordering::Relaxed)));
+    }
+    let (a, b) = (&results[0], &results[1]);
+    assert_eq!(a.0, b.0, "same accounts / values in the copy");
+    assert_eq!(a.1, b.1, "same blocks applied");
+    assert_eq!(a.2, b.2, "same reports applied");
+    assert_eq!(a.3, 1, "all at once = one slice");
+    assert_eq!(b.3, 6, "3,000 blocks in slices of 500");
+    assert_eq!(a.4, b.4, "the final status names the whole range");
+    // Each slice does its own few header rounds (parent-chain block by
+    // halving: ~log2(500) small batches to the FREE node), so more HTTP
+    // requests (CI: 66 vs 19 for 3,000 blocks) but the same headers and the
+    // same paid calls. At most ~12 extra per slice.
+    assert!(b.5 <= a.5 + 12 * b.3, "requests: {} sliced vs {} at once", b.5, a.5);
+    assert!(b.6 <= a.6 + 6 * b.3, "about the same headers read: {} vs {}", b.6, a.6);
+    assert_eq!(b.7, a.7, "no extra paid requests");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// (Nov 3) Warm restart with MORE held values than ARBSIM_COPY2_RESUME_VERIFY_MAX
+/// (they are forgotten instead of re-read), after a 3,000-block gap: the
+/// forget used to rewrite every kept version (up to ARBSIM_HISTORY 64) on its
+/// own, which broke their memory sharing (live Nov 2 23:14: +1.4 GB in 2 s).
+/// With ARBSIM_COPY2_RESUME_FORGET_KEEP_VERSIONS 4 only the newest 4 are
+/// kept and rewritten; the copy at the head is the same as the old way.
+#[test]
+fn warm_restart_forget_keeps_only_newest_versions() {
+    let z = sizes();
+    let dir = std::env::temp_dir().join(format!("arbsim-resume-forget-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path0 = dir.join("made-up.bin").to_str().unwrap().to_string();
+    // Coin settings nothing follows (every coin slot but our pools'
+    // balances): what the warm restart forgets.
+    let mut st = state(&z);
+    let mut snap = (*st.snap).clone();
+    for k in 0..600u64 {
+        snap.apply_fact(&Fact::Slot(addr(0xc0, k % 60), h("coin-setting", k), h("cs", k)));
+    }
+    st.snap = Arc::new(snap);
+    persist::save(&st, &path0).unwrap();
+    let gap = 3000u64;
+    let first = S + gap + 1;
+    let mut results = Vec::new();
+    for keep in [0usize, 4] {
+        let p = dir.join(format!("k{keep}.bin")).to_str().unwrap().to_string();
+        std::fs::copy(&path0, &p).unwrap();
+        let node = fake(first, z.v2);
+        let nd: Arc<dyn NodeApi> = node.clone();
+        let sh = Shared::new(Config { history: 64, ..Config::for_tests() }, Some(nd), Arc::new(Volatile::default()));
+        let cfg = C2Config {
+            state_file: Some(p),
+            save_every_s: 3600,
+            walks_inflight: 0,
+            keep_blocks: 2400,
+            catchup_slice_blocks: 500,
+            // Forget every held value nothing follows (the live case: 20,000+).
+            resume_verify_max: 0,
+            resume_forget_keep_versions: keep,
+            ..C2Config::for_tests()
+        };
+        let (mut intake, hd) = manual(sh.clone(), Arc::new(FillQueue::new(1000, 100)), cfg);
+        catch_up(&mut intake, &hd, first, z.v2);
+        let r = hd.status_json(false)["resume"].clone();
+        assert_eq!(counter(&hd, "catchups_done"), 1, "keep {keep}: {r}");
+        assert_eq!(counter(&hd, "unsure_marked"), 0, "keep {keep}: no pool unsure");
+        let forgotten = counter(&hd, "resume_forgotten");
+        assert!(forgotten > 0, "keep {keep}: the forget path ran: {r}");
+        let head = sh.head().unwrap();
+        assert_eq!(head.block, first, "keep {keep}: at the bot's block");
+        let n_versions = sh.published.read().unwrap().versions.len();
+        eprintln!("FORGET keep {keep}: {forgotten} values forgotten, {n_versions} versions kept after the catch-up");
+        results.push((head.snap.counts(), forgotten, n_versions));
+    }
+    let (old, new) = (&results[0], &results[1]);
+    assert_eq!(old.0, new.0, "same copy at the head (accounts / values)");
+    assert_eq!(old.1, new.1, "same values forgotten");
+    assert!(old.2 > 8, "the old way kept (and rewrote) many versions: {}", old.2);
+    assert!(new.2 <= 4 + 1, "only the newest 4 (+ the bot's block) kept: {}", new.2);
     let _ = std::fs::remove_dir_all(&dir);
 }
