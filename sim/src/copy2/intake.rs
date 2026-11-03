@@ -793,6 +793,12 @@ c2counters!(
     // only, the replay's exact event check decides; v1 reloaded the pool).
     watch_accounts_added, watch_events, watch_verifies, watch_verify_items, watch_changed,
     watch_stale_dropped, watch_reloads, watch_same_block_unsure,
+    // (Nov 3) POOL AUDIT (ARBSIM_COPY2_POOL_AUDIT_S): hooked V4 / Slipstream
+    // pools' held values re-read from the node at an exact block and
+    // compared with the copy's version of that block: rounds, values read,
+    // pools found different from the chain (reloaded), audits skipped (no
+    // version for that block / pool changed meanwhile / node error).
+    pool_audit_rounds, pool_audit_items, pool_audit_drift, pool_audit_skipped,
 );
 
 fn inc(c: &AtomicU64) {
@@ -2302,6 +2308,8 @@ enum JobFor {
     Warm { items: Vec<MissItem> },
     /// (Nov 2) A watched account's held values read again after its event(s).
     WatchVerify { addr: Address },
+    /// (Nov 3) Pool audit: one pool's held values read at an exact block.
+    PoolAudit { key: PoolKey, gen: u64 },
 }
 
 /// A ready pool the bot stopped listing (see on_track "parking"): what the
@@ -2481,6 +2489,9 @@ pub struct Intake {
     last_stall_log: Option<Instant>,
     /// Last round of re-reading the values nothing follows.
     last_verify: Instant,
+    /// (Nov 3) Pool audit: last round, and where the rotation goes on.
+    last_pool_audit: Instant,
+    pool_audit_next: usize,
     /// (Oct 30) The fast lane's filled values (slots) -> (when asked, when
     /// last read SUCCESSFULLY from the node: the fill, then each fast verify
     /// round; None = not landed yet).
@@ -2623,6 +2634,8 @@ pub fn manual(sh: Arc<Shared>, fills: Arc<FillQueue>, cfg: C2Config) -> (Intake,
         last_stall_check: Instant::now(),
         last_stall_log: None,
         last_verify: Instant::now(),
+        last_pool_audit: Instant::now(),
+        pool_audit_next: 0,
         fast_watch: HashMap::new(),
         fast_pending: HashMap::new(),
         last_fast_verify: Instant::now(),
@@ -2891,6 +2904,7 @@ impl Intake {
             self.dispatch_walks();
             self.dispatch_settle();
             self.dispatch_verify();
+            self.dispatch_pool_audit();
             self.dispatch_watch_verify();
             self.dispatch_fast_verify();
             self.dispatch_warm();
@@ -4409,6 +4423,7 @@ impl Intake {
             (JobFor::PoolCatchUp { key, gen }, Done::CatchUp { res, .. }) => self.on_pool_catchup(key, gen, res),
             (JobFor::Warm { items }, Done::Fetch { block, res, .. }) => self.on_warm(items, block, res),
             (JobFor::WatchVerify { addr }, Done::Fetch { block, res, .. }) => self.on_watch_verify(addr, block, res),
+            (JobFor::PoolAudit { key, gen }, Done::Fetch { block, res, .. }) => self.on_pool_audit(key, gen, block, res),
             _ => {}
         }
     }
@@ -6544,6 +6559,121 @@ impl Intake {
             }
         }
         self.sh.notify();
+    }
+
+    // ---- (Nov 3) POOL AUDIT: hooked V4 / Slipstream pools vs the chain ----
+    //
+    // Plain English:
+    //   Copy 2 keeps a pool exact by re-running its events. A QUIET pool
+    //   (few trades, like UP CL WETH/VIRTUAL) that went wrong once (an event
+    //   or an outside change it never saw) stays wrong until its next event
+    //   shows the mismatch: live Nov 3, hours of "phantom gaps" through
+    //   0x851d1b. So every ARBSIM_COPY2_POOL_AUDIT_S seconds (default 60;
+    //   0 = off) the next ARBSIM_COPY2_POOL_AUDIT_POOLS (default 2) ready
+    //   hooked V4 / Slipstream pools, in turn, have the values the copy holds
+    //   for them (their own storage; at most 48, the plain slots first:
+    //   price / tick / liquidity / fee settings) read from the node AT the
+    //   copy's newest block (exact block, one request per pool) and compared
+    //   with the copy's version of that very block. Any difference = the
+    //   pool is reloaded (unsure, no strike) and logged with the slot and
+    //   both values; counted (pool_audit_drift). Never a guess either way:
+    //   a pool that changed state meanwhile, or a block whose version is no
+    //   longer kept, is skipped (counted) and audited again next turn.
+    fn pool_audit_cfg() -> (u64, usize) {
+        static C: std::sync::OnceLock<(u64, usize)> = std::sync::OnceLock::new();
+        *C.get_or_init(|| (env_u64("ARBSIM_COPY2_POOL_AUDIT_S", 60), env_u64("ARBSIM_COPY2_POOL_AUDIT_POOLS", 2).max(1) as usize))
+    }
+
+    fn dispatch_pool_audit(&mut self) {
+        let (every, per_round) = Self::pool_audit_cfg();
+        if every == 0 || self.last_pool_audit.elapsed() < Duration::from_secs(every) {
+            return;
+        }
+        if self.loaders.is_none() || self.refusing_now() || self.jobs.values().any(|j| matches!(j, JobFor::PoolAudit { .. })) {
+            return;
+        }
+        self.last_pool_audit = Instant::now();
+        let Some(head) = self.sh.head() else { return };
+        // Ready new-kind pools with nothing pending, in a fixed order.
+        let mut cands: Vec<(PoolKey, u64, Vec<MissItem>)> = {
+            let reg = self.c2.reg.read().unwrap();
+            let mut keys: Vec<PoolKey> = reg.pools.iter().filter(|(_, e)| e.state == PoolState::Ready && e.pool.is_new_kind() && e.pending_from.is_none()).map(|(k, _)| *k).collect();
+            keys.sort();
+            if keys.is_empty() {
+                return;
+            }
+            let n = keys.len();
+            let start = self.pool_audit_next % n;
+            keys.rotate_left(start);
+            keys.truncate(per_round.min(n));
+            self.pool_audit_next = (start + per_round) % n.max(1);
+            keys.into_iter()
+                .filter_map(|k| {
+                    let e = reg.pools.get(&k)?;
+                    // Its own storage only (the pool contract; V4: its slots in the PoolManager).
+                    let mut slots: Vec<U256> = e.items.iter().filter(|(a, _)| *a == e.pool.address).map(|(_, s)| *s).collect();
+                    // Plain (small) slots first: price, tick, liquidity, fee settings.
+                    slots.sort_by_key(|s| (*s >= U256::from(64u8), *s));
+                    slots.truncate(48);
+                    if slots.is_empty() {
+                        return None;
+                    }
+                    Some((k, e.gen, slots.into_iter().map(|s| MissItem::Slot(e.pool.address, s)).collect()))
+                })
+                .collect()
+        };
+        inc(&self.c2.stats.pool_audit_rounds);
+        for (k, gen, items) in cands.drain(..) {
+            add(&self.c2.stats.pool_audit_items, items.len() as u64);
+            let id = self.new_job(JobFor::PoolAudit { key: k, gen });
+            self.loaders.as_ref().unwrap().send(Job::Fetch { id, block: head.block, exact: true, bulk: true, items, calls: vec![] });
+        }
+    }
+
+    /// The node's values of one audited pool at block `k` (see above).
+    fn on_pool_audit(&mut self, key: PoolKey, gen: u64, k: u64, res: Result<FetchOut, crate::node::NodeErr>) {
+        let Ok(out) = res else {
+            inc(&self.c2.stats.pool_audit_skipped);
+            return;
+        };
+        // Still the same ready pool, nothing pending (else: next turn).
+        let same = self.c2.reg.read().unwrap().pools.get(&key).is_some_and(|e| e.gen == gen && e.state == PoolState::Ready && e.pending_from.is_none() && e.ready_since <= k);
+        if !same {
+            inc(&self.c2.stats.pool_audit_skipped);
+            return;
+        }
+        let mut differ: Vec<(Address, U256, U256, U256)> = Vec::new();
+        {
+            let p = self.sh.published.read().unwrap();
+            // Exactly the version of block k (never a neighbour).
+            let Some(v) = p.versions.iter().rev().find(|v| v.block == k) else {
+                inc(&self.c2.stats.pool_audit_skipped);
+                return;
+            };
+            for (_, f) in out.items {
+                let Ok(Fetched::Slot(a, sl, val)) = f else { continue };
+                if let Lookup::Known(h) = v.snap.storage(a, sl) {
+                    if h != val {
+                        differ.push((a, sl, h, val));
+                    }
+                }
+            }
+        }
+        if differ.is_empty() {
+            return;
+        }
+        inc(&self.c2.stats.pool_audit_drift);
+        let n = self.c2.stats.pool_audit_drift.load(Ordering::Relaxed);
+        if n <= 50 || n % 100 == 0 {
+            let (a, sl, h, c) = differ[0];
+            eprintln!(
+                "[arbsim] copy2: POOL AUDIT: pool {} (id {:?}) differs from the chain at block {k}: {} value(s), e.g. account {a} slot {sl:#x} copy {h:#x} chain {c:#x}; reloading it",
+                key.0,
+                key.1,
+                differ.len()
+            );
+        }
+        self.make_unsure_with(key, "audit: a held value differs from the chain (drift): reloading", None, k, false);
     }
 
     fn on_verify(&mut self, k: u64, res: Result<FetchOut, crate::node::NodeErr>) {
