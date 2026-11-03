@@ -43,6 +43,15 @@ export function stockTickMathOn(env: Record<string, string | undefined> = proces
   return env.STOCK_TICK_MATH !== '0';
 }
 
+// LOOP FINDER switch (Nov 2, LOOP_TICK_MATH, default ON). The loop finder
+// (core/loopFinder.ts) prices each V3/V4 hop with the same range-by-range
+// walk and V4 protocol fee as the 2-pool guess. LOOP_TICK_MATH=0 = the loop
+// finder's old maths (current price band only, LP fee only). STOCK_TICK_MATH=0
+// also turns it off (one switch puts everything back).
+export function loopTickMathOn(env: Record<string, string | undefined> = process.env): boolean {
+  return stockTickMathOn(env) && env.LOOP_TICK_MATH !== '0';
+}
+
 type CallMany = (calls: { target: string; data: string }[]) => Promise<(string | null)[]>;
 
 // V3 pool reads
@@ -86,7 +95,9 @@ export function tickEligible(p: PoolState): boolean {
   return /^0x[0-9a-fA-F]{40}$/.test(p.poolAddress);
 }
 
-interface Entry {
+// One pool's loaded window, as kept in the book (and as sent to the loop
+// worker thread, which has its own book: see loopWorkerFeed.ts).
+export interface Entry {
   win: TickWindow | null;
   protocolFee: number;       // V4 only (packed, both directions)
   loadedMs: number;
@@ -100,6 +111,9 @@ export class TickWindowBook {
   private pending = new Map<string, PoolState>();
   private loading = false;
   private tickMemo = new Map<string, { sqrt: bigint; tick: number }>();
+  // PASSIVE (the loop worker thread): this book never asks for reads (it has
+  // no node); the main thread sends it the windows it loaded (putEntry).
+  private passive = false;
   readonly stats: TickBookStats = { loads: 0, loadFails: 0, pools: 0, used: 0, fellBack: 0, leftWindow: 0, requests: 0 };
   constructor(
     private readonly o: { words?: number; refreshMs?: number; maxAgeMs?: number; now?: () => number; maxPools?: number } = {},
@@ -147,13 +161,22 @@ export class TickWindowBook {
   }
 
   want(p: PoolState) {
-    if (!tickEligible(p)) return;
+    if (this.passive || !tickEligible(p)) return;
     const k = this.key(p);
     if (!this.pending.has(k) && this.pending.size < 5_000) this.pending.set(k, p);
   }
 
   pendingCount(): number { return this.pending.size; }
   size(): number { return this.book.size; }
+
+  setPassive(on: boolean) { this.passive = on; if (on) this.pending.clear(); }
+
+  // The raw entry for a pool key (lower-case address / V4 id), or undefined.
+  // A new object every load, so callers can tell "changed" by reference.
+  entry(key: string): Entry | undefined { return this.book.get(key.toLowerCase()); }
+  // Put an entry read elsewhere (the main thread's book, sent to the loop worker).
+  putEntry(key: string, e: Entry) { this.book.set(key.toLowerCase(), e); if (this.book.size > 20_000) this.prune(); }
+  drop(key: string) { this.book.delete(key.toLowerCase()); }
 
   // Test hook / recorded state: put a window in directly.
   put(poolAddress: string, win: TickWindow, protocolFee = 0) {

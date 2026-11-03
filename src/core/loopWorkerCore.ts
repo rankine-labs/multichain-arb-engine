@@ -6,6 +6,7 @@ import type { LoopResult } from './loopFinder';
 import { deepEnough, poolDepthUsd, setRealBalanceSource } from './poolPrice';
 import { setHeadBlockSource } from './eventFees';
 import { drainSteps, Steps } from './chunked';
+import { tickBook } from './tickWindow';
 import type { LoopWorkerInit, LoopBatch, PoolRec, EnvDelta } from './loopWorkerFeed';
 import type { CoinTaxGate } from './coinTax';
 
@@ -141,6 +142,9 @@ export class LoopWorkerCore {
     if (b.keys) this.keys = b.keys;
     if (b.extraKeys !== undefined) this.extraKeys = b.extraKeys;
     for (const [k, rec] of b.pools) { if (rec) this.recs.set(k, rec); else this.recs.delete(k); }
+    // TICK WINDOWS (LOOP_TICK_MATH): the main thread's loaded range windows,
+    // into this thread's book (the loop maths reads it, tickWindow.ts).
+    if (b.win) for (const [k, e] of b.win) { if (e) tickBook.putEntry(k, e); else tickBook.drop(k); }
     this.droppedNotes += b.droppedNotes;
     if (this.init.triggersOn) {
       for (const n of b.notes) { if (n[0] === 0) this.pending.noteFeedTx(n[1]); else this.pending.note(n[1], n[2]); }

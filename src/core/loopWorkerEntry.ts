@@ -1,6 +1,10 @@
 import { parentPort } from 'worker_threads';
 import { getHeapStatistics } from 'v8';
 import { LoopWorkerCore } from './loopWorkerCore';
+import { tickBook } from './tickWindow';
+// This thread has no node for tick windows: its book only takes what the
+// main thread sends (LOOP_TICK_MATH, loopWorkerFeed.ts), never queues reads.
+tickBook.setPassive(true);
 import { LoopNodeGuard, LoopNodeThrottle, LoopNodeBusy, LoopCheckDeps, runLoopCheck, loopNodeText } from './loopNode';
 import { loopLogLine } from './loopReport';
 import { loopResultsDigest } from './loopWorkerFeed';
@@ -201,7 +205,7 @@ function start(cfg: LoopWorkerInit): void {
   const stats = () => {
     const h = getHeapStatistics();
     const c = core!;
-    post({ t: 'stats', s: { heapUsed: h.used_heap_size, heapTotal: h.total_heap_size, cycles: c.trader.finder.cycleCount(), pools: c.poolCount(), pending: c.pendingCount(), scans: c.scans, lastScanMs: c.lastScanMs } });
+    post({ t: 'stats', s: { heapUsed: h.used_heap_size, heapTotal: h.total_heap_size, cycles: c.trader.finder.cycleCount(), pools: c.poolCount(), pending: c.pendingCount(), scans: c.scans, lastScanMs: c.lastScanMs, tick: { wins: tickBook.size(), used: tickBook.stats.used, fellBack: tickBook.stats.fellBack, leftWindow: tickBook.stats.leftWindow } } });
   };
   setInterval(stats, cfg.statsMs).unref?.();
   stats();
