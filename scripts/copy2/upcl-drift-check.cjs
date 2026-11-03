@@ -110,6 +110,15 @@ async function rpcBatch(reqs) {
 }
 const rpc1 = async (m, p) => { const [r] = await rpcBatch([[m, p]]); if (r.error) throw new Error(safe(r.error.message || r.error)); return r.result; };
 
+// Wait (at most 20 s) until the public node has block `b`.
+let publicHead = 0;
+async function waitPublic(b) {
+  for (let i = 0; i < 40 && publicHead < b; i++) {
+    try { publicHead = Number(BigInt(await rpc1('eth_blockNumber', []))); } catch {}
+    if (publicHead < b) await new Promise((r) => setTimeout(r, 500));
+  }
+}
+
 // --- per pool: what to compare -------------------------------------------------
 // Slipstream pool: its own views, its factory's fee answers, the tick data
 // (bitmap word and the two ticks around the price).
@@ -285,7 +294,10 @@ async function checkPart(p, f, t, part, counters) {
   try { a = await sockAsk({ type: 'call', at: { after: 'head' }, calls: calls.map(([, to, data]) => ({ to, data })) }); } catch (e) { pt.copyUnknown++; bump(t.unknownWhy, part + ' socket: ' + safe(e)); return 'unknown'; }
   if (!a.ok) { pt.copyUnknown++; bump(t.unknownWhy, part + ' ' + String(a.unknown || 'unknown') + (a.detail ? ': ' + String(a.detail).slice(0, 40) : '')); return 'unknown'; }
   const block = Number(BigInt(a.at.block));
-  // 2. the chain's answer at the same block (public node).
+  // 2. the chain's answer at the same block (public node). The public node
+  //    trails copy 2 by a few blocks ("unsupported block number"): wait until
+  //    it has block+2 (the alignment check below reads up to block+2).
+  await waitPublic(block + 2);
   const res = await rpcBatch(calls.map(([, to, data]) => ['eth_call', [{ to, data }, ethers.toQuantity(block)]]));
   const bad = res.find((r) => r.error && !/revert/i.test(JSON.stringify(r.error)));
   if (bad) { pt.chainError++; bump(t.chainErrorWhy, safe(bad.error.message || bad.error).slice(0, 60)); return 'chainError'; }
