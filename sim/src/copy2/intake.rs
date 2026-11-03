@@ -189,6 +189,15 @@ pub fn follow_flag(name: &str) -> bool {
     std::env::var(name).map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "on" | "true" | "yes")).unwrap_or(false)
 }
 
+/// (Nov 3) ARBSIM_COPY2_OUTSIDE_SETTLE [on]: the outside contracts of a
+/// hooked V4 / Slipstream pool (watched accounts, the gauge) are part of the
+/// "reports may be missing" checks (header bloom) and of the node log reads
+/// that fill them in (settle, catch-up). "0" / "off" / "false" / "no" =
+/// the old way (only the pools' own reports and coin transfers).
+pub fn outside_settle_on() -> bool {
+    std::env::var("ARBSIM_COPY2_OUTSIDE_SETTLE").map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "off" | "false" | "no")).unwrap_or(true)
+}
+
 /// (Nov 2) Why the copy refuses this pool kind right now (its flag is off),
 /// or None when it may be followed. The bot only sends these kinds when the
 /// same flags are on in .env (one .env for both); this is the second lock.
@@ -784,6 +793,12 @@ c2counters!(
     // only, the replay's exact event check decides; v1 reloaded the pool).
     watch_accounts_added, watch_events, watch_verifies, watch_verify_items, watch_changed,
     watch_stale_dropped, watch_reloads, watch_same_block_unsure,
+    // (Nov 3) POOL AUDIT (ARBSIM_COPY2_POOL_AUDIT_S): hooked V4 / Slipstream
+    // pools' held values re-read from the node at an exact block and
+    // compared with the copy's version of that block: rounds, values read,
+    // pools found different from the chain (reloaded), audits skipped (no
+    // version for that block / pool changed meanwhile / node error).
+    pool_audit_rounds, pool_audit_items, pool_audit_drift, pool_audit_skipped,
 );
 
 fn inc(c: &AtomicU64) {
@@ -1980,6 +1995,9 @@ impl Copy2Handle {
                         "address": to_hex(e.pool.address.as_slice()),
                         "v4Id": e.pool.v4_id.map(|i| format!("{i}")),
                         "kind": kind_name(e.pool.kind),
+                        // (Nov 3) For the drift checker: a V4 pool with a hook, its tick spacing.
+                        "hooked": e.pool.is_hooked_v4(),
+                        "tickSpacing": e.pool.tick_spacing,
                         "state": state_name(e.state),
                         "reason": if e.state == PoolState::Ready { Value::Null } else { json!(e.reason) },
                         "events": e.events,
@@ -2320,6 +2338,8 @@ enum JobFor {
     Warm { items: Vec<MissItem> },
     /// (Nov 2) A watched account's held values read again after its event(s).
     WatchVerify { addr: Address },
+    /// (Nov 3) Pool audit: one pool's held values read at an exact block.
+    PoolAudit { key: PoolKey, gen: u64 },
 }
 
 /// A ready pool the bot stopped listing (see on_track "parking"): what the
@@ -2532,6 +2552,9 @@ pub struct Intake {
     last_stall_log: Option<Instant>,
     /// Last round of re-reading the values nothing follows.
     last_verify: Instant,
+    /// (Nov 3) Pool audit: last round, and where the rotation goes on.
+    last_pool_audit: Instant,
+    pool_audit_next: usize,
     /// (Oct 30) The fast lane's filled values (slots) -> (when asked, when
     /// last read SUCCESSFULLY from the node: the fill, then each fast verify
     /// round; None = not landed yet).
@@ -2674,6 +2697,8 @@ pub fn manual(sh: Arc<Shared>, fills: Arc<FillQueue>, cfg: C2Config) -> (Intake,
         last_stall_check: Instant::now(),
         last_stall_log: None,
         last_verify: Instant::now(),
+        last_pool_audit: Instant::now(),
+        pool_audit_next: 0,
         fast_watch: HashMap::new(),
         fast_pending: HashMap::new(),
         last_fast_verify: Instant::now(),
@@ -2942,6 +2967,7 @@ impl Intake {
             self.dispatch_walks();
             self.dispatch_settle();
             self.dispatch_verify();
+            self.dispatch_pool_audit();
             self.dispatch_watch_verify();
             self.dispatch_fast_verify();
             self.dispatch_warm();
@@ -4460,6 +4486,7 @@ impl Intake {
             (JobFor::PoolCatchUp { key, gen }, Done::CatchUp { res, .. }) => self.on_pool_catchup(key, gen, res),
             (JobFor::Warm { items }, Done::Fetch { block, res, .. }) => self.on_warm(items, block, res),
             (JobFor::WatchVerify { addr }, Done::Fetch { block, res, .. }) => self.on_watch_verify(addr, block, res),
+            (JobFor::PoolAudit { key, gen }, Done::Fetch { block, res, .. }) => self.on_pool_audit(key, gen, block, res),
             _ => {}
         }
     }
@@ -5509,12 +5536,24 @@ impl Intake {
                 }
             }
             if let Some(bloom) = &m.bloom {
+                let outside = outside_settle_on();
+                // Contracts that did report something in this message.
+                let got_from: HashSet<Address> = m.logs.iter().filter(|l| !l.removed).map(|l| l.address).collect();
                 for (k, e) in &reg.pools {
                     let hit_own = match e.pool.v4_id {
                         Some(id) => in_bloom(bloom, id.as_slice()),
                         None => in_bloom(bloom, e.pool.address.as_slice()),
                     };
                     if hit_own && !own.contains(k) {
+                        sus.insert(*k);
+                    }
+                    // (Nov 3, ARBSIM_COPY2_OUTSIDE_SETTLE) An outside contract
+                    // of this pool (gauge, fee module, factory, voter, hook)
+                    // may have an event in this block that did not come:
+                    // the block is read back from the node (settle). Shared
+                    // contracts (one factory for all UP CL pools) mark every
+                    // pool using them; a bloom false hit costs one log read.
+                    if outside && e.pool.watch.iter().chain(e.pool.reload_on.iter()).any(|a| in_bloom(bloom, a.as_slice()) && !got_from.contains(a)) {
                         sus.insert(*k);
                     }
                     if e.pool.v4_id.is_none() {
@@ -5649,10 +5688,16 @@ impl Intake {
             }
         }
         // Keep only reports about our pools (the filters can match more).
+        let outside = outside_settle_on();
         for (b, mut ls) in by_block {
             ls.retain(|l| !self.pool_keys_for(l).is_empty() || coin_transfer(l).is_some_and(|(c, f, t, _)| {
                 let reg = self.c2.reg.read().unwrap();
                 reg.holders.get(&c).is_some_and(|h| h.contains(&f) || h.contains(&t))
+            }) || (outside && {
+                // (Nov 3) An event of a watched account / gauge (on_late
+                // passes it to on_outside_log: re-read / reload).
+                let reg = self.c2.reg.read().unwrap();
+                reg.watched.contains_key(&l.address) || reg.reloaders.contains_key(&l.address)
             }));
             if ls.is_empty() {
                 continue;
@@ -6577,6 +6622,121 @@ impl Intake {
             }
         }
         self.sh.notify();
+    }
+
+    // ---- (Nov 3) POOL AUDIT: hooked V4 / Slipstream pools vs the chain ----
+    //
+    // Plain English:
+    //   Copy 2 keeps a pool exact by re-running its events. A QUIET pool
+    //   (few trades, like UP CL WETH/VIRTUAL) that went wrong once (an event
+    //   or an outside change it never saw) stays wrong until its next event
+    //   shows the mismatch: live Nov 3, hours of "phantom gaps" through
+    //   0x851d1b. So every ARBSIM_COPY2_POOL_AUDIT_S seconds (default 60;
+    //   0 = off) the next ARBSIM_COPY2_POOL_AUDIT_POOLS (default 2) ready
+    //   hooked V4 / Slipstream pools, in turn, have the values the copy holds
+    //   for them (their own storage; at most 48, the plain slots first:
+    //   price / tick / liquidity / fee settings) read from the node AT the
+    //   copy's newest block (exact block, one request per pool) and compared
+    //   with the copy's version of that very block. Any difference = the
+    //   pool is reloaded (unsure, no strike) and logged with the slot and
+    //   both values; counted (pool_audit_drift). Never a guess either way:
+    //   a pool that changed state meanwhile, or a block whose version is no
+    //   longer kept, is skipped (counted) and audited again next turn.
+    fn pool_audit_cfg() -> (u64, usize) {
+        static C: std::sync::OnceLock<(u64, usize)> = std::sync::OnceLock::new();
+        *C.get_or_init(|| (env_u64("ARBSIM_COPY2_POOL_AUDIT_S", 60), env_u64("ARBSIM_COPY2_POOL_AUDIT_POOLS", 2).max(1) as usize))
+    }
+
+    fn dispatch_pool_audit(&mut self) {
+        let (every, per_round) = Self::pool_audit_cfg();
+        if every == 0 || self.last_pool_audit.elapsed() < Duration::from_secs(every) {
+            return;
+        }
+        if self.loaders.is_none() || self.refusing_now() || self.jobs.values().any(|j| matches!(j, JobFor::PoolAudit { .. })) {
+            return;
+        }
+        self.last_pool_audit = Instant::now();
+        let Some(head) = self.sh.head() else { return };
+        // Ready new-kind pools with nothing pending, in a fixed order.
+        let mut cands: Vec<(PoolKey, u64, Vec<MissItem>)> = {
+            let reg = self.c2.reg.read().unwrap();
+            let mut keys: Vec<PoolKey> = reg.pools.iter().filter(|(_, e)| e.state == PoolState::Ready && e.pool.is_new_kind() && e.pending_from.is_none()).map(|(k, _)| *k).collect();
+            keys.sort();
+            if keys.is_empty() {
+                return;
+            }
+            let n = keys.len();
+            let start = self.pool_audit_next % n;
+            keys.rotate_left(start);
+            keys.truncate(per_round.min(n));
+            self.pool_audit_next = (start + per_round) % n.max(1);
+            keys.into_iter()
+                .filter_map(|k| {
+                    let e = reg.pools.get(&k)?;
+                    // Its own storage only (the pool contract; V4: its slots in the PoolManager).
+                    let mut slots: Vec<U256> = e.items.iter().filter(|(a, _)| *a == e.pool.address).map(|(_, s)| *s).collect();
+                    // Plain (small) slots first: price, tick, liquidity, fee settings.
+                    slots.sort_by_key(|s| (*s >= U256::from(64u8), *s));
+                    slots.truncate(48);
+                    if slots.is_empty() {
+                        return None;
+                    }
+                    Some((k, e.gen, slots.into_iter().map(|s| MissItem::Slot(e.pool.address, s)).collect()))
+                })
+                .collect()
+        };
+        inc(&self.c2.stats.pool_audit_rounds);
+        for (k, gen, items) in cands.drain(..) {
+            add(&self.c2.stats.pool_audit_items, items.len() as u64);
+            let id = self.new_job(JobFor::PoolAudit { key: k, gen });
+            self.loaders.as_ref().unwrap().send(Job::Fetch { id, block: head.block, exact: true, bulk: true, items, calls: vec![] });
+        }
+    }
+
+    /// The node's values of one audited pool at block `k` (see above).
+    fn on_pool_audit(&mut self, key: PoolKey, gen: u64, k: u64, res: Result<FetchOut, crate::node::NodeErr>) {
+        let Ok(out) = res else {
+            inc(&self.c2.stats.pool_audit_skipped);
+            return;
+        };
+        // Still the same ready pool, nothing pending (else: next turn).
+        let same = self.c2.reg.read().unwrap().pools.get(&key).is_some_and(|e| e.gen == gen && e.state == PoolState::Ready && e.pending_from.is_none() && e.ready_since <= k);
+        if !same {
+            inc(&self.c2.stats.pool_audit_skipped);
+            return;
+        }
+        let mut differ: Vec<(Address, U256, U256, U256)> = Vec::new();
+        {
+            let p = self.sh.published.read().unwrap();
+            // Exactly the version of block k (never a neighbour).
+            let Some(v) = p.versions.iter().rev().find(|v| v.block == k) else {
+                inc(&self.c2.stats.pool_audit_skipped);
+                return;
+            };
+            for (_, f) in out.items {
+                let Ok(Fetched::Slot(a, sl, val)) = f else { continue };
+                if let Lookup::Known(h) = v.snap.storage(a, sl) {
+                    if h != val {
+                        differ.push((a, sl, h, val));
+                    }
+                }
+            }
+        }
+        if differ.is_empty() {
+            return;
+        }
+        inc(&self.c2.stats.pool_audit_drift);
+        let n = self.c2.stats.pool_audit_drift.load(Ordering::Relaxed);
+        if n <= 50 || n % 100 == 0 {
+            let (a, sl, h, c) = differ[0];
+            eprintln!(
+                "[arbsim] copy2: POOL AUDIT: pool {} (id {:?}) differs from the chain at block {k}: {} value(s), e.g. account {a} slot {sl:#x} copy {h:#x} chain {c:#x}; reloading it",
+                key.0,
+                key.1,
+                differ.len()
+            );
+        }
+        self.make_unsure_with(key, "audit: a held value differs from the chain (drift): reloading", None, k, false);
     }
 
     fn on_verify(&mut self, k: u64, res: Result<FetchOut, crate::node::NodeErr>) {
@@ -8052,6 +8212,18 @@ fn settle_filters(reg: &Registry, keys: &HashSet<PoolKey>) -> Vec<Value> {
                 }
             }
         }
+        // (Nov 3, ARBSIM_COPY2_OUTSIDE_SETTLE, default on) The pool's
+        // outside contracts too (Slipstream gauge / factory / fee modules /
+        // voter, a V4 hook): every event of theirs. Before, a gauge or fee
+        // module event the push feed missed was never read back here, so the
+        // pool was not reloaded / its values not re-read (silent drift).
+        if outside_settle_on() {
+            for a in e.pool.watch.iter().chain(e.pool.reload_on.iter()) {
+                if *a != Address::ZERO {
+                    addrs.push(format!("{a:#x}"));
+                }
+            }
+        }
     }
     addrs.sort();
     addrs.dedup();
@@ -8663,6 +8835,38 @@ mod settle_filter_tests {
         let v4: BTreeMap<Address, Vec<String>> = [(Address::repeat_byte(1), vec!["0x01".to_string()])].into_iter().collect();
         let f = build_settle_filters(&["0xaa".into()], &["0xbb".into()], &["0xcc".into()], &v4);
         assert_eq!(f.len(), 4);
+    }
+
+    /// (Nov 3) A Slipstream pool's gauge and watched contracts are read back
+    /// with its own reports (ARBSIM_COPY2_OUTSIDE_SETTLE, default on); the
+    /// coin-transfer filters still name only the pool itself.
+    #[test]
+    fn outside_contracts_are_in_the_settle_read() {
+        let pool = Address::repeat_byte(0x51);
+        let gauge = Address::repeat_byte(0x52);
+        let factory = Address::repeat_byte(0x53);
+        let p = TrackedPool { address: pool, kind: PoolKind::Slipstream, token0: Address::repeat_byte(0x0a), token1: Address::repeat_byte(0x0b), watch: vec![factory], reload_on: vec![gauge], ..Default::default() };
+        let mut reg = Registry::default();
+        let k: PoolKey = (pool, None);
+        reg.pools.insert(k, PoolEntry {
+            pool: p, state: PoolState::Ready, reason: String::new(), events: 0, strikes: 0, clean_events: 0, retry_at: Instant::now(),
+            owned: Vec::new(), items: HashSet::new(), accounts: HashSet::new(), verified: false, gen: 0, ready_since: 0, busy: false,
+            ever_ready: true, rounds: 0, fails: 0, walk: None, walk_busy: false, walk_retry_at: Instant::now(), walk_fails: 0,
+            walked: Vec::new(), far_zero: None, pending_from: None, base_block: 0, need_base: 0,
+        });
+        let f = settle_filters(&reg, &[k].into_iter().collect());
+        let addr_lists: Vec<Vec<String>> = f.iter().filter(|x| x.get("topics").is_none()).map(|x| x["address"].as_array().unwrap().iter().map(|a| a.as_str().unwrap().to_string()).collect()).collect();
+        assert_eq!(addr_lists.len(), 1);
+        for a in [pool, gauge, factory] {
+            assert!(addr_lists[0].contains(&format!("{a:#x}")), "missing {a:#x}");
+        }
+        // Transfer filters: topics padded with the pool only.
+        let pad = format!("0x{}{}", "0".repeat(24), &to_hex(pool.as_slice())[2..]);
+        for x in f.iter().filter(|x| x.get("topics").is_some()) {
+            let t = x["topics"].to_string();
+            assert!(t.contains(&pad));
+            assert!(!t.contains(&to_hex(gauge.as_slice())[2..]));
+        }
     }
 }
 
