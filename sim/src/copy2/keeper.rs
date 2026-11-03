@@ -196,8 +196,10 @@ pub struct KeeperCfg {
     /// FASTLANE_AHEAD_KEEP_THRIFT (Nov 3, Chainstack units) [off]: the
     /// master switch for the cheaper keeper below. Off = every setting
     /// keeps its old default (the keeper behaves exactly as before). On =
-    /// FASTLANE_AHEAD_KEEP_PROBE defaults to 1 and
-    /// FASTLANE_AHEAD_KEEP_FREE_TRACE to on (each can still be set alone).
+    /// FASTLANE_AHEAD_KEEP_PROBE defaults to 1, FASTLANE_AHEAD_KEEP_SEED_MERGE
+    /// to on and FASTLANE_AHEAD_KEEP_SEED_GATHER_MS to 1000 (each can still
+    /// be set alone). The units budget (FASTLANE_AHEAD_KEEP_UNITS_DAY) is
+    /// only on when set.
     pub thrift: bool,
     /// FASTLANE_AHEAD_KEEP_PROBE (thrift) [0 = no limit, the old way; 1 with
     /// THRIFT]: with FASTLANE_AHEAD_KEEP_LEAD the keeper asks for blocks the
@@ -215,7 +217,7 @@ pub struct KeeperCfg {
     /// FASTLANE_AHEAD_KEEP_RETRY_MS [50]: wait before asking again for a
     /// block the node did not have yet. 10..=2000.
     pub retry_ms: u64,
-    /// FASTLANE_AHEAD_KEEP_FREE_TRACE (thrift) [off; on with THRIFT]: ask
+    /// FASTLANE_AHEAD_KEEP_FREE_TRACE [off, also with THRIFT]: ask
     /// Robinhood's FREE public node (ARBSIM_PUBLIC_URL) for the block diffs
     /// first (no Chainstack units). The paid node is asked only when the
     /// free one fails (error, refusal, wrong answer shape: the free node
@@ -230,6 +232,35 @@ pub struct KeeperCfg {
     /// FASTLANE_AHEAD_KEEP_FREE_REST_MS [3000]: after a free-node failure,
     /// use the paid node only for this long.
     pub free_rest_ms: u64,
+    /// FASTLANE_AHEAD_KEEP_SEED_MERGE (thrift) [off; on with THRIFT]: one
+    /// seed call (eth_getProof, 1 unit) per CONTRACT, not per learned batch.
+    /// Live Nov 3: 46,689 seed calls brought 83,059 values (1.8 values a
+    /// call): every batch of missed values of a contract was its own call.
+    /// Now the waiting seed jobs of the same contract are merged into one
+    /// call (up to 100 values, the old per-call limit).
+    pub seed_merge: bool,
+    /// FASTLANE_AHEAD_KEEP_SEED_GATHER_MS (thrift) [0; 1000 with THRIFT]: a
+    /// contract's seed waits this long after its first queued value, so
+    /// the values the next runs miss join the same call. The values were
+    /// missing anyway (that run already marked its pools unsure); they just
+    /// arrive up to this much later. 0..=60000.
+    pub seed_gather_ms: u64,
+    /// FASTLANE_AHEAD_KEEP_UNITS_DAY (thrift) [0 = no budget, the old way]:
+    /// the most Chainstack units a day the keeper may use (debug trace = 2,
+    /// eth_getProof / eth_getCode = 1). Following every block costs ~1.7M
+    /// units a day on its own (~9.7 blocks/s x 2), so a lower budget means
+    /// the keeper runs in WINDOWS: it spends from a bucket that refills at
+    /// UNITS_DAY / 86,400 a second (holds FASTLANE_AHEAD_KEEP_BUDGET_WINDOW_S
+    /// seconds of refill); when the bucket is empty it drops everything it
+    /// holds (fail closed: the predicted copy simply has no keeper values,
+    /// its pools come out unsure, never wrong) and stops calling the node;
+    /// when the bucket is half full again it starts again from copy 2's
+    /// block (seeding what it learned). Right/wrong is unchanged (nothing is
+    /// ever guessed); fewer predictions are sure while it rests.
+    pub units_day: u64,
+    /// FASTLANE_AHEAD_KEEP_BUDGET_WINDOW_S [1800]: bucket size in seconds of
+    /// refill (with a budget of 40% of the need: ~10 min on, ~15 min off).
+    pub budget_window_s: u64,
 }
 
 /// FASTLANE_AHEAD_KEEP_PRUNE_BLOCKS default (memory fix 2, Nov 2): ~5 min
@@ -266,6 +297,10 @@ impl Default for KeeperCfg {
             free_trace: false,
             free_rps: 25,
             free_rest_ms: 3000,
+            seed_merge: false,
+            seed_gather_ms: 0,
+            units_day: 0,
+            budget_window_s: 1800,
         }
     }
 }
@@ -307,9 +342,15 @@ impl KeeperCfg {
             thrift,
             probe: num("FASTLANE_AHEAD_KEEP_PROBE", if thrift { 1 } else { 0 }, 0, 64),
             retry_ms: num("FASTLANE_AHEAD_KEEP_RETRY_MS", d.retry_ms, 10, 2000),
-            free_trace: super::ahead::on_off(get("FASTLANE_AHEAD_KEEP_FREE_TRACE").as_deref()).unwrap_or(thrift),
+            // Not part of THRIFT: live Nov 3 the free node answered 429 (too
+            // many requests) to 3 of 3 trace calls and was 8 blocks behind.
+            free_trace: super::ahead::on_off(get("FASTLANE_AHEAD_KEEP_FREE_TRACE").as_deref()).unwrap_or(false),
             free_rps: num("FASTLANE_AHEAD_KEEP_FREE_RPS", d.free_rps, 1, 200),
             free_rest_ms: num("FASTLANE_AHEAD_KEEP_FREE_REST_MS", d.free_rest_ms, 0, 600_000),
+            seed_merge: super::ahead::on_off(get("FASTLANE_AHEAD_KEEP_SEED_MERGE").as_deref()).unwrap_or(thrift),
+            seed_gather_ms: num("FASTLANE_AHEAD_KEEP_SEED_GATHER_MS", if thrift { 1000 } else { 0 }, 0, 60_000),
+            units_day: num("FASTLANE_AHEAD_KEEP_UNITS_DAY", 0, 0, 1_000_000_000),
+            budget_window_s: num("FASTLANE_AHEAD_KEEP_BUDGET_WINDOW_S", d.budget_window_s, 60, 86_400),
         }
     }
 }
@@ -562,6 +603,8 @@ pub struct KeeperStats {
     pub pruned_learned: u64,
     pub used_marks: u64,
     pub audits: u64,
+    /// (Thrift) seed jobs folded into another job's call (calls saved).
+    pub seeds_merged: u64,
     pub audit_values: u64,
     pub audit_mismatch: u64,
     pub resets: HashMap<&'static str, u64>,
@@ -586,7 +629,7 @@ impl KeeperStats {
             "learned": self.learned, "seedsSent": self.seeds_sent, "seedValues": self.seed_values, "seedsDropped": self.seeds_dropped,
             "evicted": self.evicted, "recreated": self.recreated, "adopted": self.adopted, "refusedFull": self.refused_full, "candsDropped": self.cands_dropped,
             "memLearnSkipped": self.mem_learn_skipped,
-            "prunes": self.prunes, "prunedValues": self.pruned_values, "prunedCodes": self.pruned_codes, "pruneLastValues": self.prune_last_values, "prunedLearned": self.pruned_learned, "usedMarks": self.used_marks, "audits": self.audits, "auditValues": self.audit_values, "auditMismatch": self.audit_mismatch,
+            "prunes": self.prunes, "prunedValues": self.pruned_values, "prunedCodes": self.pruned_codes, "pruneLastValues": self.prune_last_values, "prunedLearned": self.pruned_learned, "usedMarks": self.used_marks, "audits": self.audits, "seedsMerged": self.seeds_merged, "auditValues": self.audit_values, "auditMismatch": self.audit_mismatch,
             "resets": self.resets.iter().map(|(k, v)| (k.to_string(), json!(v))).collect::<serde_json::Map<String, Value>>(),
             "applyUs": crate::timing::pct_of(&mut t),
             "samples": self.samples,
@@ -626,6 +669,9 @@ pub struct KeeperCore {
     written_now: HashSet<u64>,
     written_prev: HashSet<u64>,
     prune_from: Option<u64>,
+    /// (Thrift, SEED_GATHER_MS) when each contract's oldest waiting seed job
+    /// was queued.
+    seed_first: HashMap<Address, Instant>,
 }
 
 
@@ -647,6 +693,7 @@ impl KeeperCore {
             written_now: HashSet::new(),
             written_prev: HashSet::new(),
             prune_from: None,
+            seed_first: HashMap::new(),
         }
     }
 
@@ -693,6 +740,7 @@ impl KeeperCore {
         self.versions.clear();
         self.recent.clear();
         self.seeds.clear();
+        self.seed_first.clear();
         self.pending.clear();
         let held: Vec<Address> = self.held.iter().copied().collect();
         for a in held {
@@ -751,6 +799,7 @@ impl KeeperCore {
             self.seeds.push_back(SeedJob { addr: a, slots: c, basics: first && need_basics });
             first = false;
         }
+        self.seed_first.entry(a).or_insert_with(Instant::now);
     }
 
     /// LEARN: values the predicted copy's runs lacked (or read only
@@ -861,6 +910,7 @@ impl KeeperCore {
         }
         self.pending.retain(|(x, _)| *x != a);
         self.seeds.retain(|j| j.addr != a);
+        self.seed_first.remove(&a);
     }
 
     /// Scores halve (once an hour): contracts that stopped coming up lose
@@ -880,6 +930,9 @@ impl KeeperCore {
             // Memory guard: the queue waits (nothing dropped).
             return None;
         }
+        if self.cfg.seed_merge || self.cfg.seed_gather_ms > 0 {
+            return self.take_merged(Instant::now());
+        }
         while let Some(j) = self.seeds.pop_front() {
             if self.held.contains(&j.addr) {
                 self.stats.seeds_sent += 1;
@@ -887,6 +940,39 @@ impl KeeperCore {
             }
         }
         None
+    }
+
+    /// THRIFT (SEED_MERGE / SEED_GATHER_MS): the first contract whose oldest
+    /// waiting job has waited SEED_GATHER_MS, with ALL its waiting jobs
+    /// folded into one call (up to `seed_batch` values; the rest stay queued).
+    /// Same values asked for as before, in fewer calls.
+    pub fn take_merged(&mut self, now: Instant) -> Option<SeedJob> {
+        // Jobs of contracts no longer kept are dropped (as before).
+        let held = &self.held;
+        self.seeds.retain(|j| held.contains(&j.addr));
+        let gather = Duration::from_millis(self.cfg.seed_gather_ms);
+        let first = &self.seed_first;
+        let idx = self.seeds.iter().position(|j| first.get(&j.addr).is_none_or(|t| now.saturating_duration_since(*t) >= gather))?;
+        let mut job = self.seeds.remove(idx)?;
+        let cap = self.cfg.seed_batch.max(1);
+        let mut i = idx;
+        while i < self.seeds.len() {
+            let fits = self.seeds[i].addr == job.addr && job.slots.len() + self.seeds[i].slots.len() <= cap;
+            if fits {
+                if let Some(j) = self.seeds.remove(i) {
+                    job.slots.extend(j.slots);
+                    job.basics |= j.basics;
+                    self.stats.seeds_merged += 1;
+                }
+            } else {
+                i += 1;
+            }
+        }
+        if !self.seeds.iter().any(|j| j.addr == job.addr) {
+            self.seed_first.remove(&job.addr);
+        }
+        self.stats.seeds_sent += 1;
+        Some(job)
     }
 
     /// A seed came back (or failed: `ans` None): the values become held,
@@ -2031,6 +2117,28 @@ fn drive_pipelined(io: Arc<dyn KeeperIo>, cfg: KeeperCfg, rx: std::sync::mpsc::R
     // answered with its changes (it surely has every block up to here).
     let mut node_has: u64 = 0;
     let retry_after = Duration::from_millis(cfg.retry_ms);
+    // THRIFT units budget (FASTLANE_AHEAD_KEEP_UNITS_DAY, 0 = none): a bucket
+    // of Chainstack units refilled at units_day / 86,400 a second, holding
+    // budget_window_s seconds of refill. Starts full.
+    let budget_on = cfg.units_day > 0;
+    let budget_rate = cfg.units_day as f64 / 86_400.0;
+    let budget_cap = budget_rate * cfg.budget_window_s as f64;
+    let mut tokens = budget_cap;
+    let mut tok_at = Instant::now();
+    let mut resting = false;
+    let mut rests = 0u64;
+    let mut rest_since: Option<Instant> = None;
+    let mut rested_s = 0f64;
+    let started = Instant::now();
+    let mut spent = 0u64;
+    // Units one call costs (Chainstack: debug_* 2, others 1).
+    macro_rules! spend {
+        ($n:expr) => {{
+            let n: u64 = $n;
+            spent += n;
+            tokens -= n as f64;
+        }};
+    }
     // Restart: everything held dropped (KeeperCore::reset) and every answer
     // still out belongs to the old run.
     macro_rules! restart {
@@ -2059,8 +2167,50 @@ fn drive_pipelined(io: Arc<dyn KeeperIo>, cfg: KeeperCfg, rx: std::sync::mpsc::R
         if status_at.elapsed() >= Duration::from_secs(1) {
             status_at = Instant::now();
             let extra = json!({"mode": "pipelined", "fetchPar": cfg.fetch_par, "seedPar": cfg.seed_par, "lead": cfg.lead_feed, "inFlight": inflight.len(), "ready": ready.len(), "seedsOut": seeds_out, "aheadOfCopy2Max": ahead_max,
-                "thrift": cfg.thrift, "probe": cfg.probe, "retryMs": cfg.retry_ms, "freeTrace": cfg.free_trace, "nodeHas": node_has});
+                "thrift": cfg.thrift, "probe": cfg.probe, "retryMs": cfg.retry_ms, "freeTrace": cfg.free_trace, "nodeHas": node_has,
+                "seedMerge": cfg.seed_merge, "seedGatherMs": cfg.seed_gather_ms,
+                // Units this runtime spent (estimate: 2 per trace, 1 per proof / code) and the budget.
+                "spent": spent, "spentPerDay": (spent as f64 / started.elapsed().as_secs_f64().max(1.0) * 86_400.0).round() as u64,
+                "budget": if budget_on { json!({"unitsDay": cfg.units_day, "tokens": tokens.round() as i64, "cap": budget_cap.round() as u64, "resting": resting, "rests": rests,
+                    "restedPct": ((rested_s + rest_since.map_or(0.0, |t| t.elapsed().as_secs_f64())) / started.elapsed().as_secs_f64().max(1.0) * 1000.0).round() / 10.0}) } else { Value::Null }});
             *sink.status.lock().unwrap_or_else(|e| e.into_inner()) = m.status(&k, io.as_ref(), rate_wait, extra);
+        }
+        // THRIFT units budget: rest when the bucket is empty, start again
+        // (from copy 2's block, everything seeded again) when half full.
+        if budget_on {
+            let now = Instant::now();
+            tokens = (tokens + budget_rate * now.saturating_duration_since(tok_at).as_secs_f64()).min(budget_cap);
+            tok_at = now;
+            if !resting && tokens <= 0.0 {
+                resting = true;
+                rests += 1;
+                rest_since = Some(now);
+                if let Some(c2) = io.copy2_head() {
+                    restart!(c2, "budget_rest");
+                }
+                eprintln!("[arbsim] fastlane keeper: units budget used up ({} a day): resting (nothing held, no node calls) until the bucket is half full", cfg.units_day);
+            } else if resting && tokens >= budget_cap * 0.5 {
+                resting = false;
+                if let Some(t) = rest_since.take() {
+                    rested_s += now.saturating_duration_since(t).as_secs_f64();
+                }
+                if let Some(c2) = io.copy2_head() {
+                    restart!(c2, "budget_resume");
+                    last_seen = Some(c2);
+                }
+                eprintln!("[arbsim] fastlane keeper: units budget refilled: running again");
+            }
+            if resting {
+                // Answers still coming back belong to the dropped run; only
+                // the seed lane's count matters.
+                while let Ok(d) = done_rx.try_recv() {
+                    if matches!(d, Done::Seed(..) | Done::Audit(..)) {
+                        seeds_out = seeds_out.saturating_sub(1);
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(50));
+                continue;
+            }
         }
         let Some(c2) = io.copy2_head() else {
             std::thread::sleep(Duration::from_millis(20));
@@ -2100,6 +2250,7 @@ fn drive_pipelined(io: Arc<dyn KeeperIo>, cfg: KeeperCfg, rx: std::sync::mpsc::R
                         return;
                     }
                     m.calls += 1;
+                    spend!(2);
                     inflight.insert(b);
                 }
                 b += 1;
@@ -2110,6 +2261,7 @@ fn drive_pipelined(io: Arc<dyn KeeperIo>, cfg: KeeperCfg, rx: std::sync::mpsc::R
             while !paused && seeds_out < cfg.seed_par {
                 let Some(job) = k.take_job() else { break };
                 m.calls += 1;
+                spend!(if job.basics { 2 } else { 1 });
                 seeds_out += 1;
                 if sl.send(Job::Seed(gen, job, head)).is_err() {
                     return;
@@ -2119,6 +2271,7 @@ fn drive_pipelined(io: Arc<dyn KeeperIo>, cfg: KeeperCfg, rx: std::sync::mpsc::R
                 audit_at = Instant::now();
                 if let Some((a, slots)) = k.audit_pick(50) {
                     m.calls += 1;
+                    spend!(1);
                     seeds_out += 1;
                     if sl.send(Job::Audit(gen, a, slots, head)).is_err() {
                         return;
@@ -2130,6 +2283,7 @@ fn drive_pipelined(io: Arc<dyn KeeperIo>, cfg: KeeperCfg, rx: std::sync::mpsc::R
             // time, only while caught up, on this thread).
             if let Some(job) = k.take_job() {
                 m.calls += 1;
+                spend!(if job.basics { 2 } else { 1 });
                 let ans = io.proof(job.addr, &job.slots, head, job.basics).ok().map(|(info, code, slots)| SeedAnswer { addr: job.addr, at: head, basics: job.basics.then_some(info), code: code.filter(|_| job.basics), slots });
                 k.on_seed(&job, ans);
                 sink.publish(&k, cfg.versions);
@@ -2344,6 +2498,87 @@ mod tests {
         assert!(k.held_list().contains(&a(3)), "{:?}", k.held_list());
         assert_eq!(k.held_list().len(), 2);
         assert!(k.stats.evicted >= 1);
+    }
+
+    /// THRIFT (SEED_MERGE): the same values are asked for, in one call per
+    /// contract instead of one per learned batch; with the merge off the
+    /// old one-call-per-batch stays.
+    #[test]
+    fn seed_jobs_of_one_contract_are_merged_into_one_call() {
+        let learn_3 = |k: &mut KeeperCore| {
+            k.start_at(1);
+            // a(1) becomes kept with the first batch; later batches add values.
+            k.learn(&[MissItem::Slot(a(1), u(1))]);
+            k.learn(&[MissItem::Slot(a(1), u(2)), MissItem::Account(a(1))]);
+            k.learn(&[MissItem::Slot(a(1), u(3))]);
+        };
+        let mut old = core(5);
+        learn_3(&mut old);
+        let mut n_old = 0;
+        let mut vals_old: Vec<U256> = Vec::new();
+        while let Some(j) = old.take_job() {
+            n_old += 1;
+            vals_old.extend(j.slots);
+        }
+        let mut k = KeeperCore::new(KeeperCfg { on: true, max_contracts: 5, seed_merge: true, ..KeeperCfg::default() });
+        learn_3(&mut k);
+        let j = k.take_job().expect("one merged job");
+        assert!(k.take_job().is_none(), "nothing left: one call");
+        let mut got = j.slots.clone();
+        got.sort();
+        vals_old.sort();
+        assert_eq!(got, vals_old, "same values as the old calls");
+        assert!(j.basics, "basics asked once");
+        assert!(n_old >= 3, "old: one call per batch ({n_old})");
+        assert_eq!(k.stats.seeds_sent, 1);
+        assert_eq!(k.stats.seeds_merged as usize, n_old - 1);
+        // The answer makes every merged value held.
+        let ans = SeedAnswer { addr: a(1), at: 1, basics: Some(Some(AccountInfo { balance: u(5), nonce: 1, code_hash: KECCAK_EMPTY, ..Default::default() })), code: None, slots: j.slots.iter().map(|s| (*s, u(7))).collect() };
+        k.on_seed(&j, Some(ans));
+        for s in [1, 2, 3] {
+            assert!(k.latest().unwrap().holds_slot(&a(1), &u(s)), "value {s} held");
+        }
+    }
+
+    /// THRIFT (SEED_GATHER_MS): a contract's seed waits for the gather time.
+    #[test]
+    fn a_seed_waits_for_the_gather_time() {
+        let mut k = KeeperCore::new(KeeperCfg { on: true, max_contracts: 5, seed_merge: true, seed_gather_ms: 60_000, ..KeeperCfg::default() });
+        k.start_at(1);
+        k.learn(&[MissItem::Slot(a(1), u(1))]);
+        assert!(k.take_job().is_none(), "too early");
+        let later = Instant::now() + Duration::from_secs(61);
+        let j = k.take_merged(later).expect("ready after the gather time");
+        assert_eq!(j.slots, vec![u(1)]);
+    }
+
+    /// THRIFT (UNITS_DAY): with a budget below the need the keeper rests in
+    /// windows (and spends about the budget); without one it never rests.
+    #[test]
+    fn the_units_budget_makes_the_keeper_rest() {
+        let pace = Duration::from_millis(20); // 50 blocks/s = 100 units/s
+        let lat = Duration::from_millis(2);
+        let run = |cfg: KeeperCfg| {
+            let io = Arc::new(FakeIo { start: Instant::now(), pace, lat, calls: Default::default(), feed_lead: 0, c2_lag: 0, not_yet: Default::default() });
+            let sink = Sink::new(Arc::new(|| {}));
+            let (_tx, rx) = std::sync::mpsc::sync_channel::<Vec<MissItem>>(16);
+            let (s2, io2) = (sink.clone(), io.clone());
+            let t = std::thread::spawn(move || drive(io2, cfg, rx, s2));
+            std::thread::sleep(Duration::from_millis(4200));
+            let st = sink.status.lock().unwrap().clone();
+            sink.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            t.join().unwrap();
+            (st, io.calls.load(std::sync::atomic::Ordering::Relaxed))
+        };
+        let base = KeeperCfg { on: true, fetch_par: 4, seed_par: 1, lead_feed: false, ..KeeperCfg::default() };
+        // 40 units/s budget (3,456,000 a day), bucket of 1 s = 40 units.
+        let (st, calls) = run(KeeperCfg { units_day: 3_456_000, budget_window_s: 1, ..base.clone() });
+        let b = &st["pipeline"]["budget"];
+        assert!(b["rests"].as_u64().unwrap_or(0) >= 1, "rested: {st}");
+        assert!(b["restedPct"].as_f64().unwrap_or(0.0) > 20.0, "rested a good share: {st}");
+        let (st0, calls0) = run(base);
+        assert!(st0["pipeline"]["budget"].is_null(), "no budget: none");
+        assert!(calls * 10 < calls0 * 8, "fewer calls with the budget ({calls0} -> {calls})");
     }
 
     /// Per-contract value cap.
@@ -2704,10 +2939,13 @@ mod tests {
         // THRIFT (Nov 3): off by default = the old keeper exactly.
         assert_eq!((o.thrift, o.probe, o.retry_ms, o.free_trace), (false, 0, 50, false), "thrift off: old");
         let t = cfg("observe", Some(("FASTLANE_AHEAD_KEEP_THRIFT", "on")));
-        assert_eq!((t.thrift, t.probe, t.free_trace), (true, 1, true), "thrift on: probe 1, free node");
+        assert_eq!((t.thrift, t.probe, t.free_trace), (true, 1, false), "thrift on: probe 1 (free node only when set)");
         assert_eq!(cfg("observe", Some(("FASTLANE_AHEAD_KEEP_PROBE", "2"))).probe, 2, "probe alone");
         assert!(cfg("observe", Some(("FASTLANE_AHEAD_KEEP_FREE_TRACE", "on"))).free_trace, "free node alone");
         assert_eq!(cfg("observe", Some(("FASTLANE_AHEAD_KEEP_RETRY_MS", "5"))).retry_ms, 50, "out of range: default");
+        assert_eq!((o.seed_merge, o.seed_gather_ms, o.units_day), (false, 0, 0), "thrift off: seeds and budget as before");
+        assert_eq!((t.seed_merge, t.seed_gather_ms, t.units_day), (true, 1000, 0), "thrift on: merged seeds, no budget unless set");
+        assert_eq!(cfg("observe", Some(("FASTLANE_AHEAD_KEEP_UNITS_DAY", "800000"))).units_day, 800_000);
     }
 
     #[test]
