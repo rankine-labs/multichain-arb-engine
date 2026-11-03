@@ -58,6 +58,8 @@ export interface LoopWorkerHostOptions {
   autoFlush?: boolean;            // tests: false = send only on flushNow (default true)
   // LIVE LOOPS: a loop the worker handed over (execution/loopLive.ts decides).
   onLiveCandidate?: (c: import('../execution/loopLive').LoopLiveCandidate) => void;
+  // POOL_SUB_FILTER (core/poolSubFilter.ts): pools of loops the worker found.
+  onUsedPools?: (pools: string[]) => void;
 }
 
 export function loopWorkerHeapMbFromEnv(env: Record<string, string | undefined> = process.env): number {
@@ -241,6 +243,7 @@ export class LoopWorkerHost {
         }
         case 'stats': this.stats = m.s; break;
         case 'liveCandidate': this.o.onLiveCandidate?.(m.c); break;
+        case 'usedPools': try { this.o.onUsedPools?.(m.pools); } catch { /* reporting only */ } break;
         case 'error': this.o.warn(`[loop] worker problem (ignored): ${m.message}`); break;
       }
     } catch (err) {

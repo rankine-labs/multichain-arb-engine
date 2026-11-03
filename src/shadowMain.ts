@@ -228,6 +228,8 @@ import { endpointLabel } from './core/endpointLabel';
 // Any-provider node settings (off unless set in .env, see docs/NODE_PROVIDERS.md).
 import { checkNodesFromEnv, buildCheckRpc } from './core/checkNodes';
 import { WsBlockReader } from './core/blockReaderWs';
+import { PoolSubFilter, poolSubSettingsFromEnv, type PoolSubDeps } from './core/poolSubFilter';
+import { copy2Key, type Copy2Pool } from './execution/copy2';
 import { nodeUsage as nodeUsageCounter } from './core/nodeUsage';
 import { ROBINHOOD_SEED_PAIRS } from './config/robinhoodSeedPairs';
 import { ResearchLane, researchConfigFromEnv, planShallowCandidate, findResearchGaps, gapCandidate, ResearchCandidate } from './core/researchLane';
@@ -582,6 +584,22 @@ let trigEntry: TrigEntry | null = null;
 // COPY 2: the pool keys (addresses / V4 ids) the block readers follow. The
 // block reader setup replaces this with its own list; until then: watched pairs.
 let copy2PoolKeys: () => string[] = () => robinhoodWatcher.watchedPairPools().flat();
+// POOL SUBSCRIPTION FILTER (core/poolSubFilter.ts, POOL_SUB_FILTER; Nov 2):
+// leaves dead / tiny pools out of the push feed's subscription to save
+// Chainstack units. Created here so every trade idea / check / chance /
+// loop find from the very start is remembered (notePoolsUsed). The block
+// reader setup below fills in the watch list, copy 2's list, the money
+// lookup and the sweep node. POOL_SUB_FILTER=0 (default) = old subscriptions,
+// counting and the 10-minute "[subfilter]" line only.
+const poolSubDeps: PoolSubDeps = {
+      watchKeys: () => copy2PoolKeys().map((k) => k.toLowerCase()),
+      copy2Keys: () => new Set<string>(),
+      depthUsd: () => null,
+      poolManager: ROBINHOOD_V4.POOL_MANAGER,
+};
+const poolSub = new PoolSubFilter(poolSubSettingsFromEnv(), poolSubDeps);
+const notePoolsUsed = (keys: Iterable<string | null | undefined>): void => poolSub.noteUsed(keys);
+process.once('exit', () => poolSub.save(true));
 // Per-node usage today (speed limits + daily allowances, core/nodeBudget.ts):
 // restored so a restart doesn't reset the counts, saved every minute.
 loadNodeUsage('data/node-usage.json');
@@ -983,6 +1001,8 @@ const checkRoundTrip = async (
       // only the node's answer is added to it here.
       fast?: FastAsk,
 ): Promise<RoundTripCheck> => {
+      // POOL_SUB_FILTER: a pool checked as part of a trade is in use (kept in the push feed).
+      if (chain === 'robinhood') notePoolsUsed([buyPool?.poolAddress, sellPool?.poolAddress]);
       const off = simOff(chain);
       if (off) { fast?.existing?.noNode(); return { status: 'skipped', reason: `simulation off: ${off}` }; }
       if (Date.now() < (simPausedUntil[chain] ?? 0)) { fast?.existing?.noNode(); return { status: 'rate_limited' }; }
@@ -2252,6 +2272,8 @@ if (loopCfg.enabled && !loopWorkerOn) {
       if (loopTaxBook) setInterval(() => loopTaxBook.save(), 60_000).unref?.();
       const loopTrader = new LoopTrader(loopCfg, {
             ...(loopTaxBook ? { coinTax: loopTaxBook } : {}),
+            // POOL_SUB_FILTER: pools of loops found stay in the push feed.
+            noteUsed: (keys) => notePoolsUsed(keys),
             ...(loopLive ? { liveOffer: offerLoopLive } : {}),
             bases: [ROBINHOOD_TOKENS.WETH, ROBINHOOD_TOKENS.USDG],
             env: {
@@ -2458,6 +2480,8 @@ if (loopWorkerOn) {
                   live: !!loopLive,
             },
             onLiveCandidate: (c) => { offerLoopLive(c); },
+            // POOL_SUB_FILTER: pools of loops the worker found stay in the push feed.
+            onUsedPools: (pools) => notePoolsUsed(pools),
             feeder,
             // Same rule as LoopNodeThrottle.sharedHasRoom (core/loopNode.ts):
             // nobody waiting, under half the speed limit used in the last
@@ -3449,6 +3473,8 @@ try {
                         tf, client: host.client, shadowLog: host.shadowLog, settings: es,
                         candidatesFor: (keys, limit) => entryCandidatesFor(keys, limit),
                         tableRoutes: entryTableRoutes,
+                        // POOL_SUB_FILTER: trigger pools + candidate routes stay in the push feed.
+                        noteUsed: (keys) => notePoolsUsed(keys),
                         // 3-POOL LOOPS (TRIG_ENTRY_LOOPS=1): candidates from the loop index,
                         // the loop safeguards (loop loss cap, size limit, in flight; live:
                         // the scoreboard's loop bucket too), and the hourly loop text.
@@ -3938,6 +3964,8 @@ if (swap.chain === 'robinhood' && sizing.grossProfitUsd >= 5) {
 }
 const buyPoolUsed = plan.buyPool;
 const sellPoolUsed = plan.sellPool;
+// POOL_SUB_FILTER: pools of every trade idea stay in the push feed.
+if (swap.chain === 'robinhood') notePoolsUsed([buyPoolUsed.poolAddress, sellPoolUsed.poolAddress]);
 
 const score = scoreOpportunity({
 conservativeNetProfitUsd: profit.conservativeNetProfitUsd,
@@ -4346,6 +4374,8 @@ await chainManager.startAll();
                   // from this scan's results already in memory (no node requests).
                   stableTally.noteGaps(gaps.map((g) => ({ key: `${g.buyPool.poolAddress}>${g.sellPool.poolAddress}`, tokens: [g.base, g.quote] as [string, string], modelUsd: g.profitUsd })));
                   let fired = 0;
+                  // POOL_SUB_FILTER: every standing gap found is a trade idea (pools kept in the push feed).
+                  for (const g of gaps) notePoolsUsed([g.buyPool.poolAddress, g.sellPool.poolAddress]);
                   for (const g of gaps) {
                         if (fired >= GAP_MAX_PER_SCAN) break;
                         // Fast scan runs in bites: a pool may have got a new price
@@ -4612,6 +4642,30 @@ await chainManager.startAll();
             if (copy2Link) nodeUsageCounter.track(copy2RpcLabel);
             copy2Link?.setBackfillRpc(async (method, params) => { nodeUsageCounter.countRequest(copy2RpcLabel); return readerRpc(method, params); });
             if (copy2Link && !process.env.BLOCK_READER_WSS) console.log('[copy2] needs the WebSocket block reader (BLOCK_READER_WSS): without it the node decides every check');
+            // POOL_SUB_FILTER: the real lists (see poolSub above). Copy 2's
+            // followed pools (watch list + held + auto-followed) are never
+            // dropped; the Set is rebuilt only when copy 2's list changes.
+            let c2Src: readonly Copy2Pool[] | null = null;
+            let c2Set: ReadonlySet<string> = new Set();
+            const usdRhSub = (t: string) => priceOracle.getUsdPrice('robinhood', t);
+            const subRpcLabel = `${endpointLabel(READER_URL)} (push filter sweep)`;
+            Object.assign(poolSubDeps, {
+                  watchKeys: () => { const t = targets(); return [...t.addrs, ...t.ids]; },
+                  copy2Keys: () => {
+                        if (!copy2Link) return c2Set;
+                        const list = copy2Link.followList();
+                        if (list !== c2Src) { c2Src = list; c2Set = new Set(list.map((p) => copy2Key(p))); }
+                        return c2Set;
+                  },
+                  depthUsd: (k: string) => { const p = cache.get('robinhood', k); return p ? poolDepthUsd(p, decimalsOf, usdRhSub) : null; },
+                  extraUsed: () => rivalWatch.loopRoutePools(Date.now() - 24 * 3600_000),
+                  rpc: readerRpc,
+                  countRequest: () => nodeUsageCounter.countRequest(subRpcLabel),
+            } satisfies Partial<PoolSubDeps>);
+            nodeUsageCounter.track(subRpcLabel);
+            console.log(`[subfilter] ${poolSub.s.on ? 'ON' : 'OFF (dry run: counting only, old subscriptions)'}: keep copy 2 pools, pools used in ${poolSub.s.useDays} d, money $${poolSub.s.minUsd}+, new pools for ${poolSub.s.newGraceH} h; re-check every ${poolSub.s.recheckH} h; busy sweep every ${poolSub.s.sweepMin} min (${poolSub.s.busyEvents}+ events = back)`);
+            setInterval(labelled('push filter', () => poolSub.tick()), 10 * 60_000);
+            if (poolSub.s.sweepMin > 0) setInterval(() => { void poolSub.sweep(); }, poolSub.s.sweepMin * 60_000);
             if (process.env.BLOCK_READER_WSS) {
                   wsReader = new WsBlockReader({
                         url: process.env.BLOCK_READER_WSS,
@@ -4633,6 +4687,9 @@ await chainManager.startAll();
                         onHealthChange: (healthy, last) => { if (!healthy && last > 0) blockReader.setBookmark(last - 1); },
                         // Copy 2 only (LOCAL_SIM shadow/on): unset = exactly as before.
                         ...(copy2Link ? { rawLogTap: copy2Link.tap } : {}),
+                        // POOL_SUB_FILTER: dropped pools left out (off = unchanged) + event counting.
+                        subFilter: poolSub,
+                        onPushed: (kind, logs) => poolSub.countPushed(kind, logs, ROBINHOOD_V4.POOL_MANAGER.toLowerCase()),
                   });
                   wsReaderRef = wsReader; // read by the 4-hour report (connections)
                   wsFacts = wsReader; // SPEED_TRUST_WS reads its health facts (core/trustFresh.ts)

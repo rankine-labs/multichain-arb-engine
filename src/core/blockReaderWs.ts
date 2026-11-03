@@ -98,6 +98,15 @@ export interface WsBlockReaderOptions {
   // COPY 2 TAP (execution/copy2.ts, fast check "copy 2"). Only set when
   // LOCAL_SIM is shadow/on; unset = this reader behaves exactly as before.
   rawLogTap?: RawLogTap;
+  // POOL SUBSCRIPTION FILTER (core/poolSubFilter.ts, POOL_SUB_FILTER). Takes
+  // pools out of the WATCH-LIST part of the subscription only (copy 2's held
+  // pools and outside contracts are added after it, untouched). Unset = every
+  // watched pool, exactly as before. apply() itself never removes a pool
+  // copy 2 follows.
+  subFilter?: { apply(pools: readonly string[], ids: Iterable<string>): { pools: string[]; ids: string[] } };
+  // Every pushed event, by subscription kind (counting only; never changes
+  // what the reader does). Unset = not counted.
+  onPushed?: (kind: 'pools' | 'v4' | 'tf' | 'heads', logs: RpcLog[] | null) => void;
 }
 
 // ---------------------------------------------------------------------------
@@ -633,19 +642,23 @@ export class WsBlockReader {
           const n = toNum(r?.number);
           if (n !== null && n > this.head) this.head = n;
           this.markData();
+          this.pushed('heads', null);
           if (this.tapHeadsOn && r) { this.tapHeads++; try { this.o.rawLogTap?.onHead?.(r); } catch { /* the tap must never break the reader */ } }
           return;
         }
         // Copy-2 transfer subscriptions: only for the tap, never the price path.
         if (sub && this.tapSubs.has(sub) && r) {
           this.markData();
-          this.toTap(Array.isArray(r) ? r : [r]);
+          const tl: RpcLog[] = Array.isArray(r) ? r : [r];
+          this.pushed('tf', tl);
+          this.toTap(tl);
           return;
         }
         if (sub && (sub === this.logsSub || this.v4Subs.has(sub)) && r) {
           this.markData();
           if (sub === this.logsSub) this.dataAt.pools = this.now(); else this.dataAt.v4 = this.now();
           const logs: RpcLog[] = Array.isArray(r) ? r : [r];
+          this.pushed(sub === this.logsSub ? 'pools' : 'v4', logs);
           if (this.tapOn) this.toTap(logs);
           for (const l of logs) {
             this.counts.logs++;
@@ -669,10 +682,18 @@ export class WsBlockReader {
   // What the filtered subscriptions ask for: our pool contracts and our V4
   // pool ids, sorted (so the same lists always give the same signature).
   private subscribeLists(): { pools: string[]; ids: string[] } {
-    const pools = new Set<string>();
+    let pools = new Set<string>();
     for (const a of this.o.addresses() ?? []) if (a && a.length === 42) pools.add(a.toLowerCase());
-    const ids = new Set<string>();
+    let ids = new Set<string>();
     for (const id of this.o.v4Ids() ?? []) if (id && id.length === 66) ids.add(id.toLowerCase());
+    // POOL_SUB_FILTER: leave out the dropped watch-list pools (filter off or
+    // unset: unchanged). Any problem in the filter = the full list.
+    if (this.o.subFilter && this.o.addressFilter !== false) {
+      try {
+        const f = this.o.subFilter.apply([...pools], ids);
+        pools = new Set(f.pools); ids = new Set(f.ids);
+      } catch { /* filter problem: full watch list */ }
+    }
     // Copy 2's held pools (see RawLogTap.extraTargets), only while the tap
     // is wanted and only next to a non-empty watch list (never on their own).
     if (pools.size > 0 && this.tapWanted()) {
@@ -729,6 +750,11 @@ export class WsBlockReader {
       // Never an empty list: an empty address / topic list could mean "everything".
       return coins.length && pools.length ? { coins, pools } : null;
     } catch { return null; }
+  }
+  // Counting hook (POOL_SUB_FILTER line). Never breaks the reader.
+  private pushed(kind: 'pools' | 'v4' | 'tf' | 'heads', logs: RpcLog[] | null): void {
+    if (!this.o.onPushed) return;
+    try { this.o.onPushed(kind, logs); } catch { /* counting only */ }
   }
   private toTap(logs: RpcLog[]): void {
     this.tapLogs += logs.length;

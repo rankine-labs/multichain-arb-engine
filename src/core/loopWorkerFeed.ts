@@ -129,6 +129,8 @@ export type FromWorker =
   | { t: 'hour'; id: number; h: LoopHour; node: string }
   | { t: 'stats'; s: WorkerStats }
   | { t: 'liveCandidate'; c: LoopLiveCandidate }
+  // POOL_SUB_FILTER: pools of loops found since the last one (at most one every 30 s).
+  | { t: 'usedPools'; pools: string[] }
   | { t: 'error'; message: string };
 
 // ---- Switch ----------------------------------------------------------------

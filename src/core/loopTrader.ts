@@ -136,6 +136,9 @@ export interface LoopTraderDeps {
   // LOOP_MODEL_VS_CHECK: a check reported the gas our loop really used
   // (replays do): teach the gas model (shadowMain: gasModel.notePractice).
   noteGas?: (pools: number, gasUsed: bigint) => void;
+  // POOL_SUB_FILTER (core/poolSubFilter.ts): the pools of every loop found,
+  // so the push feed keeps them subscribed. Missing = not reported.
+  noteUsed?: (poolKeys: string[]) => void;
   // COIN TAX TEST (Oct 20, core/coinTax.ts): coins that take a cut when moved
   // are left out of loops; untested coins are tested once before a loop that
   // uses them is checked. Missing = off (old behaviour).
@@ -450,6 +453,7 @@ export class LoopTrader {
   private count(r: LoopResult, now: number, triggerHash?: string) {
     const h = this.hour;
     h.found++;
+    try { this.deps.noteUsed?.(r.cycle.hops.map((x) => x.poolKey)); } catch { /* reporting only */ }
     const len = r.cycle.hops.length;
     h.foundByLen[len] = (h.foundByLen[len] ?? 0) + 1;
     h.bestUsd = Math.max(h.bestUsd, r.netUsd);
