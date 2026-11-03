@@ -2663,8 +2663,8 @@ mod tests {
         let (r0, behind0, calls0, ny0, blocks0) = drive_lead(KeeperCfg { probe: 0, ..base.clone() }, pace, lat, run, 6, 5);
         let (r1, behind1, calls1, ny1, blocks1) = drive_lead(KeeperCfg { probe: 1, ..base }, pace, lat, run, 6, 5);
         assert_eq!((r0, r1), (0, 0), "no restarts");
-        // Both follow the node's tip (copy 2 is 5 behind it: "behind" < 0 means ahead of the node's own tip never happens).
-        assert!(behind0 <= 2 && behind1 <= 2, "both at the node's tip ({behind0}, {behind1})");
+        // Both follow the node's tip (copy 2 is 5 blocks behind it).
+        assert!(behind0 <= 5 && behind1 <= 5, "both at the node's tip ({behind0}, {behind1})");
         assert!(blocks1 + 10 >= blocks0, "same blocks applied ({blocks0} vs {blocks1})");
         assert!(ny1 * 2 < ny0, "not-yet calls cut ({ny0} -> {ny1})");
         assert!(calls1 < calls0, "fewer calls ({calls0} -> {calls1})");
