@@ -147,3 +147,40 @@ const hash = () => '0x' + (++n).toString(16).padStart(64, '0');
   assert(blocks.reason('0xAA', '0xBB') === null, 'free again after 30 min');
 }
 
+
+// ---- (Nov 3) the brake can always fire ---------------------------------------------
+// SCORE_BUCKET_MIN_SENDS above the window (50) was never reachable; and 12
+// losing sends with no win now pause a bucket even when the minimum is higher.
+{
+  const loseN = (sb: Scoreboard, path: 'gap' | 'trig_first', k: number) => {
+    for (let i = 0; i < k; i++) { const h = hash(); sb.noteSend({ hash: h, path, expectedUsd: 0.3 }); sb.noteResult({ hash: h, status: 'reverted', gasUsd: 0.02, expectedProfitUsd: 0.3 }); }
+  };
+  assert(scoreSettings({}).bucketZeroWinSends === 12 && scoreSettings({ SCORE_BUCKET_ZERO_WIN_SENDS: '0' }).bucketZeroWinSends === 0, 'SCORE_BUCKET_ZERO_WIN_SENDS default 12, 0 = off');
+  {
+    const { sb } = board({ SCORE_BUCKET_MIN_SENDS: '40' });
+    loseN(sb, 'gap', 11);
+    assert(sb.pausedWhy('gap') === null, 'minimum 40: 11 losing sends, no win: not paused yet');
+    loseN(sb, 'gap', 1);
+    assert(/bucket gap \/ - \/ exact paused/.test(sb.pausedWhy('gap') ?? ''), 'minimum 40: the 12th losing send with no win pauses the gap bucket');
+    assert(sb.pausedWhy('trig_first') === null, 'other buckets untouched');
+  }
+  {
+    const { sb } = board({ SCORE_BUCKET_MIN_SENDS: '60', SCORE_BUCKET_ZERO_WIN_SENDS: '0' });
+    loseN(sb, 'gap', 49);
+    assert(sb.pausedWhy('gap') === null, 'minimum 60 (above the 50 window), zero-win rule off: 49 sends not yet');
+    loseN(sb, 'gap', 1);
+    assert(sb.pausedWhy('gap') !== null, 'minimum above the window is capped at the window: fires at 50');
+  }
+  {
+    const { sb } = board({ SCORE_BUCKET_MIN_SENDS: '40' });
+    const w = hash(); sb.noteSend({ hash: w, path: 'gap', expectedUsd: 0.3 }); sb.noteResult({ hash: w, status: 'profit', gasUsd: 0.02, profitUsd: 0.05, expectedProfitUsd: 0.3 });
+    loseN(sb, 'gap', 11);
+    assert(sb.pausedWhy('gap') === null, 'a win among the last 12: the zero-win rule does not fire');
+  }
+  {
+    // Rust fire-first sends scored as trig_first pause the bucket Rust's fire-first gate reads.
+    const { sb } = board({ SCORE_BUCKET_MIN_SENDS: '40' });
+    loseN(sb, 'trig_first', 12);
+    assert(sb.pausedWhy('trig_first') !== null && sb.pausedWhy('gap') === null, "12 losing Rust fire-first sends pause pausedWhy('trig_first') (state file paused.trig), not gap");
+  }
+}

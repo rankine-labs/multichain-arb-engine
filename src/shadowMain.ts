@@ -97,7 +97,7 @@ import { ROBINHOOD_SCAN_FACTORIES } from './config/knownAddresses';
 // Uniswap V4 in the chain-wide scan, asked PER PAIR (core/v4Lookup.ts), not
 // from V4's history (that ran out of memory twice on Oct 9). RH_V4_SCAN=0 off.
 const RH_V4_SCAN = process.env.RH_V4_SCAN !== '0';
-import { buildExecuteCall, planExecuteCall, checkBuildEncodeOn, executionRequested, executorConfig, pickV3Lender, kindForPool, v4KeyMatchesId, v4KeyOf, KIND_V4_HOOKED } from './execution/executorCalldata';
+import { buildExecuteCall, planExecuteCall, checkBuildEncodeOn, executionRequested, executorConfig, pickV3Lender, kindForPool, v4KeyMatchesId, v4KeyOf, KIND_V4_HOOKED, isHookedV4 } from './execution/executorCalldata';
 import { GasModel, GasCalibration, gasSettingsFromEnv, routeKeyFor, twoPoolKey, defaultUnitsFor, costsLine, loopKey } from './core/gasModel';
 import { recordEventFee, eventFeeCounts, feeFromEventsOn, setHeadBlockSource, currentHeadBlock } from './core/eventFees';
 import { OwnMoneyBook, useOwnMoney, fitTradeToWallet, OWN_MONEY_MAX_AGE_MS } from './core/ownMoney';
@@ -199,7 +199,7 @@ import { setHookedFeeSource } from './core/pairWatcher';
 import { SimBucketTally, classifySimOutcome } from './core/failReasons';
 import { makeRpc, simulateRoundTrip, simulateWithRecheck, simRpcUrl, Rpc, makeFallbackRpc, loadBalanceSlots, wssToHttps, replayRpc, ReplayCall, SimResult } from './execution/simulator';
 import { FastSender, SafetyGate, safetyConfigFromEnv, RUST_IS_SENDER } from './execution/fastSender';
-import { fastlaneModeFromEnv, FastlaneStateWriter, FastlaneSendsFollower, RustSendStats, pairRows, practiceHourSummary, routePairs, writeStartupSenderGuard, V4KeyCheckCache } from './execution/fastlaneBridge';
+import { fastlaneModeFromEnv, FastlaneStateWriter, FastlaneSendsFollower, RustSendStats, pairRows, practiceHourSummary, routePairs, writeStartupSenderGuard, V4KeyCheckCache, sendBlockKindOf, rustSendPath } from './execution/fastlaneBridge';
 import { DEFAULT_FILTER_CONFIG } from './core/fastFilter';
 import { checkLiveReady } from './execution/liveReadiness';
 import { LiveTradeTracker, Funding, LiveResult } from './execution/liveTracker';
@@ -3560,7 +3560,8 @@ if (FASTLANE_MODE !== 'off' && chainOn('robinhood')) {
                   // Our own trade seen again in the feed is never a trigger; 2 pools: 6 h block after a revert, like ours.
                   if (r.pools.length >= 2) { livePools.set(hash, [r.pools[0], r.pools[1]]); if (livePools.size > 500) livePools.delete(livePools.keys().next().value as string); }
                   liveTracker.track(hash, { expectedProfitUsd: r.expectedNetUsd, label, sizeUsd: r.sizeUsd, funding, routeKey: r.kinds?.length ? routeKeyFor(r.kinds, !!r.lender) : undefined });
-                  scoreboard.noteSend({ hash, path: loop ? 'loop' : 'gap', expectedUsd: r.expectedNetUsd, label, pools: r.pools.slice(0, 2) });
+                  // Fire-first sends under 'trig_first' (Rust's fire-first gate reads that pause), gap scan under 'gap'.
+                  scoreboard.noteSend({ hash, path: rustSendPath(r), expectedUsd: r.expectedNetUsd, label, pools: r.pools.slice(0, 2) });
                   console.log(`[fastlane] RUST SENT ${r.label}: ~$${r.expectedNetUsd.toFixed(2)} on $${Math.round(r.sizeUsd)}, block ${r.block}, feed -> sent ${(r.totalUs / 1000).toFixed(1)} ms, tx ${hash}`);
             },
             onLiveSendFailed: (r) => {
@@ -3622,6 +3623,8 @@ if (FASTLANE_MODE !== 'off' && chainOn('robinhood')) {
             rustSender: () => robinhoodSender.rustIsSender,
             dropsSeen: () => rustStats.dropsSeen,
             maxGasUsed: () => rustStats.maxGasUsed,
+            // (Nov 3) Pool kinds for Rust's FASTLANE_SEND_BLOCK_KINDS (UP CL / Raphael / hooked V4 not sent live by default).
+            poolKinds: () => { const m: Record<string, string> = {}; for (const k of copy2PoolKeys()) { const p = cache.get('robinhood', k); const kind = p ? sendBlockKindOf(p.dex, isHookedV4(p)) : null; if (kind) m[k.toLowerCase()] = kind; } return m; },
       }, (m) => console.log(m));
       writer.start(Math.max(250, Number(process.env.FASTLANE_STATE_MS ?? 2_000) || 2_000));
       follower.start(250);

@@ -74,6 +74,16 @@ pub fn to_safety_input(o: &Opportunity) -> Result<SafetyInput, String> {
     );
     // Fire-first trades answer to the scoreboard's fire-first pause.
     s.trig = o.view == super::types::ViewKind::Trigger;
+    // (Nov 3) Hooked V4 hops (FASTLANE_SEND_BLOCK_KINDS "hookedv4"): the
+    // pool key when hops and pools line up one to one, else the hook address.
+    let aligned = o.hops.len() == o.pools.len();
+    s.hooked_pools = o
+        .hops
+        .iter()
+        .enumerate()
+        .filter(|(_, h)| h.kind == super::types::KIND_V4_HOOKED)
+        .map(|(i, h)| if aligned { o.pools[i].to_ascii_lowercase() } else { lc(&h.pool) })
+        .collect();
     Ok(s)
 }
 
@@ -106,6 +116,17 @@ mod tests {
             loan_fee_usd: Some(0.2), pools: vec!["0xaa".into(), "0xbb".into()], keys: vec![], tokens: vec![a(1), a(2)],
             found_at: Instant::now(), scan_us: 7, source: "changed", check: std::sync::Arc::new(check),
         }
+    }
+
+    #[test]
+    fn hooked_v4_hops_are_named_for_the_kind_block() {
+        let mut o = opp();
+        assert!(to_safety_input(&o).unwrap().hooked_pools.is_empty());
+        o.hops[0].kind = crate::fastlane::types::KIND_V4_HOOKED;
+        assert_eq!(to_safety_input(&o).unwrap().hooked_pools, vec!["0xaa".to_string()]);
+        // Hops and pools not one to one: the hook address instead.
+        o.pools.push("0xcc".into());
+        assert_eq!(to_safety_input(&o).unwrap().hooked_pools, vec![format!("{:#x}", Address::with_last_byte(0xa))]);
     }
 
     #[test]

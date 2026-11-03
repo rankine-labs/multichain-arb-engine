@@ -37,6 +37,10 @@ import { dirname } from 'path';
 //       is in (path, confidence, "exact"). When a bucket's latest sends
 //       (at least SCORE_BUCKET_MIN_SENDS = 12, at most the last 50) together
 //       LOST money, that bucket stops sending for SCORE_BUCKET_PAUSE_H = 6 h
+//       (Nov 3: a minimum above the window is capped at the window, so the
+//       brake can always fire; and SCORE_BUCKET_ZERO_WIN_SENDS = 12: that
+//       many latest sends with NO win and a loss pause the bucket even when
+//       SCORE_BUCKET_MIN_SENDS is set higher; 0 = that rule off)
 //       (log + Telegram note). After the pause it starts counting from zero.
 //     - OVERALL STEP BACK: if every real send of the last
 //       SCORE_STEPBACK_WINDOW_H = 3 h together lost more than
@@ -87,6 +91,7 @@ export type ScoreSettings = {
   bucketMinSends: number;  // SCORE_BUCKET_MIN_SENDS [12]
   bucketWindow: number;    // SCORE_BUCKET_WINDOW [50] latest sends looked at
   bucketPauseH: number;    // SCORE_BUCKET_PAUSE_H [6]
+  bucketZeroWinSends: number; // SCORE_BUCKET_ZERO_WIN_SENDS [12] (Nov 3); 0 = off
   stepBackUsd: number;     // SCORE_STEPBACK_NET_USD [1.5] (a loss bigger than this)
   stepBackWindowH: number; // SCORE_STEPBACK_WINDOW_H [3]
   stepBackH: number;       // SCORE_STEPBACK_H [6]
@@ -102,6 +107,7 @@ export function scoreSettings(env: Record<string, string | undefined> = process.
     bucketMinSends: Math.round(num('SCORE_BUCKET_MIN_SENDS', 12, 1)),
     bucketWindow: Math.round(num('SCORE_BUCKET_WINDOW', 50, 1)),
     bucketPauseH: num('SCORE_BUCKET_PAUSE_H', 6, 0.01),
+    bucketZeroWinSends: Math.round(num('SCORE_BUCKET_ZERO_WIN_SENDS', 12, 0)),
     stepBackUsd: num('SCORE_STEPBACK_NET_USD', 1.5, 0),
     stepBackWindowH: num('SCORE_STEPBACK_WINDOW_H', 3, 0.01),
     stepBackH: num('SCORE_STEPBACK_H', 6, 0.01),
@@ -118,6 +124,24 @@ export function assumptionKinds(a: string[] | undefined): string[] {
 // The buckets one send belongs to: "path|confidence|kind" per assumption kind.
 export function bucketsOf(s: { path: SendPath; confidence?: Confidence; assumptions?: string[] }): string[] {
   return assumptionKinds(s.assumptions).map((k) => `${s.path}|${s.confidence ?? '-'}|${k}`);
+}
+
+// (Nov 3) Should a bucket whose latest sends (newest last, at most the
+// window) are `inB` pause? Lost money over at least min(SCORE_BUCKET_MIN_SENDS,
+// window) sends (a minimum above the window could never be reached: the
+// brake never fired), or SCORE_BUCKET_ZERO_WIN_SENDS (12) latest sends with
+// no win at all and a loss.
+export function bucketShouldPause(inB: ScoreRecord[], s: Pick<ScoreSettings, 'bucketMinSends' | 'bucketWindow' | 'bucketZeroWinSends'>): boolean {
+  const tt = totals(inB);
+  if (!(tt.netUsd < 0)) return false;
+  const need = Math.max(1, Math.min(s.bucketMinSends, s.bucketWindow));
+  if (tt.sends >= need) return true;
+  const z = s.bucketZeroWinSends;
+  if (z > 0) {
+    const last = inB.filter((r) => r.status !== 'dropped').slice(-z);
+    if (last.length >= z && last.every((r) => r.status !== 'won') && totals(last).netUsd < 0) return true;
+  }
+  return false;
 }
 
 // Totals of a set of settled sends (dropped ones don't count: never mined, no gas).
@@ -241,9 +265,8 @@ export class Scoreboard {
       if (this.pausedBucket(b)) continue;
       const from = this.countFrom.get(b) ?? 0;
       const inB = this.recs.filter((r) => r.status !== 'dropped' && r.settledMs > from && bucketsOf(r).includes(b)).slice(-this.s.bucketWindow);
-      if (inB.length < this.s.bucketMinSends) continue;
+      if (!bucketShouldPause(inB, this.s)) continue;
       const tt = totals(inB);
-      if (tt.netUsd >= 0) continue;
       const until = t + this.s.bucketPauseH * 3_600_000;
       const why = `${inB.length} sends lost ${usd(tt.netUsd)} (won ${tt.wins}, gas $${tt.gasUsd.toFixed(2)})`;
       this.pauses.set(b, { until, why });

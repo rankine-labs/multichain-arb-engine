@@ -199,6 +199,11 @@ pub struct NodeState {
     /// The most gas (units) any Rust send has used, as seen in receipts
     /// (0 = none yet). For the gun's gas limit.
     pub max_gas_used: u64,
+    /// (Nov 3) Pool key (lowercase) -> its kind for FASTLANE_SEND_BLOCK_KINDS
+    /// ("upcl", "raphael", "topaz", "hookedv4"); pools of other kinds are not
+    /// listed. Missing (older Node) = empty: only the route's own hooked V4
+    /// hops are then recognised.
+    pub pool_kinds: HashMap<String, String>,
 }
 
 /// The state file, turned into quick lookups.
@@ -213,6 +218,8 @@ pub struct SharedState {
     pub live_blocks: HashMap<String, (u64, String)>,
     pub fail_blocks: HashMap<String, (u64, String)>,
     pub own: HashMap<String, u128>,
+    /// Lowercased copy of raw.pool_kinds.
+    pub pool_kinds: HashMap<String, String>,
 }
 
 pub fn pair_key(a: &str, b: &str) -> String {
@@ -242,6 +249,7 @@ impl SharedState {
             live_blocks: blocks_of(&raw.live_blocks),
             fail_blocks: blocks_of(&raw.fail_blocks),
             own: raw.own_money.balances.iter().filter_map(|(k, v)| v.trim().parse::<u128>().ok().map(|n| (k.to_ascii_lowercase(), n))).collect(),
+            pool_kinds: raw.pool_kinds.iter().map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_ascii_lowercase())).collect(),
             raw,
         }
     }
@@ -436,6 +444,12 @@ pub struct SendRecord {
     /// the socket, answer still to come; the reply line follows).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
+    /// (Nov 3) Which state the trade was found on: "confirmed" / "predicted"
+    /// (gap scan) or "trigger" (fire-first). Node scores "trigger" sends
+    /// under the scoreboard path "trig_first" (the pause Rust's fire-first
+    /// gate reads), the rest under "gap" / "loop". None = older record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view: Option<String>,
 }
 
 /// Appends send records, one line per call, rotating at max_bytes, and

@@ -88,6 +88,12 @@ pub struct SafetyInput {
     /// "trig_first" pause applies (Node's pausedWhy('trig_first')), not the
     /// standing-gap one. false = as before.
     pub trig: bool,
+    /// (Nov 3, FASTLANE_SEND_BLOCK_KINDS) Pools of this route that are
+    /// traded as a hooked V4 hop (executor KIND_V4_HOOKED, e.g. Fables):
+    /// the pool key when the hops line up with `pools`, else the hook
+    /// address. Filled by convert.rs from the route's own hops, so it never
+    /// depends on Node. Empty = none (as before).
+    pub hooked_pools: Vec<String>,
 }
 
 impl SafetyInput {
@@ -95,7 +101,7 @@ impl SafetyInput {
     #[allow(clippy::too_many_arguments)]
     pub fn new(block: u64, label: String, token_in: String, tokens: Vec<String>, pools: Vec<String>, amount_in: u128, size_usd: f64, expected_net_usd: f64, gas_usd: f64, lender: Option<String>, found_at: Instant) -> SafetyInput {
         let kind = if pools.len() > 2 { RouteKind::Loop } else { RouteKind::Pair };
-        SafetyInput { block, label, kind, token_in, tokens, pools, amount_in, size_usd, expected_net_usd, gas_usd, lender, found_at, trig: false }
+        SafetyInput { block, label, kind, token_in, tokens, pools, amount_in, size_usd, expected_net_usd, gas_usd, lender, found_at, trig: false, hooked_pools: Vec::new() }
     }
 }
 
@@ -181,6 +187,18 @@ pub struct SafetyConfig {
     /// needs FASTLANE=live), and in LIVE mode the kill switch blocks exactly
     /// as before. "off" = practice obeys the kill switch too (old behaviour).
     pub practice_score_paused: bool,
+    /// FASTLANE_SEND_BLOCK_KINDS [upcl,raphael,hookedv4] (Nov 3): pool kinds
+    /// the fast lane must NOT send live through (gap scan and fire-first
+    /// alike; code "kind"). Copy 2 keeps following and checking them, and
+    /// practice would-sends still score them; only live sends stop. Kinds
+    /// come from Node's state file ("poolKinds": upcl / raphael / topaz /
+    /// hookedv4) plus the route's own hops (KIND_V4_HOOKED = hookedv4).
+    /// Empty ("" / "none" / "off") = no kind blocked (old behaviour).
+    pub send_block_kinds: std::collections::BTreeSet<String>,
+    /// FASTLANE_SEND_ALLOW_POOLS [empty] (Nov 3): pool keys (address or V4
+    /// pool id; a hook address also works for hooked V4) let through the
+    /// kind block one by one, once a pool is verified.
+    pub send_allow_pools: std::collections::HashSet<String>,
     /// Settings that are not positive numbers (any = block every send).
     pub problems: Vec<String>,
 }
@@ -245,6 +263,8 @@ impl SafetyConfig {
             feed_tip_max_age_ms: if tip_age.is_finite() && tip_age > 0.0 { tip_age as u64 } else { 1_000 },
             honour_live_blocks: crate::fastlane::mode::parse_on(get("FASTLANE_LIVE_BLOCKS").as_deref()),
             practice_score_paused: !crate::fastlane::mode::parse_off(get("FASTLANE_PRACTICE_SCORE_PAUSED").as_deref()),
+            send_block_kinds: parse_block_kinds(get("FASTLANE_SEND_BLOCK_KINDS").as_deref()),
+            send_allow_pools: get("FASTLANE_SEND_ALLOW_POOLS").unwrap_or_default().split([',', ' ', ';']).map(|x| x.trim().to_ascii_lowercase()).filter(|x| !x.is_empty()).collect(),
             problems,
         }
     }
@@ -268,6 +288,32 @@ impl SafetyConfig {
         }
         (net_usd / size_usd) * 100.0 > self.outlier_max_pct
     }
+}
+
+/// FASTLANE_SEND_BLOCK_KINDS default (Nov 3 revert study: 9 of 16 Rust
+/// sends were phantom gaps through UP CL; Raphael and hooked V4 / Fables
+/// were followed by copy 2 only since Nov 2 and are not proven yet).
+pub const DEFAULT_SEND_BLOCK_KINDS: &str = "upcl,raphael,hookedv4";
+
+/// Parse FASTLANE_SEND_BLOCK_KINDS. Unset = the default list; "" / "none" /
+/// "off" / "0" = nothing blocked. Names are lowercased; "fables" means
+/// hookedv4, "up-cl" upcl, "raphael-cl" raphael (the bot's exchange ids).
+pub fn parse_block_kinds(v: Option<&str>) -> std::collections::BTreeSet<String> {
+    let raw = v.unwrap_or(DEFAULT_SEND_BLOCK_KINDS).trim().to_ascii_lowercase();
+    if matches!(raw.as_str(), "" | "none" | "off" | "0" | "false" | "no") {
+        return Default::default();
+    }
+    raw.split([',', ' ', ';'])
+        .map(|x| x.trim())
+        .filter(|x| !x.is_empty())
+        .map(|x| match x {
+            "fables" | "hooked-v4" | "v4-hooked" => "hookedv4".to_string(),
+            "up-cl" => "upcl".to_string(),
+            "raphael-cl" => "raphael".to_string(),
+            "topaz-cl" => "topaz".to_string(),
+            o => o.to_string(),
+        })
+        .collect()
 }
 
 /// The stricter (smaller) of our limit and Node's, ignoring a missing/bad Node value.
@@ -297,6 +343,29 @@ pub fn utc_day(ms: u64) -> String {
 // ---------------------------------------------------------------------------
 // The gate
 // ---------------------------------------------------------------------------
+
+/// (Nov 3) The first pool of the route whose kind is on the block list and
+/// that is not on the allow list, with that kind. Kinds: Node's state file
+/// "poolKinds" (by pool key), and hookedv4 for every hooked V4 hop.
+pub fn blocked_kind(cfg: &SafetyConfig, st: &SharedState, o: &SafetyInput) -> Option<(String, String)> {
+    for p in &o.pools {
+        let k = p.trim().to_ascii_lowercase();
+        if let Some(kind) = st.pool_kinds.get(&k) {
+            if cfg.send_block_kinds.contains(kind) && !cfg.send_allow_pools.contains(&k) {
+                return Some((k, kind.clone()));
+            }
+        }
+    }
+    if cfg.send_block_kinds.contains("hookedv4") {
+        for h in &o.hooked_pools {
+            let k = h.trim().to_ascii_lowercase();
+            if !cfg.send_allow_pools.contains(&k) {
+                return Some((k, "hookedv4".to_string()));
+            }
+        }
+    }
+    None
+}
 
 /// One of our sends Node has not picked up yet (reserved against the caps).
 #[derive(Clone, Debug)]
@@ -330,6 +399,9 @@ pub struct Safety {
     /// (Oct 31) How many blocks behind the feed tip each checked trade was
     /// decided (newest 2,000; status "behindTipBlocks").
     pub behind_samples: VecDeque<u64>,
+    /// (Nov 3) Live sends stopped by FASTLANE_SEND_BLOCK_KINDS since start,
+    /// per kind (status "sendBlock").
+    pub kind_blocks: std::collections::BTreeMap<String, u64>,
 }
 
 /// At most this many reservations / pool holds are remembered (memory bound).
@@ -337,7 +409,7 @@ const MAX_TRACKED: usize = 1_000;
 
 impl Safety {
     pub fn new(cfg: SafetyConfig, mode: FastlaneMode, kill: KillSwitch, state: StateReader) -> Safety {
-        Safety { cfg, mode, kill, state, wall: Box::new(wall_ms), send_times: VecDeque::new(), pool_hold: HashMap::new(), reserved: VecDeque::new(), paused_passes: 0, feed_tip: None, behind_samples: VecDeque::new() }
+        Safety { cfg, mode, kill, state, wall: Box::new(wall_ms), send_times: VecDeque::new(), pool_hold: HashMap::new(), reserved: VecDeque::new(), paused_passes: 0, feed_tip: None, behind_samples: VecDeque::new(), kind_blocks: Default::default() }
     }
 
     /// Everything from the environment (the program's real settings).
@@ -452,6 +524,16 @@ impl Safety {
         }
         if !st.raw.problems.is_empty() {
             return Err(BlockReason::new("bad_setting", format!("bad safety setting (Node): {}", st.raw.problems.join(", "))));
+        }
+        // 4b. (Nov 3) Pool kinds not sent live (FASTLANE_SEND_BLOCK_KINDS):
+        //     UP CL, Raphael and hooked V4 (Fables) by default. Live only:
+        //     practice still scores them. A pool on FASTLANE_SEND_ALLOW_POOLS
+        //     passes. Checked early so the count says why ("kind").
+        if self.mode.mode == Mode::Live && !self.cfg.send_block_kinds.is_empty() {
+            if let Some((pool, kind)) = blocked_kind(&self.cfg, st, o) {
+                *self.kind_blocks.entry(kind.clone()).or_default() += 1;
+                return Err(BlockReason::new("kind", format!("{kind} pool {} not sent live (FASTLANE_SEND_BLOCK_KINDS)", short(&pool))));
+            }
         }
         // 5. Opportunity too old (new: the fast lane only aims at the next block).
         let age = now.saturating_duration_since(o.found_at);
@@ -982,6 +1064,46 @@ mod tests {
         // Loop fail block on the closing pair (p3 -> p1).
         let fb = NodeState { fail_blocks: vec![("0xp3".into(), "0xp1".into(), NOW_MS + 1_000, "x".into())], ..good_state() };
         assert_eq!(T::new(&[], fb).code(&lp), "pair_fail_block");
+    }
+
+    /// (Nov 3) FASTLANE_SEND_BLOCK_KINDS / FASTLANE_SEND_ALLOW_POOLS.
+    #[test]
+    fn send_block_kinds_stop_live_sends_only() {
+        let kinds = |m: &[(&str, &str)]| -> NodeState {
+            NodeState { pool_kinds: m.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(), ..good_state() }
+        };
+        // Default list: an UP CL / Raphael pool (Node's poolKinds) is blocked live, code "kind".
+        let mut t = T::new(&[], kinds(&[("0xP2", "upcl")]));
+        assert_eq!(t.code(&pair()), "kind");
+        assert_eq!(t.s.kind_blocks.get("upcl"), Some(&1));
+        assert_eq!(T::new(&[], kinds(&[("0xp1", "raphael")])).code(&pair()), "kind");
+        // Fire-first too (same gate).
+        assert_eq!(T::new(&[], kinds(&[("0xp1", "upcl")])).code(&SafetyInput { trig: true, ..pair() }), "kind");
+        // Kinds not on the list pass (Topaz is not blocked by default).
+        assert_eq!(T::new(&[], kinds(&[("0xp1", "topaz")])).code(&pair()), "ok");
+        // Hooked V4 hops from the route itself, no Node help needed.
+        let hooked = SafetyInput { hooked_pools: vec!["0xp2".into()], ..pair() };
+        assert_eq!(T::new(&[], good_state()).code(&hooked), "kind");
+        // Allow list: one verified pool at a time.
+        assert_eq!(T::new(&[("FASTLANE_SEND_ALLOW_POOLS", "0xP2")], kinds(&[("0xp2", "upcl")])).code(&pair()), "ok");
+        assert_eq!(T::new(&[("FASTLANE_SEND_ALLOW_POOLS", "0xp2")], good_state()).code(&hooked), "ok");
+        assert_eq!(T::new(&[("FASTLANE_SEND_ALLOW_POOLS", "0xp9")], kinds(&[("0xp2", "upcl")])).code(&pair()), "kind");
+        // Empty = old behaviour; a custom list only blocks what it names.
+        assert_eq!(T::new(&[("FASTLANE_SEND_BLOCK_KINDS", "")], kinds(&[("0xp2", "upcl")])).code(&hooked), "ok");
+        assert_eq!(T::new(&[("FASTLANE_SEND_BLOCK_KINDS", "off")], kinds(&[("0xp2", "upcl")])).code(&pair()), "ok");
+        assert_eq!(T::new(&[("FASTLANE_SEND_BLOCK_KINDS", "fables")], kinds(&[("0xp2", "upcl")])).code(&pair()), "ok");
+        assert_eq!(T::new(&[("FASTLANE_SEND_BLOCK_KINDS", "fables")], good_state()).code(&hooked), "kind");
+        // Practice still scores them (never broadcasts anyway).
+        assert_eq!(T::new(&[("FASTLANE", "practice")], kinds(&[("0xp2", "upcl")])).code(&pair()), "ok");
+    }
+
+    #[test]
+    fn parse_block_kinds_names() {
+        let v = |x: Option<&str>| parse_block_kinds(x).into_iter().collect::<Vec<_>>();
+        assert_eq!(v(None), vec!["hookedv4", "raphael", "upcl"]);
+        assert_eq!(v(Some(" UP-CL ; raphael-cl,Fables ")), vec!["hookedv4", "raphael", "upcl"]);
+        assert!(v(Some("")).is_empty());
+        assert!(v(Some("none")).is_empty());
     }
 
     #[test]
