@@ -555,3 +555,58 @@ fn catch_up_in_slices_gives_the_same_copy() {
     assert_eq!(b.7, a.7, "no extra paid requests");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// (Nov 3) Warm restart with MORE held values than ARBSIM_COPY2_RESUME_VERIFY_MAX
+/// (they are forgotten instead of re-read), after a 3,000-block gap: the
+/// forget used to rewrite every kept version (up to ARBSIM_HISTORY 64) on its
+/// own, which broke their memory sharing (live Nov 2 23:14: +1.4 GB in 2 s).
+/// With ARBSIM_COPY2_RESUME_FORGET_KEEP_VERSIONS 4 only the newest 4 are
+/// kept and rewritten; the copy at the head is the same as the old way.
+#[test]
+fn warm_restart_forget_keeps_only_newest_versions() {
+    let z = sizes();
+    let dir = std::env::temp_dir().join(format!("arbsim-resume-forget-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path0 = dir.join("made-up.bin").to_str().unwrap().to_string();
+    persist::save(&state(&z), &path0).unwrap();
+    let gap = 3000u64;
+    let first = S + gap + 1;
+    let mut results = Vec::new();
+    for keep in [0usize, 4] {
+        let p = dir.join(format!("k{keep}.bin")).to_str().unwrap().to_string();
+        std::fs::copy(&path0, &p).unwrap();
+        let node = fake(first, z.v2);
+        let nd: Arc<dyn NodeApi> = node.clone();
+        let sh = Shared::new(Config { history: 64, ..Config::for_tests() }, Some(nd), Arc::new(Volatile::default()));
+        let cfg = C2Config {
+            state_file: Some(p),
+            save_every_s: 3600,
+            walks_inflight: 0,
+            keep_blocks: 2400,
+            catchup_slice_blocks: 500,
+            // Forget every held value nothing follows (the live case: 20,000+).
+            resume_verify_max: 0,
+            resume_forget_keep_versions: keep,
+            ..C2Config::for_tests()
+        };
+        let (mut intake, hd) = manual(sh.clone(), Arc::new(FillQueue::new(1000, 100)), cfg);
+        catch_up(&mut intake, &hd, first, z.v2);
+        let r = hd.status_json(false)["resume"].clone();
+        assert_eq!(counter(&hd, "catchups_done"), 1, "keep {keep}: {r}");
+        assert_eq!(counter(&hd, "unsure_marked"), 0, "keep {keep}: no pool unsure");
+        let forgotten = counter(&hd, "resume_forgotten");
+        assert!(forgotten > 0, "keep {keep}: the forget path ran: {r}");
+        let head = sh.head().unwrap();
+        assert_eq!(head.block, first, "keep {keep}: at the bot's block");
+        let n_versions = sh.published.read().unwrap().versions.len();
+        eprintln!("FORGET keep {keep}: {forgotten} values forgotten, {n_versions} versions kept after the catch-up");
+        results.push((head.snap.counts(), forgotten, n_versions));
+    }
+    let (old, new) = (&results[0], &results[1]);
+    assert_eq!(old.0, new.0, "same copy at the head (accounts / values)");
+    assert_eq!(old.1, new.1, "same values forgotten");
+    assert!(old.2 > 8, "the old way kept (and rewrote) many versions: {}", old.2);
+    assert!(new.2 <= 4 + 1, "only the newest 4 (+ the bot's block) kept: {}", new.2);
+    let _ = std::fs::remove_dir_all(&dir);
+}

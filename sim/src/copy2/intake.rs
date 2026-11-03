@@ -2150,6 +2150,17 @@ pub struct C2Config {
     /// freed memory is handed back to the system first (memguard::trim_now,
     /// ~30 ms) [ARBSIM_COPY2_CATCHUP_TRIM_MB, 1100; 0 = never].
     pub catchup_trim_mb: u64,
+    /// (Nov 3) Warm restart, "too many held values: FORGET them" (above
+    /// ARBSIM_COPY2_RESUME_VERIFY_MAX): before forgetting, keep only this
+    /// many of the newest published versions [ARBSIM_COPY2_RESUME_FORGET_KEEP_VERSIONS,
+    /// 4; 0 = the old way: forget in every kept version]. Why: the forget
+    /// rewrote each of the up to ARBSIM_HISTORY [64] versions on its own, and
+    /// after a big catch-up all 64 are full: each rewritten copy stopped
+    /// sharing memory with the others. Live Nov 2 23:14:18 -> 23:14:20 UTC:
+    /// 1,310 MB -> 2,695 MB in 2 s, pm2 restart. Older versions are not
+    /// needed then (nothing was answered during the catch-up); a check
+    /// about an older block answers "not ready" as for any block too old.
+    pub resume_forget_keep_versions: usize,
     /// FAST RESTART (Oct 25): at most this many held "nothing follows"
     /// values are re-read before a warm restart answers again; more are
     /// FORGOTTEN instead (read again when a check needs them)
@@ -2217,6 +2228,7 @@ impl C2Config {
             resume_timeout_s: env_u64("ARBSIM_COPY2_RESUME_TIMEOUT_S", 120).max(1),
             catchup_slice_blocks: env_u64("ARBSIM_COPY2_CATCHUP_SLICE_BLOCKS", 500),
             catchup_trim_mb: env_u64("ARBSIM_COPY2_CATCHUP_TRIM_MB", 1100),
+            resume_forget_keep_versions: env_u64("ARBSIM_COPY2_RESUME_FORGET_KEEP_VERSIONS", 4) as usize,
             resume_verify_max: env_u64("ARBSIM_COPY2_RESUME_VERIFY_MAX", 20_000) as usize,
             drop_grace_s: env_u64("ARBSIM_COPY2_DROP_GRACE_S", 1800),
             drop_grace_max: env_u64("ARBSIM_COPY2_DROP_GRACE_MAX", 400).min(100_000) as usize,
@@ -2226,7 +2238,7 @@ impl C2Config {
         }
     }
     pub fn for_tests() -> Self {
-        C2Config { reload_ms: 0, reload_max_ms: 0, layout_retry_s: 3600, load_batch: 25, loaders: 2, keep_blocks: 400, max_keep_blocks: 4000, max_rounds: 40, tip_every_s: 0, catchup_max_blocks: 64, walk: WalkCfg::default(), walks_inflight: 2, walk_max_slots: 1_000_000, walk_max_rss_mb: 0, walk_hot: 16, walk_hot_max_rss_mb: 0, late_fetch: true, max_keep_logs: 1_000_000, pending_ms: 300, pm_bound: true, verify_every_s: 0, verify_max: 400, fast_verify_ms: 0, fast_verify_max: 1000, fast_max_age_ms: 150_000, stall_s: 30, state_file: None, save_every_s: 3600, resume_max_blocks: 18_000, resume_overlap: 64, resume_range: 500, resume_timeout_s: 60, catchup_slice_blocks: 0, catchup_trim_mb: 0, resume_verify_max: usize::MAX, drop_grace_s: 1800, drop_grace_max: 400, drop_grace_max_logs: 1_000_000, blind: super::v4blind::BlindCfg::for_tests(), code_prune_s: 0 }
+        C2Config { reload_ms: 0, reload_max_ms: 0, layout_retry_s: 3600, load_batch: 25, loaders: 2, keep_blocks: 400, max_keep_blocks: 4000, max_rounds: 40, tip_every_s: 0, catchup_max_blocks: 64, walk: WalkCfg::default(), walks_inflight: 2, walk_max_slots: 1_000_000, walk_max_rss_mb: 0, walk_hot: 16, walk_hot_max_rss_mb: 0, late_fetch: true, max_keep_logs: 1_000_000, pending_ms: 300, pm_bound: true, verify_every_s: 0, verify_max: 400, fast_verify_ms: 0, fast_verify_max: 1000, fast_max_age_ms: 150_000, stall_s: 30, state_file: None, save_every_s: 3600, resume_max_blocks: 18_000, resume_overlap: 64, resume_range: 500, resume_timeout_s: 60, catchup_slice_blocks: 0, catchup_trim_mb: 0, resume_forget_keep_versions: 0, resume_verify_max: usize::MAX, drop_grace_s: 1800, drop_grace_max: 400, drop_grace_max_logs: 1_000_000, blind: super::v4blind::BlindCfg::for_tests(), code_prune_s: 0 }
     }
 }
 
@@ -7288,8 +7300,19 @@ impl Intake {
         // anyway, so a re-read would have replaced 15% of them).
         if items.len() > self.cfg.resume_verify_max {
             let n = items.len();
+            let mb0 = crate::memguard::rss_mb();
+            let mut dropped = 0usize;
             {
                 let mut p = crate::timing::TimedWrite::new(&self.sh.published);
+                // (Nov 3) Only the newest few versions are rewritten (see
+                // C2Config::resume_forget_keep_versions): the older ones go.
+                let keep = self.cfg.resume_forget_keep_versions;
+                if keep > 0 {
+                    while p.versions.len() > keep {
+                        p.versions.pop_front();
+                        dropped += 1;
+                    }
+                }
                 rewrite_from(&mut p.versions, 0, |s| {
                     for it in &items {
                         if let MissItem::Slot(a, sl) = it {
@@ -7299,9 +7322,18 @@ impl Intake {
                 });
             }
             add(&self.c2.stats.resume_forgotten, n as u64);
+            // The dropped versions' memory back to the system now.
+            let trim_mb = self.cfg.catchup_trim_mb;
+            let trimmed = trim_mb > 0 && crate::memguard::rss_mb() >= trim_mb as f64;
+            if trimmed {
+                crate::memguard::trim_now();
+            }
             eprintln!(
-                "[arbsim] copy2: warm restart: {n} held value(s) nothing follows FORGOTTEN instead of re-read (more than ARBSIM_COPY2_RESUME_VERIFY_MAX {}); checks read them again when needed",
-                self.cfg.resume_verify_max
+                "[arbsim] copy2: warm restart: {n} held value(s) nothing follows FORGOTTEN instead of re-read (more than ARBSIM_COPY2_RESUME_VERIFY_MAX {}); checks read them again when needed. {dropped} older version(s) dropped first (ARBSIM_COPY2_RESUME_FORGET_KEEP_VERSIONS {}); process {mb0:.0} -> {:.0} MB{}",
+                self.cfg.resume_verify_max,
+                self.cfg.resume_forget_keep_versions,
+                crate::memguard::rss_mb(),
+                if trimmed { " (freed memory handed back)" } else { "" }
             );
             self.finish_catchup();
             return;
