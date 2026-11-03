@@ -626,6 +626,28 @@ impl NodeClient {
         Some(c)
     }
 
+    /// KEEPER THRIFT (Nov 3, copy2/keeper.rs FASTLANE_AHEAD_KEEP_FREE_TRACE):
+    /// a client for ONLY the free public node (ARBSIM_PUBLIC_URL, default
+    /// Robinhood's), allowed to send debug_* methods, with its own speed
+    /// limit `rps` (bursts up to 2 x rps) and no daily cap. Its calls cost no
+    /// Chainstack units. None = the free node is switched off
+    /// (ARBSIM_PUBLIC_URL=off / empty) or no node is configured at all.
+    pub fn free_debug_from_env(rps: f64) -> Option<Self> {
+        let mut c = Self::from_env()?;
+        let public = std::env::var("ARBSIM_PUBLIC_URL").unwrap_or_else(|_| ROBINHOOD_PUBLIC_RPC.to_string());
+        if public.trim().is_empty() || public.trim() == "off" {
+            return None;
+        }
+        // One endpoint: the free node, on budget slot 0 (so the paid-only
+        // route the keeper uses sends to it), labelled "free".
+        c.endpoints = vec![Endpoint { label: "free", url: public.trim().to_string(), debug: true, budget: 0, bg_only: false }];
+        let mut b = Budget::new(u64::MAX / 4, rps.max(0.5), None);
+        b.burst = (rps * 2.0).max(1.0);
+        c.budgets[0] = b;
+        c.bg_public = false;
+        Some(c)
+    }
+
     /// Tests only: a free node and one paid node at these URLs.
     #[cfg(test)]
     fn for_test(public: &str, paid: &str, bg_public: bool, public_rps: f64, public_burst: f64) -> Self {

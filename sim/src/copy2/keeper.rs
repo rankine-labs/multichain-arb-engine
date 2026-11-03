@@ -193,6 +193,43 @@ pub struct KeeperCfg {
     /// seeded again (self-healing). off = learned values kept for good (as
     /// before). Only matters with FASTLANE_AHEAD_KEEP_PRUNE_BLOCKS > 0.
     pub prune_learned: bool,
+    /// FASTLANE_AHEAD_KEEP_THRIFT (Nov 3, Chainstack units) [off]: the
+    /// master switch for the cheaper keeper below. Off = every setting
+    /// keeps its old default (the keeper behaves exactly as before). On =
+    /// FASTLANE_AHEAD_KEEP_PROBE defaults to 1 and
+    /// FASTLANE_AHEAD_KEEP_FREE_TRACE to on (each can still be set alone).
+    pub thrift: bool,
+    /// FASTLANE_AHEAD_KEEP_PROBE (thrift) [0 = no limit, the old way; 1 with
+    /// THRIFT]: with FASTLANE_AHEAD_KEEP_LEAD the keeper asks for blocks the
+    /// FEED has announced, which the node often does not have yet ("not
+    /// yet" answers, asked again every FASTLANE_AHEAD_KEEP_RETRY_MS). Each of
+    /// those is a paid debug call (2 Chainstack units) that brings nothing.
+    /// Live Nov 3 they were most of the keeper's calls: up to
+    /// FASTLANE_AHEAD_KEEP_FETCH_PAR (4) future blocks were asked at once,
+    /// again and again. With PROBE = n the keeper asks at most n blocks
+    /// past the newest block the node has shown it has (the newest block
+    /// it answered, or copy 2's block). Blocks the node surely has still go
+    /// out FETCH_PAR at a time, so catching up is as fast as before, and
+    /// the next block is still asked the moment the node may have it.
+    pub probe: u64,
+    /// FASTLANE_AHEAD_KEEP_RETRY_MS [50]: wait before asking again for a
+    /// block the node did not have yet. 10..=2000.
+    pub retry_ms: u64,
+    /// FASTLANE_AHEAD_KEEP_FREE_TRACE (thrift) [off; on with THRIFT]: ask
+    /// Robinhood's FREE public node (ARBSIM_PUBLIC_URL) for the block diffs
+    /// first (no Chainstack units). The paid node is asked only when the
+    /// free one fails (error, refusal, wrong answer shape: the free node
+    /// then rests FASTLANE_AHEAD_KEEP_FREE_REST_MS) or when it does not have
+    /// a block that copy 2 already has (it is behind). Seeds and audits
+    /// (eth_getProof) stay on the paid node, so the audit keeps checking
+    /// the free node's diffs against the paid node every
+    /// FASTLANE_AHEAD_KEEP_AUDIT_S.
+    pub free_trace: bool,
+    /// FASTLANE_AHEAD_KEEP_FREE_RPS [25]: own speed limit on the free node.
+    pub free_rps: u64,
+    /// FASTLANE_AHEAD_KEEP_FREE_REST_MS [3000]: after a free-node failure,
+    /// use the paid node only for this long.
+    pub free_rest_ms: u64,
 }
 
 /// FASTLANE_AHEAD_KEEP_PRUNE_BLOCKS default (memory fix 2, Nov 2): ~5 min
@@ -222,6 +259,13 @@ impl Default for KeeperCfg {
             prune_blocks: 0,
             // Off in the core's default (tests, replay unless asked); on live.
             prune_learned: false,
+            // Thrift (Nov 3): all off = the old keeper.
+            thrift: false,
+            probe: 0,
+            retry_ms: 50,
+            free_trace: false,
+            free_rps: 25,
+            free_rest_ms: 3000,
         }
     }
 }
@@ -235,6 +279,8 @@ impl KeeperCfg {
         let observe = am == super::ahead::AheadMode::Observe;
         let on = am != super::ahead::AheadMode::Off && super::ahead::on_off(get("FASTLANE_AHEAD_KEEPER").as_deref()).unwrap_or(observe);
         let max_slots_per = num("FASTLANE_AHEAD_KEEP_SLOTS", d.max_slots_per as u64, 1, 100_000) as usize;
+        // Thrift (Nov 3): the master switch only changes defaults.
+        let thrift = super::ahead::on_off(get("FASTLANE_AHEAD_KEEP_THRIFT").as_deref()).unwrap_or(false);
         // Live-speed settings (Oct 31 night): the new way is the default only
         // when the predicted copy just OBSERVES (it decides nothing); with
         // FASTLANE_AHEAD=on everything stays as before unless set.
@@ -258,6 +304,12 @@ impl KeeperCfg {
             max_behind: num("FASTLANE_AHEAD_KEEP_MAX_BEHIND", d.max_behind, 2, 10_000),
             seed_batch: d.seed_batch,
             max_candidates: d.max_candidates,
+            thrift,
+            probe: num("FASTLANE_AHEAD_KEEP_PROBE", if thrift { 1 } else { 0 }, 0, 64),
+            retry_ms: num("FASTLANE_AHEAD_KEEP_RETRY_MS", d.retry_ms, 10, 2000),
+            free_trace: super::ahead::on_off(get("FASTLANE_AHEAD_KEEP_FREE_TRACE").as_deref()).unwrap_or(thrift),
+            free_rps: num("FASTLANE_AHEAD_KEEP_FREE_RPS", d.free_rps, 1, 200),
+            free_rest_ms: num("FASTLANE_AHEAD_KEEP_FREE_REST_MS", d.free_rest_ms, 0, 600_000),
         }
     }
 }
@@ -1389,20 +1441,116 @@ pub trait KeeperIo: Send + Sync {
     fn usage(&self) -> Value {
         Value::Null
     }
+    /// THRIFT (Nov 3): Chainstack units the keeper's calls cost (status
+    /// "units"; Null where not counted, e.g. the offline replay).
+    fn units(&self) -> Value {
+        Value::Null
+    }
+}
+
+/// THRIFT (Nov 3): what the keeper's node calls cost. Chainstack (Global
+/// Node) bills every debug_* call 2 request units and other calls 1
+/// (docs.chainstack.com/docs/request-units), a "not yet" answer included.
+/// Calls inside one batch are billed one by one.
+#[derive(Default)]
+pub struct UnitCounts {
+    /// Paid debug_traceBlockByNumber calls (2 units each) / of them "not yet".
+    pub paid_traces: std::sync::atomic::AtomicU64,
+    pub paid_not_yet: std::sync::atomic::AtomicU64,
+    /// Paid eth_getProof / eth_getCode calls (1 unit each).
+    pub paid_other: std::sync::atomic::AtomicU64,
+    /// Free-node block diffs: answered / "not yet" / failed (paid used).
+    pub free_ok: std::sync::atomic::AtomicU64,
+    pub free_not_yet: std::sync::atomic::AtomicU64,
+    pub free_fail: std::sync::atomic::AtomicU64,
+}
+
+impl UnitCounts {
+    fn add(c: &std::sync::atomic::AtomicU64, n: u64) {
+        c.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+    }
+    fn get(c: &std::sync::atomic::AtomicU64) -> u64 {
+        c.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    /// Chainstack units used since start.
+    pub fn units(&self) -> u64 {
+        2 * Self::get(&self.paid_traces) + Self::get(&self.paid_other)
+    }
+    /// Status: counts, units, and the pace as units per day since `since`.
+    pub fn json(&self, since: Instant) -> Value {
+        let el = since.elapsed().as_secs_f64().max(1.0);
+        let units = self.units();
+        json!({
+            "paidTraces": Self::get(&self.paid_traces), "paidNotYet": Self::get(&self.paid_not_yet), "paidOther": Self::get(&self.paid_other),
+            "freeOk": Self::get(&self.free_ok), "freeNotYet": Self::get(&self.free_not_yet), "freeFail": Self::get(&self.free_fail),
+            "units": units, "unitsPerDay": (units as f64 / el * 86_400.0).round() as u64, "seconds": el.round() as u64,
+        })
+    }
 }
 
 /// The live keeper's node and heads.
 struct LiveIo {
     node: crate::node::NodeClient,
+    /// THRIFT (FASTLANE_AHEAD_KEEP_FREE_TRACE): the free public node, asked
+    /// first for block diffs. None = paid node only (the old way).
+    free: Option<crate::node::NodeClient>,
+    /// The free node failed: paid node only until then.
+    free_rest_until: Mutex<Option<Instant>>,
+    free_rest: Duration,
     c2: super::intake::Copy2Handle,
     l2_offset: u64,
+    n: UnitCounts,
+    since: Instant,
+}
+
+impl LiveIo {
+    /// One block's changes from the paid node (counted).
+    fn paid_block(&self, b: u64) -> Result<Option<Vec<StateDiff>>, String> {
+        UnitCounts::add(&self.n.paid_traces, 1);
+        let r = fetch_block(&self.node, b);
+        if matches!(r, Ok(None)) {
+            UnitCounts::add(&self.n.paid_not_yet, 1);
+        }
+        r
+    }
 }
 
 impl KeeperIo for LiveIo {
     fn block(&self, b: u64) -> Result<Option<Vec<StateDiff>>, String> {
-        fetch_block(&self.node, b)
+        // THRIFT: the free node first, unless it is resting after a failure.
+        if let Some(free) = &self.free {
+            let resting = self.free_rest_until.lock().unwrap_or_else(|e| e.into_inner()).is_some_and(|t| Instant::now() < t);
+            if !resting {
+                match fetch_block(free, b) {
+                    Ok(Some(t)) => {
+                        UnitCounts::add(&self.n.free_ok, 1);
+                        return Ok(Some(t));
+                    }
+                    Ok(None) => {
+                        UnitCounts::add(&self.n.free_not_yet, 1);
+                        // The free node does not have it yet. If copy 2
+                        // already has it the free node is BEHIND: the paid
+                        // node answers (never wait on a lagging free node).
+                        // Otherwise it is simply a future block: "not yet"
+                        // (asked again on the free node, at no cost).
+                        if self.copy2_head().is_none_or(|c| b > c) {
+                            return Ok(None);
+                        }
+                    }
+                    Err(_) => {
+                        // Refused / failed / unreadable: rest it, paid node now.
+                        UnitCounts::add(&self.n.free_fail, 1);
+                        *self.free_rest_until.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now() + self.free_rest);
+                    }
+                }
+            }
+        }
+        self.paid_block(b)
     }
     fn proof(&self, addr: Address, slots: &[U256], at: u64, code: bool) -> Result<ProofAnswer, String> {
+        // Seeds / audits: always the paid node (1 unit per call; with the
+        // code it is a batch of 2 calls).
+        UnitCounts::add(&self.n.paid_other, if code { 2 } else { 1 });
         fetch_proof(&self.node, addr, slots, at, code)
     }
     fn copy2_head(&self) -> Option<u64> {
@@ -1413,6 +1561,11 @@ impl KeeperIo for LiveIo {
     }
     fn usage(&self) -> Value {
         crate::node::NodeApi::usage(&self.node)
+    }
+    fn units(&self) -> Value {
+        let mut v = self.n.json(self.since);
+        v["free"] = json!(self.free.is_some());
+        v
     }
 }
 
@@ -1482,6 +1635,9 @@ pub fn start(c2: super::intake::Copy2Handle) -> bool {
         eprintln!("[arbsim] fastlane keeper: no node configured: OFF");
         return false;
     };
+    // THRIFT (FASTLANE_AHEAD_KEEP_FREE_TRACE): block diffs from the free
+    // public node first (no Chainstack units); None = paid node only.
+    let free = if cfg.free_trace { crate::node::NodeClient::free_debug_from_env(cfg.free_rps as f64) } else { None };
     let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<MissItem>>(1024);
     let sink = Sink::new(Arc::new(super::ahead::kept_hook));
     if RT.set(Rt { learn: tx, sink: sink.clone(), dropped: Default::default() }).is_err() {
@@ -1494,8 +1650,28 @@ pub fn start(c2: super::intake::Copy2Handle) -> bool {
         if cfg.lead_feed { ", up to the feed's newest block" } else { "" },
         if cfg.seed_par == 0 { "only while caught up".to_string() } else { format!("{} at a time on their own lane", cfg.seed_par) },
     );
+    eprintln!(
+        "[arbsim] fastlane keeper thrift: {} (probe {}, retry {} ms, block diffs from the free node {})",
+        if cfg.thrift { "on" } else { "off" },
+        if cfg.probe == 0 { "no limit".to_string() } else { format!("{} block(s) past the node's newest", cfg.probe) },
+        cfg.retry_ms,
+        match (&free, cfg.free_trace) {
+            (Some(_), _) => format!("first, paid node as fallback, {} calls/s max", cfg.free_rps),
+            (None, true) => "wanted but the free node is off: paid only".to_string(),
+            (None, false) => "off".to_string(),
+        },
+    );
     let l2_offset = c2.sh.cfg.l2_offset;
-    let io: Arc<dyn KeeperIo> = Arc::new(LiveIo { node, c2, l2_offset });
+    let io: Arc<dyn KeeperIo> = Arc::new(LiveIo {
+        node,
+        free,
+        free_rest_until: Mutex::new(None),
+        free_rest: Duration::from_millis(cfg.free_rest_ms),
+        c2,
+        l2_offset,
+        n: UnitCounts::default(),
+        since: Instant::now(),
+    });
     std::thread::Builder::new()
         .name("arbsim-keeper".into())
         .spawn(move || {
@@ -1611,6 +1787,7 @@ impl Meter {
         st["calls"] = json!(self.calls);
         st["notYet"] = json!(self.not_yet);
         st["node"] = io.usage();
+        st["units"] = io.units();
         st["rateRefusals"] = json!(self.rate_refusals);
         st["rateWaitMs"] = json!(rate_wait.as_millis() as u64);
         st["copy2Head"] = json!(io.copy2_head());
@@ -1850,6 +2027,10 @@ fn drive_pipelined(io: Arc<dyn KeeperIo>, cfg: KeeperCfg, rx: std::sync::mpsc::R
     let mut rate_wait = Duration::ZERO;
     let mut rate_until: Option<Instant> = None;
     let mut ahead_max = 0i64;
+    // THRIFT (FASTLANE_AHEAD_KEEP_PROBE): the newest block the node has
+    // answered with its changes (it surely has every block up to here).
+    let mut node_has: u64 = 0;
+    let retry_after = Duration::from_millis(cfg.retry_ms);
     // Restart: everything held dropped (KeeperCore::reset) and every answer
     // still out belongs to the old run.
     macro_rules! restart {
@@ -1859,6 +2040,8 @@ fn drive_pipelined(io: Arc<dyn KeeperIo>, cfg: KeeperCfg, rx: std::sync::mpsc::R
             inflight.clear();
             ready.clear();
             retry.clear();
+            // (Thrift) known again from copy 2's block and new answers.
+            node_has = 0;
             sink.publish(&k, cfg.versions);
         }};
     }
@@ -1875,7 +2058,8 @@ fn drive_pipelined(io: Arc<dyn KeeperIo>, cfg: KeeperCfg, rx: std::sync::mpsc::R
         }
         if status_at.elapsed() >= Duration::from_secs(1) {
             status_at = Instant::now();
-            let extra = json!({"mode": "pipelined", "fetchPar": cfg.fetch_par, "seedPar": cfg.seed_par, "lead": cfg.lead_feed, "inFlight": inflight.len(), "ready": ready.len(), "seedsOut": seeds_out, "aheadOfCopy2Max": ahead_max});
+            let extra = json!({"mode": "pipelined", "fetchPar": cfg.fetch_par, "seedPar": cfg.seed_par, "lead": cfg.lead_feed, "inFlight": inflight.len(), "ready": ready.len(), "seedsOut": seeds_out, "aheadOfCopy2Max": ahead_max,
+                "thrift": cfg.thrift, "probe": cfg.probe, "retryMs": cfg.retry_ms, "freeTrace": cfg.free_trace, "nodeHas": node_has});
             *sink.status.lock().unwrap_or_else(|e| e.into_inner()) = m.status(&k, io.as_ref(), rate_wait, extra);
         }
         let Some(c2) = io.copy2_head() else {
@@ -1898,7 +2082,13 @@ fn drive_pipelined(io: Arc<dyn KeeperIo>, cfg: KeeperCfg, rx: std::sync::mpsc::R
             }
             Some(h) => h,
         };
-        let target = if cfg.lead_feed { c2.max(io.feed_head().unwrap_or(0)) } else { c2 };
+        let mut target = if cfg.lead_feed { c2.max(io.feed_head().unwrap_or(0)) } else { c2 };
+        // THRIFT: never more than `probe` blocks past what the node is known
+        // to have (copy 2's block, or the newest block it answered): asking
+        // further ahead only buys paid "not yet" answers.
+        if cfg.probe > 0 {
+            target = target.min(c2.max(node_has) + cfg.probe);
+        }
         let now = Instant::now();
         let paused = rate_until.is_some_and(|t| now < t);
         // Ask for the next blocks (at most fetch_par out at once).
@@ -1970,11 +2160,13 @@ fn drive_pipelined(io: Arc<dyn KeeperIo>, cfg: KeeperCfg, rx: std::sync::mpsc::R
                             rate_wait = Duration::ZERO;
                             retry.remove(&b);
                             ready.insert(b, t);
+                            node_has = node_has.max(b);
                         }
                         Ok(None) => {
                             // The node does not have it yet (we lead copy 2).
+                            // (FASTLANE_AHEAD_KEEP_RETRY_MS, old: 50 ms.)
                             m.not_yet += 1;
-                            retry.insert(b, now + Duration::from_millis(50));
+                            retry.insert(b, now + retry_after);
                         }
                         Err(e) if crate::node::is_rate_refusal(0, &e) => {
                             m.rate_refusals += 1;
@@ -2400,6 +2592,11 @@ mod tests {
         pace: Duration,
         lat: Duration,
         calls: std::sync::atomic::AtomicU64,
+        /// (Thrift test) the feed announces blocks this many blocks before
+        /// the node has them; copy 2 publishes them this many after.
+        feed_lead: u64,
+        c2_lag: u64,
+        not_yet: std::sync::atomic::AtomicU64,
     }
     impl FakeIo {
         fn tip(&self) -> u64 {
@@ -2410,6 +2607,9 @@ mod tests {
         fn block(&self, b: u64) -> Result<Option<Vec<StateDiff>>, String> {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             std::thread::sleep(self.lat);
+            if b > self.tip() {
+                self.not_yet.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             Ok((b <= self.tip()).then(|| vec![slot_diff(a(1), &[(1, b)])]))
         }
         fn proof(&self, _addr: Address, slots: &[U256], _at: u64, _code: bool) -> Result<ProofAnswer, String> {
@@ -2417,16 +2617,23 @@ mod tests {
             Ok((None, None, slots.iter().map(|s| (*s, U256::ZERO)).collect()))
         }
         fn copy2_head(&self) -> Option<u64> {
-            Some(self.tip())
+            Some(self.tip().saturating_sub(self.c2_lag))
         }
         fn feed_head(&self) -> Option<u64> {
-            Some(self.tip())
+            Some(self.tip() + self.feed_lead)
         }
     }
 
     /// Run the real runtime for `run` against FakeIo; (resets, blocks behind at the end).
     fn drive_for(cfg: KeeperCfg, pace: Duration, lat: Duration, run: Duration) -> (u64, i64) {
-        let io = Arc::new(FakeIo { start: Instant::now(), pace, lat, calls: Default::default() });
+        let (resets, behind, _, _, _) = drive_lead(cfg, pace, lat, run, 0, 0);
+        (resets, behind)
+    }
+
+    /// Like drive_for, with the feed `feed_lead` blocks ahead of the node and
+    /// copy 2 `c2_lag` behind it; also (calls, not-yet calls, blocks applied).
+    fn drive_lead(cfg: KeeperCfg, pace: Duration, lat: Duration, run: Duration, feed_lead: u64, c2_lag: u64) -> (u64, i64, u64, u64, u64) {
+        let io = Arc::new(FakeIo { start: Instant::now(), pace, lat, calls: Default::default(), feed_lead, c2_lag, not_yet: Default::default() });
         let sink = Sink::new(Arc::new(|| {}));
         let (_tx, rx) = std::sync::mpsc::sync_channel::<Vec<MissItem>>(16);
         let (s2, io2) = (sink.clone(), io.clone());
@@ -2439,7 +2646,28 @@ mod tests {
         sink.stop.store(true, std::sync::atomic::Ordering::Relaxed);
         t.join().unwrap();
         let resets = st["stats"]["resets"].as_object().map(|m| m.values().filter_map(|v| v.as_u64()).sum()).unwrap_or(0);
-        (resets, behind)
+        let blocks = st["stats"]["blocks"].as_u64().unwrap_or(0);
+        (resets, behind, io.calls.load(std::sync::atomic::Ordering::Relaxed), io.not_yet.load(std::sync::atomic::Ordering::Relaxed), blocks)
+    }
+
+    /// THRIFT (Nov 3): with the feed ahead of the node, the old lead asks
+    /// for up to FETCH_PAR future blocks again and again ("not yet", each a
+    /// paid call). PROBE = 1 asks only one block past the node's newest:
+    /// far fewer calls, still at the node's tip (ahead of copy 2), no restart.
+    #[test]
+    fn probe_one_cuts_not_yet_calls_and_keeps_the_lead() {
+        let pace = Duration::from_millis(20);
+        let lat = Duration::from_millis(5);
+        let base = KeeperCfg { on: true, fetch_par: 4, seed_par: 1, lead_feed: true, retry_ms: 10, ..KeeperCfg::default() };
+        let run = Duration::from_millis(2000);
+        let (r0, behind0, calls0, ny0, blocks0) = drive_lead(KeeperCfg { probe: 0, ..base.clone() }, pace, lat, run, 6, 5);
+        let (r1, behind1, calls1, ny1, blocks1) = drive_lead(KeeperCfg { probe: 1, ..base }, pace, lat, run, 6, 5);
+        assert_eq!((r0, r1), (0, 0), "no restarts");
+        // Both follow the node's tip (copy 2 is 5 behind it: "behind" < 0 means ahead of the node's own tip never happens).
+        assert!(behind0 <= 2 && behind1 <= 2, "both at the node's tip ({behind0}, {behind1})");
+        assert!(blocks1 + 10 >= blocks0, "same blocks applied ({blocks0} vs {blocks1})");
+        assert!(ny1 * 2 < ny0, "not-yet calls cut ({ny0} -> {ny1})");
+        assert!(calls1 < calls0, "fewer calls ({calls0} -> {calls1})");
     }
 
     /// Blocks faster than one answer time: the old one-at-a-time loop falls
@@ -2473,6 +2701,13 @@ mod tests {
         assert_eq!(cfg("observe", Some(("FASTLANE_AHEAD_KEEP_FETCH_PAR", "99"))).fetch_par, 4, "out of range: default");
         assert!(!cfg("observe", Some(("FASTLANE_AHEAD_KEEP_LEAD", "off"))).lead_feed);
         assert_eq!(cfg("observe", Some(("FASTLANE_AHEAD_KEEP_SEED_PAR", "0"))).seed_par, 0);
+        // THRIFT (Nov 3): off by default = the old keeper exactly.
+        assert_eq!((o.thrift, o.probe, o.retry_ms, o.free_trace), (false, 0, 50, false), "thrift off: old");
+        let t = cfg("observe", Some(("FASTLANE_AHEAD_KEEP_THRIFT", "on")));
+        assert_eq!((t.thrift, t.probe, t.free_trace), (true, 1, true), "thrift on: probe 1, free node");
+        assert_eq!(cfg("observe", Some(("FASTLANE_AHEAD_KEEP_PROBE", "2"))).probe, 2, "probe alone");
+        assert!(cfg("observe", Some(("FASTLANE_AHEAD_KEEP_FREE_TRACE", "on"))).free_trace, "free node alone");
+        assert_eq!(cfg("observe", Some(("FASTLANE_AHEAD_KEEP_RETRY_MS", "5"))).retry_ms, 50, "out of range: default");
     }
 
     #[test]
