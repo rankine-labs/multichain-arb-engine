@@ -299,9 +299,33 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 // ----------------------------------------------------------------------------
 // Batched reads. Returns raw return data per call (null = call failed).
 // ----------------------------------------------------------------------------
+// MULTICALL CHECK FIX (Nov 3, CALLER_RECHECK, default on; CALLER_RECHECK=0 =
+// old behaviour). Plain English: when a caller is made, it asks the node
+// once "is the Multicall3 bundling contract there?". If the node had a
+// hiccup at that exact moment (e.g. right after a restart), the old code
+// decided "no" FOREVER, and every caller kept for the bot's life (the tick
+// windows, pair discovery, Fables fees, own-money reads) fell back to slow
+// one-by-one reads that kept failing. Live Nov 3 13:42: after a restart the
+// tick windows loaded 0 pools in 30 min (1,800+ in the first 10 min after
+// earlier restarts). Now a failed check means "not known yet": the caller
+// asks again on its next use, and until it knows it throws (every caller
+// already treats a throw as "node busy, try again later").
+export function callerRecheckOn(env: Record<string, string | undefined> = process.env): boolean {
+  return env.CALLER_RECHECK !== '0';
+}
+let callerUnknownWarned = false;
 export async function makeCaller(provider: ethers.JsonRpcProvider): Promise<{ callMany: CallMany; multicall: boolean }> {
-  let multicall = false;
-  try { multicall = (await provider.getCode(MULTICALL3)).length > 2; } catch { /* treat as absent */ }
+  let state: 'yes' | 'no' | 'unknown' = 'unknown';
+  // (Read through a function: the state changes inside detect().)
+  const now = (): 'yes' | 'no' | 'unknown' => state;
+  const detect = async () => {
+    try { state = (await provider.getCode(MULTICALL3)).length > 2 ? 'yes' : 'no'; } catch { /* node trouble: still unknown */ }
+  };
+  await detect();
+  if (now() === 'unknown') {
+    if (!callerRecheckOn()) state = 'no'; // old behaviour: treat as absent for good
+    else if (!callerUnknownWarned) { callerUnknownWarned = true; console.warn('[rpc] Multicall3 check failed (node trouble): will check again on next use instead of switching to one-by-one reads'); }
+  }
 
   // One eth_call with up to 2 attempts. A revert is a real answer (null).
   // Anything else after 2 tries (rate limit, timeout, network) is THROWN:
@@ -322,7 +346,8 @@ export async function makeCaller(provider: ethers.JsonRpcProvider): Promise<{ ca
     throw last;
   };
 
-  if (multicall) {
+  let mcMany: CallMany;
+  {
     const CHUNK = 400; // reads per request
     // One bundle. If the node rejects it as too big (revert / out of gas),
     // split it in half and try each half: a few requests, never hundreds.
@@ -339,7 +364,7 @@ export async function makeCaller(provider: ethers.JsonRpcProvider): Promise<{ ca
       const mid = Math.ceil(slice.length / 2);
       return [...(await bundle(slice.slice(0, mid))), ...(await bundle(slice.slice(mid)))];
     };
-    const callMany: CallMany = async (calls) => {
+    mcMany = async (calls) => {
       const out: (string | null)[] = [];
       for (let i = 0; i < calls.length; i += CHUNK) {
         // Between bundles, let the rest of the bot run (trades, feed messages)
@@ -351,11 +376,10 @@ export async function makeCaller(provider: ethers.JsonRpcProvider): Promise<{ ca
       }
       return out;
     };
-    return { callMany, multicall };
   }
 
   // No Multicall3: 6 calls at a time.
-  const callMany: CallMany = async (calls) => {
+  const singleMany: CallMany = async (calls) => {
     const out: (string | null)[] = new Array(calls.length).fill(null);
     for (let i = 0; i < calls.length; i += 6) {
       const res = await Promise.all(calls.slice(i, i + 6).map(rawCall));
@@ -363,7 +387,14 @@ export async function makeCaller(provider: ethers.JsonRpcProvider): Promise<{ ca
     }
     return out;
   };
-  return { callMany, multicall };
+  const callMany: CallMany = async (calls) => {
+    if (now() === 'unknown') {
+      await detect();
+      if (now() === 'unknown') throw new Error('Multicall3 check failed (node trouble): try again later');
+    }
+    return now() === 'yes' ? mcMany(calls) : singleMany(calls);
+  };
+  return { callMany, multicall: now() === 'yes' };
 }
 
 const decodeAddr = (ret: string | null): string | null => {
