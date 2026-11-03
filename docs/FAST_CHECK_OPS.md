@@ -40,6 +40,20 @@ builds it:
      untouched. Telegram: `⚠️ FAST CHECK PROBLEM` (once).
 3. A merge that doesn't touch `sim/` keeps the same fingerprint: nothing happens.
 
+**Deploy waits for the program (Nov 3).** A new commit that changes `sim/`
+is no longer pulled right away. `auto-deploy.sh` first runs
+`arbsim-update.sh --prefetch <new sim fingerprint>`, which downloads and
+checks GitHub's build into `bin/.arbsim-staged/` without touching the running
+sidecar. Until it is ready, the deploy just waits (log: `waiting for its
+arbsim program`, status page: `(waiting for its arbsim build)`), and the bot
+and the old arbsim keep running as they are. Once it is ready, the deploy
+runs as usual and arbsim swaps to the staged program with one quick restart
+right before the bot restarts (no download at that point). The wait is
+limited by `ARBSIM_DEPLOY_WAIT_MIN` in `.env` (default 30 min). After that
+it deploys the old way and Telegram says `ARBSIM BUILD LATE`.
+`ARBSIM_DEPLOY_WAIT_MIN=0` turns the wait off (old behavior: the sidecar is
+stopped until the build arrives). The wait start is in `deploy/.arbsim-wait`.
+
 **Deploy lock is unchanged.** While live, merges are not deployed, so the
 deployed `sim/` doesn't change, so the sidecar program doesn't change either
 (a newer build on GitHub just waits). It only changes when the bot's code is

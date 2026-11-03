@@ -117,12 +117,30 @@ wait_for_no_inflight() {
   return 0
 }
 
+# arbsim_wait_decision PREFETCH_RC NOW FIRST_SEEN WAIT_MIN -> one word:
+#   go       deploy now (the new arbsim program is staged, or no wait needed)
+#   wait     not ready yet: don't pull, try again in 2 minutes (the bot and
+#            the old arbsim keep running untouched)
+#   timeout  waited WAIT_MIN minutes: deploy the old way (the sidecar is off
+#            until GitHub's build is ready, the bot uses the node meanwhile)
+# PREFETCH_RC is arbsim-update.sh --prefetch's exit code (0 ready, 21 no need
+# to wait, 20 not built yet, other = a problem). FIRST_SEEN is when the wait
+# began (epoch seconds; empty = it begins now). WAIT_MIN 0 = never wait.
+arbsim_wait_decision() {
+  local rc="$1" now="$2" first="$3" wait_min="$4"
+  case "$wait_min" in ''|*[!0-9]*) wait_min=30 ;; esac
+  if [ "$wait_min" = 0 ] || [ "$rc" = 0 ] || [ "$rc" = 21 ]; then echo go; return 0; fi
+  case "$first" in ''|*[!0-9]*) echo wait; return 0 ;; esac
+  if [ $((now - first)) -ge $((wait_min * 60)) ]; then echo timeout; else echo wait; fi
+}
+
 # The test loads only the helpers above, then stops here.
 if [ "${AUTO_DEPLOY_FUNCTIONS_ONLY:-0}" = 1 ]; then return 0 2>/dev/null || exit 0; fi
 
 PENDING_FILE="$APP_DIR/data/deploy-pending.txt"
 INFLIGHT_FILE="$APP_DIR/data/inflight.json"
 ALLOW_FILE="$APP_DIR/DEPLOY_ALLOW_LIVE"
+ARBSIM_WAIT_FILE="$SCRIPT_DIR/.arbsim-wait"   # when the wait for arbsim began
 LIVE=0        # 1 = deploying while live (owner override)
 RESTARTED=0   # 1 = the new version has been started
 
@@ -211,7 +229,7 @@ $(html "$1")"
 # the NEXT commit to restart the live bot without the owner asking again.
 mark_failed() {
   echo "$1" > "$FAILED_SHA_FILE"
-  rm -f "$ALLOW_FILE" "$PENDING_FILE"
+  rm -f "$ALLOW_FILE" "$PENDING_FILE" "$ARBSIM_WAIT_FILE"
 }
 
 # --- Fast-check sidecar (arbsim) ---------------------------------------------
@@ -287,6 +305,47 @@ To deploy it: <code>touch DEPLOY_ALLOW_LIVE</code> in the bot folder, or <code>b
     ;;
   *) ;;   # practice: deploy exactly as always
 esac
+
+# --- 1c. Rust code changed? Get its arbsim program ready FIRST ------------------
+# (Nov 3) Before: the server pulled a commit that changes sim/ right away,
+# and arbsim-pm2.sh then STOPPED the sidecar until GitHub's build of the new
+# sim/ code was ready (6-8 minutes blind; the big catch-up afterwards pushed
+# arbsim to ~2.9 GB on Nov 2). Now: nothing is pulled until that build is
+# downloaded, checked and staged (arbsim-update.sh --prefetch). Meanwhile
+# the bot AND the old arbsim keep running untouched; the deploy then swaps
+# arbsim with one quick restart. At most ARBSIM_DEPLOY_WAIT_MIN minutes
+# [.env, default 30]; after that it deploys the old way (Telegram says so).
+# ARBSIM_DEPLOY_WAIT_MIN=0 = the old behaviour (never wait).
+NEW_SIM_TREE="$(git rev-parse --verify --quiet "$REMOTE_SHA:sim" 2>/dev/null || true)"
+CUR_SIM_TREE="$(git rev-parse --verify --quiet "HEAD:sim" 2>/dev/null || true)"
+ARBSIM_WAIT_MIN="$(env_file_value "$APP_DIR/.env" ARBSIM_DEPLOY_WAIT_MIN)"
+case "$ARBSIM_WAIT_MIN" in ''|*[!0-9]*) ARBSIM_WAIT_MIN=30 ;; esac
+if [ -n "$NEW_SIM_TREE" ] && [ "$NEW_SIM_TREE" != "$CUR_SIM_TREE" ] && [ "$ARBSIM_WAIT_MIN" != 0 ] \
+   && [ -f "$SCRIPT_DIR/arbsim-update.sh" ]; then
+  APP_DIR="$APP_DIR" timeout 300 bash "$SCRIPT_DIR/arbsim-update.sh" --prefetch "$NEW_SIM_TREE" 9>&-; PF_RC=$?
+  WAIT_FIRST="$(awk '{print $1; exit}' "$ARBSIM_WAIT_FILE" 2>/dev/null || true)"
+  NOW_S="$(date +%s)"
+  case "$(arbsim_wait_decision "$PF_RC" "$NOW_S" "$WAIT_FIRST" "$ARBSIM_WAIT_MIN")" in
+    wait)
+      if [ -z "$WAIT_FIRST" ]; then
+        printf '%s %s\n' "$NOW_S" "$SHORT" > "$ARBSIM_WAIT_FILE"
+        log "New commit $SHORT changes sim/: waiting for its arbsim program from GitHub before deploying (up to $ARBSIM_WAIT_MIN min); the bot and the old arbsim keep running"
+        mkdir -p "$(dirname "$PENDING_FILE")" && printf '%s\n' "$SHORT $SUBJECT (waiting for its arbsim build)" > "$PENDING_FILE"
+      fi
+      exit 0 ;;
+    timeout)
+      notify "⚠️ <b>ARBSIM BUILD LATE</b> <code>${SHORT}</code>
+Its arbsim program was not ready after ${ARBSIM_WAIT_MIN} min: deploying the old way (the sidecar is off until the build is ready; the bot uses the node meanwhile)."
+      rm -f "$ARBSIM_WAIT_FILE" ;;
+    *)
+      if [ -n "$WAIT_FIRST" ]; then
+        log "arbsim program for $SHORT ready after $((NOW_S - WAIT_FIRST)) s of waiting: deploying (quick arbsim swap)"
+      fi
+      rm -f "$ARBSIM_WAIT_FILE" ;;
+  esac
+else
+  rm -f "$ARBSIM_WAIT_FILE"
+fi
 
 log "New commit found: $SHORT $SUBJECT"
 
