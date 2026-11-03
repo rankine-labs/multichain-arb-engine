@@ -189,6 +189,15 @@ pub fn follow_flag(name: &str) -> bool {
     std::env::var(name).map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "on" | "true" | "yes")).unwrap_or(false)
 }
 
+/// (Nov 3) ARBSIM_COPY2_OUTSIDE_SETTLE [on]: the outside contracts of a
+/// hooked V4 / Slipstream pool (watched accounts, the gauge) are part of the
+/// "reports may be missing" checks (header bloom) and of the node log reads
+/// that fill them in (settle, catch-up). "0" / "off" / "false" / "no" =
+/// the old way (only the pools' own reports and coin transfers).
+pub fn outside_settle_on() -> bool {
+    std::env::var("ARBSIM_COPY2_OUTSIDE_SETTLE").map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "off" | "false" | "no")).unwrap_or(true)
+}
+
 /// (Nov 2) Why the copy refuses this pool kind right now (its flag is off),
 /// or None when it may be followed. The bot only sends these kinds when the
 /// same flags are on in .env (one .env for both); this is the second lock.
@@ -1980,6 +1989,9 @@ impl Copy2Handle {
                         "address": to_hex(e.pool.address.as_slice()),
                         "v4Id": e.pool.v4_id.map(|i| format!("{i}")),
                         "kind": kind_name(e.pool.kind),
+                        // (Nov 3) For the drift checker: a V4 pool with a hook, its tick spacing.
+                        "hooked": e.pool.is_hooked_v4(),
+                        "tickSpacing": e.pool.tick_spacing,
                         "state": state_name(e.state),
                         "reason": if e.state == PoolState::Ready { Value::Null } else { json!(e.reason) },
                         "events": e.events,
@@ -5446,12 +5458,24 @@ impl Intake {
                 }
             }
             if let Some(bloom) = &m.bloom {
+                let outside = outside_settle_on();
+                // Contracts that did report something in this message.
+                let got_from: HashSet<Address> = m.logs.iter().filter(|l| !l.removed).map(|l| l.address).collect();
                 for (k, e) in &reg.pools {
                     let hit_own = match e.pool.v4_id {
                         Some(id) => in_bloom(bloom, id.as_slice()),
                         None => in_bloom(bloom, e.pool.address.as_slice()),
                     };
                     if hit_own && !own.contains(k) {
+                        sus.insert(*k);
+                    }
+                    // (Nov 3, ARBSIM_COPY2_OUTSIDE_SETTLE) An outside contract
+                    // of this pool (gauge, fee module, factory, voter, hook)
+                    // may have an event in this block that did not come:
+                    // the block is read back from the node (settle). Shared
+                    // contracts (one factory for all UP CL pools) mark every
+                    // pool using them; a bloom false hit costs one log read.
+                    if outside && e.pool.watch.iter().chain(e.pool.reload_on.iter()).any(|a| in_bloom(bloom, a.as_slice()) && !got_from.contains(a)) {
                         sus.insert(*k);
                     }
                     if e.pool.v4_id.is_none() {
@@ -5586,10 +5610,16 @@ impl Intake {
             }
         }
         // Keep only reports about our pools (the filters can match more).
+        let outside = outside_settle_on();
         for (b, mut ls) in by_block {
             ls.retain(|l| !self.pool_keys_for(l).is_empty() || coin_transfer(l).is_some_and(|(c, f, t, _)| {
                 let reg = self.c2.reg.read().unwrap();
                 reg.holders.get(&c).is_some_and(|h| h.contains(&f) || h.contains(&t))
+            }) || (outside && {
+                // (Nov 3) An event of a watched account / gauge (on_late
+                // passes it to on_outside_log: re-read / reload).
+                let reg = self.c2.reg.read().unwrap();
+                reg.watched.contains_key(&l.address) || reg.reloaders.contains_key(&l.address)
             }));
             if ls.is_empty() {
                 continue;
@@ -7903,6 +7933,18 @@ fn settle_filters(reg: &Registry, keys: &HashSet<PoolKey>) -> Vec<Value> {
                 }
             }
         }
+        // (Nov 3, ARBSIM_COPY2_OUTSIDE_SETTLE, default on) The pool's
+        // outside contracts too (Slipstream gauge / factory / fee modules /
+        // voter, a V4 hook): every event of theirs. Before, a gauge or fee
+        // module event the push feed missed was never read back here, so the
+        // pool was not reloaded / its values not re-read (silent drift).
+        if outside_settle_on() {
+            for a in e.pool.watch.iter().chain(e.pool.reload_on.iter()) {
+                if *a != Address::ZERO {
+                    addrs.push(format!("{a:#x}"));
+                }
+            }
+        }
     }
     addrs.sort();
     addrs.dedup();
@@ -8514,6 +8556,38 @@ mod settle_filter_tests {
         let v4: BTreeMap<Address, Vec<String>> = [(Address::repeat_byte(1), vec!["0x01".to_string()])].into_iter().collect();
         let f = build_settle_filters(&["0xaa".into()], &["0xbb".into()], &["0xcc".into()], &v4);
         assert_eq!(f.len(), 4);
+    }
+
+    /// (Nov 3) A Slipstream pool's gauge and watched contracts are read back
+    /// with its own reports (ARBSIM_COPY2_OUTSIDE_SETTLE, default on); the
+    /// coin-transfer filters still name only the pool itself.
+    #[test]
+    fn outside_contracts_are_in_the_settle_read() {
+        let pool = Address::repeat_byte(0x51);
+        let gauge = Address::repeat_byte(0x52);
+        let factory = Address::repeat_byte(0x53);
+        let p = TrackedPool { address: pool, kind: PoolKind::Slipstream, token0: Address::repeat_byte(0x0a), token1: Address::repeat_byte(0x0b), watch: vec![factory], reload_on: vec![gauge], ..Default::default() };
+        let mut reg = Registry::default();
+        let k: PoolKey = (pool, None);
+        reg.pools.insert(k, PoolEntry {
+            pool: p, state: PoolState::Ready, reason: String::new(), events: 0, strikes: 0, clean_events: 0, retry_at: Instant::now(),
+            owned: Vec::new(), items: HashSet::new(), accounts: HashSet::new(), verified: false, gen: 0, ready_since: 0, busy: false,
+            ever_ready: true, rounds: 0, fails: 0, walk: None, walk_busy: false, walk_retry_at: Instant::now(), walk_fails: 0,
+            walked: Vec::new(), far_zero: None, pending_from: None, base_block: 0, need_base: 0,
+        });
+        let f = settle_filters(&reg, &[k].into_iter().collect());
+        let addr_lists: Vec<Vec<String>> = f.iter().filter(|x| x.get("topics").is_none()).map(|x| x["address"].as_array().unwrap().iter().map(|a| a.as_str().unwrap().to_string()).collect()).collect();
+        assert_eq!(addr_lists.len(), 1);
+        for a in [pool, gauge, factory] {
+            assert!(addr_lists[0].contains(&format!("{a:#x}")), "missing {a:#x}");
+        }
+        // Transfer filters: topics padded with the pool only.
+        let pad = format!("0x{}{}", "0".repeat(24), &to_hex(pool.as_slice())[2..]);
+        for x in f.iter().filter(|x| x.get("topics").is_some()) {
+            let t = x["topics"].to_string();
+            assert!(t.contains(&pad));
+            assert!(!t.contains(&to_hex(gauge.as_slice())[2..]));
+        }
     }
 }
 

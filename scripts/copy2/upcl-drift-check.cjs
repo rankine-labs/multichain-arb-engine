@@ -40,6 +40,7 @@ const HOURS = Number(arg('hours', '4'));             // stop after this long
 const OUT = arg('out', path.join(os.homedir(), 'rx/upcl/drift')).replace(/^~/, os.homedir());
 const ONLY = (arg('pools', '') || '').toLowerCase().split(',').filter(Boolean);
 const ONCE = flag('once');
+const CONTROL = Number(arg('control', '3')); // plain V3 pools checked the same way (control group)
 const SOCK = process.env.ARBSIM_SOCKET || '/tmp/arbsim.sock';
 // The free public node (repo: src/config/robinhoodEndpoints.ts).
 const PUBLIC_RPC = 'https://rpc.mainnet.chain.robinhood.com';
@@ -112,22 +113,26 @@ const rpc1 = async (m, p) => { const [r] = await rpcBatch([[m, p]]); if (r.error
 // --- per pool: what to compare -------------------------------------------------
 // Slipstream pool: its own views, its factory's fee answers, the tick data
 // (bitmap word and the two ticks around the price).
-function slipCalls(p, tick) {
+// CORE (what a quote needs: price, tick, liquidity, the swap fee) and EXTRA
+// (fee / reward totals, tick data near the price). Asked separately so a value
+// copy 2 doesn't hold yet (a "miss") in the extras never hides the core answer.
+function slipCalls(p, tick, part) {
+  if (part === 'core') {
+    return [
+      ['slot0', p.address, sel('slot0()')],
+      ['liquidity', p.address, sel('liquidity()')],
+      ['stakedLiquidity', p.address, sel('stakedLiquidity()')],
+      ['fee', p.address, sel('fee()')],
+      ['unstakedFee', p.address, sel('unstakedFee()')],
+      ...(p.factory ? [['factorySwapFee', p.factory, enc('getSwapFee(address)', ['address'], [p.address])], ['factoryUnstakedFee', p.factory, enc('getUnstakedFee(address)', ['address'], [p.address])]] : []),
+    ];
+  }
   const c = [
-    ['slot0', p.address, sel('slot0()')],
-    ['liquidity', p.address, sel('liquidity()')],
-    ['stakedLiquidity', p.address, sel('stakedLiquidity()')],
     ['feeGrowth0', p.address, sel('feeGrowthGlobal0X128()')],
     ['feeGrowth1', p.address, sel('feeGrowthGlobal1X128()')],
     ['rewardGrowth', p.address, sel('rewardGrowthGlobalX128()')],
     ['rewardReserve', p.address, sel('rewardReserve()')],
-    ['fee', p.address, sel('fee()')],
-    ['unstakedFee', p.address, sel('unstakedFee()')],
   ];
-  if (p.factory) {
-    c.push(['factorySwapFee', p.factory, enc('getSwapFee(address)', ['address'], [p.address])]);
-    c.push(['factoryUnstakedFee', p.factory, enc('getUnstakedFee(address)', ['address'], [p.address])]);
-  }
   if (p.spacing && tick !== null) {
     const comp = Math.floor(tick / p.spacing);
     const lo = comp * p.spacing;
@@ -139,14 +144,15 @@ function slipCalls(p, tick) {
 }
 // Hooked V4 pool: its storage in the PoolManager (_pools[id], slot 6):
 // slot0, fee growth x2, liquidity, and the tick bitmap word around the price.
-function v4Calls(p, tick) {
+function v4Calls(p, tick, part) {
   const base = BigInt(ethers.keccak256(coder.encode(['bytes32', 'uint256'], [p.id, 6n])));
-  const slots = [0n, 1n, 2n, 3n].map((i) => ethers.toBeHex(base + i, 32));
+  if (part === 'core') return [['poolStorage', PM, enc('extsload(bytes32[])', ['bytes32[]'], [[0n, 3n].map((i) => ethers.toBeHex(base + i, 32))])]];
+  const slots = [1n, 2n].map((i) => ethers.toBeHex(base + i, 32));
   if (p.spacing && tick !== null) {
     const w = Math.floor(tick / p.spacing) >> 8;
     slots.push(ethers.keccak256(coder.encode(['int16', 'uint256'], [w, base + 5n])));
   }
-  return [['poolStorage', PM, enc('extsload(bytes32[])', ['bytes32[]'], [slots])]];
+  return [['poolStorageX', PM, enc('extsload(bytes32[])', ['bytes32[]'], [slots])]];
 }
 
 // Price gap between two sqrtPriceX96 values, in basis points of price.
@@ -166,16 +172,16 @@ function diffOf(p, names, mine, chain) {
       x.copySqrt = word(a, 0).toString(); x.chainSqrt = word(b, 0).toString();
       x.copyTick = int24(word(a, 1)); x.chainTick = int24(word(b, 1));
       x.priceGapBps = priceGapBps(word(a, 0), word(b, 0));
-    } else if (names[i] === 'poolStorage') {
+    } else if (names[i] === 'poolStorage' || names[i] === 'poolStorageX') {
       // extsload(bytes32[]) answer: offset, length, words.
       const n = Number(word(a, 1));
-      const lab = ['slot0', 'feeGrowth0', 'feeGrowth1', 'liquidity', 'bitmapWord'];
+      const lab = names[i] === 'poolStorage' ? ['slot0', 'liquidity'] : ['feeGrowth0', 'feeGrowth1', 'bitmapWord'];
       x.parts = [];
       for (let k = 0; k < n; k++) {
         const wa = word(a, 2 + k), wb = word(b, 2 + k);
         if (wa === wb) continue;
         const part = { what: lab[k], copy: '0x' + wa.toString(16), chain: '0x' + wb.toString(16) };
-        if (k === 0) {
+        if (lab[k] === 'slot0') {
           const m = (1n << 160n) - 1n;
           part.priceGapBps = priceGapBps(wa & m, wb & m);
           part.copyTick = int24(wa >> 160n); part.chainTick = int24(wb >> 160n);
@@ -222,7 +228,7 @@ async function factsOf(p) {
       const sym = async (t) => { try { return coder.decode(['string'], await rpc1('eth_call', [{ to: t, data: sel('symbol()') }, 'latest']))[0]; } catch { return '?'; } };
       if (!f.sym) f.sym = `${await sym(p.token0)}/${await sym(p.token1)}`;
     } else {
-      f.spacing = p.spacing;
+      f.spacing = p.spacing; // V4 (from the Fables list) / control V3: nothing to look up
     }
   } catch (e) { log(`facts ${p.key.slice(0, 10)} failed: ${safe(e)}`); }
   facts.set(p.key, f);
@@ -235,7 +241,7 @@ const TOPIC_NAMES = {};
 for (const s of ['Swap(address,address,int256,int256,uint160,uint128,int24)', 'Mint(address,address,int24,int24,uint128,uint256,uint256)', 'Burn(address,int24,int24,uint128,uint256,uint256)', 'Collect(address,address,int24,int24,uint128,uint128)', 'CollectFees(uint128,uint128)', 'Flash(address,address,uint256,uint256,uint256,uint256)', 'Deposit(address,uint256,uint128)', 'Withdraw(address,uint256,uint128)', 'ClaimRewards(address,uint256)', 'NotifyReward(address,uint256)', 'Transfer(address,address,uint256)', 'Swap(bytes32,address,int128,int128,uint160,uint128,int24,uint24)', 'ModifyLiquidity(bytes32,address,int24,int24,int256,bytes32)', 'Donate(bytes32,address,uint256,uint256)', 'SetCustomFee(address,uint24)', 'DistributeReward(address,address,uint256)', 'GaugeKilled(address)', 'GaugeRevived(address)']) TOPIC_NAMES[ethers.id(s)] = s.split('(')[0];
 async function eventsBefore(p, f, from, to) {
   const out = [];
-  const addrs = p.kind === 'slipstream' ? [p.address, ...(f.gauge && !/^0x0+$/.test(f.gauge) ? [f.gauge] : []), ...f.watch] : [];
+  const addrs = p.kind === 'slipstream' ? [p.address, ...(f.gauge && !/^0x0+$/.test(f.gauge) ? [f.gauge] : []), ...f.watch] : p.kind === 'v3' ? [p.address] : [];
   const reqs = [];
   if (addrs.length) reqs.push(['eth_getLogs', [{ address: addrs, fromBlock: ethers.toQuantity(from), toBlock: ethers.toQuantity(to) }]]);
   if (p.kind === 'v4') reqs.push(['eth_getLogs', [{ address: PM, topics: [null, p.id], fromBlock: ethers.toQuantity(from), toBlock: ethers.toQuantity(to) }]]);
@@ -253,11 +259,71 @@ async function eventsBefore(p, f, from, to) {
 
 // --- per pool totals ------------------------------------------------------------
 const tot = {}; // key -> {sym, kind, checks, equal, differ, copyUnknown, notReady, chainError, maxGapBps, firstDiff, lastDiff, diffWhat}
-const T = (p) => (tot[p.key] = tot[p.key] || { sym: p.sym, kind: p.kind, checks: 0, equal: 0, differ: 0, copyUnknown: 0, notReady: 0, chainError: 0, maxGapBps: 0, firstDiff: null, lastDiff: null, diffWhat: {}, unknownWhy: {}, notReadyWhy: {}, lastEqualBlock: null });
+const T = (p) => (tot[p.key] = tot[p.key] || { sym: p.sym, kind: p.kind, checks: 0, equal: 0, differ: 0, copyUnknown: 0, notReady: 0, chainError: 0, maxGapBps: 0, firstDiff: null, lastDiff: null, diffWhat: {}, unknownWhy: {}, notReadyWhy: {}, chainErrorWhy: {}, matchOffset: {}, parts: {}, lastEqualBlock: null });
 const lastTick = new Map();
 const lastEqual = new Map();
 const started = Date.now();
 let counters0 = null;
+
+// Calls for one pool and one part ('core' / 'extra'); control V3 pools: core only.
+function callsOf(p, part) {
+  const tick = lastTick.get(p.key) ?? null;
+  if (p.kind === 'slipstream') return slipCalls(p, tick, part);
+  if (p.kind === 'v4') return v4Calls(p, tick, part);
+  return part === 'core' ? [['slot0', p.address, sel('slot0()')], ['liquidity', p.address, sel('liquidity()')], ['fee', p.address, sel('fee()')]] : [];
+}
+
+// Ask copy 2 and the chain; count and log. Returns 'equal' / 'differ' /
+// 'unknown' (copy 2 had no answer) / 'chainError' / 'none' (no calls).
+async function checkPart(p, f, t, part, counters) {
+  const calls = callsOf(p, part);
+  if (!calls.length) return 'none';
+  const pt = (t.parts[part] = t.parts[part] || { equal: 0, differ: 0, copyUnknown: 0, chainError: 0 });
+  const bump = (o, w) => { o[w] = (o[w] || 0) + 1; };
+  // 1. copy 2's answer at its newest block.
+  let a;
+  try { a = await sockAsk({ type: 'call', at: { after: 'head' }, calls: calls.map(([, to, data]) => ({ to, data })) }); } catch (e) { pt.copyUnknown++; bump(t.unknownWhy, part + ' socket: ' + safe(e)); return 'unknown'; }
+  if (!a.ok) { pt.copyUnknown++; bump(t.unknownWhy, part + ' ' + String(a.unknown || 'unknown') + (a.detail ? ': ' + String(a.detail).slice(0, 40) : '')); return 'unknown'; }
+  const block = Number(BigInt(a.at.block));
+  // 2. the chain's answer at the same block (public node).
+  const res = await rpcBatch(calls.map(([, to, data]) => ['eth_call', [{ to, data }, ethers.toQuantity(block)]]));
+  const bad = res.find((r) => r.error && !/revert/i.test(JSON.stringify(r.error)));
+  if (bad) { pt.chainError++; bump(t.chainErrorWhy, safe(bad.error.message || bad.error).slice(0, 60)); return 'chainError'; }
+  const mine = a.results.map((r) => (r.success ? r.output : 'revert'));
+  const chain = res.map((r) => (r.error ? 'revert' : r.result));
+  if (part === 'core') {
+    try {
+      if (p.kind === 'v4') lastTick.set(p.key, int24(word(chain[0], 2) >> 160n));
+      else lastTick.set(p.key, int24(word(chain[0], 1)));
+    } catch {}
+  }
+  const d = diffOf(p, calls.map((c) => c[0]), mine, chain);
+  if (!d.length) { pt.equal++; if (part === 'core') { t.equal++; t.lastEqualBlock = block; lastEqual.set(p.key, block); } return 'equal'; }
+  pt.differ++;
+  if (part === 'core') { t.differ++; t.firstDiff = t.firstDiff ?? block; t.lastDiff = block; }
+  for (const x of d) bump(t.diffWhat, x.what);
+  const gap = d.map((x) => x.priceGapBps ?? (x.parts || []).map((y) => y.priceGapBps).find((v) => v != null)).find((v) => v != null);
+  if (gap != null && Math.abs(gap) > Math.abs(t.maxGapBps)) t.maxGapBps = gap;
+  // 3. Which chain block does copy 2's answer match? (B-2..B+2: tells a
+  //    one-block lag / lead apart from a real wrong value.)
+  let matchesBlock = null;
+  try {
+    const offs = [-2, -1, 1, 2];
+    const rs = await rpcBatch(offs.flatMap((o) => calls.map(([, to, data]) => ['eth_call', [{ to, data }, ethers.toQuantity(block + o)]])));
+    offs.forEach((o, i) => {
+      const c = rs.slice(i * calls.length, (i + 1) * calls.length).map((r) => (r.error ? 'revert' : r.result));
+      if (matchesBlock === null && !diffOf(p, calls.map((x) => x[0]), mine, c).length) matchesBlock = o;
+    });
+  } catch {}
+  bump(t.matchOffset, String(matchesBlock));
+  // 4. What happened just before (since the last time it was equal, max 3000 blocks).
+  const from = Math.max(block - 3000, (lastEqual.get(p.key) ?? block - 300) + 1);
+  let before = [];
+  try { before = await eventsBefore(p, f, from, block + 2); } catch (e) { before = [{ error: safe(e) }]; }
+  ev({ kind: 'differ', part, pool: p.key, sym: t.sym, poolKind: p.kind, block, matchesBlock, lastEqual: lastEqual.get(p.key) ?? null, copyEvents: p.events, diffs: d, before, counters });
+  log(`DIFF ${part} ${t.sym || ''} ${p.key.slice(0, 10)} @${block} copy=chain@${matchesBlock === null ? 'none' : (matchesBlock > 0 ? '+' : '') + matchesBlock} ${d.map((x) => x.what + (x.priceGapBps != null ? `(${x.priceGapBps}bps)` : '')).join(',')} before:${before.map((b) => (b.block - block) + b.who + ':' + b.event).slice(-6).join(' ')}`);
+  return 'differ';
+}
 
 async function round() {
   const st = await sockAsk({ type: 'status', pools: true }, 30000);
@@ -273,6 +339,11 @@ async function round() {
       pools.push({ key: String(e.v4Id).toLowerCase(), kind: 'v4', address: PM, id: String(e.v4Id).toLowerCase(), state: e.state, reason: e.reason, events: e.events, sym: h.sym, spacing: h.spacing || e.tickSpacing || null });
     }
   }
+  // Control group (--control N): N plain Uniswap V3 pools copy 2 has long
+  // followed, most events first. They should always match: if they do not,
+  // the checker (block alignment), not the UP CL logic, is wrong.
+  const v3 = c2.list.filter((e) => e.kind === 'v3' && e.state === 'ready').sort((x, y) => y.events - x.events).slice(0, CONTROL);
+  for (const e of v3) pools.push({ key: String(e.address).toLowerCase(), kind: 'v3', address: String(e.address).toLowerCase(), state: e.state, reason: e.reason, events: e.events, sym: 'control-v3' });
   const wanted = ONLY.length ? pools.filter((p) => ONLY.some((o) => p.key.startsWith(o))) : pools;
   // copy 2 counters that tell what happened (reloads by gauge, watched events, ...)
   const cn = c2.counters || {};
@@ -284,41 +355,19 @@ async function round() {
     const t = T(p);
     t.checks++;
     if (p.state !== 'ready') { t.notReady++; notReady++; const w = String(p.reason || p.state).slice(0, 80); t.notReadyWhy[w] = (t.notReadyWhy[w] || 0) + 1; continue; }
-    if (p.kind === 'slipstream' && !p.token0) {
+    if (p.kind === 'slipstream' && !p.token0 && !facts.has(p.key)) {
       try { p.token0 = '0x' + (await rpc1('eth_call', [{ to: p.address, data: sel('token0()') }, 'latest'])).slice(26); p.token1 = '0x' + (await rpc1('eth_call', [{ to: p.address, data: sel('token1()') }, 'latest'])).slice(26); } catch {}
     }
     const f = await factsOf(p);
     if (!t.sym && f.sym) t.sym = f.sym;
     p.factory = f.factory; p.spacing = p.spacing || f.spacing;
-    const calls = p.kind === 'slipstream' ? slipCalls(p, lastTick.get(p.key) ?? null) : v4Calls(p, lastTick.get(p.key) ?? null);
-    // 1. copy 2's answer at its newest block.
-    let a;
-    try { a = await sockAsk({ type: 'call', at: { after: 'head' }, calls: calls.map(([, to, data]) => ({ to, data })) }); } catch (e) { t.copyUnknown++; unknown++; t.unknownWhy['socket: ' + safe(e)] = (t.unknownWhy['socket: ' + safe(e)] || 0) + 1; continue; }
-    if (!a.ok) { const w = String(a.unknown || 'unknown') + (a.detail ? ': ' + String(a.detail).slice(0, 60) : ''); t.copyUnknown++; unknown++; t.unknownWhy[w] = (t.unknownWhy[w] || 0) + 1; continue; }
-    const block = Number(BigInt(a.at.block));
-    // 2. the chain's answer at the same block (public node).
-    const res = await rpcBatch(calls.map(([, to, data]) => ['eth_call', [{ to, data }, ethers.toQuantity(block)]]));
-    if (res.some((r) => r.error && !/revert/i.test(JSON.stringify(r.error)))) { t.chainError++; continue; }
-    const mine = a.results.map((r) => (r.success ? r.output : 'revert'));
-    const chain = res.map((r) => (r.error ? 'revert' : r.result));
-    // Remember the tick for the next round's tick-data calls.
-    try {
-      if (p.kind === 'slipstream') lastTick.set(p.key, int24(word(chain[0], 1)));
-      else lastTick.set(p.key, int24(word(chain[0], 2) >> 160n));
-    } catch {}
-    const d = diffOf(p, calls.map((c) => c[0]), mine, chain);
-    if (!d.length) { t.equal++; equal++; t.lastEqualBlock = block; lastEqual.set(p.key, block); continue; }
-    t.differ++; differ++;
-    t.firstDiff = t.firstDiff ?? block; t.lastDiff = block;
-    for (const x of d) t.diffWhat[x.what] = (t.diffWhat[x.what] || 0) + 1;
-    const gap = d.map((x) => x.priceGapBps ?? (x.parts || []).map((y) => y.priceGapBps).find((v) => v != null)).find((v) => v != null);
-    if (gap != null && Math.abs(gap) > Math.abs(t.maxGapBps)) t.maxGapBps = gap;
-    // 3. what happened just before (since the last time it was equal, max 3000 blocks).
-    const from = Math.max(block - 3000, (lastEqual.get(p.key) ?? block - 300) + 1);
-    let before = [];
-    try { before = await eventsBefore(p, f, from, block); } catch (e) { before = [{ error: safe(e) }]; }
-    ev({ kind: 'differ', pool: p.key, sym: t.sym, poolKind: p.kind, block, lastEqual: lastEqual.get(p.key) ?? null, copyEvents: p.events, diffs: d, before, counters });
-    log(`DIFF ${t.sym || ''} ${p.key.slice(0, 10)} @${block} ${d.map((x) => x.what + (x.priceGapBps != null ? `(${x.priceGapBps}bps)` : '')).join(',')} before:${before.map((b) => b.who + ':' + b.event).slice(-6).join(' ')}`);
+    for (const part of ['core', 'extra']) {
+      const r = await checkPart(p, f, t, part, counters);
+      if (part === 'core') {
+        if (r === 'equal') { equal++; } else if (r === 'differ') { differ++; } else if (r === 'unknown') { unknown++; }
+        if (r !== 'equal') break; // extras only when the core matched
+      }
+    }
   }
   counters0 = counters0 || counters;
   ev({ kind: 'round', block: c2.lastBlock, pools: wanted.length, equal, differ, unknown, notReady, counters, byKind: c2.byKind });
