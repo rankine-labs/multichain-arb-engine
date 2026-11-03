@@ -1,4 +1,4 @@
-import { exactHopOut, realisticHopOut, hopFeePips, hopWalks, LoopFinder, LoopEnv, maxLoopInput } from '../core/loopFinder';
+import { exactHopOut, realisticHopOut, hopFeePips, hopWalks, LoopFinder, LoopEnv, maxLoopInput, inBandMaxIn } from '../core/loopFinder';
 import { clAmountOut } from '../core/venueMath';
 import { tickBook, loopTickMathOn } from '../core/tickWindow';
 import { v4SwapFeePips, TickWindow } from '../core/tickMath';
@@ -104,6 +104,18 @@ assert(loopTickMathOn({}) && !loopTickMathOn({ LOOP_TICK_MATH: '0' }) && !loopTi
   assert(newR === 991518088464827990n, 'deep SNDK pool $1,100: new loop hop = quoter exactly (old one was 0.1% too high: no protocol fee)');
   const capOld = withLoopFlag('0', () => maxLoopInput([deep], [{ poolKey: deep.poolAddress, tokenIn: USDG, tokenOut: SNDK, inIsA: true }]));
   const capNew = maxLoopInput([deep], [{ poolKey: deep.poolAddress, tokenIn: USDG, tokenOut: SNDK, inIsA: true }], { walked: true });
+  // A loaded window whose tick data disagrees with the pool (the walk refuses):
+  // the hop must fall back to the old maths WITH its band limit, never unbounded.
+  {
+    const bad = { ...deep, poolAddress: '0x' + 'bd'.repeat(32) };
+    const w = winOf(R('0x2707cb88'));
+    tickBook.put(bad.poolAddress, { ...w, ticks: w.ticks.map((e) => (e.tick === 206200 ? { tick: 206200, liquidityNet: BigInt(R('0x2707cb88').L) * 2n } : e)) }, R('0x2707cb88').protocolFee);
+    const big = 10_000_000_000n; // $10,000: past the band edge (about $4,934)
+    const maxIn = BigInt(Math.floor(inBandMaxIn(bad, true)!));
+    const want = clAmountOut(bad.sqrtPriceX96!, bad.liquidity!, big < maxIn ? big : maxIn, true, 10990).amountOut;
+    const got = realisticHopOut(bad, true, big);
+    assert(got === want, `walk refuses (bad tick data): hop falls back to the band-limited old maths + protocol fee (${got} = ${want})`);
+  }
   assert(capNew === Infinity && Number.isFinite(capOld), `exact check size limit: band edge before ($${(capOld / 1e6).toFixed(0)}), none for a walked hop now (real balance / depth caps still apply)`);
 }
 

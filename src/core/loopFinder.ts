@@ -357,10 +357,17 @@ export function realOutCap(p: PoolState, inIsA: boolean): bigint | undefined {
 //   - the output is capped at the pool's real balance of that coin.
 // For a size inside both limits this is exactly exactHopOut.
 export function realisticHopOut(p: PoolState, inIsA: boolean, amountIn: bigint): bigint {
-  let a = amountIn;
   // A walked hop is exact past the band edge (and gives nothing for input
-  // the loaded ranges can't take), so it needs no band limit.
-  const maxIn = hopWalks(p) ? null : inBandMaxIn(p, inIsA);
+  // the loaded ranges can't take), so it needs no band limit. Only when the
+  // walk really gave the number: a walk that refuses (tick data disagrees
+  // with the pool) falls back to the old maths WITH its band limit.
+  const walked = tickHopOut(p, inIsA, amountIn);
+  if (walked !== undefined) {
+    const real = realOutCap(p, inIsA);
+    return real !== undefined && walked > real ? real : walked;
+  }
+  let a = amountIn;
+  const maxIn = inBandMaxIn(p, inIsA);
   if (maxIn !== null) {
     const m = BigInt(Math.max(0, Math.floor(maxIn)));
     if (a > m) a = m;
