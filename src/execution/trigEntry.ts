@@ -987,6 +987,9 @@ export type EntryDeps = {
   // pools, ranked and capped at `limit` BEFORE anything is built (host:
   // precomputed loop index, execution/trigEntryLoops.ts). Not given = none.
   loopCandidatesFor?: (poolKeys: string[], limit: number) => { cands: EntryCandidate[]; found: number };
+  // POOL_SUB_FILTER (core/poolSubFilter.ts): the trigger's pools and every
+  // candidate route's pools, so the push feed keeps them. Missing = not reported.
+  noteUsed?: (poolKeys: string[]) => void;
   // Extra safeguards for a loop send (loop loss cap, loop size limit, a loop
   // on these pools in flight, ...). null = fine. Not given = loops never sent.
   loopGate?: (p: EntryPick) => string | null;
@@ -1406,6 +1409,7 @@ export class TrigEntry {
       } catch { h.loopErrors++; }
     }
     for (const c of cands) h.kind[kindOf(c)].built++;
+    if (this.d.noteUsed) { try { this.d.noteUsed(pools); for (const c of cands) this.d.noteUsed(c.keys); } catch { /* reporting only */ } }
     hops.built = rel(performance.now());
     rec.candidates = cands.length;
     if (!cands.length) { rec.unknown = 'no_candidates'; unknown('no_candidates'); this.finishHops(rec, T); this.finish(rec); return rec; }

@@ -109,3 +109,32 @@ BLOCK_READER_WSS=wss://robinhood-mainnet.core.chainstack.com/ws/YOUR_KEY
 - `BLOCK_READER_WSS_FILTER` (default on): the WebSocket only pushes events from our own pools plus the V4 PoolManager, not every pool on the chain. Paid providers bill each pushed message, so this keeps the bill small. When the watch list changes, the subscription is renewed at most every 10 minutes. Set `BLOCK_READER_WSS_FILTER=0` to get every pool.
 - `BLOCK_READER_WSS_DAILY` (default 400000): after this many pushed messages in a UTC day, the WebSocket switches off and the normal poll reader takes over until midnight UTC (8 pm Toronto). `0` means no cap.
 - Saved Chainstack links are used automatically (src/config/envDefaults.ts): `CHAINSTACK_RPC_ROBINHOOD` becomes the practice-check node (120000/day, QuickNode as backup) and `CHAINSTACK_WSS_ROBINHOOD` becomes `BLOCK_READER_WSS`. Anything set in .env wins. `BLOCK_READER_WSS=off` keeps the WebSocket off.
+
+## Push feed pool filter (Nov 2, POOL_SUB_FILTER)
+
+Chainstack bills every event it pushes over the WebSocket. `src/core/poolSubFilter.ts`
+can leave dead / tiny watched pools out of the push subscription. A dropped pool
+is still watched and still re-priced every 5 s by the watch list; it only loses
+block-by-block pushes.
+
+Kept: every pool copy 2 follows, every pool in a trade idea / check / trigger
+chance / loop find in the last `POOL_SUB_USE_DAYS` days, every pool with
+`POOL_SUB_MIN_USD`+ (or unknown money), pools new on the watch list (first
+`POOL_SUB_NEW_GRACE_H` hours, also the warm-up), pools the sweep found busy.
+The drop list is re-checked once a day; between re-checks pools only come back.
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `POOL_SUB_FILTER` | 0 | 0 = old subscriptions (dry run line only), 1 = use the drop list |
+| `POOL_SUB_USE_DAYS` | 5 | a pool used this recently is kept |
+| `POOL_SUB_MIN_USD` | 2000 | a pool with this much money is kept |
+| `POOL_SUB_NEW_GRACE_H` | 24 | new pools kept this long |
+| `POOL_SUB_RECHECK_H` | 24 | full re-check of the drop list |
+| `POOL_SUB_SWEEP_MIN` | 10 | busy sweep (eth_getLogs over dropped pools), 0 = off |
+| `POOL_SUB_BUSY_EVENTS` | 20 | events in one sweep window that bring a pool back |
+| `POOL_SUB_SWEEP_RANGE` | 2000 | most blocks in one sweep request |
+
+State: `data/pool-sub-filter.json` (safe to delete: the next start re-learns,
+nothing dropped for the first day). Log: one `[subfilter]` line every 10 min
+(pools subscribed / dropped, re-adds, events per minute by kind, what is or
+would be saved, busiest pools). Rollback: `POOL_SUB_FILTER=0`, restart.

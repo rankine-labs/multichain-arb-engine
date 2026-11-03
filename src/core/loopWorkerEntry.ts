@@ -93,6 +93,8 @@ const askPermit = (): Promise<boolean> => new Promise((resolve) => {
 
 // ---- State ------------------------------------------------------------------
 let core: LoopWorkerCore | null = null;
+// POOL_SUB_FILTER: pools of loops found, waiting to be sent to the main thread.
+const usedPools = new Set<string>();
 let guard: LoopNodeGuard | null = null;
 let throttle: LoopNodeThrottle | null = null;
 let init: LoopWorkerInit | null = null;
@@ -177,7 +179,15 @@ function start(cfg: LoopWorkerInit): void {
     canCheckNode: () => guard!.canCheck(),
     log: (m) => log(m),
     noteGas: (pools, gasUsed) => post({ t: 'noteGas', pools, gasUsed }),
+    // POOL_SUB_FILTER: gathered here, sent at most every 30 s (one small message).
+    noteUsed: (keys) => { for (const k of keys) if (usedPools.size < 5_000) usedPools.add(k); },
   });
+  setInterval(() => {
+    if (!usedPools.size) return;
+    const pools = [...usedPools];
+    usedPools.clear();
+    post({ t: 'usedPools', pools });
+  }, 30_000).unref?.();
   hourStart = Date.now();
   // Every 15 min: the hour so far (read only), same line as before.
   setInterval(() => {

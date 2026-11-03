@@ -40,6 +40,8 @@ export interface LoopWorkerCoreDeps {
   log: (line: string) => void;
   // A practice replay said how much gas our loop used (teaches the main thread's gas model).
   noteGas: (pools: number, gasUsed: bigint) => void;
+  // POOL_SUB_FILTER: pools of loops found (missing = not reported).
+  noteUsed?: (poolKeys: string[]) => void;
   // Set the worker-wide real-balance and head-block lookups (true in the worker;
   // tests running several cores side by side may leave it off).
   installGlobals?: boolean;
@@ -107,6 +109,7 @@ export class LoopWorkerCore {
       runCheck: (trade, ctx) => deps.runCheck(trade, ctx),
       fix: init.fix,
       noteGas: (pools, gasUsed) => deps.noteGas(pools, gasUsed),
+      ...(deps.noteUsed ? { noteUsed: deps.noteUsed } : {}),
       ...(deps.coinTax ? { coinTax: deps.coinTax } : {}),
       ...(deps.liveOffer ? { liveOffer: deps.liveOffer } : {}),
       log: (m) => {
