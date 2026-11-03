@@ -222,7 +222,9 @@ import { liveLayoutOn, LiveTradeBook, WalletWatch, formatLiveTrade, formatLiveHo
 import { FailoverJsonRpcProvider } from './core/failoverRpc';
 import { LeanJsonRpcProvider } from './core/leanRpc';
 import { makeCaller } from './core/universeScan';
-import { tickBook, stockTickMathOn } from './core/tickWindow';
+import { tickBook, stockTickMathOn, loopTickMathOn } from './core/tickWindow';
+// The loop worker's tick-book counters for the 10-min [tick-math] line (set where the worker starts).
+let loopTickLine: () => string = () => '';
 import { loadNodeUsage, saveNodeUsage, nodeUsageToday, NodeBudget, budgetForUrl, callsInBody } from './core/nodeBudget';
 import { endpointLabel } from './core/endpointLabel';
 // Any-provider node settings (off unless set in .env, see docs/NODE_PROVIDERS.md).
@@ -2453,6 +2455,10 @@ if (loopWorkerOn) {
             gasUsd: (hops) => gasModel.loopUsd(hops, 0.05),
             rivalPools: () => rivalWatch.loopRoutePools(Date.now() - 24 * 3600_000),
             balance: (p, token) => realBalanceOf(p, token),
+            // TICK WINDOWS for the loop worker (Nov 2, LOOP_TICK_MATH, default on):
+            // the window this thread loaded for the pool (asking for a refresh
+            // when old or when the price left it). LOOP_TICK_MATH=0: none sent.
+            ...(loopTickMathOn() ? { tickEntry: (p: PoolState) => { tickBook.windowFor(p); return tickBook.entry(p.poolAddress); } } : {}),
             // Daily allowance of the loop node under 80% (same rule as before).
             budgetOk: () => !loopNodeBudget || loopNodeBudget.share() < 0.8,
             head: () => currentHeadBlock(),
@@ -2515,6 +2521,7 @@ if (loopWorkerOn) {
       registerSize('loop cycles', () => host.stats?.cycles ?? 0);
       registerSize('loop confirmed states', () => cache.confirmedCount());
       registerSize('loop worker pools', () => host.stats?.pools ?? 0);
+      loopTickLine = () => { const t = host.stats?.tick; return t ? ` | loop worker: windows ${t.wins}, hops walked ${t.used} (ran past window ${t.leftWindow}), fell back ${t.fellBack}` : ''; };
       registerMemNote('loop worker', () => host.stats ? `loop worker heap ${Math.round(host.stats.heapUsed / 1_048_576)} MB${host.alive ? '' : ' (restarting)'}` : null);
       // Hourly: the worker takes the hour's numbers ONCE (and starts a new
       // hour); the same "[loop] hour:" line and Telegram block as before.
@@ -2990,9 +2997,9 @@ if (stockTickMathOn()) {
       }), 2_000);
       setInterval(() => {
             const st = tickBook.stats;
-            console.log(`[tick-math] windows ${tickBook.size()} (waiting ${tickBook.pendingCount()}) | loads ${st.loads}, failed ${st.loadFails}, requests ${st.requests} | guesses walked ${st.used} (ran past window ${st.leftWindow}), fell back ${st.fellBack}`);
+            console.log(`[tick-math] windows ${tickBook.size()} (waiting ${tickBook.pendingCount()}) | loads ${st.loads}, failed ${st.loadFails}, requests ${st.requests} | guesses walked ${st.used} (ran past window ${st.leftWindow}), fell back ${st.fellBack}${loopTickLine()}`);
       }, 10 * 60_000);
-      console.log('[tick-math] ON: V3/V4 guesses walk real price ranges + V4 protocol fee (STOCK_TICK_MATH=0 to turn off)');
+      console.log(`[tick-math] ON: V3/V4 guesses walk real price ranges + V4 protocol fee (STOCK_TICK_MATH=0 to turn off); loop finder ${loopTickMathOn() ? 'ON (LOOP_TICK_MATH=0 to turn off)' : 'OFF (LOOP_TICK_MATH=0)'}`);
 } else console.log('[tick-math] OFF (STOCK_TICK_MATH=0): old single-range V3/V4 guess');
 const pricesAtDecisionRobinhood = async (traded: PoolState, peers: PoolState[]): Promise<[PoolState, PoolState[]]> => {
       const all = [traded, ...peers];

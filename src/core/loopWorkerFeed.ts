@@ -1,6 +1,7 @@
 import type { CoinTaxConfig } from './coinTax';
 import type { LoopLiveCandidate } from '../execution/loopLive';
 import type { PoolState } from './types';
+import type { Entry as TickEntry } from './tickWindow';
 import type { ConfirmedInfo } from './poolCache';
 import type { TriggerTrade, LoopFixSwitches } from './loopPrices';
 import type { LoopTraderConfig, LoopHour } from './loopTrader';
@@ -67,6 +68,9 @@ export interface LoopBatch {
   keys?: string[];             // watched pools, in order (only when the list changed)
   extraKeys?: string[] | null; // extra single loop pools (only when changed; null = feature off)
   pools: [string, PoolRec | null][]; // changed pools (null = forget it)
+  // TICK WINDOWS (Nov 2, LOOP_TICK_MATH): changed range windows of V3/V4
+  // pools, by pool key (null = forget it). Main thread's book -> worker's.
+  win?: [string, TickEntry | null][];
   notes: LoopNote[];
   droppedNotes: number;        // feed notes dropped because the worker was behind
   rivals: RivalNote[];
@@ -119,7 +123,12 @@ export type ToWorker =
   | { t: 'crash' };
 
 // Worker -> main.
-export interface WorkerStats { heapUsed: number; heapTotal: number; cycles: number; pools: number; pending: number; scans: number; lastScanMs: number }
+export interface WorkerStats {
+  heapUsed: number; heapTotal: number; cycles: number; pools: number; pending: number; scans: number; lastScanMs: number;
+  // The worker's tick book (LOOP_TICK_MATH): windows held, hops walked, walks
+  // that fell back to the old maths, walks that ran past the loaded ranges.
+  tick?: { wins: number; used: number; fellBack: number; leftWindow: number };
+}
 export type FromWorker =
   | { t: 'ready' }
   | { t: 'ack'; seq: number; digest?: string }
@@ -165,6 +174,10 @@ export interface LoopSource {
   gasUsd: (pools: number) => number;
   rivalPools: () => Set<string>;
   balance: (pool: PoolState, token: string) => bigint | undefined; // poolPrice realBalanceOf
+  // TICK WINDOWS (optional, LOOP_TICK_MATH): this pool's loaded range window
+  // in the main thread's book (tickWindow.ts), asking for a refresh when it
+  // is old. undefined = none. Missing function = feature off.
+  tickEntry?: (pool: PoolState) => TickEntry | undefined;
   budgetOk: () => boolean;
   head: () => number | null;
   bases: string[];
@@ -179,10 +192,11 @@ export interface FeederLimits {
   envEveryMs: number;          // look for changed coin facts this often (2 s)
   balEveryMs: number;          // look for changed real balances this often (10 s)
   rivalEveryMs: number;        // send the rival pool list this often (5 s)
+  winEveryMs?: number;         // look for changed tick windows this often (5 s)
 }
 export const DEFAULT_FEEDER_LIMITS: FeederLimits = {
   maxInFlight: 3, maxNotes: 5_000, maxRivals: 500, maxPoolsPerBatch: 250,
-  envEveryMs: 2_000, balEveryMs: 10_000, rivalEveryMs: 5_000,
+  envEveryMs: 2_000, balEveryMs: 10_000, rivalEveryMs: 5_000, winEveryMs: 5_000,
 };
 
 // What was last sent for one pool (references only, nothing copied).
@@ -218,6 +232,8 @@ export class MainLoopFeeder {
   private lastBalAt = -Infinity;
   private lastRivalAt = -Infinity;
   private lastRivalKey = '';
+  private lastWinAt = -Infinity;
+  private winSent = new Map<string, TickEntry>(); // pool key -> window entry last sent (by reference)
   private morePending = false;   // the last batch was a partial one: send the rest soon
   private gen = 0;               // which build last looked at a pool (finds pools that left the lists)
   private out: { m?: PoolState; c?: PoolState; e?: object } = {};
@@ -258,6 +274,7 @@ export class MainLoopFeeder {
     this.inFlight.clear();
     this.usd.clear(); this.dec.clear(); this.sym.clear(); this.trad.clear(); this.dex.clear(); this.bal.clear(); this.v3Pools.clear();
     this.lastEnvAt = -Infinity; this.lastBalAt = -Infinity; this.lastRivalAt = -Infinity; this.lastRivalKey = '';
+    this.winSent.clear(); this.lastWinAt = -Infinity;
     this.morePending = false;
     // Notes from before the restart refer to the old worker's book: start clean.
     this.notes = []; this.rivals = [];
@@ -360,6 +377,22 @@ export class MainLoopFeeder {
       if (key !== this.lastRivalKey) { this.lastRivalKey = key; env.rivalPools = list; }
     }
     if (Object.keys(env).length) batch.env = env;
+    // 4. Tick windows (LOOP_TICK_MATH): V3/V4 pools sent to the worker whose
+    //    window in the main book is new or changed (compared by reference;
+    //    the windows themselves are small: tens of range edges per pool).
+    if (s.tickEntry && now - this.lastWinAt >= (this.limits.winEveryMs ?? 5_000)) {
+      this.lastWinAt = now;
+      const win: [string, TickEntry | null][] = [];
+      for (const [k, r] of this.sent) {
+        const p = r.c ?? r.m;
+        if (!p || p.poolType !== 'v3') continue;
+        let e: TickEntry | undefined;
+        try { e = s.tickEntry(p); } catch { e = undefined; }
+        if (e && e !== this.winSent.get(k)) { this.winSent.set(k, e); win.push([k, e]); }
+      }
+      for (const k of this.winSent.keys()) if (!this.sent.has(k)) { this.winSent.delete(k); win.push([k, null]); }
+      if (win.length) batch.win = win;
+    }
     this.inFlight.add(batch.seq);
     return batch;
   }

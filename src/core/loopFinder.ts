@@ -4,6 +4,8 @@ import { clAmountOut, v2AmountOut } from './venueMath';
 import { realBalanceOf } from './poolPrice';
 import { stallFinder } from './stallFinder';
 import { drainSteps } from './chunked';
+import { tickBook, tickAwareAmountOut, loopTickMathOn } from './tickWindow';
+import { v4SwapFeePips } from './tickMath';
 
 // ============================================================================
 // LOOP FINDER -- finds 3 to 8 pool loops that end with more than they start
@@ -68,6 +70,18 @@ import { drainSteps } from './chunked';
 // never bigger than what a pool can really pay. It can miss a loop that
 // would only pay by crossing into the next band; it will no longer report
 // loops that only "pay" because of that.
+//
+// TICK-AWARE LOOPS (Nov 2, LOOP_TICK_MATH, default on; =0 = the old maths
+// above). Same fix as the 2-pool guess (#278/#280, core/tickWindow.ts): for
+// a V3/V4 hop whose nearby price ranges are loaded, the exact check walks
+// the trade range by range like the pool does (so it is exact past the band
+// edge too, and gives nothing back where the pool has no liquidity), and
+// every V4 hop is charged the V4 PROTOCOL fee (0.05-0.10% per hop on
+// Robinhood V4 pools) on top of its LP fee, in the quick check, the long
+// loop "best case" check and the exact check. The quick check keeps its
+// band-edge size limit (so it never ranks a phantom gap high). Hops without
+// a loaded window: the old in-band maths plus the protocol fee. The loop
+// worker thread gets the windows from the main thread (loopWorkerFeed.ts).
 // ============================================================================
 
 const Q96 = 2 ** 96;
@@ -174,8 +188,30 @@ export interface UpdateOutcome {
 // out(x) = g*rout*x / (rin + g*x), with g = 1 - fee.
 export interface HopCurve { rin: number; rout: number; g: number }
 
+// The full fee of one hop in pips: the LP fee, plus (LOOP_TICK_MATH on, V4
+// pool, protocol fee known from its tick window read) the V4 protocol fee.
+export function hopFeePips(p: PoolState, inIsA: boolean): number {
+  const lp = feePipsOf(p);
+  if (!p.v4 || !loopTickMathOn()) return lp;
+  const pf = tickBook.protocolFee(p);
+  return pf ? v4SwapFeePips(lp, pf, inIsA) : lp;
+}
+
+// The range-by-range walk for one V3/V4 hop (LOOP_TICK_MATH on, its window
+// loaded), or undefined = use the old in-band maths.
+export function tickHopOut(p: PoolState, inIsA: boolean, amountIn: bigint): bigint | undefined {
+  if (p.poolType !== 'v3' || !loopTickMathOn()) return undefined;
+  const r = tickAwareAmountOut(p, inIsA, amountIn, feePipsOf(p));
+  return r === undefined ? undefined : (r ?? 0n);
+}
+
+// True when this hop is priced by the walk (no band-edge limit needed).
+export function hopWalks(p: PoolState): boolean {
+  return p.poolType === 'v3' && loopTickMathOn() && tickBook.windowFor(p) !== null;
+}
+
 export function hopCurve(p: PoolState, inIsA: boolean): HopCurve | null {
-  const g = 1 - feePipsOf(p) / 1_000_000;
+  const g = 1 - hopFeePips(p, inIsA) / 1_000_000;
   let a: number, b: number;
   if (p.poolType === 'v2') {
     if (p.reserveA === undefined || p.reserveB === undefined) return null;
@@ -234,7 +270,10 @@ export function goldenMax(f: (x: number) => number, lo: number, hi: number, iter
 // Exact output of one swap, with the same integer maths the pools use.
 export function exactHopOut(p: PoolState, inIsA: boolean, amountIn: bigint): bigint {
   if (amountIn <= 0n) return 0n;
-  const fee = feePipsOf(p);
+  // TICK-AWARE (LOOP_TICK_MATH): walk the real ranges when they are loaded.
+  const walked = tickHopOut(p, inIsA, amountIn);
+  if (walked !== undefined) return walked;
+  const fee = hopFeePips(p, inIsA);
   if (p.poolType === 'v2') {
     if (p.reserveA === undefined || p.reserveB === undefined) return 0n;
     return inIsA ? v2AmountOut(amountIn, p.reserveA, p.reserveB, fee) : v2AmountOut(amountIn, p.reserveB, p.reserveA, fee);
@@ -302,7 +341,7 @@ export function inBandMaxIn(p: PoolState, inIsA: boolean): number | null {
   if (inIsA) net = L * (1 / sqrtAtTick(Math.max(MIN_TICK, lower)) - 1 / s); // price falls to `lower`
   else net = L * (sqrtAtTick(Math.min(MAX_TICK, upper)) - s);              // price rises to `upper`
   if (!(net > 0) || !Number.isFinite(net)) return 0;
-  const g = 1 - feePipsOf(p) / 1_000_000;
+  const g = 1 - hopFeePips(p, inIsA) / 1_000_000;
   return g > 0 ? net / g : 0;
 }
 
@@ -318,6 +357,15 @@ export function realOutCap(p: PoolState, inIsA: boolean): bigint | undefined {
 //   - the output is capped at the pool's real balance of that coin.
 // For a size inside both limits this is exactly exactHopOut.
 export function realisticHopOut(p: PoolState, inIsA: boolean, amountIn: bigint): bigint {
+  // A walked hop is exact past the band edge (and gives nothing for input
+  // the loaded ranges can't take), so it needs no band limit. Only when the
+  // walk really gave the number: a walk that refuses (tick data disagrees
+  // with the pool) falls back to the old maths WITH its band limit.
+  const walked = tickHopOut(p, inIsA, amountIn);
+  if (walked !== undefined) {
+    const real = realOutCap(p, inIsA);
+    return real !== undefined && walked > real ? real : walked;
+  }
   let a = amountIn;
   const maxIn = inBandMaxIn(p, inIsA);
   if (maxIn !== null) {
@@ -347,7 +395,10 @@ export function exactLoopOut(pools: PoolState[], hops: LoopHop[], amountIn: bigi
 // only: works backwards from the last hop, turning each hop's limit on its
 // output into a limit on its input with the inverse of the x*y=k curve
 // (exact for V3 inside its band), then applying that hop's own band limit.
-export function maxLoopInput(pools: PoolState[], hops: LoopHop[]): number {
+// opts.walked (exact check, LOOP_TICK_MATH): a hop priced by the range walk
+// gets no band-edge limit (the walk itself is exact past the edge). The quick
+// check leaves it out, so its sizes stay inside the current band.
+export function maxLoopInput(pools: PoolState[], hops: LoopHop[], opts: { walked?: boolean } = {}): number {
   let lim = Infinity; // most the NEXT hop may receive (= most this hop may pay out)
   for (let i = hops.length - 1; i >= 0; i--) {
     const p = pools[i], inIsA = hops[i].inIsA;
@@ -361,7 +412,7 @@ export function maxLoopInput(pools: PoolState[], hops: LoopHop[]): number {
       // Inverse of out = g*rout*x / (rin + g*x): x = rin*out / (g*(rout - out)).
       inLim = outLim >= h.rout ? Infinity : (h.rin * outLim) / (h.g * (h.rout - outLim));
     }
-    const band = inBandMaxIn(p, inIsA);
+    const band = opts.walked && hopWalks(p) ? null : inBandMaxIn(p, inIsA);
     if (band !== null) inLim = Math.min(inLim, band);
     if (!(inLim > 0)) return 0;
     lim = inLim;
@@ -672,7 +723,9 @@ export function enumerateCycles(
 // The finder (keeps the loop list between updates)
 // ----------------------------------------------------------------------------
 
-const poolSig = (p: PoolState) => `${p.sqrtPriceX96 ?? ''}:${p.liquidity ?? ''}:${p.reserveA ?? ''}:${p.reserveB ?? ''}:${p.feePips ?? p.feeBps}`;
+// (+ the V4 protocol fee once its tick window read it, so the quick-check
+// curve is rebuilt with it: LOOP_TICK_MATH.)
+const poolSig = (p: PoolState) => `${p.sqrtPriceX96 ?? ''}:${p.liquidity ?? ''}:${p.reserveA ?? ''}:${p.reserveB ?? ''}:${p.feePips ?? p.feeBps}${p.v4 ? ':' + tickBook.protocolFee(p) : ''}`;
 
 // How the last loop list rebuild went (for the hourly report and tests).
 export interface RebuildStats {
@@ -1006,7 +1059,7 @@ export class LoopFinder {
     if (!pools) return null;
     const cap = this.capRaw(c, pools);
     if (!cap) return null;
-    const hi = Math.min(cap.cap, maxLoopInput(pools, c.hops));
+    const hi = Math.min(cap.cap, maxLoopInput(pools, c.hops, { walked: true }));
     if (!(hi >= 1)) return null;
     const toBig = (x: number) => BigInt(Math.max(0, Math.floor(x)));
     const out = (a: bigint) => exactLoopOut(pools, c.hops, a, { realistic: true });
