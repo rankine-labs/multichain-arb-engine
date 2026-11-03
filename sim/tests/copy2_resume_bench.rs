@@ -569,7 +569,15 @@ fn warm_restart_forget_keeps_only_newest_versions() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let path0 = dir.join("made-up.bin").to_str().unwrap().to_string();
-    persist::save(&state(&z), &path0).unwrap();
+    // Coin settings nothing follows (every coin slot but our pools'
+    // balances): what the warm restart forgets.
+    let mut st = state(&z);
+    let mut snap = (*st.snap).clone();
+    for k in 0..600u64 {
+        snap.apply_fact(&Fact::Slot(addr(0xc0, k % 60), h("coin-setting", k), h("cs", k)));
+    }
+    st.snap = Arc::new(snap);
+    persist::save(&st, &path0).unwrap();
     let gap = 3000u64;
     let first = S + gap + 1;
     let mut results = Vec::new();

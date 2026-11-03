@@ -7399,7 +7399,8 @@ impl Intake {
             "{} at {}: caught up from block {} in {:.1} s",
             if cu.restored { "warm restart done" } else { "gap filled" },
             self.last_block.unwrap_or(0),
-            cu.applied,
+            // (slices) where the copy was when the catch-up began
+            cu.applied0,
             cu.started.elapsed().as_secs_f64()
         );
         if cu.restored {
