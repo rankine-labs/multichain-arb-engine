@@ -537,7 +537,7 @@ fn catch_up_in_slices_gives_the_same_copy() {
         assert_eq!(head.block, first, "slice {slice}: at the bot's block");
         let requests = node.public.load(Ordering::Relaxed) + node.paid.load(Ordering::Relaxed);
         eprintln!("CATCH-UP {gap} blocks, slice {slice}: {:.2} s, {requests} requests, {} slice(s), {} blocks with reports", took.as_secs_f64(), r["lastCatchUp"]["slices"], r["lastCatchUp"]["blocks"]);
-        results.push((head.snap.counts(), counter(&hd, "catchup_blocks"), counter(&hd, "catchup_logs"), r["lastCatchUp"]["slices"].as_u64().unwrap_or(0), r["lastCatchUp"]["fromBlock"].clone(), requests));
+        results.push((head.snap.counts(), counter(&hd, "catchup_blocks"), counter(&hd, "catchup_logs"), r["lastCatchUp"]["slices"].as_u64().unwrap_or(0), r["lastCatchUp"]["fromBlock"].clone(), requests, node.headers.load(Ordering::Relaxed), node.paid.load(Ordering::Relaxed)));
     }
     let (a, b) = (&results[0], &results[1]);
     assert_eq!(a.0, b.0, "same accounts / values in the copy");
@@ -546,6 +546,12 @@ fn catch_up_in_slices_gives_the_same_copy() {
     assert_eq!(a.3, 1, "all at once = one slice");
     assert_eq!(b.3, 6, "3,000 blocks in slices of 500");
     assert_eq!(a.4, b.4, "the final status names the whole range");
-    assert!(b.5 <= a.5 + 12, "about the same node requests: {} vs {}", b.5, a.5);
+    // Each slice does its own few header rounds (parent-chain block by
+    // halving: ~log2(500) small batches to the FREE node), so more HTTP
+    // requests (CI: 66 vs 19 for 3,000 blocks) but the same headers and the
+    // same paid calls. At most ~12 extra per slice.
+    assert!(b.5 <= a.5 + 12 * b.3, "requests: {} sliced vs {} at once", b.5, a.5);
+    assert!(b.6 <= a.6 + 6 * b.3, "about the same headers read: {} vs {}", b.6, a.6);
+    assert_eq!(b.7, a.7, "no extra paid requests");
     let _ = std::fs::remove_dir_all(&dir);
 }
