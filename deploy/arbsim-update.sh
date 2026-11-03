@@ -45,6 +45,21 @@
 #
 # Settings (optional): APP_DIR (bot folder), ARBSIM_BIN_BRANCH (arbsim-bin),
 # ARBSIM_REMOTE (where to download from; default = the bot's git origin).
+#
+# PREFETCH (Nov 3, "keep the old arbsim running until the new one is ready"):
+#     bash deploy/arbsim-update.sh --prefetch <sim tree>
+#   Used by auto-deploy.sh BEFORE it pulls a commit that changes sim/: gets
+#   GitHub's build for that sim/ code ready in bin/.arbsim-staged/ (download,
+#   checksum, "does it run here" check) WITHOUT touching bin/arbsim or the
+#   running sidecar. When the deploy then happens, the normal update finds
+#   the staged program and installs it with two renames and one quick pm2
+#   restart: no 6-8 minute stop waiting for GitHub any more.
+#   Exit codes:
+#     0   ready (staged, or already installed / kept as the previous one)
+#     20  GitHub has not built it yet (asks GitHub again at most once per
+#         new arbsim-bin commit; cheap to call every 2 minutes)
+#     21  no need to wait: LOCAL_SIM is off, or bin/ARBSIM_PINNED is set
+#     1   a problem with the build (bad checksum, won't run, ...)
 # ============================================================================
 {
 set -uo pipefail
@@ -57,6 +72,70 @@ STATE_FILE="$BIN_DIR/.arbsim-update-state"   # what we last saw (stops log/alert
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [arbsim] $*"; }
 
 mkdir -p "$BIN_DIR"
+
+# Where --prefetch keeps a checked program for code not deployed yet.
+STAGE_DIR="$BIN_DIR/.arbsim-staged"
+STAGE_LOOK="$BIN_DIR/.arbsim-staged.lastlook"
+
+# --- PREFETCH mode (see the header) ---------------------------------------------
+if [ "${1:-}" = "--prefetch" ]; then
+  WANT="${2:-}"
+  [ -n "$WANT" ] || { log "--prefetch needs the sim tree to get ready"; exit 1; }
+  # Nothing runs the sidecar (LOCAL_SIM off) or the owner pinned a program
+  # by hand: the deploy has nothing to wait for.
+  [ "$(local_sim_mode)" = off ] && exit 21
+  [ -f "$ARBSIM_PIN" ] && exit 21
+  # Already here: staged, installed, or kept as the previous program.
+  if [ -x "$STAGE_DIR/arbsim" ] && [ "$(info_value "$STAGE_DIR/BUILD_INFO" sim_tree)" = "$WANT" ]; then exit 0; fi
+  [ "$(installed_sim_tree)" = "$WANT" ] && exit 0
+  if [ -x "$ARBSIM_PREV" ] && [ "$(info_value "$ARBSIM_PREV_INFO" sim_tree)" = "$WANT" ]; then exit 0; fi
+  REMOTE="${ARBSIM_REMOTE:-$(git -C "$APP_DIR" remote get-url origin 2>/dev/null)}"
+  [ -n "$REMOTE" ] || exit 20
+  REMOTE_COMMIT="$(timeout 60 git ls-remote "$REMOTE" "refs/heads/$BRANCH_BIN" 2>/dev/null | cut -f1)"
+  [ -n "$REMOTE_COMMIT" ] || exit 20
+  # This exact GitHub build was already looked at for this code: no new
+  # download until GitHub publishes another build.
+  [ "$(cat "$STAGE_LOOK" 2>/dev/null || true)" = "$WANT $REMOTE_COMMIT" ] && exit 20
+  WORK="$BIN_DIR/.arbsim-pf.$$"
+  trap 'rm -rf "$WORK"' EXIT
+  rm -rf "$WORK"; mkdir -p "$WORK"
+  if ! git init --quiet --bare "$WORK/repo.git" \
+     || ! timeout 120 git -C "$WORK/repo.git" fetch --quiet --depth 1 --no-tags "$REMOTE" "refs/heads/$BRANCH_BIN" 2>/dev/null; then
+    exit 20   # network trouble: try again next run
+  fi
+  GOT="$(git -C "$WORK/repo.git" rev-parse FETCH_HEAD)"
+  git -C "$WORK/repo.git" show "$GOT:BUILD_INFO" > "$WORK/BUILD_INFO" 2>/dev/null || : > "$WORK/BUILD_INFO"
+  if [ "$(info_value "$WORK/BUILD_INFO" sim_tree)" != "$WANT" ]; then
+    printf '%s\n' "$WANT $REMOTE_COMMIT" > "$STAGE_LOOK"
+    exit 20   # GitHub is still building this version
+  fi
+  if ! git -C "$WORK/repo.git" show "$GOT:arbsim" > "$WORK/arbsim" 2>/dev/null \
+     || ! git -C "$WORK/repo.git" show "$GOT:arbsim.sha256" > "$WORK/arbsim.sha256" 2>/dev/null; then
+    printf '%s\n' "$WANT $REMOTE_COMMIT" > "$STAGE_LOOK"
+    log "PREFETCH PROBLEM: the $BRANCH_BIN build ${GOT:0:7} is missing arbsim or arbsim.sha256"
+    exit 1
+  fi
+  PF_WANT="$(awk '{print $1; exit}' "$WORK/arbsim.sha256")"
+  PF_HAVE="$(sha256sum "$WORK/arbsim" | awk '{print $1}')"
+  if [ -z "$PF_WANT" ] || [ "$PF_WANT" != "$PF_HAVE" ]; then
+    printf '%s\n' "$WANT $REMOTE_COMMIT" > "$STAGE_LOOK"
+    log "PREFETCH PROBLEM: checksum mismatch on the downloaded program (build ${GOT:0:7})"
+    exit 1
+  fi
+  chmod 755 "$WORK/arbsim"
+  if ! smoke_test "$WORK/arbsim"; then
+    printf '%s\n' "$WANT $REMOTE_COMMIT" > "$STAGE_LOOK"
+    log "PREFETCH PROBLEM: the downloaded program doesn't run on this server (build ${GOT:0:7})"
+    exit 1
+  fi
+  # Ready: replace any older staged program (renames inside bin/).
+  rm -rf "$STAGE_DIR.new"; mkdir -p "$STAGE_DIR.new"
+  mv -f "$WORK/arbsim" "$STAGE_DIR.new/arbsim" && mv -f "$WORK/BUILD_INFO" "$STAGE_DIR.new/BUILD_INFO" || exit 1
+  rm -rf "$STAGE_DIR"; mv -f "$STAGE_DIR.new" "$STAGE_DIR" || exit 1
+  rm -f "$STAGE_LOOK"
+  log "prefetched the program for sim $(short "$WANT") (build ${GOT:0:7}, checksum ok, runs here) into bin/.arbsim-staged: the running sidecar is untouched until the deploy"
+  exit 0
+fi
 
 # say_once KEY MESSAGE -> logs MESSAGE only if the situation (KEY) is new
 # since the last run. Returns 0 if it was new, 1 if already said.
@@ -127,6 +206,19 @@ if [ -x "$ARBSIM_PREV" ] && [ "$PREV_TREE" = "$DEPLOYED" ] && smoke_test "$ARBSI
     exit 10
   fi
   log "switching back to the previous program failed; trying a download instead"
+fi
+
+# --- 2b. Prefetched for this code before the deploy (--prefetch)? Install it -------
+# Two renames and one quick restart: no download now.
+if [ -x "$STAGE_DIR/arbsim" ] && [ "$(info_value "$STAGE_DIR/BUILD_INFO" sim_tree)" = "$DEPLOYED" ] && smoke_test "$STAGE_DIR/arbsim"; then
+  if install_from "$STAGE_DIR"; then
+    rm -rf "$STAGE_DIR"
+    printf '%s\n' "ok $DEPLOYED" > "$STATE_FILE"
+    log "installed the prefetched program (bin/.arbsim-staged) for sim $(short "$DEPLOYED"); previous kept as bin/arbsim.prev"
+    ensure_pm2 --restart
+    exit 10
+  fi
+  log "installing the prefetched program failed; trying a download instead"
 fi
 
 # --- 3. Look at the newest GitHub build (read-only) ---------------------------------
