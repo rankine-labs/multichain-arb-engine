@@ -236,6 +236,7 @@ import { nodeUsage as nodeUsageCounter } from './core/nodeUsage';
 import { ROBINHOOD_SEED_PAIRS } from './config/robinhoodSeedPairs';
 import { ResearchLane, researchConfigFromEnv, planShallowCandidate, findResearchGaps, gapCandidate, ResearchCandidate } from './core/researchLane';
 import { poolDepthUsd, setRealBalanceSource, thinPools, thinPoolsSteps } from './core/poolPrice';
+import { Copy2ActivePicker, copy2ActiveSettings } from './execution/copy2Active';
 // Loop trader v1 (3-5 pool loops, practice only, off unless LOOP_TRADER=1).
 import { LoopTrader, loopConfigFromEnv, LoopCheckResult, LoopTrade, buildLoopTrade } from './core/loopTrader';
 // Which node loop practice checks run on (LOOP_CHECK_NODE, default the free public node).
@@ -602,6 +603,15 @@ const poolSubDeps: PoolSubDeps = {
 const poolSub = new PoolSubFilter(poolSubSettingsFromEnv(), poolSubDeps);
 const notePoolsUsed = (keys: Iterable<string | null | undefined>): void => poolSub.noteUsed(keys);
 process.once('exit', () => poolSub.save(true));
+// COPY 2 ACTIVE POOLS (execution/copy2Active.ts, COPY2_ACTIVE_MAX; 0 = off,
+// the default): copy 2 follows only the busiest watched pairs (push-feed
+// events), so free node plans can keep it loaded. Off = every watched pool.
+const copy2Active = new Copy2ActivePicker(copy2ActiveSettings(), {
+      pairs: () => robinhoodWatcher.watchedPairPools(),
+      events: () => poolSub.recentEvents(),
+      depthUsd: (k) => { try { return poolSubDeps.depthUsd(k); } catch { return null; } },
+});
+const copy2FollowKeys = (): string[] => copy2Active.filter(copy2PoolKeys());
 // Per-node usage today (speed limits + daily allowances, core/nodeBudget.ts):
 // restored so a restart doesn't reset the counts, saved every minute.
 loadNodeUsage('data/node-usage.json');
@@ -3071,7 +3081,7 @@ localSim = createLocalSimHost(chainOn('robinhood'), {
       // pairs + loop extra pools; set by the block reader setup below), with
       // their full details from the price cache. Used only while the fast check
       // runs in pool-events mode.
-      copy2Pools: () => copy2PoolKeys().map((k) => cache.get('robinhood', k)),
+      copy2Pools: () => copy2FollowKeys().map((k) => cache.get('robinhood', k)),
       poolManager: ROBINHOOD_V4.POOL_MANAGER,
       // Copy 2 vs node disagreements: the node again, pinned at the copy's
       // block (tells "market moved" from "copy wrong"; a few an hour at most).
@@ -3268,7 +3278,7 @@ const entryLoopPoolWhy = (p: PoolState): string | null => {
 const entryLoopPoolOk = (p: PoolState): boolean => entryLoopPoolWhy(p) === null;
 const entryLoopIndex: EntryLoopIndex<PoolState> | null = entryLoopSettings.enabled && entryLoopSettings.loops && chainOn('robinhood')
       ? new EntryLoopIndex<PoolState>(loopIndexSettings(process.env), {
-            pools: () => copy2PoolKeys().map((k) => cache.get('robinhood', k)).filter((p): p is PoolState => !!p),
+            pools: () => copy2FollowKeys().map((k) => cache.get('robinhood', k)).filter((p): p is PoolState => !!p),
             startCoins: [ROBINHOOD_TOKENS.USDG, ROBINHOOD_TOKENS.WETH],
             rules: () => {
                   entryLoopTax.refresh(); // at most once a minute

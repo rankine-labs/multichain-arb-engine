@@ -193,6 +193,15 @@ export class PoolSubFilter {
     return { pools: outP, ids: outI };
   }
 
+  // (Nov 5) Pushed events per pool key in the last 10-20 minutes (this
+  // window + the previous one). Read by copy 2's active-pool pick
+  // (execution/copy2Active.ts, COPY2_ACTIVE_MAX).
+  recentEvents(): Map<string, number> {
+    const m = new Map(this.lastPerPool);
+    for (const [k, v] of this.perPool) m.set(k, (m.get(k) ?? 0) + v);
+    return m;
+  }
+
   isDropped(key: string): boolean { return this.s.on && this.drop.has(key.toLowerCase()); }
 
   // ---- the daily re-check ----------------------------------------------------
