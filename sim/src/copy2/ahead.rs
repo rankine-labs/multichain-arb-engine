@@ -351,6 +351,12 @@ pub struct AheadCfg {
     /// right / 8 wrong: no tip ("keeper_behind") until the keeper's version
     /// arrives (a keeper rebase), so it never counts as sure.
     pub need_keeper: bool,
+    /// FASTLANE_AHEAD_HORIZON [off] (Nov 5): also measure each block's
+    /// FIRST published prediction (made on the base copy 2 had then, about
+    /// 5 blocks back: what a trade decided at the tip really used) against
+    /// the settled block, besides the usual one-block-ahead agreement.
+    /// Counted on its own (status fastlaneAhead.horizon); only measures.
+    pub horizon: bool,
     /// FASTLANE_AHEAD_THIN_PENDING [on] (memory fix, Nov 1): a predicted
     /// block waiting for its agreement (FASTLANE_AHEAD_COMPARE_DELAY_BLOCKS,
     /// ~6 at a time) keeps only what agreement reads: our pool contracts'
@@ -365,7 +371,7 @@ pub struct AheadCfg {
 
 impl Default for AheadCfg {
     fn default() -> Self {
-        AheadCfg { max_blocks: 32, run_all: false, max_txs: 256, max_touchers: 4096, l2_offset: 0, trust_sender_funds: false, msg_budget_us: 10_000, routes_only: true, compare_delay: 0, revert_unsure: true, exact_revert_sure: false, unknown_continue: false, keeper: false, keep_pick: true, budget_cpu: false, lazy_rebase: false, kept_rebuild_once: false, need_keeper: false, thin_pending: true }
+        AheadCfg { max_blocks: 32, run_all: false, max_txs: 256, max_touchers: 4096, l2_offset: 0, trust_sender_funds: false, msg_budget_us: 10_000, routes_only: true, compare_delay: 0, revert_unsure: true, exact_revert_sure: false, unknown_continue: false, keeper: false, keep_pick: true, budget_cpu: false, lazy_rebase: false, kept_rebuild_once: false, need_keeper: false, thin_pending: true, horizon: false }
     }
 }
 
@@ -479,6 +485,7 @@ impl AheadCfg {
                 _ => observe,
             },
             need_keeper: on_off(get("FASTLANE_AHEAD_NEED_KEEPER").as_deref()).unwrap_or(observe),
+            horizon: on_off(get("FASTLANE_AHEAD_HORIZON").as_deref()).unwrap_or(false),
             // Memory fix (Nov 1): on in every mode (agreement only measures;
             // its answers are the same either way).
             thin_pending: on_off(get("FASTLANE_AHEAD_THIN_PENDING").as_deref()).unwrap_or(d.thin_pending),
@@ -1575,6 +1582,13 @@ pub struct Ahead {
     pub oracle: Option<super::keeper_replay::Oracle>,
     pub hour: AheadStats,
     pub total: AheadStats,
+    /// FASTLANE_AHEAD_HORIZON: each block's first published prediction and
+    /// how many blocks ahead of its base it was, waiting for agreement.
+    hz_first: BTreeMap<u64, (u64, Pending)>,
+    /// FASTLANE_AHEAD_HORIZON: counters go to hz_hour / hz_total while true.
+    hz_mode: bool,
+    pub hz_hour: AheadStats,
+    pub hz_total: AheadStats,
     /// FASTLANE_AHEAD_THIN_PENDING: the newest thin view and the pool set
     /// it was built for (the next one is built on it: shared entries).
     thin_prev: Option<(Arc<PoolSet>, Arc<Snapshot>)>,
@@ -1612,6 +1626,10 @@ impl Ahead {
             oracle: None,
             hour: AheadStats::default(),
             total: AheadStats::default(),
+            hz_first: BTreeMap::new(),
+            hz_mode: false,
+            hz_hour: AheadStats::default(),
+            hz_total: AheadStats::default(),
             thin_prev: None,
             mem_pause: false,
             merges: 0,
@@ -1870,8 +1888,49 @@ impl Ahead {
     }
 
     fn count(&mut self, f: impl Fn(&mut AheadStats)) {
+        if self.hz_mode {
+            f(&mut self.hz_hour);
+            f(&mut self.hz_total);
+            return;
+        }
         f(&mut self.hour);
         f(&mut self.total);
+    }
+
+    /// FASTLANE_AHEAD_HORIZON: first predictions whose turn has come (the
+    /// confirmed head is FASTLANE_AHEAD_COMPARE_DELAY_BLOCKS past them),
+    /// taken out: (pool set, pools it moved, seq) for `settled_from`.
+    pub fn horizon_due(&mut self, head_seq: u64) -> Vec<u64> {
+        let d = self.cfg.compare_delay;
+        self.hz_first.keys().copied().filter(|s| s.saturating_add(d) <= head_seq).collect()
+    }
+
+    /// What `settled_from` needs for a waiting first prediction.
+    pub fn horizon_parts(&self, seq: u64) -> Option<(Arc<PoolSet>, Vec<String>)> {
+        self.hz_first.get(&seq).map(|(_, p)| {
+            let mut k: Vec<String> = p.changed_cum.iter().cloned().collect();
+            k.sort();
+            (p.pools.clone(), k)
+        })
+    }
+
+    /// Drop a waiting first prediction (copy 2 no longer holds its versions).
+    pub fn horizon_drop(&mut self, seq: u64) {
+        self.hz_first.remove(&seq);
+    }
+
+    /// Agreement of block `st.seq`'s FIRST published prediction, counted in
+    /// hz_hour / hz_total (blocksAhead there = how far ahead of its base it
+    /// was). Same rules as the normal agreement; no samples, no diagnostics.
+    pub fn compare_horizon(&mut self, st: &Settled, moved_by_tx: &dyn Fn(&B256) -> Option<Vec<String>>) -> bool {
+        let Some((depth, p)) = self.hz_first.remove(&st.seq) else { return false };
+        let diag = self.diag.take();
+        self.hz_mode = true;
+        self.count(|s| s.add_ahead(depth));
+        self.agreement(&p, st, moved_by_tx);
+        self.hz_mode = false;
+        self.diag = diag;
+        true
     }
 
     fn learn_toucher(&mut self, a: Address, pools: &[String]) {
@@ -2235,7 +2294,9 @@ impl Ahead {
             }
             // The base we predicted on was corrected later for this pool:
             // the base's miss (late reports), not the run's.
-            let stale = st.prev.get(k).is_some_and(|pv| place_vals(place, &p.base_snap) != *pv);
+            // (Horizon mode: the base is several blocks older on purpose, so
+            // "stale base" is not a label there.)
+            let stale = !self.hz_mode && st.prev.get(k).is_some_and(|pv| place_vals(place, &p.base_snap) != *pv);
             self.count(|s| {
                 s.disagree += 1;
                 if kept {
@@ -2261,6 +2322,9 @@ impl Ahead {
                     s.missed += 1;
                 }
             });
+            if self.hz_mode {
+                continue;
+            }
             let sm = self.sample(p, st, k, if stale { "staleBase" } else { kind }, kind, by, &diffs, block);
             self.add_sample(sm);
         }
@@ -2393,6 +2457,36 @@ impl Ahead {
             (Some(e), Some(n)) if e.seq == n => Some(Arc::new(self.tip_of(e, &base))),
             _ => None,
         };
+        // FASTLANE_AHEAD_HORIZON: keep the FIRST published prediction of
+        // this block (later rebuilds on newer bases are not what a trade
+        // decided at the tip used). Bounded: the 64 newest.
+        if self.cfg.horizon && self.tip.is_some() {
+            if let Some(e) = self.entries.back() {
+                if !self.hz_first.contains_key(&e.seq) {
+                    let snap = if self.cfg.thin_pending {
+                        let prev = self.thin_prev.as_ref().filter(|(p, _)| Arc::ptr_eq(p, &self.pools)).map(|(_, s)| s.as_ref());
+                        Arc::new(thin_for_agreement_from(&e.snap, &self.pools, prev))
+                    } else {
+                        e.snap.clone()
+                    };
+                    let p = Pending {
+                        seq: e.seq,
+                        base_snap: base.snap.clone(),
+                        snap,
+                        changed_cum: e.changed_cum.clone(),
+                        unsure_cum: e.unsure_cum.clone(),
+                        notes: Vec::new(),
+                        pools: self.pools.clone(),
+                        base_kept: e.base_kept,
+                    };
+                    let depth = e.seq.saturating_sub(base.seq);
+                    self.hz_first.insert(e.seq, (depth, p));
+                    while self.hz_first.len() > 64 {
+                        self.hz_first.pop_first();
+                    }
+                }
+            }
+        }
     }
 
     /// Which of our pools a transaction we can't vouch for may touch (one we
@@ -3501,6 +3595,17 @@ fn run_loop(c2: super::intake::Copy2Handle, cfg: AheadCfg, rx: Receiver<Ev>) {
                     c.written.insert(seq);
                 }
             }
+            // FASTLANE_AHEAD_HORIZON: the first published predictions.
+            for seq in a.horizon_due(h.seq) {
+                let Some((pools, keys)) = a.horizon_parts(seq) else { continue };
+                match settled_from(&pv, &pools, seq, &keys, None) {
+                    Some(st) => {
+                        let rm = &c2.c2.recent_moves;
+                        a.compare_horizon(&st, &|h| rm.lock().ok().and_then(|r| r.pools_of(h)));
+                    }
+                    None => a.horizon_drop(seq),
+                }
+            }
             // Capture: EVERY captured block gets its settled values (also
             // blocks the live prediction did not compare), for the replay.
             if let Some(c) = cap.as_mut().filter(|c| c.on()) {
@@ -3579,6 +3684,7 @@ fn run_loop(c2: super::intake::Copy2Handle, cfg: AheadCfg, rx: Receiver<Ev>) {
             hour_start = Instant::now();
             eprintln!("{}", a.hour.line());
             a.hour = AheadStats::default();
+            a.hz_hour = AheadStats::default();
         }
     }
 }
@@ -3596,6 +3702,9 @@ fn status_of(a: &Ahead) -> Value {
         // blocksAhead = per feed message, how many blocks the tip was ahead
         // of copy 2 (0 = no tip). Hour and since start.
         "accuracy": {"hour": accuracy_json(&a.hour, true), "total": accuracy_json(&a.total, false)},
+        // FASTLANE_AHEAD_HORIZON: the same, for each block's FIRST published
+        // prediction (blocksAhead = how far ahead of its base it was).
+        "horizon": if a.cfg.horizon { json!({"hour": accuracy_json(&a.hz_hour, true), "total": accuracy_json(&a.hz_total, true), "waiting": a.hz_first.len()}) } else { Value::Null },
         // KEEPER (copy2/keeper.rs): is the base laid over with the keeper's
         // values of the same block right now; its own section: fastlaneKeeper.
         "keeper": {"on": a.cfg.keeper, "baseMerged": a.merged.as_ref().is_some_and(|m| Some(m.seq) == a.base.as_ref().map(|b| b.seq)),

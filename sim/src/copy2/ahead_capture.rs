@@ -438,6 +438,8 @@ fn dec_cfg(d: &mut Dec) -> Res<AheadCfg> {
         budget_cpu: false,
         lazy_rebase: false,
         kept_rebuild_once: false,
+        // Not in the file: live measurement only (Nov 5).
+        horizon: false,
         need_keeper: false,
         // Not in the file: memory fix (Nov 1); same answers either way.
         thin_pending: true,
