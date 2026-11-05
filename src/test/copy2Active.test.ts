@@ -1,7 +1,7 @@
 import { mkdtempSync, existsSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { Copy2ActivePicker, copy2ActiveSettings } from '../execution/copy2Active';
+import { Copy2ActivePicker, copy2ActiveSettings, feedActiveOnly } from '../execution/copy2Active';
 
 // COPY 2 ACTIVE POOLS (COPY2_ACTIVE_MAX, Nov 5): copy 2 follows only the
 // busiest watched pairs. Fake clock, temp file, no network.
@@ -65,3 +65,19 @@ assert(p4.last?.from === 'money', 'a saved list older than 24 h is ignored');
 // A failing dependency never breaks copy 2: every pool.
 const bad = new Copy2ActivePicker(copy2ActiveSettings({ COPY2_ACTIVE_MAX: '3' }), { pairs: () => { throw new Error('boom'); }, events: () => events, depthUsd: () => null, log: () => {} });
 assert(bad.filter(keys).join() === keys.join(), 'an error in the pick falls back to every pool');
+
+// PUSH FEED ONLY COPY 2'S POOLS (COPY2_FEED_ACTIVE_ONLY).
+const inner = { apply: (p: readonly string[], i: Iterable<string>) => ({ pools: [...p], ids: [...i] }) };
+const all = ['0xa1', '0xb1', '0xc1'], ids = ['0x' + '1'.repeat(64), '0x' + '2'.repeat(64)];
+let c2 = new Set<string>(['0xb1', '0x' + '2'.repeat(64)]);
+assert(feedActiveOnly(inner, () => c2, true, false) === inner, 'COPY2_FEED_ACTIVE_ONLY off: the push filter is unchanged');
+assert(feedActiveOnly(inner, () => c2, false, true) === inner, 'COPY2_ACTIVE_MAX off: the switch does nothing');
+const f = feedActiveOnly(inner, () => c2, true, true);
+const r = f.apply(all, ids);
+assert(r.pools.join() === '0xb1' && r.ids.join() === '0x' + '2'.repeat(64), 'on: only the pools / ids copy 2 follows are subscribed');
+c2 = new Set();
+assert(f.apply(all, ids).pools.length === 3, 'copy 2 list empty (just started): full list');
+c2 = new Set(['0x' + '2'.repeat(64)]);
+assert(f.apply(all, ids).pools.length === 3, 'no contract left: full list (never an empty subscription)');
+const boom = feedActiveOnly(inner, () => { throw new Error('x'); }, true, true);
+assert(boom.apply(all, ids).pools.length === 3, 'an error: full list');

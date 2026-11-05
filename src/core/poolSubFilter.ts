@@ -202,6 +202,16 @@ export class PoolSubFilter {
     return m;
   }
 
+  // (Nov 5) Pools in a trade idea / check / chance in the last `ms` (the
+  // sequencer feed finds these, so they keep counting even when the push
+  // feed only listens to copy 2's pools: COPY2_FEED_ACTIVE_ONLY).
+  recentlyUsed(ms: number): string[] {
+    const cut = this.now() - ms;
+    const out: string[] = [];
+    for (const [k, t] of this.use) if (t >= cut) out.push(k);
+    return out;
+  }
+
   isDropped(key: string): boolean { return this.s.on && this.drop.has(key.toLowerCase()); }
 
   // ---- the daily re-check ----------------------------------------------------

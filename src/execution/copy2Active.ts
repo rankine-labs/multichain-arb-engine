@@ -162,3 +162,47 @@ export class Copy2ActivePicker {
     } catch { /* best effort */ }
   }
 }
+
+// ============================================================================
+// PUSH FEED: ONLY COPY 2'S POOLS (Nov 5, COPY2_FEED_ACTIVE_ONLY; off by default)
+//
+// Plain English:
+//   The push feed (WebSocket) is billed per event. With COPY2_ACTIVE_MAX on,
+//   copy 2 follows ~200 pools, but the push feed still listened to all
+//   ~1,700 watched pools (~3,300 events a minute on Nov 5). With
+//   COPY2_FEED_ACTIVE_ONLY=1 the push feed subscribes only to the pools copy
+//   2 follows (its own extra targets, held pools and outside contracts, are
+//   still added by the reader). The other pools are still priced by the
+//   watch list's normal 5-second re-reads, and trade ideas still come from
+//   the free sequencer feed.
+//   Works only together with COPY2_ACTIVE_MAX > 0. Safety: while copy 2's
+//   list is empty (just started) or anything fails, the full list is used.
+//   Rollback: COPY2_FEED_ACTIVE_ONLY=0 (or unset) = exactly as before.
+// ============================================================================
+type SubFilterLike = { apply(pools: readonly string[], ids: Iterable<string>): { pools: string[]; ids: string[] } };
+
+export function feedActiveOnlyOn(env: Record<string, string | undefined> = process.env): boolean {
+  return /^(1|on|true|yes)$/i.test(String(env.COPY2_FEED_ACTIVE_ONLY ?? '').trim());
+}
+
+export function feedActiveOnly(inner: SubFilterLike, copy2Keys: () => ReadonlySet<string>, activeOn: boolean, on = feedActiveOnlyOn()): SubFilterLike {
+  if (!on || !activeOn) return inner;
+  let logged = -1;
+  return {
+    apply(pools, ids) {
+      const base = inner.apply(pools, ids);
+      try {
+        const c2 = copy2Keys();
+        if (c2.size === 0) return base;
+        const p = base.pools.filter((k) => c2.has(k.toLowerCase()));
+        const i = base.ids.filter((k) => c2.has(k.toLowerCase()));
+        if (p.length === 0) return base;   // never an empty contract list
+        if (p.length + i.length !== logged) {
+          logged = p.length + i.length;
+          console.log(`[copy2-active] push feed: only copy 2's pools (${p.length} contracts, ${i.length} V4 ids, of ${base.pools.length + base.ids.length}; COPY2_FEED_ACTIVE_ONLY)`);
+        }
+        return { pools: p, ids: i };
+      } catch { return base; }
+    },
+  };
+}

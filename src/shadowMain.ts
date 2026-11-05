@@ -236,7 +236,7 @@ import { nodeUsage as nodeUsageCounter } from './core/nodeUsage';
 import { ROBINHOOD_SEED_PAIRS } from './config/robinhoodSeedPairs';
 import { ResearchLane, researchConfigFromEnv, planShallowCandidate, findResearchGaps, gapCandidate, ResearchCandidate } from './core/researchLane';
 import { poolDepthUsd, setRealBalanceSource, thinPools, thinPoolsSteps } from './core/poolPrice';
-import { Copy2ActivePicker, copy2ActiveSettings } from './execution/copy2Active';
+import { Copy2ActivePicker, copy2ActiveSettings, feedActiveOnly } from './execution/copy2Active';
 // Loop trader v1 (3-5 pool loops, practice only, off unless LOOP_TRADER=1).
 import { LoopTrader, loopConfigFromEnv, LoopCheckResult, LoopTrade, buildLoopTrade } from './core/loopTrader';
 // Which node loop practice checks run on (LOOP_CHECK_NODE, default the free public node).
@@ -608,7 +608,10 @@ process.once('exit', () => poolSub.save(true));
 // events), so free node plans can keep it loaded. Off = every watched pool.
 const copy2Active = new Copy2ActivePicker(copy2ActiveSettings(), {
       pairs: () => robinhoodWatcher.watchedPairPools(),
-      events: () => poolSub.recentEvents(),
+      // Push-feed events per pool, plus 10 for each pool in a trade idea /
+      // check in the last 20 min (keeps quiet-on-the-push-feed pairs
+      // rankable when COPY2_FEED_ACTIVE_ONLY narrows the push feed).
+      events: () => { const m = poolSub.recentEvents(); for (const k of poolSub.recentlyUsed(20 * 60_000)) m.set(k, (m.get(k) ?? 0) + 10); return m; },
       depthUsd: (k) => { try { return poolSubDeps.depthUsd(k); } catch { return null; } },
 });
 const copy2FollowKeys = (): string[] => copy2Active.filter(copy2PoolKeys());
@@ -4708,7 +4711,8 @@ await chainManager.startAll();
                         // Copy 2 only (LOCAL_SIM shadow/on): unset = exactly as before.
                         ...(copy2Link ? { rawLogTap: copy2Link.tap } : {}),
                         // POOL_SUB_FILTER: dropped pools left out (off = unchanged) + event counting.
-                        subFilter: poolSub,
+                        // COPY2_FEED_ACTIVE_ONLY (Nov 5, needs COPY2_ACTIVE_MAX): only copy 2's pools.
+                        subFilter: feedActiveOnly(poolSub, () => poolSubDeps.copy2Keys(), copy2Active.on),
                         onPushed: (kind, logs) => poolSub.countPushed(kind, logs, ROBINHOOD_V4.POOL_MANAGER.toLowerCase()),
                   });
                   wsReaderRef = wsReader; // read by the 4-hour report (connections)
