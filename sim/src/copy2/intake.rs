@@ -198,6 +198,13 @@ pub fn outside_settle_on() -> bool {
     std::env::var("ARBSIM_COPY2_OUTSIDE_SETTLE").map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "off" | "false" | "no")).unwrap_or(true)
 }
 
+/// (Nov 3) ARBSIM_COPY2_RELOAD_FORGET_ALL [on]: a Slipstream pool that goes
+/// unsure forgets every value held in its contract (see make_unsure_with).
+/// "0" / "off" / "false" / "no" = only the values listed as the pool's.
+pub fn reload_forget_all_on() -> bool {
+    std::env::var("ARBSIM_COPY2_RELOAD_FORGET_ALL").map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "off" | "false" | "no")).unwrap_or(true)
+}
+
 /// (Nov 2) Why the copy refuses this pool kind right now (its flag is off),
 /// or None when it may be followed. The bot only sends these kinds when the
 /// same flags are on in .env (one .env for both); this is the second lock.
@@ -799,6 +806,10 @@ c2counters!(
     // pools found different from the chain (reloaded), audits skipped (no
     // version for that block / pool changed meanwhile / node error).
     pool_audit_rounds, pool_audit_items, pool_audit_drift, pool_audit_skipped,
+    // (v2) Differing values that were not listed as the pool's (forgotten);
+    // reloads of a Slipstream pool that also forgot its unlisted values
+    // (ARBSIM_COPY2_RELOAD_FORGET_ALL) and how many.
+    pool_audit_orphans, reload_forget_all, reload_forget_all_slots,
 );
 
 fn inc(c: &AtomicU64) {
@@ -4074,7 +4085,27 @@ impl Intake {
                 let soon = Instant::now() + Duration::from_millis(self.cfg.reload_ms);
                 e.retry_at = if was_ready { soon } else { soon.max(old_retry) };
             }
-            e.items.iter().copied().chain(walked).collect()
+            let mut f: Vec<(Address, U256)> = e.items.iter().copied().chain(walked).collect();
+            // (Nov 3, ARBSIM_COPY2_RELOAD_FORGET_ALL, default on) A Slipstream
+            // pool forgets EVERY value held in its contract, not only the
+            // ones listed as its own: a value not listed (from before an
+            // earlier reload) was never forgotten, so after the reload the
+            // copy answered a stale price / fee until the pool's next trade
+            // (live Nov 3: WETH/UP 0x23d641 price and fee off after a gauge
+            // reload, quiet WETH/VIRTUAL 0x851d1b "phantom gaps"). The
+            // contract belongs to this one pool, so nothing else is lost.
+            if e.pool.kind == PoolKind::Slipstream && reload_forget_all_on() {
+                if let Some(h) = self.sh.head() {
+                    let listed: HashSet<(Address, U256)> = f.iter().copied().collect();
+                    let extra: Vec<(Address, U256)> = h.snap.accounts.get(&e.pool.address).map(|acc| acc.storage.keys().map(|s| (e.pool.address, *s)).filter(|x| !listed.contains(x)).collect()).unwrap_or_default();
+                    if !extra.is_empty() {
+                        inc(&self.c2.stats.reload_forget_all);
+                        add(&self.c2.stats.reload_forget_all_slots, extra.len() as u64);
+                        f.extend(extra);
+                    }
+                }
+            }
+            f
         };
         inc(&self.c2.stats.unsure_marked);
         if let Some(ov) = ov {
@@ -6634,7 +6665,7 @@ impl Intake {
     //   0x851d1b. So every ARBSIM_COPY2_POOL_AUDIT_S seconds (default 60;
     //   0 = off) the next ARBSIM_COPY2_POOL_AUDIT_POOLS (default 2) ready
     //   hooked V4 / Slipstream pools, in turn, have the values the copy holds
-    //   for them (their own storage; at most 48, the plain slots first:
+    //   for them (their own storage; at most 64, the plain slots first:
     //   price / tick / liquidity / fee settings) read from the node AT the
     //   copy's newest block (exact block, one request per pool) and compared
     //   with the copy's version of that very block. Any difference = the
@@ -6675,9 +6706,20 @@ impl Intake {
                     let e = reg.pools.get(&k)?;
                     // Its own storage only (the pool contract; V4: its slots in the PoolManager).
                     let mut slots: Vec<U256> = e.items.iter().filter(|(a, _)| *a == e.pool.address).map(|(_, s)| *s).collect();
+                    // (Nov 3, v2) Slipstream: EVERY value the copy holds in the
+                    // pool contract, also ones not listed as the pool's (an
+                    // "orphan" left from before a reload would never be
+                    // re-read or forgotten otherwise).
+                    if e.pool.kind == PoolKind::Slipstream {
+                        if let Some(acc) = head.snap.accounts.get(&e.pool.address) {
+                            slots.extend(acc.storage.keys().copied());
+                        }
+                        slots.sort();
+                        slots.dedup();
+                    }
                     // Plain (small) slots first: price, tick, liquidity, fee settings.
                     slots.sort_by_key(|s| (*s >= U256::from(64u8), *s));
-                    slots.truncate(48);
+                    slots.truncate(64);
                     if slots.is_empty() {
                         return None;
                     }
@@ -6706,6 +6748,7 @@ impl Intake {
             return;
         }
         let mut differ: Vec<(Address, U256, U256, U256)> = Vec::new();
+        let listed: HashSet<(Address, U256)> = self.c2.reg.read().unwrap().pools.get(&key).map(|e| e.items.clone()).unwrap_or_default();
         {
             let p = self.sh.published.read().unwrap();
             // Exactly the version of block k (never a neighbour).
@@ -6726,15 +6769,30 @@ impl Intake {
             return;
         }
         inc(&self.c2.stats.pool_audit_drift);
+        // Values that differ but are not listed as the pool's (orphans): a
+        // reload would not forget them, so they are forgotten here (every
+        // version), as well as reloading the pool.
+        let orphans: Vec<(Address, U256)> = differ.iter().filter(|(a, sl, _, _)| !listed.contains(&(*a, *sl))).map(|(a, sl, _, _)| (*a, *sl)).collect();
+        add(&self.c2.stats.pool_audit_orphans, orphans.len() as u64);
         let n = self.c2.stats.pool_audit_drift.load(Ordering::Relaxed);
         if n <= 50 || n % 100 == 0 {
             let (a, sl, h, c) = differ[0];
             eprintln!(
-                "[arbsim] copy2: POOL AUDIT: pool {} (id {:?}) differs from the chain at block {k}: {} value(s), e.g. account {a} slot {sl:#x} copy {h:#x} chain {c:#x}; reloading it",
+                "[arbsim] copy2: POOL AUDIT: pool {} (id {:?}) differs from the chain at block {k}: {} value(s) ({} not listed as the pool's), e.g. account {a} slot {sl:#x} copy {h:#x} chain {c:#x}{}; reloading it",
                 key.0,
                 key.1,
-                differ.len()
+                differ.len(),
+                orphans.len(),
+                if listed.contains(&(a, sl)) { "" } else { " (not listed)" }
             );
+        }
+        if !orphans.is_empty() {
+            let mut p = crate::timing::TimedWrite::new(&self.sh.published);
+            rewrite_from(&mut p.versions, 0, |s| {
+                for (a, sl) in &orphans {
+                    forget_slot(s, *a, *sl);
+                }
+            });
         }
         self.make_unsure_with(key, "audit: a held value differs from the chain (drift): reloading", None, k, false);
     }

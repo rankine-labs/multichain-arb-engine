@@ -332,8 +332,20 @@ async function checkPart(p, f, t, part, counters) {
   const from = Math.max(block - 3000, (lastEqual.get(p.key) ?? block - 300) + 1);
   let before = [];
   try { before = await eventsBefore(p, f, from, block + 2); } catch (e) { before = [{ error: safe(e) }]; }
-  ev({ kind: 'differ', part, pool: p.key, sym: t.sym, poolKind: p.kind, block, matchesBlock, lastEqual: lastEqual.get(p.key) ?? null, copyEvents: p.events, diffs: d, before, counters });
-  log(`DIFF ${part} ${t.sym || ''} ${p.key.slice(0, 10)} @${block} copy=chain@${matchesBlock === null ? 'none' : (matchesBlock > 0 ? '+' : '') + matchesBlock} ${d.map((x) => x.what + (x.priceGapBps != null ? `(${x.priceGapBps}bps)` : '')).join(',')} before:${before.map((b) => (b.block - block) + b.who + ':' + b.event).slice(-6).join(' ')}`);
+  // 5. Is copy 2's answer the chain's state from BEFORE one of those events
+  //    (an event it never applied / a value left from before a reload)?
+  let staleSince = null;
+  try {
+    const evBlocks = [...new Set(before.filter((b) => b.block && b.block <= block).map((b) => b.block))].slice(-4);
+    for (const eb of evBlocks.reverse()) {
+      const rs = await rpcBatch(calls.map(([, to, data]) => ['eth_call', [{ to, data }, ethers.toQuantity(eb - 1)]]));
+      const c = rs.map((r) => (r.error ? 'revert' : r.result));
+      if (!rs.some((r) => r.error && !/revert/i.test(JSON.stringify(r.error))) && !diffOf(p, calls.map((x) => x[0]), mine, c).length) { staleSince = eb; break; }
+    }
+  } catch {}
+  if (staleSince !== null) bump(t.matchOffset, 'beforeEvent');
+  ev({ kind: 'differ', part, pool: p.key, staleSince, sym: t.sym, poolKind: p.kind, block, matchesBlock, lastEqual: lastEqual.get(p.key) ?? null, copyEvents: p.events, diffs: d, before, counters });
+  log(`DIFF ${part} ${t.sym || ''} ${p.key.slice(0, 10)} @${block} copy=chain@${matchesBlock === null ? 'none' : (matchesBlock > 0 ? '+' : '') + matchesBlock}${staleSince !== null ? ` copy=stateBeforeEventAt${staleSince - block}` : ''} ${d.map((x) => x.what + (x.priceGapBps != null ? `(${x.priceGapBps}bps)` : '')).join(',')} before:${before.map((b) => (b.block - block) + b.who + ':' + b.event).slice(-6).join(' ')}`);
   return 'differ';
 }
 
