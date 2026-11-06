@@ -626,6 +626,29 @@ impl NodeClient {
         Some(c)
     }
 
+    /// KEEPER'S OWN NODE (Nov 6, ARBSIM_KEEPER_NODE_URL): the keeper's
+    /// client like `from_env_with_paid_budget`, but when
+    /// ARBSIM_KEEPER_NODE_URL is set, that node is its ONLY node (labelled
+    /// "keeper", debug methods allowed): block diffs, seeds and audits all
+    /// go there and nowhere else, while copy 2 keeps ARBSIM_NODE_URL /
+    /// _URL_2 / the public node. Lets a test run copy 2 on free nodes and
+    /// only the keeper on a node that has debug_traceBlockByNumber.
+    /// Unset / empty = exactly the old client (no change).
+    pub fn keeper_from_env(paid: Budget) -> Option<Self> {
+        let c = Self::from_env_with_paid_budget(paid)?;
+        Some(match std::env::var("ARBSIM_KEEPER_NODE_URL").ok().filter(|s| !s.trim().is_empty()) {
+            Some(u) => c.only_keeper_node(u.trim()),
+            None => c,
+        })
+    }
+
+    /// One endpoint only: `url` as the "keeper" node on budget slot 0.
+    fn only_keeper_node(mut self, url: &str) -> Self {
+        self.endpoints = vec![Endpoint { label: "keeper", url: url.to_string(), debug: true, budget: 0, bg_only: false }];
+        self.bg_public = false;
+        self
+    }
+
     /// KEEPER THRIFT (Nov 3, copy2/keeper.rs FASTLANE_AHEAD_KEEP_FREE_TRACE):
     /// a client for ONLY the free public node (ARBSIM_PUBLIC_URL, default
     /// Robinhood's), allowed to send debug_* methods, with its own speed
@@ -1170,6 +1193,13 @@ pub fn trace_block_diff(node: &dyn NodeApi, class: Class, block: u64) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keeper_node_is_the_only_endpoint() {
+        let c = NodeClient::for_test("http://127.0.0.1:1/public", "http://127.0.0.1:1/paid", true, 6.0, 40.0).only_keeper_node("http://127.0.0.1:1/keeper");
+        assert_eq!(c.labels(), vec!["keeper"], "only the keeper node is asked");
+        assert!(c.endpoints[0].debug && c.endpoints[0].budget == 0 && !c.bg_public);
+    }
 
     #[test]
     fn batch_answers_are_matched_by_id() {
