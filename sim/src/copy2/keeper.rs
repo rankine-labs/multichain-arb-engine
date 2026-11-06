@@ -1717,7 +1717,8 @@ pub fn start(c2: super::intake::Copy2Handle) -> bool {
     }
     // No daily allowance and no own speed limit (owner rule): only the
     // shared provider handling (node.rs halves the rate on "too fast").
-    let Some(node) = crate::node::NodeClient::from_env_with_paid_budget(crate::node::Budget::no_caps()) else {
+    // ARBSIM_KEEPER_NODE_URL (Nov 6): the keeper's own node, if set.
+    let Some(node) = crate::node::NodeClient::keeper_from_env(crate::node::Budget::no_caps()) else {
         eprintln!("[arbsim] fastlane keeper: no node configured: OFF");
         return false;
     };
