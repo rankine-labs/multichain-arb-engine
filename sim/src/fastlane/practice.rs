@@ -103,6 +103,9 @@ struct Pending {
     opp: Opportunity,
     seq: u64,
     hand_us: u64,
+    /// FASTLANE_PAPER (Nov 7): what happened to the pick (outcome, tip /
+    /// base block, ...), copied onto its score line. Null for practice.
+    meta: Value,
 }
 
 /// One confirmed block as scoring needs it.
@@ -167,7 +170,25 @@ impl Practice {
             self.pending.pop_front();
             self.hour.expired += 1;
         }
-        self.pending.push_back(Pending { opp: o.clone(), seq, hand_us });
+        self.pending.push_back(Pending { opp: o.clone(), seq, hand_us, meta: Value::Null });
+    }
+
+    /// FASTLANE_PAPER (lane.rs): one pick on a predicted tip, whatever
+    /// happened to it (`meta`: outcome, tip / base block, ...). Written at
+    /// once ("kind":"pick"), then scored like a would-send ("kind":"score",
+    /// with "paper" = `meta` and "landedProfitable" = real and not taken).
+    pub fn note_paper(&mut self, o: &Opportunity, meta: Value) {
+        self.hour.would_send += 1;
+        let line = json!({
+            "kind": "pick", "t": super::bridge::wall_ms(), "block": o.block, "label": o.route_label, "rid": o.rid,
+            "expectedNetUsd": o.expected_net_usd, "sizeUsd": o.size_usd, "pools": o.pools, "src": o.source, "paper": meta,
+        });
+        self.write(&line);
+        if self.pending.len() >= self.cfg.max_pending {
+            self.pending.pop_front();
+            self.hour.expired += 1;
+        }
+        self.pending.push_back(Pending { opp: o.clone(), seq: 0, hand_us: 0, meta });
     }
 
     /// Would-sends still waiting.
@@ -227,11 +248,18 @@ impl Practice {
             if taken {
                 self.hour.taken += 1;
             }
-            let line = json!({
+            let mut line = json!({
                 "kind": "score", "t": super::bridge::wall_ms(), "seq": p.seq, "block": n, "label": p.opp.route_label, "rid": p.opp.rid,
                 "result": label, "taken": taken, "expectedNetUsd": p.opp.expected_net_usd, "netAtNUsd": ev.net_usd,
                 "why": ev.at_size.as_ref().err(), "sizeUsd": p.opp.size_usd, "pools": p.opp.pools, "src": p.opp.source, "handUs": p.hand_us,
             });
+            if !p.meta.is_null() {
+                // FASTLANE_PAPER: the pick's details, and "would ours have
+                // landed profitable" (still paid at N, nobody touched its
+                // pools in N+1; an upper bound like "taken").
+                line["paper"] = p.meta.clone();
+                line["landedProfitable"] = json!(label == "real" && !taken);
+            }
             self.write(&line);
         }
         self.pending = keep;

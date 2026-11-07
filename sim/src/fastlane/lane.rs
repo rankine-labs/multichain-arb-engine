@@ -75,11 +75,25 @@ pub struct LaneCfg {
     /// FASTLANE_TIP_MAX_AGE_MS [60]: a tip older than this when the loop
     /// gets to it is skipped (it is about a block the chain already left).
     pub tip_max_age_ms: u64,
+    /// FASTLANE_AHEAD_SEND_FIRST_ONLY [off] (Nov 7): act only on a block's
+    /// FIRST published prediction (AheadTip.first: what the horizon measure
+    /// scores), never on the same block rebuilt later on a newer base (the
+    /// "one block ahead" kind: live Nov 6, 46 of 361 sure answers wrong).
+    /// Rebuilt tips are counted ("tipsRebuilt") and skipped.
+    pub first_only: bool,
+    /// FASTLANE_PAPER [off] (Nov 7): paper trading. Every opportunity the
+    /// lane picks on a predicted tip is written to FASTLANE_PAPER_FILE
+    /// [data/fastlane-paper.jsonl] with what happened to it (sent, would
+    /// send, or which safety rule stopped it, e.g. the kill file in a
+    /// hold-mode run), and later scored against copy 2's confirmed blocks
+    /// like practice (practice.rs): still paid at block N ("real") or not
+    /// ("gone"), and whether a route pool changed in N+1 ("taken").
+    pub paper: bool,
 }
 
 impl Default for LaneCfg {
     fn default() -> Self {
-        LaneCfg { fires_per_block: 1, tip_max_age_ms: 60 }
+        LaneCfg { fires_per_block: 1, tip_max_age_ms: 60, first_only: false, paper: false }
     }
 }
 
@@ -90,6 +104,8 @@ impl LaneCfg {
         LaneCfg {
             fires_per_block: num("FASTLANE_FIRES_PER_BLOCK").filter(|v| (1..=4).contains(v)).map(|v| v as usize).unwrap_or(d.fires_per_block),
             tip_max_age_ms: num("FASTLANE_TIP_MAX_AGE_MS").filter(|v| (1..=10_000).contains(v)).unwrap_or(d.tip_max_age_ms),
+            first_only: get("FASTLANE_AHEAD_SEND_FIRST_ONLY").is_some_and(|v| crate::fastlane::mode::parse_on(Some(&v))),
+            paper: get("FASTLANE_PAPER").is_some_and(|v| crate::fastlane::mode::parse_on(Some(&v))),
         }
     }
 }
@@ -280,6 +296,8 @@ pub fn reply_hook(log: Arc<SendsLog>, book: Arc<ReplyBook>) -> Arc<dyn Fn(&SendO
 pub struct LaneHour {
     pub tips: u64,
     pub tips_old: u64,
+    /// FASTLANE_AHEAD_SEND_FIRST_ONLY: rebuilt tips skipped.
+    pub tips_rebuilt: u64,
     pub opps: u64,
     /// Safety refusals by code.
     pub blocked: BTreeMap<&'static str, u64>,
@@ -535,6 +553,8 @@ pub struct Lane {
     pub log: Arc<SendsLog>,
     pub book: Arc<ReplyBook>,
     pub practice: Practice,
+    /// FASTLANE_PAPER: paper trading (its own file and counters; None = off).
+    pub paper: Option<Practice>,
     pub hour: LaneHour,
     pub last_hour: Option<LaneHour>,
     last_drops: Option<u64>,
@@ -557,6 +577,7 @@ impl Lane {
             log,
             book,
             practice,
+            paper: None,
             hour: LaneHour::default(),
             last_hour: None,
             last_drops: None,
@@ -570,6 +591,11 @@ impl Lane {
     pub fn on_tip(&mut self, tip: &AheadTip) -> Vec<FireResult> {
         let t0 = Instant::now();
         self.hour.tips += 1;
+        // FASTLANE_AHEAD_SEND_FIRST_ONLY: only a block's first prediction.
+        if self.cfg.first_only && !tip.first {
+            self.hour.tips_rebuilt += 1;
+            return Vec::new();
+        }
         if tip.built_at.elapsed() > Duration::from_millis(self.cfg.tip_max_age_ms) {
             self.hour.tips_old += 1;
             return Vec::new();
@@ -581,7 +607,20 @@ impl Lane {
         self.hour.opps += rep.opps.len() as u64;
         let mut out = Vec::new();
         for o in rep.opps.iter().take(self.cfg.fires_per_block) {
-            out.push(self.fire_one(o, tip.feed_at, tip.apply_us));
+            let r = self.fire_one(o, tip.feed_at, tip.apply_us);
+            // FASTLANE_PAPER: every pick, whatever happened to it.
+            if let Some(p) = self.paper.as_mut() {
+                let outcome = match (&r.blocked, &r.written) {
+                    (Some(code), _) => format!("blocked:{code}"),
+                    (None, Some(_)) if r.live => "live_sent".to_string(),
+                    (None, Some(_)) => "would_send".to_string(),
+                    (None, None) => "not_sent".to_string(),
+                };
+                let meta = json!({"outcome": outcome, "tipBlock": tip.block, "baseBlock": tip.base_seq, "aheadBlocks": tip.seq.saturating_sub(tip.base_seq), "firstTip": tip.first,
+                    "kinds": o.hops.iter().map(|h| h.kind).collect::<Vec<_>>(), "tokenIn": format!("{:#x}", o.token_in), "gasUsd": o.gas_usd});
+                p.note_paper(o, meta);
+            }
+            out.push(r);
         }
         let lane_us = t0.elapsed().as_micros() as u64;
         push_bounded(&mut self.hour.block_us, tip.apply_us + lane_us);
@@ -741,6 +780,10 @@ impl Lane {
     pub fn score_confirmed(&mut self, c2: &crate::copy2::intake::Copy2Handle) {
         let runner = super::c2runner::Copy2Runner::new(c2.clone());
         self.practice.on_confirmed(c2, &runner);
+        // FASTLANE_PAPER: the paper picks, the same way.
+        if let Some(p) = self.paper.as_mut() {
+            p.on_confirmed(c2, &runner);
+        }
     }
 
     /// Status section "fastlane" (summary of every part).
@@ -809,6 +852,9 @@ impl Lane {
                 "blockUsNote": "blockUs = predicted-copy apply + lane; laneUs = lane only (scan + fire)",
             },
             "practice": self.practice.status_json(),
+            // Nov 7: FASTLANE_AHEAD_SEND_FIRST_ONLY / FASTLANE_PAPER.
+            "firstOnly": {"on": self.cfg.first_only, "tipsRebuiltSkipped": h.tips_rebuilt},
+            "paper": self.paper.as_ref().map(|p| p.status_json()),
         })
     }
 
@@ -829,7 +875,11 @@ impl Lane {
         );
         self.last_hour = Some(h);
         let practice = self.practice.take_hour(crate::copy2::ahead::prediction_counts());
-        vec![lane, super::scan::take_hour(), practice]
+        let mut out = vec![lane, super::scan::take_hour(), practice];
+        if let Some(p) = self.paper.as_mut() {
+            out.push(p.take_hour(crate::copy2::ahead::prediction_counts()).replacen("fastlane practice", "fastlane paper", 1));
+        }
+        out
     }
 }
 
@@ -955,7 +1005,20 @@ pub fn start(c2: crate::copy2::intake::Copy2Handle) -> bool {
     let _ = FOLLOW.set(c2.clone());
     let scanner = Scanner::new(ScanConfig::from_env(), Box::new(super::scan::TableSource::global()), Box::new(super::c2runner::Copy2Runner::new(c2.clone())));
     let practice = Practice::new(PracticeCfg::from_lookup(&get), c2.sh.cfg.l2_offset);
-    let mut lane = Lane::new(LaneCfg::from_lookup(&get), scanner, safety, gate, gun, log, book, practice);
+    let lane_cfg = LaneCfg::from_lookup(&get);
+    let paper_on = lane_cfg.paper;
+    let first_only = lane_cfg.first_only;
+    let mut lane = Lane::new(lane_cfg, scanner, safety, gate, gun, log, book, practice);
+    // FASTLANE_PAPER: its own practice-style scorer and file.
+    if paper_on {
+        let mut pc = PracticeCfg::from_lookup(&get);
+        pc.file = std::path::PathBuf::from(get("FASTLANE_PAPER_FILE").filter(|s| !s.trim().is_empty()).unwrap_or_else(|| "data/fastlane-paper.jsonl".into()));
+        lane.paper = Some(Practice::new(pc, c2.sh.cfg.l2_offset));
+        eprintln!("[fastlane] paper trading ON (FASTLANE_PAPER): every pick on a predicted tip logged and scored");
+    }
+    if first_only {
+        eprintln!("[fastlane] FASTLANE_AHEAD_SEND_FIRST_ONLY: only each block's first prediction is acted on");
+    }
     if RT.set(Rt { status: Mutex::new(json!({})), last_practice: Mutex::new(Value::Null), firer: lane.firer(), mode: fm.mode }).is_err() {
         return false;
     }
@@ -1038,4 +1101,23 @@ pub fn status_json() -> Option<Value> {
     // Fire-first from Rust (fastlane/trigger.rs): its own section.
     v["trigger"] = super::trigger::status_json();
     Some(v)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn first_only_and_paper_are_off_unless_set() {
+        // Nov 7: FASTLANE_AHEAD_SEND_FIRST_ONLY / FASTLANE_PAPER.
+        let none = |_: &str| None::<String>;
+        let c = LaneCfg::from_lookup(&none);
+        assert!(!c.first_only && !c.paper);
+        let on = |k: &str| matches!(k, "FASTLANE_AHEAD_SEND_FIRST_ONLY" | "FASTLANE_PAPER").then(|| "on".to_string());
+        let c = LaneCfg::from_lookup(&on);
+        assert!(c.first_only && c.paper);
+        let off = |_: &str| Some("off".to_string());
+        let c = LaneCfg::from_lookup(&off);
+        assert!(!c.first_only && !c.paper);
+    }
 }
