@@ -45,7 +45,7 @@
 //   and says so (an incomplete file is refused by the replay unless asked).
 //
 //   REPLAY: `arbsim ahead-replay <capture file> [--json] [--samples N]
-//   [--budget-ms N] [--partial] [--revert-sure] [--exact-revert-sure] [--sender-funds trusted|strict] [--unknown-continue] [--keeper <truth file> [--keeper-warm [--keeper-warm-passes N]] [--keep-contracts N] [--keep-seeds-per-h N] [--keep-prune-blocks N [--keep-prune-learned]] [--oracle]] [--filter-all] [--no-keep-pick]`
+//   [--budget-ms N] [--partial] [--revert-sure] [--exact-revert-sure] [--sender-funds trusted|strict] [--unknown-continue] [--keeper <truth file> [--keeper-warm [--keeper-warm-passes N]] [--keep-contracts N] [--keep-seeds-per-h N] [--keep-prune-blocks N [--keep-prune-learned]] [--oracle]] [--filter-all] [--no-keep-pick] [--horizon] [--hz-notes] [--narrow-unsure]`
 //     Builds a fresh predicted copy, feeds it the capture event by event and
 //     prints: agreement % (agree / (agree + disagree), per pool compared),
 //     the disagreement breakdown by cause (missedFilter / missedRan /
@@ -440,6 +440,10 @@ fn dec_cfg(d: &mut Dec) -> Res<AheadCfg> {
         kept_rebuild_once: false,
         // Not in the file: live measurement only (Nov 5).
         horizon: false,
+        // Not in the file: `--env FASTLANE_AHEAD_HZ_NOTES=on` /
+        // `--env FASTLANE_AHEAD_NARROW_UNSURE=on` (Nov 7).
+        hz_notes: false,
+        narrow_unsure: false,
         need_keeper: false,
         // Not in the file: memory fix (Nov 1); same answers either way.
         thin_pending: true,
@@ -1012,6 +1016,14 @@ pub struct ReplayOpts {
     pub filter_all: bool,
     /// `--no-keep-pick`: FASTLANE_AHEAD_KEEP_PICK=off for this replay.
     pub no_keep_pick: bool,
+    /// `--horizon` (Nov 7): also score each block's FIRST published
+    /// prediction (FASTLANE_AHEAD_HORIZON) against the settled block.
+    pub horizon: bool,
+    /// `--hz-notes` (Nov 7): FASTLANE_AHEAD_HZ_NOTES=on (implies --horizon):
+    /// the horizon counts misses too.
+    pub hz_notes: bool,
+    /// `--narrow-unsure` (Nov 7): FASTLANE_AHEAD_NARROW_UNSURE=on.
+    pub narrow_unsure: bool,
 }
 
 /// Replay a capture through a fresh predicted copy. Returns the report
@@ -1086,6 +1098,10 @@ fn replay_with(cap: &CapFile, opts: &ReplayOpts, keeper: Option<KeeperOpts>) -> 
     if opts.no_keep_pick {
         cfg.keep_pick = false;
     }
+    // Nov 7: horizon (with or without its notes) and the narrow rule.
+    cfg.horizon = opts.horizon || opts.hz_notes;
+    cfg.hz_notes = opts.hz_notes;
+    cfg.narrow_unsure = opts.narrow_unsure;
     cfg.keeper = keeper.is_some();
     let l2 = cfg.l2_offset;
     let mut a = Ahead::new(cfg);
@@ -1164,6 +1180,16 @@ fn replay_with(cap: &CapFile, opts: &ReplayOpts, keeper: Option<KeeperOpts>) -> 
             }
             CapEv::Settled(st) => {
                 n_settled += 1;
+                // Nov 7 (--horizon): this block's FIRST published prediction,
+                // scored like live (FASTLANE_AHEAD_HORIZON), with the values
+                // of the pools only it moved from the versions held.
+                if let Some((pools, keys)) = a.horizon_parts(st.seq) {
+                    let mut hz = st.clone();
+                    if let (Some(prev), Some(now)) = (snaps.get(&(st.seq.wrapping_sub(1))), snaps.get(&st.seq)) {
+                        hz.fill_from(&pools, keys.iter(), prev, now);
+                    }
+                    a.compare_horizon(&hz, &|h| moves.get(h).cloned().flatten());
+                }
                 let Some((pools, keys, _)) = a.pending_parts(st.seq) else { continue };
                 let mut st = st.clone();
                 // Pools only this replay predicted moved (live did not
@@ -1193,6 +1219,12 @@ fn replay_with(cap: &CapFile, opts: &ReplayOpts, keeper: Option<KeeperOpts>) -> 
     }
     if let Some(o) = &a.oracle {
         r["oracle"] = o.report();
+    }
+    // Nov 7: the same summary as live status (sure %, why wrong, narrow
+    // rule), one block ahead and (--horizon) at each block's first tip.
+    r["oneAhead"] = super::ahead::accuracy_json(&a.total, false);
+    if a.cfg().horizon {
+        r["horizon"] = super::ahead::accuracy_json(&a.hz_total, false);
     }
     let rk = rk.map(|x| x.0);
     if let Some(k) = &rk {
@@ -1293,6 +1325,8 @@ pub fn replay_live(cap: &CapFile, opts: &ReplayOpts, truth: Arc<super::keeper_re
     cfg.lazy_rebase = fresh.lazy_rebase;
     cfg.kept_rebuild_once = fresh.kept_rebuild_once;
     cfg.need_keeper = fresh.need_keeper;
+    // Nov 7: `--env FASTLANE_AHEAD_NARROW_UNSURE=on` or `--narrow-unsure`.
+    cfg.narrow_unsure = fresh.narrow_unsure || opts.narrow_unsure;
     let settings = json!({
         "budgetMs": cfg.msg_budget_us / 1000, "budgetClock": if cfg.budget_cpu { "cpu" } else { "wall" }, "lazyRebase": cfg.lazy_rebase,
         "keptRebuild": if cfg.kept_rebuild_once { "once" } else { "every" }, "needKeeper": cfg.need_keeper,
@@ -1781,6 +1815,16 @@ pub fn print_report(r: &Value, samples: usize) -> String {
             l["agree"], l["disagree"], l["missed"], l["missedRan"], l["missedReverted"], l["missedFailed"], l["missedFilter"], l["unsure"], l["compared"], l["unpredicted"], l["msgs"], l["msgsStopped"], l["overBudget"]
         );
     }
+    // Nov 7: sure share and why-wrong, one block ahead and at the horizon.
+    for (name, k) in [("one block ahead", "oneAhead"), ("horizon (first tip)", "horizon")] {
+        let x = &r[k];
+        if x.is_object() {
+            o += &format!(
+                "{name}: right {} wrong {} unsure {} (unsure that moved {}) sure% {} | why wrong {} | narrow {}\n",
+                x["exact"], x["wrong"], x["unsure"], x["unsureMoved"], x["surePct"], x["why"], x["narrow"]
+            );
+        }
+    }
     if samples > 0 {
         if let Some(v) = r["samples"].as_array().filter(|v| !v.is_empty()) {
             o += &format!("first {} of {} disagreement samples:\n", samples.min(v.len()), v.len());
@@ -1792,10 +1836,10 @@ pub fn print_report(r: &Value, samples: usize) -> String {
     o
 }
 
-/// `arbsim ahead-replay <capture file> [--json] [--samples N] [--budget-ms N] [--partial] [--revert-sure] [--exact-revert-sure] [--sender-funds trusted|strict] [--unknown-continue] [--keeper <truth file> [--keeper-warm [--keeper-warm-passes N]] [--keep-contracts N] [--keep-seeds-per-h N] [--keep-prune-blocks N [--keep-prune-learned]] [--oracle]] [--filter-all] [--no-keep-pick]`
+/// `arbsim ahead-replay <capture file> [--json] [--samples N] [--budget-ms N] [--partial] [--revert-sure] [--exact-revert-sure] [--sender-funds trusted|strict] [--unknown-continue] [--keeper <truth file> [--keeper-warm [--keeper-warm-passes N]] [--keep-contracts N] [--keep-seeds-per-h N] [--keep-prune-blocks N [--keep-prune-learned]] [--oracle]] [--filter-all] [--no-keep-pick] [--horizon] [--hz-notes] [--narrow-unsure]`
 pub fn replay_main(args: &[String]) {
     let Some(path) = args.get(2).filter(|a| !a.starts_with("--")) else {
-        eprintln!("usage: arbsim ahead-replay <capture file> [--json] [--samples N] [--budget-ms N] [--partial] [--revert-sure] [--exact-revert-sure] [--sender-funds trusted|strict] [--unknown-continue] [--keeper <truth file> [--keeper-warm [--keeper-warm-passes N]] [--keep-contracts N] [--keep-seeds-per-h N] [--keep-prune-blocks N [--keep-prune-learned]] [--oracle]] [--filter-all] [--no-keep-pick]");
+        eprintln!("usage: arbsim ahead-replay <capture file> [--json] [--samples N] [--budget-ms N] [--partial] [--revert-sure] [--exact-revert-sure] [--sender-funds trusted|strict] [--unknown-continue] [--keeper <truth file> [--keeper-warm [--keeper-warm-passes N]] [--keep-contracts N] [--keep-seeds-per-h N] [--keep-prune-blocks N [--keep-prune-learned]] [--oracle]] [--filter-all] [--no-keep-pick] [--horizon] [--hz-notes] [--narrow-unsure]");
         std::process::exit(2);
     };
     let arg = |f: &str| args.iter().position(|a| a == f).and_then(|i| args.get(i + 1)).and_then(|v| v.parse::<u64>().ok());
@@ -1829,6 +1873,9 @@ pub fn replay_main(args: &[String]) {
         oracle: args.iter().any(|a| a == "--oracle"),
         filter_all: args.iter().any(|a| a == "--filter-all"),
         no_keep_pick: args.iter().any(|a| a == "--no-keep-pick"),
+        horizon: args.iter().any(|a| a == "--horizon"),
+        hz_notes: args.iter().any(|a| a == "--hz-notes"),
+        narrow_unsure: args.iter().any(|a| a == "--narrow-unsure"),
     };
     // KEEPER (Oct 31): --keeper <truth file> [--keeper-warm [--keeper-warm-passes N]] [--keep-contracts N]
     // [--keep-seeds-per-h N]: the hot-contract keeper on recorded block diffs.

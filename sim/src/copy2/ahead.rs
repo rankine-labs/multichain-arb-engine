@@ -357,6 +357,28 @@ pub struct AheadCfg {
     /// the settled block, besides the usual one-block-ahead agreement.
     /// Counted on its own (status fastlaneAhead.horizon); only measures.
     pub horizon: bool,
+    /// FASTLANE_AHEAD_HZ_NOTES [off] (Nov 7): the horizon measure above
+    /// kept NO transaction notes, so a pool the real block moved and our
+    /// first prediction did not ("missed") found no mover and was filed
+    /// "notFromTx" (not counted at all): the horizon's "wrong" could only
+    /// ever count phantom / value differences. Live Nov 6 the one-block
+    /// agreement's 46 wrong were ALL such misses (+1 value), while the
+    /// horizon showed 0 wrong. On = the horizon keeps that block's notes
+    /// too, so misses are counted there exactly like one block ahead.
+    /// Measures only (no decision changes).
+    pub hz_notes: bool,
+    /// FASTLANE_AHEAD_NARROW_UNSURE [off] (Nov 7): a transaction we could
+    /// not run exactly (or whose run reverted) marks as unsure only the
+    /// pools it would WRITE: its collect run (missing values read as zero)
+    /// finished and changed those pools' own values, plus the pools its
+    /// target / data name directly (address or V4 pool id) and native-ETH
+    /// pools it pays into. Pools it only READ (a bot or router looking at
+    /// prices), pools named only by their coin pair, and its target's
+    /// learned pools are no longer marked. When the collect run reverted,
+    /// could not run, or found nothing of ours, the old rule applies
+    /// unchanged (never fewer pools than "nothing known"). Nov 6 live: 96%
+    /// of the pools marked unsure never moved.
+    pub narrow_unsure: bool,
     /// FASTLANE_AHEAD_THIN_PENDING [on] (memory fix, Nov 1): a predicted
     /// block waiting for its agreement (FASTLANE_AHEAD_COMPARE_DELAY_BLOCKS,
     /// ~6 at a time) keeps only what agreement reads: our pool contracts'
@@ -371,7 +393,7 @@ pub struct AheadCfg {
 
 impl Default for AheadCfg {
     fn default() -> Self {
-        AheadCfg { max_blocks: 32, run_all: false, max_txs: 256, max_touchers: 4096, l2_offset: 0, trust_sender_funds: false, msg_budget_us: 10_000, routes_only: true, compare_delay: 0, revert_unsure: true, exact_revert_sure: false, unknown_continue: false, keeper: false, keep_pick: true, budget_cpu: false, lazy_rebase: false, kept_rebuild_once: false, need_keeper: false, thin_pending: true, horizon: false }
+        AheadCfg { max_blocks: 32, run_all: false, max_txs: 256, max_touchers: 4096, l2_offset: 0, trust_sender_funds: false, msg_budget_us: 10_000, routes_only: true, compare_delay: 0, revert_unsure: true, exact_revert_sure: false, unknown_continue: false, keeper: false, keep_pick: true, budget_cpu: false, lazy_rebase: false, kept_rebuild_once: false, need_keeper: false, thin_pending: true, horizon: false, hz_notes: false, narrow_unsure: false }
     }
 }
 
@@ -486,6 +508,9 @@ impl AheadCfg {
             },
             need_keeper: on_off(get("FASTLANE_AHEAD_NEED_KEEPER").as_deref()).unwrap_or(observe),
             horizon: on_off(get("FASTLANE_AHEAD_HORIZON").as_deref()).unwrap_or(false),
+            // Nov 7: both off unless set (see the fields).
+            hz_notes: on_off(get("FASTLANE_AHEAD_HZ_NOTES").as_deref()).unwrap_or(false),
+            narrow_unsure: on_off(get("FASTLANE_AHEAD_NARROW_UNSURE").as_deref()).unwrap_or(false),
             // Memory fix (Nov 1): on in every mode (agreement only measures;
             // its answers are the same either way).
             thin_pending: on_off(get("FASTLANE_AHEAD_THIN_PENDING").as_deref()).unwrap_or(d.thin_pending),
@@ -973,6 +998,22 @@ impl PoolSet {
         self.route.named_by(to, data)
     }
 
+    /// Our pools whose OWN values a run wrote (FASTLANE_AHEAD_NARROW_UNSURE):
+    /// any value of a pool contract, or one of a V4 pool's 4 base values
+    /// (slot0, fee growth x2, liquidity) in its PoolManager.
+    fn written_by(&self, writes: &[(Address, U256)]) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for (a, s) in writes {
+            let k = self.by_contract.get(a).or_else(|| (0..4u64).find_map(|d| s.checked_sub(U256::from(d)).and_then(|b| self.v4_slot0.get(&(*a, b)))));
+            if let Some(k) = k {
+                if !out.contains(k) {
+                    out.push(k.clone());
+                }
+            }
+        }
+        out
+    }
+
     /// Our pools behind the accounts / values a run read.
     fn touched_by(&self, accounts: &HashSet<Address>, slots: &HashSet<(Address, U256)>) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
@@ -1042,6 +1083,12 @@ pub struct AheadTip {
     /// When THIS feed message reached arbsim (the fast lane's latency
     /// clock starts here: "feed message -> would hand to socket").
     pub feed_at: Instant,
+    /// Nov 7: true = the FIRST tip ever published for this block (what the
+    /// horizon measure, FASTLANE_AHEAD_HORIZON, scores); false = the same
+    /// block rebuilt later on a newer base (the "one block ahead" kind).
+    /// FASTLANE_AHEAD_SEND_FIRST_ONLY makes the fast lane act only on
+    /// first tips.
+    pub first: bool,
 }
 
 impl AheadTip {
@@ -1317,6 +1364,13 @@ pub struct AheadStats {
     /// ...and pools such a transaction really moved (a sure pool that was
     /// wrong because of the rule: the measure of whether it is safe).
     pub missed_unknown: u64,
+    /// FASTLANE_AHEAD_NARROW_UNSURE (Nov 7): runs whose unsure pools came
+    /// from the narrow rule / pools the old rule would have marked too that
+    /// it left sure / runs that fell back to the old rule (collect run
+    /// reverted, could not run, or wrote none of our pools).
+    pub narrow_used: u64,
+    pub narrow_dropped: u64,
+    pub narrow_fallback: u64,
     /// Observe-mode build: per feed message, how many blocks the predicted
     /// tip was ahead of copy 2's confirmed version (0 = no tip: stopped or
     /// waiting). The "blocks fresher" gain. Ring of the newest MAX_TIMES.
@@ -1394,6 +1448,7 @@ impl AheadStats {
             "notCaptured": self.not_captured, "confGone": self.conf_gone, "rebaseRewrites": self.rebase_rewrites, "settleLost": self.settle_lost, "memoryPauses": self.memory_pauses, "memoryBlocks": self.memory_blocks, "failedWidened": self.failed_widened,
             "unknownContinued": self.unknown_continued, "missedUnknown": self.missed_unknown, "tips": self.tips,
             "revertsExact": self.reverts_exact, "unsureMoved": self.unsure_moved,
+            "narrowUsed": self.narrow_used, "narrowDropped": self.narrow_dropped, "narrowFallback": self.narrow_fallback,
             "keptBases": self.kept_bases, "keptMissing": self.kept_missing, "keptValues": self.kept_values, "keptRebases": self.kept_rebases, "learned": self.learned,
             "rightKeptBase": self.right_kept, "wrongKeptBase": self.wrong_kept, "rightPlainBase": self.right_plain, "wrongPlainBase": self.wrong_plain, "keptSkipped": self.kept_skipped,
             "applyCpuUs": if times { let mut c = self.cpu_us.clone(); crate::timing::pct_of(&mut c) } else { Value::Null },
@@ -1599,6 +1654,9 @@ pub struct Ahead {
     /// values added + time (status "memory": each merged base is a copy).
     merges: u64,
     merge_last: (usize, u64),
+    /// The newest block a tip was ever published for (AheadTip.first:
+    /// FASTLANE_AHEAD_SEND_FIRST_ONLY in fastlane/lane.rs).
+    tip_seq_max: u64,
 }
 
 impl Ahead {
@@ -1634,6 +1692,7 @@ impl Ahead {
             mem_pause: false,
             merges: 0,
             merge_last: (0, 0),
+            tip_seq_max: 0,
         }
     }
 
@@ -2453,10 +2512,15 @@ impl Ahead {
         }
         // The tip only when it is the newest message held (no gap waiting).
         let newest = self.msgs.keys().next_back().copied();
+        // Nov 7: is this the first tip ever published for its block?
+        let first = self.entries.back().is_some_and(|e| e.seq > self.tip_seq_max);
         self.tip = match (self.entries.back(), newest) {
-            (Some(e), Some(n)) if e.seq == n => Some(Arc::new(self.tip_of(e, &base))),
+            (Some(e), Some(n)) if e.seq == n => Some(Arc::new(self.tip_of(e, &base, first))),
             _ => None,
         };
+        if let Some(t) = &self.tip {
+            self.tip_seq_max = self.tip_seq_max.max(t.seq);
+        }
         // FASTLANE_AHEAD_HORIZON: keep the FIRST published prediction of
         // this block (later rebuilds on newer bases are not what a trade
         // decided at the tip used). Bounded: the 64 newest.
@@ -2475,7 +2539,10 @@ impl Ahead {
                         snap,
                         changed_cum: e.changed_cum.clone(),
                         unsure_cum: e.unsure_cum.clone(),
-                        notes: Vec::new(),
+                        // FASTLANE_AHEAD_HZ_NOTES: this block's notes, so a
+                        // pool the real block moved and we did not counts
+                        // as a miss (without them: "notFromTx", unseen).
+                        notes: if self.cfg.hz_notes { e.notes.clone() } else { Vec::new() },
                         pools: self.pools.clone(),
                         base_kept: e.base_kept,
                     };
@@ -2498,13 +2565,17 @@ impl Ahead {
     /// widened, nothing found, V4 only); a reverted run has its own.
     fn guess_touched(&mut self, ov: &Overlay, ctx: &BlockCtx, t: &DecodedTx, pools: &PoolSet, named_now: &Named, native: &[String], failed: bool) -> Vec<String> {
         self.last_probe = None;
+        // FASTLANE_AHEAD_NARROW_UNSURE: what the collect run WROTE (only
+        // when it finished without reverting; None = not known).
+        let mut writes: Option<Vec<(Address, U256)>> = None;
         let mut hit = if target_has_no_code(ov, t.to) {
             if failed {
                 self.count(|s| s.probes_skipped += 1);
             }
             Vec::new()
         } else {
-            let reads = probe_reads(ov, ctx, t).unwrap_or_default();
+            let (reads, w) = probe_full(ov, ctx, t, self.cfg.narrow_unsure);
+            writes = w;
             let hit = pools.touched_by(&reads.accounts, &reads.slots);
             // KEEPER: what the collect run read (learning only).
             if self.cfg.keeper {
@@ -2587,6 +2658,34 @@ impl Ahead {
                 hit = pools.sharing_named_coins(named_now);
             }
         }
+        // FASTLANE_AHEAD_NARROW_UNSURE (Nov 7): only the pools it would
+        // write (collect run finished: what it changed of ours) plus the
+        // ones it names directly / pays ETH into. Always a part of the old
+        // answer (never a pool the old rule left sure). Nothing narrower
+        // known (collect run reverted / skipped / wrote nothing of ours and
+        // names none): the old answer, unchanged.
+        if self.cfg.narrow_unsure {
+            let mut narrow: Vec<String> = writes.as_deref().map(|w| pools.written_by(w)).unwrap_or_default();
+            if writes.is_some() {
+                for k in pools.named_direct(t.to, named_now).into_iter().chain(native.iter().cloned()) {
+                    if !narrow.contains(&k) {
+                        narrow.push(k);
+                    }
+                }
+            }
+            // Only pools the old rule had too (it is a narrowing).
+            narrow.retain(|k| hit.contains(k));
+            if narrow.is_empty() {
+                self.count(|s| s.narrow_fallback += 1);
+            } else {
+                let dropped = hit.iter().filter(|k| !narrow.contains(k)).count() as u64;
+                self.count(|s| {
+                    s.narrow_used += 1;
+                    s.narrow_dropped += dropped;
+                });
+                return narrow;
+            }
+        }
         hit
     }
 
@@ -2596,7 +2695,7 @@ impl Ahead {
         self.tip = None;
     }
 
-    fn tip_of(&self, e: &Entry, base: &Confirmed) -> AheadTip {
+    fn tip_of(&self, e: &Entry, base: &Confirmed, first: bool) -> AheadTip {
         let mut unsure: Vec<String> = e.unsure_cum.iter().chain(self.pools.not_ready.iter()).cloned().collect();
         unsure.sort();
         unsure.dedup();
@@ -2613,6 +2712,7 @@ impl Ahead {
             built_at: e.built_at,
             apply_us: e.apply_us,
             feed_at: e.feed_at,
+            first,
         }
     }
 
@@ -3226,14 +3326,26 @@ fn target_has_no_code(view: &dyn StateRead, to: Option<Address>) -> bool {
 /// is kept) and write down every account / value it read. Our pools among
 /// them are the ones it may touch. Never asks the node.
 fn probe_reads(view: &dyn StateRead, ctx: &BlockCtx, t: &DecodedTx) -> Option<crate::check::db::ReadLog> {
+    Some(probe_full(view, ctx, t, false).0)
+}
+
+/// `probe_reads`, plus (when `want_writes`) the values the collect run
+/// left CHANGED, only if it finished without reverting (None otherwise:
+/// a reverted run writes nothing, which says nothing about the real one).
+/// FASTLANE_AHEAD_NARROW_UNSURE.
+fn probe_full(view: &dyn StateRead, ctx: &BlockCtx, t: &DecodedTx, want_writes: bool) -> (crate::check::db::ReadLog, Option<Vec<(Address, U256)>>) {
     let ov = Overrides::none();
     let mut s = Session::new(view, ctx, &ov, CheckOptions::default());
     s.db().set_recording(true);
     if matches!(view.account(t.from), Lookup::Missing) {
         s.db().add_pretend(t.from, AccountInfo { balance: t.value, nonce: t.nonce, code_hash: KECCAK_EMPTY, ..Default::default() });
     }
-    let _ = s.apply_decoded(t);
-    Some(std::mem::take(&mut s.db().reads))
+    let r = s.apply_decoded(t);
+    let writes = match r {
+        Ok(o) if want_writes && o.success => Some(s.changed_slots()),
+        _ => None,
+    };
+    (std::mem::take(&mut s.db().reads), writes)
 }
 
 // ---------------------------------------------------------------------------
@@ -3723,7 +3835,7 @@ fn status_of(a: &Ahead) -> Value {
 
 /// The accuracy summary (status "fastlaneAhead.accuracy"). `times` false =
 /// no blocks-ahead percentiles (no copy + sort of the since-start ring).
-fn accuracy_json(s: &AheadStats, times: bool) -> Value {
+pub fn accuracy_json(s: &AheadStats, times: bool) -> Value {
     let pct = |a: u64, b: u64| (b > 0).then(|| (1000.0 * a as f64 / b as f64).round() / 10.0);
     json!({
         "exact": s.agree, "wrong": s.disagree, "unsure": s.unsure,
@@ -3737,6 +3849,13 @@ fn accuracy_json(s: &AheadStats, times: bool) -> Value {
         // Live classification: sure pools by whether the base had the
         // keeper's values (right / wrong).
         "keptBase": {"right": s.right_kept, "wrong": s.wrong_kept}, "plainBase": {"right": s.right_plain, "wrong": s.wrong_plain},
+        // Nov 7: why the wrong ones were wrong (same labels as the hourly
+        // line), how many unsure pools really moved, and the narrow-unsure
+        // rule's counts (FASTLANE_AHEAD_NARROW_UNSURE).
+        "why": {"missedFilter": s.missed_filter, "missedRan": s.missed_ran, "missedReverted": s.missed_reverted, "missedFailed": s.missed_failed,
+            "missedOffRoute": s.missed_off_route, "phantom": s.phantom, "value": s.value_diff, "staleBase": s.stale_base, "notFromTx": s.not_from_tx},
+        "unsureMoved": s.unsure_moved,
+        "narrow": {"used": s.narrow_used, "dropped": s.narrow_dropped, "fallback": s.narrow_fallback},
     })
 }
 
@@ -3910,5 +4029,26 @@ mod tests {
         assert!(get(vec![]).routes_only && !get(vec![("FASTLANE_AHEAD_ROUTES_ONLY", "off")]).routes_only);
         // ahead3: picking keeper-held targets is on unless switched off.
         assert!(get(vec![]).keep_pick && !get(vec![("FASTLANE_AHEAD_KEEP_PICK", "off")]).keep_pick);
+        // Nov 7: horizon notes and the narrow-unsure rule are off unless set.
+        assert!(!get(vec![]).hz_notes && get(vec![("FASTLANE_AHEAD_HZ_NOTES", "on")]).hz_notes);
+        assert!(!get(vec![("FASTLANE_AHEAD", "observe")]).narrow_unsure && get(vec![("FASTLANE_AHEAD_NARROW_UNSURE", "on")]).narrow_unsure);
+    }
+
+    #[test]
+    fn written_by_finds_pool_contracts_and_v4_base_values_only() {
+        // FASTLANE_AHEAD_NARROW_UNSURE: which of our pools a run WROTE.
+        let usdg = Address::from([0x11; 20]);
+        let meme = Address::from([0x33; 20]);
+        let pm = Address::from([0x44; 20]);
+        let v2 = Address::from([0x66; 20]);
+        let id = B256::from([0x01; 32]);
+        let fp = |a: Address, id: Option<B256>| FollowedPool { key: id.map(|i| format!("{i:#x}")).unwrap_or_else(|| format!("{a:#x}")), address: a, v4_id: id };
+        let set = PoolSet::build(&[(fp(v2, None), usdg, meme), (fp(pm, Some(id)), Address::ZERO, usdg)], HashSet::new());
+        let base = v4_base(id);
+        // Any value of the pool contract counts; a coin's value does not.
+        assert_eq!(set.written_by(&[(v2, U256::from(8u64)), (usdg, U256::from(3u64))]), vec![format!("{v2:#x}")]);
+        // The V4 pool's liquidity (base + 3) counts; another PoolManager value does not.
+        assert_eq!(set.written_by(&[(pm, base + U256::from(3u64))]), vec![format!("{id:#x}")]);
+        assert!(set.written_by(&[(pm, base + U256::from(4u64)), (pm, U256::from(7u64))]).is_empty());
     }
 }
