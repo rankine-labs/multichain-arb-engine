@@ -1,0 +1,3 @@
+Built automatically by .github/workflows/arbsim-binary.yml.
+Do not edit or merge this branch. The server downloads it read-only
+(deploy/arbsim-update.sh). See docs/FAST_CHECK_OPS.md.
