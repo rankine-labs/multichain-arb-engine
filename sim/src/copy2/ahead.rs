@@ -4028,7 +4028,8 @@ mod tests {
         assert!(get(vec![("FASTLANE", "live"), ("FASTLANE_AHEAD_TRUST_SENDER_FUNDS", "on")]).trust_sender_funds);
         assert!(get(vec![]).routes_only && !get(vec![("FASTLANE_AHEAD_ROUTES_ONLY", "off")]).routes_only);
         // ahead3: picking keeper-held targets is on unless switched off.
-        assert!(get(vec![]).keep_pick && !get(vec![("FASTLANE_AHEAD_KEEP_PICK", "off")]).keep_pick);        // Nov 7: horizon notes and the narrow-unsure rule are off unless set.
+        assert!(get(vec![]).keep_pick && !get(vec![("FASTLANE_AHEAD_KEEP_PICK", "off")]).keep_pick);
+        // Nov 7: horizon notes and the narrow-unsure rule are off unless set.
         assert!(!get(vec![]).hz_notes && get(vec![("FASTLANE_AHEAD_HZ_NOTES", "on")]).hz_notes);
         assert!(!get(vec![("FASTLANE_AHEAD", "observe")]).narrow_unsure && get(vec![("FASTLANE_AHEAD_NARROW_UNSURE", "on")]).narrow_unsure);
     }
