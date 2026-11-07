@@ -246,6 +246,25 @@ impl<'a> Session<'a> {
         Snapshot(self.evm.ctx.journaled_state.inner.clone())
     }
 
+    /// Storage values the runs so far left CHANGED (address, slot): what
+    /// they wrote, as far as this scratch pad knows (a reverted run leaves
+    /// nothing). Used by the predicted copy's "narrow unsure" rule
+    /// (copy2/ahead.rs, FASTLANE_AHEAD_NARROW_UNSURE): which of our pools a
+    /// transaction it could not run exactly would really write to.
+    pub fn changed_slots(&self) -> Vec<(Address, U256)> {
+        let mut out: Vec<(Address, U256)> = self
+            .evm
+            .ctx
+            .journaled_state
+            .inner
+            .state
+            .iter()
+            .flat_map(|(a, acc)| acc.storage.iter().filter(|(_, v)| v.is_changed()).map(move |(k, _)| (*a, *k)))
+            .collect();
+        out.sort();
+        out
+    }
+
     /// Go back to a saved scratch state.
     pub fn restore(&mut self, s: &Snapshot) {
         self.evm.ctx.journaled_state.inner = s.0.clone();
