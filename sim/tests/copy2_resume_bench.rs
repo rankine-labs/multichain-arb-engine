@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use arbsim::copy2::coins::BalanceLayout;
-use arbsim::copy2::intake::{catchup_slice_to, manual, BlockMsg, C2Config, Copy2Handle, FarZero, Intake, PoolEntry, PoolState, WalkInfo};
+use arbsim::copy2::intake::{catchup_slice_to, manual, start_guard_from, start_guard_step, BlockMsg, C2Config, Copy2Handle, FarZero, Intake, PoolEntry, PoolState, StartGuard, WalkInfo};
 use arbsim::copy2::persist;
 use arbsim::copy2::{BlockCtx as ReplayCtx, PoolKind, PoolLog, TrackedPool};
 use arbsim::node::{CallResult, Class, NodeApi, NodeErr};
@@ -616,5 +616,187 @@ fn warm_restart_forget_keeps_only_newest_versions() {
     assert_eq!(old.1, new.1, "same values forgotten");
     assert!(old.2 > 8, "the old way kept (and rewrote) many versions: {}", old.2);
     assert!(new.2 <= 4 + 1, "only the newest 4 (+ the bot's block) kept: {}", new.2);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ============================================================================
+// (Nov 9) START GUARD (ARBSIM_COPY2_START_GUARD). Live Nov 9 15:03-15:34:
+// the bot's WebSocket was refused (HTTP 429) the whole time, the bot never
+// sent a block, and the restored copy waited for "the bot's first block"
+// for good (0 node requests; ARBSIM_COPY2_RESUME_MAX_BLOCKS=1 did nothing
+// because it was only checked when that block came).
+// ============================================================================
+
+/// A restored copy with the start guard set as given (no bot blocks sent).
+fn guarded(node: Arc<FakeNode>, file: String, max_blocks: u64, wait_s: u64, guard: bool) -> (Arc<Shared>, Intake, Copy2Handle) {
+    let nd: Arc<dyn NodeApi> = node;
+    let sh = Shared::new(Config { history: 64, ..Config::for_tests() }, Some(nd), Arc::new(Volatile::default()));
+    let cfg = C2Config {
+        state_file: Some(file),
+        save_every_s: 3600,
+        walks_inflight: 0,
+        keep_blocks: 2400,
+        catchup_slice_blocks: 500,
+        resume_max_blocks: max_blocks,
+        start_guard: guard,
+        start_wait_s: wait_s,
+        ..C2Config::for_tests()
+    };
+    let (i, hd) = manual(sh.clone(), Arc::new(FillQueue::new(1000, 100)), cfg);
+    (sh, i, hd)
+}
+
+/// Pump the intake until `done` says so (true) or `secs` pass (false).
+fn pump_until(intake: &mut Intake, secs: u64, mut done: impl FnMut() -> bool) -> bool {
+    let t0 = Instant::now();
+    while t0.elapsed() < Duration::from_secs(secs) {
+        intake.pump();
+        if done() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    false
+}
+
+/// A fresh copy of the made-up saved file in its own folder.
+fn saved_file(tag: &str) -> (std::path::PathBuf, String) {
+    let dir = std::env::temp_dir().join(format!("arbsim-start-guard-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = dir.join("saved.bin").to_str().unwrap().to_string();
+    persist::save(&state(&sizes()), &p).unwrap();
+    (dir, p)
+}
+
+#[test]
+fn start_guard_switch_and_steps() {
+    // Unset = on; only an explicit off turns it off.
+    assert!(start_guard_from(None));
+    assert!(start_guard_from(Some("on")));
+    assert!(start_guard_from(Some("1")));
+    assert!(start_guard_from(Some("")));
+    assert!(!start_guard_from(Some("off")));
+    assert!(!start_guard_from(Some(" OFF ")));
+    assert!(!start_guard_from(Some("0")));
+    assert!(!start_guard_from(Some("false")));
+    // The bot already sent a newer block: the normal warm restart goes on.
+    assert_eq!(start_guard_step(100, 0, 999, true, 18_000, 30), StartGuard::Wait);
+    assert_eq!(start_guard_step(100, 99_999, 999, true, 18_000, 30), StartGuard::Wait);
+    // Tip not known yet: ask it (at once, not after 30 s).
+    assert_eq!(start_guard_step(100, 0, 0, false, 18_000, 30), StartGuard::AskTip);
+    // RESUME_MAX_BLOCKS checked as soon as the tip is known (live Nov 9:
+    // =1 did nothing because it waited for the bot's first block).
+    assert_eq!(start_guard_step(100, 102, 0, false, 1, 30), StartGuard::TooFar(2));
+    assert_eq!(start_guard_step(100, 27_886, 0, false, 18_000, 30), StartGuard::TooFar(27_786));
+    // 0 = warm restart off: any newer tip drops the saved copy.
+    assert_eq!(start_guard_step(100, 101, 0, false, 0, 30), StartGuard::TooFar(1));
+    // Close enough: wait for the bot up to the wait, then catch up alone.
+    assert_eq!(start_guard_step(100, 3_100, 29, false, 18_000, 30), StartGuard::Wait);
+    assert_eq!(start_guard_step(100, 3_100, 30, false, 18_000, 30), StartGuard::CatchUpTo(3_100));
+    // A node behind the saved copy never makes it go backwards.
+    assert_eq!(start_guard_step(100, 90, 30, false, 18_000, 30), StartGuard::CatchUpTo(100));
+}
+
+/// The bot sends nothing (its WebSocket refused): the restored copy asks
+/// the node's newest block itself and catches up to it from the node's
+/// logs; the bot's first block later is a normal gap catch-up.
+#[test]
+fn start_guard_bot_silent_catches_up_alone() {
+    let z = sizes();
+    let (dir, p) = saved_file("silent");
+    let tip = S + 3000;
+    let node = fake(tip, z.v2);
+    let (sh, mut intake, hd) = guarded(node.clone(), p, 18_000, 0, true);
+    assert_eq!(counter(&hd, "resume_pools"), z.v3 + z.v2);
+    let ok = pump_until(&mut intake, 120, || counter(&hd, "catchups_done") + counter(&hd, "catchups_failed") > 0);
+    let r = hd.status_json(false)["resume"].clone();
+    assert!(ok, "never caught up without the bot: {r}");
+    assert_eq!(counter(&hd, "catchups_done"), 1, "{r}");
+    assert_eq!(counter(&hd, "catchups_failed"), 0, "{r}");
+    assert_eq!(counter(&hd, "start_guard_self_catchups"), 1);
+    assert!(counter(&hd, "start_guard_tip_asks") >= 1, "the guard asked the tip itself");
+    assert_eq!(counter(&hd, "loads"), 0, "no pool loaded again");
+    assert_eq!(counter(&hd, "unsure_marked"), 0, "no pool unsure");
+    assert!(node.public.load(Ordering::Relaxed) + node.paid.load(Ordering::Relaxed) > 0, "node requests were made");
+    assert_eq!(r["lastCatchUp"]["toBlock"].as_u64(), Some(tip), "{r}");
+    let head = sh.head().unwrap().block;
+    assert!(head > S && head <= tip, "head {head}");
+    // Now the bot's WebSocket comes back: its first block (after a "start"
+    // gap) is filled from the logs, nothing reloads.
+    let first = tip + 5;
+    node.tip.store(first, Ordering::Relaxed);
+    let mut m = msg(first, Some(first), z.v2);
+    m.gap_reason = Some("start".into());
+    hd.block(m);
+    let ok = pump_until(&mut intake, 120, || counter(&hd, "catchups_done") + counter(&hd, "catchups_failed") >= 2);
+    assert!(ok, "bot's first block never applied: {}", hd.status_json(false)["resume"]);
+    assert_eq!(counter(&hd, "catchups_done"), 2);
+    assert_eq!(counter(&hd, "catchups_failed"), 0);
+    assert_eq!(counter(&hd, "loads"), 0);
+    assert_eq!(sh.head().unwrap().block, first, "at the bot's block");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A saved copy more than ARBSIM_COPY2_RESUME_MAX_BLOCKS behind the node
+/// is dropped right at start (no bot block needed): the old normal load.
+#[test]
+fn start_guard_too_old_saved_copy_dropped_at_start() {
+    let z = sizes();
+    let (dir, p) = saved_file("toofar");
+    let node = fake(S + 5000, z.v2);
+    let (sh, mut intake, hd) = guarded(node, p, 1000, 3600, true);
+    let ok = pump_until(&mut intake, 30, || counter(&hd, "catchups_failed") > 0);
+    let r = hd.status_json(false)["resume"].clone();
+    assert!(ok, "saved copy not dropped: {r}");
+    assert_eq!(counter(&hd, "start_guard_too_far"), 1);
+    assert_eq!(counter(&hd, "catchups_done"), 0);
+    let state = r["state"].as_str().unwrap_or("");
+    assert!(state.contains("normal load") && state.contains("checked at start"), "{state}");
+    // The copy forgot the saved block: the next bot block starts a normal load.
+    assert!(sh.head().is_none());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Guard on, bot sends its block in time: the normal warm restart, the
+/// guard does nothing but ask the tip.
+#[test]
+fn start_guard_bot_in_time_normal_warm_restart() {
+    let z = sizes();
+    let (dir, p) = saved_file("intime");
+    let first = S + 3001;
+    let node = fake(first, z.v2);
+    let (sh, mut intake, hd) = guarded(node, p, 18_000, 3600, true);
+    catch_up(&mut intake, &hd, first, z.v2);
+    assert_eq!(counter(&hd, "catchups_done"), 1, "{}", hd.status_json(false)["resume"]);
+    assert_eq!(counter(&hd, "start_guard_self_catchups"), 0);
+    assert_eq!(counter(&hd, "start_guard_too_far"), 0);
+    assert_eq!(sh.head().unwrap().block, first);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Rollback: ARBSIM_COPY2_START_GUARD=off is the old way exactly (waits
+/// for the bot; no node request at all meanwhile), and the bot's first
+/// block still brings it forward.
+#[test]
+fn start_guard_off_waits_like_before() {
+    let z = sizes();
+    let (dir, p) = saved_file("off");
+    let node = fake(S + 3000, z.v2);
+    let (sh, mut intake, hd) = guarded(node.clone(), p, 1, 0, false);
+    let moved = pump_until(&mut intake, 1, || counter(&hd, "catchups_done") + counter(&hd, "catchups_failed") > 0);
+    assert!(!moved, "guard off must not act");
+    assert_eq!(node.public.load(Ordering::Relaxed) + node.paid.load(Ordering::Relaxed), 0, "no node request while waiting");
+    assert_eq!(counter(&hd, "start_guard_tip_asks"), 0);
+    assert!(hd.status_json(false)["resume"]["state"].as_str().unwrap_or("").contains("waiting for the bot"));
+    // The bot's block: RESUME_MAX_BLOCKS 1 is checked only now (the old way).
+    let first = S + 3001;
+    let mut m = msg(first, Some(first), z.v2);
+    m.gap_reason = Some("start".into());
+    hd.block(m);
+    let ok = pump_until(&mut intake, 30, || counter(&hd, "catchups_failed") > 0);
+    assert!(ok);
+    assert_eq!(counter(&hd, "start_guard_too_far"), 0);
+    let _ = sh;
     let _ = std::fs::remove_dir_all(&dir);
 }

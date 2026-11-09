@@ -799,6 +799,13 @@ c2counters!(
     // pools found different from the chain (reloaded), audits skipped (no
     // version for that block / pool changed meanwhile / node error).
     pool_audit_rounds, pool_audit_items, pool_audit_drift, pool_audit_skipped,
+    // (Nov 9) START GUARD (ARBSIM_COPY2_START_GUARD): warm restarts that
+    // caught up to the node's newest block on their own because the bot
+    // sent no block for ARBSIM_COPY2_START_WAIT_S; warm restarts dropped
+    // right at start because the node was already more than
+    // ARBSIM_COPY2_RESUME_MAX_BLOCKS ahead of the saved copy; node tip
+    // questions the guard asked itself.
+    start_guard_self_catchups, start_guard_too_far, start_guard_tip_asks,
 );
 
 fn inc(c: &AtomicU64) {
@@ -2207,6 +2214,20 @@ pub struct C2Config {
     /// seconds unused [ARBSIM_COPY2_CODE_PRUNE_S, 600; 0 = off = the old
     /// "keep every code forever"]. Checked with the 60 s memory caps.
     pub code_prune_s: u64,
+    /// (Nov 9) START GUARD after a warm restart [ARBSIM_COPY2_START_GUARD,
+    /// on; off = the old way, exactly]. Live Nov 9 15:03-15:34: the bot's
+    /// WebSocket was refused (HTTP 429) the whole time, so the bot never
+    /// sent a block, and the restored copy waited for "the bot's first
+    /// block" for good: 0 node requests, ARBSIM_COPY2_RESUME_MAX_BLOCKS
+    /// never even checked (it was only checked when that block came).
+    /// With the guard: (1) as soon as the node's newest block is known
+    /// (asked at once), a saved copy more than ARBSIM_COPY2_RESUME_MAX_BLOCKS
+    /// behind it is dropped and the pools load normally; (2) if the bot sends
+    /// no block for [ARBSIM_COPY2_START_WAIT_S, 30] the copy catches up to the
+    /// node's newest block from the node's logs on its own (the bot's
+    /// blocks after that are a normal gap catch-up).
+    pub start_guard: bool,
+    pub start_wait_s: u64,
 }
 
 impl C2Config {
@@ -2253,10 +2274,12 @@ impl C2Config {
             drop_grace_max_logs: env_u64("ARBSIM_COPY2_DROP_GRACE_MAX_LOGS", 400_000).max(1000) as usize,
             blind: super::v4blind::BlindCfg::from_env(),
             code_prune_s: env_u64("ARBSIM_COPY2_CODE_PRUNE_S", 600),
+            start_guard: start_guard_from(std::env::var("ARBSIM_COPY2_START_GUARD").ok().as_deref()),
+            start_wait_s: env_u64("ARBSIM_COPY2_START_WAIT_S", 30),
         }
     }
     pub fn for_tests() -> Self {
-        C2Config { reload_ms: 0, reload_max_ms: 0, layout_retry_s: 3600, load_batch: 25, loaders: 2, keep_blocks: 400, max_keep_blocks: 4000, max_rounds: 40, tip_every_s: 0, catchup_max_blocks: 64, walk: WalkCfg::default(), walks_inflight: 2, walk_max_slots: 1_000_000, walk_max_rss_mb: 0, walk_hot: 16, walk_hot_max_rss_mb: 0, late_fetch: true, max_keep_logs: 1_000_000, pending_ms: 300, pm_bound: true, verify_every_s: 0, verify_max: 400, fast_verify_ms: 0, fast_verify_max: 1000, fast_max_age_ms: 150_000, stall_s: 30, state_file: None, save_every_s: 3600, resume_max_blocks: 18_000, resume_overlap: 64, resume_range: 500, resume_timeout_s: 60, catchup_slice_blocks: 0, catchup_trim_mb: 0, resume_forget_keep_versions: 0, resume_verify_max: usize::MAX, drop_grace_s: 1800, drop_grace_max: 400, drop_grace_max_logs: 1_000_000, blind: super::v4blind::BlindCfg::for_tests(), code_prune_s: 0 }
+        C2Config { reload_ms: 0, reload_max_ms: 0, layout_retry_s: 3600, load_batch: 25, loaders: 2, keep_blocks: 400, max_keep_blocks: 4000, max_rounds: 40, tip_every_s: 0, catchup_max_blocks: 64, walk: WalkCfg::default(), walks_inflight: 2, walk_max_slots: 1_000_000, walk_max_rss_mb: 0, walk_hot: 16, walk_hot_max_rss_mb: 0, late_fetch: true, max_keep_logs: 1_000_000, pending_ms: 300, pm_bound: true, verify_every_s: 0, verify_max: 400, fast_verify_ms: 0, fast_verify_max: 1000, fast_max_age_ms: 150_000, stall_s: 30, state_file: None, save_every_s: 3600, resume_max_blocks: 18_000, resume_overlap: 64, resume_range: 500, resume_timeout_s: 60, catchup_slice_blocks: 0, catchup_trim_mb: 0, resume_forget_keep_versions: 0, resume_verify_max: usize::MAX, drop_grace_s: 1800, drop_grace_max: 400, drop_grace_max_logs: 1_000_000, blind: super::v4blind::BlindCfg::for_tests(), code_prune_s: 0, start_guard: false, start_wait_s: 30 }
     }
 }
 
@@ -2411,6 +2434,45 @@ struct SliceTotals {
     headers: u64,
     splits: u64,
     trims: u64,
+}
+
+/// ARBSIM_COPY2_START_GUARD: on unless set to off / 0 / false / no
+/// (unset = on).
+pub fn start_guard_from(v: Option<&str>) -> bool {
+    !matches!(v.map(|s| s.trim().to_ascii_lowercase()).as_deref(), Some("off" | "0" | "false" | "no"))
+}
+
+/// What the start guard does with a restored copy still waiting for the
+/// bot's first block (pure, for tests): `applied` = the saved copy's
+/// block, `tip` = the node's newest block (0 = not known yet), `waited` =
+/// seconds since the restore, `bot_block` = the bot sent a newer block.
+#[derive(Debug, PartialEq, Eq)]
+pub enum StartGuard {
+    /// Nothing to do (yet).
+    Wait,
+    /// Ask the node for its newest block.
+    AskTip,
+    /// The saved copy is too old: drop it, load normally.
+    TooFar(u64),
+    /// The bot is silent: catch up to this block on our own.
+    CatchUpTo(u64),
+}
+
+pub fn start_guard_step(applied: u64, tip: u64, waited_s: u64, bot_block: bool, max_blocks: u64, wait_s: u64) -> StartGuard {
+    if bot_block {
+        return StartGuard::Wait; // the normal warm restart goes on
+    }
+    if tip == 0 {
+        return StartGuard::AskTip;
+    }
+    let gap = tip.saturating_sub(applied);
+    if gap > max_blocks {
+        return StartGuard::TooFar(gap);
+    }
+    if waited_s >= wait_s {
+        return StartGuard::CatchUpTo(tip.max(applied));
+    }
+    StartGuard::Wait
 }
 
 /// CATCH-UP IN SLICES: last block the next slice reads, when the copy has
@@ -2590,6 +2652,8 @@ pub struct Intake {
     /// parked pools listed again whose own reports are being read.
     parked: HashMap<PoolKey, Parked>,
     resuming: HashMap<PoolKey, Parked>,
+    /// (Nov 9) Start guard: when it last asked the node's newest block itself.
+    guard_tip_asked: Option<Instant>,
 }
 
 /// Start the intake thread (+ loader threads).
@@ -2713,6 +2777,7 @@ pub fn manual(sh: Arc<Shared>, fills: Arc<FillQueue>, cfg: C2Config) -> (Intake,
         shutdown: None,
         parked: HashMap::new(),
         resuming: HashMap::new(),
+        guard_tip_asked: None,
     };
     let mut i = i;
     if let Some(path) = i.cfg.state_file.clone() {
@@ -2954,6 +3019,7 @@ impl Intake {
         }
         self.dispatch_tip();
         self.dispatch_delayed();
+        self.start_guard();
         self.dispatch_catchup();
         // New loads / fills / walks / settles / re-reads wait for a catch-up
         // (they would read at the copy's old block); work already running
@@ -6819,6 +6885,12 @@ impl Intake {
     //   Too big a gap (ARBSIM_COPY2_RESUME_MAX_BLOCKS), no node, or no
     //   complete answer within ARBSIM_COPY2_RESUME_TIMEOUT_S: the old way
     //   (normal load after a restart, reload of every pool after a gap).
+    //   (Nov 9) START GUARD (ARBSIM_COPY2_START_GUARD, on): after a restart
+    //   the node's newest block is asked at once; a saved copy more than
+    //   ARBSIM_COPY2_RESUME_MAX_BLOCKS behind it goes the old way right
+    //   away, and if the bot sends nothing for ARBSIM_COPY2_START_WAIT_S
+    //   (its WebSocket refused, live Nov 9) the copy catches up to the
+    //   node's newest block on its own instead of waiting for good.
 
     fn set_resume(&self, k: &str, v: Value) {
         self.c2.resume.lock().unwrap().insert(k.into(), v);
@@ -7206,6 +7278,50 @@ impl Intake {
         });
         self.set_resume("state", json!(format!("catching up blocks {}..{to} ({why})", last + 1)));
         true
+    }
+
+    /// (Nov 9) START GUARD (C2Config::start_guard): a restored copy never
+    /// waits for good for the bot's first block (see the config's notes).
+    fn start_guard(&mut self) {
+        if !self.cfg.start_guard || self.loaders.is_none() {
+            return;
+        }
+        let Some(cu) = &self.catchup else { return };
+        // Only a warm restart still waiting for the bot's first block.
+        if !cu.restored || cu.target.is_some() || cu.job.is_some() || cu.verify_job.is_some() || cu.caught {
+            return;
+        }
+        let applied = cu.applied;
+        let waited = cu.started.elapsed().as_secs();
+        let bot_block = self.pending.range(applied + 1..).next().is_some();
+        let tip = self.sh.node_tip.load(Ordering::Relaxed).max(self.c2.node_tip.load(Ordering::Relaxed));
+        match start_guard_step(applied, tip, waited, bot_block, self.cfg.resume_max_blocks, self.cfg.start_wait_s) {
+            StartGuard::Wait => {}
+            StartGuard::AskTip => {
+                // The node's newest block, asked now (not only every
+                // ARBSIM_COPY2_TIP_EVERY_S); one question at a time.
+                if self.guard_tip_asked.is_some_and(|t| t.elapsed() < Duration::from_secs(2)) || self.jobs.values().any(|j| matches!(j, JobFor::Tip)) {
+                    return;
+                }
+                self.guard_tip_asked = Some(Instant::now());
+                inc(&self.c2.stats.start_guard_tip_asks);
+                let id = self.new_job(JobFor::Tip);
+                self.loaders.as_ref().unwrap().send(Job::Tip { id });
+            }
+            StartGuard::TooFar(gap) => {
+                inc(&self.c2.stats.start_guard_too_far);
+                let why = format!("the node is {gap} blocks past the saved copy, more than ARBSIM_COPY2_RESUME_MAX_BLOCKS {} (checked at start)", self.cfg.resume_max_blocks);
+                self.catchup_failed(&why);
+            }
+            StartGuard::CatchUpTo(to) => {
+                inc(&self.c2.stats.start_guard_self_catchups);
+                let why = format!("restart; no block from the bot for {waited} s: catching up to the node's newest block {to} on its own");
+                eprintln!("[arbsim] copy2: START GUARD: {why} (ARBSIM_COPY2_START_GUARD, ARBSIM_COPY2_START_WAIT_S {})", self.cfg.start_wait_s);
+                let cu = self.catchup.as_mut().unwrap();
+                cu.target = Some(to);
+                cu.why = why;
+            }
+        }
     }
 
     /// Send the catch-up read (or stage 2) when due; give up when too late.
@@ -7894,8 +8010,19 @@ impl Intake {
         self.last_watchdog = Some(Instant::now());
         let (u, b, t) = ls.queue_lengths();
         let node = self.sh.node.as_ref().map(|n| n.usage()).unwrap_or(Value::Null);
+        // (Nov 9) Say what copy 2 itself is waiting for: on Nov 9 the only
+        // job was the 30 s node-tip check (answered each time) while the
+        // copy was really waiting for the bot's first block.
+        let waiting = match &self.catchup {
+            Some(cu) if cu.restored && cu.target.is_none() && cu.job.is_none() => format!(
+                " Copy 2 is waiting for the bot's first block after a warm restart ({} s; start guard {}).",
+                cu.started.elapsed().as_secs(),
+                if self.cfg.start_guard { format!("on, acts after {} s", self.cfg.start_wait_s) } else { "off".to_string() }
+            ),
+            _ => String::new(),
+        };
         eprintln!(
-            "[arbsim] copy2 WATCHDOG: no node answer for {} s while {} job(s) wait or run (queued: {u} urgent, {b} bulk, {t} traces). Threads: {}. Node: {}",
+            "[arbsim] copy2 WATCHDOG: no node answer for {} s while {} job(s) wait or run (queued: {u} urgent, {b} bulk, {t} traces). Threads: {}.{waiting} Node: {}",
             quiet.as_secs(),
             self.jobs.len(),
             ls.thread_states().join("; "),
