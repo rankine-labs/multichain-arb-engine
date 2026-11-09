@@ -1,0 +1,34 @@
+# ---------------------------------------------------------------------------
+# sniper: the Rust Predictive Sniper (BNB Chain / Four.meme first).
+#
+# A separate package on purpose: it has its own build, its own lock file and
+# shares nothing at runtime with the arbitrage bot (sim/ = arbsim), so work
+# here can never break the arb bot's build or behaviour.
+#
+# Phase 1 contents: a READ-ONLY lead-time probe. It never signs or sends a
+# transaction and holds no keys.
+# ---------------------------------------------------------------------------
+[package]
+name = "sniper"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "sniper"
+path = "src/main.rs"
+
+[dependencies]
+# JSON for the node's websocket messages and our JSONL output files.
+serde_json = "1"
+# Blocking websocket client (threads, no async runtime: same style as arbsim).
+# rustls + bundled root certificates, so no OpenSSL is needed on the server.
+tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
+# keccak256, to compute event ids (topic0) from their signatures.
+tiny-keccak = { version = "2", features = ["keccak"] }
+
+[profile.release]
+opt-level = 3
+debug = false
