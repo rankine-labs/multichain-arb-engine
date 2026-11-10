@@ -147,7 +147,7 @@ fn ahead_on(cfg: AheadCfg, base: Snapshot) -> Ahead {
 fn kept(block: u64) -> Arc<KeptVersion> {
     let mut k = Snapshot::default();
     put(&mut k, dep(), dep_code(), &[(0, 2)]);
-    Arc::new(KeptVersion { block, accounts: k.accounts.clone(), codes: k.codes.clone() })
+    Arc::new(KeptVersion { block, accounts: k.accounts.clone(), codes: k.codes.clone(), ..Default::default() })
 }
 
 /// The thread CPU clock does not count time spent waiting.

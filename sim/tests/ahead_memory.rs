@@ -141,7 +141,7 @@ fn copy2_snapshot(c2_pm: usize) -> Snapshot {
 /// The keeper: `keep_pm` PoolManager values copy 2 does not hold (other
 /// pools' ticks), + 299 other contracts of 300 values.
 fn kept_version(block: u64, keep_pm: usize) -> KeptVersion {
-    let mut kv = KeptVersion { block, accounts: PMap::default(), codes: PMap::default() };
+    let mut kv = KeptVersion { block, accounts: PMap::default(), codes: PMap::default(), ..Default::default() };
     let mut pm = Acct { basics: known(2), ..Default::default() };
     for i in 0..keep_pm as u64 {
         pm.storage.insert(key(PM, 10_000_000 + i), U256::from(7));

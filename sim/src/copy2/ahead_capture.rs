@@ -45,7 +45,7 @@
 //   and says so (an incomplete file is refused by the replay unless asked).
 //
 //   REPLAY: `arbsim ahead-replay <capture file> [--json] [--samples N]
-//   [--budget-ms N] [--partial] [--revert-sure] [--exact-revert-sure] [--sender-funds trusted|strict] [--unknown-continue] [--keeper <truth file> [--keeper-warm [--keeper-warm-passes N]] [--keep-contracts N] [--keep-seeds-per-h N] [--keep-prune-blocks N [--keep-prune-learned]] [--oracle]] [--filter-all] [--no-keep-pick] [--horizon] [--hz-notes] [--narrow-unsure]`
+//   [--budget-ms N] [--partial] [--revert-sure] [--exact-revert-sure] [--sender-funds trusted|strict] [--unknown-continue] [--keeper <truth file> [--keeper-warm [--keeper-warm-passes N]] [--keep-contracts N] [--keep-seeds-per-h N] [--keep-prune-blocks N [--keep-prune-learned]] [--oracle]] [--filter-all] [--no-keep-pick] [--horizon] [--hz-notes] [--narrow-unsure] [--keep-warm [--keep-warm-max N]] [--wrong-guard N]`
 //     Builds a fresh predicted copy, feeds it the capture event by event and
 //     prints: agreement % (agree / (agree + disagree), per pool compared),
 //     the disagreement breakdown by cause (missedFilter / missedRan /
@@ -447,6 +447,10 @@ fn dec_cfg(d: &mut Dec) -> Res<AheadCfg> {
         need_keeper: false,
         // Not in the file: memory fix (Nov 1); same answers either way.
         thin_pending: true,
+        // Not in the file (Nov 10): the replay always counts its causes;
+        // `--wrong-guard N` turns the guard on.
+        diag: false,
+        wrong_guard_blocks: 0,
     })
 }
 
@@ -1024,6 +1028,9 @@ pub struct ReplayOpts {
     pub hz_notes: bool,
     /// `--narrow-unsure` (Nov 7): FASTLANE_AHEAD_NARROW_UNSURE=on.
     pub narrow_unsure: bool,
+    /// `--wrong-guard N` (Nov 10): FASTLANE_AHEAD_WRONG_GUARD_BLOCKS=N
+    /// (0 / absent = off).
+    pub wrong_guard: u64,
 }
 
 /// Replay a capture through a fresh predicted copy. Returns the report
@@ -1102,10 +1109,14 @@ fn replay_with(cap: &CapFile, opts: &ReplayOpts, keeper: Option<KeeperOpts>) -> 
     cfg.horizon = opts.horizon || opts.hz_notes;
     cfg.hz_notes = opts.hz_notes;
     cfg.narrow_unsure = opts.narrow_unsure;
+    cfg.wrong_guard_blocks = opts.wrong_guard;
     cfg.keeper = keeper.is_some();
     let l2 = cfg.l2_offset;
     let mut a = Ahead::new(cfg);
     a.diag = Some(Default::default());
+    // Nov 10: the horizon's unsure causes and the missing-value contracts.
+    a.hz_diag = Some(Default::default());
+    a.miss_top = Some(Default::default());
     if opts.oracle {
         if let Some(k) = &keeper {
             a.oracle = Some(super::keeper_replay::Oracle::new(k.truth.clone()));
@@ -1217,6 +1228,10 @@ fn replay_with(cap: &CapFile, opts: &ReplayOpts, keeper: Option<KeeperOpts>) -> 
         };
         r["diag"] = json!({"failedRuns": top(fails), "unsurePools": top(unsure)});
     }
+    // Nov 10: the live status' cause breakdown (horizon causes, top missing
+    // contracts, the wrong guard).
+    a.cfg_mut_diag(true);
+    r["diag2"] = super::ahead::diag_json(&a);
     if let Some(o) = &a.oracle {
         r["oracle"] = o.report();
     }
@@ -1836,10 +1851,10 @@ pub fn print_report(r: &Value, samples: usize) -> String {
     o
 }
 
-/// `arbsim ahead-replay <capture file> [--json] [--samples N] [--budget-ms N] [--partial] [--revert-sure] [--exact-revert-sure] [--sender-funds trusted|strict] [--unknown-continue] [--keeper <truth file> [--keeper-warm [--keeper-warm-passes N]] [--keep-contracts N] [--keep-seeds-per-h N] [--keep-prune-blocks N [--keep-prune-learned]] [--oracle]] [--filter-all] [--no-keep-pick] [--horizon] [--hz-notes] [--narrow-unsure]`
+/// `arbsim ahead-replay <capture file> [--json] [--samples N] [--budget-ms N] [--partial] [--revert-sure] [--exact-revert-sure] [--sender-funds trusted|strict] [--unknown-continue] [--keeper <truth file> [--keeper-warm [--keeper-warm-passes N]] [--keep-contracts N] [--keep-seeds-per-h N] [--keep-prune-blocks N [--keep-prune-learned]] [--oracle]] [--filter-all] [--no-keep-pick] [--horizon] [--hz-notes] [--narrow-unsure] [--keep-warm [--keep-warm-max N]] [--wrong-guard N]`
 pub fn replay_main(args: &[String]) {
     let Some(path) = args.get(2).filter(|a| !a.starts_with("--")) else {
-        eprintln!("usage: arbsim ahead-replay <capture file> [--json] [--samples N] [--budget-ms N] [--partial] [--revert-sure] [--exact-revert-sure] [--sender-funds trusted|strict] [--unknown-continue] [--keeper <truth file> [--keeper-warm [--keeper-warm-passes N]] [--keep-contracts N] [--keep-seeds-per-h N] [--keep-prune-blocks N [--keep-prune-learned]] [--oracle]] [--filter-all] [--no-keep-pick] [--horizon] [--hz-notes] [--narrow-unsure]");
+        eprintln!("usage: arbsim ahead-replay <capture file> [--json] [--samples N] [--budget-ms N] [--partial] [--revert-sure] [--exact-revert-sure] [--sender-funds trusted|strict] [--unknown-continue] [--keeper <truth file> [--keeper-warm [--keeper-warm-passes N]] [--keep-contracts N] [--keep-seeds-per-h N] [--keep-prune-blocks N [--keep-prune-learned]] [--oracle]] [--filter-all] [--no-keep-pick] [--horizon] [--hz-notes] [--narrow-unsure] [--keep-warm [--keep-warm-max N]] [--wrong-guard N]");
         std::process::exit(2);
     };
     let arg = |f: &str| args.iter().position(|a| a == f).and_then(|i| args.get(i + 1)).and_then(|v| v.parse::<u64>().ok());
@@ -1876,6 +1891,7 @@ pub fn replay_main(args: &[String]) {
         horizon: args.iter().any(|a| a == "--horizon"),
         hz_notes: args.iter().any(|a| a == "--hz-notes"),
         narrow_unsure: args.iter().any(|a| a == "--narrow-unsure"),
+        wrong_guard: arg("--wrong-guard").unwrap_or(0),
     };
     // KEEPER (Oct 31): --keeper <truth file> [--keeper-warm [--keeper-warm-passes N]] [--keep-contracts N]
     // [--keep-seeds-per-h N]: the hot-contract keeper on recorded block diffs.
@@ -1964,6 +1980,11 @@ pub fn replay_main(args: &[String]) {
             }
             // (Nov 2) --keep-prune-learned: learned values pruned too (live default).
             kc.prune_learned = args.iter().any(|a| a == "--keep-prune-learned");
+            // (Nov 10) --keep-warm [--keep-warm-max N]: FASTLANE_AHEAD_KEEP_WARM.
+            kc.warm = args.iter().any(|a| a == "--keep-warm");
+            if let Some(n) = arg("--keep-warm-max") {
+                kc.warm_max = n as usize;
+            }
             let passes = if args.iter().any(|a| a == "--keeper-warm") { arg("--keeper-warm-passes").unwrap_or(1).clamp(1, 10) as usize } else { 0 };
             replay_keeper(&cap, &opts, truth, kc, passes)
         }
