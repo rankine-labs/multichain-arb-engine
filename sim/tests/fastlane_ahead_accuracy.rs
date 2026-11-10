@@ -1049,6 +1049,9 @@ fn taint_spreads_through_values_a_tainted_run_wrote() {
     assert_eq!(tip.view().storage(pool(), U256::ZERO), known(109), "100 + 3 x 3, kept");
     assert_eq!(a.total.tainted_runs, 2, "SPY and ROUTER: {}", a.total.json_with(false));
     assert!(a.total.tainted_marks >= 1);
+    // SPY moved nothing of ours, but its run was tainted: its target is
+    // learned like a failed run's, so its next calls are always picked.
+    assert!(a.is_toucher(&spy()));
 }
 
 /// A run that reads nothing unsure is exactly as before (sure).

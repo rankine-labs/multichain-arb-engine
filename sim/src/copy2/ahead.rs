@@ -3134,6 +3134,16 @@ impl Ahead {
                             s.tainted_runs += 1;
                             s.tainted_marks += n;
                         });
+                        // Its target is remembered like a failed run's (its
+                        // next calls are picked, never skipped by the filter):
+                        // with the old rule this run FAILED and taught that.
+                        // Offline Oct 31 replay: without it, one later call to
+                        // such a target was skipped and its pool was wrong.
+                        if moved.is_empty() {
+                            if let Some(a) = t.to {
+                                self.learn_toucher(a, &[]);
+                            }
+                        }
                         mark_unsure(&mut ov, &mut changed, &mut changed_cum, &mut unsure_cum, &mut held_cum, &hit);
                     }
                     for k in &moved {
