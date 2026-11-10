@@ -223,11 +223,18 @@ mod tests {
                "amount": "1000", "offers": "500", "funds": "70", "price": price.to_string(), "removed": false})
     }
 
-    /// Each buy lifts the price 5%-ish so bursts can fire (100, 105, 110, ...).
+    /// Each buy lifts the price 5% so bursts can fire. The price counter is
+    /// per test thread (each test runs on its own thread), so tests can't
+    /// affect each other whatever order they run in.
     fn trade(kind: &str, token: &str, account: &str, block: u64, cost: u64) -> Value {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static P: AtomicU64 = AtomicU64::new(100);
-        let p = if kind == "buy" { P.fetch_add(5, Ordering::Relaxed) + 5 } else { P.load(Ordering::Relaxed) };
+        use std::cell::Cell;
+        thread_local!(static P: Cell<u64> = const { Cell::new(1_000_000) });
+        let p = P.with(|c| {
+            if kind == "buy" {
+                c.set(c.get() * 105 / 100);
+            }
+            c.get()
+        });
         trade_p(kind, token, account, block, cost, p)
     }
 

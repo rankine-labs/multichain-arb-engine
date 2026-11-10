@@ -7,6 +7,9 @@
 //                                   see src/scan.rs)
 //   sniper sell-check <token> <BNB> simulate our buy + sell of a token
 //                                   (env: SNIPER_RPC, SNIPER_WALLET)
+//   sniper rhc-probe                Robinhood Chain speed test (read-only;
+//                                   env: see src/rhc.rs)
+//   sniper rhc-report <dir>         its results (head start, rushes, trades)
 //   sniper curve-check <dir>        fit + verify the Four.meme price formula
 //                                   against real trades (writes curve_fit.json)
 //   sniper report <dir> [options]   print the numbers for a probe run and
@@ -73,6 +76,39 @@ fn main() -> ExitCode {
                 }
             }
         }
+        Some("rhc-probe") => match sniper::rhc::run(sniper::rhc::Config::from_env()) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("rhc: {e}");
+                ExitCode::FAILURE
+            }
+        },
+        Some("rhc-report") => {
+            let Some(dir) = args.get(1) else {
+                eprintln!("usage: sniper rhc-report <dir> [--rush-buys N] [--min-rise-pct X] [--offset N]");
+                return ExitCode::FAILURE;
+            };
+            let mut o = sniper::rhc_report::Opts::default();
+            let mut i = 2;
+            while i < args.len() {
+                let val = args.get(i + 1).and_then(|v| v.parse::<f64>().ok());
+                match (args[i].as_str(), val) {
+                    ("--rush-buys", Some(v)) => o.rush_buys = v as usize,
+                    ("--min-rise-pct", Some(v)) => o.min_rise_pct = v,
+                    ("--offset", Some(v)) => o.offset = v as i64,
+                    (a, _) => {
+                        eprintln!("unknown or incomplete option: {a}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+                i += 2;
+            }
+            let dir = PathBuf::from(dir);
+            let r = sniper::rhc_report::build(&dir, &o);
+            let _ = std::fs::write(dir.join("rhc_summary.json"), serde_json::to_string_pretty(&r).unwrap_or_default());
+            print!("{}", sniper::rhc_report::render(&r));
+            ExitCode::SUCCESS
+        }
         Some("curve-check") => {
             let Some(dir) = args.get(1) else {
                 eprintln!("usage: sniper curve-check <probe output dir>");
@@ -123,7 +159,7 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         _ => {
-            eprintln!("usage: sniper probe | sniper scan | sniper sell-check <token> <BNB> | sniper curve-check <dir> | sniper report <dir> [--min-lead-ms N] [--burst-buys N] [--hurdle-pct X] [--json]");
+            eprintln!("usage: sniper probe | sniper rhc-probe | sniper rhc-report <dir> | sniper scan | sniper sell-check <token> <BNB> | sniper curve-check <dir> | sniper report <dir> [--min-lead-ms N] [--burst-buys N] [--hurdle-pct X] [--json]");
             ExitCode::FAILURE
         }
     }

@@ -95,6 +95,23 @@ Notes:
   doesn't, the check cannot complete, which counts as a REJECT.
 - A passing sell-check proves sellability on the current state only.
 
+## Robinhood Chain speed test (read-only)
+
+`sniper rhc-probe` records the public sequencer feed (the same feed the arb
+bot's copy reads) and every Uniswap V3/V4 swap on token/WETH and token/USDG
+pools, from any node (default: the free public RPC). No keys needed.
+`sniper rhc-report <dir>` then reports:
+1. how much earlier the feed shows each block than a normal node (the copy's
+   head start over bots that wait for block data),
+2. buying rushes on any token (>= 3 buys from 3 transactions, price +2% in
+   one block),
+3. simulated fast trades after each rush (take-profit / stop-loss / time
+   limit, pool fee both ways), for "we're first" and "rivals beat us by a
+   block", with a rough 95% range for the average.
+
+Env: `SNIPER_RHC_FEED`, `SNIPER_RHC_HTTP`, `SNIPER_OUT`,
+`SNIPER_DURATION_SECS`, `SNIPER_RHC_POLL_MS` (default 200).
+
 ## Tests
 
 ```bash
