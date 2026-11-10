@@ -1,4 +1,4 @@
-# Rust Predictive Sniper: Phase 1 lead-time probe
+# Rust Predictive Sniper (Phase 1 and 2: read-only)
 
 Read-only. It holds no keys and never sends a transaction. It is a separate
 package from the arbitrage bot (`sim/`) and shares no build or runtime with it.
@@ -79,6 +79,22 @@ Follow-through ignores our own price impact and is an upper bound.
 under ~20% of volume, or actionable under ~150 ms at p50. If so, Signal A is
 dropped and we focus on confirmed-burst entries plus pending-flow exits.
 
+## Other commands (all read-only)
+
+| Command | What it does |
+|---|---|
+| `sniper scan` | Live token scanner. Prints NEW tokens, BURST (N buys from N wallets in one block), DUMP (creator sold), GRAD (graduated). Env: `SNIPER_BLOCK_WS`, optional `SNIPER_BURST_BUYS`, `SNIPER_OUT`. Writes `signals.jsonl`. |
+| `sniper curve-check <probe dir>` | Fits Four.meme's (unpublished) price curve from real trades the probe recorded and replays every trade with our own maths. Verdict PASS only if trades match within 0.01%. Writes `curve_fit.json`. |
+| `sniper sell-check <token> <BNB>` | Simulates our wallet buying that much of a token and selling it all, on current chain state (`eth_simulateV1`). Reports buy tax, sell success and round-trip loss. Nothing is signed or spent. Env: `SNIPER_RPC` (https node URL), `SNIPER_WALLET` (address to simulate). |
+
+Notes:
+- Four.meme's contract source is not published, so the price formula is
+  fitted and verified from real trades, never assumed. Local quotes are not
+  used for sizing until `curve-check` passes.
+- `sell-check` needs a node that supports `eth_simulateV1`. If the provider
+  doesn't, the check cannot complete, which counts as a REJECT.
+- A passing sell-check proves sellability on the current state only.
+
 ## Tests
 
 ```bash
@@ -86,6 +102,14 @@ cd sniper && cargo test
 ```
 
 Unit tests cover event decoding (including the Four.meme event ids), the
-matcher and the report maths. `tests/probe_e2e.rs` runs the real probe
+matcher, the report maths, the curve maths, curve calibration (recovers a
+known curve; fails a wrong one), the token registry and the sell-check
+verdicts. `tests/probe_e2e.rs` runs the real probe
 against two fake websocket nodes, including a dropped connection and a node
 that refuses full pending txs.
+
+`tests/sellcheck_anvil.rs` runs the real sell check against a local EVM
+(anvil from Foundry) with test-only mock contracts (`tests/fixtures/`): a
+normal token (PASS), a 5% tax token (REJECT) and an unsellable token
+(REJECT). It needs `anvil` on PATH or `ANVIL_BIN=/path/to/anvil`, and
+skips itself otherwise.

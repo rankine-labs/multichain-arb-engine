@@ -5,6 +5,8 @@
 //                                   see src/probe.rs or README.md)
 //   sniper scan                     live token scanner (config: env vars,
 //                                   see src/scan.rs)
+//   sniper sell-check <token> <BNB> simulate our buy + sell of a token
+//                                   (env: SNIPER_RPC, SNIPER_WALLET)
 //   sniper curve-check <dir>        fit + verify the Four.meme price formula
 //                                   against real trades (writes curve_fit.json)
 //   sniper report <dir> [options]   print the numbers for a probe run and
@@ -37,6 +39,39 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        Some("sell-check") => {
+            // sniper sell-check <token> <funds in BNB, e.g. 0.05>
+            // env: SNIPER_RPC (https URL), SNIPER_WALLET (our trading wallet address)
+            let (Some(token), Some(bnb)) = (args.get(1), args.get(2).and_then(|v| v.parse::<f64>().ok())) else {
+                eprintln!("usage: sniper sell-check <token address> <BNB amount>   (env: SNIPER_RPC, SNIPER_WALLET)");
+                return ExitCode::FAILURE;
+            };
+            let (Ok(url), Ok(wallet)) = (std::env::var("SNIPER_RPC"), std::env::var("SNIPER_WALLET")) else {
+                eprintln!("set SNIPER_RPC (https node URL) and SNIPER_WALLET (wallet address to simulate)");
+                return ExitCode::FAILURE;
+            };
+            use sniper::sellcheck::*;
+            let funds = ruint::aliases::U256::from((bnb * 1e9).round() as u64) * ruint::aliases::U256::from(1_000_000_000u64);
+            let req = Request {
+                manager: sniper::fourmeme::TOKEN_MANAGER_2.into(),
+                token: token.clone(),
+                wallet,
+                funds,
+                block: "latest".into(),
+            };
+            match run_check(&Rpc::new(&url), &req) {
+                Ok(r) => {
+                    println!("{r:#?}");
+                    println!("buy tax: {:?} bps | round trip loss: {:?} bps", r.buy_tax_bps(), r.round_trip_loss_bps(funds));
+                    println!("VERDICT: {:?}", verdict(&r, funds, &Limits::default()));
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("check could not complete (= REJECT): {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         Some("curve-check") => {
             let Some(dir) = args.get(1) else {
                 eprintln!("usage: sniper curve-check <probe output dir>");
@@ -86,7 +121,7 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         _ => {
-            eprintln!("usage: sniper probe | sniper scan | sniper curve-check <dir> | sniper report <dir> [--min-lead-ms N] [--burst-buys N] [--hurdle-pct X] [--json]");
+            eprintln!("usage: sniper probe | sniper scan | sniper sell-check <token> <BNB> | sniper curve-check <dir> | sniper report <dir> [--min-lead-ms N] [--burst-buys N] [--hurdle-pct X] [--json]");
             ExitCode::FAILURE
         }
     }

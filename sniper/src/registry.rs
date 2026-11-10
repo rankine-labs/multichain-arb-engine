@@ -196,7 +196,7 @@ impl Registry {
     /// Most active tokens over the last `window_ns`, by buy count.
     pub fn hottest(&self, now: u64, window_ns: u64, n: usize) -> Vec<&TokenEntry> {
         let mut v: Vec<&TokenEntry> = self.tokens.values().filter(|e| now.saturating_sub(e.last_t) <= window_ns && !e.graduated).collect();
-        v.sort_by(|a, b| b.buys.cmp(&a.buys));
+        v.sort_by_key(|e| std::cmp::Reverse(e.buys));
         v.truncate(n);
         v
     }

@@ -9,6 +9,7 @@
 //   probe.rs     the measurement run (threads + JSONL output)
 //   registry.rs  live token list + burst / creator-dump / graduation signals
 //   scan.rs      the live read-only scanner command
+//   sellcheck.rs simulate buy + sell from our wallet before every buy
 //   report.rs    coverage / lead time / follow-through numbers
 // ============================================================================
 pub mod calibrate;
@@ -19,4 +20,5 @@ pub mod probe;
 pub mod registry;
 pub mod report;
 pub mod scan;
+pub mod sellcheck;
 pub mod ws;
