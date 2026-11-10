@@ -261,6 +261,29 @@ pub struct KeeperCfg {
     /// FASTLANE_AHEAD_KEEP_BUDGET_WINDOW_S [1800]: bucket size in seconds of
     /// refill (with a budget of 40% of the need: ~10 min on, ~15 min off).
     pub budget_window_s: u64,
+    /// FASTLANE_AHEAD_KEEP_WARM (Nov 10, "seeing ahead sure more often")
+    /// [on live; off in the core's own default]. Plain English: every block
+    /// diff the keeper already fetches lists EVERY contract value the block
+    /// wrote, but the keeper only used the values of its kept contracts and
+    /// threw the rest away. The top reason a replay failed (about 40%) is a
+    /// value of some other contract the keeper does not hold: another
+    /// pool's price, a rival bot's or a coin's balance, which change with
+    /// every trade and are written by the very blocks we fetch. With this
+    /// on, a value a block WRITES in any other contract is kept too
+    /// ("warm"): exact from the diff (the node's own new value), updated by
+    /// every later block's diff like a kept value, aged out by the normal
+    /// prune (FASTLANE_AHEAD_KEEP_PRUNE_BLOCKS) when no block writes it and
+    /// no run reads it. Costs no node call at all (the diffs are fetched
+    /// anyway). Safety: a warm value never replaces a value copy 2 vouches
+    /// for as exact, warm contracts' balances / code are never served (only
+    /// written values), they never make a transaction "picked"
+    /// (FASTLANE_AHEAD_KEEP_PICK stays on the kept contracts) and they have
+    /// their own limit, so they never crowd out the kept contracts. The
+    /// keeper's audit checks warm values against the node like kept ones
+    /// (a mismatch drops everything, fail closed).
+    pub warm: bool,
+    /// FASTLANE_AHEAD_KEEP_WARM_MAX [100000]: most warm values held.
+    pub warm_max: usize,
 }
 
 /// FASTLANE_AHEAD_KEEP_PRUNE_BLOCKS default (memory fix 2, Nov 2): ~5 min
@@ -301,6 +324,9 @@ impl Default for KeeperCfg {
             seed_gather_ms: 0,
             units_day: 0,
             budget_window_s: 1800,
+            // Nov 10: off in the core's default (tests, replay unless asked).
+            warm: false,
+            warm_max: 100_000,
         }
     }
 }
@@ -351,6 +377,9 @@ impl KeeperCfg {
             seed_gather_ms: num("FASTLANE_AHEAD_KEEP_SEED_GATHER_MS", if thrift { 1000 } else { 0 }, 0, 60_000),
             units_day: num("FASTLANE_AHEAD_KEEP_UNITS_DAY", 0, 0, 1_000_000_000),
             budget_window_s: num("FASTLANE_AHEAD_KEEP_BUDGET_WINDOW_S", d.budget_window_s, 60, 86_400),
+            // Nov 10: on live unless set off (rollback: FASTLANE_AHEAD_KEEP_WARM=off).
+            warm: super::ahead::on_off(get("FASTLANE_AHEAD_KEEP_WARM").as_deref()).unwrap_or(true),
+            warm_max: num("FASTLANE_AHEAD_KEEP_WARM_MAX", d.warm_max as u64, 0, 2_000_000) as usize,
         }
     }
 }
@@ -365,6 +394,9 @@ pub struct KeptVersion {
     pub block: u64,
     pub accounts: PMap<Address, Acct>,
     pub codes: PMap<B256, Bytecode>,
+    /// FASTLANE_AHEAD_KEEP_WARM: accounts in `accounts` that are NOT kept
+    /// contracts, only "warm" (values a block wrote; no basics).
+    pub warm: PMap<Address, ()>,
 }
 
 impl KeptVersion {
@@ -375,6 +407,14 @@ impl KeptVersion {
     /// Do we hold this account's basics (balance, nonce, code hash) exactly?
     pub fn holds_basics(&self, a: &Address) -> bool {
         self.accounts.get(a).is_some_and(|x| matches!(x.basics, Basics::Known(_)))
+    }
+    /// A KEPT contract (chosen and seeded), not just a warm one.
+    pub fn is_kept(&self, a: &Address) -> bool {
+        self.accounts.contains_key(a) && !self.warm.contains_key(a)
+    }
+    /// A warm account (FASTLANE_AHEAD_KEEP_WARM).
+    pub fn is_warm(&self, a: &Address) -> bool {
+        self.warm.contains_key(a)
     }
     /// Values held in all.
     pub fn slots(&self) -> usize {
@@ -441,6 +481,9 @@ pub fn merge_base(base: &Snapshot, prov: &dyn Provenance, kv: &KeptVersion) -> (
             // look), while the keeper's exact values say they exist. Then
             // the keeper's account replaces copy 2's whole (a value the
             // keeper doesn't hold reads as missing, never as zero).
+            // FASTLANE_AHEAD_KEEP_WARM: a warm account (written values
+            // only, no basics) never replaces an account copy 2 knows whole.
+            Some(c) if c.storage_complete && kv.warm.contains_key(a) => {}
             Some(c) if c.storage_complete => {
                 let kb = matches!(k.basics, Basics::Known(_));
                 let c_exact = matches!(c.basics, Basics::Known(_)) && c.balance_exact && prov.balance_exact(*a) && c.basics == k.basics;
@@ -455,7 +498,14 @@ pub fn merge_base(base: &Snapshot, prov: &dyn Provenance, kv: &KeptVersion) -> (
             Some(c) => {
                 let mut m = c.clone();
                 let mut added = 0;
+                let warm = kv.warm.contains_key(a);
                 for (s, v) in k.storage.iter() {
+                    // FASTLANE_AHEAD_KEEP_WARM: a warm value only fills a
+                    // hole or replaces an approximate one, never a value
+                    // copy 2 vouches for as exact.
+                    if warm && c.storage.contains_key(s) && prov.slot_exact(*a, *s) {
+                        continue;
+                    }
                     // KEEPER WINS (ahead3, Oct 31): the keeper's value is the
                     // node's own, of exactly this block (audited: 0 wrong in
                     // millions of checks). Copy 2's "exact" can lag (a late
@@ -605,6 +655,12 @@ pub struct KeeperStats {
     pub audits: u64,
     /// (Thrift) seed jobs folded into another job's call (calls saved).
     pub seeds_merged: u64,
+    /// FASTLANE_AHEAD_KEEP_WARM: values adopted warm, warm accounts dropped
+    /// (created / destroyed again), blocks whose new warm accounts hit
+    /// FASTLANE_AHEAD_KEEP_WARM_MAX.
+    pub warm_adopted: u64,
+    pub warm_dropped: u64,
+    pub warm_full: u64,
     pub audit_values: u64,
     pub audit_mismatch: u64,
     pub resets: HashMap<&'static str, u64>,
@@ -629,7 +685,7 @@ impl KeeperStats {
             "learned": self.learned, "seedsSent": self.seeds_sent, "seedValues": self.seed_values, "seedsDropped": self.seeds_dropped,
             "evicted": self.evicted, "recreated": self.recreated, "adopted": self.adopted, "refusedFull": self.refused_full, "candsDropped": self.cands_dropped,
             "memLearnSkipped": self.mem_learn_skipped,
-            "prunes": self.prunes, "prunedValues": self.pruned_values, "prunedCodes": self.pruned_codes, "pruneLastValues": self.prune_last_values, "prunedLearned": self.pruned_learned, "usedMarks": self.used_marks, "audits": self.audits, "seedsMerged": self.seeds_merged, "auditValues": self.audit_values, "auditMismatch": self.audit_mismatch,
+            "prunes": self.prunes, "prunedValues": self.pruned_values, "prunedCodes": self.pruned_codes, "pruneLastValues": self.prune_last_values, "prunedLearned": self.pruned_learned, "usedMarks": self.used_marks, "audits": self.audits, "seedsMerged": self.seeds_merged, "warmAdopted": self.warm_adopted, "warmDropped": self.warm_dropped, "warmFull": self.warm_full, "auditValues": self.audit_values, "auditMismatch": self.audit_mismatch,
             "resets": self.resets.iter().map(|(k, v)| (k.to_string(), json!(v))).collect::<serde_json::Map<String, Value>>(),
             "applyUs": crate::timing::pct_of(&mut t),
             "samples": self.samples,
@@ -672,6 +728,10 @@ pub struct KeeperCore {
     /// (Thrift, SEED_GATHER_MS) when each contract's oldest waiting seed job
     /// was queued.
     seed_first: HashMap<Address, Instant>,
+    /// FASTLANE_AHEAD_KEEP_WARM: warm values held (recounted exactly at
+    /// every prune; between prunes it may count a few dropped ones too,
+    /// which only makes the warm limit stricter).
+    warm_n: usize,
 }
 
 
@@ -694,6 +754,7 @@ impl KeeperCore {
             written_prev: HashSet::new(),
             prune_from: None,
             seed_first: HashMap::new(),
+            warm_n: 0,
         }
     }
 
@@ -716,6 +777,24 @@ impl KeeperCore {
         (self.held.len(), self.cur.accounts.len(), self.cur.slots())
     }
 
+    /// Values held for KEPT contracts (warm ones have their own limit).
+    fn kept_slots(&self) -> usize {
+        self.cur.slots().saturating_sub(self.warm_n)
+    }
+
+    /// Warm accounts / values held now (FASTLANE_AHEAD_KEEP_WARM).
+    pub fn warm_counts(&self) -> (usize, usize) {
+        (self.cur.warm.len(), self.warm_n)
+    }
+
+    /// Stop treating `a` as warm (it became kept, was dropped, ...).
+    fn unwarm(&mut self, a: &Address) {
+        if self.cur.warm.remove(a).is_some() {
+            let n = self.cur.accounts.get(a).map_or(0, |x| x.storage.len());
+            self.warm_n = self.warm_n.saturating_sub(n);
+        }
+    }
+
     /// Seed calls waiting.
     pub fn seeds_waiting(&self) -> usize {
         self.seeds.len()
@@ -736,7 +815,8 @@ impl KeeperCore {
     /// contract's values are asked for again (at this block).
     pub fn start_at(&mut self, block: u64) {
         self.head = Some(block);
-        self.cur = KeptVersion { block, accounts: PMap::default(), codes: std::mem::take(&mut self.cur.codes) };
+        self.cur = KeptVersion { block, accounts: PMap::default(), codes: std::mem::take(&mut self.cur.codes), warm: PMap::default() };
+        self.warm_n = 0;
         self.versions.clear();
         self.recent.clear();
         self.seeds.clear();
@@ -775,7 +855,7 @@ impl KeeperCore {
         need.sort();
         need.dedup();
         // Bounded in all: what is held + what is asked for.
-        let room = self.cfg.max_slots_total.saturating_sub(self.cur.slots() + self.pending.len());
+        let room = self.cfg.max_slots_total.saturating_sub(self.kept_slots() + self.pending.len());
         if need.len() > room {
             self.stats.refused_full += (need.len() - room) as u64;
             need.truncate(room);
@@ -830,7 +910,7 @@ impl KeeperCore {
                 }
             }
         }
-        let total_held: usize = self.cur.slots();
+        let total_held: usize = self.kept_slots();
         let mut grew: Vec<Address> = Vec::new();
         for (a, (slots, basics)) in by {
             // A kept contract may hold FASTLANE_AHEAD_KEEP_SLOTS values; a
@@ -894,6 +974,9 @@ impl KeeperCore {
         }
         let add: Vec<Address> = want.into_iter().filter(|a| !self.held.contains(a)).collect();
         for a in add {
+            // A warm account chosen to be kept: its written values stay
+            // (exact), the rest is seeded.
+            self.unwarm(&a);
             self.held.insert(a);
             if self.head.is_some() {
                 self.queue_all(a);
@@ -902,6 +985,7 @@ impl KeeperCore {
     }
 
     fn evict(&mut self, a: Address) {
+        self.unwarm(&a);
         self.held.remove(&a);
         // (PRUNE bookkeeping: its write fingerprints simply age out within
         // two rounds; nothing to do here.)
@@ -1068,10 +1152,29 @@ impl KeeperCore {
         // ADOPT (FASTLANE_AHEAD_KEEP_ADOPT): room left for written values.
         // (Memory guard: nothing adopted while paused.)
         let adopt = self.cfg.adopt_writes && !self.mem_pause;
-        let mut total = if adopt { self.cur.slots() } else { 0 };
+        let mut total = if adopt { self.kept_slots() } else { 0 };
         let adopt_per = self.cfg.max_slots_per.saturating_mul(10);
+        // FASTLANE_AHEAD_KEEP_WARM (Nov 10): values this block wrote in
+        // contracts we neither keep nor hold yet, adopted after the loop.
+        let warm_on = self.cfg.warm && !self.mem_pause;
+        let mut warm_new: Vec<Address> = Vec::new();
+        let mut warm_drop: Vec<Address> = Vec::new();
         for (a, ad) in &merged.accounts {
-            let Some(cur) = self.cur.accounts.get(a) else { continue };
+            let Some(cur) = self.cur.accounts.get(a) else {
+                // Only plain writes into an existing contract: a created /
+                // destroyed / wiped account is left unknown (never guessed),
+                // and a contract chosen to be kept waits for its own seed.
+                if warm_on && !ad.storage.is_empty() && !ad.storage_cleared && !ad.forget && !matches!(ad.info, Some(None)) && !self.held.contains(a) {
+                    warm_new.push(*a);
+                }
+                continue;
+            };
+            let is_warm = self.cur.warm.contains_key(a);
+            if is_warm && (ad.storage_cleared || ad.forget || matches!(ad.info, Some(None))) {
+                // A warm contract created again / destroyed: dropped whole.
+                warm_drop.push(*a);
+                continue;
+            }
             // A contract CREATED at an address we hold (ahead3 fix): the
             // block diffs come without code, so its new code is unknown
             // here. Never hold it code-less: drop it, seed it again (with
@@ -1105,10 +1208,20 @@ impl KeeperCore {
                 apply_held(*a, cur, ad, &keys)
             } else {
                 let mut held_n = cur.storage.len();
-                let mut f = AccountDiff { info: ad.info.clone(), code: ad.code.clone(), storage: HashMap::new(), storage_cleared: false, balance_inexact: ad.balance_inexact, forget: ad.forget };
+                // A warm account takes no basics from the diff (only the
+                // written values are served; its basics stay unknown).
+                let info = if is_warm { None } else { ad.info.clone() };
+                let mut f = AccountDiff { info, code: if is_warm { None } else { ad.code.clone() }, storage: HashMap::new(), storage_cleared: false, balance_inexact: ad.balance_inexact, forget: ad.forget };
                 for (s, v) in &ad.storage {
                     if cur.storage.contains_key(s) {
                         f.storage.insert(*s, *v);
+                    } else if is_warm {
+                        // Warm: its own limit, never the kept contracts' room.
+                        if warm_on && self.warm_n < self.cfg.warm_max {
+                            f.storage.insert(*s, *v);
+                            self.warm_n += 1;
+                            self.stats.warm_adopted += 1;
+                        }
                     } else if adopt && held_n < adopt_per && total < self.cfg.max_slots_total {
                         f.storage.insert(*s, *v);
                         held_n += 1;
@@ -1130,6 +1243,37 @@ impl KeeperCore {
                 }
             }
             self.cur.accounts.insert(*a, next);
+        }
+        for a in warm_drop {
+            self.unwarm(&a);
+            self.cur.accounts.remove(&a);
+            self.stats.warm_dropped += 1;
+        }
+        // FASTLANE_AHEAD_KEEP_WARM: new warm accounts, with the values this
+        // block wrote (the node's own new values: exact after this block).
+        for a in warm_new {
+            let Some(ad) = merged.accounts.get(&a) else { continue };
+            if self.warm_n >= self.cfg.warm_max {
+                self.stats.warm_full += 1;
+                break;
+            }
+            let mut acct = Acct::default();
+            for (s, v) in &ad.storage {
+                if self.warm_n >= self.cfg.warm_max {
+                    break;
+                }
+                acct.storage.insert(*s, *v);
+                self.warm_n += 1;
+                self.stats.warm_adopted += 1;
+                if self.cfg.prune_blocks > 0 {
+                    self.written_now.insert(written_key(&a, s));
+                }
+            }
+            if acct.storage.is_empty() {
+                continue;
+            }
+            self.cur.accounts.insert(a, acct);
+            self.cur.warm.insert(a, ());
         }
         for a in recreate {
             self.cur.accounts.remove(&a);
@@ -1223,8 +1367,16 @@ impl KeeperCore {
                 m.storage.remove(s);
             }
             dropped += gone.len();
+            if m.storage.is_empty() && self.cur.warm.contains_key(&a) {
+                // A warm account nobody writes or reads any more: gone.
+                self.cur.warm.remove(&a);
+                self.cur.accounts.remove(&a);
+                continue;
+            }
             self.cur.accounts.insert(a, m);
         }
+        // FASTLANE_AHEAD_KEEP_WARM: recount the warm values exactly.
+        self.warm_n = self.cur.warm.keys().map(|a| self.cur.accounts.get(a).map_or(0, |x| x.storage.len())).sum();
         // Codes: keep the ones a held account's basics name.
         let used: HashSet<B256> = self
             .cur
@@ -1328,6 +1480,7 @@ impl KeeperCore {
             "head": self.head, "contracts": held, "accounts": accts, "values": slots, "codes": self.cur.codes.len(),
             "candidates": self.cands.len(), "candidateValues": self.cands.values().map(|c| c.slots.len()).sum::<usize>(), "seedsWaiting": self.seeds.len(), "versions": self.versions.len(),
             "recentDiffs": self.recent.len(), "memPaused": self.mem_pause,
+            "warm": {"on": self.cfg.warm, "accounts": self.cur.warm.len(), "values": self.warm_n, "max": self.cfg.warm_max},
             "prune": {"everyBlocks": self.cfg.prune_blocks, "learnedToo": self.cfg.prune_learned, "writtenTracked": self.written_now.len() + self.written_prev.len(), "nextAt": self.prune_from.map(|f| f + self.cfg.prune_blocks)},
             "stats": self.stats.json(),
         })
@@ -3307,5 +3460,142 @@ mod tests {
         assert!(get(None).prune_learned, "live default: learned values pruned too");
         assert!(!KeeperCfg::default().prune_learned, "core default: off");
         assert_eq!(KeeperCfg::default().prune_blocks, 0, "the core's own default (tests, replay): off");
+    }
+
+    // -----------------------------------------------------------------------
+    // FASTLANE_AHEAD_KEEP_WARM (Nov 10): values blocks write in contracts we
+    // don't keep are held too ("warm"), exact, at no node cost.
+    // -----------------------------------------------------------------------
+
+    fn warm_core(max: usize) -> KeeperCore {
+        KeeperCore::new(KeeperCfg { on: true, max_contracts: 10, warm: true, warm_max: max, ..KeeperCfg::default() })
+    }
+
+    /// A value a block writes in some other contract is held from then on,
+    /// exact (the block's new value), and follows the later blocks. It is
+    /// "warm": no basics, not a kept contract. Off = the old keeper.
+    #[test]
+    fn written_values_of_other_contracts_become_warm_and_follow_the_blocks() {
+        let mut k = warm_core(1000);
+        k.start_at(100);
+        k.apply_block(101, &[slot_diff(a(7), &[(1, 5), (2, 6)])]).unwrap();
+        let v = k.version_at(101).unwrap();
+        assert!(v.holds_slot(&a(7), &u(1)) && v.holds_slot(&a(7), &u(2)), "written values held");
+        assert!(v.is_warm(&a(7)) && !v.is_kept(&a(7)), "warm, not kept");
+        assert!(!v.holds_basics(&a(7)), "a warm account's basics are never served");
+        assert!(!v.holds_slot(&a(7), &u(3)), "a value no block wrote stays unknown");
+        assert_eq!(k.warm_counts(), (1, 2));
+        k.apply_block(102, &[slot_diff(a(7), &[(1, 9), (4, 1)])]).unwrap();
+        let acct = k.account(&a(7)).unwrap();
+        assert_eq!(acct.storage.get(&u(1)), Some(&u(9)), "followed");
+        assert_eq!(acct.storage.get(&u(2)), Some(&u(6)), "untouched: kept");
+        assert_eq!(acct.storage.get(&u(4)), Some(&u(1)), "a new write adopted");
+        assert_eq!(k.version_at(101).unwrap().accounts.get(&a(7)).unwrap().storage.get(&u(1)), Some(&u(5)), "the older version unchanged");
+        assert_eq!(k.warm_counts(), (1, 3));
+        // Off: nothing of a(7) held (the old keeper).
+        let mut off = KeeperCore::new(KeeperCfg { on: true, max_contracts: 10, ..KeeperCfg::default() });
+        off.start_at(100);
+        off.apply_block(101, &[slot_diff(a(7), &[(1, 5)])]).unwrap();
+        assert!(off.account(&a(7)).is_none());
+        assert!(!KeeperCfg::default().warm, "the core's own default: off");
+    }
+
+    /// The setting: on live unless set off; its limit.
+    #[test]
+    fn warm_setting_defaults_on_live() {
+        let get = |k: &str, v: &str| KeeperCfg::from_lookup(|x| match x {
+            "FASTLANE_AHEAD" => Some("observe".to_string()),
+            _ if x == k => Some(v.to_string()),
+            _ => None,
+        });
+        assert!(get("", "").warm);
+        assert_eq!(get("", "").warm_max, 100_000);
+        assert!(!get("FASTLANE_AHEAD_KEEP_WARM", "off").warm);
+        assert_eq!(get("FASTLANE_AHEAD_KEEP_WARM_MAX", "5").warm_max, 5);
+    }
+
+    /// Warm values have their own limit and never take the kept contracts'
+    /// room (FASTLANE_AHEAD_KEEP_MAX_SLOTS).
+    #[test]
+    fn warm_values_have_their_own_limit() {
+        let mut k = KeeperCore::new(KeeperCfg { on: true, max_contracts: 10, warm: true, warm_max: 2, max_slots_total: 3, ..KeeperCfg::default() });
+        k.start_at(100);
+        k.apply_block(101, &[slot_diff(a(7), &[(1, 1), (2, 2), (3, 3)]), slot_diff(a(8), &[(1, 1)])]).unwrap();
+        assert_eq!(k.warm_counts().1, 2, "at most 2 warm values");
+        // The kept contracts' room (3) is still all there.
+        k.learn(&[MissItem::Slot(a(1), u(1)), MissItem::Slot(a(1), u(2)), MissItem::Slot(a(1), u(3))]);
+        seed(&mut k, 101);
+        let acct = k.account(&a(1)).unwrap();
+        assert_eq!(acct.storage.len(), 3, "all three kept values seeded");
+    }
+
+    /// A warm contract chosen to be kept keeps its (exact) values and gets
+    /// the rest seeded; a warm contract created / destroyed again is dropped.
+    #[test]
+    fn warm_becomes_kept_and_recreated_warm_is_dropped() {
+        let mut k = warm_core(1000);
+        k.start_at(100);
+        k.apply_block(101, &[slot_diff(a(7), &[(1, 5)]), slot_diff(a(8), &[(1, 5)])]).unwrap();
+        k.learn(&[MissItem::Slot(a(7), u(2))]);
+        assert!(!k.cur.warm.contains_key(&a(7)), "kept now");
+        assert_eq!(k.account(&a(7)).unwrap().storage.get(&u(1)), Some(&u(5)), "its warm value stays");
+        seed(&mut k, 101);
+        assert_eq!(k.account(&a(7)).unwrap().storage.get(&u(2)), Some(&u(20)), "the missing one seeded");
+        assert!(k.latest().unwrap().is_kept(&a(7)));
+        // a(8) destroyed: dropped whole (never guessed).
+        let mut d = StateDiff::default();
+        d.accounts.insert(a(8), AccountDiff { info: Some(None), storage_cleared: true, ..Default::default() });
+        k.apply_block(102, &[d]).unwrap();
+        assert!(k.account(&a(8)).is_none());
+        assert_eq!(k.stats.warm_dropped, 1);
+        // A brand-new account (created in the block) is never adopted warm.
+        let mut c = StateDiff::default();
+        c.accounts.insert(a(9), AccountDiff { storage: [(u(1), u(1))].into_iter().collect(), storage_cleared: true, ..Default::default() });
+        k.apply_block(103, &[c]).unwrap();
+        assert!(k.account(&a(9)).is_none());
+    }
+
+    /// The prune ages out warm values nobody writes or reads (and the warm
+    /// account with them); values runs read stay.
+    #[test]
+    fn warm_values_age_out_with_the_prune() {
+        let mut k = KeeperCore::new(KeeperCfg { on: true, max_contracts: 10, warm: true, prune_blocks: 10, prune_learned: true, ..KeeperCfg::default() });
+        k.start_at(100);
+        k.apply_block(101, &[slot_diff(a(7), &[(1, 5)]), slot_diff(a(8), &[(1, 5)])]).unwrap();
+        for b in 102..=140 {
+            // A run keeps reading a(8)'s value.
+            k.mark_used(&[(a(8), u(1))]);
+            k.apply_block(b, &[]).unwrap();
+        }
+        assert!(k.account(&a(7)).is_none(), "nobody wrote or read it: gone");
+        assert_eq!(k.account(&a(8)).unwrap().storage.get(&u(1)), Some(&u(5)), "read by runs: stays");
+        assert_eq!(k.warm_counts(), (1, 1), "recounted exactly");
+    }
+
+    /// Merge: a warm value fills a hole or replaces an approximate value of
+    /// copy 2, but never a value copy 2 vouches for as exact.
+    #[test]
+    fn warm_values_never_override_copy2_exact_ones() {
+        use crate::state::StateRead;
+        struct NoneExact;
+        impl Provenance for NoneExact {
+            fn slot_exact(&self, _a: Address, _s: U256) -> bool {
+                false
+            }
+            fn balance_exact(&self, _a: Address) -> bool {
+                false
+            }
+        }
+        let mut k = warm_core(1000);
+        k.start_at(100);
+        k.apply_block(101, &[slot_diff(a(7), &[(1, 5), (2, 6)])]).unwrap();
+        let kv = k.version_at(101).unwrap();
+        let mut base = Snapshot::default();
+        base.apply_fact(&crate::state::snap::Fact::Slot(a(7), u(1), u(3)));
+        let (m, _) = merge_base(&base, &crate::check::ordered::AllExact, &kv);
+        assert_eq!(m.storage(a(7), u(1)), crate::state::Lookup::Known(u(3)), "copy 2's exact value kept");
+        assert_eq!(m.storage(a(7), u(2)), crate::state::Lookup::Known(u(6)), "the hole filled");
+        let (m, _) = merge_base(&base, &NoneExact, &kv);
+        assert_eq!(m.storage(a(7), u(1)), crate::state::Lookup::Known(u(5)), "an approximate value replaced");
     }
 }

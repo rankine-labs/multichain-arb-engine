@@ -177,6 +177,19 @@
 //        wrong of the 10 sure answers. Sure answers are now also counted by
 //        base (status accuracy.keptBase / plainBase).
 //
+//   SURE MORE OFTEN (Nov 10; Nov 9 hold run: 38% of replayed txs unsure,
+//   horizon 59 right / 14 wrong / 4,834 unsure; top cause about 40%: a
+//   value of some other contract the keeper does not hold):
+//    16. FASTLANE_AHEAD_KEEP_WARM [on] (copy2/keeper.rs): the keeper also
+//        holds every value a block WRITES in any other contract (from the
+//        block diffs it already fetches: no node cost). A warm account is
+//        never a "kept target" pick (is_kept vs is_warm).
+//    17. FASTLANE_AHEAD_WRONG_GUARD [on, 3000 blocks]: a pool that was sure
+//        and wrong is listed unsure for a while (the 1-in-20 line).
+//    18. FASTLANE_AHEAD_DIAG [on]: the replay's cause breakdown, live, in
+//        status fastlaneAhead.diag (failWhy, unsureCause, hzUnsureCause,
+//        missTop).
+//
 // API (scanner and integration):
 //   Ahead::on_feed_message(Arc<BinMsg>)            a new feed message
 //   Ahead::on_confirmed(Confirmed, moved_by_tx)     copy 2 published a version
@@ -389,11 +402,29 @@ pub struct AheadCfg {
     /// tests/ahead_memory.rs). Agreement answers are exactly the same (it
     /// only reads those values). off = keep the whole copy (old rule).
     pub thin_pending: bool,
+    /// FASTLANE_AHEAD_DIAG [on live; off in the default] (Nov 10): the
+    /// replay's cause breakdown, live, in status (fastlaneAhead.diag): why
+    /// each replay failed (by the role of the missing value's contract and
+    /// whether the keeper holds it / has it warm), what made each compared
+    /// pool unsure (one block ahead and at the horizon), and the contracts
+    /// whose missing values failed the most replays (top 25 of at most
+    /// 4,096 counted). Counters only: no decision reads them.
+    pub diag: bool,
+    /// FASTLANE_AHEAD_WRONG_GUARD [on live; off in the default] (Nov 10,
+    /// the 1-in-20 safety line). A pool our prediction was SURE about and
+    /// got wrong (one block ahead or at the horizon) is not vouched for in
+    /// the next FASTLANE_AHEAD_WRONG_GUARD_BLOCKS [3000, about 5 min]
+    /// predicted blocks: it is listed unsure (its values are not forgotten,
+    /// the scanner just skips it). Wrongs cluster on a few pools (the same
+    /// rival / router keeps beating our replay there), so this keeps the
+    /// wrong-when-sure share down while other pools get sure more often.
+    /// 0 = off.
+    pub wrong_guard_blocks: u64,
 }
 
 impl Default for AheadCfg {
     fn default() -> Self {
-        AheadCfg { max_blocks: 32, run_all: false, max_txs: 256, max_touchers: 4096, l2_offset: 0, trust_sender_funds: false, msg_budget_us: 10_000, routes_only: true, compare_delay: 0, revert_unsure: true, exact_revert_sure: false, unknown_continue: false, keeper: false, keep_pick: true, budget_cpu: false, lazy_rebase: false, kept_rebuild_once: false, need_keeper: false, thin_pending: true, horizon: false, hz_notes: false, narrow_unsure: false }
+        AheadCfg { max_blocks: 32, run_all: false, max_txs: 256, max_touchers: 4096, l2_offset: 0, trust_sender_funds: false, msg_budget_us: 10_000, routes_only: true, compare_delay: 0, revert_unsure: true, exact_revert_sure: false, unknown_continue: false, keeper: false, keep_pick: true, budget_cpu: false, lazy_rebase: false, kept_rebuild_once: false, need_keeper: false, thin_pending: true, horizon: false, hz_notes: false, narrow_unsure: false, diag: false, wrong_guard_blocks: 0 }
     }
 }
 
@@ -408,6 +439,14 @@ pub fn thread_cpu_us() -> u64 {
     }
     ts.tv_sec as u64 * 1_000_000 + ts.tv_nsec as u64 / 1000
 }
+
+/// Default FASTLANE_AHEAD_WRONG_GUARD_BLOCKS (about 5 minutes of blocks).
+pub const WRONG_GUARD_BLOCKS_DEFAULT: u64 = 3_000;
+
+/// FASTLANE_AHEAD_DIAG: most contracts counted in the "missing value" table.
+const MISS_TOP_MAX: usize = 4_096;
+/// FASTLANE_AHEAD_DIAG: most distinct reasons / causes counted (the rest "other").
+const DIAG_KEYS_MAX: usize = 400;
 
 /// Default FASTLANE_AHEAD_COMPARE_DELAY_BLOCKS of the running sidecar.
 pub const COMPARE_DELAY_DEFAULT: u64 = 5;
@@ -514,6 +553,14 @@ impl AheadCfg {
             // Memory fix (Nov 1): on in every mode (agreement only measures;
             // its answers are the same either way).
             thin_pending: on_off(get("FASTLANE_AHEAD_THIN_PENDING").as_deref()).unwrap_or(d.thin_pending),
+            // Nov 10: both on live unless set off (they decide no trade on
+            // their own; the guard only removes pools from "sure").
+            diag: on_off(get("FASTLANE_AHEAD_DIAG").as_deref()).unwrap_or(true),
+            wrong_guard_blocks: if on_off(get("FASTLANE_AHEAD_WRONG_GUARD").as_deref()).unwrap_or(true) {
+                num("FASTLANE_AHEAD_WRONG_GUARD_BLOCKS").filter(|v| *v <= 1_000_000).unwrap_or(WRONG_GUARD_BLOCKS_DEFAULT as usize) as u64
+            } else {
+                0
+            },
         }
     }
 }
@@ -1371,6 +1418,10 @@ pub struct AheadStats {
     pub narrow_used: u64,
     pub narrow_dropped: u64,
     pub narrow_fallback: u64,
+    /// FASTLANE_AHEAD_WRONG_GUARD (Nov 10): sure-and-wrong pools that started
+    /// / extended a guard, and pools a prediction listed unsure for it.
+    pub guard_wrongs: u64,
+    pub guard_marks: u64,
     /// Observe-mode build: per feed message, how many blocks the predicted
     /// tip was ahead of copy 2's confirmed version (0 = no tip: stopped or
     /// waiting). The "blocks fresher" gain. Ring of the newest MAX_TIMES.
@@ -1631,6 +1682,15 @@ pub struct Ahead {
     /// keeper: whether it held the missing value's contract) and what made
     /// each compared pool unsure (cause -> count). None live.
     pub diag: Option<(BTreeMap<String, u64>, BTreeMap<String, u64>)>,
+    /// FASTLANE_AHEAD_DIAG (+ replay): what made each HORIZON pool unsure
+    /// (cause -> count), and per contract whose value a failed replay
+    /// lacked: (failed replays, of them while the keeper held it kept /
+    /// warm). Bounded (DIAG_KEYS_MAX / MISS_TOP_MAX).
+    pub hz_diag: Option<BTreeMap<String, u64>>,
+    pub miss_top: Option<HashMap<Address, (u64, u64, u64)>>,
+    /// FASTLANE_AHEAD_WRONG_GUARD: pool -> last predicted block it is
+    /// not vouched for (it was sure and wrong).
+    guard: HashMap<String, u64>,
     /// Offline replay only (`ahead-replay --oracle`): explains each reverted
     /// run against the chain's exact starting state (copy2/keeper_replay.rs
     /// Oracle). None live.
@@ -1661,6 +1721,7 @@ pub struct Ahead {
 
 impl Ahead {
     pub fn new(cfg: AheadCfg) -> Self {
+        let diag_on = cfg.diag;
         Ahead {
             cfg,
             pools: Arc::new(PoolSet::default()),
@@ -1680,7 +1741,10 @@ impl Ahead {
             used: Vec::new(),
             last_probe: None,
             collect_all: None,
-            diag: None,
+            diag: diag_on.then(Default::default),
+            hz_diag: diag_on.then(Default::default),
+            miss_top: diag_on.then(Default::default),
+            guard: HashMap::new(),
             oracle: None,
             hour: AheadStats::default(),
             total: AheadStats::default(),
@@ -1758,6 +1822,12 @@ impl Ahead {
 
     pub fn cfg(&self) -> &AheadCfg {
         &self.cfg
+    }
+
+    /// Replay report (Nov 10): show the cause breakdown (diag_json) even
+    /// though the captured settings had FASTLANE_AHEAD_DIAG off.
+    pub fn cfg_mut_diag(&mut self, on: bool) {
+        self.cfg.diag = on;
     }
 
     /// L2 block number of the confirmed base (None before the first one).
@@ -1984,10 +2054,13 @@ impl Ahead {
     pub fn compare_horizon(&mut self, st: &Settled, moved_by_tx: &dyn Fn(&B256) -> Option<Vec<String>>) -> bool {
         let Some((depth, p)) = self.hz_first.remove(&st.seq) else { return false };
         let diag = self.diag.take();
+        // FASTLANE_AHEAD_DIAG: the horizon's unsure causes in their own map.
+        self.diag = self.hz_diag.take().map(|h| (BTreeMap::new(), h));
         self.hz_mode = true;
         self.count(|s| s.add_ahead(depth));
         self.agreement(&p, st, moved_by_tx);
         self.hz_mode = false;
+        self.hz_diag = self.diag.take().map(|d| d.1);
         self.diag = diag;
         true
     }
@@ -2291,7 +2364,7 @@ impl Ahead {
                             None => "a run built on an assumed value (fill / sender funds)".to_string(),
                         }
                     };
-                    *d.1.entry(cause).or_default() += 1;
+                    diag_add(&mut d.1, cause);
                 }
                 continue;
             }
@@ -2356,6 +2429,15 @@ impl Ahead {
             // (Horizon mode: the base is several blocks older on purpose, so
             // "stale base" is not a label there.)
             let stale = !self.hz_mode && st.prev.get(k).is_some_and(|pv| place_vals(place, &p.base_snap) != *pv);
+            // FASTLANE_AHEAD_WRONG_GUARD: not vouched for in the next blocks.
+            if self.cfg.wrong_guard_blocks > 0 {
+                let until = p.seq.saturating_add(self.cfg.wrong_guard_blocks);
+                let e = self.guard.entry(k.clone()).or_insert(0);
+                if until > *e {
+                    *e = until;
+                }
+                self.count(|s| s.guard_wrongs += 1);
+            }
             self.count(|s| {
                 s.disagree += 1;
                 if kept {
@@ -2794,7 +2876,8 @@ impl Ahead {
             // run it so they stay current. Only when an unrunnable one can be
             // predicted past (FASTLANE_AHEAD_UNKNOWN_CONTINUE), so it never
             // adds stops.
-            let kept_target = self.cfg.keep_pick && self.cfg.unknown_continue && t.to.is_some_and(|a| self.merged.as_ref().is_some_and(|m| m.kept.accounts.contains_key(&a)));
+            // (Nov 10: kept contracts only; warm ones never make a pick.)
+            let kept_target = self.cfg.keep_pick && self.cfg.unknown_continue && t.to.is_some_and(|a| self.merged.as_ref().is_some_and(|m| m.kept.is_kept(&a)));
             if kept_target && !toucher {
                 self.count(|s| s.kept_picks += 1);
             }
@@ -2947,14 +3030,29 @@ impl Ahead {
                             crate::state::MissItem::Code(_) => None,
                         });
                         let kept = match (&self.merged, owner) {
-                            (Some(m), Some(a)) if m.kept.accounts.contains_key(&a) => " [keeper holds that contract]",
+                            (Some(m), Some(a)) if m.kept.is_kept(&a) => " [keeper holds that contract]",
+                            (Some(m), Some(a)) if m.kept.is_warm(&a) => " [keeper has it warm, not that value]",
                             (Some(_), Some(_)) => " [keeper does not hold it]",
                             _ => "",
                         };
                         let detail = u.missing.first().map(|m| miss_detail(&ov, &pools, m)).unwrap_or("");
                         let k = format!("{why}{kept}{detail}");
                         if let Some(d) = self.diag.as_mut() {
-                            *d.0.entry(k).or_default() += 1;
+                            diag_add(&mut d.0, k);
+                        }
+                        // FASTLANE_AHEAD_DIAG: which contracts' values fail
+                        // the most replays (and was it kept / warm then).
+                        if let (Some(mt), Some(a)) = (self.miss_top.as_mut(), owner) {
+                            let (is_kept, is_warm) = match &self.merged {
+                                Some(m) => (m.kept.is_kept(&a), m.kept.is_warm(&a)),
+                                None => (false, false),
+                            };
+                            if mt.len() < MISS_TOP_MAX || mt.contains_key(&a) {
+                                let e = mt.entry(a).or_default();
+                                e.0 += 1;
+                                e.1 += u64::from(is_kept);
+                                e.2 += u64::from(is_warm);
+                            }
                         }
                     }
                     // Which of our pools might it touch? What it reads in a
@@ -3013,6 +3111,21 @@ impl Ahead {
         if let Some(o) = self.oracle.as_mut() {
             for n in &notes {
                 o.fates.insert(n.hash, n.fate_str());
+            }
+        }
+        // FASTLANE_AHEAD_WRONG_GUARD: pools recently sure-and-wrong are not
+        // vouched for (listed unsure; their values are kept as they are).
+        if self.cfg.wrong_guard_blocks > 0 && !self.guard.is_empty() {
+            let seq = m.seq;
+            self.guard.retain(|_, until| *until >= seq);
+            let mut n = 0u64;
+            for k in self.guard.keys() {
+                if unsure_cum.insert(k.clone()) {
+                    n += 1;
+                }
+            }
+            if n > 0 {
+                self.count(|s| s.guard_marks += n);
             }
         }
         changed.sort();
@@ -3827,6 +3940,8 @@ fn status_of(a: &Ahead) -> Value {
         // keeper versions held here, merges (each merged base is a copy of
         // copy 2's maps the keeper's values were written into: the last
         // one's values added and time), and the memory guard.
+        // Nov 10 (FASTLANE_AHEAD_DIAG): the cause breakdown, live.
+        "diag": diag_json(a),
         "memory": {"paused": a.mem_pause, "waitingAgreements": a.pending.len(), "thinPending": a.cfg.thin_pending,
             "keeperVersionsHeld": a.kept.len(), "mergedBase": a.merged.is_some(), "merges": a.merges,
             "mergeLastValues": a.merge_last.0, "mergeLastUs": a.merge_last.1},
@@ -3856,6 +3971,46 @@ pub fn accuracy_json(s: &AheadStats, times: bool) -> Value {
             "missedOffRoute": s.missed_off_route, "phantom": s.phantom, "value": s.value_diff, "staleBase": s.stale_base, "notFromTx": s.not_from_tx},
         "unsureMoved": s.unsure_moved,
         "narrow": {"used": s.narrow_used, "dropped": s.narrow_dropped, "fallback": s.narrow_fallback},
+        "guard": {"wrongs": s.guard_wrongs, "marks": s.guard_marks},
+    })
+}
+
+/// FASTLANE_AHEAD_DIAG: count one reason / cause (bounded: a new key past
+/// DIAG_KEYS_MAX is counted as "other").
+fn diag_add(m: &mut BTreeMap<String, u64>, k: String) {
+    if m.len() >= DIAG_KEYS_MAX && !m.contains_key(&k) {
+        *m.entry("other".to_string()).or_default() += 1;
+        return;
+    }
+    *m.entry(k).or_default() += 1;
+}
+
+/// FASTLANE_AHEAD_DIAG: the top `n` of a count map, biggest first.
+fn top_counts(m: &BTreeMap<String, u64>, n: usize) -> Value {
+    let mut v: Vec<(&String, &u64)> = m.iter().collect();
+    v.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+    let total: u64 = m.values().sum();
+    json!({"total": total, "top": v.into_iter().take(n).map(|(k, c)| json!([k, c])).collect::<Vec<_>>()})
+}
+
+/// FASTLANE_AHEAD_DIAG (status "fastlaneAhead.diag"): since start.
+pub fn diag_json(a: &Ahead) -> Value {
+    if !a.cfg.diag {
+        return Value::Null;
+    }
+    let miss = a.miss_top.as_ref().map(|mt| {
+        let mut v: Vec<(&Address, &(u64, u64, u64))> = mt.iter().collect();
+        v.sort_by(|x, y| y.1 .0.cmp(&x.1 .0).then(x.0.cmp(y.0)));
+        let total: u64 = mt.values().map(|x| x.0).sum();
+        json!({"contracts": mt.len(), "failedRuns": total,
+            "top": v.into_iter().take(25).map(|(a, (n, k, w))| json!({"contract": format!("{a:#x}"), "runs": n, "whileKept": k, "whileWarm": w})).collect::<Vec<_>>()})
+    });
+    json!({
+        "failWhy": a.diag.as_ref().map(|d| top_counts(&d.0, 15)),
+        "unsureCause": a.diag.as_ref().map(|d| top_counts(&d.1, 15)),
+        "hzUnsureCause": a.hz_diag.as_ref().map(|d| top_counts(d, 15)),
+        "missTop": miss,
+        "guardPools": a.guard.len(),
     })
 }
 

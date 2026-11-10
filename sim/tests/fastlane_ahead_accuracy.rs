@@ -789,7 +789,7 @@ fn the_keepers_values_make_a_failed_run_exact() {
     // The keeper's DEP at block 10 (the base block).
     let mut k = Snapshot::default();
     put(&mut k, dep(), dep_code(), &[(0, 2)]);
-    let kept = |block: u64| Arc::new(KeptVersion { block, accounts: k.accounts.clone(), codes: k.codes.clone() });
+    let kept = |block: u64| Arc::new(KeptVersion { block, accounts: k.accounts.clone(), codes: k.codes.clone(), ..Default::default() });
     a.on_kept(kept(9));
     assert_eq!(a.total.kept_rebases, 0, "another block's version is never used");
     a.on_kept(kept(10));
@@ -890,3 +890,89 @@ fn memory_pause_drops_the_prediction_and_resumes() {
     assert_eq!((t.seq, t.base_seq), (13, 12));
     assert_eq!(t.view().storage(pool(), U256::ZERO), known(108));
 }
+
+// ---------------------------------------------------------------------------
+// Nov 10: FASTLANE_AHEAD_WRONG_GUARD and FASTLANE_AHEAD_DIAG
+// ---------------------------------------------------------------------------
+
+/// A pool we were SURE about and got wrong is not vouched for in the next
+/// predicted blocks (listed unsure, its values kept). Off = unchanged.
+#[test]
+fn a_pool_that_was_sure_and_wrong_is_guarded_for_a_while() {
+    for guard in [100u64, 0] {
+        let mut a = ahead_on(AheadCfg { exact_revert_sure: true, wrong_guard_blocks: guard, ..AheadCfg::default() }, copy_at(100, 7));
+        // Our exact revert said "moved nothing"; on chain it moved POOL: wrong.
+        let t = stx(0, pool(), vec![0xde, 0xad, 0xbe, 0xef]);
+        a.on_feed_message(msg(11, &[t.clone()]));
+        let h = keccak256(&t);
+        a.on_confirmed(confirmed(11, Arc::new(copy_at(150, 7))), &move |x: &B256| (*x == h).then(|| vec![key(pool())]));
+        assert_eq!(a.total.disagree, 1);
+        // The next block: nothing touches POOL.
+        a.on_feed_message(msg(12, &[]));
+        let tip = a.tip().expect("a tip");
+        if guard > 0 {
+            assert_eq!(tip.unsure_pools, vec![key(pool())], "guarded");
+            assert_eq!(tip.view().storage(pool(), U256::ZERO), known(150), "values kept (not forgotten)");
+            assert!(a.total.guard_wrongs == 1 && a.total.guard_marks >= 1);
+        } else {
+            assert!(tip.unsure_pools.is_empty(), "off: unchanged");
+            assert_eq!(a.total.guard_wrongs, 0);
+        }
+    }
+}
+
+/// The guard ends after its blocks.
+#[test]
+fn the_wrong_guard_ends() {
+    let mut a = ahead_on(AheadCfg { exact_revert_sure: true, wrong_guard_blocks: 1, ..AheadCfg::default() }, copy_at(100, 7));
+    let t = stx(0, pool(), vec![0xde, 0xad, 0xbe, 0xef]);
+    a.on_feed_message(msg(11, &[t.clone()]));
+    let h = keccak256(&t);
+    a.on_confirmed(confirmed(11, Arc::new(copy_at(150, 7))), &move |x: &B256| (*x == h).then(|| vec![key(pool())]));
+    a.on_feed_message(msg(12, &[]));
+    assert_eq!(a.tip().unwrap().unsure_pools, vec![key(pool())], "block 12: guarded (until 11 + 1)");
+    a.on_confirmed(confirmed(12, Arc::new(copy_at(150, 7))), &no_moves);
+    a.on_feed_message(msg(13, &[]));
+    assert!(a.tip().unwrap().unsure_pools.is_empty(), "block 13: over");
+}
+
+/// The settings: both on live unless set off; the guard's length.
+#[test]
+fn wrong_guard_and_diag_settings() {
+    let cfg = |k: &str, v: &str| AheadCfg::from_lookup(|x| (x == k).then(|| v.to_string()), 0);
+    assert_eq!(cfg("", "").wrong_guard_blocks, 3000);
+    assert!(cfg("", "").diag);
+    assert_eq!(cfg("FASTLANE_AHEAD_WRONG_GUARD", "off").wrong_guard_blocks, 0);
+    assert_eq!(cfg("FASTLANE_AHEAD_WRONG_GUARD_BLOCKS", "50").wrong_guard_blocks, 50);
+    assert!(!cfg("FASTLANE_AHEAD_DIAG", "off").diag);
+    assert!(!AheadCfg::default().diag && AheadCfg::default().wrong_guard_blocks == 0, "tests / replay: off unless asked");
+}
+
+/// FASTLANE_AHEAD_DIAG: the cause breakdown shows up live (why runs failed,
+/// what made pools unsure).
+#[test]
+fn diag_counts_failed_runs_and_unsure_causes() {
+    let mut a = ahead_on(AheadCfg { diag: true, ..AheadCfg::default() }, copy_at(100, 7));
+    let r0 = stx(0, router(), w(3));
+    a.on_feed_message(msg(11, &[r0.clone()]));
+    let h0 = keccak256(&r0);
+    a.on_confirmed(confirmed(11, Arc::new(copy_at(106, 7))), &move |x: &B256| (*x == h0).then(|| vec![key(pool2())]));
+    let mut s11 = copy_at(106, 7);
+    s11.apply_fact(&Fact::Forget(router()));
+    let s11 = Arc::new(s11);
+    a.on_confirmed(confirmed(12, s11.clone()), &no_moves);
+    let r1 = stx(1, router(), w(4));
+    a.on_feed_message(msg(13, &[r1.clone()]));
+    let mut s13 = (*s11).clone();
+    s13.apply_fact(&Fact::Slot(pool2(), U256::ZERO, U256::from(9u64)));
+    let h1 = keccak256(&r1);
+    a.on_confirmed(confirmed(13, Arc::new(s13)), &move |x: &B256| (*x == h1).then(|| vec![key(pool2())]));
+    let d = arbsim::copy2::ahead::diag_json(&a);
+    assert!(d["failWhy"]["total"].as_u64().unwrap() >= 1, "{d}");
+    assert!(d["unsureCause"]["total"].as_u64().unwrap() >= 1, "{d}");
+    assert!(d["unsureCause"]["top"][0][0].as_str().unwrap().starts_with("could not run"), "{d}");
+    // Off: nothing counted.
+    let off = ahead_on(AheadCfg::default(), copy_at(100, 7));
+    assert!(arbsim::copy2::ahead::diag_json(&off).is_null());
+}
+
