@@ -75,6 +75,30 @@
 //   `KeeperIo`, so `ahead-replay --live-timing` runs the very same code
 //   against a node model in real time.
 //
+//   FILL (Nov 10 evening, FASTLANE_AHEAD_KEEP_FILL [on]; live hold run:
+//   23,116 of 94,647 failed replays lacked a value of a contract the keeper
+//   already holds). Three changes, none adds a node call:
+//     - URGENT FIRST: a value a replay just failed on goes to the FRONT of
+//       the seed queue (before: behind every bulk re-seed of whole
+//       contracts after a start / reset / new pick, so it could wait for
+//       minutes while every replay needing it failed).
+//     - ONE CALL PER CONTRACT: the waiting seeds of one contract go out as
+//       one eth_getProof (up to 100 values; Chainstack bills a call, not a
+//       value), so the rest of what its replays read (the learned values not
+//       held yet) rides along for free. (= FASTLANE_AHEAD_KEEP_SEED_MERGE.)
+//     - BACK-FILL: a seed's answer is the value at the keeper's head, but
+//       the predicted copy runs on copy 2's block, a few blocks older (the
+//       keeper reads ahead, FASTLANE_AHEAD_KEEP_LEAD). Before, a seeded
+//       value only reached the versions from the next block on, so the
+//       replays on the older bases kept failing on it for ~0.5 s. Now it is
+//       also written into the held versions of the recent blocks where it
+//       is provably the same value: no block in between wrote it (the
+//       block diffs are already here) and the contract was not created /
+//       destroyed in between. Newer versions get it carried forward through
+//       their blocks' writes.
+//   off = the old queue (FIFO, one call per batch unless THRIFT / SEED_MERGE)
+//   and no back-fill.
+//
 //   The core (`KeeperCore`) does no I/O, so the offline replay
 //   (`arbsim ahead-replay --keeper <truth file>`) runs the very same code
 //   on recorded block diffs.
@@ -284,6 +308,11 @@ pub struct KeeperCfg {
     pub warm: bool,
     /// FASTLANE_AHEAD_KEEP_WARM_MAX [100000]: most warm values held.
     pub warm_max: usize,
+    /// FASTLANE_AHEAD_KEEP_FILL (Nov 10 evening) [on live; off in the
+    /// core's own default]: urgent misses first, one seed call per contract,
+    /// and back-fill of seeded values into the recent versions (see FILL in
+    /// the file header). No extra node calls.
+    pub fill: bool,
 }
 
 /// FASTLANE_AHEAD_KEEP_PRUNE_BLOCKS default (memory fix 2, Nov 2): ~5 min
@@ -327,6 +356,8 @@ impl Default for KeeperCfg {
             // Nov 10: off in the core's default (tests, replay unless asked).
             warm: false,
             warm_max: 100_000,
+            // Nov 10 evening: off in the core's default (tests, replay unless asked).
+            fill: false,
         }
     }
 }
@@ -380,6 +411,8 @@ impl KeeperCfg {
             // Nov 10: on live unless set off (rollback: FASTLANE_AHEAD_KEEP_WARM=off).
             warm: super::ahead::on_off(get("FASTLANE_AHEAD_KEEP_WARM").as_deref()).unwrap_or(true),
             warm_max: num("FASTLANE_AHEAD_KEEP_WARM_MAX", d.warm_max as u64, 0, 2_000_000) as usize,
+            // Nov 10 evening: on live unless set off (rollback: FASTLANE_AHEAD_KEEP_FILL=off).
+            fill: super::ahead::on_off(get("FASTLANE_AHEAD_KEEP_FILL").as_deref()).unwrap_or(true),
         }
     }
 }
@@ -661,6 +694,10 @@ pub struct KeeperStats {
     pub warm_adopted: u64,
     pub warm_dropped: u64,
     pub warm_full: u64,
+    /// FASTLANE_AHEAD_KEEP_FILL: urgent seed batches put at the front, and
+    /// values back-filled into older versions.
+    pub fill_urgent: u64,
+    pub fill_backfilled: u64,
     pub audit_values: u64,
     pub audit_mismatch: u64,
     pub resets: HashMap<&'static str, u64>,
@@ -685,7 +722,7 @@ impl KeeperStats {
             "learned": self.learned, "seedsSent": self.seeds_sent, "seedValues": self.seed_values, "seedsDropped": self.seeds_dropped,
             "evicted": self.evicted, "recreated": self.recreated, "adopted": self.adopted, "refusedFull": self.refused_full, "candsDropped": self.cands_dropped,
             "memLearnSkipped": self.mem_learn_skipped,
-            "prunes": self.prunes, "prunedValues": self.pruned_values, "prunedCodes": self.pruned_codes, "pruneLastValues": self.prune_last_values, "prunedLearned": self.pruned_learned, "usedMarks": self.used_marks, "audits": self.audits, "seedsMerged": self.seeds_merged, "warmAdopted": self.warm_adopted, "warmDropped": self.warm_dropped, "warmFull": self.warm_full, "auditValues": self.audit_values, "auditMismatch": self.audit_mismatch,
+            "prunes": self.prunes, "prunedValues": self.pruned_values, "prunedCodes": self.pruned_codes, "pruneLastValues": self.prune_last_values, "prunedLearned": self.pruned_learned, "usedMarks": self.used_marks, "audits": self.audits, "seedsMerged": self.seeds_merged, "warmAdopted": self.warm_adopted, "warmDropped": self.warm_dropped, "warmFull": self.warm_full, "fillUrgent": self.fill_urgent, "fillBackfilled": self.fill_backfilled, "auditValues": self.audit_values, "auditMismatch": self.audit_mismatch,
             "resets": self.resets.iter().map(|(k, v)| (k.to_string(), json!(v))).collect::<serde_json::Map<String, Value>>(),
             "applyUs": crate::timing::pct_of(&mut t),
             "samples": self.samples,
@@ -732,6 +769,9 @@ pub struct KeeperCore {
     /// every prune; between prunes it may count a few dropped ones too,
     /// which only makes the warm limit stricter).
     warm_n: usize,
+    /// FASTLANE_AHEAD_KEEP_FILL: bumped whenever older versions were
+    /// back-filled (the runtime's Sink then replaces its copies of them).
+    backfill_gen: u64,
 }
 
 
@@ -755,7 +795,18 @@ impl KeeperCore {
             prune_from: None,
             seed_first: HashMap::new(),
             warm_n: 0,
+            backfill_gen: 0,
         }
+    }
+
+    /// Blocks of the versions held, oldest first (replay audit).
+    pub fn version_blocks(&self) -> Vec<u64> {
+        self.versions.iter().map(|v| v.block).collect()
+    }
+
+    /// FASTLANE_AHEAD_KEEP_FILL: how many back-fills so far (see Sink::publish).
+    pub fn backfill_gen(&self) -> u64 {
+        self.backfill_gen
     }
 
     pub fn head(&self) -> Option<u64> {
@@ -846,6 +897,12 @@ impl KeeperCore {
 
     /// Queue seeds for values not held and not already asked for.
     fn queue(&mut self, a: Address, slots: Vec<U256>, basics: bool) {
+        self.queue_at(a, slots, basics, false);
+    }
+
+    /// `queue`, at the FRONT of the queue when `front` (FASTLANE_AHEAD_KEEP_
+    /// FILL: values a replay just failed on go before bulk re-seeds).
+    fn queue_at(&mut self, a: Address, slots: Vec<U256>, basics: bool, front: bool) {
         let held = self.cur.accounts.get(&a);
         let need_basics = basics && !held.is_some_and(|x| matches!(x.basics, Basics::Known(_))) && !self.pending.contains(&(a, None));
         let mut need: Vec<U256> = slots
@@ -874,6 +931,20 @@ impl KeeperCore {
         let mut chunks: Vec<Vec<U256>> = need.chunks(self.cfg.seed_batch.max(1)).map(|c| c.to_vec()).collect();
         if chunks.is_empty() {
             chunks.push(Vec::new());
+        }
+        if front {
+            // Urgent: in order, ahead of everything waiting.
+            for c in chunks.into_iter().rev() {
+                self.seeds.push_front(SeedJob { addr: a, slots: c, basics: false });
+            }
+            if need_basics {
+                if let Some(j) = self.seeds.front_mut() {
+                    j.basics = true;
+                }
+            }
+            self.stats.fill_urgent += 1;
+            self.seed_first.entry(a).or_insert_with(Instant::now);
+            return;
         }
         for c in chunks {
             self.seeds.push_back(SeedJob { addr: a, slots: c, basics: first && need_basics });
@@ -912,7 +983,13 @@ impl KeeperCore {
         }
         let total_held: usize = self.kept_slots();
         let mut grew: Vec<Address> = Vec::new();
+        // FASTLANE_AHEAD_KEEP_FILL: this batch's values of contracts already
+        // kept (a replay just failed on them), seeded first.
+        let mut urgent: Vec<(Address, Vec<U256>, bool)> = Vec::new();
         for (a, (slots, basics)) in by {
+            if self.cfg.fill && self.held.contains(&a) {
+                urgent.push((a, slots.clone(), basics));
+            }
             // A kept contract may hold FASTLANE_AHEAD_KEEP_SLOTS values; a
             // mere candidate remembers at most FASTLANE_AHEAD_KEEP_CAND_SLOTS
             // (bounded memory: 4,096 candidates x 2,000 values was possible).
@@ -950,6 +1027,16 @@ impl KeeperCore {
             }
         }
         self.choose();
+        // FASTLANE_AHEAD_KEEP_FILL: urgent ones to the front (still kept
+        // after choose(); bounded like any seed).
+        if total_held < self.cfg.max_slots_total {
+            urgent.sort_by_key(|u| u.0);
+            for (a, slots, basics) in urgent {
+                if self.held.contains(&a) {
+                    self.queue_at(a, slots, basics, true);
+                }
+            }
+        }
         // Values of kept contracts not held yet: seed them (bounded in all).
         for a in grew {
             if self.held.contains(&a) {
@@ -1014,7 +1101,7 @@ impl KeeperCore {
             // Memory guard: the queue waits (nothing dropped).
             return None;
         }
-        if self.cfg.seed_merge || self.cfg.seed_gather_ms > 0 {
+        if self.cfg.seed_merge || self.cfg.seed_gather_ms > 0 || self.cfg.fill {
             return self.take_merged(Instant::now());
         }
         while let Some(j) = self.seeds.pop_front() {
@@ -1121,7 +1208,81 @@ impl KeeperCore {
         }
         self.stats.seed_values += added;
         self.cur.accounts.insert(ans.addr, held);
+        // FASTLANE_AHEAD_KEEP_FILL: into the recent versions too.
+        if self.cfg.fill && !ans.slots.is_empty() {
+            let n = self.backfill(ans.addr, &ans.slots, ans.at);
+            self.stats.fill_backfilled += n as u64;
+        }
         self.publish(true);
+    }
+
+    /// FASTLANE_AHEAD_KEEP_FILL: write seeded values (exact at block `at`)
+    /// into the held versions of other recent blocks, only where the value
+    /// is provably the same: every block between that version and `at` is
+    /// in `recent`, none of them wrote that value, and none created /
+    /// destroyed / wiped the contract. Versions after `at` get the value
+    /// carried forward through their blocks' writes (like the seed itself).
+    /// A value a version already holds is never replaced. The head version
+    /// is left to `publish`. Returns the values added.
+    fn backfill(&mut self, addr: Address, vals: &[(U256, U256)], at: u64) -> usize {
+        let head_block = self.cur.block;
+        let mut added = 0usize;
+        for i in 0..self.versions.len() {
+            let b = self.versions[i].block;
+            if b == head_block || (b == at && self.versions[i].accounts.get(&addr).is_some_and(|x| vals.iter().all(|(s, _)| x.storage.contains_key(s)))) {
+                continue;
+            }
+            let (lo, hi) = if b < at { (b, at) } else { (at, b) };
+            // Every block in (lo, hi] must be here (never a gap).
+            let between: Vec<&StateDiff> = self.recent.iter().filter(|(x, _)| *x > lo && *x <= hi).map(|(_, d)| d.as_ref()).collect();
+            if between.len() as u64 != hi - lo {
+                continue;
+            }
+            // Created / destroyed / wiped in between: nothing carried.
+            if between.iter().any(|d| d.accounts.get(&addr).is_some_and(|ad| ad.storage_cleared || ad.forget || matches!(ad.info, Some(None)))) {
+                continue;
+            }
+            let v = &self.versions[i];
+            if v.accounts.get(&addr).is_some_and(|x| x.storage_complete) {
+                continue;
+            }
+            let mut acct = v.accounts.get(&addr).cloned().unwrap_or_default();
+            let mut n = 0usize;
+            for (s, val) in vals {
+                if acct.storage.contains_key(s) {
+                    continue;
+                }
+                let value = if b < at {
+                    // Back: only if no block in between wrote it.
+                    if between.iter().any(|d| d.accounts.get(&addr).is_some_and(|ad| ad.storage.contains_key(s))) {
+                        continue;
+                    }
+                    *val
+                } else {
+                    // Forward: the last write in between wins (blocks in order).
+                    let mut x = *val;
+                    for d in &between {
+                        if let Some(w) = d.accounts.get(&addr).and_then(|ad| ad.storage.get(s)) {
+                            x = *w;
+                        }
+                    }
+                    x
+                };
+                acct.storage.insert(*s, value);
+                n += 1;
+            }
+            if n == 0 {
+                continue;
+            }
+            let mut nv = (**v).clone();
+            nv.accounts.insert(addr, acct);
+            self.versions[i] = Arc::new(nv);
+            added += n;
+        }
+        if added > 0 {
+            self.backfill_gen += 1;
+        }
+        added
     }
 
     /// Codes the keeper holds (a seed asks for a contract's code only when
@@ -1813,6 +1974,8 @@ impl KeeperIo for LiveIo {
 #[derive(Clone)]
 pub struct Sink {
     pub versions: Arc<Mutex<VecDeque<Arc<KeptVersion>>>>,
+    /// FASTLANE_AHEAD_KEEP_FILL: the core's back-fill count last copied.
+    pub backfill_seen: Arc<std::sync::atomic::AtomicU64>,
     pub status: Arc<Mutex<Value>>,
     /// Called after every new version (live: wakes the predicted copy).
     pub on_publish: Arc<dyn Fn() + Send + Sync>,
@@ -1822,7 +1985,7 @@ pub struct Sink {
 
 impl Sink {
     pub fn new(on_publish: Arc<dyn Fn() + Send + Sync>) -> Sink {
-        Sink { versions: Default::default(), status: Arc::new(Mutex::new(json!({}))), on_publish, stop: Default::default() }
+        Sink { versions: Default::default(), backfill_seen: Default::default(), status: Arc::new(Mutex::new(json!({}))), on_publish, stop: Default::default() }
     }
     /// The version of exactly `block` (None = not held).
     pub fn version_at(&self, block: u64) -> Option<Arc<KeptVersion>> {
@@ -1843,6 +2006,18 @@ impl Sink {
             g.push_back(v.clone());
             while g.len() > keep {
                 g.pop_front();
+            }
+            // FASTLANE_AHEAD_KEEP_FILL: older versions the core back-filled
+            // replace their copies here (same block, more values held).
+            let gen = k.backfill_gen();
+            if self.backfill_seen.swap(gen, std::sync::atomic::Ordering::Relaxed) != gen {
+                for x in g.iter_mut() {
+                    if let Some(cv) = k.version_at(x.block) {
+                        if !Arc::ptr_eq(x, &cv) {
+                            *x = cv;
+                        }
+                    }
+                }
             }
             drop(g);
             (self.on_publish)();
@@ -3597,5 +3772,148 @@ mod tests {
         assert_eq!(m.storage(a(7), u(2)), crate::state::Lookup::Known(u(6)), "the hole filled");
         let (m, _) = merge_base(&base, &NoneExact, &kv);
         assert_eq!(m.storage(a(7), u(1)), crate::state::Lookup::Known(u(5)), "an approximate value replaced");
+    }
+
+    // -----------------------------------------------------------------
+    // FASTLANE_AHEAD_KEEP_FILL (Nov 10 evening)
+    // -----------------------------------------------------------------
+
+    fn fill_core(fill: bool) -> KeeperCore {
+        KeeperCore::new(KeeperCfg { on: true, max_contracts: 10, adopt_writes: false, fill, ..KeeperCfg::default() })
+    }
+
+    /// A value a replay just failed on (of a contract already kept) is
+    /// seeded FIRST, ahead of the bulk seeds waiting; off = the old queue.
+    #[test]
+    fn fill_urgent_misses_go_first() {
+        for fill in [true, false] {
+            let mut k = fill_core(fill);
+            k.start_at(1);
+            // Two kept contracts with many values waiting (bulk).
+            let bulk1: Vec<MissItem> = (1..=150).map(|s| MissItem::Slot(a(1), u(s))).collect();
+            let bulk2: Vec<MissItem> = (1..=150).map(|s| MissItem::Slot(a(2), u(s))).collect();
+            k.learn(&bulk1);
+            k.learn(&bulk2);
+            // A replay now fails on a NEW value of a(2).
+            k.learn(&[MissItem::Slot(a(2), u(999))]);
+            let j = k.take_job().unwrap();
+            if fill {
+                assert_eq!(j.addr, a(2), "urgent first");
+                assert!(j.slots.contains(&u(999)), "{:?}", j.slots);
+                assert!(j.slots.len() <= 100, "one call holds at most seed_batch values");
+                assert!(k.stats.fill_urgent >= 1);
+            } else {
+                assert_eq!(j.addr, a(1), "old: first come, first served");
+                assert!(!j.slots.contains(&u(999)));
+            }
+        }
+    }
+
+    /// FILL merges one contract's waiting seeds into one call (like
+    /// SEED_MERGE): the learned values ride along at no extra call.
+    #[test]
+    fn fill_one_call_per_contract() {
+        let mut k = fill_core(true);
+        k.start_at(1);
+        k.learn(&[MissItem::Slot(a(1), u(1))]);
+        k.learn(&[MissItem::Slot(a(1), u(2))]);
+        k.learn(&[MissItem::Slot(a(1), u(3))]);
+        let j = k.take_job().unwrap();
+        let mut got = j.slots.clone();
+        got.sort();
+        assert_eq!(got, vec![u(1), u(2), u(3)]);
+        assert!(k.take_job().is_none(), "one call");
+    }
+
+    /// BACK-FILL: a seeded value (exact at the head) goes into the older
+    /// versions where no block in between wrote it, and is carried forward
+    /// into newer ones through their writes; never where a block wrote it.
+    #[test]
+    fn fill_backfills_older_versions_only_where_provably_the_same() {
+        let mut k = fill_core(true);
+        k.start_at(100);
+        k.learn(&[MissItem::Slot(a(1), u(1)), MissItem::Slot(a(1), u(2))]);
+        let j = k.take_job().unwrap();
+        // Block 101 writes value 2 (55); 102 and 103 write nothing of a(1).
+        k.apply_block(101, &[slot_diff(a(1), &[(2, 55)])]).unwrap();
+        k.apply_block(102, &[slot_diff(a(9), &[(1, 1)])]).unwrap();
+        k.apply_block(103, &[]).unwrap();
+        // The seed answers at 103 (the head): value 1 = 7, value 2 = 55.
+        k.on_seed(&j, Some(SeedAnswer { addr: a(1), at: 103, basics: None, code: None, slots: vec![(u(1), u(7)), (u(2), u(55))] }));
+        let held = |b: u64, s: u64| k.version_at(b).unwrap().accounts.get(&a(1)).and_then(|x| x.storage.get(&u(s)).copied());
+        assert_eq!((held(103, 1), held(103, 2)), (Some(u(7)), Some(u(55))), "head");
+        assert_eq!((held(102, 1), held(102, 2)), (Some(u(7)), Some(u(55))), "102: nothing written since");
+        assert_eq!((held(101, 1), held(101, 2)), (Some(u(7)), Some(u(55))), "101: value 2 was written AT 101 (55), not after");
+        assert_eq!(held(100, 1), Some(u(7)), "100: value 1 never written since");
+        assert_eq!(held(100, 2), None, "100: block 101 wrote value 2 after it: unknown, never guessed");
+        assert_eq!(k.stats.fill_backfilled, 5, "2 + 2 + 1 values");
+        assert!(k.backfill_gen() >= 1);
+    }
+
+    /// Forward: a seed answered at an older block reaches the newer
+    /// versions with their blocks' writes applied. Off = no back-fill.
+    #[test]
+    fn fill_carries_a_late_seed_into_newer_versions() {
+        for fill in [true, false] {
+            let mut k = fill_core(fill);
+            k.start_at(100);
+            k.learn(&[MissItem::Slot(a(1), u(1))]);
+            let j = k.take_job().unwrap();
+            k.apply_block(101, &[]).unwrap();
+            k.apply_block(102, &[slot_diff(a(1), &[(1, 9)])]).unwrap();
+            k.apply_block(103, &[]).unwrap();
+            k.on_seed(&j, Some(SeedAnswer { addr: a(1), at: 101, basics: None, code: None, slots: vec![(u(1), u(4))] }));
+            let held = |b: u64| k.version_at(b).unwrap().accounts.get(&a(1)).and_then(|x| x.storage.get(&u(1)).copied());
+            assert_eq!(held(103), Some(u(9)), "head: carried through 102's write (as before)");
+            if fill {
+                assert_eq!(held(102), Some(u(9)), "102: its own write");
+                assert_eq!(held(101), Some(u(4)), "101: the seed's block");
+                assert_eq!(held(100), Some(u(4)), "100: nothing written in 101");
+            } else {
+                assert_eq!((held(100), held(101), held(102)), (None, None, None), "off: only the head");
+            }
+        }
+    }
+
+    /// A contract created / destroyed in between: nothing back-filled.
+    #[test]
+    fn fill_never_backfills_across_a_wipe() {
+        let mut k = fill_core(true);
+        k.start_at(100);
+        k.learn(&[MissItem::Slot(a(1), u(1))]);
+        let j = k.take_job().unwrap();
+        let mut d = StateDiff::default();
+        d.accounts.insert(a(1), AccountDiff { storage_cleared: true, ..Default::default() });
+        k.apply_block(101, &[d]).unwrap();
+        k.on_seed(&j, Some(SeedAnswer { addr: a(1), at: 101, basics: None, code: None, slots: vec![(u(1), u(4))] }));
+        assert!(k.version_at(100).unwrap().accounts.get(&a(1)).is_none());
+    }
+
+    /// The runtime's copies of the versions (Sink) get the back-filled ones.
+    #[test]
+    fn fill_sink_replaces_backfilled_versions() {
+        let mut k = fill_core(true);
+        let sink = Sink::new(Arc::new(|| {}));
+        k.start_at(100);
+        sink.publish(&k, 64);
+        k.learn(&[MissItem::Slot(a(1), u(1))]);
+        let j = k.take_job().unwrap();
+        for b in 101..=102 {
+            k.apply_block(b, &[]).unwrap();
+            sink.publish(&k, 64);
+        }
+        assert!(!sink.version_at(101).unwrap().holds_slot(&a(1), &u(1)));
+        k.on_seed(&j, Some(SeedAnswer { addr: a(1), at: 102, basics: None, code: None, slots: vec![(u(1), u(4))] }));
+        sink.publish(&k, 64);
+        assert!(sink.version_at(101).unwrap().holds_slot(&a(1), &u(1)), "back-filled copy in the sink");
+        assert!(sink.version_at(100).unwrap().holds_slot(&a(1), &u(1)));
+    }
+
+    /// Settings: on live unless set off; off in the core's own default.
+    #[test]
+    fn fill_settings() {
+        assert!(KeeperCfg::from_lookup(|_| None).fill);
+        assert!(!KeeperCfg::from_lookup(|k| (k == "FASTLANE_AHEAD_KEEP_FILL").then(|| "off".to_string())).fill);
+        assert!(!KeeperCfg::default().fill);
     }
 }

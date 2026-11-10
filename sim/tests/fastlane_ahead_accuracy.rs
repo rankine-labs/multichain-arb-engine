@@ -936,14 +936,18 @@ fn the_wrong_guard_ends() {
     assert!(a.tip().unwrap().unsure_pools.is_empty(), "block 13: over");
 }
 
-/// The settings: both on live unless set off; the guard's length.
+/// The settings: diag on live unless set off; the guard OFF unless set on
+/// (Nov 10 evening, owner approved); the guard's length.
 #[test]
 fn wrong_guard_and_diag_settings() {
     let cfg = |k: &str, v: &str| AheadCfg::from_lookup(|x| (x == k).then(|| v.to_string()), 0);
-    assert_eq!(cfg("", "").wrong_guard_blocks, 3000);
+    let cfg2 = |k: &str, v: &str, k2: &str, v2: &str| AheadCfg::from_lookup(|x| if x == k { Some(v.to_string()) } else if x == k2 { Some(v2.to_string()) } else { None }, 0);
+    assert_eq!(cfg("", "").wrong_guard_blocks, 0, "off unless set");
     assert!(cfg("", "").diag);
+    assert_eq!(cfg("FASTLANE_AHEAD_WRONG_GUARD", "on").wrong_guard_blocks, 3000);
     assert_eq!(cfg("FASTLANE_AHEAD_WRONG_GUARD", "off").wrong_guard_blocks, 0);
-    assert_eq!(cfg("FASTLANE_AHEAD_WRONG_GUARD_BLOCKS", "50").wrong_guard_blocks, 50);
+    assert_eq!(cfg("FASTLANE_AHEAD_WRONG_GUARD_BLOCKS", "50").wrong_guard_blocks, 0, "a length alone does not turn it on");
+    assert_eq!(cfg2("FASTLANE_AHEAD_WRONG_GUARD", "on", "FASTLANE_AHEAD_WRONG_GUARD_BLOCKS", "50").wrong_guard_blocks, 50);
     assert!(!cfg("FASTLANE_AHEAD_DIAG", "off").diag);
     assert!(!AheadCfg::default().diag && AheadCfg::default().wrong_guard_blocks == 0, "tests / replay: off unless asked");
 }
@@ -976,3 +980,102 @@ fn diag_counts_failed_runs_and_unsure_causes() {
     assert!(arbsim::copy2::ahead::diag_json(&off).is_null());
 }
 
+
+// ---------------------------------------------------------------------------
+// Nov 10 evening: FASTLANE_AHEAD_UNSURE_KEEP (no pool wipe, taint)
+// ---------------------------------------------------------------------------
+
+fn spy() -> Address {
+    addr(0x1004)
+}
+/// SPY: calls POOL2 with a zero word (POOL2 reads its own value 0 and adds
+/// nothing), then calls DEP with the word 3 (DEP's value 0 becomes 3). So a
+/// value of DEP is written by a run that READ POOL2.
+fn spy_code() -> Vec<u8> {
+    let mut c = hex("6000 6000 6020 6000 6000 73");
+    c.extend_from_slice(pool2().as_slice());
+    c.extend(hex("5a f1 50 6003 6000 52 6000 6000 6020 6000 6000 73"));
+    c.extend_from_slice(dep().as_slice());
+    c.extend(hex("5a f1 50 00"));
+    c
+}
+
+/// The cascade, before and after. A reverted run marks POOL unsure; a later
+/// swap on POOL in the same block:
+///   off (old rule): POOL's whole account was forgotten, so the swap FAILS
+///       on a value we threw away ("forgotten earlier", the cascade);
+///   on: POOL keeps its values, the swap runs (exactly), and because it
+///       read an unsure pool it is "tainted": POOL stays unsure (never
+///       vouched for), but nothing failed.
+#[test]
+fn an_unsure_pool_keeps_its_values_and_later_runs_still_run() {
+    for keep in [true, false] {
+        let mut a = ahead_on(AheadCfg { diag: true, unsure_keep: keep, ..AheadCfg::default() }, copy_at(100, 7));
+        let t1 = stx(0, pool(), vec![0xde, 0xad, 0xbe, 0xef]);
+        let t2 = stx(1, pool(), w(5));
+        a.on_feed_message(msg(11, &[t1, t2]));
+        let tip = a.tip().expect("a tip");
+        assert!(tip.unsure_pools.contains(&key(pool())), "{keep}: {:?}", tip.unsure_pools);
+        if keep {
+            assert_eq!(a.total.txs_failed, 0, "nothing failed");
+            assert_eq!(a.total.fail_cascade, 0);
+            assert_eq!(a.total.tainted_runs, 1, "{}", a.total.json_with(false));
+            assert_eq!(tip.view().storage(pool(), U256::ZERO), known(105), "values kept and the swap applied");
+        } else {
+            assert_eq!(a.total.txs_failed, 1, "old rule: the swap failed on our own wipe");
+            assert!(a.total.fail_cascade >= 1, "{}", a.total.json_with(false));
+            assert!(matches!(tip.view().storage(pool(), U256::ZERO), Lookup::Missing));
+        }
+        // POOL2 was never touched: sure either way.
+        assert!(!tip.unsure_pools.contains(&key(pool2())));
+    }
+}
+
+/// Taint spreads through written values: SPY reads unsure POOL2 and writes
+/// DEP; ROUTER then reads DEP and swaps on POOL. POOL's new value may be
+/// built on a wrong one: POOL is marked unsure too (values kept).
+#[test]
+fn taint_spreads_through_values_a_tainted_run_wrote() {
+    let mut base = copy_at(100, 7);
+    put(&mut base, spy(), spy_code(), &[]);
+    let mut a = ahead_on(AheadCfg { run_all: true, unsure_keep: true, ..AheadCfg::default() }, base);
+    let t1 = stx(0, pool2(), vec![0xde, 0xad, 0xbe, 0xef]);
+    let t2 = stx(1, spy(), vec![]);
+    let t3 = stx(2, router(), w(3));
+    a.on_feed_message(msg(11, &[t1, t2, t3]));
+    let tip = a.tip().expect("a tip");
+    assert_eq!(tip.unsure_pools, vec![key(pool()), key(pool2())], "{}", a.total.json_with(false));
+    assert_eq!(tip.view().storage(dep(), U256::ZERO), known(3));
+    assert_eq!(tip.view().storage(pool(), U256::ZERO), known(109), "100 + 3 x 3, kept");
+    assert_eq!(a.total.tainted_runs, 2, "SPY and ROUTER: {}", a.total.json_with(false));
+    assert!(a.total.tainted_marks >= 1);
+}
+
+/// A run that reads nothing unsure is exactly as before (sure).
+#[test]
+fn a_run_touching_nothing_unsure_stays_sure() {
+    let mut a = ahead_on(AheadCfg { unsure_keep: true, ..AheadCfg::default() }, copy_at(100, 7));
+    let t1 = stx(0, pool2(), vec![0xde, 0xad, 0xbe, 0xef]);
+    let t2 = stx(1, pool(), w(5));
+    a.on_feed_message(msg(11, &[t1, t2]));
+    let tip = a.tip().expect("a tip");
+    assert_eq!(tip.unsure_pools, vec![key(pool2())]);
+    assert_eq!(tip.view().storage(pool(), U256::ZERO), known(105));
+    assert_eq!(tip.view().storage(pool2(), U256::ZERO), known(7), "unsure, values kept");
+    assert_eq!(a.total.tainted_runs, 0);
+    // The next block builds on it: POOL2 is still unsure, still held.
+    let t3 = stx(2, pool(), w(1));
+    a.on_feed_message(msg(12, &[t3]));
+    let tip = a.tip().expect("a tip");
+    assert_eq!(tip.unsure_pools, vec![key(pool2())]);
+    assert_eq!(tip.view().storage(pool(), U256::ZERO), known(106));
+}
+
+/// Settings: on live unless set off; off in the default (tests / replay).
+#[test]
+fn unsure_keep_settings() {
+    let cfg = |k: &str, v: &str| AheadCfg::from_lookup(|x| (x == k).then(|| v.to_string()), 0);
+    assert!(cfg("", "").unsure_keep);
+    assert!(!cfg("FASTLANE_AHEAD_UNSURE_KEEP", "off").unsure_keep);
+    assert!(!AheadCfg::default().unsure_keep);
+}

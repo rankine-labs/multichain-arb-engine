@@ -774,7 +774,30 @@ impl ReplayKeeper {
             };
             let code = basics.as_ref().and_then(|b| b.as_ref()).and_then(|i| self.truth.code(&i.code_hash));
             let ans = SeedAnswer { addr: job.addr, at: head, basics, code, slots };
+            let gen = self.core.backfill_gen();
             self.core.on_seed(&job, Some(ans));
+            // FASTLANE_AHEAD_KEEP_FILL: values back-filled into OLDER
+            // versions are checked against the truth too (the per-block
+            // audit only sees each version once, when it is made).
+            if self.core.backfill_gen() != gen {
+                for b in self.core.version_blocks() {
+                    let Some(v) = self.core.version_at(b) else { continue };
+                    let Some(acct) = v.accounts.get(&job.addr) else { continue };
+                    for s in &job.slots {
+                        let Some(val) = acct.storage.get(s) else { continue };
+                        match self.truth.slot_at(&job.addr, s, b) {
+                            Some(t) if t == *val => self.audit_ok += 1,
+                            Some(t) => {
+                                self.audit_bad += 1;
+                                if self.audit_samples.len() < 10 {
+                                    self.audit_samples.push(json!({"block": b, "contract": format!("{:#x}", job.addr), "slot": format!("{s:#x}"), "ours": format!("{val:#x}"), "truth": format!("{t:#x}"), "backfill": true}));
+                                }
+                            }
+                            None => self.audit_unknown += 1,
+                        }
+                    }
+                }
+            }
         }
         self.core.version_at(block)
     }
