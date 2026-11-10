@@ -1,0 +1,98 @@
+# ============================================================================
+# SNIPER BINARY - builds the read-only sniper tools for Windows and Linux.
+#
+# Plain English:
+#   Same pattern as arbsim-binary.yml. On every push to a sniper/* branch
+#   that touches sniper/, GitHub builds the sniper program, runs its tests,
+#   and stores the results on a separate branch called "sniper-bin" (one
+#   commit only, replaced each time):
+#     sniper.exe          Windows program
+#     sniper              Linux program (Ubuntu 24.04 build, runs on 26.04)
+#     SHA256SUMS          checksums
+#     BUILD_INFO          what it was built from
+#   The sniper is read-only (probe, scanner, checks): it holds no keys and
+#   never sends transactions. It does not touch the arb bot or arbsim-bin.
+#
+# Run by hand: Actions -> "Sniper binary" -> Run workflow.
+# ============================================================================
+name: Sniper binary
+
+on:
+  push:
+    branches: ['sniper/**']
+    paths:
+      - 'sniper/**'
+      - '.github/workflows/sniper-binary.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sniper-binary
+  cancel-in-progress: true
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            bin: sniper.exe
+          - os: ubuntu-24.04
+            bin: sniper
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            sniper/target
+          key: sniper-${{ runner.os }}-${{ hashFiles('sniper/Cargo.lock') }}
+          restore-keys: sniper-${{ runner.os }}-
+      - name: Build (release)
+        working-directory: sniper
+        run: cargo build --release --locked
+      - name: Tests
+        working-directory: sniper
+        run: cargo test --release --locked
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.bin }}
+          path: sniper/target/release/${{ matrix.bin }}
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: art
+      - name: Publish to the sniper-bin branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir out
+          cp art/sniper.exe/sniper.exe out/
+          cp art/sniper/sniper out/ && chmod 755 out/sniper
+          (cd out && sha256sum sniper.exe sniper > SHA256SUMS)
+          {
+            echo "source_commit=$(git rev-parse HEAD)"
+            echo "source_ref=${GITHUB_REF_NAME}"
+            echo "sniper_tree=$(git rev-parse HEAD:sniper)"
+            echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "workflow_run=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          } > out/BUILD_INFO
+          cd out
+          git init -q -b sniper-bin
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          echo "Built automatically by .github/workflows/sniper-binary.yml. Do not edit." > README
+          git add .
+          git commit -q -m "sniper for ${GITHUB_SHA::7}"
+          git push -q --force "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" HEAD:refs/heads/sniper-bin
+        env:
+          GH_TOKEN: ${{ github.token }}
