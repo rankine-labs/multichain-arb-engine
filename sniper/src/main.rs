@@ -3,6 +3,10 @@
 //
 //   sniper probe                    run the read-only probe (config: env vars,
 //                                   see src/probe.rs or README.md)
+//   sniper scan                     live token scanner (config: env vars,
+//                                   see src/scan.rs)
+//   sniper curve-check <dir>        fit + verify the Four.meme price formula
+//                                   against real trades (writes curve_fit.json)
 //   sniper report <dir> [options]   print the numbers for a probe run and
 //                                   save them as <dir>/summary.json
 //     --min-lead-ms N    lead time needed to act on a pending buy (default 150)
@@ -26,6 +30,24 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        Some("scan") => match sniper::scan::Config::from_env().and_then(sniper::scan::run) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("scan: {e}");
+                ExitCode::FAILURE
+            }
+        },
+        Some("curve-check") => {
+            let Some(dir) = args.get(1) else {
+                eprintln!("usage: sniper curve-check <probe output dir>");
+                return ExitCode::FAILURE;
+            };
+            let dir = PathBuf::from(dir);
+            let r = sniper::calibrate::build(&dir);
+            let _ = std::fs::write(dir.join("curve_fit.json"), serde_json::to_string_pretty(&r).unwrap_or_default());
+            print!("{}", sniper::calibrate::render(&r));
+            ExitCode::SUCCESS
+        }
         Some("report") => {
             let Some(dir) = args.get(1) else {
                 eprintln!("usage: sniper report <probe output dir> [options]");
@@ -64,7 +86,7 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         _ => {
-            eprintln!("usage: sniper probe | sniper report <dir> [--min-lead-ms N] [--burst-buys N] [--hurdle-pct X] [--json]");
+            eprintln!("usage: sniper probe | sniper scan | sniper curve-check <dir> | sniper report <dir> [--min-lead-ms N] [--burst-buys N] [--hurdle-pct X] [--json]");
             ExitCode::FAILURE
         }
     }
