@@ -184,11 +184,33 @@
 //        holds every value a block WRITES in any other contract (from the
 //        block diffs it already fetches: no node cost). A warm account is
 //        never a "kept target" pick (is_kept vs is_warm).
-//    17. FASTLANE_AHEAD_WRONG_GUARD [on, 3000 blocks]: a pool that was sure
-//        and wrong is listed unsure for a while (the 1-in-20 line).
+//    17. FASTLANE_AHEAD_WRONG_GUARD [off since Nov 10 evening; 3000 blocks
+//        when on]: a pool that was sure and wrong is listed unsure for a
+//        while (the 1-in-20 line).
 //    18. FASTLANE_AHEAD_DIAG [on]: the replay's cause breakdown, live, in
 //        status fastlaneAhead.diag (failWhy, unsureCause, hzUnsureCause,
 //        missTop).
+//
+//   NO POOL WIPE (Nov 10 evening; live hold run: 18,721 of 94,647 failed
+//   replays were our OWN doing, 17,055 of them on one pool, 0x52e65b17):
+//    19. FASTLANE_AHEAD_UNSURE_KEEP [on]. Root cause: marking a pool unsure
+//        used to FORGET it in the predicted copy (forget_place): a contract
+//        pool's whole account (code, every value, its balance) was dropped,
+//        a V4 pool's 4 base values were removed (and if the PoolManager was
+//        held "every value known", the WHOLE PoolManager went). So every
+//        later transaction of the block (and of every block predicted on
+//        top, until copy 2 confirmed it) that went through that pool failed
+//        on a value WE had thrown away, and each of those failures marked
+//        more pools unsure (a cascade). 97% of the pools marked unsure never
+//        really moved. Now an unsure pool KEEPS its last exact values for
+//        replays; it is only listed unsure for decisions (the scanner, the
+//        lane, the agreement). Safety ("taint"): a later run that READS an
+//        unsure-kept pool's values, or a value an earlier tainted run wrote,
+//        may be built on a wrong value, so it is never vouched for: the pools
+//        it moves (plus the ones it names / pays ETH into; with nothing of
+//        that, the pools it read) are marked unsure too, and everything it
+//        wrote becomes tainted in turn. A run that touches nothing unsure is
+//        exactly as before. off = the old rule (forget).
 //
 // API (scanner and integration):
 //   Ahead::on_feed_message(Arc<BinMsg>)            a new feed message
@@ -410,7 +432,7 @@ pub struct AheadCfg {
     /// whose missing values failed the most replays (top 25 of at most
     /// 4,096 counted). Counters only: no decision reads them.
     pub diag: bool,
-    /// FASTLANE_AHEAD_WRONG_GUARD [on live; off in the default] (Nov 10,
+    /// FASTLANE_AHEAD_WRONG_GUARD [off; was on live Nov 10] (Nov 10,
     /// the 1-in-20 safety line). A pool our prediction was SURE about and
     /// got wrong (one block ahead or at the horizon) is not vouched for in
     /// the next FASTLANE_AHEAD_WRONG_GUARD_BLOCKS [3000, about 5 min]
@@ -419,12 +441,22 @@ pub struct AheadCfg {
     /// rival / router keeps beating our replay there), so this keeps the
     /// wrong-when-sure share down while other pools get sure more often.
     /// 0 = off.
+    /// (Nov 10 evening: OFF unless set. Live warm + guard was 0.8% sure /
+    /// 11.1% wrong-when-sure vs warm alone 1.8% / 14.0%: it took away more
+    /// right answers than wrong ones.)
     pub wrong_guard_blocks: u64,
+    /// FASTLANE_AHEAD_UNSURE_KEEP [on live; off in the default] (Nov 10
+    /// evening, see "NO POOL WIPE" in the file header): a pool marked
+    /// unsure keeps its last exact values in the predicted copy (replays
+    /// through it still run), and runs that read it are "tainted" (their
+    /// pools are marked unsure, never vouched for). off = the old rule: its
+    /// values are forgotten.
+    pub unsure_keep: bool,
 }
 
 impl Default for AheadCfg {
     fn default() -> Self {
-        AheadCfg { max_blocks: 32, run_all: false, max_txs: 256, max_touchers: 4096, l2_offset: 0, trust_sender_funds: false, msg_budget_us: 10_000, routes_only: true, compare_delay: 0, revert_unsure: true, exact_revert_sure: false, unknown_continue: false, keeper: false, keep_pick: true, budget_cpu: false, lazy_rebase: false, kept_rebuild_once: false, need_keeper: false, thin_pending: true, horizon: false, hz_notes: false, narrow_unsure: false, diag: false, wrong_guard_blocks: 0 }
+        AheadCfg { max_blocks: 32, run_all: false, max_txs: 256, max_touchers: 4096, l2_offset: 0, trust_sender_funds: false, msg_budget_us: 10_000, routes_only: true, compare_delay: 0, revert_unsure: true, exact_revert_sure: false, unknown_continue: false, keeper: false, keep_pick: true, budget_cpu: false, lazy_rebase: false, kept_rebuild_once: false, need_keeper: false, thin_pending: true, horizon: false, hz_notes: false, narrow_unsure: false, diag: false, wrong_guard_blocks: 0, unsure_keep: false }
     }
 }
 
@@ -443,6 +475,11 @@ pub fn thread_cpu_us() -> u64 {
 /// Default FASTLANE_AHEAD_WRONG_GUARD_BLOCKS (about 5 minutes of blocks).
 pub const WRONG_GUARD_BLOCKS_DEFAULT: u64 = 3_000;
 
+/// FASTLANE_AHEAD_DIAG: most learned values remembered for "first / again".
+const ASKED_MAX: usize = 500_000;
+/// FASTLANE_AHEAD_UNSURE_KEEP: most tainted values held per predicted block
+/// (past it, every later run of that prediction is tainted: fail closed).
+const TAINT_MAX: usize = 50_000;
 /// FASTLANE_AHEAD_DIAG: most contracts counted in the "missing value" table.
 const MISS_TOP_MAX: usize = 4_096;
 /// FASTLANE_AHEAD_DIAG: most distinct reasons / causes counted (the rest "other").
@@ -553,14 +590,17 @@ impl AheadCfg {
             // Memory fix (Nov 1): on in every mode (agreement only measures;
             // its answers are the same either way).
             thin_pending: on_off(get("FASTLANE_AHEAD_THIN_PENDING").as_deref()).unwrap_or(d.thin_pending),
-            // Nov 10: both on live unless set off (they decide no trade on
-            // their own; the guard only removes pools from "sure").
+            // Nov 10: on live unless set off (counters only).
             diag: on_off(get("FASTLANE_AHEAD_DIAG").as_deref()).unwrap_or(true),
-            wrong_guard_blocks: if on_off(get("FASTLANE_AHEAD_WRONG_GUARD").as_deref()).unwrap_or(true) {
+            // Nov 10 evening: the guard is OFF unless set on (owner
+            // approved; live it cost more right answers than wrong ones).
+            wrong_guard_blocks: if on_off(get("FASTLANE_AHEAD_WRONG_GUARD").as_deref()).unwrap_or(false) {
                 num("FASTLANE_AHEAD_WRONG_GUARD_BLOCKS").filter(|v| *v <= 1_000_000).unwrap_or(WRONG_GUARD_BLOCKS_DEFAULT as usize) as u64
             } else {
                 0
             },
+            // Nov 10 evening: on live unless set off (NO POOL WIPE).
+            unsure_keep: on_off(get("FASTLANE_AHEAD_UNSURE_KEEP").as_deref()).unwrap_or(true),
         }
     }
 }
@@ -1048,6 +1088,19 @@ impl PoolSet {
     /// Our pools whose OWN values a run wrote (FASTLANE_AHEAD_NARROW_UNSURE):
     /// any value of a pool contract, or one of a V4 pool's 4 base values
     /// (slot0, fee growth x2, liquidity) in its PoolManager.
+    /// FASTLANE_AHEAD_UNSURE_KEEP: the pool whose OWN state (a, s) is, if
+    /// any: any value of one of our pool contracts, or one of a V4 pool's 4
+    /// base values in its PoolManager (the same places `forget_place` used
+    /// to drop).
+    fn place_key(&self, a: &Address, s: &U256) -> Option<&String> {
+        self.by_contract.get(a).or_else(|| {
+            if !self.idx.pms.contains(a) {
+                return None;
+            }
+            (0..4u64).find_map(|d| s.checked_sub(U256::from(d)).and_then(|b| self.v4_slot0.get(&(*a, b))))
+        })
+    }
+
     fn written_by(&self, writes: &[(Address, U256)]) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
         for (a, s) in writes {
@@ -1157,6 +1210,12 @@ struct Entry {
     changed_cum: HashSet<String>,
     /// Pools unsure in this view (since the base).
     unsure_cum: HashSet<String>,
+    /// FASTLANE_AHEAD_UNSURE_KEEP: pools marked unsure whose values were
+    /// kept (a run reading them is tainted), since the base.
+    held_cum: HashSet<String>,
+    /// FASTLANE_AHEAD_UNSURE_KEEP: values written by tainted runs, since
+    /// the base (a run reading one is tainted too).
+    taint: HashSet<(Address, U256)>,
     /// Every transaction of the message and what we did with it (agreement
     /// tells a filter miss from a run that did not move the pool; the
     /// confirmed reports teach which targets move our pools).
@@ -1422,6 +1481,22 @@ pub struct AheadStats {
     /// / extended a guard, and pools a prediction listed unsure for it.
     pub guard_wrongs: u64,
     pub guard_marks: u64,
+    /// FASTLANE_AHEAD_UNSURE_KEEP (Nov 10 evening): pools marked unsure
+    /// whose values were KEPT (not forgotten); runs that read an unsure-kept
+    /// pool's value or a tainted value ("tainted": never vouched for) and
+    /// the pools those runs marked unsure.
+    pub keep_marks: u64,
+    pub tainted_runs: u64,
+    pub tainted_marks: u64,
+    /// FASTLANE_AHEAD_DIAG (Nov 10 evening): failed replays whose missing
+    /// value WE had thrown away earlier in the prediction (the cascade:
+    /// a pool forgotten after an unsure mark, or a slot forgotten after an
+    /// assumed fill), and failed replays whose missing value is a slot of a
+    /// contract the keeper holds, split by whether that value had been
+    /// handed to the keeper to learn before ("again") or not ("first").
+    pub fail_cascade: u64,
+    pub held_miss_first: u64,
+    pub held_miss_again: u64,
     /// Observe-mode build: per feed message, how many blocks the predicted
     /// tip was ahead of copy 2's confirmed version (0 = no tip: stopped or
     /// waiting). The "blocks fresher" gain. Ring of the newest MAX_TIMES.
@@ -1500,6 +1575,8 @@ impl AheadStats {
             "unknownContinued": self.unknown_continued, "missedUnknown": self.missed_unknown, "tips": self.tips,
             "revertsExact": self.reverts_exact, "unsureMoved": self.unsure_moved,
             "narrowUsed": self.narrow_used, "narrowDropped": self.narrow_dropped, "narrowFallback": self.narrow_fallback,
+            "keepMarks": self.keep_marks, "taintedRuns": self.tainted_runs, "taintedMarks": self.tainted_marks,
+            "failCascade": self.fail_cascade, "heldMissFirst": self.held_miss_first, "heldMissAgain": self.held_miss_again,
             "keptBases": self.kept_bases, "keptMissing": self.kept_missing, "keptValues": self.kept_values, "keptRebases": self.kept_rebases, "learned": self.learned,
             "rightKeptBase": self.right_kept, "wrongKeptBase": self.wrong_kept, "rightPlainBase": self.right_plain, "wrongPlainBase": self.wrong_plain, "keptSkipped": self.kept_skipped,
             "applyCpuUs": if times { let mut c = self.cpu_us.clone(); crate::timing::pct_of(&mut c) } else { Value::Null },
@@ -1691,6 +1768,9 @@ pub struct Ahead {
     /// FASTLANE_AHEAD_WRONG_GUARD: pool -> last predicted block it is
     /// not vouched for (it was sure and wrong).
     guard: HashMap<String, u64>,
+    /// FASTLANE_AHEAD_DIAG: slot values handed to the keeper to learn
+    /// (bounded, ASKED_MAX), to tell a first miss from a repeat.
+    asked: FxHashSet<(Address, U256)>,
     /// Offline replay only (`ahead-replay --oracle`): explains each reverted
     /// run against the chain's exact starting state (copy2/keeper_replay.rs
     /// Oracle). None live.
@@ -1745,6 +1825,7 @@ impl Ahead {
             hz_diag: diag_on.then(Default::default),
             miss_top: diag_on.then(Default::default),
             guard: HashMap::new(),
+            asked: FxHashSet::default(),
             oracle: None,
             hour: AheadStats::default(),
             total: AheadStats::default(),
@@ -1968,6 +2049,13 @@ impl Ahead {
             items.push(crate::state::MissItem::Account(sender));
         }
         self.count(|s| s.learned += items.len() as u64);
+        if self.diag.is_some() && self.asked.len() < ASKED_MAX {
+            for it in &items {
+                if let crate::state::MissItem::Slot(a, sl) = it {
+                    self.asked.insert((*a, *sl));
+                }
+            }
+        }
         self.learned.extend(items);
     }
 
@@ -2810,6 +2898,14 @@ impl Ahead {
             Some(e) => (e.snap.clone(), e.ctx.clone(), e.changed_cum.clone(), e.unsure_cum.clone()),
             None => (base_snap, base.ctx.clone().ok_or("no_block_details")?, HashSet::new(), HashSet::new()),
         };
+        // FASTLANE_AHEAD_UNSURE_KEEP: unsure pools whose values were kept,
+        // and values tainted runs wrote, carried from the previous block.
+        let keep_vals = self.cfg.unsure_keep;
+        let (mut held_cum, mut taint) = match self.entries.back() {
+            Some(e) if keep_vals => (e.held_cum.clone(), e.taint.clone()),
+            _ => (HashSet::new(), HashSet::new()),
+        };
+        let held0 = held_cum.len();
         // Deposits / retryables / anything we can't unpack: we can't know
         // what it does to our pools. Never guessed: stop until confirmed.
         if !m.complete || m.bad.is_some() {
@@ -2846,9 +2942,14 @@ impl Ahead {
         let note = |t: &DecodedTx, fate: Fate, ok: bool, why: Option<String>, pools: Vec<String>| TxNote { hash: t.hash, to: t.to, fate, ok, why, pools };
         // Marks pools unsure in this view: their values forgotten (reads
         // Missing), listed changed (the scanner looks again) and unsure.
-        let mark_unsure = |ov: &mut Overlay, changed: &mut Vec<String>, changed_cum: &mut HashSet<String>, unsure_cum: &mut HashSet<String>, keys: &[String]| {
+        // FASTLANE_AHEAD_UNSURE_KEEP: their values are KEPT instead (later
+        // replays through them still run) and they are listed in held_cum,
+        // so a run that reads them is tainted (see the file header).
+        let mark_unsure = |ov: &mut Overlay, changed: &mut Vec<String>, changed_cum: &mut HashSet<String>, unsure_cum: &mut HashSet<String>, held_cum: &mut HashSet<String>, keys: &[String]| {
             for k in keys {
-                if let Some(p) = pools.places.get(k) {
+                if keep_vals {
+                    held_cum.insert(k.clone());
+                } else if let Some(p) = pools.places.get(k) {
                     forget_place(ov, *p);
                 }
                 if !changed.contains(k) {
@@ -2905,7 +3006,7 @@ impl Ahead {
                         }
                         if !named.is_empty() && named.iter().all(|k| !rp.contains(k)) {
                             self.count(|s| s.txs_off_route += 1);
-                            mark_unsure(&mut ov, &mut changed, &mut changed_cum, &mut unsure_cum, &named);
+                            mark_unsure(&mut ov, &mut changed, &mut changed_cum, &mut unsure_cum, &mut held_cum, &named);
                             notes.push(note(t, Fate::OffRoute, true, None, named));
                             continue;
                         }
@@ -2936,7 +3037,14 @@ impl Ahead {
                     // (gas / nonce only) changes are kept, like a failed run.
                     // FASTLANE_AHEAD_EXACT_REVERT_SURE (Nov 2): an EXACT
                     // revert (revert data, nothing assumed) is kept sure.
-                    let exact_revert = !ok && self.cfg.exact_revert_sure && out.assumed.labels().is_empty() && out.replayed.first().is_some_and(|r| exact_revert_outcome(&r.outcome));
+                    // FASTLANE_AHEAD_UNSURE_KEEP: did this run read a value
+                    // of an unsure-kept pool, or a value a tainted run wrote?
+                    // Then it may be built on a wrong value: never vouched for.
+                    // (A taint list past TAINT_MAX taints every run: fail closed.)
+                    let tainted = keep_vals
+                        && (taint.len() >= TAINT_MAX
+                            || kept.reads.iter().any(|(a, sl)| taint.contains(&(*a, *sl)) || pools.place_key(a, sl).is_some_and(|k| held_cum.contains(k))));
+                    let exact_revert = !ok && !tainted && self.cfg.exact_revert_sure && out.assumed.labels().is_empty() && out.replayed.first().is_some_and(|r| exact_revert_outcome(&r.outcome));
                     if exact_revert {
                         self.count(|s| s.reverts_exact += 1);
                     }
@@ -2984,11 +3092,49 @@ impl Ahead {
                     if shaky && !moved.is_empty() {
                         self.count(|s| s.assumed_unsure += 1);
                         for k in &moved {
-                            if let Some(p) = pools.places.get(k) {
+                            if keep_vals {
+                                // UNSURE_KEEP: kept, and later readers tainted.
+                                held_cum.insert(k.clone());
+                            } else if let Some(p) = pools.places.get(k) {
                                 forget_place(&mut ov, *p);
                             }
                             unsure_cum.insert(k.clone());
                         }
+                    }
+                    // FASTLANE_AHEAD_UNSURE_KEEP: a tainted run's writes are
+                    // tainted, and the pools it may have changed are marked
+                    // unsure (values kept): what it moved, names directly or
+                    // pays ETH into; with none of that (e.g. a bot that only
+                    // looked at prices and did nothing), the pools it READ.
+                    // With FASTLANE_AHEAD_NARROW_UNSURE off, read pools too
+                    // (the old rule's collect-run reads).
+                    if tainted {
+                        for (a, sl) in &out.changed {
+                            if taint.len() < TAINT_MAX {
+                                taint.insert((*a, *sl));
+                            }
+                        }
+                        let mut hit: Vec<String> = moved.clone();
+                        for k in pools.named_direct(t.to, &named_now).into_iter().chain(native.iter().cloned()) {
+                            if !hit.contains(&k) {
+                                hit.push(k);
+                            }
+                        }
+                        if hit.is_empty() || !self.cfg.narrow_unsure {
+                            for (a, sl) in &kept.reads {
+                                if let Some(k) = pools.place_key(a, sl) {
+                                    if !hit.contains(k) {
+                                        hit.push(k.clone());
+                                    }
+                                }
+                            }
+                        }
+                        let n = hit.iter().filter(|k| !unsure_cum.contains(*k)).count() as u64;
+                        self.count(|s| {
+                            s.tainted_runs += 1;
+                            s.tainted_marks += n;
+                        });
+                        mark_unsure(&mut ov, &mut changed, &mut changed_cum, &mut unsure_cum, &mut held_cum, &hit);
                     }
                     for k in &moved {
                         // Values forgotten earlier stay forgotten (a later
@@ -3001,7 +3147,7 @@ impl Ahead {
                     match revert_hit {
                         Some(hit) if !hit.is_empty() => {
                             self.count(|s| s.reverts_marked += 1);
-                            mark_unsure(&mut ov, &mut changed, &mut changed_cum, &mut unsure_cum, &hit);
+                            mark_unsure(&mut ov, &mut changed, &mut changed_cum, &mut unsure_cum, &mut held_cum, &hit);
                             // The note lists the pools marked (a reverted run
                             // moves nothing of ours: `moved` is empty).
                             let mut pools_noted = moved;
@@ -3036,6 +3182,18 @@ impl Ahead {
                             _ => "",
                         };
                         let detail = u.missing.first().map(|m| miss_detail(&ov, &pools, m)).unwrap_or("");
+                        // Nov 10 evening: the cascade (a value WE threw away)
+                        // and held-contract misses (first time / again).
+                        let cascade = detail.contains("forgotten earlier");
+                        let held_slot = match (&self.merged, u.missing.first()) {
+                            (Some(m), Some(crate::state::MissItem::Slot(a, sl))) if !cascade && m.kept.is_kept(a) => Some(self.asked.contains(&(*a, *sl))),
+                            _ => None,
+                        };
+                        self.count(|s| {
+                            s.fail_cascade += u64::from(cascade);
+                            s.held_miss_first += u64::from(held_slot == Some(false));
+                            s.held_miss_again += u64::from(held_slot == Some(true));
+                        });
                         let k = format!("{why}{kept}{detail}");
                         if let Some(d) = self.diag.as_mut() {
                             diag_add(&mut d.0, k);
@@ -3103,7 +3261,7 @@ impl Ahead {
                     if let Some(a) = t.to {
                         self.learn_toucher(a, &[]);
                     }
-                    mark_unsure(&mut ov, &mut changed, &mut changed_cum, &mut unsure_cum, &hit);
+                    mark_unsure(&mut ov, &mut changed, &mut changed_cum, &mut unsure_cum, &mut held_cum, &hit);
                     notes.push(note(t, Fate::Failed, false, Some(why), hit));
                 }
             }
@@ -3128,6 +3286,10 @@ impl Ahead {
                 self.count(|s| s.guard_marks += n);
             }
         }
+        if held_cum.len() > held0 {
+            let n = (held_cum.len() - held0) as u64;
+            self.count(|s| s.keep_marks += n);
+        }
         changed.sort();
         ov.set_position(StatePosition { base_block: base.seq + self.cfg.l2_offset, after_seq: Some(m.seq) });
         let (snap, _) = ov.into_parts();
@@ -3138,6 +3300,8 @@ impl Ahead {
             changed,
             changed_cum,
             unsure_cum,
+            held_cum,
+            taint,
             notes,
             built_at: Instant::now(),
             apply_us: t0.elapsed().as_micros() as u64,
@@ -3972,6 +4136,9 @@ pub fn accuracy_json(s: &AheadStats, times: bool) -> Value {
         "unsureMoved": s.unsure_moved,
         "narrow": {"used": s.narrow_used, "dropped": s.narrow_dropped, "fallback": s.narrow_fallback},
         "guard": {"wrongs": s.guard_wrongs, "marks": s.guard_marks},
+        // Nov 10 evening: FASTLANE_AHEAD_UNSURE_KEEP and the failure split.
+        "unsureKeep": {"keptMarks": s.keep_marks, "taintedRuns": s.tainted_runs, "taintedMarks": s.tainted_marks},
+        "fails": {"cascade": s.fail_cascade, "heldMissFirst": s.held_miss_first, "heldMissAgain": s.held_miss_again},
     })
 }
 
@@ -4011,6 +4178,11 @@ pub fn diag_json(a: &Ahead) -> Value {
         "hzUnsureCause": a.hz_diag.as_ref().map(|d| top_counts(d, 15)),
         "missTop": miss,
         "guardPools": a.guard.len(),
+        // Nov 10 evening: the cascade (failed replays on a value our own
+        // prediction threw away) and held-contract misses, since start.
+        "fails": {"cascade": a.total.fail_cascade, "heldMissFirst": a.total.held_miss_first, "heldMissAgain": a.total.held_miss_again,
+            "hzCascade": a.hz_total.fail_cascade, "hzHeldMissFirst": a.hz_total.held_miss_first, "hzHeldMissAgain": a.hz_total.held_miss_again},
+        "unsureKeep": {"on": a.cfg.unsure_keep, "taintedRuns": a.total.tainted_runs, "taintedMarks": a.total.tainted_marks, "keptMarks": a.total.keep_marks},
     })
 }
 
