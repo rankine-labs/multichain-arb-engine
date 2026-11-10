@@ -54,6 +54,8 @@ struct Bucket {
     buyers: HashSet<String>,
     bought: U256,
     sold: U256,
+    /// Price just before this block's first trade.
+    start_price: Option<U256>,
     fired: bool,
 }
 
@@ -84,6 +86,9 @@ pub struct Registry {
     pub tokens: HashMap<String, TokenEntry>,
     /// Buys AND distinct buyers in one block that make a burst.
     pub burst_buys: u64,
+    /// ...and the price must have risen at least this much within the block
+    /// (basis points). Filters swarms of dust-sized bot buys.
+    pub min_rise_bps: u64,
     /// Forget tokens with no activity for this long (ns).
     pub idle_ns: u64,
 }
@@ -96,8 +101,8 @@ fn num(v: &Value, k: &str) -> U256 {
 }
 
 impl Registry {
-    pub fn new(burst_buys: u64, idle_secs: u64) -> Self {
-        Registry { tokens: HashMap::new(), burst_buys, idle_ns: idle_secs * 1_000_000_000 }
+    pub fn new(burst_buys: u64, min_rise_bps: u64, idle_secs: u64) -> Self {
+        Registry { tokens: HashMap::new(), burst_buys, min_rise_bps, idle_ns: idle_secs * 1_000_000_000 }
     }
 
     fn entry(&mut self, token: &str, block: u64, t: u64) -> (&mut TokenEntry, bool) {
@@ -126,6 +131,7 @@ impl Registry {
         }
         let block = rec["block"].as_u64().unwrap_or(0);
         let burst_buys = self.burst_buys;
+        let min_rise_bps = self.min_rise_bps;
         let kind = rec["kind"].as_str().unwrap_or("");
         let (e, new) = self.entry(&token, block, t);
         match kind {
@@ -144,10 +150,12 @@ impl Registry {
                 let account = s(rec, "account");
                 let cost = num(rec, "cost");
                 e.state = Some(State { offers: num(rec, "offers"), funds: num(rec, "funds") });
-                e.last_price = Some(num(rec, "price"));
+                let price = num(rec, "price");
                 if e.bucket.block != block {
-                    e.bucket = Bucket { block, ..Default::default() };
+                    // Price before this block = last price seen, else this trade's.
+                    e.bucket = Bucket { block, start_price: Some(e.last_price.unwrap_or(price)), ..Default::default() };
                 }
+                e.last_price = Some(price);
                 if buy {
                     e.buys += 1;
                     e.buy_volume += cost;
@@ -165,7 +173,11 @@ impl Registry {
                     }
                 }
                 let b = &mut e.bucket;
-                if !b.fired && b.buys >= burst_buys && b.buyers.len() as u64 >= burst_buys && b.bought > b.sold {
+                let rose = match b.start_price {
+                    Some(p0) if !p0.is_zero() => price >= p0 && (price - p0) * U256::from(10_000u64) >= p0 * U256::from(min_rise_bps),
+                    _ => false,
+                };
+                if !b.fired && b.buys >= burst_buys && b.buyers.len() as u64 >= burst_buys && b.bought > b.sold && rose {
                     b.fired = true;
                     out.push(Signal::Burst {
                         token: token.clone(),
@@ -206,14 +218,32 @@ impl Registry {
 mod tests {
     use super::*;
 
-    fn trade(kind: &str, token: &str, account: &str, block: u64, cost: u64) -> Value {
+    fn trade_p(kind: &str, token: &str, account: &str, block: u64, cost: u64, price: u64) -> Value {
         json!({"kind": kind, "token": token, "account": account, "block": block, "cost": cost.to_string(),
-               "amount": "1000", "offers": "500", "funds": "70", "price": "9", "removed": false})
+               "amount": "1000", "offers": "500", "funds": "70", "price": price.to_string(), "removed": false})
+    }
+
+    /// Each buy lifts the price 5%-ish so bursts can fire (100, 105, 110, ...).
+    fn trade(kind: &str, token: &str, account: &str, block: u64, cost: u64) -> Value {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static P: AtomicU64 = AtomicU64::new(100);
+        let p = if kind == "buy" { P.fetch_add(5, Ordering::Relaxed) + 5 } else { P.load(Ordering::Relaxed) };
+        trade_p(kind, token, account, block, cost, p)
+    }
+
+    #[test]
+    fn dust_buys_that_do_not_move_price_are_not_a_burst() {
+        let mut r = Registry::new(3, 200, 600);
+        for (i, a) in ["0xa", "0xb", "0xc", "0xd"].iter().enumerate() {
+            // price creeps 1000 -> 1003: +0.3%, below the 2% minimum
+            let sig = r.on_event(&trade_p("buy", "0xt", a, 10, 1, 1000 + i as u64), i as u64);
+            assert!(sig.iter().all(|s| !matches!(s, Signal::Burst { .. })), "{sig:?}");
+        }
     }
 
     #[test]
     fn create_then_trades_track_state() {
-        let mut r = Registry::new(3, 600);
+        let mut r = Registry::new(3, 200, 600);
         let sig = r.on_event(&json!({"kind": "create", "token": "0xT", "creator": "0xC", "block": 5, "launch_time": "100"}), 1);
         assert_eq!(sig, vec![Signal::NewToken { token: "0xt".into(), creator: Some("0xc".into()), block: 5 }]);
         r.on_event(&trade("buy", "0xt", "0xa", 6, 10), 2);
@@ -226,7 +256,7 @@ mod tests {
 
     #[test]
     fn burst_fires_once_on_the_crossing() {
-        let mut r = Registry::new(3, 600);
+        let mut r = Registry::new(3, 200, 600);
         assert!(r.on_event(&trade("buy", "0xt", "0xa", 10, 5), 1).iter().all(|s| !matches!(s, Signal::Burst { .. })));
         assert!(r.on_event(&trade("buy", "0xt", "0xb", 10, 5), 2).is_empty());
         let sig = r.on_event(&trade("buy", "0xt", "0xc", 10, 5), 3);
@@ -240,7 +270,7 @@ mod tests {
 
     #[test]
     fn same_wallet_three_times_is_not_a_burst() {
-        let mut r = Registry::new(3, 600);
+        let mut r = Registry::new(3, 200, 600);
         for i in 0..3 {
             let sig = r.on_event(&trade("buy", "0xt", "0xa", 10, 5), i);
             assert!(sig.iter().all(|s| !matches!(s, Signal::Burst { .. })));
@@ -249,7 +279,7 @@ mod tests {
 
     #[test]
     fn heavier_selling_blocks_a_burst() {
-        let mut r = Registry::new(3, 600);
+        let mut r = Registry::new(3, 200, 600);
         r.on_event(&trade("sell", "0xt", "0xz", 10, 100), 0);
         for (i, a) in ["0xa", "0xb", "0xc"].iter().enumerate() {
             let sig = r.on_event(&trade("buy", "0xt", a, 10, 5), i as u64 + 1);
@@ -259,7 +289,7 @@ mod tests {
 
     #[test]
     fn creator_selling_is_flagged() {
-        let mut r = Registry::new(3, 600);
+        let mut r = Registry::new(3, 200, 600);
         r.on_event(&json!({"kind": "create", "token": "0xt", "creator": "0xc", "block": 1}), 0);
         let sig = r.on_event(&trade("sell", "0xt", "0xC", 2, 50), 1);
         assert!(matches!(sig[0], Signal::CreatorSold { .. }));
@@ -268,7 +298,7 @@ mod tests {
 
     #[test]
     fn graduation_and_idle_tokens_are_pruned() {
-        let mut r = Registry::new(3, 1);
+        let mut r = Registry::new(3, 200, 1);
         r.on_event(&trade("buy", "0xg", "0xa", 1, 5), 0);
         r.on_event(&trade("buy", "0xi", "0xa", 1, 5), 0);
         r.on_event(&trade("buy", "0xk", "0xa", 1, 5), 2_500_000_000);
@@ -281,7 +311,7 @@ mod tests {
 
     #[test]
     fn reorged_events_are_ignored() {
-        let mut r = Registry::new(3, 600);
+        let mut r = Registry::new(3, 200, 600);
         let mut t = trade("buy", "0xt", "0xa", 1, 5);
         t["removed"] = json!(true);
         assert!(r.on_event(&t, 0).is_empty());

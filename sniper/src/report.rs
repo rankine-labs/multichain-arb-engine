@@ -16,7 +16,8 @@
 //      buy in the next block, does the price keep rising long enough for us
 //      to sell at a profit?"
 //        burst      = a block with >= --burst-buys buys from that many
-//                     different wallets, more bought than sold
+//                     different wallets, more bought than sold, and the
+//                     price up >= --min-rise-pct within the block
 //        entry      = price of the last trade in the burst block
 //        exit window= trades from 2 blocks later (we buy in the next block,
 //                     sell at the earliest the block after) up to N blocks
@@ -39,13 +40,16 @@ pub struct Opts {
     /// connected are never announced to us.
     pub warmup_secs: f64,
     pub burst_buys: usize,
+    /// The burst block must also lift the price by at least this much
+    /// (filters out swarms of dust-sized bot buys that move nothing).
+    pub min_rise_pct: f64,
     pub hurdle_pct: f64,
     pub windows: Vec<u64>,
 }
 
 impl Default for Opts {
     fn default() -> Self {
-        Opts { min_lead_ms: 150.0, warmup_secs: 10.0, burst_buys: 3, hurdle_pct: 3.0, windows: vec![3, 10, 30] }
+        Opts { min_lead_ms: 150.0, warmup_secs: 10.0, burst_buys: 3, min_rise_pct: 2.0, hurdle_pct: 3.0, windows: vec![3, 10, 30] }
     }
 }
 
@@ -243,17 +247,22 @@ pub fn build(dir: &Path, o: &Opts) -> Value {
             v.sort_by_key(|t| t["log_index"].as_u64().unwrap_or(0));
         }
         let keys: Vec<u64> = blocks.keys().copied().collect();
+        let mut prev_price: Option<f64> = None;
         for &b in &keys {
             let txs = &blocks[&b];
             let buys: Vec<&&Value> = txs.iter().filter(|t| t["kind"] == "buy").collect();
             let buyers: HashSet<&str> = buys.iter().filter_map(|t| t["account"].as_str()).collect();
             let bought: f64 = buys.iter().map(|t| dec(&t["cost"])).sum();
             let sold: f64 = txs.iter().filter(|t| t["kind"] == "sell").map(|t| dec(&t["cost"])).sum();
+            let entry = dec(&txs.last().unwrap()["price"]);
+            // Price before this block: last trade of an earlier block, else
+            // this block's first trade.
+            let before = prev_price.unwrap_or_else(|| dec(&txs[0]["price"]));
+            prev_price = Some(entry);
             if buys.len() < o.burst_buys || buyers.len() < o.burst_buys || bought <= sold {
                 continue;
             }
-            let entry = dec(&txs.last().unwrap()["price"]);
-            if entry <= 0.0 {
+            if entry <= 0.0 || before <= 0.0 || 100.0 * (entry / before - 1.0) < o.min_rise_pct {
                 continue;
             }
             bursts += 1;
@@ -297,7 +306,7 @@ pub fn build(dir: &Path, o: &Opts) -> Value {
             "sources": sources,
             "blocks_seen": heads.len(),
             "trades": trades.len(),
-            "settings": {"min_lead_ms": o.min_lead_ms, "warmup_secs": o.warmup_secs, "burst_buys": o.burst_buys, "hurdle_pct": o.hurdle_pct},
+            "settings": {"min_lead_ms": o.min_lead_ms, "warmup_secs": o.warmup_secs, "burst_buys": o.burst_buys, "min_rise_pct": o.min_rise_pct, "hurdle_pct": o.hurdle_pct},
         },
         "visibility": vis,
         "late_pending_notices": late.len(),

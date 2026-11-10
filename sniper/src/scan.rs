@@ -12,7 +12,7 @@
 //   the local time it was raised, so later we can measure how fast we react.
 //
 //   Config: SNIPER_BLOCK_WS (required), SNIPER_OUT (default scan-out/<time>),
-//   SNIPER_BURST_BUYS (default 3), SNIPER_DURATION_SECS (0 = until killed).
+//   SNIPER_BURST_BUYS (default 3), SNIPER_BURST_RISE_BPS (default 200 = 2%), SNIPER_DURATION_SECS (0 = until killed).
 // ============================================================================
 use std::fs::{self, OpenOptions};
 use std::io::{BufWriter, Write};
@@ -31,6 +31,7 @@ pub struct Config {
     pub block_ws: String,
     pub out: PathBuf,
     pub burst_buys: u64,
+    pub min_rise_bps: u64,
     pub duration: Option<Duration>,
     pub contracts: Vec<String>,
 }
@@ -45,6 +46,7 @@ impl Config {
             block_ws,
             out: PathBuf::from(std::env::var("SNIPER_OUT").unwrap_or_else(|_| format!("scan-out/{unix}"))),
             burst_buys: num("SNIPER_BURST_BUYS", 3),
+            min_rise_bps: num("SNIPER_BURST_RISE_BPS", 200),
             duration: (dur > 0).then(|| Duration::from_secs(dur)),
             contracts: vec![TOKEN_MANAGER_2.to_string(), TOKEN_MANAGER_1.to_string()],
         })
@@ -97,7 +99,7 @@ pub fn run(cfg: Config) -> Result<(), String> {
         });
     }
 
-    let mut reg = Registry::new(cfg.burst_buys, 3600);
+    let mut reg = Registry::new(cfg.burst_buys, cfg.min_rise_bps, 3600);
     let started = Instant::now();
     let mut last_beat = Instant::now();
     let mut last_flush = Instant::now();

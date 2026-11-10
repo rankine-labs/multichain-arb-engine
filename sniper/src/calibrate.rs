@@ -178,16 +178,27 @@ pub fn build(dir: &Path) -> Value {
     }
     let share = |a: u64| if pairs > 0 { Some(100.0 * a as f64 / pairs as f64) } else { None };
 
-    // 2. Fit A, B per token (tokens with >= 5 trades), then the median.
+    // 2. Fit A, B per token (tokens with >= 3 trades). Tokens priced in
+    //    different quote currencies (BNB, stablecoins) use different curve
+    //    settings ("templates"), so each token is fitted on its own.
     let mut per_a = Vec::new();
     let mut per_b = Vec::new();
-    for v in by_token.values().filter(|v| v.len() >= 5) {
+    let mut fitted: Vec<(&str, Curve)> = Vec::new();
+    for (tok, v) in by_token.iter().filter(|(_, v)| v.len() >= 3) {
         if let Some((a, b)) = fit(v) {
             if a > 0.0 && b > 0.0 {
                 per_a.push(a);
                 per_b.push(b);
+                fitted.push((tok, Curve { virt_tokens: to_u256(a), virt_quote: to_u256(b) }));
             }
         }
+    }
+    // Group tokens into templates by virtual quote (4 significant digits).
+    let mut templates: BTreeMap<String, (f64, f64, u64)> = BTreeMap::new();
+    for (a, b) in per_a.iter().zip(per_b.iter()) {
+        let key = format!("{:.4e}", b);
+        let e = templates.entry(key).or_insert((*a, *b, 0));
+        e.2 += 1;
     }
     per_a.sort_by(|x, y| x.partial_cmp(y).unwrap());
     per_b.sort_by(|x, y| x.partial_cmp(y).unwrap());
@@ -196,13 +207,11 @@ pub fn build(dir: &Path) -> Value {
         _ => None,
     };
 
-    // 3. Replay every trade with the shared (median) curve.
-    let all: Vec<&Trade> = trades.iter().collect();
-    let curve = match (pct(&per_a, 50.0), pct(&per_b, 50.0)) {
-        (Some(a), Some(b)) => Some(Curve { virt_tokens: to_u256(a), virt_quote: to_u256(b) }),
-        _ => None,
-    };
-    let mut errs = curve.map(|c| replay_errors(&c, &all)).unwrap_or_default();
+    // 3. Replay each fitted token's trades with its own fitted curve.
+    let mut errs: Vec<f64> = fitted
+        .iter()
+        .flat_map(|(tok, c)| replay_errors(c, &by_token[tok]))
+        .collect();
     errs.sort_by(|x, y| x.partial_cmp(y).unwrap());
     let within = |e: f64| {
         if errs.is_empty() {
@@ -245,7 +254,7 @@ pub fn build(dir: &Path) -> Value {
             "error_p99": pct(&errs, 99.0),
         },
         "fees": {"rate_bps_median": rate.map(|r| r * 1e4), "min_fee_observed": min_fee.map(|m| m.to_string())},
-        "curve": curve.map(|c| json!({"virt_tokens": c.virt_tokens.to_string(), "virt_quote": c.virt_quote.to_string()})),
+        "templates": templates.values().map(|(a, b, n)| json!({"virt_tokens": a, "virt_quote": b, "tokens": n})).collect::<Vec<_>>(),
     })
 }
 
@@ -262,7 +271,7 @@ pub fn render(r: &Value) -> String {
     format!(
         "CURVE CHECK  ({} trades, {} tokens)\n\
          1. state fields: offers moves by trade amount in {}% of pairs, funds by cost in {}% (by cost+fee {}%)\n\
-         2. fitted curve: virtual tokens {} (spread {}%), virtual quote {} (spread {}%) from {} tokens\n\
+         2. fitted curve: virtual tokens {} (spread {}%) from {} tokens; {} templates (virtual quote: {})\n\
          3. replay: {}% of trades within 0.01%, {}% within 0.1% (p99 error {})\n\
          4. fees: median {} bps, minimum fee seen {}\n\
          VERDICT: {verdict}\n",
@@ -273,9 +282,12 @@ pub fn render(r: &Value) -> String {
         p(&s["funds_moves_by_cost_plus_fee_pct"]),
         r["fit"]["virt_tokens_median"],
         p(&r["fit"]["virt_tokens_spread_pct"]),
-        r["fit"]["virt_quote_median"],
-        p(&r["fit"]["virt_quote_spread_pct"]),
         r["fit"]["tokens_fitted"],
+        r["templates"].as_array().map(|a| a.len()).unwrap_or(0),
+        r["templates"]
+            .as_array()
+            .map(|a| a.iter().map(|t| format!("{:.4} x{}", t["virt_quote"].as_f64().unwrap_or(0.0) / 1e18, t["tokens"])).collect::<Vec<_>>().join(", "))
+            .unwrap_or_default(),
         p(&rp["within_0_01pct"]),
         p(&rp["within_0_1pct"]),
         rp["error_p99"],

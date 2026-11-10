@@ -14,6 +14,7 @@
 //     --min-lead-ms N    lead time needed to act on a pending buy (default 150)
 //     --warmup-secs N    ignore N s after each reconnect (default 10)
 //     --burst-buys N     buys (from N wallets) that make a burst (default 3)
+//     --min-rise-pct X   price rise within the burst block (default 2)
 //     --hurdle-pct X     gain needed to count as profitable (default 3)
 //     --json             print the full JSON instead of the summary
 // ============================================================================
@@ -103,6 +104,7 @@ fn main() -> ExitCode {
                     ("--warmup-secs", Some(v)) => o.warmup_secs = v,
                     ("--burst-buys", Some(v)) => o.burst_buys = v as usize,
                     ("--hurdle-pct", Some(v)) => o.hurdle_pct = v,
+                    ("--min-rise-pct", Some(v)) => o.min_rise_pct = v,
                     (a, _) => {
                         eprintln!("unknown or incomplete option: {a}");
                         return ExitCode::FAILURE;
