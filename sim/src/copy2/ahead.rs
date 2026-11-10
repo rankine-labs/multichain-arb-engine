@@ -193,7 +193,8 @@
 //
 //   NO POOL WIPE (Nov 10 evening; live hold run: 18,721 of 94,647 failed
 //   replays were our OWN doing, 17,055 of them on one pool, 0x52e65b17):
-//    19. FASTLANE_AHEAD_UNSURE_KEEP [on]. Root cause: marking a pool unsure
+//    19. FASTLANE_AHEAD_UNSURE_KEEP [off unless set on; see AheadCfg for
+//        the offline measurement]. Root cause: marking a pool unsure
 //        used to FORGET it in the predicted copy (forget_place): a contract
 //        pool's whole account (code, every value, its balance) was dropped,
 //        a V4 pool's 4 base values were removed (and if the PoolManager was
@@ -445,7 +446,7 @@ pub struct AheadCfg {
     /// 11.1% wrong-when-sure vs warm alone 1.8% / 14.0%: it took away more
     /// right answers than wrong ones.)
     pub wrong_guard_blocks: u64,
-    /// FASTLANE_AHEAD_UNSURE_KEEP [on live; off in the default] (Nov 10
+    /// FASTLANE_AHEAD_UNSURE_KEEP [off; set on to use it] (Nov 10
     /// evening, see "NO POOL WIPE" in the file header): a pool marked
     /// unsure keeps its last exact values in the predicted copy (replays
     /// through it still run), and runs that read it are "tainted" (their
@@ -599,8 +600,14 @@ impl AheadCfg {
             } else {
                 0
             },
-            // Nov 10 evening: on live unless set off (NO POOL WIPE).
-            unsure_keep: on_off(get("FASTLANE_AHEAD_UNSURE_KEEP").as_deref()).unwrap_or(true),
+            // Nov 10 evening: OFF unless set on. Offline Oct 31 replay
+            // (800 blocks, keeper fill on): on = 0 cascade failures (was
+            // 338) and 239 fewer failed replays, but sure 53 right / 6 wrong
+            // vs off 58 right / 5 wrong. The extra wrong: a V4 pool moved by
+            // a transaction the cheap filter skipped (a router it had not
+            // learned); with the old rule an earlier failure had marked that
+            // pool unsure by luck. So it waits for a filter fix.
+            unsure_keep: on_off(get("FASTLANE_AHEAD_UNSURE_KEEP").as_deref()).unwrap_or(false),
         }
     }
 }

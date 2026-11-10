@@ -1074,11 +1074,12 @@ fn a_run_touching_nothing_unsure_stays_sure() {
     assert_eq!(tip.view().storage(pool(), U256::ZERO), known(106));
 }
 
-/// Settings: on live unless set off; off in the default (tests / replay).
+/// Settings: OFF unless set on (offline it cost right answers, see AheadCfg).
 #[test]
 fn unsure_keep_settings() {
     let cfg = |k: &str, v: &str| AheadCfg::from_lookup(|x| (x == k).then(|| v.to_string()), 0);
-    assert!(cfg("", "").unsure_keep);
+    assert!(!cfg("", "").unsure_keep);
+    assert!(cfg("FASTLANE_AHEAD_UNSURE_KEEP", "on").unsure_keep);
     assert!(!cfg("FASTLANE_AHEAD_UNSURE_KEEP", "off").unsure_keep);
     assert!(!AheadCfg::default().unsure_keep);
 }
