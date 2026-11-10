@@ -51,6 +51,15 @@ pub const BASES: &[(&str, &str)] = &[
     ("0x0000000000000000000000000000000000000000", "ETH"),
 ];
 
+/// Decimals of each base coin (WETH/ETH 18, USDG 6).
+pub fn base_decimals(name: &str) -> i32 {
+    if name == "USDG" {
+        6
+    } else {
+        18
+    }
+}
+
 pub fn sig_v3_swap() -> String {
     topic0("Swap(address,address,int256,int256,uint160,uint128,int24)")
 }
@@ -103,7 +112,7 @@ fn word_to_dec(w: &str) -> String {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Decoded {
     /// pool = pool address (V3) or pool id (V4)
-    Swap { v4: bool, pool: String, sqrt_price: String, fee_ppm: Option<u64> },
+    Swap { v4: bool, pool: String, sqrt_price: String, liquidity: String, fee_ppm: Option<u64> },
     V4Init { pool: String, info: PoolInfo },
 }
 
@@ -114,14 +123,14 @@ pub fn decode(log: &Value, v3_swap: &str, v4_swap: &str, v4_init: &str) -> Optio
     if t0 == v3_swap {
         // data: amount0, amount1, sqrtPriceX96, liquidity, tick
         let pool = log["address"].as_str()?.to_ascii_lowercase();
-        return Some(Decoded::Swap { v4: false, pool, sqrt_price: word_to_dec(word(data, 2)?), fee_ppm: None });
+        return Some(Decoded::Swap { v4: false, pool, sqrt_price: word_to_dec(word(data, 2)?), liquidity: word_to_dec(word(data, 3)?), fee_ppm: None });
     }
     let from_pm = log["address"].as_str().map(|a| a.eq_ignore_ascii_case(V4_POOL_MANAGER)).unwrap_or(false);
     if t0 == v4_swap && from_pm {
         // topics: id, sender. data: amount0, amount1, sqrtPriceX96, liquidity, tick, fee
         let pool = topics.get(1)?.as_str()?.to_ascii_lowercase();
         let fee = u64::from_str_radix(word(data, 5)?.trim_start_matches('0'), 16).unwrap_or(0) & 0x7f_ffff;
-        return Some(Decoded::Swap { v4: true, pool, sqrt_price: word_to_dec(word(data, 2)?), fee_ppm: Some(fee) });
+        return Some(Decoded::Swap { v4: true, pool, sqrt_price: word_to_dec(word(data, 2)?), liquidity: word_to_dec(word(data, 3)?), fee_ppm: Some(fee) });
     }
     if t0 == v4_init && from_pm {
         // topics: id, currency0, currency1. data: fee, tickSpacing, hooks, sqrtPriceX96, tick
@@ -202,7 +211,22 @@ pub fn feed_frame_seqs(text: &str) -> Vec<(u64, u64)> {
 fn feed_thread(url: String, clock: Clock, stop: Arc<AtomicBool>, tx: mpsc::Sender<Msg>) {
     let mut backoff = Duration::from_secs(1);
     while !stop.load(Ordering::Relaxed) {
-        match tungstenite::connect(url.as_str()) {
+        // Identify ourselves like a normal client (some edges refuse
+        // requests without these); same header the official Nitro feed
+        // client sends.
+        let req = (|| {
+            use tungstenite::client::IntoClientRequest;
+            let mut r = url.as_str().into_client_request().ok()?;
+            let h = r.headers_mut();
+            h.insert("User-Agent", "Mozilla/5.0 (compatible; sniper-rhc-probe/0.1)".parse().ok()?);
+            h.insert("Arbitrum-Feed-Client-Version", "2".parse().ok()?);
+            Some(r)
+        })();
+        let Some(req) = req else {
+            let _ = tx.send(Msg::Note(format!("feed DOWN (bad URL {url})")));
+            return;
+        };
+        match tungstenite::connect(req) {
             Ok((mut ws, _)) => {
                 let _ = tx.send(Msg::Note(format!("feed UP ({url})")));
                 backoff = Duration::from_secs(1);
@@ -322,7 +346,7 @@ pub fn run(cfg: Config) -> Result<(), String> {
                             w(&mut f_pools, json!({"pool": pool, "token0": info.token0, "token1": info.token1, "fee_ppm": info.fee_ppm, "v4": true}))?;
                             pools.insert(pool, Some(info));
                         }
-                        Some(Decoded::Swap { v4, pool, sqrt_price, fee_ppm }) => {
+                        Some(Decoded::Swap { v4, pool, sqrt_price, liquidity, fee_ppm }) => {
                             n_swaps += 1;
                             if !pools.contains_key(&pool) {
                                 // V3: ask the pool. V4 pools created before we
@@ -341,7 +365,7 @@ pub fn run(cfg: Config) -> Result<(), String> {
                                 &mut f_swaps,
                                 json!({
                                     "pool": pool, "v4": v4, "token": token, "base": base, "token_is0": token_is0,
-                                    "sqrt_price": sqrt_price, "fee_ppm": fee_ppm.or(info.fee_ppm),
+                                    "sqrt_price": sqrt_price, "liquidity": liquidity, "fee_ppm": fee_ppm.or(info.fee_ppm),
                                     "block": hex_u64(log.get("blockNumber")), "log_index": hex_u64(log.get("logIndex")),
                                     "tx": log["transactionHash"], "t": t,
                                 }),
@@ -413,10 +437,10 @@ mod tests {
         let w = |x: u64| format!("{x:064x}");
         let v3 = json!({"address": "0xPOOL", "topics": [a, "0x01", "0x02"],
                         "data": format!("0x{}{}{}{}{}", w(1), w(2), w(777), w(5), w(6))});
-        assert_eq!(decode(&v3, &a, &b, &c), Some(Decoded::Swap { v4: false, pool: "0xpool".into(), sqrt_price: "777".into(), fee_ppm: None }));
+        assert_eq!(decode(&v3, &a, &b, &c), Some(Decoded::Swap { v4: false, pool: "0xpool".into(), sqrt_price: "777".into(), liquidity: "5".into(), fee_ppm: None }));
         let v4 = json!({"address": V4_POOL_MANAGER, "topics": [b, "0xID", "0x02"],
                         "data": format!("0x{}{}{}{}{}{}", w(1), w(2), w(888), w(5), w(6), w(3000))});
-        assert_eq!(decode(&v4, &a, &b, &c), Some(Decoded::Swap { v4: true, pool: "0xid".into(), sqrt_price: "888".into(), fee_ppm: Some(3000) }));
+        assert_eq!(decode(&v4, &a, &b, &c), Some(Decoded::Swap { v4: true, pool: "0xid".into(), sqrt_price: "888".into(), liquidity: "5".into(), fee_ppm: Some(3000) }));
         // A V4-looking Swap from some other contract is ignored.
         let fake = json!({"address": "0xdead", "topics": [b, "0xID"], "data": v4["data"]});
         assert_eq!(decode(&fake, &a, &b, &c), None);

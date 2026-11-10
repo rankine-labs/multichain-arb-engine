@@ -85,7 +85,7 @@ fn main() -> ExitCode {
         },
         Some("rhc-report") => {
             let Some(dir) = args.get(1) else {
-                eprintln!("usage: sniper rhc-report <dir> [--rush-buys N] [--min-rise-pct X] [--offset N]");
+                eprintln!("usage: sniper rhc-report <dir> [--rush-buys N] [--min-rise-pct X] [--window-s S] [--offset N]");
                 return ExitCode::FAILURE;
             };
             let mut o = sniper::rhc_report::Opts::default();
@@ -96,6 +96,7 @@ fn main() -> ExitCode {
                     ("--rush-buys", Some(v)) => o.rush_buys = v as usize,
                     ("--min-rise-pct", Some(v)) => o.min_rise_pct = v,
                     ("--offset", Some(v)) => o.offset = v as i64,
+                    ("--window-s", Some(v)) => o.window_s = v,
                     (a, _) => {
                         eprintln!("unknown or incomplete option: {a}");
                         return ExitCode::FAILURE;

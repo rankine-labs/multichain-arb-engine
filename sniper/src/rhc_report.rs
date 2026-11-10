@@ -34,11 +34,14 @@ pub struct Opts {
     pub offset: i64,
     pub rush_buys: usize,
     pub min_rise_pct: f64,
+    /// A rush is counted over this many seconds (Robinhood makes a block
+    /// about every 0.1 s, so one block is too short to see a crowd).
+    pub window_s: f64,
 }
 
 impl Default for Opts {
     fn default() -> Self {
-        Opts { offset: 0, rush_buys: 3, min_rise_pct: 2.0 }
+        Opts { offset: 0, rush_buys: 3, min_rise_pct: 2.0, window_s: 1.0 }
     }
 }
 
@@ -59,6 +62,26 @@ pub struct Swap {
     /// Token price in base units (raw units, only ratios matter).
     pub price: f64,
     pub fee: f64,
+    /// Base-coin amount (whole coins) that would move the token price +1%
+    /// at this point (from the pool's active liquidity; rough, ignores
+    /// liquidity changing across price bands). None if not recorded.
+    pub size_1pct: Option<f64>,
+}
+
+/// Base amount (whole coins) that lifts the token price by ~1%, from the
+/// pool's active liquidity L and sqrtPriceX96 (concentrated-liquidity maths:
+/// d(token1) = L * d(sqrtP); d(token0) = L * d(1/sqrtP)). 1% on price is
+/// ~0.4988% on sqrtP.
+pub fn size_for_1pct(sqrt_price: &str, liquidity: &str, token_is0: bool, base: &str) -> Option<f64> {
+    let sp: f64 = sqrt_price.parse::<f64>().ok()? / 2f64.powi(96);
+    let l: f64 = liquidity.parse().ok()?;
+    if sp <= 0.0 || l <= 0.0 {
+        return None;
+    }
+    let k = 1.01f64.sqrt() - 1.0;
+    // Buying the token = paying base. token_is0: base is token1 (raw = L*dsqrtP).
+    let raw = if token_is0 { l * sp * k } else { l * (1.0 / sp) * k };
+    Some(raw / 10f64.powi(crate::rhc::base_decimals(base)))
 }
 
 pub fn token_price(sqrt_price: &str, token_is0: bool) -> Option<f64> {
@@ -84,6 +107,9 @@ pub fn load_swaps(dir: &Path) -> Vec<Swap> {
                 tx: s["tx"].as_str().unwrap_or("").to_string(),
                 price: token_price(s["sqrt_price"].as_str()?, s["token_is0"].as_bool()?)?,
                 fee: s["fee_ppm"].as_u64().unwrap_or(3000) as f64 / 1e6,
+                size_1pct: s["liquidity"]
+                    .as_str()
+                    .and_then(|l| size_for_1pct(s["sqrt_price"].as_str()?, l, s["token_is0"].as_bool()?, s["base"].as_str()?)),
             })
         })
         .collect();
@@ -100,12 +126,18 @@ pub struct Rush {
     pub base: String,
     pub block: u64,
     pub fee: f64,
+    pub size_1pct: Option<f64>,
 }
 
 /// Per pool: block -> last price in that block.
 pub type PricePath = BTreeMap<u64, f64>;
 
-pub fn find_rushes(swaps: &[Swap], o: &Opts) -> (Vec<Rush>, HashMap<String, PricePath>) {
+/// Rushes: at block b, the pool's buys over the last `window` blocks (b
+/// included) come from >= rush_buys different transactions, and the price
+/// rose >= min_rise_pct from just before the window. After a rush, the pool
+/// is quiet for one window (no double counting of the same rush).
+pub fn find_rushes(swaps: &[Swap], o: &Opts, window: u64) -> (Vec<Rush>, HashMap<String, PricePath>) {
+    let window = window.max(1);
     let mut by_pool: HashMap<&str, Vec<&Swap>> = HashMap::new();
     for s in swaps {
         by_pool.entry(&s.pool).or_default().push(s);
@@ -114,34 +146,38 @@ pub fn find_rushes(swaps: &[Swap], o: &Opts) -> (Vec<Rush>, HashMap<String, Pric
     let mut paths: HashMap<String, PricePath> = HashMap::new();
     for (pool, v) in by_pool {
         let mut path = PricePath::new();
-        let mut prev_price: Option<f64> = None;
+        // (block, tx) of every buy, in order.
+        let mut buys: Vec<(u64, &str)> = Vec::new();
+        let mut last: Option<f64> = None;
         let mut i = 0;
+        let mut quiet_until = 0u64;
         while i < v.len() {
             let b = v[i].block;
-            let start = prev_price;
-            let mut buys = 0usize;
-            let mut buy_txs: HashSet<&str> = HashSet::new();
-            let mut last = prev_price;
             while i < v.len() && v[i].block == b {
                 let p = v[i].price;
                 if let Some(q) = last {
                     if p > q {
-                        buys += 1;
-                        buy_txs.insert(&v[i].tx);
+                        buys.push((b, &v[i].tx));
                     }
                 }
                 last = Some(p);
                 i += 1;
             }
-            let end = last.unwrap();
-            path.insert(b, end);
-            if let Some(p0) = start {
-                if buys >= o.rush_buys && buy_txs.len() >= o.rush_buys && 100.0 * (end / p0 - 1.0) >= o.min_rise_pct {
-                    let s = v.iter().find(|s| s.block == b).unwrap();
-                    rushes.push(Rush { pool: pool.to_string(), token: s.token.clone(), base: s.base.clone(), block: b, fee: s.fee });
-                }
+            path.insert(b, last.unwrap());
+            if b < quiet_until {
+                continue;
             }
-            prev_price = Some(end);
+            let lo = b.saturating_sub(window - 1);
+            let txs: HashSet<&str> = buys.iter().filter(|(bb, _)| *bb >= lo).map(|(_, t)| *t).collect();
+            let n_buys = buys.iter().filter(|(bb, _)| *bb >= lo).count();
+            let Some((_, p0)) = path.range(..lo).next_back() else { continue };
+            let end = path[&b];
+            if n_buys >= o.rush_buys && txs.len() >= o.rush_buys && 100.0 * (end / p0 - 1.0) >= o.min_rise_pct {
+                let s = v.iter().find(|s| s.block == b).unwrap();
+                let size_1pct = v.iter().rev().find(|s| s.block == b).and_then(|s| s.size_1pct);
+                rushes.push(Rush { pool: pool.to_string(), token: s.token.clone(), base: s.base.clone(), block: b, fee: s.fee, size_1pct });
+                quiet_until = b + window;
+            }
         }
         paths.insert(pool.to_string(), path);
     }
@@ -215,20 +251,32 @@ pub fn build(dir: &Path, o: &Opts) -> Value {
     // Average block interval from the feed.
     let mut fb: Vec<(&u64, &u64)> = t_feed.iter().collect();
     fb.sort();
-    let block_ms = if fb.len() > 1 {
-        (*fb.last().unwrap().1 as f64 - *fb[0].1 as f64) / 1e6 / (*fb.last().unwrap().0 - *fb[0].0).max(1) as f64
-    } else {
-        250.0
+    // Block interval and run length: from the feed if we have it, else from
+    // the node's block numbers and arrival times.
+    let mut nb: Vec<(&u64, &u64)> = t_node.iter().collect();
+    nb.sort();
+    let span = |v: &Vec<(&u64, &u64)>| -> Option<(f64, f64)> {
+        if v.len() < 2 {
+            return None;
+        }
+        let ms = (*v.last().unwrap().1 as f64 - *v[0].1 as f64) / 1e6;
+        Some((ms / (*v.last().unwrap().0 - *v[0].0).max(1) as f64, ms / 3.6e6))
     };
+    let (block_ms, hours) = span(&fb).or_else(|| span(&nb)).unwrap_or((250.0, 0.0));
 
     // ---- 2 + 3. rushes and simulated fast trades ----
     let swaps = load_swaps(dir);
-    let (rushes, paths) = find_rushes(&swaps, o);
+    let window = ((o.window_s * 1000.0 / block_ms.max(1.0)).round() as u64).max(1);
+    let (rushes, paths) = find_rushes(&swaps, o, window);
     let tokens: HashSet<&str> = swaps.iter().map(|s| s.token.as_str()).collect();
     let grid = [(0.03, 0.03), (0.05, 0.05), (0.10, 0.05), (0.10, 0.10)];
     let horizons_s = [2.0, 10.0, 30.0];
     let mut sims = Vec::new();
-    for (timing, delay) in [("first", 0u64), ("late", 1u64)] {
+    // Entry timing: right after the rush block (we're first), or 0.3 s / 1 s
+    // later (rivals were faster; our own reaction is 60-120 ms per the arb
+    // bot's notes, rivals timed at 110-580 ms).
+    for (timing, delay_ms) in [("first", 0.0), ("+0.3s", 300.0), ("+1s", 1000.0)] {
+        let delay = (delay_ms / block_ms.max(1.0)).round() as u64;
         for &hs in &horizons_s {
             let h = ((hs * 1000.0 / block_ms.max(1.0)).round() as u64).max(1);
             for &(tp, sl) in &grid {
@@ -242,6 +290,16 @@ pub fn build(dir: &Path, o: &Opts) -> Value {
             }
         }
     }
+    // How much money a rush can take: base amount that moves the price 1%.
+    let mut depth = serde_json::Map::new();
+    for base in ["WETH", "ETH", "USDG"] {
+        let mut d: Vec<f64> = rushes.iter().filter(|r| r.base == base).filter_map(|r| r.size_1pct).collect();
+        if d.is_empty() {
+            continue;
+        }
+        d.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        depth.insert(base.into(), json!({"rushes": d.len(), "p25": pct(&d, 25.0), "p50": pct(&d, 50.0), "p75": pct(&d, 75.0)}));
+    }
     let mut per_token: HashMap<&str, u64> = HashMap::new();
     for r in &rushes {
         *per_token.entry(r.token.as_str()).or_default() += 1;
@@ -249,7 +307,6 @@ pub fn build(dir: &Path, o: &Opts) -> Value {
     let mut top: Vec<(&str, u64)> = per_token.into_iter().collect();
     top.sort_by_key(|t| std::cmp::Reverse(t.1));
     top.truncate(10);
-    let hours = fb.last().map(|(_, t)| **t as f64 / 3.6e12).unwrap_or(0.0);
 
     json!({
         "run": {"hours": hours, "feed_blocks": t_feed.len(), "node_blocks": t_node.len(), "swaps": swaps.len(), "tokens": tokens.len(), "pools": paths.len(), "block_ms": block_ms, "poll_ms": poll_ms},
@@ -260,18 +317,21 @@ pub fn build(dir: &Path, o: &Opts) -> Value {
         },
         "rushes": {"count": rushes.len(), "per_hour": if hours > 0.0 { rushes.len() as f64 / hours } else { 0.0 },
                    "top_tokens": top.iter().map(|(t, n)| json!({"token": t, "rushes": n})).collect::<Vec<_>>(),
-                   "settings": {"rush_buys": o.rush_buys, "min_rise_pct": o.min_rise_pct}},
+                   "settings": {"rush_buys": o.rush_buys, "min_rise_pct": o.min_rise_pct, "window_s": o.window_s, "window_blocks": window},
+                   "size_for_1pct_move": depth},
         "fast_trades": sims,
     })
 }
 
 pub fn render(r: &Value) -> String {
     let f = |v: &Value| v.as_f64().map(|x| format!("{x:.1}")).unwrap_or_else(|| "n/a".into());
+    let g = |v: &Value| v.as_f64().map(|x| format!("{x:.4}")).unwrap_or_else(|| "n/a".into());
     let run = &r["run"];
     let h = &r["head_start_ms"];
     let mut s = format!(
-        "ROBINHOOD SPEED TEST  ({} h, {} blocks, {} swaps, {} tokens, block every {} ms)\n\n",
+        "ROBINHOOD SPEED TEST  ({} h, {} blocks from the node, {} from the feed, {} swaps, {} tokens, block every {} ms)\n\n",
         f(&run["hours"]),
+        run["node_blocks"],
         run["feed_blocks"],
         run["swaps"],
         run["tokens"],
@@ -285,7 +345,24 @@ pub fn render(r: &Value) -> String {
         f(&h["p90"]),
         run["poll_ms"].as_u64().unwrap_or(200) / 2
     );
-    s += &format!("2. RUSHES: {} ({}/hour)\n\n", r["rushes"]["count"], f(&r["rushes"]["per_hour"]));
+    s += &format!(
+        "2. RUSHES: {} ({}/hour) = {}+ buys from {}+ transactions within {} s, price up {}%+\n\n",
+        r["rushes"]["count"],
+        f(&r["rushes"]["per_hour"]),
+        r["rushes"]["settings"]["rush_buys"],
+        r["rushes"]["settings"]["rush_buys"],
+        f(&r["rushes"]["settings"]["window_s"]),
+        f(&r["rushes"]["settings"]["min_rise_pct"])
+    );
+    if let Some(d) = r["rushes"]["size_for_1pct_move"].as_object() {
+        if !d.is_empty() {
+            s += "   how much money moves the price 1% at a rush (typical, i.e. median; quarter of pools below / above):\n";
+            for (b, v) in d {
+                s += &format!("     {b}: {} (p25 {}, p75 {}) over {} rushes\n", g(&v["p50"]), g(&v["p25"]), g(&v["p75"]), v["rushes"]);
+            }
+            s += "\n";
+        }
+    }
     s += "3. FAST TRADES after rushes (fees both ways included; avg range = rough 95% range)\n";
     if let Some(a) = r["fast_trades"].as_array() {
         for t in a {
@@ -293,7 +370,7 @@ pub fn render(r: &Value) -> String {
                 continue;
             }
             s += &format!(
-                "   {:<5} {:>4}s TP {:>2}% SL {:>2}%: avg {:>6}% [{} .. {}] | median {:>6}% | win {:>4}% | worst {:>6}% | n {}\n",
+                "   {:<6} {:>4}s TP {:>2}% SL {:>2}%: avg {:>6}% [{} .. {}] | median {:>6}% | win {:>4}% | worst {:>6}% | n {}\n",
                 t["timing"].as_str().unwrap_or(""),
                 f(&t["horizon_s"]),
                 t["tp_pct"].as_f64().unwrap_or(0.0) as u64,
@@ -316,7 +393,7 @@ mod tests {
     use super::*;
 
     fn sw(pool: &str, block: u64, li: u64, tx: &str, price: f64) -> Swap {
-        Swap { pool: pool.into(), token: "0xt".into(), base: "WETH".into(), block, log_index: li, tx: tx.into(), price, fee: 0.003 }
+        Swap { pool: pool.into(), token: "0xt".into(), base: "WETH".into(), block, log_index: li, tx: tx.into(), price, fee: 0.003, size_1pct: None }
     }
 
     #[test]
@@ -327,6 +404,18 @@ mod tests {
         let two = format!("{:.0}", 2f64.powi(96) * 2f64.sqrt());
         assert!((token_price(&two, true).unwrap() - 2.0).abs() < 1e-6);
         assert!((token_price(&two, false).unwrap() - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn size_for_one_percent_matches_concentrated_liquidity_maths() {
+        // sqrtP = 1 (price 1), L = 1e18 raw, base = token1 (WETH, 18 dp):
+        // d(token1) = L * (sqrt(1.01) - 1) = ~0.004988 WETH
+        let sp = format!("{:.0}", 2f64.powi(96));
+        let got = size_for_1pct(&sp, "1000000000000000000", true, "WETH").unwrap();
+        assert!((got - (1.01f64.sqrt() - 1.0)).abs() < 1e-9);
+        // USDG has 6 decimals.
+        let got = size_for_1pct(&sp, "1000000000000000000", true, "USDG").unwrap();
+        assert!((got - (1.01f64.sqrt() - 1.0) * 1e12).abs() < 1e-3);
     }
 
     #[test]
@@ -341,10 +430,28 @@ mod tests {
         v.push(sw("p", 3, 0, "e", 108.0));
         v.push(sw("p", 3, 1, "e", 110.0));
         v.push(sw("p", 3, 2, "e", 112.0));
-        let (r, paths) = find_rushes(&v, &o);
+        let (r, paths) = find_rushes(&v, &o, 1);
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].block, 2);
         assert_eq!(paths["p"][&3], 112.0);
+    }
+
+    #[test]
+    fn rush_can_build_over_several_blocks() {
+        let o = Opts::default();
+        let v = vec![
+            sw("p", 1, 0, "a", 100.0),
+            sw("p", 2, 0, "b", 101.0),
+            sw("p", 3, 0, "c", 102.0),
+            sw("p", 4, 0, "d", 103.0),
+            sw("p", 5, 0, "e", 104.0),
+        ];
+        // One block at a time: never 3 buys in a block.
+        assert_eq!(find_rushes(&v, &o, 1).0.len(), 0);
+        // Window of 3 blocks: blocks 2-4 give 3 buys from 3 txs, +3%.
+        let (r, _) = find_rushes(&v, &o, 3);
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].block, 4);
     }
 
     #[test]
@@ -353,7 +460,7 @@ mod tests {
         path.insert(10, 100.0);
         path.insert(11, 103.0);
         path.insert(12, 111.0);
-        let r = Rush { pool: "p".into(), token: "t".into(), base: "WETH".into(), block: 10, fee: 0.003 };
+        let r = Rush { pool: "p".into(), token: "t".into(), base: "WETH".into(), block: 10, fee: 0.003, size_1pct: None };
         // first: entry 100, TP 10% hit at 111 -> 1.11 * 0.997^2 - 1
         let got = simulate(&path, &r, 0, 0.10, 0.05, 5).unwrap();
         assert!((got - (1.11 * 0.997 * 0.997 - 1.0)).abs() < 1e-12);
@@ -394,7 +501,8 @@ mod tests {
         fs::write(dir.join("blocks.jsonl"), blocks.join("\n")).unwrap();
         fs::write(dir.join("swaps.jsonl"), swaps.join("\n")).unwrap();
         fs::write(dir.join("meta.jsonl"), json!({"event": "start", "poll_ms": 200}).to_string()).unwrap();
-        let r = build(&dir, &Opts::default());
+        // One-block window (0.25 s at 250 ms blocks) for this tiny fixture.
+        let r = build(&dir, &Opts { window_s: 0.25, ..Opts::default() });
         assert_eq!(r["head_start_ms"]["feed_first_pct"].as_f64(), Some(100.0));
         assert!((r["head_start_ms"]["p50"].as_f64().unwrap() - 80.0).abs() < 1e-6);
         assert_eq!(r["rushes"]["count"], 1);
