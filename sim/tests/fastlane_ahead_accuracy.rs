@@ -1177,6 +1177,9 @@ fn wrong_fix_settings() {
     assert_eq!(cfg("FASTLANE_AHEAD_FAIL_WIDE", "pairs").fail_wide, WIDE_PAIRS);
     assert_eq!(cfg("FASTLANE_AHEAD_SILENT_UNSURE", "pairs").silent_unsure, SILENT_PAIRS);
     assert_eq!(cfg("FASTLANE_AHEAD_UNKNOWN_UNSURE", "pairs").unknown_unsure, UNK_PAIRS);
+    assert_eq!(cfg("FASTLANE_AHEAD_FAIL_WIDE", "loop").fail_wide, WIDE_LOOP);
+    assert_eq!(cfg("FASTLANE_AHEAD_SILENT_UNSURE", "loop").silent_unsure, SILENT_LOOP);
+    assert_eq!(cfg("FASTLANE_AHEAD_UNKNOWN_UNSURE", "loop").unknown_unsure, UNK_LOOP);
     assert_eq!(d.wide_hub, WIDE_HUB_DEFAULT);
     assert_eq!(cfg("FASTLANE_AHEAD_FAIL_WIDE_HUB", "8").wide_hub, 8);
 }

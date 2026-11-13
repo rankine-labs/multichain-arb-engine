@@ -504,6 +504,11 @@ pub const WIDE_TOKENS: u8 = 8;
 /// `pairs`: every pool of the same pair (ETH = WETH) as a pool the guess
 /// found (the sister pools of that pair on other exchanges).
 pub const WIDE_PAIRS: u8 = 16;
+/// `loop`: the closed loops ("the whole route") through a NON-hub coin X of
+/// a pool the guess found: every pool between two coins of {X and the coins
+/// X trades against} (ETH = WETH). E.g. a failed ETH / X swap marks
+/// X / USDG and WETH / USDG too: the triangle an arbitrage bot closes.
+pub const WIDE_LOOP: u8 = 32;
 /// FASTLANE_AHEAD_FAIL_WIDE_HUB default.
 pub const WIDE_HUB_DEFAULT: usize = 16;
 /// What `FASTLANE_AHEAD_FAIL_WIDE=on` means (set from the offline replay).
@@ -516,6 +521,8 @@ pub const SILENT_READS: u8 = 2;
 pub const SILENT_TOKENS: u8 = 4;
 /// `pairs`: the same-pair sister pools of the pools it read or names.
 pub const SILENT_PAIRS: u8 = 8;
+/// `loop`: the closed loops (see WIDE_LOOP) of the pools it read or names.
+pub const SILENT_LOOP: u8 = 16;
 /// What `FASTLANE_AHEAD_SILENT_UNSURE=on` means.
 pub const SILENT_UNSURE_ON: u8 = SILENT_NAMED;
 /// FASTLANE_AHEAD_UNKNOWN_UNSURE parts (bits).
@@ -528,6 +535,9 @@ pub const UNK_TOKENS: u8 = 4;
 /// `pairs`: the same-pair sister pools of the pools moved earlier in this
 /// block and of its target's learned pools.
 pub const UNK_PAIRS: u8 = 8;
+/// `loop`: the closed loops (see WIDE_LOOP) of the pools moved earlier in
+/// this block and of its target's learned pools.
+pub const UNK_LOOP: u8 = 16;
 /// What `FASTLANE_AHEAD_UNKNOWN_UNSURE=on` means.
 pub const UNKNOWN_UNSURE_ON: u8 = UNK_MOVED;
 
@@ -549,9 +559,9 @@ pub fn mode_bits(v: Option<&str>, parts: &[(&str, u8)], on_bits: u8) -> u8 {
 }
 
 /// The part lists of the three Nov 12 settings (names -> bits).
-pub const FAIL_WIDE_PARTS: &[(&str, u8)] = &[("learned", WIDE_LEARNED), ("moved", WIDE_MOVED), ("coins", WIDE_COINS), ("tokens", WIDE_TOKENS), ("pairs", WIDE_PAIRS)];
-pub const SILENT_PARTS: &[(&str, u8)] = &[("named", SILENT_NAMED), ("reads", SILENT_READS), ("tokens", SILENT_TOKENS), ("pairs", SILENT_PAIRS)];
-pub const UNKNOWN_PARTS: &[(&str, u8)] = &[("moved", UNK_MOVED), ("all", UNK_ALL), ("tokens", UNK_TOKENS), ("pairs", UNK_PAIRS)];
+pub const FAIL_WIDE_PARTS: &[(&str, u8)] = &[("learned", WIDE_LEARNED), ("moved", WIDE_MOVED), ("coins", WIDE_COINS), ("tokens", WIDE_TOKENS), ("pairs", WIDE_PAIRS), ("loop", WIDE_LOOP)];
+pub const SILENT_PARTS: &[(&str, u8)] = &[("named", SILENT_NAMED), ("reads", SILENT_READS), ("tokens", SILENT_TOKENS), ("pairs", SILENT_PAIRS), ("loop", SILENT_LOOP)];
+pub const UNKNOWN_PARTS: &[(&str, u8)] = &[("moved", UNK_MOVED), ("all", UNK_ALL), ("tokens", UNK_TOKENS), ("pairs", UNK_PAIRS), ("loop", UNK_LOOP)];
 
 impl Default for AheadCfg {
     fn default() -> Self {
@@ -1181,6 +1191,61 @@ impl PoolSet {
                     push(self.native_by_coin.get(&b), &mut out);
                 } else if b == twin {
                     push(self.native_by_coin.get(&a), &mut out);
+                }
+            }
+        }
+        out
+    }
+
+    /// Nov 12 `loop` parts: for each NON-hub coin X (held by at most `hub`
+    /// of our pools) of a pool in `keys`: S = X + every coin X has a pool
+    /// with (ETH = WETH); every pool between two coins of S. The closed
+    /// loops through X (X / A, A / B, B / X), i.e. "the whole route".
+    fn loop_sisters(&self, keys: &[String], hub: usize) -> Vec<String> {
+        let twin = self.eth_twin.unwrap_or(Address::ZERO);
+        let norm = |c: Address| if c.is_zero() { twin } else { c };
+        let mut xs: Vec<Address> = Vec::new();
+        for k in keys {
+            if let Some((a, b)) = self.coins_of.get(k) {
+                for c in [norm(*a), norm(*b)] {
+                    if !c.is_zero() && self.coin_pools(&c) <= hub && !xs.contains(&c) {
+                        xs.push(c);
+                    }
+                }
+            }
+        }
+        let mut out: Vec<String> = Vec::new();
+        let push = |v: Option<&Vec<String>>, out: &mut Vec<String>| {
+            for x in v.into_iter().flatten() {
+                if !out.contains(x) {
+                    out.push(x.clone());
+                }
+            }
+        };
+        for x in xs {
+            let mut set: Vec<Address> = vec![x];
+            for y in self.idx.partners.get(&x).into_iter().flatten() {
+                if !set.contains(y) {
+                    set.push(*y);
+                }
+            }
+            // X's native-ETH pools: X trades against ETH (= WETH).
+            if self.native_by_coin.contains_key(&x) && !twin.is_zero() && !set.contains(&twin) {
+                set.push(twin);
+            }
+            // Bounded: a coin with very many partners is a hub in all but name.
+            if set.len() > 64 {
+                continue;
+            }
+            for (i, a) in set.iter().enumerate() {
+                for b in &set[i + 1..] {
+                    let p = if a < b { (*a, *b) } else { (*b, *a) };
+                    push(self.by_pair.get(&p), &mut out);
+                    if *a == twin {
+                        push(self.native_by_coin.get(b), &mut out);
+                    } else if *b == twin {
+                        push(self.native_by_coin.get(a), &mut out);
+                    }
                 }
             }
         }
@@ -3160,6 +3225,11 @@ impl Ahead {
                 add(&k, &mut out);
             }
         }
+        if self.cfg.fail_wide & WIDE_LOOP != 0 {
+            for k in pools.loop_sisters(hit, self.cfg.wide_hub) {
+                add(&k, &mut out);
+            }
+        }
         out
     }
 
@@ -3196,12 +3266,19 @@ impl Ahead {
                 }
             }
         }
-        if self.cfg.unknown_unsure & UNK_PAIRS != 0 {
+        if self.cfg.unknown_unsure & (UNK_PAIRS | UNK_LOOP) != 0 {
             let mut src: Vec<String> = moved_msg.to_vec();
             if let Some(x) = to.and_then(|a| self.touchers.get(&a)) {
                 src.extend(x.1.iter().cloned());
             }
-            for k in pools.pair_sisters(&src) {
+            let mut more: Vec<String> = Vec::new();
+            if self.cfg.unknown_unsure & UNK_PAIRS != 0 {
+                more.extend(pools.pair_sisters(&src));
+            }
+            if self.cfg.unknown_unsure & UNK_LOOP != 0 {
+                more.extend(pools.loop_sisters(&src, self.cfg.wide_hub));
+            }
+            for k in more {
                 if !out.contains(&k) {
                     out.push(k);
                 }
@@ -3539,7 +3616,7 @@ impl Ahead {
                                 }
                             }
                         }
-                        if self.cfg.silent_unsure & SILENT_PAIRS != 0 {
+                        if self.cfg.silent_unsure & (SILENT_PAIRS | SILENT_LOOP) != 0 {
                             let mut src: Vec<String> = pools.named_direct(t.to, &named_now);
                             for (a, sl) in &kept.reads {
                                 if let Some(k) = pools.place_key(a, sl) {
@@ -3548,7 +3625,14 @@ impl Ahead {
                                     }
                                 }
                             }
-                            for k in pools.pair_sisters(&src) {
+                            let mut more: Vec<String> = Vec::new();
+                            if self.cfg.silent_unsure & SILENT_PAIRS != 0 {
+                                more.extend(pools.pair_sisters(&src));
+                            }
+                            if self.cfg.silent_unsure & SILENT_LOOP != 0 {
+                                more.extend(pools.loop_sisters(&src, self.cfg.wide_hub));
+                            }
+                            for k in more {
                                 if !silent.contains(&k) {
                                     silent.push(k);
                                 }
