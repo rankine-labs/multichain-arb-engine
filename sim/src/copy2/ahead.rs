@@ -1711,8 +1711,6 @@ impl AheadStats {
             "narrowUsed": self.narrow_used, "narrowDropped": self.narrow_dropped, "narrowFallback": self.narrow_fallback,
             "keepMarks": self.keep_marks, "taintedRuns": self.tainted_runs, "taintedMarks": self.tainted_marks,
             "failCascade": self.fail_cascade, "heldMissFirst": self.held_miss_first, "heldMissAgain": self.held_miss_again,
-            "wideRuns": self.wide_runs, "wideMarks": self.wide_marks, "silentRuns": self.silent_runs, "silentMarks": self.silent_marks,
-            "unknownRuns": self.unknown_runs, "unknownMarks": self.unknown_marks, "nativeAnyPicks": self.native_any_picks, "oneCoinPicks": self.one_coin_picks,
             "keptBases": self.kept_bases, "keptMissing": self.kept_missing, "keptValues": self.kept_values, "keptRebases": self.kept_rebases, "learned": self.learned,
             "rightKeptBase": self.right_kept, "wrongKeptBase": self.wrong_kept, "rightPlainBase": self.right_plain, "wrongPlainBase": self.wrong_plain, "keptSkipped": self.kept_skipped,
             "applyCpuUs": if times { let mut c = self.cpu_us.clone(); crate::timing::pct_of(&mut c) } else { Value::Null },
@@ -1720,6 +1718,14 @@ impl AheadStats {
             "aheadBlocks": if times { let mut b = self.ahead_blocks.clone(); crate::timing::pct_of(&mut b) } else { Value::Null },
         });
         if let (Value::Object(o), Value::Object(m)) = (&mut out, more) {
+            o.extend(m);
+        }
+        // Nov 12: the "wrong when sure" fix counters (a third object, same reason).
+        let fix = json!({
+            "wideRuns": self.wide_runs, "wideMarks": self.wide_marks, "silentRuns": self.silent_runs, "silentMarks": self.silent_marks,
+            "unknownRuns": self.unknown_runs, "unknownMarks": self.unknown_marks, "nativeAnyPicks": self.native_any_picks, "oneCoinPicks": self.one_coin_picks,
+        });
+        if let (Value::Object(o), Value::Object(m)) = (&mut out, fix) {
             o.extend(m);
         }
         out
