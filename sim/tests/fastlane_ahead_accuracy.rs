@@ -1074,11 +1074,11 @@ fn a_run_touching_nothing_unsure_stays_sure() {
     assert_eq!(tip.view().storage(pool(), U256::ZERO), known(106));
 }
 
-/// Settings: OFF unless set on (offline it cost right answers, see AheadCfg).
+/// Settings: ON unless set off since Nov 13 (with the filter fix it no longer costs a wrong; see AheadCfg).
 #[test]
 fn unsure_keep_settings() {
     let cfg = |k: &str, v: &str| AheadCfg::from_lookup(|x| (x == k).then(|| v.to_string()), 0);
-    assert!(!cfg("", "").unsure_keep);
+    assert!(cfg("", "").unsure_keep, "on unless set off (Nov 13)");
     assert!(cfg("FASTLANE_AHEAD_UNSURE_KEEP", "on").unsure_keep);
     assert!(!cfg("FASTLANE_AHEAD_UNSURE_KEEP", "off").unsure_keep);
     assert!(!AheadCfg::default().unsure_keep);
@@ -1160,7 +1160,11 @@ fn wrong_fix_settings() {
     use arbsim::copy2::ahead::*;
     let cfg = |k: &str, v: &str| AheadCfg::from_lookup(|x| (x == k).then(|| v.to_string()), 0);
     let d = cfg("", "");
-    assert_eq!((d.fail_wide, d.silent_unsure, d.unknown_unsure, d.filter_native_any, d.filter_one_coin), (0, 0, 0, false, false));
+    // Nov 13 defaults (offline replay): FAIL_WIDE on (pairs + tokens),
+    // FILTER_NATIVE_ANY on, the rest off.
+    assert_eq!((d.fail_wide, d.silent_unsure, d.unknown_unsure, d.filter_native_any, d.filter_one_coin), (FAIL_WIDE_ON, 0, 0, true, false));
+    assert_eq!(FAIL_WIDE_ON, WIDE_PAIRS | WIDE_TOKENS);
+    assert!(!cfg("FASTLANE_AHEAD_FILTER_NATIVE_ANY", "off").filter_native_any);
     assert_eq!(cfg("FASTLANE_AHEAD_FAIL_WIDE", "learned,coins").fail_wide, WIDE_LEARNED | WIDE_COINS);
     assert_eq!(cfg("FASTLANE_AHEAD_FAIL_WIDE", "on").fail_wide, FAIL_WIDE_ON);
     assert_eq!(cfg("FASTLANE_AHEAD_FAIL_WIDE", "off").fail_wide, 0);
