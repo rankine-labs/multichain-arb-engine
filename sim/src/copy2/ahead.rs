@@ -193,7 +193,7 @@
 //
 //   NO POOL WIPE (Nov 10 evening; live hold run: 18,721 of 94,647 failed
 //   replays were our OWN doing, 17,055 of them on one pool, 0x52e65b17):
-//    19. FASTLANE_AHEAD_UNSURE_KEEP [off unless set on; see AheadCfg for
+//    19. FASTLANE_AHEAD_UNSURE_KEEP [on since Nov 13; see AheadCfg for
 //        the offline measurement]. Root cause: marking a pool unsure
 //        used to FORGET it in the predicted copy (forget_place): a contract
 //        pool's whole account (code, every value, its balance) was dropped,
@@ -446,14 +446,15 @@ pub struct AheadCfg {
     /// 11.1% wrong-when-sure vs warm alone 1.8% / 14.0%: it took away more
     /// right answers than wrong ones.)
     pub wrong_guard_blocks: u64,
-    /// FASTLANE_AHEAD_UNSURE_KEEP [off; set on to use it] (Nov 10
+    /// FASTLANE_AHEAD_UNSURE_KEEP [on live since Nov 13; off in Default] (Nov 10
     /// evening, see "NO POOL WIPE" in the file header): a pool marked
     /// unsure keeps its last exact values in the predicted copy (replays
     /// through it still run), and runs that read it are "tainted" (their
     /// pools are marked unsure, never vouched for). off = the old rule: its
     /// values are forgotten.
     pub unsure_keep: bool,
-    /// FASTLANE_AHEAD_FAIL_WIDE [off] (Nov 12, "wrong when sure"): a
+    /// FASTLANE_AHEAD_FAIL_WIDE [on = pairs,tokens live since Nov 13; off in
+    /// Default] (Nov 12, "wrong when sure"): a
     /// transaction we could not run marks MORE pools unsure than the guess
     /// above. A list of: `learned` = every pool its target was ever seen
     /// moving (not only the ones its data names a coin of), `moved` = the
@@ -477,7 +478,8 @@ pub struct AheadCfg {
     /// earlier in this block plus its target's learned pools; `all` = every
     /// pool a scanner route uses. `on` = UNKNOWN_UNSURE_ON. 0 = off.
     pub unknown_unsure: u8,
-    /// FASTLANE_AHEAD_FILTER_NATIVE_ANY [off] (Nov 12, the filter weakness
+    /// FASTLANE_AHEAD_FILTER_NATIVE_ANY [on live since Nov 13; off in
+    /// Default] (Nov 12, the filter weakness
     /// behind FASTLANE_AHEAD_UNSURE_KEEP's extra wrong): the cheap filter
     /// also picks a transaction whose data names the coin of one of our
     /// native-ETH pools WHATEVER its ETH value (a "sell the coin for ETH"
@@ -487,7 +489,7 @@ pub struct AheadCfg {
     /// picks a transaction whose data names ANY coin of our pools (one coin
     /// is enough; before: a pool, a V4 id or both coins of a pair).
     pub filter_one_coin: bool,
-    /// FASTLANE_AHEAD_FAIL_WIDE_HUB [16] (Nov 12): a coin held by more than
+    /// FASTLANE_AHEAD_FAIL_WIDE_HUB [64] (Nov 12): a coin held by more than
     /// this many of our pools is a "hub" (WETH, a stablecoin): the `tokens`
     /// parts below never spread through it (that would be every route).
     pub wide_hub: usize,
@@ -510,9 +512,9 @@ pub const WIDE_PAIRS: u8 = 16;
 /// X / USDG and WETH / USDG too: the triangle an arbitrage bot closes.
 pub const WIDE_LOOP: u8 = 32;
 /// FASTLANE_AHEAD_FAIL_WIDE_HUB default.
-pub const WIDE_HUB_DEFAULT: usize = 16;
+pub const WIDE_HUB_DEFAULT: usize = 64;
 /// What `FASTLANE_AHEAD_FAIL_WIDE=on` means (set from the offline replay).
-pub const FAIL_WIDE_ON: u8 = WIDE_LEARNED | WIDE_MOVED;
+pub const FAIL_WIDE_ON: u8 = WIDE_PAIRS | WIDE_TOKENS;
 /// FASTLANE_AHEAD_SILENT_UNSURE parts (bits).
 pub const SILENT_NAMED: u8 = 1;
 pub const SILENT_READS: u8 = 2;
@@ -715,13 +717,18 @@ impl AheadCfg {
             // a transaction the cheap filter skipped (a router it had not
             // learned); with the old rule an earlier failure had marked that
             // pool unsure by luck. So it waits for a filter fix.
-            unsure_keep: on_off(get("FASTLANE_AHEAD_UNSURE_KEEP").as_deref()).unwrap_or(false),
+            // Nov 13: ON unless set off. With FASTLANE_AHEAD_FILTER_NATIVE_ANY
+            // (the filter fix) its extra wrong is gone; offline Oct 31 replay
+            // with FAIL_WIDE on: 51 right / 2 wrong (3.8%) vs off 46 / 2.
+            unsure_keep: on_off(get("FASTLANE_AHEAD_UNSURE_KEEP").as_deref()).unwrap_or(true),
             // Nov 12 ("wrong when sure"): see the fields. Defaults are set
             // from the offline replay of the Oct 31 recording.
-            fail_wide: mode_bits(get("FASTLANE_AHEAD_FAIL_WIDE").as_deref(), FAIL_WIDE_PARTS, FAIL_WIDE_ON),
+            // Nov 13: unset = ON (pairs + tokens); `off` / 0 turns it off.
+            fail_wide: get("FASTLANE_AHEAD_FAIL_WIDE").map_or(FAIL_WIDE_ON, |v| mode_bits(Some(&v), FAIL_WIDE_PARTS, FAIL_WIDE_ON)),
             silent_unsure: mode_bits(get("FASTLANE_AHEAD_SILENT_UNSURE").as_deref(), SILENT_PARTS, SILENT_UNSURE_ON),
             unknown_unsure: mode_bits(get("FASTLANE_AHEAD_UNKNOWN_UNSURE").as_deref(), UNKNOWN_PARTS, UNKNOWN_UNSURE_ON),
-            filter_native_any: on_off(get("FASTLANE_AHEAD_FILTER_NATIVE_ANY").as_deref()).unwrap_or(false),
+            // Nov 13: ON unless set off (the filter fix UNSURE_KEEP needs).
+            filter_native_any: on_off(get("FASTLANE_AHEAD_FILTER_NATIVE_ANY").as_deref()).unwrap_or(true),
             filter_one_coin: on_off(get("FASTLANE_AHEAD_FILTER_ONE_COIN").as_deref()).unwrap_or(false),
             wide_hub: num("FASTLANE_AHEAD_FAIL_WIDE_HUB").filter(|v| *v >= 1 && *v <= 100_000).unwrap_or(WIDE_HUB_DEFAULT),
         }
