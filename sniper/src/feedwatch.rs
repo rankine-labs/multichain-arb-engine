@@ -202,6 +202,19 @@ fn feed_thread(url: String, clock: Clock, stop: Arc<AtomicBool>, tx: mpsc::Sende
             }
             Err(e) => {
                 let _ = tx.send(Msg::Note(format!("feed DOWN (connect: {e})")));
+                // Robinhood blocks a server for an hour after repeated refused
+                // connections; retrying during the block keeps it alive (see
+                // the arb bot's src/core/chainManager.ts). Sit the hour out.
+                let m = e.to_string();
+                if m.contains("403") || m.contains("429") || m.to_ascii_lowercase().contains("blocked") {
+                    let wait = Duration::from_secs(if m.contains("429") { 600 } else { 65 * 60 });
+                    let _ = tx.send(Msg::Note(format!("feed refused us, waiting {} min before retrying", wait.as_secs() / 60)));
+                    let until = Instant::now() + wait;
+                    while Instant::now() < until && !stop.load(Ordering::Relaxed) {
+                        std::thread::sleep(Duration::from_secs(1));
+                    }
+                    continue;
+                }
             }
         }
         std::thread::sleep(backoff);
