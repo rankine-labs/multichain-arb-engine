@@ -45,7 +45,7 @@
 //   and says so (an incomplete file is refused by the replay unless asked).
 //
 //   REPLAY: `arbsim ahead-replay <capture file> [--json] [--samples N]
-//   [--budget-ms N] [--partial] [--revert-sure] [--exact-revert-sure] [--sender-funds trusted|strict] [--unknown-continue] [--keeper <truth file> [--keeper-warm [--keeper-warm-passes N]] [--keep-contracts N] [--keep-seeds-per-h N] [--keep-prune-blocks N [--keep-prune-learned]] [--oracle]] [--filter-all] [--no-keep-pick] [--horizon] [--hz-notes] [--narrow-unsure] [--keep-warm [--keep-warm-max N]] [--wrong-guard N] [--unsure-keep] [--keep-fill]`
+//   [--budget-ms N] [--partial] [--revert-sure] [--exact-revert-sure] [--sender-funds trusted|strict] [--unknown-continue] [--keeper <truth file> [--keeper-warm [--keeper-warm-passes N]] [--keep-contracts N] [--keep-seeds-per-h N] [--keep-prune-blocks N [--keep-prune-learned]] [--oracle]] [--filter-all] [--no-keep-pick] [--horizon] [--hz-notes] [--narrow-unsure] [--keep-warm [--keep-warm-max N]] [--wrong-guard N] [--unsure-keep] [--keep-fill] [--fail-wide LIST] [--silent-unsure LIST] [--unknown-unsure LIST] [--filter-native-any] [--filter-one-coin]`
 //     Builds a fresh predicted copy, feeds it the capture event by event and
 //     prints: agreement % (agree / (agree + disagree), per pool compared),
 //     the disagreement breakdown by cause (missedFilter / missedRan /
@@ -453,6 +453,14 @@ fn dec_cfg(d: &mut Dec) -> Res<AheadCfg> {
         wrong_guard_blocks: 0,
         // Not in the file (Nov 10 evening): `--unsure-keep` turns it on.
         unsure_keep: false,
+        // Not in the file (Nov 12): `--fail-wide LIST`, `--silent-unsure
+        // LIST`, `--unknown-unsure LIST`, `--filter-native-any`,
+        // `--filter-one-coin`.
+        fail_wide: 0,
+        silent_unsure: 0,
+        unknown_unsure: 0,
+        filter_native_any: false,
+        filter_one_coin: false,
     })
 }
 
@@ -1036,6 +1044,14 @@ pub struct ReplayOpts {
     /// `--unsure-keep` (Nov 10 evening): FASTLANE_AHEAD_UNSURE_KEEP=on (an
     /// unsure pool keeps its values; runs reading it are tainted).
     pub unsure_keep: bool,
+    /// Nov 12 ("wrong when sure"): `--fail-wide LIST` / `--silent-unsure
+    /// LIST` / `--unknown-unsure LIST` (part lists or `on`, as the
+    /// FASTLANE_AHEAD_* settings), `--filter-native-any`, `--filter-one-coin`.
+    pub fail_wide: u8,
+    pub silent_unsure: u8,
+    pub unknown_unsure: u8,
+    pub filter_native_any: bool,
+    pub filter_one_coin: bool,
 }
 
 /// Replay a capture through a fresh predicted copy. Returns the report
@@ -1116,6 +1132,11 @@ fn replay_with(cap: &CapFile, opts: &ReplayOpts, keeper: Option<KeeperOpts>) -> 
     cfg.narrow_unsure = opts.narrow_unsure;
     cfg.wrong_guard_blocks = opts.wrong_guard;
     cfg.unsure_keep = opts.unsure_keep;
+    cfg.fail_wide = opts.fail_wide;
+    cfg.silent_unsure = opts.silent_unsure;
+    cfg.unknown_unsure = opts.unknown_unsure;
+    cfg.filter_native_any = opts.filter_native_any;
+    cfg.filter_one_coin = opts.filter_one_coin;
     cfg.keeper = keeper.is_some();
     let l2 = cfg.l2_offset;
     let mut a = Ahead::new(cfg);
@@ -1857,10 +1878,10 @@ pub fn print_report(r: &Value, samples: usize) -> String {
     o
 }
 
-/// `arbsim ahead-replay <capture file> [--json] [--samples N] [--budget-ms N] [--partial] [--revert-sure] [--exact-revert-sure] [--sender-funds trusted|strict] [--unknown-continue] [--keeper <truth file> [--keeper-warm [--keeper-warm-passes N]] [--keep-contracts N] [--keep-seeds-per-h N] [--keep-prune-blocks N [--keep-prune-learned]] [--oracle]] [--filter-all] [--no-keep-pick] [--horizon] [--hz-notes] [--narrow-unsure] [--keep-warm [--keep-warm-max N]] [--wrong-guard N] [--unsure-keep] [--keep-fill]`
+/// `arbsim ahead-replay <capture file> [--json] [--samples N] [--budget-ms N] [--partial] [--revert-sure] [--exact-revert-sure] [--sender-funds trusted|strict] [--unknown-continue] [--keeper <truth file> [--keeper-warm [--keeper-warm-passes N]] [--keep-contracts N] [--keep-seeds-per-h N] [--keep-prune-blocks N [--keep-prune-learned]] [--oracle]] [--filter-all] [--no-keep-pick] [--horizon] [--hz-notes] [--narrow-unsure] [--keep-warm [--keep-warm-max N]] [--wrong-guard N] [--unsure-keep] [--keep-fill] [--fail-wide LIST] [--silent-unsure LIST] [--unknown-unsure LIST] [--filter-native-any] [--filter-one-coin]`
 pub fn replay_main(args: &[String]) {
     let Some(path) = args.get(2).filter(|a| !a.starts_with("--")) else {
-        eprintln!("usage: arbsim ahead-replay <capture file> [--json] [--samples N] [--budget-ms N] [--partial] [--revert-sure] [--exact-revert-sure] [--sender-funds trusted|strict] [--unknown-continue] [--keeper <truth file> [--keeper-warm [--keeper-warm-passes N]] [--keep-contracts N] [--keep-seeds-per-h N] [--keep-prune-blocks N [--keep-prune-learned]] [--oracle]] [--filter-all] [--no-keep-pick] [--horizon] [--hz-notes] [--narrow-unsure] [--keep-warm [--keep-warm-max N]] [--wrong-guard N] [--unsure-keep] [--keep-fill]");
+        eprintln!("usage: arbsim ahead-replay <capture file> [--json] [--samples N] [--budget-ms N] [--partial] [--revert-sure] [--exact-revert-sure] [--sender-funds trusted|strict] [--unknown-continue] [--keeper <truth file> [--keeper-warm [--keeper-warm-passes N]] [--keep-contracts N] [--keep-seeds-per-h N] [--keep-prune-blocks N [--keep-prune-learned]] [--oracle]] [--filter-all] [--no-keep-pick] [--horizon] [--hz-notes] [--narrow-unsure] [--keep-warm [--keep-warm-max N]] [--wrong-guard N] [--unsure-keep] [--keep-fill] [--fail-wide LIST] [--silent-unsure LIST] [--unknown-unsure LIST] [--filter-native-any] [--filter-one-coin]");
         std::process::exit(2);
     };
     let arg = |f: &str| args.iter().position(|a| a == f).and_then(|i| args.get(i + 1)).and_then(|v| v.parse::<u64>().ok());
@@ -1875,6 +1896,8 @@ pub fn replay_main(args: &[String]) {
         eprintln!("arbsim ahead-replay: the capture is incomplete ({}); add --partial to replay what is there", cap.cut.as_deref().unwrap_or("no end record"));
         std::process::exit(2);
     }
+    // A flag's text value (Nov 12 part lists).
+    let sarg = |k: &str| args.iter().position(|a| a == k).and_then(|i| args.get(i + 1)).cloned();
     let sender_funds = args.iter().position(|a| a == "--sender-funds").and_then(|i| args.get(i + 1)).map(|v| v.as_str());
     let trust_sender_funds = match sender_funds {
         None => None,
@@ -1899,6 +1922,11 @@ pub fn replay_main(args: &[String]) {
         narrow_unsure: args.iter().any(|a| a == "--narrow-unsure"),
         wrong_guard: arg("--wrong-guard").unwrap_or(0),
         unsure_keep: args.iter().any(|a| a == "--unsure-keep"),
+        fail_wide: super::ahead::mode_bits(sarg("--fail-wide").as_deref(), super::ahead::FAIL_WIDE_PARTS, super::ahead::FAIL_WIDE_ON),
+        silent_unsure: super::ahead::mode_bits(sarg("--silent-unsure").as_deref(), super::ahead::SILENT_PARTS, super::ahead::SILENT_UNSURE_ON),
+        unknown_unsure: super::ahead::mode_bits(sarg("--unknown-unsure").as_deref(), super::ahead::UNKNOWN_PARTS, super::ahead::UNKNOWN_UNSURE_ON),
+        filter_native_any: args.iter().any(|a| a == "--filter-native-any"),
+        filter_one_coin: args.iter().any(|a| a == "--filter-one-coin"),
     };
     // KEEPER (Oct 31): --keeper <truth file> [--keeper-warm [--keeper-warm-passes N]] [--keep-contracts N]
     // [--keep-seeds-per-h N]: the hot-contract keeper on recorded block diffs.

@@ -453,11 +453,84 @@ pub struct AheadCfg {
     /// pools are marked unsure, never vouched for). off = the old rule: its
     /// values are forgotten.
     pub unsure_keep: bool,
+    /// FASTLANE_AHEAD_FAIL_WIDE [off] (Nov 12, "wrong when sure"): a
+    /// transaction we could not run marks MORE pools unsure than the guess
+    /// above. A list of: `learned` = every pool its target was ever seen
+    /// moving (not only the ones its data names a coin of), `moved` = the
+    /// pools already moved earlier in this block (a back-running bot trades
+    /// right behind them), `coins` = every pool sharing a coin with a pool
+    /// the guess found or a coin its data names (the whole neighbourhood of
+    /// the route). `on` = the replay-chosen set (FAIL_WIDE_ON). 0 = off.
+    pub fail_wide: u8,
+    /// FASTLANE_AHEAD_SILENT_UNSURE [off] (Nov 12): a picked transaction
+    /// whose run finished but moved NONE of our pools is not trusted to have
+    /// moved nothing (on chain it may have: our copy may hold a value that
+    /// steered it away, e.g. a bot that saw no profit). A list of: `named`
+    /// = the pools its target / data name directly, native-ETH pools of a
+    /// named coin and its target's learned pools; `reads` = our pools whose
+    /// values the run read. `on` = SILENT_UNSURE_ON. 0 = off.
+    pub silent_unsure: u8,
+    /// FASTLANE_AHEAD_UNKNOWN_UNSURE [off] (Nov 12): a transaction with an
+    /// unknown effect (could not run, nothing ties it to our pools,
+    /// FASTLANE_AHEAD_UNKNOWN_CONTINUE predicts past it) marks pools unsure
+    /// instead of none. A list of: `moved` = the pools already moved
+    /// earlier in this block plus its target's learned pools; `all` = every
+    /// pool a scanner route uses. `on` = UNKNOWN_UNSURE_ON. 0 = off.
+    pub unknown_unsure: u8,
+    /// FASTLANE_AHEAD_FILTER_NATIVE_ANY [off] (Nov 12, the filter weakness
+    /// behind FASTLANE_AHEAD_UNSURE_KEEP's extra wrong): the cheap filter
+    /// also picks a transaction whose data names the coin of one of our
+    /// native-ETH pools WHATEVER its ETH value (a "sell the coin for ETH"
+    /// through a router pays no ETH, so it was skipped).
+    pub filter_native_any: bool,
+    /// FASTLANE_AHEAD_FILTER_ONE_COIN [off] (Nov 12): the cheap filter also
+    /// picks a transaction whose data names ANY coin of our pools (one coin
+    /// is enough; before: a pool, a V4 id or both coins of a pair).
+    pub filter_one_coin: bool,
 }
+
+/// FASTLANE_AHEAD_FAIL_WIDE parts (bits).
+pub const WIDE_LEARNED: u8 = 1;
+pub const WIDE_MOVED: u8 = 2;
+pub const WIDE_COINS: u8 = 4;
+/// What `FASTLANE_AHEAD_FAIL_WIDE=on` means (set from the offline replay).
+pub const FAIL_WIDE_ON: u8 = WIDE_LEARNED | WIDE_MOVED;
+/// FASTLANE_AHEAD_SILENT_UNSURE parts (bits).
+pub const SILENT_NAMED: u8 = 1;
+pub const SILENT_READS: u8 = 2;
+/// What `FASTLANE_AHEAD_SILENT_UNSURE=on` means.
+pub const SILENT_UNSURE_ON: u8 = SILENT_NAMED;
+/// FASTLANE_AHEAD_UNKNOWN_UNSURE parts (bits).
+pub const UNK_MOVED: u8 = 1;
+pub const UNK_ALL: u8 = 2;
+/// What `FASTLANE_AHEAD_UNKNOWN_UNSURE=on` means.
+pub const UNKNOWN_UNSURE_ON: u8 = UNK_MOVED;
+
+/// A part list setting ("off" / "on" / "a,b"): its bits. `on` = `on_bits`;
+/// unset, off, 0, false, no or an unknown word only = 0 (off).
+pub fn mode_bits(v: Option<&str>, parts: &[(&str, u8)], on_bits: u8) -> u8 {
+    let Some(v) = v else { return 0 };
+    let v = v.trim().to_ascii_lowercase();
+    if matches!(v.as_str(), "on" | "1" | "true" | "yes") {
+        return on_bits;
+    }
+    let mut out = 0u8;
+    for w in v.split([',', '+', ' ']).map(str::trim).filter(|w| !w.is_empty()) {
+        if let Some((_, b)) = parts.iter().find(|(n, _)| *n == w) {
+            out |= b;
+        }
+    }
+    out
+}
+
+/// The part lists of the three Nov 12 settings (names -> bits).
+pub const FAIL_WIDE_PARTS: &[(&str, u8)] = &[("learned", WIDE_LEARNED), ("moved", WIDE_MOVED), ("coins", WIDE_COINS)];
+pub const SILENT_PARTS: &[(&str, u8)] = &[("named", SILENT_NAMED), ("reads", SILENT_READS)];
+pub const UNKNOWN_PARTS: &[(&str, u8)] = &[("moved", UNK_MOVED), ("all", UNK_ALL)];
 
 impl Default for AheadCfg {
     fn default() -> Self {
-        AheadCfg { max_blocks: 32, run_all: false, max_txs: 256, max_touchers: 4096, l2_offset: 0, trust_sender_funds: false, msg_budget_us: 10_000, routes_only: true, compare_delay: 0, revert_unsure: true, exact_revert_sure: false, unknown_continue: false, keeper: false, keep_pick: true, budget_cpu: false, lazy_rebase: false, kept_rebuild_once: false, need_keeper: false, thin_pending: true, horizon: false, hz_notes: false, narrow_unsure: false, diag: false, wrong_guard_blocks: 0, unsure_keep: false }
+        AheadCfg { max_blocks: 32, run_all: false, max_txs: 256, max_touchers: 4096, l2_offset: 0, trust_sender_funds: false, msg_budget_us: 10_000, routes_only: true, compare_delay: 0, revert_unsure: true, exact_revert_sure: false, unknown_continue: false, keeper: false, keep_pick: true, budget_cpu: false, lazy_rebase: false, kept_rebuild_once: false, need_keeper: false, thin_pending: true, horizon: false, hz_notes: false, narrow_unsure: false, diag: false, wrong_guard_blocks: 0, unsure_keep: false, fail_wide: 0, silent_unsure: 0, unknown_unsure: 0, filter_native_any: false, filter_one_coin: false }
     }
 }
 
@@ -608,6 +681,13 @@ impl AheadCfg {
             // learned); with the old rule an earlier failure had marked that
             // pool unsure by luck. So it waits for a filter fix.
             unsure_keep: on_off(get("FASTLANE_AHEAD_UNSURE_KEEP").as_deref()).unwrap_or(false),
+            // Nov 12 ("wrong when sure"): see the fields. Defaults are set
+            // from the offline replay of the Oct 31 recording.
+            fail_wide: mode_bits(get("FASTLANE_AHEAD_FAIL_WIDE").as_deref(), FAIL_WIDE_PARTS, FAIL_WIDE_ON),
+            silent_unsure: mode_bits(get("FASTLANE_AHEAD_SILENT_UNSURE").as_deref(), SILENT_PARTS, SILENT_UNSURE_ON),
+            unknown_unsure: mode_bits(get("FASTLANE_AHEAD_UNKNOWN_UNSURE").as_deref(), UNKNOWN_PARTS, UNKNOWN_UNSURE_ON),
+            filter_native_any: on_off(get("FASTLANE_AHEAD_FILTER_NATIVE_ANY").as_deref()).unwrap_or(false),
+            filter_one_coin: on_off(get("FASTLANE_AHEAD_FILTER_ONE_COIN").as_deref()).unwrap_or(false),
         }
     }
 }
@@ -1002,6 +1082,40 @@ impl PoolSet {
             }
         }
         out
+    }
+
+    /// FASTLANE_AHEAD_FILTER_ONE_COIN: does the data name any coin of ours?
+    fn names_a_coin(&self, n: &Named) -> bool {
+        self.idx.coins(n).next().is_some()
+    }
+
+    /// FASTLANE_AHEAD_FAIL_WIDE `coins`: our pools sharing a coin with any
+    /// pool in `keys` (the route's neighbourhood).
+    fn sharing_coins_of(&self, keys: &[String]) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for k in keys {
+            if let Some((a, b)) = self.coins_of.get(k) {
+                for c in [a, b] {
+                    if c.is_zero() {
+                        continue;
+                    }
+                    for x in self.by_coin.get(c).into_iter().chain(self.native_by_coin.get(c)).flatten() {
+                        if !out.contains(x) {
+                            out.push(x.clone());
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Replay diagnostics (Nov 12): what a SKIPPED transaction's data named
+    /// of ours, in a few words (a "missedFilter" sample shows it).
+    fn skip_why(&self, value: U256, n: &Named) -> String {
+        let coins = self.idx.coins(n).count();
+        let native = self.named_native_any(n).len();
+        format!("skipped: coins {coins} native pools of them {native} pays eth {}", !value.is_zero())
     }
 
     /// Cheap filter, first part: could this transaction touch our pools?
@@ -1504,6 +1618,19 @@ pub struct AheadStats {
     pub fail_cascade: u64,
     pub held_miss_first: u64,
     pub held_miss_again: u64,
+    /// Nov 12 ("wrong when sure"): failed runs that FAIL_WIDE widened and
+    /// the extra pools; runs that moved nothing that SILENT_UNSURE marked
+    /// and their pools; unknown-effect transactions UNKNOWN_UNSURE marked
+    /// and their pools; transactions picked only by FILTER_NATIVE_ANY /
+    /// FILTER_ONE_COIN.
+    pub wide_runs: u64,
+    pub wide_marks: u64,
+    pub silent_runs: u64,
+    pub silent_marks: u64,
+    pub unknown_runs: u64,
+    pub unknown_marks: u64,
+    pub native_any_picks: u64,
+    pub one_coin_picks: u64,
     /// Observe-mode build: per feed message, how many blocks the predicted
     /// tip was ahead of copy 2's confirmed version (0 = no tip: stopped or
     /// waiting). The "blocks fresher" gain. Ring of the newest MAX_TIMES.
@@ -1584,6 +1711,8 @@ impl AheadStats {
             "narrowUsed": self.narrow_used, "narrowDropped": self.narrow_dropped, "narrowFallback": self.narrow_fallback,
             "keepMarks": self.keep_marks, "taintedRuns": self.tainted_runs, "taintedMarks": self.tainted_marks,
             "failCascade": self.fail_cascade, "heldMissFirst": self.held_miss_first, "heldMissAgain": self.held_miss_again,
+            "wideRuns": self.wide_runs, "wideMarks": self.wide_marks, "silentRuns": self.silent_runs, "silentMarks": self.silent_marks,
+            "unknownRuns": self.unknown_runs, "unknownMarks": self.unknown_marks, "nativeAnyPicks": self.native_any_picks, "oneCoinPicks": self.one_coin_picks,
             "keptBases": self.kept_bases, "keptMissing": self.kept_missing, "keptValues": self.kept_values, "keptRebases": self.kept_rebases, "learned": self.learned,
             "rightKeptBase": self.right_kept, "wrongKeptBase": self.wrong_kept, "rightPlainBase": self.right_plain, "wrongPlainBase": self.wrong_plain, "keptSkipped": self.kept_skipped,
             "applyCpuUs": if times { let mut c = self.cpu_us.clone(); crate::timing::pct_of(&mut c) } else { Value::Null },
@@ -2577,6 +2706,11 @@ impl Ahead {
             "confMoved": st.moved.iter().any(|x| x == k), "predMoved": p.changed_cum.contains(k),
             "baseKept": p.base_kept,
         });
+        // Nov 12: what kind of pool (V4 / contract, native-ETH) and its coins.
+        if let Some((c0, c1)) = self.pools.coins_of.get(k) {
+            sm["poolCoins"] = json!([format!("{c0:#x}"), format!("{c1:#x}")]);
+            sm["poolV4"] = json!(matches!(self.pools.places.get(k), Some(Place::V4(..))));
+        }
         if kind != cause {
             sm["cause"] = json!(cause);
         }
@@ -2866,6 +3000,60 @@ impl Ahead {
         hit
     }
 
+    /// FASTLANE_AHEAD_FAIL_WIDE: the pools to add to a failed run's guess
+    /// `hit` (only ones not in it already). See AheadCfg::fail_wide.
+    fn widen_failed(&self, pools: &PoolSet, to: Option<Address>, named_now: &Named, hit: &[String], moved_msg: &[String]) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let add = |k: &String, out: &mut Vec<String>| {
+            if !hit.contains(k) && !out.contains(k) {
+                out.push(k.clone());
+            }
+        };
+        if self.cfg.fail_wide & WIDE_LEARNED != 0 {
+            if let Some(x) = to.and_then(|a| self.touchers.get(&a)) {
+                for k in &x.1 {
+                    add(k, &mut out);
+                }
+            }
+        }
+        if self.cfg.fail_wide & WIDE_MOVED != 0 {
+            for k in moved_msg {
+                add(k, &mut out);
+            }
+        }
+        if self.cfg.fail_wide & WIDE_COINS != 0 {
+            for k in pools.sharing_coins_of(hit).iter().chain(pools.sharing_named_coins(named_now).iter()) {
+                add(k, &mut out);
+            }
+        }
+        out
+    }
+
+    /// FASTLANE_AHEAD_UNKNOWN_UNSURE: the pools an unknown-effect
+    /// transaction marks unsure. See AheadCfg::unknown_unsure.
+    fn unknown_marks(&self, pools: &PoolSet, to: Option<Address>, moved_msg: &[String]) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        if self.cfg.unknown_unsure & UNK_ALL != 0 {
+            match &self.route_pools {
+                Some(rp) => out.extend(rp.iter().filter(|k| pools.places.contains_key(*k)).cloned()),
+                None => out.extend(pools.places.keys().cloned()),
+            }
+            out.sort();
+            return out;
+        }
+        if self.cfg.unknown_unsure & UNK_MOVED != 0 {
+            out.extend(moved_msg.iter().cloned());
+            if let Some(x) = to.and_then(|a| self.touchers.get(&a)) {
+                for k in &x.1 {
+                    if !out.contains(k) {
+                        out.push(k.clone());
+                    }
+                }
+            }
+        }
+        out
+    }
+
     fn halt(&mut self, seq: u64, why: &'static str) {
         self.count(|s| s.stop(why));
         self.stop = Some(Stop { seq, why });
@@ -2945,6 +3133,9 @@ impl Ahead {
         let pools = self.pools.clone();
         let assume = Assume { sender_funds: true, recent_fill: true, skip: None, record_hashes: true, proven_skip: false };
         let mut changed: Vec<String> = Vec::new();
+        // Nov 12: pools our exact runs moved earlier in this block
+        // (FAIL_WIDE / UNKNOWN_UNSURE "moved").
+        let mut moved_msg: Vec<String> = Vec::new();
         let mut notes: Vec<TxNote> = Vec::with_capacity(txs.len());
         let note = |t: &DecodedTx, fate: Fate, ok: bool, why: Option<String>, pools: Vec<String>| TxNote { hash: t.hash, to: t.to, fate, ok, why, pools };
         // Marks pools unsure in this view: their values forgotten (reads
@@ -2993,10 +3184,26 @@ impl Ahead {
             if !plain && !native.is_empty() {
                 self.count(|s| s.native_picks += 1);
             }
-            let pick = plain || !native.is_empty();
+            // Nov 12 (the filter weakness behind UNSURE_KEEP's extra wrong):
+            // FASTLANE_AHEAD_FILTER_NATIVE_ANY picks a transaction naming the
+            // coin of one of our native-ETH pools whatever its ETH value;
+            // FASTLANE_AHEAD_FILTER_ONE_COIN one naming any coin of ours.
+            let mut extra = false;
+            if !plain && native.is_empty() && !self.cfg.run_all {
+                if self.cfg.filter_native_any && !pools.named_native_any(&named_now).is_empty() {
+                    self.count(|s| s.native_any_picks += 1);
+                    extra = true;
+                } else if self.cfg.filter_one_coin && pools.names_a_coin(&named_now) {
+                    self.count(|s| s.one_coin_picks += 1);
+                    extra = true;
+                }
+            }
+            let pick = plain || !native.is_empty() || extra;
             if !pick {
                 self.count(|s| s.txs_skipped += 1);
-                notes.push(note(t, Fate::Skipped, true, None, Vec::new()));
+                // Replay diagnostics: what the data named (why it was skipped).
+                let why = self.diag.is_some().then(|| pools.skip_why(t.value, &named_now));
+                notes.push(note(t, Fate::Skipped, true, why, Vec::new()));
                 continue;
             }
             // FASTLANE_AHEAD_ROUTES_ONLY: picked only for naming pools no
@@ -3153,6 +3360,39 @@ impl Ahead {
                         }
                         mark_unsure(&mut ov, &mut changed, &mut changed_cum, &mut unsure_cum, &mut held_cum, &hit);
                     }
+                    // FASTLANE_AHEAD_SILENT_UNSURE (Nov 12): our run finished
+                    // and moved none of our pools. On chain it may have (a
+                    // value in our copy steered it away): the pools it could
+                    // have moved are not vouched for.
+                    let mut silent: Vec<String> = Vec::new();
+                    if ok && moved.is_empty() && !tainted && self.cfg.silent_unsure != 0 {
+                        if self.cfg.silent_unsure & SILENT_NAMED != 0 {
+                            silent = pools.named_direct(t.to, &named_now);
+                            let learned = t.to.and_then(|a| self.touchers.get(&a)).map(|x| pools.learned_for(&x.1, &named_now)).unwrap_or_default();
+                            for k in native.iter().cloned().chain(pools.named_native_any(&named_now)).chain(learned) {
+                                if !silent.contains(&k) {
+                                    silent.push(k);
+                                }
+                            }
+                        }
+                        if self.cfg.silent_unsure & SILENT_READS != 0 {
+                            for (a, sl) in &kept.reads {
+                                if let Some(k) = pools.place_key(a, sl) {
+                                    if !silent.contains(k) {
+                                        silent.push(k.clone());
+                                    }
+                                }
+                            }
+                        }
+                        if !silent.is_empty() {
+                            let n = silent.iter().filter(|k| !unsure_cum.contains(*k)).count() as u64;
+                            self.count(|s| {
+                                s.silent_runs += 1;
+                                s.silent_marks += n;
+                            });
+                            mark_unsure(&mut ov, &mut changed, &mut changed_cum, &mut unsure_cum, &mut held_cum, &silent);
+                        }
+                    }
                     for k in &moved {
                         // Values forgotten earlier stay forgotten (a later
                         // exact write puts back only what it wrote).
@@ -3160,6 +3400,9 @@ impl Ahead {
                             changed.push(k.clone());
                         }
                         changed_cum.insert(k.clone());
+                        if !moved_msg.contains(k) {
+                            moved_msg.push(k.clone());
+                        }
                     }
                     match revert_hit {
                         Some(hit) if !hit.is_empty() => {
@@ -3179,6 +3422,9 @@ impl Ahead {
                             self.count(|s| s.reverts_kept += 1);
                             notes.push(note(t, Fate::Ran, ok, why, moved));
                         }
+                        // SILENT_UNSURE: the note lists the pools it marked
+                        // (it moved none), "moved nothing" as its reason.
+                        None if !silent.is_empty() => notes.push(note(t, Fate::Ran, ok, Some("moved nothing".to_string()), silent)),
                         None => notes.push(note(t, Fate::Ran, ok, why, moved)),
                     }
                 }
@@ -3235,7 +3481,22 @@ impl Ahead {
                     // Practice fixes: the collect run is skipped when the
                     // target has no code in our copy (it could only read
                     // zero there and stop: nothing of ours, same answer).
-                    let hit = self.guess_touched(&ov, &ctx, t, &pools, &named_now, &native, true);
+                    let mut hit = self.guess_touched(&ov, &ctx, t, &pools, &named_now, &native, true);
+                    // FASTLANE_AHEAD_FAIL_WIDE (Nov 12): more pools than the
+                    // guess (it missed the pool on chain 3 times in the Oct
+                    // 31 replay). Only when the guess found something (an
+                    // empty guess is the unknown-effect path below).
+                    if !hit.is_empty() && self.cfg.fail_wide != 0 {
+                        let extra = self.widen_failed(&pools, t.to, &named_now, &hit, &moved_msg);
+                        if !extra.is_empty() {
+                            let n = extra.len() as u64;
+                            self.count(|s| {
+                                s.wide_runs += 1;
+                                s.wide_marks += n;
+                            });
+                            hit.extend(extra);
+                        }
+                    }
                     // ORACLE (offline replay only): did the guess cover what
                     // the real transaction moved?
                     if self.oracle.is_some() {
@@ -3263,10 +3524,23 @@ impl Ahead {
                         // trusted blindly). Its target is remembered, like any
                         // failed run's, and taught real pools by copy 2.
                         self.count(|s| s.unknown_continued += 1);
+                        // FASTLANE_AHEAD_UNKNOWN_UNSURE (Nov 12): its effect is
+                        // unknown, so the pools it could touch are not vouched
+                        // for (before: none; it moved a pool on chain once in
+                        // the Oct 31 replay).
+                        let unk = self.unknown_marks(&pools, t.to, &moved_msg);
                         if let Some(a) = t.to {
                             self.learn_toucher(a, &[]);
                         }
-                        notes.push(note(t, Fate::Unknown, false, Some(why), Vec::new()));
+                        if !unk.is_empty() {
+                            let n = unk.iter().filter(|k| !unsure_cum.contains(*k)).count() as u64;
+                            self.count(|s| {
+                                s.unknown_runs += 1;
+                                s.unknown_marks += n;
+                            });
+                            mark_unsure(&mut ov, &mut changed, &mut changed_cum, &mut unsure_cum, &mut held_cum, &unk);
+                        }
+                        notes.push(note(t, Fate::Unknown, false, Some(why), unk));
                         continue;
                     }
                     self.count(|s| s.txs_marked += 1);
@@ -4156,6 +4430,10 @@ pub fn accuracy_json(s: &AheadStats, times: bool) -> Value {
         // Nov 10 evening: FASTLANE_AHEAD_UNSURE_KEEP and the failure split.
         "unsureKeep": {"keptMarks": s.keep_marks, "taintedRuns": s.tainted_runs, "taintedMarks": s.tainted_marks},
         "fails": {"cascade": s.fail_cascade, "heldMissFirst": s.held_miss_first, "heldMissAgain": s.held_miss_again},
+        // Nov 12: the "wrong when sure" fixes (FAIL_WIDE / SILENT_UNSURE /
+        // UNKNOWN_UNSURE / FILTER_NATIVE_ANY / FILTER_ONE_COIN).
+        "wrongFix": {"wideRuns": s.wide_runs, "wideMarks": s.wide_marks, "silentRuns": s.silent_runs, "silentMarks": s.silent_marks,
+            "unknownRuns": s.unknown_runs, "unknownMarks": s.unknown_marks, "nativeAnyPicks": s.native_any_picks, "oneCoinPicks": s.one_coin_picks},
     })
 }
 
