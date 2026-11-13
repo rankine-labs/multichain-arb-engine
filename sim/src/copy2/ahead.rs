@@ -4413,7 +4413,7 @@ fn status_of(a: &Ahead) -> Value {
 /// no blocks-ahead percentiles (no copy + sort of the since-start ring).
 pub fn accuracy_json(s: &AheadStats, times: bool) -> Value {
     let pct = |a: u64, b: u64| (b > 0).then(|| (1000.0 * a as f64 / b as f64).round() / 10.0);
-    json!({
+    let mut out = json!({
         "exact": s.agree, "wrong": s.disagree, "unsure": s.unsure,
         "exactPctOfSure": pct(s.agree, s.agree + s.disagree),
         "surePct": pct(s.agree + s.disagree, s.agree + s.disagree + s.unsure),
@@ -4436,11 +4436,13 @@ pub fn accuracy_json(s: &AheadStats, times: bool) -> Value {
         // Nov 10 evening: FASTLANE_AHEAD_UNSURE_KEEP and the failure split.
         "unsureKeep": {"keptMarks": s.keep_marks, "taintedRuns": s.tainted_runs, "taintedMarks": s.tainted_marks},
         "fails": {"cascade": s.fail_cascade, "heldMissFirst": s.held_miss_first, "heldMissAgain": s.held_miss_again},
-        // Nov 12: the "wrong when sure" fixes (FAIL_WIDE / SILENT_UNSURE /
-        // UNKNOWN_UNSURE / FILTER_NATIVE_ANY / FILTER_ONE_COIN).
-        "wrongFix": {"wideRuns": s.wide_runs, "wideMarks": s.wide_marks, "silentRuns": s.silent_runs, "silentMarks": s.silent_marks,
-            "unknownRuns": s.unknown_runs, "unknownMarks": s.unknown_marks, "nativeAnyPicks": s.native_any_picks, "oneCoinPicks": s.one_coin_picks},
-    })
+    });
+    // Nov 12: the "wrong when sure" fixes (FAIL_WIDE / SILENT_UNSURE /
+    // UNKNOWN_UNSURE / FILTER_NATIVE_ANY / FILTER_ONE_COIN). Added after
+    // (one json! macro is limited in size).
+    out["wrongFix"] = json!({"wideRuns": s.wide_runs, "wideMarks": s.wide_marks, "silentRuns": s.silent_runs, "silentMarks": s.silent_marks,
+        "unknownRuns": s.unknown_runs, "unknownMarks": s.unknown_marks, "nativeAnyPicks": s.native_any_picks, "oneCoinPicks": s.one_coin_picks});
+    out
 }
 
 /// FASTLANE_AHEAD_DIAG: count one reason / cause (bounded: a new key past
