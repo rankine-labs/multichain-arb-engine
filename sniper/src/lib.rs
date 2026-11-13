@@ -6,6 +6,8 @@
 //   fourmeme.rs  Four.meme contract addresses, event ids, log decoding
 //   ws.rs        websocket eth_subscribe client with reconnects
 //   matcher.rs   joins pending sightings with confirmed Four.meme trades
+//   feedtx.rs    unpack user transactions from the sequencer feed
+//   feedwatch.rs feed head start + which routers swaps use
 //   paper.rs     Robinhood paper trader (real quotes, no money)
 //   probe.rs     the measurement run (threads + JSONL output)
 //   registry.rs  live token list + burst / creator-dump / graduation signals
@@ -17,6 +19,8 @@
 // ============================================================================
 pub mod calibrate;
 pub mod curve;
+pub mod feedtx;
+pub mod feedwatch;
 pub mod fourmeme;
 pub mod matcher;
 pub mod paper;

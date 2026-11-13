@@ -59,31 +59,43 @@ chmod +x sniper 2>/dev/null || true
 RUN="deploy/run.env"
 [ -f "$RUN" ] || { log "no $RUN in build"; exit 1; }
 ENABLED="$(kv "$RUN" SNIPER_ENABLED)"
-MODE="$(kv "$RUN" SNIPER_MODE)"; MODE="${MODE:-paper}"
-OUT="$(kv "$RUN" SNIPER_OUT)"; OUT="${OUT:-paper-out/run1}"
-case "$MODE" in paper) ;; *) log "mode '$MODE' not allowed here (paper only)"; exit 1;; esac
+# SNIPER_MODE: one or more read-only programs, space separated.
+MODES="$(kv "$RUN" SNIPER_MODE)"; MODES="${MODES:-paper}"
+ALLOWED=" paper feed-watch "
+for M in $MODES; do
+  case "$ALLOWED" in *" $M "*) ;; *) log "mode '$M' not allowed here (read-only/paper modes only)"; exit 1;; esac
+done
+# Output folder per mode: SNIPER_OUT_<MODE> (e.g. SNIPER_OUT_FEED_WATCH), else SNIPER_OUT.
+out_for() { local K="SNIPER_OUT_$(echo "$1" | tr 'a-z-' 'A-Z_')"; local O="$(kv "$RUN" "$K")"; [ -n "$O" ] || O="$(kv "$RUN" SNIPER_OUT)"; echo "${O:-$1-out/run1}"; }
+running_pid() { pgrep -f "^./sniper $1\$" | head -1 || true; }
+stop_mode() { pkill -f "^./sniper $1\$" 2>/dev/null && sleep 1; true; }
 
 # What should be running: this build + these settings.
 WANT="$(git rev-parse HEAD):$(sha256sum "$RUN" | cut -c1-16)"
-HAVE="$(kv "$STATE" RUNNING)"
-PID="$(pgrep -f "^./sniper $MODE" | head -1 || true)"
-
-stop_it() { pkill -f '^./sniper paper' 2>/dev/null && sleep 1; true; }
 
 # --- 3. Start / restart / stop ------------------------------------------------
-if [ "$ENABLED" != "1" ]; then
-  if [ -n "$PID" ]; then stop_it; log "stopped (SNIPER_ENABLED=$ENABLED)"; fi
-  set_kv "$STATE" RUNNING ""
-elif [ -z "$PID" ] || [ "$WANT" != "$HAVE" ]; then
-  [ -n "$PID" ] && stop_it
-  # Pass only SNIPER_* settings from run.env (no other variables).
-  ARGS=()
-  while IFS= read -r line; do ARGS+=("$line"); done < <(grep -E '^SNIPER_[A-Z0-9_]+=' "$RUN" | grep -v -E '^SNIPER_(ENABLED|MODE)=')
-  # 9>&- : the sniper must not inherit our lock, or the next run would think we're still busy.
-  env "${ARGS[@]}" nohup ./sniper "$MODE" >> paper.log 2>&1 9>&- &
-  set_kv "$STATE" RUNNING "$WANT"
-  log "started sniper $MODE -> $OUT (pid $!) [$( [ -z "$PID" ] && echo 'was not running' || echo 'new build or settings')]"
-fi
+for M in $(echo "$ALLOWED"); do
+  KEY="RUNNING_$(echo "$M" | tr 'a-z-' 'A-Z_')"
+  HAVE="$(kv "$STATE" "$KEY")"
+  PID="$(running_pid "$M")"
+  case " $MODES " in *" $M "*) WANTED=1;; *) WANTED=0;; esac
+  if [ "$ENABLED" != "1" ] || [ "$WANTED" = 0 ]; then
+    if [ -n "$PID" ]; then stop_mode "$M"; log "stopped $M (enabled=$ENABLED, in SNIPER_MODE=$WANTED)"; fi
+    set_kv "$STATE" "$KEY" ""
+  elif [ -z "$PID" ] || [ "$WANT" != "$HAVE" ]; then
+    [ -n "$PID" ] && stop_mode "$M"
+    OUT="$(out_for "$M")"
+    # Pass only SNIPER_* settings (no per-mode outs, no switches), then this mode's folder.
+    ARGS=()
+    while IFS= read -r line; do ARGS+=("$line"); done < <(grep -E '^SNIPER_[A-Z0-9_]+=' "$RUN" | grep -v -E '^SNIPER_(ENABLED|MODE|OUT|OUT_[A-Z0-9_]+)=')
+    ARGS+=("SNIPER_OUT=$OUT")
+    LOGF="$M.log"; [ "$M" = paper ] && LOGF="paper.log"
+    # 9>&- : the sniper must not inherit our lock, or the next run would think we're still busy.
+    env "${ARGS[@]}" nohup ./sniper "$M" >> "$LOGF" 2>&1 9>&- &
+    set_kv "$STATE" "$KEY" "$WANT"
+    log "started sniper $M -> $OUT (pid $!) [$( [ -z "$PID" ] && echo 'was not running' || echo 'new build or settings')]"
+  fi
+done
 
 # --- 4. Report to GitHub every 15 min ------------------------------------------
 NOW=$(date +%s)
@@ -94,9 +106,16 @@ if [ $((NOW - LAST)) -ge $((REPORT_EVERY_MIN * 60)) ]; then
   if [ -z "$TOKEN" ]; then
     log "no GH_STATUS_TOKEN found (ARB_ENV=$ARB_ENV), skipping report"
   else
-    REPORT="$(./sniper paper-report "$OUT" 2>&1 | tail -40)"
-    TAIL="$(tail -5 paper.log 2>/dev/null)"
-    RUNNING_NOW="$(pgrep -f '^./sniper paper' >/dev/null && echo yes || echo NO)"
+    REPORT=""; TAIL=""; RUNNING_NOW=""
+    for M in $MODES; do
+      OUT="$(out_for "$M")"; LOGF="$M.log"; [ "$M" = paper ] && LOGF="paper.log"
+      R="$(./sniper "${M%-watch}-report" "$OUT" 2>&1 | tail -40)"
+      [ "$M" = paper ] && R="$(./sniper paper-report "$OUT" 2>&1 | tail -40)"
+      REPORT="$REPORT$R"$'\n\n'
+      TAIL="$TAIL--- $M"$'\n'"$(tail -4 "$LOGF" 2>/dev/null)"$'\n'
+      RUNNING_NOW="$RUNNING_NOW $M: $( [ -n "$(running_pid "$M")" ] && echo running || echo NOT-RUNNING )"
+    done
+    [ "$ENABLED" = "1" ] || RUNNING_NOW=" stopped by kill switch"
     ISSUE="$(kv "$CONF" SNIPER_ISSUE)"
     NEW_ISSUE="$(
       TOKEN="$TOKEN" REPO="$REPO" GH_API="${GH_API:-https://api.github.com}" ISSUE="$ISSUE" REPORT="$REPORT" TAIL="$TAIL" \
@@ -114,10 +133,10 @@ def api(method, path, body=None):
     with urllib.request.urlopen(req, timeout=20) as r:
         return json.loads(r.read() or b"null")
 title = "\U0001F3AF Sniper paper status (auto-updated every 15 min)"
-body = ("## Sniper: %s\n_Updated %s UTC. Paper only: no keys, no transactions._\n\n"
+body = ("## Sniper:%s\n_Updated %s UTC. Paper only: no keys, no transactions._\n\n"
         "### Scoreboard\n```\n%s\n```\n### Last log lines\n```\n%s\n```\n"
         "### Settings (deploy/run.env)\n```\n%s\n```\n### Build\n```\n%s\n```\n") % (
-    "running" if os.environ["RUNNING_NOW"] == "yes" else "NOT RUNNING",
+    os.environ["RUNNING_NOW"],
     time.strftime("%Y-%m-%d %H:%M", time.gmtime()), os.environ["REPORT"], os.environ["TAIL"],
     os.environ["RUNFILE"], os.environ["BUILD"])
 num = os.environ.get("ISSUE") or ""

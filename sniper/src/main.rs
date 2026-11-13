@@ -93,6 +93,21 @@ fn main() -> ExitCode {
             print!("{}", sniper::paper::report(&PathBuf::from(dir)));
             ExitCode::SUCCESS
         }
+        Some("feed-watch") => match sniper::feedwatch::run(sniper::feedwatch::Config::from_env()) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("feed-watch: {e}");
+                ExitCode::FAILURE
+            }
+        },
+        Some("feed-report") => {
+            let Some(dir) = args.get(1) else {
+                eprintln!("usage: sniper feed-report <dir>");
+                return ExitCode::FAILURE;
+            };
+            print!("{}", sniper::feedwatch::report(&PathBuf::from(dir)));
+            ExitCode::SUCCESS
+        }
         Some("rhc-probe") => match sniper::rhc::run(sniper::rhc::Config::from_env()) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
@@ -178,7 +193,7 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         _ => {
-            eprintln!("usage: sniper paper | sniper paper-report <dir> | sniper probe | sniper rhc-probe | sniper rhc-report <dir> | sniper scan | sniper sell-check <token> <BNB> | sniper curve-check <dir> | sniper report <dir> [--min-lead-ms N] [--burst-buys N] [--hurdle-pct X] [--json]");
+            eprintln!("usage: sniper paper | sniper paper-report <dir> | sniper feed-watch | sniper feed-report <dir> | sniper probe | sniper rhc-probe | sniper rhc-report <dir> | sniper scan | sniper sell-check <token> <BNB> | sniper curve-check <dir> | sniper report <dir> [--min-lead-ms N] [--burst-buys N] [--hurdle-pct X] [--json]");
             ExitCode::FAILURE
         }
     }
