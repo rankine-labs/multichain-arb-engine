@@ -1174,6 +1174,9 @@ fn wrong_fix_settings() {
     assert_eq!(cfg("FASTLANE_AHEAD_FAIL_WIDE", "tokens").fail_wide, WIDE_TOKENS);
     assert_eq!(cfg("FASTLANE_AHEAD_SILENT_UNSURE", "tokens").silent_unsure, SILENT_TOKENS);
     assert_eq!(cfg("FASTLANE_AHEAD_UNKNOWN_UNSURE", "tokens").unknown_unsure, UNK_TOKENS);
+    assert_eq!(cfg("FASTLANE_AHEAD_FAIL_WIDE", "pairs").fail_wide, WIDE_PAIRS);
+    assert_eq!(cfg("FASTLANE_AHEAD_SILENT_UNSURE", "pairs").silent_unsure, SILENT_PAIRS);
+    assert_eq!(cfg("FASTLANE_AHEAD_UNKNOWN_UNSURE", "pairs").unknown_unsure, UNK_PAIRS);
     assert_eq!(d.wide_hub, WIDE_HUB_DEFAULT);
     assert_eq!(cfg("FASTLANE_AHEAD_FAIL_WIDE_HUB", "8").wide_hub, 8);
 }

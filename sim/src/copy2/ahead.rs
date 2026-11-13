@@ -501,6 +501,9 @@ pub const WIDE_COINS: u8 = 4;
 /// guess found or named in its data (the same token's other pools: the
 /// sister pools an arbitrage bot trades between).
 pub const WIDE_TOKENS: u8 = 8;
+/// `pairs`: every pool of the same pair (ETH = WETH) as a pool the guess
+/// found (the sister pools of that pair on other exchanges).
+pub const WIDE_PAIRS: u8 = 16;
 /// FASTLANE_AHEAD_FAIL_WIDE_HUB default.
 pub const WIDE_HUB_DEFAULT: usize = 16;
 /// What `FASTLANE_AHEAD_FAIL_WIDE=on` means (set from the offline replay).
@@ -511,6 +514,8 @@ pub const SILENT_READS: u8 = 2;
 /// `tokens`: every pool holding a NON-hub coin its data names or that one
 /// of its target's learned pools holds.
 pub const SILENT_TOKENS: u8 = 4;
+/// `pairs`: the same-pair sister pools of the pools it read or names.
+pub const SILENT_PAIRS: u8 = 8;
 /// What `FASTLANE_AHEAD_SILENT_UNSURE=on` means.
 pub const SILENT_UNSURE_ON: u8 = SILENT_NAMED;
 /// FASTLANE_AHEAD_UNKNOWN_UNSURE parts (bits).
@@ -520,6 +525,9 @@ pub const UNK_ALL: u8 = 2;
 /// pools moved earlier in this block and of its target's learned pools (a
 /// back-running bot trades the sister pools of what just moved).
 pub const UNK_TOKENS: u8 = 4;
+/// `pairs`: the same-pair sister pools of the pools moved earlier in this
+/// block and of its target's learned pools.
+pub const UNK_PAIRS: u8 = 8;
 /// What `FASTLANE_AHEAD_UNKNOWN_UNSURE=on` means.
 pub const UNKNOWN_UNSURE_ON: u8 = UNK_MOVED;
 
@@ -541,9 +549,9 @@ pub fn mode_bits(v: Option<&str>, parts: &[(&str, u8)], on_bits: u8) -> u8 {
 }
 
 /// The part lists of the three Nov 12 settings (names -> bits).
-pub const FAIL_WIDE_PARTS: &[(&str, u8)] = &[("learned", WIDE_LEARNED), ("moved", WIDE_MOVED), ("coins", WIDE_COINS), ("tokens", WIDE_TOKENS)];
-pub const SILENT_PARTS: &[(&str, u8)] = &[("named", SILENT_NAMED), ("reads", SILENT_READS), ("tokens", SILENT_TOKENS)];
-pub const UNKNOWN_PARTS: &[(&str, u8)] = &[("moved", UNK_MOVED), ("all", UNK_ALL), ("tokens", UNK_TOKENS)];
+pub const FAIL_WIDE_PARTS: &[(&str, u8)] = &[("learned", WIDE_LEARNED), ("moved", WIDE_MOVED), ("coins", WIDE_COINS), ("tokens", WIDE_TOKENS), ("pairs", WIDE_PAIRS)];
+pub const SILENT_PARTS: &[(&str, u8)] = &[("named", SILENT_NAMED), ("reads", SILENT_READS), ("tokens", SILENT_TOKENS), ("pairs", SILENT_PAIRS)];
+pub const UNKNOWN_PARTS: &[(&str, u8)] = &[("moved", UNK_MOVED), ("all", UNK_ALL), ("tokens", UNK_TOKENS), ("pairs", UNK_PAIRS)];
 
 impl Default for AheadCfg {
     fn default() -> Self {
@@ -759,6 +767,11 @@ pub struct PoolSet {
     /// looked for in call data): the OTHER coin -> keys. A transaction that
     /// pays ETH (value > 0) and names that coin may trade such a pool.
     native_by_coin: HashMap<Address, Vec<String>>,
+    /// Nov 12: the wrapped-ETH coin, worked out from our pools: the coin X
+    /// that most often pairs (X / Y pools) with the other coin Y of a
+    /// native-ETH pool (ETH / Y). An ETH / Y pool and a WETH / Y pool are
+    /// the same pair for the `pairs` parts.
+    eth_twin: Option<Address>,
     /// Pools copy 2 itself can't vouch for right now (loading / unsure):
     /// always listed unsure in the predicted tip.
     pub not_ready: HashSet<String>,
@@ -911,6 +924,19 @@ impl PoolSet {
         }
         // A V4 PoolManager as a target = may touch our V4 pools.
         s.route.names.extend(pms.iter().copied());
+        // Nov 12: wrapped ETH = the coin pairing most often with the other
+        // coins of native-ETH pools (ties: the lowest address, stable).
+        let mut twin: HashMap<Address, usize> = HashMap::new();
+        for y in s.native_by_coin.keys() {
+            for (a, b) in s.by_pair.keys() {
+                if a == y {
+                    *twin.entry(*b).or_default() += 1;
+                } else if b == y {
+                    *twin.entry(*a).or_default() += 1;
+                }
+            }
+        }
+        s.eth_twin = twin.into_iter().max_by(|x, y| x.1.cmp(&y.1).then(y.0.cmp(&x.0))).map(|x| x.0);
         // The fast name index: the same things the filter looks for.
         for a in s.by_contract.keys() {
             s.idx.add_addr(*a, ROLE_POOL);
@@ -1122,6 +1148,39 @@ impl PoolSet {
                             out.push(x.clone());
                         }
                     }
+                }
+            }
+        }
+        out
+    }
+
+    /// Nov 12 `pairs` parts: every pool of the SAME pair as a pool in
+    /// `keys` (an ETH / Y pool and a WETH / Y pool count as the same pair).
+    fn pair_sisters(&self, keys: &[String]) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let twin = self.eth_twin.unwrap_or(Address::ZERO);
+        let push = |v: Option<&Vec<String>>, out: &mut Vec<String>| {
+            for x in v.into_iter().flatten() {
+                if !out.contains(x) {
+                    out.push(x.clone());
+                }
+            }
+        };
+        for k in keys {
+            let Some((a, b)) = self.coins_of.get(k).copied() else { continue };
+            // ETH counts as wrapped ETH.
+            let a = if a.is_zero() { twin } else { a };
+            let b = if b.is_zero() { twin } else { b };
+            if a.is_zero() || b.is_zero() {
+                continue;
+            }
+            let p = if a < b { (a, b) } else { (b, a) };
+            push(self.by_pair.get(&p), &mut out);
+            if !twin.is_zero() {
+                if a == twin {
+                    push(self.native_by_coin.get(&b), &mut out);
+                } else if b == twin {
+                    push(self.native_by_coin.get(&a), &mut out);
                 }
             }
         }
@@ -2770,6 +2829,7 @@ impl Ahead {
             sm["poolCoins"] = json!([format!("{c0:#x}"), format!("{c1:#x}")]);
             sm["poolV4"] = json!(matches!(self.pools.places.get(k), Some(Place::V4(..))));
             sm["poolCoinPools"] = json!([self.pools.coin_pools(c0), self.pools.coin_pools(c1)]);
+            sm["ethTwin"] = json!(self.pools.eth_twin.map(|a| format!("{a:#x}")));
         }
         if kind != cause {
             sm["cause"] = json!(cause);
@@ -2788,6 +2848,10 @@ impl Ahead {
             }
             if !n.pools.is_empty() {
                 sm["txPools"] = json!(n.pools.iter().take(4).collect::<Vec<_>>());
+                // Nov 12: those pools' coins (what the guess stood for) and
+                // whether the wrong pool is a same-pair sister of one.
+                sm["txPoolCoins"] = json!(n.pools.iter().take(4).map(|x| self.pools.coins_of.get(x).map(|(a, b)| format!("{a:#x}/{b:#x}"))).collect::<Vec<_>>());
+                sm["pairSister"] = json!(self.pools.pair_sisters(&n.pools).iter().any(|x| x == k));
             }
         }
         // Our transactions of this block that ran on / marked this pool.
@@ -3091,6 +3155,11 @@ impl Ahead {
                 add(&k, &mut out);
             }
         }
+        if self.cfg.fail_wide & WIDE_PAIRS != 0 {
+            for k in pools.pair_sisters(hit) {
+                add(&k, &mut out);
+            }
+        }
         out
     }
 
@@ -3122,6 +3191,17 @@ impl Ahead {
                 src.extend(x.1.iter().cloned());
             }
             for k in pools.token_sisters(&src, &Named::default(), self.cfg.wide_hub) {
+                if !out.contains(&k) {
+                    out.push(k);
+                }
+            }
+        }
+        if self.cfg.unknown_unsure & UNK_PAIRS != 0 {
+            let mut src: Vec<String> = moved_msg.to_vec();
+            if let Some(x) = to.and_then(|a| self.touchers.get(&a)) {
+                src.extend(x.1.iter().cloned());
+            }
+            for k in pools.pair_sisters(&src) {
                 if !out.contains(&k) {
                     out.push(k);
                 }
@@ -3454,6 +3534,21 @@ impl Ahead {
                         if self.cfg.silent_unsure & SILENT_TOKENS != 0 {
                             let learned: Vec<String> = t.to.and_then(|a| self.touchers.get(&a)).map(|x| x.1.clone()).unwrap_or_default();
                             for k in pools.token_sisters(&learned, &named_now, self.cfg.wide_hub) {
+                                if !silent.contains(&k) {
+                                    silent.push(k);
+                                }
+                            }
+                        }
+                        if self.cfg.silent_unsure & SILENT_PAIRS != 0 {
+                            let mut src: Vec<String> = pools.named_direct(t.to, &named_now);
+                            for (a, sl) in &kept.reads {
+                                if let Some(k) = pools.place_key(a, sl) {
+                                    if !src.contains(k) {
+                                        src.push(k.clone());
+                                    }
+                                }
+                            }
+                            for k in pools.pair_sisters(&src) {
                                 if !silent.contains(&k) {
                                     silent.push(k);
                                 }
