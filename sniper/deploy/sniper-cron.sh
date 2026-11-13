@@ -70,6 +70,13 @@ out_for() { local K="SNIPER_OUT_$(echo "$1" | tr 'a-z-' 'A-Z_')"; local O="$(kv 
 running_pid() { pgrep -f "^./sniper $1\$" | head -1 || true; }
 stop_mode() { pkill -f "^./sniper $1\$" 2>/dev/null && sleep 1; true; }
 
+# Old one-off probes that open their OWN sequencer-feed connection must never
+# linger: Robinhood's feed blocks a server for an hour after repeated rejected
+# connections, and that also cuts off the arb bot's feed on the same server.
+for OLD in rhc-probe probe scan; do
+  if pgrep -f "^./sniper $OLD" >/dev/null; then pkill -f "^./sniper $OLD"; log "stopped leftover sniper $OLD (shares the feed with the arb bot)"; fi
+done
+
 # What should be running: this build + these settings.
 WANT="$(git rev-parse HEAD):$(sha256sum "$RUN" | cut -c1-16)"
 
