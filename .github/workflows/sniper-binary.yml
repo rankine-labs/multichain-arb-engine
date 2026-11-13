@@ -78,6 +78,8 @@ jobs:
           mkdir out
           cp art/sniper.exe/sniper.exe out/
           cp art/sniper/sniper out/ && chmod 755 out/sniper
+          # Server auto-run scripts + settings (see sniper/deploy/sniper-cron.sh)
+          cp -r sniper/deploy out/deploy
           (cd out && sha256sum sniper.exe sniper > SHA256SUMS)
           {
             echo "source_commit=$(git rev-parse HEAD)"

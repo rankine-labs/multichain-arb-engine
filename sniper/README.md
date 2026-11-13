@@ -130,3 +130,16 @@ that refuses full pending txs.
 normal token (PASS), a 5% tax token (REJECT) and an unsellable token
 (REJECT). It needs `anvil` on PATH or `ANVIL_BIN=/path/to/anvil`, and
 skips itself otherwise.
+
+## Server auto-run (no terminal needed)
+
+`sniper/deploy/` is published with every build to the `sniper-bin` branch.
+One-time setup on the server:
+
+    cd ~/sniper-bin && git fetch -q origin && git reset -q --hard origin/sniper-bin && bash deploy/install-sniper-cron.sh
+
+After that, cron runs `deploy/sniper-cron.sh` every 2 minutes: it pulls new
+builds, applies `deploy/run.env` (settings, `SNIPER_ENABLED=0` = kill switch),
+keeps the paper sniper running, and every 15 minutes posts the scoreboard to
+the GitHub issue "Sniper paper status". Paper only; never touches the arb bot
+(it only reads `GH_STATUS_TOKEN` from the arb bot's `.env` to post the issue).
