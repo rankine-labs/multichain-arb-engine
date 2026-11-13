@@ -1083,3 +1083,92 @@ fn unsure_keep_settings() {
     assert!(!cfg("FASTLANE_AHEAD_UNSURE_KEEP", "off").unsure_keep);
     assert!(!AheadCfg::default().unsure_keep);
 }
+
+// ---------------------------------------------------------------------------
+// Nov 12: "wrong when sure" fixes (FAIL_WIDE, SILENT_UNSURE, UNKNOWN_UNSURE,
+// FILTER_NATIVE_ANY, FILTER_ONE_COIN). Offline Oct 31 replay: 5 sure-but-wrong
+// pools = 3 failed runs whose guess missed the pool, 1 run that moved
+// nothing, 1 transaction with an unknown effect.
+// ---------------------------------------------------------------------------
+
+/// A 32-byte word holding an address (how call data names a pool).
+fn addr_word(a: Address) -> Vec<u8> {
+    let mut v = vec![0u8; 12];
+    v.extend_from_slice(a.as_slice());
+    v
+}
+
+/// An address our copy holds nothing for: a call to it can't be run.
+fn ghost() -> Address {
+    addr(0x9999)
+}
+
+/// SILENT_UNSURE: a run that finished but moved none of our pools (DEP just
+/// stores the word) is not trusted to have moved nothing: the pool its data
+/// names is marked unsure. Off = sure (the old rule).
+#[test]
+fn a_run_that_moved_nothing_marks_the_pools_it_names() {
+    use arbsim::copy2::ahead::SILENT_NAMED;
+    for silent in [0u8, SILENT_NAMED] {
+        let mut a = ahead_on(AheadCfg { silent_unsure: silent, ..AheadCfg::default() }, copy_at(100, 7));
+        a.on_feed_message(msg(11, &[stx(0, dep(), addr_word(pool()))]));
+        let tip = a.tip().expect("a tip");
+        if silent != 0 {
+            assert_eq!(tip.unsure_pools, vec![key(pool())], "{}", a.total.json_with(false));
+            assert_eq!(a.total.silent_runs, 1);
+        } else {
+            assert!(tip.unsure_pools.is_empty(), "{:?}", tip.unsure_pools);
+            assert_eq!(a.total.silent_runs, 0);
+        }
+    }
+}
+
+/// UNKNOWN_UNSURE: a transaction we can't run and that names nothing of
+/// ours (unknown effect, predicted past) marks: off = nothing; `moved` =
+/// the pools moved earlier in the block; `all` = every pool.
+#[test]
+fn an_unknown_effect_transaction_marks_pools_unsure() {
+    use arbsim::copy2::ahead::{UNK_ALL, UNK_MOVED};
+    let cases: [(u8, Vec<String>); 3] = [(0, vec![]), (UNK_MOVED, vec![key(pool())]), (UNK_ALL, vec![key(pool()), key(pool2())])];
+    for (bits, want) in cases {
+        let mut a = ahead_on(AheadCfg { run_all: true, unknown_continue: true, unknown_unsure: bits, ..AheadCfg::default() }, copy_at(100, 7));
+        a.on_feed_message(msg(11, &[stx(0, pool(), w(5)), stx(1, ghost(), vec![])]));
+        let tip = a.tip().expect("a tip");
+        assert_eq!(tip.unsure_pools, want, "bits {bits}: {}", a.total.json_with(false));
+        assert_eq!(a.total.unknown_continued, 1);
+    }
+}
+
+/// FAIL_WIDE `moved`: a failed run naming POOL marks POOL (the old guess)
+/// and, widened, POOL2 that an earlier transaction of the block moved.
+#[test]
+fn a_failed_run_widened_marks_pools_moved_earlier_in_the_block() {
+    use arbsim::copy2::ahead::WIDE_MOVED;
+    for bits in [0u8, WIDE_MOVED] {
+        let mut a = ahead_on(AheadCfg { fail_wide: bits, ..AheadCfg::default() }, copy_at(100, 7));
+        a.on_feed_message(msg(11, &[stx(0, pool2(), w(1)), stx(1, ghost(), addr_word(pool()))]));
+        let tip = a.tip().expect("a tip");
+        let want = if bits == 0 { vec![key(pool())] } else { vec![key(pool()), key(pool2())] };
+        assert_eq!(tip.unsure_pools, want, "bits {bits}: {}", a.total.json_with(false));
+        assert_eq!(a.total.wide_runs, u64::from(bits != 0));
+    }
+}
+
+/// Settings: all off unless set; part lists and `on`.
+#[test]
+fn wrong_fix_settings() {
+    use arbsim::copy2::ahead::*;
+    let cfg = |k: &str, v: &str| AheadCfg::from_lookup(|x| (x == k).then(|| v.to_string()), 0);
+    let d = cfg("", "");
+    assert_eq!((d.fail_wide, d.silent_unsure, d.unknown_unsure, d.filter_native_any, d.filter_one_coin), (0, 0, 0, false, false));
+    assert_eq!(cfg("FASTLANE_AHEAD_FAIL_WIDE", "learned,coins").fail_wide, WIDE_LEARNED | WIDE_COINS);
+    assert_eq!(cfg("FASTLANE_AHEAD_FAIL_WIDE", "on").fail_wide, FAIL_WIDE_ON);
+    assert_eq!(cfg("FASTLANE_AHEAD_FAIL_WIDE", "off").fail_wide, 0);
+    assert_eq!(cfg("FASTLANE_AHEAD_SILENT_UNSURE", "named,reads").silent_unsure, SILENT_NAMED | SILENT_READS);
+    assert_eq!(cfg("FASTLANE_AHEAD_SILENT_UNSURE", "on").silent_unsure, SILENT_UNSURE_ON);
+    assert_eq!(cfg("FASTLANE_AHEAD_UNKNOWN_UNSURE", "all").unknown_unsure, UNK_ALL);
+    assert_eq!(cfg("FASTLANE_AHEAD_UNKNOWN_UNSURE", "on").unknown_unsure, UNKNOWN_UNSURE_ON);
+    assert!(cfg("FASTLANE_AHEAD_FILTER_NATIVE_ANY", "on").filter_native_any);
+    assert!(cfg("FASTLANE_AHEAD_FILTER_ONE_COIN", "on").filter_one_coin);
+    assert_eq!(mode_bits(Some("nonsense"), FAIL_WIDE_PARTS, FAIL_WIDE_ON), 0);
+}
