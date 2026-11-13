@@ -516,6 +516,10 @@ pub const SILENT_UNSURE_ON: u8 = SILENT_NAMED;
 /// FASTLANE_AHEAD_UNKNOWN_UNSURE parts (bits).
 pub const UNK_MOVED: u8 = 1;
 pub const UNK_ALL: u8 = 2;
+/// `tokens`: the token sister pools (non-hub coins, see wide_hub) of the
+/// pools moved earlier in this block and of its target's learned pools (a
+/// back-running bot trades the sister pools of what just moved).
+pub const UNK_TOKENS: u8 = 4;
 /// What `FASTLANE_AHEAD_UNKNOWN_UNSURE=on` means.
 pub const UNKNOWN_UNSURE_ON: u8 = UNK_MOVED;
 
@@ -539,7 +543,7 @@ pub fn mode_bits(v: Option<&str>, parts: &[(&str, u8)], on_bits: u8) -> u8 {
 /// The part lists of the three Nov 12 settings (names -> bits).
 pub const FAIL_WIDE_PARTS: &[(&str, u8)] = &[("learned", WIDE_LEARNED), ("moved", WIDE_MOVED), ("coins", WIDE_COINS), ("tokens", WIDE_TOKENS)];
 pub const SILENT_PARTS: &[(&str, u8)] = &[("named", SILENT_NAMED), ("reads", SILENT_READS), ("tokens", SILENT_TOKENS)];
-pub const UNKNOWN_PARTS: &[(&str, u8)] = &[("moved", UNK_MOVED), ("all", UNK_ALL)];
+pub const UNKNOWN_PARTS: &[(&str, u8)] = &[("moved", UNK_MOVED), ("all", UNK_ALL), ("tokens", UNK_TOKENS)];
 
 impl Default for AheadCfg {
     fn default() -> Self {
@@ -3109,6 +3113,17 @@ impl Ahead {
                     if !out.contains(k) {
                         out.push(k.clone());
                     }
+                }
+            }
+        }
+        if self.cfg.unknown_unsure & UNK_TOKENS != 0 {
+            let mut src: Vec<String> = moved_msg.to_vec();
+            if let Some(x) = to.and_then(|a| self.touchers.get(&a)) {
+                src.extend(x.1.iter().cloned());
+            }
+            for k in pools.token_sisters(&src, &Named::default(), self.cfg.wide_hub) {
+                if !out.contains(&k) {
+                    out.push(k);
                 }
             }
         }
