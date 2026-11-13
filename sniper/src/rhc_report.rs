@@ -37,11 +37,15 @@ pub struct Opts {
     /// A rush is counted over this many seconds (Robinhood makes a block
     /// about every 0.1 s, so one block is too short to see a crowd).
     pub window_s: f64,
+    /// "First big buy" signal: one single buy that lifts the price by at
+    /// least this much. With the copy we see it the moment it's ordered and
+    /// can get in before the crowd that follows.
+    pub jump_pct: f64,
 }
 
 impl Default for Opts {
     fn default() -> Self {
-        Opts { offset: 0, rush_buys: 3, min_rise_pct: 2.0, window_s: 1.0 }
+        Opts { offset: 0, rush_buys: 3, min_rise_pct: 2.0, window_s: 1.0, jump_pct: 3.0 }
     }
 }
 
@@ -185,6 +189,33 @@ pub fn find_rushes(swaps: &[Swap], o: &Opts, window: u64) -> (Vec<Rush>, HashMap
     (rushes, paths)
 }
 
+/// "First big buy": a single swap that lifts the token price >= jump_pct
+/// from the swap just before it. Entry is right after that block. After a
+/// jump the pool is quiet for one window (no double counting).
+pub fn find_jumps(swaps: &[Swap], o: &Opts, window: u64) -> Vec<Rush> {
+    let mut by_pool: HashMap<&str, Vec<&Swap>> = HashMap::new();
+    for s in swaps {
+        by_pool.entry(&s.pool).or_default().push(s);
+    }
+    let mut out = Vec::new();
+    for (pool, v) in by_pool {
+        let mut quiet_until = 0u64;
+        for w in v.windows(2) {
+            let (a, b) = (w[0], w[1]);
+            if b.block < quiet_until || a.price <= 0.0 {
+                continue;
+            }
+            if 100.0 * (b.price / a.price - 1.0) >= o.jump_pct {
+                // Enter after the whole block the jump landed in.
+                out.push(Rush { pool: pool.to_string(), token: b.token.clone(), base: b.base.clone(), block: b.block, fee: b.fee, size_1pct: b.size_1pct });
+                quiet_until = b.block + window.max(1);
+            }
+        }
+    }
+    out.sort_by_key(|r| r.block);
+    out
+}
+
 /// Simulate one trade. Returns net return (0.01 = +1%) after fees both ways.
 /// `delay` = blocks after the rush before we're in (0 = right after it).
 pub fn simulate(path: &PricePath, r: &Rush, delay: u64, tp: f64, sl: f64, horizon: u64) -> Option<f64> {
@@ -271,25 +302,30 @@ pub fn build(dir: &Path, o: &Opts) -> Value {
     let tokens: HashSet<&str> = swaps.iter().map(|s| s.token.as_str()).collect();
     let grid = [(0.03, 0.03), (0.05, 0.05), (0.10, 0.05), (0.10, 0.10)];
     let horizons_s = [2.0, 10.0, 30.0];
-    let mut sims = Vec::new();
-    // Entry timing: right after the rush block (we're first), or 0.3 s / 1 s
-    // later (rivals were faster; our own reaction is 60-120 ms per the arb
-    // bot's notes, rivals timed at 110-580 ms).
-    for (timing, delay_ms) in [("first", 0.0), ("+0.3s", 300.0), ("+1s", 1000.0)] {
-        let delay = (delay_ms / block_ms.max(1.0)).round() as u64;
-        for &hs in &horizons_s {
-            let h = ((hs * 1000.0 / block_ms.max(1.0)).round() as u64).max(1);
-            for &(tp, sl) in &grid {
-                let res: Vec<f64> = rushes.iter().filter_map(|r| simulate(&paths[&r.pool], r, delay, tp, sl, h)).collect();
-                let mut s = stats(res);
-                s["timing"] = json!(timing);
-                s["horizon_s"] = json!(hs);
-                s["tp_pct"] = json!(tp * 100.0);
-                s["sl_pct"] = json!(sl * 100.0);
-                sims.push(s);
+    let run_sims = |signals: &[Rush]| -> Vec<Value> {
+        let mut sims = Vec::new();
+        // Entry timing: right after the signal block (we're first, as the
+        // copy allows), or 0.3 s / 1 s later (rivals were faster).
+        for (timing, delay_ms) in [("first", 0.0), ("+0.3s", 300.0), ("+1s", 1000.0)] {
+            let delay = (delay_ms / block_ms.max(1.0)).round() as u64;
+            for &hs in &horizons_s {
+                let h = ((hs * 1000.0 / block_ms.max(1.0)).round() as u64).max(1);
+                for &(tp, sl) in &grid {
+                    let res: Vec<f64> = signals.iter().filter_map(|r| simulate(&paths[&r.pool], r, delay, tp, sl, h)).collect();
+                    let mut st = stats(res);
+                    st["timing"] = json!(timing);
+                    st["horizon_s"] = json!(hs);
+                    st["tp_pct"] = json!(tp * 100.0);
+                    st["sl_pct"] = json!(sl * 100.0);
+                    sims.push(st);
+                }
             }
         }
-    }
+        sims
+    };
+    let sims = run_sims(&rushes);
+    let jumps = find_jumps(&swaps, o, window);
+    let jump_sims = run_sims(&jumps);
     // How much money a rush can take: base amount that moves the price 1%.
     let mut depth = serde_json::Map::new();
     for base in ["WETH", "ETH", "USDG"] {
@@ -320,6 +356,8 @@ pub fn build(dir: &Path, o: &Opts) -> Value {
                    "settings": {"rush_buys": o.rush_buys, "min_rise_pct": o.min_rise_pct, "window_s": o.window_s, "window_blocks": window},
                    "size_for_1pct_move": depth},
         "fast_trades": sims,
+        "jumps": {"count": jumps.len(), "per_hour": if hours > 0.0 { jumps.len() as f64 / hours } else { 0.0 }, "jump_pct": o.jump_pct},
+        "fast_trades_after_jump": jump_sims,
     })
 }
 
@@ -364,7 +402,21 @@ pub fn render(r: &Value) -> String {
         }
     }
     s += "3. FAST TRADES after rushes (fees both ways included; avg range = rough 95% range)\n";
-    if let Some(a) = r["fast_trades"].as_array() {
+    s += &table(&r["fast_trades"]);
+    s += &format!(
+        "\n4. FIRST BIG BUY: {} single buys lifting the price {}%+ ({}/hour). Trades entering right after it:\n",
+        r["jumps"]["count"],
+        f(&r["jumps"]["jump_pct"]),
+        f(&r["jumps"]["per_hour"])
+    );
+    s += &table(&r["fast_trades_after_jump"]);
+    s
+}
+
+fn table(v: &Value) -> String {
+    let f = |v: &Value| v.as_f64().map(|x| format!("{x:.1}")).unwrap_or_else(|| "n/a".into());
+    let mut s = String::new();
+    if let Some(a) = v.as_array() {
         for t in a {
             if t["n"] == 0 {
                 continue;

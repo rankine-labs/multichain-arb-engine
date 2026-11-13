@@ -6,6 +6,7 @@
 //   fourmeme.rs  Four.meme contract addresses, event ids, log decoding
 //   ws.rs        websocket eth_subscribe client with reconnects
 //   matcher.rs   joins pending sightings with confirmed Four.meme trades
+//   paper.rs     Robinhood paper trader (real quotes, no money)
 //   probe.rs     the measurement run (threads + JSONL output)
 //   registry.rs  live token list + burst / creator-dump / graduation signals
 //   scan.rs      the live read-only scanner command
@@ -18,6 +19,7 @@ pub mod calibrate;
 pub mod curve;
 pub mod fourmeme;
 pub mod matcher;
+pub mod paper;
 pub mod probe;
 pub mod registry;
 pub mod report;

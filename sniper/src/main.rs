@@ -7,6 +7,8 @@
 //                                   see src/scan.rs)
 //   sniper sell-check <token> <BNB> simulate our buy + sell of a token
 //                                   (env: SNIPER_RPC, SNIPER_WALLET)
+//   sniper paper                    Robinhood paper trader (no money; env: src/paper.rs)
+//   sniper paper-report <dir>       its results
 //   sniper rhc-probe                Robinhood Chain speed test (read-only;
 //                                   env: see src/rhc.rs)
 //   sniper rhc-report <dir>         its results (head start, rushes, trades)
@@ -76,6 +78,21 @@ fn main() -> ExitCode {
                 }
             }
         }
+        Some("paper") => match sniper::paper::run(sniper::paper::Config::from_env()) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("paper: {e}");
+                ExitCode::FAILURE
+            }
+        },
+        Some("paper-report") => {
+            let Some(dir) = args.get(1) else {
+                eprintln!("usage: sniper paper-report <dir>");
+                return ExitCode::FAILURE;
+            };
+            print!("{}", sniper::paper::report(&PathBuf::from(dir)));
+            ExitCode::SUCCESS
+        }
         Some("rhc-probe") => match sniper::rhc::run(sniper::rhc::Config::from_env()) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
@@ -85,7 +102,7 @@ fn main() -> ExitCode {
         },
         Some("rhc-report") => {
             let Some(dir) = args.get(1) else {
-                eprintln!("usage: sniper rhc-report <dir> [--rush-buys N] [--min-rise-pct X] [--window-s S] [--offset N]");
+                eprintln!("usage: sniper rhc-report <dir> [--rush-buys N] [--min-rise-pct X] [--window-s S] [--jump-pct X] [--offset N]");
                 return ExitCode::FAILURE;
             };
             let mut o = sniper::rhc_report::Opts::default();
@@ -97,6 +114,7 @@ fn main() -> ExitCode {
                     ("--min-rise-pct", Some(v)) => o.min_rise_pct = v,
                     ("--offset", Some(v)) => o.offset = v as i64,
                     ("--window-s", Some(v)) => o.window_s = v,
+                    ("--jump-pct", Some(v)) => o.jump_pct = v,
                     (a, _) => {
                         eprintln!("unknown or incomplete option: {a}");
                         return ExitCode::FAILURE;
@@ -160,7 +178,7 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         _ => {
-            eprintln!("usage: sniper probe | sniper rhc-probe | sniper rhc-report <dir> | sniper scan | sniper sell-check <token> <BNB> | sniper curve-check <dir> | sniper report <dir> [--min-lead-ms N] [--burst-buys N] [--hurdle-pct X] [--json]");
+            eprintln!("usage: sniper paper | sniper paper-report <dir> | sniper probe | sniper rhc-probe | sniper rhc-report <dir> | sniper scan | sniper sell-check <token> <BNB> | sniper curve-check <dir> | sniper report <dir> [--min-lead-ms N] [--burst-buys N] [--hurdle-pct X] [--json]");
             ExitCode::FAILURE
         }
     }
