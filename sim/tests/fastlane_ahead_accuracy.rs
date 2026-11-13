@@ -1171,4 +1171,8 @@ fn wrong_fix_settings() {
     assert!(cfg("FASTLANE_AHEAD_FILTER_NATIVE_ANY", "on").filter_native_any);
     assert!(cfg("FASTLANE_AHEAD_FILTER_ONE_COIN", "on").filter_one_coin);
     assert_eq!(mode_bits(Some("nonsense"), FAIL_WIDE_PARTS, FAIL_WIDE_ON), 0);
+    assert_eq!(cfg("FASTLANE_AHEAD_FAIL_WIDE", "tokens").fail_wide, WIDE_TOKENS);
+    assert_eq!(cfg("FASTLANE_AHEAD_SILENT_UNSURE", "tokens").silent_unsure, SILENT_TOKENS);
+    assert_eq!(d.wide_hub, WIDE_HUB_DEFAULT);
+    assert_eq!(cfg("FASTLANE_AHEAD_FAIL_WIDE_HUB", "8").wide_hub, 8);
 }

@@ -487,17 +487,30 @@ pub struct AheadCfg {
     /// picks a transaction whose data names ANY coin of our pools (one coin
     /// is enough; before: a pool, a V4 id or both coins of a pair).
     pub filter_one_coin: bool,
+    /// FASTLANE_AHEAD_FAIL_WIDE_HUB [16] (Nov 12): a coin held by more than
+    /// this many of our pools is a "hub" (WETH, a stablecoin): the `tokens`
+    /// parts below never spread through it (that would be every route).
+    pub wide_hub: usize,
 }
 
 /// FASTLANE_AHEAD_FAIL_WIDE parts (bits).
 pub const WIDE_LEARNED: u8 = 1;
 pub const WIDE_MOVED: u8 = 2;
 pub const WIDE_COINS: u8 = 4;
+/// `tokens`: every pool holding a NON-hub coin (see wide_hub) of a pool the
+/// guess found or named in its data (the same token's other pools: the
+/// sister pools an arbitrage bot trades between).
+pub const WIDE_TOKENS: u8 = 8;
+/// FASTLANE_AHEAD_FAIL_WIDE_HUB default.
+pub const WIDE_HUB_DEFAULT: usize = 16;
 /// What `FASTLANE_AHEAD_FAIL_WIDE=on` means (set from the offline replay).
 pub const FAIL_WIDE_ON: u8 = WIDE_LEARNED | WIDE_MOVED;
 /// FASTLANE_AHEAD_SILENT_UNSURE parts (bits).
 pub const SILENT_NAMED: u8 = 1;
 pub const SILENT_READS: u8 = 2;
+/// `tokens`: every pool holding a NON-hub coin its data names or that one
+/// of its target's learned pools holds.
+pub const SILENT_TOKENS: u8 = 4;
 /// What `FASTLANE_AHEAD_SILENT_UNSURE=on` means.
 pub const SILENT_UNSURE_ON: u8 = SILENT_NAMED;
 /// FASTLANE_AHEAD_UNKNOWN_UNSURE parts (bits).
@@ -524,13 +537,13 @@ pub fn mode_bits(v: Option<&str>, parts: &[(&str, u8)], on_bits: u8) -> u8 {
 }
 
 /// The part lists of the three Nov 12 settings (names -> bits).
-pub const FAIL_WIDE_PARTS: &[(&str, u8)] = &[("learned", WIDE_LEARNED), ("moved", WIDE_MOVED), ("coins", WIDE_COINS)];
-pub const SILENT_PARTS: &[(&str, u8)] = &[("named", SILENT_NAMED), ("reads", SILENT_READS)];
+pub const FAIL_WIDE_PARTS: &[(&str, u8)] = &[("learned", WIDE_LEARNED), ("moved", WIDE_MOVED), ("coins", WIDE_COINS), ("tokens", WIDE_TOKENS)];
+pub const SILENT_PARTS: &[(&str, u8)] = &[("named", SILENT_NAMED), ("reads", SILENT_READS), ("tokens", SILENT_TOKENS)];
 pub const UNKNOWN_PARTS: &[(&str, u8)] = &[("moved", UNK_MOVED), ("all", UNK_ALL)];
 
 impl Default for AheadCfg {
     fn default() -> Self {
-        AheadCfg { max_blocks: 32, run_all: false, max_txs: 256, max_touchers: 4096, l2_offset: 0, trust_sender_funds: false, msg_budget_us: 10_000, routes_only: true, compare_delay: 0, revert_unsure: true, exact_revert_sure: false, unknown_continue: false, keeper: false, keep_pick: true, budget_cpu: false, lazy_rebase: false, kept_rebuild_once: false, need_keeper: false, thin_pending: true, horizon: false, hz_notes: false, narrow_unsure: false, diag: false, wrong_guard_blocks: 0, unsure_keep: false, fail_wide: 0, silent_unsure: 0, unknown_unsure: 0, filter_native_any: false, filter_one_coin: false }
+        AheadCfg { max_blocks: 32, run_all: false, max_txs: 256, max_touchers: 4096, l2_offset: 0, trust_sender_funds: false, msg_budget_us: 10_000, routes_only: true, compare_delay: 0, revert_unsure: true, exact_revert_sure: false, unknown_continue: false, keeper: false, keep_pick: true, budget_cpu: false, lazy_rebase: false, kept_rebuild_once: false, need_keeper: false, thin_pending: true, horizon: false, hz_notes: false, narrow_unsure: false, diag: false, wrong_guard_blocks: 0, unsure_keep: false, fail_wide: 0, silent_unsure: 0, unknown_unsure: 0, filter_native_any: false, filter_one_coin: false, wide_hub: WIDE_HUB_DEFAULT }
     }
 }
 
@@ -688,6 +701,7 @@ impl AheadCfg {
             unknown_unsure: mode_bits(get("FASTLANE_AHEAD_UNKNOWN_UNSURE").as_deref(), UNKNOWN_PARTS, UNKNOWN_UNSURE_ON),
             filter_native_any: on_off(get("FASTLANE_AHEAD_FILTER_NATIVE_ANY").as_deref()).unwrap_or(false),
             filter_one_coin: on_off(get("FASTLANE_AHEAD_FILTER_ONE_COIN").as_deref()).unwrap_or(false),
+            wide_hub: num("FASTLANE_AHEAD_FAIL_WIDE_HUB").filter(|v| *v >= 1 && *v <= 100_000).unwrap_or(WIDE_HUB_DEFAULT),
         }
     }
 }
@@ -1104,6 +1118,41 @@ impl PoolSet {
                             out.push(x.clone());
                         }
                     }
+                }
+            }
+        }
+        out
+    }
+
+    /// How many of our pools hold coin `c` (plain + native-ETH pools).
+    fn coin_pools(&self, c: &Address) -> usize {
+        self.by_coin.get(c).map_or(0, |v| v.len()) + self.native_by_coin.get(c).map_or(0, |v| v.len())
+    }
+
+    /// FAIL_WIDE / SILENT_UNSURE `tokens`: every pool holding a NON-hub coin
+    /// (held by at most `hub` of our pools) of a pool in `keys` or named in
+    /// the data `n`: the token's sister pools.
+    fn token_sisters(&self, keys: &[String], n: &Named, hub: usize) -> Vec<String> {
+        let mut coins: Vec<Address> = Vec::new();
+        for k in keys {
+            if let Some((a, b)) = self.coins_of.get(k) {
+                for c in [*a, *b] {
+                    if !c.is_zero() && !coins.contains(&c) {
+                        coins.push(c);
+                    }
+                }
+            }
+        }
+        for c in self.idx.coins(n) {
+            if !coins.contains(c) {
+                coins.push(*c);
+            }
+        }
+        let mut out: Vec<String> = Vec::new();
+        for c in coins.iter().filter(|c| self.coin_pools(c) <= hub) {
+            for x in self.by_coin.get(c).into_iter().chain(self.native_by_coin.get(c)).flatten() {
+                if !out.contains(x) {
+                    out.push(x.clone());
                 }
             }
         }
@@ -2716,6 +2765,7 @@ impl Ahead {
         if let Some((c0, c1)) = self.pools.coins_of.get(k) {
             sm["poolCoins"] = json!([format!("{c0:#x}"), format!("{c1:#x}")]);
             sm["poolV4"] = json!(matches!(self.pools.places.get(k), Some(Place::V4(..))));
+            sm["poolCoinPools"] = json!([self.pools.coin_pools(c0), self.pools.coin_pools(c1)]);
         }
         if kind != cause {
             sm["cause"] = json!(cause);
@@ -3030,6 +3080,11 @@ impl Ahead {
         if self.cfg.fail_wide & WIDE_COINS != 0 {
             for k in pools.sharing_coins_of(hit).iter().chain(pools.sharing_named_coins(named_now).iter()) {
                 add(k, &mut out);
+            }
+        }
+        if self.cfg.fail_wide & WIDE_TOKENS != 0 {
+            for k in pools.token_sisters(hit, named_now, self.cfg.wide_hub) {
+                add(&k, &mut out);
             }
         }
         out
@@ -3376,6 +3431,14 @@ impl Ahead {
                             silent = pools.named_direct(t.to, &named_now);
                             let learned = t.to.and_then(|a| self.touchers.get(&a)).map(|x| pools.learned_for(&x.1, &named_now)).unwrap_or_default();
                             for k in native.iter().cloned().chain(pools.named_native_any(&named_now)).chain(learned) {
+                                if !silent.contains(&k) {
+                                    silent.push(k);
+                                }
+                            }
+                        }
+                        if self.cfg.silent_unsure & SILENT_TOKENS != 0 {
+                            let learned: Vec<String> = t.to.and_then(|a| self.touchers.get(&a)).map(|x| x.1.clone()).unwrap_or_default();
+                            for k in pools.token_sisters(&learned, &named_now, self.cfg.wide_hub) {
                                 if !silent.contains(&k) {
                                     silent.push(k);
                                 }
