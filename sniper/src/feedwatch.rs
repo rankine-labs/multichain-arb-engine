@@ -23,7 +23,7 @@
 //   samples.jsonl  up to 5 full call-data samples per (router, function)
 //   meta.jsonl     start/stop/notes + a summary every 10 min
 //
-// Settings: SNIPER_RHC_FEED, SNIPER_RHC_HTTP, SNIPER_RHC_POLL_MS (default 300)
+// Settings: SNIPER_RHC_FEED, SNIPER_RHC_HTTP, SNIPER_FW_POLL_MS (default 500)
 // Report:   sniper feed-report <dir>
 // ============================================================================
 use std::collections::{HashMap, VecDeque};
@@ -59,7 +59,9 @@ impl Config {
             feed: std::env::var("SNIPER_RHC_FEED").unwrap_or_else(|_| crate::rhc::DEFAULT_FEED.into()),
             http: std::env::var("SNIPER_RHC_HTTP").unwrap_or_else(|_| crate::rhc::DEFAULT_HTTP.into()),
             out: PathBuf::from(std::env::var("SNIPER_OUT").unwrap_or_else(|_| format!("feed-out/{unix}"))),
-            poll_ms: std::env::var("SNIPER_RHC_POLL_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(300),
+            // Own setting (not SNIPER_RHC_POLL_MS) so it doesn't share the paper
+            // trader's pace; slower = fewer "429 too many requests" from the free node.
+            poll_ms: std::env::var("SNIPER_FW_POLL_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(500),
         }
     }
 }
@@ -278,7 +280,7 @@ pub fn run(cfg: Config) -> Result<(), String> {
     let mut data: HashMap<String, (Vec<u8>, u128)> = HashMap::new();
     let mut data_order: VecDeque<String> = VecDeque::new();
     let started = Instant::now();
-    let (mut last_flush, mut last_sum) = (Instant::now(), Instant::now());
+    let (mut last_flush, mut last_sum, mut last_beat) = (Instant::now(), Instant::now(), Instant::now());
     loop {
         match rx.recv_timeout(Duration::from_millis(250)) {
             Ok(Msg::Feed { t, blocks }) => {
@@ -340,6 +342,12 @@ pub fn run(cfg: Config) -> Result<(), String> {
             }
             last_flush = Instant::now();
         }
+        if last_beat.elapsed() >= Duration::from_secs(60) {
+            // Feed health line: how many feed txs we've decoded so far.
+            w(&mut f_meta, json!({"event": "beat", "t": clock.now() / 1_000_000, "feed_txs": m.feed_txs, "swaps": m.swaps, "matched": m.matched}))?;
+            eprintln!("feed-watch: {}m | feed txs {} | swaps {} | matched {}", started.elapsed().as_secs() / 60, m.feed_txs, m.swaps, m.matched);
+            last_beat = Instant::now();
+        }
         if last_sum.elapsed() >= Duration::from_secs(600) {
             let s = m.summary();
             eprintln!("feed-watch: {}m | {}", started.elapsed().as_secs() / 60, s);
@@ -353,6 +361,15 @@ pub fn run(cfg: Config) -> Result<(), String> {
 
 /// Plain-English report from matched.jsonl.
 pub fn report(dir: &Path) -> String {
+    // Feed health from meta.jsonl: last feed UP/DOWN note and decoded tx count.
+    let meta: Vec<Value> = fs::read_to_string(dir.join("meta.jsonl")).unwrap_or_default().lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
+    let feed_note = meta.iter().rev().filter_map(|m| m["detail"].as_str()).find(|d| d.starts_with("feed ")).unwrap_or("no feed status yet");
+    let feed_txs = meta.iter().rev().find_map(|m| m["feed_txs"].as_u64()).unwrap_or(0);
+    let health = format!("feed: {feed_note} | feed txs decoded {feed_txs}\n");
+    health + &report_rows(dir)
+}
+
+fn report_rows(dir: &Path) -> String {
     let rows: Vec<Value> = fs::read_to_string(dir.join("matched.jsonl")).unwrap_or_default().lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
     if rows.is_empty() {
         return "FEED WATCH: no swaps recorded yet\n".into();
