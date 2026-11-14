@@ -18,6 +18,13 @@
 //   after 6 h (owners can switch a tax on later), a fail after 24 h.
 //   If the test can't run (node error), the trade is skipped too: we never
 //   buy a token we couldn't check.
+//
+//   REAL-SIZE TEST (test_amount): the 0.1% test can miss traps that only
+//   bite at a certain size (for example "max sell" limits). So, right before
+//   each paper buy, a second simulation moves OUR exact token amount (what the
+//   buy quote says we would get) pool -> test wallet, then ALL of it back,
+//   judged the same way. This one is never cached: the amount changes every
+//   trade.
 // ============================================================================
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -79,10 +86,17 @@ pub fn judge(calls: &[Value], amount: U256, back: U256, pool_before: U256) -> Ve
     if !ok(&calls[0]) {
         return Verdict::Blocked("token refused to leave the pool".into());
     }
+    let got_buy = u256_of(&calls[1]["returnData"]).unwrap_or(U256::ZERO);
     if !ok(&calls[2]) {
+        // If the "buy" already arrived short (taxed), the wallet holds less
+        // than we try to send back, so the send-back fails for that reason.
+        // Report the tax we actually saw rather than a misleading "can't sell".
+        let b = loss_bps(amount, got_buy);
+        if b > MAX_LOSS_BPS {
+            return Verdict::Taxed { buy_bps: b, sell_bps: 0 };
+        }
         return Verdict::Blocked("token refused to go back to the pool (can't sell)".into());
     }
-    let got_buy = u256_of(&calls[1]["returnData"]).unwrap_or(U256::ZERO);
     let pool_after = u256_of(&calls[3]["returnData"]).unwrap_or(U256::ZERO);
     let got_sell = pool_after.saturating_sub(pool_before.saturating_sub(amount));
     let (b, s) = (loss_bps(amount, got_buy), loss_bps(back, got_sell));
@@ -93,15 +107,53 @@ pub fn judge(calls: &[Value], amount: U256, back: U256, pool_before: U256) -> Ve
     }
 }
 
-/// Run the test once against the live chain.
-pub fn test_token(rpc: &Rpc, token: &str, pool: &str) -> Result<Verdict, String> {
+/// How many tokens the pool holds right now.
+fn pool_balance(rpc: &Rpc, token: &str, pool: &str) -> Result<U256, String> {
     let bal = rpc.call("eth_call", json!([{"to": token, "data": data_balance(pool)}, "latest"]))?;
-    let pool_before = u256_of(&bal).ok_or("pool balance unreadable")?;
+    u256_of(&bal).ok_or_else(|| "pool balance unreadable".to_string())
+}
+
+/// Run the 0.1%-of-pool test once against the live chain.
+pub fn test_token(rpc: &Rpc, token: &str, pool: &str) -> Result<Verdict, String> {
+    let pool_before = pool_balance(rpc, token, pool)?;
     let amount = pool_before / U256::from(1000u64);
     if amount.is_zero() {
         return Err("pool holds none of the token".into());
     }
     let back = amount * U256::from(9u64) / U256::from(10u64);
+    simulate(rpc, token, pool, amount, back, pool_before)
+}
+
+/// The amounts the real-size test uses: move exactly our token amount out of
+/// the pool and send ALL of it back. Refuses amounts the pool can't cover
+/// (zero, or more than it holds), because that test would mean nothing.
+pub fn real_size_amounts(ours: U256, pool_before: U256) -> Result<(U256, U256), String> {
+    if ours.is_zero() {
+        return Err("real-size test: zero tokens".into());
+    }
+    if ours > pool_before {
+        return Err("real-size test: pool holds less than our amount".into());
+    }
+    Ok((ours, ours))
+}
+
+/// Real-size test: simulate OUR exact token amount leaving the pool (like
+/// our buy) and 100% of it coming back (like our sell). Not cached.
+pub fn test_amount(rpc: &Rpc, token: &str, pool: &str, ours: U256) -> Result<Verdict, String> {
+    let pool_before = pool_balance(rpc, token, pool)?;
+    let (amount, back) = real_size_amounts(ours, pool_before)?;
+    simulate(rpc, token, pool, amount, back, pool_before)
+}
+
+/// Is this verdict a real finding about the token (taxed or blocked), as
+/// opposed to a pass? Used to put the token on the permanent blocklist.
+pub fn is_bad(v: &Verdict) -> bool {
+    !matches!(v, Verdict::Ok)
+}
+
+/// The shared simulation: `amount` pool -> test wallet, `back` test wallet ->
+/// pool, read both balances, then judge. Nothing is sent to the chain.
+fn simulate(rpc: &Rpc, token: &str, pool: &str, amount: U256, back: U256, pool_before: U256) -> Result<Verdict, String> {
     let calls = json!([
         {"from": pool, "to": token, "data": data_transfer(TEST_WALLET, amount)},
         {"to": token, "data": data_balance(TEST_WALLET)},
@@ -163,6 +215,50 @@ mod tests {
         let (pool, amt) = (U256::from(1_000_000u64), U256::from(1_000u64));
         let calls = [call("0x1", U256::ZERO), call("0x1", amt), call("0x0", U256::ZERO), call("0x1", pool - amt)];
         assert!(matches!(judge(&calls, amt, U256::from(900u64), pool), Verdict::Blocked(_)));
+    }
+
+    #[test]
+    fn real_size_full_round_trip_passes() {
+        // Our 50,000 tokens out of a 1,000,000 pool, and ALL 50,000 back.
+        let pool = U256::from(1_000_000u64);
+        let (amt, back) = real_size_amounts(U256::from(50_000u64), pool).unwrap();
+        assert_eq!(amt, back);
+        let calls = [call("0x1", U256::ZERO), call("0x1", amt), call("0x1", U256::ZERO), call("0x1", pool)];
+        assert_eq!(judge(&calls, amt, back, pool), Verdict::Ok);
+    }
+
+    #[test]
+    fn real_size_sell_limit_is_blocked() {
+        // A "max sell" trap: our full amount can't go back to the pool.
+        let pool = U256::from(1_000_000u64);
+        let (amt, back) = real_size_amounts(U256::from(50_000u64), pool).unwrap();
+        let calls = [call("0x1", U256::ZERO), call("0x1", amt), call("0x0", U256::ZERO), call("0x1", pool - amt)];
+        assert!(matches!(judge(&calls, amt, back, pool), Verdict::Blocked(_)));
+    }
+
+    #[test]
+    fn real_size_buy_tax_reads_as_taxed_not_blocked() {
+        // 2% buy tax: wallet gets 49,000, so sending 50,000 back fails.
+        // That must be reported as the tax we saw.
+        let pool = U256::from(1_000_000u64);
+        let (amt, back) = real_size_amounts(U256::from(50_000u64), pool).unwrap();
+        let calls = [call("0x1", U256::ZERO), call("0x1", U256::from(49_000u64)), call("0x0", U256::ZERO), call("0x1", pool - amt)];
+        assert_eq!(judge(&calls, amt, back, pool), Verdict::Taxed { buy_bps: 200, sell_bps: 0 });
+    }
+
+    #[test]
+    fn real_size_refuses_impossible_amounts() {
+        let pool = U256::from(1_000u64);
+        assert!(real_size_amounts(U256::ZERO, pool).is_err());
+        assert!(real_size_amounts(U256::from(1_001u64), pool).is_err());
+        assert!(real_size_amounts(U256::from(1_000u64), pool).is_ok());
+    }
+
+    #[test]
+    fn only_ok_is_not_bad() {
+        assert!(!is_bad(&Verdict::Ok));
+        assert!(is_bad(&Verdict::Taxed { buy_bps: 1, sell_bps: 0 }));
+        assert!(is_bad(&Verdict::Blocked("x".into())));
     }
 
     #[test]

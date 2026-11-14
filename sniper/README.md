@@ -117,6 +117,32 @@ Env: `SNIPER_RHC_FEED`, `SNIPER_RHC_HTTP`, `SNIPER_OUT`,
 `sniper paper` trades rushes on paper with real on-chain quotes (settings at
 the top of `src/paper.rs`); `sniper paper-report <dir>` shows the results.
 
+Safety filters (each skipped rush is logged in `signals.jsonl` with its
+reason, and the report's last line counts them):
+
+- **blocked token**: tokens that failed a trap check, or whose sale could
+  not be priced (`exit_quote_failed`), go on a permanent blocklist saved to
+  `<out>/blocked_tokens.json`. It is loaded at start, so restarts keep it.
+  Delete an entry by hand to forgive a token.
+- **no sell history**: buy only after the pool has shown at least
+  `SNIPER_MIN_SELLS` (default 3) sells of the token since the trader started.
+- **already jumped**: skip if the price already rose more than
+  `SNIPER_MAX_RISE_PCT` (default 8) from just before the first rush buy.
+- **unsafe**: the trap check (0.1% of the pool) failed, or the real-size
+  check failed (our exact token amount out of the pool and all of it back).
+- **too thin**: no size in `SNIPER_SIZES` survives an instant round trip
+  with at most `SNIPER_AUTO_MAX_RT_PCT` (1.5) loss.
+
+Rush buyers are counted as different wallets receiving the tokens (the
+swap's recipient), not different transactions. A router that receives the
+tokens itself can hide the real wallet, so we may under-count buyers.
+
+Size: each trade uses the auto size (largest size in `SNIPER_SIZES`,
+default 25,50,100, that passed the round-trip test), capped at
+`SNIPER_MAX_USD` (default 50). `SNIPER_PAPER_USD` is used only if
+`SNIPER_SIZES` is empty. A trade that can't be sold counts as a loss of
+its own size.
+
 Race check: the normal quote assumes we get the price at the instant we
 decide. Real transactions land at least a block later, after other traders.
 So every buy and sell is quoted again once the chain is `SNIPER_LATE_BLOCKS`

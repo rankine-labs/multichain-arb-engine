@@ -7,12 +7,32 @@
 //   2. RUSH = at least 3 different buyers in one coin within ~1 second and
 //      the price up >= 2% (the only rule that beat random entries in our
 //      research). Single big buys are ignored: they lost money.
-//   3. On a rush, "buy" a fixed dollar amount: ask Uniswap's own on-chain
+//      "Different buyers" = different wallets RECEIVING the tokens in the
+//      swap log (the V3 Swap "recipient"). Limit: when people trade through
+//      a router that receives the tokens itself, several real people can
+//      look like one buyer (we under-count, the safe direction), and one
+//      person using several wallets still looks like several buyers.
+//   3. Safety filters, cheapest first. Any one failing skips the rush:
+//        - "blocked token": the token is on our permanent blocklist (it
+//          failed a trap check or we could not price its sale before).
+//        - "no sell history": we have not yet seen at least MIN_SELLS
+//          people sell this token into this pool since we started.
+//        - "already jumped": the price already rose more than MAX_RISE_PCT
+//          from just before the first rush buy; we would be buying the top.
+//        - "unsafe": the tax/trap check (0.1% of the pool) failed.
+//        - "too thin": no size in the size list survives an instant round
+//          trip with <= AUTO_MAX_RT loss (fees plus our own price impact).
+//        - "unsafe: real size": the trap check with OUR exact token amount
+//          (all of it sold back) failed.
+//   4. Size: the "auto" size (largest list size that passed the round-trip
+//      test), capped at MAX_USD. Then "buy": ask Uniswap's own on-chain
 //      price contract (QuoterV2) exactly how many tokens that buys right now.
 //      Real pool maths, real fee, real depth. Nothing is signed or sent.
-//   4. Sell at +TP%, -SL%, or after HOLD seconds, whichever comes first,
+//   5. Sell at +TP%, -SL%, or after HOLD seconds, whichever comes first,
 //      again with a real on-chain quote. Gas is estimated and subtracted.
-//   5. One trade at a time (risk rule). Every trade and every rush we had to
+//      If the sale can't even be priced, the trade counts as lost in full
+//      (its own size) and the token goes on the blocklist.
+//   6. One trade at a time (risk rule). Every trade and every rush we had to
 //      skip is written to disk; a status line prints every minute.
 //
 // Honest limits (shown in the report):
@@ -27,12 +47,23 @@
 //   SNIPER_RHC_HTTP      node (default: free public Robinhood RPC)
 //   SNIPER_OUT           output folder (default paper-out/<unix time>)
 //   SNIPER_DURATION_SECS stop after (0 = until closed)
-//   SNIPER_PAPER_USD     dollars per trade (default 50)
+//   SNIPER_SIZES         size list in USD (default 25,50,100); every trade
+//                        is also priced at each size (size study)
+//   SNIPER_MAX_USD       largest trade size allowed (default 50)
+//   SNIPER_AUTO_MAX_RT_PCT  max instant round-trip loss for a size (1.5)
+//   SNIPER_PAPER_USD     size used ONLY if SNIPER_SIZES is empty (default 50)
+//   SNIPER_MIN_SELLS     sells of the token seen in the pool before we buy (3)
+//   SNIPER_MAX_RISE_PCT  skip if price already rose more than this (8)
+//   SNIPER_TAXCHECK      off = skip both trap checks (default on)
 //   SNIPER_TP_PCT / SNIPER_SL_PCT / SNIPER_HOLD_SECS   exits (5 / 5 / 10)
 //   SNIPER_RUSH_BUYS / SNIPER_RUSH_WINDOW_S / SNIPER_RUSH_RISE_PCT  (3 / 1 / 2)
 //   SNIPER_RHC_POLL_MS   how often to ask the node (default 200)
 //   SNIPER_LATE_BLOCKS   race check: re-quote every buy and sell this many
 //                        blocks after we decide (default 2, see below)
+//
+// Blocklist: saved to <out>/blocked_tokens.json and loaded at start, so a
+// restart keeps it. Entries never expire during a run. Delete the file (or
+// a line in it) by hand to forgive a token.
 //
 // Race check: the normal quote is taken the instant we decide, which assumes
 // our transaction would land on that exact price. In reality it lands at
@@ -42,10 +73,10 @@
 // report, next to the optimistic total. Nothing waits for it: the trader
 // keeps running and finishes these re-quotes as the blocks arrive.
 // ============================================================================
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::{BufWriter, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ruint::aliases::U256;
@@ -136,8 +167,8 @@ pub struct Pool {
 #[derive(Clone, Debug, Default)]
 struct PoolState {
     last_price: Option<f64>,
-    /// (block, tx) of recent buys
-    buys: VecDeque<(u64, String)>,
+    /// Recent buys: (block, buyer wallet, price just BEFORE this buy).
+    buys: VecDeque<(u64, String, f64)>,
     /// (block, last price in block), recent
     prices: VecDeque<(u64, f64)>,
     cooldown_until: u64,
@@ -155,6 +186,8 @@ pub struct RushSig {
     pub pool: String,
     pub block: u64,
     pub price: f64,
+    /// Price just before the first buy of this rush (for "already jumped").
+    pub start_price: f64,
 }
 
 #[derive(Default)]
@@ -163,12 +196,13 @@ pub struct Detector {
 }
 
 impl Detector {
-    /// Feed one swap (in order). Returns a rush if this swap completes one.
-    pub fn on_swap(&mut self, pool: &str, block: u64, tx: &str, price: f64, r: &Rules) -> Option<RushSig> {
+    /// Feed one swap (in order). `buyer` is the wallet that received the
+    /// tokens (see swap_buyer). Returns a rush if this swap completes one.
+    pub fn on_swap(&mut self, pool: &str, block: u64, buyer: &str, price: f64, r: &Rules) -> Option<RushSig> {
         let st = self.pools.entry(pool.to_string()).or_default();
         if let Some(prev) = st.last_price {
             if price > prev {
-                st.buys.push_back((block, tx.to_string()));
+                st.buys.push_back((block, buyer.to_string(), prev));
             }
         }
         st.last_price = Some(price);
@@ -178,7 +212,7 @@ impl Detector {
         }
         // Forget anything older than two windows.
         let lo = block.saturating_sub(r.window_blocks - 1);
-        while st.buys.front().is_some_and(|(b, _)| *b < lo) {
+        while st.buys.front().is_some_and(|(b, _, _)| *b < lo) {
             st.buys.pop_front();
         }
         while st.prices.len() > 2 && st.prices[1].0 < lo {
@@ -187,8 +221,10 @@ impl Detector {
         if block < st.cooldown_until || st.buys.len() < r.buys {
             return None;
         }
-        let txs: HashSet<&str> = st.buys.iter().map(|(_, t)| t.as_str()).collect();
-        if txs.len() < r.buys {
+        // Count DIFFERENT buyer wallets, not buy events: one wallet splitting
+        // its buy into many pieces is not a crowd.
+        let buyers: HashSet<&str> = st.buys.iter().map(|(_, w, _)| w.as_str()).collect();
+        if buyers.len() < r.buys {
             return None;
         }
         // Price just before the window.
@@ -197,13 +233,155 @@ impl Detector {
             return None;
         }
         st.cooldown_until = block + r.window_blocks;
-        Some(RushSig { pool: pool.to_string(), block, price })
+        let start_price = st.buys.front().map_or(p0, |(_, _, before)| *before);
+        Some(RushSig { pool: pool.to_string(), block, price, start_price })
     }
 
     pub fn last_price(&self, pool: &str) -> Option<f64> {
         self.pools.get(pool).and_then(|s| s.last_price)
     }
 }
+
+/// Who bought, from a V3 Swap log: topic 2 is the "recipient" (the wallet
+/// that received what came out of the pool). Topic 1 is the "sender", which
+/// is usually a router contract, so it says little about the real buyer.
+/// Limit: a router that takes delivery itself hides the real wallet. If the
+/// recipient is missing (malformed log), fall back to the transaction hash
+/// so the old behaviour (one buy per transaction) still applies.
+pub fn swap_buyer(log: &Value) -> String {
+    let recipient = log["topics"]
+        .as_array()
+        .and_then(|t| t.get(2))
+        .and_then(|t| t.as_str())
+        .map(|t| t.trim_start_matches("0x"))
+        .filter(|t| t.len() == 64)
+        .map(|t| format!("0x{}", t[24..].to_ascii_lowercase()));
+    recipient.unwrap_or_else(|| log["transactionHash"].as_str().unwrap_or("").to_string())
+}
+
+/// Is a 64-hex-digit signed number (int256) below zero? (Top bit set.)
+fn word_is_negative(w: &str) -> bool {
+    w.len() == 64 && w.chars().next().and_then(|c| c.to_digit(16)).is_some_and(|d| d >= 8)
+}
+
+/// Was this V3 swap a SELL of the token? A V3 Swap log's first two data
+/// words are amount0 and amount1, from the pool's point of view: negative =
+/// the pool paid that coin out. A sell means the pool paid out the BASE
+/// coin (WETH/USDG). The base is token1 when the token is token0, and the
+/// other way round.
+pub fn is_sell_swap(words: &[&str], token_is0: bool) -> bool {
+    let base_word = if token_is0 { words.get(1) } else { words.first() };
+    base_word.is_some_and(|w| word_is_negative(w))
+}
+
+/// How many sells of its token each pool has shown since we started.
+#[derive(Default)]
+pub struct SellHistory {
+    counts: HashMap<String, u64>,
+}
+
+impl SellHistory {
+    /// Count one more sell in this pool.
+    pub fn record(&mut self, pool: &str) {
+        *self.counts.entry(pool.to_string()).or_default() += 1;
+    }
+    /// Sells seen in this pool so far (0 if none).
+    pub fn count(&self, pool: &str) -> u64 {
+        self.counts.get(pool).copied().unwrap_or(0)
+    }
+    /// Has this pool shown enough sells for us to believe people can sell?
+    pub fn enough(&self, pool: &str, min_sells: u64) -> bool {
+        self.count(pool) >= min_sells
+    }
+}
+
+/// Percent the price rose from `start` to `now` (None if start is not > 0).
+pub fn rise_pct(start: f64, now: f64) -> Option<f64> {
+    (start > 0.0).then(|| 100.0 * (now / start - 1.0))
+}
+
+/// "Already jumped": the rush has already lifted the price more than
+/// `max_pct`, so most of the move is behind us. An unreadable start price
+/// counts as jumped (we skip what we can't measure).
+pub fn already_jumped(start: f64, now: f64, max_pct: f64) -> bool {
+    rise_pct(start, now).is_none_or(|r| r > max_pct)
+}
+
+/// What size to trade, or None = "too thin" (skip).
+///   - `sizes` is the configured size list. If it is EMPTY there is no auto
+///     size, so we use `fallback` (SNIPER_PAPER_USD), still capped.
+///   - Otherwise `auto` (from pick_auto) must be above zero, then it is
+///     raised to at least the smallest list size and capped at `max_usd`.
+///     The cap wins if the two disagree: the cap is the safety limit.
+pub fn decide_size(auto: f64, sizes: &[f64], max_usd: f64, fallback: f64) -> Option<f64> {
+    let positive = |x: f64| (x > 0.0).then_some(x);
+    if sizes.is_empty() {
+        return positive(fallback.min(max_usd));
+    }
+    if auto <= 0.0 {
+        return None;
+    }
+    let floor = sizes.iter().cloned().fold(f64::INFINITY, f64::min);
+    positive(auto.max(floor).min(max_usd))
+}
+
+// ---------------------------------------------------------------------------
+// Permanent blocklist (saved next to the run's other files)
+// ---------------------------------------------------------------------------
+
+/// Tokens we will never buy again: token address -> why it was blocked.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Blocklist {
+    pub tokens: BTreeMap<String, String>,
+}
+
+impl Blocklist {
+    /// The file name inside the output folder.
+    pub const FILE: &'static str = "blocked_tokens.json";
+
+    /// Read the blocklist. A missing file is an empty list (first run). A
+    /// file we can't read or understand is an ERROR, so the trader refuses
+    /// to start instead of quietly forgetting tokens that hurt us.
+    pub fn load(path: &Path) -> Result<Self, String> {
+        let text = match fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(e) => return Err(format!("blocklist {}: {e}", path.display())),
+        };
+        let tokens: BTreeMap<String, String> =
+            serde_json::from_str(&text).map_err(|e| format!("blocklist {} is damaged ({e}); fix or delete it", path.display()))?;
+        Ok(Blocklist { tokens: tokens.into_iter().map(|(k, v)| (k.to_ascii_lowercase(), v)).collect() })
+    }
+
+    /// Write the blocklist. Written to a temp file first and then renamed,
+    /// so a crash mid-write can't leave a half-written file behind.
+    pub fn save(&self, path: &Path) -> Result<(), String> {
+        let tmp = path.with_extension("json.tmp");
+        let text = serde_json::to_string_pretty(&self.tokens).map_err(|e| e.to_string())?;
+        fs::write(&tmp, text).map_err(|e| e.to_string())?;
+        fs::rename(&tmp, path).map_err(|e| e.to_string())
+    }
+
+    /// Is this token blocked? (Addresses compared in lower case.)
+    pub fn contains(&self, token: &str) -> bool {
+        self.tokens.contains_key(&token.to_ascii_lowercase())
+    }
+
+    /// Block a token. Returns true if it was new (so the caller saves).
+    /// The first reason is kept if the token is already blocked.
+    pub fn add(&mut self, token: &str, why: &str) -> bool {
+        let k = token.to_ascii_lowercase();
+        if self.tokens.contains_key(&k) {
+            return false;
+        }
+        self.tokens.insert(k, why.to_string());
+        true
+    }
+}
+
+/// Skip reasons we count separately in the report (in report order). Each
+/// skip line in signals.jsonl has a "why" starting with one of these.
+pub const SKIP_REASONS: [&str; 5] = ["blocked token", "no sell history", "already jumped", "too thin", "unsafe"];
 
 // ---------------------------------------------------------------------------
 // The paper position
@@ -220,6 +398,8 @@ pub struct Position {
     pub entry_price: f64,
     pub gas_in: u64,
     pub usd_per_base: f64,
+    /// This trade's own size in USD (auto size, capped).
+    pub usd_in: f64,
     /// Size study: the same trade priced at other sizes (usd, base_in, tokens).
     pub ladder: Vec<(f64, U256, U256)>,
     /// The size the auto-sizer would have picked (0 = none viable).
@@ -408,7 +588,14 @@ pub struct Config {
     pub wss: Option<String>,
     pub out: PathBuf,
     pub duration: Option<Duration>,
+    /// Fallback size, used only when the size list is empty.
     pub usd: f64,
+    /// Largest trade size allowed (SNIPER_MAX_USD).
+    pub max_usd: f64,
+    /// Sells of the token a pool must have shown before we buy.
+    pub min_sells: u64,
+    /// Skip if the rush already lifted the price more than this (percent).
+    pub max_rise_pct: f64,
     pub tp: f64,
     pub sl: f64,
     pub hold: Duration,
@@ -426,12 +613,15 @@ impl Config {
         Config {
             http: std::env::var("SNIPER_RHC_HTTP").unwrap_or_else(|_| crate::rhc::DEFAULT_HTTP.into()),
             wss: std::env::var("SNIPER_RHC_WSS").ok().filter(|s| !s.trim().is_empty()),
-            sizes: std::env::var("SNIPER_SIZES").unwrap_or_else(|_| "25,50,100,200,500".into()).split(',').filter_map(|x| x.trim().parse().ok()).collect(),
+            sizes: std::env::var("SNIPER_SIZES").unwrap_or_else(|_| "25,50,100".into()).split(',').filter_map(|x| x.trim().parse().ok()).collect(),
             auto_max_rt: std::env::var("SNIPER_AUTO_MAX_RT_PCT").ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(1.5) / 100.0,
             taxcheck: std::env::var("SNIPER_TAXCHECK").map(|v| v != "off").unwrap_or(true),
             out: PathBuf::from(std::env::var("SNIPER_OUT").unwrap_or_else(|_| format!("paper-out/{unix}"))),
             duration: Some(f("SNIPER_DURATION_SECS", 0.0)).filter(|d| *d > 0.0).map(Duration::from_secs_f64),
             usd: f("SNIPER_PAPER_USD", 50.0),
+            max_usd: f("SNIPER_MAX_USD", 50.0),
+            min_sells: f("SNIPER_MIN_SELLS", 3.0) as u64,
+            max_rise_pct: f("SNIPER_MAX_RISE_PCT", 8.0),
             tp: f("SNIPER_TP_PCT", 5.0) / 100.0,
             sl: f("SNIPER_SL_PCT", 5.0) / 100.0,
             hold: Duration::from_secs_f64(f("SNIPER_HOLD_SECS", 10.0)),
@@ -502,11 +692,23 @@ pub fn run(cfg: Config) -> Result<(), String> {
     let wall_ms = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
     write(
         &mut f_meta,
-        json!({"event": "start", "wall_ms": wall_ms, "usd": cfg.usd, "tp": cfg.tp, "sl": cfg.sl, "hold_s": cfg.hold.as_secs_f64(),
+        json!({"event": "start", "wall_ms": wall_ms, "usd": cfg.usd, "sizing": "auto", "max_usd": cfg.max_usd, "sizes": cfg.sizes,
+               "min_sells": cfg.min_sells, "max_rise_pct": cfg.max_rise_pct, "tp": cfg.tp, "sl": cfg.sl, "hold_s": cfg.hold.as_secs_f64(),
                "rush_buys": cfg.rules.buys, "window_blocks": cfg.rules.window_blocks, "rise_pct": cfg.rules.rise_pct,
                "node": crate::probe::redact(&cfg.http), "push": cfg.wss.as_deref().map(crate::probe::redact), "eth_usd": eth, "late_blocks": cfg.late_blocks}),
     )?;
-    eprintln!("paper: writing to {} | ETH ${eth:.0} | ${} per trade, TP {}% SL {}% hold {}s", cfg.out.display(), cfg.usd, cfg.tp * 100.0, cfg.sl * 100.0, cfg.hold.as_secs_f64());
+    // Permanent blocklist: load what earlier runs in this folder learned.
+    let block_path = cfg.out.join(Blocklist::FILE);
+    let mut blocklist = Blocklist::load(&block_path)?;
+    eprintln!(
+        "paper: writing to {} | ETH ${eth:.0} | auto size, max ${} | TP {}% SL {}% hold {}s | {} blocked tokens loaded",
+        cfg.out.display(),
+        cfg.max_usd,
+        cfg.tp * 100.0,
+        cfg.sl * 100.0,
+        cfg.hold.as_secs_f64(),
+        blocklist.tokens.len()
+    );
 
     let swap_topic = sig_v3_swap();
     // Push mode: a websocket thread hands us each V3 swap log as it happens.
@@ -533,10 +735,21 @@ pub fn run(cfg: Config) -> Result<(), String> {
     });
     let mut pools: HashMap<String, Option<Pool>> = HashMap::new();
     let mut det = Detector::default();
+    let mut sells = SellHistory::default();
     let mut pos: Option<Position> = None;
     let mut last_block: Option<u64> = None;
     let (mut n_trades, mut n_wins, mut total, mut n_rush, mut n_skipped) = (0u64, 0u64, 0.0f64, 0u64, 0u64);
     let mut n_unsafe = 0u64; // rushes skipped by the tax/trap check
+    let mut n_filtered = 0u64; // rushes skipped by the other safety filters
+    // Put a token on the blocklist and save the file right away.
+    let block = |bl: &mut Blocklist, token: &str, why: &str| {
+        if bl.add(token, why) {
+            eprintln!("paper: BLOCKED {token} ({why})");
+            if let Err(e) = bl.save(&block_path) {
+                eprintln!("paper: could not save blocklist ({e})");
+            }
+        }
+    };
     let started = Instant::now();
     let mut beat = Instant::now();
     let mut errors = 0u32;
@@ -619,8 +832,12 @@ pub fn run(cfg: Config) -> Result<(), String> {
                 let Some(sp) = w.get(2) else { continue };
                 let Some(price) = token_price(&crate::fourmeme::word_dec(sp), info.token_is0) else { continue };
                 let block = hex_u64(log.get("blockNumber"));
-                let tx = log["transactionHash"].as_str().unwrap_or("");
-                if let Some(r) = det.on_swap(&pool, block, tx, price, &cfg.rules) {
+                // Sell history: did someone sell the token (base paid out)?
+                if is_sell_swap(&w, info.token_is0) {
+                    sells.record(&pool);
+                }
+                let buyer = swap_buyer(log);
+                if let Some(r) = det.on_swap(&pool, block, &buyer, price, &cfg.rules) {
                     rushes.push(r);
                 }
             }
@@ -667,7 +884,7 @@ pub fn run(cfg: Config) -> Result<(), String> {
                             &mut f_trades,
                             json!({"pool": p.pool, "token": p.info.token, "base": p.info.base, "open_block": p.open_block, "close_block": last_block,
                                    "held_s": p.opened.elapsed().as_secs_f64(), "reason": reason, "pool_move_pct": 100.0 * gain,
-                                   "usd_in": cfg.usd, "gross_usd": gross, "gas_usd": gross - net, "net_usd": net,
+                                   "usd_in": p.usd_in, "gross_usd": gross, "gas_usd": gross - net, "net_usd": net,
                                    "base_in": p.base_in.to_string(), "base_out": out.to_string(), "tokens": p.tokens.to_string(),
                                    "wall_ms": SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)}),
                         )?;
@@ -688,12 +905,14 @@ pub fn run(cfg: Config) -> Result<(), String> {
                     Err(e) => {
                         // Can't price the exit: keep trying; record it.
                         if p.opened.elapsed() > cfg.hold * 3 {
-                            write(&mut f_trades, json!({"pool": p.pool, "token": p.info.token, "reason": "exit_quote_failed", "error": e, "net_usd": -cfg.usd}))?;
+                            write(&mut f_trades, json!({"pool": p.pool, "token": p.info.token, "reason": "exit_quote_failed", "error": e, "usd_in": p.usd_in, "net_usd": -p.usd_in}))?;
                             // Size study: every size is lost in full too.
                             let ladder: Vec<Value> = p.ladder.iter().map(|(usd, _, _)| json!({"usd": usd, "net": -usd})).collect();
                             write(&mut f_trades, json!({"ladder_for": p.pool, "open_block": p.open_block, "auto_usd": p.auto_usd, "ladder": ladder}))?;
-                            total -= cfg.usd;
+                            total -= p.usd_in;
                             n_trades += 1;
+                            // Never touch this token again (survives restarts).
+                            block(&mut blocklist, &p.info.token, "exit_quote_failed");
                             // Race check: still try the late sell (no optimistic price to compare).
                             schedule_late_exit(&mut late, &p, last_block, cfg.late_blocks, None);
                             pos = None;
@@ -713,18 +932,40 @@ pub fn run(cfg: Config) -> Result<(), String> {
                 write(&mut f_sig, json!({"pool": r.pool, "token": info.token, "block": r.block, "taken": false, "why": "busy"}))?;
                 continue;
             }
+            // A skipped rush: one line in signals.jsonl with the reason.
+            let skip = |f: &mut BufWriter<std::fs::File>, why: String| write(f, json!({"pool": r.pool, "token": info.token, "block": r.block, "taken": false, "why": why}));
+            // Cheap filters first (no node calls).
+            if blocklist.contains(&info.token) {
+                n_filtered += 1;
+                skip(&mut f_sig, "blocked token".into())?;
+                continue;
+            }
+            if !sells.enough(&r.pool, cfg.min_sells) {
+                n_filtered += 1;
+                skip(&mut f_sig, format!("no sell history ({} of {} sells seen)", sells.count(&r.pool), cfg.min_sells))?;
+                continue;
+            }
+            if already_jumped(r.start_price, r.price, cfg.max_rise_pct) {
+                n_filtered += 1;
+                let up = rise_pct(r.start_price, r.price).map_or("?".to_string(), |x| format!("{x:.1}%"));
+                skip(&mut f_sig, format!("already jumped (up {up}, max {}%)", cfg.max_rise_pct))?;
+                continue;
+            }
             // Safety first: never buy a token that is taxed, blocked or unchecked.
             if cfg.taxcheck {
                 let verdict = taxcheck.check(&rpc, &info.token, &r.pool);
                 if !matches!(verdict, Ok(crate::taxcheck::Verdict::Ok)) {
                     n_unsafe += 1;
-                    write(&mut f_sig, json!({"pool": r.pool, "token": info.token, "block": r.block, "taken": false, "why": format!("unsafe: {verdict:?}")}))?;
+                    // A real finding (taxed/blocked) is permanent; a node error is not.
+                    if let Ok(v) = &verdict {
+                        block(&mut blocklist, &info.token, &format!("trap check: {v:?}"));
+                    }
+                    skip(&mut f_sig, format!("unsafe: {verdict:?}"))?;
                     continue;
                 }
             }
             let usd_per_base = if info.base == "USDG" { 1.0 } else { eth };
             let raw = |usd: f64| U256::from(((usd / usd_per_base) * 10f64.powi(base_decimals(info.base))) as u128);
-            let base_in = raw(cfg.usd);
             // Size study: price this trade at every size, plus an instant
             // round trip at each (what fees + our own impact cost us).
             let mut ladder = Vec::new();
@@ -741,10 +982,35 @@ pub fn run(cfg: Config) -> Result<(), String> {
                 }
             }
             let auto_usd = pick_auto(&round_trips, cfg.auto_max_rt);
+            // The trade's real size: auto size, capped at MAX_USD.
+            let Some(usd_in) = decide_size(auto_usd, &cfg.sizes, cfg.max_usd, cfg.usd) else {
+                if round_trips.is_empty() {
+                    // Nothing could be priced at all: a quote problem, not depth.
+                    skip(&mut f_sig, "quote failed: size study got no round-trip quotes".into())?;
+                } else {
+                    n_filtered += 1;
+                    skip(&mut f_sig, format!("too thin (no size within {}% round trip)", cfg.auto_max_rt * 100.0))?;
+                }
+                continue;
+            };
+            let base_in = raw(usd_in);
             match quoter.quote(&info.base_addr, &info.token, info.fee, base_in) {
                 Ok((tokens, gas_in)) if !tokens.is_zero() => {
-                    write(&mut f_sig, json!({"pool": r.pool, "token": info.token, "block": r.block, "taken": true}))?;
-                    eprintln!("paper: BUY  {} ${} ({}/{} rush at block {})", info.token, cfg.usd, info.base, r.pool, r.block);
+                    // Real-size trap check: OUR exact token amount out of the
+                    // pool and ALL of it back in, before we take the trade.
+                    if cfg.taxcheck {
+                        let verdict = crate::taxcheck::test_amount(&rpc, &info.token, &r.pool, tokens);
+                        if !matches!(verdict, Ok(crate::taxcheck::Verdict::Ok)) {
+                            n_unsafe += 1;
+                            if let Ok(v) = &verdict {
+                                block(&mut blocklist, &info.token, &format!("real-size check: {v:?}"));
+                            }
+                            skip(&mut f_sig, format!("unsafe: real size: {verdict:?}"))?;
+                            continue;
+                        }
+                    }
+                    write(&mut f_sig, json!({"pool": r.pool, "token": info.token, "block": r.block, "taken": true, "usd_in": usd_in}))?;
+                    eprintln!("paper: BUY  {} ${usd_in} ({}/{} rush at block {})", info.token, info.base, r.pool, r.block);
                     // Race check: price this exact buy again a few blocks from
                     // the newest block we have seen (when we really decided).
                     let decided = last_block.unwrap_or(r.block).max(r.block);
@@ -769,13 +1035,14 @@ pub fn run(cfg: Config) -> Result<(), String> {
                         entry_price: det.last_price(&r.pool).unwrap_or(r.price),
                         gas_in,
                         usd_per_base,
+                        usd_in,
                         ladder,
                         auto_usd,
                         late_tokens: None,
                     });
                 }
                 other => {
-                    write(&mut f_sig, json!({"pool": r.pool, "token": info.token, "block": r.block, "taken": false, "why": format!("quote failed: {other:?}")}))?;
+                    skip(&mut f_sig, format!("quote failed: {other:?}"))?;
                 }
             }
         }
@@ -783,7 +1050,7 @@ pub fn run(cfg: Config) -> Result<(), String> {
         if beat.elapsed() >= Duration::from_secs(60) {
             let h = started.elapsed().as_secs_f64() / 3600.0;
             eprintln!(
-                "paper: {}m | rushes {n_rush} (skipped while busy {n_skipped}, unsafe {n_unsafe}) | trades {n_trades} | wins {:.0}% | total ${total:+.2} (${:+.2}/h) | open: {}",
+                "paper: {}m | rushes {n_rush} (skipped while busy {n_skipped}, unsafe {n_unsafe}, filtered {n_filtered}) | trades {n_trades} | wins {:.0}% | total ${total:+.2} (${:+.2}/h) | open: {}",
                 started.elapsed().as_secs() / 60,
                 if n_trades > 0 { 100.0 * n_wins as f64 / n_trades as f64 } else { 0.0 },
                 if h > 0.0 { total / h } else { 0.0 },
@@ -828,6 +1095,21 @@ pub fn report(dir: &std::path::Path) -> String {
     }
     let taken = sig.iter().filter(|s| s["taken"] == json!(true)).count();
     let unsafe_n = sig.iter().filter(|s| s["why"].as_str().is_some_and(|w| w.starts_with("unsafe"))).count();
+    // Skips by the safety filters, per reason (SKIP_REASONS order; last is unsafe).
+    let skips = count_skips(&sig);
+    let filtered: usize = skips[..skips.len() - 1].iter().sum();
+    // Header: new runs size each trade automatically; old runs used one size.
+    let size_txt = match start.and_then(|m| m["max_usd"].as_f64()) {
+        Some(max) => format!("auto size, max ${max}"),
+        None => format!("${} per trade", start.and_then(|m| m["usd"].as_f64()).unwrap_or(0.0)),
+    };
+    // Each trade's own size (lines from older runs may not have one).
+    let sizes_in: Vec<f64> = rows.iter().filter_map(|r| r["usd_in"].as_f64()).collect();
+    let skip_txt = format!(
+        "skips: {} | average trade size ${:.2}\n",
+        SKIP_REASONS.iter().zip(skips.iter()).map(|(name, n)| format!("{name} {n}")).collect::<Vec<_>>().join(" | "),
+        if sizes_in.is_empty() { 0.0 } else { sizes_in.iter().sum::<f64>() / sizes_in.len() as f64 }
+    );
     // Size study: total per fixed size, plus what the auto-sizer would have made.
     let mut by_size: std::collections::BTreeMap<u64, (f64, usize)> = Default::default();
     let (mut auto_total, mut auto_n) = (0.0f64, 0usize);
@@ -857,16 +1139,16 @@ pub fn report(dir: &std::path::Path) -> String {
     let sd = if n > 1 { (nets.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n - 1) as f64).sqrt() } else { 0.0 };
     let half = 1.96 * sd / (n.max(1) as f64).sqrt();
     format!(
-        "PAPER TRADER ({:.1} h, ${} per trade)\n\
+        "PAPER TRADER ({:.1} h, {})\n\
          rushes seen {} | trades {} | skipped (busy or no quote) {} | blocked as unsafe {}\n\
          TOTAL ${:+.2}  =  ${:+.2} per hour  |  per trade ${:+.2} (rough 95% range ${:+.2} .. ${:+.2})\n\
          wins {:.0}% | best ${:+.2} | worst ${:+.2} | gas paid ${:.2}\n\
-         exits: {:?}\n{}{}",
+         exits: {:?}\n{}{}{}",
         hours,
-        start.and_then(|m| m["usd"].as_f64()).unwrap_or(0.0),
+        size_txt,
         sig.len(),
         n,
-        sig.len() - taken - unsafe_n,
+        sig.len().saturating_sub(taken + unsafe_n + filtered),
         unsafe_n,
         total,
         if hours > 0.0 { total / hours } else { 0.0 },
@@ -879,8 +1161,23 @@ pub fn report(dir: &std::path::Path) -> String {
         gas,
         reasons,
         sizes_txt,
-        race_txt
+        race_txt,
+        skip_txt
     )
+}
+
+/// Count skipped rushes per safety reason (same order as SKIP_REASONS),
+/// matching the start of each signal line's "why".
+pub fn count_skips(sig: &[Value]) -> [usize; SKIP_REASONS.len()] {
+    let mut out = [0usize; SKIP_REASONS.len()];
+    for s in sig {
+        if let Some(w) = s["why"].as_str() {
+            if let Some(i) = SKIP_REASONS.iter().position(|r| w.starts_with(r)) {
+                out[i] += 1;
+            }
+        }
+    }
+    out
 }
 
 /// Report section for the race check: the same trades, but priced as if our
@@ -967,6 +1264,150 @@ mod tests {
         for (i, p) in [100.1, 100.2, 100.3, 100.4].iter().enumerate() {
             assert!(d.on_swap("p", 10 + i as u64, &format!("t{i}"), *p, &r).is_none());
         }
+    }
+
+    #[test]
+    fn rush_remembers_price_before_first_buy() {
+        let mut d = Detector::default();
+        let r = rules();
+        d.on_swap("p", 1, "x", 100.0, &r);
+        d.on_swap("p", 10, "a", 101.0, &r);
+        d.on_swap("p", 11, "b", 102.0, &r);
+        let s = d.on_swap("p", 12, "c", 110.0, &r).unwrap();
+        // Price before the first rush buy (block 10) was 100.
+        assert_eq!(s.start_price, 100.0);
+        assert!(already_jumped(s.start_price, s.price, 8.0)); // up 10%
+        assert!(!already_jumped(s.start_price, s.price, 12.0));
+    }
+
+    #[test]
+    fn many_transactions_from_one_wallet_are_one_buyer() {
+        // Real logs: three different transactions, same recipient wallet.
+        let log = |tx: &str| json!({"transactionHash": tx, "topics": ["0xsig", format!("0x{:0>64}", "r0u7e2"), format!("0x{:0>64}", "beef")]});
+        let buyers: Vec<String> = ["0x1", "0x2", "0x3"].iter().map(|t| swap_buyer(&log(t))).collect();
+        assert!(buyers.iter().all(|b| b == "0x000000000000000000000000000000000000beef"));
+        let mut d = Detector::default();
+        let r = rules();
+        d.on_swap("p", 1, "x", 100.0, &r);
+        for (i, b) in buyers.iter().enumerate() {
+            assert!(d.on_swap("p", 10 + i as u64, b, 101.0 + i as f64, &r).is_none());
+        }
+    }
+
+    #[test]
+    fn buyer_falls_back_to_tx_hash_without_recipient() {
+        assert_eq!(swap_buyer(&json!({"transactionHash": "0xabc", "topics": ["0xsig"]})), "0xabc");
+        assert_eq!(swap_buyer(&json!({"transactionHash": "0xabc"})), "0xabc");
+    }
+
+    #[test]
+    fn sell_is_base_paid_out_of_the_pool() {
+        let neg = "f".repeat(60) + "fc18"; // -1000 as int256
+        let pos = format!("{:064x}", 1000);
+        // token is token0, base is token1: base word negative = sell
+        assert!(is_sell_swap(&[pos.as_str(), neg.as_str()], true));
+        assert!(!is_sell_swap(&[neg.as_str(), pos.as_str()], true)); // a buy
+        // token is token1, base is token0
+        assert!(is_sell_swap(&[neg.as_str(), pos.as_str()], false));
+        assert!(!is_sell_swap(&[pos.as_str(), neg.as_str()], false));
+        // malformed data is never a sell
+        assert!(!is_sell_swap(&[], true));
+        assert!(!is_sell_swap(&["ff"], false));
+    }
+
+    #[test]
+    fn sell_history_counts_per_pool() {
+        let mut h = SellHistory::default();
+        assert!(!h.enough("p", 3));
+        assert!(h.enough("p", 0));
+        for _ in 0..3 {
+            h.record("p");
+        }
+        h.record("q");
+        assert_eq!(h.count("p"), 3);
+        assert!(h.enough("p", 3));
+        assert!(!h.enough("q", 3));
+        assert_eq!(h.count("none"), 0);
+    }
+
+    #[test]
+    fn rise_filter() {
+        assert!((rise_pct(100.0, 108.0).unwrap() - 8.0).abs() < 1e-9);
+        assert_eq!(rise_pct(0.0, 5.0), None);
+        assert!(!already_jumped(100.0, 107.9, 8.0));
+        assert!(already_jumped(100.0, 108.1, 8.0));
+        assert!(already_jumped(0.0, 108.0, 8.0)); // can't measure = skip
+    }
+
+    #[test]
+    fn size_is_auto_capped_and_floored() {
+        let ladder = [25.0, 50.0, 100.0];
+        assert_eq!(decide_size(100.0, &ladder, 50.0, 50.0), Some(50.0)); // capped
+        assert_eq!(decide_size(25.0, &ladder, 50.0, 50.0), Some(25.0));
+        assert_eq!(decide_size(0.0, &ladder, 50.0, 50.0), None); // too thin
+        assert_eq!(decide_size(10.0, &ladder, 50.0, 50.0), Some(25.0)); // floor
+        assert_eq!(decide_size(100.0, &ladder, 10.0, 50.0), Some(10.0)); // cap beats floor
+        // Empty size list: fallback, still capped.
+        assert_eq!(decide_size(0.0, &[], 50.0, 30.0), Some(30.0));
+        assert_eq!(decide_size(0.0, &[], 50.0, 80.0), Some(50.0));
+        assert_eq!(decide_size(0.0, &[], 50.0, 0.0), None);
+    }
+
+    #[test]
+    fn blocklist_saves_and_loads() {
+        let dir = std::env::temp_dir().join(format!("sniper-block-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(Blocklist::FILE);
+        // Missing file = empty list.
+        let mut b = Blocklist::load(&path).unwrap();
+        assert!(b.tokens.is_empty());
+        assert!(b.add("0xABC", "exit_quote_failed"));
+        assert!(!b.add("0xabc", "again")); // already there, first reason kept
+        assert!(b.contains("0xAbC"));
+        b.save(&path).unwrap();
+        let back = Blocklist::load(&path).unwrap();
+        assert_eq!(back, b);
+        assert_eq!(back.tokens["0xabc"], "exit_quote_failed");
+        // A damaged file stops the trader instead of forgetting tokens.
+        fs::write(&path, "{not json").unwrap();
+        assert!(Blocklist::load(&path).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn report_counts_skips_and_real_sizes() {
+        let dir = std::env::temp_dir().join(format!("sniper-paper-skips-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("meta.jsonl"), json!({"event": "start", "wall_ms": 0, "usd": 50.0, "max_usd": 50.0}).to_string()).unwrap();
+        let trades = [
+            json!({"net_usd": 1.0, "gas_usd": 0.01, "reason": "time", "wall_ms": 3_600_000, "usd_in": 50.0}).to_string(),
+            // a failed exit loses its OWN size, not a constant
+            json!({"reason": "exit_quote_failed", "usd_in": 25.0, "net_usd": -25.0}).to_string(),
+        ];
+        fs::write(dir.join("paper_trades.jsonl"), trades.join("\n")).unwrap();
+        let why = |w: &str| json!({"taken": false, "why": w}).to_string();
+        let sig = [
+            json!({"taken": true}).to_string(),
+            json!({"taken": true}).to_string(),
+            why("busy"),
+            why("blocked token"),
+            why("no sell history (1 of 3 sells seen)"),
+            why("no sell history (2 of 3 sells seen)"),
+            why("already jumped (up 9.0%, max 8%)"),
+            why("too thin (no size within 1.5% round trip)"),
+            why("unsafe: Ok(Blocked(\"x\"))"),
+            why("unsafe: real size: Ok(Taxed)"),
+        ];
+        fs::write(dir.join("signals.jsonl"), sig.join("\n")).unwrap();
+        let r = report(&dir);
+        assert!(r.starts_with("PAPER TRADER (1.0 h, auto size, max $50)"), "{r}");
+        assert!(r.contains("TOTAL $-24.00"), "{r}");
+        // only "busy" is left in the old busy/no-quote bucket
+        assert!(r.contains("skipped (busy or no quote) 1 | blocked as unsafe 2"), "{r}");
+        assert!(r.contains("skips: blocked token 1 | no sell history 2 | already jumped 1 | too thin 1 | unsafe 2 | average trade size $37.50"), "{r}");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
