@@ -112,6 +112,21 @@ pools, from any node (default: the free public RPC). No keys needed.
 Env: `SNIPER_RHC_FEED`, `SNIPER_RHC_HTTP`, `SNIPER_OUT`,
 `SNIPER_DURATION_SECS`, `SNIPER_RHC_POLL_MS` (default 200).
 
+## Paper trader (Robinhood Chain, no money)
+
+`sniper paper` trades rushes on paper with real on-chain quotes (settings at
+the top of `src/paper.rs`); `sniper paper-report <dir>` shows the results.
+
+Race check: the normal quote assumes we get the price at the instant we
+decide. Real transactions land at least a block later, after other traders.
+So every buy and sell is quoted again once the chain is `SNIPER_LATE_BLOCKS`
+blocks further on (default 2, about 0.2 s). Each trade gets an extra
+`late_for` line in `paper_trades.jsonl`, and the report ends with a
+"RACE CHECK" section: late total and $/hour, late win %, median entry and
+exit slip (how much worse the late price was), and late quotes that failed.
+If the late total is much worse than the normal total, the paper profit
+depends on landing instantly, which we cannot do.
+
 ## Tests
 
 ```bash
