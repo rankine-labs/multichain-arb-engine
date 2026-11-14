@@ -184,11 +184,38 @@ def main():
                 later = [x for x in sw[k + 1:] if x["tf"] - t_in <= HOLD_MS]
                 return (later[-1]["price"] / p_in - 1 if later else 0.0), "time"
 
+            def outcome_sellwatch(k, p_in, t_in, thr, use_feed):
+                """Same exits as the paper bot, PLUS: the moment a sell that
+                drops the price by >= thr shows up, get out. With the feed we
+                see it at its feed time; without it, at its node time (~1 s
+                later). We land after everything sequenced by then."""
+                prev = sw[k]["price"]
+                for j in range(k + 1, len(sw)):
+                    x = sw[j]
+                    if x["tf"] - t_in > HOLD_MS:
+                        break
+                    g = x["price"] / p_in - 1
+                    if g >= TP or g <= -SL:
+                        return g, "tp" if g >= TP else "sl"
+                    if not x["buy"] and x["price"] / prev - 1 <= -thr:
+                        seen = (x["tf"] if use_feed else x["tn"]) + react
+                        m = max(jj for jj in range(j, len(sw)) if jj == j or sw[jj]["tf"] <= seen)
+                        return sw[m]["price"] / p_in - 1, "sell_seen"
+                    prev = x["price"]
+                later = [x for x in sw[k + 1:] if x["tf"] - t_in <= HOLD_MS]
+                return (later[-1]["price"] / p_in - 1 if later else 0.0), "time"
+
             kf, pf = entry(s["tf"] + react)
             ks, ps = entry(s["tn"] + react)
             gf, ef = outcome(kf, pf, s["tf"] + react)
             gs, es = outcome(ks, ps, s["tn"] + react)
-            results.append({"pool": pool, "edge": ps / pf - 1, "gf": gf, "gs": gs, "ef": ef, "es": es,
+            # Early-exit study: entry as the paper bot does today (slow entry,
+            # since entry speed made no difference), exits with a sell watch.
+            sellwatch = {}
+            for thr in (0.0, 0.01, 0.03):
+                sellwatch[f"feed {thr:.0%}"] = outcome_sellwatch(ks, ps, s["tn"] + react, thr, True)[0]
+                sellwatch[f"node {thr:.0%}"] = outcome_sellwatch(ks, ps, s["tn"] + react, thr, False)[0]
+            results.append({"sw": sellwatch, "pool": pool, "edge": ps / pf - 1, "gf": gf, "gs": gs, "ef": ef, "es": es,
                             "lead": s["lead"], "skipped_between": ks - kf})
             for b in buys:
                 routers[(b["to"], b["sel"])] += 1
@@ -213,6 +240,15 @@ def main():
     for (to, sel), c in sorted(routers.items(), key=lambda x: -x[1])[:8]:
         print(f"    {to} {sel}  {c} ({100*c/tot:.0f}%)")
     print("  NOTE: prices ignore our own impact and gas, same for both; the gap between FAST and SLOW is the speed edge.")
+    # Early exits: sell on the first sell of size >= X, seen via feed vs node.
+    print("  EARLY EXIT study (today's entry; exit when a sell dropping the price >= X% appears):")
+    print(f"    {'rule':<28} win%   total$    $/h   per trade")
+    base = [usd * (r["gs"] - fee) for r in results]
+    print(f"    {'today (+5/-10/60s)':<28} {100*sum(1 for x in base if x > 0)/n:4.0f} {sum(base):+8.2f} {sum(base)/hours:+7.2f} {S.mean(base):+7.2f}")
+    for key in results[0]["sw"]:
+        v = [usd * (r["sw"][key] - fee) for r in results]
+        label = ("watch sells via " + key.split()[0]) + f" >= {key.split()[1]}"
+        print(f"    {label:<28} {100*sum(1 for x in v if x > 0)/n:4.0f} {sum(v):+8.2f} {sum(v)/hours:+7.2f} {S.mean(v):+7.2f}")
 
 
 if __name__ == "__main__":
