@@ -44,13 +44,16 @@ def s256(h):
 
 def call(to, data):
     body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "eth_call", "params": [{"to": to, "data": data}, "latest"]}).encode()
-    for attempt in range(4):
+    # The free node throttles (HTTP 429) when the feed reader is busy: be
+    # patient (up to ~2 minutes per request) and say what went wrong.
+    for attempt in range(8):
         try:
             req = urllib.request.Request(RPC, body, {"Content-Type": "application/json"})
-            with urllib.request.urlopen(req, timeout=10) as r:
+            with urllib.request.urlopen(req, timeout=15) as r:
                 return json.loads(r.read()).get("result")
-        except Exception:
-            time.sleep(2 ** attempt)
+        except Exception as e:
+            print(f"  node busy ({e}), retrying", file=sys.stderr)
+            time.sleep(min(2 ** attempt, 30))
     return None
 
 
