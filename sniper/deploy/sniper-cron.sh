@@ -93,7 +93,9 @@ if [ "$RELAY" = "1" ] && ! pgrep -f "feed-relay.py" >/dev/null; then
 fi
 
 # What should be running: this build + these settings.
-WANT="$(git rev-parse HEAD):$(sha256sum "$RUN" | cut -c1-16)"
+# (The program file itself, not the git commit: a change to scripts or
+# studies under deploy/ must NOT restart the running bots.)
+WANT="$(sha256sum sniper | cut -c1-16):$(sha256sum "$RUN" | cut -c1-16)"
 
 # --- 3. Start / restart / stop ------------------------------------------------
 for M in $(echo "$ALLOWED"); do
