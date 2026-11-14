@@ -1533,6 +1533,8 @@ struct Entry {
     base_kept: bool,
     /// CPU time this thread spent applying it (microseconds).
     cpu_us: u64,
+    /// RUSH TAP: this block's lines (empty when the tap is off).
+    tap_rows: Vec<super::rushtap::TapRow>,
 }
 
 /// What the prediction did with one transaction.
@@ -2123,6 +2125,9 @@ pub struct Ahead {
     /// The newest block a tip was ever published for (AheadTip.first:
     /// FASTLANE_AHEAD_SEND_FIRST_ONLY in fastlane/lane.rs).
     tip_seq_max: u64,
+    /// RUSH TAP (copy2/rushtap.rs, ARBSIM_RUSH_TAP): None = off (the
+    /// default): nothing of the tap runs and every rule is as before.
+    pub tap: Option<super::rushtap::TapState>,
 }
 
 impl Ahead {
@@ -2164,7 +2169,23 @@ impl Ahead {
             merges: 0,
             merge_last: (0, 0),
             tip_seq_max: 0,
+            tap: None,
         }
+    }
+
+    /// RUSH TAP: turn the tap on with these pools, or replace its pool set
+    /// (the lines already waiting and the "done" mark are kept).
+    pub fn set_tap(&mut self, set: Arc<super::rushtap::TapSet>) {
+        match self.tap.as_mut() {
+            Some(t) => t.set = set,
+            None => self.tap = Some(super::rushtap::TapState::new(set)),
+        }
+    }
+
+    /// RUSH TAP: the lines of blocks predicted since the last call (empty
+    /// when off).
+    pub fn take_tap_rows(&mut self) -> Vec<super::rushtap::TapRow> {
+        self.tap.as_mut().map(|t| t.take()).unwrap_or_default()
     }
 
     /// The pools we follow (rebuilt by the caller when copy 2's registry changes).
@@ -2997,7 +3018,7 @@ impl Ahead {
                 return;
             }
             match self.apply(&base, &m) {
-                Ok(e) => {
+                Ok(mut e) => {
                     self.count(|s| s.applied += 1);
                     let us = e.apply_us;
                     let cpu = e.cpu_us;
@@ -3005,6 +3026,12 @@ impl Ahead {
                         s.add_time(us);
                         s.add_cpu(cpu);
                     });
+                    // RUSH TAP: a block's lines are handed out once (its
+                    // first successful prediction).
+                    if let Some(t) = self.tap.as_mut() {
+                        let age = e.built_at.saturating_duration_since(e.feed_at).as_micros() as u64;
+                        t.accept(e.seq, std::mem::take(&mut e.tap_rows), age);
+                    }
                     self.entries.push_back(e);
                 }
                 Err(why) => {
@@ -3371,6 +3398,9 @@ impl Ahead {
         }
         let mut ov = Overlay::new((*prev_snap).clone());
         let pools = self.pools.clone();
+        // RUSH TAP (None = off): the tapped pools, and this block's lines.
+        let tap = self.tap.as_ref().map(|t| t.set.clone()).filter(|s| !s.is_empty());
+        let mut tap_rows: Vec<super::rushtap::TapRow> = Vec::new();
         let assume = Assume { sender_funds: true, recent_fill: true, skip: None, record_hashes: true, proven_skip: false };
         let mut changed: Vec<String> = Vec::new();
         // Nov 12: pools our exact runs moved earlier in this block
@@ -3458,7 +3488,15 @@ impl Ahead {
                                 named.push(k.clone());
                             }
                         }
-                        if !named.is_empty() && named.iter().all(|k| !rp.contains(k)) {
+                        // RUSH TAP: a transaction naming a tapped pool is
+                        // run (the tap needs its prediction). Off: as before.
+                        let tapped = tap.as_ref().is_some_and(|ts| named.iter().any(|k| ts.has(k)));
+                        if tapped && !named.is_empty() && named.iter().all(|k| !rp.contains(k)) {
+                            if let Some(t) = self.tap.as_mut() {
+                                t.counts.off_route_run += 1;
+                            }
+                        }
+                        if !tapped && !named.is_empty() && named.iter().all(|k| !rp.contains(k)) {
                             self.count(|s| s.txs_off_route += 1);
                             mark_unsure(&mut ov, &mut changed, &mut changed_cum, &mut unsure_cum, &mut held_cum, &named);
                             notes.push(note(t, Fate::OffRoute, true, None, named));
@@ -3533,11 +3571,39 @@ impl Ahead {
                     }
                     // KEEPER (Nov 2): the keeper's values this run read are in use.
                     self.note_used(&kept.reads);
+                    // RUSH TAP: tapped pools whose price this run writes,
+                    // with their price word BEFORE it (read from the copy).
+                    let tap_before: Vec<(usize, Option<U256>)> = match &tap {
+                        Some(ts) => ts.price_hits(&out.changed).into_iter().map(|i| (i, known_word(ov.storage(ts.targets[i].price_at.0, ts.targets[i].price_at.1)))).collect(),
+                        None => Vec::new(),
+                    };
                     ov.commit(&kept.diff);
                     for (a, s) in &kept.forget {
                         ov.forget_slot(*a, *s);
                     }
                     let moved: Vec<String> = pools.moved.moved(&out.changed, &out.hashes).into_iter().map(|x| x.key).collect();
+                    if let Some(ts) = &tap {
+                        // Not vouched for: built on an assumed / tainted
+                        // value, the pool already unsure (since the base)
+                        // or not ready in copy 2.
+                        let doubt = |k: &str| shaky || tainted || unsure_cum.contains(k) || held_cum.contains(k) || pools.not_ready.contains(k);
+                        for (ti, before) in &tap_before {
+                            let tg = &ts.targets[*ti];
+                            let after = known_word(ov.storage(tg.price_at.0, tg.price_at.1));
+                            let row = if before.is_some() && before == &after { super::rushtap::RowKind::Moved } else { super::rushtap::RowKind::Swap };
+                            tap_rows.push(tap_row(m.seq, base.seq, self.cfg.l2_offset, i_tx(i), t, row, if ok { "ran" } else { "reverted" }, ok && !doubt(&tg.key), tg, *before, after, why.clone()));
+                        }
+                        // Moved without a price write (liquidity added /
+                        // removed): a "moved" line, price as it stands.
+                        for k in &moved {
+                            if let Some(tg) = ts.target(k) {
+                                if !tap_before.iter().any(|(ti, _)| ts.targets[*ti].key == *k) {
+                                    let now = known_word(ov.storage(tg.price_at.0, tg.price_at.1));
+                                    tap_rows.push(tap_row(m.seq, base.seq, self.cfg.l2_offset, i_tx(i), t, super::rushtap::RowKind::Moved, "ran", ok && !doubt(k), tg, now, now, None));
+                                }
+                            }
+                        }
+                    }
                     if !moved.is_empty() {
                         if let Some(a) = t.to {
                             self.learn_toucher(a, &moved);
@@ -3852,6 +3918,41 @@ impl Ahead {
             self.count(|s| s.keep_marks += n);
         }
         changed.sort();
+        // RUSH TAP: a transaction that may touch a tapped pool but gave no
+        // exact line for it (could not be run, reverted, off route, marked
+        // unsure for it): an "unsure" line, no prices.
+        if let Some(ts) = &tap {
+            for (i, n) in notes.iter().enumerate() {
+                if n.fate == Fate::Skipped {
+                    continue;
+                }
+                for k in &n.pools {
+                    let Some(tg) = ts.target(k) else { continue };
+                    if tap_rows.iter().any(|r| r.hash == n.hash && r.target.key == *k) {
+                        continue;
+                    }
+                    let why = n.why.clone();
+                    tap_rows.push(super::rushtap::TapRow {
+                        seq: m.seq,
+                        block: m.seq + self.cfg.l2_offset,
+                        base_seq: base.seq,
+                        tx_index: i as u32,
+                        hash: n.hash,
+                        from: txs.get(i).map(|t| t.from).unwrap_or_default(),
+                        to: n.to,
+                        row: super::rushtap::RowKind::Unsure,
+                        fate: n.fate_str(),
+                        sure: false,
+                        target: tg.clone(),
+                        before: None,
+                        after: None,
+                        why,
+                        feed_age_us: 0,
+                    });
+                }
+            }
+            tap_rows.sort_by_key(|r| r.tx_index);
+        }
         ov.set_position(StatePosition { base_block: base.seq + self.cfg.l2_offset, after_seq: Some(m.seq) });
         let (snap, _) = ov.into_parts();
         Ok(Entry {
@@ -3869,8 +3970,28 @@ impl Ahead {
             feed_at: self.arrived.get(&m.seq).copied().unwrap_or(t0),
             base_kept,
             cpu_us: thread_cpu_us().saturating_sub(c0),
+            tap_rows,
         })
     }
+}
+
+/// RUSH TAP: a held value, or None (never zero for a value not held).
+fn known_word(l: Lookup<U256>) -> Option<U256> {
+    match l {
+        Lookup::Known(v) => Some(v),
+        Lookup::Missing => None,
+    }
+}
+
+/// RUSH TAP: transaction position as the line gives it.
+fn i_tx(i: usize) -> u32 {
+    i as u32
+}
+
+/// RUSH TAP: one line of an exact run.
+#[allow(clippy::too_many_arguments)]
+fn tap_row(seq: u64, base_seq: u64, l2_offset: u64, tx_index: u32, t: &DecodedTx, row: super::rushtap::RowKind, fate: &'static str, sure: bool, tg: &super::rushtap::Target, before: Option<U256>, after: Option<U256>, why: Option<String>) -> super::rushtap::TapRow {
+    super::rushtap::TapRow { seq, block: seq + l2_offset, base_seq, tx_index, hash: t.hash, from: t.from, to: t.to, row, fate, sure, target: tg.clone(), before, after, why, feed_age_us: 0 }
 }
 
 /// Forget one pool's own state in the predicted copy (strict: reads of it
@@ -4379,6 +4500,30 @@ fn pool_list(c2: &super::intake::Copy2Handle) -> PoolList {
     (list, not_ready)
 }
 
+/// RUSH TAP: copy 2's pools with their kinds (copied under the registry's
+/// read lock; only when the tap is on and the pool list changed).
+fn tap_followed(c2: &super::intake::Copy2Handle) -> Vec<super::rushtap::Followed> {
+    let reg = c2.c2.reg.read().unwrap_or_else(|e| e.into_inner());
+    let mut v: Vec<super::rushtap::Followed> = reg
+        .pools
+        .iter()
+        .map(|(pk, e)| super::rushtap::Followed {
+            key: match pk.1 {
+                Some(id) => format!("{id:#x}"),
+                None => format!("{:#x}", e.pool.address),
+            },
+            kind: e.pool.kind,
+            address: e.pool.address,
+            v4_id: pk.1,
+            token0: e.pool.token0,
+            token1: e.pool.token1,
+        })
+        .collect();
+    drop(reg);
+    v.sort_by(|x, y| x.key.cmp(&y.key));
+    v
+}
+
 fn same_list(a: &PoolList, b: &PoolList) -> bool {
     a.1 == b.1 && a.0.len() == b.0.len() && a.0.iter().zip(&b.0).all(|(x, y)| x.0.key == y.0.key && x.0.address == y.0.address && x.0.v4_id == y.0.v4_id && x.1 == y.1 && x.2 == y.2)
 }
@@ -4412,6 +4557,10 @@ fn run_loop(c2: super::intake::Copy2Handle, cfg: AheadCfg, rx: Receiver<Ev>) {
     let mut routes_now: Option<Vec<String>> = None;
     // Accuracy fixes: the capture (FASTLANE_CAPTURE_FILE; None = off).
     let mut cap = super::ahead_capture::CapCfg::from_lookup(|k| std::env::var(k).ok()).map(super::ahead_capture::LiveCapture::new);
+    // RUSH TAP (ARBSIM_RUSH_TAP; None = off, the default: nothing below
+    // that names it runs).
+    let mut tap_rt = super::rushtap::TapRuntime::from_env();
+    let mut tap_list: Vec<super::rushtap::Followed> = Vec::new();
     loop {
         // Review M2: no idle polling. Woken by a feed message or a published
         // version (confirmed_hook); the 1 s timeout only drives the status
@@ -4426,16 +4575,29 @@ fn run_loop(c2: super::intake::Copy2Handle, cfg: AheadCfg, rx: Receiver<Ev>) {
         // Pools: looked at only when copy 2's registry changed, and the
         // lookup tables rebuilt only when the pool list / readiness changed.
         let g = c2.c2.reg.gen();
+        let mut list_changed = false;
         if g != reg_gen && pools_at.is_none_or(|t| t.elapsed() >= Duration::from_secs(1)) {
             reg_gen = g;
             pools_at = Some(Instant::now());
             let now = pool_list(&c2);
             if !same_list(&now, &list) || a.pools().is_empty() {
+                list_changed = true;
                 list = now;
                 a.set_pools(Arc::new(PoolSet::build(&list.0, list.1.iter().cloned().collect())));
                 if let Some(c) = cap.as_mut().filter(|c| c.on()) {
                     c.send(&a, super::ahead_capture::CapEv::Pools { list: list.0.clone(), not_ready: list.1.clone() });
                 }
+            }
+        }
+        // RUSH TAP: its pool set, rebuilt when copy 2's list or the tap's
+        // list file changed.
+        if let Some(trt) = tap_rt.as_mut() {
+            let file_changed = trt.poll_file();
+            if list_changed || file_changed || a.tap.is_none() {
+                if list_changed || tap_list.is_empty() {
+                    tap_list = tap_followed(&c2);
+                }
+                a.set_tap(Arc::new(super::rushtap::TapSet::build(&tap_list, &trt.want())));
             }
         }
         let tg = crate::check::entry::table_gen();
@@ -4603,6 +4765,10 @@ fn run_loop(c2: super::intake::Copy2Handle, cfg: AheadCfg, rx: Receiver<Ev>) {
                 super::keeper::used_hook(std::mem::take(&mut a.used));
             }
         }
+        // RUSH TAP: this round's lines to the writer (never waits).
+        if let Some(trt) = &tap_rt {
+            trt.send(a.take_tap_rows());
+        }
         if let Some(rt) = RT.get() {
             {
                 let mut t = rt.tip.lock().unwrap_or_else(|e| e.into_inner());
@@ -4626,6 +4792,13 @@ fn run_loop(c2: super::intake::Copy2Handle, cfg: AheadCfg, rx: Receiver<Ev>) {
                 let mut st = status_of(&a);
                 if let Some(c) = &cap {
                     st["capture"] = json!({"file": c.cfg.path, "on": c.on(), "bytes": c.cap.as_ref().map(|x| x.bytes.load(std::sync::atomic::Ordering::Relaxed))});
+                }
+                if let (Some(trt), Some(t)) = (&tap_rt, &a.tap) {
+                    let mut v = t.status();
+                    if let (Some(o), Value::Object(w)) = (v.as_object_mut(), trt.status()) {
+                        o.extend(w);
+                    }
+                    st["rushTap"] = v;
                 }
                 *rt.status.lock().unwrap_or_else(|e| e.into_inner()) = st;
             }

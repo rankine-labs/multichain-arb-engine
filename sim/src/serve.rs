@@ -82,6 +82,11 @@ pub fn build_with(cfg: Config, node: Option<Arc<dyn NodeApi>>, source: Source) -
             // on every new copy-2 version. The fire-first trigger thread
             // (fastlane/trigger.rs) starts with the server (it needs Ctx).
             crate::copy2::ahead::start(c2.clone());
+            // RUSH TAP (copy2/rushtap.rs) lives inside the predicted copy:
+            // asked for without it = nothing written, said once, loudly.
+            if crate::copy2::rushtap::is_on(std::env::var("ARBSIM_RUSH_TAP").ok().as_deref()) && crate::copy2::ahead::status_json().is_none() {
+                eprintln!("[arbsim] rush tap: ARBSIM_RUSH_TAP=on but the predicted copy is off (it needs FASTLANE=practice|live and FASTLANE_AHEAD=observe|on): no lines are written");
+            }
             // Its hot-contract keeper (Oct 31): only with the predicted copy
             // running and FASTLANE_AHEAD_KEEPER on (default: observe only).
             if crate::copy2::ahead::status_json().is_some() {

@@ -42,6 +42,10 @@ pub mod ahead;
 // Capture of what the predicted copy saw + offline replay (`arbsim
 // ahead-replay`). Only with FASTLANE on and FASTLANE_CAPTURE_FILE set.
 pub mod ahead_capture;
+// RUSH TAP (Nov 14, sniper): the predicted copy's swaps of listed pools,
+// written as JSON lines. Only with ARBSIM_RUSH_TAP=on (and the predicted copy
+// running); off = nothing of it runs.
+pub mod rushtap;
 // FAST LANE A: the hot-contract keeper (Oct 31): other bots' / routers'
 // values the predicted copy needs, kept exact from the node's block diffs.
 pub mod keeper;
