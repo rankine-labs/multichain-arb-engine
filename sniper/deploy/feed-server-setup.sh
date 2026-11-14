@@ -23,5 +23,7 @@ printf 'MODES=feed-watch\nPUBLISH_PORT=8080\nFEED_RELAY=1\n' > $H/.sniper-cron.c
 chown $U:$U $H/.sniper-cron.conf && chmod 600 $H/.sniper-cron.conf
 systemctl enable --now cron   # make sure the scheduler runs
 ( sudo -u $U crontab -l 2>/dev/null | grep -v sniper-auto-run; echo "*/2 * * * * bash $H/sniper-bin/deploy/sniper-cron.sh >> $H/sniper-bin/cron.log 2>&1 # sniper-auto-run" ) | sudo -u $U crontab -
-sudo -u $U bash $H/sniper-bin/deploy/sniper-cron.sh >> $H/sniper-bin/cron.log 2>&1
+# Run once AS ubuntu, log file included (a root-owned log breaks every later cron run).
+sudo -u $U bash -c "bash $H/sniper-bin/deploy/sniper-cron.sh >> $H/sniper-bin/cron.log 2>&1"
+chown -R $U:$U $H/sniper-bin
 echo "feed server ready"
