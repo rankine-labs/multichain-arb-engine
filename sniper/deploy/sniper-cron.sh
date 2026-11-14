@@ -80,6 +80,14 @@ for OLD in rhc-probe probe scan; do
   if pgrep -f "^./sniper $OLD" >/dev/null; then pkill -f "^./sniper $OLD"; log "stopped leftover sniper $OLD (shares the feed with the arb bot)"; fi
 done
 
+# Feed server only (FEED_RELAY=1 in conf): keep the compressed-feed relay
+# running (deploy/feed-relay.py); feed-watch then reads ws://127.0.0.1:9642.
+RELAY="$(kv "$CONF" FEED_RELAY)"
+if [ "$RELAY" = "1" ] && ! pgrep -f "feed-relay.py" >/dev/null; then
+  nohup python3 deploy/feed-relay.py >> feed-relay.log 2>&1 9>&- &
+  log "started feed relay (pid $!)"; sleep 2
+fi
+
 # What should be running: this build + these settings.
 WANT="$(git rev-parse HEAD):$(sha256sum "$RUN" | cut -c1-16)"
 
@@ -99,6 +107,7 @@ for M in $(echo "$ALLOWED"); do
     ARGS=()
     while IFS= read -r line; do ARGS+=("$line"); done < <(grep -E '^SNIPER_[A-Z0-9_]+=' "$RUN" | grep -v -E '^SNIPER_(ENABLED|MODE|OUT|OUT_[A-Z0-9_]+|USE_CHAINSTACK|RHC_WSS)=')
     ARGS+=("SNIPER_OUT=$OUT")
+    [ "$RELAY" = "1" ] && ARGS+=("SNIPER_RHC_FEED=ws://127.0.0.1:9642")
     # SNIPER_USE_CHAINSTACK=1: give the PAPER trader the paid Chainstack node
     # (pushed swaps over websocket + quotes over https), read from the arb
     # bot's .env. Only while the arb bot is paused, so they never share the

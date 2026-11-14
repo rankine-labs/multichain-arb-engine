@@ -16,10 +16,10 @@
 set -u
 U=ubuntu
 H=/home/$U
-apt-get update -qq && apt-get install -y -qq git cron python3 >/dev/null
+apt-get update -qq && apt-get install -y -qq git cron python3 python3-websockets >/dev/null
 sudo -u $U git clone -q --branch sniper-bin --single-branch https://github.com/rankine-labs/multichain-arb-engine.git $H/sniper-bin
 chmod +x $H/sniper-bin/sniper
-printf 'MODES=feed-watch\nPUBLISH_PORT=8080\n' > $H/.sniper-cron.conf
+printf 'MODES=feed-watch\nPUBLISH_PORT=8080\nFEED_RELAY=1\n' > $H/.sniper-cron.conf
 chown $U:$U $H/.sniper-cron.conf && chmod 600 $H/.sniper-cron.conf
 systemctl enable --now cron   # make sure the scheduler runs
 ( sudo -u $U crontab -l 2>/dev/null | grep -v sniper-auto-run; echo "*/2 * * * * bash $H/sniper-bin/deploy/sniper-cron.sh >> $H/sniper-bin/cron.log 2>&1 # sniper-auto-run" ) | sudo -u $U crontab -
