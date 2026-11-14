@@ -64,6 +64,8 @@ MODES="$(kv "$RUN" SNIPER_MODE)"; MODES="${MODES:-paper}"
 # A server can run its own set instead (MODES=... in ~/.sniper-cron.conf),
 # e.g. the separate feed server runs only feed-watch.
 HOST_MODES="$(kv "$CONF" MODES)"; [ -n "$HOST_MODES" ] && MODES="$HOST_MODES"
+# MODES=none: this server runs no sniper program (e.g. the feed server only relays).
+[ "$MODES" = "none" ] && MODES=""
 ALLOWED=" paper feed-watch "
 for M in $MODES; do
   case "$ALLOWED" in *" $M "*) ;; *) log "mode '$M' not allowed here (read-only/paper modes only)"; exit 1;; esac
@@ -84,7 +86,9 @@ done
 # running (deploy/feed-relay.py); feed-watch then reads ws://127.0.0.1:9642.
 RELAY="$(kv "$CONF" FEED_RELAY)"
 if [ "$RELAY" = "1" ] && ! pgrep -f "feed-relay.py" >/dev/null; then
-  nohup python3 deploy/feed-relay.py >> feed-relay.log 2>&1 9>&- &
+  # FEED_RELAY_HOST=0.0.0.0 lets the main server read the relay over the
+  # private network (the AWS firewall only lets the main server in).
+  FEED_RELAY_HOST="$(kv "$CONF" FEED_RELAY_HOST)" nohup python3 deploy/feed-relay.py >> feed-relay.log 2>&1 9>&- &
   log "started feed relay (pid $!)"; sleep 2
 fi
 
@@ -112,13 +116,13 @@ for M in $(echo "$ALLOWED"); do
     # (pushed swaps over websocket + quotes over https), read from the arb
     # bot's .env. Only while the arb bot is paused, so they never share the
     # budget. The links hold API keys: passed to the program, never logged.
-    if [ "$M" = paper ] && [ "$(kv "$RUN" SNIPER_USE_CHAINSTACK)" = "1" ]; then
+    if { [ "$M" = paper ] || [ "$M" = feed-watch ]; } && [ "$(kv "$RUN" SNIPER_USE_CHAINSTACK)" = "1" ]; then
       ARB_ENV="$(kv "$CONF" ARB_ENV)"
       CS_WSS="$( [ -n "$ARB_ENV" ] && kv "$ARB_ENV" CHAINSTACK_WSS_ROBINHOOD )"
       CS_RPC="$( [ -n "$ARB_ENV" ] && kv "$ARB_ENV" CHAINSTACK_RPC_ROBINHOOD )"
       if [ -n "$CS_WSS" ] && [ -n "$CS_RPC" ]; then
         ARGS+=("SNIPER_RHC_WSS=$CS_WSS" "SNIPER_RHC_HTTP=$CS_RPC")
-        log "paper uses Chainstack (push + quotes)"
+        log "$M uses Chainstack (push + quotes)"
       else
         log "SNIPER_USE_CHAINSTACK=1 but Chainstack links not found in arb .env; using the free node"
       fi

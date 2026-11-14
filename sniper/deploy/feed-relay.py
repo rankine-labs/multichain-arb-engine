@@ -16,7 +16,9 @@
 #   - Exactly one upstream connection, never more.
 #   - Any HTTP refusal: wait 10 minutes (65 if 403) before retrying, so we
 #     never get the server blocked the way repeated refusals did before.
-#   - Local only: binds to 127.0.0.1. No keys, read-only.
+#   - Binds to 127.0.0.1 unless FEED_RELAY_HOST says otherwise (the feed
+#     server uses 0.0.0.0; its AWS firewall only admits the main server).
+#     No keys, read-only.
 # ============================================================================
 import asyncio
 import os
@@ -30,7 +32,8 @@ except ImportError:  # older websockets (< 13)
     from websockets import connect, serve  # type: ignore
 
 UPSTREAM = os.environ.get("FEED_UPSTREAM", "wss://feed.mainnet.chain.robinhood.com")
-HOST, PORT = "127.0.0.1", int(os.environ.get("FEED_RELAY_PORT", "9642"))
+HOST = os.environ.get("FEED_RELAY_HOST") or "127.0.0.1"
+PORT = int(os.environ.get("FEED_RELAY_PORT", "9642"))
 
 clients = set()
 

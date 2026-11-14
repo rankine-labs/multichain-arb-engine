@@ -48,6 +48,9 @@ const KEEP_MS: u64 = 120_000;
 pub struct Config {
     pub feed: String,
     pub http: String,
+    /// Optional websocket node (e.g. Chainstack): swaps are PUSHED to us as
+    /// each block is made, instead of polling the node (no 429s, few requests).
+    pub wss: Option<String>,
     pub out: PathBuf,
     pub poll_ms: u64,
 }
@@ -58,6 +61,7 @@ impl Config {
         Config {
             feed: std::env::var("SNIPER_RHC_FEED").unwrap_or_else(|_| crate::rhc::DEFAULT_FEED.into()),
             http: std::env::var("SNIPER_RHC_HTTP").unwrap_or_else(|_| crate::rhc::DEFAULT_HTTP.into()),
+            wss: std::env::var("SNIPER_RHC_WSS").ok().filter(|s| !s.trim().is_empty()),
             out: PathBuf::from(std::env::var("SNIPER_OUT").unwrap_or_else(|_| format!("feed-out/{unix}"))),
             // Own setting (not SNIPER_RHC_POLL_MS) so it doesn't share the paper
             // trader's pace; slower = fewer "429 too many requests" from the free node.
@@ -228,6 +232,26 @@ fn feed_thread(url: String, clock: Clock, stop: Arc<AtomicBool>, tx: mpsc::Sende
     }
 }
 
+/// Push mode: subscribe to V3 + V4 swap logs over websocket and hand each
+/// one to the main loop the moment it arrives (stamped with our clock).
+fn push_thread(url: String, clock: Clock, stop: Arc<AtomicBool>, tx: mpsc::Sender<Msg>) {
+    let subs = [crate::ws::Sub { label: "logs", params: json!(["logs", {"topics": [[sig_v3_swap(), sig_v4_swap()]]}]), fallback: None }];
+    let tx2 = tx.clone();
+    crate::ws::run(
+        &url,
+        &subs,
+        clock,
+        &stop,
+        |at, _, v| {
+            let _ = tx.send(Msg::Logs { t: at / 1_000_000, logs: vec![v.clone()] });
+        },
+        // Never print the node link (it holds the API key).
+        |_, up, d| {
+            let _ = tx2.send(Msg::Note(format!("push node {} ({})", if up { "UP" } else { "DOWN" }, if d.contains("://") { crate::probe::redact(&d) } else { d })));
+        },
+    );
+}
+
 fn poll_thread(url: String, poll: Duration, clock: Clock, stop: Arc<AtomicBool>, tx: mpsc::Sender<Msg>) {
     let rpc = Rpc::new(&url);
     let topics = vec![sig_v3_swap(), sig_v4_swap()];
@@ -287,7 +311,11 @@ pub fn run(cfg: Config) -> Result<(), String> {
         let (u, s, t) = (cfg.feed.clone(), stop.clone(), tx.clone());
         std::thread::spawn(move || feed_thread(u, clock, s, t));
     }
-    {
+    if let Some(wss) = cfg.wss.clone() {
+        // Push mode: the node streams every V3/V4 swap log to us.
+        let (s, t) = (stop.clone(), tx.clone());
+        std::thread::spawn(move || push_thread(wss, clock, s, t));
+    } else {
         let (u, s, t, p) = (cfg.http.clone(), stop.clone(), tx.clone(), Duration::from_millis(cfg.poll_ms));
         std::thread::spawn(move || poll_thread(u, p, clock, s, t));
     }
