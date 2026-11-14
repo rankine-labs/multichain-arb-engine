@@ -1,0 +1,27 @@
+# One-off check: can a machine OUTSIDE our AWS servers (a GitHub runner) open
+# Robinhood's public sequencer feed? Tells us "feed down/closed for everyone"
+# vs "only our servers are refused". Read-only, no secrets.
+name: sniper-feed-check
+on:
+  push:
+    branches: [sniper/phase1-leadtime-probe]
+    paths: [.github/workflows/sniper-feed-check.yml]
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - run: pip install -q websockets
+      - shell: python
+        run: |
+          import asyncio, websockets, time
+          async def main():
+              for url in ["wss://feed.mainnet.chain.robinhood.com", "wss://feed.testnet.chain.robinhood.com"]:
+                  try:
+                      async with websockets.connect(url, open_timeout=10) as ws:
+                          t = time.time(); n = 0
+                          while time.time() - t < 5:
+                              await asyncio.wait_for(ws.recv(), 5); n += 1
+                          print(f"{url}: CONNECTED, {n} messages in 5 s")
+                  except Exception as e:
+                      print(f"{url}: FAILED {type(e).__name__}: {e}")
+          asyncio.run(main())
