@@ -115,11 +115,17 @@ def main():
     d = sys.argv[1] if len(sys.argv) > 1 else "feed-out/run1"
     react = int(sys.argv[2]) if len(sys.argv) > 2 else 50
     rows = []
+    last_t = -1
     for line in open(os.path.join(d, "matched.jsonl")):
         try:
             r = json.loads(line)
         except Exception:
             continue
+        # feed-watch's clock restarts at 0 on every restart: keep only the
+        # newest run (times from different runs can't be compared).
+        if r.get("t", 0) < last_t - 60_000:
+            rows = []
+        last_t = r.get("t", 0)
         if r.get("v4") or not r.get("data") or r.get("lead_ms") is None:
             continue
         w = r["data"][2:]
