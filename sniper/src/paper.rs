@@ -210,6 +210,17 @@ pub struct Position {
     pub entry_price: f64,
     pub gas_in: u64,
     pub usd_per_base: f64,
+    /// Size study: the same trade priced at other sizes (usd, base_in, tokens).
+    pub ladder: Vec<(f64, U256, U256)>,
+    /// The size the auto-sizer would have picked (0 = none viable).
+    pub auto_usd: f64,
+}
+
+/// Auto-size rule: the LARGEST size whose instant round trip (buy, then sell
+/// straight back) loses at most `max_rt` (fees + our own price impact).
+/// Thin pools => small size, deep pools => bigger size; capped by the list.
+pub fn pick_auto(round_trips: &[(f64, f64)], max_rt: f64) -> f64 {
+    round_trips.iter().filter(|(_, loss)| *loss <= max_rt).map(|(usd, _)| *usd).fold(0.0, f64::max)
 }
 
 /// Why we'd exit right now, if at all.
@@ -238,6 +249,12 @@ pub fn pnl_usd(base_in: U256, base_out: U256, base: &str, usd_per_base: f64, gas
 // ---------------------------------------------------------------------------
 
 pub struct Config {
+    /// Sizes to price every trade at, for the size study (USD).
+    pub sizes: Vec<f64>,
+    /// Auto-size: max instant round-trip loss allowed (0.015 = 1.5%).
+    pub auto_max_rt: f64,
+    /// Run the tax/trap check before every buy (SNIPER_TAXCHECK=off disables).
+    pub taxcheck: bool,
     pub http: String,
     /// Optional websocket node (e.g. Chainstack). When set, swaps are PUSHED
     /// to us as each block is made (eth_subscribe "logs") instead of asking
@@ -261,6 +278,9 @@ impl Config {
         Config {
             http: std::env::var("SNIPER_RHC_HTTP").unwrap_or_else(|_| crate::rhc::DEFAULT_HTTP.into()),
             wss: std::env::var("SNIPER_RHC_WSS").ok().filter(|s| !s.trim().is_empty()),
+            sizes: std::env::var("SNIPER_SIZES").unwrap_or_else(|_| "25,50,100,200,500".into()).split(',').filter_map(|x| x.trim().parse().ok()).collect(),
+            auto_max_rt: std::env::var("SNIPER_AUTO_MAX_RT_PCT").ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(1.5) / 100.0,
+            taxcheck: std::env::var("SNIPER_TAXCHECK").map(|v| v != "off").unwrap_or(true),
             out: PathBuf::from(std::env::var("SNIPER_OUT").unwrap_or_else(|_| format!("paper-out/{unix}"))),
             duration: Some(f("SNIPER_DURATION_SECS", 0.0)).filter(|d| *d > 0.0).map(Duration::from_secs_f64),
             usd: f("SNIPER_PAPER_USD", 50.0),
@@ -317,6 +337,7 @@ pub fn run(cfg: Config) -> Result<(), String> {
     };
     let rpc = Rpc::new(&cfg.http);
     let quoter = ChainQuoter { rpc: Rpc::new(&cfg.http) };
+    let mut taxcheck = crate::taxcheck::Checker::default();
     let agent = ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(10))).build().new_agent();
     let mut eth = eth_usd(&quoter).ok_or("could not price ETH in USDG (node or quoter unreachable)")?;
     let mut eth_at = Instant::now();
@@ -357,6 +378,7 @@ pub fn run(cfg: Config) -> Result<(), String> {
     let mut pos: Option<Position> = None;
     let mut last_block: Option<u64> = None;
     let (mut n_trades, mut n_wins, mut total, mut n_rush, mut n_skipped) = (0u64, 0u64, 0.0f64, 0u64, 0u64);
+    let mut n_unsafe = 0u64; // rushes skipped by the tax/trap check
     let started = Instant::now();
     let mut beat = Instant::now();
     let mut errors = 0u32;
@@ -467,6 +489,15 @@ pub fn run(cfg: Config) -> Result<(), String> {
                                    "base_in": p.base_in.to_string(), "base_out": out.to_string(), "tokens": p.tokens.to_string(),
                                    "wall_ms": SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)}),
                         )?;
+                        // Size study: sell the same trade at every other size, right now.
+                        let mut ladder = Vec::new();
+                        for (usd, b_in, toks) in &p.ladder {
+                            if let Ok((o, g)) = quoter.quote(&p.info.token, &p.info.base_addr, p.info.fee, *toks) {
+                                let (_, n) = pnl_usd(*b_in, o, p.info.base, p.usd_per_base, p.gas_in + g + 2 * GAS_OVERHEAD, gp, eth);
+                                ladder.push(json!({"usd": usd, "net": n}));
+                            }
+                        }
+                        write(&mut f_trades, json!({"ladder_for": p.pool, "open_block": p.open_block, "auto_usd": p.auto_usd, "ladder": ladder}))?;
                         eprintln!("paper: SELL {} ({reason}, {:.1}s) net ${net:+.2} | total ${total:+.2} over {n_trades} trades", p.info.token, p.opened.elapsed().as_secs_f64());
                         pos = None;
                     }
@@ -474,6 +505,9 @@ pub fn run(cfg: Config) -> Result<(), String> {
                         // Can't price the exit: keep trying; record it.
                         if p.opened.elapsed() > cfg.hold * 3 {
                             write(&mut f_trades, json!({"pool": p.pool, "token": p.info.token, "reason": "exit_quote_failed", "error": e, "net_usd": -cfg.usd}))?;
+                            // Size study: every size is lost in full too.
+                            let ladder: Vec<Value> = p.ladder.iter().map(|(usd, _, _)| json!({"usd": usd, "net": -usd})).collect();
+                            write(&mut f_trades, json!({"ladder_for": p.pool, "open_block": p.open_block, "auto_usd": p.auto_usd, "ladder": ladder}))?;
                             total -= cfg.usd;
                             n_trades += 1;
                             pos = None;
@@ -493,8 +527,34 @@ pub fn run(cfg: Config) -> Result<(), String> {
                 write(&mut f_sig, json!({"pool": r.pool, "token": info.token, "block": r.block, "taken": false, "why": "busy"}))?;
                 continue;
             }
+            // Safety first: never buy a token that is taxed, blocked or unchecked.
+            if cfg.taxcheck {
+                let verdict = taxcheck.check(&rpc, &info.token, &r.pool);
+                if !matches!(verdict, Ok(crate::taxcheck::Verdict::Ok)) {
+                    n_unsafe += 1;
+                    write(&mut f_sig, json!({"pool": r.pool, "token": info.token, "block": r.block, "taken": false, "why": format!("unsafe: {verdict:?}")}))?;
+                    continue;
+                }
+            }
             let usd_per_base = if info.base == "USDG" { 1.0 } else { eth };
-            let base_in = U256::from(((cfg.usd / usd_per_base) * 10f64.powi(base_decimals(info.base))) as u128);
+            let raw = |usd: f64| U256::from(((usd / usd_per_base) * 10f64.powi(base_decimals(info.base))) as u128);
+            let base_in = raw(cfg.usd);
+            // Size study: price this trade at every size, plus an instant
+            // round trip at each (what fees + our own impact cost us).
+            let mut ladder = Vec::new();
+            let mut round_trips = Vec::new();
+            for usd in &cfg.sizes {
+                if let Ok((toks, _)) = quoter.quote(&info.base_addr, &info.token, info.fee, raw(*usd)) {
+                    if toks.is_zero() {
+                        continue;
+                    }
+                    if let Ok((back, _)) = quoter.quote(&info.token, &info.base_addr, info.fee, toks) {
+                        round_trips.push((*usd, 1.0 - f64::from(back) / f64::from(raw(*usd)).max(1.0)));
+                    }
+                    ladder.push((*usd, raw(*usd), toks));
+                }
+            }
+            let auto_usd = pick_auto(&round_trips, cfg.auto_max_rt);
             match quoter.quote(&info.base_addr, &info.token, info.fee, base_in) {
                 Ok((tokens, gas_in)) if !tokens.is_zero() => {
                     write(&mut f_sig, json!({"pool": r.pool, "token": info.token, "block": r.block, "taken": true}))?;
@@ -509,6 +569,8 @@ pub fn run(cfg: Config) -> Result<(), String> {
                         entry_price: det.last_price(&r.pool).unwrap_or(r.price),
                         gas_in,
                         usd_per_base,
+                        ladder,
+                        auto_usd,
                     });
                 }
                 other => {
@@ -520,7 +582,7 @@ pub fn run(cfg: Config) -> Result<(), String> {
         if beat.elapsed() >= Duration::from_secs(60) {
             let h = started.elapsed().as_secs_f64() / 3600.0;
             eprintln!(
-                "paper: {}m | rushes {n_rush} (skipped while busy {n_skipped}) | trades {n_trades} | wins {:.0}% | total ${total:+.2} (${:+.2}/h) | open: {}",
+                "paper: {}m | rushes {n_rush} (skipped while busy {n_skipped}, unsafe {n_unsafe}) | trades {n_trades} | wins {:.0}% | total ${total:+.2} (${:+.2}/h) | open: {}",
                 started.elapsed().as_secs() / 60,
                 if n_trades > 0 { 100.0 * n_wins as f64 / n_trades as f64 } else { 0.0 },
                 if h > 0.0 { total / h } else { 0.0 },
@@ -538,11 +600,14 @@ pub fn run(cfg: Config) -> Result<(), String> {
 // ---------------------------------------------------------------------------
 
 pub fn report(dir: &std::path::Path) -> String {
-    let rows: Vec<Value> = fs::read_to_string(dir.join("paper_trades.jsonl"))
+    let all: Vec<Value> = fs::read_to_string(dir.join("paper_trades.jsonl"))
         .unwrap_or_default()
         .lines()
         .filter_map(|l| serde_json::from_str(l).ok())
         .collect();
+    // Trade lines vs size-study lines ("ladder_for").
+    let rows: Vec<Value> = all.iter().filter(|r| r.get("reason").is_some()).cloned().collect();
+    let ladders: Vec<&Value> = all.iter().filter(|r| r.get("ladder_for").is_some()).collect();
     let meta: Vec<Value> = fs::read_to_string(dir.join("meta.jsonl")).unwrap_or_default().lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
     let sig: Vec<Value> = fs::read_to_string(dir.join("signals.jsonl")).unwrap_or_default().lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
     let start = meta.iter().find(|m| m["event"] == "start");
@@ -561,20 +626,46 @@ pub fn report(dir: &std::path::Path) -> String {
         *reasons.entry(r["reason"].as_str().unwrap_or("?").to_string()).or_default() += 1;
     }
     let taken = sig.iter().filter(|s| s["taken"] == json!(true)).count();
+    let unsafe_n = sig.iter().filter(|s| s["why"].as_str().is_some_and(|w| w.starts_with("unsafe"))).count();
+    // Size study: total per fixed size, plus what the auto-sizer would have made.
+    let mut by_size: std::collections::BTreeMap<u64, (f64, usize)> = Default::default();
+    let (mut auto_total, mut auto_n) = (0.0f64, 0usize);
+    for l in &ladders {
+        let auto = l["auto_usd"].as_f64().unwrap_or(0.0);
+        for e in l["ladder"].as_array().cloned().unwrap_or_default() {
+            let (usd, net) = (e["usd"].as_f64().unwrap_or(0.0), e["net"].as_f64().unwrap_or(0.0));
+            let slot = by_size.entry(usd as u64).or_default();
+            slot.0 += net;
+            slot.1 += 1;
+            if auto > 0.0 && (usd - auto).abs() < 0.01 {
+                auto_total += net;
+                auto_n += 1;
+            }
+        }
+    }
+    let mut sizes_txt = String::new();
+    if !ladders.is_empty() {
+        sizes_txt += "size study (same trades priced at each size):\n";
+        for (usd, (t, n)) in &by_size {
+            sizes_txt += &format!("  ${usd:>4}: ${t:+.2} over {n} trades (${:+.2}/h)\n", if hours > 0.0 { t / hours } else { 0.0 });
+        }
+        sizes_txt += &format!("  AUTO (largest size with <=1.5% round-trip cost): ${auto_total:+.2} over {auto_n} trades (${:+.2}/h)\n", if hours > 0.0 { auto_total / hours } else { 0.0 });
+    }
     let mean = if n > 0 { total / n as f64 } else { 0.0 };
     let sd = if n > 1 { (nets.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n - 1) as f64).sqrt() } else { 0.0 };
     let half = 1.96 * sd / (n.max(1) as f64).sqrt();
     format!(
         "PAPER TRADER ({:.1} h, ${} per trade)\n\
-         rushes seen {} | trades {} | skipped (busy or no quote) {}\n\
+         rushes seen {} | trades {} | skipped (busy or no quote) {} | blocked as unsafe {}\n\
          TOTAL ${:+.2}  =  ${:+.2} per hour  |  per trade ${:+.2} (rough 95% range ${:+.2} .. ${:+.2})\n\
          wins {:.0}% | best ${:+.2} | worst ${:+.2} | gas paid ${:.2}\n\
-         exits: {:?}\n",
+         exits: {:?}\n{}",
         hours,
         start.and_then(|m| m["usd"].as_f64()).unwrap_or(0.0),
         sig.len(),
         n,
-        sig.len() - taken,
+        sig.len() - taken - unsafe_n,
+        unsafe_n,
         total,
         if hours > 0.0 { total / hours } else { 0.0 },
         mean,
@@ -584,7 +675,8 @@ pub fn report(dir: &std::path::Path) -> String {
         if n > 0 { best } else { 0.0 },
         if n > 0 { worst } else { 0.0 },
         gas,
-        reasons
+        reasons,
+        sizes_txt
     )
 }
 
@@ -644,6 +736,13 @@ mod tests {
         for (i, p) in [100.1, 100.2, 100.3, 100.4].iter().enumerate() {
             assert!(d.on_swap("p", 10 + i as u64, &format!("t{i}"), *p, &r).is_none());
         }
+    }
+
+    #[test]
+    fn auto_size_takes_largest_cheap_round_trip() {
+        let rt = [(25.0, 0.006), (50.0, 0.008), (100.0, 0.012), (200.0, 0.02), (500.0, 0.05)];
+        assert_eq!(pick_auto(&rt, 0.015), 100.0);
+        assert_eq!(pick_auto(&rt, 0.001), 0.0);
     }
 
     #[test]

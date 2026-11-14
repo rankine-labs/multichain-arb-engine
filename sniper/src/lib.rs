@@ -31,4 +31,5 @@ pub mod rhc;
 pub mod rhc_report;
 pub mod scan;
 pub mod sellcheck;
+pub mod taxcheck;
 pub mod ws;
