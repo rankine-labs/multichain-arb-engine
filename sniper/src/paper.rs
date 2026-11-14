@@ -239,6 +239,10 @@ pub fn pnl_usd(base_in: U256, base_out: U256, base: &str, usd_per_base: f64, gas
 
 pub struct Config {
     pub http: String,
+    /// Optional websocket node (e.g. Chainstack). When set, swaps are PUSHED
+    /// to us as each block is made (eth_subscribe "logs") instead of asking
+    /// the node over and over: faster, and only a handful of requests a day.
+    pub wss: Option<String>,
     pub out: PathBuf,
     pub duration: Option<Duration>,
     pub usd: f64,
@@ -256,6 +260,7 @@ impl Config {
         let block_ms = 105.0;
         Config {
             http: std::env::var("SNIPER_RHC_HTTP").unwrap_or_else(|_| crate::rhc::DEFAULT_HTTP.into()),
+            wss: std::env::var("SNIPER_RHC_WSS").ok().filter(|s| !s.trim().is_empty()),
             out: PathBuf::from(std::env::var("SNIPER_OUT").unwrap_or_else(|_| format!("paper-out/{unix}"))),
             duration: Some(f("SNIPER_DURATION_SECS", 0.0)).filter(|d| *d > 0.0).map(Duration::from_secs_f64),
             usd: f("SNIPER_PAPER_USD", 50.0),
@@ -320,11 +325,33 @@ pub fn run(cfg: Config) -> Result<(), String> {
         &mut f_meta,
         json!({"event": "start", "wall_ms": wall_ms, "usd": cfg.usd, "tp": cfg.tp, "sl": cfg.sl, "hold_s": cfg.hold.as_secs_f64(),
                "rush_buys": cfg.rules.buys, "window_blocks": cfg.rules.window_blocks, "rise_pct": cfg.rules.rise_pct,
-               "node": crate::probe::redact(&cfg.http), "eth_usd": eth}),
+               "node": crate::probe::redact(&cfg.http), "push": cfg.wss.as_deref().map(crate::probe::redact), "eth_usd": eth}),
     )?;
     eprintln!("paper: writing to {} | ETH ${eth:.0} | ${} per trade, TP {}% SL {}% hold {}s", cfg.out.display(), cfg.usd, cfg.tp * 100.0, cfg.sl * 100.0, cfg.hold.as_secs_f64());
 
     let swap_topic = sig_v3_swap();
+    // Push mode: a websocket thread hands us each V3 swap log as it happens.
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let log_rx = cfg.wss.clone().map(|url| {
+        let (ltx, lrx) = std::sync::mpsc::channel::<Value>();
+        let (stop2, topic, shown) = (stop.clone(), swap_topic.clone(), crate::probe::redact(&url));
+        std::thread::spawn(move || {
+            let subs = [crate::ws::Sub { label: "logs", params: json!(["logs", {"topics": [[topic]]}]), fallback: None }];
+            crate::ws::run(
+                &url,
+                &subs,
+                crate::ws::Clock::new(),
+                &stop2,
+                |_, _, v| {
+                    let _ = ltx.send(v.clone());
+                },
+                // Never print a node link (it holds the API key).
+                |_, up, d| eprintln!("paper: push node {} ({})", if up { "UP" } else { "DOWN" }, if d.contains("://") { crate::probe::redact(&d) } else { d }),
+            );
+        });
+        eprintln!("paper: swaps pushed from {shown}");
+        lrx
+    });
     let mut pools: HashMap<String, Option<Pool>> = HashMap::new();
     let mut det = Detector::default();
     let mut pos: Option<Position> = None;
@@ -335,7 +362,10 @@ pub fn run(cfg: Config) -> Result<(), String> {
     let mut errors = 0u32;
 
     loop {
-        std::thread::sleep(cfg.poll);
+        // Push mode waits on the stream (below); poll mode sleeps between asks.
+        if log_rx.is_none() {
+            std::thread::sleep(cfg.poll);
+        }
         if cfg.duration.is_some_and(|d| started.elapsed() >= d) {
             break;
         }
@@ -345,52 +375,71 @@ pub fn run(cfg: Config) -> Result<(), String> {
             }
             eth_at = Instant::now();
         }
-        // ---- new swaps ----
-        let head = match rpc.call("eth_blockNumber", json!([])) {
-            Ok(v) => hex_u64(Some(&v)),
-            Err(e) => {
-                errors += 1;
-                if errors % 20 == 1 {
-                    eprintln!("paper: node error ({e})");
-                }
-                continue;
+        // ---- new swaps (pushed or polled) ----
+        let mut logs: Vec<Value> = Vec::new();
+        if let Some(rx) = &log_rx {
+            // Wait briefly for the next swap, then take everything queued.
+            if let Ok(v) = rx.recv_timeout(cfg.poll.min(Duration::from_millis(50))) {
+                logs.push(v);
+                logs.extend(rx.try_iter());
             }
-        };
-        let from = match last_block {
-            None => head,
-            Some(l) if head <= l => head + 1,
-            Some(l) => (l + 1).max(head.saturating_sub(50)),
-        };
-        let mut rushes: Vec<RushSig> = Vec::new();
-        if from <= head {
-            let params = json!([{"fromBlock": format!("0x{from:x}"), "toBlock": format!("0x{head:x}"), "topics": [[swap_topic]]}]);
-            match rpc.call("eth_getLogs", params) {
-                Ok(v) => {
-                    last_block = Some(head);
-                    let mut logs = v.as_array().cloned().unwrap_or_default();
-                    logs.sort_by_key(|l| (hex_u64(l.get("blockNumber")), hex_u64(l.get("logIndex"))));
-                    for log in &logs {
-                        let Some(pool) = log["address"].as_str().map(str::to_ascii_lowercase) else { continue };
-                        if !pools.contains_key(&pool) {
-                            let info = pool_info(&cfg.http, &agent, &pool);
-                            pools.insert(pool.clone(), info);
-                        }
-                        let Some(Some(info)) = pools.get(&pool) else { continue };
-                        let w = words(log["data"].as_str().unwrap_or(""));
-                        let Some(sp) = w.get(2) else { continue };
-                        let Some(price) = token_price(&crate::fourmeme::word_dec(sp), info.token_is0) else { continue };
-                        let block = hex_u64(log.get("blockNumber"));
-                        let tx = log["transactionHash"].as_str().unwrap_or("");
-                        if let Some(r) = det.on_swap(&pool, block, tx, price, &cfg.rules) {
-                            rushes.push(r);
-                        }
-                    }
-                }
+            if let Some(b) = logs.iter().map(|l| hex_u64(l.get("blockNumber"))).max() {
+                last_block = Some(last_block.map_or(b, |x| x.max(b)));
+            }
+        } else {
+            let head = match rpc.call("eth_blockNumber", json!([])) {
+                Ok(v) => hex_u64(Some(&v)),
                 Err(e) => {
                     errors += 1;
                     if errors % 20 == 1 {
                         eprintln!("paper: node error ({e})");
                     }
+                    continue;
+                }
+            };
+            let from = match last_block {
+                None => head,
+                Some(l) if head <= l => head + 1,
+                Some(l) => (l + 1).max(head.saturating_sub(50)),
+            };
+            if from <= head {
+                let params = json!([{"fromBlock": format!("0x{from:x}"), "toBlock": format!("0x{head:x}"), "topics": [[swap_topic]]}]);
+                match rpc.call("eth_getLogs", params) {
+                    Ok(v) => {
+                        last_block = Some(head);
+                        logs = v.as_array().cloned().unwrap_or_default();
+                    }
+                    Err(e) => {
+                        errors += 1;
+                        if errors % 20 == 1 {
+                            eprintln!("paper: node error ({e})");
+                        }
+                    }
+                }
+            }
+        }
+        let mut rushes: Vec<RushSig> = Vec::new();
+        {
+            let mut logs = logs;
+            logs.sort_by_key(|l| (hex_u64(l.get("blockNumber")), hex_u64(l.get("logIndex"))));
+            for log in &logs {
+                // A log the node takes back (short re-org) is not a real swap.
+                if log["removed"].as_bool() == Some(true) {
+                    continue;
+                }
+                let Some(pool) = log["address"].as_str().map(str::to_ascii_lowercase) else { continue };
+                if !pools.contains_key(&pool) {
+                    let info = pool_info(&cfg.http, &agent, &pool);
+                    pools.insert(pool.clone(), info);
+                }
+                let Some(Some(info)) = pools.get(&pool) else { continue };
+                let w = words(log["data"].as_str().unwrap_or(""));
+                let Some(sp) = w.get(2) else { continue };
+                let Some(price) = token_price(&crate::fourmeme::word_dec(sp), info.token_is0) else { continue };
+                let block = hex_u64(log.get("blockNumber"));
+                let tx = log["transactionHash"].as_str().unwrap_or("");
+                if let Some(r) = det.on_swap(&pool, block, tx, price, &cfg.rules) {
+                    rushes.push(r);
                 }
             }
         }

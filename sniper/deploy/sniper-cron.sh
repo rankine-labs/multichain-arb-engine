@@ -94,8 +94,23 @@ for M in $(echo "$ALLOWED"); do
     OUT="$(out_for "$M")"
     # Pass only SNIPER_* settings (no per-mode outs, no switches), then this mode's folder.
     ARGS=()
-    while IFS= read -r line; do ARGS+=("$line"); done < <(grep -E '^SNIPER_[A-Z0-9_]+=' "$RUN" | grep -v -E '^SNIPER_(ENABLED|MODE|OUT|OUT_[A-Z0-9_]+)=')
+    while IFS= read -r line; do ARGS+=("$line"); done < <(grep -E '^SNIPER_[A-Z0-9_]+=' "$RUN" | grep -v -E '^SNIPER_(ENABLED|MODE|OUT|OUT_[A-Z0-9_]+|USE_CHAINSTACK|RHC_WSS)=')
     ARGS+=("SNIPER_OUT=$OUT")
+    # SNIPER_USE_CHAINSTACK=1: give the PAPER trader the paid Chainstack node
+    # (pushed swaps over websocket + quotes over https), read from the arb
+    # bot's .env. Only while the arb bot is paused, so they never share the
+    # budget. The links hold API keys: passed to the program, never logged.
+    if [ "$M" = paper ] && [ "$(kv "$RUN" SNIPER_USE_CHAINSTACK)" = "1" ]; then
+      ARB_ENV="$(kv "$CONF" ARB_ENV)"
+      CS_WSS="$( [ -n "$ARB_ENV" ] && kv "$ARB_ENV" CHAINSTACK_WSS_ROBINHOOD )"
+      CS_RPC="$( [ -n "$ARB_ENV" ] && kv "$ARB_ENV" CHAINSTACK_RPC_ROBINHOOD )"
+      if [ -n "$CS_WSS" ] && [ -n "$CS_RPC" ]; then
+        ARGS+=("SNIPER_RHC_WSS=$CS_WSS" "SNIPER_RHC_HTTP=$CS_RPC")
+        log "paper uses Chainstack (push + quotes)"
+      else
+        log "SNIPER_USE_CHAINSTACK=1 but Chainstack links not found in arb .env; using the free node"
+      fi
+    fi
     LOGF="$M.log"; [ "$M" = paper ] && LOGF="paper.log"
     # 9>&- : the sniper must not inherit our lock, or the next run would think we're still busy.
     env "${ARGS[@]}" nohup ./sniper "$M" >> "$LOGF" 2>&1 9>&- &
