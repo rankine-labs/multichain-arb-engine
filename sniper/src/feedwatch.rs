@@ -19,7 +19,7 @@
 //   Read-only: no keys, never sends anything.
 //
 // Output folder (SNIPER_OUT, default feed-out/<unix>):
-//   matched.jsonl  one line per swap: tx, pool, v4, block, seq, lead_ms, to, sel
+//   matched.jsonl  one line per swap tx: tx, pool, v4, block, seq, lead_ms, to, sel, data (raw swap)
 //   samples.jsonl  up to 5 full call-data samples per (router, function)
 //   meta.jsonl     start/stop/notes + a summary every 10 min
 //
@@ -338,6 +338,9 @@ pub fn run(cfg: Config) -> Result<(), String> {
                     w(&mut f_match, json!({
                         "tx": hash, "pool": pool, "v4": is_v4, "block": hex_u64(log.get("blockNumber")),
                         "seq": r.seq, "lead_ms": r.lead_ms, "to": r.to, "sel": r.sel, "t": t,
+                        // Raw swap numbers (amounts, price after, liquidity, tick) for
+                        // the rush study: which buyers move prices, through which routers.
+                        "data": log["data"].as_str().unwrap_or(""), "li": hex_u64(log.get("logIndex")),
                     }))?;
                     if let (Some(to), Some(sel)) = (&r.to, &r.sel) {
                         if m.want_sample(to, sel) {
