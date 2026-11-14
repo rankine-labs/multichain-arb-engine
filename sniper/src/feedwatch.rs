@@ -162,13 +162,17 @@ impl Matcher {
 fn feed_thread(url: String, clock: Clock, stop: Arc<AtomicBool>, tx: mpsc::Sender<Msg>) {
     let mut backoff = Duration::from_secs(1);
     while !stop.load(Ordering::Relaxed) {
-        // Same identifying headers as the official Nitro feed client.
+        // Plain websocket request, exactly like the arb bot's working client
+        // (src/chains/robinhoodChain.ts sends no extra headers). Set
+        // SNIPER_FEED_HEADERS=1 to add the Nitro client headers instead.
         let req = (|| {
             use tungstenite::client::IntoClientRequest;
             let mut r = url.as_str().into_client_request().ok()?;
-            let h = r.headers_mut();
-            h.insert("User-Agent", "Mozilla/5.0 (compatible; sniper-feed-watch/0.1)".parse().ok()?);
-            h.insert("Arbitrum-Feed-Client-Version", "2".parse().ok()?);
+            if std::env::var("SNIPER_FEED_HEADERS").as_deref() == Ok("1") {
+                let h = r.headers_mut();
+                h.insert("User-Agent", "Mozilla/5.0 (compatible; sniper-feed-watch/0.1)".parse().ok()?);
+                h.insert("Arbitrum-Feed-Client-Version", "2".parse().ok()?);
+            }
             Some(r)
         })();
         let Some(req) = req else {
