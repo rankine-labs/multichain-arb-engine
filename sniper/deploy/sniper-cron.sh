@@ -61,6 +61,9 @@ RUN="deploy/run.env"
 ENABLED="$(kv "$RUN" SNIPER_ENABLED)"
 # SNIPER_MODE: one or more read-only programs, space separated.
 MODES="$(kv "$RUN" SNIPER_MODE)"; MODES="${MODES:-paper}"
+# A server can run its own set instead (MODES=... in ~/.sniper-cron.conf),
+# e.g. the separate feed server runs only feed-watch.
+HOST_MODES="$(kv "$CONF" MODES)"; [ -n "$HOST_MODES" ] && MODES="$HOST_MODES"
 ALLOWED=" paper feed-watch "
 for M in $MODES; do
   case "$ALLOWED" in *" $M "*) ;; *) log "mode '$M' not allowed here (read-only/paper modes only)"; exit 1;; esac
@@ -119,25 +122,47 @@ for M in $(echo "$ALLOWED"); do
   fi
 done
 
-# --- 4. Report to GitHub every 15 min ------------------------------------------
+# --- 4. Reports ---------------------------------------------------------------
+# build_report: scoreboards + last log lines for this server's programs.
+build_report() {
+  REPORT=""; TAIL=""; RUNNING_NOW=""
+  for M in $MODES; do
+    OUT="$(out_for "$M")"; LOGF="$M.log"; [ "$M" = paper ] && LOGF="paper.log"
+    case "$M" in paper) R="$(./sniper paper-report "$OUT" 2>&1 | tail -40)";; *) R="$(./sniper "${M%-watch}-report" "$OUT" 2>&1 | tail -40)";; esac
+    REPORT="$REPORT$R"$'\n\n'
+    TAIL="$TAIL--- $M"$'\n'"$(tail -4 "$LOGF" 2>/dev/null)"$'\n'
+    RUNNING_NOW="$RUNNING_NOW $M: $( [ -n "$(running_pid "$M")" ] && echo running || echo NOT-RUNNING )"
+  done
+  [ "$ENABLED" = "1" ] || RUNNING_NOW=" stopped by kill switch"
+}
+
+# 4a. Feed server: publish the report as a plain text page on the PRIVATE
+#     network (PUBLISH_PORT=8080 in conf). The AWS firewall only lets the main
+#     server read it. No secrets live on the feed server.
+PORT="$(kv "$CONF" PUBLISH_PORT)"
+if [ -n "$PORT" ]; then
+  build_report
+  mkdir -p "$HOME/report-public"
+  { echo "feed server:$RUNNING_NOW ($(date -u '+%H:%M') UTC)"; echo "$REPORT"; echo "$TAIL"; } > "$HOME/report-public/status.tmp" && mv "$HOME/report-public/status.tmp" "$HOME/report-public/status.txt"
+  if ! pgrep -f "http.server $PORT" >/dev/null; then
+    nohup python3 -m http.server "$PORT" --directory "$HOME/report-public" >/dev/null 2>&1 9>&- &
+    log "report page started on port $PORT"
+  fi
+fi
+
+# 4b. Main server: post to the GitHub issue every 15 min (adds the feed
+#     server's page when REMOTE_REPORT=http://<private ip>:8080/status.txt).
 NOW=$(date +%s)
 LAST=$(kv "$STATE" LAST_REPORT); LAST=${LAST:-0}
-if [ $((NOW - LAST)) -ge $((REPORT_EVERY_MIN * 60)) ]; then
-  ARB_ENV="$(kv "$CONF" ARB_ENV)"
-  TOKEN="$( [ -n "$ARB_ENV" ] && kv "$ARB_ENV" GH_STATUS_TOKEN )"
-  if [ -z "$TOKEN" ]; then
-    log "no GH_STATUS_TOKEN found (ARB_ENV=$ARB_ENV), skipping report"
-  else
-    REPORT=""; TAIL=""; RUNNING_NOW=""
-    for M in $MODES; do
-      OUT="$(out_for "$M")"; LOGF="$M.log"; [ "$M" = paper ] && LOGF="paper.log"
-      R="$(./sniper "${M%-watch}-report" "$OUT" 2>&1 | tail -40)"
-      [ "$M" = paper ] && R="$(./sniper paper-report "$OUT" 2>&1 | tail -40)"
-      REPORT="$REPORT$R"$'\n\n'
-      TAIL="$TAIL--- $M"$'\n'"$(tail -4 "$LOGF" 2>/dev/null)"$'\n'
-      RUNNING_NOW="$RUNNING_NOW $M: $( [ -n "$(running_pid "$M")" ] && echo running || echo NOT-RUNNING )"
-    done
-    [ "$ENABLED" = "1" ] || RUNNING_NOW=" stopped by kill switch"
+ARB_ENV="$(kv "$CONF" ARB_ENV)"
+TOKEN="$( [ -n "$ARB_ENV" ] && kv "$ARB_ENV" GH_STATUS_TOKEN )"
+if [ -n "$TOKEN" ] && [ $((NOW - LAST)) -ge $((REPORT_EVERY_MIN * 60)) ]; then
+    build_report
+    REMOTE="$(kv "$CONF" REMOTE_REPORT)"; [ -n "$REMOTE" ] || REMOTE="$(kv "$RUN" SNIPER_REMOTE_REPORT)"
+    if [ -n "$REMOTE" ]; then
+      RR="$(curl -s -m 5 "$REMOTE" 2>/dev/null | head -60)"
+      REPORT="$REPORT=== FEED SERVER ==="$'\n'"${RR:-feed server page not reachable}"$'\n'
+    fi
     ISSUE="$(kv "$CONF" SNIPER_ISSUE)"
     NEW_ISSUE="$(
       TOKEN="$TOKEN" REPO="$REPO" GH_API="${GH_API:-https://api.github.com}" ISSUE="$ISSUE" REPORT="$REPORT" TAIL="$TAIL" \
@@ -180,7 +205,6 @@ PY
     else
       log "report failed: $NEW_ISSUE"
     fi
-  fi
 fi
 exit 0
 }
