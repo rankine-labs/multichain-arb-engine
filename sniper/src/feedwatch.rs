@@ -206,8 +206,10 @@ fn feed_thread(url: String, clock: Clock, stop: Arc<AtomicBool>, tx: mpsc::Sende
                 // connections; retrying during the block keeps it alive (see
                 // the arb bot's src/core/chainManager.ts). Sit the hour out.
                 let m = e.to_string();
-                if m.contains("403") || m.contains("429") || m.to_ascii_lowercase().contains("blocked") {
-                    let wait = Duration::from_secs(if m.contains("429") { 600 } else { 65 * 60 });
+                // Any HTTP refusal (400/403/429/5xx): back off hard so we never
+                // look like a hammering client. 403 = the hour-long block.
+                if m.contains("HTTP error") || m.contains("429") || m.to_ascii_lowercase().contains("blocked") {
+                    let wait = Duration::from_secs(if m.contains("403") { 65 * 60 } else { 600 });
                     let _ = tx.send(Msg::Note(format!("feed refused us, waiting {} min before retrying", wait.as_secs() / 60)));
                     let until = Instant::now() + wait;
                     while Instant::now() < until && !stop.load(Ordering::Relaxed) {
