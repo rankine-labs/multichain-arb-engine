@@ -16,8 +16,8 @@
 #   both (same $ size), so the DIFFERENCE between them is the speed edge.
 #   It also lists which routers the rush buys came through.
 #
-#   Read-only. Uses the public node only to look up each pool's two tokens
-#   (cached in pool-tokens.json, ~2 lookups/second).
+#   Read-only. Uses the public node only to look up each pool's two tokens,
+#   100 pools per request via Multicall3 (cached in pool-tokens.json).
 #
 # Usage: python3 deploy/rush-study.py feed-out/run1 [reaction_ms=50]
 # ============================================================================
@@ -54,15 +54,56 @@ def call(to, data):
     return None
 
 
+MULTICALL3 = "0xca11bde05977b3631167028862be2a173976ca11"  # same address on most EVM chains
+
+
+def _enc_aggregate3(calls):
+    """ABI-encode Multicall3.aggregate3((address,bool,bytes)[]) for 4-byte calls."""
+    n = len(calls)
+    out = "82ad56cb" + "%064x" % 0x20 + "%064x" % n
+    tuple_size = 32 * 5  # target, allowFailure, offset, length, 4 bytes padded
+    out += "".join("%064x" % (32 * n + i * tuple_size) for i in range(n))
+    for target, data in calls:
+        d = data[2:] if data.startswith("0x") else data
+        out += target[2:].lower().rjust(64, "0") + "%064x" % 1 + "%064x" % 0x60 + "%064x" % (len(d) // 2) + d.ljust(64, "0")
+    return "0x" + out
+
+
+def _dec_aggregate3(hexdata):
+    """Decode (bool success, bytes returnData)[] into a list of hex strings or None."""
+    b = bytes.fromhex(hexdata[2:])
+    word = lambda o: int.from_bytes(b[o:o + 32], "big")
+    base = word(0)
+    n = word(base)
+    start = base + 32
+    res = []
+    for i in range(n):
+        t = start + word(start + 32 * i)
+        ok = word(t)
+        off = t + word(t + 32)
+        ln = word(off)
+        data = b[off + 32:off + 32 + ln]
+        res.append("0x" + data.hex() if ok and ln >= 32 else None)
+    return res
+
+
 def pool_tokens(pools, cache_path):
+    """token0/token1 of every pool, 100 pools per request (Multicall3), cached."""
     cache = json.load(open(cache_path)) if os.path.exists(cache_path) else {}
     todo = [p for p in pools if p not in cache]
-    for i, p in enumerate(todo):
-        t0, t1 = call(p, "0x0dfe1681"), call(p, "0xd21220a7")
-        cache[p] = ["0x" + t0[-40:] if t0 else None, "0x" + t1[-40:] if t1 else None]
-        time.sleep(0.5)
-        if i % 50 == 49:
-            json.dump(cache, open(cache_path, "w"))
+    for i in range(0, len(todo), 100):
+        chunk = todo[i:i + 100]
+        calls = []
+        for p in chunk:
+            calls += [(p, "0x0dfe1681"), (p, "0xd21220a7")]
+        r = call(MULTICALL3, _enc_aggregate3(calls))
+        if not r:
+            continue
+        vals = _dec_aggregate3(r)
+        for j, p in enumerate(chunk):
+            t0, t1 = vals[2 * j], vals[2 * j + 1]
+            cache[p] = ["0x" + t0[-40:] if t0 else None, "0x" + t1[-40:] if t1 else None]
+        time.sleep(1)
     json.dump(cache, open(cache_path, "w"))
     return cache
 
