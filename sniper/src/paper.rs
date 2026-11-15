@@ -382,6 +382,17 @@ pub fn already_jumped(start: f64, now: f64, max_pct: f64) -> bool {
     rise_pct(start, now).is_none_or(|r| r > max_pct)
 }
 
+/// Room for one more position? Never two in the same token, at most
+/// `max_positions` open, and (when the size is known) open money plus this
+/// trade within `max_total_usd`. `open` = (token, usd) of each open position.
+pub fn has_room(open: &[(&str, f64)], token: &str, usd: Option<f64>, max_positions: usize, max_total_usd: f64) -> bool {
+    if open.len() >= max_positions || open.iter().any(|(t, _)| t.eq_ignore_ascii_case(token)) {
+        return false;
+    }
+    let used: f64 = open.iter().map(|(_, u)| u).sum();
+    usd.is_none_or(|u| used + u <= max_total_usd + 1e-9)
+}
+
 /// What size to trade, or None = "too thin" (skip).
 ///   - `sizes` is the configured size list. If it is EMPTY there is no auto
 ///     size, so we use `fallback` (SNIPER_PAPER_USD), still capped.
@@ -682,6 +693,10 @@ pub struct Config {
     pub usd: f64,
     /// Largest trade size allowed (SNIPER_MAX_USD).
     pub max_usd: f64,
+    /// Positions open at the same time (never two in one token).
+    pub max_positions: usize,
+    /// Most money in open positions at once, in USD.
+    pub max_total_usd: f64,
     /// Sells of the token a pool must have shown before we buy.
     pub min_sells: u64,
     /// Skip if the rush already lifted the price more than this (percent).
@@ -716,6 +731,8 @@ impl Config {
             duration: Some(f("SNIPER_DURATION_SECS", 0.0)).filter(|d| *d > 0.0).map(Duration::from_secs_f64),
             usd: f("SNIPER_PAPER_USD", 50.0),
             max_usd: f("SNIPER_MAX_USD", 50.0),
+            max_positions: (f("SNIPER_MAX_POSITIONS", 3.0) as usize).max(1),
+            max_total_usd: f("SNIPER_MAX_TOTAL_USD", 150.0),
             min_sells: f("SNIPER_MIN_SELLS", 3.0) as u64,
             max_rise_pct: f("SNIPER_MAX_RISE_PCT", 8.0),
             tp: f("SNIPER_TP_PCT", 5.0) / 100.0,
@@ -937,7 +954,7 @@ pub fn run(cfg: Config) -> Result<(), String> {
     let venue_names: Vec<&str> = cfg.venues.iter().map(|v| v.name()).collect();
     write(
         &mut f_meta,
-        json!({"event": "start", "wall_ms": wall_ms, "usd": cfg.usd, "sizing": "auto", "max_usd": cfg.max_usd, "sizes": cfg.sizes,
+        json!({"event": "start", "wall_ms": wall_ms, "usd": cfg.usd, "sizing": "auto", "max_usd": cfg.max_usd, "max_positions": cfg.max_positions, "max_total_usd": cfg.max_total_usd, "sizes": cfg.sizes,
                "min_sells": cfg.min_sells, "max_rise_pct": cfg.max_rise_pct, "tp": cfg.tp, "sl": cfg.sl, "hold_s": cfg.hold.as_secs_f64(),
                "rush_buys": cfg.rules.buys, "window_blocks": cfg.rules.window_blocks, "rise_pct": cfg.rules.rise_pct,
                "node": crate::probe::redact(&cfg.http), "push": cfg.wss.as_deref().map(crate::probe::redact), "eth_usd": eth, "late_blocks": cfg.late_blocks,
@@ -1001,7 +1018,8 @@ pub fn run(cfg: Config) -> Result<(), String> {
     let mut v2_res: HashMap<String, (U256, U256)> = HashMap::new();
     let mut det = Detector::default();
     let mut sells = SellHistory::default();
-    let mut pos: Option<Position> = None;
+    // Open positions (up to max_positions, one per token, max_total_usd in all).
+    let mut positions: Vec<Position> = Vec::new();
     let mut last_block: Option<u64> = None;
     let (mut n_trades, mut n_wins, mut total, mut n_rush, mut n_skipped) = (0u64, 0u64, 0.0f64, 0u64, 0u64);
     let mut n_unsafe = 0u64; // rushes skipped by the tax/trap check
@@ -1205,7 +1223,7 @@ pub fn run(cfg: Config) -> Result<(), String> {
                 let line = step_late(&mut late[i], lb, &quoter, eth);
                 let t = &late[i];
                 // Copy the late buy result onto the open position it belongs to.
-                if let Some(p) = pos.as_mut().filter(|p| p.pool == t.pool && p.open_block == t.open_block && p.late_tokens.is_none()) {
+                if let Some(p) = positions.iter_mut().find(|p| p.pool == t.pool && p.open_block == t.open_block && p.late_tokens.is_none()) {
                     if let LateQuote::Done(toks, _) = t.buy {
                         p.late_tokens = Some(toks);
                     }
@@ -1220,8 +1238,11 @@ pub fn run(cfg: Config) -> Result<(), String> {
             }
         }
 
-        // ---- manage the open position ----
-        if let Some(p) = pos.clone() {
+        // ---- manage the open positions ----
+        let mut pi = 0;
+        while pi < positions.len() {
+            let p = positions[pi].clone();
+            let mut closed = false;
             let price = det.last_price(&p.pool).unwrap_or(p.entry_price);
             let gain = price / p.entry_price - 1.0;
             let vt = p.info.venue_name();
@@ -1264,7 +1285,7 @@ pub fn run(cfg: Config) -> Result<(), String> {
                         );
                         // Race check: re-quote this same sell a few blocks from now.
                         schedule_late_exit(&mut late, &p, last_block, cfg.late_blocks, Some(out));
-                        pos = None;
+                        closed = true;
                     }
                     Err(e) => {
                         // Can't price the exit: keep trying; record it.
@@ -1285,11 +1306,16 @@ pub fn run(cfg: Config) -> Result<(), String> {
                             block(&mut blocklist, &p.info.token, "exit_quote_failed");
                             // Race check: still try the late sell (no optimistic price to compare).
                             schedule_late_exit(&mut late, &p, last_block, cfg.late_blocks, None);
-                            pos = None;
+                            closed = true;
                             eprintln!("paper: EXIT FAILED {} [{vt}] (counted as total loss)", p.info.token);
                         }
                     }
                 }
+            }
+            if closed {
+                positions.remove(pi);
+            } else {
+                pi += 1;
             }
         }
 
@@ -1320,7 +1346,9 @@ pub fn run(cfg: Config) -> Result<(), String> {
                     continue;
                 }
             }
-            if pos.is_some() {
+            // Busy: all slots full, or we already hold this token.
+            let open: Vec<(&str, f64)> = positions.iter().map(|p| (p.info.token.as_str(), p.usd_in)).collect();
+            if !has_room(&open, &info.token, None, cfg.max_positions, cfg.max_total_usd) {
                 n_skipped += 1;
                 skip(&mut f_sig, "busy".into())?;
                 continue;
@@ -1404,6 +1432,14 @@ pub fn run(cfg: Config) -> Result<(), String> {
                 }
                 continue;
             };
+            // Total money at risk across open positions stays under the cap.
+            let open: Vec<(&str, f64)> = positions.iter().map(|p| (p.info.token.as_str(), p.usd_in)).collect();
+            let open_usd: f64 = open.iter().map(|(_, u)| u).sum();
+            if !has_room(&open, &info.token, Some(usd_in), cfg.max_positions, cfg.max_total_usd) {
+                n_skipped += 1;
+                skip(&mut f_sig, format!("busy (${open_usd:.0} open, cap ${:.0})", cfg.max_total_usd))?;
+                continue;
+            }
             let base_in = raw(usd_in);
             match quoter.quote(&info.venue, &info.base_addr, &info.token, base_in) {
                 Ok((tokens, gas_in)) if !tokens.is_zero() => {
@@ -1436,7 +1472,7 @@ pub fn run(cfg: Config) -> Result<(), String> {
                         buy: LateQuote::Pending,
                         exit: None,
                     });
-                    pos = Some(Position {
+                    positions.push(Position {
                         pool: r.pool.clone(),
                         info,
                         opened: Instant::now(),
@@ -1467,7 +1503,7 @@ pub fn run(cfg: Config) -> Result<(), String> {
                 if n_trades > 0 { 100.0 * n_wins as f64 / n_trades as f64 } else { 0.0 },
                 if h > 0.0 { total / h } else { 0.0 },
                 if per_venue.is_empty() { "no rushes yet".to_string() } else { per_venue.join(", ") },
-                pos.as_ref().map(|p| p.info.token.as_str()).unwrap_or("none"),
+                if positions.is_empty() { "none".to_string() } else { positions.iter().map(|p| p.info.token.as_str()).collect::<Vec<_>>().join(",") },
                 crate::sellcheck::NODE_CALLS.load(std::sync::atomic::Ordering::Relaxed),
                 if h > 0.0 { crate::sellcheck::NODE_CALLS.load(std::sync::atomic::Ordering::Relaxed) as f64 / h * 24.0 / 1000.0 } else { 0.0 }
             );
@@ -1556,7 +1592,7 @@ pub fn report(dir: &std::path::Path) -> String {
         sizes_txt += &format!("  AUTO (largest size with <=1.5% round-trip cost): ${auto_total:+.2} over {auto_n} trades (${:+.2}/h)\n", if hours > 0.0 { auto_total / hours } else { 0.0 });
     }
     let race_txt = race_section(&all, start.and_then(|m| m["late_blocks"].as_u64()), hours);
-    let venue_txt = venue_section(&all, &sig, start);
+    let venue_txt = venue_section(&all, &sig, start) + &hour_section(&rows);
     let mean = if n > 0 { total / n as f64 } else { 0.0 };
     let sd = if n > 1 { (nets.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n - 1) as f64).sqrt() } else { 0.0 };
     let half = 1.96 * sd / (n.max(1) as f64).sqrt();
@@ -1587,6 +1623,29 @@ pub fn report(dir: &std::path::Path) -> String {
         race_txt,
         skip_txt
     )
+}
+
+/// Report section: results by time of day in Toronto (UTC-5), 4-hour
+/// blocks, from each trade's close time. The 3-day chain replay lost money
+/// 8 AM-4 PM and made it at night; this checks that on paper.
+pub fn hour_section(rows: &[Value]) -> String {
+    let mut b: BTreeMap<u64, (u64, u64, f64)> = BTreeMap::new();
+    for r in rows {
+        let (Some(ms), Some(net)) = (r["wall_ms"].as_u64(), r["net_usd"].as_f64()) else { continue };
+        let h = ((ms / 1000 + 86_400 - 5 * 3600) % 86_400) / 3600 / 4 * 4;
+        let e = b.entry(h).or_default();
+        e.0 += 1;
+        e.1 += (net > 0.0) as u64;
+        e.2 += net;
+    }
+    if b.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("by time of day (Toronto):\n");
+    for (h, (n, w, t)) in b {
+        out += &format!("  {h:02}:00-{:02}:00: {n} trades | wins {:.0}% | ${t:+.2}\n", h + 4, 100.0 * w as f64 / n as f64);
+    }
+    out
 }
 
 /// Which venue a file line belongs to. Lines from runs before venues
@@ -1682,6 +1741,26 @@ mod tests {
 
     fn rules() -> Rules {
         Rules { buys: 3, window_blocks: 10, rise_pct: 2.0 }
+    }
+
+    #[test]
+    fn hours_split_in_toronto_time() {
+        // 13:00 UTC = 08:00 Toronto; 03:00 UTC = 22:00 Toronto (previous day)
+        let rows = vec![json!({"wall_ms": 13 * 3_600_000u64, "net_usd": -1.0}), json!({"wall_ms": 3 * 3_600_000u64, "net_usd": 2.0})];
+        let t = hour_section(&rows);
+        assert!(t.contains("08:00-12:00: 1 trades | wins 0% | $-1.00"), "{t}");
+        assert!(t.contains("20:00-24:00: 1 trades | wins 100% | $+2.00"), "{t}");
+    }
+
+    #[test]
+    fn position_slots_and_money_cap() {
+        let open = [("0xa", 50.0), ("0xb", 50.0)];
+        assert!(has_room(&open, "0xc", Some(50.0), 3, 150.0));
+        assert!(!has_room(&open, "0xA", None, 3, 150.0)); // same token, any case
+        assert!(!has_room(&open, "0xc", Some(60.0), 3, 150.0)); // over the money cap
+        assert!(!has_room(&[("0xa", 10.0), ("0xb", 10.0), ("0xd", 10.0)], "0xc", None, 3, 150.0)); // slots full
+        assert!(has_room(&[], "0xc", Some(50.0), 1, 50.0));
+        assert!(!has_room(&[("0xa", 50.0)], "0xc", None, 1, 150.0)); // max 1 = old behaviour
     }
 
     #[test]
