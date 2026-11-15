@@ -825,6 +825,7 @@ mod tests {
         assert!(e.iter().any(|x| x.contains("SNIPER_KEY_FILE")), "{e:?}");
     }
 
+    #[cfg(unix)] // file modes are a Unix thing (the server is Linux)
     #[test]
     fn gate_refuses_readable_key_file() {
         use std::os::unix::fs::PermissionsExt;
