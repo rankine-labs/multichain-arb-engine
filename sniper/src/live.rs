@@ -225,6 +225,30 @@ fn encode_fields(f: &TxFields) -> Result<Vec<u8>, String> {
     Ok(b)
 }
 
+/// 32 random bytes for THROWAWAY keys (dry-fire and tests only; the live
+/// wallet always comes from its key file). Unix: the OS random device.
+/// Elsewhere (the Windows build): std's per-process random hash keys, which
+/// the OS seeds; fine for a key that never holds money.
+fn random_bytes() -> Result<[u8; 32], String> {
+    let mut b = [0u8; 32];
+    #[cfg(unix)]
+    {
+        use std::io::Read;
+        std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut b)).map_err(|e| format!("no random source: {}", e.kind()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        use std::hash::{BuildHasher, Hasher};
+        for (i, chunk) in b.chunks_mut(8).enumerate() {
+            let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+            h.write_usize(i);
+            h.write_u128(SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
+            chunk.copy_from_slice(&h.finish().to_le_bytes());
+        }
+    }
+    Ok(b)
+}
+
 /// The sniper's wallet. The key lives only in here and is wiped on drop.
 pub struct Signer {
     key: SecretKey,
@@ -297,10 +321,8 @@ impl Signer {
 
     /// A throwaway key (dry-fire and tests).
     pub fn random() -> Result<Signer, String> {
-        use std::io::Read;
         for _ in 0..8 {
-            let mut b = [0u8; 32];
-            std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut b)).map_err(|e| format!("no random source: {}", e.kind()))?;
+            let mut b = random_bytes()?;
             if let Ok(s) = Signer::from_bytes(&mut b) {
                 return Ok(s);
             }
