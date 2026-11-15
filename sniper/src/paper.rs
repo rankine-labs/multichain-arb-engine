@@ -638,7 +638,7 @@ impl Config {
 
 /// Look up a pool: must be a Uniswap V3 pool (our factory) with exactly one
 /// side WETH or USDG. One batched request.
-fn pool_info(url: &str, agent: &ureq::Agent, pool: &str) -> Option<Pool> {
+pub fn pool_info(url: &str, agent: &ureq::Agent, pool: &str) -> Option<Pool> {
     let call = |id: u64, sel: &str| json!({"jsonrpc": "2.0", "id": id, "method": "eth_call", "params": [{"to": pool, "data": sel}, "latest"]});
     // token0, token1, fee, factory
     let body = json!([call(1, "0x0dfe1681"), call(2, "0xd21220a7"), call(3, "0xddca3f43"), call(4, "0xc45a0155")]);

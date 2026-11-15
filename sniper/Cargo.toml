@@ -29,6 +29,11 @@ tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 # keccak256, to compute event ids (topic0) from their signatures.
 tiny-keccak = { version = "2", features = ["keccak"] }
 ruint = "1"
+# (live sender, off by default) sign our own trades: libsecp256k1 with
+# RFC 6979 deterministic signatures, same version the arb bot's sender uses.
+secp256k1 = { version = "=0.31.1", features = ["recovery", "global-context"] }
+# wipe key bytes from memory after use
+zeroize = "1"
 ureq = { version = "3", default-features = false, features = ["rustls", "json"] }
 
 [profile.release]

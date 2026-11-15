@@ -9,6 +9,8 @@
 //                                   (env: SNIPER_RPC, SNIPER_WALLET)
 //   sniper paper                    Robinhood paper trader (no money; env: src/paper.rs)
 //   sniper paper-report <dir>       its results
+//   sniper dry-fire <pool> <usd>    live sender's real calls in a free
+//                                   simulation (no key, no money)
 //   sniper rhc-probe                Robinhood Chain speed test (read-only;
 //                                   env: see src/rhc.rs)
 //   sniper rhc-report <dir>         its results (head start, rushes, trades)
@@ -100,6 +102,26 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        Some("dry-fire") => {
+            // sniper dry-fire <pool> <usd> [slip_bps]: the live sender's exact
+            // buy + sell calls, run in a free simulation. No key, no money.
+            let (Some(pool), Some(usd)) = (args.get(1), args.get(2).and_then(|v| v.parse::<f64>().ok())) else {
+                eprintln!("usage: sniper dry-fire <pool address> <usd> [slip_bps]   (env: SNIPER_RHC_HTTP)");
+                return ExitCode::FAILURE;
+            };
+            let slip = args.get(3).and_then(|v| v.parse::<u64>().ok()).unwrap_or(300);
+            let url = std::env::var("SNIPER_RHC_HTTP").unwrap_or_else(|_| sniper::rhc::DEFAULT_HTTP.to_string());
+            match sniper::live::dry_fire_usd(&url, pool, usd, slip) {
+                Ok(line) => {
+                    println!("{line}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("dry-fire: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         Some("feed-report") => {
             let Some(dir) = args.get(1) else {
                 eprintln!("usage: sniper feed-report <dir>");

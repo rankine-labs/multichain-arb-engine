@@ -22,6 +22,7 @@ pub mod curve;
 pub mod feedtx;
 pub mod feedwatch;
 pub mod fourmeme;
+pub mod live;
 pub mod matcher;
 pub mod paper;
 pub mod probe;
