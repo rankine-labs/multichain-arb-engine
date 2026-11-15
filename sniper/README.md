@@ -133,6 +133,26 @@ reason, and the report's last line counts them):
 - **too thin**: no size in `SNIPER_SIZES` survives an instant round trip
   with at most `SNIPER_AUTO_MAX_RT_PCT` (1.5) loss.
 
+- **unsafe hook**: a Uniswap V4 pool whose hook can change swap amounts
+  (beforeSwapReturnDelta / afterSwapReturnDelta flags). Hook-free pools and
+  hooks without those flags are traded.
+- **unknown v4 pool**: a rush in a V4 pool whose key (coins, fee, tick
+  spacing, hook) we never saw, because the pool was created before the run
+  and the node could not find its Initialize event in history.
+- **few real buyers**: V4 swap logs only name the router, so a V4 rush's
+  transactions are looked up and the signing wallets counted; fewer than
+  `SNIPER_RUSH_BUYS` different wallets = skip.
+
+Venues: `SNIPER_VENUES` (default `v3,v4,v2`) picks Uniswap V3 (QuoterV2),
+Uniswap V4 (V4Quoter, keys from Initialize events saved to
+`<out>/v4_pool_keys.json`, native-ETH pools included) and Uniswap V2
+(reserves maths, 0.30% fee). All venues go through the same filters, sizes,
+exits and race check; the V4 trap check moves tokens to/from the
+PoolManager, which holds every V4 pool's coins. The report has a "by venue"
+section (rushes, taken, trades, wins, P&L, late P&L). `SNIPER_V4_LOOKUP=off`
+stops the background search for old V4 pools. Dry-fire (and any future
+live sending) is Uniswap V3 only; it refuses V4 pool ids and V2 pairs.
+
 Rush buyers are counted as different wallets receiving the tokens (the
 swap's recipient), not different transactions. A router that receives the
 tokens itself can hide the real wallet, so we may under-count buyers.

@@ -16,6 +16,7 @@
 //   rhc.rs       Robinhood Chain speed test probe (feed timing + all swaps)
 //   rhc_report.rs  head start, rushes, simulated fast trades
 //   report.rs    coverage / lead time / follow-through numbers
+//   venue.rs     Uniswap V3 / V4 / V2 venue facts for the paper trader
 // ============================================================================
 pub mod calibrate;
 pub mod curve;
@@ -33,4 +34,5 @@ pub mod rhc_report;
 pub mod scan;
 pub mod sellcheck;
 pub mod taxcheck;
+pub mod venue;
 pub mod ws;

@@ -2,8 +2,8 @@
 // PAPER TRADER (Robinhood Chain): the fast buy/sell idea, live, no money.
 //
 // Plain English:
-//   1. Watch every Uniswap V3 trade on Robinhood Chain (coins priced in WETH
-//      or USDG), straight from a node, a few times a second.
+//   1. Watch every Uniswap V3, V4 and V2 trade on Robinhood Chain (coins
+//      priced in WETH, USDG or native ETH), straight from a node.
 //   2. RUSH = at least 3 different buyers in one coin within ~1 second and
 //      the price up >= 2% (the only rule that beat random entries in our
 //      research). Single big buys are ignored: they lost money.
@@ -65,6 +65,22 @@
 // restart keeps it. Entries never expire during a run. Delete the file (or
 // a line in it) by hand to forgive a token.
 //
+// Venues (SNIPER_VENUES, default "v3,v4,v2"; details in venue.rs):
+//   v3  Uniswap V3 pools (our factory), priced by QuoterV2.
+//   v4  Uniswap V4 pools (one PoolManager), priced by V4Quoter. Pool keys
+//       come from Initialize events (kept in <out>/v4_pool_keys.json); old
+//       pools are looked up once in the background; if that fails, their
+//       rushes are skipped as "unknown v4 pool". Pools whose hook can change
+//       swap amounts are skipped as "unsafe hook". Native-ETH pools are
+//       included (priced as ETH). V4 swap logs don't name the buyer, so a
+//       V4 rush's transactions are looked up and the SIGNING wallets are
+//       counted; too few = "few real buyers".
+//   v2  Uniswap V2 pairs (our factory), priced with reserves maths (0.30%).
+//   Every venue goes through the SAME filters, sizes, exits and race check.
+//   The trap check for V4 moves tokens to/from the PoolManager (it holds
+//   every V4 pool's coins). The report splits results per venue.
+//   SNIPER_V4_LOOKUP=off   don't search history for old V4 pools.
+//
 // Race check: the normal quote is taken the instant we decide, which assumes
 // our transaction would land on that exact price. In reality it lands at
 // least one block later, after other traders. So every buy and every sell is
@@ -83,9 +99,10 @@ use ruint::aliases::U256;
 use serde_json::{json, Value};
 
 use crate::fourmeme::{hex, hex_u64, keccak};
-use crate::rhc::{base_decimals, sig_v3_swap};
+use crate::rhc::{base_decimals, sig_v3_swap, sig_v4_init, sig_v4_swap, V4_POOL_MANAGER};
 use crate::rhc_report::token_price;
 use crate::sellcheck::Rpc;
+use crate::venue::{self, Venue, VenueKind, V4Key};
 
 /// Uniswap V3 on Robinhood Chain (src/config/knownAddresses.ts ROBINHOOD_V3).
 pub const V3_FACTORY: &str = "0x1f7d7550b1b028f7571e69a784071f0205fd2efa";
@@ -101,8 +118,9 @@ const GAS_OVERHEAD: u64 = 60_000;
 
 /// Anything that can price a swap. Real one asks the chain; tests use a fake.
 pub trait Quoter {
-    /// (amount out, gas estimate) for swapping `amount_in` of token_in.
-    fn quote(&self, token_in: &str, token_out: &str, fee: u32, amount_in: U256) -> Result<(U256, u64), String>;
+    /// (amount out, gas estimate) for swapping `amount_in` of token_in in
+    /// the pool described by `venue` (V3 fee tier, V4 key or V2 pair).
+    fn quote(&self, venue: &Venue, token_in: &str, token_out: &str, amount_in: U256) -> Result<(U256, u64), String>;
     /// Gas price in wei.
     fn gas_price(&self) -> Result<U256, String>;
 }
@@ -121,8 +139,9 @@ pub struct ChainQuoter {
     pub rpc: Rpc,
 }
 
-impl Quoter for ChainQuoter {
-    fn quote(&self, token_in: &str, token_out: &str, fee: u32, amount_in: U256) -> Result<(U256, u64), String> {
+impl ChainQuoter {
+    /// Uniswap V3: QuoterV2.quoteExactInputSingle.
+    fn quote_v3(&self, token_in: &str, token_out: &str, fee: u32, amount_in: U256) -> Result<(U256, u64), String> {
         let r = self
             .rpc
             .call("eth_call", json!([{"to": V3_QUOTER_V2, "data": data_quote(token_in, token_out, fee, amount_in)}, "latest"]))?;
@@ -135,6 +154,37 @@ impl Quoter for ChainQuoter {
         let gas = u64::from_str_radix(h[192..256].trim_start_matches('0'), 16).unwrap_or(150_000);
         Ok((out, gas))
     }
+
+    /// Uniswap V4: V4Quoter.quoteExactInputSingle with the pool's exact key
+    /// (runs the real swap, hook included, inside a reverted simulation).
+    fn quote_v4(&self, key: &V4Key, token_in: &str, amount_in: U256) -> Result<(U256, u64), String> {
+        let zfo = venue::v4_zero_for_one(key, token_in).ok_or("v4 quote: token not in pool")?;
+        let r = self.rpc.call("eth_call", json!([{"to": venue::V4_QUOTER, "data": venue::data_v4_quote(key, zfo, amount_in)?}, "latest"]))?;
+        venue::parse_v4_quote(r.as_str().ok_or("v4 quote: no data")?)
+    }
+
+    /// Uniswap V2: the pair's current reserves and the 0.30% fee formula.
+    fn quote_v2(&self, pair: &str, token0: &str, token_in: &str, amount_in: U256) -> Result<(U256, u64), String> {
+        // getReserves() = 0x0902f1ac
+        let r = self.rpc.call("eth_call", json!([{"to": pair, "data": "0x0902f1ac"}, "latest"]))?;
+        let (r0, r1) = venue::v2_reserves(r.as_str().unwrap_or("")).ok_or("v2 quote: reserves unreadable")?;
+        let (r_in, r_out) = if token_in.eq_ignore_ascii_case(token0) { (r0, r1) } else { (r1, r0) };
+        let out = venue::v2_amount_out(amount_in, r_in, r_out);
+        if out.is_zero() {
+            return Err("v2 quote: empty pool".into());
+        }
+        Ok((out, venue::V2_SWAP_GAS))
+    }
+}
+
+impl Quoter for ChainQuoter {
+    fn quote(&self, venue: &Venue, token_in: &str, token_out: &str, amount_in: U256) -> Result<(U256, u64), String> {
+        match venue {
+            Venue::V3 { fee } => self.quote_v3(token_in, token_out, *fee, amount_in),
+            Venue::V4 { key } => self.quote_v4(key, token_in, amount_in),
+            Venue::V2 { pair, token0 } => self.quote_v2(pair, token0, token_in, amount_in),
+        }
+    }
     fn gas_price(&self) -> Result<U256, String> {
         let r = self.rpc.call("eth_gasPrice", json!([]))?;
         U256::from_str_radix(r.as_str().unwrap_or("0x0").trim_start_matches("0x"), 16).map_err(|e| e.to_string())
@@ -146,7 +196,7 @@ pub fn eth_usd(q: &dyn Quoter) -> Option<f64> {
     let one = U256::from(10u64).pow(U256::from(18));
     [500u32, 3000, 100, 10000]
         .iter()
-        .filter_map(|f| q.quote(WETH, USDG, *f, one).ok())
+        .filter_map(|f| q.quote(&Venue::V3 { fee: *f }, WETH, USDG, one).ok())
         .map(|(out, _)| f64::from(out) / 1e6)
         .fold(None, |a: Option<f64>, x| Some(a.map_or(x, |y| y.max(x))))
 }
@@ -158,10 +208,22 @@ pub fn eth_usd(q: &dyn Quoter) -> Option<f64> {
 #[derive(Clone, Debug)]
 pub struct Pool {
     pub token: String,
+    /// "WETH", "USDG" or (V4 only) "ETH".
     pub base: &'static str,
+    /// The base coin's address (0x000..0 for native ETH).
     pub base_addr: String,
     pub token_is0: bool,
+    /// LP fee in millionths, for display (V3 also uses it to pick the pool).
     pub fee: u32,
+    /// Which exchange type, with what its quoter needs.
+    pub venue: Venue,
+}
+
+impl Pool {
+    /// "v3" / "v4" / "v2", for files and the report.
+    pub fn venue_name(&self) -> &'static str {
+        self.venue.kind().name()
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -188,6 +250,9 @@ pub struct RushSig {
     pub price: f64,
     /// Price just before the first buy of this rush (for "already jumped").
     pub start_price: f64,
+    /// The different buyer ids in the rush window (wallets, or transaction
+    /// hashes for V4, which are looked up before trading).
+    pub buyers: Vec<String>,
 }
 
 #[derive(Default)]
@@ -234,11 +299,19 @@ impl Detector {
         }
         st.cooldown_until = block + r.window_blocks;
         let start_price = st.buys.front().map_or(p0, |(_, _, before)| *before);
-        Some(RushSig { pool: pool.to_string(), block, price, start_price })
+        let mut ids: Vec<String> = buyers.into_iter().map(str::to_string).collect();
+        ids.sort();
+        Some(RushSig { pool: pool.to_string(), block, price, start_price, buyers: ids })
     }
 
     pub fn last_price(&self, pool: &str) -> Option<f64> {
         self.pools.get(pool).and_then(|s| s.last_price)
+    }
+
+    /// Drop everything known about one detector key (used when an unknown
+    /// V4 pool's key arrives: its old prices may have been the wrong way up).
+    pub fn forget(&mut self, pool: &str) {
+        self.pools.remove(pool);
     }
 }
 
@@ -381,7 +454,22 @@ impl Blocklist {
 
 /// Skip reasons we count separately in the report (in report order). Each
 /// skip line in signals.jsonl has a "why" starting with one of these.
-pub const SKIP_REASONS: [&str; 5] = ["blocked token", "no sell history", "already jumped", "too thin", "unsafe"];
+/// Matching takes the FIRST reason a "why" starts with, so "unsafe hook"
+/// must stay before "unsafe" (the trap check, always last).
+pub const SKIP_REASONS: [&str; 8] =
+    ["blocked token", "unsafe hook", "unknown v4 pool", "no sell history", "already jumped", "few real buyers", "too thin", "unsafe"];
+/// Index of the trap-check reason ("unsafe") in SKIP_REASONS.
+const UNSAFE_IDX: usize = SKIP_REASONS.len() - 1;
+
+/// Suffix for the "mirror" detector of a V4 pool whose key we don't know
+/// (we can't tell which coin is the token, so we watch the price both ways
+/// up; see run()). Never a real pool id.
+pub const MIRROR: &str = "~inv";
+
+/// The pool id a detector key belongs to (strips the mirror suffix).
+pub fn base_pool_id(detector_key: &str) -> &str {
+    detector_key.strip_suffix(MIRROR).unwrap_or(detector_key)
+}
 
 // ---------------------------------------------------------------------------
 // The paper position
@@ -495,7 +583,7 @@ pub struct LateTrade {
 pub fn step_late(t: &mut LateTrade, last_block: u64, q: &dyn Quoter, eth_usd: f64) -> Option<Value> {
     // Step 1: the late buy (same money in, same pool and fee).
     if t.buy == LateQuote::Pending && last_block >= t.buy_due {
-        match q.quote(&t.info.base_addr, &t.info.token, t.info.fee, t.base_in) {
+        match q.quote(&t.info.venue, &t.info.base_addr, &t.info.token, t.base_in) {
             Ok((toks, gas)) if !toks.is_zero() => t.buy = LateQuote::Done(toks, gas),
             other => {
                 if gave_up(t.buy_due, last_block) {
@@ -510,7 +598,7 @@ pub fn step_late(t: &mut LateTrade, last_block: u64, q: &dyn Quoter, eth_usd: f6
         return None;
     }
     let entry_slip = |late: U256| slip_pct(f64::from(t.opt_tokens), f64::from(late));
-    let base = json!({"late_for": t.pool, "token": t.info.token, "open_block": t.open_block});
+    let base = json!({"late_for": t.pool, "token": t.info.token, "open_block": t.open_block, "venue": t.info.venue_name()});
     let with = |mut v: Value, extra: Value| {
         if let (Some(m), Some(e)) = (v.as_object_mut(), extra.as_object()) {
             m.extend(e.clone());
@@ -522,7 +610,7 @@ pub fn step_late(t: &mut LateTrade, last_block: u64, q: &dyn Quoter, eth_usd: f6
         LateQuote::Pending => None,
         // Late buy impossible: we would never have held the coin.
         LateQuote::Failed(e) => Some(with(base, json!({"late_net_usd": null, "late_failed": "buy", "error": e}))),
-        LateQuote::Done(late_tokens, gas_in) => match q.quote(&t.info.token, &t.info.base_addr, t.info.fee, late_tokens) {
+        LateQuote::Done(late_tokens, gas_in) => match q.quote(&t.info.venue, &t.info.token, &t.info.base_addr, late_tokens) {
             Ok((out, gas_out)) => {
                 let gp = q.gas_price().unwrap_or(U256::ZERO);
                 let (_, net) = pnl_usd(t.base_in, out, t.info.base, t.usd_per_base, gas_in + gas_out + 2 * GAS_OVERHEAD, gp, eth_usd);
@@ -603,6 +691,10 @@ pub struct Config {
     pub poll: Duration,
     /// Race check: how many blocks after deciding we assume our tx lands.
     pub late_blocks: u64,
+    /// Exchange types to watch (SNIPER_VENUES, default v3,v4,v2).
+    pub venues: Vec<VenueKind>,
+    /// Look up old V4 pools' keys from history (SNIPER_V4_LOOKUP, default on).
+    pub v4_lookup: bool,
 }
 
 impl Config {
@@ -632,8 +724,16 @@ impl Config {
             },
             poll: Duration::from_millis(f("SNIPER_RHC_POLL_MS", 200.0) as u64),
             late_blocks: f("SNIPER_LATE_BLOCKS", 2.0) as u64,
+            // A bad list is caught in run() (venues_from_env) so the error is shown.
+            venues: venue::parse_venues(&std::env::var("SNIPER_VENUES").unwrap_or_else(|_| "v3,v4,v2".into())).unwrap_or_default(),
+            v4_lookup: std::env::var("SNIPER_V4_LOOKUP").map(|v| v != "off").unwrap_or(true),
         }
     }
+}
+
+/// The venue list from SNIPER_VENUES, with the error text if it is bad.
+pub fn venues_from_env() -> Result<Vec<VenueKind>, String> {
+    venue::parse_venues(&std::env::var("SNIPER_VENUES").unwrap_or_else(|_| "v3,v4,v2".into()))
 }
 
 /// Look up a pool: must be a Uniswap V3 pool (our factory) with exactly one
@@ -657,7 +757,140 @@ pub fn pool_info(url: &str, agent: &ureq::Agent, pool: &str) -> Option<Pool> {
         return None;
     }
     let base_addr = if token_is0 { t1 } else { t0 };
-    Some(Pool { token, base, base_addr, token_is0, fee })
+    Some(Pool { token, base, base_addr, token_is0, fee, venue: Venue::V3 { fee } })
+}
+
+/// Look up a Uniswap V2 pair: must come from our V2 factory (not a fork,
+/// e.g. PancakeSwap V2 emits the same events with a different fee) with
+/// exactly one side WETH or USDG. One batched request.
+pub fn v2_pool_info(url: &str, agent: &ureq::Agent, pair: &str) -> Option<Pool> {
+    let call = |id: u64, sel: &str| json!({"jsonrpc": "2.0", "id": id, "method": "eth_call", "params": [{"to": pair, "data": sel}, "latest"]});
+    // token0, token1, factory
+    let body = json!([call(1, "0x0dfe1681"), call(2, "0xd21220a7"), call(4, "0xc45a0155")]);
+    let mut r = agent.post(url).send_json(&body).ok()?;
+    let v: Value = r.body_mut().read_json().ok()?;
+    let get = |id: u64| v.as_array()?.iter().find(|x| x["id"] == id).and_then(|x| x["result"].as_str()).map(str::to_string);
+    let addr = |h: String| (h.len() >= 66).then(|| format!("0x{}", h.trim_start_matches("0x")[24..64].to_ascii_lowercase()));
+    let (t0, t1, factory) = (addr(get(1)?)?, addr(get(2)?)?, addr(get(4)?)?);
+    v2_pool_from(pair, &t0, &t1, &factory)
+}
+
+/// The V2 part of v2_pool_info that needs no node (testable).
+pub fn v2_pool_from(pair: &str, t0: &str, t1: &str, factory: &str) -> Option<Pool> {
+    if !factory.eq_ignore_ascii_case(venue::V2_FACTORY) {
+        return None;
+    }
+    let p = crate::rhc::PoolInfo { token0: t0.to_string(), token1: t1.to_string(), fee_ppm: Some(venue::V2_FEE_PPM as u64) };
+    let (token, base, token_is0) = p.sides()?;
+    if base == "ETH" {
+        return None; // V2 pairs can't hold native ETH
+    }
+    let base_addr = if token_is0 { t1 } else { t0 }.to_string();
+    Some(Pool { token, base, base_addr, token_is0, fee: venue::V2_FEE_PPM, venue: Venue::V2 { pair: pair.to_ascii_lowercase(), token0: t0.to_string() } })
+}
+
+/// A tradable pool from a V4 key: exactly one side WETH, USDG or native
+/// ETH. (Hook safety is checked at rush time, so those rushes are counted.)
+pub fn v4_pool(key: &V4Key) -> Option<Pool> {
+    let p = crate::rhc::PoolInfo { token0: key.currency0.clone(), token1: key.currency1.clone(), fee_ppm: Some(key.fee_ppm() as u64) };
+    let (token, base, token_is0) = p.sides()?;
+    let base_addr = if token_is0 { key.currency1.clone() } else { key.currency0.clone() };
+    Some(Pool { token, base, base_addr, token_is0, fee: key.fee_ppm(), venue: Venue::V4 { key: key.clone() } })
+}
+
+/// Which event a log is, for the venues we watch.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum LogKind {
+    V3Swap,
+    V4Swap,
+    V4Init,
+    V2Swap,
+    V2Sync,
+}
+
+/// The event ids (topic0) to subscribe to / ask for, per enabled venue.
+pub fn topics_for(venues: &[VenueKind]) -> Vec<(String, LogKind)> {
+    let mut t = Vec::new();
+    for v in venues {
+        match v {
+            VenueKind::V3 => t.push((sig_v3_swap(), LogKind::V3Swap)),
+            VenueKind::V4 => {
+                t.push((sig_v4_swap(), LogKind::V4Swap));
+                t.push((sig_v4_init(), LogKind::V4Init));
+            }
+            VenueKind::V2 => {
+                t.push((venue::sig_v2_swap(), LogKind::V2Swap));
+                t.push((venue::sig_v2_sync(), LogKind::V2Sync));
+            }
+        }
+    }
+    t
+}
+
+/// Classify a log by its topic0 (V4 events only count from the real PoolManager).
+pub fn log_kind(log: &Value, topics: &[(String, LogKind)]) -> Option<LogKind> {
+    let t0 = log["topics"].as_array()?.first()?.as_str()?.to_ascii_lowercase();
+    let k = topics.iter().find(|(t, _)| *t == t0)?.1;
+    let from_pm = log["address"].as_str().is_some_and(|a| a.eq_ignore_ascii_case(V4_POOL_MANAGER));
+    match k {
+        LogKind::V4Swap | LogKind::V4Init if !from_pm => None,
+        k => Some(k),
+    }
+}
+
+/// Ask the node who signed each transaction (one batched request).
+fn tx_signers(url: &str, agent: &ureq::Agent, hashes: &[String]) -> Result<HashMap<String, String>, String> {
+    if hashes.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let body: Vec<Value> = hashes
+        .iter()
+        .enumerate()
+        .map(|(i, h)| json!({"jsonrpc": "2.0", "id": i + 1, "method": "eth_getTransactionByHash", "params": [h]}))
+        .collect();
+    let mut r = agent.post(url).send_json(Value::Array(body)).map_err(|e| format!("tx lookup: {e}"))?;
+    let v: Value = r.body_mut().read_json().map_err(|e| format!("tx lookup: bad reply: {e}"))?;
+    Ok(venue::signers_from_replies(&v))
+}
+
+/// Background helper: finds old V4 pools' Initialize events, one at a time,
+/// so a slow history search never holds up the trading loop. Send it pool
+/// ids; it answers (id, key or None). It stops asking once the node shows
+/// it can't do it (venue::LookupBudget).
+fn spawn_v4_lookup(url: String) -> (std::sync::mpsc::Sender<String>, std::sync::mpsc::Receiver<(String, Option<V4Key>)>) {
+    let (req_tx, req_rx) = std::sync::mpsc::channel::<String>();
+    let (ans_tx, ans_rx) = std::sync::mpsc::channel::<(String, Option<V4Key>)>();
+    std::thread::spawn(move || {
+        let rpc = Rpc::new(&url);
+        let mut budget = venue::LookupBudget::default();
+        let mut told = false;
+        for id in req_rx {
+            if !budget.open() {
+                if !told {
+                    eprintln!("paper: old V4 pool lookups stopped (this node can't search V4 history); those pools stay \"unknown v4 pool\"");
+                    told = true;
+                }
+                let _ = ans_tx.send((id, None));
+                continue;
+            }
+            let r = rpc.call("eth_getLogs", venue::v4_init_lookup_params(&id));
+            let key = r.as_ref().ok().and_then(|v| v.as_array().and_then(|a| a.iter().find_map(venue::decode_v4_init))).filter(|(i, _)| *i == id).map(|(_, k)| k);
+            budget.record(&r.map(|_| key.is_some()));
+            if ans_tx.send((id, key)).is_err() {
+                break;
+            }
+        }
+    });
+    (req_tx, ans_rx)
+}
+
+/// Per-venue tallies for the status line.
+#[derive(Clone, Debug, Default)]
+struct VenueTally {
+    rushes: u64,
+    trades: u64,
+    wins: u64,
+    pnl: f64,
 }
 
 /// Race check: when a position closes, tell its late job when to re-quote
@@ -675,6 +908,9 @@ fn words(data: &str) -> Vec<&str> {
 }
 
 pub fn run(cfg: Config) -> Result<(), String> {
+    if cfg.venues.is_empty() {
+        return Err(venues_from_env().err().unwrap_or_else(|| "SNIPER_VENUES: no venues".into()));
+    }
     fs::create_dir_all(&cfg.out).map_err(|e| e.to_string())?;
     let open = |n: &str| OpenOptions::new().create(true).append(true).open(cfg.out.join(n)).map(BufWriter::new).map_err(|e| e.to_string());
     let (mut f_trades, mut f_sig, mut f_meta) = (open("paper_trades.jsonl")?, open("signals.jsonl")?, open("meta.jsonl")?);
@@ -690,34 +926,47 @@ pub fn run(cfg: Config) -> Result<(), String> {
     let mut eth = eth_usd(&quoter).ok_or("could not price ETH in USDG (node or quoter unreachable)")?;
     let mut eth_at = Instant::now();
     let wall_ms = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
+    let venue_names: Vec<&str> = cfg.venues.iter().map(|v| v.name()).collect();
     write(
         &mut f_meta,
         json!({"event": "start", "wall_ms": wall_ms, "usd": cfg.usd, "sizing": "auto", "max_usd": cfg.max_usd, "sizes": cfg.sizes,
                "min_sells": cfg.min_sells, "max_rise_pct": cfg.max_rise_pct, "tp": cfg.tp, "sl": cfg.sl, "hold_s": cfg.hold.as_secs_f64(),
                "rush_buys": cfg.rules.buys, "window_blocks": cfg.rules.window_blocks, "rise_pct": cfg.rules.rise_pct,
-               "node": crate::probe::redact(&cfg.http), "push": cfg.wss.as_deref().map(crate::probe::redact), "eth_usd": eth, "late_blocks": cfg.late_blocks}),
+               "node": crate::probe::redact(&cfg.http), "push": cfg.wss.as_deref().map(crate::probe::redact), "eth_usd": eth, "late_blocks": cfg.late_blocks,
+               "venues": venue_names, "v4_lookup": cfg.v4_lookup}),
     )?;
     // Permanent blocklist: load what earlier runs in this folder learned.
     let block_path = cfg.out.join(Blocklist::FILE);
     let mut blocklist = Blocklist::load(&block_path)?;
+    // V4 pool keys seen by earlier runs in this folder (a damaged file only
+    // costs us those pools, so it is reported, not fatal).
+    let keys_path = cfg.out.join(venue::V4Keys::FILE);
+    let mut v4keys = venue::V4Keys::load(&keys_path).unwrap_or_else(|e| {
+        eprintln!("paper: V4 pool keys not loaded ({e}); starting empty");
+        venue::V4Keys::default()
+    });
     eprintln!(
-        "paper: writing to {} | ETH ${eth:.0} | auto size, max ${} | TP {}% SL {}% hold {}s | {} blocked tokens loaded",
+        "paper: writing to {} | venues {} | ETH ${eth:.0} | auto size, max ${} | TP {}% SL {}% hold {}s | {} blocked tokens, {} V4 pool keys loaded",
         cfg.out.display(),
+        venue_names.join(","),
         cfg.max_usd,
         cfg.tp * 100.0,
         cfg.sl * 100.0,
         cfg.hold.as_secs_f64(),
-        blocklist.tokens.len()
+        blocklist.tokens.len(),
+        v4keys.keys.len()
     );
 
-    let swap_topic = sig_v3_swap();
-    // Push mode: a websocket thread hands us each V3 swap log as it happens.
+    // Event ids to watch, for the enabled venues (one subscription, OR'ed).
+    let topics = topics_for(&cfg.venues);
+    let topic_list: Vec<String> = topics.iter().map(|(t, _)| t.clone()).collect();
+    // Push mode: a websocket thread hands us each matching log as it happens.
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let log_rx = cfg.wss.clone().map(|url| {
         let (ltx, lrx) = std::sync::mpsc::channel::<Value>();
-        let (stop2, topic, shown) = (stop.clone(), swap_topic.clone(), crate::probe::redact(&url));
+        let (stop2, tl, shown) = (stop.clone(), topic_list.clone(), crate::probe::redact(&url));
         std::thread::spawn(move || {
-            let subs = [crate::ws::Sub { label: "logs", params: json!(["logs", {"topics": [[topic]]}]), fallback: None }];
+            let subs = [crate::ws::Sub { label: "logs", params: json!(["logs", {"topics": [tl]}]), fallback: None }];
             crate::ws::run(
                 &url,
                 &subs,
@@ -733,7 +982,14 @@ pub fn run(cfg: Config) -> Result<(), String> {
         eprintln!("paper: swaps pushed from {shown}");
         lrx
     });
+    // Old V4 pools: background history lookups (off with SNIPER_V4_LOOKUP=off).
+    let lookup = (cfg.venues.contains(&VenueKind::V4) && cfg.v4_lookup).then(|| spawn_v4_lookup(cfg.http.clone()));
+    let mut v4_asked: HashSet<String> = HashSet::new();
+    // Pool address (V3/V2) or pool id (V4) -> what we know. None = known and
+    // not tradable. Missing = not looked up yet (or a V4 pool with no key).
     let mut pools: HashMap<String, Option<Pool>> = HashMap::new();
+    // Latest V2 reserves per pair, from Sync events.
+    let mut v2_res: HashMap<String, (U256, U256)> = HashMap::new();
     let mut det = Detector::default();
     let mut sells = SellHistory::default();
     let mut pos: Option<Position> = None;
@@ -741,6 +997,7 @@ pub fn run(cfg: Config) -> Result<(), String> {
     let (mut n_trades, mut n_wins, mut total, mut n_rush, mut n_skipped) = (0u64, 0u64, 0.0f64, 0u64, 0u64);
     let mut n_unsafe = 0u64; // rushes skipped by the tax/trap check
     let mut n_filtered = 0u64; // rushes skipped by the other safety filters
+    let mut tally: BTreeMap<&'static str, VenueTally> = BTreeMap::new();
     // Put a token on the blocklist and save the file right away.
     let block = |bl: &mut Blocklist, token: &str, why: &str| {
         if bl.add(token, why) {
@@ -770,10 +1027,24 @@ pub fn run(cfg: Config) -> Result<(), String> {
             }
             eth_at = Instant::now();
         }
-        // ---- new swaps (pushed or polled) ----
+        // ---- old V4 pools the helper found ----
+        if let Some((_, rx)) = &lookup {
+            for (id, key) in rx.try_iter() {
+                let Some(k) = key else { continue }; // not found: stays unknown
+                let p = v4_pool(&k);
+                if p.is_some() {
+                    v4keys.insert(k);
+                }
+                pools.insert(id.clone(), p);
+                // Its detectors so far guessed the price direction: start clean.
+                det.forget(&id);
+                det.forget(&format!("{id}{MIRROR}"));
+            }
+        }
+        // ---- new logs (pushed or polled) ----
         let mut logs: Vec<Value> = Vec::new();
         if let Some(rx) = &log_rx {
-            // Wait briefly for the next swap, then take everything queued.
+            // Wait briefly for the next log, then take everything queued.
             if let Ok(v) = rx.recv_timeout(cfg.poll.min(Duration::from_millis(50))) {
                 logs.push(v);
                 logs.extend(rx.try_iter());
@@ -798,7 +1069,7 @@ pub fn run(cfg: Config) -> Result<(), String> {
                 Some(l) => (l + 1).max(head.saturating_sub(50)),
             };
             if from <= head {
-                let params = json!([{"fromBlock": format!("0x{from:x}"), "toBlock": format!("0x{head:x}"), "topics": [[swap_topic]]}]);
+                let params = json!([{"fromBlock": format!("0x{from:x}"), "toBlock": format!("0x{head:x}"), "topics": [topic_list]}]);
                 match rpc.call("eth_getLogs", params) {
                     Ok(v) => {
                         last_block = Some(head);
@@ -814,6 +1085,8 @@ pub fn run(cfg: Config) -> Result<(), String> {
             }
         }
         let mut rushes: Vec<RushSig> = Vec::new();
+        // Rushes on V4 pools whose key we don't know: counted, never traded.
+        let mut unknown_rushes: Vec<RushSig> = Vec::new();
         {
             let mut logs = logs;
             logs.sort_by_key(|l| (hex_u64(l.get("blockNumber")), hex_u64(l.get("logIndex"))));
@@ -822,21 +1095,89 @@ pub fn run(cfg: Config) -> Result<(), String> {
                 if log["removed"].as_bool() == Some(true) {
                     continue;
                 }
-                let Some(pool) = log["address"].as_str().map(str::to_ascii_lowercase) else { continue };
-                if !pools.contains_key(&pool) {
-                    let info = pool_info(&cfg.http, &agent, &pool);
-                    pools.insert(pool.clone(), info);
-                }
-                let Some(Some(info)) = pools.get(&pool) else { continue };
+                let Some(kind) = log_kind(log, &topics) else { continue };
+                let addr = log["address"].as_str().map(str::to_ascii_lowercase).unwrap_or_default();
                 let w = words(log["data"].as_str().unwrap_or(""));
-                let Some(sp) = w.get(2) else { continue };
-                let Some(price) = token_price(&crate::fourmeme::word_dec(sp), info.token_is0) else { continue };
                 let block = hex_u64(log.get("blockNumber"));
+                let pool = match kind {
+                    LogKind::V4Init => {
+                        // A new V4 pool: remember its key (only pairs we could trade).
+                        if let Some((id, key)) = venue::decode_v4_init(log) {
+                            let p = v4_pool(&key);
+                            if p.is_some() {
+                                v4keys.insert(key);
+                            }
+                            pools.insert(id, p);
+                        }
+                        continue;
+                    }
+                    LogKind::V2Sync => {
+                        // V2 reserves (each Swap comes right after its Sync).
+                        if !matches!(pools.get(&addr), Some(None)) {
+                            if let Some(r) = venue::v2_reserves(log["data"].as_str().unwrap_or("")) {
+                                v2_res.insert(addr, r);
+                            }
+                        }
+                        continue;
+                    }
+                    LogKind::V4Swap => match log["topics"][1].as_str() {
+                        Some(id) => id.to_ascii_lowercase(),
+                        None => continue,
+                    },
+                    LogKind::V3Swap | LogKind::V2Swap => addr,
+                };
+                if !pools.contains_key(&pool) {
+                    match kind {
+                        LogKind::V3Swap => {
+                            let info = pool_info(&cfg.http, &agent, &pool);
+                            pools.insert(pool.clone(), info);
+                        }
+                        LogKind::V2Swap => {
+                            let info = v2_pool_info(&cfg.http, &agent, &pool);
+                            pools.insert(pool.clone(), info);
+                        }
+                        LogKind::V4Swap => {
+                            if let Some(k) = v4keys.get(&pool).cloned() {
+                                pools.insert(pool.clone(), v4_pool(&k));
+                            } else if let Some((tx, _)) = &lookup {
+                                // Ask the helper once; until it answers the pool is unknown.
+                                if v4_asked.insert(pool.clone()) {
+                                    let _ = tx.send(pool.clone());
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let Some(entry) = pools.get(&pool) else {
+                    // V4 pool with no key: we can't tell which coin is the
+                    // token, so watch the price BOTH ways up (pool and its
+                    // mirror). A rush either way is counted as "unknown v4 pool".
+                    let Some(p) = w.get(2).and_then(|sp| token_price(&crate::fourmeme::word_dec(sp), true)) else { continue };
+                    let buyer = venue::swap_buyer_v4(log);
+                    for (k, px) in [(pool.clone(), p), (format!("{pool}{MIRROR}"), 1.0 / p)] {
+                        if let Some(r) = det.on_swap(&k, block, &buyer, px, &cfg.rules) {
+                            unknown_rushes.push(r);
+                        }
+                    }
+                    continue;
+                };
+                let Some(info) = entry else { continue };
+                let price = match kind {
+                    LogKind::V2Swap => v2_res.get(&pool).and_then(|(r0, r1)| venue::v2_price(*r0, *r1, info.token_is0)),
+                    _ => w.get(2).and_then(|sp| token_price(&crate::fourmeme::word_dec(sp), info.token_is0)),
+                };
+                let Some(price) = price else { continue };
                 // Sell history: did someone sell the token (base paid out)?
-                if is_sell_swap(&w, info.token_is0) {
+                let sold = match kind {
+                    LogKind::V4Swap => venue::is_sell_v4(&w, info.token_is0),
+                    LogKind::V2Swap => venue::is_sell_v2(&w, info.token_is0),
+                    _ => is_sell_swap(&w, info.token_is0),
+                };
+                if sold {
                     sells.record(&pool);
                 }
-                let buyer = swap_buyer(log);
+                let buyer = if kind == LogKind::V4Swap { venue::swap_buyer_v4(log) } else { swap_buyer(log) };
                 if let Some(r) = det.on_swap(&pool, block, &buyer, price, &cfg.rules) {
                     rushes.push(r);
                 }
@@ -869,8 +1210,9 @@ pub fn run(cfg: Config) -> Result<(), String> {
         if let Some(p) = pos.clone() {
             let price = det.last_price(&p.pool).unwrap_or(p.entry_price);
             let gain = price / p.entry_price - 1.0;
+            let vt = p.info.venue_name();
             if let Some(reason) = exit_reason(gain, p.opened.elapsed(), cfg.tp, cfg.sl, cfg.hold) {
-                match quoter.quote(&p.info.token, &p.info.base_addr, p.info.fee, p.tokens) {
+                match quoter.quote(&p.info.venue, &p.info.token, &p.info.base_addr, p.tokens) {
                     Ok((out, gas_out)) => {
                         let gp = quoter.gas_price().unwrap_or(U256::ZERO);
                         let gas_units = p.gas_in + gas_out + 2 * GAS_OVERHEAD;
@@ -880,9 +1222,13 @@ pub fn run(cfg: Config) -> Result<(), String> {
                             n_wins += 1;
                         }
                         total += net;
+                        let t = tally.entry(vt).or_default();
+                        t.trades += 1;
+                        t.wins += (net > 0.0) as u64;
+                        t.pnl += net;
                         write(
                             &mut f_trades,
-                            json!({"pool": p.pool, "token": p.info.token, "base": p.info.base, "open_block": p.open_block, "close_block": last_block,
+                            json!({"pool": p.pool, "token": p.info.token, "base": p.info.base, "venue": vt, "open_block": p.open_block, "close_block": last_block,
                                    "held_s": p.opened.elapsed().as_secs_f64(), "reason": reason, "pool_move_pct": 100.0 * gain,
                                    "usd_in": p.usd_in, "gross_usd": gross, "gas_usd": gross - net, "net_usd": net,
                                    "base_in": p.base_in.to_string(), "base_out": out.to_string(), "tokens": p.tokens.to_string(),
@@ -891,13 +1237,17 @@ pub fn run(cfg: Config) -> Result<(), String> {
                         // Size study: sell the same trade at every other size, right now.
                         let mut ladder = Vec::new();
                         for (usd, b_in, toks) in &p.ladder {
-                            if let Ok((o, g)) = quoter.quote(&p.info.token, &p.info.base_addr, p.info.fee, *toks) {
+                            if let Ok((o, g)) = quoter.quote(&p.info.venue, &p.info.token, &p.info.base_addr, *toks) {
                                 let (_, n) = pnl_usd(*b_in, o, p.info.base, p.usd_per_base, p.gas_in + g + 2 * GAS_OVERHEAD, gp, eth);
                                 ladder.push(json!({"usd": usd, "net": n}));
                             }
                         }
-                        write(&mut f_trades, json!({"ladder_for": p.pool, "open_block": p.open_block, "auto_usd": p.auto_usd, "ladder": ladder}))?;
-                        eprintln!("paper: SELL {} ({reason}, {:.1}s) net ${net:+.2} | total ${total:+.2} over {n_trades} trades", p.info.token, p.opened.elapsed().as_secs_f64());
+                        write(&mut f_trades, json!({"ladder_for": p.pool, "venue": vt, "open_block": p.open_block, "auto_usd": p.auto_usd, "ladder": ladder}))?;
+                        eprintln!(
+                            "paper: SELL {} [{vt}] ({reason}, {:.1}s) net ${net:+.2} | total ${total:+.2} over {n_trades} trades",
+                            p.info.token,
+                            p.opened.elapsed().as_secs_f64()
+                        );
                         // Race check: re-quote this same sell a few blocks from now.
                         schedule_late_exit(&mut late, &p, last_block, cfg.late_blocks, Some(out));
                         pos = None;
@@ -905,35 +1255,62 @@ pub fn run(cfg: Config) -> Result<(), String> {
                     Err(e) => {
                         // Can't price the exit: keep trying; record it.
                         if p.opened.elapsed() > cfg.hold * 3 {
-                            write(&mut f_trades, json!({"pool": p.pool, "token": p.info.token, "reason": "exit_quote_failed", "error": e, "usd_in": p.usd_in, "net_usd": -p.usd_in}))?;
+                            write(
+                                &mut f_trades,
+                                json!({"pool": p.pool, "token": p.info.token, "venue": vt, "reason": "exit_quote_failed", "error": e, "usd_in": p.usd_in, "net_usd": -p.usd_in}),
+                            )?;
                             // Size study: every size is lost in full too.
                             let ladder: Vec<Value> = p.ladder.iter().map(|(usd, _, _)| json!({"usd": usd, "net": -usd})).collect();
-                            write(&mut f_trades, json!({"ladder_for": p.pool, "open_block": p.open_block, "auto_usd": p.auto_usd, "ladder": ladder}))?;
+                            write(&mut f_trades, json!({"ladder_for": p.pool, "venue": vt, "open_block": p.open_block, "auto_usd": p.auto_usd, "ladder": ladder}))?;
                             total -= p.usd_in;
                             n_trades += 1;
+                            let t = tally.entry(vt).or_default();
+                            t.trades += 1;
+                            t.pnl -= p.usd_in;
                             // Never touch this token again (survives restarts).
                             block(&mut blocklist, &p.info.token, "exit_quote_failed");
                             // Race check: still try the late sell (no optimistic price to compare).
                             schedule_late_exit(&mut late, &p, last_block, cfg.late_blocks, None);
                             pos = None;
-                            eprintln!("paper: EXIT FAILED {} (counted as total loss)", p.info.token);
+                            eprintln!("paper: EXIT FAILED {} [{vt}] (counted as total loss)", p.info.token);
                         }
                     }
                 }
             }
         }
 
+        // ---- rushes on V4 pools we have no key for: count and skip ----
+        for r in unknown_rushes {
+            n_rush += 1;
+            n_filtered += 1;
+            tally.entry("v4").or_default().rushes += 1;
+            let id = base_pool_id(&r.pool);
+            write(&mut f_sig, json!({"pool": id, "token": null, "block": r.block, "taken": false, "venue": "v4", "why": "unknown v4 pool (no Initialize event seen; pool older than our run)"}))?;
+        }
+
         // ---- new rushes ----
         for r in rushes {
             n_rush += 1;
-            let info = pools.get(&r.pool).cloned().flatten().unwrap();
+            let Some(info) = pools.get(&r.pool).cloned().flatten() else { continue };
+            let vt = info.venue_name();
+            tally.entry(vt).or_default().rushes += 1;
+            // A skipped rush: one line in signals.jsonl with the reason.
+            let skip = |f: &mut BufWriter<std::fs::File>, why: String| {
+                write(f, json!({"pool": r.pool, "token": info.token, "block": r.block, "taken": false, "venue": vt, "why": why}))
+            };
+            // V4 hook that can change swap amounts: our maths would be wrong.
+            if let Venue::V4 { key } = &info.venue {
+                if venue::hook_changes_amounts(&key.hooks) {
+                    n_filtered += 1;
+                    skip(&mut f_sig, format!("unsafe hook ({}: can change swap amounts)", key.hooks))?;
+                    continue;
+                }
+            }
             if pos.is_some() {
                 n_skipped += 1;
-                write(&mut f_sig, json!({"pool": r.pool, "token": info.token, "block": r.block, "taken": false, "why": "busy"}))?;
+                skip(&mut f_sig, "busy".into())?;
                 continue;
             }
-            // A skipped rush: one line in signals.jsonl with the reason.
-            let skip = |f: &mut BufWriter<std::fs::File>, why: String| write(f, json!({"pool": r.pool, "token": info.token, "block": r.block, "taken": false, "why": why}));
             // Cheap filters first (no node calls).
             if blocklist.contains(&info.token) {
                 n_filtered += 1;
@@ -951,9 +1328,29 @@ pub fn run(cfg: Config) -> Result<(), String> {
                 skip(&mut f_sig, format!("already jumped (up {up}, max {}%)", cfg.max_rise_pct))?;
                 continue;
             }
+            // Buyers known only by transaction (V4): count the signing wallets.
+            let hashes: Vec<String> = r.buyers.iter().filter(|b| venue::is_tx_hash(b)).cloned().collect();
+            if !hashes.is_empty() {
+                let verdict = tx_signers(&cfg.http, &agent, &hashes).map(|m| venue::distinct_buyers(&r.buyers, &m));
+                match verdict {
+                    Ok(n) if n >= cfg.rules.buys => {}
+                    Ok(n) => {
+                        n_filtered += 1;
+                        skip(&mut f_sig, format!("few real buyers ({n} wallets behind {} buys, need {})", r.buyers.len(), cfg.rules.buys))?;
+                        continue;
+                    }
+                    Err(e) => {
+                        n_filtered += 1;
+                        skip(&mut f_sig, format!("few real buyers (could not look up: {e})"))?;
+                        continue;
+                    }
+                }
+            }
             // Safety first: never buy a token that is taxed, blocked or unchecked.
+            // The trap check moves tokens to/from whoever holds them (V4: PoolManager).
+            let holder = venue::token_holder(&info.venue, &r.pool);
             if cfg.taxcheck {
-                let verdict = taxcheck.check(&rpc, &info.token, &r.pool);
+                let verdict = taxcheck.check(&rpc, &info.token, &holder);
                 if !matches!(verdict, Ok(crate::taxcheck::Verdict::Ok)) {
                     n_unsafe += 1;
                     // A real finding (taxed/blocked) is permanent; a node error is not.
@@ -971,11 +1368,11 @@ pub fn run(cfg: Config) -> Result<(), String> {
             let mut ladder = Vec::new();
             let mut round_trips = Vec::new();
             for usd in &cfg.sizes {
-                if let Ok((toks, _)) = quoter.quote(&info.base_addr, &info.token, info.fee, raw(*usd)) {
+                if let Ok((toks, _)) = quoter.quote(&info.venue, &info.base_addr, &info.token, raw(*usd)) {
                     if toks.is_zero() {
                         continue;
                     }
-                    if let Ok((back, _)) = quoter.quote(&info.token, &info.base_addr, info.fee, toks) {
+                    if let Ok((back, _)) = quoter.quote(&info.venue, &info.token, &info.base_addr, toks) {
                         round_trips.push((*usd, 1.0 - f64::from(back) / f64::from(raw(*usd)).max(1.0)));
                     }
                     ladder.push((*usd, raw(*usd), toks));
@@ -994,12 +1391,12 @@ pub fn run(cfg: Config) -> Result<(), String> {
                 continue;
             };
             let base_in = raw(usd_in);
-            match quoter.quote(&info.base_addr, &info.token, info.fee, base_in) {
+            match quoter.quote(&info.venue, &info.base_addr, &info.token, base_in) {
                 Ok((tokens, gas_in)) if !tokens.is_zero() => {
                     // Real-size trap check: OUR exact token amount out of the
                     // pool and ALL of it back in, before we take the trade.
                     if cfg.taxcheck {
-                        let verdict = crate::taxcheck::test_amount(&rpc, &info.token, &r.pool, tokens);
+                        let verdict = crate::taxcheck::test_amount(&rpc, &info.token, &holder, tokens);
                         if !matches!(verdict, Ok(crate::taxcheck::Verdict::Ok)) {
                             n_unsafe += 1;
                             if let Ok(v) = &verdict {
@@ -1009,8 +1406,8 @@ pub fn run(cfg: Config) -> Result<(), String> {
                             continue;
                         }
                     }
-                    write(&mut f_sig, json!({"pool": r.pool, "token": info.token, "block": r.block, "taken": true, "usd_in": usd_in}))?;
-                    eprintln!("paper: BUY  {} ${usd_in} ({}/{} rush at block {})", info.token, info.base, r.pool, r.block);
+                    write(&mut f_sig, json!({"pool": r.pool, "token": info.token, "block": r.block, "taken": true, "venue": vt, "usd_in": usd_in}))?;
+                    eprintln!("paper: BUY  {} ${usd_in} [{vt}] ({}/{} rush at block {})", info.token, info.base, r.pool, r.block);
                     // Race check: price this exact buy again a few blocks from
                     // the newest block we have seen (when we really decided).
                     let decided = last_block.unwrap_or(r.block).max(r.block);
@@ -1049,16 +1446,23 @@ pub fn run(cfg: Config) -> Result<(), String> {
 
         if beat.elapsed() >= Duration::from_secs(60) {
             let h = started.elapsed().as_secs_f64() / 3600.0;
+            let per_venue: Vec<String> = tally.iter().map(|(v, t)| format!("{v} r{} t{} ${:+.2}", t.rushes, t.trades, t.pnl)).collect();
             eprintln!(
-                "paper: {}m | rushes {n_rush} (skipped while busy {n_skipped}, unsafe {n_unsafe}, filtered {n_filtered}) | trades {n_trades} | wins {:.0}% | total ${total:+.2} (${:+.2}/h) | open: {}",
+                "paper: {}m | rushes {n_rush} (skipped while busy {n_skipped}, unsafe {n_unsafe}, filtered {n_filtered}) | trades {n_trades} | wins {:.0}% | total ${total:+.2} (${:+.2}/h) | {} | open: {}",
                 started.elapsed().as_secs() / 60,
                 if n_trades > 0 { 100.0 * n_wins as f64 / n_trades as f64 } else { 0.0 },
                 if h > 0.0 { total / h } else { 0.0 },
+                if per_venue.is_empty() { "no rushes yet".to_string() } else { per_venue.join(", ") },
                 pos.as_ref().map(|p| p.info.token.as_str()).unwrap_or("none")
             );
+            if let Err(e) = v4keys.save_if_dirty(&keys_path) {
+                eprintln!("paper: could not save V4 pool keys ({e})");
+            }
             beat = Instant::now();
         }
     }
+    let _ = v4keys.save_if_dirty(&keys_path);
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
     write(&mut f_meta, json!({"event": "stop", "trades": n_trades, "total_usd": total}))?;
     Ok(())
 }
@@ -1094,10 +1498,11 @@ pub fn report(dir: &std::path::Path) -> String {
         *reasons.entry(r["reason"].as_str().unwrap_or("?").to_string()).or_default() += 1;
     }
     let taken = sig.iter().filter(|s| s["taken"] == json!(true)).count();
-    let unsafe_n = sig.iter().filter(|s| s["why"].as_str().is_some_and(|w| w.starts_with("unsafe"))).count();
-    // Skips by the safety filters, per reason (SKIP_REASONS order; last is unsafe).
+    // Skips by the safety filters, per reason (SKIP_REASONS order). The trap
+    // check ("unsafe") is reported on its own; "unsafe hook" is a filter.
     let skips = count_skips(&sig);
-    let filtered: usize = skips[..skips.len() - 1].iter().sum();
+    let unsafe_n = skips[UNSAFE_IDX];
+    let filtered: usize = skips.iter().sum::<usize>() - unsafe_n;
     // Header: new runs size each trade automatically; old runs used one size.
     let size_txt = match start.and_then(|m| m["max_usd"].as_f64()) {
         Some(max) => format!("auto size, max ${max}"),
@@ -1135,6 +1540,7 @@ pub fn report(dir: &std::path::Path) -> String {
         sizes_txt += &format!("  AUTO (largest size with <=1.5% round-trip cost): ${auto_total:+.2} over {auto_n} trades (${:+.2}/h)\n", if hours > 0.0 { auto_total / hours } else { 0.0 });
     }
     let race_txt = race_section(&all, start.and_then(|m| m["late_blocks"].as_u64()), hours);
+    let venue_txt = venue_section(&all, &sig, start);
     let mean = if n > 0 { total / n as f64 } else { 0.0 };
     let sd = if n > 1 { (nets.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n - 1) as f64).sqrt() } else { 0.0 };
     let half = 1.96 * sd / (n.max(1) as f64).sqrt();
@@ -1143,7 +1549,7 @@ pub fn report(dir: &std::path::Path) -> String {
          rushes seen {} | trades {} | skipped (busy or no quote) {} | blocked as unsafe {}\n\
          TOTAL ${:+.2}  =  ${:+.2} per hour  |  per trade ${:+.2} (rough 95% range ${:+.2} .. ${:+.2})\n\
          wins {:.0}% | best ${:+.2} | worst ${:+.2} | gas paid ${:.2}\n\
-         exits: {:?}\n{}{}{}",
+         exits: {:?}\n{}{}{}{}",
         hours,
         size_txt,
         sig.len(),
@@ -1160,10 +1566,56 @@ pub fn report(dir: &std::path::Path) -> String {
         if n > 0 { worst } else { 0.0 },
         gas,
         reasons,
+        venue_txt,
         sizes_txt,
         race_txt,
         skip_txt
     )
+}
+
+/// Which venue a file line belongs to. Lines from runs before venues
+/// existed have none: those runs watched only V3.
+fn line_venue(v: &Value) -> String {
+    v["venue"].as_str().unwrap_or("v3").to_string()
+}
+
+/// Report section: results per venue, so the owner sees which exchange type
+/// makes money. Rushes = signal lines (taken or skipped), trades = closed
+/// trades, wins = trades with net > 0, P&L = sum of net, late = the race
+/// check's total for that venue's trades (landing a few blocks late).
+/// Venues listed: those the run was started with, plus any seen in the files.
+pub fn venue_section(all: &[Value], sig: &[Value], start: Option<&Value>) -> String {
+    let mut names: Vec<String> = start
+        .and_then(|m| m["venues"].as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+        .unwrap_or_default();
+    for v in sig.iter().map(line_venue).chain(all.iter().filter(|r| r.get("reason").is_some() || r.get("late_for").is_some()).map(line_venue)) {
+        if !names.contains(&v) {
+            names.push(v);
+        }
+    }
+    if names.is_empty() {
+        return String::new();
+    }
+    // Same order as the venue list (v3, v4, v2), unknown names last.
+    let order = |n: &String| VenueKind::ALL.iter().position(|k| k.name() == n).unwrap_or(99);
+    names.sort_by_key(order);
+    let mut out = String::from("by venue:\n");
+    for name in &names {
+        let rushes = sig.iter().filter(|s| line_venue(s) == *name).count();
+        let taken = sig.iter().filter(|s| line_venue(s) == *name && s["taken"] == json!(true)).count();
+        let nets: Vec<f64> = all.iter().filter(|r| r.get("reason").is_some() && line_venue(r) == *name).filter_map(|r| r["net_usd"].as_f64()).collect();
+        let wins = nets.iter().filter(|x| **x > 0.0).count();
+        let late: f64 = all.iter().filter(|r| r.get("late_for").is_some() && line_venue(r) == *name).filter_map(|r| r["late_net_usd"].as_f64()).fold(0.0, |a, b| a + b);
+        out += &format!(
+            "  {name}: rushes {rushes} | taken {taken} | trades {} | wins {:.0}% | P&L ${:+.2} | late P&L ${late:+.2}\n",
+            nets.len(),
+            if nets.is_empty() { 0.0 } else { 100.0 * wins as f64 / nets.len() as f64 },
+            // fold from +0.0: an empty f64 sum is -0.0, which prints "$-0.00"
+            nets.iter().fold(0.0, |a, b| a + b)
+        );
+    }
+    out
 }
 
 /// Count skipped rushes per safety reason (same order as SKIP_REASONS),
@@ -1399,6 +1851,10 @@ mod tests {
             why("too thin (no size within 1.5% round trip)"),
             why("unsafe: Ok(Blocked(\"x\"))"),
             why("unsafe: real size: Ok(Taxed)"),
+            // new venue filters: must NOT be counted as trap-check "unsafe"
+            why("unsafe hook (0x..88: can change swap amounts)"),
+            why("unknown v4 pool (no Initialize event seen; pool older than our run)"),
+            why("few real buyers (2 wallets behind 3 buys, need 3)"),
         ];
         fs::write(dir.join("signals.jsonl"), sig.join("\n")).unwrap();
         let r = report(&dir);
@@ -1406,7 +1862,10 @@ mod tests {
         assert!(r.contains("TOTAL $-24.00"), "{r}");
         // only "busy" is left in the old busy/no-quote bucket
         assert!(r.contains("skipped (busy or no quote) 1 | blocked as unsafe 2"), "{r}");
-        assert!(r.contains("skips: blocked token 1 | no sell history 2 | already jumped 1 | too thin 1 | unsafe 2 | average trade size $37.50"), "{r}");
+        assert!(
+            r.contains("skips: blocked token 1 | unsafe hook 1 | unknown v4 pool 1 | no sell history 2 | already jumped 1 | few real buyers 1 | too thin 1 | unsafe 2 | average trade size $37.50"),
+            "{r}"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1436,8 +1895,10 @@ mod tests {
 
     struct FakeQuoter;
     impl Quoter for FakeQuoter {
-        fn quote(&self, token_in: &str, _out: &str, fee: u32, amount_in: U256) -> Result<(U256, u64), String> {
+        fn quote(&self, venue: &Venue, token_in: &str, _out: &str, amount_in: U256) -> Result<(U256, u64), String> {
             // 1 WETH = 2500 USDG on the 500 tier, worse elsewhere
+            let Venue::V3 { fee } = venue else { return Err("not v3".into()) };
+            let fee = *fee;
             if token_in == WETH {
                 let px = if fee == 500 { 2500u64 } else { 2400 };
                 return Ok((amount_in / U256::from(10u64).pow(U256::from(12)) * U256::from(px), 100_000));
@@ -1503,7 +1964,7 @@ mod tests {
         sell_out: std::cell::Cell<Option<u64>>,
     }
     impl Quoter for RaceQuoter {
-        fn quote(&self, token_in: &str, _out: &str, _fee: u32, _amount_in: U256) -> Result<(U256, u64), String> {
+        fn quote(&self, _venue: &Venue, token_in: &str, _out: &str, _amount_in: U256) -> Result<(U256, u64), String> {
             let v = if token_in == USDG { self.buy_tokens.get() } else { self.sell_out.get() };
             v.map(|x| (U256::from(x), 100_000)).ok_or_else(|| "no pool".to_string())
         }
@@ -1515,7 +1976,7 @@ mod tests {
     fn late_trade() -> LateTrade {
         LateTrade {
             pool: "p".into(),
-            info: Pool { token: "0xtok".into(), base: "USDG", base_addr: USDG.into(), token_is0: true, fee: 3000 },
+            info: Pool { token: "0xtok".into(), base: "USDG", base_addr: USDG.into(), token_is0: true, fee: 3000, venue: Venue::V4 { key: v4_test_key() } },
             open_block: 100,
             base_in: U256::from(50_000_000u64), // $50 of USDG
             usd_per_base: 1.0,
@@ -1542,6 +2003,7 @@ mod tests {
         let line = step_late(&mut t, 112, &q, 2500.0).unwrap();
         assert_eq!(line["late_for"], "p");
         assert_eq!(line["open_block"], 100);
+        assert_eq!(line["venue"], "v4");
         // $51 back for $50 in, gas free in this fake.
         assert!((line["late_net_usd"].as_f64().unwrap() - 1.0).abs() < 1e-9);
         // 980 vs 1000 tokens = 2% worse entry.
@@ -1608,6 +2070,137 @@ mod tests {
         assert!(r.contains("RACE CHECK (we land 2 blocks late)"), "{r}");
         assert!(r.contains("count 3 | late total $+1.00 ($+1.00/h) | late wins 67%"), "{r}");
         assert!(r.contains("median entry slip +2.00% | median exit slip +2.00% | late quotes failed 1"), "{r}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn v4_test_key() -> V4Key {
+        V4Key { currency0: venue::NATIVE_ETH.into(), currency1: "0x00000000000000000000000000000000000000aa".into(), fee: 3000, tick_spacing: 60, hooks: venue::NATIVE_ETH.into() }
+    }
+
+    #[test]
+    fn rush_lists_its_different_buyers() {
+        let mut d = Detector::default();
+        let r = rules();
+        d.on_swap("p", 1, "x", 100.0, &r);
+        d.on_swap("p", 10, "b", 101.0, &r);
+        d.on_swap("p", 11, "a", 102.0, &r);
+        d.on_swap("p", 11, "a", 102.5, &r);
+        let s = d.on_swap("p", 12, "c", 103.0, &r).unwrap();
+        assert_eq!(s.buyers, vec!["a", "b", "c"]);
+        // forget() wipes a pool's history (used when a V4 key arrives late).
+        d.forget("p");
+        assert_eq!(d.last_price("p"), None);
+    }
+
+    #[test]
+    fn mirror_keys_map_back_to_the_pool() {
+        assert_eq!(base_pool_id(&format!("0xabc{MIRROR}")), "0xabc");
+        assert_eq!(base_pool_id("0xabc"), "0xabc");
+    }
+
+    #[test]
+    fn v4_pools_from_keys() {
+        // Native ETH / token: base ETH at 0x0, token is currency1.
+        let p = v4_pool(&v4_test_key()).unwrap();
+        assert_eq!((p.base, p.base_addr.as_str(), p.token_is0), ("ETH", venue::NATIVE_ETH, false));
+        assert_eq!(p.token, "0x00000000000000000000000000000000000000aa");
+        assert_eq!(p.venue_name(), "v4");
+        // token / USDG: token is currency0 when its address is lower.
+        let k = V4Key { currency0: "0x0000000000000000000000000000000000000001".into(), currency1: USDG.into(), ..v4_test_key() };
+        let p = v4_pool(&k).unwrap();
+        assert_eq!((p.base, p.token_is0, p.base_addr.as_str()), ("USDG", true, USDG));
+        // WETH / USDG: no token to snipe.
+        let k = V4Key { currency0: WETH.into(), currency1: USDG.into(), ..v4_test_key() };
+        assert!(v4_pool(&k).is_none());
+        // Dynamic fee: display fee 0, key keeps the marker for the quoter.
+        let k = V4Key { fee: 0x80_0000, ..v4_test_key() };
+        let p = v4_pool(&k).unwrap();
+        assert_eq!(p.fee, 0);
+        assert!(matches!(p.venue, Venue::V4 { ref key } if key.fee == 0x80_0000));
+    }
+
+    #[test]
+    fn v2_pairs_only_from_our_factory() {
+        let tok = "0x00000000000000000000000000000000000000aa";
+        let p = v2_pool_from("0xPAIR", tok, WETH, venue::V2_FACTORY).unwrap();
+        assert_eq!((p.base, p.token_is0, p.fee), ("WETH", true, 3000));
+        assert_eq!(p.venue, Venue::V2 { pair: "0xpair".into(), token0: tok.into() });
+        // A fork's pair (e.g. PancakeSwap V2: different fee) is refused.
+        assert!(v2_pool_from("0xpair", tok, WETH, "0x02a84c1b3bbd7401a5f7fa98a384ebc70bb5749e").is_none());
+        // No base coin, or both base coins: refused.
+        assert!(v2_pool_from("0xpair", tok, "0x00000000000000000000000000000000000000bb", venue::V2_FACTORY).is_none());
+        assert!(v2_pool_from("0xpair", WETH, USDG, venue::V2_FACTORY).is_none());
+    }
+
+    #[test]
+    fn topics_follow_the_venue_list() {
+        let all = topics_for(&[VenueKind::V3, VenueKind::V4, VenueKind::V2]);
+        assert_eq!(all.len(), 5);
+        let only_v3 = topics_for(&[VenueKind::V3]);
+        assert_eq!(only_v3, vec![(sig_v3_swap(), LogKind::V3Swap)]);
+        let log = |t: String, addr: &str| json!({"address": addr, "topics": [t]});
+        assert_eq!(log_kind(&log(sig_v4_swap(), V4_POOL_MANAGER), &all), Some(LogKind::V4Swap));
+        // V4 events from anything but the real PoolManager are ignored.
+        assert_eq!(log_kind(&log(sig_v4_swap(), "0x1111111111111111111111111111111111111111"), &all), None);
+        assert_eq!(log_kind(&log(venue::sig_v2_sync(), "0xpair"), &all), Some(LogKind::V2Sync));
+        // A venue that is switched off is not classified at all.
+        assert_eq!(log_kind(&log(venue::sig_v2_swap(), "0xpair"), &only_v3), None);
+    }
+
+    /// Fake quoter that only answers for one venue kind (checks dispatch).
+    struct OnlyVenue(VenueKind);
+    impl Quoter for OnlyVenue {
+        fn quote(&self, venue: &Venue, _in: &str, _out: &str, amount_in: U256) -> Result<(U256, u64), String> {
+            if venue.kind() == self.0 {
+                Ok((amount_in, 1))
+            } else {
+                Err(format!("wrong venue {:?}", venue.kind()))
+            }
+        }
+        fn gas_price(&self) -> Result<U256, String> {
+            Ok(U256::ZERO)
+        }
+    }
+
+    #[test]
+    fn race_check_quotes_on_the_trades_own_venue() {
+        let mut t = late_trade(); // a V4 trade
+        t.exit = Some(LateExit { due: 102, opt_out: None });
+        assert!(step_late(&mut t, 102, &OnlyVenue(VenueKind::V3), 2500.0).is_none()); // V3 quoter can't price it
+        let line = step_late(&mut t, 102, &OnlyVenue(VenueKind::V4), 2500.0).unwrap();
+        assert!(line["late_net_usd"].as_f64().is_some(), "{line}");
+    }
+
+    #[test]
+    fn report_splits_results_by_venue() {
+        let dir = std::env::temp_dir().join(format!("sniper-paper-venue-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("meta.jsonl"), json!({"event": "start", "wall_ms": 0, "usd": 50.0, "venues": ["v3", "v4", "v2"]}).to_string()).unwrap();
+        let trades = [
+            // old line without a venue = V3
+            json!({"net_usd": 1.0, "reason": "time", "wall_ms": 3_600_000}).to_string(),
+            json!({"net_usd": 2.0, "reason": "take_profit", "venue": "v4"}).to_string(),
+            json!({"net_usd": -1.5, "reason": "stop_loss", "venue": "v4"}).to_string(),
+            json!({"late_for": "p", "venue": "v4", "late_net_usd": -0.25}).to_string(),
+            json!({"ladder_for": "p", "venue": "v4", "auto_usd": 0.0, "ladder": []}).to_string(),
+        ];
+        fs::write(dir.join("paper_trades.jsonl"), trades.join("\n")).unwrap();
+        let sig = [
+            json!({"taken": true}).to_string(),
+            json!({"taken": true, "venue": "v4"}).to_string(),
+            json!({"taken": true, "venue": "v4"}).to_string(),
+            json!({"taken": false, "venue": "v4", "why": "unknown v4 pool (x)"}).to_string(),
+            json!({"taken": false, "venue": "v2", "why": "too thin (x)"}).to_string(),
+        ];
+        fs::write(dir.join("signals.jsonl"), sig.join("\n")).unwrap();
+        let r = report(&dir);
+        assert!(r.contains("by venue:\n"), "{r}");
+        assert!(r.contains("  v3: rushes 1 | taken 1 | trades 1 | wins 100% | P&L $+1.00 | late P&L $+0.00\n"), "{r}");
+        assert!(r.contains("  v4: rushes 3 | taken 2 | trades 2 | wins 50% | P&L $+0.50 | late P&L $-0.25\n"), "{r}");
+        assert!(r.contains("  v2: rushes 1 | taken 0 | trades 0 | wins 0% | P&L $+0.00 | late P&L $+0.00\n"), "{r}");
+        // Totals unchanged by the split.
+        assert!(r.contains("TOTAL $+1.50"), "{r}");
         let _ = fs::remove_dir_all(&dir);
     }
 }

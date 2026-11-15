@@ -646,13 +646,36 @@ pub fn dry_fire(rpc: &Rpc, pool: &str, token: &str, base: &str, fee: u32, base_i
     Ok(out)
 }
 
+/// A Uniswap V4 pool is named by a 32-byte pool id, not a 20-byte address.
+/// Dry-fire can't trade those (no V4 sender yet): refuse with a clear message.
+pub fn refuse_v4_pool_id(pool: &str) -> Result<(), String> {
+    let h = pool.trim().trim_start_matches("0x");
+    if h.len() == 64 && h.chars().all(|c| c.is_ascii_hexdigit()) {
+        return crate::venue::dry_fire_supported(crate::venue::VenueKind::V4);
+    }
+    Ok(())
+}
+
 /// Round-trip result in plain numbers for one dry fire, as one line of JSON:
 /// usd_in, what the quotes promised back, what the real calls got back, and
 /// the difference (positive = real calls did better than the paper quote).
 pub fn dry_fire_usd(url: &str, pool: &str, usd: f64, slip_bps: u64) -> Result<String, String> {
     let rpc = Rpc::new(url);
     let agent = ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(10))).build().new_agent();
-    let p = crate::paper::pool_info(url, &agent, pool).ok_or("not a Uniswap V3 WETH/USDG pool")?;
+    // Only Uniswap V3 pools can be dry-fired (the live calls are SwapRouter02).
+    // V4 pools (given by 32-byte pool id) and V2 pairs are paper only: say so
+    // clearly instead of failing with a confusing lookup error.
+    refuse_v4_pool_id(pool)?;
+    let p = match crate::paper::pool_info(url, &agent, pool) {
+        Some(p) => p,
+        None => {
+            if let Some(v2) = crate::paper::v2_pool_info(url, &agent, pool) {
+                crate::venue::dry_fire_supported(v2.venue.kind())?;
+            }
+            return Err("not a Uniswap V3 WETH/USDG pool".into());
+        }
+    };
+    crate::venue::dry_fire_supported(p.venue.kind())?;
     let q = crate::paper::ChainQuoter { rpc: Rpc::new(url) };
     let eth = crate::paper::eth_usd(&q).ok_or("no ETH price")?;
     let usd_per_base = if p.base == "USDG" { 1.0 } else { eth };
@@ -677,6 +700,15 @@ pub fn dry_fire_usd(url: &str, pool: &str, usd: f64, slip_bps: u64) -> Result<St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dry_fire_refuses_v4_pool_ids() {
+        let id = "0x21c67e77068de97969ba93d4aab21826d33ca12bb9f565d8496e8fda8a82ca27";
+        let e = refuse_v4_pool_id(id).unwrap_err();
+        assert!(e.contains("only Uniswap V3") && e.contains("V4"), "{e}");
+        // A normal 20-byte pool address passes this step (V3 lookup follows).
+        assert!(refuse_v4_pool_id("0x2222222222222222222222222222222222222222").is_ok());
+    }
 
     #[test]
     fn known_selectors() {

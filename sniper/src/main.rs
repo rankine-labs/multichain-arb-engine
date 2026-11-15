@@ -106,7 +106,7 @@ fn main() -> ExitCode {
             // sniper dry-fire <pool> <usd> [slip_bps]: the live sender's exact
             // buy + sell calls, run in a free simulation. No key, no money.
             let (Some(pool), Some(usd)) = (args.get(1), args.get(2).and_then(|v| v.parse::<f64>().ok())) else {
-                eprintln!("usage: sniper dry-fire <pool address> <usd> [slip_bps]   (env: SNIPER_RHC_HTTP)");
+                eprintln!("usage: sniper dry-fire <Uniswap V3 pool address> <usd> [slip_bps]   (V3 only; env: SNIPER_RHC_HTTP)");
                 return ExitCode::FAILURE;
             };
             let slip = args.get(3).and_then(|v| v.parse::<u64>().ok()).unwrap_or(300);
