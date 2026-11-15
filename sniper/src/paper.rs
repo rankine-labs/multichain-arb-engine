@@ -57,7 +57,9 @@
 //   SNIPER_TAXCHECK      off = skip both trap checks (default on)
 //   SNIPER_TP_PCT / SNIPER_SL_PCT / SNIPER_HOLD_SECS   exits (5 / 5 / 10)
 //   SNIPER_RUSH_BUYS / SNIPER_RUSH_WINDOW_S / SNIPER_RUSH_RISE_PCT  (3 / 1 / 2)
-//   SNIPER_RHC_POLL_MS   how often to ask the node (default 200)
+//   SNIPER_RHC_POLL_MS   how often to ask the node (default 1000)
+//   SNIPER_PUSH=1        use websocket push instead (each pushed log is a
+//                        paid Chainstack request: off by default)
 //   SNIPER_LATE_BLOCKS   race check: re-quote every buy and sell this many
 //                        blocks after we decide (default 2, see below)
 //
@@ -704,7 +706,9 @@ impl Config {
         let block_ms = 105.0;
         Config {
             http: std::env::var("SNIPER_RHC_HTTP").unwrap_or_else(|_| crate::rhc::DEFAULT_HTTP.into()),
-            wss: std::env::var("SNIPER_RHC_WSS").ok().filter(|s| !s.trim().is_empty()),
+            // Push costs one paid request per pushed log (Chainstack bills
+            // every websocket message), so it is used only with SNIPER_PUSH=1.
+            wss: std::env::var("SNIPER_RHC_WSS").ok().filter(|s| !s.trim().is_empty()).filter(|_| std::env::var("SNIPER_PUSH").as_deref() == Ok("1")),
             sizes: std::env::var("SNIPER_SIZES").unwrap_or_else(|_| "25,50,100".into()).split(',').filter_map(|x| x.trim().parse().ok()).collect(),
             auto_max_rt: std::env::var("SNIPER_AUTO_MAX_RT_PCT").ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(1.5) / 100.0,
             taxcheck: std::env::var("SNIPER_TAXCHECK").map(|v| v != "off").unwrap_or(true),
@@ -722,7 +726,8 @@ impl Config {
                 window_blocks: ((f("SNIPER_RUSH_WINDOW_S", 1.0) * 1000.0 / block_ms).round() as u64).max(1),
                 rise_pct: f("SNIPER_RUSH_RISE_PCT", 2.0),
             },
-            poll: Duration::from_millis(f("SNIPER_RHC_POLL_MS", 200.0) as u64),
+            // 1 s: two requests a second (~173k a day) whatever the volume.
+            poll: Duration::from_millis(f("SNIPER_RHC_POLL_MS", 1000.0) as u64),
             late_blocks: f("SNIPER_LATE_BLOCKS", 2.0) as u64,
             // A bad list is caught in run() (venues_from_env) so the error is shown.
             venues: venue::parse_venues(&std::env::var("SNIPER_VENUES").unwrap_or_else(|_| "v3,v4,v2".into())).unwrap_or_default(),
@@ -742,6 +747,7 @@ pub fn pool_info(url: &str, agent: &ureq::Agent, pool: &str) -> Option<Pool> {
     let call = |id: u64, sel: &str| json!({"jsonrpc": "2.0", "id": id, "method": "eth_call", "params": [{"to": pool, "data": sel}, "latest"]});
     // token0, token1, fee, factory
     let body = json!([call(1, "0x0dfe1681"), call(2, "0xd21220a7"), call(3, "0xddca3f43"), call(4, "0xc45a0155")]);
+    crate::sellcheck::count_calls(body.as_array().map_or(1, |a| a.len() as u64));
     let mut r = agent.post(url).send_json(&body).ok()?;
     let v: Value = r.body_mut().read_json().ok()?;
     let get = |id: u64| v.as_array()?.iter().find(|x| x["id"] == id).and_then(|x| x["result"].as_str()).map(str::to_string);
@@ -767,6 +773,7 @@ pub fn v2_pool_info(url: &str, agent: &ureq::Agent, pair: &str) -> Option<Pool> 
     let call = |id: u64, sel: &str| json!({"jsonrpc": "2.0", "id": id, "method": "eth_call", "params": [{"to": pair, "data": sel}, "latest"]});
     // token0, token1, factory
     let body = json!([call(1, "0x0dfe1681"), call(2, "0xd21220a7"), call(4, "0xc45a0155")]);
+    crate::sellcheck::count_calls(body.as_array().map_or(1, |a| a.len() as u64));
     let mut r = agent.post(url).send_json(&body).ok()?;
     let v: Value = r.body_mut().read_json().ok()?;
     let get = |id: u64| v.as_array()?.iter().find(|x| x["id"] == id).and_then(|x| x["result"].as_str()).map(str::to_string);
@@ -848,34 +855,35 @@ fn tx_signers(url: &str, agent: &ureq::Agent, hashes: &[String]) -> Result<HashM
         .enumerate()
         .map(|(i, h)| json!({"jsonrpc": "2.0", "id": i + 1, "method": "eth_getTransactionByHash", "params": [h]}))
         .collect();
+    crate::sellcheck::count_calls(body.len() as u64);
     let mut r = agent.post(url).send_json(Value::Array(body)).map_err(|e| format!("tx lookup: {e}"))?;
     let v: Value = r.body_mut().read_json().map_err(|e| format!("tx lookup: bad reply: {e}"))?;
     Ok(venue::signers_from_replies(&v))
 }
 
-/// Background helper: finds old V4 pools' Initialize events, one at a time,
-/// so a slow history search never holds up the trading loop. Send it pool
-/// ids; it answers (id, key or None). It stops asking once the node shows
-/// it can't do it (venue::LookupBudget).
-fn spawn_v4_lookup(url: String) -> (std::sync::mpsc::Sender<String>, std::sync::mpsc::Receiver<(String, Option<V4Key>)>) {
-    let (req_tx, req_rx) = std::sync::mpsc::channel::<String>();
+/// Background helper: works out old V4 pools' keys from a swap's receipt
+/// (venue::match_v4_key), so the lookup never holds up the trading loop.
+/// Send it (pool id, swap tx hash); it answers (id, key or None).
+/// Budget: venue::KeyLookupBudget (60 receipts an hour, each pool once an hour).
+/// (requests out: pool id + tx hash, answers in: pool id + key if found)
+type V4Lookup = (std::sync::mpsc::Sender<(String, String)>, std::sync::mpsc::Receiver<(String, Option<V4Key>)>);
+
+fn spawn_v4_lookup(url: String) -> V4Lookup {
+    let (req_tx, req_rx) = std::sync::mpsc::channel::<(String, String)>();
     let (ans_tx, ans_rx) = std::sync::mpsc::channel::<(String, Option<V4Key>)>();
     std::thread::spawn(move || {
         let rpc = Rpc::new(&url);
-        let mut budget = venue::LookupBudget::default();
-        let mut told = false;
-        for id in req_rx {
-            if !budget.open() {
-                if !told {
-                    eprintln!("paper: old V4 pool lookups stopped (this node can't search V4 history); those pools stay \"unknown v4 pool\"");
-                    told = true;
-                }
+        let mut budget = venue::KeyLookupBudget::default();
+        for (id, tx) in req_rx {
+            let hour = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() / 3600).unwrap_or(0);
+            if !budget.take(&id, hour) {
                 let _ = ans_tx.send((id, None));
                 continue;
             }
-            let r = rpc.call("eth_getLogs", venue::v4_init_lookup_params(&id));
-            let key = r.as_ref().ok().and_then(|v| v.as_array().and_then(|a| a.iter().find_map(venue::decode_v4_init))).filter(|(i, _)| *i == id).map(|(_, k)| k);
-            budget.record(&r.map(|_| key.is_some()));
+            let key = rpc
+                .call("eth_getTransactionReceipt", json!([tx]))
+                .ok()
+                .and_then(|r| venue::match_v4_key(&id, &venue::currencies_from_receipt(&r)));
             if ans_tx.send((id, key)).is_err() {
                 break;
             }
@@ -973,6 +981,7 @@ pub fn run(cfg: Config) -> Result<(), String> {
                 crate::ws::Clock::new(),
                 &stop2,
                 |_, _, v| {
+                    crate::sellcheck::count_calls(1); // each pushed log is billed
                     let _ = ltx.send(v.clone());
                 },
                 // Never print a node link (it holds the API key).
@@ -1030,7 +1039,10 @@ pub fn run(cfg: Config) -> Result<(), String> {
         // ---- old V4 pools the helper found ----
         if let Some((_, rx)) = &lookup {
             for (id, key) in rx.try_iter() {
-                let Some(k) = key else { continue }; // not found: stays unknown
+                let Some(k) = key else {
+                    v4_asked.remove(&id); // not found: may be asked again later
+                    continue;
+                };
                 let p = v4_pool(&k);
                 if p.is_some() {
                     v4keys.insert(k);
@@ -1140,9 +1152,11 @@ pub fn run(cfg: Config) -> Result<(), String> {
                             if let Some(k) = v4keys.get(&pool).cloned() {
                                 pools.insert(pool.clone(), v4_pool(&k));
                             } else if let Some((tx, _)) = &lookup {
-                                // Ask the helper once; until it answers the pool is unknown.
+                                // Ask the helper; until it answers the pool is unknown.
+                                // Not found: it may be asked again (next hour, budget allowing).
                                 if v4_asked.insert(pool.clone()) {
-                                    let _ = tx.send(pool.clone());
+                                    let h = log["transactionHash"].as_str().unwrap_or("").to_string();
+                                    let _ = tx.send((pool.clone(), h));
                                 }
                             }
                         }
@@ -1448,12 +1462,14 @@ pub fn run(cfg: Config) -> Result<(), String> {
             let h = started.elapsed().as_secs_f64() / 3600.0;
             let per_venue: Vec<String> = tally.iter().map(|(v, t)| format!("{v} r{} t{} ${:+.2}", t.rushes, t.trades, t.pnl)).collect();
             eprintln!(
-                "paper: {}m | rushes {n_rush} (skipped while busy {n_skipped}, unsafe {n_unsafe}, filtered {n_filtered}) | trades {n_trades} | wins {:.0}% | total ${total:+.2} (${:+.2}/h) | {} | open: {}",
+                "paper: {}m | rushes {n_rush} (skipped while busy {n_skipped}, unsafe {n_unsafe}, filtered {n_filtered}) | trades {n_trades} | wins {:.0}% | total ${total:+.2} (${:+.2}/h) | {} | open: {} | node requests {} (~{:.0}k/day)",
                 started.elapsed().as_secs() / 60,
                 if n_trades > 0 { 100.0 * n_wins as f64 / n_trades as f64 } else { 0.0 },
                 if h > 0.0 { total / h } else { 0.0 },
                 if per_venue.is_empty() { "no rushes yet".to_string() } else { per_venue.join(", ") },
-                pos.as_ref().map(|p| p.info.token.as_str()).unwrap_or("none")
+                pos.as_ref().map(|p| p.info.token.as_str()).unwrap_or("none"),
+                crate::sellcheck::NODE_CALLS.load(std::sync::atomic::Ordering::Relaxed),
+                if h > 0.0 { crate::sellcheck::NODE_CALLS.load(std::sync::atomic::Ordering::Relaxed) as f64 / h * 24.0 / 1000.0 } else { 0.0 }
             );
             if let Err(e) = v4keys.save_if_dirty(&keys_path) {
                 eprintln!("paper: could not save V4 pool keys ({e})");

@@ -149,6 +149,7 @@ fn v3_pool_info(rpc_url: &str, agent: &ureq::Agent, pool: &str) -> Option<PoolIn
     let call = |id: u64, sel: &str| json!({"jsonrpc": "2.0", "id": id, "method": "eth_call", "params": [{"to": pool, "data": sel}, "latest"]});
     // token0() 0x0dfe1681, token1() 0xd21220a7, fee() 0xddca3f43
     let body = json!([call(1, "0x0dfe1681"), call(2, "0xd21220a7"), call(3, "0xddca3f43")]);
+    crate::sellcheck::count_calls(body.as_array().map_or(1, |a| a.len() as u64));
     let mut r = agent.post(rpc_url).send_json(&body).ok()?;
     let v: Value = r.body_mut().read_json().ok()?;
     let get = |id: u64| v.as_array()?.iter().find(|x| x["id"] == id).and_then(|x| x["result"].as_str()).map(str::to_string);

@@ -358,43 +358,103 @@ pub fn is_sell_v4(w: &[&str], token_is0: bool) -> bool {
     base_word.is_some_and(|w| w.len() == 64 && !word_is_negative(w) && !word_is_zero(w))
 }
 
-/// eth_getLogs params to find one old pool's Initialize event (whole history).
-pub fn v4_init_lookup_params(id: &str) -> Value {
-    json!([{"address": V4_POOL_MANAGER, "topics": [sig_v4_init(), id], "fromBlock": "0x0", "toBlock": "latest"}])
+// ---------------------------------------------------------------------------
+// Old V4 pools: key from the swap's own receipt (dex bot lesson, PR #211)
+// ---------------------------------------------------------------------------
+//
+// Plain English:
+//   A V4 Swap log only carries the pool's id (a hash of its key). For pools
+//   made before our run we never saw the Initialize event. Searching the
+//   whole chain history for it failed for the dex bot (Chainstack times out
+//   or refuses), so instead:
+//     1. read the swap transaction's receipt (1 request),
+//     2. the ERC-20 Transfer logs to or from the PoolManager name the coins
+//        that moved (native ETH moves without a Transfer log, so it is
+//        always tried too),
+//     3. hash every coin pair with every fee / tick-spacing setting the dex
+//        bot has seen on Robinhood (hooks = none) and keep the one whose hash
+//        equals the pool id. A match is exact, never a guess.
+//   Hooked pools or unusual settings don't match and stay "unknown v4 pool".
+//   At most KeyLookupBudget::PER_HOUR receipts an hour, each pool tried at
+//   most once an hour.
+
+/// Fee / tick-spacing settings seen on Robinhood V4 pools (dex bot
+/// src/config/v4Tiers.ts: STANDARD_V4_TIERS + EXTRA_V4_TIERS).
+pub const V4_TIERS: &[(u32, i32)] = &[
+    (500, 10), (3000, 60), (10000, 200), (100, 1),
+    (200, 4), (310, 3), (450, 9), (460, 9), (500, 1), (500, 5), (800, 5), (1000, 2), (1000, 10),
+    (1200, 15), (1500, 15), (2000, 20), (2300, 23), (2400, 24), (2500, 25), (2690, 54), (3000, 30),
+    (5000, 50), (7500, 75), (8000, 80), (9000, 90), (9900, 99), (10000, 100), (19000, 190),
+    (25000, 250), (28000, 280), (32000, 320),
+];
+
+/// keccak("Transfer(address,address,uint256)")
+pub const SIG_TRANSFER: &str = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+
+fn topic_is(t: &Value, addr: &str) -> bool {
+    t.as_str().is_some_and(|x| x.len() >= 42 && x[x.len() - 40..].eq_ignore_ascii_case(addr.trim_start_matches("0x")))
 }
 
-/// Throttle for the old-pool lookups: the node may not keep history (the
-/// free public one does not) or may refuse whole-history searches. Stop
-/// asking after 3 errors in a row, or 20 "not found" answers in a row
-/// (= this node has no old events), so we don't waste calls.
-#[derive(Clone, Debug, Default)]
-pub struct LookupBudget {
-    errors_in_row: u32,
-    empty_in_row: u32,
-    found: u64,
-}
-
-impl LookupBudget {
-    pub const MAX_ERRORS: u32 = 3;
-    pub const MAX_EMPTY: u32 = 20;
-    /// Should we keep asking?
-    pub fn open(&self) -> bool {
-        self.errors_in_row < Self::MAX_ERRORS && (self.found > 0 || self.empty_in_row < Self::MAX_EMPTY)
-    }
-    /// Record one answer: Ok(true) found, Ok(false) not found, Err node error.
-    pub fn record(&mut self, r: &Result<bool, String>) {
-        match r {
-            Ok(true) => {
-                self.found += 1;
-                self.errors_in_row = 0;
-                self.empty_in_row = 0;
-            }
-            Ok(false) => {
-                self.errors_in_row = 0;
-                self.empty_in_row += 1;
-            }
-            Err(_) => self.errors_in_row += 1,
+/// Coins that moved to or from the PoolManager in this receipt, plus native ETH.
+pub fn currencies_from_receipt(receipt: &Value) -> Vec<String> {
+    let mut out = vec![NATIVE_ETH.to_string()];
+    for l in receipt["logs"].as_array().into_iter().flatten() {
+        let t = &l["topics"];
+        if t[0].as_str().map(str::to_ascii_lowercase).as_deref() != Some(SIG_TRANSFER) {
+            continue;
         }
+        if !(topic_is(&t[1], V4_POOL_MANAGER) || topic_is(&t[2], V4_POOL_MANAGER)) {
+            continue;
+        }
+        if let Some(a) = l["address"].as_str().map(str::to_ascii_lowercase) {
+            if !out.contains(&a) {
+                out.push(a);
+            }
+        }
+    }
+    out
+}
+
+/// The hook-free key among (coin pairs x V4_TIERS) whose id is `id`.
+pub fn match_v4_key(id: &str, currencies: &[String]) -> Option<V4Key> {
+    let id = id.to_ascii_lowercase();
+    for (i, a) in currencies.iter().enumerate() {
+        for b in &currencies[i + 1..] {
+            let (c0, c1) = if a < b { (a, b) } else { (b, a) };
+            for (fee, ts) in V4_TIERS {
+                let k = V4Key { currency0: c0.clone(), currency1: c1.clone(), fee: *fee, tick_spacing: *ts, hooks: NATIVE_ETH.to_string() };
+                if k.id() == id {
+                    return Some(k);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Limits receipt lookups: PER_HOUR per clock hour, one try per pool per hour.
+#[derive(Clone, Debug, Default)]
+pub struct KeyLookupBudget {
+    hour: u64,
+    used: u32,
+    tried: HashMap<String, u64>,
+}
+
+impl KeyLookupBudget {
+    pub const PER_HOUR: u32 = 60;
+    /// May we look this pool up now (`hour` = unix hours)? Records the try.
+    pub fn take(&mut self, id: &str, hour: u64) -> bool {
+        if hour != self.hour {
+            self.hour = hour;
+            self.used = 0;
+            self.tried.retain(|_, h| *h == hour);
+        }
+        if self.used >= Self::PER_HOUR || self.tried.contains_key(id) {
+            return false;
+        }
+        self.used += 1;
+        self.tried.insert(id.to_string(), hour);
+        true
     }
 }
 
@@ -696,27 +756,40 @@ mod tests {
     }
 
     #[test]
-    fn lookup_budget_stops_on_errors_or_no_history() {
-        let mut b = LookupBudget::default();
-        assert!(b.open());
-        for _ in 0..LookupBudget::MAX_ERRORS {
-            b.record(&Err("range too big".into()));
+    fn key_found_from_receipt_transfers() {
+        let token = "0x1111111111111111111111111111111111111111";
+        let pm = V4_POOL_MANAGER.trim_start_matches("0x");
+        let user = "000000000000000000000000aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        // The real pool: ETH(native)/token at a non-standard setting, no hook.
+        let real = V4Key { currency0: NATIVE_ETH.into(), currency1: token.into(), fee: 2500, tick_spacing: 25, hooks: NATIVE_ETH.into() };
+        let receipt = json!({"logs": [
+            // token sent from the PoolManager to the user (a buy)
+            {"address": token, "topics": [SIG_TRANSFER, format!("0x000000000000000000000000{pm}"), format!("0x{user}")]},
+            // unrelated transfer elsewhere in the tx: ignored
+            {"address": "0x2222222222222222222222222222222222222222", "topics": [SIG_TRANSFER, format!("0x{user}"), format!("0x{user}")]},
+        ]});
+        let cur = currencies_from_receipt(&receipt);
+        assert_eq!(cur, vec![NATIVE_ETH.to_string(), token.to_string()]);
+        assert_eq!(match_v4_key(&real.id(), &cur), Some(real.clone()));
+        // A hooked pool (or unknown setting) never matches: stays unknown.
+        let hooked = V4Key { hooks: "0x00000000000000000000000000000000000000c0".into(), ..real.clone() };
+        assert_eq!(match_v4_key(&hooked.id(), &cur), None);
+        let odd = V4Key { fee: 1234, tick_spacing: 7, ..real };
+        assert_eq!(match_v4_key(&odd.id(), &cur), None);
+    }
+
+    #[test]
+    fn key_budget_once_per_pool_per_hour_and_capped() {
+        let mut b = KeyLookupBudget::default();
+        assert!(b.take("0xa", 10));
+        assert!(!b.take("0xa", 10)); // same pool, same hour
+        assert!(b.take("0xa", 11)); // next hour: may try again
+        let mut b = KeyLookupBudget::default();
+        for i in 0..KeyLookupBudget::PER_HOUR {
+            assert!(b.take(&format!("0x{i}"), 5));
         }
-        assert!(!b.open());
-        let mut b = LookupBudget::default();
-        for _ in 0..LookupBudget::MAX_EMPTY {
-            b.record(&Ok(false));
-        }
-        assert!(!b.open()); // node keeps no history
-        let mut b = LookupBudget::default();
-        b.record(&Ok(true));
-        for _ in 0..LookupBudget::MAX_EMPTY + 5 {
-            b.record(&Ok(false));
-        }
-        assert!(b.open()); // it found one before: history works, keep going
-        b.record(&Err("x".into()));
-        b.record(&Ok(true));
-        assert!(b.open());
+        assert!(!b.take("0xnew", 5)); // hourly cap
+        assert!(b.take("0xnew", 6));
     }
 
     #[test]

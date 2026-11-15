@@ -61,7 +61,8 @@ impl Config {
         Config {
             feed: std::env::var("SNIPER_RHC_FEED").unwrap_or_else(|_| crate::rhc::DEFAULT_FEED.into()),
             http: std::env::var("SNIPER_RHC_HTTP").unwrap_or_else(|_| crate::rhc::DEFAULT_HTTP.into()),
-            wss: std::env::var("SNIPER_RHC_WSS").ok().filter(|s| !s.trim().is_empty()),
+            // Push only with SNIPER_PUSH=1 (every pushed log is a paid request).
+            wss: std::env::var("SNIPER_RHC_WSS").ok().filter(|s| !s.trim().is_empty()).filter(|_| std::env::var("SNIPER_PUSH").as_deref() == Ok("1")),
             out: PathBuf::from(std::env::var("SNIPER_OUT").unwrap_or_else(|_| format!("feed-out/{unix}"))),
             // Own setting (not SNIPER_RHC_POLL_MS) so it doesn't share the paper
             // trader's pace; slower = fewer "429 too many requests" from the free node.

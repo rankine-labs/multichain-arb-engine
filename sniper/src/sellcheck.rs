@@ -33,6 +33,16 @@ use serde_json::{json, Value};
 
 use crate::fourmeme::{decode_log, keccak, Kind, Topics};
 
+/// Node requests made by this program (each one is a paid Chainstack
+/// "request unit"; a batch of N counts N). Shown in the report so cost is
+/// visible. Pushed websocket messages are counted separately where used.
+pub static NODE_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Count `n` node requests.
+pub fn count_calls(n: u64) {
+    NODE_CALLS.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Minimal JSON-RPC over HTTPS client (blocking, kept-alive, like arbsim's).
 pub struct Rpc {
     url: String,
@@ -47,6 +57,7 @@ impl Rpc {
 
     pub fn call(&self, method: &str, params: Value) -> Result<Value, String> {
         let body = json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params});
+        count_calls(1);
         let mut resp = self.agent.post(&self.url).send_json(&body).map_err(|e| format!("{method}: {e}"))?;
         let v: Value = resp.body_mut().read_json().map_err(|e| format!("{method}: bad reply: {e}"))?;
         if let Some(err) = v.get("error") {
