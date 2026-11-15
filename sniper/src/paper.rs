@@ -499,10 +499,11 @@ impl Blocklist {
 /// skip line in signals.jsonl has a "why" starting with one of these.
 /// Matching takes the FIRST reason a "why" starts with, so "unsafe hook"
 /// must stay before "unsafe" (the trap check, always last).
-pub const SKIP_REASONS: [&str; 10] = [
+pub const SKIP_REASONS: [&str; 11] = [
     "blocked token",
     "pool too young",
     "blocked creator",
+    "coin cooling off",
     "unsafe hook",
     "unknown v4 pool",
     "no sell history",
@@ -548,7 +549,15 @@ pub struct Position {
     /// Race check: tokens the same buy would have got LATE_BLOCKS blocks
     /// later (None until that re-quote has run, or if it failed).
     pub late_tokens: Option<U256>,
+    /// Stop-loss study (measure only): for each tighter stop level, the real
+    /// net result if we had sold the first time the chart crossed it
+    /// (None = never crossed). Levels: SHADOW_STOPS.
+    pub shadow: Vec<Option<f64>>,
 }
+
+/// Tighter stop losses studied without trading on them (chart drop, as a
+/// fraction): what would selling at -3%, -5% or -7% have made?
+pub const SHADOW_STOPS: [f64; 3] = [0.03, 0.05, 0.07];
 
 // ---------------------------------------------------------------------------
 // Race check: re-quote each trade a few blocks late (we never land instantly)
@@ -690,6 +699,28 @@ pub fn pick_auto(round_trips: &[(f64, f64)], max_rt: f64) -> f64 {
     round_trips.iter().filter(|(_, loss)| *loss <= max_rt).map(|(usd, _)| *usd).fold(0.0, f64::max)
 }
 
+/// Should we ask for a real sale quote now? Only when the chart says we
+/// might be near a target (saves node requests): within 60% of the profit
+/// target, past half the stop, crossing a tighter stop being studied, or
+/// out of time.
+pub fn worth_quoting(chart_gain: f64, held: Duration, tp: f64, sl: f64, hold: Duration) -> bool {
+    chart_gain >= 0.6 * tp || chart_gain <= -0.5 * sl.min(SHADOW_STOPS[0] * 2.0) || held >= hold
+}
+
+/// Exit decision on the REAL result of selling now (net after fees, our
+/// own price impact and gas, as a fraction of what we paid). The chart
+/// price is only used to decide when to ask (worth_quoting).
+pub fn exit_on_quote(net_gain: f64, held: Duration, tp: f64, sl: f64, hold: Duration) -> Option<&'static str> {
+    exit_reason(net_gain, held, tp, sl, hold)
+}
+
+/// Coin cutoff: this coin's closed trades within `window` lost more than
+/// `max_loss` (USD) in total. `hist` = (when closed, net USD).
+pub fn coin_cooling(hist: &[(Instant, f64)], now: Instant, window: Duration, max_loss: f64) -> bool {
+    let sum: f64 = hist.iter().filter(|(t, _)| now.saturating_duration_since(*t) < window).map(|(_, n)| n).sum();
+    sum < -max_loss
+}
+
 /// Why we'd exit right now, if at all.
 pub fn exit_reason(gain: f64, held: Duration, tp: f64, sl: f64, hold: Duration) -> Option<&'static str> {
     if gain >= tp {
@@ -741,6 +772,10 @@ pub struct Config {
     pub min_sells: u64,
     /// Skip pools younger than this (seconds). Run 5: every rug was < 2 min.
     pub min_pool_age_s: f64,
+    /// Coin cutoff: skip a coin whose closed trades lost more than this
+    /// (USD) within cut_window. 0 = off.
+    pub cut_loss_usd: f64,
+    pub cut_window: Duration,
     /// At start, look back this many minutes for pool creations (pools
     /// older than this count as old enough).
     pub age_backfill_min: f64,
@@ -780,6 +815,8 @@ impl Config {
             max_total_usd: f("SNIPER_MAX_TOTAL_USD", 150.0),
             min_sells: f("SNIPER_MIN_SELLS", 3.0) as u64,
             min_pool_age_s: f("SNIPER_MIN_POOL_AGE_SECS", 120.0),
+            cut_loss_usd: f("SNIPER_COIN_CUT_USD", 15.0),
+            cut_window: Duration::from_secs_f64(f("SNIPER_COIN_CUT_HOURS", 6.0) * 3600.0),
             age_backfill_min: f("SNIPER_AGE_BACKFILL_MIN", 15.0),
             max_rise_pct: f("SNIPER_MAX_RISE_PCT", 8.0),
             tp: f("SNIPER_TP_PCT", 5.0) / 100.0,
@@ -1008,7 +1045,7 @@ pub fn run(cfg: Config) -> Result<(), String> {
     write(
         &mut f_meta,
         json!({"event": "start", "wall_ms": wall_ms, "usd": cfg.usd, "sizing": "auto", "max_usd": cfg.max_usd, "max_positions": cfg.max_positions, "max_total_usd": cfg.max_total_usd, "sizes": cfg.sizes,
-               "min_sells": cfg.min_sells, "min_pool_age_s": cfg.min_pool_age_s, "max_rise_pct": cfg.max_rise_pct, "tp": cfg.tp, "sl": cfg.sl, "hold_s": cfg.hold.as_secs_f64(),
+               "min_sells": cfg.min_sells, "min_pool_age_s": cfg.min_pool_age_s, "coin_cut_usd": cfg.cut_loss_usd, "coin_cut_hours": cfg.cut_window.as_secs_f64() / 3600.0, "max_rise_pct": cfg.max_rise_pct, "tp": cfg.tp, "sl": cfg.sl, "hold_s": cfg.hold.as_secs_f64(),
                "rush_buys": cfg.rules.buys, "window_blocks": cfg.rules.window_blocks, "rise_pct": cfg.rules.rise_pct,
                "node": crate::probe::redact(&cfg.http), "push": cfg.wss.as_deref().map(crate::probe::redact), "eth_usd": eth, "late_blocks": cfg.late_blocks,
                "venues": venue_names, "v4_lookup": cfg.v4_lookup}),
@@ -1104,6 +1141,8 @@ pub fn run(cfg: Config) -> Result<(), String> {
     let mut n_unsafe = 0u64; // rushes skipped by the tax/trap check
     let mut n_filtered = 0u64; // rushes skipped by the other safety filters
     let mut tally: BTreeMap<&'static str, VenueTally> = BTreeMap::new();
+    // Coin cutoff: each coin's closed trades (when, net USD).
+    let mut coin_hist: HashMap<String, Vec<(Instant, f64)>> = HashMap::new();
     // Put a token on the blocklist and save the file right away.
     let block = |bl: &mut Blocklist, token: &str, why: &str| {
         if bl.add(token, why) {
@@ -1332,17 +1371,31 @@ pub fn run(cfg: Config) -> Result<(), String> {
             let price = det.last_price(&p.pool).unwrap_or(p.entry_price);
             let gain = price / p.entry_price - 1.0;
             let vt = p.info.venue_name();
-            if let Some(reason) = exit_reason(gain, p.opened.elapsed(), cfg.tp, cfg.sl, cfg.hold) {
+            // The chart only decides WHEN to ask; the real sale quote decides.
+            let new_shadow = SHADOW_STOPS.iter().enumerate().any(|(i, lv)| gain <= -lv && p.shadow[i].is_none());
+            if worth_quoting(gain, p.opened.elapsed(), cfg.tp, cfg.sl, cfg.hold) || new_shadow {
                 match quoter.quote(&p.info.venue, &p.info.token, &p.info.base_addr, p.tokens) {
                     Ok((out, gas_out)) => {
                         let gp = quoter.gas_price().unwrap_or(U256::ZERO);
                         let gas_units = p.gas_in + gas_out + 2 * GAS_OVERHEAD;
                         let (gross, net) = pnl_usd(p.base_in, out, p.info.base, p.usd_per_base, gas_units, gp, eth);
+                        // Stop-loss study: record the real result at each tighter stop crossed.
+                        for (i, lv) in SHADOW_STOPS.iter().enumerate() {
+                            if gain <= -lv && positions[pi].shadow[i].is_none() {
+                                positions[pi].shadow[i] = Some(net);
+                            }
+                        }
+                        let p = positions[pi].clone();
+                        let Some(reason) = exit_on_quote(net / p.usd_in, p.opened.elapsed(), cfg.tp, cfg.sl, cfg.hold) else {
+                            pi += 1;
+                            continue; // the real sale isn't at a target yet: keep holding
+                        };
                         n_trades += 1;
                         if net > 0.0 {
                             n_wins += 1;
                         }
                         total += net;
+                        coin_hist.entry(p.info.token.clone()).or_default().push((Instant::now(), net));
                         let t = tally.entry(vt).or_default();
                         t.trades += 1;
                         t.wins += (net > 0.0) as u64;
@@ -1351,6 +1404,7 @@ pub fn run(cfg: Config) -> Result<(), String> {
                             &mut f_trades,
                             json!({"pool": p.pool, "token": p.info.token, "base": p.info.base, "venue": vt, "open_block": p.open_block, "close_block": last_block,
                                    "held_s": p.opened.elapsed().as_secs_f64(), "reason": reason, "pool_move_pct": 100.0 * gain,
+                                   "shadow_sl": SHADOW_STOPS.iter().zip(&p.shadow).map(|(lv, v)| (format!("{:.0}", lv * 100.0), json!(v))).collect::<serde_json::Map<_, _>>(),
                                    "usd_in": p.usd_in, "gross_usd": gross, "gas_usd": gross - net, "net_usd": net,
                                    "base_in": p.base_in.to_string(), "base_out": out.to_string(), "tokens": p.tokens.to_string(),
                                    "wall_ms": SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)}),
@@ -1457,6 +1511,12 @@ pub fn run(cfg: Config) -> Result<(), String> {
             if let Some(c) = creators.blocked(&rpc, &ages, &r.pool) {
                 n_filtered += 1;
                 skip(&mut f_sig, format!("blocked creator ({c})"))?;
+                continue;
+            }
+            // Coin cutoff: stop chasing a coin that has been losing for us.
+            if cfg.cut_loss_usd > 0.0 && coin_hist.get(&info.token).is_some_and(|h| coin_cooling(h, Instant::now(), cfg.cut_window, cfg.cut_loss_usd)) {
+                n_filtered += 1;
+                skip(&mut f_sig, format!("coin cooling off (lost over ${:.0} in {:.0}h)", cfg.cut_loss_usd, cfg.cut_window.as_secs_f64() / 3600.0))?;
                 continue;
             }
             if !sells.enough(&r.pool, cfg.min_sells) {
@@ -1590,6 +1650,7 @@ pub fn run(cfg: Config) -> Result<(), String> {
                         ladder,
                         auto_usd,
                         late_tokens: None,
+                        shadow: vec![None; SHADOW_STOPS.len()],
                     });
                 }
                 other => {
@@ -1696,7 +1757,7 @@ pub fn report(dir: &std::path::Path) -> String {
         sizes_txt += &format!("  AUTO (largest size with <=1.5% round-trip cost): ${auto_total:+.2} over {auto_n} trades (${:+.2}/h)\n", if hours > 0.0 { auto_total / hours } else { 0.0 });
     }
     let race_txt = race_section(&all, start.and_then(|m| m["late_blocks"].as_u64()), hours);
-    let venue_txt = venue_section(&all, &sig, start) + &hour_section(&rows);
+    let venue_txt = venue_section(&all, &sig, start) + &hour_section(&rows) + &stop_study_section(&rows);
     let mean = if n > 0 { total / n as f64 } else { 0.0 };
     let sd = if n > 1 { (nets.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n - 1) as f64).sqrt() } else { 0.0 };
     let half = 1.96 * sd / (n.max(1) as f64).sqrt();
@@ -1748,6 +1809,34 @@ pub fn hour_section(rows: &[Value]) -> String {
     let mut out = String::from("by time of day (Toronto):\n");
     for (h, (n, w, t)) in b {
         out += &format!("  {h:02}:00-{:02}:00: {n} trades | wins {:.0}% | ${t:+.2}\n", h + 4, 100.0 * w as f64 / n as f64);
+    }
+    out
+}
+
+/// Report section: the stop-loss study. For each tighter stop, the run's
+/// total if every trade that crossed it had been sold right then (at the
+/// real quote recorded at that moment), the rest unchanged.
+pub fn stop_study_section(rows: &[Value]) -> String {
+    let with: Vec<&Value> = rows.iter().filter(|r| r["shadow_sl"].is_object()).collect();
+    if with.is_empty() {
+        return String::new();
+    }
+    let actual: f64 = with.iter().filter_map(|r| r["net_usd"].as_f64()).sum();
+    let mut out = format!("stop-loss study ({} trades; actual stop {}): actual ${actual:+.2}\n", with.len(), "10%");
+    for lv in SHADOW_STOPS {
+        let k = format!("{:.0}", lv * 100.0);
+        let mut tot = 0.0;
+        let mut hit = 0;
+        for r in &with {
+            match r["shadow_sl"][&k].as_f64() {
+                Some(v) => {
+                    tot += v;
+                    hit += 1;
+                }
+                None => tot += r["net_usd"].as_f64().unwrap_or(0.0),
+            }
+        }
+        out += &format!("  if stop at -{k}%: ${tot:+.2} ({hit} trades would have sold early)\n");
     }
     out
 }
@@ -1854,6 +1943,43 @@ mod tests {
         let t = hour_section(&rows);
         assert!(t.contains("08:00-12:00: 1 trades | wins 0% | $-1.00"), "{t}");
         assert!(t.contains("20:00-24:00: 1 trades | wins 100% | $+2.00"), "{t}");
+    }
+
+    #[test]
+    fn exits_and_quotes() {
+        let s = Duration::from_secs;
+        // only quote near a target, past a studied stop, or at the time limit
+        assert!(!worth_quoting(0.01, s(1), 0.05, 0.10, s(60)));
+        assert!(worth_quoting(0.031, s(1), 0.05, 0.10, s(60)));
+        assert!(worth_quoting(-0.031, s(1), 0.05, 0.10, s(60)));
+        assert!(worth_quoting(0.0, s(61), 0.05, 0.10, s(60)));
+        // the real sale decides: chart +6% but real net +2% = keep holding
+        assert_eq!(exit_on_quote(0.02, s(5), 0.05, 0.10, s(60)), None);
+        assert_eq!(exit_on_quote(0.051, s(5), 0.05, 0.10, s(60)), Some("take_profit"));
+        assert_eq!(exit_on_quote(-0.11, s(5), 0.05, 0.10, s(60)), Some("stop_loss"));
+    }
+
+    #[test]
+    fn coin_cutoff_counts_only_recent_losses() {
+        let now = Instant::now() + Duration::from_secs(10 * 3600);
+        let h = |hours_ago: u64, net: f64| (now - Duration::from_secs(hours_ago * 3600), net);
+        let w = Duration::from_secs(6 * 3600);
+        assert!(coin_cooling(&[h(1, -6.0), h(2, -6.0), h(3, -5.0)], now, w, 15.0)); // -$17 in 6 h
+        assert!(!coin_cooling(&[h(1, -6.0), h(2, -6.0), h(7, -5.0)], now, w, 15.0)); // old loss expired
+        assert!(!coin_cooling(&[h(1, -10.0), h(2, -10.0), h(3, 8.0)], now, w, 15.0)); // wins count too
+    }
+
+    #[test]
+    fn stop_study_report() {
+        let rows = vec![
+            json!({"net_usd": -7.0, "shadow_sl": {"3": -2.0, "5": -3.5, "7": -5.0}}),
+            json!({"net_usd": 3.0, "shadow_sl": {"3": -1.5, "5": null, "7": null}}),
+            json!({"net_usd": 2.0, "shadow_sl": {"3": null, "5": null, "7": null}}),
+        ];
+        let t = stop_study_section(&rows);
+        assert!(t.contains("actual $-2.00"), "{t}");
+        assert!(t.contains("if stop at -3%: $-1.50 (2 trades"), "{t}");
+        assert!(t.contains("if stop at -5%: $+1.50 (1 trades"), "{t}");
     }
 
     #[test]
@@ -2062,7 +2188,7 @@ mod tests {
         // only "busy" is left in the old busy/no-quote bucket
         assert!(r.contains("skipped (busy or no quote) 1 | blocked as unsafe 2"), "{r}");
         assert!(
-            r.contains("skips: blocked token 1 | pool too young 0 | blocked creator 0 | unsafe hook 1 | unknown v4 pool 1 | no sell history 2 | already jumped 1 | few real buyers 1 | too thin 1 | unsafe 2 | average trade size $37.50"),
+            r.contains("skips: blocked token 1 | pool too young 0 | blocked creator 0 | coin cooling off 0 | unsafe hook 1 | unknown v4 pool 1 | no sell history 2 | already jumped 1 | few real buyers 1 | too thin 1 | unsafe 2 | average trade size $37.50"),
             "{r}"
         );
         let _ = fs::remove_dir_all(&dir);
