@@ -111,6 +111,8 @@ pub const V3_FACTORY: &str = "0x1f7d7550b1b028f7571e69a784071f0205fd2efa";
 pub const V3_QUOTER_V2: &str = "0x33e885ed0ec9bf04ecfb19341582aadcb4c8a9e7";
 pub const WETH: &str = "0x0bd7d308f8e1639fab988df18a8011f41eacad73";
 pub const USDG: &str = "0x5fc5360d0400a0fd4f2af552add042d716f1d168";
+/// Robinhood Chain block time in seconds (pool ages, look-back windows).
+pub const BLOCK_SECS: f64 = 0.105;
 /// Extra gas per swap on top of the quoter's estimate (router, transfers).
 const GAS_OVERHEAD: u64 = 60_000;
 
@@ -382,6 +384,34 @@ pub fn already_jumped(start: f64, now: f64, max_pct: f64) -> bool {
     rise_pct(start, now).is_none_or(|r| r > max_pct)
 }
 
+/// Rug guard measurements for a trade we take (logged, not used as a rule
+/// yet): pool age, the pool creator's share of the coin's supply now, and
+/// the "bundle" share (coins bought out of the pool in its first ~2 s).
+/// Only for pools we saw being created; V4 has no bundle figure (all V4
+/// pools share one PoolManager balance). About 3 node requests.
+fn rug_measure(rpc: &Rpc, creators: &mut crate::rugguard::Creators, ages: &crate::rugguard::PoolAges, pool: &str, info: &Pool, block: u64) -> Value {
+    let Some(born) = ages.get(pool).cloned() else { return json!({"pool_age_s": null}) };
+    let age = block.saturating_sub(born.block) as f64 * BLOCK_SECS;
+    let u = |v: Result<Value, String>| v.ok().and_then(|x| x.as_str().and_then(crate::rugguard::hex_u128));
+    let supply = u(rpc.call("eth_call", json!([{"to": info.token, "data": "0x18160ddd"}, "latest"])));
+    let creator = creators.creator(rpc, ages, pool);
+    let creator_share = match (&creator, supply) {
+        (Some(c), Some(sup)) => {
+            let bal = u(rpc.call("eth_call", json!([{"to": info.token, "data": format!("0x70a08231{:0>64}", c.trim_start_matches("0x"))}, "latest"])));
+            bal.and_then(|b| crate::rugguard::share(b, sup))
+        }
+        _ => None,
+    };
+    let bundle = match (&info.venue, supply) {
+        (Venue::V4 { .. }, _) | (_, None) => None,
+        (_, Some(sup)) => rpc
+            .call("eth_getLogs", json!([{"address": info.token, "fromBlock": format!("0x{:x}", born.block), "toBlock": format!("0x{:x}", born.block + 20), "topics": [crate::venue::SIG_TRANSFER]}]))
+            .ok()
+            .and_then(|v| crate::rugguard::bundle_share(v.as_array().map(Vec::as_slice).unwrap_or(&[]), pool, sup)),
+    };
+    json!({"pool_age_s": age, "creator": creator, "creator_share": creator_share, "bundle_share": bundle})
+}
+
 /// Room for one more position? Never two in the same token, at most
 /// `max_positions` open, and (when the size is known) open money plus this
 /// trade within `max_total_usd`. `open` = (token, usd) of each open position.
@@ -469,8 +499,18 @@ impl Blocklist {
 /// skip line in signals.jsonl has a "why" starting with one of these.
 /// Matching takes the FIRST reason a "why" starts with, so "unsafe hook"
 /// must stay before "unsafe" (the trap check, always last).
-pub const SKIP_REASONS: [&str; 8] =
-    ["blocked token", "unsafe hook", "unknown v4 pool", "no sell history", "already jumped", "few real buyers", "too thin", "unsafe"];
+pub const SKIP_REASONS: [&str; 10] = [
+    "blocked token",
+    "pool too young",
+    "blocked creator",
+    "unsafe hook",
+    "unknown v4 pool",
+    "no sell history",
+    "already jumped",
+    "few real buyers",
+    "too thin",
+    "unsafe",
+];
 /// Index of the trap-check reason ("unsafe") in SKIP_REASONS.
 const UNSAFE_IDX: usize = SKIP_REASONS.len() - 1;
 
@@ -699,6 +739,11 @@ pub struct Config {
     pub max_total_usd: f64,
     /// Sells of the token a pool must have shown before we buy.
     pub min_sells: u64,
+    /// Skip pools younger than this (seconds). Run 5: every rug was < 2 min.
+    pub min_pool_age_s: f64,
+    /// At start, look back this many minutes for pool creations (pools
+    /// older than this count as old enough).
+    pub age_backfill_min: f64,
     /// Skip if the rush already lifted the price more than this (percent).
     pub max_rise_pct: f64,
     pub tp: f64,
@@ -734,6 +779,8 @@ impl Config {
             max_positions: (f("SNIPER_MAX_POSITIONS", 3.0) as usize).max(1),
             max_total_usd: f("SNIPER_MAX_TOTAL_USD", 150.0),
             min_sells: f("SNIPER_MIN_SELLS", 3.0) as u64,
+            min_pool_age_s: f("SNIPER_MIN_POOL_AGE_SECS", 120.0),
+            age_backfill_min: f("SNIPER_AGE_BACKFILL_MIN", 15.0),
             max_rise_pct: f("SNIPER_MAX_RISE_PCT", 8.0),
             tp: f("SNIPER_TP_PCT", 5.0) / 100.0,
             sl: f("SNIPER_SL_PCT", 5.0) / 100.0,
@@ -825,6 +872,8 @@ pub fn v4_pool(key: &V4Key) -> Option<Pool> {
 /// Which event a log is, for the venues we watch.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum LogKind {
+    /// A pool was created (V3 PoolCreated / V2 PairCreated): its age.
+    Created,
     V3Swap,
     V4Swap,
     V4Init,
@@ -837,7 +886,10 @@ pub fn topics_for(venues: &[VenueKind]) -> Vec<(String, LogKind)> {
     let mut t = Vec::new();
     for v in venues {
         match v {
-            VenueKind::V3 => t.push((sig_v3_swap(), LogKind::V3Swap)),
+            VenueKind::V3 => {
+                t.push((sig_v3_swap(), LogKind::V3Swap));
+                t.push((crate::rugguard::SIG_V3_POOL_CREATED.to_string(), LogKind::Created));
+            }
             VenueKind::V4 => {
                 t.push((sig_v4_swap(), LogKind::V4Swap));
                 t.push((sig_v4_init(), LogKind::V4Init));
@@ -845,6 +897,7 @@ pub fn topics_for(venues: &[VenueKind]) -> Vec<(String, LogKind)> {
             VenueKind::V2 => {
                 t.push((venue::sig_v2_swap(), LogKind::V2Swap));
                 t.push((venue::sig_v2_sync(), LogKind::V2Sync));
+                t.push((crate::rugguard::SIG_V2_PAIR_CREATED.to_string(), LogKind::Created));
             }
         }
     }
@@ -955,7 +1008,7 @@ pub fn run(cfg: Config) -> Result<(), String> {
     write(
         &mut f_meta,
         json!({"event": "start", "wall_ms": wall_ms, "usd": cfg.usd, "sizing": "auto", "max_usd": cfg.max_usd, "max_positions": cfg.max_positions, "max_total_usd": cfg.max_total_usd, "sizes": cfg.sizes,
-               "min_sells": cfg.min_sells, "max_rise_pct": cfg.max_rise_pct, "tp": cfg.tp, "sl": cfg.sl, "hold_s": cfg.hold.as_secs_f64(),
+               "min_sells": cfg.min_sells, "min_pool_age_s": cfg.min_pool_age_s, "max_rise_pct": cfg.max_rise_pct, "tp": cfg.tp, "sl": cfg.sl, "hold_s": cfg.hold.as_secs_f64(),
                "rush_buys": cfg.rules.buys, "window_blocks": cfg.rules.window_blocks, "rise_pct": cfg.rules.rise_pct,
                "node": crate::probe::redact(&cfg.http), "push": cfg.wss.as_deref().map(crate::probe::redact), "eth_usd": eth, "late_blocks": cfg.late_blocks,
                "venues": venue_names, "v4_lookup": cfg.v4_lookup}),
@@ -963,6 +1016,9 @@ pub fn run(cfg: Config) -> Result<(), String> {
     // Permanent blocklist: load what earlier runs in this folder learned.
     let block_path = cfg.out.join(Blocklist::FILE);
     let mut blocklist = Blocklist::load(&block_path)?;
+    // Rug guard: pool ages and blocked creators (see rugguard.rs).
+    let mut ages = crate::rugguard::PoolAges::default();
+    let mut creators = crate::rugguard::Creators::load(&cfg.out)?;
     // V4 pool keys seen by earlier runs in this folder (a damaged file only
     // costs us those pools, so it is reported, not fatal).
     let keys_path = cfg.out.join(venue::V4Keys::FILE);
@@ -985,6 +1041,29 @@ pub fn run(cfg: Config) -> Result<(), String> {
     // Event ids to watch, for the enabled venues (one subscription, OR'ed).
     let topics = topics_for(&cfg.venues);
     let topic_list: Vec<String> = topics.iter().map(|(t, _)| t.clone()).collect();
+    // Rug guard look-back: pools created in the last few minutes, so a
+    // pool born just before we started is not mistaken for an old one.
+    {
+        let born_topics: Vec<String> = topics.iter().filter(|(_, k)| matches!(k, LogKind::Created | LogKind::V4Init)).map(|(t, _)| t.clone()).collect();
+        let head = rpc.call("eth_blockNumber", json!([])).map(|v| hex_u64(Some(&v))).unwrap_or(0);
+        let back = (cfg.age_backfill_min * 60.0 / BLOCK_SECS) as u64;
+        let mut a = head.saturating_sub(back);
+        while head > 0 && !born_topics.is_empty() && a <= head {
+            let b = (a + 1999).min(head);
+            match rpc.call("eth_getLogs", json!([{"fromBlock": format!("0x{a:x}"), "toBlock": format!("0x{b:x}"), "topics": [born_topics]}])) {
+                Ok(v) => {
+                    for l in v.as_array().into_iter().flatten() {
+                        if let Some((p, born)) = crate::rugguard::decode_created(l, V3_FACTORY) {
+                            ages.insert(&p, born);
+                        }
+                    }
+                }
+                Err(e) => eprintln!("paper: pool-age look-back failed for {a}..{b} ({e}); those pools count as old"),
+            }
+            a = b + 1;
+        }
+        eprintln!("paper: rug guard: {} pools created in the last {} min | skip pools < {}s | {} blocked creators", ages.len(), cfg.age_backfill_min, cfg.min_pool_age_s, creators.list.tokens.len());
+    }
     // Push mode: a websocket thread hands us each matching log as it happens.
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let log_rx = cfg.wss.clone().map(|url| {
@@ -1129,7 +1208,14 @@ pub fn run(cfg: Config) -> Result<(), String> {
                 let addr = log["address"].as_str().map(str::to_ascii_lowercase).unwrap_or_default();
                 let w = words(log["data"].as_str().unwrap_or(""));
                 let block = hex_u64(log.get("blockNumber"));
+                // Rug guard: remember every pool's birth (V2/V3/V4).
+                if matches!(kind, LogKind::Created | LogKind::V4Init) {
+                    if let Some((p, born)) = crate::rugguard::decode_created(log, V3_FACTORY) {
+                        ages.insert(&p, born);
+                    }
+                }
                 let pool = match kind {
+                    LogKind::Created => continue,
                     LogKind::V4Init => {
                         // A new V4 pool: remember its key (only pairs we could trade).
                         if let Some((id, key)) = venue::decode_v4_init(log) {
@@ -1304,6 +1390,7 @@ pub fn run(cfg: Config) -> Result<(), String> {
                             t.pnl -= p.usd_in;
                             // Never touch this token again (survives restarts).
                             block(&mut blocklist, &p.info.token, "exit_quote_failed");
+                            creators.block(&rpc, &ages, &p.pool, &format!("rug: exit failed on {}", p.info.token));
                             // Race check: still try the late sell (no optimistic price to compare).
                             schedule_late_exit(&mut late, &p, last_block, cfg.late_blocks, None);
                             closed = true;
@@ -1359,6 +1446,19 @@ pub fn run(cfg: Config) -> Result<(), String> {
                 skip(&mut f_sig, "blocked token".into())?;
                 continue;
             }
+            // Rug guard: brand-new pools are where every run-5 rug happened.
+            let age = ages.age_secs(&r.pool, r.block, BLOCK_SECS);
+            if crate::rugguard::too_young(age, cfg.min_pool_age_s) {
+                n_filtered += 1;
+                skip(&mut f_sig, format!("pool too young ({:.0}s old, need {:.0}s)", age.unwrap_or(0.0), cfg.min_pool_age_s))?;
+                continue;
+            }
+            // Rug guard: this pool's creator rugged us before.
+            if let Some(c) = creators.blocked(&rpc, &ages, &r.pool) {
+                n_filtered += 1;
+                skip(&mut f_sig, format!("blocked creator ({c})"))?;
+                continue;
+            }
             if !sells.enough(&r.pool, cfg.min_sells) {
                 n_filtered += 1;
                 skip(&mut f_sig, format!("no sell history ({} of {} sells seen)", sells.count(&r.pool), cfg.min_sells))?;
@@ -1398,6 +1498,7 @@ pub fn run(cfg: Config) -> Result<(), String> {
                     // A real finding (taxed/blocked) is permanent; a node error is not.
                     if let Ok(v) = &verdict {
                         block(&mut blocklist, &info.token, &format!("trap check: {v:?}"));
+                        creators.block(&rpc, &ages, &r.pool, &format!("trap check on {}: {v:?}", info.token));
                     }
                     skip(&mut f_sig, format!("unsafe: {verdict:?}"))?;
                     continue;
@@ -1451,12 +1552,15 @@ pub fn run(cfg: Config) -> Result<(), String> {
                             n_unsafe += 1;
                             if let Ok(v) = &verdict {
                                 block(&mut blocklist, &info.token, &format!("real-size check: {v:?}"));
+                                creators.block(&rpc, &ages, &r.pool, &format!("real-size check on {}: {v:?}", info.token));
                             }
                             skip(&mut f_sig, format!("unsafe: real size: {verdict:?}"))?;
                             continue;
                         }
                     }
-                    write(&mut f_sig, json!({"pool": r.pool, "token": info.token, "block": r.block, "taken": true, "venue": vt, "usd_in": usd_in}))?;
+                    // Rug guard measurements (no rule yet): scored later against outcomes.
+                    let rug_meta = rug_measure(&rpc, &mut creators, &ages, &r.pool, &info, r.block);
+                    write(&mut f_sig, json!({"pool": r.pool, "token": info.token, "block": r.block, "taken": true, "venue": vt, "usd_in": usd_in, "rug": rug_meta}))?;
                     eprintln!("paper: BUY  {} ${usd_in} [{vt}] ({}/{} rush at block {})", info.token, info.base, r.pool, r.block);
                     // Race check: price this exact buy again a few blocks from
                     // the newest block we have seen (when we really decided).
@@ -1958,7 +2062,7 @@ mod tests {
         // only "busy" is left in the old busy/no-quote bucket
         assert!(r.contains("skipped (busy or no quote) 1 | blocked as unsafe 2"), "{r}");
         assert!(
-            r.contains("skips: blocked token 1 | unsafe hook 1 | unknown v4 pool 1 | no sell history 2 | already jumped 1 | few real buyers 1 | too thin 1 | unsafe 2 | average trade size $37.50"),
+            r.contains("skips: blocked token 1 | pool too young 0 | blocked creator 0 | unsafe hook 1 | unknown v4 pool 1 | no sell history 2 | already jumped 1 | few real buyers 1 | too thin 1 | unsafe 2 | average trade size $37.50"),
             "{r}"
         );
         let _ = fs::remove_dir_all(&dir);
@@ -2230,9 +2334,9 @@ mod tests {
     #[test]
     fn topics_follow_the_venue_list() {
         let all = topics_for(&[VenueKind::V3, VenueKind::V4, VenueKind::V2]);
-        assert_eq!(all.len(), 5);
+        assert_eq!(all.len(), 7); // swaps, syncs, V4 Initialize, V3/V2 pool creations
         let only_v3 = topics_for(&[VenueKind::V3]);
-        assert_eq!(only_v3, vec![(sig_v3_swap(), LogKind::V3Swap)]);
+        assert_eq!(only_v3, vec![(sig_v3_swap(), LogKind::V3Swap), (crate::rugguard::SIG_V3_POOL_CREATED.to_string(), LogKind::Created)]);
         let log = |t: String, addr: &str| json!({"address": addr, "topics": [t]});
         assert_eq!(log_kind(&log(sig_v4_swap(), V4_POOL_MANAGER), &all), Some(LogKind::V4Swap));
         // V4 events from anything but the real PoolManager are ignored.
