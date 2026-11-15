@@ -45,6 +45,15 @@ pub const CHAIN_ID: u64 = 4663;
 /// Uniswap SwapRouter02 on Robinhood Chain (from src/config/knownAddresses.ts,
 /// bytecode verified by the dex bot).
 pub const SWAP_ROUTER_02: &str = "0xcaf681a66d020601342297493863e78c959e5cb2";
+/// Where signed trades go: straight to Robinhood's sequencer, like the arb
+/// bot (PR #19: "sends to sequencer.mainnet.chain.robinhood.com"). Reads
+/// (nonce, gas, receipts) still use our normal node. SNIPER_SEND_RPC overrides.
+pub const SEQUENCER_RPC: &str = "https://sequencer.mainnet.chain.robinhood.com";
+
+/// The send endpoint: SNIPER_SEND_RPC, else the sequencer.
+pub fn send_url_from_env() -> String {
+    std::env::var("SNIPER_SEND_RPC").ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).unwrap_or_else(|| SEQUENCER_RPC.to_string())
+}
 
 /// Hard ceilings. The settings can only go LOWER than these; raising them
 /// means changing this file, which is a deliberate owner decision.
@@ -458,14 +467,24 @@ pub fn outcome_of(receipt: &Value) -> Option<Outcome> {
 
 /// Sends and tracks transactions for one wallet, one at a time.
 pub struct Sender {
+    /// Reads: nonce, gas, receipts, balances.
     pub rpc: Rpc,
+    /// Sends only (the sequencer by default).
+    pub send: Rpc,
     pub signer: Signer,
     next_nonce: Option<u64>,
 }
 
 impl Sender {
-    pub fn new(rpc: Rpc, signer: Signer) -> Sender {
-        Sender { rpc, signer, next_nonce: None }
+    /// Refuses to start unless the read node really is Robinhood Chain
+    /// (dex bot PR #38: live readiness checks gate every send).
+    pub fn new(rpc: Rpc, send: Rpc, signer: Signer) -> Result<Sender, String> {
+        let id = rpc.call("eth_chainId", json!([]))?;
+        let id = u64::from_str_radix(id.as_str().unwrap_or("0x0").trim_start_matches("0x"), 16).unwrap_or(0);
+        if id != CHAIN_ID {
+            return Err(format!("node is chain {id}, not Robinhood ({CHAIN_ID}): refusing to send"));
+        }
+        Ok(Sender { rpc, send, signer, next_nonce: None })
     }
 
     /// Next nonce: from the node the first time and after any doubt.
@@ -501,7 +520,7 @@ impl Sender {
             let n = self.nonce()?;
             let f = TxFields { nonce: n, max_priority_fee: 0, max_fee, gas_limit: *gas_limit, to: to.clone(), value: U256::ZERO, data: data.clone() };
             let s = self.signer.sign(&f)?;
-            match self.rpc.call("eth_sendRawTransaction", json!([s.raw_hex()])) {
+            match self.send.call("eth_sendRawTransaction", json!([s.raw_hex()])) {
                 Ok(_) => {
                     self.next_nonce = Some(n + 1);
                     hashes.push(s.hash);
