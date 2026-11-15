@@ -715,10 +715,37 @@ pub fn exit_on_quote(net_gain: f64, held: Duration, tp: f64, sl: f64, hold: Dura
 }
 
 /// Coin cutoff: this coin's closed trades within `window` lost more than
-/// `max_loss` (USD) in total. `hist` = (when closed, net USD).
-pub fn coin_cooling(hist: &[(Instant, f64)], now: Instant, window: Duration, max_loss: f64) -> bool {
-    let sum: f64 = hist.iter().filter(|(t, _)| now.saturating_duration_since(*t) < window).map(|(_, n)| n).sum();
+/// `max_loss` (USD) in total. `hist` = (unix seconds when closed, net USD).
+pub fn coin_cooling(hist: &[(u64, f64)], now: u64, window: Duration, max_loss: f64) -> bool {
+    let w = window.as_secs();
+    let sum: f64 = hist.iter().filter(|(t, _)| now.saturating_sub(*t) < w).map(|(_, n)| n).sum();
     sum < -max_loss
+}
+
+/// Unix time in seconds.
+fn unix_now() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// Coin cutoff memory that survives restarts: closed trades from EVERY run
+/// folder next to ours (paper-out/*/paper_trades.jsonl) within `window`.
+/// Without this a restart forgot run 6/7's worst coin and re-lost $33 on it.
+pub fn load_coin_history(out: &Path, window: Duration) -> HashMap<String, Vec<(u64, f64)>> {
+    let mut h: HashMap<String, Vec<(u64, f64)>> = HashMap::new();
+    let since = unix_now().saturating_sub(window.as_secs());
+    let Some(parent) = out.parent() else { return h };
+    let Ok(dirs) = fs::read_dir(parent) else { return h };
+    for d in dirs.flatten() {
+        let Ok(text) = fs::read_to_string(d.path().join("paper_trades.jsonl")) else { continue };
+        for line in text.lines() {
+            let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
+            let (Some(tok), Some(ms), Some(net)) = (v["token"].as_str(), v["wall_ms"].as_u64(), v["net_usd"].as_f64()) else { continue };
+            if v["reason"].is_string() && ms / 1000 >= since {
+                h.entry(tok.to_ascii_lowercase()).or_default().push((ms / 1000, net));
+            }
+        }
+    }
+    h
 }
 
 /// Why we'd exit right now, if at all.
@@ -1142,7 +1169,8 @@ pub fn run(cfg: Config) -> Result<(), String> {
     let mut n_filtered = 0u64; // rushes skipped by the other safety filters
     let mut tally: BTreeMap<&'static str, VenueTally> = BTreeMap::new();
     // Coin cutoff: each coin's closed trades (when, net USD).
-    let mut coin_hist: HashMap<String, Vec<(Instant, f64)>> = HashMap::new();
+    let mut coin_hist = load_coin_history(&cfg.out, cfg.cut_window);
+    eprintln!("paper: coin cutoff: remembered {} coins' recent trades from earlier runs", coin_hist.len());
     // Put a token on the blocklist and save the file right away.
     let block = |bl: &mut Blocklist, token: &str, why: &str| {
         if bl.add(token, why) {
@@ -1395,7 +1423,7 @@ pub fn run(cfg: Config) -> Result<(), String> {
                             n_wins += 1;
                         }
                         total += net;
-                        coin_hist.entry(p.info.token.clone()).or_default().push((Instant::now(), net));
+                        coin_hist.entry(p.info.token.to_ascii_lowercase()).or_default().push((unix_now(), net));
                         let t = tally.entry(vt).or_default();
                         t.trades += 1;
                         t.wins += (net > 0.0) as u64;
@@ -1514,7 +1542,7 @@ pub fn run(cfg: Config) -> Result<(), String> {
                 continue;
             }
             // Coin cutoff: stop chasing a coin that has been losing for us.
-            if cfg.cut_loss_usd > 0.0 && coin_hist.get(&info.token).is_some_and(|h| coin_cooling(h, Instant::now(), cfg.cut_window, cfg.cut_loss_usd)) {
+            if cfg.cut_loss_usd > 0.0 && coin_hist.get(&info.token.to_ascii_lowercase()).is_some_and(|h| coin_cooling(h, unix_now(), cfg.cut_window, cfg.cut_loss_usd)) {
                 n_filtered += 1;
                 skip(&mut f_sig, format!("coin cooling off (lost over ${:.0} in {:.0}h)", cfg.cut_loss_usd, cfg.cut_window.as_secs_f64() / 3600.0))?;
                 continue;
@@ -1961,12 +1989,38 @@ mod tests {
 
     #[test]
     fn coin_cutoff_counts_only_recent_losses() {
-        let now = Instant::now() + Duration::from_secs(10 * 3600);
-        let h = |hours_ago: u64, net: f64| (now - Duration::from_secs(hours_ago * 3600), net);
+        let now = 1_000_000u64;
+        let h = |hours_ago: u64, net: f64| (now - hours_ago * 3600, net);
         let w = Duration::from_secs(6 * 3600);
         assert!(coin_cooling(&[h(1, -6.0), h(2, -6.0), h(3, -5.0)], now, w, 15.0)); // -$17 in 6 h
         assert!(!coin_cooling(&[h(1, -6.0), h(2, -6.0), h(7, -5.0)], now, w, 15.0)); // old loss expired
         assert!(!coin_cooling(&[h(1, -10.0), h(2, -10.0), h(3, 8.0)], now, w, 15.0)); // wins count too
+    }
+
+    #[test]
+    fn coin_history_read_from_all_runs() {
+        let root = std::env::temp_dir().join(format!("sniper-coinhist-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("run7")).unwrap();
+        fs::create_dir_all(root.join("run8")).unwrap();
+        let ms = unix_now() * 1000;
+        let old = ms - 7 * 3600 * 1000;
+        fs::write(
+            root.join("run7/paper_trades.jsonl"),
+            [
+                json!({"token": "0xAA", "reason": "stop_loss", "net_usd": -9.0, "wall_ms": ms}).to_string(),
+                json!({"token": "0xaa", "reason": "stop_loss", "net_usd": -9.0, "wall_ms": ms}).to_string(),
+                json!({"token": "0xbb", "reason": "time", "net_usd": -9.0, "wall_ms": old}).to_string(), // too old
+                json!({"ladder_for": "0xpool"}).to_string(),
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        let h = load_coin_history(&root.join("run8"), Duration::from_secs(6 * 3600));
+        assert_eq!(h.get("0xaa").map(Vec::len), Some(2));
+        assert!(!h.contains_key("0xbb"));
+        assert!(coin_cooling(&h["0xaa"], unix_now(), Duration::from_secs(6 * 3600), 15.0));
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
