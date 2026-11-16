@@ -25,6 +25,7 @@ pub mod feedwatch;
 pub mod fourmeme;
 pub mod live;
 pub mod rugguard;
+pub mod safety;
 pub mod matcher;
 pub mod paper;
 pub mod probe;

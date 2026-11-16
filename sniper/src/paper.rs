@@ -389,8 +389,15 @@ pub fn already_jumped(start: f64, now: f64, max_pct: f64) -> bool {
 /// the "bundle" share (coins bought out of the pool in its first ~2 s).
 /// Only for pools we saw being created; V4 has no bundle figure (all V4
 /// pools share one PoolManager balance). About 3 node requests.
-fn rug_measure(rpc: &Rpc, creators: &mut crate::rugguard::Creators, ages: &crate::rugguard::PoolAges, pool: &str, info: &Pool, block: u64) -> Value {
-    let Some(born) = ages.get(pool).cloned() else { return json!({"pool_age_s": null}) };
+fn rug_measure(rpc: &Rpc, creators: &mut crate::rugguard::Creators, ages: &crate::rugguard::PoolAges, safety_cache: &mut HashMap<String, Value>, pool: &str, info: &Pool, block: u64) -> Value {
+    // Safety checklist (measure only, safety.rs): once per coin.
+    let born_block = ages.get(pool).map(|b| b.block);
+    let creator_now = creators.creator(rpc, ages, pool);
+    let safety = safety_cache
+        .entry(info.token.to_ascii_lowercase())
+        .or_insert_with(|| crate::safety::measure(rpc, &info.token, pool, born_block, creator_now.as_deref(), matches!(info.venue, Venue::V3 { .. })))
+        .clone();
+    let Some(born) = ages.get(pool).cloned() else { return json!({"pool_age_s": null, "safety": safety}) };
     let age = block.saturating_sub(born.block) as f64 * BLOCK_SECS;
     let u = |v: Result<Value, String>| v.ok().and_then(|x| x.as_str().and_then(crate::rugguard::hex_u128));
     let supply = u(rpc.call("eth_call", json!([{"to": info.token, "data": "0x18160ddd"}, "latest"])));
@@ -409,7 +416,7 @@ fn rug_measure(rpc: &Rpc, creators: &mut crate::rugguard::Creators, ages: &crate
             .ok()
             .and_then(|v| crate::rugguard::bundle_share(v.as_array().map(Vec::as_slice).unwrap_or(&[]), pool, sup)),
     };
-    json!({"pool_age_s": age, "creator": creator, "creator_share": creator_share, "bundle_share": bundle})
+    json!({"pool_age_s": age, "creator": creator, "creator_share": creator_share, "bundle_share": bundle, "safety": safety})
 }
 
 /// Room for one more position? Never two in the same token, at most
@@ -1083,6 +1090,8 @@ pub fn run(cfg: Config) -> Result<(), String> {
     // Rug guard: pool ages and blocked creators (see rugguard.rs).
     let mut ages = crate::rugguard::PoolAges::default();
     let mut creators = crate::rugguard::Creators::load(&cfg.out)?;
+    // Safety checklist results per coin (measure only).
+    let mut safety_cache: HashMap<String, Value> = HashMap::new();
     // V4 pool keys seen by earlier runs in this folder (a damaged file only
     // costs us those pools, so it is reported, not fatal).
     let keys_path = cfg.out.join(venue::V4Keys::FILE);
@@ -1656,7 +1665,7 @@ pub fn run(cfg: Config) -> Result<(), String> {
                         }
                     }
                     // Rug guard measurements (no rule yet): scored later against outcomes.
-                    let rug_meta = rug_measure(&rpc, &mut creators, &ages, &r.pool, &info, r.block);
+                    let rug_meta = rug_measure(&rpc, &mut creators, &ages, &mut safety_cache, &r.pool, &info, r.block);
                     write(&mut f_sig, json!({"pool": r.pool, "token": info.token, "block": r.block, "taken": true, "venue": vt, "usd_in": usd_in, "rug": rug_meta}))?;
                     eprintln!("paper: BUY  {} ${usd_in} [{vt}] ({}/{} rush at block {})", info.token, info.base, r.pool, r.block);
                     // Race check: price this exact buy again a few blocks from
