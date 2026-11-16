@@ -77,30 +77,36 @@ POLICIES = [
 def exit_on_path(rets, pol):
     """rets: [(block offset from entry, net return)] after entry, in order.
     Returns (net return at exit, reason, block offset). Shared by the
-    replay and deploy/trail-test.py."""
+    replay and deploy/trail-test.py. REPLAY_EXIT_DELAY_BLOCKS (default 0):
+    a sell decided at one swap fills at the first swap that many blocks
+    later (we see prices ~1 s late and land ~2 blocks late)."""
     hold = round(pol["hold_s"] / BLOCK_S)
+    delay = int(os.environ.get("REPLAY_EXIT_DELAY_BLOCKS", "0"))
     peak = None
     last = None
-    for off, ret in rets:
+
+    def filled(i, off, ret, why):
+        if delay <= 0:
+            return ret, why, off
+        for off2, ret2 in rets[i + 1:]:
+            if off2 >= off + delay:
+                return ret2, why, off2
+        return ret, why, off
+
+    for i, (off, ret) in enumerate(rets):
         if off > hold:
             break
-        last = (ret, off)
+        last = (i, ret, off)
         peak = ret if peak is None else max(peak, ret)
         if ret <= -pol["sl"]:
-            return ret, "stop_loss", off
+            return filled(i, off, ret, "stop_loss")
         if pol["tp"] is not None and ret >= pol["tp"]:
-            return ret, "take_profit", off
+            return filled(i, off, ret, "take_profit")
         if pol["trail"] is not None and peak >= pol["trail"] and ret <= peak - pol["gap"]:
-            return ret, "trail", off
+            return filled(i, off, ret, "trail")
     if last is None:
         return None, "time", hold
-    return last[0], "time", last[1]
-LATE_BLOCKS = 2
-USD, MAX_RT = 50.0, 0.015
-GAS_USD = 0.01  # per side, run 5 paid $0.80 for 75 trades (both sides)
-
-Q96 = 2 ** 96
-calls_made = 0
+    return filled(last[0], last[2], last[1], "time")
 
 
 def rpc(method, params, tries=8):
