@@ -907,19 +907,59 @@ pub fn venues_from_env() -> Result<Vec<VenueKind>, String> {
 /// Look up a pool: must be a Uniswap V3 pool (our factory) with exactly one
 /// side WETH or USDG. One batched request.
 pub fn pool_info(url: &str, agent: &ureq::Agent, pool: &str) -> Option<Pool> {
+    pool_info_checked(url, agent, pool).ok().flatten()
+}
+
+/// One batched node request; each answer is Ok(result), or Err when the
+/// node did not really answer (network error, rate limit, overload).
+/// A revert (the address isn't a pool) is a real answer: Ok("0x").
+///
+/// Why this matters (run 10 bug, Nov 16): a failed lookup used to be saved
+/// as "not a tradeable pool" for the whole run. Right after a restart the
+/// node was busy, every hot V3 pool failed once, and the bot ignored all V3
+/// trading for over an hour. Failures are now retried instead of remembered.
+fn batch_answers(url: &str, agent: &ureq::Agent, body: &Value) -> Result<Value, String> {
+    crate::sellcheck::count_calls(body.as_array().map_or(1, |a| a.len() as u64));
+    let mut r = agent.post(url).send_json(body).map_err(|e| format!("send: {e}"))?;
+    let v: Value = r.body_mut().read_json().map_err(|e| format!("read: {e}"))?;
+    if !v.is_array() {
+        return Err(format!("not a batch answer: {}", v.to_string().chars().take(120).collect::<String>()));
+    }
+    Ok(v)
+}
+
+/// Result for request `id` in a batch answer (see batch_answers).
+pub fn batch_get(v: &Value, id: u64) -> Result<String, String> {
+    let x = v.as_array().and_then(|a| a.iter().find(|x| x["id"] == id)).ok_or("missing answer")?;
+    if let Some(r) = x["result"].as_str() {
+        return Ok(r.to_string());
+    }
+    let msg = x["error"]["message"].as_str().unwrap_or("").to_ascii_lowercase();
+    if x["error"]["code"] == 3 || msg.contains("revert") {
+        return Ok("0x".into()); // a real "no": not a pool
+    }
+    Err(format!("node error: {}", x["error"]))
+}
+
+/// V3 pool lookup. Ok(None) = the node answered and it's not a pool we can
+/// trade (remember that). Err = no real answer (retry later).
+pub fn pool_info_checked(url: &str, agent: &ureq::Agent, pool: &str) -> Result<Option<Pool>, String> {
     let call = |id: u64, sel: &str| json!({"jsonrpc": "2.0", "id": id, "method": "eth_call", "params": [{"to": pool, "data": sel}, "latest"]});
     // token0, token1, fee, factory
     let body = json!([call(1, "0x0dfe1681"), call(2, "0xd21220a7"), call(3, "0xddca3f43"), call(4, "0xc45a0155")]);
-    crate::sellcheck::count_calls(body.as_array().map_or(1, |a| a.len() as u64));
-    let mut r = agent.post(url).send_json(&body).ok()?;
-    let v: Value = r.body_mut().read_json().ok()?;
-    let get = |id: u64| v.as_array()?.iter().find(|x| x["id"] == id).and_then(|x| x["result"].as_str()).map(str::to_string);
-    let addr = |h: String| (h.len() >= 66).then(|| format!("0x{}", h.trim_start_matches("0x")[24..64].to_ascii_lowercase()));
-    let (t0, t1, factory) = (addr(get(1)?)?, addr(get(2)?)?, addr(get(4)?)?);
+    let v = batch_answers(url, agent, &body)?;
+    let (r1, r2, r3, r4) = (batch_get(&v, 1)?, batch_get(&v, 2)?, batch_get(&v, 3)?, batch_get(&v, 4)?);
+    Ok(v3_pool_from(&r1, &r2, &r3, &r4))
+}
+
+/// The V3 part that needs no node (testable): raw answers -> pool.
+pub fn v3_pool_from(r1: &str, r2: &str, r3: &str, r4: &str) -> Option<Pool> {
+    let addr = |h: &str| (h.len() >= 66).then(|| format!("0x{}", h.trim_start_matches("0x")[24..64].to_ascii_lowercase()));
+    let (t0, t1, factory) = (addr(r1)?, addr(r2)?, addr(r4)?);
     if factory != V3_FACTORY {
         return None; // other V3 forks: the Uniswap quoter can't price them
     }
-    let fee = u32::from_str_radix(get(3)?.trim_start_matches("0x").trim_start_matches('0'), 16).ok()?;
+    let fee = u32::from_str_radix(r3.trim_start_matches("0x").trim_start_matches('0'), 16).ok()?;
     let p = crate::rhc::PoolInfo { token0: t0.clone(), token1: t1.clone(), fee_ppm: Some(fee as u64) };
     let (token, base, token_is0) = p.sides()?;
     if base == "ETH" {
@@ -933,16 +973,19 @@ pub fn pool_info(url: &str, agent: &ureq::Agent, pool: &str) -> Option<Pool> {
 /// e.g. PancakeSwap V2 emits the same events with a different fee) with
 /// exactly one side WETH or USDG. One batched request.
 pub fn v2_pool_info(url: &str, agent: &ureq::Agent, pair: &str) -> Option<Pool> {
+    v2_pool_info_checked(url, agent, pair).ok().flatten()
+}
+
+/// V2 pair lookup; same Ok(None) vs Err meaning as pool_info_checked.
+pub fn v2_pool_info_checked(url: &str, agent: &ureq::Agent, pair: &str) -> Result<Option<Pool>, String> {
     let call = |id: u64, sel: &str| json!({"jsonrpc": "2.0", "id": id, "method": "eth_call", "params": [{"to": pair, "data": sel}, "latest"]});
     // token0, token1, factory
     let body = json!([call(1, "0x0dfe1681"), call(2, "0xd21220a7"), call(4, "0xc45a0155")]);
-    crate::sellcheck::count_calls(body.as_array().map_or(1, |a| a.len() as u64));
-    let mut r = agent.post(url).send_json(&body).ok()?;
-    let v: Value = r.body_mut().read_json().ok()?;
-    let get = |id: u64| v.as_array()?.iter().find(|x| x["id"] == id).and_then(|x| x["result"].as_str()).map(str::to_string);
-    let addr = |h: String| (h.len() >= 66).then(|| format!("0x{}", h.trim_start_matches("0x")[24..64].to_ascii_lowercase()));
-    let (t0, t1, factory) = (addr(get(1)?)?, addr(get(2)?)?, addr(get(4)?)?);
-    v2_pool_from(pair, &t0, &t1, &factory)
+    let v = batch_answers(url, agent, &body)?;
+    let (r1, r2, r4) = (batch_get(&v, 1)?, batch_get(&v, 2)?, batch_get(&v, 4)?);
+    let addr = |h: &str| (h.len() >= 66).then(|| format!("0x{}", h.trim_start_matches("0x")[24..64].to_ascii_lowercase()));
+    let (Some(t0), Some(t1), Some(factory)) = (addr(&r1), addr(&r2), addr(&r4)) else { return Ok(None) };
+    Ok(v2_pool_from(pair, &t0, &t1, &factory))
 }
 
 /// The V2 part of v2_pool_info that needs no node (testable).
@@ -1209,6 +1252,9 @@ pub fn run(cfg: Config) -> Result<(), String> {
     // Pool address (V3/V2) or pool id (V4) -> what we know. None = known and
     // not tradable. Missing = not looked up yet (or a V4 pool with no key).
     let mut pools: HashMap<String, Option<Pool>> = HashMap::new();
+    // Pools whose lookup failed (node busy): when we last tried, to retry later.
+    let mut info_retry: HashMap<String, Instant> = HashMap::new();
+    let mut n_info_fail: u64 = 0;
     // Latest V2 reserves per pair, from Sync events.
     let mut v2_res: HashMap<String, (U256, U256)> = HashMap::new();
     let mut det = Detector::default();
@@ -1363,13 +1409,27 @@ pub fn run(cfg: Config) -> Result<(), String> {
                 };
                 if !pools.contains_key(&pool) {
                     match kind {
-                        LogKind::V3Swap => {
-                            let info = pool_info(&cfg.http, &agent, &pool);
-                            pools.insert(pool.clone(), info);
-                        }
-                        LogKind::V2Swap => {
-                            let info = v2_pool_info(&cfg.http, &agent, &pool);
-                            pools.insert(pool.clone(), info);
+                        LogKind::V3Swap | LogKind::V2Swap => {
+                            // Failed lookups are retried (at most every 30 s
+                            // per pool), never remembered as "not a pool".
+                            if info_retry.get(&pool).is_some_and(|t: &Instant| t.elapsed() < Duration::from_secs(30)) {
+                                continue;
+                            }
+                            let got = if kind == LogKind::V3Swap { pool_info_checked(&cfg.http, &agent, &pool) } else { v2_pool_info_checked(&cfg.http, &agent, &pool) };
+                            match got {
+                                Ok(info) => {
+                                    info_retry.remove(&pool);
+                                    pools.insert(pool.clone(), info);
+                                }
+                                Err(e) => {
+                                    n_info_fail += 1;
+                                    if n_info_fail <= 20 || n_info_fail.is_multiple_of(100) {
+                                        eprintln!("paper: pool lookup failed for {pool} ({e}); will retry [{n_info_fail} so far]");
+                                    }
+                                    info_retry.insert(pool.clone(), Instant::now());
+                                    continue;
+                                }
+                            }
                         }
                         LogKind::V4Swap => {
                             if let Some(k) = v4keys.get(&pool).cloned() {
@@ -2749,4 +2809,21 @@ mod tests {
         assert!(r.contains("TOTAL $+1.50"), "{r}");
         let _ = fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn pool_lookup_failures_are_not_remembered_as_not_a_pool() {
+        // run 10 bug: a busy node made every hot V3 pool look "not tradeable"
+        let ok = json!([{"id": 1, "result": "0xabc"}, {"id": 2, "error": {"code": 3, "message": "execution reverted"}}]);
+        assert_eq!(batch_get(&ok, 1), Ok("0xabc".to_string()));
+        assert_eq!(batch_get(&ok, 2), Ok("0x".to_string())); // a revert is a real "no"
+        assert!(batch_get(&ok, 9).is_err()); // missing answer = retry
+        let busy = json!([{"id": 1, "error": {"code": -32005, "message": "rate limit exceeded"}}]);
+        assert!(batch_get(&busy, 1).is_err()); // rate limit = retry, not "no"
+        // real answers that aren't a pool -> definite None
+        assert!(v3_pool_from("0x", "0x", "0x", "0x").is_none());
+        let w = |a: &str| format!("0x{:0>64}", a);
+        // not the Uniswap V3 factory -> definite None
+        assert!(v3_pool_from(&w("11"), &w("22"), &w("bb8"), &w("33")).is_none());
+    }
+
 }
