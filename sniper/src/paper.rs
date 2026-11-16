@@ -528,9 +528,10 @@ impl Blocklist {
 /// skip line in signals.jsonl has a "why" starting with one of these.
 /// Matching takes the FIRST reason a "why" starts with, so "unsafe hook"
 /// must stay before "unsafe" (the trap check, always last).
-pub const SKIP_REASONS: [&str; 11] = [
+pub const SKIP_REASONS: [&str; 12] = [
     "blocked token",
     "pool too young",
+    "pool age unknown",
     "blocked creator",
     "coin cooling off",
     "unsafe hook",
@@ -1117,6 +1118,12 @@ pub fn run(cfg: Config) -> Result<(), String> {
     // Rug guard: pool ages and blocked creators (see rugguard.rs).
     let mut ages = crate::rugguard::PoolAges::default();
     let mut creators = crate::rugguard::Creators::load(&cfg.out)?;
+    // Real birth blocks from chain lookups, shared by all runs
+    // (paper-out/pool_births.json). Closes the restart hole: a pool we did
+    // not see being created gets its real age looked up, not assumed old.
+    let births_path = cfg.out.parent().unwrap_or(&cfg.out).join(crate::rugguard::Births::FILE);
+    let mut births = crate::rugguard::Births::load(births_path);
+    eprintln!("paper: {} pool birth blocks loaded from earlier lookups", births.map.len());
     // Safety checklist results per coin (measure only).
     let mut safety_cache: HashMap<String, Value> = HashMap::new();
     // V4 pool keys seen by earlier runs in this folder (a damaged file only
@@ -1590,7 +1597,32 @@ pub fn run(cfg: Config) -> Result<(), String> {
                 continue;
             }
             // Rug guard: brand-new pools are where every run-5 rug happened.
-            let age = ages.age_secs(&r.pool, r.block, BLOCK_SECS);
+            let mut age = ages.age_secs(&r.pool, r.block, BLOCK_SECS);
+            if age.is_none() && cfg.min_pool_age_s > 0.0 {
+                // Not seen being created: use (or look up) its real birth.
+                let born = match births.get(&r.pool) {
+                    Some(b) => Some(b),
+                    None => match crate::rugguard::birth_lookup(&rpc, &r.pool, r.block) {
+                        Ok(b) => {
+                            births.add(&r.pool, b);
+                            Some(b)
+                        }
+                        Err(e) => {
+                            eprintln!("paper: birth lookup failed for {} ({e})", r.pool);
+                            None
+                        }
+                    },
+                };
+                match born {
+                    Some(b) => age = Some(r.block.saturating_sub(b) as f64 * BLOCK_SECS),
+                    None => {
+                        // Can't prove it is old enough: safe side is skip.
+                        n_filtered += 1;
+                        skip(&mut f_sig, "pool age unknown (lookup failed)".into())?;
+                        continue;
+                    }
+                }
+            }
             if crate::rugguard::too_young(age, cfg.min_pool_age_s) {
                 n_filtered += 1;
                 skip(&mut f_sig, format!("pool too young ({:.0}s old, need {:.0}s)", age.unwrap_or(0.0), cfg.min_pool_age_s))?;
@@ -2368,6 +2400,7 @@ mod tests {
             why("unsafe hook (0x..88: can change swap amounts)"),
             why("unknown v4 pool (no Initialize event seen; pool older than our run)"),
             why("few real buyers (2 wallets behind 3 buys, need 3)"),
+            why("pool age unknown (lookup failed)"),
         ];
         fs::write(dir.join("signals.jsonl"), sig.join("\n")).unwrap();
         let r = report(&dir);
@@ -2376,7 +2409,7 @@ mod tests {
         // only "busy" is left in the old busy/no-quote bucket
         assert!(r.contains("skipped (busy or no quote) 1 | blocked as unsafe 2"), "{r}");
         assert!(
-            r.contains("skips: blocked token 1 | pool too young 0 | blocked creator 0 | coin cooling off 0 | unsafe hook 1 | unknown v4 pool 1 | no sell history 2 | already jumped 1 | few real buyers 1 | too thin 1 | unsafe 2 | average trade size $37.50"),
+            r.contains("skips: blocked token 1 | pool too young 0 | pool age unknown 1 | blocked creator 0 | coin cooling off 0 | unsafe hook 1 | unknown v4 pool 1 | no sell history 2 | already jumped 1 | few real buyers 1 | too thin 1 | unsafe 2 | average trade size $37.50"),
             "{r}"
         );
         let _ = fs::remove_dir_all(&dir);

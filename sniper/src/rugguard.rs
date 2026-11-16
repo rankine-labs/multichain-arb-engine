@@ -109,9 +109,125 @@ impl PoolAges {
 }
 
 /// The age rule: too young only when we KNOW the age and it is under the
-/// minimum. Unknown = created before our look-back = old enough.
+/// minimum. (paper.rs now looks up the real age of any pool it has not seen
+/// being created, so "unknown" only happens when that lookup fails, and the
+/// trade is then skipped as "pool age unknown".)
 pub fn too_young(age_secs: Option<f64>, min_secs: f64) -> bool {
     age_secs.is_some_and(|a| a < min_secs)
+}
+
+// ---------------------------------------------------------------------------
+// REAL BIRTH LOOKUP (fixes the restart hole)
+//
+// Plain English: on restart the bot only sees pools created in the last few
+// minutes. Any pool older than that used to count as "old", so a 20-minute
+// old scam pool passed the age rule right after a restart. Now we ask the
+// chain directly when the pool first existed, with a binary search over
+// history (about 27 node requests per pool, done once, then remembered on
+// disk in paper-out/pool_births.json and shared by every run):
+//   V3/V2 pool = a contract: first block where it has code.
+//   V4 pool    = a slot in the PoolManager (pools[id]): first block where it
+//                is non-zero. It is set by Initialize.
+// ---------------------------------------------------------------------------
+
+/// Storage slot of `pools[id]` in the V4 PoolManager (mapping at slot 6).
+pub fn v4_state_slot(pool_id: &str) -> Option<String> {
+    let id = pool_id.trim_start_matches("0x");
+    if id.len() != 64 {
+        return None;
+    }
+    let mut buf = Vec::with_capacity(64);
+    for i in (0..64).step_by(2) {
+        buf.push(u8::from_str_radix(&id[i..i + 2], 16).ok()?);
+    }
+    buf.extend_from_slice(&[0u8; 31]);
+    buf.push(6);
+    Some(crate::fourmeme::hex(&crate::fourmeme::keccak(&buf)))
+}
+
+/// Does the pool exist at `block`? (one node request)
+fn exists_at(rpc: &crate::sellcheck::Rpc, pool: &str, block: u64) -> Result<bool, String> {
+    let tag = format!("0x{block:x}");
+    if let Some(slot) = v4_state_slot(pool) {
+        // extsload(bytes32) = 0x1e2eaeaf
+        let data = format!("0x1e2eaeaf{}", slot.trim_start_matches("0x"));
+        let v = rpc.call("eth_call", serde_json::json!([{"to": V4_POOL_MANAGER, "data": data}, tag]))?;
+        Ok(v.as_str().unwrap_or("0x").trim_start_matches("0x").chars().any(|c| c != '0'))
+    } else {
+        let v = rpc.call("eth_getCode", serde_json::json!([pool, tag]))?;
+        Ok(v.as_str().unwrap_or("0x").len() > 2)
+    }
+}
+
+/// First block where the pool exists, searching 0..=upper.
+/// Err when the node fails or the pool does not exist at `upper`.
+pub fn birth_lookup(rpc: &crate::sellcheck::Rpc, pool: &str, upper: u64) -> Result<u64, String> {
+    first_true(upper, |b| exists_at(rpc, pool, b))
+}
+
+/// Binary search: smallest block in 0..=upper where `test` is true
+/// (`test` must be false then true, never back). Split out so it can be
+/// tested without a node.
+pub fn first_true(upper: u64, mut test: impl FnMut(u64) -> Result<bool, String>) -> Result<u64, String> {
+    if !test(upper)? {
+        return Err("pool does not exist yet at that block".into());
+    }
+    let (mut lo, mut hi) = (0u64, upper);
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if test(mid)? {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    Ok(lo)
+}
+
+/// Birth blocks found by lookups, kept on disk and shared by all runs
+/// (paper-out/pool_births.json: {"<pool>": block}). The pool-age study
+/// script writes the same file, so its results are reused for free.
+#[derive(Default, Debug)]
+pub struct Births {
+    pub map: HashMap<String, u64>,
+    path: Option<std::path::PathBuf>,
+}
+
+impl Births {
+    pub const FILE: &'static str = "pool_births.json";
+
+    /// Load (a missing or damaged file just means starting empty; values
+    /// that are not block numbers, like the study's error notes, are skipped).
+    pub fn load(path: std::path::PathBuf) -> Self {
+        let mut map = HashMap::new();
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            if let Ok(Value::Object(o)) = serde_json::from_str::<Value>(&text) {
+                for (k, v) in o {
+                    if let Some(b) = v.as_u64() {
+                        map.insert(k.to_ascii_lowercase(), b);
+                    }
+                }
+            }
+        }
+        Births { map, path: Some(path) }
+    }
+
+    pub fn get(&self, pool: &str) -> Option<u64> {
+        self.map.get(&pool.to_ascii_lowercase()).copied()
+    }
+
+    /// Remember and save (write to a temp file, then rename, so a crash
+    /// never leaves a half-written file).
+    pub fn add(&mut self, pool: &str, block: u64) {
+        self.map.insert(pool.to_ascii_lowercase(), block);
+        if let Some(p) = &self.path {
+            let tmp = p.with_extension("json.tmp");
+            let ok = serde_json::to_string(&self.map).map_err(|e| e.to_string()).and_then(|s| std::fs::write(&tmp, s).map_err(|e| e.to_string())).and_then(|_| std::fs::rename(&tmp, p).map_err(|e| e.to_string()));
+            if let Err(e) = ok {
+                eprintln!("paper: could not save pool births ({e})");
+            }
+        }
+    }
 }
 
 /// A hex number ("0x...", one 32-byte word or less) as u128; numbers too
@@ -260,5 +376,48 @@ mod tests {
         let logs = vec![t(pool, 100), t(pool, 50), t("0x1111111111111111111111111111111111111111", 999)];
         assert_eq!(bundle_share(&logs, pool, 1000), Some(0.15));
         assert_eq!(bundle_share(&logs, pool, 0), None);
+    }
+
+    #[test]
+    fn v4_slot_matches_python_and_chain() {
+        // Same formula the pool-age study used; for this pool it gave 34.9
+        // min, matching the Initialize event found by v4-rug-check.py.
+        let id = "0x5295c931d68835960420dedc2012e6e6bd1d08ce2dd338238f92a06e91757fda";
+        assert_eq!(v4_state_slot(id).unwrap(), "d001e6ac5165509468e527d4a6f8fe3e5782970e34f95805ce116ac02a402aff");
+        // a V3 address is not a V4 id
+        assert_eq!(v4_state_slot("0xf8818bf7bd50437d11595a10eaa3aae7a2f8bf3b"), None);
+    }
+
+    #[test]
+    fn binary_search_finds_first_block() {
+        let mut calls = 0;
+        let got = first_true(115_000_000, |b| {
+            calls += 1;
+            Ok(b >= 114_321_987)
+        });
+        assert_eq!(got, Ok(114_321_987));
+        assert!(calls <= 30, "about 27 node requests, got {calls}");
+        // pool not there yet = error, not a fake block
+        assert!(first_true(100, |_| Ok(false)).is_err());
+        // node failure propagates (trade gets skipped, not passed)
+        assert!(first_true(100, |b| if b == 100 { Ok(true) } else { Err("down".into()) }).is_err());
+        // existed from block 0
+        assert_eq!(first_true(100, |_| Ok(true)), Ok(0));
+    }
+
+    #[test]
+    fn births_file_round_trip_and_skips_bad_values() {
+        let dir = std::env::temp_dir().join(format!("births-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(Births::FILE);
+        std::fs::write(&path, r#"{"0xAA": 10, "0xbb": "error: node down"}"#).unwrap();
+        let mut b = Births::load(path.clone());
+        assert_eq!(b.get("0xaa"), Some(10));
+        assert_eq!(b.get("0xbb"), None);
+        b.add("0xCC", 42);
+        let again = Births::load(path);
+        assert_eq!(again.get("0xcc"), Some(42));
+        assert_eq!(again.get("0xaa"), Some(10));
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
