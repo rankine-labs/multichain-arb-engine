@@ -463,6 +463,9 @@ impl KeyLookupBudget {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct V4Keys {
     pub keys: BTreeMap<String, V4Key>,
+    /// Keys from the shared history read: looked up, never re-saved here
+    /// (that file is written by deploy/v4-history.py).
+    shared: HashMap<String, V4Key>,
     dirty: bool,
 }
 
@@ -470,7 +473,7 @@ impl V4Keys {
     pub const FILE: &'static str = "v4_pool_keys.json";
     /// Memory guard: we only keep keys of pools we could trade (one side
     /// WETH/USDG/ETH), but cap the file anyway.
-    pub const MAX: usize = 200_000;
+    pub const MAX: usize = 500_000;
 
     /// Missing file = empty (first run). A damaged file is ignored with an
     /// error message (unlike the blocklist, losing keys is safe: those pools
@@ -519,7 +522,7 @@ impl V4Keys {
     /// Add a key. Returns true if it was new.
     pub fn insert(&mut self, key: V4Key) -> bool {
         let id = key.id();
-        if self.keys.contains_key(&id) || self.keys.len() >= Self::MAX {
+        if self.keys.contains_key(&id) || self.shared.contains_key(&id) || self.keys.len() >= Self::MAX {
             return false;
         }
         self.keys.insert(id, key);
@@ -527,8 +530,30 @@ impl V4Keys {
         true
     }
 
+    /// Add every key from another file (the shared history read,
+    /// deploy/v4-history.py). Returns how many were new.
+    pub fn merge(&mut self, other: V4Keys) -> usize {
+        let before = self.shared.len();
+        for (id, k) in other.keys {
+            if !self.keys.contains_key(&id) && self.shared.len() < Self::MAX {
+                self.shared.insert(id, k);
+            }
+        }
+        self.shared.len() - before
+    }
+
+    /// All keys known (this run's plus the shared history read).
+    pub fn len(&self) -> usize {
+        self.keys.len() + self.shared.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     pub fn get(&self, id: &str) -> Option<&V4Key> {
-        self.keys.get(&id.to_ascii_lowercase())
+        let id = id.to_ascii_lowercase();
+        self.keys.get(&id).or_else(|| self.shared.get(&id))
     }
 }
 
@@ -626,6 +651,19 @@ pub fn signers_from_replies(replies: &Value) -> HashMap<String, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn shared_keys_are_found_but_not_resaved() {
+        let k = V4Key { currency0: NATIVE_ETH.into(), currency1: "0x1111111111111111111111111111111111111111".into(), fee: 3000, tick_spacing: 60, hooks: NATIVE_ETH.into() };
+        let mut shared = V4Keys::default();
+        assert!(shared.insert(k.clone()));
+        let mut mine = V4Keys::default();
+        assert_eq!(mine.merge(shared), 1);
+        assert_eq!(mine.get(&k.id().to_ascii_uppercase().replace("0X", "0x")), Some(&k));
+        assert!(!mine.insert(k.clone())); // already known: not added to this run's file
+        assert!(mine.keys.is_empty());
+        assert_eq!(mine.len(), 1);
+    }
+
     use super::*;
 
     const WETH: &str = "0x0bd7d308f8e1639fab988df18a8011f41eacad73";

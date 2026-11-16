@@ -1090,6 +1090,15 @@ pub fn run(cfg: Config) -> Result<(), String> {
         eprintln!("paper: V4 pool keys not loaded ({e}); starting empty");
         venue::V4Keys::default()
     });
+    // Plus every V4 pool from the chain's history (deploy/v4-history.py
+    // writes paper-out/v4_pool_keys.json, shared by all runs). Each key is
+    // re-checked against its id on load. Old pools stop being "unknown".
+    if let Some(shared) = cfg.out.parent().map(|p| p.join(venue::V4Keys::FILE)) {
+        match venue::V4Keys::load(&shared) {
+            Ok(k) => eprintln!("paper: {} V4 pool keys added from the history read", v4keys.merge(k)),
+            Err(e) => eprintln!("paper: shared V4 pool keys not loaded ({e})"),
+        }
+    }
     eprintln!(
         "paper: writing to {} | venues {} | ETH ${eth:.0} | auto size, max ${} | TP {}% SL {}% hold {}s | {} blocked tokens, {} V4 pool keys loaded",
         cfg.out.display(),
@@ -1099,7 +1108,7 @@ pub fn run(cfg: Config) -> Result<(), String> {
         cfg.sl * 100.0,
         cfg.hold.as_secs_f64(),
         blocklist.tokens.len(),
-        v4keys.keys.len()
+        v4keys.len()
     );
 
     // Event ids to watch, for the enabled venues (one subscription, OR'ed).
