@@ -107,6 +107,12 @@ def exit_on_path(rets, pol):
     if last is None:
         return None, "time", hold
     return filled(last[0], last[2], last[1], "time")
+LATE_BLOCKS = 2
+USD, MAX_RT = 50.0, 0.015
+GAS_USD = 0.01  # per side, run 5 paid $0.80 for 75 trades (both sides)
+
+Q96 = 2 ** 96
+calls_made = 0
 
 
 def rpc(method, params, tries=8):
