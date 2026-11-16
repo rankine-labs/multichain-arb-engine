@@ -53,6 +53,48 @@ BLOCK_S = 0.105  # Robinhood block time (paper.rs uses the same)
 RUSH_BUYS, WINDOW_BLOCKS, RUSH_RISE = 3, round(1.0 / BLOCK_S), 0.02
 MIN_SELLS, MAX_RISE = 3, 0.08
 TP, SL, HOLD_BLOCKS = 0.05, 0.10, round(60 / BLOCK_S)
+# Price path kept after each rush (longer than the 60 s hold, so exit
+# policies with longer holds can be tested): REPLAY_PATH_SECS.
+PATH_BLOCKS = round(float(os.environ.get("REPLAY_PATH_SECS", "60")) / BLOCK_S)
+
+# Exit policies to compare (REPLAY_POLICIES=1). Each: fixed take profit
+# (tp), trailing take profit (start trailing once up `trail` net, sell when
+# it falls `gap` below its best), stop loss (sl), most time held (hold_s).
+POLICIES = [
+    ("now: TP 5% / SL 10% / 60s", dict(tp=0.05, trail=None, gap=None, sl=0.10, hold_s=60)),
+    ("TP 3%", dict(tp=0.03, trail=None, gap=None, sl=0.10, hold_s=60)),
+    ("TP 8%", dict(tp=0.08, trail=None, gap=None, sl=0.10, hold_s=60)),
+    ("trail from +3%, sell 2% off best, 60s", dict(tp=None, trail=0.03, gap=0.02, sl=0.10, hold_s=60)),
+    ("trail from +3%, sell 2% off best, 180s", dict(tp=None, trail=0.03, gap=0.02, sl=0.10, hold_s=180)),
+    ("trail from +5%, sell 3% off best, 60s", dict(tp=None, trail=0.05, gap=0.03, sl=0.10, hold_s=60)),
+    ("trail from +5%, sell 3% off best, 180s", dict(tp=None, trail=0.05, gap=0.03, sl=0.10, hold_s=180)),
+    ("trail from +5%, sell 2% off best, 180s", dict(tp=None, trail=0.05, gap=0.02, sl=0.10, hold_s=180)),
+    ("TP 5% / SL 5% / 60s", dict(tp=0.05, trail=None, gap=None, sl=0.05, hold_s=60)),
+    ("trail from +3%, sell 2% off, SL 5%, 180s", dict(tp=None, trail=0.03, gap=0.02, sl=0.05, hold_s=180)),
+]
+
+
+def exit_on_path(rets, pol):
+    """rets: [(block offset from entry, net return)] after entry, in order.
+    Returns (net return at exit, reason, block offset). Shared by the
+    replay and deploy/trail-test.py."""
+    hold = round(pol["hold_s"] / BLOCK_S)
+    peak = None
+    last = None
+    for off, ret in rets:
+        if off > hold:
+            break
+        last = (ret, off)
+        peak = ret if peak is None else max(peak, ret)
+        if ret <= -pol["sl"]:
+            return ret, "stop_loss", off
+        if pol["tp"] is not None and ret >= pol["tp"]:
+            return ret, "take_profit", off
+        if pol["trail"] is not None and peak >= pol["trail"] and ret <= peak - pol["gap"]:
+            return ret, "trail", off
+    if last is None:
+        return None, "time", hold
+    return last[0], "time", last[1]
 LATE_BLOCKS = 2
 USD, MAX_RT = 50.0, 0.015
 GAS_USD = 0.01  # per side, run 5 paid $0.80 for 75 trades (both sides)
@@ -274,7 +316,7 @@ def main():
                 if pool in open_watch:
                     keep = []
                     for r in open_watch[pool]:
-                        if block <= r["block"] + LATE_BLOCKS + HOLD_BLOCKS:
+                        if block <= r["block"] + LATE_BLOCKS + max(HOLD_BLOCKS, PATH_BLOCKS):
                             r["path"].append(tick)
                             keep.append(r)
                     if keep:
@@ -306,72 +348,83 @@ def main():
 
     # Pass 2: trade them in time order, one position at a time.
     rushes.sort(key=lambda r: r["block"])
-    trades, skips = [], defaultdict(int)
-    busy_until = -1
-    for r in rushes:
-        f = cache.get(r["pool"]) or {}
-        if f.get("factory") != V3_FACTORY or not f.get("t0"):
-            continue
-        t0, t1 = f["t0"], f["t1"]
-        token = t0 if r["token_side"] == 0 else t1
-        base = t1 if r["token_side"] == 0 else t0
-        if base not in (WETH, USDG) or token in (WETH, USDG):
-            continue
-        skips["rushes"] += 1
-        if r["block"] <= busy_until:
-            skips["busy"] += 1
-            continue
-        if r["sells"] < MIN_SELLS:
-            skips["no sell history"] += 1
-            continue
-        if r["price"] / r["start"] - 1 > MAX_RISE:
-            skips["already jumped"] += 1
-            continue
-        fee = (f["fee"] or 3000) / 1e6
-        base_is1 = r["token_side"] == 0
-        usd_per_base = eth if base == WETH else 1.0
-        dec = 18 if base == WETH else 6
-        # entry: last swap at or before rush block + late blocks
-        entry_blk = r["block"] + LATE_BLOCKS
-        path = r["path"]
-        ent = None
-        for k, tk in enumerate(path):
-            if tk[0] <= entry_blk:
-                ent = (k, tk)
-            else:
-                break
-        k0, (eb, ep1, esq, eliq) = ent
-        # size: largest of 50 / 25 within the round-trip limit (auto, capped $50)
-        usd = None
-        for s in (USD, 25.0):
-            imp1 = impact_side(esq, eliq, base_is1, s / usd_per_base * 10**dec)
-            if 2 * fee + 2 * imp1 <= MAX_RT:
-                usd, imp = s, imp1
-                break
-        if usd is None:
-            skips["too thin"] += 1
-            continue
-        tok_px = lambda p1: p1 if r["token_side"] == 0 else 1 / p1  # base per token
-        entry = tok_px(ep1) * (1 + fee) * (1 + imp)
-        exit_px, why, xb = None, "time", None
-        for tk in path[k0 + 1:]:
-            if tk[0] > entry_blk + HOLD_BLOCKS:
-                break
-            got = tok_px(tk[1]) * (1 - fee) * (1 - imp)
-            ret = got / entry - 1
-            exit_px, xb = got, tk[0]
-            if ret >= TP:
-                why = "take_profit"
-                break
-            if ret <= -SL:
-                why = "stop_loss"
-                break
-        if exit_px is None:  # nobody traded after us: sell at the entry price level
-            exit_px, xb = tok_px(ep1) * (1 - fee) * (1 - imp), entry_blk + HOLD_BLOCKS
-        net = usd * (exit_px / entry - 1) - 2 * GAS_USD
-        busy_until = xb
-        trades.append({"pool": r["pool"], "token": token, "base": "WETH" if base == WETH else "USDG", "block": r["block"],
-                       "t": blk_time(r["block"]), "usd": usd, "net": round(net, 4), "exit": why})
+
+    def run_policy(pol):
+        trades, skips = [], defaultdict(int)
+        busy_until = -1
+        for r in rushes:
+            f = cache.get(r["pool"]) or {}
+            if f.get("factory") != V3_FACTORY or not f.get("t0"):
+                continue
+            t0, t1 = f["t0"], f["t1"]
+            token = t0 if r["token_side"] == 0 else t1
+            base = t1 if r["token_side"] == 0 else t0
+            if base not in (WETH, USDG) or token in (WETH, USDG):
+                continue
+            skips["rushes"] += 1
+            if r["block"] <= busy_until:
+                skips["busy"] += 1
+                continue
+            if r["sells"] < MIN_SELLS:
+                skips["no sell history"] += 1
+                continue
+            if r["price"] / r["start"] - 1 > MAX_RISE:
+                skips["already jumped"] += 1
+                continue
+            fee = (f["fee"] or 3000) / 1e6
+            base_is1 = r["token_side"] == 0
+            usd_per_base = eth if base == WETH else 1.0
+            dec = 18 if base == WETH else 6
+            # entry: last swap at or before rush block + late blocks
+            entry_blk = r["block"] + LATE_BLOCKS
+            path = r["path"]
+            ent = None
+            for k, tk in enumerate(path):
+                if tk[0] <= entry_blk:
+                    ent = (k, tk)
+                else:
+                    break
+            k0, (eb, ep1, esq, eliq) = ent
+            # size: largest of 50 / 25 within the round-trip limit (auto, capped $50)
+            usd = None
+            for s in (USD, 25.0):
+                imp1 = impact_side(esq, eliq, base_is1, s / usd_per_base * 10**dec)
+                if 2 * fee + 2 * imp1 <= MAX_RT:
+                    usd, imp = s, imp1
+                    break
+            if usd is None:
+                skips["too thin"] += 1
+                continue
+            tok_px = lambda p1: p1 if r["token_side"] == 0 else 1 / p1  # base per token
+            entry = tok_px(ep1) * (1 + fee) * (1 + imp)
+            rets = [(tk[0] - entry_blk, tok_px(tk[1]) * (1 - fee) * (1 - imp) / entry - 1) for tk in path[k0 + 1:]]
+            ret, why, off = exit_on_path(rets, pol)
+            if ret is None:  # nobody traded after us: sell at the entry price level
+                ret = tok_px(ep1) * (1 - fee) * (1 - imp) / entry - 1
+            xb = entry_blk + off
+            net = usd * ret - 2 * GAS_USD
+            busy_until = xb
+            trades.append({"pool": r["pool"], "token": token, "base": "WETH" if base == WETH else "USDG", "block": r["block"],
+                           "t": blk_time(r["block"]), "usd": usd, "net": round(net, 4), "exit": why})
+        return trades, skips
+
+    trades, skips = run_policy(POLICIES[0][1])
+    if os.environ.get("REPLAY_POLICIES") == "1":
+        excl = set()
+        import glob
+        for f in glob.glob(os.path.join(os.path.dirname(os.path.abspath(out)), "paper-out", "*", "blocked_tokens.json")) + glob.glob(os.environ.get("REPLAY_BLOCKED_GLOB", "/nonexistent")):
+            try:
+                excl |= {k.lower() for k in json.load(open(f))}
+            except Exception:
+                pass
+        print(f"EXIT POLICIES ({len(excl)} known taxed/trap tokens left out of the second total)")
+        for name, pol in POLICIES:
+            ts, _ = run_policy(pol)
+            c = [t for t in ts if t["token"] not in excl]
+            w = sum(1 for t in c if t["net"] > 0)
+            wins = [t["net"] for t in c if t["net"] > 0]
+            loss = [t["net"] for t in c if t["net"] <= 0]
+            print(f"  {name:44s} all ${sum(t['net'] for t in ts):+8.2f} | clean {len(c):4d} trades wins {100*w/max(1,len(c)):3.0f}% ${sum(t['net'] for t in c):+8.2f} | avg win ${sum(wins)/max(1,len(wins)):+.2f} avg loss ${sum(loss)/max(1,len(loss)):+.2f}")
 
     # Today's trap check on every token we traded (eth_simulateV1, like taxcheck.rs).
     trapped = set()
