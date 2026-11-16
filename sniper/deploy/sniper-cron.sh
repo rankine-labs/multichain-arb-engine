@@ -130,6 +130,22 @@ for M in $(echo "$ALLOWED"); do
       fi
     fi
     LOGF="$M.log"; [ "$M" = paper ] && LOGF="paper.log"
+    # V4 KEY CATCH-UP (same idea as the dex bot's V4 discovery "follow" step,
+    # src/core/v4EventDiscovery.ts): the shared V4 key file was read once
+    # from history; while the sniper runs it sees new pools live, but pools
+    # created between the last read and this start were never seen ("unknown
+    # v4 pool" skips). v4-history.py resumes from its saved progress, so this
+    # only reads the gap (a few dozen requests per day missed), then the
+    # sniper loads the refreshed file. Paper/read-only. Capped at 10 minutes;
+    # a failure just means the old file is used, as before.
+    if [ "$M" = paper ] && [ -f deploy/v4-history.py ] && [ -f paper-out/v4_history_progress.json ]; then
+      V4RPC="$(printf '%s\n' "${ARGS[@]}" | grep '^SNIPER_RHC_HTTP=' | tail -1 | cut -d= -f2-)"
+      if [ -n "$V4RPC" ]; then
+        SNIPER_RHC_HTTP="$V4RPC" timeout 600 python3 deploy/v4-history.py paper-out > /dev/null 2>> v4-catchup.log \
+          && log "V4 keys caught up: $(tail -1 v4-catchup.log 2>/dev/null | cut -c1-120)" \
+          || log "V4 key catch-up failed or timed out (using the existing file)"
+      fi
+    fi
     # 9>&- : the sniper must not inherit our lock, or the next run would think we're still busy.
     env "${ARGS[@]}" nohup ./sniper "$M" >> "$LOGF" 2>&1 9>&- &
     set_kv "$STATE" "$KEY" "$WANT"
