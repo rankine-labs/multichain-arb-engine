@@ -238,7 +238,17 @@ struct PoolState {
     /// (block, last price in block), recent
     prices: VecDeque<(u64, f64)>,
     cooldown_until: u64,
+    /// Order flow (follow-through study): (block, true = price up / buy,
+    /// false = price down / sell) for the last FLOW_BLOCKS blocks.
+    flow: VecDeque<(u64, bool)>,
 }
+
+/// How far back the order-flow record goes (~65 s of blocks).
+pub const FLOW_BLOCKS: u64 = 620;
+/// The pre-entry flow window (~60 s).
+pub const PRE_FLOW_BLOCKS: u64 = 571;
+/// When the early follow-through check runs after a buy.
+pub const EARLY_CHECK: Duration = Duration::from_secs(15);
 
 pub struct Rules {
     pub buys: usize,
@@ -273,6 +283,12 @@ impl Detector {
             if price > prev {
                 st.buys.push_back((block, buyer.to_string(), prev));
             }
+            if price != prev {
+                st.flow.push_back((block, price > prev));
+            }
+        }
+        while st.flow.front().is_some_and(|(b, _)| *b + FLOW_BLOCKS < block) {
+            st.flow.pop_front();
         }
         st.last_price = Some(price);
         match st.prices.back_mut() {
@@ -306,6 +322,12 @@ impl Detector {
         let mut ids: Vec<String> = buyers.into_iter().map(str::to_string).collect();
         ids.sort();
         Some(RushSig { pool: pool.to_string(), block, price, start_price, buyers: ids })
+    }
+
+    /// Buys and sells in this pool from `from_block` on (order-flow study).
+    pub fn flow(&self, pool: &str, from_block: u64) -> (u32, u32) {
+        let Some(st) = self.pools.get(pool) else { return (0, 0) };
+        st.flow.iter().filter(|(b, _)| *b >= from_block).fold((0, 0), |(b, s), (_, up)| if *up { (b + 1, s) } else { (b, s + 1) })
     }
 
     pub fn last_price(&self, pool: &str) -> Option<f64> {
@@ -560,6 +582,11 @@ pub struct Position {
     /// net result if we had sold the first time the chart crossed it
     /// (None = never crossed). Levels: SHADOW_STOPS.
     pub shadow: Vec<Option<f64>>,
+    /// Follow-through study: buys/sells in the ~60 s before we bought.
+    pub pre_flow: (u32, u32),
+    /// Follow-through study: at ~15 s, buys/sells since we bought and (when
+    /// sellers kept up with buyers) the real net of selling right then.
+    pub early: Option<Value>,
 }
 
 /// Tighter stop losses studied without trading on them (chart drop, as a
@@ -1414,6 +1441,21 @@ pub fn run(cfg: Config) -> Result<(), String> {
         while pi < positions.len() {
             let p = positions[pi].clone();
             let mut closed = false;
+            // Follow-through study (measure only): at ~15 s, did buyers keep
+            // coming? If sellers kept up, price what selling right then gives.
+            if p.early.is_none() && p.opened.elapsed() >= EARLY_CHECK {
+                let (b, s) = det.flow(&p.pool, p.open_block + 1);
+                let net = if s >= b {
+                    quoter.quote(&p.info.venue, &p.info.token, &p.info.base_addr, p.tokens).ok().map(|(out, g)| {
+                        let gp = quoter.gas_price().unwrap_or(U256::ZERO);
+                        pnl_usd(p.base_in, out, p.info.base, p.usd_per_base, p.gas_in + g + 2 * GAS_OVERHEAD, gp, eth).1
+                    })
+                } else {
+                    None
+                };
+                positions[pi].early = Some(json!({"buys": b, "sells": s, "net_if_exit": net}));
+            }
+            let p = positions[pi].clone();
             let price = det.last_price(&p.pool).unwrap_or(p.entry_price);
             let gain = price / p.entry_price - 1.0;
             let vt = p.info.venue_name();
@@ -1450,6 +1492,7 @@ pub fn run(cfg: Config) -> Result<(), String> {
                             &mut f_trades,
                             json!({"pool": p.pool, "token": p.info.token, "base": p.info.base, "venue": vt, "open_block": p.open_block, "close_block": last_block,
                                    "held_s": p.opened.elapsed().as_secs_f64(), "reason": reason, "pool_move_pct": 100.0 * gain,
+                                   "pre_flow": {"buys": p.pre_flow.0, "sells": p.pre_flow.1}, "early": p.early,
                                    "shadow_sl": SHADOW_STOPS.iter().zip(&p.shadow).map(|(lv, v)| (format!("{:.0}", lv * 100.0), json!(v))).collect::<serde_json::Map<_, _>>(),
                                    "usd_in": p.usd_in, "gross_usd": gross, "gas_usd": gross - net, "net_usd": net,
                                    "base_in": p.base_in.to_string(), "base_out": out.to_string(), "tokens": p.tokens.to_string(),
@@ -1697,6 +1740,8 @@ pub fn run(cfg: Config) -> Result<(), String> {
                         auto_usd,
                         late_tokens: None,
                         shadow: vec![None; SHADOW_STOPS.len()],
+                        pre_flow: det.flow(&r.pool, r.block.saturating_sub(PRE_FLOW_BLOCKS)),
+                        early: None,
                     });
                 }
                 other => {
@@ -1803,7 +1848,7 @@ pub fn report(dir: &std::path::Path) -> String {
         sizes_txt += &format!("  AUTO (largest size with <=1.5% round-trip cost): ${auto_total:+.2} over {auto_n} trades (${:+.2}/h)\n", if hours > 0.0 { auto_total / hours } else { 0.0 });
     }
     let race_txt = race_section(&all, start.and_then(|m| m["late_blocks"].as_u64()), hours);
-    let venue_txt = venue_section(&all, &sig, start) + &hour_section(&rows) + &stop_study_section(&rows);
+    let venue_txt = venue_section(&all, &sig, start) + &hour_section(&rows) + &stop_study_section(&rows) + &flow_study_section(&rows);
     let mean = if n > 0 { total / n as f64 } else { 0.0 };
     let sd = if n > 1 { (nets.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n - 1) as f64).sqrt() } else { 0.0 };
     let half = 1.96 * sd / (n.max(1) as f64).sqrt();
@@ -1884,6 +1929,53 @@ pub fn stop_study_section(rows: &[Value]) -> String {
         }
         out += &format!("  if stop at -{k}%: ${tot:+.2} ({hit} trades would have sold early)\n");
     }
+    out
+}
+
+/// A named test on the sells/buys ratio before entry.
+type FlowGroup = (&'static str, fn(f64) -> bool);
+
+/// Report section: follow-through study. (1) Trades grouped by the
+/// buy/sell balance in the minute before entry. (2) The run's total if we
+/// had sold at ~15 s whenever sellers had kept up with buyers since entry.
+pub fn flow_study_section(rows: &[Value]) -> String {
+    let with: Vec<&Value> = rows.iter().filter(|r| r["pre_flow"].is_object()).collect();
+    if with.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("follow-through study (buys vs sells):\n");
+    let groups: [FlowGroup; 3] = [
+        ("before entry: buyers > 2x sellers", |r| r < 0.5),
+        ("before entry: buyers 1-2x sellers", |r| (0.5..1.0).contains(&r)),
+        ("before entry: sellers >= buyers  ", |r| r >= 1.0),
+    ];
+    for (name, f) in groups {
+        let g: Vec<&&Value> = with
+            .iter()
+            .filter(|r| {
+                let b = r["pre_flow"]["buys"].as_f64().unwrap_or(0.0).max(1.0);
+                f(r["pre_flow"]["sells"].as_f64().unwrap_or(0.0) / b)
+            })
+            .collect();
+        if !g.is_empty() {
+            let tot: f64 = g.iter().filter_map(|r| r["net_usd"].as_f64()).sum();
+            let w = g.iter().filter(|r| r["net_usd"].as_f64().unwrap_or(0.0) > 0.0).count();
+            out += &format!("  {name}: {} trades | wins {:.0}% | ${tot:+.2}\n", g.len(), 100.0 * w as f64 / g.len() as f64);
+        }
+    }
+    let actual: f64 = with.iter().filter_map(|r| r["net_usd"].as_f64()).sum();
+    let mut early_tot = 0.0;
+    let mut n_early = 0;
+    for r in &with {
+        match r["early"]["net_if_exit"].as_f64() {
+            Some(v) => {
+                early_tot += v;
+                n_early += 1;
+            }
+            None => early_tot += r["net_usd"].as_f64().unwrap_or(0.0),
+        }
+    }
+    out += &format!("  exit at 15s when sellers kept up: ${early_tot:+.2} vs actual ${actual:+.2} ({n_early} trades would have sold early)\n");
     out
 }
 
@@ -2039,6 +2131,30 @@ mod tests {
         assert!(!h.contains_key("0xbb"));
         assert!(coin_cooling(&h["0xaa"], unix_now(), Duration::from_secs(6 * 3600), 15.0));
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn order_flow_counts() {
+        let mut d = Detector::default();
+        let r = Rules { buys: 99, window_blocks: 10, rise_pct: 2.0 };
+        for (b, p) in [(1, 1.0), (2, 1.1), (3, 1.0), (4, 1.2), (5, 1.3), (6, 1.3)] {
+            d.on_swap("0xp", b, "w", p, &r);
+        }
+        assert_eq!(d.flow("0xp", 0), (3, 1)); // up 2,4,5 / down 3 / unchanged 6 ignored
+        assert_eq!(d.flow("0xp", 4), (2, 0));
+        assert_eq!(d.flow("0xnone", 0), (0, 0));
+    }
+
+    #[test]
+    fn flow_study_report() {
+        let rows = vec![
+            json!({"net_usd": 3.0, "pre_flow": {"buys": 10, "sells": 2}, "early": {"buys": 5, "sells": 1, "net_if_exit": null}}),
+            json!({"net_usd": -7.0, "pre_flow": {"buys": 5, "sells": 6}, "early": {"buys": 1, "sells": 3, "net_if_exit": -2.0}}),
+        ];
+        let t = flow_study_section(&rows);
+        assert!(t.contains("buyers > 2x sellers: 1 trades | wins 100% | $+3.00"), "{t}");
+        assert!(t.contains("sellers >= buyers  : 1 trades | wins 0% | $-7.00"), "{t}");
+        assert!(t.contains("exit at 15s when sellers kept up: $+1.00 vs actual $-4.00 (1 trades"), "{t}");
     }
 
     #[test]

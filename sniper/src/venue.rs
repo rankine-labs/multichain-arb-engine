@@ -473,7 +473,7 @@ impl V4Keys {
     pub const FILE: &'static str = "v4_pool_keys.json";
     /// Memory guard: we only keep keys of pools we could trade (one side
     /// WETH/USDG/ETH), but cap the file anyway.
-    pub const MAX: usize = 500_000;
+    pub const MAX: usize = 2_000_000;
 
     /// Missing file = empty (first run). A damaged file is ignored with an
     /// error message (unlike the blocklist, losing keys is safe: those pools
