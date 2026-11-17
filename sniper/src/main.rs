@@ -122,6 +122,21 @@ fn main() -> ExitCode {
                 }
             }
         }
+        Some("wallet-status") => {
+            // sniper wallet-status: the live wallet's address and balances.
+            // Needs SNIPER_KEY_FILE only; prints no secret; sends nothing.
+            let url = std::env::var("SNIPER_RHC_HTTP").unwrap_or_else(|_| sniper::rhc::DEFAULT_HTTP.to_string());
+            match sniper::livetrade::wallet_status(&url) {
+                Ok(s) => {
+                    println!("{s}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("wallet-status: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         Some("feed-report") => {
             let Some(dir) = args.get(1) else {
                 eprintln!("usage: sniper feed-report <dir>");

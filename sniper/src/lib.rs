@@ -24,6 +24,7 @@ pub mod feedtx;
 pub mod feedwatch;
 pub mod fourmeme;
 pub mod live;
+pub mod livetrade;
 pub mod rugguard;
 pub mod safety;
 pub mod matcher;

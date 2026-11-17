@@ -620,6 +620,11 @@ fn quote_at(rpc: &Rpc, block: &str, token_in: &str, token_out: &str, fee: u32, a
     U256::from_str_radix(&h[..h.len().min(64)], 16).map_err(|e| e.to_string())
 }
 
+/// Quote at the latest block (used by the live trader for min-outs).
+pub fn quote_now(rpc: &Rpc, token_in: &str, token_out: &str, fee: u32, amount: U256) -> Result<U256, String> {
+    quote_at(rpc, "latest", token_in, token_out, fee, amount)
+}
+
 fn call(from: &str, to: &str, data: Vec<u8>) -> Value {
     json!({"from": from, "to": to, "data": format!("0x{}", hex(&data))})
 }

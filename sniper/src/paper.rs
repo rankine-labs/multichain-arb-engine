@@ -1243,6 +1243,22 @@ pub fn run(cfg: Config) -> Result<(), String> {
         v4keys.len()
     );
 
+    // LIVE MODE (off by default). SNIPER_MODE=live asks for real trades that
+    // mirror paper decisions (see livetrade.rs). If it is asked for and the
+    // gate is closed, refuse to start: never silently run paper instead.
+    let mut live: Option<crate::livetrade::LiveTrader> = None;
+    if std::env::var("SNIPER_MODE").map(|m| m.trim().eq_ignore_ascii_case("live")).unwrap_or(false) {
+        let mut lt = crate::livetrade::LiveTrader::from_env(&cfg.http, &cfg.out)?;
+        eprintln!("LIVE MODE ON: wallet {} | ${:.2} a trade | daily loss cap ${:.2} | {}", lt.address(), lt.gate.max_trade_usd, lt.gate.max_day_loss_usd, lt.status());
+        if lt.open.is_some() {
+            // Left over from a crash or restart: sell it before anything else.
+            match lt.sell("leftover after restart", true, None, eth) {
+                Ok(n) => eprintln!("LIVE: leftover position sold, real ${n:+.2}"),
+                Err(e) => eprintln!("LIVE: leftover position NOT sold ({e}); new live buys stay blocked until it is"),
+            }
+        }
+        live = Some(lt);
+    }
     // Event ids to watch, for the enabled venues (one subscription, OR'ed).
     let topics = topics_for(&cfg.venues);
     let topic_list: Vec<String> = topics.iter().map(|(t, _)| t.clone()).collect();
@@ -1625,6 +1641,14 @@ pub fn run(cfg: Config) -> Result<(), String> {
                             p.info.token,
                             p.opened.elapsed().as_secs_f64()
                         );
+                        // Live mode: sell the real position that mirrors this one.
+                        if let Some(lt) = live.as_mut() {
+                            if lt.open.as_ref().is_some_and(|lp| lp.pool == p.pool) {
+                                if let Err(e) = lt.sell(reason, reason == "stop_loss", Some(net), eth) {
+                                    eprintln!("LIVE: sell of {} failed ({e}); will retry as an emergency sell", p.info.token);
+                                }
+                            }
+                        }
                         // Race check: re-quote this same sell a few blocks from now.
                         schedule_late_exit(&mut late, &p, last_block, cfg.late_blocks, Some(out));
                         closed = true;
@@ -1651,6 +1675,13 @@ pub fn run(cfg: Config) -> Result<(), String> {
                             schedule_late_exit(&mut late, &p, last_block, cfg.late_blocks, None);
                             closed = true;
                             eprintln!("paper: EXIT FAILED {} [{vt}] (counted as total loss)", p.info.token);
+                            if let Some(lt) = live.as_mut() {
+                                if lt.open.as_ref().is_some_and(|lp| lp.pool == p.pool) {
+                                    if let Err(e) = lt.sell("exit quote failed", true, Some(-p.usd_in), eth) {
+                                        eprintln!("LIVE: emergency sell of {} failed ({e})", p.info.token);
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -1877,6 +1908,17 @@ pub fn run(cfg: Config) -> Result<(), String> {
                         buy: LateQuote::Pending,
                         exit: None,
                     });
+                    // Live mode: mirror this buy with real money if allowed.
+                    if let Some(lt) = live.as_mut() {
+                        match lt.refuse(&info) {
+                            None => {
+                                if let Err(e) = lt.buy(&r.pool, &info, usd_per_base, tokens) {
+                                    eprintln!("LIVE: buy {} not done ({e})", info.token);
+                                }
+                            }
+                            Some(why) => write(&mut f_sig, json!({"pool": r.pool, "token": info.token, "live_skip": why}))?,
+                        }
+                    }
                     positions.push(Position {
                         pool: r.pool.clone(),
                         info,
@@ -1915,6 +1957,19 @@ pub fn run(cfg: Config) -> Result<(), String> {
                 crate::sellcheck::NODE_CALLS.load(std::sync::atomic::Ordering::Relaxed),
                 if h > 0.0 { crate::sellcheck::NODE_CALLS.load(std::sync::atomic::Ordering::Relaxed) as f64 / h * 24.0 / 1000.0 } else { 0.0 }
             );
+            if let Some(lt) = live.as_mut() {
+                // A live position whose paper twin is gone (its sell failed):
+                // keep trying an emergency sell every heartbeat.
+                if let Some(lp) = lt.open.clone() {
+                    if !positions.iter().any(|p| p.pool == lp.pool) {
+                        match lt.sell("retry after failed sell", true, None, eth) {
+                            Ok(n) => eprintln!("LIVE: retried sell done, real ${n:+.2}"),
+                            Err(e) => eprintln!("LIVE: retried sell failed again ({e})"),
+                        }
+                    }
+                }
+                eprintln!("{}", lt.status());
+            }
             if let Err(e) = v4keys.save_if_dirty(&keys_path) {
                 eprintln!("paper: could not save V4 pool keys ({e})");
             }
