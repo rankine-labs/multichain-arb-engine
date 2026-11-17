@@ -528,10 +528,30 @@ impl Blocklist {
 /// skip line in signals.jsonl has a "why" starting with one of these.
 /// Matching takes the FIRST reason a "why" starts with, so "unsafe hook"
 /// must stay before "unsafe" (the trap check, always last).
-pub const SKIP_REASONS: [&str; 12] = [
+/// How many rushes this pool had in the `window` blocks BEFORE `block`
+/// (the rush at `block` itself is not counted). Used by the skip-first-
+/// rush filter (SNIPER_MIN_PRIOR_RUSHES).
+pub fn prior_rushes(hist: &VecDeque<u64>, block: u64, window: u64) -> usize {
+    hist.iter().filter(|&&b| b < block && b + window >= block).count()
+}
+
+/// Remember a rush (all rushes, traded or skipped, like the study that
+/// found the rule). Keeps at most 500 per pool and drops ones over 2 h old.
+pub fn note_rush(hist: &mut VecDeque<u64>, block: u64, window: u64) {
+    hist.push_back(block);
+    while hist.len() > 500 || hist.front().is_some_and(|&b| b + 2 * window < block) {
+        hist.pop_front();
+    }
+}
+
+/// One hour in blocks (for the skip-first-rush window).
+pub const HOUR_BLOCKS: u64 = (3600.0 / BLOCK_SECS) as u64;
+
+pub const SKIP_REASONS: [&str; 13] = [
     "blocked token",
     "pool too young",
     "pool age unknown",
+    "first rush",
     "blocked creator",
     "coin cooling off",
     "unsafe hook",
@@ -834,6 +854,10 @@ pub struct Config {
     pub min_sells: u64,
     /// Skip pools younger than this (seconds). Run 5: every rug was < 2 min.
     pub min_pool_age_s: f64,
+    /// Skip a rush unless the pool had at least this many rushes in the
+    /// hour before (0 = off). Run 10b: a coin's first rush in an hour lost
+    /// money (49 past trades, 24% wins, -$54); later rushes paid.
+    pub min_prior_rushes: usize,
     /// Coin cutoff: skip a coin whose closed trades lost more than this
     /// (USD) within cut_window. 0 = off.
     pub cut_loss_usd: f64,
@@ -877,6 +901,7 @@ impl Config {
             max_total_usd: f("SNIPER_MAX_TOTAL_USD", 150.0),
             min_sells: f("SNIPER_MIN_SELLS", 3.0) as u64,
             min_pool_age_s: f("SNIPER_MIN_POOL_AGE_SECS", 120.0),
+            min_prior_rushes: f("SNIPER_MIN_PRIOR_RUSHES", 0.0) as usize,
             cut_loss_usd: f("SNIPER_COIN_CUT_USD", 15.0),
             cut_window: Duration::from_secs_f64(f("SNIPER_COIN_CUT_HOURS", 6.0) * 3600.0),
             age_backfill_min: f("SNIPER_AGE_BACKFILL_MIN", 15.0),
@@ -1167,6 +1192,27 @@ pub fn run(cfg: Config) -> Result<(), String> {
     let births_path = cfg.out.parent().unwrap_or(&cfg.out).join(crate::rugguard::Births::FILE);
     let mut births = crate::rugguard::Births::load(births_path);
     eprintln!("paper: {} pool birth blocks loaded from earlier lookups", births.map.len());
+    // Rush history per pool for the skip-first-rush filter. Reloaded from
+    // this run's own signals file so a restart doesn't forget the last hour.
+    let mut rush_hist: HashMap<String, VecDeque<u64>> = HashMap::new();
+    if cfg.min_prior_rushes > 0 {
+        if let Ok(text) = fs::read_to_string(cfg.out.join("signals.jsonl")) {
+            for line in text.lines() {
+                if let Ok(v) = serde_json::from_str::<Value>(line) {
+                    if let (Some(p), Some(b)) = (v["pool"].as_str(), v["block"].as_u64()) {
+                        rush_hist.entry(p.to_ascii_lowercase()).or_default().push_back(b);
+                    }
+                }
+            }
+        }
+        for h in rush_hist.values_mut() {
+            h.make_contiguous().sort_unstable();
+            while h.len() > 500 {
+                h.pop_front();
+            }
+        }
+        eprintln!("paper: skip-first-rush on (need {} rush(es) in the hour before); remembered {} pools", cfg.min_prior_rushes, rush_hist.len());
+    }
     // Safety checklist results per coin (measure only).
     let mut safety_cache: HashMap<String, Value> = HashMap::new();
     // V4 pool keys seen by earlier runs in this folder (a damaged file only
@@ -1629,6 +1675,13 @@ pub fn run(cfg: Config) -> Result<(), String> {
         for r in rushes {
             n_rush += 1;
             let Some(info) = pools.get(&r.pool).cloned().flatten() else { continue };
+            // Skip-first-rush: count earlier rushes BEFORE remembering this one.
+            let prior = {
+                let h = rush_hist.entry(r.pool.to_ascii_lowercase()).or_default();
+                let n = prior_rushes(h, r.block, HOUR_BLOCKS);
+                note_rush(h, r.block, HOUR_BLOCKS);
+                n
+            };
             let vt = info.venue_name();
             tally.entry(vt).or_default().rushes += 1;
             // A skipped rush: one line in signals.jsonl with the reason.
@@ -1686,6 +1739,13 @@ pub fn run(cfg: Config) -> Result<(), String> {
             if crate::rugguard::too_young(age, cfg.min_pool_age_s) {
                 n_filtered += 1;
                 skip(&mut f_sig, format!("pool too young ({:.0}s old, need {:.0}s)", age.unwrap_or(0.0), cfg.min_pool_age_s))?;
+                continue;
+            }
+            // Skip-first-rush: a lone rush on a coin that was quiet for the
+            // past hour tended to fizzle; trade only once it is active.
+            if prior < cfg.min_prior_rushes {
+                n_filtered += 1;
+                skip(&mut f_sig, format!("first rush ({prior} in the hour before, need {})", cfg.min_prior_rushes))?;
                 continue;
             }
             // Rug guard: this pool's creator rugged us before.
@@ -2469,7 +2529,7 @@ mod tests {
         // only "busy" is left in the old busy/no-quote bucket
         assert!(r.contains("skipped (busy or no quote) 1 | blocked as unsafe 2"), "{r}");
         assert!(
-            r.contains("skips: blocked token 1 | pool too young 0 | pool age unknown 1 | blocked creator 0 | coin cooling off 0 | unsafe hook 1 | unknown v4 pool 1 | no sell history 2 | already jumped 1 | few real buyers 1 | too thin 1 | unsafe 2 | average trade size $37.50"),
+            r.contains("skips: blocked token 1 | pool too young 0 | pool age unknown 1 | first rush 0 | blocked creator 0 | coin cooling off 0 | unsafe hook 1 | unknown v4 pool 1 | no sell history 2 | already jumped 1 | few real buyers 1 | too thin 1 | unsafe 2 | average trade size $37.50"),
             "{r}"
         );
         let _ = fs::remove_dir_all(&dir);
@@ -2824,6 +2884,22 @@ mod tests {
         let w = |a: &str| format!("0x{:0>64}", a);
         // not the Uniswap V3 factory -> definite None
         assert!(v3_pool_from(&w("11"), &w("22"), &w("bb8"), &w("33")).is_none());
+    }
+
+
+    #[test]
+    fn skip_first_rush_counts_only_the_hour_before() {
+        let mut h = VecDeque::new();
+        assert_eq!(prior_rushes(&h, 1_000_000, HOUR_BLOCKS), 0); // first rush: skipped
+        note_rush(&mut h, 1_000_000, HOUR_BLOCKS);
+        // same block doesn't count itself; a later rush within the hour sees 1
+        assert_eq!(prior_rushes(&h, 1_000_000, HOUR_BLOCKS), 0);
+        assert_eq!(prior_rushes(&h, 1_000_100, HOUR_BLOCKS), 1);
+        // more than an hour later: back to 0
+        assert_eq!(prior_rushes(&h, 1_000_000 + HOUR_BLOCKS + 1, HOUR_BLOCKS), 0);
+        // old entries are dropped after 2 hours
+        note_rush(&mut h, 1_000_000 + 3 * HOUR_BLOCKS, HOUR_BLOCKS);
+        assert_eq!(h.len(), 1);
     }
 
 }
