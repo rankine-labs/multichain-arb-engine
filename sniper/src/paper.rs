@@ -58,6 +58,8 @@
 //   SNIPER_TP_PCT / SNIPER_SL_PCT / SNIPER_HOLD_SECS   exits (5 / 5 / 10)
 //   SNIPER_RUSH_BUYS / SNIPER_RUSH_WINDOW_S / SNIPER_RUSH_RISE_PCT  (3 / 1 / 2)
 //   SNIPER_RHC_POLL_MS   how often to ask the node (default 1000)
+//   SNIPER_RHC_POLL_NIGHT_MS  faster polling in the night window (off if unset)
+//   SNIPER_NIGHT_HOURS   night window, Toronto hours (default 20-8)
 //   SNIPER_PUSH=1        use websocket push instead (each pushed log is a
 //                        paid Chainstack request: off by default)
 //   SNIPER_LATE_BLOCKS   race check: re-quote every buy and sell this many
@@ -747,6 +749,92 @@ pub fn step_late(t: &mut LateTrade, last_block: u64, q: &dyn Quoter, eth_usd: f6
     }
 }
 
+// ---------------------------------------------------------------------------
+// Speed (step 1): faster night polling, parallel size study, delay logging
+// ---------------------------------------------------------------------------
+
+/// How long to wait before the next node poll: the night setting inside
+/// the night window, the normal one otherwise.
+pub fn poll_now(cfg: &Config, now: SystemTime) -> Duration {
+    match cfg.poll_night {
+        Some(n) if crate::livetrade::in_hours(cfg.night, crate::livetrade::toronto_hour(now)) => n,
+        _ => cfg.poll,
+    }
+}
+
+/// One priced size: (usd, base amount in, tokens out, buy gas, round-trip cost).
+/// Round-trip cost is None when the sell-back quote failed.
+pub type Rung = (f64, U256, U256, u64, Option<f64>);
+
+/// Size study, all sizes at once: each size gets its own thread doing a buy
+/// quote then a sell-back quote, so the whole ladder costs two node round
+/// trips instead of two per size. Sizes that fail or give zero are dropped.
+/// Results keep the order of `sizes`.
+pub fn price_ladder(q: &(dyn Quoter + Sync), venue: &Venue, base: &str, token: &str, sizes: &[(f64, U256)]) -> Vec<Rung> {
+    std::thread::scope(|sc| {
+        let jobs: Vec<_> = sizes
+            .iter()
+            .map(|&(usd, raw)| {
+                sc.spawn(move || {
+                    let (toks, gas) = q.quote(venue, base, token, raw).ok()?;
+                    if toks.is_zero() {
+                        return None;
+                    }
+                    let rt = q.quote(venue, token, base, toks).ok().map(|(back, _)| 1.0 - f64::from(back) / f64::from(raw).max(1.0));
+                    Some((usd, raw, toks, gas, rt))
+                })
+            })
+            .collect();
+        jobs.into_iter().filter_map(|j| j.join().ok().flatten()).collect()
+    })
+}
+
+/// Delay record for one buy (all times in milliseconds).
+///   behind   blocks between the rush block and the newest block the node
+///            told us about when we asked (time the rush sat waiting for us)
+///   fetch    how long the log request itself took
+///   work     from logs in hand to the buy being ready (checks + quotes)
+///   total    our best estimate of rush block -> buy ready
+pub fn delay_json(behind_blocks: u64, fetch_ms: f64, work_ms: f64, ladder_ms: f64, check_ms: f64) -> Value {
+    let wait = behind_blocks as f64 * BLOCK_SECS * 1000.0;
+    json!({
+        "behind_blocks": behind_blocks,
+        "wait_ms": wait.round(),
+        "fetch_ms": fetch_ms.round(),
+        "work_ms": work_ms.round(),
+        "ladder_ms": ladder_ms.round(),
+        "check_ms": check_ms.round(),
+        "total_ms": (wait + fetch_ms + work_ms).round(),
+    })
+}
+
+/// Percentile (0..100) of a list, nearest rank. None when empty.
+pub fn pct(v: &[f64], p: f64) -> Option<f64> {
+    if v.is_empty() {
+        return None;
+    }
+    let mut s = v.to_vec();
+    s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let i = ((p / 100.0) * (s.len() as f64 - 1.0)).round() as usize;
+    Some(s[i.min(s.len() - 1)])
+}
+
+/// Report section: how fast we were from rush block to buy ready.
+pub fn delay_section(sig: &[Value]) -> String {
+    let get = |k: &str| -> Vec<f64> { sig.iter().filter_map(|l| l["delay"][k].as_f64()).collect() };
+    let total = get("total_ms");
+    if total.is_empty() {
+        return String::new();
+    }
+    let line = |name: &str, v: &[f64]| format!("  {name:<6} p50 {:>5.0} | p95 {:>5.0} | worst {:>5.0}\n", pct(v, 50.0).unwrap_or(0.0), pct(v, 95.0).unwrap_or(0.0), pct(v, 100.0).unwrap_or(0.0));
+    let mut t = format!("speed (rush block -> buy ready, ms, {} buys):\n", total.len());
+    t += &line("total", &total);
+    t += &line("wait", &get("wait_ms"));
+    t += &line("fetch", &get("fetch_ms"));
+    t += &line("work", &get("work_ms"));
+    t
+}
+
 /// Auto-size rule: the LARGEST size whose instant round trip (buy, then sell
 /// straight back) loses at most `max_rt` (fees + our own price impact).
 /// Thin pools => small size, deep pools => bigger size; capped by the list.
@@ -872,6 +960,11 @@ pub struct Config {
     pub hold: Duration,
     pub rules: Rules,
     pub poll: Duration,
+    /// Faster polling during night hours (SNIPER_RHC_POLL_NIGHT_MS, off if
+    /// unset). Night is when the money is made, so we pay for speed then.
+    pub poll_night: Option<Duration>,
+    /// Night window in Toronto hours (SNIPER_NIGHT_HOURS, default 20-8).
+    pub night: Option<(u32, u32)>,
     /// Race check: how many blocks after deciding we assume our tx lands.
     pub late_blocks: u64,
     /// Exchange types to watch (SNIPER_VENUES, default v3,v4,v2).
@@ -916,6 +1009,10 @@ impl Config {
             },
             // 1 s: two requests a second (~173k a day) whatever the volume.
             poll: Duration::from_millis(f("SNIPER_RHC_POLL_MS", 1000.0) as u64),
+            // 0.4 s at night: ~5 requests a second for 12 h (~216k), about
+            // 300k a day in total, well inside the node plan.
+            poll_night: Some(f("SNIPER_RHC_POLL_NIGHT_MS", 0.0)).filter(|m| *m > 0.0).map(|m| Duration::from_millis(m as u64)),
+            night: crate::livetrade::parse_hours(&std::env::var("SNIPER_NIGHT_HOURS").unwrap_or_else(|_| "20-8".into())).ok().flatten(),
             late_blocks: f("SNIPER_LATE_BLOCKS", 2.0) as u64,
             // A bad list is caught in run() (venues_from_env) so the error is shown.
             venues: venue::parse_venues(&std::env::var("SNIPER_VENUES").unwrap_or_else(|_| "v3,v4,v2".into())).unwrap_or_default(),
@@ -1349,7 +1446,7 @@ pub fn run(cfg: Config) -> Result<(), String> {
     loop {
         // Push mode waits on the stream (below); poll mode sleeps between asks.
         if log_rx.is_none() {
-            std::thread::sleep(cfg.poll);
+            std::thread::sleep(poll_now(&cfg, SystemTime::now()));
         }
         if cfg.duration.is_some_and(|d| started.elapsed() >= d) {
             break;
@@ -1379,6 +1476,8 @@ pub fn run(cfg: Config) -> Result<(), String> {
         }
         // ---- new logs (pushed or polled) ----
         let mut logs: Vec<Value> = Vec::new();
+        // Delay logging: how long the log request took (poll mode only).
+        let mut fetch_ms = 0.0f64;
         if let Some(rx) = &log_rx {
             // Wait briefly for the next log, then take everything queued.
             if let Ok(v) = rx.recv_timeout(cfg.poll.min(Duration::from_millis(50))) {
@@ -1406,7 +1505,10 @@ pub fn run(cfg: Config) -> Result<(), String> {
             };
             if from <= head {
                 let params = json!([{"fromBlock": format!("0x{from:x}"), "toBlock": format!("0x{head:x}"), "topics": [topic_list]}]);
-                match rpc.call("eth_getLogs", params) {
+                let t_fetch = Instant::now();
+                let got = rpc.call("eth_getLogs", params);
+                fetch_ms = t_fetch.elapsed().as_secs_f64() * 1000.0;
+                match got {
                     Ok(v) => {
                         last_block = Some(head);
                         logs = v.as_array().cloned().unwrap_or_default();
@@ -1420,6 +1522,10 @@ pub fn run(cfg: Config) -> Result<(), String> {
                 }
             }
         }
+        // Logs in hand: the clock for "work" starts here; the newest block
+        // the node reported is what "behind" is measured against.
+        let t_logs = Instant::now();
+        let head_seen = last_block;
         let mut rushes: Vec<RushSig> = Vec::new();
         // Rushes on V4 pools whose key we don't know: counted, never traded.
         let mut unknown_rushes: Vec<RushSig> = Vec::new();
@@ -1777,6 +1883,17 @@ pub fn run(cfg: Config) -> Result<(), String> {
             if prior < cfg.min_prior_rushes {
                 n_filtered += 1;
                 skip(&mut f_sig, format!("first rush ({prior} in the hour before, need {})", cfg.min_prior_rushes))?;
+                // Speed: run the trap check now (cached 6 h) so a second rush
+                // on this coin can buy without waiting for it. A real bad
+                // result blocks the token right away.
+                if cfg.taxcheck {
+                    let holder = venue::token_holder(&info.venue, &r.pool);
+                    if let Ok(v) = taxcheck.check(&rpc, &info.token, &holder) {
+                        if !matches!(v, crate::taxcheck::Verdict::Ok) {
+                            block(&mut blocklist, &info.token, &format!("trap check (early): {v:?}"));
+                        }
+                    }
+                }
                 continue;
             }
             // Rug guard: this pool's creator rugged us before.
@@ -1840,19 +1957,13 @@ pub fn run(cfg: Config) -> Result<(), String> {
             let raw = |usd: f64| U256::from(((usd / usd_per_base) * 10f64.powi(base_decimals(info.base))) as u128);
             // Size study: price this trade at every size, plus an instant
             // round trip at each (what fees + our own impact cost us).
-            let mut ladder = Vec::new();
-            let mut round_trips = Vec::new();
-            for usd in &cfg.sizes {
-                if let Ok((toks, _)) = quoter.quote(&info.venue, &info.base_addr, &info.token, raw(*usd)) {
-                    if toks.is_zero() {
-                        continue;
-                    }
-                    if let Ok((back, _)) = quoter.quote(&info.venue, &info.token, &info.base_addr, toks) {
-                        round_trips.push((*usd, 1.0 - f64::from(back) / f64::from(raw(*usd)).max(1.0)));
-                    }
-                    ladder.push((*usd, raw(*usd), toks));
-                }
-            }
+            // All sizes are priced in parallel (speed step 1).
+            let t_ladder = Instant::now();
+            let sizes_raw: Vec<(f64, U256)> = cfg.sizes.iter().map(|u| (*u, raw(*u))).collect();
+            let rungs = price_ladder(&quoter, &info.venue, &info.base_addr, &info.token, &sizes_raw);
+            let ladder_ms = t_ladder.elapsed().as_secs_f64() * 1000.0;
+            let ladder: Vec<(f64, U256, U256)> = rungs.iter().map(|(u, b, t, _, _)| (*u, *b, *t)).collect();
+            let round_trips: Vec<(f64, f64)> = rungs.iter().filter_map(|(u, _, _, _, rt)| rt.map(|x| (*u, x))).collect();
             let auto_usd = pick_auto(&round_trips, cfg.auto_max_rt);
             // The trade's real size: auto size, capped at MAX_USD.
             let Some(usd_in) = decide_size(auto_usd, &cfg.sizes, cfg.max_usd, cfg.usd) else {
@@ -1874,10 +1985,15 @@ pub fn run(cfg: Config) -> Result<(), String> {
                 continue;
             }
             let base_in = raw(usd_in);
-            match quoter.quote(&info.venue, &info.base_addr, &info.token, base_in) {
+            // The chosen size was already priced in the ladder: reuse that
+            // quote instead of asking again (one less node round trip).
+            let reused = rungs.iter().find(|(u, b, _, _, _)| (*u - usd_in).abs() < 1e-9 && *b == base_in).map(|(_, _, t, g, _)| Ok((*t, *g)));
+            let final_quote = reused.unwrap_or_else(|| quoter.quote(&info.venue, &info.base_addr, &info.token, base_in));
+            match final_quote {
                 Ok((tokens, gas_in)) if !tokens.is_zero() => {
                     // Real-size trap check: OUR exact token amount out of the
                     // pool and ALL of it back in, before we take the trade.
+                    let t_check = Instant::now();
                     if cfg.taxcheck {
                         let verdict = crate::taxcheck::test_amount(&rpc, &info.token, &holder, tokens);
                         if !matches!(verdict, Ok(crate::taxcheck::Verdict::Ok)) {
@@ -1890,9 +2006,10 @@ pub fn run(cfg: Config) -> Result<(), String> {
                             continue;
                         }
                     }
-                    // Rug guard measurements (no rule yet): scored later against outcomes.
-                    let rug_meta = rug_measure(&rpc, &mut creators, &ages, &mut safety_cache, &r.pool, &info, r.block);
-                    write(&mut f_sig, json!({"pool": r.pool, "token": info.token, "block": r.block, "taken": true, "venue": vt, "usd_in": usd_in, "rug": rug_meta}))?;
+                    let check_ms = t_check.elapsed().as_secs_f64() * 1000.0;
+                    // Buy is ready now: this is the moment a live order goes out.
+                    let behind = head_seen.unwrap_or(r.block).saturating_sub(r.block);
+                    let delay = delay_json(behind, fetch_ms, t_logs.elapsed().as_secs_f64() * 1000.0, ladder_ms, check_ms);
                     eprintln!("paper: BUY  {} ${usd_in} [{vt}] ({}/{} rush at block {})", info.token, info.base, r.pool, r.block);
                     // Race check: price this exact buy again a few blocks from
                     // the newest block we have seen (when we really decided).
@@ -1919,6 +2036,10 @@ pub fn run(cfg: Config) -> Result<(), String> {
                             Some(why) => write(&mut f_sig, json!({"pool": r.pool, "token": info.token, "live_skip": why}))?,
                         }
                     }
+                    // Rug guard measurements (no rule yet, scored later against
+                    // outcomes). Done AFTER the buy so they never slow it down.
+                    let rug_meta = rug_measure(&rpc, &mut creators, &ages, &mut safety_cache, &r.pool, &info, r.block);
+                    write(&mut f_sig, json!({"pool": r.pool, "token": info.token, "block": r.block, "taken": true, "venue": vt, "usd_in": usd_in, "rug": rug_meta, "delay": delay}))?;
                     positions.push(Position {
                         pool: r.pool.clone(),
                         info,
@@ -2054,7 +2175,7 @@ pub fn report(dir: &std::path::Path) -> String {
         }
         sizes_txt += &format!("  AUTO (largest size with <=1.5% round-trip cost): ${auto_total:+.2} over {auto_n} trades (${:+.2}/h)\n", if hours > 0.0 { auto_total / hours } else { 0.0 });
     }
-    let race_txt = race_section(&all, start.and_then(|m| m["late_blocks"].as_u64()), hours);
+    let race_txt = race_section(&all, start.and_then(|m| m["late_blocks"].as_u64()), hours) + &delay_section(&sig);
     let venue_txt = venue_section(&all, &sig, start) + &hour_section(&rows) + &stop_study_section(&rows) + &flow_study_section(&rows);
     let mean = if n > 0 { total / n as f64 } else { 0.0 };
     let sd = if n > 1 { (nets.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n - 1) as f64).sqrt() } else { 0.0 };
@@ -2955,6 +3076,82 @@ mod tests {
         // old entries are dropped after 2 hours
         note_rush(&mut h, 1_000_000 + 3 * HOUR_BLOCKS, HOUR_BLOCKS);
         assert_eq!(h.len(), 1);
+    }
+
+
+    // ---- speed step 1 ----
+
+    /// Pool that pays back 98% on a round trip; a "slow" token fails to sell.
+    struct LadderQuoter;
+    impl Quoter for LadderQuoter {
+        fn quote(&self, _v: &Venue, token_in: &str, _out: &str, amount_in: U256) -> Result<(U256, u64), String> {
+            std::thread::sleep(Duration::from_millis(50));
+            match token_in {
+                "base" => Ok((amount_in * U256::from(2u64), 90_000)),
+                "tok" => Ok((amount_in * U256::from(49u64) / U256::from(100u64), 0)),
+                _ => Err("no sell".into()),
+            }
+        }
+        fn gas_price(&self) -> Result<U256, String> {
+            Ok(U256::from(1u64))
+        }
+    }
+
+    #[test]
+    fn ladder_is_priced_in_parallel_and_keeps_order() {
+        let v = Venue::V3 { fee: 3000 };
+        let sizes: Vec<(f64, U256)> = [25.0, 50.0, 100.0].iter().map(|u| (*u, U256::from(*u as u64 * 1000))).collect();
+        let t = Instant::now();
+        let r = price_ladder(&LadderQuoter, &v, "base", "tok", &sizes);
+        // 3 sizes x 2 quotes x 50 ms would be 300 ms one after another.
+        assert!(t.elapsed() < Duration::from_millis(250), "took {:?}", t.elapsed());
+        assert_eq!(r.iter().map(|x| x.0).collect::<Vec<_>>(), vec![25.0, 50.0, 100.0]);
+        assert_eq!(r[1].2, U256::from(100_000u64));
+        assert_eq!(r[1].3, 90_000);
+        assert!((r[0].4.unwrap() - 0.02).abs() < 1e-9);
+    }
+
+    #[test]
+    fn ladder_keeps_a_size_whose_sell_back_failed() {
+        let v = Venue::V3 { fee: 3000 };
+        let r = price_ladder(&LadderQuoter, &v, "base", "nosell", &[(25.0, U256::from(1000u64))]);
+        assert_eq!(r.len(), 1);
+        assert!(r[0].4.is_none());
+        assert!(price_ladder(&LadderQuoter, &v, "bad", "tok", &[(25.0, U256::from(1u64))]).is_empty());
+    }
+
+    #[test]
+    fn night_polls_faster() {
+        let mut c = Config::from_env();
+        c.poll = Duration::from_millis(1000);
+        c.poll_night = Some(Duration::from_millis(400));
+        c.night = Some((20, 8));
+        // 03:00 UTC = 22:00 Toronto (night); 17:00 UTC = 12:00 Toronto (day).
+        let at = |h: u64| UNIX_EPOCH + Duration::from_secs(h * 3600);
+        assert_eq!(poll_now(&c, at(3)), Duration::from_millis(400));
+        assert_eq!(poll_now(&c, at(17)), Duration::from_millis(1000));
+        c.poll_night = None;
+        assert_eq!(poll_now(&c, at(3)), Duration::from_millis(1000));
+    }
+
+    #[test]
+    fn delay_adds_wait_fetch_and_work() {
+        let d = delay_json(4, 120.0, 300.0, 200.0, 80.0);
+        assert_eq!(d["wait_ms"], 420.0);
+        assert_eq!(d["total_ms"], 840.0);
+        assert_eq!(d["behind_blocks"], 4);
+    }
+
+    #[test]
+    fn delay_report_percentiles() {
+        assert_eq!(pct(&[], 50.0), None);
+        assert_eq!(pct(&[3.0, 1.0, 2.0], 50.0), Some(2.0));
+        assert_eq!(pct(&[3.0, 1.0, 2.0], 100.0), Some(3.0));
+        let sig: Vec<Value> = [500.0, 700.0, 900.0].iter().map(|t| json!({"taken": true, "delay": delay_json(1, 0.0, *t, 0.0, 0.0)})).collect();
+        let txt = delay_section(&sig);
+        assert!(txt.contains("3 buys"), "{txt}");
+        assert!(txt.contains("p50   805"), "{txt}");
+        assert_eq!(delay_section(&[json!({"taken": false})]), "");
     }
 
 }
