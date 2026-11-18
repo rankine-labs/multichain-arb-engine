@@ -232,6 +232,29 @@ poll path (the same wallet in most trades, not always).
 Side-by-side paper test on the server: see the "FEED WAKE-UP" notes at the
 top of `deploy/sniper-engine.sh`.
 
+## Young-pool test group (paper only, off by default)
+
+`SNIPER_YOUNG_TEST=1` gives rushes on pools younger than
+`SNIPER_MIN_POOL_AGE_SECS` a separate paper test instead of a plain skip.
+Details: the top of `src/paper.rs`.
+
+- The main results do not change: the rush is still written as "pool too
+  young". It then goes through every OTHER filter and the same buy/exit
+  logic as a "young" test trade, in its own slots
+  (`SNIPER_YOUNG_MAX_POSITIONS`, default 2, each up to `SNIPER_YOUNG_USD`,
+  default 50). It never uses or blocks a main slot or the main money cap.
+  `SNIPER_YOUNG_MIN_AGE_SECS` (default 0) skips the very youngest pools.
+- Its lines in `signals.jsonl` / `paper_trades.jsonl` carry
+  `"group":"young"` and `"pool_age_s"`. `paper-report` keeps them out of
+  every main number and adds a "YOUNG POOL TEST GROUP" section: trades,
+  wins, $, rugs (exit failed, sale quote gone, or a loss of 50% or more),
+  $ without rugs, by pool age (<15, 15-30, 30-60, 60+ min) and by venue.
+- Never copied by the live trader (so never in the live daily loss
+  ledger). A trap-check failure or rug on a young trade still blocks the
+  token and its creator for everyone, and its result counts in the coin
+  cooling-off history like any trade.
+- Polled and feed wake-up rushes are routed the same way.
+
 ## Tests
 
 ```bash
@@ -273,6 +296,19 @@ real arbsim (same build step, `tests/common/` holds the fakes):
 (cd sniper && cargo test --test feedwake_e2e --test feedwake_paper_e2e -- --ignored --nocapture)
 ```
 
+Young-pool test group: unit tests in `src/paper.rs` (routing, separate
+slots, never mirrored live, line tags, rugs and age bands, and a report
+check that the main part is byte-for-byte the report without the test).
+`tests/young_poll_e2e.rs` runs the real paper trader on the polled path
+(plain `cargo test`); `tests/young_feed_e2e.rs` does the same rush through
+feed wake-up (needs arbsim, `--ignored`).
+
+Cron engine auto-start: `tests/cron_engine_test.sh` runs the real
+`deploy/sniper-cron.sh` against fake binaries in a temp folder (fake HOME,
+fake build, fake arbsim, fake node link) and checks start, keep, restart,
+kill switch, feed server, failed-start back-off and that no link is logged.
+`cargo test` runs it via `tests/cron_engine.rs`; or `bash tests/cron_engine_test.sh`.
+
 `feedwake_e2e` sends real signed transactions (3 buys + 1 failed) through a
 fake feed into the engine and checks the confirmed swaps reach the rush
 detector. `feedwake_paper_e2e` runs the real paper trader: a rush found in
@@ -288,6 +324,24 @@ One-time setup on the server:
 
 After that, cron runs `deploy/sniper-cron.sh` every 2 minutes: it pulls new
 builds, applies `deploy/run.env` (settings, `SNIPER_ENABLED=0` = kill switch),
-keeps the paper sniper running, and every 15 minutes posts the scoreboard to
+keeps the paper sniper running (and, with `SNIPER_ENGINE=1`, the sniper's
+own engine first: started if not running or its socket is dead, never
+restarted while healthy, never the dex bot's), and every 15 minutes posts the scoreboard to
 the GitHub issue "Sniper paper status". Paper only; never touches the arb bot
 (it only reads `GH_STATUS_TOKEN` from the arb bot's `.env` to post the issue).
+
+### Planned run 12 settings (not active yet)
+
+Owner's go-ahead needed; goes in `deploy/run.env` on the `sniper/**` branch
+that builds the server:
+
+    SNIPER_OUT=paper-out/run12          new folder: clean numbers
+    SNIPER_ENGINE=1                     cron starts/keeps the engine itself
+    SNIPER_ENGINE_CHECK=1               trades keep using the node's quotes
+    SNIPER_FEED_WAKE=1                  rushes from the sequencer feed
+    SNIPER_RHC_POLL_MS_WHEN_FEED=0      node polled at today's pace (fair comparison)
+    SNIPER_FEED_STALE_SECS=5
+    SNIPER_YOUNG_TEST=1                 young-pool paper test group
+
+With `SNIPER_ENGINE=1` no manual `sniper-engine.sh start` is needed: the
+cron does it before starting the paper bot.

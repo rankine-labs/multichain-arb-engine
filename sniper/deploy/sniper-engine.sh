@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # ============================================================================
 # SNIPER ENGINE: start / stop / check the sniper's OWN copy of arbsim
-# (speed step 2, sniper/src/engine.rs). NOT run automatically by anything.
+# (speed step 2, sniper/src/engine.rs). Started automatically by
+# deploy/sniper-cron.sh ONLY when deploy/run.env has SNIPER_ENGINE=1 (start
+# if not running or its socket is dead; a healthy engine is left alone).
+# Without that line nothing runs it; it can always be run by hand.
 #
 # Plain English:
 #   The dex bot's arbsim program keeps a full in-memory copy of Robinhood
@@ -35,7 +38,7 @@
 # and read the "engine quotes" section of `./sniper paper-report <dir>`.
 #
 # FEED WAKE-UP (speed step 3, src/feedwake.rs), side-by-side paper test.
-# Needs this engine running (start it first). Add to deploy/run.env, on the
+# Needs this engine running (with SNIPER_ENGINE=1 the cron starts it). Add to deploy/run.env, on the
 # sniper/** branch that builds the server, ONLY with the owner's go-ahead:
 #   SNIPER_OUT=paper-out/run12          new folder: clean feed-vs-poll numbers
 #   SNIPER_ENGINE=1
@@ -45,6 +48,7 @@
 #                                       (1 s day / 0.4 s night), so "feed vs
 #                                       poll" leads compare with what we have
 #   SNIPER_FEED_STALE_SECS=5
+#   SNIPER_YOUNG_TEST=1                 young-pool paper test group (src/paper.rs)
 # SNIPER_RHC_FEED (already set) is the feed the forwarder reads; the
 # wake-up uses that same one connection (no extra connection to the relay).
 # Read: `./sniper paper-report paper-out/run12`, section "feed wake-up".

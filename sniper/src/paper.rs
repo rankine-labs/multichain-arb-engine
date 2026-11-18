@@ -67,6 +67,26 @@
 //   SNIPER_LATE_BLOCKS   race check: re-quote every buy and sell this many
 //                        blocks after we decide (default 2, see below)
 //
+// YOUNG-POOL TEST GROUP (paper only, off unless SNIPER_YOUNG_TEST=1):
+//   A rush skipped ONLY because its pool is younger than
+//   SNIPER_MIN_POOL_AGE_SECS (and at least SNIPER_YOUNG_MIN_AGE_SECS old,
+//   default 0) is still written as "pool too young" for the main results,
+//   then goes through every other filter and the same buy/exit logic as a
+//   separate "young" test trade:
+//     - its own slots: SNIPER_YOUNG_MAX_POSITIONS (default 2), each at most
+//       SNIPER_YOUNG_USD (default 50); it never uses or blocks main slots or
+//       the main money cap (it does wait if a main trade holds that coin)
+//     - every line it writes carries "group":"young" and "pool_age_s"; the
+//       report leaves those lines out of every main number and shows them
+//       in their own "young pool test group" section
+//     - never copied by the live trader, so it can't touch the live daily
+//       loss ledger
+//     - a failed trap check or a rug on a young trade still blocks that
+//       token and creator for everyone (it protects main trades too), and
+//       its result counts in the coin cooling-off history like any trade
+//   Polled rushes and feed wake-up rushes go through the same code here, so
+//   both are routed the same way.
+//
 // Blocklist: saved to <out>/blocked_tokens.json and loaded at start, so a
 // restart keeps it. Entries never expire during a run. Delete the file (or
 // a line in it) by hand to forgive a token.
@@ -654,6 +674,9 @@ pub struct Position {
     /// Follow-through study: at ~15 s, buys/sells since we bought and (when
     /// sellers kept up with buyers) the real net of selling right then.
     pub early: Option<Value>,
+    /// Young-pool test group: Some(pool age in seconds at the rush) for a
+    /// young test position, None for a normal (main) one.
+    pub young_age: Option<f64>,
 }
 
 /// Tighter stop losses studied without trading on them (chart drop, as a
@@ -737,6 +760,8 @@ pub struct LateTrade {
     pub buy: LateQuote,
     /// None while the position is still open.
     pub exit: Option<LateExit>,
+    /// Young test group: pool age (None = main trade). Tags the late line.
+    pub young_age: Option<f64>,
 }
 
 /// Do whatever part of one race check is due now. Order is always: late buy
@@ -761,7 +786,8 @@ pub fn step_late(t: &mut LateTrade, last_block: u64, q: &dyn Quoter, eth_usd: f6
         return None;
     }
     let entry_slip = |late: U256| slip_pct(f64::from(t.opt_tokens), f64::from(late));
-    let base = json!({"late_for": t.pool, "token": t.info.token, "open_block": t.open_block, "venue": t.info.venue_name()});
+    let mut base = json!({"late_for": t.pool, "token": t.info.token, "open_block": t.open_block, "venue": t.info.venue_name()});
+    tag_group(&mut base, t.young_age);
     let with = |mut v: Value, extra: Value| {
         if let (Some(m), Some(e)) = (v.as_object_mut(), extra.as_object()) {
             m.extend(e.clone());
@@ -1015,6 +1041,78 @@ pub struct Config {
     pub venues: Vec<VenueKind>,
     /// Look up old V4 pools' keys from history (SNIPER_V4_LOOKUP, default on).
     pub v4_lookup: bool,
+    /// Young-pool test group (SNIPER_YOUNG_TEST=1; off by default).
+    pub young: YoungCfg,
+}
+
+/// Settings of the young-pool test group (paper only, see the file top).
+#[derive(Clone, Debug, PartialEq)]
+pub struct YoungCfg {
+    /// SNIPER_YOUNG_TEST=1 turns it on. Off = the trader behaves as before.
+    pub on: bool,
+    /// Pools younger than this are skipped even by the test (seconds, default 0).
+    pub min_age_s: f64,
+    /// Young test positions open at once (default 2), separate from main.
+    pub max_positions: usize,
+    /// Largest young test trade in USD (default 50, same as main's cap).
+    pub usd: f64,
+}
+
+impl YoungCfg {
+    /// Read the SNIPER_YOUNG_* settings.
+    pub fn from_env() -> Self {
+        let f = |k: &str, d: f64| std::env::var(k).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(d);
+        YoungCfg {
+            on: std::env::var("SNIPER_YOUNG_TEST").map(|v| v.trim() == "1").unwrap_or(false),
+            min_age_s: f("SNIPER_YOUNG_MIN_AGE_SECS", 0.0).max(0.0),
+            max_positions: (f("SNIPER_YOUNG_MAX_POSITIONS", 2.0) as usize).max(1),
+            usd: f("SNIPER_YOUNG_USD", 50.0),
+        }
+    }
+
+    /// Off (what every test and older caller gets).
+    pub fn off() -> Self {
+        YoungCfg { on: false, min_age_s: 0.0, max_positions: 2, usd: 50.0 }
+    }
+
+    /// Most money in young test positions at once.
+    pub fn max_total_usd(&self) -> f64 {
+        self.max_positions as f64 * self.usd
+    }
+}
+
+/// Does a rush on a pool of this age go to the young test group? Only when
+/// the test is on, the main rule would skip it as "pool too young", and it
+/// is at least the test's own minimum age. (Unknown age never qualifies:
+/// that rush is already skipped as "pool age unknown".)
+pub fn goes_young(age: Option<f64>, min_pool_age_s: f64, y: &YoungCfg) -> bool {
+    y.on && crate::rugguard::too_young(age, min_pool_age_s) && age.is_some_and(|a| a >= y.min_age_s)
+}
+
+/// Room for one more YOUNG test position: young slots and the young money
+/// cap only (main slots and money are never used), and never a coin that
+/// any position, main or young, already holds. `usd` None = size not known yet.
+pub fn young_has_room(main_open: &[(&str, f64)], young_open: &[(&str, f64)], token: &str, usd: Option<f64>, y: &YoungCfg) -> bool {
+    !main_open.iter().any(|(t, _)| t.eq_ignore_ascii_case(token)) && has_room(young_open, token, usd, y.max_positions, y.max_total_usd())
+}
+
+/// Should the live trader copy this paper position? Never a young one.
+pub fn live_mirrors(young: bool) -> bool {
+    !young
+}
+
+/// Mark a file line as part of the young test group (no-op for main lines,
+/// so main lines stay exactly as before).
+pub fn tag_group(line: &mut Value, young_age: Option<f64>) {
+    if let Some(a) = young_age {
+        line["group"] = json!("young");
+        line["pool_age_s"] = json!(a.round());
+    }
+}
+
+/// Is this file line from the young test group?
+pub fn is_young_line(v: &Value) -> bool {
+    v["group"] == "young"
 }
 
 impl Config {
@@ -1061,6 +1159,7 @@ impl Config {
             // A bad list is caught in run() (venues_from_env) so the error is shown.
             venues: venue::parse_venues(&std::env::var("SNIPER_VENUES").unwrap_or_else(|_| "v3,v4,v2".into())).unwrap_or_default(),
             v4_lookup: std::env::var("SNIPER_V4_LOOKUP").map(|v| v != "off").unwrap_or(true),
+            young: YoungCfg::from_env(),
         }
     }
 }
@@ -1338,6 +1437,15 @@ pub fn run(cfg: Config) -> Result<(), String> {
                "node": crate::probe::redact(&cfg.http), "push": cfg.wss.as_deref().map(crate::probe::redact), "eth_usd": eth, "late_blocks": cfg.late_blocks,
                "venues": venue_names, "v4_lookup": cfg.v4_lookup}),
     )?;
+    // Young-pool test group: its settings go in meta.jsonl only when it is on
+    // (off = meta.jsonl exactly as before).
+    if cfg.young.on {
+        write(&mut f_meta, json!({"event": "young_test", "min_age_s": cfg.young.min_age_s, "max_positions": cfg.young.max_positions, "usd": cfg.young.usd, "main_min_pool_age_s": cfg.min_pool_age_s}))?;
+        eprintln!(
+            "paper: YOUNG-POOL TEST ON (paper only, never live): pools {:.0}s..{:.0}s old trade in {} separate slot(s) of up to ${}",
+            cfg.young.min_age_s, cfg.min_pool_age_s, cfg.young.max_positions, cfg.young.usd
+        );
+    }
     // Permanent blocklist: load what earlier runs in this folder learned.
     let block_path = cfg.out.join(Blocklist::FILE);
     let mut blocklist = Blocklist::load(&block_path)?;
@@ -1357,6 +1465,11 @@ pub fn run(cfg: Config) -> Result<(), String> {
         if let Ok(text) = fs::read_to_string(cfg.out.join("signals.jsonl")) {
             for line in text.lines() {
                 if let Ok(v) = serde_json::from_str::<Value>(line) {
+                    // A young test line repeats a rush already in the file
+                    // (as "pool too young"): count each rush once.
+                    if is_young_line(&v) {
+                        continue;
+                    }
                     if let (Some(p), Some(b)) = (v["pool"].as_str(), v["block"].as_u64()) {
                         rush_hist.entry(p.to_ascii_lowercase()).or_default().push_back(b);
                     }
@@ -1541,6 +1654,8 @@ pub fn run(cfg: Config) -> Result<(), String> {
     let (mut n_trades, mut n_wins, mut total, mut n_rush, mut n_skipped) = (0u64, 0u64, 0.0f64, 0u64, 0u64);
     let mut n_unsafe = 0u64; // rushes skipped by the tax/trap check
     let mut n_filtered = 0u64; // rushes skipped by the other safety filters
+    // Young test group tallies (status line only): trades, wins, net USD.
+    let (mut y_trades, mut y_wins, mut y_total) = (0u64, 0u64, 0.0f64);
     let mut tally: BTreeMap<&'static str, VenueTally> = BTreeMap::new();
     // Coin cutoff: each coin's closed trades (when, net USD).
     let mut coin_hist = load_coin_history(&cfg.out, cfg.cut_window);
@@ -1944,26 +2059,33 @@ pub fn run(cfg: Config) -> Result<(), String> {
                             pi += 1;
                             continue; // the real sale isn't at a target yet: keep holding
                         };
-                        n_trades += 1;
-                        if net > 0.0 {
-                            n_wins += 1;
+                        if p.young_age.is_some() {
+                            // Young test trade: its own tallies, never the main ones.
+                            y_trades += 1;
+                            y_wins += (net > 0.0) as u64;
+                            y_total += net;
+                        } else {
+                            n_trades += 1;
+                            if net > 0.0 {
+                                n_wins += 1;
+                            }
+                            total += net;
+                            let t = tally.entry(vt).or_default();
+                            t.trades += 1;
+                            t.wins += (net > 0.0) as u64;
+                            t.pnl += net;
                         }
-                        total += net;
+                        // Coin cooling-off history: every closed trade, young or main.
                         coin_hist.entry(p.info.token.to_ascii_lowercase()).or_default().push((unix_now(), net));
-                        let t = tally.entry(vt).or_default();
-                        t.trades += 1;
-                        t.wins += (net > 0.0) as u64;
-                        t.pnl += net;
-                        write(
-                            &mut f_trades,
-                            json!({"pool": p.pool, "token": p.info.token, "base": p.info.base, "venue": vt, "open_block": p.open_block, "close_block": last_block,
+                        let mut row = json!({"pool": p.pool, "token": p.info.token, "base": p.info.base, "venue": vt, "open_block": p.open_block, "close_block": last_block,
                                    "held_s": p.opened.elapsed().as_secs_f64(), "reason": reason, "pool_move_pct": 100.0 * gain,
                                    "pre_flow": {"buys": p.pre_flow.0, "sells": p.pre_flow.1}, "early": p.early,
                                    "shadow_sl": SHADOW_STOPS.iter().zip(&p.shadow).map(|(lv, v)| (format!("{:.0}", lv * 100.0), json!(v))).collect::<serde_json::Map<_, _>>(),
                                    "usd_in": p.usd_in, "gross_usd": gross, "gas_usd": gross - net, "net_usd": net,
                                    "base_in": p.base_in.to_string(), "base_out": out.to_string(), "tokens": p.tokens.to_string(),
-                                   "wall_ms": SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)}),
-                        )?;
+                                   "wall_ms": SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)});
+                        tag_group(&mut row, p.young_age);
+                        write(&mut f_trades, row)?;
                         // Size study: sell the same trade at every other size, right now.
                         let mut ladder = Vec::new();
                         for (usd, b_in, toks) in &p.ladder {
@@ -1972,14 +2094,25 @@ pub fn run(cfg: Config) -> Result<(), String> {
                                 ladder.push(json!({"usd": usd, "net": n}));
                             }
                         }
-                        write(&mut f_trades, json!({"ladder_for": p.pool, "venue": vt, "open_block": p.open_block, "auto_usd": p.auto_usd, "ladder": ladder}))?;
-                        eprintln!(
-                            "paper: SELL {} [{vt}] ({reason}, {:.1}s) net ${net:+.2} | total ${total:+.2} over {n_trades} trades",
-                            p.info.token,
-                            p.opened.elapsed().as_secs_f64()
-                        );
-                        // Live mode: sell the real position that mirrors this one.
-                        if let Some(lt) = live.as_mut() {
+                        let mut lad = json!({"ladder_for": p.pool, "venue": vt, "open_block": p.open_block, "auto_usd": p.auto_usd, "ladder": ladder});
+                        tag_group(&mut lad, p.young_age);
+                        write(&mut f_trades, lad)?;
+                        if p.young_age.is_some() {
+                            eprintln!(
+                                "paper: SELL {} [{vt}] YOUNG TEST ({reason}, {:.1}s) net ${net:+.2} | young total ${y_total:+.2} over {y_trades} trades",
+                                p.info.token,
+                                p.opened.elapsed().as_secs_f64()
+                            );
+                        } else {
+                            eprintln!(
+                                "paper: SELL {} [{vt}] ({reason}, {:.1}s) net ${net:+.2} | total ${total:+.2} over {n_trades} trades",
+                                p.info.token,
+                                p.opened.elapsed().as_secs_f64()
+                            );
+                        }
+                        // Live mode: sell the real position that mirrors this
+                        // one (young test trades are never mirrored).
+                        if let Some(lt) = live.as_mut().filter(|_| live_mirrors(p.young_age.is_some())) {
                             if lt.open.as_ref().is_some_and(|lp| lp.pool == p.pool) {
                                 if let Err(e) = lt.sell(reason, reason == "stop_loss", Some(net), eth) {
                                     eprintln!("LIVE: sell of {} failed ({e}); will retry as an emergency sell", p.info.token);
@@ -1993,26 +2126,32 @@ pub fn run(cfg: Config) -> Result<(), String> {
                     Err(e) => {
                         // Can't price the exit: keep trying; record it.
                         if p.opened.elapsed() > cfg.hold * 3 {
-                            write(
-                                &mut f_trades,
-                                json!({"pool": p.pool, "token": p.info.token, "venue": vt, "reason": "exit_quote_failed", "error": e, "usd_in": p.usd_in, "net_usd": -p.usd_in}),
-                            )?;
+                            let mut row = json!({"pool": p.pool, "token": p.info.token, "venue": vt, "reason": "exit_quote_failed", "error": e, "usd_in": p.usd_in, "net_usd": -p.usd_in});
+                            tag_group(&mut row, p.young_age);
+                            write(&mut f_trades, row)?;
                             // Size study: every size is lost in full too.
                             let ladder: Vec<Value> = p.ladder.iter().map(|(usd, _, _)| json!({"usd": usd, "net": -usd})).collect();
-                            write(&mut f_trades, json!({"ladder_for": p.pool, "venue": vt, "open_block": p.open_block, "auto_usd": p.auto_usd, "ladder": ladder}))?;
-                            total -= p.usd_in;
-                            n_trades += 1;
-                            let t = tally.entry(vt).or_default();
-                            t.trades += 1;
-                            t.pnl -= p.usd_in;
+                            let mut lad = json!({"ladder_for": p.pool, "venue": vt, "open_block": p.open_block, "auto_usd": p.auto_usd, "ladder": ladder});
+                            tag_group(&mut lad, p.young_age);
+                            write(&mut f_trades, lad)?;
+                            if p.young_age.is_some() {
+                                y_trades += 1;
+                                y_total -= p.usd_in;
+                            } else {
+                                total -= p.usd_in;
+                                n_trades += 1;
+                                let t = tally.entry(vt).or_default();
+                                t.trades += 1;
+                                t.pnl -= p.usd_in;
+                            }
                             // Never touch this token again (survives restarts).
                             block(&mut blocklist, &p.info.token, "exit_quote_failed");
                             creators.block(&rpc, &ages, &p.pool, &format!("rug: exit failed on {}", p.info.token));
                             // Race check: still try the late sell (no optimistic price to compare).
                             schedule_late_exit(&mut late, &p, last_block, cfg.late_blocks, None);
                             closed = true;
-                            eprintln!("paper: EXIT FAILED {} [{vt}] (counted as total loss)", p.info.token);
-                            if let Some(lt) = live.as_mut() {
+                            eprintln!("paper: EXIT FAILED {} [{vt}]{} (counted as total loss)", p.info.token, if p.young_age.is_some() { " YOUNG TEST" } else { "" });
+                            if let Some(lt) = live.as_mut().filter(|_| live_mirrors(p.young_age.is_some())) {
                                 if lt.open.as_ref().is_some_and(|lp| lp.pool == p.pool) {
                                     if let Err(e) = lt.sell("exit quote failed", true, Some(-p.usd_in), eth) {
                                         eprintln!("LIVE: emergency sell of {} failed ({e})", p.info.token);
@@ -2040,7 +2179,14 @@ pub fn run(cfg: Config) -> Result<(), String> {
         }
 
         // ---- new rushes ----
+        // Young test group: status counters as they were before a rush went
+        // to the young test, put back afterwards so the status line's main
+        // counts stay exactly as without the test.
+        let mut restore: Option<(u64, u64, u64)> = None;
         for (r, (src, seen_ms)) in rushes {
+            if let Some(c) = restore.take() {
+                (n_filtered, n_unsafe, n_skipped) = c;
+            }
             n_rush += 1;
             let Some(info) = pools.get(&r.pool).cloned().flatten() else { continue };
             // Skip-first-rush: count earlier rushes BEFORE remembering this one.
@@ -2052,12 +2198,24 @@ pub fn run(cfg: Config) -> Result<(), String> {
             };
             let vt = info.venue_name();
             tally.entry(vt).or_default().rushes += 1;
+            // Young test group (off = both stay unset, nothing changes):
+            //   young_age  Some(age) once this rush is a young test rush: its
+            //              lines are then tagged "group":"young"
+            //   main_done  the main result was already written ("busy") and
+            //              we only go on to see if it is a young test rush;
+            //              main lines are not written again
+            let young_age: std::cell::Cell<Option<f64>> = std::cell::Cell::new(None);
+            let main_done = std::cell::Cell::new(false);
             // A skipped rush: one line in signals.jsonl with the reason.
             let skip = |f: &mut BufWriter<std::fs::File>, why: String| {
+                if young_age.get().is_none() && main_done.get() {
+                    return Ok(());
+                }
                 let mut line = json!({"pool": r.pool, "token": info.token, "block": r.block, "taken": false, "venue": vt, "why": why});
                 if wake.is_some() {
                     line["src"] = json!(src.name());
                 }
+                tag_group(&mut line, young_age.get());
                 write(f, line)
             };
             // V4 hook that can change swap amounts: our maths would be wrong.
@@ -2068,12 +2226,19 @@ pub fn run(cfg: Config) -> Result<(), String> {
                     continue;
                 }
             }
-            // Busy: all slots full, or we already hold this token.
-            let open: Vec<(&str, f64)> = positions.iter().map(|p| (p.info.token.as_str(), p.usd_in)).collect();
+            // Busy: all (main) slots full, or we already hold this token.
+            // Young test positions never take or block a main slot.
+            let open: Vec<(&str, f64)> = positions.iter().filter(|p| p.young_age.is_none()).map(|p| (p.info.token.as_str(), p.usd_in)).collect();
             if !has_room(&open, &info.token, None, cfg.max_positions, cfg.max_total_usd) {
                 n_skipped += 1;
                 skip(&mut f_sig, "busy".into())?;
-                continue;
+                if !cfg.young.on {
+                    continue;
+                }
+                // Young test on: main is done with this rush, but it may
+                // still be a young test rush (decided by its pool age below).
+                main_done.set(true);
+                restore.get_or_insert((n_filtered, n_unsafe, n_skipped));
             }
             // Cheap filters first (no node calls).
             if blocklist.contains(&info.token) {
@@ -2109,10 +2274,30 @@ pub fn run(cfg: Config) -> Result<(), String> {
                 }
             }
             if crate::rugguard::too_young(age, cfg.min_pool_age_s) {
-                n_filtered += 1;
-                skip(&mut f_sig, format!("pool too young ({:.0}s old, need {:.0}s)", age.unwrap_or(0.0), cfg.min_pool_age_s))?;
+                if !main_done.get() {
+                    n_filtered += 1;
+                    skip(&mut f_sig, format!("pool too young ({:.0}s old, need {:.0}s)", age.unwrap_or(0.0), cfg.min_pool_age_s))?;
+                }
+                // Young test group: the main result above stays "pool too
+                // young"; from here on this rush is a young test rush and
+                // goes through every other filter on its own lines.
+                if !goes_young(age, cfg.min_pool_age_s, &cfg.young) {
+                    continue;
+                }
+                restore.get_or_insert((n_filtered, n_unsafe, n_skipped));
+                young_age.set(age);
+                let main_open: Vec<(&str, f64)> = positions.iter().filter(|p| p.young_age.is_none()).map(|p| (p.info.token.as_str(), p.usd_in)).collect();
+                let young_open: Vec<(&str, f64)> = positions.iter().filter(|p| p.young_age.is_some()).map(|p| (p.info.token.as_str(), p.usd_in)).collect();
+                if !young_has_room(&main_open, &young_open, &info.token, None, &cfg.young) {
+                    skip(&mut f_sig, "busy".into())?;
+                    continue;
+                }
+            } else if main_done.get() {
+                // Main was busy and this is not a young pool: nothing more to do.
                 continue;
             }
+            // From here on, `young` = this is a young test rush.
+            let young = young_age.get().is_some();
             // Skip-first-rush: a lone rush on a coin that was quiet for the
             // past hour tended to fizzle; trade only once it is active.
             if prior < cfg.min_prior_rushes {
@@ -2208,8 +2393,10 @@ pub fn run(cfg: Config) -> Result<(), String> {
             let ladder: Vec<(f64, U256, U256)> = rungs.iter().map(|(u, b, t, _, _)| (*u, *b, *t)).collect();
             let round_trips: Vec<(f64, f64)> = rungs.iter().filter_map(|(u, _, _, _, rt)| rt.map(|x| (*u, x))).collect();
             let auto_usd = pick_auto(&round_trips, cfg.auto_max_rt);
-            // The trade's real size: auto size, capped at MAX_USD.
-            let Some(usd_in) = decide_size(auto_usd, &cfg.sizes, cfg.max_usd, cfg.usd) else {
+            // The trade's real size: auto size, capped at MAX_USD (young
+            // test: capped at SNIPER_YOUNG_USD instead).
+            let (cap_usd, fallback_usd) = if young { (cfg.young.usd, cfg.young.usd) } else { (cfg.max_usd, cfg.usd) };
+            let Some(usd_in) = decide_size(auto_usd, &cfg.sizes, cap_usd, fallback_usd) else {
                 if round_trips.is_empty() {
                     // Nothing could be priced at all: a quote problem, not depth.
                     skip(&mut f_sig, "quote failed: size study got no round-trip quotes".into())?;
@@ -2219,12 +2406,23 @@ pub fn run(cfg: Config) -> Result<(), String> {
                 }
                 continue;
             };
-            // Total money at risk across open positions stays under the cap.
-            let open: Vec<(&str, f64)> = positions.iter().map(|p| (p.info.token.as_str(), p.usd_in)).collect();
-            let open_usd: f64 = open.iter().map(|(_, u)| u).sum();
-            if !has_room(&open, &info.token, Some(usd_in), cfg.max_positions, cfg.max_total_usd) {
+            // Total money at risk across open positions stays under the cap
+            // (main and young test each against their own cap).
+            let main_open: Vec<(&str, f64)> = positions.iter().filter(|p| p.young_age.is_none()).map(|p| (p.info.token.as_str(), p.usd_in)).collect();
+            let young_open: Vec<(&str, f64)> = positions.iter().filter(|p| p.young_age.is_some()).map(|p| (p.info.token.as_str(), p.usd_in)).collect();
+            let (open_usd, cap): (f64, f64) = if young {
+                (young_open.iter().map(|(_, u)| u).sum(), cfg.young.max_total_usd())
+            } else {
+                (main_open.iter().map(|(_, u)| u).sum(), cfg.max_total_usd)
+            };
+            let room = if young {
+                young_has_room(&main_open, &young_open, &info.token, Some(usd_in), &cfg.young)
+            } else {
+                has_room(&main_open, &info.token, Some(usd_in), cfg.max_positions, cfg.max_total_usd)
+            };
+            if !room {
                 n_skipped += 1;
-                skip(&mut f_sig, format!("busy (${open_usd:.0} open, cap ${:.0})", cfg.max_total_usd))?;
+                skip(&mut f_sig, format!("busy (${open_usd:.0} open, cap ${cap:.0})"))?;
                 continue;
             }
             let base_in = raw(usd_in);
@@ -2256,7 +2454,14 @@ pub fn run(cfg: Config) -> Result<(), String> {
                     if let Some(sh) = &wake {
                         tag_delay(&mut delay, src, sh.ms_of(t_logs).saturating_sub(seen_ms) as f64, sh.now_ms().saturating_sub(seen_ms) as f64, feed_head.unwrap_or(r.block).saturating_sub(r.block));
                     }
-                    eprintln!("paper: BUY  {} ${usd_in} [{vt}] ({}/{} rush at block {})", info.token, info.base, r.pool, r.block);
+                    eprintln!(
+                        "paper: BUY  {} ${usd_in} [{vt}]{} ({}/{} rush at block {})",
+                        info.token,
+                        young_age.get().map_or(String::new(), |a| format!(" YOUNG TEST (pool {:.0} min old)", a / 60.0)),
+                        info.base,
+                        r.pool,
+                        r.block
+                    );
                     // Race check: price this exact buy again a few blocks from
                     // the newest block we have seen (when we really decided).
                     let decided = last_block.unwrap_or(r.block).max(r.block);
@@ -2270,9 +2475,11 @@ pub fn run(cfg: Config) -> Result<(), String> {
                         buy_due: late_due(decided, cfg.late_blocks),
                         buy: LateQuote::Pending,
                         exit: None,
+                        young_age: young_age.get(),
                     });
                     // Live mode: mirror this buy with real money if allowed.
-                    if let Some(lt) = live.as_mut() {
+                    // Young test trades are NEVER mirrored (paper only).
+                    if let Some(lt) = live.as_mut().filter(|_| live_mirrors(young)) {
                         match lt.refuse(&info) {
                             None => {
                                 if let Err(e) = lt.buy(&r.pool, &info, usd_per_base, tokens) {
@@ -2289,6 +2496,7 @@ pub fn run(cfg: Config) -> Result<(), String> {
                     if wake.is_some() {
                         line["src"] = json!(src.name());
                     }
+                    tag_group(&mut line, young_age.get());
                     write(&mut f_sig, line)?;
                     positions.push(Position {
                         pool: r.pool.clone(),
@@ -2307,12 +2515,17 @@ pub fn run(cfg: Config) -> Result<(), String> {
                         shadow: vec![None; SHADOW_STOPS.len()],
                         pre_flow: det.flow(&r.pool, r.block.saturating_sub(PRE_FLOW_BLOCKS)),
                         early: None,
+                        young_age: young_age.get(),
                     });
                 }
                 other => {
                     skip(&mut f_sig, format!("quote failed: {other:?}"))?;
                 }
             }
+        }
+
+        if let Some(c) = restore.take() {
+            (n_filtered, n_unsafe, n_skipped) = c;
         }
 
         if beat.elapsed() >= Duration::from_secs(60) {
@@ -2324,10 +2537,21 @@ pub fn run(cfg: Config) -> Result<(), String> {
                 if n_trades > 0 { 100.0 * n_wins as f64 / n_trades as f64 } else { 0.0 },
                 if h > 0.0 { total / h } else { 0.0 },
                 if per_venue.is_empty() { "no rushes yet".to_string() } else { per_venue.join(", ") },
-                if positions.is_empty() { "none".to_string() } else { positions.iter().map(|p| p.info.token.as_str()).collect::<Vec<_>>().join(",") },
+                {
+                    let main: Vec<&str> = positions.iter().filter(|p| p.young_age.is_none()).map(|p| p.info.token.as_str()).collect();
+                    if main.is_empty() { "none".to_string() } else { main.join(",") }
+                },
                 crate::sellcheck::NODE_CALLS.load(std::sync::atomic::Ordering::Relaxed),
                 if h > 0.0 { crate::sellcheck::NODE_CALLS.load(std::sync::atomic::Ordering::Relaxed) as f64 / h * 24.0 / 1000.0 } else { 0.0 }
             );
+            if cfg.young.on {
+                let open_y: Vec<&str> = positions.iter().filter(|p| p.young_age.is_some()).map(|p| p.info.token.as_str()).collect();
+                eprintln!(
+                    "paper: young test (paper only, not in the totals above): trades {y_trades} | wins {:.0}% | ${y_total:+.2} | open: {}",
+                    if y_trades > 0 { 100.0 * y_wins as f64 / y_trades as f64 } else { 0.0 },
+                    if open_y.is_empty() { "none".to_string() } else { open_y.join(",") }
+                );
+            }
             if let Some(sh) = &wake {
                 let m = &merge.stats;
                 eprintln!(
@@ -2352,7 +2576,8 @@ pub fn run(cfg: Config) -> Result<(), String> {
                 // A live position whose paper twin is gone (its sell failed):
                 // keep trying an emergency sell every heartbeat.
                 if let Some(lp) = lt.open.clone() {
-                    if !positions.iter().any(|p| p.pool == lp.pool) {
+                    // (only a main position can be its twin: young ones are never mirrored)
+                    if !positions.iter().any(|p| p.young_age.is_none() && p.pool == lp.pool) {
                         match lt.sell("retry after failed sell", true, None, eth) {
                             Ok(n) => eprintln!("LIVE: retried sell done, real ${n:+.2}"),
                             Err(e) => eprintln!("LIVE: retried sell failed again ({e})"),
@@ -2416,16 +2641,20 @@ pub fn tag_delay(delay: &mut Value, src: crate::feedwake::Src, wait_ms: f64, sin
 // ---------------------------------------------------------------------------
 
 pub fn report(dir: &std::path::Path) -> String {
-    let all: Vec<Value> = fs::read_to_string(dir.join("paper_trades.jsonl"))
+    let all_lines: Vec<Value> = fs::read_to_string(dir.join("paper_trades.jsonl"))
         .unwrap_or_default()
         .lines()
         .filter_map(|l| serde_json::from_str(l).ok())
         .collect();
+    let sig_lines: Vec<Value> = fs::read_to_string(dir.join("signals.jsonl")).unwrap_or_default().lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
+    // Young-pool test group lines are kept OUT of every main number below
+    // (the main part reads as if the test never ran) and get their own section.
+    let (young_all, all): (Vec<Value>, Vec<Value>) = all_lines.into_iter().partition(is_young_line);
+    let (young_sig, sig): (Vec<Value>, Vec<Value>) = sig_lines.into_iter().partition(is_young_line);
     // Trade lines vs size-study lines ("ladder_for").
     let rows: Vec<Value> = all.iter().filter(|r| r.get("reason").is_some()).cloned().collect();
     let ladders: Vec<&Value> = all.iter().filter(|r| r.get("ladder_for").is_some()).collect();
     let meta: Vec<Value> = fs::read_to_string(dir.join("meta.jsonl")).unwrap_or_default().lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
-    let sig: Vec<Value> = fs::read_to_string(dir.join("signals.jsonl")).unwrap_or_default().lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
     let start = meta.iter().find(|m| m["event"] == "start");
     let start_ms = start.and_then(|m| m["wall_ms"].as_u64()).unwrap_or(0);
     let last_ms = rows.iter().filter_map(|r| r["wall_ms"].as_u64()).max().unwrap_or(start_ms);
@@ -2493,7 +2722,7 @@ pub fn report(dir: &std::path::Path) -> String {
          rushes seen {} | trades {} | skipped (busy or no quote) {} | blocked as unsafe {}\n\
          TOTAL ${:+.2}  =  ${:+.2} per hour  |  per trade ${:+.2} (rough 95% range ${:+.2} .. ${:+.2})\n\
          wins {:.0}% | best ${:+.2} | worst ${:+.2} | gas paid ${:.2}\n\
-         exits: {:?}\n{}{}{}{}",
+         exits: {:?}\n{}{}{}{}{}",
         hours,
         size_txt,
         sig.len(),
@@ -2513,8 +2742,81 @@ pub fn report(dir: &std::path::Path) -> String {
         venue_txt,
         sizes_txt,
         race_txt,
-        skip_txt
+        skip_txt,
+        young_section(&young_all, &young_sig, meta.iter().any(|m| m["event"] == "young_test"))
     )
+}
+
+/// A young test trade that was a rug: the sale could not be priced at all
+/// (exit failed), the sale quote came back as nothing, or it lost half or more.
+pub fn is_rug(r: &Value) -> bool {
+    let net = r["net_usd"].as_f64().unwrap_or(0.0);
+    let usd_in = r["usd_in"].as_f64().unwrap_or(0.0);
+    r["reason"] == "exit_quote_failed" || r["base_out"] == "0" || (usd_in > 0.0 && net <= -0.5 * usd_in)
+}
+
+/// Age band of a young test trade (pool age at the rush).
+pub fn age_band(age_s: Option<f64>) -> &'static str {
+    match age_s {
+        None => "age ?",
+        Some(a) if a < 900.0 => "<15 min",
+        Some(a) if a < 1800.0 => "15-30 min",
+        Some(a) if a < 3600.0 => "30-60 min",
+        Some(_) => "60 min+",
+    }
+}
+
+/// Report section: the young-pool test group (paper only). Trades, wins,
+/// dollars, rugs and dollars without rugs, in all and split by pool age band
+/// and by venue. Empty if the test never ran in this folder.
+pub fn young_section(all: &[Value], sig: &[Value], was_on: bool) -> String {
+    let rows: Vec<&Value> = all.iter().filter(|r| r.get("reason").is_some()).collect();
+    if rows.is_empty() && sig.is_empty() && !was_on {
+        return String::new();
+    }
+    // One summary line for a group of trades.
+    let line = |g: &[&Value]| -> String {
+        let n = g.len();
+        let wins = g.iter().filter(|r| r["net_usd"].as_f64().unwrap_or(0.0) > 0.0).count();
+        let tot = g.iter().filter_map(|r| r["net_usd"].as_f64()).fold(0.0, |a, b| a + b);
+        let rugs: Vec<&&Value> = g.iter().filter(|r| is_rug(r)).collect();
+        let clean = g.iter().filter(|r| !is_rug(r)).filter_map(|r| r["net_usd"].as_f64()).fold(0.0, |a, b| a + b);
+        format!(
+            "{n} trades | wins {:.0}% | ${tot:+.2} | rugs {} | ${clean:+.2} without rugs",
+            if n > 0 { 100.0 * wins as f64 / n as f64 } else { 0.0 },
+            rugs.len()
+        )
+    };
+    let taken = sig.iter().filter(|s| s["taken"] == json!(true)).count();
+    let mut out = format!(
+        "YOUNG POOL TEST GROUP (paper only, NOT in any number above; never traded live)\n  young-pool rushes {} | bought {} | skipped by the other filters {}\n  all: {}\n",
+        sig.len(),
+        taken,
+        sig.len() - taken,
+        line(&rows)
+    );
+    out += "  by pool age:\n";
+    for band in ["<15 min", "15-30 min", "30-60 min", "60 min+", "age ?"] {
+        let g: Vec<&Value> = rows.iter().copied().filter(|r| age_band(r["pool_age_s"].as_f64()) == band).collect();
+        if !g.is_empty() {
+            out += &format!("    {band:<9}: {}\n", line(&g));
+        }
+    }
+    let mut venues: Vec<String> = rows.iter().map(|r| line_venue(r)).collect();
+    venues.sort_by_key(|n| VenueKind::ALL.iter().position(|k| k.name() == n).unwrap_or(99));
+    venues.dedup();
+    if !venues.is_empty() {
+        out += "  by venue:\n";
+        for v in venues {
+            let g: Vec<&Value> = rows.iter().copied().filter(|r| line_venue(r) == v).collect();
+            out += &format!("    {v:<9}: {}\n", line(&g));
+        }
+    }
+    let skips = count_skips(sig);
+    let named: Vec<String> = SKIP_REASONS.iter().zip(skips.iter()).filter(|(_, n)| **n > 0).map(|(name, n)| format!("{name} {n}")).collect();
+    let busy = sig.iter().filter(|s| s["why"].as_str().is_some_and(|w| w.starts_with("busy"))).count();
+    out += &format!("  young skips: busy {busy}{}{}\n", if named.is_empty() { "" } else { " | " }, named.join(" | "));
+    out
 }
 
 /// Report section: results by time of day in Toronto (UTC-5), 4-hour
@@ -3174,6 +3476,7 @@ mod tests {
             buy_due: 102,
             buy: LateQuote::Pending,
             exit: None,
+            young_age: None,
         }
     }
 
@@ -3502,4 +3805,148 @@ mod tests {
         assert_eq!(delay_section(&[json!({"taken": false})]), "");
     }
 
+
+    // ---- young-pool test group ----
+
+    fn young_on() -> YoungCfg {
+        YoungCfg { on: true, min_age_s: 0.0, max_positions: 2, usd: 50.0 }
+    }
+
+    #[test]
+    fn young_routing_only_for_pools_skipped_as_too_young() {
+        let y = young_on();
+        // Off: nothing ever goes young (the trader behaves as before).
+        assert!(!goes_young(Some(100.0), 3600.0, &YoungCfg::off()));
+        // On: a pool younger than the main rule goes young...
+        assert!(goes_young(Some(100.0), 3600.0, &y));
+        assert!(goes_young(Some(0.0), 3600.0, &y));
+        // ...an old-enough pool stays main, an unknown age is never young.
+        assert!(!goes_young(Some(3600.0), 3600.0, &y));
+        assert!(!goes_young(Some(9000.0), 3600.0, &y));
+        assert!(!goes_young(None, 3600.0, &y));
+        // The test's own minimum age.
+        let y5 = YoungCfg { min_age_s: 300.0, ..young_on() };
+        assert!(!goes_young(Some(299.0), 3600.0, &y5));
+        assert!(goes_young(Some(300.0), 3600.0, &y5));
+        // Main age rule off: nothing is "too young", so nothing goes young.
+        assert!(!goes_young(Some(10.0), 0.0, &y));
+    }
+
+    #[test]
+    fn young_slots_are_separate_from_main() {
+        let y = young_on();
+        // Main full (3 positions, $150): young still has room.
+        let main = [("0xa", 50.0), ("0xb", 50.0), ("0xc", 50.0)];
+        assert!(!has_room(&main, "0xd", None, 3, 150.0));
+        assert!(young_has_room(&main, &[], "0xd", Some(50.0), &y));
+        // Young full (2 slots): no more young, but main is not affected
+        // (main only ever looks at main positions).
+        let young = [("0xe", 50.0), ("0xf", 50.0)];
+        assert!(!young_has_room(&[], &young, "0xd", None, &y));
+        assert!(has_room(&[], "0xd", Some(50.0), 3, 150.0));
+        // Young money cap = slots x size.
+        assert!(!young_has_room(&[], &[("0xe", 50.0)], "0xd", Some(60.0), &y));
+        assert!(young_has_room(&[], &[("0xe", 50.0)], "0xd", Some(50.0), &y));
+        // Never a coin a main position (or another young one) already holds.
+        assert!(!young_has_room(&[("0xD", 50.0)], &[], "0xd", None, &y));
+        assert!(!young_has_room(&[], &[("0xd", 50.0)], "0xd", None, &y));
+    }
+
+    #[test]
+    fn young_trades_are_never_mirrored_live() {
+        assert!(live_mirrors(false));
+        assert!(!live_mirrors(true));
+    }
+
+    #[test]
+    fn young_lines_are_tagged_main_lines_untouched() {
+        let mut main = json!({"pool": "p", "taken": true});
+        tag_group(&mut main, None);
+        assert_eq!(main, json!({"pool": "p", "taken": true}));
+        let mut y = json!({"pool": "p", "taken": true});
+        tag_group(&mut y, Some(612.4));
+        assert_eq!(y["group"], "young");
+        assert_eq!(y["pool_age_s"], json!(612.0));
+        assert!(is_young_line(&y) && !is_young_line(&main));
+        // The race check line of a young trade is tagged too.
+        let q = RaceQuoter { buy_tokens: Some(980).into(), sell_out: Some(51_000_000).into() };
+        let mut t = LateTrade { young_age: Some(100.0), ..late_trade() };
+        t.exit = Some(LateExit { due: 105, opt_out: Some(U256::from(51_000_000u64)) });
+        let line = step_late(&mut t, 110, &q, 3000.0).expect("done");
+        assert_eq!(line["group"], "young");
+        let mut m = late_trade();
+        m.exit = Some(LateExit { due: 105, opt_out: Some(U256::from(51_000_000u64)) });
+        assert!(step_late(&mut m, 110, &q, 3000.0).expect("done").get("group").is_none());
+    }
+
+    #[test]
+    fn rugs_and_age_bands() {
+        assert!(is_rug(&json!({"reason": "exit_quote_failed", "usd_in": 50.0, "net_usd": -50.0})));
+        assert!(is_rug(&json!({"reason": "time", "usd_in": 50.0, "net_usd": -1.0, "base_out": "0"})));
+        assert!(is_rug(&json!({"reason": "stop_loss", "usd_in": 50.0, "net_usd": -25.0})));
+        assert!(!is_rug(&json!({"reason": "stop_loss", "usd_in": 50.0, "net_usd": -24.9, "base_out": "25"})));
+        assert_eq!(age_band(Some(10.0)), "<15 min");
+        assert_eq!(age_band(Some(900.0)), "15-30 min");
+        assert_eq!(age_band(Some(3599.0)), "30-60 min");
+        assert_eq!(age_band(Some(5000.0)), "60 min+");
+        assert_eq!(age_band(None), "age ?");
+    }
+
+    #[test]
+    fn report_keeps_young_out_of_main_numbers() {
+        let base = std::env::temp_dir().join(format!("sniper-young-report-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let (plain, with) = (base.join("plain"), base.join("with"));
+        // The main lines of a run (trade, size study, race check, signals).
+        let meta = json!({"event": "start", "wall_ms": 0, "max_usd": 50.0, "venues": ["v3", "v4", "v2"], "late_blocks": 2}).to_string();
+        let main_trades = vec![
+            json!({"pool": "p1", "venue": "v3", "reason": "take_profit", "usd_in": 50.0, "net_usd": 2.0, "gas_usd": 0.01, "wall_ms": 3_600_000u64, "shadow_sl": {"3": 1.0}, "pre_flow": {"buys": 3, "sells": 1}}).to_string(),
+            json!({"ladder_for": "p1", "venue": "v3", "auto_usd": 50.0, "ladder": [{"usd": 50.0, "net": 2.0}]}).to_string(),
+            json!({"late_for": "p1", "venue": "v3", "late_net_usd": 1.5}).to_string(),
+        ];
+        let main_sig = vec![
+            json!({"pool": "p1", "block": 1, "taken": true, "venue": "v3", "usd_in": 50.0, "delay": {"total_ms": 300.0, "wait_ms": 100.0, "fetch_ms": 50.0, "work_ms": 150.0}}).to_string(),
+            json!({"pool": "p2", "block": 2, "taken": false, "venue": "v2", "why": "pool too young (100s old, need 3600s)"}).to_string(),
+            json!({"pool": "p3", "block": 3, "taken": false, "venue": "v4", "why": "pool too young (2000s old, need 3600s)"}).to_string(),
+        ];
+        // The young test's own lines (same rushes as the "pool too young" ones).
+        let young_trades = vec![
+            json!({"pool": "p2", "venue": "v2", "reason": "take_profit", "usd_in": 50.0, "net_usd": 3.0, "gas_usd": 0.01, "wall_ms": 7_200_000u64, "group": "young", "pool_age_s": 100.0, "shadow_sl": {}, "pre_flow": {"buys": 3, "sells": 0}}).to_string(),
+            json!({"ladder_for": "p2", "venue": "v2", "auto_usd": 50.0, "ladder": [{"usd": 50.0, "net": 3.0}], "group": "young", "pool_age_s": 100.0}).to_string(),
+            json!({"late_for": "p2", "venue": "v2", "late_net_usd": -9.0, "group": "young", "pool_age_s": 100.0}).to_string(),
+            json!({"pool": "p4", "venue": "v4", "reason": "exit_quote_failed", "usd_in": 40.0, "net_usd": -40.0, "group": "young", "pool_age_s": 2000.0}).to_string(),
+        ];
+        let young_sig = vec![
+            json!({"pool": "p2", "block": 2, "taken": true, "venue": "v2", "usd_in": 50.0, "group": "young", "pool_age_s": 100.0, "delay": {"total_ms": 9000.0}}).to_string(),
+            json!({"pool": "p4", "block": 4, "taken": true, "venue": "v4", "usd_in": 40.0, "group": "young", "pool_age_s": 2000.0}).to_string(),
+            json!({"pool": "p3", "block": 3, "taken": false, "venue": "v4", "why": "no sell history (1 of 3 sells seen)", "group": "young", "pool_age_s": 2000.0}).to_string(),
+        ];
+        let write_run = |d: &Path, trades: Vec<String>, sig: Vec<String>, meta: Vec<String>| {
+            fs::create_dir_all(d).unwrap();
+            fs::write(d.join("meta.jsonl"), meta.join("\n")).unwrap();
+            fs::write(d.join("paper_trades.jsonl"), trades.join("\n")).unwrap();
+            fs::write(d.join("signals.jsonl"), sig.join("\n")).unwrap();
+        };
+        write_run(&plain, main_trades.clone(), main_sig.clone(), vec![meta.clone()]);
+        // Young lines mixed in between the main ones, as a real run writes them.
+        let mix = |a: &[String], b: &[String]| a.iter().zip(b.iter()).flat_map(|(x, y)| [x.clone(), y.clone()]).chain(b.iter().skip(a.len()).cloned()).collect::<Vec<_>>();
+        let young_meta = json!({"event": "young_test", "min_age_s": 0.0, "max_positions": 2, "usd": 50.0}).to_string();
+        write_run(&with, mix(&main_trades, &young_trades), mix(&main_sig, &young_sig), vec![meta, young_meta]);
+        let (a, b) = (report(&plain), report(&with));
+        // Every main number is the same: the main part of the report is
+        // exactly the report of a run without the test.
+        assert!(!a.contains("YOUNG POOL TEST GROUP"), "{a}");
+        let (main_part, young_part) = b.split_once("YOUNG POOL TEST GROUP").expect("young section");
+        assert_eq!(main_part, a, "main part changed:\n{b}");
+        assert!(a.contains("trades 1") && a.contains("TOTAL $+2.00"), "{a}");
+        // The young section: 2 trades, 1 win, +3 - 40 = -37, 1 rug, +3 without it.
+        assert!(young_part.contains("young-pool rushes 3 | bought 2 | skipped by the other filters 1"), "{young_part}");
+        assert!(young_part.contains("all: 2 trades | wins 50% | $-37.00 | rugs 1 | $+3.00 without rugs"), "{young_part}");
+        assert!(young_part.contains("<15 min  : 1 trades | wins 100% | $+3.00 | rugs 0"), "{young_part}");
+        assert!(young_part.contains("30-60 min: 1 trades | wins 0% | $-40.00 | rugs 1 | $+0.00 without rugs"), "{young_part}");
+        assert!(young_part.contains("v4       : 1 trades"), "{young_part}");
+        assert!(young_part.contains("v2       : 1 trades"), "{young_part}");
+        assert!(young_part.contains("no sell history 1"), "{young_part}");
+        let _ = fs::remove_dir_all(&base);
+    }
 }
