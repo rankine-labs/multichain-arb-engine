@@ -382,8 +382,7 @@ pub fn rss_mb(pid: u32) -> Option<f64> {
 // ---------------------------------------------------------------------------
 
 fn ask_status(sock: &str) -> Option<Value> {
-    use std::os::unix::net::UnixStream;
-    let mut s = UnixStream::connect(sock).ok()?;
+    let mut s = crate::engine::UnixStream::connect(sock).ok()?;
     let _ = s.set_read_timeout(Some(Duration::from_secs(3)));
     let _ = s.set_write_timeout(Some(Duration::from_secs(3)));
     crate::engine::write_msg(&mut s, json!({"id": 1, "type": "status"}).to_string().as_bytes()).ok()?;

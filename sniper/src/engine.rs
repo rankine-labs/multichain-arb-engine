@@ -56,7 +56,46 @@
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::io::{BufWriter, Read, Write};
-use std::os::unix::net::UnixStream;
+// The engine talks over a Unix socket (Linux server). The Windows desktop
+// copy has no Unix sockets: there UnixStream is a stand-in whose connect
+// always fails, so the engine simply counts as "down" and every quote goes
+// to the node, exactly as with SNIPER_ENGINE unset.
+#[cfg(unix)]
+pub use std::os::unix::net::UnixStream;
+#[cfg(not(unix))]
+pub use nounix::UnixStream;
+
+#[cfg(not(unix))]
+mod nounix {
+    use std::io;
+    use std::time::Duration;
+    /// Never exists (connect always fails), so no method below can run.
+    pub struct UnixStream(std::convert::Infallible);
+    impl UnixStream {
+        pub fn connect<P: AsRef<std::path::Path>>(_p: P) -> io::Result<UnixStream> {
+            Err(io::Error::new(io::ErrorKind::Unsupported, "no Unix sockets on this system"))
+        }
+        pub fn set_read_timeout(&self, _d: Option<Duration>) -> io::Result<()> {
+            match self.0 {}
+        }
+        pub fn set_write_timeout(&self, _d: Option<Duration>) -> io::Result<()> {
+            match self.0 {}
+        }
+    }
+    impl io::Read for UnixStream {
+        fn read(&mut self, _b: &mut [u8]) -> io::Result<usize> {
+            match self.0 {}
+        }
+    }
+    impl io::Write for UnixStream {
+        fn write(&mut self, _b: &[u8]) -> io::Result<usize> {
+            match self.0 {}
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            match self.0 {}
+        }
+    }
+}
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError};
