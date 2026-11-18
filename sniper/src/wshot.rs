@@ -390,6 +390,31 @@ pub fn fill_range(from: u64, head: u64, max: u64) -> Option<(u64, u64, bool)> {
 // Free estimate
 // ---------------------------------------------------------------------------
 
+/// BUDGET BRAKE (lesson from the dex bot: its WebSocket grew to ~60% of all
+/// node use and had to be cut back, PRs #285 / #294). Every 10 minutes the
+/// trader compares the free estimate for the CURRENT hot set (last 10 min,
+/// projected per day) with SNIPER_WS_HOT_BUDGET_DAY:
+///   over budget        -> shrink the hot list to half
+///   under half budget  -> grow it back (x1.5, up to the configured size)
+/// The list never goes below WS_MIN_HOT pools / ids, so the busiest pools
+/// stay fast; everything else is still found by normal polling.
+pub const WS_MIN_HOT: usize = 5;
+pub const WS_BRAKE_EVERY: Duration = Duration::from_secs(600);
+
+/// New scale (0..=1) for the hot list size, from the recent estimate.
+pub fn budget_scale(recent_per_day: Option<f64>, budget: f64, scale: f64) -> f64 {
+    match recent_per_day {
+        Some(r) if r > budget => (scale * 0.5).max(0.0),
+        Some(r) if r < budget * 0.5 && scale < 1.0 => (scale * 1.5).min(1.0),
+        _ => scale,
+    }
+}
+
+/// Hot list size for a configured maximum at a given scale.
+pub fn scaled_max(max: usize, scale: f64) -> usize {
+    ((max as f64 * scale).round() as usize).max(WS_MIN_HOT.min(max))
+}
+
 /// Counts polled logs the current hot set's subscription would have pushed.
 pub struct Estimator {
     pub started: Instant,
@@ -982,6 +1007,23 @@ mod tests {
         assert_eq!(a.iter().find(|(k, _)| *k == "0xa").map(|(_, v)| *v), Some((10, Some(20))));
         a.prune(1_000, 985);
         assert_eq!(a.len(), 1, "B (last seen 5) is past the window, A (rush 20) is not");
+    }
+
+    #[test]
+    fn budget_brake_shrinks_and_regrows() {
+        // Over budget: halve. Way under: grow back, never above 1.
+        assert_eq!(budget_scale(Some(400_000.0), 300_000.0, 1.0), 0.5);
+        assert_eq!(budget_scale(Some(400_000.0), 300_000.0, 0.5), 0.25);
+        assert_eq!(budget_scale(Some(100_000.0), 300_000.0, 0.5), 0.75);
+        assert_eq!(budget_scale(Some(100_000.0), 300_000.0, 0.75), 1.0);
+        // In between, or no estimate yet: unchanged.
+        assert_eq!(budget_scale(Some(200_000.0), 300_000.0, 0.5), 0.5);
+        assert_eq!(budget_scale(None, 300_000.0, 0.5), 0.5);
+        // Sizes: never below the floor (or the configured max if smaller).
+        assert_eq!(scaled_max(200, 1.0), 200);
+        assert_eq!(scaled_max(200, 0.25), 50);
+        assert_eq!(scaled_max(200, 0.001), WS_MIN_HOT);
+        assert_eq!(scaled_max(3, 0.1), 3);
     }
 
     #[test]

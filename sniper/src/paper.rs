@@ -1652,7 +1652,7 @@ pub fn run(cfg: Config) -> Result<(), String> {
     // Swap dedupe and source timing (feedwake.rs Merge) for any push source.
     let merging = wake.is_some() || ws_sh.is_some();
     let mut f_ws = if hot_on { Some(open(crate::wshot::FILE)?) } else { None };
-    let hot_rules = crate::wshot::HotRules {
+    let mut hot_rules = crate::wshot::HotRules {
         window_ms: hcfg.active.as_millis() as u64,
         min_age_s: cfg.min_pool_age_s,
         young_min_age_s: cfg.young.on.then_some(cfg.young.min_age_s),
@@ -1665,6 +1665,9 @@ pub fn run(cfg: Config) -> Result<(), String> {
     let mut hot_dirty = false;
     let mut est = crate::wshot::Estimator::default();
     let mut est_recent: Option<f64> = None;
+    // Budget brake on the hot list size (wshot::budget_scale).
+    let mut ws_scale = 1.0f64;
+    let mut ws_brake_at = Instant::now();
     let mut ws_healthy = false;
     let mut ws_head: Option<u64> = None;
     let mut ws_stats_at = Instant::now();
@@ -2736,6 +2739,25 @@ pub fn run(cfg: Config) -> Result<(), String> {
                 let k = |x: Option<f64>| x.map_or("?".to_string(), |v| if v >= 10_000.0 { format!("{:.0}k", v / 1000.0) } else { format!("{v:.0}") });
                 if hcfg.estimate {
                     est_recent = est.recent_per_day();
+                    // Budget brake: at most every 10 min, shrink / regrow the
+                    // hot list so the WebSocket bill stays inside the budget.
+                    if ws_brake_at.elapsed() >= crate::wshot::WS_BRAKE_EVERY {
+                        ws_brake_at = Instant::now();
+                        let new_scale = crate::wshot::budget_scale(est_recent, hcfg.budget_day, ws_scale);
+                        if (new_scale - ws_scale).abs() > 1e-9 {
+                            ws_scale = new_scale;
+                            hot_rules.max_pools = crate::wshot::scaled_max(hcfg.max_pools, ws_scale);
+                            hot_rules.max_v4 = crate::wshot::scaled_max(hcfg.max_v4, ws_scale);
+                            hot_dirty = true;
+                            eprintln!(
+                                "paper: ws budget brake: estimate ~{:.0}/day vs budget {:.0}/day -> hot list now up to {} pools + {} V4 ids",
+                                est_recent.unwrap_or(0.0),
+                                hcfg.budget_day,
+                                hot_rules.max_pools,
+                                hot_rules.max_v4
+                            );
+                        }
+                    }
                     eprintln!(
                         "paper: ws estimate (free): hot set {} pools + {} V4 ids would push ~{} messages/day (last 10 min ~{}/day; {} matching logs so far) | spare budget {}/day",
                         hot.addrs.len(),
