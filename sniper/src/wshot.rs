@@ -112,6 +112,8 @@ pub struct WsHotCfg {
     pub stale: Duration,
     pub fill_max_blocks: u64,
     pub budget_day: f64,
+    /// SNIPER_WS_HOT_MAX_SWAPS_PER_MIN: busier pools stay off the WebSocket.
+    pub max_swaps_per_min: f64,
     /// Node poll pace while the WebSocket is healthy. None = normal pace.
     pub poll_when_ws: Option<Duration>,
 }
@@ -137,6 +139,7 @@ impl WsHotCfg {
             stale: Duration::from_secs(num("SNIPER_WS_HOT_STALE_SECS", 30).clamp(2, 600)),
             fill_max_blocks: num("SNIPER_WS_HOT_FILL_MAX_BLOCKS", 600).clamp(1, 10_000),
             budget_day: num("SNIPER_WS_HOT_BUDGET_DAY", 300_000) as f64,
+            max_swaps_per_min: num("SNIPER_WS_HOT_MAX_SWAPS_PER_MIN", 20) as f64,
             poll_when_ws: Some(num("SNIPER_RHC_POLL_MS_WHEN_WS", 0)).filter(|m| *m > 0).map(|m| Duration::from_millis(m.clamp(100, 60_000))),
         };
         let warn = (asked && !wss).then(|| "SNIPER_WS_HOT=1 needs SNIPER_RHC_WSS (the paid WebSocket node); hot-pool WebSocket stays OFF".to_string());
@@ -193,6 +196,11 @@ pub struct Cand {
     pub age_s: Option<f64>,
     pub blocked: bool,
     pub unsafe_hook: bool,
+    /// Swaps a minute on this pool right now (RateMeter). Bot-churned pools
+    /// trade constantly, rarely pass our filters and cost one paid pushed
+    /// message per swap, so they are kept off the WebSocket (polling still
+    /// watches them).
+    pub swaps_per_min: f64,
 }
 
 /// The cheap-filter rules and caps for the hot set.
@@ -205,6 +213,9 @@ pub struct HotRules {
     pub young_min_age_s: Option<f64>,
     pub max_pools: usize,
     pub max_v4: usize,
+    /// SNIPER_WS_HOT_MAX_SWAPS_PER_MIN (default 20, 0 = no limit): busier
+    /// pools stay off the WebSocket.
+    pub max_swaps_per_min: f64,
 }
 
 /// Would a rush on this pool get past the cheap filters (no node calls)?
@@ -213,6 +224,9 @@ pub fn passes(c: &Cand, r: &HotRules, now_ms: u64) -> bool {
     let recent = now_ms.saturating_sub(c.last_swap_ms.max(c.last_rush_ms.unwrap_or(0))) <= r.window_ms;
     if !recent || c.blocked || c.unsafe_hook {
         return false;
+    }
+    if r.max_swaps_per_min > 0.0 && c.swaps_per_min > r.max_swaps_per_min {
+        return false; // bot-churned: too costly to push, polling covers it
     }
     if r.min_age_s <= 0.0 {
         return true;
@@ -243,6 +257,38 @@ pub fn select_hot(cands: &[Cand], r: &HotRules, now_ms: u64) -> HotSet {
         }
     }
     h
+}
+
+/// Swaps a minute per pool, from whole-minute counts: the busier of the
+/// current minute and the last full one (so a burst shows at once, and a
+/// pool stays "busy" for at least a minute after it calms down).
+#[derive(Default)]
+pub struct RateMeter {
+    map: HashMap<String, (u64, u32, u32)>, // (minute number, this minute, last minute)
+}
+
+impl RateMeter {
+    pub fn note(&mut self, key: &str, t_ms: u64) {
+        let m = t_ms / 60_000;
+        let e = self.map.entry(key.to_ascii_lowercase()).or_insert((m, 0, 0));
+        if e.0 != m {
+            *e = (m, 0, if e.0 + 1 == m { e.1 } else { 0 });
+        }
+        e.1 += 1;
+    }
+    pub fn per_min(&self, key: &str, now_ms: u64) -> f64 {
+        let m = now_ms / 60_000;
+        match self.map.get(&key.to_ascii_lowercase()) {
+            Some(&(em, cur, prev)) if em == m => cur.max(prev) as f64,
+            Some(&(em, cur, _)) if em + 1 == m => cur as f64,
+            _ => 0.0,
+        }
+    }
+    /// Forget pools with no swap for over 2 minutes.
+    pub fn prune(&mut self, now_ms: u64) {
+        let m = now_ms / 60_000;
+        self.map.retain(|_, (em, _, _)| *em + 2 > m);
+    }
 }
 
 /// Recent swap / rush times per pool (kept by the trader).
@@ -407,6 +453,17 @@ pub fn budget_scale(recent_per_day: Option<f64>, budget: f64, scale: f64) -> f64
         Some(r) if r > budget => (scale * 0.5).max(0.0),
         Some(r) if r < budget * 0.5 && scale < 1.0 => (scale * 1.5).min(1.0),
         _ => scale,
+    }
+}
+
+/// HARD OFF SWITCH. The brake already shrank the list to its floor and the
+/// estimate is still over budget: stop the WebSocket (polling takes over).
+/// Back on once the would-be list's estimate drops under half the budget.
+pub fn ws_off(recent_per_day: Option<f64>, budget: f64, at_floor: bool, off_now: bool) -> bool {
+    match recent_per_day {
+        Some(r) if r > budget && at_floor => true,
+        Some(r) if off_now && r < budget * 0.5 => false,
+        _ => off_now,
     }
 }
 
@@ -933,10 +990,10 @@ mod tests {
     use super::*;
 
     fn rules() -> HotRules {
-        HotRules { window_ms: 60_000, min_age_s: 7200.0, young_min_age_s: None, max_pools: 2, max_v4: 1 }
+        HotRules { window_ms: 60_000, min_age_s: 7200.0, young_min_age_s: None, max_pools: 2, max_v4: 1, max_swaps_per_min: 20.0 }
     }
     fn cand(key: &str, v4: bool, swap: u64, rush: Option<u64>, age: Option<f64>) -> Cand {
-        Cand { key: key.into(), v4, last_swap_ms: swap, last_rush_ms: rush, age_s: age, blocked: false, unsafe_hook: false }
+        Cand { key: key.into(), v4, last_swap_ms: swap, last_rush_ms: rush, age_s: age, blocked: false, unsafe_hook: false, swaps_per_min: 0.0 }
     }
 
     #[test]
@@ -1007,6 +1064,46 @@ mod tests {
         assert_eq!(a.iter().find(|(k, _)| *k == "0xa").map(|(_, v)| *v), Some((10, Some(20))));
         a.prune(1_000, 985);
         assert_eq!(a.len(), 1, "B (last seen 5) is past the window, A (rush 20) is not");
+    }
+
+    #[test]
+    fn churned_pools_stay_off_the_websocket() {
+        let now = 600_000;
+        let mut busy = cand("0xbusy", false, now - 1000, Some(now - 500), Some(9000.0));
+        busy.swaps_per_min = 120.0;
+        let calm = cand("0xcalm", false, now - 1000, None, Some(9000.0));
+        let r = rules();
+        assert!(!passes(&busy, &r, now), "bot-churned pool kept off");
+        assert!(passes(&calm, &r, now));
+        assert!(passes(&busy, &HotRules { max_swaps_per_min: 0.0, ..r.clone() }, now), "0 = no limit");
+        let h = select_hot(&[busy, calm], &r, now);
+        assert!(h.addrs.contains("0xcalm") && !h.addrs.contains("0xbusy"));
+    }
+
+    #[test]
+    fn rate_meter_counts_per_minute() {
+        let mut m = RateMeter::default();
+        for i in 0..30 {
+            m.note("0xA", 60_000 + i * 1000); // 30 swaps in minute 1
+        }
+        assert_eq!(m.per_min("0xa", 59_000 + 60_000), 30.0);
+        m.note("0xa", 120_500); // 1 swap in minute 2
+        assert_eq!(m.per_min("0xa", 121_000), 30.0, "last full minute still counts");
+        assert_eq!(m.per_min("0xa", 185_000), 1.0, "one minute later: only minute 2");
+        assert_eq!(m.per_min("0xa", 300_000), 0.0);
+        m.prune(300_000);
+        assert_eq!(m.per_min("0xa", 120_000), 0.0, "pruned");
+    }
+
+    #[test]
+    fn hard_off_switch() {
+        // Over budget at the floor: off. Over budget but not at floor: brake first.
+        assert!(ws_off(Some(400_000.0), 250_000.0, true, false));
+        assert!(!ws_off(Some(400_000.0), 250_000.0, false, false));
+        // Off stays off until the estimate is under half the budget.
+        assert!(ws_off(Some(200_000.0), 250_000.0, true, true));
+        assert!(!ws_off(Some(100_000.0), 250_000.0, true, true));
+        assert!(ws_off(None, 250_000.0, true, true));
     }
 
     #[test]

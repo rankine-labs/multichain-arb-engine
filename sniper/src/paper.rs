@@ -1658,7 +1658,12 @@ pub fn run(cfg: Config) -> Result<(), String> {
         young_min_age_s: cfg.young.on.then_some(cfg.young.min_age_s),
         max_pools: hcfg.max_pools,
         max_v4: hcfg.max_v4,
+        max_swaps_per_min: hcfg.max_swaps_per_min,
     };
+    // Swaps a minute per pool: bot-churned pools stay off the WebSocket.
+    let mut hot_rate = crate::wshot::RateMeter::default();
+    // Hard off switch (wshot::ws_off): WebSocket paused, polling does all.
+    let mut ws_paused = false;
     let mut hot = crate::wshot::HotSet::default();
     let mut hot_act = crate::wshot::Activity::default();
     let mut hot_at: Option<Instant> = None;
@@ -2050,6 +2055,7 @@ pub fn run(cfg: Config) -> Result<(), String> {
                 // Hot set: this tradable pool just traded.
                 if hot_on {
                     hot_act.note_swap(&pool, started.elapsed().as_millis() as u64);
+                    hot_rate.note(&pool, started.elapsed().as_millis() as u64);
                 }
                 let price = match kind {
                     LogKind::V2Swap => v2_res.get(&pool).and_then(|(r0, r1)| venue::v2_price(*r0, *r1, info.token_is0)),
@@ -2118,6 +2124,7 @@ pub fn run(cfg: Config) -> Result<(), String> {
         if hot_on && (hot_dirty || hot_at.is_none_or(|t| t.elapsed() >= Duration::from_secs(5))) {
             let now_ms = started.elapsed().as_millis() as u64;
             hot_act.prune(now_ms, hot_rules.window_ms);
+            hot_rate.prune(now_ms);
             let lb = last_block.unwrap_or(0);
             let cands: Vec<crate::wshot::Cand> = hot_act
                 .iter()
@@ -2131,12 +2138,15 @@ pub fn run(cfg: Config) -> Result<(), String> {
                         age_s: ages.age_secs(k, lb, BLOCK_SECS).or_else(|| births.get(k).map(|b| lb.saturating_sub(b) as f64 * BLOCK_SECS)),
                         blocked: blocklist.contains(&info.token),
                         unsafe_hook: matches!(&info.venue, Venue::V4 { key } if venue::hook_changes_amounts(&key.hooks)),
+                        swaps_per_min: hot_rate.per_min(k, now_ms),
                     })
                 })
                 .collect();
             hot = crate::wshot::select_hot(&cands, &hot_rules, now_ms);
             if let Some(w) = &ws_sh {
-                w.set_wanted(hot.clone());
+                // Paused by the off switch: subscribe to nothing (the estimate
+                // still runs on `hot`, the list we WOULD subscribe).
+                w.set_wanted(if ws_paused { crate::wshot::HotSet::default() } else { hot.clone() });
                 merge.ws_subscribed = w.live().keys();
             }
             hot_at = Some(Instant::now());
@@ -2744,6 +2754,20 @@ pub fn run(cfg: Config) -> Result<(), String> {
                     if ws_brake_at.elapsed() >= crate::wshot::WS_BRAKE_EVERY {
                         ws_brake_at = Instant::now();
                         let new_scale = crate::wshot::budget_scale(est_recent, hcfg.budget_day, ws_scale);
+                        // Hard off switch: brake already at its floor and still over.
+                        let at_floor = crate::wshot::scaled_max(hcfg.max_pools, ws_scale) <= crate::wshot::WS_MIN_HOT
+                            && crate::wshot::scaled_max(hcfg.max_v4, ws_scale) <= crate::wshot::WS_MIN_HOT;
+                        let off = crate::wshot::ws_off(est_recent, hcfg.budget_day, at_floor, ws_paused);
+                        if off != ws_paused && ws_sh.is_some() {
+                            ws_paused = off;
+                            hot_dirty = true;
+                            eprintln!(
+                                "paper: ws OFF SWITCH: {} (estimate ~{:.0}/day vs budget {:.0}/day)",
+                                if off { "WebSocket paused, polling does everything" } else { "WebSocket back on" },
+                                est_recent.unwrap_or(0.0),
+                                hcfg.budget_day
+                            );
+                        }
                         if (new_scale - ws_scale).abs() > 1e-9 {
                             ws_scale = new_scale;
                             hot_rules.max_pools = crate::wshot::scaled_max(hcfg.max_pools, ws_scale);
