@@ -173,6 +173,28 @@ exit slip (how much worse the late price was), and late quotes that failed.
 If the late total is much worse than the normal total, the paper profit
 depends on landing instantly, which we cannot do.
 
+## Engine quotes (speed step 2, off by default)
+
+With `SNIPER_ENGINE=1` the paper trader prices swaps from its own copy of
+the dex bot's `arbsim` engine (a full in-memory copy of Robinhood Chain,
+answers in about a millisecond) instead of a node round trip. If the engine
+is not ready, still loading a value, too slow (`SNIPER_ENGINE_TIMEOUT_MS`,
+default 50) or not running, the node is asked as before. The trader also
+forwards the sequencer feed (`SNIPER_RHC_FEED`) into the engine so its copy
+stays current. Details and all settings: `src/engine.rs`.
+
+- The engine is a SEPARATE process with its own socket
+  (`/tmp/sniper-arbsim.sock`); the dex bot's `/tmp/arbsim.sock` is refused.
+  Start it with `bash deploy/sniper-engine.sh start` (see that file).
+- `SNIPER_ENGINE_CHECK=1`: every quote is asked of both, side by side, and
+  written to `engine_check.jsonl`; trades use the NODE's answer. Different
+  answers are re-asked of the node at the engine's exact block, to separate
+  "engine was newer" from "engine was wrong". The report gets an
+  "engine quotes" section: match rate, engine vs node time (p50 / p95),
+  fallback rate and reasons.
+- The status line every minute shows engine answers vs node fallbacks and
+  the feed forwarder's sent / dropped frames.
+
 ## Tests
 
 ```bash
@@ -191,6 +213,17 @@ that refuses full pending txs.
 normal token (PASS), a 5% tax token (REJECT) and an unsellable token
 (REJECT). It needs `anvil` on PATH or `ANVIL_BIN=/path/to/anvil`, and
 skips itself otherwise.
+
+`src/engine.rs` tests use a fake engine socket (fallback on miss, slow,
+missing, reverted and garbled answers; message formats; the report).
+`tests/engine_e2e.rs` runs the sniper's forwarder and quoter against the
+REAL arbsim binary (fake node + fake feed relay, all local). It needs the
+binary, so plain `cargo test` skips it:
+
+```bash
+(cd sim && cargo build --release --bin arbsim)
+(cd sniper && cargo test --test engine_e2e -- --ignored --nocapture)
+```
 
 ## Server auto-run (no terminal needed)
 

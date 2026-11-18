@@ -62,6 +62,8 @@
 //   SNIPER_NIGHT_HOURS   night window, Toronto hours (default 20-8)
 //   SNIPER_PUSH=1        use websocket push instead (each pushed log is a
 //                        paid Chainstack request: off by default)
+//   SNIPER_ENGINE=1      quotes from our own arbsim engine copy, node as
+//                        fallback (speed step 2; settings in engine.rs)
 //   SNIPER_LATE_BLOCKS   race check: re-quote every buy and sell this many
 //                        blocks after we decide (default 2, see below)
 //
@@ -145,51 +147,64 @@ pub struct ChainQuoter {
     pub rpc: Rpc,
 }
 
+/// One read-only contract call: (to, calldata) -> the raw answer as hex
+/// text, or None when the source gave no data. The node (ChainQuoter) and
+/// the local engine copy (engine.rs EngineQuoter) both plug in here, so the
+/// quote maths below is written once and both sources price identically.
+pub type EthCall<'a> = dyn Fn(&str, &str) -> Result<Option<String>, String> + 'a;
+
+/// Plain English: price one swap through `call`. V3 asks QuoterV2, V4 asks
+/// V4Quoter (the real swap, hook included, inside a reverted simulation),
+/// V2 reads the pair's reserves and applies the 0.30% fee formula.
+pub fn quote_via(call: &EthCall, venue: &Venue, token_in: &str, token_out: &str, amount_in: U256) -> Result<(U256, u64), String> {
+    match venue {
+        Venue::V3 { fee } => {
+            let r = call(V3_QUOTER_V2, &data_quote(token_in, token_out, *fee, amount_in))?;
+            let h = r.ok_or("quote: no data")?;
+            let h = h.trim_start_matches("0x");
+            if h.len() < 64 * 4 {
+                return Err("quote: short answer".into());
+            }
+            // returns (amountOut, sqrtPriceX96After, initializedTicksCrossed, gasEstimate)
+            let out = U256::from_str_radix(&h[0..64], 16).map_err(|e| e.to_string())?;
+            let gas = u64::from_str_radix(h[192..256].trim_start_matches('0'), 16).unwrap_or(150_000);
+            Ok((out, gas))
+        }
+        Venue::V4 { key } => {
+            let zfo = venue::v4_zero_for_one(key, token_in).ok_or("v4 quote: token not in pool")?;
+            let r = call(venue::V4_QUOTER, &venue::data_v4_quote(key, zfo, amount_in)?)?;
+            venue::parse_v4_quote(&r.ok_or("v4 quote: no data")?)
+        }
+        Venue::V2 { pair, token0 } => {
+            // getReserves() = 0x0902f1ac
+            let r = call(pair, "0x0902f1ac")?;
+            let (r0, r1) = venue::v2_reserves(r.as_deref().unwrap_or("")).ok_or("v2 quote: reserves unreadable")?;
+            let (r_in, r_out) = if token_in.eq_ignore_ascii_case(token0) { (r0, r1) } else { (r1, r0) };
+            let out = venue::v2_amount_out(amount_in, r_in, r_out);
+            if out.is_zero() {
+                return Err("v2 quote: empty pool".into());
+            }
+            Ok((out, venue::V2_SWAP_GAS))
+        }
+    }
+}
+
 impl ChainQuoter {
-    /// Uniswap V3: QuoterV2.quoteExactInputSingle.
-    fn quote_v3(&self, token_in: &str, token_out: &str, fee: u32, amount_in: U256) -> Result<(U256, u64), String> {
-        let r = self
-            .rpc
-            .call("eth_call", json!([{"to": V3_QUOTER_V2, "data": data_quote(token_in, token_out, fee, amount_in)}, "latest"]))?;
-        let h = r.as_str().ok_or("quote: no data")?.trim_start_matches("0x");
-        if h.len() < 64 * 4 {
-            return Err("quote: short answer".into());
-        }
-        // returns (amountOut, sqrtPriceX96After, initializedTicksCrossed, gasEstimate)
-        let out = U256::from_str_radix(&h[0..64], 16).map_err(|e| e.to_string())?;
-        let gas = u64::from_str_radix(h[192..256].trim_start_matches('0'), 16).unwrap_or(150_000);
-        Ok((out, gas))
+    /// eth_call against the node's "latest" block (or an exact block, hex).
+    pub fn eth_call_at(&self, to: &str, data: &str, block: &str) -> Result<Option<String>, String> {
+        let r = self.rpc.call("eth_call", json!([{"to": to, "data": data}, block]))?;
+        Ok(r.as_str().map(str::to_string))
     }
 
-    /// Uniswap V4: V4Quoter.quoteExactInputSingle with the pool's exact key
-    /// (runs the real swap, hook included, inside a reverted simulation).
-    fn quote_v4(&self, key: &V4Key, token_in: &str, amount_in: U256) -> Result<(U256, u64), String> {
-        let zfo = venue::v4_zero_for_one(key, token_in).ok_or("v4 quote: token not in pool")?;
-        let r = self.rpc.call("eth_call", json!([{"to": venue::V4_QUOTER, "data": venue::data_v4_quote(key, zfo, amount_in)?}, "latest"]))?;
-        venue::parse_v4_quote(r.as_str().ok_or("v4 quote: no data")?)
-    }
-
-    /// Uniswap V2: the pair's current reserves and the 0.30% fee formula.
-    fn quote_v2(&self, pair: &str, token0: &str, token_in: &str, amount_in: U256) -> Result<(U256, u64), String> {
-        // getReserves() = 0x0902f1ac
-        let r = self.rpc.call("eth_call", json!([{"to": pair, "data": "0x0902f1ac"}, "latest"]))?;
-        let (r0, r1) = venue::v2_reserves(r.as_str().unwrap_or("")).ok_or("v2 quote: reserves unreadable")?;
-        let (r_in, r_out) = if token_in.eq_ignore_ascii_case(token0) { (r0, r1) } else { (r1, r0) };
-        let out = venue::v2_amount_out(amount_in, r_in, r_out);
-        if out.is_zero() {
-            return Err("v2 quote: empty pool".into());
-        }
-        Ok((out, venue::V2_SWAP_GAS))
+    /// The same quote, priced at an exact block (side-by-side check).
+    pub fn quote_at(&self, venue: &Venue, token_in: &str, token_out: &str, amount_in: U256, block: &str) -> Result<(U256, u64), String> {
+        quote_via(&|to, data| self.eth_call_at(to, data, block), venue, token_in, token_out, amount_in)
     }
 }
 
 impl Quoter for ChainQuoter {
     fn quote(&self, venue: &Venue, token_in: &str, token_out: &str, amount_in: U256) -> Result<(U256, u64), String> {
-        match venue {
-            Venue::V3 { fee } => self.quote_v3(token_in, token_out, *fee, amount_in),
-            Venue::V4 { key } => self.quote_v4(key, token_in, amount_in),
-            Venue::V2 { pair, token0 } => self.quote_v2(pair, token0, token_in, amount_in),
-        }
+        self.quote_at(venue, token_in, token_out, amount_in, "latest")
     }
     fn gas_price(&self) -> Result<U256, String> {
         let r = self.rpc.call("eth_gasPrice", json!([]))?;
@@ -1262,7 +1277,24 @@ pub fn run(cfg: Config) -> Result<(), String> {
         f.flush().map_err(|e| e.to_string())
     };
     let rpc = Rpc::new(&cfg.http);
-    let quoter = ChainQuoter { rpc: Rpc::new(&cfg.http) };
+    // Speed step 2 (engine.rs): with SNIPER_ENGINE=1, quotes come from our
+    // own arbsim engine copy (node as automatic fallback). Unset = the plain
+    // node quoter, exactly as before.
+    let (ecfg, ewarn) = crate::engine::EngineConfig::from_env();
+    if let Some(w) = ewarn {
+        eprintln!("paper: {w}");
+    }
+    let quoter = crate::engine::EngineQuoter::new(ChainQuoter { rpc: Rpc::new(&cfg.http) }, &cfg.http, &ecfg, &cfg.out)?;
+    if ecfg.on {
+        eprintln!(
+            "paper: engine quotes ON (socket {}, timeout {} ms, at {}, check mode {}, feed forward {})",
+            ecfg.socket,
+            ecfg.timeout.as_millis(),
+            ecfg.at,
+            if ecfg.check { "ON: trades use the node's answer" } else { "off" },
+            if ecfg.forward { "on" } else { "off" }
+        );
+    }
     let mut taxcheck = crate::taxcheck::Checker::default();
     let agent = ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(10))).build().new_agent();
     let mut eth = eth_usd(&quoter).ok_or("could not price ETH in USDG (node or quoter unreachable)")?;
@@ -1384,6 +1416,9 @@ pub fn run(cfg: Config) -> Result<(), String> {
     }
     // Push mode: a websocket thread hands us each matching log as it happens.
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Feed forwarder for the engine (its own threads; never touches this loop).
+    let fwd = (ecfg.on && ecfg.forward).then(|| crate::engine::spawn_forwarder(&ecfg, stop.clone()));
+    let mut engine_meta_at = Instant::now();
     let log_rx = cfg.wss.clone().map(|url| {
         let (ltx, lrx) = std::sync::mpsc::channel::<Value>();
         let (stop2, tl, shown) = (stop.clone(), topic_list.clone(), crate::probe::redact(&url));
@@ -2078,6 +2113,15 @@ pub fn run(cfg: Config) -> Result<(), String> {
                 crate::sellcheck::NODE_CALLS.load(std::sync::atomic::Ordering::Relaxed),
                 if h > 0.0 { crate::sellcheck::NODE_CALLS.load(std::sync::atomic::Ordering::Relaxed) as f64 / h * 24.0 / 1000.0 } else { 0.0 }
             );
+            if quoter.engine_on() {
+                eprintln!("paper: {}{}", quoter.stats.summary(), fwd.as_ref().map(|f| format!(" | {}", f.summary())).unwrap_or_default());
+                // Counts for the report, every 10 minutes.
+                if engine_meta_at.elapsed() >= Duration::from_secs(600) {
+                    write(&mut f_meta, json!({"event": "engine", "wall_ms": SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0),
+                                              "quotes": quoter.stats.json(), "feed": fwd.as_ref().map(|f| f.json())}))?;
+                    engine_meta_at = Instant::now();
+                }
+            }
             if let Some(lt) = live.as_mut() {
                 // A live position whose paper twin is gone (its sell failed):
                 // keep trying an emergency sell every heartbeat.
@@ -2099,6 +2143,9 @@ pub fn run(cfg: Config) -> Result<(), String> {
     }
     let _ = v4keys.save_if_dirty(&keys_path);
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    if quoter.engine_on() {
+        write(&mut f_meta, json!({"event": "engine", "quotes": quoter.stats.json(), "feed": fwd.as_ref().map(|f| f.json())}))?;
+    }
     write(&mut f_meta, json!({"event": "stop", "trades": n_trades, "total_usd": total}))?;
     Ok(())
 }
@@ -2175,7 +2222,7 @@ pub fn report(dir: &std::path::Path) -> String {
         }
         sizes_txt += &format!("  AUTO (largest size with <=1.5% round-trip cost): ${auto_total:+.2} over {auto_n} trades (${:+.2}/h)\n", if hours > 0.0 { auto_total / hours } else { 0.0 });
     }
-    let race_txt = race_section(&all, start.and_then(|m| m["late_blocks"].as_u64()), hours) + &delay_section(&sig);
+    let race_txt = race_section(&all, start.and_then(|m| m["late_blocks"].as_u64()), hours) + &delay_section(&sig) + &crate::engine::report_section(dir, &meta);
     let venue_txt = venue_section(&all, &sig, start) + &hour_section(&rows) + &stop_study_section(&rows) + &flow_study_section(&rows);
     let mean = if n > 0 { total / n as f64 } else { 0.0 };
     let sd = if n > 1 { (nets.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n - 1) as f64).sqrt() } else { 0.0 };
