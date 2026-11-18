@@ -228,6 +228,23 @@ impl EngineClient {
 
     /// One eth_call on the engine. Never waits longer than the timeout.
     pub fn eth_call(&self, to: &str, data: &str) -> Result<EngineOk, String> {
+        let at = self.at;
+        let v = self.ask(&|id| call_msg(id, to, data, at))?;
+        parse_answer(&v)
+    }
+
+    /// Several eth_calls on ONE exact state `at` (sim/src/proto.rs `at`,
+    /// e.g. {"afterTx":"0x.."} or {"afterSeq":N}). Feed wake-up uses it to
+    /// read pool prices right before and right after one feed transaction.
+    /// Ok = each call's output (None = that call reverted) and the block.
+    pub fn call_at(&self, at: &Value, calls: &[(String, String)]) -> Result<(Vec<Option<String>>, Option<u64>), String> {
+        let list: Vec<Value> = calls.iter().map(|(to, data)| json!({"to": to, "data": data})).collect();
+        let v = self.ask(&|id| json!({"id": id, "type": "call", "at": at, "calls": list}))?;
+        parse_many(&v, calls.len())
+    }
+
+    /// Send one question built by `build(id)` and wait (bounded) for its answer.
+    fn ask(&self, build: &dyn Fn(u64) -> Value) -> Result<Value, String> {
         if self.now_ms() < self.down_until_ms.load(Ordering::Relaxed) {
             return Err("down".into());
         }
@@ -244,7 +261,7 @@ impl EngineClient {
             },
         };
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let body = serde_json::to_vec(&call_msg(id, to, data, self.at)).map_err(|_| "bad_request".to_string())?;
+        let body = serde_json::to_vec(&build(id)).map_err(|_| "bad_request".to_string())?;
         let _ = s.set_write_timeout(Some(self.timeout));
         if write_msg(&mut s, &body).is_err() {
             // A reused connection the engine closed (restart): drop it.
@@ -273,9 +290,24 @@ impl EngineClient {
                     p.push(s);
                 }
             }
-            return parse_answer(&v);
+            return Ok(v);
         }
     }
+}
+
+/// Read a multi-call answer: every call's output (None = reverted) and the
+/// block. Err = the engine was not sure (same reasons as `parse_answer`).
+pub fn parse_many(v: &Value, n: usize) -> Result<(Vec<Option<String>>, Option<u64>), String> {
+    if v["ok"] != json!(true) {
+        return Err(v["unknown"].as_str().unwrap_or("unknown").to_string());
+    }
+    let res = v["results"].as_array().ok_or("bad_answer")?;
+    if res.len() != n {
+        return Err("bad_answer".into());
+    }
+    let outs = res.iter().map(|r| if r["success"] == json!(true) { r["output"].as_str().map(str::to_string) } else { None }).collect();
+    let block = v["at"]["block"].as_str().and_then(|b| u64::from_str_radix(b.trim_start_matches("0x"), 16).ok());
+    Ok((outs, block))
 }
 
 // ---------------------------------------------------------------------------
@@ -533,12 +565,14 @@ pub struct FwdStats {
     pub engine_connects: AtomicU64,
     pub engine_up: AtomicBool,
     pub feed_up: AtomicBool,
+    /// Frame copies the feed wake-up tap could not take (its queue was full).
+    pub tap_dropped: AtomicU64,
 }
 
 impl FwdStats {
     pub fn json(&self) -> Value {
         let g = |a: &AtomicU64| a.load(Ordering::Relaxed);
-        json!({"received": g(&self.received), "sent": g(&self.sent), "dropped": g(&self.dropped), "engine_connects": g(&self.engine_connects),
+        json!({"received": g(&self.received), "sent": g(&self.sent), "dropped": g(&self.dropped), "engine_connects": g(&self.engine_connects), "tap_dropped": g(&self.tap_dropped),
                "engine_up": self.engine_up.load(Ordering::Relaxed), "feed_up": self.feed_up.load(Ordering::Relaxed)})
     }
     pub fn summary(&self) -> String {
@@ -606,7 +640,7 @@ pub fn send_frames(rx: Receiver<String>, socket: &str, st: &FwdStats, stop: &Ato
 /// Reader thread body: every text frame from the feed relay, untouched, to
 /// `offer`. Same reconnect / back-off rules as feed-watch (feedwatch.rs):
 /// any HTTP refusal waits 10 minutes (65 if 403) so we never hammer it.
-fn read_feed(url: &str, tx: &SyncSender<String>, st: &FwdStats, stop: &AtomicBool) {
+fn read_feed(url: &str, tx: Option<&SyncSender<String>>, tap: Option<&Tap>, st: &FwdStats, stop: &AtomicBool) {
     let mut backoff = Duration::from_secs(1);
     while !stop.load(Ordering::Relaxed) {
         match tungstenite::connect(url) {
@@ -619,7 +653,19 @@ fn read_feed(url: &str, tx: &SyncSender<String>, st: &FwdStats, stop: &AtomicBoo
                         return;
                     }
                     match ws.read() {
-                        Ok(tungstenite::Message::Text(s)) => offer(tx, s.to_string(), st),
+                        Ok(tungstenite::Message::Text(s)) => {
+                            let at = Instant::now();
+                            // Engine first (it must replay the frame before
+                            // feed wake-up can ask about it), then the tap.
+                            if let Some(tx) = tx {
+                                offer(tx, s.to_string(), st);
+                            }
+                            if let Some(t) = tap {
+                                if t.try_send((at, Arc::from(s.as_str()))).is_err() {
+                                    st.tap_dropped.fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+                        }
                         Ok(tungstenite::Message::Close(_)) => break,
                         Ok(_) => {}
                         Err(e) => {
@@ -649,16 +695,36 @@ fn read_feed(url: &str, tx: &SyncSender<String>, st: &FwdStats, stop: &AtomicBoo
 
 /// Start the forwarder (two background threads). Returns its counters.
 pub fn spawn_forwarder(cfg: &EngineConfig, stop: Arc<AtomicBool>) -> Arc<FwdStats> {
+    spawn_forwarder_tap(cfg, stop, None)
+}
+
+/// A copy of every feed frame for someone else (feed wake-up): when it
+/// arrived and the frame text. Never waits: if the tap's queue is full the
+/// copy is dropped and counted in `FwdStats::tap_dropped`.
+pub type Tap = SyncSender<(Instant, Arc<str>)>;
+
+/// `spawn_forwarder` plus an optional tap. The ONE feed connection serves
+/// both the engine and the tap (no second connection to the relay).
+pub fn spawn_forwarder_tap(cfg: &EngineConfig, stop: Arc<AtomicBool>, tap: Option<Tap>) -> Arc<FwdStats> {
     let st = Arc::new(FwdStats::default());
     let (tx, rx) = std::sync::mpsc::sync_channel::<String>(cfg.queue);
     {
         let (st, stop, url) = (st.clone(), stop.clone(), cfg.feed.clone());
-        std::thread::Builder::new().name("engine-feed-in".into()).spawn(move || read_feed(&url, &tx, &st, &stop)).expect("engine feed reader");
+        std::thread::Builder::new().name("engine-feed-in".into()).spawn(move || read_feed(&url, Some(&tx), tap.as_ref(), &st, &stop)).expect("engine feed reader");
     }
     {
         let (st, socket) = (st.clone(), cfg.socket.clone());
         std::thread::Builder::new().name("engine-feed-out".into()).spawn(move || send_frames(rx, &socket, &st, &stop)).expect("engine feed sender");
     }
+    st
+}
+
+/// Feed reader for the tap ONLY (SNIPER_ENGINE_FORWARD=0: someone else
+/// feeds the engine, but feed wake-up still needs the frames).
+pub fn spawn_tap_reader(url: &str, stop: Arc<AtomicBool>, tap: Tap) -> Arc<FwdStats> {
+    let st = Arc::new(FwdStats::default());
+    let (st2, url) = (st.clone(), url.to_string());
+    std::thread::Builder::new().name("feedwake-in".into()).spawn(move || read_feed(&url, None, Some(&tap), &st2, &stop)).expect("feed wake reader");
     st
 }
 

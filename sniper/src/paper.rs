@@ -296,6 +296,7 @@ impl Detector {
     /// tokens (see swap_buyer). Returns a rush if this swap completes one.
     pub fn on_swap(&mut self, pool: &str, block: u64, buyer: &str, price: f64, r: &Rules) -> Option<RushSig> {
         let st = self.pools.entry(pool.to_string()).or_default();
+        // (rest below; the rush test itself is shared with on_late_swap)
         if let Some(prev) = st.last_price {
             if price > prev {
                 st.buys.push_back((block, buyer.to_string(), prev));
@@ -320,12 +321,19 @@ impl Detector {
         while st.prices.len() > 2 && st.prices[1].0 < lo {
             st.prices.pop_front();
         }
-        if block < st.cooldown_until || st.buys.len() < r.buys {
+        Self::rush_test(st, pool, block, price, r)
+    }
+
+    /// Is there a rush now (at `block`, current price `price`)? Shared by
+    /// on_swap and on_late_swap so both use exactly the same rule.
+    fn rush_test(st: &mut PoolState, pool: &str, block: u64, price: f64, r: &Rules) -> Option<RushSig> {
+        let lo = block.saturating_sub(r.window_blocks - 1);
+        if block < st.cooldown_until || st.buys.iter().filter(|(b, _, _)| *b >= lo).count() < r.buys {
             return None;
         }
         // Count DIFFERENT buyer wallets, not buy events: one wallet splitting
         // its buy into many pieces is not a crowd.
-        let buyers: HashSet<&str> = st.buys.iter().map(|(_, w, _)| w.as_str()).collect();
+        let buyers: HashSet<&str> = st.buys.iter().filter(|(b, _, _)| *b >= lo).map(|(_, w, _)| w.as_str()).collect();
         if buyers.len() < r.buys {
             return None;
         }
@@ -335,10 +343,31 @@ impl Detector {
             return None;
         }
         st.cooldown_until = block + r.window_blocks;
-        let start_price = st.buys.front().map_or(p0, |(_, _, before)| *before);
+        let start_price = st.buys.iter().find(|(b, _, _)| *b >= lo).map_or(p0, |(_, _, before)| *before);
         let mut ids: Vec<String> = buyers.into_iter().map(str::to_string).collect();
         ids.sort();
         Some(RushSig { pool: pool.to_string(), block, price, start_price, buyers: ids })
+    }
+
+    /// Feed wake-up (feedwake.rs): a swap that arrives OUT OF ORDER, because
+    /// the other source already showed this pool's newer swaps (the feed
+    /// missed this one and polling found it later). Its buyer still counts
+    /// (in its own block), but the pool's price and price history stay as
+    /// they are (they already include this swap's effect). `is_buy` comes
+    /// from the swap's own amounts. Same rush rule as on_swap, tested at the
+    /// pool's newest block and price.
+    pub fn on_late_swap(&mut self, pool: &str, block: u64, buyer: &str, price: f64, is_buy: bool, r: &Rules) -> Option<RushSig> {
+        let st = self.pools.get_mut(pool)?;
+        let (newest, now) = (st.prices.back()?.0, st.last_price?);
+        if is_buy {
+            // Price just before it: the last recorded price of an earlier block.
+            let before = st.prices.iter().rev().find(|(b, _)| *b < block).map_or(price, |(_, p)| *p);
+            let at = st.buys.iter().position(|(b, _, _)| *b > block).unwrap_or(st.buys.len());
+            st.buys.insert(at, (block, buyer.to_string(), before));
+        }
+        let at = st.flow.iter().position(|(b, _)| *b > block).unwrap_or(st.flow.len());
+        st.flow.insert(at, (block, is_buy));
+        Self::rush_test(st, pool, newest, now, r)
     }
 
     /// Buys and sells in this pool from `from_block` on (order-flow study).
@@ -1416,8 +1445,61 @@ pub fn run(cfg: Config) -> Result<(), String> {
     }
     // Push mode: a websocket thread hands us each matching log as it happens.
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Speed step 3 (feedwake.rs): swaps found in the sequencer feed and
+    // confirmed on the engine wake this loop up. Off unless SNIPER_FEED_WAKE=1
+    // (and the engine is on); off = nothing below changes anything.
+    let (wcfg, wwarn) = crate::feedwake::WakeConfig::from_env(ecfg.on);
+    if let Some(w) = wwarn {
+        eprintln!("paper: {w}");
+    }
+    let wake = wcfg.on.then(|| crate::feedwake::Shared::new(stop.clone()));
+    let (tap_tx, tap_rx) = match &wake {
+        Some(_) => {
+            let (t, r) = std::sync::mpsc::sync_channel::<(Instant, std::sync::Arc<str>)>(256);
+            (Some(t), Some(r))
+        }
+        None => (None, None),
+    };
     // Feed forwarder for the engine (its own threads; never touches this loop).
-    let fwd = (ecfg.on && ecfg.forward).then(|| crate::engine::spawn_forwarder(&ecfg, stop.clone()));
+    // With feed wake-up its one feed connection also feeds the wake-up tap.
+    let fwd = (ecfg.on && ecfg.forward).then(|| crate::engine::spawn_forwarder_tap(&ecfg, stop.clone(), tap_tx.clone()));
+    let tap_stats = match (&tap_tx, ecfg.forward) {
+        (Some(t), false) => Some(crate::engine::spawn_tap_reader(&ecfg.feed, stop.clone(), t.clone())),
+        _ => None,
+    };
+    drop(tap_tx);
+    let wake_rx = match (&wake, tap_rx) {
+        (Some(sh), Some(rx)) => Some(crate::feedwake::spawn_worker(sh.clone(), &ecfg.socket, ecfg.timeout, wcfg.wait, rx)),
+        _ => None,
+    };
+    let mut f_wake = match &wake {
+        Some(_) => Some(open(crate::feedwake::FILE)?),
+        None => None,
+    };
+    if wake.is_some() {
+        eprintln!(
+            "paper: FEED WAKE-UP ON: swaps from the sequencer feed, confirmed on the engine | node poll {} while the feed is healthy, normal pace if no frame for {} s",
+            wcfg.poll_when_feed.map_or("at the normal pace".to_string(), |p| format!("every {} ms", p.as_millis())),
+            wcfg.stale.as_secs()
+        );
+        write(&mut f_meta, json!({"event": "feedwake", "poll_when_feed_ms": wcfg.poll_when_feed.map(|p| p.as_millis() as u64), "stale_s": wcfg.stale.as_secs(), "wait_ms": wcfg.wait.as_millis() as u64}))?;
+    }
+    let mut merge = crate::feedwake::Merge::default();
+    // Feed health as last reported (for "went stale" / "healthy again" lines).
+    let mut wake_healthy = false;
+    let mut wake_stats_at = Instant::now();
+    // When the node was last polled (feed wake-up decides when it is due).
+    let mut last_poll: Option<Instant> = None;
+    // Pools traded recently (watch list) and whether the list must be rebuilt.
+    let mut active: HashMap<String, Instant> = HashMap::new();
+    let mut watched: HashSet<String> = HashSet::new();
+    let mut watch_dirty = false;
+    let mut watch_at = Instant::now();
+    // Signers the feed recovered (V4 rushes count wallets without a node lookup).
+    let mut feed_signers: HashMap<String, String> = HashMap::new();
+    let mut feed_signer_order: VecDeque<String> = VecDeque::new();
+    // Newest block the feed showed (for "behind" on feed rushes).
+    let mut feed_head: Option<u64> = None;
     let mut engine_meta_at = Instant::now();
     let log_rx = cfg.wss.clone().map(|url| {
         let (ltx, lrx) = std::sync::mpsc::channel::<Value>();
@@ -1479,8 +1561,51 @@ pub fn run(cfg: Config) -> Result<(), String> {
     let mut late: Vec<LateTrade> = Vec::new();
 
     loop {
-        // Push mode waits on the stream (below); poll mode sleeps between asks.
-        if log_rx.is_none() {
+        // ---- feed wake-up: wait for a feed swap OR the next node poll ----
+        // Swap records from the feed (see feedwake.rs), handled before the
+        // polled ones in this round.
+        let mut feed_logs: Vec<Value> = Vec::new();
+        let mut poll_due = true;
+        if let (Some(sh), Some(rx)) = (&wake, &wake_rx) {
+            let healthy = sh.healthy(wcfg.stale);
+            if healthy != wake_healthy {
+                let ev = if healthy { "healthy" } else { "stale" };
+                eprintln!("paper: feed wake-up {}", if healthy { "HEALTHY: node polling slowed to backup pace" } else { "STALE (no feed frames or engine not answering): back to normal node polling" });
+                if let Some(f) = f_wake.as_mut() {
+                    write(f, json!({"ev": ev, "t": sh.now_ms(), "wall_ms": SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0), "worker": sh.json()}))?;
+                }
+                wake_healthy = healthy;
+            }
+            let pace = match wcfg.poll_when_feed {
+                Some(p) if healthy => p,
+                _ => poll_now(&cfg, SystemTime::now()),
+            };
+            let due_at = last_poll.map_or(Instant::now(), |t| t + pace);
+            let mut got: Vec<crate::feedwake::FeedSwap> = Vec::new();
+            if log_rx.is_none() {
+                // Sleep until the poll is due, unless a feed swap arrives first.
+                if let Ok(fs) = rx.recv_timeout(due_at.saturating_duration_since(Instant::now())) {
+                    got.push(fs);
+                }
+            }
+            got.extend(rx.try_iter());
+            for fs in &got {
+                feed_head = Some(feed_head.map_or(fs.block, |h| h.max(fs.block)));
+                if let Some(w) = &fs.signer {
+                    if feed_signers.insert(fs.tx.clone(), w.clone()).is_none() {
+                        feed_signer_order.push_back(fs.tx.clone());
+                        if feed_signer_order.len() > 20_000 {
+                            if let Some(old) = feed_signer_order.pop_front() {
+                                feed_signers.remove(&old);
+                            }
+                        }
+                    }
+                }
+                feed_logs.extend(crate::feedwake::synth_logs(fs));
+            }
+            poll_due = Instant::now() >= due_at;
+        } else if log_rx.is_none() {
+            // Push mode waits on the stream (below); poll mode sleeps between asks.
             std::thread::sleep(poll_now(&cfg, SystemTime::now()));
         }
         if cfg.duration.is_some_and(|d| started.elapsed() >= d) {
@@ -1522,23 +1647,30 @@ pub fn run(cfg: Config) -> Result<(), String> {
             if let Some(b) = logs.iter().map(|l| hex_u64(l.get("blockNumber"))).max() {
                 last_block = Some(last_block.map_or(b, |x| x.max(b)));
             }
-        } else {
+        } else if poll_due {
+            last_poll = Some(Instant::now());
             let head = match rpc.call("eth_blockNumber", json!([])) {
-                Ok(v) => hex_u64(Some(&v)),
+                Ok(v) => Some(hex_u64(Some(&v))),
                 Err(e) => {
                     errors += 1;
                     if errors % 20 == 1 {
                         eprintln!("paper: node error ({e})");
                     }
-                    continue;
+                    // Feed swaps in hand are still handled; otherwise as before.
+                    if feed_logs.is_empty() {
+                        continue;
+                    }
+                    None
                 }
             };
+            let head_ok = head.is_some();
+            let head = head.unwrap_or(0);
             let from = match last_block {
                 None => head,
                 Some(l) if head <= l => head + 1,
                 Some(l) => (l + 1).max(head.saturating_sub(50)),
             };
-            if from <= head {
+            if head_ok && from <= head {
                 let params = json!([{"fromBlock": format!("0x{from:x}"), "toBlock": format!("0x{head:x}"), "topics": [topic_list]}]);
                 let t_fetch = Instant::now();
                 let got = rpc.call("eth_getLogs", params);
@@ -1561,18 +1693,29 @@ pub fn run(cfg: Config) -> Result<(), String> {
         // the node reported is what "behind" is measured against.
         let t_logs = Instant::now();
         let head_seen = last_block;
-        let mut rushes: Vec<RushSig> = Vec::new();
+        // Feed wake-up: when the polled logs arrived, on its shared clock.
+        let poll_ms = wake.as_ref().map_or(0, |sh| sh.ms_of(t_logs));
+        // Each rush with where it came from: (source, ms it was first seen).
+        let mut rushes: Vec<(RushSig, (crate::feedwake::Src, u64))> = Vec::new();
         // Rushes on V4 pools whose key we don't know: counted, never traded.
         let mut unknown_rushes: Vec<RushSig> = Vec::new();
         {
             let mut logs = logs;
             logs.sort_by_key(|l| (hex_u64(l.get("blockNumber")), hex_u64(l.get("logIndex"))));
-            for log in &logs {
+            // Feed swaps first (they arrived first), in chain order.
+            feed_logs.sort_by_key(|l| (hex_u64(l.get("blockNumber")), hex_u64(l.get("transactionIndex")), hex_u64(l.get("logIndex"))));
+            for log in feed_logs.iter().chain(logs.iter()) {
                 // A log the node takes back (short re-org) is not a real swap.
                 if log["removed"].as_bool() == Some(true) {
                     continue;
                 }
                 let Some(kind) = log_kind(log, &topics) else { continue };
+                // Feed wake-up: which source this record is from, and when seen.
+                let (src, seen_ms) = match log["_src"].as_str() {
+                    Some("feed") => (crate::feedwake::Src::Feed, log["_seen_ms"].as_u64().unwrap_or(poll_ms)),
+                    _ => (crate::feedwake::Src::Poll, poll_ms),
+                };
+                let txh = log["transactionHash"].as_str().unwrap_or("").to_ascii_lowercase();
                 let addr = log["address"].as_str().map(str::to_ascii_lowercase).unwrap_or_default();
                 let w = words(log["data"].as_str().unwrap_or(""));
                 let block = hex_u64(log.get("blockNumber"));
@@ -1596,6 +1739,10 @@ pub fn run(cfg: Config) -> Result<(), String> {
                         continue;
                     }
                     LogKind::V2Sync => {
+                        // Feed wake-up: the other source already counted this swap.
+                        if wake.is_some() && merge.seen_by_other(src, &txh, &addr) {
+                            continue;
+                        }
                         // V2 reserves (each Swap comes right after its Sync).
                         if !matches!(pools.get(&addr), Some(None)) {
                             if let Some(r) = venue::v2_reserves(log["data"].as_str().unwrap_or("")) {
@@ -1610,6 +1757,17 @@ pub fn run(cfg: Config) -> Result<(), String> {
                     },
                     LogKind::V3Swap | LogKind::V2Swap => addr,
                 };
+                // Feed wake-up: count each swap once (tx + pool), whichever
+                // source showed it first; note swaps that arrive out of order.
+                let admit = if wake.is_some() {
+                    let txi = hex_u64(log.get("transactionIndex"));
+                    merge.admit(src, &txh, &pool, (block, txi), seen_ms, watched.contains(&pool))
+                } else {
+                    crate::feedwake::Admit::Fresh
+                };
+                if admit == crate::feedwake::Admit::Dup {
+                    continue;
+                }
                 if !pools.contains_key(&pool) {
                     match kind {
                         LogKind::V3Swap | LogKind::V2Swap => {
@@ -1678,8 +1836,46 @@ pub fn run(cfg: Config) -> Result<(), String> {
                     sells.record(&pool);
                 }
                 let buyer = if kind == LogKind::V4Swap { venue::swap_buyer_v4(log) } else { swap_buyer(log) };
-                if let Some(r) = det.on_swap(&pool, block, &buyer, price, &cfg.rules) {
-                    rushes.push(r);
+                let rush = if admit == crate::feedwake::Admit::Late {
+                    // Out of order (the other source already showed newer
+                    // swaps here): its buyer counts, the price stays.
+                    det.on_late_swap(&pool, block, &buyer, price, !sold, &cfg.rules)
+                } else {
+                    det.on_swap(&pool, block, &buyer, price, &cfg.rules)
+                };
+                if wake.is_some() {
+                    // Watch list: pools that traded recently.
+                    active.insert(pool.clone(), Instant::now());
+                    if !watched.contains(&pool) {
+                        watch_dirty = true;
+                    }
+                }
+                if let Some(r) = rush {
+                    if wake.is_some() {
+                        merge.note_rush(src, &txh, &pool, block, seen_ms);
+                    }
+                    rushes.push((r, (src, seen_ms)));
+                }
+            }
+        }
+
+        // ---- feed wake-up: watch list and lead-time lines ----
+        if let Some(sh) = &wake {
+            if watch_dirty || watch_at.elapsed() >= Duration::from_secs(60) {
+                active.retain(|_, t| t.elapsed() <= wcfg.active);
+                let list: Vec<crate::feedwake::WatchPool> = active.keys().filter_map(|k| pools.get(k).cloned().flatten().map(|p| watch_pool(k, &p))).collect();
+                watched = list.iter().map(|p| p.key.clone()).collect();
+                sh.set_watch(crate::feedwake::WatchIndex::build(list));
+                watch_dirty = false;
+                watch_at = Instant::now();
+            }
+            if let Some(f) = f_wake.as_mut() {
+                for ev in merge.events.drain(..) {
+                    write(f, ev)?;
+                }
+                if wake_stats_at.elapsed() >= Duration::from_secs(600) {
+                    write(f, json!({"ev": "stats", "t": sh.now_ms(), "merge": merge.json(), "worker": sh.json()}))?;
+                    wake_stats_at = Instant::now();
                 }
             }
         }
@@ -1844,7 +2040,7 @@ pub fn run(cfg: Config) -> Result<(), String> {
         }
 
         // ---- new rushes ----
-        for r in rushes {
+        for (r, (src, seen_ms)) in rushes {
             n_rush += 1;
             let Some(info) = pools.get(&r.pool).cloned().flatten() else { continue };
             // Skip-first-rush: count earlier rushes BEFORE remembering this one.
@@ -1858,7 +2054,11 @@ pub fn run(cfg: Config) -> Result<(), String> {
             tally.entry(vt).or_default().rushes += 1;
             // A skipped rush: one line in signals.jsonl with the reason.
             let skip = |f: &mut BufWriter<std::fs::File>, why: String| {
-                write(f, json!({"pool": r.pool, "token": info.token, "block": r.block, "taken": false, "venue": vt, "why": why}))
+                let mut line = json!({"pool": r.pool, "token": info.token, "block": r.block, "taken": false, "venue": vt, "why": why});
+                if wake.is_some() {
+                    line["src"] = json!(src.name());
+                }
+                write(f, line)
             };
             // V4 hook that can change swap amounts: our maths would be wrong.
             if let Venue::V4 { key } = &info.venue {
@@ -1957,7 +2157,15 @@ pub fn run(cfg: Config) -> Result<(), String> {
             // Buyers known only by transaction (V4): count the signing wallets.
             let hashes: Vec<String> = r.buyers.iter().filter(|b| venue::is_tx_hash(b)).cloned().collect();
             if !hashes.is_empty() {
-                let verdict = tx_signers(&cfg.http, &agent, &hashes).map(|m| venue::distinct_buyers(&r.buyers, &m));
+                // Signers the feed already recovered need no node lookup
+                // (empty without feed wake-up: every hash is looked up).
+                let known: HashMap<String, String> = hashes.iter().filter_map(|h| feed_signers.get(h).map(|w| (h.clone(), w.clone()))).collect();
+                let ask: Vec<String> = hashes.iter().filter(|h| !known.contains_key(*h)).cloned().collect();
+                let looked = if ask.is_empty() { Ok(HashMap::new()) } else { tx_signers(&cfg.http, &agent, &ask) };
+                let verdict = looked.map(|mut m| {
+                    m.extend(known);
+                    venue::distinct_buyers(&r.buyers, &m)
+                });
                 match verdict {
                     Ok(n) if n >= cfg.rules.buys => {}
                     Ok(n) => {
@@ -2044,7 +2252,10 @@ pub fn run(cfg: Config) -> Result<(), String> {
                     let check_ms = t_check.elapsed().as_secs_f64() * 1000.0;
                     // Buy is ready now: this is the moment a live order goes out.
                     let behind = head_seen.unwrap_or(r.block).saturating_sub(r.block);
-                    let delay = delay_json(behind, fetch_ms, t_logs.elapsed().as_secs_f64() * 1000.0, ladder_ms, check_ms);
+                    let mut delay = delay_json(behind, fetch_ms, t_logs.elapsed().as_secs_f64() * 1000.0, ladder_ms, check_ms);
+                    if let Some(sh) = &wake {
+                        tag_delay(&mut delay, src, sh.ms_of(t_logs).saturating_sub(seen_ms) as f64, sh.now_ms().saturating_sub(seen_ms) as f64, feed_head.unwrap_or(r.block).saturating_sub(r.block));
+                    }
                     eprintln!("paper: BUY  {} ${usd_in} [{vt}] ({}/{} rush at block {})", info.token, info.base, r.pool, r.block);
                     // Race check: price this exact buy again a few blocks from
                     // the newest block we have seen (when we really decided).
@@ -2074,7 +2285,11 @@ pub fn run(cfg: Config) -> Result<(), String> {
                     // Rug guard measurements (no rule yet, scored later against
                     // outcomes). Done AFTER the buy so they never slow it down.
                     let rug_meta = rug_measure(&rpc, &mut creators, &ages, &mut safety_cache, &r.pool, &info, r.block);
-                    write(&mut f_sig, json!({"pool": r.pool, "token": info.token, "block": r.block, "taken": true, "venue": vt, "usd_in": usd_in, "rug": rug_meta, "delay": delay}))?;
+                    let mut line = json!({"pool": r.pool, "token": info.token, "block": r.block, "taken": true, "venue": vt, "usd_in": usd_in, "rug": rug_meta, "delay": delay});
+                    if wake.is_some() {
+                        line["src"] = json!(src.name());
+                    }
+                    write(&mut f_sig, line)?;
                     positions.push(Position {
                         pool: r.pool.clone(),
                         info,
@@ -2113,6 +2328,17 @@ pub fn run(cfg: Config) -> Result<(), String> {
                 crate::sellcheck::NODE_CALLS.load(std::sync::atomic::Ordering::Relaxed),
                 if h > 0.0 { crate::sellcheck::NODE_CALLS.load(std::sync::atomic::Ordering::Relaxed) as f64 / h * 24.0 / 1000.0 } else { 0.0 }
             );
+            if let Some(sh) = &wake {
+                let m = &merge.stats;
+                eprintln!(
+                    "paper: {} | {} | polled swaps on watched pools {} (feed had {} first) | tap dropped {}",
+                    sh.summary(),
+                    if wake_healthy { "healthy" } else { "STALE" },
+                    m.polled_watched,
+                    m.polled_feed_first,
+                    fwd.as_ref().or(tap_stats.as_ref()).map_or(0, |f| f.tap_dropped.load(std::sync::atomic::Ordering::Relaxed))
+                );
+            }
             if quoter.engine_on() {
                 eprintln!("paper: {}{}", quoter.stats.summary(), fwd.as_ref().map(|f| format!(" | {}", f.summary())).unwrap_or_default());
                 // Counts for the report, every 10 minutes.
@@ -2146,8 +2372,43 @@ pub fn run(cfg: Config) -> Result<(), String> {
     if quoter.engine_on() {
         write(&mut f_meta, json!({"event": "engine", "quotes": quoter.stats.json(), "feed": fwd.as_ref().map(|f| f.json())}))?;
     }
+    if let (Some(sh), Some(f)) = (&wake, f_wake.as_mut()) {
+        for ev in merge.events.drain(..) {
+            write(f, ev)?;
+        }
+        write(f, json!({"ev": "stats", "t": sh.now_ms(), "merge": merge.json(), "worker": sh.json(), "final": true}))?;
+    }
     write(&mut f_meta, json!({"event": "stop", "trades": n_trades, "total_usd": total}))?;
     Ok(())
+}
+
+/// Feed wake-up: the watch-list entry for one of the trader's pools.
+pub fn watch_pool(key: &str, p: &Pool) -> crate::feedwake::WatchPool {
+    let kind = match p.venue {
+        Venue::V3 { .. } => crate::feedwake::Kind::V3,
+        Venue::V2 { .. } => crate::feedwake::Kind::V2,
+        Venue::V4 { .. } => crate::feedwake::Kind::V4,
+    };
+    crate::feedwake::WatchPool { key: key.to_ascii_lowercase(), kind, token: p.token.to_ascii_lowercase(), token_is0: p.token_is0 }
+}
+
+/// Feed wake-up: tag a buy's delay record with the rush's source.
+///   src            "feed" or "poll" (which source completed the rush)
+///   since_seen_ms  first sighting of the rush's last swap -> buy ready
+/// For a FEED rush "wait" is the time from the feed frame arriving to the
+/// swap being in our hands (engine confirm + queue), there is no node fetch,
+/// and "behind" counts blocks the feed was past the rush block; total =
+/// wait + work, comparable with a polled rush's total.
+pub fn tag_delay(delay: &mut Value, src: crate::feedwake::Src, wait_ms: f64, since_seen_ms: f64, feed_behind: u64) {
+    delay["src"] = json!(src.name());
+    delay["since_seen_ms"] = json!(since_seen_ms.round());
+    if src == crate::feedwake::Src::Feed {
+        let work = delay["work_ms"].as_f64().unwrap_or(0.0);
+        delay["behind_blocks"] = json!(feed_behind);
+        delay["wait_ms"] = json!(wait_ms.round());
+        delay["fetch_ms"] = json!(0.0);
+        delay["total_ms"] = json!((wait_ms + work).round());
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2222,7 +2483,7 @@ pub fn report(dir: &std::path::Path) -> String {
         }
         sizes_txt += &format!("  AUTO (largest size with <=1.5% round-trip cost): ${auto_total:+.2} over {auto_n} trades (${:+.2}/h)\n", if hours > 0.0 { auto_total / hours } else { 0.0 });
     }
-    let race_txt = race_section(&all, start.and_then(|m| m["late_blocks"].as_u64()), hours) + &delay_section(&sig) + &crate::engine::report_section(dir, &meta);
+    let race_txt = race_section(&all, start.and_then(|m| m["late_blocks"].as_u64()), hours) + &delay_section(&sig) + &crate::engine::report_section(dir, &meta) + &crate::feedwake::report_section(dir, &sig);
     let venue_txt = venue_section(&all, &sig, start) + &hour_section(&rows) + &stop_study_section(&rows) + &flow_study_section(&rows);
     let mean = if n > 0 { total / n as f64 } else { 0.0 };
     let sd = if n > 1 { (nets.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n - 1) as f64).sqrt() } else { 0.0 };
@@ -2584,6 +2845,46 @@ mod tests {
         assert_eq!(s.block, 12);
         // cooldown: no repeat right away
         assert!(d.on_swap("p", 13, "e", 104.0, &r).is_none());
+    }
+
+    #[test]
+    fn a_late_buyer_completes_a_rush_without_moving_the_price() {
+        // Feed showed b and d (newest price 103); polling later shows c,
+        // a buy in block 11 the feed missed: it completes the rush.
+        let mut d = Detector::default();
+        let r = rules();
+        assert!(d.on_swap("p", 1, "a", 100.0, &r).is_none());
+        assert!(d.on_swap("p", 10, "b", 101.0, &r).is_none());
+        assert!(d.on_swap("p", 12, "d", 103.0, &r).is_none(), "only 2 buyers so far");
+        let s = d.on_late_swap("p", 11, "c", 102.0, true, &r).expect("3rd buyer arrives late");
+        assert_eq!(s.block, 12, "tested at the newest block");
+        assert_eq!(s.price, 103.0, "price stays the newest one");
+        assert_eq!(s.buyers, vec!["b", "c", "d"]);
+        assert_eq!(d.last_price("p"), Some(103.0));
+        // a late SELL adds no buyer, and an unknown pool does nothing
+        let mut d2 = Detector::default();
+        d2.on_swap("q", 1, "a", 100.0, &r);
+        d2.on_swap("q", 10, "b", 101.0, &r);
+        d2.on_swap("q", 12, "d", 103.0, &r);
+        assert!(d2.on_late_swap("q", 11, "c", 99.0, false, &r).is_none());
+        assert_eq!(d2.flow("q", 0), (2, 1));
+        assert!(d2.on_late_swap("nope", 1, "x", 1.0, true, &r).is_none());
+    }
+
+    #[test]
+    fn feed_delay_tag() {
+        let mut d = delay_json(3, 30.0, 110.0, 50.0, 20.0);
+        tag_delay(&mut d, crate::feedwake::Src::Feed, 8.0, 125.0, 0);
+        assert_eq!(d["src"], "feed");
+        assert_eq!(d["total_ms"], 118.0, "frame -> in hand 8 ms + our work 110 ms");
+        assert_eq!(d["fetch_ms"], 0.0);
+        assert_eq!(d["behind_blocks"], 0);
+        let mut p = delay_json(3, 30.0, 110.0, 50.0, 20.0);
+        let before = p["total_ms"].clone();
+        tag_delay(&mut p, crate::feedwake::Src::Poll, 0.0, 115.0, 9);
+        assert_eq!(p["src"], "poll");
+        assert_eq!(p["total_ms"], before, "a polled rush keeps its numbers");
+        assert_eq!(p["since_seen_ms"], 115.0);
     }
 
     #[test]

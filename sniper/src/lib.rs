@@ -23,6 +23,7 @@ pub mod calibrate;
 pub mod curve;
 pub mod engine;
 pub mod feedtx;
+pub mod feedwake;
 pub mod feedwatch;
 pub mod fourmeme;
 pub mod live;

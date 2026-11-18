@@ -195,6 +195,43 @@ stays current. Details and all settings: `src/engine.rs`.
 - The status line every minute shows engine answers vs node fallbacks and
   the feed forwarder's sent / dropped frames.
 
+## Feed wake-up (speed step 3, off by default)
+
+With `SNIPER_FEED_WAKE=1` (needs `SNIPER_ENGINE=1` and the engine running)
+the paper trader learns about swaps from the sequencer feed instead of
+waiting for its next node poll. Details and settings: `src/feedwake.rs`.
+
+How it works, in short:
+- The pools the trader already follows (traded in the last 30 min) are on a
+  watch list. Every feed transaction whose call data mentions a watched
+  token or pool (any router, any byte position), or that calls a watched
+  pool directly, is a candidate.
+- For each candidate the engine is asked for the pool's price right before
+  and right after that transaction (its exact replayed copy). No change = no
+  swap, so failed / reverted transactions never count. A change = a swap:
+  direction from the price move, buyer = the wallet that signed it.
+- Confirmed swaps go through the SAME rush detector, filters and buy path as
+  polled swaps. Node polling keeps running as a backup
+  (`SNIPER_RHC_POLL_MS_WHEN_FEED`, default 2000 ms; 0 = normal pace). A swap
+  seen both ways counts once (tx hash + pool). No feed frame for
+  `SNIPER_FEED_STALE_SECS` (default 5), or the engine failing, = stale:
+  normal polling, logged.
+- `feedwake.jsonl` (run folder) records which source saw each rush first and
+  by how many ms, stale / healthy switches and counters. `paper-report` adds
+  a "feed wake-up" section: rushes first seen by feed vs poll, lead p50/p95,
+  coverage, engine confirms, stale fallbacks, rush -> buy ready by source.
+  Signals and delay records get `"src": "feed" | "poll"` (only when on).
+
+Known gaps: a swap whose call data names neither the token nor the pool is
+missed by the feed (polling still finds it later; it then counts as a late
+buyer without moving the price). Several swaps of one transaction in one
+pool are one net move. Blocks the engine could not replay itself are missed.
+V3/V2 buyers are counted by signer on the feed path and by recipient on the
+poll path (the same wallet in most trades, not always).
+
+Side-by-side paper test on the server: see the "FEED WAKE-UP" notes at the
+top of `deploy/sniper-engine.sh`.
+
 ## Tests
 
 ```bash
@@ -224,6 +261,23 @@ binary, so plain `cargo test` skips it:
 (cd sim && cargo build --release --bin arbsim)
 (cd sniper && cargo test --test engine_e2e -- --ignored --nocapture)
 ```
+
+Feed wake-up: `src/feedwake.rs` and `src/feedtx.rs` tests cover candidate
+finding (ABI words, packed V3 paths, direct pool calls, V4 by token), price
+reads, swap direction (failed tx = no change, V2 liquidity moves ignored),
+signer recovery (real signatures and the EIP-155 example), dedupe, lead
+times, health / stale, and the report section. Two end-to-end tests use the
+real arbsim (same build step, `tests/common/` holds the fakes):
+
+```bash
+(cd sniper && cargo test --test feedwake_e2e --test feedwake_paper_e2e -- --ignored --nocapture)
+```
+
+`feedwake_e2e` sends real signed transactions (3 buys + 1 failed) through a
+fake feed into the engine and checks the confirmed swaps reach the rush
+detector. `feedwake_paper_e2e` runs the real paper trader: a rush found in
+the feed is bought (paper) tagged `src: feed`, the node's later copies are
+counted once, a feed outage switches back to normal polling.
 
 ## Server auto-run (no terminal needed)
 

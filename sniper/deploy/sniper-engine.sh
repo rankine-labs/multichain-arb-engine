@@ -34,6 +34,30 @@
 #   SNIPER_ENGINE_CHECK=1    first run: side-by-side, trades use the node
 # and read the "engine quotes" section of `./sniper paper-report <dir>`.
 #
+# FEED WAKE-UP (speed step 3, src/feedwake.rs), side-by-side paper test.
+# Needs this engine running (start it first). Add to deploy/run.env, on the
+# sniper/** branch that builds the server, ONLY with the owner's go-ahead:
+#   SNIPER_OUT=paper-out/run12          new folder: clean feed-vs-poll numbers
+#   SNIPER_ENGINE=1
+#   SNIPER_ENGINE_CHECK=1               trades keep using the node's quotes
+#   SNIPER_FEED_WAKE=1
+#   SNIPER_RHC_POLL_MS_WHEN_FEED=0      first run: node polled at today's pace
+#                                       (1 s day / 0.4 s night), so "feed vs
+#                                       poll" leads compare with what we have
+#   SNIPER_FEED_STALE_SECS=5
+# SNIPER_RHC_FEED (already set) is the feed the forwarder reads; the
+# wake-up uses that same one connection (no extra connection to the relay).
+# Read: `./sniper paper-report paper-out/run12`, section "feed wake-up".
+# Node requests: the first run (pace 0) is about the same as today (~300k a
+# day), minus the V4 signer lookups the feed now answers. Once the numbers
+# look right, SNIPER_RHC_POLL_MS_WHEN_FEED=2000 cuts the polling part (about
+# 2 requests per poll) to ~86k a day while the feed is healthy; it goes back
+# to normal pace by itself when the feed is stale. The engine reads each
+# watched pool's price once from a node, then follows it from the feed
+# (inside its own budget, ENGINE_DAILY_CAP). Estimates, not measured.
+# Off again: remove SNIPER_FEED_WAKE (the trader then behaves exactly as
+# before).
+#
 # Settings (optional, environment of this script):
 #   ARB_DIR           dex bot folder (default: folder of ARB_ENV in
 #                     ~/.sniper-cron.conf)
