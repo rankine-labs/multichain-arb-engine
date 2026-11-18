@@ -139,6 +139,12 @@ if engine_alive; then
   GOUT="$(ENGINE_DIR="$ENGINE_DIR" bash deploy/sniper-engine.sh guard 2>&1 9>&- | redact | tail -1 | sed -E 's/^\[[^]]*\] sniper-engine: //')"
   [ -n "$GOUT" ] && log "engine $GOUT"
 fi
+# Kill switch: SNIPER_ENABLED=0 also stops the sniper's own engine (never
+# the dex bot's). It comes back by itself when the switch is turned back on.
+if [ "$ENABLED" != "1" ] && engine_alive; then
+  ENGINE_DIR="$ENGINE_DIR" bash deploy/sniper-engine.sh stop >/dev/null 2>&1 9>&-
+  log "engine stopped (kill switch: SNIPER_ENABLED=$ENABLED)"
+fi
 if [ "$(kv "$RUN" SNIPER_ENGINE)" = "1" ] && [ "$ENABLED" = "1" ] && [ "$PAPER_HERE" = 1 ]; then
   # Same socket the paper bot will use (SNIPER_ENGINE_SOCKET, else its default).
   ESOCK="$(kv "$RUN" SNIPER_ENGINE_SOCKET)"; ESOCK="${ESOCK:-/tmp/sniper-arbsim.sock}"
