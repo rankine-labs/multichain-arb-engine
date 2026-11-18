@@ -1,3 +1,6 @@
+// Linux only: needs Unix sockets / bash (the server is Linux; the Windows
+// desktop copy never runs the engine).
+#![cfg(unix)]
 // ============================================================================
 // END-TO-END: the sniper's engine quoter against a REAL `arbsim serve`.
 //

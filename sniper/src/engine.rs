@@ -834,7 +834,8 @@ pub fn report_section(dir: &Path, meta: &[Value]) -> String {
     t
 }
 
-#[cfg(test)]
+// Tests use Unix sockets: Linux only.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::os::unix::net::UnixListener;

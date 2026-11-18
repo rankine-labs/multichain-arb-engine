@@ -942,7 +942,8 @@ pub fn report_section(dir: &Path, sig: &[Value]) -> String {
     t
 }
 
-#[cfg(test)]
+// Tests use Unix sockets: Linux only.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 

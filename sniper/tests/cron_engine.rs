@@ -1,3 +1,6 @@
+// Linux only: needs Unix sockets / bash (the server is Linux; the Windows
+// desktop copy never runs the engine).
+#![cfg(unix)]
 // ============================================================================
 // Runs tests/cron_engine_test.sh (the cron script's engine auto-start,
 // against fake binaries in a temp folder) as part of `cargo test`.

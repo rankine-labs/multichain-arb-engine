@@ -1,3 +1,6 @@
+// Linux only: needs Unix sockets / bash (the server is Linux; the Windows
+// desktop copy never runs the engine).
+#![cfg(unix)]
 // ============================================================================
 // Runs tests/engine_guard_test.sh (the engine's memory guard in the cron and
 // the `trial` command, against fake binaries in a temp folder, with the
