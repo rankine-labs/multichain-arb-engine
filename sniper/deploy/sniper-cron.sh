@@ -112,6 +112,8 @@ WANT="$(sha256sum sniper | cut -c1-16):$(sha256sum "$RUN" | cut -c1-16)"
 #     trying again, so a broken setup can't fill the log every 2 minutes.
 #   - Never touches the dex bot's engine, socket (/tmp/arbsim.sock) or pm2.
 #   - Logs one line per (re)start. Node links never reach the log.
+#   - Memory guard first (see just below): an engine over its memory limit
+#     is stopped, and its restart waits out a growing backoff.
 # SNIPER_ENGINE unset (or not 1): nothing here runs at all.
 ENGINE_DIR="${ENGINE_DIR:-$HOME/sniper-engine}"
 ENGINE_GRACE_S="${ENGINE_GRACE_S:-180}"
@@ -129,6 +131,14 @@ engine_socket_ok() {
   [ -S "$1" ] && python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX); s.settimeout(2); s.connect(sys.argv[1])' "$1" 2>/dev/null
 }
 case " $MODES " in *" paper "*) PAPER_HERE=1;; *) PAPER_HERE=0;; esac
+# MEMORY GUARD (always, whatever run.env says, also for an engine kept
+# after a trial): over ENGINE_MEM_LIMIT_MB (default 1500 MB) the engine is
+# stopped and logged; restarts below then follow the backoff in
+# deploy/sniper-engine.sh (first one at once, then 120 s, 240 s ... 30 min).
+if engine_alive; then
+  GOUT="$(ENGINE_DIR="$ENGINE_DIR" bash deploy/sniper-engine.sh guard 2>&1 9>&- | redact | tail -1 | sed -E 's/^\[[^]]*\] sniper-engine: //')"
+  [ -n "$GOUT" ] && log "engine $GOUT"
+fi
 if [ "$(kv "$RUN" SNIPER_ENGINE)" = "1" ] && [ "$ENABLED" = "1" ] && [ "$PAPER_HERE" = 1 ]; then
   # Same socket the paper bot will use (SNIPER_ENGINE_SOCKET, else its default).
   ESOCK="$(kv "$RUN" SNIPER_ENGINE_SOCKET)"; ESOCK="${ESOCK:-/tmp/sniper-arbsim.sock}"
@@ -156,7 +166,16 @@ if [ "$(kv "$RUN" SNIPER_ENGINE)" = "1" ] && [ "$ENABLED" = "1" ] && [ "$PAPER_H
       EOUT="$(ENGINE_SOCKET="$ESOCK" ENGINE_DIR="$ENGINE_DIR" bash deploy/sniper-engine.sh start 2>&1 9>&- | redact | tail -1 | sed -E 's/^\[[^]]*\] sniper-engine: //')"
       if engine_alive; then
         set_kv "$STATE" ENGINE_FAILED_AT ""
+        set_kv "$STATE" ENGINE_BACKOFF_SAID ""
         log "engine (re)started [$WHY]: $EOUT"
+      elif echo "$EOUT" | grep -q "memory backoff"; then
+        # Waiting out the memory backoff on purpose: not a failure. Said
+        # once per backoff period (not every 2 minutes).
+        NEXT_AT="$(kv "$ENGINE_DIR/memguard.state" NEXT_START_AT)"
+        if [ "$(kv "$STATE" ENGINE_BACKOFF_SAID)" != "$NEXT_AT" ]; then
+          set_kv "$STATE" ENGINE_BACKOFF_SAID "$NEXT_AT"
+          log "engine not started [$WHY]: $EOUT (paper bot uses the node meanwhile)"
+        fi
       else
         set_kv "$STATE" ENGINE_FAILED_AT "$(date +%s)"
         log "engine start FAILED [$WHY]: $EOUT (next try in ${ENGINE_RETRY_S}s; paper bot falls back to the node)"

@@ -57,7 +57,9 @@ pub struct Sub {
 /// BSC produces a block every ~0.45 s, so 20 s of silence is never normal.
 const IDLE_LIMIT: Duration = Duration::from_secs(20);
 
-fn set_timeout(ws: &mut WebSocket<MaybeTlsStream<TcpStream>>, d: Duration) {
+/// Read timeout + no-delay on the socket under a websocket (also used by
+/// wshot.rs).
+pub fn set_timeout(ws: &mut WebSocket<MaybeTlsStream<TcpStream>>, d: Duration) {
     let r = match ws.get_mut() {
         MaybeTlsStream::Plain(s) => s.set_read_timeout(Some(d)),
         MaybeTlsStream::Rustls(s) => s.get_ref().set_read_timeout(Some(d)),

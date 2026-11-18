@@ -421,6 +421,8 @@ pub fn synth_logs(s: &FeedSwap) -> Vec<Value> {
 pub enum Src {
     Feed,
     Poll,
+    /// Hot-pool WebSocket push (wshot.rs): real node logs, pushed.
+    Ws,
 }
 
 impl Src {
@@ -428,6 +430,7 @@ impl Src {
         match self {
             Src::Feed => "feed",
             Src::Poll => "poll",
+            Src::Ws => "ws",
         }
     }
 }
@@ -471,6 +474,13 @@ pub struct MergeStats {
     pub feed_swaps: u64,
     /// Records handled as late (out of order) buyers.
     pub late: u64,
+    /// Hot-pool WebSocket (wshot.rs): swaps it pushed (first sightings of
+    /// their own), polled swaps on pools it was subscribed to, of which it
+    /// had pushed first, and swaps it pushed only after polling had them.
+    pub ws_swaps: u64,
+    pub polled_ws_subscribed: u64,
+    pub polled_ws_first: u64,
+    pub ws_after_poll: u64,
 }
 
 /// Dedupe + timing between feed and poll (one per trader run).
@@ -483,6 +493,11 @@ pub struct Merge {
     rushes: HashMap<(String, String), PendingRush>,
     /// Swap-level leads (ms the feed was ahead of polling; negative = behind).
     leads: VecDeque<f64>,
+    /// Same for the hot-pool WebSocket against polling.
+    ws_leads: VecDeque<f64>,
+    /// Pools (V3/V2 address or V4 id) the hot-pool WebSocket is subscribed
+    /// to right now (set by the trader; empty when it is off).
+    pub ws_subscribed: HashSet<String>,
     pub stats: MergeStats,
     /// Lines for feedwake.jsonl (rush leads), drained by the trader.
     pub events: Vec<Value>,
@@ -500,30 +515,56 @@ impl Merge {
             // one pool): handled as usual, counted once.
             return Admit::Fresh;
         }
-        if src == Src::Poll {
-            self.stats.polled_all += 1;
-            if watched {
-                self.stats.polled_watched += 1;
+        let ws_sub = src == Src::Poll && self.ws_subscribed.contains(&key.1);
+        match src {
+            Src::Poll => {
+                self.stats.polled_all += 1;
+                if watched {
+                    self.stats.polled_watched += 1;
+                }
+                if ws_sub {
+                    self.stats.polled_ws_subscribed += 1;
+                }
             }
-        } else {
-            self.stats.feed_swaps += 1;
+            Src::Feed => self.stats.feed_swaps += 1,
+            Src::Ws => {}
         }
         if let Some(s) = self.seen.get(&key) {
             let first = s.src;
             let lead = t as f64 - s.t as f64;
-            if src == Src::Poll {
-                if watched {
-                    self.stats.polled_feed_first += 1;
+            match (first, src) {
+                // Feed vs poll: exactly as before the WebSocket existed.
+                (Src::Feed, Src::Poll) => {
+                    if watched {
+                        self.stats.polled_feed_first += 1;
+                    }
+                    self.push_lead(lead);
                 }
-                self.push_lead(lead);
-            } else {
-                self.stats.feed_after_poll += 1;
-                self.push_lead(-lead);
+                (Src::Poll, Src::Feed) => {
+                    self.stats.feed_after_poll += 1;
+                    self.push_lead(-lead);
+                }
+                // WebSocket vs poll: its own counters.
+                (Src::Ws, Src::Poll) => {
+                    if ws_sub {
+                        self.stats.polled_ws_first += 1;
+                    }
+                    push_capped(&mut self.ws_leads, lead);
+                }
+                (Src::Poll, Src::Ws) => {
+                    self.stats.ws_after_poll += 1;
+                    push_capped(&mut self.ws_leads, -lead);
+                }
+                // Feed vs WebSocket: only deduped.
+                _ => {}
             }
             if let Some(r) = self.rushes.remove(&key) {
-                self.events.push(json!({"ev": "rush_lead", "pool": r.pool, "block": r.block, "first": first.name(), "lead_ms": lead.round(), "t": r.t}));
+                self.events.push(json!({"ev": "rush_lead", "pool": r.pool, "block": r.block, "first": first.name(), "other": src.name(), "lead_ms": lead.round(), "t": r.t}));
             }
             return Admit::Dup;
+        }
+        if src == Src::Ws {
+            self.stats.ws_swaps += 1;
         }
         self.seen.insert(key.clone(), Sighting { src, t });
         self.order.push_back((t, key));
@@ -549,10 +590,12 @@ impl Merge {
     }
 
     fn push_lead(&mut self, ms: f64) {
-        if self.leads.len() >= 20_000 {
-            self.leads.pop_front();
-        }
-        self.leads.push_back(ms);
+        push_capped(&mut self.leads, ms);
+    }
+
+    /// Hot-pool WebSocket leads over polling (ms; negative = it was later).
+    pub fn ws_leads(&self) -> Vec<f64> {
+        self.ws_leads.iter().copied().collect()
     }
 
     fn expire(&mut self, t: u64) {
@@ -576,8 +619,18 @@ impl Merge {
         let s = &self.stats;
         json!({"polled_watched": s.polled_watched, "polled_feed_first": s.polled_feed_first, "feed_after_poll": s.feed_after_poll,
                "polled_all": s.polled_all, "feed_swaps": s.feed_swaps, "late": s.late,
-               "swap_lead_ms_p50": crate::paper::pct(&l, 50.0), "swap_lead_ms_p95": crate::paper::pct(&l, 95.0), "swap_leads": l.len()})
+               "swap_lead_ms_p50": crate::paper::pct(&l, 50.0), "swap_lead_ms_p95": crate::paper::pct(&l, 95.0), "swap_leads": l.len(),
+               "ws_swaps": s.ws_swaps, "polled_ws_subscribed": s.polled_ws_subscribed, "polled_ws_first": s.polled_ws_first, "ws_after_poll": s.ws_after_poll,
+               "ws_lead_ms_p50": crate::paper::pct(&self.ws_leads(), 50.0), "ws_lead_ms_p95": crate::paper::pct(&self.ws_leads(), 95.0), "ws_leads": self.ws_leads.len()})
     }
+}
+
+/// Keep at most 20,000 lead samples (oldest dropped first).
+fn push_capped(v: &mut VecDeque<f64>, ms: f64) {
+    if v.len() >= 20_000 {
+        v.pop_front();
+    }
+    v.push_back(ms);
 }
 
 // ---------------------------------------------------------------------------
@@ -825,7 +878,10 @@ pub fn report_section(dir: &Path, sig: &[Value]) -> String {
     }
     let p = |v: &[f64], q: f64| crate::paper::pct(v, q).map_or("-".to_string(), |x| format!("{x:.0}"));
     let mut t = String::from("feed wake-up (speed step 3):\n");
-    let leads: Vec<&Value> = lines.iter().filter(|l| l["ev"] == "rush_lead").collect();
+    // Only feed-vs-poll rush leads here (the hot-pool WebSocket has its own
+    // section; lines from before it existed have no "other").
+    let fp = |v: &Value| v.as_str().is_none_or(|x| x == "feed" || x == "poll" || x == "never");
+    let leads: Vec<&Value> = lines.iter().filter(|l| l["ev"] == "rush_lead" && fp(&l["first"]) && fp(&l["other"])).collect();
     let by = |src: &str| leads.iter().filter(|l| l["first"] == src).count();
     let (feed_first, poll_first) = (by("feed"), by("poll"));
     let feed_leads: Vec<f64> = leads.iter().filter(|l| l["first"] == "feed").filter_map(|l| l["lead_ms"].as_f64()).collect();

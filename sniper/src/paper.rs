@@ -1635,6 +1635,52 @@ pub fn run(cfg: Config) -> Result<(), String> {
         eprintln!("paper: swaps pushed from {shown}");
         lrx
     });
+    // HOT-POOL WEBSOCKET (wshot.rs): pushed swaps for the few hot pools,
+    // off unless SNIPER_WS_HOT=1; plus its free cost estimate (default on).
+    // Not with SNIPER_PUSH (that already pushes every swap on the chain).
+    let (hcfg, hwarn) = crate::wshot::WsHotCfg::from_env();
+    if let Some(w) = hwarn {
+        eprintln!("paper: {w}");
+    }
+    let ws_topics = crate::wshot::Topics::from_paper(&topics);
+    let hot_on = hcfg.needs_hot_set() && log_rx.is_none();
+    // One clock for every source's "seen at" times (the feed wake-up's when on).
+    let clock0 = wake.as_ref().map_or_else(Instant::now, |sh| sh.born);
+    let ms_of = |t: Instant| t.saturating_duration_since(clock0).as_millis() as u64;
+    let ws_sh = (hcfg.on && log_rx.is_none()).then(|| crate::wshot::Shared::new(stop.clone(), clock0));
+    let ws_rx = ws_sh.as_ref().map(|sh| crate::wshot::spawn(std::env::var("SNIPER_RHC_WSS").unwrap_or_default(), cfg.http.clone(), hcfg.clone(), ws_topics.clone(), sh.clone()));
+    // Swap dedupe and source timing (feedwake.rs Merge) for any push source.
+    let merging = wake.is_some() || ws_sh.is_some();
+    let mut f_ws = if hot_on { Some(open(crate::wshot::FILE)?) } else { None };
+    let hot_rules = crate::wshot::HotRules {
+        window_ms: hcfg.active.as_millis() as u64,
+        min_age_s: cfg.min_pool_age_s,
+        young_min_age_s: cfg.young.on.then_some(cfg.young.min_age_s),
+        max_pools: hcfg.max_pools,
+        max_v4: hcfg.max_v4,
+    };
+    let mut hot = crate::wshot::HotSet::default();
+    let mut hot_act = crate::wshot::Activity::default();
+    let mut hot_at: Option<Instant> = None;
+    let mut hot_dirty = false;
+    let mut est = crate::wshot::Estimator::default();
+    let mut est_recent: Option<f64> = None;
+    let mut ws_healthy = false;
+    let mut ws_head: Option<u64> = None;
+    let mut ws_stats_at = Instant::now();
+    if hot_on {
+        write(&mut f_meta, json!({"event": "wshot", "on": ws_sh.is_some(), "estimate": hcfg.estimate, "max_pools": hcfg.max_pools, "max_v4": hcfg.max_v4,
+                                  "active_min": hcfg.active.as_secs() / 60, "renew_s": hcfg.renew_min.as_secs(), "stale_s": hcfg.stale.as_secs(),
+                                  "poll_when_ws_ms": hcfg.poll_when_ws.map(|p| p.as_millis() as u64), "budget_day": hcfg.budget_day}))?;
+        eprintln!(
+            "paper: hot-pool WebSocket {} | free estimate {} | hot set: up to {} pools + {} V4 ids traded in the last {} min that pass the cheap filters",
+            if ws_sh.is_some() { "ON (pushed swaps for hot pools; polling stays on as backup)" } else { "off" },
+            if hcfg.estimate { "on" } else { "off" },
+            hcfg.max_pools,
+            hcfg.max_v4,
+            hcfg.active.as_secs() / 60
+        );
+    }
     // Old V4 pools: background history lookups (off with SNIPER_V4_LOOKUP=off).
     let lookup = (cfg.venues.contains(&VenueKind::V4) && cfg.v4_lookup).then(|| spawn_v4_lookup(cfg.http.clone()));
     let mut v4_asked: HashSet<String> = HashSet::new();
@@ -1680,7 +1726,28 @@ pub fn run(cfg: Config) -> Result<(), String> {
         // Swap records from the feed (see feedwake.rs), handled before the
         // polled ones in this round.
         let mut feed_logs: Vec<Value> = Vec::new();
+        // Pushed logs from the hot-pool WebSocket (wshot.rs), this round.
+        let mut ws_logs: Vec<Value> = Vec::new();
         let mut poll_due = true;
+        let ws_ok = ws_sh.as_ref().is_some_and(|w| w.healthy(hcfg.stale));
+        if let Some(w) = &ws_sh {
+            if ws_ok != ws_healthy {
+                eprintln!(
+                    "paper: hot-pool WebSocket {}",
+                    if ws_ok { "HEALTHY (subscribed, messages arriving)" } else { "NOT healthy (not subscribed or quiet): normal node polling" }
+                );
+                if let Some(f) = f_ws.as_mut() {
+                    write(f, json!({"ev": if ws_ok { "healthy" } else { "stale" }, "t": w.now_ms(), "wall_ms": SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0), "ws": w.json()}))?;
+                }
+                ws_healthy = ws_ok;
+            }
+        }
+        // A healthy WebSocket may slow polling (SNIPER_RHC_POLL_MS_WHEN_WS;
+        // default: no, normal pace). Never faster than the pace given.
+        let ws_pace = |p: Duration| match hcfg.poll_when_ws {
+            Some(x) if ws_ok => p.max(x),
+            _ => p,
+        };
         if let (Some(sh), Some(rx)) = (&wake, &wake_rx) {
             let healthy = sh.healthy(wcfg.stale);
             if healthy != wake_healthy {
@@ -1691,16 +1758,32 @@ pub fn run(cfg: Config) -> Result<(), String> {
                 }
                 wake_healthy = healthy;
             }
-            let pace = match wcfg.poll_when_feed {
+            let pace = ws_pace(match wcfg.poll_when_feed {
                 Some(p) if healthy => p,
                 _ => poll_now(&cfg, SystemTime::now()),
-            };
+            });
             let due_at = last_poll.map_or(Instant::now(), |t| t + pace);
             let mut got: Vec<crate::feedwake::FeedSwap> = Vec::new();
             if log_rx.is_none() {
-                // Sleep until the poll is due, unless a feed swap arrives first.
-                if let Ok(fs) = rx.recv_timeout(due_at.saturating_duration_since(Instant::now())) {
-                    got.push(fs);
+                match &ws_rx {
+                    // Sleep until the poll is due, unless a feed swap arrives first.
+                    None => {
+                        if let Ok(fs) = rx.recv_timeout(due_at.saturating_duration_since(Instant::now())) {
+                            got.push(fs);
+                        }
+                    }
+                    // Both push sources: wait in short slices for either.
+                    Some(wrx) => loop {
+                        let left = due_at.saturating_duration_since(Instant::now());
+                        if let Ok(fs) = rx.recv_timeout(left.min(Duration::from_millis(20))) {
+                            got.push(fs);
+                            break;
+                        }
+                        ws_logs.extend(wrx.try_iter());
+                        if !ws_logs.is_empty() || Instant::now() >= due_at {
+                            break;
+                        }
+                    },
                 }
             }
             got.extend(rx.try_iter());
@@ -1719,9 +1802,23 @@ pub fn run(cfg: Config) -> Result<(), String> {
                 feed_logs.extend(crate::feedwake::synth_logs(fs));
             }
             poll_due = Instant::now() >= due_at;
+        } else if let (Some(wrx), true) = (&ws_rx, log_rx.is_none()) {
+            // Hot-pool WebSocket only: sleep until the poll is due, unless a
+            // pushed log arrives first.
+            let due_at = last_poll.map_or(Instant::now(), |t| t + ws_pace(poll_now(&cfg, SystemTime::now())));
+            if let Ok(v) = wrx.recv_timeout(due_at.saturating_duration_since(Instant::now())) {
+                ws_logs.push(v);
+            }
+            poll_due = Instant::now() >= due_at;
         } else if log_rx.is_none() {
             // Push mode waits on the stream (below); poll mode sleeps between asks.
             std::thread::sleep(poll_now(&cfg, SystemTime::now()));
+        }
+        if let Some(wrx) = &ws_rx {
+            ws_logs.extend(wrx.try_iter());
+            if let Some(b) = ws_logs.iter().map(|l| hex_u64(l.get("blockNumber"))).max() {
+                ws_head = Some(ws_head.map_or(b, |h| h.max(b)));
+            }
         }
         if cfg.duration.is_some_and(|d| started.elapsed() >= d) {
             break;
@@ -1771,8 +1868,8 @@ pub fn run(cfg: Config) -> Result<(), String> {
                     if errors % 20 == 1 {
                         eprintln!("paper: node error ({e})");
                     }
-                    // Feed swaps in hand are still handled; otherwise as before.
-                    if feed_logs.is_empty() {
+                    // Pushed swaps in hand are still handled; otherwise as before.
+                    if feed_logs.is_empty() && ws_logs.is_empty() {
                         continue;
                     }
                     None
@@ -1794,6 +1891,14 @@ pub fn run(cfg: Config) -> Result<(), String> {
                     Ok(v) => {
                         last_block = Some(head);
                         logs = v.as_array().cloned().unwrap_or_default();
+                        // Free estimate: what the hot set's subscription would push.
+                        if hot_on && hcfg.estimate {
+                            est.count(&logs, &hot, &ws_topics);
+                        }
+                        // Where a WebSocket fill-in would start.
+                        if let Some(w) = &ws_sh {
+                            w.head_hint.store(head, std::sync::atomic::Ordering::Relaxed);
+                        }
                     }
                     Err(e) => {
                         errors += 1;
@@ -1809,7 +1914,7 @@ pub fn run(cfg: Config) -> Result<(), String> {
         let t_logs = Instant::now();
         let head_seen = last_block;
         // Feed wake-up: when the polled logs arrived, on its shared clock.
-        let poll_ms = wake.as_ref().map_or(0, |sh| sh.ms_of(t_logs));
+        let poll_ms = if merging { ms_of(t_logs) } else { 0 };
         // Each rush with where it came from: (source, ms it was first seen).
         let mut rushes: Vec<(RushSig, (crate::feedwake::Src, u64))> = Vec::new();
         // Rushes on V4 pools whose key we don't know: counted, never traded.
@@ -1819,7 +1924,9 @@ pub fn run(cfg: Config) -> Result<(), String> {
             logs.sort_by_key(|l| (hex_u64(l.get("blockNumber")), hex_u64(l.get("logIndex"))));
             // Feed swaps first (they arrived first), in chain order.
             feed_logs.sort_by_key(|l| (hex_u64(l.get("blockNumber")), hex_u64(l.get("transactionIndex")), hex_u64(l.get("logIndex"))));
-            for log in feed_logs.iter().chain(logs.iter()) {
+            // Then WebSocket pushes (real node logs), in chain order.
+            ws_logs.sort_by_key(|l| (hex_u64(l.get("blockNumber")), hex_u64(l.get("logIndex"))));
+            for log in feed_logs.iter().chain(ws_logs.iter()).chain(logs.iter()) {
                 // A log the node takes back (short re-org) is not a real swap.
                 if log["removed"].as_bool() == Some(true) {
                     continue;
@@ -1828,6 +1935,7 @@ pub fn run(cfg: Config) -> Result<(), String> {
                 // Feed wake-up: which source this record is from, and when seen.
                 let (src, seen_ms) = match log["_src"].as_str() {
                     Some("feed") => (crate::feedwake::Src::Feed, log["_seen_ms"].as_u64().unwrap_or(poll_ms)),
+                    Some("ws") => (crate::feedwake::Src::Ws, log["_seen_ms"].as_u64().unwrap_or(poll_ms)),
                     _ => (crate::feedwake::Src::Poll, poll_ms),
                 };
                 let txh = log["transactionHash"].as_str().unwrap_or("").to_ascii_lowercase();
@@ -1855,7 +1963,7 @@ pub fn run(cfg: Config) -> Result<(), String> {
                     }
                     LogKind::V2Sync => {
                         // Feed wake-up: the other source already counted this swap.
-                        if wake.is_some() && merge.seen_by_other(src, &txh, &addr) {
+                        if merging && merge.seen_by_other(src, &txh, &addr) {
                             continue;
                         }
                         // V2 reserves (each Swap comes right after its Sync).
@@ -1874,7 +1982,7 @@ pub fn run(cfg: Config) -> Result<(), String> {
                 };
                 // Feed wake-up: count each swap once (tx + pool), whichever
                 // source showed it first; note swaps that arrive out of order.
-                let admit = if wake.is_some() {
+                let admit = if merging {
                     let txi = hex_u64(log.get("transactionIndex"));
                     merge.admit(src, &txh, &pool, (block, txi), seen_ms, watched.contains(&pool))
                 } else {
@@ -1936,6 +2044,10 @@ pub fn run(cfg: Config) -> Result<(), String> {
                     continue;
                 };
                 let Some(info) = entry else { continue };
+                // Hot set: this tradable pool just traded.
+                if hot_on {
+                    hot_act.note_swap(&pool, started.elapsed().as_millis() as u64);
+                }
                 let price = match kind {
                     LogKind::V2Swap => v2_res.get(&pool).and_then(|(r0, r1)| venue::v2_price(*r0, *r1, info.token_is0)),
                     _ => w.get(2).and_then(|sp| token_price(&crate::fourmeme::word_dec(sp), info.token_is0)),
@@ -1966,8 +2078,12 @@ pub fn run(cfg: Config) -> Result<(), String> {
                     }
                 }
                 if let Some(r) = rush {
-                    if wake.is_some() {
+                    if merging {
                         merge.note_rush(src, &txh, &pool, block, seen_ms);
+                    }
+                    if hot_on {
+                        hot_act.note_rush(&pool, started.elapsed().as_millis() as u64);
+                        hot_dirty = true;
                     }
                     rushes.push((r, (src, seen_ms)));
                 }
@@ -1992,6 +2108,50 @@ pub fn run(cfg: Config) -> Result<(), String> {
                     write(f, json!({"ev": "stats", "t": sh.now_ms(), "merge": merge.json(), "worker": sh.json()}))?;
                     wake_stats_at = Instant::now();
                 }
+            }
+        }
+
+        // ---- hot-pool WebSocket: hot set (every 5 s, or at once after a rush) ----
+        if hot_on && (hot_dirty || hot_at.is_none_or(|t| t.elapsed() >= Duration::from_secs(5))) {
+            let now_ms = started.elapsed().as_millis() as u64;
+            hot_act.prune(now_ms, hot_rules.window_ms);
+            let lb = last_block.unwrap_or(0);
+            let cands: Vec<crate::wshot::Cand> = hot_act
+                .iter()
+                .filter_map(|(k, (swap, rush))| {
+                    let info = pools.get(k)?.as_ref()?;
+                    Some(crate::wshot::Cand {
+                        key: k.clone(),
+                        v4: matches!(info.venue, Venue::V4 { .. }),
+                        last_swap_ms: *swap,
+                        last_rush_ms: *rush,
+                        age_s: ages.age_secs(k, lb, BLOCK_SECS).or_else(|| births.get(k).map(|b| lb.saturating_sub(b) as f64 * BLOCK_SECS)),
+                        blocked: blocklist.contains(&info.token),
+                        unsafe_hook: matches!(&info.venue, Venue::V4 { key } if venue::hook_changes_amounts(&key.hooks)),
+                    })
+                })
+                .collect();
+            hot = crate::wshot::select_hot(&cands, &hot_rules, now_ms);
+            if let Some(w) = &ws_sh {
+                w.set_wanted(hot.clone());
+                merge.ws_subscribed = w.live().keys();
+            }
+            hot_at = Some(Instant::now());
+            hot_dirty = false;
+        }
+        if let Some(f) = f_ws.as_mut() {
+            // Rush leads go here when the feed wake-up file is not open.
+            if f_wake.is_none() {
+                for ev in merge.events.drain(..) {
+                    write(f, ev)?;
+                }
+            }
+            if ws_stats_at.elapsed() >= Duration::from_secs(600) {
+                write(f, wshot_line(&est, est_recent, &hot, &hcfg))?;
+                if let Some(w) = &ws_sh {
+                    write(f, json!({"ev": "stats", "t": w.now_ms(), "ws": w.json(), "merge": merge.json()}))?;
+                }
+                ws_stats_at = Instant::now();
             }
         }
 
@@ -2212,7 +2372,7 @@ pub fn run(cfg: Config) -> Result<(), String> {
                     return Ok(());
                 }
                 let mut line = json!({"pool": r.pool, "token": info.token, "block": r.block, "taken": false, "venue": vt, "why": why});
-                if wake.is_some() {
+                if merging {
                     line["src"] = json!(src.name());
                 }
                 tag_group(&mut line, young_age.get());
@@ -2451,8 +2611,15 @@ pub fn run(cfg: Config) -> Result<(), String> {
                     // Buy is ready now: this is the moment a live order goes out.
                     let behind = head_seen.unwrap_or(r.block).saturating_sub(r.block);
                     let mut delay = delay_json(behind, fetch_ms, t_logs.elapsed().as_secs_f64() * 1000.0, ladder_ms, check_ms);
-                    if let Some(sh) = &wake {
-                        tag_delay(&mut delay, src, sh.ms_of(t_logs).saturating_sub(seen_ms) as f64, sh.now_ms().saturating_sub(seen_ms) as f64, feed_head.unwrap_or(r.block).saturating_sub(r.block));
+                    if merging {
+                        // "Behind" for a pushed rush: the newest block that
+                        // source (or polling) has shown past the rush block.
+                        let src_head = match src {
+                            crate::feedwake::Src::Feed => feed_head,
+                            crate::feedwake::Src::Ws => ws_head.max(head_seen),
+                            crate::feedwake::Src::Poll => head_seen,
+                        };
+                        tag_delay(&mut delay, src, ms_of(t_logs).saturating_sub(seen_ms) as f64, ms_of(Instant::now()).saturating_sub(seen_ms) as f64, src_head.unwrap_or(r.block).saturating_sub(r.block));
                     }
                     eprintln!(
                         "paper: BUY  {} ${usd_in} [{vt}]{} ({}/{} rush at block {})",
@@ -2480,7 +2647,9 @@ pub fn run(cfg: Config) -> Result<(), String> {
                     // Live mode: mirror this buy with real money if allowed.
                     // Young test trades are NEVER mirrored (paper only).
                     if let Some(lt) = live.as_mut().filter(|_| live_mirrors(young)) {
-                        match lt.refuse(&info) {
+                        // Stale-signal guard: never send a buy decided too far
+                        // behind the chain (PR #249 lesson). Paper still trades it.
+                        match lt.refuse(&info).or_else(|| lt.refuse_stale(&delay)) {
                             None => {
                                 if let Err(e) = lt.buy(&r.pool, &info, usd_per_base, tokens) {
                                     eprintln!("LIVE: buy {} not done ({e})", info.token);
@@ -2493,7 +2662,7 @@ pub fn run(cfg: Config) -> Result<(), String> {
                     // outcomes). Done AFTER the buy so they never slow it down.
                     let rug_meta = rug_measure(&rpc, &mut creators, &ages, &mut safety_cache, &r.pool, &info, r.block);
                     let mut line = json!({"pool": r.pool, "token": info.token, "block": r.block, "taken": true, "venue": vt, "usd_in": usd_in, "rug": rug_meta, "delay": delay});
-                    if wake.is_some() {
+                    if merging {
                         line["src"] = json!(src.name());
                     }
                     tag_group(&mut line, young_age.get());
@@ -2563,6 +2732,45 @@ pub fn run(cfg: Config) -> Result<(), String> {
                     fwd.as_ref().or(tap_stats.as_ref()).map_or(0, |f| f.tap_dropped.load(std::sync::atomic::Ordering::Relaxed))
                 );
             }
+            if hot_on {
+                let k = |x: Option<f64>| x.map_or("?".to_string(), |v| if v >= 10_000.0 { format!("{:.0}k", v / 1000.0) } else { format!("{v:.0}") });
+                if hcfg.estimate {
+                    est_recent = est.recent_per_day();
+                    eprintln!(
+                        "paper: ws estimate (free): hot set {} pools + {} V4 ids would push ~{} messages/day (last 10 min ~{}/day; {} matching logs so far) | spare budget {}/day",
+                        hot.addrs.len(),
+                        hot.v4.len(),
+                        k(est.per_day()),
+                        k(est_recent),
+                        est.matched,
+                        k(Some(hcfg.budget_day))
+                    );
+                }
+                if let Some(w) = &ws_sh {
+                    let g = |a: &std::sync::atomic::AtomicU64| a.load(std::sync::atomic::Ordering::Relaxed);
+                    let live = w.live();
+                    let m = &merge.stats;
+                    eprintln!(
+                        "paper: ws hot: {} | live {} pools + {} V4 ids (wanted {} + {}) | messages {} (~{}/day) | renewals {} (refused {}), connections {}, went quiet {} | fill-ins {} ({} logs, {} failed) | swaps ws first {}, poll first {}",
+                        if ws_healthy { "healthy" } else { "NOT healthy (normal polling)" },
+                        live.addrs.len(),
+                        live.v4.len(),
+                        hot.addrs.len(),
+                        hot.v4.len(),
+                        g(&w.c.messages),
+                        k(w.messages_per_day()),
+                        g(&w.c.renewals),
+                        g(&w.c.renew_errors),
+                        g(&w.c.sessions),
+                        g(&w.c.stale_drops),
+                        g(&w.c.fills),
+                        g(&w.c.fill_logs),
+                        g(&w.c.fill_errors),
+                        m.polled_ws_first,
+                        m.ws_after_poll
+                    );
+                }
+            }
             if quoter.engine_on() {
                 eprintln!("paper: {}{}", quoter.stats.summary(), fwd.as_ref().map(|f| format!(" | {}", f.summary())).unwrap_or_default());
                 // Counts for the report, every 10 minutes.
@@ -2603,8 +2811,26 @@ pub fn run(cfg: Config) -> Result<(), String> {
         }
         write(f, json!({"ev": "stats", "t": sh.now_ms(), "merge": merge.json(), "worker": sh.json(), "final": true}))?;
     }
+    if let Some(f) = f_ws.as_mut() {
+        if f_wake.is_none() {
+            for ev in merge.events.drain(..) {
+                write(f, ev)?;
+            }
+        }
+        let recent = est.recent_per_day();
+        write(f, wshot_line(&est, recent, &hot, &hcfg))?;
+        if let Some(w) = &ws_sh {
+            write(f, json!({"ev": "stats", "t": w.now_ms(), "ws": w.json(), "merge": merge.json(), "final": true}))?;
+        }
+    }
     write(&mut f_meta, json!({"event": "stop", "trades": n_trades, "total_usd": total}))?;
     Ok(())
+}
+
+/// The free estimate's line for wshot.jsonl.
+fn wshot_line(est: &crate::wshot::Estimator, recent: Option<f64>, hot: &crate::wshot::HotSet, hcfg: &crate::wshot::WsHotCfg) -> Value {
+    json!({"ev": "estimate", "on": hcfg.estimate, "pools": hot.addrs.len(), "v4": hot.v4.len(), "matched": est.matched, "secs": est.started.elapsed().as_secs(),
+           "per_day": est.per_day().map(f64::round), "recent_per_day": recent.map(f64::round), "budget_day": hcfg.budget_day})
 }
 
 /// Feed wake-up: the watch-list entry for one of the trader's pools.
@@ -2627,7 +2853,8 @@ pub fn watch_pool(key: &str, p: &Pool) -> crate::feedwake::WatchPool {
 pub fn tag_delay(delay: &mut Value, src: crate::feedwake::Src, wait_ms: f64, since_seen_ms: f64, feed_behind: u64) {
     delay["src"] = json!(src.name());
     delay["since_seen_ms"] = json!(since_seen_ms.round());
-    if src == crate::feedwake::Src::Feed {
+    // Pushed sources (feed, hot-pool WebSocket): no node fetch of our own.
+    if src != crate::feedwake::Src::Poll {
         let work = delay["work_ms"].as_f64().unwrap_or(0.0);
         delay["behind_blocks"] = json!(feed_behind);
         delay["wait_ms"] = json!(wait_ms.round());
@@ -2712,7 +2939,7 @@ pub fn report(dir: &std::path::Path) -> String {
         }
         sizes_txt += &format!("  AUTO (largest size with <=1.5% round-trip cost): ${auto_total:+.2} over {auto_n} trades (${:+.2}/h)\n", if hours > 0.0 { auto_total / hours } else { 0.0 });
     }
-    let race_txt = race_section(&all, start.and_then(|m| m["late_blocks"].as_u64()), hours) + &delay_section(&sig) + &crate::engine::report_section(dir, &meta) + &crate::feedwake::report_section(dir, &sig);
+    let race_txt = race_section(&all, start.and_then(|m| m["late_blocks"].as_u64()), hours) + &delay_section(&sig) + &crate::engine::report_section(dir, &meta) + &crate::feedwake::report_section(dir, &sig) + &crate::wshot::report_section(dir, &sig);
     let venue_txt = venue_section(&all, &sig, start) + &hour_section(&rows) + &stop_study_section(&rows) + &flow_study_section(&rows);
     let mean = if n > 0 { total / n as f64 } else { 0.0 };
     let sd = if n > 1 { (nets.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n - 1) as f64).sqrt() } else { 0.0 };

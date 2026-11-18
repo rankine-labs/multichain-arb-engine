@@ -9,6 +9,8 @@
 //                                   (env: SNIPER_RPC, SNIPER_WALLET)
 //   sniper paper                    Robinhood paper trader (no money; env: src/paper.rs)
 //   sniper paper-report <dir>       its results
+//   sniper engine-trial             live trial of the sniper's engine (run by
+//                                   deploy/sniper-engine.sh trial; src/enginetrial.rs)
 //   sniper dry-fire <pool> <usd>    live sender's real calls in a free
 //                                   simulation (no key, no money)
 //   sniper rhc-probe                Robinhood Chain speed test (read-only;
@@ -87,6 +89,11 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        Some("engine-trial") => {
+            // Exit code carries the verdict (0 works, 2 not good enough, 3 memory).
+            let code = sniper::enginetrial::run(sniper::enginetrial::TrialCfg::from_lookup(|k| std::env::var(k).ok()));
+            ExitCode::from(code.clamp(0, 255) as u8)
+        }
         Some("paper-report") => {
             let Some(dir) = args.get(1) else {
                 eprintln!("usage: sniper paper-report <dir>");

@@ -276,3 +276,111 @@ pub fn swap_log(tx: &str, block: u64, txi: u64, recipient: &str, sqrt: U256, buy
            "data": format!("0x{a0}{a1}{:064x}{}{}", sqrt, "0".repeat(64), "0".repeat(64)),
            "blockNumber": format!("0x{block:x}"), "transactionIndex": format!("0x{txi:x}"), "logIndex": "0x0", "transactionHash": tx, "removed": false})
 }
+
+// ---------------------------------------------------------------------------
+// Fake WebSocket node (eth_subscribe "logs"), for the hot-pool WebSocket
+// tests (wshot_e2e.rs, wshot_thread.rs). Pushes the logs put in PUSH to
+// every live subscription whose address + topic0 filter matches.
+// ---------------------------------------------------------------------------
+/// Logs the test wants pushed by the fake WebSocket node.
+pub static PUSH: Mutex<Vec<Value>> = Mutex::new(Vec::new());
+/// Every subscription filter the trader asked for, in order.
+pub static SUBS_SEEN: Mutex<Vec<Value>> = Mutex::new(Vec::new());
+/// Set: the fake WebSocket node drops the connection once.
+pub static DROP: AtomicBool = AtomicBool::new(false);
+/// While set, the fake WebSocket node refuses new connections (an outage).
+pub static DOWN: AtomicBool = AtomicBool::new(false);
+pub static CONNS: AtomicU64 = AtomicU64::new(0);
+pub static PUSHED: AtomicU64 = AtomicU64::new(0);
+/// Refuse a subscription whose address list is longer than this (0 = never).
+pub static REFUSE_OVER: AtomicU64 = AtomicU64::new(0);
+/// eth_unsubscribe requests received.
+pub static UNSUBS: AtomicU64 = AtomicU64::new(0);
+
+
+/// Does a subscription filter match a log (address list + topic0 list)?
+pub fn ws_matches(f: &Value, log: &Value) -> bool {
+    let addr = log["address"].as_str().unwrap_or("").to_ascii_lowercase();
+    let in_addr = match &f["address"] {
+        Value::Array(a) => a.iter().any(|x| x.as_str().is_some_and(|x| x.eq_ignore_ascii_case(&addr))),
+        Value::String(x) => x.eq_ignore_ascii_case(&addr),
+        _ => false,
+    };
+    let t0 = log["topics"][0].as_str().unwrap_or("");
+    in_addr && f["topics"][0].as_array().is_some_and(|ts| ts.iter().any(|t| t.as_str().is_some_and(|t| t.eq_ignore_ascii_case(t0))))
+}
+
+/// A tiny eth_subscribe "logs" WebSocket node.
+pub fn fake_ws() -> String {
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("ws://{}", l.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for c in l.incoming() {
+            let Ok(c) = c else { continue };
+            if DOWN.load(Ordering::Relaxed) {
+                drop(c);
+                continue;
+            }
+            std::thread::spawn(move || {
+                let Ok(mut ws) = tungstenite::accept(c) else { return };
+                CONNS.fetch_add(1, Ordering::Relaxed);
+                let _ = ws.get_ref().set_read_timeout(Some(Duration::from_millis(30)));
+                let mut subs: Vec<(String, Value)> = Vec::new();
+                let mut n = 0u64;
+                loop {
+                    if DROP.swap(false, Ordering::Relaxed) {
+                        let _ = ws.close(None);
+                        let _ = ws.flush();
+                        return;
+                    }
+                    match ws.read() {
+                        Ok(tungstenite::Message::Text(t)) => {
+                            let v: Value = serde_json::from_str(&t).unwrap_or(Value::Null);
+                            let reply = match v["method"].as_str() {
+                                Some("eth_subscribe") if REFUSE_OVER.load(Ordering::Relaxed) > 0
+                                    && v["params"][1]["address"].as_array().is_some_and(|a| a.len() as u64 > REFUSE_OVER.load(Ordering::Relaxed)) =>
+                                {
+                                    json!({"jsonrpc": "2.0", "id": v["id"], "error": {"code": -32000, "message": "exceed max addresses"}})
+                                }
+                                Some("eth_subscribe") => {
+                                    n += 1;
+                                    let sid = format!("0x{:x}{n}", CONNS.load(Ordering::Relaxed));
+                                    SUBS_SEEN.lock().unwrap().push(v["params"][1].clone());
+                                    subs.push((sid.clone(), v["params"][1].clone()));
+                                    json!({"jsonrpc": "2.0", "id": v["id"], "result": sid})
+                                }
+                                Some("eth_unsubscribe") => {
+                                    UNSUBS.fetch_add(1, Ordering::Relaxed);
+                                    let sid = v["params"][0].as_str().unwrap_or("").to_string();
+                                    subs.retain(|(s, _)| *s != sid);
+                                    json!({"jsonrpc": "2.0", "id": v["id"], "result": true})
+                                }
+                                _ => json!({"jsonrpc": "2.0", "id": v["id"], "error": {"code": -32601, "message": "no"}}),
+                            };
+                            if ws.send(tungstenite::Message::text(reply.to_string())).is_err() {
+                                return;
+                            }
+                        }
+                        Ok(tungstenite::Message::Close(_)) => return,
+                        Ok(_) => {}
+                        Err(tungstenite::Error::Io(e)) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {}
+                        Err(_) => return,
+                    }
+                    let out: Vec<Value> = std::mem::take(&mut *PUSH.lock().unwrap());
+                    for log in out {
+                        for (sid, f) in &subs {
+                            if ws_matches(f, &log) {
+                                let m = json!({"jsonrpc": "2.0", "method": "eth_subscription", "params": {"subscription": sid, "result": log}});
+                                if ws.send(tungstenite::Message::text(m.to_string())).is_err() {
+                                    return;
+                                }
+                                PUSHED.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    });
+    url
+}
