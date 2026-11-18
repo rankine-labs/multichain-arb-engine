@@ -22,6 +22,19 @@
 //! - Exact approvals only, a minimum-out on every swap, a 2-minute deadline.
 //! - An open position is saved to disk; after a crash or restart the first
 //!   thing it does is sell it.
+//! - Stale-signal guard (the dex bot's PR #249 lesson: never send a trade
+//!   decided behind the feed tip): a buy is refused when the rush it
+//!   answers is already more than SNIPER_LIVE_MAX_BEHIND_BLOCKS (default 5,
+//!   ~0.5 s) blocks old at the moment the order would go out, measured by
+//!   the paper trader's own `delay` record (behind_blocks; total_ms is
+//!   shown in the reason). Logged as a live_skip. Paper keeps trading such
+//!   rushes as before (so we keep measuring them). 0 = guard off.
+//!
+//! KNOWN LIMIT (not built yet, must be fixed before scaling): a live buy
+//! and sell wait for their receipts INSIDE the paper trader's main loop
+//! (up to RECEIPT_WAIT = 20 s each). While waiting, nothing else is
+//! watched. Acceptable for one $5 position; must become non-blocking
+//! before more positions or bigger sizes.
 //!
 //! Real result = WETH back - WETH spent - gas actually paid, measured from
 //! wallet balances and receipts, never from quotes.
@@ -127,6 +140,32 @@ pub fn real_net_usd(base_in: U256, base_out: U256, usd_per_base: f64, gas_eth: f
     (f(base_out) - f(base_in)) * usd_per_base - gas_eth * usd_per_eth
 }
 
+/// Default for SNIPER_LIVE_MAX_BEHIND_BLOCKS (Robinhood: ~0.1 s a block).
+pub const MAX_BEHIND_BLOCKS: u64 = 5;
+
+/// Stale-signal guard: why a buy must NOT be sent because its rush is too
+/// old by the time the order would go out (None = fresh enough).
+/// `delay` is the paper trader's delay record for this buy (behind_blocks =
+/// how many blocks the newest block we know is past the rush's block;
+/// total_ms = rush in hand -> buy ready). A missing measure is treated as
+/// stale (never trade on a signal we can't date). `max_behind` 0 = off.
+pub fn stale_reason(delay: &Value, max_behind: u64) -> Option<String> {
+    if max_behind == 0 {
+        return None;
+    }
+    let total = delay["total_ms"].as_f64().map_or("?".to_string(), |t| format!("{t:.0}"));
+    match delay["behind_blocks"].as_u64() {
+        None => Some(format!("stale signal: no delay measure (need at most {max_behind} blocks behind)")),
+        Some(b) if b > max_behind => Some(format!("stale signal: rush {b} blocks behind the newest block (max {max_behind}), {total} ms to decide")),
+        Some(_) => None,
+    }
+}
+
+/// SNIPER_LIVE_MAX_BEHIND_BLOCKS from a lookup (default 5; 0 = off).
+pub fn max_behind_from(get: impl Fn(&str) -> Option<String>) -> u64 {
+    get("SNIPER_LIVE_MAX_BEHIND_BLOCKS").and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(MAX_BEHIND_BLOCKS)
+}
+
 /// Why live mode won't open a trade right now (None = it may).
 pub fn refuse_reason(halted: Option<&str>, has_open: bool, venue_is_v3: bool, base_is_weth: bool, hours_ok: bool, ledger_ok: bool) -> Option<String> {
     if let Some(h) = halted {
@@ -158,6 +197,8 @@ pub struct LiveTrader {
     pub open: Option<LivePos>,
     pub halted: Option<String>,
     pub fails: u32,
+    /// Stale-signal guard (SNIPER_LIVE_MAX_BEHIND_BLOCKS, 0 = off).
+    pub max_behind_blocks: u64,
     state_path: PathBuf,
     log_path: PathBuf,
     rpc: Rpc,
@@ -178,7 +219,7 @@ impl LiveTrader {
         let hours = parse_hours(&std::env::var("SNIPER_LIVE_HOURS").unwrap_or_default())?;
         let state_path = out.join("live_open.json");
         let open = std::fs::read_to_string(&state_path).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok()).and_then(|v| LivePos::from_json(&v));
-        let lt = LiveTrader { sender, gate, ledger, hours, open, halted: None, fails: 0, state_path, log_path: out.join("live_trades.jsonl"), rpc: Rpc::new(read_url) };
+        let lt = LiveTrader { sender, gate, ledger, hours, open, halted: None, fails: 0, max_behind_blocks: max_behind_from(|k| std::env::var(k).ok()), state_path, log_path: out.join("live_trades.jsonl"), rpc: Rpc::new(read_url) };
         Ok(lt)
     }
 
@@ -259,6 +300,11 @@ impl LiveTrader {
             in_hours(self.hours, toronto_hour(SystemTime::now())),
             self.ledger.allows(self.gate.max_trade_usd, self.gate.max_day_loss_usd),
         )
+    }
+
+    /// The stale-signal guard for one buy (see `stale_reason`).
+    pub fn refuse_stale(&self, delay: &Value) -> Option<String> {
+        stale_reason(delay, self.max_behind_blocks)
     }
 
     /// Real buy of `gate.max_trade_usd` worth of WETH into `info.token`.
@@ -377,6 +423,20 @@ mod tests {
         assert!(refuse_reason(None, false, true, false, true, true).unwrap().contains("WETH"));
         assert!(refuse_reason(None, false, true, true, false, true).unwrap().contains("hours"));
         assert!(refuse_reason(None, false, true, true, true, false).unwrap().contains("loss cap"));
+    }
+
+    #[test]
+    fn stale_signal_guard() {
+        let d = |b: u64, t: f64| json!({"behind_blocks": b, "total_ms": t});
+        assert_eq!(stale_reason(&d(0, 120.0), 5), None);
+        assert_eq!(stale_reason(&d(5, 600.0), 5), None, "exactly at the line is still allowed");
+        let r = stale_reason(&d(6, 700.0), 5).unwrap();
+        assert!(r.starts_with("stale signal") && r.contains("6 blocks behind") && r.contains("700 ms"), "{r}");
+        assert!(stale_reason(&json!({}), 5).unwrap().contains("no delay measure"), "undated = stale");
+        assert_eq!(stale_reason(&d(50, 1.0), 0), None, "0 = guard off");
+        assert_eq!(max_behind_from(|_| None), 5);
+        assert_eq!(max_behind_from(|_| Some(" 2 ".into())), 2);
+        assert_eq!(max_behind_from(|_| Some("junk".into())), 5);
     }
 
     #[test]

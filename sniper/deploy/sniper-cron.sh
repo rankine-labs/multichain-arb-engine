@@ -7,9 +7,11 @@
 #   a GitHub issue, so nobody has to open a terminal:
 #     1. Pulls the newest sniper build from the "sniper-bin" branch.
 #     2. Reads deploy/run.env (the settings) from that build.
-#     3. (Re)starts the sniper if the build or settings changed, or if it
+#     3. With SNIPER_ENGINE=1 in run.env: makes sure the sniper's own
+#        engine (deploy/sniper-engine.sh) is running first (see step 2b).
+#     4. (Re)starts the sniper if the build or settings changed, or if it
 #        stopped. SNIPER_ENABLED=0 in run.env stops it (kill switch).
-#     4. Every 15 minutes, posts the paper-trade scoreboard to the GitHub
+#     5. Every 15 minutes, posts the paper-trade scoreboard to the GitHub
 #        issue "Sniper paper status".
 #
 # Safety:
@@ -96,6 +98,91 @@ fi
 # (The program file itself, not the git commit: a change to scripts or
 # studies under deploy/ must NOT restart the running bots.)
 WANT="$(sha256sum sniper | cut -c1-16):$(sha256sum "$RUN" | cut -c1-16)"
+
+# --- 2b. The sniper's own engine (speed step 2) -------------------------------
+# SNIPER_ENGINE=1 in run.env: make sure the sniper's OWN arbsim copy
+# (deploy/sniper-engine.sh) is up BEFORE the paper bot is started or kept.
+#   - Only on a server that runs the paper bot, and only while enabled
+#     (the feed server and the kill switch never start it).
+#   - Started if it is not running, or if it runs but its socket has not
+#     answered for ENGINE_GRACE_S (default 180 s) since it was started.
+#   - Left alone when healthy: a new build or new settings restart only the
+#     paper bot, never a healthy engine (it keeps its warm chain copy).
+#   - After a failed start, waits ENGINE_RETRY_S (default 600 s) before
+#     trying again, so a broken setup can't fill the log every 2 minutes.
+#   - Never touches the dex bot's engine, socket (/tmp/arbsim.sock) or pm2.
+#   - Logs one line per (re)start. Node links never reach the log.
+#   - Memory guard first (see just below): an engine over its memory limit
+#     is stopped, and its restart waits out a growing backoff.
+# SNIPER_ENGINE unset (or not 1): nothing here runs at all.
+ENGINE_DIR="${ENGINE_DIR:-$HOME/sniper-engine}"
+ENGINE_GRACE_S="${ENGINE_GRACE_S:-180}"
+ENGINE_RETRY_S="${ENGINE_RETRY_S:-600}"
+# Never print a node link (they hold API keys): any "scheme://..." becomes <link>.
+redact() { sed -E 's#[A-Za-z][A-Za-z0-9+.-]*://[^[:space:]"'\'']*#<link>#g'; }
+# Is the engine process from our pid file alive and really an arbsim (not
+# a finished "zombie", not some other program that got the same pid)?
+engine_alive() {
+  local P; P="$(cat "$ENGINE_DIR/engine.pid" 2>/dev/null)"
+  [ -n "$P" ] && kill -0 "$P" 2>/dev/null && ps -p "$P" -o stat=,args= 2>/dev/null | grep -v '^ *Z' | grep -q arbsim
+}
+# Does the engine socket accept a connection (2 s max)?
+engine_socket_ok() {
+  [ -S "$1" ] && python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX); s.settimeout(2); s.connect(sys.argv[1])' "$1" 2>/dev/null
+}
+case " $MODES " in *" paper "*) PAPER_HERE=1;; *) PAPER_HERE=0;; esac
+# MEMORY GUARD (always, whatever run.env says, also for an engine kept
+# after a trial): over ENGINE_MEM_LIMIT_MB (default 1500 MB) the engine is
+# stopped and logged; restarts below then follow the backoff in
+# deploy/sniper-engine.sh (first one at once, then 120 s, 240 s ... 30 min).
+if engine_alive; then
+  GOUT="$(ENGINE_DIR="$ENGINE_DIR" bash deploy/sniper-engine.sh guard 2>&1 9>&- | redact | tail -1 | sed -E 's/^\[[^]]*\] sniper-engine: //')"
+  [ -n "$GOUT" ] && log "engine $GOUT"
+fi
+if [ "$(kv "$RUN" SNIPER_ENGINE)" = "1" ] && [ "$ENABLED" = "1" ] && [ "$PAPER_HERE" = 1 ]; then
+  # Same socket the paper bot will use (SNIPER_ENGINE_SOCKET, else its default).
+  ESOCK="$(kv "$RUN" SNIPER_ENGINE_SOCKET)"; ESOCK="${ESOCK:-/tmp/sniper-arbsim.sock}"
+  WHY=""
+  if [ "$ESOCK" = "/tmp/arbsim.sock" ]; then
+    log "engine: refusing SNIPER_ENGINE_SOCKET=/tmp/arbsim.sock (the dex bot's engine)"
+  elif ! engine_alive; then
+    WHY="was not running"
+  elif ! engine_socket_ok "$ESOCK"; then
+    # Still starting up? Give it ENGINE_GRACE_S from its start (pid file time).
+    STARTED_AT="$(stat -c %Y "$ENGINE_DIR/engine.pid" 2>/dev/null || echo 0)"
+    [ $(( $(date +%s) - STARTED_AT )) -ge "$ENGINE_GRACE_S" ] && WHY="socket $ESOCK not answering"
+  fi
+  if [ -n "$WHY" ]; then
+    LAST_FAIL="$(kv "$STATE" ENGINE_FAILED_AT)"; LAST_FAIL="${LAST_FAIL:-0}"
+    if [ $(( $(date +%s) - LAST_FAIL )) -ge "$ENGINE_RETRY_S" ]; then
+      # 9>&- : the engine must not inherit our lock (same as the sniper below).
+      if engine_alive; then
+        ENGINE_SOCKET="$ESOCK" ENGINE_DIR="$ENGINE_DIR" bash deploy/sniper-engine.sh stop >/dev/null 2>&1 9>&-
+      else
+        # A stale pid file (engine gone) would make "start" think it still
+        # runs, and "stop" could hit an unrelated program: just drop it.
+        rm -f "$ENGINE_DIR/engine.pid"
+      fi
+      EOUT="$(ENGINE_SOCKET="$ESOCK" ENGINE_DIR="$ENGINE_DIR" bash deploy/sniper-engine.sh start 2>&1 9>&- | redact | tail -1 | sed -E 's/^\[[^]]*\] sniper-engine: //')"
+      if engine_alive; then
+        set_kv "$STATE" ENGINE_FAILED_AT ""
+        set_kv "$STATE" ENGINE_BACKOFF_SAID ""
+        log "engine (re)started [$WHY]: $EOUT"
+      elif echo "$EOUT" | grep -q "memory backoff"; then
+        # Waiting out the memory backoff on purpose: not a failure. Said
+        # once per backoff period (not every 2 minutes).
+        NEXT_AT="$(kv "$ENGINE_DIR/memguard.state" NEXT_START_AT)"
+        if [ "$(kv "$STATE" ENGINE_BACKOFF_SAID)" != "$NEXT_AT" ]; then
+          set_kv "$STATE" ENGINE_BACKOFF_SAID "$NEXT_AT"
+          log "engine not started [$WHY]: $EOUT (paper bot uses the node meanwhile)"
+        fi
+      else
+        set_kv "$STATE" ENGINE_FAILED_AT "$(date +%s)"
+        log "engine start FAILED [$WHY]: $EOUT (next try in ${ENGINE_RETRY_S}s; paper bot falls back to the node)"
+      fi
+    fi
+  fi
+fi
 
 # --- 3. Start / restart / stop ------------------------------------------------
 for M in $(echo "$ALLOWED"); do

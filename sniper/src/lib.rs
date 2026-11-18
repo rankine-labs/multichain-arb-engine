@@ -8,6 +8,9 @@
 //   matcher.rs   joins pending sightings with confirmed Four.meme trades
 //   feedtx.rs    unpack user transactions from the sequencer feed
 //   feedwatch.rs feed head start + which routers swaps use
+//   engine.rs    quotes from our own arbsim engine copy, node as fallback
+//   enginetrial.rs  live trial of that engine (answers vs unknown, budget, memory)
+//   wshot.rs     hot-pool WebSocket wake-up + its free cost estimate
 //   paper.rs     Robinhood paper trader (real quotes, no money)
 //   probe.rs     the measurement run (threads + JSONL output)
 //   registry.rs  live token list + burst / creator-dump / graduation signals
@@ -20,7 +23,10 @@
 // ============================================================================
 pub mod calibrate;
 pub mod curve;
+pub mod engine;
+pub mod enginetrial;
 pub mod feedtx;
+pub mod feedwake;
 pub mod feedwatch;
 pub mod fourmeme;
 pub mod live;
@@ -39,3 +45,4 @@ pub mod sellcheck;
 pub mod taxcheck;
 pub mod venue;
 pub mod ws;
+pub mod wshot;

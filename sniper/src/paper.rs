@@ -62,8 +62,30 @@
 //   SNIPER_NIGHT_HOURS   night window, Toronto hours (default 20-8)
 //   SNIPER_PUSH=1        use websocket push instead (each pushed log is a
 //                        paid Chainstack request: off by default)
+//   SNIPER_ENGINE=1      quotes from our own arbsim engine copy, node as
+//                        fallback (speed step 2; settings in engine.rs)
 //   SNIPER_LATE_BLOCKS   race check: re-quote every buy and sell this many
 //                        blocks after we decide (default 2, see below)
+//
+// YOUNG-POOL TEST GROUP (paper only, off unless SNIPER_YOUNG_TEST=1):
+//   A rush skipped ONLY because its pool is younger than
+//   SNIPER_MIN_POOL_AGE_SECS (and at least SNIPER_YOUNG_MIN_AGE_SECS old,
+//   default 0) is still written as "pool too young" for the main results,
+//   then goes through every other filter and the same buy/exit logic as a
+//   separate "young" test trade:
+//     - its own slots: SNIPER_YOUNG_MAX_POSITIONS (default 2), each at most
+//       SNIPER_YOUNG_USD (default 50); it never uses or blocks main slots or
+//       the main money cap (it does wait if a main trade holds that coin)
+//     - every line it writes carries "group":"young" and "pool_age_s"; the
+//       report leaves those lines out of every main number and shows them
+//       in their own "young pool test group" section
+//     - never copied by the live trader, so it can't touch the live daily
+//       loss ledger
+//     - a failed trap check or a rug on a young trade still blocks that
+//       token and creator for everyone (it protects main trades too), and
+//       its result counts in the coin cooling-off history like any trade
+//   Polled rushes and feed wake-up rushes go through the same code here, so
+//   both are routed the same way.
 //
 // Blocklist: saved to <out>/blocked_tokens.json and loaded at start, so a
 // restart keeps it. Entries never expire during a run. Delete the file (or
@@ -145,51 +167,64 @@ pub struct ChainQuoter {
     pub rpc: Rpc,
 }
 
+/// One read-only contract call: (to, calldata) -> the raw answer as hex
+/// text, or None when the source gave no data. The node (ChainQuoter) and
+/// the local engine copy (engine.rs EngineQuoter) both plug in here, so the
+/// quote maths below is written once and both sources price identically.
+pub type EthCall<'a> = dyn Fn(&str, &str) -> Result<Option<String>, String> + 'a;
+
+/// Plain English: price one swap through `call`. V3 asks QuoterV2, V4 asks
+/// V4Quoter (the real swap, hook included, inside a reverted simulation),
+/// V2 reads the pair's reserves and applies the 0.30% fee formula.
+pub fn quote_via(call: &EthCall, venue: &Venue, token_in: &str, token_out: &str, amount_in: U256) -> Result<(U256, u64), String> {
+    match venue {
+        Venue::V3 { fee } => {
+            let r = call(V3_QUOTER_V2, &data_quote(token_in, token_out, *fee, amount_in))?;
+            let h = r.ok_or("quote: no data")?;
+            let h = h.trim_start_matches("0x");
+            if h.len() < 64 * 4 {
+                return Err("quote: short answer".into());
+            }
+            // returns (amountOut, sqrtPriceX96After, initializedTicksCrossed, gasEstimate)
+            let out = U256::from_str_radix(&h[0..64], 16).map_err(|e| e.to_string())?;
+            let gas = u64::from_str_radix(h[192..256].trim_start_matches('0'), 16).unwrap_or(150_000);
+            Ok((out, gas))
+        }
+        Venue::V4 { key } => {
+            let zfo = venue::v4_zero_for_one(key, token_in).ok_or("v4 quote: token not in pool")?;
+            let r = call(venue::V4_QUOTER, &venue::data_v4_quote(key, zfo, amount_in)?)?;
+            venue::parse_v4_quote(&r.ok_or("v4 quote: no data")?)
+        }
+        Venue::V2 { pair, token0 } => {
+            // getReserves() = 0x0902f1ac
+            let r = call(pair, "0x0902f1ac")?;
+            let (r0, r1) = venue::v2_reserves(r.as_deref().unwrap_or("")).ok_or("v2 quote: reserves unreadable")?;
+            let (r_in, r_out) = if token_in.eq_ignore_ascii_case(token0) { (r0, r1) } else { (r1, r0) };
+            let out = venue::v2_amount_out(amount_in, r_in, r_out);
+            if out.is_zero() {
+                return Err("v2 quote: empty pool".into());
+            }
+            Ok((out, venue::V2_SWAP_GAS))
+        }
+    }
+}
+
 impl ChainQuoter {
-    /// Uniswap V3: QuoterV2.quoteExactInputSingle.
-    fn quote_v3(&self, token_in: &str, token_out: &str, fee: u32, amount_in: U256) -> Result<(U256, u64), String> {
-        let r = self
-            .rpc
-            .call("eth_call", json!([{"to": V3_QUOTER_V2, "data": data_quote(token_in, token_out, fee, amount_in)}, "latest"]))?;
-        let h = r.as_str().ok_or("quote: no data")?.trim_start_matches("0x");
-        if h.len() < 64 * 4 {
-            return Err("quote: short answer".into());
-        }
-        // returns (amountOut, sqrtPriceX96After, initializedTicksCrossed, gasEstimate)
-        let out = U256::from_str_radix(&h[0..64], 16).map_err(|e| e.to_string())?;
-        let gas = u64::from_str_radix(h[192..256].trim_start_matches('0'), 16).unwrap_or(150_000);
-        Ok((out, gas))
+    /// eth_call against the node's "latest" block (or an exact block, hex).
+    pub fn eth_call_at(&self, to: &str, data: &str, block: &str) -> Result<Option<String>, String> {
+        let r = self.rpc.call("eth_call", json!([{"to": to, "data": data}, block]))?;
+        Ok(r.as_str().map(str::to_string))
     }
 
-    /// Uniswap V4: V4Quoter.quoteExactInputSingle with the pool's exact key
-    /// (runs the real swap, hook included, inside a reverted simulation).
-    fn quote_v4(&self, key: &V4Key, token_in: &str, amount_in: U256) -> Result<(U256, u64), String> {
-        let zfo = venue::v4_zero_for_one(key, token_in).ok_or("v4 quote: token not in pool")?;
-        let r = self.rpc.call("eth_call", json!([{"to": venue::V4_QUOTER, "data": venue::data_v4_quote(key, zfo, amount_in)?}, "latest"]))?;
-        venue::parse_v4_quote(r.as_str().ok_or("v4 quote: no data")?)
-    }
-
-    /// Uniswap V2: the pair's current reserves and the 0.30% fee formula.
-    fn quote_v2(&self, pair: &str, token0: &str, token_in: &str, amount_in: U256) -> Result<(U256, u64), String> {
-        // getReserves() = 0x0902f1ac
-        let r = self.rpc.call("eth_call", json!([{"to": pair, "data": "0x0902f1ac"}, "latest"]))?;
-        let (r0, r1) = venue::v2_reserves(r.as_str().unwrap_or("")).ok_or("v2 quote: reserves unreadable")?;
-        let (r_in, r_out) = if token_in.eq_ignore_ascii_case(token0) { (r0, r1) } else { (r1, r0) };
-        let out = venue::v2_amount_out(amount_in, r_in, r_out);
-        if out.is_zero() {
-            return Err("v2 quote: empty pool".into());
-        }
-        Ok((out, venue::V2_SWAP_GAS))
+    /// The same quote, priced at an exact block (side-by-side check).
+    pub fn quote_at(&self, venue: &Venue, token_in: &str, token_out: &str, amount_in: U256, block: &str) -> Result<(U256, u64), String> {
+        quote_via(&|to, data| self.eth_call_at(to, data, block), venue, token_in, token_out, amount_in)
     }
 }
 
 impl Quoter for ChainQuoter {
     fn quote(&self, venue: &Venue, token_in: &str, token_out: &str, amount_in: U256) -> Result<(U256, u64), String> {
-        match venue {
-            Venue::V3 { fee } => self.quote_v3(token_in, token_out, *fee, amount_in),
-            Venue::V4 { key } => self.quote_v4(key, token_in, amount_in),
-            Venue::V2 { pair, token0 } => self.quote_v2(pair, token0, token_in, amount_in),
-        }
+        self.quote_at(venue, token_in, token_out, amount_in, "latest")
     }
     fn gas_price(&self) -> Result<U256, String> {
         let r = self.rpc.call("eth_gasPrice", json!([]))?;
@@ -281,6 +316,7 @@ impl Detector {
     /// tokens (see swap_buyer). Returns a rush if this swap completes one.
     pub fn on_swap(&mut self, pool: &str, block: u64, buyer: &str, price: f64, r: &Rules) -> Option<RushSig> {
         let st = self.pools.entry(pool.to_string()).or_default();
+        // (rest below; the rush test itself is shared with on_late_swap)
         if let Some(prev) = st.last_price {
             if price > prev {
                 st.buys.push_back((block, buyer.to_string(), prev));
@@ -305,12 +341,19 @@ impl Detector {
         while st.prices.len() > 2 && st.prices[1].0 < lo {
             st.prices.pop_front();
         }
-        if block < st.cooldown_until || st.buys.len() < r.buys {
+        Self::rush_test(st, pool, block, price, r)
+    }
+
+    /// Is there a rush now (at `block`, current price `price`)? Shared by
+    /// on_swap and on_late_swap so both use exactly the same rule.
+    fn rush_test(st: &mut PoolState, pool: &str, block: u64, price: f64, r: &Rules) -> Option<RushSig> {
+        let lo = block.saturating_sub(r.window_blocks - 1);
+        if block < st.cooldown_until || st.buys.iter().filter(|(b, _, _)| *b >= lo).count() < r.buys {
             return None;
         }
         // Count DIFFERENT buyer wallets, not buy events: one wallet splitting
         // its buy into many pieces is not a crowd.
-        let buyers: HashSet<&str> = st.buys.iter().map(|(_, w, _)| w.as_str()).collect();
+        let buyers: HashSet<&str> = st.buys.iter().filter(|(b, _, _)| *b >= lo).map(|(_, w, _)| w.as_str()).collect();
         if buyers.len() < r.buys {
             return None;
         }
@@ -320,10 +363,31 @@ impl Detector {
             return None;
         }
         st.cooldown_until = block + r.window_blocks;
-        let start_price = st.buys.front().map_or(p0, |(_, _, before)| *before);
+        let start_price = st.buys.iter().find(|(b, _, _)| *b >= lo).map_or(p0, |(_, _, before)| *before);
         let mut ids: Vec<String> = buyers.into_iter().map(str::to_string).collect();
         ids.sort();
         Some(RushSig { pool: pool.to_string(), block, price, start_price, buyers: ids })
+    }
+
+    /// Feed wake-up (feedwake.rs): a swap that arrives OUT OF ORDER, because
+    /// the other source already showed this pool's newer swaps (the feed
+    /// missed this one and polling found it later). Its buyer still counts
+    /// (in its own block), but the pool's price and price history stay as
+    /// they are (they already include this swap's effect). `is_buy` comes
+    /// from the swap's own amounts. Same rush rule as on_swap, tested at the
+    /// pool's newest block and price.
+    pub fn on_late_swap(&mut self, pool: &str, block: u64, buyer: &str, price: f64, is_buy: bool, r: &Rules) -> Option<RushSig> {
+        let st = self.pools.get_mut(pool)?;
+        let (newest, now) = (st.prices.back()?.0, st.last_price?);
+        if is_buy {
+            // Price just before it: the last recorded price of an earlier block.
+            let before = st.prices.iter().rev().find(|(b, _)| *b < block).map_or(price, |(_, p)| *p);
+            let at = st.buys.iter().position(|(b, _, _)| *b > block).unwrap_or(st.buys.len());
+            st.buys.insert(at, (block, buyer.to_string(), before));
+        }
+        let at = st.flow.iter().position(|(b, _)| *b > block).unwrap_or(st.flow.len());
+        st.flow.insert(at, (block, is_buy));
+        Self::rush_test(st, pool, newest, now, r)
     }
 
     /// Buys and sells in this pool from `from_block` on (order-flow study).
@@ -610,6 +674,9 @@ pub struct Position {
     /// Follow-through study: at ~15 s, buys/sells since we bought and (when
     /// sellers kept up with buyers) the real net of selling right then.
     pub early: Option<Value>,
+    /// Young-pool test group: Some(pool age in seconds at the rush) for a
+    /// young test position, None for a normal (main) one.
+    pub young_age: Option<f64>,
 }
 
 /// Tighter stop losses studied without trading on them (chart drop, as a
@@ -693,6 +760,8 @@ pub struct LateTrade {
     pub buy: LateQuote,
     /// None while the position is still open.
     pub exit: Option<LateExit>,
+    /// Young test group: pool age (None = main trade). Tags the late line.
+    pub young_age: Option<f64>,
 }
 
 /// Do whatever part of one race check is due now. Order is always: late buy
@@ -717,7 +786,8 @@ pub fn step_late(t: &mut LateTrade, last_block: u64, q: &dyn Quoter, eth_usd: f6
         return None;
     }
     let entry_slip = |late: U256| slip_pct(f64::from(t.opt_tokens), f64::from(late));
-    let base = json!({"late_for": t.pool, "token": t.info.token, "open_block": t.open_block, "venue": t.info.venue_name()});
+    let mut base = json!({"late_for": t.pool, "token": t.info.token, "open_block": t.open_block, "venue": t.info.venue_name()});
+    tag_group(&mut base, t.young_age);
     let with = |mut v: Value, extra: Value| {
         if let (Some(m), Some(e)) = (v.as_object_mut(), extra.as_object()) {
             m.extend(e.clone());
@@ -971,6 +1041,78 @@ pub struct Config {
     pub venues: Vec<VenueKind>,
     /// Look up old V4 pools' keys from history (SNIPER_V4_LOOKUP, default on).
     pub v4_lookup: bool,
+    /// Young-pool test group (SNIPER_YOUNG_TEST=1; off by default).
+    pub young: YoungCfg,
+}
+
+/// Settings of the young-pool test group (paper only, see the file top).
+#[derive(Clone, Debug, PartialEq)]
+pub struct YoungCfg {
+    /// SNIPER_YOUNG_TEST=1 turns it on. Off = the trader behaves as before.
+    pub on: bool,
+    /// Pools younger than this are skipped even by the test (seconds, default 0).
+    pub min_age_s: f64,
+    /// Young test positions open at once (default 2), separate from main.
+    pub max_positions: usize,
+    /// Largest young test trade in USD (default 50, same as main's cap).
+    pub usd: f64,
+}
+
+impl YoungCfg {
+    /// Read the SNIPER_YOUNG_* settings.
+    pub fn from_env() -> Self {
+        let f = |k: &str, d: f64| std::env::var(k).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(d);
+        YoungCfg {
+            on: std::env::var("SNIPER_YOUNG_TEST").map(|v| v.trim() == "1").unwrap_or(false),
+            min_age_s: f("SNIPER_YOUNG_MIN_AGE_SECS", 0.0).max(0.0),
+            max_positions: (f("SNIPER_YOUNG_MAX_POSITIONS", 2.0) as usize).max(1),
+            usd: f("SNIPER_YOUNG_USD", 50.0),
+        }
+    }
+
+    /// Off (what every test and older caller gets).
+    pub fn off() -> Self {
+        YoungCfg { on: false, min_age_s: 0.0, max_positions: 2, usd: 50.0 }
+    }
+
+    /// Most money in young test positions at once.
+    pub fn max_total_usd(&self) -> f64 {
+        self.max_positions as f64 * self.usd
+    }
+}
+
+/// Does a rush on a pool of this age go to the young test group? Only when
+/// the test is on, the main rule would skip it as "pool too young", and it
+/// is at least the test's own minimum age. (Unknown age never qualifies:
+/// that rush is already skipped as "pool age unknown".)
+pub fn goes_young(age: Option<f64>, min_pool_age_s: f64, y: &YoungCfg) -> bool {
+    y.on && crate::rugguard::too_young(age, min_pool_age_s) && age.is_some_and(|a| a >= y.min_age_s)
+}
+
+/// Room for one more YOUNG test position: young slots and the young money
+/// cap only (main slots and money are never used), and never a coin that
+/// any position, main or young, already holds. `usd` None = size not known yet.
+pub fn young_has_room(main_open: &[(&str, f64)], young_open: &[(&str, f64)], token: &str, usd: Option<f64>, y: &YoungCfg) -> bool {
+    !main_open.iter().any(|(t, _)| t.eq_ignore_ascii_case(token)) && has_room(young_open, token, usd, y.max_positions, y.max_total_usd())
+}
+
+/// Should the live trader copy this paper position? Never a young one.
+pub fn live_mirrors(young: bool) -> bool {
+    !young
+}
+
+/// Mark a file line as part of the young test group (no-op for main lines,
+/// so main lines stay exactly as before).
+pub fn tag_group(line: &mut Value, young_age: Option<f64>) {
+    if let Some(a) = young_age {
+        line["group"] = json!("young");
+        line["pool_age_s"] = json!(a.round());
+    }
+}
+
+/// Is this file line from the young test group?
+pub fn is_young_line(v: &Value) -> bool {
+    v["group"] == "young"
 }
 
 impl Config {
@@ -1017,6 +1159,7 @@ impl Config {
             // A bad list is caught in run() (venues_from_env) so the error is shown.
             venues: venue::parse_venues(&std::env::var("SNIPER_VENUES").unwrap_or_else(|_| "v3,v4,v2".into())).unwrap_or_default(),
             v4_lookup: std::env::var("SNIPER_V4_LOOKUP").map(|v| v != "off").unwrap_or(true),
+            young: YoungCfg::from_env(),
         }
     }
 }
@@ -1262,7 +1405,24 @@ pub fn run(cfg: Config) -> Result<(), String> {
         f.flush().map_err(|e| e.to_string())
     };
     let rpc = Rpc::new(&cfg.http);
-    let quoter = ChainQuoter { rpc: Rpc::new(&cfg.http) };
+    // Speed step 2 (engine.rs): with SNIPER_ENGINE=1, quotes come from our
+    // own arbsim engine copy (node as automatic fallback). Unset = the plain
+    // node quoter, exactly as before.
+    let (ecfg, ewarn) = crate::engine::EngineConfig::from_env();
+    if let Some(w) = ewarn {
+        eprintln!("paper: {w}");
+    }
+    let quoter = crate::engine::EngineQuoter::new(ChainQuoter { rpc: Rpc::new(&cfg.http) }, &cfg.http, &ecfg, &cfg.out)?;
+    if ecfg.on {
+        eprintln!(
+            "paper: engine quotes ON (socket {}, timeout {} ms, at {}, check mode {}, feed forward {})",
+            ecfg.socket,
+            ecfg.timeout.as_millis(),
+            ecfg.at,
+            if ecfg.check { "ON: trades use the node's answer" } else { "off" },
+            if ecfg.forward { "on" } else { "off" }
+        );
+    }
     let mut taxcheck = crate::taxcheck::Checker::default();
     let agent = ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(10))).build().new_agent();
     let mut eth = eth_usd(&quoter).ok_or("could not price ETH in USDG (node or quoter unreachable)")?;
@@ -1277,6 +1437,15 @@ pub fn run(cfg: Config) -> Result<(), String> {
                "node": crate::probe::redact(&cfg.http), "push": cfg.wss.as_deref().map(crate::probe::redact), "eth_usd": eth, "late_blocks": cfg.late_blocks,
                "venues": venue_names, "v4_lookup": cfg.v4_lookup}),
     )?;
+    // Young-pool test group: its settings go in meta.jsonl only when it is on
+    // (off = meta.jsonl exactly as before).
+    if cfg.young.on {
+        write(&mut f_meta, json!({"event": "young_test", "min_age_s": cfg.young.min_age_s, "max_positions": cfg.young.max_positions, "usd": cfg.young.usd, "main_min_pool_age_s": cfg.min_pool_age_s}))?;
+        eprintln!(
+            "paper: YOUNG-POOL TEST ON (paper only, never live): pools {:.0}s..{:.0}s old trade in {} separate slot(s) of up to ${}",
+            cfg.young.min_age_s, cfg.min_pool_age_s, cfg.young.max_positions, cfg.young.usd
+        );
+    }
     // Permanent blocklist: load what earlier runs in this folder learned.
     let block_path = cfg.out.join(Blocklist::FILE);
     let mut blocklist = Blocklist::load(&block_path)?;
@@ -1296,6 +1465,11 @@ pub fn run(cfg: Config) -> Result<(), String> {
         if let Ok(text) = fs::read_to_string(cfg.out.join("signals.jsonl")) {
             for line in text.lines() {
                 if let Ok(v) = serde_json::from_str::<Value>(line) {
+                    // A young test line repeats a rush already in the file
+                    // (as "pool too young"): count each rush once.
+                    if is_young_line(&v) {
+                        continue;
+                    }
                     if let (Some(p), Some(b)) = (v["pool"].as_str(), v["block"].as_u64()) {
                         rush_hist.entry(p.to_ascii_lowercase()).or_default().push_back(b);
                     }
@@ -1384,6 +1558,62 @@ pub fn run(cfg: Config) -> Result<(), String> {
     }
     // Push mode: a websocket thread hands us each matching log as it happens.
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Speed step 3 (feedwake.rs): swaps found in the sequencer feed and
+    // confirmed on the engine wake this loop up. Off unless SNIPER_FEED_WAKE=1
+    // (and the engine is on); off = nothing below changes anything.
+    let (wcfg, wwarn) = crate::feedwake::WakeConfig::from_env(ecfg.on);
+    if let Some(w) = wwarn {
+        eprintln!("paper: {w}");
+    }
+    let wake = wcfg.on.then(|| crate::feedwake::Shared::new(stop.clone()));
+    let (tap_tx, tap_rx) = match &wake {
+        Some(_) => {
+            let (t, r) = std::sync::mpsc::sync_channel::<(Instant, std::sync::Arc<str>)>(256);
+            (Some(t), Some(r))
+        }
+        None => (None, None),
+    };
+    // Feed forwarder for the engine (its own threads; never touches this loop).
+    // With feed wake-up its one feed connection also feeds the wake-up tap.
+    let fwd = (ecfg.on && ecfg.forward).then(|| crate::engine::spawn_forwarder_tap(&ecfg, stop.clone(), tap_tx.clone()));
+    let tap_stats = match (&tap_tx, ecfg.forward) {
+        (Some(t), false) => Some(crate::engine::spawn_tap_reader(&ecfg.feed, stop.clone(), t.clone())),
+        _ => None,
+    };
+    drop(tap_tx);
+    let wake_rx = match (&wake, tap_rx) {
+        (Some(sh), Some(rx)) => Some(crate::feedwake::spawn_worker(sh.clone(), &ecfg.socket, ecfg.timeout, wcfg.wait, rx)),
+        _ => None,
+    };
+    let mut f_wake = match &wake {
+        Some(_) => Some(open(crate::feedwake::FILE)?),
+        None => None,
+    };
+    if wake.is_some() {
+        eprintln!(
+            "paper: FEED WAKE-UP ON: swaps from the sequencer feed, confirmed on the engine | node poll {} while the feed is healthy, normal pace if no frame for {} s",
+            wcfg.poll_when_feed.map_or("at the normal pace".to_string(), |p| format!("every {} ms", p.as_millis())),
+            wcfg.stale.as_secs()
+        );
+        write(&mut f_meta, json!({"event": "feedwake", "poll_when_feed_ms": wcfg.poll_when_feed.map(|p| p.as_millis() as u64), "stale_s": wcfg.stale.as_secs(), "wait_ms": wcfg.wait.as_millis() as u64}))?;
+    }
+    let mut merge = crate::feedwake::Merge::default();
+    // Feed health as last reported (for "went stale" / "healthy again" lines).
+    let mut wake_healthy = false;
+    let mut wake_stats_at = Instant::now();
+    // When the node was last polled (feed wake-up decides when it is due).
+    let mut last_poll: Option<Instant> = None;
+    // Pools traded recently (watch list) and whether the list must be rebuilt.
+    let mut active: HashMap<String, Instant> = HashMap::new();
+    let mut watched: HashSet<String> = HashSet::new();
+    let mut watch_dirty = false;
+    let mut watch_at = Instant::now();
+    // Signers the feed recovered (V4 rushes count wallets without a node lookup).
+    let mut feed_signers: HashMap<String, String> = HashMap::new();
+    let mut feed_signer_order: VecDeque<String> = VecDeque::new();
+    // Newest block the feed showed (for "behind" on feed rushes).
+    let mut feed_head: Option<u64> = None;
+    let mut engine_meta_at = Instant::now();
     let log_rx = cfg.wss.clone().map(|url| {
         let (ltx, lrx) = std::sync::mpsc::channel::<Value>();
         let (stop2, tl, shown) = (stop.clone(), topic_list.clone(), crate::probe::redact(&url));
@@ -1405,6 +1635,52 @@ pub fn run(cfg: Config) -> Result<(), String> {
         eprintln!("paper: swaps pushed from {shown}");
         lrx
     });
+    // HOT-POOL WEBSOCKET (wshot.rs): pushed swaps for the few hot pools,
+    // off unless SNIPER_WS_HOT=1; plus its free cost estimate (default on).
+    // Not with SNIPER_PUSH (that already pushes every swap on the chain).
+    let (hcfg, hwarn) = crate::wshot::WsHotCfg::from_env();
+    if let Some(w) = hwarn {
+        eprintln!("paper: {w}");
+    }
+    let ws_topics = crate::wshot::Topics::from_paper(&topics);
+    let hot_on = hcfg.needs_hot_set() && log_rx.is_none();
+    // One clock for every source's "seen at" times (the feed wake-up's when on).
+    let clock0 = wake.as_ref().map_or_else(Instant::now, |sh| sh.born);
+    let ms_of = |t: Instant| t.saturating_duration_since(clock0).as_millis() as u64;
+    let ws_sh = (hcfg.on && log_rx.is_none()).then(|| crate::wshot::Shared::new(stop.clone(), clock0));
+    let ws_rx = ws_sh.as_ref().map(|sh| crate::wshot::spawn(std::env::var("SNIPER_RHC_WSS").unwrap_or_default(), cfg.http.clone(), hcfg.clone(), ws_topics.clone(), sh.clone()));
+    // Swap dedupe and source timing (feedwake.rs Merge) for any push source.
+    let merging = wake.is_some() || ws_sh.is_some();
+    let mut f_ws = if hot_on { Some(open(crate::wshot::FILE)?) } else { None };
+    let hot_rules = crate::wshot::HotRules {
+        window_ms: hcfg.active.as_millis() as u64,
+        min_age_s: cfg.min_pool_age_s,
+        young_min_age_s: cfg.young.on.then_some(cfg.young.min_age_s),
+        max_pools: hcfg.max_pools,
+        max_v4: hcfg.max_v4,
+    };
+    let mut hot = crate::wshot::HotSet::default();
+    let mut hot_act = crate::wshot::Activity::default();
+    let mut hot_at: Option<Instant> = None;
+    let mut hot_dirty = false;
+    let mut est = crate::wshot::Estimator::default();
+    let mut est_recent: Option<f64> = None;
+    let mut ws_healthy = false;
+    let mut ws_head: Option<u64> = None;
+    let mut ws_stats_at = Instant::now();
+    if hot_on {
+        write(&mut f_meta, json!({"event": "wshot", "on": ws_sh.is_some(), "estimate": hcfg.estimate, "max_pools": hcfg.max_pools, "max_v4": hcfg.max_v4,
+                                  "active_min": hcfg.active.as_secs() / 60, "renew_s": hcfg.renew_min.as_secs(), "stale_s": hcfg.stale.as_secs(),
+                                  "poll_when_ws_ms": hcfg.poll_when_ws.map(|p| p.as_millis() as u64), "budget_day": hcfg.budget_day}))?;
+        eprintln!(
+            "paper: hot-pool WebSocket {} | free estimate {} | hot set: up to {} pools + {} V4 ids traded in the last {} min that pass the cheap filters",
+            if ws_sh.is_some() { "ON (pushed swaps for hot pools; polling stays on as backup)" } else { "off" },
+            if hcfg.estimate { "on" } else { "off" },
+            hcfg.max_pools,
+            hcfg.max_v4,
+            hcfg.active.as_secs() / 60
+        );
+    }
     // Old V4 pools: background history lookups (off with SNIPER_V4_LOOKUP=off).
     let lookup = (cfg.venues.contains(&VenueKind::V4) && cfg.v4_lookup).then(|| spawn_v4_lookup(cfg.http.clone()));
     let mut v4_asked: HashSet<String> = HashSet::new();
@@ -1424,6 +1700,8 @@ pub fn run(cfg: Config) -> Result<(), String> {
     let (mut n_trades, mut n_wins, mut total, mut n_rush, mut n_skipped) = (0u64, 0u64, 0.0f64, 0u64, 0u64);
     let mut n_unsafe = 0u64; // rushes skipped by the tax/trap check
     let mut n_filtered = 0u64; // rushes skipped by the other safety filters
+    // Young test group tallies (status line only): trades, wins, net USD.
+    let (mut y_trades, mut y_wins, mut y_total) = (0u64, 0u64, 0.0f64);
     let mut tally: BTreeMap<&'static str, VenueTally> = BTreeMap::new();
     // Coin cutoff: each coin's closed trades (when, net USD).
     let mut coin_hist = load_coin_history(&cfg.out, cfg.cut_window);
@@ -1444,9 +1722,103 @@ pub fn run(cfg: Config) -> Result<(), String> {
     let mut late: Vec<LateTrade> = Vec::new();
 
     loop {
-        // Push mode waits on the stream (below); poll mode sleeps between asks.
-        if log_rx.is_none() {
+        // ---- feed wake-up: wait for a feed swap OR the next node poll ----
+        // Swap records from the feed (see feedwake.rs), handled before the
+        // polled ones in this round.
+        let mut feed_logs: Vec<Value> = Vec::new();
+        // Pushed logs from the hot-pool WebSocket (wshot.rs), this round.
+        let mut ws_logs: Vec<Value> = Vec::new();
+        let mut poll_due = true;
+        let ws_ok = ws_sh.as_ref().is_some_and(|w| w.healthy(hcfg.stale));
+        if let Some(w) = &ws_sh {
+            if ws_ok != ws_healthy {
+                eprintln!(
+                    "paper: hot-pool WebSocket {}",
+                    if ws_ok { "HEALTHY (subscribed, messages arriving)" } else { "NOT healthy (not subscribed or quiet): normal node polling" }
+                );
+                if let Some(f) = f_ws.as_mut() {
+                    write(f, json!({"ev": if ws_ok { "healthy" } else { "stale" }, "t": w.now_ms(), "wall_ms": SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0), "ws": w.json()}))?;
+                }
+                ws_healthy = ws_ok;
+            }
+        }
+        // A healthy WebSocket may slow polling (SNIPER_RHC_POLL_MS_WHEN_WS;
+        // default: no, normal pace). Never faster than the pace given.
+        let ws_pace = |p: Duration| match hcfg.poll_when_ws {
+            Some(x) if ws_ok => p.max(x),
+            _ => p,
+        };
+        if let (Some(sh), Some(rx)) = (&wake, &wake_rx) {
+            let healthy = sh.healthy(wcfg.stale);
+            if healthy != wake_healthy {
+                let ev = if healthy { "healthy" } else { "stale" };
+                eprintln!("paper: feed wake-up {}", if healthy { "HEALTHY: node polling slowed to backup pace" } else { "STALE (no feed frames or engine not answering): back to normal node polling" });
+                if let Some(f) = f_wake.as_mut() {
+                    write(f, json!({"ev": ev, "t": sh.now_ms(), "wall_ms": SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0), "worker": sh.json()}))?;
+                }
+                wake_healthy = healthy;
+            }
+            let pace = ws_pace(match wcfg.poll_when_feed {
+                Some(p) if healthy => p,
+                _ => poll_now(&cfg, SystemTime::now()),
+            });
+            let due_at = last_poll.map_or(Instant::now(), |t| t + pace);
+            let mut got: Vec<crate::feedwake::FeedSwap> = Vec::new();
+            if log_rx.is_none() {
+                match &ws_rx {
+                    // Sleep until the poll is due, unless a feed swap arrives first.
+                    None => {
+                        if let Ok(fs) = rx.recv_timeout(due_at.saturating_duration_since(Instant::now())) {
+                            got.push(fs);
+                        }
+                    }
+                    // Both push sources: wait in short slices for either.
+                    Some(wrx) => loop {
+                        let left = due_at.saturating_duration_since(Instant::now());
+                        if let Ok(fs) = rx.recv_timeout(left.min(Duration::from_millis(20))) {
+                            got.push(fs);
+                            break;
+                        }
+                        ws_logs.extend(wrx.try_iter());
+                        if !ws_logs.is_empty() || Instant::now() >= due_at {
+                            break;
+                        }
+                    },
+                }
+            }
+            got.extend(rx.try_iter());
+            for fs in &got {
+                feed_head = Some(feed_head.map_or(fs.block, |h| h.max(fs.block)));
+                if let Some(w) = &fs.signer {
+                    if feed_signers.insert(fs.tx.clone(), w.clone()).is_none() {
+                        feed_signer_order.push_back(fs.tx.clone());
+                        if feed_signer_order.len() > 20_000 {
+                            if let Some(old) = feed_signer_order.pop_front() {
+                                feed_signers.remove(&old);
+                            }
+                        }
+                    }
+                }
+                feed_logs.extend(crate::feedwake::synth_logs(fs));
+            }
+            poll_due = Instant::now() >= due_at;
+        } else if let (Some(wrx), true) = (&ws_rx, log_rx.is_none()) {
+            // Hot-pool WebSocket only: sleep until the poll is due, unless a
+            // pushed log arrives first.
+            let due_at = last_poll.map_or(Instant::now(), |t| t + ws_pace(poll_now(&cfg, SystemTime::now())));
+            if let Ok(v) = wrx.recv_timeout(due_at.saturating_duration_since(Instant::now())) {
+                ws_logs.push(v);
+            }
+            poll_due = Instant::now() >= due_at;
+        } else if log_rx.is_none() {
+            // Push mode waits on the stream (below); poll mode sleeps between asks.
             std::thread::sleep(poll_now(&cfg, SystemTime::now()));
+        }
+        if let Some(wrx) = &ws_rx {
+            ws_logs.extend(wrx.try_iter());
+            if let Some(b) = ws_logs.iter().map(|l| hex_u64(l.get("blockNumber"))).max() {
+                ws_head = Some(ws_head.map_or(b, |h| h.max(b)));
+            }
         }
         if cfg.duration.is_some_and(|d| started.elapsed() >= d) {
             break;
@@ -1487,23 +1859,30 @@ pub fn run(cfg: Config) -> Result<(), String> {
             if let Some(b) = logs.iter().map(|l| hex_u64(l.get("blockNumber"))).max() {
                 last_block = Some(last_block.map_or(b, |x| x.max(b)));
             }
-        } else {
+        } else if poll_due {
+            last_poll = Some(Instant::now());
             let head = match rpc.call("eth_blockNumber", json!([])) {
-                Ok(v) => hex_u64(Some(&v)),
+                Ok(v) => Some(hex_u64(Some(&v))),
                 Err(e) => {
                     errors += 1;
                     if errors % 20 == 1 {
                         eprintln!("paper: node error ({e})");
                     }
-                    continue;
+                    // Pushed swaps in hand are still handled; otherwise as before.
+                    if feed_logs.is_empty() && ws_logs.is_empty() {
+                        continue;
+                    }
+                    None
                 }
             };
+            let head_ok = head.is_some();
+            let head = head.unwrap_or(0);
             let from = match last_block {
                 None => head,
                 Some(l) if head <= l => head + 1,
                 Some(l) => (l + 1).max(head.saturating_sub(50)),
             };
-            if from <= head {
+            if head_ok && from <= head {
                 let params = json!([{"fromBlock": format!("0x{from:x}"), "toBlock": format!("0x{head:x}"), "topics": [topic_list]}]);
                 let t_fetch = Instant::now();
                 let got = rpc.call("eth_getLogs", params);
@@ -1512,6 +1891,14 @@ pub fn run(cfg: Config) -> Result<(), String> {
                     Ok(v) => {
                         last_block = Some(head);
                         logs = v.as_array().cloned().unwrap_or_default();
+                        // Free estimate: what the hot set's subscription would push.
+                        if hot_on && hcfg.estimate {
+                            est.count(&logs, &hot, &ws_topics);
+                        }
+                        // Where a WebSocket fill-in would start.
+                        if let Some(w) = &ws_sh {
+                            w.head_hint.store(head, std::sync::atomic::Ordering::Relaxed);
+                        }
                     }
                     Err(e) => {
                         errors += 1;
@@ -1526,18 +1913,32 @@ pub fn run(cfg: Config) -> Result<(), String> {
         // the node reported is what "behind" is measured against.
         let t_logs = Instant::now();
         let head_seen = last_block;
-        let mut rushes: Vec<RushSig> = Vec::new();
+        // Feed wake-up: when the polled logs arrived, on its shared clock.
+        let poll_ms = if merging { ms_of(t_logs) } else { 0 };
+        // Each rush with where it came from: (source, ms it was first seen).
+        let mut rushes: Vec<(RushSig, (crate::feedwake::Src, u64))> = Vec::new();
         // Rushes on V4 pools whose key we don't know: counted, never traded.
         let mut unknown_rushes: Vec<RushSig> = Vec::new();
         {
             let mut logs = logs;
             logs.sort_by_key(|l| (hex_u64(l.get("blockNumber")), hex_u64(l.get("logIndex"))));
-            for log in &logs {
+            // Feed swaps first (they arrived first), in chain order.
+            feed_logs.sort_by_key(|l| (hex_u64(l.get("blockNumber")), hex_u64(l.get("transactionIndex")), hex_u64(l.get("logIndex"))));
+            // Then WebSocket pushes (real node logs), in chain order.
+            ws_logs.sort_by_key(|l| (hex_u64(l.get("blockNumber")), hex_u64(l.get("logIndex"))));
+            for log in feed_logs.iter().chain(ws_logs.iter()).chain(logs.iter()) {
                 // A log the node takes back (short re-org) is not a real swap.
                 if log["removed"].as_bool() == Some(true) {
                     continue;
                 }
                 let Some(kind) = log_kind(log, &topics) else { continue };
+                // Feed wake-up: which source this record is from, and when seen.
+                let (src, seen_ms) = match log["_src"].as_str() {
+                    Some("feed") => (crate::feedwake::Src::Feed, log["_seen_ms"].as_u64().unwrap_or(poll_ms)),
+                    Some("ws") => (crate::feedwake::Src::Ws, log["_seen_ms"].as_u64().unwrap_or(poll_ms)),
+                    _ => (crate::feedwake::Src::Poll, poll_ms),
+                };
+                let txh = log["transactionHash"].as_str().unwrap_or("").to_ascii_lowercase();
                 let addr = log["address"].as_str().map(str::to_ascii_lowercase).unwrap_or_default();
                 let w = words(log["data"].as_str().unwrap_or(""));
                 let block = hex_u64(log.get("blockNumber"));
@@ -1561,6 +1962,10 @@ pub fn run(cfg: Config) -> Result<(), String> {
                         continue;
                     }
                     LogKind::V2Sync => {
+                        // Feed wake-up: the other source already counted this swap.
+                        if merging && merge.seen_by_other(src, &txh, &addr) {
+                            continue;
+                        }
                         // V2 reserves (each Swap comes right after its Sync).
                         if !matches!(pools.get(&addr), Some(None)) {
                             if let Some(r) = venue::v2_reserves(log["data"].as_str().unwrap_or("")) {
@@ -1575,6 +1980,17 @@ pub fn run(cfg: Config) -> Result<(), String> {
                     },
                     LogKind::V3Swap | LogKind::V2Swap => addr,
                 };
+                // Feed wake-up: count each swap once (tx + pool), whichever
+                // source showed it first; note swaps that arrive out of order.
+                let admit = if merging {
+                    let txi = hex_u64(log.get("transactionIndex"));
+                    merge.admit(src, &txh, &pool, (block, txi), seen_ms, watched.contains(&pool))
+                } else {
+                    crate::feedwake::Admit::Fresh
+                };
+                if admit == crate::feedwake::Admit::Dup {
+                    continue;
+                }
                 if !pools.contains_key(&pool) {
                     match kind {
                         LogKind::V3Swap | LogKind::V2Swap => {
@@ -1628,6 +2044,10 @@ pub fn run(cfg: Config) -> Result<(), String> {
                     continue;
                 };
                 let Some(info) = entry else { continue };
+                // Hot set: this tradable pool just traded.
+                if hot_on {
+                    hot_act.note_swap(&pool, started.elapsed().as_millis() as u64);
+                }
                 let price = match kind {
                     LogKind::V2Swap => v2_res.get(&pool).and_then(|(r0, r1)| venue::v2_price(*r0, *r1, info.token_is0)),
                     _ => w.get(2).and_then(|sp| token_price(&crate::fourmeme::word_dec(sp), info.token_is0)),
@@ -1643,9 +2063,95 @@ pub fn run(cfg: Config) -> Result<(), String> {
                     sells.record(&pool);
                 }
                 let buyer = if kind == LogKind::V4Swap { venue::swap_buyer_v4(log) } else { swap_buyer(log) };
-                if let Some(r) = det.on_swap(&pool, block, &buyer, price, &cfg.rules) {
-                    rushes.push(r);
+                let rush = if admit == crate::feedwake::Admit::Late {
+                    // Out of order (the other source already showed newer
+                    // swaps here): its buyer counts, the price stays.
+                    det.on_late_swap(&pool, block, &buyer, price, !sold, &cfg.rules)
+                } else {
+                    det.on_swap(&pool, block, &buyer, price, &cfg.rules)
+                };
+                if wake.is_some() {
+                    // Watch list: pools that traded recently.
+                    active.insert(pool.clone(), Instant::now());
+                    if !watched.contains(&pool) {
+                        watch_dirty = true;
+                    }
                 }
+                if let Some(r) = rush {
+                    if merging {
+                        merge.note_rush(src, &txh, &pool, block, seen_ms);
+                    }
+                    if hot_on {
+                        hot_act.note_rush(&pool, started.elapsed().as_millis() as u64);
+                        hot_dirty = true;
+                    }
+                    rushes.push((r, (src, seen_ms)));
+                }
+            }
+        }
+
+        // ---- feed wake-up: watch list and lead-time lines ----
+        if let Some(sh) = &wake {
+            if watch_dirty || watch_at.elapsed() >= Duration::from_secs(60) {
+                active.retain(|_, t| t.elapsed() <= wcfg.active);
+                let list: Vec<crate::feedwake::WatchPool> = active.keys().filter_map(|k| pools.get(k).cloned().flatten().map(|p| watch_pool(k, &p))).collect();
+                watched = list.iter().map(|p| p.key.clone()).collect();
+                sh.set_watch(crate::feedwake::WatchIndex::build(list));
+                watch_dirty = false;
+                watch_at = Instant::now();
+            }
+            if let Some(f) = f_wake.as_mut() {
+                for ev in merge.events.drain(..) {
+                    write(f, ev)?;
+                }
+                if wake_stats_at.elapsed() >= Duration::from_secs(600) {
+                    write(f, json!({"ev": "stats", "t": sh.now_ms(), "merge": merge.json(), "worker": sh.json()}))?;
+                    wake_stats_at = Instant::now();
+                }
+            }
+        }
+
+        // ---- hot-pool WebSocket: hot set (every 5 s, or at once after a rush) ----
+        if hot_on && (hot_dirty || hot_at.is_none_or(|t| t.elapsed() >= Duration::from_secs(5))) {
+            let now_ms = started.elapsed().as_millis() as u64;
+            hot_act.prune(now_ms, hot_rules.window_ms);
+            let lb = last_block.unwrap_or(0);
+            let cands: Vec<crate::wshot::Cand> = hot_act
+                .iter()
+                .filter_map(|(k, (swap, rush))| {
+                    let info = pools.get(k)?.as_ref()?;
+                    Some(crate::wshot::Cand {
+                        key: k.clone(),
+                        v4: matches!(info.venue, Venue::V4 { .. }),
+                        last_swap_ms: *swap,
+                        last_rush_ms: *rush,
+                        age_s: ages.age_secs(k, lb, BLOCK_SECS).or_else(|| births.get(k).map(|b| lb.saturating_sub(b) as f64 * BLOCK_SECS)),
+                        blocked: blocklist.contains(&info.token),
+                        unsafe_hook: matches!(&info.venue, Venue::V4 { key } if venue::hook_changes_amounts(&key.hooks)),
+                    })
+                })
+                .collect();
+            hot = crate::wshot::select_hot(&cands, &hot_rules, now_ms);
+            if let Some(w) = &ws_sh {
+                w.set_wanted(hot.clone());
+                merge.ws_subscribed = w.live().keys();
+            }
+            hot_at = Some(Instant::now());
+            hot_dirty = false;
+        }
+        if let Some(f) = f_ws.as_mut() {
+            // Rush leads go here when the feed wake-up file is not open.
+            if f_wake.is_none() {
+                for ev in merge.events.drain(..) {
+                    write(f, ev)?;
+                }
+            }
+            if ws_stats_at.elapsed() >= Duration::from_secs(600) {
+                write(f, wshot_line(&est, est_recent, &hot, &hcfg))?;
+                if let Some(w) = &ws_sh {
+                    write(f, json!({"ev": "stats", "t": w.now_ms(), "ws": w.json(), "merge": merge.json()}))?;
+                }
+                ws_stats_at = Instant::now();
             }
         }
 
@@ -1713,26 +2219,33 @@ pub fn run(cfg: Config) -> Result<(), String> {
                             pi += 1;
                             continue; // the real sale isn't at a target yet: keep holding
                         };
-                        n_trades += 1;
-                        if net > 0.0 {
-                            n_wins += 1;
+                        if p.young_age.is_some() {
+                            // Young test trade: its own tallies, never the main ones.
+                            y_trades += 1;
+                            y_wins += (net > 0.0) as u64;
+                            y_total += net;
+                        } else {
+                            n_trades += 1;
+                            if net > 0.0 {
+                                n_wins += 1;
+                            }
+                            total += net;
+                            let t = tally.entry(vt).or_default();
+                            t.trades += 1;
+                            t.wins += (net > 0.0) as u64;
+                            t.pnl += net;
                         }
-                        total += net;
+                        // Coin cooling-off history: every closed trade, young or main.
                         coin_hist.entry(p.info.token.to_ascii_lowercase()).or_default().push((unix_now(), net));
-                        let t = tally.entry(vt).or_default();
-                        t.trades += 1;
-                        t.wins += (net > 0.0) as u64;
-                        t.pnl += net;
-                        write(
-                            &mut f_trades,
-                            json!({"pool": p.pool, "token": p.info.token, "base": p.info.base, "venue": vt, "open_block": p.open_block, "close_block": last_block,
+                        let mut row = json!({"pool": p.pool, "token": p.info.token, "base": p.info.base, "venue": vt, "open_block": p.open_block, "close_block": last_block,
                                    "held_s": p.opened.elapsed().as_secs_f64(), "reason": reason, "pool_move_pct": 100.0 * gain,
                                    "pre_flow": {"buys": p.pre_flow.0, "sells": p.pre_flow.1}, "early": p.early,
                                    "shadow_sl": SHADOW_STOPS.iter().zip(&p.shadow).map(|(lv, v)| (format!("{:.0}", lv * 100.0), json!(v))).collect::<serde_json::Map<_, _>>(),
                                    "usd_in": p.usd_in, "gross_usd": gross, "gas_usd": gross - net, "net_usd": net,
                                    "base_in": p.base_in.to_string(), "base_out": out.to_string(), "tokens": p.tokens.to_string(),
-                                   "wall_ms": SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)}),
-                        )?;
+                                   "wall_ms": SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)});
+                        tag_group(&mut row, p.young_age);
+                        write(&mut f_trades, row)?;
                         // Size study: sell the same trade at every other size, right now.
                         let mut ladder = Vec::new();
                         for (usd, b_in, toks) in &p.ladder {
@@ -1741,14 +2254,25 @@ pub fn run(cfg: Config) -> Result<(), String> {
                                 ladder.push(json!({"usd": usd, "net": n}));
                             }
                         }
-                        write(&mut f_trades, json!({"ladder_for": p.pool, "venue": vt, "open_block": p.open_block, "auto_usd": p.auto_usd, "ladder": ladder}))?;
-                        eprintln!(
-                            "paper: SELL {} [{vt}] ({reason}, {:.1}s) net ${net:+.2} | total ${total:+.2} over {n_trades} trades",
-                            p.info.token,
-                            p.opened.elapsed().as_secs_f64()
-                        );
-                        // Live mode: sell the real position that mirrors this one.
-                        if let Some(lt) = live.as_mut() {
+                        let mut lad = json!({"ladder_for": p.pool, "venue": vt, "open_block": p.open_block, "auto_usd": p.auto_usd, "ladder": ladder});
+                        tag_group(&mut lad, p.young_age);
+                        write(&mut f_trades, lad)?;
+                        if p.young_age.is_some() {
+                            eprintln!(
+                                "paper: SELL {} [{vt}] YOUNG TEST ({reason}, {:.1}s) net ${net:+.2} | young total ${y_total:+.2} over {y_trades} trades",
+                                p.info.token,
+                                p.opened.elapsed().as_secs_f64()
+                            );
+                        } else {
+                            eprintln!(
+                                "paper: SELL {} [{vt}] ({reason}, {:.1}s) net ${net:+.2} | total ${total:+.2} over {n_trades} trades",
+                                p.info.token,
+                                p.opened.elapsed().as_secs_f64()
+                            );
+                        }
+                        // Live mode: sell the real position that mirrors this
+                        // one (young test trades are never mirrored).
+                        if let Some(lt) = live.as_mut().filter(|_| live_mirrors(p.young_age.is_some())) {
                             if lt.open.as_ref().is_some_and(|lp| lp.pool == p.pool) {
                                 if let Err(e) = lt.sell(reason, reason == "stop_loss", Some(net), eth) {
                                     eprintln!("LIVE: sell of {} failed ({e}); will retry as an emergency sell", p.info.token);
@@ -1762,26 +2286,32 @@ pub fn run(cfg: Config) -> Result<(), String> {
                     Err(e) => {
                         // Can't price the exit: keep trying; record it.
                         if p.opened.elapsed() > cfg.hold * 3 {
-                            write(
-                                &mut f_trades,
-                                json!({"pool": p.pool, "token": p.info.token, "venue": vt, "reason": "exit_quote_failed", "error": e, "usd_in": p.usd_in, "net_usd": -p.usd_in}),
-                            )?;
+                            let mut row = json!({"pool": p.pool, "token": p.info.token, "venue": vt, "reason": "exit_quote_failed", "error": e, "usd_in": p.usd_in, "net_usd": -p.usd_in});
+                            tag_group(&mut row, p.young_age);
+                            write(&mut f_trades, row)?;
                             // Size study: every size is lost in full too.
                             let ladder: Vec<Value> = p.ladder.iter().map(|(usd, _, _)| json!({"usd": usd, "net": -usd})).collect();
-                            write(&mut f_trades, json!({"ladder_for": p.pool, "venue": vt, "open_block": p.open_block, "auto_usd": p.auto_usd, "ladder": ladder}))?;
-                            total -= p.usd_in;
-                            n_trades += 1;
-                            let t = tally.entry(vt).or_default();
-                            t.trades += 1;
-                            t.pnl -= p.usd_in;
+                            let mut lad = json!({"ladder_for": p.pool, "venue": vt, "open_block": p.open_block, "auto_usd": p.auto_usd, "ladder": ladder});
+                            tag_group(&mut lad, p.young_age);
+                            write(&mut f_trades, lad)?;
+                            if p.young_age.is_some() {
+                                y_trades += 1;
+                                y_total -= p.usd_in;
+                            } else {
+                                total -= p.usd_in;
+                                n_trades += 1;
+                                let t = tally.entry(vt).or_default();
+                                t.trades += 1;
+                                t.pnl -= p.usd_in;
+                            }
                             // Never touch this token again (survives restarts).
                             block(&mut blocklist, &p.info.token, "exit_quote_failed");
                             creators.block(&rpc, &ages, &p.pool, &format!("rug: exit failed on {}", p.info.token));
                             // Race check: still try the late sell (no optimistic price to compare).
                             schedule_late_exit(&mut late, &p, last_block, cfg.late_blocks, None);
                             closed = true;
-                            eprintln!("paper: EXIT FAILED {} [{vt}] (counted as total loss)", p.info.token);
-                            if let Some(lt) = live.as_mut() {
+                            eprintln!("paper: EXIT FAILED {} [{vt}]{} (counted as total loss)", p.info.token, if p.young_age.is_some() { " YOUNG TEST" } else { "" });
+                            if let Some(lt) = live.as_mut().filter(|_| live_mirrors(p.young_age.is_some())) {
                                 if lt.open.as_ref().is_some_and(|lp| lp.pool == p.pool) {
                                     if let Err(e) = lt.sell("exit quote failed", true, Some(-p.usd_in), eth) {
                                         eprintln!("LIVE: emergency sell of {} failed ({e})", p.info.token);
@@ -1809,7 +2339,14 @@ pub fn run(cfg: Config) -> Result<(), String> {
         }
 
         // ---- new rushes ----
-        for r in rushes {
+        // Young test group: status counters as they were before a rush went
+        // to the young test, put back afterwards so the status line's main
+        // counts stay exactly as without the test.
+        let mut restore: Option<(u64, u64, u64)> = None;
+        for (r, (src, seen_ms)) in rushes {
+            if let Some(c) = restore.take() {
+                (n_filtered, n_unsafe, n_skipped) = c;
+            }
             n_rush += 1;
             let Some(info) = pools.get(&r.pool).cloned().flatten() else { continue };
             // Skip-first-rush: count earlier rushes BEFORE remembering this one.
@@ -1821,9 +2358,25 @@ pub fn run(cfg: Config) -> Result<(), String> {
             };
             let vt = info.venue_name();
             tally.entry(vt).or_default().rushes += 1;
+            // Young test group (off = both stay unset, nothing changes):
+            //   young_age  Some(age) once this rush is a young test rush: its
+            //              lines are then tagged "group":"young"
+            //   main_done  the main result was already written ("busy") and
+            //              we only go on to see if it is a young test rush;
+            //              main lines are not written again
+            let young_age: std::cell::Cell<Option<f64>> = std::cell::Cell::new(None);
+            let main_done = std::cell::Cell::new(false);
             // A skipped rush: one line in signals.jsonl with the reason.
             let skip = |f: &mut BufWriter<std::fs::File>, why: String| {
-                write(f, json!({"pool": r.pool, "token": info.token, "block": r.block, "taken": false, "venue": vt, "why": why}))
+                if young_age.get().is_none() && main_done.get() {
+                    return Ok(());
+                }
+                let mut line = json!({"pool": r.pool, "token": info.token, "block": r.block, "taken": false, "venue": vt, "why": why});
+                if merging {
+                    line["src"] = json!(src.name());
+                }
+                tag_group(&mut line, young_age.get());
+                write(f, line)
             };
             // V4 hook that can change swap amounts: our maths would be wrong.
             if let Venue::V4 { key } = &info.venue {
@@ -1833,12 +2386,19 @@ pub fn run(cfg: Config) -> Result<(), String> {
                     continue;
                 }
             }
-            // Busy: all slots full, or we already hold this token.
-            let open: Vec<(&str, f64)> = positions.iter().map(|p| (p.info.token.as_str(), p.usd_in)).collect();
+            // Busy: all (main) slots full, or we already hold this token.
+            // Young test positions never take or block a main slot.
+            let open: Vec<(&str, f64)> = positions.iter().filter(|p| p.young_age.is_none()).map(|p| (p.info.token.as_str(), p.usd_in)).collect();
             if !has_room(&open, &info.token, None, cfg.max_positions, cfg.max_total_usd) {
                 n_skipped += 1;
                 skip(&mut f_sig, "busy".into())?;
-                continue;
+                if !cfg.young.on {
+                    continue;
+                }
+                // Young test on: main is done with this rush, but it may
+                // still be a young test rush (decided by its pool age below).
+                main_done.set(true);
+                restore.get_or_insert((n_filtered, n_unsafe, n_skipped));
             }
             // Cheap filters first (no node calls).
             if blocklist.contains(&info.token) {
@@ -1874,10 +2434,30 @@ pub fn run(cfg: Config) -> Result<(), String> {
                 }
             }
             if crate::rugguard::too_young(age, cfg.min_pool_age_s) {
-                n_filtered += 1;
-                skip(&mut f_sig, format!("pool too young ({:.0}s old, need {:.0}s)", age.unwrap_or(0.0), cfg.min_pool_age_s))?;
+                if !main_done.get() {
+                    n_filtered += 1;
+                    skip(&mut f_sig, format!("pool too young ({:.0}s old, need {:.0}s)", age.unwrap_or(0.0), cfg.min_pool_age_s))?;
+                }
+                // Young test group: the main result above stays "pool too
+                // young"; from here on this rush is a young test rush and
+                // goes through every other filter on its own lines.
+                if !goes_young(age, cfg.min_pool_age_s, &cfg.young) {
+                    continue;
+                }
+                restore.get_or_insert((n_filtered, n_unsafe, n_skipped));
+                young_age.set(age);
+                let main_open: Vec<(&str, f64)> = positions.iter().filter(|p| p.young_age.is_none()).map(|p| (p.info.token.as_str(), p.usd_in)).collect();
+                let young_open: Vec<(&str, f64)> = positions.iter().filter(|p| p.young_age.is_some()).map(|p| (p.info.token.as_str(), p.usd_in)).collect();
+                if !young_has_room(&main_open, &young_open, &info.token, None, &cfg.young) {
+                    skip(&mut f_sig, "busy".into())?;
+                    continue;
+                }
+            } else if main_done.get() {
+                // Main was busy and this is not a young pool: nothing more to do.
                 continue;
             }
+            // From here on, `young` = this is a young test rush.
+            let young = young_age.get().is_some();
             // Skip-first-rush: a lone rush on a coin that was quiet for the
             // past hour tended to fizzle; trade only once it is active.
             if prior < cfg.min_prior_rushes {
@@ -1922,7 +2502,15 @@ pub fn run(cfg: Config) -> Result<(), String> {
             // Buyers known only by transaction (V4): count the signing wallets.
             let hashes: Vec<String> = r.buyers.iter().filter(|b| venue::is_tx_hash(b)).cloned().collect();
             if !hashes.is_empty() {
-                let verdict = tx_signers(&cfg.http, &agent, &hashes).map(|m| venue::distinct_buyers(&r.buyers, &m));
+                // Signers the feed already recovered need no node lookup
+                // (empty without feed wake-up: every hash is looked up).
+                let known: HashMap<String, String> = hashes.iter().filter_map(|h| feed_signers.get(h).map(|w| (h.clone(), w.clone()))).collect();
+                let ask: Vec<String> = hashes.iter().filter(|h| !known.contains_key(*h)).cloned().collect();
+                let looked = if ask.is_empty() { Ok(HashMap::new()) } else { tx_signers(&cfg.http, &agent, &ask) };
+                let verdict = looked.map(|mut m| {
+                    m.extend(known);
+                    venue::distinct_buyers(&r.buyers, &m)
+                });
                 match verdict {
                     Ok(n) if n >= cfg.rules.buys => {}
                     Ok(n) => {
@@ -1965,8 +2553,10 @@ pub fn run(cfg: Config) -> Result<(), String> {
             let ladder: Vec<(f64, U256, U256)> = rungs.iter().map(|(u, b, t, _, _)| (*u, *b, *t)).collect();
             let round_trips: Vec<(f64, f64)> = rungs.iter().filter_map(|(u, _, _, _, rt)| rt.map(|x| (*u, x))).collect();
             let auto_usd = pick_auto(&round_trips, cfg.auto_max_rt);
-            // The trade's real size: auto size, capped at MAX_USD.
-            let Some(usd_in) = decide_size(auto_usd, &cfg.sizes, cfg.max_usd, cfg.usd) else {
+            // The trade's real size: auto size, capped at MAX_USD (young
+            // test: capped at SNIPER_YOUNG_USD instead).
+            let (cap_usd, fallback_usd) = if young { (cfg.young.usd, cfg.young.usd) } else { (cfg.max_usd, cfg.usd) };
+            let Some(usd_in) = decide_size(auto_usd, &cfg.sizes, cap_usd, fallback_usd) else {
                 if round_trips.is_empty() {
                     // Nothing could be priced at all: a quote problem, not depth.
                     skip(&mut f_sig, "quote failed: size study got no round-trip quotes".into())?;
@@ -1976,12 +2566,23 @@ pub fn run(cfg: Config) -> Result<(), String> {
                 }
                 continue;
             };
-            // Total money at risk across open positions stays under the cap.
-            let open: Vec<(&str, f64)> = positions.iter().map(|p| (p.info.token.as_str(), p.usd_in)).collect();
-            let open_usd: f64 = open.iter().map(|(_, u)| u).sum();
-            if !has_room(&open, &info.token, Some(usd_in), cfg.max_positions, cfg.max_total_usd) {
+            // Total money at risk across open positions stays under the cap
+            // (main and young test each against their own cap).
+            let main_open: Vec<(&str, f64)> = positions.iter().filter(|p| p.young_age.is_none()).map(|p| (p.info.token.as_str(), p.usd_in)).collect();
+            let young_open: Vec<(&str, f64)> = positions.iter().filter(|p| p.young_age.is_some()).map(|p| (p.info.token.as_str(), p.usd_in)).collect();
+            let (open_usd, cap): (f64, f64) = if young {
+                (young_open.iter().map(|(_, u)| u).sum(), cfg.young.max_total_usd())
+            } else {
+                (main_open.iter().map(|(_, u)| u).sum(), cfg.max_total_usd)
+            };
+            let room = if young {
+                young_has_room(&main_open, &young_open, &info.token, Some(usd_in), &cfg.young)
+            } else {
+                has_room(&main_open, &info.token, Some(usd_in), cfg.max_positions, cfg.max_total_usd)
+            };
+            if !room {
                 n_skipped += 1;
-                skip(&mut f_sig, format!("busy (${open_usd:.0} open, cap ${:.0})", cfg.max_total_usd))?;
+                skip(&mut f_sig, format!("busy (${open_usd:.0} open, cap ${cap:.0})"))?;
                 continue;
             }
             let base_in = raw(usd_in);
@@ -2009,8 +2610,25 @@ pub fn run(cfg: Config) -> Result<(), String> {
                     let check_ms = t_check.elapsed().as_secs_f64() * 1000.0;
                     // Buy is ready now: this is the moment a live order goes out.
                     let behind = head_seen.unwrap_or(r.block).saturating_sub(r.block);
-                    let delay = delay_json(behind, fetch_ms, t_logs.elapsed().as_secs_f64() * 1000.0, ladder_ms, check_ms);
-                    eprintln!("paper: BUY  {} ${usd_in} [{vt}] ({}/{} rush at block {})", info.token, info.base, r.pool, r.block);
+                    let mut delay = delay_json(behind, fetch_ms, t_logs.elapsed().as_secs_f64() * 1000.0, ladder_ms, check_ms);
+                    if merging {
+                        // "Behind" for a pushed rush: the newest block that
+                        // source (or polling) has shown past the rush block.
+                        let src_head = match src {
+                            crate::feedwake::Src::Feed => feed_head,
+                            crate::feedwake::Src::Ws => ws_head.max(head_seen),
+                            crate::feedwake::Src::Poll => head_seen,
+                        };
+                        tag_delay(&mut delay, src, ms_of(t_logs).saturating_sub(seen_ms) as f64, ms_of(Instant::now()).saturating_sub(seen_ms) as f64, src_head.unwrap_or(r.block).saturating_sub(r.block));
+                    }
+                    eprintln!(
+                        "paper: BUY  {} ${usd_in} [{vt}]{} ({}/{} rush at block {})",
+                        info.token,
+                        young_age.get().map_or(String::new(), |a| format!(" YOUNG TEST (pool {:.0} min old)", a / 60.0)),
+                        info.base,
+                        r.pool,
+                        r.block
+                    );
                     // Race check: price this exact buy again a few blocks from
                     // the newest block we have seen (when we really decided).
                     let decided = last_block.unwrap_or(r.block).max(r.block);
@@ -2024,10 +2642,14 @@ pub fn run(cfg: Config) -> Result<(), String> {
                         buy_due: late_due(decided, cfg.late_blocks),
                         buy: LateQuote::Pending,
                         exit: None,
+                        young_age: young_age.get(),
                     });
                     // Live mode: mirror this buy with real money if allowed.
-                    if let Some(lt) = live.as_mut() {
-                        match lt.refuse(&info) {
+                    // Young test trades are NEVER mirrored (paper only).
+                    if let Some(lt) = live.as_mut().filter(|_| live_mirrors(young)) {
+                        // Stale-signal guard: never send a buy decided too far
+                        // behind the chain (PR #249 lesson). Paper still trades it.
+                        match lt.refuse(&info).or_else(|| lt.refuse_stale(&delay)) {
                             None => {
                                 if let Err(e) = lt.buy(&r.pool, &info, usd_per_base, tokens) {
                                     eprintln!("LIVE: buy {} not done ({e})", info.token);
@@ -2039,7 +2661,12 @@ pub fn run(cfg: Config) -> Result<(), String> {
                     // Rug guard measurements (no rule yet, scored later against
                     // outcomes). Done AFTER the buy so they never slow it down.
                     let rug_meta = rug_measure(&rpc, &mut creators, &ages, &mut safety_cache, &r.pool, &info, r.block);
-                    write(&mut f_sig, json!({"pool": r.pool, "token": info.token, "block": r.block, "taken": true, "venue": vt, "usd_in": usd_in, "rug": rug_meta, "delay": delay}))?;
+                    let mut line = json!({"pool": r.pool, "token": info.token, "block": r.block, "taken": true, "venue": vt, "usd_in": usd_in, "rug": rug_meta, "delay": delay});
+                    if merging {
+                        line["src"] = json!(src.name());
+                    }
+                    tag_group(&mut line, young_age.get());
+                    write(&mut f_sig, line)?;
                     positions.push(Position {
                         pool: r.pool.clone(),
                         info,
@@ -2057,12 +2684,17 @@ pub fn run(cfg: Config) -> Result<(), String> {
                         shadow: vec![None; SHADOW_STOPS.len()],
                         pre_flow: det.flow(&r.pool, r.block.saturating_sub(PRE_FLOW_BLOCKS)),
                         early: None,
+                        young_age: young_age.get(),
                     });
                 }
                 other => {
                     skip(&mut f_sig, format!("quote failed: {other:?}"))?;
                 }
             }
+        }
+
+        if let Some(c) = restore.take() {
+            (n_filtered, n_unsafe, n_skipped) = c;
         }
 
         if beat.elapsed() >= Duration::from_secs(60) {
@@ -2074,15 +2706,86 @@ pub fn run(cfg: Config) -> Result<(), String> {
                 if n_trades > 0 { 100.0 * n_wins as f64 / n_trades as f64 } else { 0.0 },
                 if h > 0.0 { total / h } else { 0.0 },
                 if per_venue.is_empty() { "no rushes yet".to_string() } else { per_venue.join(", ") },
-                if positions.is_empty() { "none".to_string() } else { positions.iter().map(|p| p.info.token.as_str()).collect::<Vec<_>>().join(",") },
+                {
+                    let main: Vec<&str> = positions.iter().filter(|p| p.young_age.is_none()).map(|p| p.info.token.as_str()).collect();
+                    if main.is_empty() { "none".to_string() } else { main.join(",") }
+                },
                 crate::sellcheck::NODE_CALLS.load(std::sync::atomic::Ordering::Relaxed),
                 if h > 0.0 { crate::sellcheck::NODE_CALLS.load(std::sync::atomic::Ordering::Relaxed) as f64 / h * 24.0 / 1000.0 } else { 0.0 }
             );
+            if cfg.young.on {
+                let open_y: Vec<&str> = positions.iter().filter(|p| p.young_age.is_some()).map(|p| p.info.token.as_str()).collect();
+                eprintln!(
+                    "paper: young test (paper only, not in the totals above): trades {y_trades} | wins {:.0}% | ${y_total:+.2} | open: {}",
+                    if y_trades > 0 { 100.0 * y_wins as f64 / y_trades as f64 } else { 0.0 },
+                    if open_y.is_empty() { "none".to_string() } else { open_y.join(",") }
+                );
+            }
+            if let Some(sh) = &wake {
+                let m = &merge.stats;
+                eprintln!(
+                    "paper: {} | {} | polled swaps on watched pools {} (feed had {} first) | tap dropped {}",
+                    sh.summary(),
+                    if wake_healthy { "healthy" } else { "STALE" },
+                    m.polled_watched,
+                    m.polled_feed_first,
+                    fwd.as_ref().or(tap_stats.as_ref()).map_or(0, |f| f.tap_dropped.load(std::sync::atomic::Ordering::Relaxed))
+                );
+            }
+            if hot_on {
+                let k = |x: Option<f64>| x.map_or("?".to_string(), |v| if v >= 10_000.0 { format!("{:.0}k", v / 1000.0) } else { format!("{v:.0}") });
+                if hcfg.estimate {
+                    est_recent = est.recent_per_day();
+                    eprintln!(
+                        "paper: ws estimate (free): hot set {} pools + {} V4 ids would push ~{} messages/day (last 10 min ~{}/day; {} matching logs so far) | spare budget {}/day",
+                        hot.addrs.len(),
+                        hot.v4.len(),
+                        k(est.per_day()),
+                        k(est_recent),
+                        est.matched,
+                        k(Some(hcfg.budget_day))
+                    );
+                }
+                if let Some(w) = &ws_sh {
+                    let g = |a: &std::sync::atomic::AtomicU64| a.load(std::sync::atomic::Ordering::Relaxed);
+                    let live = w.live();
+                    let m = &merge.stats;
+                    eprintln!(
+                        "paper: ws hot: {} | live {} pools + {} V4 ids (wanted {} + {}) | messages {} (~{}/day) | renewals {} (refused {}), connections {}, went quiet {} | fill-ins {} ({} logs, {} failed) | swaps ws first {}, poll first {}",
+                        if ws_healthy { "healthy" } else { "NOT healthy (normal polling)" },
+                        live.addrs.len(),
+                        live.v4.len(),
+                        hot.addrs.len(),
+                        hot.v4.len(),
+                        g(&w.c.messages),
+                        k(w.messages_per_day()),
+                        g(&w.c.renewals),
+                        g(&w.c.renew_errors),
+                        g(&w.c.sessions),
+                        g(&w.c.stale_drops),
+                        g(&w.c.fills),
+                        g(&w.c.fill_logs),
+                        g(&w.c.fill_errors),
+                        m.polled_ws_first,
+                        m.ws_after_poll
+                    );
+                }
+            }
+            if quoter.engine_on() {
+                eprintln!("paper: {}{}", quoter.stats.summary(), fwd.as_ref().map(|f| format!(" | {}", f.summary())).unwrap_or_default());
+                // Counts for the report, every 10 minutes.
+                if engine_meta_at.elapsed() >= Duration::from_secs(600) {
+                    write(&mut f_meta, json!({"event": "engine", "wall_ms": SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0),
+                                              "quotes": quoter.stats.json(), "feed": fwd.as_ref().map(|f| f.json())}))?;
+                    engine_meta_at = Instant::now();
+                }
+            }
             if let Some(lt) = live.as_mut() {
                 // A live position whose paper twin is gone (its sell failed):
                 // keep trying an emergency sell every heartbeat.
                 if let Some(lp) = lt.open.clone() {
-                    if !positions.iter().any(|p| p.pool == lp.pool) {
+                    // (only a main position can be its twin: young ones are never mirrored)
+                    if !positions.iter().any(|p| p.young_age.is_none() && p.pool == lp.pool) {
                         match lt.sell("retry after failed sell", true, None, eth) {
                             Ok(n) => eprintln!("LIVE: retried sell done, real ${n:+.2}"),
                             Err(e) => eprintln!("LIVE: retried sell failed again ({e})"),
@@ -2099,8 +2802,65 @@ pub fn run(cfg: Config) -> Result<(), String> {
     }
     let _ = v4keys.save_if_dirty(&keys_path);
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    if quoter.engine_on() {
+        write(&mut f_meta, json!({"event": "engine", "quotes": quoter.stats.json(), "feed": fwd.as_ref().map(|f| f.json())}))?;
+    }
+    if let (Some(sh), Some(f)) = (&wake, f_wake.as_mut()) {
+        for ev in merge.events.drain(..) {
+            write(f, ev)?;
+        }
+        write(f, json!({"ev": "stats", "t": sh.now_ms(), "merge": merge.json(), "worker": sh.json(), "final": true}))?;
+    }
+    if let Some(f) = f_ws.as_mut() {
+        if f_wake.is_none() {
+            for ev in merge.events.drain(..) {
+                write(f, ev)?;
+            }
+        }
+        let recent = est.recent_per_day();
+        write(f, wshot_line(&est, recent, &hot, &hcfg))?;
+        if let Some(w) = &ws_sh {
+            write(f, json!({"ev": "stats", "t": w.now_ms(), "ws": w.json(), "merge": merge.json(), "final": true}))?;
+        }
+    }
     write(&mut f_meta, json!({"event": "stop", "trades": n_trades, "total_usd": total}))?;
     Ok(())
+}
+
+/// The free estimate's line for wshot.jsonl.
+fn wshot_line(est: &crate::wshot::Estimator, recent: Option<f64>, hot: &crate::wshot::HotSet, hcfg: &crate::wshot::WsHotCfg) -> Value {
+    json!({"ev": "estimate", "on": hcfg.estimate, "pools": hot.addrs.len(), "v4": hot.v4.len(), "matched": est.matched, "secs": est.started.elapsed().as_secs(),
+           "per_day": est.per_day().map(f64::round), "recent_per_day": recent.map(f64::round), "budget_day": hcfg.budget_day})
+}
+
+/// Feed wake-up: the watch-list entry for one of the trader's pools.
+pub fn watch_pool(key: &str, p: &Pool) -> crate::feedwake::WatchPool {
+    let kind = match p.venue {
+        Venue::V3 { .. } => crate::feedwake::Kind::V3,
+        Venue::V2 { .. } => crate::feedwake::Kind::V2,
+        Venue::V4 { .. } => crate::feedwake::Kind::V4,
+    };
+    crate::feedwake::WatchPool { key: key.to_ascii_lowercase(), kind, token: p.token.to_ascii_lowercase(), token_is0: p.token_is0 }
+}
+
+/// Feed wake-up: tag a buy's delay record with the rush's source.
+///   src            "feed" or "poll" (which source completed the rush)
+///   since_seen_ms  first sighting of the rush's last swap -> buy ready
+/// For a FEED rush "wait" is the time from the feed frame arriving to the
+/// swap being in our hands (engine confirm + queue), there is no node fetch,
+/// and "behind" counts blocks the feed was past the rush block; total =
+/// wait + work, comparable with a polled rush's total.
+pub fn tag_delay(delay: &mut Value, src: crate::feedwake::Src, wait_ms: f64, since_seen_ms: f64, feed_behind: u64) {
+    delay["src"] = json!(src.name());
+    delay["since_seen_ms"] = json!(since_seen_ms.round());
+    // Pushed sources (feed, hot-pool WebSocket): no node fetch of our own.
+    if src != crate::feedwake::Src::Poll {
+        let work = delay["work_ms"].as_f64().unwrap_or(0.0);
+        delay["behind_blocks"] = json!(feed_behind);
+        delay["wait_ms"] = json!(wait_ms.round());
+        delay["fetch_ms"] = json!(0.0);
+        delay["total_ms"] = json!((wait_ms + work).round());
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2108,16 +2868,20 @@ pub fn run(cfg: Config) -> Result<(), String> {
 // ---------------------------------------------------------------------------
 
 pub fn report(dir: &std::path::Path) -> String {
-    let all: Vec<Value> = fs::read_to_string(dir.join("paper_trades.jsonl"))
+    let all_lines: Vec<Value> = fs::read_to_string(dir.join("paper_trades.jsonl"))
         .unwrap_or_default()
         .lines()
         .filter_map(|l| serde_json::from_str(l).ok())
         .collect();
+    let sig_lines: Vec<Value> = fs::read_to_string(dir.join("signals.jsonl")).unwrap_or_default().lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
+    // Young-pool test group lines are kept OUT of every main number below
+    // (the main part reads as if the test never ran) and get their own section.
+    let (young_all, all): (Vec<Value>, Vec<Value>) = all_lines.into_iter().partition(is_young_line);
+    let (young_sig, sig): (Vec<Value>, Vec<Value>) = sig_lines.into_iter().partition(is_young_line);
     // Trade lines vs size-study lines ("ladder_for").
     let rows: Vec<Value> = all.iter().filter(|r| r.get("reason").is_some()).cloned().collect();
     let ladders: Vec<&Value> = all.iter().filter(|r| r.get("ladder_for").is_some()).collect();
     let meta: Vec<Value> = fs::read_to_string(dir.join("meta.jsonl")).unwrap_or_default().lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
-    let sig: Vec<Value> = fs::read_to_string(dir.join("signals.jsonl")).unwrap_or_default().lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
     let start = meta.iter().find(|m| m["event"] == "start");
     let start_ms = start.and_then(|m| m["wall_ms"].as_u64()).unwrap_or(0);
     let last_ms = rows.iter().filter_map(|r| r["wall_ms"].as_u64()).max().unwrap_or(start_ms);
@@ -2175,7 +2939,7 @@ pub fn report(dir: &std::path::Path) -> String {
         }
         sizes_txt += &format!("  AUTO (largest size with <=1.5% round-trip cost): ${auto_total:+.2} over {auto_n} trades (${:+.2}/h)\n", if hours > 0.0 { auto_total / hours } else { 0.0 });
     }
-    let race_txt = race_section(&all, start.and_then(|m| m["late_blocks"].as_u64()), hours) + &delay_section(&sig);
+    let race_txt = race_section(&all, start.and_then(|m| m["late_blocks"].as_u64()), hours) + &delay_section(&sig) + &crate::engine::report_section(dir, &meta) + &crate::feedwake::report_section(dir, &sig) + &crate::wshot::report_section(dir, &sig);
     let venue_txt = venue_section(&all, &sig, start) + &hour_section(&rows) + &stop_study_section(&rows) + &flow_study_section(&rows);
     let mean = if n > 0 { total / n as f64 } else { 0.0 };
     let sd = if n > 1 { (nets.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n - 1) as f64).sqrt() } else { 0.0 };
@@ -2185,7 +2949,7 @@ pub fn report(dir: &std::path::Path) -> String {
          rushes seen {} | trades {} | skipped (busy or no quote) {} | blocked as unsafe {}\n\
          TOTAL ${:+.2}  =  ${:+.2} per hour  |  per trade ${:+.2} (rough 95% range ${:+.2} .. ${:+.2})\n\
          wins {:.0}% | best ${:+.2} | worst ${:+.2} | gas paid ${:.2}\n\
-         exits: {:?}\n{}{}{}{}",
+         exits: {:?}\n{}{}{}{}{}",
         hours,
         size_txt,
         sig.len(),
@@ -2205,8 +2969,81 @@ pub fn report(dir: &std::path::Path) -> String {
         venue_txt,
         sizes_txt,
         race_txt,
-        skip_txt
+        skip_txt,
+        young_section(&young_all, &young_sig, meta.iter().any(|m| m["event"] == "young_test"))
     )
+}
+
+/// A young test trade that was a rug: the sale could not be priced at all
+/// (exit failed), the sale quote came back as nothing, or it lost half or more.
+pub fn is_rug(r: &Value) -> bool {
+    let net = r["net_usd"].as_f64().unwrap_or(0.0);
+    let usd_in = r["usd_in"].as_f64().unwrap_or(0.0);
+    r["reason"] == "exit_quote_failed" || r["base_out"] == "0" || (usd_in > 0.0 && net <= -0.5 * usd_in)
+}
+
+/// Age band of a young test trade (pool age at the rush).
+pub fn age_band(age_s: Option<f64>) -> &'static str {
+    match age_s {
+        None => "age ?",
+        Some(a) if a < 900.0 => "<15 min",
+        Some(a) if a < 1800.0 => "15-30 min",
+        Some(a) if a < 3600.0 => "30-60 min",
+        Some(_) => "60 min+",
+    }
+}
+
+/// Report section: the young-pool test group (paper only). Trades, wins,
+/// dollars, rugs and dollars without rugs, in all and split by pool age band
+/// and by venue. Empty if the test never ran in this folder.
+pub fn young_section(all: &[Value], sig: &[Value], was_on: bool) -> String {
+    let rows: Vec<&Value> = all.iter().filter(|r| r.get("reason").is_some()).collect();
+    if rows.is_empty() && sig.is_empty() && !was_on {
+        return String::new();
+    }
+    // One summary line for a group of trades.
+    let line = |g: &[&Value]| -> String {
+        let n = g.len();
+        let wins = g.iter().filter(|r| r["net_usd"].as_f64().unwrap_or(0.0) > 0.0).count();
+        let tot = g.iter().filter_map(|r| r["net_usd"].as_f64()).fold(0.0, |a, b| a + b);
+        let rugs: Vec<&&Value> = g.iter().filter(|r| is_rug(r)).collect();
+        let clean = g.iter().filter(|r| !is_rug(r)).filter_map(|r| r["net_usd"].as_f64()).fold(0.0, |a, b| a + b);
+        format!(
+            "{n} trades | wins {:.0}% | ${tot:+.2} | rugs {} | ${clean:+.2} without rugs",
+            if n > 0 { 100.0 * wins as f64 / n as f64 } else { 0.0 },
+            rugs.len()
+        )
+    };
+    let taken = sig.iter().filter(|s| s["taken"] == json!(true)).count();
+    let mut out = format!(
+        "YOUNG POOL TEST GROUP (paper only, NOT in any number above; never traded live)\n  young-pool rushes {} | bought {} | skipped by the other filters {}\n  all: {}\n",
+        sig.len(),
+        taken,
+        sig.len() - taken,
+        line(&rows)
+    );
+    out += "  by pool age:\n";
+    for band in ["<15 min", "15-30 min", "30-60 min", "60 min+", "age ?"] {
+        let g: Vec<&Value> = rows.iter().copied().filter(|r| age_band(r["pool_age_s"].as_f64()) == band).collect();
+        if !g.is_empty() {
+            out += &format!("    {band:<9}: {}\n", line(&g));
+        }
+    }
+    let mut venues: Vec<String> = rows.iter().map(|r| line_venue(r)).collect();
+    venues.sort_by_key(|n| VenueKind::ALL.iter().position(|k| k.name() == n).unwrap_or(99));
+    venues.dedup();
+    if !venues.is_empty() {
+        out += "  by venue:\n";
+        for v in venues {
+            let g: Vec<&Value> = rows.iter().copied().filter(|r| line_venue(r) == v).collect();
+            out += &format!("    {v:<9}: {}\n", line(&g));
+        }
+    }
+    let skips = count_skips(sig);
+    let named: Vec<String> = SKIP_REASONS.iter().zip(skips.iter()).filter(|(_, n)| **n > 0).map(|(name, n)| format!("{name} {n}")).collect();
+    let busy = sig.iter().filter(|s| s["why"].as_str().is_some_and(|w| w.starts_with("busy"))).count();
+    out += &format!("  young skips: busy {busy}{}{}\n", if named.is_empty() { "" } else { " | " }, named.join(" | "));
+    out
 }
 
 /// Report section: results by time of day in Toronto (UTC-5), 4-hour
@@ -2540,6 +3377,46 @@ mod tests {
     }
 
     #[test]
+    fn a_late_buyer_completes_a_rush_without_moving_the_price() {
+        // Feed showed b and d (newest price 103); polling later shows c,
+        // a buy in block 11 the feed missed: it completes the rush.
+        let mut d = Detector::default();
+        let r = rules();
+        assert!(d.on_swap("p", 1, "a", 100.0, &r).is_none());
+        assert!(d.on_swap("p", 10, "b", 101.0, &r).is_none());
+        assert!(d.on_swap("p", 12, "d", 103.0, &r).is_none(), "only 2 buyers so far");
+        let s = d.on_late_swap("p", 11, "c", 102.0, true, &r).expect("3rd buyer arrives late");
+        assert_eq!(s.block, 12, "tested at the newest block");
+        assert_eq!(s.price, 103.0, "price stays the newest one");
+        assert_eq!(s.buyers, vec!["b", "c", "d"]);
+        assert_eq!(d.last_price("p"), Some(103.0));
+        // a late SELL adds no buyer, and an unknown pool does nothing
+        let mut d2 = Detector::default();
+        d2.on_swap("q", 1, "a", 100.0, &r);
+        d2.on_swap("q", 10, "b", 101.0, &r);
+        d2.on_swap("q", 12, "d", 103.0, &r);
+        assert!(d2.on_late_swap("q", 11, "c", 99.0, false, &r).is_none());
+        assert_eq!(d2.flow("q", 0), (2, 1));
+        assert!(d2.on_late_swap("nope", 1, "x", 1.0, true, &r).is_none());
+    }
+
+    #[test]
+    fn feed_delay_tag() {
+        let mut d = delay_json(3, 30.0, 110.0, 50.0, 20.0);
+        tag_delay(&mut d, crate::feedwake::Src::Feed, 8.0, 125.0, 0);
+        assert_eq!(d["src"], "feed");
+        assert_eq!(d["total_ms"], 118.0, "frame -> in hand 8 ms + our work 110 ms");
+        assert_eq!(d["fetch_ms"], 0.0);
+        assert_eq!(d["behind_blocks"], 0);
+        let mut p = delay_json(3, 30.0, 110.0, 50.0, 20.0);
+        let before = p["total_ms"].clone();
+        tag_delay(&mut p, crate::feedwake::Src::Poll, 0.0, 115.0, 9);
+        assert_eq!(p["src"], "poll");
+        assert_eq!(p["total_ms"], before, "a polled rush keeps its numbers");
+        assert_eq!(p["since_seen_ms"], 115.0);
+    }
+
+    #[test]
     fn one_wallet_splitting_buys_is_not_a_rush() {
         let mut d = Detector::default();
         let r = rules();
@@ -2826,6 +3703,7 @@ mod tests {
             buy_due: 102,
             buy: LateQuote::Pending,
             exit: None,
+            young_age: None,
         }
     }
 
@@ -3154,4 +4032,148 @@ mod tests {
         assert_eq!(delay_section(&[json!({"taken": false})]), "");
     }
 
+
+    // ---- young-pool test group ----
+
+    fn young_on() -> YoungCfg {
+        YoungCfg { on: true, min_age_s: 0.0, max_positions: 2, usd: 50.0 }
+    }
+
+    #[test]
+    fn young_routing_only_for_pools_skipped_as_too_young() {
+        let y = young_on();
+        // Off: nothing ever goes young (the trader behaves as before).
+        assert!(!goes_young(Some(100.0), 3600.0, &YoungCfg::off()));
+        // On: a pool younger than the main rule goes young...
+        assert!(goes_young(Some(100.0), 3600.0, &y));
+        assert!(goes_young(Some(0.0), 3600.0, &y));
+        // ...an old-enough pool stays main, an unknown age is never young.
+        assert!(!goes_young(Some(3600.0), 3600.0, &y));
+        assert!(!goes_young(Some(9000.0), 3600.0, &y));
+        assert!(!goes_young(None, 3600.0, &y));
+        // The test's own minimum age.
+        let y5 = YoungCfg { min_age_s: 300.0, ..young_on() };
+        assert!(!goes_young(Some(299.0), 3600.0, &y5));
+        assert!(goes_young(Some(300.0), 3600.0, &y5));
+        // Main age rule off: nothing is "too young", so nothing goes young.
+        assert!(!goes_young(Some(10.0), 0.0, &y));
+    }
+
+    #[test]
+    fn young_slots_are_separate_from_main() {
+        let y = young_on();
+        // Main full (3 positions, $150): young still has room.
+        let main = [("0xa", 50.0), ("0xb", 50.0), ("0xc", 50.0)];
+        assert!(!has_room(&main, "0xd", None, 3, 150.0));
+        assert!(young_has_room(&main, &[], "0xd", Some(50.0), &y));
+        // Young full (2 slots): no more young, but main is not affected
+        // (main only ever looks at main positions).
+        let young = [("0xe", 50.0), ("0xf", 50.0)];
+        assert!(!young_has_room(&[], &young, "0xd", None, &y));
+        assert!(has_room(&[], "0xd", Some(50.0), 3, 150.0));
+        // Young money cap = slots x size.
+        assert!(!young_has_room(&[], &[("0xe", 50.0)], "0xd", Some(60.0), &y));
+        assert!(young_has_room(&[], &[("0xe", 50.0)], "0xd", Some(50.0), &y));
+        // Never a coin a main position (or another young one) already holds.
+        assert!(!young_has_room(&[("0xD", 50.0)], &[], "0xd", None, &y));
+        assert!(!young_has_room(&[], &[("0xd", 50.0)], "0xd", None, &y));
+    }
+
+    #[test]
+    fn young_trades_are_never_mirrored_live() {
+        assert!(live_mirrors(false));
+        assert!(!live_mirrors(true));
+    }
+
+    #[test]
+    fn young_lines_are_tagged_main_lines_untouched() {
+        let mut main = json!({"pool": "p", "taken": true});
+        tag_group(&mut main, None);
+        assert_eq!(main, json!({"pool": "p", "taken": true}));
+        let mut y = json!({"pool": "p", "taken": true});
+        tag_group(&mut y, Some(612.4));
+        assert_eq!(y["group"], "young");
+        assert_eq!(y["pool_age_s"], json!(612.0));
+        assert!(is_young_line(&y) && !is_young_line(&main));
+        // The race check line of a young trade is tagged too.
+        let q = RaceQuoter { buy_tokens: Some(980).into(), sell_out: Some(51_000_000).into() };
+        let mut t = LateTrade { young_age: Some(100.0), ..late_trade() };
+        t.exit = Some(LateExit { due: 105, opt_out: Some(U256::from(51_000_000u64)) });
+        let line = step_late(&mut t, 110, &q, 3000.0).expect("done");
+        assert_eq!(line["group"], "young");
+        let mut m = late_trade();
+        m.exit = Some(LateExit { due: 105, opt_out: Some(U256::from(51_000_000u64)) });
+        assert!(step_late(&mut m, 110, &q, 3000.0).expect("done").get("group").is_none());
+    }
+
+    #[test]
+    fn rugs_and_age_bands() {
+        assert!(is_rug(&json!({"reason": "exit_quote_failed", "usd_in": 50.0, "net_usd": -50.0})));
+        assert!(is_rug(&json!({"reason": "time", "usd_in": 50.0, "net_usd": -1.0, "base_out": "0"})));
+        assert!(is_rug(&json!({"reason": "stop_loss", "usd_in": 50.0, "net_usd": -25.0})));
+        assert!(!is_rug(&json!({"reason": "stop_loss", "usd_in": 50.0, "net_usd": -24.9, "base_out": "25"})));
+        assert_eq!(age_band(Some(10.0)), "<15 min");
+        assert_eq!(age_band(Some(900.0)), "15-30 min");
+        assert_eq!(age_band(Some(3599.0)), "30-60 min");
+        assert_eq!(age_band(Some(5000.0)), "60 min+");
+        assert_eq!(age_band(None), "age ?");
+    }
+
+    #[test]
+    fn report_keeps_young_out_of_main_numbers() {
+        let base = std::env::temp_dir().join(format!("sniper-young-report-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let (plain, with) = (base.join("plain"), base.join("with"));
+        // The main lines of a run (trade, size study, race check, signals).
+        let meta = json!({"event": "start", "wall_ms": 0, "max_usd": 50.0, "venues": ["v3", "v4", "v2"], "late_blocks": 2}).to_string();
+        let main_trades = vec![
+            json!({"pool": "p1", "venue": "v3", "reason": "take_profit", "usd_in": 50.0, "net_usd": 2.0, "gas_usd": 0.01, "wall_ms": 3_600_000u64, "shadow_sl": {"3": 1.0}, "pre_flow": {"buys": 3, "sells": 1}}).to_string(),
+            json!({"ladder_for": "p1", "venue": "v3", "auto_usd": 50.0, "ladder": [{"usd": 50.0, "net": 2.0}]}).to_string(),
+            json!({"late_for": "p1", "venue": "v3", "late_net_usd": 1.5}).to_string(),
+        ];
+        let main_sig = vec![
+            json!({"pool": "p1", "block": 1, "taken": true, "venue": "v3", "usd_in": 50.0, "delay": {"total_ms": 300.0, "wait_ms": 100.0, "fetch_ms": 50.0, "work_ms": 150.0}}).to_string(),
+            json!({"pool": "p2", "block": 2, "taken": false, "venue": "v2", "why": "pool too young (100s old, need 3600s)"}).to_string(),
+            json!({"pool": "p3", "block": 3, "taken": false, "venue": "v4", "why": "pool too young (2000s old, need 3600s)"}).to_string(),
+        ];
+        // The young test's own lines (same rushes as the "pool too young" ones).
+        let young_trades = vec![
+            json!({"pool": "p2", "venue": "v2", "reason": "take_profit", "usd_in": 50.0, "net_usd": 3.0, "gas_usd": 0.01, "wall_ms": 7_200_000u64, "group": "young", "pool_age_s": 100.0, "shadow_sl": {}, "pre_flow": {"buys": 3, "sells": 0}}).to_string(),
+            json!({"ladder_for": "p2", "venue": "v2", "auto_usd": 50.0, "ladder": [{"usd": 50.0, "net": 3.0}], "group": "young", "pool_age_s": 100.0}).to_string(),
+            json!({"late_for": "p2", "venue": "v2", "late_net_usd": -9.0, "group": "young", "pool_age_s": 100.0}).to_string(),
+            json!({"pool": "p4", "venue": "v4", "reason": "exit_quote_failed", "usd_in": 40.0, "net_usd": -40.0, "group": "young", "pool_age_s": 2000.0}).to_string(),
+        ];
+        let young_sig = vec![
+            json!({"pool": "p2", "block": 2, "taken": true, "venue": "v2", "usd_in": 50.0, "group": "young", "pool_age_s": 100.0, "delay": {"total_ms": 9000.0}}).to_string(),
+            json!({"pool": "p4", "block": 4, "taken": true, "venue": "v4", "usd_in": 40.0, "group": "young", "pool_age_s": 2000.0}).to_string(),
+            json!({"pool": "p3", "block": 3, "taken": false, "venue": "v4", "why": "no sell history (1 of 3 sells seen)", "group": "young", "pool_age_s": 2000.0}).to_string(),
+        ];
+        let write_run = |d: &Path, trades: Vec<String>, sig: Vec<String>, meta: Vec<String>| {
+            fs::create_dir_all(d).unwrap();
+            fs::write(d.join("meta.jsonl"), meta.join("\n")).unwrap();
+            fs::write(d.join("paper_trades.jsonl"), trades.join("\n")).unwrap();
+            fs::write(d.join("signals.jsonl"), sig.join("\n")).unwrap();
+        };
+        write_run(&plain, main_trades.clone(), main_sig.clone(), vec![meta.clone()]);
+        // Young lines mixed in between the main ones, as a real run writes them.
+        let mix = |a: &[String], b: &[String]| a.iter().zip(b.iter()).flat_map(|(x, y)| [x.clone(), y.clone()]).chain(b.iter().skip(a.len()).cloned()).collect::<Vec<_>>();
+        let young_meta = json!({"event": "young_test", "min_age_s": 0.0, "max_positions": 2, "usd": 50.0}).to_string();
+        write_run(&with, mix(&main_trades, &young_trades), mix(&main_sig, &young_sig), vec![meta, young_meta]);
+        let (a, b) = (report(&plain), report(&with));
+        // Every main number is the same: the main part of the report is
+        // exactly the report of a run without the test.
+        assert!(!a.contains("YOUNG POOL TEST GROUP"), "{a}");
+        let (main_part, young_part) = b.split_once("YOUNG POOL TEST GROUP").expect("young section");
+        assert_eq!(main_part, a, "main part changed:\n{b}");
+        assert!(a.contains("trades 1") && a.contains("TOTAL $+2.00"), "{a}");
+        // The young section: 2 trades, 1 win, +3 - 40 = -37, 1 rug, +3 without it.
+        assert!(young_part.contains("young-pool rushes 3 | bought 2 | skipped by the other filters 1"), "{young_part}");
+        assert!(young_part.contains("all: 2 trades | wins 50% | $-37.00 | rugs 1 | $+3.00 without rugs"), "{young_part}");
+        assert!(young_part.contains("<15 min  : 1 trades | wins 100% | $+3.00 | rugs 0"), "{young_part}");
+        assert!(young_part.contains("30-60 min: 1 trades | wins 0% | $-40.00 | rugs 1 | $+0.00 without rugs"), "{young_part}");
+        assert!(young_part.contains("v4       : 1 trades"), "{young_part}");
+        assert!(young_part.contains("v2       : 1 trades"), "{young_part}");
+        assert!(young_part.contains("no sell history 1"), "{young_part}");
+        let _ = fs::remove_dir_all(&base);
+    }
 }

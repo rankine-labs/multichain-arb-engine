@@ -173,6 +173,157 @@ exit slip (how much worse the late price was), and late quotes that failed.
 If the late total is much worse than the normal total, the paper profit
 depends on landing instantly, which we cannot do.
 
+## Live trader safety notes (live stays OFF)
+
+- Stale-signal guard (the dex bot's PR #249 lesson: never send a trade
+  decided behind the chain tip): the live trader refuses a buy when the
+  rush is more than `SNIPER_LIVE_MAX_BEHIND_BLOCKS` (default 5, about
+  0.5 s) blocks behind the newest block we know at the moment the order
+  would go out (the buy's `delay.behind_blocks`; `total_ms` is shown too).
+  Written to `signals.jsonl` as a `live_skip` reason. Paper keeps trading
+  those rushes, so we keep measuring them. `0` turns the guard off.
+- KNOWN LIMIT, not built yet: a live buy and sell wait for their receipts
+  INSIDE the paper trader's main loop (up to 20 s each, `RECEIPT_WAIT` in
+  `src/livetrade.rs`). Nothing else is watched meanwhile. Acceptable for one
+  $5 position; must be made non-blocking before more positions or bigger
+  sizes.
+
+## Engine quotes (speed step 2, off by default)
+
+With `SNIPER_ENGINE=1` the paper trader prices swaps from its own copy of
+the dex bot's `arbsim` engine (a full in-memory copy of Robinhood Chain,
+answers in about a millisecond) instead of a node round trip. If the engine
+is not ready, still loading a value, too slow (`SNIPER_ENGINE_TIMEOUT_MS`,
+default 50) or not running, the node is asked as before. The trader also
+forwards the sequencer feed (`SNIPER_RHC_FEED`) into the engine so its copy
+stays current. Details and all settings: `src/engine.rs`.
+
+- The engine is a SEPARATE process with its own socket
+  (`/tmp/sniper-arbsim.sock`); the dex bot's `/tmp/arbsim.sock` is refused.
+  Start it with `bash deploy/sniper-engine.sh start` (see that file).
+- `SNIPER_ENGINE_CHECK=1`: every quote is asked of both, side by side, and
+  written to `engine_check.jsonl`; trades use the NODE's answer. Different
+  answers are re-asked of the node at the engine's exact block, to separate
+  "engine was newer" from "engine was wrong". The report gets an
+  "engine quotes" section: match rate, engine vs node time (p50 / p95),
+  fallback rate and reasons.
+- The status line every minute shows engine answers vs node fallbacks and
+  the feed forwarder's sent / dropped frames.
+
+## Feed wake-up (speed step 3, off by default)
+
+With `SNIPER_FEED_WAKE=1` (needs `SNIPER_ENGINE=1` and the engine running)
+the paper trader learns about swaps from the sequencer feed instead of
+waiting for its next node poll. Details and settings: `src/feedwake.rs`.
+
+How it works, in short:
+- The pools the trader already follows (traded in the last 30 min) are on a
+  watch list. Every feed transaction whose call data mentions a watched
+  token or pool (any router, any byte position), or that calls a watched
+  pool directly, is a candidate.
+- For each candidate the engine is asked for the pool's price right before
+  and right after that transaction (its exact replayed copy). No change = no
+  swap, so failed / reverted transactions never count. A change = a swap:
+  direction from the price move, buyer = the wallet that signed it.
+- Confirmed swaps go through the SAME rush detector, filters and buy path as
+  polled swaps. Node polling keeps running as a backup
+  (`SNIPER_RHC_POLL_MS_WHEN_FEED`, default 2000 ms; 0 = normal pace). A swap
+  seen both ways counts once (tx hash + pool). No feed frame for
+  `SNIPER_FEED_STALE_SECS` (default 5), or the engine failing, = stale:
+  normal polling, logged.
+- `feedwake.jsonl` (run folder) records which source saw each rush first and
+  by how many ms, stale / healthy switches and counters. `paper-report` adds
+  a "feed wake-up" section: rushes first seen by feed vs poll, lead p50/p95,
+  coverage, engine confirms, stale fallbacks, rush -> buy ready by source.
+  Signals and delay records get `"src": "feed" | "poll"` (only when on).
+
+Known gaps: a swap whose call data names neither the token nor the pool is
+missed by the feed (polling still finds it later; it then counts as a late
+buyer without moving the price). Several swaps of one transaction in one
+pool are one net move. Blocks the engine could not replay itself are missed.
+V3/V2 buyers are counted by signer on the feed path and by recipient on the
+poll path (the same wallet in most trades, not always).
+
+Side-by-side paper test on the server: see the "FEED WAKE-UP" notes at the
+top of `deploy/sniper-engine.sh`.
+
+## Engine safety and the live trial (run 12 morning step 1)
+
+Lesson from the dex bot (`sim/COPY2_PLAN.md`): the engine mode the sniper
+uses ("replay every chain transaction", `ARBSIM_SOURCE=feed`) needed ~2.1M
+node reads a day on the live chain. The sniper's engine has 3,000 paid
+reads a day, and every earlier test used a fake node. So before run 12:
+
+    bash deploy/sniper-engine.sh trial          # 30 minutes; "trial 45 keep" = 45 min, keep it running
+
+starts the engine alone (paper bot untouched), forwards the feed relay into
+it, and every minute logs paid node reads used vs cap, public node reads,
+ready / not ready, how many quotes for ~10 hot V3 pools (from the newest
+paper run's `signals.jsonl`) it answered vs "unknown", memory and CPU. At
+the end: `ENGINE TRIAL VERDICT: WORKS | FALLS BACK TOO OFTEN | TOO MUCH
+MEMORY OR CPU`, with the numbers, also saved to
+`~/sniper-engine/trial-<time>.txt`. The engine is then stopped unless
+`keep`. The trial itself never talks to a node. Code: `src/enginetrial.rs`.
+
+Memory guard (dex bot lesson: its engine runs 1,000-1,250 MB, pm2 kills at
+1,800; this server has 7.7 GB and 2 CPUs): the cron stops our engine above
+`ENGINE_MEM_LIMIT_MB` (default 1500), logged, and restarts it with a growing
+wait (at once, then 120 s, 240 s ... 30 min; counted again after a stable
+hour). It also runs at low CPU priority (nice 15), with mimalloc and the
+copy's own size limits. Details: the top of `deploy/sniper-engine.sh`.
+
+## Hot-pool WebSocket (off by default) and its free estimate (on)
+
+The dex bot's proven way to hear about swaps early: subscribe on the paid
+WebSocket node to the swap events of ONLY the pools that matter (Chainstack
+pushes them about as fast as the sequencer feed, median 7 ms earlier; it
+bills every pushed message). Details and settings: `src/wshot.rs`.
+
+- Hot set: pools with a swap or rush in the last 30 min that pass the cheap
+  filters (tradable, not blocked, safe V4 hook, old enough for the age rule
+  or the young-test window). Rushed first, then most recent; capped at 200
+  V3/V2 pools + 200 V4 ids (hard limit 1,000; lists sent in pieces of 400).
+  V3/V2 filtered by address; V4 by pool id on the PoolManager.
+- Renewed when the set changes, at most every 30 s, make-before-break on the
+  same connection; every renewal and reconnect also fills in the gap from the
+  HTTP node (`eth_getLogs`). Repeats dropped by tx hash + log index; the
+  trader counts each swap once whichever source saw it first.
+- Pushed swaps go through the same rush detector and buy path (`"src":"ws"`).
+  Polling stays on as backup at the normal pace (rushes on pools that are
+  not hot yet are only found by polling); `SNIPER_RHC_POLL_MS_WHEN_WS` can
+  slow it while healthy. Quiet for 30 s = reconnect, normal polling meanwhile.
+- `SNIPER_WS_HOT_ESTIMATE` (default ON, costs nothing): counts the polled logs
+  the hot set's subscription WOULD push and projects messages per day,
+  against the spare budget `SNIPER_WS_HOT_BUDGET_DAY` (300,000).
+- Status line every minute, `wshot.jsonl` in the run folder, and a
+  "hot-pool WebSocket" section in `paper-report`: estimate (FITS / does NOT
+  fit), live messages per day, renewals, reconnects, fill-ins, rushes first
+  seen by ws / poll / feed, ws lead p50/p95, fallbacks.
+- Not used together with `SNIPER_PUSH=1` (that already pushes every swap).
+
+## Young-pool test group (paper only, off by default)
+
+`SNIPER_YOUNG_TEST=1` gives rushes on pools younger than
+`SNIPER_MIN_POOL_AGE_SECS` a separate paper test instead of a plain skip.
+Details: the top of `src/paper.rs`.
+
+- The main results do not change: the rush is still written as "pool too
+  young". It then goes through every OTHER filter and the same buy/exit
+  logic as a "young" test trade, in its own slots
+  (`SNIPER_YOUNG_MAX_POSITIONS`, default 2, each up to `SNIPER_YOUNG_USD`,
+  default 50). It never uses or blocks a main slot or the main money cap.
+  `SNIPER_YOUNG_MIN_AGE_SECS` (default 0) skips the very youngest pools.
+- Its lines in `signals.jsonl` / `paper_trades.jsonl` carry
+  `"group":"young"` and `"pool_age_s"`. `paper-report` keeps them out of
+  every main number and adds a "YOUNG POOL TEST GROUP" section: trades,
+  wins, $, rugs (exit failed, sale quote gone, or a loss of 50% or more),
+  $ without rugs, by pool age (<15, 15-30, 30-60, 60+ min) and by venue.
+- Never copied by the live trader (so never in the live daily loss
+  ledger). A trap-check failure or rug on a young trade still blocks the
+  token and its creator for everyone, and its result counts in the coin
+  cooling-off history like any trade.
+- Polled and feed wake-up rushes are routed the same way.
+
 ## Tests
 
 ```bash
@@ -192,6 +343,68 @@ normal token (PASS), a 5% tax token (REJECT) and an unsellable token
 (REJECT). It needs `anvil` on PATH or `ANVIL_BIN=/path/to/anvil`, and
 skips itself otherwise.
 
+`src/engine.rs` tests use a fake engine socket (fallback on miss, slow,
+missing, reverted and garbled answers; message formats; the report).
+`tests/engine_e2e.rs` runs the sniper's forwarder and quoter against the
+REAL arbsim binary (fake node + fake feed relay, all local). It needs the
+binary, so plain `cargo test` skips it:
+
+```bash
+(cd sim && cargo build --release --bin arbsim)
+(cd sniper && cargo test --test engine_e2e -- --ignored --nocapture)
+```
+
+Feed wake-up: `src/feedwake.rs` and `src/feedtx.rs` tests cover candidate
+finding (ABI words, packed V3 paths, direct pool calls, V4 by token), price
+reads, swap direction (failed tx = no change, V2 liquidity moves ignored),
+signer recovery (real signatures and the EIP-155 example), dedupe, lead
+times, health / stale, and the report section. Two end-to-end tests use the
+real arbsim (same build step, `tests/common/` holds the fakes):
+
+```bash
+(cd sniper && cargo test --test feedwake_e2e --test feedwake_paper_e2e -- --ignored --nocapture)
+```
+
+Young-pool test group: unit tests in `src/paper.rs` (routing, separate
+slots, never mirrored live, line tags, rugs and age bands, and a report
+check that the main part is byte-for-byte the report without the test).
+`tests/young_poll_e2e.rs` runs the real paper trader on the polled path
+(plain `cargo test`); `tests/young_feed_e2e.rs` does the same rush through
+feed wake-up (needs arbsim, `--ignored`).
+
+Cron engine auto-start: `tests/cron_engine_test.sh` runs the real
+`deploy/sniper-cron.sh` against fake binaries in a temp folder (fake HOME,
+fake build, fake arbsim, fake node link) and checks start, keep, restart,
+kill switch, feed server, failed-start back-off and that no link is logged.
+`cargo test` runs it via `tests/cron_engine.rs`; or `bash tests/cron_engine_test.sh`.
+
+Engine memory guard + trial: `tests/engine_guard_test.sh` (run by
+`tests/engine_guard.rs`) runs the real cron and `sniper-engine.sh` against a
+fake arbsim that holds as much memory as told and speaks the engine's
+message format, a fake feed relay and the REAL `sniper engine-trial`: stop
+over the limit, restart backoff (0, 120, 240 s; reset after a stable hour),
+guard without `SNIPER_ENGINE`, verdicts WORKS / FALLS BACK / TOO MUCH
+MEMORY, keep, refusals, no node link printed. Verdict maths: unit tests in
+`src/enginetrial.rs`.
+
+Hot-pool WebSocket: unit tests in `src/wshot.rs` (settings, cheap filters,
+hot set order and caps, renewal rate limit, filter pieces, dedupe, fill-in
+range, estimator, report). `tests/wshot_thread.rs` runs the WebSocket thread
+against a fake WebSocket node (rate-limited make-before-break renewal,
+renewal fill-in, refused renewal keeps the old subscription, repeats
+dropped). `tests/wshot_e2e.rs` runs the real paper trader with a fake HTTP
+node and a fake WebSocket node: the rush is found from the WebSocket, bought,
+counted once, and after a dropped connection the fill-in recovers a swap
+that was never pushed. Both run in plain `cargo test`.
+
+Live stale-signal guard: unit test in `src/livetrade.rs`.
+
+`feedwake_e2e` sends real signed transactions (3 buys + 1 failed) through a
+fake feed into the engine and checks the confirmed swaps reach the rush
+detector. `feedwake_paper_e2e` runs the real paper trader: a rush found in
+the feed is bought (paper) tagged `src: feed`, the node's later copies are
+counted once, a feed outage switches back to normal polling.
+
 ## Server auto-run (no terminal needed)
 
 `sniper/deploy/` is published with every build to the `sniper-bin` branch.
@@ -201,6 +414,39 @@ One-time setup on the server:
 
 After that, cron runs `deploy/sniper-cron.sh` every 2 minutes: it pulls new
 builds, applies `deploy/run.env` (settings, `SNIPER_ENABLED=0` = kill switch),
-keeps the paper sniper running, and every 15 minutes posts the scoreboard to
+keeps the paper sniper running (and, with `SNIPER_ENGINE=1`, the sniper's
+own engine first: started if not running or its socket is dead, never
+restarted while healthy, never the dex bot's), and every 15 minutes posts the scoreboard to
 the GitHub issue "Sniper paper status". Paper only; never touches the arb bot
 (it only reads `GH_STATUS_TOKEN` from the arb bot's `.env` to post the issue).
+
+### Planned run 12 settings (not active yet)
+
+Morning sequence (owner's go-ahead needed for every run.env change):
+
+1. Engine trial on the server: `cd ~/sniper-bin && bash deploy/sniper-engine.sh trial`
+   (30 min, paper bot untouched). Read the verdict.
+2. Trial says WORKS: run 12 = the settings below (engine + feed wake-up +
+   young-pool test).
+3. Trial says anything else: do NOT turn the engine on. Run 12 = new folder +
+   young-pool test, with the free WebSocket estimate (on by default) only;
+   or, if the estimate in the first hours FITS the node budget,
+   `SNIPER_WS_HOT=1` as well:
+
+       SNIPER_OUT=paper-out/run12
+       SNIPER_YOUNG_TEST=1
+       # SNIPER_WS_HOT=1                 only if the estimate fits
+
+Settings if the trial passes; they go in `deploy/run.env` on the `sniper/**`
+branch that builds the server:
+
+    SNIPER_OUT=paper-out/run12          new folder: clean numbers
+    SNIPER_ENGINE=1                     cron starts/keeps the engine itself
+    SNIPER_ENGINE_CHECK=1               trades keep using the node's quotes
+    SNIPER_FEED_WAKE=1                  rushes from the sequencer feed
+    SNIPER_RHC_POLL_MS_WHEN_FEED=0      node polled at today's pace (fair comparison)
+    SNIPER_FEED_STALE_SECS=5
+    SNIPER_YOUNG_TEST=1                 young-pool paper test group
+
+With `SNIPER_ENGINE=1` no manual `sniper-engine.sh start` is needed: the
+cron does it before starting the paper bot.
