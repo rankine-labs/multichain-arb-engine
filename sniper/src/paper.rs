@@ -573,21 +573,52 @@ impl Blocklist {
         fs::rename(&tmp, path).map_err(|e| e.to_string())
     }
 
-    /// Is this token blocked? (Addresses compared in lower case.)
+    /// Is this token blocked right now? (Addresses compared in lower case.)
+    /// A temporary entry ("temp:<until unix ms>:<why>") counts only until
+    /// its time is up.
     pub fn contains(&self, token: &str) -> bool {
-        self.tokens.contains_key(&token.to_ascii_lowercase())
+        self.contains_at(token, now_unix_ms())
     }
 
-    /// Block a token. Returns true if it was new (so the caller saves).
-    /// The first reason is kept if the token is already blocked.
+    pub fn contains_at(&self, token: &str, now_ms: u64) -> bool {
+        match self.tokens.get(&token.to_ascii_lowercase()) {
+            None => false,
+            Some(why) => temp_until(why).is_none_or(|until| now_ms < until),
+        }
+    }
+
+    /// Block a token for good. Returns true if the list changed (so the
+    /// caller saves). A permanent reason replaces a temporary one; otherwise
+    /// the first reason is kept.
     pub fn add(&mut self, token: &str, why: &str) -> bool {
         let k = token.to_ascii_lowercase();
-        if self.tokens.contains_key(&k) {
-            return false;
+        if let Some(old) = self.tokens.get(&k) {
+            if temp_until(old).is_none() || temp_until(why).is_some() && temp_until(old) >= temp_until(why) {
+                return false;
+            }
         }
         self.tokens.insert(k, why.to_string());
         true
     }
+
+    /// Block a token only until `until_ms` (unix ms).
+    ///
+    /// Why: a coin minutes old often fails the trap check for launch-time
+    /// reasons (launch taxes, anti-bot limits) that are gone an hour later,
+    /// when the coin becomes tradable for the main group. A permanent block
+    /// then throws away good trades. Rugs (exit failed) stay permanent.
+    pub fn add_temp(&mut self, token: &str, why: &str, until_ms: u64) -> bool {
+        self.add(token, &format!("temp:{until_ms}:{why}"))
+    }
+}
+
+/// Expiry time of a temporary blocklist reason, None if permanent.
+pub fn temp_until(why: &str) -> Option<u64> {
+    why.strip_prefix("temp:")?.split(':').next()?.parse().ok()
+}
+
+fn now_unix_ms() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
 
 /// Skip reasons we count separately in the report (in report order). Each
@@ -1723,6 +1754,23 @@ pub fn run(cfg: Config) -> Result<(), String> {
             }
         }
     };
+    // Trap-check failure: on a pool younger than the main age rule the
+    // block lasts only until the pool reaches that age (then the coin is
+    // checked again); on an old enough pool it is permanent.
+    let block_check = |bl: &mut Blocklist, token: &str, why: &str, age_s: Option<f64>| -> bool {
+        let left = age_s.map(|a| cfg.min_pool_age_s - a).filter(|l| *l > 0.0);
+        let changed = match left {
+            Some(l) => bl.add_temp(token, why, now_unix_ms() + (l * 1000.0) as u64),
+            None => bl.add(token, why),
+        };
+        if changed {
+            eprintln!("paper: BLOCKED {token} ({why}){}", left.map(|l| format!(" for {:.0} min (young pool)", l / 60.0)).unwrap_or_default());
+            if let Err(e) = bl.save(&block_path) {
+                eprintln!("paper: could not save blocklist ({e})");
+            }
+        }
+        left.is_none()
+    };
     let started = Instant::now();
     let mut beat = Instant::now();
     let mut errors = 0u32;
@@ -2483,7 +2531,7 @@ pub fn run(cfg: Config) -> Result<(), String> {
                     let holder = venue::token_holder(&info.venue, &r.pool);
                     if let Ok(v) = taxcheck.check(&rpc, &info.token, &holder) {
                         if !matches!(v, crate::taxcheck::Verdict::Ok) {
-                            block(&mut blocklist, &info.token, &format!("trap check (early): {v:?}"));
+                            block_check(&mut blocklist, &info.token, &format!("trap check (early): {v:?}"), young_age.get());
                         }
                     }
                 }
@@ -2547,8 +2595,10 @@ pub fn run(cfg: Config) -> Result<(), String> {
                     n_unsafe += 1;
                     // A real finding (taxed/blocked) is permanent; a node error is not.
                     if let Ok(v) = &verdict {
-                        block(&mut blocklist, &info.token, &format!("trap check: {v:?}"));
-                        creators.block(&rpc, &ages, &r.pool, &format!("trap check on {}: {v:?}", info.token));
+                        // Creator blocked only for a permanent (old-pool) finding.
+                        if block_check(&mut blocklist, &info.token, &format!("trap check: {v:?}"), young_age.get()) {
+                            creators.block(&rpc, &ages, &r.pool, &format!("trap check on {}: {v:?}", info.token));
+                        }
                     }
                     skip(&mut f_sig, format!("unsafe: {verdict:?}"))?;
                     continue;
@@ -2613,8 +2663,9 @@ pub fn run(cfg: Config) -> Result<(), String> {
                         if !matches!(verdict, Ok(crate::taxcheck::Verdict::Ok)) {
                             n_unsafe += 1;
                             if let Ok(v) = &verdict {
-                                block(&mut blocklist, &info.token, &format!("real-size check: {v:?}"));
-                                creators.block(&rpc, &ages, &r.pool, &format!("real-size check on {}: {v:?}", info.token));
+                                if block_check(&mut blocklist, &info.token, &format!("real-size check: {v:?}"), young_age.get()) {
+                                    creators.block(&rpc, &ages, &r.pool, &format!("real-size check on {}: {v:?}", info.token));
+                                }
                             }
                             skip(&mut f_sig, format!("unsafe: real size: {verdict:?}"))?;
                             continue;
@@ -3567,6 +3618,27 @@ mod tests {
         assert_eq!(decide_size(0.0, &[], 50.0, 30.0), Some(30.0));
         assert_eq!(decide_size(0.0, &[], 50.0, 80.0), Some(50.0));
         assert_eq!(decide_size(0.0, &[], 50.0, 0.0), None);
+    }
+
+    #[test]
+    fn young_trap_check_blocks_expire() {
+        let mut b = Blocklist::default();
+        assert!(b.add_temp("0xA", "trap check: Taxed", 1_000));
+        assert!(b.contains_at("0xa", 999));
+        assert!(!b.contains_at("0xa", 1_000), "expired");
+        // A later permanent finding (a rug) replaces the temporary one.
+        assert!(b.add("0xa", "exit_quote_failed"));
+        assert!(b.contains_at("0xa", u64::MAX));
+        // ...and a temporary one never weakens a permanent one.
+        assert!(!b.add_temp("0xa", "trap check", 5));
+        assert_eq!(b.tokens["0xa"], "exit_quote_failed");
+        // Longer temporary block extends; shorter does not.
+        assert!(b.add_temp("0xb", "x", 100));
+        assert!(!b.add_temp("0xb", "y", 50));
+        assert!(b.add_temp("0xb", "z", 200));
+        assert!(b.contains_at("0xb", 150));
+        assert_eq!(temp_until("trap check"), None);
+        assert_eq!(temp_until("temp:42:trap check: Taxed"), Some(42));
     }
 
     #[test]
