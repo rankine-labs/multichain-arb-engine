@@ -1043,6 +1043,11 @@ pub struct Config {
     pub min_sells: u64,
     /// Skip pools younger than this (seconds). Run 5: every rug was < 2 min.
     pub min_pool_age_s: f64,
+    /// SNIPER_MIN_POOL_AGE_SECS_V4: a shorter age rule for Uniswap V4 pools
+    /// (unset = same as everything else). Nov 20: V4 pools 15-60 min old
+    /// were clean for 3 days in the young test group (0 rugs over 189 V4
+    /// young trades); every recent rug was V3.
+    pub min_pool_age_v4_s: Option<f64>,
     /// Skip a rush unless the pool had at least this many rushes in the
     /// hour before (0 = off). Run 10b: a coin's first rush in an hour lost
     /// money (49 past trades, 24% wins, -$54); later rushes paid.
@@ -1147,6 +1152,14 @@ pub fn is_young_line(v: &Value) -> bool {
 }
 
 impl Config {
+    /// Minimum pool age for this venue (V4 may have its own, shorter rule).
+    pub fn min_age_for(&self, venue: &Venue) -> f64 {
+        match (venue, self.min_pool_age_v4_s) {
+            (Venue::V4 { .. }, Some(v4)) => v4,
+            _ => self.min_pool_age_s,
+        }
+    }
+
     pub fn from_env() -> Self {
         let unix = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
         let f = |k: &str, d: f64| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
@@ -1167,6 +1180,7 @@ impl Config {
             max_total_usd: f("SNIPER_MAX_TOTAL_USD", 150.0),
             min_sells: f("SNIPER_MIN_SELLS", 3.0) as u64,
             min_pool_age_s: f("SNIPER_MIN_POOL_AGE_SECS", 120.0),
+            min_pool_age_v4_s: std::env::var("SNIPER_MIN_POOL_AGE_SECS_V4").ok().and_then(|v| v.trim().parse().ok()),
             min_prior_rushes: f("SNIPER_MIN_PRIOR_RUSHES", 0.0) as usize,
             cut_loss_usd: f("SNIPER_COIN_CUT_USD", 15.0),
             cut_window: Duration::from_secs_f64(f("SNIPER_COIN_CUT_HOURS", 6.0) * 3600.0),
@@ -1757,8 +1771,8 @@ pub fn run(cfg: Config) -> Result<(), String> {
     // Trap-check failure: on a pool younger than the main age rule the
     // block lasts only until the pool reaches that age (then the coin is
     // checked again); on an old enough pool it is permanent.
-    let block_check = |bl: &mut Blocklist, token: &str, why: &str, age_s: Option<f64>| -> bool {
-        let left = age_s.map(|a| cfg.min_pool_age_s - a).filter(|l| *l > 0.0);
+    let block_check = |bl: &mut Blocklist, token: &str, why: &str, age_s: Option<f64>, min_age: f64| -> bool {
+        let left = age_s.map(|a| min_age - a).filter(|l| *l > 0.0);
         let changed = match left {
             Some(l) => bl.add_temp(token, why, now_unix_ms() + (l * 1000.0) as u64),
             None => bl.add(token, why),
@@ -2468,8 +2482,9 @@ pub fn run(cfg: Config) -> Result<(), String> {
                 continue;
             }
             // Rug guard: brand-new pools are where every run-5 rug happened.
+            let min_age = cfg.min_age_for(&info.venue);
             let mut age = ages.age_secs(&r.pool, r.block, BLOCK_SECS);
-            if age.is_none() && cfg.min_pool_age_s > 0.0 {
+            if age.is_none() && min_age > 0.0 {
                 // Not seen being created: use (or look up) its real birth.
                 let born = match births.get(&r.pool) {
                     Some(b) => Some(b),
@@ -2494,15 +2509,15 @@ pub fn run(cfg: Config) -> Result<(), String> {
                     }
                 }
             }
-            if crate::rugguard::too_young(age, cfg.min_pool_age_s) {
+            if crate::rugguard::too_young(age, min_age) {
                 if !main_done.get() {
                     n_filtered += 1;
-                    skip(&mut f_sig, format!("pool too young ({:.0}s old, need {:.0}s)", age.unwrap_or(0.0), cfg.min_pool_age_s))?;
+                    skip(&mut f_sig, format!("pool too young ({:.0}s old, need {:.0}s)", age.unwrap_or(0.0), min_age))?;
                 }
                 // Young test group: the main result above stays "pool too
                 // young"; from here on this rush is a young test rush and
                 // goes through every other filter on its own lines.
-                if !goes_young(age, cfg.min_pool_age_s, &cfg.young) {
+                if !goes_young(age, min_age, &cfg.young) {
                     continue;
                 }
                 restore.get_or_insert((n_filtered, n_unsafe, n_skipped));
@@ -2531,7 +2546,7 @@ pub fn run(cfg: Config) -> Result<(), String> {
                     let holder = venue::token_holder(&info.venue, &r.pool);
                     if let Ok(v) = taxcheck.check(&rpc, &info.token, &holder) {
                         if !matches!(v, crate::taxcheck::Verdict::Ok) {
-                            block_check(&mut blocklist, &info.token, &format!("trap check (early): {v:?}"), young_age.get());
+                            block_check(&mut blocklist, &info.token, &format!("trap check (early): {v:?}"), young_age.get(), min_age);
                         }
                     }
                 }
@@ -2596,7 +2611,7 @@ pub fn run(cfg: Config) -> Result<(), String> {
                     // A real finding (taxed/blocked) is permanent; a node error is not.
                     if let Ok(v) = &verdict {
                         // Creator blocked only for a permanent (old-pool) finding.
-                        if block_check(&mut blocklist, &info.token, &format!("trap check: {v:?}"), young_age.get()) {
+                        if block_check(&mut blocklist, &info.token, &format!("trap check: {v:?}"), young_age.get(), min_age) {
                             creators.block(&rpc, &ages, &r.pool, &format!("trap check on {}: {v:?}", info.token));
                         }
                     }
@@ -2663,7 +2678,7 @@ pub fn run(cfg: Config) -> Result<(), String> {
                         if !matches!(verdict, Ok(crate::taxcheck::Verdict::Ok)) {
                             n_unsafe += 1;
                             if let Ok(v) = &verdict {
-                                if block_check(&mut blocklist, &info.token, &format!("real-size check: {v:?}"), young_age.get()) {
+                                if block_check(&mut blocklist, &info.token, &format!("real-size check: {v:?}"), young_age.get(), min_age) {
                                     creators.block(&rpc, &ages, &r.pool, &format!("real-size check on {}: {v:?}", info.token));
                                 }
                             }
@@ -4155,6 +4170,23 @@ mod tests {
 
     fn young_on() -> YoungCfg {
         YoungCfg { on: true, min_age_s: 0.0, max_positions: 2, usd: 50.0 }
+    }
+
+    #[test]
+    fn v4_can_have_its_own_age_rule() {
+        let mut c = Config::from_env();
+        c.min_pool_age_s = 3600.0;
+        c.min_pool_age_v4_s = None;
+        let v3 = Venue::V3 { fee: 3000 };
+        let v4 = Venue::V4 { key: crate::venue::V4Key { currency0: "0x0".into(), currency1: "0x1".into(), fee: 3000, tick_spacing: 60, hooks: "0x0".into() } };
+        assert_eq!(c.min_age_for(&v3), 3600.0);
+        assert_eq!(c.min_age_for(&v4), 3600.0, "unset: same rule");
+        c.min_pool_age_v4_s = Some(900.0);
+        assert_eq!(c.min_age_for(&v4), 900.0);
+        assert_eq!(c.min_age_for(&v3), 3600.0, "V3 keeps the main rule");
+        // A 20-min V4 pool is main-group now; a 10-min one is still young.
+        assert!(!crate::rugguard::too_young(Some(1200.0), c.min_age_for(&v4)));
+        assert!(crate::rugguard::too_young(Some(600.0), c.min_age_for(&v4)));
     }
 
     #[test]
