@@ -78,37 +78,74 @@ def tx_links(d):
     return "\n".join(out)
 
 
-def fmt(d, day):
-    """One trade row -> message text."""
+TOKEN_URL = "https://robinhoodchain.blockscout.com/token/"
+
+# Why the bot sold, in plain words.
+REASONS = {
+    "take_profit": "hit the profit target",
+    "stop_loss": "price dropped, cut the loss",
+    "time": "time limit reached, got out",
+    "rug": "liquidity pulled, emergency exit",
+    "emergency": "emergency exit",
+}
+
+
+def money(x):
+    """$1.20 / -$0.84 style."""
+    return f"-${abs(x):.2f}" if x < 0 else f"+${x:.2f}"
+
+
+def secs(s):
+    try:
+        s = float(s)
+    except (TypeError, ValueError):
+        return "?"
+    return f"{s:.0f} sec" if s < 90 else f"{s / 60:.1f} min"
+
+
+def coin(d):
+    t = d.get("token") or ""
+    return f'<a href="{TOKEN_URL}{t}">{short(t)}</a>' if t else "?"
+
+
+def main_tx(d):
+    """Link to the actual swap (skip the approve step)."""
+    txs = [t for t in (d.get("txs") or []) if t.get("hash")]
+    swaps = [t for t in txs if "approve" not in (t.get("what") or "").lower()]
+    t = (swaps or txs or [None])[-1]
+    return f'<a href="{EXPLORER}{t["hash"]}">view on explorer</a>' if t else ""
+
+
+def fmt(d, day, day_n=None):
+    """One trade row -> short plain-English Telegram message."""
     ev = d.get("event", "?")
-    venue = (d.get("venue") or "?").upper()
-    pool = short(d.get("pool", ""))
     if ev == "buy":
         usd = d.get("usd") or d.get("usd_in")
-        size = f"${usd:.2f}" if isinstance(usd, (int, float)) else "$?"
-        return f"🎯 <b>SNIPER LIVE BUY</b> {venue}\nsize {size} | pool {pool}\n{tx_links(d)}"
+        size = f"${usd:.2f}" if isinstance(usd, (int, float)) else "?"
+        return (f"🛒 <b>BOUGHT {size}</b> of coin {coin(d)}\n"
+                f"Watching for a profit to sell...\n{main_tx(d)}")
     if ev == "sell":
         real = d.get("real_net_usd")
-        paper = d.get("paper_net_usd")
-        usd = d.get("_usd") or d.get("usd_in") or 10.0
-        icon = "🟢" if isinstance(real, (int, float)) and real >= 0 else "🔴"
-        r = f"${real:+.2f}" if isinstance(real, (int, float)) else "?"
-        fill = d.get("fill_vs_quote_pct")
-        lines = [
-            f"{icon} <b>SNIPER LIVE SELL</b> {venue} ({d.get('reason', '?')}, {d.get('held_s', '?')}s)",
-            f"real {r}" + (f" ({d['real_pct']:+.1f}%)" if isinstance(d.get("real_pct"), (int, float))
-                           else (f" ({real / usd * 100:+.1f}%)" if isinstance(real, (int, float)) and usd else "")),
-        ]
-        # Paper twin trades a different size ($100), so compare in %, not $.
-        ppct = d.get("paper_pct")
-        if isinstance(ppct, (int, float)):
-            lines.append(f"paper twin {ppct:+.1f}%")
-        if isinstance(fill, (int, float)):
-            lines.append(f"fill vs quote {fill:+.2f}%")
-        # Prefer the trader's own running total (exact, survives notifier restarts).
+        pct = d.get("real_pct")
+        won = isinstance(real, (int, float)) and real > 0
+        head = "🟢 <b>WON" if won else "🔴 <b>LOST"
+        amt = f"${abs(real):.2f}" if isinstance(real, (int, float)) else "?"  # sign is in WON/LOST
+        p = f" ({pct:+.1f}%)" if isinstance(pct, (int, float)) else ""
+        why = REASONS.get(d.get("reason"), d.get("reason") or "?")
+        if d.get("emergency") and d.get("reason") != "take_profit" and "emergency" not in why:
+            why += " (fast exit)"
         dr = d.get("day_realized_usd")
-        lines.append(f"live today ${(dr if isinstance(dr, (int, float)) else day):+.2f}")
-        lines.append(tx_links(d))
+        today = dr if isinstance(dr, (int, float)) else day
+        lines = [
+            f"{head} {amt}</b>{p} on coin {coin(d)}",
+            f"Sold after {secs(d.get('held_s'))}: {why}",
+        ]
+        ppct = d.get("paper_pct")
+        if isinstance(ppct, (int, float)) and isinstance(pct, (int, float)):
+            diff = pct - ppct
+            lines.append(f"Simulator expected {ppct:+.1f}% ({'better' if diff >= 0 else 'worse'} by {abs(diff):.1f}%)")
+        lines.append(f"Today: <b>{money(today)}</b>" + (f" over {day_n} trades" if day_n else ""))
+        lines.append(main_tx(d))
         return "\n".join(x for x in lines if x)
     return f"⚠️ <b>SNIPER LIVE</b> {ev}: {json.dumps({k: v for k, v in d.items() if k not in ('txs',)})[:600]}"
 
@@ -155,35 +192,36 @@ def local_now():
 
 
 def stats_text(title, sells):
-    """Summary block for a list of sell rows."""
+    """Plain-English summary block for a list of sell rows."""
     real = [s["real_net_usd"] for s in sells if isinstance(s.get("real_net_usd"), (int, float))]
     if not real:
-        return f"📊 <b>{title}</b>\nno closed live trades"
-    # Paper twin at the LIVE size: paper % x live $ in (paper itself trades $100).
+        return f"📊 <b>{title}</b>\nNo trades."
+    # Simulator result at the LIVE size: paper % x live $ in (paper itself trades $100).
     paper = [s["paper_pct"] / 100.0 * s.get("_usd", 10.0) for s in sells
              if isinstance(s.get("paper_pct"), (int, float))]
-    fills = [s["fill_vs_quote_pct"] for s in sells if isinstance(s.get("fill_vs_quote_pct"), (int, float))]
     wins = [x for x in real if x > 0]
     losses = [x for x in real if x <= 0]
+    total = sum(real)
     lines = [
         f"📊 <b>{title}</b>",
-        f"trades {len(real)} | wins {len(wins)} | losses {len(losses)} | win rate {len(wins) / len(real) * 100:.0f}%",
-        f"real net <b>${sum(real):+.2f}</b>" + (f" | paper twin ${sum(paper):+.2f}" if paper else ""),
-        f"avg win ${sum(wins) / len(wins):+.2f}" if wins else "avg win n/a",
-        f"avg loss ${sum(losses) / len(losses):+.2f}" if losses else "avg loss n/a",
-        f"best ${max(real):+.2f} | worst ${min(real):+.2f}",
+        f"{'🟢' if total >= 0 else '🔴'} Profit: <b>{money(total)}</b> from {len(real)} trades",
+        f"Won {len(wins)}, lost {len(losses)} ({len(wins) / len(real) * 100:.0f}% winners)",
     ]
-    if fills:
-        lines.append(f"avg fill vs quote {sum(fills) / len(fills):+.2f}%")
-    # Per-venue split (V3 vs V4 etc.)
+    if wins:
+        lines.append(f"Typical win {money(sum(wins) / len(wins))}, biggest {money(max(wins))}")
+    if losses:
+        lines.append(f"Typical loss {money(sum(losses) / len(losses))}, biggest {money(min(losses))}")
+    if paper:
+        diff = total - sum(paper)
+        lines.append(f"Simulator expected {money(sum(paper))} (real was {'better' if diff >= 0 else 'worse'} by ${abs(diff):.2f})")
     by = {}
     for s in sells:
         if isinstance(s.get("real_net_usd"), (int, float)):
             v = (s.get("venue") or "?").upper()
             n, tot = by.get(v, (0, 0.0))
             by[v] = (n + 1, tot + s["real_net_usd"])
-    if by:
-        lines.append(" | ".join(f"{v}: {n} trades ${t:+.2f}" for v, (n, t) in sorted(by.items())))
+    if len(by) > 1:
+        lines.append("By type: " + ", ".join(f"{v} {money(t)} ({n})" for v, (n, t) in sorted(by.items())))
     return "\n".join(lines)
 
 
@@ -283,8 +321,8 @@ def main():
     if "--summary" in sys.argv:
         sells = all_sells(trade_path, seen_at)
         cut = time.time() - 86400
-        send(tok, chat, stats_text("SNIPER live: last 24 h", [s for s in sells if s["_t"] >= cut])
-             + "\n\n" + stats_text("SNIPER live: since start", sells))
+        send(tok, chat, stats_text("Sniper: last 24 hours", [s for s in sells if s["_t"] >= cut])
+             + "\n\n" + stats_text("Sniper: since going live", sells))
         print("summary sent", flush=True)
         return
     send(tok, chat, f"🎯 SNIPER live notifier started ({out}). Trades, hourly and {DAILY_HOUR} AM summaries will post here.")
@@ -298,14 +336,16 @@ def main():
             # Today's live total (local calendar day), rebuilt from the whole file.
             sells = all_sells(trade_path, seen_at)
             midnight = local_now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
-            day = sum(s["real_net_usd"] for s in sells
-                      if s["_t"] >= midnight and isinstance(s.get("real_net_usd"), (int, float)))
+            today = [s for s in sells
+                     if s["_t"] >= midnight and isinstance(s.get("real_net_usd"), (int, float))]
+            day = sum(s["real_net_usd"] for s in today)
+            day_n = len(today)
         for line in new_rows:
             try:
                 d = json.loads(line)
             except ValueError:
                 continue
-            send(tok, chat, fmt(d, day))
+            send(tok, chat, fmt(d, day, day_n))
         for line in log.lines():
             if worth_alert(line, last_sent, time.time()):
                 send(tok, chat, "⚠️ <b>SNIPER LIVE</b> " + line[:500].replace("<", "&lt;"))
@@ -317,15 +357,15 @@ def main():
             sells = all_sells(trade_path, seen_at)
             hour_sells = [s for s in sells if end - 3600 <= s["_t"] < end]
             if hour_sells:
-                send(tok, chat, stats_text(f"SNIPER live: last hour (to {now.strftime('%-I %p')})", hour_sells))
+                send(tok, chat, stats_text(f"Sniper: last hour (to {now.strftime('%-I %p')})", hour_sells))
             last_hour = hour_key
         # Daily summary once per day at DAILY_HOUR local.
         day_key = now.strftime("%Y-%m-%d")
         if now.hour >= DAILY_HOUR and day_key != last_daily:
             sells = all_sells(trade_path, seen_at)
             cut = time.time() - 86400
-            send(tok, chat, stats_text("SNIPER live: daily (last 24 h)", [s for s in sells if s["_t"] >= cut])
-                 + "\n\n" + stats_text("SNIPER live: since start", sells))
+            send(tok, chat, stats_text("Sniper daily report (last 24 hours)", [s for s in sells if s["_t"] >= cut])
+                 + "\n\n" + stats_text("Sniper: since going live", sells))
             last_daily = day_key
         time.sleep(POLL_S)
 
