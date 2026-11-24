@@ -128,8 +128,27 @@ class Tail:
         return [l for l in data.split("\n") if l.strip()]
 
 
-# live.log lines worth an alert (halts, refusals at start, gate closed, errors)
-ALERT = re.compile(r"LIVE.*(HALT|halt|refus|not done|gate|failed|stuck|unknown)", re.I)
+# live.log lines worth an alert (halts, refusals at start, gate closed, errors).
+# Case-sensitive "LIVE" tag so ordinary lowercase "live" in status lines no
+# longer matches.
+ALERT = re.compile(r"LIVE.*(HALT|halt|refus|not done|gate|failed|stuck|unknown)")
+# Routine health/status lines: never alert on these. They contain words like
+# "refused 0" and "0 failed" that used to trip the alert pattern every minute.
+ROUTINE = re.compile(r"ws hot|healthy|refused 0\b|\b0 failed|went quiet 0", re.I)
+# Same alert text is posted at most once per this many seconds (anti-spam).
+ALERT_COOLDOWN_S = 900
+
+
+def worth_alert(line, last_sent, now):
+    """True if this log line is a real problem we haven't posted recently."""
+    if ROUTINE.search(line) or not ALERT.search(line):
+        return False
+    # Dedupe on the line with digits stripped, so counters don't make it "new".
+    key = re.sub(r"\d+", "#", line)[:200]
+    if now - last_sent.get(key, 0) < ALERT_COOLDOWN_S:
+        return False
+    last_sent[key] = now
+    return True
 
 
 def main():
@@ -142,6 +161,7 @@ def main():
     trades = Tail(os.path.join(out, "live_trades.jsonl"))
     log = Tail("live.log")
     day = 0.0
+    last_sent = {}  # alert key -> last post time, for the cooldown
     send(tok, chat, f"🎯 SNIPER live notifier started ({out}). Every live buy and sell will post here.")
     print(f"{time.strftime('%H:%M:%S')} watching {out}", flush=True)
     while True:
@@ -154,7 +174,7 @@ def main():
                 day += d["real_net_usd"]
             send(tok, chat, fmt(d, day))
         for line in log.lines():
-            if ALERT.search(line):
+            if worth_alert(line, last_sent, time.time()):
                 send(tok, chat, "⚠️ <b>SNIPER LIVE</b> " + line[:500].replace("<", "&lt;"))
         time.sleep(POLL_S)
 
