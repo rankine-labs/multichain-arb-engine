@@ -326,7 +326,8 @@ def worth_alert(line, last_sent, now):
 def rpc(method, params):
     """One JSON-RPC call to the public node. Returns the result or None."""
     body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).encode()
-    req = urllib.request.Request(PUBLIC_RPC, body, {"Content-Type": "application/json"})
+    # A browser-like User-Agent: the public node rejects Python's default one.
+    req = urllib.request.Request(PUBLIC_RPC, body, {"Content-Type": "application/json", "User-Agent": "curl/8.5.0"})
     try:
         with urllib.request.urlopen(req, timeout=10) as r:
             return json.loads(r.read()).get("result")
