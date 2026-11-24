@@ -41,8 +41,10 @@
 //   makes (the PoolManager pays out on a buy and receives on a sell), so a
 //   token that taxes or blocks transfers to/from the PoolManager is caught.
 //
-//   Live sending stays V3 only (SwapRouter02). V4 and V2 are paper only;
-//   dry_fire_supported() says so.
+//   Live trading covers all three venues (liveroute.rs: V3 through
+//   SwapRouter02, V4 and V2 through Uniswap's Universal Router; V2 is off
+//   by default). The OLD `sniper dry-fire` command stays V3 only;
+//   dry_fire_supported() says so. `sniper live-dryrun` checks every venue.
 //
 // Addresses (src/config/knownAddresses.ts ROBINHOOD_V4 / ROBINHOOD_V2):
 //   V4 PoolManager 0x8366a39CC670B4001A1121B8F6A443A643e40951 (rhc.rs)

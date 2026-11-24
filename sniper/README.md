@@ -150,8 +150,8 @@ Uniswap V4 (V4Quoter, keys from Initialize events saved to
 exits and race check; the V4 trap check moves tokens to/from the
 PoolManager, which holds every V4 pool's coins. The report has a "by venue"
 section (rushes, taken, trades, wins, P&L, late P&L). `SNIPER_V4_LOOKUP=off`
-stops the background search for old V4 pools. Dry-fire (and any future
-live sending) is Uniswap V3 only; it refuses V4 pool ids and V2 pairs.
+stops the background search for old V4 pools. The old `sniper dry-fire`
+is Uniswap V3 only; `sniper live-dryrun` (below) checks every venue.
 
 Rush buyers are counted as different wallets receiving the tokens (the
 swap's recipient), not different transactions. A router that receives the
@@ -173,20 +173,106 @@ exit slip (how much worse the late price was), and late quotes that failed.
 If the late total is much worse than the normal total, the paper profit
 depends on landing instantly, which we cannot do.
 
-## Live trader safety notes (live stays OFF)
+## Live trader (live stays OFF)
 
-- Stale-signal guard (the dex bot's PR #249 lesson: never send a trade
-  decided behind the chain tip): the live trader refuses a buy when the
-  rush is more than `SNIPER_LIVE_MAX_BEHIND_BLOCKS` (default 5, about
-  0.5 s) blocks behind the newest block we know at the moment the order
-  would go out (the buy's `delay.behind_blocks`; `total_ms` is shown too).
-  Written to `signals.jsonl` as a `live_skip` reason. Paper keeps trading
-  those rushes, so we keep measuring them. `0` turns the guard off.
-- KNOWN LIMIT, not built yet: a live buy and sell wait for their receipts
-  INSIDE the paper trader's main loop (up to 20 s each, `RECEIPT_WAIT` in
-  `src/livetrade.rs`). Nothing else is watched meanwhile. Acceptable for one
-  $5 position; must be made non-blocking before more positions or bigger
-  sizes.
+The live trader (`src/livetrade.rs`) copies some paper decisions with real
+money. It is off unless every gate below is open, and the auto-run cron
+cannot start it (it only allows `paper` and `feed-watch`).
+
+### Venues and base coins
+
+| Venue | How a live swap is sent | Live by default |
+|---|---|---|
+| Uniswap V3 | `approve(SwapRouter02, exact)` + SwapRouter02 `exactInputSingle` (min out, deadline) | yes |
+| Uniswap V4 | Universal Router `execute` with `V4_SWAP` = SWAP_EXACT_IN_SINGLE + SETTLE_ALL + TAKE_ALL, paid through Permit2 (exact amount, 10 min expiry), or native ETH sent with the swap | yes |
+| Uniswap V2 | Universal Router `V2_SWAP_EXACT_IN`, paid through Permit2 | **no**: add `v2` to `SNIPER_LIVE_VENUES` only after a V2 `live-dryrun` passes |
+
+- Router: `SNIPER_LIVE_UR`, default `0x8876789976decbfcbbbe364623c63652db8c0904`,
+  the Universal Router on Uniswap's own Robinhood Chain deployment list (it
+  also lists 2.1.2 at `0x204faca1764b154221e35c0d20abb3c525710498`). The 2.1
+  routers add one field to the V4 swap step; the shape is picked from the
+  address. Any other address also needs `SNIPER_LIVE_UR_LAYOUT=2.0` or `2.1`.
+- V4 pools whose hook can change swap amounts are refused (same rule as paper).
+- Base coin = the pool's: WETH, USDG or (V4 only) native ETH. The wallet must
+  already hold it; live never swaps one base into another. Size is
+  `SNIPER_LIVE_MAX_USD` worth of that coin.
+- Every allowance is for the exact amount of one swap. Every swap has a
+  minimum out (fresh quote minus 3%, or 15% for emergency sells) and a
+  2-minute deadline.
+
+### Every guard
+
+| Guard | What it does |
+|---|---|
+| `SNIPER_MODE=live` | Asks for live mode. Without it the paper trader never sends anything. |
+| `SNIPER_LIVE=1` | Live switch. If live is asked for and any gate check fails, the bot refuses to start (never silently paper). |
+| `SNIPER_LIVE_ACK="I approve real money trading"` | Exact owner phrase. |
+| `SNIPER_KEY_FILE` | The live wallet's key file; refused unless `chmod 600`. Never in env or chat. |
+| `SNIPER_LIVE_MAX_USD` | Size of each live trade. Default 5, hard cap 10 (compiled in). |
+| `SNIPER_LIVE_DAY_LOSS_USD` | Daily loss stop. Default 10, hard cap 20. Saved in the ledger (`SNIPER_LIVE_LEDGER`, default `live-ledger.json`) so a restart can't reset it; a damaged ledger stops trading. |
+| `SNIPER_LIVE_HOURS` | Optional Toronto-time window, e.g. `20-8`. |
+| `SNIPER_LIVE_MAX_BEHIND_BLOCKS` | Stale-signal guard (default 5, about 0.5 s; 0 = off): no buy for a rush already that far behind the newest block. Logged as `live_skip`; paper still trades it. |
+| `SNIPER_LIVE_VENUES` | Which venues may trade live (default `v3,v4`). |
+| `SNIPER_LIVE_UR` / `SNIPER_LIVE_UR_LAYOUT` | Router for V4/V2 (see above). |
+| Halt | New buys stop after 3 failed transactions in a row, or after any transaction whose fate is unknown. Sells keep being retried. |
+| Gas reserve | Keeps 0.0005 ETH; below it new buys halt. Native-ETH buys also need trade size plus the reserve. |
+| One position | Only one live position at a time; young-pool test trades are never copied. |
+| Leftover on restart | The open position is saved (`live_open.json`); on start the first thing live mode does is sell it. |
+
+### Slow receipts (blocking, and why paper and live can't drift apart)
+
+A live buy or sell waits for its receipts inside the paper trader's main
+loop (up to 20 s each). Nothing else is watched while it waits; the paper
+twin of a buy is opened after the live buy returns, so both start together.
+Fine for one $5 position; must become non-blocking before more positions
+or bigger sizes. The live position is written to disk BEFORE the buy is
+sent, marked pending. If the receipt is late or the send got no answer, the
+position stays (and new buys halt), so late tokens are always sold; a pending
+position with no tokens is dropped only after the buy's own deadline has
+passed. A sell whose fate is unknown keeps the position and remembers the
+balance before it, so a sell that did land is still measured.
+
+### What gets recorded
+
+`<out>/live_trades.jsonl`, one line per event: `buy`, `sell`, `buy_failed`,
+`buy_unknown`, `sell_failed`, `sell_unknown`, `sell_nothing`,
+`buy_never_filled`. Buy and sell lines carry the venue, every transaction
+hash, quoted vs filled amounts (`fill_vs_quote_pct`), gas, and the paper
+twin's numbers (`paper_tokens_per_usd` vs `live_tokens_per_usd`,
+`paper_pct` vs `real_pct`). Real P&L = base back - base spent - gas, from
+wallet balances and receipts, never from quotes.
+
+### Pre-flight: `sniper live-dryrun <pool> [usd]`
+
+Builds the exact buy and sell transactions live would send for one pool, from
+the live wallet's address, and runs them in the node's free simulation
+(`eth_simulateV1`). Signs nothing, sends nothing. `<pool>` = V3 pool address,
+V2 pair address, or V4 pool id (key read from the paper run's
+`v4_pool_keys.json`; `SNIPER_V4_KEYS` points at other files). Wallet:
+`SNIPER_LIVE_ADDRESS`, else the address of `SNIPER_KEY_FILE`. If the wallet
+is short of the base coin the simulation lends it (`"funded_in_sim": true`).
+Prints one JSON line: `ok`, `failed` (first failing step), each transaction
+with gas used vs limit, quoted vs simulated tokens and base back, round trip
+in USD, `live_allowed` / `live_refusal`. Exit code 0 only when `ok`.
+
+### Go-live checklist (in order; do not skip)
+
+1. Fund a NEW wallet used only by the sniper: ETH for gas (at least 0.002),
+   plus the base coins you want traded (WETH and/or USDG; ETH for native
+   V4 pools). `sniper wallet-status` shows balances, router and live venues.
+2. Key file: `chmod 600`, path in `SNIPER_KEY_FILE`.
+3. Dry-run, all must print `"ok":true`: two real V3 pools, two V4 pools with
+   a WETH or USDG side (these prove the router's V4 swap shape; a native-ETH
+   pool alone does not), one native-ETH V4 pool. Pick pools from the paper
+   run's `signals.jsonl` (`taken: true` lines). Check `tokens_vs_quote_pct`
+   is near 0 and no `gas_warnings`. For V2: only if you want it live, dry-run
+   a V2 pair, then add `v2` to `SNIPER_LIVE_VENUES`.
+4. Set `SNIPER_LIVE=1`, `SNIPER_LIVE_ACK`, `SNIPER_LIVE_MAX_USD=5`,
+   `SNIPER_LIVE_DAY_LOSS_USD=10`, optionally `SNIPER_LIVE_HOURS`, then start
+   the paper trader by hand with `SNIPER_MODE=live` and its own
+   `SNIPER_OUT` folder (the cron will not start live mode).
+5. Watch the first trades in `live_trades.jsonl`: `fill_vs_quote_pct`, gas,
+   and real vs paper. Stop (kill the process) on anything unexpected.
 
 ## Engine quotes (speed step 2, off by default)
 
@@ -398,6 +484,12 @@ counted once, and after a dropped connection the fill-in recovers a swap
 that was never pushed. Both run in plain `cargo test`.
 
 Live stale-signal guard: unit test in `src/livetrade.rs`.
+
+Live venues: `cargo test --test live_venues` runs the real live trader
+against a fake local node (V4 WETH buy and sell, native-ETH V4, refusals
+before sending, a swap whose send got no answer, the live-dryrun report).
+Router calldata is checked byte for byte against Python `eth_abi`
+encodings (`tests/fixtures/*.hex`, unit tests in `src/liveroute.rs`).
 
 `feedwake_e2e` sends real signed transactions (3 buys + 1 failed) through a
 fake feed into the engine and checks the confirmed swaps reach the rush

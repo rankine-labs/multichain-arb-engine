@@ -487,6 +487,17 @@ pub fn outcome_of(receipt: &Value) -> Option<Outcome> {
     Some(if receipt["status"].as_str() == Some("0x1") { Outcome::Ok { block, gas_used, gas_price } } else { Outcome::Reverted { block, gas_used, gas_price } })
 }
 
+/// What happened when a batch was handed to the sequencer (Sender::send_txs).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Sent {
+    /// Every transaction signed, in order (also the one whose send failed).
+    pub hashes: Vec<String>,
+    /// How many the node accepted (the first `accepted` of `hashes`).
+    pub accepted: usize,
+    /// (index, reason, definite) of the refused one, if any.
+    pub error: Option<(usize, String, bool)>,
+}
+
 /// Sends and tracks transactions for one wallet, one at a time.
 pub struct Sender {
     /// Reads: nonce, gas, receipts, balances.
@@ -536,25 +547,48 @@ impl Sender {
     /// Sign and send a batch back to back (consecutive nonces, no waiting
     /// between them: approve + swap land in order). Returns their hashes.
     pub fn send_all(&mut self, txs: &[(String, Vec<u8>, u64)]) -> Result<Vec<String>, String> {
+        let list: Vec<crate::liveroute::LiveTx> =
+            txs.iter().map(|(to, data, gas)| crate::liveroute::LiveTx { label: String::new(), to: to.clone(), data: data.clone(), gas: *gas, value: U256::ZERO }).collect();
+        let s = self.send_txs(&list)?;
+        match s.error {
+            None => Ok(s.hashes),
+            Some((i, e, _)) => Err(format!("send refused after {i} of {}: {e}", txs.len())),
+        }
+    }
+
+    /// Like send_all, but each transaction may carry ETH (native-ETH V4
+    /// swaps), and a refusal is reported in detail instead of as a bare
+    /// error, because the caller must know whether the SWAP might be out:
+    ///   Err(..)  nothing was sent (gas price or nonce could not be read).
+    ///   Ok(Sent) `hashes` = every transaction signed, in order, INCLUDING
+    ///            the one whose send failed (so its fate can be checked
+    ///            later); `error` = (index, reason, definite). definite =
+    ///            the node answered with an error, so it did NOT take it;
+    ///            not definite = no answer (timeout, connection), so it MAY
+    ///            have gone out.
+    pub fn send_txs(&mut self, txs: &[crate::liveroute::LiveTx]) -> Result<Sent, String> {
         let max_fee = self.max_fee()?;
-        let mut hashes = Vec::new();
-        for (to, data, gas_limit) in txs {
+        let mut out = Sent { hashes: Vec::new(), accepted: 0, error: None };
+        for t in txs {
             let n = self.nonce()?;
-            let f = TxFields { nonce: n, max_priority_fee: 0, max_fee, gas_limit: *gas_limit, to: to.clone(), value: U256::ZERO, data: data.clone() };
+            let f = TxFields { nonce: n, max_priority_fee: 0, max_fee, gas_limit: t.gas, to: t.to.clone(), value: t.value, data: t.data.clone() };
             let s = self.signer.sign(&f)?;
+            out.hashes.push(s.hash.clone());
             match self.send.call("eth_sendRawTransaction", json!([s.raw_hex()])) {
                 Ok(_) => {
                     self.next_nonce = Some(n + 1);
-                    hashes.push(s.hash);
+                    out.accepted += 1;
                 }
                 Err(e) => {
                     // Any refusal: we no longer trust our nonce.
                     self.resync();
-                    return Err(format!("send refused after {} of {}: {e}", hashes.len(), txs.len()));
+                    let definite = e.contains("node error");
+                    out.error = Some((out.accepted, e, definite));
+                    return Ok(out);
                 }
             }
         }
-        Ok(hashes)
+        Ok(out)
     }
 
     /// Wait for one receipt (polls every 100 ms, about one block).

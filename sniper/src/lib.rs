@@ -31,6 +31,8 @@ pub mod feedwatch;
 pub mod fourmeme;
 pub mod live;
 pub mod livetrade;
+pub mod liveroute;
+pub mod livedry;
 pub mod rugguard;
 pub mod safety;
 pub mod matcher;

@@ -12,7 +12,13 @@
 //   sniper engine-trial             live trial of the sniper's engine (run by
 //                                   deploy/sniper-engine.sh trial; src/enginetrial.rs)
 //   sniper dry-fire <pool> <usd>    live sender's real calls in a free
-//                                   simulation (no key, no money)
+//                                   simulation (no key, no money; V3 only)
+//   sniper live-dryrun <pool> [usd] the live trader's EXACT buy + sell
+//                                   transactions (V3, V4, V2) from the live
+//                                   wallet's address, in a free simulation.
+//                                   Signs and sends nothing. Env:
+//                                   SNIPER_RHC_HTTP, SNIPER_LIVE_ADDRESS (or
+//                                   SNIPER_KEY_FILE), SNIPER_V4_KEYS (optional)
 //   sniper rhc-probe                Robinhood Chain speed test (read-only;
 //                                   env: see src/rhc.rs)
 //   sniper rhc-report <dir>         its results (head start, rushes, trades)
@@ -125,6 +131,43 @@ fn main() -> ExitCode {
                 }
                 Err(e) => {
                     eprintln!("dry-fire: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Some("live-dryrun") => {
+            // sniper live-dryrun <pool address or V4 pool id> [usd, default
+            // SNIPER_LIVE_MAX_USD or 5]: read-only pre-flight check of the
+            // live trader's real transactions. See src/livedry.rs.
+            let Some(pool) = args.get(1) else {
+                eprintln!("usage: sniper live-dryrun <V3 pool | V2 pair | V4 pool id> [usd]   (env: SNIPER_RHC_HTTP, SNIPER_LIVE_ADDRESS or SNIPER_KEY_FILE)");
+                return ExitCode::FAILURE;
+            };
+            let get = |k: &str| std::env::var(k).ok();
+            let default_usd = get("SNIPER_LIVE_MAX_USD").and_then(|v| v.parse::<f64>().ok()).unwrap_or(5.0);
+            let usd = match args.get(2) {
+                None => default_usd,
+                Some(v) => match v.parse::<f64>() {
+                    Ok(u) if u > 0.0 && u <= sniper::live::HARD_MAX_TRADE_USD => u,
+                    _ => {
+                        eprintln!("live-dryrun: usd must be above 0 and at most {}", sniper::live::HARD_MAX_TRADE_USD);
+                        return ExitCode::FAILURE;
+                    }
+                },
+            };
+            let url = get("SNIPER_RHC_HTTP").unwrap_or_else(|| sniper::rhc::DEFAULT_HTTP.to_string());
+            match sniper::livedry::live_dryrun(&url, pool, usd, &get) {
+                Ok(v) => {
+                    println!("{v}");
+                    if v["ok"] == true {
+                        ExitCode::SUCCESS
+                    } else {
+                        ExitCode::FAILURE
+                    }
+                }
+                Err(e) => {
+                    // Never print the node link (it can hold an API key).
+                    eprintln!("live-dryrun: {}", e.replace(&url, "<node>"));
                     ExitCode::FAILURE
                 }
             }
